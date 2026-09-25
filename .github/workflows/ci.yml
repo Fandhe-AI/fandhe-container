@@ -6,7 +6,9 @@ name: CI
 # （未作成のまま有効化すると rust-ci / rust-ci-default-features が「対象パッケージが
 # 無い」エラーで毎回 fail する）。lint-docs が参照する設定ファイル
 # （.markdownlint.jsonc 等）・3 OS matrix（ubuntu / macos / windows）・
-# cache-key-prefix のリポ名化は fandhe-browser の ci.yml から取り込み済み
+# cache-key-prefix のリポ名化は fandhe-browser の ci.yml から取り込み済み。
+# 有効化後は ruleset（branch protection）の必須チェックへ `ci-complete` 1 件を
+# 登録する（下の ci-complete ジョブのコメントを参照）
 on:
   workflow_dispatch:
 
@@ -35,14 +37,18 @@ jobs:
   # `.editorconfig` + `.editorconfig-checker.json` / `.yamllint` /
   # `commitlint.config.mjs` を参照する。
   #
-  # 必須チェックの集約: reusable 側の集約ジョブ `lint-docs / lint-docs-complete`
-  # （fail-closed。各 lint ジョブは boolean input の if: を持つ条件付きジョブとして
-  # 明示リストで skipped を判定する）を branch protection の必須チェックに使う。
-  # rust-ci・rust-ci-default-features は 3 OS matrix のため OS ごとに別名のチェックが
-  # 生成される。有効化後は branch protection の必須チェックへ
-  # `rust-ci (ubuntu-latest|macos-latest|windows-latest) / rust-base-ci-complete` の
-  # 3 件と `rust-ci-default-features (ubuntu-latest|macos-latest|windows-latest)` の
-  # 3 件を追加する（登録はユーザー作業）。
+  # 必須チェックの集約: reusable 側の lint-docs 自体も集約ジョブ
+  # `lint-docs / lint-docs-complete`（fail-closed。各 lint ジョブは boolean input の
+  # if: を持つ条件付きジョブとして明示リストで skipped を判定する）で単一の result に
+  # まとめられているため、本 workflow からは `needs.lint-docs.result` を信頼できる
+  # 単一値として扱える。rust-ci・rust-ci-default-features は 3 OS matrix のため
+  # OS ごとに別名のチェックが生成され、そのままでは branch protection の必須チェック
+  # 一覧を OS 追加のたびに更新する必要がある。本 workflow 内の集約ジョブ
+  # `ci-complete`（下部）が lint-docs・rust-ci・rust-ci-default-features の結果を
+  # まとめて fail-closed 判定するため、有効化後は ruleset（branch protection）の
+  # 必須チェックに `ci-complete` 1 件だけを登録する（現状は workflow_dispatch のみで
+  # PR に報告されないため、今は必須化しない。報告されない必須チェックを登録すると
+  # マージが永久にブロックされる）。
   lint-docs:
     # Fandhe-AI/actions は可変タグ latest（move-latest-tag 管理で main へ追従）で
     # 参照する（組織現行標準）
@@ -134,3 +140,69 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test（既定 feature）
         run: cargo test --workspace
+
+  # --------------------------------------------------
+  # ci-complete（必須チェック集約ジョブ）
+  # --------------------------------------------------
+  # ruleset（branch protection）に登録する必須チェックを 1 件に集約する。
+  # rust-ci・rust-ci-default-features は 3 OS matrix ジョブのため、needs 上では
+  # OS ごとの結果ではなく 1 つの result に集約される（いずれかの OS が失敗・
+  # キャンセルされれば全体が failure / cancelled になる。fail-fast: false でも
+  # 集約結果には影響しない）。
+  #
+  # ジョブを追加したら本ジョブの needs にも追加すること（漏れると新ジョブの失敗が
+  # 必須チェックに反映されない）。
+  ci-complete:
+    needs: [lint-docs, rust-ci, rust-ci-default-features]
+    if: always()
+    permissions: {}
+    runs-on: ubuntu-latest
+    # 判定は jq のみの軽量処理のため短時間で終わる想定（ハング時の多層防御）
+    timeout-minutes: 5
+    steps:
+      - name: needs の result を検証（fail-closed）
+        env:
+          # ${{ }} を run スクリプトへ直接埋め込むとログインジェクション /
+          # スクリプトインジェクションの経路になるため、env 経由で受け渡す
+          NEEDS_CONTEXT: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          # skipped を許容するジョブ名の明示リスト（現状は if: を持つ条件付き
+          # ジョブが無いため空。将来 if: 付きジョブを追加する場合はここへ
+          # ジョブ ID を追加し、skipped も合格扱いにする）
+          allow_skipped=()
+
+          # jq の失敗（needs が不正な JSON 等）でループが空回りして合格扱いに
+          # ならないよう、プロセス置換ではなく変数へ先に取り出して set -e で止める。
+          # needs の件数が 0 の場合も異常として扱う（fail-closed）
+          entries="$(printf '%s' "${NEEDS_CONTEXT}" | jq -er 'to_entries[] | [.key, .value.result] | @tsv')"
+          if [ -z "${entries}" ]; then
+            echo "needs context is empty" >&2
+            exit 1
+          fi
+
+          failed=""
+          while IFS=$'\t' read -r job result; do
+            if [ "${result}" = "success" ]; then
+              continue
+            fi
+            skip_ok="false"
+            for allowed in "${allow_skipped[@]:-}"; do
+              if [ "${job}" = "${allowed}" ] && [ "${result}" = "skipped" ]; then
+                skip_ok="true"
+                break
+              fi
+            done
+            if [ "${skip_ok}" = "true" ]; then
+              continue
+            fi
+            failed="${failed}${job}: ${result}\n"
+          done <<< "${entries}"
+
+          if [ -n "${failed}" ]; then
+            echo "The following required jobs did not succeed:" >&2
+            printf '%b' "${failed}" >&2
+            exit 1
+          fi
+
+          echo "All required jobs succeeded."

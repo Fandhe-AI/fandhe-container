@@ -6,11 +6,12 @@ name: release
 # 「publish（`mode: publish` のときのみ。GitHub Environment `crates-io-release` の
 # 承認ゲートを通す）」の 2 ジョブで実行する。既定モードは dry-run-only（安全側）。
 #
-# 公開対象は workspace の 2 クレート（`crates/engine` = fandhe-vector-db-engine、
-# `crates/wire-server` = fandhe-vector-db-wire-server）。crate 入力を choice 型に
-# 固定することで、任意文字列のシェル注入・存在しないパッケージ指定を構造的に排除する
-# （fail-closed）。`all` は `cargo publish --workspace` による依存順の一括公開
-# （engine → wire-server。cargo が sparse index 反映待ちを含めて順序解決する）。
+# 公開対象クレートは未確定（crate 構成は TASK-1・REPAIR-1 で確定し、crates.io 公開方針は
+# OSS 系ビヘイビアに従って別途決める）。確定後に inputs.crate の options を公開 crate 名
+# （`fandhe-container-*`）へ置換する。crate 入力を choice 型に固定することで、任意文字列の
+# シェル注入・存在しないパッケージ指定を構造的に排除する（fail-closed）。`all` は
+# `cargo publish --workspace` による依存順の一括公開（cargo が sparse index 反映待ちを
+# 含めて順序解決する）。
 #
 # タグ push 起点は採用しない。workflow_dispatch の明示入力（crate/version/mode）に
 # よるバージョン整合ガード（semver 形式・Cargo.toml 一致・crates.io 既公開チェック）の
@@ -19,7 +20,7 @@ name: release
 # 前提（オーナー作業。本ワークフローは存在確認のみ行い作成はしない）:
 # - GitHub Environment `crates-io-release` に required reviewers を設定する（初回 run で
 #   環境が自動作成された場合は保護ルールが空のため、必ず手動で追加する）
-# - 同 Environment の secret `CARGO_REGISTRY_TOKEN`（crates.io API トークン。両クレートの
+# - 同 Environment の secret `CARGO_REGISTRY_TOKEN`（crates.io API トークン。公開対象クレートの
 #   publish-new / publish-update スコープ）を設定する。トークンは publish ステップの env
 #   にのみ注入し、他ステップ・verify ジョブへは渡さない
 # - private submodule（docs/spec）は公開処理に不要なため取得しない
@@ -43,10 +44,9 @@ on:
 #         description: "公開対象クレート（all は --workspace による依存順の一括公開）"
 #         type: choice
 #         required: true
-#         default: fandhe-vector-db-engine
+#         # 公開 crate 名は TASK-1（REPAIR-1）で確定後に置換する（現状は all のみのプレースホルダ）
+#         default: all
 #         options:
-#           - fandhe-vector-db-engine
-#           - fandhe-vector-db-wire-server
 #           - all
 #       version:
 #         description: "公開しようとするバージョン（例: 0.1.0）。対象クレートの Cargo.toml の version と完全一致する必要がある"
@@ -85,15 +85,14 @@ jobs:
       RELEASE_MODE: ${{ inputs.mode }}
     steps:
       - name: Checkout
-        # ci.yml / bench.yml と同一コミットに固定。docs/spec submodule は取得しない。
+        # ci.yml と同一コミットに固定。docs/spec submodule は取得しない。
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           submodules: false
           persist-credentials: false
 
       - name: Install Rust toolchain (rust-toolchain.toml)
-        # bench.yml / detect-features.yml と同じく rust-toolchain.toml を単一真実源として
-        # rustup show で同期する。
+        # rust-toolchain.toml を単一真実源として rustup show で同期する。
         run: rustup show
 
       - name: "guard: 入力バージョン形式の検証"
@@ -109,7 +108,7 @@ jobs:
 
       - name: "guard: 公開対象クレートの解決"
         # choice 入力 `all` を workspace の公開対象パッケージ一覧へ展開する。
-        # `publish = false` のパッケージは対象に含めない（現状は 2 クレートとも公開対象）。
+        # `publish = false` のパッケージは対象に含めない。
         # 後続ステップは RELEASE_PACKAGES（空白区切り）を対象として扱う。
         run: |
           set -euo pipefail
@@ -130,7 +129,7 @@ jobs:
           echo "RELEASE_PACKAGES=${PACKAGES}" >> "${GITHUB_ENV}"
 
       - name: "guard: Cargo.toml バージョン一致の検証"
-        # cargo pkgid の出力（例: path+file:///.../crates/engine#fandhe-vector-db-engine@0.1.0）
+        # cargo pkgid の出力（例: path+file:///.../crates/io#fandhe-container-io@0.1.0）
         # からバージョンを抽出し、入力 version と完全一致しなければ公開を止める。
         # `all` のときは全対象パッケージが同一バージョンであることを要求する。
         run: |
@@ -231,8 +230,8 @@ jobs:
       - name: "verify: cargo publish --dry-run"
         # トークン不要。パッケージ検証ビルドまでを実施し、実公開前にビルド可能性・
         # パッケージング可能性を確認する。`all` は --workspace で依存順に検証する
-        # （wire-server 単体は engine の公開版が crates.io に無い間は依存解決で失敗する。
-        # 初回公開は `all` を使う）。
+        # （workspace 内の他 crate に依存する crate 単体は、依存先の公開版が crates.io に
+        # 無い間は依存解決で失敗する。初回公開は `all` を使う）。
         run: |
           set -euo pipefail
           if [ "${RELEASE_CRATE}" = "all" ]; then
@@ -282,7 +281,7 @@ jobs:
 
       - name: "publish: cargo publish"
         # トークンはこのステップの env にのみ限定して注入し、ジョブ全体（他ステップ）へは
-        # 広げない。`all` は --workspace で engine → wire-server の依存順に公開する。
+        # 広げない。`all` は --workspace で workspace 内の依存順に公開する。
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |

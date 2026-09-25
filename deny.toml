@@ -1,0 +1,72 @@
+# cargo-deny 設定。`make deny` が本ファイルと Cargo.toml の両方が存在する時点で
+# 自動有効化され、`cargo deny --locked check advisories bans licenses sources` として
+# 実行される（実装未着手のため現時点では Makefile 側の HAS_CARGO / HAS_MEMBERS 判定で
+# スキップされる。workspace とメンバー crate の作成後に有効化）。
+# 依存方針（.claude/rules/dependency-policy.md）: 依存最小・`=x.y.z` 完全固定・
+# 追加はユーザー承認制。Fandhe-AI/rust-ai-library の deny.toml と同一方針。
+
+[graph]
+# feature gate 配下の optional 依存（OS 別・GPU 別の plugin 依存等）を既定 feature
+# 集合のみの監査対象から漏らさないため、optional 依存を含む全 feature を監査対象に
+# する（fail-closed）。
+all-features = true
+
+[advisories]
+# RUSTSEC アドバイザリ監査（vulnerability / unmaintained / unsound / yanked）。
+# ignore へアドバイザリ ID を追加する場合は、理由・解消予定（追跡 Issue 番号）を
+# コメント付きで記録し、レビューを必須とする。
+version = 2
+ignore = [
+]
+
+[licenses]
+version = 2
+include-dev = true
+# OSS-4・OSS-5 対応: `cargo deny check licenses` による許可外ライセンス
+# （GPL/LGPL/AGPL 系・MPL-2.0 等）の fail-closed 検出
+# （`.github/workflows/ci.yml` の `rust-ci` ジョブから呼び出す）。
+# 本リポは OSS-3 に従い中核 crate を Apache-2.0 単独とし、汎用再利用可能な補助 crate は
+# `MIT OR Apache-2.0` を選択肢として残す。依存もこれと互換な permissive
+# ライセンスのみ許可する。allow には互換 permissive の代表集合（rust-ai-library の
+# Cargo.lock 全域実測で出現した SPDX 識別子集合と同一）を事前許可しておき、推移的依存が
+# BSD/ISC 等の一般的な permissive を持つだけで make deny が不要に失敗しないようにする。
+# ここに無い識別子の追加は依存追加のユーザー承認
+# （dependency-policy.md）とセットで行い、コピーレフト（GPL/LGPL/MPL 等）は列挙しない
+# ことで fail-closed に検出する。
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unlicense",
+]
+# allow・[licenses.exceptions] へ識別子を追加する際は、SPDX 識別子の機械判定だけに
+# 頼らず、対象クレートのライセンス文言（LICENSE ファイル・Cargo.toml license 欄）を
+# 目視確認してから追加する。
+confidence-threshold = 0.8
+
+[sources]
+# git 依存・代替レジストリの混入をサプライチェーン観点で fail-closed 検出する
+# （全依存は crates.io 由来のみを許可）。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[bans]
+# 同一クレートの複数バージョン混入の検出。`=x.y.z` 完全固定方針では重複は原則
+# 発生しない前提だが、推移的依存経由の重複は依存元側の追随を待つほかなく "deny" では
+# ノイズが上回るため、警告に留めて CI ログで増加傾向を観測する（rust-ai-library と同一判断）。
+multiple-versions = "warn"
+
+# バージョン要求 `*` の依存宣言を拒否する（バージョン無指定はサプライチェーン上
+# 任意の最新版を受け入れる宣言であり、`=x.y.z` 完全固定方針に反するため fail-closed で弾く）。
+wildcards = "deny"
+# workspace 内クレート（`crates/<短縮名>`）同士の相互参照はバージョン無しの path 依存
+# （cargo 上は `*` 扱い）になるため、private（`publish = false`）クレートの path 依存に
+# 限り wildcards の対象外とする（cargo-deny の仕様上、公開対象クレートの path 依存は
+# 引き続き検出される。crates.io 公開する crate はバージョン併記の path 依存にする）。
+allow-wildcard-paths = true

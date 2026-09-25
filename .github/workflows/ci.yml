@@ -1,0 +1,136 @@
+name: CI
+
+# 準備が整うまで発火条件を無効化している（手動実行のみのプレースホルダ）。
+# 有効化時はこの on: を削除し、下のコメントアウトした on: ブロックを戻す。
+# 有効化前に必要な作業: workspace（Cargo.toml）とメンバー crate の作成
+# （未作成のまま有効化すると rust-ci / rust-ci-default-features が「対象パッケージが
+# 無い」エラーで毎回 fail する）。lint-docs が参照する設定ファイル
+# （.markdownlint.jsonc 等）・3 OS matrix（ubuntu / macos / windows）・
+# cache-key-prefix のリポ名化は fandhe-browser の ci.yml から取り込み済み
+on:
+  workflow_dispatch:
+
+# on:
+#   workflow_dispatch:
+#   pull_request:
+#   push:
+#     branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # PR ごとに一意な番号を group に含める（head_ref のみだと fork 間で同名ブランチの
+  # 別 PR が同一グループになり、互いの CI を cancel し合う）
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------
+  # lint-docs（ドキュメント／設定ファイル系 lint）
+  # --------------------------------------------------
+  # Fandhe-AI/actions の lint-docs reusable workflow（lint ツールバージョンは
+  # 共通側で固定。agent-cli-skills の同名ジョブと同型）を呼び出す。
+  # 設定はそれぞれ `.markdownlint.jsonc` / `.markdownlintignore` /
+  # `.editorconfig` + `.editorconfig-checker.json` / `.yamllint` /
+  # `commitlint.config.mjs` を参照する。
+  #
+  # 必須チェックの集約: reusable 側の集約ジョブ `lint-docs / lint-docs-complete`
+  # （fail-closed。各 lint ジョブは boolean input の if: を持つ条件付きジョブとして
+  # 明示リストで skipped を判定する）を branch protection の必須チェックに使う。
+  # rust-ci・rust-ci-default-features は 3 OS matrix のため OS ごとに別名のチェックが
+  # 生成される。有効化後は branch protection の必須チェックへ
+  # `rust-ci (ubuntu-latest|macos-latest|windows-latest) / rust-base-ci-complete` の
+  # 3 件と `rust-ci-default-features (ubuntu-latest|macos-latest|windows-latest)` の
+  # 3 件を追加する（登録はユーザー作業）。
+  lint-docs:
+    # Fandhe-AI/actions は可変タグ latest（move-latest-tag 管理で main へ追従）で
+    # 参照する（組織現行標準）
+    uses: Fandhe-AI/actions/.github/workflows/lint-docs.yml@latest
+    permissions:
+      contents: read
+    with:
+      # public リポジトリのため GitHub ホステッド runner を明示指定（組織 runner 方針）
+      runner-label: ubuntu-latest
+      markdownlint: true
+      editorconfig: true
+      yamllint: true
+      # commitlint は PR の base/head から commit 範囲を取るため pull_request 専用
+      # （reusable 側は他イベントを fail-closed で拒否する）。push でも動く本
+      # workflow では event で切り替え、main への push では実行しない
+      commitlint: ${{ github.event_name == 'pull_request' }}
+
+  # --------------------------------------------------
+  # rust-ci（Rust ベースライン品質ゲート: fmt / clippy / test / cargo-deny）
+  # --------------------------------------------------
+  # reusable workflow 側の `test` ジョブが `cargo test --workspace --all-features` を
+  # continue-on-error 無しで実行し、集約ジョブ `rust-base-ci-complete` が
+  # fmt/clippy/test/deny 各ジョブの result を明示チェックしてフェイルクローズで判定する
+  # （本呼び出しからは `rust-ci (<os>) / rust-base-ci-complete` として見える）。
+  #
+  # 3 OS 一級対応（macOS・Windows・Linux）: 各ネイティブ runner で rust-base-ci
+  # （fmt/clippy/test/deny）をそれぞれ実行する。fail-fast: false は 1 OS の失敗で
+  # 他 OS の実行を打ち切らせないため（3 OS すべての結果を必ず得る）。
+  rust-ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    uses: Fandhe-AI/actions/.github/workflows/rust-base-ci.yml@latest
+    permissions:
+      contents: read
+    with:
+      # 3 OS matrix。matrix.os をそのまま runner-label へ渡す
+      # （public リポジトリの GitHub ホステッド runner 方針は維持）
+      runner-label: ${{ matrix.os }}
+      # make deny（Makefile の deny ターゲット）と同一のチェック集合。
+      # licenses チェックは OSS-4（deny.toml の [licenses] 参照）
+      deny-checks: advisories bans licenses sources
+      # cargo レジストリ・target の cache（reusable 側のオプトイン入力。
+      # key は `**/Cargo.lock` のハッシュに加え `runner.os` を含む形で reusable
+      # workflow 側が OS ごとに分離する）。ホステッド runner は毎回まっさらなため、
+      # 無効のままだと各ジョブが依存クレートを毎回フルビルドすることになる。
+      # cache-key-prefix は他リポジトリとの衝突回避のため本リポ名にする。
+      #
+      # windows-latest のみ cache を無効化する: rust-base-ci.yml（Fandhe-AI/actions）の
+      # 「workspace メンバー成果物を prune（cache 保存前・cache 有効時のみ）」ステップが
+      # windows-latest（git-bash/MSYS）環境で正当な crate 名を「想定外の crate / target 名」
+      # と誤検出して fail する既知の問題がある（fandhe-browser PR #409 で実測）。
+      # 上流で修正され次第この条件式は削除してよい
+      cache: ${{ matrix.os != 'windows-latest' }}
+      cache-key-prefix: fandhe-container
+
+  # --------------------------------------------------
+  # rust-ci-default-features（既定 feature でのローカルゲート再現）
+  # --------------------------------------------------
+  # 上記 rust-ci（reusable workflow）は `cargo clippy/test --all-features` で
+  # 検証するため、既定 feature（`--all-features` なし）の構成は別途検証されない。
+  #   cargo clippy --workspace --all-targets -- -D warnings
+  #   cargo test --workspace
+  # （いずれも既定 feature）を本 workflow 内で直接実行し、既定 feature 側の回帰も
+  # CI で検出できるようにする。Makefile の `lint`/`test` ターゲット（既定 feature 用）と
+  # 同一コマンドを実行する。rust-ci と同じ 3 OS matrix で実行する（既定 feature 構成の
+  # OS 依存回帰を --all-features 側だけでは検出できないため）。
+  # 生の steps を持つジョブのため、第三者 action は SHA 固定で参照する
+  # （`@latest` が許されるのは Fandhe-AI/actions のみ）。
+  rust-ci-default-features:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # ハングしたジョブの無期限実行を防ぐ多層防御（release.yml の verify と同じ 30 分）
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: clippy
+      - name: cargo clippy（既定 feature）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test（既定 feature）
+        run: cargo test --workspace

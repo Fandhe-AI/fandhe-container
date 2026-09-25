@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'fandhe-container: 日本語でやりとり / 作業は subagent へ委譲し main 消費を抑える (delegation.md, delegation-impl.md) / Conventional Commits 厳守 (--no-verify 禁止) / spec は SSOT・引用時はビヘイビア ID 併記 (spec-reference.md) / 依存追加はユーザー承認 + =x.y.z 完全固定・rust-vmm 等は不使用 (dependency-policy.md) / 実装着手はユーザーの明示指示後・implement-issue は計画承認後に実装 / root 権限コマンドは明示指示なしに実行しない'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'command -v jq >/dev/null 2>&1 || exit 0; f=$(jq -r \".tool_input.file_path // empty\"); case \"$f\" in *.rs) command -v rustfmt >/dev/null 2>&1 && [ -f \"$f\" ] || exit 0; ed=$(sed -n \"s/^edition *= *\\\"\\\\([0-9]\\\\{4\\\\}\\\\)\\\".*/\\\\1/p\" \"${CLAUDE_PROJECT_DIR:-.}/Cargo.toml\" 2>/dev/null | head -n1); rustfmt --edition \"${ed:-2024}\" \"$f\" || true ;; esac; exit 0'"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -11,7 +11,8 @@
 - workspace は `crates/<短縮名>`・crate 名前空間 `fandhe-container-*` で構成する（短縮名は TASK-1・REPAIR-1 で確定）
 - 1 回の改修が波及する crate・モジュールを最小に保つ（単一責務・疎結合。AI 自己補修の前提。REPAIR-1）
 - 循環依存を作らない。複数 crate が共有する型は下位 crate へ置き、上位から下位への一方向依存を保つ
-- 拡張機能は別プロセス＋UDS 境界の plugin として分離する。`ContainerRuntime`・`StateStore`・`NetworkPlugin` の実装は plugin 側、`VolumeProvider`（データパス）は core 側に置く（PLUG-1）。plugin の追加で core を変更しない（PLUG-4）
+- 拡張機能は別プロセス＋UDS 境界の plugin として分離する。`ContainerRuntime`・`NetworkPlugin` の実装は plugin 側、`VolumeProvider`（データパス）はトレイト定義・実装とも core 側に置く（PLUG-1）。plugin の追加で core を変更しない（PLUG-4）
+- `StateStore` はトレイト定義を core に置き、ファイルベースの既定実装も core に置く（TASK-31・OCI-5。常駐デーモンを持たない CORE-1 と整合）。別実装は plugin として差し替え可能にする（PLUG-1 の「実装は plugin 境界に出せる」）
 - 中央の常駐デーモンを前提にした設計をしない（CORE-1・D-19。監視はコンテナごとの supervisor）
 
 ## 公開 API・型設計

@@ -17,7 +17,7 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 ```text
 fandhe-container/
 ├── CLAUDE.md                      # Claude 運用方針（本ファイル）
-├── AGENTS.md                      #（予定）ビルド・回帰確認コマンド（REPAIR-10）/ AI PR レビュー観点集
+├── AGENTS.md                      # AI PR レビュー観点集 / ビルド・回帰確認コマンド（REPAIR-10）
 ├── README.md                      # 概要・実装方針（要点）・開発環境構築
 ├── LICENSE                        # Apache License 2.0
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）

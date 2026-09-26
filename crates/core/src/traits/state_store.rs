@@ -25,8 +25,9 @@
 //!    トレイトに出さない。実装の内部事情とし、分散ストアへ差し替えられるようにする
 //! 6. plugin の信頼境界（PLUG-11・PLUG-12）はこのトレイトの外側、境界機構
 //!    （`fandhe-container-plugin`）の責務。plugin 実装からの応答は untrusted として扱い、
-//!    proxy 実装は [`StateList`] の件数と [`TraitError::message`] の長さを上限検証してから
-//!    アロケーションする
+//!    proxy 実装は [`StateList::records`] の件数が要求した [`ListStateRequest::page_size`]
+//!    を超えていないか、[`StateListCursor`] の長さが [`MAX_CURSOR_LEN`] を超えていないか、
+//!    [`TraitError::message`] の長さが上限内かを検証してからアロケーションする
 //! 7. 状態レコードとエラーメッセージに秘密情報（レジストリ資格情報等）を含めない
 //!    （security.md）
 //!
@@ -35,8 +36,11 @@
 //!
 //! シグネチャは人間のアーキテクチャレビュー（#19・TASK-4.h1）前の暫定版であり、
 //! 「確認済み」の確定仕様ではない。`StateRevision` による楽観的排他は特に、
-//! #19 で確定させる想定。
+//! #19 で確定させる想定。[`StateRevision`] の店舗（ストア）全体での単調採番方式・
+//! [`ListStateRequest`] のページング契約は、PR #1076 への codex レビュー指摘
+//! （P1 ×2）を受けた暫定対応であり、同じく #19 で確定させる。
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use super::container_runtime::ContainerStatus;
@@ -48,12 +52,26 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 /// 方針。coding-rust.md・dependency-policy.md の依存最小方針により async ランタイムへの
 /// 依存を追加しない）。
 pub trait StateStore: Send + Sync {
-    /// 新しいコンテナ状態を作成する（revision は [`StateRevision::INITIAL`] から始まる）。
+    /// 新しいコンテナ状態を作成する（revision はストア全体で単調に採番された
+    /// 未使用の値になる。新規ストアでの最初の 1 件は [`StateRevision::INITIAL`]
+    /// になるが、それ以降の `create` はこれを返すとは限らない）。
     ///
     /// 前提: 同じ [`ContainerId`] のレコードが存在しないこと。存在する場合は
     /// [`ErrorCode::AlreadyExists`] を返す。`update`（upsert）にしない理由は、
     /// `ContainerRuntime::create` の二重作成検出をストア側で不可分に判定できるようにする
     /// ため。対応: OCI-5・CRI-7・ERR-2。
+    ///
+    /// # revision の再利用禁止（#19 codex レビュー P1 対応）
+    /// 同じ [`ContainerId`] が削除後に再作成された場合でも、新しいレコードの revision は
+    /// 過去にそのストアが発行したどの revision とも異なる値にする（etcd の
+    /// `mod_revision` と同じ、ストア全体で単調増加するグローバル採番。line 93 参照）。
+    /// `create` の度に [`StateRevision::INITIAL`] へ巻き戻すと、削除前の旧レコードを
+    /// 読んだクライアントが保持する旧 revision が、たまたま同じ値になった新レコードに
+    /// 対して `update`/`delete` を誤って成功させてしまう（楽観的排他の消失。
+    /// 特に `delete` は新しい状態を誤って消す）。実装（TASK-31・G8）はこの採番位置を
+    /// ストア再起動をまたいで永続化する必要がある。既存レコードの revision の
+    /// 最大値から復元する方式は、削除済みレコードの revision を再発行してしまうため
+    /// 不十分（別途ハイウォーターマークとして永続化する）。
     fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError>;
 
     /// 既存のコンテナ状態を更新する（楽観的排他）。
@@ -62,6 +80,11 @@ pub trait StateStore: Send + Sync {
     /// `req.expected_revision()` が現在の revision と一致しなければ
     /// [`ErrorCode::FailedPrecondition`] を返す（並行書き込みによる更新の消失を検出する）。
     /// 対応: OCI-5・CRI-7・ERR-2。
+    ///
+    /// 更新後の revision も `create` と同じストア全体の単調採番から払い出す
+    /// （対象レコードの revision に単純に `+1` するのではない）。同一 ID を対象にした
+    /// 単純な `+1` は、削除・再作成を挟んだ別レコードが過去に使った revision の値域へ
+    /// 再突入し得るため、上記 `create` の再利用禁止契約を破ってしまう。
     fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError>;
 
     /// コンテナ状態を取得する。
@@ -70,10 +93,15 @@ pub trait StateStore: Send + Sync {
     /// 対応: OCI-5・CRI-7・ERR-2。
     fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError>;
 
-    /// 全コンテナ状態を一覧する。
+    /// コンテナ状態を 1 ページ分一覧する。
     ///
-    /// 将来のフィルタ・ページングは [`ListStateRequest`] のフィールド追加で拡張する
-    /// （`#[non_exhaustive]`）。対応: OCI-5・CRI-7。
+    /// 返すレコード数は [`ListStateRequest::page_size`] を超えない。まだ残りがある場合は
+    /// [`StateList::next_cursor`] に続きを取得するためのカーソルが入り、呼び出し側は
+    /// それを次回の [`ListStateRequest`] に渡す。無制限に全件確保することを禁じ、件数の
+    /// 上限をトレイト契約レベルで表現する（#19 codex レビュー P1 対応。
+    /// coding-rust.md の「長さ・件数を上限検証してからアロケーションに使う」）。
+    /// `req.cursor()` が不正・失効している場合は [`ErrorCode::InvalidArgument`] を返す。
+    /// 対応: OCI-5・CRI-7。
     fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError>;
 
     /// コンテナ状態を削除する（楽観的排他）。
@@ -97,7 +125,11 @@ pub trait StateStore: Send + Sync {
 pub struct StateRevision(u64);
 
 impl StateRevision {
-    /// レコード作成時にストアが割り当てる初期 revision。
+    /// 新規ストアが最初に払い出す revision。
+    ///
+    /// ストアの寿命全体で単調に増加するグローバル採番の起点であり、`create` の度に
+    /// 割り当てられる値ではない（2 件目以降の `create`・`update` はこの値を返さない）。
+    /// 詳細は [`StateStore::create`] の「revision の再利用禁止」を参照。
     pub const INITIAL: StateRevision = StateRevision(0);
 
     /// 次の revision を返す。`u64` の上限に達している場合は [`ErrorCode::Internal`] を返す
@@ -188,7 +220,8 @@ impl StateRecord {
 
 /// [`StateStore::create`] の要求。
 ///
-/// revision は持たない（ストアが [`StateRevision::INITIAL`] を採番する）。
+/// revision は持たない（ストアがストア全体の単調採番から次の未使用値を割り当てる。
+/// [`StateStore::create`] の「revision の再利用禁止」参照）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CreateStateRequest {
@@ -312,16 +345,91 @@ impl DeleteStateRequest {
     }
 }
 
-/// [`StateStore::list`] の要求。当面フィールドを持たないが、将来のフィルタ・ページング
-/// 追加に備えて構造体にする（`#[non_exhaustive]`）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// [`ListStateRequest::page_size`] に指定できる最大値（#19 codex レビュー P1 対応）。
+///
+/// plugin proxy 実装はこの値を上限として要求・応答を検証し、無制限なアロケーションを
+/// 防ぐ（coding-rust.md「長さ・件数を上限検証してからアロケーションに使う」）。
+/// 暫定値。#19（TASK-4.h1）のアーキテクチャレビューで確定させる。
+pub const MAX_PAGE_SIZE: u32 = 1_000;
+
+/// [`StateListCursor`] に許容する最大バイト長。
+///
+/// カーソルは実装（TASK-31 のファイルベース実装・plugin proxy）が発行する不透明な
+/// トークンだが、plugin からの応答は untrusted な外部入力として扱い、
+/// アロケーション前に長さを検証する（security.md・coding-rust.md）。
+pub const MAX_CURSOR_LEN: usize = 4_096;
+
+/// [`StateStore::list`] の要求。
+///
+/// 1 ページあたりの最大件数（[`MAX_PAGE_SIZE`] 以下）を必須で持たせることで、
+/// 無制限な全件確保をトレイト契約レベルで防ぐ（#19 codex レビュー P1 対応）。
+/// 将来の追加フィルタは新しいフィールドの追加で拡張する（`#[non_exhaustive]`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ListStateRequest {}
+pub struct ListStateRequest {
+    page_size: NonZeroU32,
+    cursor: Option<StateListCursor>,
+}
 
 impl ListStateRequest {
-    /// 空の要求を作る（フィルタなしの全件一覧）。
-    pub fn new() -> Self {
-        Self {}
+    /// 1 ページあたりの最大件数から、カーソルなし（先頭ページ）の要求を作る。
+    ///
+    /// `page_size` が [`MAX_PAGE_SIZE`] を超える場合は [`ErrorCode::InvalidArgument`]
+    /// を返す。
+    pub fn new(page_size: NonZeroU32) -> Result<Self, TraitError> {
+        if page_size.get() > MAX_PAGE_SIZE {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "page_size exceeds MAX_PAGE_SIZE",
+            ));
+        }
+        Ok(Self {
+            page_size,
+            cursor: None,
+        })
+    }
+
+    /// 前回の [`StateList::next_cursor`] を指定し、続きのページを要求する。
+    pub fn with_cursor(mut self, cursor: StateListCursor) -> Self {
+        self.cursor = Some(cursor);
+        self
+    }
+
+    /// 1 ページあたりの最大件数を返す。
+    pub fn page_size(&self) -> NonZeroU32 {
+        self.page_size
+    }
+
+    /// 続きのページを取得するためのカーソルを返す（先頭ページなら `None`）。
+    pub fn cursor(&self) -> Option<&StateListCursor> {
+        self.cursor.as_ref()
+    }
+}
+
+/// [`StateStore::list`] のページ送りに使う不透明なカーソル。
+///
+/// 値の形式は実装の内部事情とし、トレイトはバイト長の上限（[`MAX_CURSOR_LEN`]）のみを
+/// 規定する。plugin からの応答は untrusted な外部入力のため、`from_raw` は検証付きで
+/// `Result` を返す（無検証の構築手段を公開しない）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StateListCursor(String);
+
+impl StateListCursor {
+    /// 生のトークン文字列からカーソルを作る。[`MAX_CURSOR_LEN`] バイトを超える場合は
+    /// [`ErrorCode::InvalidArgument`] を返す。
+    pub fn from_raw(token: String) -> Result<Self, TraitError> {
+        if token.len() > MAX_CURSOR_LEN {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "cursor exceeds MAX_CURSOR_LEN",
+            ));
+        }
+        Ok(Self(token))
+    }
+
+    /// カーソルのトークン文字列を返す。
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -330,15 +438,22 @@ impl ListStateRequest {
 #[non_exhaustive]
 pub struct StateList {
     records: Vec<StateRecord>,
+    next_cursor: Option<StateListCursor>,
 }
 
 impl StateList {
-    /// レコード一覧から応答を作る。
-    pub fn new(records: Vec<StateRecord>) -> Self {
-        Self { records }
+    /// レコード一覧と、続きがある場合のカーソルから応答を作る。
+    ///
+    /// `next_cursor` が `Some` であることは「まだ残りがある」ことを意味し、`None` は
+    /// このページが最後であることを意味する。
+    pub fn new(records: Vec<StateRecord>, next_cursor: Option<StateListCursor>) -> Self {
+        Self {
+            records,
+            next_cursor,
+        }
     }
 
-    /// レコード一覧への参照を返す。
+    /// レコード一覧への参照を返す（要求した [`ListStateRequest::page_size`] 以下）。
     pub fn records(&self) -> &[StateRecord] {
         &self.records
     }
@@ -346,6 +461,11 @@ impl StateList {
     /// レコード一覧を所有権ごと取り出す。
     pub fn into_records(self) -> Vec<StateRecord> {
         self.records
+    }
+
+    /// 続きのページを取得するためのカーソルを返す（残りがなければ `None`）。
+    pub fn next_cursor(&self) -> Option<&StateListCursor> {
+        self.next_cursor.as_ref()
     }
 }
 
@@ -369,15 +489,29 @@ mod tests {
 
     /// テスト専用のインメモリスタブ実装。dyn 互換性とメソッドの契約を確認するためのみに
     /// 使い、ライブラリ側の既定実装（TASK-31・OCI-5）はここには置かない（REPAIR-3）。
+    ///
+    /// `next_revision` はストア全体で単調に増加する採番カウンタで、`create`・`update`
+    /// の両方がここから revision を払い出す。削除・再作成を挟んでも同じ値を再発行しない
+    /// ことで、#19 codex レビュー P1（PR #1076）の revision 再利用を防ぐ。
     struct StubStateStore {
         records: Mutex<HashMap<ContainerId, StateRecord>>,
+        next_revision: Mutex<StateRevision>,
     }
 
     impl StubStateStore {
         fn new() -> Self {
             Self {
                 records: Mutex::new(HashMap::new()),
+                next_revision: Mutex::new(StateRevision::INITIAL),
             }
+        }
+
+        /// ストア全体で一意な revision を 1 つ払い出す。
+        fn allocate_revision(&self) -> Result<StateRevision, TraitError> {
+            let mut next = self.next_revision.lock().unwrap_or_else(|e| e.into_inner());
+            let allocated = *next;
+            *next = allocated.next()?;
+            Ok(allocated)
         }
     }
 
@@ -390,11 +524,9 @@ mod tests {
                     "container state already exists",
                 ));
             }
-            let record = StateRecord::new(
-                req.status().clone(),
-                req.bundle().to_path_buf(),
-                StateRevision::INITIAL,
-            )?;
+            let revision = self.allocate_revision()?;
+            let record =
+                StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
             records.insert(req.id().clone(), record.clone());
             Ok(record)
         }
@@ -410,12 +542,9 @@ mod tests {
                     "revision mismatch",
                 ));
             }
-            let next_revision = current.revision().next()?;
-            let updated = StateRecord::new(
-                req.status().clone(),
-                current.bundle().to_path_buf(),
-                next_revision,
-            )?;
+            let bundle = current.bundle().to_path_buf();
+            let next_revision = self.allocate_revision()?;
+            let updated = StateRecord::new(req.status().clone(), bundle, next_revision)?;
             records.insert(req.id().clone(), updated.clone());
             Ok(updated)
         }
@@ -428,9 +557,42 @@ mod tests {
                 .ok_or_else(|| TraitError::new(ErrorCode::NotFound, "container state not found"))
         }
 
-        fn list(&self, _req: &ListStateRequest) -> Result<StateList, TraitError> {
+        fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
             let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
-            Ok(StateList::new(records.values().cloned().collect()))
+            let mut sorted: Vec<&StateRecord> = records.values().collect();
+            sorted.sort_by(|a, b| a.id().as_str().cmp(b.id().as_str()));
+
+            let start_index = match req.cursor() {
+                Some(cursor) => {
+                    let after_id = cursor.as_str();
+                    let position = sorted
+                        .iter()
+                        .position(|record| record.id().as_str() == after_id)
+                        .ok_or_else(|| {
+                            TraitError::new(ErrorCode::InvalidArgument, "unknown list cursor")
+                        })?;
+                    position + 1
+                }
+                None => 0,
+            };
+
+            // page_size は `ListStateRequest::new` が MAX_PAGE_SIZE 以下であることを
+            // 検証済みのため、ここでの usize 変換は安全（32bit 環境でも u32 は usize に収まる）。
+            let page_size = req.page_size().get() as usize;
+            let end_index = start_index.saturating_add(page_size).min(sorted.len());
+            let page: Vec<StateRecord> = sorted[start_index..end_index]
+                .iter()
+                .map(|record| (*record).clone())
+                .collect();
+
+            let next_cursor = if end_index < sorted.len() {
+                let last_id = sorted[end_index - 1].id().as_str().to_string();
+                Some(StateListCursor::from_raw(last_id)?)
+            } else {
+                None
+            };
+
+            Ok(StateList::new(page, next_cursor))
         }
 
         fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
@@ -585,7 +747,10 @@ mod tests {
             )
             .expect("create b succeeds");
 
-        let listed = store.list(&ListStateRequest::new()).expect("list succeeds");
+        let page_size = NonZeroU32::new(10).expect("nonzero");
+        let listed = store
+            .list(&ListStateRequest::new(page_size).expect("valid page size"))
+            .expect("list succeeds");
         let mut ids: Vec<String> = listed
             .records()
             .iter()
@@ -597,7 +762,9 @@ mod tests {
         store
             .delete(&DeleteStateRequest::new(id_a, StateRevision::INITIAL))
             .expect("delete a succeeds");
-        let listed_after = store.list(&ListStateRequest::new()).expect("list succeeds");
+        let listed_after = store
+            .list(&ListStateRequest::new(page_size).expect("valid page size"))
+            .expect("list succeeds");
         let ids_after: Vec<String> = listed_after
             .into_records()
             .into_iter()
@@ -687,5 +854,133 @@ mod tests {
         let max = StateRevision(u64::MAX);
         let err = max.next().expect_err("overflow must be rejected");
         assert_eq!(err.code().as_str(), "INTERNAL");
+    }
+
+    /// OCI-5: 削除後に同じ ID を再作成しても revision は再利用されないため、削除前の
+    /// revision を保持していたクライアントの `update`/`delete` は新しいレコードに対して
+    /// `"FAILED_PRECONDITION"` になる（#19 codex レビュー P1・PR #1076 対応。修正前は
+    /// `create` が常に `StateRevision::INITIAL` へ巻き戻していたため、この `update`/
+    /// `delete` が誤って成功し、`delete` の場合は新しい状態を消してしまっていた）。
+    #[test]
+    fn oci5_revision_not_reused_after_delete_and_recreate() {
+        let store = StubStateStore::new();
+        let id = sample_id("reuse");
+
+        let created = store
+            .create(
+                &CreateStateRequest::new(
+                    ContainerStatus::created(id.clone(), None),
+                    sample_bundle(),
+                )
+                .expect("valid bundle"),
+            )
+            .expect("create succeeds");
+        let stale_revision = created.revision();
+
+        store
+            .delete(&DeleteStateRequest::new(id.clone(), stale_revision))
+            .expect("delete succeeds");
+
+        let recreated = store
+            .create(
+                &CreateStateRequest::new(
+                    ContainerStatus::created(id.clone(), None),
+                    sample_bundle(),
+                )
+                .expect("valid bundle"),
+            )
+            .expect("recreate succeeds");
+        assert_ne!(recreated.revision(), stale_revision);
+
+        let stale_update_err = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(id.clone(), None),
+                stale_revision,
+            ))
+            .expect_err("stale revision update against recreated record must fail");
+        assert_eq!(stale_update_err.code().as_str(), "FAILED_PRECONDITION");
+
+        let stale_delete_err = store
+            .delete(&DeleteStateRequest::new(id.clone(), stale_revision))
+            .expect_err("stale revision delete against recreated record must fail");
+        assert_eq!(stale_delete_err.code().as_str(), "FAILED_PRECONDITION");
+
+        let still_present = store
+            .get(&GetStateRequest::new(id))
+            .expect("recreated record must still exist after stale requests are rejected");
+        assert_eq!(still_present.revision(), recreated.revision());
+    }
+
+    /// OCI-5: `list` は `page_size` 以下の件数だけを返し、残りがあれば `next_cursor` で
+    /// 続きのページを取得できる（#19 codex レビュー P1・PR #1076 対応）。
+    #[test]
+    fn oci5_list_pagination_respects_page_size() {
+        let store = StubStateStore::new();
+        for name in ["a", "b", "c"] {
+            store
+                .create(
+                    &CreateStateRequest::new(
+                        ContainerStatus::created(sample_id(name), None),
+                        sample_bundle(),
+                    )
+                    .expect("valid bundle"),
+                )
+                .expect("create succeeds");
+        }
+
+        let page_size = NonZeroU32::new(2).expect("nonzero");
+        let first_page = store
+            .list(&ListStateRequest::new(page_size).expect("valid page size"))
+            .expect("list succeeds");
+        let first_ids: Vec<String> = first_page
+            .records()
+            .iter()
+            .map(|r| r.id().as_str().to_string())
+            .collect();
+        assert_eq!(first_ids, vec!["a".to_string(), "b".to_string()]);
+        let cursor = first_page
+            .next_cursor()
+            .cloned()
+            .expect("more records remain after first page");
+
+        let second_req = ListStateRequest::new(page_size)
+            .expect("valid page size")
+            .with_cursor(cursor);
+        let second_page = store.list(&second_req).expect("list succeeds");
+        assert!(second_page.next_cursor().is_none());
+        let second_ids: Vec<String> = second_page
+            .into_records()
+            .into_iter()
+            .map(|r| r.id().as_str().to_string())
+            .collect();
+        assert_eq!(second_ids, vec!["c".to_string()]);
+    }
+
+    /// OCI-5: `page_size` が `MAX_PAGE_SIZE` を超える `ListStateRequest::new` は
+    /// `"INVALID_ARGUMENT"` を返し、`MAX_PAGE_SIZE` ちょうどは受理する（#19 codex レビュー
+    /// P1・PR #1076 対応。無制限アロケーションの防止）。
+    #[test]
+    fn oci5_list_request_rejects_page_size_over_max() {
+        let too_large = NonZeroU32::new(MAX_PAGE_SIZE + 1).expect("nonzero");
+        let err =
+            ListStateRequest::new(too_large).expect_err("oversized page_size must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        let max_allowed = NonZeroU32::new(MAX_PAGE_SIZE).expect("nonzero");
+        assert!(ListStateRequest::new(max_allowed).is_ok());
+    }
+
+    /// OCI-5: `StateListCursor::from_raw` は `MAX_CURSOR_LEN` を超えるトークンを
+    /// `"INVALID_ARGUMENT"` で拒否し、上限ちょうどは受理する（plugin からの untrusted な
+    /// 応答を検証してからアロケーションする契約。security.md・coding-rust.md）。
+    #[test]
+    fn oci5_state_list_cursor_rejects_oversized_token() {
+        let too_long = "x".repeat(MAX_CURSOR_LEN + 1);
+        let err =
+            StateListCursor::from_raw(too_long).expect_err("oversized cursor must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        let max_len = "x".repeat(MAX_CURSOR_LEN);
+        assert!(StateListCursor::from_raw(max_len).is_ok());
     }
 }

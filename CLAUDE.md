@@ -19,6 +19,7 @@ fandhe-container/
 ├── CLAUDE.md                      # Claude 運用方針（本ファイル）
 ├── AGENTS.md                      # AI PR レビュー観点集 / ビルド・回帰確認コマンド（REPAIR-10）
 ├── README.md                      # 概要・実装方針（要点）・開発環境構築
+├── MAINTAINERS.md                 # メンテナンス体制・コアチーム（TASK-100・OSS-6）
 ├── LICENSE                        # Apache License 2.0
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── .editorconfig / .gitattributes # インデント・改行（LF 固定）・文字コード規約
@@ -42,7 +43,10 @@ fandhe-container/
 │   └── plugin-*/                  #   fandhe-container-plugin-cri / -macos / -windows / -microvm / -mcp
 ├── scripts/ / benches/            #（予定）依存禁止判定等 / ベンチ回帰（REPAIR-8）
 ├── docs/
-│   ├── design/                    #（予定）architecture.md（REPAIR-3）・crate-naming.md 等
+│   ├── design/                    # 設計決定・拡張点・リソース効率目標
+│   │   ├── orchestration-scope.md # オーケストレーション スコープ（TASK-5・CRI-8）
+│   │   ├── from-scratch-policy.md # フルスクラッチ方針・依存基準（TASK-7・MS-0）
+│   │   └── resource-efficiency-target.md  # リソース効率目標値（TASK-48・CORE-8）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external（稼働）/ ci・release（発火条件無効化中）
 ├── .agents/skills/                # npx skills add の導入実体

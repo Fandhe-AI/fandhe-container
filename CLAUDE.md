@@ -31,7 +31,7 @@ fandhe-container/
 ├── .markdownlint.jsonc / .yamllint / .editorconfig-checker.json  # lint-docs 設定
 ├── deny.toml                      # cargo-deny 設定（ライセンス・advisories・sources 検査）
 ├── Cargo.toml                     # workspace 定義（members は TASK-1.3 で有効化）
-├── crates/                        #（予定。crate 名前空間は fandhe-container-*）
+├── crates/                        # crate 名前空間は fandhe-container-*（Cargo.toml・src/lib.rs は TASK-1.3 雛形。本体は各 TASK）
 │   ├── io/                        #   I/O 共有層（バッチ write-back・フラッシュバリア・FS 正規化）
 │   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless）
 │   ├── supervisor/                #   コンテナごとの軽量監視プロセス
@@ -42,7 +42,8 @@ fandhe-container/
 │   ├── cli/ / stack/              #   統一 CLI / 複数コンテナ定義（TOML スキーマ・起動順）
 │   ├── compose-convert/           #   compose.yaml → TOML 片方向変換ツール（fandhe-container-compose-convert）
 │   └── plugin-*/                  #   fandhe-container-plugin-cri / -macos / -windows / -microvm / -mcp
-├── scripts/ / benches/            #（予定）依存禁止判定等 / ベンチ回帰（REPAIR-8。benches/ は root の workspace メンバー crate fandhe-container-benches、publish = false）
+├── scripts/                       #（予定）依存禁止判定等
+├── benches/                       # crate をまたぐベンチ回帰（REPAIR-8。root の workspace メンバー crate fandhe-container-benches、publish = false。Cargo.toml・src/lib.rs は TASK-1.3 雛形）
 ├── docs/
 │   ├── design/                    # 設計決定・拡張点・リソース効率目標
 │   │   ├── orchestration-scope.md # オーケストレーション スコープ（TASK-5・CRI-8）

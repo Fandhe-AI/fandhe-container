@@ -1,0 +1,12 @@
+# CRI サーバー plugin バイナリ（fandhe-container-cri の実装を別プロセス化。crate-naming.md の表 #15）。
+# 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G8（TASK-114）で実装する。
+# バイナリ名は `fandhe-container-plugin-cri`（発見対象。PLUG-4・PLUG-11）。本雛形では `[[bin]]`/`main.rs` は未定義。
+# version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
+# 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
+
+[package]
+name = "fandhe-container-plugin-cri"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false

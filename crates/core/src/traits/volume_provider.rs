@@ -296,6 +296,9 @@ impl HostBindPath {
     /// - 絶対パスでない（[`super::container_runtime::CreateRequest::new`] が bundle パスに
     ///   課す制約と同じ理由で、相対パスは plugin プロセスとの作業ディレクトリの違いにより
     ///   解決先が曖昧になる）
+    /// - NUL バイトを含む（[`GuestPath::new`] と同じ理由。実マウント時に OS の path API・
+    ///   FFI 境界へ渡す際、NUL 終端文字列として途中で切り詰められ、検証済みパスと実際に
+    ///   マウントされるパスが食い違う経路になる）
     /// - `..`（親ディレクトリ）要素を 1 つでも含む（`/allowed/../../etc` のような経路で
     ///   許可境界の外へ抜けるパストラバーサルを型のレベルで拒否する。security.md）
     ///
@@ -310,6 +313,15 @@ impl HostBindPath {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 "bind mount host path must be absolute",
+            ));
+        }
+        // NUL (U+0000) は UTF-8 として 1 バイトでそのまま符号化されるため、非 UTF-8 な
+        // OsStr であっても to_string_lossy() の置換対象にならず失われない。unix 専用の
+        // OsStrExt に頼らずクロスプラットフォームに検査できる（coding-rust.md）。
+        if path.to_string_lossy().contains('\0') {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "bind mount host path must not contain a NUL byte",
             ));
         }
         for component in path.components() {
@@ -606,17 +618,31 @@ impl VolumeDetachResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     /// テスト用のスタブ実装。dyn 互換性と各メソッドの戻り値を確認するためのみに使う。
     ///
-    /// `attached` は現在 attach 中の [`VolumeName`] の集合を保持する（[`VolumeSource::Bind`]
-    /// は provider 管理のボリュームではないため対象外。CRI-7 の使用中判定テストが
-    /// 実際に attach 状態を検証できるようにするための最小限の状態）。
+    /// `attachments` は現在 attach 中の接続を `(ContainerId, GuestPath)` → 接続元の
+    /// [`VolumeName`] で保持する（[`VolumeSource::Bind`] は provider 管理のボリュームでは
+    /// ないため対象外）。`detach` は [`VolumeDetachRequest`] が持つ `container_id` +
+    /// `destination` をキーとしてエントリを取り除くことで、`remove` の使用中判定が
+    /// 「detach 後は当該ボリュームを使う接続が無くなる」という契約を正しく反映するように
+    /// する（AGENTS.md「テストとビヘイビア ID の対応」・REPAIR-12）。
     #[derive(Default)]
     struct StubVolumeProvider {
-        attached: Mutex<HashSet<VolumeName>>,
+        attachments: Mutex<HashMap<(ContainerId, GuestPath), VolumeName>>,
+    }
+
+    impl StubVolumeProvider {
+        /// `name` を接続元とする attach が 1 件でも残っているかを判定する。
+        fn is_in_use(&self, name: &VolumeName) -> bool {
+            self.attachments
+                .lock()
+                .expect("attachments mutex must not be poisoned")
+                .values()
+                .any(|attached_name| attached_name == name)
+        }
     }
 
     impl VolumeProvider for StubVolumeProvider {
@@ -625,21 +651,16 @@ mod tests {
         }
 
         fn remove(&self, req: &VolumeRemoveRequest) -> Result<VolumeRemoveResponse, TraitError> {
-            let in_use = self
-                .attached
-                .lock()
-                .expect("attached mutex must not be poisoned")
-                .contains(req.name());
-            if in_use && !req.force() {
+            if self.is_in_use(req.name()) && !req.force() {
                 return Err(TraitError::new(
                     ErrorCode::FailedPrecondition,
                     "volume is still attached",
                 ));
             }
-            self.attached
+            self.attachments
                 .lock()
-                .expect("attached mutex must not be poisoned")
-                .remove(req.name());
+                .expect("attachments mutex must not be poisoned")
+                .retain(|_, attached_name| attached_name != req.name());
             Ok(VolumeRemoveResponse::new())
         }
 
@@ -649,10 +670,13 @@ mod tests {
 
         fn attach(&self, req: &VolumeAttachRequest) -> Result<VolumeAttachment, TraitError> {
             if let VolumeSource::Named(name) = req.source() {
-                self.attached
+                self.attachments
                     .lock()
-                    .expect("attached mutex must not be poisoned")
-                    .insert(name.clone());
+                    .expect("attachments mutex must not be poisoned")
+                    .insert(
+                        (req.container_id().clone(), req.destination().clone()),
+                        name.clone(),
+                    );
             }
             Ok(VolumeAttachment::new(
                 req.container_id().clone(),
@@ -662,11 +686,10 @@ mod tests {
         }
 
         fn detach(&self, req: &VolumeDetachRequest) -> Result<VolumeDetachResponse, TraitError> {
-            // このスタブは VolumeName 単位でしか使用中状態を持たず、
-            // VolumeDetachRequest（container_id + destination）から対象の VolumeName へ
-            // 逆引きする情報を保持しない。そのため detach は `attached` 集合を変更しない
-            // （テストで参照する remove の使用中判定は attach 呼び出しのみで検証する）。
-            let _ = req;
+            self.attachments
+                .lock()
+                .expect("attachments mutex must not be poisoned")
+                .remove(&(req.container_id().clone(), req.destination().clone()));
             Ok(VolumeDetachResponse::new())
         }
     }
@@ -719,9 +742,11 @@ mod tests {
             VolumeDetachResponse::new()
         );
 
+        // detach 済みのため、force を指定しない通常の remove が成功することを確認する
+        // （detach 後に接続が残っていないという契約の回帰検出。REPAIR-12）。
         let removed = shared
-            .remove(&VolumeRemoveRequest::new(name).with_force(true))
-            .expect("force remove succeeds");
+            .remove(&VolumeRemoveRequest::new(name).with_force(false))
+            .expect("remove without force succeeds after detach");
         assert_eq!(removed, VolumeRemoveResponse::new());
     }
 
@@ -861,6 +886,37 @@ mod tests {
 
         let err =
             VolumeSource::bind(traversal).expect_err("VolumeSource::bind must reject the same");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// PLUG-1: `HostBindPath` は絶対パスであっても NUL バイトを含む場合は拒否する。
+    /// 実マウント時に OS の path API・FFI 境界へ渡す際、NUL 終端文字列として途中で
+    /// 切り詰められ、検証済みパスと実際にマウントされるパスが食い違う経路を型のレベルで
+    /// 塞ぐ（security.md「パス要素は検証・正規化してからルート配下であることを確認する」）。
+    #[test]
+    fn cri7_host_bind_path_rejects_nul_byte() {
+        #[cfg(unix)]
+        let with_nul = {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            PathBuf::from(OsString::from_vec(b"/allowed/\0etc".to_vec()))
+        };
+        #[cfg(windows)]
+        let with_nul = {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+            let units: Vec<u16> = r"C:\allowed\".encode_utf16().chain([0]).collect();
+            let mut units = units;
+            units.extend("Windows".encode_utf16());
+            PathBuf::from(OsString::from_wide(&units))
+        };
+
+        let err = HostBindPath::new(with_nul.clone())
+            .expect_err("NUL byte in an absolute path must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        let err =
+            VolumeSource::bind(with_nul).expect_err("VolumeSource::bind must reject the same");
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
     }
 

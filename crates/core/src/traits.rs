@@ -298,9 +298,15 @@ impl ContainerState {
         // 起きる（P0 指摘。PR #1073 レビュー）。`MAX_ANNOTATION_COUNT` 件を
         // 超えた時点でそれ以上イテレータを進めず即座にエラー化することで、
         // `validated` に保持するメモリ量を常に上限以下へ抑える。
+        //
+        // 件数判定には `validated.len()`（ユニークキー数）ではなく、ここで
+        // 別途カウントする「消費した入力要素数」を使う。重複キーは
+        // `BTreeMap::insert` で上書きされ `validated.len()` を増やさないため、
+        // ユニークキー数だけで打ち切ると同一キーを繰り返す無制限イテレータを
+        // 全消費してしまう（P0 指摘。PR #1073 レビュー再指摘）。
         let mut validated = BTreeMap::new();
-        for (key, value) in annotations {
-            if validated.len() >= Self::MAX_ANNOTATION_COUNT {
+        for (consumed, (key, value)) in annotations.into_iter().enumerate() {
+            if consumed >= Self::MAX_ANNOTATION_COUNT {
                 return Err(StateStoreError::InvalidState {
                     reason: format!(
                         "annotations must contain at most {} entries",
@@ -1193,6 +1199,42 @@ mod tests {
         // 上限（`MAX_ANNOTATION_COUNT`）+ 1 件目を検出した時点で打ち切る
         // ため、消費した要素数は上限をわずかに超える程度に留まり、
         // イテレータ全体（上限の 10 倍）を消費しない。
+        assert_eq!(polled.get(), ContainerState::MAX_ANNOTATION_COUNT + 1);
+    }
+
+    /// security.md「長さ・件数を上限検証してからアロケーションに使う」:
+    /// 重複キーのみを繰り返すイテレータは `BTreeMap::insert` で上書きされ
+    /// `validated.len()`（ユニークキー数）を増やさない。ユニークキー数で
+    /// 打ち切り判定すると `MAX_ANNOTATION_COUNT` を超えても検出できず、
+    /// 無制限の入力を全消費してしまう（P0 指摘。PR #1073 レビュー再指摘・
+    /// cursor[bot] Medium 指摘と同一根本原因）。消費した入力要素数で
+    /// 判定することを、実際に消費された要素数で機械照合する（REPAIR-12）。
+    #[test]
+    fn container_state_new_stops_consuming_duplicate_key_annotations_past_limit() {
+        use std::cell::Cell;
+
+        let polled = Cell::new(0usize);
+        // 全要素が同一キーの無制限イテレータ（重複キーによる回避の模擬）。
+        let annotations = (0..ContainerState::MAX_ANNOTATION_COUNT * 10)
+            .map(|_| ("dup".to_string(), "value".to_string()))
+            .inspect(|_| polled.set(polled.get() + 1));
+
+        let err = ContainerState::new(
+            "1.0.2",
+            ContainerId::new("abc123").expect("valid id in test fixture"),
+            ContainerStatus::Created,
+            None,
+            test_bundle_path(),
+            annotations,
+            None,
+            HealthStatus::Unknown,
+            0,
+        )
+        .expect_err("duplicate keys must not bypass the annotation count limit");
+        assert_eq!(err.code(), "INVALID_STATE");
+        // ユニークキー数（常に 1）ではなく消費した入力要素数で打ち切るため、
+        // 上限 + 1 件目を検出した時点で止まり、イテレータ全体
+        // （上限の 10 倍）を消費しない。
         assert_eq!(polled.get(), ContainerState::MAX_ANNOTATION_COUNT + 1);
     }
 

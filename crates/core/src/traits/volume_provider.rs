@@ -775,11 +775,21 @@ mod tests {
         }
 
         fn detach(&self, req: &VolumeDetachRequest) -> Result<VolumeDetachResponse, TraitError> {
-            self.attachments
+            let removed = self
+                .attachments
                 .lock()
                 .expect("attachments mutex must not be poisoned")
                 .remove(&(req.container_id().clone(), req.destination().clone()));
-            Ok(VolumeDetachResponse::new())
+            // レビュー指摘（PR #1077・Codex/Bugbot）の是正: HashMap::remove の戻り値
+            // （取り除いたエントリの有無）を捨てず、対象の attach が存在しない場合は
+            // VolumeProvider::detach のドキュメント契約どおり NotFound を返す。
+            match removed {
+                Some(_) => Ok(VolumeDetachResponse::new()),
+                None => Err(TraitError::new(
+                    ErrorCode::NotFound,
+                    "attachment does not exist",
+                )),
+            }
         }
     }
 
@@ -1070,6 +1080,22 @@ mod tests {
     pub(crate) mod contract {
         use super::*;
 
+        /// CRI-7: 同名のボリュームに対する 2 回目の `create` は
+        /// [`ErrorCode::AlreadyExists`] を返す（[`VolumeProvider::create`] のドキュメント
+        /// 契約）。既存 doc 条件のうち契約テストが無かった項目を埋める対象
+        /// （レビュー指摘 PR #1077 で発覚した検証漏れの是正）。
+        pub(crate) fn create_duplicate_returns_already_exists(provider: &dyn VolumeProvider) {
+            let name = sample_volume_name();
+            provider
+                .create(&VolumeCreateRequest::new(name.clone()))
+                .expect("first create succeeds");
+
+            let err = provider
+                .create(&VolumeCreateRequest::new(name))
+                .expect_err("second create of the same name must fail");
+            assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
+        }
+
         /// CRI-7: attach 中のボリュームに対する `remove`（force なし）は
         /// `FAILED_PRECONDITION` を返す。attach 状態を保持しない実装では常に失敗して
         /// しまい、未使用ボリュームでも成立してしまう（使用中判定を実質検証できて
@@ -1215,6 +1241,61 @@ mod tests {
                 .expect_err("second attach to the same destination must fail");
             assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
         }
+
+        /// CRI-7: 対応する attach が存在しない `detach` は [`ErrorCode::NotFound`] を返す
+        /// （[`VolumeProvider::detach`] のドキュメント契約）。レビュー指摘（PR #1077・
+        /// Codex/Bugbot）の是正: 状態を持たないスタブは `HashMap::remove` の戻り値を捨てて
+        /// 常に成功していたため、この失敗条件を検証できていなかった。
+        pub(crate) fn detach_missing_attachment_returns_not_found(provider: &dyn VolumeProvider) {
+            let destination = GuestPath::new("/data").expect("valid guest path");
+            let err = provider
+                .detach(&VolumeDetachRequest::new(
+                    sample_container_id(),
+                    destination,
+                ))
+                .expect_err("detach without a matching attach must fail");
+            assert_eq!(err.code().as_str(), "NOT_FOUND");
+        }
+
+        /// CRI-7: 1 回目の `detach` が成功した後、同じ接続先への 2 回目の `detach` は
+        /// [`ErrorCode::NotFound`] を返す（[`VolumeProvider::detach`] のドキュメント契約。
+        /// detach 済みの接続はもう「対象の attach」ではないという状態遷移を確認する）。
+        pub(crate) fn detach_twice_returns_not_found_on_second_call(provider: &dyn VolumeProvider) {
+            let name = sample_volume_name();
+            provider
+                .create(&VolumeCreateRequest::new(name.clone()))
+                .expect("create succeeds");
+            let destination = GuestPath::new("/data").expect("valid guest path");
+            provider
+                .attach(&VolumeAttachRequest::new(
+                    sample_container_id(),
+                    VolumeSource::named(name),
+                    destination.clone(),
+                    AccessMode::ReadWrite,
+                ))
+                .expect("attach succeeds");
+            provider
+                .detach(&VolumeDetachRequest::new(
+                    sample_container_id(),
+                    destination.clone(),
+                ))
+                .expect("first detach succeeds");
+
+            let err = provider
+                .detach(&VolumeDetachRequest::new(
+                    sample_container_id(),
+                    destination,
+                ))
+                .expect_err("second detach of the same destination must fail");
+            assert_eq!(err.code().as_str(), "NOT_FOUND");
+        }
+    }
+
+    /// CRI-7: [`contract::create_duplicate_returns_already_exists`] を
+    /// `StubVolumeProvider` に対して機械照合する。
+    #[test]
+    fn cri7_volume_create_duplicate_returns_already_exists() {
+        contract::create_duplicate_returns_already_exists(&StubVolumeProvider::default());
     }
 
     /// CRI-7: [`contract::remove_in_use_returns_failed_precondition`] を
@@ -1266,6 +1347,20 @@ mod tests {
         contract::attach_duplicate_destination_returns_already_exists(
             &StubVolumeProvider::default(),
         );
+    }
+
+    /// CRI-7: [`contract::detach_missing_attachment_returns_not_found`] を
+    /// `StubVolumeProvider` に対して機械照合する。
+    #[test]
+    fn cri7_volume_detach_missing_attachment_returns_not_found() {
+        contract::detach_missing_attachment_returns_not_found(&StubVolumeProvider::default());
+    }
+
+    /// CRI-7: [`contract::detach_twice_returns_not_found_on_second_call`] を
+    /// `StubVolumeProvider` に対して機械照合する。
+    #[test]
+    fn cri7_volume_detach_twice_returns_not_found_on_second_call() {
+        contract::detach_twice_returns_not_found_on_second_call(&StubVolumeProvider::default());
     }
 
     /// CRI-7: `VolumeName` の `TryFrom<&str>`/`TryFrom<String>` は `new` と同じ検証結果を返す。

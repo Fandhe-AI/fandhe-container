@@ -26,7 +26,7 @@ commit-msg フック（lefthook の正規表現検査）と `make lint-commits`�
 
 ## scope
 
-crate の scope は短縮名（`crates/<短縮名>`）に合わせる。短縮名は TASK-1（REPAIR-1）で確定するため、確定後に本表を更新する。
+crate の scope は短縮名（`crates/<短縮名>`）に合わせる。短縮名は [crate-naming.md](../../docs/design/crate-naming.md)（TASK-1・REPAIR-1）で確定済み。
 
 | scope | 対象 |
 | ----- | ---- |
@@ -35,14 +35,14 @@ crate の scope は短縮名（`crates/<短縮名>`）に合わせる。短縮�
 | supervisor | `crates/supervisor`（コンテナごとの監視プロセス） |
 | oci | `crates/oci` |
 | cri | `crates/cri`・`fandhe-container-plugin-cri` |
-| platform | `crates/platform-*`・`fandhe-container-plugin-macos` / `-windows` |
+| platform | `crates/platform-*`・`fandhe-container-plugin-macos` / `-windows`（複数 crate をまとめる scope） |
 | microvm | `crates/microvm`・`fandhe-container-plugin-microvm` |
 | gpu | `crates/gpu` |
 | net | `crates/net` |
-| plugin | `crates/plugin-api`（plugin 境界機構） |
+| plugin | `crates/plugin`（plugin 境界機構） |
 | mcp | `fandhe-container-plugin-mcp` |
 | cli | `crates/cli` |
-| stack | `crates/stack`（TOML / compose 変換） |
+| stack | `crates/stack`（TOML スキーマ）・`crates/compose-convert`（compose 変換。複数 crate をまとめる scope） |
 | deps | 依存の追加・更新（`Cargo.toml`・`Cargo.lock`） |
 | spec | `docs/spec` submodule 参照の更新 |
 | claude | `CLAUDE.md`・`.claude/`（agents・rules・settings・workflows） |

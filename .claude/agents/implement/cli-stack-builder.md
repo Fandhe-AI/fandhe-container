@@ -1,6 +1,6 @@
 ---
 name: cli-stack-builder
-description: "CLI・複数コンテナ定義 crate（crates/cli・crates/stack。統一 CLI・独自 TOML 定義・compose.yaml 変換器・構造化エラー形式）の実装・編集を担当"
+description: "CLI・複数コンテナ定義 crate（crates/cli・crates/stack・crates/compose-convert。統一 CLI・独自 TOML 定義・compose.yaml 変換器・構造化エラー形式）の実装・編集を担当"
 model: sonnet
 tools: [Read, Edit, Write, Glob, Grep, Bash]
 ---
@@ -12,7 +12,8 @@ tools: [Read, Edit, Write, Glob, Grep, Bash]
 ## 担当範囲
 
 - `crates/cli`（CLI 系ビヘイビア。G6）: 3 OS 同一の構文・挙動（CLI-1）・OS 固有設定はセットアップ時のみ（CLI-2）・構造化エラー出力（ERR-1・ERR-4）
-- `crates/stack`（STACK 系ビヘイビア。G11）: 独自 TOML を正本とする複数コンテナ定義・`depends_on` 起動順制御・`compose.yaml` 変換器・GPU 予約変換・`profiles`
+- `crates/stack`（STACK 系ビヘイビア。G11）: 独自 TOML を正本とする複数コンテナ定義スキーマ・`depends_on` 起動順制御・`profiles`
+- `crates/compose-convert`（STACK 系ビヘイビア。G11）: `compose.yaml` → TOML の片方向変換ツール（変換レポート・キー分類・`--downgrade` 格下げ・GPU 予約変換）。TOML の型は `crates/stack` のものを使う（`compose-convert` → `stack` の一方向依存）。YAML パーサーの依存は `crates/cli` に持ち込まない
 
 ## 固有の遵守事項
 

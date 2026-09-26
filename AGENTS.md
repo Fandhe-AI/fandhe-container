@@ -88,8 +88,8 @@ make deny   # cargo deny --locked check advisories bans licenses sources
 
 | 観点 | 確認内容 | 優先度 |
 | ---- | ---- | ---- |
-| crate 構成 | 変更が `crates/<短縮名>`（名前空間 `fandhe-container-*`）の想定責務（`io`: I/O 共有層／`core`・`supervisor`: 実行層・監視プロセス／`oci`・`cri`: イメージ・ライフサイクル・CRI／`platform-macos`・`platform-windows`・`microvm`: プラットフォーム層／`gpu`・`net`: GPU パススルー・network／`plugin-api`: plugin 境界機構／`cli`・`stack`: 統一 CLI・複数コンテナ定義／`plugin-*`: plugin crate 群。詳細は `CLAUDE.md` の Repository Structure）に収まっているか。短縮名は TASK-1（REPAIR-1）で確定する仮称であり、確定後に本表を更新する | P1 |
-| 依存方向 | crate 間の一方向依存が保たれ循環がないか。複数 crate が共有する型が下位 crate に置かれているか。crate 間の許可依存表は spec 未定義のため、TASK-1（REPAIR-1）で crate 構成が確定したら本書へ追記する | P0 |
+| crate 構成 | 変更が `crates/<短縮名>`（名前空間 `fandhe-container-*`）の想定責務（`io`: I/O 共有層／`core`・`supervisor`: 実行層・監視プロセス／`oci`・`cri`: イメージ・ライフサイクル・CRI／`platform-macos`・`platform-windows`・`microvm`: プラットフォーム層／`gpu`・`net`: GPU パススルー・network／`plugin`: plugin 境界機構（`fandhe-container-plugin`）／`cli`・`stack`: 統一 CLI・複数コンテナ定義スキーマ／`compose-convert`: compose.yaml 変換ツール／`plugin-*`: plugin crate 群。詳細は `docs/design/crate-naming.md`・`CLAUDE.md` の Repository Structure）に収まっているか。短縮名は `docs/design/crate-naming.md`（TASK-1・REPAIR-1）で確定済み | P1 |
+| 依存方向 | crate 間の一方向依存が保たれ循環がないか。複数 crate が共有する型が下位 crate に置かれているか。crate 構成は確定済み（`docs/design/crate-naming.md`。TASK-1・REPAIR-1）で、決まっている一方向依存は `compose-convert` → `stack`・`supervisor` → `core`・`plugin-*` → `plugin`。全体の許可依存表は未整備で、後続のタスク（`docs/architecture.md`。TASK-6）で追記する | P0 |
 | core / plugin 境界 | `ContainerRuntime`・`NetworkPlugin` の実装が plugin 側、`VolumeProvider`（データパス）がトレイト定義・実装とも core 側に置かれているか（PLUG-1）。`StateStore` はトレイト定義とファイルベースの既定実装が core 側にあり、別実装を plugin として差し替えられるか（TASK-31・OCI-5。常駐デーモンを持たない CORE-1 と整合）。plugin の追加で core（ソース・バイナリ）を変更していないか（PLUG-4） | P0 |
 | 常駐デーモン前提の排除 | 中央の常駐デーモンを前提にした設計になっていないか（監視はコンテナごとの supervisor に限る。CORE-1・D-19） | P0 |
 | 3 OS 対応 | パスを `PathBuf` / `Path::join` で組み立てているか（文字列連結・区切り文字のハードコードがないか）。大文字小文字非区別・長パス（260 文字超）・Unicode 正規化の差を考慮しているか（IO-5）。内部データファイルの改行が LF 固定か。OS 固有処理が `cfg(target_os = ...)` で局所化されているか（CLI-1） | P1 |
@@ -110,7 +110,7 @@ make deny   # cargo deny --locked check advisories bans licenses sources
 | 観点 | 確認内容 | 優先度 |
 | ---- | ---- | ---- |
 | 単一責務・疎結合 | 1 回の改修が波及する crate・モジュールが最小に保たれているか（REPAIR-1） | P1 |
-| ワイヤー型 | I/O 共有プロトコル（`crates/io`）・plugin 境界の長さ接頭辞フレーム（`crates/plugin-api`。PLUG-2）等のプロトコルフレーム（ID・長さ・データ）を生の `Vec<u8>` の手組みで扱わず、「壊れた値を表現できない」型（固定長ヘッダの newtype・チェックサム等）で組み立てているか（REPAIR-2） | P1 |
+| ワイヤー型 | I/O 共有プロトコル（`crates/io`）・plugin 境界の長さ接頭辞フレーム（`crates/plugin`。PLUG-2）等のプロトコルフレーム（ID・長さ・データ）を生の `Vec<u8>` の手組みで扱わず、「壊れた値を表現できない」型（固定長ヘッダの newtype・チェックサム等）で組み立てているか（REPAIR-2） | P1 |
 | 構造化された戻り値 | 公開 API の戻り値が将来拡張できる構造を持つ型か（真偽値・フラットな文字列で済ませていないか） | P1 |
 | スタブの明示 | 未実装・簡易実装箇所が「実装済みを装って」いないか。ドキュメントコメントに将来仕様と対応するビヘイビア ID が明記されているか（REPAIR-3） | P0 |
 | 可観測性 | read/write/create/start 等の操作の成功 / 失敗カウント・レイテンシ分布が構造化ログ / メトリクスとして出力されているか（REPAIR-4） | P1 |

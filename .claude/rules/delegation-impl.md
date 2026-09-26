@@ -6,7 +6,7 @@
 
 ## パスベース委譲マッピング（実装）
 
-crate の短縮名は spec の仮称（`05-tasks.md` 冒頭）。TASK-1（REPAIR-1）で確定したら本表を実名へ更新する。
+crate の短縮名は [crate-naming.md](../../docs/design/crate-naming.md)（TASK-1・REPAIR-1）で確定済み。
 
 | 対象パス | 委譲先 Agent | model |
 | -------- | ------------ | ----- |
@@ -16,8 +16,8 @@ crate の短縮名は spec の仮称（`05-tasks.md` 冒頭）。TASK-1（REPAIR
 | `crates/platform-macos/`・`crates/platform-windows/`・`crates/microvm/`・`fandhe-container-plugin-macos` / `-windows` / `-microvm` | platform-builder | sonnet |
 | `crates/gpu/`（CDI・`/dev/dxg`・Venus） | gpu-builder | sonnet |
 | `crates/net/`（netlink・nftables・bridge/veth/netns・DNS） | net-builder | sonnet |
-| `crates/plugin-api/`・`fandhe-container-plugin-mcp`（plugin 境界機構・MCP サーバー） | plugin-builder | sonnet |
-| `crates/cli/`・`crates/stack/`（統一 CLI・TOML / compose 変換） | cli-stack-builder | sonnet |
+| `crates/plugin/`・`fandhe-container-plugin-mcp`（plugin 境界機構・MCP サーバー） | plugin-builder | sonnet |
+| `crates/cli/`・`crates/stack/`・`crates/compose-convert/`（統一 CLI・TOML スキーマ・compose 変換） | cli-stack-builder | sonnet |
 | ルート `Cargo.toml`・`.github/workflows/`・`deny.toml`・`Makefile`・`lefthook.yml`・`Dockerfile`・`compose.yaml`・`scripts/`・`benches/` | infra-builder | sonnet |
 | テスト実行・失敗解析（`make test` / `make lint`） | test-runner | sonnet |
 | コードレビュー | reviewer | sonnet |

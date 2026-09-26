@@ -12,7 +12,7 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 
 ## Repository Structure
 
-「（予定）」は spec のタスク定義に基づく計画上の配置で、まだ存在しない。crate の短縮名は spec の仮称で、TASK-1（REPAIR-1）で確定する。
+「（予定）」は spec のタスク定義に基づく計画上の配置で、まだ存在しない。crate の短縮名は [crate-naming.md](docs/design/crate-naming.md)（TASK-1・REPAIR-1）で確定済み。
 
 ```text
 fandhe-container/
@@ -38,10 +38,11 @@ fandhe-container/
 │   ├── oci/ / cri/                #   OCI イメージ・ライフサイクル / CRI
 │   ├── platform-macos/ / platform-windows/ / microvm/  # プラットフォーム層
 │   ├── gpu/ / net/                #   GPU パススルー（CDI）/ network
-│   ├── plugin-api/                #   plugin 境界機構（UDS＋長さ接頭辞フレーム）
-│   ├── cli/ / stack/              #   統一 CLI / 複数コンテナ定義（TOML・compose 変換）
+│   ├── plugin/                    #   plugin 境界機構（UDS＋長さ接頭辞フレーム。fandhe-container-plugin）
+│   ├── cli/ / stack/              #   統一 CLI / 複数コンテナ定義（TOML スキーマ・起動順）
+│   ├── compose-convert/           #   compose.yaml → TOML 片方向変換ツール（fandhe-container-compose-convert）
 │   └── plugin-*/                  #   fandhe-container-plugin-cri / -macos / -windows / -microvm / -mcp
-├── scripts/ / benches/            #（予定）依存禁止判定等 / ベンチ回帰（REPAIR-8）
+├── scripts/ / benches/            #（予定）依存禁止判定等 / ベンチ回帰（REPAIR-8。benches/ は root の workspace メンバー crate fandhe-container-benches、publish = false）
 ├── docs/
 │   ├── design/                    # 設計決定・拡張点・リソース効率目標
 │   │   ├── orchestration-scope.md # オーケストレーション スコープ（TASK-5・CRI-8）
@@ -49,7 +50,7 @@ fandhe-container/
 │   │   ├── resource-efficiency-target.md  # リソース効率目標値（TASK-48・CORE-8）
 │   │   ├── declarative-config.md  # 宣言的起動設定の方針メモ（TASK-82・CLI-4）
 │   │   ├── small-model-repair-policy.md  # 小型モデル自己補修方針（TASK-92・REPAIR-11/13/14）
-│   │   └── crate-naming.md        # crate 短縮名・plugin crate 配置のドラフト（TASK-1・REPAIR-1）
+│   │   └── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external（稼働）/ ci・release（発火条件無効化中）
 ├── .agents/skills/                # npx skills add の導入実体
@@ -75,8 +76,8 @@ main セッションはオーケストレーションに徹し、調査・実装
 | `crates/platform-*/`・`crates/microvm/`・`plugin-macos` / `-windows` / `-microvm` | explorer | platform-builder |
 | `crates/gpu/` | explorer | gpu-builder |
 | `crates/net/` | explorer | net-builder |
-| `crates/plugin-api/`・`plugin-mcp` | explorer | plugin-builder |
-| `crates/cli/`・`crates/stack/` | explorer | cli-stack-builder |
+| `crates/plugin/`・`plugin-mcp` | explorer | plugin-builder |
+| `crates/cli/`・`crates/stack/`・`crates/compose-convert/` | explorer | cli-stack-builder |
 | `Cargo.toml`・CI・`deny.toml`・`Makefile`・`lefthook.yml`・`Dockerfile`・`scripts/`・`benches/` | explorer | infra-builder |
 | `docs/spec/`（private） | explorer | 変更しない（spec リポ側で管理） |
 | 外部仕様（OCI / CRI・Linux カーネル API・Virtualization.framework・WSL2・KVM・CDI・MCP） | reference-researcher | — |
@@ -103,8 +104,8 @@ main セッションはオーケストレーションに徹し、調査・実装
 | implement | platform-builder | sonnet | macOS / Windows / microVM の platform・plugin crate |
 | implement | gpu-builder | sonnet | gpu crate（CDI・`/dev/dxg`・Venus） |
 | implement | net-builder | sonnet | net crate（netlink・nftables・bridge/veth/netns・DNS） |
-| implement | plugin-builder | sonnet | plugin-api crate・plugin-mcp（境界機構・信頼性検証・MCP） |
-| implement | cli-stack-builder | sonnet | cli・stack crate（統一 CLI・TOML / compose 変換） |
+| implement | plugin-builder | sonnet | plugin crate・plugin-mcp（境界機構・信頼性検証・MCP） |
+| implement | cli-stack-builder | sonnet | cli・stack・compose-convert crate（統一 CLI・TOML スキーマ・compose 変換） |
 | implement | infra-builder | sonnet | workspace・3 OS CI・5 段階ゲート・deny・Makefile・Dockerfile・scripts・benches |
 | testing | test-runner | sonnet | cargo test / clippy 実行と失敗解析（実機前提テストの区別を含む） |
 | quality | reviewer | sonnet | 設計原則・AI 自己補修性・フルスクラッチ方針・規約準拠のレビュー |

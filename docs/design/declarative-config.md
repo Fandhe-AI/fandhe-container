@@ -38,7 +38,7 @@
 | TASK-156 | GPU 予約から CDI への変換 |
 | TASK-187〜188 | `profiles`（STACK-10。2026-09-24 追加） |
 
-crate 配置は `crates/stack/`（仮称。短縮名は TASK-1・REPAIR-1 で確定）を想定する。
+crate 配置は、TOML スキーマ・起動順・プロジェクト単位 CLI を `crates/stack/`、`compose.yaml` 変換器を独立した crate・バイナリの `crates/compose-convert/`（`fandhe-container-compose-convert`。compose-convert → stack の一方向依存）とする（#9・TASK-1.h1 で確定。詳細は `crate-naming.md`）。
 
 ## 未決事項
 

@@ -956,49 +956,111 @@ mod tests {
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
     }
 
-    /// CRI-7: attach 中のボリュームに対する `remove`（force なし）は
-    /// `FAILED_PRECONDITION` を返す。attach 状態を保持しないスタブでは常に失敗して
-    /// しまい、未使用ボリュームでも成立してしまっていた（使用中判定を実質検証できて
-    /// いなかった）ため、実際に `attach` を呼んで使用中状態を作ってから確認する
-    /// （REPAIR-12: 挙動とテストの対応を機械照合する）。
-    #[test]
-    fn cri7_volume_remove_in_use_returns_failed_precondition() {
-        let provider = StubVolumeProvider::default();
-        let name = sample_volume_name();
-        provider
-            .create(&VolumeCreateRequest::new(name.clone()))
-            .expect("create succeeds");
-        let destination = GuestPath::new("/data").expect("valid guest path");
-        provider
-            .attach(&VolumeAttachRequest::new(
-                sample_container_id(),
-                VolumeSource::named(name.clone()),
-                destination,
-                AccessMode::ReadWrite,
-            ))
-            .expect("attach succeeds");
+    /// 実装非依存の契約テスト（REPAIR-12: 挙動とテストの対応を機械照合する）。
+    ///
+    /// ここに置く関数は `&dyn VolumeProvider` を受け取り、実装の型を問わず同じ契約
+    /// （create/attach/detach/remove の状態遷移）を検証する。レビュー指摘（PR #1077）:
+    /// 従来はスタブ自身の実装を呼ぶだけのテストしか無く、将来の core 側実装が契約に
+    /// 違反しても検出できなかった。現時点で本契約テストを通る実装は
+    /// [`super::StubVolumeProvider`] のみだが、関数を `&dyn VolumeProvider` 引数の形で
+    /// 独立させたことで、将来の core 側実装（本 crate に実装を置く方針は module doc の
+    /// 「core 側に実装を置く理由」を参照）が追加された際は同じ関数をそのまま呼んで契約を
+    /// 機械照合できる（REPAIR-3: 実装済みを装わない。契約の対象拡大自体は将来の実装 PR で
+    /// 行う）。
+    pub(crate) mod contract {
+        use super::*;
 
-        let err = provider
-            .remove(&VolumeRemoveRequest::new(name))
-            .expect_err("must fail without force while attached");
-        assert_eq!(err.code().as_str(), "FAILED_PRECONDITION");
+        /// CRI-7: attach 中のボリュームに対する `remove`（force なし）は
+        /// `FAILED_PRECONDITION` を返す。attach 状態を保持しない実装では常に失敗して
+        /// しまい、未使用ボリュームでも成立してしまう（使用中判定を実質検証できて
+        /// いない）ため、実際に `attach` を呼んで使用中状態を作ってから確認する。
+        pub(crate) fn remove_in_use_returns_failed_precondition(provider: &dyn VolumeProvider) {
+            let name = sample_volume_name();
+            provider
+                .create(&VolumeCreateRequest::new(name.clone()))
+                .expect("create succeeds");
+            let destination = GuestPath::new("/data").expect("valid guest path");
+            provider
+                .attach(&VolumeAttachRequest::new(
+                    sample_container_id(),
+                    VolumeSource::named(name.clone()),
+                    destination,
+                    AccessMode::ReadWrite,
+                ))
+                .expect("attach succeeds");
+
+            let err = provider
+                .remove(&VolumeRemoveRequest::new(name))
+                .expect_err("must fail without force while attached");
+            assert_eq!(err.code().as_str(), "FAILED_PRECONDITION");
+        }
+
+        /// CRI-7: attach されていない（未使用の）ボリュームに対する `remove`（force なし）
+        /// は成功する。上記の使用中判定が「常に失敗する」実装でも通ってしまわないことの
+        /// 対照ケース。
+        pub(crate) fn remove_unused_succeeds_without_force(provider: &dyn VolumeProvider) {
+            let name = sample_volume_name();
+            provider
+                .create(&VolumeCreateRequest::new(name.clone()))
+                .expect("create succeeds");
+
+            let removed = provider
+                .remove(&VolumeRemoveRequest::new(name))
+                .expect("unused volume removal succeeds without force");
+            assert_eq!(removed, VolumeRemoveResponse::new());
+        }
+
+        /// CRI-7: attach → detach 済みのボリュームに対する `remove`（force なし）は
+        /// 成功する。「detach 後は当該ボリュームを使う接続が無くなる」という契約
+        /// （[`super::super::VolumeProvider::detach`] のドキュメントを参照）を、
+        /// 使用中判定と組み合わせて確認する対象。
+        pub(crate) fn remove_after_detach_succeeds_without_force(provider: &dyn VolumeProvider) {
+            let name = sample_volume_name();
+            provider
+                .create(&VolumeCreateRequest::new(name.clone()))
+                .expect("create succeeds");
+            let destination = GuestPath::new("/data").expect("valid guest path");
+            provider
+                .attach(&VolumeAttachRequest::new(
+                    sample_container_id(),
+                    VolumeSource::named(name.clone()),
+                    destination.clone(),
+                    AccessMode::ReadWrite,
+                ))
+                .expect("attach succeeds");
+            provider
+                .detach(&VolumeDetachRequest::new(
+                    sample_container_id(),
+                    destination,
+                ))
+                .expect("detach succeeds");
+
+            let removed = provider
+                .remove(&VolumeRemoveRequest::new(name).with_force(false))
+                .expect("remove without force succeeds after detach");
+            assert_eq!(removed, VolumeRemoveResponse::new());
+        }
     }
 
-    /// CRI-7: attach されていない（未使用の）ボリュームに対する `remove`（force なし）は
-    /// 成功する。上記の使用中判定テストが「常に失敗する」実装でも通ってしまわないことの
-    /// 対照ケース。
+    /// CRI-7: [`contract::remove_in_use_returns_failed_precondition`] を
+    /// `StubVolumeProvider` に対して機械照合する。
+    #[test]
+    fn cri7_volume_remove_in_use_returns_failed_precondition() {
+        contract::remove_in_use_returns_failed_precondition(&StubVolumeProvider::default());
+    }
+
+    /// CRI-7: [`contract::remove_unused_succeeds_without_force`] を
+    /// `StubVolumeProvider` に対して機械照合する。
     #[test]
     fn cri7_volume_remove_unused_succeeds_without_force() {
-        let provider = StubVolumeProvider::default();
-        let name = sample_volume_name();
-        provider
-            .create(&VolumeCreateRequest::new(name.clone()))
-            .expect("create succeeds");
+        contract::remove_unused_succeeds_without_force(&StubVolumeProvider::default());
+    }
 
-        let removed = provider
-            .remove(&VolumeRemoveRequest::new(name))
-            .expect("unused volume removal succeeds without force");
-        assert_eq!(removed, VolumeRemoveResponse::new());
+    /// CRI-7: [`contract::remove_after_detach_succeeds_without_force`] を
+    /// `StubVolumeProvider` に対して機械照合する。
+    #[test]
+    fn cri7_volume_remove_after_detach_succeeds_without_force() {
+        contract::remove_after_detach_succeeds_without_force(&StubVolumeProvider::default());
     }
 
     /// CRI-7: `VolumeName` の `TryFrom<&str>`/`TryFrom<String>` は `new` と同じ検証結果を返す。

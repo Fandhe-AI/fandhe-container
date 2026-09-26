@@ -309,11 +309,15 @@ impl ContainerState {
 /// コンテナの状態照会結果。真偽値やフラットな文字列ではなく、将来の拡張
 /// （リソース使用量等）に備えて構造化された型にする（coding-rust.md）。
 ///
-/// `pid` は [`ContainerState::Running`]、`exit_code` は [`ContainerState::Stopped`]
-/// のときにのみ意味を持つ。以前は状態と無関係に `with_pid` / `with_exit_code` を
-/// 呼べるビルダだったため、`Created` に終了コードを付与する等の矛盾した値を
-/// 公開 API から作れてしまっていた（codex レビュー指摘・PR #1074）。状態ごとに
-/// 対応するコンストラクタ（[`Self::creating`]・[`Self::created`]・[`Self::running`]・
+/// `pid` は [`ContainerState::Created`]・[`ContainerState::Running`] のときに
+/// 意味を持ち（OCI の `created` コンテナは runtime create 完了時点で init
+/// プロセスを既に fork 済みのため、CRI / shim アダプタがその PID を state から
+/// 参照できる必要がある。Bugbot 指摘・PR #1074 discussion_r4112017709）、
+/// `exit_code` は [`ContainerState::Stopped`] のときにのみ意味を持つ。以前は
+/// 状態と無関係に `with_pid` / `with_exit_code` を呼べるビルダだったため、
+/// `Created` に終了コードを付与する等の矛盾した値を公開 API から作れて
+/// しまっていた（codex レビュー指摘・PR #1074）。状態ごとに対応する
+/// コンストラクタ（[`Self::creating`]・[`Self::created`]・[`Self::running`]・
 /// [`Self::stopped`]）に限定し、組み合わせを型で制限する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -346,9 +350,11 @@ impl ContainerStatus {
         Self::build(id, ContainerState::Creating, None, None)
     }
 
-    /// 作成済みでまだ未開始の状態を作る（`pid`・`exit_code` は持たない）。
-    pub fn created(id: ContainerId) -> Self {
-        Self::build(id, ContainerState::Created, None, None)
+    /// 作成済みでまだ未開始の状態を作る。`pid` は init プロセスの PID が
+    /// 判明していれば渡す（OCI の `created` コンテナは既に init プロセスを
+    /// 持つため）。`exit_code` は持たない。
+    pub fn created(id: ContainerId, pid: Option<NonZeroU32>) -> Self {
+        Self::build(id, ContainerState::Created, pid, None)
     }
 
     /// 実行中の状態を作る。`pid` は判明していれば渡す（`exit_code` は持たない）。
@@ -371,7 +377,8 @@ impl ContainerStatus {
         self.state
     }
 
-    /// 実行中プロセスの PID（未設定なら `None`）を返す。
+    /// init プロセスの PID（`Created` または `Running` で判明していれば返す。
+    /// それ以外の状態、または未設定なら `None`）を返す。
     pub fn pid(&self) -> Option<NonZeroU32> {
         self.pid
     }
@@ -405,7 +412,7 @@ mod tests {
 
     impl ContainerRuntime for StubRuntime {
         fn create(&self, req: &CreateRequest) -> Result<ContainerStatus, TraitError> {
-            Ok(ContainerStatus::created(req.id().clone()))
+            Ok(ContainerStatus::created(req.id().clone(), None))
         }
 
         fn start(&self, req: &StartRequest) -> Result<ContainerStatus, TraitError> {
@@ -546,8 +553,8 @@ mod tests {
     }
 
     /// codex レビュー指摘（PR #1074）: `ContainerStatus` は状態ごとのコンストラクタに
-    /// 限定されており、`Created`/`Creating` に `pid`・`exit_code` が付かず、
-    /// `Running` に `exit_code` が、`Stopped` に `pid` が付かないことを固定する。
+    /// 限定されており、`Creating` に `pid`・`exit_code` が付かず、`Running`/`Stopped`
+    /// に `exit_code`/`pid` が付かないことを固定する。
     #[test]
     fn cri7_container_status_constructors_restrict_field_combinations() {
         let creating = ContainerStatus::creating(sample_id());
@@ -555,7 +562,7 @@ mod tests {
         assert_eq!(creating.pid(), None);
         assert_eq!(creating.exit_code(), None);
 
-        let created = ContainerStatus::created(sample_id());
+        let created = ContainerStatus::created(sample_id(), None);
         assert_eq!(created.state(), ContainerState::Created);
         assert_eq!(created.pid(), None);
         assert_eq!(created.exit_code(), None);
@@ -570,5 +577,18 @@ mod tests {
         assert_eq!(stopped.state(), ContainerState::Stopped);
         assert_eq!(stopped.pid(), None);
         assert_eq!(stopped.exit_code(), Some(1));
+    }
+
+    /// Bugbot 指摘（PR #1074 discussion_r4112017709）: OCI の `created` コンテナは
+    /// runtime create 完了時点で init プロセスを既に fork 済みのため、
+    /// `ContainerStatus::created` はその PID を保持でき、`state()` 経由で
+    /// CRI / shim アダプタへ渡せることを固定する。
+    #[test]
+    fn cri7_container_status_created_can_carry_pid() {
+        let pid = NonZeroU32::new(11).expect("11 is nonzero");
+        let created = ContainerStatus::created(sample_id(), Some(pid));
+        assert_eq!(created.state(), ContainerState::Created);
+        assert_eq!(created.pid(), Some(pid));
+        assert_eq!(created.exit_code(), None);
     }
 }

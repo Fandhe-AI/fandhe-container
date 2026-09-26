@@ -286,7 +286,10 @@ impl TryFrom<String> for GuestPath {
 /// （[`HostBindPath::new`] のドキュメントを参照）。symlink はファイルシステムの実体を見ない
 /// 限り検知できないため、ここでは解決しない。実マウント時に symlink を解決したうえで許可
 /// 境界（ホストの許可ディレクトリ配下であること）を確認するのは、`VolumeProvider` 実装側の
-/// 責務であり、本トレイトが保証する契約には含まれない。
+/// 責務であり、本トレイトが保証する契約には含まれない。Windows の `\\?\` verbatim 形式は
+/// 受理しない（[`HostBindPath::new`] のドキュメントを参照）。260 文字超の長パス対応
+/// （IO-5）に verbatim 形式が必要になった場合は、実装側で非 verbatim な入力を内部変換する
+/// 形で対応する（本トレイトの検証範囲を広げない）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HostBindPath(PathBuf);
 
@@ -302,13 +305,17 @@ impl HostBindPath {
     ///   マウントされるパスが食い違う経路になる）
     /// - `..`（親ディレクトリ）要素を 1 つでも含む（`/allowed/../../etc` のような経路で
     ///   許可境界の外へ抜けるパストラバーサルを型のレベルで拒否する。security.md）
+    /// - Windows の `\\?\` verbatim プレフィックスを含む（レビュー指摘の是正: verbatim
+    ///   プレフィックスがあると `PathBuf::push`/`components()` の正規化規則が変わり、
+    ///   `.`・`..` セグメントがパストラバーサル判定を経ずに文字どおり残ってしまう。
+    ///   `components()` を使った以降の正規化・トラバーサル検証を、入力と保存値が一致する
+    ///   前提のまま安全に行うため、verbatim 形式はここで拒否する）
     ///
     /// 非先頭の `.` セグメント・重複区切り文字・末尾区切り文字は [`GuestPath`] と同様に
     /// 読み飛ばして正規化し、保持する内部値・[`HostBindPath::as_path`] の戻り値の両方に
-    /// 反映する（`Path::components()` が持つ正規化規則に従う。Windows の `\\?\` verbatim
-    /// 形式は `components()` の正規化規則が異なるため対象外とし、そのまま保持する）。
-    /// symlink の解決はここでは行わない（型ドキュメントの「検証範囲」を参照。実マウント時に
-    /// provider 側で解決・境界確認する）。
+    /// 反映する（`Path::components()` が持つ正規化規則に従う）。symlink の解決はここでは
+    /// 行わない（型ドキュメントの「検証範囲」を参照。実マウント時に provider 側で解決・
+    /// 境界確認する）。
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, TraitError> {
         use std::path::Component;
 
@@ -329,6 +336,18 @@ impl HostBindPath {
             ));
         }
         for component in path.components() {
+            if let Component::Prefix(prefix) = component {
+                // verbatim（`\\?\`・`\\?\UNC\`）プレフィックスは components()/push() の
+                // 正規化規則が非 verbatim パスと異なり、以降の `..` 検証・正規化の結果が
+                // 保存値と食い違う（Bugbot 指摘）。この型の検証範囲では区別して扱わず、
+                // 単純に拒否する（型ドキュメント「拒否条件」を参照）。
+                if prefix.kind().is_verbatim() {
+                    return Err(TraitError::new(
+                        ErrorCode::InvalidArgument,
+                        "bind mount host path must not use a Windows verbatim (\\\\?\\) prefix",
+                    ));
+                }
+            }
             if component == Component::ParentDir {
                 return Err(TraitError::new(
                     ErrorCode::InvalidArgument,
@@ -337,8 +356,8 @@ impl HostBindPath {
             }
         }
         // `Path::components()` は非先頭の `.` セグメント・重複区切り文字・末尾区切り文字を
-        // 読み飛ばした Component 列を返す（std のドキュメント）。これを組み直すことで、
-        // 上のドキュメントコメントが謳う正規化を実際に保持値へ反映する（レビュー指摘:
+        // 読み飛ばした Component 列を返す（std のドキュメント）。verbatim プレフィックスは
+        // 上で拒否済みのため、ここで組み直しても入力と保存値は食い違わない（レビュー指摘:
         // 正規化すると謳いながら元の path をそのまま保持していた不一致の是正）。
         let normalized: PathBuf = path.components().collect();
         Ok(Self(normalized))
@@ -953,6 +972,23 @@ mod tests {
 
         let err =
             VolumeSource::bind(with_nul).expect_err("VolumeSource::bind must reject the same");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// PLUG-1: `HostBindPath` は Windows の `\\?\` verbatim プレフィックスを拒否する
+    /// （Bugbot 指摘の是正: verbatim 入力を `components()` で組み直すと `.`・`..` が
+    /// 正規化規則の違いで欠落し、保存値が入力と食い違っていた。ここでは受理せず拒否する
+    /// ことで、受理される値は常に入力と一致する保存値になることを保証する）。
+    #[cfg(windows)]
+    #[test]
+    fn cri7_host_bind_path_rejects_verbatim_prefix() {
+        let verbatim = PathBuf::from(r"\\?\C:\allowed\..\etc");
+        let err = HostBindPath::new(verbatim.clone())
+            .expect_err("verbatim prefix must be rejected even though the path is absolute");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        let err = VolumeSource::bind(verbatim)
+            .expect_err("VolumeSource::bind must reject the same verbatim prefix");
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
     }
 

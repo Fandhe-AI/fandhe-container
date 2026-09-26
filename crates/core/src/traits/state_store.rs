@@ -484,8 +484,33 @@ impl DeleteStateResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::cmp::Ordering;
+    use std::collections::{BinaryHeap, HashMap};
     use std::sync::{Arc, Mutex};
+
+    /// [`StubStateStore::list`] の有界選択で使う比較用ラッパー。`StateRecord` 自体は
+    /// 状態・revision も含むため `Ord` を持たず、id のみで全順序を与える。
+    struct HeapEntry(StateRecord);
+
+    impl PartialEq for HeapEntry {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.id().as_str() == other.0.id().as_str()
+        }
+    }
+
+    impl Eq for HeapEntry {}
+
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.0.id().as_str().cmp(other.0.id().as_str())
+        }
+    }
 
     /// テスト専用のインメモリスタブ実装。dyn 互換性とメソッドの契約を確認するためのみに
     /// 使い、ライブラリ側の既定実装（TASK-31・OCI-5）はここには置かない（REPAIR-3）。
@@ -559,40 +584,76 @@ mod tests {
 
         fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
             let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
-            let mut sorted: Vec<&StateRecord> = records.values().collect();
-            sorted.sort_by(|a, b| a.id().as_str().cmp(b.id().as_str()));
 
-            let start_index = match req.cursor() {
+            // カーソルが指定された場合は対応する id の存在だけを確認する。全件を
+            // Vec に集めてソートすると、要求したページ 1 件分に対してもストア全体の
+            // 件数に比例したメモリを確保してしまい、StateStore の「無制限に全件確保
+            // しない」契約（本ファイル冒頭の契約コメント）と AGENTS.md のリソース上限
+            // 規約に反する（PR #1076 codex レビュー P1 対応）。
+            let after_id = match req.cursor() {
                 Some(cursor) => {
-                    let after_id = cursor.as_str();
-                    let position = sorted
-                        .iter()
-                        .position(|record| record.id().as_str() == after_id)
-                        .ok_or_else(|| {
-                            TraitError::new(ErrorCode::InvalidArgument, "unknown list cursor")
-                        })?;
-                    position + 1
+                    let after_id = cursor.as_str().to_string();
+                    let exists = records.keys().any(|id| id.as_str() == after_id);
+                    if !exists {
+                        return Err(TraitError::new(
+                            ErrorCode::InvalidArgument,
+                            "unknown list cursor",
+                        ));
+                    }
+                    Some(after_id)
                 }
-                None => 0,
+                None => None,
             };
 
             // page_size は `ListStateRequest::new` が MAX_PAGE_SIZE 以下であることを
             // 検証済みのため、ここでの usize 変換は安全（32bit 環境でも u32 は usize に収まる）。
             let page_size = req.page_size().get() as usize;
-            let end_index = start_index.saturating_add(page_size).min(sorted.len());
-            let page: Vec<StateRecord> = sorted[start_index..end_index]
-                .iter()
-                .map(|record| (*record).clone())
+            // ページに含み得る上限（page_size + 1。次ページの有無判定用に 1 件多く見る）
+            // のみを保持する有界選択に留め、保持サイズをストア全体の件数に依存させない。
+            let capacity = page_size.saturating_add(1);
+            let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(capacity.min(64));
+
+            for record in records.values() {
+                if let Some(after_id) = &after_id
+                    && record.id().as_str() <= after_id.as_str()
+                {
+                    continue;
+                }
+                if heap.len() < capacity {
+                    heap.push(HeapEntry(record.clone()));
+                } else if let Some(top) = heap.peek()
+                    && record.id().as_str() < top.0.id().as_str()
+                {
+                    heap.pop();
+                    heap.push(HeapEntry(record.clone()));
+                }
+            }
+
+            // `into_sorted_vec` は id 昇順（HeapEntry の Ord に従う）で最大 capacity 件を返す。
+            let mut selected: Vec<StateRecord> = heap
+                .into_sorted_vec()
+                .into_iter()
+                .map(|entry| entry.0)
                 .collect();
 
-            let next_cursor = if end_index < sorted.len() {
-                let last_id = sorted[end_index - 1].id().as_str().to_string();
+            let has_next = selected.len() > page_size;
+            if has_next {
+                selected.truncate(page_size);
+            }
+
+            let next_cursor = if has_next {
+                let last_id = selected
+                    .last()
+                    .map(|record| record.id().as_str().to_string())
+                    .ok_or_else(|| {
+                        TraitError::new(ErrorCode::Internal, "list pagination state inconsistent")
+                    })?;
                 Some(StateListCursor::from_raw(last_id)?)
             } else {
                 None
             };
 
-            Ok(StateList::new(page, next_cursor))
+            Ok(StateList::new(selected, next_cursor))
         }
 
         fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {

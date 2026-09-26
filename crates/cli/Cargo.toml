@@ -1,0 +1,11 @@
+# 統一 CLI・基本コマンド（create/start/stop/delete/list/logs/ps）、観測性（crate-naming.md の表 #9）。
+# 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G6（TASK-79〜98 の一部）で実装する。
+# バイナリ名 `fandhe-container` は TASK-79 で `[[bin]] name` を指定して付ける（本雛形では未定義）。
+# version は未指定（Cargo の既定で 0.0.0・publish = false）。版数・公開方針は未決定。
+# 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
+
+[package]
+name = "fandhe-container-cli"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true

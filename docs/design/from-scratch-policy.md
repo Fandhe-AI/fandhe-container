@@ -7,7 +7,7 @@
 
 ## 方針
 
-youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization のクレート群）は設計の参考にとどめ、以下を行わない：
+youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization のクレート群）は設計の参考にとどめ、以下を行わない（TASK-7・MVM-4・MS-0）：
 
 - コードの採用・流用・拡張
 - 低レベル基盤クレートとしての利用
@@ -77,7 +77,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 - shlex シェルパーサ（#597）
 - ttrpc（CRI・#670）
 - ストリーミング HTTP サーバ（#678）
-- libloading（動的ライブラリロード・#1048）
+- `libloading` 等（#1048。TASK-180・GPU-6・MAC-5）: macOS の GPU 経路で、外部ライブラリの MoltenVK をホスト側の GPU バックエンドが実行時に読み込む用途に限る。plugin の読み込みには使わない（plugin は別プロセス＋UDS に限る。PLUG-2）。libc 経由の自前 dlopen ラッパーで足りるかも併せて比較する
 
 **非同期ランタイム**（tokio など）: 現時点で未承認。必要になった時点で検討・承認
 

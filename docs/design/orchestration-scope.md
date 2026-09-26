@@ -15,7 +15,7 @@ MVP におけるオーケストレーション機能の範囲（CRI-8）と、�
 
 ## MVP に含む拡張点設計
 
-TASK-4 で定義する 4 つの拡張トレイト（PLUG-1）：
+TASK-4（MS-0）で定義する 4 つの拡張トレイト（PLUG-1・CRI-8）：
 
 - `ContainerRuntime`: コンテナ起動・シグナル・ライフサイクル
 - `NetworkPlugin`: veth / bridge・DNS・ネットワークポリシー

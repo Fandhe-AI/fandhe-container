@@ -7,7 +7,7 @@
 
 ## 採用目標値
 
-**ホスト側プロセス RSS 合計が Docker Desktop 現行版比 10% 以内**
+**ホスト側プロセス RSS 合計が Docker Desktop 現行版比 10% 以内**（CORE-8・TASK-48・MS-0。実測は TASK-49）
 
 - Docker Desktop 基準: 約 2,524MB
 - 本基盤の上限: 約 252MB 以下

@@ -65,7 +65,7 @@ plugin crate（#14〜18）は、実行時のバイナリ配置（PLUG-11 の管�
 
 - `[workspace.dependencies]` で共通依存を統一管理し、`=x.y.z` 固定（dependency-policy）を確実に適用できる
 - `make ci`（lint・fmt・clippy・test）が全 crate に一括適用され、3 OS CI でも plugin バイナリ全体を統一して検証できる
-- PLUG-3（Cargo feature による軽量化）を実装する場合、feature フラグを workspace ルート `Cargo.toml` で一元管理しやすい
+- PLUG-3（Cargo feature による軽量化）を実装する場合、feature 自体は各 crate の `[features]` で定義するが、依存の指定を `[workspace.dependencies]` で共有でき、feature の組み合わせを workspace 全体のビルド・CI で一括検証できる
 
 #### 短所
 
@@ -87,7 +87,7 @@ plugin crate（#14〜18）は、実行時のバイナリ配置（PLUG-11 の管�
 
 - `[workspace.dependencies]` による共通依存の統一管理が及ばず、plugin ごとに依存を `=x.y.z` で個別に固定する手間が増える
 - 別 workspace の CI・`make ci`・`cargo deny` を別途用意する必要がある
-- PLUG-3（Cargo feature）を実装する場合、feature フラグを plugin ごとに個別管理する
+- PLUG-3（Cargo feature）を実装する場合、feature 自体は案 A と同じく各 crate の `[features]` で定義するが、`[workspace.dependencies]` による依存の共有が及ばず、組み合わせを workspace 全体で一括検証できない
 
 ### 案 B2: 別リポジトリに配置
 
@@ -95,7 +95,7 @@ plugin crate を root リポジトリの外（別 GitHub リポジトリ）に�
 
 #### 長所
 
-- 案 B1 の長所に加え、plugin ごとの版数・リリースサイクルを core と独立に設定できる
+- 案 B1 の長所に加え、別リポのため plugin ごとの版数・リリースサイクルが core と独立になる（同一リポの案 A・B1 でも crate ごとに独立した版数は設定できるが、リリースのタイミング・タグ付け・CI は同一リポ内で共有される）
 - plugin の開発・レビュー体制を core と分離できる
 
 #### 短所
@@ -103,9 +103,10 @@ plugin crate を root リポジトリの外（別 GitHub リポジトリ）に�
 - 案 B1 の短所（別リポの CI・`make ci`・`cargo deny` の個別整備を含む）に加え、plugin crate が依存する `plugin-api` をバージョン付きで公開・参照する仕組み（レジストリ公開または git 依存）が別途必要になる
 - リリースを core・plugin で分ける必要があり、バージョン履歴が分散する
 
-### A・B1 共通の課題: 全 crate の版数管理
+### 版数管理
 
-案 A（workspace 内）・案 B1（同一リポの workspace 外）はいずれも単一リポジトリ内で全 crate を管理するため、リリース版作成時に全 18 crate の版数・changelog を管理する手間が増える点は共通の課題である（`[workspace.package]` で版数を一元管理すれば個々の `Cargo.toml` への転記は避けられるが、crate ごとの独立リリースサイクルは持てない）。案 B2（別リポジトリ）のみ、plugin ごとに独立した版数・リリースサイクルを持てるためこの課題が緩和される（上記「長所」参照）。
+- **版数の継承範囲**: `[workspace.package]` による version 継承は workspace のメンバーにしか効かない。案 A（workspace 内）はこの継承を選べるが、案 B1（同一リポの workspace 外）・案 B2（別リポジトリ）は workspace 外のためこの継承を使えない
+- **リリース運用上の選択**: 同一リポ内でも crate ごとに独立した版数を設定することはできるため、「全 crate 一括の版数」か「crate ごとの独立版数」かは案 A・B1 のどちらでも選べる運用上の選択である。案 B2 は別リポジトリのため、版数・リリースサイクル・タグ付け・CI が実質的に core と独立になる（上記「長所」参照）
 
 ### PoC-13 での計測上の措置の位置づけ
 

@@ -47,7 +47,8 @@ fandhe-container/
 │   │   ├── orchestration-scope.md # オーケストレーション スコープ（TASK-5・CRI-8）
 │   │   ├── from-scratch-policy.md # フルスクラッチ方針・依存基準（TASK-7・MS-0）
 │   │   ├── resource-efficiency-target.md  # リソース効率目標値（TASK-48・CORE-8）
-│   │   └── declarative-config.md  # 宣言的起動設定の方針メモ（TASK-82・CLI-4）
+│   │   ├── declarative-config.md  # 宣言的起動設定の方針メモ（TASK-82・CLI-4）
+│   │   └── small-model-repair-policy.md  # 小型モデル自己補修方針（TASK-92・REPAIR-11/13/14）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external（稼働）/ ci・release（発火条件無効化中）
 ├── .agents/skills/                # npx skills add の導入実体

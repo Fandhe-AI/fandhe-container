@@ -76,10 +76,13 @@ pub trait StateStore: Send + Sync {
     /// （`#[non_exhaustive]`）。対応: OCI-5・CRI-7。
     fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError>;
 
-    /// コンテナ状態を削除する。
+    /// コンテナ状態を削除する（楽観的排他）。
     ///
     /// 前提: 対象レコードが存在すること。存在しなければ [`ErrorCode::NotFound`] を返す。
-    /// 対応: OCI-5・CRI-7・ERR-2。
+    /// `req.expected_revision()` が現在の revision と一致しなければ
+    /// [`ErrorCode::FailedPrecondition`] を返す。`update` と同じ理由（読み取り後に
+    /// 別の書き込みが状態を更新した場合、古い判断に基づく削除が新しい状態を消してしまう
+    /// のを防ぐ）で、削除にも revision の照合を要求する。対応: OCI-5・CRI-7・ERR-2。
     fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError>;
 }
 
@@ -278,21 +281,34 @@ impl GetStateRequest {
 }
 
 /// [`StateStore::delete`] の要求。
+///
+/// `update` と同じ楽観的排他を課すため `expected_revision` を持つ（#19 の P1 指摘対応。
+/// revision を持たない旧仕様では、読み取り後に別の書き込みが状態を更新していても
+/// 古い判断に基づく削除が成功し、新しい状態を消してしまっていた）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DeleteStateRequest {
     id: ContainerId,
+    expected_revision: StateRevision,
 }
 
 impl DeleteStateRequest {
-    /// 対象コンテナの ID から要求を作る。
-    pub fn new(id: ContainerId) -> Self {
-        Self { id }
+    /// 対象コンテナの ID と、削除前提となる revision から要求を作る。
+    pub fn new(id: ContainerId, expected_revision: StateRevision) -> Self {
+        Self {
+            id,
+            expected_revision,
+        }
     }
 
     /// 対象コンテナの ID を返す。
     pub fn id(&self) -> &ContainerId {
         &self.id
+    }
+
+    /// 削除前提となる revision を返す（楽観的排他）。
+    pub fn expected_revision(&self) -> StateRevision {
+        self.expected_revision
     }
 }
 
@@ -419,12 +435,16 @@ mod tests {
 
         fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
             let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
-            if records.remove(req.id()).is_none() {
+            let current = records
+                .get(req.id())
+                .ok_or_else(|| TraitError::new(ErrorCode::NotFound, "container state not found"))?;
+            if current.revision() != req.expected_revision() {
                 return Err(TraitError::new(
-                    ErrorCode::NotFound,
-                    "container state not found",
+                    ErrorCode::FailedPrecondition,
+                    "revision mismatch",
                 ));
             }
+            records.remove(req.id());
             Ok(DeleteStateResponse::new())
         }
     }
@@ -496,7 +516,7 @@ mod tests {
         assert_eq!(get_err.code().as_str(), "NOT_FOUND");
 
         let delete_err = store
-            .delete(&DeleteStateRequest::new(missing))
+            .delete(&DeleteStateRequest::new(missing, StateRevision::INITIAL))
             .expect_err("delete must fail for missing id");
         assert_eq!(delete_err.code().as_str(), "NOT_FOUND");
     }
@@ -575,7 +595,7 @@ mod tests {
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
 
         store
-            .delete(&DeleteStateRequest::new(id_a))
+            .delete(&DeleteStateRequest::new(id_a, StateRevision::INITIAL))
             .expect("delete a succeeds");
         let listed_after = store.list(&ListStateRequest::new()).expect("list succeeds");
         let ids_after: Vec<String> = listed_after
@@ -584,6 +604,55 @@ mod tests {
             .map(|r| r.id().as_str().to_string())
             .collect();
         assert_eq!(ids_after, vec!["b".to_string()]);
+    }
+
+    /// OCI-5: 古い revision での delete が `"FAILED_PRECONDITION"` を返し、レコードは
+    /// 削除されずに残る。正しい revision（更新後の最新値）なら削除に成功する（#19 P1 指摘:
+    /// 削除にも update と同じ楽観的排他を課す）。
+    #[test]
+    fn oci5_delete_with_stale_revision_returns_failed_precondition() {
+        let store = StubStateStore::new();
+        let id = sample_id("d");
+        store
+            .create(
+                &CreateStateRequest::new(
+                    ContainerStatus::created(id.clone(), None),
+                    sample_bundle(),
+                )
+                .expect("valid bundle"),
+            )
+            .expect("create succeeds");
+        let updated = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(id.clone(), None),
+                StateRevision::INITIAL,
+            ))
+            .expect("update succeeds");
+        assert_eq!(
+            updated.revision(),
+            StateRevision::INITIAL.next().expect("next revision")
+        );
+
+        // 古い revision（INITIAL）での削除は現在の revision と一致しないため失敗する。
+        let stale_err = store
+            .delete(&DeleteStateRequest::new(id.clone(), StateRevision::INITIAL))
+            .expect_err("stale revision delete must fail");
+        assert_eq!(stale_err.code().as_str(), "FAILED_PRECONDITION");
+
+        // レコードは削除されず残っているため get で取得できる。
+        let still_present = store
+            .get(&GetStateRequest::new(id.clone()))
+            .expect("record must still exist after failed delete");
+        assert_eq!(still_present.revision(), updated.revision());
+
+        // 正しい revision（最新値）を指定すれば削除に成功する。
+        store
+            .delete(&DeleteStateRequest::new(id.clone(), updated.revision()))
+            .expect("delete succeeds with correct revision");
+        let get_err = store
+            .get(&GetStateRequest::new(id))
+            .expect_err("record must be gone after delete");
+        assert_eq!(get_err.code().as_str(), "NOT_FOUND");
     }
 
     /// CRI-7: `CreateStateRequest::new` と `StateRecord::new` が相対パスを

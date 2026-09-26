@@ -18,8 +18,8 @@ on:
     paths:
       - ".github/workflows/linux-env-probe.yml"
 
-permissions:
-  contents: read
+# GITHUB_TOKEN を使う処理（checkout・API 呼び出し）が無いため権限は付与しない
+permissions: {}
 
 concurrency:
   # PR ごとに一意な番号を group に含める（head_ref のみだと fork 間で同名ブランチの
@@ -52,8 +52,7 @@ jobs:
     # ハングしたジョブの無期限実行を防ぐ多層防御。L2 ゲスト起動プローブに
     # 90 秒の timeout を持たせているが、apt-get 等を含めた全体の上限として設定する
     timeout-minutes: 20
-    permissions:
-      contents: read
+    permissions: {}
     defaults:
       run:
         shell: bash
@@ -119,9 +118,9 @@ jobs:
           exit 0
 
       # --------------------------------------------------
-      # 3. /dev/kvm（udev 修正前）
+      # 3. /dev/kvm（アクセス権付与前）
       # --------------------------------------------------
-      - name: Check /dev/kvm before udev fix
+      - name: Check /dev/kvm before ACL grant
         continue-on-error: true
         run: |
           set +e
@@ -129,16 +128,18 @@ jobs:
           RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
           record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
           if [ -e /dev/kvm ]; then
-            record "/dev/kvm before udev fix" "$(ls -l /dev/kvm)"
+            record "/dev/kvm before ACL grant" "$(ls -l /dev/kvm)"
           else
-            record "/dev/kvm before udev fix" "not present"
+            record "/dev/kvm before ACL grant" "not present"
           fi
           exit 0
 
       # --------------------------------------------------
-      # 4. /dev/kvm の udev ルール修正
+      # 4. /dev/kvm へのアクセス権付与
       # --------------------------------------------------
-      - name: Apply KVM udev rule
+      # udev ルールで MODE="0666" にする例が多いが、全ユーザーへの書き込み許可は
+      # 最小権限に反するため、ACL でジョブ実行ユーザーだけに rw を付与する
+      - name: Grant /dev/kvm access to the runner user
         continue-on-error: true
         run: |
           set +e
@@ -146,13 +147,17 @@ jobs:
           RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
           record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
           if [ -e /dev/kvm ]; then
-            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-              | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
-            sudo udevadm control --reload-rules
-            sudo udevadm trigger --name-match=kvm
-            record "/dev/kvm after udev fix" "$(ls -l /dev/kvm)"
+            if ! command -v setfacl >/dev/null 2>&1; then
+              sudo apt-get install -y -qq acl >/dev/null
+            fi
+            if sudo setfacl -m "u:$(id -un):rw" /dev/kvm; then
+              acl_users="$(getfacl -p /dev/kvm 2>/dev/null | grep '^user:[^:]' | tr '\n' ' ')"
+              record "/dev/kvm after ACL grant" "$(ls -l /dev/kvm) / ${acl_users}"
+            else
+              record "/dev/kvm after ACL grant" "setfacl failed"
+            fi
           else
-            record "/dev/kvm after udev fix" "not applicable (no /dev/kvm)"
+            record "/dev/kvm after ACL grant" "not applicable (no /dev/kvm)"
           fi
           exit 0
 
@@ -219,7 +224,8 @@ jobs:
           fi
           record "KVM ioctl: KVM_GET_API_VERSION (expect 12)" "${api_line:-skipped (open failed)}"
 
-          vm_line="$(printf '%s\n' "${probe_out}" | grep -m1 '^create_vm_fd')"
+          # create_vm_fd= と create_vm_error= の両方を拾い、失敗理由を表に残す
+          vm_line="$(printf '%s\n' "${probe_out}" | grep -m1 '^create_vm')"
           if printf '%s' "${vm_line}" | grep -Eq '^create_vm_fd=[0-9]+$'; then
             create_vm_ok="true"
           fi
@@ -287,13 +293,16 @@ jobs:
           echo "---- end of guest boot log ----"
 
           # initrd を渡していないため root マウントに失敗して panic する想定
-          # （panic=-1・-no-reboot で再起動せず終了する）。カーネル起動自体の成否は
-          # ブートメッセージ "Linux version" の有無と timeout(exit 124) でないことで判定する
-          if [ "${qemu_status}" -eq 124 ]; then
-            record "L2 guest boot (qemu+kvm)" "failed (timeout after ${duration}s)"
-            echo "L2_BOOT_OK=false" >> "$GITHUB_ENV"
-          elif grep -q 'Linux version' "${log_file}"; then
-            record "L2 guest boot (qemu+kvm)" "kernel started in ${duration}s (qemu exit=${qemu_status})"
+          # （panic=-1 で即座に再起動を要求し、-no-reboot により QEMU がそこで終了する）。
+          # 成否は KVM 上でゲストカーネルが動いたこと（ブートメッセージ "Linux version"）で
+          # 判定し、終了経路（正常終了か timeout の exit 124 か）は結果に併記するだけにする
+          if grep -q 'Linux version' "${log_file}"; then
+            if [ "${qemu_status}" -eq 124 ]; then
+              exit_note="terminated by timeout"
+            else
+              exit_note="qemu exit=${qemu_status}"
+            fi
+            record "L2 guest boot (qemu+kvm)" "kernel started in ${duration}s (${exit_note})"
             echo "L2_BOOT_OK=true" >> "$GITHUB_ENV"
           else
             record "L2 guest boot (qemu+kvm)" "failed (no kernel boot message, qemu exit=${qemu_status}, ${duration}s)"
@@ -423,12 +432,15 @@ jobs:
       - name: Build step summary table
         if: always()
         continue-on-error: true
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          ASSERT_KVM: ${{ matrix.assert_kvm }}
         run: |
           RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
           # Step Summary は API で取得できないため、gh run view --log で読めるよう
           # 同じ表をジョブログにも出す（tee）
           {
-            echo "### Linux env probe results — ${{ matrix.os }} (assert_kvm=${{ matrix.assert_kvm }})"
+            echo "### Linux env probe results — ${MATRIX_OS} (assert_kvm=${ASSERT_KVM})"
             echo ""
             echo "| Item | Result |"
             echo "| ---- | ------ |"
@@ -446,15 +458,17 @@ jobs:
       # --------------------------------------------------
       - name: Assert all KVM checks succeeded (x86_64 runners only)
         if: always()
+        env:
+          ASSERT_KVM: ${{ matrix.assert_kvm }}
         run: |
-          if [ "${{ matrix.assert_kvm }}" != "true" ]; then
+          if [ "${ASSERT_KVM}" != "true" ]; then
             echo "assert_kvm is false for this runner; reporting only, not asserting."
             exit 0
           fi
 
           failed=""
           kvm_checks=(
-            "open /dev/kvm after udev fix:${KVM_OPEN_OK:-false}"
+            "open /dev/kvm after ACL grant:${KVM_OPEN_OK:-false}"
             "KVM_GET_API_VERSION=12:${KVM_API_OK:-false}"
             "KVM_CREATE_VM:${KVM_CREATE_VM_OK:-false}"
             "qemu KVM guest boot:${L2_BOOT_OK:-false}"

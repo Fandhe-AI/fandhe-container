@@ -108,11 +108,11 @@ D-14（`01-brainstorm.md`「設計上の論点」6）の推奨に合わせ、com
 - TASK-152（往復検証テスト、成果物 `crates/stack/tests/roundtrip.rs`）は変換器（`compose-convert`）の出力を検証するテストであり、`stack` 側に置くと依存の向き（`compose-convert` → `stack`）が逆転する。テストは `crates/compose-convert/tests/` に移す
 - spec の TASK-151・152・153・154・156・182 の成果物パス（現状 `crates/stack/src/compose_convert.rs`・`crates/stack/tests/roundtrip.rs` 等）の修正は、spec リポジトリ側で行う（「後続タスクへの引き継ぎ」参照）
 
-### 決定 6: `StateStore` 実装の一本化
+### 決定 6: `StateStore` 既定実装の一本化
 
-`StateStore` の実装は core（TASK-31、PLUG-1）の 1 つだけにする。
+`StateStore` のファイルベースの既定実装は core（TASK-31）の 1 つに一本化する。代替実装を plugin 境界から差し替えられる構造（PLUG-1）は維持する。
 
-- supervisor は core の `StateStore` を使う（supervisor → core の一方向依存）
+- supervisor は 2 つ目の実装を持たず、core の既定実装を使う（supervisor → core の一方向依存）
 - `state.json` の形式と、supervisor が使う項目（`supervisor_pid`・`health`・`restart_count`）は core の型に含める
 - CLI と supervisor の書き込みの排他は TASK-157 で詰める
 - spec の TASK-157 の記述（現状 `crates/supervisor/src/state.rs` を `StateStore` トレイトの実装として記載）の修正は、spec リポジトリ側で行う

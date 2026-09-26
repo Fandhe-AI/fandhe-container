@@ -263,17 +263,61 @@ impl TryFrom<String> for GuestPath {
     }
 }
 
+/// 検証済みのホスト bind マウントパス。
+///
+/// フィールドを非公開にし、[`HostBindPath::new`]（および [`TryFrom`] 実装）を通してのみ
+/// 作れるようにする。[`VolumeSource::Bind`] がこの型を保持することで、
+/// `VolumeSource::Bind(PathBuf::from("relative"))` のように enum variant を直接構築して
+/// [`VolumeSource::bind`] の絶対パス検証を迂回する経路を型のレベルで塞ぐ
+/// （coding-rust.md「壊れた値を表現できない」型の方針。[`VolumeName`]・[`GuestPath`] と
+/// 同じ形）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HostBindPath(PathBuf);
+
+impl HostBindPath {
+    /// 入力パスを検証してホスト bind マウントパスを作る。
+    ///
+    /// `path` が絶対パスでない場合は [`ErrorCode::InvalidArgument`] を返す（fail-closed。
+    /// [`super::container_runtime::CreateRequest::new`] が bundle パスに課す制約と同じ理由で、
+    /// 相対パスは plugin プロセスとの作業ディレクトリの違いにより解決先が曖昧になる）。
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, TraitError> {
+        let path = path.into();
+        if !path.is_absolute() {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "bind mount host path must be absolute",
+            ));
+        }
+        Ok(Self(path))
+    }
+
+    /// 検証済みパスへの参照を返す。
+    pub fn as_path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl TryFrom<PathBuf> for HostBindPath {
+    type Error = TraitError;
+
+    fn try_from(value: PathBuf) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
 /// ボリュームの接続元（provider 管理のボリューム、またはホストの絶対パスの bind マウント）。
 ///
 /// フィールドを直接公開せず、[`VolumeSource::named`]・[`VolumeSource::bind`] を通してのみ
-/// 作れるようにすることで、`Bind` の相対パスといった未検証の値の混入を防ぐ。
+/// 作れるようにすることで、`Bind` の相対パスといった未検証の値の混入を防ぐ。`Bind` variant
+/// 自体は [`HostBindPath`]（検証済みでなければ構築できない newtype）を保持するため、
+/// enum variant を直接構築しても未検証パスは混入しない。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum VolumeSource {
     /// provider が管理する名前付きボリューム（例: io-share ドライバ）。
     Named(VolumeName),
     /// ホストの絶対パスを直接マウントする bind マウント。
-    Bind(PathBuf),
+    Bind(HostBindPath),
 }
 
 impl VolumeSource {
@@ -284,17 +328,10 @@ impl VolumeSource {
 
     /// ホストの絶対パスを指す bind マウントの接続元を作る。
     ///
-    /// `path` が絶対パスでない場合は [`ErrorCode::InvalidArgument`] を返す（fail-closed。
-    /// [`super::container_runtime::CreateRequest::new`] が bundle パスに課す制約と同じ理由で、
-    /// 相対パスは plugin プロセスとの作業ディレクトリの違いにより解決先が曖昧になる）。
+    /// `path` が絶対パスでない場合は [`ErrorCode::InvalidArgument`] を返す（[`HostBindPath::new`]
+    /// に委譲）。
     pub fn bind(path: PathBuf) -> Result<Self, TraitError> {
-        if !path.is_absolute() {
-            return Err(TraitError::new(
-                ErrorCode::InvalidArgument,
-                "bind mount host path must be absolute",
-            ));
-        }
-        Ok(Self::Bind(path))
+        Ok(Self::Bind(HostBindPath::new(path)?))
     }
 }
 
@@ -721,6 +758,31 @@ mod tests {
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
 
         assert!(VolumeSource::bind(sample_host_path()).is_ok());
+    }
+
+    /// PLUG-1: `HostBindPath` は `new`/`TryFrom` のいずれも相対パスを拒否し、
+    /// 絶対パスは検証済みの内部値として `as_path()` から往復できる。`VolumeSource::Bind`
+    /// が生の `PathBuf` ではなくこの型を保持することで、enum variant を直接構築しても
+    /// `VolumeSource::bind` の絶対パス検証を迂回できないことを確認する対象。
+    #[test]
+    fn plug1_host_bind_path_rejects_relative_and_roundtrips_absolute() {
+        let err =
+            HostBindPath::new(PathBuf::from("relative")).expect_err("relative path is rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        let host_path = sample_host_path();
+        let validated = HostBindPath::new(host_path.clone()).expect("absolute path is accepted");
+        assert_eq!(validated.as_path(), host_path.as_path());
+
+        let err = HostBindPath::try_from(PathBuf::from("relative"))
+            .expect_err("relative path is rejected via TryFrom");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+        assert_eq!(
+            HostBindPath::try_from(host_path.clone())
+                .expect("absolute path is accepted via TryFrom")
+                .as_path(),
+            host_path.as_path()
+        );
     }
 
     /// CRI-7: `remove` が使用中判定で `FAILED_PRECONDITION` を返す。

@@ -30,7 +30,8 @@ pub use container_runtime::{
 };
 pub use types::{ContainerId, ErrorCode, TraitError};
 pub use volume_provider::{
-    AccessMode, GuestPath, VolumeAttachRequest, VolumeAttachment, VolumeCreateRequest,
-    VolumeDetachRequest, VolumeDetachResponse, VolumeInfo, VolumeInspectRequest, VolumeName,
-    VolumeProvider, VolumeRemoveRequest, VolumeRemoveResponse, VolumeSource,
+    AccessMode, GuestPath, HostBindPath, VolumeAttachRequest, VolumeAttachment,
+    VolumeCreateRequest, VolumeDetachRequest, VolumeDetachResponse, VolumeInfo,
+    VolumeInspectRequest, VolumeName, VolumeProvider, VolumeRemoveRequest, VolumeRemoveResponse,
+    VolumeSource,
 };

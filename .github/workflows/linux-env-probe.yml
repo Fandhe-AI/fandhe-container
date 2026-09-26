@@ -271,6 +271,9 @@ jobs:
 
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-system-x86
+          # qemu パッケージ導入時の udev 再適用で /dev/kvm の ACL が初期化されるため
+          # （実測で Permission denied になった）、起動直前に付け直す
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
 
           # ホストカーネルは root 専用読み取り（0600）のため、非 root の qemu プロセスが
           # 読めるコピーを作業ディレクトリへ用意する

@@ -76,9 +76,13 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///    より恒久的に失敗するため、ロールバックは再試行可能性の前提でもある。
 /// 7. **二重作成の拒否**: 同名のネットワークや同じコンテナの netns が既にあれば
 ///    [`ErrorCode::AlreadyExists`] を返す。前回の残骸を黙って再利用しない。
-/// 8. **前提違反**: 存在しないネットワークへの [`Self::attach`] / [`Self::publish_port`]、
-///    netns 未作成のコンテナへの [`Self::attach`] は [`ErrorCode::NotFound`] または
-///    [`ErrorCode::FailedPrecondition`] を返す。
+/// 8. **前提違反**: 存在しないネットワークへの [`Self::create_netns`] / [`Self::attach`] /
+///    [`Self::publish_port`]、netns 未作成のコンテナへの [`Self::attach`] は
+///    [`ErrorCode::NotFound`] を返す。加えて [`Self::attach`] は、対象コンテナの netns が
+///    [`Self::create_netns`] で紐付けられたネットワーク（`CreateNetnsRequest::network`）と
+///    `req.network()` が一致しない場合、[`ErrorCode::FailedPrecondition`] を返す
+///    （異なるネットワークへの越境接続を拒否し、[`Self::delete_network`] の追跡対象と
+///    実際の接続先の食い違いを防ぐ。codex/review 指摘 P1）。
 /// 9. **削除はベストエフォートで続行**: [`Self::delete_network`] は個々の削除に失敗しても
 ///    残りの削除を続け、1 件でも失敗があれば `Err`（[`ErrorCode::Internal`]）を返す
 ///    （PoC-15 の `net-delete` に準拠）。
@@ -97,10 +101,14 @@ pub trait NetworkPlugin: Send + Sync {
 
     /// コンテナ専用の netns を作成する（lo の up を含む）。
     ///
-    /// netsetup の `netns-create` に対応し、`SetUpPod` の一部。前提: 同じコンテナの
-    /// netns が既に存在しないこと。存在する場合は [`ErrorCode::AlreadyExists`] を
-    /// 返す（契約 7）。`req.network()` が指すネットワークに属するものとして実装側が
-    /// 追跡し、[`Self::delete_network`] の削除対象に含める（`attach` 未実施でも回収
+    /// netsetup の `netns-create` に対応し、`SetUpPod` の一部。前提: `req.network()` が
+    /// [`Self::create_network`] 済みであること（未作成なら [`ErrorCode::NotFound`]。
+    /// 作成済みネットワークにのみ netns を紐付けることで、[`Self::delete_network`] が
+    /// 存在しないネットワーク名を回収対象として追跡する事態や、孤立した netns が
+    /// 残る事態を防ぐ。codex/review 指摘 P1）。加えて、同じコンテナの netns が既に
+    /// 存在しないこと。存在する場合は [`ErrorCode::AlreadyExists`] を返す（契約 7）。
+    /// `req.network()` が指すネットワークに属するものとして実装側が追跡し、
+    /// [`Self::delete_network`] の削除対象に含める（`attach` 未実施でも回収
     /// できるようにするため。codex/review 指摘 P1）。lo の up に失敗した場合は
     /// 作成済みの netns を削除してから `Err` を返す（契約 6）。対応: NET-1。
     fn create_netns(&self, req: &CreateNetnsRequest) -> Result<NetnsStatus, TraitError>;
@@ -110,8 +118,13 @@ pub trait NetworkPlugin: Send + Sync {
     /// netsetup の `veth-attach` に対応し、`SetUpPod` の一部。前提: `req.network()` が
     /// [`Self::create_network`] 済みであること（未作成なら [`ErrorCode::NotFound`]）、
     /// 対象コンテナの netns が [`Self::create_netns`] 済みであること（未作成なら
-    /// [`ErrorCode::FailedPrecondition`]）。途中で失敗した場合は作成済みリソースを
-    /// 逆順に削除する（契約 6）。対応: NET-1・NET-2。
+    /// [`ErrorCode::FailedPrecondition`]）。さらに、その netns が [`Self::create_netns`]
+    /// 呼び出し時に紐付けられたネットワーク（`CreateNetnsRequest::network`）が
+    /// `req.network()` と一致すること（不一致なら [`ErrorCode::FailedPrecondition`]）。
+    /// 異なるネットワークに属する netns への接続を許すと、実際の接続先ネットワークと
+    /// [`Self::delete_network`] が追跡する削除対象ネットワークが食い違い、分離・
+    /// 後始末の契約が崩れるため（codex/review 指摘 P1）。途中で失敗した場合は
+    /// 作成済みリソースを逆順に削除する（契約 6）。対応: NET-1・NET-2。
     fn attach(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError>;
 
     /// コンテナのポートをホスト側へ公開する（nft DNAT）。

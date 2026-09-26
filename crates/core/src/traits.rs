@@ -221,14 +221,35 @@ impl ContainerState {
     /// 外部入力（イメージ・CRI リクエスト等）から状態を構築する経路で
     /// 巨大な値を無制限に受け入れないための検証（security.md・
     /// coding-rust.md「長さ・件数を上限検証してからアロケーションに使う」）。
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// `annotations` は既に構築済みの `BTreeMap` ではなく
+    /// `IntoIterator<Item = (String, String)>` で受け取り、要素を 1 件ずつ
+    /// `BTreeMap` へ格納する前に件数・キー長・値長を検証する。呼び出し側が
+    /// 外部入力（CRI リクエスト等）を境界なく列挙するイテレータを渡した
+    /// 場合でも、`Self::MAX_ANNOTATION_COUNT` 件を超えた時点で以降の要素を
+    /// 消費・格納せずに打ち切るため、検証前の無制限確保を防げる
+    /// （security.md「長さ・件数を上限検証してからアロケーションに使う」）。
+    /// `BTreeMap<String, String>` はそのまま `IntoIterator` を実装するため
+    /// 既存の呼び出し側はそのまま渡せる。
+    ///
+    /// 引数 9 個は `ContainerState` の全フィールド（OCI-4 の生成時チェック・
+    /// 決定 6・TASK-157 の supervisor 系フィールドを含む）に 1 対 1 対応し、
+    /// 構造体を持たないビルダーを追加すると「壊れた値を表現できない」検証
+    /// 済み構築という本関数の役割が分散するため、まとめずにここへ委譲する
+    /// （coding-rust.md「戻り値は将来拡張できる構造を持つ型にする」）。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "全フィールドを 1 回の検証済みコンストラクタへ集約する設計上の選択であり、\
+                  ビルダー分割は検証ロジックの分散を招くため許容する（上記ドキュメンテーション\
+                  コメント参照）"
+    )]
     pub fn new(
         oci_version: impl Into<String>,
         id: ContainerId,
         status: ContainerStatus,
         pid: Option<u32>,
         bundle: PathBuf,
-        annotations: BTreeMap<String, String>,
+        annotations: impl IntoIterator<Item = (String, String)>,
         supervisor_pid: Option<u32>,
         health: HealthStatus,
         restart_count: u32,
@@ -270,15 +291,23 @@ impl ContainerState {
             });
         }
         Self::validate_oci_version(&oci_version)?;
-        if annotations.len() > Self::MAX_ANNOTATION_COUNT {
-            return Err(StateStoreError::InvalidState {
-                reason: format!(
-                    "annotations must contain at most {} entries",
-                    Self::MAX_ANNOTATION_COUNT
-                ),
-            });
-        }
-        for (key, value) in &annotations {
+        // 呼び出し側が渡すイテレータを 1 件ずつ消費しながら検証する。
+        // `annotations.collect::<BTreeMap<_, _>>()` のように先に丸ごと
+        // 格納してから件数チェックすると、外部入力（CRI リクエスト等）が
+        // 無制限に要素を列挙するイテレータだった場合に検証前の無制限確保が
+        // 起きる（P0 指摘。PR #1073 レビュー）。`MAX_ANNOTATION_COUNT` 件を
+        // 超えた時点でそれ以上イテレータを進めず即座にエラー化することで、
+        // `validated` に保持するメモリ量を常に上限以下へ抑える。
+        let mut validated = BTreeMap::new();
+        for (key, value) in annotations {
+            if validated.len() >= Self::MAX_ANNOTATION_COUNT {
+                return Err(StateStoreError::InvalidState {
+                    reason: format!(
+                        "annotations must contain at most {} entries",
+                        Self::MAX_ANNOTATION_COUNT
+                    ),
+                });
+            }
             if key.len() > Self::MAX_ANNOTATION_KEY_LEN {
                 return Err(StateStoreError::InvalidState {
                     reason: format!(
@@ -295,6 +324,7 @@ impl ContainerState {
                     ),
                 });
             }
+            validated.insert(key, value);
         }
 
         Ok(Self {
@@ -303,7 +333,7 @@ impl ContainerState {
             status,
             pid,
             bundle,
-            annotations,
+            annotations: validated,
             supervisor_pid,
             health,
             restart_count,
@@ -493,9 +523,9 @@ pub struct ContainerIdPage {
 /// コンテナ状態の永続化・取得を抽象化するトレイト（CRI-7・PLUG-1）。
 ///
 /// 境界の配置（2026-09-26 決定。`docs/design/crate-naming.md` 決定 6・
-/// spec の `plugin-system.md` 境界表・PLUG-1・OCI-5 に基づく。Issue #16 本文は
-/// 「実装は plugin 側」と書いているが、上記 SSOT が優先されるためここでは
-/// 以下の 3 点で扱う）:
+/// spec の `plugin-system.md` 境界表・PLUG-1・OCI-5・TASK-4（MS-0）に基づく。
+/// Issue #16 本文は「実装は plugin 側」と書いているが、上記 SSOT が優先
+/// されるためここでは以下の 3 点で扱う）:
 ///
 /// - トレイト定義: 本 crate（core。CRI-7・PLUG-1）
 /// - ファイルベースの既定実装: 本 crate（core。OCI-5・TASK-31。常駐デーモンを
@@ -1127,6 +1157,43 @@ mod tests {
         )
         .expect_err("too many annotations must be rejected");
         assert_eq!(err.code(), "INVALID_STATE");
+    }
+
+    /// security.md「長さ・件数を上限検証してからアロケーションに使う」:
+    /// `annotations` を丸ごと `BTreeMap` へ格納してから件数検証するのではなく、
+    /// `MAX_ANNOTATION_COUNT` 件を超えた時点でイテレータの消費を打ち切る
+    /// ことを、実際に消費された要素数で機械照合する（PR #1073 レビュー
+    /// P0 指摘・REPAIR-12「受け入れ基準を機械照合するテストを置く」）。
+    /// 外部入力が無制限に列挙するイテレータであっても、`ContainerState::new`
+    /// が保持するメモリは上限を超えない。
+    #[test]
+    fn container_state_new_stops_consuming_annotations_past_limit() {
+        use std::cell::Cell;
+
+        let polled = Cell::new(0usize);
+        // 上限より大幅に多い要素を持つイテレータ（無制限入力の模擬）。
+        // `inspect` で実際に `next()` が呼ばれた回数を数える。
+        let annotations = (0..ContainerState::MAX_ANNOTATION_COUNT * 10)
+            .map(|i| (format!("key{i}"), "value".to_string()))
+            .inspect(|_| polled.set(polled.get() + 1));
+
+        let err = ContainerState::new(
+            "1.0.2",
+            ContainerId::new("abc123").expect("valid id in test fixture"),
+            ContainerStatus::Created,
+            None,
+            test_bundle_path(),
+            annotations,
+            None,
+            HealthStatus::Unknown,
+            0,
+        )
+        .expect_err("too many annotations must be rejected");
+        assert_eq!(err.code(), "INVALID_STATE");
+        // 上限（`MAX_ANNOTATION_COUNT`）+ 1 件目を検出した時点で打ち切る
+        // ため、消費した要素数は上限をわずかに超える程度に留まり、
+        // イテレータ全体（上限の 10 倍）を消費しない。
+        assert_eq!(polled.get(), ContainerState::MAX_ANNOTATION_COUNT + 1);
     }
 
     /// security.md: アノテーション 1 件あたりのキー・値の長さ上限を超える

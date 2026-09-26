@@ -1,6 +1,6 @@
 # TOML スキーマ・depends_on 起動順・profiles 絞り込み（crate-naming.md の表 #13）。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G11（TASK-149・150・187〜188）で実装する。
-# version は未指定（Cargo の既定で 0.0.0・publish = false）。版数・公開方針は未決定。
+# version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
 # 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -8,3 +8,4 @@ name = "fandhe-container-stack"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false

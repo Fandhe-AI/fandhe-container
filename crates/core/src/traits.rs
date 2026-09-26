@@ -20,6 +20,23 @@ use std::path::PathBuf;
 /// 型で排除する（security.md「パス要素は検証・正規化してからルート配下で
 /// あることを確認する」・REPAIR-2「壊れた値を表現できない型」）。
 ///
+/// 3 OS 一級対応（coding-rust.md「大文字小文字非区別・長パス・Unicode 正規化の
+/// 差を考慮する」IO-5）のため、`new` で以下も保証する:
+///
+/// - ASCII 英数字を小文字へ正規化して保持する（macOS 既定 FS・Windows は
+///   大文字小文字非区別のため、`"Foo"` と `"foo"` が異なるディレクトリへ
+///   解決される Linux 側の前提のまま TASK-31 のパス要素へ使うと、同一ファイル
+///   への衝突・状態の混線を招く）
+/// - Windows 予約デバイス名（`con`/`nul`/`aux`/`prn`/`com1`-`com9`/
+///   `lpt1`-`lpt9`。拡張子付き・大文字小文字を問わない）を拒否する
+///   （該当パスは Windows 上でディレクトリ作成自体に失敗するため）
+/// - 末尾が `.` で終わる値を拒否する（Win32 のパス正規化で末尾の `.` が
+///   剥離され、想定と異なるパスに解決されるため）
+///
+/// 上記はパス要素として安全な範囲に限定した検証であり、Unicode 正規化
+/// （NFC/NFD 差異）を伴う ID は現状 ASCII 英数字と `_-.+` のみ許可することで
+/// 範囲外としている（未対応。将来 Unicode ID を許可する場合は別途対応する）。
+///
 /// 長さ上限（128 バイト）は暫定値。TASK-31（ファイルベース既定実装）で
 /// 実際のパス長制約に合わせて見直してよい。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -29,11 +46,22 @@ impl ContainerId {
     /// コンテナ ID の長さ上限（バイト）。TASK-31 で見直す可能性がある暫定値。
     pub const MAX_LEN: usize = 128;
 
+    /// Windows 予約デバイス名（拡張子を除いた先頭部分・小文字比較）。
+    /// これらをパス要素にすると Windows 上でファイル / ディレクトリ操作が
+    /// 失敗する（例: `CreateFileW` が `ERROR_INVALID_NAME` 相当を返す）。
+    const WINDOWS_RESERVED_NAMES: &'static [&'static str] = &[
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+
     /// 文字列からコンテナ ID を検証付きで生成する。
     ///
     /// 受理: 空でない・`Self::MAX_LEN` バイト以下・ASCII 英数字と
-    /// `_` `-` `.` `+` のみで構成される・`.`/`..` そのものではない。
-    /// 上記を満たさない場合は `StateStoreError::InvalidId` を返す。
+    /// `_` `-` `.` `+` のみで構成される・`.`/`..` そのものではない・
+    /// 末尾が `.` でない・Windows 予約デバイス名（拡張子付き・大文字小文字を
+    /// 問わない）でない。上記を満たさない場合は `StateStoreError::InvalidId`
+    /// を返す。受理された値は ASCII 英数字を小文字へ正規化して保持する
+    /// （3 OS でのファイルシステム衝突を防ぐため。型ドキュメント参照）。
     pub fn new(id: impl Into<String>) -> Result<Self, StateStoreError> {
         let id = id.into();
 
@@ -52,6 +80,11 @@ impl ContainerId {
                 reason: "container id must not be \".\" or \"..\"".to_string(),
             });
         }
+        if id.ends_with('.') {
+            return Err(StateStoreError::InvalidId {
+                reason: "container id must not end with '.'".to_string(),
+            });
+        }
         let is_valid_char =
             |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+');
         if !id.chars().all(is_valid_char) {
@@ -61,7 +94,15 @@ impl ContainerId {
             });
         }
 
-        Ok(Self(id))
+        let normalized = id.to_ascii_lowercase();
+        let stem = normalized.split('.').next().unwrap_or(normalized.as_str());
+        if Self::WINDOWS_RESERVED_NAMES.contains(&stem) {
+            return Err(StateStoreError::InvalidId {
+                reason: format!("container id must not be a Windows reserved device name: {stem}"),
+            });
+        }
+
+        Ok(Self(normalized))
     }
 
     /// 内部の文字列表現を借用で返す。
@@ -396,6 +437,37 @@ mod tests {
         }
         let too_long = "a".repeat(ContainerId::MAX_LEN + 1);
         let err = ContainerId::new(too_long).expect_err("too long value must be rejected");
+        assert_eq!(err.code(), "INVALID_ID");
+    }
+
+    /// IO-5（3 OS 一級対応。大文字小文字非区別の考慮）: 異なる大文字小文字の
+    /// 入力が同一の正規化済み ID（小文字）へ解決されることを確認する。
+    /// macOS 既定 FS・Windows はファイルシステムが大文字小文字非区別のため、
+    /// 正規化せずに TASK-31 のパス要素へ使うと衝突する。
+    #[test]
+    fn container_id_normalizes_ascii_case() {
+        let upper = ContainerId::new("Foo-Bar").expect("valid id in test fixture");
+        let lower = ContainerId::new("foo-bar").expect("valid id in test fixture");
+        assert_eq!(upper, lower);
+        assert_eq!(upper.as_str(), "foo-bar");
+    }
+
+    /// IO-5: Windows 予約デバイス名（拡張子付き・大文字小文字を問わない）を
+    /// パス要素として使うと Windows 上でディレクトリ作成が失敗するため拒否する。
+    #[test]
+    fn container_id_rejects_windows_reserved_device_names() {
+        let cases = ["con", "CON", "Con.txt", "nul", "com1", "COM1.log", "lpt9"];
+        for case in cases {
+            let err = ContainerId::new(case).expect_err("value must be rejected");
+            assert_eq!(err.code(), "INVALID_ID", "case: {case:?}");
+        }
+    }
+
+    /// IO-5: Win32 のパス正規化で末尾の `.` が剥離されるため、末尾が `.` の
+    /// 値は生成時に拒否する。
+    #[test]
+    fn container_id_rejects_trailing_dot() {
+        let err = ContainerId::new("foo.").expect_err("value must be rejected");
         assert_eq!(err.code(), "INVALID_ID");
     }
 

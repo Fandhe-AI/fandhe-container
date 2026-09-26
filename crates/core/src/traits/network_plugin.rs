@@ -16,7 +16,7 @@
 //! | netsetup（PoC-15） | メソッド | 単位 | 主な責務 | CRI 対応 |
 //! | ------------------ | -------- | ---- | -------- | -------- |
 //! | `net-create` | [`NetworkPlugin::create_network`] | ネットワーク | bridge・専用 nft テーブル（masquerade）・DNS ヘルパー | `SetUpPod` 相当 |
-//! | `netns-create` | [`NetworkPlugin::create_netns`] | コンテナ | 専用 netns の作成（lo の up を含む） | `SetUpPod` の一部 |
+//! | `netns-create` | [`NetworkPlugin::create_netns`] | コンテナ | 専用 netns の作成（lo の up を含む）。所属ネットワークを受け取り `net-delete` の追跡対象に加える | `SetUpPod` の一部 |
 //! | `veth-attach` | [`NetworkPlugin::attach`] | コンテナ | veth ペアの作成、bridge / netns への接続、アドレス・default route の設定 | `SetUpPod` の一部 |
 //! | `publish-port` | [`NetworkPlugin::publish_port`] | コンテナ | ポート公開（nft DNAT） | PortMapping |
 //! | `net-delete` | [`NetworkPlugin::delete_network`] | ネットワーク | bridge・nft テーブル・関連 netns の一括削除 | `TearDownPod` 相当 |
@@ -66,9 +66,14 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///    PLUG-11・PLUG-12）はこのトレイトの外側、境界機構（`fandhe-container-plugin`）の
 ///    責務であり、`NetworkPlugin` の呼び出し側はそれらが検証済みであることを
 ///    前提にしてよい。
-/// 6. **部分失敗時のロールバック**: [`Self::create_network`]・[`Self::attach`] が途中で
-///    失敗した場合、実装は作成済みのリソース（bridge・veth・nft テーブル）を逆順に
-///    削除してから `Err` を返す（PoC-15 の 2026-09-24 修正に準拠）。
+/// 6. **部分失敗時のロールバック**: [`Self::create_network`]・[`Self::create_netns`]・
+///    [`Self::attach`] が途中で失敗した場合、実装は作成済みのリソース
+///    （bridge・veth・nft テーブル・netns）を逆順に削除してから `Err` を返す
+///    （PoC-15 の 2026-09-24 修正に準拠）。[`Self::create_netns`] は netns 作成後に
+///    lo の up を行うため、lo 設定が失敗した場合は作成済みの netns 自体を削除して
+///    から `Err` を返す（codex/review 指摘 P1）。ロールバックせず netns を残したまま
+///    `Err` を返すと、同じコンテナへの再試行が [`ErrorCode::AlreadyExists`]（契約 7）に
+///    より恒久的に失敗するため、ロールバックは再試行可能性の前提でもある。
 /// 7. **二重作成の拒否**: 同名のネットワークや同じコンテナの netns が既にあれば
 ///    [`ErrorCode::AlreadyExists`] を返す。前回の残骸を黙って再利用しない。
 /// 8. **前提違反**: 存在しないネットワークへの [`Self::attach`] / [`Self::publish_port`]、
@@ -94,7 +99,10 @@ pub trait NetworkPlugin: Send + Sync {
     ///
     /// netsetup の `netns-create` に対応し、`SetUpPod` の一部。前提: 同じコンテナの
     /// netns が既に存在しないこと。存在する場合は [`ErrorCode::AlreadyExists`] を
-    /// 返す（契約 7）。対応: NET-1。
+    /// 返す（契約 7）。`req.network()` が指すネットワークに属するものとして実装側が
+    /// 追跡し、[`Self::delete_network`] の削除対象に含める（`attach` 未実施でも回収
+    /// できるようにするため。codex/review 指摘 P1）。lo の up に失敗した場合は
+    /// 作成済みの netns を削除してから `Err` を返す（契約 6）。対応: NET-1。
     fn create_netns(&self, req: &CreateNetnsRequest) -> Result<NetnsStatus, TraitError>;
 
     /// veth ペアを作成し、bridge / netns へ接続してアドレス・default route を設定する。
@@ -119,8 +127,10 @@ pub trait NetworkPlugin: Send + Sync {
     /// ネットワーク（bridge・nft テーブル・関連 netns）を一括削除する。
     ///
     /// netsetup の `net-delete` に対応し、CRI の `TearDownPod` 相当。削除対象の netns
-    /// 一覧は呼び出し側から受け取らず、そのネットワークで作成・接続したものを実装
-    /// （plugin 側）が追跡して決める（上限のない `Vec` を境界へ持ち込まないため）。
+    /// 一覧は呼び出し側から受け取らず、そのネットワークに [`Self::create_netns`]（`req.network()`
+    /// で紐付け）・[`Self::attach`] のいずれかで関連付けたものを実装（plugin 側）が追跡して
+    /// 決める（上限のない `Vec` を境界へ持ち込まないため）。`attach` 前に失敗した netns も
+    /// `create_netns` の時点で追跡対象に入っているため回収できる（codex/review 指摘 P1）。
     /// 個々の削除に失敗しても残りの削除を続け、1 件でも失敗があれば `Err` を返す
     /// （契約 9）。対応: NET-3・NET-5。
     fn delete_network(
@@ -335,17 +345,30 @@ impl NetworkStatus {
 }
 
 /// [`NetworkPlugin::create_netns`] の要求。
+///
+/// `network` は、この netns がどのネットワークに属するかを実装（plugin 側）へ伝える
+/// （codex/review 指摘 P1）。[`Self::network`] 経由の `attach` 前に本呼び出しが失敗しても、
+/// 実装はこの時点で受け取ったネットワーク名に紐付けて netns を追跡でき、その後の
+/// [`NetworkPlugin::delete_network`] が `attach` 未実施の netns も含めて回収できる
+/// （残存孤児 netns の防止）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct CreateNetnsRequest {
+    network: NetworkName,
     container: ContainerId,
 }
 
 impl CreateNetnsRequest {
-    /// 対象コンテナの ID から要求を作る。netns の名前は検証済みの [`ContainerId`] から
-    /// 実装側が導出する（パストラバーサル対策。security.md）。
-    pub fn new(container: ContainerId) -> Self {
-        Self { container }
+    /// 所属先ネットワーク名と対象コンテナの ID から要求を作る。netns の名前は検証済みの
+    /// [`ContainerId`] から実装側が導出する（パストラバーサル対策。security.md）。
+    pub fn new(network: NetworkName, container: ContainerId) -> Self {
+        Self { network, container }
+    }
+
+    /// 所属先ネットワーク名を返す。実装（plugin 側）はこれを使って
+    /// [`NetworkPlugin::delete_network`] の追跡対象にこの netns を含める。
+    pub fn network(&self) -> &NetworkName {
+        &self.network
     }
 
     /// 対象コンテナの ID を返す。
@@ -363,17 +386,63 @@ pub struct NetnsStatus {
 }
 
 impl NetnsStatus {
-    /// 対象コンテナの ID と netns の絶対パスから応答を作る。
+    /// 対象コンテナの ID・netns の絶対パス・許可された netns 配下ディレクトリ
+    /// （`allowed_root`）から応答を作る。
     ///
-    /// `path` が絶対パスでない場合は [`ErrorCode::InvalidArgument`] を返す。plugin
-    /// プロセスは呼び出し元と作業ディレクトリが異なるため、相対パスは解決先が曖昧に
-    /// なる（fail-closed。[`super::container_runtime::CreateRequest::new`] と同じ理由）。
-    /// runtime（`ContainerRuntime` 実装）がこの netns に join する際のパスになる。
-    pub fn new(container: ContainerId, path: PathBuf) -> Result<Self, TraitError> {
+    /// plugin からの応答は untrusted な外部入力であり、`path` を `is_absolute()` だけで
+    /// 受理すると任意の絶対パス（`/etc/passwd` 等）を runtime がそのまま join する経路に
+    /// なってしまう（codex/review 指摘 P0・security.md「plugin からの入力は untrusted
+    /// として検証する」「パス要素は検証・正規化してからルート配下であることを確認する」）。
+    /// そのため、次の 2 段階で fail-closed に検証する。
+    ///
+    /// 1. **契約（呼び出し側の責務）**: 呼び出し側（境界機構・proxy。PLUG-11・PLUG-12）は
+    ///    plugin から受け取った生のパスをこの関数へ渡す前に、シンボリックリンクを解決
+    ///    した正規化済みの絶対パス（例: `std::fs::canonicalize` 相当）にしてから渡す。
+    ///    本 crate（core）はこのトレイト定義のみを持ち、実際のファイルシステム走査は
+    ///    行わない（PLUG-1・上記境界機構の責務）。
+    /// 2. **本関数が構造的に強制する検証**: `path` が絶対パスであること、`.`・`..`
+    ///    コンポーネントを含まないこと（字句上のトラバーサル拒否）、そして `path` が
+    ///    `allowed_root` の**コンポーネント単位**の配下にあることを検証する。文字列の
+    ///    前方一致（`starts_with`）ではなく [`Path::strip_prefix`] を使うのは、
+    ///    `/run/netns-evil/x` のような紛らわしい兄弟ディレクトリを `/run/netns` への
+    ///    前方一致で誤って許可しないためである。
+    ///
+    /// `allowed_root` が絶対パスでない、`path` が絶対パスでない、`path` が
+    /// `.`・`..` を含む、または `path` が `allowed_root` 配下にない場合は
+    /// [`ErrorCode::InvalidArgument`] を返す。runtime（`ContainerRuntime` 実装）が
+    /// この netns に join する際のパスになる。
+    pub fn new(
+        container: ContainerId,
+        path: PathBuf,
+        allowed_root: &Path,
+    ) -> Result<Self, TraitError> {
+        if !allowed_root.is_absolute() {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "netns allowed root must be absolute",
+            ));
+        }
         if !path.is_absolute() {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 "netns path must be absolute",
+            ));
+        }
+        if path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        }) {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "netns path must not contain \".\" or \"..\" components",
+            ));
+        }
+        if path.strip_prefix(allowed_root).is_err() {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "netns path must be under the allowed netns root",
             ));
         }
         Ok(Self { container, path })
@@ -665,7 +734,7 @@ mod tests {
 
         fn create_netns(&self, req: &CreateNetnsRequest) -> Result<NetnsStatus, TraitError> {
             let path = PathBuf::from(sample_netns_path());
-            NetnsStatus::new(req.container().clone(), path)
+            NetnsStatus::new(req.container().clone(), path, &sample_netns_allowed_root())
         }
 
         fn attach(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError> {
@@ -725,7 +794,18 @@ mod tests {
 
     #[cfg(windows)]
     fn sample_netns_path() -> &'static str {
-        r"C:\x"
+        r"C:\netns\x"
+    }
+
+    /// [`NetnsStatus::new`] へ渡す許可済み netns 配下ディレクトリ（テスト用固定値）。
+    #[cfg(unix)]
+    fn sample_netns_allowed_root() -> PathBuf {
+        PathBuf::from("/run/netns")
+    }
+
+    #[cfg(windows)]
+    fn sample_netns_allowed_root() -> PathBuf {
+        PathBuf::from(r"C:\netns")
     }
 
     /// CRI-7: `NetworkPlugin` は dyn 互換で、`Box`/`Arc` に収めて 5 メソッドを順に呼べる。
@@ -737,7 +817,10 @@ mod tests {
         assert_eq!(net_status.subnet().to_string(), "10.250.11.1/24");
 
         let netns_status = boxed
-            .create_netns(&CreateNetnsRequest::new(sample_container_id()))
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
             .expect("create_netns succeeds");
         assert_eq!(netns_status.path(), Path::new(sample_netns_path()));
 
@@ -855,15 +938,87 @@ mod tests {
         assert_eq!(Protocol::Udp.as_str(), "udp");
     }
 
-    /// CRI-7: `NetnsStatus::new` は相対パスを拒否し、絶対パスは受理する。
+    /// CRI-7: `NetnsStatus::new` は相対パスを拒否し、`allowed_root` 配下の絶対パスは
+    /// 受理する。
     #[test]
     fn cri7_netns_status_rejects_relative_path() {
-        let err = NetnsStatus::new(sample_container_id(), PathBuf::from("netns"))
+        let allowed_root = sample_netns_allowed_root();
+        let err = NetnsStatus::new(sample_container_id(), PathBuf::from("netns"), &allowed_root)
             .expect_err("relative path must be rejected");
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
 
-        let ok = NetnsStatus::new(sample_container_id(), PathBuf::from(sample_netns_path()));
+        let ok = NetnsStatus::new(
+            sample_container_id(),
+            PathBuf::from(sample_netns_path()),
+            &allowed_root,
+        );
         assert!(ok.is_ok());
+    }
+
+    /// codex/review 指摘 P0: `NetnsStatus::new` は untrusted な plugin 応答が
+    /// 任意の絶対パスを主張しても、`allowed_root` 配下でなければ拒否する
+    /// （文字列前方一致ではなくコンポーネント単位で判定するため、紛らわしい兄弟
+    /// ディレクトリも通さない）。
+    #[test]
+    fn p0_netns_status_rejects_path_outside_allowed_root() {
+        let allowed_root = sample_netns_allowed_root();
+
+        // allowed_root と無関係な絶対パス（任意ファイルへの誘導）。
+        #[cfg(unix)]
+        let outside = PathBuf::from("/etc/passwd");
+        #[cfg(windows)]
+        let outside = PathBuf::from(r"C:\Windows\System32\config\SAM");
+        let err = NetnsStatus::new(sample_container_id(), outside, &allowed_root)
+            .expect_err("path outside allowed root must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        // 文字列の前方一致では通ってしまう紛らわしい兄弟ディレクトリ
+        // （`/run/netns-evil` は `/run/netns` に前方一致するが配下ではない）。
+        #[cfg(unix)]
+        let lookalike = PathBuf::from("/run/netns-evil/x");
+        #[cfg(windows)]
+        let lookalike = PathBuf::from(r"C:\netns-evil\x");
+        let err = NetnsStatus::new(sample_container_id(), lookalike, &allowed_root)
+            .expect_err("string-prefix lookalike must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// codex/review 指摘 P0: `NetnsStatus::new` は `allowed_root` 配下でも
+    /// `..` コンポーネントを含む字句上のトラバーサルを拒否する。
+    #[test]
+    fn p0_netns_status_rejects_parent_dir_traversal() {
+        let allowed_root = sample_netns_allowed_root();
+
+        #[cfg(unix)]
+        let traversal = PathBuf::from("/run/netns/../../etc/passwd");
+        #[cfg(windows)]
+        let traversal = PathBuf::from(r"C:\netns\..\..\Windows\win.ini");
+        let err = NetnsStatus::new(sample_container_id(), traversal, &allowed_root)
+            .expect_err("parent-dir traversal must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// codex/review 指摘 P0: `allowed_root` 自体が絶対パスでなければ拒否する
+    /// （呼び出し側の設定ミスを fail-closed で検出する）。
+    #[test]
+    fn p0_netns_status_rejects_relative_allowed_root() {
+        let allowed_root = PathBuf::from("netns");
+        let err = NetnsStatus::new(
+            sample_container_id(),
+            PathBuf::from(sample_netns_path()),
+            &allowed_root,
+        )
+        .expect_err("relative allowed root must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// codex/review 指摘 P1: `CreateNetnsRequest` は所属先ネットワーク名を保持し、
+    /// `network()` で参照できる（`delete_network` の追跡対象決定に使うため）。
+    #[test]
+    fn p1_create_netns_request_returns_network() {
+        let req = CreateNetnsRequest::new(sample_network_name(), sample_container_id());
+        assert_eq!(req.network(), &sample_network_name());
+        assert_eq!(req.container(), &sample_container_id());
     }
 
     /// NET-1: `AttachRequest` は `new` 直後に `address()` が `None`、

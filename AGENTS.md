@@ -68,7 +68,7 @@ make deny   # cargo deny --locked check advisories bans licenses sources
 | user namespace | コンテナ内 root をホストの非特権 UID へ写しているか（SEC-5） | P0 |
 | 監査ログ | 分離違反の試行を監査ログに記録しているか（SEC-4） | P0 |
 | rootfs・マウント・ボリューム境界 | rootfs・マウント・ボリュームの外へ書き込める経路（パストラバーサル・symlink・ハードリンク・マウント伝播）がないか。パス要素を検証・正規化してからルート配下であることを確認しているか | P0 |
-| plugin 境界 | 動的ライブラリの実行時ロードを行っていないか（拡張は別プロセス＋UDS に限る。PLUG-2）。`ContainerRuntime`・`StateStore`・`NetworkPlugin` の実装が plugin 側、`VolumeProvider` が core 側になっているか（PLUG-1）。他ユーザー書き込み可能な場所の plugin・許可済みハッシュ / 署名に一致しない plugin の登録を拒否しているか。`PATH` 探索が opt-in のみになっているか（PLUG-11） | P0 |
+| plugin 境界 | 動的ライブラリの実行時ロードを行っていないか（拡張は別プロセス＋UDS に限る。PLUG-2）。`ContainerRuntime`・`NetworkPlugin` の実装が plugin 側、`VolumeProvider` が core 側になっているか（PLUG-1）。`StateStore` はトレイト定義とファイルベースの既定実装が core 側にあり、別実装を plugin として差し替えられる構造になっているか（TASK-31・OCI-5・PLUG-1）。他ユーザー書き込み可能な場所の plugin・許可済みハッシュ / 署名に一致しない plugin の登録を拒否しているか。`PATH` 探索が opt-in のみになっているか（PLUG-11） | P0 |
 | UDS 境界 | UDS を所有者・権限・symlink を検証してから bind しているか。別 UID からの接続を peer credential 検証で切断しているか（PLUG-12） | P0 |
 | plugin 入力の検証 | plugin からの入力を untrusted として検証しているか | P0 |
 | 外部入力の検証 | イメージ・CDI spec・TOML / compose・CRI / MCP リクエスト・plugin 入出力・カーネル応答の経路で `unwrap`・`expect`・添字アクセス（`[]`）を使わず、`get()`・`try_into()`・checked 演算で処理しているか | P0 |
@@ -90,7 +90,7 @@ make deny   # cargo deny --locked check advisories bans licenses sources
 | ---- | ---- | ---- |
 | crate 構成 | 変更が `crates/<短縮名>`（名前空間 `fandhe-container-*`）の想定責務（`io`: I/O 共有層／`core`・`supervisor`: 実行層・監視プロセス／`oci`・`cri`: イメージ・ライフサイクル・CRI／`platform-macos`・`platform-windows`・`microvm`: プラットフォーム層／`gpu`・`net`: GPU パススルー・network／`plugin-api`: plugin 境界機構／`cli`・`stack`: 統一 CLI・複数コンテナ定義／`plugin-*`: plugin crate 群。詳細は `CLAUDE.md` の Repository Structure）に収まっているか。短縮名は TASK-1（REPAIR-1）で確定する仮称であり、確定後に本表を更新する | P1 |
 | 依存方向 | crate 間の一方向依存が保たれ循環がないか。複数 crate が共有する型が下位 crate に置かれているか。crate 間の許可依存表は spec 未定義のため、TASK-1（REPAIR-1）で crate 構成が確定したら本書へ追記する | P0 |
-| core / plugin 境界 | `ContainerRuntime`・`StateStore`・`NetworkPlugin` の実装が plugin 側、`VolumeProvider`（データパス）が core 側に置かれているか（PLUG-1）。plugin の追加で core（ソース・バイナリ）を変更していないか（PLUG-4） | P0 |
+| core / plugin 境界 | `ContainerRuntime`・`NetworkPlugin` の実装が plugin 側、`VolumeProvider`（データパス）がトレイト定義・実装とも core 側に置かれているか（PLUG-1）。`StateStore` はトレイト定義とファイルベースの既定実装が core 側にあり、別実装を plugin として差し替えられるか（TASK-31・OCI-5。常駐デーモンを持たない CORE-1 と整合）。plugin の追加で core（ソース・バイナリ）を変更していないか（PLUG-4） | P0 |
 | 常駐デーモン前提の排除 | 中央の常駐デーモンを前提にした設計になっていないか（監視はコンテナごとの supervisor に限る。CORE-1・D-19） | P0 |
 | 3 OS 対応 | パスを `PathBuf` / `Path::join` で組み立てているか（文字列連結・区切り文字のハードコードがないか）。大文字小文字非区別・長パス（260 文字超）・Unicode 正規化の差を考慮しているか（IO-5）。内部データファイルの改行が LF 固定か。OS 固有処理が `cfg(target_os = ...)` で局所化されているか（CLI-1） | P1 |
 | `docs/spec` 非依存ビルド | コード・`build.rs`・テストが `docs/spec` 配下を読み込んでいないか（`docs/spec` 抜きでビルド・テストが成立するか） | P0 |

@@ -30,7 +30,7 @@ fandhe-container/
 ├── Dockerfile / compose.yaml      # 開発コンテナ（環境非依存の `make docker-ci`）
 ├── .markdownlint.jsonc / .yamllint / .editorconfig-checker.json  # lint-docs 設定
 ├── deny.toml                      # cargo-deny 設定（ライセンス・advisories・sources 検査）
-├── Cargo.toml                     #（予定）workspace 定義
+├── Cargo.toml                     # workspace 定義（members は TASK-1.3 で有効化）
 ├── crates/                        #（予定。crate 名前空間は fandhe-container-*）
 │   ├── io/                        #   I/O 共有層（バッチ write-back・フラッシュバリア・FS 正規化）
 │   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless）

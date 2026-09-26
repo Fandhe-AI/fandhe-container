@@ -308,6 +308,13 @@ impl ContainerState {
 
 /// コンテナの状態照会結果。真偽値やフラットな文字列ではなく、将来の拡張
 /// （リソース使用量等）に備えて構造化された型にする（coding-rust.md）。
+///
+/// `pid` は [`ContainerState::Running`]、`exit_code` は [`ContainerState::Stopped`]
+/// のときにのみ意味を持つ。以前は状態と無関係に `with_pid` / `with_exit_code` を
+/// 呼べるビルダだったため、`Created` に終了コードを付与する等の矛盾した値を
+/// 公開 API から作れてしまっていた（codex レビュー指摘・PR #1074）。状態ごとに
+/// 対応するコンストラクタ（[`Self::creating`]・[`Self::created`]・[`Self::running`]・
+/// [`Self::stopped`]）に限定し、組み合わせを型で制限する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContainerStatus {
@@ -318,26 +325,40 @@ pub struct ContainerStatus {
 }
 
 impl ContainerStatus {
-    /// ID と状態から作る（`pid`・`exit_code` は未設定）。
-    pub fn new(id: ContainerId, state: ContainerState) -> Self {
+    /// 内部専用の共通コンストラクタ。公開コンストラクタから状態ごとの
+    /// 組み合わせ（`pid`・`exit_code` の有無）を固定して呼ぶ。
+    fn build(
+        id: ContainerId,
+        state: ContainerState,
+        pid: Option<NonZeroU32>,
+        exit_code: Option<i32>,
+    ) -> Self {
         Self {
             id,
             state,
-            pid: None,
-            exit_code: None,
+            pid,
+            exit_code,
         }
     }
 
-    /// 実行中プロセスの PID を設定したビルダ。
-    pub fn with_pid(mut self, pid: NonZeroU32) -> Self {
-        self.pid = Some(pid);
-        self
+    /// 作成処理中の状態を作る（`pid`・`exit_code` は持たない）。
+    pub fn creating(id: ContainerId) -> Self {
+        Self::build(id, ContainerState::Creating, None, None)
     }
 
-    /// 終了コードを設定したビルダ。
-    pub fn with_exit_code(mut self, exit_code: i32) -> Self {
-        self.exit_code = Some(exit_code);
-        self
+    /// 作成済みでまだ未開始の状態を作る（`pid`・`exit_code` は持たない）。
+    pub fn created(id: ContainerId) -> Self {
+        Self::build(id, ContainerState::Created, None, None)
+    }
+
+    /// 実行中の状態を作る。`pid` は判明していれば渡す（`exit_code` は持たない）。
+    pub fn running(id: ContainerId, pid: Option<NonZeroU32>) -> Self {
+        Self::build(id, ContainerState::Running, pid, None)
+    }
+
+    /// 終了済みの状態を作る。`exit_code` は必須（`pid` は持たない）。
+    pub fn stopped(id: ContainerId, exit_code: i32) -> Self {
+        Self::build(id, ContainerState::Stopped, None, Some(exit_code))
     }
 
     /// コンテナ ID を返す。
@@ -384,28 +405,22 @@ mod tests {
 
     impl ContainerRuntime for StubRuntime {
         fn create(&self, req: &CreateRequest) -> Result<ContainerStatus, TraitError> {
-            Ok(ContainerStatus::new(
-                req.id().clone(),
-                ContainerState::Created,
-            ))
+            Ok(ContainerStatus::created(req.id().clone()))
         }
 
         fn start(&self, req: &StartRequest) -> Result<ContainerStatus, TraitError> {
-            Ok(
-                ContainerStatus::new(req.id().clone(), ContainerState::Running)
-                    .with_pid(NonZeroU32::new(42).expect("42 is nonzero")),
-            )
-        }
-
-        fn kill(&self, req: &KillRequest) -> Result<ContainerStatus, TraitError> {
-            Ok(ContainerStatus::new(
+            Ok(ContainerStatus::running(
                 req.id().clone(),
-                ContainerState::Running,
+                Some(NonZeroU32::new(42).expect("42 is nonzero")),
             ))
         }
 
+        fn kill(&self, req: &KillRequest) -> Result<ContainerStatus, TraitError> {
+            Ok(ContainerStatus::running(req.id().clone(), None))
+        }
+
         fn stop(&self, req: &StopRequest) -> Result<ContainerStatus, TraitError> {
-            Ok(ContainerStatus::new(req.id().clone(), ContainerState::Stopped).with_exit_code(0))
+            Ok(ContainerStatus::stopped(req.id().clone(), 0))
         }
 
         fn delete(&self, req: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
@@ -419,10 +434,7 @@ mod tests {
         }
 
         fn state(&self, req: &StateRequest) -> Result<ContainerStatus, TraitError> {
-            Ok(ContainerStatus::new(
-                req.id().clone(),
-                ContainerState::Running,
-            ))
+            Ok(ContainerStatus::running(req.id().clone(), None))
         }
     }
 
@@ -531,5 +543,32 @@ mod tests {
         assert_eq!(ContainerState::Created.as_str(), "created");
         assert_eq!(ContainerState::Running.as_str(), "running");
         assert_eq!(ContainerState::Stopped.as_str(), "stopped");
+    }
+
+    /// codex レビュー指摘（PR #1074）: `ContainerStatus` は状態ごとのコンストラクタに
+    /// 限定されており、`Created`/`Creating` に `pid`・`exit_code` が付かず、
+    /// `Running` に `exit_code` が、`Stopped` に `pid` が付かないことを固定する。
+    #[test]
+    fn cri7_container_status_constructors_restrict_field_combinations() {
+        let creating = ContainerStatus::creating(sample_id());
+        assert_eq!(creating.state(), ContainerState::Creating);
+        assert_eq!(creating.pid(), None);
+        assert_eq!(creating.exit_code(), None);
+
+        let created = ContainerStatus::created(sample_id());
+        assert_eq!(created.state(), ContainerState::Created);
+        assert_eq!(created.pid(), None);
+        assert_eq!(created.exit_code(), None);
+
+        let pid = NonZeroU32::new(7).expect("7 is nonzero");
+        let running = ContainerStatus::running(sample_id(), Some(pid));
+        assert_eq!(running.state(), ContainerState::Running);
+        assert_eq!(running.pid(), Some(pid));
+        assert_eq!(running.exit_code(), None);
+
+        let stopped = ContainerStatus::stopped(sample_id(), 1);
+        assert_eq!(stopped.state(), ContainerState::Stopped);
+        assert_eq!(stopped.pid(), None);
+        assert_eq!(stopped.exit_code(), Some(1));
     }
 }

@@ -169,6 +169,12 @@ impl TryFrom<String> for VolumeName {
 /// ホストで `std::path::Path::is_absolute()` を使うと `/data` は絶対パスと判定されず、
 /// 3 OS CI が壊れる。coding-rust.md が定める「パスは `PathBuf` で組み立てる」原則の例外
 /// として、ゲスト内パスに限りここで `String` ベースの検証済み型を用いる。
+///
+/// 保持する文字列は正規化済み（末尾スラッシュ除去・連続スラッシュ折り畳み・`.` セグメント
+/// 除去）である。`attach`/`detach` の契約（二重 attach は `AlreadyExists`、対応する attach
+/// が無い detach は `NotFound`）は同一の [`GuestPath`] であることの判定に依存するため、
+/// `/data`・`/data/`・`/data//` のような表記ゆれを型のレベルで同一視し、`PartialEq`/`Hash`
+/// が「壊れた値を表現できない」契約どおりに機能するようにする（coding-rust.md）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GuestPath(String);
 
@@ -178,11 +184,15 @@ impl GuestPath {
     /// 拒否条件（いずれかに該当すると `ErrorCode::InvalidArgument`）:
     /// - `/` で始まらない（絶対パスでない）
     /// - NUL バイトを含む
-    /// - `..` 要素を含む（パストラバーサル）
     /// - 長さが `GUEST_PATH_MAX_LEN`（4096 バイト）を超える
+    /// - `..` 要素を含む（パストラバーサル）
+    /// - 正規化後にセグメントが 1 つも残らない（ルート `"/"` 自体。rootfs 全体を覆い隠す
+    ///   マウント先になるため、security.md の fail-closed 方針・rootfs 保護の観点から拒否
+    ///   する）
     ///
-    /// symlink の解決や rootfs 配下であることの最終確認は実装側（将来）の責務であり、
-    /// ここでは形式検証のみを行う（実装済みを装わない。REPAIR-3）。
+    /// 正規化（末尾スラッシュ除去・連続スラッシュ折り畳み・`.` セグメント除去）はここで
+    /// 行うが、symlink の解決や rootfs 配下であることの最終確認は実装側（将来）の責務であり、
+    /// 形式検証と正規化のみを行う（実装済みを装わない。REPAIR-3）。
     pub fn new(value: impl Into<String>) -> Result<Self, TraitError> {
         let value = value.into();
         if !value.starts_with('/') {
@@ -197,19 +207,32 @@ impl GuestPath {
                 "guest path must not contain a NUL byte",
             ));
         }
-        if value.split('/').any(|segment| segment == "..") {
-            return Err(TraitError::new(
-                ErrorCode::InvalidArgument,
-                "guest path must not contain a \"..\" segment",
-            ));
-        }
         if value.len() > GUEST_PATH_MAX_LEN {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 format!("guest path must be at most {GUEST_PATH_MAX_LEN} bytes"),
             ));
         }
-        Ok(Self(value))
+        let mut segments: Vec<&str> = Vec::new();
+        for segment in value.split('/') {
+            if segment.is_empty() || segment == "." {
+                continue;
+            }
+            if segment == ".." {
+                return Err(TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    "guest path must not contain a \"..\" segment",
+                ));
+            }
+            segments.push(segment);
+        }
+        if segments.is_empty() {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "guest path must not be the root path (\"/\")",
+            ));
+        }
+        Ok(Self(format!("/{}", segments.join("/"))))
     }
 
     /// 検証済み文字列への参照を返す。
@@ -244,7 +267,7 @@ impl TryFrom<String> for GuestPath {
 ///
 /// フィールドを直接公開せず、[`VolumeSource::named`]・[`VolumeSource::bind`] を通してのみ
 /// 作れるようにすることで、`Bind` の相対パスといった未検証の値の混入を防ぐ。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum VolumeSource {
     /// provider が管理する名前付きボリューム（例: io-share ドライバ）。
@@ -356,7 +379,7 @@ impl VolumeInspectRequest {
 }
 
 /// [`VolumeProvider::attach`] の要求。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct VolumeAttachRequest {
     container_id: ContainerId,
@@ -452,7 +475,7 @@ impl VolumeInfo {
 }
 
 /// [`VolumeProvider::attach`] の応答。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct VolumeAttachment {
     container_id: ContainerId,
@@ -640,8 +663,9 @@ mod tests {
         }
     }
 
-    /// IO-5: GuestPath は絶対パスのみを受理し、相対パス・トラバーサル・NUL・長さ超過を
-    /// 拒否する。OS 分岐を持たず、3 OS すべてで同じ結果になることを確認する対象。
+    /// CRI-7: GuestPath は絶対パスのみを受理し、相対パス・トラバーサル・NUL・長さ超過・
+    /// ルート（`"/"`）を拒否する。OS 分岐を持たず、3 OS すべてで同じ結果になることを
+    /// 確認する対象（IO-5 が定めるパス表記ゆれの吸収も併せて検証する）。
     #[test]
     fn cri7_guest_path_validation() {
         assert_eq!(GuestPath::new("/data").unwrap().as_str(), "/data");
@@ -656,6 +680,9 @@ mod tests {
             "/a/../b".to_string(),
             "/..".to_string(),
             "/a\0b".to_string(),
+            "/".to_string(),
+            "//".to_string(),
+            "/.".to_string(),
             format!("/{}", "a".repeat(GUEST_PATH_MAX_LEN)),
         ];
         for case in cases {
@@ -666,6 +693,24 @@ mod tests {
                 "case {case:?} should be INVALID_ARGUMENT"
             );
         }
+    }
+
+    /// IO-5: `/data`・`/data/`・`/data//` のような表記ゆれは同一の [`GuestPath`] に
+    /// 正規化され、`PartialEq`/`Hash` が同一視することを確認する（attach/detach の
+    /// 契約が表記ゆれで破綻しないことの検証）。
+    #[test]
+    fn cri7_guest_path_normalizes_trailing_and_repeated_slashes() {
+        let base = GuestPath::new("/data").unwrap();
+        let trailing_slash = GuestPath::new("/data/").unwrap();
+        let repeated_slash = GuestPath::new("/data//").unwrap();
+        let dot_segment = GuestPath::new("/./data").unwrap();
+
+        assert_eq!(base, trailing_slash);
+        assert_eq!(base, repeated_slash);
+        assert_eq!(base, dot_segment);
+        assert_eq!(trailing_slash.as_str(), "/data");
+        assert_eq!(repeated_slash.as_str(), "/data");
+        assert_eq!(dot_segment.as_str(), "/data");
     }
 
     /// PLUG-1: `VolumeSource::bind` は相対パスを拒否し、ホストの絶対パスは受理する。

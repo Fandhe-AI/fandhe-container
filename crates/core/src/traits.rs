@@ -30,6 +30,7 @@ pub use container_runtime::{
 };
 pub use state_store::{
     CreateStateRequest, DeleteStateRequest, DeleteStateResponse, GetStateRequest, ListStateRequest,
-    StateList, StateRecord, StateRevision, StateStore, UpdateStateRequest,
+    MAX_CURSOR_LEN, MAX_PAGE_SIZE, StateList, StateListCursor, StateRecord, StateRevision,
+    StateStore, UpdateStateRequest,
 };
 pub use types::{ContainerId, ErrorCode, TraitError};

@@ -7,11 +7,24 @@
 
 ## 採用目標値
 
-**ホスト側プロセス RSS 合計が Docker Desktop 現行版比 10% 以内**（CORE-8・TASK-48・MS-0。実測は TASK-49）
+2 本立てで判定する（CORE-8・TASK-48・MS-0。実測は TASK-49）。
+
+### 基準 1: ホスト側プロセス
+
+**ホスト側プロセス RSS 合計（VM プロセスを除く）が Docker Desktop 現行版比 10% 以内**
 
 - Docker Desktop 基準: 約 2,524MB
 - 本基盤の上限: 約 252MB 以下
 - 根拠: PoC-11 の実測で同構成の Podman (applehv) 約 71MB（2.8%）・colima (virtiofs) 約 150MB（5.9%）が満たしており達成見込みがある
+
+### 基準 2: VM 側
+
+**VM 側のメモリを、同じ条件で測った Docker Desktop 現行版の値と比べて閾値以内に収める**（2026-09-26 ユーザー決定。#1061）
+
+- 指標: macOS では `com.apple.Virtualization.VirtualMachine`（VM の XPC プロセス）の RSS。Windows の相当値は TASK-49 で定める
+- 理由: 基準 1 は VM プロセスを除いた合計なので、それだけでは VM の消費が判定に入らない
+- 閾値: TASK-49 で Docker Desktop を同じ条件で計測してから確定する（未定）
+- 参考: 2026-09-26 の実測では Rancher Desktop 約 2,244MB・Finch 約 3,139MB（VM 内で実際に使っていた量は約 0.7〜1GB）
 
 ## 不採用（50% 削減案）
 
@@ -21,7 +34,7 @@ Docker Desktop 比 50% 削減案（約 1.2GB 以下）は採用しない。理�
 
 **対象**: macOS・Windows の VM 経由時。コンテナ 0 個のアイドル状態で、値が安定したときのホスト側プロセスの RSS 合計（CORE-8）
 
-- macOS: PoC-11 と同じく `ps -axo rss,comm` を対象プロセス名で集計する。本基盤の CLI・supervisor・VM を起動・管理するプロセスを合計する。Virtualization.framework が VM のメモリを計上する `com.apple.Virtualization.VirtualMachine`（XPC プロセス）は合計に含めず、参考値として別に記録する（PoC-11 の Podman・colima と同じ条件）
+- macOS: PoC-11 と同じく `ps -axo rss,comm` を対象プロセス名で集計する。本基盤の CLI・supervisor・VM を起動・管理するプロセスを合計する。Virtualization.framework が VM のメモリを計上する `com.apple.Virtualization.VirtualMachine`（XPC プロセス）は基準 1 の合計に含めず（PoC-11 の Podman・colima と同じ条件）、基準 2 の指標として別に計測する
 - Windows: `ps` は使えないため、取得方法（対象プロセスと計測 API）と WSL2 関連プロセスの扱いを TASK-49 で定める
 
 **比較対象**: Docker Desktop の版数・測定条件・タイムスタンプを記録。参考値として Docker Desktop VM 内込み約 3.2GB も記載

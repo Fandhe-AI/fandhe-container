@@ -110,6 +110,18 @@ impl StateRevision {
     pub fn value(self) -> u64 {
         self.0
     }
+
+    /// 生の `u64` 値から `StateRevision` を復元する。
+    ///
+    /// TASK-31 のファイルベース既定実装が `state.json` から revision を読み戻す場合や、
+    /// plugin proxy がワイヤーフレームから revision を復元する場合に使う（`next()` を
+    /// 繰り返し呼ぶ以外に構築手段がなかったための追加）。値の正当性（実際にストアが
+    /// 発行した revision であること）は呼び出し側の責務とし、本メソッドは検証しない。
+    ///
+    /// 暫定仕様。#19（TASK-4.h1）の人間アーキテクチャレビューで確定させる。
+    pub fn from_raw(value: u64) -> Self {
+        StateRevision(value)
+    }
 }
 
 /// コンテナ状態のレコード（[`StateStore`] が保持・返却する単位）。
@@ -596,7 +608,7 @@ mod tests {
         assert!(StateRecord::new(status, sample_bundle(), StateRevision::INITIAL).is_ok());
     }
 
-    /// REPAIR-5: `StateRevision::next` は `INITIAL` の次を +1 にし、`u64::MAX` からの
+    /// `StateRevision::next` は `INITIAL` の次を +1 にし、`u64::MAX` からの
     /// `next()` は `"INTERNAL"` を返す（オーバーフロー検出）。
     #[test]
     fn cri7_state_revision_next_increments_and_detects_overflow() {

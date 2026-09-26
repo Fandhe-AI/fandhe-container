@@ -9,7 +9,7 @@
 ## 何を書くか
 
 - このファイル・モジュール・関数の役割と責務境界（1〜2 行要約をドキュメンテーションコメントで）
-- 呼び出し元・呼び出し先の文脈（「supervisor の restart ループから呼ばれる」「plugin-api のフレームを復号して `ContainerRuntime` へ渡す」等）
+- 呼び出し元・呼び出し先の文脈（「supervisor の restart ループから呼ばれる」「`fandhe-container-plugin`（境界機構）のフレームを復号して `ContainerRuntime` へ渡す」等）
 - 他 crate・plugin との契約（公開トレイト・フレーム形式・エラー型・前提条件・スレッド安全性・ACK / FLUSH ACK の保証範囲）
 - spec のビヘイビア対応（該当する場合は ビヘイビア ID・TASK-n を併記する。[spec-reference](./spec-reference.md)）
 - 未実装・簡易実装箇所の将来仕様（スタブであることを明示し、目指す挙動とビヘイビア ID を書く。REPAIR-3）

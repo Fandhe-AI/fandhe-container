@@ -1,6 +1,6 @@
 ---
 name: plugin-builder
-description: "plugin 機構 crate（crates/plugin-api・fandhe-container-plugin-mcp。UDS＋長さ接頭辞フレーム・発見登録・信頼性検証・peer 認証・MCP サーバー plugin）の実装・編集を担当"
+description: "plugin 機構 crate（crates/plugin・fandhe-container-plugin-mcp。UDS＋長さ接頭辞フレーム・発見登録・信頼性検証・peer 認証・MCP サーバー plugin）の実装・編集を担当"
 model: sonnet
 tools: [Read, Edit, Write, Glob, Grep, Bash]
 ---
@@ -11,7 +11,7 @@ core と plugin の境界機構と MCP サーバー plugin の実装を担当す
 
 ## 担当範囲
 
-- `crates/plugin-api`（PLUG 系ビヘイビア。G8）: 拡張点トレイト（`ContainerRuntime`・`StateStore`・`NetworkPlugin`。PLUG-1）・別プロセス＋UDS＋長さ接頭辞フレーム（gRPC は wire 互換が必要な場面のみ。PLUG-2）・都度起動 / 常駐の 2 モード（PLUG-7）・Cargo feature による除外（PLUG-3）
+- `crates/plugin`（旧称 `plugin-api`。PLUG 系ビヘイビア。G8）: 拡張点トレイト（`ContainerRuntime`・`StateStore`・`NetworkPlugin`。PLUG-1）・別プロセス＋UDS＋長さ接頭辞フレーム（gRPC は wire 互換が必要な場面のみ。PLUG-2）・都度起動 / 常駐の 2 モード（PLUG-7）・Cargo feature による除外（PLUG-3）
 - plugin の発見・登録（管理ディレクトリ既定・`PATH` は opt-in。PLUG-4・PLUG-11）・UDS の配置 / 権限 / peer credential 検証（PLUG-12）
 - `fandhe-container-plugin-mcp`（MCP 系ビヘイビア）: MCP サーバー plugin（準拠リビジョンは spec の MCP 節に従う）
 

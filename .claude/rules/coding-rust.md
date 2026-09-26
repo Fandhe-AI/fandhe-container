@@ -8,7 +8,7 @@
 
 ## crate 構成と境界
 
-- workspace は `crates/<短縮名>`・crate 名前空間 `fandhe-container-*` で構成する（短縮名は TASK-1・REPAIR-1 で確定）
+- workspace は `crates/<短縮名>`・crate 名前空間 `fandhe-container-*` で構成する（短縮名は [crate-naming.md](../../docs/design/crate-naming.md)〔TASK-1・REPAIR-1〕で確定済み）
 - 1 回の改修が波及する crate・モジュールを最小に保つ（単一責務・疎結合。AI 自己補修の前提。REPAIR-1）
 - 循環依存を作らない。複数 crate が共有する型は下位 crate へ置き、上位から下位への一方向依存を保つ
 - 拡張機能は別プロセス＋UDS 境界の plugin として分離する。`ContainerRuntime`・`NetworkPlugin` の実装は plugin 側、`VolumeProvider`（データパス）はトレイト定義・実装とも core 側に置く（PLUG-1）。plugin の追加で core を変更しない（PLUG-4）

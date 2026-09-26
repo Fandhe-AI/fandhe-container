@@ -425,6 +425,8 @@ jobs:
         continue-on-error: true
         run: |
           RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          # Step Summary は API で取得できないため、gh run view --log で読めるよう
+          # 同じ表をジョブログにも出す（tee）
           {
             echo "### Linux env probe results — ${{ matrix.os }} (assert_kvm=${{ matrix.assert_kvm }})"
             echo ""
@@ -436,7 +438,7 @@ jobs:
                 echo "| ${item} | ${escaped_value} |"
               done < "${RESULTS_FILE}"
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
           exit 0
 
       # --------------------------------------------------

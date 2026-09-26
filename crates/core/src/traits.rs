@@ -1,4 +1,4 @@
-//! オーケストレーション拡張点のトレイト群（TASK-4・CRI-7・PLUG-1）。
+//! オーケストレーション拡張点のトレイト群（TASK-4・CRI-7・PLUG-1・MS-0）。
 //!
 //! CRI-7（Must・確定）は 4 トレイト（`ContainerRuntime`・`StateStore`・`NetworkPlugin`・
 //! `VolumeProvider`）を core に定義し、CRI サーバー層・I/O 層・実行層が互いの具象型を

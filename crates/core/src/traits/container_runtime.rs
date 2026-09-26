@@ -1,4 +1,4 @@
-//! `ContainerRuntime` 拡張点トレイト（TASK-4.1・CRI-7・PLUG-1）。
+//! `ContainerRuntime` 拡張点トレイト（TASK-4.1・CRI-7・PLUG-1・MS-0）。
 //!
 //! CRI サーバー層（`fandhe-container-cri`）・将来の containerd shim v2（CRI-5）は、
 //! この内部トレイトを呼ぶアダプタとなる想定（PoC-7 の原案）。実装は本 crate には置かず、

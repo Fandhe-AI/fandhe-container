@@ -1,5 +1,5 @@
 //! 拡張点トレイト（`ContainerRuntime`・`StateStore`・`NetworkPlugin`・`VolumeProvider`）が
-//! 共有する型（TASK-4・CRI-7）。
+//! 共有する型（TASK-4・CRI-7・MS-0）。
 //!
 //! `ContainerId` は OCI-5 の状態パス（`/run/fandhe-container/<id>/state.json` 等）の
 //! 1 パス要素になるため、外部入力（CLI・CRI・MCP リクエスト）から作る際にここで検証し、

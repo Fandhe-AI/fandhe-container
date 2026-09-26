@@ -402,11 +402,19 @@ impl CreateNetnsRequest {
 }
 
 /// [`NetworkPlugin::create_netns`] の応答。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// `path` は診断・ログ用途の実体パス（canonicalize 後）に過ぎず、`handle` が指す
+/// オブジェクトとの同一性を runtime 側が改めて保証する手段ではない。netns への
+/// join 等、実際の利用は必ず [`Self::handle`] が返すオープン済みのファイル
+/// ディスクリプタ経由で行い、`path()` を使って再度開き直さない契約とする
+/// （codex/review 指摘 P1・TOCTOU 対策）。`File` は `Clone`/`PartialEq`/`Eq`/`Hash` を
+/// 実装しないため、それらの derive は落としてある。
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct NetnsStatus {
     container: ContainerId,
     path: PathBuf,
+    handle: std::fs::File,
 }
 
 impl NetnsStatus {
@@ -441,13 +449,39 @@ impl NetnsStatus {
     ///
     /// 呼び出し側（境界機構・proxy。PLUG-11・PLUG-12）は、plugin から受け取った生の
     /// パスをそのまま渡してよい。symlink 解決はこの関数が行うため、呼び出し側で
-    /// 事前に正規化する契約には依存しない。返す [`NetnsStatus`] が保持するパスは
-    /// canonicalize 後の実体パスであり、runtime（`ContainerRuntime` 実装）がこの
-    /// netns に join する際にそのまま使える。
+    /// 事前に正規化する契約には依存しない。
+    ///
+    /// # netns であることの確認（codex/review 指摘 P1）
+    ///
+    /// 配下判定（手順 4）だけでは、`allowed_root` 配下に置かれた「netns を装った
+    /// 通常ファイル」を untrusted な plugin 応答がそのまま主張しても検出できない
+    /// （security.md「plugin からの入力は untrusted として検証する」）。そのため
+    /// canonicalize 後、実際に `canonical_path` を開いて Linux の `/proc/self/fd/<fd>`
+    /// が `net:[<inode>]` 形式（`proc(5)`。ネットワーク namespace 以外の namespace
+    /// 種別や通常ファイルはこの形式にならない）を指すことを確認する
+    /// （[`verify_is_netns`]）。`libc` / `nix` 等の追加依存やコード内 `unsafe` を
+    /// 増やさない方針（dependency-policy.md・coding-rust.md）のため、`setns(2)` 等の
+    /// syscall 直叩きではなく `std::fs`（`File::open`・`read_link`）のみで検証する。
+    /// Linux 以外（NET-1〜5 は Linux カーネルの netns 機能が前提）では常に拒否する。
+    ///
+    /// # TOCTOU 対策（codex/review 指摘 P1）
+    ///
+    /// 検証と利用の間で対象が差し替えられる（TOCTOU）と、canonicalize 後の
+    /// パス文字列だけを渡す契約では runtime が後で別の対象を開いてしまう。
+    /// 本関数は canonicalize 直後に一度だけ `File::open` した結果（`handle`）を
+    /// そのまま [`NetnsStatus`] に保持して返し、netns であることの確認
+    /// （上記）もこの同じハンドルに対して行う。runtime 側は [`Self::handle`] の
+    /// ハンドルをそのまま使い（将来の `setns(2)` 実装は fd を直接渡す）、
+    /// [`Self::path`] を再度開き直さない契約とすることで、確認した対象と
+    /// 利用する対象の同一性を保証する。`canonicalize` から `File::open` までの
+    /// 間（本関数内の数マイクロ秒）に限っては fs 操作自体の原子性が std だけでは
+    /// 保証できず残存するが、「runtime が任意のタイミングで再度パスを開き直す」
+    /// という従来の無期限な TOCTOU 窓は本関数内の 1 回の open へ縮小される。
     ///
     /// `allowed_root` が絶対パスでない、`path` が絶対パスでない、`path` が `.`・`..`
     /// を含む、`path` / `allowed_root` の実体が存在せず canonicalize に失敗する、
-    /// または canonicalize 後の `path` が canonicalize 後の `allowed_root` 配下にない
+    /// canonicalize 後の `path` が canonicalize 後の `allowed_root` 配下にない、
+    /// 対象を開けない、または対象がネットワーク namespace であることを確認できない
     /// 場合は [`ErrorCode::InvalidArgument`] を返す。
     pub fn new(
         container: ContainerId,
@@ -499,9 +533,21 @@ impl NetnsStatus {
                 "netns path must be under the allowed netns root",
             ));
         }
+        // codex/review 指摘 P1（TOCTOU）: ここで一度だけ開いたハンドルを、
+        // 直後の netns 種別確認（P1 その 1）にも、返り値として runtime に渡す
+        // ハンドルにも共用する。runtime が後から path() を再度開き直す経路を
+        // 作らないことで、確認対象と利用対象の同一性を保証する。
+        let handle = std::fs::File::open(&canonical_path).map_err(|e| {
+            TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("netns path could not be opened: {e}"),
+            )
+        })?;
+        verify_is_netns(&handle)?;
         Ok(Self {
             container,
             path: canonical_path,
+            handle,
         })
     }
 
@@ -510,10 +556,69 @@ impl NetnsStatus {
         &self.container
     }
 
-    /// netns の絶対パスを返す。
+    /// netns のオープン済みハンドルを返す。
+    ///
+    /// runtime（`ContainerRuntime` 実装）はこのハンドルを使って netns に join する
+    /// （将来の `setns(2)` 実装は本ハンドルの fd を直接渡す想定。TASK-4.h1）。
+    /// [`Self::path`] を使って再度開き直すと、[`Self::new`] が検証した対象との
+    /// 同一性が保証されなくなる（codex/review 指摘 P1・TOCTOU）。
+    pub fn handle(&self) -> &std::fs::File {
+        &self.handle
+    }
+
+    /// netns の絶対パス（canonicalize 後の実体パス）を返す。
+    ///
+    /// 診断・ログ用途のみに使う。実際に netns を利用する経路は必ず
+    /// [`Self::handle`] を使う（codex/review 指摘 P1・TOCTOU 対策）。
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// [`NetnsStatus::new`] が開いたハンドルが実際にネットワーク namespace であることを
+/// 確認する（codex/review 指摘 P1）。
+///
+/// `file` の指す対象が Linux の nsfs 上のネットワーク namespace であれば `Ok`、
+/// 通常ファイル・他の namespace 種別（uts・mnt・pid 等）・非対応プラットフォームでは
+/// `Err`（[`ErrorCode::InvalidArgument`]）を返す。`libc` / `nix` 等の追加依存や
+/// `unsafe` を増やさない方針（dependency-policy.md・coding-rust.md）のため、
+/// `statfs(2)` / `setns(2)` 直叩きではなく `std::fs::read_link` による
+/// `/proc/self/fd/<fd>` の内容確認のみで判定する。
+#[cfg(target_os = "linux")]
+fn verify_is_netns(file: &std::fs::File) -> Result<(), TraitError> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd_path = Path::new("/proc/self/fd").join(file.as_raw_fd().to_string());
+    let target = std::fs::read_link(&fd_path).map_err(|e| {
+        TraitError::new(
+            ErrorCode::InvalidArgument,
+            format!("netns handle could not be inspected via procfs: {e}"),
+        )
+    })?;
+    // nsfs 上の namespace ファイルは proc(5) の規定により `readlink` が
+    // `<種別>:[<inode番号>]`（例: `net:[4026531840]`）を返す。ネットワーク
+    // namespace 以外（`uts:[...]` 等）や通常ファイル（実パスになる）はこの形式に
+    // ならないため拒否する。
+    let target_str = target.to_string_lossy();
+    if target_str.starts_with("net:[") && target_str.ends_with(']') {
+        Ok(())
+    } else {
+        Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "netns path does not refer to a network namespace",
+        ))
+    }
+}
+
+/// Linux 以外では netns 機能自体が存在しない（NET-1〜5 は Linux カーネル前提）ため
+/// 常に拒否する。3 OS 一級対応（coding-rust.md）のためのプラットフォーム分岐であり、
+/// macOS / Windows 向けの netns 実装は本トレイトのスコープ外（#19・TASK-4.h1）。
+#[cfg(not(target_os = "linux"))]
+fn verify_is_netns(_file: &std::fs::File) -> Result<(), TraitError> {
+    Err(TraitError::new(
+        ErrorCode::InvalidArgument,
+        "netns is only supported on Linux",
+    ))
 }
 
 /// [`NetworkPlugin::attach`] の要求。
@@ -919,17 +1024,19 @@ mod tests {
         let net_status = boxed.create_network(&net_req).expect("create succeeds");
         assert_eq!(net_status.subnet().to_string(), "10.250.11.1/24");
 
-        let netns_status = boxed
+        // `StubNetworkPlugin::create_netns` は fixture の通常ファイルを渡すため、
+        // 特権なしでは本物の netns を用意できず [`NetnsStatus::new`] の netns 種別
+        // 確認（codex/review 指摘 P1）で必ず拒否される。dyn dispatch 経由で
+        // `Result<NetnsStatus, TraitError>` が正しく返ってくることの確認が本テストの
+        // 目的であり、実際の netns 検証は `p1_netns_status_rejects_non_netns_file`
+        // が担う。
+        let netns_err = boxed
             .create_netns(&CreateNetnsRequest::new(
                 sample_network_name(),
                 sample_container_id(),
             ))
-            .expect("create_netns succeeds");
-        assert_eq!(
-            netns_status.path().file_name(),
-            Some(std::ffi::OsStr::new("x"))
-        );
-        assert!(netns_status.path().is_absolute());
+            .expect_err("stub does not provide a real netns");
+        assert_eq!(netns_err.code().as_str(), "INVALID_ARGUMENT");
 
         let attach_resp = boxed
             .attach(&AttachRequest::new(
@@ -1045,8 +1152,7 @@ mod tests {
         assert_eq!(Protocol::Udp.as_str(), "udp");
     }
 
-    /// CRI-7: `NetnsStatus::new` は相対パスを拒否し、`allowed_root` 配下の実在する
-    /// 絶対パスは受理して canonicalize 後の実体パスを保持する。
+    /// CRI-7: `NetnsStatus::new` は相対パスを拒否する。
     #[test]
     fn cri7_netns_status_rejects_relative_path() {
         let fixture = NetnsTestFixture::new("relative");
@@ -1054,14 +1160,48 @@ mod tests {
         let err = NetnsStatus::new(sample_container_id(), PathBuf::from("netns"), &allowed_root)
             .expect_err("relative path must be rejected");
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
 
-        let valid_path = fixture.file_under(&allowed_root, "x");
-        let status = NetnsStatus::new(sample_container_id(), valid_path.clone(), &allowed_root)
-            .expect("path under allowed_root must be accepted");
-        assert_eq!(
-            status.path(),
-            valid_path.canonicalize().expect("canonicalize").as_path()
-        );
+    /// codex/review 指摘 P1: `NetnsStatus::new` は `allowed_root` 配下にあり
+    /// 字句上・symlink 解決後の配下判定を通る実在パスであっても、それが実際には
+    /// netns ではない通常ファイルであれば拒否する（untrusted な plugin 応答が
+    /// 「netns を装った通常ファイル」を主張するケースの再現。配下判定だけでは
+    /// 通ってしまっていた元の不具合）。
+    #[test]
+    fn p1_netns_status_rejects_non_netns_file() {
+        let fixture = NetnsTestFixture::new("non-netns");
+        let allowed_root = fixture.allowed_root();
+        let path = fixture.file_under(&allowed_root, "x");
+        let err = NetnsStatus::new(sample_container_id(), path, &allowed_root)
+            .expect_err("a regular file must not be accepted as a netns");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// codex/review 指摘 P1: netns 種別確認の核となる述語（`verify_is_netns`）は、
+    /// 特権なしで開ける実在のネットワーク namespace（自プロセスの
+    /// `/proc/self/ns/net`）を正しく受理する。`NetnsStatus::new` 全体（配下判定＋
+    /// canonicalize）を経由する結合テストは、`allowed_root` 配下に本物の netns を
+    /// 非特権で用意する手段がない（`ip netns add` 相当のビルドマウントには
+    /// `CAP_SYS_ADMIN` が要る）ため、述語単体をここで直接検証する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn p1_verify_is_netns_accepts_real_network_namespace() {
+        let file = std::fs::File::open("/proc/self/ns/net")
+            .expect("this process always has a network namespace");
+        verify_is_netns(&file).expect("own netns must be recognized as a netns");
+    }
+
+    /// codex/review 指摘 P1: netns 種別確認の述語は、netns ではない通常ファイルを
+    /// 拒否する（Linux で `/proc/self/fd/<fd>` の readlink が `net:[...]` 形式に
+    /// ならないケース）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn p1_verify_is_netns_rejects_regular_file() {
+        let fixture = NetnsTestFixture::new("predicate");
+        let path = fixture.file_under(fixture.base(), "not-a-netns");
+        let file = std::fs::File::open(&path).expect("open fixture file");
+        let err = verify_is_netns(&file).expect_err("a regular file must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
     }
 
     /// codex/review 指摘 P0: `NetnsStatus::new` は untrusted な plugin 応答が

@@ -646,7 +646,7 @@ impl VolumeDetachResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
     /// テスト用のスタブ実装。dyn 互換性と各メソッドの戻り値を確認するためのみに使う。
@@ -657,55 +657,116 @@ mod tests {
     /// `destination` をキーとしてエントリを取り除くことで、`remove` の使用中判定が
     /// 「detach 後は当該ボリュームを使う接続が無くなる」という契約を正しく反映するように
     /// する（AGENTS.md「テストとビヘイビア ID の対応」・REPAIR-12）。
+    ///
+    /// レビュー指摘（PR #1077）の是正: 以前は状態を持たず常に成功を返していたため、
+    /// `NotFound`・`AlreadyExists` を要求する契約に違反する実装でもスタブ自身のテストが
+    /// 通ってしまっていた。`volumes` に create 済みのボリューム名を保持し、
+    /// `attachments` の値を [`VolumeSource`] に変更して `Bind` も含めた同一接続先の
+    /// 二重 attach を検出できるようにする。
     #[derive(Default)]
     struct StubVolumeProvider {
-        attachments: Mutex<HashMap<(ContainerId, GuestPath), VolumeName>>,
+        volumes: Mutex<HashSet<VolumeName>>,
+        attachments: Mutex<HashMap<(ContainerId, GuestPath), VolumeSource>>,
     }
 
     impl StubVolumeProvider {
-        /// `name` を接続元とする attach が 1 件でも残っているかを判定する。
+        /// `name` を接続元（[`VolumeSource::Named`]）とする attach が 1 件でも残っているかを
+        /// 判定する。
         fn is_in_use(&self, name: &VolumeName) -> bool {
             self.attachments
                 .lock()
                 .expect("attachments mutex must not be poisoned")
                 .values()
-                .any(|attached_name| attached_name == name)
+                .any(|source| matches!(source, VolumeSource::Named(attached) if attached == name))
         }
     }
 
     impl VolumeProvider for StubVolumeProvider {
         fn create(&self, req: &VolumeCreateRequest) -> Result<VolumeInfo, TraitError> {
+            let mut volumes = self
+                .volumes
+                .lock()
+                .expect("volumes mutex must not be poisoned");
+            if !volumes.insert(req.name().clone()) {
+                return Err(TraitError::new(
+                    ErrorCode::AlreadyExists,
+                    "volume already exists",
+                ));
+            }
             Ok(VolumeInfo::new(req.name().clone()))
         }
 
         fn remove(&self, req: &VolumeRemoveRequest) -> Result<VolumeRemoveResponse, TraitError> {
+            if !self
+                .volumes
+                .lock()
+                .expect("volumes mutex must not be poisoned")
+                .contains(req.name())
+            {
+                return Err(TraitError::new(
+                    ErrorCode::NotFound,
+                    "volume does not exist",
+                ));
+            }
             if self.is_in_use(req.name()) && !req.force() {
                 return Err(TraitError::new(
                     ErrorCode::FailedPrecondition,
                     "volume is still attached",
                 ));
             }
+            self.volumes
+                .lock()
+                .expect("volumes mutex must not be poisoned")
+                .remove(req.name());
             self.attachments
                 .lock()
                 .expect("attachments mutex must not be poisoned")
-                .retain(|_, attached_name| attached_name != req.name());
+                .retain(
+                    |_, source| !matches!(source, VolumeSource::Named(name) if name == req.name()),
+                );
             Ok(VolumeRemoveResponse::new())
         }
 
         fn inspect(&self, req: &VolumeInspectRequest) -> Result<VolumeInfo, TraitError> {
+            if !self
+                .volumes
+                .lock()
+                .expect("volumes mutex must not be poisoned")
+                .contains(req.name())
+            {
+                return Err(TraitError::new(
+                    ErrorCode::NotFound,
+                    "volume does not exist",
+                ));
+            }
             Ok(VolumeInfo::new(req.name().clone()))
         }
 
         fn attach(&self, req: &VolumeAttachRequest) -> Result<VolumeAttachment, TraitError> {
-            if let VolumeSource::Named(name) = req.source() {
-                self.attachments
+            if let VolumeSource::Named(name) = req.source()
+                && !self
+                    .volumes
                     .lock()
-                    .expect("attachments mutex must not be poisoned")
-                    .insert(
-                        (req.container_id().clone(), req.destination().clone()),
-                        name.clone(),
-                    );
+                    .expect("volumes mutex must not be poisoned")
+                    .contains(name)
+            {
+                return Err(TraitError::new(
+                    ErrorCode::NotFound,
+                    "volume does not exist",
+                ));
             }
+            let key = (req.container_id().clone(), req.destination().clone());
+            let mut attachments = self
+                .attachments
+                .lock()
+                .expect("attachments mutex must not be poisoned");
+            if attachments.contains_key(&key) {
+                return Err(TraitError::new(
+                    ErrorCode::AlreadyExists,
+                    "destination is already attached",
+                ));
+            }
+            attachments.insert(key, req.source().clone());
             Ok(VolumeAttachment::new(
                 req.container_id().clone(),
                 req.destination().clone(),
@@ -752,6 +813,9 @@ mod tests {
         assert_eq!(info.name().as_str(), "sample-volume");
 
         let shared: Arc<dyn VolumeProvider> = Arc::new(StubVolumeProvider::default());
+        shared
+            .create(&VolumeCreateRequest::new(name.clone()))
+            .expect("create on the shared provider succeeds");
         let destination = GuestPath::new("/data").expect("valid guest path");
         let attach_req = VolumeAttachRequest::new(
             sample_container_id(),
@@ -1076,6 +1140,81 @@ mod tests {
                 .expect("remove without force succeeds after detach");
             assert_eq!(removed, VolumeRemoveResponse::new());
         }
+
+        /// CRI-7: 存在しないボリュームに対する `remove` は [`ErrorCode::NotFound`] を返す
+        /// （[`VolumeProvider::remove`] のドキュメント契約）。レビュー指摘（PR #1077）:
+        /// 状態を持たないスタブは常に成功していたため、この失敗条件を検証できていなかった。
+        pub(crate) fn remove_missing_volume_returns_not_found(provider: &dyn VolumeProvider) {
+            let name = sample_volume_name();
+            let err = provider
+                .remove(&VolumeRemoveRequest::new(name))
+                .expect_err("remove of a volume that was never created must fail");
+            assert_eq!(err.code().as_str(), "NOT_FOUND");
+        }
+
+        /// CRI-7: 存在しないボリュームに対する `inspect` は [`ErrorCode::NotFound`] を返す
+        /// （[`VolumeProvider::inspect`] のドキュメント契約）。
+        pub(crate) fn inspect_missing_volume_returns_not_found(provider: &dyn VolumeProvider) {
+            let name = sample_volume_name();
+            let err = provider
+                .inspect(&VolumeInspectRequest::new(name))
+                .expect_err("inspect of a volume that was never created must fail");
+            assert_eq!(err.code().as_str(), "NOT_FOUND");
+        }
+
+        /// CRI-7: [`VolumeSource::Named`] が指す未作成のボリュームへの `attach` は
+        /// [`ErrorCode::NotFound`] を返す（[`VolumeProvider::attach`] のドキュメント契約。
+        /// `Named` variant のみが対象で、`Bind` は provider 管理のボリュームではないため
+        /// この前提を課さない）。
+        pub(crate) fn attach_named_missing_volume_returns_not_found(provider: &dyn VolumeProvider) {
+            let name = sample_volume_name();
+            let destination = GuestPath::new("/data").expect("valid guest path");
+            let err = provider
+                .attach(&VolumeAttachRequest::new(
+                    sample_container_id(),
+                    VolumeSource::named(name),
+                    destination,
+                    AccessMode::ReadWrite,
+                ))
+                .expect_err("attach of an uncreated named volume must fail");
+            assert_eq!(err.code().as_str(), "NOT_FOUND");
+        }
+
+        /// CRI-7: 同一コンテナ・同一 [`GuestPath`] への二重 `attach` は
+        /// [`ErrorCode::AlreadyExists`] を返す（[`VolumeProvider::attach`] のドキュメント
+        /// 契約。「variant によらず」の記述どおり、2 回目が異なる名前付きボリュームでも
+        /// 拒否されることを確認する）。
+        pub(crate) fn attach_duplicate_destination_returns_already_exists(
+            provider: &dyn VolumeProvider,
+        ) {
+            let first_name = VolumeName::new("sample-volume-a").expect("valid name");
+            let second_name = VolumeName::new("sample-volume-b").expect("valid name");
+            provider
+                .create(&VolumeCreateRequest::new(first_name.clone()))
+                .expect("create first volume succeeds");
+            provider
+                .create(&VolumeCreateRequest::new(second_name.clone()))
+                .expect("create second volume succeeds");
+            let destination = GuestPath::new("/data").expect("valid guest path");
+            provider
+                .attach(&VolumeAttachRequest::new(
+                    sample_container_id(),
+                    VolumeSource::named(first_name),
+                    destination.clone(),
+                    AccessMode::ReadWrite,
+                ))
+                .expect("first attach to the destination succeeds");
+
+            let err = provider
+                .attach(&VolumeAttachRequest::new(
+                    sample_container_id(),
+                    VolumeSource::named(second_name),
+                    destination,
+                    AccessMode::ReadWrite,
+                ))
+                .expect_err("second attach to the same destination must fail");
+            assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
+        }
     }
 
     /// CRI-7: [`contract::remove_in_use_returns_failed_precondition`] を
@@ -1097,6 +1236,36 @@ mod tests {
     #[test]
     fn cri7_volume_remove_after_detach_succeeds_without_force() {
         contract::remove_after_detach_succeeds_without_force(&StubVolumeProvider::default());
+    }
+
+    /// CRI-7: [`contract::remove_missing_volume_returns_not_found`] を
+    /// `StubVolumeProvider` に対して機械照合する。
+    #[test]
+    fn cri7_volume_remove_missing_returns_not_found() {
+        contract::remove_missing_volume_returns_not_found(&StubVolumeProvider::default());
+    }
+
+    /// CRI-7: [`contract::inspect_missing_volume_returns_not_found`] を
+    /// `StubVolumeProvider` に対して機械照合する。
+    #[test]
+    fn cri7_volume_inspect_missing_returns_not_found() {
+        contract::inspect_missing_volume_returns_not_found(&StubVolumeProvider::default());
+    }
+
+    /// CRI-7: [`contract::attach_named_missing_volume_returns_not_found`] を
+    /// `StubVolumeProvider` に対して機械照合する。
+    #[test]
+    fn cri7_volume_attach_named_missing_returns_not_found() {
+        contract::attach_named_missing_volume_returns_not_found(&StubVolumeProvider::default());
+    }
+
+    /// CRI-7: [`contract::attach_duplicate_destination_returns_already_exists`] を
+    /// `StubVolumeProvider` に対して機械照合する。
+    #[test]
+    fn cri7_volume_attach_duplicate_destination_returns_already_exists() {
+        contract::attach_duplicate_destination_returns_already_exists(
+            &StubVolumeProvider::default(),
+        );
     }
 
     /// CRI-7: `VolumeName` の `TryFrom<&str>`/`TryFrom<String>` は `new` と同じ検証結果を返す。

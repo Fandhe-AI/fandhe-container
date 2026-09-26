@@ -13,7 +13,7 @@
 
 **ホスト側プロセス RSS 合計（VM プロセスを除く）が Docker Desktop 現行版比 10% 以内**
 
-- Docker Desktop 基準: 約 2,524MB
+- Docker Desktop 基準: 約 2,524MB（PoC-11。Docker 自身のプロセス〔`com.docker.backend`・`com.docker.virtualization` 等〕の合計で、`com.apple.Virtualization.VirtualMachine` は含まない。本基盤と同じ除外条件の値）
 - 本基盤の上限: 約 252MB 以下
 - 根拠: PoC-11 の実測で同構成の Podman (applehv) 約 71MB（2.8%）・colima (virtiofs) 約 150MB（5.9%）が満たしており達成見込みがある
 

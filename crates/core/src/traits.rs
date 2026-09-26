@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `StateStore` が扱うコンテナ ID。
 ///
@@ -134,20 +134,111 @@ pub enum ContainerStatus {
 ///
 /// 永続化形式（JSON 等）はこのトレイトの契約に含めない。ファイルベース
 /// 既定実装の形式決定は TASK-31（OCI-5）の責務。
+///
+/// フィールドは非公開とし、`new` の検証を経ないと値を作れない（「壊れた値を
+/// 表現できない型」。coding-rust.md・REPAIR-2）。`create`/`update`（`&dyn
+/// StateStore` 経由の plugin 実装を含む）は `ContainerState` を受け取る時点で
+/// 既にライフサイクル整合性が保証されるため、トレイト実装側で個別に
+/// pid / status / bundle の整合性を再検証する必要はない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerState {
     /// 対象とする OCI Runtime Specification のバージョン文字列。
-    pub oci_version: String,
+    oci_version: String,
     /// コンテナ ID。
-    pub id: ContainerId,
+    id: ContainerId,
     /// ライフサイクル状態。
-    pub status: ContainerStatus,
-    /// コンテナプロセスの PID。`Created`/`Running` のときのみ `Some`。
-    pub pid: Option<u32>,
+    status: ContainerStatus,
+    /// コンテナプロセスの PID。`Running` のときは必ず `Some`、`Creating`/
+    /// `Stopped` のときは必ず `None`（`Created` はプロセスが未起動なら
+    /// `None`、fork 済みなら `Some` のどちらも許容する）。
+    pid: Option<u32>,
     /// バンドルディレクトリの絶対パス。
-    pub bundle: PathBuf,
+    bundle: PathBuf,
     /// 任意のアノテーション。
-    pub annotations: BTreeMap<String, String>,
+    annotations: BTreeMap<String, String>,
+}
+
+impl ContainerState {
+    /// 検証済みの `ContainerState` を生成する。
+    ///
+    /// 検証項目（違反時は `StateStoreError::InvalidState` を返す）:
+    /// - `status` が `Running` のとき `pid` は `Some` でなければならない
+    /// - `status` が `Creating`/`Stopped` のとき `pid` は `None` でなければ
+    ///   ならない（`Created` は制約なし）
+    /// - `bundle` は絶対パスでなければならない（相対パスは OCI-5 の状態
+    ///   ファイルからの再構成時に基準ディレクトリへ依存し曖昧になるため）
+    pub fn new(
+        oci_version: impl Into<String>,
+        id: ContainerId,
+        status: ContainerStatus,
+        pid: Option<u32>,
+        bundle: PathBuf,
+        annotations: BTreeMap<String, String>,
+    ) -> Result<Self, StateStoreError> {
+        match (status, pid) {
+            (ContainerStatus::Running, None) => {
+                return Err(StateStoreError::InvalidState {
+                    reason: "pid must be Some when status is Running".to_string(),
+                });
+            }
+            (ContainerStatus::Creating, Some(_)) => {
+                return Err(StateStoreError::InvalidState {
+                    reason: "pid must be None when status is Creating".to_string(),
+                });
+            }
+            (ContainerStatus::Stopped, Some(_)) => {
+                return Err(StateStoreError::InvalidState {
+                    reason: "pid must be None when status is Stopped".to_string(),
+                });
+            }
+            _ => {}
+        }
+        if !bundle.is_absolute() {
+            return Err(StateStoreError::InvalidState {
+                reason: "bundle must be an absolute path".to_string(),
+            });
+        }
+
+        Ok(Self {
+            oci_version: oci_version.into(),
+            id,
+            status,
+            pid,
+            bundle,
+            annotations,
+        })
+    }
+
+    /// 対象とする OCI Runtime Specification のバージョン文字列。
+    pub fn oci_version(&self) -> &str {
+        &self.oci_version
+    }
+
+    /// コンテナ ID。
+    pub fn id(&self) -> &ContainerId {
+        &self.id
+    }
+
+    /// ライフサイクル状態。
+    pub fn status(&self) -> ContainerStatus {
+        self.status
+    }
+
+    /// コンテナプロセスの PID（`new` の検証によりステータスとの整合性が
+    /// 保証されている。型ドキュメント参照）。
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// バンドルディレクトリの絶対パス。
+    pub fn bundle(&self) -> &Path {
+        &self.bundle
+    }
+
+    /// 任意のアノテーション。
+    pub fn annotations(&self) -> &BTreeMap<String, String> {
+        &self.annotations
+    }
 }
 
 /// `StateStore` の操作が失敗した理由。
@@ -160,6 +251,12 @@ pub enum StateStoreError {
     /// `ContainerId` の検証に失敗した。
     InvalidId {
         /// 検証に失敗した理由（英語・資格情報やホスト固有情報を含まない）。
+        reason: String,
+    },
+    /// `ContainerState::new` の検証に失敗した（status と pid の不整合・
+    /// `bundle` が相対パス等）。
+    InvalidState {
+        /// 検証に失敗した理由（英語）。
         reason: String,
     },
     /// 指定した ID のコンテナ状態が見つからない。
@@ -198,6 +295,7 @@ impl StateStoreError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidId { .. } => "INVALID_ID",
+            Self::InvalidState { .. } => "INVALID_STATE",
             Self::NotFound { .. } => "NOT_FOUND",
             Self::AlreadyExists { .. } => "ALREADY_EXISTS",
             Self::Corrupted { .. } => "CORRUPTED",
@@ -212,6 +310,7 @@ impl fmt::Display for StateStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidId { reason } => write!(f, "invalid container id: {reason}"),
+            Self::InvalidState { reason } => write!(f, "invalid container state: {reason}"),
             Self::NotFound { id } => write!(f, "container state not found: {id}"),
             Self::AlreadyExists { id } => write!(f, "container state already exists: {id}"),
             Self::Corrupted { id, reason } => {
@@ -225,6 +324,26 @@ impl fmt::Display for StateStoreError {
 }
 
 impl Error for StateStoreError {}
+
+/// `StateStore::list` が 1 回の呼び出しで返す最大件数。
+///
+/// 無制限確保による DoS を防ぐための上限（security.md「長さ・件数を上限
+/// 検証してからアロケーションに使う」）。実装はこれを超える件数を 1 ページ
+/// に詰め込んではならない。
+pub const LIST_PAGE_LIMIT: usize = 1024;
+
+/// `StateStore::list` の 1 ページ分の結果。
+///
+/// `next_cursor` が `Some` の場合はまだ残りがあることを示し、続きは
+/// `list(next_cursor.as_ref())` で取得できる。`None` は末尾まで返し終えた
+/// ことを示す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerIdPage {
+    /// このページに含まれるコンテナ ID（`LIST_PAGE_LIMIT` 件以下）。
+    pub ids: Vec<ContainerId>,
+    /// 次ページの開始位置。末尾まで返し終えた場合は `None`。
+    pub next_cursor: Option<ContainerId>,
+}
 
 /// コンテナ状態の永続化・取得を抽象化するトレイト（CRI-7・PLUG-1）。
 ///
@@ -271,11 +390,18 @@ pub trait StateStore: Send + Sync {
     /// 見つからない場合は `StateStoreError::NotFound` を返す。
     fn delete(&self, id: &ContainerId) -> Result<(), StateStoreError>;
 
-    /// 永続化されている全コンテナ ID を列挙する。
+    /// 永続化されているコンテナ ID を 1 ページ分列挙する。
     ///
-    /// 実装は返却件数に上限を設け、破損したエントリを読んでも panic しない
-    /// こと（無制限確保による DoS を防ぐ。security.md）。
-    fn list(&self) -> Result<Vec<ContainerId>, StateStoreError>;
+    /// `after` に前回取得した `ContainerIdPage::next_cursor` を渡すと、その
+    /// 続き（`after` より後の ID）から返す。`None` は先頭から返す。
+    /// 実装は 1 回の呼び出しで返す件数を `LIST_PAGE_LIMIT` 以下に制限し
+    /// （無制限確保による DoS を防ぐ。security.md）、上限に達してもまだ
+    /// 残りがある場合は `next_cursor` に次ページの開始位置（`Some`）を
+    /// 設定する。全件を取りこぼさず列挙するには、呼び出し側が
+    /// `next_cursor` が `None` になるまでループする必要がある
+    /// （全件列挙の契約は「1 回の呼び出し」ではなく「ページングの完了」で
+    /// 満たされる）。破損したエントリを読んでも panic しないこと。
+    fn list(&self, after: Option<&ContainerId>) -> Result<ContainerIdPage, StateStoreError>;
 }
 
 #[cfg(test)]
@@ -303,12 +429,12 @@ mod tests {
     impl StateStore for InMemoryStateStore {
         fn create(&self, state: &ContainerState) -> Result<(), StateStoreError> {
             let mut entries = self.entries.lock().expect("test mutex poisoned");
-            if entries.contains_key(&state.id) {
+            if entries.contains_key(state.id()) {
                 return Err(StateStoreError::AlreadyExists {
-                    id: state.id.clone(),
+                    id: state.id().clone(),
                 });
             }
-            entries.insert(state.id.clone(), state.clone());
+            entries.insert(state.id().clone(), state.clone());
             Ok(())
         }
 
@@ -322,12 +448,12 @@ mod tests {
 
         fn update(&self, state: &ContainerState) -> Result<(), StateStoreError> {
             let mut entries = self.entries.lock().expect("test mutex poisoned");
-            if !entries.contains_key(&state.id) {
+            if !entries.contains_key(state.id()) {
                 return Err(StateStoreError::NotFound {
-                    id: state.id.clone(),
+                    id: state.id().clone(),
                 });
             }
-            entries.insert(state.id.clone(), state.clone());
+            entries.insert(state.id().clone(), state.clone());
             Ok(())
         }
 
@@ -339,21 +465,66 @@ mod tests {
                 .ok_or_else(|| StateStoreError::NotFound { id: id.clone() })
         }
 
-        fn list(&self) -> Result<Vec<ContainerId>, StateStoreError> {
+        fn list(&self, after: Option<&ContainerId>) -> Result<ContainerIdPage, StateStoreError> {
             let entries = self.entries.lock().expect("test mutex poisoned");
-            Ok(entries.keys().cloned().collect())
+            let range = match after {
+                Some(cursor) => entries.range((
+                    std::ops::Bound::Excluded(cursor.clone()),
+                    std::ops::Bound::Unbounded,
+                )),
+                None => entries.range(..),
+            };
+
+            // `next_cursor` は「実際にこのページへ積んだ最後の ID」でなければ
+            // ならない。先読みした（ページに積まなかった）ID を cursor にすると、
+            // その ID は次ページでも Excluded 側の境界に消費され、どのページにも
+            // 現れないまま失われる（このバグは修正前に発生していた）。
+            let mut iter = range.peekable();
+            let mut ids = Vec::new();
+            while ids.len() < LIST_PAGE_LIMIT {
+                match iter.next() {
+                    Some((id, _)) => ids.push(id.clone()),
+                    None => break,
+                }
+            }
+            let next_cursor = if iter.peek().is_some() {
+                ids.last().cloned()
+            } else {
+                None
+            };
+            Ok(ContainerIdPage { ids, next_cursor })
         }
     }
 
     fn sample_state(id: &str) -> ContainerState {
-        ContainerState {
-            oci_version: "1.0.2".to_string(),
-            id: ContainerId::new(id).expect("valid id in test fixture"),
-            status: ContainerStatus::Created,
-            pid: None,
-            bundle: PathBuf::from("/run/fandhe-container/bundle"),
-            annotations: BTreeMap::new(),
+        ContainerState::new(
+            "1.0.2",
+            ContainerId::new(id).expect("valid id in test fixture"),
+            ContainerStatus::Created,
+            None,
+            PathBuf::from("/run/fandhe-container/bundle"),
+            BTreeMap::new(),
+        )
+        .expect("valid state in test fixture")
+    }
+
+    /// `list` の全ページを走査し、全コンテナ ID を昇順で返すテストヘルパー。
+    fn list_all(store: &dyn StateStore) -> Vec<ContainerId> {
+        let mut ids = Vec::new();
+        let mut cursor: Option<ContainerId> = None;
+        loop {
+            let page = store.list(cursor.as_ref()).expect("list should succeed");
+            let reached_end = page.next_cursor.is_none();
+            ids.extend(page.ids);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => {
+                    assert!(reached_end);
+                    break;
+                }
+            }
         }
+        ids
     }
 
     // object safety の確認（PLUG-1: `&dyn StateStore` として plugin アダプタに
@@ -374,7 +545,7 @@ mod tests {
         let store: Box<dyn StateStore> = Box::new(InMemoryStateStore::new());
         let state = sample_state("abc123");
         store.create(&state).expect("create should succeed");
-        let loaded = store.load(&state.id).expect("load should succeed");
+        let loaded = store.load(state.id()).expect("load should succeed");
         assert_eq!(loaded, state);
     }
 
@@ -416,9 +587,39 @@ mod tests {
         let store: Box<dyn StateStore> = Box::new(InMemoryStateStore::new());
         let state = sample_state("abc123");
         store.create(&state).expect("create should succeed");
-        store.delete(&state.id).expect("delete should succeed");
-        let ids = store.list().expect("list should succeed");
-        assert_eq!(ids, Vec::<ContainerId>::new());
+        store.delete(state.id()).expect("delete should succeed");
+        let page = store.list(None).expect("list should succeed");
+        assert_eq!(page.ids, Vec::<ContainerId>::new());
+        assert_eq!(page.next_cursor, None);
+    }
+
+    /// CRI-7: `list` は 1 ページの上限（`LIST_PAGE_LIMIT`）を超える件数を
+    /// 1 回の呼び出しで返さず、`next_cursor` で残りを示す。呼び出し側が
+    /// `next_cursor` を使って全ページを辿ればコンテナを見落とさない
+    /// （全件列挙の契約とページングの両立）。
+    #[test]
+    fn cri7_list_paginates_beyond_page_limit() {
+        let store: Box<dyn StateStore> = Box::new(InMemoryStateStore::new());
+        let total = LIST_PAGE_LIMIT + 5;
+        for i in 0..total {
+            let state = sample_state(&format!("c{i:05}"));
+            store.create(&state).expect("create should succeed");
+        }
+
+        let first_page = store.list(None).expect("list should succeed");
+        assert_eq!(first_page.ids.len(), LIST_PAGE_LIMIT);
+        assert!(first_page.next_cursor.is_some());
+
+        let all_ids = list_all(store.as_ref());
+        assert_eq!(all_ids.len(), total);
+        let mut sorted = all_ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            total,
+            "list_all must not miss or duplicate ids"
+        );
     }
 
     #[test]
@@ -482,6 +683,13 @@ mod tests {
             "INVALID_ID"
         );
         assert_eq!(
+            StateStoreError::InvalidState {
+                reason: "x".to_string()
+            }
+            .code(),
+            "INVALID_STATE"
+        );
+        assert_eq!(
             StateStoreError::NotFound { id: id.clone() }.code(),
             "NOT_FOUND"
         );
@@ -512,5 +720,123 @@ mod tests {
             .code(),
             "UNAVAILABLE"
         );
+    }
+
+    /// CRI-7: `Running` は `pid: Some` を要求し、`Creating`/`Stopped` は
+    /// `pid: None` を要求する。`Created` は制約なし（両方許容）。
+    #[test]
+    fn container_state_new_enforces_pid_status_invariant() {
+        let id = || ContainerId::new("abc123").expect("valid id in test fixture");
+        let bundle = || PathBuf::from("/run/fandhe-container/bundle");
+
+        // 妥当な組み合わせ。
+        assert!(
+            ContainerState::new(
+                "1.0.2",
+                id(),
+                ContainerStatus::Creating,
+                None,
+                bundle(),
+                BTreeMap::new()
+            )
+            .is_ok()
+        );
+        assert!(
+            ContainerState::new(
+                "1.0.2",
+                id(),
+                ContainerStatus::Created,
+                None,
+                bundle(),
+                BTreeMap::new()
+            )
+            .is_ok()
+        );
+        assert!(
+            ContainerState::new(
+                "1.0.2",
+                id(),
+                ContainerStatus::Created,
+                Some(123),
+                bundle(),
+                BTreeMap::new()
+            )
+            .is_ok()
+        );
+        assert!(
+            ContainerState::new(
+                "1.0.2",
+                id(),
+                ContainerStatus::Running,
+                Some(123),
+                bundle(),
+                BTreeMap::new()
+            )
+            .is_ok()
+        );
+        assert!(
+            ContainerState::new(
+                "1.0.2",
+                id(),
+                ContainerStatus::Stopped,
+                None,
+                bundle(),
+                BTreeMap::new()
+            )
+            .is_ok()
+        );
+
+        // 不正な組み合わせ: Running で pid: None。
+        let err = ContainerState::new(
+            "1.0.2",
+            id(),
+            ContainerStatus::Running,
+            None,
+            bundle(),
+            BTreeMap::new(),
+        )
+        .expect_err("Running with pid: None must be rejected");
+        assert_eq!(err.code(), "INVALID_STATE");
+
+        // 不正な組み合わせ: Stopped で pid: Some。
+        let err = ContainerState::new(
+            "1.0.2",
+            id(),
+            ContainerStatus::Stopped,
+            Some(123),
+            bundle(),
+            BTreeMap::new(),
+        )
+        .expect_err("Stopped with pid: Some must be rejected");
+        assert_eq!(err.code(), "INVALID_STATE");
+
+        // 不正な組み合わせ: Creating で pid: Some。
+        let err = ContainerState::new(
+            "1.0.2",
+            id(),
+            ContainerStatus::Creating,
+            Some(123),
+            bundle(),
+            BTreeMap::new(),
+        )
+        .expect_err("Creating with pid: Some must be rejected");
+        assert_eq!(err.code(), "INVALID_STATE");
+    }
+
+    /// CRI-7: `bundle` は絶対パスでなければならない。相対パスは OCI-5 の
+    /// 状態ファイルからの再構成時に基準ディレクトリへ依存し曖昧になるため
+    /// 構築時に拒否する。
+    #[test]
+    fn container_state_new_rejects_relative_bundle() {
+        let err = ContainerState::new(
+            "1.0.2",
+            ContainerId::new("abc123").expect("valid id in test fixture"),
+            ContainerStatus::Created,
+            None,
+            PathBuf::from("relative/bundle"),
+            BTreeMap::new(),
+        )
+        .expect_err("relative bundle must be rejected");
+        assert_eq!(err.code(), "INVALID_STATE");
     }
 }

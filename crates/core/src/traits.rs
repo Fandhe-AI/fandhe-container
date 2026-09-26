@@ -130,6 +130,25 @@ pub enum ContainerStatus {
     Stopped,
 }
 
+/// supervisor（コンテナごとの軽量監視プロセス）から見たコンテナの健全性。
+///
+/// `docs/design/crate-naming.md` 決定 6 に基づき、`state.json` の形式・
+/// supervisor が使う項目（`supervisor_pid`・`health`・`restart_count`）を
+/// core の状態型（`ContainerState`）に含める。判定ロジック（ヘルスチェックの
+/// 実行方法・間隔等）は TASK-157 の範囲であり、本トレイトは値の置き場のみを
+/// 定義する（REPAIR-3: 未実装範囲の明示）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HealthStatus {
+    /// 未判定（supervisor がまだヘルスチェックを実行していない、または
+    /// ヘルスチェックが設定されていないコンテナの既定値）。
+    #[default]
+    Unknown,
+    /// 健全。
+    Healthy,
+    /// 不健全（supervisor の再起動判断に使われる。TASK-157）。
+    Unhealthy,
+}
+
 /// `StateStore` が永続化・取得するコンテナ状態の 1 レコード。
 ///
 /// 永続化形式（JSON 等）はこのトレイトの契約に含めない。ファイルベース
@@ -156,17 +175,53 @@ pub struct ContainerState {
     bundle: PathBuf,
     /// 任意のアノテーション。
     annotations: BTreeMap<String, String>,
+    /// supervisor（コンテナごとの監視プロセス）自身の PID。supervisor が
+    /// 未起動、またはこの状態を扱う実装が supervisor と無関係な場合は
+    /// `None`（決定 6・TASK-157）。
+    supervisor_pid: Option<u32>,
+    /// supervisor が判定したヘルスチェック結果（決定 6・TASK-157）。
+    health: HealthStatus,
+    /// supervisor によるコンテナプロセスの再起動回数（決定 6・TASK-157）。
+    restart_count: u32,
 }
 
 impl ContainerState {
+    /// `oci_version` の長さ上限（バイト）。OCI Runtime Specification の
+    /// バージョン文字列（例: `"1.0.2"`）を想定した暫定値で、TASK-31 で
+    /// 見直してよい。
+    pub const MAX_OCI_VERSION_LEN: usize = 32;
+    /// `bundle` パスの長さ上限（バイト）。Linux の一般的な `PATH_MAX`
+    /// （4096 バイト）に合わせた暫定値。3 OS 対応の長パス方針（IO-5）は
+    /// TASK-31 で見直す。
+    pub const MAX_BUNDLE_LEN: usize = 4096;
+    /// `annotations` の件数上限。無制限確保による DoS を防ぐ
+    /// （security.md「長さ・件数を上限検証してからアロケーションに使う」）。
+    pub const MAX_ANNOTATION_COUNT: usize = 256;
+    /// アノテーション 1 件あたりのキーの長さ上限（バイト）。
+    pub const MAX_ANNOTATION_KEY_LEN: usize = 256;
+    /// アノテーション 1 件あたりの値の長さ上限（バイト）。
+    pub const MAX_ANNOTATION_VALUE_LEN: usize = 4096;
+
     /// 検証済みの `ContainerState` を生成する。
     ///
     /// 検証項目（違反時は `StateStoreError::InvalidState` を返す）:
-    /// - `status` が `Running` のとき `pid` は `Some` でなければならない
+    /// - `status` が `Running` のとき `pid` は `Some` でなければならず、
+    ///   `0` はコンテナプロセスを指せないため許容しない
     /// - `status` が `Creating`/`Stopped` のとき `pid` は `None` でなければ
     ///   ならない（`Created` は制約なし）
     /// - `bundle` は絶対パスでなければならない（相対パスは OCI-5 の状態
     ///   ファイルからの再構成時に基準ディレクトリへ依存し曖昧になるため）
+    /// - `oci_version` は `Self::MAX_OCI_VERSION_LEN` バイト以下・空でない・
+    ///   `<数字>(.<数字>)*`（1 個以上のドット区切り数字列）の形式であること
+    /// - `bundle` は `Self::MAX_BUNDLE_LEN` バイト以下であること
+    /// - `annotations` は `Self::MAX_ANNOTATION_COUNT` 件以下、各キーは
+    ///   `Self::MAX_ANNOTATION_KEY_LEN` バイト以下、各値は
+    ///   `Self::MAX_ANNOTATION_VALUE_LEN` バイト以下であること
+    ///
+    /// 外部入力（イメージ・CRI リクエスト等）から状態を構築する経路で
+    /// 巨大な値を無制限に受け入れないための検証（security.md・
+    /// coding-rust.md「長さ・件数を上限検証してからアロケーションに使う」）。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         oci_version: impl Into<String>,
         id: ContainerId,
@@ -174,11 +229,21 @@ impl ContainerState {
         pid: Option<u32>,
         bundle: PathBuf,
         annotations: BTreeMap<String, String>,
+        supervisor_pid: Option<u32>,
+        health: HealthStatus,
+        restart_count: u32,
     ) -> Result<Self, StateStoreError> {
+        let oci_version = oci_version.into();
+
         match (status, pid) {
             (ContainerStatus::Running, None) => {
                 return Err(StateStoreError::InvalidState {
                     reason: "pid must be Some when status is Running".to_string(),
+                });
+            }
+            (ContainerStatus::Running, Some(0)) => {
+                return Err(StateStoreError::InvalidState {
+                    reason: "pid must not be 0 when status is Running".to_string(),
                 });
             }
             (ContainerStatus::Creating, Some(_)) => {
@@ -198,15 +263,80 @@ impl ContainerState {
                 reason: "bundle must be an absolute path".to_string(),
             });
         }
+        let bundle_len = bundle.as_os_str().len();
+        if bundle_len > Self::MAX_BUNDLE_LEN {
+            return Err(StateStoreError::InvalidState {
+                reason: format!("bundle must be at most {} bytes", Self::MAX_BUNDLE_LEN),
+            });
+        }
+        Self::validate_oci_version(&oci_version)?;
+        if annotations.len() > Self::MAX_ANNOTATION_COUNT {
+            return Err(StateStoreError::InvalidState {
+                reason: format!(
+                    "annotations must contain at most {} entries",
+                    Self::MAX_ANNOTATION_COUNT
+                ),
+            });
+        }
+        for (key, value) in &annotations {
+            if key.len() > Self::MAX_ANNOTATION_KEY_LEN {
+                return Err(StateStoreError::InvalidState {
+                    reason: format!(
+                        "annotation key must be at most {} bytes",
+                        Self::MAX_ANNOTATION_KEY_LEN
+                    ),
+                });
+            }
+            if value.len() > Self::MAX_ANNOTATION_VALUE_LEN {
+                return Err(StateStoreError::InvalidState {
+                    reason: format!(
+                        "annotation value must be at most {} bytes",
+                        Self::MAX_ANNOTATION_VALUE_LEN
+                    ),
+                });
+            }
+        }
 
         Ok(Self {
-            oci_version: oci_version.into(),
+            oci_version,
             id,
             status,
             pid,
             bundle,
             annotations,
+            supervisor_pid,
+            health,
+            restart_count,
         })
+    }
+
+    /// `oci_version` が OCI Runtime Specification のバージョン文字列として
+    /// 妥当な形式（空でない・`Self::MAX_OCI_VERSION_LEN` バイト以下・
+    /// 1 個以上のドット区切り数字列。例: `"1.0.2"`）かを検証する。
+    fn validate_oci_version(oci_version: &str) -> Result<(), StateStoreError> {
+        if oci_version.is_empty() {
+            return Err(StateStoreError::InvalidState {
+                reason: "oci_version must not be empty".to_string(),
+            });
+        }
+        if oci_version.len() > Self::MAX_OCI_VERSION_LEN {
+            return Err(StateStoreError::InvalidState {
+                reason: format!(
+                    "oci_version must be at most {} bytes",
+                    Self::MAX_OCI_VERSION_LEN
+                ),
+            });
+        }
+        let is_valid = oci_version
+            .split('.')
+            .all(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()));
+        if !is_valid {
+            return Err(StateStoreError::InvalidState {
+                reason: "oci_version must be a dot-separated numeric version (e.g. \"1.0.2\")"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// 対象とする OCI Runtime Specification のバージョン文字列。
@@ -238,6 +368,21 @@ impl ContainerState {
     /// 任意のアノテーション。
     pub fn annotations(&self) -> &BTreeMap<String, String> {
         &self.annotations
+    }
+
+    /// supervisor 自身の PID（決定 6・TASK-157）。
+    pub fn supervisor_pid(&self) -> Option<u32> {
+        self.supervisor_pid
+    }
+
+    /// supervisor が判定したヘルスチェック結果（決定 6・TASK-157）。
+    pub fn health(&self) -> HealthStatus {
+        self.health
+    }
+
+    /// supervisor によるコンテナプロセスの再起動回数（決定 6・TASK-157）。
+    pub fn restart_count(&self) -> u32 {
+        self.restart_count
     }
 }
 
@@ -496,14 +641,29 @@ mod tests {
         }
     }
 
+    /// テスト用の絶対パスのバンドルディレクトリ。`ContainerState::new` は
+    /// `Path::is_absolute()` で判定するため、Windows では Unix 形式の
+    /// パス（ドライブプレフィックスなし）が相対パス扱いになり検証に失敗する
+    /// （3 OS 一級対応。IO-5）。OS ごとに絶対パスとして解決される値を返す。
+    fn test_bundle_path() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\fandhe-container\bundle")
+        } else {
+            PathBuf::from("/run/fandhe-container/bundle")
+        }
+    }
+
     fn sample_state(id: &str) -> ContainerState {
         ContainerState::new(
             "1.0.2",
             ContainerId::new(id).expect("valid id in test fixture"),
             ContainerStatus::Created,
             None,
-            PathBuf::from("/run/fandhe-container/bundle"),
+            test_bundle_path(),
             BTreeMap::new(),
+            None,
+            HealthStatus::Unknown,
+            0,
         )
         .expect("valid state in test fixture")
     }
@@ -722,12 +882,13 @@ mod tests {
         );
     }
 
-    /// CRI-7: `Running` は `pid: Some` を要求し、`Creating`/`Stopped` は
-    /// `pid: None` を要求する。`Created` は制約なし（両方許容）。
+    /// CRI-7: `Running` は `pid: Some` を要求し（`0` は不可）、
+    /// `Creating`/`Stopped` は `pid: None` を要求する。`Created` は制約なし
+    /// （両方許容）。
     #[test]
     fn container_state_new_enforces_pid_status_invariant() {
         let id = || ContainerId::new("abc123").expect("valid id in test fixture");
-        let bundle = || PathBuf::from("/run/fandhe-container/bundle");
+        let bundle = test_bundle_path;
 
         // 妥当な組み合わせ。
         assert!(
@@ -737,7 +898,10 @@ mod tests {
                 ContainerStatus::Creating,
                 None,
                 bundle(),
-                BTreeMap::new()
+                BTreeMap::new(),
+                None,
+                HealthStatus::Unknown,
+                0,
             )
             .is_ok()
         );
@@ -748,7 +912,10 @@ mod tests {
                 ContainerStatus::Created,
                 None,
                 bundle(),
-                BTreeMap::new()
+                BTreeMap::new(),
+                None,
+                HealthStatus::Unknown,
+                0,
             )
             .is_ok()
         );
@@ -759,7 +926,10 @@ mod tests {
                 ContainerStatus::Created,
                 Some(123),
                 bundle(),
-                BTreeMap::new()
+                BTreeMap::new(),
+                None,
+                HealthStatus::Unknown,
+                0,
             )
             .is_ok()
         );
@@ -770,7 +940,10 @@ mod tests {
                 ContainerStatus::Running,
                 Some(123),
                 bundle(),
-                BTreeMap::new()
+                BTreeMap::new(),
+                None,
+                HealthStatus::Unknown,
+                0,
             )
             .is_ok()
         );
@@ -781,7 +954,10 @@ mod tests {
                 ContainerStatus::Stopped,
                 None,
                 bundle(),
-                BTreeMap::new()
+                BTreeMap::new(),
+                None,
+                HealthStatus::Unknown,
+                0,
             )
             .is_ok()
         );
@@ -794,8 +970,27 @@ mod tests {
             None,
             bundle(),
             BTreeMap::new(),
+            None,
+            HealthStatus::Unknown,
+            0,
         )
         .expect_err("Running with pid: None must be rejected");
+        assert_eq!(err.code(), "INVALID_STATE");
+
+        // 不正な組み合わせ: Running で pid: Some(0)（PID 0 はコンテナ
+        // プロセスを指せないため拒否する）。
+        let err = ContainerState::new(
+            "1.0.2",
+            id(),
+            ContainerStatus::Running,
+            Some(0),
+            bundle(),
+            BTreeMap::new(),
+            None,
+            HealthStatus::Unknown,
+            0,
+        )
+        .expect_err("Running with pid: Some(0) must be rejected");
         assert_eq!(err.code(), "INVALID_STATE");
 
         // 不正な組み合わせ: Stopped で pid: Some。
@@ -806,6 +1001,9 @@ mod tests {
             Some(123),
             bundle(),
             BTreeMap::new(),
+            None,
+            HealthStatus::Unknown,
+            0,
         )
         .expect_err("Stopped with pid: Some must be rejected");
         assert_eq!(err.code(), "INVALID_STATE");
@@ -818,6 +1016,9 @@ mod tests {
             Some(123),
             bundle(),
             BTreeMap::new(),
+            None,
+            HealthStatus::Unknown,
+            0,
         )
         .expect_err("Creating with pid: Some must be rejected");
         assert_eq!(err.code(), "INVALID_STATE");
@@ -835,8 +1036,143 @@ mod tests {
             None,
             PathBuf::from("relative/bundle"),
             BTreeMap::new(),
+            None,
+            HealthStatus::Unknown,
+            0,
         )
         .expect_err("relative bundle must be rejected");
         assert_eq!(err.code(), "INVALID_STATE");
+    }
+
+    /// CRI-7: `oci_version` は空文字列を許容しない。
+    #[test]
+    fn container_state_new_rejects_empty_oci_version() {
+        let err = ContainerState::new(
+            "",
+            ContainerId::new("abc123").expect("valid id in test fixture"),
+            ContainerStatus::Created,
+            None,
+            test_bundle_path(),
+            BTreeMap::new(),
+            None,
+            HealthStatus::Unknown,
+            0,
+        )
+        .expect_err("empty oci_version must be rejected");
+        assert_eq!(err.code(), "INVALID_STATE");
+    }
+
+    /// CRI-7: `oci_version` はドット区切り数字列のみを受理し、非数字を含む
+    /// 値・長さ超過の値は拒否する。
+    #[test]
+    fn container_state_new_rejects_malformed_oci_version() {
+        let cases = [
+            "v1.0.2",
+            "1.0.2-rc1",
+            "1..2",
+            ".1.0",
+            "1.0.",
+            "not-a-version",
+        ];
+        for case in cases {
+            let err = ContainerState::new(
+                case,
+                ContainerId::new("abc123").expect("valid id in test fixture"),
+                ContainerStatus::Created,
+                None,
+                test_bundle_path(),
+                BTreeMap::new(),
+                None,
+                HealthStatus::Unknown,
+                0,
+            )
+            .expect_err("malformed oci_version must be rejected");
+            assert_eq!(err.code(), "INVALID_STATE", "case: {case:?}");
+        }
+
+        let too_long = "1.".repeat(ContainerState::MAX_OCI_VERSION_LEN);
+        let err = ContainerState::new(
+            too_long,
+            ContainerId::new("abc123").expect("valid id in test fixture"),
+            ContainerStatus::Created,
+            None,
+            test_bundle_path(),
+            BTreeMap::new(),
+            None,
+            HealthStatus::Unknown,
+            0,
+        )
+        .expect_err("too long oci_version must be rejected");
+        assert_eq!(err.code(), "INVALID_STATE");
+    }
+
+    /// security.md: `annotations` の件数上限（`MAX_ANNOTATION_COUNT`）を
+    /// 超える入力は拒否する（無制限確保による DoS を防ぐ）。
+    #[test]
+    fn container_state_new_rejects_too_many_annotations() {
+        let mut annotations = BTreeMap::new();
+        for i in 0..=ContainerState::MAX_ANNOTATION_COUNT {
+            annotations.insert(format!("key{i}"), "value".to_string());
+        }
+        let err = ContainerState::new(
+            "1.0.2",
+            ContainerId::new("abc123").expect("valid id in test fixture"),
+            ContainerStatus::Created,
+            None,
+            test_bundle_path(),
+            annotations,
+            None,
+            HealthStatus::Unknown,
+            0,
+        )
+        .expect_err("too many annotations must be rejected");
+        assert_eq!(err.code(), "INVALID_STATE");
+    }
+
+    /// security.md: アノテーション 1 件あたりのキー・値の長さ上限を超える
+    /// 入力は拒否する。
+    #[test]
+    fn container_state_new_rejects_oversized_annotation_value() {
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            "key".to_string(),
+            "v".repeat(ContainerState::MAX_ANNOTATION_VALUE_LEN + 1),
+        );
+        let err = ContainerState::new(
+            "1.0.2",
+            ContainerId::new("abc123").expect("valid id in test fixture"),
+            ContainerStatus::Created,
+            None,
+            test_bundle_path(),
+            annotations,
+            None,
+            HealthStatus::Unknown,
+            0,
+        )
+        .expect_err("oversized annotation value must be rejected");
+        assert_eq!(err.code(), "INVALID_STATE");
+    }
+
+    /// 決定 6（`docs/design/crate-naming.md`）: supervisor が使う
+    /// `supervisor_pid`・`health`・`restart_count` は core の `ContainerState`
+    /// に保持され、`new`/アクセサを経由して読み書きできる。
+    #[test]
+    fn container_state_retains_supervisor_fields() {
+        let state = ContainerState::new(
+            "1.0.2",
+            ContainerId::new("abc123").expect("valid id in test fixture"),
+            ContainerStatus::Running,
+            Some(123),
+            test_bundle_path(),
+            BTreeMap::new(),
+            Some(456),
+            HealthStatus::Healthy,
+            3,
+        )
+        .expect("valid state in test fixture");
+
+        assert_eq!(state.supervisor_pid(), Some(456));
+        assert_eq!(state.health(), HealthStatus::Healthy);
+        assert_eq!(state.restart_count(), 3);
     }
 }

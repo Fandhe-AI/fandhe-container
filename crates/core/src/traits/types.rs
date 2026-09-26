@@ -234,4 +234,24 @@ mod tests {
         let err = TraitError::new(ErrorCode::NotFound, "container not found");
         assert_eq!(err.to_string(), "NOT_FOUND: container not found");
     }
+
+    /// CRI-7: `TryFrom<&str>` は `ContainerId::new` と同じ検証結果を返す。
+    #[test]
+    fn cri7_container_id_try_from_str_matches_new() {
+        let id = ContainerId::try_from("abc").expect("valid id");
+        assert_eq!(id.as_str(), "abc");
+
+        let err = ContainerId::try_from("a/b").expect_err("must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// CRI-7: `TryFrom<String>` は `ContainerId::new` と同じ検証結果を返す。
+    #[test]
+    fn cri7_container_id_try_from_string_matches_new() {
+        let id = ContainerId::try_from("a-b_c.1".to_string()).expect("valid id");
+        assert_eq!(id.as_str(), "a-b_c.1");
+
+        let err = ContainerId::try_from("..".to_string()).expect_err("must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
 }

@@ -204,6 +204,16 @@ impl KillRequest {
     }
 }
 
+/// [`StopRequest::new`] が受理する猶予時間の上限（REPAIR-5）。
+///
+/// `Duration::MAX` 相当の実質無期限の値を渡すと、SIGKILL への切り替えが
+/// 無期限待ちになり得る（REPAIR-5 のタイムアウト必須方針に反する）ため、
+/// 型のレベルで上限を強制する。具体的な既定タイムアウト値の決定は
+/// proxy 実装（G8・TASK-107/114）の責務であり、ここでは「無期限を許さない」
+/// という契約のみを表現する暫定値として 24 時間を採用する
+/// （人間のアーキテクチャレビュー #19・TASK-4.h1 で確定させる）。
+const STOP_GRACE_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// [`ContainerRuntime::stop`] の要求。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -216,9 +226,16 @@ impl StopRequest {
     /// 対象コンテナの ID と SIGKILL までの猶予時間から要求を作る。
     ///
     /// 猶予は呼び出し側が明示する必要があり（無期限を許さない。REPAIR-5）、
-    /// 実装は猶予経過後に SIGKILL へ切り替える。
-    pub fn new(id: ContainerId, grace: Duration) -> Self {
-        Self { id, grace }
+    /// 実装は猶予経過後に SIGKILL へ切り替える。`grace` が [`STOP_GRACE_MAX`] を
+    /// 超える場合は実質無期限の値とみなし [`ErrorCode::InvalidArgument`] を返す。
+    pub fn new(id: ContainerId, grace: Duration) -> Result<Self, TraitError> {
+        if grace > STOP_GRACE_MAX {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("grace must not exceed {STOP_GRACE_MAX:?}"),
+            ));
+        }
+        Ok(Self { id, grace })
     }
 
     /// 対象コンテナの ID を返す。
@@ -477,7 +494,42 @@ mod tests {
             .expect_err("must fail without force");
         assert_eq!(err.code().as_str(), "FAILED_PRECONDITION");
 
-        let ok = runtime.delete(&DeleteRequest::new(sample_id()).with_force(true));
-        assert!(ok.is_ok());
+        let ok = runtime
+            .delete(&DeleteRequest::new(sample_id()).with_force(true))
+            .expect("force delete succeeds");
+        assert_eq!(ok, DeleteResponse::new());
+    }
+
+    /// REPAIR-5: `Signal::new` は境界値 1・64 を受理し、値が一致する。
+    #[test]
+    fn cri7_signal_new_accepts_boundary_values() {
+        assert_eq!(Signal::new(1).expect("1 is valid").as_u8(), 1);
+        assert_eq!(Signal::new(64).expect("64 is valid").as_u8(), 64);
+    }
+
+    /// REPAIR-5: `StopRequest::new` は `STOP_GRACE_MAX` 以下を受理し、
+    /// それを超える猶予（`Duration::MAX` 相当の実質無期限値を含む）は
+    /// `INVALID_ARGUMENT` として拒否する。
+    #[test]
+    fn cri7_stop_request_rejects_grace_beyond_max() {
+        let ok = StopRequest::new(sample_id(), STOP_GRACE_MAX).expect("max grace is valid");
+        assert_eq!(ok.grace(), STOP_GRACE_MAX);
+
+        let err = StopRequest::new(sample_id(), STOP_GRACE_MAX + Duration::from_secs(1))
+            .expect_err("beyond max must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        let err_max = StopRequest::new(sample_id(), Duration::MAX)
+            .expect_err("Duration::MAX must be rejected");
+        assert_eq!(err_max.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// OCI Runtime Spec: `ContainerState::as_str` が全バリアントで規定の小文字文字列を返す。
+    #[test]
+    fn cri7_container_state_as_str_matches_all_variants() {
+        assert_eq!(ContainerState::Creating.as_str(), "creating");
+        assert_eq!(ContainerState::Created.as_str(), "created");
+        assert_eq!(ContainerState::Running.as_str(), "running");
+        assert_eq!(ContainerState::Stopped.as_str(), "stopped");
     }
 }

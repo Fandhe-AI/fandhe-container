@@ -1,0 +1,880 @@
+//! `NetworkPlugin` 拡張点トレイト（TASK-4.3・CRI-7・PLUG-1・MS-0）。
+//!
+//! ネットワーク設定の制御面（bridge・veth・netns・ポート公開・DNAT の作成/削除）を
+//! 抽象化する拡張点。データパス（パケット転送そのもの）ではなく制御面の RPC なので、
+//! plugin 境界を越えるコストは許容範囲になる（PoC-13）。トレイト定義は本 crate（core）に
+//! 置くが、実装は本 crate には置かず、別プロセス plugin（`fandhe-container-plugin-net` 等。
+//! TASK-114）が担う。core 側の proxy（G8・TASK-107/114）が UDS＋長さ接頭辞フレームの
+//! RPC へ変換し、`Box<dyn NetworkPlugin>` として呼び出し側へ渡す（PLUG-1）。
+//!
+//! # netsetup（PoC-15）粒度との対応
+//!
+//! CRI-7 の 2026-09-23 追記により、メソッド分割は PoC-15 の `netsetup` の操作粒度
+//! （`net-create`・`netns-create`・`veth-attach`・`publish-port`・`net-delete`）に
+//! そのまま対応づけられることが実機で確認されている。
+//!
+//! | netsetup（PoC-15） | メソッド | 単位 | 主な責務 | CRI 対応 |
+//! | ------------------ | -------- | ---- | -------- | -------- |
+//! | `net-create` | [`NetworkPlugin::create_network`] | ネットワーク | bridge・専用 nft テーブル（masquerade）・DNS ヘルパー | `SetUpPod` 相当 |
+//! | `netns-create` | [`NetworkPlugin::create_netns`] | コンテナ | 専用 netns の作成（lo の up を含む） | `SetUpPod` の一部 |
+//! | `veth-attach` | [`NetworkPlugin::attach`] | コンテナ | veth ペアの作成、bridge / netns への接続、アドレス・default route の設定 | `SetUpPod` の一部 |
+//! | `publish-port` | [`NetworkPlugin::publish_port`] | コンテナ | ポート公開（nft DNAT） | PortMapping |
+//! | `net-delete` | [`NetworkPlugin::delete_network`] | ネットワーク | bridge・nft テーブル・関連 netns の一括削除 | `TearDownPod` 相当 |
+//!
+//! 分割の理由: ネットワーク単位とコンテナ単位のライフサイクルが異なるため、
+//! 単一メソッドに畳み込まずライフサイクル単位ごとに分ける。PoC-15 の実機実証で、
+//! この粒度でロールバックと冪等性の境界が引けることを確認している（CRI-7 追記）。
+//! DNS ヘルパーの起動・終了と `/etc/resolv.conf` の設定は `create_network` /
+//! `delete_network`（`SetUpPod` / `TearDownPod` 相当）に含まれ、DNS レジストリの更新は
+//! コンテナのライフサイクルイベント（`ContainerRuntime` 側の create/delete）にフックする
+//! 設計である。関連ビヘイビア: NET-1〜NET-5（bridge・veth・nft・DNS ヘルパー）。
+//! NET-11（netlink / nftables の自前実装）は plugin 実装側の関心事であり、本トレイトは
+//! 実装方式（netlink 直叩き・nft コマンド呼び出し等）に依存しない。
+//!
+//! # 未対応（スコープ外。#19・TASK-4.h1 と後続タスクへ引き継ぐ）
+//!
+//! - NET-6 の host / none モード（netsetup の操作を経由しない経路の扱いは #19 で確定する）
+//! - コンテナ単位の detach・netns 単独の削除（コンテナ削除時の後始末）。将来は
+//!   既定実装付きメソッドとして追加できる
+//! - DNS ヘルパーのライフサイクルとレジストリ更新の詳細（NET-5・NET-7）、
+//!   `--add-host` / `--dns`（NET-12）、rootless ネットワーク（NET-9・検討中）、
+//!   ホスト側 bind IP の指定
+//! - 実装（TASK-114・G7 の net crate）と proxy（G8・TASK-107/114）
+//!
+//! シグネチャは人間のアーキテクチャレビュー（#19・TASK-4.h1）前の暫定版であり、
+//! 「確認済み」の確定仕様ではない（REPAIR-3）。
+
+use std::fmt;
+use std::net::IpAddr;
+use std::num::NonZeroU16;
+use std::path::{Path, PathBuf};
+
+use super::types::{ContainerId, ErrorCode, TraitError};
+
+/// ネットワーク設定の制御面（bridge・veth・netns・ポート公開）を抽象化する拡張点。
+///
+/// # 契約
+/// 1. 実装は panic せず、すべての結果を `Result` で返す（coding-rust.md）。
+/// 2. 相手の応答を待つ処理（plugin RPC）は無期限に待たず、上限時間を超えたら
+///    [`ErrorCode::Timeout`] を返す（REPAIR-5）。既定タイムアウト値の決定は
+///    proxy 実装（G8・TASK-107/114）の責務であり、本トレイトは契約のみを定める。
+/// 3. `Send + Sync` を要求する。呼び出し側は `Arc<dyn NetworkPlugin>` として複数スレッド
+///    から共有できることを前提にしてよい。
+/// 4. 本 crate（core）にはこのトレイトの実装を置かない。実装は plugin 側にある
+///    （PLUG-1・TASK-114）。「実装済みを装わない」という REPAIR-3 の方針に基づく。
+/// 5. plugin の信頼境界（UDS の所有者・権限検証、別 UID からの接続切断等。
+///    PLUG-11・PLUG-12）はこのトレイトの外側、境界機構（`fandhe-container-plugin`）の
+///    責務であり、`NetworkPlugin` の呼び出し側はそれらが検証済みであることを
+///    前提にしてよい。
+/// 6. **部分失敗時のロールバック**: [`Self::create_network`]・[`Self::attach`] が途中で
+///    失敗した場合、実装は作成済みのリソース（bridge・veth・nft テーブル）を逆順に
+///    削除してから `Err` を返す（PoC-15 の 2026-09-24 修正に準拠）。
+/// 7. **二重作成の拒否**: 同名のネットワークや同じコンテナの netns が既にあれば
+///    [`ErrorCode::AlreadyExists`] を返す。前回の残骸を黙って再利用しない。
+/// 8. **前提違反**: 存在しないネットワークへの [`Self::attach`] / [`Self::publish_port`]、
+///    netns 未作成のコンテナへの [`Self::attach`] は [`ErrorCode::NotFound`] または
+///    [`ErrorCode::FailedPrecondition`] を返す。
+/// 9. **削除はベストエフォートで続行**: [`Self::delete_network`] は個々の削除に失敗しても
+///    残りの削除を続け、1 件でも失敗があれば `Err`（[`ErrorCode::Internal`]）を返す
+///    （PoC-15 の `net-delete` に準拠）。
+///
+/// メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
+/// dyn 互換（object safety）を保ち、async ランタイムへの依存を追加しない
+/// （依存最小方針。dependency-policy.md）。
+pub trait NetworkPlugin: Send + Sync {
+    /// ネットワーク（bridge・専用 nft テーブル・DNS ヘルパー）を作成する。
+    ///
+    /// netsetup の `net-create` に対応し、CRI の `SetUpPod` 相当。前提: 同名の
+    /// ネットワークが存在しないこと。存在する場合は [`ErrorCode::AlreadyExists`] を
+    /// 返す（契約 7）。途中で失敗した場合は作成済みリソースを逆順に削除する（契約 6）。
+    /// 対応: NET-1〜NET-3。
+    fn create_network(&self, req: &CreateNetworkRequest) -> Result<NetworkStatus, TraitError>;
+
+    /// コンテナ専用の netns を作成する（lo の up を含む）。
+    ///
+    /// netsetup の `netns-create` に対応し、`SetUpPod` の一部。前提: 同じコンテナの
+    /// netns が既に存在しないこと。存在する場合は [`ErrorCode::AlreadyExists`] を
+    /// 返す（契約 7）。対応: NET-1。
+    fn create_netns(&self, req: &CreateNetnsRequest) -> Result<NetnsStatus, TraitError>;
+
+    /// veth ペアを作成し、bridge / netns へ接続してアドレス・default route を設定する。
+    ///
+    /// netsetup の `veth-attach` に対応し、`SetUpPod` の一部。前提: `req.network()` が
+    /// [`Self::create_network`] 済みであること（未作成なら [`ErrorCode::NotFound`]）、
+    /// 対象コンテナの netns が [`Self::create_netns`] 済みであること（未作成なら
+    /// [`ErrorCode::FailedPrecondition`]）。途中で失敗した場合は作成済みリソースを
+    /// 逆順に削除する（契約 6）。対応: NET-1・NET-2。
+    fn attach(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError>;
+
+    /// コンテナのポートをホスト側へ公開する（nft DNAT）。
+    ///
+    /// netsetup の `publish-port` に対応する。前提: `req.network()` が
+    /// [`Self::create_network`] 済みで、対象コンテナが [`Self::attach`] 済みであること
+    /// （いずれも未作成なら [`ErrorCode::NotFound`]）。宛先は生の IP アドレスではなく
+    /// [`ContainerId`] で指定し、実装（plugin 側）が attach 済みのアドレスへ解決する。
+    /// これは PoC-15 との差分であり、ネットワーク外の任意ホストへ DNAT させる経路を
+    /// トレイト境界で作らないための設計である（#19 で確認する）。対応: NET-4。
+    fn publish_port(&self, req: &PublishPortRequest) -> Result<PortMapping, TraitError>;
+
+    /// ネットワーク（bridge・nft テーブル・関連 netns）を一括削除する。
+    ///
+    /// netsetup の `net-delete` に対応し、CRI の `TearDownPod` 相当。削除対象の netns
+    /// 一覧は呼び出し側から受け取らず、そのネットワークで作成・接続したものを実装
+    /// （plugin 側）が追跡して決める（上限のない `Vec` を境界へ持ち込まないため）。
+    /// 個々の削除に失敗しても残りの削除を続け、1 件でも失敗があれば `Err` を返す
+    /// （契約 9）。対応: NET-3・NET-5。
+    fn delete_network(
+        &self,
+        req: &DeleteNetworkRequest,
+    ) -> Result<DeleteNetworkResponse, TraitError>;
+}
+
+/// ネットワーク名の許容文字数の上限（暫定値）。
+///
+/// plugin はインターフェース名の制約（`IFNAMSIZ` 由来。PoC-17 で bridge の接頭辞込みで
+/// 8 文字が `ERANGE` になった事例）により、さらに厳しい上限を [`ErrorCode::InvalidArgument`]
+/// で課してよい。この値の確定は人間のアーキテクチャレビュー（#19・TASK-4.h1）で行う。
+const NETWORK_NAME_MAX_LEN: usize = 64;
+
+/// 検証済みのネットワーク名。
+///
+/// bridge・nft テーブル・netns の名前として実装側が使うため、パス区切り文字・NUL・
+/// 非 ASCII・制御文字・空白を型のレベルで排除する（PoC-15 で名前が nft スクリプトや
+/// インターフェース名へ埋め込まれていたため、境界の型の時点で制限する。security.md）。
+/// 生成は [`NetworkName::new`] のみで、検証を経ずに値を作れない。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NetworkName(String);
+
+impl NetworkName {
+    /// 入力文字列を検証してネットワーク名を作る。
+    ///
+    /// 拒否条件（いずれかに該当すると [`ErrorCode::InvalidArgument`]）:
+    /// - 空文字列
+    /// - 長さが `NETWORK_NAME_MAX_LEN`（64 バイト）を超える
+    /// - 先頭が ASCII 英数字でない
+    /// - 2 文字目以降に `[A-Za-z0-9-]` 以外の文字を含む
+    pub fn new(value: impl Into<String>) -> Result<Self, TraitError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "network name must not be empty",
+            ));
+        }
+        if value.len() > NETWORK_NAME_MAX_LEN {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("network name must be at most {NETWORK_NAME_MAX_LEN} bytes"),
+            ));
+        }
+        let mut bytes = value.bytes();
+        let Some(first) = bytes.next() else {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "network name must not be empty",
+            ));
+        };
+        if !first.is_ascii_alphanumeric() {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "network name must start with an ASCII alphanumeric character",
+            ));
+        }
+        if !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "network name must match [A-Za-z0-9][A-Za-z0-9-]*",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// 検証済み文字列への参照を返す。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for NetworkName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<&str> for NetworkName {
+    type Error = TraitError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for NetworkName {
+    type Error = TraitError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// IPv4 / IPv6 アドレスと prefix 長の組（CIDR 表記）。
+///
+/// prefix 長はアドレスファミリごとの上限（IPv4: 32・IPv6: 128）を超えられない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IpCidr {
+    addr: IpAddr,
+    prefix_len: u8,
+}
+
+impl IpCidr {
+    /// アドレスと prefix 長から CIDR を作る。
+    ///
+    /// `prefix_len` がアドレスファミリの上限（IPv4: 32・IPv6: 128）を超える場合は
+    /// [`ErrorCode::InvalidArgument`] を返す。
+    pub fn new(addr: IpAddr, prefix_len: u8) -> Result<Self, TraitError> {
+        let max = match addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if prefix_len > max {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("prefix length must be at most {max} for this address family"),
+            ));
+        }
+        Ok(Self { addr, prefix_len })
+    }
+
+    /// アドレスを返す。
+    pub fn addr(&self) -> IpAddr {
+        self.addr
+    }
+
+    /// prefix 長を返す。
+    pub fn prefix_len(&self) -> u8 {
+        self.prefix_len
+    }
+}
+
+impl fmt::Display for IpCidr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix_len)
+    }
+}
+
+/// ポート公開のトランスポートプロトコル。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Protocol {
+    /// TCP。
+    Tcp,
+    /// UDP。
+    Udp,
+}
+
+impl Protocol {
+    /// プロトコル名を小文字文字列で返す。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+/// [`NetworkPlugin::create_network`] の要求。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct CreateNetworkRequest {
+    name: NetworkName,
+    subnet: IpCidr,
+}
+
+impl CreateNetworkRequest {
+    /// ネットワーク名と bridge 側のアドレス・prefix（サブネット）から要求を作る。
+    pub fn new(name: NetworkName, subnet: IpCidr) -> Self {
+        Self { name, subnet }
+    }
+
+    /// ネットワーク名を返す。
+    pub fn name(&self) -> &NetworkName {
+        &self.name
+    }
+
+    /// bridge 側のサブネット（アドレス・prefix）を返す。
+    pub fn subnet(&self) -> IpCidr {
+        self.subnet
+    }
+}
+
+/// [`NetworkPlugin::create_network`] の応答。
+///
+/// 将来の拡張（DNS ヘルパーのアドレス等）に備えて構造体にする（coding-rust.md）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct NetworkStatus {
+    name: NetworkName,
+    subnet: IpCidr,
+}
+
+impl NetworkStatus {
+    /// ネットワーク名とサブネットから状態を作る。
+    pub fn new(name: NetworkName, subnet: IpCidr) -> Self {
+        Self { name, subnet }
+    }
+
+    /// ネットワーク名を返す。
+    pub fn name(&self) -> &NetworkName {
+        &self.name
+    }
+
+    /// bridge 側のサブネット（アドレス・prefix）を返す。
+    pub fn subnet(&self) -> IpCidr {
+        self.subnet
+    }
+}
+
+/// [`NetworkPlugin::create_netns`] の要求。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct CreateNetnsRequest {
+    container: ContainerId,
+}
+
+impl CreateNetnsRequest {
+    /// 対象コンテナの ID から要求を作る。netns の名前は検証済みの [`ContainerId`] から
+    /// 実装側が導出する（パストラバーサル対策。security.md）。
+    pub fn new(container: ContainerId) -> Self {
+        Self { container }
+    }
+
+    /// 対象コンテナの ID を返す。
+    pub fn container(&self) -> &ContainerId {
+        &self.container
+    }
+}
+
+/// [`NetworkPlugin::create_netns`] の応答。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct NetnsStatus {
+    container: ContainerId,
+    path: PathBuf,
+}
+
+impl NetnsStatus {
+    /// 対象コンテナの ID と netns の絶対パスから応答を作る。
+    ///
+    /// `path` が絶対パスでない場合は [`ErrorCode::InvalidArgument`] を返す。plugin
+    /// プロセスは呼び出し元と作業ディレクトリが異なるため、相対パスは解決先が曖昧に
+    /// なる（fail-closed。[`super::container_runtime::CreateRequest::new`] と同じ理由）。
+    /// runtime（`ContainerRuntime` 実装）がこの netns に join する際のパスになる。
+    pub fn new(container: ContainerId, path: PathBuf) -> Result<Self, TraitError> {
+        if !path.is_absolute() {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "netns path must be absolute",
+            ));
+        }
+        Ok(Self { container, path })
+    }
+
+    /// 対象コンテナの ID を返す。
+    pub fn container(&self) -> &ContainerId {
+        &self.container
+    }
+
+    /// netns の絶対パスを返す。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// [`NetworkPlugin::attach`] の要求。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct AttachRequest {
+    network: NetworkName,
+    container: ContainerId,
+    address: Option<IpCidr>,
+}
+
+impl AttachRequest {
+    /// 接続先ネットワークと対象コンテナから要求を作る（アドレスは未指定）。
+    pub fn new(network: NetworkName, container: ContainerId) -> Self {
+        Self {
+            network,
+            container,
+            address: None,
+        }
+    }
+
+    /// 静的 IPAM（NET-1）で使う固定アドレスを指定するビルダ。
+    ///
+    /// 指定しない場合、実装（plugin 側）が動的に IPAM を行う。
+    pub fn with_address(mut self, address: IpCidr) -> Self {
+        self.address = Some(address);
+        self
+    }
+
+    /// 接続先ネットワーク名を返す。
+    pub fn network(&self) -> &NetworkName {
+        &self.network
+    }
+
+    /// 対象コンテナの ID を返す。
+    pub fn container(&self) -> &ContainerId {
+        &self.container
+    }
+
+    /// 指定された固定アドレス（未指定なら `None`）を返す。
+    pub fn address(&self) -> Option<IpCidr> {
+        self.address
+    }
+}
+
+/// [`NetworkPlugin::attach`] の応答。実際に割り当てられたアドレスとゲートウェイを返す。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct AttachResponse {
+    network: NetworkName,
+    container: ContainerId,
+    address: IpCidr,
+    gateway: Option<IpAddr>,
+}
+
+impl AttachResponse {
+    /// 接続先ネットワーク・対象コンテナ・割り当てアドレス・ゲートウェイから応答を作る。
+    pub fn new(
+        network: NetworkName,
+        container: ContainerId,
+        address: IpCidr,
+        gateway: Option<IpAddr>,
+    ) -> Self {
+        Self {
+            network,
+            container,
+            address,
+            gateway,
+        }
+    }
+
+    /// 接続先ネットワーク名を返す。
+    pub fn network(&self) -> &NetworkName {
+        &self.network
+    }
+
+    /// 対象コンテナの ID を返す。
+    pub fn container(&self) -> &ContainerId {
+        &self.container
+    }
+
+    /// 実際に割り当てられたアドレス（CIDR）を返す。
+    pub fn address(&self) -> IpCidr {
+        self.address
+    }
+
+    /// default route のゲートウェイ（判明していれば）を返す。
+    pub fn gateway(&self) -> Option<IpAddr> {
+        self.gateway
+    }
+}
+
+/// [`NetworkPlugin::publish_port`] の要求。
+///
+/// 宛先は生の IP アドレスではなく [`ContainerId`] で指定する。実装（plugin 側）が
+/// [`NetworkPlugin::attach`] 済みのアドレスへ解決する（トレイト doc の契約参照）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct PublishPortRequest {
+    network: NetworkName,
+    container: ContainerId,
+    host_port: NonZeroU16,
+    container_port: NonZeroU16,
+    protocol: Protocol,
+}
+
+impl PublishPortRequest {
+    /// ネットワーク名・対象コンテナ・ホスト側ポート・コンテナ側ポート・プロトコルから
+    /// 要求を作る。
+    pub fn new(
+        network: NetworkName,
+        container: ContainerId,
+        host_port: NonZeroU16,
+        container_port: NonZeroU16,
+        protocol: Protocol,
+    ) -> Self {
+        Self {
+            network,
+            container,
+            host_port,
+            container_port,
+            protocol,
+        }
+    }
+
+    /// 対象ネットワーク名を返す。
+    pub fn network(&self) -> &NetworkName {
+        &self.network
+    }
+
+    /// 宛先コンテナの ID を返す。
+    pub fn container(&self) -> &ContainerId {
+        &self.container
+    }
+
+    /// ホスト側の公開ポートを返す。
+    pub fn host_port(&self) -> NonZeroU16 {
+        self.host_port
+    }
+
+    /// コンテナ側の待受ポートを返す。
+    pub fn container_port(&self) -> NonZeroU16 {
+        self.container_port
+    }
+
+    /// トランスポートプロトコルを返す。
+    pub fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+}
+
+/// [`NetworkPlugin::publish_port`] の応答。要求と同じ内容を実施結果として返す。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct PortMapping {
+    network: NetworkName,
+    container: ContainerId,
+    host_port: NonZeroU16,
+    container_port: NonZeroU16,
+    protocol: Protocol,
+}
+
+impl PortMapping {
+    /// ネットワーク名・対象コンテナ・ホスト側ポート・コンテナ側ポート・プロトコルから
+    /// マッピング結果を作る。
+    pub fn new(
+        network: NetworkName,
+        container: ContainerId,
+        host_port: NonZeroU16,
+        container_port: NonZeroU16,
+        protocol: Protocol,
+    ) -> Self {
+        Self {
+            network,
+            container,
+            host_port,
+            container_port,
+            protocol,
+        }
+    }
+
+    /// 対象ネットワーク名を返す。
+    pub fn network(&self) -> &NetworkName {
+        &self.network
+    }
+
+    /// 宛先コンテナの ID を返す。
+    pub fn container(&self) -> &ContainerId {
+        &self.container
+    }
+
+    /// ホスト側の公開ポートを返す。
+    pub fn host_port(&self) -> NonZeroU16 {
+        self.host_port
+    }
+
+    /// コンテナ側の待受ポートを返す。
+    pub fn container_port(&self) -> NonZeroU16 {
+        self.container_port
+    }
+
+    /// トランスポートプロトコルを返す。
+    pub fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+}
+
+/// [`NetworkPlugin::delete_network`] の要求。
+///
+/// 削除対象の netns 一覧はここでは受け取らない。そのネットワークで作成・接続した
+/// netns は実装（plugin 側）が追跡して決める（上限のない `Vec` を境界へ持ち込まない）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct DeleteNetworkRequest {
+    name: NetworkName,
+}
+
+impl DeleteNetworkRequest {
+    /// 削除対象のネットワーク名から要求を作る。
+    pub fn new(name: NetworkName) -> Self {
+        Self { name }
+    }
+
+    /// 削除対象のネットワーク名を返す。
+    pub fn name(&self) -> &NetworkName {
+        &self.name
+    }
+}
+
+/// [`NetworkPlugin::delete_network`] の応答。当面は空だが、将来の拡張
+/// （解放した資源の情報等）に備えて構造体にする（[`super::container_runtime::DeleteResponse`]
+/// と同じ形）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeleteNetworkResponse {}
+
+impl DeleteNetworkResponse {
+    /// 空の応答を作る。
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// テスト用のスタブ実装。dyn 互換性と各メソッドの戻り値を確認するためのみに使う。
+    struct StubNetworkPlugin {
+        network_created: std::sync::atomic::AtomicBool,
+    }
+
+    impl StubNetworkPlugin {
+        fn new() -> Self {
+            Self {
+                network_created: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl NetworkPlugin for StubNetworkPlugin {
+        fn create_network(&self, req: &CreateNetworkRequest) -> Result<NetworkStatus, TraitError> {
+            if self
+                .network_created
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(TraitError::new(
+                    ErrorCode::AlreadyExists,
+                    "network already exists",
+                ));
+            }
+            Ok(NetworkStatus::new(req.name().clone(), req.subnet()))
+        }
+
+        fn create_netns(&self, req: &CreateNetnsRequest) -> Result<NetnsStatus, TraitError> {
+            let path = PathBuf::from(sample_netns_path());
+            NetnsStatus::new(req.container().clone(), path)
+        }
+
+        fn attach(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError> {
+            let address = req
+                .address()
+                .unwrap_or_else(|| IpCidr::new(sample_attach_addr(), 24).expect("valid cidr"));
+            Ok(AttachResponse::new(
+                req.network().clone(),
+                req.container().clone(),
+                address,
+                Some(sample_gateway()),
+            ))
+        }
+
+        fn publish_port(&self, req: &PublishPortRequest) -> Result<PortMapping, TraitError> {
+            Ok(PortMapping::new(
+                req.network().clone(),
+                req.container().clone(),
+                req.host_port(),
+                req.container_port(),
+                req.protocol(),
+            ))
+        }
+
+        fn delete_network(
+            &self,
+            _req: &DeleteNetworkRequest,
+        ) -> Result<DeleteNetworkResponse, TraitError> {
+            Ok(DeleteNetworkResponse::new())
+        }
+    }
+
+    fn sample_network_name() -> NetworkName {
+        NetworkName::new("front-end").expect("valid network name")
+    }
+
+    fn sample_container_id() -> ContainerId {
+        ContainerId::new("sample-container").expect("valid id")
+    }
+
+    fn sample_subnet() -> IpCidr {
+        IpCidr::new(IpAddr::from([10, 250, 11, 1]), 24).expect("valid cidr")
+    }
+
+    fn sample_attach_addr() -> IpAddr {
+        IpAddr::from([10, 250, 11, 2])
+    }
+
+    fn sample_gateway() -> IpAddr {
+        IpAddr::from([10, 250, 11, 1])
+    }
+
+    #[cfg(unix)]
+    fn sample_netns_path() -> &'static str {
+        "/run/netns/x"
+    }
+
+    #[cfg(windows)]
+    fn sample_netns_path() -> &'static str {
+        r"C:\x"
+    }
+
+    /// CRI-7: `NetworkPlugin` は dyn 互換で、`Box`/`Arc` に収めて 5 メソッドを順に呼べる。
+    #[test]
+    fn cri7_network_plugin_is_dyn_compatible() {
+        let boxed: Box<dyn NetworkPlugin> = Box::new(StubNetworkPlugin::new());
+        let net_req = CreateNetworkRequest::new(sample_network_name(), sample_subnet());
+        let net_status = boxed.create_network(&net_req).expect("create succeeds");
+        assert_eq!(net_status.subnet().to_string(), "10.250.11.1/24");
+
+        let netns_status = boxed
+            .create_netns(&CreateNetnsRequest::new(sample_container_id()))
+            .expect("create_netns succeeds");
+        assert_eq!(netns_status.path(), Path::new(sample_netns_path()));
+
+        let attach_resp = boxed
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("attach succeeds");
+        assert_eq!(attach_resp.address().to_string(), "10.250.11.2/24");
+
+        let mapping = boxed
+            .publish_port(&PublishPortRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect("publish_port succeeds");
+        assert_eq!(mapping.protocol().as_str(), "tcp");
+
+        let shared: Arc<dyn NetworkPlugin> = Arc::new(StubNetworkPlugin::new());
+        let delete_resp = shared
+            .delete_network(&DeleteNetworkRequest::new(sample_network_name()))
+            .expect("delete_network succeeds");
+        assert_eq!(delete_resp, DeleteNetworkResponse::new());
+    }
+
+    /// PLUG-1: 実装のエラーコードが ERR-1 の機械可読文字列（`code().as_str()`）へ
+    /// そのまま伝播する（二重の `create_network` は `ALREADY_EXISTS`）。
+    #[test]
+    fn plug1_network_plugin_error_propagates_code() {
+        let plugin = StubNetworkPlugin::new();
+        let req = CreateNetworkRequest::new(sample_network_name(), sample_subnet());
+        assert!(plugin.create_network(&req).is_ok());
+        let err = plugin
+            .create_network(&req)
+            .expect_err("second create must fail");
+        assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
+    }
+
+    /// NET-1: 受理されるネットワーク名の例（英数字始まり・ハイフン・境界長）。
+    #[test]
+    fn net1_network_name_accepts_valid_values() {
+        assert_eq!(NetworkName::new("n1").expect("valid").as_str(), "n1");
+        assert_eq!(
+            NetworkName::new("front-end").expect("valid").as_str(),
+            "front-end"
+        );
+        let max_len = "a".repeat(64);
+        assert!(NetworkName::new(max_len).is_ok());
+    }
+
+    /// NET-1: 拒否されるネットワーク名の例（空・記号先頭・区切り文字・NUL・非 ASCII・長さ超過）。
+    #[test]
+    fn net1_network_name_rejects_invalid_values() {
+        let cases: Vec<String> = vec![
+            String::new(),
+            "-a".to_string(),
+            "a_b".to_string(),
+            "a.b".to_string(),
+            "a/b".to_string(),
+            "a b".to_string(),
+            "a\0b".to_string(),
+            "é".to_string(),
+            "a".repeat(65),
+        ];
+        for case in cases {
+            let err = NetworkName::new(case.clone()).expect_err("must be rejected");
+            assert_eq!(
+                err.code().as_str(),
+                "INVALID_ARGUMENT",
+                "case {case:?} should be INVALID_ARGUMENT"
+            );
+        }
+    }
+
+    /// NET-1: `TryFrom<&str>` / `TryFrom<String>` が `new` と同じ検証結果を返す。
+    #[test]
+    fn net1_network_name_try_from_matches_new() {
+        let name = NetworkName::try_from("front-end").expect("valid");
+        assert_eq!(name.as_str(), "front-end");
+
+        let name = NetworkName::try_from("front-end".to_string()).expect("valid");
+        assert_eq!(name.as_str(), "front-end");
+
+        let err = NetworkName::try_from("-a").expect_err("must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// NET-1: `IpCidr::new` はアドレスファミリごとの prefix 上限を検証し、
+    /// `Display` が "10.250.11.1/24" 形式になる。
+    #[test]
+    fn net1_ip_cidr_validates_prefix_by_family() {
+        let v4 = IpAddr::from([10, 250, 11, 1]);
+        assert!(IpCidr::new(v4, 0).is_ok());
+        assert!(IpCidr::new(v4, 32).is_ok());
+        let err = IpCidr::new(v4, 33).expect_err("v4 prefix must be <= 32");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        let v6 = IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1]);
+        assert!(IpCidr::new(v6, 128).is_ok());
+        let err = IpCidr::new(v6, 129).expect_err("v6 prefix must be <= 128");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        let cidr = IpCidr::new(v4, 24).expect("valid cidr");
+        assert_eq!(cidr.to_string(), "10.250.11.1/24");
+    }
+
+    /// NET-4: `Protocol::as_str` が全バリアントで小文字文字列を返す。
+    #[test]
+    fn net1_protocol_as_str() {
+        assert_eq!(Protocol::Tcp.as_str(), "tcp");
+        assert_eq!(Protocol::Udp.as_str(), "udp");
+    }
+
+    /// CRI-7: `NetnsStatus::new` は相対パスを拒否し、絶対パスは受理する。
+    #[test]
+    fn cri7_netns_status_rejects_relative_path() {
+        let err = NetnsStatus::new(sample_container_id(), PathBuf::from("netns"))
+            .expect_err("relative path must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        let ok = NetnsStatus::new(sample_container_id(), PathBuf::from(sample_netns_path()));
+        assert!(ok.is_ok());
+    }
+
+    /// NET-1: `AttachRequest` は `new` 直後に `address()` が `None`、
+    /// `with_address` の後は `Some`（具体値で一致）になる。
+    #[test]
+    fn net1_attach_request_address_is_optional() {
+        let req = AttachRequest::new(sample_network_name(), sample_container_id());
+        assert_eq!(req.address(), None);
+
+        let addr = IpCidr::new(sample_attach_addr(), 24).expect("valid cidr");
+        let req = req.with_address(addr);
+        assert_eq!(req.address(), Some(addr));
+    }
+}

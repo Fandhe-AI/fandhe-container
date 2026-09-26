@@ -319,6 +319,11 @@ impl ContainerState {
 /// しまっていた（codex レビュー指摘・PR #1074）。状態ごとに対応する
 /// コンストラクタ（[`Self::creating`]・[`Self::created`]・[`Self::running`]・
 /// [`Self::stopped`]）に限定し、組み合わせを型で制限する。
+///
+/// `Stopped` の `exit_code` は `Option<i32>` にする。作成途中の失敗・シグナルに
+/// よる異常終了等、実装側が終了コードを取得できないまま「停止済み」の事実
+/// だけは確認できるケースがあり、`i32` 必須では実装が値を捏造するか
+/// 停止状態そのものを返せなくなってしまう（codex レビュー指摘・PR #1074）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContainerStatus {
@@ -362,9 +367,12 @@ impl ContainerStatus {
         Self::build(id, ContainerState::Running, pid, None)
     }
 
-    /// 終了済みの状態を作る。`exit_code` は必須（`pid` は持たない）。
-    pub fn stopped(id: ContainerId, exit_code: i32) -> Self {
-        Self::build(id, ContainerState::Stopped, None, Some(exit_code))
+    /// 終了済みの状態を作る。`exit_code` は判明していれば渡す（`pid` は持たない）。
+    ///
+    /// 作成途中の失敗やシグナルによる異常終了等、終了コードを取得できない
+    /// まま停止状態だけが確認できるケースがあるため `Option<i32>` を受ける。
+    pub fn stopped(id: ContainerId, exit_code: Option<i32>) -> Self {
+        Self::build(id, ContainerState::Stopped, None, exit_code)
     }
 
     /// コンテナ ID を返す。
@@ -427,7 +435,7 @@ mod tests {
         }
 
         fn stop(&self, req: &StopRequest) -> Result<ContainerStatus, TraitError> {
-            Ok(ContainerStatus::stopped(req.id().clone(), 0))
+            Ok(ContainerStatus::stopped(req.id().clone(), Some(0)))
         }
 
         fn delete(&self, req: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
@@ -573,10 +581,21 @@ mod tests {
         assert_eq!(running.pid(), Some(pid));
         assert_eq!(running.exit_code(), None);
 
-        let stopped = ContainerStatus::stopped(sample_id(), 1);
+        let stopped = ContainerStatus::stopped(sample_id(), Some(1));
         assert_eq!(stopped.state(), ContainerState::Stopped);
         assert_eq!(stopped.pid(), None);
         assert_eq!(stopped.exit_code(), Some(1));
+    }
+
+    /// codex レビュー指摘（PR #1074・P2）: 作成途中の失敗や異常終了等で終了コードを
+    /// 取得できないまま停止状態だけが確認できるケースを、`exit_code: None` の
+    /// `Stopped` として表現できることを固定する。
+    #[test]
+    fn cri7_container_status_stopped_can_have_unknown_exit_code() {
+        let stopped = ContainerStatus::stopped(sample_id(), None);
+        assert_eq!(stopped.state(), ContainerState::Stopped);
+        assert_eq!(stopped.pid(), None);
+        assert_eq!(stopped.exit_code(), None);
     }
 
     /// Bugbot 指摘（PR #1074 discussion_r4112017709）: OCI の `created` コンテナは

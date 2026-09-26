@@ -1,0 +1,473 @@
+name: Linux env probe
+
+# GitHub ホステッド Linux runner が issue #26（TASK-8・CLOSE-1・MS-0）の環境要件
+# 「sudo / AppArmor 調整可能で /dev/kvm 権限のある Linux 環境」を満たせるかを
+# 実測で確かめるための検証用ワークフロー。判定は人間が行う事項（ci.md・
+# delegation-impl.md）のため、本ワークフローは計測結果を
+# $GITHUB_STEP_SUMMARY へ表として出すところまでに留め、合否の最終判断は
+# ユーザーへ委ねる。ただし x86_64 runner（assert_kvm=true）では、KVM 関連の
+# プローブ（/dev/kvm open・API_VERSION=12・KVM_CREATE_VM・qemu の KVM 起動）の
+# いずれか 1 つでも失敗した場合は明確な失敗として検出できるよう最後にジョブを
+# fail させる（arm64・その他のプローブは失敗しても後続へ進み、結果を蓄積して表にする）。
+#
+# 発火条件は手動実行と本ファイルの変更時のみに絞る（広い発火条件は付けない）。
+# runner イメージの更新で結果が変わり得るため、再確認用の手順として残す。
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/linux-env-probe.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  # PR ごとに一意な番号を group に含める（head_ref のみだと fork 間で同名ブランチの
+  # 別 PR が同一グループになり、互いの CI を cancel し合う）
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------
+  # probe（3 種類の GitHub ホステッド Linux runner で実機プローブ）
+  # --------------------------------------------------
+  # matrix.assert_kvm: x86_64 の 2 種（ubuntu-24.04 / ubuntu-22.04）は KVM が
+  # 使えることを期待して最後に assert する。ubuntu-24.04-arm は KVM
+  # （ネストした仮想化）を前提にできないため報告のみに留める。
+  # fail-fast: false は 1 OS の失敗で他 OS の実行を打ち切らせないため
+  # （3 種すべての実測結果を必ず得る）。
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-24.04
+            assert_kvm: true
+          - os: ubuntu-22.04
+            assert_kvm: true
+          - os: ubuntu-24.04-arm
+            assert_kvm: false
+    runs-on: ${{ matrix.os }}
+    # ハングしたジョブの無期限実行を防ぐ多層防御。L2 ゲスト起動プローブに
+    # 90 秒の timeout を持たせているが、apt-get 等を含めた全体の上限として設定する
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      # 各ステップが記録した項目を貯めるための一時ファイル名（ジョブ内の
+      # ステップ間でファイルシステムを共有できることを前提にする）。
+      # 最後の集計ステップでここから summary 表を組み立てる。
+      # runner context は job 単位の env: では参照できないため（actionlint 検出）、
+      # 実際の絶対パスは各ステップの実行時に $RUNNER_TEMP（runner が設定する
+      # 実環境変数）と組み合わせて "${RUNNER_TEMP}/${RESULTS_FILE}" として使う
+      RESULTS_FILE: probe-results.tsv
+    steps:
+      # --------------------------------------------------
+      # 1. 環境情報
+      # --------------------------------------------------
+      - name: Collect host environment info
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail
+          RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          : > "${RESULTS_FILE}"
+          record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
+
+          record "ImageOS" "${ImageOS:-unknown}"
+          record "ImageVersion" "${ImageVersion:-unknown}"
+          record "kernel (uname -r)" "$(uname -r)"
+          record "arch (uname -m)" "$(uname -m)"
+
+          os_pretty="$(grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"')"
+          record "OS PRETTY_NAME" "${os_pretty:-unknown}"
+
+          record "nproc" "$(nproc)"
+
+          mem_total="$(free -m | awk '/^Mem:/ {print $2}')"
+          record "memory total (MB)" "${mem_total:-unknown}"
+
+          cpu_model="$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+          record "CPU model" "${cpu_model:-not reported}"
+
+          vmx_svm="$(grep -cwE 'vmx|svm' /proc/cpuinfo)"
+          record "vmx/svm flag count (/proc/cpuinfo)" "${vmx_svm:-0}"
+
+          virt_type="$(systemd-detect-virt 2>/dev/null || echo "detection failed")"
+          record "systemd-detect-virt" "${virt_type}"
+          exit 0
+
+      # --------------------------------------------------
+      # 2. sudo
+      # --------------------------------------------------
+      - name: Check passwordless sudo
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail
+          RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
+          if sudo -n true 2>/dev/null; then
+            record "sudo -n true" "success"
+          else
+            record "sudo -n true" "failed"
+          fi
+          exit 0
+
+      # --------------------------------------------------
+      # 3. /dev/kvm（udev 修正前）
+      # --------------------------------------------------
+      - name: Check /dev/kvm before udev fix
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail
+          RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
+          if [ -e /dev/kvm ]; then
+            record "/dev/kvm before udev fix" "$(ls -l /dev/kvm)"
+          else
+            record "/dev/kvm before udev fix" "not present"
+          fi
+          exit 0
+
+      # --------------------------------------------------
+      # 4. /dev/kvm の udev ルール修正
+      # --------------------------------------------------
+      - name: Apply KVM udev rule
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail
+          RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+            record "/dev/kvm after udev fix" "$(ls -l /dev/kvm)"
+          else
+            record "/dev/kvm after udev fix" "not applicable (no /dev/kvm)"
+          fi
+          exit 0
+
+      # --------------------------------------------------
+      # 5. KVM ioctl（非 root で /dev/kvm を open して確認）
+      # --------------------------------------------------
+      - name: Probe KVM ioctls as non-root
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail
+          RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
+
+          probe_out="$(python3 - <<'PY'
+          import fcntl
+          import os
+
+          # KVM_GET_API_VERSION / KVM_CREATE_VM の ioctl 番号（KVM API の固定値。
+          # 期待する API_VERSION は 12）
+          KVM_GET_API_VERSION = 0xAE00
+          KVM_CREATE_VM = 0xAE01
+
+          try:
+              fd = os.open("/dev/kvm", os.O_RDWR)
+          except OSError as exc:
+              print(f"open_error={exc}")
+              raise SystemExit
+
+          print("open_ok=true")
+
+          try:
+              version = fcntl.ioctl(fd, KVM_GET_API_VERSION)
+              print(f"api_version={version}")
+          except OSError as exc:
+              print(f"api_version_error={exc}")
+
+          try:
+              vm_fd = fcntl.ioctl(fd, KVM_CREATE_VM, 0)
+              print(f"create_vm_fd={vm_fd}")
+          except OSError as exc:
+              print(f"create_vm_error={exc}")
+
+          os.close(fd)
+          PY
+          )"
+          echo "${probe_out}"
+
+          open_ok="false"
+          api_ok="false"
+          create_vm_ok="false"
+
+          if printf '%s\n' "${probe_out}" | grep -q '^open_ok=true'; then
+            open_ok="true"
+            record "KVM ioctl: open /dev/kvm" "success"
+          else
+            open_error="$(printf '%s\n' "${probe_out}" | grep -m1 '^open_error' || echo "failed")"
+            record "KVM ioctl: open /dev/kvm" "${open_error}"
+          fi
+
+          api_line="$(printf '%s\n' "${probe_out}" | grep -m1 '^api_version')"
+          if printf '%s' "${api_line}" | grep -q '^api_version=12$'; then
+            api_ok="true"
+          fi
+          record "KVM ioctl: KVM_GET_API_VERSION (expect 12)" "${api_line:-skipped (open failed)}"
+
+          vm_line="$(printf '%s\n' "${probe_out}" | grep -m1 '^create_vm_fd')"
+          if printf '%s' "${vm_line}" | grep -Eq '^create_vm_fd=[0-9]+$'; then
+            create_vm_ok="true"
+          fi
+          record "KVM ioctl: KVM_CREATE_VM" "${vm_line:-skipped (open failed)}"
+
+          {
+            echo "KVM_OPEN_OK=${open_ok}"
+            echo "KVM_API_OK=${api_ok}"
+            echo "KVM_CREATE_VM_OK=${create_vm_ok}"
+          } >> "$GITHUB_ENV"
+          exit 0
+
+      # --------------------------------------------------
+      # 6. ネストした仮想化の設定（参考情報。assert はしない）
+      # --------------------------------------------------
+      - name: Check nested virtualization parameter
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail
+          RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
+          nested="none"
+          if [ -e /sys/module/kvm_intel/parameters/nested ]; then
+            nested="$(cat /sys/module/kvm_intel/parameters/nested)"
+          elif [ -e /sys/module/kvm_amd/parameters/nested ]; then
+            nested="$(cat /sys/module/kvm_amd/parameters/nested)"
+          fi
+          record "nested virtualization parameter" "${nested}"
+          exit 0
+
+      # --------------------------------------------------
+      # 7. L2 ゲスト起動（x86_64 かつ KVM_CREATE_VM 成功時のみ）
+      # --------------------------------------------------
+      - name: Boot minimal L2 guest under KVM
+        if: matrix.assert_kvm == true && env.KVM_CREATE_VM_OK == 'true'
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail
+          RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86
+
+          # ホストカーネルは root 専用読み取り（0600）のため、非 root の qemu プロセスが
+          # 読めるコピーを作業ディレクトリへ用意する
+          kernel_copy="${RUNNER_TEMP}/vmlinuz-probe"
+          sudo install -m 0644 "/boot/vmlinuz-$(uname -r)" "${kernel_copy}"
+
+          log_file="${RUNNER_TEMP}/l2-guest-boot.log"
+          start_ts="$(date +%s.%N)"
+          timeout 90 qemu-system-x86_64 \
+            -accel kvm -cpu host -m 256 -nographic -no-reboot \
+            -kernel "${kernel_copy}" \
+            -append 'console=ttyS0 panic=-1' \
+            > "${log_file}" 2>&1
+          qemu_status=$?
+          end_ts="$(date +%s.%N)"
+          duration="$(awk -v a="${start_ts}" -v b="${end_ts}" 'BEGIN { printf "%.1f", b - a }')"
+
+          echo "---- last 20 lines of guest boot log ----"
+          tail -n 20 "${log_file}"
+          echo "---- end of guest boot log ----"
+
+          # initrd を渡していないため root マウントに失敗して panic する想定
+          # （panic=-1・-no-reboot で再起動せず終了する）。カーネル起動自体の成否は
+          # ブートメッセージ "Linux version" の有無と timeout(exit 124) でないことで判定する
+          if [ "${qemu_status}" -eq 124 ]; then
+            record "L2 guest boot (qemu+kvm)" "failed (timeout after ${duration}s)"
+            echo "L2_BOOT_OK=false" >> "$GITHUB_ENV"
+          elif grep -q 'Linux version' "${log_file}"; then
+            record "L2 guest boot (qemu+kvm)" "kernel started in ${duration}s (qemu exit=${qemu_status})"
+            echo "L2_BOOT_OK=true" >> "$GITHUB_ENV"
+          else
+            record "L2 guest boot (qemu+kvm)" "failed (no kernel boot message, qemu exit=${qemu_status}, ${duration}s)"
+            echo "L2_BOOT_OK=false" >> "$GITHUB_ENV"
+          fi
+          exit 0
+
+      - name: Record L2 guest boot as skipped
+        if: "!(matrix.assert_kvm == true && env.KVM_CREATE_VM_OK == 'true')"
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail
+          RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
+          record "L2 guest boot (qemu+kvm)" "skipped (assert_kvm=false or KVM_CREATE_VM failed)"
+          echo "L2_BOOT_OK=false" >> "$GITHUB_ENV"
+          exit 0
+
+      # --------------------------------------------------
+      # 8. user namespace / AppArmor（報告のみ。fail させない）
+      # --------------------------------------------------
+      - name: Check user namespace and AppArmor restrictions
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail
+          RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
+
+          max_userns="$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo "unknown")"
+          record "max_user_namespaces" "${max_userns}"
+
+          apparmor_restrict="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo "none")"
+          record "apparmor_restrict_unprivileged_userns (before)" "${apparmor_restrict}"
+
+          if unshare -Ur true 2>/dev/null; then
+            record "unshare -Ur true (before adjustment)" "success"
+          else
+            record "unshare -Ur true (before adjustment)" "failed"
+          fi
+
+          if [ "${apparmor_restrict}" = "1" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 >/dev/null 2>&1
+            apparmor_restrict_after="$(
+              sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo "none"
+            )"
+            record "apparmor_restrict_unprivileged_userns (after adjustment)" "${apparmor_restrict_after}"
+
+            if unshare -Ur true 2>/dev/null; then
+              record "unshare -Ur true (after adjustment)" "success"
+            else
+              record "unshare -Ur true (after adjustment)" "failed"
+            fi
+          else
+            record "apparmor_restrict_unprivileged_userns (after adjustment)" \
+              "not applicable (already 0 or unavailable)"
+            record "unshare -Ur true (after adjustment)" "not applicable"
+          fi
+
+          if unshare -Urmpf --mount-proc true 2>/dev/null; then
+            record "unshare -Urmpf --mount-proc true (after adjustment)" "success"
+          else
+            record "unshare -Urmpf --mount-proc true (after adjustment)" "failed"
+          fi
+          exit 0
+
+      # --------------------------------------------------
+      # 9. cgroup
+      # --------------------------------------------------
+      - name: Check cgroup configuration
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail
+          RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
+          fs_type="$(stat -fc %T /sys/fs/cgroup 2>/dev/null || echo "unknown")"
+          record "/sys/fs/cgroup filesystem type (expect cgroup2fs)" "${fs_type}"
+          controllers="$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || echo "unknown")"
+          record "cgroup.controllers" "${controllers}"
+          exit 0
+
+      # --------------------------------------------------
+      # 10. seccomp / Landlock
+      # --------------------------------------------------
+      - name: Check seccomp and Landlock availability
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail
+          RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          record() { printf '%s\t%s\n' "$1" "$2" >> "${RESULTS_FILE}"; }
+
+          seccomp="$(grep '^Seccomp:' /proc/self/status 2>/dev/null || echo "unknown")"
+          record "Seccomp (/proc/self/status)" "${seccomp}"
+
+          lsm_list="$(sudo cat /sys/kernel/security/lsm 2>/dev/null || echo "unavailable")"
+          record "active LSMs (/sys/kernel/security/lsm)" "${lsm_list}"
+
+          landlock_abi="$(python3 - <<'PY'
+          import ctypes
+
+          libc = ctypes.CDLL(None, use_errno=True)
+          libc.syscall.restype = ctypes.c_long
+
+          # landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION) は
+          # ABI バージョン問い合わせ専用の呼び出し。syscall 番号 444 は
+          # x86_64 / aarch64 で共通
+          LANDLOCK_CREATE_RULESET = 444
+          LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
+
+          ret = libc.syscall(LANDLOCK_CREATE_RULESET, None, 0, LANDLOCK_CREATE_RULESET_VERSION)
+          if ret < 0:
+              err = ctypes.get_errno()
+              print(f"error (errno={err})")
+          else:
+              print(f"abi_version={ret}")
+          PY
+          )"
+          record "Landlock ABI version" "${landlock_abi}"
+          exit 0
+
+      # --------------------------------------------------
+      # 集計・summary 出力
+      # --------------------------------------------------
+      - name: Build step summary table
+        if: always()
+        continue-on-error: true
+        run: |
+          RESULTS_FILE="${RUNNER_TEMP}/${RESULTS_FILE}"
+          {
+            echo "### Linux env probe results — ${{ matrix.os }} (assert_kvm=${{ matrix.assert_kvm }})"
+            echo ""
+            echo "| Item | Result |"
+            echo "| ---- | ------ |"
+            if [ -f "${RESULTS_FILE}" ]; then
+              while IFS=$'\t' read -r item value; do
+                escaped_value="${value//|/\\|}"
+                echo "| ${item} | ${escaped_value} |"
+              done < "${RESULTS_FILE}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      # --------------------------------------------------
+      # KVM 判定（assert_kvm=true の runner のみ。arm64 は報告のみで fail させない）
+      # --------------------------------------------------
+      - name: Assert all KVM checks succeeded (x86_64 runners only)
+        if: always()
+        run: |
+          if [ "${{ matrix.assert_kvm }}" != "true" ]; then
+            echo "assert_kvm is false for this runner; reporting only, not asserting."
+            exit 0
+          fi
+
+          failed=""
+          kvm_checks=(
+            "open /dev/kvm after udev fix:${KVM_OPEN_OK:-false}"
+            "KVM_GET_API_VERSION=12:${KVM_API_OK:-false}"
+            "KVM_CREATE_VM:${KVM_CREATE_VM_OK:-false}"
+            "qemu KVM guest boot:${L2_BOOT_OK:-false}"
+          )
+          for check in "${kvm_checks[@]}"; do
+            name="${check%%:*}"
+            result="${check##*:}"
+            if [ "${result}" != "true" ]; then
+              failed="${failed}${name}; "
+            fi
+          done
+
+          if [ -n "${failed}" ]; then
+            echo "The following KVM checks did not succeed on this x86_64 runner: ${failed}" >&2
+            exit 1
+          fi
+
+          echo "All KVM checks succeeded."

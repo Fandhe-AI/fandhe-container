@@ -281,7 +281,8 @@ impl TryFrom<String> for GuestPath {
 ///
 /// # 検証範囲（security.md「パス要素は検証・正規化してからルート配下であることを確認する」）
 ///
-/// この型が保証するのは絶対パス表記であることと、字句上 `..` 要素を含まないことの 2 点のみ
+/// この型が保証するのは絶対パス表記であること・字句上 `..` 要素を含まないこと・非先頭の
+/// `.` セグメント / 重複区切り文字 / 末尾区切り文字を正規化して保持することの 3 点のみ
 /// （[`HostBindPath::new`] のドキュメントを参照）。symlink はファイルシステムの実体を見ない
 /// 限り検知できないため、ここでは解決しない。実マウント時に symlink を解決したうえで許可
 /// 境界（ホストの許可ディレクトリ配下であること）を確認するのは、`VolumeProvider` 実装側の
@@ -302,9 +303,12 @@ impl HostBindPath {
     /// - `..`（親ディレクトリ）要素を 1 つでも含む（`/allowed/../../etc` のような経路で
     ///   許可境界の外へ抜けるパストラバーサルを型のレベルで拒否する。security.md）
     ///
-    /// `.` 要素・重複区切り文字は [`GuestPath`] と同様に読み飛ばして正規化する。symlink の
-    /// 解決はここでは行わない（型ドキュメントの「検証範囲」を参照。実マウント時に provider
-    /// 側で解決・境界確認する）。
+    /// 非先頭の `.` セグメント・重複区切り文字・末尾区切り文字は [`GuestPath`] と同様に
+    /// 読み飛ばして正規化し、保持する内部値・[`HostBindPath::as_path`] の戻り値の両方に
+    /// 反映する（`Path::components()` が持つ正規化規則に従う。Windows の `\\?\` verbatim
+    /// 形式は `components()` の正規化規則が異なるため対象外とし、そのまま保持する）。
+    /// symlink の解決はここでは行わない（型ドキュメントの「検証範囲」を参照。実マウント時に
+    /// provider 側で解決・境界確認する）。
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, TraitError> {
         use std::path::Component;
 
@@ -332,7 +336,12 @@ impl HostBindPath {
                 ));
             }
         }
-        Ok(Self(path))
+        // `Path::components()` は非先頭の `.` セグメント・重複区切り文字・末尾区切り文字を
+        // 読み飛ばした Component 列を返す（std のドキュメント）。これを組み直すことで、
+        // 上のドキュメントコメントが謳う正規化を実際に保持値へ反映する（レビュー指摘:
+        // 正規化すると謳いながら元の path をそのまま保持していた不一致の是正）。
+        let normalized: PathBuf = path.components().collect();
+        Ok(Self(normalized))
     }
 
     /// 検証済みパスへの参照を返す。
@@ -867,6 +876,33 @@ mod tests {
                 .as_path(),
             host_path.as_path()
         );
+    }
+
+    /// PLUG-1: `HostBindPath` はドキュメントどおり、非先頭の `.` セグメント・重複区切り
+    /// 文字・末尾区切り文字を正規化して保持する（レビュー指摘の是正: 正規化を謳いながら
+    /// `as_path()` が元の未正規化パスをそのまま返していた不一致を機械照合する）。
+    #[test]
+    fn plug1_host_bind_path_normalizes_dot_and_repeated_separators() {
+        #[cfg(unix)]
+        {
+            let messy = PathBuf::from("/srv/./x//y/");
+            let clean = HostBindPath::new(messy).expect("messy absolute path is accepted");
+            assert_eq!(clean.as_path(), std::path::Path::new("/srv/x/y"));
+
+            let already_clean =
+                HostBindPath::new(PathBuf::from("/srv/x/y")).expect("clean path is accepted");
+            assert_eq!(clean, already_clean);
+        }
+        #[cfg(windows)]
+        {
+            let messy = PathBuf::from(r"C:\srv\.\x\\y\");
+            let clean = HostBindPath::new(messy).expect("messy absolute path is accepted");
+            assert_eq!(clean.as_path(), std::path::Path::new(r"C:\srv\x\y"));
+
+            let already_clean =
+                HostBindPath::new(PathBuf::from(r"C:\srv\x\y")).expect("clean path is accepted");
+            assert_eq!(clean, already_clean);
+        }
     }
 
     /// PLUG-1: `HostBindPath` は絶対パスであっても `..` 要素を含む場合は拒否する

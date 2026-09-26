@@ -77,12 +77,17 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 /// 7. **二重作成の拒否**: 同名のネットワークや同じコンテナの netns が既にあれば
 ///    [`ErrorCode::AlreadyExists`] を返す。前回の残骸を黙って再利用しない。
 /// 8. **前提違反**: 存在しないネットワークへの [`Self::create_netns`] / [`Self::attach`] /
-///    [`Self::publish_port`]、netns 未作成のコンテナへの [`Self::attach`] は
-///    [`ErrorCode::NotFound`] を返す。加えて [`Self::attach`] は、対象コンテナの netns が
-///    [`Self::create_netns`] で紐付けられたネットワーク（`CreateNetnsRequest::network`）と
+///    [`Self::publish_port`]、netns 未作成のコンテナへの [`Self::attach`]、
+///    未 attach のコンテナへの [`Self::publish_port`] は [`ErrorCode::NotFound`] を返す。
+///    加えて [`Self::attach`] は、対象コンテナの netns が [`Self::create_netns`] で
+///    紐付けられたネットワーク（`CreateNetnsRequest::network`）と `req.network()` が
+///    一致しない場合、[`ErrorCode::FailedPrecondition`] を返す（異なるネットワークへの
+///    越境接続を拒否し、[`Self::delete_network`] の追跡対象と実際の接続先の食い違いを
+///    防ぐ。codex/review 指摘 P1）。同様に [`Self::publish_port`] は、対象コンテナが
+///    [`Self::attach`] された際のネットワーク（`AttachRequest::network`）と
 ///    `req.network()` が一致しない場合、[`ErrorCode::FailedPrecondition`] を返す
-///    （異なるネットワークへの越境接続を拒否し、[`Self::delete_network`] の追跡対象と
-///    実際の接続先の食い違いを防ぐ。codex/review 指摘 P1）。
+///    （別ネットワークに属するコンテナ ID を渡して越境 DNAT を設定させないため。
+///    codex/review 指摘 P1）。
 /// 9. **削除はベストエフォートで続行**: [`Self::delete_network`] は個々の削除に失敗しても
 ///    残りの削除を続け、1 件でも失敗があれば `Err`（[`ErrorCode::Internal`]）を返す
 ///    （PoC-15 の `net-delete` に準拠）。
@@ -131,10 +136,16 @@ pub trait NetworkPlugin: Send + Sync {
     ///
     /// netsetup の `publish-port` に対応する。前提: `req.network()` が
     /// [`Self::create_network`] 済みで、対象コンテナが [`Self::attach`] 済みであること
-    /// （いずれも未作成なら [`ErrorCode::NotFound`]）。宛先は生の IP アドレスではなく
-    /// [`ContainerId`] で指定し、実装（plugin 側）が attach 済みのアドレスへ解決する。
-    /// これは PoC-15 との差分であり、ネットワーク外の任意ホストへ DNAT させる経路を
-    /// トレイト境界で作らないための設計である（#19 で確認する）。対応: NET-4。
+    /// （いずれも未作成なら [`ErrorCode::NotFound`]）。加えて、対象コンテナが
+    /// [`Self::attach`] された際のネットワーク（`AttachRequest::network`）が
+    /// `req.network()` と一致すること（不一致なら [`ErrorCode::FailedPrecondition`]）。
+    /// 一致を要求しないと、別ネットワークに属するコンテナ ID を渡されても実装が
+    /// そのアドレスへ DNAT を設定でき、ネットワーク間の分離と [`Self::delete_network`]
+    /// が追跡する削除対象の食い違いを招く（[`Self::attach`] の契約 8 と同じ理由。
+    /// codex/review 指摘 P1）。宛先は生の IP アドレスではなく [`ContainerId`] で
+    /// 指定し、実装（plugin 側）が attach 済みのアドレスへ解決する。これは PoC-15
+    /// との差分であり、ネットワーク外の任意ホストへ DNAT させる経路をトレイト境界で
+    /// 作らないための設計である（#19 で確認する）。対応: NET-4。
     fn publish_port(&self, req: &PublishPortRequest) -> Result<PortMapping, TraitError>;
 
     /// ネットワーク（bridge・nft テーブル・関連 netns）を一括削除する。
@@ -402,28 +413,42 @@ impl NetnsStatus {
     /// 対象コンテナの ID・netns の絶対パス・許可された netns 配下ディレクトリ
     /// （`allowed_root`）から応答を作る。
     ///
-    /// plugin からの応答は untrusted な外部入力であり、`path` を `is_absolute()` だけで
-    /// 受理すると任意の絶対パス（`/etc/passwd` 等）を runtime がそのまま join する経路に
-    /// なってしまう（codex/review 指摘 P0・security.md「plugin からの入力は untrusted
-    /// として検証する」「パス要素は検証・正規化してからルート配下であることを確認する」）。
-    /// そのため、次の 2 段階で fail-closed に検証する。
+    /// plugin からの応答は untrusted な外部入力であり、`path` を字句上の判定
+    /// （`is_absolute()`・[`Path::strip_prefix`] 等）だけで受理すると、`allowed_root`
+    /// 配下にある symlink が外部（`/etc/passwd` 等）を指す場合にも通ってしまい、
+    /// runtime がその symlink をそのまま辿る経路になる（codex/review 指摘 P0・
+    /// security.md「plugin からの入力は untrusted として検証する」「パス要素は
+    /// 検証・正規化してからルート配下であることを確認する」）。そのため本関数は
+    /// 字句上の検証に加えて `std::fs::canonicalize` で symlink を実際に解決してから
+    /// 配下判定を行う（`StateStore` の既定実装が core に置かれるのと同様、fs アクセスは
+    /// 本 crate の関心事から外れない。coding-rust.md）。
     ///
-    /// 1. **契約（呼び出し側の責務）**: 呼び出し側（境界機構・proxy。PLUG-11・PLUG-12）は
-    ///    plugin から受け取った生のパスをこの関数へ渡す前に、シンボリックリンクを解決
-    ///    した正規化済みの絶対パス（例: `std::fs::canonicalize` 相当）にしてから渡す。
-    ///    本 crate（core）はこのトレイト定義のみを持ち、実際のファイルシステム走査は
-    ///    行わない（PLUG-1・上記境界機構の責務）。
-    /// 2. **本関数が構造的に強制する検証**: `path` が絶対パスであること、`.`・`..`
-    ///    コンポーネントを含まないこと（字句上のトラバーサル拒否）、そして `path` が
-    ///    `allowed_root` の**コンポーネント単位**の配下にあることを検証する。文字列の
-    ///    前方一致（`starts_with`）ではなく [`Path::strip_prefix`] を使うのは、
-    ///    `/run/netns-evil/x` のような紛らわしい兄弟ディレクトリを `/run/netns` への
-    ///    前方一致で誤って許可しないためである。
+    /// 検証手順（fail-closed）:
+    /// 1. `path`・`allowed_root` がともに絶対パスであること（相対パスは cwd に依存し
+    ///    `canonicalize` の意味が呼び出し文脈で変わるため、先に弾く）。
+    /// 2. `path` が `.`・`..` コンポーネントを含まないこと（字句上のトラバーサル拒否。
+    ///    canonicalize で `..` は解決されるが、明らかな不正入力を早期に弾くため残す）。
+    /// 3. `path`・`allowed_root` の双方を `canonicalize` し、symlink・`..`・冗長な
+    ///    区切り文字を解決した実体パスにする。**両方**を canonicalize するのは、
+    ///    片方だけだと macOS の `/tmp` → `/private/tmp` のような実体パスの差異や、
+    ///    Windows の `\\?\` verbose prefix の有無で [`Path::strip_prefix`] が誤って
+    ///    不一致になる（＝正当な netns まで拒否する）ためである。
+    /// 4. canonicalize 後の `path` が canonicalize 後の `allowed_root` の
+    ///    **コンポーネント単位**の配下にあることを [`Path::strip_prefix`] で検証する。
+    ///    文字列の前方一致（`starts_with`）を使わないのは、`/run/netns-evil/x` の
+    ///    ような紛らわしい兄弟ディレクトリを `/run/netns` への前方一致で誤って
+    ///    許可しないためである。
     ///
-    /// `allowed_root` が絶対パスでない、`path` が絶対パスでない、`path` が
-    /// `.`・`..` を含む、または `path` が `allowed_root` 配下にない場合は
-    /// [`ErrorCode::InvalidArgument`] を返す。runtime（`ContainerRuntime` 実装）が
-    /// この netns に join する際のパスになる。
+    /// 呼び出し側（境界機構・proxy。PLUG-11・PLUG-12）は、plugin から受け取った生の
+    /// パスをそのまま渡してよい。symlink 解決はこの関数が行うため、呼び出し側で
+    /// 事前に正規化する契約には依存しない。返す [`NetnsStatus`] が保持するパスは
+    /// canonicalize 後の実体パスであり、runtime（`ContainerRuntime` 実装）がこの
+    /// netns に join する際にそのまま使える。
+    ///
+    /// `allowed_root` が絶対パスでない、`path` が絶対パスでない、`path` が `.`・`..`
+    /// を含む、`path` / `allowed_root` の実体が存在せず canonicalize に失敗する、
+    /// または canonicalize 後の `path` が canonicalize 後の `allowed_root` 配下にない
+    /// 場合は [`ErrorCode::InvalidArgument`] を返す。
     pub fn new(
         container: ContainerId,
         path: PathBuf,
@@ -452,13 +477,32 @@ impl NetnsStatus {
                 "netns path must not contain \".\" or \"..\" components",
             ));
         }
-        if path.strip_prefix(allowed_root).is_err() {
+        // symlink・`..`・冗長区切りを解決した実体パスへ正規化する。plugin から
+        // 渡された生のパスが `allowed_root` 配下の symlink 経由で外部を指す場合
+        // でも、ここで実体パスに解決してから配下判定を行うため通らない
+        // （codex/review 指摘 P0）。
+        let canonical_path = path.canonicalize().map_err(|e| {
+            TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("netns path could not be resolved (canonicalize failed): {e}"),
+            )
+        })?;
+        let canonical_root = allowed_root.canonicalize().map_err(|e| {
+            TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("netns allowed root could not be resolved (canonicalize failed): {e}"),
+            )
+        })?;
+        if canonical_path.strip_prefix(&canonical_root).is_err() {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 "netns path must be under the allowed netns root",
             ));
         }
-        Ok(Self { container, path })
+        Ok(Self {
+            container,
+            path: canonical_path,
+        })
     }
 
     /// 対象コンテナの ID を返す。
@@ -718,15 +762,69 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// `NetnsStatus::new`（P0 の symlink 解決検証）用の一時ディレクトリ管理。
+    ///
+    /// `NetnsStatus::new` が `std::fs::canonicalize` で実体パスを解決する契約
+    /// （codex/review 指摘 P0）になったため、テストも実在するパスを用意する
+    /// 必要がある。`base` 配下に allowed_root・その外側のディレクトリ・symlink を
+    /// 作り、`Drop` で後始末する。
+    struct NetnsTestFixture {
+        base: PathBuf,
+    }
+
+    impl NetnsTestFixture {
+        /// `tag`（テストごとに異なる文字列）とプロセス ID・連番から一意な一時
+        /// ディレクトリを作る。並列実行される他のテストと衝突しない。
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let base = std::env::temp_dir().join(format!(
+                "fandhe-container-network-plugin-test-{tag}-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&base).expect("create fixture base dir");
+            Self { base }
+        }
+
+        /// フィクスチャのベースディレクトリ（`allowed_root` の外側にも使う）。
+        fn base(&self) -> &Path {
+            &self.base
+        }
+
+        /// `allowed_root` として使うディレクトリを作って返す。
+        fn allowed_root(&self) -> PathBuf {
+            let root = self.base.join("root");
+            std::fs::create_dir_all(&root).expect("create allowed root");
+            root
+        }
+
+        /// `dir` 配下に空ファイル `name` を作り、そのパスを返す（`dir` も必要なら作る）。
+        fn file_under(&self, dir: &Path, name: &str) -> PathBuf {
+            std::fs::create_dir_all(dir).expect("create parent dir");
+            let file = dir.join(name);
+            std::fs::write(&file, b"").expect("create fixture file");
+            file
+        }
+    }
+
+    impl Drop for NetnsTestFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
     /// テスト用のスタブ実装。dyn 互換性と各メソッドの戻り値を確認するためのみに使う。
     struct StubNetworkPlugin {
         network_created: std::sync::atomic::AtomicBool,
+        netns_fixture: NetnsTestFixture,
     }
 
     impl StubNetworkPlugin {
         fn new() -> Self {
             Self {
                 network_created: std::sync::atomic::AtomicBool::new(false),
+                netns_fixture: NetnsTestFixture::new("stub"),
             }
         }
     }
@@ -746,8 +844,9 @@ mod tests {
         }
 
         fn create_netns(&self, req: &CreateNetnsRequest) -> Result<NetnsStatus, TraitError> {
-            let path = PathBuf::from(sample_netns_path());
-            NetnsStatus::new(req.container().clone(), path, &sample_netns_allowed_root())
+            let allowed_root = self.netns_fixture.allowed_root();
+            let path = self.netns_fixture.file_under(&allowed_root, "x");
+            NetnsStatus::new(req.container().clone(), path, &allowed_root)
         }
 
         fn attach(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError> {
@@ -800,24 +899,15 @@ mod tests {
         IpAddr::from([10, 250, 11, 1])
     }
 
+    /// [`NetnsStatus::new`] の字句上のトラバーサル拒否テストへ渡す、実在しなくてよい
+    /// 許可済み netns 配下ディレクトリ（絶対パスであること以外は検証されない経路）。
     #[cfg(unix)]
-    fn sample_netns_path() -> &'static str {
-        "/run/netns/x"
-    }
-
-    #[cfg(windows)]
-    fn sample_netns_path() -> &'static str {
-        r"C:\netns\x"
-    }
-
-    /// [`NetnsStatus::new`] へ渡す許可済み netns 配下ディレクトリ（テスト用固定値）。
-    #[cfg(unix)]
-    fn sample_netns_allowed_root() -> PathBuf {
+    fn nonexistent_allowed_root() -> PathBuf {
         PathBuf::from("/run/netns")
     }
 
     #[cfg(windows)]
-    fn sample_netns_allowed_root() -> PathBuf {
+    fn nonexistent_allowed_root() -> PathBuf {
         PathBuf::from(r"C:\netns")
     }
 
@@ -835,7 +925,11 @@ mod tests {
                 sample_container_id(),
             ))
             .expect("create_netns succeeds");
-        assert_eq!(netns_status.path(), Path::new(sample_netns_path()));
+        assert_eq!(
+            netns_status.path().file_name(),
+            Some(std::ffi::OsStr::new("x"))
+        );
+        assert!(netns_status.path().is_absolute());
 
         let attach_resp = boxed
             .attach(&AttachRequest::new(
@@ -951,56 +1045,81 @@ mod tests {
         assert_eq!(Protocol::Udp.as_str(), "udp");
     }
 
-    /// CRI-7: `NetnsStatus::new` は相対パスを拒否し、`allowed_root` 配下の絶対パスは
-    /// 受理する。
+    /// CRI-7: `NetnsStatus::new` は相対パスを拒否し、`allowed_root` 配下の実在する
+    /// 絶対パスは受理して canonicalize 後の実体パスを保持する。
     #[test]
     fn cri7_netns_status_rejects_relative_path() {
-        let allowed_root = sample_netns_allowed_root();
+        let fixture = NetnsTestFixture::new("relative");
+        let allowed_root = fixture.allowed_root();
         let err = NetnsStatus::new(sample_container_id(), PathBuf::from("netns"), &allowed_root)
             .expect_err("relative path must be rejected");
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
 
-        let ok = NetnsStatus::new(
-            sample_container_id(),
-            PathBuf::from(sample_netns_path()),
-            &allowed_root,
+        let valid_path = fixture.file_under(&allowed_root, "x");
+        let status = NetnsStatus::new(sample_container_id(), valid_path.clone(), &allowed_root)
+            .expect("path under allowed_root must be accepted");
+        assert_eq!(
+            status.path(),
+            valid_path.canonicalize().expect("canonicalize").as_path()
         );
-        assert!(ok.is_ok());
     }
 
     /// codex/review 指摘 P0: `NetnsStatus::new` は untrusted な plugin 応答が
-    /// 任意の絶対パスを主張しても、`allowed_root` 配下でなければ拒否する
+    /// 任意の実在パスを主張しても、`allowed_root` 配下でなければ拒否する
     /// （文字列前方一致ではなくコンポーネント単位で判定するため、紛らわしい兄弟
     /// ディレクトリも通さない）。
     #[test]
     fn p0_netns_status_rejects_path_outside_allowed_root() {
-        let allowed_root = sample_netns_allowed_root();
+        let fixture = NetnsTestFixture::new("outside");
+        let allowed_root = fixture.allowed_root();
 
-        // allowed_root と無関係な絶対パス（任意ファイルへの誘導）。
-        #[cfg(unix)]
-        let outside = PathBuf::from("/etc/passwd");
-        #[cfg(windows)]
-        let outside = PathBuf::from(r"C:\Windows\System32\config\SAM");
+        // allowed_root と無関係な実在パス（任意ファイルへの誘導）。
+        let outside = fixture.file_under(&fixture.base().join("outside"), "secret");
         let err = NetnsStatus::new(sample_container_id(), outside, &allowed_root)
             .expect_err("path outside allowed root must be rejected");
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
 
         // 文字列の前方一致では通ってしまう紛らわしい兄弟ディレクトリ
-        // （`/run/netns-evil` は `/run/netns` に前方一致するが配下ではない）。
-        #[cfg(unix)]
-        let lookalike = PathBuf::from("/run/netns-evil/x");
-        #[cfg(windows)]
-        let lookalike = PathBuf::from(r"C:\netns-evil\x");
+        // （`root-evil` は `root` に前方一致するが配下ではない）。
+        let lookalike_dir = {
+            let mut dir = allowed_root.clone();
+            dir.set_file_name("root-evil");
+            dir
+        };
+        let lookalike = fixture.file_under(&lookalike_dir, "x");
         let err = NetnsStatus::new(sample_container_id(), lookalike, &allowed_root)
             .expect_err("string-prefix lookalike must be rejected");
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
     }
 
+    /// codex/review 指摘 P0: `NetnsStatus::new` は `allowed_root` の symlink を
+    /// 実際に解決し、`allowed_root` 配下にある symlink が外部を指す場合は拒否する
+    /// （字句上の判定だけでは通ってしまう経路。symlink 解決検証が本体）。
+    #[test]
+    fn p0_netns_status_rejects_symlink_escaping_allowed_root() {
+        let fixture = NetnsTestFixture::new("symlink");
+        let allowed_root = fixture.allowed_root();
+
+        let outside_dir = fixture.base().join("outside");
+        let target = fixture.file_under(&outside_dir, "secret");
+
+        let link = allowed_root.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &link).expect("create symlink");
+
+        let err = NetnsStatus::new(sample_container_id(), link, &allowed_root)
+            .expect_err("symlink escaping allowed_root must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
     /// codex/review 指摘 P0: `NetnsStatus::new` は `allowed_root` 配下でも
-    /// `..` コンポーネントを含む字句上のトラバーサルを拒否する。
+    /// `..` コンポーネントを含む字句上のトラバーサルを拒否する（実在パスの有無に
+    /// 関わらず、この字句チェックは canonicalize より先に走る）。
     #[test]
     fn p0_netns_status_rejects_parent_dir_traversal() {
-        let allowed_root = sample_netns_allowed_root();
+        let allowed_root = nonexistent_allowed_root();
 
         #[cfg(unix)]
         let traversal = PathBuf::from("/run/netns/../../etc/passwd");
@@ -1012,16 +1131,32 @@ mod tests {
     }
 
     /// codex/review 指摘 P0: `allowed_root` 自体が絶対パスでなければ拒否する
-    /// （呼び出し側の設定ミスを fail-closed で検出する）。
+    /// （呼び出し側の設定ミスを fail-closed で検出する。canonicalize の前に弾くため
+    /// 実在パスは不要）。
     #[test]
     fn p0_netns_status_rejects_relative_allowed_root() {
         let allowed_root = PathBuf::from("netns");
         let err = NetnsStatus::new(
             sample_container_id(),
-            PathBuf::from(sample_netns_path()),
+            PathBuf::from("/run/netns/x"),
             &allowed_root,
         )
         .expect_err("relative allowed root must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// codex/review 指摘 P0: `path` / `allowed_root` の実体が存在しない場合は
+    /// canonicalize が失敗し `InvalidArgument` になる（存在確認なしに受理しない）。
+    #[test]
+    fn p0_netns_status_rejects_nonexistent_path() {
+        let fixture = NetnsTestFixture::new("nonexistent");
+        let allowed_root = fixture.allowed_root();
+        let err = NetnsStatus::new(
+            sample_container_id(),
+            allowed_root.join("does-not-exist"),
+            &allowed_root,
+        )
+        .expect_err("nonexistent path must be rejected");
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
     }
 

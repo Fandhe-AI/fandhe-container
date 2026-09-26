@@ -79,9 +79,16 @@ pub trait VolumeProvider: Send + Sync {
 
     /// ボリュームをコンテナのゲスト内パスへ接続する。
     ///
-    /// 前提: 対象ボリュームが作成済みであること。存在しなければ [`ErrorCode::NotFound`] を
-    /// 返す。同一コンテナ・同一 [`GuestPath`] への二重 attach は [`ErrorCode::AlreadyExists`]
-    /// を返す。
+    /// 前提は [`VolumeAttachRequest::source`]（[`VolumeSource`]）の variant によって異なる。
+    /// - [`VolumeSource::Named`]: 対象ボリュームが [`VolumeProvider::create`] 済みであること。
+    ///   存在しなければ [`ErrorCode::NotFound`] を返す。
+    /// - [`VolumeSource::Bind`]: provider が管理する名前付きボリュームではないため、
+    ///   `create` 済みであることは前提にしない（[`HostBindPath`] で検証済みの絶対パスを
+    ///   ホストからそのまま bind する）。ホスト側のパスが実在しない等の検証は実マウント時に
+    ///   provider が行う。
+    ///
+    /// variant によらず、同一コンテナ・同一 [`GuestPath`] への二重 attach は
+    /// [`ErrorCode::AlreadyExists`] を返す。
     fn attach(&self, req: &VolumeAttachRequest) -> Result<VolumeAttachment, TraitError>;
 
     /// ボリュームをコンテナから切り離す。
@@ -271,22 +278,47 @@ impl TryFrom<String> for GuestPath {
 /// [`VolumeSource::bind`] の絶対パス検証を迂回する経路を型のレベルで塞ぐ
 /// （coding-rust.md「壊れた値を表現できない」型の方針。[`VolumeName`]・[`GuestPath`] と
 /// 同じ形）。
+///
+/// # 検証範囲（security.md「パス要素は検証・正規化してからルート配下であることを確認する」）
+///
+/// この型が保証するのは絶対パス表記であることと、字句上 `..` 要素を含まないことの 2 点のみ
+/// （[`HostBindPath::new`] のドキュメントを参照）。symlink はファイルシステムの実体を見ない
+/// 限り検知できないため、ここでは解決しない。実マウント時に symlink を解決したうえで許可
+/// 境界（ホストの許可ディレクトリ配下であること）を確認するのは、`VolumeProvider` 実装側の
+/// 責務であり、本トレイトが保証する契約には含まれない。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HostBindPath(PathBuf);
 
 impl HostBindPath {
     /// 入力パスを検証してホスト bind マウントパスを作る。
     ///
-    /// `path` が絶対パスでない場合は [`ErrorCode::InvalidArgument`] を返す（fail-closed。
-    /// [`super::container_runtime::CreateRequest::new`] が bundle パスに課す制約と同じ理由で、
-    /// 相対パスは plugin プロセスとの作業ディレクトリの違いにより解決先が曖昧になる）。
+    /// 拒否条件（いずれかに該当すると [`ErrorCode::InvalidArgument`]。fail-closed）:
+    /// - 絶対パスでない（[`super::container_runtime::CreateRequest::new`] が bundle パスに
+    ///   課す制約と同じ理由で、相対パスは plugin プロセスとの作業ディレクトリの違いにより
+    ///   解決先が曖昧になる）
+    /// - `..`（親ディレクトリ）要素を 1 つでも含む（`/allowed/../../etc` のような経路で
+    ///   許可境界の外へ抜けるパストラバーサルを型のレベルで拒否する。security.md）
+    ///
+    /// `.` 要素・重複区切り文字は [`GuestPath`] と同様に読み飛ばして正規化する。symlink の
+    /// 解決はここでは行わない（型ドキュメントの「検証範囲」を参照。実マウント時に provider
+    /// 側で解決・境界確認する）。
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, TraitError> {
+        use std::path::Component;
+
         let path = path.into();
         if !path.is_absolute() {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 "bind mount host path must be absolute",
             ));
+        }
+        for component in path.components() {
+            if component == Component::ParentDir {
+                return Err(TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    "bind mount host path must not contain a \"..\" component",
+                ));
+            }
         }
         Ok(Self(path))
     }
@@ -574,10 +606,18 @@ impl VolumeDetachResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
 
     /// テスト用のスタブ実装。dyn 互換性と各メソッドの戻り値を確認するためのみに使う。
-    struct StubVolumeProvider;
+    ///
+    /// `attached` は現在 attach 中の [`VolumeName`] の集合を保持する（[`VolumeSource::Bind`]
+    /// は provider 管理のボリュームではないため対象外。CRI-7 の使用中判定テストが
+    /// 実際に attach 状態を検証できるようにするための最小限の状態）。
+    #[derive(Default)]
+    struct StubVolumeProvider {
+        attached: Mutex<HashSet<VolumeName>>,
+    }
 
     impl VolumeProvider for StubVolumeProvider {
         fn create(&self, req: &VolumeCreateRequest) -> Result<VolumeInfo, TraitError> {
@@ -585,12 +625,21 @@ mod tests {
         }
 
         fn remove(&self, req: &VolumeRemoveRequest) -> Result<VolumeRemoveResponse, TraitError> {
-            if !req.force() {
+            let in_use = self
+                .attached
+                .lock()
+                .expect("attached mutex must not be poisoned")
+                .contains(req.name());
+            if in_use && !req.force() {
                 return Err(TraitError::new(
                     ErrorCode::FailedPrecondition,
                     "volume is still attached",
                 ));
             }
+            self.attached
+                .lock()
+                .expect("attached mutex must not be poisoned")
+                .remove(req.name());
             Ok(VolumeRemoveResponse::new())
         }
 
@@ -599,6 +648,12 @@ mod tests {
         }
 
         fn attach(&self, req: &VolumeAttachRequest) -> Result<VolumeAttachment, TraitError> {
+            if let VolumeSource::Named(name) = req.source() {
+                self.attached
+                    .lock()
+                    .expect("attached mutex must not be poisoned")
+                    .insert(name.clone());
+            }
             Ok(VolumeAttachment::new(
                 req.container_id().clone(),
                 req.destination().clone(),
@@ -607,6 +662,10 @@ mod tests {
         }
 
         fn detach(&self, req: &VolumeDetachRequest) -> Result<VolumeDetachResponse, TraitError> {
+            // このスタブは VolumeName 単位でしか使用中状態を持たず、
+            // VolumeDetachRequest（container_id + destination）から対象の VolumeName へ
+            // 逆引きする情報を保持しない。そのため detach は `attached` 集合を変更しない
+            // （テストで参照する remove の使用中判定は attach 呼び出しのみで検証する）。
             let _ = req;
             Ok(VolumeDetachResponse::new())
         }
@@ -634,14 +693,14 @@ mod tests {
     /// create → attach → detach → remove の一連を呼べる。戻り値は具体値で確認する。
     #[test]
     fn plug1_volume_provider_is_dyn_compatible() {
-        let boxed: Box<dyn VolumeProvider> = Box::new(StubVolumeProvider);
+        let boxed: Box<dyn VolumeProvider> = Box::new(StubVolumeProvider::default());
         let name = sample_volume_name();
         let info = boxed
             .create(&VolumeCreateRequest::new(name.clone()))
             .expect("create succeeds");
         assert_eq!(info.name().as_str(), "sample-volume");
 
-        let shared: Arc<dyn VolumeProvider> = Arc::new(StubVolumeProvider);
+        let shared: Arc<dyn VolumeProvider> = Arc::new(StubVolumeProvider::default());
         let destination = GuestPath::new("/data").expect("valid guest path");
         let attach_req = VolumeAttachRequest::new(
             sample_container_id(),
@@ -785,14 +844,69 @@ mod tests {
         );
     }
 
-    /// CRI-7: `remove` が使用中判定で `FAILED_PRECONDITION` を返す。
+    /// PLUG-1: `HostBindPath` は絶対パスであっても `..` 要素を含む場合は拒否する
+    /// （`/allowed/../../etc` のようなパストラバーサルを型のレベルで塞ぐ。security.md）。
+    /// `VolumeSource::bind` 経由でも `VolumeSource::Bind` variant を直接構築する経路でも
+    /// 同じ検証を通ることを確認する対象。
+    #[test]
+    fn cri7_host_bind_path_rejects_parent_dir_component() {
+        #[cfg(unix)]
+        let traversal = PathBuf::from("/allowed/../../etc");
+        #[cfg(windows)]
+        let traversal = PathBuf::from(r"C:\allowed\..\..\Windows");
+
+        let err = HostBindPath::new(traversal.clone())
+            .expect_err("\"..\" component must be rejected even for an absolute path");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        let err =
+            VolumeSource::bind(traversal).expect_err("VolumeSource::bind must reject the same");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// CRI-7: attach 中のボリュームに対する `remove`（force なし）は
+    /// `FAILED_PRECONDITION` を返す。attach 状態を保持しないスタブでは常に失敗して
+    /// しまい、未使用ボリュームでも成立してしまっていた（使用中判定を実質検証できて
+    /// いなかった）ため、実際に `attach` を呼んで使用中状態を作ってから確認する
+    /// （REPAIR-12: 挙動とテストの対応を機械照合する）。
     #[test]
     fn cri7_volume_remove_in_use_returns_failed_precondition() {
-        let provider = StubVolumeProvider;
+        let provider = StubVolumeProvider::default();
+        let name = sample_volume_name();
+        provider
+            .create(&VolumeCreateRequest::new(name.clone()))
+            .expect("create succeeds");
+        let destination = GuestPath::new("/data").expect("valid guest path");
+        provider
+            .attach(&VolumeAttachRequest::new(
+                sample_container_id(),
+                VolumeSource::named(name.clone()),
+                destination,
+                AccessMode::ReadWrite,
+            ))
+            .expect("attach succeeds");
+
         let err = provider
-            .remove(&VolumeRemoveRequest::new(sample_volume_name()))
-            .expect_err("must fail without force");
+            .remove(&VolumeRemoveRequest::new(name))
+            .expect_err("must fail without force while attached");
         assert_eq!(err.code().as_str(), "FAILED_PRECONDITION");
+    }
+
+    /// CRI-7: attach されていない（未使用の）ボリュームに対する `remove`（force なし）は
+    /// 成功する。上記の使用中判定テストが「常に失敗する」実装でも通ってしまわないことの
+    /// 対照ケース。
+    #[test]
+    fn cri7_volume_remove_unused_succeeds_without_force() {
+        let provider = StubVolumeProvider::default();
+        let name = sample_volume_name();
+        provider
+            .create(&VolumeCreateRequest::new(name.clone()))
+            .expect("create succeeds");
+
+        let removed = provider
+            .remove(&VolumeRemoveRequest::new(name))
+            .expect("unused volume removal succeeds without force");
+        assert_eq!(removed, VolumeRemoveResponse::new());
     }
 
     /// CRI-7: `VolumeName` の `TryFrom<&str>`/`TryFrom<String>` は `new` と同じ検証結果を返す。

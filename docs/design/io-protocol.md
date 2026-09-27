@@ -47,4 +47,4 @@ CRC-32C は MAC（HMAC 等の暗号学的完全性検証）ではない。ホス
 2. 期待される本体長（`payload_len + CHECKSUM_LEN`）と実際の本体長を比較。不一致なら `IoErrorCode::InvalidArgument`（チェックサム不一致とは別コード）
 3. ヘッダ＋ペイロードから再計算した CRC-32C とトレーラの値を比較。不一致なら `IoErrorCode::DataLoss`
 
-PoC-8（`03-poc/ai-self-repair`）の BREAK-2 は、送信側がペイロード長を実際より 1 バイト少なく申告する破壊が `cargo build` を素通りし、整合性テストでしか検出できなかった事例である。本チェックサムにより、その種の破壊は上記手順 3 で `IoErrorCode::DataLoss` として検出できる（`crates/io/src/protocol.rs` の `repair2_decode_detects_break2_short_declared_len` テストで確認）。
+PoC-8（`03-poc/ai-self-repair`）の BREAK-2 は、送信側がペイロード長を実際より 1 バイト少なく申告する破壊が `cargo build` を素通りし、整合性テストでしか検出できなかった事例である。本チェックサムは、正しくエンコードされたフレームに対して転送中の偶発的破損（ビット反転・末尾切り詰め等）でヘッダの `payload_len` が書き換わった場合に、元のペイロード＋トレイラの残りバイトを申告長どおりに読み直した結果としてチェックサム不一致を検出し、上記手順 3 で `IoErrorCode::DataLoss` として拒否する（`crates/io/src/protocol.rs` の `repair2_decode_detects_break2_short_declared_len` テストで確認）。ただし、これは CRC-32C が偶発的破損を検出する性質によるものであり、送信側が短く申告した `payload_len` とそれに整合するペイロードからチェックサムを再計算して送出した場合（意図的な長さの偽装）は、ヘッダ・ペイロード・チェックサムが自己整合しているため検出できない（38 行目のとおり CRC-32C は改ざん耐性を持たない）。意図的な偽装への耐性が必要な経路では、別レイヤーでの真正性検証（信頼境界の検証）が必要になる。

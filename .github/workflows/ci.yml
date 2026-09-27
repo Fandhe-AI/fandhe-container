@@ -348,7 +348,8 @@ jobs:
   # 残ると新たな check-run が報告されず全 PR がマージ不能になる）。ruleset の
   # 変更はリポジトリ設定の変更のためオーナー承認を経る。TASK-86.2（#36）で
   # integration-test (<os>) 3 件が増え、ruleset へも登録済み（オーナー承認
-  # 2026-09-27。合計 31 件）。
+  # 2026-09-27。合計 27 件。冒頭コメントの内訳〔1 + lint-docs 5 + rust-ci 15 +
+  # rust-ci-default-features 3 + integration-test 3 = 27〕と一致させる）。
   ci-complete:
     needs: [lint-docs, rust-ci, rust-ci-default-features, integration-test]
     if: always()

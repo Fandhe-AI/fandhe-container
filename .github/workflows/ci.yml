@@ -9,9 +9,12 @@ name: CI
 # ci.yml から取り込み済み。
 # ruleset（branch protection）の必須チェックには、implement-issue-tree の自動マージ前
 # ゲート（G0。PR 上の全 check-run context が必須チェックに含まれることを要求する）に
-# 適合させるため、本 workflow が生成する check-run 24 件（ci-complete・
-# lint-docs / * 5 件・rust-ci (<os>) / * 15 件・rust-ci-default-features (<os>) 3 件）を
-# すべて個別に登録済み（オーナー判断 2026-09-27。下の ci-complete ジョブのコメントを参照）。
+# 適合させるため、本 workflow が生成する check-run 25 件（ci-complete・
+# lint-docs / * 5 件・rust-ci (<os>) / * 15 件・rust-ci-default-features (<os>) 3 件・
+# bench-regression 1 件）をすべて個別に登録する（オーナー判断 2026-09-27。下の
+# ci-complete ジョブのコメントを参照）。bench-regression は TASK-86.3（REPAIR-7 第 4
+# 段階）で追加した check-run のため、登録済みの 24 件に加えてオーナーが登録するまで
+# implement-issue-tree の自動マージは G0 で止まる。
 # ジョブの追加・改名・matrix 変更で check-run 名が変わる場合は ruleset 側も
 # 同時に更新する（リポジトリ設定の変更のためオーナー作業とする）
 on:
@@ -149,17 +152,49 @@ jobs:
         run: cargo test --workspace
 
   # --------------------------------------------------
+  # bench-regression（ベンチ回帰チェック: REPAIR-7 第 4 段階・REPAIR-8）
+  # --------------------------------------------------
+  # ベンチ実行結果を基準値（benches/baseline.json）と比較し、15% 超の悪化を
+  # 検出したら fail する（scripts/check-bench-regression.sh。閾値・判定式は
+  # 同スクリプト内のコメントを参照）。TASK-86.3 時点では benches/ の実ベンチが
+  # 未実装のため、決定的な固定値を出力するプレースホルダベンチ
+  # （benches/benches/regression_placeholder.rs）と暫定基準値
+  # （benches/baseline.json の placeholder: true）で動作を確認する段階にある。
+  # 実測を伴う本物のベンチと基準値への置き換えはそれぞれ TASK-113・TASK-88 で行う。
+  #
+  # ubuntu-latest 単独とし 3 OS matrix にしない: ベンチの数値は OS 間の実行環境
+  # （CPU・ノイズ）が異なり比較できないこと、check-run が増えると ruleset
+  # （branch protection）の登録作業が増えることが理由。ci.md の「3 OS 必須」は
+  # ビルド・テストのゲート（rust-ci・rust-ci-default-features）を対象とする規則
+  # であり、ベンチ回帰チェックはその対象外と整理する。
+  bench-regression:
+    runs-on: ubuntu-latest
+    # ハングに対する多層防御（他ジョブの timeout-minutes と同じ位置づけ）
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: ベンチ回帰比較スクリプトの自己テスト（受け入れ基準 2 の記録。REPAIR-12）
+        run: make bench-check-selftest
+      - name: ベンチ回帰チェック（プレースホルダベンチ・暫定基準値）
+        run: make bench-check
+
+  # --------------------------------------------------
   # ci-complete（全ジョブ結果の fail-closed 集約ゲート）
   # --------------------------------------------------
-  # lint-docs・rust-ci・rust-ci-default-features の結果を集約し、いずれかが
-  # 失敗・キャンセルされれば本ジョブも failure にする fail-closed ゲート。
+  # lint-docs・rust-ci・rust-ci-default-features・bench-regression の結果を集約し、
+  # いずれかが失敗・キャンセルされれば本ジョブも failure にする fail-closed ゲート。
   # rust-ci・rust-ci-default-features は 3 OS matrix ジョブのため、needs 上では
   # OS ごとの結果ではなく 1 つの result に集約される（いずれかの OS が失敗・
   # キャンセルされれば全体が failure / cancelled になる。fail-fast: false でも
   # 集約結果には影響しない）。
   #
   # ruleset（branch protection）の必須チェックには本ジョブに加え、本 workflow が
-  # 生成する check-run 全件を個別に登録済み（冒頭コメント参照。implement-issue-tree
+  # 生成する check-run 全件を個別に登録する（冒頭コメント参照。implement-issue-tree
   # の自動マージ前ゲート G0 が要求するため）。ジョブを追加・改名したら、本ジョブの
   # needs への追加（漏れると新ジョブの失敗が本ジョブに反映されない）に加えて、
   # ruleset の必須チェック一覧も同時に更新すること（更新漏れの影響: 増えた
@@ -167,7 +202,7 @@ jobs:
   # 残ると新たな check-run が報告されず全 PR がマージ不能になる）。ruleset の
   # 変更はリポジトリ設定の変更のためオーナー承認を経る。
   ci-complete:
-    needs: [lint-docs, rust-ci, rust-ci-default-features]
+    needs: [lint-docs, rust-ci, rust-ci-default-features, bench-regression]
     if: always()
     permissions: {}
     runs-on: ubuntu-latest

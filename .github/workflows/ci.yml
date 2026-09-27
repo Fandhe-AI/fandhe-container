@@ -395,6 +395,20 @@ jobs:
         run: make bench-check-selftest
       - name: ベンチ比較の配線確認（プレースホルダ・性能回帰は未検出）
         run: make bench-check
+      # AGENTS.md（REPAIR-10。Codex レビューの基準）が記載するコマンド・タイムアウト値・
+      # ci-complete の needs が、実際の ci.yml・Makefile と齟齬なく保たれているかを
+      # 機械照合する（TASK-94.1・REPAIR-12）。bash + jq のみで完結し cargo を要さない
+      # ため、本来は新規ジョブとして独立させたいところだが、新しいジョブを追加すると
+      # check-run 名が増えて ruleset（branch protection の必須チェック）の更新が
+      # 必要になり、それはオーナー作業になる（ci.yml 冒頭コメント参照）。そのため
+      # 同じく bash + jq 完結型で前例のある本ジョブ（bench-regression）へステップとして
+      # 追加する。ubuntu-latest 単独で問題ない: 本照合はテキストファイルの整合検査
+      # であり OS 依存の挙動差が無いため（3 OS 必須はビルド・テストのゲートが対象。
+      # ci.md「3 OS CI」のベンチ回帰チェックと同じ整理）。
+      - name: AGENTS.md・CI 設定照合スクリプトの自己テスト（TASK-94.1・REPAIR-10 / REPAIR-12）
+        run: make agents-ci-check-selftest
+      - name: AGENTS.md と ci.yml・Makefile の機械照合（TASK-94.1・REPAIR-10）
+        run: make agents-ci-check
 
   # --------------------------------------------------
   # ci-complete（全ジョブ結果の fail-closed 集約ゲート）

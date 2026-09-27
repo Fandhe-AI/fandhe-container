@@ -313,7 +313,16 @@ ${row_targets}"
       [ -z "$tgt" ] && continue
       hint="$(cmd_hint_for_target "$tgt")"
       if [ -n "$hint" ]; then
-        if printf '%s' "$job_body" | grep -qF "$hint"; then
+        # `grep -qF` によるジョブ本文全体への部分文字列一致だと、
+        # `cargo test --workspace --test '*' --no-run`（ビルド用ステップ）が
+        # 実行コマンド `cargo test --workspace --test '*'` を部分文字列として
+        # 含むため、実行ステップを削除してもビルド用ステップへの一致で
+        # 合格してしまう（P1: Codex レビュー・PR #1097）。hint を正規表現
+        # エスケープしたうえで、コマンドの前後が行頭 / 空白 / クォート・行末
+        # （空白 / クォートのみ許容）であることを要求し、`--no-run` 等の
+        # 追加引数を伴う別コマンドを実行コマンドと誤認しないようにする。
+        hint_re="$(printf '%s' "$hint" | sed -e 's/[][\.^$*+?(){}|\\]/\\&/g')"
+        if printf '%s\n' "$job_body" | grep -qE "(^|[\"'\`[:space:]:|])${hint_re}[[:space:]\"']*\$"; then
           continue
         fi
         report "対応表の実行内容照合: 'make ${tgt}' の注記コマンド '${hint}' がジョブ '${job}' の実行ステップから到達できない（削除・書き換えの可能性）"

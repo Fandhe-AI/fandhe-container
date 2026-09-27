@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-docs:
+    uses: Fandhe-AI/actions/.github/workflows/lint-docs.yml@latest
+    permissions:
+      contents: read
+    with:
+      runner-label: ubuntu-latest
+
+  rust-ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    uses: Fandhe-AI/actions/.github/workflows/rust-base-ci.yml@latest
+    permissions:
+      contents: read
+    with:
+      runner-label: ${{ matrix.os }}
+      deny-checks: advisories bans licenses sources
+      cargo-deny-version: "0.20.2"
+
+  rust-ci-default-features:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - run: cargo build --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  integration-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"
+    steps:
+      - name: 結合試験のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        run: cargo test --workspace --test '*' --no-run
+      - name: 結合試験の実行
+        timeout-minutes: 10
+        run: cargo test --workspace --test '*'
+
+  bench-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - run: echo bench placeholder
+
+  ci-complete:
+    needs:
+      [
+        lint-docs,
+        rust-ci,
+        rust-ci-default-features,
+        integration-test,
+        bench-regression,
+      ]
+    if: always()
+    permissions: {}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo ok

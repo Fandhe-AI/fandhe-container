@@ -78,6 +78,16 @@ run_case "needs-mismatch" "${fixtures_dir}/needs-mismatch/AGENTS.md.txt" "${ok_d
 run_case "step-removed-baseline" "${fixtures_dir}/step-removed/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${fixtures_dir}/step-removed/Makefile.txt" 0
 run_case "step-removed" "${fixtures_dir}/step-removed/AGENTS.md.txt" "${fixtures_dir}/step-removed/ci.yml.txt" "${fixtures_dir}/step-removed/Makefile.txt" 1
 
+# PR #1097 codex レビュー P1 の回帰確認: 対応表の実行内容照合が `run:` のコマンドを
+# ステップ単位ではなくジョブ本文全体へのテキスト検索で行っていたため、
+# `cargo test --workspace --test '*' --no-run`（ビルド用ステップ）が実行コマンド
+# `cargo test --workspace --test '*'`（`--no-run` なし）を部分文字列として含み、
+# 実行ステップ自体を削除してもビルド用ステップへの一致で誤って合格していた。
+# baseline（ビルド用ステップ・実行ステップの両方が揃っている）は合格（0）のまま、
+# 実行ステップだけを削除した fixture は不一致として fail（1）すること。
+run_case "no-run-collision-baseline" "${fixtures_dir}/no-run-collision-baseline/AGENTS.md.txt" "${fixtures_dir}/no-run-collision-baseline/ci.yml.txt" "${fixtures_dir}/no-run-collision-baseline/Makefile.txt" 0
+run_case "no-run-collision" "${fixtures_dir}/no-run-collision/AGENTS.md.txt" "${fixtures_dir}/no-run-collision/ci.yml.txt" "${fixtures_dir}/no-run-collision/Makefile.txt" 1
+
 # OSS-4/OSS-5: cargo-deny バージョンが Makefile と ci.yml で食い違う（1）
 run_case "deny-version-mismatch" "${ok_dir}/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${fixtures_dir}/deny-version-mismatch/Makefile.txt" 1
 

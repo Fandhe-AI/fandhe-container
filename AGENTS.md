@@ -149,6 +149,7 @@ make deny   # cargo deny --locked check advisories bans licenses sources
 | ---- | ---- | ---- |
 | 第三者 action の固定 | サードパーティ action はコミット SHA で固定されているか | P0 |
 | `Fandhe-AI/actions` の例外 | `Fandhe-AI/actions` は組織内（first-party）の上流リポジトリであり、上記「第三者 action の固定」の対象ではない。reusable workflow への参照は組織方針（2026-08-18 オーナー判断）により可変タグ `@latest` の使用が認められている。`@latest` への統一・SHA pin の除去を指摘しない | 指摘しない（例外） |
+| `ai-review.yml` の同期 PR skip | `ai-review.yml` の codex ジョブの `skip-branch-prefixes: chore/skills-update-,chore/submodule-update-` は、`update-external.yml` が生成する日次同期 PR（上流の取り込みで、指摘があってもその PR では直せない）の AI レビューを skip するためのオーナー判断による受容済みの設定である（2026-09-27 オーナー判断。Fandhe-AI/actions の `ai-review/README.md`「`skip-branch-prefixes` の受容済み残留リスク」〔2026-09-24〕と同じ運用）。ブランチ名接頭辞のみで判定するため push 権限者が gate を回避できる点は受容済みで、この 2 接頭辞の設定そのもの・その追加を指摘しない。前提は write 権限者がオーナー相当のみであること（第三者の write コラボレーターを迎える場合は入力を空に戻す）。skip 対象 PR にも Cursor Bugbot と CI の必須チェックは適用される。一方、この 2 接頭辞以外の追加・`skip-*` 系の条件拡大（actor・ラベル等による skip の新設）・fork PR への拡大は従来どおり「品質ゲートの破壊」として P0 で指摘する | 指摘しない（受容済みの例外。範囲拡大は P0） |
 | runner 方針 | public リポジトリのため既定は GitHub ホステッドランナー。self-hosted の使用が許可されるのは `ai-review.yml` の `codex / review` ジョブ（組織承認済み例外）のみで、`codex / preflight`・`codex / post_feedback` を含む他ジョブ・他 workflow は GitHub ホステッドランナーになっているか | P0 |
 | permissions | ワークフロー・ジョブの `permissions` が最小権限で明示されているか | P0 |
 | secrets の扱い | secrets が `pull_request` イベントのログへ出力されていないか | P0 |

@@ -92,7 +92,7 @@ make deny   # cargo deny --locked check advisories bans licenses sources
 | 外部入力の検証 | イメージ・CDI spec・TOML / compose・CRI / MCP リクエスト・plugin 入出力・カーネル応答の経路で `unwrap`・`expect`・添字アクセス（`[]`）を使わず、`get()`・`try_into()`・checked 演算で処理しているか | P0 |
 | リソース上限 | 長さ・件数を上限検証してからアロケーションに使っているか（無制限確保による DoS を防ぐ） | P0 |
 | タイムアウト | ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、有限時間で打ち切るタイムアウトが設けられているか（REPAIR-5） | P0 |
-| `unsafe`/FFI | syscall・ioctl・FFI 境界（objc2・Win32 を含む）の新規 `unsafe` は、PR 本文に unsafe 箇所一覧と事前承認コメント（[#4](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856057084)）へのリンクがあるか確認（[coding-rust.md](https://github.com/Fandhe-AI/fandhe-container/blob/main/.claude/rules/coding-rust.md)・オーナー決定 2026-09-27）。その他の新規 `unsafe` は従来通りユーザー承認の記録（承認した Issue・コメントへのリンクと承認内容の転記等）で確認。全ての `unsafe` ブロックに `// SAFETY:` コメント（理由・維持すべき不変条件）があるか | P0 |
+| `unsafe`/FFI | syscall・ioctl・FFI 境界（objc2・Win32 を含む）の新規 `unsafe` は、PR 本文に unsafe 箇所一覧・security-auditor 観点のレビューの実施記録（確認した不変条件と指摘への対応）・事前承認コメント（[#4](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856057084)）へのリンクがそろっているか確認し、いずれかが欠ければ事前承認の条件を満たさないものとして P0（[coding-rust.md](https://github.com/Fandhe-AI/fandhe-container/blob/main/.claude/rules/coding-rust.md)・オーナー決定 2026-09-27）。その他の新規 `unsafe` は従来通りユーザー承認の記録（承認した Issue・コメントへのリンクと承認内容の転記等）で確認。全ての `unsafe` ブロックに `// SAFETY:` コメント（理由・維持すべき不変条件）があるか | P0 |
 | イメージ完全性 | イメージ digest の検証を省略・弱体化していないか | P0 |
 | API の公開範囲 | CRI / MCP / Docker 互換 API を既定で外部インターフェースへ認証なし公開する変更になっていないか | P0 |
 | インジェクション | CLI 引数・TOML / compose・CDI hooks・MCP / CRI リクエストをシェル・パス・コマンドへ未検証で連結していないか | P0 |

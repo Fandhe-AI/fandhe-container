@@ -19,7 +19,7 @@ macOS・Windows・microVM のプラットフォーム層と各バックエンド
 
 - rust-vmm 系クレート（`vm-memory`・`kvm-ioctls`・`vhost` 等）・Cloud Hypervisor / Firecracker のコードを使わない（MVM-4・TASK-73。`.claude/rules/dependency-policy.md`）
 - OS 固有処理は `cfg(target_os = ...)` で担当 crate 内に局所化し、上位 crate へ OS 固有型を漏らさない（CLI-1・CLI-2）
-- FFI（objc2・Win32・ioctl）の `unsafe` は条件つき事前承認の範囲（`.claude/rules/coding-rust.md`）。`// SAFETY:` で不変条件を明記し、security-auditor レビューを受け、PR 本文に unsafe 箇所を列挙して承認コメントへリンクする。範囲外の `unsafe` はユーザー承認事項として main へ報告する
+- FFI（objc2・Win32・ioctl）の `unsafe` は条件つき事前承認の範囲（`.claude/rules/coding-rust.md`）。`// SAFETY:` で不変条件を明記し、security-auditor レビューを受け、PR 本文に unsafe 箇所の一覧・レビューの実施記録・承認コメントへのリンクを記載する。範囲外の `unsafe` はユーザー承認事項として main へ報告する
 - Hyper-V 直接方式・Windows ネイティブコンテナは MVP 射程外（WIN-6）。着手しない
 
 ## 共通の遵守事項

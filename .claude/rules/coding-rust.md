@@ -35,7 +35,7 @@
 - syscall・ioctl・FFI 境界（objc2・Win32 を含む）の新規 `unsafe` は、以下の条件を満たせば事前承認済み（オーナー決定 2026-09-27〔[#4](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856057084)〕）:
   - 上記の `// SAFETY:` で理由と維持すべき不変条件を明記する
   - security-auditor 観点（分離・特権・メモリ安全）のレビューを通す
-  - PR 本文に unsafe 箇所の一覧を記載し、上記承認コメントへのリンクを示す
+  - PR 本文に unsafe 箇所の一覧・security-auditor 観点のレビューの実施記録（確認した不変条件と指摘への対応）・上記承認コメントへのリンクを記載する
   - 条件不備はレビューで P0 として扱う
 - それ以外の `unsafe`（性能目的・境界以外のロジック等）は従来どおり個別のユーザー承認を得る（P0）
 - syscall 番号・構造体レイアウトのアーキテクチャ差（x86_64 / aarch64）は `cfg(target_arch = ...)` で扱い、定数を流用しない

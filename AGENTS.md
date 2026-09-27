@@ -51,12 +51,14 @@ make deny                   # cargo deny --locked check advisories bans licenses
 make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + deny を一括実行
 make bench-check-selftest   # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
 make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
+make agents-ci-check-selftest   # AGENTS.md と CI 設定の照合スクリプトの自己テスト（REPAIR-10・REPAIR-12）
+make agents-ci-check            # AGENTS.md と ci.yml・Makefile の機械照合（TASK-94・REPAIR-10）
 ```
 
 - `make test-integration`: 終了コード 0 が成功基準。integration test target が 0 件のときの `notice:` 出力での成功終了は現状の正常動作。jq 未導入時は fail-closed で終了コード非 0 になる
 - `make bench-check-selftest` / `make bench-check`: 終了コード 0 が成功基準。`bench-check` を呼ぶ比較スクリプト（`scripts/check-bench-regression.sh`）自体の終了コードは 0（合格）/ 1（回帰検出）/ 2（入力エラー）の 3 値で、詳細は下記「タイムアウト保護された結合試験・ベンチ回帰」節 (4) を参照する。**現時点では計測対象がプレースホルダのため、`bench-check` の成功を性能回帰がない根拠として扱わない**
 - CI の `rust-ci`（3 OS matrix）は clippy/test を `--all-features` で実行し（fmt/deny は feature 非依存）、`rust-ci-default-features`（3 OS matrix）が `make lint`/`make test` と同一コマンド（既定 feature）を再現する。両者は別ジョブであり、既定 feature 側の回帰は `rust-ci-default-features` でのみ検出される
-- 各コマンドと CI ジョブの対応（TASK-94 の整合確認で参照する）:
+- 各コマンドと CI ジョブの対応（TASK-94 の整合確認で参照する。`make agents-ci-check` が本表・上記コードブロック・`make ci` の構成・推奨タイムアウト値表・`ci-complete` の needs を ci.yml・Makefile と機械照合する。TASK-94.1・REPAIR-10・REPAIR-12）:
 
 | コマンド | 対応する CI ジョブ |
 | ---- | ---- |
@@ -64,7 +66,12 @@ make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段�
 | `lint`・`test`（既定 feature） | `rust-ci-default-features`（`--all-features` 側は `rust-ci`） |
 | `test-integration` | `integration-test` |
 | `bench-check-selftest`・`bench-check` | `bench-regression` |
+| `agents-ci-check-selftest`・`agents-ci-check` | `bench-regression` |
 | `lint-docs` | `lint-docs` |
+| `check-workspace-manifest` | CI では直接実行しない（`rust-ci-default-features` の `cargo build --workspace` 等の cargo 実行が manifest の解釈を暗黙に検証する） |
+| `ci` | CI では直接実行しない（構成要素を上記の各ジョブが個別に実行する。`--all-features`・結合試験・ベンチ・3 OS は CI 側だけが持つ） |
+
+- `rust-ci-default-features` はステージ 1（ビルド・型検査）として `cargo build --workspace` を実行する。対応する `make` ターゲットは無く（`make lint`/`make test` の前提としてビルドされる分がローカルでの代替になる）、上記コードブロックには含めない
 
 ### 推奨タイムアウト値（REPAIR-5・REPAIR-10 (c)）
 
@@ -72,7 +79,9 @@ make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段�
 | ---- | ---- | ---- | ---- |
 | テスト 1 件の応答待ち（ACK・plugin RPC・子プロセス） | 推奨 5〜10 秒（CI 設定値 10 秒） | `ci.yml` `integration-test` ジョブの env `FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"`（TASK-87.1・#40） | PoC-8 実測・REPAIR-10 (c)・REPAIR-5 |
 | 結合試験の実行ステップ | 10 分 | `integration-test` ジョブの実行ステップ `timeout-minutes: 10` | TASK-86.2（#36）・TASK-87 |
-| ジョブ全体 | `integration-test` 30 分・`bench-regression` 15 分・`ci-complete` 5 分 | 各ジョブの `timeout-minutes` | 多層防御 |
+| ジョブ全体 | `integration-test` 30 分・`rust-ci-default-features` 30 分・`bench-regression` 15 分・`ci-complete` 5 分 | 各ジョブの `timeout-minutes` | 多層防御 |
+
+- `rust-ci`（reusable `rust-base-ci.yml` の既定値。fmt 10 分・clippy 30 分・test 30 分・deny 20 分）は ci.yml から上書きしていないため、このリポ内のファイルだけでは照合できない（手動確認。`Fandhe-AI/actions` の該当 SHA 時点の値を PR 本文に記録する）
 
 - この env を読んで `Duration` を組み立て `recv_timeout` 等に使う消費側コードは、integration test target が 0 件の現時点では存在せず、TASK-85 以降で実装される（実装済みを装わない。REPAIR-3）
 - 新しく書く応答待ち処理は 5〜10 秒の範囲を既定とする。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5。詳細は下記「タイムアウト保護された結合試験・ベンチ回帰」節および「レビュー観点」のタイムアウト項目）

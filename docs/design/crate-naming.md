@@ -17,6 +17,7 @@ spec で確定済みの前提と、本ドキュメントで確定した内容を
 - **workspace 内 crate のパス形式**: `crates/<短縮名>`
 - **CLI バイナリ名**: `fandhe-container` に統一する。plugin バイナリ名は `fandhe-container-plugin-*`（発見対象）とする
 - **旧提案の不採用**: `vm-core`・`vm-io` 等の `vm-*` 形式は採用しない（TASK-1）
+- **製品名の表記**: `fandhe-container` を製品名として使用する（TASK-2・`OSS-1`・`OSS-2`・MS-0。crates.io・GitHub での名称衝突有無の確認状況は本ドキュメントの対象外で、spec 側 `OSS-1`・`OSS-2` を参照する）
 
 **本決定（#9）で確定した内容**:
 

@@ -19,7 +19,7 @@
 
 ## ビルド・テスト・回帰確認コマンド（REPAIR-7・REPAIR-10）
 
-`make` ターゲットを正とする（括弧内に実行される cargo コマンドを併記する）。本節は REPAIR-10 が求める 4 項目のうち (a) ビルドコマンドと成功基準・(b) 回帰確認コマンド一覧・(c) 推奨タイムアウト値を扱う。(d) 新機能追加時に更新すべきテスト一覧は TASK-93.2（#47）で追加する（本書は実装済みを装わない。REPAIR-3）。
+`make` ターゲットを正とする（括弧内に実行される cargo コマンドを併記する）。本節は REPAIR-10 が求める 4 項目 (a) ビルドコマンドと成功基準・(b) 回帰確認コマンド一覧・(c) 推奨タイムアウト値・(d) 新機能追加時に更新すべきテスト一覧をすべて扱う。(d) は下記「新機能追加時に更新すべきテスト一覧」節で扱う。
 
 - `Cargo.toml`（workspace）と `crates/*/Cargo.toml`（メンバー crate）は現在すべて揃っており、`deny.toml` も存在するため、下記の `fmt`/`lint`/`test`/`deny` は Makefile 側で skip されず常に実行される（`HAS_CARGO`/`HAS_MEMBERS`/`HAS_DENY` はいずれも真）。`skip: ...` という出力が現れた場合は本来実行されるはずのターゲットが実行されていない異常事態であり、**合格の根拠にしない**（false-green 防止）。`check-workspace-manifest`（`cargo verify-project`）は `Cargo.toml` の存在のみで判定し、メンバー crate 未追加の中間状態でも実行される仕組みだった名残で、現状は常に実行される
 - PR 本文にこれらのコマンドの実行結果（終了コードと要点）が記載されているか（同じ PR で CI 設定を変更する場合はその diff にこれらのコマンドが含まれているか）を確認する。本節の未達は、個別に優先度を明記した項目を除き既定で P1 とする
@@ -78,6 +78,44 @@ make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段�
 - 新しく書く応答待ち処理は 5〜10 秒の範囲を既定とする。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5。詳細は下記「タイムアウト保護された結合試験・ベンチ回帰」節および「レビュー観点」のタイムアウト項目）
 - タイムアウト値を検出が弱まる方向（上限の撤廃・大幅な延長）へ変える差分は、根拠の記録がなければ「回帰検出の後退」として扱う（bench 閾値の既存記述と同じ扱い）
 - ハングプローブ（TASK-87.2・#41）の実施記録は下記「タイムアウト保護された結合試験・ベンチ回帰」節に記載済み
+
+### 新機能追加時に更新すべきテスト一覧（REPAIR-10 (d)）
+
+新機能を追加したり既存の挙動を変えたりする差分では、触れたビヘイビア ID に対応するユニットテストと結合試験を追加・更新する。テスト名またはドキュメントコメントにビヘイビア ID を書き、期待値は具体値で書く（REPAIR-12・[coding-rust](.claude/rules/coding-rust.md)「テスト」）。本節は「追加時に用意すべきテストのカテゴリ」を示すものであり、既存テストの一覧ではない（REPAIR-3）。現時点で未実装の仕組みは各行に「現状」を注記する。本節の未達は、個別に優先度を明記した項目を除き既定で P1 とする（上記「ビルド・テスト・回帰確認コマンド」節と同じ扱い）。
+
+共通カテゴリ:
+
+| カテゴリ | 置き場所 | 実行コマンド | 現状 |
+| ---- | ---- | ---- | ---- |
+| ユニットテスト | 各 crate の `src/` 内 `#[cfg(test)]` | `make test` | — |
+| 結合試験 | 各 crate の `tests/*.rs`（integration test target） | `make test-integration` | 現時点では 0 件。最初の追加は各機能タスクが担う |
+| ベンチ回帰 | `benches/benches/*.rs`・`benches/baseline.json` | `make bench-check` | プレースホルダ段階。実ベンチは TASK-113、基準値の校正は TASK-88 |
+| 実機前提テスト | 既定のテスト集合から分離する | 分離の仕組みは該当タスクで決める | 下記「実機前提テスト」節・[ci](.claude/rules/ci.md)「実機前提テスト」を参照 |
+| 依存・ライセンス検査 | `Cargo.toml`・`deny.toml` | `make deny` | 依存を追加・更新するときのみ（ユーザー承認制。[dependency-policy](.claude/rules/dependency-policy.md)） |
+
+コマンドと CI ジョブの対応は上記「回帰確認コマンド一覧」節の表を参照する（重複管理しない。TASK-94）。
+
+#### crate 追加時（`crates/<短縮名>` を新設するとき）
+
+- root `Cargo.toml` の `members` に追加し、`make check-workspace-manifest`・`make ci` が `skip:` を出さずに実行されることを確認する
+- 公開 API ごとのユニットテスト（ビヘイビア ID と具体値の期待値）
+- 外部入力（イメージ・TOML・CDI・リクエスト等）を受ける crate は、不正値・上限超過を拒否することのユニットテスト（[coding-rust](.claude/rules/coding-rust.md)「エラーハンドリング」）
+- 他 crate との結合や応答待ち（ACK・RPC・子プロセス）を持つ crate は、`tests/*.rs` に結合試験を置く。応答待ちにはタイムアウトを付ける（REPAIR-5）
+- OS 依存の FS 挙動（パス・大文字小文字・改行・長パス。IO-5・CLI-1）に触れる crate は、3 OS すべてで実行されるテストにする。特定 OS だけ skip して CI を通さない
+- 性能目標を持つ crate は、ベンチの metric を追加し baseline を用意する（校正は TASK-88 の手順に従う。現状は placeholder）
+- root 権限・KVM・GPU・WSL2・特定カーネル版数（Landlock ABI 等）が必要なテストは実機前提テストとして分離し、理由とビヘイビア ID を記して、実機での実行結果を PR に残す（[ci](.claude/rules/ci.md)「実機前提テスト」・下記「実機前提テスト」節）
+
+#### plugin 追加時（`crates/plugin-<名前>` を追加するとき）
+
+上記「crate 追加時」の全項目に加えて、次を追加で用意する。
+
+- plugin 境界フレーム（長さ接頭辞フレーム。PLUG-2）の符号化・復号、壊れたフレームや長さ上限超過を拒否することのユニットテスト。フレームは型で組み立てる（REPAIR-2）。plugin からの入力は untrusted として検証する
+- plugin RPC の応答待ちがタイムアウトで打ち切られることの結合試験（REPAIR-5）
+- PLUG-4「core 無変更」の 3 点比較（core 側ソースの sha256 一覧・`cargo tree -p <core> --locked -e normal` で見た core の依存木・core バイナリの sha256。[crate-naming.md](docs/design/crate-naming.md) 決定 3）が変化しないこと。**現状**: 判定の仕組みは TASK-109 で実装予定で未実装。plugin を通すために core 側のソースやテストを書き換えないこと（PLUG-4 違反は既存の P0 観点）
+- plugin の信頼性検証（PLUG-11: 他ユーザー書き込み可能な場所・ハッシュ不一致の plugin の登録拒否）と UDS 境界（PLUG-12: 権限・peer credential 検証）について、新しい plugin を対象にしたケース。**現状**: 検証の仕組みは TASK-109・TASK-122〜124 で実装予定で未実装
+- plugin 境界のベンチ（TASK-113 の `plugin_boundary` 系）。**現状**: 未実装
+- `plugin-microvm` 等 microVM 系の依存に触れる場合は `make deny` の禁止クレート検査（MVM-4）。**現状**: 機械判定（`scripts/check-microvm-deps.sh`・`deny.toml` `[bans]`）は TASK-73 で導入予定
+- macOS Virtualization.framework・WSL2・KVM を使うバックエンド plugin（`plugin-macos`・`plugin-windows`・`plugin-microvm`）の実機依存テストは、実機前提テストとして分離する（[ci](.claude/rules/ci.md)「実機前提テスト」）
 
 ### タイムアウト保護された結合試験・ベンチ回帰（REPAIR-5・REPAIR-8）
 
@@ -178,7 +216,7 @@ make deny   # cargo deny --locked check advisories bans licenses sources
 | スタブの明示 | 未実装・簡易実装箇所が「実装済みを装って」いないか。ドキュメントコメントに将来仕様と対応するビヘイビア ID が明記されているか（REPAIR-3） | P0 |
 | 可観測性 | read/write/create/start 等の操作の成功 / 失敗カウント・レイテンシ分布が構造化ログ / メトリクスとして出力されているか（REPAIR-4） | P1 |
 | コメント規約 | crate・モジュールの入口に `//!`、公開 API に `///` で役割要約があるか。呼び出し元・呼び出し先の文脈、他 crate との契約（公開トレイト・エラー型・前提条件・スレッド安全性）が書かれているか。逐語説明や spec 本文の長い引用になっていないか（`.claude/rules/code-comment-style.md`） | P2 |
-| テストとビヘイビア ID の対応 | 挙動がビヘイビア ID（例: `IO-2`）に対応づけてテストされ、テスト名またはドキュメントコメントに ID が記されているか。ユニットテストと結合テストが併置され、期待値が具体値で書かれているか。受け入れ基準を機械照合するテストがあるか（REPAIR-12） | P1 |
+| テストとビヘイビア ID の対応 | 挙動がビヘイビア ID（例: `IO-2`）に対応づけてテストされ、テスト名またはドキュメントコメントに ID が記されているか。ユニットテストと結合テストが併置され、期待値が具体値で書かれているか。受け入れ基準を機械照合するテストがあるか（REPAIR-12）。新機能追加時に揃えるテストのカテゴリは上記「新機能追加時に更新すべきテスト一覧」節を参照 | P1 |
 | スコープ外事項の追跡 | 実装・レビュー中に見つかったスコープ外の事項が、当該 PR に混入せず Issue 追跡へ切り出されているか（`.claude/rules/out-of-scope-tracking.md`。スコープ外混入は `.claude/rules/conventional-commits.md` の禁止事項） | P1 |
 
 ### 規約（表記・コミット）

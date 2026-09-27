@@ -106,6 +106,22 @@ run_case "no-run-collision" "${fixtures_dir}/no-run-collision/AGENTS.md.txt" "${
 run_case "run-step-echoed" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/run-step-echoed/ci.yml.txt" "${ok_dir}/Makefile.txt" 1
 run_case "run-step-commented" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/run-step-commented/ci.yml.txt" "${ok_dir}/Makefile.txt" 1
 
+# PR #1097 codex レビュー P1 の回帰確認: `job_run_text` が `run:` の文字列だけを
+# 抽出し、ステップの `if:` 条件を見ていなかったため、`if: false` で無効化した
+# ステップ（実行されない）の `run:` も「実行内容へ到達できる」と誤判定していた。
+# `lint` 対応ステップ（rust-ci-default-features の clippy 呼び出し）へ
+# `if: false` を付けても、実際には実行されないコマンドとして不一致（1）に
+# なること。
+run_case "run-step-if-false" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/run-step-if-false/ci.yml.txt" "${ok_dir}/Makefile.txt" 1
+
+# PR #1097 codex レビュー P1 の回帰確認: `FANDHE_CONTAINER_TEST_TIMEOUT_SECS` の
+# 抽出が integration-test ジョブ本文全体（YAML コメントを含む）から最初の
+# 一致を拾っていたため、実際の env 変更（10→20）の前に旧値 "10" を書いた
+# コメントを残すだけで照合をすり抜けていた。ジョブ直下の `env:` にある
+# 有効なキーの値（20）を見て、AGENTS.md 記載値（10）との不一致（1）を
+# 検出すること。
+run_case "env-timeout-comment-leak" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/env-timeout-comment-leak/ci.yml.txt" "${ok_dir}/Makefile.txt" 1
+
 # OSS-4/OSS-5: cargo-deny バージョンが Makefile と ci.yml で食い違う（1）
 run_case "deny-version-mismatch" "${ok_dir}/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${fixtures_dir}/deny-version-mismatch/Makefile.txt" 1
 

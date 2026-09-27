@@ -203,6 +203,22 @@ job_level_timeout() {
   printf '%s\n' "$block" | grep -E '^    timeout-minutes:' | head -n1 | grep -oE '[0-9]+' || true
 }
 
+# ジョブ本体（job_block の出力）から、ジョブ直下の `env:`（4 スペース
+# インデント）配下のキー行（6 スペースインデント）だけを抽出する。
+# ジョブ本文全体（`steps:` の `run:` スクリプトや YAML コメントを含む）への
+# テキスト検索だと、無効化前の値を残したコメント・別ステップの記述に一致して
+# 実際の env 変更を見逃す（P1: Codex レビュー・PR #1097）ため、`env:` セクション
+# の本文だけに絞る。次の 4 スペースインデントのキー（`steps:` 等）または
+# 本文末尾までを対象とする。
+job_env_block() {
+  local block="$1"
+  awk '
+    /^    env:[[:space:]]*$/ { in_env = 1; next }
+    in_env && /^    [A-Za-z0-9_-]+:/ { exit }
+    in_env { print }
+  ' <<<"$block"
+}
+
 job_is_reusable_call() {
   # ジョブ本体（4 スペースインデント）が `uses:`（reusable workflow 呼び出し）を
   # 持つかを判定する。reusable 呼び出しの中身（timeout-minutes・実行ステップ）は
@@ -243,15 +259,46 @@ cmd_hint_for_target() {
 # 正規化してから同じロジックで扱う。`run: |` のブロックスカラーは、続く行の
 # インデントが 8 スペース以下（次のフィールド・次のステップ）に戻るまでを
 # 本文として拾う。
+#
+# ステップの `if:` 条件が真偽リテラル `false`（クォート・大文字小文字・
+# `${{ }}` ラップの違いを許容）の場合、そのステップは実行されないため
+# `run:` 本文を出力に含めない（P1: Codex レビュー・PR #1097。`if: false` で
+# 無効化したステップの `run:` を「実行される」と誤判定し、対応表の実行内容
+# 照合が到達不能なコマンドを合格させてしまうのを防ぐ）。式評価が必要な
+# 非リテラルな `if:`（`steps.x.outputs.y != 'z'` 等）は対象外とし、これまで
+# どおり実行されるものとして扱う（誤って fail-closed 側へ倒し過ぎない）。
 job_run_text() {
   local block="$1"
   awk '
+    function flush_step() {
+      if (!step_disabled) {
+        for (i = 0; i < buf_n; i++) print buf[i]
+      }
+      buf_n = 0
+      step_disabled = 0
+      in_run = 0
+    }
     {
       line = $0
       if (line ~ /^      - /) {
+        flush_step()
         sub(/^      - /, "        ", line)
       }
       $0 = line
+    }
+    /^        if:[[:space:]]*/ {
+      val = $0
+      sub(/^        if:[[:space:]]*/, "", val)
+      gsub(/[[:space:]]+$/, "", val)
+      gsub(/^\$\{\{[[:space:]]*/, "", val)
+      gsub(/[[:space:]]*\}\}$/, "", val)
+      gsub(/^"/, "", val)
+      gsub(/"$/, "", val)
+      gsub(/^'"'"'/, "", val)
+      gsub(/'"'"'$/, "", val)
+      if (tolower(val) == "false") step_disabled = 1
+      in_run = 0
+      next
     }
     /^        run: \|[+-]?[[:space:]]*$/ { in_run = 1; next }
     /^        run: >[+-]?[[:space:]]*$/  { in_run = 1; next }
@@ -259,14 +306,15 @@ job_run_text() {
       in_run = 0
       l = $0
       sub(/^        run: /, "", l)
-      print l
+      buf[buf_n++] = l
       next
     }
     in_run {
       if ($0 ~ /^        [A-Za-z_-]+:/) { in_run = 0; next }
-      print
+      buf[buf_n++] = $0
       next
     }
+    END { flush_step() }
   ' <<<"$block"
 }
 
@@ -432,7 +480,12 @@ if [ -z "$it_block" ]; then
   err "anchor-not-found" "ci.yml: integration-test ジョブが見つからない"
   exit 2
 fi
-ci_env_secs="$(printf '%s\n' "$it_block" | grep -oE 'FANDHE_CONTAINER_TEST_TIMEOUT_SECS:[[:space:]]*"[0-9]+"' | head -n1 | grep -oE '[0-9]+' || true)"
+# ジョブ直下の `env:` セクションのキー行だけに絞り、かつ YAML コメント行
+# （`# ...`）を除外してから照合する。ジョブ本文全体への検索だと、実際の
+# env 変更前の値を書いたコメント（削除し忘れ）や `run:` スクリプト内の記述に
+# 先に一致してすり抜けてしまう（P1: Codex レビュー・PR #1097）。
+it_env_block="$(job_env_block "$it_block")"
+ci_env_secs="$(printf '%s\n' "$it_env_block" | grep -vE '^[[:space:]]*#' | grep -oE '^[[:space:]]*FANDHE_CONTAINER_TEST_TIMEOUT_SECS:[[:space:]]*"[0-9]+"' | head -n1 | grep -oE '[0-9]+' || true)"
 if [ -z "$ci_env_secs" ]; then
   err "anchor-not-found" "ci.yml: integration-test ジョブに FANDHE_CONTAINER_TEST_TIMEOUT_SECS が見つからない"
   exit 2

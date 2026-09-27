@@ -19,6 +19,7 @@ fandhe-container/
 ├── CLAUDE.md                      # Claude 運用方針（本ファイル）
 ├── AGENTS.md                      # AI PR レビュー観点集 / ビルド・回帰確認コマンド（REPAIR-10）
 ├── README.md                      # 概要・実装方針（要点）・開発環境構築
+├── CONTRIBUTING.md                # コントリビュータ向け最小骨子（TASK-2・OSS-1/OSS-2・MS-0。PR フロー詳細は TASK-99・OSS-6・MS-6 で後日整備）
 ├── MAINTAINERS.md                 # メンテナンス体制・コアチーム（TASK-100・OSS-6）
 ├── LICENSE                        # Apache License 2.0
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）

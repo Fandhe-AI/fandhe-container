@@ -80,7 +80,14 @@ check_input_file() {
     exit 2
   fi
   local size
-  size=$(wc -c <"$path" | tr -d ' ')
+  # `wc -c` の失敗（読み取り権限なし等）を `set -e` に丸投げしない。丸投げすると
+  # パイプライン全体の終了コード（`wc` 由来。多くは 1）がそのままスクリプトの
+  # 終了コードになり、呼び出し元が「回帰検出」（exit 1）と誤認する。
+  # 契約どおり入力エラーとして exit 2 で終わらせるため、ここで捕捉する。
+  if ! size=$(wc -c <"$path" 2>/dev/null | tr -d ' '); then
+    err "invalid-input" "$path could not be read"
+    exit 2
+  fi
   if [ "$size" -gt "$MAX_FILE_BYTES" ]; then
     err "invalid-input" "$path exceeds ${MAX_FILE_BYTES} bytes"
     exit 2
@@ -196,7 +203,7 @@ fi
 
 placeholder=$(printf '%s' "$output" | jq -r '.placeholder')
 if [ "$placeholder" = "true" ]; then
-  echo "warning: baseline.json is a placeholder (TASK-88 が実測から確定させ置き換える予定)" >&2
+  echo "warning: baseline.json is a placeholder (to be replaced with measured values in TASK-88)" >&2
 fi
 
 printf '%s\n' "$output" | jq -r '.rows[] | "\(.name) / baseline=\(.baseline)\(.unit) / current=\(.current)\(.unit) / change=\(.change_percent)% / \(.status)"'

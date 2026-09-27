@@ -66,6 +66,21 @@ run_case "regress-lower-extreme-overflow" "${fixtures_dir}/baseline-extreme.json
 # 存在しないファイル → 入力エラー（2）
 run_case "missing-file" "$baseline" "${fixtures_dir}/does-not-exist.json" 2
 
+# 読み取り権限の無いファイル → 入力エラー（2）。`wc -c` 自体が失敗するケースを
+# `set -e` に丸投げして exit 1（回帰検出）と誤認しないことを確認する回帰テスト。
+# root（CI コンテナ等）はパーミッションを無視して読めてしまうため、その場合は
+# このケースを意味のある形で再現できずスキップする。
+if [ "$(id -u)" -eq 0 ]; then
+  echo "SKIP: unreadable-file (running as root, permission bits are not enforced)"
+else
+  unreadable="${fixtures_dir}/unreadable.json"
+  cp "${fixtures_dir}/results-improved.json" "$unreadable"
+  chmod 000 "$unreadable"
+  run_case "unreadable-file" "$baseline" "$unreadable" 2
+  chmod 644 "$unreadable"
+  rm -f "$unreadable"
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "self-test failed: ${failures} case(s) did not match the expected exit code" >&2
   exit 1

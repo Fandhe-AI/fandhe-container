@@ -249,7 +249,7 @@ ci: lint-docs check-workspace-manifest fmt-check lint test deny ## ローカル�
 .PHONY: bench-check-selftest
 bench-check-selftest: ## ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
 	@if ! command -v jq >/dev/null 2>&1; then \
-		echo "jq 未導入: brew install jq / apt-get install jq 等で導入してください" >&2; \
+		echo "jq is required but not found: install it (e.g. brew install jq / apt-get install jq)" >&2; \
 		exit 1; \
 	fi
 	bash scripts/check-bench-regression-selftest.sh

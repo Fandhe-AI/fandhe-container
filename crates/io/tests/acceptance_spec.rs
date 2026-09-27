@@ -270,32 +270,86 @@ const EXPECTED_ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
     },
 ];
 
-/// マッチャが TASK-15（IO-2）の FLUSH ACK 永続化条件（バリア以前の
-/// 書き込みが永続化された後にのみ FLUSH ACK を返すこと）を機械照合できる
-/// ことを確認する（REPAIR-12。[`ACCEPTANCE_TARGETS`] の TASK-15 行に対応。
-/// Codex レビュー指摘: 永続化条件が照合対象から欠落していたため追加）。
+/// TASK-15（IO-2）の FLUSH ACK 永続化条件を照合するための、単一
+/// io イベントの暫定表現（Codex レビュー指摘対応）。
 ///
-/// サンプル行は TASK-11 / TASK-15 で ACK フレーム型が確定するまでの暫定
-/// フィールド名であり、確定契約ではない（本ファイルのモジュールドキュメント
+/// `persisted_before_barrier=true` のような固定文字列 1 個の一致判定では、
+/// 「FLUSH ACK を返す前に実際に永続化が完了したか」という順序関係を
+/// 検証できない（永続化未完了のまま `persisted_before_barrier=true` という
+/// 値だけを出力する回帰があっても検出できない）。そこで ACK 応答を
+/// 「イベント列」として表現し、[`flush_ack_follows_persistence`] で
+/// `PersistedBeforeBarrier` イベントが `FlushAckSent` より前に実際に
+/// 記録されていることを、列の走査により機械的に確認する。
+///
+/// io の実 API 接続後（TASK-11 / TASK-15）は、このイベント列を io の
+/// 実際の ACK 送出順序ログ・永続化完了通知に置き換える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckEvent {
+    /// バリア以前に発行された書き込みの永続化（fsync 相当）が完了した。
+    PersistedBeforeBarrier,
+    /// FLUSH ACK をクライアントへ送出した。
+    FlushAckSent,
+}
+
+/// `events` を先頭から走査し、`FlushAckSent` が現れた時点で、それより
+/// 前に `PersistedBeforeBarrier` が記録済みであることを確認する。
+///
+/// - `FlushAckSent` が一度も現れない列は判定対象がないため `false` を返す
+/// - `PersistedBeforeBarrier` を伴わない・それより後にしか永続化が記録
+///   されない `FlushAckSent` は違反として `false` を返す（PoC-12 型の
+///   「ビルドは通るが仕様未達」を、値の一致ではなく順序の観測で検出する）
+fn flush_ack_follows_persistence(events: &[AckEvent]) -> bool {
+    let mut persisted = false;
+    let mut saw_flush_ack = false;
+    for event in events {
+        match event {
+            AckEvent::PersistedBeforeBarrier => persisted = true,
+            AckEvent::FlushAckSent => {
+                saw_flush_ack = true;
+                if !persisted {
+                    return false;
+                }
+            }
+        }
+    }
+    saw_flush_ack
+}
+
+/// マッチャが TASK-15（IO-2）の FLUSH ACK 永続化条件（バリア以前の
+/// 書き込みが永続化された後にのみ FLUSH ACK を返すこと）を、ACK の
+/// 返却順序と永続化状態の観測によって機械照合できることを確認する
+/// （REPAIR-12。[`ACCEPTANCE_TARGETS`] の TASK-15 行に対応。Codex レビュー
+/// 指摘: 固定文字列 `persisted_before_barrier=true` の一致判定では
+/// 永続化前に FLUSH ACK を返す回帰を検出できないため、イベント順序を
+/// 観測する [`flush_ack_follows_persistence`] へ置き換えた）。
+///
+/// イベント列は TASK-11 / TASK-15 で ACK フレーム型が確定するまでの暫定
+/// 表現であり、確定契約ではない（本ファイルのモジュールドキュメント
 /// 「スタブについて」を参照）。
 #[test]
 fn repair_12_scaffold_matcher_detects_premature_flush_ack() {
-    // 仕様どおり: バリア以前の書き込みが永続化済みの場合にのみ FLUSH ACK。
-    let sample_persisted = "ack: type=FLUSH persisted_before_barrier=true";
-    assert_eq!(find_value(sample_persisted, "type"), Some("FLUSH"));
-    assert_eq!(
-        find_value(sample_persisted, "persisted_before_barrier"),
-        Some("true"),
-        "FLUSH ACK はバリア以前の書き込みの永続化後にのみ返る想定"
+    // 仕様どおり: バリア以前の書き込みが永続化済みになってから FLUSH ACK。
+    let ordered = [AckEvent::PersistedBeforeBarrier, AckEvent::FlushAckSent];
+    assert!(
+        flush_ack_follows_persistence(&ordered),
+        "永続化後の FLUSH ACK を正当な列として受理できていない"
     );
 
-    // 仕様違反の再現: 永続化前に FLUSH ACK を返す回帰（PoC-12 型の失敗
-    // モード。ビルドは通るが永続化保証を満たさない）。
-    let sample_premature = "ack: type=FLUSH persisted_before_barrier=false";
-    assert_ne!(
-        find_value(sample_premature, "persisted_before_barrier"),
-        Some("true"),
-        "永続化前に FLUSH ACK を返す回帰をマッチャが検出できていない"
+    // 仕様違反の再現 (1): 永続化イベントを伴わずに FLUSH ACK を送出する
+    // 回帰（PoC-12 型の失敗モード。値だけを見れば `persisted_before_barrier`
+    // 相当のフィールドを立てていても、実際の永続化完了イベントが無い）。
+    let missing_persistence = [AckEvent::FlushAckSent];
+    assert!(
+        !flush_ack_follows_persistence(&missing_persistence),
+        "永続化イベントを伴わない FLUSH ACK 送出をマッチャが検出できていない"
+    );
+
+    // 仕様違反の再現 (2): 永続化完了が FLUSH ACK 送出より後に記録される
+    // 回帰（返却順序の違反。文字列の値一致だけでは検出できない失敗モード）。
+    let out_of_order = [AckEvent::FlushAckSent, AckEvent::PersistedBeforeBarrier];
+    assert!(
+        !flush_ack_follows_persistence(&out_of_order),
+        "永続化完了より先に FLUSH ACK を送出する順序違反をマッチャが検出できていない"
     );
 }
 

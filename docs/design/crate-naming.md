@@ -17,10 +17,10 @@ spec で確定済みの前提と、本ドキュメントで確定した内容を
 - **workspace 内 crate のパス形式**: `crates/<短縮名>`
 - **CLI バイナリ名**: `fandhe-container` に統一する。plugin バイナリ名は `fandhe-container-plugin-*`（発見対象）とする
 - **旧提案の不採用**: `vm-core`・`vm-io` 等の `vm-*` 形式は採用しない（TASK-1）
+- **製品名の表記**: `fandhe-container` を製品名として使用する（TASK-2・`OSS-1`・`OSS-2`。crates.io・GitHub での名称衝突有無の確認状況は本ドキュメントの対象外で、spec 側 `OSS-1`・`OSS-2` を参照する）
 
 **本決定（#9）で確定した内容**:
 
-- **製品名の表記**: `fandhe-container` を製品名として使用する（`OSS-1`・`OSS-2`。crates.io・GitHub での名称衝突有無の確認は本ドキュメントの対象外で、確認状況は spec 側 `OSS-1`・`OSS-2` を参照する）
 - **crate 名（Cargo.toml）の名前空間**: `fandhe-container-*`。ただし plugin 境界機構ライブラリは `fandhe-container-plugin`（`crates/plugin/`）とし、plugin バイナリ専用の `fandhe-container-plugin-*` と区別する。発見はバイナリ名で行う（PLUG-4・PLUG-11）ため、この区別により発見ロジックが `plugin`（境界機構ライブラリ）を誤検出する経路をなくす（決定 4）
 - 下表の短縮名（「短縮名（crate 内パス）」列）・crate 名・責務区分を確定一覧とする
 

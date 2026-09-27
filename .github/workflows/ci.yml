@@ -206,9 +206,10 @@ jobs:
   # --------------------------------------------------
   # integration-test（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）
   # --------------------------------------------------
-  # spec の REPAIR-5（PoC-8 の BREAK-1: ACK 未送信）は `cargo build` でもユニット
-  # テストでも検出できず、ハングとしてしか表面化しない。ハングするテストを
-  # 有限時間で打ち切り CI を fail させるのが本ジョブの役割（TASK-86.2・#36）。
+  # spec の REPAIR-5（PoC-8 の BREAK-1: ACK 未送信、MS-0）は `cargo build` でも
+  # ユニットテストでも検出できず、ハングとしてしか表面化しない。ハングする
+  # テストを有限時間で打ち切り CI を fail させるのが本ジョブの役割
+  # （TASK-86.2・#36）。
   #
   # 「結合試験」は Cargo の integration test target（各 crate の `tests/*.rs`。
   # `cargo metadata` 上で kind が "test" のもの）を指す。lib 内 unit test

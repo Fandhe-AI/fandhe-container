@@ -163,14 +163,14 @@ done
 # --------------------------------------------------
 # 3. `make ci` の構成順序チェック
 # --------------------------------------------------
-ci_row_seq="$(grep -oE '(`[A-Za-z][A-Za-z0-9_-]*`[[:space:]]*→[[:space:]]*)+`[A-Za-z][A-Za-z0-9_-]*`[[:space:]]*の順に実行' "$agents_file" | head -n1 | sed -E 's/の順に実行$//')"
+ci_row_seq="$(grep -oE '(`[A-Za-z][A-Za-z0-9_-]*`[[:space:]]*→[[:space:]]*)+`[A-Za-z][A-Za-z0-9_-]*`[[:space:]]*の順に実行' "$agents_file" | head -n1 | sed -E 's/の順に実行$//' || true)"
 if [ -z "$ci_row_seq" ]; then
   err "anchor-not-found" "AGENTS.md: 'make ci' の構成順序（'... の順に実行'）が見つからない"
   exit 2
 fi
-agents_ci_order="$(printf '%s' "$ci_row_seq" | grep -oE '`[A-Za-z][A-Za-z0-9_-]*`' | tr -d '`' | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')"
+agents_ci_order="$(printf '%s' "$ci_row_seq" | grep -oE '`[A-Za-z][A-Za-z0-9_-]*`' | tr -d '`' | tr '\n' ' ' | sed -E 's/[[:space:]]+$//' || true)"
 
-makefile_ci_line="$(grep -E '^ci:' "$makefile" | head -n1)"
+makefile_ci_line="$(grep -E '^ci:' "$makefile" | head -n1 || true)"
 if [ -z "$makefile_ci_line" ]; then
   err "anchor-not-found" "Makefile: 'ci:' ターゲットが見つからない"
   exit 2
@@ -220,7 +220,7 @@ while IFS= read -r row; do
   left="$(printf '%s' "$row" | awk -F'|' '{print $2}')"
   right="$(printf '%s' "$row" | awk -F'|' '{print $3}')"
 
-  row_targets="$(printf '%s' "$left" | grep -oE '`[A-Za-z][A-Za-z0-9_-]*`' | tr -d '`')"
+  row_targets="$(printf '%s' "$left" | grep -oE '`[A-Za-z][A-Za-z0-9_-]*`' | tr -d '`' || true)"
   if [ -z "$row_targets" ]; then
     err "parse-error" "AGENTS.md: 対応表の左列を解釈できない行: ${row}"
     exit 2
@@ -231,7 +231,7 @@ ${row_targets}"
   if printf '%s' "$right" | grep -qF 'CI では直接実行しない'; then
     continue
   fi
-  row_jobs="$(printf '%s' "$right" | grep -oE '`[A-Za-z][A-Za-z0-9_-]*`' | tr -d '`')"
+  row_jobs="$(printf '%s' "$right" | grep -oE '`[A-Za-z][A-Za-z0-9_-]*`' | tr -d '`' || true)"
   if [ -z "$row_jobs" ]; then
     err "parse-error" "AGENTS.md: 対応表の右列を解釈できない行（ジョブ名も 'CI では直接実行しない' も無い）: ${row}"
     exit 2
@@ -269,11 +269,13 @@ job_level_timeout() {
   # ジョブ本体（4 スペースインデント）の timeout-minutes のみを対象にする
   # （8 スペースインデントのステップ個別 timeout-minutes は含めない）。
   local block="$1"
-  printf '%s\n' "$block" | grep -E '^    timeout-minutes:' | head -n1 | grep -oE '[0-9]+'
+  # 該当行が無い場合（reusable 呼び出し等）は空文字を返す（grep 非マッチによる
+  # 呼び出し元の set -e 停止を避け、呼び出し元の [ -z ] 分岐へ確実に到達させる）。
+  printf '%s\n' "$block" | grep -E '^    timeout-minutes:' | head -n1 | grep -oE '[0-9]+' || true
 }
 
 # 5-1: テスト 1 件の応答待ち（env FANDHE_CONTAINER_TEST_TIMEOUT_SECS）
-agents_env_secs="$(grep -oE 'CI 設定値 [0-9]+ 秒' "$agents_file" | head -n1 | grep -oE '[0-9]+')"
+agents_env_secs="$(grep -oE 'CI 設定値 [0-9]+ 秒' "$agents_file" | head -n1 | grep -oE '[0-9]+' || true)"
 if [ -z "$agents_env_secs" ]; then
   err "anchor-not-found" "AGENTS.md: 'CI 設定値 N 秒' の記載が見つからない"
   exit 2
@@ -283,7 +285,7 @@ if [ -z "$it_block" ]; then
   err "anchor-not-found" "ci.yml: integration-test ジョブが見つからない"
   exit 2
 fi
-ci_env_secs="$(printf '%s\n' "$it_block" | grep -oE 'FANDHE_CONTAINER_TEST_TIMEOUT_SECS:[[:space:]]*"[0-9]+"' | head -n1 | grep -oE '[0-9]+')"
+ci_env_secs="$(printf '%s\n' "$it_block" | grep -oE 'FANDHE_CONTAINER_TEST_TIMEOUT_SECS:[[:space:]]*"[0-9]+"' | head -n1 | grep -oE '[0-9]+' || true)"
 if [ -z "$ci_env_secs" ]; then
   err "anchor-not-found" "ci.yml: integration-test ジョブに FANDHE_CONTAINER_TEST_TIMEOUT_SECS が見つからない"
   exit 2
@@ -293,12 +295,12 @@ if [ "$agents_env_secs" != "$ci_env_secs" ]; then
 fi
 
 # 5-2: 結合試験の実行ステップ（step-level timeout-minutes）
-agents_step_min="$(grep -A1 '結合試験の実行ステップ' "$agents_file" | grep -oE '[0-9]+ 分' | head -n1 | grep -oE '[0-9]+')"
+agents_step_min="$(grep -A1 '結合試験の実行ステップ' "$agents_file" | grep -oE '[0-9]+ 分' | head -n1 | grep -oE '[0-9]+' || true)"
 if [ -z "$agents_step_min" ]; then
   err "anchor-not-found" "AGENTS.md: '結合試験の実行ステップ' の分数が見つからない"
   exit 2
 fi
-ci_step_min="$(printf '%s\n' "$it_block" | grep -E '^        timeout-minutes:' | head -n1 | grep -oE '[0-9]+')"
+ci_step_min="$(printf '%s\n' "$it_block" | grep -E '^        timeout-minutes:' | head -n1 | grep -oE '[0-9]+' || true)"
 if [ -z "$ci_step_min" ]; then
   err "anchor-not-found" "ci.yml: integration-test ジョブの実行ステップに timeout-minutes が見つからない"
   exit 2
@@ -308,21 +310,21 @@ if [ "$agents_step_min" != "$ci_step_min" ]; then
 fi
 
 # 5-3: ジョブ全体（「ジョブ全体」行に列挙された `job` N 分 の組）
-overall_row="$(grep -E '^\| ジョブ全体 \|' "$agents_file" | head -n1)"
+overall_row="$(grep -E '^\| ジョブ全体 \|' "$agents_file" | head -n1 || true)"
 if [ -z "$overall_row" ]; then
   err "anchor-not-found" "AGENTS.md: 推奨タイムアウト値表の 'ジョブ全体' 行が見つからない"
   exit 2
 fi
 overall_cell="$(printf '%s' "$overall_row" | awk -F'|' '{print $3}')"
-pairs="$(printf '%s' "$overall_cell" | grep -oE '`[A-Za-z][A-Za-z0-9_-]*`[[:space:]]*[0-9]+[[:space:]]*分')"
+pairs="$(printf '%s' "$overall_cell" | grep -oE '`[A-Za-z][A-Za-z0-9_-]*`[[:space:]]*[0-9]+[[:space:]]*分' || true)"
 if [ -z "$pairs" ]; then
   err "anchor-not-found" "AGENTS.md: 'ジョブ全体' 行から '\`job\` N 分' の組を 1 件も抽出できない"
   exit 2
 fi
 while IFS= read -r pair; do
   [ -z "$pair" ] && continue
-  job="$(printf '%s' "$pair" | grep -oE '`[A-Za-z][A-Za-z0-9_-]*`' | tr -d '`')"
-  minutes="$(printf '%s' "$pair" | grep -oE '[0-9]+')"
+  job="$(printf '%s' "$pair" | grep -oE '`[A-Za-z][A-Za-z0-9_-]*`' | tr -d '`' || true)"
+  minutes="$(printf '%s' "$pair" | grep -oE '[0-9]+' || true)"
   block="$(job_block "$job")"
   if [ -z "$block" ]; then
     report "ジョブ全体タイムアウト: AGENTS.md が挙げる '${job}' ジョブが ci.yml に存在しない"
@@ -350,18 +352,18 @@ ci_needs="$(printf '%s\n' "$cc_block" | awk '
   /needs:/ { in_needs = 1 }
   in_needs { print }
   in_needs && /\]/ { exit }
-' | grep -oE '[A-Za-z0-9_-]+' | grep -vxF 'needs')"
+' | grep -oE '[A-Za-z0-9_-]+' | grep -vxF 'needs' || true)"
 if [ -z "$ci_needs" ]; then
   err "anchor-not-found" "ci.yml: ci-complete の needs を解釈できない"
   exit 2
 fi
 
-agents_needs_sentence="$(grep -oE '集約ジョブ `ci-complete` が[^。]*全ジョブ' "$agents_file" | head -n1)"
+agents_needs_sentence="$(grep -oE '集約ジョブ `ci-complete` が[^。]*全ジョブ' "$agents_file" | head -n1 || true)"
 if [ -z "$agents_needs_sentence" ]; then
   err "anchor-not-found" "AGENTS.md: '集約ジョブ \`ci-complete\` が ... 全ジョブ' の記述が見つからない"
   exit 2
 fi
-agents_needs="$(printf '%s' "$agents_needs_sentence" | sed -E 's/^集約ジョブ `ci-complete` が//' | grep -oE '`[A-Za-z][A-Za-z0-9_-]*`' | tr -d '`')"
+agents_needs="$(printf '%s' "$agents_needs_sentence" | sed -E 's/^集約ジョブ `ci-complete` が//' | grep -oE '`[A-Za-z][A-Za-z0-9_-]*`' | tr -d '`' || true)"
 
 # (i) AGENTS.md の列挙と ci.yml の needs が集合として一致するか
 diff_a="$(comm -23 <(printf '%s\n' "$ci_needs" | sort -u) <(printf '%s\n' "$agents_needs" | sort -u))"
@@ -381,8 +383,8 @@ fi
 # --------------------------------------------------
 # 7. deny の checks 集合・cargo-deny バージョン照合
 # --------------------------------------------------
-makefile_deny_checks="$(grep -E 'cargo deny --locked check' "$makefile" | head -n1 | sed -E 's/^.*cargo deny --locked check[[:space:]]*//' | tr -s ' ')"
-ci_deny_checks="$(grep -E 'deny-checks:' "$ci_file" | head -n1 | sed -E 's/^.*deny-checks:[[:space:]]*//' | tr -s ' ')"
+makefile_deny_checks="$(grep -E 'cargo deny --locked check' "$makefile" | head -n1 | sed -E 's/^.*cargo deny --locked check[[:space:]]*//' | tr -s ' ' || true)"
+ci_deny_checks="$(grep -E 'deny-checks:' "$ci_file" | head -n1 | sed -E 's/^.*deny-checks:[[:space:]]*//' | tr -s ' ' || true)"
 if [ -z "$makefile_deny_checks" ]; then
   err "anchor-not-found" "Makefile: 'cargo deny --locked check ...' が見つからない"
   exit 2
@@ -395,8 +397,8 @@ if [ "$makefile_deny_checks" != "$ci_deny_checks" ]; then
   report "deny checks: Makefile '${makefile_deny_checks}' が ci.yml の deny-checks '${ci_deny_checks}' と一致しない"
 fi
 
-makefile_deny_version="$(grep -E '^CARGO_DENY_VERSION[[:space:]]*:=' "$makefile" | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
-ci_deny_version="$(grep -E 'cargo-deny-version:' "$ci_file" | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+makefile_deny_version="$(grep -E '^CARGO_DENY_VERSION[[:space:]]*:=' "$makefile" | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+ci_deny_version="$(grep -E 'cargo-deny-version:' "$ci_file" | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
 if [ -z "$makefile_deny_version" ]; then
   err "anchor-not-found" "Makefile: 'CARGO_DENY_VERSION := ...' が見つからない"
   exit 2

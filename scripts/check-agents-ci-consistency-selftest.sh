@@ -74,6 +74,16 @@ run_case "deny-version-mismatch" "${ok_dir}/AGENTS.md.txt" "${ok_dir}/ci.yml.txt
 # REPAIR-7: 想定する見出し（アンカー）が無く解析できない → 入力エラー（2。fail-closed）
 run_case "no-anchor" "${fixtures_dir}/no-anchor/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${ok_dir}/Makefile.txt" 2
 
+# REPAIR-10 レビュー修正の回帰確認: 「結合試験の実行ステップ」行が無い場合、
+# grep -oE の非マッチで `set -e` により無出力 exit 1 で落ちず、
+# anchor-not-found のメッセージ付き exit 2 で止まること（fail-closed の経路自体を検証）
+run_case "missing-step-anchor" "${fixtures_dir}/missing-step-anchor/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${ok_dir}/Makefile.txt" 2
+
+# REPAIR-10 レビュー修正の回帰確認: 「ジョブ全体」表に列挙されたジョブから
+# timeout-minutes が消えても、5-3 節の graceful-degradation（note 出力・continue）
+# に到達し、無出力 exit 1 で落ちず合格（0）のまま止まること
+run_case "missing-job-timeout" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/missing-job-timeout/ci.yml.txt" "${ok_dir}/Makefile.txt" 0
+
 # 存在しないファイル → 入力エラー（2）
 run_case "missing-file" "${ok_dir}/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${fixtures_dir}/does-not-exist.txt" 2
 

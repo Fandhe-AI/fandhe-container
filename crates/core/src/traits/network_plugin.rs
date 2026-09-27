@@ -85,8 +85,9 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///    [`ErrorCode::AlreadyExists`] を返す。前回の残骸を黙って再利用しない。
 /// 8. **前提違反**: 存在しないネットワークへの [`Self::create_netns`] / [`Self::attach`] /
 ///    [`Self::publish_port`] / [`Self::detach`]、netns 未作成のコンテナへの
-///    [`Self::attach`] / [`Self::detach`]、未 attach のコンテナへの
-///    [`Self::publish_port`] は [`ErrorCode::NotFound`] を返す。加えて [`Self::attach`]・
+///    [`Self::attach`]、netns が未作成、または既に [`Self::detach`] 済みのコンテナへの
+///    [`Self::detach`]、未 attach のコンテナへの [`Self::publish_port`] は
+///    [`ErrorCode::NotFound`] を返す。加えて [`Self::attach`]・
 ///    [`Self::detach`] は、対象コンテナの netns が [`Self::create_netns`] で
 ///    紐付けられたネットワーク（`CreateNetnsRequest::network`）と `req.network()` が
 ///    一致しない場合、[`ErrorCode::FailedPrecondition`] を返す（異なるネットワークへの
@@ -1024,16 +1025,39 @@ mod tests {
             &self,
             req: &DeleteNetworkRequest,
         ) -> Result<DeleteNetworkResponse, TraitError> {
+            // 契約 9: 部分失敗を注入する場合、doc が保証するのは「1 件でも失敗があれば
+            // Err」であって、内部でどこまで削除が進んだかは呼び出し側から観測できない
+            // （plugin 実装依存）。このスタブは fail_delete が立っている間は追跡状態を
+            // 一切変更せずに Err を返すことで、doc と矛盾しない最も単純な失敗経路を
+            // 表現する。
             if self.fail_delete.load(Ordering::SeqCst) {
                 return Err(TraitError::new(
                     ErrorCode::Internal,
                     "failed to delete one or more tracked resources",
                 ));
             }
-            self.networks
-                .lock()
-                .expect("lock networks")
-                .remove(req.name());
+            // トレイト doc（delete_network）: 「そのネットワークに create_netns（紐付け）・
+            // attach のいずれかで関連付けたもの」を削除対象として回収する。ネットワーク名の
+            // 一致で netns を洗い出し、紐づく attach・公開済みポートもまとめて削除する
+            // （他ネットワークの資源には触れない）。
+            let name = req.name().clone();
+            let mut netns = self.netns.lock().expect("lock netns");
+            let mut attached = self.attached.lock().expect("lock attached");
+            let mut published = self.published.lock().expect("lock published");
+            let containers: Vec<ContainerId> = netns
+                .iter()
+                .filter(|(_, bound_network)| **bound_network == name)
+                .map(|(container, _)| container.clone())
+                .collect();
+            for container in containers {
+                netns.remove(&container);
+                attached.remove(&container);
+                published.remove(&container);
+            }
+            drop(netns);
+            drop(attached);
+            drop(published);
+            self.networks.lock().expect("lock networks").remove(&name);
             Ok(DeleteNetworkResponse::new())
         }
     }
@@ -1048,6 +1072,12 @@ mod tests {
 
     fn sample_container_id() -> ContainerId {
         ContainerId::new("sample-container").expect("valid id")
+    }
+
+    /// [`other_network_name`] に属するコンテナ用の 2 つ目の ID
+    /// （`delete_network` がネットワーク単位でのみ回収することを確認するため）。
+    fn other_container_id() -> ContainerId {
+        ContainerId::new("other-container").expect("valid id")
     }
 
     fn sample_subnet() -> IpCidr {
@@ -1472,6 +1502,89 @@ mod tests {
             .delete_network(&DeleteNetworkRequest::new(sample_network_name()))
             .expect_err("a partial failure must surface as Err");
         assert_eq!(err.code().as_str(), "INTERNAL");
+    }
+
+    /// `delete_network` のメソッド doc「そのネットワークに create_netns（紐付け）・
+    /// attach のいずれかで関連付けたものを実装（plugin 側）が追跡して決める」を検証する。
+    /// 削除後は同名ネットワーク・同コンテナの再作成が Ok になり（残骸が残らない）、
+    /// 別ネットワークに属する netns/attach/公開ポートは削除対象に含まれず残る
+    /// （ネットワーク単位でのみ回収する）。
+    #[test]
+    fn net3_delete_network_reclaims_netns_and_allows_recreate() {
+        let plugin = StubNetworkPlugin::new();
+
+        // 削除対象のネットワーク（front-end）側の資源一式。
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create front-end network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns bound to front-end");
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("attach to front-end");
+        plugin
+            .publish_port(&PublishPortRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect("publish_port on front-end");
+
+        // 削除対象ではない別ネットワーク（back-end）側の資源一式。回収されないことを
+        // 確認する対照群。
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                other_network_name(),
+                IpCidr::new(IpAddr::from([10, 250, 12, 1]), 24).expect("valid cidr"),
+            ))
+            .expect("create back-end network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                other_network_name(),
+                other_container_id(),
+            ))
+            .expect("create netns bound to back-end");
+
+        plugin
+            .delete_network(&DeleteNetworkRequest::new(sample_network_name()))
+            .expect("delete_network reclaims front-end resources");
+
+        // 回収済み: 同名ネットワーク・同コンテナの再作成が Ok になる
+        // （AlreadyExists が返らない = 残骸が残っていない）。
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("front-end network can be recreated after delete_network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("netns for the same container can be recreated after delete_network");
+
+        // 対照群: 別ネットワーク（back-end）の netns は削除対象に含まれないため、
+        // 同コンテナでの再作成は AlreadyExists のまま（＝資源が残っている証拠）。
+        let err = plugin
+            .create_netns(&CreateNetnsRequest::new(
+                other_network_name(),
+                other_container_id(),
+            ))
+            .expect_err("back-end's netns must be untouched by delete_network of front-end");
+        assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
     }
 
     /// 契約 6: `publish_port` は DNAT ルール追加後に失敗した場合、撤回にも失敗すれば

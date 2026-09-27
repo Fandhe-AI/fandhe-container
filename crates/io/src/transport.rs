@@ -65,7 +65,13 @@ impl TryFrom<Duration> for IoTimeout {
 ///
 /// [`WireFrame`] を実装できるのは本 crate 内の検証済みフレーム型だけに限る
 /// （REPAIR-2: 生バイト列を公開 API の関連型に指定させない）。
-mod sealed {
+///
+/// `pub(crate)` にして crate 内の兄弟モジュールから参照できるようにしている。
+/// TASK-11.2（#69）・TASK-11.3（#70）で追加される `protocol` モジュールのフレーム型が
+/// `sealed::Sealed` を実装できる必要があるため（`protocol` は `transport` の親では
+/// なく兄弟モジュールになる想定で、`mod` 既定の非公開のままだと参照できない）。
+/// crate 外からは `sealed` モジュール自体が非公開のままなので封印の効果は変わらない。
+pub(crate) mod sealed {
     /// [`super::WireFrame`] の封印用トレイト。crate 外はこれを実装できない。
     pub trait Sealed {}
 }

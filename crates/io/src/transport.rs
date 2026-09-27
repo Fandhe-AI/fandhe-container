@@ -126,15 +126,18 @@ pub trait FrameReceiver: Send {
 /// 分割 API（`split()` 等）は OS ごとのソケット実装に依存するため、本件では定義せず
 /// TASK-12 で決める。
 ///
-/// フレーム型の一致（`FrameSender::Frame == FrameReceiver::Frame`）は、関連型の等式
-/// 制約を使った blanket impl（`FrameReceiver<Frame = <Self as FrameSender>::Frame>`）を
-/// 試みたが、`Box<dyn FrameTransport<Frame = F>>` 等の呼び出し側で関連型 `Frame` の
-/// 出どころが曖昧になり（E0222）意図どおりに使えなかった。そのため本トレイトは単純な
-/// supertrait の組（`FrameSender + FrameReceiver`）とし、両者のフレーム型が一致する
-/// ことはこの doc の契約として明記するに留める（実装者が保証する）。
-pub trait FrameTransport: FrameSender + FrameReceiver {}
+/// フレーム型の一致（`FrameSender::Frame == FrameReceiver::Frame`）は、supertrait の
+/// 宣言で `FrameReceiver<Frame = <Self as FrameSender>::Frame>` という関連型の等式
+/// 制約を課すことでコンパイル時に強制する（REPAIR-2: 型の不一致を実装者の注意のみに
+/// 委ねない）。`Box<dyn FrameTransport<Frame = F>>` のように `FrameTransport` 自体が
+/// 関連型 `Frame` を持つ形にすると呼び出し側で出どころが曖昧になる（E0222）ため、
+/// `FrameTransport` 自身は関連型を持たせず、supertrait 境界としてのみ等式制約を課す。
+pub trait FrameTransport:
+    FrameSender + FrameReceiver<Frame = <Self as FrameSender>::Frame>
+{
+}
 
-impl<T> FrameTransport for T where T: FrameSender + FrameReceiver {}
+impl<T> FrameTransport for T where T: FrameSender + FrameReceiver<Frame = <T as FrameSender>::Frame> {}
 
 #[cfg(test)]
 mod tests {

@@ -19,25 +19,69 @@
 
 ## ビルド・テスト・回帰確認コマンド（REPAIR-7・REPAIR-10）
 
-`make` ターゲットを正とする（括弧内に実行される cargo コマンドを併記する）。
+`make` ターゲットを正とする（括弧内に実行される cargo コマンドを併記する）。本節は REPAIR-10 が求める 4 項目のうち (a) ビルドコマンドと成功基準・(b) 回帰確認コマンド一覧・(c) 推奨タイムアウト値を扱う。(d) 新機能追加時に更新すべきテスト一覧は TASK-93.2（#47）で追加する（本書は実装済みを装わない。REPAIR-3）。
 
-```bash
-make fmt-check   # cargo fmt --all --check
-make lint        # cargo clippy --workspace --all-targets -- -D warnings（既定 feature）
-make test        # cargo test --workspace（既定 feature）
-make deny        # cargo deny --locked check advisories bans licenses sources
-make ci          # lint-docs + check-workspace-manifest + 上記 4 つを一括実行
-make bench-check-selftest  # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
-make bench-check           # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
-```
-
-- `Cargo.toml`（workspace）が未作成の間、`fmt`/`lint`/`test` は対象がなく実行できない。`Cargo.toml` と `crates/*/Cargo.toml`（メンバー crate）の両方が揃うまで Makefile 側でこれらは skip される。`deny` は加えて `deny.toml` の存在を要する。`check-workspace-manifest`（`cargo verify-project`）は `Cargo.toml` の存在のみで判定し、メンバー crate 未追加の中間状態でも実行される
-- workspace 作成後の PR からは、PR 本文にこれらのコマンドの実行結果が記載されているか（同じ PR で CI 設定を変更する場合はその diff にこれらのコマンドが含まれているか）を確認する。本節の未達は、個別に優先度を明記した項目を除き既定で P1 とする
-- CI の `rust-ci`（3 OS matrix）は clippy/test を `--all-features` で実行し（fmt/deny は feature 非依存）、`rust-ci-default-features`（3 OS matrix）が `make lint`/`make test` と同一コマンド（既定 feature）を再現する。両者は別ジョブであり、既定 feature 側の回帰は `rust-ci-default-features` でのみ検出される
+- `Cargo.toml`（workspace）と `crates/*/Cargo.toml`（メンバー crate）は現在すべて揃っており、`deny.toml` も存在するため、下記の `fmt`/`lint`/`test`/`deny` は Makefile 側で skip されず常に実行される（`HAS_CARGO`/`HAS_MEMBERS`/`HAS_DENY` はいずれも真）。`skip: ...` という出力が現れた場合は本来実行されるはずのターゲットが実行されていない異常事態であり、**合格の根拠にしない**（false-green 防止）。`check-workspace-manifest`（`cargo verify-project`）は `Cargo.toml` の存在のみで判定し、メンバー crate 未追加の中間状態でも実行される仕組みだった名残で、現状は常に実行される
+- PR 本文にこれらのコマンドの実行結果（終了コードと要点）が記載されているか（同じ PR で CI 設定を変更する場合はその diff にこれらのコマンドが含まれているか）を確認する。本節の未達は、個別に優先度を明記した項目を除き既定で P1 とする
 - clippy 警告は 0 件を維持する。理由コメントなしで `#[allow(...)]` により警告を握りつぶす差分は P1。crate・モジュール全体に及ぶ広範な `#[allow(...)]`（`#![allow(...)]` 等）や、`unsafe` 関連 lint（`unsafe_code`・`clippy::undocumented_unsafe_blocks` 等）・外部入力の検証を隠す lint（`clippy::unwrap_used`・`clippy::expect_used`・`clippy::indexing_slicing` 等。下記「外部入力の検証」観点）の外部入力経路での抑止は、理由コメントの有無を問わず P0
 - テストの skip・ignore・アサーション弱体化で CI を通す差分は P0（回帰検出の後退を招くため）
 
+### ビルドコマンドと成功基準（REPAIR-10 (a)）
+
+合格は共通して「終了コード 0」とする。`skip: ...` が出力された場合は実行されていないため合格扱いにしない（上記の注意を参照）。
+
+| ターゲット | 実行内容 | 成功基準 |
+| ---- | ---- | ---- |
+| `make fmt-check` | `cargo fmt --all --check` | 終了コード 0。整形差分（`Diff in ...`）を出力しない。差分がある場合は `make fmt` で整形してから再実行する |
+| `make lint` | `cargo clippy --workspace --all-targets -- -D warnings`（既定 feature） | 終了コード 0 かつ clippy 警告 0 件（`-D warnings` により警告はエラー扱いになる）。理由なしの `#[allow]` での抑止は上記のとおり P1・外部入力系 lint の抑止は P0 |
+| `make test` | `cargo test --workspace`（既定 feature） | 終了コード 0。すべての `test result:` 行が `0 failed`。`ignored` の増加で通していないこと（skip/ignore は P0） |
+| `make deny` | `cargo deny --locked check advisories bans licenses sources` | 終了コード 0 かつ advisories・bans・licenses・sources の 4 チェックすべて ok（`--locked` により `Cargo.lock` の更新が必要な状態も失敗として検出する） |
+| `make ci` | `lint-docs` → `check-workspace-manifest` → `fmt-check` → `lint` → `test` → `deny` の順に実行 | 6 サブターゲットすべてが終了コード 0（make は最初の失敗で停止する）。`lint-docs` は markdownlint・yamllint・editorconfig-checker・commitlint（`origin/main` からの分岐点以降のコミット）を含む |
+
+**`make ci` の合格はローカルゲート（[ci](.claude/rules/ci.md)）であり、PR のマージゲートである CI 全体と同一ではない。** `make ci` は `--all-features` での検証・`test-integration`・`bench-check`・3 OS matrix を含まない。PR のマージゲートは `ci.yml` の集約ジョブ `ci-complete` が `lint-docs`・`rust-ci`・`rust-ci-default-features`・`integration-test`・`bench-regression` の全ジョブの成功を fail-closed で検証した上で成功することである。
+
+### 回帰確認コマンド一覧（REPAIR-7・REPAIR-10 (b)）
+
+```bash
+make fmt-check              # cargo fmt --all --check
+make lint                   # cargo clippy --workspace --all-targets -- -D warnings（既定 feature）
+make test                   # cargo test --workspace（既定 feature）
+make test-integration       # cargo test --workspace --test '*'（結合試験。integration test target が 0 件なら notice を出して成功終了する。現時点では 0 件）
+make deny                   # cargo deny --locked check advisories bans licenses sources
+make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + deny を一括実行
+make bench-check-selftest   # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
+make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
+```
+
+- `make test-integration`: 終了コード 0 が成功基準。integration test target が 0 件のときの `notice:` 出力での成功終了は現状の正常動作。jq 未導入時は fail-closed で終了コード非 0 になる
+- `make bench-check-selftest` / `make bench-check`: 終了コード 0 が成功基準。`bench-check` を呼ぶ比較スクリプト（`scripts/check-bench-regression.sh`）自体の終了コードは 0（合格）/ 1（回帰検出）/ 2（入力エラー）の 3 値で、詳細は下記「タイムアウト保護された結合試験・ベンチ回帰」節 (4) を参照する。**現時点では計測対象がプレースホルダのため、`bench-check` の成功を性能回帰がない根拠として扱わない**
+- CI の `rust-ci`（3 OS matrix）は clippy/test を `--all-features` で実行し（fmt/deny は feature 非依存）、`rust-ci-default-features`（3 OS matrix）が `make lint`/`make test` と同一コマンド（既定 feature）を再現する。両者は別ジョブであり、既定 feature 側の回帰は `rust-ci-default-features` でのみ検出される
+- 各コマンドと CI ジョブの対応（TASK-94 の整合確認で参照する）:
+
+| コマンド | 対応する CI ジョブ |
+| ---- | ---- |
+| `fmt-check`・`deny` | `rust-ci` |
+| `lint`・`test`（既定 feature） | `rust-ci-default-features`（`--all-features` 側は `rust-ci`） |
+| `test-integration` | `integration-test` |
+| `bench-check-selftest`・`bench-check` | `bench-regression` |
+| `lint-docs` | `lint-docs` |
+
+### 推奨タイムアウト値（REPAIR-5・REPAIR-10 (c)）
+
+| 層 | 値 | 設定箇所 | 根拠 |
+| ---- | ---- | ---- | ---- |
+| テスト 1 件の応答待ち（ACK・plugin RPC・子プロセス） | 推奨 5〜10 秒（CI 設定値 10 秒） | `ci.yml` `integration-test` ジョブの env `FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"`（TASK-87.1・#40） | PoC-8 実測・REPAIR-10 (c)・REPAIR-5 |
+| 結合試験の実行ステップ | 10 分 | `integration-test` ジョブの実行ステップ `timeout-minutes: 10` | TASK-86.2（#36）・TASK-87 |
+| ジョブ全体 | `integration-test` 30 分・`bench-regression` 15 分・`ci-complete` 5 分 | 各ジョブの `timeout-minutes` | 多層防御 |
+
+- この env を読んで `Duration` を組み立て `recv_timeout` 等に使う消費側コードは、integration test target が 0 件の現時点では存在せず、TASK-85 以降で実装される（実装済みを装わない。REPAIR-3）
+- 新しく書く応答待ち処理は 5〜10 秒の範囲を既定とする。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5。詳細は下記「タイムアウト保護された結合試験・ベンチ回帰」節および「レビュー観点」のタイムアウト項目）
+- タイムアウト値を検出が弱まる方向（上限の撤廃・大幅な延長）へ変える差分は、根拠の記録がなければ「回帰検出の後退」として扱う（bench 閾値の既存記述と同じ扱い）
+- ハングプローブ（TASK-87.2・#41）の実施記録は下記「タイムアウト保護された結合試験・ベンチ回帰」節に記載済み
+
 ### タイムアウト保護された結合試験・ベンチ回帰（REPAIR-5・REPAIR-8）
+
+数値・設定箇所は上記「推奨タイムアウト値」節に集約している。本節はその判定基準・実施記録の詳細を扱う。
 
 REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された結合試験は TASK-86.2（#36）で CI 導入済み。(4) ベンチ回帰チェック（15% 超の悪化で fail）の比較の仕組みは TASK-86.3（#37）で導入したが、計測対象がプレースホルダ（固定値）のため現時点では実装の性能悪化を検出しない（実測ベンチ・基準値への置き換えは TASK-113〔#269〕・TASK-88〔#227〕）。`bench-regression` の成功を「性能回帰がない」根拠として扱わない。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5）
 

@@ -31,8 +31,8 @@ pub use container_runtime::{
 };
 pub use network_plugin::{
     AttachRequest, AttachResponse, CreateNetnsRequest, CreateNetworkRequest, DeleteNetworkRequest,
-    DeleteNetworkResponse, IpCidr, NetnsName, NetnsStatus, NetworkName, NetworkPlugin,
-    NetworkStatus, PortMapping, Protocol, PublishPortRequest,
+    DeleteNetworkResponse, DetachRequest, DetachResponse, IpCidr, NetnsName, NetnsStatus,
+    NetworkName, NetworkPlugin, NetworkStatus, PortMapping, Protocol, PublishPortRequest,
 };
 pub use state_store::{
     CreateStateRequest, DeleteStateRequest, DeleteStateResponse, GetStateRequest, ListStateRequest,

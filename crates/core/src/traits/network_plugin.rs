@@ -21,6 +21,12 @@
 //! | `publish-port` | [`NetworkPlugin::publish_port`] | コンテナ | ポート公開（nft DNAT） | PortMapping |
 //! | `net-delete` | [`NetworkPlugin::delete_network`] | ネットワーク | bridge・nft テーブル・関連 netns の一括削除 | `TearDownPod` 相当 |
 //!
+//! [`NetworkPlugin::detach`] は PoC-15 の `netsetup` には対応する操作粒度がない
+//! （PoC-15 はネットワーク単位の一括削除のみを実証した）。CNI の `DEL`・CRI の
+//! `StopPodSandbox`/`RemovePodSandbox` 相当のコンテナ単位の後始末として本トレイトが
+//! 独自に定義する。ポート公開（DNAT）→ veth → netns を逆順に解放し、
+//! [`NetworkPlugin::attach`] 前（netns のみ作成済み）でも呼び出せる。
+//!
 //! 分割の理由: ネットワーク単位とコンテナ単位のライフサイクルが異なるため、
 //! 単一メソッドに畳み込まずライフサイクル単位ごとに分ける。PoC-15 の実機実証で、
 //! この粒度でロールバックと冪等性の境界が引けることを確認している（CRI-7 追記）。
@@ -34,8 +40,6 @@
 //! # 未対応（スコープ外。#19・TASK-4.h1 と後続タスクへ引き継ぐ）
 //!
 //! - NET-6 の host / none モード（netsetup の操作を経由しない経路の扱いは #19 で確定する）
-//! - コンテナ単位の detach・netns 単独の削除（コンテナ削除時の後始末）。将来は
-//!   既定実装付きメソッドとして追加できる
 //! - DNS ヘルパーのライフサイクルとレジストリ更新の詳細（NET-5・NET-7）、
 //!   `--add-host` / `--dns`（NET-12）、rootless ネットワーク（NET-9・検討中）、
 //!   ホスト側 bind IP の指定
@@ -80,20 +84,22 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 /// 7. **二重作成の拒否**: 同名のネットワークや同じコンテナの netns が既にあれば
 ///    [`ErrorCode::AlreadyExists`] を返す。前回の残骸を黙って再利用しない。
 /// 8. **前提違反**: 存在しないネットワークへの [`Self::create_netns`] / [`Self::attach`] /
-///    [`Self::publish_port`]、netns 未作成のコンテナへの [`Self::attach`]、
-///    未 attach のコンテナへの [`Self::publish_port`] は [`ErrorCode::NotFound`] を返す。
-///    加えて [`Self::attach`] は、対象コンテナの netns が [`Self::create_netns`] で
+///    [`Self::publish_port`] / [`Self::detach`]、netns 未作成のコンテナへの
+///    [`Self::attach`] / [`Self::detach`]、未 attach のコンテナへの
+///    [`Self::publish_port`] は [`ErrorCode::NotFound`] を返す。加えて [`Self::attach`]・
+///    [`Self::detach`] は、対象コンテナの netns が [`Self::create_netns`] で
 ///    紐付けられたネットワーク（`CreateNetnsRequest::network`）と `req.network()` が
 ///    一致しない場合、[`ErrorCode::FailedPrecondition`] を返す（異なるネットワークへの
-///    越境接続を拒否し、[`Self::delete_network`] の追跡対象と実際の接続先の食い違いを
-///    防ぐ）。同様に [`Self::publish_port`] は、対象コンテナが [`Self::attach`] された
-///    際のネットワーク（`AttachRequest::network`）と `req.network()` が一致しない場合、
-///    [`ErrorCode::FailedPrecondition`] を返す（別ネットワークに属するコンテナ ID を
-///    渡して越境 DNAT を設定させないため）。
-/// 9. **削除はベストエフォートで続行**: [`Self::delete_network`] は個々の削除に失敗しても
-///    残りの削除を続け、1 件でも失敗があれば `Err`（[`ErrorCode::Internal`]。`message`
-///    に残存資源を含める。契約 6 の [`Self::publish_port`] と同じ fail-closed の表現）
-///    を返す（PoC-15 の `net-delete` に準拠）。
+///    越境接続・越境解放を拒否し、[`Self::delete_network`] の追跡対象と実際の接続先の
+///    食い違いを防ぐ）。同様に [`Self::publish_port`] は、対象コンテナが
+///    [`Self::attach`] された際のネットワーク（`AttachRequest::network`）と
+///    `req.network()` が一致しない場合、[`ErrorCode::FailedPrecondition`] を返す
+///    （別ネットワークに属するコンテナ ID を渡して越境 DNAT を設定させないため）。
+/// 9. **削除・解放はベストエフォートで続行**: [`Self::delete_network`]・[`Self::detach`]
+///    は個々の削除・解放に失敗しても残りを続け、1 件でも失敗があれば `Err`
+///    （[`ErrorCode::Internal`]。`message` に残存資源を含める。契約 6 の
+///    [`Self::publish_port`] と同じ fail-closed の表現）を返す（PoC-15 の `net-delete`
+///    に準拠。[`Self::detach`] も同じパターンを踏襲する）。
 ///
 /// メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 /// dyn 互換（object safety）を保ち、async ランタイムへの依存を追加しない
@@ -153,14 +159,36 @@ pub trait NetworkPlugin: Send + Sync {
     /// 対応: NET-4。
     fn publish_port(&self, req: &PublishPortRequest) -> Result<PortMapping, TraitError>;
 
+    /// コンテナのネットワーク接続を解放する（ポート公開 → veth → netns の逆順）。
+    ///
+    /// CNI の `DEL`・CRI の `StopPodSandbox` / `RemovePodSandbox` 相当のコンテナ単位の
+    /// 後始末 API（PoC-15 の `netsetup` には対応する操作粒度がなく、本トレイトが独自に
+    /// 定義する）。[`Self::attach`] 前（netns のみ作成済み）でも呼び出せる。前提:
+    /// `req.network()` が [`Self::create_network`] 済みであること（未作成なら
+    /// [`ErrorCode::NotFound`]）。対象コンテナの netns が存在すること（未作成、または
+    /// 既に detach 済みなら [`ErrorCode::NotFound`]）。その netns が [`Self::create_netns`]
+    /// 呼び出し時に紐付けられたネットワークが `req.network()` と一致すること（不一致
+    /// なら [`ErrorCode::FailedPrecondition`]。[`Self::attach`] の契約 8 と同じ理由）。
+    /// 対象コンテナに [`Self::publish_port`] 済みのポート公開があれば、veth・netns を
+    /// 解放する前にそれらをまとめて解放する。個々の解放に失敗しても残りの解放を続け、
+    /// 1 件でも失敗があれば `Err`（[`ErrorCode::Internal`]。`message` に残存資源を含める。
+    /// 契約 9）を返す。二重の呼び出しは、1 回目で netns が解放済みになるため 2 回目が
+    /// [`ErrorCode::NotFound`] になる。[`Self::delete_network`] との関係:
+    /// `delete_network` はネットワーク単位で残存する netns をまとめて回収するため、
+    /// `detach` 済みのコンテナは `delete_network` の削除対象から自然に外れ、二重削除に
+    /// ならない。対応: NET-1・NET-2・NET-4。
+    fn detach(&self, req: &DetachRequest) -> Result<DetachResponse, TraitError>;
+
     /// ネットワーク（bridge・nft テーブル・関連 netns）を一括削除する。
     ///
     /// netsetup の `net-delete` に対応し、CRI の `TearDownPod` 相当。削除対象の netns
     /// 一覧は呼び出し側から受け取らず、そのネットワークに [`Self::create_netns`]（`req.network()`
     /// で紐付け）・[`Self::attach`] のいずれかで関連付けたものを実装（plugin 側）が追跡して
     /// 決める（上限のない `Vec` を境界へ持ち込まないため）。`attach` 前に失敗した netns も
-    /// `create_netns` の時点で追跡対象に入っているため回収できる。個々の削除に失敗しても
-    /// 残りの削除を続け、1 件でも失敗があれば `Err` を返す（契約 9）。対応: NET-3・NET-5。
+    /// `create_netns` の時点で追跡対象に入っているため回収できる。[`Self::detach`] 済みの
+    /// コンテナは実装側の追跡対象から既に外れているため、削除対象に含まれない
+    /// （二重削除の防止）。個々の削除に失敗しても残りの削除を続け、1 件でも失敗があれば
+    /// `Err` を返す（契約 9）。対応: NET-3・NET-5。
     fn delete_network(
         &self,
         req: &DeleteNetworkRequest,
@@ -697,6 +725,50 @@ impl PortMapping {
     }
 }
 
+/// [`NetworkPlugin::detach`] の要求。
+///
+/// コンテナのネットワーク接続（ポート公開・veth・netns）を解放する対象を指定する。
+/// 解放するリソースの一覧はここでは受け取らない。[`Self::network`]・[`Self::container`]
+/// から実装（plugin 側）が追跡済みの資源（`create_netns`・`attach`・`publish_port` で
+/// 紐付けたもの）を特定する（上限のない `Vec` を境界へ持ち込まない設計は
+/// [`DeleteNetworkRequest`] と同じ）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct DetachRequest {
+    network: NetworkName,
+    container: ContainerId,
+}
+
+impl DetachRequest {
+    /// 対象ネットワークとコンテナから要求を作る。
+    pub fn new(network: NetworkName, container: ContainerId) -> Self {
+        Self { network, container }
+    }
+
+    /// 対象ネットワーク名を返す。
+    pub fn network(&self) -> &NetworkName {
+        &self.network
+    }
+
+    /// 対象コンテナの ID を返す。
+    pub fn container(&self) -> &ContainerId {
+        &self.container
+    }
+}
+
+/// [`NetworkPlugin::detach`] の応答。当面は空だが、将来の拡張（解放した資源の種別等）
+/// に備えて構造体にする（[`DeleteNetworkResponse`] と同じ形）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DetachResponse {}
+
+impl DetachResponse {
+    /// 空の応答を作る。
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
 /// [`NetworkPlugin::delete_network`] の要求。
 ///
 /// 削除対象の netns 一覧はここでは受け取らない。そのネットワークで作成・接続した
@@ -752,8 +824,12 @@ mod tests {
         networks: Mutex<HashSet<NetworkName>>,
         netns: Mutex<HashMap<ContainerId, NetworkName>>,
         attached: Mutex<HashMap<ContainerId, NetworkName>>,
+        /// コンテナごとに公開済みのポート（[`NetworkPlugin::detach`] が解放対象を
+        /// 追跡し、[`NetworkPlugin::publish_port`] が積む）。
+        published: Mutex<HashMap<ContainerId, Vec<PortMapping>>>,
         fail_delete: AtomicBool,
         fail_publish_port: AtomicBool,
+        fail_detach: AtomicBool,
     }
 
     impl StubNetworkPlugin {
@@ -762,8 +838,10 @@ mod tests {
                 networks: Mutex::new(HashSet::new()),
                 netns: Mutex::new(HashMap::new()),
                 attached: Mutex::new(HashMap::new()),
+                published: Mutex::new(HashMap::new()),
                 fail_delete: AtomicBool::new(false),
                 fail_publish_port: AtomicBool::new(false),
+                fail_detach: AtomicBool::new(false),
             }
         }
 
@@ -777,6 +855,12 @@ mod tests {
         /// 「DNAT ルール追加後に失敗し、撤回にも失敗する」経路へ強制するためのスイッチ。
         fn set_fail_publish_port(&self, fail: bool) {
             self.fail_publish_port.store(fail, Ordering::SeqCst);
+        }
+
+        /// [`NetworkPlugin::detach`] の次回呼び出しを契約 9 の
+        /// 「1 件でも失敗があれば `Err`」経路へ強制するためのスイッチ。
+        fn set_fail_detach(&self, fail: bool) {
+            self.fail_detach.store(fail, Ordering::SeqCst);
         }
     }
 
@@ -877,13 +961,63 @@ mod tests {
                     "failed to add DNAT rule and rollback also failed",
                 ));
             }
-            Ok(PortMapping::new(
+            let mapping = PortMapping::new(
                 req.network().clone(),
                 req.container().clone(),
                 req.host_port(),
                 req.container_port(),
                 req.protocol(),
-            ))
+            );
+            // `detach` が解放対象として追跡できるよう、公開済みポートを積んでおく。
+            self.published
+                .lock()
+                .expect("lock published")
+                .entry(req.container().clone())
+                .or_default()
+                .push(mapping.clone());
+            Ok(mapping)
+        }
+
+        fn detach(&self, req: &DetachRequest) -> Result<DetachResponse, TraitError> {
+            if !self
+                .networks
+                .lock()
+                .expect("lock networks")
+                .contains(req.network())
+            {
+                return Err(TraitError::new(ErrorCode::NotFound, "network not found"));
+            }
+            let mut netns = self.netns.lock().expect("lock netns");
+            let bound_network = netns
+                .get(req.container())
+                .ok_or_else(|| TraitError::new(ErrorCode::NotFound, "netns not found"))?
+                .clone();
+            if bound_network != *req.network() {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "netns is bound to a different network",
+                ));
+            }
+            // 契約 9: ポート公開 → veth（attached）→ netns の逆順にベストエフォートで
+            // 解放する。個々の解放に失敗しても残りの解放を続け、1 件でも失敗があれば
+            // `Internal` を返す。
+            self.published
+                .lock()
+                .expect("lock published")
+                .remove(req.container());
+            self.attached
+                .lock()
+                .expect("lock attached")
+                .remove(req.container());
+            netns.remove(req.container());
+            drop(netns);
+            if self.fail_detach.load(Ordering::SeqCst) {
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to release one or more tracked resources",
+                ));
+            }
+            Ok(DetachResponse::new())
         }
 
         fn delete_network(
@@ -928,7 +1062,7 @@ mod tests {
         IpAddr::from([10, 250, 11, 1])
     }
 
-    /// CRI-7: `NetworkPlugin` は dyn 互換で、`Box`/`Arc` に収めて 5 メソッドを順に呼べる。
+    /// CRI-7: `NetworkPlugin` は dyn 互換で、`Box`/`Arc` に収めて 6 メソッドを順に呼べる。
     #[test]
     fn cri7_network_plugin_is_dyn_compatible() {
         let boxed: Box<dyn NetworkPlugin> = Box::new(StubNetworkPlugin::new());
@@ -963,6 +1097,14 @@ mod tests {
             ))
             .expect("publish_port succeeds");
         assert_eq!(mapping.protocol().as_str(), "tcp");
+
+        let detach_resp = boxed
+            .detach(&DetachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("detach succeeds");
+        assert_eq!(detach_resp, DetachResponse::new());
 
         let shared: Arc<dyn NetworkPlugin> = Arc::new(StubNetworkPlugin::new());
         let delete_resp = shared
@@ -1365,6 +1507,207 @@ mod tests {
                 Protocol::Tcp,
             ))
             .expect_err("DNAT rule addition and its rollback both fail");
+        assert_eq!(err.code().as_str(), "INTERNAL");
+    }
+
+    /// 契約 9: `detach` はポート公開・veth（attach）・netns をまとめて解放し、
+    /// 解放後は同じコンテナに対して `create_netns` をやり直せる（netns が実際に
+    /// 追跡対象から外れたことの確認）。
+    #[test]
+    fn net1_detach_releases_netns_and_attachment() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("attach");
+        let resp = plugin
+            .detach(&DetachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("detach succeeds");
+        assert_eq!(resp, DetachResponse::new());
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("netns was released so it can be recreated");
+    }
+
+    /// 契約 8: netns が既に解放済み（未作成を含む）のコンテナへの 2 回目の `detach` は
+    /// `NotFound`。
+    #[test]
+    fn net1_detach_twice_is_not_found() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+        plugin
+            .detach(&DetachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("first detach succeeds");
+        let err = plugin
+            .detach(&DetachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect_err("netns was already released");
+        assert_eq!(err.code().as_str(), "NOT_FOUND");
+    }
+
+    /// 契約 8: 存在しないネットワークへの `detach` は `NotFound`。
+    #[test]
+    fn net1_detach_without_network_is_not_found() {
+        let plugin = StubNetworkPlugin::new();
+        let err = plugin
+            .detach(&DetachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect_err("network was never created");
+        assert_eq!(err.code().as_str(), "NOT_FOUND");
+    }
+
+    /// 契約 8: netns が別ネットワークに紐付いている場合の `detach` は
+    /// `FailedPrecondition`（越境解放の拒否）。
+    #[test]
+    fn net2_detach_other_network_is_failed_precondition() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create front-end network");
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                other_network_name(),
+                IpCidr::new(IpAddr::from([10, 250, 12, 1]), 24).expect("valid cidr"),
+            ))
+            .expect("create back-end network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns bound to front-end");
+        let err = plugin
+            .detach(&DetachRequest::new(
+                other_network_name(),
+                sample_container_id(),
+            ))
+            .expect_err("netns is bound to a different network");
+        assert_eq!(err.code().as_str(), "FAILED_PRECONDITION");
+    }
+
+    /// 契約 6・9: `detach` は解放対象に公開済みポートを含める（`publish_port` が
+    /// 積んだ追跡状態が `detach` 後に消える）。
+    #[test]
+    fn net4_detach_removes_published_ports() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("attach");
+        plugin
+            .publish_port(&PublishPortRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect("publish_port succeeds");
+        assert_eq!(
+            plugin
+                .published
+                .lock()
+                .expect("lock published")
+                .get(&sample_container_id())
+                .map(Vec::len),
+            Some(1)
+        );
+
+        plugin
+            .detach(&DetachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("detach succeeds");
+        assert_eq!(
+            plugin
+                .published
+                .lock()
+                .expect("lock published")
+                .get(&sample_container_id()),
+            None
+        );
+    }
+
+    /// 契約 9: `detach` は個々の解放に 1 件でも失敗すれば `Internal` を返す
+    /// （ベストエフォートで残りの解放を続ける契約であり、部分失敗も `Err` 扱い）。
+    #[test]
+    fn net3_detach_partial_failure_is_internal() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+        plugin.set_fail_detach(true);
+        let err = plugin
+            .detach(&DetachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect_err("a partial failure must surface as Err");
         assert_eq!(err.code().as_str(), "INTERNAL");
     }
 }

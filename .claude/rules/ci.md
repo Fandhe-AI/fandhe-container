@@ -20,7 +20,7 @@ make ci          # 上記 + lint-docs + deny を一括実行
 4. ベンチ回帰チェック（15% 超の悪化で fail。REPAIR-8）
 5. セキュリティチェック（`cargo deny`・禁止 API / 禁止クレート検査。REPAIR-9・MVM-4）
 
-現状の `.github/workflows/ci.yml` は lint-docs と 1・2・3・5（rust-base-ci）相当を持ち、発火条件は `workflow_dispatch`・`pull_request`・`push`（main）で稼働している（TASK-86.1・REPAIR-7）。ステージ 3（タイムアウト保護された結合試験）は `integration-test` ジョブ（3 OS matrix。実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes）が担う（TASK-86.2・#36）。4 は該当タスクで追加する。
+現状の `.github/workflows/ci.yml` は lint-docs と 1・2・5（rust-base-ci）・3（integration-test）相当を持ち、発火条件は `workflow_dispatch`・`pull_request`・`push`（main）で稼働している（TASK-86.1・REPAIR-7）。ステージ 3（タイムアウト保護された結合試験）は `integration-test` ジョブ（3 OS matrix。実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes）が担う（TASK-86.2・#36）。4 は該当タスクで追加する。
 
 ## 3 OS CI（macOS・Windows・Linux 一級対応）
 

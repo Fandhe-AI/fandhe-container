@@ -262,6 +262,10 @@ jobs:
 
       - name: 結合試験の実行（ステージ 3・タイムアウト保護。REPAIR-5 / REPAIR-7）
         timeout-minutes: 10
+        env:
+          # 前段ステップの outputs も `${{ }}` を run: へ直接埋め込まず env 経由で
+          # 受け渡す（HANG_PROBE と同じスクリプトインジェクション対策）
+          COUNT: ${{ steps.count.outputs.count }}
         run: |
           set -euo pipefail
           if [ "${HANG_PROBE}" = "true" ]; then
@@ -269,7 +273,7 @@ jobs:
             echo "hang probe test returned without timing out" >&2
             exit 1
           fi
-          if [ "${{ steps.count.outputs.count }}" = "0" ]; then
+          if [ "${COUNT}" = "0" ]; then
             echo "::notice::integration test targets: 0 (nothing to run)"
             exit 0
           fi

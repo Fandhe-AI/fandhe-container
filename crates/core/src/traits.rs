@@ -13,9 +13,9 @@
 //!
 //! 本モジュールは索引のみを持ち、実体はサブモジュールに分ける（兄弟 issue #16〜#18・
 //! TASK-4.2〜4.4 が同じファイルへ追記する際の衝突を 1 行単位に抑えるため）。
-//! `ContainerRuntime`・`StateStore` は定義済み、`NetworkPlugin`・`VolumeProvider` は
-//! #17・#18 で追加される予定であり、現時点では未定義である（REPAIR-3: 実装済みを
-//! 装わない）。
+//! `ContainerRuntime`・`StateStore`・`VolumeProvider` は定義済みで、残る `NetworkPlugin`
+//! は #17 で追加される予定であり、現時点では未定義である
+//! （REPAIR-3: 実装済みを装わない）。
 //!
 //! シグネチャは人間のアーキテクチャレビュー（#19・TASK-4.h1）前の暫定版であり、
 //! 「確認済み」の確定仕様ではない。
@@ -23,6 +23,7 @@
 pub mod container_runtime;
 pub mod state_store;
 pub mod types;
+pub mod volume_provider;
 
 pub use container_runtime::{
     ContainerRuntime, ContainerState, ContainerStatus, CreateRequest, DeleteRequest,
@@ -34,3 +35,9 @@ pub use state_store::{
     StateStore, UpdateStateRequest,
 };
 pub use types::{ContainerId, ErrorCode, TraitError};
+pub use volume_provider::{
+    AccessMode, GuestPath, HostBindPath, VolumeAttachRequest, VolumeAttachment,
+    VolumeCreateRequest, VolumeDetachRequest, VolumeDetachResponse, VolumeInfo,
+    VolumeInspectRequest, VolumeName, VolumeProvider, VolumeRemoveRequest, VolumeRemoveResponse,
+    VolumeSource,
+};

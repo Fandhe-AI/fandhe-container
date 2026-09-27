@@ -280,86 +280,246 @@ const EXPECTED_ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
     },
 ];
 
-/// TASK-15（IO-2）の FLUSH ACK 永続化条件を照合するための、単一
-/// io イベントの暫定表現（Codex レビュー指摘対応）。
+/// TASK-15（IO-2）の FLUSH ACK 永続化条件・ACK 種別区別を照合するための、
+/// 単一 io イベントの暫定表現（Codex レビュー指摘対応・2 巡目）。
 ///
-/// `persisted_before_barrier=true` のような固定文字列 1 個の一致判定では、
-/// 「FLUSH ACK を返す前に実際に永続化が完了したか」という順序関係を
-/// 検証できない（永続化未完了のまま `persisted_before_barrier=true` という
-/// 値だけを出力する回帰があっても検出できない）。そこで ACK 応答を
-/// 「イベント列」として表現し、[`flush_ack_follows_persistence`] で
-/// `PersistedBeforeBarrier` イベントが `FlushAckSent` より前に実際に
-/// 記録されていることを、列の走査により機械的に確認する。
+/// 1 巡目の修正（`PersistedBeforeBarrier` / `FlushAckSent` の 2 種のみ）には
+/// 残っていた 2 つの穴を、`generation`（バリアの通し番号）付きの 4 変種で
+/// 塞ぐ:
+///
+/// - **世代の使い捨て漏れ**: `persisted` を単一の真偽値で持つと、1 回目の
+///   バリアの永続化完了後は真のまま戻らず、2 回目以降のバリア（新たな
+///   書き込み後の再フラッシュ）に対する FLUSH ACK を無条件で正当と判定
+///   してしまう（IO-2「各バリア以前に受理した書き込みの永続化完了」という
+///   契約は世代ごとに個別に満たす必要がある）。`generation` を全イベントに
+///   持たせ、[`flush_ack_follows_persistence`] で世代ごとに厳密照合する
+///   （`generation` が一致する `PersistedBeforeBarrier` のみを有効とし、
+///   他世代の永続化完了で代用させない）
+/// - **ACK 種別の取り違え未検出**: 通常の書き込み ACK（`WriteAckSent`。
+///   永続化完了を待たずに返してよい）と FLUSH ACK（永続化完了必須）の
+///   どちらを返すべきかという区別自体を、以前は表現できなかった。
+///   `BarrierRequested` を追加し、「バリア要求に対して FLUSH ACK ではなく
+///   通常 ACK しか返らない」「バリア要求が無いのに FLUSH ACK を返す」の
+///   双方向の取り違えを [`flush_ack_follows_persistence`] で検出する
 ///
 /// io の実 API 接続後（TASK-11 / TASK-15）は、このイベント列を io の
 /// 実際の ACK 送出順序ログ・永続化完了通知に置き換える。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AckEvent {
-    /// バリア以前に発行された書き込みの永続化（fsync 相当）が完了した。
-    PersistedBeforeBarrier,
-    /// FLUSH ACK をクライアントへ送出した。
-    FlushAckSent,
+    /// クライアントが FLUSH バリアを要求した（`generation` はバリアの
+    /// 通し番号。同じ番号を持つ `PersistedBeforeBarrier` / `FlushAckSent`
+    /// と対応づける）。
+    BarrierRequested { generation: u32 },
+    /// バリア以前に発行された書き込みの永続化（fsync 相当）が、
+    /// `generation` の世代について完了した。
+    PersistedBeforeBarrier { generation: u32 },
+    /// 通常の書き込み ACK を送出した（IO-1・IO-2: 永続化完了を待たずに
+    /// 返してよい種別。FLUSH ACK とは別種別として区別する）。
+    WriteAckSent { generation: u32 },
+    /// FLUSH ACK をクライアントへ送出した（`generation` に対応する
+    /// バリア要求への応答。永続化完了後にのみ送出してよい）。
+    FlushAckSent { generation: u32 },
 }
 
-/// `events` を先頭から走査し、`FlushAckSent` が現れた時点で、それより
-/// 前に `PersistedBeforeBarrier` が記録済みであることを確認する。
+/// [`flush_ack_follows_persistence`] の判定結果。
 ///
-/// - `FlushAckSent` が一度も現れない列は判定対象がないため `false` を返す
-/// - `PersistedBeforeBarrier` を伴わない・それより後にしか永続化が記録
-///   されない `FlushAckSent` は違反として `false` を返す（PoC-12 型の
-///   「ビルドは通るが仕様未達」を、値の一致ではなく順序の観測で検出する）
-fn flush_ack_follows_persistence(events: &[AckEvent]) -> bool {
-    let mut persisted = false;
-    let mut saw_flush_ack = false;
+/// 真偽値のみの assert では「どの契約に違反したか」が失われる
+/// （[coding-rust] のテスト規約「期待値は具体値で書く」）ため、違反した
+/// 世代まで含めて表現する。
+///
+/// [coding-rust]: ../../../.claude/rules/coding-rust.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushAckVerdict {
+    /// 送出された FLUSH ACK はすべて仕様どおり（対応するバリア要求があり、
+    /// 同一世代の永続化完了後に送出された）。
+    Ok,
+    /// FLUSH ACK が一度も送出されなかった（判定対象がない。バリア要求に
+    /// 対して通常 ACK しか返らない取り違えもここに含まれる）。
+    NoFlushAck,
+    /// `generation` に対応する永続化完了より前に FLUSH ACK を送出した
+    /// （IO-2 のバリア以前の書き込み永続化契約への違反）。
+    PrematureFlushAck { generation: u32 },
+    /// 対応する `BarrierRequested` が無いのに FLUSH ACK を送出した
+    /// （通常の書き込み ACK を返すべき場面で FLUSH ACK を返す取り違え）。
+    FlushAckWithoutBarrier { generation: u32 },
+}
+
+/// `events` を先頭から走査し、各 `FlushAckSent { generation }` について
+/// 同じ `generation` の `BarrierRequested` が先行し、かつ同じ `generation`
+/// の `PersistedBeforeBarrier` が FLUSH ACK 送出より前に記録済みであること
+/// を確認する。
+///
+/// - 世代ごとに個別照合するため、他世代の永続化完了（過去に完了した
+///   世代の使い回し）では通らない（世代の使い捨て漏れの検出）
+/// - `WriteAckSent` は永続化完了の有無を問わず許容する（IO-1・IO-2 の
+///   契約差: 通常 ACK は永続化完了を待たずに返してよい）
+/// - `FlushAckSent` が一度も現れない列は [`FlushAckVerdict::NoFlushAck`]
+///   を返す（PoC-12 型の「ビルドは通るが仕様未達」を、値の一致ではなく
+///   イベント種別・順序の観測で検出する）
+fn flush_ack_follows_persistence(events: &[AckEvent]) -> FlushAckVerdict {
+    let mut requested_generations: Vec<u32> = Vec::new();
+    let mut persisted_generations: Vec<u32> = Vec::new();
+    let mut verdict = FlushAckVerdict::NoFlushAck;
+
     for event in events {
         match event {
-            AckEvent::PersistedBeforeBarrier => persisted = true,
-            AckEvent::FlushAckSent => {
-                saw_flush_ack = true;
-                if !persisted {
-                    return false;
+            AckEvent::BarrierRequested { generation } => {
+                requested_generations.push(*generation);
+            }
+            AckEvent::PersistedBeforeBarrier { generation } => {
+                persisted_generations.push(*generation);
+            }
+            AckEvent::WriteAckSent { .. } => {}
+            AckEvent::FlushAckSent { generation } => {
+                if !requested_generations.contains(generation) {
+                    return FlushAckVerdict::FlushAckWithoutBarrier {
+                        generation: *generation,
+                    };
                 }
+                if !persisted_generations.contains(generation) {
+                    return FlushAckVerdict::PrematureFlushAck {
+                        generation: *generation,
+                    };
+                }
+                verdict = FlushAckVerdict::Ok;
             }
         }
     }
-    saw_flush_ack
+
+    verdict
 }
 
 /// マッチャが TASK-15（IO-2）の FLUSH ACK 永続化条件（バリア以前の
-/// 書き込みが永続化された後にのみ FLUSH ACK を返すこと）を、ACK の
-/// 返却順序と永続化状態の観測によって機械照合できることを確認する
-/// （REPAIR-12。[`ACCEPTANCE_TARGETS`] の TASK-15 行に対応。Codex レビュー
-/// 指摘: 固定文字列 `persisted_before_barrier=true` の一致判定では
-/// 永続化前に FLUSH ACK を返す回帰を検出できないため、イベント順序を
-/// 観測する [`flush_ack_follows_persistence`] へ置き換えた）。
+/// 書き込みが永続化された後にのみ FLUSH ACK を返すこと）を、世代ごとの
+/// イベント順序の観測によって機械照合できることを確認する（REPAIR-12。
+/// [`ACCEPTANCE_TARGETS`] の TASK-15 行に対応。Codex レビュー指摘・2 巡目:
+/// 単一の真偽値 `persisted` は一度真になると戻らず 2 回目以降のバリアの
+/// FLUSH ACK を無条件で正当と判定してしまうため、`generation` 付きの
+/// 世代別照合に置き換えた）。
 ///
 /// イベント列は TASK-11 / TASK-15 で ACK フレーム型が確定するまでの暫定
 /// 表現であり、確定契約ではない（本ファイルのモジュールドキュメント
 /// 「スタブについて」を参照）。
 #[test]
 fn repair_12_scaffold_matcher_detects_premature_flush_ack() {
-    // 仕様どおり: バリア以前の書き込みが永続化済みになってから FLUSH ACK。
-    let ordered = [AckEvent::PersistedBeforeBarrier, AckEvent::FlushAckSent];
-    assert!(
+    // 仕様どおり: バリア要求 → 永続化完了 → FLUSH ACK の順。
+    let ordered = [
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::PersistedBeforeBarrier { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+    ];
+    assert_eq!(
         flush_ack_follows_persistence(&ordered),
+        FlushAckVerdict::Ok,
         "永続化後の FLUSH ACK を正当な列として受理できていない"
     );
 
-    // 仕様違反の再現 (1): 永続化イベントを伴わずに FLUSH ACK を送出する
-    // 回帰（PoC-12 型の失敗モード。値だけを見れば `persisted_before_barrier`
-    // 相当のフィールドを立てていても、実際の永続化完了イベントが無い）。
-    let missing_persistence = [AckEvent::FlushAckSent];
-    assert!(
-        !flush_ack_follows_persistence(&missing_persistence),
+    // 仕様どおり (2 世代目): 1 世代目の FLUSH ACK 後、新たな書き込みに
+    // 対する 2 世代目のバリアも、2 世代目自身の永続化完了後であれば正当。
+    let two_generations_ok = [
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::PersistedBeforeBarrier { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+        AckEvent::BarrierRequested { generation: 2 },
+        AckEvent::PersistedBeforeBarrier { generation: 2 },
+        AckEvent::FlushAckSent { generation: 2 },
+    ];
+    assert_eq!(
+        flush_ack_follows_persistence(&two_generations_ok),
+        FlushAckVerdict::Ok,
+        "2 世代目も自身の永続化完了後であれば正当と判定できていない"
+    );
+
+    // 仕様違反の再現 (1): 1 世代目の永続化完了を、2 世代目の FLUSH ACK の
+    // 根拠として使い回す回帰（世代の使い捨て漏れ。単一の真偽値
+    // `persisted` を使う旧実装はこれを検出できなかった）。
+    let stale_persistence_reused = [
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::PersistedBeforeBarrier { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+        AckEvent::BarrierRequested { generation: 2 },
+        AckEvent::FlushAckSent { generation: 2 },
+    ];
+    assert_eq!(
+        flush_ack_follows_persistence(&stale_persistence_reused),
+        FlushAckVerdict::PrematureFlushAck { generation: 2 },
+        "1 世代目の永続化完了を 2 世代目の FLUSH ACK の根拠として\
+            使い回す回帰をマッチャが検出できていない"
+    );
+
+    // 仕様違反の再現 (2): バリア要求はあるが永続化イベントを伴わずに
+    // FLUSH ACK を送出する回帰（PoC-12 型の失敗モード）。
+    let missing_persistence = [
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+    ];
+    assert_eq!(
+        flush_ack_follows_persistence(&missing_persistence),
+        FlushAckVerdict::PrematureFlushAck { generation: 1 },
         "永続化イベントを伴わない FLUSH ACK 送出をマッチャが検出できていない"
     );
 
-    // 仕様違反の再現 (2): 永続化完了が FLUSH ACK 送出より後に記録される
-    // 回帰（返却順序の違反。文字列の値一致だけでは検出できない失敗モード）。
-    let out_of_order = [AckEvent::FlushAckSent, AckEvent::PersistedBeforeBarrier];
-    assert!(
-        !flush_ack_follows_persistence(&out_of_order),
+    // 仕様違反の再現 (3): 永続化完了が FLUSH ACK 送出より後に記録される
+    // 回帰（返却順序の違反）。
+    let out_of_order = [
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+        AckEvent::PersistedBeforeBarrier { generation: 1 },
+    ];
+    assert_eq!(
+        flush_ack_follows_persistence(&out_of_order),
+        FlushAckVerdict::PrematureFlushAck { generation: 1 },
         "永続化完了より先に FLUSH ACK を送出する順序違反をマッチャが検出できていない"
+    );
+}
+
+/// マッチャが TASK-15（IO-1・IO-2）の「通常の書き込み ACK と FLUSH ACK の
+/// 種別の違い」を区別して照合できることを確認する（REPAIR-12。Codex
+/// レビュー指摘・2 巡目: 旧 `AckEvent` は永続化完了と FLUSH ACK の 2 種
+/// しか持たず、通常の書き込み ACK を表現できなかったため、両者を取り
+/// 違える実装があっても検出できなかった）。
+#[test]
+fn repair_12_scaffold_matcher_distinguishes_write_ack_from_flush_ack() {
+    // 仕様どおり: 通常の書き込み ACK は永続化完了を待たずに返してよい
+    // （IO-1・IO-2 の契約差）。その後バリア要求・永続化完了・FLUSH ACK が
+    // 続く列は正当と判定される。
+    let write_ack_before_persistence = [
+        AckEvent::WriteAckSent { generation: 1 },
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::PersistedBeforeBarrier { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+    ];
+    assert_eq!(
+        flush_ack_follows_persistence(&write_ack_before_persistence),
+        FlushAckVerdict::Ok,
+        "永続化完了前の通常書き込み ACK を不当に拒否している\
+            （IO-1・IO-2 は通常 ACK に永続化完了を要求しない）"
+    );
+
+    // 仕様違反の再現 (1): バリア要求に対して通常の書き込み ACK しか
+    // 返さない取り違え（FLUSH ACK を返すべき場面で通常 ACK を返す）。
+    let write_ack_instead_of_flush_ack = [
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::PersistedBeforeBarrier { generation: 1 },
+        AckEvent::WriteAckSent { generation: 1 },
+    ];
+    assert_eq!(
+        flush_ack_follows_persistence(&write_ack_instead_of_flush_ack),
+        FlushAckVerdict::NoFlushAck,
+        "バリア要求に対して通常書き込み ACK しか返らない取り違えを\
+            マッチャが検出できていない"
+    );
+
+    // 仕様違反の再現 (2): バリア要求が無いのに FLUSH ACK を返す取り違え
+    // （通常 ACK を返すべき場面で FLUSH ACK を返す。方向が逆の取り違え）。
+    let flush_ack_without_barrier = [
+        AckEvent::PersistedBeforeBarrier { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+    ];
+    assert_eq!(
+        flush_ack_follows_persistence(&flush_ack_without_barrier),
+        FlushAckVerdict::FlushAckWithoutBarrier { generation: 1 },
+        "バリア要求を伴わない FLUSH ACK 送出をマッチャが検出できていない"
     );
 }
 

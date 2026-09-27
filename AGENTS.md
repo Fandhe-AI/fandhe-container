@@ -39,9 +39,17 @@ make bench-check           # ベンチ回帰チェック（REPAIR-7 第 4 段階
 
 ### タイムアウト保護された結合試験・ベンチ回帰（REPAIR-5・REPAIR-8）
 
-REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された結合試験（ACK 未送信等のハング検出。推奨 5〜10 秒）は現時点で CI 未導入である。導入時は本節・`.claude/rules/ci.md` に実行コマンドと判定基準を追記する。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5）
+REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された結合試験は TASK-86.2（#36）で、(4) ベンチ回帰チェック（15% 超の悪化で fail）は TASK-86.3（#37）で、それぞれ CI 導入済み。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5）
 
-(4) ベンチ回帰チェックは `.github/workflows/ci.yml` の `bench-regression` ジョブ（ubuntu-latest 単独。3 OS matrix にはしない。理由は ci.yml のジョブコメントおよび `.claude/rules/ci.md` を参照）として導入済み（TASK-86.3）。判定基準:
+(3) の内容:
+
+- 対象: Cargo の integration test target（各 crate の `tests/*.rs`。lib 内 unit test は rust-ci / rust-ci-default-features が担うため対象外）
+- 実行コマンド: `make test-integration`（`cargo test --workspace --test '*'`。integration test target が 0 件の場合は notice を出して成功終了する。現時点では 0 件）
+- 判定基準: CI（ci.yml の `integration-test` ジョブ。3 OS matrix）は実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes でハングを検出して fail させる。テスト 1 件ごとの推奨タイムアウト値（5〜10 秒）の設定と、CI 全体のハング防止の最終確認は TASK-87 が担当する
+- ハングプローブ: `gh workflow run ci.yml --ref <branch> -f hang-probe=true` で起動する。リポ外の使い捨て crate に仕込んだハングするテストを実行し、実行ステップの timeout で 3 OS とも fail することを実証するための手動トリガー（PR・push イベントでは動かない）
+- 最初の integration test target の追加は各機能タスクが担当する。追加する差分は、実行ステップの `timeout-minutes` 内で完走することを PR 本文で確認しているか
+
+(4) の内容: `.github/workflows/ci.yml` の `bench-regression` ジョブ（ubuntu-latest 単独。3 OS matrix にはしない。理由は ci.yml のジョブコメントおよび `.claude/rules/ci.md` を参照）として導入済み（TASK-86.3）。判定基準:
 
 - ベンチ実行結果（`benches/baseline.json` と同スキーマの JSON）と基準値を `scripts/check-bench-regression.sh` で比較し、metric ごとに `direction`（`higher_is_better` / `lower_is_better`）に応じた向きで悪化率を判定する
 - 15% **超**の悪化を回帰として fail させる（ちょうど 15.0% の悪化は合格）。終了コードは `0`（合格）/ `1`（回帰検出）/ `2`（入力エラー。引数・ファイル・スキーマ不正等）の 3 値
@@ -147,4 +155,4 @@ make deny   # cargo deny --locked check advisories bans licenses sources
 | `ci.yml` の発火条件 | `ci.yml` は `workflow_dispatch`・`pull_request`・`push`（main）で稼働中（TASK-86.1・REPAIR-7）。`on:` から `pull_request` / `push` を外す変更・`pull_request_target` への変更は P1 で指摘する | P1 |
 | `ci.yml` への変更 | `ci.yml` を変更する差分では、3 OS matrix（Linux・macOS・Windows）を維持しているか、本リポに存在しない `make` ターゲット・`scripts/` を前提にしたジョブが混入していないかを確認する | P1 |
 | `release.yml` | `workflow_dispatch` 限定のプレースホルダであり、有効化には公開対象クレート・crates.io 公開方針の確定を要する。現状のプレースホルダ状態自体は指摘しない | 指摘しない（既知の暫定状態） |
-| ゲート未導入段階の追記 | REPAIR-7 の 5 段階ゲートのうち (3) タイムアウト保護された結合試験の導入時は、本書「ビルド・テスト・回帰確認コマンド」節・`.claude/rules/ci.md` の更新を伴っているか（(4) ベンチ回帰チェックは TASK-86.3 で導入済み） | P2 |
+| ゲート未導入段階の追記 | REPAIR-7 の 5 段階ゲートのうち (3) タイムアウト保護された結合試験（TASK-86.2）・(4) ベンチ回帰チェック（TASK-86.3）は導入済み。残る段階を新たに導入する際は、本書「ビルド・テスト・回帰確認コマンド」節・`.claude/rules/ci.md` の更新を伴っているか | P2 |

@@ -20,7 +20,9 @@ make ci          # 上記 + lint-docs + deny を一括実行
 4. ベンチ回帰チェック（15% 超の悪化で fail。REPAIR-8）
 5. セキュリティチェック（`cargo deny`・禁止 API / 禁止クレート検査。REPAIR-9・MVM-4）
 
-現状の `.github/workflows/ci.yml` は lint-docs・1・2・5（rust-base-ci）相当・4（`bench-regression` ジョブ）を持ち、発火条件は `workflow_dispatch`・`pull_request`・`push`（main）で稼働している（TASK-86.1・TASK-86.3・REPAIR-7）。3 は該当タスク（#36）で追加する。
+現状の `.github/workflows/ci.yml` は lint-docs・1・2・3（`integration-test` ジョブ）・4（`bench-regression` ジョブ）・5（rust-base-ci）相当のすべてを持ち、発火条件は `workflow_dispatch`・`pull_request`・`push`（main）で稼働している（TASK-86.1・TASK-86.2・TASK-86.3・REPAIR-7）。
+
+ステージ 3（タイムアウト保護された結合試験）は `integration-test` ジョブ（3 OS matrix。実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes）が担う（TASK-86.2・#36）。
 
 `bench-regression` ジョブは `make bench-check-selftest`（比較スクリプトの自己テスト）→ `make bench-check`（ベンチ実行・基準値比較）の順に実行する。現時点では `benches/benches/regression_placeholder.rs`（決定的な固定値の stub）と `benches/baseline.json`（`placeholder: true` の暫定値）で動作確認する段階にあり、実測を伴う本物のベンチ・基準値への置き換えはそれぞれ TASK-113・TASK-88 で行う。
 

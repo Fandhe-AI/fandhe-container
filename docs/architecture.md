@@ -3,9 +3,9 @@
 crate 境界・依存方向・実装コードを持たない確定済み設計判断への索引となる文書（REPAIR-3）。個々の crate の責務・PLUG-1 区分の確定一覧は [crate-naming.md](design/crate-naming.md) を正とし、本書ではそれを層構造・依存方向の観点で要約する。
 
 - 作成日: 2026-09-27
-- 関連 issue: #21（TASK-6）・#22（TASK-6.1・本書）・#23（TASK-6.2）・#24（TASK-6.h1）
+- 関連 issue: #21（TASK-6）・#22（TASK-6.1・本書）・#23（TASK-6.2）・#24（TASK-6.h1）・#30（TASK-72）
 - ステータス: #24（TASK-6.h1）で内容レビュー承認待ち
-- 対象ビヘイビア: REPAIR-3・PLUG-1（crate 分割の前提として REPAIR-1 も参照）
+- 対象ビヘイビア: REPAIR-3・PLUG-1（crate 分割の前提として REPAIR-1 も参照）・WIN-6
 - 対象マイルストーン: MS-0
 
 spec（`docs/spec/04-behavior/`）と本書の記述が食い違う場合は spec を正とする（[spec-reference](../.claude/rules/spec-reference.md)）。
@@ -201,12 +201,23 @@ D-14（方針追記 2）に基づく core / plugin の割り付け表を以下�
 - DNS ヘルパー・rootless ネットワーク転送（行）は `検討中（未確定）` であり、D-14 原則の例外とするかは未確定である
 - GPU-5・7・8・9 は境界表に明示判定がない（[crate-naming.md](design/crate-naming.md) 注 1 を参照）
 
+## Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）
+
+MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である。その上で、以下の 2 方式については MVP スコープを次のとおり判断する。
+
+- **Windows ネイティブコンテナ**（Windows Server ベースイメージ専用のコンテナ実行）は、本プロジェクトの主目的である「OCI 準拠 Linux コンテナ実行基盤」とは別カテゴリの技術であり、**MVP の射程外**とする
+- **Hyper-V 直接方式**（WHP〔Windows Hypervisor Platform〕API 経由で VMM をフルスクラッチ実装する経路）は、将来の強い分離オプションとして**設計上は残すが MVP には実装しない**。これは microVM の 3 OS 展開方針（`api-microvm.md` MVM-5。本書「確定済み設計判断」節を参照）で Windows（WHP）を将来オプションと位置づけているのと同系統の扱いである。ただし、この方式を実装する場合の crate 配置（`microvm` 系統に含めるか等）は [crate-naming.md](design/crate-naming.md) に現時点で明示判定がなく、MVM-5 の本書追記を担う TASK-78 側で確定する事項であり、本節では断定しない
+
+根拠は PoC-4 の机上検証であり、実機性能計測ではない点に注意する（`README.md` 記載の PoC 位置づけと同様）。
+
+出典: `docs/spec/04-behavior/api-platform-windows.md`（submodule リビジョン `2241961`）の `WIN-6`。
+
 ## 確定済み設計判断（実装コードを持たないもの）
 
 | ID | 要約 | spec 出典 | 本リポ側の詳細 |
 | -- | ---- | --------- | --------------- |
 | CRI-8 | オーケストレーション本体（スケジューラ・マルチノード調整）は MVP 対象外とし、4 つの拡張点トレイトの設計のみを MVP に含める | `api-cri.md` | [orchestration-scope.md](design/orchestration-scope.md)（TASK-5・#20） |
-| WIN-6 | Windows ネイティブコンテナは MVP の射程外。Hyper-V 直接方式は将来の強分離オプションとして設計上残す | `api-platform-windows.md` | 本書へ TASK-72 で追記予定 |
+| WIN-6 | Windows ネイティブコンテナは MVP の射程外。Hyper-V 直接方式は将来の強分離オプションとして設計上残す | `api-platform-windows.md` | 本書「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節を参照 |
 | MAC-4 | 既定は常駐 VM＋軽量プロセス分離とし、1 コンテナ = 1 VM はオプション扱いとする | `api-platform-macos.md` | `docs/design/macos-vm-strategy.md`（TASK-66 で作成予定） |
 | MVM-5 | microVM の 3 OS 展開は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、Windows（WHP）は将来オプションとする | `api-microvm.md` | 本書へ TASK-78 で追記予定 |
 | REPAIR-11 | モデル規模で自己補修の可否を一律禁止せず、ハーネス（REPAIR-7・REPAIR-12）を通過した変更のみ採用する | `ai-self-repair.md` | [small-model-repair-policy.md](design/small-model-repair-policy.md)（TASK-92。当該メモ自体は #44〔TASK-92.h1〕で再承認待ち） |
@@ -214,4 +225,4 @@ D-14（方針追記 2）に基づく core / plugin の割り付け表を以下�
 
 ## 見直し
 
-REPAIR-3・PLUG-1、または [crate-naming.md](design/crate-naming.md) が更新されたら本書も追従する。`plugin-system.md` の境界表が更新されたら「core / plugin 境界（PLUG-1）」節も追従する。依存を追加した際は「依存関係グラフ」節の「現状」を更新する。
+REPAIR-3・PLUG-1、または [crate-naming.md](design/crate-naming.md) が更新されたら本書も追従する。`plugin-system.md` の境界表が更新されたら「core / plugin 境界（PLUG-1）」節も追従する。`api-platform-windows.md` の `WIN-6` が更新されたら「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節も追従する。依存を追加した際は「依存関係グラフ」節の「現状」を更新する。

@@ -813,6 +813,32 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
+    /// [`StubNetworkPlugin::create_netns`] が netns 名を決定的に導出するための
+    /// 変換規則（テスト用スタブ限定。P1 修正）。
+    ///
+    /// 実際の plugin 実装が netns 名を `ContainerId` からどう導出するかは
+    /// 人間のアーキテクチャレビュー（#19・TASK-4.h1）で確定する未確定事項であり、
+    /// ここでの規則はスタブの契約テストを通すためだけの仮のものである
+    /// （REPAIR-3: 実装済みを装わない）。`ContainerId` が許すが [`NetnsName`] では
+    /// 許可されない文字（`.`・`_`）を `-` に置換し、`"netns-"` 接頭辞を付けたうえで
+    /// [`IDENTIFIER_MAX_LEN`] に収まるよう切り詰める。置換後の文字はすべて
+    /// `[A-Za-z0-9-]`（`ContainerId` の文字集合の部分集合）に限られ、接頭辞が
+    /// 英字で始まるため、[`NetnsName::new`] の検証には理論上常に通る
+    /// （`Result` を返す形は保つが、`unwrap`/`expect` で panic させないための
+    /// 契約として `?` で伝播する）。長い `ContainerId` は切り詰めにより衝突しうるが、
+    /// これはスタブの仮規則の既知の限界であり、本番の導出規則は #19 で確定する。
+    fn derive_netns_name(container: &ContainerId) -> Result<NetnsName, TraitError> {
+        const PREFIX: &str = "netns-";
+        let sanitized: String = container
+            .as_str()
+            .chars()
+            .map(|c| if c == '.' || c == '_' { '-' } else { c })
+            .collect();
+        let available = IDENTIFIER_MAX_LEN.saturating_sub(PREFIX.len());
+        let truncated: String = sanitized.chars().take(available).collect();
+        NetnsName::new(format!("{PREFIX}{truncated}"))
+    }
+
     /// テスト専用の契約検証スタブ実装（dyn 互換性・契約 6〜9 の失敗条件を確認するため
     /// のみに使う）。トレイト doc の契約 4「本 crate にはこのトレイトの実装を置かない」
     /// は本番実装を core に置かないという方針であり、`#[cfg(test)]` 配下のみに存在する
@@ -828,8 +854,16 @@ mod tests {
         /// コンテナごとに公開済みのポート（[`NetworkPlugin::detach`] が解放対象を
         /// 追跡し、[`NetworkPlugin::publish_port`] が積む）。
         published: Mutex<HashMap<ContainerId, Vec<PortMapping>>>,
+        /// ネットワーク本体の削除（`networks` からの除去）だけを失敗させる
+        /// （契約 9。配下の netns・attach・公開ポートの回収は成功する前提）。
         fail_delete: AtomicBool,
+        /// DNAT ルール追加後の失敗を注入する（契約 6）。
         fail_publish_port: AtomicBool,
+        /// `fail_publish_port` が立っている間、追加済みルールの撤回自体も
+        /// 失敗させるかどうか。`false`（既定）なら撤回は成功する。
+        fail_publish_port_rollback: AtomicBool,
+        /// netns の解放だけを失敗させる（契約 9。公開ポート・attach の解放は
+        /// 成功する前提）。
         fail_detach: AtomicBool,
     }
 
@@ -842,24 +876,39 @@ mod tests {
                 published: Mutex::new(HashMap::new()),
                 fail_delete: AtomicBool::new(false),
                 fail_publish_port: AtomicBool::new(false),
+                fail_publish_port_rollback: AtomicBool::new(false),
                 fail_detach: AtomicBool::new(false),
             }
         }
 
         /// [`NetworkPlugin::delete_network`] の次回呼び出しを契約 9 の
-        /// 「1 件でも失敗があれば `Err`」経路へ強制するためのスイッチ。
+        /// 「1 件でも失敗があれば `Err`」経路へ強制するためのスイッチ。ネットワーク
+        /// 本体の削除のみを失敗させ、配下の netns・attach・公開ポートは回収済みの
+        /// ままにする（残存資源はネットワークエントリ自体になる）。
         fn set_fail_delete(&self, fail: bool) {
             self.fail_delete.store(fail, Ordering::SeqCst);
         }
 
         /// [`NetworkPlugin::publish_port`] の次回呼び出しを契約 6 の
-        /// 「DNAT ルール追加後に失敗し、撤回にも失敗する」経路へ強制するためのスイッチ。
+        /// 「DNAT ルール追加後に失敗する」経路へ強制するためのスイッチ。撤回が
+        /// 成功するか失敗するかは [`Self::set_fail_publish_port_rollback`] で選ぶ。
         fn set_fail_publish_port(&self, fail: bool) {
             self.fail_publish_port.store(fail, Ordering::SeqCst);
         }
 
+        /// [`Self::set_fail_publish_port`] で失敗を注入している間、追加済み DNAT
+        /// ルールの撤回自体も失敗させるかどうかを切り替える。`true` にすると
+        /// 契約 6 の「撤回にも失敗した場合」経路（残存資源あり）を再現し、
+        /// `false`（既定）なら撤回に成功する経路（残存資源なし）を再現する。
+        fn set_fail_publish_port_rollback(&self, fail: bool) {
+            self.fail_publish_port_rollback
+                .store(fail, Ordering::SeqCst);
+        }
+
         /// [`NetworkPlugin::detach`] の次回呼び出しを契約 9 の
-        /// 「1 件でも失敗があれば `Err`」経路へ強制するためのスイッチ。
+        /// 「1 件でも失敗があれば `Err`」経路へ強制するためのスイッチ。netns の
+        /// 解放のみを失敗させ、公開ポート・attach の解放は成功させる（残存資源は
+        /// netns 自体になる）。
         fn set_fail_detach(&self, fail: bool) {
             self.fail_detach.store(fail, Ordering::SeqCst);
         }
@@ -893,9 +942,13 @@ mod tests {
                     "netns already exists for this container",
                 ));
             }
+            // P1 修正: 名前の導出を `netns.insert` より前に行う。導出（外部入力である
+            // `ContainerId` からの変換）が失敗しても追跡状態を汚さないようにするため
+            // （旧実装は insert 後に `.expect` しており、59 バイト以上の
+            // `ContainerId` や `.`・`_` を含む `ContainerId` で panic し、かつ
+            // netns が「作成済み」として残る不整合を招いていた）。
+            let name = derive_netns_name(req.container())?;
             netns.insert(req.container().clone(), req.network().clone());
-            let name = NetnsName::new(format!("netns-{}", req.container().as_str()))
-                .expect("stub container ids are valid netns name suffixes");
             Ok(NetnsStatus::new(req.container().clone(), name))
         }
 
@@ -952,16 +1005,6 @@ mod tests {
                     "container is attached to a different network",
                 ));
             }
-            // 契約 6: DNAT ルール追加後に失敗した場合は追加済みのルールを撤回してから
-            // `Err` を返し、撤回にも失敗すれば `Internal` を返す。このスタブは
-            // `set_fail_publish_port` が立っている間、ルールを積まずに撤回済み相当の
-            // 状態のまま `Internal` を返すことでその経路を模擬する。
-            if self.fail_publish_port.load(Ordering::SeqCst) {
-                return Err(TraitError::new(
-                    ErrorCode::Internal,
-                    "failed to add DNAT rule and rollback also failed",
-                ));
-            }
             let mapping = PortMapping::new(
                 req.network().clone(),
                 req.container().clone(),
@@ -969,6 +1012,50 @@ mod tests {
                 req.container_port(),
                 req.protocol(),
             );
+            // 契約 6: DNAT ルール追加後に失敗した場合は追加済みのルールを撤回してから
+            // `Err` を返し、撤回にも失敗すれば `Internal` を返して message に残存資源を
+            // 含める。このスタブは `set_fail_publish_port` が立っている間、まず
+            // ルール相当の状態（`published`）を実際に積んでから撤回を試みることで、
+            // 「追加後に失敗する」契約 6 の経路を忠実に模擬する（旧実装はルールを
+            // 一切積まなかったため、撤回対象の状態そのものが存在しなかった）。
+            if self.fail_publish_port.load(Ordering::SeqCst) {
+                self.published
+                    .lock()
+                    .expect("lock published")
+                    .entry(req.container().clone())
+                    .or_default()
+                    .push(mapping.clone());
+                if self.fail_publish_port_rollback.load(Ordering::SeqCst) {
+                    // 撤回にも失敗: 資源を残したまま Err を返し、message に残存資源を
+                    // 含める（契約 6 の後段）。
+                    return Err(TraitError::new(
+                        ErrorCode::Internal,
+                        format!(
+                            "failed to add DNAT rule and rollback also failed; \
+                             residual rule host_port={} container_port={} protocol={}",
+                            mapping.host_port(),
+                            mapping.container_port(),
+                            mapping.protocol().as_str()
+                        ),
+                    ));
+                }
+                // 撤回に成功: 直前に積んだルールを取り除き、追加前の状態へ戻してから
+                // `Err` を返す（契約 6 の前段。エラーコードは doc がこの分岐に固有の
+                // コードを定めていないため、契約 9 の削除失敗と同じ `Internal` を
+                // 代表値として用いる）。
+                let mut published = self.published.lock().expect("lock published");
+                if let Some(list) = published.get_mut(req.container()) {
+                    list.pop();
+                    if list.is_empty() {
+                        published.remove(req.container());
+                    }
+                }
+                drop(published);
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to add DNAT rule; rolled back successfully",
+                ));
+            }
             // `detach` が解放対象として追跡できるよう、公開済みポートを積んでおく。
             self.published
                 .lock()
@@ -1000,8 +1087,11 @@ mod tests {
                 ));
             }
             // 契約 9: ポート公開 → veth（attached）→ netns の逆順にベストエフォートで
-            // 解放する。個々の解放に失敗しても残りの解放を続け、1 件でも失敗があれば
-            // `Internal` を返す。
+            // 解放する。公開ポート・attach の解放は常に成功させ、netns の解放だけを
+            // `fail_detach` で失敗させられるようにする。個々の解放に失敗しても残りの
+            // 解放は続け（ここでは既に完了済み）、1 件でも失敗があれば `Internal` を
+            // 返して message に残存資源を含める。netns エントリは解放に失敗した場合
+            // 追跡状態に残し（残存資源）、次回の呼び出しで再試行できるようにする。
             self.published
                 .lock()
                 .expect("lock published")
@@ -1010,14 +1100,15 @@ mod tests {
                 .lock()
                 .expect("lock attached")
                 .remove(req.container());
-            netns.remove(req.container());
-            drop(netns);
             if self.fail_detach.load(Ordering::SeqCst) {
+                drop(netns);
                 return Err(TraitError::new(
                     ErrorCode::Internal,
-                    "failed to release one or more tracked resources",
+                    "failed to release one or more tracked resources: residual netns",
                 ));
             }
+            netns.remove(req.container());
+            drop(netns);
             Ok(DetachResponse::new())
         }
 
@@ -1025,21 +1116,13 @@ mod tests {
             &self,
             req: &DeleteNetworkRequest,
         ) -> Result<DeleteNetworkResponse, TraitError> {
-            // 契約 9: 部分失敗を注入する場合、doc が保証するのは「1 件でも失敗があれば
-            // Err」であって、内部でどこまで削除が進んだかは呼び出し側から観測できない
-            // （plugin 実装依存）。このスタブは fail_delete が立っている間は追跡状態を
-            // 一切変更せずに Err を返すことで、doc と矛盾しない最も単純な失敗経路を
-            // 表現する。
-            if self.fail_delete.load(Ordering::SeqCst) {
-                return Err(TraitError::new(
-                    ErrorCode::Internal,
-                    "failed to delete one or more tracked resources",
-                ));
-            }
             // トレイト doc（delete_network）: 「そのネットワークに create_netns（紐付け）・
             // attach のいずれかで関連付けたもの」を削除対象として回収する。ネットワーク名の
             // 一致で netns を洗い出し、紐づく attach・公開済みポートもまとめて削除する
-            // （他ネットワークの資源には触れない）。
+            // （他ネットワークの資源には触れない）。この回収はネットワーク本体の削除に
+            // 先立って行い、契約 9 の「個々の削除に失敗しても残りの削除を続ける」を
+            // 体現する（配下資源の回収は常に成功する前提とし、続くネットワーク本体の
+            // 削除だけを `fail_delete` で失敗させられるようにする）。
             let name = req.name().clone();
             let mut netns = self.netns.lock().expect("lock netns");
             let mut attached = self.attached.lock().expect("lock attached");
@@ -1057,6 +1140,18 @@ mod tests {
             drop(netns);
             drop(attached);
             drop(published);
+            // 契約 9: ネットワーク本体（bridge・nft テーブル相当）の削除に失敗した場合、
+            // 配下資源は既に回収済みのため、残存資源は `networks` のエントリ自体になる。
+            // message にその旨を含め、`networks` からは除去せずに `Err` を返す
+            // （呼び出し側が同じネットワーク名で削除を再試行できるようにするため）。
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "failed to delete one or more tracked resources: residual network {name}"
+                    ),
+                ));
+            }
             self.networks.lock().expect("lock networks").remove(&name);
             Ok(DeleteNetworkResponse::new())
         }
@@ -1342,6 +1437,52 @@ mod tests {
         assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
     }
 
+    /// P1 修正: `derive_netns_name` は `.`・`_` を含む有効な `ContainerId` を
+    /// panic せず決定的に変換する（旧実装は `netns.insert` 後に `.expect` しており、
+    /// この入力で panic していた）。
+    #[test]
+    fn net1_derive_netns_name_replaces_dots_and_underscores() {
+        let container = ContainerId::new("web.1_test").expect("valid container id");
+        let name = derive_netns_name(&container).expect("derivation must not fail");
+        assert_eq!(name.as_str(), "netns-web-1-test");
+    }
+
+    /// P1 修正: `derive_netns_name` は `IDENTIFIER_MAX_LEN`（64 バイト）を超える長さの
+    /// `ContainerId` でも panic せず、`"netns-"` 接頭辞込みで上限内に切り詰めた
+    /// 具体値を返す（旧実装は境界検証なしに文字列連結するだけだったため、
+    /// 59 バイト以上の `ContainerId` で `NetnsName::new` の長さ検証に落ちて
+    /// `.expect` が panic していた）。
+    #[test]
+    fn net1_derive_netns_name_truncates_long_container_id() {
+        let long_id = "a".repeat(200);
+        let container = ContainerId::new(long_id.clone()).expect("valid container id");
+        let name = derive_netns_name(&container).expect("derivation must not fail");
+        let expected = format!("netns-{}", "a".repeat(58));
+        assert_eq!(name.as_str(), expected);
+        assert_eq!(name.as_str().len(), 64);
+    }
+
+    /// P1 修正: `create_netns` は `.`・`_` を含む長い `ContainerId` でも panic せず
+    /// `Ok` を返し、`NetnsStatus::name()` が導出規則どおりの具体値になる
+    /// （名前導出は `netns.insert` より前に行われるため、導出に成功した場合のみ
+    /// 状態が変化する契約が保たれる）。
+    #[test]
+    fn net1_create_netns_does_not_panic_for_dotted_or_long_container_id() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+
+        let dotted = ContainerId::new("web.1_test").expect("valid container id");
+        let status = plugin
+            .create_netns(&CreateNetnsRequest::new(sample_network_name(), dotted))
+            .expect("create_netns must not panic for a valid ContainerId with '.' and '_'");
+        assert_eq!(status.name().as_str(), "netns-web-1-test");
+    }
+
     /// 契約 8: 存在しないネットワークへの `attach` は `NotFound`。
     #[test]
     fn net1_attach_without_network_is_not_found() {
@@ -1486,10 +1627,14 @@ mod tests {
         assert_eq!(err.code().as_str(), "FAILED_PRECONDITION");
     }
 
-    /// 契約 9: `delete_network` は個々の削除に 1 件でも失敗すれば `Internal` を返す
-    /// （ベストエフォートで残りの削除を続ける契約であり、部分失敗も `Err` 扱い）。
+    /// 契約 9: `delete_network` はネットワーク本体の削除に失敗すれば `Internal` を
+    /// 返し、message に残存資源（ネットワーク名）を含める。配下の netns は
+    /// ベストエフォートの回収が先に成功しているため削除済みのままだが、
+    /// ネットワーク自体は `networks` に残り、同名での再作成が `AlreadyExists` に
+    /// なることで残存を確認できる（P1 修正: 旧実装は失敗注入時に状態を一切
+    /// 変更しておらず、契約 9 が要求する「残存資源」を再現できていなかった）。
     #[test]
-    fn net3_delete_network_partial_failure_is_internal() {
+    fn net3_delete_network_partial_failure_leaves_network_residual() {
         let plugin = StubNetworkPlugin::new();
         plugin
             .create_network(&CreateNetworkRequest::new(
@@ -1497,11 +1642,54 @@ mod tests {
                 sample_subnet(),
             ))
             .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
         plugin.set_fail_delete(true);
+
         let err = plugin
             .delete_network(&DeleteNetworkRequest::new(sample_network_name()))
             .expect_err("a partial failure must surface as Err");
         assert_eq!(err.code().as_str(), "INTERNAL");
+        assert!(
+            err.message().contains("residual network"),
+            "message must name the residual resource: {}",
+            err.message()
+        );
+
+        // 配下の netns はベストエフォートの回収で既に削除済み（残存資源ではない）。
+        assert_eq!(
+            plugin
+                .netns
+                .lock()
+                .expect("lock netns")
+                .get(&sample_container_id()),
+            None
+        );
+        // ネットワーク本体は削除に失敗したため `networks` に残っている
+        // （残存資源）。同名の再作成が `AlreadyExists` になることでも確認できる。
+        let err = plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect_err("the network entry itself must still be tracked as residual");
+        assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
+
+        // 失敗注入を解除して再試行すると、残存していたネットワークも削除できる。
+        plugin.set_fail_delete(false);
+        plugin
+            .delete_network(&DeleteNetworkRequest::new(sample_network_name()))
+            .expect("retry succeeds once the failure is no longer injected");
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("network can be recreated once fully deleted");
     }
 
     /// `delete_network` のメソッド doc「そのネットワークに create_netns（紐付け）・
@@ -1587,10 +1775,13 @@ mod tests {
         assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
     }
 
-    /// 契約 6: `publish_port` は DNAT ルール追加後に失敗した場合、撤回にも失敗すれば
-    /// `Internal` を返す。
+    /// 契約 6 の後段: `publish_port` は DNAT ルール追加後に失敗し、撤回にも失敗した
+    /// 場合、`Internal` を返し message に残存資源（ホスト側・コンテナ側ポート）を
+    /// 含める。実際に `published` へルールが積まれた状態のまま残ることを具体値で
+    /// 検証する（P1 修正: 旧実装はルールを一切積まなかったため、撤回対象の状態も
+    /// 残存資源も再現できていなかった）。
     #[test]
-    fn net4_publish_port_partial_failure_rolls_back() {
+    fn net4_publish_port_partial_failure_rollback_fails_leaves_residual() {
         let plugin = StubNetworkPlugin::new();
         plugin
             .create_network(&CreateNetworkRequest::new(
@@ -1611,6 +1802,8 @@ mod tests {
             ))
             .expect("attach");
         plugin.set_fail_publish_port(true);
+        plugin.set_fail_publish_port_rollback(true);
+
         let err = plugin
             .publish_port(&PublishPortRequest::new(
                 sample_network_name(),
@@ -1621,6 +1814,96 @@ mod tests {
             ))
             .expect_err("DNAT rule addition and its rollback both fail");
         assert_eq!(err.code().as_str(), "INTERNAL");
+        assert!(
+            err.message().contains("host_port=8080") && err.message().contains("container_port=80"),
+            "message must name the residual rule: {}",
+            err.message()
+        );
+
+        let published = plugin.published.lock().expect("lock published");
+        let residual = published
+            .get(&sample_container_id())
+            .expect("the failed-to-roll-back rule must remain tracked");
+        assert_eq!(residual.len(), 1);
+        assert_eq!(
+            residual[0],
+            PortMapping::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            )
+        );
+    }
+
+    /// 契約 6 の前段: `publish_port` は DNAT ルール追加後に失敗しても、撤回に成功
+    /// すれば追加前の状態（`published` にエントリなし）へ戻したうえで `Err` を返す。
+    /// エラーコードは doc がこの分岐に固有のコードを定めていないため、契約 9 の
+    /// 削除失敗と同じ `Internal` を代表値として用いる（このスタブの選択であり、
+    /// 新しい契約を追加するものではない）。
+    #[test]
+    fn net4_publish_port_partial_failure_rollback_succeeds_clears_residual() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("attach");
+        plugin.set_fail_publish_port(true);
+        // set_fail_publish_port_rollback は既定で false（撤回は成功する）。
+
+        let err = plugin
+            .publish_port(&PublishPortRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect_err("DNAT rule addition fails but rollback succeeds");
+        assert_eq!(err.code().as_str(), "INTERNAL");
+        assert!(
+            err.message().contains("rolled back successfully"),
+            "message must indicate the rollback outcome: {}",
+            err.message()
+        );
+
+        // 撤回成功: 追加前の状態（エントリなし）へ戻っている。
+        assert_eq!(
+            plugin
+                .published
+                .lock()
+                .expect("lock published")
+                .get(&sample_container_id()),
+            None
+        );
+
+        // 失敗注入を解除して再試行すると、通常どおり公開できる。
+        plugin.set_fail_publish_port(false);
+        let mapping = plugin
+            .publish_port(&PublishPortRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect("retry succeeds once the failure is no longer injected");
+        assert_eq!(mapping.host_port().get(), 8080);
     }
 
     /// 契約 9: `detach` はポート公開・veth（attach）・netns をまとめて解放し、
@@ -1797,10 +2080,14 @@ mod tests {
         );
     }
 
-    /// 契約 9: `detach` は個々の解放に 1 件でも失敗すれば `Internal` を返す
-    /// （ベストエフォートで残りの解放を続ける契約であり、部分失敗も `Err` 扱い）。
+    /// 契約 9: `detach` は netns の解放に失敗すれば `Internal` を返し、message に
+    /// 残存資源（netns）を含める。公開ポート・attach の解放はベストエフォートで
+    /// 先に成功しているため削除済みのままだが、netns だけが追跡状態に残る
+    /// （P1 修正: 旧実装は失敗注入前に netns も含めてすべて削除していたため、
+    /// 契約 9 が要求する「残存資源」を再現できていなかった）。失敗注入を解除すると
+    /// 同じ要求で再試行でき、残っていた netns も最終的に解放される。
     #[test]
-    fn net3_detach_partial_failure_is_internal() {
+    fn net3_detach_partial_failure_leaves_netns_residual() {
         let plugin = StubNetworkPlugin::new();
         plugin
             .create_network(&CreateNetworkRequest::new(
@@ -1814,7 +2101,23 @@ mod tests {
                 sample_container_id(),
             ))
             .expect("create netns");
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("attach");
+        plugin
+            .publish_port(&PublishPortRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect("publish_port succeeds");
         plugin.set_fail_detach(true);
+
         let err = plugin
             .detach(&DetachRequest::new(
                 sample_network_name(),
@@ -1822,5 +2125,54 @@ mod tests {
             ))
             .expect_err("a partial failure must surface as Err");
         assert_eq!(err.code().as_str(), "INTERNAL");
+        assert!(
+            err.message().contains("residual netns"),
+            "message must name the residual resource: {}",
+            err.message()
+        );
+
+        // ベストエフォートで先に解放される公開ポート・attach は既に消えている。
+        assert_eq!(
+            plugin
+                .published
+                .lock()
+                .expect("lock published")
+                .get(&sample_container_id()),
+            None
+        );
+        assert_eq!(
+            plugin
+                .attached
+                .lock()
+                .expect("lock attached")
+                .get(&sample_container_id()),
+            None
+        );
+        // netns だけが残存資源として追跡され続ける。
+        assert_eq!(
+            plugin
+                .netns
+                .lock()
+                .expect("lock netns")
+                .get(&sample_container_id()),
+            Some(&sample_network_name())
+        );
+
+        // 失敗注入を解除して再試行すると、残っていた netns も解放される。
+        plugin.set_fail_detach(false);
+        plugin
+            .detach(&DetachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("retry succeeds once the failure is no longer injected");
+        assert_eq!(
+            plugin
+                .netns
+                .lock()
+                .expect("lock netns")
+                .get(&sample_container_id()),
+            None
+        );
     }
 }

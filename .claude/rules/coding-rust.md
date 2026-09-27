@@ -32,7 +32,13 @@
 ## unsafe・FFI・syscall
 
 - `unsafe` は原則禁止。syscall・ioctl・FFI 境界（objc2・Win32）で必要な場合のみ、`// SAFETY:` コメントで理由と維持すべき不変条件を明記する
-- `unsafe` の新規追加はユーザー承認を得る（レビューで P0 として扱う）
+- 事前承認の範囲（オーナー決定 2026-09-27〔[#4](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856057084)・[範囲限定](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856167174)〕）: 各 crate の `sys` モジュール（`src/sys.rs` または `src/sys/` 配下）に置いた syscall・ioctl・FFI（objc2・Win32 を含む）の薄いラッパーの新規 `unsafe` は、以下の条件をすべて満たせば個別承認なしで追加できる:
+  - ラッパーは安全な API を上位へ公開し、`unsafe` を `sys` モジュールの外へ漏らさない（`unsafe fn` を `sys` の外へ公開しない）
+  - 上記の `// SAFETY:` で理由と維持すべき不変条件を明記する
+  - security-auditor 観点（分離・特権・メモリ安全）のレビューを通す
+  - PR 本文に unsafe 箇所の一覧（ファイル・行）・security-auditor 観点のレビューの実施記録（確認した不変条件と指摘への対応）・上記承認コメントへのリンクを記載する
+  - 条件不備はレビューで P0 として扱う
+- `sys` モジュールの外の `unsafe`（境界処理であっても）・性能目的の `unsafe` など事前承認の範囲外のものは、従来どおり 1 件ずつユーザー承認を得る（未承認は P0）
 - syscall 番号・構造体レイアウトのアーキテクチャ差（x86_64 / aarch64）は `cfg(target_arch = ...)` で扱い、定数を流用しない
 
 ## クロスプラットフォーム（macOS・Windows・Linux の 3 OS 一級対応）

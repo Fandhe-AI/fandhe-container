@@ -331,62 +331,139 @@ enum AckEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlushAckVerdict {
     /// 送出された FLUSH ACK はすべて仕様どおり（対応するバリア要求があり、
-    /// 同一世代の永続化完了後に送出された）。
+    /// 同一世代の永続化完了後に送出された）。バリア要求した全世代について
+    /// 対応する FLUSH ACK が揃っている場合にのみこの verdict になる
+    /// （Codex レビュー指摘・3 巡目: 一部世代だけ判定して他世代の応答欠落を
+    /// 見逃さないよう、全世代を走査し終えてから確定する）。
     Ok,
-    /// FLUSH ACK が一度も送出されなかった（判定対象がない。バリア要求に
-    /// 対して通常 ACK しか返らない取り違えもここに含まれる）。
+    /// FLUSH ACK が一度も送出されなかった（判定対象がない）、または
+    /// `BarrierRequested` した世代のうち少なくとも 1 つに対応する
+    /// `FlushAckSent` が最後まで現れなかった（バリア要求に対して通常 ACK
+    /// しか返らない取り違えもここに含まれる）。
     NoFlushAck,
-    /// `generation` に対応する永続化完了より前に FLUSH ACK を送出した
-    /// （IO-2 のバリア以前の書き込み永続化契約への違反）。
+    /// `generation` に対応する永続化完了（同一世代の `BarrierRequested`
+    /// より後に記録された `PersistedBeforeBarrier`）より前に FLUSH ACK を
+    /// 送出した（IO-2 のバリア以前の書き込み永続化契約への違反。バリア
+    /// 要求より前に記録された古い永続化通知の使い回しもここに含まれる）。
     PrematureFlushAck { generation: u32 },
     /// 対応する `BarrierRequested` が無いのに FLUSH ACK を送出した
     /// （通常の書き込み ACK を返すべき場面で FLUSH ACK を返す取り違え）。
     FlushAckWithoutBarrier { generation: u32 },
 }
 
-/// `events` を先頭から走査し、各 `FlushAckSent { generation }` について
-/// 同じ `generation` の `BarrierRequested` が先行し、かつ同じ `generation`
-/// の `PersistedBeforeBarrier` が FLUSH ACK 送出より前に記録済みであること
-/// を確認する。
+/// 世代ごとの `flush_ack_follows_persistence` 内部状態。
+///
+/// - `requested`: この世代の `BarrierRequested` を観測済みか
+/// - `persisted_after_request`: `requested` になった後に観測した
+///   `PersistedBeforeBarrier` があるか（`requested` より前に記録された
+///   ものは数えない。Codex レビュー指摘・3 巡目: バリア要求前の永続化
+///   通知を後続のバリアの根拠として使い回す取り違えを検出するため）
+/// - `flush_ack_sent`: この世代の `FlushAckSent` を観測済みか
+#[derive(Debug, Clone, Copy, Default)]
+struct GenerationState {
+    requested: bool,
+    persisted_after_request: bool,
+    flush_ack_sent: bool,
+}
+
+/// `generation` に対応する状態を `states` から探し、無ければ `order` に
+/// 記録した上で既定状態を追加する（世代の初出順を保つための補助）。
+fn generation_state_mut<'a>(
+    states: &'a mut Vec<(u32, GenerationState)>,
+    order: &mut Vec<u32>,
+    generation: u32,
+) -> &'a mut GenerationState {
+    if !states.iter().any(|(g, _)| *g == generation) {
+        order.push(generation);
+        states.push((generation, GenerationState::default()));
+    }
+    &mut states
+        .iter_mut()
+        .find(|(g, _)| *g == generation)
+        .expect("直前に存在を保証したエントリが見つからない")
+        .1
+}
+
+/// `events` を先頭から走査し、`BarrierRequested` した各世代について、
+/// 同じ世代の `FlushAckSent` が「バリア要求後に記録された同世代の
+/// `PersistedBeforeBarrier`」より後に送出されていることを世代ごとに
+/// 個別照合する。
 ///
 /// - 世代ごとに個別照合するため、他世代の永続化完了（過去に完了した
 ///   世代の使い回し）では通らない（世代の使い捨て漏れの検出）
+/// - `PersistedBeforeBarrier` は同世代の `BarrierRequested` より後に
+///   記録されたものだけを「その世代の FLUSH ACK の根拠」として数える
+///   （Codex レビュー指摘・3 巡目: バリア要求より前の古い永続化通知を
+///   使い回す取り違えの検出。IO-2 はバリア要求以降の永続化完了を保証と
+///   するため、要求前の通知では保証を満たさない）
 /// - `WriteAckSent` は永続化完了の有無を問わず許容する（IO-1・IO-2 の
 ///   契約差: 通常 ACK は永続化完了を待たずに返してよい）
-/// - `FlushAckSent` が一度も現れない列は [`FlushAckVerdict::NoFlushAck`]
-///   を返す（PoC-12 型の「ビルドは通るが仕様未達」を、値の一致ではなく
-///   イベント種別・順序の観測で検出する）
+/// - `BarrierRequested` した世代のうち 1 つでも `FlushAckSent` が最後まで
+///   現れなければ [`FlushAckVerdict::NoFlushAck`] を返す（Codex レビュー
+///   指摘・3 巡目: 従来は最後に処理した世代の判定結果で上書きされ、他の
+///   世代の応答欠落を見逃していた。全世代を走査し終えてから確定する）
 fn flush_ack_follows_persistence(events: &[AckEvent]) -> FlushAckVerdict {
-    let mut requested_generations: Vec<u32> = Vec::new();
-    let mut persisted_generations: Vec<u32> = Vec::new();
-    let mut verdict = FlushAckVerdict::NoFlushAck;
+    let mut order: Vec<u32> = Vec::new();
+    let mut states: Vec<(u32, GenerationState)> = Vec::new();
 
     for event in events {
         match event {
             AckEvent::BarrierRequested { generation } => {
-                requested_generations.push(*generation);
+                generation_state_mut(&mut states, &mut order, *generation).requested = true;
             }
             AckEvent::PersistedBeforeBarrier { generation } => {
-                persisted_generations.push(*generation);
+                let state = generation_state_mut(&mut states, &mut order, *generation);
+                // バリア要求より前に記録された永続化通知は、この世代の
+                // FLUSH ACK の根拠にしない（要求前の通知の使い回し防止）。
+                if state.requested {
+                    state.persisted_after_request = true;
+                }
             }
             AckEvent::WriteAckSent { .. } => {}
             AckEvent::FlushAckSent { generation } => {
-                if !requested_generations.contains(generation) {
+                let state = generation_state_mut(&mut states, &mut order, *generation);
+                if !state.requested {
                     return FlushAckVerdict::FlushAckWithoutBarrier {
                         generation: *generation,
                     };
                 }
-                if !persisted_generations.contains(generation) {
+                if !state.persisted_after_request {
                     return FlushAckVerdict::PrematureFlushAck {
                         generation: *generation,
                     };
                 }
-                verdict = FlushAckVerdict::Ok;
+                state.flush_ack_sent = true;
             }
         }
     }
 
-    verdict
+    let requested_generations: Vec<u32> = order
+        .iter()
+        .copied()
+        .filter(|generation| {
+            states
+                .iter()
+                .find(|(g, _)| g == generation)
+                .is_some_and(|(_, state)| state.requested)
+        })
+        .collect();
+
+    if requested_generations.is_empty() {
+        return FlushAckVerdict::NoFlushAck;
+    }
+
+    let all_acked = requested_generations.iter().all(|generation| {
+        states
+            .iter()
+            .find(|(g, _)| g == generation)
+            .is_some_and(|(_, state)| state.flush_ack_sent)
+    });
+
+    if all_acked {
+        FlushAckVerdict::Ok
+    } else {
+        FlushAckVerdict::NoFlushAck
+    }
 }
 
 /// マッチャが TASK-15（IO-2）の FLUSH ACK 永続化条件（バリア以前の
@@ -520,6 +597,53 @@ fn repair_12_scaffold_matcher_distinguishes_write_ack_from_flush_ack() {
         flush_ack_follows_persistence(&flush_ack_without_barrier),
         FlushAckVerdict::FlushAckWithoutBarrier { generation: 1 },
         "バリア要求を伴わない FLUSH ACK 送出をマッチャが検出できていない"
+    );
+}
+
+/// マッチャが、一部の世代だけ FLUSH ACK が揃っていても他の世代の応答
+/// 欠落を見逃さないことを確認する（REPAIR-12・IO-2。Codex レビュー指摘・
+/// 3 巡目 #1: 旧実装は最後に処理した `FlushAckSent` の判定結果で
+/// `verdict` を上書きしていたため、1 世代目が仕様どおりでも 2 世代目の
+/// バリア要求に応答が無いまま `Ok` になっていた）。
+#[test]
+fn repair_12_scaffold_matcher_detects_missing_flush_ack_for_later_barrier() {
+    // 1 世代目は仕様どおり（バリア要求 → 永続化完了 → FLUSH ACK）。
+    // 2 世代目はバリア要求のみで、対応する FLUSH ACK が最後まで現れない。
+    let second_barrier_never_acked = [
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::PersistedBeforeBarrier { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+        AckEvent::BarrierRequested { generation: 2 },
+    ];
+    assert_eq!(
+        flush_ack_follows_persistence(&second_barrier_never_acked),
+        FlushAckVerdict::NoFlushAck,
+        "1 世代目が仕様どおりでも、2 世代目のバリア要求に対する \
+            FLUSH ACK 欠落を見逃して Ok と判定してしまっている"
+    );
+}
+
+/// マッチャが、バリア要求より前に記録された永続化通知を、そのバリアの
+/// FLUSH ACK の根拠として使い回せないことを確認する（REPAIR-12・IO-2。
+/// Codex レビュー指摘・3 巡目 #2: 旧実装は `persisted_generations` に
+/// 世代番号が含まれるかしか見ておらず、`PersistedBeforeBarrier` が
+/// `BarrierRequested` より前後どちらに記録されたかを区別できなかった）。
+#[test]
+fn repair_12_scaffold_matcher_rejects_persistence_notification_before_barrier_request() {
+    // バリア要求より前に届いた（古い）永続化通知を使い回すパターン:
+    // PersistedBeforeBarrier(1) → BarrierRequested(1) → FlushAckSent(1)。
+    // IO-2 が保証するのは「バリア要求以降の永続化完了」であり、要求前の
+    // 通知はこの世代のバリアに対する保証を満たさない。
+    let persisted_before_request = [
+        AckEvent::PersistedBeforeBarrier { generation: 1 },
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+    ];
+    assert_eq!(
+        flush_ack_follows_persistence(&persisted_before_request),
+        FlushAckVerdict::PrematureFlushAck { generation: 1 },
+        "バリア要求より前の永続化通知を FLUSH ACK の根拠として \
+            使い回す取り違えをマッチャが検出できていない"
     );
 }
 

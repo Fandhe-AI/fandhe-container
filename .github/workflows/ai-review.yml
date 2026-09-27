@@ -4,6 +4,8 @@
 #
 # 有効化のスイッチは呼び出し先 reusable workflow の fail-closed ガードに従う:
 # Actions variable `CODEX_HOME_DIR` が未設定の間は review / post_feedback が skip される。
+# また head branch が `skip-branch-prefixes`（update-external.yml の日次同期 PR）に
+# 一致する場合も同様に review / post_feedback が skip される（`skip-reason: branch-prefix`）。
 name: AI PR review
 
 on:
@@ -36,3 +38,9 @@ jobs:
     with:
       provider: codex
       post-feedback-runner: ubuntu-latest
+      # update-external.yml が生成する日次同期 PR は上流の取り込みそのもので、
+      # AI の指摘があってもこの PR では直せない（修正先は取り込み元の上流リポジトリ）。
+      # 判定はブランチ名の接頭辞のみで行うため、push できる主体は該当接頭辞の
+      # ブランチで gate を回避できる（受容済み残留リスク。Fandhe-AI/actions の
+      # ai-review/README.md 参照。第三者の write コラボレーターを迎える場合は外す）。
+      skip-branch-prefixes: chore/skills-update-,chore/submodule-update-

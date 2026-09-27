@@ -229,6 +229,76 @@ cmd_hint_for_target() {
   printf ''
 }
 
+# ジョブ本文（job_block の出力）から、実際に実行される `run:` ステップの
+# コマンド文字列だけを抽出する（P1: Codex レビュー・PR #1097）。
+# ジョブ本文全体への文字列検索だと、ステップ名・YAML コメント・`run:`
+# スクリプト内のシェルコメント（`# ...`）が同じ文字列を残すだけで
+# 「実行内容の到達可能性チェック」に合格してしまう（`run:` ステップ自体を
+# 削除・コメントアウトしても素通りする）ため、実行される行だけへ絞る。
+#
+# ステップは 2 つの書式を扱う: `- name: ...` の後に `run:` が独立行で続く形式
+# （フィールドは 8 スペースインデント）と、`- run: ...` のように list marker
+# と同じ行へまとめた単一行形式（現行 ci.yml の rust-ci-default-features・
+# bench-regression 等）。後者は先頭の `      - ` を `        `（8 スペース）へ
+# 正規化してから同じロジックで扱う。`run: |` のブロックスカラーは、続く行の
+# インデントが 8 スペース以下（次のフィールド・次のステップ）に戻るまでを
+# 本文として拾う。
+job_run_text() {
+  local block="$1"
+  awk '
+    {
+      line = $0
+      if (line ~ /^      - /) {
+        sub(/^      - /, "        ", line)
+      }
+      $0 = line
+    }
+    /^        run: \|[+-]?[[:space:]]*$/ { in_run = 1; next }
+    /^        run: >[+-]?[[:space:]]*$/  { in_run = 1; next }
+    /^        run: / {
+      in_run = 0
+      l = $0
+      sub(/^        run: /, "", l)
+      print l
+      next
+    }
+    in_run {
+      if ($0 ~ /^        [A-Za-z_-]+:/) { in_run = 0; next }
+      print
+      next
+    }
+  ' <<<"$block"
+}
+
+# job_run_text の出力から、実行されない行（シェルコメント `# ...`・
+# `echo` 出力のみの行）を取り除く。コマンド文字列をコメントや echo に
+# 残すだけの回避策を「実行された」と誤認しないため
+# （P1: Codex レビュー・PR #1097）。
+job_run_effective_lines() {
+  local text="$1"
+  printf '%s\n' "$text" | grep -vE '^[[:space:]]*(#|echo([[:space:]]|$))' || true
+}
+
+# ジョブ本文（job_block の出力）から、ステップ名（`- name:` の値）に
+# 指定した部分文字列を含む最初のステップのブロックを抽出する
+# （次のステップ行または本文末尾までを対象とする）。
+# 対応表の実行内容照合（job_run_text）と異なり、こちらは値をジョブ本文の
+# 最初の一致からではなく名指ししたステップへ紐付けて取得するために使う
+# （P1: Codex レビュー・PR #1097。前段の無名ステップに timeout-minutes を
+# 足すだけで、実行ステップの値とすり替わるのを防ぐ）。
+step_block_by_name() {
+  local block="$1"
+  local name_substr="$2"
+  awk -v pat="$name_substr" '
+    /^      - / {
+      if (in_step) exit
+      if (index($0, "- name:") > 0 && index($0, pat) > 0) { in_step = 1; print; next }
+      next
+    }
+    in_step { print }
+  ' <<<"$block"
+}
+
 # --------------------------------------------------
 # 4. 対応表の網羅性・ジョブ存在・実行内容の到達可能性チェック
 #    （各コマンドと CI ジョブの対応）
@@ -309,11 +379,16 @@ ${row_targets}"
       note "対応表の実行内容照合: '${job}' は reusable workflow 呼び出しのため ci.yml 上でステップの中身を照合できない（手動確認）"
       continue
     fi
+    # `run:` ステップの実行内容だけに絞る（ジョブ本文全体ではなく）。
+    # ジョブ本文全体へのテキスト検索だと、`run:` ステップを削除しても
+    # ステップ名・YAML コメント・シェルコメント・`echo` 出力に同じ文字列を
+    # 残すだけで合格してしまう（P1: Codex レビュー・PR #1097）。
+    job_run_content="$(job_run_effective_lines "$(job_run_text "$job_body")")"
     while IFS= read -r tgt; do
       [ -z "$tgt" ] && continue
       hint="$(cmd_hint_for_target "$tgt")"
       if [ -n "$hint" ]; then
-        # `grep -qF` によるジョブ本文全体への部分文字列一致だと、
+        # `grep -qF` による部分文字列一致だと、
         # `cargo test --workspace --test '*' --no-run`（ビルド用ステップ）が
         # 実行コマンド `cargo test --workspace --test '*'` を部分文字列として
         # 含むため、実行ステップを削除してもビルド用ステップへの一致で
@@ -322,13 +397,13 @@ ${row_targets}"
         # （空白 / クォートのみ許容）であることを要求し、`--no-run` 等の
         # 追加引数を伴う別コマンドを実行コマンドと誤認しないようにする。
         hint_re="$(printf '%s' "$hint" | sed -e 's/[][\.^$*+?(){}|\\]/\\&/g')"
-        if printf '%s\n' "$job_body" | grep -qE "(^|[\"'\`[:space:]:|])${hint_re}[[:space:]\"']*\$"; then
+        if printf '%s\n' "$job_run_content" | grep -qE "(^|[\"'\`[:space:]:|])${hint_re}[[:space:]\"']*\$"; then
           continue
         fi
         report "対応表の実行内容照合: 'make ${tgt}' の注記コマンド '${hint}' がジョブ '${job}' の実行ステップから到達できない（削除・書き換えの可能性）"
         continue
       fi
-      if printf '%s' "$job_body" | grep -qE "make[[:space:]]+${tgt}([[:space:]]|\$|')"; then
+      if printf '%s\n' "$job_run_content" | grep -qE "make[[:space:]]+${tgt}([[:space:]]|\$|')"; then
         continue
       fi
       report "対応表の実行内容照合: 'make ${tgt}' の呼び出しがジョブ '${job}' の実行ステップから到達できない（削除・書き換えの可能性）"
@@ -372,13 +447,20 @@ if [ -z "$agents_step_min" ]; then
   err "anchor-not-found" "AGENTS.md: '結合試験の実行ステップ' の分数が見つからない"
   exit 2
 fi
-ci_step_min="$(printf '%s\n' "$it_block" | grep -E '^        timeout-minutes:' | head -n1 | grep -oE '[0-9]+' || true)"
-if [ -z "$ci_step_min" ]; then
-  err "anchor-not-found" "ci.yml: integration-test ジョブの実行ステップに timeout-minutes が見つからない"
-  exit 2
-fi
-if [ "$agents_step_min" != "$ci_step_min" ]; then
-  report "結合試験の実行ステップ: AGENTS.md '${agents_step_min} 分' が ci.yml の実行ステップ timeout-minutes '${ci_step_min}' と一致しない"
+# ジョブ本文の最初の 8 スペース timeout-minutes を無条件に採用すると、
+# 前段のステップ（結合試験のビルド等）へ timeout-minutes を足すだけで
+# 実際の実行ステップ（`結合試験の実行`）の値のすり替え・削除を見逃す
+# （P1: Codex レビュー・PR #1097）。ステップ名で名指しして値を取得する。
+exec_step_block="$(step_block_by_name "$it_block" '結合試験の実行')"
+if [ -z "$exec_step_block" ]; then
+  report "結合試験の実行ステップ: ci.yml の integration-test ジョブに '結合試験の実行' を含む名前のステップが見つからない（AGENTS.md 記載値 '${agents_step_min} 分'）"
+else
+  ci_step_min="$(printf '%s\n' "$exec_step_block" | grep -E '^        timeout-minutes:' | head -n1 | grep -oE '[0-9]+' || true)"
+  if [ -z "$ci_step_min" ]; then
+    report "結合試験の実行ステップ: ci.yml の '結合試験の実行' ステップに timeout-minutes が見つからない（AGENTS.md 記載値 '${agents_step_min} 分'）"
+  elif [ "$agents_step_min" != "$ci_step_min" ]; then
+    report "結合試験の実行ステップ: AGENTS.md '${agents_step_min} 分' が ci.yml の実行ステップ timeout-minutes '${ci_step_min}' と一致しない"
+  fi
 fi
 
 # 5-3: ジョブ全体（「ジョブ全体」行に列挙された `job` N 分 の組）

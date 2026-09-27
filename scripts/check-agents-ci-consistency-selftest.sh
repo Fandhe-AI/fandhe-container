@@ -50,6 +50,15 @@ run_case "timeout-mismatch" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/timeout-m
 # REPAIR-5: 結合試験の実行ステップ timeout-minutes が食い違う（1）
 run_case "step-timeout-mismatch" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/step-timeout-mismatch/ci.yml.txt" "${ok_dir}/Makefile.txt" 1
 
+# PR #1097 codex レビュー P1 の回帰確認: 結合試験の実行ステップ timeout-minutes
+# の照合が、ジョブ本文中で最初に現れる 8 スペース timeout-minutes を無条件に
+# 採用していたため、前段のステップ（ビルド等）に AGENTS.md 記載値と同じ
+# timeout-minutes を足すだけで、実際の実行ステップの timeout-minutes（この
+# fixture では 20 分）のすり替え・延長を見逃していた。ステップ名
+# 「結合試験の実行」で名指しして値を取得した後は、不一致として fail（1）
+# すること。
+run_case "step-timeout-front-step-leak" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/step-timeout-front-step-leak/ci.yml.txt" "${ok_dir}/Makefile.txt" 1
+
 # REPAIR-5: FANDHE_CONTAINER_TEST_TIMEOUT_SECS が食い違う（1）
 run_case "env-timeout-mismatch" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/env-timeout-mismatch/ci.yml.txt" "${ok_dir}/Makefile.txt" 1
 
@@ -87,6 +96,15 @@ run_case "step-removed" "${fixtures_dir}/step-removed/AGENTS.md.txt" "${fixtures
 # 実行ステップだけを削除した fixture は不一致として fail（1）すること。
 run_case "no-run-collision-baseline" "${fixtures_dir}/no-run-collision-baseline/AGENTS.md.txt" "${fixtures_dir}/no-run-collision-baseline/ci.yml.txt" "${fixtures_dir}/no-run-collision-baseline/Makefile.txt" 0
 run_case "no-run-collision" "${fixtures_dir}/no-run-collision/AGENTS.md.txt" "${fixtures_dir}/no-run-collision/ci.yml.txt" "${fixtures_dir}/no-run-collision/Makefile.txt" 1
+
+# PR #1097 codex レビュー P1 の回帰確認: 対応表の実行内容照合がジョブ本文全体
+# （YAML コメント・echo 文字列を含む）へのテキスト検索だったため、`run:`
+# ステップ自体を `echo` に置き換えても・コメントアウトしても合格していた。
+# 実際に実行される `run:` 内容だけへ絞り、コメント・echo 行を除外した後は
+# 不一致として fail（1）すること（ok/ci.yml.txt の `lint` ターゲット対応
+# ステップ〔rust-ci-default-features の clippy 呼び出し〕を壊す）。
+run_case "run-step-echoed" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/run-step-echoed/ci.yml.txt" "${ok_dir}/Makefile.txt" 1
+run_case "run-step-commented" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/run-step-commented/ci.yml.txt" "${ok_dir}/Makefile.txt" 1
 
 # OSS-4/OSS-5: cargo-deny バージョンが Makefile と ci.yml で食い違う（1）
 run_case "deny-version-mismatch" "${ok_dir}/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${fixtures_dir}/deny-version-mismatch/Makefile.txt" 1

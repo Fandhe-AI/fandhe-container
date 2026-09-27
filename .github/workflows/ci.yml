@@ -9,13 +9,25 @@ name: CI
 # ci.yml から取り込み済み。
 # ruleset（branch protection）の必須チェックには、implement-issue-tree の自動マージ前
 # ゲート（G0。PR 上の全 check-run context が必須チェックに含まれることを要求する）に
-# 適合させるため、本 workflow が生成する check-run 24 件（ci-complete・
-# lint-docs / * 5 件・rust-ci (<os>) / * 15 件・rust-ci-default-features (<os>) 3 件）を
-# すべて個別に登録済み（オーナー判断 2026-09-27。下の ci-complete ジョブのコメントを参照）。
+# 適合させるため、本 workflow が生成する check-run 27 件（ci-complete・
+# lint-docs / * 5 件・rust-ci (<os>) / * 15 件・rust-ci-default-features (<os>) 3 件・
+# integration-test (<os>) 3 件）をすべて個別に登録済み（オーナー判断 2026-09-27。
+# TASK-86.2〔#36〕の integration-test (<os>) 3 件を含む。下の ci-complete・
+# integration-test ジョブのコメントを参照）。
 # ジョブの追加・改名・matrix 変更で check-run 名が変わる場合は ruleset 側も
 # 同時に更新する（リポジトリ設定の変更のためオーナー作業とする）
 on:
   workflow_dispatch:
+    inputs:
+      hang-probe:
+        description: >-
+          true にすると、integration-test ジョブでリポ外の使い捨て crate に
+          仕込んだハングするテストを実行し、REPAIR-5（タイムアウト保護）が
+          実際に fail することを実証する（TASK-86.2）。既定 false では通常の
+          結合試験を実行する。PR・push イベントではこの入力自体が存在しない
+          （既定 false 相当）
+        type: boolean
+        default: false
   pull_request:
   push:
     branches: [main]
@@ -192,14 +204,140 @@ jobs:
         run: cargo test --workspace
 
   # --------------------------------------------------
+  # integration-test（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）
+  # --------------------------------------------------
+  # spec の REPAIR-5（PoC-8 の BREAK-1: ACK 未送信、MS-0）は `cargo build` でも
+  # ユニットテストでも検出できず、ハングとしてしか表面化しない。ハングする
+  # テストを有限時間で打ち切り CI を fail させるのが本ジョブの役割
+  # （TASK-86.2・#36）。
+  #
+  # 「結合試験」は Cargo の integration test target（各 crate の `tests/*.rs`。
+  # `cargo metadata` 上で kind が "test" のもの）を指す。lib 内 unit test
+  # （`#[cfg(test)]`）は rust-ci / rust-ci-default-features（ステージ 2）が
+  # 既に担っており、ここでは重複させない。
+  #
+  # 現時点では integration test target が 0 件（各機能タスクで tests/*.rs が
+  # 追加され次第この件数は増える）。0 件のまま `cargo test --workspace --test '*'`
+  # を呼ぶと「no test target matches pattern」で非 0 終了するため、実行前に
+  # `cargo metadata` + jq で件数を数え、0 件なら notice を出して成功で終える
+  # （無言の skip にはしない）。jq の失敗は fail-closed で扱う。
+  #
+  # タイムアウトは二段構え: ジョブ全体 30 分（他ジョブと同じ多層防御）、実行
+  # ステップ 10 分（ハング検出の本体）。テスト 1 件ごとの推奨値 5〜10 秒の
+  # 設定と、CI 全体のハング防止の最終確認は後続の TASK-87 が担当する。
+  #
+  # ハングプローブ（workflow_dispatch の hang-probe=true）: リポジトリに
+  # ハングするテストを常設せず、$RUNNER_TEMP 配下（リポ外）に依存なしの
+  # 使い捨て crate を都度生成し、同じ実行ステップ・同じ timeout-minutes で
+  # 実行することで「そのステップの timeout で fail する」ことを実証する。
+  # プローブのテストが戻ってきた場合（sleep がタイムアウトより先に終わる等）
+  # は exit 1 で fail させ、プローブ無効化による false-green を防ぐ。
+  #
+  # Windows runner の既定シェルは pwsh のため、bash のヒアドキュメント・
+  # `set -euo pipefail` をそのまま使えるよう defaults.run.shell を明示する。
+  integration-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      # inputs.hang-probe は workflow_dispatch 以外のイベントでは存在しないため
+      # github.event_name で明示的に絞る。値は env 経由でのみ受け取り、
+      # run: スクリプトへ `${{ }}` を直接埋め込まない（スクリプトインジェクション対策）
+      HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.hang-probe == true }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+
+      - name: integration test target 件数の判定
+        id: count
+        run: |
+          set -euo pipefail
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          count="$(printf '%s' "${metadata}" | jq -er '[.packages[].targets[] | select(.kind[]? == "test")] | length')"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "integration test targets: ${count}" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::integration test targets: ${count}"
+
+      - name: 結合試験のビルド（ステージ 3。実行タイムアウトの時間枠を消費しないよう分離）
+        if: steps.count.outputs.count != '0' && env.HANG_PROBE != 'true'
+        run: cargo test --workspace --test '*' --no-run
+
+      - name: ハングプローブ crate の生成（workflow_dispatch の hang-probe=true 時のみ）
+        if: env.HANG_PROBE == 'true'
+        run: |
+          set -euo pipefail
+          probe_dir="${RUNNER_TEMP}/hang-probe"
+          mkdir -p "${probe_dir}/src" "${probe_dir}/tests"
+          cat > "${probe_dir}/Cargo.toml" <<'EOF'
+          # REPAIR-5（TASK-86.2）のハング検出を実証するための使い捨て crate。
+          # 親 workspace から切り離すため空の [workspace] テーブルを持つ。依存は持たない
+          [package]
+          name = "fandhe-container-hang-probe"
+          version = "0.0.0"
+          edition = "2021"
+          publish = false
+
+          [workspace]
+          EOF
+          # 結合試験（tests/hang.rs）だけでは cargo の対象 target にならず、
+          # 通常の lib/bin target を持たない manifest では `cargo test --no-run`
+          # が「no targets specified in the manifest」相当で失敗し、ハングする
+          # テストが実行ステップへ到達しない（レビュー指摘。REPAIR-5 の実証不成立）。
+          # 空の src/lib.rs で lib target を用意し、tests/hang.rs が確実にビルド・
+          # 実行される状態にする。
+          touch "${probe_dir}/src/lib.rs"
+          cat > "${probe_dir}/tests/hang.rs" <<'EOF'
+          // integration-test ジョブ（TASK-86.2・REPAIR-5）が実行ステップの
+          // timeout-minutes で fail することを実証するためだけのプローブ。
+          // 戻ってきた場合（timeout より先に sleep が終わる等）はプローブが
+          // 機能していないことを意味するため、false-green を防ぐため fail させる。
+          #[test]
+          fn hang_forever() {
+              loop {
+                  std::thread::sleep(std::time::Duration::from_secs(3600));
+              }
+          }
+          EOF
+          cargo test --manifest-path "${probe_dir}/Cargo.toml" --no-run
+
+      - name: 結合試験の実行（ステージ 3・タイムアウト保護。REPAIR-5 / REPAIR-7）
+        timeout-minutes: 10
+        env:
+          # 前段ステップの outputs も `${{ }}` を run: へ直接埋め込まず env 経由で
+          # 受け渡す（HANG_PROBE と同じスクリプトインジェクション対策）
+          COUNT: ${{ steps.count.outputs.count }}
+        run: |
+          set -euo pipefail
+          if [ "${HANG_PROBE}" = "true" ]; then
+            cargo test --manifest-path "${RUNNER_TEMP}/hang-probe/Cargo.toml"
+            echo "hang probe test returned without timing out" >&2
+            exit 1
+          fi
+          if [ "${COUNT}" = "0" ]; then
+            echo "::notice::integration test targets: 0 (nothing to run)"
+            exit 0
+          fi
+          cargo test --workspace --test '*'
+
+  # --------------------------------------------------
   # ci-complete（全ジョブ結果の fail-closed 集約ゲート）
   # --------------------------------------------------
-  # lint-docs・rust-ci・rust-ci-default-features の結果を集約し、いずれかが
-  # 失敗・キャンセルされれば本ジョブも failure にする fail-closed ゲート。
-  # rust-ci・rust-ci-default-features は 3 OS matrix ジョブのため、needs 上では
-  # OS ごとの結果ではなく 1 つの result に集約される（いずれかの OS が失敗・
-  # キャンセルされれば全体が failure / cancelled になる。fail-fast: false でも
-  # 集約結果には影響しない）。
+  # lint-docs・rust-ci・rust-ci-default-features・integration-test の結果を集約し、
+  # いずれかが失敗・キャンセルされれば本ジョブも failure にする fail-closed ゲート。
+  # rust-ci・rust-ci-default-features・integration-test は 3 OS matrix ジョブの
+  # ため、needs 上では OS ごとの結果ではなく 1 つの result に集約される
+  # （いずれかの OS が失敗・キャンセルされれば全体が failure / cancelled になる。
+  # fail-fast: false でも集約結果には影響しない）。
   #
   # ruleset（branch protection）の必須チェックには本ジョブに加え、本 workflow が
   # 生成する check-run 全件を個別に登録済み（冒頭コメント参照。implement-issue-tree
@@ -208,9 +346,12 @@ jobs:
   # ruleset の必須チェック一覧も同時に更新すること（更新漏れの影響: 増えた
   # チェックが未登録だと自動マージが G0 で止まる。改名された旧名が必須のまま
   # 残ると新たな check-run が報告されず全 PR がマージ不能になる）。ruleset の
-  # 変更はリポジトリ設定の変更のためオーナー承認を経る。
+  # 変更はリポジトリ設定の変更のためオーナー承認を経る。TASK-86.2（#36）で
+  # integration-test (<os>) 3 件が増え、ruleset へも登録済み（オーナー承認
+  # 2026-09-27。合計 27 件。冒頭コメントの内訳〔1 + lint-docs 5 + rust-ci 15 +
+  # rust-ci-default-features 3 + integration-test 3 = 27〕と一致させる）。
   ci-complete:
-    needs: [lint-docs, rust-ci, rust-ci-default-features]
+    needs: [lint-docs, rust-ci, rust-ci-default-features, integration-test]
     if: always()
     permissions: {}
     runs-on: ubuntu-latest

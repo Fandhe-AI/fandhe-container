@@ -9,6 +9,12 @@
 #
 # version は未指定（Cargo の既定で 0.0.0）。
 # 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
+#
+# [[bench]] regression_placeholder は TASK-86.3（REPAIR-7 第 4 段階・REPAIR-8）で
+# CI のベンチ回帰ゲートを暫定的に稼働させるための stub ベンチ（本文は
+# benches/regression_placeholder.rs。決定的な固定値を出力するだけで実測はしない）。
+# `benches/benches/regression_placeholder.rs` への自動発見に依存する配置は暫定であり、
+# 正式な配置方式（`benches/benches/*.rs` か `path` 明示か）は TASK-113 で決める。
 
 [package]
 name = "fandhe-container-benches"
@@ -16,3 +22,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[[bench]]
+name = "regression_placeholder"
+harness = false

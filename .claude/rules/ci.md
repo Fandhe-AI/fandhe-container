@@ -20,13 +20,18 @@ make ci          # 上記 + lint-docs + deny を一括実行
 4. ベンチ回帰チェック（15% 超の悪化で fail。REPAIR-8）
 5. セキュリティチェック（`cargo deny`・禁止 API / 禁止クレート検査。REPAIR-9・MVM-4）
 
-現状の `.github/workflows/ci.yml` は lint-docs と 1・2・5（rust-base-ci）・3（integration-test）相当を持ち、発火条件は `workflow_dispatch`・`pull_request`・`push`（main）で稼働している（TASK-86.1・REPAIR-7）。ステージ 3（タイムアウト保護された結合試験）は `integration-test` ジョブ（3 OS matrix。実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes）が担う（TASK-86.2・#36）。4 は該当タスクで追加する。
+現状の `.github/workflows/ci.yml` は lint-docs・1・2・3（`integration-test` ジョブ）・4 の比較の仕組み（`bench-regression` ジョブ）・5（rust-base-ci）相当のすべてを持ち、発火条件は `workflow_dispatch`・`pull_request`・`push`（main）で稼働している（TASK-86.1・TASK-86.2・TASK-86.3・REPAIR-7）。
+
+ステージ 3（タイムアウト保護された結合試験）は `integration-test` ジョブ（3 OS matrix。実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes）が担う（TASK-86.2・#36）。
+
+`bench-regression` ジョブは `make bench-check-selftest`（比較スクリプトの自己テスト）→ `make bench-check`（ベンチ実行・基準値比較）の順に実行する。現時点では `benches/benches/regression_placeholder.rs`（決定的な固定値の stub）と `benches/baseline.json`（`placeholder: true` の暫定値）で動作確認する段階にあり、実測を伴う本物のベンチ・基準値への置き換えはそれぞれ TASK-113・TASK-88 で行う。計測対象がプレースホルダのため、現時点では実装の性能悪化を検出せず、性能回帰ゲートとして機能しない。
 
 ## 3 OS CI（macOS・Windows・Linux 一級対応）
 
 - 各 OS のネイティブランナーでビルド・テストする（クロスコンパイル前提にしない）
 - matrix は ubuntu / macos / windows の 3 OS を必須とし、特定 OS のみの skip で CI を通さない
 - OS 依存のファイルシステム挙動（パス・大文字小文字・ロック・改行）のテストは 3 OS すべてで実行する
+- ベンチ回帰チェック（`bench-regression` ジョブ）は例外として ubuntu-latest 単独で実行する。ベンチの数値は OS 間の実行環境差で比較できず、3 OS matrix にしても意味のある回帰検出にならないため（本節の「3 OS 必須」はビルド・テストのゲートを対象とする規則であり、ベンチ回帰チェックはその対象外）
 
 ## 実機前提テスト
 

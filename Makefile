@@ -270,6 +270,39 @@ endif
 ci: lint-docs check-workspace-manifest fmt-check lint test deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
+# ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8）
+# --------------------------------------------------
+# `make ci` には含めない: (1) ci.md のローカルゲート定義（fmt-check/lint/test/deny）を
+# 変えないため、(2) 実ベンチの実行は時間がかかるため。CI 側は `.github/workflows/ci.yml`
+# の `bench-regression` 専用ジョブが必ず実行するため、`make ci` に無くてもゲートは
+# 抜けない。
+
+# 比較スクリプト自体の自己テスト（scripts/testdata/bench-regression/ の固定 fixture で
+# 終了コードを照合。REPAIR-12）。bash + jq のみで完結し、cargo を必要としないため
+# HAS_CARGO では判定しない。jq 未導入時は導入方法を案内して fail-closed で止める
+# （黙ってスキップしない）。
+.PHONY: bench-check-selftest
+bench-check-selftest: ## ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
+	@if ! command -v jq >/dev/null 2>&1; then \
+		echo "jq is required but not found: install it (e.g. brew install jq / apt-get install jq)" >&2; \
+		exit 1; \
+	fi
+	bash scripts/check-bench-regression-selftest.sh
+
+# プレースホルダベンチ（benches/benches/regression_placeholder.rs）を実行し、
+# 結果を基準値（benches/baseline.json）と比較する。一時ディレクトリは trap で
+# 必ず削除する（1 レシピ行で完結させ、定義から削除までの経路を保つ）。
+.PHONY: bench-check
+bench-check: ## ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	cargo bench -p fandhe-container-benches --bench regression_placeholder -- --output "$$tmp/results.json" && \
+	bash scripts/check-bench-regression.sh benches/baseline.json "$$tmp/results.json"
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-check をスキップ"
+endif
+
+# --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------
 

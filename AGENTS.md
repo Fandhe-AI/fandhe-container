@@ -65,6 +65,7 @@ make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段�
 | `test-integration` | `integration-test` |
 | `bench-check-selftest`・`bench-check` | `bench-regression` |
 | `lint-docs` | `lint-docs` |
+| `check-workspace-manifest`（`make ci` の一部） | 専用の CI ジョブはない（ローカルゲート専用）。workspace manifest が不正なら各 cargo ジョブのビルドが失敗するため、CI では間接的に検出される |
 
 ### 推奨タイムアウト値（REPAIR-5・REPAIR-10 (c)）
 

@@ -58,6 +58,11 @@ run_case "unknown-metric" "$baseline" "${fixtures_dir}/results-unknown-metric.js
 # baseline の value が 0（有限の正数ではない）→ 入力エラー（2）
 run_case "baseline-invalid-zero" "${fixtures_dir}/baseline-invalid-zero.json" "${fixtures_dir}/results-improved.json" 2
 
+# 極端に大きい有限値同士（baseline=1e307, current=1e308 の 10 倍悪化）で乗算比較が
+# DBL_MAX へ飽和し「回帰なし」と誤判定しないことを確認する回帰テスト（比率比較への
+# 修正の受け入れ基準）
+run_case "regress-lower-extreme-overflow" "${fixtures_dir}/baseline-extreme.json" "${fixtures_dir}/results-regress-extreme-10x.json" 1
+
 # 存在しないファイル → 入力エラー（2）
 run_case "missing-file" "$baseline" "${fixtures_dir}/does-not-exist.json" 2
 

@@ -26,10 +26,14 @@
 # 閾値は REPAIR-8 の固定値としてこのスクリプト内の定数に置く（baseline.json 側の
 # フィールドでは変更できない。ゲートをデータ側から緩める経路を作らないため）。
 #
-# 判定式（割り算を避け、境界を明示する。浮動小数点誤差を避けるため 100 倍した
-# 整数側で比較する）:
-#   lower_is_better:  current*100 > baseline*(100+THRESHOLD_PERCENT) なら回帰
-#   higher_is_better: current*100 < baseline*(100-THRESHOLD_PERCENT) なら回帰
+# 判定式（比率 current/baseline で比較する。baseline は is_finite_positive_number
+#   により有限かつ 0 超であることを検証済みなので除算は安全に行える。かつては
+#   current*100 と baseline*(100±THRESHOLD_PERCENT) を乗算してから比較していたが、
+#   baseline・current が極端に大きい有限値（例: 1e307 と 1e308）だと乗算結果が
+#   双方とも DBL_MAX 相当へ飽和して等しくなり、実際には閾値超の悪化があっても
+#   「回帰なし」と誤判定する不具合があったため、乗算を避け比率で比較する）:
+#   lower_is_better:  current/baseline > (100+THRESHOLD_PERCENT)/100 なら回帰
+#   higher_is_better: current/baseline < (100-THRESHOLD_PERCENT)/100 なら回帰
 #   「15% 超」の悪化を回帰とするため、ちょうど 15.0% の悪化は合格（不等号は
 #   `>` / `<` であり `>=` / `<=` ではない）。
 
@@ -159,9 +163,9 @@ def validate_doc(require_direction):
     | ($r.value) as $cv
     | ($b.direction) as $dir
     | (if $dir == "lower_is_better" then
-         ($cv * 100) > ($bv * (100 + $threshold))
+         ($cv / $bv) > ((100 + $threshold) / 100)
        else
-         ($cv * 100) < ($bv * (100 - $threshold))
+         ($cv / $bv) < ((100 - $threshold) / 100)
        end) as $is_regression
     | {
         name: $name,

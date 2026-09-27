@@ -114,7 +114,8 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
     AcceptanceTarget {
         task: "TASK-16",
         behavior: "IO-10",
-        spec_fact: "未フラッシュ滞留量の上限到達時に自動フラッシュが発行されること",
+        spec_fact: "未フラッシュ滞留量の上限が設定可能で、\
+            上限到達時に自動フラッシュが発行されること",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
             planned_task: "TASK-16",
@@ -132,7 +133,8 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
     AcceptanceTarget {
         task: "TASK-19",
         behavior: "IO-5",
-        spec_fact: "大文字小文字の違いのみで衝突する 2 ファイル作成が構造化エラーで返ること",
+        spec_fact: "大文字小文字の違いのみで衝突する 2 ファイル作成が\
+            構造化エラー（`code`・`message`）で返ること",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
             planned_task: "TASK-19",
@@ -141,7 +143,8 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
     AcceptanceTarget {
         task: "TASK-20",
         behavior: "IO-5・WIN-4",
-        spec_fact: "260 文字を超える共有パスに警告またはエラーが返ること",
+        spec_fact: "260 文字を超える共有パスに警告またはエラーが返ること\
+            （しきい値 260/261 の境界）",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
             planned_task: "TASK-20",
@@ -172,7 +175,9 @@ fn find_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// REPAIR-12 の雛形マッチャが、仕様から作った暫定サンプル行を正しく
-/// 具体値で照合できることを確認する（TASK-91.1・#129）。
+/// 具体値で照合できることを確認する（TASK-91.1・#129。IO-1・IO-10 に対応:
+/// `batch_size` は IO-1〔TASK-13〕の既定値反映、`flush_every` は
+/// IO-10〔TASK-16〕の上限設定を照合する）。
 ///
 /// サンプル行は PoC-12 の失敗事例（`batch_size` / `flush_every` の要求）を
 /// もとにした暫定値であり、確定契約ではない（本ファイルのモジュール
@@ -187,7 +192,9 @@ fn repair_12_scaffold_matcher_accepts_spec_sample() {
 }
 
 /// マッチャが「ビルドは通るが仕様未達」の失敗モード（PoC-12: 要求された
-/// フィールドが出力から欠落）を検出できることを確認する（REPAIR-12）。
+/// フィールドが出力から欠落）を検出できることを確認する（REPAIR-12。
+/// 欠落させる `flush_every` は IO-10〔TASK-16〕、健在を確認する
+/// `batch_size` は IO-1〔TASK-13〕に対応する）。
 #[test]
 fn repair_12_scaffold_matcher_detects_missing_field() {
     // flush_every を欠いたサンプル（PoC-12 の失敗モードの再現）。
@@ -235,7 +242,8 @@ const EXPECTED_ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
     AcceptanceTarget {
         task: "TASK-16",
         behavior: "IO-10",
-        spec_fact: "未フラッシュ滞留量の上限到達時に自動フラッシュが発行されること",
+        spec_fact: "未フラッシュ滞留量の上限が設定可能で、\
+            上限到達時に自動フラッシュが発行されること",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
             planned_task: "TASK-16",
@@ -253,7 +261,8 @@ const EXPECTED_ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
     AcceptanceTarget {
         task: "TASK-19",
         behavior: "IO-5",
-        spec_fact: "大文字小文字の違いのみで衝突する 2 ファイル作成が構造化エラーで返ること",
+        spec_fact: "大文字小文字の違いのみで衝突する 2 ファイル作成が\
+            構造化エラー（`code`・`message`）で返ること",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
             planned_task: "TASK-19",
@@ -262,7 +271,8 @@ const EXPECTED_ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
     AcceptanceTarget {
         task: "TASK-20",
         behavior: "IO-5・WIN-4",
-        spec_fact: "260 文字を超える共有パスに警告またはエラーが返ること",
+        spec_fact: "260 文字を超える共有パスに警告またはエラーが返ること\
+            （しきい値 260/261 の境界）",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
             planned_task: "TASK-20",

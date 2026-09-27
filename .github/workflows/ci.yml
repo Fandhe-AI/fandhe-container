@@ -332,15 +332,18 @@ jobs:
           cargo test --workspace --test '*'
 
   # --------------------------------------------------
-  # bench-regression（ベンチ回帰チェック: REPAIR-7 第 4 段階・REPAIR-8）
+  # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）
   # --------------------------------------------------
   # ベンチ実行結果を基準値（benches/baseline.json）と比較し、15% 超の悪化を
-  # 検出したら fail する（scripts/check-bench-regression.sh。閾値・判定式は
-  # 同スクリプト内のコメントを参照）。TASK-86.3 時点では benches/ の実ベンチが
-  # 未実装のため、決定的な固定値を出力するプレースホルダベンチ
-  # （benches/benches/regression_placeholder.rs）と暫定基準値
-  # （benches/baseline.json の placeholder: true）で動作を確認する段階にある。
-  # 実測を伴う本物のベンチと基準値への置き換えはそれぞれ TASK-113・TASK-88 で行う。
+  # 検出したら fail する判定ロジック（scripts/check-bench-regression.sh。閾値・
+  # 判定式は同スクリプト内のコメントを参照）とその自己テスト・CI 組み込みを
+  # TASK-86.3 で導入した。ただし計測対象は決定的な固定値を出力するだけの
+  # プレースホルダベンチ（benches/benches/regression_placeholder.rs）と暫定基準値
+  # （benches/baseline.json の placeholder: true）であり、実装の性能を計測して
+  # いない。そのため本ジョブは実際の性能回帰を検出せず、実装が 15% 超悪化しても
+  # 成功し続ける。本ジョブの成功を「性能回帰がない」根拠にしないこと。実測を
+  # 伴う本物のベンチ（TASK-113・#269）と実測に基づく基準値（TASK-88・#227）へ
+  # 置き換えて初めて、性能回帰ゲートとして機能する。
   #
   # ubuntu-latest 単独とし 3 OS matrix にしない: ベンチの数値は OS 間の実行環境
   # （CPU・ノイズ）が異なり比較できないこと、check-run が増えると ruleset
@@ -360,7 +363,7 @@ jobs:
           toolchain: stable
       - name: ベンチ回帰比較スクリプトの自己テスト（受け入れ基準 2 の記録。REPAIR-12）
         run: make bench-check-selftest
-      - name: ベンチ回帰チェック（プレースホルダベンチ・暫定基準値）
+      - name: ベンチ比較の配線確認（プレースホルダ・性能回帰は未検出）
         run: make bench-check
 
   # --------------------------------------------------

@@ -820,13 +820,13 @@ mod tests {
     /// 人間のアーキテクチャレビュー（#19・TASK-4.h1）で確定する未確定事項であり、
     /// ここでの規則はスタブの契約テストを通すためだけの仮のものである
     /// （REPAIR-3: 実装済みを装わない）。`ContainerId` が許すが [`NetnsName`] では
-    /// 許可されない文字（`.`・`_`）を `-` に置換し、`"netns-"` 接頭辞を付けたうえで
-    /// [`IDENTIFIER_MAX_LEN`] に収まるよう切り詰める。置換後の文字はすべて
-    /// `[A-Za-z0-9-]`（`ContainerId` の文字集合の部分集合）に限られ、接頭辞が
-    /// 英字で始まるため、[`NetnsName::new`] の検証には理論上常に通る
-    /// （`Result` を返す形は保つが、`unwrap`/`expect` で panic させないための
-    /// 契約として `?` で伝播する）。長い `ContainerId` は切り詰めにより衝突しうるが、
-    /// これはスタブの仮規則の既知の限界であり、本番の導出規則は #19 で確定する。
+    /// 許可されない文字（`.`・`_`）を `-` に置換し、`"netns-"` 接頭辞を付ける。
+    /// 置換後の文字はすべて `[A-Za-z0-9-]`（`ContainerId` の文字集合の部分集合）に
+    /// 限られ、接頭辞が英字で始まるため、結果が [`IDENTIFIER_MAX_LEN`] に収まる
+    /// 限り [`NetnsName::new`] の検証には理論上常に通る。長さを切り詰めると
+    /// 異なる `ContainerId` が同じ `NetnsName` に衝突しうるため切り詰めは行わず、
+    /// 収まらない場合は [`ErrorCode::InvalidArgument`] を返す（`ContainerId` は
+    /// 検証済みの外部入力であり、この経路は `panic` させない。coding-rust.md）。
     fn derive_netns_name(container: &ContainerId) -> Result<NetnsName, TraitError> {
         const PREFIX: &str = "netns-";
         let sanitized: String = container
@@ -835,8 +835,16 @@ mod tests {
             .map(|c| if c == '.' || c == '_' { '-' } else { c })
             .collect();
         let available = IDENTIFIER_MAX_LEN.saturating_sub(PREFIX.len());
-        let truncated: String = sanitized.chars().take(available).collect();
-        NetnsName::new(format!("{PREFIX}{truncated}"))
+        if sanitized.len() > available {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "container id is too long to derive a netns name \
+                     (stub rule allows at most {available} bytes after sanitization)"
+                ),
+            ));
+        }
+        NetnsName::new(format!("{PREFIX}{sanitized}"))
     }
 
     /// テスト専用の契約検証スタブ実装（dyn 互換性・契約 6〜9 の失敗条件を確認するため
@@ -1448,24 +1456,25 @@ mod tests {
     }
 
     /// P1 修正: `derive_netns_name` は `IDENTIFIER_MAX_LEN`（64 バイト）を超える長さの
-    /// `ContainerId` でも panic せず、`"netns-"` 接頭辞込みで上限内に切り詰めた
-    /// 具体値を返す（旧実装は境界検証なしに文字列連結するだけだったため、
-    /// 59 バイト以上の `ContainerId` で `NetnsName::new` の長さ検証に落ちて
-    /// `.expect` が panic していた）。
+    /// `ContainerId` でも panic せず、`InvalidArgument` を返す（切り詰めによる
+    /// 異なる `ContainerId` 間の衝突を避けるため。旧実装は境界検証なしに文字列連結
+    /// するだけだったため、59 バイト以上の `ContainerId` で `NetnsName::new` の
+    /// 長さ検証に落ちて `.expect` が panic していた）。
     #[test]
-    fn net1_derive_netns_name_truncates_long_container_id() {
+    fn net1_derive_netns_name_rejects_long_container_id() {
         let long_id = "a".repeat(200);
-        let container = ContainerId::new(long_id.clone()).expect("valid container id");
-        let name = derive_netns_name(&container).expect("derivation must not fail");
-        let expected = format!("netns-{}", "a".repeat(58));
-        assert_eq!(name.as_str(), expected);
-        assert_eq!(name.as_str().len(), 64);
+        let container = ContainerId::new(long_id).expect("valid container id");
+        let err = derive_netns_name(&container)
+            .expect_err("a container id that does not fit must be rejected, not truncated");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
     }
 
-    /// P1 修正: `create_netns` は `.`・`_` を含む長い `ContainerId` でも panic せず
-    /// `Ok` を返し、`NetnsStatus::name()` が導出規則どおりの具体値になる
-    /// （名前導出は `netns.insert` より前に行われるため、導出に成功した場合のみ
-    /// 状態が変化する契約が保たれる）。
+    /// P1 修正: `create_netns` は `.`・`_` を含む `ContainerId` では panic せず `Ok` を
+    /// 返し、`NetnsStatus::name()` が導出規則どおりの具体値になる（名前導出は
+    /// `netns.insert` より前に行われるため、導出に成功した場合のみ状態が変化する
+    /// 契約が保たれる）。長すぎる `ContainerId` では名前導出が `Err` を返し、
+    /// その場合 `netns` に一切エントリが残らないこと（insert 前に弾かれたこと）も
+    /// あわせて確認する。
     #[test]
     fn net1_create_netns_does_not_panic_for_dotted_or_long_container_id() {
         let plugin = StubNetworkPlugin::new();
@@ -1481,6 +1490,18 @@ mod tests {
             .create_netns(&CreateNetnsRequest::new(sample_network_name(), dotted))
             .expect("create_netns must not panic for a valid ContainerId with '.' and '_'");
         assert_eq!(status.name().as_str(), "netns-web-1-test");
+
+        let long_id = ContainerId::new("a".repeat(200)).expect("valid container id");
+        let err = plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                long_id.clone(),
+            ))
+            .expect_err("create_netns must not panic; it must reject a name that does not fit");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+        // 導出は insert より前に行われるため、失敗した場合は netns に一切
+        // 記録が残らない（P1 修正の核心: 旧実装は insert 済みのまま panic していた）。
+        assert_eq!(plugin.netns.lock().expect("lock netns").get(&long_id), None);
     }
 
     /// 契約 8: 存在しないネットワークへの `attach` は `NotFound`。
@@ -1826,7 +1847,9 @@ mod tests {
             .expect("the failed-to-roll-back rule must remain tracked");
         assert_eq!(residual.len(), 1);
         assert_eq!(
-            residual[0],
+            *residual
+                .first()
+                .expect("residual.len() == 1 was just asserted"),
             PortMapping::new(
                 sample_network_name(),
                 sample_container_id(),

@@ -225,8 +225,15 @@ jobs:
   # （無言の skip にはしない）。jq の失敗は fail-closed で扱う。
   #
   # タイムアウトは二段構え: ジョブ全体 30 分（他ジョブと同じ多層防御）、実行
-  # ステップ 10 分（ハング検出の本体）。テスト 1 件ごとの推奨値 5〜10 秒の
-  # 設定と、CI 全体のハング防止の最終確認は後続の TASK-87 が担当する。
+  # ステップ 10 分（ハング検出の本体）。テスト 1 件ごとの推奨タイムアウト値
+  # （PoC-8 実測に基づく 5〜10 秒のレンジ）は TASK-87.1（#40）で
+  # FANDHE_CONTAINER_TEST_TIMEOUT_SECS（下記 env）として設定済み。3 OS matrix
+  # （特に macOS/Windows runner のノイズ）を踏まえ上限寄りの 10 秒を採用した。
+  # 値を渡すだけで、これを読んで Duration を組み立て recv_timeout 等へ使う
+  # 消費側コードは integration test target が 0 件の現時点では存在せず、
+  # TASK-85（`crates/io/tests/responsiveness.rs` 等）以降で実装される
+  # 未実装状態にある（実装済みを装わない。REPAIR-3）。CI ジョブ全体のハング
+  # 防止の最終確認は TASK-87.2（#41）が担当する。
   #
   # ハングプローブ（workflow_dispatch の hang-probe=true）: リポジトリに
   # ハングするテストを常設せず、$RUNNER_TEMP 配下（リポ外）に依存なしの
@@ -254,6 +261,11 @@ jobs:
       # github.event_name で明示的に絞る。値は env 経由でのみ受け取り、
       # run: スクリプトへ `${{ }}` を直接埋め込まない（スクリプトインジェクション対策）
       HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.hang-probe == true }}
+      # 個別テスト 1 件ごとの推奨タイムアウト値（秒。PoC-8 実測に基づく
+      # 5〜10 秒のレンジの上限寄り。TASK-87.1・#40・REPAIR-5）。現時点では
+      # integration test target が 0 件のため、この値を読んで使う消費側
+      # コードはまだ無い（TASK-85 以降で追加予定。REPAIR-3）
+      FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87

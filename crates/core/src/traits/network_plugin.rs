@@ -308,7 +308,11 @@ fn validate_identifier(value: &str, kind: &str) -> Result<(), TraitError> {
 pub struct NetworkName(String);
 
 impl NetworkName {
-    /// 入力文字列を検証してネットワーク名を作る（検証条件は [`validate_identifier`]）。
+    /// 入力文字列を検証してネットワーク名を作る。
+    ///
+    /// 拒否条件（いずれかに該当すると [`ErrorCode::InvalidArgument`]）: 空文字列・
+    /// 長さが 64 バイトを超える・先頭が ASCII 英数字でない・2 文字目以降に
+    /// `[A-Za-z0-9-]` 以外の文字を含む。
     pub fn new(value: impl Into<String>) -> Result<Self, TraitError> {
         let value = value.into();
         validate_identifier(&value, "network name")?;
@@ -347,13 +351,18 @@ impl TryFrom<String> for NetworkName {
 ///
 /// netns の実体（パス・fd）は本トレイトの型に含めない（下記 [`NetnsStatus`] の doc）。
 /// この型は plugin が [`ContainerId`] から導出し応答する netns の「名前」のみを表し、
-/// [`NetworkName`] と同じ文字集合・長さ制約を [`validate_identifier`] で共有する。
+/// [`NetworkName`] と同じ文字集合・長さ制約（空文字列不可・64 バイト以内・先頭が
+/// ASCII 英数字・2 文字目以降は `[A-Za-z0-9-]`）を共有する。
 /// 生成は [`NetnsName::new`] のみで、検証を経ずに値を作れない。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NetnsName(String);
 
 impl NetnsName {
-    /// 入力文字列を検証して netns 名を作る（検証条件は [`validate_identifier`]）。
+    /// 入力文字列を検証して netns 名を作る。
+    ///
+    /// 拒否条件（いずれかに該当すると [`ErrorCode::InvalidArgument`]）: 空文字列・
+    /// 長さが 64 バイトを超える・先頭が ASCII 英数字でない・2 文字目以降に
+    /// `[A-Za-z0-9-]` 以外の文字を含む。
     pub fn new(value: impl Into<String>) -> Result<Self, TraitError> {
         let value = value.into();
         validate_identifier(&value, "netns name")?;

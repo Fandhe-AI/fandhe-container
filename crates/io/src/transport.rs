@@ -2,9 +2,10 @@
 //!
 //! ホストとゲストの間のファイル共有プロトコル（IO-1）で、TASK-12（パイプライン送信
 //! クライアント）・TASK-13（バッチ write-back サーバー）・TASK-83 が共通で使う「送受信の
-//! 抽象」をここで定める。フレームの具体形（ヘッダ newtype・チェックサム）は
-//! TASK-11.2（#69）・TASK-11.3（#70）が `protocol` モジュールに追加する。本モジュールは
-//! 現時点でフレーム型の実装を 1 つも持たない（REPAIR-3。実装済みを装わない）。
+//! 抽象」をここで定める。フレームの具体形（ヘッダ newtype・チェックサム付きフレーム
+//! 全体型）は TASK-11.2（#69）・TASK-11.3（#70）が `protocol` モジュールに追加した
+//! （[`crate::protocol::Frame`]。REPAIR-2）。本モジュール自体はトランスポートの具象実装
+//! （UDS・vsock・named pipe 等）を持たない（REPAIR-3。実装済みを装わない）。
 //!
 //! OS 固有の型（`std::os::unix` 等）・`cfg(target_os = ...)` 分岐は持たない。UDS・vsock・
 //! named pipe などの具象トランスポート実装は後続タスクの担当 crate / モジュールに置く。
@@ -74,9 +75,9 @@ impl TryFrom<Duration> for IoTimeout {
 /// （REPAIR-2: 生バイト列を公開 API の関連型に指定させない）。
 ///
 /// `pub(crate)` にして crate 内の兄弟モジュールから参照できるようにしている。
-/// TASK-11.2（#69）・TASK-11.3（#70）で追加される `protocol` モジュールのフレーム型が
-/// `sealed::Sealed` を実装できる必要があるため（`protocol` は `transport` の親では
-/// なく兄弟モジュールになる想定で、`mod` 既定の非公開のままだと参照できない）。
+/// `protocol` モジュールのフレーム型（[`crate::protocol::Frame`]。TASK-11.2（#69）・
+/// TASK-11.3（#70））が `sealed::Sealed` を実装できる必要があるため（`protocol` は
+/// `transport` の親ではなく兄弟モジュールで、`mod` 既定の非公開のままだと参照できない）。
 /// crate 外からは `sealed` モジュール自体が非公開のままなので封印の効果は変わらない。
 pub(crate) mod sealed {
     /// [`super::WireFrame`] の封印用トレイト。crate 外はこれを実装できない。
@@ -89,8 +90,8 @@ pub(crate) mod sealed {
 /// 実装できるのは本 crate 内で構築時に検証済みのフレーム型のみ（[`sealed::Sealed`] で
 /// 封印）。長さ上限の検証・チェックサムの検証はフレーム型の構築時（TASK-11.2・
 /// TASK-11.3）に行われ、[`FrameReceiver::recv_frame`] は検証済みの値だけを返す契約と
-/// する。本 crate は現時点でこのトレイトを実装する非テストの型を 1 つも持たない
-/// （REPAIR-3）。
+/// する。本 crate では [`crate::protocol::Frame`]（TASK-11.3・#70）がこのトレイトを
+/// 実装する。
 pub trait WireFrame: sealed::Sealed + Send + core::fmt::Debug {}
 
 /// フレームをトランスポートへ送る側の抽象（IO-1: パイプライン送信）。

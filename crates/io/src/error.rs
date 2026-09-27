@@ -11,8 +11,7 @@ use std::fmt;
 /// `IoError` の機械可読な分類（ERR-1）。
 ///
 /// `#[non_exhaustive]` により、呼び出し側の `match` は将来のバリアント追加に備えて
-/// `_` 分岐を持つ必要がある。フレーム破損（チェックサム不一致等）用のコードは
-/// TASK-11.3（#70）でフレーム型と合わせて追加する（本件では予約しない。REPAIR-3）。
+/// `_` 分岐を持つ必要がある。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum IoErrorCode {
@@ -26,6 +25,18 @@ pub enum IoErrorCode {
     Unimplemented,
     /// 内部エラー。
     Internal,
+    /// フレームのチェックサム不一致（TASK-11.3・IO-1・REPAIR-2・#70）。
+    ///
+    /// [`crate::protocol::Frame::decode_body`] がヘッダ＋ペイロードから計算した
+    /// CRC-32C と、フレーム末尾のチェックサムが一致しない場合に返す。長さの
+    /// 不一致（[`IoErrorCode::InvalidArgument`]）とは別のコードとして区別する
+    /// （PoC-8 BREAK-2 のような偶発的破損の検出であり、真正性〔改ざん耐性〕は
+    /// 保証しない。詳細は `docs/design/io-protocol.md`）。
+    ///
+    /// gRPC 正準コードの `DATA_LOSS` を借用した名称であり、ERR-1/3/5 の既定表には
+    /// ない拡張コード。spec `error-format.md` への反映要否は spec 側への報告事項
+    /// （spec-reference）。
+    DataLoss,
 }
 
 impl IoErrorCode {
@@ -37,6 +48,7 @@ impl IoErrorCode {
             Self::Unavailable => "UNAVAILABLE",
             Self::Unimplemented => "UNIMPLEMENTED",
             Self::Internal => "INTERNAL",
+            Self::DataLoss => "DATA_LOSS",
         }
     }
 }
@@ -103,6 +115,7 @@ mod tests {
         assert_eq!(IoErrorCode::Unavailable.as_str(), "UNAVAILABLE");
         assert_eq!(IoErrorCode::Unimplemented.as_str(), "UNIMPLEMENTED");
         assert_eq!(IoErrorCode::Internal.as_str(), "INTERNAL");
+        assert_eq!(IoErrorCode::DataLoss.as_str(), "DATA_LOSS");
     }
 
     /// IO-1: `IoError` の `Display` が `"<CODE>: <message>"` 形式になる。

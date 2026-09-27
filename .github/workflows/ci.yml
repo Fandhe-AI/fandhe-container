@@ -235,19 +235,23 @@ jobs:
   # 未実装状態にある（実装済みを装わない。REPAIR-3）。
   #
   # TASK-87.2（#41）: CI ジョブ全体のハング防止の最終確認について。下記の
-  # ハングプローブ機構自体は TASK-86.2（#36）で実装済みだが、本 concurrency
+  # ハングプローブ機構自体は TASK-86.2（#36）で実装済み。本 concurrency
   # グループ（`${{ github.workflow }}-${{ github.event.pull_request.number ||
   # github.ref }}`・`cancel-in-progress: true`）は `workflow_dispatch` を
   # `main` ブランチへ向けて起動した場合、`push`（main）トリガーの通常 CI と
-  # 同一グループになり互いを cancel し合う。複数 Issue の並列自動実装・
-  # 自動マージが進行中の期間に main へ向けて起動すると、他エージェントが
-  # マージ待ちで走らせている必須チェックを誤って cancel しうるため、本
-  # TASK-87.2 の実装コミット時点ではあえて `workflow_dispatch` を起動せず、
-  # 並列実行が落ち着いたタイミング（他エージェントの CI と concurrency
-  # グループが衝突しない状態。例えば PR ブランチ自身の ref に対する起動、
-  # または main への同時 push が無い時間帯）で実施し、実行結果（run URL・
-  # 3 OS の結果）をこのコメントと AGENTS.md に追記する（実装済みを装わない。
-  # REPAIR-3）。
+  # 同一グループになり互いを cancel し合う。そのため他エージェントの並列
+  # 自動実装・自動マージが落ち着き、concurrency グループが衝突しないタイミ
+  # ングを選んで実施した: 2026-09-27、main（4469898）に対し
+  # `gh workflow run ci.yml --ref main -f hang-probe=true` を実行。実行時点
+  # で open PR は 0 件・main への直近 push の CI 完了後だったため衝突なし。
+  # run: https://github.com/Fandhe-AI/fandhe-container/actions/runs/36335480476
+  # integration-test の 3 OS（ubuntu-latest / macos-latest / windows-latest）
+  # すべてで、実行ステップ「結合試験の実行（ステージ 3・タイムアウト保護。
+  # REPAIR-5 / REPAIR-7）」が「has timed out after 10 minutes」で fail し、
+  # ジョブ全体は開始から約 10〜11 分で終了した（ジョブの timeout-minutes
+  # 30 分に達する前に、詰まらず fail することを確認済み）。今後再実行する
+  # 際も、他エージェントの CI と concurrency グループが衝突しないタイミン
+  # グを選ぶこと。
   #
   # ハングプローブ（workflow_dispatch の hang-probe=true）: リポジトリに
   # ハングするテストを常設せず、$RUNNER_TEMP 配下（リポ外）に依存なしの

@@ -146,7 +146,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 - **日本語**: やりとり・報告・コミット説明文・コード内コメントは日本語（プログラム出力文字列は英語）
 - **Conventional Commits**: `--no-verify` 禁止
 - **セキュリティレビュー**: PR 作成前に OWASP Top 10＋コンテナ分離・plugin 信頼境界を確認
-- **ユーザー承認フロー**: 実装の着手 / 依存の追加・更新 / `unsafe` の新規追加 / ライセンス判断 / root 権限コマンドの実行 / Issue 起票 / 既存ファイル上書き / implement-issue の実装開始（計画承認後）は必ずユーザー承認を経る
+- **ユーザー承認フロー**: 実装の着手 / 依存の追加・更新 / 事前承認の範囲外の `unsafe` の新規追加（[coding-rust](.claude/rules/coding-rust.md)） / ライセンス判断 / root 権限コマンドの実行 / Issue 起票 / 既存ファイル上書き / implement-issue の実装開始（計画承認後）は必ずユーザー承認を経る
 - **spec 参照**: `docs/spec` の内容を引用・要約する際は TASK-n・ビヘイビア ID（`<PREFIX>-<N>`）・MS-n を併記する。`docs/spec` は本リポから編集しない
 - **implement-issue-tree**: `.claude/workflows/implement-issue-tree.js`（相対 symlink）を named workflow として利用できる
 

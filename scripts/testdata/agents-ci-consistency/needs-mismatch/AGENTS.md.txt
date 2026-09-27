@@ -1,0 +1,45 @@
+# AGENTS.md
+
+## ビルド・テスト・回帰確認コマンド（REPAIR-7・REPAIR-10）
+
+### 成功基準（抜粋。TASK-94.1 fixture）
+
+| ターゲット | 実行内容 | 成功基準 |
+| ---- | ---- | ---- |
+| `make ci` | `lint-docs` → `check-workspace-manifest` → `fmt-check` → `lint` → `test` → `deny` の順に実行 | 6 サブターゲットすべてが終了コード 0 |
+
+### 回帰確認コマンド一覧（REPAIR-7・REPAIR-10 (b)）
+
+```bash
+make fmt-check   # cargo fmt --all --check
+make lint        # cargo clippy --workspace --all-targets -- -D warnings（既定 feature）
+make test        # cargo test --workspace（既定 feature）
+make deny        # cargo deny --locked check advisories bans licenses sources
+make ci          # lint-docs + check-workspace-manifest + fmt-check + lint + test + deny を一括実行
+```
+
+各コマンドと CI ジョブの対応（TASK-94 の整合確認で参照する）:
+
+| コマンド | 対応する CI ジョブ |
+| ---- | ---- |
+| `fmt-check`・`deny` | `rust-ci` |
+| `lint`・`test` | `rust-ci-default-features` |
+| `ci` | CI では直接実行しない |
+
+### 推奨タイムアウト値（REPAIR-5・REPAIR-10 (c)）
+
+| 層 | 値 | 設定箇所 | 根拠 |
+| ---- | ---- | ---- | ---- |
+| テスト 1 件の応答待ち（ACK・plugin RPC・子プロセス） | 推奨 5〜10 秒（CI 設定値 10 秒） | `ci.yml` `integration-test` ジョブの env `FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"` | PoC-8 実測 |
+| 結合試験の実行ステップ | 10 分 | `integration-test` ジョブの実行ステップ `timeout-minutes: 10` | TASK-86.2 |
+| ジョブ全体 | `integration-test` 30 分・`rust-ci-default-features` 30 分・`bench-regression` 15 分・`ci-complete` 5 分 | 各ジョブの `timeout-minutes` | 多層防御 |
+
+- `rust-ci`（reusable `rust-base-ci.yml` の既定値。fmt 10・clippy 30・test 30・deny 20 分）は ci.yml で上書きしていないため、この表では照合できない（手動確認）。
+
+集約ジョブ `ci-complete` が `lint-docs`・`rust-ci`・`rust-ci-default-features`・`integration-test` の全ジョブの成功を検証する。
+
+### ライセンス検査
+
+```bash
+make deny   # cargo deny --locked check advisories bans licenses sources
+```

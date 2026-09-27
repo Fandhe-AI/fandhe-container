@@ -303,6 +303,33 @@ else
 endif
 
 # --------------------------------------------------
+# AGENTS.md と CI 設定の機械照合（TASK-94.1・REPAIR-10・REPAIR-12）
+# --------------------------------------------------
+# AGENTS.md（REPAIR-10 が Codex レビューの基準として読む）の記載コマンド・
+# タイムアウト値・needs 列挙が、実際の ci.yml・Makefile と齟齬なく保たれて
+# いるかを機械照合する。bash + jq のみで完結し、cargo を必要としないため
+# bench-check と同様 HAS_CARGO では判定しない。`make ci` には含めない
+# （ci.md のローカルゲート定義を変えないため。bench 系と同じ理由）。
+
+# 照合スクリプト自体の自己テスト（scripts/testdata/agents-ci-consistency/ の
+# 固定 fixture で終了コードを照合。REPAIR-12）。
+.PHONY: agents-ci-check-selftest
+agents-ci-check-selftest: ## AGENTS.md と CI 設定の照合スクリプトの自己テスト（REPAIR-10・REPAIR-12）
+	@if ! command -v jq >/dev/null 2>&1; then \
+		echo "jq is required but not found: install it (e.g. brew install jq / apt-get install jq)" >&2; \
+		exit 1; \
+	fi
+	bash scripts/check-agents-ci-consistency-selftest.sh
+
+.PHONY: agents-ci-check
+agents-ci-check: ## AGENTS.md と ci.yml・Makefile の機械照合（TASK-94・REPAIR-10）
+	@if ! command -v jq >/dev/null 2>&1; then \
+		echo "jq is required but not found: install it (e.g. brew install jq / apt-get install jq)" >&2; \
+		exit 1; \
+	fi
+	bash scripts/check-agents-ci-consistency.sh AGENTS.md .github/workflows/ci.yml Makefile
+
+# --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------
 

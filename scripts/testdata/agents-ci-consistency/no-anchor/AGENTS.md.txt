@@ -1,0 +1,11 @@
+# AGENTS.md
+
+## ビルド・テスト・回帰確認コマンド（REPAIR-7・REPAIR-10）
+
+見出しを欠いた fixture（REPAIR-10・TASK-94.1 の no-anchor ケース）。
+'### 回帰確認コマンド一覧' の見出しが無いため、照合スクリプトはアンカーを
+見つけられず fail-closed（exit 2）で止まることを確認する。
+
+```bash
+make fmt-check
+```

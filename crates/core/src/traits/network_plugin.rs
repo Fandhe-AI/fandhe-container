@@ -103,11 +103,17 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///    に準拠。[`Self::detach`] も同じパターンを踏襲する）。
 /// 10. **静的アドレスの検証**: [`Self::attach`] の `AttachRequest::address`
 ///     （[`AttachRequest::with_address`] 経由）が指定されている場合、実装は次を検証する。
-///     (a) 指定アドレスが `req.network()` の [`Self::create_network`] 時のサブネット
-///     （`CreateNetworkRequest::subnet`）に含まれること。含まれない、またはそのサブネットの
-///     ネットワークアドレス・ブロードキャストアドレス等のホスト割り当てに使えない予約
-///     アドレスであれば [`ErrorCode::InvalidArgument`] を返す。(b) 同一ネットワーク内の
-///     他コンテナが既にそのアドレスを使用中であれば [`ErrorCode::AlreadyExists`] を返す。
+///     (a) 指定アドレスの prefix 長（`IpCidr::prefix_len`）が `req.network()` の
+///     [`Self::create_network`] 時のサブネット（`CreateNetworkRequest::subnet`）の
+///     prefix 長と一致すること。不一致であれば [`ErrorCode::InvalidArgument`] を返す
+///     （例: サブネットが `/24` のとき `/8` や `/32` を指定することはできない。
+///     prefix 長が異なると同じアドレス値でもサブネットの解釈が変わり、
+///     `AttachResponse::address` を経由して呼び出し側へ誤った境界情報が伝播するため）。
+///     (b) 指定アドレスが上記サブネットに含まれること。含まれない場合（アドレス
+///     ファミリの不一致を含む）、またはそのサブネットのネットワークアドレス・
+///     ブロードキャストアドレス等のホスト割り当てに使えない予約アドレスであれば
+///     [`ErrorCode::InvalidArgument`] を返す。(c) 同一ネットワーク内の他コンテナが
+///     既にそのアドレスを使用中であれば [`ErrorCode::AlreadyExists`] を返す。
 ///     アドレス未指定の場合は実装が動的に割り当てる（[`AttachRequest::with_address`] の
 ///     doc のとおり）。
 /// 11. **ホストポートの二重公開の拒否**: [`Self::publish_port`] は、同じホスト側ポート
@@ -153,10 +159,11 @@ pub trait NetworkPlugin: Send + Sync {
     /// [`ErrorCode::FailedPrecondition`]）。異なるネットワークに属する netns への接続を
     /// 許すと、実際の接続先ネットワークと [`Self::delete_network`] が追跡する削除対象
     /// ネットワークが食い違い、分離・後始末の契約が崩れるため。`req.address()` で
-    /// 静的アドレスが指定されている場合はサブネット内・非予約・未使用であることを
-    /// 検証する（契約 10。範囲外・予約アドレスは [`ErrorCode::InvalidArgument`]、
-    /// 他コンテナが使用中なら [`ErrorCode::AlreadyExists`]）。途中で失敗した場合は
-    /// 作成済みリソースを逆順に削除する（契約 6）。対応: NET-1・NET-2。
+    /// 静的アドレスが指定されている場合は prefix 長がサブネットと一致し、サブネット内・
+    /// 非予約・未使用であることを検証する（契約 10。prefix 長不一致・範囲外・予約
+    /// アドレスは [`ErrorCode::InvalidArgument`]、他コンテナが使用中なら
+    /// [`ErrorCode::AlreadyExists`]）。途中で失敗した場合は作成済みリソースを逆順に
+    /// 削除する（契約 6）。対応: NET-1・NET-2。
     fn attach(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError>;
 
     /// コンテナのポートをホスト側へ公開する（nft DNAT）。
@@ -631,8 +638,9 @@ impl AttachRequest {
     /// 静的 IPAM（NET-1）で使う固定アドレスを指定するビルダ。
     ///
     /// 指定しない場合、実装（plugin 側）が動的に IPAM を行う。指定した場合、
-    /// [`NetworkPlugin::attach`] の実装は対象ネットワークのサブネット内・非予約・
-    /// 未使用であることを検証する（トレイト doc の契約 10）。
+    /// [`NetworkPlugin::attach`] の実装は `address` の prefix 長が対象ネットワークの
+    /// サブネットの prefix 長と一致し、かつサブネット内・非予約・未使用であることを
+    /// 検証する（トレイト doc の契約 10）。
     pub fn with_address(mut self, address: IpCidr) -> Self {
         self.address = Some(address);
         self
@@ -940,11 +948,31 @@ mod tests {
     /// [`StubNetworkPlugin::attach`] が静的アドレス（`AttachRequest::address`）を
     /// 検証するための述語（トレイト doc の契約 10）。
     ///
-    /// `address.addr()` が `subnet` に含まれない場合、または `subnet` のネットワーク
-    /// アドレス・ブロードキャストアドレスと一致する場合に
-    /// [`ErrorCode::InvalidArgument`] を返す。使用中かどうか（契約 10 の (b)）は
-    /// 呼び出し側（`attach`）が `assigned_addresses` を見て別途判定する。
+    /// 検証順序（fail-closed）:
+    /// 1. `address.prefix_len()` が `subnet.prefix_len()` と一致すること（契約 10
+    ///    (a)）。prefix 長が異なると、同じアドレス値でもサブネットの境界（ネットワーク
+    ///    アドレス・ブロードキャストアドレスの位置）の解釈が変わり、かつ
+    ///    `AttachResponse::address` を経由してその不一致な prefix 長がそのまま
+    ///    呼び出し側へ伝播してしまう（Codex P1 指摘。例: サブネットが `/24` の
+    ///    ネットワークに `/8` や `/32` を紛れ込ませられる経路になっていた）。
+    /// 2. `address.addr()` が `subnet` に含まれること（契約 10 (b)）。アドレス
+    ///    ファミリが異なる場合も [`IpCidr::contains`] が `false` を返すためここで
+    ///    拒否される（IPv4 ネットワークへの IPv6 アドレス指定等）。
+    /// 3. `address.addr()` が `subnet` のネットワークアドレス・ブロードキャスト
+    ///    アドレスのいずれとも一致しないこと（契約 10 (b) の予約アドレス排除）。
+    ///
+    /// 使用中かどうか（契約 10 (c)）は呼び出し側（`attach`）が `assigned_addresses`
+    /// を見て別途判定する。
     fn validate_static_address(subnet: IpCidr, address: IpCidr) -> Result<(), TraitError> {
+        if address.prefix_len() != subnet.prefix_len() {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "address prefix length /{} does not match the network's subnet {subnet}",
+                    address.prefix_len()
+                ),
+            ));
+        }
         let ip = address.addr();
         if !subnet.contains(ip) {
             return Err(TraitError::new(
@@ -1927,7 +1955,107 @@ mod tests {
         assert_eq!(resp.address(), address);
     }
 
-    /// 契約 10 (a): サブネット外の静的アドレスを指定した `attach` は
+    /// 契約 10 (a): 静的アドレスの prefix 長がネットワークのサブネットの prefix 長と
+    /// 一致しない場合は `InvalidArgument`（Codex P1 指摘。`/24` のネットワークに
+    /// `/8` や `/32` を紛れ込ませられる経路になっていた）。
+    #[test]
+    fn net1_attach_with_mismatched_prefix_length_is_invalid_argument() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+
+        // サブネットは /24（sample_subnet）。/8 を指定すると prefix 長が不一致。
+        let too_wide = IpCidr::new(IpAddr::from([10, 250, 11, 42]), 8).expect("valid cidr");
+        let err = plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), sample_container_id())
+                    .with_address(too_wide),
+            )
+            .expect_err("a /8 address on a /24 network must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        // /32（ホスト経路）も同様に不一致として拒否される。
+        let too_narrow = IpCidr::new(IpAddr::from([10, 250, 11, 42]), 32).expect("valid cidr");
+        let err = plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), sample_container_id())
+                    .with_address(too_narrow),
+            )
+            .expect_err("a /32 address on a /24 network must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// 契約 10 (a): IPv6 ネットワークでも prefix 長の不一致は `InvalidArgument`
+    /// になる（v4 限定の穴ではないことを確認する）。
+    #[test]
+    fn net1_attach_with_mismatched_prefix_length_ipv6_is_invalid_argument() {
+        let plugin = StubNetworkPlugin::new();
+        let v6_subnet = IpCidr::new(IpAddr::from([0x2001u16, 0x0db8, 0, 0, 0, 0, 0, 0]), 64)
+            .expect("valid cidr");
+        plugin
+            .create_network(&CreateNetworkRequest::new(sample_network_name(), v6_subnet))
+            .expect("create ipv6 network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+
+        let mismatched = IpCidr::new(IpAddr::from([0x2001u16, 0x0db8, 0, 0, 0, 0, 0, 1]), 128)
+            .expect("valid cidr");
+        let err = plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), sample_container_id())
+                    .with_address(mismatched),
+            )
+            .expect_err("a /128 address on a /64 network must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// 契約 10 (b): IPv4 ネットワークに IPv6 の静的アドレスを指定した `attach` は
+    /// `InvalidArgument`（prefix 長の数値がたまたま一致していてもアドレス
+    /// ファミリの不一致で拒否されることを確認する自己点検テスト）。
+    #[test]
+    fn net1_attach_with_address_family_mismatch_is_invalid_argument() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create ipv4 network with /24 subnet");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+
+        // prefix 長の数値（24）はネットワークの /24 と一致させ、prefix 長不一致の
+        // チェックをすり抜けたとしても family 不一致で拒否されることを確認する。
+        let v6_address = IpCidr::new(IpAddr::from([0x2001u16, 0x0db8, 0, 0, 0, 0, 0, 1]), 24)
+            .expect("valid cidr");
+        let err = plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), sample_container_id())
+                    .with_address(v6_address),
+            )
+            .expect_err("an IPv6 address on an IPv4 network must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// 契約 10 (b): サブネット外の静的アドレスを指定した `attach` は
     /// `InvalidArgument`。
     #[test]
     fn net1_attach_with_static_address_outside_subnet_is_invalid_argument() {
@@ -1954,7 +2082,7 @@ mod tests {
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
     }
 
-    /// 契約 10 (a): サブネットのネットワークアドレス・ブロードキャストアドレスを
+    /// 契約 10 (b): サブネットのネットワークアドレス・ブロードキャストアドレスを
     /// 指定した `attach` は `InvalidArgument`（予約アドレス）。
     #[test]
     fn net1_attach_with_reserved_static_address_is_invalid_argument() {
@@ -1991,7 +2119,7 @@ mod tests {
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
     }
 
-    /// 契約 10 (b): 同一ネットワーク内の他コンテナが使用中の静的アドレスを指定した
+    /// 契約 10 (c): 同一ネットワーク内の他コンテナが使用中の静的アドレスを指定した
     /// `attach` は `AlreadyExists`。`detach` で解放されれば再利用できることも
     /// あわせて確認する。
     #[test]

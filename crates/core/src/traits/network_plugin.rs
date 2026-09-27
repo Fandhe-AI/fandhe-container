@@ -115,7 +115,10 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///     [`ErrorCode::InvalidArgument`] を返す。(c) 同一ネットワーク内の他コンテナが
 ///     既にそのアドレスを使用中であれば [`ErrorCode::AlreadyExists`] を返す。
 ///     アドレス未指定の場合は実装が動的に割り当てる（[`AttachRequest::with_address`] の
-///     doc のとおり）。
+///     doc のとおり）。動的に割り当てるアドレスも、(a)〜(b) と同じ制約
+///     （対象ネットワークのサブネット内・prefix 長一致・非予約）を満たさなければ
+///     ならない。これは新たな契約ではなく、(a)〜(b) が「実装が返す `AttachResponse`
+///     のアドレス」全般に適用される帰結である。
 /// 11. **ホストポートの二重公開の拒否**: [`Self::publish_port`] は、同じホスト側ポート
 ///     番号とプロトコルの組が、ネットワーク・コンテナに関わらず既に公開済みであれば
 ///     [`ErrorCode::AlreadyExists`] を返す。ホスト bind IP の指定はスコープ外（#19）の
@@ -637,10 +640,12 @@ impl AttachRequest {
 
     /// 静的 IPAM（NET-1）で使う固定アドレスを指定するビルダ。
     ///
-    /// 指定しない場合、実装（plugin 側）が動的に IPAM を行う。指定した場合、
-    /// [`NetworkPlugin::attach`] の実装は `address` の prefix 長が対象ネットワークの
-    /// サブネットの prefix 長と一致し、かつサブネット内・非予約・未使用であることを
-    /// 検証する（トレイト doc の契約 10）。
+    /// 指定しない場合、実装（plugin 側）が動的に IPAM を行う。動的に割り当てる
+    /// アドレスも、契約 10 の帰結として対象ネットワークのサブネット内・prefix 長
+    /// 一致・非予約・未使用でなければならない（静的指定時に課される制約と同じ
+    /// 集合を満たす）。指定した場合、[`NetworkPlugin::attach`] の実装は `address`
+    /// の prefix 長が対象ネットワークのサブネットの prefix 長と一致し、かつ
+    /// サブネット内・非予約・未使用であることを検証する（トレイト doc の契約 10）。
     pub fn with_address(mut self, address: IpCidr) -> Self {
         self.address = Some(address);
         self
@@ -995,6 +1000,94 @@ mod tests {
         Ok(())
     }
 
+    /// `subnet` のゲートウェイアドレス（ネットワークアドレス + 1）を返す
+    /// （テスト限定の規約。[`allocate_dynamic_address`] の +2 起点と対をなす）。
+    /// [`NetworkPlugin::attach`] は静的・動的いずれのアドレス割り当てでも、この
+    /// ゲートウェイを `AttachResponse::gateway` として返す。実際の default route
+    /// の付与方式（ネットワークアドレス + 1 をゲートウェイとするかどうか）は
+    /// 本番の plugin 実装の設計次第であり、#19（TASK-4.h1）で確定する。
+    fn subnet_gateway(subnet: IpCidr) -> IpAddr {
+        match subnet.network_address() {
+            IpAddr::V4(network) => IpAddr::V4(Ipv4Addr::from(u32::from(network).saturating_add(1))),
+            IpAddr::V6(network) => {
+                IpAddr::V6(Ipv6Addr::from(u128::from(network).saturating_add(1)))
+            }
+        }
+    }
+
+    /// [`StubNetworkPlugin::attach`] が動的 IPAM（`AttachRequest::address` 未指定時）
+    /// で使うアドレスを、対象ネットワークのサブネットから決定的に選ぶ
+    /// （`AttachRequest::with_address` の doc「指定しない場合、実装（plugin 側）が
+    /// 動的に IPAM を行う」の帰結。契約 10 が要求するサブネット内・prefix 一致・
+    /// 非予約を動的割り当てにも及ぼすための、テスト限定の仮規則である。本番の
+    /// 割り当てアルゴリズムは #19・TASK-4.h1 で確定する）。
+    ///
+    /// [`subnet_gateway`] と同じ規約でネットワークアドレス + 1 をゲートウェイとして
+    /// 予約し、+2 以降で `assigned`（静的割り当て済みのものを含む、その時点で
+    /// 使用中のアドレス）に含まれない最初のアドレスを返す。IPv4 はブロードキャスト
+    /// アドレスの 1 つ手前まで、IPv6 はブロードキャストの概念がないため prefix 長
+    /// から求めたホスト空間の終端まで走査する。空きがなければ
+    /// [`ErrorCode::Internal`] を返す（既存の `ErrorCode` に資源枯渇専用の分類が
+    /// ないため、契約の範囲内で妥当な既定値として用いる。新しい契約は追加しない）。
+    /// 走査回数は `MAX_DYNAMIC_ADDRESS_SCAN` で打ち切り、極端に広いサブネット
+    /// （`/0` 等）でスタブが長時間ブロックしないようにする。
+    fn allocate_dynamic_address(
+        subnet: IpCidr,
+        assigned: &HashMap<IpAddr, ContainerId>,
+    ) -> Result<IpCidr, TraitError> {
+        const MAX_DYNAMIC_ADDRESS_SCAN: u128 = 1 << 16;
+
+        let is_v4 = matches!(subnet.addr(), IpAddr::V4(_));
+        let network_num: u128 = match subnet.network_address() {
+            IpAddr::V4(addr) => u128::from(u32::from(addr)),
+            IpAddr::V6(addr) => u128::from(addr),
+        };
+        let last_usable: u128 = if is_v4 {
+            let Some(IpAddr::V4(broadcast)) = subnet.broadcast_address() else {
+                // v4 で broadcast_address が None になるのは `/32`（ホスト部なし）
+                // のときのみ。動的に割り当てられるホストアドレスが存在しない。
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    format!("no address available in subnet {subnet} (network has no host range)"),
+                ));
+            };
+            u128::from(u32::from(broadcast)).saturating_sub(1)
+        } else {
+            let host_bits = 128u32.saturating_sub(u32::from(subnet.prefix_len()));
+            if host_bits >= 128 {
+                // `/0` 相当。スタブの単純な線形探索では非現実的なため、契約の
+                // 範囲内で妥当な既定値として Internal を返す。
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    format!("subnet {subnet} is too large for the stub's dynamic allocator"),
+                ));
+            }
+            network_num.saturating_add((1u128 << host_bits).saturating_sub(1))
+        };
+
+        let mut candidate = network_num.saturating_add(2);
+        let mut attempts: u128 = 0;
+        while candidate <= last_usable && attempts < MAX_DYNAMIC_ADDRESS_SCAN {
+            let addr = if is_v4 {
+                match u32::try_from(candidate) {
+                    Ok(host) => IpAddr::V4(Ipv4Addr::from(host)),
+                    Err(_) => break,
+                }
+            } else {
+                IpAddr::V6(Ipv6Addr::from(candidate))
+            };
+            if !assigned.contains_key(&addr) {
+                return IpCidr::new(addr, subnet.prefix_len());
+            }
+            candidate = candidate.saturating_add(1);
+            attempts += 1;
+        }
+        Err(TraitError::new(
+            ErrorCode::Internal,
+            format!("no address available in subnet {subnet}"),
+        ))
+    }
+
     /// テスト専用の契約検証スタブ実装（dyn 互換性・契約 6〜11 の失敗条件を確認するため
     /// のみに使う）。トレイト doc の契約 4「本 crate にはこのトレイトの実装を置かない」
     /// は本番実装を core に置かないという方針であり、`#[cfg(test)]` 配下のみに存在する
@@ -1152,17 +1245,19 @@ mod tests {
                     "netns is bound to a different network",
                 ));
             }
-            // 契約 10: 静的アドレス（`with_address` 経由）はサブネット内・非予約・
-            // 未使用であることを検証してから記録する。未指定なら実装が動的に
-            // 割り当てる（このスタブでは固定のサンプルアドレスで代替する）。
+            // 契約 10: 静的アドレス（`with_address` 経由）はサブネット内・prefix 長
+            // 一致・非予約・未使用であることを検証してから記録する。未指定なら、
+            // 実装は対象ネットワークのサブネットから未使用・非予約のアドレスを
+            // 決定的に割り当てる（`with_address` の doc・契約 10 の帰結。
+            // `allocate_dynamic_address` の doc を参照）。
+            let mut assigned = self
+                .assigned_addresses
+                .lock()
+                .expect("lock assigned_addresses");
+            let network_addrs = assigned.entry(req.network().clone()).or_default();
             let address = match req.address() {
                 Some(address) => {
                     validate_static_address(subnet, address)?;
-                    let mut assigned = self
-                        .assigned_addresses
-                        .lock()
-                        .expect("lock assigned_addresses");
-                    let network_addrs = assigned.entry(req.network().clone()).or_default();
                     if let Some(existing) = network_addrs.get(&address.addr())
                         && existing != req.container()
                     {
@@ -1171,11 +1266,12 @@ mod tests {
                             "address is already in use by another container on this network",
                         ));
                     }
-                    network_addrs.insert(address.addr(), req.container().clone());
                     address
                 }
-                None => IpCidr::new(sample_attach_addr(), 24).expect("valid cidr"),
+                None => allocate_dynamic_address(subnet, network_addrs)?,
             };
+            network_addrs.insert(address.addr(), req.container().clone());
+            drop(assigned);
             self.attached
                 .lock()
                 .expect("lock attached")
@@ -1184,7 +1280,7 @@ mod tests {
                 req.network().clone(),
                 req.container().clone(),
                 address,
-                Some(sample_gateway()),
+                Some(subnet_gateway(subnet)),
             ))
         }
 
@@ -1436,10 +1532,6 @@ mod tests {
 
     fn sample_attach_addr() -> IpAddr {
         IpAddr::from([10, 250, 11, 2])
-    }
-
-    fn sample_gateway() -> IpAddr {
-        IpAddr::from([10, 250, 11, 1])
     }
 
     /// CRI-7: `NetworkPlugin` は dyn 互換で、`Box`/`Arc` に収めて 6 メソッドを順に呼べる。
@@ -2173,6 +2265,210 @@ mod tests {
                     .with_address(address),
             )
             .expect("the address can be reused once released by detach");
+    }
+
+    /// 契約 10 の帰結（動的 IPAM）: `with_address` 未指定の `attach` が返す
+    /// アドレスは、対象ネットワーク（`sample_network_name` とは別の
+    /// `10.250.12.0/24`）のサブネット内・prefix 長一致であることを確認する
+    /// （旧実装は `sample_network_name` 用の固定値 `10.250.11.2/24` を無条件に
+    /// 返しており、別ネットワークではサブネット外の値になっていた）。
+    #[test]
+    fn net1_attach_dynamic_address_is_within_target_network_subnet() {
+        let plugin = StubNetworkPlugin::new();
+        let subnet = IpCidr::new(IpAddr::from([10, 250, 12, 1]), 24).expect("valid cidr");
+        plugin
+            .create_network(&CreateNetworkRequest::new(other_network_name(), subnet))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                other_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+
+        let resp = plugin
+            .attach(&AttachRequest::new(
+                other_network_name(),
+                sample_container_id(),
+            ))
+            .expect("dynamic attach succeeds");
+        assert_eq!(resp.address().prefix_len(), 24);
+        assert!(
+            subnet.contains(resp.address().addr()),
+            "dynamically assigned address {} must be inside the target subnet {subnet}",
+            resp.address()
+        );
+        assert_ne!(resp.address().addr(), subnet.network_address());
+        assert_ne!(resp.address().addr(), subnet.broadcast_address().unwrap());
+    }
+
+    /// 契約 10 の帰結（動的 IPAM）: 同一ネットワークで動的に attach した 2 コンテナは
+    /// 異なるアドレスを取得する（具体値: `10.250.11.2` と `10.250.11.3`。ゲートウェイ
+    /// 相当の `.1` は割り当てられない）。
+    #[test]
+    fn net1_attach_dynamic_addresses_differ_across_containers() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns for first container");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                other_container_id(),
+            ))
+            .expect("create netns for second container");
+
+        let first = plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("first dynamic attach succeeds");
+        let second = plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                other_container_id(),
+            ))
+            .expect("second dynamic attach succeeds");
+
+        assert_eq!(
+            first.address(),
+            IpCidr::new(IpAddr::from([10, 250, 11, 2]), 24).unwrap()
+        );
+        assert_eq!(
+            second.address(),
+            IpCidr::new(IpAddr::from([10, 250, 11, 3]), 24).unwrap()
+        );
+        assert_ne!(first.address(), second.address());
+    }
+
+    /// 契約 10 の帰結（動的 IPAM）: 動的割り当ては静的に指定済みのアドレスを避ける。
+    #[test]
+    fn net1_attach_dynamic_address_avoids_statically_assigned_address() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns for first container");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                other_container_id(),
+            ))
+            .expect("create netns for second container");
+
+        // 動的割り当ての最初の候補（ネットワークアドレス + 2）を静的に予約しておく。
+        let reserved = IpCidr::new(IpAddr::from([10, 250, 11, 2]), 24).expect("valid cidr");
+        plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), sample_container_id())
+                    .with_address(reserved),
+            )
+            .expect("static attach reserves .2");
+
+        let dynamic = plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                other_container_id(),
+            ))
+            .expect("dynamic attach succeeds despite .2 being taken");
+        assert_ne!(dynamic.address(), reserved);
+        assert_eq!(
+            dynamic.address(),
+            IpCidr::new(IpAddr::from([10, 250, 11, 3]), 24).unwrap()
+        );
+    }
+
+    /// 契約 10 の帰結（動的 IPAM）: IPv6 ネットワークでも決定的にサブネット内の
+    /// アドレスを割り当てる。
+    #[test]
+    fn net1_attach_dynamic_address_ipv6() {
+        let plugin = StubNetworkPlugin::new();
+        let subnet = IpCidr::new(IpAddr::from([0x2001u16, 0x0db8, 0, 0, 0, 0, 0, 0]), 64)
+            .expect("valid cidr");
+        plugin
+            .create_network(&CreateNetworkRequest::new(sample_network_name(), subnet))
+            .expect("create ipv6 network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+
+        let resp = plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("dynamic attach succeeds on an ipv6 network");
+        assert_eq!(resp.address().prefix_len(), 64);
+        assert!(subnet.contains(resp.address().addr()));
+        assert_eq!(
+            resp.address(),
+            IpCidr::new(IpAddr::from([0x2001u16, 0x0db8, 0, 0, 0, 0, 0, 2]), 64).unwrap()
+        );
+    }
+
+    /// 契約 10 の帰結（動的 IPAM）: 小さいサブネット（`/30`）で動的に割り当てられる
+    /// アドレスは 1 つだけ（ネットワークアドレス + 2）であり、枯渇後は
+    /// `ErrorCode::Internal` を返す（既存の `ErrorCode` に資源枯渇専用の分類が
+    /// ないため、契約の範囲内で妥当な既定値として用いる。新しい契約は追加しない）。
+    #[test]
+    fn net1_attach_dynamic_address_exhaustion_on_small_subnet_is_internal() {
+        let plugin = StubNetworkPlugin::new();
+        let subnet = IpCidr::new(IpAddr::from([10, 250, 20, 0]), 30).expect("valid cidr");
+        plugin
+            .create_network(&CreateNetworkRequest::new(sample_network_name(), subnet))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns for first container");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                other_container_id(),
+            ))
+            .expect("create netns for second container");
+
+        let first = plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("the single available dynamic address is assigned");
+        assert_eq!(
+            first.address(),
+            IpCidr::new(IpAddr::from([10, 250, 20, 2]), 30).unwrap()
+        );
+
+        let err = plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                other_container_id(),
+            ))
+            .expect_err("the /30 subnet has no more dynamic addresses left");
+        assert_eq!(err.code().as_str(), "INTERNAL");
     }
 
     /// 契約 8: 存在しないネットワークへの `publish_port` は `NotFound`。

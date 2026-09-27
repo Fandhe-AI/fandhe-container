@@ -9,11 +9,10 @@ name: CI
 # ci.yml から取り込み済み。
 # ruleset（branch protection）の必須チェックには、implement-issue-tree の自動マージ前
 # ゲート（G0。PR 上の全 check-run context が必須チェックに含まれることを要求する）に
-# 適合させるため、本 workflow が生成する check-run 24 件（ci-complete・
-# lint-docs / * 5 件・rust-ci (<os>) / * 15 件・rust-ci-default-features (<os>) 3 件）を
-# すべて個別に登録済み（オーナー判断 2026-09-27。下の ci-complete ジョブのコメントを参照）。
-# TASK-86.2（#36・REPAIR-7 ステージ 3）で integration-test (<os>) 3 件を追加したため
-# 合計 27 件になったが、ruleset への追加登録は未実施（オーナー作業。下の
+# 適合させるため、本 workflow が生成する check-run 27 件（ci-complete・
+# lint-docs / * 5 件・rust-ci (<os>) / * 15 件・rust-ci-default-features (<os>) 3 件・
+# integration-test (<os>) 3 件）をすべて個別に登録済み（オーナー判断 2026-09-27。
+# TASK-86.2〔#36〕の integration-test (<os>) 3 件を含む。下の ci-complete・
 # integration-test ジョブのコメントを参照）。
 # ジョブの追加・改名・matrix 変更で check-run 名が変わる場合は ruleset 側も
 # 同時に更新する（リポジトリ設定の変更のためオーナー作業とする）
@@ -297,8 +296,8 @@ jobs:
   # チェックが未登録だと自動マージが G0 で止まる。改名された旧名が必須のまま
   # 残ると新たな check-run が報告されず全 PR がマージ不能になる）。ruleset の
   # 変更はリポジトリ設定の変更のためオーナー承認を経る。TASK-86.2（#36）で
-  # integration-test (<os>) 3 件が増え合計 27 件になったが、ruleset への追加登録は
-  # 未実施（オーナー作業）。
+  # integration-test (<os>) 3 件が増え、ruleset へも登録済み（オーナー承認
+  # 2026-09-27。合計 31 件）。
   ci-complete:
     needs: [lint-docs, rust-ci, rust-ci-default-features, integration-test]
     if: always()

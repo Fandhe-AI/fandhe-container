@@ -83,6 +83,17 @@ jobs:
   # 3 OS 一級対応（macOS・Windows・Linux）: 各ネイティブ runner で rust-base-ci
   # （fmt/clippy/test/deny）をそれぞれ実行する。fail-fast: false は 1 OS の失敗で
   # 他 OS の実行を打ち切らせないため（3 OS すべての結果を必ず得る）。
+  #
+  # deny ジョブ（REPAIR-7 ステージ 5: セキュリティチェック・依存監査。TASK-86.4・#38）は
+  # 次の 4 種を `make deny` と同一集合で実行する。
+  #   - advisories: RUSTSEC アドバイザリ（脆弱・unmaintained・unsound・yanked。REPAIR-9）
+  #   - bans: wildcards 等の禁止設定（rust-vmm 系クレートの禁止リストは MVM-4・
+  #     TASK-73 で deny.toml の [bans] へ追記予定。本 PR では追記しない）
+  #   - licenses: 許可ライセンス外の依存を検出（OSS-4・OSS-5）
+  #   - sources: crates.io 以外のレジストリ / git 依存を拒否
+  # 「禁止 API リント」（REPAIR-7 ステージ 5 のもう一方の観点）は対応する TASK が
+  # spec 側に見当たらず未導入（スタブ扱い。REPAIR-3）。導入の要否は別途 spec 側で
+  # 判断してもらう
   rust-ci:
     strategy:
       fail-fast: false
@@ -98,6 +109,14 @@ jobs:
       # make deny（Makefile の deny ターゲット）と同一のチェック集合。
       # licenses チェックは OSS-4（deny.toml の [licenses] 参照）
       deny-checks: advisories bans licenses sources
+      # cargo-deny のバージョンを Makefile の CARGO_DENY_VERSION・Dockerfile の
+      # `cargo install cargo-deny@...` と明示的に同期させる（3 箇所とも 0.20.2）。
+      # reusable workflow 側の入力既定値（cargo-deny-version の default）に
+      # 暗黙依存すると、上流 Fandhe-AI/actions が既定値を上げた際に検査の挙動が
+      # 黙って変わり得るため、ここで固定して再現性を保つ（`@latest` 追従との
+      # トレードオフを埋める。値を上げる場合は Makefile・Dockerfile 側も同時に
+      # 更新し、3 箇所の整合をレビューで確認する）
+      cargo-deny-version: "0.20.2"
       # cargo レジストリ・target の cache（reusable 側のオプトイン入力。
       # key は `**/Cargo.lock` のハッシュに加え `runner.os` を含む形で reusable
       # workflow 側が OS ごとに分離する）。ホステッド runner は毎回まっさらなため、
@@ -139,6 +158,30 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      # REPAIR-7 ステージ 5（セキュリティチェック・依存監査。TASK-86.4・#38）の
+      # 前提ファイル検証（fail-closed）。rust-ci が呼ぶ reusable
+      # rust-base-ci.yml 側の deny ジョブは、Cargo.toml・deny.toml のいずれかが
+      # 無いと deny ステップ自体を skip して success 扱いにする（fail-open）ため、
+      # 変更でこれらのファイルが誤って削除・改名されても rust-ci 側の結果だけでは
+      # 気付けない。新しいジョブを追加すると check-run 名が増えて ruleset
+      # （branch protection の必須チェック。オーナー作業）の更新が要るため、
+      # 既存の steps を持つ本ジョブへ検証ステップとして追加する（上流
+      # Fandhe-AI/actions にこの検証が入れば削除してよい）。
+      # `${{ }}` 式は run へ埋め込まず、固定のファイル名リストのみを扱う
+      - name: ステージ 5 前提ファイルの存在検証（fail-closed）
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=""
+          for f in Cargo.toml Cargo.lock deny.toml; do
+            if [ ! -f "${f}" ]; then
+              missing="${missing} ${f}"
+            fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error::required file(s) for cargo deny stage are missing:${missing}"
+            exit 1
+          fi
       # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:

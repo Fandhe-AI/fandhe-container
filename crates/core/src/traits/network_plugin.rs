@@ -49,7 +49,7 @@
 //! 「確認済み」の確定仕様ではない（REPAIR-3）。
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU16;
 
 use super::types::{ContainerId, ErrorCode, TraitError};
@@ -101,6 +101,20 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///    （[`ErrorCode::Internal`]。`message` に残存資源を含める。契約 6 の
 ///    [`Self::publish_port`] と同じ fail-closed の表現）を返す（PoC-15 の `net-delete`
 ///    に準拠。[`Self::detach`] も同じパターンを踏襲する）。
+/// 10. **静的アドレスの検証**: [`Self::attach`] の `AttachRequest::address`
+///     （[`AttachRequest::with_address`] 経由）が指定されている場合、実装は次を検証する。
+///     (a) 指定アドレスが `req.network()` の [`Self::create_network`] 時のサブネット
+///     （`CreateNetworkRequest::subnet`）に含まれること。含まれない、またはそのサブネットの
+///     ネットワークアドレス・ブロードキャストアドレス等のホスト割り当てに使えない予約
+///     アドレスであれば [`ErrorCode::InvalidArgument`] を返す。(b) 同一ネットワーク内の
+///     他コンテナが既にそのアドレスを使用中であれば [`ErrorCode::AlreadyExists`] を返す。
+///     アドレス未指定の場合は実装が動的に割り当てる（[`AttachRequest::with_address`] の
+///     doc のとおり）。
+/// 11. **ホストポートの二重公開の拒否**: [`Self::publish_port`] は、同じホスト側ポート
+///     番号とプロトコルの組が、ネットワーク・コンテナに関わらず既に公開済みであれば
+///     [`ErrorCode::AlreadyExists`] を返す。ホスト bind IP の指定はスコープ外（#19）の
+///     ままであるため、判定キーは `(host_port, protocol)` のみとする。[`Self::detach`]
+///     または [`Self::delete_network`] で解放されたポートは再公開できる。
 ///
 /// メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 /// dyn 互換（object safety）を保ち、async ランタイムへの依存を追加しない
@@ -138,7 +152,10 @@ pub trait NetworkPlugin: Send + Sync {
     /// （`CreateNetnsRequest::network`）が `req.network()` と一致すること（不一致なら
     /// [`ErrorCode::FailedPrecondition`]）。異なるネットワークに属する netns への接続を
     /// 許すと、実際の接続先ネットワークと [`Self::delete_network`] が追跡する削除対象
-    /// ネットワークが食い違い、分離・後始末の契約が崩れるため。途中で失敗した場合は
+    /// ネットワークが食い違い、分離・後始末の契約が崩れるため。`req.address()` で
+    /// 静的アドレスが指定されている場合はサブネット内・非予約・未使用であることを
+    /// 検証する（契約 10。範囲外・予約アドレスは [`ErrorCode::InvalidArgument`]、
+    /// 他コンテナが使用中なら [`ErrorCode::AlreadyExists`]）。途中で失敗した場合は
     /// 作成済みリソースを逆順に削除する（契約 6）。対応: NET-1・NET-2。
     fn attach(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError>;
 
@@ -155,9 +172,13 @@ pub trait NetworkPlugin: Send + Sync {
     /// 宛先は生の IP アドレスではなく [`ContainerId`] で指定し、実装（plugin 側）が
     /// attach 済みのアドレスへ解決する。これは PoC-15 との差分であり、ネットワーク外の
     /// 任意ホストへ DNAT させる経路をトレイト境界で作らないための設計である
-    /// （#19 で確認する）。DNAT ルール追加後に失敗した場合は追加済みのルールを撤回して
-    /// から `Err` を返し、撤回にも失敗すれば [`ErrorCode::Internal`] を返す（契約 6）。
-    /// 対応: NET-4。
+    /// （#19 で確認する）。加えて、同じホスト側ポートとプロトコルの組がネットワーク・
+    /// コンテナに関わらず既に公開済みであれば [`ErrorCode::AlreadyExists`] を返す
+    /// （契約 11。ホスト bind IP の指定はスコープ外〔#19〕のため判定キーは
+    /// `(host_port, protocol)` のみ）。[`Self::detach`] / [`Self::delete_network`] で
+    /// 解放されたポートは再公開できる。DNAT ルール追加後に失敗した場合は追加済みの
+    /// ルールを撤回してから `Err` を返し、撤回にも失敗すれば [`ErrorCode::Internal`] を
+    /// 返す（契約 6）。対応: NET-4。
     fn publish_port(&self, req: &PublishPortRequest) -> Result<PortMapping, TraitError>;
 
     /// コンテナのネットワーク接続を解放する（ポート公開 → veth → netns の逆順）。
@@ -370,6 +391,73 @@ impl IpCidr {
     pub fn prefix_len(&self) -> u8 {
         self.prefix_len
     }
+
+    /// このサブネットに `addr` が含まれるかどうかを判定する（NET-1・契約 10 の
+    /// 「サブネット内」検証で使う）。アドレスファミリが異なる場合は常に `false` を
+    /// 返す（IPv4 サブネットは IPv6 アドレスを含み得ないため）。
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        match (self.addr, addr) {
+            (IpAddr::V4(base), IpAddr::V4(target)) => {
+                let mask = v4_prefix_mask(self.prefix_len);
+                (u32::from(base) & mask) == (u32::from(target) & mask)
+            }
+            (IpAddr::V6(base), IpAddr::V6(target)) => {
+                let mask = v6_prefix_mask(self.prefix_len);
+                (u128::from(base) & mask) == (u128::from(target) & mask)
+            }
+            _ => false,
+        }
+    }
+
+    /// このサブネットのネットワークアドレス（ホスト部がすべて 0）を返す
+    /// （NET-1・契約 10 の予約アドレス検証で使う）。
+    pub fn network_address(&self) -> IpAddr {
+        match self.addr {
+            IpAddr::V4(base) => IpAddr::V4(Ipv4Addr::from(
+                u32::from(base) & v4_prefix_mask(self.prefix_len),
+            )),
+            IpAddr::V6(base) => IpAddr::V6(Ipv6Addr::from(
+                u128::from(base) & v6_prefix_mask(self.prefix_len),
+            )),
+        }
+    }
+
+    /// このサブネットのブロードキャストアドレス（ホスト部がすべて 1）を返す
+    /// （NET-1・契約 10 の予約アドレス検証で使う）。IPv6 にはブロードキャストの概念が
+    /// ないため常に `None`。IPv4 でもホスト部が存在しない `/32` はネットワーク
+    /// アドレスとブロードキャストアドレスを区別できないため `None` を返す。
+    pub fn broadcast_address(&self) -> Option<IpAddr> {
+        match self.addr {
+            IpAddr::V4(base) if self.prefix_len < 32 => {
+                let mask = v4_prefix_mask(self.prefix_len);
+                Some(IpAddr::V4(Ipv4Addr::from(u32::from(base) | !mask)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// `prefix_len`（0..=32）に対応する IPv4 のサブネットマスクをビット表現で返す。
+///
+/// `prefix_len == 0` はホスト部のみ（マスク全 0）を意味し、シフト量 32 は
+/// Rust の整数シフトで許容されない（オーバーフロー panic）ため専用に分岐する。
+/// `IpCidr::new` が範囲（0..=32）を検証済みであることを前提とする内部ヘルパー。
+fn v4_prefix_mask(prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix_len))
+    }
+}
+
+/// `prefix_len`（0..=128）に対応する IPv6 のサブネットマスクをビット表現で返す。
+/// 分岐の理由は [`v4_prefix_mask`] と同じ（シフト量 128 の回避）。
+fn v6_prefix_mask(prefix_len: u8) -> u128 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(prefix_len))
+    }
 }
 
 impl fmt::Display for IpCidr {
@@ -542,7 +630,9 @@ impl AttachRequest {
 
     /// 静的 IPAM（NET-1）で使う固定アドレスを指定するビルダ。
     ///
-    /// 指定しない場合、実装（plugin 側）が動的に IPAM を行う。
+    /// 指定しない場合、実装（plugin 側）が動的に IPAM を行う。指定した場合、
+    /// [`NetworkPlugin::attach`] の実装は対象ネットワークのサブネット内・非予約・
+    /// 未使用であることを検証する（トレイト doc の契約 10）。
     pub fn with_address(mut self, address: IpCidr) -> Self {
         self.address = Some(address);
         self
@@ -809,7 +899,7 @@ impl DeleteNetworkResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -847,7 +937,37 @@ mod tests {
         NetnsName::new(format!("{PREFIX}{sanitized}"))
     }
 
-    /// テスト専用の契約検証スタブ実装（dyn 互換性・契約 6〜9 の失敗条件を確認するため
+    /// [`StubNetworkPlugin::attach`] が静的アドレス（`AttachRequest::address`）を
+    /// 検証するための述語（トレイト doc の契約 10）。
+    ///
+    /// `address.addr()` が `subnet` に含まれない場合、または `subnet` のネットワーク
+    /// アドレス・ブロードキャストアドレスと一致する場合に
+    /// [`ErrorCode::InvalidArgument`] を返す。使用中かどうか（契約 10 の (b)）は
+    /// 呼び出し側（`attach`）が `assigned_addresses` を見て別途判定する。
+    fn validate_static_address(subnet: IpCidr, address: IpCidr) -> Result<(), TraitError> {
+        let ip = address.addr();
+        if !subnet.contains(ip) {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("address {ip} is outside the network's subnet {subnet}"),
+            ));
+        }
+        if ip == subnet.network_address() {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("address {ip} is the network address of the subnet {subnet}"),
+            ));
+        }
+        if subnet.broadcast_address() == Some(ip) {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("address {ip} is the broadcast address of the subnet {subnet}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// テスト専用の契約検証スタブ実装（dyn 互換性・契約 6〜11 の失敗条件を確認するため
     /// のみに使う）。トレイト doc の契約 4「本 crate にはこのトレイトの実装を置かない」
     /// は本番実装を core に置かないという方針であり、`#[cfg(test)]` 配下のみに存在する
     /// 契約チェック用スタブはその対象外である。
@@ -856,12 +976,20 @@ mod tests {
     /// して保持し、トレイト doc の契約 6〜9・各メソッド doc が定める前提違反を実際に
     /// 検出する。
     struct StubNetworkPlugin {
-        networks: Mutex<HashSet<NetworkName>>,
+        /// ネットワーク名 → 作成時のサブネット。契約 10（静的アドレス検証）で
+        /// `req.network()` のサブネットを参照するために `IpCidr` も保持する。
+        networks: Mutex<HashMap<NetworkName, IpCidr>>,
         netns: Mutex<HashMap<ContainerId, NetworkName>>,
         attached: Mutex<HashMap<ContainerId, NetworkName>>,
         /// コンテナごとに公開済みのポート（[`NetworkPlugin::detach`] が解放対象を
-        /// 追跡し、[`NetworkPlugin::publish_port`] が積む）。
+        /// 追跡し、[`NetworkPlugin::publish_port`] が積む）。契約 11（ホストポートの
+        /// 二重公開の拒否）の判定もこのマップを全件走査して行う（別途フラットな
+        /// `(host_port, protocol)` 集合を持たず、`detach`/`delete_network` による
+        /// 解放と自動的に整合させるため）。
         published: Mutex<HashMap<ContainerId, Vec<PortMapping>>>,
+        /// ネットワーク名 → （割り当て済みアドレス → コンテナ ID）。契約 10 の
+        /// 「同一ネットワーク内の他コンテナが使用中」判定に使う。
+        assigned_addresses: Mutex<HashMap<NetworkName, HashMap<IpAddr, ContainerId>>>,
         /// ネットワーク本体の削除（`networks` からの除去）だけを失敗させる
         /// （契約 9。配下の netns・attach・公開ポートの回収は成功する前提）。
         fail_delete: AtomicBool,
@@ -878,10 +1006,11 @@ mod tests {
     impl StubNetworkPlugin {
         fn new() -> Self {
             Self {
-                networks: Mutex::new(HashSet::new()),
+                networks: Mutex::new(HashMap::new()),
                 netns: Mutex::new(HashMap::new()),
                 attached: Mutex::new(HashMap::new()),
                 published: Mutex::new(HashMap::new()),
+                assigned_addresses: Mutex::new(HashMap::new()),
                 fail_delete: AtomicBool::new(false),
                 fail_publish_port: AtomicBool::new(false),
                 fail_publish_port_rollback: AtomicBool::new(false),
@@ -925,12 +1054,13 @@ mod tests {
     impl NetworkPlugin for StubNetworkPlugin {
         fn create_network(&self, req: &CreateNetworkRequest) -> Result<NetworkStatus, TraitError> {
             let mut networks = self.networks.lock().expect("lock networks");
-            if !networks.insert(req.name().clone()) {
+            if networks.contains_key(req.name()) {
                 return Err(TraitError::new(
                     ErrorCode::AlreadyExists,
                     "network already exists",
                 ));
             }
+            networks.insert(req.name().clone(), req.subnet());
             Ok(NetworkStatus::new(req.name().clone(), req.subnet()))
         }
 
@@ -939,7 +1069,7 @@ mod tests {
                 .networks
                 .lock()
                 .expect("lock networks")
-                .contains(req.network())
+                .contains_key(req.network())
             {
                 return Err(TraitError::new(ErrorCode::NotFound, "network not found"));
             }
@@ -961,14 +1091,12 @@ mod tests {
         }
 
         fn attach(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError> {
-            if !self
+            let subnet = *self
                 .networks
                 .lock()
                 .expect("lock networks")
-                .contains(req.network())
-            {
-                return Err(TraitError::new(ErrorCode::NotFound, "network not found"));
-            }
+                .get(req.network())
+                .ok_or_else(|| TraitError::new(ErrorCode::NotFound, "network not found"))?;
             let netns = self.netns.lock().expect("lock netns");
             let bound_network = netns
                 .get(req.container())
@@ -979,9 +1107,30 @@ mod tests {
                     "netns is bound to a different network",
                 ));
             }
-            let address = req
-                .address()
-                .unwrap_or_else(|| IpCidr::new(sample_attach_addr(), 24).expect("valid cidr"));
+            // 契約 10: 静的アドレス（`with_address` 経由）はサブネット内・非予約・
+            // 未使用であることを検証してから記録する。未指定なら実装が動的に
+            // 割り当てる（このスタブでは固定のサンプルアドレスで代替する）。
+            let address = match req.address() {
+                Some(address) => {
+                    validate_static_address(subnet, address)?;
+                    let mut assigned = self
+                        .assigned_addresses
+                        .lock()
+                        .expect("lock assigned_addresses");
+                    let network_addrs = assigned.entry(req.network().clone()).or_default();
+                    if let Some(existing) = network_addrs.get(&address.addr())
+                        && existing != req.container()
+                    {
+                        return Err(TraitError::new(
+                            ErrorCode::AlreadyExists,
+                            "address is already in use by another container on this network",
+                        ));
+                    }
+                    network_addrs.insert(address.addr(), req.container().clone());
+                    address
+                }
+                None => IpCidr::new(sample_attach_addr(), 24).expect("valid cidr"),
+            };
             self.attached
                 .lock()
                 .expect("lock attached")
@@ -999,7 +1148,7 @@ mod tests {
                 .networks
                 .lock()
                 .expect("lock networks")
-                .contains(req.network())
+                .contains_key(req.network())
             {
                 return Err(TraitError::new(ErrorCode::NotFound, "network not found"));
             }
@@ -1011,6 +1160,27 @@ mod tests {
                 return Err(TraitError::new(
                     ErrorCode::FailedPrecondition,
                     "container is attached to a different network",
+                ));
+            }
+            drop(attached);
+            // 契約 11: 同じホスト側ポートとプロトコルの組がネットワーク・コンテナに
+            // 関わらず既に公開済みなら拒否する。フラットな `(host_port, protocol)`
+            // 集合を別途持たず `published` を全件走査するのは、`detach` /
+            // `delete_network` による解放（`published` からの削除）と自動的に
+            // 整合させ、二重管理による状態不整合を避けるため。
+            if self
+                .published
+                .lock()
+                .expect("lock published")
+                .values()
+                .flatten()
+                .any(|existing| {
+                    existing.host_port() == req.host_port() && existing.protocol() == req.protocol()
+                })
+            {
+                return Err(TraitError::new(
+                    ErrorCode::AlreadyExists,
+                    "host port is already published",
                 ));
             }
             let mapping = PortMapping::new(
@@ -1079,7 +1249,7 @@ mod tests {
                 .networks
                 .lock()
                 .expect("lock networks")
-                .contains(req.network())
+                .contains_key(req.network())
             {
                 return Err(TraitError::new(ErrorCode::NotFound, "network not found"));
             }
@@ -1108,6 +1278,16 @@ mod tests {
                 .lock()
                 .expect("lock attached")
                 .remove(req.container());
+            // 契約 10 の割り当て済みアドレス台帳も、attach の解放にあわせて回収する
+            // （このコンテナが占有していたアドレスを他コンテナが再利用できるようにする）。
+            if let Some(addrs) = self
+                .assigned_addresses
+                .lock()
+                .expect("lock assigned_addresses")
+                .get_mut(req.network())
+            {
+                addrs.retain(|_, container| container != req.container());
+            }
             if self.fail_detach.load(Ordering::SeqCst) {
                 drop(netns);
                 return Err(TraitError::new(
@@ -1148,6 +1328,12 @@ mod tests {
             drop(netns);
             drop(attached);
             drop(published);
+            // 契約 10 の割り当て済みアドレス台帳もネットワーク単位で回収する
+            // （配下資源の回収と同じく常に成功する前提）。
+            self.assigned_addresses
+                .lock()
+                .expect("lock assigned_addresses")
+                .remove(&name);
             // 契約 9: ネットワーク本体（bridge・nft テーブル相当）の削除に失敗した場合、
             // 配下資源は既に回収済みのため、残存資源は `networks` のエントリ自体になる。
             // message にその旨を含め、`networks` からは除去せずに `Err` を返す
@@ -1386,6 +1572,75 @@ mod tests {
         assert_eq!(cidr.to_string(), "10.250.11.1/24");
     }
 
+    /// 契約 10: `IpCidr::contains` は IPv4 サブネット内外を判定し、アドレス
+    /// ファミリが異なれば常に `false` を返す。
+    #[test]
+    fn net1_ip_cidr_contains_ipv4() {
+        let subnet = IpCidr::new(IpAddr::from([10, 250, 11, 0]), 24).expect("valid cidr");
+        assert!(subnet.contains(IpAddr::from([10, 250, 11, 1])));
+        assert!(subnet.contains(IpAddr::from([10, 250, 11, 254])));
+        assert!(!subnet.contains(IpAddr::from([10, 250, 12, 1])));
+        // アドレスファミリ不一致は常に false。
+        assert!(!subnet.contains(IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1])));
+    }
+
+    /// 契約 10: `IpCidr::contains` は IPv6 サブネット内外を判定する。
+    #[test]
+    fn net1_ip_cidr_contains_ipv6() {
+        let subnet = IpCidr::new(IpAddr::from([0x2001u16, 0x0db8, 0, 0, 0, 0, 0, 0]), 32)
+            .expect("valid cidr");
+        assert!(subnet.contains(IpAddr::from([0x2001u16, 0x0db8, 0, 0, 0, 0, 0, 1])));
+        assert!(!subnet.contains(IpAddr::from([0x2001u16, 0x0db9, 0, 0, 0, 0, 0, 1])));
+    }
+
+    /// 契約 10: prefix 長 0（境界値）は同一アドレスファミリの任意のアドレスを含む。
+    #[test]
+    fn net1_ip_cidr_contains_prefix_zero_matches_any_same_family_address() {
+        let v4_any = IpCidr::new(IpAddr::from([0, 0, 0, 0]), 0).expect("valid cidr");
+        assert!(v4_any.contains(IpAddr::from([255, 255, 255, 255])));
+        assert!(v4_any.contains(IpAddr::from([1, 2, 3, 4])));
+
+        let v6_any = IpCidr::new(IpAddr::from([0u16; 8]), 0).expect("valid cidr");
+        assert!(v6_any.contains(IpAddr::from([0xffffu16; 8])));
+    }
+
+    /// 契約 10: prefix 長が最大値（境界値。v4: 32・v6: 128）はホスト経路として
+    /// 完全一致するアドレスのみを含む。
+    #[test]
+    fn net1_ip_cidr_contains_max_prefix_matches_exact_address_only() {
+        let v4_host = IpCidr::new(IpAddr::from([10, 0, 0, 1]), 32).expect("valid cidr");
+        assert!(v4_host.contains(IpAddr::from([10, 0, 0, 1])));
+        assert!(!v4_host.contains(IpAddr::from([10, 0, 0, 2])));
+
+        let v6_host =
+            IpCidr::new(IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1]), 128).expect("valid cidr");
+        assert!(v6_host.contains(IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1])));
+        assert!(!v6_host.contains(IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 2])));
+    }
+
+    /// 契約 10: IPv4 サブネットのネットワークアドレス・ブロードキャストアドレスが
+    /// 具体値どおりになる（`10.250.11.0/24` → `.0` と `.255`）。
+    #[test]
+    fn net1_ip_cidr_network_and_broadcast_addresses_ipv4() {
+        let subnet = IpCidr::new(IpAddr::from([10, 250, 11, 1]), 24).expect("valid cidr");
+        assert_eq!(subnet.network_address(), IpAddr::from([10, 250, 11, 0]));
+        assert_eq!(
+            subnet.broadcast_address(),
+            Some(IpAddr::from([10, 250, 11, 255]))
+        );
+    }
+
+    /// 契約 10: IPv6 にはブロードキャストの概念がなく常に `None`。IPv4 の `/32`
+    /// もネットワークアドレスとブロードキャストアドレスを区別できないため `None`。
+    #[test]
+    fn net1_ip_cidr_broadcast_address_is_none_for_ipv6_and_slash32() {
+        let v6 = IpCidr::new(IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1]), 64).expect("valid cidr");
+        assert_eq!(v6.broadcast_address(), None);
+
+        let v4_host = IpCidr::new(IpAddr::from([10, 0, 0, 1]), 32).expect("valid cidr");
+        assert_eq!(v4_host.broadcast_address(), None);
+    }
+
     /// NET-4: `Protocol::as_str` が全バリアントで小文字文字列を返す。
     #[test]
     fn net1_protocol_as_str() {
@@ -1569,6 +1824,153 @@ mod tests {
         assert_eq!(err.code().as_str(), "FAILED_PRECONDITION");
     }
 
+    /// 契約 10: サブネット内・非予約・未使用の静的アドレスを指定した `attach` は
+    /// 成功し、指定どおりのアドレスが `AttachResponse` に反映される。
+    #[test]
+    fn net1_attach_with_valid_static_address_succeeds() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+        let address = IpCidr::new(IpAddr::from([10, 250, 11, 42]), 24).expect("valid cidr");
+        let resp = plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), sample_container_id())
+                    .with_address(address),
+            )
+            .expect("valid static address must be accepted");
+        assert_eq!(resp.address(), address);
+    }
+
+    /// 契約 10 (a): サブネット外の静的アドレスを指定した `attach` は
+    /// `InvalidArgument`。
+    #[test]
+    fn net1_attach_with_static_address_outside_subnet_is_invalid_argument() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+        let outside = IpCidr::new(IpAddr::from([10, 250, 12, 42]), 24).expect("valid cidr");
+        let err = plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), sample_container_id())
+                    .with_address(outside),
+            )
+            .expect_err("address outside the subnet must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// 契約 10 (a): サブネットのネットワークアドレス・ブロードキャストアドレスを
+    /// 指定した `attach` は `InvalidArgument`（予約アドレス）。
+    #[test]
+    fn net1_attach_with_reserved_static_address_is_invalid_argument() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+
+        let network_addr = IpCidr::new(IpAddr::from([10, 250, 11, 0]), 24).expect("valid cidr");
+        let err = plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), sample_container_id())
+                    .with_address(network_addr),
+            )
+            .expect_err("the network address itself must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+
+        let broadcast_addr = IpCidr::new(IpAddr::from([10, 250, 11, 255]), 24).expect("valid cidr");
+        let err = plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), sample_container_id())
+                    .with_address(broadcast_addr),
+            )
+            .expect_err("the broadcast address must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// 契約 10 (b): 同一ネットワーク内の他コンテナが使用中の静的アドレスを指定した
+    /// `attach` は `AlreadyExists`。`detach` で解放されれば再利用できることも
+    /// あわせて確認する。
+    #[test]
+    fn net1_attach_with_static_address_in_use_by_other_container_is_already_exists() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns for first container");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                other_container_id(),
+            ))
+            .expect("create netns for second container");
+
+        let address = IpCidr::new(IpAddr::from([10, 250, 11, 42]), 24).expect("valid cidr");
+        plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), sample_container_id())
+                    .with_address(address),
+            )
+            .expect("first container acquires the address");
+
+        let err = plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), other_container_id())
+                    .with_address(address),
+            )
+            .expect_err("a different container must not reuse the same address");
+        assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
+
+        // 解放（detach）すれば別コンテナが同じアドレスを取得できる。
+        plugin
+            .detach(&DetachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("detach releases the address");
+        plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), other_container_id())
+                    .with_address(address),
+            )
+            .expect("the address can be reused once released by detach");
+    }
+
     /// 契約 8: 存在しないネットワークへの `publish_port` は `NotFound`。
     #[test]
     fn net4_publish_port_without_network_is_not_found() {
@@ -1646,6 +2048,210 @@ mod tests {
             ))
             .expect_err("container is attached to a different network");
         assert_eq!(err.code().as_str(), "FAILED_PRECONDITION");
+    }
+
+    /// 契約 11: 同じホストポート・プロトコルの組は、ネットワーク・コンテナが異なって
+    /// いても二重公開を拒否される（`AlreadyExists`）。
+    #[test]
+    fn net4_publish_port_duplicate_host_port_is_already_exists() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create front-end network");
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                other_network_name(),
+                IpCidr::new(IpAddr::from([10, 250, 12, 1]), 24).expect("valid cidr"),
+            ))
+            .expect("create back-end network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns for first container");
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("attach first container");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                other_network_name(),
+                other_container_id(),
+            ))
+            .expect("create netns for second container");
+        plugin
+            .attach(&AttachRequest::new(
+                other_network_name(),
+                other_container_id(),
+            ))
+            .expect("attach second container");
+
+        plugin
+            .publish_port(&PublishPortRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect("first publish_port succeeds");
+
+        // 別ネットワーク・別コンテナでも、同じ host_port・プロトコルの組は拒否される。
+        let err = plugin
+            .publish_port(&PublishPortRequest::new(
+                other_network_name(),
+                other_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(81).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect_err("the same host port and protocol must not be published twice");
+        assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
+
+        // プロトコルが異なれば同じ host_port を公開できる（判定キーは
+        // (host_port, protocol) のため）。
+        plugin
+            .publish_port(&PublishPortRequest::new(
+                other_network_name(),
+                other_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(81).expect("nonzero"),
+                Protocol::Udp,
+            ))
+            .expect("a different protocol on the same host port must be allowed");
+    }
+
+    /// 契約 11: `detach` で解放されたホストポートは再公開できる。
+    #[test]
+    fn net4_publish_port_reusable_after_detach() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("attach");
+        plugin
+            .publish_port(&PublishPortRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect("first publish_port succeeds");
+
+        plugin
+            .detach(&DetachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("detach releases the published port");
+
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("recreate netns");
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("re-attach");
+        plugin
+            .publish_port(&PublishPortRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect("the host port must be reusable once released by detach");
+    }
+
+    /// 契約 11: `delete_network` で解放されたホストポートは再公開できる。
+    #[test]
+    fn net4_publish_port_reusable_after_delete_network() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("attach");
+        plugin
+            .publish_port(&PublishPortRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect("first publish_port succeeds");
+
+        plugin
+            .delete_network(&DeleteNetworkRequest::new(sample_network_name()))
+            .expect("delete_network releases the published port");
+
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("recreate network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("recreate netns");
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("re-attach");
+        plugin
+            .publish_port(&PublishPortRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect("the host port must be reusable once released by delete_network");
     }
 
     /// 契約 9: `delete_network` はネットワーク本体の削除に失敗すれば `Internal` を

@@ -45,7 +45,8 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
 
 - 対象: Cargo の integration test target（各 crate の `tests/*.rs`。lib 内 unit test は rust-ci / rust-ci-default-features が担うため対象外）
 - 実行コマンド: `make test-integration`（`cargo test --workspace --test '*'`。integration test target が 0 件の場合は notice を出して成功終了する。現時点では 0 件）
-- 判定基準: CI（ci.yml の `integration-test` ジョブ。3 OS matrix）は実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes でハングを検出して fail させる。テスト 1 件ごとの推奨タイムアウト値（PoC-8 実測に基づく 5〜10 秒のレンジ）は `integration-test` ジョブの env `FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"` として TASK-87.1（#40）で設定済み。この値を読んで `Duration` を組み立て `recv_timeout` 等に使う消費側コードは integration test target が 0 件の現時点では存在せず、TASK-85 以降で実装される（実装済みを装わない）。CI 全体のハング防止の最終確認は TASK-87.2（#41）が担当する
+- 判定基準: CI（ci.yml の `integration-test` ジョブ。3 OS matrix）は実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes でハングを検出して fail させる。テスト 1 件ごとの推奨タイムアウト値（PoC-8 実測に基づく 5〜10 秒のレンジ）は `integration-test` ジョブの env `FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"` として TASK-87.1（#40）で設定済み。この値を読んで `Duration` を組み立て `recv_timeout` 等に使う消費側コードは integration test target が 0 件の現時点では存在せず、TASK-85 以降で実装される（実装済みを装わない）
+- TASK-87.2（#41）: ハングプローブ機構自体は TASK-86.2（#36）で実装済みだが、CI の concurrency グループ（`${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}`・`cancel-in-progress: true`）は `main` への `workflow_dispatch` を `push`（main）トリガーの通常 CI と同一グループにする。複数 Issue の並列自動実装・自動マージが進行中の期間に `main` へ向けて起動すると他エージェントの必須チェックを誤って cancel しうるため、本コミット時点ではあえて実行を見送った。並列実行が落ち着いた時間帯、または衝突しない ref（PR ブランチ自身の ref 等）で実行し、run URL・3 OS の結果をこの一文と ci.yml のジョブコメントに追記する（実装済みを装わない。REPAIR-3）
 - ハングプローブ: `gh workflow run ci.yml --ref <branch> -f hang-probe=true` で起動する。リポ外の使い捨て crate に仕込んだハングするテストを実行し、実行ステップの timeout で 3 OS とも fail することを実証するための手動トリガー（PR・push イベントでは動かない）
 - 最初の integration test target の追加は各機能タスクが担当する。追加する差分は、実行ステップの `timeout-minutes` 内で完走することを PR 本文で確認しているか
 

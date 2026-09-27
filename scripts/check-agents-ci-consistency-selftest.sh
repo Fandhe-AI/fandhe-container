@@ -68,6 +68,16 @@ run_case "unmapped-command" "${fixtures_dir}/unmapped-command/AGENTS.md.txt" "${
 # TASK-94: ci-complete.needs と AGENTS.md の列挙が食い違う（1）
 run_case "needs-mismatch" "${fixtures_dir}/needs-mismatch/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${ok_dir}/Makefile.txt" 1
 
+# PR #1097 codex レビュー P1 の回帰確認: 対応表（各コマンドと CI ジョブの対応）の
+# 右列ジョブ名が存在するだけでなく、左列の各ターゲットがそのジョブの実行ステップ
+# から実際に到達できるかを照合する。bench-regression ジョブから
+# `make bench-check` の呼び出しステップを削除しても、これまではジョブ名の存在
+# チェックだけを通って合格（0）になっていたが、削除後は不一致として fail（1）
+# すること（拡張した AGENTS.md.txt/Makefile.txt を使い、ok/ci.yml.txt を基準に
+# ステップを 1 つ削った ci.yml.txt と比較する）。
+run_case "step-removed-baseline" "${fixtures_dir}/step-removed/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${fixtures_dir}/step-removed/Makefile.txt" 0
+run_case "step-removed" "${fixtures_dir}/step-removed/AGENTS.md.txt" "${fixtures_dir}/step-removed/ci.yml.txt" "${fixtures_dir}/step-removed/Makefile.txt" 1
+
 # OSS-4/OSS-5: cargo-deny バージョンが Makefile と ci.yml で食い違う（1）
 run_case "deny-version-mismatch" "${ok_dir}/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${fixtures_dir}/deny-version-mismatch/Makefile.txt" 1
 
@@ -79,10 +89,18 @@ run_case "no-anchor" "${fixtures_dir}/no-anchor/AGENTS.md.txt" "${ok_dir}/ci.yml
 # anchor-not-found のメッセージ付き exit 2 で止まること（fail-closed の経路自体を検証）
 run_case "missing-step-anchor" "${fixtures_dir}/missing-step-anchor/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${ok_dir}/Makefile.txt" 2
 
-# REPAIR-10 レビュー修正の回帰確認: 「ジョブ全体」表に列挙されたジョブから
-# timeout-minutes が消えても、5-3 節の graceful-degradation（note 出力・continue）
-# に到達し、無出力 exit 1 で落ちず合格（0）のまま止まること
-run_case "missing-job-timeout" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/missing-job-timeout/ci.yml.txt" "${ok_dir}/Makefile.txt" 0
+# PR #1097 codex レビュー P0 の回帰確認: 「ジョブ全体」表に列挙された
+# *ローカル*ジョブ（`uses:` を持たず `steps:` で実行する bench-regression 等）から
+# timeout-minutes が消えたら、5-3 節の graceful-degradation（note 出力・continue）
+# ではなく不一致として fail（1）すること。note で素通りしてよいのは
+# reusable workflow 呼び出し（`uses:` を持つジョブ。lint-docs・rust-ci 等）に
+# 限る（このジョブは Fandhe-AI/actions 側の設定を要し本スクリプトの照合範囲外）。
+run_case "missing-job-timeout" "${ok_dir}/AGENTS.md.txt" "${fixtures_dir}/missing-job-timeout/ci.yml.txt" "${ok_dir}/Makefile.txt" 1
+
+# 上記 P0 修正の反例確認: reusable workflow 呼び出しジョブ（`uses:` を持つ
+# lint-docs）を「ジョブ全体」表に加えても、timeout-minutes 未検出は
+# note のみに留まり合格（0）のままであること（照合できない範囲の正しい免除）
+run_case "reusable-job-timeout-exempt" "${fixtures_dir}/reusable-job-timeout-exempt/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${ok_dir}/Makefile.txt" 0
 
 # 存在しないファイル → 入力エラー（2）
 run_case "missing-file" "${ok_dir}/AGENTS.md.txt" "${ok_dir}/ci.yml.txt" "${fixtures_dir}/does-not-exist.txt" 2

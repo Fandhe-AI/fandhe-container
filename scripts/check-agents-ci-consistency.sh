@@ -182,8 +182,56 @@ if [ "$agents_ci_order" != "$makefile_ci_order" ]; then
   report "AGENTS.md の 'make ci' 構成順序 [${agents_ci_order}] が Makefile の ci: prerequisites [${makefile_ci_order}] と一致しない"
 fi
 
+# ジョブブロック（ジョブ名 → 本文）を抽出する補助関数。ジョブ本体は
+# 次のジョブ見出し（2 スペースインデント）または EOF までとする。
+# 節 4（対応表の実行内容照合）・節 5（タイムアウト値の照合）の両方から使う。
+job_block() {
+  local name="$1"
+  awk -v n="^  ${name}:[[:space:]]*\$" '
+    $0 ~ n { in_job = 1; next }
+    in_job && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit }
+    in_job { print }
+  ' "$ci_file"
+}
+
+job_level_timeout() {
+  # ジョブ本体（4 スペースインデント）の timeout-minutes のみを対象にする
+  # （8 スペースインデントのステップ個別 timeout-minutes は含めない）。
+  local block="$1"
+  # 該当行が無い場合（reusable 呼び出し等）は空文字を返す（grep 非マッチによる
+  # 呼び出し元の set -e 停止を避け、呼び出し元の [ -z ] 分岐へ確実に到達させる）。
+  printf '%s\n' "$block" | grep -E '^    timeout-minutes:' | head -n1 | grep -oE '[0-9]+' || true
+}
+
+job_is_reusable_call() {
+  # ジョブ本体（4 スペースインデント）が `uses:`（reusable workflow 呼び出し）を
+  # 持つかを判定する。reusable 呼び出しの中身（timeout-minutes・実行ステップ）は
+  # `Fandhe-AI/actions` 側（ネットワーク取得が要る）にしか無いため、
+  # 「照合できない範囲」として note に留めてよいのはこの場合のみに限る。
+  # ローカルジョブ（`steps:` を持つ）はここで検証できるため、未検出は
+  # 齟齬として fail させる（P0/P1: Codex レビュー・PR #1097。設定欠落・
+  # ステップ削除を notice や無検査で素通りさせない）。
+  local block="$1"
+  printf '%s\n' "$block" | grep -qE '^    uses:'
+}
+
+# make ターゲット名から、回帰確認コマンド一覧（節 1）で記録した
+# `# cargo ...` 注記（cmd_cargo_hints）を引く補助関数。無ければ空文字を返す。
+cmd_hint_for_target() {
+  local tgt="$1"
+  local i
+  for i in "${!cmd_targets[@]}"; do
+    if [ "${cmd_targets[$i]}" = "$tgt" ]; then
+      printf '%s' "${cmd_cargo_hints[$i]}"
+      return 0
+    fi
+  done
+  printf ''
+}
+
 # --------------------------------------------------
-# 4. 対応表の網羅性・ジョブ存在チェック（各コマンドと CI ジョブの対応）
+# 4. 対応表の網羅性・ジョブ存在・実行内容の到達可能性チェック
+#    （各コマンドと CI ジョブの対応）
 # --------------------------------------------------
 mapping_block="$(awk '
   /^\| コマンド \| 対応する CI ジョブ \|/ { in_table = 1; print; next }
@@ -240,7 +288,42 @@ ${row_targets}"
     [ -z "$job" ] && continue
     if ! printf '%s\n' "$job_names" | grep -qxF "$job"; then
       report "AGENTS.md 対応表が参照するジョブ '${job}'（コマンド: ${left}）が ci.yml の jobs に存在しない"
+      continue
     fi
+
+    # 実行内容の到達可能性チェック（P1: Codex レビュー・PR #1097）。
+    # ジョブ名が存在するだけでなく、対応表の左列に挙げた各ターゲットが
+    # そのジョブの実行ステップから到達可能か（`make <target>` の直接呼び出し、
+    # または回帰確認コマンド一覧の `# cargo ...` 注記と同じコマンドの再現）を
+    # 照合する。reusable workflow 呼び出し（`uses:`）はステップの中身が
+    # `Fandhe-AI/actions` 側（ネットワーク取得が要る）にしか無く本スクリプトの
+    # 照合範囲外のため、note に留めて exit 2/1 にはしない。
+    job_body="$(job_block "$job")"
+    if [ -z "$job_body" ]; then
+      # 直前の存在チェックを通っている以上ここには来ないはずだが、
+      # 解析前提の崩れ（見出し書式の変化等）を黙って合格にしない。
+      err "parse-error" "ci.yml: ジョブ '${job}' の本文を抽出できない（書式前提の崩れの可能性）"
+      exit 2
+    fi
+    if job_is_reusable_call "$job_body"; then
+      note "対応表の実行内容照合: '${job}' は reusable workflow 呼び出しのため ci.yml 上でステップの中身を照合できない（手動確認）"
+      continue
+    fi
+    while IFS= read -r tgt; do
+      [ -z "$tgt" ] && continue
+      hint="$(cmd_hint_for_target "$tgt")"
+      if [ -n "$hint" ]; then
+        if printf '%s' "$job_body" | grep -qF "$hint"; then
+          continue
+        fi
+        report "対応表の実行内容照合: 'make ${tgt}' の注記コマンド '${hint}' がジョブ '${job}' の実行ステップから到達できない（削除・書き換えの可能性）"
+        continue
+      fi
+      if printf '%s' "$job_body" | grep -qE "make[[:space:]]+${tgt}([[:space:]]|\$|')"; then
+        continue
+      fi
+      report "対応表の実行内容照合: 'make ${tgt}' の呼び出しがジョブ '${job}' の実行ステップから到達できない（削除・書き換えの可能性）"
+    done <<<"$row_targets"
   done <<<"$row_jobs"
 done <<<"$table_rows"
 
@@ -254,26 +337,6 @@ done
 # --------------------------------------------------
 # 5. タイムアウト値の照合（推奨タイムアウト値節）
 # --------------------------------------------------
-# ジョブブロック（ジョブ名 → 本文）を抽出する補助関数。ジョブ本体は
-# 次のジョブ見出し（2 スペースインデント）または EOF までとする。
-job_block() {
-  local name="$1"
-  awk -v n="^  ${name}:[[:space:]]*\$" '
-    $0 ~ n { in_job = 1; next }
-    in_job && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit }
-    in_job { print }
-  ' "$ci_file"
-}
-
-job_level_timeout() {
-  # ジョブ本体（4 スペースインデント）の timeout-minutes のみを対象にする
-  # （8 スペースインデントのステップ個別 timeout-minutes は含めない）。
-  local block="$1"
-  # 該当行が無い場合（reusable 呼び出し等）は空文字を返す（grep 非マッチによる
-  # 呼び出し元の set -e 停止を避け、呼び出し元の [ -z ] 分岐へ確実に到達させる）。
-  printf '%s\n' "$block" | grep -E '^    timeout-minutes:' | head -n1 | grep -oE '[0-9]+' || true
-}
-
 # 5-1: テスト 1 件の応答待ち（env FANDHE_CONTAINER_TEST_TIMEOUT_SECS）
 agents_env_secs="$(grep -oE 'CI 設定値 [0-9]+ 秒' "$agents_file" | head -n1 | grep -oE '[0-9]+' || true)"
 if [ -z "$agents_env_secs" ]; then
@@ -332,7 +395,11 @@ while IFS= read -r pair; do
   fi
   ci_minutes="$(job_level_timeout "$block")"
   if [ -z "$ci_minutes" ]; then
-    note "ジョブ全体タイムアウト: '${job}' は ci.yml 上で timeout-minutes を直接持たない（reusable 呼び出し等。手動確認）"
+    if job_is_reusable_call "$block"; then
+      note "ジョブ全体タイムアウト: '${job}' は reusable workflow 呼び出しのため ci.yml 上で timeout-minutes を直接持たない（手動確認）"
+      continue
+    fi
+    report "ジョブ全体タイムアウト: AGENTS.md が挙げる '${job}' ジョブ（ローカルジョブ）に ci.yml 上の timeout-minutes が見つからない（AGENTS.md 記載値 '${minutes} 分'）"
     continue
   fi
   if [ "$minutes" != "$ci_minutes" ]; then

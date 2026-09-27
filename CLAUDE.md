@@ -45,6 +45,7 @@ fandhe-container/
 ├── scripts/                       #（予定）依存禁止判定等
 ├── benches/                       # crate をまたぐベンチ回帰（REPAIR-8。root の workspace メンバー crate fandhe-container-benches、publish = false。Cargo.toml・src/lib.rs は TASK-1.3 雛形）
 ├── docs/
+│   ├── architecture.md            # crate 境界・依存関係グラフ・確定済み設計判断の索引（TASK-6・REPAIR-3・PLUG-1）
 │   ├── design/                    # 設計決定・拡張点・リソース効率目標
 │   │   ├── orchestration-scope.md # オーケストレーション スコープ（TASK-5・CRI-8）
 │   │   ├── from-scratch-policy.md # フルスクラッチ方針・依存基準（TASK-7・MS-0）

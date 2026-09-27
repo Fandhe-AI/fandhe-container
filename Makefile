@@ -38,7 +38,8 @@ COMMITLINT_VERSION := 21.2.1
 COMMITLINT_CONFIG_VERSION := 21.2.0
 
 # 導入系ツールの固定バージョン（`=x.y.z` 完全固定方針に合わせ exact 固定。
-# CARGO_DENY_VERSION は Dockerfile の先行導入と値を同期させる）。
+# CARGO_DENY_VERSION は Dockerfile の先行導入・.github/workflows/ci.yml の
+# rust-ci.with.cargo-deny-version（REPAIR-7 ステージ 5）と値を同期させる）。
 LEFTHOOK_VERSION := 2.1.10
 CARGO_DENY_VERSION := 0.20.2
 

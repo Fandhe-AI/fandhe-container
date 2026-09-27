@@ -134,7 +134,7 @@ make deny   # cargo deny --locked check advisories bans licenses sources
 | runner 方針 | public リポジトリのため既定は GitHub ホステッドランナー。self-hosted の使用が許可されるのは `ai-review.yml` の `codex / review` ジョブ（組織承認済み例外）のみで、`codex / preflight`・`codex / post_feedback` を含む他ジョブ・他 workflow は GitHub ホステッドランナーになっているか | P0 |
 | permissions | ワークフロー・ジョブの `permissions` が最小権限で明示されているか | P0 |
 | secrets の扱い | secrets が `pull_request` イベントのログへ出力されていないか | P0 |
-| `ci.yml` の現状 | `ci.yml` は準備が整うまで発火条件を無効化中（`workflow_dispatch` のみ）であり、workspace（`Cargo.toml`）とメンバー crate の作成後に `pull_request` / `push` を有効化する設計であることを踏まえ、この無効化自体を指摘しない | 指摘しない（既知の暫定状態） |
+| `ci.yml` の発火条件 | `ci.yml` は `workflow_dispatch`・`pull_request`・`push`（main）で稼働中（TASK-86.1・REPAIR-7）。`on:` から `pull_request` / `push` を外す変更・`pull_request_target` への変更は P1 で指摘する | P1 |
 | `ci.yml` への変更 | `ci.yml` を変更する差分では、3 OS matrix（Linux・macOS・Windows）を維持しているか、本リポに存在しない `make` ターゲット・`scripts/` を前提にしたジョブが混入していないかを確認する | P1 |
 | `release.yml` | `workflow_dispatch` 限定のプレースホルダであり、有効化には公開対象クレート・crates.io 公開方針の確定を要する。現状のプレースホルダ状態自体は指摘しない | 指摘しない（既知の暫定状態） |
 | ゲート未導入段階の追記 | REPAIR-7 の 5 段階ゲートのうち (3) タイムアウト保護された結合試験・(4) ベンチ回帰チェック（REPAIR-8）の導入時は、本書「ビルド・テスト・回帰確認コマンド」節・`.claude/rules/ci.md` の更新を伴っているか | P2 |

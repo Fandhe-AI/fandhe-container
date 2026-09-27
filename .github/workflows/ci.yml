@@ -1,22 +1,19 @@
 name: CI
 
-# 準備が整うまで発火条件を無効化している（手動実行のみのプレースホルダ）。
-# 有効化時はこの on: を削除し、下のコメントアウトした on: ブロックを戻す。
-# 有効化前に必要な作業: workspace（Cargo.toml）とメンバー crate の作成
-# （未作成のまま有効化すると rust-ci / rust-ci-default-features が「対象パッケージが
-# 無い」エラーで毎回 fail する）。lint-docs が参照する設定ファイル
-# （.markdownlint.jsonc 等）・3 OS matrix（ubuntu / macos / windows）・
-# cache-key-prefix のリポ名化は fandhe-browser の ci.yml から取り込み済み。
-# 有効化後は ruleset（branch protection）の必須チェックへ `ci-complete` 1 件を
-# 登録する（下の ci-complete ジョブのコメントを参照）
+# TASK-1（#7）・TASK-1.h1（#9）で workspace（Cargo.toml）とメンバー crate（19 crate＋
+# benches）を作成済みのため、TASK-86.1（#35・REPAIR-7）で発火条件を有効化した。
+# pull_request は fork PR でも secrets なし・read-only トークンで動くイベントを使い、
+# pull_request_target は使わない（フォークからの secrets 露出・書き込み権限奪取を防ぐ）。
+# lint-docs が参照する設定ファイル（.markdownlint.jsonc 等）・3 OS matrix
+# （ubuntu / macos / windows）・cache-key-prefix のリポ名化は fandhe-browser の
+# ci.yml から取り込み済み。
+# ruleset（branch protection）の必須チェックへの `ci-complete` 1 件の登録は
+# リポジトリ設定の変更のためオーナー作業とする（下の ci-complete ジョブのコメントを参照）
 on:
   workflow_dispatch:
-
-# on:
-#   workflow_dispatch:
-#   pull_request:
-#   push:
-#     branches: [main]
+  pull_request:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -45,10 +42,10 @@ jobs:
   # OS ごとに別名のチェックが生成され、そのままでは branch protection の必須チェック
   # 一覧を OS 追加のたびに更新する必要がある。本 workflow 内の集約ジョブ
   # `ci-complete`（下部）が lint-docs・rust-ci・rust-ci-default-features の結果を
-  # まとめて fail-closed 判定するため、有効化後は ruleset（branch protection）の
-  # 必須チェックに `ci-complete` 1 件だけを登録する（現状は workflow_dispatch のみで
-  # PR に報告されないため、今は必須化しない。報告されない必須チェックを登録すると
-  # マージが永久にブロックされる）。
+  # まとめて fail-closed 判定するため、ruleset（branch protection）の必須チェックには
+  # `ci-complete` 1 件だけを登録する（pull_request 有効化により PR 上に報告される
+  # ようになったため、登録可能。ruleset への登録自体はリポジトリ設定の変更なので
+  # オーナー作業とする）。
   lint-docs:
     # Fandhe-AI/actions は可変タグ latest（move-latest-tag 管理で main へ追従）で
     # 参照する（組織現行標準）
@@ -111,12 +108,14 @@ jobs:
   # --------------------------------------------------
   # 上記 rust-ci（reusable workflow）は `cargo clippy/test --all-features` で
   # 検証するため、既定 feature（`--all-features` なし）の構成は別途検証されない。
+  #   cargo build --workspace（REPAIR-7 ステージ 1: ビルド・型検査）
   #   cargo clippy --workspace --all-targets -- -D warnings
-  #   cargo test --workspace
+  #   cargo test --workspace（REPAIR-7 ステージ 2: ユニット / 統合テスト）
   # （いずれも既定 feature）を本 workflow 内で直接実行し、既定 feature 側の回帰も
   # CI で検出できるようにする。Makefile の `lint`/`test` ターゲット（既定 feature 用）と
-  # 同一コマンドを実行する。rust-ci と同じ 3 OS matrix で実行する（既定 feature 構成の
-  # OS 依存回帰を --all-features 側だけでは検出できないため）。
+  # 同一コマンドを実行する（`cargo build` は `--locked` を付けず、他ステップと条件を
+  # そろえる）。rust-ci と同じ 3 OS matrix で実行する（既定 feature 構成の OS 依存回帰を
+  # --all-features 側だけでは検出できないため）。
   # 生の steps を持つジョブのため、第三者 action は SHA 固定で参照する
   # （`@latest` が許されるのは Fandhe-AI/actions のみ）。
   rust-ci-default-features:
@@ -136,6 +135,8 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      - name: cargo build（既定 feature。ステージ 1）
+        run: cargo build --workspace
       - name: cargo clippy（既定 feature）
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test（既定 feature）

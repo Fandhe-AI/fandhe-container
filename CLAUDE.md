@@ -54,7 +54,7 @@ fandhe-container/
 │   │   ├── small-model-repair-policy.md  # 小型モデル自己補修方針（TASK-92・REPAIR-11/13/14）
 │   │   └── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）
-├── .github/workflows/             # ai-review・update-external（稼働）/ ci・release（発火条件無効化中）
+├── .github/workflows/             # ai-review・update-external・ci（稼働）/ release（発火条件無効化中）
 ├── .agents/skills/                # npx skills add の導入実体
 └── .claude/
     ├── agents/                    # カテゴリ別 subagent 定義

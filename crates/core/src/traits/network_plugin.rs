@@ -66,13 +66,17 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///    責務であり、`NetworkPlugin` の呼び出し側はそれらが検証済みであることを
 ///    前提にしてよい。
 /// 6. **部分失敗時のロールバック**: [`Self::create_network`]・[`Self::create_netns`]・
-///    [`Self::attach`] が途中で失敗した場合、実装は作成済みのリソース
-///    （bridge・veth・nft テーブル・netns）を逆順に削除してから `Err` を返す
-///    （PoC-15 の 2026-09-24 修正に準拠）。[`Self::create_netns`] は netns 作成後に
-///    lo の up を行うため、lo 設定が失敗した場合は作成済みの netns 自体を削除して
-///    から `Err` を返す。ロールバックせず netns を残したまま `Err` を返すと、
-///    同じコンテナへの再試行が [`ErrorCode::AlreadyExists`]（契約 7）により恒久的に
-///    失敗するため、ロールバックは再試行可能性の前提でもある。
+///    [`Self::attach`]・[`Self::publish_port`] が途中で失敗した場合、実装は作成済みの
+///    リソース（bridge・veth・nft テーブル・netns・DNAT ルール）を逆順に削除してから
+///    `Err` を返す（PoC-15 の 2026-09-24 修正に準拠）。[`Self::create_netns`] は netns
+///    作成後に lo の up を行うため、lo 設定が失敗した場合は作成済みの netns 自体を
+///    削除してから `Err` を返す。[`Self::publish_port`] は DNAT ルール追加後に失敗
+///    した場合、追加済みのルールを撤回してから `Err` を返す。撤回にも失敗した場合は
+///    [`ErrorCode::Internal`] を返し、`message` に残存資源を含める（fail-closed。
+///    呼び出し側はポート公開が残っている可能性があるものとして扱う）。ロールバックせず
+///    netns を残したまま `Err` を返すと、同じコンテナへの再試行が
+///    [`ErrorCode::AlreadyExists`]（契約 7）により恒久的に失敗するため、ロールバックは
+///    再試行可能性の前提でもある。
 /// 7. **二重作成の拒否**: 同名のネットワークや同じコンテナの netns が既にあれば
 ///    [`ErrorCode::AlreadyExists`] を返す。前回の残骸を黙って再利用しない。
 /// 8. **前提違反**: 存在しないネットワークへの [`Self::create_netns`] / [`Self::attach`] /
@@ -87,8 +91,9 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///    [`ErrorCode::FailedPrecondition`] を返す（別ネットワークに属するコンテナ ID を
 ///    渡して越境 DNAT を設定させないため）。
 /// 9. **削除はベストエフォートで続行**: [`Self::delete_network`] は個々の削除に失敗しても
-///    残りの削除を続け、1 件でも失敗があれば `Err`（[`ErrorCode::Internal`]）を返す
-///    （PoC-15 の `net-delete` に準拠）。
+///    残りの削除を続け、1 件でも失敗があれば `Err`（[`ErrorCode::Internal`]。`message`
+///    に残存資源を含める。契約 6 の [`Self::publish_port`] と同じ fail-closed の表現）
+///    を返す（PoC-15 の `net-delete` に準拠）。
 ///
 /// メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 /// dyn 互換（object safety）を保ち、async ランタイムへの依存を追加しない
@@ -143,7 +148,9 @@ pub trait NetworkPlugin: Send + Sync {
     /// 宛先は生の IP アドレスではなく [`ContainerId`] で指定し、実装（plugin 側）が
     /// attach 済みのアドレスへ解決する。これは PoC-15 との差分であり、ネットワーク外の
     /// 任意ホストへ DNAT させる経路をトレイト境界で作らないための設計である
-    /// （#19 で確認する）。対応: NET-4。
+    /// （#19 で確認する）。DNAT ルール追加後に失敗した場合は追加済みのルールを撤回して
+    /// から `Err` を返し、撤回にも失敗すれば [`ErrorCode::Internal`] を返す（契約 6）。
+    /// 対応: NET-4。
     fn publish_port(&self, req: &PublishPortRequest) -> Result<PortMapping, TraitError>;
 
     /// ネットワーク（bridge・nft テーブル・関連 netns）を一括削除する。
@@ -746,6 +753,7 @@ mod tests {
         netns: Mutex<HashMap<ContainerId, NetworkName>>,
         attached: Mutex<HashMap<ContainerId, NetworkName>>,
         fail_delete: AtomicBool,
+        fail_publish_port: AtomicBool,
     }
 
     impl StubNetworkPlugin {
@@ -755,6 +763,7 @@ mod tests {
                 netns: Mutex::new(HashMap::new()),
                 attached: Mutex::new(HashMap::new()),
                 fail_delete: AtomicBool::new(false),
+                fail_publish_port: AtomicBool::new(false),
             }
         }
 
@@ -762,6 +771,12 @@ mod tests {
         /// 「1 件でも失敗があれば `Err`」経路へ強制するためのスイッチ。
         fn set_fail_delete(&self, fail: bool) {
             self.fail_delete.store(fail, Ordering::SeqCst);
+        }
+
+        /// [`NetworkPlugin::publish_port`] の次回呼び出しを契約 6 の
+        /// 「DNAT ルール追加後に失敗し、撤回にも失敗する」経路へ強制するためのスイッチ。
+        fn set_fail_publish_port(&self, fail: bool) {
+            self.fail_publish_port.store(fail, Ordering::SeqCst);
         }
     }
 
@@ -850,6 +865,16 @@ mod tests {
                 return Err(TraitError::new(
                     ErrorCode::FailedPrecondition,
                     "container is attached to a different network",
+                ));
+            }
+            // 契約 6: DNAT ルール追加後に失敗した場合は追加済みのルールを撤回してから
+            // `Err` を返し、撤回にも失敗すれば `Internal` を返す。このスタブは
+            // `set_fail_publish_port` が立っている間、ルールを積まずに撤回済み相当の
+            // 状態のまま `Internal` を返すことでその経路を模擬する。
+            if self.fail_publish_port.load(Ordering::SeqCst) {
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to add DNAT rule and rollback also failed",
                 ));
             }
             Ok(PortMapping::new(
@@ -1304,6 +1329,42 @@ mod tests {
         let err = plugin
             .delete_network(&DeleteNetworkRequest::new(sample_network_name()))
             .expect_err("a partial failure must surface as Err");
+        assert_eq!(err.code().as_str(), "INTERNAL");
+    }
+
+    /// 契約 6: `publish_port` は DNAT ルール追加後に失敗した場合、撤回にも失敗すれば
+    /// `Internal` を返す。
+    #[test]
+    fn net4_publish_port_partial_failure_rolls_back() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("attach");
+        plugin.set_fail_publish_port(true);
+        let err = plugin
+            .publish_port(&PublishPortRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+                NonZeroU16::new(8080).expect("nonzero"),
+                NonZeroU16::new(80).expect("nonzero"),
+                Protocol::Tcp,
+            ))
+            .expect_err("DNAT rule addition and its rollback both fail");
         assert_eq!(err.code().as_str(), "INTERNAL");
     }
 }

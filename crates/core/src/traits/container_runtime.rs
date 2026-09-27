@@ -226,7 +226,7 @@ impl StopRequest {
     /// 対象コンテナの ID と SIGKILL までの猶予時間から要求を作る。
     ///
     /// 猶予は呼び出し側が明示する必要があり（無期限を許さない。REPAIR-5）、
-    /// 実装は猶予経過後に SIGKILL へ切り替える。`grace` が [`STOP_GRACE_MAX`] を
+    /// 実装は猶予経過後に SIGKILL へ切り替える。`grace` が 24 時間を
     /// 超える場合は実質無期限の値とみなし [`ErrorCode::InvalidArgument`] を返す。
     pub fn new(id: ContainerId, grace: Duration) -> Result<Self, TraitError> {
         if grace > STOP_GRACE_MAX {

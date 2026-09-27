@@ -1,4 +1,4 @@
-//! パイプライン送信・バッチ ACK に使う送受信抽象（TASK-11.1・IO-1）。
+//! パイプライン送信・バッチ ACK に使う送受信抽象（TASK-11.1・IO-1・MS-1）。
 //!
 //! ホストとゲストの間のファイル共有プロトコル（IO-1）で、TASK-12（パイプライン送信
 //! クライアント）・TASK-13（バッチ write-back サーバー）・TASK-83 が共通で使う「送受信の
@@ -13,10 +13,17 @@ use std::time::Duration;
 
 use crate::error::{IoError, IoErrorCode};
 
-/// パイプライン送信・バッチ ACK が上限時間を超えて待ち続けないための境界
-/// （AGENTS.md の CI 結合試験ステップ上限 10 分に合わせる。値の見直しは
-/// TASK-12・TASK-13 で行う）。
-pub const MAX_IO_TIMEOUT: Duration = Duration::from_secs(600);
+/// ACK・plugin RPC・子プロセスなど「相手の応答を 1 回待つ」処理が上限時間を超えて
+/// 待ち続けないための境界（REPAIR-5・IO-1）。
+///
+/// AGENTS.md「推奨タイムアウト値」（REPAIR-5・REPAIR-10 (c)）が個別の応答待ちに定める
+/// 既定レンジ（5〜10 秒。PoC-8 実測・CI の `FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"`）の
+/// 上限に合わせる。結合試験ステップ全体の上限（10 分。TASK-86.2・#36）や
+/// ジョブ全体の上限とは別物であり、それらは [`FrameSender::send_frame`]・
+/// [`FrameReceiver::recv_frame`] 呼び出し 1 回分の待ち時間には使わない
+/// （長時間待機が必要な用途が生じた場合は、この定数を流用せず別の型・定数として
+/// 分離し、根拠を明記する）。
+pub const MAX_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// [`FrameSender::send_frame`]・[`FrameReceiver::recv_frame`] に渡すタイムアウト。
 ///

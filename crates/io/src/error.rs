@@ -1,4 +1,4 @@
-//! `fandhe-container-io` 共通の構造化エラー型（TASK-11.1・IO-1・ERR-1）。
+//! `fandhe-container-io` 共通の構造化エラー型（TASK-11.1・IO-1・ERR-1・MS-1）。
 //!
 //! `transport` モジュールの送受信トレイトが返すエラーをここに集約する。core 側の
 //! `fandhe_container_core::traits::types::{ErrorCode, TraitError}`（CRI-7）と機械可読

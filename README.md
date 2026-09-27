@@ -6,6 +6,7 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 
 - **本リポジトリは public** です（vector-db・fandhe-browser と同一方針）
 - **仕様・ビヘイビア定義**: [fandhe-container-spec](https://github.com/Fandhe-AI/fandhe-container-spec)（`docs/spec` に submodule 参照。**private リポジトリとして意図的に非公開を維持**する方針であり、アクセス権のない環境からは submodule を解決できません）
+- **製品名**: `fandhe-container` は crates.io・GitHub での名称衝突なしを確認のうえ確定済みです（`OSS-1`・`OSS-2`）
 
 ## ステータス
 

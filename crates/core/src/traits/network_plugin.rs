@@ -980,6 +980,10 @@ mod tests {
         /// `req.network()` のサブネットを参照するために `IpCidr` も保持する。
         networks: Mutex<HashMap<NetworkName, IpCidr>>,
         netns: Mutex<HashMap<ContainerId, NetworkName>>,
+        /// 導出済みの netns 名 → 所有コンテナ（P2 修正）。`derive_netns_name` の
+        /// 仮規則は異なる `ContainerId`（例: `a.b` と `a_b`）を同じ `NetnsName` に
+        /// 変換しうるため、`create_netns` はこのマップで衝突を検出して拒否する。
+        netns_names: Mutex<HashMap<NetnsName, ContainerId>>,
         attached: Mutex<HashMap<ContainerId, NetworkName>>,
         /// コンテナごとに公開済みのポート（[`NetworkPlugin::detach`] が解放対象を
         /// 追跡し、[`NetworkPlugin::publish_port`] が積む）。契約 11（ホストポートの
@@ -1008,6 +1012,7 @@ mod tests {
             Self {
                 networks: Mutex::new(HashMap::new()),
                 netns: Mutex::new(HashMap::new()),
+                netns_names: Mutex::new(HashMap::new()),
                 attached: Mutex::new(HashMap::new()),
                 published: Mutex::new(HashMap::new()),
                 assigned_addresses: Mutex::new(HashMap::new()),
@@ -1086,6 +1091,18 @@ mod tests {
             // `ContainerId` や `.`・`_` を含む `ContainerId` で panic し、かつ
             // netns が「作成済み」として残る不整合を招いていた）。
             let name = derive_netns_name(req.container())?;
+            // P2 修正: `derive_netns_name`（スタブ限定の仮規則）は `a.b` と `a_b` の
+            // ように異なる `ContainerId` を同じ `NetnsName` に変換しうる。導出名が
+            // 他コンテナの netns 名と衝突する場合は、いずれの状態（`netns`・
+            // `netns_names`）も変更する前に `AlreadyExists` で拒否する。
+            let mut netns_names = self.netns_names.lock().expect("lock netns_names");
+            if netns_names.contains_key(&name) {
+                return Err(TraitError::new(
+                    ErrorCode::AlreadyExists,
+                    "derived netns name collides with an existing netns (stub-only rule)",
+                ));
+            }
+            netns_names.insert(name.clone(), req.container().clone());
             netns.insert(req.container().clone(), req.network().clone());
             Ok(NetnsStatus::new(req.container().clone(), name))
         }
@@ -1297,6 +1314,15 @@ mod tests {
             }
             netns.remove(req.container());
             drop(netns);
+            // P2 修正: netns 本体を解放したら、衝突検出用の逆引き（`netns_names`）
+            // からも同じ名前を取り除く。`derive_netns_name` は決定的なので、
+            // 作成時と同じ入力から同じ名前を再計算できる。
+            if let Ok(name) = derive_netns_name(req.container()) {
+                self.netns_names
+                    .lock()
+                    .expect("lock netns_names")
+                    .remove(&name);
+            }
             Ok(DetachResponse::new())
         }
 
@@ -1313,6 +1339,7 @@ mod tests {
             // 削除だけを `fail_delete` で失敗させられるようにする）。
             let name = req.name().clone();
             let mut netns = self.netns.lock().expect("lock netns");
+            let mut netns_names = self.netns_names.lock().expect("lock netns_names");
             let mut attached = self.attached.lock().expect("lock attached");
             let mut published = self.published.lock().expect("lock published");
             let containers: Vec<ContainerId> = netns
@@ -1321,11 +1348,17 @@ mod tests {
                 .map(|(container, _)| container.clone())
                 .collect();
             for container in containers {
+                // P2 修正: netns_names（衝突検出用の逆引き）も netns 本体と一緒に
+                // 回収する（`derive_netns_name` は決定的なので再計算できる）。
+                if let Ok(derived) = derive_netns_name(&container) {
+                    netns_names.remove(&derived);
+                }
                 netns.remove(&container);
                 attached.remove(&container);
                 published.remove(&container);
             }
             drop(netns);
+            drop(netns_names);
             drop(attached);
             drop(published);
             // 契約 10 の割り当て済みアドレス台帳もネットワーク単位で回収する
@@ -1757,6 +1790,49 @@ mod tests {
         // 導出は insert より前に行われるため、失敗した場合は netns に一切
         // 記録が残らない（P1 修正の核心: 旧実装は insert 済みのまま panic していた）。
         assert_eq!(plugin.netns.lock().expect("lock netns").get(&long_id), None);
+    }
+
+    /// P2 修正: `derive_netns_name`（スタブ限定の仮規則）は `a.b` と `a_b` のように
+    /// 異なる `ContainerId` を同じ `NetnsName` に変換しうる。`create_netns` は
+    /// 導出名が既存の netns 名と衝突する場合、insert 前に `AlreadyExists` で拒否し、
+    /// 追跡状態（`netns`）を汚さないことを確認する。
+    #[test]
+    fn net1_create_netns_rejects_colliding_derived_name() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+
+        let dot_id = ContainerId::new("a.b").expect("valid container id");
+        let status = plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                dot_id.clone(),
+            ))
+            .expect("first container acquires the derived name");
+        assert_eq!(status.name().as_str(), "netns-a-b");
+
+        let underscore_id = ContainerId::new("a_b").expect("valid container id");
+        let err = plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                underscore_id.clone(),
+            ))
+            .expect_err("a colliding derived name must be rejected");
+        assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
+        // insert 前に拒否されるため、衝突した側のコンテナは netns に記録されない。
+        assert_eq!(
+            plugin.netns.lock().expect("lock netns").get(&underscore_id),
+            None
+        );
+        // 衝突していない最初のコンテナの記録はそのまま残る。
+        assert_eq!(
+            plugin.netns.lock().expect("lock netns").get(&dot_id),
+            Some(&sample_network_name())
+        );
     }
 
     /// 契約 8: 存在しないネットワークへの `attach` は `NotFound`。

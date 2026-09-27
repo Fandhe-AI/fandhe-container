@@ -3,10 +3,10 @@
 `fandhe-container-io`（`crates/io`）が提供するフレーム全体型（[`Frame`](../../crates/io/src/protocol.rs)）のバイトレイアウト・採用したチェックサムアルゴリズムの根拠・newtype 設計方針・IO-1 / REPAIR-2 対応表を記録する。
 
 - 対象ビヘイビア: IO-1（ホスト⇔ゲスト間のファイル共有プロトコル）・REPAIR-2（壊れた値を表現できない型）
-- 関連タスク: TASK-11.1（#68）・TASK-11.2（#69。ヘッダ newtype）・TASK-11.3（#70。チェックサム付きフレーム型）・TASK-11.4（#71。本節以降）
+- 関連タスク: TASK-11.1（#68）・TASK-11.2（#69。ヘッダ newtype）・TASK-11.3（#70。チェックサム付きフレーム型）・TASK-11.4（#71。本節以降）・TASK-13.1（#76。バッチ集約バッファ）
 - 関連ビヘイビア: IO-2（Flush / FlushAck 種別）・REPAIR-5（`IoTimeout`。無期限待ちを型で表現しない）
 - 対象マイルストーン: MS-1
-- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）を記録する。ペイロード内部レイアウト（request id・ACK status 等）は TASK-12（パイプライン送信クライアント）・TASK-13（バッチ write-back サーバー）が本書へ追記する
+- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）に加え、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）を記録する。ペイロード内部レイアウト（request id・ACK status 等）・UDS 受信ループ・ディスク書き込み・ACK 返却は TASK-12（パイプライン送信クライアント）・TASK-13 の後続 sub-issue（TASK-13.2 系）が本書へ追記する
 
 ## バイトレイアウト
 
@@ -108,8 +108,9 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 | REPAIR-2 | ビット反転・種別すり替え・チェックサム破損の検出 | CRC-32C（ヘッダ + ペイロードを対象） | `repair2_decode_rejects_flipped_payload_bit`・`repair2_decode_rejects_kind_swapped_to_valid_kind`・`repair2_decode_rejects_corrupted_checksum`・`tests/protocol.rs` の `io1_public_api_decode_rejects_corrupted_payload`・`io1_public_api_decode_rejects_corrupted_checksum` |
 | REPAIR-2 | 未知種別・切り詰めの拒否 | `FrameKind::try_from`・`Frame::decode` の `split_first_chunk` | `io1_frame_kind_rejects_unknown_bytes`・`io1_frame_header_from_bytes_rejects_unknown_kind`・`io1_decode_rejects_truncated_header`・`tests/protocol.rs` の `io1_public_api_decode_rejects_too_short_input` |
 | IO-1 | CRC 実装の正しさ | `crates/io/src/checksum.rs` の `Crc32c` | `io1_crc32c_matches_standard_check_value`・`io1_crc32c_matches_rfc3720_vectors`・`io1_crc32c_split_update_matches_single_call` |
+| IO-1 | 既定 64 件（設定可能）単位でのバッチ集約 | `crates/io/src/batch.rs` の `BatchBuffer::push`・`BatchConfig`（既定値 `DEFAULT_BATCH_SIZE = 64`・上限 `MAX_BATCH_SIZE = 4096`〔暫定〕） | `io1_batch_buffer_fires_at_default_64`・`io1_batch_buffer_fires_at_custom_size_8`・`io1_batch_config_default_is_64`・`io1_batch_config_rejects_zero`・`io1_batch_config_rejects_above_max`・`tests/batch.rs` の `io1_public_api_batch_buffer_fires_at_default_size`・`io1_public_api_batch_config_custom_size_fires`・`io1_public_api_batch_config_rejects_zero` |
 
-補足: IO-1 が定めるバッチ化・その設定 API は本書時点では未実装であり、TASK-13 の範囲で扱う（REPAIR-3: 実装済みを装わない。既定値は `docs/spec`〔本環境では未解決〕側で確認が必要）。
+補足: TASK-13.1（#76）でバッチ集約バッファ（`BatchBuffer`）と設定 API（`BatchConfig`）を追加した。ディスク書き込み・ACK 返却・UDS 受信ループ・CLI からのバッチサイズ配線（`--batch-size` 相当）は本書時点では未実装であり、TASK-13.2 系・TASK-13.3 の範囲で扱う（REPAIR-3: 実装済みを装わない）。
 
 ## デコード時の検証順序と検出する破壊
 

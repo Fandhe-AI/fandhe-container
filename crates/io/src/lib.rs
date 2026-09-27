@@ -3,13 +3,16 @@
 //!
 //! 現状は送受信の抽象トレイト（[`transport`]）・構造化エラー（[`error`]）・フレーム
 //! ヘッダ newtype とチェックサム付きフレーム全体型（[`protocol`]。TASK-11.2・#69・
-//! TASK-11.3・#70）を持つ雛形で、トランスポートの具象実装（UDS・vsock・named pipe
-//! 等）はない（REPAIR-3。スタブの明示）。[`protocol::Frame`] はヘッダ・ペイロード・
+//! TASK-11.3・#70）・バッチ集約バッファ（[`batch`]。TASK-13.1・#76）を持つ雛形で、
+//! トランスポートの具象実装（UDS・vsock・named pipe 等）・ディスク書き込み・ACK 返却
+//! はない（REPAIR-3。スタブの明示）。[`protocol::Frame`] はヘッダ・ペイロード・
 //! CRC-32C チェックサムのエンコード / デコードを提供するが、request id・ACK status の
 //! ペイロードレイアウト、種別ごとのペイロード長制約は TASK-12・TASK-13（またはそれらの
-//! 後続 sub-issue）が定める。パイプライン送信クライアント（TASK-12）・バッチ
-//! write-back サーバー（TASK-13）の本体はこの crate のトレイトを実装する形で
-//! 後続タスクが追加する。
+//! 後続 sub-issue）が定める。[`batch::BatchBuffer`] は受信した `Write` フレームを
+//! 既定 64 件（設定可能）単位で集約するメモリ内ロジックのみを提供し、UDS 受信ループ・
+//! ディスク書き込み・ACK 送出は TASK-13.2 系の後続 sub-issue が担う。パイプライン
+//! 送信クライアント（TASK-12）・バッチ write-back サーバー本体（TASK-13）はこの
+//! crate のトレイト・型を組み合わせる形で後続タスクが追加する。
 //!
 //! PLUG-1 区分は core（`fandhe-container-plugin` の境界機構とは別に、コアの一部として
 //! 直接リンクされる）。crate 名 `fandhe-container-io` は
@@ -17,11 +20,15 @@
 //! `core → io` であり、本 crate は `fandhe-container-core` に依存しない
 //! （`docs/architecture.md`「依存関係グラフ」）。
 
+pub mod batch;
 mod checksum;
 pub mod error;
 pub mod protocol;
 pub mod transport;
 
+pub use batch::{
+    Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
+};
 pub use error::{IoError, IoErrorCode};
 pub use protocol::{
     CHECKSUM_LEN, FRAME_HEADER_LEN, Frame, FrameChecksum, FrameHeader, FrameKind, MAX_FRAME_LEN,

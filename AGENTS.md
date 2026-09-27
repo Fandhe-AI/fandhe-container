@@ -27,6 +27,8 @@ make lint        # cargo clippy --workspace --all-targets -- -D warnings（既�
 make test        # cargo test --workspace（既定 feature）
 make deny        # cargo deny --locked check advisories bans licenses sources
 make ci          # lint-docs + check-workspace-manifest + 上記 4 つを一括実行
+make bench-check-selftest  # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
+make bench-check           # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
 ```
 
 - `Cargo.toml`（workspace）が未作成の間、`fmt`/`lint`/`test` は対象がなく実行できない。`Cargo.toml` と `crates/*/Cargo.toml`（メンバー crate）の両方が揃うまで Makefile 側でこれらは skip される。`deny` は加えて `deny.toml` の存在を要する。`check-workspace-manifest`（`cargo verify-project`）は `Cargo.toml` の存在のみで判定し、メンバー crate 未追加の中間状態でも実行される
@@ -37,7 +39,15 @@ make ci          # lint-docs + check-workspace-manifest + 上記 4 つを一括�
 
 ### タイムアウト保護された結合試験・ベンチ回帰（REPAIR-5・REPAIR-8）
 
-REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された結合試験（ACK 未送信等のハング検出。推奨 5〜10 秒）・(4) ベンチ回帰チェック（15% 超の悪化で fail）は現時点で CI 未導入である。導入時は本節・`.claude/rules/ci.md` に実行コマンドと判定基準を追記する。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5）
+REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された結合試験（ACK 未送信等のハング検出。推奨 5〜10 秒）は現時点で CI 未導入である。導入時は本節・`.claude/rules/ci.md` に実行コマンドと判定基準を追記する。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5）
+
+(4) ベンチ回帰チェックは `.github/workflows/ci.yml` の `bench-regression` ジョブ（ubuntu-latest 単独。3 OS matrix にはしない。理由は ci.yml のジョブコメントおよび `.claude/rules/ci.md` を参照）として導入済み（TASK-86.3）。判定基準:
+
+- ベンチ実行結果（`benches/baseline.json` と同スキーマの JSON）と基準値を `scripts/check-bench-regression.sh` で比較し、metric ごとに `direction`（`higher_is_better` / `lower_is_better`）に応じた向きで悪化率を判定する
+- 15% **超**の悪化を回帰として fail させる（ちょうど 15.0% の悪化は合格）。終了コードは `0`（合格）/ `1`（回帰検出）/ `2`（入力エラー。引数・ファイル・スキーマ不正等）の 3 値
+- 基準値にある metric が結果に無い、または結果にしかない metric がある場合も入力エラー（`2`）として fail する（基準値の無いベンチを素通りさせない）
+- 現時点では `benches/benches/regression_placeholder.rs`（決定的な固定値を返す stub）と `benches/baseline.json`（`placeholder: true` の暫定値）で動作確認する段階にある。実測を伴う本物のベンチと基準値への置き換えはそれぞれ TASK-113・TASK-88 で行う
+- `benches/baseline.json` の値を回帰が隠れる方向へ書き換える差分、`scripts/check-bench-regression.sh` の閾値（`THRESHOLD_PERCENT`）を変える差分、比較対象から metric を外す差分は、TASK-88 の校正記録が無い限り「回帰検出の後退」（P0）として扱う
 
 ### 実機前提テスト
 
@@ -137,4 +147,4 @@ make deny   # cargo deny --locked check advisories bans licenses sources
 | `ci.yml` の発火条件 | `ci.yml` は `workflow_dispatch`・`pull_request`・`push`（main）で稼働中（TASK-86.1・REPAIR-7）。`on:` から `pull_request` / `push` を外す変更・`pull_request_target` への変更は P1 で指摘する | P1 |
 | `ci.yml` への変更 | `ci.yml` を変更する差分では、3 OS matrix（Linux・macOS・Windows）を維持しているか、本リポに存在しない `make` ターゲット・`scripts/` を前提にしたジョブが混入していないかを確認する | P1 |
 | `release.yml` | `workflow_dispatch` 限定のプレースホルダであり、有効化には公開対象クレート・crates.io 公開方針の確定を要する。現状のプレースホルダ状態自体は指摘しない | 指摘しない（既知の暫定状態） |
-| ゲート未導入段階の追記 | REPAIR-7 の 5 段階ゲートのうち (3) タイムアウト保護された結合試験・(4) ベンチ回帰チェック（REPAIR-8）の導入時は、本書「ビルド・テスト・回帰確認コマンド」節・`.claude/rules/ci.md` の更新を伴っているか | P2 |
+| ゲート未導入段階の追記 | REPAIR-7 の 5 段階ゲートのうち (3) タイムアウト保護された結合試験の導入時は、本書「ビルド・テスト・回帰確認コマンド」節・`.claude/rules/ci.md` の更新を伴っているか（(4) ベンチ回帰チェックは TASK-86.3 で導入済み） | P2 |

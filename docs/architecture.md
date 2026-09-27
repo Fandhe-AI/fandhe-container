@@ -174,7 +174,32 @@ flowchart LR
 
 ## core / plugin 境界（PLUG-1）
 
-未記載。#23（TASK-6.2）で `docs/spec/04-behavior/plugin-system.md` の境界表を転記する。
+D-14（方針追記 2）に基づく core / plugin の割り付け表を以下に転記する（PLUG-1）。出典は `docs/spec/04-behavior/plugin-system.md`「境界表」であり、記述が食い違う場合は spec を正とする。crate 単位の PLUG-1 区分は [crate-naming.md](design/crate-naming.md) を正とし、本節では重複させない。
+
+| 対象 | 配置 | 根拠 |
+| ---- | ---- | ---- |
+| Linux ネイティブ実行層（`api-runtime-core.md`）・I/O 共有プロトコル（`api-io-share.md`）・OCI イメージ（`api-oci-image.md`）・CLI（`screen-cli.md`） | core | D-14 の core 範囲定義そのもの |
+| `ContainerRuntime`（`api-cri.md` CRI-7） | plugin（トレイト定義は core、実装を別プロセスへ配置可能） | 制御面のみを扱い、Δp50=5.542μs（長さ接頭辞フレーム）で CORE-10/MAC-2 目標に無視できる影響（PoC-13。フレーム方式の値は bincode ペイロードでの計測値であり、serde_json 変更に伴い TASK-113 で再計測する） |
+| `StateStore`（同上） | **core**（トレイト定義・ファイルベースの既定実装とも core。別実装〔分散ストア等〕は plugin として差し替え可能） | 既定実装は core、別実装は plugin で差し替え可能。CLI・supervisor・`create`/`delete` の全経路が使う状態ファイル（OCI-5）であり、plugin 未導入の最小構成でも状態管理を完結させ、常駐デーモンを持たない CORE-1 と整合させるため（ユーザー決定 2026-09-26）。別実装を plugin に出す場合のオーバーヘッドは制御面として許容範囲（PoC-13） |
+| `NetworkPlugin`（同上） | plugin（同上） | 制御面（ネットワーク設定操作）でありデータパス（パケット転送そのもの）ではないため同様に許容範囲（PoC-13） |
+| `VolumeProvider`（同上） | **core**（トレイト定義・実装とも core に残す） | データパス（ファイル I/O）に接するため。gRPC 境界で PoC-2 batch 比 17.62%、フレーム境界でも 3.71% の劣化が数値で示された（PoC-13 データパス机上見積もり） |
+| macOS バックエンド（`api-platform-macos.md`） | plugin（別プロセス、常駐/都度起動いずれも可） | MAC-2 上乗せが常駐 5.032ms（core-harness 起動＋UDS 接続＋4 RPC〔代表操作 A・B〕を含む保守的な値）・都度起動 2.537ms（いずれも 2 秒目標の 0.3%未満、PoC-13） |
+| Windows バックエンド（`api-platform-windows.md`） | plugin（macOS と同型の境界を想定） | 上記と同様の制御面境界コストの見込み。実測は macOS 単独のため参考値（PoC-13、Linux/Windows での再確認は Phase 5 へ申し送り） |
+| microVM（`api-microvm.md`） | plugin（起動・停止等の制御面のみ。VM 内部の I/O パスは対象外） | 制御面操作である限り上記と同様（PoC-13） |
+| CRI サーバー（`api-cri.md`） | plugin | 制御面（`RunPodSandbox` 等）であり PoC-13 の代表操作 (A) そのもの |
+| MCP サーバー（`api-mcp.md`） | plugin（`fandhe-container-plugin-mcp` として参照実装済み） | core 無変更で追加可能なことを実証（PoC-13 成功基準 3） |
+| CDI の適用・OCI hook の実行（`api-gpu.md` GPU-1〜GPU-4） | core（推奨） | GPU の device node・mount・env 付与は汎用の mount／device 操作であり D-14 の core 範囲定義（Linux ネイティブ実行層）と整合する。hook はホスト権限でコンテナの rootfs を書き換える（ld キャッシュ更新等）ため、core 内で OCI hook（`createContainer` 相当）を実行する機能として実装する案を推奨する（D-15、gpu-passthrough-cdi〔PoC-14〕）。未解決疑問点 11 は未決であり、core 範囲の最終確定はスコープ確認（Phase 4→5）以降に持ち越す |
+| DNS ヘルパー・rootless ネットワーク転送（`api-network.md` NET-5・NET-9） | 検討中（未確定） | ネットワークごとの DNS ヘルパーとユーザー空間転送（pasta 相当）はデータパス上で動作するプロセスである。core⇔plugin の IPC 往復がデータパスに入るわけではなく、転送プロセス自体がネットワークを構成するという点で `VolumeProvider`（データパスのため core 固定）とは性質が異なる（D-18）。この整理を D-14 の原則（plugin 境界をデータパスに置かない）の例外として認めるかは未確定であり、判断材料（性質の違い・実測されたセットアップ時間への影響なし）のみを記録する |
+| supervisor（コンテナごとの監視プロセス、`api-supervisor.md`、D-19） | core | コンテナのライフサイクルに従属する軽量監視プロセスであり、CORE-1 の「中央の常駐デーモンを持たない」への読み替え（D-19）の実装主体そのものである。PLUG-2 の plugin 境界を経由せず実行層コアの一部として動作する（supervisor-model、PoC-17。own n=0 で常駐プロセス 0 個を実機確認） |
+| 複数コンテナ定義の `up`／`down` 等（`api-stack.md`） | 独立した plugin 境界を持たない | `up` は TOML（STACK-1）を解析し、`depends_on` のトポロジカルソート順に core の CLI／ライブラリ API を順に呼ぶオーケストレーションで、別プロセス plugin 境界を持たない（`api-supervisor.md` SUP-1 の監視プロセス起動 API 等。supervisor-model、PoC-17 の `supervisor up` 実装で確認） |
+
+転記元: `docs/spec/04-behavior/plugin-system.md`（submodule リビジョン `2241961`）の境界表。追加分 3（2026-09-23）の 4 行（CDI の適用・OCI hook の実行／DNS ヘルパー・rootless ネットワーク転送／supervisor／複数コンテナ定義の `up`／`down`）を含む。
+
+補足:
+
+- CDI の適用・OCI hook の実行（行）は `core（推奨）` の段階であり、未解決疑問点 11 が未決のため確定扱いしない
+- DNS ヘルパー・rootless ネットワーク転送（行）は `検討中（未確定）` であり、D-14 原則の例外とするかは未確定である
+- GPU-5・7・8・9 は境界表に明示判定がない（[crate-naming.md](design/crate-naming.md) 注 1 を参照）
 
 ## 確定済み設計判断（実装コードを持たないもの）
 
@@ -189,4 +214,4 @@ flowchart LR
 
 ## 見直し
 
-REPAIR-3・PLUG-1、または [crate-naming.md](design/crate-naming.md) が更新されたら本書も追従する。依存を追加した際は「依存関係グラフ」節の「現状」を更新する。
+REPAIR-3・PLUG-1、または [crate-naming.md](design/crate-naming.md) が更新されたら本書も追従する。`plugin-system.md` の境界表が更新されたら「core / plugin 境界（PLUG-1）」節も追従する。依存を追加した際は「依存関係グラフ」節の「現状」を更新する。

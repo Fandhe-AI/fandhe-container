@@ -48,6 +48,14 @@ trim_trailing_whitespace = false
 [Makefile]
 indent_style = tab
 
+# scripts/testdata/agents-ci-consistency/*/Makefile.txt（TASK-94.1）: 拡張子は
+# .txt だが中身は Makefile 形式の fixture で、check-agents-ci-consistency.sh の
+# レシピ抽出対象として本物の Makefile と同じくレシピ行のハードタブが必須
+# （PR #1097 レビュー指摘: `.editorconfig` 側で Makefile 扱いされず
+# editorconfig-checker が誤検出していた）
+[Makefile.txt]
+indent_style = tab
+
 # .gitmodules（git submodule コマンドがタブインデントで生成・更新する）
 [.gitmodules]
 indent_style = tab

@@ -96,6 +96,9 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///    [`Self::attach`] された際のネットワーク（`AttachRequest::network`）と
 ///    `req.network()` が一致しない場合、[`ErrorCode::FailedPrecondition`] を返す
 ///    （別ネットワークに属するコンテナ ID を渡して越境 DNAT を設定させないため）。
+///    [`Self::attach`] に関するこれらの判定は、対象コンテナが未 attach の場合にのみ
+///    行われる。既に attach 済みであれば契約 12 が優先し、これらより先に
+///    [`ErrorCode::AlreadyExists`] を返す。
 /// 9. **削除・解放はベストエフォートで続行**: [`Self::delete_network`]・[`Self::detach`]
 ///    は個々の削除・解放に失敗しても残りを続け、1 件でも失敗があれば `Err`
 ///    （[`ErrorCode::Internal`]。`message` に残存資源を含める。契約 6 の
@@ -111,8 +114,11 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///     `AttachResponse::address` を経由して呼び出し側へ誤った境界情報が伝播するため）。
 ///     (b) 指定アドレスが上記サブネットに含まれること。含まれない場合（アドレス
 ///     ファミリの不一致を含む）、またはそのサブネットのネットワークアドレス・
-///     ブロードキャストアドレス等のホスト割り当てに使えない予約アドレスであれば
-///     [`ErrorCode::InvalidArgument`] を返す。(c) 同一ネットワーク内の他コンテナが
+///     ブロードキャストアドレス・実装がゲートウェイとして使うアドレス等の
+///     ホスト割り当てに使えない予約アドレスであれば [`ErrorCode::InvalidArgument`]
+///     を返す（ゲートウェイと同じアドレスをコンテナに割り当てると、
+///     `AttachResponse::gateway` が指すホストとコンテナ自身が同じ IP になり
+///     default route の意味が崩れるため）。(c) 同一ネットワーク内の他コンテナが
 ///     既にそのアドレスを使用中であれば [`ErrorCode::AlreadyExists`] を返す。
 ///     アドレス未指定の場合は実装が動的に割り当てる（[`AttachRequest::with_address`] の
 ///     doc のとおり）。動的に割り当てるアドレスも、(a)〜(b) と同じ制約
@@ -124,6 +130,19 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///     [`ErrorCode::AlreadyExists`] を返す。ホスト bind IP の指定はスコープ外（#19）の
 ///     ままであるため、判定キーは `(host_port, protocol)` のみとする。[`Self::detach`]
 ///     または [`Self::delete_network`] で解放されたポートは再公開できる。
+/// 12. **二重 attach の拒否**: 既に [`Self::attach`] 済みのコンテナへの再度の
+///     [`Self::attach`] は、対象ネットワークが同一か別かを問わず
+///     [`ErrorCode::AlreadyExists`] を返し、状態（割り当て済みアドレス・attach
+///     済みネットワーク）を変更しない
+///     （[`crate::traits::volume_provider::VolumeProvider::attach`] の「同一コンテナへの
+///     二重 attach は `AlreadyExists`」と同じ扱い）。「対象ネットワークを問わず」を
+///     文字どおり満たすため、この判定は `req.network()` が [`Self::create_network`]
+///     済みかどうかや netns の紐付け（契約 8）の確認よりも前に行われる（契約 8 の
+///     [`ErrorCode::NotFound`] / [`ErrorCode::FailedPrecondition`] は、対象コンテナが
+///     まだ attach されていない場合にのみ適用される）。以前のアドレスを上書きせず
+///     `AlreadyExists` を返すことで、再 attach 時に前回のアドレスが割り当て済みの
+///     まま残る不整合を防ぐ。[`Self::detach`] 後の再 attach は前回のアドレスが
+///     解放されているため `Ok` になる（契約 9）。
 ///
 /// メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 /// dyn 互換（object safety）を保ち、async ランタイムへの依存を追加しない
@@ -153,17 +172,22 @@ pub trait NetworkPlugin: Send + Sync {
 
     /// veth ペアを作成し、bridge / netns へ接続してアドレス・default route を設定する。
     ///
-    /// netsetup の `veth-attach` に対応し、`SetUpPod` の一部。前提: `req.network()` が
-    /// [`Self::create_network`] 済みであること（未作成なら [`ErrorCode::NotFound`]）、
-    /// 対象コンテナの netns が [`Self::create_netns`] 済みであること（未作成なら、
-    /// `create_network` 未作成時と同じ扱いとして [`ErrorCode::NotFound`]）。さらに、
-    /// その netns が [`Self::create_netns`] 呼び出し時に紐付けられたネットワーク
+    /// netsetup の `veth-attach` に対応し、`SetUpPod` の一部。前提（判定順）:
+    /// 対象コンテナが既に [`Self::attach`] 済みであれば、対象ネットワークが同一か
+    /// 別かを問わず最初に [`ErrorCode::AlreadyExists`] を返し状態を変更しない
+    /// （契約 12。以下の `req.network()` / netns の前提確認より先に判定する）。
+    /// 未 attach であれば続けて、`req.network()` が [`Self::create_network`] 済み
+    /// であること（未作成なら [`ErrorCode::NotFound`]）、対象コンテナの netns が
+    /// [`Self::create_netns`] 済みであること（未作成なら、`create_network` 未作成時
+    /// と同じ扱いとして [`ErrorCode::NotFound`]）を検証する。さらに、その netns が
+    /// [`Self::create_netns`] 呼び出し時に紐付けられたネットワーク
     /// （`CreateNetnsRequest::network`）が `req.network()` と一致すること（不一致なら
     /// [`ErrorCode::FailedPrecondition`]）。異なるネットワークに属する netns への接続を
     /// 許すと、実際の接続先ネットワークと [`Self::delete_network`] が追跡する削除対象
     /// ネットワークが食い違い、分離・後始末の契約が崩れるため。`req.address()` で
     /// 静的アドレスが指定されている場合は prefix 長がサブネットと一致し、サブネット内・
-    /// 非予約・未使用であることを検証する（契約 10。prefix 長不一致・範囲外・予約
+    /// 非予約（ネットワークアドレス・ブロードキャストアドレス・ゲートウェイのいずれでも
+    /// ない）・未使用であることを検証する（契約 10。prefix 長不一致・範囲外・予約
     /// アドレスは [`ErrorCode::InvalidArgument`]、他コンテナが使用中なら
     /// [`ErrorCode::AlreadyExists`]）。途中で失敗した場合は作成済みリソースを逆順に
     /// 削除する（契約 6）。対応: NET-1・NET-2。
@@ -964,7 +988,11 @@ mod tests {
     ///    ファミリが異なる場合も [`IpCidr::contains`] が `false` を返すためここで
     ///    拒否される（IPv4 ネットワークへの IPv6 アドレス指定等）。
     /// 3. `address.addr()` が `subnet` のネットワークアドレス・ブロードキャスト
-    ///    アドレスのいずれとも一致しないこと（契約 10 (b) の予約アドレス排除）。
+    ///    アドレス・ゲートウェイアドレス（[`subnet_gateway`]）のいずれとも一致しない
+    ///    こと（契約 10 (b) の予約アドレス排除）。ゲートウェイと同じアドレスを
+    ///    コンテナに割り当てると、`AttachResponse::gateway` が指すホストとコンテナ
+    ///    自身が同じ IP になり default route の意味が崩れる（Codex P1・Bugbot Low
+    ///    指摘）。
     ///
     /// 使用中かどうか（契約 10 (c)）は呼び出し側（`attach`）が `assigned_addresses`
     /// を見て別途判定する。
@@ -995,6 +1023,12 @@ mod tests {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 format!("address {ip} is the broadcast address of the subnet {subnet}"),
+            ));
+        }
+        if ip == subnet_gateway(subnet) {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("address {ip} is the gateway address of the subnet {subnet}"),
             ));
         }
         Ok(())
@@ -1229,6 +1263,24 @@ mod tests {
         }
 
         fn attach(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError> {
+            // 契約 12: 既に attach 済みのコンテナへの再 attach は、対象ネットワークを
+            // 問わず ErrorCode::AlreadyExists を返し、状態（assigned_addresses・
+            // attached）を変更しない。「ネットワークを問わず」を文字どおり満たすため、
+            // 対象ネットワークの存在確認や netns の紐付け確認より前に判定する
+            // （insert 前に判定することで、以前のアドレスが上書きされず割り当て済み
+            // のまま残る不整合〔Codex P1・Bugbot Low 指摘〕も防ぐ）。
+            // VolumeProvider::attach の「二重 attach は AlreadyExists」と同じ扱いに揃える。
+            if self
+                .attached
+                .lock()
+                .expect("lock attached")
+                .contains_key(req.container())
+            {
+                return Err(TraitError::new(
+                    ErrorCode::AlreadyExists,
+                    "container is already attached",
+                ));
+            }
             let subnet = *self
                 .networks
                 .lock()
@@ -2020,6 +2072,183 @@ mod tests {
         assert_eq!(err.code().as_str(), "FAILED_PRECONDITION");
     }
 
+    /// 契約 12: 既に attach 済みのコンテナへの、同一ネットワークを指定した再 attach は
+    /// `AlreadyExists`。状態（assigned_addresses・attached）が変化しないことも
+    /// 具体値で確認する（Codex P1・Bugbot Low 指摘: 旧実装は再 attach 時に
+    /// assigned_addresses へ新しいエントリを積み増すか、以前のアドレスが割り当て
+    /// 済みのまま残っていた）。
+    #[test]
+    fn net2_attach_already_attached_to_same_network_is_already_exists() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+
+        let first = plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("first attach succeeds");
+
+        let err = plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect_err("re-attaching an already-attached container must be rejected");
+        assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
+
+        // 状態が変化していないことを確認する: assigned_addresses は最初の割り当て
+        // 1 件のみで、attached は最初のネットワークを指したまま。
+        assert_eq!(
+            plugin
+                .assigned_addresses
+                .lock()
+                .expect("lock assigned_addresses")
+                .get(&sample_network_name())
+                .map(|addrs| addrs.len()),
+            Some(1)
+        );
+        assert_eq!(
+            plugin
+                .assigned_addresses
+                .lock()
+                .expect("lock assigned_addresses")
+                .get(&sample_network_name())
+                .and_then(|addrs| addrs.get(&first.address().addr())),
+            Some(&sample_container_id())
+        );
+        assert_eq!(
+            plugin
+                .attached
+                .lock()
+                .expect("lock attached")
+                .get(&sample_container_id()),
+            Some(&sample_network_name())
+        );
+    }
+
+    /// 契約 12: 既に attach 済みのコンテナへの、別ネットワークを指定した再 attach も
+    /// `AlreadyExists`（「ネットワークを問わず」の確認。契約 8 の netns 紐付け
+    /// 不一致による `FailedPrecondition` より契約 12 が優先されることも確認する）。
+    /// 別ネットワーク側の状態が一切変更されないことも確認する。
+    #[test]
+    fn net2_attach_already_attached_to_other_network_is_already_exists() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create front-end network");
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                other_network_name(),
+                IpCidr::new(IpAddr::from([10, 250, 12, 1]), 24).expect("valid cidr"),
+            ))
+            .expect("create back-end network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns bound to front-end");
+
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("attach to front-end succeeds");
+
+        let err = plugin
+            .attach(&AttachRequest::new(
+                other_network_name(),
+                sample_container_id(),
+            ))
+            .expect_err("an already-attached container must be rejected regardless of network");
+        assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
+
+        // 別ネットワーク（back-end）側には一切アドレスが記録されない。
+        assert_eq!(
+            plugin
+                .assigned_addresses
+                .lock()
+                .expect("lock assigned_addresses")
+                .get(&other_network_name())
+                .map(|addrs| addrs.len())
+                .unwrap_or(0),
+            0
+        );
+        // attached は最初に成功した front-end のままである。
+        assert_eq!(
+            plugin
+                .attached
+                .lock()
+                .expect("lock attached")
+                .get(&sample_container_id()),
+            Some(&sample_network_name())
+        );
+    }
+
+    /// 契約 9・12: `detach` 後の再 attach は `Ok` になり、以前のアドレスが解放されて
+    /// いるため再利用される（同じコンテナが再び同じアドレスを取得する）。
+    #[test]
+    fn net1_attach_after_detach_reuses_released_address() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+
+        let first = plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("first attach succeeds");
+
+        plugin
+            .detach(&DetachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("detach releases the address and the attach record");
+
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("recreate netns for the same container");
+        let second = plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("re-attach succeeds once detached");
+
+        assert_eq!(second.address(), first.address());
+    }
+
     /// 契約 10: サブネット内・非予約・未使用の静的アドレスを指定した `attach` は
     /// 成功し、指定どおりのアドレスが `AttachResponse` に反映される。
     #[test]
@@ -2208,6 +2437,65 @@ mod tests {
                     .with_address(broadcast_addr),
             )
             .expect_err("the broadcast address must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// 契約 10 (b): ゲートウェイと同じ IPv4 静的アドレスを指定した `attach` は
+    /// `InvalidArgument`（Codex P1・Bugbot Low 指摘。ゲートウェイとコンテナが
+    /// 同じ IP になり default route の意味が崩れるため）。
+    #[test]
+    fn net1_attach_with_gateway_as_static_address_is_invalid_argument() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+
+        // sample_subnet（10.250.11.1/24）のゲートウェイは 10.250.11.1（ネットワーク
+        // アドレス 10.250.11.0 + 1）。
+        let gateway_addr = IpCidr::new(IpAddr::from([10, 250, 11, 1]), 24).expect("valid cidr");
+        let err = plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), sample_container_id())
+                    .with_address(gateway_addr),
+            )
+            .expect_err("the gateway address must be rejected");
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// 契約 10 (b): ゲートウェイと同じ IPv6 静的アドレスを指定した `attach` も
+    /// `InvalidArgument`（v4 限定の穴ではないことを確認する）。
+    #[test]
+    fn net1_attach_with_gateway_as_static_address_ipv6_is_invalid_argument() {
+        let plugin = StubNetworkPlugin::new();
+        let subnet = IpCidr::new(IpAddr::from([0x2001u16, 0x0db8, 0, 0, 0, 0, 0, 0]), 64)
+            .expect("valid cidr");
+        plugin
+            .create_network(&CreateNetworkRequest::new(sample_network_name(), subnet))
+            .expect("create ipv6 network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+
+        let gateway_addr = IpCidr::new(IpAddr::from([0x2001u16, 0x0db8, 0, 0, 0, 0, 0, 1]), 64)
+            .expect("valid cidr");
+        let err = plugin
+            .attach(
+                &AttachRequest::new(sample_network_name(), sample_container_id())
+                    .with_address(gateway_addr),
+            )
+            .expect_err("the ipv6 gateway address must be rejected");
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
     }
 
@@ -3072,6 +3360,43 @@ mod tests {
                 sample_container_id(),
             ))
             .expect("netns was released so it can be recreated");
+    }
+
+    /// 自己点検（状態遷移の順序違い）: `detach` は `attach` 未実施の netns のみの
+    /// コンテナにも呼び出せる（`detach` のメソッド doc「`attach` 前（netns のみ
+    /// 作成済み）でも呼び出せる」の直接的な検証。既存契約の範囲内で、これまで
+    /// `attach` 済みの経路しかテストされていなかった漏れを埋める）。
+    #[test]
+    fn net1_detach_without_prior_attach_succeeds() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns (no attach)");
+
+        let resp = plugin
+            .detach(&DetachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("detach succeeds without a prior attach");
+        assert_eq!(resp, DetachResponse::new());
+        assert_eq!(
+            plugin
+                .netns
+                .lock()
+                .expect("lock netns")
+                .get(&sample_container_id()),
+            None
+        );
     }
 
     /// 契約 8: netns が既に解放済み（未作成を含む）のコンテナへの 2 回目の `detach` は

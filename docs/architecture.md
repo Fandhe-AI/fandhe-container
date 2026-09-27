@@ -75,7 +75,7 @@ flowchart TB
         compose_convert["compose-convert"]
     end
 
-    cli -.-> core
+    cli --> core
     supervisor --> core
     compose_convert --> stack
 
@@ -90,11 +90,11 @@ flowchart TB
     core -. "UDS 境界（PLUG-2）" .-> plugin_microvm
     plugin_mcp -. "UDS 境界（PLUG-2）" .-> core
 
-    plugin_lib -.-> core
-    plugin_lib -.-> plugin_cri
+    core --> plugin_lib
+    plugin_cri --> plugin_lib
 ```
 
-実線は「設計上の依存方向」（現状の `Cargo.toml` にはまだ実装されていない辺を含む。「依存関係グラフ」節を参照）、点線は UDS 境界（PLUG-2）を越える呼び出し関係を示す。plugin 境界の外側（バックエンド実装ライブラリ）は plugin バイナリからのみ呼ばれ、core 側からは直接依存しない。
+実線は「設計上の依存方向」（Cargo 依存関係。現状の `Cargo.toml` にはまだ実装されていない辺を含む。「依存関係グラフ」節を参照）を示し、点線は「UDS 境界（PLUG-2）」ラベルを付した、UDS 境界を越える呼び出し関係のみを示す。`core --> plugin_lib`・`plugin_cri --> plugin_lib`（境界基盤ライブラリへの依存。crate-naming.md 表 #10「core・plugin 双方が依存する境界基盤ライブラリ」）は UDS 呼び出しではなく Cargo 依存関係のため実線で描く。plugin 境界の外側（バックエンド実装ライブラリ）は plugin バイナリからのみ呼ばれ、core 側からは直接依存しない。
 
 ## インターフェース契約（拡張点トレイト）
 

@@ -37,7 +37,15 @@ make ci          # lint-docs + check-workspace-manifest + 上記 4 つを一括�
 
 ### タイムアウト保護された結合試験・ベンチ回帰（REPAIR-5・REPAIR-8）
 
-REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された結合試験（ACK 未送信等のハング検出。推奨 5〜10 秒）・(4) ベンチ回帰チェック（15% 超の悪化で fail）は現時点で CI 未導入である。導入時は本節・`.claude/rules/ci.md` に実行コマンドと判定基準を追記する。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5）
+REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された結合試験は TASK-86.2（#36）で導入済み、(4) ベンチ回帰チェック（15% 超の悪化で fail）は現時点で CI 未導入である。(4) 導入時は本節・`.claude/rules/ci.md` に実行コマンドと判定基準を追記する。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5）
+
+(3) の内容:
+
+- 対象: Cargo の integration test target（各 crate の `tests/*.rs`。lib 内 unit test は rust-ci / rust-ci-default-features が担うため対象外）
+- 実行コマンド: `make test-integration`（`cargo test --workspace --test '*'`。integration test target が 0 件の場合は notice を出して成功終了する。現時点では 0 件）
+- 判定基準: CI（ci.yml の `integration-test` ジョブ。3 OS matrix）は実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes でハングを検出して fail させる。テスト 1 件ごとの推奨タイムアウト値（5〜10 秒）の設定と、CI 全体のハング防止の最終確認は TASK-87 が担当する
+- ハングプローブ: `gh workflow run ci.yml --ref <branch> -f hang-probe=true` で起動する。リポ外の使い捨て crate に仕込んだハングするテストを実行し、実行ステップの timeout で 3 OS とも fail することを実証するための手動トリガー（PR・push イベントでは動かない）
+- 最初の integration test target の追加は各機能タスクが担当する。追加する差分は、実行ステップの `timeout-minutes` 内で完走することを PR 本文で確認しているか
 
 ### 実機前提テスト
 

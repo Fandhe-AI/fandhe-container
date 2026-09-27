@@ -6,10 +6,12 @@
 //!
 //! # 位置づけ
 //!
-//! - 本ファイルは TASK-91.1（#129）の成果物。対象仕様の選定一覧・照合ヘルパ・
-//!   雛形テストを実装する（少なくとも 1 件が実際に動く状態にする）
+//! - 本ファイルは TASK-91.1（#129・MS-1 Phase 2）の成果物。対象仕様の選定
+//!   一覧・照合ヘルパ・雛形テストを実装する（少なくとも 1 件が実際に動く
+//!   状態にする）
 //! - 本照合（選定した対象仕様のうち最低 2 件について、仕様未達の実装に
-//!   差し替えると実際に fail することの確認）は TASK-91.2（#130）で行う
+//!   差し替えると実際に fail することの確認）は TASK-91.2（#130・MS-1
+//!   Phase 2）で行う
 //! - 配置理由: spec（`docs/spec/05-tasks.md` の TASK-91）上の成果物パスは
 //!   `crates/core/tests/acceptance_spec.rs` だが、親 #128 の受け入れ条件が
 //!   「MS-1 時点で core は雛形のみで本タスクの照合対象（io の出力仕様）を
@@ -102,7 +104,8 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
     AcceptanceTarget {
         task: "TASK-15",
         behavior: "IO-2",
-        spec_fact: "書き込み ACK と FLUSH ACK が別種別として区別されること",
+        spec_fact: "書き込み ACK と FLUSH ACK が別種別として区別され、\
+            FLUSH ACK はバリア以前の書き込みの永続化後にのみ返ること",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
             planned_task: "TASK-11 / TASK-15",
@@ -203,12 +206,111 @@ fn repair_12_scaffold_matcher_detects_missing_field() {
     );
 }
 
+/// モジュールドキュメントの表を Rust ソースへ複製した期待値。
+///
+/// [`repair_12_acceptance_targets_are_listed`] が [`ACCEPTANCE_TARGETS`] の
+/// 各行を `behavior`・`spec_fact`・`method`・`status` まで含めて個別に
+/// 照合するための対照データ（Codex レビュー指摘: 件数と TASK-13 の一部しか
+/// 検証しておらず、他の行を改変しても検出できなかった穴を塞ぐ）。
+const EXPECTED_ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
+    AcceptanceTarget {
+        task: "TASK-13",
+        behavior: "IO-1",
+        spec_fact: "バッチサイズの既定値 64 が設定の実効値に反映されること",
+        method: MatchMethod::StructuredAssert,
+        status: TargetStatus::NotWired {
+            planned_task: "TASK-13",
+        },
+    },
+    AcceptanceTarget {
+        task: "TASK-15",
+        behavior: "IO-2",
+        spec_fact: "書き込み ACK と FLUSH ACK が別種別として区別され、\
+            FLUSH ACK はバリア以前の書き込みの永続化後にのみ返ること",
+        method: MatchMethod::StructuredAssert,
+        status: TargetStatus::NotWired {
+            planned_task: "TASK-11 / TASK-15",
+        },
+    },
+    AcceptanceTarget {
+        task: "TASK-16",
+        behavior: "IO-10",
+        spec_fact: "未フラッシュ滞留量の上限到達時に自動フラッシュが発行されること",
+        method: MatchMethod::StructuredAssert,
+        status: TargetStatus::NotWired {
+            planned_task: "TASK-16",
+        },
+    },
+    AcceptanceTarget {
+        task: "TASK-17",
+        behavior: "IO-2",
+        spec_fact: "docs/api/io-barrier.md に ACK / FLUSH ACK の永続化保証の違いが明記されていること",
+        method: MatchMethod::StringPattern,
+        status: TargetStatus::NotWired {
+            planned_task: "TASK-17",
+        },
+    },
+    AcceptanceTarget {
+        task: "TASK-19",
+        behavior: "IO-5",
+        spec_fact: "大文字小文字の違いのみで衝突する 2 ファイル作成が構造化エラーで返ること",
+        method: MatchMethod::StructuredAssert,
+        status: TargetStatus::NotWired {
+            planned_task: "TASK-19",
+        },
+    },
+    AcceptanceTarget {
+        task: "TASK-20",
+        behavior: "IO-5・WIN-4",
+        spec_fact: "260 文字を超える共有パスに警告またはエラーが返ること",
+        method: MatchMethod::StructuredAssert,
+        status: TargetStatus::NotWired {
+            planned_task: "TASK-20",
+        },
+    },
+];
+
+/// マッチャが TASK-15（IO-2）の FLUSH ACK 永続化条件（バリア以前の
+/// 書き込みが永続化された後にのみ FLUSH ACK を返すこと）を機械照合できる
+/// ことを確認する（REPAIR-12。[`ACCEPTANCE_TARGETS`] の TASK-15 行に対応。
+/// Codex レビュー指摘: 永続化条件が照合対象から欠落していたため追加）。
+///
+/// サンプル行は TASK-11 / TASK-15 で ACK フレーム型が確定するまでの暫定
+/// フィールド名であり、確定契約ではない（本ファイルのモジュールドキュメント
+/// 「スタブについて」を参照）。
+#[test]
+fn repair_12_scaffold_matcher_detects_premature_flush_ack() {
+    // 仕様どおり: バリア以前の書き込みが永続化済みの場合にのみ FLUSH ACK。
+    let sample_persisted = "ack: type=FLUSH persisted_before_barrier=true";
+    assert_eq!(find_value(sample_persisted, "type"), Some("FLUSH"));
+    assert_eq!(
+        find_value(sample_persisted, "persisted_before_barrier"),
+        Some("true"),
+        "FLUSH ACK はバリア以前の書き込みの永続化後にのみ返る想定"
+    );
+
+    // 仕様違反の再現: 永続化前に FLUSH ACK を返す回帰（PoC-12 型の失敗
+    // モード。ビルドは通るが永続化保証を満たさない）。
+    let sample_premature = "ack: type=FLUSH persisted_before_barrier=false";
+    assert_ne!(
+        find_value(sample_premature, "persisted_before_barrier"),
+        Some("true"),
+        "永続化前に FLUSH ACK を返す回帰をマッチャが検出できていない"
+    );
+}
+
 /// 選定した対象仕様の一覧（[`ACCEPTANCE_TARGETS`]）が、モジュール
 /// ドキュメントの表と一致する件数・内容を持つことを機械照合する
 /// （TASK-91.1 の受け入れ条件「一覧化」を機械照合するテスト）。
+///
+/// 件数と `task` の前方一致チェックに加え、[`EXPECTED_ACCEPTANCE_TARGETS`]
+/// との突き合わせで全行の `behavior`・`spec_fact`・`method`・`status` を
+/// 個別に照合する。行の内容（TASK-15 の FLUSH ACK 永続化条件を含む）が
+/// 改変されても検出できる。
 #[test]
 fn repair_12_acceptance_targets_are_listed() {
     assert_eq!(ACCEPTANCE_TARGETS.len(), 6);
+    assert_eq!(ACCEPTANCE_TARGETS.len(), EXPECTED_ACCEPTANCE_TARGETS.len());
 
     for target in ACCEPTANCE_TARGETS {
         assert!(
@@ -226,16 +328,30 @@ fn repair_12_acceptance_targets_are_listed() {
         );
     }
 
-    let task_13 = ACCEPTANCE_TARGETS
+    for (actual, expected) in ACCEPTANCE_TARGETS
         .iter()
-        .find(|t| t.task == "TASK-13")
-        .expect("TASK-13 の行が一覧に含まれる想定");
-    assert_eq!(task_13.behavior, "IO-1");
-    assert_eq!(task_13.method, MatchMethod::StructuredAssert);
-    assert_eq!(
-        task_13.status,
-        TargetStatus::NotWired {
-            planned_task: "TASK-13"
-        }
-    );
+        .zip(EXPECTED_ACCEPTANCE_TARGETS.iter())
+    {
+        assert_eq!(actual.task, expected.task, "task の不一致");
+        assert_eq!(
+            actual.behavior, expected.behavior,
+            "{}: behavior の不一致",
+            actual.task
+        );
+        assert_eq!(
+            actual.spec_fact, expected.spec_fact,
+            "{}: spec_fact の不一致",
+            actual.task
+        );
+        assert_eq!(
+            actual.method, expected.method,
+            "{}: method の不一致",
+            actual.task
+        );
+        assert_eq!(
+            actual.status, expected.status,
+            "{}: status の不一致",
+            actual.task
+        );
+    }
 }

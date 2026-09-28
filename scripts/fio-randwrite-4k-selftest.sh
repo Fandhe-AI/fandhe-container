@@ -855,6 +855,79 @@ fi
 TMPDIR="${tmp_root}/no-such-tmpdir" run_case_msg "from-json-missing-tmpdir" 2 "temporary (TMPDIR) directory could not be resolved" \
   --from-json "${fixtures_dir}/fio-3-ok.json" --label x
 
+# パス要素 1 つ分の権限判定（check_trusted_dir_component）の単体照合。find の
+# -maxdepth（POSIX に無い）を -prune に置き換えたため、判定の意味（所有者・group/other の
+# 書き込み・sticky の例外・symlink）が変わっていないことと、始点の中へ降りないことを
+# モードの組み合わせで照合する。対象スクリプトから関数定義だけを取り出して使う
+perm_harness="${tmp_root}/perm-harness.sh"
+# shellcheck disable=SC2016 # ハーネスへ書き出す文字列であり、$1 等はハーネス側で展開させる
+{
+  echo 'set -euo pipefail'
+  echo 'err() { echo "error: $1: $2" >&2; }'
+  sed -n '/^check_trusted_dir_component() {$/,/^}$/p' "$target_script"
+  echo 'check_trusted_dir_component "test" "$1" "$(id -u)" "$1"'
+  echo 'echo "verdict=trusted"'
+} >"$perm_harness"
+perm_case() {
+  # 引数: <ケース名> <パス> <trusted|untrusted|symlink>
+  local name="$1" path="$2" want="$3" actual=0 out needle expected_rc
+  case "$want" in
+    trusted) expected_rc=0 needle="verdict=trusted" ;;
+    untrusted) expected_rc=2 needle="can be modified by other users" ;;
+    symlink) expected_rc=2 needle="is a symlink" ;;
+  esac
+  out=$("$bash_bin" "$perm_harness" "$path" 2>&1) || actual=$?
+  if [ "$actual" -eq "$expected_rc" ] && [[ "$out" == *"$needle"* ]]; then
+    echo "PASS: perm-${name} (${want})"
+  else
+    echo "FAIL: perm-${name} (expected ${want}: exit=${expected_rc} with '${needle}', actual exit=${actual})" >&2
+    print_indented "$out"
+    failures=$((failures + 1))
+  fi
+}
+perm_matrix="${tmp_root}/perm-matrix"
+mkdir -p "$perm_matrix"
+for mode in 0755 0700 0775 0770 0757 0777 1777 1775 1700; do
+  mkdir -p "${perm_matrix}/m${mode}"
+  chmod "$mode" "${perm_matrix}/m${mode}"
+done
+perm_case "mode-0755" "${perm_matrix}/m0755" trusted
+perm_case "mode-0700" "${perm_matrix}/m0700" trusted
+perm_case "mode-0775-group-writable" "${perm_matrix}/m0775" untrusted
+perm_case "mode-0770-group-writable" "${perm_matrix}/m0770" untrusted
+perm_case "mode-0757-other-writable" "${perm_matrix}/m0757" untrusted
+perm_case "mode-0777" "${perm_matrix}/m0777" untrusted
+perm_case "mode-1777-sticky" "${perm_matrix}/m1777" trusted
+perm_case "mode-1775-sticky-group-writable" "${perm_matrix}/m1775" trusted
+perm_case "mode-1700-sticky" "${perm_matrix}/m1700" trusted
+# 始点の中へ降りない（-prune）: 中に他ユーザー書き込み可の子があっても、始点だけで判定する
+mkdir -p "${perm_matrix}/m0755-with-children/child-dir"
+: >"${perm_matrix}/m0755-with-children/child-file"
+chmod 0777 "${perm_matrix}/m0755-with-children/child-dir"
+chmod 0666 "${perm_matrix}/m0755-with-children/child-file"
+chmod 0755 "${perm_matrix}/m0755-with-children"
+perm_case "no-descent-into-children" "${perm_matrix}/m0755-with-children" trusted
+# ディレクトリでないもの・symlink は信頼しない
+: >"${perm_matrix}/regular-file"
+chmod 0644 "${perm_matrix}/regular-file"
+perm_case "regular-file" "${perm_matrix}/regular-file" untrusted
+ln -s "${perm_matrix}/m0755" "${perm_matrix}/link-to-m0755"
+perm_case "symlink" "${perm_matrix}/link-to-m0755" symlink
+# root 所有・ルートディレクトリ
+perm_case "root-directory" "/" trusted
+for mode in 0775 0770 0757 0777; do
+  chmod 0755 "${perm_matrix}/m${mode}"
+done
+
+# ルート（/）だけからなる場合も要素の走査が壊れない（空配列の展開。bash 3.2 対策）。
+# TMPDIR=/ では / の検証を通ったうえで、/ に書けないため一時ディレクトリの作成で止まる
+if [ "$(id -u)" -eq 0 ]; then
+  echo "SKIP: from-json-tmpdir-root (running as root, / is writable)"
+else
+  TMPDIR=/ run_case_msg "from-json-tmpdir-root" 2 "could not create a private temporary directory under /" \
+    --from-json "${fixtures_dir}/fio-3-ok.json" --label x
+fi
+
 # 変換対象 JSON のスナップショット（snapshot_json_input）の単体照合。検証後の差し替え
 # （FIFO・デバイス）は起動経路からは決定的に再現できないため、対象スクリプトから関数
 # 定義だけを取り出し、差し替え後の状態を直接入力して照合する（実装そのものを使う）

@@ -16,7 +16,7 @@
 //! - UDS 接続受付ループ（`server.rs`。TASK-13.2.1）
 //! - CLI / 設定からのバッチサイズ・バイト数上限配線（`--batch-size` 相当。TASK-13.3）
 //! - 受信フレーム長そのものの検証・複数接続を跨いだ受信経路の DoS 対策
-//!   （TASK-13.4）
+//!   （[`crate::recv_limits`]・TASK-13.4・#796）
 //! - FLUSH バリアの処理（IO-2・TASK-15）・未フラッシュ滞留量上限（IO-10・TASK-16）
 //!
 //! # 呼び出し文脈
@@ -54,8 +54,9 @@ pub const DEFAULT_BATCH_SIZE: usize = 64;
 /// では 1 フレームあたり最大 64 MiB（[`crate::protocol::MAX_PAYLOAD_LEN`]）の
 /// ペイロード合計バイト数は抑えられない（この累積バイト数の上限は
 /// [`MAX_BATCH_BYTES`] が別途担う。受信経路自体の長さ・件数検証は
-/// IO-10（TASK-16）・TASK-13.4（#796）の責務であり、本モジュールが持つのは
-/// 「1 つの [`BatchBuffer`] インスタンスが確保し続けるメモリ量」自体の上限）。
+/// [`crate::recv_limits`]（TASK-13.4・#796）・IO-10（TASK-16）の責務であり、
+/// 本モジュールが持つのは「1 つの [`BatchBuffer`] インスタンスが確保し続ける
+/// メモリ量」自体の上限）。
 /// この値自体も TASK-13.3・TASK-13.4・TASK-16・TASK-88（ベンチ校正）で
 /// 見直してよい暫定値（REPAIR-3）。
 pub const MAX_BATCH_SIZE: usize = 4096;

@@ -53,6 +53,10 @@ pub enum IoErrorCode {
     /// （security.md「不安全な設計」観点）、`InvalidArgument`（引数そのものの形式・
     /// 範囲違反）とは区別する。
     ///
+    /// 受信経路でも同じ意味で使う: [`crate::recv_limits::ReceiveLimits::admit`]
+    /// （TASK-13.4・#796）が、申告長または滞留件数が設定上限に達したフレームを
+    /// 本体バッファ確保前に拒否する際に返す。
+    ///
     /// gRPC 正準コードの `RESOURCE_EXHAUSTED` を借用した名称であり、`DataLoss` と
     /// 同じく ERR-1/3/5 の既定表にはない拡張コード。spec `error-format.md` への
     /// 反映要否は spec 側への報告事項（spec-reference）。

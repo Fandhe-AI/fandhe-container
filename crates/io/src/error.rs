@@ -75,13 +75,10 @@ pub enum IoErrorCode {
     /// 別ファイルとして作成するとホスト側で黙って上書きされうるため、ゲスト側で
     /// 検出してエラーを返す）。
     ///
-    /// gRPC 正準コードの `ALREADY_EXISTS` を借用した名称。`DataLoss` と同じく
-    /// ERR-1/3 の既定表にあるかどうかは未確認の拡張コードとして扱う。本コードの
-    /// 追加時点では ERR-3 対応表への `ALREADY_EXISTS` の定義を確認できておらず、
-    /// 「定義済み」と断定しない
-    /// （spec-reference: ステータス未確認のビヘイビアは確定扱いしない）。
-    /// spec `error-format.md` への反映要否は spec 側への報告事項
-    /// （out-of-scope-tracking）。
+    /// spec `error-format.md` の ERR-3 対応表の `ALREADY_EXISTS` と同じ名称。ただし
+    /// ERR-3 の定義は「同一 ID のコンテナ・Pod サンドボックスが既に存在する状態での
+    /// `Create` 系呼び出し」であり、I/O 共有層（IO-5）のパス衝突での使用は同表に
+    /// 明記されていない。spec 側への反映要否は spec 側への報告事項（spec-reference）。
     AlreadyExists,
 }
 

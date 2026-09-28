@@ -289,6 +289,13 @@ where
 
 /// バッチを `sink` へ書き込み、成功したら到着順に通常 ACK を送る（D2・D6の
 /// 「sink 失敗時は ACK を 1 件も返さない」を 1 か所にまとめる）。
+///
+/// `sink.write_batch` の契約（[`BatchSink`] のドキュメント）は
+/// 「バッチ全体が書けたときだけ `Ok`」だが、`Ok` の中身（`frames_written`）を
+/// 信頼せずここで `batch.len()` と突き合わせて検証する。現行の
+/// [`AppendFileSink`] は常に一致するが、将来別実装の `sink` が件数不一致の
+/// `Ok` を返す可能性に備えたフェイルクローズ（防御的検証。coding-rust
+/// 「外部入力の経路では明示的に処理する」の趣旨を sink 実装の誤りにも適用）。
 fn write_batch_and_ack<T, W>(
     conn: &mut T,
     sink: &mut W,
@@ -301,6 +308,16 @@ where
     W: BatchSink,
 {
     let report = sink.write_batch(batch)?;
+    if report.frames_written != batch.len() {
+        return Err(IoError::new(
+            IoErrorCode::Internal,
+            format!(
+                "sink reported frames_written={} but batch.len()={}",
+                report.frames_written,
+                batch.len()
+            ),
+        ));
+    }
     stats.batches_written = stats.batches_written.saturating_add(1);
     stats.bytes_written = stats.bytes_written.saturating_add(report.bytes_written);
     send_acks_in_order(conn, batch, timeout, stats)
@@ -341,7 +358,16 @@ where
     /// （D5。マクロではなくローカル関数だと `stats`/`buffer` の可変借用が絡むため、
     /// 呼び出し側で都度 1 行にまとめる代わりにこの内部ヘルパーへ集約する）。
     fn finish(mut stats: WritebackStats, buffer: &BatchBuffer, end: IoError) -> WritebackReport {
-        stats.discarded_pending_frames = buffer.len() as u64;
+        // buffer.len() は BatchConfig の上限（バッチサイズ）に抑えられており
+        // u64 の範囲を超えることはないが、同ファイル内の他箇所（`sink` 実装
+        // 等）と流儀を揃えて `as` キャストではなく `u64::try_from` で扱う。
+        // 上限を超えることは構造上ないため通常は到達しないが、万一変換に
+        // 失敗した場合は 0 件（＝破棄なし）ではなく `u64::MAX` を用いる
+        // （このファイルの他のカウンタが `saturating_add` で飽和側へ倒す
+        // のと同じ「失敗を過小報告しない」方針。discarded_pending_frames は
+        // 可観測性用カウンタだが、変換失敗を理由にループ終了処理自体は
+        // 失敗させない）。
+        stats.discarded_pending_frames = u64::try_from(buffer.len()).unwrap_or(u64::MAX);
         WritebackReport { stats, end }
     }
 

@@ -66,6 +66,20 @@ pub enum IoErrorCode {
     /// 同じく ERR-1/3/5 の既定表にはない拡張コード。spec `error-format.md` への
     /// 反映要否は spec 側への報告事項（spec-reference）。
     ResourceExhausted,
+    /// 既存の対象と衝突しており、これ以上の作成・登録を拒否する
+    /// （TASK-19.1・IO-5・#99）。
+    ///
+    /// [`crate::fs_normalize::CaseCollisionSet::try_insert`] が、既に登録済みの
+    /// パスと大文字小文字の違いだけで衝突する相対パスを拒否する際に返す
+    /// （APFS / NTFS の大文字小文字非区別と ext4 の区別との差異により、ゲスト側で
+    /// 別ファイルとして作成するとホスト側で黙って上書きされうるため、ゲスト側で
+    /// 検出してエラーを返す）。
+    ///
+    /// spec `error-format.md` の ERR-3 対応表の `ALREADY_EXISTS` と同じ名称。ただし
+    /// ERR-3 の定義は「同一 ID のコンテナ・Pod サンドボックスが既に存在する状態での
+    /// `Create` 系呼び出し」であり、I/O 共有層（IO-5）のパス衝突での使用は同表に
+    /// 明記されていない。spec 側への反映要否は spec 側への報告事項（spec-reference）。
+    AlreadyExists,
 }
 
 impl IoErrorCode {
@@ -79,6 +93,7 @@ impl IoErrorCode {
             Self::Internal => "INTERNAL",
             Self::DataLoss => "DATA_LOSS",
             Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
+            Self::AlreadyExists => "ALREADY_EXISTS",
         }
     }
 }
@@ -150,6 +165,7 @@ mod tests {
             IoErrorCode::ResourceExhausted.as_str(),
             "RESOURCE_EXHAUSTED"
         );
+        assert_eq!(IoErrorCode::AlreadyExists.as_str(), "ALREADY_EXISTS");
     }
 
     /// IO-1: `IoError` の `Display` が `"<CODE>: <message>"` 形式になる。

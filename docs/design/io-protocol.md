@@ -124,8 +124,9 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 | REPAIR-5・REPAIR-6 | エラー後の接続再利用禁止（P1-3。フレーム境界の同期マーカー欠如） | `FrameSender::send_frame` / `FrameReceiver::recv_frame` のドキュメンテーションコメントの契約（実装はエラー後 `UNAVAILABLE` を返し続けなければならない） | `transport.rs` の `p1_3_connection_becomes_unavailable_after_error`（mock 実装での契約確認。具象トランスポート実装〔TASK-12・TASK-13〕はこの契約に従う義務を負う） |
 | IO-1 | 既定 64 件（設定可能）単位でのバッチ集約 | `crates/io/src/batch.rs` の `BatchBuffer::push`・`BatchConfig`（既定値 `DEFAULT_BATCH_SIZE = 64`・上限 `MAX_BATCH_SIZE = 4096`〔暫定〕） | `io1_batch_buffer_fires_at_default_64`・`io1_batch_buffer_fires_at_custom_size_8`・`io1_batch_config_default_is_64`・`io1_batch_config_rejects_zero`・`io1_batch_config_rejects_above_max`・`tests/batch.rs` の `io1_public_api_batch_buffer_fires_at_default_size`・`io1_public_api_batch_config_custom_size_fires`・`io1_public_api_batch_config_rejects_zero` |
 | P0 | バッチ 1 つあたりの累積ペイロードバイト数の上限（無制限確保による DoS の防止） | `BatchConfig::max_bytes` / `BatchConfig::with_max_bytes`（既定 `MAX_BATCH_BYTES = 256 MiB`〔暫定〕）。累積が上限を超える手前で `BatchBuffer::push` が既存滞留分を `BatchTrigger::BytesLimitReached` として強制発火させる（件数上限 `MAX_BATCH_SIZE` × 1 フレーム最大長 `MAX_PAYLOAD_LEN` の理論値〔約 256 GiB〕とは独立した安全弁。PR #1105 codex レビュー指摘）。フレーム単体のペイロード長が `max_bytes` を超える場合は `pending` の状態によらず追加前に `INVALID_ARGUMENT` で拒否し、`pending_bytes` が `max_bytes` を上回った状態を作らない（`with_max_bytes` は `MAX_PAYLOAD_LEN` より小さい値も個別設定できるため。PR #1105 codex レビュー指摘・2 巡目） | `batch_config_rejects_zero_max_bytes`・`batch_config_default_max_bytes_is_max_batch_bytes`・`batch_buffer_fires_on_bytes_limit_before_size_limit`・`batch_buffer_does_not_fire_when_bytes_exactly_at_limit`・`batch_buffer_rejects_single_frame_larger_than_max_bytes`・`batch_buffer_accepts_single_frame_exactly_at_max_bytes`・`max_batch_bytes_bounds_worst_case_far_below_size_only_limit` |
+| TASK-13.4 | 受信フレームの長さ・滞留件数を、本体バッファ確保前に設定上限で検証する受理判定ゲート（無制限確保による DoS の防止） | `crates/io/src/recv_limits.rs` の `ReceiveLimits::admit`（`BatchConfig` から `for_batch` で導出。`RESOURCE_EXHAUSTED` で拒否）・`AdmittedHeader::allocate_body`（受理後にのみ本体バッファを確保する唯一の箇所） | `io1_admit_rejects_payload_over_limit_before_allocation`・`io1_admit_rejects_pending_at_limit_before_allocation`・`io1_admit_pending_check_ignores_control_frames`・`io1_admit_accepts_boundaries`・`io1_admitted_allocates_exactly_once`（陽性対照）・`io1_admitted_decode_body_round_trips`・`tests/recv_limits.rs` の `io1_public_api_under_limit_frames_are_buffered`・`io1_public_api_over_config_max_bytes_rejected_before_batch_push` |
 
-補足: TASK-13.1（#76）でバッチ集約バッファ（`BatchBuffer`）と設定 API（`BatchConfig`）を追加した。ディスク書き込み・ACK 返却・UDS 受信ループ・CLI からのバッチサイズ配線（`--batch-size` 相当）は本書時点では未実装であり、TASK-13.2 系・TASK-13.3 の範囲で扱う（REPAIR-3: 実装済みを装わない）。累積バイト数上限（`MAX_BATCH_BYTES`）は `BatchBuffer` 単体の確保量を抑える安全弁であり、受信経路自体の長さ・件数検証（TASK-13.4）・未フラッシュ滞留量上限（IO-10・TASK-16）とは別物。
+補足: TASK-13.1（#76）でバッチ集約バッファ（`BatchBuffer`）と設定 API（`BatchConfig`）を追加した。ディスク書き込み・ACK 返却・UDS 受信ループ・CLI からのバッチサイズ配線（`--batch-size` 相当）は本書時点では未実装であり、TASK-13.2 系・TASK-13.3 の範囲で扱う（REPAIR-3: 実装済みを装わない）。累積バイト数上限（`MAX_BATCH_BYTES`）は `BatchBuffer` 単体の確保量を抑える安全弁であり、受信経路の長さ・件数検証は `recv_limits`（TASK-13.4・#796）が担う。複数接続を跨いだ累積・未フラッシュ滞留量上限（IO-10・TASK-16）とは別物。
 
 ## デコード時の検証順序と検出する破壊
 
@@ -148,8 +149,9 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 
 1. 先頭 `FRAME_HEADER_LEN`（10 バイト）を読む
 2. `FrameHeader::from_bytes` で検証する（上記 1〜4）。ここで拒否されれば、化けた `payload_len` を信用した巨大確保は一切発生しない
-3. 検証が通ってから `FrameHeader::body_len()`（`≤ MAX_PAYLOAD_LEN + CHECKSUM_LEN`。失敗しない）ぶんのバッファを確保して読む
-4. `Frame::decode_body` へ渡す
+3. `ReceiveLimits::admit`（TASK-13.4・#796）で設定上限（`MAX_PAYLOAD_LEN` 以下へ個別設定できる）・現在の滞留件数を照合する。ここで拒否されれば、設定上限を下回るがプロトコル上限以下の申告長でも、まだ本体バッファは確保されない
+4. 検証が通ってから `FrameHeader::body_len()`（`≤ MAX_PAYLOAD_LEN + CHECKSUM_LEN`。失敗しない）ぶんのバッファを `AdmittedHeader::allocate_body` で確保して読む
+5. `AdmittedHeader::decode_body`（`Frame::decode_body` への薄い委譲）へ渡す
 
 これにより「申告長に比例するアロケーションは検証後だけ」という DoS 対策が、一括 `Frame::decode` だけでなくストリーム読み経路でも成り立つ（`header_crc` がなければ、ストリーム読みは手順 2 の検証をヘッダ単体では完結できず、`payload_len` を信用してから手順 3 の確保をした後で初めて手順 7 のトレーラ検証に到達することになり、化けた `payload_len` による巨大確保・待ち続けを防げなかった。これが `header_crc` を追加した動機。P1-2）。
 

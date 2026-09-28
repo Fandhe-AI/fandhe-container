@@ -47,9 +47,15 @@
 //! 2. [`FrameHeader::from_bytes`] で検証する（`header_crc` → `version` → `kind` →
 //!    `payload_len` の順。上記 4 点）。ここで拒否されれば、化けた `payload_len`
 //!    を信用した巨大確保は一切発生しない
-//! 3. 検証が通ってから [`FrameHeader::body_len`]（`≤ MAX_PAYLOAD_LEN +
-//!    CHECKSUM_LEN`。失敗しない）ぶんのバッファを確保して読む
-//! 4. [`Frame::decode_body`] へ渡す
+//! 3. [`crate::recv_limits::ReceiveLimits::admit`]（TASK-13.4・#796）で設定上限
+//!    （[`MAX_PAYLOAD_LEN`] 以下へ個別設定できる）・現在の滞留件数を照合する。
+//!    ここで拒否されれば、設定上限を下回るがプロトコル上限以下の申告長でも、
+//!    まだ本体バッファは確保されない
+//! 4. 検証が通ってから [`FrameHeader::body_len`]（`≤ MAX_PAYLOAD_LEN +
+//!    CHECKSUM_LEN`。失敗しない）ぶんのバッファを
+//!    [`crate::recv_limits::AdmittedHeader::allocate_body`] で確保して読む
+//! 5. [`crate::recv_limits::AdmittedHeader::decode_body`]（[`Frame::decode_body`]
+//!    への薄い委譲）へ渡す
 //!
 //! これにより「申告長に比例するアロケーションは検証後だけ」という DoS 対策
 //! （security.md）が、一括 [`Frame::decode`] だけでなくストリーム読み経路でも

@@ -15,8 +15,10 @@
 //! （TASK-12.2・#74）が送信順で ACK を検証・対応付けし、タイムアウト付きで待つ。
 //! [`batch::BatchBuffer`] は受信した `Write` フレームを既定 64 件（設定可能）単位で
 //! 集約するメモリ内ロジックのみを提供し、UDS 受信ループ・ディスク書き込み・ACK 送出は
-//! TASK-13.2 系の後続 sub-issue が担う。バッチ write-back サーバー本体（TASK-13）も
-//! この crate のトレイト・型を組み合わせる形で後続タスクが追加する。
+//! TASK-13.2 系の後続 sub-issue が担う。受信フレームの長さ・件数を本体バッファ確保前に
+//! 上限検証する受理判定ゲート（[`recv_limits::ReceiveLimits`]・TASK-13.4・#796）も
+//! 持つ。バッチ write-back サーバー本体（TASK-13）もこの crate のトレイト・型を
+//! 組み合わせる形で後続タスクが追加する。
 //!
 //! PLUG-1 区分は core（`fandhe-container-plugin` の境界機構とは別に、コアの一部として
 //! 直接リンクされる）。crate 名 `fandhe-container-io` は
@@ -31,6 +33,7 @@ pub mod error;
 pub mod observe;
 pub mod payload;
 pub mod protocol;
+pub mod recv_limits;
 pub mod transport;
 
 pub use batch::{
@@ -54,6 +57,9 @@ pub use payload::{
 pub use protocol::{
     CHECKSUM_LEN, FRAME_HEADER_LEN, Frame, FrameChecksum, FrameHeader, FrameKind, MAX_FRAME_LEN,
     MAX_PAYLOAD_LEN, PROTOCOL_VERSION, PayloadLen,
+};
+pub use recv_limits::{
+    AdmittedHeader, MAX_CONTROL_PAYLOAD_LEN, MAX_RECV_PENDING_FRAMES, ReceiveLimits,
 };
 pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, WireFrame,

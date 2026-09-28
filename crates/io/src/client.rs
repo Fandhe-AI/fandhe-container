@@ -279,6 +279,18 @@ where
 {
     sender: S,
     queue: SendQueue,
+    /// `send_frame` が「相手に届いたか不明」なエラーを返した後に立てる失効フラグ
+    /// （TASK-12.1・#73 codex 指摘対応）。
+    ///
+    /// [`FrameSender::send_frame`] の契約は「エラー時に相手へ届いていないことを
+    /// 保証しない」（`transport` モジュールのドキュメント参照）。部分送信・
+    /// タイムアウト後のエラーでは、実際には相手に届いている可能性が残るため、
+    /// その id を再利用して次のリクエストに使うと、後から届く応答（ACK）が
+    /// 別のリクエストへ誤対応付けされる危険がある。これを避けるため、送信結果が
+    /// 不明なエラーが起きたら本フィールドを立てて以降の [`Self::send`] をすべて
+    /// 拒否し、id 空間・トランスポートの両方をこのクライアントでは再利用しない
+    /// 状態へ遷移させる。
+    poisoned: bool,
 }
 
 impl<S> PipelineClient<S>
@@ -290,12 +302,23 @@ where
         Self {
             sender,
             queue: SendQueue::new(limit),
+            poisoned: false,
         }
     }
 
     /// 未 ACK リクエストの追跡状態を参照する。
     pub fn queue(&self) -> &SendQueue {
         &self.queue
+    }
+
+    /// このクライアントが失効済み（[`Self::poisoned`] 参照）かどうかを返す。
+    ///
+    /// `true` の場合、[`Self::send`] は常に [`IoErrorCode::Unavailable`] を返す。
+    /// 呼び出し元はこの状態になったトランスポートを再利用せず、新しい接続を
+    /// 張り直す必要がある（送信結果が不明なリクエストが残っている可能性がある
+    /// ため）。
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// 内部のトランスポートを取り出す（呼び出し元がトランスポートの後始末をしたい
@@ -306,22 +329,53 @@ where
 
     /// フレームを送信する。ACK は待たない。
     ///
-    /// 処理順（トランスポートへ書き込む前に上限判定を行う。REPAIR-5・
+    /// 処理順（トランスポートへ書き込む前に上限判定・id 確保を行う。REPAIR-5・
     /// security.md「不安全な設計」観点）:
-    /// 1. 未 ACK 件数が上限に達していれば、あるいは id 採番が溢れるなら
+    /// 1. すでに失効済み（[`Self::is_poisoned`]）なら [`IoErrorCode::Unavailable`]
+    ///    を返す（トランスポートへは書き込まない）
+    /// 2. `frame.kind()` が [`FrameKind::Write`] / [`FrameKind::Flush`] 以外
+    ///    （[`FrameKind::Ack`] / [`FrameKind::FlushAck`] は応答フレームであり
+    ///    対応する ACK が来ないため、未 ACK キューに載せると枠が解放されない。
+    ///    IO-1 の未 ACK リクエスト追跡契約の対象外）なら
+    ///    [`IoErrorCode::InvalidArgument`] を返す
+    /// 3. 未 ACK 件数が上限に達していれば、あるいは id 採番が溢れるなら
     ///    [`IoErrorCode::ResourceExhausted`] を返す（この時点ではトランスポートへ
     ///    書き込まない）
-    /// 2. `sender.send_frame` でトランスポートへ書き出す。失敗したらそのまま
-    ///    エラーを返し、キューへは登録しない（id も消費しない）
-    /// 3. 成功したら [`SendQueue::register`] で採番・登録し、[`InFlightRequest`]
-    ///    を返す
+    /// 4. [`SendQueue::register`] で id を先に確保してキューへ登録する（送信前に
+    ///    確保することで、送信結果が不明なエラーが起きても id を使い回さない）
+    /// 5. `sender.send_frame` でトランスポートへ書き出す。失敗した場合、
+    ///    [`FrameSender::send_frame`] は「相手に届いていないことを保証しない」
+    ///    契約であるため、届いた可能性を残したまま id を回収せず（キューの
+    ///    エントリはそのまま残す）、[`Self::poisoned`] を立てて以降の送信を
+    ///    すべて拒否し、エラーを返す
     ///
     /// `timeout` は 1 回の書き込みにそのまま渡す（ACK を待つものではない。
     /// REPAIR-5）。
     pub fn send(&mut self, frame: &Frame, timeout: IoTimeout) -> Result<InFlightRequest, IoError> {
+        if self.poisoned {
+            return Err(IoError::new(
+                IoErrorCode::Unavailable,
+                "pipeline client is poisoned after an ambiguous send failure; reconnect required",
+            ));
+        }
+        match frame.kind() {
+            FrameKind::Write | FrameKind::Flush => {}
+            FrameKind::Ack | FrameKind::FlushAck => {
+                return Err(IoError::new(
+                    IoErrorCode::InvalidArgument,
+                    "only Write/Flush frames can be tracked as in-flight requests",
+                ));
+            }
+        }
         self.queue.ensure_can_register()?;
-        self.sender.send_frame(frame, timeout)?;
-        self.queue.register(frame.kind())
+        let request = self.queue.register(frame.kind())?;
+        if let Err(err) = self.sender.send_frame(frame, timeout) {
+            // 送信結果が不明なため、request.id() をキューへ残したまま接続を
+            // 失効させる（上記ドキュメンテーションコメント参照）。
+            self.poisoned = true;
+            return Err(err);
+        }
+        Ok(request)
     }
 
     /// 指定した id の未 ACK リクエストを取り外す（#74 の ACK 処理から呼ばれる入口）。
@@ -546,11 +600,13 @@ mod tests {
         assert_eq!(queue.len(), 1);
     }
 
-    /// IO-1・TASK-12.1: トランスポートへの書き込みが失敗した場合はキューへ登録
-    /// せず、id も消費しない（同一クライアントで「1 回失敗 → 成功」を再現し、
-    /// 成功した送信の id が `0` から始まることを確認する）。
+    /// IO-1・TASK-12.1（#73 codex 指摘対応）: トランスポートへの書き込みが失敗した
+    /// 場合、`send_frame` は「相手に届いていないことを保証しない」契約であるため、
+    /// 確保済みの id はキューに残したまま回収せず、クライアントを失効
+    /// （[`PipelineClient::is_poisoned`]）させる。失効後の送信はすべて
+    /// `Unavailable` になり、id を再利用しない。
     #[test]
-    fn io1_pipeline_client_does_not_register_on_transport_error() {
+    fn io1_pipeline_client_poisons_on_transport_error() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
         let mut client = PipelineClient::new(AlwaysTimeoutSender, limit);
 
@@ -558,22 +614,82 @@ mod tests {
             .send(&write_frame(1), test_timeout())
             .expect_err("transport failure must propagate");
         assert_eq!(err.code(), IoErrorCode::Timeout);
-        assert_eq!(client.queue().len(), 0);
+        // 送信結果が不明なため id `0` の枠はキューに残ったままになる。
+        assert_eq!(client.queue().len(), 1);
+        assert!(client.is_poisoned());
 
-        // 同一クライアント上で「1 回失敗 → その後成功」を再現し、失敗した送信が
-        // id を消費していないことを確認する（成功した送信の id が `0` から始まる）。
+        // 失効後は再送を試みても id を再利用せず、常に `Unavailable` を返す。
+        let err = client
+            .send(&write_frame(2), test_timeout())
+            .expect_err("poisoned client must reject further sends");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+        assert_eq!(client.queue().len(), 1);
+    }
+
+    /// IO-1・TASK-12.1（#73 codex 指摘対応）: 送信前に id を確保するため、1 回目の
+    /// 失敗で確保した id（`0`）は失効した接続に残り続け、新しい接続（新しい
+    /// `PipelineClient`）でのみ id `0` から採番が再開されることを確認する
+    /// （失効した接続をまたいで id が使い回されないことの確認）。
+    #[test]
+    fn io1_pipeline_client_reserves_id_before_send_and_does_not_reuse_after_poison() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
         let mut client = PipelineClient::new(FailOnceSender::default(), limit);
+
         let first_attempt = client
             .send(&write_frame(1), test_timeout())
             .expect_err("1st attempt must fail via the mock sender");
         assert_eq!(first_attempt.code(), IoErrorCode::Timeout);
+        assert!(client.is_poisoned());
+        // 確保済みの id `0` はキューに残ったまま（送信結果が不明なため回収しない）。
+        assert_eq!(client.queue().len(), 1);
+        assert_eq!(
+            client
+                .queue()
+                .oldest()
+                .expect("one entry must remain")
+                .id()
+                .get(),
+            0
+        );
+
+        // 失効した接続では id を再利用できない（Unavailable で拒否される）。
+        let err = client
+            .send(&write_frame(1), test_timeout())
+            .expect_err("poisoned client must reject further sends");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+
+        // 新しい接続（新しい `PipelineClient`）でのみ id `0` から採番が再開される。
+        let mut fresh_client = PipelineClient::new(RecordingSender::default(), limit);
+        let request = fresh_client
+            .send(&write_frame(1), test_timeout())
+            .expect("a fresh connection must succeed");
+        assert_eq!(request.id().get(), 0);
+        assert_eq!(fresh_client.queue().len(), 1);
+    }
+
+    /// IO-1・TASK-12.1（#73 codex 指摘対応）: `send` は `Write`・`Flush` 以外の
+    /// フレーム種別（`Ack`・`FlushAck`）を拒否する。応答フレームを未 ACK キューへ
+    /// 登録すると、対応する ACK が来ないため枠が解放されないままになる。
+    #[test]
+    fn io1_pipeline_client_rejects_response_frame_kinds() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+
+        let ack_frame = Frame::new(FrameKind::Ack, Vec::new()).expect("frame must be valid");
+        let err = client
+            .send(&ack_frame, test_timeout())
+            .expect_err("Ack frames must not be trackable as in-flight requests");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
         assert_eq!(client.queue().len(), 0);
 
-        let request = client
-            .send(&write_frame(1), test_timeout())
-            .expect("2nd attempt must succeed once the mock sender stops failing");
-        assert_eq!(request.id().get(), 0);
-        assert_eq!(client.queue().len(), 1);
+        let flush_ack_frame =
+            Frame::new(FrameKind::FlushAck, Vec::new()).expect("frame must be valid");
+        let err = client
+            .send(&flush_ack_frame, test_timeout())
+            .expect_err("FlushAck frames must not be trackable as in-flight requests");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(client.queue().len(), 0);
+        assert_eq!(client.into_inner().sent.len(), 0);
     }
 
     /// IO-1・TASK-12.1: id の採番が `u64` の範囲を超える場合は `ResourceExhausted`

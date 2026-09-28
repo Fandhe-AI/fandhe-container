@@ -6,8 +6,11 @@
 //! 未 ACK 件数に上限を設けて追跡する送信キュー（[`SendQueue`]）と、それを使って
 //! [`crate::transport::FrameSender`] へ橋渡しするクライアント（[`PipelineClient`]）を
 //! 提供する。[`PipelineClient::send`] の成功・失敗カウントとレイテンシ分布は
-//! [`SendMetrics`]（[`PipelineClient::metrics`] で参照）として観測できる
-//! （base 側 AGENTS.md の可観測性要件・REPAIR-4）。
+//! [`SendMetrics`]（[`PipelineClient::metrics`] で参照）として観測できるほか、
+//! 送信のたびに [`crate::observe::SendObserver`] へイベント通知する（既定は
+//! [`NoopSendObserver`]。[`PipelineClient::with_observer`] で
+//! [`crate::observe::JsonLinesSendObserver`] 等の外部出力へ差し替えられる。
+//! base 側 AGENTS.md の可観測性要件・REPAIR-4）。
 //!
 //! # #74（TASK-12.2）との境界
 //!
@@ -27,6 +30,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::error::{IoError, IoErrorCode};
+use crate::observe::{NoopSendObserver, SendEvent, SendEventError, SendObserver};
 use crate::protocol::{Frame, FrameKind};
 use crate::transport::{FrameSender, IoTimeout};
 
@@ -473,9 +477,10 @@ impl SendMetrics {
 /// 「#74（TASK-12.2）との境界」を参照）。`&mut self` を要求し、単一スレッド前提
 /// （[`crate::transport::FrameSender`] と同じ契約）。
 #[derive(Debug)]
-pub struct PipelineClient<S>
+pub struct PipelineClient<S, O = NoopSendObserver>
 where
     S: FrameSender<Frame = Frame>,
+    O: SendObserver,
 {
     sender: S,
     queue: SendQueue,
@@ -494,19 +499,39 @@ where
     /// [`Self::send`] の成功・失敗カウントとレイテンシ分布（TASK-12.1・#73 codex
     /// 指摘対応。P1・REPAIR-4）。
     metrics: SendMetrics,
+    /// [`Self::send`] のたびに通知する送信イベントの観測フック（TASK-12.1・#73
+    /// codex 指摘対応。P1・REPAIR-4）。既定は [`NoopSendObserver`]。
+    observer: O,
 }
 
-impl<S> PipelineClient<S>
+impl<S> PipelineClient<S, NoopSendObserver>
 where
     S: FrameSender<Frame = Frame>,
 {
-    /// トランスポートと未 ACK 件数上限からクライアントを作る。
+    /// トランスポートと未 ACK 件数上限からクライアントを作る（観測フックは
+    /// [`NoopSendObserver`]。外部へ出力したい場合は [`Self::with_observer`] を使う）。
     pub fn new(sender: S, limit: InFlightLimit) -> Self {
+        Self::with_observer(sender, limit, NoopSendObserver)
+    }
+}
+
+impl<S, O> PipelineClient<S, O>
+where
+    S: FrameSender<Frame = Frame>,
+    O: SendObserver,
+{
+    /// トランスポート・未 ACK 件数上限・送信イベントの観測フックからクライアントを
+    /// 作る（TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）。
+    ///
+    /// `observer` には [`crate::observe::JsonLinesSendObserver`] 等、送信イベントを
+    /// 外部のログ・メトリクス基盤へ出力する実装を渡せる。
+    pub fn with_observer(sender: S, limit: InFlightLimit, observer: O) -> Self {
         Self {
             sender,
             queue: SendQueue::new(limit),
             poisoned: false,
             metrics: SendMetrics::default(),
+            observer,
         }
     }
 
@@ -518,6 +543,10 @@ where
     /// [`Self::send`] の成功・失敗カウントとレイテンシ分布を参照する
     /// （TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）。呼び出し元はここから
     /// 読み出した値を、任意のログ・メトリクス基盤へ変換して出力する。
+    ///
+    /// 送信の都度リアルタイムに出力したい場合は [`Self::with_observer`] で
+    /// [`SendObserver`] を差し込む（本メソッドは呼び出し元が明示的に読み出す
+    /// 集計値であり、送信のたびに自動で外部へ出力する経路ではない）。
     pub fn metrics(&self) -> &SendMetrics {
         &self.metrics
     }
@@ -610,35 +639,58 @@ where
     ///
     /// # 観測（TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）
     ///
-    /// 呼び出しごとに結果種別（[`SendOutcome`]）を [`Self::metrics`] へ記録する。
-    /// 上限到達（[`SendOutcome::RejectedResourceExhausted`]）・トランスポート失敗
-    /// （[`SendOutcome::TransportFailure`]）も含め、すべての分岐を計上する。
+    /// 呼び出しごとに結果種別（[`SendOutcome`]）を [`Self::metrics`] へ記録し、
+    /// [`SendEvent`] として [`Self::observer`]（`observer` フィールド。既定は
+    /// [`NoopSendObserver`]）へも通知する。上限到達
+    /// （[`SendOutcome::RejectedResourceExhausted`]）・トランスポート失敗
+    /// （[`SendOutcome::TransportFailure`]）も含め、すべての分岐を計上・通知する。
     /// 所要時間はトランスポートへ実際に書き込んだ呼び出し（成功・失敗の両方）に
-    /// ついてのみ計測する（早期拒否はトランスポートを介さないため）。
+    /// ついてのみ計測する（早期拒否はトランスポートを介さないため `Duration::ZERO`）。
     pub fn send(&mut self, frame: &Frame, timeout: IoTimeout) -> Result<InFlightRequest, IoError> {
+        let kind = frame.kind();
         if self.poisoned {
             self.metrics
                 .record(SendOutcome::RejectedPoisoned, Duration::ZERO);
-            return Err(IoError::new(
+            let err = IoError::new(
                 IoErrorCode::Unavailable,
                 "pipeline client is poisoned after an ambiguous send failure; reconnect required",
-            ));
+            );
+            self.notify(kind, SendOutcome::RejectedPoisoned, Duration::ZERO, &err);
+            return Err(err);
         }
-        if let Err(err) = ensure_trackable_frame_kind(frame.kind()) {
+        if let Err(err) = ensure_trackable_frame_kind(kind) {
             self.metrics
                 .record(SendOutcome::RejectedInvalidFrameKind, Duration::ZERO);
+            self.notify(
+                kind,
+                SendOutcome::RejectedInvalidFrameKind,
+                Duration::ZERO,
+                &err,
+            );
             return Err(err);
         }
         if let Err(err) = self.queue.ensure_can_register() {
             self.metrics
                 .record(SendOutcome::RejectedResourceExhausted, Duration::ZERO);
+            self.notify(
+                kind,
+                SendOutcome::RejectedResourceExhausted,
+                Duration::ZERO,
+                &err,
+            );
             return Err(err);
         }
-        let request = match self.queue.register(frame.kind()) {
+        let request = match self.queue.register(kind) {
             Ok(request) => request,
             Err(err) => {
                 self.metrics
                     .record(SendOutcome::RejectedResourceExhausted, Duration::ZERO);
+                self.notify(
+                    kind,
+                    SendOutcome::RejectedResourceExhausted,
+                    Duration::ZERO,
+                    &err,
+                );
                 return Err(err);
             }
         };
@@ -647,13 +699,34 @@ where
             // 送信結果が不明なため、request.id() をキューへ残したまま接続を
             // 失効させる（上記ドキュメンテーションコメント参照）。
             self.poisoned = true;
-            self.metrics
-                .record(SendOutcome::TransportFailure, started_at.elapsed());
+            let elapsed = started_at.elapsed();
+            self.metrics.record(SendOutcome::TransportFailure, elapsed);
+            self.notify(kind, SendOutcome::TransportFailure, elapsed, &err);
             return Err(err);
         }
-        self.metrics
-            .record(SendOutcome::Success, started_at.elapsed());
+        let elapsed = started_at.elapsed();
+        self.metrics.record(SendOutcome::Success, elapsed);
+        self.observer.on_send(&SendEvent {
+            kind,
+            outcome: SendOutcome::Success,
+            latency: elapsed,
+            error: None,
+        });
         Ok(request)
+    }
+
+    /// [`Self::send`] の各失敗分岐から共通で呼び、[`SendEvent`]（失敗詳細つき）を
+    /// [`Self::observer`] へ通知する（TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）。
+    fn notify(&mut self, kind: FrameKind, outcome: SendOutcome, latency: Duration, err: &IoError) {
+        self.observer.on_send(&SendEvent {
+            kind,
+            outcome,
+            latency,
+            error: Some(SendEventError {
+                code: err.code(),
+                message: err.message().to_string(),
+            }),
+        });
     }
 
     /// 指定した id の未 ACK リクエストを取り外す（#74 の ACK 処理から呼ばれる入口）。
@@ -1219,6 +1292,54 @@ mod tests {
         assert_eq!(metrics.transport_failure_count(), 1);
         assert_eq!(metrics.rejected_poisoned_count(), 1);
         assert_eq!(metrics.write_latency().count(), 1);
+    }
+
+    /// TASK-12.1（#73 codex 指摘対応。P1・REPAIR-4）: [`PipelineClient::with_observer`]
+    /// に差し込んだ [`crate::observe::JsonLinesSendObserver`] が、成功・上限到達
+    /// （早期拒否）の 2 件それぞれで 1 行ずつ JSON Lines を出力する。`metrics()` を
+    /// 明示的に読み出さなくても外部（ここでは `Vec<u8>`）へ送信結果が観測できる
+    /// ことを確認する（codex レビュー指摘の解消）。
+    #[test]
+    fn repair4_with_observer_writes_json_lines_for_each_send_outcome() {
+        use crate::observe::JsonLinesSendObserver;
+
+        let limit = InFlightLimit::new(1).expect("1 must be valid");
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let observer = JsonLinesSendObserver::new(&mut buf);
+            let mut client =
+                PipelineClient::with_observer(RecordingSender::default(), limit, observer);
+
+            client
+                .send(&write_frame(1), test_timeout())
+                .expect("1st send must succeed under the limit");
+            let err = client
+                .send(&write_frame(2), test_timeout())
+                .expect_err("2nd send must be rejected once the limit is reached");
+            assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+            assert_eq!(
+                err.message(),
+                "send queue is full: 1 in-flight requests reached the limit of 1"
+            );
+        }
+
+        let output = String::from_utf8(buf).expect("output must be UTF-8");
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2, "expected one JSON line per send() call");
+        assert!(
+            lines[0].starts_with(
+                "{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"ok\",\"latency_us\":"
+            ) && lines[0].ends_with('}'),
+            "unexpected success line: {}",
+            lines[0]
+        );
+        assert_eq!(
+            lines[1],
+            "{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"error\",\
+             \"reason\":\"rejected_resource_exhausted\",\"code\":\"RESOURCE_EXHAUSTED\",\
+             \"message\":\"send queue is full: 1 in-flight requests reached the limit of 1\",\
+             \"latency_us\":0}"
+        );
     }
 
     /// TASK-12.1（#73 codex 指摘対応。P1・REPAIR-4）: 追跡対象外のフレーム種別

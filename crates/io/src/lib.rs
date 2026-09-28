@@ -4,7 +4,9 @@
 //! 送受信の抽象トレイト（[`transport`]）・構造化エラー（[`error`]）・フレームヘッダ
 //! newtype とチェックサム付きフレーム全体型（[`protocol`]。TASK-11.2・#69・
 //! TASK-11.3・#70）に加え、パイプライン送信クライアントの送信キュー
-//! （[`client::SendQueue`]・[`client::PipelineClient`]。TASK-12.1・#73）を持つ。
+//! （[`client::SendQueue`]・[`client::PipelineClient`]。TASK-12.1・#73）と、送信
+//! イベントを外部のログ・メトリクス基盤へ出力する観測フック（[`observe`]。
+//! TASK-12.1・#73 codex 指摘対応。REPAIR-4）を持つ。
 //! トランスポートの具象実装（UDS・vsock・named pipe 等）はまだない（REPAIR-3。
 //! スタブの明示）。[`protocol::Frame`] はヘッダ・ペイロード・CRC-32C チェックサムの
 //! エンコード / デコードを提供するが、request id のワイヤー表現・ACK status の
@@ -23,14 +25,18 @@
 mod checksum;
 pub mod client;
 pub mod error;
+pub mod observe;
 pub mod protocol;
 pub mod transport;
 
 pub use client::{
     DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest, MAX_IN_FLIGHT_LIMIT, PipelineClient,
-    RequestId, SendQueue,
+    RequestId, SendOutcome, SendQueue,
 };
 pub use error::{IoError, IoErrorCode};
+pub use observe::{
+    JsonLinesSendObserver, NoopSendObserver, SendEvent, SendEventError, SendObserver,
+};
 pub use protocol::{
     CHECKSUM_LEN, FRAME_HEADER_LEN, Frame, FrameChecksum, FrameHeader, FrameKind, MAX_FRAME_LEN,
     MAX_PAYLOAD_LEN, PayloadLen,

@@ -9,8 +9,12 @@
 //! [`SendMetrics`]（[`PipelineClient::metrics`] で参照）として観測できるほか、
 //! 送信のたびに [`crate::observe::SendObserver`] へイベント通知する（既定は
 //! [`NoopSendObserver`]。[`PipelineClient::with_observer`] で
-//! [`crate::observe::JsonLinesSendObserver`] 等の外部出力へ差し替えられる。
-//! base 側 AGENTS.md の可観測性要件・REPAIR-4）。
+//! [`crate::observe::JsonLinesSendObserver`] 等へ差し替えられる。`on_send` は
+//! 送信経路から同期で呼ばれるためブロックする I/O をしてはならず
+//! （REPAIR-5。[`crate::observe`] モジュールドキュメント参照）、
+//! [`crate::observe::JsonLinesSendObserver`] はメモリ内にためるだけで、実際の
+//! 書き出しは [`PipelineClient::observer_mut`] 経由で取り出した観測フックに対し
+//! 呼び出し元が行う。base 側 AGENTS.md の可観測性要件・REPAIR-4）。
 //!
 //! # #74（TASK-12.2）との境界
 //!
@@ -509,7 +513,7 @@ where
     S: FrameSender<Frame = Frame>,
 {
     /// トランスポートと未 ACK 件数上限からクライアントを作る（観測フックは
-    /// [`NoopSendObserver`]。外部へ出力したい場合は [`Self::with_observer`] を使う）。
+    /// [`NoopSendObserver`]。送信イベントを記録したい場合は [`Self::with_observer`] を使う）。
     pub fn new(sender: S, limit: InFlightLimit) -> Self {
         Self::with_observer(sender, limit, NoopSendObserver)
     }
@@ -524,7 +528,8 @@ where
     /// 作る（TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）。
     ///
     /// `observer` には [`crate::observe::JsonLinesSendObserver`] 等、送信イベントを
-    /// 外部のログ・メトリクス基盤へ出力する実装を渡せる。
+    /// 記録する実装を渡せる。渡した観測フックは [`Self::observer_mut`] で
+    /// 取り出せる。
     pub fn with_observer(sender: S, limit: InFlightLimit, observer: O) -> Self {
         Self {
             sender,
@@ -549,6 +554,23 @@ where
     /// 集計値であり、送信のたびに自動で外部へ出力する経路ではない）。
     pub fn metrics(&self) -> &SendMetrics {
         &self.metrics
+    }
+
+    /// [`Self::with_observer`] で差し込んだ観測フックを参照する（TASK-12.1・#73
+    /// codex 再指摘対応。P1・REPAIR-4）。
+    pub fn observer(&self) -> &O {
+        &self.observer
+    }
+
+    /// [`Self::with_observer`] で差し込んだ観測フックを可変参照で取り出す
+    /// （TASK-12.1・#73 codex 再指摘対応。P1・REPAIR-4・REPAIR-5）。
+    ///
+    /// [`crate::observe::JsonLinesSendObserver`] のようにメモリ内へためるだけの
+    /// 実装では、`send` の呼び出しごとに `on_send`（ブロックしない契約。REPAIR-5）
+    /// がここへ積むだけなので、実際の書き出しは呼び出し元がこの参照から
+    /// `drain_lines` / `drain_into` を呼んで行う。
+    pub fn observer_mut(&mut self) -> &mut O {
+        &mut self.observer
     }
 
     /// このクライアントが失効済み（[`Self::poisoned`] 参照）かどうかを返す。
@@ -1296,37 +1318,34 @@ mod tests {
         assert_eq!(metrics.write_latency().count(), 1);
     }
 
-    /// TASK-12.1（#73 codex 指摘対応。P1・REPAIR-4）: [`PipelineClient::with_observer`]
-    /// に差し込んだ [`crate::observe::JsonLinesSendObserver`] が、成功・上限到達
-    /// （早期拒否）の 2 件それぞれで 1 行ずつ JSON Lines を出力する。`metrics()` を
-    /// 明示的に読み出さなくても外部（ここでは `Vec<u8>`）へ送信結果が観測できる
+    /// TASK-12.1（#73 codex 再指摘対応。P1・REPAIR-4・REPAIR-5）:
+    /// [`PipelineClient::with_observer`] に差し込んだ
+    /// [`crate::observe::JsonLinesSendObserver`] が、成功・上限到達（早期拒否）の
+    /// 2 件それぞれで 1 行ずつ JSON Lines をメモリ内にためる。`on_send` 自体は
+    /// I/O をせず（REPAIR-5）、`observer_mut().drain_lines()` で呼び出し元が
+    /// 取り出す。`metrics()` を明示的に読み出さなくても送信結果が観測できる
     /// ことを確認する（codex レビュー指摘の解消）。
     #[test]
-    fn repair4_with_observer_writes_json_lines_for_each_send_outcome() {
+    fn repair4_with_observer_buffers_json_lines_for_each_send_outcome() {
         use crate::observe::JsonLinesSendObserver;
 
         let limit = InFlightLimit::new(1).expect("1 must be valid");
-        let mut buf: Vec<u8> = Vec::new();
-        {
-            let observer = JsonLinesSendObserver::new(&mut buf);
-            let mut client =
-                PipelineClient::with_observer(RecordingSender::default(), limit, observer);
+        let observer = JsonLinesSendObserver::new();
+        let mut client = PipelineClient::with_observer(RecordingSender::default(), limit, observer);
 
-            client
-                .send(&write_frame(1), test_timeout())
-                .expect("1st send must succeed under the limit");
-            let err = client
-                .send(&write_frame(2), test_timeout())
-                .expect_err("2nd send must be rejected once the limit is reached");
-            assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
-            assert_eq!(
-                err.message(),
-                "send queue is full: 1 in-flight requests reached the limit of 1"
-            );
-        }
+        client
+            .send(&write_frame(1), test_timeout())
+            .expect("1st send must succeed under the limit");
+        let err = client
+            .send(&write_frame(2), test_timeout())
+            .expect_err("2nd send must be rejected once the limit is reached");
+        assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+        assert_eq!(
+            err.message(),
+            "send queue is full: 1 in-flight requests reached the limit of 1"
+        );
 
-        let output = String::from_utf8(buf).expect("output must be UTF-8");
-        let lines: Vec<&str> = output.lines().collect();
+        let lines = client.observer_mut().drain_lines();
         assert_eq!(lines.len(), 2, "expected one JSON line per send() call");
         assert!(
             lines[0].starts_with(

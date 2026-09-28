@@ -8,7 +8,8 @@
 use std::time::Duration;
 
 use fandhe_container_io::{
-    Frame, FrameKind, FrameSender, InFlightLimit, IoError, IoErrorCode, IoTimeout, PipelineClient,
+    Frame, FrameKind, FrameSender, InFlightLimit, IoError, IoErrorCode, IoTimeout,
+    JsonLinesSendObserver, PipelineClient,
 };
 
 fn test_timeout() -> IoTimeout {
@@ -164,4 +165,35 @@ fn io1_public_api_in_flight_limit_validation() {
     let over_err = InFlightLimit::new(fandhe_container_io::MAX_IN_FLIGHT_LIMIT + 1)
         .expect_err("MAX_IN_FLIGHT_LIMIT + 1 must be rejected");
     assert_eq!(over_err.code(), IoErrorCode::InvalidArgument);
+}
+
+/// TASK-12.1（#73 codex 再指摘対応。P1・REPAIR-4・REPAIR-5）:
+/// [`PipelineClient::observer_mut`] は crate 外からも観測フックへ到達でき、
+/// [`JsonLinesSendObserver`] にためた送信イベントを `drain_into` で書き出せる。
+/// `on_send`（送信経路）自体は I/O をせず、書き出しは呼び出し元が明示的に行う
+/// 契約（REPAIR-5）が公開 API として機能することを確認する。
+#[test]
+fn repair5_public_api_observer_mut_drains_buffered_send_log() {
+    let limit = InFlightLimit::new(1).expect("1 must be valid");
+    let observer = JsonLinesSendObserver::new();
+    let mut client = PipelineClient::with_observer(RecordingSender::default(), limit, observer);
+
+    client
+        .send(&write_frame(1), test_timeout())
+        .expect("send must succeed while under the limit");
+
+    let mut buf: Vec<u8> = Vec::new();
+    let written = client
+        .observer_mut()
+        .drain_into(&mut buf)
+        .expect("writing to an in-memory buffer must not fail");
+    assert_eq!(written, 1, "expected one buffered JSON line");
+    assert!(client.observer_mut().is_empty());
+
+    let output = String::from_utf8(buf).expect("output must be UTF-8");
+    assert!(
+        output.starts_with("{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"ok\",")
+            && output.ends_with("}\n"),
+        "unexpected drained output: {output}"
+    );
 }

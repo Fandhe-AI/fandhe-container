@@ -1,21 +1,35 @@
-//! [`crate::client::PipelineClient::send`] の送信イベントを外部へ出力する観測フック
-//! （TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）。
+//! [`crate::client::PipelineClient::send`] の送信イベントを観測する仕組み
+//! （TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4・REPAIR-5）。
 //!
 //! [`crate::client::SendMetrics`]（[`crate::client::PipelineClient::metrics`] で参照）は
 //! プロセス内の集計値を保持するだけで、外部のログ・メトリクス基盤への出力を持たない。
 //! 呼び出し元が `metrics()` を明示的に読み出さない限り、送信失敗や上限到達を観測
 //! できないという codex レビュー指摘（base 側 AGENTS.md の可観測性要件・REPAIR-4）に
 //! 対応するため、本モジュールは送信 1 回ごとのイベントを [`SendObserver`] へ同期的に
-//! 通知する仕組みと、その既定実装として JSON Lines（1 イベント 1 行）で出力する
-//! [`JsonLinesSendObserver`] を提供する。[`SendMetrics`](crate::client::SendMetrics) を
-//! 置き換えるものではなく、その補完（外部出力用のフック）として使う。
+//! 通知する仕組みと、その既定実装として送信イベントを JSON Lines（1 イベント 1 行）へ
+//! 変換して上限付きのメモリ内キューへためる [`JsonLinesSendObserver`] を提供する。
+//! [`SendMetrics`](crate::client::SendMetrics) を置き換えるものではなく、その補完
+//! （外部出力用のフック）として使う。
+//!
+//! # `on_send` はブロックしてはならない（REPAIR-5。codex 再指摘対応）
+//!
+//! [`SendObserver::on_send`] は [`crate::client::PipelineClient::send`] という送信経路
+//! から同期で呼ばれる。旧実装の [`JsonLinesSendObserver`] は `on_send` の中で任意の
+//! `Write` へ同期的に `write_all`・`flush` していたが、満杯の pipe など書き込み先が
+//! ブロックする状況では `send` そのものが無期限に停止しかねず、
+//! [`crate::transport::IoTimeout`] でも打ち切れない（REPAIR-5 違反）。本モジュールの
+//! [`JsonLinesSendObserver`] は `on_send` の中では `VecDeque` へ積むだけにとどめ、
+//! 実際の書き出しは呼び出し元が任意のタイミング・スレッドで
+//! [`JsonLinesSendObserver::drain_lines`] / [`JsonLinesSendObserver::drain_into`] を
+//! 呼んで行う（送信経路の外に I/O を分離する）。
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::io::Write;
+use std::io::{self, Write};
 use std::time::Duration;
 
 use crate::client::SendOutcome;
-use crate::error::IoErrorCode;
+use crate::error::{IoError, IoErrorCode};
 use crate::protocol::FrameKind;
 
 /// [`crate::client::PipelineClient::send`] 1 回分の送信イベント（TASK-12.1・#73
@@ -51,11 +65,19 @@ pub struct SendEventError {
 }
 
 /// [`crate::client::PipelineClient::send`] の送信イベントを受け取る観測フック
-/// （TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）。
+/// （TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4・REPAIR-5）。
 ///
 /// 呼び出しは送信のたびに同期的・単一スレッドで行われる（[`crate::client::PipelineClient`]
-/// 自体が `&mut self` を要求し単一スレッド前提であることと同じ契約）。実装は送信経路を
-/// ブロックしないよう軽量に保つこと（重い I/O・ロック待ちを行わない）。
+/// 自体が `&mut self` を要求し単一スレッド前提であることと同じ契約）。
+///
+/// # 契約: ブロックする I/O をしてはならない（REPAIR-5）
+///
+/// `on_send` は送信経路（[`crate::client::PipelineClient::send`]）から同期で呼ばれる。
+/// ここでブロックする I/O（ソケット・pipe への書き込み・ロック待ち等）を行うと、
+/// 相手の応答を待たない送信であるはずの `send` 自体が無期限に停止しかねず、
+/// [`crate::transport::IoTimeout`] でも打ち切れない。実装はメモリ内へ積む・
+/// 非ブロッキング操作のみに留め、実際の I/O は別経路（呼び出し元が明示的に呼ぶ
+/// drain API 等）へ分離すること（[`JsonLinesSendObserver`] を参照）。
 ///
 /// `Debug` は要求しない。`Box<dyn Write + Send>` のような非 `Debug` な書き込み先を
 /// 保持する観測フックも実装できるようにするため（[`crate::client::PipelineClient`]
@@ -75,8 +97,17 @@ impl SendObserver for NoopSendObserver {
     fn on_send(&mut self, _event: &SendEvent) {}
 }
 
-/// [`SendEvent`] を JSON Lines（1 イベント 1 行）として `W` へ書き出す既定実装
-/// （TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4・ERR-1 の構造化 `code` / `message` 形式）。
+/// [`JsonLinesSendObserver::new`]（既定容量）が使う、ためられる JSON 行数の既定値
+/// （TASK-12.1・#73 codex 再指摘対応。P1・REPAIR-5）。
+pub const DEFAULT_SEND_LOG_CAPACITY: usize = 1024;
+
+/// [`JsonLinesSendObserver::with_capacity`] が受理する容量の最大値。無制限確保を
+/// 防ぐための上限（security.md「不安全な設計」観点）。
+pub const MAX_SEND_LOG_CAPACITY: usize = 65536;
+
+/// [`SendEvent`] を JSON Lines（1 イベント 1 行）へ変換し、上限付きのメモリ内
+/// `VecDeque` へためる既定実装（TASK-12.1・#73 codex 再指摘対応。P1・REPAIR-4・
+/// REPAIR-5・ERR-1 の構造化 `code` / `message` 形式）。
 ///
 /// 出力キーは英語 snake_case 固定（`event`・`kind`・`outcome`・`reason`・`code`・
 /// `message`・`latency_us`）。`event` は常に `"io_send"`、`kind` は `WRITE`/`ACK`/
@@ -91,56 +122,131 @@ impl SendObserver for NoopSendObserver {
 /// （untrusted なトランスポート由来を含みうる）だけを [`escape_json_string`] で
 /// エスケープする。
 ///
-/// # 書き込み失敗の扱い
-/// `W` への書き込み・flush が失敗しても [`SendObserver::on_send`] はそれを送信処理
-/// （[`crate::client::PipelineClient::send`]）へ伝播させず黙って握りつぶす（観測が
-/// 主処理を妨げてはならないため）。書き込み失敗自体を計測する指標は持たない
-/// （REPAIR-3。必要になれば別タスクで拡張する）。
-pub struct JsonLinesSendObserver<W>
-where
-    W: Write + Send,
-{
-    writer: W,
+/// # `on_send` は I/O をしない（REPAIR-5。codex 再指摘対応）
+/// 旧実装は `on_send` の中で任意の `Write` へ同期的に書き込んでいたが、満杯の
+/// pipe 等で送信経路（[`crate::client::PipelineClient::send`]）自体が無期限に
+/// ブロックしかねず、[`crate::transport::IoTimeout`] でも打ち切れなかった
+/// （REPAIR-5 違反）。本実装は `on_send` の中では `VecDeque` へ積むだけにとどめ、
+/// 実際の書き出しは呼び出し元が [`Self::drain_lines`] / [`Self::drain_into`] を
+/// 呼んで自分のタイミング・スレッドで行う。
+///
+/// # 満杯時の扱い
+/// 容量に達した状態で新しいイベントが来た場合、新規イベントを破棄し
+/// （最古のイベントを保持する。すでにためた分の消失より、直近の詳細を失うほうが
+/// 実害が小さいと判断）、[`Self::dropped_count`] を増分する。破棄そのものが
+/// `send` へ伝播することはない（観測が主処理を妨げてはならないため）。
+pub struct JsonLinesSendObserver {
+    lines: VecDeque<String>,
+    capacity: usize,
+    dropped: u64,
 }
 
-impl<W> JsonLinesSendObserver<W>
-where
-    W: Write + Send,
-{
-    /// 書き込み先から観測フックを作る。
-    pub fn new(writer: W) -> Self {
-        Self { writer }
+impl JsonLinesSendObserver {
+    /// 既定容量（[`DEFAULT_SEND_LOG_CAPACITY`]）で観測フックを作る。
+    pub fn new() -> Self {
+        Self {
+            lines: VecDeque::new(),
+            capacity: DEFAULT_SEND_LOG_CAPACITY,
+            dropped: 0,
+        }
     }
 
-    /// 内部の書き込み先を取り出す。
-    pub fn into_inner(self) -> W {
-        self.writer
+    /// 容量を指定して観測フックを作る。`capacity` が `0` または
+    /// [`MAX_SEND_LOG_CAPACITY`] を超える場合は [`IoErrorCode::InvalidArgument`]
+    /// を返す（無制限確保の防止）。
+    pub fn with_capacity(capacity: usize) -> Result<Self, IoError> {
+        if capacity == 0 {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                "send log capacity must not be zero",
+            ));
+        }
+        if capacity > MAX_SEND_LOG_CAPACITY {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!("send log capacity must be at most {MAX_SEND_LOG_CAPACITY}"),
+            ));
+        }
+        Ok(Self {
+            lines: VecDeque::new(),
+            capacity,
+            dropped: 0,
+        })
+    }
+
+    /// このバッファの容量を返す。
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// 現在ためている JSON 行数を返す。
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// ためている JSON 行が 1 件もないかを返す。
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// 容量超過により破棄した（新規イベント側を破棄した）件数を返す。
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped
+    }
+
+    /// ためている JSON 行をすべて取り出す（呼び出し元が任意の書き出し先へ渡す
+    /// 想定。改行は含まない）。
+    pub fn drain_lines(&mut self) -> Vec<String> {
+        self.lines.drain(..).collect()
+    }
+
+    /// ためている JSON 行を `writer` へ 1 行ずつ書き出す（改行付き）。
+    ///
+    /// [`Self::on_send`]（[`SendObserver`]）と異なり、こちらは呼び出し元が明示的に
+    /// 呼ぶ経路であり、ブロックする I/O を行ってよい（REPAIR-5 の制約は送信経路
+    /// から呼ばれる `on_send` のみが対象）。書き込みが失敗した行は `VecDeque`
+    /// から取り除かず、以降の行も試みずに即座にエラーを返す（失われた行を
+    /// 再現できるようにするため）。
+    pub fn drain_into<W: Write>(&mut self, writer: &mut W) -> io::Result<usize> {
+        let mut written = 0usize;
+        while let Some(line) = self.lines.front() {
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
+            self.lines.pop_front();
+            written += 1;
+        }
+        writer.flush()?;
+        Ok(written)
     }
 }
 
-impl<W> SendObserver for JsonLinesSendObserver<W>
-where
-    W: Write + Send,
-{
+impl Default for JsonLinesSendObserver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SendObserver for JsonLinesSendObserver {
     fn on_send(&mut self, event: &SendEvent) {
-        let line = encode_send_event(event);
-        // 書き込み失敗は送信処理を妨げないよう握りつぶす（上記ドキュメント参照）。
-        let _ = self.writer.write_all(line.as_bytes());
-        let _ = self.writer.write_all(b"\n");
-        let _ = self.writer.flush();
+        if self.lines.len() >= self.capacity {
+            // 満杯時は新規イベントを破棄する（上記ドキュメント参照）。ここで
+            // I/O は行わない（REPAIR-5）。
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        self.lines.push_back(encode_send_event(event));
     }
 }
 
-/// `writer`（バッファリングした送信ログを含みうる）の中身を誤ってダンプしないよう、
-/// フィールドを省略した手書きの `Debug` 実装（[`W`] に `Debug` を要求しないための
-/// 措置。`Box<dyn Write + Send>` のような非 `Debug` な書き込み先も保持できる）。
-impl<W> fmt::Debug for JsonLinesSendObserver<W>
-where
-    W: Write + Send,
-{
+/// ためた JSON 行の中身を誤ってダンプしないよう、件数・破棄数のみを出す手書きの
+/// `Debug` 実装。
+impl fmt::Debug for JsonLinesSendObserver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JsonLinesSendObserver")
-            .finish_non_exhaustive()
+            .field("len", &self.lines.len())
+            .field("capacity", &self.capacity)
+            .field("dropped", &self.dropped)
+            .finish()
     }
 }
 
@@ -250,26 +356,28 @@ mod tests {
         }
     }
 
-    /// REPAIR-4: 成功イベントが `outcome":"ok"` の 1 行 JSON になる。
+    /// REPAIR-4: 成功イベントが `outcome":"ok"` の 1 行 JSON として `drain_lines`
+    /// から取り出せる（改行は含まない）。
     #[test]
     fn repair4_json_lines_observer_encodes_success_event() {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut observer = JsonLinesSendObserver::new(&mut buf);
+        let mut observer = JsonLinesSendObserver::new();
         observer.on_send(&success_event(123));
 
-        let output = String::from_utf8(buf).expect("output must be UTF-8");
+        let lines = observer.drain_lines();
         assert_eq!(
-            output,
-            "{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"ok\",\"latency_us\":123}\n"
+            lines,
+            vec![
+                "{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"ok\",\"latency_us\":123}"
+            ]
         );
+        assert!(observer.is_empty());
     }
 
     /// REPAIR-4: トランスポート失敗イベントが `outcome":"error"` と `code` を含む
     /// 1 行 JSON になる。
     #[test]
     fn repair4_json_lines_observer_encodes_transport_failure_event() {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut observer = JsonLinesSendObserver::new(&mut buf);
+        let mut observer = JsonLinesSendObserver::new();
         observer.on_send(&failure_event(
             FrameKind::Write,
             SendOutcome::TransportFailure,
@@ -278,12 +386,14 @@ mod tests {
             456,
         ));
 
-        let output = String::from_utf8(buf).expect("output must be UTF-8");
+        let lines = observer.drain_lines();
         assert_eq!(
-            output,
-            "{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"error\",\
-             \"reason\":\"transport_failure\",\"code\":\"TIMEOUT\",\
-             \"message\":\"ack not received within timeout\",\"latency_us\":456}\n"
+            lines,
+            vec![
+                "{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"error\",\
+                 \"reason\":\"transport_failure\",\"code\":\"TIMEOUT\",\
+                 \"message\":\"ack not received within timeout\",\"latency_us\":456}"
+            ]
         );
     }
 
@@ -291,8 +401,7 @@ mod tests {
     /// `latency_us":0` を含む 1 行 JSON になる。
     #[test]
     fn repair4_json_lines_observer_encodes_resource_exhausted_event() {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut observer = JsonLinesSendObserver::new(&mut buf);
+        let mut observer = JsonLinesSendObserver::new();
         observer.on_send(&failure_event(
             FrameKind::Write,
             SendOutcome::RejectedResourceExhausted,
@@ -301,12 +410,14 @@ mod tests {
             0,
         ));
 
-        let output = String::from_utf8(buf).expect("output must be UTF-8");
+        let lines = observer.drain_lines();
         assert_eq!(
-            output,
-            "{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"error\",\
-             \"reason\":\"rejected_resource_exhausted\",\"code\":\"RESOURCE_EXHAUSTED\",\
-             \"message\":\"in-flight limit reached\",\"latency_us\":0}\n"
+            lines,
+            vec![
+                "{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"error\",\
+                 \"reason\":\"rejected_resource_exhausted\",\"code\":\"RESOURCE_EXHAUSTED\",\
+                 \"message\":\"in-flight limit reached\",\"latency_us\":0}"
+            ]
         );
     }
 
@@ -315,8 +426,7 @@ mod tests {
     /// エラーメッセージが JSON 構造を壊すのを防ぐ）。
     #[test]
     fn repair4_json_lines_observer_escapes_message_special_characters() {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut observer = JsonLinesSendObserver::new(&mut buf);
+        let mut observer = JsonLinesSendObserver::new();
         observer.on_send(&failure_event(
             FrameKind::Flush,
             SendOutcome::RejectedInvalidFrameKind,
@@ -325,13 +435,76 @@ mod tests {
             0,
         ));
 
+        let lines = observer.drain_lines();
+        assert_eq!(
+            lines,
+            vec![
+                "{\"event\":\"io_send\",\"kind\":\"FLUSH\",\"outcome\":\"error\",\
+                 \"reason\":\"rejected_invalid_frame_kind\",\"code\":\"INVALID_ARGUMENT\",\
+                 \"message\":\"bad \\\"frame\\\"\\\\payload\\nwith control chars\",\
+                 \"latency_us\":0}"
+            ]
+        );
+    }
+
+    /// REPAIR-5: `with_capacity(0)` と `MAX_SEND_LOG_CAPACITY + 1` は
+    /// `InvalidArgument` で拒否される（無制限確保の防止）。
+    #[test]
+    fn repair5_json_lines_observer_with_capacity_rejects_out_of_range() {
+        let zero_err = JsonLinesSendObserver::with_capacity(0).expect_err("zero must be rejected");
+        assert_eq!(zero_err.code(), IoErrorCode::InvalidArgument);
+
+        let over_err = JsonLinesSendObserver::with_capacity(MAX_SEND_LOG_CAPACITY + 1)
+            .expect_err("MAX_SEND_LOG_CAPACITY + 1 must be rejected");
+        assert_eq!(over_err.code(), IoErrorCode::InvalidArgument);
+    }
+
+    /// REPAIR-5（codex 再指摘対応）: 容量に達すると新規イベントを破棄し
+    /// `dropped_count` を増分する。ためた行は最古（先に来た）2 件のまま変わらず、
+    /// 3 件目（新規側）が破棄されたことを確認する。
+    #[test]
+    fn repair5_json_lines_observer_drops_newest_when_full() {
+        let mut observer =
+            JsonLinesSendObserver::with_capacity(2).expect("2 must be a valid capacity");
+
+        observer.on_send(&success_event(1));
+        observer.on_send(&success_event(2));
+        observer.on_send(&success_event(3));
+
+        assert_eq!(observer.len(), 2);
+        assert_eq!(observer.dropped_count(), 1);
+
+        let lines = observer.drain_lines();
+        assert_eq!(
+            lines,
+            vec![
+                "{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"ok\",\"latency_us\":1}",
+                "{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"ok\",\"latency_us\":2}",
+            ]
+        );
+        assert!(observer.is_empty());
+    }
+
+    /// REPAIR-5: `on_send` は I/O をしない契約だが、`drain_into` は呼び出し元が
+    /// 明示的に呼ぶ経路として実際の書き出しを行う（改行付き）。
+    #[test]
+    fn repair5_json_lines_observer_drain_into_writes_lines_with_newline() {
+        let mut observer = JsonLinesSendObserver::new();
+        observer.on_send(&success_event(1));
+        observer.on_send(&success_event(2));
+
+        let mut buf: Vec<u8> = Vec::new();
+        let written = observer
+            .drain_into(&mut buf)
+            .expect("writing to an in-memory buffer must not fail");
+        assert_eq!(written, 2);
+        assert!(observer.is_empty());
+
         let output = String::from_utf8(buf).expect("output must be UTF-8");
         assert_eq!(
             output,
-            "{\"event\":\"io_send\",\"kind\":\"FLUSH\",\"outcome\":\"error\",\
-             \"reason\":\"rejected_invalid_frame_kind\",\"code\":\"INVALID_ARGUMENT\",\
-             \"message\":\"bad \\\"frame\\\"\\\\payload\\nwith control chars\",\
-             \"latency_us\":0}\n"
+            "{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"ok\",\"latency_us\":1}\n\
+             {\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"ok\",\"latency_us\":2}\n"
         );
     }
 

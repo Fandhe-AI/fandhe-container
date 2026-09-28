@@ -5,9 +5,9 @@
 //! newtype とチェックサム付きフレーム全体型（[`protocol`]。TASK-11.2・#69・
 //! TASK-11.3・#70）・バッチ集約バッファ（[`batch`]。TASK-13.1・#76）に加え、
 //! パイプライン送信クライアントの送信キュー（[`client::SendQueue`]・
-//! [`client::PipelineClient`]。TASK-12.1・#73）と、送信イベントを外部のログ・
-//! メトリクス基盤へ出力する観測フック（[`observe`]。TASK-12.1・#73 codex 指摘対応。
-//! REPAIR-4）を持つ。トランスポートの具象実装（UDS・vsock・named pipe 等）・
+//! [`client::PipelineClient`]。TASK-12.1・#73）と、送信イベントを記録する観測フック
+//! （[`observe`]。TASK-12.1・#73 codex 指摘対応。REPAIR-4・REPAIR-5）を持つ。
+//! トランスポートの具象実装（UDS・vsock・named pipe 等）・
 //! ディスク書き込み・ACK 返却はまだない（REPAIR-3。スタブの明示）。
 //! [`protocol::Frame`] はヘッダ・ペイロード・CRC-32C チェックサムのエンコード /
 //! デコードを提供するが、request id のワイヤー表現・ACK status のペイロード
@@ -42,7 +42,8 @@ pub use client::{
 };
 pub use error::{IoError, IoErrorCode};
 pub use observe::{
-    JsonLinesSendObserver, NoopSendObserver, SendEvent, SendEventError, SendObserver,
+    DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver, MAX_SEND_LOG_CAPACITY, NoopSendObserver,
+    SendEvent, SendEventError, SendObserver,
 };
 pub use protocol::{
     CHECKSUM_LEN, FRAME_HEADER_LEN, Frame, FrameChecksum, FrameHeader, FrameKind, MAX_FRAME_LEN,

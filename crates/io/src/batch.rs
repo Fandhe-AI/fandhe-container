@@ -345,14 +345,24 @@ impl BatchBuffer {
     /// `frame` が [`FrameKind::Write`] 以外の場合は
     /// [`IoErrorCode::InvalidArgument`] を返し、バッファの内容は変更しない。
     ///
-    /// 追加前に、このフレームを加えると累積ペイロードバイト数が設定上限
-    /// （[`BatchConfig::max_bytes`]）を超えると判明した場合（かつ既に滞留分が
-    /// ある場合）は、そのフレームを加える前に既存の滞留分を
-    /// [`BatchTrigger::BytesLimitReached`] な [`PushOutcome::Ready`] として
-    /// 強制的に取り出し、渡された `frame` は空になったバッファへ新たに
-    /// 積む（次回以降の呼び出しで扱われる。P0: 無制限確保による DoS の防止。
-    /// 1 フレーム自体の長さは [`crate::protocol::MAX_PAYLOAD_LEN`] で
-    /// 別途検証済みのため、単独のフレームが理由で拒否されることはない）。
+    /// `frame` 単体のペイロード長が設定上限（[`BatchConfig::max_bytes`]）を
+    /// 超える場合も同様に [`IoErrorCode::InvalidArgument`] を返し、バッファの
+    /// 内容は変更しない（P0・PR #1105 codex レビュー指摘: `max_bytes` は
+    /// [`BatchConfig::with_max_bytes`] で [`crate::protocol::MAX_PAYLOAD_LEN`]
+    /// より小さい値へ個別設定できるため、「1 フレーム自体の長さは
+    /// `MAX_PAYLOAD_LEN` で別途検証済みだから単独のフレームが理由で拒否され
+    /// ない」という前提は既定設定でしか成り立たない。`pending` が空だからと
+    /// 上限超過フレームをそのまま積むと、[`Self::pending_bytes`] が
+    /// `max_bytes` を上回った状態を作ってしまい、本フィールドが担う
+    /// 「無制限確保による DoS の防止」という安全弁の契約を破る）。
+    ///
+    /// 上記 2 つの拒否条件のいずれにも当てはまらない場合、このフレームを
+    /// 加えると累積ペイロードバイト数が `max_bytes` を超えると判明した
+    /// 場合（かつ既に滞留分がある場合）は、そのフレームを加える前に既存の
+    /// 滞留分を [`BatchTrigger::BytesLimitReached`] な [`PushOutcome::Ready`]
+    /// として強制的に取り出し、渡された `frame` は空になったバッファへ
+    /// 新たに積む（次回以降の呼び出しで扱われる。P0: 無制限確保による
+    /// DoS の防止）。
     ///
     /// 上記のバイト数上限に抵触せず追加できた場合、追加後の滞留件数が設定件数
     /// （[`BatchConfig::batch_size`]）に到達したときも同様にバッファ内の
@@ -368,6 +378,16 @@ impl BatchBuffer {
         }
 
         let frame_len = frame.payload().len();
+
+        if frame_len > self.config.max_bytes() {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!(
+                    "frame payload length {frame_len} exceeds configured max_bytes {}",
+                    self.config.max_bytes()
+                ),
+            ));
+        }
 
         if !self.pending.is_empty()
             && self.pending_bytes.saturating_add(frame_len) > self.config.max_bytes()
@@ -702,28 +722,36 @@ mod tests {
     /// フレーム自体が失われたり拒否されたりはしない（分割できないため、
     /// そのフレーム単独のバッチとして次回発火する）。
     #[test]
-    fn batch_buffer_accepts_single_frame_larger_than_max_bytes() {
+    fn batch_buffer_rejects_single_frame_larger_than_max_bytes() {
+        // P1（PR #1105 codex レビュー指摘）: `pending` が空でも、フレーム単体の
+        // ペイロード長が `max_bytes` を超える場合は追加前に拒否し、累積バイト数
+        // 上限の契約（無制限確保による DoS の防止）を破らない。
+        let config =
+            BatchConfig::with_max_bytes(MAX_BATCH_SIZE, 4).expect("valid config must succeed");
+        let mut buffer = BatchBuffer::new(config);
+
+        let err = buffer
+            .push(write_frame_of_len(100))
+            .expect_err("single frame exceeding max_bytes must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        // 拒否されたフレームはバッファへ反映されない。
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.pending_bytes(), 0);
+    }
+
+    /// P1（PR #1105 codex レビュー指摘）: フレーム単体の長さがちょうど
+    /// `max_bytes` に一致する境界値は拒否されず、通常どおり滞留する。
+    #[test]
+    fn batch_buffer_accepts_single_frame_exactly_at_max_bytes() {
         let config =
             BatchConfig::with_max_bytes(MAX_BATCH_SIZE, 4).expect("valid config must succeed");
         let mut buffer = BatchBuffer::new(config);
 
         let outcome = buffer
-            .push(write_frame_of_len(100))
-            .expect("push must succeed even if it alone exceeds max_bytes");
+            .push(write_frame_of_len(4))
+            .expect("frame exactly at max_bytes must be accepted");
         assert!(matches!(outcome, PushOutcome::Buffered { pending: 1 }));
-        assert_eq!(buffer.pending_bytes(), 100);
-
-        // 次のフレームを積もうとすると、単体で上限超過済みの滞留分が
-        // 先に発火する。
-        let outcome = buffer
-            .push(write_frame_of_len(1))
-            .expect("push must succeed");
-        let batch = match outcome {
-            PushOutcome::Ready(batch) => batch,
-            PushOutcome::Buffered { .. } => panic!("oversized pending frame must flush first"),
-        };
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch.trigger(), BatchTrigger::BytesLimitReached);
+        assert_eq!(buffer.pending_bytes(), 4);
     }
 
     /// P0: バイト数上限（暫定 256 GiB 規模の DoS）に対する回帰確認として、

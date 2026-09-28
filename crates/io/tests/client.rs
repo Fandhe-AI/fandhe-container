@@ -35,8 +35,19 @@ impl FrameSender for RecordingSender {
 }
 
 /// IO-1・TASK-12.1: 未 ACK 件数が上限に達すると `send` は
-/// `IoErrorCode::ResourceExhausted` を返し、トランスポートへの書き込み件数は
-/// 上限と一致する（それ以上は書き込まれない）。
+/// `IoErrorCode::ResourceExhausted` を返し、それ以上未 ACK 件数は増えない
+/// （`queue().len()` が上限のまま変わらないことで確認する）。
+///
+/// # `into_inner` が未 ACK 保持中にトランスポートを返さないことについて
+/// （TASK-12.1・#73 codex レビュー指摘対応。P1）
+///
+/// 未 ACK の枠を解放する [`PipelineClient::remove_in_flight`] は `pub(crate)`
+/// （上記 P0 指摘対応）のため、本ファイルのような crate 外の結合試験からは
+/// キューを空にできない。そのため本テストでは、送信済みバイト列を
+/// `into_inner` 経由で取り出す代わりに `queue().len()` で未 ACK 件数のみを
+/// 確認する。未 ACK が残ったままの `into_inner` が `Unavailable` を返し
+/// トランスポートを渡さないことの確認は crate 内部の `src/client.rs` の
+/// `io1_pipeline_client_into_inner_rejects_unacked_requests` が担う。
 #[test]
 fn io1_public_api_pipeline_client_rejects_when_limit_reached() {
     let limit = InFlightLimit::new(3).expect("3 must be a valid limit");
@@ -54,14 +65,6 @@ fn io1_public_api_pipeline_client_rejects_when_limit_reached() {
     assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
 
     assert_eq!(client.queue().len(), 3);
-    assert_eq!(
-        client
-            .into_inner()
-            .expect("healthy client must yield its transport")
-            .sent
-            .len(),
-        3
-    );
 }
 
 // IO-1・TASK-12.1（#73 codex 指摘対応。P0）: 未 ACK 枠の解放

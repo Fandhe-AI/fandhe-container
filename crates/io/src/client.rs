@@ -349,12 +349,37 @@ where
     /// （[`FrameSender`] は明示的な close / shutdown を持たないため、`self` を
     /// consume して drop することが、この接続を再利用不可にする API 上の唯一の
     /// 保証手段になる）。
+    ///
+    /// # 未 ACK が残るトランスポートの扱い（TASK-12.1・#73 codex 指摘対応。P1）
+    ///
+    /// `poisoned` が `false` でも、[`SendQueue`] に未 ACK のリクエストが 1 件でも
+    /// 残っている場合は [`IoErrorCode::Unavailable`] を返し、同様に `self` を drop
+    /// する。未 ACK 追跡状態（`queue`）はこの呼び出しで破棄されるため、返した
+    /// `sender` を使って呼び出し元が新しい [`PipelineClient::new`] を作ると、
+    /// 未 ACK キュー・`next_id` が空・`0` に巻き戻り、（a）まだ応答が来ていない
+    /// 旧リクエストの ACK が新しいクライアントの id 空間へ誤対応付けされる、
+    /// （b）ACK 未受信のまま実質的に `InFlightLimit` を超えて送信を継続できる、
+    /// という 2 つの問題を招く。追跡状態を保ったままトランスポートだけを
+    /// 差し替えたい場合は、`queue().is_empty()` で未 ACK が無いことを確認してから
+    /// 呼び出すか、すべての ACK を受信し終えてから呼び出す（#74 の範囲。IO-1）。
     pub fn into_inner(self) -> Result<S, IoError> {
         if self.poisoned {
             return Err(IoError::new(
                 IoErrorCode::Unavailable,
                 "pipeline client is poisoned after an ambiguous send failure; \
                  the transport is dropped instead of being returned for reuse",
+            ));
+        }
+        if !self.queue.is_empty() {
+            return Err(IoError::new(
+                IoErrorCode::Unavailable,
+                format!(
+                    "pipeline client still has {} unacknowledged in-flight request(s); \
+                     the transport is dropped instead of being returned for reuse, since \
+                     recreating PipelineClient would reset the in-flight tracking state \
+                     and misattribute late ACKs",
+                    self.queue.len()
+                ),
             ));
         }
         Ok(self.sender)
@@ -564,9 +589,18 @@ mod tests {
             ]
         );
 
+        // `into_inner` は未 ACK が残る限りトランスポートを返さない（#73 codex
+        // レビュー指摘対応。P1）ため、送信済みバイト列を確認する前に、すべての
+        // 枠を ACK 済み相当として解放しておく。
+        for id in [0u64, 1, 2] {
+            client
+                .remove_in_flight(RequestId(id))
+                .expect("removing an acknowledged id must succeed");
+        }
+
         let sent_bytes: Vec<u8> = client
             .into_inner()
-            .expect("healthy client must yield its transport")
+            .expect("healthy client with a drained queue must yield its transport")
             .sent
             .iter()
             .map(|frame| frame.payload()[0])
@@ -595,10 +629,20 @@ mod tests {
 
         assert_eq!(client.queue().len(), 2);
         assert!(client.queue().is_full());
+
+        // `into_inner` は未 ACK が残る限りトランスポートを返さない（#73 codex
+        // レビュー指摘対応。P1）ため、送信件数を確認する前に両方の枠を
+        // ACK 済み相当として解放しておく。
+        for id in [0u64, 1] {
+            client
+                .remove_in_flight(RequestId(id))
+                .expect("removing an acknowledged id must succeed");
+        }
+
         assert_eq!(
             client
                 .into_inner()
-                .expect("healthy client must yield its transport")
+                .expect("healthy client with a drained queue must yield its transport")
                 .sent
                 .len(),
             2
@@ -701,6 +745,52 @@ mod tests {
             .into_inner()
             .expect_err("poisoned client must not yield its transport for reuse");
         assert_eq!(err.code(), IoErrorCode::Unavailable);
+    }
+
+    /// IO-1・TASK-12.1（#73 codex レビュー指摘対応。P1）: `poisoned` が `false` でも、
+    /// 未 ACK のリクエストが残ったままの [`PipelineClient::into_inner`] は
+    /// `Unavailable` を返し、トランスポートを渡さない。返してしまうと、呼び出し元が
+    /// その sender で新しい `PipelineClient::new` を作り直せてしまい、未 ACK キュー・
+    /// `next_id` が空・`0` に巻き戻って、後から届く旧リクエストの ACK が新しい
+    /// リクエストへ誤対応付けされたり、ACK 未受信のまま実質的に `InFlightLimit` を
+    /// 超えて送信を継続できたりする。
+    #[test]
+    fn io1_pipeline_client_into_inner_rejects_unacked_requests() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+
+        client
+            .send(&write_frame(1), test_timeout())
+            .expect("send must succeed while under the limit");
+        assert!(!client.is_poisoned());
+        assert_eq!(client.queue().len(), 1);
+
+        let err = client
+            .into_inner()
+            .expect_err("client with unacknowledged requests must not yield its transport");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+    }
+
+    /// IO-1・TASK-12.1（#73 codex レビュー指摘対応。P1 の回帰確認）: 送信済みの
+    /// リクエストがすべて `remove_in_flight`（#74 の ACK 処理が呼ぶ想定の入口）で
+    /// 解放され、未 ACK 件数が `0` に戻っていれば `into_inner` は通常どおり
+    /// トランスポートを返す（不要に厳しくなっていないことの確認）。
+    #[test]
+    fn io1_pipeline_client_into_inner_accepts_when_queue_drained() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+
+        let request = client
+            .send(&write_frame(1), test_timeout())
+            .expect("send must succeed while under the limit");
+        client
+            .remove_in_flight(request.id())
+            .expect("removing the acknowledged id must succeed");
+        assert!(client.queue().is_empty());
+
+        client
+            .into_inner()
+            .expect("client with a drained queue must yield its transport");
     }
 
     /// IO-1・TASK-12.1（#73 codex 指摘対応）: 送信前に id を確保するため、1 回目の

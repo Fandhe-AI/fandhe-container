@@ -150,6 +150,18 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 
 別 uid からの接続は root 権限がないと再現できないため結合試験の対象にはせず、uid の一致判定を純粋関数（`imp::peer_credential_matches`）へ切り出して具体値で検証する（`crates/io/src/server.rs` のユニットテスト）。拒否 1 件ごとの通知から最終イベントまでの配線は、同じファイルのユニットテストで照合関数をテスト時だけ差し替え（非公開の `imp::ServerInner::accept_with`。本番の `accept` は常に固定の照合を渡す）、実際のソケット（同一 uid の接続）で確かめる（I4・#820 security-auditor 再監査指摘対応）。同一プロセスからの自己接続（`UnixStream::pair`）で `crate::sys::peer_uid` が自プロセスの実効 uid と一致することは `crates/io/src/sys.rs` のユニットテストで確認する。
 
+### UDS ソケットファイルのモード（PLUG-12・security.md。J2・#820 codex P0 指摘対応）
+
+`UdsServer::bind` は bind の後にソケットのパスを再解決する操作（パス経由の chmod 等）を行わない。以前は bind 後にパス経由でソケットファイルを `0600` へ chmod していたが、bind 後にパスや祖先ディレクトリを差し替えられると、symlink の参照先など別のファイルのモードをサーバープロセスの権限で変えうるため廃止した。socket fd 経由の `fchmod(2)` も代替にならない: Linux では sockfs 側の inode にしか作用せず、ファイルシステム上のソケットファイル（パスの inode）のモードは変わらない（#820 で実測。fd 側の `fstat` は `0600` に変わるが、パスの `lstat` は umask 由来のモード〔umask 022 で `0755`〕のまま）。macOS では socket fd への `fchmod(2)` 自体がエラーになる。
+
+したがってソケットファイル自体のモードは bind 時の umask に従う（umask `000` なら `0777`）。別 uid の到達を遮断するのはソケットファイルのモードではなく、(1) bind 前に検証する親ディレクトリ（symlink でない・ディレクトリである・`mode & 0o077 == 0`・所有者 == 自プロセスの実効 uid。パス名での `connect(2)` には親ディレクトリの search 権限が要るため、owner 以外はソケットファイルのモードに関係なく到達できない）と、(2) accept 時の peer credential 検証（上記「UDS の peer credential 検証」節）の 2 段である。親ディレクトリの検証は bind 時点の 1 回だけで、以後も owner 専用に保つのは所有者（呼び出し側）の責務とする。結合試験 `io1_plug12_uds_parent_dir_guards_socket_access_and_cleanup`（`crates/io/tests/server.rs`）が bind 後の親ディレクトリの不変条件を確かめる。
+
+### UDS ソケットファイルの片付け（PLUG-12・security.md。J3・#820 codex P1 指摘対応）
+
+`UdsServer::bind` は bind 直後に `symlink_metadata` でパス上のファイルを調べ、ソケットであり・所有者 uid が bind 時点の実効 uid と一致することを確かめて、その `(dev, ino)`・所有者 uid を保存する（`imp::SocketFileIdentity`。socket fd の `fstat` は sockfs 側の inode を返しパスの inode と一致しないため、記録にはパスの `lstat` を使う）。確かめられなかった場合（別物に差し替わっていた等）は、自分が作ったと確認できないためパス上のファイルを削除せず、listener を閉じてエラーを返す（`symlink_metadata` 自体の失敗は `Internal`、ソケットでない・所有者 uid が異なる場合は bind 前の所有者照合と同じ `InvalidArgument`）。
+
+`UdsServer` の `Drop`（と bind 失敗時の後始末）は、削除直前に `symlink_metadata` で取り直した実体が、保存した実体（ソケットであること・`(dev, ino)`・所有者 uid）とすべて一致する場合だけソケットファイルを削除し、一致しなければ何もしない。bind 後に元のパスが unlink され、別の listener が同じパスへ bind した場合でも、古い `UdsServer` の drop が新しいソケットを削除して接続不能にすることはない（結合試験 `j3_plug12_uds_drop_keeps_socket_rebound_by_another_listener`）。検査と削除の間に残る競合の窓でパス上のファイルを差し替えられるのは、親ディレクトリ（owner 専用・自プロセスの実効 uid が所有）に書き込める主体、すなわち同じ uid か root に限られ、それらは窓がなくても同じファイルを直接操作できるため、新たな権限昇格の経路にはならない。
+
 ## デコード時の検証順序と検出する破壊
 
 `FrameHeader::from_bytes` は次の順序で検証する（設計レビュー・2026-09-28 オーナー決定・P1-2: 先に検証したフィールドが壊れていれば後続フィールドの値を一切信用しない）。

@@ -99,6 +99,47 @@
 //! エラーコードは新設せず、bind 時の所有者照合（`imp::check_socket_owner`）と
 //! 同じ [`IoErrorCode::InvalidArgument`] を使う。
 //!
+//! # ソケットファイルの権限と片付け（PLUG-12・security.md。J2・J3・#820 codex
+//! P0 / P1 指摘対応）
+//!
+//! [`UdsServer::bind`] は、bind の後にソケットのパスを再解決する操作
+//! （パス経由の chmod 等）を行わない。bind 後にパスや祖先ディレクトリが
+//! 差し替えられた場合、パス経由の操作は symlink の参照先など別のファイルに
+//! サーバープロセスの権限で作用しうるため（J2）。bind した socket の fd 経由で
+//! 権限を変える方法も採らない: Linux では socket fd への `fchmod(2)` は sockfs
+//! 側の inode にしか作用せず、ファイルシステム上のソケットファイル（パスの
+//! inode）のモードは変わらない（#820 で実測: fd 側の `fstat` は `0600` に
+//! 変わるが、パスの `lstat` は umask 由来のモードのまま）。macOS では socket
+//! fd への `fchmod(2)` 自体がエラーになる。
+//!
+//! したがってソケットファイル自体のモードは bind 時の umask に従い（umask
+//! `000` なら `0777` のまま）、本モジュールはそれに依存しない。別 uid の到達を
+//! 遮断するのは次の 2 段で、ソケットファイルのモードではない:
+//!
+//! 1. bind 前に検証する親ディレクトリ（symlink でない・ディレクトリである・
+//!    `mode & 0o077 == 0`・所有者 == 自プロセスの実効 uid。
+//!    `imp::validate_parent_dir`）。パス名での `connect(2)` には親ディレクトリの
+//!    search 権限が要るため、owner 以外はソケットファイルのモードに関係なく
+//!    到達できない。この検証は bind 時点の 1 回だけで、以後も親ディレクトリを
+//!    owner 専用に保つのは所有者（呼び出し側）の責務とする。
+//! 2. accept 時の peer credential 検証（下記「peer credential の検証」節）。
+//!
+//! [`UdsServer`] の [`Drop`]（と bind 失敗時の後始末）がソケットファイルを
+//! 削除するのは、bind 直後に `symlink_metadata` で記録した実体（ソケットで
+//! あること・所有者 uid・`(dev, ino)`）と、削除直前に `symlink_metadata` で
+//! 取り直した実体がすべて一致する場合だけである（J3。`imp::SocketFileIdentity`）。
+//! bind 後に元のパスが unlink され、別の listener が同じパスへ bind した場合でも、
+//! 古い [`UdsServer`] の drop が新しいソケットを削除して接続不能にすることはない。
+//! bind 直後の記録で自分が作ったソケットだと確認できなかった場合（別物に
+//! 差し替わっていた等）は、listener を閉じてエラーを返し、パス上のファイルは
+//! 削除しない。
+//!
+//! 検査（`symlink_metadata`）と削除（`remove_file`）の間には競合の窓が残るが、
+//! この窓でパス上のファイルを差し替えられるのは親ディレクトリ（owner 専用・
+//! 自プロセスの実効 uid が所有）に書き込める主体、すなわち同じ uid か root に
+//! 限られ、それらは窓がなくても同じファイルを直接操作できるため、新たな
+//! 権限昇格の経路にはならない。
+//!
 //! # OS 対応
 //!
 //! Linux / macOS では [`UdsServer`]・[`UdsConnection`] は実際に UDS を bind・
@@ -123,18 +164,16 @@
 //! - クライアント側の UDS 接続（`connect`）・[`crate::client::PipelineClient`]
 //!   との結合（TASK-13.2.2・#822）
 //! - vsock（microVM）トランスポート
-//! - bind から `0600` への chmod 完了までの短い窓（[`UdsServer::bind`] の
-//!   ドキュメンテーションコメント参照）は親ディレクトリの権限で塞ぐ設計とし、
-//!   ソケットファイル自体の一時的なモードには依存しない
 //! - `path` の直近の親ディレクトリ以外（祖先のパス要素）の symlink 検査は
 //!   行わない（`imp::validate_parent_dir`（Linux / macOS 限定の非公開関数）
 //!   のドキュメンテーションコメント参照）。祖先ディレクトリが bind 後に
 //!   symlink へ差し替えられた場合、[`UdsServer`] の [`Drop`] が呼ぶ
 //!   `imp::cleanup_socket_file`（自分が bind したソケットファイルの自動削除）
-//!   が意図しないパスを操作しうるが、これも本タスクの範囲外とする
-//!   （security P2・#820 レビュー指摘。`cleanup_socket_file` 自体は削除直前に
-//!   `symlink_metadata` でソケットのままであることを確かめるため、任意の
-//!   ファイルを消す経路にはならない）
+//!   が別のディレクトリのパスを lstat しうるが、これも本タスクの範囲外とする
+//!   （security P2・#820 レビュー指摘。`cleanup_socket_file` は bind 直後に
+//!   記録したソケットの実体〔`(dev, ino)`・所有者 uid〕と一致するファイルしか
+//!   削除しないため、任意のファイルや別の主体のソケットを消す経路にはならない。
+//!   上記「ソケットファイルの権限と片付け」節参照）
 //! - macOS の ACL（Access Control List）は `st_mode` のパーミッションビット
 //!   検査の対象外であり、`imp::validate_parent_dir` の owner 専用チェックを
 //!   ACL で上書きされていても検出できない（security Low・#820 レビュー指摘。
@@ -192,9 +231,12 @@ struct RecvAttempt {
 /// UDS の接続受け付け役（TASK-13.2.1・IO-1）。
 ///
 /// `bind` したソケットファイルは [`Drop`] で片付ける。片付けの直前に
-/// 「自分が bind したパスがまだソケットファイルのままであること」を
-/// `symlink_metadata` で確かめ、別種のファイルに置き換わっていた場合は
-/// 削除しない（任意のファイルを消す経路を作らないため。security.md）。
+/// 「パス上のファイルが bind 直後に記録した自分のソケットと同じ実体
+/// （ソケットであること・所有者 uid・`(dev, ino)`）であること」を
+/// `symlink_metadata` で確かめ、一致しなければ削除しない（任意のファイルや、
+/// 同じパスへ後から bind された別の listener のソケットを消す経路を作らない
+/// ため。security.md・J3・#820 codex P1 指摘対応。モジュール doc「ソケット
+/// ファイルの権限と片付け」節参照）。
 ///
 /// `O: ServerObserver` は [`Self::bind`] が受け取る必須の観測フックで、
 /// [`Self::accept`] のイベント（[`crate::observe::ServerOp::Accept`]）を
@@ -235,10 +277,18 @@ impl<O: ServerObserver> UdsServer<O> {
     /// peer credential 照合の基準にする（モジュール doc「peer credential の
     /// 検証」節参照）。
     ///
-    /// bind 後に行うのは、ソケットファイルの `0600` への chmod と listener の
-    /// 非ブロッキング化のみで、どちらかに失敗した場合に限り作成済みの
-    /// ソケットファイルを片付けてから（`imp::cleanup_socket_file`。削除直前に
-    /// ソケットのままであることを確かめる）エラーを返す。
+    /// bind 後に行うのは、作成したソケットファイルの実体の記録と listener の
+    /// 非ブロッキング化のみで、bind 後にソケットのパスを再解決して権限を
+    /// 変える操作は行わない（J2・#820 codex P0 指摘対応。下記「ソケット
+    /// ファイルのモード」節）。実体の記録（bind 直後の `symlink_metadata` で、
+    /// ソケットであること・所有者 uid が上記の実効 uid と一致することを確かめ、
+    /// `(dev, ino)` を保存する。J3・#820 codex P1 指摘対応）に失敗した場合は、
+    /// 自分が作ったと確認できないためパス上のファイルを削除せず、listener を
+    /// 閉じてエラーを返す（`symlink_metadata` 自体の失敗は
+    /// [`IoErrorCode::Internal`]、ソケットでない・所有者 uid が異なる場合は
+    /// 所有者照合と同じ [`IoErrorCode::InvalidArgument`]）。非ブロッキング化に
+    /// 失敗した場合は、記録した実体と一致する場合に限り作成済みのソケット
+    /// ファイルを片付けてから（`imp::cleanup_socket_file`）エラーを返す。
     ///
     /// `limits` は [`Self::accept`] が返す各接続の `recv_frame` が使う受信上限で、
     /// 必須引数である（モジュール doc「受信上限」節参照。F・#820 codex P1
@@ -253,12 +303,18 @@ impl<O: ServerObserver> UdsServer<O> {
     /// 前の入力検証であり、accept・送受信のような繰り返し呼ばれる操作ではない
     /// ため。#820 レビュー指摘）。
     ///
-    /// # 既知の残存リスク（bind から chmod までの窓）
-    /// `UnixListener::bind` はソケットファイルの作成と listen の開始を同時に
-    /// 行うため、上記の検証・`0600` へのチャモードが完了するまでの短い間、
-    /// ソケットファイルの実効モードは umask 依存になる。親ディレクトリを
-    /// owner 専用（`0700` 以下）にする検証が実質的な防壁であり、この窓の
-    /// 間に到達できるのは親ディレクトリを辿れる者（＝ owner 本人）に限られる。
+    /// # ソケットファイルのモード（J2・#820 codex P0 指摘対応）
+    /// ソケットファイル自体のモードは bind 時の umask に従い、本関数は変更
+    /// しない（umask `000` なら `0777` のまま）。以前は bind 後にパス経由で
+    /// `0600` へ chmod していたが、bind 後にパスや祖先ディレクトリを差し替え
+    /// られると symlink の参照先など別のファイルのモードを変えうるため廃止した。
+    /// socket fd 経由の `fchmod(2)` は、Linux では sockfs 側の inode にしか
+    /// 作用せずパスの inode のモードを変えず（#820 で実測）、macOS では
+    /// エラーになるため代替にならない。別 uid の到達は、bind 前に検証した
+    /// 親ディレクトリ（owner 専用・自プロセスの実効 uid が所有。パス名での
+    /// 接続には親ディレクトリの search 権限が要る）と、[`Self::accept`] の
+    /// peer credential 検証で遮断する（モジュール doc「ソケットファイルの権限と
+    /// 片付け」節参照）。
     pub fn bind(path: &Path, limits: ReceiveLimits, observer: O) -> Result<Self, IoError> {
         Ok(Self {
             inner: imp::ServerInner::bind(path)?,
@@ -561,9 +617,9 @@ impl<C: ServerObserver> FrameReceiver for UdsConnection<C> {
 /// coding-rust「クロスプラットフォーム」節）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod imp {
-    use std::fs::{self, Permissions};
+    use std::fs;
     use std::io::{self, Read, Write};
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -602,6 +658,10 @@ mod imp {
         /// #820 security-auditor 再監査指摘対応。bind 後に `seteuid` 等で実効 uid が
         /// 変わっても、照合の基準は bind したときの主体のまま変わらない）。
         effective_uid: u32,
+        /// bind 直後に記録したソケットファイルの実体（J3・#820 codex P1 指摘
+        /// 対応）。[`Drop`] の [`cleanup_socket_file`] は、パス上のファイルが
+        /// これと一致する場合だけ削除する。
+        socket_identity: SocketFileIdentity,
     }
 
     impl ServerInner {
@@ -619,11 +679,19 @@ mod imp {
 
             let listener = UnixListener::bind(path).map_err(map_bind_error)?;
 
-            // bind 後の後始末（chmod・nonblocking 化）が失敗したら、作成済みの
-            // ソケットファイルを片付けてからエラーを返す（後始末自体の失敗は
-            // 握りつぶし、元のエラーを優先して返す。cleanup_socket_file 参照）。
-            if let Err(err) = finish_bind(&listener, path) {
-                cleanup_socket_file(path);
+            // J3・#820 codex P1 指摘対応: bind 直後にパス上のファイルの実体を
+            // 記録する。自分が作ったソケットだと確認できなければ、パス上の
+            // ファイルは削除せず（`cleanup_socket_file` を呼ばない）、`listener`
+            // をこのスコープの終わりで閉じてエラーを返す。
+            let socket_identity = SocketFileIdentity::capture(path, effective_uid)?;
+
+            // bind 後の後始末（nonblocking 化）が失敗したら、記録した実体と
+            // 一致する場合に限り作成済みのソケットファイルを片付けてからエラーを
+            // 返す（後始末自体の失敗は握りつぶし、元のエラーを優先して返す。
+            // cleanup_socket_file 参照）。J2・#820 codex P0 指摘対応で、bind 後に
+            // パスを再解決して権限を変える操作（旧 `0600` への chmod）は廃止した。
+            if let Err(err) = finish_bind(&listener) {
+                cleanup_socket_file(path, &socket_identity);
                 return Err(err);
             }
 
@@ -631,6 +699,7 @@ mod imp {
                 listener,
                 path: path.to_path_buf(),
                 effective_uid,
+                socket_identity,
             })
         }
 
@@ -809,34 +878,104 @@ mod imp {
 
     impl Drop for ServerInner {
         fn drop(&mut self) {
-            cleanup_socket_file(&self.path);
+            cleanup_socket_file(&self.path, &self.socket_identity);
         }
     }
 
-    /// 自分が bind したソケットファイルを片付ける。削除の直前に
-    /// `symlink_metadata` でソケットのままであることを確かめ、別種の
-    /// ファイル（他プロセスが同じパスへ作り直した等）に置き換わっていたら
-    /// 削除しない。
-    fn cleanup_socket_file(path: &Path) {
+    /// bind したソケットファイルの実体（J3・#820 codex P1 指摘対応。PLUG-12）。
+    ///
+    /// [`ServerInner::bind`] が bind 直後に [`Self::capture`] で記録し、
+    /// [`cleanup_socket_file`] が削除直前に取り直した値と比べる。`(dev, ino)` で
+    /// ファイルシステム上の同一ファイルを識別し、所有者 uid もあわせて比べる
+    /// （bind 後に元のパスが unlink され、別の listener が同じパスへ bind した
+    /// 場合、その新しいソケットは別の `(dev, ino)` を持つため削除対象にならない）。
+    /// socket fd の `fstat` は sockfs 側の inode を返し、パスの inode とは一致
+    /// しないため（#820 で実測）、記録にはパスの `symlink_metadata` を使う。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SocketFileIdentity {
+        dev: u64,
+        ino: u64,
+        uid: u32,
+    }
+
+    impl SocketFileIdentity {
+        /// `meta` がソケットファイルならその実体を返し、それ以外（通常ファイル・
+        /// symlink・ディレクトリ等）なら `None` を返す純粋関数。
+        fn from_metadata(meta: &fs::Metadata) -> Option<Self> {
+            meta.file_type().is_socket().then(|| Self {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                uid: meta.uid(),
+            })
+        }
+
+        /// bind 直後の `path` を `symlink_metadata` で調べ、ソケットであり・所有者
+        /// uid が `effective_uid`（bind 時点の自プロセスの実効 uid）と一致する
+        /// 場合に、その実体を返す。
+        ///
+        /// 失敗した場合、呼び出し元（[`ServerInner::bind`]）はパス上のファイルを
+        /// 削除しない（自分が作ったと確認できないため）。`symlink_metadata`
+        /// 自体の失敗（bind 直後に unlink された等）は [`IoErrorCode::Internal`]、
+        /// ソケットでない・所有者 uid が異なる（別物に差し替わっていた）場合は
+        /// bind 前の所有者照合（[`check_socket_owner`]）と同じ分類の
+        /// [`IoErrorCode::InvalidArgument`] を返す（メッセージは親ディレクトリでは
+        /// なくソケットファイル自身の所有者を比べたことを示す専用のもの）。
+        fn capture(path: &Path, effective_uid: u32) -> Result<Self, IoError> {
+            let meta = fs::symlink_metadata(path).map_err(|e| {
+                IoError::new(
+                    IoErrorCode::Internal,
+                    format!("failed to stat the socket file right after bind: {e}"),
+                )
+            })?;
+            let identity = Self::from_metadata(&meta).ok_or_else(|| {
+                IoError::new(
+                    IoErrorCode::InvalidArgument,
+                    "the socket path no longer refers to a socket right after bind",
+                )
+            })?;
+            if identity.uid != effective_uid {
+                return Err(IoError::new(
+                    IoErrorCode::InvalidArgument,
+                    format!(
+                        "the socket file created by bind is owned by uid {} but the server's \
+                         effective uid is {effective_uid}",
+                        identity.uid
+                    ),
+                ));
+            }
+            Ok(identity)
+        }
+    }
+
+    /// 自分が bind したソケットファイルを片付ける（[`ServerInner`] の [`Drop`]・
+    /// bind 失敗時の後始末から呼ばれる）。削除の直前に `symlink_metadata` で
+    /// 取り直した実体が、bind 直後に記録した `expected`（ソケットであること・
+    /// `(dev, ino)`・所有者 uid）とすべて一致する場合だけ削除し、一致しなければ
+    /// 何もしない（J3・#820 codex P1 指摘対応。別種のファイルや、同じパスへ
+    /// 後から bind された別の listener のソケットを消さない）。
+    ///
+    /// 検査と削除の間の残る競合は、親ディレクトリ（owner 専用・自プロセスの
+    /// 実効 uid が所有）に書き込める主体（同じ uid か root）にしか使えない
+    /// （モジュール doc「ソケットファイルの権限と片付け」節参照）。
+    fn cleanup_socket_file(path: &Path, expected: &SocketFileIdentity) {
         if let Ok(meta) = fs::symlink_metadata(path)
-            && meta.file_type().is_socket()
+            && SocketFileIdentity::from_metadata(&meta).as_ref() == Some(expected)
         {
             let _ = fs::remove_file(path);
         }
     }
 
-    /// bind 直後の後始末: `0600` への chmod → listener の非ブロッキング化、の
-    /// 順に行う。いずれかに失敗すれば呼び出し元（[`ServerInner::bind`]）が
+    /// bind 直後の後始末: listener の非ブロッキング化。失敗すれば呼び出し元
+    /// （[`ServerInner::bind`]）が、記録した実体と一致する場合に限り
     /// ソケットファイルを片付ける。所有者の照合（PLUG-12・[`check_socket_owner`]）
-    /// はここではなく bind 前の [`validate_parent_dir`] で済ませている（I1・
-    /// #820 security-auditor 再監査指摘対応）。
-    fn finish_bind(listener: &UnixListener, path: &Path) -> Result<(), IoError> {
-        fs::set_permissions(path, Permissions::from_mode(0o600)).map_err(|e| {
-            IoError::new(
-                IoErrorCode::Internal,
-                format!("failed to set socket file permissions to 0600: {e}"),
-            )
-        })?;
+    /// はここではなく bind 前の [`validate_parent_dir`] と bind 直後の
+    /// [`SocketFileIdentity::capture`] で済ませている（I1・J3・#820）。
+    ///
+    /// ソケットファイルのパスは受け取らない（J2・#820 codex P0 指摘対応。
+    /// bind 後にパスを再解決して権限を変える操作をしないことを型で保つ。
+    /// 旧実装の `0600` への chmod を廃止した理由は [`super::UdsServer::bind`]
+    /// の「ソケットファイルのモード」節参照）。
+    fn finish_bind(listener: &UnixListener) -> Result<(), IoError> {
         listener.set_nonblocking(true).map_err(|e| {
             IoError::new(
                 IoErrorCode::Internal,
@@ -1014,11 +1153,13 @@ mod imp {
     /// 行い、失敗した場合は何も作らずに拒否する（I1・#820 security-auditor
     /// 再監査指摘対応）。
     ///
-    /// `0o077` まで絞る理由: bind 直後から `0600` への chmod が完了するまでの
-    /// 短い間、ソケットファイル自体のモードは umask 依存で緩くなりうる
-    /// （[`UdsServer::bind`] のドキュメンテーションコメント参照）。ソケットは
-    /// 最終的に owner 専用になるため、親ディレクトリを owner 専用にしても
-    /// 正当な用途を妨げない一方、この窓を親ディレクトリの権限で実質的に塞げる。
+    /// `0o077` まで絞る理由: ソケットファイル自体のモードは bind 時の umask に
+    /// 従い、bind 後に変更しない（J2・#820 codex P0 指摘対応。
+    /// [`super::UdsServer::bind`] の「ソケットファイルのモード」節参照）。
+    /// パス名での接続には親ディレクトリの search 権限が要るため、親ディレクトリを
+    /// owner 専用にすることが、ソケットファイルのモードに関係なく owner 以外の
+    /// 到達を遮断する境界になる（accept 時の peer credential 検証と合わせた
+    /// 2 段。モジュール doc「ソケットファイルの権限と片付け」節参照）。
     ///
     /// 直近の親ディレクトリのみを検査し、祖先のパス要素（親の親など）の
     /// symlink は検査しない（`Path::parent()` はパスを正規化しないため、
@@ -1941,6 +2082,137 @@ mod imp {
             let dir = super::super::test_support::TempSocketDir::new();
             validate_parent_dir(&dir.socket_path(), crate::sys::effective_uid())
                 .expect("a 0700 directory owned by the effective uid must be accepted");
+        }
+
+        /// J3・#820（codex P1 指摘対応。PLUG-12）: bind 直後のパスがソケットで
+        /// なければ（別物に差し替わっていた場合に相当）、`SocketFileIdentity::capture`
+        /// は `InvalidArgument` を返し、パス上のファイルには触れない。
+        #[test]
+        fn j3_plug12_capture_rejects_non_socket_and_keeps_the_file() {
+            let dir = super::super::test_support::TempSocketDir::new();
+            let path = dir.socket_path();
+            fs::write(&path, b"not a socket").expect("must be able to create a regular file");
+
+            let err = SocketFileIdentity::capture(&path, crate::sys::effective_uid())
+                .expect_err("a regular file must not be recorded as our socket");
+
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+            assert_eq!(
+                fs::read(&path).expect("the regular file must remain"),
+                b"not a socket".to_vec()
+            );
+        }
+
+        /// J3・#820（PLUG-12）: bind 直後のソケットの所有者 uid が bind 時点の
+        /// 実効 uid と異なれば、`SocketFileIdentity::capture` は `InvalidArgument`
+        /// を返し、ソケットファイルは削除しない。別 uid 所有のソケットは root が
+        /// ないと用意できないため、「実効 uid」側を自分の uid と異なる値にして呼ぶ。
+        #[test]
+        fn j3_plug12_capture_rejects_owner_mismatch_and_keeps_the_socket() {
+            let dir = super::super::test_support::TempSocketDir::new();
+            let path = dir.socket_path();
+            let _listener = UnixListener::bind(&path).expect("bind must succeed");
+            let other_uid = crate::sys::effective_uid().wrapping_add(1);
+
+            let err = SocketFileIdentity::capture(&path, other_uid)
+                .expect_err("a socket owned by another uid must not be recorded as ours");
+
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+            let own_uid = crate::sys::effective_uid();
+            assert_eq!(
+                err.message(),
+                format!(
+                    "the socket file created by bind is owned by uid {own_uid} but the \
+                     server's effective uid is {other_uid}"
+                )
+            );
+            assert!(
+                fs::symlink_metadata(&path)
+                    .expect("the socket must remain")
+                    .file_type()
+                    .is_socket()
+            );
+        }
+
+        /// J3・#820（PLUG-12）: bind 直後にパスが消えていれば（stat 自体の失敗）
+        /// `SocketFileIdentity::capture` は `Internal` を返す。
+        #[test]
+        fn j3_plug12_capture_reports_missing_path_as_internal() {
+            let dir = super::super::test_support::TempSocketDir::new();
+
+            let err = SocketFileIdentity::capture(&dir.socket_path(), crate::sys::effective_uid())
+                .expect_err("a missing path must not be recorded");
+
+            assert_eq!(err.code(), IoErrorCode::Internal);
+        }
+
+        /// J3・#820（codex P1 指摘対応。PLUG-12）: `cleanup_socket_file` は、
+        /// 記録した実体と `(dev, ino)` または所有者 uid が 1 つでも異なるソケットは
+        /// 削除せず、すべて一致する場合だけ削除する。元のパスを unlink して別の
+        /// listener が同じパスへ bind した状況を実際のソケットで作る。
+        #[test]
+        fn j3_plug12_cleanup_socket_file_removes_only_the_recorded_socket() {
+            let dir = super::super::test_support::TempSocketDir::new();
+            let path = dir.socket_path();
+            let euid = crate::sys::effective_uid();
+
+            let old_listener = UnixListener::bind(&path).expect("first bind must succeed");
+            let old = SocketFileIdentity::capture(&path, euid).expect("must record the socket");
+            fs::remove_file(&path).expect("must be able to unlink the first socket");
+            let _new_listener = UnixListener::bind(&path).expect("second bind must succeed");
+            drop(old_listener);
+            let new = SocketFileIdentity::capture(&path, euid).expect("must record the socket");
+            assert_ne!(
+                (old.dev, old.ino),
+                (new.dev, new.ino),
+                "the filesystem reused the inode, so the two sockets cannot be told apart"
+            );
+
+            // (dev, ino) が異なる: 後から bind された別の listener のソケットは消さない。
+            cleanup_socket_file(&path, &old);
+            assert_eq!(
+                SocketFileIdentity::capture(&path, euid).expect("the new socket must remain"),
+                new
+            );
+
+            // (dev, ino) は同じでも所有者 uid が異なる記録とは一致しない。
+            let other_owner = SocketFileIdentity {
+                uid: euid.wrapping_add(1),
+                ..new
+            };
+            cleanup_socket_file(&path, &other_owner);
+            assert_eq!(
+                SocketFileIdentity::capture(&path, euid).expect("the new socket must remain"),
+                new
+            );
+
+            // すべて一致すれば削除する。
+            cleanup_socket_file(&path, &new);
+            assert_eq!(
+                fs::symlink_metadata(&path).map_err(|e| e.kind()).err(),
+                Some(io::ErrorKind::NotFound)
+            );
+        }
+
+        /// J3・#820（PLUG-12）: 記録したソケットのパスが通常ファイルに差し替わって
+        /// いれば、`cleanup_socket_file` は削除しない。
+        #[test]
+        fn j3_plug12_cleanup_socket_file_keeps_a_replaced_regular_file() {
+            let dir = super::super::test_support::TempSocketDir::new();
+            let path = dir.socket_path();
+            let listener = UnixListener::bind(&path).expect("bind must succeed");
+            let recorded = SocketFileIdentity::capture(&path, crate::sys::effective_uid())
+                .expect("must record the socket");
+            drop(listener);
+            fs::remove_file(&path).expect("must be able to unlink the socket");
+            fs::write(&path, b"replaced").expect("must be able to create a regular file");
+
+            cleanup_socket_file(&path, &recorded);
+
+            assert_eq!(
+                fs::read(&path).expect("the replaced file must remain"),
+                b"replaced".to_vec()
+            );
         }
     }
 }

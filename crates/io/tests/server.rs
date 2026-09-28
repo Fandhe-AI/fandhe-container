@@ -9,8 +9,8 @@
 mod unix {
     use std::io::{Read, Write};
     use std::os::unix::fs::DirBuilderExt;
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
@@ -722,10 +722,22 @@ mod unix {
         );
     }
 
-    /// security.md（UDS 観点）: bind 後のソケットファイルは mode 0600 であり、
-    /// `UdsServer` を drop するとソケットファイルが削除される。
+    /// security.md（UDS 観点）・PLUG-12・J2・#820（codex P0 指摘対応）: bind 後、
+    /// 別 uid がソケットへ到達できない前提が親ディレクトリで担保されている
+    /// （親ディレクトリは symlink でないディレクトリで、モードは bind 前と同じ
+    /// `0700` のまま〔group / other のビットがない〕、所有者はソケットファイルの
+    /// 所有者〔bind したプロセスの実効 uid〕と同じ）。`UdsServer` を drop すると
+    /// ソケットファイルが削除される。
+    ///
+    /// ソケットファイル自体のモードは bind 時の umask に従い、`UdsServer` は
+    /// 変更しない（bind 後にパスを再解決する chmod を廃止した。
+    /// `UdsServer::bind` の「ソケットファイルのモード」節）ため、ここでは
+    /// ソケットファイルのモードの値を検査しない（umask 000 では `0777` になる）。
+    /// 旧テスト `io1_uds_socket_file_mode_and_cleanup` はソケットが `0600` で
+    /// あることで「owner 以外が到達できない」ことを確かめていたが、その担保が
+    /// 親ディレクトリへ移ったため、同じ目的を親ディレクトリの不変条件で確かめる。
     #[test]
-    fn io1_uds_socket_file_mode_and_cleanup() {
+    fn io1_plug12_uds_parent_dir_guards_socket_access_and_cleanup() {
         let dir = TempSocketDir::new();
         let path = dir.socket_path();
         let server = fandhe_container_io::UdsServer::bind(
@@ -736,11 +748,58 @@ mod unix {
         .expect("bind must succeed on a fresh path");
         assert_eq!(server.path(), path.as_path());
 
-        let meta = std::fs::symlink_metadata(&path).expect("socket file must exist after bind");
-        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let socket_meta =
+            std::fs::symlink_metadata(&path).expect("socket file must exist after bind");
+        assert!(socket_meta.file_type().is_socket());
+        let parent_meta =
+            std::fs::symlink_metadata(&dir.path).expect("parent directory must exist");
+        assert!(!parent_meta.file_type().is_symlink());
+        assert!(parent_meta.is_dir());
+        assert_eq!(parent_meta.permissions().mode() & 0o777, 0o700);
+        assert_eq!(parent_meta.permissions().mode() & 0o077, 0);
+        assert_eq!(socket_meta.uid(), parent_meta.uid());
 
         drop(server);
         assert!(!path.exists(), "socket file must be removed after drop");
+    }
+
+    /// PLUG-12・J3・#820（codex P1 指摘対応）: bind 後に元のパスが unlink され、
+    /// 別の listener が同じパスへ bind した場合、古い `UdsServer` の drop は
+    /// 新しいソケットを削除しない（bind 直後に記録した `(dev, ino)`・所有者 uid と
+    /// 一致しないため）。新しいソケットはパスに残り、接続できる。
+    #[test]
+    fn j3_plug12_uds_drop_keeps_socket_rebound_by_another_listener() {
+        let dir = TempSocketDir::new();
+        let path = dir.socket_path();
+        let server = fandhe_container_io::UdsServer::bind(
+            &path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a fresh path");
+        let old_meta = std::fs::symlink_metadata(&path).expect("socket file must exist");
+
+        std::fs::remove_file(&path).expect("must be able to unlink the bound socket");
+        let new_listener =
+            UnixListener::bind(&path).expect("another listener must be able to bind the path");
+        let new_meta = std::fs::symlink_metadata(&path).expect("new socket file must exist");
+        assert_ne!(
+            (old_meta.dev(), old_meta.ino()),
+            (new_meta.dev(), new_meta.ino()),
+            "the filesystem reused the inode, so the two sockets cannot be told apart"
+        );
+
+        drop(server);
+
+        let after = std::fs::symlink_metadata(&path)
+            .expect("the new socket must not be removed by the old server's drop");
+        assert!(after.file_type().is_socket());
+        assert_eq!((after.dev(), after.ino()), (new_meta.dev(), new_meta.ino()));
+        let _client =
+            UnixStream::connect(&path).expect("the new listener must still accept connections");
+        new_listener
+            .accept()
+            .expect("the new listener must receive the connection");
     }
 
     /// REPAIR-5（#820 レビュー指摘）: 書き込みがブロックし続ける相手に対しては

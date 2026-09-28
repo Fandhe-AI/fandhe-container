@@ -105,6 +105,8 @@ readonly MAX_FROM_JSON_BYTES=4194304 # 4 MiB
 # fio の --size はジョブごとの値のため、上限は総量（--size × --numjobs）で課す
 # （DoS 防止。ジョブ単体の --size もこれ以下になる）。
 readonly MAX_TOTAL_SIZE_BYTES=$((10 * 1024 * 1024 * 1024)) # 10 GiB
+# ブロックサイズ（--bs=4k 固定）。--size はこの値以上かつこの倍数でなければならない
+readonly BLOCK_SIZE_BYTES=4096
 readonly FIO_JOB_NAME="fandhe-fio-randwrite-4k"
 readonly MIN_RUNTIME=1
 readonly MAX_RUNTIME=600
@@ -141,9 +143,10 @@ common options:
 workload options (run mode: passed to fio; --from-json mode: the fio JSON's
 job options must match these values, defaults included):
   --direct 0|1        O_DIRECT flag (default: 1)
-  --size <NkNmNg>      fio --size per job (default: 256m; --size x --numjobs
-                       is capped at 10 GiB in total, and is the upper bound
-                       on the bytes written)
+  --size <NkNmNg>      fio --size per job (default: 256m; must be a multiple
+                       of 4k and at least 4k; --size x --numjobs is capped at
+                       10 GiB in total, and is the upper bound on the bytes
+                       written)
   --runtime <1-600>    fio --runtime in seconds, an upper bound on the run
                        (default: 30; fio stops earlier once --size is written)
   --iodepth <1-64>     fio --iodepth (default: 1)
@@ -317,6 +320,15 @@ case "$size_unit" in
   g) size_mult=$((1024 * 1024 * 1024)) ;;
 esac
 size_bytes=$((size_num * size_mult))
+# --size は 4 KiB（--bs）以上かつ 4 KiB の倍数に限る。4 KiB 未満では 1 ブロックも
+# 書けず、端数があると fio は末尾の端数領域を書かない（または扱いが版に依存する）ため、
+# 「--size 分の 4K ブロックを重複なく 1 巡する」という計測の前提（IO-8）と総書き込み量の
+# 上限の説明が崩れる。単位は k/m/g 必須（上の正規表現）で、m・g は常に 4 KiB の倍数に
+# なるため、実質的に制約を受けるのは k（4 の倍数 k のみ可）。総量の上限判定より先に行う。
+if [ "$size_bytes" -lt "$BLOCK_SIZE_BYTES" ] || [ $((size_bytes % BLOCK_SIZE_BYTES)) -ne 0 ]; then
+  err "invalid-input" "--size must be at least ${BLOCK_SIZE_BYTES} bytes and a multiple of ${BLOCK_SIZE_BYTES} bytes (the 4k block size): $size (${size_bytes} bytes)"
+  exit 2
+fi
 # 総量（ジョブごとの --size × --numjobs）で上限を課す。値域は size_num ≤ 999999・
 # size_mult ≤ 1 GiB・numjobs ≤ 16 のため、積は bash の 64bit 整数に収まる。
 # （実装上は全ジョブが同じ --filename を共有するためディスク上のファイルは 1 つだが、

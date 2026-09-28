@@ -192,6 +192,13 @@ mod unix {
 
     /// REPAIR-5: 1 バイトずつ間隔を空けて送ってくる相手でも、フレーム全体の期限で
     /// `Timeout` になる（1 回の read ごとの期限ではないことの確認）。
+    ///
+    /// C2（#820 レビュー指摘）: client は「間隔を空けて送る」ループを終えた
+    /// あと、`recv_timeout` で server 側の判定完了（`tx.send`）を待ってから
+    /// 切断する。固定の sleep 時間で「server の期限より十分長く接続を保つ」
+    /// ことを狙うのではなく、実際に server が期限切れの判定を終えるまで
+    /// 同期することで、スケジューリングの遅れ（CI 環境の負荷等）で client が
+    /// 先に切断し `Unavailable` になってしまうレースを構造的に無くす。
     #[test]
     fn repair5_uds_recv_times_out_on_trickling_peer() {
         let dir = TempSocketDir::new();
@@ -199,6 +206,7 @@ mod unix {
         let mut server = fandhe_container_io::UdsServer::bind(&socket_path, NoopServerObserver)
             .expect("bind must succeed on a private, empty path");
 
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
             let mut stream = UnixStream::connect(&connect_path).expect("client must connect");
@@ -210,6 +218,10 @@ mod unix {
                 let _ = stream.write_all(std::slice::from_ref(byte));
                 std::thread::sleep(Duration::from_millis(200));
             }
+            // server がタイムアウト判定・アサーションを終えるまで接続を保持する
+            // （最大 10 秒。判定が来なければテスト側の `join` がハングせず
+            // タイムアウト自体のバグとして顕在化するよう、待ちは無期限にしない）。
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
             drop(stream);
         });
 
@@ -229,6 +241,7 @@ mod unix {
         // read 期限（500ms）× 送信回数ぶん待ち続けることはない。
         assert!(elapsed <= Duration::from_secs(2), "elapsed={elapsed:?}");
 
+        let _ = release_tx.send(());
         let _ = client_thread.join();
     }
 
@@ -537,6 +550,62 @@ mod unix {
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
 
         assert!(!path.exists(), "no socket file must be created");
+    }
+
+    /// C1・security.md（UDS 観点。#820 レビュー指摘の回帰テスト）: 親ディレクトリ
+    /// 自体が symlink の場合、`bind` は `InvalidArgument` として拒否し、symlink
+    /// 先にソケットファイルを作らない（`imp::validate_parent_dir` の
+    /// `is_symlink` 検査）。
+    #[test]
+    fn c1_uds_bind_rejects_symlinked_parent_directory() {
+        let dir = TempSocketDir::new();
+        let real_dir = dir.path.join("real");
+        std::fs::create_dir(&real_dir).expect("must be able to create the real target dir");
+        let link_dir = dir.path.join("link");
+        std::os::unix::fs::symlink(&real_dir, &link_dir)
+            .expect("must be able to create a symlinked parent directory");
+        let path = link_dir.join("s.sock");
+
+        let err = fandhe_container_io::UdsServer::bind(&path, NoopServerObserver)
+            .expect_err("bind under a symlinked parent directory must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+
+        assert!(
+            !path.exists(),
+            "no socket file must be created under the symlinked parent"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link_dir)
+                .expect("the symlink itself must remain")
+                .file_type()
+                .is_symlink(),
+            "the parent symlink must not be touched"
+        );
+    }
+
+    /// C1・security.md（UDS 観点。#820 レビュー指摘の回帰テスト）: bind 先の
+    /// パス自体が既存の symlink の場合も `bind` は `InvalidArgument` として
+    /// 拒否し、その symlink を消さない（`imp::reject_existing_path` は
+    /// `symlink_metadata` で symlink 自体を検出し、自動 unlink はしない）。
+    #[test]
+    fn c1_uds_bind_rejects_existing_symlink_path() {
+        let dir = TempSocketDir::new();
+        let target = dir.path.join("target-file");
+        std::fs::write(&target, b"not a socket").expect("must be able to create the link target");
+        let path = dir.socket_path();
+        std::os::unix::fs::symlink(&target, &path)
+            .expect("must be able to create a symlink at the socket path");
+
+        let err = fandhe_container_io::UdsServer::bind(&path, NoopServerObserver)
+            .expect_err("bind onto an existing symlink must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+
+        let meta =
+            std::fs::symlink_metadata(&path).expect("the symlink at the socket path must remain");
+        assert!(
+            meta.file_type().is_symlink(),
+            "the existing symlink must not be removed"
+        );
     }
 
     /// security.md（UDS 観点）: bind 後のソケットファイルは mode 0600 であり、

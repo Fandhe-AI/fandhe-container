@@ -30,6 +30,13 @@
 //! `--batch-size` 相当の設定 API（CLI / 設定の文字列から検証済み
 //! [`batch::BatchConfig`] と [`recv_limits::ReceiveLimits`] を単一の入口から
 //! 導く）は [`settings`] モジュール（TASK-13.3・#78）が提供する。
+//! FS 正規化層は、大文字小文字を区別しないホスト（APFS / NTFS）とゲスト
+//! （ext4）の差異による黙った上書きを防ぐため、ゲスト相対パスの大文字小文字
+//! 衝突を検出する（[`fs_normalize::CaseCollisionSet`]・
+//! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。サーバーの
+//! 書き込み経路への組み込みは #100（TASK-19.2）、パス長 260 超の検証は
+//! TASK-20、Unicode 正規化（NFC / NFD）は TASK-21 でそれぞれ後続実装する
+//! （REPAIR-3。本 crate はまだこれらを呼び出していない）。
 //!
 //! PLUG-1 区分は core（`fandhe-container-plugin` の境界機構とは別に、コアの一部として
 //! 直接リンクされる）。crate 名 `fandhe-container-io` は
@@ -41,6 +48,7 @@ pub mod batch;
 mod checksum;
 pub mod client;
 pub mod error;
+pub mod fs_normalize;
 pub mod observe;
 pub mod payload;
 pub mod protocol;
@@ -60,6 +68,7 @@ pub use client::{
     SendMetrics, SendOutcome, SendQueue,
 };
 pub use error::{IoError, IoErrorCode};
+pub use fs_normalize::{CaseCollisionSet, MAX_COLLISION_MESSAGE_PATH_CHARS, check_case_collisions};
 pub use observe::{
     AckEvent, AckEventError, DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver,
     JsonLinesServerObserver, MAX_SEND_LOG_BUFFER_BYTES, MAX_SEND_LOG_CAPACITY,

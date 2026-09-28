@@ -5,7 +5,9 @@
 //! 待たずに送り続けると未 ACK のリクエストが際限なく増えうるため、本モジュールは
 //! 未 ACK 件数に上限を設けて追跡する送信キュー（[`SendQueue`]）と、それを使って
 //! [`crate::transport::FrameSender`] へ橋渡しするクライアント（[`PipelineClient`]）を
-//! 提供する。
+//! 提供する。[`PipelineClient::send`] の成功・失敗カウントとレイテンシ分布は
+//! [`SendMetrics`]（[`PipelineClient::metrics`] で参照）として観測できる
+//! （base 側 AGENTS.md の可観測性要件・REPAIR-4）。
 //!
 //! # #74（TASK-12.2）との境界
 //!
@@ -22,6 +24,7 @@
 //! [`PipelineClient`] は `&mut self` を要求する単一スレッド前提の型として実装する。
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::error::{IoError, IoErrorCode};
 use crate::protocol::{Frame, FrameKind};
@@ -280,6 +283,167 @@ impl SendQueue {
     }
 }
 
+/// [`PipelineClient::send`] 1 回の結果種別（[`SendMetrics`] の内訳。TASK-12.1・#73
+/// codex 指摘対応。P1・REPAIR-4）。
+///
+/// [`PipelineClient::send`] のドキュメンテーションコメントに記した処理順の各分岐に
+/// 1 対 1 で対応する。呼び出し元はこの内訳を使い、上限到達（`ResourceExhausted`）や
+/// トランスポート失敗（`TransportFailure`）を成功と区別して観測できる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SendOutcome {
+    /// トランスポートへの書き込みまで成功した。
+    Success,
+    /// すでに失効済み（[`PipelineClient::is_poisoned`]）だったため拒否した。
+    RejectedPoisoned,
+    /// `Ack`/`FlushAck` など追跡対象外のフレーム種別だったため拒否した。
+    RejectedInvalidFrameKind,
+    /// 未 ACK 件数の上限到達、または id 採番の溢れで拒否した。
+    RejectedResourceExhausted,
+    /// トランスポートへの書き込みが失敗し、クライアントを失効させた。
+    TransportFailure,
+}
+
+/// 所要時間の分布を件数・合計・最小・最大で集計する（TASK-12.1・#73 codex 指摘
+/// 対応。P1・REPAIR-4）。
+///
+/// ヒストグラム等の詳細な分布は持たない軽量な集計であり、外部メトリクス基盤への
+/// エクスポートも持たない（REPAIR-3。スタブの明示。詳細な分布・エクスポートは
+/// 別タスクで拡張してよい）。[`SendMetrics`] が送信結果種別ごとに保持し、
+/// [`PipelineClient::metrics`] 経由で読み出す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LatencyStats {
+    count: u64,
+    total: Duration,
+    min: Option<Duration>,
+    max: Option<Duration>,
+}
+
+impl LatencyStats {
+    fn record(&mut self, elapsed: Duration) {
+        self.count = self.count.saturating_add(1);
+        self.total = self.total.saturating_add(elapsed);
+        self.min = Some(match self.min {
+            Some(current) => current.min(elapsed),
+            None => elapsed,
+        });
+        self.max = Some(match self.max {
+            Some(current) => current.max(elapsed),
+            None => elapsed,
+        });
+    }
+
+    /// 観測件数を返す。
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// 観測した所要時間の合計を返す。
+    pub fn total(&self) -> Duration {
+        self.total
+    }
+
+    /// 観測した所要時間の最小値を返す（未観測なら `None`）。
+    pub fn min(&self) -> Option<Duration> {
+        self.min
+    }
+
+    /// 観測した所要時間の最大値を返す（未観測なら `None`）。
+    pub fn max(&self) -> Option<Duration> {
+        self.max
+    }
+
+    /// 観測した所要時間の平均値を返す（未観測なら `None`）。
+    ///
+    /// `count` は内部カウンタであり untrusted な入力ではないが、`u32` への
+    /// キャストで panic させないよう浮動小数点経由で計算する。
+    pub fn mean(&self) -> Option<Duration> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(Duration::from_secs_f64(
+            self.total.as_secs_f64() / self.count as f64,
+        ))
+    }
+}
+
+/// [`PipelineClient::send`] の成功・失敗カウントとレイテンシ分布を保持する
+/// 構造化メトリクス（TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）。
+///
+/// base 側 AGENTS.md が要求する「write 操作の成功・失敗カウントとレイテンシ分布」
+/// をプロセス内で観測するための最小実装。外部のログ / メトリクス基盤への出力は
+/// 持たず、[`PipelineClient::metrics`] で読み出した値を呼び出し元が任意の基盤へ
+/// 変換して出す（REPAIR-3。詳細な分布・エクスポート先の選定は別タスクの範囲）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SendMetrics {
+    success_count: u64,
+    rejected_poisoned_count: u64,
+    rejected_invalid_frame_kind_count: u64,
+    rejected_resource_exhausted_count: u64,
+    transport_failure_count: u64,
+    /// トランスポートへ実際に書き込んだ呼び出し（`Success`・`TransportFailure`）
+    /// の所要時間分布。早期に拒否した呼び出し（`RejectedPoisoned` 等）はここへ
+    /// 含めない（トランスポートを介さないため所要時間として意味を持たない）。
+    write_latency: LatencyStats,
+}
+
+impl SendMetrics {
+    fn record(&mut self, outcome: SendOutcome, elapsed: Duration) {
+        match outcome {
+            SendOutcome::Success => {
+                self.success_count = self.success_count.saturating_add(1);
+                self.write_latency.record(elapsed);
+            }
+            SendOutcome::RejectedPoisoned => {
+                self.rejected_poisoned_count = self.rejected_poisoned_count.saturating_add(1);
+            }
+            SendOutcome::RejectedInvalidFrameKind => {
+                self.rejected_invalid_frame_kind_count =
+                    self.rejected_invalid_frame_kind_count.saturating_add(1);
+            }
+            SendOutcome::RejectedResourceExhausted => {
+                self.rejected_resource_exhausted_count =
+                    self.rejected_resource_exhausted_count.saturating_add(1);
+            }
+            SendOutcome::TransportFailure => {
+                self.transport_failure_count = self.transport_failure_count.saturating_add(1);
+                self.write_latency.record(elapsed);
+            }
+        }
+    }
+
+    /// トランスポートへの書き込みまで成功した回数。
+    pub fn success_count(&self) -> u64 {
+        self.success_count
+    }
+
+    /// [`PipelineClient::is_poisoned`] により拒否した回数。
+    pub fn rejected_poisoned_count(&self) -> u64 {
+        self.rejected_poisoned_count
+    }
+
+    /// 追跡対象外のフレーム種別（`Ack`/`FlushAck`）により拒否した回数。
+    pub fn rejected_invalid_frame_kind_count(&self) -> u64 {
+        self.rejected_invalid_frame_kind_count
+    }
+
+    /// 未 ACK 件数の上限到達・id 採番の溢れにより拒否した回数（`InFlightLimit`
+    /// への到達を観測する指標。TASK-12.1）。
+    pub fn rejected_resource_exhausted_count(&self) -> u64 {
+        self.rejected_resource_exhausted_count
+    }
+
+    /// トランスポートへの書き込みが失敗し、クライアントを失効させた回数。
+    pub fn transport_failure_count(&self) -> u64 {
+        self.transport_failure_count
+    }
+
+    /// トランスポートへ実際に書き込んだ呼び出し（成功・失敗の両方）の
+    /// 所要時間分布を返す。
+    pub fn write_latency(&self) -> LatencyStats {
+        self.write_latency
+    }
+}
+
 /// [`crate::transport::FrameSender`] と [`SendQueue`] を組み合わせ、パイプライン送信
 /// （IO-1）のキュー管理付き送信 API を提供する（TASK-12.1）。
 ///
@@ -305,6 +469,9 @@ where
     /// 拒否し、id 空間・トランスポートの両方をこのクライアントでは再利用しない
     /// 状態へ遷移させる。
     poisoned: bool,
+    /// [`Self::send`] の成功・失敗カウントとレイテンシ分布（TASK-12.1・#73 codex
+    /// 指摘対応。P1・REPAIR-4）。
+    metrics: SendMetrics,
 }
 
 impl<S> PipelineClient<S>
@@ -317,12 +484,20 @@ where
             sender,
             queue: SendQueue::new(limit),
             poisoned: false,
+            metrics: SendMetrics::default(),
         }
     }
 
     /// 未 ACK リクエストの追跡状態を参照する。
     pub fn queue(&self) -> &SendQueue {
         &self.queue
+    }
+
+    /// [`Self::send`] の成功・失敗カウントとレイテンシ分布を参照する
+    /// （TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）。呼び出し元はここから
+    /// 読み出した値を、任意のログ・メトリクス基盤へ変換して出力する。
+    pub fn metrics(&self) -> &SendMetrics {
+        &self.metrics
     }
 
     /// このクライアントが失効済み（[`Self::poisoned`] 参照）かどうかを返す。
@@ -409,8 +584,18 @@ where
     ///
     /// `timeout` は 1 回の書き込みにそのまま渡す（ACK を待つものではない。
     /// REPAIR-5）。
+    ///
+    /// # 観測（TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）
+    ///
+    /// 呼び出しごとに結果種別（[`SendOutcome`]）を [`Self::metrics`] へ記録する。
+    /// 上限到達（[`SendOutcome::RejectedResourceExhausted`]）・トランスポート失敗
+    /// （[`SendOutcome::TransportFailure`]）も含め、すべての分岐を計上する。
+    /// 所要時間はトランスポートへ実際に書き込んだ呼び出し（成功・失敗の両方）に
+    /// ついてのみ計測する（早期拒否はトランスポートを介さないため）。
     pub fn send(&mut self, frame: &Frame, timeout: IoTimeout) -> Result<InFlightRequest, IoError> {
         if self.poisoned {
+            self.metrics
+                .record(SendOutcome::RejectedPoisoned, Duration::ZERO);
             return Err(IoError::new(
                 IoErrorCode::Unavailable,
                 "pipeline client is poisoned after an ambiguous send failure; reconnect required",
@@ -419,20 +604,38 @@ where
         match frame.kind() {
             FrameKind::Write | FrameKind::Flush => {}
             FrameKind::Ack | FrameKind::FlushAck => {
+                self.metrics
+                    .record(SendOutcome::RejectedInvalidFrameKind, Duration::ZERO);
                 return Err(IoError::new(
                     IoErrorCode::InvalidArgument,
                     "only Write/Flush frames can be tracked as in-flight requests",
                 ));
             }
         }
-        self.queue.ensure_can_register()?;
-        let request = self.queue.register(frame.kind())?;
+        if let Err(err) = self.queue.ensure_can_register() {
+            self.metrics
+                .record(SendOutcome::RejectedResourceExhausted, Duration::ZERO);
+            return Err(err);
+        }
+        let request = match self.queue.register(frame.kind()) {
+            Ok(request) => request,
+            Err(err) => {
+                self.metrics
+                    .record(SendOutcome::RejectedResourceExhausted, Duration::ZERO);
+                return Err(err);
+            }
+        };
+        let started_at = Instant::now();
         if let Err(err) = self.sender.send_frame(frame, timeout) {
             // 送信結果が不明なため、request.id() をキューへ残したまま接続を
             // 失効させる（上記ドキュメンテーションコメント参照）。
             self.poisoned = true;
+            self.metrics
+                .record(SendOutcome::TransportFailure, started_at.elapsed());
             return Err(err);
         }
+        self.metrics
+            .record(SendOutcome::Success, started_at.elapsed());
         Ok(request)
     }
 
@@ -897,5 +1100,105 @@ mod tests {
     #[test]
     fn io1_pipeline_client_is_send() {
         assert_send::<PipelineClient<RecordingSender>>();
+    }
+
+    /// TASK-12.1（#73 codex 指摘対応。P1・REPAIR-4）: 成功した送信は
+    /// `SendMetrics::success_count` を増分し、`write_latency` の観測件数も
+    /// 増える（早期拒否と異なりトランスポートへ実際に書き込むため）。
+    #[test]
+    fn repair4_send_metrics_counts_success_and_latency() {
+        let limit = InFlightLimit::new(4).expect("4 must be valid");
+        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+
+        client
+            .send(&write_frame(1), test_timeout())
+            .expect("send must succeed while under the limit");
+        client
+            .send(&write_frame(2), test_timeout())
+            .expect("send must succeed while under the limit");
+
+        let metrics = client.metrics();
+        assert_eq!(metrics.success_count(), 2);
+        assert_eq!(metrics.rejected_poisoned_count(), 0);
+        assert_eq!(metrics.rejected_invalid_frame_kind_count(), 0);
+        assert_eq!(metrics.rejected_resource_exhausted_count(), 0);
+        assert_eq!(metrics.transport_failure_count(), 0);
+        assert_eq!(metrics.write_latency().count(), 2);
+    }
+
+    /// TASK-12.1（#73 codex 指摘対応。P1・REPAIR-4）: 未 ACK 件数の上限到達で
+    /// 拒否された送信は `rejected_resource_exhausted_count` を増分し、
+    /// `write_latency` へは計上しない（トランスポートへ書き込んでいないため）。
+    #[test]
+    fn repair4_send_metrics_counts_resource_exhausted() {
+        let limit = InFlightLimit::new(1).expect("1 must be valid");
+        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+
+        client
+            .send(&write_frame(1), test_timeout())
+            .expect("1st send must succeed");
+        let err = client
+            .send(&write_frame(2), test_timeout())
+            .expect_err("2nd send must be rejected once the limit is reached");
+        assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+
+        let metrics = client.metrics();
+        assert_eq!(metrics.success_count(), 1);
+        assert_eq!(metrics.rejected_resource_exhausted_count(), 1);
+        assert_eq!(metrics.write_latency().count(), 1);
+    }
+
+    /// TASK-12.1（#73 codex 指摘対応。P1・REPAIR-4）: トランスポート失敗
+    /// （クライアントを失効させる分岐）は `transport_failure_count` を増分し、
+    /// `write_latency` にも計上する（トランスポートへ実際に書き込んだため）。
+    /// 失効後の拒否は `rejected_poisoned_count` を増分し、`write_latency` には
+    /// 計上しない。
+    #[test]
+    fn repair4_send_metrics_counts_transport_failure_and_poisoned_rejection() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut client = PipelineClient::new(AlwaysTimeoutSender, limit);
+
+        client
+            .send(&write_frame(1), test_timeout())
+            .expect_err("transport failure must propagate");
+        client
+            .send(&write_frame(2), test_timeout())
+            .expect_err("poisoned client must reject further sends");
+
+        let metrics = client.metrics();
+        assert_eq!(metrics.success_count(), 0);
+        assert_eq!(metrics.transport_failure_count(), 1);
+        assert_eq!(metrics.rejected_poisoned_count(), 1);
+        assert_eq!(metrics.write_latency().count(), 1);
+    }
+
+    /// TASK-12.1（#73 codex 指摘対応。P1・REPAIR-4）: 追跡対象外のフレーム種別
+    /// （`Ack`・`FlushAck`）による拒否は `rejected_invalid_frame_kind_count` を
+    /// 増分し、`write_latency` には計上しない。
+    #[test]
+    fn repair4_send_metrics_counts_invalid_frame_kind() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+
+        let ack_frame = Frame::new(FrameKind::Ack, Vec::new()).expect("frame must be valid");
+        client
+            .send(&ack_frame, test_timeout())
+            .expect_err("Ack frames must not be trackable as in-flight requests");
+
+        let metrics = client.metrics();
+        assert_eq!(metrics.rejected_invalid_frame_kind_count(), 1);
+        assert_eq!(metrics.write_latency().count(), 0);
+    }
+
+    /// TASK-12.1（#73 codex 指摘対応。P1・REPAIR-4）: 未観測の `LatencyStats` は
+    /// `count` が `0` で `min`/`max`/`mean` が `None` になる。
+    #[test]
+    fn repair4_latency_stats_defaults_to_empty() {
+        let stats = LatencyStats::default();
+        assert_eq!(stats.count(), 0);
+        assert_eq!(stats.total(), Duration::ZERO);
+        assert_eq!(stats.min(), None);
+        assert_eq!(stats.max(), None);
+        assert_eq!(stats.mean(), None);
     }
 }

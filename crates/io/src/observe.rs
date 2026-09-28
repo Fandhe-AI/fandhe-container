@@ -37,7 +37,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
 
-use crate::client::SendOutcome;
+use crate::client::{AckOutcome, SendOutcome};
 use crate::error::{IoError, IoErrorCode};
 use crate::protocol::FrameKind;
 
@@ -126,20 +126,88 @@ impl fmt::Debug for SendEventError<'_> {
     }
 }
 
-/// [`crate::client::PipelineClient::send`] の送信イベントを受け取る観測フック
-/// （TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4・REPAIR-5）。
+/// [`crate::client::PipelineClient::recv_ack`] 1 回分の ACK 受信イベント
+/// （TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
 ///
-/// 呼び出しは送信のたびに同期的・単一スレッドで行われる（[`crate::client::PipelineClient`]
-/// 自体が `&mut self` を要求し単一スレッド前提であることと同じ契約）。
+/// [`SendEvent`] の ACK 受信版で、[`crate::client::AckMetrics`] が集計している
+/// 事象（結果種別・所要時間）と対応させる。[`SendEvent`] と同様に将来フィールドを
+/// 追加できるよう `#[non_exhaustive]` にする（REPAIR-3）。
+///
+/// # 借用型である理由
+///
+/// [`SendEvent`] のドキュメント参照。`error`（[`AckEventError::message`]）は
+/// 呼び出し元（[`crate::client::PipelineClient::notify_ack`]）が保持する
+/// [`crate::error::IoError`] の内部文字列を借用するだけで、複製しない。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AckEvent<'a> {
+    /// [`AckOutcome`]（成功・各拒否理由・トランスポート失敗）。
+    pub outcome: AckOutcome,
+    /// `receiver.recv_frame` を実際に呼び出した呼び出しの所要時間。早期拒否
+    /// （`receiver` を呼ばない分岐）の場合は `Duration::ZERO`
+    /// （[`crate::client::AckMetrics`] と同じ扱い）。
+    pub latency: Duration,
+    /// `outcome` が失敗系だった場合の詳細（エラーコード・メッセージ）。
+    /// 成功時は `None`。
+    pub error: Option<AckEventError<'a>>,
+}
+
+/// 件数・破棄数等の要約のみを出す手書きの `Debug`（[`SendEvent`] と同じ理由）。
+impl fmt::Debug for AckEvent<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AckEvent")
+            .field("outcome", &self.outcome)
+            .field("latency", &self.latency)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+/// [`AckEvent::error`] が保持する失敗詳細（TASK-12.2・#74 codex 指摘対応。P1）。
+///
+/// 借用の契約は [`SendEventError`] と同じ（呼び出し中のみ有効。REPAIR-5）。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AckEventError<'a> {
+    /// 機械可読なエラーコード（ERR-1）。
+    pub code: IoErrorCode,
+    /// 人間可読なエラーメッセージ。トランスポート実装（untrusted な相手側）由来の
+    /// 文字列を含みうるため、[`JsonLinesSendObserver`] は出力時にエスケープする。
+    pub message: &'a str,
+}
+
+/// [`SendEventError`] と同じ理由の手書き `Debug`。
+impl fmt::Debug for AckEventError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (prefix, truncated) = truncate_message_bytes(self.message);
+        f.debug_struct("AckEventError")
+            .field("code", &self.code)
+            .field("message_len", &self.message.len())
+            .field("message_prefix", &prefix)
+            .field("message_truncated", &truncated)
+            .finish()
+    }
+}
+
+/// [`crate::client::PipelineClient::send`] の送信イベントと
+/// [`crate::client::PipelineClient::recv_ack`] の ACK 受信イベントを受け取る
+/// 観測フック（TASK-12.1・#73／TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4・
+/// REPAIR-5）。
+///
+/// 呼び出しは送信・ACK 受信のたびに同期的・単一スレッドで行われる
+/// （[`crate::client::PipelineClient`] 自体が `&mut self` を要求し単一スレッド
+/// 前提であることと同じ契約）。
 ///
 /// # 契約: ブロックする I/O をしてはならない（REPAIR-5）
 ///
-/// `on_send` は送信経路（[`crate::client::PipelineClient::send`]）から同期で呼ばれる。
-/// ここでブロックする I/O（ソケット・pipe への書き込み・ロック待ち等）を行うと、
-/// 相手の応答を待たない送信であるはずの `send` 自体が無期限に停止しかねず、
-/// [`crate::transport::IoTimeout`] でも打ち切れない。実装はメモリ内へ積む・
-/// 非ブロッキング操作のみに留め、実際の I/O は別経路（呼び出し元が明示的に呼ぶ
-/// drain API 等）へ分離すること（[`JsonLinesSendObserver`] を参照）。
+/// `on_send`・`on_ack` は送信・受信経路（[`crate::client::PipelineClient::send`]・
+/// [`crate::client::PipelineClient::recv_ack`]）から同期で呼ばれる。ここで
+/// ブロックする I/O（ソケット・pipe への書き込み・ロック待ち等）を行うと、
+/// 相手の応答を待たない送信・ACK 待ちであるはずの呼び出し自体が無期限に
+/// 停止しかねず、[`crate::transport::IoTimeout`] でも打ち切れない。実装は
+/// メモリ内へ積む・非ブロッキング操作のみに留め、実際の I/O は別経路
+/// （呼び出し元が明示的に呼ぶ drain API 等）へ分離すること
+/// （[`JsonLinesSendObserver`] を参照）。
 ///
 /// `Debug` は要求しない。`Box<dyn Write + Send>` のような非 `Debug` な書き込み先を
 /// 保持する観測フックも実装できるようにするため（[`crate::client::PipelineClient`]
@@ -149,6 +217,17 @@ pub trait SendObserver: Send {
     /// 1 回の送信イベントを通知する。`event` は呼び出し中のみ有効な借用
     /// （[`SendEvent`] のドキュメント参照。#73 P0 再指摘対応）。
     fn on_send(&mut self, event: &SendEvent<'_>);
+
+    /// 1 回の ACK 受信イベントを通知する（TASK-12.2・#74 codex 指摘対応。P1・
+    /// REPAIR-4）。`event` は呼び出し中のみ有効な借用（[`AckEvent`] のドキュメント
+    /// 参照）。
+    ///
+    /// 既定実装は何もしない。[`on_send`](Self::on_send) と異なり必須にしない
+    /// 理由: `SendObserver` 実装は本トレイトが `on_ack` を追加する以前から
+    /// 存在し、既定実装を用意することで既存の実装（本 crate 外のものを含む）を
+    /// 壊さずに ACK 受信の観測を追加できる。ACK を観測したい実装は本メソッドを
+    /// 明示的にオーバーライドする（[`JsonLinesSendObserver`] を参照）。
+    fn on_ack(&mut self, _event: &AckEvent<'_>) {}
 }
 
 /// 何もしない実装（観測しない場合に呼び出し元が
@@ -350,15 +429,22 @@ impl Default for JsonLinesSendObserver {
     }
 }
 
-impl SendObserver for JsonLinesSendObserver {
-    fn on_send(&mut self, event: &SendEvent<'_>) {
+impl JsonLinesSendObserver {
+    /// 行数上限に達していないか確認し、達していなければ `encode` を呼んで
+    /// エンコードしたうえで、合計バイト数の上限チェックのうえキューへ積む
+    /// 共通処理（[`Self::on_send`]・[`SendObserver::on_ack`] 実装で共有。
+    /// TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4・REPAIR-5）。
+    ///
+    /// `encode` を遅延評価にするのは、行数上限に達している場合はエンコード
+    /// 自体を省く（旧実装の挙動を保つ）ため。満杯・合計バイト数超過時は
+    /// 新規イベントを破棄し（上記モジュール doc 参照）、[`Self::dropped_count`]
+    /// を増分する。ここでは I/O を行わない（REPAIR-5）。
+    fn push_encoded_line(&mut self, encode: impl FnOnce() -> String) {
         if self.lines.len() >= self.capacity {
-            // 満杯時は新規イベントを破棄する（上記ドキュメント参照）。ここで
-            // I/O は行わない（REPAIR-5）。
             self.dropped = self.dropped.saturating_add(1);
             return;
         }
-        let encoded = encode_send_event(event);
+        let encoded = encode();
         // 行数上限とは独立に、合計バイト数の上限も守る（codex P0 再指摘対応）。
         // 巨大な `message` が連続しても、キューの総メモリ使用量を有界に保つ。
         if self.total_bytes.saturating_add(encoded.len()) > MAX_SEND_LOG_BUFFER_BYTES {
@@ -367,6 +453,16 @@ impl SendObserver for JsonLinesSendObserver {
         }
         self.total_bytes += encoded.len();
         self.lines.push_back(encoded);
+    }
+}
+
+impl SendObserver for JsonLinesSendObserver {
+    fn on_send(&mut self, event: &SendEvent<'_>) {
+        self.push_encoded_line(|| encode_send_event(event));
+    }
+
+    fn on_ack(&mut self, event: &AckEvent<'_>) {
+        self.push_encoded_line(|| encode_ack_event(event));
     }
 }
 
@@ -486,6 +582,67 @@ fn encode_send_event(event: &SendEvent<'_>) -> String {
             let reason = outcome_reason_str(*outcome);
             format!(
                 "{{\"event\":\"io_send\",\"kind\":\"{kind}\",\"outcome\":\"error\",\
+                 \"reason\":\"{reason}\",\"latency_us\":{latency_us}}}"
+            )
+        }
+    }
+}
+
+/// [`AckOutcome`] の snake_case 名を返す（[`outcome_reason_str`] の ACK 版。
+/// TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
+fn ack_outcome_reason_str(outcome: AckOutcome) -> &'static str {
+    match outcome {
+        AckOutcome::Success => "success",
+        AckOutcome::RejectedPoisoned => "rejected_poisoned",
+        AckOutcome::RejectedNoInFlight => "rejected_no_in_flight",
+        AckOutcome::TransportFailure => "transport_failure",
+        AckOutcome::RejectedInvalidPayload => "rejected_invalid_payload",
+        AckOutcome::RejectedOutOfOrder => "rejected_out_of_order",
+        AckOutcome::RejectedUnknownAckId => "rejected_unknown_ack_id",
+        AckOutcome::RejectedAckKindMismatch => "rejected_ack_kind_mismatch",
+        AckOutcome::RejectedInternal => "rejected_internal",
+    }
+}
+
+/// [`AckEvent`] を 1 行の JSON Lines 文字列へエンコードする（改行は含まない。
+/// [`encode_send_event`] の ACK 版。TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
+///
+/// `event` フィールドは `io_send` と区別するため `"io_recv_ack"` を使う。
+/// フレーム種別（`kind`）は持たない（`recv_ack` はキューの先頭と対応付けるまで
+/// 送信時の種別が確定しないため。[`AckEvent`] のドキュメント参照）。
+fn encode_ack_event(event: &AckEvent<'_>) -> String {
+    let latency_us = event.latency.as_micros();
+    match (&event.outcome, &event.error) {
+        (AckOutcome::Success, _) => {
+            format!("{{\"event\":\"io_recv_ack\",\"outcome\":\"ok\",\"latency_us\":{latency_us}}}")
+        }
+        (outcome, Some(error)) => {
+            let reason = ack_outcome_reason_str(*outcome);
+            let code = error.code.as_str();
+            let (truncated_message, truncated) = truncate_message_bytes(error.message);
+            let message = escape_json_string(truncated_message);
+            if truncated {
+                format!(
+                    "{{\"event\":\"io_recv_ack\",\"outcome\":\"error\",\
+                     \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
+                     \"message_truncated\":true,\"latency_us\":{latency_us}}}"
+                )
+            } else {
+                format!(
+                    "{{\"event\":\"io_recv_ack\",\"outcome\":\"error\",\
+                     \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
+                     \"latency_us\":{latency_us}}}"
+                )
+            }
+        }
+        (outcome, None) => {
+            // `Success` 以外は必ず `error` を伴う契約だが（`PipelineClient::notify_ack`
+            // が組み立てる）、型としては `Option` のため、万一 `None` が来ても
+            // panic せず `code`/`message` を省いた行を出す（`encode_send_event` と
+            // 同じフォールバック方針）。
+            let reason = ack_outcome_reason_str(*outcome);
+            format!(
+                "{{\"event\":\"io_recv_ack\",\"outcome\":\"error\",\
                  \"reason\":\"{reason}\",\"latency_us\":{latency_us}}}"
             )
         }

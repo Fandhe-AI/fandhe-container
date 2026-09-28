@@ -37,15 +37,15 @@ pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
 };
 pub use client::{
-    AckReceipt, DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest, LATENCY_HISTOGRAM_BUCKETS,
-    LatencyStats, MAX_IN_FLIGHT_LIMIT, PipelineClient, RequestId, SendMetrics, SendOutcome,
-    SendQueue,
+    AckMetrics, AckOutcome, AckReceipt, DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest,
+    LATENCY_HISTOGRAM_BUCKETS, LatencyStats, MAX_IN_FLIGHT_LIMIT, PipelineClient, RequestId,
+    SendMetrics, SendOutcome, SendQueue,
 };
 pub use error::{IoError, IoErrorCode};
 pub use observe::{
-    DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver, MAX_SEND_LOG_BUFFER_BYTES,
-    MAX_SEND_LOG_CAPACITY, MAX_SEND_LOG_MESSAGE_BYTES, NoopSendObserver, SendEvent, SendEventError,
-    SendObserver,
+    AckEvent, AckEventError, DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver,
+    MAX_SEND_LOG_BUFFER_BYTES, MAX_SEND_LOG_CAPACITY, MAX_SEND_LOG_MESSAGE_BYTES, NoopSendObserver,
+    SendEvent, SendEventError, SendObserver,
 };
 pub use payload::{
     ACK_PAYLOAD_LEN, AckEnvelope, MAX_WRITE_BODY_LEN, REQUEST_ID_WIRE_LEN, RequestEnvelope,

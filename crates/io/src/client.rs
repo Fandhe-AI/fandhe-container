@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use crate::error::{IoError, IoErrorCode};
 #[cfg(test)]
 use crate::observe::NoopSendObserver;
-use crate::observe::{SendEvent, SendEventError, SendObserver};
+use crate::observe::{AckEvent, AckEventError, SendEvent, SendEventError, SendObserver};
 use crate::payload::{self, WireRequestId};
 use crate::protocol::{Frame, FrameKind};
 use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
@@ -728,6 +728,169 @@ impl SendMetrics {
     }
 }
 
+/// [`PipelineClient::recv_ack`] 1 回の結果種別（[`AckMetrics`] の内訳。TASK-12.2・#74
+/// codex 指摘対応。P1・REPAIR-4）。
+///
+/// [`PipelineClient::recv_ack`] のドキュメンテーションコメントに記した処理順の各
+/// 分岐に 1 対 1 で対応する。呼び出し元はこの内訳を使い、成功・タイムアウト・
+/// プロトコル違反（形式・送信順・種別）を区別して観測できる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AckOutcome {
+    /// 送信順・種別の対応付けまで検証し、未 ACK 枠を解放できた。
+    Success,
+    /// すでに失効済み（[`PipelineClient::is_poisoned`]）だったため拒否した
+    /// （`receiver` は呼ばない）。
+    RejectedPoisoned,
+    /// 未 ACK のリクエストが 1 件もない状態で呼ばれたため拒否した
+    /// （`receiver` は呼ばない。プロトコル違反ではないため失効させない）。
+    RejectedNoInFlight,
+    /// `receiver.recv_frame` がエラー（[`IoErrorCode::Timeout`] を含む）を返し、
+    /// クライアントを失効させた。
+    TransportFailure,
+    /// [`crate::payload::decode_ack`] のペイロード検証（種別違反・長さ違反）で
+    /// 拒否し、クライアントを失効させた。
+    RejectedInvalidPayload,
+    /// 受け取った request id がキュー内には存在するが最古ではなかった
+    /// （out-of-order ack）ため拒否し、クライアントを失効させた。
+    RejectedOutOfOrder,
+    /// 受け取った request id がキューのどこにも存在しなかった（unknown ack id）
+    /// ため拒否し、クライアントを失効させた。
+    RejectedUnknownAckId,
+    /// 送信時の [`FrameKind`] に対応する ACK 種別（`Write` → `Ack`・`Flush` →
+    /// `FlushAck`）と実際の受信種別が一致しなかったため拒否し、クライアントを
+    /// 失効させた。
+    RejectedAckKindMismatch,
+    /// 構造上起こらないはずの内部不整合（キューが空チェック後に空になった・
+    /// 追跡対象外のフレーム種別が未 ACK エントリに残っていた）を検出し、安全側に
+    /// 倒して拒否した。到達しない想定だが、`unwrap`・`expect` を避けるための
+    /// フォールバック分岐（coding-rust「ライブラリコードでは panic させない」）。
+    RejectedInternal,
+}
+
+/// [`PipelineClient::recv_ack`] の成功・失敗カウントと ACK 待機の所要時間分布を
+/// 保持する構造化メトリクス（TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
+///
+/// [`SendMetrics`] と対になる ACK 受信側の観測で、base 側 AGENTS.md が要求する
+/// 「I/O 操作の成功・失敗カウントとレイテンシ分布」を `recv_ack` についても満たす。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AckMetrics {
+    success_count: u64,
+    rejected_poisoned_count: u64,
+    rejected_no_in_flight_count: u64,
+    transport_failure_count: u64,
+    rejected_invalid_payload_count: u64,
+    rejected_out_of_order_count: u64,
+    rejected_unknown_ack_id_count: u64,
+    rejected_ack_kind_mismatch_count: u64,
+    rejected_internal_count: u64,
+    /// `receiver.recv_frame` を実際に呼び出した呼び出し（成功・失敗の両方）の
+    /// 所要時間分布。`receiver` を呼ばずに早期拒否した呼び出し
+    /// （`RejectedPoisoned`・`RejectedNoInFlight`）はここへ含めない（[`SendMetrics::write_latency`]
+    /// と同じ扱い）。
+    wait_latency: LatencyStats,
+}
+
+impl AckMetrics {
+    fn record(&mut self, outcome: AckOutcome, elapsed: Duration) {
+        match outcome {
+            AckOutcome::Success => {
+                self.success_count = self.success_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+            AckOutcome::RejectedPoisoned => {
+                self.rejected_poisoned_count = self.rejected_poisoned_count.saturating_add(1);
+            }
+            AckOutcome::RejectedNoInFlight => {
+                self.rejected_no_in_flight_count =
+                    self.rejected_no_in_flight_count.saturating_add(1);
+            }
+            AckOutcome::TransportFailure => {
+                self.transport_failure_count = self.transport_failure_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+            AckOutcome::RejectedInvalidPayload => {
+                self.rejected_invalid_payload_count =
+                    self.rejected_invalid_payload_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+            AckOutcome::RejectedOutOfOrder => {
+                self.rejected_out_of_order_count =
+                    self.rejected_out_of_order_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+            AckOutcome::RejectedUnknownAckId => {
+                self.rejected_unknown_ack_id_count =
+                    self.rejected_unknown_ack_id_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+            AckOutcome::RejectedAckKindMismatch => {
+                self.rejected_ack_kind_mismatch_count =
+                    self.rejected_ack_kind_mismatch_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+            AckOutcome::RejectedInternal => {
+                self.rejected_internal_count = self.rejected_internal_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+        }
+    }
+
+    /// 送信順・種別の対応付けまで検証し、未 ACK 枠を解放できた回数。
+    pub fn success_count(&self) -> u64 {
+        self.success_count
+    }
+
+    /// [`PipelineClient::is_poisoned`] により拒否した回数（`receiver` を呼ばない）。
+    pub fn rejected_poisoned_count(&self) -> u64 {
+        self.rejected_poisoned_count
+    }
+
+    /// 未 ACK のリクエストが 1 件もない状態で呼ばれ拒否した回数
+    /// （`receiver` を呼ばない）。
+    pub fn rejected_no_in_flight_count(&self) -> u64 {
+        self.rejected_no_in_flight_count
+    }
+
+    /// `receiver.recv_frame` がエラー（タイムアウトを含む）を返し失効させた回数。
+    pub fn transport_failure_count(&self) -> u64 {
+        self.transport_failure_count
+    }
+
+    /// ACK ペイロードの形式検証で拒否し失効させた回数。
+    pub fn rejected_invalid_payload_count(&self) -> u64 {
+        self.rejected_invalid_payload_count
+    }
+
+    /// 受信 ACK の request id がキュー内には存在するが最古ではなく拒否し
+    /// 失効させた回数（out-of-order ack）。
+    pub fn rejected_out_of_order_count(&self) -> u64 {
+        self.rejected_out_of_order_count
+    }
+
+    /// 受信 ACK の request id がキューのどこにも存在せず拒否し失効させた回数
+    /// （unknown ack id）。
+    pub fn rejected_unknown_ack_id_count(&self) -> u64 {
+        self.rejected_unknown_ack_id_count
+    }
+
+    /// 送信時のフレーム種別に対応しない ACK 種別を受け取り拒否し失効させた回数。
+    pub fn rejected_ack_kind_mismatch_count(&self) -> u64 {
+        self.rejected_ack_kind_mismatch_count
+    }
+
+    /// 構造上起こらないはずの内部不整合を検出し拒否した回数（到達しない想定の
+    /// フォールバック分岐。[`AckOutcome::RejectedInternal`] 参照）。
+    pub fn rejected_internal_count(&self) -> u64 {
+        self.rejected_internal_count
+    }
+
+    /// `receiver.recv_frame` を実際に呼び出した呼び出し（成功・失敗の両方）の
+    /// 所要時間分布を返す。
+    pub fn wait_latency(&self) -> LatencyStats {
+        self.wait_latency
+    }
+}
+
 /// [`crate::transport::FrameSender`] と [`SendQueue`] を組み合わせ、パイプライン送信
 /// （IO-1）のキュー管理付き送信 API を提供する（TASK-12.1）。
 ///
@@ -757,10 +920,15 @@ where
     /// [`Self::send`] の成功・失敗カウントとレイテンシ分布（TASK-12.1・#73 codex
     /// 指摘対応。P1・REPAIR-4）。
     metrics: SendMetrics,
+    /// [`Self::recv_ack`] の成功・失敗カウントと ACK 待機の所要時間分布
+    /// （TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
+    ack_metrics: AckMetrics,
     /// [`Self::send`] のたびに通知する送信イベントの観測フック（TASK-12.1・#73
     /// codex 指摘対応。P1・REPAIR-4）。[`Self::new`] の必須引数であり、観測しない
     /// 場合は呼び出し元が [`crate::observe::NoopSendObserver`] を明示的に渡す（codex P1 再指摘
     /// 対応。既定を暗黙に選ばず、観測先の指定を構築時の必須契約にする）。
+    /// [`Self::recv_ack`] の ACK イベントも同じ観測フック（[`SendObserver::on_ack`]）
+    /// へ通知する（TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
     observer: O,
 }
 
@@ -788,6 +956,7 @@ where
             queue: SendQueue::new(limit),
             poisoned: false,
             metrics: SendMetrics::default(),
+            ack_metrics: AckMetrics::default(),
             observer,
         }
     }
@@ -806,6 +975,18 @@ where
     /// 集計値であり、送信のたびに自動で外部へ出力する経路ではない）。
     pub fn metrics(&self) -> &SendMetrics {
         &self.metrics
+    }
+
+    /// [`Self::recv_ack`] の成功・失敗カウントと ACK 待機の所要時間分布を参照する
+    /// （TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。呼び出し元はここから
+    /// 読み出した値を、任意のログ・メトリクス基盤へ変換して出力する。
+    ///
+    /// 受信の都度リアルタイムに出力したい場合は [`Self::new`] へ渡す
+    /// [`SendObserver`]（[`SendObserver::on_ack`]）を使う（本メソッドは呼び出し元が
+    /// 明示的に読み出す集計値であり、`recv_ack` のたびに自動で外部へ出力する
+    /// 経路ではない）。
+    pub fn ack_metrics(&self) -> &AckMetrics {
+        &self.ack_metrics
     }
 
     /// [`Self::new`] へ渡した観測フックを参照する（TASK-12.1・#73
@@ -1074,6 +1255,25 @@ where
         });
     }
 
+    /// [`Self::recv_ack`] の各失敗分岐から共通で呼び、[`Self::ack_metrics`] へ記録
+    /// したうえで [`AckEvent`]（失敗詳細つき）を [`Self::observer`] へ通知する
+    /// （TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
+    ///
+    /// [`Self::notify`]（送信側）と対になる ACK 受信側の入口。`err.message()` を
+    /// 借用のまま [`AckEventError::message`] へ渡し、複製しない
+    /// （[`SendEvent`]・[`AckEvent`] のドキュメント参照）。
+    fn notify_ack(&mut self, outcome: AckOutcome, latency: Duration, err: &IoError) {
+        self.ack_metrics.record(outcome, latency);
+        self.observer.on_ack(&AckEvent {
+            outcome,
+            latency,
+            error: Some(AckEventError {
+                code: err.code(),
+                message: err.message(),
+            }),
+        });
+    }
+
     /// 検証済み ACK の request id で未 ACK 枠を解放する、メモリ内の低水準な入口
     /// （IO-1・TASK-12.1・#73 codex 再指摘対応。P1）。
     ///
@@ -1140,6 +1340,20 @@ where
     /// すべての書き込みが永続化済みであることを保証する（IO-2）。本メソッドの
     /// 送信順照合はどちらの種別でも同じ規則（キュー先頭との一致）を使い、
     /// この保証範囲の違いと矛盾しない。
+    ///
+    /// # 観測（TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）
+    ///
+    /// 呼び出しごとに結果種別（[`AckOutcome`]）を [`Self::ack_metrics`] へ記録し、
+    /// [`AckEvent`] として [`Self::observer`]（`observer` フィールド。[`Self::new`]
+    /// の必須引数）へも通知する。受信成功・タイムアウトを含むトランスポート失敗
+    /// （[`AckOutcome::TransportFailure`]）・ペイロード形式違反
+    /// （[`AckOutcome::RejectedInvalidPayload`]）・送信順照合違反
+    /// （[`AckOutcome::RejectedOutOfOrder`]・[`AckOutcome::RejectedUnknownAckId`]）・
+    /// 種別対応違反（[`AckOutcome::RejectedAckKindMismatch`]）も含め、すべての
+    /// 分岐を計上・通知する。所要時間は `receiver.recv_frame` を実際に呼び出した
+    /// 呼び出し（成功・失敗の両方）に対して計測し、それより前の早期拒否
+    /// （[`AckOutcome::RejectedPoisoned`]・[`AckOutcome::RejectedNoInFlight`]）は
+    /// [`Duration::ZERO`] とする（[`Self::send`] の早期拒否と同じ扱い）。
     pub fn recv_ack<R>(
         &mut self,
         receiver: &mut R,
@@ -1149,17 +1363,23 @@ where
         R: FrameReceiver<Frame = Frame>,
     {
         if self.poisoned {
-            return Err(IoError::new(
+            let err = IoError::new(
                 IoErrorCode::Unavailable,
                 "pipeline client is poisoned after an ambiguous send failure; reconnect required",
-            ));
+            );
+            self.notify_ack(AckOutcome::RejectedPoisoned, Duration::ZERO, &err);
+            return Err(err);
         }
         if self.queue.is_empty() {
-            return Err(IoError::new(
+            let err = IoError::new(
                 IoErrorCode::InvalidArgument,
                 "recv_ack called with no in-flight requests to match against",
-            ));
+            );
+            self.notify_ack(AckOutcome::RejectedNoInFlight, Duration::ZERO, &err);
+            return Err(err);
         }
+
+        let started_at = Instant::now();
 
         let frame = match receiver.recv_frame(timeout) {
             Ok(frame) => frame,
@@ -1168,6 +1388,8 @@ where
                 // 返した接続はどんなエラーであれ以後使用不可。「まだ来ていない
                 // だけ」という再試行の余地を残さない。
                 self.poisoned = true;
+                let elapsed = started_at.elapsed();
+                self.notify_ack(AckOutcome::TransportFailure, elapsed, &err);
                 return Err(err);
             }
         };
@@ -1176,6 +1398,8 @@ where
             Ok(ack) => ack,
             Err(err) => {
                 self.poisoned = true;
+                let elapsed = started_at.elapsed();
+                self.notify_ack(AckOutcome::RejectedInvalidPayload, elapsed, &err);
                 return Err(err);
             }
         };
@@ -1184,36 +1408,51 @@ where
         // `unwrap`・`expect` は使わず `Result` 経由でフォールバックする
         // （coding-rust「ライブラリコードでは panic させない」）。到達しない
         // はずの経路でも `Internal` として安全側に倒す。
-        let oldest = self.queue.oldest().copied().ok_or_else(|| {
-            self.poisoned = true;
-            IoError::new(
-                IoErrorCode::Internal,
-                "in-flight queue became empty between the emptiness check and oldest() lookup",
-            )
-        })?;
+        let oldest = match self.queue.oldest().copied() {
+            Some(oldest) => oldest,
+            None => {
+                self.poisoned = true;
+                let elapsed = started_at.elapsed();
+                let err = IoError::new(
+                    IoErrorCode::Internal,
+                    "in-flight queue became empty between the emptiness check and oldest() lookup",
+                );
+                self.notify_ack(AckOutcome::RejectedInternal, elapsed, &err);
+                return Err(err);
+            }
+        };
 
         if oldest.id().get() != ack.id().get() {
             self.poisoned = true;
+            let elapsed = started_at.elapsed();
             let is_known_but_not_oldest = self
                 .queue
                 .iter()
                 .any(|entry| entry.id().get() == ack.id().get());
-            let message = if is_known_but_not_oldest {
-                format!(
-                    "out-of-order ack: received ack for request id {}, but the oldest \
-                     unacknowledged request id is {}",
-                    ack.id().get(),
-                    oldest.id().get()
+            let (outcome, message) = if is_known_but_not_oldest {
+                (
+                    AckOutcome::RejectedOutOfOrder,
+                    format!(
+                        "out-of-order ack: received ack for request id {}, but the oldest \
+                         unacknowledged request id is {}",
+                        ack.id().get(),
+                        oldest.id().get()
+                    ),
                 )
             } else {
-                format!(
-                    "unknown ack id: received ack for request id {}, which is not among \
-                     the {} in-flight request(s) tracked by this queue",
-                    ack.id().get(),
-                    self.queue.len()
+                (
+                    AckOutcome::RejectedUnknownAckId,
+                    format!(
+                        "unknown ack id: received ack for request id {}, which is not among \
+                         the {} in-flight request(s) tracked by this queue",
+                        ack.id().get(),
+                        self.queue.len()
+                    ),
                 )
             };
-            return Err(IoError::new(IoErrorCode::InvalidArgument, message));
+            let err = IoError::new(IoErrorCode::InvalidArgument, message);
+            self.notify_ack(outcome, elapsed, &err);
+            return Err(err);
         }
 
         let expected_ack_kind = match oldest.kind() {
@@ -1224,15 +1463,19 @@ where
             // `expect` を避け、フォールバックとして安全側（拒否）に倒す。
             FrameKind::Ack | FrameKind::FlushAck => {
                 self.poisoned = true;
-                return Err(IoError::new(
+                let elapsed = started_at.elapsed();
+                let err = IoError::new(
                     IoErrorCode::Internal,
                     "in-flight request has a non-trackable frame kind; this must not happen",
-                ));
+                );
+                self.notify_ack(AckOutcome::RejectedInternal, elapsed, &err);
+                return Err(err);
             }
         };
         if ack.kind() != expected_ack_kind {
             self.poisoned = true;
-            return Err(IoError::new(
+            let elapsed = started_at.elapsed();
+            let err = IoError::new(
                 IoErrorCode::InvalidArgument,
                 format!(
                     "ack kind mismatch: request id {} was sent as {:?} but the ack frame kind is {:?}",
@@ -1240,10 +1483,26 @@ where
                     oldest.kind(),
                     ack.kind()
                 ),
-            ));
+            );
+            self.notify_ack(AckOutcome::RejectedAckKindMismatch, elapsed, &err);
+            return Err(err);
         }
 
-        let released = self.queue.remove(oldest.id())?;
+        let released = match self.queue.remove(oldest.id()) {
+            Ok(released) => released,
+            Err(err) => {
+                let elapsed = started_at.elapsed();
+                self.notify_ack(AckOutcome::RejectedInternal, elapsed, &err);
+                return Err(err);
+            }
+        };
+        let elapsed = started_at.elapsed();
+        self.ack_metrics.record(AckOutcome::Success, elapsed);
+        self.observer.on_ack(&AckEvent {
+            outcome: AckOutcome::Success,
+            latency: elapsed,
+            error: None,
+        });
         Ok(AckReceipt {
             request: released,
             ack_kind: ack.kind(),

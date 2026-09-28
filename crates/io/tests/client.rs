@@ -18,6 +18,19 @@ fn test_timeout() -> IoTimeout {
     IoTimeout::new(Duration::from_millis(1)).expect("1ms must be a valid timeout")
 }
 
+/// [`JsonLinesSendObserver::drain_lines`] は `send`（`io_send`）と `recv_ack`
+/// （`io_recv_ack`）のイベントを同じキューへ積む（[`SendObserver`] が両方の通知先を
+/// 兼ねるため）。ACK 系の観測を検証するテストは、`send` 呼び出しが残す `io_send`
+/// 行を除いた `io_recv_ack` 行だけを見る（TASK-12.2・#74 codex 指摘対応。P1・
+/// REPAIR-4）。
+fn drain_ack_lines(observer: &mut JsonLinesSendObserver) -> Vec<String> {
+    observer
+        .drain_lines()
+        .into_iter()
+        .filter(|line| line.contains("\"event\":\"io_recv_ack\""))
+        .collect()
+}
+
 /// 結合試験専用のモック sender。送信したフレームを記録し、常に成功する。
 #[derive(Debug, Default)]
 struct RecordingSender {
@@ -720,4 +733,182 @@ fn io1_acknowledge_rejects_id_already_released_by_recv_ack() {
         .acknowledge(request.id())
         .expect_err("acknowledging an id already released by recv_ack must be rejected");
     assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+}
+
+/// TASK-12.2・#74 codex 指摘対応（P1・REPAIR-4）: `recv_ack` の成功・早期拒否
+/// （poisoned・no in-flight）・タイムアウト（トランスポート失敗）を
+/// [`PipelineClient::ack_metrics`] が結果別に計上し、[`JsonLinesSendObserver`]
+/// （`SendObserver::on_ack`）が `io_recv_ack` イベントとして通知することを
+/// 確認する。プロトコル違反系（形式・送信順・種別）の分岐は
+/// `repair4_public_api_ack_observer_covers_protocol_violation_outcomes` で扱う。
+#[test]
+fn repair4_public_api_ack_metrics_and_observer_cover_success_and_early_reject_outcomes() {
+    // 早期拒否（poisoned・no in-flight）は `receiver` を呼ばず `latency_us":0`。
+    let limit = InFlightLimit::new(2).expect("2 must be valid");
+    let observer = JsonLinesSendObserver::new();
+    let mut client = PipelineClient::new(RecordingSender::default(), limit, observer);
+
+    let mut empty_receiver = ScriptedReceiver::default();
+    client
+        .recv_ack(&mut empty_receiver, test_timeout())
+        .expect_err("recv_ack with no in-flight requests must be rejected");
+    assert_eq!(client.ack_metrics().rejected_no_in_flight_count(), 1);
+
+    let request = client
+        .send(FrameKind::Write, &[1], test_timeout())
+        .expect("send must succeed");
+    let ack = encode_ack(FrameKind::Ack, WireRequestId::from(request.id()))
+        .expect("encode_ack must succeed");
+    let mut receiver = ScriptedReceiver::new(vec![Ok(ack)]);
+    client
+        .recv_ack(&mut receiver, test_timeout())
+        .expect("recv_ack must succeed for the oldest in-flight request");
+    assert_eq!(client.ack_metrics().success_count(), 1);
+    assert_eq!(client.ack_metrics().wait_latency().count(), 1);
+
+    let lines = drain_ack_lines(client.observer_mut());
+    assert_eq!(lines.len(), 2, "expected one JSON line per recv_ack() call");
+    assert!(
+        lines[0].contains("\"event\":\"io_recv_ack\"")
+            && lines[0].contains("\"outcome\":\"error\"")
+            && lines[0].contains("\"reason\":\"rejected_no_in_flight\"")
+            && lines[0].contains("\"latency_us\":0"),
+        "unexpected no-in-flight line: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("{\"event\":\"io_recv_ack\",\"outcome\":\"ok\",")
+            && lines[1].ends_with('}'),
+        "unexpected success line: {}",
+        lines[1]
+    );
+
+    // poisoned は失効済みトランスポートで再現する。
+    let poisoning_observer = JsonLinesSendObserver::new();
+    let mut poisoning_client = PipelineClient::new(AlwaysTimeoutSender, limit, poisoning_observer);
+    poisoning_client
+        .send(FrameKind::Write, &[1], test_timeout())
+        .expect_err("the mock sender always times out");
+    let mut receiver = ScriptedReceiver::default();
+    poisoning_client
+        .recv_ack(&mut receiver, test_timeout())
+        .expect_err("a poisoned client must reject recv_ack");
+    assert_eq!(poisoning_client.ack_metrics().rejected_poisoned_count(), 1);
+    let poisoning_lines = drain_ack_lines(poisoning_client.observer_mut());
+    assert_eq!(poisoning_lines.len(), 1);
+    assert!(
+        poisoning_lines[0].contains("\"reason\":\"rejected_poisoned\"")
+            && poisoning_lines[0].contains("\"latency_us\":0"),
+        "unexpected poisoned line: {}",
+        poisoning_lines[0]
+    );
+
+    // タイムアウト（トランスポート失敗）は所要時間 0 ではない可能性があるため
+    // `reason` のみを確認する（`repair5_recv_ack_times_out_and_poisons` が
+    // 失効・エラーコードの契約を担当する）。
+    let timeout_limit = InFlightLimit::new(1).expect("1 must be valid");
+    let timeout_observer = JsonLinesSendObserver::new();
+    let mut timeout_client =
+        PipelineClient::new(RecordingSender::default(), timeout_limit, timeout_observer);
+    timeout_client
+        .send(FrameKind::Write, &[1], test_timeout())
+        .expect("send must succeed");
+    let mut empty_script = ScriptedReceiver::new(Vec::new());
+    timeout_client
+        .recv_ack(&mut empty_script, test_timeout())
+        .expect_err("an empty script must time out");
+    assert_eq!(timeout_client.ack_metrics().transport_failure_count(), 1);
+    let timeout_lines = drain_ack_lines(timeout_client.observer_mut());
+    assert_eq!(timeout_lines.len(), 1);
+    assert!(
+        timeout_lines[0].contains("\"reason\":\"transport_failure\"")
+            && timeout_lines[0].contains("\"code\":\"TIMEOUT\""),
+        "unexpected transport-failure line: {}",
+        timeout_lines[0]
+    );
+}
+
+/// TASK-12.2・#74 codex 指摘対応（P1・REPAIR-4）: `recv_ack` のプロトコル違反系
+/// （ペイロード形式・送信順〔out-of-order／unknown〕・種別対応）の各分岐が
+/// [`PipelineClient::ack_metrics`] へ個別に計上され、`SendObserver::on_ack` へも
+/// 対応する `reason` で通知されることを確認する。
+#[test]
+fn repair4_public_api_ack_observer_covers_protocol_violation_outcomes() {
+    let limit = InFlightLimit::new(4).expect("4 must be valid");
+
+    // RejectedInvalidPayload: `decode_ack` が種別違反として拒否するフレーム。
+    let observer = JsonLinesSendObserver::new();
+    let mut client = PipelineClient::new(RecordingSender::default(), limit, observer);
+    client
+        .send(FrameKind::Write, &[1], test_timeout())
+        .expect("send must succeed");
+    let not_an_ack = Frame::new(FrameKind::Write, vec![0u8; 8]).expect("Frame::new must succeed");
+    let mut receiver = ScriptedReceiver::new(vec![Ok(not_an_ack)]);
+    client
+        .recv_ack(&mut receiver, test_timeout())
+        .expect_err("a non-ack frame kind must be rejected");
+    assert_eq!(client.ack_metrics().rejected_invalid_payload_count(), 1);
+    let lines = drain_ack_lines(client.observer_mut());
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("\"reason\":\"rejected_invalid_payload\""));
+
+    // RejectedOutOfOrder: キュー先頭ではない id への ACK。
+    let observer = JsonLinesSendObserver::new();
+    let mut client = PipelineClient::new(RecordingSender::default(), limit, observer);
+    client
+        .send(FrameKind::Write, &[1], test_timeout())
+        .expect("1st send must succeed");
+    let second = client
+        .send(FrameKind::Write, &[2], test_timeout())
+        .expect("2nd send must succeed");
+    let out_of_order_ack = encode_ack(FrameKind::Ack, WireRequestId::from(second.id()))
+        .expect("encode_ack must succeed");
+    let mut receiver = ScriptedReceiver::new(vec![Ok(out_of_order_ack)]);
+    client
+        .recv_ack(&mut receiver, test_timeout())
+        .expect_err("out-of-order ack must be rejected");
+    assert_eq!(client.ack_metrics().rejected_out_of_order_count(), 1);
+    let lines = drain_ack_lines(client.observer_mut());
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("\"reason\":\"rejected_out_of_order\""));
+
+    // RejectedUnknownAckId: キューのどこにも存在しない id への ACK。
+    let observer = JsonLinesSendObserver::new();
+    let mut client = PipelineClient::new(RecordingSender::default(), limit, observer);
+    client
+        .send(FrameKind::Write, &[1], test_timeout())
+        .expect("1st send must succeed");
+    let released = client
+        .send(FrameKind::Write, &[2], test_timeout())
+        .expect("2nd send must succeed");
+    client
+        .acknowledge(released.id())
+        .expect("removing the released id via the low-level entry point must succeed");
+    let unknown_ack = encode_ack(FrameKind::Ack, WireRequestId::from(released.id()))
+        .expect("encode_ack must succeed");
+    let mut receiver = ScriptedReceiver::new(vec![Ok(unknown_ack)]);
+    client
+        .recv_ack(&mut receiver, test_timeout())
+        .expect_err("unknown ack id must be rejected");
+    assert_eq!(client.ack_metrics().rejected_unknown_ack_id_count(), 1);
+    let lines = drain_ack_lines(client.observer_mut());
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("\"reason\":\"rejected_unknown_ack_id\""));
+
+    // RejectedAckKindMismatch: `Write` に `FlushAck` を返す。
+    let observer = JsonLinesSendObserver::new();
+    let mut client = PipelineClient::new(RecordingSender::default(), limit, observer);
+    let write_request = client
+        .send(FrameKind::Write, &[1], test_timeout())
+        .expect("write send must succeed");
+    let mismatched_ack = encode_ack(FrameKind::FlushAck, WireRequestId::from(write_request.id()))
+        .expect("encode_ack must succeed");
+    let mut receiver = ScriptedReceiver::new(vec![Ok(mismatched_ack)]);
+    client
+        .recv_ack(&mut receiver, test_timeout())
+        .expect_err("kind mismatch must be rejected");
+    assert_eq!(client.ack_metrics().rejected_ack_kind_mismatch_count(), 1);
+    let lines = drain_ack_lines(client.observer_mut());
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("\"reason\":\"rejected_ack_kind_mismatch\""));
 }

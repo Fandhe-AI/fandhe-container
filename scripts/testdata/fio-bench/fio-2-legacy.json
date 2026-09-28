@@ -1,0 +1,47 @@
+{
+  "fio version": "fio-2.21",
+  "timestamp": 1600000000,
+  "jobs": [
+    {
+      "jobname": "fandhe-fio-randwrite-4k",
+      "groupid": 0,
+      "error": 0,
+      "job options": {
+        "name": "fandhe-fio-randwrite-4k",
+        "directory": "/tmp/fandhe-fio-example/fandhe-fio-randwrite-4k.AbCdEf1234",
+        "filename": "fandhe-fio-randwrite-4k.dat",
+        "rw": "randwrite",
+        "bs": "4k",
+        "ioengine": "psync",
+        "direct": "1",
+        "size": "256m",
+        "runtime": "30",
+        "iodepth": "1",
+        "numjobs": "1",
+        "end_fsync": "1",
+        "group_reporting": ""
+      },
+      "write": {
+        "io_bytes": 268435456,
+        "iops": 1000.0,
+        "lat": {
+          "min": 100,
+          "max": 2000,
+          "mean": 500.0,
+          "stddev": 50.0
+        },
+        "clat": {
+          "min": 90,
+          "max": 1900,
+          "mean": 480.0,
+          "stddev": 48.0,
+          "percentile": {
+            "50.000000": 400,
+            "95.000000": 900,
+            "99.000000": 1300
+          }
+        }
+      }
+    }
+  ]
+}

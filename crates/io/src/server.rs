@@ -207,7 +207,7 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use crate::error::{IoError, IoErrorCode};
-    use crate::protocol::{FRAME_HEADER_LEN, Frame, FrameHeader};
+    use crate::protocol::{FRAME_HEADER_LEN, Frame, FrameHeader, FrameKind};
     use crate::recv_limits::ReceiveLimits;
     use crate::transport::IoTimeout;
 
@@ -495,9 +495,22 @@ mod imp {
         }
 
         /// `crate::protocol` の「ストリーム読みの手順」（1: 固定長ヘッダを読む→
-        /// 2: `FrameHeader::from_bytes` で検証→3: `ReceiveLimits::admit` で
-        /// 確保前の受理判定→4: 検証済みの `body_len` を上限に本体を読む→
-        /// 5: `Frame::decode_body` に渡す）どおりに実装する。
+        /// 2: `FrameHeader::from_bytes` で検証→3: サーバーが受信してはならない
+        /// 応答系種別（`Ack`・`FlushAck`）を確保前に拒否→4: `ReceiveLimits::admit`
+        /// で確保前の受理判定→5: 検証済みの `body_len` を上限に本体を読む→
+        /// 6: `Frame::decode_body` に渡す）どおりに実装する。
+        ///
+        /// # 応答フレームの拒否（IO-1・REPAIR-2・#820 レビュー指摘）
+        /// UDS サーバー側はクライアントからの `Write` / `Flush` を受け取り
+        /// `Ack` / `FlushAck` を返す側であり、クライアントから `Ack` /
+        /// `FlushAck` が届くことはプロトコル違反（`Frame` 自体は妥当だが
+        /// 文脈上不正）である。ヘッダの `header_crc`・種別自体の検証
+        /// （`FrameHeader::from_bytes`）が通った直後・本体バッファを確保する
+        /// 前に拒否し、`IoErrorCode::InvalidArgument` を返す。他の拒否経路
+        /// （壊れたヘッダ・確保前の長さ超過）と同じく [`FrameSender::send_frame`]
+        /// / [`FrameReceiver::recv_frame`]（[`super::UdsConnection`]）の
+        /// poison 契約に従い、このエラーも呼び出し元で `Unavailable` への
+        /// 固定化に使われる（P1-3）。
         ///
         /// `ReceiveLimits::admit` に渡す滞留件数（`pending_frames`）は常に
         /// `0` にする。この層は単一接続の送受信のみを担い、複数接続を跨いだ
@@ -520,11 +533,33 @@ mod imp {
             )?;
 
             let header = FrameHeader::from_bytes(header_bytes)?;
+            reject_client_originated_response_frame(header.kind())?;
             let admitted = ReceiveLimits::default().admit(header, 0)?;
 
             let body = read_body_until(&mut self.stream, admitted.body_len(), deadline)?;
 
             admitted.decode_body(&body)
+        }
+    }
+
+    /// サーバーが受信してはならない応答系種別（`Ack`・`FlushAck`）を拒否する
+    /// （IO-1・REPAIR-2・#820 レビュー指摘）。
+    ///
+    /// UDS サーバー側はクライアントからの `Write` / `Flush` のみを受け取る
+    /// 想定であり（`Ack` / `FlushAck` はサーバーからクライアントへ返す側）、
+    /// クライアントからこれらが届くのはプロトコル違反として扱う
+    /// （`FrameKind` の全バリアントを列挙する `match` にし、将来種別が
+    /// 追加された場合はここがコンパイルエラーになって判断漏れを防ぐ。
+    /// fail-closed）。`crates/io/src/recv_limits.rs` モジュール doc の
+    /// 「スコープ外」節が「サーバー側で Ack / FlushAck を受信した場合の拒否は
+    /// TASK-13.2.1（#820）が担う」としている箇所の実体がこの関数である。
+    fn reject_client_originated_response_frame(kind: FrameKind) -> Result<(), IoError> {
+        match kind {
+            FrameKind::Write | FrameKind::Flush => Ok(()),
+            FrameKind::Ack | FrameKind::FlushAck => Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!("server does not accept client-originated response frames: {kind:?}"),
+            )),
         }
     }
 

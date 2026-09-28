@@ -354,6 +354,84 @@ mod unix {
         let _ = client_thread.join();
     }
 
+    /// IO-1・REPAIR-2（#820 レビュー指摘）: サーバー側はクライアントから
+    /// `Ack` フレームを受け取ることを想定していない（サーバーが `Ack` を返す側）。
+    /// `recv_frame` は本体を読む前に `InvalidArgument` で拒否し、その後は P1-3
+    /// により `Unavailable` になる。
+    #[test]
+    fn io1_uds_recv_rejects_client_originated_ack_frame() {
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+        let server = fandhe_container_io::UdsServer::bind(&socket_path)
+            .expect("bind must succeed on a private, empty path");
+
+        let connect_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&connect_path).expect("client must connect");
+            let frame = Frame::new(FrameKind::Ack, vec![0u8; 8]).expect("ack frame must construct");
+            stream
+                .write_all(&frame.encode())
+                .expect("client write must succeed");
+            std::thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        });
+
+        let mut connection = server
+            .accept(test_timeout())
+            .expect("server must accept the client connection");
+
+        let err = connection
+            .recv_frame(test_timeout())
+            .expect_err("a client-originated Ack frame must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+
+        let err = connection
+            .recv_frame(test_timeout())
+            .expect_err("a poisoned connection must not be reused for recv");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+
+        let _ = client_thread.join();
+    }
+
+    /// IO-1・REPAIR-2（#820 レビュー指摘）: `FlushAck` も同様に
+    /// サーバーが返す側の種別であり、クライアントから届くのはプロトコル違反
+    /// として拒否する。
+    #[test]
+    fn io1_uds_recv_rejects_client_originated_flush_ack_frame() {
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+        let server = fandhe_container_io::UdsServer::bind(&socket_path)
+            .expect("bind must succeed on a private, empty path");
+
+        let connect_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&connect_path).expect("client must connect");
+            let frame = Frame::new(FrameKind::FlushAck, vec![0u8; 8])
+                .expect("flush ack frame must construct");
+            stream
+                .write_all(&frame.encode())
+                .expect("client write must succeed");
+            std::thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        });
+
+        let mut connection = server
+            .accept(test_timeout())
+            .expect("server must accept the client connection");
+
+        let err = connection
+            .recv_frame(test_timeout())
+            .expect_err("a client-originated FlushAck frame must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+
+        let err = connection
+            .recv_frame(test_timeout())
+            .expect_err("a poisoned connection must not be reused for recv");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+
+        let _ = client_thread.join();
+    }
+
     /// P1-3: エラーの後は send/recv どちらも `Unavailable` になり、socket に
     /// 追加のバイトが書き込まれない（client 側で追加データが届かないことを
     /// 短い read timeout で確かめる）。

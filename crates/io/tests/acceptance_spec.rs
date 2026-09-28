@@ -349,6 +349,16 @@ enum FlushAckVerdict {
     /// 対応する `BarrierRequested` が無いのに FLUSH ACK を送出した
     /// （通常の書き込み ACK を返すべき場面で FLUSH ACK を返す取り違え）。
     FlushAckWithoutBarrier { generation: u32 },
+    /// 既に `BarrierRequested` 済みの世代番号に対し、再度 `BarrierRequested`
+    /// を観測した（世代番号の再利用。Codex レビュー指摘・4 巡目: 世代番号を
+    /// 使い捨てにせず再利用すると、`BarrierRequested(1) →
+    /// PersistedBeforeBarrier(1) → FlushAckSent(1) → BarrierRequested(1) →
+    /// FlushAckSent(1)` のように、1 回目のバリアで得た永続化完了フラグを
+    /// 2 回目のバリアの根拠として使い回せてしまい、IO-2 の「各バリア以前に
+    /// 受理した書き込みの永続化完了」を世代ごとに満たしていなくても `Ok`
+    /// と誤判定する。同一世代番号の 2 度目の `BarrierRequested` は、1 回目が
+    /// 未完了か完了済みかによらず違反として拒否する）。
+    GenerationReused { generation: u32 },
 }
 
 /// 世代ごとの `flush_ack_follows_persistence` 内部状態。
@@ -398,6 +408,11 @@ fn generation_state_mut<'a>(
 ///   するため、要求前の通知では保証を満たさない）
 /// - `WriteAckSent` は永続化完了の有無を問わず許容する（IO-1・IO-2 の
 ///   契約差: 通常 ACK は永続化完了を待たずに返してよい）
+/// - 同一の世代番号に対する 2 度目の `BarrierRequested` は
+///   [`FlushAckVerdict::GenerationReused`] として即座に拒否する（Codex
+///   レビュー指摘・4 巡目: 世代番号を使い捨てにしないと、1 回目のバリアの
+///   永続化完了フラグが 2 回目のバリアの FLUSH ACK の根拠として使い回され、
+///   IO-2 の世代ごとの永続化完了保証を満たさないまま `Ok` と誤判定する）
 /// - `BarrierRequested` した世代のうち 1 つでも `FlushAckSent` が最後まで
 ///   現れなければ [`FlushAckVerdict::NoFlushAck`] を返す（Codex レビュー
 ///   指摘・3 巡目: 従来は最後に処理した世代の判定結果で上書きされ、他の
@@ -409,7 +424,13 @@ fn flush_ack_follows_persistence(events: &[AckEvent]) -> FlushAckVerdict {
     for event in events {
         match event {
             AckEvent::BarrierRequested { generation } => {
-                generation_state_mut(&mut states, &mut order, *generation).requested = true;
+                let state = generation_state_mut(&mut states, &mut order, *generation);
+                if state.requested {
+                    return FlushAckVerdict::GenerationReused {
+                        generation: *generation,
+                    };
+                }
+                state.requested = true;
             }
             AckEvent::PersistedBeforeBarrier { generation } => {
                 let state = generation_state_mut(&mut states, &mut order, *generation);
@@ -644,6 +665,47 @@ fn repair_12_scaffold_matcher_rejects_persistence_notification_before_barrier_re
         FlushAckVerdict::PrematureFlushAck { generation: 1 },
         "バリア要求より前の永続化通知を FLUSH ACK の根拠として \
             使い回す取り違えをマッチャが検出できていない"
+    );
+}
+
+/// マッチャが、既に `FlushAckSent` まで完了した世代番号の `BarrierRequested`
+/// 再利用を検出できることを確認する（REPAIR-12・IO-2。Codex レビュー指摘・
+/// 4 巡目: 1 回目のバリアの永続化完了フラグが世代を跨いでリセットされない
+/// ため、`BarrierRequested(1) → PersistedBeforeBarrier(1) →
+/// FlushAckSent(1) → BarrierRequested(1) → FlushAckSent(1)` が誤って `Ok`
+/// と判定されていた。後半のバリアには新たな永続化完了が無いため、この列は
+/// IO-2 の「各バリア以前に受理した書き込みの永続化完了」を満たさない）。
+#[test]
+fn repair_12_scaffold_matcher_rejects_generation_reuse_after_ack() {
+    let generation_reused_after_ack = [
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::PersistedBeforeBarrier { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+    ];
+    assert_eq!(
+        flush_ack_follows_persistence(&generation_reused_after_ack),
+        FlushAckVerdict::GenerationReused { generation: 1 },
+        "FLUSH ACK 済みの世代番号を再利用したバリア要求をマッチャが\
+            検出できていない（1 回目の永続化完了を 2 回目の根拠に使い回す回帰）"
+    );
+}
+
+/// マッチャが、まだ `FlushAckSent` が届いていない未完了の世代番号に対する
+/// `BarrierRequested` の重複も検出できることを確認する（REPAIR-12・IO-2。
+/// ACK 完了の有無によらず、同一世代番号の 2 度目のバリア要求自体を
+/// 拒否対象とする）。
+#[test]
+fn repair_12_scaffold_matcher_rejects_duplicate_barrier_request_before_ack() {
+    let duplicate_barrier_before_ack = [
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::BarrierRequested { generation: 1 },
+    ];
+    assert_eq!(
+        flush_ack_follows_persistence(&duplicate_barrier_before_ack),
+        FlushAckVerdict::GenerationReused { generation: 1 },
+        "未完了の世代番号への重複バリア要求をマッチャが検出できていない"
     );
 }
 

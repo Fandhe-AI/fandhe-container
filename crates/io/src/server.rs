@@ -29,13 +29,25 @@
 //!
 //! - ACK フレームの送出方針・ディスク書き込み・[`crate::batch::BatchBuffer`] との
 //!   つなぎ込み（TASK-13.2.2・#822）
-//! - 同時接続数の上限・受信経路の件数や長さの検証の強化（TASK-13.4）
-//! - peer credential の検証（`SO_PEERCRED` / `getpeereid`）・所有 UID の照合
-//!   （PLUG-12 相当）: std だけでは実装できず `libc` / `nix` の依存承認が必要
+//! - 同時接続数の上限（TASK-13.4）
+//! - [`recv_limits::ReceiveLimits::admit`] の滞留件数（`pending_frames`）は本
+//!   モジュールでは常に `0` を渡す（この層は単一接続しか見えず、複数接続を
+//!   跨いだ実際の準備完了キューを持たないため）。実際のキューとの配線は
+//!   [`crate::batch::BatchBuffer`] を導入する TASK-13.2.2（#822）の責務
+//!   （`crates/io/src/recv_limits.rs` モジュール doc 参照）
+//! - peer credential の検証（`SO_PEERCRED` / `getpeereid`）: std だけでは実装
+//!   できず `libc` / `nix` の依存承認が必要（PLUG-12 の別観点。所有 UID の
+//!   照合自体は本タスクで [`imp::check_socket_owner`] により実装済み）
 //! - 送信側と受信側の分割 API（`try_clone` を使った split。TASK-12）
 //! - クライアント側の UDS 接続（`connect`）・[`crate::client::PipelineClient`]
 //!   との結合（TASK-12.2 以降）
 //! - vsock（microVM）トランスポート
+//! - bind から `0600` への chmod 完了までの短い窓（[`UdsServer::bind`] の
+//!   ドキュメンテーションコメント参照）は親ディレクトリの権限で塞ぐ設計とし、
+//!   ソケットファイル自体の一時的なモードには依存しない
+//! - `path` の直近の親ディレクトリ以外（祖先のパス要素）の symlink 検査は
+//!   行わない（[`imp::validate_parent_dir`] のドキュメンテーションコメント
+//!   参照）
 //!
 //! # SIGPIPE の前提
 //!
@@ -74,10 +86,20 @@ impl UdsServer {
     /// `path` に UDS を bind する。
     ///
     /// bind 前に親ディレクトリ（symlink でない・ディレクトリである・
-    /// group / other が書き込めない）と `path` 自体（既存パスは拒否し、
-    /// 自動 unlink はしない）を検証する（security.md の UDS 観点。
-    /// fail-closed）。bind 後はソケットファイルを `0600` にし、listener を
-    /// 非ブロッキングにする。
+    /// owner 以外に read / write / search のいずれも与えない）と `path` 自体
+    /// （既存パスは拒否し、自動 unlink はしない）を検証する（security.md の
+    /// UDS 観点。fail-closed）。bind 直後には、作成されたソケットファイルの
+    /// 所有者（bind したプロセスの実効 uid と一致する）が親ディレクトリの
+    /// 所有者と一致することも確かめ（PLUG-12・[`imp::check_socket_owner`]）、
+    /// 不一致ならソケットファイルを片付けてから拒否する。検証後はソケット
+    /// ファイルを `0600` にし、listener を非ブロッキングにする。
+    ///
+    /// # 既知の残存リスク（bind から chmod までの窓）
+    /// `UnixListener::bind` はソケットファイルの作成と listen の開始を同時に
+    /// 行うため、上記の検証・`0600` へのチャモードが完了するまでの短い間、
+    /// ソケットファイルの実効モードは umask 依存になる。親ディレクトリを
+    /// owner 専用（`0700` 以下）にする検証が実質的な防壁であり、この窓の
+    /// 間に到達できるのは親ディレクトリを辿れる者（＝ owner 本人）に限られる。
     pub fn bind(path: &Path) -> Result<Self, IoError> {
         Ok(Self {
             inner: imp::ServerInner::bind(path)?,
@@ -183,6 +205,7 @@ mod imp {
 
     use crate::error::{IoError, IoErrorCode};
     use crate::protocol::{FRAME_HEADER_LEN, Frame, FrameHeader};
+    use crate::recv_limits::ReceiveLimits;
     use crate::transport::IoTimeout;
 
     /// `WouldBlock` になった `accept` を待ち直す際の 1 回あたりの上限
@@ -191,6 +214,12 @@ mod imp {
     /// 最小限にする方針であり、本タスクの受け入れ条件は依存追加なしの
     /// std 実装を求めている）。
     const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+    /// `accept` が `ConnectionAborted`（相手が accept 完了前に切断した）を
+    /// 受け続けた場合の再試行回数の上限（REPAIR-5: 相手の応答を待つ処理は
+    /// 無期限にループしない。`deadline` 自体も毎回照合するため、この上限は
+    /// 「短時間に大量の切断が続く」病的なケースの保険）。
+    const MAX_ACCEPT_ABORT_RETRIES: u32 = 32;
 
     /// 本体読み込みを少しずつ伸ばす際の 1 回あたりの読み取り上限
     /// （申告された `body_len` が最大 64 MiB + 4 バイトでも、悪意ある相手の
@@ -204,14 +233,16 @@ mod imp {
 
     impl ServerInner {
         pub(super) fn bind(path: &Path) -> Result<Self, IoError> {
-            validate_parent_dir(path)?;
+            let parent_uid = validate_parent_dir(path)?;
             reject_existing_path(path)?;
 
             let listener = UnixListener::bind(path).map_err(map_bind_error)?;
 
-            // bind 後の後始末（chmod・nonblocking 化）が失敗したら、
-            // 作成済みのソケットファイルを片付けてからエラーを返す。
-            if let Err(err) = finish_bind(&listener, path) {
+            // bind 後の後始末（所有者検証・chmod・nonblocking 化）が失敗したら、
+            // 作成済みのソケットファイルを片付けてからエラーを返す（後始末自体の
+            // 失敗は握りつぶし、元のエラーを優先して返す。cleanup_socket_file
+            // 参照）。
+            if let Err(err) = finish_bind(&listener, path, parent_uid) {
                 cleanup_socket_file(path);
                 return Err(err);
             }
@@ -228,6 +259,7 @@ mod imp {
 
         pub(super) fn accept(&self, timeout: IoTimeout) -> Result<ConnectionInner, IoError> {
             let deadline = Instant::now() + timeout.as_duration();
+            let mut abort_retries = 0u32;
             loop {
                 match self.listener.accept() {
                     Ok((stream, _addr)) => {
@@ -251,6 +283,28 @@ mod imp {
                             ));
                         }
                         std::thread::sleep(remaining.min(ACCEPT_POLL_INTERVAL));
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                        // 相手が accept 完了前に切断しただけであり、受付ループ
+                        // 自体を終わらせる理由にはならない（REPAIR-5 の趣旨:
+                        // 一時的な相手都合で受付が止まらないようにする）。
+                        // ただし無期限にリトライしないよう、期限と回数の両方で
+                        // 打ち切る。
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            return Err(IoError::new(
+                                IoErrorCode::Timeout,
+                                "accept timed out waiting for a client connection",
+                            ));
+                        }
+                        abort_retries += 1;
+                        if abort_retries > MAX_ACCEPT_ABORT_RETRIES {
+                            return Err(IoError::new(
+                                IoErrorCode::Internal,
+                                "accept exceeded the retry limit after repeated peer \
+                                 disconnects before accept completed",
+                            ));
+                        }
                     }
                     Err(e) => {
                         return Err(IoError::new(
@@ -281,7 +335,20 @@ mod imp {
         }
     }
 
-    fn finish_bind(listener: &UnixListener, path: &Path) -> Result<(), IoError> {
+    /// bind 直後の後始末: 所有者検証（PLUG-12）→ `0600` への chmod →
+    /// listener の非ブロッキング化、の順に行う。いずれかに失敗すれば
+    /// 呼び出し元（[`ServerInner::bind`]）がソケットファイルを片付ける。
+    fn finish_bind(listener: &UnixListener, path: &Path, parent_uid: u32) -> Result<(), IoError> {
+        let socket_uid = fs::symlink_metadata(path)
+            .map_err(|e| {
+                IoError::new(
+                    IoErrorCode::Internal,
+                    format!("failed to stat the socket file after bind: {e}"),
+                )
+            })?
+            .uid();
+        check_socket_owner(socket_uid, parent_uid)?;
+
         fs::set_permissions(path, Permissions::from_mode(0o600)).map_err(|e| {
             IoError::new(
                 IoErrorCode::Internal,
@@ -297,9 +364,47 @@ mod imp {
         Ok(())
     }
 
-    /// 親ディレクトリが symlink でなく・ディレクトリであり・group / other が
-    /// 書き込めないことを確かめる（security.md の UDS 観点。fail-closed）。
-    fn validate_parent_dir(path: &Path) -> Result<(), IoError> {
+    /// ソケットファイルの所有者（`socket_uid`）が親ディレクトリの所有者
+    /// （`parent_uid`）と一致することを確かめる（PLUG-12・security.md「UDS は
+    /// 所有者・権限・symlink を検証してから bind」）。
+    ///
+    /// プロセスの実効 uid は std だけでは直接取得できないため（`libc` の
+    /// `geteuid` 相当の依存が必要）、bind 直後のソケットファイルの所有者
+    /// （自分が作成したので実効 uid と一致する）を実効 uid の代理として使う。
+    /// uid の比較自体は純粋関数に切り出し、実機で別ユーザーを用意できない
+    /// 単体テストからも具体的な uid の組で検証できるようにする
+    /// （コミット 2・項目 10）。
+    fn check_socket_owner(socket_uid: u32, parent_uid: u32) -> Result<(), IoError> {
+        if socket_uid != parent_uid {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!(
+                    "socket file owner (uid {socket_uid}) does not match the parent \
+                     directory owner (uid {parent_uid})"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 親ディレクトリが symlink でなく・ディレクトリであり・owner 以外に
+    /// read / write / search のいずれも与えていないことを確かめる
+    /// （security.md の UDS 観点。fail-closed）。検証に成功した場合は
+    /// [`finish_bind`] の所有者照合で使う親ディレクトリの uid を返す。
+    ///
+    /// `0o077` まで絞る理由: bind 直後から `0600` への chmod が完了するまでの
+    /// 短い間、ソケットファイル自体のモードは umask 依存で緩くなりうる
+    /// （[`UdsServer::bind`] のドキュメンテーションコメント参照）。ソケットは
+    /// 最終的に owner 専用になるため、親ディレクトリを owner 専用にしても
+    /// 正当な用途を妨げない一方、この窓を親ディレクトリの権限で実質的に塞げる。
+    ///
+    /// 直近の親ディレクトリのみを検査し、祖先のパス要素（親の親など）の
+    /// symlink は検査しない（`Path::parent()` はパスを正規化しないため、
+    /// 祖先を辿るには `canonicalize` 相当の解決が必要になるが、macOS の
+    /// `/tmp` が `/private/tmp` への symlink であるように、canonicalize 結果を
+    /// 素朴に比較する方式は環境依存の誤判定を生みやすく採らない。範囲外として
+    /// `server.rs` モジュール doc に明記する）。
+    fn validate_parent_dir(path: &Path) -> Result<u32, IoError> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -327,13 +432,14 @@ mod imp {
                 "parent path of the socket path is not a directory",
             ));
         }
-        if meta.mode() & 0o022 != 0 {
+        if meta.mode() & 0o077 != 0 {
             return Err(IoError::new(
                 IoErrorCode::InvalidArgument,
-                "parent directory of the socket path must not be group- or other-writable",
+                "parent directory of the socket path must not grant access to \
+                 non-owner users",
             ));
         }
-        Ok(())
+        Ok(meta.uid())
     }
 
     /// 既存パス（ファイル・symlink・古いソケット等）を拒否する。任意のファイルを
@@ -386,8 +492,19 @@ mod imp {
         }
 
         /// `crate::protocol` の「ストリーム読みの手順」（1: 固定長ヘッダを読む→
-        /// 2: `FrameHeader::from_bytes` で検証→3: 検証済みの `body_len` を
-        /// 上限に本体を読む→4: `Frame::decode_body` に渡す）どおりに実装する。
+        /// 2: `FrameHeader::from_bytes` で検証→3: `ReceiveLimits::admit` で
+        /// 確保前の受理判定→4: 検証済みの `body_len` を上限に本体を読む→
+        /// 5: `Frame::decode_body` に渡す）どおりに実装する。
+        ///
+        /// `ReceiveLimits::admit` に渡す滞留件数（`pending_frames`）は常に
+        /// `0` にする。この層は単一接続の送受信のみを担い、複数接続を跨いだ
+        /// 実際の準備完了キューを持たないため（本ファイルのモジュール doc
+        /// 「範囲外」節・`crates/io/src/recv_limits.rs` モジュール doc
+        /// 参照）。したがってここで効くのは `ReceiveLimits` のペイロード長
+        /// 上限（`Write` は `BatchConfig` 由来の設定上限、制御フレームは
+        /// `MAX_CONTROL_PAYLOAD_LEN`）の確保前検証のみであり、滞留件数上限の
+        /// 実効化は TASK-13.2.2（#822）が `BatchBuffer` を配線した時点で
+        /// 初めて機能する。
         pub(super) fn recv_frame(&mut self, timeout: IoTimeout) -> Result<Frame, IoError> {
             let deadline = Instant::now() + timeout.as_duration();
 
@@ -400,10 +517,11 @@ mod imp {
             )?;
 
             let header = FrameHeader::from_bytes(header_bytes)?;
+            let admitted = ReceiveLimits::default().admit(header, 0)?;
 
-            let body = read_body_until(&mut self.stream, header.body_len(), deadline)?;
+            let body = read_body_until(&mut self.stream, admitted.body_len(), deadline)?;
 
-            Frame::decode_body(header, &body)
+            admitted.decode_body(&body)
         }
     }
 
@@ -422,9 +540,16 @@ mod imp {
         Ok(deadline - now)
     }
 
-    /// `io::Error` を `IoError` へ変換する（3.3 節の対応表）。相手から届いた
-    /// データを message に含めず、`ErrorKind` 程度の情報のみを載せる
-    /// （security.md「情報漏えい」観点）。
+    /// `io::Error` を `IoError` へ変換する（`crate::error` の `IoErrorCode`・
+    /// ERR-1 対応）。相手から届いたデータを message に含めず、`ErrorKind`
+    /// 程度の情報のみを載せる（security.md「情報漏えい」観点）。
+    ///
+    /// `WouldBlock` / `TimedOut` もここでは `Timeout` に写像するが、
+    /// `read_exact_until` / `read_body_until` / `write_all_until` は
+    /// これらのエラーを本関数に渡さず、`remaining_or_timeout` によるフレーム
+    /// 全体の期限の再計算へループを戻す（REPAIR-5・項目 4）。テスト
+    /// （`task13_2_1_map_io_error_maps_would_block_and_timed_out_to_timeout`）
+    /// のために写像自体はここに残す。
     fn map_io_error(e: io::Error) -> IoError {
         match e.kind() {
             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
@@ -473,7 +598,21 @@ mod imp {
                     ));
                 }
                 Ok(n) => filled += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // 個々の read 呼び出しの期限切れ（`WouldBlock` /
+                    // `TimedOut`）では即座に諦めず、`remaining_or_timeout` に
+                    // よるフレーム全体の期限の再計算へループを戻す
+                    // （REPAIR-5）。期限を過ぎていれば次の周回の先頭で
+                    // `remaining_or_timeout` が `Timeout` を返す。
+                    continue;
+                }
                 Err(e) => return Err(map_io_error(e)),
             }
         }
@@ -516,7 +655,17 @@ mod imp {
                         body.extend_from_slice(read);
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // read_exact_until と同じ理由でループを戻す（REPAIR-5）。
+                    continue;
+                }
                 Err(e) => return Err(map_io_error(e)),
             }
         }
@@ -553,7 +702,17 @@ mod imp {
                     ));
                 }
                 Ok(n) => written += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // read_exact_until と同じ理由でループを戻す（REPAIR-5）。
+                    continue;
+                }
                 Err(e) => return Err(map_io_error(e)),
             }
         }
@@ -628,6 +787,7 @@ mod imp {
     use crate::protocol::Frame;
     use crate::transport::IoTimeout;
 
+    #[derive(Debug)]
     pub(super) enum ServerInner {}
 
     impl ServerInner {
@@ -647,6 +807,7 @@ mod imp {
         }
     }
 
+    #[derive(Debug)]
     pub(super) enum ConnectionInner {}
 
     impl ConnectionInner {

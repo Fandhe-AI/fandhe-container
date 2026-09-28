@@ -377,6 +377,13 @@ where
 /// ループは常にエラーで終わる（[`WritebackReport`] 参照）。終了時、
 /// [`BatchBuffer`] に残っていた滞留フレームは書き込まずに破棄し件数を
 /// [`WritebackStats::discarded_pending_frames`] へ残す（D5）。
+///
+/// `config` は [`crate::settings::WritebackSettings::batch_config`] から
+/// 渡し、対応する [`crate::server::UdsServer::bind`] には同じ
+/// [`crate::settings::WritebackSettings`] インスタンスの
+/// [`crate::settings::WritebackSettings::receive_limits`] を渡すことを推奨する
+/// （TASK-13.3・#78。両者を別々の設定値から個別に構築すると、受信ゲートと
+/// 集約ロジックのバッチサイズが食い違う経路を作れてしまう）。
 pub fn serve_connection<T, W>(
     conn: &mut T,
     config: BatchConfig,

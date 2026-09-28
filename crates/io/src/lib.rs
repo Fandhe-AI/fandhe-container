@@ -27,6 +27,9 @@
 //! 本体バッファ確保前に上限検証する受理判定ゲート
 //! （[`recv_limits::ReceiveLimits`]・TASK-13.4・#796）も持つ。UDS 受信ループの
 //! 受付ループ（accept → 次の accept）・同時接続数の上限は後続 sub-issue が担う。
+//! `--batch-size` 相当の設定 API（CLI / 設定の文字列から検証済み
+//! [`batch::BatchConfig`] と [`recv_limits::ReceiveLimits`] を単一の入口から
+//! 導く）は [`settings`] モジュール（TASK-13.3・#78）が提供する。
 //!
 //! PLUG-1 区分は core（`fandhe-container-plugin` の境界機構とは別に、コアの一部として
 //! 直接リンクされる）。crate 名 `fandhe-container-io` は
@@ -43,6 +46,7 @@ pub mod payload;
 pub mod protocol;
 pub mod recv_limits;
 pub mod server;
+pub mod settings;
 mod sys;
 pub mod transport;
 pub mod writeback;
@@ -75,6 +79,10 @@ pub use recv_limits::{
     AdmittedHeader, MAX_CONTROL_PAYLOAD_LEN, MAX_RECV_PENDING_FRAMES, ReceiveLimits,
 };
 pub use server::{UdsConnection, UdsServer};
+pub use settings::{
+    BATCH_SIZE_OPTION, BATCH_SIZE_SETTING_KEY, MAX_BATCH_SIZE_ARG_LEN, WritebackSettings,
+    parse_batch_size,
+};
 pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, WireFrame,
 };

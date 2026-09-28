@@ -41,8 +41,13 @@
 //!
 //! # FLUSH フレームの扱い（D4。FlushAck は偽装しない）
 //!
-//! [`FrameKind::Flush`] を受信すると、[`crate::batch::BatchBuffer::take_pending`]
-//! で件数未達のまま滞留していた分を取り出して書き込み、通常 ACK を返した後、
+//! [`FrameKind::Flush`] を受信すると、まず [`decode_request`] で形式
+//! （request id がちょうど 8 バイト・body が空）を検証する（Codex #822
+//! レビュー指摘。`Write` と同じ検証を経ないまま `take_pending` へ進むと、
+//! request id 欠如や余分な body を持つ不正な Flush までバリアとして働き、
+//! クライアントが ACK していない保留分を誤って確定させてしまうため）。
+//! 検証を通ったら [`crate::batch::BatchBuffer::take_pending`] で件数未達の
+//! まま滞留していた分を取り出して書き込み、通常 ACK を返した後、
 //! **FlushAck は送らずに** [`crate::error::IoErrorCode::Unimplemented`] で
 //! 処理を終える。FLUSH ACK は永続化の保証（IO-2）であり、`syncfs` を呼ばずに
 //! 返すと契約違反になるため（fail-closed）。呼び出し側は接続を閉じる。
@@ -94,7 +99,7 @@
 //! 別 sub-issue（要起票。`server.rs` モジュール doc 参照）が担う。
 
 use std::fs::File;
-use std::io::{self, Write as _};
+use std::io::{self, Seek as _, SeekFrom, Write as _};
 
 use crate::batch::{Batch, BatchBuffer, BatchConfig, PushOutcome};
 use crate::error::{IoError, IoErrorCode};
@@ -112,6 +117,21 @@ pub struct SinkWriteReport {
     pub frames_written: usize,
     /// このバッチで書き込んだ body の合計バイト数。
     pub bytes_written: u64,
+}
+
+impl SinkWriteReport {
+    /// `frames_written`・`bytes_written` から [`SinkWriteReport`] を作る。
+    ///
+    /// `#[non_exhaustive]` によりフィールドが `pub` でも構造体リテラルでは
+    /// crate 外から組み立てられないため、[`BatchSink`] を crate 外で実装する
+    /// 側（公開拡張点。coding-rust「crate 境界」参照）が `write_batch` の
+    /// 戻り値を作るための唯一の入口として用意する。
+    pub fn new(frames_written: usize, bytes_written: u64) -> Self {
+        Self {
+            frames_written,
+            bytes_written,
+        }
+    }
 }
 
 /// バッチをディスク（または他の永続先）へ書き込む抽象（D1）。
@@ -143,9 +163,28 @@ pub struct AppendFileSink {
 
 impl AppendFileSink {
     /// 追記先の `file` から sink を作る。`file` は呼び出し側が書き込みモードで
-    /// 開いたものとする（既存内容の扱いは呼び出し側の責務）。
-    pub fn new(file: File) -> Self {
-        Self { file }
+    /// 開いたものとする。
+    ///
+    /// # 末尾への位置合わせ（Codex #822 レビュー指摘）
+    ///
+    /// `AppendFileSink` は「到着順に追記する」契約（構造体ドキュメント参照）を
+    /// 持つが、`file` を `OpenOptions::write(true)`（`append(true)` を付けずに）
+    /// で開んだだけでは書き込み位置が既定でファイル先頭になり、`write_batch`
+    /// の `write_all` が既存内容を上書きしてしまう。呼び出し側がどちらの
+    /// モードで開いたかに関わらず追記契約を満たせるよう、ここで明示的に
+    /// `SeekFrom::End(0)` へ位置合わせしてから返す（OS の `O_APPEND` に頼ると
+    /// 各書き込みがアトミックに末尾へ移動する一方、通常モードでは `seek` は
+    /// 一度きりで以後は逐次書き込みに委ねる違いがあるが、本 sink は単一の
+    /// `serve_connection` ループからのみ使われ他プロセスとの競合書き込みを
+    /// 想定しないため、この違いは契約上問題にならない）。
+    pub fn new(mut file: File) -> Result<Self, IoError> {
+        file.seek(SeekFrom::End(0)).map_err(|err| {
+            IoError::new(
+                IoErrorCode::Internal,
+                format!("failed to seek to end of file ({:?})", err.kind()),
+            )
+        })?;
+        Ok(Self { file })
     }
 
     /// 内部の [`File`] を参照で取り出す（TASK-15.2.2・#824 が `fsync` /
@@ -209,10 +248,7 @@ impl BatchSink for AppendFileSink {
             })?;
         }
 
-        Ok(SinkWriteReport {
-            frames_written,
-            bytes_written,
-        })
+        Ok(SinkWriteReport::new(frames_written, bytes_written))
     }
 }
 
@@ -406,6 +442,16 @@ where
                 }
             }
             FrameKind::Flush => {
+                // Codex #822 レビュー指摘: Write と同様、`decode_request` で
+                // 形式（request id ちょうど 8 バイト・body 空）を検証してから
+                // 滞留分（`buffer.take_pending()`）へ触れる。request id が
+                // 欠けている・余分な body を持つ不正な Flush をバリアとして
+                // 扱うと、クライアントが ACK していない書き込みを誤って
+                // 確定させてしまうため（D5 の fail-closed と一貫させる）。
+                if let Err(err) = decode_request(&frame) {
+                    return finish(stats, &buffer, err);
+                }
+
                 if let Some(batch) = buffer.take_pending()
                     && let Err(err) =
                         write_batch_and_ack(conn, sink, &batch, timeouts.send, &mut stats)
@@ -562,10 +608,9 @@ mod tests {
                 frames_written += 1;
                 bytes_written += envelope.body().len() as u64;
             }
-            Ok(SinkWriteReport {
-                frames_written,
-                bytes_written,
-            })
+            // `SinkWriteReport::new` を使う（crate 外実装が使う唯一の構築経路
+            // であることの回帰確認を兼ねる。Bugbot #822 レビュー指摘）。
+            Ok(SinkWriteReport::new(frames_written, bytes_written))
         }
     }
 
@@ -622,6 +667,49 @@ mod tests {
         assert_eq!(report.stats.discarded_pending_frames, 0);
         assert_eq!(report.end.code(), IoErrorCode::Unimplemented);
         assert!(conn.sent.iter().all(|frame| frame.kind() == FrameKind::Ack));
+    }
+
+    /// IO-1・REPAIR-2（Codex #822 レビュー指摘）: request id を持たない
+    /// （空ペイロードの）Flush は `decode_request` に拒否され
+    /// `InvalidArgument` で終わる。滞留していた Write はバリアとして
+    /// 書き込まれず（`sink.calls == 0`）、ACK も送らず破棄される
+    /// （`discarded_pending_frames`）。
+    #[test]
+    fn io1_writeback_rejects_malformed_flush_without_touching_pending() {
+        let malformed_flush =
+            Frame::new(FrameKind::Flush, Vec::new()).expect("empty payload must construct");
+        let frames = vec![write_frame(0, b"a"), malformed_flush];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = FakeSink::new();
+        let config = BatchConfig::new(4).expect("4 must be valid");
+
+        let report = serve_connection(&mut conn, config, &mut sink, timeouts());
+
+        assert_eq!(report.stats.acks_sent, 0);
+        assert_eq!(sink.calls, 0, "malformed flush must not trigger a write");
+        assert_eq!(report.stats.discarded_pending_frames, 1);
+        assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
+    }
+
+    /// IO-1・REPAIR-2（Codex #822 レビュー指摘）: request id に続けて余分な
+    /// body を持つ Flush も同様に `InvalidArgument` で拒否される。
+    #[test]
+    fn io1_writeback_rejects_flush_with_extra_body_without_touching_pending() {
+        let mut payload = 7u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(b"unexpected-body");
+        let malformed_flush =
+            Frame::new(FrameKind::Flush, payload).expect("payload must construct");
+        let frames = vec![write_frame(0, b"a"), malformed_flush];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = FakeSink::new();
+        let config = BatchConfig::new(4).expect("4 must be valid");
+
+        let report = serve_connection(&mut conn, config, &mut sink, timeouts());
+
+        assert_eq!(report.stats.acks_sent, 0);
+        assert_eq!(sink.calls, 0, "malformed flush must not trigger a write");
+        assert_eq!(report.stats.discarded_pending_frames, 1);
+        assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
     }
 
     /// IO-1・D5: `batch_size = 4` で 2 件送って EOF（`Unavailable`）になると、
@@ -733,7 +821,7 @@ mod tests {
             .open(&path)
             .expect("must open output file");
 
-        let mut sink = AppendFileSink::new(file);
+        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
         let mut buffer = BatchBuffer::new(BatchConfig::new(2).expect("2 must be valid"));
         let batch = match buffer
             .push(write_frame(0, b"ab"))
@@ -762,6 +850,55 @@ mod tests {
         assert_eq!(contents, b"abcd");
 
         let _ = sink.into_inner();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex #822 レビュー指摘: `file` を `truncate(false)`（かつ `append(true)`
+    /// を付けない）`write(true)` で開いた既存ファイルへ `AppendFileSink::new`
+    /// を渡しても、`write_batch` は先頭から上書きせず既存内容の末尾へ追記する
+    /// （追記契約〔構造体ドキュメント〕の回帰確認）。
+    #[test]
+    fn append_file_sink_appends_after_existing_content_without_append_mode() {
+        let dir = std::env::temp_dir().join(format!(
+            "fcio-writeback-existing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("must create temp dir");
+        let path = dir.join("out.bin");
+        std::fs::write(&path, b"existing").expect("must seed existing content");
+
+        // `append(true)` を付けず、`truncate` もしない（=呼び出し側が
+        // 追記の作法を守らなくても `AppendFileSink::new` 自身が末尾へ
+        // 位置合わせすることの確認）。
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("must open existing output file");
+
+        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut buffer = BatchBuffer::new(BatchConfig::new(1).expect("1 must be valid"));
+        let batch = match buffer
+            .push(write_frame(0, b"-new"))
+            .expect("push must succeed")
+        {
+            PushOutcome::Ready(batch) => batch,
+            other => panic!("expected Ready with batch_size=1, got {other:?}"),
+        };
+
+        let report = sink.write_batch(&batch).expect("write_batch must succeed");
+        assert_eq!(report.frames_written, 1);
+        assert_eq!(report.bytes_written, 4);
+
+        let contents = std::fs::read(&path).expect("must read output file");
+        assert_eq!(
+            contents, b"existing-new",
+            "write_batch must append after existing content, not overwrite it from offset 0"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

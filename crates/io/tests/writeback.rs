@@ -188,7 +188,7 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file);
+        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
 
         // serve_connection はエラーで終わるまでブロックするため、別スレッドで
         // 動かし、64 件ぶんの ACK を読み終えたクライアントスレッドと合流する
@@ -279,7 +279,7 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file);
+        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
 
         let config = BatchConfig::new(8).expect("8 must be a valid batch size");
         let server_thread = std::thread::spawn(move || {
@@ -328,7 +328,17 @@ mod unix {
                 let mut header = [0u8; fandhe_container_io::FRAME_HEADER_LEN];
                 match stream.read_exact(&mut header) {
                     Ok(()) => {}
-                    Err(_) => break, // EOF（サーバーが接続を閉じた）
+                    // `read_exact` が返すエラーのうち、サーバーが接続を正常に
+                    // 閉じた場合（EOF）だけを `UnexpectedEof` として区別する
+                    // （Codex #822 レビュー指摘）。読み取りタイムアウト
+                    // （`WouldBlock` / `TimedOut`。サーバーが ACK を送らずに
+                    // ハングするバグの兆候）まで一律に「接続が閉じた」扱いに
+                    // すると、その種のバグを見逃したままテストが成功してしまう
+                    // ため、それ以外の種別は panic させて検出可能にする。
+                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => panic!(
+                        "unexpected error while reading response header (not a clean EOF): {err}"
+                    ),
                 }
                 let parsed_header =
                     FrameHeader::from_bytes(header).expect("response header must be valid");
@@ -353,7 +363,7 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file);
+        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
 
         let report = serve_connection(
             &mut connection,
@@ -400,10 +410,20 @@ mod unix {
                 .write_all(&malformed.encode())
                 .expect("client write must succeed");
 
-            // サーバーは ACK を送らずに接続を閉じる。読み取りが即座に EOF /
-            // エラーになることを確認する。
+            // サーバーは ACK を送らずに接続を閉じる。読み取りが即座に EOF
+            // （`Ok(0)`）になることを確認する。`unwrap_or(0)` で読み取り
+            // エラー全般を「0 バイト」に丸めると、読み取りタイムアウト
+            // （サーバーが応答をハングさせるバグの兆候）まで「EOF が来た」
+            // という誤った成功として扱ってしまうため、エラーは区別せず
+            // panic させる（Codex #822 レビュー指摘。Ok(0) だけを接続終了と
+            // みなす）。
             let mut buf = [0u8; 1];
-            stream.read(&mut buf).unwrap_or(0)
+            match stream.read(&mut buf) {
+                Ok(n) => n,
+                Err(err) => {
+                    panic!("unexpected error while confirming no ack bytes were sent: {err}")
+                }
+            }
         });
 
         let mut connection = server
@@ -416,7 +436,7 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file);
+        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
 
         let report = serve_connection(
             &mut connection,

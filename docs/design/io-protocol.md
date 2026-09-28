@@ -3,10 +3,10 @@
 `fandhe-container-io`（`crates/io`）が提供するフレーム全体型（[`Frame`](../../crates/io/src/protocol.rs)）のバイトレイアウト・採用したチェックサムアルゴリズムの根拠・newtype 設計方針・IO-1 / REPAIR-2 対応表を記録する。
 
 - 対象ビヘイビア: IO-1（ホスト⇔ゲスト間のファイル共有プロトコル）・REPAIR-2（壊れた値を表現できない型）・REPAIR-5（タイムアウト保護・エラー後の接続再利用禁止）・REPAIR-6（整合性テスト）
-- 関連タスク: TASK-11.1（#68）・TASK-11.2（#69。ヘッダ newtype）・TASK-11.3（#70。チェックサム付きフレーム型）・TASK-11.4（#71。本節以降）・TASK-12.1（#73。送信キュー）・TASK-12.2（#74。ペイロード形式・ACK 受信）・TASK-13.1（#76。バッチ集約バッファ）・TASK-13.2.1（#820。UDS サーバー側トランスポート）・TASK-13.2.2（#822。バッチ write-back の実行・ACK 返却）・TASK-13.3（#78。バッチサイズ設定 API）・TASK-13.4（#796。受信フレームの受理判定ゲート）・TASK-83.1（#116。BREAK-2 相当のワイヤーレベル検出テスト）・TASK-83.2（#117。デコード時の範囲外長さ検証の強化とアロケーション前拒否のテスト）。ヘッダ拡張（version・header_crc）・接続再利用契約は TASK-12・TASK-13 着手前の設計レビュー（2026-09-28 オーナー決定・#67・#115）による
+- 関連タスク: TASK-11.1（#68）・TASK-11.2（#69。ヘッダ newtype）・TASK-11.3（#70。チェックサム付きフレーム型）・TASK-11.4（#71。本節以降）・TASK-12.1（#73。送信キュー）・TASK-12.2（#74。ペイロード形式・ACK 受信）・TASK-13.1（#76。バッチ集約バッファ）・TASK-13.2.1（#820。UDS サーバー側トランスポート）・TASK-13.2.2（#822。バッチ write-back の実行・ACK 返却）・TASK-13.3（#78。バッチサイズ設定 API）・TASK-13.4（#796。受信フレームの受理判定ゲート）・TASK-15.1（#85。FLUSH バリア API 型定義・通常 ACK との区別）・TASK-83.1（#116。BREAK-2 相当のワイヤーレベル検出テスト）・TASK-83.2（#117。デコード時の範囲外長さ検証の強化とアロケーション前拒否のテスト）。ヘッダ拡張（version・header_crc）・接続再利用契約は TASK-12・TASK-13 着手前の設計レビュー（2026-09-28 オーナー決定・#67・#115）による
 - 関連ビヘイビア: IO-2（Flush / FlushAck 種別）・REPAIR-5（`IoTimeout`。無期限待ちを型で表現しない）
 - 対象マイルストーン: MS-1
-- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）、TASK-12.1 で追加した送信キュー（`SendQueue`・`PipelineClient`）、TASK-12.2 で追加したペイロード内部レイアウト（[`crates/io/src/payload.rs`](../../crates/io/src/payload.rs)）と ACK 受信・対応付け（`PipelineClient::recv_ack`）、TASK-13.2.1（#820）で追加した UDS サーバー側トランスポート（[`UdsServer`・`UdsConnection`](../../crates/io/src/server.rs)。Linux / macOS）、TASK-13.2.2（#822）で追加したバッチ write-back の実行と通常 ACK 返却（[`serve_connection`・`AppendFileSink`](../../crates/io/src/writeback.rs)）、TASK-13.3（#78）で追加したバッチサイズ設定 API（[`parse_batch_size`・`WritebackSettings`](../../crates/io/src/settings.rs)）に加え、2026-09-28 の設計レビュー（TASK-12・TASK-13 着手前に P1 として指摘・オーナー決定で先行対応）で追加したヘッダの `version`・`header_crc` フィールドと、エラー後の接続再利用禁止契約を記録する。クライアント側の UDS 接続との本番結合・FLUSH ACK の返却・Windows のトランスポートは後続 sub-issue が本書へ追記する
+- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）、TASK-12.1 で追加した送信キュー（`SendQueue`・`PipelineClient`）、TASK-12.2 で追加したペイロード内部レイアウト（[`crates/io/src/payload.rs`](../../crates/io/src/payload.rs)）と ACK 受信・対応付け（`PipelineClient::recv_ack`）、TASK-13.2.1（#820）で追加した UDS サーバー側トランスポート（[`UdsServer`・`UdsConnection`](../../crates/io/src/server.rs)。Linux / macOS）、TASK-13.2.2（#822）で追加したバッチ write-back の実行と通常 ACK 返却（[`serve_connection`・`AppendFileSink`](../../crates/io/src/writeback.rs)）、TASK-13.3（#78）で追加したバッチサイズ設定 API（[`parse_batch_size`・`WritebackSettings`](../../crates/io/src/settings.rs)）、TASK-15.1（#85）で追加した FLUSH バリア API の ACK 型分離（[`barrier`](../../crates/io/src/barrier.rs) モジュールの `WriteAck`・`FlushAck`・`FlushBarrier`・`AckReceipt`、`PipelineClient::flush`）に加え、2026-09-28 の設計レビュー（TASK-12・TASK-13 着手前に P1 として指摘・オーナー決定で先行対応）で追加したヘッダの `version`・`header_crc` フィールドと、エラー後の接続再利用禁止契約を記録する。クライアント側の UDS 接続との本番結合・FLUSH ACK の返却・Windows のトランスポートは後続 sub-issue が本書へ追記する
 
 ## バイトレイアウト
 
@@ -260,9 +260,21 @@ BREAK-2 検出経路の整理:
 4. `decode_ack` の検証に失敗したら `InvalidArgument`
 5. **送信順の照合**: 受信した request id が `SendQueue::oldest()` の id と一致しなければ `InvalidArgument`。キュー内に存在するが最古でない場合は "out-of-order ack"、キューのどこにも存在しない場合は "unknown ack id" とメッセージを区別する。`SendQueue` は FIFO であり、サーバー側は送信順に ACK を返す設計（TASK-13.2）を前提とする。順序が入れ替わる必要が生じた場合は TASK-13 側で本方針を見直す
 6. 種別対応の確認: `Ack` は元が `Write` に、`FlushAck` は元が `Flush` に対応しなければならない。ずれていれば `InvalidArgument`
-7. `SendQueue::remove` で解放し、`AckReceipt`（`request()`・`ack_kind()`）を返す
+7. `crates/io/src/barrier.rs` の `AckReceipt::from_matched` で種別ごとの `AckReceipt`（`AckReceipt::Write` / `AckReceipt::Flush`）を組み立ててから `SendQueue::remove` で解放し、その `AckReceipt` を返す
 
 `FrameKind::Ack` は対応する書き込みがバッファリングされたことのみを保証し（IO-1）、`FrameKind::FlushAck` はそのバリア以前に受理したすべての書き込みが永続化済みであることを保証する（IO-2）。送信順照合はどちらの種別でも同じ規則（キュー先頭との一致）を使い、この保証範囲の違いと矛盾しない。
+
+### ACK 種別の型による区別（TASK-15.1・IO-2・#85）
+
+`recv_ack` が返す `AckReceipt` は、以前は `{ request: InFlightRequest, ack_kind: FrameKind }` という単一構造体で、呼び出し元が `ack_kind()` を確認して種別を判別する形だった。これだと確認を怠った呼び出し元が、永続化を保証しない通常 ACK（IO-1）を永続化済み（IO-2）として扱えてしまう（データ損失。ERR-3 `DATA_LOSS`）。`crates/io/src/barrier.rs` はこれを型で分離する:
+
+- `WriteAck` / `FlushAck`: それぞれ通常 ACK・FLUSH ACK の受領記録。`request()` アクセサのみ持ち、相互変換は一切実装しない
+- `FlushAck::barrier() -> FlushBarrier`: 受信した FLUSH ACK が対応するバリアのハンドルを返す。`PipelineClient::flush(timeout) -> Result<FlushBarrier, IoError>`（`send(Flush)` の薄いラッパー）が送信直後に返す `FlushBarrier` と `PartialEq` で突き合わせられる
+- `AckReceipt`: `#[non_exhaustive] enum { Write(WriteAck), Flush(FlushAck) }`。共通アクセサ `request()` は残すが、判別用の `ack_kind()` は公開面から削除した
+- `TryFrom<AckReceipt> for FlushAck` / `for WriteAck`: 「FLUSH ACK だけを待つ」呼び出し元が型で絞り込める変換（逆種別なら `InvalidArgument`）
+- 構築経路: `WriteAck`・`FlushAck`・`AckReceipt` はいずれもフィールドが非公開で、`pub(crate)` の `AckReceipt::from_matched(request, ack_kind)` だけが生成できる。crate 外のコードは `recv_ack` に実際に受信した ACK を通す以外の方法でこれらの値を得られない（`pub(crate)` のため crate 内の他コードからは `from_matched` を直接呼べるが、`client.rs`（`recv_ack`）以外の呼び出し箇所は用意しない）
+
+未実装範囲（変更なし。REPAIR-3）: サーバー側で FLUSH バリア以前の書き込みを実際に永続化してから FLUSH ACK を送出する処理はまだない（下記「FLUSH フレームの扱い」・TASK-15.2・#823・#824）。本節が定めるのはクライアント側の型契約のみ。
 
 ### 範囲外（後続タスク）
 

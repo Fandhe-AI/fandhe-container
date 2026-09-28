@@ -17,6 +17,11 @@
 //! [`payload`] モジュール（TASK-12.2・#74）が定める。[`client::PipelineClient::send`]
 //! はこの形式で request id を埋め込み、[`client::PipelineClient::recv_ack`]
 //! （TASK-12.2・#74）が送信順で ACK を検証・対応付けし、タイムアウト付きで待つ。
+//! `recv_ack` が返す通常 ACK と FLUSH ACK は [`barrier`] モジュール
+//! （TASK-15.1・#85・IO-1・IO-2）が別の型（[`barrier::WriteAck`] /
+//! [`barrier::FlushAck`]）として区別し、取り違えをコンパイル時に検出できる
+//! ようにする。[`client::PipelineClient::flush`] は FLUSH フレームを送信し、
+//! [`barrier::FlushBarrier`] を返す。
 //! [`batch::BatchBuffer`] は受信した `Write` フレームを既定 64 件（設定可能）単位で
 //! 集約するメモリ内ロジックのみを提供する。その集約結果を実際にディスクへ書き込み、
 //! 書き込み完了後に通常 ACK を返すところまでは [`writeback`] モジュール
@@ -37,6 +42,7 @@
 //! `core → io` であり、本 crate は `fandhe-container-core` に依存しない
 //! （`docs/architecture.md`「依存関係グラフ」）。
 
+pub mod barrier;
 pub mod batch;
 mod checksum;
 pub mod client;
@@ -51,11 +57,12 @@ mod sys;
 pub mod transport;
 pub mod writeback;
 
+pub use barrier::{AckReceipt, FlushAck, FlushBarrier, WriteAck};
 pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
 };
 pub use client::{
-    AckMetrics, AckOutcome, AckReceipt, DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest,
+    AckMetrics, AckOutcome, DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest,
     LATENCY_HISTOGRAM_BUCKETS, LatencyStats, MAX_IN_FLIGHT_LIMIT, PipelineClient, RequestId,
     SendMetrics, SendOutcome, SendQueue,
 };

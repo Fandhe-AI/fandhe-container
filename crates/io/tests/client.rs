@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fandhe_container_io::{
-    Frame, FrameKind, FrameReceiver, FrameSender, InFlightLimit, IoError, IoErrorCode, IoTimeout,
-    JsonLinesSendObserver, NoopSendObserver, PipelineClient, WireRequestId, decode_request,
-    encode_ack,
+    AckReceipt, FlushAck, Frame, FrameKind, FrameReceiver, FrameSender, InFlightLimit, IoError,
+    IoErrorCode, IoTimeout, JsonLinesSendObserver, NoopSendObserver, PipelineClient, WireRequestId,
+    decode_request, encode_ack,
 };
 
 fn test_timeout() -> IoTimeout {
@@ -541,8 +541,9 @@ fn io1_recv_ack_releases_slot_so_send_can_continue() {
     assert_eq!(third.id().get(), 2);
 }
 
-/// IO-1・IO-2・TASK-12.2（#74）: `Write` → `Flush` の順に送り、`Ack` → `FlushAck`
-/// の順に受け取ると、それぞれ [`AckReceipt::ack_kind`] が対応する種別になる。
+/// IO-1・IO-2・TASK-12.2（#74）・TASK-15.1（#85）: `Write` → `Flush` の順に送り、
+/// `Ack` → `FlushAck` の順に受け取ると、それぞれ `AckReceipt` が対応する
+/// バリアント（`AckReceipt::Write` / `AckReceipt::Flush`）になる。
 #[test]
 fn io1_recv_ack_flush_ack_matches_flush() {
     let limit = InFlightLimit::new(4).expect("4 must be valid");
@@ -567,14 +568,21 @@ fn io1_recv_ack_flush_ack_matches_flush() {
     let write_receipt = client
         .recv_ack(test_timeout())
         .expect("recv_ack must accept the write ack");
-    assert_eq!(write_receipt.ack_kind(), FrameKind::Ack);
+    assert!(matches!(write_receipt, AckReceipt::Write(_)));
     assert_eq!(write_receipt.request().id().get(), write_request.id().get());
 
     let flush_receipt = client
         .recv_ack(test_timeout())
         .expect("recv_ack must accept the flush ack");
-    assert_eq!(flush_receipt.ack_kind(), FrameKind::FlushAck);
+    assert!(matches!(flush_receipt, AckReceipt::Flush(_)));
     assert_eq!(flush_receipt.request().id().get(), flush_request.id().get());
+
+    // TASK-15.1・IO-2（#85）: `AckReceipt::Flush` は `FlushAck::try_from` で
+    // `FlushAck` へ変換でき、その `barrier()` は送信した FLUSH リクエストと
+    // 対応する `FlushBarrier` になる。
+    let flush_ack =
+        FlushAck::try_from(flush_receipt).expect("AckReceipt::Flush must convert to FlushAck");
+    assert_eq!(flush_ack.barrier().id().get(), flush_request.id().get());
 }
 
 /// IO-1・TASK-12.2（#74）: 送信順 id `0, 1` のうち id `1`（キュー先頭ではない）の

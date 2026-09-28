@@ -19,6 +19,9 @@
 # `.github/workflows/ci.yml` の `bench-regression` ジョブ。
 #
 # 期待と異なる終了コード・値が 1 件でもあれば非ゼロで終了する（fail-closed）。
+# 各ケースの失敗は failures に数えて最後まで実行を続け、末尾のサマリーで判定する
+# （`set -e` 下で判定ヘルパーが非ゼロを返すと途中で打ち切られ、後続ケースと
+# サマリーが出なくなるため、ヘルパーは常に 0 を返し、ケース結果は変数で渡す）。
 
 set -euo pipefail
 
@@ -35,8 +38,9 @@ tmp_root=$(mktemp -d)
 trap 'rm -rf "$tmp_root"' EXIT
 
 # 直近の run_case で対象スクリプトが出した stdout+stderr（失敗時の診断・
-# メッセージ照合用）。
+# メッセージ照合用）と、そのケースが期待どおりだったか（1/0）。
 last_output=""
+last_case_passed=0
 
 # 失敗時の診断出力を字下げして stderr へ出す。PATH を絞ったケース（前提ツール
 # 欠如の検証）でも動くよう、sed 等の外部コマンドを使わない。
@@ -58,12 +62,15 @@ run_case() {
   last_output=$("$bash_bin" "$target_script" "$@" 2>&1) || actual=$?
   if [ "$actual" -eq "$expected" ]; then
     echo "PASS: ${name} (exit=${actual})"
+    last_case_passed=1
     return 0
   fi
   echo "FAIL: ${name} (expected exit=${expected}, actual exit=${actual})" >&2
   print_indented "$last_output"
   failures=$((failures + 1))
-  return 1
+  last_case_passed=0
+  # set -e で打ち切られないよう、失敗でも 0 を返す（結果は last_case_passed と failures）
+  return 0
 }
 
 # run_case に加えて、出力に期待する文字列が含まれることを照合する（終了コードが
@@ -75,7 +82,11 @@ run_case_msg() {
   local expected="$2"
   local needle="$3"
   shift 3
-  run_case "$name" "$expected" "$@" || return 0
+  run_case "$name" "$expected" "$@"
+  # 終了コードが違う時点で失敗は計上済み。メッセージ照合は重ねて数えない
+  if [ "$last_case_passed" -ne 1 ]; then
+    return 0
+  fi
   if [[ "$last_output" == *"$needle"* ]]; then
     echo "PASS: ${name}-message (contains '${needle}')"
   else
@@ -206,7 +217,8 @@ check_value "params-end-fsync" ".params.end_fsync" '1'
 # 前提を機械照合する）
 # --------------------------------------------------
 results_json="${tmp_root}/results.json"
-"$bash_bin" "$target_script" --from-json "${fixtures_dir}/fio-3-ok.json" --label docker_bind_mount >"$results_json"
+# 準備段階の失敗でも set -e で打ち切らず、下の round-trip 判定の FAIL として数える
+"$bash_bin" "$target_script" --from-json "${fixtures_dir}/fio-3-ok.json" --label docker_bind_mount >"$results_json" 2>/dev/null || true
 
 baseline_json="${tmp_root}/baseline.json"
 jq '{
@@ -214,7 +226,7 @@ jq '{
   metrics: (.metrics | with_entries(.value += {direction: (
     if (.key | test("_iops$")) then "higher_is_better" else "lower_is_better" end
   )}))
-}' "$results_json" >"$baseline_json"
+}' "$results_json" >"$baseline_json" 2>/dev/null || true
 
 roundtrip_actual=0
 roundtrip_output=$(bash "$bench_check_script" "$baseline_json" "$results_json" 2>&1) || roundtrip_actual=$?

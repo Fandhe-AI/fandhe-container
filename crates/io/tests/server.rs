@@ -343,6 +343,81 @@ mod unix {
         assert_eq!(err.code(), IoErrorCode::Unavailable);
     }
 
+    /// IO-1・REPAIR-5・#820（PR #1113 の macOS CI 失敗の修正）: client が完全な
+    /// フレームを 2 件送り切ってから close しても、server は受信バッファに残った
+    /// 2 件とも受信でき、3 回目の `recv_frame` で `Unavailable` になる。
+    ///
+    /// macOS では相手の close 後に `set_read_timeout` が `EINVAL` を返すため、
+    /// 以前の実装は最初の `recv_frame` で `Unavailable` を返し、相手が最後に
+    /// 送ったフレームを失っていた（本テストはその回帰を捕まえる）。2 件にするのは、
+    /// 1 件目の受信後に blocking へ戻したソケットで 2 件目の受信が再び受信バッファの
+    /// 残りを読む経路を通すため。server が読む前に client が書き切って close
+    /// できるよう、ペイロードは macOS の UDS の既定の送信バッファ（数 KiB）より
+    /// 十分小さくする（大きいと client の write がブロックしたままになる）。
+    #[test]
+    fn io1_repair5_820_recv_reads_frames_sent_before_peer_close() {
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &socket_path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
+
+        let first_payload: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
+        let second_payload = vec![0x5a; 37];
+        let first =
+            Frame::new(FrameKind::Write, first_payload.clone()).expect("write frame must build");
+        let second =
+            Frame::new(FrameKind::Flush, second_payload.clone()).expect("flush frame must build");
+
+        let connect_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&connect_path).expect("client must connect");
+            stream
+                .write_all(&first.encode())
+                .expect("client must send the first frame");
+            stream
+                .write_all(&second.encode())
+                .expect("client must send the second frame");
+            drop(stream);
+        });
+        // client が送り切って close してから server が受信を始める。
+        client_thread.join().expect("client thread must not panic");
+
+        let mut connection = server
+            .accept(test_timeout(), NoopServerObserver)
+            .expect("server must accept the (already closed) client connection");
+
+        let received = connection
+            .recv_frame(test_timeout())
+            .expect("a frame sent before the peer closed must still be received");
+        assert_eq!(received.kind(), FrameKind::Write);
+        assert_eq!(received.payload(), first_payload.as_slice());
+
+        let received = connection
+            .recv_frame(test_timeout())
+            .expect("the last frame sent before the peer closed must still be received");
+        assert_eq!(received.kind(), FrameKind::Flush);
+        assert_eq!(received.payload(), second_payload.as_slice());
+
+        let started = Instant::now();
+        let err = connection
+            .recv_frame(test_timeout())
+            .expect_err("recv after the buffered frames are drained must report unavailable");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+        assert_eq!(
+            err.message(),
+            "peer closed the connection before sending a complete frame header"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "recv on a drained, peer-closed connection must not wait for the timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// TASK-13.4・IO-1（#796・#820 レビュー指摘の 0b・0 コミット項目）: 制御
     /// フレーム（`Flush`）が `MAX_CONTROL_PAYLOAD_LEN` を超える長さを申告すると、
     /// `recv_frame` は本体を読む前に `ReceiveLimits::admit` により

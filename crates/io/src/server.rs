@@ -274,16 +274,43 @@ impl<O: ServerObserver> UdsServer<O> {
         timeout: IoTimeout,
         conn_observer: C,
     ) -> Result<UdsConnection<C>, IoError> {
+        self.accept_via(conn_observer, |inner, on_event| {
+            inner.accept(timeout, on_event)
+        })
+    }
+
+    /// [`Self::accept`] の本体（観測フックへの配線と最終イベントの組み立て）。
+    ///
+    /// `inner_accept` は `imp` 層の 1 回分の受け付けを行う呼び出しで、本番
+    /// （非テスト）で呼ぶのは [`Self::accept`] のみであり、そこでは常に
+    /// `imp::ServerInner::accept`（peer credential 照合は固定の
+    /// `imp::verify_peer_credential`）を渡す。照合を差し替えた
+    /// `imp::ServerInner::accept_with` を渡すのは `imp` のテスト（`#[cfg(test)]`）
+    /// だけで、拒否 1 件ごとの通知から最終イベントまでの配線を実際のソケットで
+    /// 確かめるために使う（I4・#820 security-auditor 再監査指摘対応。SEC-4・
+    /// PLUG-12）。本関数は非公開のため、差し替えの経路が crate 外へ漏れることはない。
+    fn accept_via<C, F>(
+        &mut self,
+        conn_observer: C,
+        inner_accept: F,
+    ) -> Result<UdsConnection<C>, IoError>
+    where
+        C: ServerObserver,
+        F: FnOnce(
+            &imp::ServerInner,
+            &mut dyn FnMut(&ServerEvent<'_>),
+        ) -> AcceptAttempt<imp::ConnectionInner>,
+    {
         let started = Instant::now();
         // `observer` と `self.inner` は互いに素なフィールドの借用のため、
-        // `self.inner.accept(...)` へ渡すクロージャの中で `observer` を
+        // `inner_accept` へ渡すクロージャの中で `observer` を
         // 可変借用しても衝突しない（H1・#820 security-auditor 指摘対応。
         // peer credential 拒否の都度、`imp` 層のループから観測フックへ
         // 個別に通知するための経路。`&mut dyn FnMut` はブロックしない・
         // 借用は呼び出しの間だけという `ServerObserver::on_event` の契約を
         // そのまま伝播する）。
         let observer = &mut self.observer;
-        let attempt = self.inner.accept(timeout, &mut |event: &ServerEvent<'_>| {
+        let attempt = inner_accept(&self.inner, &mut |event: &ServerEvent<'_>| {
             observer.on_event(event);
         });
         let elapsed = started.elapsed();
@@ -611,6 +638,26 @@ mod imp {
             timeout: IoTimeout,
             on_event: &mut dyn FnMut(&ServerEvent<'_>),
         ) -> super::AcceptAttempt<ConnectionInner> {
+            self.accept_with(timeout, on_event, &mut verify_peer_credential)
+        }
+
+        /// [`Self::accept`] の本体。peer credential の照合を `verify` として
+        /// 受け取る（I4・#820 security-auditor 再監査指摘対応。SEC-4・PLUG-12）。
+        ///
+        /// 非公開（`imp` の外からは呼べない）で、本番の呼び出し元は
+        /// [`Self::accept`] だけであり、そこでは常に固定の
+        /// [`verify_peer_credential`] を渡す。別の照合を渡すのは本モジュールの
+        /// テスト（`#[cfg(test)]`）だけで、別 uid の接続を実機で用意できなくても
+        /// 「拒否 1 件ごとの通知 → 件数の加算 → 期限・上限判定 → 再試行」の配線を
+        /// 実際のソケット（同一 uid の接続）で確かめるために使う。`verify` の
+        /// 第 2 引数は bind 時点で保存した実効 uid（[`ServerInner`] の
+        /// `effective_uid`）。
+        fn accept_with(
+            &self,
+            timeout: IoTimeout,
+            on_event: &mut dyn FnMut(&ServerEvent<'_>),
+            verify: &mut dyn FnMut(&UnixStream, u32) -> Result<(), PeerCredentialRejection>,
+        ) -> super::AcceptAttempt<ConnectionInner> {
             let deadline = Instant::now() + timeout.as_duration();
             let mut abort_retries = 0u32;
             let mut credential_rejections = 0u32;
@@ -641,8 +688,7 @@ mod imp {
                         // 別のカウンタ・同じ上限（`MAX_ACCEPT_ABORT_RETRIES`）で
                         // 再試行する（H1・#820 security-auditor 指摘対応。
                         // `AcceptAttempt` のドキュメンテーションコメント参照）。
-                        if let Err(rejection) = verify_peer_credential(&stream, self.effective_uid)
-                        {
+                        if let Err(rejection) = verify(&stream, self.effective_uid) {
                             drop(stream);
                             // H3・#820 security-auditor 指摘対応: 件数の加算・
                             // 拒否の通知は、期限切れの判定より必ず先に行う
@@ -1663,6 +1709,198 @@ mod imp {
                 Some(io::ErrorKind::NotFound),
                 "no socket file may be created when the owner check fails"
             );
+        }
+
+        /// I4 のテストで観測イベントを owned な要約として記録する観測フック
+        /// （`ServerEvent` は `on_event` の間だけ有効な借用を含むため、比較に
+        /// 必要なフィールドだけを写し取る）。
+        #[derive(Default)]
+        struct RecordingObserver {
+            events: Vec<RecordedEvent>,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct RecordedEvent {
+            op: ServerOp,
+            outcome: ServerOutcome,
+            accept_aborted_retries: u32,
+            peer_credential_rejections: u32,
+            peer_uid: Option<u32>,
+            code: Option<IoErrorCode>,
+        }
+
+        impl crate::observe::ServerObserver for RecordingObserver {
+            fn on_event(&mut self, event: &ServerEvent<'_>) {
+                self.events.push(RecordedEvent {
+                    op: event.op,
+                    outcome: event.outcome,
+                    accept_aborted_retries: event.accept_aborted_retries,
+                    peer_credential_rejections: event.peer_credential_rejections,
+                    peer_uid: event.peer_uid,
+                    code: event.error.as_ref().map(|e| e.code),
+                });
+            }
+        }
+
+        /// I4 のテストで差し替える照合が返す拒否（本番の
+        /// [`verify_peer_credential`] が uid 不一致で返すものと同じ形）。
+        fn injected_rejection(peer_uid: u32, expected_uid: u32) -> PeerCredentialRejection {
+            PeerCredentialRejection {
+                peer_uid: Some(peer_uid),
+                error: IoError::new(
+                    IoErrorCode::InvalidArgument,
+                    format!(
+                        "connecting peer uid ({peer_uid}) does not match the server's \
+                         effective uid at bind time ({expected_uid})"
+                    ),
+                ),
+            }
+        }
+
+        /// accept 前に `count` 本の接続を listen キューへ積んでおく（backlog は
+        /// 33 本より十分大きい）。拒否された接続が accept 前に閉じられると
+        /// `ConnectionAborted` として別のカウンタへ乗ってしまうため、返した
+        /// `UnixStream` はテストの最後まで保持する。
+        fn connect_clients(path: &Path, count: usize) -> Vec<UnixStream> {
+            (0..count)
+                .map(|_| UnixStream::connect(path).expect("client must be able to connect"))
+                .collect()
+        }
+
+        fn injection_test_timeout() -> IoTimeout {
+            IoTimeout::new(Duration::from_secs(5)).expect("5s must be a valid IoTimeout")
+        }
+
+        /// I4・#820（security-auditor 再監査指摘対応。SEC-4・PLUG-12）: peer
+        /// credential 照合を差し替えて 3 回拒否させたあと、4 回目は本番の
+        /// [`verify_peer_credential`]（同一 uid の接続なので受理）に通す。
+        /// 拒否 1 件ごとに `RejectedPeerCredential` が通知され、件数が 1, 2, 3 と
+        /// 単調に増え、最後の Accept 成功イベントの件数が 3 と一致する。拒否した
+        /// 接続はすぐに閉じられ、クライアント側は EOF を読む。
+        #[test]
+        fn i4_sec4_plug12_accept_notifies_each_rejection_then_succeeds() {
+            const REJECTIONS: u32 = 3;
+            let dir = super::super::test_support::TempSocketDir::new();
+            let path = dir.socket_path();
+            let mut server = super::super::UdsServer::bind(
+                &path,
+                ReceiveLimits::default(),
+                RecordingObserver::default(),
+            )
+            .expect("bind must succeed in a 0700 directory owned by the test user");
+            let expected_uid = crate::sys::effective_uid();
+            let fake_peer_uid = expected_uid.wrapping_add(1);
+            let mut clients = connect_clients(&path, REJECTIONS as usize + 1);
+
+            let mut calls = 0u32;
+            let mut verify = |stream: &UnixStream, bind_uid: u32| {
+                calls += 1;
+                // 差し替えた照合にも bind 時点の実効 uid が渡る（I2）。
+                assert_eq!(bind_uid, expected_uid);
+                if calls <= REJECTIONS {
+                    Err(injected_rejection(fake_peer_uid, bind_uid))
+                } else {
+                    verify_peer_credential(stream, bind_uid)
+                }
+            };
+            let conn = server
+                .accept_via(crate::observe::NoopServerObserver, |inner, on_event| {
+                    inner.accept_with(injection_test_timeout(), on_event, &mut verify)
+                })
+                .expect("the 4th connection from the same uid must be accepted");
+            drop(conn);
+            assert_eq!(calls, REJECTIONS + 1);
+
+            let rejection = |n: u32| RecordedEvent {
+                op: ServerOp::Accept,
+                outcome: ServerOutcome::RejectedPeerCredential,
+                accept_aborted_retries: 0,
+                peer_credential_rejections: n,
+                peer_uid: Some(fake_peer_uid),
+                code: Some(IoErrorCode::InvalidArgument),
+            };
+            assert_eq!(
+                server.observer().events,
+                vec![
+                    rejection(1),
+                    rejection(2),
+                    rejection(3),
+                    RecordedEvent {
+                        op: ServerOp::Accept,
+                        outcome: ServerOutcome::Success,
+                        accept_aborted_retries: 0,
+                        peer_credential_rejections: REJECTIONS,
+                        peer_uid: None,
+                        code: None,
+                    },
+                ]
+            );
+
+            // 拒否した 3 本はサーバー側で閉じられている（EOF を読む）。
+            for client in clients.iter_mut().take(REJECTIONS as usize) {
+                client
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("set_read_timeout must succeed");
+                let mut buf = [0u8; 1];
+                let n = client
+                    .read(&mut buf)
+                    .expect("a rejected connection must be closed, not left hanging");
+                assert_eq!(n, 0);
+            }
+        }
+
+        /// I4・#820（security-auditor 再監査指摘対応。SEC-4・PLUG-12・H4）: 照合を
+        /// 常に拒否へ差し替えると、`MAX_ACCEPT_ABORT_RETRIES` を超えた
+        /// （`MAX_ACCEPT_ABORT_RETRIES + 1` 件目の）拒否で `Unavailable` を返す。
+        /// 拒否の通知は `MAX_ACCEPT_ABORT_RETRIES + 1` 回（件数 1 から順に単調
+        /// 増加）で、最後の Accept 失敗イベントは同じ件数と `Unavailable` を載せる。
+        #[test]
+        fn i4_sec4_plug12_accept_returns_unavailable_after_rejection_limit() {
+            let limit_plus_one = MAX_ACCEPT_ABORT_RETRIES + 1;
+            let dir = super::super::test_support::TempSocketDir::new();
+            let path = dir.socket_path();
+            let mut server = super::super::UdsServer::bind(
+                &path,
+                ReceiveLimits::default(),
+                RecordingObserver::default(),
+            )
+            .expect("bind must succeed in a 0700 directory owned by the test user");
+            let expected_uid = crate::sys::effective_uid();
+            let fake_peer_uid = expected_uid.wrapping_add(1);
+            let _clients = connect_clients(&path, limit_plus_one as usize);
+
+            let mut calls = 0u32;
+            let mut verify = |_stream: &UnixStream, bind_uid: u32| {
+                calls += 1;
+                Err(injected_rejection(fake_peer_uid, bind_uid))
+            };
+            let err = server
+                .accept_via(crate::observe::NoopServerObserver, |inner, on_event| {
+                    inner.accept_with(injection_test_timeout(), on_event, &mut verify)
+                })
+                .expect_err("exceeding the rejection limit must fail the accept");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+            assert_eq!(calls, limit_plus_one);
+
+            let mut expected: Vec<RecordedEvent> = (1..=limit_plus_one)
+                .map(|n| RecordedEvent {
+                    op: ServerOp::Accept,
+                    outcome: ServerOutcome::RejectedPeerCredential,
+                    accept_aborted_retries: 0,
+                    peer_credential_rejections: n,
+                    peer_uid: Some(fake_peer_uid),
+                    code: Some(IoErrorCode::InvalidArgument),
+                })
+                .collect();
+            expected.push(RecordedEvent {
+                op: ServerOp::Accept,
+                outcome: ServerOutcome::Failure,
+                accept_aborted_retries: 0,
+                peer_credential_rejections: limit_plus_one,
+                peer_uid: None,
+                code: Some(IoErrorCode::Unavailable),
+            });
+            assert_eq!(server.observer().events, expected);
         }
 
         /// I1・#820（PLUG-12）: 実効 uid が親ディレクトリの所有者と一致すれば

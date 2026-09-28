@@ -847,9 +847,9 @@ mod tests {
         assert_eq!(buffer.pending_bytes(), 8);
     }
 
-    /// P0: 1 件のフレーム単体が `max_bytes` を超える場合でも、
-    /// フレーム自体が失われたり拒否されたりはしない（分割できないため、
-    /// そのフレーム単独のバッチとして次回発火する）。
+    /// P0: 1 件のフレーム単体が `max_bytes` を超える場合、
+    /// フレームは分割できないため、追加前に `InvalidArgument` で拒否する
+    /// （バッファへは反映しない）。
     #[test]
     fn batch_buffer_rejects_single_frame_larger_than_max_bytes() {
         // P1（PR #1105 codex レビュー指摘）: `pending` が空でも、フレーム単体の

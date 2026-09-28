@@ -1,0 +1,30 @@
+{
+  "fio version": "fio-3.35",
+  "timestamp": 1700000000,
+  "jobs": [
+    {
+      "jobname": "fandhe-fio-randwrite-4k",
+      "write": {
+        "io_bytes": 0,
+        "iops": 0.0,
+        "lat_ns": {
+          "min": 0,
+          "max": 0,
+          "mean": 0.0,
+          "stddev": 0.0
+        },
+        "clat_ns": {
+          "min": 0,
+          "max": 0,
+          "mean": 0.0,
+          "stddev": 0.0,
+          "percentile": {
+            "50.000000": 0,
+            "95.000000": 0,
+            "99.000000": 0
+          }
+        }
+      }
+    }
+  ]
+}

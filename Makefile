@@ -303,6 +303,35 @@ else
 endif
 
 # --------------------------------------------------
+# fio 4K ランダム write ベンチ（TASK-25.1・IO-8・MS-1 Phase 2）
+# --------------------------------------------------
+# `scripts/fio-randwrite-4k.sh` は DB 書き込み相当の 4K ランダム write を fio で
+# 実行し、IOPS・レイテンシを機械可読形式で出力する。実機前提（fio・GNU
+# coreutils の `timeout`・Linux ホスト）のため `make ci` には含めない
+# （AGENTS.md「実機前提テスト」・.claude/rules/ci.md）。cargo を必要としないため
+# HAS_CARGO では判定しない。
+
+# 自己テスト（--from-json モード＋固定 fixture＋fio スタブで完結。fio 実機なしで
+# 動く。jq 未導入時は導入方法を案内して fail-closed で止める）。
+.PHONY: fio-bench-selftest
+fio-bench-selftest: ## fio ベンチスクリプトの自己テスト（REPAIR-12。実 fio 不要）
+	@if ! command -v jq >/dev/null 2>&1; then \
+		echo "jq is required but not found: install it (e.g. brew install jq / apt-get install jq)" >&2; \
+		exit 1; \
+	fi
+	bash scripts/fio-randwrite-4k-selftest.sh
+
+# 実機での run モード実行（fio・GNU coreutils の timeout が必要。root 権限・
+# /dev/kvm は不要）。TARGET_DIR 未指定時は案内を出して止める。
+.PHONY: fio-bench
+fio-bench: ## fio 4K ランダム write ベンチを実行する（要 fio・実機。TARGET_DIR/LABEL 必須）
+	@if [ -z "$(TARGET_DIR)" ] || [ -z "$(LABEL)" ]; then \
+		echo "usage: make fio-bench TARGET_DIR=<dir> LABEL=<label> [RUNTIME=<seconds>]" >&2; \
+		exit 2; \
+	fi
+	bash scripts/fio-randwrite-4k.sh --target-dir "$(TARGET_DIR)" --label "$(LABEL)" --runtime "$(or $(RUNTIME),30)"
+
+# --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------
 

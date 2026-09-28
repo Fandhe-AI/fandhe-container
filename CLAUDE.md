@@ -43,7 +43,7 @@ fandhe-container/
 │   ├── cli/ / stack/              #   統一 CLI / 複数コンテナ定義（TOML スキーマ・起動順）
 │   ├── compose-convert/           #   compose.yaml → TOML 片方向変換ツール（fandhe-container-compose-convert）
 │   └── plugin-*/                  #   fandhe-container-plugin-cri / -macos / -windows / -microvm / -mcp
-├── scripts/                       # ベンチ回帰比較スクリプト（TASK-86.3・REPAIR-8。scripts/testdata/ に fixture）。依存禁止判定等は（予定）
+├── scripts/                       # ベンチ回帰比較スクリプト（TASK-86.3・REPAIR-8）・fio 4K ランダム write ベンチスクリプト（TASK-25.1・IO-8。scripts/testdata/ に fixture）。依存禁止判定等は（予定）
 ├── benches/                       # crate をまたぐベンチ回帰（REPAIR-8。root の workspace メンバー crate fandhe-container-benches、publish = false。benches/benches/regression_placeholder.rs は TASK-86.3 のプレースホルダベンチ、baseline.json は暫定基準値。実ベンチ本体は TASK-113、基準値の校正は TASK-88）
 ├── docs/
 │   ├── architecture.md            # crate 境界・依存関係グラフ・確定済み設計判断の索引（TASK-6・REPAIR-3・PLUG-1）
@@ -54,6 +54,7 @@ fandhe-container/
 │   │   ├── declarative-config.md  # 宣言的起動設定の方針メモ（TASK-82・CLI-4）
 │   │   ├── small-model-repair-policy.md  # 小型モデル自己補修方針（TASK-92・REPAIR-11/13/14）
 │   │   ├── io-protocol.md         # I/O 共有層のワイヤーフレーム・チェックサム（TASK-11・IO-1・REPAIR-2）
+│   │   ├── io-fio-bench.md        # fio 4K ランダム write ベンチスクリプトの契約（TASK-25.1・IO-8）
 │   │   └── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external・ci（稼働）/ release（発火条件無効化中）

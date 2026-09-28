@@ -23,10 +23,10 @@
 //! したがって「テスト自体が無限に待たずタイムアウト秒数内で終了する」ことは
 //! 「厳密にタイムアウト未満で終わる」ではなく、**「ACK 待ちの所要時間が
 //! `timeout - ABSENT_ACK_TOLERANCE` 以上 `timeout + HANG_GUARD_GRACE` 未満で
-//! あり、シナリオ全体が二段の watchdog（準備段階は
-//! `CONNECT_RETRY_BUDGET + HANG_GUARD_GRACE`、ACK 待ち段階は
-//! `timeout + HANG_GUARD_GRACE` での `recv_timeout`）で上限を機械的に
-//! 保証されている」**と解釈する
+//! あり、シナリオ全体が二段の watchdog（準備段階は `CONNECT_RETRY_BUDGET +
+//! REQUEST_COUNT * timeout + HANG_GUARD_GRACE`、ACK 待ち段階は
+//! `timeout + HANG_GUARD_GRACE + ACK_WAIT_SCHEDULING_SLACK` での
+//! `recv_timeout`）で上限を機械的に保証されている」**と解釈する
 //! （`mod unix::repair5_missing_ack_is_detected_as_timeout` 参照）。
 //!
 //! 当初は client スレッド全体（`connect` の最大 5 秒リトライ＋送信＋
@@ -36,7 +36,9 @@
 //! ACK タイムアウト検出がハングしたかのように誤って panic し得た
 //! （cursor Bugbot 指摘・codex P2 指摘・#1124）。本ファイルは
 //! 準備段階（`connect` 完了・送信完了まで）と ACK 待ち段階を別々の期限で
-//! 管理することでこれを解消する。
+//! 管理することでこれを解消する。準備段階の期限には `connect` のリトライ
+//! 予算だけでなく、その後に行う複数件の送信（各 send は最大 `timeout` まで
+//! 掛かり得る）の予算も含める（codex P2 指摘・#1124）。
 //!
 //! タイムアウト秒数は環境変数 `FANDHE_CONTAINER_TEST_TIMEOUT_SECS` で上書きでき、
 //! 未設定時の既定値は [`DEFAULT_TEST_TIMEOUT_SECS`]（10 秒）。CI の
@@ -824,10 +826,12 @@ mod unix {
     /// 二段の watchdog を持つ:
     ///
     /// 1. 準備段階（`connect` の最大 [`CONNECT_RETRY_BUDGET`] 秒リトライ＋
-    ///    3 件の送信）は `ready_rx.recv_timeout(CONNECT_RETRY_BUDGET +
-    ///    HANG_GUARD_GRACE)` で上限を持たせる
+    ///    3 件の送信。各送信は最大 `timeout` まで掛かり得る）は
+    ///    `ready_rx.recv_timeout(CONNECT_RETRY_BUDGET + REQUEST_COUNT * timeout
+    ///    + HANG_GUARD_GRACE)` で上限を持たせる
     /// 2. ACK 待ち段階（`recv_ack(timeout)`）は
-    ///    `result_rx.recv_timeout(timeout + HANG_GUARD_GRACE)` で上限を持たせる
+    ///    `result_rx.recv_timeout(timeout + HANG_GUARD_GRACE +
+    ///    ACK_WAIT_SCHEDULING_SLACK)` で上限を持たせる
     ///
     /// のいずれも critical path 上に上限なしの `recv()` / `join()` を置かない
     /// （REPAIR-5）。当初は単一の `timeout + HANG_GUARD_GRACE` の watchdog で
@@ -867,16 +871,25 @@ mod unix {
             // 準備段階（connect・送信）完了を main 側の watchdog へ通知する。
             // 送信に失敗した場合はこのスレッドが上の unwrap_or_else で既に
             // panic しているため、ここへ到達するのは準備が成功した場合のみ。
-            // ACK 待ちの実際の開始時刻（wait_started）を通知と一緒に main
-            // 側へ渡すことで、main 側の watchdog（下記 stage 2）が「通知を
-            // 受け取った時刻」ではなく「ACK 待ちが実際に始まった時刻」を
-            // 起点に期限を計算できるようにする。通知直後に client スレッド
-            // が長くスケジューラ遅延を受けても、main 側の recv_timeout の
-            // 起点が実際の待機開始からずれないため、ACK 待ちが正常な場合に
-            // 誤ってハングと判定することがない（codex P2 指摘・#1124）。
-            let wait_started = Instant::now();
-            let _ = ready_tx.send(wait_started);
+            // 通知時刻（ready_at）は main 側の stage 2 watchdog の起点にのみ
+            // 使う。「通知を受け取った時刻」ではなく「通知を送った時刻」を
+            // 起点にすることで、通知直後に client スレッドが長くスケジューラ
+            // 遅延を受けても、main 側の recv_timeout の起点が実際の待機開始
+            // からずれないため、ACK 待ちが正常な場合に誤ってハングと判定する
+            // ことがない（codex P2 指摘・#1124）。
+            let ready_at = Instant::now();
+            let _ = ready_tx.send(ready_at);
 
+            // `elapsed`（下記の受け入れ条件 2 判定に使う所要時間）は
+            // `ready_tx.send` 完了後、`recv_ack` 呼び出し直前に改めて記録する。
+            // `ready_at` をそのまま使うと、`ready_tx.send` 自体のスケジューラ
+            // 遅延・実行時間が「ACK 待ちの所要時間」に混入し、
+            // `recv_ack` は実際には timeout どおりに返っているのに
+            // `elapsed < timeout + HANG_GUARD_GRACE`（下記）が誤ってタイムアウト
+            // 扱いされ得た（codex P2 指摘・#1124）。この 2 つの Instant は別軸
+            // （`ready_at` は main watchdog の起点、`wait_started` は elapsed の
+            // 計測起点）であり、意図的に分離している。
+            let wait_started = Instant::now();
             let first_recv_ack = client.recv_ack(timeout);
             let elapsed = wait_started.elapsed();
 
@@ -913,12 +926,21 @@ mod unix {
             )
         });
 
-        // hang guard（watchdog）その 1: 準備段階（connect のリトライ＋送信）
-        // の完了通知を、connect のリトライ予算 + 猶予を上限に待つ
+        // hang guard（watchdog）その 1: 準備段階（connect のリトライ＋
+        // REQUEST_COUNT 件の送信）の完了通知を、connect のリトライ予算 +
+        // 送信分の予算（各 send は最大 `timeout` まで掛かり得るため
+        // `REQUEST_COUNT * timeout` を加算する）+ 猶予を上限に待つ
         // （本関数 doc 参照。critical path 上に上限なしの recv() を置かない）。
-        let ready_deadline = CONNECT_RETRY_BUDGET + HANG_GUARD_GRACE;
-        let wait_started = match ready_rx.recv_timeout(ready_deadline) {
-            Ok(wait_started) => wait_started,
+        // 送信分を含めていないと、`connect` 自体は速く終わっても 3 件の送信が
+        // 詰まった場合に準備段階の完了通知が `CONNECT_RETRY_BUDGET +
+        // HANG_GUARD_GRACE` を超えて遅れ、実際にはまだ送信中（＝ハングでは
+        // ない）にもかかわらず watchdog が誤って「準備段階がハングした」と
+        // 判定し得る（codex P2 指摘・#1124）。
+        let ready_deadline = CONNECT_RETRY_BUDGET
+            + timeout.as_duration() * (REQUEST_COUNT as u32)
+            + HANG_GUARD_GRACE;
+        let ready_at = match ready_rx.recv_timeout(ready_deadline) {
+            Ok(ready_at) => ready_at,
             Err(_) => {
                 // client スレッドが準備段階中に panic した場合はここへは来ず
                 // join() 側で検出されるはずだが、二重の安全のため確認する
@@ -953,26 +975,27 @@ mod unix {
         // （REPAIR-5・本ファイル冒頭 `//!` の受け入れ条件 2 の解釈）。
         //
         // 期限は「main 側が readiness 通知を受け取った時刻」ではなく、
-        // client スレッドが送ってきた `wait_started`（ACK 待ちを実際に
-        // 開始した時刻）を起点に計算する。通知（mpsc の受信）自体の
+        // client スレッドが送ってきた `ready_at`（`ready_tx.send()` を
+        // 呼んだ時刻）を起点に計算する。通知（mpsc の受信）自体の
         // スケジューリング遅延を期限計算に混ぜると、通知直後に client
         // スレッドが長く待たされただけで ACK 待ちが正常なのに watchdog が
         // 先に期限切れになり得る（codex P2 指摘・#1124）。
         //
-        // さらに、`wait_started` は `ready_tx.send()` を挟んで `recv_ack`
-        // 呼び出しの直前に記録されるため、その送信自体で client スレッドが
-        // スケジューリング遅延を受けると、`recv_ack` が実際にブロッキング
-        // 待ちへ入る時刻は `wait_started` よりわずかに後ろへずれ得る。
+        // さらに、client スレッドは `ready_at` を送った後、`recv_ack`
+        // 呼び出し直前に改めて `wait_started`（elapsed 計測専用。下記）を
+        // 記録するため、`ready_at` から実際に `recv_ack` がブロッキング
+        // 待ちへ入る時刻までにわずかなスケジューリング遅延の余地がある。
         // この理論上の窓を `ACK_WAIT_SCHEDULING_SLACK` として明示的に
         // budget へ加算し、watchdog が「無限に待たない」安全網としてのみ
         // 機能するよう `HANG_GUARD_GRACE` 単体より広い期限にする
         // （codex P2 指摘・#1124。所要時間の精密な検証は下記の `elapsed`
-        // assert が別途担う）。
+        // assert が別途担う。`elapsed` は `ready_at` ではなく `wait_started`
+        // 起点で計測するため、この余地を含まない）。
         std::thread::spawn(move || {
             let _ = result_tx.send(client_thread.join());
         });
         let watchdog_budget = timeout.as_duration() + HANG_GUARD_GRACE + ACK_WAIT_SCHEDULING_SLACK;
-        let watchdog_deadline_instant = wait_started + watchdog_budget;
+        let watchdog_deadline_instant = ready_at + watchdog_budget;
         let remaining = watchdog_deadline_instant.saturating_duration_since(Instant::now());
         let client_result = result_rx.recv_timeout(remaining).unwrap_or_else(|_| {
             panic!(

@@ -34,7 +34,7 @@
 //! | TASK    | ビヘイビア  | 機械照合する出力仕様                                                                  | 照合方法            | 状態                          |
 //! | ------- | ----------- | -------------------------------------------------------------------------------------- | ------------------- | ----------------------------- |
 //! | TASK-13 | IO-1        | バッチサイズの既定値 64 が設定の実効値に反映されること（`batch_size=<N>`）             | 構造化 assert       | 未接続（TASK-13 で接続）      |
-//! | TASK-15 | IO-2        | 書き込み ACK と FLUSH ACK が別種別として区別され、FLUSH ACK はバリア以前の書き込みの永続化後にのみ返ること | 構造化 assert | 未接続（TASK-11 / TASK-15 で接続） |
+//! | TASK-15 | IO-2        | 書き込み ACK と FLUSH ACK が別種別として区別され、FLUSH ACK はバリア以前の書き込みの永続化後にのみ返ること（書き込み ACK（IO-1）自体の対応照合は本照合器の対象外で、TASK-12・13 の結合試験が担う） | 構造化 assert | 未接続（TASK-11 / TASK-15 で接続） |
 //! | TASK-16 | IO-10       | 未フラッシュ滞留量の上限が設定可能で、上限到達時に自動フラッシュが発行されること（`flush_every=<N>`） | 構造化 assert | 未接続（TASK-16 で接続）      |
 //! | TASK-17 | IO-2        | `docs/api/io-barrier.md` に ACK / FLUSH ACK の永続化保証の違いが明記されていること      | 文字列パターン照合  | 未接続（TASK-17 で文書作成後に接続） |
 //! | TASK-19 | IO-5        | 大文字小文字の違いのみで衝突する 2 ファイル作成が構造化エラー（`code`・`message`）で返ること | 構造化 assert  | 未接続（TASK-19 で接続）      |
@@ -109,7 +109,9 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
         task: "TASK-15",
         behavior: "IO-2",
         spec_fact: "書き込み ACK と FLUSH ACK が別種別として区別され、\
-            FLUSH ACK はバリア以前の書き込みの永続化後にのみ返ること",
+            FLUSH ACK はバリア以前の書き込みの永続化後にのみ返ること\
+            （書き込み ACK（IO-1）自体の対応照合は本照合器の対象外で、\
+            TASK-12・13 の結合試験が担う）",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
             planned_task: "TASK-11 / TASK-15",
@@ -347,6 +349,13 @@ enum AckEvent {
     PersistedBeforeBarrier { generation: u32 },
     /// 通常の書き込み ACK を送出した（IO-1・IO-2: 永続化完了を待たずに
     /// 返してよい種別。FLUSH ACK とは別種別として区別する）。
+    ///
+    /// 本照合器（[`flush_ack_follows_persistence`]）は `WriteAckSent` を
+    /// 「FLUSH ACK と取り違えていないか」の判定にのみ使い、`generation` を
+    /// 含めて無条件で許容する（Codex レビュー指摘・5 巡目 P2: 通常の
+    /// 書き込み要求と、それに対応する書き込み ACK が 1 対 1 で発行されて
+    /// いるかという IO-1 自体の対応照合は、本照合器の保証範囲に含まない。
+    /// その照合は TASK-12・13 の結合試験が担う）。
     WriteAckSent { generation: u32 },
     /// FLUSH ACK をクライアントへ送出した（`generation` に対応する
     /// バリア要求への応答。永続化完了後にのみ送出してよい）。
@@ -465,7 +474,9 @@ fn generation_state_mut<'a>(
 ///   するため、要求前の通知では保証を満たさない。
 ///   [`FlushAckVerdict::PrematureFlushAck`]）
 /// - `WriteAckSent` は永続化完了の有無を問わず許容する（IO-1・IO-2 の
-///   契約差: 通常 ACK は永続化完了を待たずに返してよい）
+///   契約差: 通常 ACK は永続化完了を待たずに返してよい。書き込み要求と
+///   書き込み ACK の対応そのものの照合は本照合器の対象外で、TASK-12・13
+///   の結合試験が担う ─ [`AckEvent::WriteAckSent`] のドキュメントを参照）
 /// - 同一の世代番号に対する 2 度目の `BarrierRequested` は
 ///   [`FlushAckVerdict::GenerationReused`] として即座に拒否する（Codex
 ///   レビュー指摘・4 巡目: 世代番号を使い捨てにしないと、1 回目のバリアの

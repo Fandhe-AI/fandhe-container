@@ -19,6 +19,23 @@
 //! こと**と定義する。同じオフセット領域への上書き競合はワイヤーで表現
 //! できないため対象外（out-of-scope-tracking で追跡）。
 //!
+//! # 「rename / truncate」の定義（TASK-14.2・#81 の範囲）
+//!
+//! ワイヤー形式はパスもオフセットも持たない（上記 D1 参照）。そこで本
+//! sub-issue（[`rename_truncate`]）のケースは、**[`fandhe_container_io::AppendFileSink`]
+//! が書き込む先のファイルに対して、呼び出し側（ホスト側）が
+//! `std::fs::rename` / `File::set_len` を実行する操作**と定義する。
+//!
+//! 操作は決定的な静止点でのみ行う。セッション境界の操作
+//! （[`rename_truncate::run_session`](rename_truncate)）は `serve_connection`
+//! の join 後（内部の [`fandhe_container_io::AppendFileSink`] が確実に閉じた
+//! 後）、ライブセッション中の操作（[`rename_truncate::LiveSession`]）は
+//! 「`batch_size` の倍数件を送り、対応する ACK をすべて受け取った直後」で
+//! 行う。ACK はバッチ書き込みの後にしか返らないため、この時点でファイル
+//! 内容は確定している（`writeback.rs` D3）。`Flush`（受信すると
+//! `serve_connection` が `Unimplemented` で終了する。D4）とクライアントの
+//! drop はセッション終了にのみ使い、`sleep` によるタイミング同期は行わない。
+//!
 //! # 実行する OS の方針
 //!
 //! [`harness::DuplexEnd`]（`std::sync::mpsc` によるメモリ内の二方向
@@ -28,10 +45,19 @@
 //! ため、実ソケット越しの並行性を追加で補強するケースは範囲外とし、
 //! out-of-scope-tracking で追跡する（`fandhe_container_io::server` モジュール
 //! doc の「範囲外」節が同じ理由で UDS 受付ループ自体を後続 sub-issue としている
-//! ことと整合させる）。
+//! ことと整合させる）。[`rename_truncate`] の 10 件も同じ [`harness::DuplexEnd`]
+//! 基盤で 3 OS すべてで動くが、1 点だけ OS 差の前提を置く: Rust std の既定
+//! `share_mode` には `FILE_SHARE_DELETE` が含まれるため、開いているファイルを
+//! **移動元**として rename するのは Windows でも成功する見込みだが、開いている
+//! ファイルへ**上書きで rename する**（atomic replace）操作は Windows では
+//! 失敗しうる。そのため atomic replace 系のケースは移動先を閉じた状態でだけ
+//! 実行する。
 
 #[path = "consistency/harness.rs"]
 mod harness;
 
 #[path = "consistency/concurrent_write.rs"]
 mod concurrent_write;
+
+#[path = "consistency/rename_truncate.rs"]
+mod rename_truncate;

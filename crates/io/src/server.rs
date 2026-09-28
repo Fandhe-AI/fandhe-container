@@ -55,12 +55,22 @@
 //! security-auditor 指摘対応）が、[`UdsServer::bind`] の時点で 1 回だけ取得して
 //! 保存した自プロセスの実効 uid（`crate::sys::effective_uid`。accept のたびに
 //! 取り直さない。I2・#820 security-auditor 再監査指摘対応）と一致することを
-//! 確かめる（`imp::verify_peer_credential`。Linux / macOS 限定の非公開関数）。接続元が user namespace の外側から見えている場合、
-//! namespace 外の uid はマッピングを持たないため
-//! `overflowuid`（Linux の既定値 `65534`）として観測されることがあり、実効 uid と
-//! 一致せず拒否されうる（H2・#820 security-auditor 指摘対応。想定内の
-//! fail-closed 挙動であり、正しい uid マッピングを持つ呼び出し元からの接続を
-//! 妨げない）。
+//! 確かめる（`imp::verify_peer_credential`。Linux / macOS 限定の非公開関数）。
+//! 接続元が user namespace の外側から見えている場合、namespace 外の uid は
+//! マッピングを持たないため `overflowuid`（Linux の既定値 `65534`）として
+//! 観測されることがあり、実効 uid と一致せず拒否されうる（H2・#820
+//! security-auditor 指摘対応。想定内の fail-closed 挙動であり、正しい uid
+//! マッピングを持つ呼び出し元からの接続を妨げない）。
+//!
+//! 比較するのは uid のみで、gid・pid・所属する user namespace は見ない。
+//! したがって、user namespace の中にいても本プロセス側から見て同じ uid に
+//! 写されるプロセス（rootless コンテナ内の root が、本プロセスを実行している
+//! ホストの非特権 uid に写されている場合等。SEC-5）は、本プロセスと同じ主体と
+//! して受理する（I6・#820 security-auditor 再監査指摘対応）。これは、ソケットの
+//! パス（とその親ディレクトリ）をコンテナへマウントしないことを前提にした
+//! 設計であり、コンテナ内のプロセスがソケットへ到達できる構成では
+//! この照合だけでは分離にならない（到達経路を塞ぐのは呼び出し側・マウント
+//! 構成の責務）。
 //!
 //! 不一致・取得失敗（対応していないアーキテクチャを含む）のいずれも拒否し
 //! （fail-closed）、拒否した接続はすぐに閉じる。1 件の不正な接続で受付ループ
@@ -262,6 +272,16 @@ impl<O: ServerObserver> UdsServer<O> {
     /// 期限を過ぎても接続が来なければ [`IoErrorCode::Timeout`] を返す
     /// （REPAIR-5: 無期限にブロックしない）。呼び出し側は次の接続を待つために
     /// 再度この関数を呼ぶ（受付ループはこのモジュールの外で組む）。
+    ///
+    /// # 返す `Unavailable` の意味（I7・#820 security-auditor 再監査指摘対応）
+    /// 本関数が [`IoErrorCode::Unavailable`] を返すのは、1 回の呼び出しの中で
+    /// `ConnectionAborted` または peer credential 拒否が再試行上限
+    /// （`imp::MAX_ACCEPT_ABORT_RETRIES`）を超えた場合で、不正・無効な接続が
+    /// 続いたことを示すだけであり、リスナー（[`UdsServer`]）自体は健全である。
+    /// 呼び出し側は同じ [`UdsServer`] で本関数を再度呼んでよい（受付ループを
+    /// 継続できる。受付ループの扱いは TASK-13.2.2・#822）。これに対し、
+    /// [`UdsConnection`] の送受信が返す `Unavailable` は、その接続が poison 済み
+    /// （P1-3）で以後使えないことを示し、再接続が必要になる。
     ///
     /// `conn_observer` は返す [`UdsConnection`] が送受信イベント
     /// （[`crate::observe::ServerOp::Recv`]・[`crate::observe::ServerOp::Send`]）を

@@ -104,7 +104,7 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 | IO-1 | ACK はバッファリング時点まで保証（永続化は非保証） | `FrameKind::Ack` の契約（ドキュメンテーションコメント） | `io1_frame_kind_round_trips_all_variants` |
 | IO-1 | ワイヤー形式の往復 | `Frame::encode` / `Frame::decode` | `io1_frame_encode_layout`・`io1_frame_round_trips_all_kinds`・`io1_frame_header_to_bytes_layout`・`io1_frame_header_from_bytes_round_trip`・`tests/protocol.rs` の `io1_public_api_frame_round_trips` |
 | IO-1 | 長さ上限の検証（DoS 対策） | `PayloadLen::new` / `FrameHeader::from_bytes` がアロケーション前に検証 | `io1_payload_len_rejects_max_plus_one`・`io1_frame_header_from_bytes_rejects_len_over_max`・`tests/protocol.rs` の `io1_public_api_frame_new_rejects_oversized_payload` |
-| REPAIR-2 | 長さ偽装（BREAK-2） | 送信側: `Frame::new` の長さ導出で表現不能。受信側: 本体長不一致（`INVALID_ARGUMENT`）またはチェックサム不一致（`DATA_LOSS`）で拒否 | `repair2_decode_detects_break2_short_declared_len`・`io1_decode_rejects_length_mismatch`・`tests/protocol.rs` の `io1_public_api_decode_rejects_length_mismatch` |
+| REPAIR-2 | 長さ偽装（BREAK-2） | 送信側: `Frame::new` の長さ導出で表現不能。受信側: 本体長不一致（`INVALID_ARGUMENT`）またはチェックサム不一致（`DATA_LOSS`）で拒否 | `repair2_decode_detects_break2_short_declared_len`・`io1_decode_rejects_length_mismatch`・`tests/protocol.rs` の `io1_public_api_decode_rejects_length_mismatch`・`tests/frame_integrity.rs`（TASK-83.1・#116。ワイヤー上の `payload_len` フィールド自体を書き換えた入力で、一括 `decode` とストリーム読みの両経路を確認: `repair2_break2_declared_len_shorter_rejected_by_decode`・`repair2_break2_declared_len_shorter_rejected_by_stream_read`・`repair2_break2_declared_len_longer_rejected_by_decode`・`repair2_break2_declared_len_longer_rejected_by_stream_read`・`repair2_break2_declared_len_zero_rejected_by_both_paths`・`repair2_break2_declared_len_over_max_rejected_by_decode`） |
 | REPAIR-2 | ビット反転・種別すり替え・チェックサム破損の検出 | CRC-32C（ヘッダ + ペイロードを対象） | `repair2_decode_rejects_flipped_payload_bit`・`repair2_decode_rejects_kind_swapped_to_valid_kind`・`repair2_decode_rejects_corrupted_checksum`・`tests/protocol.rs` の `io1_public_api_decode_rejects_corrupted_payload`・`io1_public_api_decode_rejects_corrupted_checksum` |
 | REPAIR-2 | 未知種別・切り詰めの拒否 | `FrameKind::try_from`・`Frame::decode` の `split_first_chunk` | `io1_frame_kind_rejects_unknown_bytes`・`io1_frame_header_from_bytes_rejects_unknown_kind`・`io1_decode_rejects_truncated_header`・`tests/protocol.rs` の `io1_public_api_decode_rejects_too_short_input` |
 | IO-1 | CRC 実装の正しさ | `crates/io/src/checksum.rs` の `Crc32c` | `io1_crc32c_matches_standard_check_value`・`io1_crc32c_matches_rfc3720_vectors`・`io1_crc32c_split_update_matches_single_call` |
@@ -126,7 +126,7 @@ BREAK-2 検出経路の整理:
 
 - 送信側の申告誤り（`Frame::new` を経由する限りの誤り）: 型として表現不能（`payload_len` は `payload.len()` から導出される）
 - 転送中に長さフィールドが偶発的に破損した場合（一括 `decode`。全長が既知）: `body.len()` と `payload_len + CHECKSUM_LEN` が食い違うため必ず `InvalidArgument`（`DataLoss` には至らない）
-- 転送中に長さフィールドが偶発的に破損した場合（ストリーム読み。申告された `payload_len` ぶんだけ読んでから `decode_body` へ渡す想定。TASK-12・TASK-13）: 長さ検証は申告どおりの本体長と一致するため通過し、ペイロード＋チェックサムの再計算で不一致となり `DataLoss`（`repair2_decode_detects_break2_short_declared_len` はこの経路を模している）
+- 転送中に長さフィールドが偶発的に破損した場合（ストリーム読み。申告された `payload_len` ぶんだけ読んでから `decode_body` へ渡す想定。TASK-12・TASK-13）: 長さ検証は申告どおりの本体長と一致するため通過し、ペイロード＋チェックサムの再計算で不一致となり `DataLoss`（`repair2_decode_detects_break2_short_declared_len` はこの経路を模している。`tests/frame_integrity.rs` の `stream_read_frame` ヘルパーは同じ経路を公開 API のみで再現し、申告長を短く／長く偽った両方向で確認する。TASK-83.1・#116）
 - 意図的な自己整合偽装（申告長・ペイロード・チェックサムを揃えて送出）: 本チェックサムの範囲外（真正性は別レイヤーの責務。上記「範囲外」節のとおり）
 
 ## 見直し

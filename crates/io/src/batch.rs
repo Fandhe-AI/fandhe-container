@@ -51,6 +51,12 @@ pub const DEFAULT_BATCH_SIZE: usize = 64;
 /// 見直してよい暫定値（REPAIR-3）。
 pub const MAX_BATCH_SIZE: usize = 4096;
 
+// DEFAULT_BATCH_SIZE は 1..=MAX_BATCH_SIZE の範囲内でなければならない不変条件を
+// コンパイル時に保証する（`protocol.rs` の `MAX_PAYLOAD_LEN < u32::MAX` と同種の
+// パターン）。これにより `BatchConfig::default()` 実装（`Self::new(...).expect(...)`）
+// が将来 MAX_BATCH_SIZE の変更で実行時パニックへ化けることを防ぐ。
+const _: () = assert!(DEFAULT_BATCH_SIZE >= 1 && DEFAULT_BATCH_SIZE <= MAX_BATCH_SIZE);
+
 /// [`BatchBuffer`] の集約単位（件数）を表す設定値（IO-1）。
 ///
 /// 非公開フィールドに `NonZeroUsize` を持ち、[`Self::new`] を経由しない限り
@@ -95,7 +101,9 @@ impl BatchConfig {
 impl Default for BatchConfig {
     /// IO-1 の既定値（[`DEFAULT_BATCH_SIZE`] = 64）を使う。
     fn default() -> Self {
-        // DEFAULT_BATCH_SIZE は 1..=MAX_BATCH_SIZE 範囲内の定数のため必ず成功する。
+        // 上記の `const _: () = assert!(...)` により DEFAULT_BATCH_SIZE は
+        // 1..=MAX_BATCH_SIZE 範囲内であることがコンパイル時に保証されているため、
+        // この expect は到達不能であり実行時パニックにはならない。
         Self::new(DEFAULT_BATCH_SIZE).expect("DEFAULT_BATCH_SIZE must be a valid batch size")
     }
 }

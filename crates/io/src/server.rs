@@ -45,13 +45,22 @@
 //!
 //! # peer credential の検証（PLUG-12・security.md「UDS は所有者・権限・
 //! symlink を検証してから bind し、別 UID からの接続は peer credential 検証で
-//! 切断する」。E・#820 codex P0 指摘対応。H1・H3・H4・H6・#820 security-auditor
+//! 切断する」。E・#820 codex P0 指摘対応。H1〜H4・H6・#820 security-auditor
 //! 指摘対応）
 //!
-//! [`UdsServer::accept`] は、accept した接続の相手側 uid
-//! （`crate::sys::peer_uid`。Linux は `SO_PEERCRED`、macOS は `getpeereid(2)`）が
-//! 自プロセスの実効 uid（`crate::sys::effective_uid`）と一致することを確かめる
-//! （`imp::verify_peer_credential`。Linux / macOS 限定の非公開関数）。
+//! [`UdsServer::accept`] は、accept した接続の相手側の**接続時点の実効 uid
+//! （euid）**（`crate::sys::peer_uid`。Linux は `SO_PEERCRED` が返す
+//! `struct ucred.uid`、macOS は `getpeereid(2)` が返す euid で、どちらも
+//! 「相手プロセスの実 uid」ではなく接続時点の euid を指す。H2・#820
+//! security-auditor 指摘対応）が自プロセスの実効 uid（`crate::sys::effective_uid`）
+//! と一致することを確かめる（`imp::verify_peer_credential`。Linux / macOS
+//! 限定の非公開関数）。接続元が user namespace の外側から見えている場合、
+//! namespace 外の uid はマッピングを持たないため
+//! `overflowuid`（Linux の既定値 `65534`）として観測されることがあり、実効 uid と
+//! 一致せず拒否されうる（H2・#820 security-auditor 指摘対応。想定内の
+//! fail-closed 挙動であり、正しい uid マッピングを持つ呼び出し元からの接続を
+//! 妨げない）。
+//!
 //! 不一致・取得失敗（対応していないアーキテクチャを含む）のいずれも拒否し
 //! （fail-closed）、拒否した接続はすぐに閉じる。1 件の不正な接続で受付ループ
 //! 自体は止めない。ただし `ConnectionAborted`（相手都合の切断）と peer
@@ -791,10 +800,14 @@ mod imp {
     /// 指摘対応。PLUG-12・security.md「別 UID からの接続は peer credential
     /// 検証で切断する」）。
     ///
-    /// `crate::sys::peer_uid`（Linux は `SO_PEERCRED`、macOS は
-    /// `getpeereid(2)`）で接続元の実 uid を取得し、`crate::sys::effective_uid`
+    /// `crate::sys::peer_uid`（Linux は `SO_PEERCRED` が返す
+    /// `struct ucred.uid`、macOS は `getpeereid(2)` が返す euid）で接続元の
+    /// **接続時点の実効 uid（euid）**を取得し、`crate::sys::effective_uid`
     /// （bind したプロセス自身の実効 uid）と一致するかを
-    /// [`peer_credential_matches`]（純粋関数。単体テスト対象）で判定する。
+    /// [`peer_credential_matches`]（純粋関数。単体テスト対象）で判定する（H2・
+    /// #820 security-auditor 指摘対応。「実 uid」ではなく euid である点・
+    /// user namespace の外の uid は `overflowuid` として観測されうる点は
+    /// `server.rs` モジュール doc「peer credential の検証」節参照）。
     /// `peer_uid` の取得自体に失敗した場合（対応していないアーキテクチャを
     /// 含む）も、判定不能を「別 UID からの接続」と同じ扱いにして拒否する
     /// （fail-closed）。拒否時のエラーコードは [`check_socket_owner`]（bind 時の
@@ -1166,9 +1179,10 @@ mod imp {
     }
 
     /// `set_read_timeout` / `set_write_timeout` の失敗を `IoError` へ変換する
-    /// （D・#820・PR #1113 の macOS CI 失敗の修正）。
+    /// （D・#820・PR #1113 の macOS CI 失敗の修正。H7・#820 security-auditor
+    /// 指摘対応で macOS 限定に絞った）。
     ///
-    /// # macOS での `EINVAL`（`InvalidInput`）
+    /// # macOS での `EINVAL`（`InvalidInput`）限定（H7）
     /// macOS の `setsockopt(2)`（`SO_RCVTIMEO` / `SO_SNDTIMEO` の設定に使う）は、
     /// マニュアルの `[EINVAL]` 項に「ソケットが接続済みでなければならない
     /// オプションを、接続されていないソケットに指定した」場合に返ると明記されて
@@ -1178,9 +1192,7 @@ mod imp {
     /// で残り時間を計算し直した直後に `set_read_timeout` / `set_write_timeout` を
     /// 呼び直す（B4・#820 レビュー指摘対応）ため、相手が接続直後に切断した場合
     /// （`io1_uds_recv_reports_unavailable_on_peer_close` が再現するケース）に、
-    /// 最初のループでこの `EINVAL` を踏みうる。Linux では同じ状況でも
-    /// `setsockopt` 自体は成功し、直後の `read`/`write` が `map_io_error` の
-    /// 切断系 `ErrorKind` を返す（実装差）。
+    /// 最初のループでこの `EINVAL` を踏みうる。
     ///
     /// `remaining_or_timeout` は `Duration::ZERO` を `set_*_timeout` へ渡さない
     /// （呼び出し前に自身が `Timeout` を返して打ち切るため）ため、この経路の
@@ -1188,8 +1200,17 @@ mod imp {
     /// 「相手の接続がすでに閉じている」ことを示すと判断して良い。したがって
     /// `map_io_error` とは別にここで `Unavailable` へ変換し、
     /// 切断済みの相手への操作を `Internal`（本来は実装のバグを示すコード）で
-    /// 誤って報告しないようにする。それ以外の失敗（`EBADF` 等）は引き続き
-    /// `Internal` として扱う。
+    /// 誤って報告しないようにする。
+    ///
+    /// この読み替えは macOS 限定で行う（`cfg(target_os = "macos")`）。Linux では
+    /// 同じ状況でも `setsockopt` 自体は成功し、直後の `read`/`write` が
+    /// `map_io_error` の切断系 `ErrorKind` を返すため、この関数が `InvalidInput`
+    /// を受け取ること自体が「相手の接続」とは無関係な実装上の異常（不正な
+    /// timeout 値の指定等）を示す可能性が高い。macOS 版の判断根拠を Linux にも
+    /// 転用すると、本来 `Internal`（実装バグ）として報告すべきものを
+    /// `Unavailable` に読み替えてしまい、誤ってバグを隠す側に倒れる
+    /// （H7・#820 security-auditor 指摘対応）。
+    #[cfg(target_os = "macos")]
     fn map_set_timeout_error(e: io::Error) -> IoError {
         if e.kind() == io::ErrorKind::InvalidInput {
             IoError::new(
@@ -1202,6 +1223,18 @@ mod imp {
                 format!("failed to set io timeout: {e}"),
             )
         }
+    }
+
+    /// Linux 版 [`map_set_timeout_error`]（H7・#820 security-auditor 指摘対応）。
+    /// 上記のドキュメンテーションコメントのとおり、Linux では
+    /// `set_read_timeout` / `set_write_timeout` の失敗を「相手の接続が閉じて
+    /// いる」ことの手がかりとして扱わず、常に `Internal` として報告する。
+    #[cfg(target_os = "linux")]
+    fn map_set_timeout_error(e: io::Error) -> IoError {
+        IoError::new(
+            IoErrorCode::Internal,
+            format!("failed to set io timeout: {e}"),
+        )
     }
 
     /// `buf` を埋め切るまで読む。フレーム全体の `deadline` を基準に毎回残り
@@ -1395,19 +1428,32 @@ mod imp {
             assert_eq!(err.code(), IoErrorCode::Internal);
         }
 
-        /// D・#820（PR #1113 の macOS CI 失敗の修正）: `set_read_timeout` /
-        /// `set_write_timeout` の `InvalidInput`（macOS の `EINVAL`。相手が
-        /// すでに切断済みのソケットへタイムアウトを設定しようとした場合）は
+        /// D・#820（PR #1113 の macOS CI 失敗の修正。H7・#820 security-auditor
+        /// 指摘対応で macOS 限定に絞った）: macOS では `set_read_timeout` /
+        /// `set_write_timeout` の `InvalidInput`（`EINVAL`。相手がすでに
+        /// 切断済みのソケットへタイムアウトを設定しようとした場合）は
         /// `Internal` ではなく `Unavailable` に写像される
         /// （`map_set_timeout_error` のドキュメンテーションコメント参照）。
+        #[cfg(target_os = "macos")]
         #[test]
-        fn d_820_map_set_timeout_error_maps_invalid_input_to_unavailable() {
+        fn d_820_map_set_timeout_error_maps_invalid_input_to_unavailable_on_macos() {
             let err = map_set_timeout_error(io::Error::from(io::ErrorKind::InvalidInput));
             assert_eq!(err.code(), IoErrorCode::Unavailable);
         }
 
+        /// H7・#820（security-auditor 指摘対応）: Linux では `InvalidInput` を
+        /// macOS 固有の EINVAL 事情の手がかりとして扱わず、引き続き `Internal`
+        /// に写像される（`map_set_timeout_error` のドキュメンテーションコメント
+        /// 「Linux にも転用すると誤ってバグを隠す側に倒れる」参照）。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn h7_map_set_timeout_error_keeps_invalid_input_as_internal_on_linux() {
+            let err = map_set_timeout_error(io::Error::from(io::ErrorKind::InvalidInput));
+            assert_eq!(err.code(), IoErrorCode::Internal);
+        }
+
         /// D・#820: `InvalidInput` 以外のタイムアウト設定失敗（例: 無効な fd を
-        /// 示す `EBADF` 相当）は引き続き `Internal` に写像される
+        /// 示す `EBADF` 相当）は、両 OS とも引き続き `Internal` に写像される
         /// （実装のバグを示す経路と、相手の切断を示す経路を区別する）。
         #[test]
         fn d_820_map_set_timeout_error_maps_other_kinds_to_internal() {

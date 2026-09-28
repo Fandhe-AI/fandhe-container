@@ -13,11 +13,22 @@
 //! unstable のため使えない）ため、本モジュールが必要最小限のラッパーを持つ。
 //!
 //! - Linux: `getsockopt(2)` の `SOL_SOCKET`/`SO_PEERCRED` で接続元の
-//!   `struct ucred`（pid・uid・gid）を取得する
-//! - macOS: `getpeereid(2)` で接続元の uid・gid を取得する
+//!   `struct ucred`（pid・接続時点の実効 uid・gid）を取得する
+//! - macOS: `getpeereid(2)` で接続元の接続時点の実効 uid・gid を取得する
 //! - 両 OS 共通: `geteuid(2)` で自プロセスの実効 uid を取得する
 //!   （bind したプロセス自身の実効 uid。`crate::server::imp::check_socket_owner`
 //!   が親ディレクトリ所有者との照合に使う）
+//!
+//! # 「実 uid」ではなく「接続時点の実効 uid（euid）」（H2・#820
+//! security-auditor 指摘対応）
+//! `SO_PEERCRED` が返す `struct ucred.uid` も `getpeereid(2)` が返す値も、
+//! 接続元プロセスの実 uid（real uid）ではなく、接続を確立した時点の実効 uid
+//! （effective uid・euid）である（setuid されたプロセスが接続した場合、
+//! 実 uid とは異なりうる）。また、接続元が本プロセスとは別の user namespace
+//! に属する場合、その uid が本プロセス側の namespace にマッピングされて
+//! いなければ `overflowuid`（Linux の既定値 `65534`）として観測されることが
+//! あり、この場合も本プロセスの実効 uid とは一致せず拒否される
+//! （`crate::server` モジュール doc「peer credential の検証」節参照）。
 //!
 //! # 契約（事前承認の条件を満たす設計）
 //! - `unsafe fn` はこのモジュールの外へ公開しない。公開するのは安全な関数
@@ -69,6 +80,23 @@ mod linux {
         pub gid: u32,
     }
 
+    /// `struct ucred` のバイト長（コンパイル時定数）。
+    pub(super) const UCRED_SIZE: usize = core::mem::size_of::<Ucred>();
+
+    // UCRED_SIZE は u32 に収まらなければならない不変条件をコンパイル時に
+    // 保証する（H5・#820 security-auditor 指摘対応。`struct ucred` は
+    // pid/uid/gid の 3 フィールドのみで実際には 12 バイトだが、将来
+    // フィールドが増えても `optlen` に渡す `u32` の範囲を超えないことを
+    // 明示し、`peer_uid` 側で実行時に panic しうる
+    // `u32::try_from(...).expect(...)` を使わずに済むようにする）。
+    const _: () = assert!(UCRED_SIZE <= u32::MAX as usize);
+
+    /// `getsockopt` の `optlen` に渡す `struct ucred` のバイト長（`u32`）。
+    /// 上記の `const assert` により `as u32` での切り捨ては発生しない
+    /// （コンパイル時に不変条件を保証済みのキャストであり、実行時に
+    /// panic する経路を持たない。H5・#820 security-auditor 指摘対応）。
+    pub(super) const UCRED_LEN: u32 = UCRED_SIZE as u32;
+
     // SOL_SOCKET・SO_PEERCRED の値は asm-generic の socket.h 由来で x86_64・
     // aarch64 双方とも同じ値（1・17）だが、coding-rust.md の「定数を流用
     // しない」方針に従い、アーキテクチャごとに個別の定数として定義する
@@ -116,8 +144,10 @@ unsafe extern "C" {
     fn geteuid() -> u32;
 }
 
-/// 接続済みの `stream` の相手側（接続元）の実 uid を取得する
-/// （PLUG-12・security.md）。
+/// 接続済みの `stream` の相手側（接続元）の、接続時点の実効 uid（euid）を
+/// 取得する（PLUG-12・security.md。実 uid ではない点・user namespace の外の
+/// uid が `overflowuid` として見える点はモジュール doc 参照。H2・#820
+/// security-auditor 指摘対応）。
 ///
 /// `stream` を借用し続けている間だけ有効な fd を渡すため、呼び出し中に
 /// fd がクローズされることはない。取得できない場合（syscall 失敗・
@@ -133,8 +163,10 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, IoError> {
             uid: 0,
             gid: 0,
         };
-        let mut len = u32::try_from(core::mem::size_of::<linux::Ucred>())
-            .expect("size_of::<Ucred>() must fit in u32");
+        // H5・#820 security-auditor 指摘対応: 実行時に panic しうる
+        // `u32::try_from(...).expect(...)` を使わず、コンパイル時に不変条件を
+        // 保証済みの定数（`linux::UCRED_LEN`）を使う。
+        let mut len = linux::UCRED_LEN;
 
         // SAFETY: fd は呼び出し元が `&UnixStream` を借用し続けている間だけ
         // 有効（呼び出しが終わるまでクローズされない）。`optval` は
@@ -154,7 +186,7 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, IoError> {
         if rc == -1 {
             return Err(last_os_error_to_ioerror("getsockopt(SO_PEERCRED) failed"));
         }
-        if len as usize != core::mem::size_of::<linux::Ucred>() {
+        if len as usize != linux::UCRED_SIZE {
             return Err(IoError::new(
                 IoErrorCode::Internal,
                 "getsockopt(SO_PEERCRED) returned an unexpected ucred size",

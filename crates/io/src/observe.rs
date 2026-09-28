@@ -415,20 +415,26 @@ impl BoundedJsonLines {
     /// 実害が小さいと判断）、[`Self::dropped_count`] を増分する。破棄そのものが
     /// 呼び出し元（送信・受信経路）へ伝播することはない（観測が主処理を妨げて
     /// はならないため）。ここでは I/O を行わない（REPAIR-5）。
-    fn push_encoded_line(&mut self, encode: impl FnOnce() -> String) {
+    ///
+    /// 戻り値は積めた場合 `true`、破棄した場合（行数上限・合計バイト数上限の
+    /// いずれでも）`false`。呼び出し元がイベント種別ごとの破棄件数を数えるため
+    /// に使う（[`JsonLinesServerObserver::dropped_peer_credential_rejections`]。
+    /// I5・#820 security-auditor 再監査指摘対応）。
+    fn push_encoded_line(&mut self, encode: impl FnOnce() -> String) -> bool {
         if self.lines.len() >= self.capacity {
             self.dropped = self.dropped.saturating_add(1);
-            return;
+            return false;
         }
         let encoded = encode();
         // 行数上限とは独立に、合計バイト数の上限も守る（codex P0 再指摘対応）。
         // 巨大な `message` が連続しても、キューの総メモリ使用量を有界に保つ。
         if self.total_bytes.saturating_add(encoded.len()) > MAX_SEND_LOG_BUFFER_BYTES {
             self.dropped = self.dropped.saturating_add(1);
-            return;
+            return false;
         }
         self.total_bytes += encoded.len();
         self.lines.push_back(encoded);
+        true
     }
 }
 
@@ -961,8 +967,20 @@ const _: () = assert!(
 /// [`JsonLinesSendObserver`] と同じ理由（そのドキュメント参照）で、
 /// [`ServerObserver::on_event`] は `BoundedJsonLines` へ積むだけにとどめ、
 /// 実際の書き出しは呼び出し元が [`Self::drain_lines`] で取り出して行う。
+///
+/// # peer credential 拒否イベントの破棄件数（SEC-4。I5・#820 security-auditor
+/// 再監査指摘対応）
+/// 満杯時の破棄はイベント種別を区別しないため、[`Self::dropped_count`] だけでは
+/// SEC-4「分離違反の試行は監査ログに記録する」の対象となる
+/// [`ServerOutcome::RejectedPeerCredential`] が欠けたかどうかを判別できない。
+/// そのため、このイベントの破棄件数を [`Self::dropped_peer_credential_rejections`]
+/// で別に数える（全体の [`Self::dropped_count`] にも同時に含まれる）。
 pub struct JsonLinesServerObserver {
     buf: BoundedJsonLines,
+    /// 破棄した [`ServerOutcome::RejectedPeerCredential`] イベントの件数
+    /// （saturating で増やす）。[`Self::drain_lines`] では `0` に戻さない
+    /// （[`Self::dropped_count`] と同じく累積値）。
+    dropped_peer_credential_rejections: u64,
 }
 
 impl JsonLinesServerObserver {
@@ -970,6 +988,7 @@ impl JsonLinesServerObserver {
     pub fn new() -> Self {
         Self {
             buf: BoundedJsonLines::new(),
+            dropped_peer_credential_rejections: 0,
         }
     }
 
@@ -979,6 +998,7 @@ impl JsonLinesServerObserver {
     pub fn with_capacity(capacity: usize) -> Result<Self, IoError> {
         Ok(Self {
             buf: BoundedJsonLines::try_with_capacity(capacity, "server log")?,
+            dropped_peer_credential_rejections: 0,
         })
     }
 
@@ -1002,6 +1022,18 @@ impl JsonLinesServerObserver {
         self.buf.dropped_count()
     }
 
+    /// 容量超過（行数上限・合計バイト数上限のいずれか）により破棄した
+    /// [`ServerOutcome::RejectedPeerCredential`] イベントの件数を返す
+    /// （[`Self::dropped_count`] の内数。saturating で数える）。
+    ///
+    /// SEC-4「分離違反の試行は監査ログに記録する」の監査記録（peer credential
+    /// 拒否。PLUG-12）が欠けたかどうかを判別するためのもの（I5・#820
+    /// security-auditor 再監査指摘対応）。`0` でなければ、拒否の一部が記録に
+    /// 残っていないことを示す。
+    pub fn dropped_peer_credential_rejections(&self) -> u64 {
+        self.dropped_peer_credential_rejections
+    }
+
     /// 現在ためている JSON 行の合計バイト数（改行を含まない）を返す。
     pub fn total_bytes(&self) -> usize {
         self.buf.total_bytes()
@@ -1023,7 +1055,11 @@ impl Default for JsonLinesServerObserver {
 
 impl ServerObserver for JsonLinesServerObserver {
     fn on_event(&mut self, event: &ServerEvent<'_>) {
-        self.buf.push_encoded_line(|| encode_server_event(event));
+        let pushed = self.buf.push_encoded_line(|| encode_server_event(event));
+        if !pushed && event.outcome == ServerOutcome::RejectedPeerCredential {
+            self.dropped_peer_credential_rejections =
+                self.dropped_peer_credential_rejections.saturating_add(1);
+        }
     }
 }
 
@@ -1035,6 +1071,10 @@ impl fmt::Debug for JsonLinesServerObserver {
             .field("len", &self.buf.len())
             .field("capacity", &self.buf.capacity())
             .field("dropped", &self.buf.dropped_count())
+            .field(
+                "dropped_peer_credential_rejections",
+                &self.dropped_peer_credential_rejections,
+            )
             .field("total_bytes", &self.buf.total_bytes())
             .finish()
     }
@@ -1768,6 +1808,113 @@ mod tests {
             ]
         );
         assert!(observer.is_empty());
+    }
+
+    /// I5・#820（security-auditor 再監査指摘対応。SEC-4・PLUG-12）: 満杯時に
+    /// peer credential 拒否イベントを送ると、全体の `dropped_count` と専用の
+    /// `dropped_peer_credential_rejections` の両方が増える。満杯時の通常の
+    /// イベント（Accept 成功・Recv 失敗）では専用カウンタは増えない。
+    #[test]
+    fn i5_json_lines_server_observer_counts_dropped_peer_credential_rejections_separately() {
+        let mut observer =
+            JsonLinesServerObserver::with_capacity(1).expect("1 must be a valid capacity");
+        let accept_ok = ServerEvent {
+            op: ServerOp::Accept,
+            kind: None,
+            outcome: ServerOutcome::Success,
+            latency: Duration::ZERO,
+            accept_aborted_retries: 0,
+            peer_credential_rejections: 0,
+            peer_uid: None,
+            error: None,
+        };
+        let rejection = ServerEvent {
+            op: ServerOp::Accept,
+            kind: None,
+            outcome: ServerOutcome::RejectedPeerCredential,
+            latency: Duration::ZERO,
+            accept_aborted_retries: 0,
+            peer_credential_rejections: 1,
+            peer_uid: Some(1000),
+            error: Some(SendEventError {
+                code: IoErrorCode::InvalidArgument,
+                message: "connecting peer uid (1000) does not match",
+            }),
+        };
+        let recv_failure = ServerEvent {
+            op: ServerOp::Recv,
+            kind: Some(FrameKind::Write),
+            outcome: ServerOutcome::Failure,
+            latency: Duration::ZERO,
+            accept_aborted_retries: 0,
+            peer_credential_rejections: 0,
+            peer_uid: None,
+            error: Some(SendEventError {
+                code: IoErrorCode::Timeout,
+                message: "timed out",
+            }),
+        };
+
+        // 1 件目で満杯にする（ここまでは何も破棄されない）。
+        observer.on_event(&accept_ok);
+        assert_eq!(observer.dropped_count(), 0);
+        assert_eq!(observer.dropped_peer_credential_rejections(), 0);
+
+        // 満杯時の通常イベントは全体の件数のみを増やす。
+        observer.on_event(&accept_ok);
+        observer.on_event(&recv_failure);
+        assert_eq!(observer.dropped_count(), 2);
+        assert_eq!(observer.dropped_peer_credential_rejections(), 0);
+
+        // 満杯時の peer credential 拒否は両方を増やす。
+        observer.on_event(&rejection);
+        observer.on_event(&rejection);
+        assert_eq!(observer.dropped_count(), 4);
+        assert_eq!(observer.dropped_peer_credential_rejections(), 2);
+
+        // 空きがあるときの peer credential 拒否は破棄されず、どちらも増えない。
+        let _ = observer.drain_lines();
+        observer.on_event(&rejection);
+        assert_eq!(observer.len(), 1);
+        assert_eq!(observer.dropped_count(), 4);
+        assert_eq!(observer.dropped_peer_credential_rejections(), 2);
+    }
+
+    /// I5・#820（SEC-4・PLUG-12）: 行数上限ではなく合計バイト数上限による破棄
+    /// でも、peer credential 拒否イベントなら専用カウンタが増える。
+    #[test]
+    fn i5_json_lines_server_observer_counts_rejection_dropped_by_total_bytes_limit() {
+        let mut observer =
+            JsonLinesServerObserver::with_capacity(MAX_SEND_LOG_CAPACITY).expect("valid capacity");
+        let near_max_message = "c".repeat(MAX_SEND_LOG_MESSAGE_BYTES);
+        let rejection = ServerEvent {
+            op: ServerOp::Accept,
+            kind: None,
+            outcome: ServerOutcome::RejectedPeerCredential,
+            latency: Duration::ZERO,
+            accept_aborted_retries: 0,
+            peer_credential_rejections: 1,
+            peer_uid: Some(1000),
+            error: Some(SendEventError {
+                code: IoErrorCode::InvalidArgument,
+                message: &near_max_message,
+            }),
+        };
+
+        let mut pushed = 0usize;
+        loop {
+            let before = observer.total_bytes();
+            observer.on_event(&rejection);
+            if observer.total_bytes() == before {
+                break;
+            }
+            pushed += 1;
+        }
+
+        assert!(pushed > 0, "at least one line must fit before the limit");
+        assert!(observer.len() < MAX_SEND_LOG_CAPACITY);
+        assert_eq!(observer.dropped_count(), 1);
+        assert_eq!(observer.dropped_peer_credential_rejections(), 1);
     }
 
     /// REPAIR-5（#820 レビュー指摘）: `with_capacity(0)` と

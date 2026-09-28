@@ -1,17 +1,31 @@
-//! REPAIR-5（結合試験の応答性）: 正常系タイムアウト内 ACK 到達試験
-//! （TASK-85.1・#119・親 #118）。
+//! REPAIR-5（結合試験の応答性）: タイムアウト内 ACK 到達・未到達検出試験
+//! （TASK-85.1・#119、TASK-85.2・#120。親 #118）。
 //!
 //! [`fandhe_container_io::client::PipelineClient`]（TASK-12）と
 //! [`fandhe_container_io::server::UdsServer`] / [`fandhe_container_io::writeback::serve_connection`]
-//! （TASK-13）を実際の UDS 上で結合し、送信した全リクエストについて
-//! [`AGENTS.md`]「推奨タイムアウト値」（REPAIR-5・REPAIR-10 (c)）が定める
-//! 5〜10 秒のタイムアウト設定の範囲内で ACK が届くことを確かめる。PoC-8 では
-//! ACK 未送信（BREAK-1）がビルドでも整合性テストでも検出できず、ハングとして
-//! しか現れなかった。本ファイルはその再発を防ぐ結合試験の土台であり、正常系
-//! （本 issue #119・TASK-85.1）のみを扱う。異常系（ACK を意図的に止めて
-//! タイムアウトで検出するケース）は #120（TASK-85.2）が同じファイルへ追加する
-//! 前提で、タイムアウト設定ヘルパーと [`unix::UnixStreamTransport`] は
-//! そちらからも再利用できる形にしてある。
+//! （TASK-13）を実際の UDS 上で結合し、
+//!
+//! - 正常系（#119・TASK-85.1）: 送信した全リクエストについて
+//!   [`AGENTS.md`]「推奨タイムアウト値」（REPAIR-5・REPAIR-10 (c)）が定める
+//!   5〜10 秒のタイムアウト設定の範囲内で ACK が届くことを確かめる
+//! - 異常系（#120・TASK-85.2）: ACK を意図的に送信しないサーバーに対して、
+//!   クライアントの ACK 待ちがタイムアウトとして検出され、かつテスト自体が
+//!   無限に待たずタイムアウト秒数（＋固定の猶予）で打ち切られることを確かめる
+//!
+//! の両方を扱う。PoC-8 では ACK 未送信（BREAK-1）がビルドでも整合性テスト
+//! でも検出できず、ハングとしてしか現れなかった（PoC-12 でタイムアウト保護
+//! 付き結合試験により検出を確認）。本ファイルはその再発を防ぐ結合試験。
+//!
+//! ## 異常系の受け入れ条件 2 の解釈（#120）
+//!
+//! 異常系テストは ACK 待ちそのものをタイムアウトさせる（＝検出したいもの）
+//! ため、テストの所要時間は必然的に「タイムアウト秒数 ≒ elapsed」になる。
+//! したがって「テスト自体が無限に待たずタイムアウト秒数内で終了する」ことは
+//! 「厳密にタイムアウト未満で終わる」ではなく、**「ACK 待ちの所要時間が
+//! `timeout - ABSENT_ACK_TOLERANCE` 以上 `timeout + HANG_GUARD_GRACE` 未満で
+//! あり、シナリオ全体が watchdog（`timeout + HANG_GUARD_GRACE` での
+//! `recv_timeout`）で上限を機械的に保証されている」**と解釈する
+//! （`mod unix::repair5_missing_ack_is_detected_as_timeout` 参照）。
 //!
 //! タイムアウト秒数は環境変数 `FANDHE_CONTAINER_TEST_TIMEOUT_SECS` で上書きでき、
 //! 未設定時の既定値は [`DEFAULT_TEST_TIMEOUT_SECS`]（10 秒）。CI の
@@ -152,6 +166,7 @@ mod unix {
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use fandhe_container_io::client::{InFlightLimit, PipelineClient};
@@ -161,9 +176,21 @@ mod unix {
     use fandhe_container_io::writeback::{AppendFileSink, WritebackTimeouts, serve_connection};
     use fandhe_container_io::{
         BatchConfig, FRAME_HEADER_LEN, IoError, IoErrorCode, ReceiveLimits, UdsServer,
+        decode_request,
     };
 
     use super::response_timeout;
+
+    /// [`repair5_missing_ack_is_detected_as_timeout`]（#120）が下限として許容
+    /// する誤差。`SO_RCVTIMEO`（`recv_frame` が内部で使うソケットタイムアウト）
+    /// は多くの実装で切り上げのため早期復帰しない前提だが、スケジューラ遅延
+    /// による多少の前倒しは許容する。
+    const ABSENT_ACK_TOLERANCE: Duration = Duration::from_millis(100);
+
+    /// 同テストが上限（watchdog の待ち時間・ACK 待ちの所要時間の上限判定）に
+    /// 使う猶予。CI ランナーのスケジューラ揺らぎを吸収しつつ、
+    /// 「無限に待たない」ことを機械的に保証できる範囲に収める。
+    const HANG_GUARD_GRACE: Duration = Duration::from_secs(2);
 
     /// テストごとに固有かつ短いソケットディレクトリを作る（`tests/writeback.rs`
     /// の `TempSocketDir` と同じ理由・同じ実装。`sun_path` の長さ上限のため
@@ -677,6 +704,216 @@ mod unix {
             IoErrorCode::Unavailable
         );
         assert!(poisoned);
+    }
+
+    /// [`spawn_silent_server`] が受信・記録する 1 件分の request（owned。
+    /// [`fandhe_container_io::payload::RequestEnvelope`] はフレームを借用する
+    /// ため、サーバースレッドの戻り値としてそのままは返せない）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SilentServerRequest {
+        kind: FrameKind,
+        id: u64,
+        body: Vec<u8>,
+    }
+
+    /// PoC-8 の BREAK-1（ACK 未送信）をテスト内で再現するスタブ用サーバー
+    /// （REPAIR-3: 実装済みを装わない。本番の `serve_connection` には
+    /// 「ACK を送らない」切り替え口を追加しない。あくまでテストローカルの
+    /// 代用実装）。
+    ///
+    /// `expected_count` 件のフレームを受信・検証するだけで、
+    /// [`fandhe_container_io::transport::FrameSender::send_frame`] を一度も
+    /// 呼ばない。これにより「リクエストは届いたが ACK が返らなかった」ことを
+    /// 「リクエスト自体が届かなかった」ことと区別できる。
+    ///
+    /// `done_rx` で呼び出し元（テスト本体）からの完了通知を
+    /// `timeout + HANG_GUARD_GRACE` を上限に待ってから `connection` を drop
+    /// する（サーバー側でさらに `recv_frame(timeout)` を回すと、サーバーの
+    /// タイムアウトとクライアントのタイムアウトがほぼ同時刻に競合し、
+    /// アサーションが不安定になるため、受信後は完了通知待ちに専念する）。
+    fn spawn_silent_server(
+        socket_path: PathBuf,
+        timeout: IoTimeout,
+        expected_count: usize,
+        done_rx: mpsc::Receiver<()>,
+    ) -> std::thread::JoinHandle<Vec<SilentServerRequest>> {
+        std::thread::spawn(move || {
+            let mut server =
+                UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
+                    .expect("bind must succeed on a private, empty path");
+            let mut connection = server
+                .accept(timeout, NoopServerObserver)
+                .expect("server must accept the client connection within the timeout");
+
+            let mut received = Vec::with_capacity(expected_count);
+            for _ in 0..expected_count {
+                let frame = connection
+                    .recv_frame(timeout)
+                    .expect("silent server must receive the expected request frame");
+                let envelope = decode_request(&frame)
+                    .expect("silent server must receive a well-formed request frame");
+                received.push(SilentServerRequest {
+                    kind: envelope.kind(),
+                    id: envelope.id().get(),
+                    body: envelope.body().to_vec(),
+                });
+            }
+
+            // 意図的に send_frame を一度も呼ばない（BREAK-1 相当）。
+            let _ = done_rx.recv_timeout(timeout.as_duration() + HANG_GUARD_GRACE);
+            drop(connection);
+
+            received
+        })
+    }
+
+    /// TASK-85.2・REPAIR-5・BREAK-1・#120: ACK を意図的に送信しないサーバー
+    /// （[`spawn_silent_server`]）に対して送信した場合、クライアントの
+    /// `recv_ack` がタイムアウトとして検出され（[`IoErrorCode::Timeout`]）、
+    /// 以後クライアントが失効（poison）して送受信を拒否することを確かめる。
+    ///
+    /// 受け入れ条件 2（テスト自体が無限に待たずタイムアウト秒数内で終了する
+    /// こと）の解釈は本ファイル冒頭の `//!` を参照。本テストは main 側の
+    /// watchdog（`result_rx.recv_timeout(timeout + HANG_GUARD_GRACE)`）で
+    /// critical path の待ちに上限を持たせ、ハングした場合は明示メッセージで
+    /// panic する。
+    #[test]
+    fn repair5_missing_ack_is_detected_as_timeout() {
+        let timeout = response_timeout();
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+
+        const REQUEST_COUNT: u64 = 3;
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server_thread = spawn_silent_server(
+            socket_path.clone(),
+            timeout,
+            REQUEST_COUNT as usize,
+            done_rx,
+        );
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let connect_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let stream = connect(&connect_path);
+            let transport = UnixStreamTransport::new(stream);
+            let mut client =
+                PipelineClient::new(transport, InFlightLimit::default(), NoopSendObserver);
+
+            for id in 0..REQUEST_COUNT {
+                client
+                    .send(FrameKind::Write, &id.to_le_bytes(), timeout)
+                    .unwrap_or_else(|err| panic!("send must succeed for id {id}: {err}"));
+            }
+
+            let wait_started = Instant::now();
+            let first_recv_ack = client.recv_ack(timeout);
+            let elapsed = wait_started.elapsed();
+
+            let first_err_code = first_recv_ack
+                .expect_err("recv_ack must fail once the ack wait exceeds the timeout")
+                .code();
+            let is_poisoned_after_timeout = client.is_poisoned();
+            let ack_metrics_after_timeout = *client.ack_metrics();
+
+            // 失効後の 2 回目の呼び出しも P1-3 契約どおり Unavailable で
+            // 拒否されることを確かめる（poison の効果が持続する）。
+            let second_recv_ack_code = client.recv_ack(timeout).map(|_| ()).unwrap_err().code();
+            let send_after_poison_code = client
+                .send(FrameKind::Write, &REQUEST_COUNT.to_le_bytes(), timeout)
+                .map(|_| ())
+                .unwrap_err()
+                .code();
+            let ack_metrics_after_second_call = *client.ack_metrics();
+
+            // client（内部の UnixStream を含む）をこのスレッド内で drop し、
+            // サーバー側の完了通知待ちが早く終われるようにする
+            // （`repair5_all_acks_arrive_within_timeout_default_batch_64` と
+            // 同じ理由）。
+            drop(client);
+
+            (
+                first_err_code,
+                elapsed,
+                is_poisoned_after_timeout,
+                ack_metrics_after_timeout,
+                second_recv_ack_code,
+                send_after_poison_code,
+                ack_metrics_after_second_call,
+            )
+        });
+
+        // hang guard（watchdog）: client_thread の結果を上限付きで待つ。
+        // critical path 上に上限なしの recv()・join() を置かない
+        // （REPAIR-5・本ファイル冒頭 `//!` の受け入れ条件 2 の解釈）。
+        std::thread::spawn(move || {
+            let _ = result_tx.send(client_thread.join());
+        });
+        let watchdog_deadline = timeout.as_duration() + HANG_GUARD_GRACE;
+        let client_result = result_rx
+            .recv_timeout(watchdog_deadline)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "missing-ack detection did not complete within {watchdog_deadline:?}; \
+                 timeout detection is not working (hung instead of erroring)"
+                )
+            });
+        let (
+            first_err_code,
+            elapsed,
+            is_poisoned_after_timeout,
+            ack_metrics_after_timeout,
+            second_recv_ack_code,
+            send_after_poison_code,
+            ack_metrics_after_second_call,
+        ) = client_result.expect("client thread must not panic");
+
+        // 検出: recv_ack はタイムアウトとして検出しなければならない。
+        assert_eq!(first_err_code, IoErrorCode::Timeout);
+
+        // 所要時間の下限・上限: 実際に待ったことを示しつつ、無限には待たない。
+        let lower_bound = timeout.as_duration().saturating_sub(ABSENT_ACK_TOLERANCE);
+        assert!(
+            elapsed >= lower_bound,
+            "ack wait elapsed {elapsed:?} must be at least {lower_bound:?} \
+             (timeout {:?} minus tolerance {ABSENT_ACK_TOLERANCE:?})",
+            timeout.as_duration()
+        );
+        let upper_bound = timeout.as_duration() + HANG_GUARD_GRACE;
+        assert!(
+            elapsed < upper_bound,
+            "ack wait elapsed {elapsed:?} must be under {upper_bound:?} \
+             (timeout {:?} plus grace {HANG_GUARD_GRACE:?})",
+            timeout.as_duration()
+        );
+
+        // 失効（P1-3 契約）とメトリクス。
+        assert!(is_poisoned_after_timeout);
+        assert_eq!(ack_metrics_after_timeout.transport_failure_count(), 1);
+        assert_eq!(ack_metrics_after_timeout.success_count(), 0);
+
+        // 失効後の 2 回目以降の呼び出しは Unavailable で拒否され続ける。
+        assert_eq!(second_recv_ack_code, IoErrorCode::Unavailable);
+        assert_eq!(send_after_poison_code, IoErrorCode::Unavailable);
+        assert_eq!(ack_metrics_after_second_call.rejected_poisoned_count(), 1);
+
+        // サーバー側: 完了を通知して受信内容を回収する（サーバー受信自体は
+        // クライアントの ACK 待ちタイムアウトより先に、REQUEST_COUNT 件の
+        // 受信が完了しているはず。通知が既に受理不能でも送信失敗は無視する
+        // ― サーバースレッドは自身の recv_timeout の上限で終了する）。
+        let _ = done_tx.send(());
+        let received = server_thread
+            .join()
+            .expect("silent server thread must not panic");
+
+        assert_eq!(received.len(), REQUEST_COUNT as usize);
+        for (index, request) in received.iter().enumerate() {
+            let expected_id = index as u64;
+            assert_eq!(request.kind, FrameKind::Write);
+            assert_eq!(request.id, expected_id);
+            assert_eq!(request.body, expected_id.to_le_bytes().to_vec());
+        }
     }
 }
 

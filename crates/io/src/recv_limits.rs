@@ -15,6 +15,9 @@
 //! 入力に取り、超過時は本体バッファを確保する前に構造化エラー
 //! （[`IoErrorCode::ResourceExhausted`]）で拒否する。受理した場合に限り、
 //! 本体バッファを確保できる型付きの証跡（[`AdmittedHeader`]）を返す。
+//! 設定上限（`max_bytes` 由来）は `Write` 用のバッチ集約上限であり、
+//! `Ack` / `Flush` / `FlushAck` 等の制御フレームには適用しない（詳細は
+//! [`ReceiveLimits::admit`] のドキュメンテーションコメント参照）。
 //!
 //! # 呼び出し文脈
 //! TASK-13.2.1（#820）が新設する予定の UDS 受信ループが、[`crate::protocol::Frame`]
@@ -179,7 +182,9 @@ impl ReceiveLimits {
             .expect("BatchConfig-derived values must satisfy ReceiveLimits::new")
     }
 
-    /// 検証済みのペイロード長上限（バイト数）を返す。
+    /// 検証済みのペイロード長上限（バイト数）を返す。[`Self::admit`] は
+    /// この上限を `FrameKind::Write` にのみ適用する（制御フレームには
+    /// 適用しない。理由は [`Self::admit`] のドキュメンテーションコメント参照）。
     pub fn max_payload_len(&self) -> u32 {
         self.max_payload_len
     }
@@ -193,8 +198,19 @@ impl ReceiveLimits {
     /// （TASK-13.4 の中心処理）。
     ///
     /// # 検証順序
-    /// 1. `header.payload_len().get() > self.max_payload_len` の場合は
-    ///    [`IoErrorCode::ResourceExhausted`]（全種別に適用する）
+    /// 1. `header.kind() == FrameKind::Write` かつ
+    ///    `header.payload_len().get() > self.max_payload_len` の場合は
+    ///    [`IoErrorCode::ResourceExhausted`]（`max_payload_len` は
+    ///    [`Self::for_batch`] が `BatchConfig::max_bytes()`〔`Write` 用の
+    ///    バッチ集約上限〕から導く設定値のため、`Write` 種別にのみ適用する。
+    ///    `Ack` / `Flush` / `FlushAck` 等の制御フレームにこの上限を適用すると、
+    ///    運用者がバッチ用に小さい `max_bytes` を設定した場合に、正常な制御
+    ///    フレームまで本体を読む前に誤って `ResourceExhausted` で拒否しうる
+    ///    〔PR #1110 codex レビュー指摘の P1〕。制御フレームは
+    ///    [`crate::protocol::FrameHeader::from_bytes`] が既に検証済みの
+    ///    プロトコル上限 [`MAX_PAYLOAD_LEN`] の範囲でそのまま受理する。
+    ///    種別ごとの妥当な長さ上限〔制御フレームは長さ 0 等〕を設ける判断は
+    ///    引き続きスコープ外（モジュール doc 参照）
     /// 2. `header.kind() == FrameKind::Write` かつ
     ///    `pending_frames >= self.max_pending_frames` の場合は
     ///    [`IoErrorCode::ResourceExhausted`]（制御フレームは滞留を排出する側
@@ -210,7 +226,7 @@ impl ReceiveLimits {
         pending_frames: usize,
     ) -> Result<AdmittedHeader, IoError> {
         let payload_len = header.payload_len().get();
-        if payload_len > self.max_payload_len {
+        if header.kind() == FrameKind::Write && payload_len > self.max_payload_len {
             return Err(IoError::new(
                 IoErrorCode::ResourceExhausted,
                 format!(
@@ -443,6 +459,40 @@ mod tests {
         let _admitted = limits
             .admit(header, 8)
             .expect("control frames must bypass the pending frame count check");
+    }
+
+    /// PR #1110 codex レビュー指摘の P1（IO-1）: `Write` 用に導出した
+    /// `max_payload_len`（`BatchConfig::max_bytes()` 由来）を制御フレームへ
+    /// 誤って適用すると、`max_bytes` を小さく設定した運用で正常な `Ack` /
+    /// `Flush` / `FlushAck` まで拒否されてしまう。制御フレームは申告長が
+    /// `max_payload_len` を超えていても（プロトコル上限
+    /// `MAX_PAYLOAD_LEN` の範囲内であれば）受理されることを確認する。
+    #[test]
+    fn io1_admit_length_check_does_not_apply_to_control_frames() {
+        let limits = ReceiveLimits::new(8, 8).expect("valid limits must succeed");
+
+        for kind in [FrameKind::Ack, FrameKind::Flush, FrameKind::FlushAck] {
+            let header =
+                FrameHeader::new(kind, 1024).expect("header within protocol limit must be valid");
+            let _admitted = limits.admit(header, 0).expect(
+                "control frame payload length must not be checked against the Write-only \
+                 max_payload_len",
+            );
+        }
+    }
+
+    /// IO-1・REPAIR-2: `Write` フレームの申告長が `max_payload_len` を
+    /// 超える場合は引き続き `ResourceExhausted` で拒否される（制御フレーム
+    /// 除外の変更が `Write` の検証を弱めていないことの回帰確認）。
+    #[test]
+    fn io1_admit_length_check_still_applies_to_write_frames() {
+        let limits = ReceiveLimits::new(8, 8).expect("valid limits must succeed");
+        let header = write_header(9);
+
+        let err = limits
+            .admit(header, 0)
+            .expect_err("Write frame payload over the configured limit must be rejected");
+        assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
     }
 
     /// IO-1: 申告長・滞留件数がちょうど上限（境界値）のときは受理される

@@ -19,8 +19,14 @@
 //! 本ファイルが、この env を読んで `Duration` を組み立てる最初の消費側コードに
 //! なる（AGENTS.md 78 行の「消費側コードは存在せず」は本 PR で解消される）。
 
+// `Duration` / `IoTimeout` は `response_timeout`（下記。UDS 対応 OS のみ）
+// でのみ使う。Windows では `response_timeout` ごとコンパイル対象外になる
+// ため、import も同じ cfg で揃える（未使用 import を clippy `-D warnings`
+// で検出させない）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Duration;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use fandhe_container_io::IoTimeout;
 
 /// タイムアウト秒数を上書きする環境変数名（TASK-87.1・#40 が CI 側で設定する
@@ -79,6 +85,11 @@ fn parse_test_timeout_secs(raw: Option<&str>) -> Result<u64, String> {
 /// 並列実行される他のテストと競合しうるため）。そのため env 依存の分岐は
 /// 本関数からは検証せず、[`parse_test_timeout_secs`] のユニットテスト
 /// （境界値テスト。下記）で検証する。
+///
+/// 呼び出し元は `mod unix`（下記）に限る。UDS 未対応 OS（Windows）では
+/// `mod unix` ごとコンパイル対象外になるため、本関数も同じ cfg で
+/// 揃える（`dead_code` を Windows の clippy `-D warnings` で検出させない）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn response_timeout() -> IoTimeout {
     let raw = match std::env::var(TEST_TIMEOUT_ENV) {
         Ok(value) => Some(value),
@@ -219,11 +230,14 @@ mod unix {
     /// 真になった後は実際の読み書きを一切行わず [`IoErrorCode::Unavailable`]
     /// を返す。
     ///
-    /// `recv_frame` の内部ループは `read` 呼び出しごとにタイムアウトを設定し
-    /// 直す（残り時間が尽きたら [`IoErrorCode::Timeout`]）。これは 1 回の
-    /// `read` あたりの保護であり、`read` が複数回に分かれる場合の合計時間の
-    /// 厳密な上限ではない。合計の応答時間はテスト側で `Instant::elapsed` を
-    /// 使って確認する。
+    /// `recv_frame` は呼び出し全体（ヘッダ＋本体）で 1 つの `deadline` を持ち、
+    /// `read_with_deadline` が生の `read` 呼び出しのたびに残り時間を
+    /// `deadline` から再計算してソケットタイムアウトへ設定し直す（codex P0
+    /// 指摘・#1121: `read_exact` 1 回に対して 1 度だけ設定すると、相手が
+    /// `deadline` 未満の間隔で細切れ送信を続けた場合、個々の `read` は
+    /// タイムアウトせずに済んでしまい、呼び出し全体としては `deadline` を
+    /// 超えて待ち続け得る。REPAIR-5 の「応答待ちの有限時間打ち切り」に反する
+    /// ため、`read` 1 回ごとに `deadline` との差分を見て打ち切る）。
     struct UnixStreamTransport {
         stream: UnixStream,
         poisoned: bool,
@@ -252,6 +266,35 @@ mod unix {
                 ),
             }
         }
+
+        /// macOS では、相手がすでに接続を閉じたソケットに対して
+        /// `set_read_timeout` / `set_write_timeout` を呼ぶと `EINVAL`
+        /// （`ErrorKind::InvalidInput` かつ `raw_os_error()` を伴う）を返す
+        /// （cursor Bugbot 指摘・#1121）。本番の `fandhe_container_io::server`
+        /// の `is_peer_shutdown_einval`／`SET_TIMEOUT_EINVAL_MEANS_PEER_SHUTDOWN`
+        /// と同じ観測に基づく判定で、このテスト用トランスポートでも同じ結論
+        /// （`Unavailable`）へ写す。std が合成する `InvalidInput`（例:
+        /// ゼロ `Duration` を渡した場合）は `raw_os_error()` を持たないため
+        /// この判定には掛からず、`map_io_error` 経由で `Internal` のまま返る
+        /// （`map_io_error` 自体には組み込まない理由: read/write 自体の
+        /// エラーは OS を問わず素直に分類したいため、タイムアウト設定の
+        /// 失敗経路だけに限定して適用する）。
+        fn is_peer_shutdown_einval(err: &std::io::Error) -> bool {
+            cfg!(target_os = "macos")
+                && err.kind() == std::io::ErrorKind::InvalidInput
+                && err.raw_os_error().is_some()
+        }
+
+        /// `set_read_timeout` / `set_write_timeout` の失敗を変換する
+        /// （[`Self::is_peer_shutdown_einval`] なら `Unavailable`、それ以外は
+        /// [`Self::map_io_error`] へ委譲）。
+        fn map_set_timeout_error(err: std::io::Error) -> IoError {
+            if Self::is_peer_shutdown_einval(&err) {
+                IoError::new(IoErrorCode::Unavailable, "transport connection is closed")
+            } else {
+                Self::map_io_error(&err)
+            }
+        }
     }
 
     impl FrameSender for UnixStreamTransport {
@@ -267,7 +310,7 @@ mod unix {
             let result = self
                 .stream
                 .set_write_timeout(Some(timeout.as_duration()))
-                .map_err(|err| Self::map_io_error(&err))
+                .map_err(Self::map_set_timeout_error)
                 .and_then(|()| {
                     self.stream
                         .write_all(&frame.encode())
@@ -311,19 +354,43 @@ mod unix {
     }
 
     impl UnixStreamTransport {
-        /// 残り時間で読み取りタイムアウトを設定し直しながら `buf` を
-        /// 読み切る（`recv_frame` のヘッダ・本体読み取りで共有するヘルパー）。
+        /// `buf` を読み切るまで、生の `read` 呼び出しのたびに `deadline` から
+        /// 残り時間を再計算してソケットタイムアウトへ設定し直す（`recv_frame`
+        /// のヘッダ・本体読み取りで共有するヘルパー）。
+        ///
+        /// `read_exact` を 1 回だけ呼んで `set_read_timeout` も 1 回だけ設定
+        /// する実装（旧版）は、相手が `deadline` 未満の間隔で細切れ送信を
+        /// 続けた場合に `read_exact` 内部の個々の `read` はどれもタイムアウト
+        /// せずに済んでしまい、呼び出し全体では `deadline` を大幅に超えて
+        /// 待ち続け得た（codex P0 指摘・#1121。REPAIR-5「応答待ちの有限時間
+        /// 打ち切り」に反する）。本実装は `read` 1 回ごとに `deadline` との
+        /// 差分を見て打ち切るため、細切れ送信でも合計待ち時間が `deadline`
+        /// を超えない。
         fn read_with_deadline(&mut self, buf: &mut [u8], deadline: Instant) -> Result<(), IoError> {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|d| !d.is_zero())
-                .ok_or_else(|| IoError::new(IoErrorCode::Timeout, "deadline already elapsed"))?;
-            self.stream
-                .set_read_timeout(Some(remaining))
-                .map_err(|err| Self::map_io_error(&err))?;
-            self.stream
-                .read_exact(buf)
-                .map_err(|err| Self::map_io_error(&err))
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| {
+                        IoError::new(IoErrorCode::Timeout, "deadline already elapsed")
+                    })?;
+                self.stream
+                    .set_read_timeout(Some(remaining))
+                    .map_err(Self::map_set_timeout_error)?;
+                match self.stream.read(&mut buf[filled..]) {
+                    Ok(0) => {
+                        return Err(IoError::new(
+                            IoErrorCode::Unavailable,
+                            "transport connection is closed",
+                        ));
+                    }
+                    Ok(n) => filled += n,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(Self::map_io_error(&err)),
+                }
+            }
+            Ok(())
         }
     }
 
@@ -331,6 +398,14 @@ mod unix {
     /// 送ると、全件の ACK がタイムアウト設定の範囲内に届く。ACK はバッチ満了
     /// （64 件）でしか返らないため（`writeback.rs` D3）、先に 64 件すべてを
     /// 送ってから受信する。
+    ///
+    /// 各リクエストの送信時刻は `send_started`（id ごとの `Instant`）に記録し、
+    /// 対応する ACK 受信時刻との差分（`send` から `recv_ack` までの実際の
+    /// 往復時間）で判定する（codex P1 指摘・#1121: 計測開始を全 64 件の
+    /// `send` 完了後に置くと、先行リクエストの ACK がタイムアウトを超えて
+    /// 遅延していても「受信開始後にタイムアウト内で届いた」ことしか検証でき
+    /// ず、REPAIR-5 の「送信した全リクエストの ACK がタイムアウト内に届く」
+    /// という受け入れ条件を取りこぼす）。
     #[test]
     fn repair5_all_acks_arrive_within_timeout_default_batch_64() {
         let timeout = response_timeout();
@@ -349,23 +424,28 @@ mod unix {
             let mut client =
                 PipelineClient::new(transport, InFlightLimit::default(), NoopSendObserver);
 
+            let started = Instant::now();
+            let mut send_started: Vec<Instant> = Vec::with_capacity(64);
             for id in 0..64u64 {
+                send_started.push(Instant::now());
                 client
                     .send(FrameKind::Write, &id.to_le_bytes(), timeout)
                     .unwrap_or_else(|err| panic!("send must succeed for id {id}: {err}"));
             }
 
-            let started = Instant::now();
             let mut acked_ids = Vec::with_capacity(64);
             let mut per_ack_elapsed = Vec::with_capacity(64);
             for _ in 0..64 {
-                let ack_started = Instant::now();
                 let receipt = client
                     .recv_ack(timeout)
                     .expect("recv_ack must succeed within the timeout");
-                per_ack_elapsed.push(ack_started.elapsed());
                 assert_eq!(receipt.ack_kind(), FrameKind::Ack);
-                acked_ids.push(receipt.request().id().get());
+                let acked_id = receipt.request().id().get();
+                let send_time = send_started.get(acked_id as usize).unwrap_or_else(|| {
+                    panic!("acked id {acked_id} must have a recorded send time")
+                });
+                per_ack_elapsed.push(send_time.elapsed());
+                acked_ids.push(acked_id);
             }
             let total = started.elapsed();
             let ack_metrics = *client.ack_metrics();
@@ -423,13 +503,14 @@ mod unix {
         for (index, elapsed) in per_ack_elapsed.iter().enumerate() {
             assert!(
                 *elapsed < timeout.as_duration(),
-                "recv_ack #{index} took {elapsed:?}, which must be under the {:?} timeout",
+                "send-to-ack round trip for the request acked at recv position #{index} took \
+                 {elapsed:?}, which must be under the {:?} timeout",
                 timeout.as_duration()
             );
         }
         assert!(
             total < timeout.as_duration(),
-            "total time to receive all 64 acks {total:?} must be under the {:?} timeout",
+            "total time from the first send to the last ack {total:?} must be under the {:?} timeout",
             timeout.as_duration()
         );
 

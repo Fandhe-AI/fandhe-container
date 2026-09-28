@@ -30,6 +30,23 @@
 //! ブロックする I/O を行わない（[`crate::observe::ServerObserver`] のドキュメント
 //! 参照）。
 //!
+//! # peer credential の検証（PLUG-12・security.md「UDS は所有者・権限・
+//! symlink を検証してから bind し、別 UID からの接続は peer credential 検証で
+//! 切断する」。E・#820 codex P0 指摘対応）
+//!
+//! [`UdsServer::accept`] は、accept した接続の相手側 uid
+//! （`crate::sys::peer_uid`。Linux は `SO_PEERCRED`、macOS は `getpeereid(2)`）が
+//! 自プロセスの実効 uid（`crate::sys::effective_uid`）と一致することを確かめる
+//! （`imp::verify_peer_credential`。Linux / macOS 限定の非公開関数）。
+//! 不一致・取得失敗（対応していないアーキテクチャを含む）のいずれも拒否し
+//! （fail-closed）、拒否した接続はすぐに閉じる。1 件の不正な接続で受付ループ
+//! 自体は止めず（`ConnectionAborted` の再試行と同じ枠組みで、期限
+//! ・[`imp::MAX_ACCEPT_ABORT_RETRIES`] の両方で有界に再試行し、
+//! [`crate::observe::ServerEvent::accept_aborted_retries`] で件数を観測できる。
+//! `AcceptAttempt` のドキュメンテーションコメント参照）、期限内は次の接続を
+//! 待ち続ける。拒否時のエラーコードは新設せず、bind 時の所有者照合
+//! （`imp::check_socket_owner`）と同じ [`IoErrorCode::InvalidArgument`] を使う。
+//!
 //! # OS 対応
 //!
 //! Linux / macOS では [`UdsServer`]・[`UdsConnection`] は実際に UDS を bind・
@@ -50,10 +67,6 @@
 //!   実際のキューとの配線は [`crate::batch::BatchBuffer`] を導入する
 //!   TASK-13.2.2（#822）の責務（`crates/io/src/recv_limits.rs` モジュール
 //!   doc 参照）
-//! - peer credential の検証（`SO_PEERCRED` / `getpeereid`）: std だけでは実装
-//!   できず `libc` / `nix` の依存承認が必要（PLUG-12 の別観点。所有 UID の
-//!   照合自体は本タスクで `imp::check_socket_owner`（Linux / macOS 限定の
-//!   非公開関数）により実装済み）
 //! - 送信側と受信側の分割 API（`try_clone` を使った split。TASK-12）
 //! - クライアント側の UDS 接続（`connect`）・[`crate::client::PipelineClient`]
 //!   との結合（TASK-13.2.2・#822）
@@ -91,11 +104,18 @@ use crate::observe::{SendEventError, ServerEvent, ServerObserver, ServerOp, Serv
 use crate::protocol::{Frame, FrameKind};
 use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
 
-/// [`imp::ServerInner::accept`] の結果に、`ConnectionAborted` の再試行回数
+/// [`imp::ServerInner::accept`] の結果に、受付ループ内で再試行した回数
 /// （[`crate::observe::ServerEvent::accept_aborted_retries`] に必要）を添えて
 /// 呼び出し元（[`UdsServer::accept`]）へ持ち帰るための非公開型（TASK-13.2.1・
 /// #820・reviewer 指摘対応。REPAIR-4）。`imp` モジュールの外へ OS 固有型を
 /// 漏らさないため、`C` は `imp::ConnectionInner` を指す型引数として使う。
+///
+/// 再試行には 2 種類ある（E・#820 codex P0 指摘対応で追加）: 相手が accept
+/// 完了前に切断した場合（`ConnectionAborted`）と、accept 自体は完了したが
+/// peer credential の検証（`imp::verify_peer_credential`）に失敗した場合。
+/// どちらも「1 件の不正・無効な接続で受付ループ全体を止めない」という同じ
+/// 目的のため、同じカウンタ・同じ上限（`imp::MAX_ACCEPT_ABORT_RETRIES`）を
+/// 共有する。
 struct AcceptAttempt<C> {
     result: Result<C, IoError>,
     aborted_retries: u32,
@@ -477,19 +497,58 @@ mod imp {
                         // macOS では accept() した stream がリスナーの
                         // O_NONBLOCK を引き継ぐ（Linux では引き継がないが、
                         // 呼んでも無害なので常に呼ぶ）。
-                        let result = stream
-                            .set_nonblocking(false)
-                            .map_err(|e| {
-                                IoError::new(
+                        if let Err(e) = stream.set_nonblocking(false) {
+                            return super::AcceptAttempt {
+                                result: Err(IoError::new(
                                     IoErrorCode::Internal,
                                     format!(
                                         "failed to clear nonblocking mode on accepted stream: {e}"
                                     ),
-                                )
-                            })
-                            .map(|()| ConnectionInner { stream });
+                                )),
+                                aborted_retries: abort_retries,
+                            };
+                        }
+
+                        // E・#820 codex P0 指摘対応（PLUG-12・security.md）:
+                        // 接続元の peer credential を検証し、自プロセスの実効
+                        // uid と一致しない（取得自体に失敗した場合を含む）
+                        // 接続は fail-closed で拒否する。1 件の不正な接続で
+                        // 受付ループ全体を止めないため、`ConnectionAborted` と
+                        // 同じ再試行の枠組み（期限・`MAX_ACCEPT_ABORT_RETRIES`
+                        // の両方で有界）を共有する（`AcceptAttempt` のドキュメン
+                        // テーションコメント参照）。
+                        if let Err(cred_err) = verify_peer_credential(&stream) {
+                            drop(stream);
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                return super::AcceptAttempt {
+                                    result: Err(IoError::new(
+                                        IoErrorCode::Timeout,
+                                        "accept timed out waiting for a client connection",
+                                    )),
+                                    aborted_retries: abort_retries,
+                                };
+                            }
+                            abort_retries = abort_retries.saturating_add(1);
+                            if abort_retries > MAX_ACCEPT_ABORT_RETRIES {
+                                return super::AcceptAttempt {
+                                    result: Err(IoError::new(
+                                        IoErrorCode::Internal,
+                                        format!(
+                                            "accept exceeded the retry limit after repeatedly \
+                                             rejecting connections (peer disconnects before \
+                                             accept completed or peer credential mismatches; \
+                                             last rejection: {cred_err})"
+                                        ),
+                                    )),
+                                    aborted_retries: abort_retries,
+                                };
+                            }
+                            continue;
+                        }
+
                         return super::AcceptAttempt {
-                            result,
+                            result: Ok(ConnectionInner { stream }),
                             aborted_retries: abort_retries,
                         };
                     }
@@ -577,15 +636,7 @@ mod imp {
     /// listener の非ブロッキング化、の順に行う。いずれかに失敗すれば
     /// 呼び出し元（[`ServerInner::bind`]）がソケットファイルを片付ける。
     fn finish_bind(listener: &UnixListener, path: &Path, parent_uid: u32) -> Result<(), IoError> {
-        let socket_uid = fs::symlink_metadata(path)
-            .map_err(|e| {
-                IoError::new(
-                    IoErrorCode::Internal,
-                    format!("failed to stat the socket file after bind: {e}"),
-                )
-            })?
-            .uid();
-        check_socket_owner(socket_uid, parent_uid)?;
+        check_socket_owner(crate::sys::effective_uid(), parent_uid)?;
 
         fs::set_permissions(path, Permissions::from_mode(0o600)).map_err(|e| {
             IoError::new(
@@ -602,27 +653,64 @@ mod imp {
         Ok(())
     }
 
-    /// ソケットファイルの所有者（`socket_uid`）が親ディレクトリの所有者
+    /// bind したプロセスの実効 uid（`effective_uid`）が親ディレクトリの所有者
     /// （`parent_uid`）と一致することを確かめる（PLUG-12・security.md「UDS は
     /// 所有者・権限・symlink を検証してから bind」）。
     ///
-    /// プロセスの実効 uid は std だけでは直接取得できないため（`libc` の
-    /// `geteuid` 相当の依存が必要）、bind 直後のソケットファイルの所有者
-    /// （自分が作成したので実効 uid と一致する）を実効 uid の代理として使う。
-    /// uid の比較自体は純粋関数に切り出し、実機で別ユーザーを用意できない
-    /// 単体テストからも具体的な uid の組で検証できるようにする
-    /// （#820 レビュー指摘）。
-    fn check_socket_owner(socket_uid: u32, parent_uid: u32) -> Result<(), IoError> {
-        if socket_uid != parent_uid {
+    /// 第 1 ラウンド（#820）時点では std だけでは実効 uid を直接取得できず
+    /// （`libc`/`nix` の依存承認が必要）、bind 直後のソケットファイルの所有者
+    /// （自分が作成したので実効 uid と一致する）を代理として使っていた。
+    /// `crate::sys::effective_uid`（E・#820 codex P0 指摘対応で追加。`geteuid(2)`
+    /// を FFI で直接呼ぶ `sys` モジュール）を導入したことで、代理を使わず
+    /// 実際の実効 uid を直接比較できるようになった。uid の比較自体は純粋関数に
+    /// 切り出し、実機で別ユーザーを用意できない単体テストからも具体的な uid の
+    /// 組で検証できるようにする（#820 レビュー指摘）。
+    fn check_socket_owner(effective_uid: u32, parent_uid: u32) -> Result<(), IoError> {
+        if effective_uid != parent_uid {
             return Err(IoError::new(
                 IoErrorCode::InvalidArgument,
                 format!(
-                    "socket file owner (uid {socket_uid}) does not match the parent \
+                    "socket owner (effective uid {effective_uid}) does not match the parent \
                      directory owner (uid {parent_uid})"
                 ),
             ));
         }
         Ok(())
+    }
+
+    /// 接続元（`stream`）の peer credential を検証する（E・#820 codex P0
+    /// 指摘対応。PLUG-12・security.md「別 UID からの接続は peer credential
+    /// 検証で切断する」）。
+    ///
+    /// `crate::sys::peer_uid`（Linux は `SO_PEERCRED`、macOS は
+    /// `getpeereid(2)`）で接続元の実 uid を取得し、`crate::sys::effective_uid`
+    /// （bind したプロセス自身の実効 uid）と一致するかを
+    /// [`peer_credential_matches`]（純粋関数。単体テスト対象）で判定する。
+    /// `peer_uid` の取得自体に失敗した場合（対応していないアーキテクチャを
+    /// 含む）も、判定不能を「別 UID からの接続」と同じ扱いにして拒否する
+    /// （fail-closed）。拒否時のエラーコードは [`check_socket_owner`]（bind 時の
+    /// 所有者照合）と同じ [`IoErrorCode::InvalidArgument`] を使い、新しいコードは
+    /// 追加しない（#820 修正計画 E）。
+    fn verify_peer_credential(stream: &UnixStream) -> Result<(), IoError> {
+        let peer_uid = crate::sys::peer_uid(stream)?;
+        let expected_uid = crate::sys::effective_uid();
+        if !peer_credential_matches(peer_uid, expected_uid) {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!(
+                    "connecting peer uid ({peer_uid}) does not match the server's effective \
+                     uid ({expected_uid})"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// uid の一致判定のみを担う純粋関数（[`check_socket_owner`] と同じ方針。
+    /// 実機で別ユーザーを用意できない単体テストから具体値で検証できるように
+    /// する。E・#820）。
+    fn peer_credential_matches(peer_uid: u32, expected_uid: u32) -> bool {
+        peer_uid == expected_uid
     }
 
     /// 親ディレクトリが symlink でなく・ディレクトリであり・owner 以外に
@@ -1172,8 +1260,25 @@ mod imp {
             let err = check_socket_owner(1000, 0)
                 .expect_err("a socket owned by a different uid than the parent must be rejected");
             assert_eq!(err.code(), IoErrorCode::InvalidArgument);
-            assert!(err.message().contains("(uid 1000)"));
+            assert!(err.message().contains("(effective uid 1000)"));
             assert!(err.message().contains("(uid 0)"));
+        }
+
+        /// E・#820（PLUG-12・security.md）: uid が一致すれば
+        /// `peer_credential_matches` は `true` を返す。別 uid の接続は root が
+        /// ないと実機で用意できないため、uid の一致判定ロジックを具体値で
+        /// 確かめる純粋関数のテストに留める（`server.rs` モジュール doc「peer
+        /// credential の検証」節）。
+        #[test]
+        fn e_820_peer_credential_matches_accepts_matching_uid() {
+            assert!(peer_credential_matches(1000, 1000));
+        }
+
+        /// E・#820（PLUG-12・security.md）: uid が不一致なら
+        /// `peer_credential_matches` は `false` を返す。
+        #[test]
+        fn e_820_peer_credential_matches_rejects_mismatched_uid() {
+            assert!(!peer_credential_matches(1000, 0));
         }
     }
 }

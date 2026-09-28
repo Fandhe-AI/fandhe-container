@@ -179,7 +179,11 @@ impl AppendFileSink {
     /// バッチごとに行う。通常モード（非 `O_APPEND`）で一度だけ `seek` すると、
     /// バッチの合間に外部から truncate されたときカーソルが古い EOF に残り、
     /// 次のバッチが `[新 EOF, 古い EOF)` をゼロ埋めの穴にして書き込むため
-    /// （IO-4・TASK-14.2。`tests/consistency/rename_truncate.rs` の T6 で検出）。
+    /// （IO-4・TASK-14.2）。回帰確認は unit test
+    /// `io4_append_file_sink_follows_external_truncate_between_batches`（3 OS）
+    /// と、UDS 経由で ACK 受信後に truncate してから次バッチを送る結合試験
+    /// `tests/writeback.rs` の `io4_io1_uds_writeback_follows_external_truncate_after_ack`
+    /// （Linux / macOS）で行う。
     /// バッチ単位の位置合わせで保証するのは「バッチの合間（ACK 送出後の
     /// 静止点）に行われた外部 truncate・拡張への追随」までであり、バッチの
     /// 書き込み途中の外部 truncate や他プロセスとの競合書き込みは対象外

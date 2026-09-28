@@ -24,13 +24,23 @@
 #     GNU coreutils の `timeout`（Linux ホストが対象。macOS 標準環境には無い）、`jq`
 #   - --from-json モード: `jq` のみ（fio 不要）
 #   - root 権限・`/dev/kvm` は不要
+#   - 全モード共通で `grep`・`dirname`・`wc`・`tr`・`mktemp`、run モードでは加えて
+#     `realpath`・`find`（いずれも前提ツール検証の対象。欠如は exit 3）
+#
+# 書き込み先の安全性（security.md の symlink・ボリューム外書き込み対策）:
+#   fio のデータファイルは `--target-dir` 直下の固定パスではなく、実行ごとに
+#   `mktemp -d` で `--target-dir` 内へ新規作成する専用サブディレクトリ（0700）の中に
+#   作る。事前に置かれた symlink を fio（O_CREAT・O_EXCL なしで open し symlink を
+#   たどる）に踏ませないための構造的対策で、後始末もそのサブディレクトリを
+#   `rm -rf` で消すだけにする（symlink をたどらない）。
 #
 # 終了コード（呼び出し元はこの具体値で分岐する）:
 #   0: 成功
 #   1: fio の実行失敗またはタイムアウト
 #   2: 入力エラー（引数の検証失敗、fio JSON のスキーマ不正、値が 0 以下、
 #      ファイルサイズ超過、symlink 等）
-#   3: 前提ツールが無い（run モードでの fio・timeout。全モード共通で jq）
+#   3: 前提ツールが無い（run モードでの fio・timeout・realpath・find。全モード共通で
+#      jq・grep・dirname・wc・tr・mktemp）
 #
 # 出力（stdout。`--output <path>` を指定した場合はファイルにも書く。人が読む進捗・
 # サマリーは stderr に出す）:
@@ -68,6 +78,9 @@ readonly MAX_IODEPTH=64
 readonly MIN_NUMJOBS=1
 readonly MAX_NUMJOBS=16
 readonly TIMEOUT_MARGIN_SECS=60 # fio の起動・終了処理のオーバーヘッド分の余裕
+# timeout が SIGTERM を送っても fio が終わらない（共有 FS 上の fsync 待ち等で
+# SIGTERM を無視する）場合に SIGKILL へ切り替えるまでの猶予（REPAIR-5: 確実に終わらせる）
+readonly TIMEOUT_KILL_AFTER_SECS=10
 
 err() {
   # ERR 系の構造化形式（code: message）に揃える（coding-rust.md）。
@@ -178,10 +191,15 @@ fi
 # `timeout` コマンド自体が要る。ツール欠如とその他の入力エラーを終了コードで
 # 区別できるよう、ファイルシステム検証より先に済ませる）
 # --------------------------------------------------
-if ! command -v jq >/dev/null 2>&1; then
-  err "missing-tool" "jq is required but not found in PATH"
-  exit 3
-fi
+# jq 以外の coreutils 系も確認する。欠如したまま進むと `set -e` でそのコマンドの
+# 終了コード（多くは 1 か 127）がスクリプトの終了コードになり、「fio 実行失敗」
+# （exit 1）と誤分類される（c2458d5 で直した誤分類と同種の穴）。
+for tool in jq grep dirname wc tr mktemp; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    err "missing-tool" "${tool} is required but not found in PATH"
+    exit 3
+  fi
+done
 if [ "$mode" = "run" ]; then
   if ! command -v fio >/dev/null 2>&1; then
     err "missing-tool" "fio is required but not found in PATH (run mode)"
@@ -191,6 +209,12 @@ if [ "$mode" = "run" ]; then
     err "missing-tool" "GNU coreutils 'timeout' is required but not found in PATH (run mode, Linux host only)"
     exit 3
   fi
+  for tool in realpath find; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      err "missing-tool" "${tool} is required but not found in PATH (run mode)"
+      exit 3
+    fi
+  done
 fi
 
 # --------------------------------------------------
@@ -245,6 +269,23 @@ if [ "$size_bytes" -gt "$MAX_SIZE_BYTES" ]; then
   err "invalid-input" "--size exceeds the ${MAX_SIZE_BYTES}-byte cap: $size"
   exit 2
 fi
+
+# 結果 JSON を --output へ書く。事前の `-L`/`-e` 検証から書き込みまでの間に
+# symlink・ファイルを置かれても踏まないよう、noclobber（bash は対象が無ければ
+# O_CREAT|O_EXCL で開くため、dangling を含む symlink・既存ファイルでは失敗する）の
+# サブシェルで書く。失敗は入力エラー（exit 2）として扱う（set -e に任せると
+# exit 1「fio 実行失敗」と誤分類されるため）。
+# 残る制約: bash の noclobber は、既存の「通常ファイル以外」（FIFO・デバイス等。
+# それを指す symlink を含む）には O_CREAT なしで開いて書き込む仕様のため、検証後の
+# 競合でそれらを指す symlink を置かれた場合は防げない（通常ファイル・dangling
+# symlink・存在しないパスの上書きは防げる）。
+write_output_file() {
+  local content="$1"
+  if ! (set -o noclobber; printf '%s\n' "$content" >"$output_path") 2>/dev/null; then
+    err "invalid-input" "--output path could not be created exclusively (appeared after validation or is not writable): $output_path"
+    exit 2
+  fi
+}
 
 check_symlink_reject() {
   # symlink をたどって存在判定する `-e`/`-f` より先に symlink 判定する
@@ -418,7 +459,7 @@ if [ "$mode" = "from-json" ]; then
   result=$(convert_fio_json "$from_json" "from_json" "$params_json")
   printf '%s\n' "$result"
   if [ -n "$output_path" ]; then
-    printf '%s\n' "$result" >"$output_path"
+    write_output_file "$result"
   fi
   exit 0
 fi
@@ -439,7 +480,10 @@ if [ ! -w "$target_dir" ]; then
   err "invalid-input" "--target-dir is not writable: $target_dir"
   exit 2
 fi
-target_dir_real=$(realpath -- "$target_dir")
+if ! target_dir_real=$(realpath -- "$target_dir" 2>/dev/null) || [ -z "$target_dir_real" ]; then
+  err "invalid-input" "--target-dir could not be resolved: $target_dir"
+  exit 2
+fi
 
 # fio の `--directory`/`--filename` は ':' をリスト区切り文字として解釈し
 # （fio 本体の `filename.c` の `add_file`/`get_next_filename` 周辺が
@@ -447,7 +491,7 @@ target_dir_real=$(realpath -- "$target_dir")
 # `directory=str`/`filename=str` の「複数指定は ':' 区切り」という記述と一致する。
 # エスケープは `\:`。この環境に fio が無く実機での再現確認はしていない）、
 # ':' を含む正規化後のパスを渡すと fio が意図しない複数ディレクトリへ書き込みうる。
-# `cleanup()` は固定の 1 ファイルしか消さないため、他の書き込み先にデータファイルが
+# `cleanup()` は専用サブディレクトリ 1 つしか消さないため、他の書き込み先にデータファイルが
 # 残留する（security.md の「ボリューム外へ書き込める経路を作らない」に反する）。
 # realpath 後の値を検証し、シンボリックリンク解決や相対解釈で ':' が入り込む
 # 余地を残さない。
@@ -456,23 +500,61 @@ if [ "$target_dir_real" != "${target_dir_real//:/}" ]; then
   exit 2
 fi
 
-tmp_dir=$(mktemp -d)
-fio_out_json="${tmp_dir}/fio-output.json"
-data_file="${target_dir_real}/${FIXED_FILENAME}"
+# 他ユーザーが書き込めて sticky bit も無いディレクトリは拒否する。そのような
+# ディレクトリでは、下の専用サブディレクトリを作った直後に第三者がそれを rename して
+# symlink へ差し替え、fio をボリューム外へ書き込ませる競合が残るため（sticky bit が
+# あれば他ユーザーは自分のエントリしか rename・削除できない。/tmp 等の 1777 は許容）。
+# グループ書き込み可（775 等）は、ユーザープライベートグループ既定の環境で一般的な
+# ため拒否しない（同じグループのメンバーは信頼する前提）。
+if [ -n "$(find "$target_dir_real" -maxdepth 0 -perm -0002 ! -perm -1000 2>/dev/null)" ]; then
+  err "invalid-input" "--target-dir is world-writable without the sticky bit, refusing to use it: $target_dir_real"
+  exit 2
+fi
 
+# trap より先に空で初期化し、作成前に終了した経路で未定義・空パスを rm しないようにする。
+tmp_dir=""
+run_dir=""
 # fio の一時出力・書き込んだデータファイルは、成否に関わらず必ず削除する（DoS 防止・
 # ディスク占有を残さないための後始末。coding-rust.md「相手の応答を待つ処理には
 # タイムアウトを設ける」と対で、タイムアウト／失敗経路でも後始末が漏れないようにする）。
+# `rm -rf` は削除対象のパス自体が symlink に差し替えられていてもリンクそのものを
+# 消すだけで、リンク先をたどって再帰削除しない。
 # shellcheck disable=SC2329 # trap 経由で呼ばれるため直接の呼び出しは無い
 cleanup() {
-  rm -rf "$tmp_dir"
-  rm -f "$data_file"
+  if [ -n "$tmp_dir" ]; then
+    rm -rf -- "$tmp_dir"
+  fi
+  if [ -n "$run_dir" ]; then
+    rm -rf -- "$run_dir"
+  fi
 }
 trap cleanup EXIT
 
+if ! tmp_dir=$(mktemp -d 2>/dev/null) || [ -z "$tmp_dir" ]; then
+  tmp_dir=""
+  err "invalid-input" "could not create a temporary directory for the fio output"
+  exit 2
+fi
+fio_out_json="${tmp_dir}/fio-output.json"
+
+# データファイルの置き場として、--target-dir 内に実行ごとの専用サブディレクトリを
+# 新規作成する（security.md の symlink・ボリューム外書き込み対策）。
+# 固定パス `${target_dir_real}/${FIXED_FILENAME}` を直接 fio に渡すと、事前に置かれた
+# 同名 symlink を fio がたどってリンク先（ボリューム外）を --size 分上書きする。
+# 「symlink・既存ファイルなら拒否（exit 2）」という事前検査は検査から fio の open
+# までの競合（TOCTOU）を原理的に塞げないため採らない。`mktemp -d` は一意な名前で
+# mkdir(2)（最終要素が既存の symlink なら EEXIST で失敗し、たどらない）を 0700 で
+# 行うため、作成後のサブディレクトリ内へ第三者（root 以外）がエントリを置けない。
+# fio にはこのサブディレクトリ内の固定ファイル名だけを渡す。
+if ! run_dir=$(mktemp -d "${target_dir_real}/fandhe-fio-randwrite-4k.XXXXXXXXXX" 2>/dev/null) || [ -z "$run_dir" ]; then
+  run_dir=""
+  err "invalid-input" "could not create a private working directory under --target-dir: $target_dir_real"
+  exit 2
+fi
+
 fio_args=(
   --name=fandhe-fio-randwrite-4k
-  --directory="$target_dir_real"
+  --directory="$run_dir"
   --filename="$FIXED_FILENAME"
   --rw=randwrite
   --bs=4k
@@ -492,9 +574,17 @@ fio_args=(
 timeout_secs=$((runtime + TIMEOUT_MARGIN_SECS))
 echo "info: running fio (runtime=${runtime}s, timeout=${timeout_secs}s, target=${target_dir_real})" >&2
 fio_rc=0
-timeout "${timeout_secs}s" fio "${fio_args[@]}" >&2 || fio_rc=$?
+# `-k` で SIGTERM 後も終わらない fio を SIGKILL する（REPAIR-5）。タイムアウト時の
+# 終了コードは SIGTERM で止まれば 124、SIGKILL へ切り替えた場合は 137（128+SIGKILL）に
+# なりうる（uutils coreutils 0.10.0 で 137 を確認。GNU coreutils での値は未確認）ため、
+# 両方をタイムアウト系として扱う。いずれも契約上は exit 1。
+timeout -k "${TIMEOUT_KILL_AFTER_SECS}s" "${timeout_secs}s" fio "${fio_args[@]}" >&2 || fio_rc=$?
 if [ "$fio_rc" -eq 124 ]; then
   err "fio-timeout" "fio did not finish within ${timeout_secs}s"
+  exit 1
+fi
+if [ "$fio_rc" -eq 137 ]; then
+  err "fio-timeout" "fio was killed with SIGKILL (did not stop within ${TIMEOUT_KILL_AFTER_SECS}s after the ${timeout_secs}s timeout, or was killed externally)"
   exit 1
 fi
 if [ "$fio_rc" -ne 0 ]; then
@@ -505,6 +595,6 @@ fi
 result=$(convert_fio_json "$fio_out_json" "run" "$params_json")
 printf '%s\n' "$result"
 if [ -n "$output_path" ]; then
-  printf '%s\n' "$result" >"$output_path"
+  write_output_file "$result"
 fi
 exit 0

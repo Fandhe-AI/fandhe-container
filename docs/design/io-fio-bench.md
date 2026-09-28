@@ -13,8 +13,9 @@ fandhe-container の I/O 共有プロトコル経由の共有マウントはま�
 
 ## 前提条件
 
-- **run モード**（実際に fio を実行する）: fio 3.x 以上（`lat_ns`/`clat_ns` 等の `*_ns` キーを出力する版）・GNU coreutils の `timeout`・`jq`。**Linux ホストのみ対象**（GNU `timeout` が無い macOS 標準環境・Windows は対象外。VM ゲスト経由の経路は後続 TASK で扱う）
-- **`--from-json` モード**（既存の fio JSON 出力を変換するだけ）: `jq` のみ（fio・`timeout` は不要）。bash と jq だけで動くため、fio 未導入の CI・ローカル環境でも自己テストが完結する
+- **run モード**（実際に fio を実行する）: fio 3.x 以上（`lat_ns`/`clat_ns` 等の `*_ns` キーを出力する版）・GNU coreutils の `timeout`・`realpath`・`find`・`jq`。**Linux ホストのみ対象**（GNU `timeout` が無い macOS 標準環境・Windows は対象外。VM ゲスト経由の経路は後続 TASK で扱う）
+- **`--from-json` モード**（既存の fio JSON 出力を変換するだけ）: `jq`（fio・`timeout` は不要）。bash と jq だけで動くため、fio 未導入の CI・ローカル環境でも自己テストが完結する
+- **全モード共通**: `grep`・`dirname`・`wc`・`tr`・`mktemp`（欠如時は終了コード 3。欠如したまま進むと別の終了コードへ誤分類されるため事前に検出する）
 - **root 権限・`/dev/kvm` は不要**（親 #111 の受入基準）
 
 ## 使い方
@@ -47,10 +48,10 @@ bash scripts/fio-randwrite-4k.sh --from-json /tmp/fio-out.json --label docker_bi
 
 | オプション | 既定値 | 説明 |
 | ---- | ---- | ---- |
-| `--target-dir <dir>` | （run モード必須） | fio の書き込み先ディレクトリ。symlink 拒否・書き込み可能なディレクトリであることを検証してから `realpath` で正規化する。正規化後のパスに `:` を含む場合も拒否する（fio が `--directory`/`--filename` の `:` をディレクトリ・ファイル名リストの区切り文字として解釈するため） |
+| `--target-dir <dir>` | （run モード必須） | fio の書き込み先ディレクトリ。symlink 拒否・書き込み可能なディレクトリであることを検証してから `realpath` で正規化する。正規化後のパスに `:` を含む場合も拒否する（fio が `--directory`/`--filename` の `:` をディレクトリ・ファイル名リストの区切り文字として解釈するため）。他ユーザー書き込み可能で sticky bit が無いディレクトリも拒否する（`/tmp` 等の 1777 は可）。データファイルは下記「書き込み先の安全性」のとおり、このディレクトリ内に実行ごとに作る専用サブディレクトリへ書く |
 | `--from-json <path>` | （from-json モード必須） | 既存の fio `--output-format=json` 出力へのパス。symlink 拒否・サイズ上限（4 MiB）あり |
 | `--label <label>` | 必須 | `^[a-z0-9_-]{1,64}$`。出力 JSON にそのまま記録し、計測対象（Docker ベースラインか fandhe 経路か等）を表す |
-| `--output <path>` | （出力しない） | 指定時、結果 JSON をこのパスにも書く。symlink 拒否・既存ファイルへの上書きは拒否する。親ディレクトリの存在・書き込み可否も事前検証する（未検証のまま書き込みに失敗すると、呼び出し元が終了コード 1「fio 実行失敗」と誤認するため） |
+| `--output <path>` | （出力しない） | 指定時、結果 JSON をこのパスにも書く。symlink 拒否・既存ファイルへの上書きは拒否する。親ディレクトリの存在・書き込み可否も事前検証する（未検証のまま書き込みに失敗すると、呼び出し元が終了コード 1「fio 実行失敗」と誤認するため）。書き込み自体も noclobber（対象が無ければ `O_CREAT\|O_EXCL`）で行い、検証後に symlink・ファイルを置かれた場合は書かずに終了コード 2 で止める（bash の noclobber の仕様上、FIFO・デバイス等の通常ファイル以外を指す symlink を検証後に置かれた場合は対象外） |
 | `--direct 0\|1` | `1` | fio `--direct`。tmpfs・FUSE 系の共有 FS では O_DIRECT が失敗しうるため変更できる |
 | `--size <NkNmNg>` | `256m` | fio `--size`。`^[1-9][0-9]{0,5}[kmg]$`（先頭ゼロ不可）かつ 10 GiB 以下（DoS 防止の上限） |
 | `--runtime <1-600>` | `30` | fio `--runtime`（秒。`--time_based` と併用）。`^[1-9][0-9]{0,3}$`（先頭ゼロ不可） |
@@ -58,6 +59,12 @@ bash scripts/fio-randwrite-4k.sh --from-json /tmp/fio-out.json --label docker_bi
 | `--numjobs <1-16>` | `1` | fio `--numjobs`。`^[1-9][0-9]{0,2}$`（先頭ゼロ不可） |
 
 先頭ゼロを拒否する理由: 先頭ゼロを許すとシェル側の算術評価が 8 進数として解釈してしまい（例: `08` は無効な 8 進数リテラルとしてエラーになる）、入力エラーであるべきケースが「fio 実行失敗」等の別の終了コードに化ける、または無効な JSON 数値として渡ってしまうため。
+
+### 書き込み先の安全性（symlink 経由のボリューム外書き込み対策）
+
+fio はデータファイルを `O_CREAT`（`O_EXCL` なし）で開き symlink をたどるため、`--target-dir` 直下の固定パスへ書かせると、事前に同名の symlink を置かれた場合にリンク先（ボリューム外の任意ファイル）を `--size` 分上書きしてしまう（security.md のパストラバーサル・symlink 対策）。そこで run モードは実行ごとに `mktemp -d` で `--target-dir` 内へ一意な名前の専用サブディレクトリ（`fandhe-fio-randwrite-4k.XXXXXXXXXX`・0700）を新規作成し、fio にはその中の固定ファイル名 `fandhe-fio-randwrite-4k.dat` だけを渡す。後始末はそのサブディレクトリを `rm -rf` で消すだけで、symlink をたどらない。
+
+「symlink・既存ファイルなら拒否する」事前検査を採らないのは、検査から fio の open までの競合（TOCTOU）を原理的に塞げないため。`--target-dir` 直下に置かれた同名 symlink はそのまま残り、リンク先も変更されない（自己テストで照合する）。
 
 `--rw`（`randwrite` 固定）・`--bs`（`4k` 固定）・`--ioengine`（`psync` 固定。libaio は Linux 専用のため移植性を優先）・`--end_fsync`（`1` 固定。write-back とフラッシュの意味論〔IO-2〕を含めて測るため）・`--group_reporting`（有効固定）は変更できない。有効値はすべて出力 JSON の `params` に記録する。
 
@@ -98,14 +105,14 @@ bash scripts/fio-randwrite-4k.sh --from-json /tmp/fio-out.json --label docker_bi
 | コード | 意味 |
 | ---- | ---- |
 | 0 | 成功 |
-| 1 | fio の実行失敗またはタイムアウト（`timeout` が保護する。REPAIR-5） |
+| 1 | fio の実行失敗またはタイムアウト（`timeout` が保護する。SIGTERM で止まらない場合は 10 秒後に SIGKILL する。REPAIR-5） |
 | 2 | 入力エラー（引数の検証失敗、fio JSON のスキーマ不正、値が 0 以下、ファイルサイズ超過、symlink 等） |
-| 3 | 前提ツールが無い（run モードでの fio・timeout。全モード共通で jq） |
+| 3 | 前提ツールが無い（run モードでの fio・timeout・realpath・find。全モード共通で jq・grep・dirname・wc・tr・mktemp） |
 
 ## 自己テスト（`scripts/fio-randwrite-4k-selftest.sh`）
 
-`--from-json` モードと `scripts/testdata/fio-bench/` の固定 fixture、および最小の fio スタブ（固定 JSON を書き出すだけ）を使い、実 fio なしで終了コード・出力値・`check-bench-regression.sh` との round-trip互換性を機械照合する（REPAIR-12）。`make fio-bench-selftest` から実行し、CI の `bench-regression` ジョブにも組み込む。run モードの実 fio を使った実行確認は「実機での確認」節を参照。
+`--from-json` モードと `scripts/testdata/fio-bench/` の固定 fixture、および最小の fio スタブ（固定 JSON を書き出すだけ）を使い、実 fio なしで終了コード・出力値・`check-bench-regression.sh` との round-trip 互換性、および symlink・競合に対する書き込み先の安全性（上記「書き込み先の安全性」・`--output` の排他作成）を機械照合する（REPAIR-12）。`make fio-bench-selftest` から実行し、CI の `bench-regression` ジョブにも組み込む。run モードの実 fio を使った実行確認は「実機での確認」節を参照。
 
 ## 実機での確認（人間担当・TASK-25.2 との切り分け）
 
-fio が導入された Linux 環境で `make fio-bench TARGET_DIR=<一時ディレクトリ> LABEL=local_tmp RUNTIME=5` を実行し、JSON が出力されること・実行後に target ディレクトリへデータファイルが残らないことを確認する。Docker ベースライン比の実測・レポート・目標値案は TASK-25.2（#113）、目標値の妥当性判断は TASK-25.h1（#114。人間担当）で行う。
+fio が導入された Linux 環境で `make fio-bench TARGET_DIR=<一時ディレクトリ> LABEL=local_tmp RUNTIME=5` を実行し、JSON が出力されること・実行後に target ディレクトリへ専用サブディレクトリ（`fandhe-fio-randwrite-4k.*`）とデータファイルが残らないことを確認する。Docker ベースライン比の実測・レポート・目標値案は TASK-25.2（#113）、目標値の妥当性判断は TASK-25.h1（#114。人間担当）で行う。

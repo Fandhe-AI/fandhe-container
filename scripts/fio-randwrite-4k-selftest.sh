@@ -5,7 +5,9 @@
 # （scripts/testdata/fio-bench/）で、終了コードと変換結果の値を具体値で照合する
 # （REPAIR-12: 受け入れ基準を機械照合する）。run モードの経路は起動コマンド組み立て
 # （引数検証・symlink・上限チェック・欠如ツール検出・後始末）を最小の fio スタブで
-# 確認する（実 fio は使わない）。run モードは対象スクリプト自体が GNU coreutils の
+# 確認する（実 fio は使わない）。専用サブディレクトリへの書き込み・事前に置かれた
+# symlink を踏まないこと・--output の検証後に置かれた symlink を拒否することも
+# スタブで照合する（security.md）。run モードは対象スクリプト自体が GNU coreutils の
 # `timeout`・`realpath` を要求する契約（Linux ホストのみ対象）のため、本自己テストの
 # run モード関連ケースも同じ前提（Linux・GNU coreutils）を引き継ぐ。実測（実際の
 # 書き込み性能）はここでは行わない（実測は docs/design/io-fio-bench.md の
@@ -29,18 +31,69 @@ failures=0
 tmp_root=$(mktemp -d)
 trap 'rm -rf "$tmp_root"' EXIT
 
-# 期待終了コードと実際の終了コードを照合する 1 ケース分の判定。
-# 引数: <ケース名> <期待終了コード> -- <target_script への残り引数...>
+# 直近の run_case で対象スクリプトが出した stdout+stderr（失敗時の診断・
+# メッセージ照合用）。
+last_output=""
+
+# 失敗時の診断出力を字下げして stderr へ出す。PATH を絞ったケース（前提ツール
+# 欠如の検証）でも動くよう、sed 等の外部コマンドを使わない。
+print_indented() {
+  local line
+  while IFS= read -r line; do
+    printf '  | %s\n' "$line" >&2
+  done <<<"$1"
+}
+
+# 期待終了コードと実際の終了コードを照合する 1 ケース分の判定。失敗時は対象
+# スクリプトの出力をそのまま表示し、CI のログだけで原因を追えるようにする。
+# 引数: <ケース名> <期待終了コード> <target_script への残り引数...>
 run_case() {
   local name="$1"
   local expected="$2"
   shift 2
   local actual=0
-  "$bash_bin" "$target_script" "$@" >/dev/null 2>&1 || actual=$?
+  last_output=$("$bash_bin" "$target_script" "$@" 2>&1) || actual=$?
   if [ "$actual" -eq "$expected" ]; then
     echo "PASS: ${name} (exit=${actual})"
+    return 0
+  fi
+  echo "FAIL: ${name} (expected exit=${expected}, actual exit=${actual})" >&2
+  print_indented "$last_output"
+  failures=$((failures + 1))
+  return 1
+}
+
+# run_case に加えて、出力に期待する文字列が含まれることを照合する（終了コードが
+# 同じでも別の理由で止まっていないことを確かめる）。PATH を絞った状態でも
+# 動くよう、外部コマンドを使わず bash のパターン照合で判定する。
+# 引数: <ケース名> <期待終了コード> <期待する部分文字列> <target_script への残り引数...>
+run_case_msg() {
+  local name="$1"
+  local expected="$2"
+  local needle="$3"
+  shift 3
+  run_case "$name" "$expected" "$@" || return 0
+  if [[ "$last_output" == *"$needle"* ]]; then
+    echo "PASS: ${name}-message (contains '${needle}')"
   else
-    echo "FAIL: ${name} (expected exit=${expected}, actual exit=${actual})" >&2
+    echo "FAIL: ${name}-message (output does not contain '${needle}')" >&2
+    print_indented "$last_output"
+    failures=$((failures + 1))
+  fi
+}
+
+# 期待する文字列内容とファイルの中身を照合する（symlink 経由の上書きが無いことの確認用）。
+# 引数: <ケース名> <ファイル> <期待内容>
+check_file_content() {
+  local name="$1"
+  local file="$2"
+  local expected="$3"
+  local actual
+  actual=$(cat -- "$file" 2>/dev/null || echo "<unreadable>")
+  if [ "$actual" = "$expected" ]; then
+    echo "PASS: ${name}"
+  else
+    echo "FAIL: ${name} (expected content '${expected}', actual '${actual}': ${file})" >&2
     failures=$((failures + 1))
   fi
 }
@@ -121,11 +174,12 @@ jq '{
 }' "$results_json" >"$baseline_json"
 
 roundtrip_actual=0
-bash "$bench_check_script" "$baseline_json" "$results_json" >/dev/null 2>&1 || roundtrip_actual=$?
+roundtrip_output=$(bash "$bench_check_script" "$baseline_json" "$results_json" 2>&1) || roundtrip_actual=$?
 if [ "$roundtrip_actual" -eq 0 ]; then
   echo "PASS: results-json-compatible-with-bench-regression (exit=${roundtrip_actual})"
 else
   echo "FAIL: results-json-compatible-with-bench-regression (expected exit=0, actual exit=${roundtrip_actual})" >&2
+  print_indented "$roundtrip_output"
   failures=$((failures + 1))
 fi
 
@@ -141,6 +195,19 @@ else
   failures=$((failures + 1))
 fi
 run_case "output-refuse-overwrite" 2 --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "$out_path"
+
+# --output が dangling symlink の場合も拒否し、リンク先を作らない（`-e` は dangling
+# symlink を「存在しない」と判定するため、`-L` 判定が先に効いていることの確認）
+dangling_victim="${tmp_root}/dangling-victim.json"
+dangling_link="${tmp_root}/dangling-link.json"
+ln -s "$dangling_victim" "$dangling_link"
+run_case "output-refuse-dangling-symlink" 2 --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "$dangling_link"
+if [ ! -e "$dangling_victim" ]; then
+  echo "PASS: output-dangling-symlink-target-not-created"
+else
+  echo "FAIL: output-dangling-symlink-target-not-created (created: $dangling_victim)" >&2
+  failures=$((failures + 1))
+fi
 
 # --output の親ディレクトリが存在しない場合は入力エラー（exit 2）として弾く
 # （回帰テスト: `printf ... >"$output_path"` の書き込み失敗に丸投げすると
@@ -166,28 +233,23 @@ chmod 755 "$readonly_output_dir"
 # 起動するため PATH を空にしても解決できる）
 empty_bin="${tmp_root}/empty-bin"
 mkdir -p "$empty_bin"
-no_jq_actual=0
-PATH="$empty_bin" "$bash_bin" "$target_script" --from-json "${fixtures_dir}/fio-3-ok.json" --label x >/dev/null 2>&1 || no_jq_actual=$?
-if [ "$no_jq_actual" -eq 3 ]; then
-  echo "PASS: missing-jq-tool (exit=${no_jq_actual})"
-else
-  echo "FAIL: missing-jq-tool (expected exit=3, actual exit=${no_jq_actual})" >&2
-  failures=$((failures + 1))
-fi
+PATH="$empty_bin" run_case_msg "missing-jq-tool" 3 "jq is required" --from-json "${fixtures_dir}/fio-3-ok.json" --label x
 
-# fio が無い PATH（run モードのみの前提ツール欠如。exit 3。PATH を jq だけに絞る）
+# jq だけがある PATH（coreutils 系の前提ツール欠如。exit 3。欠如したまま進むと
+# `set -e` 経由で exit 1「fio 実行失敗」に誤分類されていた穴の回帰テスト）
 jq_only_bin="${tmp_root}/jq-only-bin"
 mkdir -p "$jq_only_bin"
-jq_path=$(command -v jq)
-ln -s "$jq_path" "${jq_only_bin}/jq"
-no_fio_actual=0
-PATH="$jq_only_bin" "$bash_bin" "$target_script" --target-dir /tmp --label x >/dev/null 2>&1 || no_fio_actual=$?
-if [ "$no_fio_actual" -eq 3 ]; then
-  echo "PASS: missing-fio-tool (exit=${no_fio_actual})"
-else
-  echo "FAIL: missing-fio-tool (expected exit=3, actual exit=${no_fio_actual})" >&2
-  failures=$((failures + 1))
-fi
+ln -s "$(command -v jq)" "${jq_only_bin}/jq"
+PATH="$jq_only_bin" run_case_msg "missing-grep-tool" 3 "grep is required" --from-json "${fixtures_dir}/fio-3-ok.json" --label x
+
+# 全モード共通の前提ツールは揃っているが fio が無い PATH（run モードのみの前提
+# ツール欠如。exit 3。fio の欠如そのものを検出していることをメッセージで確認する）
+common_bin="${tmp_root}/common-bin"
+mkdir -p "$common_bin"
+for tool in jq grep dirname wc tr mktemp; do
+  ln -s "$(command -v "$tool")" "${common_bin}/${tool}"
+done
+PATH="$common_bin" run_case_msg "missing-fio-tool" 3 "fio is required" --target-dir /tmp --label x
 
 # 最小の fio スタブ（固定 JSON を --output へ書き出すだけ）を作り、既存 PATH の
 # 先頭に足すことで「fio・timeout・jq は揃っている」状態を作る（bash 解決に
@@ -211,7 +273,12 @@ fio_stub="${stub_bin}/fio"
   echo '    --filename=*) fname="${a#--filename=}" ;;'
   echo '  esac'
   echo 'done'
-  echo '[ -n "$dir" ] && [ -n "$fname" ] && : > "$dir/$fname"'
+  # 受け取った --directory を記録する（書き込み先が専用サブディレクトリであることの照合用）
+  echo '[ -n "${FIO_STUB_DIR_LOG:-}" ] && echo "$dir" >"$FIO_STUB_DIR_LOG"'
+  # 実 fio と同じく、データファイルを symlink をたどる形（O_CREAT・O_EXCL なし）で書く
+  echo '[ -n "$dir" ] && [ -n "$fname" ] && echo stub-fio-data > "$dir/$fname"'
+  # 実行中に第三者が symlink を置く競合（TOCTOU）を再現するためのフック
+  echo '[ -n "${FIO_STUB_PLANT_LINK:-}" ] && ln -s "$FIO_STUB_PLANT_TARGET" "$FIO_STUB_PLANT_LINK"'
   echo "cat \"${fixtures_dir}/fio-3-ok.json\" >\"\$out\""
   echo 'exit 0'
 } >"$fio_stub"
@@ -254,10 +321,37 @@ else
 fi
 chmod 755 "$readonly_target"
 
-# run モードの正常系（fio スタブ経由。データファイルが後始末で残らないことも確認する）
+# 他ユーザー書き込み可能で sticky bit が無い --target-dir は拒否する（作成した専用
+# サブディレクトリを第三者が symlink へ差し替える競合を防ぐ。security.md）
+ww_target="${tmp_root}/world-writable-target"
+mkdir -p "$ww_target"
+chmod 777 "$ww_target"
+PATH="$stub_path" run_case_msg "run-world-writable-no-sticky-target-dir" 2 "world-writable without the sticky bit" --target-dir "$ww_target" --label x
+chmod 755 "$ww_target"
+
+# sticky bit 付き（/tmp と同じ 1777）は許容する
+sticky_target="${tmp_root}/sticky-target"
+mkdir -p "$sticky_target"
+chmod 1777 "$sticky_target"
+PATH="$stub_path" run_case "run-sticky-world-writable-target-dir" 0 --target-dir "$sticky_target" --label x --runtime 5
+chmod 755 "$sticky_target"
+
+# run モードの正常系（fio スタブ経由。データファイルが専用サブディレクトリに書かれ、
+# 後始末でサブディレクトリごと残らないことも確認する）
 run_target="${tmp_root}/run-target"
 mkdir -p "$run_target"
-PATH="$stub_path" run_case "run-ok-with-stub" 0 --target-dir "$run_target" --label local_tmp --runtime 5
+dir_log="${tmp_root}/fio-stub-dir.log"
+FIO_STUB_DIR_LOG="$dir_log" PATH="$stub_path" run_case "run-ok-with-stub" 0 --target-dir "$run_target" --label local_tmp --runtime 5
+stub_dir=$(cat -- "$dir_log" 2>/dev/null || true)
+case "$stub_dir" in
+  "${run_target}"/fandhe-fio-randwrite-4k.??????????)
+    echo "PASS: run-uses-private-subdir (${stub_dir})"
+    ;;
+  *)
+    echo "FAIL: run-uses-private-subdir (fio --directory was '${stub_dir}', expected ${run_target}/fandhe-fio-randwrite-4k.XXXXXXXXXX)" >&2
+    failures=$((failures + 1))
+    ;;
+esac
 leftover_count=$(find "$run_target" -mindepth 1 | wc -l | tr -d ' ')
 if [ "$leftover_count" -eq 0 ]; then
   echo "PASS: run-cleanup-no-leftover-files"
@@ -265,6 +359,45 @@ else
   echo "FAIL: run-cleanup-no-leftover-files (found ${leftover_count} leftover entries under $run_target)" >&2
   failures=$((failures + 1))
 fi
+
+# 回帰テスト（security.md・symlink 経由のボリューム外書き込み）: --target-dir 直下に
+# 固定データファイル名の symlink をボリューム外の victim へ向けて事前に置いても、
+# fio（スタブは実 fio と同じく symlink をたどって書く）は専用サブディレクトリへ書く
+# ため victim は変更されない。事前検査での拒否ではなくサブディレクトリ方式にした
+# 理由（TOCTOU）は fio-randwrite-4k.sh の run_dir 作成箇所のコメントを参照。
+attack_target="${tmp_root}/attack-target"
+mkdir -p "$attack_target"
+victim_file="${tmp_root}/victim.txt"
+printf 'victim-original-content\n' >"$victim_file"
+ln -s "$victim_file" "${attack_target}/fandhe-fio-randwrite-4k.dat"
+PATH="$stub_path" run_case "run-preplaced-data-file-symlink" 0 --target-dir "$attack_target" --label x --runtime 5
+check_file_content "run-preplaced-symlink-victim-unchanged" "$victim_file" "victim-original-content"
+if [ -L "${attack_target}/fandhe-fio-randwrite-4k.dat" ]; then
+  echo "PASS: run-preplaced-symlink-left-untouched"
+else
+  echo "FAIL: run-preplaced-symlink-left-untouched (symlink was removed or replaced)" >&2
+  failures=$((failures + 1))
+fi
+attack_leftover=$(find "$attack_target" -mindepth 1 ! -name fandhe-fio-randwrite-4k.dat | wc -l | tr -d ' ')
+if [ "$attack_leftover" -eq 0 ]; then
+  echo "PASS: run-preplaced-symlink-no-leftover-subdir"
+else
+  echo "FAIL: run-preplaced-symlink-no-leftover-subdir (found ${attack_leftover} leftover entries under $attack_target)" >&2
+  failures=$((failures + 1))
+fi
+
+# 回帰テスト（--output の検証後に symlink を置かれる競合。TOCTOU）: fio 実行中に
+# --output のパスへ victim を指す symlink を置いても、noclobber で排他的に作成する
+# ため書き込みを拒否し（exit 2）、victim は変更されない。
+race_target="${tmp_root}/race-target"
+mkdir -p "$race_target"
+race_victim="${tmp_root}/race-victim.txt"
+printf 'race-victim-original\n' >"$race_victim"
+race_output="${tmp_root}/race-output.json"
+FIO_STUB_PLANT_LINK="$race_output" FIO_STUB_PLANT_TARGET="$race_victim" PATH="$stub_path" \
+  run_case_msg "run-output-symlink-planted-during-run" 2 "could not be created exclusively" \
+  --target-dir "$race_target" --label x --runtime 5 --output "$race_output"
+check_file_content "run-output-race-victim-unchanged" "$race_victim" "race-victim-original"
 
 if [ "$failures" -gt 0 ]; then
   echo "self-test failed: ${failures} case(s) did not match the expected result" >&2

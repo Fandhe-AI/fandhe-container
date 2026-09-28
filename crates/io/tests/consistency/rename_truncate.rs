@@ -66,9 +66,10 @@ fn reopen_sink(path: &Path) -> AppendFileSink {
 /// `path` を `OpenOptions::append(true)` で開いた [`AppendFileSink`] を返す
 /// （T4 専用。非 `O_APPEND` の [`AppendFileSink::new`] は一度だけ末尾へ seek
 /// するため、ライブセッション中に外部から truncate されるとカーソルが古い
-/// ままになりゼロ埋めの穴ができる〔§7 のスコープ外事項〕。`append(true)` で
-/// 開くと各 `write_all` が OS レベルで常に現在の EOF に着地するため、この穴を
-/// 避けられる）。
+/// ままになりゼロ埋めの穴ができる。これは非 append モードでの既知の限界で、
+/// 本テストファイルの対応範囲外とし、別途の Issue 化は未実施（Issue 未起票）。
+/// `append(true)` で開くと各 `write_all` が OS レベルで常に現在の EOF に
+/// 着地するため、この穴を避けられる）。
 fn append_mode_sink(path: &Path) -> AppendFileSink {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -559,9 +560,9 @@ fn io4_truncate_mid_record_is_detected_then_recovered() {
 /// IO-4・REPAIR-6・TASK-14.2: `append(true)` で開いたライブセッション中に、
 /// 別ハンドルで `set_len(0)` する。`AppendFileSink` は非 `O_APPEND` だが
 /// `append(true)` で開いているため各 `write_all` が OS レベルで常に現在の
-/// EOF に着地し、ゼロ埋めの穴ができないことを確認する（§7 のスコープ外事項
-/// 「非 append モードでの古いカーソル問題」の反例として、append モードなら
-/// 安全であることを固定する）。
+/// EOF に着地し、ゼロ埋めの穴ができないことを確認する（`append_mode_sink`
+/// のドキュメンテーションコメントに記した、非 append モードでの古いカーソル
+/// 問題の反例として、append モードなら安全であることを固定する）。
 #[test]
 fn io4_truncate_live_session_append_mode_lands_at_new_eof() {
     const BODY_LEN: usize = 16;

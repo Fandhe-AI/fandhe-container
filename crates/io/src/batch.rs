@@ -3,7 +3,8 @@
 //!
 //! 本モジュールが持つのは「一定件数（既定 [`DEFAULT_BATCH_SIZE`]）・
 //! 一定累積バイト数（既定 [`MAX_BATCH_BYTES`]）ぶんの [`crate::protocol::Frame`]
-//! を溜め、いずれかの上限に達した時点でバッチ（値）を返す」純粋なメモリ内
+//! を溜め、件数が上限に到達した時点、または次のフレームを加えると累積バイト数が
+//! 上限を超えると判明した時点でバッチ（値）を返す」純粋なメモリ内
 //! ロジックのみ。ソケット・スレッド・ディスク書き込み・ACK 返却・タイマーは
 //! 一切持たない（REPAIR-3: 実装済みを装わない）。累積バイト数上限は
 //! [`BatchBuffer`] 単体が確保し続けるメモリ量そのものを抑える安全弁であり
@@ -21,7 +22,8 @@
 //! # 呼び出し文脈
 //! TASK-13.2.1 以降が新設する予定の `server.rs`（UDS 受信ループ）が、受信した
 //! `FrameKind::Write` フレームを [`BatchBuffer::push`] へ渡し、[`PushOutcome::Ready`]
-//! が返ったバッチをディスク書き込み（TASK-13.2）へ引き渡す想定。接続終了時・
+//! （まれに [`PushOutcome::ReadyTwice`]。[`BatchBuffer::push`] 参照）が返った
+//! バッチをディスク書き込み（TASK-13.2）へ引き渡す想定。接続終了時・
 //! FLUSH 受信時（TASK-15）には [`BatchBuffer::take_pending`] で件数未達分を
 //! 強制的に取り出す。
 //!
@@ -185,8 +187,11 @@ impl TryFrom<usize> for BatchConfig {
 pub enum BatchTrigger {
     /// 設定件数（[`BatchConfig::batch_size`]）に到達して自動発火した。
     SizeReached,
-    /// 累積ペイロードバイト数が上限（[`BatchConfig::max_bytes`]）に達し、
-    /// 件数未達のまま自動発火した（P0: 無制限確保による DoS の防止）。
+    /// 次のフレームを加えると累積ペイロードバイト数が上限
+    /// （[`BatchConfig::max_bytes`]）を超えると判明し、そのフレームを加える前に
+    /// 既存の滞留分が件数未達のまま自動発火した（P0: 無制限確保による DoS の
+    /// 防止）。累積が上限と厳密に等しい場合はまだ発火しない（`>` であり `>=`
+    /// ではない。[`BatchBuffer::push`] 参照）。
     BytesLimitReached,
     /// [`BatchBuffer::take_pending`] により、件数未達のまま強制的に取り出された。
     Drained,
@@ -260,8 +265,28 @@ impl std::fmt::Debug for Batch {
 pub enum PushOutcome {
     /// バッファへ蓄積された（まだ発火していない）。`pending` は現在の滞留件数。
     Buffered { pending: usize },
-    /// 設定件数に到達し、バッチが発火した。
+    /// 設定件数、またはバイト数上限のいずれか一方に到達し、バッチが発火した。
     Ready(Batch),
+    /// バイト数上限で既存の滞留分（`.0`。[`BatchTrigger::BytesLimitReached`]）
+    /// が発火した直後、その場で積んだ新フレーム単体が設定件数
+    /// （[`BatchConfig::batch_size`]）にも到達している場合、新バッチ（`.1`。
+    /// [`BatchTrigger::SizeReached`]）も同じ `push` 呼び出し内で即座に発火した
+    /// ことを表す（#76 PR #1105 codex レビュー指摘の P1 を受けた型設計:
+    /// `Ready` だけでは 1 回の `push` が発火させる 2 つのバッチを表現できず、
+    /// 新バッチを捨てるか誤って `Buffered` 扱いする経路をコンパイラで塞げない
+    /// ため、専用バリアントとして両方を呼び出し側へ確実に渡す）。
+    ///
+    /// [`BatchBuffer::push`] の実装注記のとおり、1 回の呼び出しが 1 フレームの
+    /// みを受け付ける現行の契約下ではこの分岐に到達する時点で既に
+    /// `batch_size >= 2` が成立しており、発火直後にリセットされた `pending` へ
+    /// 積まれる新フレームは常に 1 件のみで `batch_size` 未満のため、本バリアント
+    /// は今日の実装では生成されない。将来 `push` が複数フレームをまとめて
+    /// 受け付けるよう拡張された場合に備えて型として用意する。
+    ///
+    /// 生成された場合、呼び出し側は `.0` → `.1` の順（挿入順）で両方を必ず
+    /// 処理しなければならない。`.1` を捨てると新バッチのフレームが以後の
+    /// `push` 呼び出しがない限り滞留し続ける。
+    ReadyTwice(Batch, Batch),
 }
 
 /// 受信した書き込みフレームを既定 [`DEFAULT_BATCH_SIZE`]（設定可能）件単位で
@@ -359,16 +384,27 @@ impl BatchBuffer {
     /// 上記 2 つの拒否条件のいずれにも当てはまらない場合、このフレームを
     /// 加えると累積ペイロードバイト数が `max_bytes` を超えると判明した
     /// 場合（かつ既に滞留分がある場合）は、そのフレームを加える前に既存の
-    /// 滞留分を [`BatchTrigger::BytesLimitReached`] な [`PushOutcome::Ready`]
-    /// として強制的に取り出し、渡された `frame` は空になったバッファへ
-    /// 新たに積む（次回以降の呼び出しで扱われる。P0: 無制限確保による
-    /// DoS の防止）。
+    /// 滞留分を [`BatchTrigger::BytesLimitReached`] な [`Batch`] として強制的に
+    /// 取り出し、渡された `frame` は空になったバッファへ新たに積む。この時点で
+    /// `frame` 単体により滞留件数が設定件数（[`BatchConfig::batch_size`]）に
+    /// 到達した場合は、その新バッチも [`BatchTrigger::SizeReached`] として
+    /// 同じ呼び出し内で即座に発火させ、両方を [`PushOutcome::ReadyTwice`]
+    /// として返す（IO-1 の「設定件数到達時に発火する」契約を、バイト数上限
+    /// 発火の直後でも型として保証するため。#76 PR #1105 codex レビュー指摘の
+    /// P1 を受けた対応）。ただし、この分岐に到達する時点で既に
+    /// `pending` が非空だった（＝直前の呼び出しで `Buffered` を返していた）
+    /// ことが前提となるため、`batch_size >= 2` が既に成立しており、ここで
+    /// リセット後に積まれる新フレームは常に 1 件のみで `batch_size` に満たない
+    /// （テスト `io1_bytes_limit_flush_never_reaches_size_limit_in_same_push`
+    /// 参照）。到達していなければ新フレームは次回以降の呼び出しで扱われ、旧バッチ
+    /// のみを [`PushOutcome::Ready`] として返す（P0: 無制限確保による DoS
+    /// の防止）。
     ///
     /// 上記のバイト数上限に抵触せず追加できた場合、追加後の滞留件数が設定件数
     /// （[`BatchConfig::batch_size`]）に到達したときも同様にバッファ内の
     /// フレームをすべて [`BatchTrigger::SizeReached`] として取り出して返し、
     /// バッファは空の状態（次バッチぶんの容量を確保済み）に戻る。
-    /// どちらの上限にも到達しなければ [`PushOutcome::Buffered`] を返す。
+    /// どの上限にも到達しなければ [`PushOutcome::Buffered`] を返す。
     pub fn push(&mut self, frame: Frame) -> Result<PushOutcome, IoError> {
         if frame.kind() != FrameKind::Write {
             return Err(IoError::new(
@@ -395,6 +431,20 @@ impl BatchBuffer {
             let flushed = self.drain_pending(BatchTrigger::BytesLimitReached);
             self.pending.push(frame);
             self.pending_bytes = frame_len;
+
+            // 新フレーム単体が設定件数に既に到達している場合、ここで return
+            // してしまうと新バッチが Ready にならないまま滞留し続け、以後
+            // push が呼ばれるまで IO-1 の件数到達契約を破りかねない
+            // （#76 PR #1105 codex レビュー指摘の P1）。この分岐に到達する
+            // 時点で batch_size >= 2 が既に成立しているため（push の
+            // ドキュメンテーションコメント参照）、今日の実装では
+            // self.pending.len() は常に 1 でこの if は成立しないが、
+            // 型の契約として両方の発火を ReadyTwice で表現できるようにする。
+            if self.pending.len() >= self.config.batch_size() {
+                let second = self.drain_pending(BatchTrigger::SizeReached);
+                return Ok(PushOutcome::ReadyTwice(flushed, second));
+            }
+
             return Ok(PushOutcome::Ready(flushed));
         }
 
@@ -500,7 +550,9 @@ mod tests {
         let outcome = buffer.push(write_frame(63)).expect("push must succeed");
         let batch = match outcome {
             PushOutcome::Ready(batch) => batch,
-            PushOutcome::Buffered { .. } => panic!("must fire at the 64th frame"),
+            PushOutcome::Buffered { .. } | PushOutcome::ReadyTwice(..) => {
+                panic!("must fire at the 64th frame")
+            }
         };
 
         assert_eq!(batch.len(), 64);
@@ -524,7 +576,9 @@ mod tests {
         let outcome = buffer.push(write_frame(7)).expect("push must succeed");
         let batch = match outcome {
             PushOutcome::Ready(batch) => batch,
-            PushOutcome::Buffered { .. } => panic!("must fire at the 8th frame"),
+            PushOutcome::Buffered { .. } | PushOutcome::ReadyTwice(..) => {
+                panic!("must fire at the 8th frame")
+            }
         };
         assert_eq!(batch.len(), 8);
         assert_eq!(batch.trigger(), BatchTrigger::SizeReached);
@@ -540,7 +594,9 @@ mod tests {
             let outcome = buffer.push(write_frame(seq)).expect("push must succeed");
             let batch = match outcome {
                 PushOutcome::Ready(batch) => batch,
-                PushOutcome::Buffered { .. } => panic!("size 1 must fire every push"),
+                PushOutcome::Buffered { .. } | PushOutcome::ReadyTwice(..) => {
+                    panic!("size 1 must fire every push")
+                }
             };
             assert_eq!(batch.len(), 1);
             assert_eq!(frame_seq(&batch.frames()[0]), seq);
@@ -559,6 +615,10 @@ mod tests {
             match buffer.push(write_frame(seq)).expect("push must succeed") {
                 PushOutcome::Ready(batch) => ready_batches.push(batch),
                 PushOutcome::Buffered { .. } => {}
+                PushOutcome::ReadyTwice(first, second) => {
+                    ready_batches.push(first);
+                    ready_batches.push(second);
+                }
             }
         }
 
@@ -680,7 +740,9 @@ mod tests {
             .expect("push must succeed");
         let batch = match outcome {
             PushOutcome::Ready(batch) => batch,
-            PushOutcome::Buffered { .. } => panic!("bytes limit must fire before size limit"),
+            PushOutcome::Buffered { .. } | PushOutcome::ReadyTwice(..) => {
+                panic!("bytes limit must fire before size limit")
+            }
         };
         assert_eq!(batch.len(), 2);
         assert_eq!(batch.trigger(), BatchTrigger::BytesLimitReached);
@@ -752,6 +814,55 @@ mod tests {
             .expect("frame exactly at max_bytes must be accepted");
         assert!(matches!(outcome, PushOutcome::Buffered { pending: 1 }));
         assert_eq!(buffer.pending_bytes(), 4);
+    }
+
+    /// IO-1・P1（PR #1105 codex レビュー指摘の対応。[`PushOutcome::ReadyTwice`]
+    /// を参照）: `push` はバイト数上限で旧バッチを発火させた直後、その場で
+    /// 積んだ新フレーム単体が設定件数にも到達していれば `ReadyTwice` で両方を
+    /// 返す契約を持つ。ただし現行 `push` は 1 回の呼び出しで 1 フレームしか
+    /// 積まないため、この分岐（`!self.pending.is_empty()`）に到達する時点で
+    /// 既に `batch_size >= 2` が成立しており（`batch_size == 1` は毎回即座に
+    /// [`BatchTrigger::SizeReached`] で発火し `pending` が空でない状態を作れない。
+    /// [`io1_batch_buffer_size_1_fires_every_push`] が既に確認済み）、
+    /// 発火直後にリセットした `pending` へ積まれるのは常にこの新フレーム 1 件
+    /// のみで `1 < batch_size` が保たれる。したがって今日の実装では
+    /// `ReadyTwice` は理論上到達不能で、常に `Ready` 単体（`.len() == 1`）が
+    /// 返ることを、複数の `batch_size` で機械的に確認する。将来 `push` が
+    /// 複数フレームをまとめて受け付けるよう拡張された場合に、この不変条件が
+    /// 崩れたことを検知する回帰点として置く。
+    #[test]
+    fn io1_bytes_limit_flush_never_reaches_size_limit_in_same_push() {
+        for batch_size in 2..=4usize {
+            let config =
+                BatchConfig::with_max_bytes(batch_size, 4).expect("valid config must succeed");
+            let mut buffer = BatchBuffer::new(config);
+
+            let outcome = buffer
+                .push(write_frame_of_len(4))
+                .expect("push must succeed");
+            assert!(
+                matches!(outcome, PushOutcome::Buffered { pending: 1 }),
+                "batch_size={batch_size}: 1st push must buffer, got {outcome:?}"
+            );
+
+            // 2 件目（4 バイト）: 累積 8 バイトは上限 4 バイトを超えるため、
+            // 追加前に 1 件目が BytesLimitReached として発火する。
+            let outcome = buffer
+                .push(write_frame_of_len(4))
+                .expect("push must succeed");
+            match outcome {
+                PushOutcome::Ready(batch) => {
+                    assert_eq!(batch.len(), 1);
+                    assert_eq!(batch.trigger(), BatchTrigger::BytesLimitReached);
+                }
+                other => panic!(
+                    "batch_size={batch_size}: bytes limit must fire alone here, got {other:?}"
+                ),
+            }
+            // 新フレームはリセット後の pending へ 1 件だけ積まれ、
+            // batch_size(>=2) に満たないため滞留し続ける。
+            assert_eq!(buffer.len(), 1);
+        }
     }
 
     /// P0: バイト数上限（暫定 256 GiB 規模の DoS）に対する回帰確認として、

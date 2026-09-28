@@ -307,15 +307,8 @@ mod unix {
                     "transport is poisoned after a previous i/o error",
                 ));
             }
-            let result = self
-                .stream
-                .set_write_timeout(Some(timeout.as_duration()))
-                .map_err(Self::map_set_timeout_error)
-                .and_then(|()| {
-                    self.stream
-                        .write_all(&frame.encode())
-                        .map_err(|err| Self::map_io_error(&err))
-                });
+            let deadline = Instant::now() + timeout.as_duration();
+            let result = self.write_with_deadline(&frame.encode(), deadline);
             if result.is_err() {
                 self.poisoned = true;
             }
@@ -386,6 +379,46 @@ mod unix {
                         ));
                     }
                     Ok(n) => filled += n,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(Self::map_io_error(&err)),
+                }
+            }
+            Ok(())
+        }
+
+        /// `buf` を書き切るまで、生の `write` 呼び出しのたびに `deadline` から
+        /// 残り時間を再計算してソケットタイムアウトへ設定し直す
+        /// （[`Self::read_with_deadline`] の書き込み側対応。`send_frame` から
+        /// 呼ばれる）。
+        ///
+        /// `set_write_timeout` を 1 回だけ設定して `write_all` を 1 回呼ぶ
+        /// 実装（旧版）は、相手が `deadline` 未満の間隔で少しずつしか読み
+        /// 進めない場合に `write_all` 内部の個々の `write` はどれもタイム
+        /// アウトせずに済んでしまい、呼び出し全体では `deadline` を大幅に
+        /// 超えて待ち続け得た（codex P0 指摘・#1121。REPAIR-5「応答待ちの
+        /// 有限時間打ち切り」に反する）。本実装は `write` 1 回ごとに
+        /// `deadline` との差分を見て打ち切るため、相手が細切れにしか読ま
+        /// なくても合計待ち時間が `deadline` を超えない。
+        fn write_with_deadline(&mut self, buf: &[u8], deadline: Instant) -> Result<(), IoError> {
+            let mut sent = 0usize;
+            while sent < buf.len() {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| {
+                        IoError::new(IoErrorCode::Timeout, "deadline already elapsed")
+                    })?;
+                self.stream
+                    .set_write_timeout(Some(remaining))
+                    .map_err(Self::map_set_timeout_error)?;
+                match self.stream.write(&buf[sent..]) {
+                    Ok(0) => {
+                        return Err(IoError::new(
+                            IoErrorCode::Unavailable,
+                            "transport connection is closed",
+                        ));
+                    }
+                    Ok(n) => sent += n,
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(err) => return Err(Self::map_io_error(&err)),
                 }

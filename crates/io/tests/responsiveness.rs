@@ -835,7 +835,7 @@ mod unix {
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let server_thread = spawn_silent_server(server, timeout, REQUEST_COUNT as usize, done_rx);
 
-        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Instant>();
         let (result_tx, result_rx) = mpsc::channel();
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
@@ -853,9 +853,16 @@ mod unix {
             // 準備段階（connect・送信）完了を main 側の watchdog へ通知する。
             // 送信に失敗した場合はこのスレッドが上の unwrap_or_else で既に
             // panic しているため、ここへ到達するのは準備が成功した場合のみ。
-            let _ = ready_tx.send(());
-
+            // ACK 待ちの実際の開始時刻（wait_started）を通知と一緒に main
+            // 側へ渡すことで、main 側の watchdog（下記 stage 2）が「通知を
+            // 受け取った時刻」ではなく「ACK 待ちが実際に始まった時刻」を
+            // 起点に期限を計算できるようにする。通知直後に client スレッド
+            // が長くスケジューラ遅延を受けても、main 側の recv_timeout の
+            // 起点が実際の待機開始からずれないため、ACK 待ちが正常な場合に
+            // 誤ってハングと判定することがない（codex P2 指摘・#1124）。
             let wait_started = Instant::now();
+            let _ = ready_tx.send(wait_started);
+
             let first_recv_ack = client.recv_ack(timeout);
             let elapsed = wait_started.elapsed();
 
@@ -896,49 +903,60 @@ mod unix {
         // の完了通知を、connect のリトライ予算 + 猶予を上限に待つ
         // （本関数 doc 参照。critical path 上に上限なしの recv() を置かない）。
         let ready_deadline = CONNECT_RETRY_BUDGET + HANG_GUARD_GRACE;
-        if ready_rx.recv_timeout(ready_deadline).is_err() {
-            // client スレッドが準備段階中に panic した場合はここへは来ず
-            // join() 側で検出されるはずだが、二重の安全のため確認する
-            // （panic メッセージをそのまま伝える）。ただし join() をこの
-            // watchdog スレッド上で直接無期限に呼ぶと、connect / 送信が
-            // 真にハングしているケースではこの join() 自体が無期限停止し、
-            // REPAIR-5（有限時間でのハング検出）に違反する
-            // （codex レビュー P0 指摘・#1124）。join() は別スレッドへ
-            // 隔離し、その結果を `HANG_GUARD_GRACE` を上限に待つ。
-            let (join_tx, join_rx) = mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = join_tx.send(client_thread.join());
-            });
-            match join_rx.recv_timeout(HANG_GUARD_GRACE) {
-                Ok(Ok(_)) => panic!(
-                    "client thread finished without signalling readiness within \
-                     {ready_deadline:?} (connect + send setup did not complete in time)"
-                ),
-                Ok(Err(payload)) => std::panic::resume_unwind(payload),
-                Err(_) => panic!(
-                    "client thread did not finish within {ready_deadline:?} + \
-                     {HANG_GUARD_GRACE:?} after readiness notification was not \
-                     received; connect/send setup appears hung \
-                     (timeout detection is not working)"
-                ),
+        let wait_started = match ready_rx.recv_timeout(ready_deadline) {
+            Ok(wait_started) => wait_started,
+            Err(_) => {
+                // client スレッドが準備段階中に panic した場合はここへは来ず
+                // join() 側で検出されるはずだが、二重の安全のため確認する
+                // （panic メッセージをそのまま伝える）。ただし join() をこの
+                // watchdog スレッド上で直接無期限に呼ぶと、connect / 送信が
+                // 真にハングしているケースではこの join() 自体が無期限停止し、
+                // REPAIR-5（有限時間でのハング検出）に違反する
+                // （codex レビュー P0 指摘・#1124）。join() は別スレッドへ
+                // 隔離し、その結果を `HANG_GUARD_GRACE` を上限に待つ。
+                let (join_tx, join_rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = join_tx.send(client_thread.join());
+                });
+                match join_rx.recv_timeout(HANG_GUARD_GRACE) {
+                    Ok(Ok(_)) => panic!(
+                        "client thread finished without signalling readiness within \
+                         {ready_deadline:?} (connect + send setup did not complete in time)"
+                    ),
+                    Ok(Err(payload)) => std::panic::resume_unwind(payload),
+                    Err(_) => panic!(
+                        "client thread did not finish within {ready_deadline:?} + \
+                         {HANG_GUARD_GRACE:?} after readiness notification was not \
+                         received; connect/send setup appears hung \
+                         (timeout detection is not working)"
+                    ),
+                }
             }
-        }
+        };
 
         // hang guard（watchdog）その 2: client_thread の結果を上限付きで待つ。
         // critical path 上に上限なしの recv()・join() を置かない
         // （REPAIR-5・本ファイル冒頭 `//!` の受け入れ条件 2 の解釈）。
+        //
+        // 期限は「main 側が readiness 通知を受け取った時刻」ではなく、
+        // client スレッドが送ってきた `wait_started`（ACK 待ちを実際に
+        // 開始した時刻）を起点に計算する。通知（mpsc の受信）自体の
+        // スケジューリング遅延を期限計算に混ぜると、通知直後に client
+        // スレッドが長く待たされただけで ACK 待ちが正常なのに watchdog が
+        // 先に期限切れになり得る（codex P2 指摘・#1124）。
         std::thread::spawn(move || {
             let _ = result_tx.send(client_thread.join());
         });
-        let watchdog_deadline = timeout.as_duration() + HANG_GUARD_GRACE;
-        let client_result = result_rx
-            .recv_timeout(watchdog_deadline)
-            .unwrap_or_else(|_| {
-                panic!(
-                    "missing-ack detection did not complete within {watchdog_deadline:?}; \
-                 timeout detection is not working (hung instead of erroring)"
-                )
-            });
+        let watchdog_budget = timeout.as_duration() + HANG_GUARD_GRACE;
+        let watchdog_deadline_instant = wait_started + watchdog_budget;
+        let remaining = watchdog_deadline_instant.saturating_duration_since(Instant::now());
+        let client_result = result_rx.recv_timeout(remaining).unwrap_or_else(|_| {
+            panic!(
+                "missing-ack detection did not complete within {watchdog_budget:?} of \
+                 the ack wait starting; timeout detection is not working \
+                 (hung instead of erroring)"
+            )
+        });
         let (
             first_err_code,
             elapsed,

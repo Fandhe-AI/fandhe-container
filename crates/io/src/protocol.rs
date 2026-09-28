@@ -19,6 +19,14 @@
 //! 境界であり、ヘッダ単体はその構成要素の 1 つに過ぎないため。[`Frame::decode`] は
 //! 受信バイト列の先頭 [`FRAME_HEADER_LEN`] バイトを [`FrameHeader::from_bytes`] で
 //! 検証してからペイロード長ぶんのバッファを確保する（DoS 対策。security.md）。
+//!
+//! 申告長に比例するペイロード用バッファの確保は、デコード経路
+//! （[`Frame::decode`] / [`Frame::decode_body`]）全体を通じて `copy_validated_payload`
+//! （非公開関数）の 1 か所に集約しており、そこへ到達するのは長さ検証（ヘッダ上限・
+//! 本体長一致）とチェックサム検証をすべて通過した後だけである（アロケーション前の
+//! 早期拒否をユニットテストで示す。TASK-83.2・#117）。受信側（ストリーム読み。
+//! TASK-12・TASK-13）が読み取り上限に使う本体長は [`FrameHeader::body_len`] から
+//! 得ること。
 
 use crate::error::{IoError, IoErrorCode};
 use crate::transport::{WireFrame, sealed};
@@ -36,6 +44,17 @@ const _: () = assert!(MAX_PAYLOAD_LEN < u32::MAX);
 
 /// 固定長ヘッダのバイト数（種別 1 バイト + ペイロード長 4 バイト）。
 pub const FRAME_HEADER_LEN: usize = 5;
+
+/// `usize` が 32 ビット以上であることをコンパイル時に保証する。
+///
+/// [`FrameHeader::body_len`] は `payload_len: u32` を `as usize` で拡張するが、
+/// この変換で情報が失われないことの根拠にする（16 ビット usize のような
+/// 非現実的なターゲットを将来サポートした場合の回帰を検出する）。
+const _: () = assert!(usize::BITS >= 32);
+
+/// `MAX_PAYLOAD_LEN + CHECKSUM_LEN` が `usize` の範囲でオーバーフローしないことを
+/// コンパイル時に保証する（[`FrameHeader::body_len`] の加算が安全であることの根拠）。
+const _: () = assert!(MAX_PAYLOAD_LEN as usize + CHECKSUM_LEN == MAX_FRAME_LEN - FRAME_HEADER_LEN);
 
 /// フレームの種別（IO-1・IO-2）。
 ///
@@ -177,6 +196,24 @@ impl FrameHeader {
         self.payload_len
     }
 
+    /// 検証済みの `payload_len` から、ヘッダに続く本体（ペイロード + チェックサム）の
+    /// バイト数を返す（TASK-83.2・IO-1・REPAIR-2・#117）。
+    ///
+    /// `self` は [`Self::new`] / [`Self::from_bytes`] を経由してのみ構築できるため
+    /// `payload_len` は既に [`MAX_PAYLOAD_LEN`] 以下であることが保証されており、
+    /// この関数は失敗しない。受信側（ストリーム読み。TASK-12・TASK-13）は、
+    /// 生のヘッダバイトから長さを自前で再計算せず、この値だけを読み取りサイズ・
+    /// バッファ上限として使うこと。そうしないと、検証前の値や検証していない値で
+    /// バッファを確保する回帰が入りうる（[`crate::protocol`] モジュールの
+    /// デコード時検証順序の説明を参照）。
+    pub fn body_len(&self) -> usize {
+        // 上限は MAX_PAYLOAD_LEN（型で保証）かつ usize::BITS >= 32 をコンパイル時に
+        // 確認済みのため、`as usize` への切り捨ては起きない。加算も
+        // `MAX_PAYLOAD_LEN as usize + CHECKSUM_LEN == MAX_FRAME_LEN - FRAME_HEADER_LEN`
+        // がコンパイル時に成り立つことを確認済みのためオーバーフローしない。
+        self.payload_len.get() as usize + CHECKSUM_LEN
+    }
+
     /// ヘッダを `[kind: u8][payload_len: u32 LE]` の固定長配列へ変換する。
     /// 添字アクセスを避けるため分割代入で組み立てる（coding-rust「外部入力」節）。
     pub fn to_bytes(&self) -> [u8; FRAME_HEADER_LEN] {
@@ -312,28 +349,19 @@ impl Frame {
     /// 使う想定）。
     ///
     /// # 検証順序
-    /// 1. `header.payload_len()` から期待される本体長（`payload_len + CHECKSUM_LEN`）を
-    ///    `checked_add` で算出し、オーバーフロー時は [`IoErrorCode::InvalidArgument`]
+    /// 1. `header.body_len()`（検証済みの `payload_len + CHECKSUM_LEN`）を期待される
+    ///    本体長とする（[`FrameHeader::body_len`] は失敗しない。TASK-83.2）
     /// 2. `body.len()` が期待長と一致しなければ [`IoErrorCode::InvalidArgument`]
     ///    （チェックサム不一致とは別コード）
     /// 3. `body` をペイロードと受信チェックサムに分割し、ヘッダ＋ペイロードから
     ///    再計算した CRC-32C と比較。不一致なら [`IoErrorCode::DataLoss`]
     ///
     /// `body` は untrusted なトランスポート由来の入力を想定し、添字アクセスではなく
-    /// `split_last_chunk` で読む。
+    /// `split_last_chunk` で読む。申告長に比例するアロケーション（[`copy_validated_payload`]）
+    /// は、上記 1〜3 の検証をすべて通過した後にしか呼ばれない（DoS 対策。security.md・
+    /// TASK-83.2・#117）。
     pub fn decode_body(header: FrameHeader, body: &[u8]) -> Result<Self, IoError> {
-        let payload_len = usize::try_from(header.payload_len().get()).map_err(|_| {
-            IoError::new(
-                IoErrorCode::InvalidArgument,
-                "payload length does not fit in usize on this platform",
-            )
-        })?;
-        let expected_len = payload_len.checked_add(CHECKSUM_LEN).ok_or_else(|| {
-            IoError::new(
-                IoErrorCode::InvalidArgument,
-                "payload length + checksum length overflows",
-            )
-        })?;
+        let expected_len = header.body_len();
 
         if body.len() != expected_len {
             return Err(IoError::new(
@@ -368,7 +396,7 @@ impl Frame {
 
         Ok(Self {
             header,
-            payload: payload.to_vec(),
+            payload: copy_validated_payload(payload),
             checksum: expected_checksum,
         })
     }
@@ -394,6 +422,24 @@ impl Frame {
     }
 }
 
+/// デコード経路（[`Frame::decode`] / [`Frame::decode_body`]）で、申告長に比例する
+/// ペイロード用バッファを確保する唯一の箇所（TASK-83.2・IO-1・REPAIR-2・#117）。
+///
+/// [`Frame::decode_body`] からは、長さ検証（[`FrameHeader::from_bytes`] の上限検証・
+/// 本体長一致）とチェックサム検証をすべて通過した後にのみ呼ばれる。新たに
+/// 申告長に比例する確保箇所を追加する場合は、必ずこの関数を経由すること
+/// （経由しないと `mod tests` の「アロケーション前に拒否される」ことを確かめる
+/// テストが見逃す）。本番の挙動は `payload.to_vec()` のままで、`#[cfg(test)]` の
+/// ときだけスレッドローカルの記録器（確保回数・最後に確保した長さ）を更新する
+/// （`cargo test` はテストを並列スレッドで実行するため、グローバルなカウンタでは
+/// 他のテストの確保が混ざってしまう）。
+fn copy_validated_payload(payload: &[u8]) -> Vec<u8> {
+    #[cfg(test)]
+    tests::record_allocation(payload.len());
+
+    payload.to_vec()
+}
+
 impl core::fmt::Debug for Frame {
     /// ペイロード内容を出力しない。長さ・種別・チェックサムのみを表示する
     /// （security.md「情報漏えい」観点。message/Debug にペイロード内容を含めない）。
@@ -413,6 +459,37 @@ impl WireFrame for Frame {}
 mod tests {
     use super::*;
     use crate::checksum::crc32c;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// [`copy_validated_payload`] が呼ばれた回数（スレッドローカル。TASK-83.2）。
+        /// `cargo test` はテストを並列スレッドで実行するため、他のテストの確保と
+        /// 混ざらないようスレッドごとに独立させる。
+        static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+        /// [`copy_validated_payload`] が最後に確保したバイト数。
+        static LAST_ALLOCATION_LEN: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// [`copy_validated_payload`] から呼ばれる記録の副作用（`#[cfg(test)]` 限定）。
+    pub(super) fn record_allocation(len: usize) {
+        ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+        LAST_ALLOCATION_LEN.with(|last| last.set(len));
+    }
+
+    /// 記録器をリセットする（各テストの冒頭で呼ぶ。前のテストの記録が残らないように
+    /// する）。
+    fn reset_allocation_recorder() {
+        ALLOCATION_COUNT.with(|count| count.set(0));
+        LAST_ALLOCATION_LEN.with(|last| last.set(0));
+    }
+
+    fn allocation_count() -> usize {
+        ALLOCATION_COUNT.with(Cell::get)
+    }
+
+    fn last_allocation_len() -> usize {
+        LAST_ALLOCATION_LEN.with(Cell::get)
+    }
 
     /// IO-1・REPAIR-2: `PayloadLen::new(0)` は受理され、値は 0。
     #[test]
@@ -734,5 +811,93 @@ mod tests {
     fn io1_frame_implements_wire_frame() {
         fn assert_wire<T: WireFrame>() {}
         assert_wire::<Frame>();
+    }
+
+    /// IO-1・TASK-83.2: `FrameHeader::body_len` の境界値。長さ 0 では
+    /// `body_len() == CHECKSUM_LEN`、`MAX_PAYLOAD_LEN` では
+    /// `body_len() == MAX_PAYLOAD_LEN + CHECKSUM_LEN`。
+    #[test]
+    fn io1_frame_header_body_len_values() {
+        let zero = FrameHeader::new(FrameKind::Write, 0).expect("0 must be accepted");
+        assert_eq!(zero.body_len(), 4);
+
+        let max = FrameHeader::new(FrameKind::Write, MAX_PAYLOAD_LEN)
+            .expect("MAX_PAYLOAD_LEN must be accepted");
+        assert_eq!(max.body_len(), 67_108_868);
+    }
+
+    /// TASK-83.2・REPAIR-2（受け入れ基準 2。#117）: `MAX_PAYLOAD_LEN` を超える申告長
+    /// （境界値と `u32::MAX`）を含むヘッダは、[`Frame::decode`] が
+    /// [`FrameHeader::from_bytes`] の段階で拒否し、`copy_validated_payload`（申告長に
+    /// 比例するペイロード用バッファの確保）を 1 度も呼ばない。
+    ///
+    /// 「アロケーション」は申告長に比例するペイロード用バッファの確保を指す
+    /// （`IoError` の message 用 `String` の確保はサイズが一定でこの検証対象では
+    /// ない。issue #117 実装計画 2 章）。
+    #[test]
+    fn repair2_decode_rejects_over_max_len_before_allocation() {
+        reset_allocation_recorder();
+
+        let [l0, l1, l2, l3] = (MAX_PAYLOAD_LEN + 1).to_le_bytes();
+        let err = Frame::decode(&[FrameKind::Write.as_u8(), l0, l1, l2, l3])
+            .expect_err("declared length over MAX_PAYLOAD_LEN must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(allocation_count(), 0);
+
+        let err = Frame::decode(&[FrameKind::Write.as_u8(), 0xFF, 0xFF, 0xFF, 0xFF])
+            .expect_err("u32::MAX declared length must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(allocation_count(), 0);
+    }
+
+    /// TASK-83.2・REPAIR-2（#117）: 上限内の申告長（`MAX_PAYLOAD_LEN` ちょうど）でも、
+    /// 実際の本体が短ければ本体長不一致として `InvalidArgument` になり、
+    /// `copy_validated_payload` を呼ばない。上限を通過しただけの巨大な申告に対して
+    /// 64 MiB のバッファを確保してしまう増幅を防ぐことを確認する。
+    #[test]
+    fn repair2_decode_body_rejects_len_mismatch_before_allocation() {
+        reset_allocation_recorder();
+
+        let header = FrameHeader::new(FrameKind::Write, MAX_PAYLOAD_LEN)
+            .expect("MAX_PAYLOAD_LEN must be accepted");
+        let short_body = [0u8; 8];
+
+        let err = Frame::decode_body(header, &short_body)
+            .expect_err("short body under a MAX_PAYLOAD_LEN declaration must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(allocation_count(), 0);
+    }
+
+    /// TASK-83.2・REPAIR-2（#117）: チェックサム不一致で拒否される経路でも
+    /// `copy_validated_payload` を呼ばない（長さ検証を通過した後段の検証失敗でも
+    /// アロケーションしないことの確認）。
+    #[test]
+    fn repair2_decode_rejects_checksum_mismatch_before_allocation() {
+        reset_allocation_recorder();
+
+        let frame = Frame::new(FrameKind::Write, b"hello".to_vec()).expect("Frame::new");
+        let mut encoded = frame.encode();
+        encoded[5] ^= 0x01;
+
+        let err = Frame::decode(&encoded).expect_err("flipped bit must be rejected");
+        assert_eq!(err.code(), IoErrorCode::DataLoss);
+        assert_eq!(allocation_count(), 0);
+    }
+
+    /// TASK-83.2（陽性対照。#117）: 正常フレームのデコードでは
+    /// `copy_validated_payload` がちょうど 1 回、申告どおりの長さで呼ばれる。
+    /// この陽性対照がないと、記録器自体が動いていないために上記の
+    /// `*_before_allocation` テストが偽の合格になる可能性を排除できない。
+    #[test]
+    fn repair2_decode_allocates_exactly_once_for_valid_frame() {
+        reset_allocation_recorder();
+
+        let frame = Frame::new(FrameKind::Write, b"hello".to_vec()).expect("Frame::new");
+        let encoded = frame.encode();
+
+        let decoded = Frame::decode(&encoded).expect("valid frame must decode");
+        assert_eq!(decoded.payload(), b"hello");
+        assert_eq!(allocation_count(), 1);
+        assert_eq!(last_allocation_len(), 5);
     }
 }

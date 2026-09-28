@@ -15,11 +15,13 @@
 //!   を直列化して共有する [`fandhe_container_io::BatchSink`] 実装
 //! - [`spawn_server`] / [`join_within`]: `serve_connection` を別スレッドで
 //!   動かし、期限付きで合流する（REPAIR-5）
+//! - [`barrier_wait_within`]: `std::sync::Barrier::wait` を期限付きで待つ
+//!   （REPAIR-5）
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use fandhe_container_io::{
@@ -206,6 +208,16 @@ pub fn decompose_records(data: &[u8]) -> Vec<Vec<u8>> {
             .try_into()
             .expect("header slice is exactly 4 bytes");
         let len = u32::from_le_bytes(len_bytes) as usize;
+        // `len` はヘッダ自身を含む値であり、`BODY_HEADER_LEN` 未満だと
+        // `rest.get(..len)` が空スライス（`len == 0`）や不完全なヘッダを
+        // 誤って 1 レコードとして受理し、`rest` が一切縮まないまま次周の
+        // `while !rest.is_empty()` に戻って無限ループする（データ破損を
+        // ハングとして見逃す。REPAIR-5 違反）。ここで即座に失敗させる。
+        assert!(
+            len >= BODY_HEADER_LEN,
+            "decompose_records: declared record length {len} is shorter than a record header \
+             ({BODY_HEADER_LEN} bytes) — output is corrupted or truncated"
+        );
         let record = rest.get(..len).unwrap_or_else(|| {
             panic!(
                 "decompose_records: declared record length {len} exceeds the {} byte(s) \
@@ -316,6 +328,34 @@ where
             "join_within: thread did not finish within {deadline:?} \
              (REPAIR-5: bounded join — likely an unsent ACK or other hang)"
         ),
+    }
+}
+
+/// [`std::sync::Barrier::wait`] を無期限に待たず、`deadline` 以内に全参加者が
+/// 揃わなければ panic する（REPAIR-5: [`concurrent_write`](super::concurrent_write)
+/// の各ケースが開始同期に使う `Barrier` にも期限を設ける。参加予定のクライアント
+/// スレッドが `barrier.wait()` へ到達する前に panic 等で脱落すると、残りの
+/// 参加者・呼び出し元スレッドは本来なら [`Barrier`] の性質上永久に揃わない）。
+///
+/// [`join_within`] と同じ構成（監視用の別スレッドへ実際のブロッキング呼び出し
+/// `barrier.wait()` を委譲し、呼び出し元は `recv_timeout` で期限付きに待つ）を
+/// 取る。`Barrier::wait` はどの OS スレッドから呼んでも参加カウントに数えられる
+/// ため、監視スレッド経由でも待ち合わせの意味は変わらない。期限切れの場合、
+/// 監視スレッドはバックグラウンドに残る（テストプロセス自体は panic で終了する
+/// ため実害はない）。
+pub fn barrier_wait_within(barrier: &Arc<Barrier>, deadline: Duration) {
+    let barrier = Arc::clone(barrier);
+    let (tx, rx) = mpsc::channel();
+    let _watcher = std::thread::spawn(move || {
+        barrier.wait();
+        let _ = tx.send(());
+    });
+    if rx.recv_timeout(deadline).is_err() {
+        panic!(
+            "barrier_wait_within: barrier did not release within {deadline:?} \
+             (REPAIR-5: bounded barrier wait — a participant likely failed before \
+             reaching barrier.wait())"
+        );
     }
 }
 

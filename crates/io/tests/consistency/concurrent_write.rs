@@ -17,8 +17,8 @@ use fandhe_container_io::{
 };
 
 use super::harness::{
-    self, DuplexEnd, SharedSink, TempDir, body_for, decompose_records, drain_acks, join_within,
-    record_client, record_seq, send_all_writes, spawn_server, timeout,
+    self, DuplexEnd, SharedSink, TempDir, barrier_wait_within, body_for, decompose_records,
+    drain_acks, join_within, record_client, record_seq, send_all_writes, spawn_server, timeout,
 };
 
 /// `join_within` に渡す上限時間（各 `serve_connection`・クライアントスレッドの
@@ -99,15 +99,15 @@ fn io4_concurrent_write_two_clients_default_batch_exact_bytes() {
                 InFlightLimit::new(FRAMES as usize + 1).expect("valid in-flight limit"),
                 NoopSendObserver,
             );
-            barrier.wait();
+            barrier_wait_within(&barrier, join_deadline());
             send_all_writes(&mut client, &bodies, timeout());
             drain_acks(&mut client, bodies.len(), timeout());
         }));
     }
-    barrier.wait();
+    barrier_wait_within(&barrier, join_deadline());
 
     for handle in client_handles {
-        handle.join().expect("client thread must not panic");
+        join_within(handle, join_deadline());
     }
 
     for (i, handle) in server_handles.into_iter().enumerate() {
@@ -160,15 +160,15 @@ fn io4_concurrent_write_eight_clients_many_batches_exact_bytes() {
                 InFlightLimit::new(FRAMES as usize + 1).expect("valid in-flight limit"),
                 NoopSendObserver,
             );
-            barrier.wait();
+            barrier_wait_within(&barrier, join_deadline());
             send_all_writes(&mut client, &bodies, timeout());
             drain_acks(&mut client, bodies.len(), timeout());
         }));
     }
-    barrier.wait();
+    barrier_wait_within(&barrier, join_deadline());
 
     for handle in client_handles {
-        handle.join().expect("client thread must not panic");
+        join_within(handle, join_deadline());
     }
 
     for (i, handle) in server_handles.into_iter().enumerate() {
@@ -230,15 +230,15 @@ fn io4_concurrent_write_shared_file_batches_never_interleave() {
                 InFlightLimit::new(FRAMES as usize + 1).expect("valid in-flight limit"),
                 NoopSendObserver,
             );
-            barrier.wait();
+            barrier_wait_within(&barrier, join_deadline());
             send_all_writes(&mut client, &bodies, timeout());
             drain_acks(&mut client, bodies.len(), timeout());
         }));
     }
-    barrier.wait();
+    barrier_wait_within(&barrier, join_deadline());
 
     for handle in client_handles {
-        handle.join().expect("client thread must not panic");
+        join_within(handle, join_deadline());
     }
 
     let mut total_acks = 0u64;
@@ -348,15 +348,15 @@ fn io4_concurrent_write_shared_file_batch_size_one_preserves_per_client_order() 
                 InFlightLimit::new(FRAMES as usize + 1).expect("valid in-flight limit"),
                 NoopSendObserver,
             );
-            barrier.wait();
+            barrier_wait_within(&barrier, join_deadline());
             send_all_writes(&mut client, &bodies, timeout());
             drain_acks(&mut client, bodies.len(), timeout());
         }));
     }
-    barrier.wait();
+    barrier_wait_within(&barrier, join_deadline());
 
     for handle in client_handles {
-        handle.join().expect("client thread must not panic");
+        join_within(handle, join_deadline());
     }
 
     for handle in server_handles {
@@ -424,15 +424,15 @@ fn io4_concurrent_write_varied_body_sizes_exact_bytes() {
                 InFlightLimit::new(BODY_LENS.len() + 1).expect("valid in-flight limit"),
                 NoopSendObserver,
             );
-            barrier.wait();
+            barrier_wait_within(&barrier, join_deadline());
             send_all_writes(&mut client, &bodies, timeout());
             drain_acks(&mut client, bodies.len(), timeout());
         }));
     }
-    barrier.wait();
+    barrier_wait_within(&barrier, join_deadline());
 
     for handle in client_handles {
-        handle.join().expect("client thread must not panic");
+        join_within(handle, join_deadline());
     }
 
     for (i, handle) in server_handles.into_iter().enumerate() {
@@ -469,9 +469,10 @@ fn io4_concurrent_write_bytes_limit_trigger_exact_bytes() {
     const FRAMES: u32 = 4;
     // body_for は最低でも BODY_HEADER_LEN バイトを要求するため、これより
     // 小さい body 長は使えない（BODY_LEN=4 で試すと body_for がスレッド内で
-    // panic し、まだ barrier.wait() に到達していない他クライアントの
-    // barrier.wait() が永久に揃わずテストがハングする — 実装時に踏んだ
-    // 回帰点なのでコメントに残す）。
+    // panic し、まだ barrier_wait_within に到達していない他クライアントの
+    // 分が deadline（REPAIR-5）まで待たされた末に panic する — 修正前は
+    // `barrier.wait()` が無期限で永久に揃わずテストがハングした回帰点なので
+    // コメントに残す）。
     const BODY_LEN: usize = harness::BODY_HEADER_LEN;
     let frame_payload_len = REQUEST_ID_WIRE_LEN + BODY_LEN;
     let max_bytes = frame_payload_len * 2;
@@ -503,7 +504,7 @@ fn io4_concurrent_write_bytes_limit_trigger_exact_bytes() {
                 InFlightLimit::new(FRAMES as usize + 1).expect("valid in-flight limit"),
                 NoopSendObserver,
             );
-            barrier.wait();
+            barrier_wait_within(&barrier, join_deadline());
             send_all_writes(&mut client, &bodies, timeout());
             // 3・4 件目（末尾の滞留分）は、既存の滞留量上限だけでは発火
             // しないため、明示的な Flush で確定させる（D3。`writeback.rs`
@@ -516,10 +517,10 @@ fn io4_concurrent_write_bytes_limit_trigger_exact_bytes() {
             drain_acks(&mut client, bodies.len(), timeout());
         }));
     }
-    barrier.wait();
+    barrier_wait_within(&barrier, join_deadline());
 
     for handle in client_handles {
-        handle.join().expect("client thread must not panic");
+        join_within(handle, join_deadline());
     }
 
     for (i, handle) in server_handles.into_iter().enumerate() {
@@ -575,7 +576,7 @@ fn io4_concurrent_write_partial_batch_flushed_by_flush_frame() {
                 InFlightLimit::new(FRAMES as usize + 1).expect("valid in-flight limit"),
                 NoopSendObserver,
             );
-            barrier.wait();
+            barrier_wait_within(&barrier, join_deadline());
             send_all_writes(&mut client, &bodies, timeout());
             client
                 .send(FrameKind::Flush, &[], timeout())
@@ -583,10 +584,10 @@ fn io4_concurrent_write_partial_batch_flushed_by_flush_frame() {
             drain_acks(&mut client, bodies.len(), timeout());
         }));
     }
-    barrier.wait();
+    barrier_wait_within(&barrier, join_deadline());
 
     for handle in client_handles {
-        handle.join().expect("client thread must not panic");
+        join_within(handle, join_deadline());
     }
 
     for (i, handle) in server_handles.into_iter().enumerate() {
@@ -650,7 +651,7 @@ fn io4_concurrent_write_one_client_disconnect_does_not_corrupt_others() {
                         .expect("valid in-flight limit"),
                     NoopSendObserver,
                 );
-                barrier.wait();
+                barrier_wait_within(&barrier, join_deadline());
                 send_all_writes(&mut client, &bodies, timeout());
                 // 最初の 1 バッチぶん（BATCH_SIZE 件）だけ ACK を受け取り、
                 // 残りの端数（5 件）は未 ACK のまま Flush を送らずに切断する
@@ -666,16 +667,16 @@ fn io4_concurrent_write_one_client_disconnect_does_not_corrupt_others() {
                     InFlightLimit::new(NORMAL_FRAMES as usize + 1).expect("valid in-flight limit"),
                     NoopSendObserver,
                 );
-                barrier.wait();
+                barrier_wait_within(&barrier, join_deadline());
                 send_all_writes(&mut client, &bodies, timeout());
                 drain_acks(&mut client, bodies.len(), timeout());
             }
         }));
     }
-    barrier.wait();
+    barrier_wait_within(&barrier, join_deadline());
 
     for handle in client_handles {
-        handle.join().expect("client thread must not panic");
+        join_within(handle, join_deadline());
     }
 
     for (i, handle) in server_handles.into_iter().enumerate() {

@@ -432,6 +432,19 @@ PATH="$stub_path" run_case "run-invalid-runtime-zero" 2 --target-dir /tmp --labe
 PATH="$stub_path" run_case "run-invalid-runtime-leading-zero" 2 --target-dir /tmp --label x --runtime 08
 PATH="$stub_path" run_case "run-invalid-size-leading-zero" 2 --target-dir /tmp --label x --size 08m
 PATH="$stub_path" run_case "run-invalid-size-oversized" 2 --target-dir /tmp --label x --size 999999g
+# --size は 4 KiB（--bs）以上かつ 4 KiB の倍数に限る（Codex P2）。単位なしのバイト数は
+# 既存の書式（単位必須）で拒否する
+size_target="${tmp_root}/size-align-target"
+mkdir -p "$size_target"
+PATH="$stub_path" run_case_msg "run-size-1k-below-block" 2 "--size must be at least 4096 bytes and a multiple of 4096 bytes" --target-dir "$size_target" --label x --runtime 5 --size 1k
+PATH="$stub_path" run_case_msg "run-size-6k-not-multiple" 2 "--size must be at least 4096 bytes and a multiple of 4096 bytes" --target-dir "$size_target" --label x --runtime 5 --size 6k
+PATH="$stub_path" run_case_msg "run-size-4097-bytes-no-unit" 2 "--size must match" --target-dir "$size_target" --label x --runtime 5 --size 4097
+PATH="$stub_path" run_case "run-size-4k-ok" 0 --target-dir "$size_target" --label x --runtime 5 --size 4k
+PATH="$stub_path" run_case "run-size-8k-ok" 0 --target-dir "$size_target" --label x --runtime 5 --size 8k
+# 総量の上限より先に判定する（端数のある値は上限内でも拒否）
+PATH="$stub_path" run_case_msg "run-size-alignment-before-total-cap" 2 "multiple of 4096 bytes" --target-dir "$size_target" --label x --runtime 5 --size 10241k --numjobs 16
+# --from-json でも同じ条件が及ぶ（CLI の --size が検証済みで、JSON の size はそれとの一致を要求）
+run_case_msg "from-json-size-6k-rejected" 2 "multiple of 4096 bytes" --from-json "${fixtures_dir}/fio-3-ok.json" --label x --size 6k
 PATH="$stub_path" run_case "run-invalid-iodepth" 2 --target-dir /tmp --label x --iodepth 999
 PATH="$stub_path" run_case "run-invalid-numjobs" 2 --target-dir /tmp --label x --numjobs 0
 PATH="$stub_path" run_case "run-invalid-direct" 2 --target-dir /tmp --label x --direct 2

@@ -1463,7 +1463,9 @@ mod imp {
     /// `WouldBlock` / `TimedOut` もここでは `Timeout` に写像するが、
     /// `read_exact_until` / `read_body_until` / `write_all_until` は
     /// これらのエラーを本関数に渡さず、`remaining_or_timeout` によるフレーム
-    /// 全体の期限の再計算へループを戻す（REPAIR-5・#820 レビュー指摘）。テスト
+    /// 全体の期限の再計算へループを戻す（REPAIR-5・#820 レビュー指摘。ただし
+    /// 読み取り経路の drain モードでの `WouldBlock` は、ループを戻さず EOF と
+    /// 同じ `Unavailable` にする。[`ReadWait`] 参照）。テスト
     /// （`task13_2_1_map_io_error_maps_would_block_and_timed_out_to_timeout`）
     /// のために写像自体はここに残す。
     fn map_io_error(e: io::Error) -> IoError {
@@ -1482,41 +1484,106 @@ mod imp {
         }
     }
 
-    /// `set_read_timeout` / `set_write_timeout` の失敗を `IoError` へ変換する
-    /// （D・#820・PR #1113 の macOS CI 失敗の修正。H7・#820 security-auditor
-    /// 指摘対応で macOS 限定に絞った）。
+    /// この OS で、`set_read_timeout` / `set_write_timeout`（`setsockopt(2)` の
+    /// `SO_RCVTIMEO` / `SO_SNDTIMEO`）が返す `EINVAL` を「相手がすでに切断した」
+    /// ことの手がかりとして扱うか。macOS だけ `true`（根拠は
+    /// [`is_peer_shutdown_einval`] 参照。H7・#820）。
     ///
-    /// # macOS での `EINVAL`（`InvalidInput`）限定（H7）
-    /// macOS の `setsockopt(2)`（`SO_RCVTIMEO` / `SO_SNDTIMEO` の設定に使う）は、
-    /// マニュアルの `[EINVAL]` 項に「ソケットが接続済みでなければならない
-    /// オプションを、接続されていないソケットに指定した」場合に返ると明記されて
-    /// おり、相手がすでに切断した（あるいは accept 前に切断された）ソケットに対して
-    /// タイムアウトを設定しようとすると発生しうる。この実装は `read_exact_until`・
-    /// `read_body_until`・`write_all_until` のループの毎回、`remaining_or_timeout`
-    /// で残り時間を計算し直した直後に `set_read_timeout` / `set_write_timeout` を
-    /// 呼び直す（B4・#820 レビュー指摘対応）ため、相手が接続直後に切断した場合
-    /// （`io1_uds_recv_reports_unavailable_on_peer_close` が再現するケース）に、
-    /// 最初のループでこの `EINVAL` を踏みうる。
+    /// cfg を実行時の判定から切り離して bool 定数に閉じ込め、判定関数
+    /// （[`classify_read_timeout_error`]・[`map_write_timeout_error`]）には引数で
+    /// 渡す。これにより macOS 側の分岐も Linux 上のユニットテストで確かめられる。
+    const SET_TIMEOUT_EINVAL_MEANS_PEER_SHUTDOWN: bool = cfg!(target_os = "macos");
+
+    /// タイムアウト設定の失敗が「相手の切断を示す `EINVAL`」かを判定する純粋関数
+    /// （D・H7・#820。PR #1113 の macOS CI 失敗の修正）。
     ///
-    /// `remaining_or_timeout` は `Duration::ZERO` を `set_*_timeout` へ渡さない
-    /// （呼び出し前に自身が `Timeout` を返して打ち切るため）ため、この経路の
-    /// `InvalidInput` が「ゼロ Duration を渡した」という別要因で起きることはなく、
-    /// 「相手の接続がすでに閉じている」ことを示すと判断して良い。したがって
-    /// `map_io_error` とは別にここで `Unavailable` へ変換し、
-    /// 切断済みの相手への操作を `Internal`（本来は実装のバグを示すコード）で
-    /// 誤って報告しないようにする。
+    /// `einval_means_peer_shutdown` には通常 [`SET_TIMEOUT_EINVAL_MEANS_PEER_SHUTDOWN`]
+    /// を渡す（テストだけが両方の値を渡す）。`true` かつ `e` が OS の返した
+    /// `EINVAL`（`kind() == InvalidInput` かつ `raw_os_error()` を持つ）のときだけ
+    /// `true` を返す。std が OS を呼ばずに合成する `InvalidInput`（`Duration::ZERO`
+    /// を渡した場合等。`raw_os_error()` を持たない）は対象外にし、実装の誤りを
+    /// 相手の切断と取り違えない（加えて `remaining_or_timeout` が
+    /// `Duration::ZERO` を渡さない）。
     ///
-    /// この読み替えは macOS 限定で行う（`cfg(target_os = "macos")`）。Linux では
-    /// 同じ状況でも `setsockopt` 自体は成功し、直後の `read`/`write` が
-    /// `map_io_error` の切断系 `ErrorKind` を返すため、この関数が `InvalidInput`
-    /// を受け取ること自体が「相手の接続」とは無関係な実装上の異常（不正な
-    /// timeout 値の指定等）を示す可能性が高い。macOS 版の判断根拠を Linux にも
-    /// 転用すると、本来 `Internal`（実装バグ）として報告すべきものを
-    /// `Unavailable` に読み替えてしまい、誤ってバグを隠す側に倒れる
-    /// （H7・#820 security-auditor 指摘対応）。
-    #[cfg(target_os = "macos")]
-    fn map_set_timeout_error(e: io::Error) -> IoError {
-        if e.kind() == io::ErrorKind::InvalidInput {
+    /// # macOS で `EINVAL` を相手の切断とみなす根拠
+    /// - 実測: macOS CI では、相手が close した後のソケットに対する
+    ///   `set_read_timeout` が `EINVAL`（os error 22）を返す
+    ///   （`io1_uds_recv_reports_unavailable_on_peer_close` が再現するケースと、
+    ///   PR #1113 で失敗した 2 テスト）
+    /// - XNU のソース（`sosetoptlock`）を読む限り、ソケットが送受信とも
+    ///   shutdown 済み（`SS_CANTRCVMORE` と `SS_CANTSENDMORE` の両方が立った状態。
+    ///   UDS では相手の close でこの状態になるように見える）のとき、setsockopt は
+    ///   オプションの種類によらず `EINVAL` を返すように見える。macOS の
+    ///   `setsockopt(2)` のマニュアルの `[EINVAL]` 項にも、接続済みであることを
+    ///   要するオプションを接続されていないソケットに指定した場合に返るとある。
+    ///   ただしどの状態で `EINVAL` になるかを実機で網羅的に確かめたものではない
+    ///
+    /// # Linux（`false`）
+    /// Linux では相手が切断済みでも `setsockopt` 自体は成功し、直後の
+    /// `read` / `write` が `map_io_error` の切断系 `ErrorKind` を返す。したがって
+    /// `EINVAL` は相手の接続とは無関係な実装上の異常（不正な timeout 値の指定等）を
+    /// 示す可能性が高い。macOS の判断を Linux に転用すると、本来 `Internal`
+    /// （実装バグ）として報告すべきものを相手の切断に読み替えてバグを隠す側に
+    /// 倒れるため、Linux では常に `false` を返す（H7・#820 security-auditor 指摘
+    /// 対応）。
+    fn is_peer_shutdown_einval(e: &io::Error, einval_means_peer_shutdown: bool) -> bool {
+        einval_means_peer_shutdown
+            && e.kind() == io::ErrorKind::InvalidInput
+            && e.raw_os_error().is_some()
+    }
+
+    /// 読み取り経路の `set_read_timeout` が失敗したときの処置
+    /// （[`classify_read_timeout_error`] の戻り値）。
+    #[derive(Debug)]
+    enum ReadTimeoutAction {
+        /// 相手が切断済みとみなし、タイムアウトを設定せずに受信バッファの残りを
+        /// 読み出す（[`ReadWait`] の drain モードへ入る）。
+        DrainWithoutTimeout,
+        /// 読み取りを打ち切ってこのエラーを返す。
+        Fail(IoError),
+    }
+
+    /// 読み取り経路（`read_exact_until`・`read_body_until`）の `set_read_timeout`
+    /// の失敗を処置へ振り分ける純粋関数（IO-1・REPAIR-5・#820。PR #1113 の macOS
+    /// CI 失敗の修正）。
+    ///
+    /// - [`is_peer_shutdown_einval`] が `true`（macOS の `EINVAL`）:
+    ///   [`ReadTimeoutAction::DrainWithoutTimeout`]
+    /// - それ以外（Linux の `EINVAL`・他の `ErrorKind`・std が合成した
+    ///   `InvalidInput`）: `Internal` の [`ReadTimeoutAction::Fail`]
+    ///
+    /// # 失敗にせず読み続ける理由
+    /// 相手が close 前に送り切ったデータは受信バッファに残っており、ここで
+    /// `Unavailable` にすると正当なフレーム（1 フレーム送って閉じる相手の最後の
+    /// フレーム等）を読まずに失う。以前の実装（H7）は macOS の `EINVAL` を
+    /// 読み取り経路でも `Unavailable` にしていたため、このフレームを失っていた。
+    /// タイムアウトを設定できなくてもハングしないことは、XNU の性質（送受信とも
+    /// shutdown 済みのソケットの read は受信バッファのデータを返し、尽きれば 0 を
+    /// 返してブロックしないように見えること）には依存させず、[`ReadWait`] が
+    /// ソケットを nonblocking にしてから read することで担保する。
+    fn classify_read_timeout_error(
+        e: io::Error,
+        einval_means_peer_shutdown: bool,
+    ) -> ReadTimeoutAction {
+        if is_peer_shutdown_einval(&e, einval_means_peer_shutdown) {
+            ReadTimeoutAction::DrainWithoutTimeout
+        } else {
+            ReadTimeoutAction::Fail(IoError::new(
+                IoErrorCode::Internal,
+                format!("failed to set io timeout: {e}"),
+            ))
+        }
+    }
+
+    /// 書き込み経路（`write_all_until`）の `set_write_timeout` の失敗を
+    /// `IoError` へ変換する純粋関数（D・H7・#820）。
+    ///
+    /// - [`is_peer_shutdown_einval`] が `true`（macOS の `EINVAL`）: `Unavailable`
+    ///   （相手が閉じていれば書けないため、読み取り経路と違い続行しない。
+    ///   切断済みの相手への操作を実装バグを示す `Internal` で誤って報告しない）
+    /// - それ以外: `Internal`
+    fn map_write_timeout_error(e: io::Error, einval_means_peer_shutdown: bool) -> IoError {
+        if is_peer_shutdown_einval(&e, einval_means_peer_shutdown) {
             IoError::new(
                 IoErrorCode::Unavailable,
                 format!("peer connection is unavailable: failed to set io timeout: {e}"),
@@ -1529,16 +1596,103 @@ mod imp {
         }
     }
 
-    /// Linux 版 [`map_set_timeout_error`]（H7・#820 security-auditor 指摘対応）。
-    /// 上記のドキュメンテーションコメントのとおり、Linux では
-    /// `set_read_timeout` / `set_write_timeout` の失敗を「相手の接続が閉じて
-    /// いる」ことの手がかりとして扱わず、常に `Internal` として報告する。
-    #[cfg(target_os = "linux")]
-    fn map_set_timeout_error(e: io::Error) -> IoError {
-        IoError::new(
-            IoErrorCode::Internal,
-            format!("failed to set io timeout: {e}"),
-        )
+    /// 読み取り経路（`read_exact_until`・`read_body_until`）の 1 回の呼び出しの
+    /// 間、各 read の前の期限判定・待ち時間の設定と、相手の切断後に受信バッファの
+    /// 残りを読み出す drain モードを管理する（IO-1・REPAIR-5・#820。PR #1113 の
+    /// macOS CI 失敗の修正）。
+    ///
+    /// # drain モード
+    /// [`Self::before_read`] で `set_read_timeout` の失敗が
+    /// [`ReadTimeoutAction::DrainWithoutTimeout`] に振り分けられると、ソケットを
+    /// nonblocking に切り替えて drain モードへ入る。drain モードでは:
+    ///
+    /// - 各 read の前の期限判定（`remaining_or_timeout`）は通常時と同じく行う
+    /// - `set_read_timeout` はその呼び出しの残りでは呼び直さない（相手の切断は
+    ///   元に戻らず、呼び直しても同じ失敗になるだけのため）
+    /// - read はブロックせず、データ・0（EOF）・`WouldBlock` のいずれかで即座に
+    ///   返る。`WouldBlock` は受信バッファが空であることを示し、相手はもう送って
+    ///   こないため EOF と同じ `Unavailable` にする（呼び出し元が
+    ///   [`Self::is_draining`] で判定する。通常時のように待ち直すと期限まで
+    ///   busy loop になる）
+    ///
+    /// # blocking への復帰
+    /// [`Self::finish`] が読み取り関数の終了時（成功・失敗とも）に blocking へ
+    /// 戻し、読み取り関数の外から見たソケットの状態を「blocking＋呼び出しごとの
+    /// タイムアウト」に保つ。`EINVAL` が相手の切断以外の原因だった場合に
+    /// nonblocking のまま返すと、次の recv / send で `set_*_timeout` が成功しても
+    /// read / write が `WouldBlock` を返し続け、期限まで busy loop になりうる
+    /// （`write_all_until` は blocking＋`SO_SNDTIMEO` が前提）。相手が本当に切断
+    /// 済みなら、次の recv は再び drain モードへ入り、send は `set_write_timeout`
+    /// の失敗で `Unavailable` になるため、戻しても害はない。
+    ///
+    /// nonblocking の切り替えが失敗した場合は `Internal` を返す（fail-closed。
+    /// 復帰の失敗では受信済みのフレームも失う）。accept 経路（`accept_with`）は
+    /// 相手が切断済みの接続にも `set_nonblocking(false)` を呼んでおり、その接続の
+    /// 最初の `set_read_timeout` が `EINVAL` になる
+    /// `io1_uds_recv_reports_unavailable_on_peer_close` が macOS CI で通っている
+    /// ことから、この状態のソケットでも切り替えは成功すると見込んでいる。
+    struct ReadWait {
+        draining: bool,
+    }
+
+    impl ReadWait {
+        fn new() -> Self {
+            Self { draining: false }
+        }
+
+        fn is_draining(&self) -> bool {
+            self.draining
+        }
+
+        /// read の直前に呼ぶ。期限を過ぎていれば `Timeout`、drain モードでなければ
+        /// 残り時間を `set_read_timeout` に設定する（失敗は
+        /// [`classify_read_timeout_error`] で振り分ける）。
+        fn before_read(&mut self, stream: &UnixStream, deadline: Instant) -> Result<(), IoError> {
+            let remaining = remaining_or_timeout(deadline)?;
+            if self.draining {
+                return Ok(());
+            }
+            match stream.set_read_timeout(Some(remaining)) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    match classify_read_timeout_error(e, SET_TIMEOUT_EINVAL_MEANS_PEER_SHUTDOWN) {
+                        ReadTimeoutAction::DrainWithoutTimeout => self.enter_drain(stream),
+                        ReadTimeoutAction::Fail(err) => Err(err),
+                    }
+                }
+            }
+        }
+
+        /// ソケットを nonblocking に切り替えて drain モードへ入る（テストは
+        /// Linux 上で drain モードを強制するために直接呼ぶ）。
+        fn enter_drain(&mut self, stream: &UnixStream) -> Result<(), IoError> {
+            stream.set_nonblocking(true).map_err(|e| {
+                IoError::new(
+                    IoErrorCode::Internal,
+                    format!("failed to switch a peer-closed stream to nonblocking mode: {e}"),
+                )
+            })?;
+            self.draining = true;
+            Ok(())
+        }
+
+        /// 読み取り関数の結果を受け取り、drain モードに入っていれば blocking へ
+        /// 戻してから返す。読み取り自体がエラーならそのエラーを優先する（接続は
+        /// 呼び出し元で poison され以後使われないため、復帰の失敗は捨てる）。
+        fn finish<T>(self, stream: &UnixStream, result: Result<T, IoError>) -> Result<T, IoError> {
+            if !self.draining {
+                return result;
+            }
+            let restored = stream.set_nonblocking(false);
+            match (result, restored) {
+                (Err(e), _) => Err(e),
+                (Ok(value), Ok(())) => Ok(value),
+                (Ok(_), Err(e)) => Err(IoError::new(
+                    IoErrorCode::Internal,
+                    format!("failed to restore blocking mode after draining: {e}"),
+                )),
+            }
+        }
     }
 
     /// `buf` を埋め切るまで読む。フレーム全体の `deadline` を基準に毎回残り
@@ -1546,18 +1700,39 @@ mod imp {
     /// フレーム全体の期限で打ち切られる（期限後に read を始めず、各 read の待ちも
     /// 残り時間が上限。超過はソケットのタイムアウトの粒度の範囲に収まる。
     /// REPAIR-5）。
+    ///
+    /// 相手が切断済みでも受信バッファに残ったデータは読み切り、尽きたところで
+    /// `Unavailable` を返す（macOS の扱いは [`ReadWait`] 参照。IO-1・#820）。
     fn read_exact_until(
         stream: &mut UnixStream,
         buf: &mut [u8],
         deadline: Instant,
         what: &'static str,
     ) -> Result<(), IoError> {
+        let mut wait = ReadWait::new();
+        let result = read_exact_with(stream, buf, deadline, what, &mut wait);
+        wait.finish(stream, result)
+    }
+
+    /// [`read_exact_until`] の読み取りループ本体。`wait` の drain モードの
+    /// 後始末（blocking への復帰）は呼び出し元が [`ReadWait::finish`] で行う
+    /// （テストは drain モードを強制した `wait` を渡して直接呼ぶ）。
+    fn read_exact_with(
+        stream: &mut UnixStream,
+        buf: &mut [u8],
+        deadline: Instant,
+        what: &'static str,
+        wait: &mut ReadWait,
+    ) -> Result<(), IoError> {
+        let peer_closed = || {
+            IoError::new(
+                IoErrorCode::Unavailable,
+                format!("peer closed the connection before sending a complete {what}"),
+            )
+        };
         let mut filled = 0usize;
         while filled < buf.len() {
-            let remaining = remaining_or_timeout(deadline)?;
-            stream
-                .set_read_timeout(Some(remaining))
-                .map_err(map_set_timeout_error)?;
+            wait.before_read(stream, deadline)?;
             let Some(dst) = buf.get_mut(filled..) else {
                 return Err(IoError::new(
                     IoErrorCode::Internal,
@@ -1565,13 +1740,13 @@ mod imp {
                 ));
             };
             match stream.read(dst) {
-                Ok(0) => {
-                    return Err(IoError::new(
-                        IoErrorCode::Unavailable,
-                        format!("peer closed the connection before sending a complete {what}"),
-                    ));
-                }
+                Ok(0) => return Err(peer_closed()),
                 Ok(n) => filled += n,
+                // drain モード（相手が切断済み）で受信バッファが尽きた。EOF と
+                // 同じ扱いにする（ReadWait 参照）。
+                Err(e) if wait.is_draining() && e.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(peer_closed());
+                }
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -1734,25 +1909,45 @@ mod imp {
     /// 領域をペイロードとして使う（複製しない。#820 codex P0 指摘対応）。
     /// したがって 1 フレームの受信で申告長に比例して確保するのは、
     /// `AdmittedHeader` 由来の `body_len` ぶんの 1 回だけである。
+    ///
+    /// # 相手の切断後（IO-1・#820）
+    /// 相手が切断済みでも受信バッファに残ったデータは読み切り、尽きたところで
+    /// `Unavailable` を返す（macOS の扱いは [`ReadWait`] 参照）。
     fn read_body_until(
         stream: &mut UnixStream,
         body_len: usize,
         deadline: Instant,
     ) -> Result<Vec<u8>, IoError> {
+        let mut wait = ReadWait::new();
+        let result = read_body_with(stream, body_len, deadline, &mut wait);
+        wait.finish(stream, result)
+    }
+
+    /// [`read_body_until`] の読み取りループ本体（後始末の分担は
+    /// [`read_exact_with`] と同じ）。
+    fn read_body_with(
+        stream: &mut UnixStream,
+        body_len: usize,
+        deadline: Instant,
+        wait: &mut ReadWait,
+    ) -> Result<Vec<u8>, IoError> {
+        let peer_closed = || {
+            IoError::new(
+                IoErrorCode::Unavailable,
+                "peer closed the connection before sending a complete frame body",
+            )
+        };
         let mut body = BodyBuffer::new(body_len);
         while !body.is_complete() {
-            let remaining = remaining_or_timeout(deadline)?;
-            stream
-                .set_read_timeout(Some(remaining))
-                .map_err(map_set_timeout_error)?;
+            wait.before_read(stream, deadline)?;
             match body.read_once(stream) {
-                Ok(0) => {
-                    return Err(IoError::new(
-                        IoErrorCode::Unavailable,
-                        "peer closed the connection before sending a complete frame body",
-                    ));
-                }
+                Ok(0) => return Err(peer_closed()),
                 Ok(_) => {}
+                // read_exact_with と同じく、drain モードで受信バッファが尽きたら
+                // EOF と同じ扱いにする。
+                Err(e) if wait.is_draining() && e.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(peer_closed());
+                }
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -1761,7 +1956,7 @@ mod imp {
                             | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    // read_exact_until と同じ理由でループを戻す（REPAIR-5）。
+                    // read_exact_with と同じ理由でループを戻す（REPAIR-5）。
                     // `BodyBuffer::read_once` はエラー時に `filled` を進めない
                     // ため、ゼロ埋め済みの未受信領域が本体として数えられる
                     // ことはない。
@@ -1775,6 +1970,10 @@ mod imp {
 
     /// `bytes` を書き切るまで送る（`write_all` 相当をフレーム単位の期限付きで
     /// 自前実装したもの）。
+    ///
+    /// `set_write_timeout` の失敗は [`map_write_timeout_error`] で変換する
+    /// （macOS で相手が切断済みなら `Unavailable`。読み取り経路と違い、相手が
+    /// 閉じていれば書けないため続行しない）。
     fn write_all_until(
         stream: &mut UnixStream,
         bytes: &[u8],
@@ -1785,7 +1984,7 @@ mod imp {
             let remaining = remaining_or_timeout(deadline)?;
             stream
                 .set_write_timeout(Some(remaining))
-                .map_err(map_set_timeout_error)?;
+                .map_err(|e| map_write_timeout_error(e, SET_TIMEOUT_EINVAL_MEANS_PEER_SHUTDOWN))?;
             let Some(src) = bytes.get(written..) else {
                 return Err(IoError::new(
                     IoErrorCode::Internal,
@@ -1808,7 +2007,7 @@ mod imp {
                             | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    // read_exact_until と同じ理由でループを戻す（REPAIR-5）。
+                    // read_exact_with と同じ理由でループを戻す（REPAIR-5）。
                     continue;
                 }
                 Err(e) => return Err(map_io_error(e)),
@@ -1852,37 +2051,271 @@ mod imp {
             assert_eq!(err.code(), IoErrorCode::Internal);
         }
 
-        /// D・#820（PR #1113 の macOS CI 失敗の修正。H7・#820 security-auditor
-        /// 指摘対応で macOS 限定に絞った）: macOS では `set_read_timeout` /
-        /// `set_write_timeout` の `InvalidInput`（`EINVAL`。相手がすでに
-        /// 切断済みのソケットへタイムアウトを設定しようとした場合）は
-        /// `Internal` ではなく `Unavailable` に写像される
-        /// （`map_set_timeout_error` のドキュメンテーションコメント参照）。
+        /// Linux・macOS 共通の `EINVAL` の errno 値（std はこれを
+        /// `ErrorKind::InvalidInput` に写像する）。`imp` は両 OS でだけ
+        /// コンパイルされるため、テストでも同じ値を使える。
+        const TEST_EINVAL: i32 = 22;
+        /// Linux・macOS 共通の `EBADF` の errno 値（`EINVAL` 以外の OS エラーの例）。
+        const TEST_EBADF: i32 = 9;
+
+        /// IO-1・H7・#820: macOS の本番の設定値
+        /// （[`SET_TIMEOUT_EINVAL_MEANS_PEER_SHUTDOWN`]）では、`EINVAL` は読み取り
+        /// 経路で drain モード、書き込み経路で `Unavailable` になる。
         #[cfg(target_os = "macos")]
         #[test]
-        fn d_820_map_set_timeout_error_maps_invalid_input_to_unavailable_on_macos() {
-            let err = map_set_timeout_error(io::Error::from(io::ErrorKind::InvalidInput));
+        fn io1_h7_820_macos_setting_drains_reads_and_fails_writes_on_einval() {
+            match classify_read_timeout_error(
+                io::Error::from_raw_os_error(TEST_EINVAL),
+                SET_TIMEOUT_EINVAL_MEANS_PEER_SHUTDOWN,
+            ) {
+                ReadTimeoutAction::DrainWithoutTimeout => {}
+                ReadTimeoutAction::Fail(err) => {
+                    panic!("EINVAL on the read path must drain on macOS, got {err:?}")
+                }
+            }
+            let err = map_write_timeout_error(
+                io::Error::from_raw_os_error(TEST_EINVAL),
+                SET_TIMEOUT_EINVAL_MEANS_PEER_SHUTDOWN,
+            );
             assert_eq!(err.code(), IoErrorCode::Unavailable);
         }
 
-        /// H7・#820（security-auditor 指摘対応）: Linux では `InvalidInput` を
-        /// macOS 固有の EINVAL 事情の手がかりとして扱わず、引き続き `Internal`
-        /// に写像される（`map_set_timeout_error` のドキュメンテーションコメント
-        /// 「Linux にも転用すると誤ってバグを隠す側に倒れる」参照）。
+        /// H7・#820（security-auditor 指摘対応）: Linux の本番の設定値では、
+        /// `EINVAL` を相手の切断の手がかりとして扱わず、読み取り・書き込みとも
+        /// `Internal`。
         #[cfg(target_os = "linux")]
         #[test]
-        fn h7_map_set_timeout_error_keeps_invalid_input_as_internal_on_linux() {
-            let err = map_set_timeout_error(io::Error::from(io::ErrorKind::InvalidInput));
+        fn h7_820_linux_setting_keeps_einval_internal_on_both_paths() {
+            let err = expect_read_fail(classify_read_timeout_error(
+                io::Error::from_raw_os_error(TEST_EINVAL),
+                SET_TIMEOUT_EINVAL_MEANS_PEER_SHUTDOWN,
+            ));
+            assert_eq!(err.code(), IoErrorCode::Internal);
+            let err = map_write_timeout_error(
+                io::Error::from_raw_os_error(TEST_EINVAL),
+                SET_TIMEOUT_EINVAL_MEANS_PEER_SHUTDOWN,
+            );
             assert_eq!(err.code(), IoErrorCode::Internal);
         }
 
-        /// D・#820: `InvalidInput` 以外のタイムアウト設定失敗（例: 無効な fd を
-        /// 示す `EBADF` 相当）は、両 OS とも引き続き `Internal` に写像される
-        /// （実装のバグを示す経路と、相手の切断を示す経路を区別する）。
+        /// IO-1・REPAIR-5・#820（PR #1113 の macOS CI 失敗の修正）: macOS の
+        /// 意味論（`true`）では、読み取り経路の `EINVAL` は失敗にせず drain
+        /// モードへ進む（受信バッファの残りを読む）。
         #[test]
-        fn d_820_map_set_timeout_error_maps_other_kinds_to_internal() {
-            let err = map_set_timeout_error(io::Error::from(io::ErrorKind::PermissionDenied));
+        fn io1_repair5_820_read_timeout_einval_drains_with_macos_semantics() {
+            let e = io::Error::from_raw_os_error(TEST_EINVAL);
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            match classify_read_timeout_error(e, true) {
+                ReadTimeoutAction::DrainWithoutTimeout => {}
+                ReadTimeoutAction::Fail(err) => {
+                    panic!("EINVAL on the read path must drain on macOS, got {err:?}")
+                }
+            }
+        }
+
+        /// H7・#820: Linux の意味論（`false`）では、読み取り経路の `EINVAL` も
+        /// 従来どおり `Internal`。
+        #[test]
+        fn h7_820_read_timeout_einval_is_internal_with_linux_semantics() {
+            let err = expect_read_fail(classify_read_timeout_error(
+                io::Error::from_raw_os_error(TEST_EINVAL),
+                false,
+            ));
             assert_eq!(err.code(), IoErrorCode::Internal);
+            assert_eq!(
+                err.message(),
+                format!(
+                    "failed to set io timeout: {}",
+                    io::Error::from_raw_os_error(TEST_EINVAL)
+                )
+            );
+        }
+
+        /// D・H7・#820: `EINVAL` 以外の OS エラー・std が合成した
+        /// `InvalidInput`（`raw_os_error()` を持たない。`Duration::ZERO` を渡した
+        /// 場合等）は、macOS の意味論でも読み取り経路で `Internal`（実装の誤りを
+        /// 相手の切断と取り違えない）。
+        #[test]
+        fn d_h7_820_read_timeout_other_errors_are_internal_on_both_semantics() {
+            for semantics in [true, false] {
+                for e in [
+                    io::Error::from_raw_os_error(TEST_EBADF),
+                    io::Error::from(io::ErrorKind::InvalidInput),
+                ] {
+                    let label = format!("{e:?} semantics={semantics}");
+                    let err = expect_read_fail(classify_read_timeout_error(e, semantics));
+                    assert_eq!(err.code(), IoErrorCode::Internal, "{label}");
+                }
+            }
+        }
+
+        /// D・H7・#820: macOS の意味論では、書き込み経路の `EINVAL` は続行せず
+        /// `Unavailable`（相手が閉じていれば書けないため）。
+        #[test]
+        fn d_h7_820_write_timeout_einval_is_unavailable_with_macos_semantics() {
+            let err = map_write_timeout_error(io::Error::from_raw_os_error(TEST_EINVAL), true);
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+            assert_eq!(
+                err.message(),
+                format!(
+                    "peer connection is unavailable: failed to set io timeout: {}",
+                    io::Error::from_raw_os_error(TEST_EINVAL)
+                )
+            );
+        }
+
+        /// H7・#820: Linux の意味論では、書き込み経路の `EINVAL` も `Internal`。
+        /// `EINVAL` 以外・std が合成した `InvalidInput` は両方の意味論で
+        /// `Internal`。
+        #[test]
+        fn d_h7_820_write_timeout_other_cases_are_internal() {
+            let err = map_write_timeout_error(io::Error::from_raw_os_error(TEST_EINVAL), false);
+            assert_eq!(err.code(), IoErrorCode::Internal);
+            for semantics in [true, false] {
+                for e in [
+                    io::Error::from_raw_os_error(TEST_EBADF),
+                    io::Error::from(io::ErrorKind::InvalidInput),
+                ] {
+                    let label = format!("{e:?} semantics={semantics}");
+                    let err = map_write_timeout_error(e, semantics);
+                    assert_eq!(err.code(), IoErrorCode::Internal, "{label}");
+                }
+            }
+        }
+
+        fn expect_read_fail(action: ReadTimeoutAction) -> IoError {
+            match action {
+                ReadTimeoutAction::Fail(err) => err,
+                ReadTimeoutAction::DrainWithoutTimeout => {
+                    panic!("this case must fail instead of draining")
+                }
+            }
+        }
+
+        /// IO-1・REPAIR-5・#820: drain モード（macOS で相手の切断後に入る経路を
+        /// Linux 上でも強制して確かめる）では、相手が close 前に送り切ったデータを
+        /// ヘッダ・本体とも読み切り、尽きたところで `Unavailable` を返す。
+        #[test]
+        fn io1_repair5_820_drain_mode_reads_buffered_data_after_peer_close() {
+            let (mut reader, mut writer) = UnixStream::pair().expect("socketpair");
+            let header = patterned_bytes(10);
+            let body = patterned_bytes(300);
+            writer.write_all(&header).expect("writer must send header");
+            writer.write_all(&body).expect("writer must send body");
+            drop(writer);
+            let deadline = Instant::now() + Duration::from_secs(5);
+
+            let mut wait = ReadWait::new();
+            wait.enter_drain(&reader)
+                .expect("nonblocking switch must succeed");
+            let mut got_header = [0u8; 10];
+            let result = read_exact_with(
+                &mut reader,
+                &mut got_header,
+                deadline,
+                "frame header",
+                &mut wait,
+            );
+            wait.finish(&reader, result)
+                .expect("buffered header must be read in drain mode");
+            assert_eq!(got_header.as_slice(), header.as_slice());
+
+            let mut wait = ReadWait::new();
+            wait.enter_drain(&reader)
+                .expect("nonblocking switch must succeed");
+            let result = read_body_with(&mut reader, body.len(), deadline, &mut wait);
+            let got_body = wait
+                .finish(&reader, result)
+                .expect("buffered body must be read in drain mode");
+            assert_eq!(got_body, body);
+            assert_eq!(got_body.capacity(), body.len());
+
+            let mut wait = ReadWait::new();
+            wait.enter_drain(&reader)
+                .expect("nonblocking switch must succeed");
+            let mut one = [0u8; 1];
+            let result =
+                read_exact_with(&mut reader, &mut one, deadline, "frame header", &mut wait);
+            let err = wait
+                .finish(&reader, result)
+                .expect_err("reading past the buffered data must fail");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+            assert_eq!(
+                err.message(),
+                "peer closed the connection before sending a complete frame header"
+            );
+        }
+
+        /// REPAIR-5・#820: drain モードの read はブロックしない。相手が生きていて
+        /// データがない場合も、期限（5 秒）まで待たずに即座に `Unavailable` を
+        /// 返す。その後 [`ReadWait::finish`] が blocking に戻すため、以後の read は
+        /// 設定したタイムアウトまで待つ（nonblocking のまま残ると即座に返る）。
+        #[test]
+        fn repair5_820_drain_mode_never_blocks_and_finish_restores_blocking() {
+            let (mut reader, writer) = UnixStream::pair().expect("socketpair");
+            let deadline = Instant::now() + Duration::from_secs(5);
+
+            let started = Instant::now();
+            let mut wait = ReadWait::new();
+            wait.enter_drain(&reader)
+                .expect("nonblocking switch must succeed");
+            let result = read_body_with(&mut reader, 4, deadline, &mut wait);
+            let err = wait
+                .finish(&reader, result)
+                .expect_err("an empty receive buffer in drain mode must fail");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+            assert_eq!(
+                err.message(),
+                "peer closed the connection before sending a complete frame body"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "drain mode must not wait for the deadline: {:?}",
+                started.elapsed()
+            );
+
+            const PROBE: Duration = Duration::from_millis(100);
+            reader
+                .set_read_timeout(Some(PROBE))
+                .expect("set_read_timeout must succeed on a live connection");
+            let probe_started = Instant::now();
+            let mut buf = [0u8; 1];
+            let probe = reader.read(&mut buf).expect_err("no data was sent");
+            assert!(
+                matches!(
+                    probe.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ),
+                "kind={:?}",
+                probe.kind()
+            );
+            assert!(
+                probe_started.elapsed() >= PROBE / 2,
+                "the stream must be blocking again after finish: {:?}",
+                probe_started.elapsed()
+            );
+            drop(writer);
+        }
+
+        /// REPAIR-5・#820: drain モードでも各 read の前の期限判定は行う
+        /// （期限切れなら受信バッファにデータがあっても `Timeout`）。
+        #[test]
+        fn repair5_820_drain_mode_still_honors_the_deadline() {
+            let (mut reader, mut writer) = UnixStream::pair().expect("socketpair");
+            writer.write_all(&[1, 2, 3]).expect("writer must send");
+            drop(writer);
+            let deadline = Instant::now() - Duration::from_millis(1);
+
+            let mut wait = ReadWait::new();
+            wait.enter_drain(&reader)
+                .expect("nonblocking switch must succeed");
+            let mut buf = [0u8; 3];
+            let result =
+                read_exact_with(&mut reader, &mut buf, deadline, "frame header", &mut wait);
+            let err = wait
+                .finish(&reader, result)
+                .expect_err("a past deadline must time out even in drain mode");
+            assert_eq!(err.code(), IoErrorCode::Timeout);
         }
 
         /// [`BodyBuffer`] のテスト用の `Read` 実装。`source` を `pattern` の
@@ -2349,9 +2782,9 @@ mod imp {
         /// 読み取りタイムアウトは connect の直後（サーバーがまだ接続を閉じて
         /// いない間）に設定しておく。macOS の `setsockopt(SO_RCVTIMEO)` は、相手が
         /// 切断済みのソケットに対しては `EINVAL` を返すため（本番側は
-        /// `map_set_timeout_error` の H7 で扱う挙動）、サーバーが拒否した接続を
-        /// 閉じた後に設定すると失敗する（J1・#820 PR #1113 の macOS CI 失敗の
-        /// 修正）。
+        /// `classify_read_timeout_error`・`map_write_timeout_error` で扱う
+        /// 挙動）、サーバーが拒否した接続を閉じた後に設定すると失敗する（J1・
+        /// #820 PR #1113 の macOS CI 失敗の修正）。
         fn connect_clients(path: &Path, count: usize) -> Vec<UnixStream> {
             (0..count)
                 .map(|_| {

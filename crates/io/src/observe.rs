@@ -328,6 +328,15 @@ const _: () = assert!(
 /// 1 か所へ集約する（コード重複の防止。REPAIR-1）。非公開のため公開 API には
 /// 影響しない（各観測フックがこの型をラップし、同じメソッド名・戻り値で
 /// 公開する）。
+///
+/// # 確保量の上限
+/// 各行の `String` は積む前に余剰容量を返すため、行の確保量の合計は
+/// `total_bytes`（[`MAX_SEND_LOG_BUFFER_BYTES`] 以下）に一致する。行を指す
+/// `VecDeque` の枠は遅延確保の償却つき成長だが、行数上限（`capacity`。最大
+/// [`MAX_SEND_LOG_CAPACITY`]）で頭打ちになるため、枠の確保量は
+/// `2 × capacity × size_of::<String>()` 程度に収まる（事前に `capacity` ぶん
+/// 確保すると、使わない観測フックにも最大容量の枠を持たせることになるため
+/// 遅延確保のままにする）。
 struct BoundedJsonLines {
     lines: VecDeque<String>,
     capacity: usize,
@@ -425,13 +434,17 @@ impl BoundedJsonLines {
             self.dropped = self.dropped.saturating_add(1);
             return false;
         }
-        let encoded = encode();
+        let mut encoded = encode();
         // 行数上限とは独立に、合計バイト数の上限も守る（codex P0 再指摘対応）。
         // 巨大な `message` が連続しても、キューの総メモリ使用量を有界に保つ。
         if self.total_bytes.saturating_add(encoded.len()) > MAX_SEND_LOG_BUFFER_BYTES {
             self.dropped = self.dropped.saturating_add(1);
             return false;
         }
+        // `format!` は償却つきで伸ばすため容量が長さを上回りうる。`total_bytes` が
+        // 数える長さと実際の確保量を一致させるため、積む前に余剰容量を返す
+        // （#820 codex P0 指摘〔確保容量が検証済みの長さを超える〕と同じ観点）。
+        encoded.shrink_to_fit();
         self.total_bytes += encoded.len();
         self.lines.push_back(encoded);
         true
@@ -586,6 +599,8 @@ fn outcome_reason_str(outcome: SendOutcome) -> &'static str {
 ///
 /// 依存を追加せず手書きで JSON を組み立てるための最小実装（serde_json 相当の
 /// 完全な仕様準拠は目指さない。ERR-1 の `message` を出力する用途に限る）。
+/// 呼び出し元は [`truncate_message_bytes`] で切り詰めた入力だけを渡すため、
+/// 伸長後の長さも [`MAX_ESCAPED_MESSAGE_BYTES`] 以下に収まる。
 fn escape_json_string(input: &str) -> String {
     let mut escaped = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -1120,7 +1135,9 @@ fn peer_uid_json_fragment(peer_uid: Option<u32>) -> String {
 }
 
 /// [`ServerEvent`] を 1 行の JSON Lines 文字列へエンコードする（改行は含まない。
-/// [`encode_send_event`] の UDS サーバー版。TASK-13.2.1・#820）。
+/// [`encode_send_event`] の UDS サーバー版。TASK-13.2.1・#820）。出力長は
+/// [`MAX_SERVER_LOG_LINE_BYTES`] 以下（固定語彙・数値と切り詰め済みの `message`
+/// だけで組み立てるため。最悪ケースはテストで照合する）。
 fn encode_server_event(event: &ServerEvent<'_>) -> String {
     let latency_us = event.latency.as_micros();
     let op = server_op_str(event.op);

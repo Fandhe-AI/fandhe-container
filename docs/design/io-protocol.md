@@ -128,7 +128,7 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 
 補足: TASK-13.1（#76）でバッチ集約バッファ（`BatchBuffer`）と設定 API（`BatchConfig`）を追加した。TASK-13.2.1（#820）で UDS サーバー側トランスポート（`UdsServer`・`UdsConnection`。Linux / macOS。1 接続の期限付き送受信までを提供し、受付ループ自体は呼び出し側が組む）を追加した。ディスク書き込み・ACK 返却・`BatchBuffer` とのつなぎ込み・クライアント側の UDS 接続・CLI からのバッチサイズ配線（`--batch-size` 相当）は本書時点では未実装であり、TASK-13.2.2（#822）・TASK-13.3 の範囲で扱う（REPAIR-3: 実装済みを装わない）。累積バイト数上限（`MAX_BATCH_BYTES`）は `BatchBuffer` 単体の確保量を抑える安全弁であり、受信経路の長さ・件数検証は `recv_limits`（TASK-13.4・#796）が担う。複数接続を跨いだ累積・未フラッシュ滞留量上限（IO-10・TASK-16）とは別物。
 
-「確保量の上限は `admit` を通過した `AdmittedHeader` からしか得られない」という契約には 2 つの経路がある（#820 レビュー指摘。security P2）: 一括確保する経路は `AdmittedHeader::allocate_body`（`Frame::decode_body` 等が本体をまるごと読める場合向け）を使い、相手が遅い・悪意ある場合でも接続 1 本あたりの瞬間的なメモリ使用量を抑えたい分割読みの経路（`crates/io/src/server.rs` の `read_body_until`。UDS 受信ループが使う）は本メソッドを経由せず `AdmittedHeader::body_len` を読み取りの上限として使う。どちらの経路も `AdmittedHeader` を経由しない長さを確保量へ用いてはならない。
+「確保量の上限は `admit` を通過した `AdmittedHeader` からしか得られない」という契約には 2 つの経路がある（#820 レビュー指摘。security P2）: 一括確保する経路は `AdmittedHeader::allocate_body`（`Frame::decode_body` 等が本体をまるごと読める場合向け）を使い、相手が遅い・悪意ある場合でも接続 1 本あたりの瞬間的なメモリ使用量を抑えたい分割読みの経路（`crates/io/src/server.rs` の `read_body_until`。UDS 受信ループが使う）は本メソッドを経由せず `AdmittedHeader::body_len` を読み取りの上限として使う。どちらの経路も `AdmittedHeader` を経由しない長さを確保量へ用いてはならない。分割読みの経路は、確保容量そのものも `body_len` 以下に保つ（`imp::BodyBuffer`。初期容量 `min(body_len, 64 KiB)`、空きを使い切ったときだけ `reserve_exact` で最大 64 KiB ずつ伸ばし、償却つきの成長〔2 倍化〕で `body_len` を超えて確保しない。読み込み先は `Vec` の領域そのもので中間バッファを持たない。#820 codex P0 指摘対応）。復号時に `Frame::decode_body` がペイロードを 1 回複製するため、1 フレームの受信中の瞬間的な確保量は約 `2 × body_len`（いずれも `AdmittedHeader` 由来の長さ）になる。
 
 ### UDS サーバーの観測（REPAIR-4・REPAIR-5・TASK-13.2.1・#820）
 

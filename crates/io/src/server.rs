@@ -661,9 +661,10 @@ mod imp {
     /// 「短時間に大量の切断が続く」病的なケースの保険）。
     const MAX_ACCEPT_ABORT_RETRIES: u32 = 32;
 
-    /// 本体読み込みを少しずつ伸ばす際の 1 回あたりの読み取り上限
+    /// 本体読み込みを少しずつ伸ばす際の 1 回あたりの伸長量の上限
     /// （申告された `body_len` が最大 64 MiB + 4 バイトでも、悪意ある相手の
-    /// 申告だけを信用して一度に確保しない。security.md）。
+    /// 申告だけを信用して一度に確保しない。security.md。伸ばし方は
+    /// `BodyBuffer` 参照）。
     const BODY_READ_CHUNK: usize = 64 * 1024;
 
     pub(super) struct ServerInner {
@@ -1584,8 +1585,124 @@ mod imp {
         Ok(())
     }
 
+    /// 受信中のフレーム本体（`body_len` バイト）を、届いた分だけ少しずつ
+    /// 確保しながらためるバッファ（REPAIR-2・security.md の DoS 対策。#820
+    /// codex P0 指摘対応）。[`read_body_until`] が読み取りループの中で使う。
+    ///
+    /// # 確保容量の上限（#820 codex P0 指摘対応）
+    /// 容量は常に `body_len` 以下に保つ。`Vec::extend_from_slice` 等の
+    /// 償却つき成長は容量を幾何級数的に増やすため、実際の確保容量が受理済みの
+    /// `body_len` を超えうる（以前の実装の問題）。本型は次の 2 点でこれを防ぐ:
+    ///
+    /// - 初期容量は `min(body_len, BODY_READ_CHUNK)`
+    /// - 空き領域を使い切ったときだけ `reserve_exact(min(BODY_READ_CHUNK,
+    ///   body_len - 容量))` で伸ばす（`reserve_exact` は要求どおりの容量を
+    ///   確保し、要求量は `body_len` を超えない）。`resize` は伸ばした直後に
+    ///   その空き領域をゼロ埋めするためだけに呼び、容量ぴったりまでしか
+    ///   伸ばさないので内部で再確保は起きない
+    ///
+    /// 伸長は空きを使い切ったときに限るため、相手が 1 バイトずつ小出しに
+    /// 送ってきても再確保は最大 `ceil(body_len / BODY_READ_CHUNK)` 回、
+    /// ゼロ埋めも各バイト 1 回ずつに収まる（1 回の read ごとにゼロ埋めや
+    /// 再確保をやり直す実装にすると、小出しの相手に CPU を浪費させられる）。
+    /// 読み込み先は `Vec` の領域そのもので、ペイロード大の中間バッファ・
+    /// 二重コピーを使わない（以前の実装が持っていた 64 KiB のスタック上の
+    /// 一時配列も使わない）。
+    ///
+    /// # 不変条件
+    /// `filled <= buf.len() <= buf.capacity() <= body_len`。`buf.len()` は
+    /// 初期化済み（ゼロ埋め済みまたは受信済み）の範囲、`filled` はそのうち
+    /// 実際に受信したバイト数を表す。受信していないゼロ埋め領域を本体として
+    /// 返さないよう、[`Self::into_body`] は `filled == body_len` のときだけ
+    /// 本体を返す。
+    struct BodyBuffer {
+        buf: Vec<u8>,
+        filled: usize,
+        body_len: usize,
+    }
+
+    impl BodyBuffer {
+        /// `body_len` は [`crate::recv_limits::AdmittedHeader::body_len`]
+        /// （`admit` を通過した検証済みの長さ）だけを渡す。
+        fn new(body_len: usize) -> Self {
+            Self {
+                buf: Vec::with_capacity(body_len.min(BODY_READ_CHUNK)),
+                filled: 0,
+                body_len,
+            }
+        }
+
+        fn is_complete(&self) -> bool {
+            self.filled >= self.body_len
+        }
+
+        /// `reader` から 1 回だけ読み、受信したバイト数を返す（`Ok(0)` は相手の
+        /// 切断、`Err` は `reader` のエラーをそのまま返す。いずれの場合も
+        /// 不変条件は崩れず、`Interrupted` 等で呼び直してよい）。
+        fn read_once<R: Read>(&mut self, reader: &mut R) -> io::Result<usize> {
+            if self.filled == self.buf.len() {
+                self.grow_initialized();
+            }
+            let Some(dst) = self.buf.get_mut(self.filled..) else {
+                return Err(io::Error::other("body buffer index out of range"));
+            };
+            if dst.is_empty() {
+                // `is_complete` のときにしか起きない（呼び出し元は完了後に
+                // 呼ばない）。0 を返すと切断と区別できないため別扱いにする。
+                return Err(io::Error::other("body buffer is already complete"));
+            }
+            let got = reader.read(dst)?;
+            // `Read` の契約上 `got <= dst.len()` だが、実装の誤りで超えても
+            // 不変条件を崩さないよう初期化済みの範囲で頭打ちにする。
+            self.filled = self.filled.saturating_add(got).min(self.buf.len());
+            Ok(got)
+        }
+
+        /// 初期化済みの範囲を 1 段（最大 `BODY_READ_CHUNK`）伸ばす。容量に
+        /// 空きがなければ先に `reserve_exact` で `body_len` を超えない範囲だけ
+        /// 容量を増やし、その後 `resize` で容量ぴったりまでゼロ埋めする
+        /// （`resize` の要求量が容量以下なので、`resize` の内部で償却つきの
+        /// 再確保は起きない）。
+        fn grow_initialized(&mut self) {
+            let len = self.buf.len();
+            if len == self.buf.capacity() {
+                let additional = self.body_len.saturating_sub(len).min(BODY_READ_CHUNK);
+                self.buf.reserve_exact(additional);
+            }
+            let target = self.buf.capacity().min(self.body_len);
+            if target > len {
+                self.buf.resize(target, 0);
+            }
+        }
+
+        /// 受信し終えた本体を返す。未完了なら `Internal`（呼び出し元の
+        /// ループの誤り）を返し、ゼロ埋めのまま受信していない領域を本体と
+        /// して扱わない。
+        fn into_body(self) -> Result<Vec<u8>, IoError> {
+            if self.filled != self.body_len || self.buf.len() != self.body_len {
+                return Err(IoError::new(
+                    IoErrorCode::Internal,
+                    "frame body buffer is incomplete",
+                ));
+            }
+            Ok(self.buf)
+        }
+
+        #[cfg(test)]
+        fn capacity(&self) -> usize {
+            self.buf.capacity()
+        }
+
+        #[cfg(test)]
+        fn filled(&self) -> usize {
+            self.filled
+        }
+    }
+
     /// `body_len` バイトの本体を、届いた分だけ少しずつ確保しながら読む
     /// （申告された長さだけで一度に確保しない。security.md の DoS 対策）。
+    /// 確保容量を `body_len` 以下に保つ仕組みは [`BodyBuffer`] を参照
+    /// （#820 codex P0 指摘対応）。
     ///
     /// # `AdmittedHeader::allocate_body` を経由しない理由（B1・#820 レビュー
     /// 指摘。security P2）
@@ -1598,37 +1715,34 @@ mod imp {
     /// 変わらない（`crates/io/src/recv_limits.rs` モジュール doc「埋める穴」
     /// 節・`AdmittedHeader::allocate_body` のドキュメンテーションコメント
     /// 参照）。
+    ///
+    /// # 受信 1 フレームあたりの確保量
+    /// 本関数が返す本体の容量は `body_len` ちょうど。呼び出し元
+    /// （[`ConnectionInner::recv_frame`]）はこの後
+    /// `AdmittedHeader::decode_body` → `crate::protocol::Frame::decode_body` で
+    /// ペイロード（`body_len - CHECKSUM_LEN` バイト）を 1 回複製するため、
+    /// 復号の間は瞬間的に約 `2 × body_len` を使う。どちらの長さも
+    /// `AdmittedHeader` 由来で上限検証済みである（複製をなくすには
+    /// `Frame::decode_body` の契約変更が要るため、本 PR〔#820〕の範囲外）。
     fn read_body_until(
         stream: &mut UnixStream,
         body_len: usize,
         deadline: Instant,
     ) -> Result<Vec<u8>, IoError> {
-        let mut body = Vec::with_capacity(body_len.min(BODY_READ_CHUNK));
-        let mut chunk = [0u8; BODY_READ_CHUNK];
-        while body.len() < body_len {
+        let mut body = BodyBuffer::new(body_len);
+        while !body.is_complete() {
             let remaining = remaining_or_timeout(deadline)?;
             stream
                 .set_read_timeout(Some(remaining))
                 .map_err(map_set_timeout_error)?;
-            let want = (body_len - body.len()).min(chunk.len());
-            let Some(dst) = chunk.get_mut(..want) else {
-                return Err(IoError::new(
-                    IoErrorCode::Internal,
-                    "read chunk index out of range",
-                ));
-            };
-            match stream.read(dst) {
+            match body.read_once(stream) {
                 Ok(0) => {
                     return Err(IoError::new(
                         IoErrorCode::Unavailable,
                         "peer closed the connection before sending a complete frame body",
                     ));
                 }
-                Ok(n) => {
-                    if let Some(read) = dst.get(..n) {
-                        body.extend_from_slice(read);
-                    }
-                }
+                Ok(_) => {}
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -1638,12 +1752,15 @@ mod imp {
                     ) =>
                 {
                     // read_exact_until と同じ理由でループを戻す（REPAIR-5）。
+                    // `BodyBuffer::read_once` はエラー時に `filled` を進めない
+                    // ため、ゼロ埋め済みの未受信領域が本体として数えられる
+                    // ことはない。
                     continue;
                 }
                 Err(e) => return Err(map_io_error(e)),
             }
         }
-        Ok(body)
+        body.into_body()
     }
 
     /// `bytes` を書き切るまで送る（`write_all` 相当をフレーム単位の期限付きで
@@ -1756,6 +1873,203 @@ mod imp {
         fn d_820_map_set_timeout_error_maps_other_kinds_to_internal() {
             let err = map_set_timeout_error(io::Error::from(io::ErrorKind::PermissionDenied));
             assert_eq!(err.code(), IoErrorCode::Internal);
+        }
+
+        /// [`BodyBuffer`] のテスト用の `Read` 実装。`source` を `pattern` の
+        /// 大きさ（`Err` の場合はそのエラー）で順繰りに小出しに返す。
+        struct TricklingReader {
+            source: Vec<u8>,
+            pos: usize,
+            pattern: Vec<Result<usize, io::ErrorKind>>,
+            step: usize,
+        }
+
+        impl TricklingReader {
+            fn new(source: Vec<u8>, pattern: Vec<Result<usize, io::ErrorKind>>) -> Self {
+                Self {
+                    source,
+                    pos: 0,
+                    pattern,
+                    step: 0,
+                }
+            }
+        }
+
+        impl Read for TricklingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let planned = self
+                    .pattern
+                    .get(self.step % self.pattern.len())
+                    .copied()
+                    .unwrap_or(Ok(1));
+                self.step += 1;
+                let want = match planned {
+                    Ok(n) => n,
+                    Err(kind) => return Err(io::Error::from(kind)),
+                };
+                let rest = &self.source[self.pos..];
+                let n = want.min(buf.len()).min(rest.len());
+                buf[..n].copy_from_slice(&rest[..n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        /// 決定的な疑似データ（内容の取り違えを検出できるよう位置ごとに値を変える）。
+        fn patterned_bytes(len: usize) -> Vec<u8> {
+            (0..len).map(|i| (i % 251) as u8).collect()
+        }
+
+        /// REPAIR-2・#820（codex P0 指摘対応）: 本体長が `BODY_READ_CHUNK` の
+        /// 3 倍 + 1 のフレームを、相手が奇数サイズで小出しに送ってきても、
+        /// 各 read の後の容量は受理済みの `body_len` を超えず、読み終わりで
+        /// 容量・長さとも `body_len` ちょうどになる。容量の推移は
+        /// `BODY_READ_CHUNK` 刻みの `reserve_exact` だけで、償却つき成長
+        /// （2 倍化）が起きないことを具体値の列で確かめる。
+        #[test]
+        fn repair2_820_body_buffer_capacity_never_exceeds_body_len_on_trickled_reads() {
+            let body_len = BODY_READ_CHUNK * 3 + 1;
+            let source = patterned_bytes(body_len);
+            let mut reader =
+                TricklingReader::new(source.clone(), vec![Ok(1), Ok(7), Ok(40_001), Ok(65_537)]);
+            let mut body = BodyBuffer::new(body_len);
+            assert_eq!(body.capacity(), BODY_READ_CHUNK);
+
+            let mut capacities = vec![body.capacity()];
+            let mut reads = 0usize;
+            while !body.is_complete() {
+                let got = body.read_once(&mut reader).expect("mock read must succeed");
+                assert!(got > 0, "the mock never reports EOF before the end");
+                reads += 1;
+                assert!(
+                    body.capacity() <= body_len,
+                    "capacity {} exceeded body_len {body_len} after read #{reads}",
+                    body.capacity()
+                );
+                assert!(body.filled() <= body.capacity());
+                if capacities.last() != Some(&body.capacity()) {
+                    capacities.push(body.capacity());
+                }
+            }
+
+            assert_eq!(
+                capacities,
+                vec![
+                    BODY_READ_CHUNK,
+                    BODY_READ_CHUNK * 2,
+                    BODY_READ_CHUNK * 3,
+                    BODY_READ_CHUNK * 3 + 1,
+                ]
+            );
+            assert_eq!(body.capacity(), body_len);
+            let body = body.into_body().expect("a complete body must be returned");
+            assert_eq!(body.len(), body_len);
+            assert_eq!(body.capacity(), body_len);
+            assert_eq!(body, source);
+        }
+
+        /// REPAIR-2・REPAIR-5・#820: 読み取りの途中で `WouldBlock`・`Interrupted`・
+        /// `TimedOut` が挟まっても、ゼロ埋め済みの未受信領域を受信済みとして
+        /// 数えず、最終的な内容が送信内容と一致する。
+        #[test]
+        fn repair2_repair5_820_body_buffer_ignores_zero_filled_region_on_transient_errors() {
+            let body_len = BODY_READ_CHUNK + 3;
+            let source = patterned_bytes(body_len);
+            let mut reader = TricklingReader::new(
+                source.clone(),
+                vec![
+                    Ok(5),
+                    Err(io::ErrorKind::WouldBlock),
+                    Ok(9_999),
+                    Err(io::ErrorKind::Interrupted),
+                    Err(io::ErrorKind::TimedOut),
+                    Ok(3),
+                ],
+            );
+            let mut body = BodyBuffer::new(body_len);
+            let mut transient_errors = 0usize;
+            while !body.is_complete() {
+                let filled_before = body.filled();
+                match body.read_once(&mut reader) {
+                    Ok(got) => assert_eq!(body.filled(), filled_before + got),
+                    Err(e) => {
+                        assert!(matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::Interrupted
+                                | io::ErrorKind::TimedOut
+                        ));
+                        assert_eq!(body.filled(), filled_before);
+                        transient_errors += 1;
+                    }
+                }
+                assert!(body.capacity() <= body_len);
+            }
+
+            assert!(transient_errors >= 3);
+            let body = body.into_body().expect("a complete body must be returned");
+            assert_eq!(body.len(), body_len);
+            assert_eq!(body.capacity(), body_len);
+            assert_eq!(body, source);
+        }
+
+        /// REPAIR-2・#820: 未完了のバッファは本体として返さない（ゼロ埋めの
+        /// 未受信領域を本体として扱わない）。
+        #[test]
+        fn repair2_820_body_buffer_into_body_rejects_incomplete_buffer() {
+            let mut reader = TricklingReader::new(patterned_bytes(10), vec![Ok(4)]);
+            let mut body = BodyBuffer::new(10);
+            assert_eq!(body.read_once(&mut reader).expect("mock read"), 4);
+            let err = body
+                .into_body()
+                .expect_err("incomplete body must be rejected");
+            assert_eq!(err.code(), IoErrorCode::Internal);
+        }
+
+        /// REPAIR-2・#820: 本体長 0（`admit` はペイロード長 0 を受理しうるが、
+        /// 本体にはチェックサムが付くため実際には呼ばれない想定）でも確保せず
+        /// 空の本体を返す。
+        #[test]
+        fn repair2_820_body_buffer_zero_length_allocates_nothing() {
+            let body = BodyBuffer::new(0);
+            assert!(body.is_complete());
+            assert_eq!(body.capacity(), 0);
+            let body = body.into_body().expect("empty body must be returned");
+            assert_eq!(body.len(), 0);
+            assert_eq!(body.capacity(), 0);
+        }
+
+        /// REPAIR-2・REPAIR-5・#820（codex P0 指摘対応）: 実際の UDS ソケット
+        /// 越しに相手が奇数サイズで小出しに送っても、`read_body_until` が返す
+        /// 本体は長さ・容量とも `body_len` ちょうどで、内容が一致する。
+        #[test]
+        fn repair2_repair5_820_read_body_until_returns_exact_capacity_over_socket() {
+            let body_len = BODY_READ_CHUNK * 3 + 1;
+            let source = patterned_bytes(body_len);
+            let (mut reader, mut writer) = UnixStream::pair().expect("socketpair");
+            let to_send = source.clone();
+            let sender = std::thread::spawn(move || {
+                let sizes = [1usize, 7, 40_001, 3, 65_537];
+                let mut pos = 0usize;
+                let mut i = 0usize;
+                while pos < to_send.len() {
+                    let n = sizes[i % sizes.len()].min(to_send.len() - pos);
+                    writer
+                        .write_all(&to_send[pos..pos + n])
+                        .expect("writer must be able to send");
+                    pos += n;
+                    i += 1;
+                }
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let body = read_body_until(&mut reader, body_len, deadline)
+                .expect("the full body must be received before the deadline");
+            sender.join().expect("sender thread must not panic");
+
+            assert_eq!(body.len(), body_len);
+            assert_eq!(body.capacity(), body_len);
+            assert_eq!(body, source);
         }
 
         /// REPAIR-5: 期限をすでに過ぎていれば `remaining_or_timeout` は

@@ -27,7 +27,8 @@
 //! `FrameHeader::from_bytes` → [`ReceiveLimits::admit`] → 本体の読み込み
 //! （検証済みの [`AdmittedHeader::body_len`] を上限に少しずつ確保する。
 //! `server.rs` の `read_body_until` のドキュメンテーションコメント参照） →
-//! [`AdmittedHeader::decode_body`] の順に呼ぶ。[`crate::batch::BatchBuffer::push`]
+//! `AdmittedHeader::decode_body_owned`（[`AdmittedHeader::decode_body`] の
+//! 所有権を受け取る変種。本体を複製しない）の順に呼ぶ。[`crate::batch::BatchBuffer::push`]
 //! との配線（受理した `Write` フレームをバッチへ積む経路）は TASK-13.2.2・#822 が
 //! 行う。
 //!
@@ -372,6 +373,16 @@ impl AdmittedHeader {
     /// 迂回しない。
     pub fn decode_body(self, body: &[u8]) -> Result<Frame, IoError> {
         Frame::decode_body(self.header, body)
+    }
+
+    /// [`Self::decode_body`] の所有権を受け取る変種（`Frame::decode_body_owned`
+    /// への薄い委譲。REPAIR-2・IO-1・#820）。読み込んだ本体の領域をそのまま
+    /// ペイロードとして再利用し、複製しない。UDS 受信経路
+    /// （`crates/io/src/server.rs` の `imp::ConnectionInner::recv_frame`）が使う。
+    /// Linux / macOS 以外では UDS 受信経路がスタブのため未使用になる。
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    pub(crate) fn decode_body_owned(self, body: Vec<u8>) -> Result<Frame, IoError> {
+        Frame::decode_body_owned(self.header, body)
     }
 }
 

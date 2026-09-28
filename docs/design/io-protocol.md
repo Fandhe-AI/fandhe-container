@@ -128,7 +128,7 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 
 補足: TASK-13.1（#76）でバッチ集約バッファ（`BatchBuffer`）と設定 API（`BatchConfig`）を追加した。TASK-13.2.1（#820）で UDS サーバー側トランスポート（`UdsServer`・`UdsConnection`。Linux / macOS。1 接続の期限付き送受信までを提供し、受付ループ自体は呼び出し側が組む）を追加した。ディスク書き込み・ACK 返却・`BatchBuffer` とのつなぎ込み・クライアント側の UDS 接続・CLI からのバッチサイズ配線（`--batch-size` 相当）は本書時点では未実装であり、TASK-13.2.2（#822）・TASK-13.3 の範囲で扱う（REPAIR-3: 実装済みを装わない）。累積バイト数上限（`MAX_BATCH_BYTES`）は `BatchBuffer` 単体の確保量を抑える安全弁であり、受信経路の長さ・件数検証は `recv_limits`（TASK-13.4・#796）が担う。複数接続を跨いだ累積・未フラッシュ滞留量上限（IO-10・TASK-16）とは別物。
 
-「確保量の上限は `admit` を通過した `AdmittedHeader` からしか得られない」という契約には 2 つの経路がある（#820 レビュー指摘。security P2）: 一括確保する経路は `AdmittedHeader::allocate_body`（`Frame::decode_body` 等が本体をまるごと読める場合向け）を使い、相手が遅い・悪意ある場合でも接続 1 本あたりの瞬間的なメモリ使用量を抑えたい分割読みの経路（`crates/io/src/server.rs` の `read_body_until`。UDS 受信ループが使う）は本メソッドを経由せず `AdmittedHeader::body_len` を読み取りの上限として使う。どちらの経路も `AdmittedHeader` を経由しない長さを確保量へ用いてはならない。分割読みの経路は、確保容量そのものも `body_len` 以下に保つ（`imp::BodyBuffer`。初期容量 `min(body_len, 64 KiB)`、空きを使い切ったときだけ `reserve_exact` で最大 64 KiB ずつ伸ばし、償却つきの成長〔2 倍化〕で `body_len` を超えて確保しない。読み込み先は `Vec` の領域そのもので中間バッファを持たない。#820 codex P0 指摘対応）。復号時に `Frame::decode_body` がペイロードを 1 回複製するため、1 フレームの受信中の瞬間的な確保量は約 `2 × body_len`（いずれも `AdmittedHeader` 由来の長さ）になる。
+「確保量の上限は `admit` を通過した `AdmittedHeader` からしか得られない」という契約には 2 つの経路がある（#820 レビュー指摘。security P2）: 一括確保する経路は `AdmittedHeader::allocate_body`（`Frame::decode_body` 等が本体をまるごと読める場合向け）を使い、相手が遅い・悪意ある場合でも接続 1 本あたりの瞬間的なメモリ使用量を抑えたい分割読みの経路（`crates/io/src/server.rs` の `read_body_until`。UDS 受信ループが使う）は本メソッドを経由せず `AdmittedHeader::body_len` を読み取りの上限として使う。どちらの経路も `AdmittedHeader` を経由しない長さを確保量へ用いてはならない。分割読みの経路は、確保容量そのものも `body_len` 以下に保つ（`imp::BodyBuffer`。初期容量 `min(body_len, 64 KiB)`、空きを使い切ったときだけ `reserve_exact` で最大 64 KiB ずつ伸ばし、償却つきの成長〔2 倍化〕で `body_len` を超えて確保しない。読み込み先は `Vec` の領域そのもので中間バッファを持たない。#820 codex P0 指摘対応）。復号は所有権を受け取る crate 内部の変種（`AdmittedHeader::decode_body_owned` → `Frame::decode_body_owned`。検証は `Frame::decode_body` と共通の `Frame::verify_body`）で行い、チェックサム検証後に末尾のチェックサムを落とした同じ領域をペイロードとして使う（複製しない）。したがって 1 フレームの受信で申告長に比例して確保するのは `body_len` ぶんの 1 回だけである（#820 codex P0 指摘対応）。
 
 ### UDS サーバーの観測（REPAIR-4・REPAIR-5・TASK-13.2.1・#820）
 
@@ -186,7 +186,7 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 6. `header.body_len()`（検証済みの `payload_len + CHECKSUM_LEN`。失敗しない）を期待される本体長とし、実際の本体長と比較。不一致なら `IoErrorCode::InvalidArgument`（チェックサム不一致とは別コード）
 7. `prefix_bytes()`（ヘッダの意味あるフィールド。6 バイト。`header_crc` を含まない）＋ペイロードから再計算した CRC-32C とトレーラの値を比較。不一致なら `IoErrorCode::DataLoss`
 
-申告長に比例するペイロード用バッファの確保（`copy_validated_payload`。非公開関数）は上記 1〜7 をすべて通過した後の 1 か所だけで行い、これをユニットテスト（`repair2_decode_rejects_over_max_len_before_allocation` 等。TASK-83.2・#117）で確かめる。「アロケーション」はここでは申告長に比例するペイロード用バッファの確保を指し、`IoError` の message（`String`）の確保はサイズが一定の上限に収まるため対象外とする。
+申告長に比例するペイロード用バッファの確保（`copy_validated_payload`。非公開関数）は上記 1〜7 をすべて通過した後の 1 か所だけで行い（所有権を受け取る変種 `Frame::decode_body_owned` は呼び出し元が確保済みの本体を再利用し、新たに確保しない）、これをユニットテスト（`repair2_decode_rejects_over_max_len_before_allocation` 等。TASK-83.2・#117）で確かめる。「アロケーション」はここでは申告長に比例するペイロード用バッファの確保を指し、`IoError` の message（`String`）の確保はサイズが一定の上限に収まるため対象外とする。
 
 ### ストリーム読みの手順（TASK-12・TASK-13 が実装する想定。REPAIR-5・REPAIR-6）
 
@@ -194,7 +194,7 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 2. `FrameHeader::from_bytes` で検証する（上記 1〜4）。ここで拒否されれば、化けた `payload_len` を信用した巨大確保は一切発生しない
 3. `ReceiveLimits::admit`（TASK-13.4・#796）で設定上限（`MAX_PAYLOAD_LEN` 以下へ個別設定できる）・現在の滞留件数を照合する。ここで拒否されれば、設定上限を下回るがプロトコル上限以下の申告長でも、まだ本体バッファは確保されない
 4. 検証が通ってから `FrameHeader::body_len()`（`≤ MAX_PAYLOAD_LEN + CHECKSUM_LEN`。失敗しない）ぶんの本体を読む。一括で確保できる場合は `AdmittedHeader::allocate_body` で確保して読み、相手が遅い場合の DoS 耐性を優先する UDS 受信ループ（`crates/io/src/server.rs` の `read_body_until`）は `AdmittedHeader::body_len` を上限に少しずつ確保しながら読む（B1・#820 レビュー指摘。どちらの経路も確保量の上限は `AdmittedHeader` からしか得ない）
-5. `AdmittedHeader::decode_body`（`Frame::decode_body` への薄い委譲）へ渡す
+5. `AdmittedHeader::decode_body`（`Frame::decode_body` への薄い委譲）へ渡す。UDS 受信ループは所有権を受け取る crate 内部の変種 `AdmittedHeader::decode_body_owned`（`Frame::decode_body_owned`。検証は同じ `Frame::verify_body`）へ渡し、読み込んだ本体の領域をペイロードとして再利用する（複製しない。#820）
 
 これにより「申告長に比例するアロケーションは検証後だけ」という DoS 対策が、一括 `Frame::decode` だけでなくストリーム読み経路でも成り立つ（`header_crc` がなければ、ストリーム読みは手順 2 の検証をヘッダ単体では完結できず、`payload_len` を信用してから手順 3 の確保をした後で初めて手順 7 のトレーラ検証に到達することになり、化けた `payload_len` による巨大確保・待ち続けを防げなかった。これが `header_crc` を追加した動機。P1-2）。
 

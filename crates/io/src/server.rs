@@ -1414,7 +1414,7 @@ mod imp {
             };
 
             super::RecvAttempt {
-                result: admitted.decode_body(&body),
+                result: admitted.decode_body_owned(body),
                 kind: Some(kind),
             }
         }
@@ -1728,12 +1728,12 @@ mod imp {
     ///
     /// # 受信 1 フレームあたりの確保量
     /// 本関数が返す本体の容量は `body_len` ちょうど。呼び出し元
-    /// （[`ConnectionInner::recv_frame`]）はこの後
-    /// `AdmittedHeader::decode_body` → `crate::protocol::Frame::decode_body` で
-    /// ペイロード（`body_len - CHECKSUM_LEN` バイト）を 1 回複製するため、
-    /// 復号の間は瞬間的に約 `2 × body_len` を使う。どちらの長さも
-    /// `AdmittedHeader` 由来で上限検証済みである（複製をなくすには
-    /// `Frame::decode_body` の契約変更が要るため、本 PR〔#820〕の範囲外）。
+    /// （[`ConnectionInner::recv_frame`]）はこれを
+    /// `AdmittedHeader::decode_body_owned` → `crate::protocol::Frame::decode_body_owned`
+    /// へ所有権ごと渡し、チェックサム検証後に末尾のチェックサムを落とした同じ
+    /// 領域をペイロードとして使う（複製しない。#820 codex P0 指摘対応）。
+    /// したがって 1 フレームの受信で申告長に比例して確保するのは、
+    /// `AdmittedHeader` 由来の `body_len` ぶんの 1 回だけである。
     fn read_body_until(
         stream: &mut UnixStream,
         body_len: usize,
@@ -2080,6 +2080,52 @@ mod imp {
             assert_eq!(body.len(), body_len);
             assert_eq!(body.capacity(), body_len);
             assert_eq!(body, source);
+        }
+
+        /// REPAIR-2・IO-1・#820（codex P0 指摘対応）: 受信経路の本体読み込み
+        /// （`read_body_until`）→ 受理済みヘッダでの復号（`decode_body_owned`）を
+        /// 通しても、ペイロードは読み込んだ本体と同じ領域（ポインタ一致）・同じ
+        /// 容量（`body_len`）のままで、1 フレームあたりの申告長に比例する確保は
+        /// `body_len` ぶんの 1 回だけになる。
+        #[test]
+        fn repair2_io1_820_recv_path_decodes_without_copying_the_payload() {
+            let payload = patterned_bytes(BODY_READ_CHUNK * 2 + 7);
+            let frame = Frame::new(FrameKind::Write, payload.clone()).expect("Frame::new");
+            let encoded = frame.encode();
+            let (header_bytes, wire_body) = encoded
+                .split_first_chunk::<FRAME_HEADER_LEN>()
+                .expect("encoded frame must have a header");
+            let header = FrameHeader::from_bytes(*header_bytes).expect("header must decode");
+            let admitted = ReceiveLimits::default()
+                .admit(header, 0)
+                .expect("the default limits must admit this frame");
+            let body_len = admitted.body_len();
+            assert_eq!(body_len, payload.len() + 4);
+
+            let (mut reader, mut writer) = UnixStream::pair().expect("socketpair");
+            let to_send = wire_body.to_vec();
+            let sender = std::thread::spawn(move || {
+                for chunk in to_send.chunks(40_001) {
+                    writer
+                        .write_all(chunk)
+                        .expect("writer must be able to send");
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let body = read_body_until(&mut reader, body_len, deadline)
+                .expect("the full body must be received before the deadline");
+            sender.join().expect("sender thread must not panic");
+            let body_ptr = body.as_ptr();
+            assert_eq!(body.capacity(), body_len);
+
+            let decoded = admitted
+                .decode_body_owned(body)
+                .expect("a valid frame must decode");
+            let out = decoded.into_payload();
+            assert_eq!(out.as_ptr(), body_ptr);
+            assert_eq!(out.capacity(), body_len);
+            assert_eq!(out.len(), payload.len());
+            assert_eq!(out, payload);
         }
 
         /// REPAIR-5: 期限をすでに過ぎていれば `remaining_or_timeout` は

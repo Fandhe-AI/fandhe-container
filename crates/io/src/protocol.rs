@@ -55,7 +55,9 @@
 //!    CHECKSUM_LEN`。失敗しない）ぶんのバッファを
 //!    [`crate::recv_limits::AdmittedHeader::allocate_body`] で確保して読む
 //! 5. [`crate::recv_limits::AdmittedHeader::decode_body`]（[`Frame::decode_body`]
-//!    への薄い委譲）へ渡す
+//!    への薄い委譲）へ渡す（UDS 受信ループ〔`crates/io/src/server.rs`〕は所有権を
+//!    受け取る crate 内部の変種 `AdmittedHeader::decode_body_owned` へ渡し、
+//!    本体を複製しない。#820）
 //!
 //! これにより「申告長に比例するアロケーションは検証後だけ」という DoS 対策
 //! （security.md）が、一括 [`Frame::decode`] だけでなくストリーム読み経路でも
@@ -65,7 +67,9 @@
 //!
 //! 申告長に比例するペイロード用バッファの確保は、デコード経路
 //! （[`Frame::decode`] / [`Frame::decode_body`]）全体を通じて `copy_validated_payload`
-//! （非公開関数）の 1 か所に集約しており、そこへ到達するのは長さ検証（ヘッダ上限・
+//! （非公開関数）の 1 か所に集約しており（所有権を受け取る crate 内部の変種
+//! `Frame::decode_body_owned` は呼び出し元が確保済みの本体をそのまま再利用し、
+//! 新たに確保しない。#820）、そこへ到達するのは長さ検証（ヘッダ上限・
 //! 本体長一致）とチェックサム検証をすべて通過した後だけである（アロケーション前の
 //! 早期拒否をユニットテストで示す。TASK-83.2・#117）。受信側（ストリーム読み。
 //! TASK-12・TASK-13）が読み取り上限に使う本体長は [`FrameHeader::body_len`] から
@@ -517,7 +521,59 @@ impl Frame {
     /// `split_last_chunk` で読む。申告長に比例するアロケーション（[`copy_validated_payload`]）
     /// は、上記 1〜3 の検証をすべて通過した後にしか呼ばれない（DoS 対策。security.md・
     /// TASK-83.2・#117）。
+    ///
+    /// 検証は `Self::verify_body`（非公開）に集約しており、所有権を受け取る
+    /// crate 内部の変種（`Self::decode_body_owned`。UDS 受信経路向け）と同じ順序・同じエラー
+    /// コード・同じメッセージで判定する。
     pub fn decode_body(header: FrameHeader, body: &[u8]) -> Result<Self, IoError> {
+        let (payload, checksum) = Self::verify_body(&header, body)?;
+        Ok(Self {
+            header,
+            payload: copy_validated_payload(payload),
+            checksum,
+        })
+    }
+
+    /// [`Self::decode_body`] の所有権を受け取る変種（REPAIR-2・IO-1・#820 codex
+    /// P0 指摘対応）。検証は同じ [`Self::verify_body`] で行い、通過したら `body` の
+    /// 末尾 [`CHECKSUM_LEN`] バイト（チェックサム）を `truncate` で落として
+    /// ペイロードとしてそのまま使う（本体はペイロード ‖ チェックサムの順のため、
+    /// ペイロードは先頭にあり詰め直しは要らない）。
+    ///
+    /// ペイロード用のバッファを新たに確保しない（結果のペイロードは `body` と
+    /// 同じ領域・同じ容量）ため、[`copy_validated_payload`] を経由しない。
+    /// 申告長に比例する確保は呼び出し元がすでに `body` として済ませており、
+    /// その上限は呼び出し元が [`crate::recv_limits::AdmittedHeader`] から得る
+    /// （`crates/io/src/server.rs` の `BodyBuffer`）。これにより UDS 受信 1 フレーム
+    /// あたりの確保量は `body_len` ぶんの 1 回だけになる（以前は
+    /// [`Self::decode_body`] の複製で約 2 倍だった）。容量を詰める
+    /// `shrink_to_fit` は再確保・複製になりうるため行わない（余りは
+    /// [`CHECKSUM_LEN`] バイトだけ）。
+    ///
+    /// 本番の呼び出し元は Linux / macOS の UDS 受信経路だけで、それ以外の OS では
+    /// `server.rs` がスタブのため未使用になる（テストは全 OS で呼ぶ）。
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    pub(crate) fn decode_body_owned(
+        header: FrameHeader,
+        mut body: Vec<u8>,
+    ) -> Result<Self, IoError> {
+        let (payload, checksum) = Self::verify_body(&header, &body)?;
+        let payload_len = payload.len();
+        body.truncate(payload_len);
+        Ok(Self {
+            header,
+            payload: body,
+            checksum,
+        })
+    }
+
+    /// [`Self::decode_body`]・[`Self::decode_body_owned`] が共有する本体の検証
+    /// （doc「検証順序」の 1〜3）。通過したらペイロード部分の参照と、再計算した
+    /// チェックサムを返す。ここでは申告長に比例する確保をしない。
+    fn verify_body<'b>(
+        header: &FrameHeader,
+        body: &'b [u8],
+    ) -> Result<(&'b [u8], FrameChecksum), IoError> {
         let expected_len = header.body_len();
 
         if body.len() != expected_len {
@@ -539,7 +595,7 @@ impl Frame {
             })?;
 
         let received_checksum = u32::from_le_bytes(*checksum_bytes);
-        let expected_checksum = Self::compute_checksum(&header, payload);
+        let expected_checksum = Self::compute_checksum(header, payload);
 
         if received_checksum != expected_checksum.0 {
             return Err(IoError::new(
@@ -551,11 +607,7 @@ impl Frame {
             ));
         }
 
-        Ok(Self {
-            header,
-            payload: copy_validated_payload(payload),
-            checksum: expected_checksum,
-        })
+        Ok((payload, expected_checksum))
     }
 
     /// ヘッダから始まる完全なワイヤーバイト列からフレームを復元する
@@ -1159,5 +1211,134 @@ mod tests {
         assert_eq!(decoded.payload(), b"hello");
         assert_eq!(allocation_count(), 1);
         assert_eq!(last_allocation_len(), 5);
+    }
+
+    /// `encode` 済みのバイト列をヘッダ（検証済み）と本体に分ける（テスト用）。
+    fn split_encoded(encoded: &[u8]) -> (FrameHeader, Vec<u8>) {
+        let (header_bytes, body) = encoded
+            .split_first_chunk::<FRAME_HEADER_LEN>()
+            .expect("encoded frame must have a header");
+        let header = FrameHeader::from_bytes(*header_bytes).expect("header must decode");
+        (header, body.to_vec())
+    }
+
+    /// `decode_body` と `decode_body_owned` を同じ入力で呼び、成功時は同じ
+    /// `Frame`、失敗時は同じエラーコード・同じメッセージになることを確かめて
+    /// から、その結果を返す（owned 版は `copy_validated_payload` を一度も呼ばない
+    /// ことも併せて確かめる）。
+    fn decode_both(header: FrameHeader, body: &[u8]) -> Result<Frame, IoError> {
+        let borrowed = Frame::decode_body(header, body);
+        reset_allocation_recorder();
+        let owned = Frame::decode_body_owned(header, body.to_vec());
+        assert_eq!(
+            allocation_count(),
+            0,
+            "decode_body_owned must not allocate a payload copy"
+        );
+        match (&borrowed, &owned) {
+            (Ok(b), Ok(o)) => assert_eq!(b, o),
+            (Err(b), Err(o)) => {
+                assert_eq!(b.code(), o.code());
+                assert_eq!(b.message(), o.message());
+            }
+            _ => panic!("decode_body and decode_body_owned disagree: {borrowed:?} vs {owned:?}"),
+        }
+        owned
+    }
+
+    /// REPAIR-2・IO-1・#820（codex P0 指摘対応）: 正常なフレーム（ペイロード長
+    /// 5 と 0）で、`decode_body_owned` は `decode_body` と同じ `Frame` を返す。
+    #[test]
+    fn repair2_io1_820_decode_body_owned_matches_borrowed_on_valid_frames() {
+        for payload in [b"hello".to_vec(), Vec::new()] {
+            let frame = Frame::new(FrameKind::Write, payload.clone()).expect("Frame::new");
+            let (header, body) = split_encoded(&frame.encode());
+            let decoded = decode_both(header, &body).expect("valid frame must decode");
+            assert_eq!(decoded.payload(), payload.as_slice());
+            assert_eq!(decoded, frame);
+        }
+    }
+
+    /// REPAIR-2・IO-1・#820（codex P0 指摘対応）: 既存テストがある各異常系
+    /// （ペイロードのビット反転・種別の差し替え・チェックサム改変・BREAK-2 の
+    /// 短い申告長・本体の過不足・上限ちょうどの申告に対する短い本体）で、
+    /// `decode_body_owned` は `decode_body` と同じエラーコード・メッセージを返す。
+    #[test]
+    fn repair2_io1_820_decode_body_owned_matches_borrowed_on_each_rejection() {
+        let frame = Frame::new(FrameKind::Write, b"hello".to_vec()).expect("Frame::new");
+        let (header, body) = split_encoded(&frame.encode());
+
+        // ペイロードのビット反転 → DataLoss。
+        let mut flipped = body.clone();
+        flipped[0] ^= 0x01;
+        let err = decode_both(header, &flipped).expect_err("flipped bit must be rejected");
+        assert_eq!(err.code(), IoErrorCode::DataLoss);
+
+        // 種別を別の有効な種別へ差し替えたヘッダ → DataLoss。
+        let swapped = FrameHeader::from_bytes(raw_header(
+            PROTOCOL_VERSION,
+            FrameKind::Ack.as_u8(),
+            frame.header().payload_len().get(),
+        ))
+        .expect("swapped header must be self-consistent");
+        let err = decode_both(swapped, &body).expect_err("kind swap must be rejected");
+        assert_eq!(err.code(), IoErrorCode::DataLoss);
+
+        // チェックサムの改変 → DataLoss。
+        let mut corrupted = body.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xFF;
+        let err = decode_both(header, &corrupted).expect_err("corrupted checksum must be rejected");
+        assert_eq!(err.code(), IoErrorCode::DataLoss);
+
+        // BREAK-2（申告長を実長 − 1 にした自己整合的なヘッダ）→ DataLoss。
+        let short_header = FrameHeader::new(FrameKind::Write, 4).expect("short header");
+        let short_body = body.get(..4 + CHECKSUM_LEN).expect("body is long enough");
+        let err = decode_both(short_header, short_body).expect_err("BREAK-2 must be rejected");
+        assert_eq!(err.code(), IoErrorCode::DataLoss);
+
+        // 本体の不足・余剰 → InvalidArgument（メッセージも一致）。
+        let mut truncated = body.clone();
+        truncated.pop();
+        let err = decode_both(header, &truncated).expect_err("short body must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "frame body length mismatch: expected 9 bytes, got 8 bytes"
+        );
+        let mut extended = body.clone();
+        extended.push(0);
+        let err = decode_both(header, &extended).expect_err("long body must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+
+        // 上限ちょうどの申告に対する短い本体 → InvalidArgument。
+        let max_header =
+            FrameHeader::new(FrameKind::Write, MAX_PAYLOAD_LEN).expect("MAX_PAYLOAD_LEN header");
+        let err = decode_both(max_header, &[0u8; 8]).expect_err("short body must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+    }
+
+    /// REPAIR-2・IO-1・#820（codex P0 指摘対応）: `decode_body_owned` の結果の
+    /// ペイロードは入力の `Vec` と同じ領域（ポインタ一致）・同じ容量
+    /// （`body_len`）で、長さだけがペイロード長に縮む（追加の確保・複製を
+    /// しない）。`copy_validated_payload` も呼ばない。
+    #[test]
+    fn repair2_io1_820_decode_body_owned_reuses_the_input_buffer() {
+        let payload: Vec<u8> = (0..=250u8).collect();
+        let frame = Frame::new(FrameKind::Write, payload.clone()).expect("Frame::new");
+        let (header, body) = split_encoded(&frame.encode());
+        assert_eq!(body.len(), 251 + CHECKSUM_LEN);
+        assert_eq!(body.capacity(), 255);
+        let input_ptr = body.as_ptr();
+
+        reset_allocation_recorder();
+        let decoded = Frame::decode_body_owned(header, body).expect("valid frame must decode");
+        assert_eq!(allocation_count(), 0);
+
+        let out = decoded.into_payload();
+        assert_eq!(out.as_ptr(), input_ptr);
+        assert_eq!(out.len(), 251);
+        assert_eq!(out.capacity(), 255);
+        assert_eq!(out, payload);
     }
 }

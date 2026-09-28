@@ -54,45 +54,24 @@ fn io1_public_api_pipeline_client_rejects_when_limit_reached() {
     assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
 
     assert_eq!(client.queue().len(), 3);
-    assert_eq!(client.into_inner().sent.len(), 3);
+    assert_eq!(
+        client
+            .into_inner()
+            .expect("healthy client must yield its transport")
+            .sent
+            .len(),
+        3
+    );
 }
 
-/// IO-1・TASK-12.1: 1 枠を解放すると次の送信が成功し、id は単調増加を続ける。
-/// 送信順（残っているリクエストの並び）も保たれる。
-#[test]
-fn io1_public_api_pipeline_client_releases_slot_and_keeps_order() {
-    let limit = InFlightLimit::new(2).expect("2 must be a valid limit");
-    let mut client = PipelineClient::new(RecordingSender::default(), limit);
-
-    let first = client
-        .send(&write_frame(1), test_timeout())
-        .expect("1st send must succeed");
-    let second = client
-        .send(&write_frame(2), test_timeout())
-        .expect("2nd send must succeed");
-    assert_eq!(first.id().get(), 0);
-    assert_eq!(second.id().get(), 1);
-
-    client
-        .send(&write_frame(3), test_timeout())
-        .expect_err("3rd send must be rejected while full");
-
-    client
-        .remove_in_flight(first.id())
-        .expect("removing the oldest request must succeed");
-
-    let third = client
-        .send(&write_frame(3), test_timeout())
-        .expect("send must succeed after a slot is released");
-    assert_eq!(third.id().get(), 2);
-
-    let remaining_ids: Vec<u64> = client
-        .queue()
-        .iter()
-        .map(|entry| entry.id().get())
-        .collect();
-    assert_eq!(remaining_ids, vec![1, 2]);
-}
+// IO-1・TASK-12.1（#73 codex 指摘対応。P0）: 未 ACK 枠の解放
+// （`PipelineClient::remove_in_flight`）は `pub(crate)` に変更済みで、本ファイルの
+// ような crate 外の結合試験からは呼び出せない（公開 API のままだと、ACK を
+// 確認せずに枠を解放でき `InFlightLimit` の上限を無視して送信を続けられてしまう
+// という P0 指摘に対応するため）。解放・再利用フローそのものの検証は crate 内部の
+// `src/client.rs` の `io1_pipeline_client_accepts_after_slot_released` が担う。
+// 以前ここにあった `io1_public_api_pipeline_client_releases_slot_and_keeps_order`
+// は公開 API 経由の解放を前提にしていたため、可視性変更に伴い削除した。
 
 /// IO-1・TASK-12.1: `InFlightLimit` は `0` と `MAX_IN_FLIGHT_LIMIT` 超過を
 /// `InvalidArgument` として拒否する。

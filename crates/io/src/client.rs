@@ -240,7 +240,21 @@ impl SendQueue {
     /// `position` と `Option` 経由で探し、`unwrap`・`expect`・添字アクセスは使わない。
     /// 未登録の id を渡された場合は [`IoErrorCode::InvalidArgument`] を返し、
     /// キューの状態を変更しない。
-    pub fn remove(&mut self, id: RequestId) -> Result<InFlightRequest, IoError> {
+    ///
+    /// # 公開範囲（TASK-12.1・#73 codex 指摘対応。P0）
+    ///
+    /// `pub(crate)` に留め、crate 外へは公開しない。`SendQueue` は
+    /// [`crate::client`] の外から `pub use` で参照できる型だが、枠の解放は
+    /// 「ACK を確認できた側だけが行える」よう、[`PipelineClient::send`] が返す
+    /// [`RequestId`] をそのまま外部から渡して解放できないようにする（ACK 未受信の
+    /// まま `InFlightLimit` を回避して送信し続けられる、という P0 指摘への対応）。
+    /// ACK フレームを検証してから取り外す実装は #74（TASK-12.2）が本 crate 内に
+    /// 追加する（REPAIR-3。それまでは crate 内のテストのみが呼び出す）。
+    // `pub(crate)` の唯一の呼び出し元は #74（TASK-12.2）が追加する ACK 処理だが、
+    // 本 PR（#73）時点ではまだ実装されておらず、テスト以外から呼ばれないため
+    // `dead_code` を明示的に許容する（REPAIR-3: スタブであることの明示）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn remove(&mut self, id: RequestId) -> Result<InFlightRequest, IoError> {
         let position = self
             .entries
             .iter()
@@ -314,17 +328,36 @@ where
     /// このクライアントが失効済み（[`Self::poisoned`] 参照）かどうかを返す。
     ///
     /// `true` の場合、[`Self::send`] は常に [`IoErrorCode::Unavailable`] を返す。
-    /// 呼び出し元はこの状態になったトランスポートを再利用せず、新しい接続を
-    /// 張り直す必要がある（送信結果が不明なリクエストが残っている可能性がある
-    /// ため）。
+    /// [`Self::into_inner`] も同様に `Err` を返してトランスポートを drop するため
+    /// （TASK-12.1・#73 codex 指摘対応。P1）、呼び出し元はこの状態になった
+    /// トランスポートを再利用できず、新しい接続を張り直す必要がある（送信結果が
+    /// 不明なリクエストが残っている可能性があるため）。
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
 
     /// 内部のトランスポートを取り出す（呼び出し元がトランスポートの後始末をしたい
     /// 場合に使う）。未 ACK の追跡状態は破棄される。
-    pub fn into_inner(self) -> S {
-        self.sender
+    ///
+    /// # 失効済みトランスポートの扱い（TASK-12.1・#73 codex 指摘対応。P1）
+    ///
+    /// [`Self::is_poisoned`] が `true`（送信結果が不明なエラーの後）の場合は
+    /// [`IoErrorCode::Unavailable`] を返し、`self`（`sender` を含む）をその場で
+    /// drop する。トランスポートを呼び出し元へ返すと、それを使って新しい
+    /// [`PipelineClient::new`] を作り直せてしまい、id が `0` から再開した状態で
+    /// 遅れて届く ACK が別のリクエストへ誤対応付けされる危険がある
+    /// （[`FrameSender`] は明示的な close / shutdown を持たないため、`self` を
+    /// consume して drop することが、この接続を再利用不可にする API 上の唯一の
+    /// 保証手段になる）。
+    pub fn into_inner(self) -> Result<S, IoError> {
+        if self.poisoned {
+            return Err(IoError::new(
+                IoErrorCode::Unavailable,
+                "pipeline client is poisoned after an ambiguous send failure; \
+                 the transport is dropped instead of being returned for reuse",
+            ));
+        }
+        Ok(self.sender)
     }
 
     /// フレームを送信する。ACK は待たない。
@@ -379,7 +412,22 @@ where
     }
 
     /// 指定した id の未 ACK リクエストを取り外す（#74 の ACK 処理から呼ばれる入口）。
-    pub fn remove_in_flight(&mut self, id: RequestId) -> Result<InFlightRequest, IoError> {
+    ///
+    /// # 公開範囲（TASK-12.1・#73 codex 指摘対応。P0）
+    ///
+    /// `pub(crate)` に留める。[`Self::send`] が返す [`RequestId`] を外部の
+    /// 呼び出し元がそのままここへ渡せると、ACK を確認せずに未 ACK 枠を解放でき、
+    /// `InFlightLimit` を実質的に無視して送信を続けられてしまう
+    /// （`InFlightLimit` は「未 ACK のまま送れる件数」の上限であり、ACK 未受信の
+    /// 枠を勝手に解放されると上限の意味がなくなる）。ACK フレームを受信・検証して
+    /// から取り外す経路は #74（TASK-12.2）が本 crate 内（[`crate::client`] モジュール
+    /// 自身か、そこから呼ばれる同一 crate 内のコード）に実装し、その経路だけが
+    /// この関数を呼べるようにする（REPAIR-3。それまでは crate 内のテストのみが
+    /// 呼び出す）。
+    // `remove` と同様、#74（TASK-12.2）の ACK 処理が実装されるまでテスト以外の
+    // 呼び出し元がなく `dead_code` になるため、明示的に許容する（REPAIR-3）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn remove_in_flight(&mut self, id: RequestId) -> Result<InFlightRequest, IoError> {
         self.queue.remove(id)
     }
 }
@@ -518,6 +566,7 @@ mod tests {
 
         let sent_bytes: Vec<u8> = client
             .into_inner()
+            .expect("healthy client must yield its transport")
             .sent
             .iter()
             .map(|frame| frame.payload()[0])
@@ -546,7 +595,14 @@ mod tests {
 
         assert_eq!(client.queue().len(), 2);
         assert!(client.queue().is_full());
-        assert_eq!(client.into_inner().sent.len(), 2);
+        assert_eq!(
+            client
+                .into_inner()
+                .expect("healthy client must yield its transport")
+                .sent
+                .len(),
+            2
+        );
     }
 
     /// IO-1・TASK-12.1: 満杯のあと 1 枠を解放すると次の送信が成功し、id は
@@ -626,6 +682,27 @@ mod tests {
         assert_eq!(client.queue().len(), 1);
     }
 
+    /// IO-1・TASK-12.1（#73 codex 指摘対応。P1）: 失効（[`PipelineClient::is_poisoned`]）
+    /// したクライアントの [`PipelineClient::into_inner`] は `Unavailable` を返し、
+    /// トランスポートを呼び出し元へ渡さずに drop する。呼び出し元がこの sender を
+    /// 使って [`PipelineClient::new`] を作り直し、id を `0` から再開して遅延 ACK を
+    /// 誤対応付けする経路を塞ぐ。
+    #[test]
+    fn io1_pipeline_client_into_inner_rejects_poisoned() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut client = PipelineClient::new(AlwaysTimeoutSender, limit);
+
+        client
+            .send(&write_frame(1), test_timeout())
+            .expect_err("transport failure must propagate");
+        assert!(client.is_poisoned());
+
+        let err = client
+            .into_inner()
+            .expect_err("poisoned client must not yield its transport for reuse");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+    }
+
     /// IO-1・TASK-12.1（#73 codex 指摘対応）: 送信前に id を確保するため、1 回目の
     /// 失敗で確保した id（`0`）は失効した接続に残り続け、新しい接続（新しい
     /// `PipelineClient`）でのみ id `0` から採番が再開されることを確認する
@@ -689,7 +766,14 @@ mod tests {
             .expect_err("FlushAck frames must not be trackable as in-flight requests");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
         assert_eq!(client.queue().len(), 0);
-        assert_eq!(client.into_inner().sent.len(), 0);
+        assert_eq!(
+            client
+                .into_inner()
+                .expect("healthy client must yield its transport")
+                .sent
+                .len(),
+            0
+        );
     }
 
     /// IO-1・TASK-12.1: id の採番が `u64` の範囲を超える場合は `ResourceExhausted`
@@ -706,7 +790,14 @@ mod tests {
             .send(&write_frame(1), test_timeout())
             .expect_err("id overflow must be rejected");
         assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
-        assert_eq!(client.into_inner().sent.len(), 0);
+        assert_eq!(
+            client
+                .into_inner()
+                .expect("healthy client must yield its transport")
+                .sent
+                .len(),
+            0
+        );
     }
 
     fn assert_send<T: Send>() {}

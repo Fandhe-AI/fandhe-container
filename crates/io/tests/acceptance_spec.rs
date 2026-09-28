@@ -169,15 +169,51 @@ fn parse_key_values(line: &str) -> Vec<(&str, &str)> {
         .collect()
 }
 
+/// [`find_value`] の照合結果。
+///
+/// 単純に `Option<&str>` を返すと「最初に一致した値だけを採用する」実装に
+/// なり、将来の実出力に `batch_size=64 batch_size=32` のような矛盾する
+/// 値が重複して出力されても、期待値が先に現れていれば照合を通過してしまう
+/// （Codex レビュー指摘。PoC-12 型の「ビルド・回帰は通るが仕様未達」失敗
+/// モードの一種）。対象キーの出現回数を欠落・単一・重複の 3 通りに区別し、
+/// 重複時は両方の値を保持したまま `Duplicate` として返すことで、
+/// [coding-rust] の「期待値は具体値で書く」方針に沿って重複した値の内容
+/// ごと照合失敗させられるようにする。
+///
+/// [coding-rust]: ../../../.claude/rules/coding-rust.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FindValueOutcome<'a> {
+    /// 対象キーがちょうど 1 回だけ現れ、その値を採用できた。
+    Found(&'a str),
+    /// 対象キーが 1 回も現れなかった（PoC-12 の要求フィールド欠落と同じ
+    /// 失敗モード）。
+    Missing,
+    /// 対象キーが 2 回以上現れた（矛盾する値が出力に混在している可能性が
+    /// あるため、どちらか一方を無条件で採用せず失敗として扱う）。
+    /// 出現順にすべての値を保持する。
+    Duplicate(Vec<&'a str>),
+}
+
 /// `parse_key_values` の結果から指定した `key` の値を探す。
 ///
-/// 見つからない場合は `None` を返す（PoC-12 のように要求されたフィールドが
-/// 出力から欠けている失敗モードを、この `None` で検出する）。
-fn find_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    parse_key_values(line)
+/// 対象キーの出現回数によって [`FindValueOutcome`] の 3 通りの結果を返す。
+/// 呼び出し元は `Found` 以外を照合失敗として扱うこと（欠落・重複のいずれも
+/// 期待する具体値と一致したとはみなさない）。
+fn find_value<'a>(line: &'a str, key: &str) -> FindValueOutcome<'a> {
+    let matches: Vec<&'a str> = parse_key_values(line)
         .into_iter()
-        .find(|(k, _)| *k == key)
+        .filter(|(k, _)| *k == key)
         .map(|(_, v)| v)
+        .collect();
+
+    if let [value] = matches.as_slice() {
+        return FindValueOutcome::Found(value);
+    }
+    if matches.is_empty() {
+        FindValueOutcome::Missing
+    } else {
+        FindValueOutcome::Duplicate(matches)
+    }
 }
 
 /// REPAIR-12 の雛形マッチャが、仕様から作った暫定サンプル行を正しく
@@ -192,9 +228,18 @@ fn find_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 fn repair_12_scaffold_matcher_accepts_spec_sample() {
     let sample = "batch: n=200 batch_size=64 flush_every=Some(20) flush_acks=10";
 
-    assert_eq!(find_value(sample, "batch_size"), Some("64"));
-    assert_eq!(find_value(sample, "flush_every"), Some("Some(20)"));
-    assert_eq!(find_value(sample, "flush_acks"), Some("10"));
+    assert_eq!(
+        find_value(sample, "batch_size"),
+        FindValueOutcome::Found("64")
+    );
+    assert_eq!(
+        find_value(sample, "flush_every"),
+        FindValueOutcome::Found("Some(20)")
+    );
+    assert_eq!(
+        find_value(sample, "flush_acks"),
+        FindValueOutcome::Found("10")
+    );
 }
 
 /// マッチャが「ビルドは通るが仕様未達」の失敗モード（PoC-12: 要求された
@@ -208,14 +253,38 @@ fn repair_12_scaffold_matcher_detects_missing_field() {
 
     assert_eq!(
         find_value(sample_missing_flush_every, "flush_every"),
-        None,
+        FindValueOutcome::Missing,
         "flush_every が出力に含まれないことをマッチャが検出できていない"
     );
     // batch_size 自体は存在するため、マッチャが全フィールドを一律に
     // 見失っているわけではないことも合わせて確認する。
     assert_eq!(
         find_value(sample_missing_flush_every, "batch_size"),
-        Some("64")
+        FindValueOutcome::Found("64")
+    );
+}
+
+/// マッチャが、対象キーが重複して出現する出力を「最初に一致した値」で
+/// 通過させず、重複そのものを検出できることを確認する（Codex レビュー
+/// 指摘: `find_value` が最初に一致した値だけを返す実装のままだと、将来の
+/// 実出力に `batch_size=64 batch_size=32` のような矛盾する値が含まれても
+/// 期待値が先に現れていれば照合を通過してしまう）。
+#[test]
+fn repair_12_scaffold_matcher_rejects_duplicate_key_occurrence() {
+    let sample_duplicate_batch_size = "batch: n=200 batch_size=64 batch_size=32 flush_acks=10";
+
+    assert_eq!(
+        find_value(sample_duplicate_batch_size, "batch_size"),
+        FindValueOutcome::Duplicate(vec!["64", "32"]),
+        "batch_size の重複出現をマッチャが検出できていない\
+            （最初に一致した値だけを採用する実装への回帰）"
+    );
+
+    // 重複していない flush_acks は従来どおり単一の値として照合できる
+    // ことも合わせて確認する（重複検出の追加で正常系を壊していないか）。
+    assert_eq!(
+        find_value(sample_duplicate_batch_size, "flush_acks"),
+        FindValueOutcome::Found("10")
     );
 }
 

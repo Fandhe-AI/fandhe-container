@@ -18,15 +18,17 @@
 //! 実装済みを装わない）。
 //!
 //! # 畳み込み方式と、これが近似であること（REPAIR-3）
-//! 大文字小文字の畳み込みは `char::to_lowercase()` を各文字へ適用する方式
-//! （[`CaseFoldKey`] 参照）で、Unicode の単純な case folding の近似に過ぎない。
-//! APFS の `casefold` 正規化表・NTFS の upcase table と厳密に一致することは
-//! 主張しない。方式は「衝突の見逃しよりも過検出を選ぶ」よう選んでいる:
-//! 見逃しはホスト側での黙った上書き（データ損失）に直結するが、過検出は
-//! ゲストに見えるエラーで済むため。既知の非衝突（`ß` と `SS` など）は
-//! テストで境界を固定する。APFS / NTFS の実際の case folding 表との厳密な
-//! 一致・非 UTF-8 ファイル名の扱いは TASK-21（Unicode 正規化。方針は人間が
-//! 判断する）以降のスコープ。
+//! 大文字小文字の畳み込みは各文字へ `c.to_uppercase().flat_map(char::to_lowercase)`
+//! （upper-then-lower）を適用する方式（[`CaseFoldKey`] 参照）で、Unicode の
+//! 単純な case folding の近似に過ぎない。APFS の `casefold` 正規化表・NTFS の
+//! upcase table と厳密に一致することは主張しない。方式は「衝突の見逃しより
+//! 過検出を選ぶ」よう選んでいる: 見逃しはホスト側での黙った上書き
+//! （データ損失）に直結するが、過検出はゲストに見えるエラーで済むため。
+//! この方針により `ß` は `"SS"`/`"ss"` と衝突検出される（Unicode の厳密な
+//! simple case folding では非衝突だが、本方式では意図して過検出側に倒す。
+//! `CaseFoldKey` のドキュメント参照）。APFS / NTFS の実際の case folding
+//! 表との厳密な一致・非 UTF-8 ファイル名の扱いは TASK-21（Unicode 正規化。
+//! 方針は人間が判断する）以降のスコープ。
 //!
 //! # 入力表現がゲスト相対パスの `&str` である理由
 //! 入力はワイヤープロトコル上のゲスト（Linux）側 `/` 区切り相対パス表現であり、
@@ -68,12 +70,31 @@ pub const MAX_COLLISION_MESSAGE_PATH_CHARS: usize = 128;
 /// 大文字小文字だけで衝突するかどうかを判定するための畳み込み済みキー
 /// （非公開 newtype）。
 ///
-/// `/` 区切りの各コンポーネントに `char::to_lowercase()` を適用して
-/// 畳み込む。`str::to_lowercase()`（文字列全体への一括変換）ではなく
-/// 文字ごとの `char::to_lowercase()` を使う理由は、`str::to_lowercase()` が
-/// 語末のギリシャ文字シグマ（Σ）をコンテキスト依存で `ς`（語末形）に
-/// 変換する規則を持ち、`"ΣΣ"` と `"σσ"` が異なる畳み込み結果になって
-/// 衝突を見逃しうるため（`io5_final_sigma_folds_consistently` で回帰確認）。
+/// `/` 区切りの各コンポーネントへ文字ごとに `c.to_uppercase().flat_map(char::to_lowercase)`
+/// （upper-then-lower）を適用して畳み込む。`char::to_lowercase()` 単独（lower のみ）
+/// では見逃す衝突があるため upper-then-lower を採用している:
+/// - 語末のギリシャ文字シグマ `ς`（U+03C2）は `to_lowercase()` だけでは
+///   変化せず `ς` のまま残るが、`to_uppercase()` で `Σ` に正規化してから
+///   `to_lowercase()` すると `σ` になり、`σ` 自身の畳み込み結果と一致する
+///   （`io5_final_sigma_folds_consistently_both_directions` で回帰確認）。
+/// - ラテン文字の long s `ſ`（U+017F）・トルコ語系のドットなし i `ı`（U+0131）も
+///   同様に lower-only では自分自身に留まり `s`/`i` との衝突を見逃すが、
+///   upper-then-lower なら畳み込まれる（`io5_long_s_and_dotless_i_fold_to_ascii`）。
+///
+/// `str::to_lowercase()`（文字列全体への一括変換）を使わない理由は、それが
+/// 語末シグマをコンテキスト依存（直前が文字・直後が非文字等）で `ς` に
+/// 変換する規則を持ち、`"ΣΣ"` と `"σσ"` が異なる畳み込み結果になって衝突を
+/// 見逃しうるため（`io5_final_sigma_folds_consistently_both_directions` で
+/// 固定）。文字ごとの `to_uppercase`/`to_lowercase` はコンテキストを見ないため
+/// この揺れが無い。
+///
+/// # 見逃しより過検出（既知のトレードオフ）
+/// upper-then-lower により `ß`（U+00DF）は `"SS"` へ畳み込まれ、`"SS"` /
+/// `"ss"` と衝突として検出されるようになる（本来の Unicode simple case
+/// folding では `ß` は非衝突）。これは本モジュールの設計方針
+/// 「見逃しよりも過検出を選ぶ」（モジュール doc 参照）どおりの意図した挙動
+/// であり、`io5_sharp_s_is_detected_as_collision_under_upper_then_lower` で
+/// 固定する。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CaseFoldKey(Vec<String>);
 
@@ -81,7 +102,12 @@ impl CaseFoldKey {
     fn fold(components: &[&str]) -> Self {
         let folded = components
             .iter()
-            .map(|component| component.chars().flat_map(char::to_lowercase).collect())
+            .map(|component| {
+                component
+                    .chars()
+                    .flat_map(|c| c.to_uppercase().flat_map(char::to_lowercase))
+                    .collect()
+            })
             .collect();
         Self(folded)
     }
@@ -342,7 +368,7 @@ mod tests {
 
     /// IO-5: `str::to_lowercase()` への退行検出。語末のギリシャ文字シグマの
     /// コンテキスト依存変換規則があると `"ΣΣ"` と `"σσ"` が異なる畳み込み結果に
-    /// なり衝突を見逃すため、char ごとの `to_lowercase` を使うことで一貫して
+    /// なり衝突を見逃すため、char ごとの upper-then-lower を使うことで一貫して
     /// 検出できることを固定する。
     #[test]
     fn io5_final_sigma_folds_consistently() {
@@ -355,16 +381,59 @@ mod tests {
         assert_eq!(err.code(), IoErrorCode::AlreadyExists);
     }
 
-    /// IO-5: `ß` と `SS` は本方式の近似では衝突として検出しない（既知の非衝突。
-    /// モジュール doc「畳み込み方式と、これが近似であること」で明示済みの境界を
-    /// 固定する）。
+    /// IO-5: 語末形 `ς`（U+03C2）単体と `σ`（U+03C3）も衝突として検出する。
+    /// lower-only 畳み込み（`char::to_lowercase()` のみ）では `ς` が変化せず
+    /// 見逃されるため、upper-then-lower（`CaseFoldKey` 参照）で検出できることを
+    /// 固定する回帰テスト。
     #[test]
-    fn io5_sharp_s_is_documented_non_collision() {
+    fn io5_final_sigma_folds_consistently_both_directions() {
+        let mut set = CaseCollisionSet::new();
+        set.try_insert("σ.txt").expect("first insert must succeed");
+
+        let err = set
+            .try_insert("ς.txt")
+            .expect_err("final-sigma form must collide with sigma under upper-then-lower folding");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+    }
+
+    /// IO-5: ラテン文字の long s `ſ`（U+017F）は `s`/`S` と衝突として検出する。
+    /// トルコ語系のドットなし i `ı`（U+0131）も `I` と衝突として検出する。
+    /// いずれも lower-only 畳み込みでは自分自身に留まり見逃されるため、
+    /// upper-then-lower で検出できることを固定する回帰テスト。
+    #[test]
+    fn io5_long_s_and_dotless_i_fold_to_ascii() {
+        let mut long_s_set = CaseCollisionSet::new();
+        long_s_set
+            .try_insert("S.txt")
+            .expect("first insert must succeed");
+        let err = long_s_set
+            .try_insert("ſ.txt")
+            .expect_err("long s must collide with S under upper-then-lower folding");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+
+        let mut dotless_i_set = CaseCollisionSet::new();
+        dotless_i_set
+            .try_insert("I.txt")
+            .expect("first insert must succeed");
+        let err = dotless_i_set
+            .try_insert("ı.txt")
+            .expect_err("dotless i must collide with I under upper-then-lower folding");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+    }
+
+    /// IO-5: `ß` と `SS` は upper-then-lower 畳み込みでは `"ss"` に揃い、
+    /// 衝突として検出される（Unicode の厳密な simple case folding では
+    /// 非衝突だが、本モジュールの方針「見逃しよりも過検出を選ぶ」により
+    /// 意図して過検出側に倒す。モジュール doc・`CaseFoldKey` のドキュメント
+    /// 参照）。
+    #[test]
+    fn io5_sharp_s_is_detected_as_collision_under_upper_then_lower() {
         let mut set = CaseCollisionSet::new();
         set.try_insert("ß.txt").expect("insert must succeed");
-        set.try_insert("SS.txt")
-            .expect("ß vs SS is a documented non-collision under this approximation");
-        assert_eq!(set.len(), 2);
+        let err = set
+            .try_insert("SS.txt")
+            .expect_err("ß vs SS must be detected as a collision under upper-then-lower folding");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
     }
 
     /// IO-5: 不正な形式のパスはすべて `InvalidArgument` で拒否される。

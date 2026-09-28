@@ -7,7 +7,10 @@
 # （引数検証・symlink・上限チェック・欠如ツール検出・後始末）を最小の fio スタブで
 # 確認する（実 fio は使わない）。専用サブディレクトリへの書き込み・事前に置かれた
 # symlink を踏まないこと・--output の検証後に置かれた symlink を拒否することも
-# スタブで照合する（security.md）。run モードは対象スクリプト自体が GNU coreutils の
+# スタブで照合する（security.md）。fio JSON の実行条件（job options・jobname・jobs 件数・
+# error）の照合と総書き込み量（--size × --numjobs）の上限の境界も、fixture と
+# 受け取ったオプションを job options に記録するスタブで照合する（IO-8）。
+# run モードは対象スクリプト自体が GNU coreutils の
 # `timeout`・`realpath` を要求する契約（Linux ホストのみ対象）のため、本自己テストの
 # run モード関連ケースも同じ前提（Linux・GNU coreutils）を引き継ぐ。実測（実際の
 # 書き込み性能）はここでは行わない（実測は docs/design/io-fio-bench.md の
@@ -102,17 +105,46 @@ check_file_content() {
 # --from-json モード（jq のみで完結。fio 不要）
 # --------------------------------------------------
 run_case "from-json-ok" 0 --from-json "${fixtures_dir}/fio-3-ok.json" --label docker_bind_mount
-run_case "from-json-missing-clat" 2 --from-json "${fixtures_dir}/fio-3-missing-clat.json" --label x
-run_case "from-json-zero-iops" 2 --from-json "${fixtures_dir}/fio-3-zero-iops.json" --label x
-run_case "from-json-fio-2x-legacy" 2 --from-json "${fixtures_dir}/fio-2-legacy.json" --label x
+# 負例 fixture は実行条件（job options）を正しく持たせたうえで 1 点だけ壊している。
+# 同じ exit 2 でも別の理由で止まっていないことをメッセージで照合する。
+run_case_msg "from-json-missing-clat" 2 "clat_ns is missing" --from-json "${fixtures_dir}/fio-3-missing-clat.json" --label x
+run_case_msg "from-json-zero-iops" 2 "iops must be a finite number greater than 0" --from-json "${fixtures_dir}/fio-3-zero-iops.json" --label x
+run_case_msg "from-json-fio-2x-legacy" 2 "unsupported fio version" --from-json "${fixtures_dir}/fio-2-legacy.json" --label x
 # 回帰テスト: capture(...)? は正規表現が不一致でも空ストリーム（jq 側は成功扱い）を
 # 返すため、テストなしで放置すると壊れた version 文字列が「変換成功・空 JSON」と
 # いう exit 0 の誤判定を通してしまう（fail-closed の穴）。バージョン文字列が
 # "fio-" 接頭辞を持たない壊れた形式を、明示的に exit 2 で拒否することを確認する。
-run_case "from-json-unparseable-version" 2 --from-json "${fixtures_dir}/fio-3-bad-version.json" --label x
+run_case_msg "from-json-unparseable-version" 2 "cannot parse fio version" --from-json "${fixtures_dir}/fio-3-bad-version.json" --label x
 run_case "from-json-not-json" 2 --from-json "${fixtures_dir}/not-json.txt" --label x
 run_case "from-json-invalid-label" 2 --from-json "${fixtures_dir}/fio-3-ok.json" --label "Bad Label"
 run_case "from-json-missing-file" 2 --from-json "${fixtures_dir}/does-not-exist.json" --label x
+
+# --------------------------------------------------
+# 実行条件の照合（IO-8: fio_randwrite_4k_* として出してよいのは 4K ランダム write の
+# 条件で実行された結果だけ。run モードと同じ条件以外の fio JSON は exit 2 で拒否する）
+# --------------------------------------------------
+run_case_msg "from-json-no-job-options" 2 "cannot verify that the run used the 4K random write conditions" --from-json "${fixtures_dir}/fio-3-no-job-options.json" --label x
+run_case_msg "from-json-wrong-rw" 2 "fio option rw must be" --from-json "${fixtures_dir}/fio-3-wrong-rw.json" --label x
+run_case_msg "from-json-wrong-bs" 2 "fio option bs must be 4k" --from-json "${fixtures_dir}/fio-3-wrong-bs.json" --label x
+run_case_msg "from-json-wrong-jobname" 2 "jobs[0].jobname must be" --from-json "${fixtures_dir}/fio-3-wrong-jobname.json" --label x
+run_case_msg "from-json-extra-option" 2 "unexpected fio options (only the options passed in run mode are accepted): rate_iops" --from-json "${fixtures_dir}/fio-3-extra-option.json" --label x
+run_case_msg "from-json-two-jobs" 2 "exactly one entry" --from-json "${fixtures_dir}/fio-3-two-jobs.json" --label x
+run_case_msg "from-json-job-error" 2 "jobs[0].error must be present and 0 (got 5)" --from-json "${fixtures_dir}/fio-3-job-error.json" --label x
+run_case_msg "from-json-time-based-off" 2 "time_based must be enabled" --from-json "${fixtures_dir}/fio-3-time-based-off.json" --label x
+# 同じ fixture でも、CLI の条件（既定値を含む）と食い違えば拒否する（出力の params が
+# 元の fio 実行条件と一致することの保証）
+run_case_msg "from-json-size-mismatch" 2 "size must match --size 512m" --from-json "${fixtures_dir}/fio-3-ok.json" --label x --size 512m
+run_case_msg "from-json-direct-mismatch" 2 "direct must match --direct 0" --from-json "${fixtures_dir}/fio-3-ok.json" --label x --direct 0
+run_case_msg "from-json-iodepth-mismatch" 2 "iodepth must match --iodepth 4" --from-json "${fixtures_dir}/fio-3-ok.json" --label x --iodepth 4
+run_case_msg "from-json-numjobs-mismatch" 2 "numjobs must match --numjobs 2" --from-json "${fixtures_dir}/fio-3-ok.json" --label x --numjobs 2
+run_case_msg "from-json-runtime-60-default-cli" 2 "runtime must match --runtime 30" --from-json "${fixtures_dir}/fio-3-runtime-60.json" --label x
+run_case "from-json-runtime-60-matching-cli" 0 --from-json "${fixtures_dir}/fio-3-runtime-60.json" --label x --runtime 60
+# 表記ゆれ（size=256M・runtime=30s・bs=4096）は正規化して同じ条件として受け付ける
+run_case "from-json-normalized-units" 0 --from-json "${fixtures_dir}/fio-3-normalized-units.json" --label x
+# global options に置かれた条件も job options と合わせた実効値で照合する
+run_case "from-json-global-options" 0 --from-json "${fixtures_dir}/fio-3-global-options.json" --label x
+# --target-dir は run モード専用。併用すると黙って無視されるため拒否する
+run_case_msg "from-json-with-target-dir" 2 "cannot be combined with --from-json" --from-json "${fixtures_dir}/fio-3-ok.json" --label x --target-dir /tmp
 
 # symlink 入力の拒否（security.md のパストラバーサル・symlink 対策）
 sym_input="${tmp_root}/sym-input.json"
@@ -256,32 +288,48 @@ PATH="$common_bin" run_case_msg "missing-fio-tool" 3 "fio is required" --target-
 # 使う既存 PATH は残すため、以降のケースは stub_bin を PATH の先頭に prefix する）。
 stub_bin="${tmp_root}/stub-bin"
 mkdir -p "$stub_bin"
-# fio スタブは --output 引数の JSON 書き出しに加えて、--directory/--filename が
-# 指す固定データファイルも実際に作る（run-cleanup-no-leftover-files が「後始末で
-# 実在するファイルが消える」ことを確認できるようにするため。ファイルを作らないと
-# 後始末の trap が空振りしても検出できず、テストが意味を持たない）。
+# fio スタブは実 fio と同じく、受け取った `--key=value`・値なしフラグ（`--time_based` 等）
+# を `jobs[0]["job options"]` に正規名→入力文字列（フラグは空文字列）で記録した JSON を
+# --output へ書く（fio 本体の parse.c `add_to_dump_list`・stat.c `json_add_job_opts` と
+# 同じ形。run モードの出力も --from-json と同じ実行条件の照合を通ることを確かめるため）。
+# 加えて --directory/--filename が指す固定データファイルも実際に作る
+# （run-cleanup-no-leftover-files が「後始末で実在するファイルが消える」ことを確認
+# できるようにするため）。
 fio_stub="${stub_bin}/fio"
-# shellcheck disable=SC2016 # stub スクリプトへ書き出す文字列であり、$@ 等は
-# stub 側で展開させる意図でシングルクォートにしている。
-{
-  echo '#!/usr/bin/env bash'
-  echo 'out="" dir="" fname=""'
-  echo 'for a in "$@"; do'
-  echo '  case "$a" in'
-  echo '    --output=*) out="${a#--output=}" ;;'
-  echo '    --directory=*) dir="${a#--directory=}" ;;'
-  echo '    --filename=*) fname="${a#--filename=}" ;;'
-  echo '  esac'
-  echo 'done'
-  # 受け取った --directory を記録する（書き込み先が専用サブディレクトリであることの照合用）
-  echo '[ -n "${FIO_STUB_DIR_LOG:-}" ] && echo "$dir" >"$FIO_STUB_DIR_LOG"'
-  # 実 fio と同じく、データファイルを symlink をたどる形（O_CREAT・O_EXCL なし）で書く
-  echo '[ -n "$dir" ] && [ -n "$fname" ] && echo stub-fio-data > "$dir/$fname"'
-  # 実行中に第三者が symlink を置く競合（TOCTOU）を再現するためのフック
-  echo '[ -n "${FIO_STUB_PLANT_LINK:-}" ] && ln -s "$FIO_STUB_PLANT_TARGET" "$FIO_STUB_PLANT_LINK"'
-  echo "cat \"${fixtures_dir}/fio-3-ok.json\" >\"\$out\""
-  echo 'exit 0'
-} >"$fio_stub"
+cat >"$fio_stub" <<STUB
+#!/usr/bin/env bash
+fixture="${fixtures_dir}/fio-3-ok.json"
+STUB
+cat >>"$fio_stub" <<'STUB'
+out="" dir="" fname="" opts='{}'
+for a in "$@"; do
+  case "$a" in
+    --output=*) out="${a#--output=}" ;;
+    --output-format=*) ;;
+    --*=*)
+      k="${a%%=*}"
+      k="${k#--}"
+      v="${a#*=}"
+      [ "$k" = directory ] && dir="$v"
+      [ "$k" = filename ] && fname="$v"
+      opts=$(jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}' <<<"$opts")
+      ;;
+    --*) opts=$(jq -c --arg k "${a#--}" '. + {($k): ""}' <<<"$opts") ;;
+  esac
+done
+# 受け取った --directory を記録する（書き込み先が専用サブディレクトリであることの照合用）
+[ -n "${FIO_STUB_DIR_LOG:-}" ] && echo "$dir" >"$FIO_STUB_DIR_LOG"
+# 実 fio と同じく、データファイルを symlink をたどる形（O_CREAT・O_EXCL なし）で書く
+[ -n "$dir" ] && [ -n "$fname" ] && echo stub-fio-data >"$dir/$fname"
+# 実行中に第三者が symlink を置く競合（TOCTOU）を再現するためのフック
+[ -n "${FIO_STUB_PLANT_LINK:-}" ] && ln -s "$FIO_STUB_PLANT_TARGET" "$FIO_STUB_PLANT_LINK"
+# 出力 JSON を書かずに成功終了する fio を再現するためのフック
+[ -n "${FIO_STUB_NO_OUTPUT:-}" ] && exit 0
+# 記録するオプションを上書きする（run モードでも実行条件の照合が効くことの確認用）
+[ -n "${FIO_STUB_OVERRIDE_OPTS:-}" ] && opts=$(jq -c --argjson o "$FIO_STUB_OVERRIDE_OPTS" '. + $o' <<<"$opts")
+jq --argjson o "$opts" '.jobs[0]["job options"] = $o' "$fixture" >"$out"
+exit 0
+STUB
 chmod +x "$fio_stub"
 stub_path="${stub_bin}:${PATH}"
 
@@ -297,6 +345,40 @@ PATH="$stub_path" run_case "run-invalid-numjobs" 2 --target-dir /tmp --label x -
 PATH="$stub_path" run_case "run-invalid-direct" 2 --target-dir /tmp --label x --direct 2
 PATH="$stub_path" run_case "run-nonexistent-target-dir" 2 --target-dir /no-such-fandhe-fio-dir --label x
 run_case "run-missing-label" 2 --target-dir /tmp
+PATH="$stub_path" run_case_msg "run-missing-target-dir" 2 "--target-dir is required in run mode" --label x
+
+# 総書き込み量の上限（--size はジョブごとの値のため --size × --numjobs ≤ 10 GiB。
+# DoS 防止）の境界。スタブは --size 分を実際には書かない
+cap_target="${tmp_root}/cap-target"
+mkdir -p "$cap_target"
+PATH="$stub_path" run_case "run-total-size-10g-x1-at-cap" 0 --target-dir "$cap_target" --label x --runtime 5 --size 10g
+PATH="$stub_path" run_case "run-total-size-5g-x2-at-cap" 0 --target-dir "$cap_target" --label x --runtime 5 --size 5g --numjobs 2
+PATH="$stub_path" run_case "run-total-size-10240m-x1-at-cap" 0 --target-dir "$cap_target" --label x --runtime 5 --size 10240m
+PATH="$stub_path" run_case_msg "run-total-size-10241m-x1-over-cap" 2 "total cap" --target-dir "$cap_target" --label x --runtime 5 --size 10241m
+PATH="$stub_path" run_case_msg "run-total-size-5g-x3-over-cap" 2 "total cap" --target-dir "$cap_target" --label x --runtime 5 --size 5g --numjobs 3
+PATH="$stub_path" run_case_msg "run-total-size-10g-x2-over-cap" 2 "total cap" --target-dir "$cap_target" --label x --runtime 5 --size 10g --numjobs 2
+# --from-json でも同じ上限を課す（params の契約は両モード共通）
+run_case_msg "from-json-total-size-over-cap" 2 "total cap" --from-json "${fixtures_dir}/fio-3-ok.json" --label x --size 5g --numjobs 3
+
+# run モードの fio 出力にも同じ実行条件の照合をかける（fio が別条件で走った場合を
+# スタブの記録オプション上書きで再現する）
+opts_target="${tmp_root}/opts-target"
+mkdir -p "$opts_target"
+FIO_STUB_OVERRIDE_OPTS='{"rw":"randrw"}' PATH="$stub_path" run_case_msg "run-fio-options-mismatch" 2 "fio option rw must be" --target-dir "$opts_target" --label x --runtime 5
+
+# fio が exit 0 でも出力 JSON を書かなかった場合は fio 側の失敗（exit 1）として扱う
+FIO_STUB_NO_OUTPUT=1 PATH="$stub_path" run_case_msg "run-fio-no-output" 1 "did not write its JSON output" --target-dir "$opts_target" --label x --runtime 5
+
+# run モードの出力の params・target_kind が実際に fio へ渡した条件を表すこと
+run_out="${tmp_root}/run-out.json"
+PATH="$stub_path" run_case "run-ok-output-params" 0 --target-dir "$opts_target" --label x --runtime 5 --numjobs 2 --output "$run_out"
+run_params=$(jq -c '[.target_kind, .params.runtime, .params.numjobs, .params.size]' "$run_out" 2>/dev/null || echo "<unreadable>")
+if [ "$run_params" = '["run",5,2,"256m"]' ]; then
+  echo "PASS: run-output-params-values (${run_params})"
+else
+  echo "FAIL: run-output-params-values (expected [\"run\",5,2,\"256m\"], actual ${run_params})" >&2
+  failures=$((failures + 1))
+fi
 
 sym_target="${tmp_root}/sym-target"
 real_target="${tmp_root}/real-target"
@@ -398,6 +480,14 @@ FIO_STUB_PLANT_LINK="$race_output" FIO_STUB_PLANT_TARGET="$race_victim" PATH="$s
   run_case_msg "run-output-symlink-planted-during-run" 2 "could not be created exclusively" \
   --target-dir "$race_target" --label x --runtime 5 --output "$race_output"
 check_file_content "run-output-race-victim-unchanged" "$race_victim" "race-victim-original"
+# --output の書き込みに失敗したときは stdout に結果 JSON を出さない（呼び出し元は
+# exit 0 のときだけ stdout を結果として読む）
+if [[ "$last_output" != *'"schema_version"'* ]]; then
+  echo "PASS: run-output-failure-emits-no-result"
+else
+  echo "FAIL: run-output-failure-emits-no-result (result JSON was printed although --output failed)" >&2
+  failures=$((failures + 1))
+fi
 
 if [ "$failures" -gt 0 ]; then
   echo "self-test failed: ${failures} case(s) did not match the expected result" >&2

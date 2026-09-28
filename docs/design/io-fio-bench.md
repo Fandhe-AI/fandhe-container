@@ -38,13 +38,25 @@ fandhe 経路（共有マウント）の計測は、共有マウントが公開�
 ### `--from-json` モード（既存の fio 出力を変換するだけ）
 
 ```bash
-fio --name=x --rw=randwrite --bs=4k --size=256m --runtime=30 --time_based \
-    --ioengine=psync --direct=1 --end_fsync=1 --group_reporting \
-    --output-format=json --output=/tmp/fio-out.json --directory=/path/to/target
+fio --name=fandhe-fio-randwrite-4k --directory=/path/to/target \
+    --filename=fandhe-fio-randwrite-4k.dat --rw=randwrite --bs=4k --ioengine=psync \
+    --direct=1 --size=256m --runtime=30 --time_based --iodepth=1 --numjobs=1 \
+    --end_fsync=1 --group_reporting --output-format=json --output=/tmp/fio-out.json
 bash scripts/fio-randwrite-4k.sh --from-json /tmp/fio-out.json --label docker_bind_mount
 ```
 
-### 共通オプション
+`--from-json` は run モードと同じ条件で実行された fio JSON だけを受け付ける（IO-8: `fio_randwrite_4k_*` の名前で出す結果は 4K ランダム write の条件で計測されたものに限る）。照合内容は次のとおりで、1 つでも満たさなければ終了コード 2 で拒否する。
+
+- `jobs` はちょうど 1 件（`--group_reporting` を付け、ジョブセクションは 1 つ）、`jobname` は `fandhe-fio-randwrite-4k`、`error` は 0
+- `global options` と `jobs[0]["job options"]` を合わせた（job 側を優先した）fio オプションは、run モードが渡すもの（`name`・`directory`・`filename`・`rw`・`bs`・`ioengine`・`direct`・`size`・`runtime`・`time_based`・`iodepth`・`numjobs`・`end_fsync`・`group_reporting`）に限る。これ以外のオプション（`rate_iops`・`fsync`・`percentile_list` 等）が 1 つでもあれば拒否する。`job options` が無い JSON も拒否する
+- 固定値: `rw=randwrite`・`bs=4k`（`4k`/`4K`/`4096`）・`ioengine=psync`・`filename=fandhe-fio-randwrite-4k.dat`・`end_fsync=1`・`time_based` と `group_reporting` が有効（値なし、または `1`）
+- 本スクリプトの同名オプション（既定値を含む）との一致: `direct`・`iodepth`・`numjobs`（文字列として一致）、`size`（`k`/`m`/`g` の大文字小文字・単位なしのバイト数を正規化して一致）、`runtime`（秒。末尾 `s` は可）。元の fio 実行が既定値と異なる条件なら、変換時に同じ値を `--size`・`--runtime`・`--iodepth`・`--numjobs`・`--direct` へ渡す
+
+fio の JSON 上のオプション表現（`job options`/`global options` は正規オプション名→入力文字列の組で、値なしフラグは空文字列）は fio 本体（axboe/fio）の `parse.c`（`add_to_dump_list`）・`stat.c`（`json_add_job_opts`）・`json.h` を直接参照して確認した。実 fio の出力での照合は未実施（実機での確認は下記「実機での確認」節）。
+
+### オプション
+
+`--target-dir` は run モード専用で、`--from-json` と併用すると終了コード 2 で拒否する（黙って無視すると、呼び出し元が実測したと誤認するため）。`--direct`・`--size`・`--runtime`・`--iodepth`・`--numjobs` は、run モードでは fio へ渡す条件、`--from-json` モードでは fio JSON に記録された条件と照合する期待値になる。
 
 | オプション | 既定値 | 説明 |
 | ---- | ---- | ---- |
@@ -53,7 +65,7 @@ bash scripts/fio-randwrite-4k.sh --from-json /tmp/fio-out.json --label docker_bi
 | `--label <label>` | 必須 | `^[a-z0-9_-]{1,64}$`。出力 JSON にそのまま記録し、計測対象（Docker ベースラインか fandhe 経路か等）を表す |
 | `--output <path>` | （出力しない） | 指定時、結果 JSON をこのパスにも書く。symlink 拒否・既存ファイルへの上書きは拒否する。親ディレクトリの存在・書き込み可否も事前検証する（未検証のまま書き込みに失敗すると、呼び出し元が終了コード 1「fio 実行失敗」と誤認するため）。書き込み自体も noclobber（対象が無ければ `O_CREAT\|O_EXCL`）で行い、検証後に symlink・ファイルを置かれた場合は書かずに終了コード 2 で止める（bash の noclobber の仕様上、FIFO・デバイス等の通常ファイル以外を指す symlink を検証後に置かれた場合は対象外） |
 | `--direct 0\|1` | `1` | fio `--direct`。tmpfs・FUSE 系の共有 FS では O_DIRECT が失敗しうるため変更できる |
-| `--size <NkNmNg>` | `256m` | fio `--size`。`^[1-9][0-9]{0,5}[kmg]$`（先頭ゼロ不可）かつ 10 GiB 以下（DoS 防止の上限） |
+| `--size <NkNmNg>` | `256m` | fio `--size`（ジョブごとの値）。`^[1-9][0-9]{0,5}[kmg]$`（先頭ゼロ不可）。DoS 防止の上限は総量で課し、`--size` × `--numjobs` が 10 GiB 以下（例: `10g`×1・`5g`×2 は可、`5g`×3 は不可）。全ジョブが同じ `--filename` を共有するためディスク上のファイルは 1 つだが、書き込み量に対して保守的に総量で制限する |
 | `--runtime <1-600>` | `30` | fio `--runtime`（秒。`--time_based` と併用）。`^[1-9][0-9]{0,3}$`（先頭ゼロ不可） |
 | `--iodepth <1-64>` | `1` | fio `--iodepth`（`ioengine=psync` では実質 1。記録用）。`^[1-9][0-9]{0,2}$`（先頭ゼロ不可） |
 | `--numjobs <1-16>` | `1` | fio `--numjobs`。`^[1-9][0-9]{0,2}$`（先頭ゼロ不可） |
@@ -66,7 +78,7 @@ fio はデータファイルを `O_CREAT`（`O_EXCL` なし）で開き symlink 
 
 「symlink・既存ファイルなら拒否する」事前検査を採らないのは、検査から fio の open までの競合（TOCTOU）を原理的に塞げないため。`--target-dir` 直下に置かれた同名 symlink はそのまま残り、リンク先も変更されない（自己テストで照合する）。
 
-`--rw`（`randwrite` 固定）・`--bs`（`4k` 固定）・`--ioengine`（`psync` 固定。libaio は Linux 専用のため移植性を優先）・`--end_fsync`（`1` 固定。write-back とフラッシュの意味論〔IO-2〕を含めて測るため）・`--group_reporting`（有効固定）は変更できない。有効値はすべて出力 JSON の `params` に記録する。
+`--rw`（`randwrite` 固定）・`--bs`（`4k` 固定）・`--ioengine`（`psync` 固定。libaio は Linux 専用のため移植性を優先）・`--end_fsync`（`1` 固定。write-back とフラッシュの意味論〔IO-2〕を含めて測るため）・`--group_reporting`（有効固定）は変更できない。有効値はすべて出力 JSON の `params` に記録する。run モードの fio 出力にも `--from-json` と同じ実行条件の照合をかけるため、`params` はどちらのモードでも fio JSON に記録された実行条件と一致する。
 
 ## 出力スキーマ
 
@@ -95,24 +107,24 @@ fio はデータファイルを `O_CREAT`（`O_EXCL` なし）で開き symlink 
 ```
 
 - `target_kind` は実行経路を表す（`run`: fio を実際に実行した、`from_json`: 既存出力の変換のみで実測を伴わない）。Docker ベースラインか fandhe 経路かの区別は `--label` で表現する契約
-- `--from-json` モード（`target_kind: "from_json"`）の `params` は、**変換時に渡した本スクリプトの CLI 引数（既定値含む）であり、元の fio 実行が実際にどの条件で行われたかを保証しない**。呼び出し元が測定条件を記録として残したい場合は、変換時に元の fio 実行と同じ値を `--size`・`--runtime`・`--iodepth`・`--numjobs`・`--direct` へ明示的に渡す
+- `params` は run・`--from-json` のどちらのモードでも、fio JSON に記録された実行条件と照合済みの値である（照合内容は上記「`--from-json` モード」節。不一致なら出力せず終了コード 2）
 - IOPS・レイテンシが 0 以下・欠落・非有限のときは出力せず、終了コード 2 で止める（fail-closed）
 - fio 2.x 系の `lat`/`clat`（usec 単位・キー名も異なる）は非対応。`"fio version"` の major が 3 未満、または `lat_ns`/`clat_ns` キーが無い場合は終了コード 2 で拒否する
-- 人が読む進捗・サマリーは stderr に出し、stdout は JSON のみ
+- 人が読む進捗・サマリーは stderr に出し、stdout は JSON のみ。`--output` を指定した場合はファイルを先に書き、その書き込みに失敗したときは stdout に何も出さず終了コード 2 で止める（呼び出し元は終了コード 0 のときだけ stdout を結果として読む）
 
 ## 終了コード
 
 | コード | 意味 |
 | ---- | ---- |
 | 0 | 成功 |
-| 1 | fio の実行失敗またはタイムアウト（`timeout` が保護する。SIGTERM で止まらない場合は 10 秒後に SIGKILL する。REPAIR-5） |
-| 2 | 入力エラー（引数の検証失敗、fio JSON のスキーマ不正、値が 0 以下、ファイルサイズ超過、symlink 等） |
+| 1 | fio の実行失敗（exit 0 でも出力 JSON を書かなかった場合を含む）またはタイムアウト（`timeout` が保護する。SIGTERM で止まらない場合は 10 秒後に SIGKILL する。REPAIR-5） |
+| 2 | 入力エラー（引数の検証失敗、fio JSON のスキーマ不正・実行条件の不一致、値が 0 以下、ファイルサイズ・総書き込み量の上限超過、symlink 等） |
 | 3 | 前提ツールが無い（run モードでの fio・timeout・realpath・find。全モード共通で jq・grep・dirname・wc・tr・mktemp） |
 
 ## 自己テスト（`scripts/fio-randwrite-4k-selftest.sh`）
 
-`--from-json` モードと `scripts/testdata/fio-bench/` の固定 fixture、および最小の fio スタブ（固定 JSON を書き出すだけ）を使い、実 fio なしで終了コード・出力値・`check-bench-regression.sh` との round-trip 互換性、および symlink・競合に対する書き込み先の安全性（上記「書き込み先の安全性」・`--output` の排他作成）を機械照合する（REPAIR-12）。`make fio-bench-selftest` から実行し、CI の `bench-regression` ジョブにも組み込む。run モードの実 fio を使った実行確認は「実機での確認」節を参照。
+`--from-json` モードと `scripts/testdata/fio-bench/` の固定 fixture、および最小の fio スタブ（受け取ったオプションを fio と同じ形で `job options` に記録した固定 JSON を書き出す）を使い、実 fio なしで終了コード・出力値・`check-bench-regression.sh` との round-trip 互換性、実行条件の照合（負例 fixture は照合を通る `job options` を持たせたうえで 1 点だけ壊し、拒否理由をメッセージで照合する）、総書き込み量の上限の境界、および symlink・競合に対する書き込み先の安全性（上記「書き込み先の安全性」・`--output` の排他作成）を機械照合する（REPAIR-12）。`make fio-bench-selftest` から実行し、CI の `bench-regression` ジョブにも組み込む。run モードの実 fio を使った実行確認は「実機での確認」節を参照。
 
 ## 実機での確認（人間担当・TASK-25.2 との切り分け）
 
-fio が導入された Linux 環境で `make fio-bench TARGET_DIR=<一時ディレクトリ> LABEL=local_tmp RUNTIME=5` を実行し、JSON が出力されること・実行後に target ディレクトリへ専用サブディレクトリ（`fandhe-fio-randwrite-4k.*`）とデータファイルが残らないことを確認する。Docker ベースライン比の実測・レポート・目標値案は TASK-25.2（#113）、目標値の妥当性判断は TASK-25.h1（#114。人間担当）で行う。
+fio が導入された Linux 環境で `make fio-bench TARGET_DIR=<一時ディレクトリ> LABEL=local_tmp RUNTIME=5` を実行し、JSON が出力されること・実行後に target ディレクトリへ専用サブディレクトリ（`fandhe-fio-randwrite-4k.*`）とデータファイルが残らないことを確認する。実行条件の照合（`job options` の形）は fio 本体のソースから導いたもので実 fio では未確認のため、この実行が最初の実機照合になる。`unexpected fio options` や `jobs[0]["job options"] is missing` で終了コード 2 になった場合は、使用した fio の版が想定と異なる形でオプションを記録していることを意味するので、回避せず fio の版と出力 JSON を添えて報告する。Docker ベースライン比の実測・レポート・目標値案は TASK-25.2（#113）、目標値の妥当性判断は TASK-25.h1（#114。人間担当）で行う。

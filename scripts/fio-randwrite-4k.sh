@@ -22,7 +22,7 @@
 #     なし）を使うため、`_ns` キーの有無で fio 3.x 以降かどうかを判定する（`_ns` への正確な
 #     移行版数までは未確認。この環境には fio が無く、実際の fio 出力での照合は未実施）、
 #     GNU coreutils の `timeout`（Linux ホストが対象。macOS 標準環境には無い）、`jq`
-#   - --from-json モード: `jq` のみ（fio 不要）
+#   - --from-json モード: `jq`（fio 不要）
 #   - root 権限・`/dev/kvm` は不要
 #   - 全モード共通で `grep`・`dirname`・`wc`・`tr`・`mktemp`、run モードでは加えて
 #     `realpath`・`find`（いずれも前提ツール検証の対象。欠如は exit 3）
@@ -34,11 +34,26 @@
 #   たどる）に踏ませないための構造的対策で、後始末もそのサブディレクトリを
 #   `rm -rf` で消すだけにする（symlink をたどらない）。
 #
+# --from-json と run モードの契約（IO-8 の計測条件をベンチ名と一致させる）:
+#   変換対象の fio JSON は run モードと同じ条件で実行されたものだけを受け付ける。
+#   `jobs` はちょうど 1 件（--group_reporting）・`jobname` は `fandhe-fio-randwrite-4k`・
+#   `error` は 0 で、`global options` と `job options` を合わせた fio オプションは
+#   run モードが渡すものと同じ集合（name・directory・filename・rw・bs・ioengine・direct・
+#   size・runtime・time_based・iodepth・numjobs・end_fsync・group_reporting）に限る。
+#   値は rw=randwrite・bs=4k（4k/4K/4096）・ioengine=psync・filename=固定名・
+#   end_fsync=1 で、direct・size・runtime・iodepth・numjobs は本スクリプトの
+#   同名オプション（既定値含む）と一致しなければならない。これにより出力の `params` は
+#   元の fio 実行条件と一致することが保証される。条件不一致・欠落・未知のオプションは
+#   exit 2。fio の JSON 上のオプション表現（`job options`/`global options` は
+#   `add_to_dump_list` が記録した正規名→入力文字列の組、値なしフラグは空文字列）は
+#   fio 本体（axboe/fio master）の `parse.c`・`stat.c`（`json_add_job_opts`）・
+#   `json.h` を直接参照して確認した（実 fio の出力での照合は未実施）。
+#
 # 終了コード（呼び出し元はこの具体値で分岐する）:
 #   0: 成功
-#   1: fio の実行失敗またはタイムアウト
-#   2: 入力エラー（引数の検証失敗、fio JSON のスキーマ不正、値が 0 以下、
-#      ファイルサイズ超過、symlink 等）
+#   1: fio の実行失敗（exit 0 でも出力 JSON を書かなかった場合を含む）またはタイムアウト
+#   2: 入力エラー（引数の検証失敗、fio JSON のスキーマ不正・実行条件の不一致、
+#      値が 0 以下、ファイルサイズ・総書き込み量の上限超過、symlink 等）
 #   3: 前提ツールが無い（run モードでの fio・timeout・realpath・find。全モード共通で
 #      jq・grep・dirname・wc・tr・mktemp）
 #
@@ -70,7 +85,10 @@ set -euo pipefail
 # --------------------------------------------------
 readonly FIXED_FILENAME="fandhe-fio-randwrite-4k.dat"
 readonly MAX_FROM_JSON_BYTES=4194304 # 4 MiB
-readonly MAX_SIZE_BYTES=$((10 * 1024 * 1024 * 1024)) # 10 GiB（--size の上限）
+# fio の --size はジョブごとの値のため、上限は総量（--size × --numjobs）で課す
+# （DoS 防止。ジョブ単体の --size もこれ以下になる）。
+readonly MAX_TOTAL_SIZE_BYTES=$((10 * 1024 * 1024 * 1024)) # 10 GiB
+readonly FIO_JOB_NAME="fandhe-fio-randwrite-4k"
 readonly MIN_RUNTIME=1
 readonly MAX_RUNTIME=600
 readonly MIN_IODEPTH=1
@@ -98,12 +116,16 @@ common options:
                        parent directory must already exist and be writable)
   -h, --help          show this help
 
-run-mode-only options:
+workload options (run mode: passed to fio; --from-json mode: the fio JSON's
+job options must match these values, defaults included):
   --direct 0|1        O_DIRECT flag (default: 1)
-  --size <NkNmNg>      fio --size (default: 256m, capped at 10 GiB)
+  --size <NkNmNg>      fio --size per job (default: 256m; --size x --numjobs
+                       is capped at 10 GiB in total)
   --runtime <1-600>    fio --runtime in seconds (default: 30)
   --iodepth <1-64>     fio --iodepth (default: 1)
   --numjobs <1-16>     fio --numjobs (default: 1)
+
+--target-dir is run-mode only and must not be combined with --from-json.
 USAGE
 }
 
@@ -112,6 +134,7 @@ USAGE
 # --------------------------------------------------
 mode="run"
 target_dir=""
+target_dir_given=0
 from_json=""
 label=""
 output_path=""
@@ -126,6 +149,7 @@ while [ "$#" -gt 0 ]; do
     --target-dir)
       [ "$#" -ge 2 ] || { err "arg-error" "--target-dir requires a value"; exit 2; }
       target_dir="$2"
+      target_dir_given=1
       shift 2
       ;;
     --from-json)
@@ -183,6 +207,16 @@ done
 
 if [ -z "$label" ]; then
   err "arg-error" "--label is required"
+  exit 2
+fi
+# --from-json と --target-dir の併用は拒否する（--target-dir が黙って無視され、
+# 呼び出し元が「実測した」と誤認するのを防ぐ）。run モードでは --target-dir 必須。
+if [ "$mode" = "from-json" ] && [ "$target_dir_given" -eq 1 ]; then
+  err "arg-error" "--target-dir cannot be combined with --from-json"
+  exit 2
+fi
+if [ "$mode" = "run" ] && [ -z "$target_dir" ]; then
+  err "arg-error" "--target-dir is required in run mode (or use --from-json)"
   exit 2
 fi
 
@@ -265,8 +299,13 @@ case "$size_unit" in
   g) size_mult=$((1024 * 1024 * 1024)) ;;
 esac
 size_bytes=$((size_num * size_mult))
-if [ "$size_bytes" -gt "$MAX_SIZE_BYTES" ]; then
-  err "invalid-input" "--size exceeds the ${MAX_SIZE_BYTES}-byte cap: $size"
+# 総量（ジョブごとの --size × --numjobs）で上限を課す。値域は size_num ≤ 999999・
+# size_mult ≤ 1 GiB・numjobs ≤ 16 のため、積は bash の 64bit 整数に収まる。
+# （実装上は全ジョブが同じ --filename を共有するためディスク上のファイルは 1 つだが、
+# fio の書き込み量・将来のファイル分割に対して保守的に総量で制限する）
+total_size_bytes=$((size_bytes * numjobs))
+if [ "$total_size_bytes" -gt "$MAX_TOTAL_SIZE_BYTES" ]; then
+  err "invalid-input" "--size x --numjobs (${size} x ${numjobs} = ${total_size_bytes} bytes) exceeds the ${MAX_TOTAL_SIZE_BYTES}-byte total cap"
   exit 2
 fi
 
@@ -332,6 +371,29 @@ convert_jq_program='
 def is_finite_positive_number:
   (type == "number") and (isnan | not) and (isinfinite | not) and (. > 0);
 
+# fio の size 文字列（`256m`・`256M`・`268435456` 等）をバイト数へ。kb_base の既定
+# （1024）前提で k/m/g のみ受け付け、それ以外の書式（`256MiB`・`1t`・小数等）は null
+# （＝不一致として拒否）にする。
+def fio_size_bytes:
+  if type != "string" then null
+  else (capture("^(?<n>[1-9][0-9]{0,11})(?<u>[kKmMgG]?)$") // null) as $c
+  | if $c == null then null
+    else ($c.n | tonumber) * ({"": 1, "k": 1024, "m": 1048576, "g": 1073741824}[$c.u | ascii_downcase])
+    end
+  end;
+
+# fio の runtime 文字列（`30`・`30s`）を秒数へ。それ以外の単位（`1m` 等）は null。
+def fio_runtime_secs:
+  if type != "string" then null
+  else (capture("^(?<n>[1-9][0-9]{0,5})s?$") // null) as $c
+  | if $c == null then null else ($c.n | tonumber) end
+  end;
+
+# 値なしフラグ（time_based・group_reporting）: fio は値なしを空文字列で記録する。
+# `=1` は有効、`=0` は無効化なので拒否する。
+def fio_flag_enabled:
+  (type == "string") and (. == "" or . == "1");
+
 ($ff[0]) as $doc
 | if ($ff | length) != 1 then error("fio output must contain exactly one JSON document") else . end
 | if (($doc | type) != "object") then error("fio output must be a JSON object") else . end
@@ -344,10 +406,76 @@ def is_finite_positive_number:
 | if ($major < 3) then
     error("unsupported fio version \($fv): fio 3.x or later is required (lat_ns/clat_ns output keys)")
   else . end
-| if (($doc.jobs | type) != "array") or (($doc.jobs | length) < 1) then
-    error("fio output must contain a non-empty \"jobs\" array")
+| if (($doc.jobs | type) != "array") or (($doc.jobs | length) != 1) then
+    error("fio output must contain exactly one entry in \"jobs\" (run with --group_reporting and a single job section)")
   else . end
-| ($doc.jobs[0].write) as $w
+| ($doc.jobs[0]) as $job
+| if (($job | type) != "object") then error("jobs[0] must be an object") else . end
+| if ($job.jobname != $expect.jobname) then
+    error("jobs[0].jobname must be \"\($expect.jobname)\" (got \($job.jobname | tojson))")
+  else . end
+| if ($job.error != 0) then
+    error("jobs[0].error must be present and 0 (got \($job.error | tojson))")
+  else . end
+# 実行条件の検証（IO-8: fio_randwrite_4k_* の名前で出してよいのは 4K ランダム write の
+# 条件で実行された結果だけ）。global options に job options を上書きした実効値で判定する。
+| ($doc["global options"] // {}) as $gopts
+| if (($gopts | type) != "object") then error("\"global options\" must be an object") else . end
+| ($job["job options"]) as $jopts
+| if (($jopts | type) != "object") then
+    error("jobs[0][\"job options\"] is missing: cannot verify that the run used the 4K random write conditions")
+  else . end
+| ($gopts + $jopts) as $o
+| (["name", "directory", "filename", "rw", "bs", "ioengine", "direct", "size", "runtime",
+    "time_based", "iodepth", "numjobs", "end_fsync", "group_reporting"]) as $allowed
+| (($o | keys) - $allowed) as $unexpected
+| if ($unexpected | length) > 0 then
+    error("unexpected fio options (only the options passed in run mode are accepted): \($unexpected | join(", "))")
+  else . end
+| (($o | to_entries | map(select(.value | type != "string")) | map(.key))) as $nonstring
+| if ($nonstring | length) > 0 then
+    error("fio options must be strings: \($nonstring | join(", "))")
+  else . end
+| if (($o | has("name")) and ($o.name != $expect.jobname)) then
+    error("fio option name must be \"\($expect.jobname)\" (got \($o.name | tojson))")
+  else . end
+| if ($o.rw != "randwrite") then
+    error("fio option rw must be \"randwrite\" (got \($o.rw | tojson))")
+  else . end
+| if (($o.bs | IN("4k", "4K", "4096")) | not) then
+    error("fio option bs must be 4k (\"4k\", \"4K\" or \"4096\"; got \($o.bs | tojson))")
+  else . end
+| if ($o.ioengine != "psync") then
+    error("fio option ioengine must be \"psync\" (got \($o.ioengine | tojson))")
+  else . end
+| if ($o.filename != $expect.filename) then
+    error("fio option filename must be \"\($expect.filename)\" (got \($o.filename | tojson))")
+  else . end
+| if ($o.end_fsync != "1") then
+    error("fio option end_fsync must be \"1\" (got \($o.end_fsync | tojson))")
+  else . end
+| if (($o.time_based | fio_flag_enabled) | not) then
+    error("fio option time_based must be enabled (got \($o.time_based | tojson))")
+  else . end
+| if (($o.group_reporting | fio_flag_enabled) | not) then
+    error("fio option group_reporting must be enabled (got \($o.group_reporting | tojson))")
+  else . end
+| if ($o.direct != $expect.direct) then
+    error("fio option direct must match --direct \($expect.direct) (got \($o.direct | tojson))")
+  else . end
+| if ($o.iodepth != $expect.iodepth) then
+    error("fio option iodepth must match --iodepth \($expect.iodepth) (got \($o.iodepth | tojson))")
+  else . end
+| if ($o.numjobs != $expect.numjobs) then
+    error("fio option numjobs must match --numjobs \($expect.numjobs) (got \($o.numjobs | tojson))")
+  else . end
+| if (($o.size | fio_size_bytes) != $expect.size_bytes) then
+    error("fio option size must match --size \($expect.size) (\($expect.size_bytes) bytes; got \($o.size | tojson))")
+  else . end
+| if (($o.runtime | fio_runtime_secs) != $expect.runtime) then
+    error("fio option runtime must match --runtime \($expect.runtime) seconds (got \($o.runtime | tojson))")
+  else . end
+| ($job.write) as $w
 | if (($w | type) != "object") then error("jobs[0].write is missing or not an object") else . end
 | if (($w.lat_ns | type) != "object") then
     error("jobs[0].write.lat_ns is missing (fio 2.x \"lat\" output is not supported)")
@@ -402,6 +530,7 @@ convert_fio_json() {
     --arg label "$label" \
     --arg target_kind "$target_kind" \
     --argjson params "$params_json" \
+    --argjson expect "$expect_json" \
     --slurpfile ff "$fio_json_path" \
     "$convert_jq_program" 2>&1); then
     err "invalid-input" "$out"
@@ -433,6 +562,51 @@ params_json=$(jq -n \
     runtime: $runtime, iodepth: $iodepth, numjobs: $numjobs,
     end_fsync: $end_fsync, group_reporting: $group_reporting, filename: $filename}')
 
+# fio JSON の実行条件の照合値（convert_jq_program の $expect）。params と同じ入力から
+# 作り、run・--from-json の両モードで同じ照合をかける（出力の params が元の fio 実行
+# 条件と一致することの保証）。fio は値を入力文字列のまま記録するため direct・iodepth・
+# numjobs は文字列で、size・runtime は正規化後の数値で比較する。
+expect_json=$(jq -n \
+  --arg jobname "$FIO_JOB_NAME" \
+  --arg filename "$FIXED_FILENAME" \
+  --arg direct "$direct" \
+  --arg iodepth "$iodepth" \
+  --arg numjobs "$numjobs" \
+  --arg size "$size" \
+  --argjson size_bytes "$size_bytes" \
+  --argjson runtime "$runtime" \
+  '{jobname: $jobname, filename: $filename, direct: $direct, iodepth: $iodepth,
+    numjobs: $numjobs, size: $size, size_bytes: $size_bytes, runtime: $runtime}')
+
+# 変換結果を出す。--output を先に書き、失敗したら stdout には何も出さず exit 2 に
+# する（呼び出し元は exit 0 のときだけ stdout を結果として読む前提）。
+emit_result() {
+  local result="$1"
+  if [ -n "$output_path" ]; then
+    write_output_file "$result"
+  fi
+  printf '%s\n' "$result"
+}
+
+# 変換対象 JSON のサイズ上限検証（DoS 防止。--from-json の入力と run モードの fio
+# 出力の両方に同じ上限を課す）。
+# `wc -c` 自体の失敗（読み取り権限なし等）を `set -e`/`pipefail` に丸投げすると
+# `wc` 由来の終了コード（多くは 1）がそのままスクリプトの終了コードになり、
+# 「fio 実行失敗」（exit 1）と誤認する。ここで捕捉し、契約どおり入力エラー
+# （exit 2）として扱う（check-bench-regression.sh の check_input_file と同方針）。
+check_json_size() {
+  local path="$1"
+  local bytes
+  if ! bytes=$(wc -c <"$path" 2>/dev/null | tr -d ' '); then
+    err "invalid-input" "$path could not be read"
+    exit 2
+  fi
+  if [ "$bytes" -gt "$MAX_FROM_JSON_BYTES" ]; then
+    err "invalid-input" "$path exceeds ${MAX_FROM_JSON_BYTES} bytes"
+    exit 2
+  fi
+}
+
 if [ "$mode" = "from-json" ]; then
   check_symlink_reject "$from_json"
   if [ ! -e "$from_json" ]; then
@@ -443,24 +617,10 @@ if [ "$mode" = "from-json" ]; then
     err "invalid-input" "$from_json is not a regular file"
     exit 2
   fi
-  # `wc -c` 自体の失敗（読み取り権限なし等）を `set -e`/`pipefail` に丸投げすると
-  # `wc` 由来の終了コード（多くは 1）がそのままスクリプトの終了コードになり、
-  # 「fio 実行失敗」（exit 1）と誤認する。ここで捕捉し、契約どおり入力エラー
-  # （exit 2）として扱う（check-bench-regression.sh の check_input_file と同方針）。
-  if ! from_json_size=$(wc -c <"$from_json" 2>/dev/null | tr -d ' '); then
-    err "invalid-input" "$from_json could not be read"
-    exit 2
-  fi
-  if [ "$from_json_size" -gt "$MAX_FROM_JSON_BYTES" ]; then
-    err "invalid-input" "$from_json exceeds ${MAX_FROM_JSON_BYTES} bytes"
-    exit 2
-  fi
+  check_json_size "$from_json"
 
   result=$(convert_fio_json "$from_json" "from_json" "$params_json")
-  printf '%s\n' "$result"
-  if [ -n "$output_path" ]; then
-    write_output_file "$result"
-  fi
+  emit_result "$result"
   exit 0
 fi
 
@@ -553,7 +713,7 @@ if ! run_dir=$(mktemp -d "${target_dir_real}/fandhe-fio-randwrite-4k.XXXXXXXXXX"
 fi
 
 fio_args=(
-  --name=fandhe-fio-randwrite-4k
+  --name="$FIO_JOB_NAME"
   --directory="$run_dir"
   --filename="$FIXED_FILENAME"
   --rw=randwrite
@@ -592,9 +752,14 @@ if [ "$fio_rc" -ne 0 ]; then
   exit 1
 fi
 
-result=$(convert_fio_json "$fio_out_json" "run" "$params_json")
-printf '%s\n' "$result"
-if [ -n "$output_path" ]; then
-  write_output_file "$result"
+# fio が exit 0 でも出力 JSON を書いていなければ fio 側の失敗（exit 1）として扱う
+# （そのまま jq に渡すとスキーマ不正の exit 2 に誤分類される）。
+if [ ! -f "$fio_out_json" ] || [ ! -s "$fio_out_json" ]; then
+  err "fio-failed" "fio exited successfully but did not write its JSON output"
+  exit 1
 fi
+check_json_size "$fio_out_json"
+
+result=$(convert_fio_json "$fio_out_json" "run" "$params_json")
+emit_result "$result"
 exit 0

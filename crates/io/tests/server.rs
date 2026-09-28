@@ -29,14 +29,25 @@ mod unix {
 
     impl TempSocketDir {
         fn new() -> Self {
+            Self::with_mode(0o700)
+        }
+
+        /// `mode` で作成する。`DirBuilder::mode` は `mkdir(2)` 相当であり
+        /// プロセスの umask でマスクされるため（実測: umask 022 環境では
+        /// `mode(0o777)` で作っても実効モードが `0o755` になり、意図した
+        /// world-writable な検証にならない）、作成直後に `set_permissions` で
+        /// umask の影響を受けない実効モードを明示的に確定させる。
+        fn with_mode(mode: u32) -> Self {
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let pid = std::process::id();
             let dir = std::env::temp_dir().join(format!("fcio-{pid}-{n}"));
             std::fs::DirBuilder::new()
-                .mode(0o700)
+                .mode(mode)
                 .create(&dir)
-                .expect("must be able to create a private temp dir for the socket");
+                .expect("must be able to create a temp dir for the socket");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))
+                .expect("must be able to force the exact directory mode regardless of umask");
             Self { path: dir }
         }
 
@@ -313,10 +324,22 @@ mod unix {
                 .expect("set_read_timeout must succeed");
             let mut buf = [0u8; 16];
             let mut client_stream = stream;
-            let n = client_stream.read(&mut buf).unwrap_or(usize::MAX);
-            // poison 後に server が何も書き込んでいないことを確認する
-            // （タイムアウト・EOF のいずれかであり、実データは届かない）。
-            assert_ne!(n, 0, "server must not write any bytes after being poisoned");
+            // poison 後に server が何も書き込んでいないことを確認する。
+            // 「タイムアウト（Err の WouldBlock/TimedOut）または EOF（Ok(0)）の
+            // いずれか」だけを許し、それ以外（実データが届く Ok(n>0) や他の
+            // エラー種別）は P1-3 契約違反として失敗させる（poison 後に
+            // 誤ってバイトが書き込まれるケースを検出できるようにする）。
+            match client_stream.read(&mut buf) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Ok(0) => {}
+                other => {
+                    panic!("server must not write any bytes after being poisoned, got {other:?}")
+                }
+            }
         });
 
         let mut connection = server
@@ -357,29 +380,35 @@ mod unix {
     }
 
     /// security.md（UDS 観点）: 親ディレクトリが group / other 書き込み可能な場合は
-    /// `bind` を `InvalidArgument` として拒否する。
+    /// `bind` を `InvalidArgument` として拒否する（umask 022・002・000 いずれの
+    /// 環境でも、`TempSocketDir::with_mode` が umask の影響を受けない実効モード
+    /// `0o777` を保証するため再現する）。
     #[test]
     fn io1_uds_bind_rejects_world_writable_parent() {
-        let parent = std::env::temp_dir().join(format!(
-            "fcio-ww-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock must be after the unix epoch")
-                .as_nanos()
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o777)
-            .create(&parent)
-            .expect("must be able to create a world-writable dir");
-        let path = parent.join("s.sock");
+        let dir = TempSocketDir::with_mode(0o777);
+        let path = dir.socket_path();
 
         let err = fandhe_container_io::UdsServer::bind(&path)
             .expect_err("bind under a world-writable parent must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
 
         assert!(!path.exists(), "no socket file must be created");
-        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// security.md（UDS 観点。項目 2・3 の回帰テスト）: 親ディレクトリが
+    /// `0o755`（group / other は書き込めないが read / search は許す）でも、
+    /// owner 以外への一切のアクセスを拒否する強化後の検証で `bind` を拒否する。
+    /// 強化前（`mode & 0o022`）はこのケースを通してしまっていた。
+    #[test]
+    fn io1_uds_bind_rejects_parent_readable_by_others() {
+        let dir = TempSocketDir::with_mode(0o755);
+        let path = dir.socket_path();
+
+        let err = fandhe_container_io::UdsServer::bind(&path)
+            .expect_err("bind under a 0o755 parent directory must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+
+        assert!(!path.exists(), "no socket file must be created");
     }
 
     /// security.md（UDS 観点）: bind 後のソケットファイルは mode 0600 であり、
@@ -397,6 +426,54 @@ mod unix {
 
         drop(server);
         assert!(!path.exists(), "socket file must be removed after drop");
+    }
+
+    /// REPAIR-5（項目 11）: 書き込みがブロックし続ける相手に対しては
+    /// `send_frame` がフレーム全体の期限で `Timeout` を返し（送信側の
+    /// `write_all_until` のタイムアウト経路）、その後は P1-3 により
+    /// `Unavailable` になる。
+    #[test]
+    fn repair5_uds_send_times_out_on_unresponsive_peer() {
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+        let server = fandhe_container_io::UdsServer::bind(&socket_path)
+            .expect("bind must succeed on a private, empty path");
+
+        let connect_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let stream = UnixStream::connect(&connect_path).expect("client must connect");
+            // 接続を保持したまま何も読まない。カーネルの送信バッファ（既定は
+            // 数百 KiB 程度）を溢れさせるには十分大きいペイロードが必要
+            // （send_frame のテスト側で 16 MiB を送る）。
+            std::thread::sleep(Duration::from_millis(900));
+            drop(stream);
+        });
+
+        let mut connection = server
+            .accept(test_timeout())
+            .expect("server must accept the client connection");
+
+        let big_payload = vec![0x5au8; 16 * 1024 * 1024];
+        let big_frame =
+            Frame::new(FrameKind::Write, big_payload).expect("large frame must construct");
+
+        let timeout = IoTimeout::new(Duration::from_millis(300)).expect("300ms must be valid");
+        let started = Instant::now();
+        let err = connection
+            .send_frame(&big_frame, timeout)
+            .expect_err("send to an unresponsive peer must time out");
+        let elapsed = started.elapsed();
+
+        assert_eq!(err.code(), IoErrorCode::Timeout);
+        assert!(elapsed >= Duration::from_millis(300), "elapsed={elapsed:?}");
+        assert!(elapsed <= Duration::from_secs(3), "elapsed={elapsed:?}");
+
+        let err = connection
+            .send_frame(&big_frame, test_timeout())
+            .expect_err("connection must be poisoned after a send timeout");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+
+        let _ = client_thread.join();
     }
 }
 

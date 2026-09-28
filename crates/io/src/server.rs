@@ -771,6 +771,28 @@ mod imp {
             assert!(remaining > Duration::ZERO);
             assert!(remaining <= Duration::from_secs(5));
         }
+
+        /// PLUG-12・security.md（項目 3・10 の回帰テスト）: uid が一致すれば
+        /// `check_socket_owner` は受理する。他ユーザーを実機で用意できないため、
+        /// uid の比較ロジックを具体値で確かめる純粋関数のテストに留める
+        /// （`server.rs` モジュール doc「範囲外」節）。
+        #[test]
+        fn plug12_check_socket_owner_accepts_matching_uid() {
+            check_socket_owner(1000, 1000).expect("matching uid must be accepted");
+        }
+
+        /// PLUG-12・security.md（項目 3・10 の回帰テスト）: uid が不一致なら
+        /// `InvalidArgument` で拒否し、両方の uid を message に含める
+        /// （デバッグ容易性。秘密情報ではないため security.md の情報漏えい観点には
+        /// 抵触しない）。
+        #[test]
+        fn plug12_check_socket_owner_rejects_mismatched_uid() {
+            let err = check_socket_owner(1000, 0)
+                .expect_err("a socket owned by a different uid than the parent must be rejected");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+            assert!(err.message().contains("1000"));
+            assert!(err.message().contains('0'));
+        }
     }
 }
 

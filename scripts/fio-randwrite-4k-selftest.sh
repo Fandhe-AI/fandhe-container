@@ -404,6 +404,8 @@ for a in "$@"; do
     --*) opts=$(jq -c --arg k "${a#--}" '. + {($k): ""}' <<<"$opts") ;;
   esac
 done
+# 受け取った --output（fio の JSON 出力先。一時ディレクトリの中）を記録する
+[ -n "${FIO_STUB_OUT_LOG:-}" ] && echo "$out" >"$FIO_STUB_OUT_LOG"
 # 受け取った --directory を記録する（書き込み先が専用サブディレクトリであることの照合用）
 [ -n "${FIO_STUB_DIR_LOG:-}" ] && echo "$dir" >"$FIO_STUB_DIR_LOG"
 # 実 fio と同じく、データファイルを symlink をたどる形（O_CREAT・O_EXCL なし）で書く
@@ -786,6 +788,72 @@ FIO_STUB_OPTS_LOG="$nt_opts_log" PATH="$stub_path" run_case "run-without-time-ba
   --target-dir "$nt_target" --label x --runtime 5 --output "$nt_out"
 check_json_value "run-fio-args-have-no-time-based" "$nt_opts_log" 'has("time_based")' 'false'
 check_json_value "run-fio-args-runtime-and-size" "$nt_opts_log" '[.runtime, .size, .numjobs]' '["5", "256m", "1"]'
+
+# 計測データ（run モードの専用サブディレクトリ）を後始末で削除できなければ、残った
+# パスを出して exit 4 で終わる（Codex P1。大容量のデータが黙って残るのを防ぐ）。
+# rm スタブ（失敗する・成功を装って何も消さない）で再現する。本来の終了コードが
+# 非ゼロ（fio の出力が条件不一致で exit 2）でも exit 4 を優先し、元の値も出す。
+rm_noop_bin="${tmp_root}/rm-noop-bin"
+mkdir -p "$rm_noop_bin"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${rm_noop_bin}/rm"
+chmod +x "${rm_noop_bin}/rm"
+data_left_tmp="${tmp_root}/data-left-tmpdir"
+mkdir -p "$data_left_tmp"
+for variant in fail noop; do
+  if [ "$variant" = fail ]; then
+    variant_bin="$rm_fail_bin"
+  else
+    variant_bin="$rm_noop_bin"
+  fi
+  data_left_target="${tmp_root}/data-left-target-${variant}"
+  mkdir -p "$data_left_target"
+  TMPDIR="$data_left_tmp" PATH="${variant_bin}:${stub_path}" run_case_msg "run-data-cleanup-${variant}-exits-4" 4 \
+    "could not remove benchmark data (up to --size bytes may remain): ${data_left_target}/fandhe-fio-randwrite-4k." \
+    --target-dir "$data_left_target" --label x --runtime 5
+  data_left_count=$(count_entries "$data_left_target" -mindepth 2 -name fandhe-fio-randwrite-4k.dat)
+  if is_count "$data_left_count" 1; then
+    echo "PASS: run-data-cleanup-${variant}-data-really-left"
+  else
+    echo "FAIL: run-data-cleanup-${variant}-data-really-left (expected 1 leftover data file, found ${data_left_count})" >&2
+    failures=$((failures + 1))
+  fi
+done
+data_left_failed_target="${tmp_root}/data-left-target-failed-run"
+mkdir -p "$data_left_failed_target"
+TMPDIR="$data_left_tmp" FIO_STUB_OVERRIDE_OPTS='{"rw":"randrw"}' PATH="${rm_fail_bin}:${stub_path}" \
+  run_case_msg "run-data-cleanup-fail-overrides-exit-2" 4 "the run had already failed with exit status 2" \
+  --target-dir "$data_left_failed_target" --label x --runtime 5
+
+# 一時ディレクトリは TMPDIR を先に実体へ解決・検証し、その下に mktemp -d したパスを
+# そのまま使う（Cursor Medium）。TMPDIR が symlink 経由でも、fio の JSON 出力先は
+# 実体側の fandhe-fio-bench.XXXXXXXXXX の中になる
+tmpdir_real="${tmp_root}/tmpdir-real"
+mkdir -p "$tmpdir_real"
+ln -s "$tmpdir_real" "${tmp_root}/tmpdir-link"
+tmpdir_target="${tmp_root}/tmpdir-target"
+mkdir -p "$tmpdir_target"
+out_log="${tmp_root}/fio-stub-out.log"
+TMPDIR="${tmp_root}/tmpdir-link" FIO_STUB_OUT_LOG="$out_log" PATH="$stub_path" run_case "run-tmpdir-through-symlink" 0 \
+  --target-dir "$tmpdir_target" --label x --runtime 5
+stub_out=$(cat -- "$out_log" 2>/dev/null || true)
+case "$stub_out" in
+  "${tmpdir_real}"/fandhe-fio-bench.??????????/*)
+    echo "PASS: run-tmpdir-resolved-before-mktemp (${stub_out})"
+    ;;
+  *)
+    echo "FAIL: run-tmpdir-resolved-before-mktemp (fio --output was '${stub_out}', expected under ${tmpdir_real}/fandhe-fio-bench.XXXXXXXXXX/)" >&2
+    failures=$((failures + 1))
+    ;;
+esac
+tmpdir_leftover=$(count_entries "$tmpdir_real" -mindepth 1)
+if is_count "$tmpdir_leftover" 0; then
+  echo "PASS: run-tmpdir-cleaned-up"
+else
+  echo "FAIL: run-tmpdir-cleaned-up (found ${tmpdir_leftover} entries under ${tmpdir_real})" >&2
+  failures=$((failures + 1))
+fi
+TMPDIR="${tmp_root}/no-such-tmpdir" run_case_msg "from-json-missing-tmpdir" 2 "temporary (TMPDIR) directory could not be resolved" \
+  --from-json "${fixtures_dir}/fio-3-ok.json" --label x
 
 # 変換対象 JSON のスナップショット（snapshot_json_input）の単体照合。検証後の差し替え
 # （FIFO・デバイス）は起動経路からは決定的に再現できないため、対象スクリプトから関数

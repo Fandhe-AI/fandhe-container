@@ -30,6 +30,16 @@
 //! ブロックする I/O を行わない（[`crate::observe::ServerObserver`] のドキュメント
 //! 参照）。
 //!
+//! # 受信上限（[`crate::recv_limits::ReceiveLimits`]。F・#820 codex P1 指摘対応）
+//!
+//! [`UdsServer::bind`] は検証済みの [`crate::recv_limits::ReceiveLimits`] を
+//! 構築時の必須引数として受け取り、[`UdsServer::accept`] が返す
+//! [`UdsConnection`] へそのまま引き継ぐ。`recv_frame`（`imp::ConnectionInner`）は
+//! この受け取った上限を使い、`ReceiveLimits::default()` を暗黙に使うことはない。
+//! これにより、呼び出し側が [`crate::batch::BatchConfig::with_max_bytes`] 等で
+//! 既定値より小さい上限を設定した場合、その設定が実際の UDS 受信経路（本体
+//! バッファの確保前検証）へ確実に反映される。
+//!
 //! # peer credential の検証（PLUG-12・security.md「UDS は所有者・権限・
 //! symlink を検証してから bind し、別 UID からの接続は peer credential 検証で
 //! 切断する」。E・#820 codex P0 指摘対応）
@@ -102,6 +112,7 @@ use std::time::{Duration, Instant};
 use crate::error::{IoError, IoErrorCode};
 use crate::observe::{SendEventError, ServerEvent, ServerObserver, ServerOp, ServerOutcome};
 use crate::protocol::{Frame, FrameKind};
+use crate::recv_limits::ReceiveLimits;
 use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
 
 /// [`imp::ServerInner::accept`] の結果に、受付ループ内で再試行した回数
@@ -140,9 +151,14 @@ struct RecvAttempt {
 /// `O: ServerObserver` は [`Self::bind`] が受け取る必須の観測フックで、
 /// [`Self::accept`] のイベント（[`crate::observe::ServerOp::Accept`]）を
 /// 通知する（モジュール doc「観測」節参照）。
+///
+/// `limits`（[`crate::recv_limits::ReceiveLimits`]）は [`Self::bind`] が受け取る
+/// 必須引数で、[`Self::accept`] が返す各 [`UdsConnection`] へそのまま引き継がれる
+/// （モジュール doc「受信上限」節参照。F・#820 codex P1 指摘対応）。
 pub struct UdsServer<O: ServerObserver> {
     inner: imp::ServerInner,
     observer: O,
+    limits: ReceiveLimits,
 }
 
 impl<O: ServerObserver> core::fmt::Debug for UdsServer<O> {
@@ -169,6 +185,11 @@ impl<O: ServerObserver> UdsServer<O> {
     /// 不一致ならソケットファイルを片付けてから拒否する。検証後はソケット
     /// ファイルを `0600` にし、listener を非ブロッキングにする。
     ///
+    /// `limits` は [`Self::accept`] が返す各接続の `recv_frame` が使う受信上限で、
+    /// 必須引数である（モジュール doc「受信上限」節参照。F・#820 codex P1
+    /// 指摘対応。既定の上限で良い場合は呼び出し元が
+    /// [`crate::recv_limits::ReceiveLimits::default`] を明示的に渡す）。
+    ///
     /// `observer` は [`Self::accept`] が通知する Accept イベントの送り先で、
     /// 必須引数である（観測しない場合は [`crate::observe::NoopServerObserver`]
     /// を明示的に渡す。モジュール doc「観測」節参照）。bind 自体は
@@ -183,10 +204,11 @@ impl<O: ServerObserver> UdsServer<O> {
     /// ソケットファイルの実効モードは umask 依存になる。親ディレクトリを
     /// owner 専用（`0700` 以下）にする検証が実質的な防壁であり、この窓の
     /// 間に到達できるのは親ディレクトリを辿れる者（＝ owner 本人）に限られる。
-    pub fn bind(path: &Path, observer: O) -> Result<Self, IoError> {
+    pub fn bind(path: &Path, limits: ReceiveLimits, observer: O) -> Result<Self, IoError> {
         Ok(Self {
             inner: imp::ServerInner::bind(path)?,
             observer,
+            limits,
         })
     }
 
@@ -235,6 +257,7 @@ impl<O: ServerObserver> UdsServer<O> {
             inner,
             poisoned: false,
             observer: conn_observer,
+            limits: self.limits,
         })
     }
 
@@ -272,10 +295,15 @@ impl<O: ServerObserver> UdsServer<O> {
 /// `C: ServerObserver` は [`UdsServer::accept`] から受け取る必須の観測フックで、
 /// `send_frame` / `recv_frame` のすべての分岐（成功・poison による拒否・
 /// その他の失敗）を通知する（モジュール doc「観測」節参照）。
+///
+/// `limits` は [`UdsServer::bind`] で渡された受信上限をそのまま引き継いだもので、
+/// `recv_frame` が本体バッファ確保前の受理判定（`ReceiveLimits::admit`）に使う
+/// （モジュール doc「受信上限」節参照。F・#820 codex P1 指摘対応）。
 pub struct UdsConnection<C: ServerObserver> {
     inner: imp::ConnectionInner,
     poisoned: bool,
     observer: C,
+    limits: ReceiveLimits,
 }
 
 impl<C: ServerObserver> core::fmt::Debug for UdsConnection<C> {
@@ -403,7 +431,7 @@ impl<C: ServerObserver> FrameReceiver for UdsConnection<C> {
             return Err(err);
         }
         let started = Instant::now();
-        let attempt = self.inner.recv_frame(timeout);
+        let attempt = self.inner.recv_frame(timeout, self.limits);
         let elapsed = started.elapsed();
         match &attempt.result {
             Ok(frame) => self.notify_success(ServerOp::Recv, Some(frame.kind()), elapsed),
@@ -852,7 +880,18 @@ mod imp {
         /// へ持ち帰り、[`crate::observe::ServerEvent::kind`] に載せられるように
         /// する。ヘッダ自体の読み込み・検証に失敗した場合は種別が確定しないため
         /// `None` のままにする。
-        pub(super) fn recv_frame(&mut self, timeout: IoTimeout) -> super::RecvAttempt {
+        ///
+        /// # `limits` の出どころ（F・#820 codex P1 指摘対応）
+        /// `limits` は [`super::UdsServer::bind`] が受け取った検証済みの
+        /// [`ReceiveLimits`] を [`super::UdsServer::accept`]・
+        /// [`super::UdsConnection`] 経由でそのまま引き継いだもの。本関数は
+        /// `ReceiveLimits::default()` を暗黙に使わない（呼び出し側が設定した
+        /// 上限が、本体バッファ確保前の受理判定に確実に反映される）。
+        pub(super) fn recv_frame(
+            &mut self,
+            timeout: IoTimeout,
+            limits: ReceiveLimits,
+        ) -> super::RecvAttempt {
             let deadline = Instant::now() + timeout.as_duration();
 
             let mut header_bytes = [0u8; FRAME_HEADER_LEN];
@@ -885,7 +924,7 @@ mod imp {
                     kind: Some(kind),
                 };
             }
-            let admitted = match ReceiveLimits::default().admit(header, 0) {
+            let admitted = match limits.admit(header, 0) {
                 Ok(admitted) => admitted,
                 Err(e) => {
                     return super::RecvAttempt {
@@ -1294,6 +1333,7 @@ mod imp {
 
     use crate::error::{IoError, IoErrorCode};
     use crate::protocol::Frame;
+    use crate::recv_limits::ReceiveLimits;
     use crate::transport::IoTimeout;
 
     #[derive(Debug)]
@@ -1328,7 +1368,11 @@ mod imp {
             match *self {}
         }
 
-        pub(super) fn recv_frame(&mut self, _timeout: IoTimeout) -> super::RecvAttempt {
+        pub(super) fn recv_frame(
+            &mut self,
+            _timeout: IoTimeout,
+            _limits: ReceiveLimits,
+        ) -> super::RecvAttempt {
             match *self {}
         }
     }

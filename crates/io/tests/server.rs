@@ -17,7 +17,7 @@ mod unix {
 
     use fandhe_container_io::{
         Frame, FrameKind, FrameReceiver, FrameSender, IoErrorCode, IoTimeout,
-        JsonLinesServerObserver, MAX_CONTROL_PAYLOAD_LEN, NoopServerObserver,
+        JsonLinesServerObserver, MAX_CONTROL_PAYLOAD_LEN, NoopServerObserver, ReceiveLimits,
     };
 
     /// テストごとに固有かつ短いソケットディレクトリを作る（macOS の
@@ -74,8 +74,12 @@ mod unix {
     fn io1_uds_roundtrip_single_frame() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let mut server = fandhe_container_io::UdsServer::bind(&socket_path, NoopServerObserver)
-            .expect("bind must succeed on a private, empty path");
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &socket_path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
 
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
@@ -139,9 +143,12 @@ mod unix {
     #[test]
     fn io1_uds_accept_times_out_without_client() {
         let dir = TempSocketDir::new();
-        let mut server =
-            fandhe_container_io::UdsServer::bind(&dir.socket_path(), NoopServerObserver)
-                .expect("bind must succeed on a private, empty path");
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &dir.socket_path(),
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
 
         let timeout = IoTimeout::new(Duration::from_millis(300)).expect("300ms must be valid");
         let started = Instant::now();
@@ -161,8 +168,12 @@ mod unix {
     fn repair5_uds_recv_times_out_on_silent_peer() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let mut server = fandhe_container_io::UdsServer::bind(&socket_path, NoopServerObserver)
-            .expect("bind must succeed on a private, empty path");
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &socket_path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
 
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
@@ -203,8 +214,12 @@ mod unix {
     fn repair5_uds_recv_times_out_on_trickling_peer() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let mut server = fandhe_container_io::UdsServer::bind(&socket_path, NoopServerObserver)
-            .expect("bind must succeed on a private, empty path");
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &socket_path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
 
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let connect_path = socket_path.clone();
@@ -251,8 +266,12 @@ mod unix {
     fn io1_uds_recv_rejects_corrupted_header() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let mut server = fandhe_container_io::UdsServer::bind(&socket_path, NoopServerObserver)
-            .expect("bind must succeed on a private, empty path");
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &socket_path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
 
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
@@ -300,8 +319,12 @@ mod unix {
     fn io1_uds_recv_reports_unavailable_on_peer_close() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let mut server = fandhe_container_io::UdsServer::bind(&socket_path, NoopServerObserver)
-            .expect("bind must succeed on a private, empty path");
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &socket_path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
 
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
@@ -328,8 +351,12 @@ mod unix {
     fn io1_uds_recv_rejects_oversized_control_frame_before_body_read() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let mut server = fandhe_container_io::UdsServer::bind(&socket_path, NoopServerObserver)
-            .expect("bind must succeed on a private, empty path");
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &socket_path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
 
         let connect_path = socket_path.clone();
         let oversized_len = MAX_CONTROL_PAYLOAD_LEN as usize + 1;
@@ -368,6 +395,61 @@ mod unix {
         let _ = client_thread.join();
     }
 
+    /// F・#820（codex P1 指摘対応）: `UdsServer::bind` に構築時に渡した
+    /// [`ReceiveLimits`] が、`ReceiveLimits::default()` ではなく実際に
+    /// `recv_frame` の確保前検証へ反映される。既定値より小さい上限を設定した
+    /// `Write` フレームは、本体バッファを確保する前に `ResourceExhausted` で
+    /// 拒否される（既定の `MAX_PAYLOAD_LEN` に収まる長さでも、設定した小さい
+    /// 上限では拒否されることを確認する）。
+    #[test]
+    fn f_820_uds_recv_honors_receive_limits_passed_to_bind() {
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+        let small_limits = ReceiveLimits::new(8, 8).expect("8 bytes must be a valid limit");
+        let mut server =
+            fandhe_container_io::UdsServer::bind(&socket_path, small_limits, NoopServerObserver)
+                .expect("bind must succeed on a private, empty path");
+
+        let connect_path = socket_path.clone();
+        // 既定の MAX_PAYLOAD_LEN には遠く及ばないが、上で設定した上限（8
+        // バイト）は超える長さ。
+        let oversized_len = 9usize;
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&connect_path).expect("client must connect");
+            let frame = Frame::new(FrameKind::Write, vec![0u8; oversized_len])
+                .expect("payload within MAX_PAYLOAD_LEN must construct a Frame");
+            // ヘッダだけ書き切れば admit の判定には十分（本体を待たずに拒否
+            // されるはずのため、本体は送らずに接続を保持する）。
+            let encoded = frame.encode();
+            let header = encoded
+                .get(..fandhe_container_io::FRAME_HEADER_LEN)
+                .expect("encoded frame must contain a full header");
+            stream
+                .write_all(header)
+                .expect("client header write must succeed");
+            std::thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        });
+
+        let mut connection = server
+            .accept(test_timeout(), NoopServerObserver)
+            .expect("server must accept the client connection");
+
+        let err = connection.recv_frame(test_timeout()).expect_err(
+            "a Write frame over the bind-time configured limit must be rejected before the \
+             body is read",
+        );
+        assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+        assert!(err.message().contains('8'));
+
+        let err = connection
+            .recv_frame(test_timeout())
+            .expect_err("a poisoned connection must not be reused for recv");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+
+        let _ = client_thread.join();
+    }
+
     /// IO-1・REPAIR-2（#820 レビュー指摘）: サーバー側はクライアントから
     /// `Ack` フレームを受け取ることを想定していない（サーバーが `Ack` を返す側）。
     /// `recv_frame` は本体を読む前に `InvalidArgument` で拒否し、その後は P1-3
@@ -376,8 +458,12 @@ mod unix {
     fn io1_uds_recv_rejects_client_originated_ack_frame() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let mut server = fandhe_container_io::UdsServer::bind(&socket_path, NoopServerObserver)
-            .expect("bind must succeed on a private, empty path");
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &socket_path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
 
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
@@ -414,8 +500,12 @@ mod unix {
     fn io1_uds_recv_rejects_client_originated_flush_ack_frame() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let mut server = fandhe_container_io::UdsServer::bind(&socket_path, NoopServerObserver)
-            .expect("bind must succeed on a private, empty path");
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &socket_path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
 
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
@@ -453,8 +543,12 @@ mod unix {
     fn p1_3_uds_connection_unavailable_after_error() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let mut server = fandhe_container_io::UdsServer::bind(&socket_path, NoopServerObserver)
-            .expect("bind must succeed on a private, empty path");
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &socket_path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
 
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
@@ -512,8 +606,12 @@ mod unix {
         let path = dir.socket_path();
         std::fs::write(&path, b"not a socket").expect("must be able to create a placeholder file");
 
-        let err = fandhe_container_io::UdsServer::bind(&path, NoopServerObserver)
-            .expect_err("bind onto an existing path must be rejected");
+        let err = fandhe_container_io::UdsServer::bind(
+            &path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect_err("bind onto an existing path must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
 
         let contents = std::fs::read(&path).expect("the existing file must not be removed");
@@ -529,8 +627,12 @@ mod unix {
         let dir = TempSocketDir::with_mode(0o777);
         let path = dir.socket_path();
 
-        let err = fandhe_container_io::UdsServer::bind(&path, NoopServerObserver)
-            .expect_err("bind under a world-writable parent must be rejected");
+        let err = fandhe_container_io::UdsServer::bind(
+            &path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect_err("bind under a world-writable parent must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
 
         assert!(!path.exists(), "no socket file must be created");
@@ -545,8 +647,12 @@ mod unix {
         let dir = TempSocketDir::with_mode(0o755);
         let path = dir.socket_path();
 
-        let err = fandhe_container_io::UdsServer::bind(&path, NoopServerObserver)
-            .expect_err("bind under a 0o755 parent directory must be rejected");
+        let err = fandhe_container_io::UdsServer::bind(
+            &path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect_err("bind under a 0o755 parent directory must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
 
         assert!(!path.exists(), "no socket file must be created");
@@ -566,8 +672,12 @@ mod unix {
             .expect("must be able to create a symlinked parent directory");
         let path = link_dir.join("s.sock");
 
-        let err = fandhe_container_io::UdsServer::bind(&path, NoopServerObserver)
-            .expect_err("bind under a symlinked parent directory must be rejected");
+        let err = fandhe_container_io::UdsServer::bind(
+            &path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect_err("bind under a symlinked parent directory must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
 
         assert!(
@@ -596,8 +706,12 @@ mod unix {
         std::os::unix::fs::symlink(&target, &path)
             .expect("must be able to create a symlink at the socket path");
 
-        let err = fandhe_container_io::UdsServer::bind(&path, NoopServerObserver)
-            .expect_err("bind onto an existing symlink must be rejected");
+        let err = fandhe_container_io::UdsServer::bind(
+            &path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect_err("bind onto an existing symlink must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
 
         let meta =
@@ -614,8 +728,12 @@ mod unix {
     fn io1_uds_socket_file_mode_and_cleanup() {
         let dir = TempSocketDir::new();
         let path = dir.socket_path();
-        let server = fandhe_container_io::UdsServer::bind(&path, NoopServerObserver)
-            .expect("bind must succeed on a fresh path");
+        let server = fandhe_container_io::UdsServer::bind(
+            &path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a fresh path");
         assert_eq!(server.path(), path.as_path());
 
         let meta = std::fs::symlink_metadata(&path).expect("socket file must exist after bind");
@@ -633,8 +751,12 @@ mod unix {
     fn repair5_uds_send_times_out_on_unresponsive_peer() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let mut server = fandhe_container_io::UdsServer::bind(&socket_path, NoopServerObserver)
-            .expect("bind must succeed on a private, empty path");
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &socket_path,
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
 
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
@@ -685,9 +807,12 @@ mod unix {
     fn a3_uds_json_lines_server_observer_records_accept_recv_send_and_poison_events() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let mut server =
-            fandhe_container_io::UdsServer::bind(&socket_path, JsonLinesServerObserver::new())
-                .expect("bind must succeed on a private, empty path");
+        let mut server = fandhe_container_io::UdsServer::bind(
+            &socket_path,
+            ReceiveLimits::default(),
+            JsonLinesServerObserver::new(),
+        )
+        .expect("bind must succeed on a private, empty path");
 
         // 1 本目の接続: Write を受信し（Recv 成功）、Ack を送り返す（Send 成功）。
         let connect_path = socket_path.clone();
@@ -800,6 +925,7 @@ mod unix {
         let dir = TempSocketDir::new();
         let mut server = fandhe_container_io::UdsServer::bind(
             &dir.socket_path(),
+            ReceiveLimits::default(),
             JsonLinesServerObserver::new(),
         )
         .expect("bind must succeed on a private, empty path");
@@ -831,10 +957,14 @@ mod unix {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn io1_uds_bind_unimplemented_on_unsupported_platform() {
-    use fandhe_container_io::{IoErrorCode, NoopServerObserver};
+    use fandhe_container_io::{IoErrorCode, NoopServerObserver, ReceiveLimits};
 
     let dir = std::env::temp_dir().join("fcio-unsupported-platform-test");
-    let err = fandhe_container_io::UdsServer::bind(&dir.join("s.sock"), NoopServerObserver)
-        .expect_err("unsupported platform must reject bind");
+    let err = fandhe_container_io::UdsServer::bind(
+        &dir.join("s.sock"),
+        ReceiveLimits::default(),
+        NoopServerObserver,
+    )
+    .expect_err("unsupported platform must reject bind");
     assert_eq!(err.code(), IoErrorCode::Unimplemented);
 }

@@ -829,7 +829,8 @@ pub struct ServerEvent<'a> {
     pub peer_credential_rejections: u32,
     /// [`ServerOutcome::RejectedPeerCredential`] の拒否で、接続元の uid が
     /// 取得できた場合の値（`crate::sys::peer_uid` が成功したが
-    /// `crate::sys::effective_uid` と不一致だった場合）。数値のみで秘密情報や
+    /// bind 時点で取得・保存した自プロセスの実効 uid〔`crate::sys::effective_uid`〕と
+    /// 不一致だった場合）。数値のみで秘密情報や
     /// untrusted な文字列を含まないため、message とは独立してそのまま観測
     /// イベントへ載せてよい（H1・#820 security-auditor 指摘対応）。取得自体に
     /// 失敗した場合・他の `op`/`outcome` では `None`。

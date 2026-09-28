@@ -16,8 +16,10 @@
 //!   `struct ucred`（pid・接続時点の実効 uid・gid）を取得する
 //! - macOS: `getpeereid(2)` で接続元の接続時点の実効 uid・gid を取得する
 //! - 両 OS 共通: `geteuid(2)` で自プロセスの実効 uid を取得する
-//!   （bind したプロセス自身の実効 uid。`crate::server::imp::check_socket_owner`
-//!   が親ディレクトリ所有者との照合に使う）
+//!   （`crate::server::imp::ServerInner::bind` が bind 前に 1 回だけ取得し、
+//!   `crate::server::imp::check_socket_owner` による親ディレクトリ所有者との
+//!   照合に使ったうえで保存し、accept ごとの peer credential 照合
+//!   〔`crate::server::imp::verify_peer_credential`〕の基準にする）
 //!
 //! # 「実 uid」ではなく「接続時点の実効 uid（euid）」（H2・#820
 //! security-auditor 指摘対応）
@@ -60,11 +62,14 @@ use crate::error::{IoError, IoErrorCode};
 /// [`io::Error::last_os_error`] を [`IoError`] へ変換する（本モジュール限定の
 /// ヘルパー。相手側〔untrusted〕由来の文字列は含まないため、そのまま
 /// `Display` した errno の説明文を使ってよい）。
+///
+/// errno はスレッドローカルで、後続の libc 呼び出し（`format!` のメモリ確保等）
+/// で上書きされうるため、関数の先頭で [`io::Error::last_os_error`] を確保して
+/// から使う（I3・#820 security-auditor 再監査指摘対応）。呼び出し元は syscall
+/// の戻り値を判定した直後、他の処理を挟まずにこの関数を呼ぶ。
 fn last_os_error_to_ioerror(context: &str) -> IoError {
-    IoError::new(
-        IoErrorCode::Internal,
-        format!("{context}: {}", io::Error::last_os_error()),
-    )
+    let err = io::Error::last_os_error();
+    IoError::new(IoErrorCode::Internal, format!("{context}: {err}"))
 }
 
 #[cfg(target_os = "linux")]

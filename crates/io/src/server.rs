@@ -52,9 +52,10 @@
 //! （euid）**（`crate::sys::peer_uid`。Linux は `SO_PEERCRED` が返す
 //! `struct ucred.uid`、macOS は `getpeereid(2)` が返す euid で、どちらも
 //! 「相手プロセスの実 uid」ではなく接続時点の euid を指す。H2・#820
-//! security-auditor 指摘対応）が自プロセスの実効 uid（`crate::sys::effective_uid`）
-//! と一致することを確かめる（`imp::verify_peer_credential`。Linux / macOS
-//! 限定の非公開関数）。接続元が user namespace の外側から見えている場合、
+//! security-auditor 指摘対応）が、[`UdsServer::bind`] の時点で 1 回だけ取得して
+//! 保存した自プロセスの実効 uid（`crate::sys::effective_uid`。accept のたびに
+//! 取り直さない。I2・#820 security-auditor 再監査指摘対応）と一致することを
+//! 確かめる（`imp::verify_peer_credential`。Linux / macOS 限定の非公開関数）。接続元が user namespace の外側から見えている場合、
 //! namespace 外の uid はマッピングを持たないため
 //! `overflowuid`（Linux の既定値 `65534`）として観測されることがあり、実効 uid と
 //! 一致せず拒否されうる（H2・#820 security-auditor 指摘対応。想定内の
@@ -215,12 +216,19 @@ impl<O: ServerObserver> UdsServer<O> {
     /// bind 前に親ディレクトリ（symlink でない・ディレクトリである・
     /// owner 以外に read / write / search のいずれも与えない）と `path` 自体
     /// （既存パスは拒否し、自動 unlink はしない）を検証する（security.md の
-    /// UDS 観点。fail-closed）。bind 直後には、作成されたソケットファイルの
-    /// 所有者（bind したプロセスの実効 uid と一致する）が親ディレクトリの
-    /// 所有者と一致することも確かめ（PLUG-12・`imp::check_socket_owner`。
-    /// Linux / macOS 限定の非公開関数）、
-    /// 不一致ならソケットファイルを片付けてから拒否する。検証後はソケット
-    /// ファイルを `0600` にし、listener を非ブロッキングにする。
+    /// UDS 観点。fail-closed）。同じく bind 前に、自プロセスの実効 uid
+    /// （bind で作られるソケットファイルの所有者になる uid）と親ディレクトリの
+    /// 所有者を照合し（PLUG-12・`imp::check_socket_owner`。Linux / macOS 限定の
+    /// 非公開関数）、不一致ならソケットファイルを作らずに
+    /// [`IoErrorCode::InvalidArgument`] で拒否する（I1・#820 security-auditor
+    /// 再監査指摘対応）。このとき取得した実効 uid は保存し、[`Self::accept`] の
+    /// peer credential 照合の基準にする（モジュール doc「peer credential の
+    /// 検証」節参照）。
+    ///
+    /// bind 後に行うのは、ソケットファイルの `0600` への chmod と listener の
+    /// 非ブロッキング化のみで、どちらかに失敗した場合に限り作成済みの
+    /// ソケットファイルを片付けてから（`imp::cleanup_socket_file`。削除直前に
+    /// ソケットのままであることを確かめる）エラーを返す。
     ///
     /// `limits` は [`Self::accept`] が返す各接続の `recv_frame` が使う受信上限で、
     /// 必須引数である（モジュール doc「受信上限」節参照。F・#820 codex P1
@@ -540,20 +548,34 @@ mod imp {
     pub(super) struct ServerInner {
         listener: UnixListener,
         path: PathBuf,
+        /// bind 時点で 1 回だけ取得した自プロセスの実効 uid
+        /// （`crate::sys::effective_uid`）。bind 前の親ディレクトリ所有者との照合
+        /// （[`check_socket_owner`]）と、accept ごとの peer credential 照合
+        /// （[`verify_peer_credential`]）の比較基準を同じ値に固定する（I1・I2・
+        /// #820 security-auditor 再監査指摘対応。bind 後に `seteuid` 等で実効 uid が
+        /// 変わっても、照合の基準は bind したときの主体のまま変わらない）。
+        effective_uid: u32,
     }
 
     impl ServerInner {
         pub(super) fn bind(path: &Path) -> Result<Self, IoError> {
-            let parent_uid = validate_parent_dir(path)?;
+            // I1・#820 security-auditor 再監査指摘対応: 実効 uid と親ディレクトリの
+            // 所有者の照合は bind より前（`validate_parent_dir` の中）で行い、
+            // 不一致なら何も作らずに拒否する。以前は bind 後に照合していたため、
+            // 不一致時に作成済みのソケットファイルを `cleanup_socket_file`
+            // （stat → unlink の 2 段階）で消す必要があり、その間に親ディレクトリを
+            // symlink へ差し替えられると意図しないパスを unlink しうる TOCTOU が
+            // あった（特に root 実行時）。
+            let effective_uid = crate::sys::effective_uid();
+            validate_parent_dir(path, effective_uid)?;
             reject_existing_path(path)?;
 
             let listener = UnixListener::bind(path).map_err(map_bind_error)?;
 
-            // bind 後の後始末（所有者検証・chmod・nonblocking 化）が失敗したら、
-            // 作成済みのソケットファイルを片付けてからエラーを返す（後始末自体の
-            // 失敗は握りつぶし、元のエラーを優先して返す。cleanup_socket_file
-            // 参照）。
-            if let Err(err) = finish_bind(&listener, path, parent_uid) {
+            // bind 後の後始末（chmod・nonblocking 化）が失敗したら、作成済みの
+            // ソケットファイルを片付けてからエラーを返す（後始末自体の失敗は
+            // 握りつぶし、元のエラーを優先して返す。cleanup_socket_file 参照）。
+            if let Err(err) = finish_bind(&listener, path) {
                 cleanup_socket_file(path);
                 return Err(err);
             }
@@ -561,6 +583,7 @@ mod imp {
             Ok(Self {
                 listener,
                 path: path.to_path_buf(),
+                effective_uid,
             })
         }
 
@@ -618,7 +641,8 @@ mod imp {
                         // 別のカウンタ・同じ上限（`MAX_ACCEPT_ABORT_RETRIES`）で
                         // 再試行する（H1・#820 security-auditor 指摘対応。
                         // `AcceptAttempt` のドキュメンテーションコメント参照）。
-                        if let Err(rejection) = verify_peer_credential(&stream) {
+                        if let Err(rejection) = verify_peer_credential(&stream, self.effective_uid)
+                        {
                             drop(stream);
                             // H3・#820 security-auditor 指摘対応: 件数の加算・
                             // 拒否の通知は、期限切れの判定より必ず先に行う
@@ -735,12 +759,12 @@ mod imp {
         }
     }
 
-    /// bind 直後の後始末: 所有者検証（PLUG-12）→ `0600` への chmod →
-    /// listener の非ブロッキング化、の順に行う。いずれかに失敗すれば
-    /// 呼び出し元（[`ServerInner::bind`]）がソケットファイルを片付ける。
-    fn finish_bind(listener: &UnixListener, path: &Path, parent_uid: u32) -> Result<(), IoError> {
-        check_socket_owner(crate::sys::effective_uid(), parent_uid)?;
-
+    /// bind 直後の後始末: `0600` への chmod → listener の非ブロッキング化、の
+    /// 順に行う。いずれかに失敗すれば呼び出し元（[`ServerInner::bind`]）が
+    /// ソケットファイルを片付ける。所有者の照合（PLUG-12・[`check_socket_owner`]）
+    /// はここではなく bind 前の [`validate_parent_dir`] で済ませている（I1・
+    /// #820 security-auditor 再監査指摘対応）。
+    fn finish_bind(listener: &UnixListener, path: &Path) -> Result<(), IoError> {
         fs::set_permissions(path, Permissions::from_mode(0o600)).map_err(|e| {
             IoError::new(
                 IoErrorCode::Internal,
@@ -756,9 +780,15 @@ mod imp {
         Ok(())
     }
 
-    /// bind したプロセスの実効 uid（`effective_uid`）が親ディレクトリの所有者
-    /// （`parent_uid`）と一致することを確かめる（PLUG-12・security.md「UDS は
-    /// 所有者・権限・symlink を検証してから bind」）。
+    /// bind するプロセスの実効 uid（`effective_uid`。bind で作られるソケット
+    /// ファイルの所有者になる uid）が親ディレクトリの所有者（`parent_uid`）と
+    /// 一致することを確かめる（PLUG-12・security.md「UDS は所有者・権限・
+    /// symlink を検証してから bind」）。
+    ///
+    /// [`validate_parent_dir`] から bind より前に呼ばれ、不一致ならソケット
+    /// ファイルを作る前に拒否する（I1・#820 security-auditor 再監査指摘対応。
+    /// 比べる 2 値はどちらも bind 前に確定しているため、bind 後に照合して
+    /// 作成済みのファイルを片付ける必要がない）。
     ///
     /// 第 1 ラウンド（#820）時点では std だけでは実効 uid を直接取得できず
     /// （`libc`/`nix` の依存承認が必要）、bind 直後のソケットファイルの所有者
@@ -788,8 +818,8 @@ mod imp {
     /// （[`crate::observe::ServerOutcome::RejectedPeerCredential`]）へ個別に
     /// 載せられるようにする。
     struct PeerCredentialRejection {
-        /// `crate::sys::peer_uid` の取得自体は成功したが
-        /// `crate::sys::effective_uid` と不一致だった場合の接続元 uid。取得自体
+        /// `crate::sys::peer_uid` の取得自体は成功したが bind 時点の実効 uid
+        /// （[`ServerInner`] が保存した値）と不一致だった場合の接続元 uid。取得自体
         /// に失敗した場合（対応していないアーキテクチャを含む）は `None`。
         peer_uid: Option<u32>,
         /// 拒否の詳細（エラーコード・メッセージ）。
@@ -802,8 +832,10 @@ mod imp {
     ///
     /// `crate::sys::peer_uid`（Linux は `SO_PEERCRED` が返す
     /// `struct ucred.uid`、macOS は `getpeereid(2)` が返す euid）で接続元の
-    /// **接続時点の実効 uid（euid）**を取得し、`crate::sys::effective_uid`
-    /// （bind したプロセス自身の実効 uid）と一致するかを
+    /// **接続時点の実効 uid（euid）**を取得し、`expected_uid`（[`ServerInner`] が
+    /// bind 時点で取得・保存した自プロセスの実効 uid。accept のたびに
+    /// `geteuid(2)` を取り直さない。I2・#820 security-auditor 再監査指摘対応）と
+    /// 一致するかを
     /// [`peer_credential_matches`]（純粋関数。単体テスト対象）で判定する（H2・
     /// #820 security-auditor 指摘対応。「実 uid」ではなく euid である点・
     /// user namespace の外の uid は `overflowuid` として観測されうる点は
@@ -813,7 +845,10 @@ mod imp {
     /// （fail-closed）。拒否時のエラーコードは [`check_socket_owner`]（bind 時の
     /// 所有者照合）と同じ [`IoErrorCode::InvalidArgument`] を使い、新しいコードは
     /// 追加しない（#820 修正計画 E）。
-    fn verify_peer_credential(stream: &UnixStream) -> Result<(), PeerCredentialRejection> {
+    fn verify_peer_credential(
+        stream: &UnixStream,
+        expected_uid: u32,
+    ) -> Result<(), PeerCredentialRejection> {
         let peer_uid = match crate::sys::peer_uid(stream) {
             Ok(uid) => uid,
             Err(error) => {
@@ -823,7 +858,6 @@ mod imp {
                 });
             }
         };
-        let expected_uid = crate::sys::effective_uid();
         if !peer_credential_matches(peer_uid, expected_uid) {
             return Err(PeerCredentialRejection {
                 peer_uid: Some(peer_uid),
@@ -831,7 +865,7 @@ mod imp {
                     IoErrorCode::InvalidArgument,
                     format!(
                         "connecting peer uid ({peer_uid}) does not match the server's \
-                         effective uid ({expected_uid})"
+                         effective uid at bind time ({expected_uid})"
                     ),
                 ),
             });
@@ -908,8 +942,11 @@ mod imp {
 
     /// 親ディレクトリが symlink でなく・ディレクトリであり・owner 以外に
     /// read / write / search のいずれも与えていないことを確かめる
-    /// （security.md の UDS 観点。fail-closed）。検証に成功した場合は
-    /// [`finish_bind`] の所有者照合で使う親ディレクトリの uid を返す。
+    /// （security.md の UDS 観点。fail-closed）。あわせて、親ディレクトリの
+    /// 所有者が `effective_uid`（bind するプロセスの実効 uid）と一致することを
+    /// [`check_socket_owner`] で確かめる（PLUG-12）。いずれも bind より前に
+    /// 行い、失敗した場合は何も作らずに拒否する（I1・#820 security-auditor
+    /// 再監査指摘対応）。
     ///
     /// `0o077` まで絞る理由: bind 直後から `0600` への chmod が完了するまでの
     /// 短い間、ソケットファイル自体のモードは umask 依存で緩くなりうる
@@ -923,7 +960,7 @@ mod imp {
     /// `/tmp` が `/private/tmp` への symlink であるように、canonicalize 結果を
     /// 素朴に比較する方式は環境依存の誤判定を生みやすく採らない。範囲外として
     /// `server.rs` モジュール doc に明記する）。
-    fn validate_parent_dir(path: &Path) -> Result<u32, IoError> {
+    fn validate_parent_dir(path: &Path, effective_uid: u32) -> Result<(), IoError> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -958,7 +995,7 @@ mod imp {
                  non-owner users",
             ));
         }
-        Ok(meta.uid())
+        check_socket_owner(effective_uid, meta.uid())
     }
 
     /// 既存パス（ファイル・symlink・古いソケット等）を拒否する。任意のファイルを
@@ -1597,6 +1634,86 @@ mod imp {
                 "exceeded",
             );
             assert!(outcome.is_none());
+        }
+
+        /// I1・#820（security-auditor 再監査指摘対応。PLUG-12）: 親ディレクトリの
+        /// 所有者と実効 uid が一致しない場合、`validate_parent_dir` は bind より
+        /// 前の段階で `InvalidArgument` を返し、ソケットファイルを作らない。
+        /// 別ユーザー所有のディレクトリは root がないと用意できないため、実在の
+        /// 自分所有のディレクトリに対して「実効 uid」側を自分の uid と異なる値に
+        /// して呼ぶ。
+        #[test]
+        fn i1_validate_parent_dir_rejects_owner_mismatch_before_bind() {
+            let dir = super::super::test_support::TempSocketDir::new();
+            let path = dir.socket_path();
+            let other_uid = crate::sys::effective_uid().wrapping_add(1);
+
+            let err = validate_parent_dir(&path, other_uid)
+                .expect_err("an owner mismatch must be rejected before bind");
+
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+            assert!(
+                err.message()
+                    .contains(&format!("(effective uid {other_uid})")),
+                "message={}",
+                err.message()
+            );
+            assert_eq!(
+                fs::symlink_metadata(&path).map_err(|e| e.kind()).err(),
+                Some(io::ErrorKind::NotFound),
+                "no socket file may be created when the owner check fails"
+            );
+        }
+
+        /// I1・#820（PLUG-12）: 実効 uid が親ディレクトリの所有者と一致すれば
+        /// `validate_parent_dir` は受理する（自分所有の `0700` ディレクトリ）。
+        #[test]
+        fn i1_validate_parent_dir_accepts_matching_owner() {
+            let dir = super::super::test_support::TempSocketDir::new();
+            validate_parent_dir(&dir.socket_path(), crate::sys::effective_uid())
+                .expect("a 0700 directory owned by the effective uid must be accepted");
+        }
+    }
+}
+
+/// `imp` 層・`UdsServer` の単体テストが共有する一時ディレクトリ
+/// （`crates/io/tests/server.rs` の `TempSocketDir` と同じ手順。テスト専用）。
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod test_support {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// テストごとに固有かつ短い `0700` のディレクトリを作り、`Drop` で削除する。
+    /// macOS の sun_path 上限（104 バイト）に近づかないよう名前を短く保ち、
+    /// umask の影響を受けないよう作成直後に `set_permissions` でモードを確定させる。
+    pub(super) struct TempSocketDir {
+        path: PathBuf,
+    }
+
+    impl TempSocketDir {
+        pub(super) fn new() -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let dir = std::env::temp_dir().join(format!("fcu-{pid}-{n}"));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .expect("must be able to create a temp dir for the socket");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("must be able to force the directory mode regardless of umask");
+            Self { path: dir }
+        }
+
+        pub(super) fn socket_path(&self) -> PathBuf {
+            self.path.join("s.sock")
+        }
+    }
+
+    impl Drop for TempSocketDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }

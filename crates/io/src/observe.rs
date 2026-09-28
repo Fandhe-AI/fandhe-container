@@ -398,6 +398,7 @@ fn outcome_reason_str(outcome: SendOutcome) -> &'static str {
         SendOutcome::RejectedPoisoned => "rejected_poisoned",
         SendOutcome::RejectedInvalidFrameKind => "rejected_invalid_frame_kind",
         SendOutcome::RejectedResourceExhausted => "rejected_resource_exhausted",
+        SendOutcome::RejectedInvalidPayload => "rejected_invalid_payload",
         SendOutcome::TransportFailure => "transport_failure",
     }
 }

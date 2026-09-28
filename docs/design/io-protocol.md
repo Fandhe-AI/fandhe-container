@@ -3,10 +3,10 @@
 `fandhe-container-io`（`crates/io`）が提供するフレーム全体型（[`Frame`](../../crates/io/src/protocol.rs)）のバイトレイアウト・採用したチェックサムアルゴリズムの根拠・newtype 設計方針・IO-1 / REPAIR-2 対応表を記録する。
 
 - 対象ビヘイビア: IO-1（ホスト⇔ゲスト間のファイル共有プロトコル）・REPAIR-2（壊れた値を表現できない型）・REPAIR-5（タイムアウト保護・エラー後の接続再利用禁止）・REPAIR-6（整合性テスト）
-- 関連タスク: TASK-11.1（#68）・TASK-11.2（#69。ヘッダ newtype）・TASK-11.3（#70。チェックサム付きフレーム型）・TASK-11.4（#71。本節以降）・TASK-13.1（#76。バッチ集約バッファ）・TASK-83.1（#116。BREAK-2 相当のワイヤーレベル検出テスト）・TASK-83.2（#117。デコード時の範囲外長さ検証の強化とアロケーション前拒否のテスト）。ヘッダ拡張（version・header_crc）・接続再利用契約は TASK-12・TASK-13 着手前の設計レビュー（2026-09-28 オーナー決定・#67・#115）による
+- 関連タスク: TASK-11.1（#68）・TASK-11.2（#69。ヘッダ newtype）・TASK-11.3（#70。チェックサム付きフレーム型）・TASK-11.4（#71。本節以降）・TASK-12.1（#73。送信キュー）・TASK-12.2（#74。ペイロード形式・ACK 受信）・TASK-13.1（#76。バッチ集約バッファ）・TASK-83.1（#116。BREAK-2 相当のワイヤーレベル検出テスト）・TASK-83.2（#117。デコード時の範囲外長さ検証の強化とアロケーション前拒否のテスト）。ヘッダ拡張（version・header_crc）・接続再利用契約は TASK-12・TASK-13 着手前の設計レビュー（2026-09-28 オーナー決定・#67・#115）による
 - 関連ビヘイビア: IO-2（Flush / FlushAck 種別）・REPAIR-5（`IoTimeout`。無期限待ちを型で表現しない）
 - 対象マイルストーン: MS-1
-- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）に加え、2026-09-28 の設計レビュー（TASK-12・TASK-13 着手前に P1 として指摘・オーナー決定で先行対応）で追加したヘッダの `version`・`header_crc` フィールドと、エラー後の接続再利用禁止契約を記録する。ペイロード内部レイアウト（request id・ACK status 等）・UDS 受信ループ・ディスク書き込み・ACK 返却は TASK-12（パイプライン送信クライアント）・TASK-13 の後続 sub-issue（TASK-13.2 系）が本書へ追記する
+- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）、TASK-12.1 で追加した送信キュー（`SendQueue`・`PipelineClient`）、TASK-12.2 で追加したペイロード内部レイアウト（[`crates/io/src/payload.rs`](../../crates/io/src/payload.rs)）と ACK 受信・対応付け（`PipelineClient::recv_ack`）に加え、2026-09-28 の設計レビュー（TASK-12・TASK-13 着手前に P1 として指摘・オーナー決定で先行対応）で追加したヘッダの `version`・`header_crc` フィールドと、エラー後の接続再利用禁止契約を記録する。UDS 受信ループ・ディスク書き込みは TASK-13 の後続 sub-issue（TASK-13.2 系）が本書へ追記する
 
 ## バイトレイアウト
 
@@ -173,13 +173,55 @@ BREAK-2 検出経路の整理:
 
 - 未 ACK 件数の上限は `InFlightLimit`（検証済み newtype）で表現し、既定値は `DEFAULT_IN_FLIGHT_LIMIT = 64`。根拠は PoC-2（`03-poc/io-layer-redesign`）のクライアントが使っていた in-flight window の既定値（サーバー側バッチサイズに揃えた値）
 - 上限の最大値は `MAX_IN_FLIGHT_LIMIT = 4096`（暫定値。`InFlightRequest` は id・種別のみを保持しペイロードを持たないため上限まで埋まってもメモリ量は小さい。TASK-113 のベンチ・TASK-85 の結合試験で見直してよい）
-- 上限に達した状態で `PipelineClient::send` を呼ぶと、**トランスポートへ書き込む前に** `IoErrorCode::ResourceExhausted` を返す（ブロックしない。ACK 待ちによる枠の解放は TASK-12.2〔#74〕の範囲）
-- request id（`RequestId`）はクライアントがローカルに振る単調増加の連番であり、ペイロードには含めない。ワイヤー上のレイアウトは TASK-12.2（#74）が定める
-- ACK フレームの受信・デコード・id との対応付け・タイムアウト付き ACK 待ちは本件の範囲外で、TASK-12.2（#74）が `client` モジュールへ追加する
+- 上限に達した状態で `PipelineClient::send` を呼ぶと、**トランスポートへ書き込む前に** `IoErrorCode::ResourceExhausted` を返す（ブロックしない）
+- request id（`RequestId`）はクライアントがローカルに振る単調増加の連番であり、ワイヤー上のレイアウトは下記「ペイロード形式と ACK 対応付け」節（TASK-12.2・#74）が定める
+- ACK フレームの受信・デコード・id との対応付け・タイムアウト付き ACK 待ちは `PipelineClient::recv_ack`（TASK-12.2・#74）が提供する
 
 `IoErrorCode::ResourceExhausted` は `DataLoss` と同じく ERR-1/3/5 の既定表にない拡張コード（gRPC 正準コードの `RESOURCE_EXHAUSTED` を借用）。spec `error-format.md` への反映要否は spec 側への報告事項（spec-reference）。
+
+## ペイロード形式と ACK 対応付け（TASK-12.2・IO-1・IO-2・#74）
+
+`crates/io/src/payload.rs` が `crates/io/src/protocol.rs` の `Frame` ペイロードの内部レイアウト（request id・ACK の対応付け）を定める。`FrameHeader` は `[version][kind][payload_len][header_crc]` の固定 10 バイトで確定済み（2026-09-28 オーナー決定・#67・#115・#1108）であり、ヘッダに request id フィールドを追加するのはワイヤー互換を壊す変更（`PROTOCOL_VERSION` の繰り上げが必要）かつ I/O 契約（IO-1）の設計変更にあたるため、TASK-12 系の受入基準が言う「フレームヘッダの ID フィールド」は、本書では代わりに「ペイロード先頭 8 バイトの固定オフセットに置く request id」として実装する（このずれは実装計画・PR で明記し、spec 側の記述と合わせるかはユーザー判断事項として報告する。out-of-scope-tracking）。
+
+### ペイロードレイアウト
+
+| 種別 | ペイロード | 制約 |
+| ---- | ---------- | ---- |
+| `FrameKind::Write` | `[request_id: u64 LE][body...]` | `body.len() ≤ MAX_WRITE_BODY_LEN`（`= MAX_PAYLOAD_LEN - 8`） |
+| `FrameKind::Flush` | `[request_id: u64 LE]` | ちょうど 8 バイト（body は空） |
+| `FrameKind::Ack` / `FrameKind::FlushAck` | `[request_id: u64 LE]` | ちょうど 8 バイト（短くても長くても拒否） |
+
+- `WireRequestId`（非公開フィールド。`RequestId` からのみ構築できる）がワイヤー表現を担う。`RequestId` が内部に持つ発行元キュー識別子（`QueueId`）はメモリ内の区別にのみ使い、ワイヤー上には一切現れない（TASK-12.1 の契約を維持する）
+- `encode_request` / `decode_request`（`Write`・`Flush` 用）、`encode_ack` / `decode_ack`（`Ack`・`FlushAck` 用）が公開 API。種別違反・長さ違反は構築前に検証し、`Frame::decode` 系のアロケーション前検証（TASK-83.2）を壊さない
+- ACK に status バイト（成功/失敗）は持たせない。サーバー側の失敗は接続再利用禁止契約（P1-3。上記「エラー後の接続再利用禁止」節）により接続断で伝わるため、ACK 自体に真偽値を足す必要がない。あとから追加する場合はワイヤー形式の変更（`PROTOCOL_VERSION` の繰り上げ）が要る（PoC-2 の `status(0=OK)` をあえて再現しない理由）
+- `PROTOCOL_VERSION` は `1` のまま据え置く。ペイロードはこれまで意味づけされていない不透明なバイト列だったため、本節が初めてその形式を定めるのであり、ヘッダ・フレーム全体のバイトレイアウトは変わっていない
+
+### 送信（`PipelineClient::send`）
+
+`send(kind, body, timeout)` は `SendQueue::peek_next_id` で次の id を覗き見てから `encode_request` でフレームを組み立て、`SendQueue::register` で確定した id と一致することを確認してから送信する（id が一致しない場合は内部不整合として `IoErrorCode::Internal` を返す。単一スレッド前提のこの型では構造上起こらないはずの分岐）。ペイロード形式の検証に失敗した場合は `SendOutcome::RejectedInvalidPayload` として送信前に拒否する（`SendOutcome::RejectedInvalidFrameKind` とは別の分類。REPAIR-4）。
+
+### 受信・対応付け（`PipelineClient::recv_ack`）
+
+`recv_ack(receiver, timeout)` は次の順で検証し、いずれかに失敗すると `PipelineClient` を失効させる（`is_poisoned() == true`。以後の `send`・`recv_ack` はすべて `IoErrorCode::Unavailable`）:
+
+1. 失効済みなら `receiver` を呼ばずに `Unavailable`
+2. 未 ACK が 0 件なら `receiver` を呼ばずに `InvalidArgument`（待つ対象がない呼び出しの誤りであり、プロトコル違反ではないため失効させない）
+3. `receiver.recv_frame(timeout)` が `Err` を返したら、そのエラー（`Timeout` を含む）をそのまま返して失効させる。`FrameReceiver::recv_frame` の P1-3 契約（エラー後は接続を再利用しない）により、同じ接続でポーリングする使い方は想定しない
+4. `decode_ack` の検証に失敗したら `InvalidArgument`
+5. **送信順の照合**: 受信した request id が `SendQueue::oldest()` の id と一致しなければ `InvalidArgument`。キュー内に存在するが最古でない場合は "out-of-order ack"、キューのどこにも存在しない場合は "unknown ack id" とメッセージを区別する。`SendQueue` は FIFO であり、サーバー側は送信順に ACK を返す設計（TASK-13.2）を前提とする。順序が入れ替わる必要が生じた場合は TASK-13 側で本方針を見直す
+6. 種別対応の確認: `Ack` は元が `Write` に、`FlushAck` は元が `Flush` に対応しなければならない。ずれていれば `InvalidArgument`
+7. `SendQueue::remove` で解放し、`AckReceipt`（`request()`・`ack_kind()`）を返す
+
+`FrameKind::Ack` は対応する書き込みがバッファリングされたことのみを保証し（IO-1）、`FrameKind::FlushAck` はそのバリア以前に受理したすべての書き込みが永続化済みであることを保証する（IO-2）。送信順照合はどちらの種別でも同じ規則（キュー先頭との一致）を使い、この保証範囲の違いと矛盾しない。
+
+### 範囲外（後続タスク）
+
+- ACK 受信のメトリクス・観測フック（ACK レイテンシ。REPAIR-4）
+- 送信側と受信側をスレッドで分ける API（`split()` 等）
+- ACK status バイトの導入（導入する場合は `PROTOCOL_VERSION` の繰り上げが必要）
+- サーバー側（TASK-13.2）が本形式で ACK を返す実装と、送信順を守る義務の明記
 
 ## 見直し
 
 - `crates/io/src/protocol.rs` のフレーム形式・定数・`FrameKind` のバリアントが変わった場合は本書を追従させる
-- TASK-12.2（#74）・TASK-13（バッチ write-back サーバー）がペイロード内部のレイアウト（request id・ACK status 等）を確定させた際は、本書へ追記する
+- `crates/io/src/payload.rs` のペイロードレイアウトが変わった場合は「ペイロード形式と ACK 対応付け」節を追従させる

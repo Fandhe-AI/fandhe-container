@@ -78,21 +78,49 @@ pub const MAX_BATCH_SIZE: usize = 4096;
 /// 必要とする場合は [`BatchConfig::with_max_bytes`] で個別に指定できる。
 pub const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
 
+/// [`BatchConfig::with_max_bytes`] が受理する累積ペイロードバイト数上限の
+/// 安全な最大値（P0: PR #1105 codex レビュー指摘。無制限確保による DoS の
+/// 防止）。
+///
+/// [`with_max_bytes`](BatchConfig::with_max_bytes) は呼び出し側が既定
+/// [`MAX_BATCH_BYTES`] と異なる `max_bytes` を個別指定できる抜け道を持つが、
+/// `max_bytes == 0` のみを拒否し上限を設けないと、[`MAX_BATCH_SIZE`]
+/// （4096 件）× [`crate::protocol::MAX_PAYLOAD_LEN`]（64 MiB）≒ 256 GiB
+/// もの滞留を公開設定 API 経由で許してしまい、既定 [`MAX_BATCH_BYTES`]
+/// による DoS 防御を実質的に無効化できる。本定数は「独自の上限を必要とする
+/// 呼び出し側の柔軟性」と「無制限確保の防止」を両立させるため、既定値
+/// （256 MiB）の 4 倍を安全な上限として個別設定を許す範囲を区切る。
+///
+/// この係数（4 倍）自体も [`MAX_BATCH_BYTES`] 同様、実測に基づく校正では
+/// なく「桁を潰す」以上の根拠を持たない暫定値であり、見直しは
+/// [`MAX_BATCH_BYTES`] と同じ TASK-13.3・TASK-13.4・TASK-16・TASK-88
+/// （ベンチ校正）の責務（REPAIR-3: 実装済みを装わない）。
+pub const MAX_ALLOWED_BATCH_BYTES: usize = MAX_BATCH_BYTES * 4;
+
 // DEFAULT_BATCH_SIZE は 1..=MAX_BATCH_SIZE の範囲内でなければならない不変条件を
 // コンパイル時に保証する（`protocol.rs` の `MAX_PAYLOAD_LEN < u32::MAX` と同種の
 // パターン）。これにより `BatchConfig::default()` 実装（`Self::new(...).expect(...)`）
 // が将来 MAX_BATCH_SIZE の変更で実行時パニックへ化けることを防ぐ。
 const _: () = assert!(DEFAULT_BATCH_SIZE >= 1 && DEFAULT_BATCH_SIZE <= MAX_BATCH_SIZE);
 
-// MAX_BATCH_BYTES は非ゼロでなければならない（`NonZeroUsize` で表現するため）。
-const _: () = assert!(MAX_BATCH_BYTES > 0);
+// MAX_BATCH_BYTES は非ゼロであり、かつ MAX_ALLOWED_BATCH_BYTES（`with_max_bytes`
+// が個別設定を許す上限）の範囲内でなければならない不変条件をコンパイル時に
+// 保証する（既定値そのものが個別設定の上限を超えて `with_max_bytes` から
+// 拒否される、という自己矛盾を防ぐ）。
+const _: () = assert!(MAX_BATCH_BYTES > 0 && MAX_BATCH_BYTES <= MAX_ALLOWED_BATCH_BYTES);
+
+// MAX_ALLOWED_BATCH_BYTES 自体が usize の乗算でオーバーフローしないことを
+// コンパイル時に保証する（`MAX_BATCH_BYTES * 4` は 32bit usize では
+// オーバーフローし得るため、`checked_mul` 相当の検証をコンパイル時に行う）。
+const _: () = assert!(MAX_ALLOWED_BATCH_BYTES / 4 == MAX_BATCH_BYTES);
 
 /// [`BatchBuffer`] の集約単位（件数・累積バイト数）を表す設定値（IO-1）。
 ///
 /// 非公開フィールドに `NonZeroUsize` を持ち、[`Self::new`] /
 /// [`Self::with_max_bytes`] を経由しない限り `1..=MAX_BATCH_SIZE`（件数）・
-/// `1..=usize::MAX`（累積バイト数）の範囲外の値を表現できない
-/// （REPAIR-2: 壊れた値を表現できない型）。
+/// `1..=MAX_ALLOWED_BATCH_BYTES`（累積バイト数。P0: PR #1105 codex
+/// レビュー指摘を受け `usize::MAX` を含む無制限の値は拒否する）の範囲外の
+/// 値を表現できない（REPAIR-2: 壊れた値を表現できない型）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BatchConfig {
     batch_size: NonZeroUsize,
@@ -115,8 +143,11 @@ impl BatchConfig {
     /// [`MAX_BATCH_BYTES`] と異なる上限を必要とする場合に使う）。
     ///
     /// `batch_size` が `0` または [`MAX_BATCH_SIZE`] を超える値、
-    /// あるいは `max_bytes` が `0` の場合は
-    /// [`IoErrorCode::InvalidArgument`] として拒否する。
+    /// あるいは `max_bytes` が `0` または [`MAX_ALLOWED_BATCH_BYTES`] を
+    /// 超える値の場合は [`IoErrorCode::InvalidArgument`] として拒否する
+    /// （P0: PR #1105 codex レビュー指摘。`max_bytes` に上限を設けない場合
+    /// [`MAX_ALLOWED_BATCH_BYTES`] のドキュメンテーションコメント参照の
+    /// とおり本関数が無制限確保による DoS 防御の抜け道になってしまう）。
     pub fn with_max_bytes(batch_size: usize, max_bytes: usize) -> Result<Self, IoError> {
         if batch_size == 0 {
             return Err(IoError::new(
@@ -136,8 +167,14 @@ impl BatchConfig {
                 "max batch bytes must be at least 1",
             ));
         }
-        // 上の分岐で 1..=MAX_BATCH_SIZE・1..=usize::MAX の範囲を確認済みのため、
-        // 以下の NonZeroUsize::new は必ず Some を返す。
+        if max_bytes > MAX_ALLOWED_BATCH_BYTES {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!("max batch bytes must be at most {MAX_ALLOWED_BATCH_BYTES}"),
+            ));
+        }
+        // 上の分岐で 1..=MAX_BATCH_SIZE・1..=MAX_ALLOWED_BATCH_BYTES の範囲を
+        // 確認済みのため、以下の NonZeroUsize::new は必ず Some を返す。
         let batch_size = NonZeroUsize::new(batch_size)
             .ok_or_else(|| IoError::new(IoErrorCode::Internal, "unexpected zero batch size"))?;
         let max_bytes = NonZeroUsize::new(max_bytes)
@@ -696,6 +733,36 @@ mod tests {
     fn batch_config_rejects_zero_max_bytes() {
         let err = BatchConfig::with_max_bytes(DEFAULT_BATCH_SIZE, 0)
             .expect_err("max_bytes == 0 must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+    }
+
+    /// P0（PR #1105 codex 指摘）: `max_bytes` に `usize::MAX` を渡しても、
+    /// `MAX_BATCH_SIZE`（4096 件）× `MAX_PAYLOAD_LEN`（64 MiB）≒ 256 GiB もの
+    /// 滞留を許す設定は成立せず、[`MAX_ALLOWED_BATCH_BYTES`] を超える値として
+    /// 拒否される（無制限確保による DoS 防御が公開設定 API から外せないことの
+    /// 回帰テスト）。
+    #[test]
+    fn batch_config_rejects_max_bytes_above_allowed_ceiling() {
+        let err = BatchConfig::with_max_bytes(DEFAULT_BATCH_SIZE, usize::MAX)
+            .expect_err("max_bytes above MAX_ALLOWED_BATCH_BYTES must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+    }
+
+    /// P0: `max_bytes` にちょうど [`MAX_ALLOWED_BATCH_BYTES`] を指定した境界値は
+    /// 拒否されず、通常どおり設定として成立する。
+    #[test]
+    fn batch_config_accepts_max_bytes_exactly_at_allowed_ceiling() {
+        let config = BatchConfig::with_max_bytes(DEFAULT_BATCH_SIZE, MAX_ALLOWED_BATCH_BYTES)
+            .expect("max_bytes exactly at MAX_ALLOWED_BATCH_BYTES must be accepted");
+        assert_eq!(config.max_bytes(), MAX_ALLOWED_BATCH_BYTES);
+    }
+
+    /// P0: `max_bytes` に [`MAX_ALLOWED_BATCH_BYTES`] を 1 バイトでも超える値は
+    /// 拒否される（境界値テスト）。
+    #[test]
+    fn batch_config_rejects_max_bytes_one_above_allowed_ceiling() {
+        let err = BatchConfig::with_max_bytes(DEFAULT_BATCH_SIZE, MAX_ALLOWED_BATCH_BYTES + 1)
+            .expect_err("max_bytes one byte above MAX_ALLOWED_BATCH_BYTES must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
     }
 

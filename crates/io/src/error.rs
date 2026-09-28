@@ -76,9 +76,9 @@ pub enum IoErrorCode {
     /// 検出してエラーを返す）。
     ///
     /// gRPC 正準コードの `ALREADY_EXISTS` を借用した名称。`DataLoss` と同じく
-    /// ERR-1/3 の既定表にあるかどうかは未確認の拡張コードとして扱う。本リポの
-    /// `docs/spec` submodule 参照（コミット `06e368f`）には ERR-3 対応表への
-    /// `ALREADY_EXISTS` 追加を確認できておらず、「定義済み」と断定しない
+    /// ERR-1/3 の既定表にあるかどうかは未確認の拡張コードとして扱う。本コードの
+    /// 追加時点では ERR-3 対応表への `ALREADY_EXISTS` の定義を確認できておらず、
+    /// 「定義済み」と断定しない
     /// （spec-reference: ステータス未確認のビヘイビアは確定扱いしない）。
     /// spec `error-format.md` への反映要否は spec 側への報告事項
     /// （out-of-scope-tracking）。

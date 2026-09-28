@@ -71,6 +71,8 @@
 #      値が 0 以下、ファイルサイズ・総書き込み量の上限超過、symlink 等）
 #   3: 前提ツールが無い（run モードでの fio・timeout。全モード共通で
 #      jq・grep・dirname・basename・wc・tr・mktemp・find・ln・head・sleep・id）
+#   4: 計測データ（run モードの専用サブディレクトリ。最大 --size 分）を後始末で
+#      削除できなかった（残ったパスを stderr に出す。本来の終了コードより優先する）
 #
 # 出力（stdout。`--output <path>` を指定した場合はファイルにも書く。人が読む進捗・
 # サマリーは stderr に出す）:
@@ -334,21 +336,42 @@ fi
 tmp_dir=""
 run_dir=""
 output_tmp=""
-# 後始末の失敗は終了コードの契約（0〜3）を上書きしない。`set -e` 下の EXIT trap で
-# コマンドが失敗すると、シェルはその失敗の終了コードで終わる（exit 0/2 のつもりが
-# 1 になる。bash で確認）。そこで入口で元の終了コードを保存し、各 rm の失敗は
-# 警告として stderr に出したうえで、最後に元の終了コードで終わる。
+# 削除失敗の扱いは対象の大きさで分ける:
+#   - run モードの専用サブディレクトリ（計測データ。最大 --size 分、既定 256 MiB・
+#     上限 10 GiB）: 削除できなければ残ったパスを stderr に出し、本来の終了コードより
+#     優先して exit 4 で終わる（大容量のデータが黙って残るのを防ぐ。fail-closed）
+#   - 一時ディレクトリ（JSON のスナップショット・fio の JSON 出力。各 4 MiB 以下）・
+#     --output 用の一時ファイル名（結果 JSON と同じ inode の別名）: 小さいため警告
+#     （残ったパス）を stderr に出すだけで、本来の終了コードを保つ
+# 削除できたかどうかは rm の終了コードに加え、削除後にパスが残っていないこと
+# （存在しない・symlink でもない）で判定する。
+# `set -e` 下の EXIT trap でコマンドが失敗すると、シェルはその失敗の終了コードで
+# 終わる（bash で確認）ため、入口で本来の終了コードを保存し、最後に明示的に終わる。
 # shellcheck disable=SC2329 # trap 経由で呼ばれるため直接の呼び出しは無い
 cleanup() {
   local rc=$?
+  local data_left=0
   if [ -n "$tmp_dir" ]; then
-    rm -rf -- "$tmp_dir" || echo "warning: cleanup-failed: could not remove ${tmp_dir}" >&2
+    if ! rm -rf -- "$tmp_dir" || [ -e "$tmp_dir" ] || [ -L "$tmp_dir" ]; then
+      echo "warning: cleanup-failed: could not remove temporary files: ${tmp_dir}" >&2
+    fi
   fi
   if [ -n "$run_dir" ]; then
-    rm -rf -- "$run_dir" || echo "warning: cleanup-failed: could not remove ${run_dir}" >&2
+    if ! rm -rf -- "$run_dir" || [ -e "$run_dir" ] || [ -L "$run_dir" ]; then
+      echo "error: cleanup-failed: could not remove benchmark data (up to --size bytes may remain): ${run_dir}" >&2
+      data_left=1
+    fi
   fi
   if [ -n "$output_tmp" ]; then
-    rm -f -- "$output_tmp" || echo "warning: cleanup-failed: could not remove ${output_tmp}" >&2
+    if ! rm -f -- "$output_tmp" || [ -e "$output_tmp" ] || [ -L "$output_tmp" ]; then
+      echo "warning: cleanup-failed: could not remove temporary file: ${output_tmp}" >&2
+    fi
+  fi
+  if [ "$data_left" -eq 1 ]; then
+    if [ "$rc" -ne 0 ]; then
+      echo "error: cleanup-failed: the run had already failed with exit status ${rc}" >&2
+    fi
+    exit 4
   fi
   exit "$rc"
 }
@@ -489,8 +512,11 @@ write_output_file() {
     err "invalid-input" "--output path was replaced during the write (a directory or other entry appeared after validation): $output_path"
     exit 2
   fi
-  rm -f -- "$output_tmp"
-  output_tmp=""
+  # 一時ファイル名の削除に失敗しても結果は --output に書けている。set -e で打ち切らず、
+  # 後始末（cleanup）でもう一度消し、それでも残れば警告にする。
+  if rm -f -- "$output_tmp"; then
+    output_tmp=""
+  fi
 }
 
 check_symlink_reject() {
@@ -806,19 +832,23 @@ emit_result() {
   printf '%s\n' "$result"
 }
 
-# 本スクリプト専用の一時ディレクトリ（mktemp -d。0700 で新規作成され、他ユーザーは
-# 中へエントリを置けない）。変換対象 JSON のスナップショットと run モードの fio 出力を
-# 置く。両モード共通で作る。
-if ! tmp_dir=$(mktemp -d 2>/dev/null) || [ -z "$tmp_dir" ] || [ ! -d "$tmp_dir" ] || [ -L "$tmp_dir" ]; then
+# 本スクリプト専用の一時ディレクトリ。変換対象 JSON のスナップショットと run モードの
+# fio 出力を置く（両モード共通）。手順は「解決 → 検証 → 作成 → 返り値をそのまま使う」:
+#   1. TMPDIR（未設定なら /tmp）を cd と pwd -P で実体のパスへ解決する
+#   2. その全パス要素を require_trusted_dir_chain で検証する（第三者が書き換え可能な
+#      場所だと、スナップショットを差し替えられてサイズ判定済みの内容と変換する内容が
+#      ずれる）
+#   3. 解決済みの実体パスを基点に mktemp -d する（0700 で新規作成。最終要素が既存の
+#      symlink なら失敗し、たどらない）
+#   4. mktemp が返したパスをそのまま使い、以後は解決し直さない（作成後に解決し直すと、
+#      その間に差し替えられたパスを採用してしまうため）。後始末も同じパスを消す
+require_trusted_dir_chain "temporary (TMPDIR)" "${TMPDIR:-/tmp}"
+tmp_base="$trusted_dir"
+if ! tmp_dir=$(mktemp -d "${tmp_base}/fandhe-fio-bench.XXXXXXXXXX" 2>/dev/null) || [ -z "$tmp_dir" ] || [ ! -d "$tmp_dir" ] || [ -L "$tmp_dir" ]; then
   tmp_dir=""
-  err "invalid-input" "could not create a private temporary directory"
+  err "invalid-input" "could not create a private temporary directory under ${tmp_base}"
   exit 2
 fi
-# 一時ディレクトリ（TMPDIR 配下）も祖先を含めて検証する。TMPDIR が第三者に書き換え
-# 可能な場所だと、スナップショットを差し替えられてサイズ判定済みの内容と変換する
-# 内容がずれる。以後は解決済みのパスだけを使う（後始末も同じパスを消す）。
-require_trusted_dir_chain "temporary (TMPDIR)" "$tmp_dir"
-tmp_dir="$trusted_dir"
 
 # 変換対象 JSON を 1 回だけ読み、内容を固定したコピー（tmp_dir 内に mktemp で作る
 # 0600 の新規ファイル。パスは snapshot_path に入れて返す）を作る。
@@ -965,9 +995,8 @@ if ! run_dir=$(mktemp -d "${target_dir_real}/fandhe-fio-randwrite-4k.XXXXXXXXXX"
   err "invalid-input" "could not create a private working directory under --target-dir: $target_dir_real"
   exit 2
 fi
-# 作成した専用サブディレクトリ自体（0700・実行ユーザー所有）も同じ条件で確かめる
-require_trusted_dir_chain "--target-dir working" "$run_dir"
-run_dir="$trusted_dir"
+# mktemp が返したパス（検証済みの target_dir_real を基点に 0700 で新規作成したもの）を
+# そのまま使い、解決し直さない（一時ディレクトリと同じ理由）。
 # run モードの fio 出力は、fio の directory がこの専用サブディレクトリと一致することまで
 # 照合する（--from-json では形式のみ。convert_jq_program の directory の照合を参照）。
 if ! expect_json=$(jq -c --arg directory "$run_dir" '.directory = $directory' <<<"$expect_json") || [ -z "$expect_json" ]; then

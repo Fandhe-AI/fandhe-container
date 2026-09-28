@@ -41,3 +41,17 @@ fn io5_public_api_rejects_malformed_path() {
         .expect_err("absolute path must be rejected via the public API");
     assert_eq!(err.code(), IoErrorCode::InvalidArgument);
 }
+
+/// IO-5: 公開 API 経由でも深さの異なる衝突（ファイル `"a"` とディレクトリ
+/// `"A"` 配下の `"A/b"`）を検出する。
+#[test]
+fn io5_public_api_detects_collision_across_depths() {
+    let err = check_case_collisions(["a", "A/b"])
+        .expect_err("file and case-differing directory must collide via the public API");
+    assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+    assert_eq!(
+        err.message(),
+        "case-insensitive path collision: \"A/b\" conflicts with existing \"a\" \
+         (components \"A\" and \"a\" differ only by case)"
+    );
+}

@@ -35,7 +35,8 @@
 //! 衝突を検出する（[`fs_normalize::CaseCollisionSet`]・
 //! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。サーバーの
 //! 書き込み経路への組み込みは #100（TASK-19.2）、パス長 260 超の検証は
-//! TASK-20、Unicode 正規化（NFC / NFD）は TASK-21 でそれぞれ後続実装する
+//! TASK-20、Unicode 正規化（NFC / NFD）は #103（TASK-21.h1）の方針決定後に
+//! TASK-21 でそれぞれ後続実装する
 //! （REPAIR-3。本 crate はまだこれらを呼び出していない）。
 //!
 //! PLUG-1 区分は core（`fandhe-container-plugin` の境界機構とは別に、コアの一部として

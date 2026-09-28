@@ -70,9 +70,9 @@ fn reopen_sink(path: &Path) -> AppendFileSink {
 /// の穴ができる。これは非 append モードでの現在の実装の既知の限界であり
 /// （`AppendFileSink::new` のドキュメント参照）、
 /// `io4_truncate_live_session_normal_mode_post_truncate_records_intact_at_tail`
-/// （T6）のドキュメンテーションコメントに記録している（穴の有無そのものは
-/// テストの成功条件にしない。将来 `AppendFileSink` が現在の EOF に追随する
-/// よう修正された場合でも T6 は失敗しない）。本関数（T4）はその対比として、
+/// （T6）が、この穴を含むファイル全体の具体的なバイト列との完全一致で固定
+/// している（将来 `AppendFileSink` が現在の EOF に追随するよう修正された
+/// 場合は T6 の期待値を更新すること）。本関数（T4）はその対比として、
 /// `append(true)` で開くと各 `write_all` が OS レベルで常に現在の EOF に
 /// 着地し、この穴を避けられることを固定する）。
 fn append_mode_sink(path: &Path) -> AppendFileSink {
@@ -606,22 +606,24 @@ fn io4_truncate_live_session_append_mode_lands_at_new_eof() {
 }
 
 /// IO-4・REPAIR-6・TASK-14.2（codex/review 指摘・PR #1125 対応。
-/// `PRRT_kwDOUq78ts6mvDdg` への対応）: `create_sink`（通常モード、非
+/// `PRRT_kwDOUq78ts6mvTBb` への対応）: `create_sink`（通常モード、非
 /// `O_APPEND`）で開いたライブセッション中に、別ハンドルで `set_len(0)` する。
 ///
-/// 検証するのは「truncate 後に ACK された M 件のレコードが、ファイル末尾に
-/// バイト完全一致で欠落なく存在すること」（IO-4 の整合性要件）であり、
-/// truncate 前の領域がどうなるか（ゼロ埋めの穴が残るか、それとも将来
-/// [`AppendFileSink`] が現在の EOF に追随するよう修正されて穴自体が生じなく
-/// なるか）は成功条件にしない。どちらの実装でも末尾の M 件は変わらず、
-/// この assert は両方の実装で成立する。
+/// 現在の [`AppendFileSink::new`] は一度だけ現在の EOF（`N*BODY_LEN`）へ
+/// `seek` し、以後の `write_all` はその古いオフセットへ書き込み続けるため
+/// （ドキュメント参照）、外部 truncate 後もカーソルが追随せず、
+/// `[0, N*BODY_LEN)` がゼロ埋めの穴として残る（POSIX `write(2)`・Windows
+/// `WriteFile` いずれも決定的）。モジュール doc が約束する「ファイル内容の
+/// 完全一致」（IO-4・REPAIR-6・#81 受入基準）を満たすため、この穴を含む
+/// 現在のファイル全体を具体的なバイト列（ゼロ埋め `N*BODY_LEN` バイト＋
+/// truncate 後の M 件）と完全一致で検証する。末尾 M 件だけの比較では
+/// この穴が残っても成功してしまい、アサーション弱体化になる
+/// （AGENTS.md「アサーション弱体化による回帰検出の後退」P0）。
 ///
-/// # 既知の限界（記録のみ・非 assert）
-/// 現在の [`AppendFileSink::new`] は一度だけ現在の EOF へ `seek` し、以後の
-/// `write_all` はその古いオフセットへ書き込み続けるため（ドキュメント
-/// 参照）、外部 truncate 後もカーソルが追随せず、`[0, N*BODY_LEN)` が
-/// ゼロ埋めの穴になる（POSIX `write(2)`・Windows `WriteFile` いずれも
-/// 決定的）。`append_mode_sink`（T4）はこの穴を避けられることの対比になる。
+/// 将来 [`AppendFileSink`] が現在の EOF に追随するよう修正され、この穴が
+/// 生じなくなった場合は、このケースの期待値（`expected` の構築）を
+/// 更新すること（`append_mode_sink`（T4）はこの穴を避けられることの
+/// 対比になる）。
 #[test]
 fn io4_truncate_live_session_normal_mode_post_truncate_records_intact_at_tail() {
     const BODY_LEN: usize = 16;
@@ -651,21 +653,22 @@ fn io4_truncate_live_session_normal_mode_post_truncate_records_intact_at_tail() 
     let report = session.finish();
     assert_eq!(report.stats.acks_sent, u64::from(N + M));
 
-    let expected_tail = records(0, N..N + M, BODY_LEN);
+    // `create_sink` は非 append モードで、`AppendFileSink::new` が truncate
+    // 前の EOF（`N*BODY_LEN`）へ一度だけ seek しているため、外部 truncate 後
+    // の書き込みもその古いオフセットへ着地し、`[0, N*BODY_LEN)` がゼロ埋め
+    // の穴として残る（上記ドキュメンテーションコメント参照）。この穴を
+    // 含めてファイル全体を具体的なバイト列と完全一致で検証する。
+    let mut expected = vec![0u8; N as usize * BODY_LEN];
+    expected.extend(records(0, N..N + M, BODY_LEN));
+
     let actual = std::fs::read(&path).expect("must read file");
-    assert!(
-        actual.len() >= expected_tail.len(),
-        "file must contain at least the post-truncate ACKed records \
-         (actual {} bytes, expected tail {} bytes)",
-        actual.len(),
-        expected_tail.len()
-    );
-    let tail_start = actual.len() - expected_tail.len();
     assert_eq!(
-        &actual[tail_start..],
-        &expected_tail[..],
-        "post-truncate ACKed records must be byte-exact and intact at EOF, \
-         regardless of how the sink lands writes before the truncate point (IO-4/REPAIR-6)"
+        actual, expected,
+        "current AppendFileSink implementation must reproduce the known \
+         zero-fill hole ([0, N*BODY_LEN)) followed by the byte-exact \
+         post-truncate ACKed records at EOF (IO-4/REPAIR-6); update this \
+         expected value if AppendFileSink is changed to track the current \
+         EOF after an external truncate"
     );
 }
 

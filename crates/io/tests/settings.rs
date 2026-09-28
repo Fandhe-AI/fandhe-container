@@ -107,8 +107,8 @@ mod unix {
     use std::time::{Duration, Instant};
 
     use fandhe_container_io::{
-        AppendFileSink, Frame, FrameHeader, FrameKind, IoTimeout, NoopServerObserver, UdsServer,
-        WritebackSettings, WritebackTimeouts, serve_connection,
+        AppendFileSink, Frame, FrameHeader, FrameKind, IoTimeout, NoopServerObserver,
+        WritebackSettings, WritebackTimeouts,
     };
 
     struct TempSocketDir {
@@ -200,10 +200,13 @@ mod unix {
         stream
     }
 
-    /// `WritebackSettings::from_batch_size_arg(batch_size)` で導いた
-    /// `receive_limits()`／`batch_config()` を `UdsServer::bind`／
-    /// `serve_connection` それぞれに渡し、`batch_size` 件ごとに ACK が
-    /// バッチとして届くことを確認する（R1・REPAIR-2 の整合確認）。
+    /// `WritebackSettings::from_batch_size_arg(batch_size)` を
+    /// [`WritebackSettings::bind`]／[`WritebackSettings::serve_connection`]
+    /// という組み合わせ入口経由でそれぞれ呼び、`batch_size` 件ごとに ACK が
+    /// バッチとして届くことを確認する（R1・REPAIR-2・#78 codex レビュー指摘
+    /// 対応。`bind` 側の `ReceiveLimits` と `serve_connection` 側の
+    /// `BatchConfig` を個別に取り出して別々に渡すのではなく、同じ
+    /// `&settings` から導く実際の呼び出し経路を検証する）。
     fn run_batch_size_case(batch_size: usize, batches: usize) {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
@@ -212,9 +215,9 @@ mod unix {
         let settings = WritebackSettings::from_batch_size_arg(&batch_size.to_string())
             .expect("batch_size must be a valid setting");
 
-        let mut server =
-            UdsServer::bind(&socket_path, settings.receive_limits(), NoopServerObserver)
-                .expect("bind must succeed on a private, empty path");
+        let mut server = settings
+            .bind(&socket_path, NoopServerObserver)
+            .expect("bind must succeed on a private, empty path");
 
         let total: u64 = (batch_size * batches) as u64;
         let connect_path = socket_path.clone();
@@ -244,12 +247,7 @@ mod unix {
         let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
 
         let server_thread = std::thread::spawn(move || {
-            serve_connection(
-                &mut connection,
-                settings.batch_config(),
-                &mut sink,
-                writeback_timeouts(),
-            )
+            settings.serve_connection(&mut connection, &mut sink, writeback_timeouts())
         });
 
         let acked_ids = client_thread.join().expect("client thread must not panic");
@@ -293,12 +291,13 @@ mod unix {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn io1_settings_uds_bind_is_unimplemented_on_unsupported_os() {
-    use fandhe_container_io::{IoErrorCode, NoopServerObserver, UdsServer, WritebackSettings};
+    use fandhe_container_io::{IoErrorCode, NoopServerObserver, WritebackSettings};
 
     let settings =
         WritebackSettings::from_batch_size_arg("8").expect("8 must be a valid batch size");
     let path = std::env::temp_dir().join("fcio-settings-unsupported.sock");
-    let err = UdsServer::bind(&path, settings.receive_limits(), NoopServerObserver)
+    let err = settings
+        .bind(&path, NoopServerObserver)
         .expect_err("bind must be unimplemented on unsupported OS");
     assert_eq!(err.code(), IoErrorCode::Unimplemented);
 }

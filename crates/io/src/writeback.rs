@@ -383,7 +383,12 @@ where
 /// [`crate::settings::WritebackSettings`] インスタンスの
 /// [`crate::settings::WritebackSettings::receive_limits`] を渡すことを推奨する
 /// （TASK-13.3・#78。両者を別々の設定値から個別に構築すると、受信ゲートと
-/// 集約ロジックのバッチサイズが食い違う経路を作れてしまう）。
+/// 集約ロジックのバッチサイズが食い違う経路を作れてしまう）。この対応を型で
+/// 保証したい場合は、本関数を直接呼ぶ代わりに
+/// [`crate::settings::WritebackSettings::serve_connection`] を
+/// [`crate::settings::WritebackSettings::bind`] と対で使う
+/// （REPAIR-2。両メソッドは同じ `&WritebackSettings` から値を導くため
+/// 食い違いを作れない）。
 pub fn serve_connection<T, W>(
     conn: &mut T,
     config: BatchConfig,

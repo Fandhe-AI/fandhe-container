@@ -1781,9 +1781,22 @@ mod imp {
         /// 33 本より十分大きい）。拒否された接続が accept 前に閉じられると
         /// `ConnectionAborted` として別のカウンタへ乗ってしまうため、返した
         /// `UnixStream` はテストの最後まで保持する。
+        ///
+        /// 読み取りタイムアウトは connect の直後（サーバーがまだ接続を閉じて
+        /// いない間）に設定しておく。macOS の `setsockopt(SO_RCVTIMEO)` は、相手が
+        /// 切断済みのソケットに対しては `EINVAL` を返すため（本番側は
+        /// `map_set_timeout_error` の H7 で扱う挙動）、サーバーが拒否した接続を
+        /// 閉じた後に設定すると失敗する（J1・#820 PR #1113 の macOS CI 失敗の
+        /// 修正）。
         fn connect_clients(path: &Path, count: usize) -> Vec<UnixStream> {
             (0..count)
-                .map(|_| UnixStream::connect(path).expect("client must be able to connect"))
+                .map(|_| {
+                    let client = UnixStream::connect(path).expect("client must be able to connect");
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .expect("set_read_timeout must succeed while the connection is open");
+                    client
+                })
                 .collect()
         }
 
@@ -1856,11 +1869,9 @@ mod imp {
                 ]
             );
 
-            // 拒否した 3 本はサーバー側で閉じられている（EOF を読む）。
+            // 拒否した 3 本はサーバー側で閉じられている（EOF を読む）。読み取り
+            // タイムアウトは `connect_clients` が接続中に設定済み（J1）。
             for client in clients.iter_mut().take(REJECTIONS as usize) {
-                client
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .expect("set_read_timeout must succeed");
                 let mut buf = [0u8; 1];
                 let n = client
                     .read(&mut buf)

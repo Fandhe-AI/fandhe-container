@@ -108,8 +108,9 @@ impl RequestId {
 
 /// 送信済みで ACK 未受信の 1 リクエストを表す（TASK-12.1）。
 ///
-/// ペイロードそのものは保持しない（再送は本件の範囲外。§2「スコープ境界」）。
-/// 将来フィールドを追加できるよう、フィールドは非公開でアクセサ経由にする。
+/// ペイロードそのものは保持しない（再送はモジュール冒頭の「#74（TASK-12.2）との
+/// 境界」に記した範囲外）。将来フィールドを追加できるよう、フィールドは非公開で
+/// アクセサ経由にする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InFlightRequest {
     id: RequestId,
@@ -218,12 +219,16 @@ impl SendQueue {
     pub fn register(&mut self, kind: FrameKind) -> Result<InFlightRequest, IoError> {
         self.ensure_can_register()?;
         let id = RequestId(self.next_id);
-        // `ensure_can_register` が `checked_add` の成功を確認済みのため、ここでの
-        // インクリメントは安全に行える（未検証の `+= 1` を避けるための事前確認）。
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .expect("checked in ensure_can_register");
+        // `ensure_can_register` で `checked_add` の成功を確認済みだが、ライブラリ
+        // コードは panic させない方針（coding-rust）のため、ここでも `expect` では
+        // なく `Result` 経由でオーバーフローを扱う（到達しないはずの経路も含めて
+        // panic 経路を作らない）。
+        self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
+            IoError::new(
+                IoErrorCode::ResourceExhausted,
+                "request id counter would overflow u64",
+            )
+        })?;
         let request = InFlightRequest { id, kind };
         self.entries.push_back(request);
         Ok(request)

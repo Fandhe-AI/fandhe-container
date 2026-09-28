@@ -26,14 +26,15 @@
 //!
 //! 選定は G2（TASK-11〜25）の中から、io の実出力（設定の実効値・ACK 種別・
 //! エラー構造・文書中の契約文言）を文字列パターンまたは構造化データとして
-//! 照合できるものに限った。一覧の内容はこの表を正としつつ、機械的にも確認
-//! できるよう [`ACCEPTANCE_TARGETS`] に同じ内容を Rust のデータとして持つ
-//! （表とデータが食い違ったらデータ表を正とする）。
+//! 照合できるものに限った。この表を正とし、[`ACCEPTANCE_TARGETS`] は表と
+//! 同じ内容を Rust のデータとして持つ。両者が食い違っていないことは
+//! [`repair_12_acceptance_targets_are_listed`] が本ファイル自身のソースから
+//! この表を解析して機械照合する（表だけの書き換えでも検出できる）。
 //!
 //! | TASK    | ビヘイビア  | 機械照合する出力仕様                                                                  | 照合方法            | 状態                          |
 //! | ------- | ----------- | -------------------------------------------------------------------------------------- | ------------------- | ----------------------------- |
 //! | TASK-13 | IO-1        | バッチサイズの既定値 64 が設定の実効値に反映されること（`batch_size=<N>`）             | 構造化 assert       | 未接続（TASK-13 で接続）      |
-//! | TASK-15 | IO-2        | 書き込み ACK と FLUSH ACK が別種別として区別され、FLUSH ACK はバリア以前の書き込みの永続化後にのみ返ること | 構造化 assert | 未接続（TASK-11 / 15 で接続） |
+//! | TASK-15 | IO-2        | 書き込み ACK と FLUSH ACK が別種別として区別され、FLUSH ACK はバリア以前の書き込みの永続化後にのみ返ること | 構造化 assert | 未接続（TASK-11 / TASK-15 で接続） |
 //! | TASK-16 | IO-10       | 未フラッシュ滞留量の上限が設定可能で、上限到達時に自動フラッシュが発行されること（`flush_every=<N>`） | 構造化 assert | 未接続（TASK-16 で接続）      |
 //! | TASK-17 | IO-2        | `docs/api/io-barrier.md` に ACK / FLUSH ACK の永続化保証の違いが明記されていること      | 文字列パターン照合  | 未接続（TASK-17 で文書作成後に接続） |
 //! | TASK-19 | IO-5        | 大文字小文字の違いのみで衝突する 2 ファイル作成が構造化エラー（`code`・`message`）で返ること | 構造化 assert  | 未接続（TASK-19 で接続）      |
@@ -89,13 +90,16 @@ struct AcceptanceTarget {
     status: TargetStatus,
 }
 
-/// TASK-91.1 で選定した対象仕様の一覧（モジュールドキュメントの表を正とし、
-/// このデータは表と同じ内容を機械照合できる形で保持したもの）。
+/// TASK-91.1 で選定した対象仕様の一覧。モジュールドキュメントの表と同じ
+/// 内容を機械照合できる形で保持したもの（各フィールドは表の対応する列と
+/// 文字単位で一致させる。[`repair_12_acceptance_targets_are_listed`] が
+/// 本ファイル自身のソースから表を解析して突き合わせるため、フィールドを
+/// 表の文言から乖離させると当該テストが fail する）。
 const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
     AcceptanceTarget {
         task: "TASK-13",
         behavior: "IO-1",
-        spec_fact: "バッチサイズの既定値 64 が設定の実効値に反映されること",
+        spec_fact: "バッチサイズの既定値 64 が設定の実効値に反映されること（`batch_size=<N>`）",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
             planned_task: "TASK-13",
@@ -115,7 +119,7 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
         task: "TASK-16",
         behavior: "IO-10",
         spec_fact: "未フラッシュ滞留量の上限が設定可能で、\
-            上限到達時に自動フラッシュが発行されること",
+            上限到達時に自動フラッシュが発行されること（`flush_every=<N>`）",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
             planned_task: "TASK-16",
@@ -124,7 +128,7 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
     AcceptanceTarget {
         task: "TASK-17",
         behavior: "IO-2",
-        spec_fact: "docs/api/io-barrier.md に ACK / FLUSH ACK の永続化保証の違いが明記されていること",
+        spec_fact: "`docs/api/io-barrier.md` に ACK / FLUSH ACK の永続化保証の違いが明記されていること",
         method: MatchMethod::StringPattern,
         status: TargetStatus::NotWired {
             planned_task: "TASK-17",
@@ -213,72 +217,100 @@ fn repair_12_scaffold_matcher_detects_missing_field() {
     );
 }
 
-/// モジュールドキュメントの表を Rust ソースへ複製した期待値。
+/// 本ファイル自身のソース（コンパイル時に埋め込む）。
 ///
-/// [`repair_12_acceptance_targets_are_listed`] が [`ACCEPTANCE_TARGETS`] の
-/// 各行を `behavior`・`spec_fact`・`method`・`status` まで含めて個別に
-/// 照合するための対照データ（Codex レビュー指摘: 件数と TASK-13 の一部しか
-/// 検証しておらず、他の行を改変しても検出できなかった穴を塞ぐ）。
-const EXPECTED_ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
-    AcceptanceTarget {
-        task: "TASK-13",
-        behavior: "IO-1",
-        spec_fact: "バッチサイズの既定値 64 が設定の実効値に反映されること",
-        method: MatchMethod::StructuredAssert,
-        status: TargetStatus::NotWired {
-            planned_task: "TASK-13",
-        },
-    },
-    AcceptanceTarget {
-        task: "TASK-15",
-        behavior: "IO-2",
-        spec_fact: "書き込み ACK と FLUSH ACK が別種別として区別され、\
-            FLUSH ACK はバリア以前の書き込みの永続化後にのみ返ること",
-        method: MatchMethod::StructuredAssert,
-        status: TargetStatus::NotWired {
-            planned_task: "TASK-11 / TASK-15",
-        },
-    },
-    AcceptanceTarget {
-        task: "TASK-16",
-        behavior: "IO-10",
-        spec_fact: "未フラッシュ滞留量の上限が設定可能で、\
-            上限到達時に自動フラッシュが発行されること",
-        method: MatchMethod::StructuredAssert,
-        status: TargetStatus::NotWired {
-            planned_task: "TASK-16",
-        },
-    },
-    AcceptanceTarget {
-        task: "TASK-17",
-        behavior: "IO-2",
-        spec_fact: "docs/api/io-barrier.md に ACK / FLUSH ACK の永続化保証の違いが明記されていること",
-        method: MatchMethod::StringPattern,
-        status: TargetStatus::NotWired {
-            planned_task: "TASK-17",
-        },
-    },
-    AcceptanceTarget {
-        task: "TASK-19",
-        behavior: "IO-5",
-        spec_fact: "大文字小文字の違いのみで衝突する 2 ファイル作成が\
-            構造化エラー（`code`・`message`）で返ること",
-        method: MatchMethod::StructuredAssert,
-        status: TargetStatus::NotWired {
-            planned_task: "TASK-19",
-        },
-    },
-    AcceptanceTarget {
-        task: "TASK-20",
-        behavior: "IO-5・WIN-4",
-        spec_fact: "260 文字を超える共有パスに警告またはエラーが返ること\
-            （しきい値 260/261 の境界）",
-        method: MatchMethod::StructuredAssert,
-        status: TargetStatus::NotWired {
-            planned_task: "TASK-20",
-        },
-    },
-];
+/// [`parse_doc_table`] がこの文字列からモジュールドキュメントの表
+/// （本ファイル冒頭の `//!` コメント内）を解析し、[`ACCEPTANCE_TARGETS`]
+/// と突き合わせる（Codex レビュー指摘・4 巡目: 表と同じ内容を複製した
+/// Rust 定数同士を比較するだけでは、表だけを書き換えても検出できない。
+/// 表そのものを解析して比較する）。`include_str!` は自ファイルを対象と
+/// するため、`docs/spec` を含む外部ファイルへは一切アクセスしない。
+const SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/acceptance_spec.rs"
+));
+
+/// [`parse_doc_table`] が抽出した、モジュールドキュメントの表 1 行分。
+///
+/// フィールドは表の列（TASK・ビヘイビア・機械照合する出力仕様・照合方法・
+/// 状態）にそれぞれ対応する。`status` 列は `未接続（<planned_task> で
+/// 接続）` / `未接続（<planned_task> で文書作成後に接続）` の形式を前提に
+/// `planned_task` 部分だけを取り出す（現時点で表に現れる状態は `NotWired`
+/// のみのため）。
+struct DocTableRow<'a> {
+    task: &'a str,
+    behavior: &'a str,
+    spec_fact: &'a str,
+    method: MatchMethod,
+    planned_task: &'a str,
+}
+
+/// `source` からモジュールドキュメントの表の行（`//! | TASK-... | ... |`
+/// の形式）を抽出する。
+///
+/// 呼び出し元は [`repair_12_acceptance_targets_are_listed`]。ヘッダ行・
+/// 区切り行（`| ---`）・表以外の `//!` 行・本文中のその他の記述は無視する。
+/// 表の書式（列数・列の文言）が想定と異なる行を見つけた場合は、`unwrap`
+/// 等で panic させず、どの行のどの列が想定と違うかを含む `Err(String)` を
+/// 返す（本ファイル自身の整形式チェックであり外部入力ではないが、
+/// [coding-rust] の「明確な失敗メッセージ」の方針に倣う）。
+///
+/// [coding-rust]: ../../../.claude/rules/coding-rust.md
+fn parse_doc_table(source: &str) -> Result<Vec<DocTableRow<'_>>, String> {
+    let mut rows = Vec::new();
+
+    for line in source.lines() {
+        let Some(content) = line.trim_start().strip_prefix("//!") else {
+            continue;
+        };
+        let content = content.trim();
+        if !content.starts_with("| TASK-") {
+            continue;
+        }
+
+        let columns: Vec<&str> = content
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect();
+        let (task, behavior, spec_fact, method_text, status_text) = match columns.as_slice() {
+            [task, behavior, spec_fact, method_text, status_text] => {
+                (*task, *behavior, *spec_fact, *method_text, *status_text)
+            }
+            other => {
+                return Err(format!(
+                    "表の行の列数が想定（5 列）と異なる（{} 列）: {content:?}",
+                    other.len()
+                ));
+            }
+        };
+
+        let method = match method_text {
+            "構造化 assert" => MatchMethod::StructuredAssert,
+            "文字列パターン照合" => MatchMethod::StringPattern,
+            other => return Err(format!("未知の照合方法列: {other:?}")),
+        };
+
+        let inner = status_text
+            .strip_prefix("未接続（")
+            .and_then(|rest| rest.strip_suffix('）'))
+            .ok_or_else(|| format!("未接続の状態列の形式が想定と異なる: {status_text:?}"))?;
+        let planned_task = inner
+            .split(" で")
+            .next()
+            .ok_or_else(|| format!("状態列から planned_task を抽出できない: {status_text:?}"))?;
+
+        rows.push(DocTableRow {
+            task,
+            behavior,
+            spec_fact,
+            method,
+            planned_task,
+        });
+    }
+
+    Ok(rows)
+}
 
 /// TASK-15（IO-2）の FLUSH ACK 永続化条件・ACK 種別区別を照合するための、
 /// 単一 io イベントの暫定表現（Codex レビュー指摘対応・2 巡目）。
@@ -713,14 +745,14 @@ fn repair_12_scaffold_matcher_rejects_duplicate_barrier_request_before_ack() {
 /// ドキュメントの表と一致する件数・内容を持つことを機械照合する
 /// （TASK-91.1 の受け入れ条件「一覧化」を機械照合するテスト）。
 ///
-/// 件数と `task` の前方一致チェックに加え、[`EXPECTED_ACCEPTANCE_TARGETS`]
-/// との突き合わせで全行の `behavior`・`spec_fact`・`method`・`status` を
-/// 個別に照合する。行の内容（TASK-15 の FLUSH ACK 永続化条件を含む）が
-/// 改変されても検出できる。
+/// 単純な複製定数同士の突き合わせでは表だけの書き換えを検出できない
+/// （Codex レビュー指摘・4 巡目）ため、[`parse_doc_table`] で本ファイル
+/// 自身のソースからモジュールドキュメントの表を実際に解析し、
+/// [`ACCEPTANCE_TARGETS`] の全行を `task`・`behavior`・`spec_fact`・
+/// `method`・`status`（`planned_task`）まで個別に照合する。
 #[test]
 fn repair_12_acceptance_targets_are_listed() {
     assert_eq!(ACCEPTANCE_TARGETS.len(), 6);
-    assert_eq!(ACCEPTANCE_TARGETS.len(), EXPECTED_ACCEPTANCE_TARGETS.len());
 
     for target in ACCEPTANCE_TARGETS {
         assert!(
@@ -738,30 +770,36 @@ fn repair_12_acceptance_targets_are_listed() {
         );
     }
 
-    for (actual, expected) in ACCEPTANCE_TARGETS
-        .iter()
-        .zip(EXPECTED_ACCEPTANCE_TARGETS.iter())
-    {
-        assert_eq!(actual.task, expected.task, "task の不一致");
+    let doc_rows = parse_doc_table(SOURCE)
+        .expect("モジュールドキュメントの表の解析に失敗した（表の書式を確認する）");
+    assert_eq!(
+        ACCEPTANCE_TARGETS.len(),
+        doc_rows.len(),
+        "モジュールドキュメントの表の行数と ACCEPTANCE_TARGETS の件数が一致しない"
+    );
+
+    for (target, row) in ACCEPTANCE_TARGETS.iter().zip(doc_rows.iter()) {
+        assert_eq!(target.task, row.task, "task の不一致（表 vs データ）");
         assert_eq!(
-            actual.behavior, expected.behavior,
-            "{}: behavior の不一致",
-            actual.task
+            target.behavior, row.behavior,
+            "{}: behavior の不一致（表 vs データ）",
+            target.task
         );
         assert_eq!(
-            actual.spec_fact, expected.spec_fact,
-            "{}: spec_fact の不一致",
-            actual.task
+            target.spec_fact, row.spec_fact,
+            "{}: spec_fact の不一致（表 vs データ）",
+            target.task
         );
         assert_eq!(
-            actual.method, expected.method,
-            "{}: method の不一致",
-            actual.task
+            target.method, row.method,
+            "{}: method の不一致（表 vs データ）",
+            target.task
         );
+        let TargetStatus::NotWired { planned_task } = target.status;
         assert_eq!(
-            actual.status, expected.status,
-            "{}: status の不一致",
-            actual.task
+            planned_task, row.planned_task,
+            "{}: status（planned_task）の不一致（表 vs データ）",
+            target.task
         );
     }
 }

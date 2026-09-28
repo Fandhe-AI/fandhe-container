@@ -285,6 +285,55 @@ mod unix {
     fn io1_settings_batch_size_64_via_uds_fires_at_configured_count() {
         run_batch_size_case(64, 1);
     }
+
+    /// IO-1・TASK-13.3・#1115 Bugbot レビュー指摘対応: `WritebackSettings::bind`
+    /// が返す [`fandhe_container_io::BoundWriteback`] は、渡した `observer` を
+    /// ラッパーの中へ隠さず `observer()` / `observer_mut()` 経由で取り出せる。
+    /// `JsonLinesServerObserver` を bind に渡した場合、`accept` が発火させる
+    /// Accept イベントが `observer_mut().drain_lines()` で実際に取り出せる
+    /// ことを、素の `NoopServerObserver` ではなく `JsonLinesServerObserver` を
+    /// 使った実接続で確認する（推奨経路〔bind/accept〕にこの観測フックを渡すと
+    /// Accept / 接続イベントを収集できなくなっていた、という指摘の再現条件を
+    /// そのまま実行する）。
+    #[test]
+    fn io1_settings_bound_writeback_observer_forwards_accept_events() {
+        use fandhe_container_io::JsonLinesServerObserver;
+
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+
+        let settings =
+            WritebackSettings::from_batch_size_arg("1").expect("1 must be a valid batch size");
+
+        let mut server = settings
+            .bind(&socket_path, JsonLinesServerObserver::new())
+            .expect("bind must succeed on a private, empty path");
+
+        assert!(
+            server.observer().is_empty(),
+            "no Accept event must have been recorded before any client connects"
+        );
+
+        let connect_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            // 接続を確立するだけでよく、フレームの送受信までは不要
+            // （`accept` が Accept イベントを記録することの確認が目的）。
+            let _stream = connect(&connect_path);
+        });
+
+        let connection = server
+            .accept(test_timeout(), fandhe_container_io::NoopServerObserver)
+            .expect("server must accept the client connection within the timeout");
+        drop(connection);
+        client_thread.join().expect("client thread must not panic");
+
+        let lines = server.observer_mut().drain_lines();
+        assert!(
+            !lines.is_empty(),
+            "BoundWriteback::observer_mut() must forward accept's Accept event to the \
+             JsonLinesServerObserver passed to WritebackSettings::bind"
+        );
+    }
 }
 
 /// 非対応 OS（Windows）では `UdsServer::bind` が常に `Unimplemented` を返す

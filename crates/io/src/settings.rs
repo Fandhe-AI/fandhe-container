@@ -147,9 +147,12 @@ impl FromStr for BatchConfig {
 /// [`crate::server::UdsServer::bind`] が使う [`ReceiveLimits`] を同じ内部値
 /// から導く。両者を別々に構築して渡すと、呼び出し側の実装ミスで異なる
 /// バッチサイズを受信ゲートと集約ロジックへ与えてしまえる（REPAIR-2）ため、
-/// [`Self::bind`] / [`Self::serve_connection`] という組み合わせ入口を経由する
-/// ことを推奨する（この 2 メソッドだけが型で不整合を防げる。モジュール doc
-/// 参照）。[`Self::batch_config`] / [`Self::receive_limits`] は、外部の
+/// [`Self::bind`] → [`BoundWriteback::accept`] → [`BoundConnection::serve`]
+/// という組み合わせ入口を経由することを推奨する（この経路だけが型で
+/// 不整合を防げる。モジュール doc 参照）。`Self::serve_connection` という
+/// 独立メソッドは存在しない（#1115 codex レビュー指摘対応: 過去の設計案の
+/// 名残りで doc がこの経路を指していたが実装と食い違っていたため修正）。
+/// [`Self::batch_config`] / [`Self::receive_limits`] は、外部の
 /// `UdsServer::bind` 呼び出しと組み合わせるなど、値だけを取り出したい
 /// 呼び出し元向けに残す。
 ///
@@ -257,6 +260,24 @@ impl<O: ServerObserver> BoundWriteback<O> {
         self.settings
     }
 
+    /// [`Self::bind`]（[`WritebackSettings::bind`]）で渡した観測フックを
+    /// 参照する（[`crate::server::UdsServer::observer`] への委譲。#1115
+    /// Bugbot レビュー指摘対応: `BoundWriteback` が `UdsServer` を包む前は
+    /// 呼び出し側が `UdsServer::observer` を直接呼べたが、ラップしたことで
+    /// 経路が失われていた）。
+    pub fn observer(&self) -> &O {
+        self.server.observer()
+    }
+
+    /// [`Self::bind`]（[`WritebackSettings::bind`]）で渡した観測フックを
+    /// 可変参照で取り出す（[`crate::server::UdsServer::observer_mut`] への
+    /// 委譲）。[`crate::observe::JsonLinesServerObserver::drain_lines`] 等、
+    /// Accept イベントをためた行として取り出す操作に使う（#1115 Bugbot
+    /// レビュー指摘対応）。
+    pub fn observer_mut(&mut self) -> &mut O {
+        self.server.observer_mut()
+    }
+
     /// [`crate::server::UdsServer::accept`] を呼び、返す接続へ bind に使った
     /// 設定を引き継がせる（TASK-13.3・#1115 codex レビュー指摘対応）。
     /// `timeout`・`conn_observer` の意味は
@@ -302,6 +323,20 @@ impl<C: ServerObserver> BoundConnection<C> {
     /// bind・accept に使った設定を返す。
     pub fn settings(&self) -> WritebackSettings {
         self.settings
+    }
+
+    /// [`Self::accept`]（[`BoundWriteback::accept`]）で渡した観測フックを
+    /// 参照する（[`crate::server::UdsConnection::observer`] への委譲。#1115
+    /// Bugbot レビュー指摘対応）。
+    pub fn observer(&self) -> &C {
+        self.conn.observer()
+    }
+
+    /// [`Self::accept`]（[`BoundWriteback::accept`]）で渡した観測フックを
+    /// 可変参照で取り出す（[`crate::server::UdsConnection::observer_mut`]
+    /// への委譲。#1115 Bugbot レビュー指摘対応）。
+    pub fn observer_mut(&mut self) -> &mut C {
+        self.conn.observer_mut()
     }
 
     /// [`crate::writeback::serve_connection`] を、自身が保持する

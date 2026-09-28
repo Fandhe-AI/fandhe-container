@@ -7,11 +7,13 @@
 //! [`crate::transport::FrameSender`] へ橋渡しするクライアント（[`PipelineClient`]）を
 //! 提供する。[`PipelineClient::send`] の成功・失敗カウントとレイテンシ分布は
 //! [`SendMetrics`]（[`PipelineClient::metrics`] で参照）として観測できるほか、
-//! 送信のたびに [`crate::observe::SendObserver`] へイベント通知する（既定は
-//! [`NoopSendObserver`]。[`PipelineClient::with_observer`] で
-//! [`crate::observe::JsonLinesSendObserver`] 等へ差し替えられる。`on_send` は
-//! 送信経路から同期で呼ばれるためブロックする I/O をしてはならず
-//! （REPAIR-5。[`crate::observe`] モジュールドキュメント参照）、
+//! 送信のたびに [`crate::observe::SendObserver`] へイベント通知する。
+//! [`PipelineClient::new`] は観測フックを必須引数として要求し（TASK-12.1・#73
+//! codex 再指摘対応。P1・REPAIR-4）、観測しない場合は呼び出し元が
+//! [`crate::observe::NoopSendObserver`] を明示的に渡す（暗黙に破棄しない）。
+//! [`crate::observe::JsonLinesSendObserver`] 等へ差し替えれば送信イベントを記録
+//! できる。`on_send` は送信経路から同期で呼ばれるためブロックする I/O をしては
+//! ならず（REPAIR-5。[`crate::observe`] モジュールドキュメント参照）、
 //! [`crate::observe::JsonLinesSendObserver`] はメモリ内にためるだけで、実際の
 //! 書き出しは [`PipelineClient::observer_mut`] 経由で取り出した観測フックに対し
 //! 呼び出し元が行う。base 側 AGENTS.md の可観測性要件・REPAIR-4）。
@@ -40,7 +42,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::error::{IoError, IoErrorCode};
-use crate::observe::{NoopSendObserver, SendEvent, SendEventError, SendObserver};
+#[cfg(test)]
+use crate::observe::NoopSendObserver;
+use crate::observe::{SendEvent, SendEventError, SendObserver};
 use crate::protocol::{Frame, FrameKind};
 use crate::transport::{FrameSender, IoTimeout};
 
@@ -470,19 +474,59 @@ pub enum SendOutcome {
     TransportFailure,
 }
 
-/// 所要時間の分布を件数・合計・最小・最大で集計する（TASK-12.1・#73 codex 指摘
-/// 対応。P1・REPAIR-4）。
+/// [`LatencyStats`] のヒストグラムのバケット数（TASK-12.1・#73 codex 再指摘対応。
+/// P1・REPAIR-4・REPAIR-3）。
 ///
-/// ヒストグラム等の詳細な分布は持たない軽量な集計であり、外部メトリクス基盤への
-/// エクスポートも持たない（REPAIR-3。スタブの明示。詳細な分布・エクスポートは
-/// 別タスクで拡張してよい）。[`SendMetrics`] が送信結果種別ごとに保持し、
-/// [`PipelineClient::metrics`] 経由で読み出す。
+/// バケット `i`（`1..=LATENCY_HISTOGRAM_BUCKETS - 2`）は `[2^(i-1), 2^i)` マイクロ秒を
+/// 表し、バケット `0` は `0µs` 以上 `1µs` 未満を表す。最後のバケット
+/// （`LATENCY_HISTOGRAM_BUCKETS - 1`）は上限なしで
+/// `2^(LATENCY_HISTOGRAM_BUCKETS - 2)` マイクロ秒以上のすべてを受け持つ
+/// （[`latency_bucket_index`]）。`25` は、最後のバケットの下限
+/// （`2^23 = 8_388_608µs` ≒ 8.39 秒）が [`crate::transport::MAX_IO_TIMEOUT`]
+/// （10 秒）以下になるよう選んだ値で、`MAX_IO_TIMEOUT` を超える所要時間は必ず
+/// 最後のバケットに入る（下記の `const` assert で保証する）。
+pub const LATENCY_HISTOGRAM_BUCKETS: usize = 25;
+
+/// [`LATENCY_HISTOGRAM_BUCKETS`] が [`crate::transport::MAX_IO_TIMEOUT`] を
+/// 超える所要時間を最後のバケットで受け持てることをコンパイル時に保証する
+/// （バケット数を変更した際に、この前提が壊れていないかを検出する）。
+const _: () = assert!(
+    (1u128 << (LATENCY_HISTOGRAM_BUCKETS - 2)) <= crate::transport::MAX_IO_TIMEOUT.as_micros(),
+    "LATENCY_HISTOGRAM_BUCKETS は、最後のバケットの下限が MAX_IO_TIMEOUT 以下になる \
+     大きさでなければならない（MAX_IO_TIMEOUT を超える値が最後のバケットに入らなくなる）"
+);
+
+/// `micros` が属するヒストグラムのバケット番号を返す（[`LATENCY_HISTOGRAM_BUCKETS`]
+/// のドキュメント参照）。`0` はバケット `0`、それ以外は `ilog2(micros) + 1` を
+/// 最後のバケット番号で飽和させた値になる（`u64::ilog2` は `0` に対して
+/// panic するため、`0` は先に分岐する）。
+fn latency_bucket_index(micros: u64) -> usize {
+    if micros == 0 {
+        return 0;
+    }
+    // `ilog2` は `usize` へ変換してから加算する（`u32` のまま `+1` しても桁あふれは
+    // 実用上起こらないが、以降の比較・添字アクセスを `usize` へ統一するため変換する）。
+    let raw = micros.ilog2() as usize + 1;
+    raw.min(LATENCY_HISTOGRAM_BUCKETS - 1)
+}
+
+/// 所要時間の分布を件数・合計・最小・最大・ヒストグラムで集計する（TASK-12.1・#73
+/// codex 指摘対応。P1・REPAIR-4。ヒストグラムは #73 codex 再指摘対応。REPAIR-3・
+/// REPAIR-4「所要時間分布」の doc と実装を一致させる）。
+///
+/// 外部メトリクス基盤へのエクスポートは持たない（REPAIR-3。スタブの明示。
+/// エクスポートは別タスクで拡張してよい）。[`SendMetrics`] が送信結果種別ごとに
+/// 保持し、[`PipelineClient::metrics`] 経由で読み出す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LatencyStats {
     count: u64,
     total: Duration,
     min: Option<Duration>,
     max: Option<Duration>,
+    /// マイクロ秒の 2 のべき乗境界のヒストグラム（[`LATENCY_HISTOGRAM_BUCKETS`]の
+    /// doc 参照）。固定長配列でアロケーションを伴わず、各バケットは
+    /// `saturating_add` で増やす（オーバーフローで panic・巻き戻りをしない）。
+    buckets: [u64; LATENCY_HISTOGRAM_BUCKETS],
 }
 
 impl LatencyStats {
@@ -497,6 +541,17 @@ impl LatencyStats {
             Some(current) => current.max(elapsed),
             None => elapsed,
         });
+        // `Duration::as_micros` は `u128` を返すため、`u64` へ縮める際は `try_from`
+        // で飽和させる（`as` キャストによる無言の切り捨てをしない。coding-rust
+        // 「外部入力」観点に準じ、境界値〔`Duration::MAX`〕でも panic させない）。
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let index = latency_bucket_index(micros);
+        // 添字アクセス（`[]`）を使わず `get_mut` で範囲を確認してから更新する
+        // （`index` は `latency_bucket_index` が必ず範囲内に収める契約だが、
+        // 万一の不整合でも panic させない）。
+        if let Some(bucket) = self.buckets.get_mut(index) {
+            *bucket = bucket.saturating_add(1);
+        }
     }
 
     /// 観測件数を返す。
@@ -533,6 +588,24 @@ impl LatencyStats {
             return None;
         }
         Duration::try_from_secs_f64(self.total.as_secs_f64() / self.count as f64).ok()
+    }
+
+    /// ヒストグラムの各バケットの観測件数を返す（[`LATENCY_HISTOGRAM_BUCKETS`]の
+    /// doc にバケット境界の定義がある）。
+    pub fn histogram(&self) -> &[u64; LATENCY_HISTOGRAM_BUCKETS] {
+        &self.buckets
+    }
+
+    /// `index` 番目のバケットが表す上限（排他的。マイクロ秒）を返す。
+    ///
+    /// 最後のバケット（`LATENCY_HISTOGRAM_BUCKETS - 1`。上限なし）と範囲外の
+    /// `index` はどちらも `None` を返す（呼び出し元が「上限なし」と「無効な
+    /// index」を区別したい場合は [`LATENCY_HISTOGRAM_BUCKETS`] と比較する）。
+    pub fn bucket_upper_bound_micros(index: usize) -> Option<u64> {
+        if index >= LATENCY_HISTOGRAM_BUCKETS - 1 {
+            return None;
+        }
+        Some(1u64 << index)
     }
 }
 
@@ -622,7 +695,7 @@ impl SendMetrics {
 /// 「#74（TASK-12.2）との境界」を参照）。`&mut self` を要求し、単一スレッド前提
 /// （[`crate::transport::FrameSender`] と同じ契約）。
 #[derive(Debug)]
-pub struct PipelineClient<S, O = NoopSendObserver>
+pub struct PipelineClient<S, O>
 where
     S: FrameSender<Frame = Frame>,
     O: SendObserver,
@@ -645,19 +718,10 @@ where
     /// 指摘対応。P1・REPAIR-4）。
     metrics: SendMetrics,
     /// [`Self::send`] のたびに通知する送信イベントの観測フック（TASK-12.1・#73
-    /// codex 指摘対応。P1・REPAIR-4）。既定は [`NoopSendObserver`]。
+    /// codex 指摘対応。P1・REPAIR-4）。[`Self::new`] の必須引数であり、観測しない
+    /// 場合は呼び出し元が [`crate::observe::NoopSendObserver`] を明示的に渡す（codex P1 再指摘
+    /// 対応。既定を暗黙に選ばず、観測先の指定を構築時の必須契約にする）。
     observer: O,
-}
-
-impl<S> PipelineClient<S, NoopSendObserver>
-where
-    S: FrameSender<Frame = Frame>,
-{
-    /// トランスポートと未 ACK 件数上限からクライアントを作る（観測フックは
-    /// [`NoopSendObserver`]。送信イベントを記録したい場合は [`Self::with_observer`] を使う）。
-    pub fn new(sender: S, limit: InFlightLimit) -> Self {
-        Self::with_observer(sender, limit, NoopSendObserver)
-    }
 }
 
 impl<S, O> PipelineClient<S, O>
@@ -668,10 +732,17 @@ where
     /// トランスポート・未 ACK 件数上限・送信イベントの観測フックからクライアントを
     /// 作る（TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）。
     ///
+    /// `observer` は必須引数であり、観測しない場合は呼び出し元が
+    /// [`crate::observe::NoopSendObserver`] を明示的に渡す（codex P1 再指摘対応: `NoopSendObserver`
+    /// を暗黙の既定にすると、通常の利用経路で送信成功・失敗や上限到達のイベントが
+    /// 呼び出し元に気づかれないまま破棄され、base 側 AGENTS.md の可観測性要件
+    /// 〔REPAIR-4〕を満たさない。観測先の指定を構築時の必須契約にすることで、
+    /// 「観測しない」ことを呼び出し元の明示的な選択にする）。
+    ///
     /// `observer` には [`crate::observe::JsonLinesSendObserver`] 等、送信イベントを
     /// 記録する実装を渡せる。渡した観測フックは [`Self::observer_mut`] で
     /// 取り出せる。
-    pub fn with_observer(sender: S, limit: InFlightLimit, observer: O) -> Self {
+    pub fn new(sender: S, limit: InFlightLimit, observer: O) -> Self {
         Self {
             sender,
             queue: SendQueue::new(limit),
@@ -690,20 +761,20 @@ where
     /// （TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）。呼び出し元はここから
     /// 読み出した値を、任意のログ・メトリクス基盤へ変換して出力する。
     ///
-    /// 送信の都度リアルタイムに出力したい場合は [`Self::with_observer`] で
-    /// [`SendObserver`] を差し込む（本メソッドは呼び出し元が明示的に読み出す
+    /// 送信の都度リアルタイムに出力したい場合は [`Self::new`] へ渡す
+    /// [`SendObserver`] を使う（本メソッドは呼び出し元が明示的に読み出す
     /// 集計値であり、送信のたびに自動で外部へ出力する経路ではない）。
     pub fn metrics(&self) -> &SendMetrics {
         &self.metrics
     }
 
-    /// [`Self::with_observer`] で差し込んだ観測フックを参照する（TASK-12.1・#73
+    /// [`Self::new`] へ渡した観測フックを参照する（TASK-12.1・#73
     /// codex 再指摘対応。P1・REPAIR-4）。
     pub fn observer(&self) -> &O {
         &self.observer
     }
 
-    /// [`Self::with_observer`] で差し込んだ観測フックを可変参照で取り出す
+    /// [`Self::new`] へ渡した観測フックを可変参照で取り出す
     /// （TASK-12.1・#73 codex 再指摘対応。P1・REPAIR-4・REPAIR-5）。
     ///
     /// [`crate::observe::JsonLinesSendObserver`] のようにメモリ内へためるだけの
@@ -803,8 +874,8 @@ where
     /// # 観測（TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）
     ///
     /// 呼び出しごとに結果種別（[`SendOutcome`]）を [`Self::metrics`] へ記録し、
-    /// [`SendEvent`] として [`Self::observer`]（`observer` フィールド。既定は
-    /// [`NoopSendObserver`]）へも通知する。上限到達
+    /// [`SendEvent`] として [`Self::observer`]（`observer` フィールド。[`Self::new`]
+    /// の必須引数）へも通知する。上限到達
     /// （[`SendOutcome::RejectedResourceExhausted`]）・トランスポート失敗
     /// （[`SendOutcome::TransportFailure`]）も含め、すべての分岐を計上・通知する。
     /// 所要時間はトランスポートへ実際に書き込んだ呼び出し（成功・失敗の両方）に
@@ -1035,7 +1106,7 @@ mod tests {
     #[test]
     fn io1_pipeline_client_preserves_send_order() {
         let limit = InFlightLimit::new(4).expect("4 must be valid");
-        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         let mut ids = Vec::new();
         let mut requests = Vec::new();
@@ -1087,7 +1158,7 @@ mod tests {
     #[test]
     fn io1_pipeline_client_rejects_when_limit_reached() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
-        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         let first = client
             .send(&write_frame(1), test_timeout())
@@ -1128,7 +1199,7 @@ mod tests {
     #[test]
     fn io1_pipeline_client_accepts_after_slot_released() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
-        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         let first = client
             .send(&write_frame(1), test_timeout())
@@ -1257,7 +1328,7 @@ mod tests {
     #[test]
     fn io1_pipeline_client_poisons_on_transport_error() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
-        let mut client = PipelineClient::new(AlwaysTimeoutSender, limit);
+        let mut client = PipelineClient::new(AlwaysTimeoutSender, limit, NoopSendObserver);
 
         let err = client
             .send(&write_frame(1), test_timeout())
@@ -1283,7 +1354,7 @@ mod tests {
     #[test]
     fn io1_pipeline_client_into_inner_rejects_poisoned() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
-        let mut client = PipelineClient::new(AlwaysTimeoutSender, limit);
+        let mut client = PipelineClient::new(AlwaysTimeoutSender, limit, NoopSendObserver);
 
         client
             .send(&write_frame(1), test_timeout())
@@ -1306,7 +1377,7 @@ mod tests {
     #[test]
     fn io1_pipeline_client_into_inner_rejects_unacked_requests() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
-        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         client
             .send(&write_frame(1), test_timeout())
@@ -1327,7 +1398,7 @@ mod tests {
     #[test]
     fn io1_pipeline_client_into_inner_accepts_when_queue_drained() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
-        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         let request = client
             .send(&write_frame(1), test_timeout())
@@ -1349,7 +1420,7 @@ mod tests {
     #[test]
     fn io1_pipeline_client_reserves_id_before_send_and_does_not_reuse_after_poison() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
-        let mut client = PipelineClient::new(FailOnceSender::default(), limit);
+        let mut client = PipelineClient::new(FailOnceSender::default(), limit, NoopSendObserver);
 
         let first_attempt = client
             .send(&write_frame(1), test_timeout())
@@ -1375,7 +1446,8 @@ mod tests {
         assert_eq!(err.code(), IoErrorCode::Unavailable);
 
         // 新しい接続（新しい `PipelineClient`）でのみ id `0` から採番が再開される。
-        let mut fresh_client = PipelineClient::new(RecordingSender::default(), limit);
+        let mut fresh_client =
+            PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
         let request = fresh_client
             .send(&write_frame(1), test_timeout())
             .expect("a fresh connection must succeed");
@@ -1389,7 +1461,7 @@ mod tests {
     #[test]
     fn io1_pipeline_client_rejects_response_frame_kinds() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
-        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         let ack_frame = Frame::new(FrameKind::Ack, Vec::new()).expect("frame must be valid");
         let err = client
@@ -1420,7 +1492,7 @@ mod tests {
     #[test]
     fn io1_send_queue_rejects_id_overflow() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
-        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
         // `pub(crate)` ではなく `#[cfg(test)]` の内部ヘルパーで直接キューの状態を
         // 書き換え、`u64::MAX` からの採番がオーバーフローを起こす境界を再現する。
         client.queue.set_next_id_for_test(u64::MAX);
@@ -1482,7 +1554,7 @@ mod tests {
     /// （`FrameSender: Send` の supertrait により自動的に成立する）。
     #[test]
     fn io1_pipeline_client_is_send() {
-        assert_send::<PipelineClient<RecordingSender>>();
+        assert_send::<PipelineClient<RecordingSender, NoopSendObserver>>();
     }
 
     /// TASK-12.1（#73 codex 指摘対応。P1・REPAIR-4）: 成功した送信は
@@ -1491,7 +1563,7 @@ mod tests {
     #[test]
     fn repair4_send_metrics_counts_success_and_latency() {
         let limit = InFlightLimit::new(4).expect("4 must be valid");
-        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         client
             .send(&write_frame(1), test_timeout())
@@ -1515,7 +1587,7 @@ mod tests {
     #[test]
     fn repair4_send_metrics_counts_resource_exhausted() {
         let limit = InFlightLimit::new(1).expect("1 must be valid");
-        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         client
             .send(&write_frame(1), test_timeout())
@@ -1539,7 +1611,7 @@ mod tests {
     #[test]
     fn repair4_send_metrics_counts_transport_failure_and_poisoned_rejection() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
-        let mut client = PipelineClient::new(AlwaysTimeoutSender, limit);
+        let mut client = PipelineClient::new(AlwaysTimeoutSender, limit, NoopSendObserver);
 
         client
             .send(&write_frame(1), test_timeout())
@@ -1556,7 +1628,7 @@ mod tests {
     }
 
     /// TASK-12.1（#73 codex 再指摘対応。P1・REPAIR-4・REPAIR-5）:
-    /// [`PipelineClient::with_observer`] に差し込んだ
+    /// [`PipelineClient::new`] に差し込んだ
     /// [`crate::observe::JsonLinesSendObserver`] が、成功・上限到達（早期拒否）の
     /// 2 件それぞれで 1 行ずつ JSON Lines をメモリ内にためる。`on_send` 自体は
     /// I/O をせず（REPAIR-5）、`observer_mut().drain_lines()` で呼び出し元が
@@ -1568,7 +1640,7 @@ mod tests {
 
         let limit = InFlightLimit::new(1).expect("1 must be valid");
         let observer = JsonLinesSendObserver::new();
-        let mut client = PipelineClient::with_observer(RecordingSender::default(), limit, observer);
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, observer);
 
         client
             .send(&write_frame(1), test_timeout())
@@ -1606,7 +1678,7 @@ mod tests {
     #[test]
     fn repair4_send_metrics_counts_invalid_frame_kind() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
-        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         let ack_frame = Frame::new(FrameKind::Ack, Vec::new()).expect("frame must be valid");
         client
@@ -1679,7 +1751,7 @@ mod tests {
     fn repair5_repair12_notify_borrows_error_message_without_copying_huge_message() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
         let observer = PtrCapturingObserver::default();
-        let mut client = PipelineClient::with_observer(HugeMessageTimeoutSender, limit, observer);
+        let mut client = PipelineClient::new(HugeMessageTimeoutSender, limit, observer);
 
         let err = client
             .send(&write_frame(1), test_timeout())
@@ -1781,7 +1853,7 @@ mod tests {
     #[test]
     fn io1_repair12_poisoned_client_stays_poisoned_after_draining_queue() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
-        let mut client = PipelineClient::new(AlwaysTimeoutSender, limit);
+        let mut client = PipelineClient::new(AlwaysTimeoutSender, limit, NoopSendObserver);
 
         client
             .send(&write_frame(1), test_timeout())

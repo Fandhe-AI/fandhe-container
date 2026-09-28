@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use fandhe_container_io::{
     Frame, FrameKind, FrameSender, InFlightLimit, IoError, IoErrorCode, IoTimeout,
-    JsonLinesSendObserver, PipelineClient,
+    JsonLinesSendObserver, NoopSendObserver, PipelineClient,
 };
 
 fn test_timeout() -> IoTimeout {
@@ -44,7 +44,7 @@ impl FrameSender for RecordingSender {
 #[test]
 fn io1_public_api_pipeline_client_rejects_when_limit_reached() {
     let limit = InFlightLimit::new(3).expect("3 must be a valid limit");
-    let mut client = PipelineClient::new(RecordingSender::default(), limit);
+    let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
     let mut ids = Vec::new();
     for byte in 0u8..3 {
@@ -83,7 +83,7 @@ fn io1_public_api_pipeline_client_rejects_when_limit_reached() {
 #[test]
 fn io1_public_api_pipeline_client_releases_slot_and_keeps_order() {
     let limit = InFlightLimit::new(2).expect("2 must be a valid limit");
-    let mut client = PipelineClient::new(RecordingSender::default(), limit);
+    let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
     let first = client
         .send(&write_frame(1), test_timeout())
@@ -125,8 +125,8 @@ fn io1_public_api_pipeline_client_releases_slot_and_keeps_order() {
 #[test]
 fn io1_public_api_pipeline_client_acknowledge_rejects_unknown_and_duplicate() {
     let limit = InFlightLimit::new(2).expect("2 must be a valid limit");
-    let mut client = PipelineClient::new(RecordingSender::default(), limit);
-    let mut other_client = PipelineClient::new(RecordingSender::default(), limit);
+    let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
+    let mut other_client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
     let request = client
         .send(&write_frame(1), test_timeout())
@@ -169,8 +169,8 @@ fn io1_public_api_pipeline_client_acknowledge_rejects_unknown_and_duplicate() {
 #[test]
 fn io1_public_api_pipeline_client_acknowledge_rejects_same_numbered_id_from_another_client() {
     let limit = InFlightLimit::new(2).expect("2 must be a valid limit");
-    let mut client_a = PipelineClient::new(RecordingSender::default(), limit);
-    let mut client_b = PipelineClient::new(RecordingSender::default(), limit);
+    let mut client_a = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
+    let mut client_b = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
     let request_a = client_a
         .send(&write_frame(1), test_timeout())
@@ -237,7 +237,7 @@ fn io1_public_api_in_flight_limit_validation() {
 fn repair5_public_api_observer_mut_drains_buffered_send_log() {
     let limit = InFlightLimit::new(1).expect("1 must be valid");
     let observer = JsonLinesSendObserver::new();
-    let mut client = PipelineClient::with_observer(RecordingSender::default(), limit, observer);
+    let mut client = PipelineClient::new(RecordingSender::default(), limit, observer);
 
     client
         .send(&write_frame(1), test_timeout())

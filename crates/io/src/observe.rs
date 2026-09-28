@@ -151,8 +151,10 @@ pub trait SendObserver: Send {
     fn on_send(&mut self, event: &SendEvent<'_>);
 }
 
-/// 何もしない既定実装（観測フック未指定時に [`crate::client::PipelineClient::new`] が
-/// 使う。TASK-12.1・#73 codex 指摘対応。P1）。
+/// 何もしない実装（観測しない場合に呼び出し元が
+/// [`crate::client::PipelineClient::new`] へ明示的に渡す。`PipelineClient::new`
+/// は観測フックを必須引数として要求するため、暗黙の既定として選ばれることはない。
+/// TASK-12.1・#73 codex 再指摘対応。P1・REPAIR-4）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NoopSendObserver;
 

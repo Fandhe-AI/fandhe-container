@@ -37,8 +37,9 @@ pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
 };
 pub use client::{
-    DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest, MAX_IN_FLIGHT_LIMIT, PipelineClient,
-    RequestId, SendOutcome, SendQueue,
+    DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest, LATENCY_HISTOGRAM_BUCKETS,
+    LatencyStats, MAX_IN_FLIGHT_LIMIT, PipelineClient, RequestId, SendMetrics, SendOutcome,
+    SendQueue,
 };
 pub use error::{IoError, IoErrorCode};
 pub use observe::{

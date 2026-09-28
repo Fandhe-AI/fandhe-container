@@ -160,34 +160,45 @@ run_case "from-json-oversized-input" 2 --from-json "$oversized_input" --label x
 # 値の照合（from-json-ok が exit 0 で返す JSON の各値が期待どおりか。
 # 真偽値のみの assert に頼らず具体値で照合する。coding-rust.md）
 # --------------------------------------------------
-check_value() {
+# 期待値は JSON リテラルで渡し、jq の中で JSON の値として比較する（`jq -e`）。
+# jq の数値の文字列表現は版で異なる（jq 1.6 は 1000.0 を `1000`、jq 1.7 はリテラルの
+# まま `1000.0` と出力する）ため、`jq -r` の出力を文字列比較しない。
+# 引数: <ケース名> <JSON ファイル> <jq フィルタ> <期待値の JSON リテラル>
+check_json_value() {
   local name="$1"
-  local jq_filter="$2"
-  local expected="$3"
+  local json_file="$2"
+  local jq_filter="$3"
+  local expected_json="$4"
   local actual
-  actual=$("$bash_bin" "$target_script" --from-json "${fixtures_dir}/fio-3-ok.json" --label docker_bind_mount 2>/dev/null | jq -r "$jq_filter")
-  if [ "$actual" = "$expected" ]; then
-    echo "PASS: value-${name} (${actual})"
+  actual=$(jq -c "$jq_filter" "$json_file" 2>/dev/null || echo "<unreadable>")
+  if jq -e --argjson want "$expected_json" "(${jq_filter}) == \$want" "$json_file" >/dev/null 2>&1; then
+    echo "PASS: ${name} (${actual})"
   else
-    echo "FAIL: value-${name} (expected ${expected}, actual ${actual})" >&2
+    echo "FAIL: ${name} (expected ${expected_json}, actual ${actual})" >&2
     failures=$((failures + 1))
   fi
 }
 
-check_value "schema-version" ".schema_version" "1"
-check_value "benchmark" ".benchmark" "fio_randwrite_4k"
-check_value "label" ".label" "docker_bind_mount"
-check_value "target-kind" ".target_kind" "from_json"
-check_value "iops" ".metrics.fio_randwrite_4k_iops.value" "1000.0"
-check_value "iops-unit" ".metrics.fio_randwrite_4k_iops.unit" "ops/s"
-check_value "lat-mean-us" ".metrics.fio_randwrite_4k_lat_mean_us.value" "500"
-check_value "clat-p50-us" ".metrics.fio_randwrite_4k_clat_p50_us.value" "400"
-check_value "clat-p95-us" ".metrics.fio_randwrite_4k_clat_p95_us.value" "900"
-check_value "clat-p99-us" ".metrics.fio_randwrite_4k_clat_p99_us.value" "1300"
-check_value "params-rw" ".params.rw" "randwrite"
-check_value "params-bs" ".params.bs" "4k"
-check_value "params-ioengine" ".params.ioengine" "psync"
-check_value "params-end-fsync" ".params.end_fsync" "1"
+from_json_ok_out="${tmp_root}/from-json-ok-out.json"
+"$bash_bin" "$target_script" --from-json "${fixtures_dir}/fio-3-ok.json" --label docker_bind_mount >"$from_json_ok_out" 2>/dev/null || true
+check_value() {
+  check_json_value "value-$1" "$from_json_ok_out" "$2" "$3"
+}
+
+check_value "schema-version" ".schema_version" '1'
+check_value "benchmark" ".benchmark" '"fio_randwrite_4k"'
+check_value "label" ".label" '"docker_bind_mount"'
+check_value "target-kind" ".target_kind" '"from_json"'
+check_value "iops" ".metrics.fio_randwrite_4k_iops.value" '1000'
+check_value "iops-unit" ".metrics.fio_randwrite_4k_iops.unit" '"ops/s"'
+check_value "lat-mean-us" ".metrics.fio_randwrite_4k_lat_mean_us.value" '500'
+check_value "clat-p50-us" ".metrics.fio_randwrite_4k_clat_p50_us.value" '400'
+check_value "clat-p95-us" ".metrics.fio_randwrite_4k_clat_p95_us.value" '900'
+check_value "clat-p99-us" ".metrics.fio_randwrite_4k_clat_p99_us.value" '1300'
+check_value "params-rw" ".params.rw" '"randwrite"'
+check_value "params-bs" ".params.bs" '"4k"'
+check_value "params-ioengine" ".params.ioengine" '"psync"'
+check_value "params-end-fsync" ".params.end_fsync" '1'
 
 # --------------------------------------------------
 # check-bench-regression.sh との回帰比較の round-trip（出力がそのまま
@@ -373,13 +384,7 @@ FIO_STUB_NO_OUTPUT=1 PATH="$stub_path" run_case_msg "run-fio-no-output" 1 "did n
 # run モードの出力の params・target_kind が実際に fio へ渡した条件を表すこと
 run_out="${tmp_root}/run-out.json"
 PATH="$stub_path" run_case "run-ok-output-params" 0 --target-dir "$opts_target" --label x --runtime 5 --numjobs 2 --output "$run_out"
-run_params=$(jq -c '[.target_kind, .params.runtime, .params.numjobs, .params.size]' "$run_out" 2>/dev/null || echo "<unreadable>")
-if [ "$run_params" = '["run",5,2,"256m"]' ]; then
-  echo "PASS: run-output-params-values (${run_params})"
-else
-  echo "FAIL: run-output-params-values (expected [\"run\",5,2,\"256m\"], actual ${run_params})" >&2
-  failures=$((failures + 1))
-fi
+check_json_value "run-output-params-values" "$run_out" '[.target_kind, .params.runtime, .params.numjobs, .params.size]' '["run", 5, 2, "256m"]'
 
 sym_target="${tmp_root}/sym-target"
 real_target="${tmp_root}/real-target"

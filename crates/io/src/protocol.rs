@@ -1,24 +1,61 @@
 //! パイプライン送信・バッチ ACK で使うフレームヘッダの newtype（TASK-11.2・IO-1・
-//! REPAIR-2・MS-1・#69）。
+//! REPAIR-2・MS-1・#69。ヘッダ拡張は #67・#115・REPAIR-5・REPAIR-6）。
 //!
-//! ヘッダは固定長 5 バイト（`[kind: u8][payload_len: u32 LE]`）で、種別
-//! （[`FrameKind`]）とペイロード長（[`PayloadLen`]）だけを持つ。PoC-8
+//! ヘッダは固定長 10 バイト（`[version: u8][kind: u8][payload_len: u32 LE]
+//! [header_crc: u32 LE]`）で、プロトコル版（[`PROTOCOL_VERSION`]）・種別
+//! （[`FrameKind`]）・ペイロード長（[`PayloadLen`]）・ヘッダ単体の CRC-32C
+//! （`header_crc`。`bytes[0..6]` を対象とする）を持つ。PoC-8
 //! （`03-poc/ai-self-repair` の BREAK-2）で `data_len` を 1 バイト少なく申告する
 //! 壊れ方が `cargo build` を素通りした反省から、構築時に上限検証済みの値しか
 //! 表現できない型として組み立てる（REPAIR-2）。
 //!
+//! `header_crc` を追加した理由（設計レビュー P1-2・2026-09-28 オーナー決定）:
+//! ヘッダ単体にチェックサムがないと、ストリーム読み（TASK-12・TASK-13）は
+//! フレーム全体のトレーラ CRC（[`FrameChecksum`]）を検証する前に `body_len()`
+//! （最大 [`MAX_PAYLOAD_LEN`] + [`CHECKSUM_LEN`]）ぶんのバッファを確保して
+//! 待つことになり、1 ビット化けた `payload_len` で巨大確保・待ち続けが起きる。
+//! `header_crc` は 10 バイトのヘッダだけで検証でき、化けたヘッダの値
+//! （`version`・`kind`・`payload_len`）を一切信用せずに早期拒否できる。
+//!
+//! `version` を追加した理由（設計レビュー P1-1）: ホスト側 CLI と microVM
+//! ゲストは別ビルドになり得るため、ワイヤー形式が変わった版ずれを検出できないと
+//! 壊れたペイロードとして誤解釈されうる。バージョンごとのネゴシエーション
+//! （Hello 交換）は MVP では行わず、フレームごとの `version` 照合で不一致を
+//! `Unimplemented` として検出する（`docs/design/io-protocol.md`「バージョン
+//! 方針」）。
+//!
 //! request id・ACK status はヘッダに含めない。それらのペイロード側レイアウトと、
 //! 種別ごとのペイロード長制約（例: 制御フレームは長さ 0）は、本モジュールでは扱わず
 //! TASK-12・TASK-13（またはそれらの後続 sub-issue）が定める（REPAIR-3: 実装済みを
-//! 装わない）。本モジュールが検証するのは (a) 種別が既知の値であること、
-//! (b) ペイロード長が [`MAX_PAYLOAD_LEN`] 以下であること、(c) [`Frame`] 全体の
-//! チェックサムが一致すること、の 3 点。ペイロードは不透明なバイト列として扱う。
+//! 装わない）。[`FrameHeader::from_bytes`] が検証するのは (a) `header_crc` が
+//! `bytes[0..6]` の再計算値と一致すること（不一致なら化けたヘッダの他フィールドを
+//! 一切信用せず即座に拒否する）、(b) `version` が [`PROTOCOL_VERSION`] と一致する
+//! こと、(c) 種別が既知の値であること、(d) ペイロード長が [`MAX_PAYLOAD_LEN`]
+//! 以下であること、の 4 点。[`Frame::decode_body`] はこれに加えて
+//! (e) [`Frame`] 全体（10 バイトヘッダ ‖ ペイロード）のトレーラ CRC
+//! （[`FrameChecksum`]）が一致することを検証する。ペイロードは不透明なバイト列
+//! として扱う。
 //!
 //! [`FrameHeader`] は [`crate::transport::WireFrame`] を実装しない。`WireFrame` は
 //! フレーム全体（ヘッダ + ペイロード + チェックサム。[`Frame`]）を表す型のための
 //! 境界であり、ヘッダ単体はその構成要素の 1 つに過ぎないため。[`Frame::decode`] は
 //! 受信バイト列の先頭 [`FRAME_HEADER_LEN`] バイトを [`FrameHeader::from_bytes`] で
 //! 検証してからペイロード長ぶんのバッファを確保する（DoS 対策。security.md）。
+//!
+//! # ストリーム読みの手順（TASK-12・TASK-13 が実装する想定。REPAIR-5・REPAIR-6）
+//! 1. 先頭 [`FRAME_HEADER_LEN`]（10 バイト）を読む
+//! 2. [`FrameHeader::from_bytes`] で検証する（`header_crc` → `version` → `kind` →
+//!    `payload_len` の順。上記 4 点）。ここで拒否されれば、化けた `payload_len`
+//!    を信用した巨大確保は一切発生しない
+//! 3. 検証が通ってから [`FrameHeader::body_len`]（`≤ MAX_PAYLOAD_LEN +
+//!    CHECKSUM_LEN`。失敗しない）ぶんのバッファを確保して読む
+//! 4. [`Frame::decode_body`] へ渡す
+//!
+//! これにより「申告長に比例するアロケーションは検証後だけ」という DoS 対策
+//! （security.md）が、一括 [`Frame::decode`] だけでなくストリーム読み経路でも
+//! 成り立つ。`header_crc` はヘッダの偶発的破損の検出であり、改ざん耐性
+//! （真正性の保証）ではない（トレーラの [`FrameChecksum`] と同じ範囲外事項。
+//! `docs/design/io-protocol.md`「範囲外」節）。
 //!
 //! 申告長に比例するペイロード用バッファの確保は、デコード経路
 //! （[`Frame::decode`] / [`Frame::decode_body`]）全体を通じて `copy_validated_payload`
@@ -42,8 +79,31 @@ pub const MAX_PAYLOAD_LEN: u32 = 64 * 1024 * 1024;
 /// `MAX_PAYLOAD_LEN + 1` が `u32` の範囲を超えないことをコンパイル時に保証する。
 const _: () = assert!(MAX_PAYLOAD_LEN < u32::MAX);
 
-/// 固定長ヘッダのバイト数（種別 1 バイト + ペイロード長 4 バイト）。
-pub const FRAME_HEADER_LEN: usize = 5;
+/// このビルドが送受信するワイヤー形式のバージョン（設計レビュー P1-1・
+/// 2026-09-28 オーナー決定）。
+///
+/// ホスト側 CLI と microVM ゲストが別ビルドになり得るため、[`FrameHeader`] の
+/// 版ずれをフレームごとに検出する。ワイヤー形式（ヘッダ・フレーム全体の
+/// バイトレイアウト）を変える変更は必ずこの値を上げる（`docs/design/
+/// io-protocol.md`「バージョン方針」）。MVP ではネゴシエーション（Hello 交換）は
+/// 行わず、[`FrameHeader::from_bytes`] が受信側の値と比較して不一致を
+/// [`IoErrorCode::Unimplemented`] として返す。
+pub const PROTOCOL_VERSION: u8 = 1;
+
+/// 固定長ヘッダのバイト数（version 1 バイト + 種別 1 バイト + ペイロード長
+/// 4 バイト + ヘッダ CRC 4 バイト）。
+pub const FRAME_HEADER_LEN: usize = 10;
+
+/// ヘッダの意味あるフィールド（`version` + `kind` + `payload_len`）だけのバイト数。
+/// `header_crc`（[`FrameHeader::to_bytes`] が末尾に足す 4 バイト）自身は含めない。
+///
+/// 2 箇所で使う: (a) `header_crc` を計算する入力（[`header_crc`] 関数）、
+/// (b) [`Frame`] のトレーラ [`FrameChecksum`] が対象とするヘッダ部分
+/// （[`Frame::compute_checksum`]）。(b) が [`FRAME_HEADER_LEN`]（10 バイト。
+/// `header_crc` を含む）ではなくこの [`HEADER_PREFIX_LEN`]（6 バイト）を使う
+/// 理由は CRC-32C の残差（residue）性質による設計上の制約であり、
+/// [`Frame::compute_checksum`] のドキュメンテーションコメントを参照。
+const HEADER_PREFIX_LEN: usize = FRAME_HEADER_LEN - CHECKSUM_LEN;
 
 /// `usize` が 32 ビット以上であることをコンパイル時に保証する。
 ///
@@ -163,11 +223,14 @@ impl TryFrom<usize> for PayloadLen {
     }
 }
 
-/// フレームの固定長ヘッダ（種別・ペイロード長のみ。IO-1・REPAIR-2）。
+/// フレームの固定長ヘッダ（version・種別・ペイロード長・ヘッダ CRC。IO-1・
+/// REPAIR-2・REPAIR-5・REPAIR-6）。
 ///
 /// request id・ACK status は含まない（TASK-12・TASK-13 がペイロード側のレイアウトを
 /// 定める）。フィールドは非公開で、[`Self::new`] / [`Self::from_bytes`] を経由しない
-/// 限り値を作れない。
+/// 限り値を作れない。`version` は常に [`PROTOCOL_VERSION`]（構築時に検証済み）
+/// であり、値として保持するのは検証結果を [`Self::from_bytes`] の呼び出し元へ
+/// 伝える必要がないため（不一致は構築失敗として扱う）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameHeader {
     kind: FrameKind,
@@ -175,7 +238,9 @@ pub struct FrameHeader {
 }
 
 impl FrameHeader {
-    /// 種別とペイロード長（`u32`）からヘッダを作る。
+    /// 種別とペイロード長（`u32`）からヘッダを作る。`version` は常に
+    /// [`PROTOCOL_VERSION`] を使う（このプロセス自身が送信するヘッダのため
+    /// 版ずれは起こらない）。
     ///
     /// `payload_len` が [`MAX_PAYLOAD_LEN`] を超える場合は
     /// [`IoErrorCode::InvalidArgument`] を返す。
@@ -214,24 +279,83 @@ impl FrameHeader {
         self.payload_len.get() as usize + CHECKSUM_LEN
     }
 
-    /// ヘッダを `[kind: u8][payload_len: u32 LE]` の固定長配列へ変換する。
+    /// ヘッダの意味あるフィールド（`[version][kind][payload_len]`。
+    /// [`HEADER_PREFIX_LEN`] バイト）を組み立てる（[`Self::to_bytes`]・
+    /// [`Frame::compute_checksum`] が共有する）。`self` は構築時に検証済みの
+    /// ため `version` は常に [`PROTOCOL_VERSION`]。
+    fn prefix_bytes(&self) -> [u8; HEADER_PREFIX_LEN] {
+        let [l0, l1, l2, l3] = self.payload_len.get().to_le_bytes();
+        [PROTOCOL_VERSION, self.kind.as_u8(), l0, l1, l2, l3]
+    }
+
+    /// ヘッダを `[version: u8][kind: u8][payload_len: u32 LE][header_crc: u32 LE]`
+    /// の固定長配列へ変換する。`header_crc` は `[version][kind][payload_len]`
+    /// （[`Self::prefix_bytes`]）に対する CRC-32C を計算して埋める。
     /// 添字アクセスを避けるため分割代入で組み立てる（coding-rust「外部入力」節）。
     pub fn to_bytes(&self) -> [u8; FRAME_HEADER_LEN] {
-        let [l0, l1, l2, l3] = self.payload_len.get().to_le_bytes();
-        [self.kind.as_u8(), l0, l1, l2, l3]
+        let prefix = self.prefix_bytes();
+        let [c0, c1, c2, c3] = header_crc(&prefix).to_le_bytes();
+        [
+            prefix[0], prefix[1], prefix[2], prefix[3], prefix[4], prefix[5], c0, c1, c2, c3,
+        ]
     }
 
     /// 固定長配列からヘッダを復元する。
     ///
-    /// 未知の種別バイト・[`MAX_PAYLOAD_LEN`] を超えるペイロード長は
-    /// [`IoErrorCode::InvalidArgument`] として拒否する。`bytes` は untrusted な
-    /// トランスポート由来の入力を想定し、添字アクセスではなく分割代入で読む。
+    /// 検証順序（先に検証したフィールドが壊れていれば後続フィールドの値を
+    /// 一切信用しない。設計レビュー P1-2）:
+    /// 1. `header_crc` が `[version][kind][payload_len]` の再計算値と一致しない
+    ///    場合は [`IoErrorCode::DataLoss`]（化けたヘッダの偶発的破損の検出。
+    ///    改ざん耐性ではない）
+    /// 2. `version` が [`PROTOCOL_VERSION`] と一致しない場合は
+    ///    [`IoErrorCode::Unimplemented`]（message に受信 `version` と対応
+    ///    `PROTOCOL_VERSION` の両方を含める）
+    /// 3. 種別バイトが未知の場合は [`IoErrorCode::InvalidArgument`]
+    /// 4. ペイロード長が [`MAX_PAYLOAD_LEN`] を超える場合は
+    ///    [`IoErrorCode::InvalidArgument`]
+    ///
+    /// `bytes` は untrusted なトランスポート由来の入力を想定し、添字アクセスでは
+    /// なく分割代入で読む。
     pub fn from_bytes(bytes: [u8; FRAME_HEADER_LEN]) -> Result<Self, IoError> {
-        let [kind_byte, l0, l1, l2, l3] = bytes;
+        let [version, kind_byte, l0, l1, l2, l3, c0, c1, c2, c3] = bytes;
+        let prefix = [version, kind_byte, l0, l1, l2, l3];
+        let received_crc = u32::from_le_bytes([c0, c1, c2, c3]);
+        let expected_crc = header_crc(&prefix);
+
+        if received_crc != expected_crc {
+            return Err(IoError::new(
+                IoErrorCode::DataLoss,
+                format!(
+                    "frame header crc mismatch: expected {expected_crc:#010x}, got {received_crc:#010x}"
+                ),
+            ));
+        }
+
+        if version != PROTOCOL_VERSION {
+            return Err(IoError::new(
+                IoErrorCode::Unimplemented,
+                format!(
+                    "unsupported frame protocol version: received {version}, this build supports {PROTOCOL_VERSION}"
+                ),
+            ));
+        }
+
         let kind = FrameKind::try_from(kind_byte)?;
         let payload_len = PayloadLen::new(u32::from_le_bytes([l0, l1, l2, l3]))?;
         Ok(Self { kind, payload_len })
     }
+}
+
+/// `prefix`（`[version][kind][payload_len]`。[`HEADER_PREFIX_LEN`] バイト）に
+/// 対する CRC-32C を計算する（`header_crc` フィールドの値。設計レビュー P1-2）。
+///
+/// `crate::checksum::crc32c` は `#[cfg(test)]` 限定のテスト用ヘルパーのため、
+/// 本番コードは [`crate::checksum::Crc32c`]（ストリーミング API）を直接使う
+/// （[`Frame::compute_checksum`] と同じ流儀）。
+fn header_crc(prefix: &[u8; HEADER_PREFIX_LEN]) -> u32 {
+    let mut crc = crate::checksum::Crc32c::new();
+    crc.update(prefix);
+    crc.finalize()
 }
 
 /// チェックサムのバイト数（CRC-32C・4 バイト）。
@@ -261,7 +385,10 @@ impl FrameChecksum {
 ///
 /// # 不変条件
 /// - `header.payload_len().get() as usize == payload.len()`
-/// - `checksum` は `header.to_bytes() ‖ payload` に対する CRC-32C と一致する
+/// - `checksum` はヘッダの意味あるフィールド（`[version][kind][payload_len]`。
+///   [`HEADER_PREFIX_LEN`] バイト。`header_crc` は含めない） ‖ `payload` に
+///   対する CRC-32C と一致する（対象から `header_crc` を除く理由は
+///   [`Self::compute_checksum`] を参照）
 ///
 /// フィールドは非公開で、[`Self::new`]・[`Self::decode`]・[`Self::decode_body`] を
 /// 経由しない限り値を作れない。ペイロードは不透明なバイト列として扱い、
@@ -294,12 +421,36 @@ impl Frame {
         })
     }
 
-    /// ヘッダとペイロードから CRC-32C を計算する（ヘッダも対象に含める。
-    /// 種別・長さフィールドの破壊も検出するため。ペイロードのみだと BREAK-2 の
-    /// ような「長さの嘘」に対し、送信側バグと整合したチェックサムが通る余地がある）。
+    /// ヘッダとペイロードから CRC-32C を計算する（ヘッダの意味あるフィールド
+    /// [`FrameHeader::prefix_bytes`] も対象に含める。種別・長さフィールドの
+    /// 破壊も検出するため。ペイロードのみだと BREAK-2 のような「長さの嘘」に
+    /// 対し、送信側バグと整合したチェックサムが通る余地がある）。
+    ///
+    /// # なぜ `header.to_bytes()`（10 バイト。`header_crc` を含む）ではなく
+    /// `header.prefix_bytes()`（6 バイト）を使うか
+    /// CRC-32C は線形写像であり、`M ‖ CRC(M)` を処理した後の CRC レジスタ状態は
+    /// `M` の中身によらず常に同じ定数（残差・residue）になる（Rocksoft の CRC
+    /// カタログが定義する「residue」と同じ性質。Ethernet FCS の自己検証定数と
+    /// 同種）。もし `header_crc` を含む 10 バイト全体をここで対象にすると、
+    /// `header_crc` が正しく再計算されてさえいれば `version`・`kind`・
+    /// `payload_len` にどんな値を入れても `crc.update(&header.to_bytes())` の
+    /// 寄与が常に同一の定数になってしまい、以降の `payload` が同じである限り
+    /// このトレーラは「どの自己整合ヘッダを差し替えても同じ値」になる
+    /// （実測: `FrameHeader::to_bytes()` で `version=1`・`payload_len=5` 固定・
+    /// `kind` だけを `Write`〜`FlushAck` に変えた 4 通りで、10 バイト全体を
+    /// 対象にすると全て `0x64e6a5da` に一致する一方、6 バイトの
+    /// `prefix_bytes()` を対象にすると 4 通りとも異なる値になることを確認
+    /// 済み）。これは「トレーラは種別・長さフィールドの破壊も検出する」という
+    /// 本関数冒頭の契約と、`repair2_decode_rejects_kind_swapped_to_valid_kind`
+    /// が確認する回帰点を静かに壊す（自己整合的に再構築された別種別のヘッダへの
+    /// 差し替えを検出できなくなる）。`header_crc` を対象から除いた
+    /// `prefix_bytes()`（意味あるフィールドのみ）を使うことで、この残差性質を
+    /// 回避し、ヘッダの意味あるフィールドすべてを従来どおりトレーラで検出できる
+    /// ようにしている（設計レビュー・2026-09-28 オーナー決定からの実装時逸脱。
+    /// 発見時の判断は PR 説明を参照）。
     fn compute_checksum(header: &FrameHeader, payload: &[u8]) -> FrameChecksum {
         let mut crc = crate::checksum::Crc32c::new();
-        crc.update(&header.to_bytes());
+        crc.update(&header.prefix_bytes());
         crc.update(payload);
         FrameChecksum(crc.finalize())
     }
@@ -458,7 +609,6 @@ impl WireFrame for Frame {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checksum::crc32c;
     use std::cell::Cell;
 
     thread_local! {
@@ -591,13 +741,20 @@ mod tests {
         assert_eq!(err_max.code(), IoErrorCode::InvalidArgument);
     }
 
-    /// IO-1: `to_bytes()` が `[kind][payload_len: LE]` のレイアウトになる
-    /// （0x0102_0304 → LE で 04 03 02 01）。
+    /// IO-1・REPAIR-5: `to_bytes()` が
+    /// `[version][kind][payload_len: LE][header_crc: LE]` のレイアウトになる
+    /// （version=1・kind=Write=1・payload_len=0x0102_0304 → LE で 04 03 02 01）。
+    /// `header_crc` は `crc32c([1, 1, 0x04, 0x03, 0x02, 0x01])` の LE 表現
+    /// （独立計算による golden 値。テスト自身が `header_crc` を再計算すると
+    /// 実装のバグを見逃すため、実装から独立した固定値で照合する）。
     #[test]
     fn io1_frame_header_to_bytes_layout() {
         let header = FrameHeader::new(FrameKind::Write, 0x0102_0304)
             .expect("valid header must be constructed");
-        assert_eq!(header.to_bytes(), [0x01, 0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(
+            header.to_bytes(),
+            [0x01, 0x01, 0x04, 0x03, 0x02, 0x01, 0x52, 0x3a, 0x29, 0xc4]
+        );
     }
 
     /// IO-1・REPAIR-2: 全種別・長さ 0 / MAX で `to_bytes` → `from_bytes` が往復する。
@@ -620,30 +777,105 @@ mod tests {
         }
     }
 
-    /// IO-1: 未知の種別バイト（`0`・`0xFF`）を含むヘッダは `from_bytes` で拒否される。
+    /// `version`・種別バイト・ペイロード長（`u32` LE）から、`header_crc` を
+    /// 正しく再計算した [`FRAME_HEADER_LEN`] バイトの生ヘッダを組み立てる
+    /// （テスト専用ヘルパー）。`header_crc` を自前で計算せずに `kind_byte` /
+    /// `len` だけを差し替えるテストは、`from_bytes` の検証順序（`header_crc`
+    /// を最初に検証する。設計レビュー P1-2）により意図せず `DataLoss` に
+    /// 化けてしまうため、`version`・`kind`・`payload_len` の各検証を個別に
+    /// 確認したいテストはこのヘルパーで自己整合的なヘッダを作ってから
+    /// 対象フィールドだけを壊す。
+    fn raw_header(version: u8, kind_byte: u8, len: u32) -> [u8; FRAME_HEADER_LEN] {
+        let [l0, l1, l2, l3] = len.to_le_bytes();
+        let prefix = [version, kind_byte, l0, l1, l2, l3];
+        let [c0, c1, c2, c3] = header_crc(&prefix).to_le_bytes();
+        [
+            prefix[0], prefix[1], prefix[2], prefix[3], prefix[4], prefix[5], c0, c1, c2, c3,
+        ]
+    }
+
+    /// IO-1: 未知の種別バイト（`0`・`0xFF`）を含むヘッダは（`header_crc`・
+    /// `version` の検証を通過した上で）`from_bytes` で `InvalidArgument` として
+    /// 拒否される。
     #[test]
     fn io1_frame_header_from_bytes_rejects_unknown_kind() {
-        let zero_kind =
-            FrameHeader::from_bytes([0, 0, 0, 0, 0]).expect_err("kind byte 0 must be rejected");
+        let zero_kind = FrameHeader::from_bytes(raw_header(PROTOCOL_VERSION, 0, 0))
+            .expect_err("kind byte 0 must be rejected");
         assert_eq!(zero_kind.code(), IoErrorCode::InvalidArgument);
 
-        let unknown_kind = FrameHeader::from_bytes([0xFF, 0, 0, 0, 0])
+        let unknown_kind = FrameHeader::from_bytes(raw_header(PROTOCOL_VERSION, 0xFF, 0))
             .expect_err("kind byte 0xFF must be rejected");
         assert_eq!(unknown_kind.code(), IoErrorCode::InvalidArgument);
     }
 
     /// IO-1・REPAIR-2: BREAK-2（PoC-8）を模した、上限を超えるペイロード長申告は
-    /// `from_bytes` で拒否される。
+    /// （`header_crc`・`version`・`kind` の検証を通過した上で）`from_bytes` で
+    /// `InvalidArgument` として拒否される。
     #[test]
     fn io1_frame_header_from_bytes_rejects_len_over_max() {
-        let [l0, l1, l2, l3] = (MAX_PAYLOAD_LEN + 1).to_le_bytes();
-        let over_max = FrameHeader::from_bytes([FrameKind::Write.as_u8(), l0, l1, l2, l3])
-            .expect_err("MAX_PAYLOAD_LEN + 1 must be rejected");
+        let over_max = FrameHeader::from_bytes(raw_header(
+            PROTOCOL_VERSION,
+            FrameKind::Write.as_u8(),
+            MAX_PAYLOAD_LEN + 1,
+        ))
+        .expect_err("MAX_PAYLOAD_LEN + 1 must be rejected");
         assert_eq!(over_max.code(), IoErrorCode::InvalidArgument);
 
-        let u32_max = FrameHeader::from_bytes([FrameKind::Write.as_u8(), 0xFF, 0xFF, 0xFF, 0xFF])
-            .expect_err("u32::MAX must be rejected");
+        let u32_max = FrameHeader::from_bytes(raw_header(
+            PROTOCOL_VERSION,
+            FrameKind::Write.as_u8(),
+            u32::MAX,
+        ))
+        .expect_err("u32::MAX must be rejected");
         assert_eq!(u32_max.code(), IoErrorCode::InvalidArgument);
+    }
+
+    /// IO-1・REPAIR-5: `header_crc` が `[version][kind][payload_len]` の
+    /// 再計算値と一致しない場合、`version`・`kind`・`payload_len` のいずれかが
+    /// 妥当な値であっても `from_bytes` は `DataLoss` を返す（設計レビュー
+    /// P1-2: 化けたヘッダの値を一切信用しない）。
+    #[test]
+    fn repair5_frame_header_from_bytes_rejects_header_crc_mismatch() {
+        let mut bytes = raw_header(PROTOCOL_VERSION, FrameKind::Write.as_u8(), 3);
+        bytes[FRAME_HEADER_LEN - 1] ^= 0x01;
+
+        let err = FrameHeader::from_bytes(bytes).expect_err("header crc mismatch must be rejected");
+        assert_eq!(err.code(), IoErrorCode::DataLoss);
+    }
+
+    /// IO-1・REPAIR-5: ヘッダの `version`・`kind`・`payload_len`・`header_crc` の
+    /// 各バイトを 1 ビット反転すると、すべて `header_crc` の不一致として
+    /// `DataLoss` になる（設計レビュー P1-2: `header_crc` を最初に検証する
+    /// ため、他のフィールドの妥当性検証には到達しない）。
+    #[test]
+    fn repair5_frame_header_from_bytes_detects_any_single_bit_flip() {
+        let base = raw_header(PROTOCOL_VERSION, FrameKind::Write.as_u8(), 0x0102_0304);
+
+        for byte_index in 0..FRAME_HEADER_LEN {
+            let mut tampered = base;
+            tampered[byte_index] ^= 0x01;
+            let err = FrameHeader::from_bytes(tampered)
+                .expect_err(&format!("bit flip at byte {byte_index} must be rejected"));
+            assert_eq!(
+                err.code(),
+                IoErrorCode::DataLoss,
+                "byte {byte_index} must be detected by header_crc"
+            );
+        }
+    }
+
+    /// IO-1・REPAIR-5: `header_crc` を正しく再計算した上で `version` だけを
+    /// 不一致にすると `Unimplemented` になり、message に受信 `version` と
+    /// このビルドの `PROTOCOL_VERSION` の両方が含まれる。
+    #[test]
+    fn repair5_frame_header_from_bytes_rejects_version_mismatch() {
+        let other_version = PROTOCOL_VERSION.wrapping_add(1);
+        let bytes = raw_header(other_version, FrameKind::Write.as_u8(), 0);
+
+        let err = FrameHeader::from_bytes(bytes).expect_err("version mismatch must be rejected");
+        assert_eq!(err.code(), IoErrorCode::Unimplemented);
+        assert!(err.message().contains(&other_version.to_string()));
+        assert!(err.message().contains(&PROTOCOL_VERSION.to_string()));
     }
 
     /// IO-1・REPAIR-2: 全種別・ペイロード長 0 と小サイズで `encode` → `decode` が
@@ -667,21 +899,28 @@ mod tests {
         }
     }
 
-    /// IO-1・REPAIR-2: 固定入力（Write・`b"abc"`）の `encode` 結果を具体値で照合する。
-    /// レイアウトは `[kind][payload_len LE][payload][checksum LE]`。
+    /// IO-1・REPAIR-2・REPAIR-5: 固定入力（Write・`b"abc"`）の `encode` 結果を
+    /// 具体値で照合する。レイアウトは
+    /// `[version][kind][payload_len LE][header_crc LE][payload][checksum LE]`。
+    /// `header_crc`・`checksum` は独立計算による golden 値
+    /// （`docs/design/io-protocol.md`「エンコード例」と同じ入力・結果）。
     #[test]
     fn io1_frame_encode_layout() {
         let frame = Frame::new(FrameKind::Write, b"abc".to_vec()).expect("Frame::new");
         let encoded = frame.encode();
 
-        // ヘッダ: kind=1(Write), payload_len=3(LE)
-        assert_eq!(&encoded[0..5], &[1, 3, 0, 0, 0]);
+        // ヘッダ: version=1, kind=1(Write), payload_len=3(LE), header_crc(LE)
+        assert_eq!(
+            &encoded[0..FRAME_HEADER_LEN],
+            &[1, 1, 3, 0, 0, 0, 0x06, 0xf1, 0x29, 0xe2]
+        );
         // ペイロード
-        assert_eq!(&encoded[5..8], b"abc");
-        // チェックサム: ヘッダ(5B) ‖ ペイロード(3B) に対する CRC-32C の LE 表現
-        let expected_crc = crc32c(&[1, 3, 0, 0, 0, b'a', b'b', b'c']);
-        assert_eq!(&encoded[8..12], &expected_crc.to_le_bytes());
-        assert_eq!(encoded.len(), 12);
+        assert_eq!(&encoded[FRAME_HEADER_LEN..FRAME_HEADER_LEN + 3], b"abc");
+        // チェックサム: ヘッダの意味あるフィールド（6B: version‖kind‖payload_len。
+        // `header_crc` は対象外。`Frame::compute_checksum` のドキュメンテーション
+        // コメント〔CRC 残差性質〕参照） ‖ ペイロード(3B) に対する CRC-32C の LE 表現
+        assert_eq!(&encoded[FRAME_HEADER_LEN + 3..], &[0x59, 0x2a, 0xcd, 0xe8]);
+        assert_eq!(encoded.len(), FRAME_HEADER_LEN + 3 + CHECKSUM_LEN);
     }
 
     /// IO-1・REPAIR-2（受け入れ条件 1）: PoC-8 BREAK-2 相当（送信側が申告する
@@ -725,20 +964,30 @@ mod tests {
     fn repair2_decode_rejects_flipped_payload_bit() {
         let frame = Frame::new(FrameKind::Write, b"hello".to_vec()).expect("Frame::new");
         let mut encoded = frame.encode();
-        // ペイロード領域（header 5B の直後）の 1 バイト目、最下位ビットを反転する。
-        encoded[5] ^= 0x01;
+        // ペイロード領域（header FRAME_HEADER_LEN の直後）の 1 バイト目、
+        // 最下位ビットを反転する。
+        encoded[FRAME_HEADER_LEN] ^= 0x01;
 
         let err = Frame::decode(&encoded).expect_err("flipped bit must be rejected");
         assert_eq!(err.code(), IoErrorCode::DataLoss);
     }
 
-    /// IO-1・REPAIR-2: 種別バイトを別の有効な種別へ差し替えると `DataLoss` になる
-    /// （チェックサムがヘッダも対象にしていることの確認）。
+    /// IO-1・REPAIR-2・REPAIR-5: 種別バイトを別の有効な種別へ差し替え、
+    /// `header_crc` は差し替え後の種別に合わせて正しく再計算した（＝ヘッダ単体は
+    /// 自己整合的な）ヘッダへ入れ替えると、トレーラの [`FrameChecksum`]
+    /// （元の種別で計算済み）との不一致により `DataLoss` になる（トレーラの
+    /// チェックサムがヘッダも対象にしていることの確認。`header_crc` の検証を
+    /// 通過させるため生の 1 バイト差し替えではなく `raw_header` で作り直す）。
     #[test]
     fn repair2_decode_rejects_kind_swapped_to_valid_kind() {
         let frame = Frame::new(FrameKind::Write, b"hello".to_vec()).expect("Frame::new");
         let mut encoded = frame.encode();
-        encoded[0] = FrameKind::Ack.as_u8();
+        let swapped_header = raw_header(
+            PROTOCOL_VERSION,
+            FrameKind::Ack.as_u8(),
+            frame.header().payload_len().get(),
+        );
+        encoded[..FRAME_HEADER_LEN].copy_from_slice(&swapped_header);
 
         let err = Frame::decode(&encoded).expect_err("kind swap must be rejected");
         assert_eq!(err.code(), IoErrorCode::DataLoss);
@@ -785,7 +1034,8 @@ mod tests {
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
     }
 
-    /// IO-1: ヘッダ長未満（5 バイト未満）の入力は `InvalidArgument` になる。
+    /// IO-1: ヘッダ長未満（[`FRAME_HEADER_LEN`] バイト未満）の入力は
+    /// `InvalidArgument` になる。
     #[test]
     fn io1_decode_rejects_truncated_header() {
         let err = Frame::decode(&[1, 0, 0, 0]).expect_err("4 bytes must be rejected");
@@ -838,14 +1088,18 @@ mod tests {
     fn repair2_decode_rejects_over_max_len_before_allocation() {
         reset_allocation_recorder();
 
-        let [l0, l1, l2, l3] = (MAX_PAYLOAD_LEN + 1).to_le_bytes();
-        let err = Frame::decode(&[FrameKind::Write.as_u8(), l0, l1, l2, l3])
-            .expect_err("declared length over MAX_PAYLOAD_LEN must be rejected");
+        let raw = raw_header(
+            PROTOCOL_VERSION,
+            FrameKind::Write.as_u8(),
+            MAX_PAYLOAD_LEN + 1,
+        );
+        let err =
+            Frame::decode(&raw).expect_err("declared length over MAX_PAYLOAD_LEN must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
         assert_eq!(allocation_count(), 0);
 
-        let err = Frame::decode(&[FrameKind::Write.as_u8(), 0xFF, 0xFF, 0xFF, 0xFF])
-            .expect_err("u32::MAX declared length must be rejected");
+        let raw = raw_header(PROTOCOL_VERSION, FrameKind::Write.as_u8(), u32::MAX);
+        let err = Frame::decode(&raw).expect_err("u32::MAX declared length must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
         assert_eq!(allocation_count(), 0);
     }
@@ -877,7 +1131,7 @@ mod tests {
 
         let frame = Frame::new(FrameKind::Write, b"hello".to_vec()).expect("Frame::new");
         let mut encoded = frame.encode();
-        encoded[5] ^= 0x01;
+        encoded[FRAME_HEADER_LEN] ^= 0x01;
 
         let err = Frame::decode(&encoded).expect_err("flipped bit must be rejected");
         assert_eq!(err.code(), IoErrorCode::DataLoss);

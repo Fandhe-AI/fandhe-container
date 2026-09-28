@@ -59,7 +59,9 @@ run_case() {
   local expected="$2"
   shift 2
   local actual=0
-  last_output=$("$bash_bin" "$target_script" "$@" 2>&1) || actual=$?
+  # RUN_CASE_CWD を指定すると、その作業ディレクトリで対象スクリプトを起動する
+  # （相対パス引数の扱いの確認用）
+  last_output=$(cd "${RUN_CASE_CWD:-.}" && "$bash_bin" "$target_script" "$@" 2>&1) || actual=$?
   if [ "$actual" -eq "$expected" ]; then
     echo "PASS: ${name} (exit=${actual})"
     last_case_passed=1
@@ -110,6 +112,29 @@ check_file_content() {
     echo "FAIL: ${name} (expected content '${expected}', actual '${actual}': ${file})" >&2
     failures=$((failures + 1))
   fi
+}
+
+# find で数えたエントリ数を返す。find の失敗を `set -e` による打ち切りや 0 件扱い
+# （空出力を合格とみなす fail-open）にせず、`error` を返して呼び出し側の数値比較を
+# 失敗させる。引数: find への引数一式
+count_entries() {
+  local listing
+  local count
+  if ! listing=$(find "$@" 2>&1); then
+    printf 'error'
+    return 0
+  fi
+  if [ -z "$listing" ]; then
+    printf '0'
+    return 0
+  fi
+  count=$(printf '%s\n' "$listing" | wc -l | tr -d ' ') || count="error"
+  printf '%s' "$count"
+}
+
+# 期待値が数値で、実際の値がそれと一致するか（`error` 等の非数値は不一致）
+is_count() {
+  [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -eq "$2" ]
 }
 
 # --------------------------------------------------
@@ -190,7 +215,17 @@ run_case "from-json-symlink-input" 2 --from-json "$sym_input" --label x
 # --from-json のサイズ上限超過（DoS 防止。MAX_FROM_JSON_BYTES=4MiB を 1 バイトだけ超える）
 oversized_input="${tmp_root}/oversized.json"
 head -c $((4 * 1024 * 1024 + 1)) /dev/zero >"$oversized_input"
-run_case "from-json-oversized-input" 2 --from-json "$oversized_input" --label x
+run_case_msg "from-json-oversized-input" 2 "exceeds 4194304 bytes" --from-json "$oversized_input" --label x
+# 境界: ちょうど上限（4 MiB）はサイズ判定を通る（中身は JSON でないため変換で拒否）
+at_limit_input="${tmp_root}/at-limit.json"
+head -c $((4 * 1024 * 1024)) /dev/zero >"$at_limit_input"
+run_case_msg "from-json-at-limit-input-passes-size-check" 2 "jq: error" --from-json "$at_limit_input" --label x
+if [[ "$last_output" == *"exceeds"* ]]; then
+  echo "FAIL: from-json-at-limit-input-not-rejected-by-size (rejected by the size cap at exactly the limit)" >&2
+  failures=$((failures + 1))
+else
+  echo "PASS: from-json-at-limit-input-not-rejected-by-size"
+fi
 
 # --------------------------------------------------
 # 値の照合（from-json-ok が exit 0 で返す JSON の各値が期待どおりか。
@@ -326,7 +361,7 @@ PATH="$jq_only_bin" run_case_msg "missing-grep-tool" 3 "grep is required" --from
 # ツール欠如。exit 3。fio の欠如そのものを検出していることをメッセージで確認する）
 common_bin="${tmp_root}/common-bin"
 mkdir -p "$common_bin"
-for tool in jq grep dirname wc tr mktemp find ln; do
+for tool in jq grep dirname wc tr mktemp find ln head sleep id; do
   ln -s "$(command -v "$tool")" "${common_bin}/${tool}"
 done
 PATH="$common_bin" run_case_msg "missing-fio-tool" 3 "fio is required" --target-dir /tmp --label x
@@ -479,8 +514,8 @@ case "$stub_dir" in
     failures=$((failures + 1))
     ;;
 esac
-leftover_count=$(find "$run_target" -mindepth 1 | wc -l | tr -d ' ')
-if [ "$leftover_count" -eq 0 ]; then
+leftover_count=$(count_entries "$run_target" -mindepth 1)
+if is_count "$leftover_count" 0; then
   echo "PASS: run-cleanup-no-leftover-files"
 else
   echo "FAIL: run-cleanup-no-leftover-files (found ${leftover_count} leftover entries under $run_target)" >&2
@@ -505,8 +540,8 @@ else
   echo "FAIL: run-preplaced-symlink-left-untouched (symlink was removed or replaced)" >&2
   failures=$((failures + 1))
 fi
-attack_leftover=$(find "$attack_target" -mindepth 1 ! -name fandhe-fio-randwrite-4k.dat | wc -l | tr -d ' ')
-if [ "$attack_leftover" -eq 0 ]; then
+attack_leftover=$(count_entries "$attack_target" -mindepth 1 ! -name fandhe-fio-randwrite-4k.dat)
+if is_count "$attack_leftover" 0; then
   echo "PASS: run-preplaced-symlink-no-leftover-subdir"
 else
   echo "FAIL: run-preplaced-symlink-no-leftover-subdir (found ${attack_leftover} leftover entries under $attack_target)" >&2
@@ -567,8 +602,8 @@ race_dirlink_output="${tmp_root}/race-dirlink-output.json"
 FIO_STUB_PLANT_LINK="$race_dirlink_output" FIO_STUB_PLANT_TARGET="$race_linked_dir" PATH="$stub_path" \
   run_case_msg "run-output-dir-symlink-planted-during-run" 2 "could not be created exclusively" \
   --target-dir "$race_target" --label x --runtime 5 --output "$race_dirlink_output"
-linked_dir_entries=$(find "$race_linked_dir" -mindepth 1 | wc -l | tr -d ' ')
-if [ "$linked_dir_entries" -eq 0 ]; then
+linked_dir_entries=$(count_entries "$race_linked_dir" -mindepth 1)
+if is_count "$linked_dir_entries" 0; then
   echo "PASS: run-output-dir-symlink-target-unchanged"
 else
   echo "FAIL: run-output-dir-symlink-target-unchanged (found ${linked_dir_entries} entries under $race_linked_dir)" >&2
@@ -587,18 +622,131 @@ FIO_STUB_PLANT_DIR="$race_realdir_output" PATH="$stub_path" \
 ww_output_dir="${tmp_root}/world-writable-output-dir"
 mkdir -p "$ww_output_dir"
 chmod 777 "$ww_output_dir"
-run_case_msg "output-parent-world-writable-no-sticky" 2 "--output parent directory is world-writable without the sticky bit" \
+run_case_msg "output-parent-world-writable-no-sticky" 2 "--output parent directory can be modified by other users" \
   --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "${ww_output_dir}/out.json"
 chmod 755 "$ww_output_dir"
 
 # 成功・失敗のどちらの経路でも --output 用の一時ファイルが残らない
-output_tmp_leftover=$(find "$tmp_root" -maxdepth 1 -name '.fandhe-fio-output.*' | wc -l | tr -d ' ')
-if [ "$output_tmp_leftover" -eq 0 ]; then
+output_tmp_leftover=$(count_entries "$tmp_root" -maxdepth 1 -name '.fandhe-fio-output.*')
+if is_count "$output_tmp_leftover" 0; then
   echo "PASS: output-no-leftover-temp-files"
 else
   echo "FAIL: output-no-leftover-temp-files (found ${output_tmp_leftover} .fandhe-fio-output.* files under $tmp_root)" >&2
   failures=$((failures + 1))
 fi
+
+# --------------------------------------------------
+# 全体自己監査の回帰テスト（TOCTOU・外部コマンドの失敗による fail-open・上限の
+# すり抜け・symlink）。PR #1129 の Codex P0/P1 と同種の穴をまとめて照合する
+# --------------------------------------------------
+# ディレクトリの権限確認は find が「安全」と判定したときだけ通す（fail-closed）。
+# find が失敗する・何も出力しない（旧実装は空出力を合格扱いにしていた）状況を
+# find スタブで再現する。スタブ以外のツールは実物を使う。
+find_fail_bin="${tmp_root}/find-fail-bin"
+find_empty_bin="${tmp_root}/find-empty-bin"
+mkdir -p "$find_fail_bin" "$find_empty_bin"
+printf '#!/usr/bin/env bash\necho "find: simulated failure" >&2\nexit 1\n' >"${find_fail_bin}/find"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${find_empty_bin}/find"
+chmod +x "${find_fail_bin}/find" "${find_empty_bin}/find"
+perm_out_dir="${tmp_root}/perm-check-output"
+mkdir -p "$perm_out_dir"
+PATH="${find_fail_bin}:${PATH}" run_case_msg "output-parent-permission-check-find-fails" 2 "could not verify the permissions of --output parent directory" \
+  --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "${perm_out_dir}/a.json"
+PATH="${find_empty_bin}:${PATH}" run_case_msg "output-parent-permission-check-find-empty" 2 "could not verify the permissions of --output parent directory" \
+  --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "${perm_out_dir}/b.json"
+perm_target="${tmp_root}/perm-check-target"
+mkdir -p "$perm_target"
+PATH="${find_fail_bin}:${stub_path}" run_case_msg "target-dir-permission-check-find-fails" 2 "could not verify the permissions of --target-dir directory" \
+  --target-dir "$perm_target" --label x --runtime 5
+PATH="${find_empty_bin}:${stub_path}" run_case_msg "target-dir-permission-check-find-empty" 2 "could not verify the permissions of --target-dir directory" \
+  --target-dir "$perm_target" --label x --runtime 5
+perm_leftover=$(count_entries "$perm_out_dir" "$perm_target" -mindepth 1)
+if is_count "$perm_leftover" 0; then
+  echo "PASS: permission-check-failure-writes-nothing"
+else
+  echo "FAIL: permission-check-failure-writes-nothing (found ${perm_leftover} entries)" >&2
+  failures=$((failures + 1))
+fi
+
+# サイズの判定は数値であることを確かめてから行う（wc の出力が非数値のとき
+# `[ -gt ]` が偽になって上限判定を素通りするのを防ぐ）。wc スタブで再現する
+wc_bad_bin="${tmp_root}/wc-bad-bin"
+mkdir -p "$wc_bad_bin"
+printf '#!/usr/bin/env bash\ncat >/dev/null\necho "not-a-number"\n' >"${wc_bad_bin}/wc"
+chmod +x "${wc_bad_bin}/wc"
+PATH="${wc_bad_bin}:${PATH}" run_case_msg "from-json-size-check-non-numeric-wc" 2 "could not determine the size of --from-json input" \
+  --from-json "${fixtures_dir}/fio-3-ok.json" --label x
+
+# `-` で始まる相対パスの --output がオプションとして解釈されない（find・mktemp への
+# 受け渡しで `./` を前置する）
+mkdir -p "${tmp_root}/-dash-dir"
+RUN_CASE_CWD="$tmp_root" run_case "output-relative-dash-dir" 0 \
+  --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "-dash-dir/out.json"
+check_json_value "output-relative-dash-dir-written" "${tmp_root}/-dash-dir/out.json" '.schema_version' '1'
+
+# 後始末（rm）の失敗が終了コードの契約を上書きしない（成功は 0、入力エラーは 2 の
+# まま、警告を stderr に出す）。rm スタブで再現する
+rm_fail_bin="${tmp_root}/rm-fail-bin"
+mkdir -p "$rm_fail_bin"
+printf '#!/usr/bin/env bash\nexit 1\n' >"${rm_fail_bin}/rm"
+chmod +x "${rm_fail_bin}/rm"
+# 消せずに残る本スクリプトの一時ディレクトリが tmp_root 配下に収まるよう TMPDIR を向ける
+# （selftest 自身の後始末で実物の rm が消す）
+rm_fail_tmp="${tmp_root}/rm-fail-tmpdir"
+mkdir -p "$rm_fail_tmp"
+TMPDIR="$rm_fail_tmp" PATH="${rm_fail_bin}:${PATH}" run_case_msg "cleanup-failure-keeps-exit-0" 0 "warning: cleanup-failed" \
+  --from-json "${fixtures_dir}/fio-3-ok.json" --label x
+TMPDIR="$rm_fail_tmp" PATH="${rm_fail_bin}:${PATH}" run_case_msg "cleanup-failure-keeps-exit-2" 2 "warning: cleanup-failed" \
+  --from-json "${fixtures_dir}/fio-3-wrong-rw.json" --label x
+
+# 変換対象 JSON のスナップショット（snapshot_json_input）の単体照合。検証後の差し替え
+# （FIFO・デバイス）は起動経路からは決定的に再現できないため、対象スクリプトから関数
+# 定義だけを取り出し、差し替え後の状態を直接入力して照合する（実装そのものを使う）
+snapshot_harness="${tmp_root}/snapshot-harness.sh"
+# shellcheck disable=SC2016 # ハーネスへ書き出す文字列であり、$1 等はハーネス側で展開させる
+{
+  echo 'set -euo pipefail'
+  echo 'err() { echo "error: $1: $2" >&2; }'
+  echo 'MAX_FROM_JSON_BYTES=16'
+  echo 'INPUT_READ_TIMEOUT_SECS=2'
+  echo 'tmp_dir="$2"'
+  sed -n '/^snapshot_json_input() {$/,/^}$/p' "$target_script"
+  echo 'snapshot_json_input "$1" "test input"'
+  # コピーの権限（0600）と内容を呼び出し側で照合できるよう、コピーのパスを出す
+  echo 'echo "snapshot=${snapshot_path}"'
+} >"$snapshot_harness"
+snapshot_case() {
+  # 引数: <ケース名> <期待終了コード> <期待する部分文字列> <入力パス>
+  local name="$1" expected="$2" needle="$3" src="$4" actual=0 out
+  local work="${tmp_root}/snapshot-work-${name}"
+  mkdir -p "$work"
+  out=$(timeout -k 5s 30s "$bash_bin" "$snapshot_harness" "$src" "$work" 2>&1) || actual=$?
+  last_output="$out"
+  if [ "$actual" -eq "$expected" ] && [[ "$out" == *"$needle"* ]]; then
+    echo "PASS: snapshot-${name} (exit=${actual})"
+  else
+    echo "FAIL: snapshot-${name} (expected exit=${expected} with '${needle}', actual exit=${actual})" >&2
+    print_indented "$out"
+    failures=$((failures + 1))
+  fi
+}
+printf '{"a":1}\n' >"${tmp_root}/snapshot-small.json"
+snapshot_case "regular-file" 0 "snapshot=" "${tmp_root}/snapshot-small.json"
+snapshot_copy="${last_output##*snapshot=}"
+check_file_content "snapshot-regular-file-copied" "$snapshot_copy" '{"a":1}'
+snapshot_mode_listing=$(count_entries "$snapshot_copy" -perm 0600)
+if is_count "$snapshot_mode_listing" 1; then
+  echo "PASS: snapshot-copy-mode-0600"
+else
+  echo "FAIL: snapshot-copy-mode-0600 (copy is not mode 0600: ${snapshot_copy})" >&2
+  failures=$((failures + 1))
+fi
+head -c 17 /dev/zero >"${tmp_root}/snapshot-over.json"
+snapshot_case "over-limit" 2 "exceeds 16 bytes" "${tmp_root}/snapshot-over.json"
+snapshot_case "device" 2 "is not a regular file" /dev/zero
+mkfifo "${tmp_root}/snapshot-fifo"
+snapshot_case "fifo-open-blocks" 2 "could not be read within 2s" "${tmp_root}/snapshot-fifo"
+snapshot_case "missing" 2 "could not be opened" "${tmp_root}/snapshot-no-such-file"
 
 if [ "$failures" -gt 0 ]; then
   echo "self-test failed: ${failures} case(s) did not match the expected result" >&2

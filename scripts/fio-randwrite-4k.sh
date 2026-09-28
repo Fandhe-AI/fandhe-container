@@ -24,9 +24,9 @@
 #     GNU coreutils の `timeout`（Linux ホストが対象。macOS 標準環境には無い）、`jq`
 #   - --from-json モード: `jq`（fio 不要）
 #   - root 権限・`/dev/kvm` は不要
-#   - 全モード共通で `grep`・`dirname`・`wc`・`tr`・`mktemp`・`find`・`ln`、
-#     run モードでは加えて
-#     `realpath`（いずれも前提ツール検証の対象。欠如は exit 3）
+#   - 全モード共通で `grep`・`dirname`・`wc`・`tr`・`mktemp`・`find`・`ln`・`head`・
+#     `sleep`・`id`、run モードでは加えて `realpath`（いずれも前提ツール検証の対象。
+#     欠如は exit 3）
 #
 # 書き込み先の安全性（security.md の symlink・ボリューム外書き込み対策）:
 #   fio のデータファイルは `--target-dir` 直下の固定パスではなく、実行ごとに
@@ -60,7 +60,7 @@
 #   2: 入力エラー（引数の検証失敗、fio JSON のスキーマ不正・実行条件の不一致、
 #      値が 0 以下、ファイルサイズ・総書き込み量の上限超過、symlink 等）
 #   3: 前提ツールが無い（run モードでの fio・timeout・realpath。全モード共通で
-#      jq・grep・dirname・wc・tr・mktemp・find・ln）
+#      jq・grep・dirname・wc・tr・mktemp・find・ln・head・sleep・id）
 #
 # 出力（stdout。`--output <path>` を指定した場合はファイルにも書く。人が読む進捗・
 # サマリーは stderr に出す）:
@@ -104,6 +104,11 @@ readonly TIMEOUT_MARGIN_SECS=60 # fio の起動・終了処理のオーバーヘ
 # timeout が SIGTERM を送っても fio が終わらない（共有 FS 上の fsync 待ち等で
 # SIGTERM を無視する）場合に SIGKILL へ切り替えるまでの猶予（REPAIR-5: 確実に終わらせる）
 readonly TIMEOUT_KILL_AFTER_SECS=10
+# 変換対象 JSON を一時ファイルへ 1 回だけ読み込むときの上限時間。検証後に入力パスを
+# FIFO 等へ差し替えられて open/read が止まっても、この秒数で打ち切る（REPAIR-5）。
+# `timeout` は macOS 標準環境に無く --from-json モードでは使えないため、sleep と kill
+# による見張りで実装する（snapshot_json_input 参照）。
+readonly INPUT_READ_TIMEOUT_SECS=10
 
 err() {
   # ERR 系の構造化形式（code: message）に揃える（coding-rust.md）。
@@ -233,7 +238,7 @@ fi
 # jq 以外の coreutils 系も確認する。欠如したまま進むと `set -e` でそのコマンドの
 # 終了コード（多くは 1 か 127）がスクリプトの終了コードになり、「fio 実行失敗」
 # （exit 1）と誤分類される（c2458d5 で直した誤分類と同種の穴）。
-for tool in jq grep dirname wc tr mktemp find ln; do
+for tool in jq grep dirname wc tr mktemp find ln head sleep id; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     err "missing-tool" "${tool} is required but not found in PATH"
     exit 3
@@ -321,36 +326,74 @@ fi
 tmp_dir=""
 run_dir=""
 output_tmp=""
+# 後始末の失敗は終了コードの契約（0〜3）を上書きしない。`set -e` 下の EXIT trap で
+# コマンドが失敗すると、シェルはその失敗の終了コードで終わる（exit 0/2 のつもりが
+# 1 になる。bash で確認）。そこで入口で元の終了コードを保存し、各 rm の失敗は
+# 警告として stderr に出したうえで、最後に元の終了コードで終わる。
 # shellcheck disable=SC2329 # trap 経由で呼ばれるため直接の呼び出しは無い
 cleanup() {
+  local rc=$?
   if [ -n "$tmp_dir" ]; then
-    rm -rf -- "$tmp_dir"
+    rm -rf -- "$tmp_dir" || echo "warning: cleanup-failed: could not remove ${tmp_dir}" >&2
   fi
   if [ -n "$run_dir" ]; then
-    rm -rf -- "$run_dir"
+    rm -rf -- "$run_dir" || echo "warning: cleanup-failed: could not remove ${run_dir}" >&2
   fi
   if [ -n "$output_tmp" ]; then
-    rm -f -- "$output_tmp"
+    rm -f -- "$output_tmp" || echo "warning: cleanup-failed: could not remove ${output_tmp}" >&2
   fi
+  exit "$rc"
 }
 trap cleanup EXIT
 
-# 他ユーザーが書き込めて sticky bit も無いディレクトリを拒否する（exit 2）。
-# そのようなディレクトリでは、本スクリプトが作ったエントリ（専用サブディレクトリ・
-# 一時ファイル）を作成直後に第三者が rename・削除して symlink へ差し替え、書き込みを
-# ディレクトリ外へ向けさせる競合が残るため（sticky bit があれば他ユーザーは自分の
-# エントリしか rename・削除できない。/tmp 等の 1777 は許容）。グループ書き込み可
-# （775 等）は、ユーザープライベートグループ既定の環境で一般的なため拒否しない
-# （同じグループのメンバーは信頼する前提）。`find` 自体が失敗した場合は判定を
-# 素通りする（fail-open）点に注意。
+# 外部コマンドへパスを渡すときに、`-` で始まる相対パスがオプションとして解釈される
+# のを防ぐ（例: --output の親ディレクトリ名が `-delete` だと `find -delete ...` に
+# なる）。絶対パスはそのまま、相対パスは `./` を前置する。
+as_path_arg() {
+  case "$1" in
+    /*) printf '%s' "$1" ;;
+    *) printf './%s' "$1" ;;
+  esac
+}
+
+# 本スクリプトがエントリ（専用サブディレクトリ・一時ファイル）を作るディレクトリが、
+# 自分と root 以外に書き換えられないことを確かめる（exit 2）。条件は次の両方:
+#   - 所有者が自分（実行ユーザー）または root（ディレクトリの所有者は sticky bit が
+#     あっても任意のエントリを rename・削除できるため）
+#   - 他ユーザー書き込み不可、または sticky bit あり（sticky bit があれば他ユーザーは
+#     自分のエントリしか rename・削除できない。/tmp 等の 1777 は許容）
+# これを満たさないと、作成直後のエントリを第三者が symlink へ差し替え、書き込みを
+# ディレクトリ外へ向けさせる競合が残る。グループ書き込み可（775 等）は、ユーザー
+# プライベートグループ既定の環境で一般的なため拒否しない（同じグループのメンバーは
+# 信頼する前提）。
+# 判定は fail-closed: find が安全と判定したときに限り `safe` を 1 回だけ出力させ、
+# find の終了コードが 0 かつ出力（stderr を含む）が `safe` と完全一致するときだけ
+# 通す。find の失敗・エラー出力・空出力・`unsafe` はすべて拒否になる（出力が空なら
+# 合格とする判定は、find が失敗したときに素通りするため採らない）。
 # 引数: <オプション名（メッセージ用）> <ディレクトリ>
-reject_world_writable_without_sticky() {
+reject_unless_private_enough() {
   local what="$1"
-  local dir="$2"
-  if [ -n "$(find "$dir" -maxdepth 0 -perm -0002 ! -perm -1000 2>/dev/null)" ]; then
-    err "invalid-input" "${what} directory is world-writable without the sticky bit, refusing to use it: ${dir}"
+  local dir
+  local uid
+  local verdict
+  local rc=0
+  dir=$(as_path_arg "$2")
+  if ! uid=$(id -u 2>&1) || ! printf '%s' "$uid" | grep -Eq '^[0-9]+$'; then
+    err "invalid-input" "could not determine the current user id to check ${what} directory ownership: ${uid}"
     exit 2
   fi
+  verdict=$(find "$dir" -maxdepth 0 \
+    \( \( -user "$uid" -o -user 0 \) \( ! -perm -0002 -o -perm -1000 \) -exec printf safe \; \) \
+    -o -exec printf unsafe \; 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] && [ "$verdict" = "safe" ]; then
+    return 0
+  fi
+  if [ "$rc" -eq 0 ] && [ "$verdict" = "unsafe" ]; then
+    err "invalid-input" "${what} directory can be modified by other users (it must be owned by you or root, and must not be world-writable without the sticky bit), refusing to use it: $2"
+    exit 2
+  fi
+  err "invalid-input" "could not verify the permissions of ${what} directory (find exited with ${rc}: ${verdict}), refusing to use it: $2"
+  exit 2
 }
 
 # 結果 JSON を --output へ書く（security.md の symlink 対策）。
@@ -369,15 +412,16 @@ reject_world_writable_without_sticky() {
 #      あることを確かめ、違えば exit 2（置かれたディレクトリの中に一時ファイル名の
 #      ハードリンクが残るが、既存のエントリは変更しない）
 #   4. 一時ファイル名を消す（--output 側のリンクが残る）
-# 1 の書き込みはパス名で開き直すが、親ディレクトリは他ユーザー書き込み可かつ
-# sticky bit 無しを拒否済みのため、他ユーザーが一時ファイルを差し替えることはできない。
+# 1 の書き込みはパス名で開き直すが、親ディレクトリは reject_unless_private_enough で
+# 「自分か root の所有、かつ他ユーザー書き込み不可または sticky bit あり」を確認済みの
+# ため、他ユーザー（同じグループのメンバーを除く）が一時ファイルを差し替えることはできない。
 # 制約: ハードリンク非対応のファイルシステム（FAT 系等）では 2 が失敗し exit 2 になる。
 # 出力ファイルの権限は mktemp の 0600 になる。失敗はすべて入力エラー（exit 2）として
 # 扱う（set -e に任せると exit 1「fio 実行失敗」と誤分類されるため）。
 write_output_file() {
   local content="$1"
   local out_dir
-  out_dir=$(dirname -- "$output_path")
+  out_dir=$(as_path_arg "$(dirname -- "$output_path")")
   if ! output_tmp=$(mktemp "${out_dir}/.fandhe-fio-output.XXXXXXXXXX" 2>/dev/null) || [ -z "$output_tmp" ]; then
     output_tmp=""
     err "invalid-input" "could not create a temporary file next to --output: $output_path"
@@ -432,7 +476,7 @@ if [ -n "$output_path" ]; then
     err "invalid-input" "--output parent directory is not writable: $output_dir"
     exit 2
   fi
-  reject_world_writable_without_sticky "--output parent" "$output_dir"
+  reject_unless_private_enough "--output parent" "$output_dir"
 fi
 
 # --------------------------------------------------
@@ -640,7 +684,9 @@ convert_fio_json() {
   printf '%s\n' "$out"
 }
 
-params_json=$(jq -n \
+# params・expect の組み立ては入力検証済みの値だけから作る。jq が失敗した場合は
+# set -e に任せず入力エラーとして止める（終了コードの契約を保つ）。
+if ! params_json=$(jq -n \
   --arg rw "randwrite" \
   --arg bs "4k" \
   --arg ioengine "psync" \
@@ -654,13 +700,16 @@ params_json=$(jq -n \
   --arg filename "$FIXED_FILENAME" \
   '{rw: $rw, bs: $bs, ioengine: $ioengine, direct: $direct, size: $size,
     runtime: $runtime, iodepth: $iodepth, numjobs: $numjobs,
-    end_fsync: $end_fsync, group_reporting: $group_reporting, filename: $filename}')
+    end_fsync: $end_fsync, group_reporting: $group_reporting, filename: $filename}') || [ -z "$params_json" ]; then
+  err "invalid-input" "could not build the params object"
+  exit 2
+fi
 
 # fio JSON の実行条件の照合値（convert_jq_program の $expect）。params と同じ入力から
 # 作り、run・--from-json の両モードで同じ照合をかける（出力の params が元の fio 実行
 # 条件と一致することの保証）。fio は値を入力文字列のまま記録するため direct・iodepth・
 # numjobs は文字列で、size・runtime は正規化後の数値で比較する。
-expect_json=$(jq -n \
+if ! expect_json=$(jq -n \
   --arg jobname "$FIO_JOB_NAME" \
   --arg filename "$FIXED_FILENAME" \
   --arg direct "$direct" \
@@ -671,7 +720,10 @@ expect_json=$(jq -n \
   --argjson runtime "$runtime" \
   '{jobname: $jobname, filename: $filename, direct: $direct, iodepth: $iodepth,
     numjobs: $numjobs, size: $size, size_bytes: $size_bytes, runtime: $runtime,
-    directory: null}')
+    directory: null}') || [ -z "$expect_json" ]; then
+  err "invalid-input" "could not build the expected fio options"
+  exit 2
+fi
 # directory の期待値は run モードでのみ、専用サブディレクトリ作成後に設定する
 # （--from-json では元の実行先を知り得ないため null のまま。形式の照合だけ行う）。
 
@@ -685,26 +737,91 @@ emit_result() {
   printf '%s\n' "$result"
 }
 
-# 変換対象 JSON のサイズ上限検証（DoS 防止。--from-json の入力と run モードの fio
-# 出力の両方に同じ上限を課す）。
-# `wc -c` 自体の失敗（読み取り権限なし等）を `set -e`/`pipefail` に丸投げすると
-# `wc` 由来の終了コード（多くは 1）がそのままスクリプトの終了コードになり、
-# 「fio 実行失敗」（exit 1）と誤認する。ここで捕捉し、契約どおり入力エラー
-# （exit 2）として扱う（check-bench-regression.sh の check_input_file と同方針）。
-check_json_size() {
-  local path="$1"
+# 本スクリプト専用の一時ディレクトリ（mktemp -d。0700 で新規作成され、他ユーザーは
+# 中へエントリを置けない）。変換対象 JSON のスナップショットと run モードの fio 出力を
+# 置く。両モード共通で作る。
+if ! tmp_dir=$(mktemp -d 2>/dev/null) || [ -z "$tmp_dir" ] || [ ! -d "$tmp_dir" ] || [ -L "$tmp_dir" ]; then
+  tmp_dir=""
+  err "invalid-input" "could not create a private temporary directory"
+  exit 2
+fi
+
+# 変換対象 JSON を 1 回だけ読み、内容を固定したコピー（tmp_dir 内に mktemp で作る
+# 0600 の新規ファイル。パスは snapshot_path に入れて返す）を作る。
+# 以後の処理（サイズ上限の判定・jq による変換）はこのコピーだけを入力にするため、
+# 検証と使用の間に元のパスを差し替えられても、判定済みの内容と変換する内容が
+# ずれない（TOCTOU 対策・DoS 防止）。
+#   - 元のパスは 1 回だけ open し、その fd が通常ファイルであることを確かめてから
+#     `head -c (上限+1)` でコピーする（FIFO・デバイス等へ差し替えられた場合は拒否。
+#     上限 +1 バイトまでしか読まないため、巨大ファイルでも読み込み量は有界）
+#   - open 自体が FIFO で止まる場合に備え、INPUT_READ_TIMEOUT_SECS で打ち切る
+#     （sleep と kill の見張り。timeout は --from-json の対象の macOS に無いため）
+#   - コピーのサイズが上限を超えたら拒否する。サイズは数字であることを確かめてから
+#     比較する（`wc` の出力が空・非数値のとき `[ -gt ]` が偽になって素通りするのを防ぐ）
+# 検証後に元のパスを通常ファイルへの symlink に差し替えられた場合はリンク先を読む
+# （読み取りのみで書き込みはしない。内容は untrusted として変換時にすべて検証する）。
+# 引数: <元のパス> <メッセージ用の名前>
+snapshot_path=""
+snapshot_json_input() {
+  local src="$1"
+  local what="$2"
+  local dst
+  local reader_pid
+  local watchdog_pid
+  local rc=0
   local bytes
-  if ! bytes=$(wc -c <"$path" 2>/dev/null | tr -d ' '); then
-    err "invalid-input" "$path could not be read"
+  if ! dst=$(mktemp "${tmp_dir}/json-snapshot.XXXXXXXXXX" 2>/dev/null) || [ -z "$dst" ]; then
+    err "invalid-input" "could not create a temporary file to copy ${what}"
+    exit 2
+  fi
+  (
+    exec 3<"$src" || exit 10
+    # /dev/fd/3 の stat は開いた fd 自体を指す（Linux・macOS 共通）
+    [ -f /dev/fd/3 ] || exit 11
+    exec head -c "$((MAX_FROM_JSON_BYTES + 1))" <&3 >"$dst"
+  ) 2>/dev/null &
+  reader_pid=$!
+  ( sleep "$INPUT_READ_TIMEOUT_SECS" && kill -KILL "$reader_pid" ) >/dev/null 2>&1 &
+  watchdog_pid=$!
+  wait "$reader_pid" || rc=$?
+  # 見張りの終了コードは判定に使わない（読み取りが先に終われば kill で止めるだけ）。
+  # ここでの `|| true` は、既に終了した見張りへの kill・wait の失敗で set -e が
+  # スクリプトを止めないためのもの。
+  kill "$watchdog_pid" >/dev/null 2>&1 || true
+  wait "$watchdog_pid" >/dev/null 2>&1 || true
+  case "$rc" in
+    0) ;;
+    10)
+      err "invalid-input" "${what} could not be opened: ${src}"
+      exit 2
+      ;;
+    11)
+      err "invalid-input" "${what} is not a regular file (it may have been replaced after validation): ${src}"
+      exit 2
+      ;;
+    137)
+      err "invalid-input" "${what} could not be read within ${INPUT_READ_TIMEOUT_SECS}s (it may have been replaced by a FIFO after validation): ${src}"
+      exit 2
+      ;;
+    *)
+      err "invalid-input" "${what} could not be read (status ${rc}): ${src}"
+      exit 2
+      ;;
+  esac
+  if ! bytes=$(wc -c <"$dst" | tr -d ' ') || ! printf '%s' "$bytes" | grep -Eq '^[0-9]+$'; then
+    err "invalid-input" "could not determine the size of ${what}: ${src}"
     exit 2
   fi
   if [ "$bytes" -gt "$MAX_FROM_JSON_BYTES" ]; then
-    err "invalid-input" "$path exceeds ${MAX_FROM_JSON_BYTES} bytes"
+    err "invalid-input" "${what} exceeds ${MAX_FROM_JSON_BYTES} bytes: ${src}"
     exit 2
   fi
+  snapshot_path="$dst"
 }
 
 if [ "$mode" = "from-json" ]; then
+  # 以下の事前検査は分かりやすいエラーを早く返すためのもので、安全性（差し替えへの
+  # 耐性・サイズ上限）は snapshot_json_input が担う。
   check_symlink_reject "$from_json"
   if [ ! -e "$from_json" ]; then
     err "invalid-input" "$from_json does not exist"
@@ -714,9 +831,9 @@ if [ "$mode" = "from-json" ]; then
     err "invalid-input" "$from_json is not a regular file"
     exit 2
   fi
-  check_json_size "$from_json"
+  snapshot_json_input "$from_json" "--from-json input"
 
-  result=$(convert_fio_json "$from_json" "from_json" "$params_json")
+  result=$(convert_fio_json "$snapshot_path" "from_json" "$params_json")
   emit_result "$result"
   exit 0
 fi
@@ -759,13 +876,8 @@ fi
 
 # 下の専用サブディレクトリを作った直後に第三者がそれを rename して symlink へ
 # 差し替え、fio をボリューム外へ書き込ませる競合を防ぐ（判定基準は関数側のコメント）。
-reject_world_writable_without_sticky "--target-dir" "$target_dir_real"
+reject_unless_private_enough "--target-dir" "$target_dir_real"
 
-if ! tmp_dir=$(mktemp -d 2>/dev/null) || [ -z "$tmp_dir" ]; then
-  tmp_dir=""
-  err "invalid-input" "could not create a temporary directory for the fio output"
-  exit 2
-fi
 fio_out_json="${tmp_dir}/fio-output.json"
 
 # データファイルの置き場として、--target-dir 内に実行ごとの専用サブディレクトリを
@@ -777,14 +889,17 @@ fio_out_json="${tmp_dir}/fio-output.json"
 # mkdir(2)（最終要素が既存の symlink なら EEXIST で失敗し、たどらない）を 0700 で
 # 行うため、作成後のサブディレクトリ内へ第三者（root 以外）がエントリを置けない。
 # fio にはこのサブディレクトリ内の固定ファイル名だけを渡す。
-if ! run_dir=$(mktemp -d "${target_dir_real}/fandhe-fio-randwrite-4k.XXXXXXXXXX" 2>/dev/null) || [ -z "$run_dir" ]; then
+if ! run_dir=$(mktemp -d "${target_dir_real}/fandhe-fio-randwrite-4k.XXXXXXXXXX" 2>/dev/null) || [ -z "$run_dir" ] || [ ! -d "$run_dir" ] || [ -L "$run_dir" ]; then
   run_dir=""
   err "invalid-input" "could not create a private working directory under --target-dir: $target_dir_real"
   exit 2
 fi
 # run モードの fio 出力は、fio の directory がこの専用サブディレクトリと一致することまで
 # 照合する（--from-json では形式のみ。convert_jq_program の directory の照合を参照）。
-expect_json=$(jq -c --arg directory "$run_dir" '.directory = $directory' <<<"$expect_json")
+if ! expect_json=$(jq -c --arg directory "$run_dir" '.directory = $directory' <<<"$expect_json") || [ -z "$expect_json" ]; then
+  err "invalid-input" "could not set the expected fio directory"
+  exit 2
+fi
 
 fio_args=(
   --name="$FIO_JOB_NAME"
@@ -832,8 +947,8 @@ if [ ! -f "$fio_out_json" ] || [ ! -s "$fio_out_json" ]; then
   err "fio-failed" "fio exited successfully but did not write its JSON output"
   exit 1
 fi
-check_json_size "$fio_out_json"
+snapshot_json_input "$fio_out_json" "fio JSON output"
 
-result=$(convert_fio_json "$fio_out_json" "run" "$params_json")
+result=$(convert_fio_json "$snapshot_path" "run" "$params_json")
 emit_result "$result"
 exit 0

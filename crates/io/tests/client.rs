@@ -576,7 +576,13 @@ fn io1_recv_ack_rejects_unknown_id_and_poisons() {
         err.message()
     );
     assert!(client.is_poisoned());
-    assert_eq!(kept.id().get(), kept.id().get()); // `kept` を使い続けたことの明示
+    // `kept` は unknown ack の対象ではなく、失効前のキューに残っていた唯一の
+    // 未 ACK エントリと一致すること（released とは異なる id）を確認する。
+    assert_ne!(kept.id().get(), released.id().get());
+    assert_eq!(
+        client.queue().oldest().map(|entry| entry.id()),
+        Some(kept.id())
+    );
 }
 
 /// IO-1・IO-2・TASK-12.2（#74）: `Write` に `FlushAck`、`Flush` に `Ack` を返すと

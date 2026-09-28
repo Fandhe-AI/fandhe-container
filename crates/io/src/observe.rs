@@ -320,61 +320,27 @@ const _: () = assert!(
      1 行の最大サイズが総バイト上限を超えてしまう"
 );
 
-/// [`SendEvent`] を JSON Lines（1 イベント 1 行）へ変換し、上限付きのメモリ内
-/// `VecDeque` へためる既定実装（TASK-12.1・#73 codex 再指摘対応。P1・REPAIR-4・
-/// REPAIR-5・ERR-1 の構造化 `code` / `message` 形式）。
+/// 上限付きの JSON Lines バッファ（TASK-12.1・#73／TASK-13.2.1・#820 レビュー
+/// 指摘対応。P1・REPAIR-4・REPAIR-5）。
 ///
-/// 出力キーは英語 snake_case 固定（`event`・`kind`・`outcome`・`reason`・`code`・
-/// `message`・`message_truncated`・`latency_us`）。`event` は常に `"io_send"`、
-/// `kind` は `WRITE`/`ACK`/`FLUSH`/`FLUSH_ACK`、`outcome` は成功なら `"ok"`、
-/// 失敗系なら `"error"` で、失敗系の場合のみ `reason`（[`SendOutcome`] の
-/// snake_case 名）・`code`（ERR-1 文字列）・`message`（[`MAX_SEND_LOG_MESSAGE_BYTES`]
-/// で切り詰め済み・エスケープ済みの文字列）を付与する。`message_truncated` は
-/// 切り詰めが発生した場合のみ `true` を付与し、発生しない場合はキー自体を省く。
-///
-/// # 依存を追加しない制約
-/// 本 crate は `serde_json` 等へ依存しない（dependency-policy）。JSON は手書きで
-/// 組み立てるため、固定語彙のフィールド（`event`・`kind`・`outcome`・`reason`・
-/// `code`）はエスケープ不要な既知の値のみを書き込み、`message` のような任意文字列
-/// （untrusted なトランスポート由来を含みうる）だけを [`escape_json_string`] で
-/// エスケープする。
-///
-/// # `on_send` は I/O をしない（REPAIR-5。codex 再指摘対応）
-/// 旧実装は `on_send` の中で任意の `Write` へ同期的に書き込んでいたが、満杯の
-/// pipe 等で送信経路（[`crate::client::PipelineClient::send`]）自体が無期限に
-/// ブロックしかねず、[`crate::transport::IoTimeout`] でも打ち切れなかった
-/// （REPAIR-5 違反）。本実装は `on_send` の中では `VecDeque` へ積むだけにとどめ、
-/// 実際の書き出しは呼び出し元が [`Self::drain_lines`] を呼んで取り出した行を
-/// 自分のタイミング・スレッドで書き出す（部分書き込み時の再試行も呼び出し元の
-/// 責務。codex/bugbot 再指摘対応）。
-///
-/// # 満杯時の扱い
-/// 次のいずれかに達した状態で新しいイベントが来た場合、新規イベントを破棄し
-/// （最古のイベントを保持する。すでにためた分の消失より、直近の詳細を失うほうが
-/// 実害が小さいと判断）、[`Self::dropped_count`] を増分する。破棄そのものが
-/// `send` へ伝播することはない（観測が主処理を妨げてはならないため）。
-///
-/// - 行数が `capacity` に達している（[`Self::capacity`]）
-/// - ためている JSON 行の合計バイト数が [`MAX_SEND_LOG_BUFFER_BYTES`] を超える
-///   （codex P0 再指摘対応。1 行あたりのメッセージが巨大でも総メモリ使用量を
-///   有界に保つ）
-///
-/// また、`message`（[`SendEventError::message`]）はエンコード前に
-/// [`MAX_SEND_LOG_MESSAGE_BYTES`] へ切り詰める（UTF-8 の文字境界を跨がない）。
-/// 切り詰めた場合は JSON に `"message_truncated":true` を付与する。
-pub struct JsonLinesSendObserver {
+/// [`JsonLinesSendObserver`] と [`JsonLinesServerObserver`] が共通で使う
+/// 「行数上限・合計バイト数上限に達したら新規イベント側を破棄する」ロジックを
+/// 1 か所へ集約する（コード重複の防止。REPAIR-1）。非公開のため公開 API には
+/// 影響しない（各観測フックがこの型をラップし、同じメソッド名・戻り値で
+/// 公開する）。
+struct BoundedJsonLines {
     lines: VecDeque<String>,
     capacity: usize,
     dropped: u64,
     /// `lines` にためている JSON 行のエンコード後バイト数の合計（改行を含まない）。
     /// [`MAX_SEND_LOG_BUFFER_BYTES`] との比較にのみ使う内部カウンタで、
-    /// [`Self::drain_lines`] で `0` へ戻す。
+    /// [`Self::drain`] で `0` へ戻す。
     total_bytes: usize,
 }
 
-impl JsonLinesSendObserver {
-    /// 既定容量（[`DEFAULT_SEND_LOG_CAPACITY`]）で観測フックを作る。
-    pub fn new() -> Self {
+impl BoundedJsonLines {
+    /// 既定容量（[`DEFAULT_SEND_LOG_CAPACITY`]）で作る。
+    fn new() -> Self {
         Self {
             lines: VecDeque::new(),
             capacity: DEFAULT_SEND_LOG_CAPACITY,
@@ -383,20 +349,21 @@ impl JsonLinesSendObserver {
         }
     }
 
-    /// 容量を指定して観測フックを作る。`capacity` が `0` または
-    /// [`MAX_SEND_LOG_CAPACITY`] を超える場合は [`IoErrorCode::InvalidArgument`]
-    /// を返す（無制限確保の防止）。
-    pub fn with_capacity(capacity: usize) -> Result<Self, IoError> {
+    /// 容量を指定して作る。`capacity` が `0` または [`MAX_SEND_LOG_CAPACITY`] を
+    /// 超える場合は [`IoErrorCode::InvalidArgument`] を返す（無制限確保の防止）。
+    /// `label` はエラーメッセージに埋め込む呼び出し元の種別名
+    /// （`"send log"` / `"server log"` 等）。
+    fn try_with_capacity(capacity: usize, label: &str) -> Result<Self, IoError> {
         if capacity == 0 {
             return Err(IoError::new(
                 IoErrorCode::InvalidArgument,
-                "send log capacity must not be zero",
+                format!("{label} capacity must not be zero"),
             ));
         }
         if capacity > MAX_SEND_LOG_CAPACITY {
             return Err(IoError::new(
                 IoErrorCode::InvalidArgument,
-                format!("send log capacity must be at most {MAX_SEND_LOG_CAPACITY}"),
+                format!("{label} capacity must be at most {MAX_SEND_LOG_CAPACITY}"),
             ));
         }
         Ok(Self {
@@ -407,59 +374,47 @@ impl JsonLinesSendObserver {
         })
     }
 
-    /// このバッファの容量を返す。
-    pub fn capacity(&self) -> usize {
+    fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// 現在ためている JSON 行数を返す。
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.lines.len()
     }
 
-    /// ためている JSON 行が 1 件もないかを返す。
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.lines.is_empty()
     }
 
-    /// 容量超過により破棄した（新規イベント側を破棄した）件数を返す。
-    pub fn dropped_count(&self) -> u64 {
+    fn dropped_count(&self) -> u64 {
         self.dropped
     }
 
-    /// 現在ためている JSON 行の合計バイト数（改行を含まない）を返す。
-    pub fn total_bytes(&self) -> usize {
+    fn total_bytes(&self) -> usize {
         self.total_bytes
     }
 
     /// ためている JSON 行をすべて取り出してキューを空にする（各行は改行を含まない
-    /// 完全な JSON 文字列）。
-    ///
-    /// 本型は I/O をしない契約（[`Self::on_send`]・上記モジュール doc 参照）のため、
-    /// 取り出した行をどこへどう書き出すか（ファイル・ソケット・部分書き込み時の
-    /// 再試行を含む）は呼び出し元の責務とする。
-    pub fn drain_lines(&mut self) -> Vec<String> {
+    /// 完全な JSON 文字列）。本型は I/O をしない契約（呼び出し元の `on_send` /
+    /// `on_event` 実装の doc 参照）のため、取り出した行をどこへどう書き出すか
+    /// （ファイル・ソケット・部分書き込み時の再試行を含む）は呼び出し元の責務。
+    fn drain(&mut self) -> Vec<String> {
         self.total_bytes = 0;
         self.lines.drain(..).collect()
     }
-}
 
-impl Default for JsonLinesSendObserver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl JsonLinesSendObserver {
     /// 行数上限に達していないか確認し、達していなければ `encode` を呼んで
     /// エンコードしたうえで、合計バイト数の上限チェックのうえキューへ積む
-    /// 共通処理（[`Self::on_send`]・[`SendObserver::on_ack`] 実装で共有。
-    /// TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4・REPAIR-5）。
+    /// （[`JsonLinesSendObserver`]・[`JsonLinesServerObserver`] の各 `on_*` 実装が
+    /// 共有する。TASK-12.2・#74／TASK-13.2.1・#820 codex・reviewer 指摘対応。
+    /// P1・REPAIR-4・REPAIR-5）。
     ///
     /// `encode` を遅延評価にするのは、行数上限に達している場合はエンコード
-    /// 自体を省く（旧実装の挙動を保つ）ため。満杯・合計バイト数超過時は
-    /// 新規イベントを破棄し（上記モジュール doc 参照）、[`Self::dropped_count`]
-    /// を増分する。ここでは I/O を行わない（REPAIR-5）。
+    /// 自体を省くため。満杯・合計バイト数超過時は新規イベントを破棄し（最古の
+    /// イベントを保持する。すでにためた分の消失より、直近の詳細を失うほうが
+    /// 実害が小さいと判断）、[`Self::dropped_count`] を増分する。破棄そのものが
+    /// 呼び出し元（送信・受信経路）へ伝播することはない（観測が主処理を妨げて
+    /// はならないため）。ここでは I/O を行わない（REPAIR-5）。
     fn push_encoded_line(&mut self, encode: impl FnOnce() -> String) {
         if self.lines.len() >= self.capacity {
             self.dropped = self.dropped.saturating_add(1);
@@ -477,13 +432,114 @@ impl JsonLinesSendObserver {
     }
 }
 
+/// [`SendEvent`] を JSON Lines（1 イベント 1 行）へ変換し、上限付きのメモリ内
+/// バッファ（`BoundedJsonLines`）へためる既定実装（TASK-12.1・#73 codex
+/// 再指摘対応。P1・REPAIR-4・REPAIR-5・ERR-1 の構造化 `code` / `message` 形式）。
+///
+/// 出力キーは英語 snake_case 固定（`event`・`kind`・`outcome`・`reason`・`code`・
+/// `message`・`message_truncated`・`latency_us`）。`event` は常に `"io_send"`、
+/// `kind` は `WRITE`/`ACK`/`FLUSH`/`FLUSH_ACK`、`outcome` は成功なら `"ok"`、
+/// 失敗系なら `"error"` で、失敗系の場合のみ `reason`（[`SendOutcome`] の
+/// snake_case 名）・`code`（ERR-1 文字列）・`message`（[`MAX_SEND_LOG_MESSAGE_BYTES`]
+/// で切り詰め済み・エスケープ済みの文字列）を付与する。`message_truncated` は
+/// 切り詰めが発生した場合のみ `true` を付与し、発生しない場合はキー自体を省く。
+/// この形式は [`JsonLinesServerObserver`]（TASK-13.2.1・#820）の `io_server`
+/// イベントと共通の語彙を使う（両者のドキュメント参照）。
+///
+/// # 依存を追加しない制約
+/// 本 crate は `serde_json` 等へ依存しない（dependency-policy）。JSON は手書きで
+/// 組み立てるため、固定語彙のフィールド（`event`・`kind`・`outcome`・`reason`・
+/// `code`）はエスケープ不要な既知の値のみを書き込み、`message` のような任意文字列
+/// （untrusted なトランスポート由来を含みうる）だけを [`escape_json_string`] で
+/// エスケープする。
+///
+/// # `on_send` は I/O をしない（REPAIR-5。codex 再指摘対応）
+/// 旧実装は `on_send` の中で任意の `Write` へ同期的に書き込んでいたが、満杯の
+/// pipe 等で送信経路（[`crate::client::PipelineClient::send`]）自体が無期限に
+/// ブロックしかねず、[`crate::transport::IoTimeout`] でも打ち切れなかった
+/// （REPAIR-5 違反）。本実装は `on_send` の中では `BoundedJsonLines` へ積むだけに
+/// とどめ、実際の書き出しは呼び出し元が [`Self::drain_lines`] を呼んで取り出した
+/// 行を自分のタイミング・スレッドで書き出す（部分書き込み時の再試行も呼び出し元の
+/// 責務。codex/bugbot 再指摘対応）。
+///
+/// # 満杯時の扱い
+/// `BoundedJsonLines::push_encoded_line` のドキュメント参照（行数上限
+/// [`Self::capacity`]・合計バイト数上限 [`MAX_SEND_LOG_BUFFER_BYTES`] のいずれかに
+/// 達した新規イベントは破棄し [`Self::dropped_count`] を増分する）。
+///
+/// また、`message`（[`SendEventError::message`]）はエンコード前に
+/// [`MAX_SEND_LOG_MESSAGE_BYTES`] へ切り詰める（UTF-8 の文字境界を跨がない）。
+/// 切り詰めた場合は JSON に `"message_truncated":true` を付与する。
+pub struct JsonLinesSendObserver {
+    buf: BoundedJsonLines,
+}
+
+impl JsonLinesSendObserver {
+    /// 既定容量（[`DEFAULT_SEND_LOG_CAPACITY`]）で観測フックを作る。
+    pub fn new() -> Self {
+        Self {
+            buf: BoundedJsonLines::new(),
+        }
+    }
+
+    /// 容量を指定して観測フックを作る。`capacity` が `0` または
+    /// [`MAX_SEND_LOG_CAPACITY`] を超える場合は [`IoErrorCode::InvalidArgument`]
+    /// を返す（無制限確保の防止）。
+    pub fn with_capacity(capacity: usize) -> Result<Self, IoError> {
+        Ok(Self {
+            buf: BoundedJsonLines::try_with_capacity(capacity, "send log")?,
+        })
+    }
+
+    /// このバッファの容量を返す。
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    /// 現在ためている JSON 行数を返す。
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// ためている JSON 行が 1 件もないかを返す。
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// 容量超過により破棄した（新規イベント側を破棄した）件数を返す。
+    pub fn dropped_count(&self) -> u64 {
+        self.buf.dropped_count()
+    }
+
+    /// 現在ためている JSON 行の合計バイト数（改行を含まない）を返す。
+    pub fn total_bytes(&self) -> usize {
+        self.buf.total_bytes()
+    }
+
+    /// ためている JSON 行をすべて取り出してキューを空にする（各行は改行を含まない
+    /// 完全な JSON 文字列）。
+    ///
+    /// 本型は I/O をしない契約（[`Self::on_send`]・上記モジュール doc 参照）のため、
+    /// 取り出した行をどこへどう書き出すか（ファイル・ソケット・部分書き込み時の
+    /// 再試行を含む）は呼び出し元の責務とする。
+    pub fn drain_lines(&mut self) -> Vec<String> {
+        self.buf.drain()
+    }
+}
+
+impl Default for JsonLinesSendObserver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SendObserver for JsonLinesSendObserver {
     fn on_send(&mut self, event: &SendEvent<'_>) {
-        self.push_encoded_line(|| encode_send_event(event));
+        self.buf.push_encoded_line(|| encode_send_event(event));
     }
 
     fn on_ack(&mut self, event: &AckEvent<'_>) {
-        self.push_encoded_line(|| encode_ack_event(event));
+        self.buf.push_encoded_line(|| encode_ack_event(event));
     }
 }
 
@@ -492,10 +548,10 @@ impl SendObserver for JsonLinesSendObserver {
 impl fmt::Debug for JsonLinesSendObserver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JsonLinesSendObserver")
-            .field("len", &self.lines.len())
-            .field("capacity", &self.capacity)
-            .field("dropped", &self.dropped)
-            .field("total_bytes", &self.total_bytes)
+            .field("len", &self.buf.len())
+            .field("capacity", &self.buf.capacity())
+            .field("dropped", &self.buf.dropped_count())
+            .field("total_bytes", &self.buf.total_bytes())
             .finish()
     }
 }
@@ -683,6 +739,339 @@ fn encode_ack_event(event: &AckEvent<'_>) -> String {
             format!(
                 "{{\"event\":\"io_recv_ack\",{ack_kind}\"outcome\":\"error\",\
                  \"reason\":\"{reason}\",\"latency_us\":{latency_us}}}"
+            )
+        }
+    }
+}
+
+/// [`crate::server::UdsServer`]・[`crate::server::UdsConnection`]
+/// （TASK-13.2.1・#820）が扱う 1 回の操作種別。
+///
+/// [`ServerEvent::op`] が示す操作で、将来 `Bind` 等を追加できるよう
+/// `#[non_exhaustive]` にする（REPAIR-3。現時点では bind は観測イベントを
+/// 持たない。[`ServerObserver`] のドキュメント「bind は観測対象外」参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServerOp {
+    /// [`crate::server::UdsServer::accept`]。
+    Accept,
+    /// [`crate::server::UdsConnection`] の [`crate::transport::FrameReceiver::recv_frame`]。
+    Recv,
+    /// [`crate::server::UdsConnection`] の [`crate::transport::FrameSender::send_frame`]。
+    Send,
+}
+
+/// [`ServerEvent::outcome`]（TASK-13.2.1・#820。P1-3 の poison 契約を
+/// [`SendOutcome`] と同じ語彙で区別できるようにする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServerOutcome {
+    /// 操作が成功した。
+    Success,
+    /// [`crate::server::UdsConnection`] が P1-3 により失効済み（poison 済み）で
+    /// あるために拒否した（送受信自体をトランスポートへ渡さなかった早期拒否）。
+    RejectedPoisoned,
+    /// 上記以外の失敗（タイムアウト・プロトコル違反・`ReceiveLimits::admit` の
+    /// 拒否・トランスポート層のエラー等）。
+    Failure,
+}
+
+/// [`crate::server::UdsServer`]・[`crate::server::UdsConnection`] の 1 回の
+/// 操作イベント（TASK-13.2.1・#820・reviewer/security-auditor 指摘対応。P1・
+/// REPAIR-4・REPAIR-5）。
+///
+/// [`SendEvent`]（TASK-12.1・#73）と同じ設計方針を UDS サーバー側へ適用した型で、
+/// 借用・`Debug`・エラー詳細の扱いは [`SendEvent`] のドキュメントを参照
+/// （`error` は既存の [`SendEventError`] をそのまま再利用し、専用の型を新設
+/// しない）。将来フィールドを追加できるよう `#[non_exhaustive]` にする
+/// （REPAIR-3）。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ServerEvent<'a> {
+    /// この呼び出しが対象とした操作種別。
+    pub op: ServerOp,
+    /// フレーム種別。[`ServerOp::Send`] は呼び出し元が渡した送信対象の種別、
+    /// [`ServerOp::Recv`] はヘッダ検証（`FrameHeader::from_bytes` と
+    /// `crate::server` のプロトコル違反判定）を通過した場合に確定する種別
+    /// （通過前に失敗した場合は `None`）、[`ServerOp::Accept`] は常に `None`
+    /// （フレームを介さない操作のため）。
+    pub kind: Option<FrameKind>,
+    /// [`ServerOutcome`]（成功・poison による拒否・その他の失敗）。
+    pub outcome: ServerOutcome,
+    /// 実際にトランスポートを介した呼び出しに要した時間。poison による早期
+    /// 拒否（トランスポートを介さない分岐）の場合は `Duration::ZERO`
+    /// （[`SendEvent::latency`] と同じ扱い）。
+    pub latency: Duration,
+    /// [`ServerOp::Accept`] が `ConnectionAborted`（相手が accept 完了前に
+    /// 切断した）を再試行した回数。[`crate::server`] モジュール doc の
+    /// 「受付ループの組み方」参照。[`ServerOp::Recv`]・[`ServerOp::Send`] では
+    /// 常に `0`。
+    pub accept_aborted_retries: u32,
+    /// `outcome` が失敗系だった場合の詳細（エラーコード・メッセージ）。
+    /// 成功時は `None`。[`SendEventError`] のドキュメント参照（借用は
+    /// `on_event` の呼び出し中のみ有効）。
+    pub error: Option<SendEventError<'a>>,
+}
+
+/// 件数・破棄数等の要約のみを出す手書きの `Debug`（[`SendEvent`] と同じ理由。
+/// `error` は [`SendEventError`] の truncate 済み `Debug` へ委譲する）。
+impl fmt::Debug for ServerEvent<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerEvent")
+            .field("op", &self.op)
+            .field("kind", &self.kind)
+            .field("outcome", &self.outcome)
+            .field("latency", &self.latency)
+            .field("accept_aborted_retries", &self.accept_aborted_retries)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+/// [`crate::server::UdsServer`]・[`crate::server::UdsConnection`] の accept・
+/// 送受信イベントを受け取る観測フック（TASK-13.2.1・#820。P1・REPAIR-4・
+/// REPAIR-5）。[`SendObserver`] の UDS サーバー版で、契約は同じ
+/// （[`SendObserver`] のドキュメント参照）。
+///
+/// # 契約: ブロックする I/O をしてはならない（REPAIR-5）
+///
+/// `on_event` は accept・送信・受信経路（[`crate::server::UdsServer::accept`]・
+/// [`crate::transport::FrameSender::send_frame`]・
+/// [`crate::transport::FrameReceiver::recv_frame`] の [`crate::server::UdsConnection`]
+/// 実装）から同期で呼ばれる。ここでブロックする I/O を行うと、受付ループ・
+/// 送受信そのものが無期限に停止しかねず、[`crate::transport::IoTimeout`] でも
+/// 打ち切れない。実装はメモリ内へ積む・非ブロッキング操作のみに留め、実際の
+/// I/O は別経路（呼び出し元が明示的に呼ぶ drain API 等）へ分離すること
+/// （[`JsonLinesServerObserver`] を参照）。
+///
+/// # `bind` は観測対象外
+///
+/// [`ServerOp`] は `Accept`・`Recv`・`Send` のみを持つ。
+/// [`crate::server::UdsServer::bind`] は本フックへ引き渡す前段階（構築時の
+/// 引数）であり、bind 自体の成功・失敗は観測イベントとして通知されない
+/// （bind 失敗時は観測フックの値ごと破棄される）。将来 bind を観測対象に
+/// 含める場合は `ServerOp` へバリアントを追加する（`#[non_exhaustive]`）。
+///
+/// # 全分岐で必ず 1 回通知する
+///
+/// [`crate::server::UdsServer::accept`]・[`crate::server::UdsConnection`] の
+/// 送受信は、成功・各種拒否（プロトコル違反・`ReceiveLimits::admit` の拒否・
+/// poison 済みでの拒否）・タイムアウトのすべての分岐で、本メソッドを必ず
+/// 1 回呼ぶ（`crates/io/tests/server.rs` の結合試験で確認する）。
+pub trait ServerObserver: Send {
+    /// 1 回の操作イベントを通知する。`event` は呼び出し中のみ有効な借用
+    /// （[`ServerEvent`] のドキュメント参照）。
+    fn on_event(&mut self, event: &ServerEvent<'_>);
+}
+
+/// 何もしない実装（観測しない場合に呼び出し元が [`crate::server::UdsServer::bind`]・
+/// [`crate::server::UdsServer::accept`] へ明示的に渡す。暗黙の既定として選ばれる
+/// ことはない。TASK-13.2.1・#820。[`NoopSendObserver`] の UDS サーバー版）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoopServerObserver;
+
+impl ServerObserver for NoopServerObserver {
+    fn on_event(&mut self, _event: &ServerEvent<'_>) {}
+}
+
+/// [`ServerEvent`] の JSON エンコード時に固定で書き込む部分（`event`・`op`・
+/// `kind`・`outcome`・`reason`・`code`・`message_truncated`・
+/// `accept_aborted_retries`・`latency_us` のキー名・区切り文字・想定される値の
+/// 最大長）に見込む上限バイト数。[`SEND_LOG_LINE_FIXED_OVERHEAD_BYTES`] より、
+/// `op`（最大 `"\"op\":\"accept\","` 相当）・`accept_aborted_retries`（`u32` の
+/// 最大桁数 `4294967295`）ぶん余分に見積もる。[`MAX_SERVER_LOG_LINE_BYTES`] の
+/// 計算にのみ使う保守的な見積もりであり、実際のエンコード処理はこの値を直接
+/// 参照しない。
+const SERVER_LOG_LINE_FIXED_OVERHEAD_BYTES: usize = SEND_LOG_LINE_FIXED_OVERHEAD_BYTES + 128;
+
+/// [`JsonLinesServerObserver`] がためる 1 行の JSON がとりうる最大バイト数の
+/// 見積もり（[`MAX_SEND_LOG_LINE_BYTES`] のサーバー版）。
+const MAX_SERVER_LOG_LINE_BYTES: usize =
+    SERVER_LOG_LINE_FIXED_OVERHEAD_BYTES + MAX_ESCAPED_MESSAGE_BYTES;
+
+const _: () = assert!(
+    MAX_SERVER_LOG_LINE_BYTES <= MAX_SEND_LOG_BUFFER_BYTES,
+    "SERVER_LOG_LINE_FIXED_OVERHEAD_BYTES と MAX_SEND_LOG_MESSAGE_BYTES の組み合わせでは \
+     1 行の最大サイズが総バイト上限を超えてしまう"
+);
+
+/// [`ServerEvent`] を JSON Lines（1 イベント 1 行）へ変換し、上限付きのメモリ内
+/// バッファ（`BoundedJsonLines`）へためる既定実装（TASK-13.2.1・#820。P1・
+/// REPAIR-4・REPAIR-5。[`JsonLinesSendObserver`] の UDS サーバー版）。
+///
+/// [`JsonLinesSendObserver`] と行数上限（[`DEFAULT_SEND_LOG_CAPACITY`]・
+/// [`MAX_SEND_LOG_CAPACITY`]）・合計バイト数上限（[`MAX_SEND_LOG_BUFFER_BYTES`]）・
+/// `message` の切り詰め長（[`MAX_SEND_LOG_MESSAGE_BYTES`]）・満杯時に新規
+/// イベント側を破棄する方針・`dropped_count`・`drain_lines` の契約を共有する
+/// （両者とも `BoundedJsonLines` をラップする。上限の値自体を UDS サーバー用に
+/// 分ける理由がないため、既存の定数をそのまま再利用する）。
+///
+/// 出力キーは [`JsonLinesSendObserver`] と共通の語彙に `op`・
+/// `accept_aborted_retries` を加えたもの: `event`（常に `"io_server"`）・
+/// `op`（`"accept"`/`"recv"`/`"send"`）・`kind`（`WRITE`/`ACK`/`FLUSH`/
+/// `FLUSH_ACK`。[`ServerEvent::kind`] が `None` の場合はキー自体を省く）・
+/// `outcome`（`"ok"`/`"error"`）・`reason`（失敗系のみ。[`ServerOutcome`] の
+/// snake_case 名。`rejected_poisoned` で P1-3 の poison 拒否を区別できる）・
+/// `code`（失敗系のみ・ERR-1 文字列）・`message`（失敗系のみ・切り詰め済み・
+/// エスケープ済み）・`message_truncated`（切り詰め発生時のみ `true`）・
+/// `accept_aborted_retries`（`u32`）・`latency_us`。フィールドの出力順は
+/// この記載順に固定する。
+///
+/// # `on_event` は I/O をしない（REPAIR-5）
+/// [`JsonLinesSendObserver`] と同じ理由（そのドキュメント参照）で、
+/// [`ServerObserver::on_event`] は `BoundedJsonLines` へ積むだけにとどめ、
+/// 実際の書き出しは呼び出し元が [`Self::drain_lines`] で取り出して行う。
+pub struct JsonLinesServerObserver {
+    buf: BoundedJsonLines,
+}
+
+impl JsonLinesServerObserver {
+    /// 既定容量（[`DEFAULT_SEND_LOG_CAPACITY`]）で観測フックを作る。
+    pub fn new() -> Self {
+        Self {
+            buf: BoundedJsonLines::new(),
+        }
+    }
+
+    /// 容量を指定して観測フックを作る。`capacity` が `0` または
+    /// [`MAX_SEND_LOG_CAPACITY`] を超える場合は [`IoErrorCode::InvalidArgument`]
+    /// を返す（無制限確保の防止）。
+    pub fn with_capacity(capacity: usize) -> Result<Self, IoError> {
+        Ok(Self {
+            buf: BoundedJsonLines::try_with_capacity(capacity, "server log")?,
+        })
+    }
+
+    /// このバッファの容量を返す。
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    /// 現在ためている JSON 行数を返す。
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// ためている JSON 行が 1 件もないかを返す。
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// 容量超過により破棄した（新規イベント側を破棄した）件数を返す。
+    pub fn dropped_count(&self) -> u64 {
+        self.buf.dropped_count()
+    }
+
+    /// 現在ためている JSON 行の合計バイト数（改行を含まない）を返す。
+    pub fn total_bytes(&self) -> usize {
+        self.buf.total_bytes()
+    }
+
+    /// ためている JSON 行をすべて取り出してキューを空にする（各行は改行を含まない
+    /// 完全な JSON 文字列）。書き出し・再試行は呼び出し元の責務
+    /// （[`JsonLinesSendObserver::drain_lines`] と同じ契約）。
+    pub fn drain_lines(&mut self) -> Vec<String> {
+        self.buf.drain()
+    }
+}
+
+impl Default for JsonLinesServerObserver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServerObserver for JsonLinesServerObserver {
+    fn on_event(&mut self, event: &ServerEvent<'_>) {
+        self.buf.push_encoded_line(|| encode_server_event(event));
+    }
+}
+
+/// ためた JSON 行の中身を誤ってダンプしないよう、件数・破棄数・合計バイト数のみを
+/// 出す手書きの `Debug` 実装（[`JsonLinesSendObserver`] と同じ理由）。
+impl fmt::Debug for JsonLinesServerObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JsonLinesServerObserver")
+            .field("len", &self.buf.len())
+            .field("capacity", &self.buf.capacity())
+            .field("dropped", &self.buf.dropped_count())
+            .field("total_bytes", &self.buf.total_bytes())
+            .finish()
+    }
+}
+
+fn server_op_str(op: ServerOp) -> &'static str {
+    match op {
+        ServerOp::Accept => "accept",
+        ServerOp::Recv => "recv",
+        ServerOp::Send => "send",
+    }
+}
+
+/// [`ServerOutcome`] の snake_case 名を返す（[`outcome_reason_str`] の UDS
+/// サーバー版。TASK-13.2.1・#820）。
+fn server_outcome_reason_str(outcome: ServerOutcome) -> &'static str {
+    match outcome {
+        ServerOutcome::Success => "success",
+        ServerOutcome::RejectedPoisoned => "rejected_poisoned",
+        ServerOutcome::Failure => "failure",
+    }
+}
+
+/// `event.kind` から `"kind":"WRITE",` の先頭カンマなし・末尾カンマありの
+/// 断片を組み立てる（[`ack_kind_json_fragment`] の `kind` 版。`None` の場合は
+/// フィールド自体を省く）。
+fn server_kind_json_fragment(kind: Option<FrameKind>) -> String {
+    match kind {
+        Some(kind) => format!("\"kind\":\"{}\",", frame_kind_str(kind)),
+        None => String::new(),
+    }
+}
+
+/// [`ServerEvent`] を 1 行の JSON Lines 文字列へエンコードする（改行は含まない。
+/// [`encode_send_event`] の UDS サーバー版。TASK-13.2.1・#820）。
+fn encode_server_event(event: &ServerEvent<'_>) -> String {
+    let latency_us = event.latency.as_micros();
+    let op = server_op_str(event.op);
+    let kind = server_kind_json_fragment(event.kind);
+    let retries = event.accept_aborted_retries;
+    match (&event.outcome, &event.error) {
+        (ServerOutcome::Success, _) => {
+            format!(
+                "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"ok\",\
+                 \"accept_aborted_retries\":{retries},\"latency_us\":{latency_us}}}"
+            )
+        }
+        (outcome, Some(error)) => {
+            let reason = server_outcome_reason_str(*outcome);
+            let code = error.code.as_str();
+            let (truncated_message, truncated) = truncate_message_bytes(error.message);
+            let message = escape_json_string(truncated_message);
+            if truncated {
+                format!(
+                    "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"error\",\
+                     \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
+                     \"message_truncated\":true,\"accept_aborted_retries\":{retries},\
+                     \"latency_us\":{latency_us}}}"
+                )
+            } else {
+                format!(
+                    "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"error\",\
+                     \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
+                     \"accept_aborted_retries\":{retries},\"latency_us\":{latency_us}}}"
+                )
+            }
+        }
+        (outcome, None) => {
+            // 契約上 `Success` 以外は必ず `error` を伴う（`crate::server` が
+            // 組み立てる）が、型としては `Option` のため、万一 `None` が来ても
+            // panic せず `code`/`message` を省いた行を出す（`encode_send_event`
+            // と同じフォールバック方針）。
+            let reason = server_outcome_reason_str(*outcome);
+            format!(
+                "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"error\",\
+                 \"reason\":\"{reason}\",\"accept_aborted_retries\":{retries},\
+                 \"latency_us\":{latency_us}}}"
             )
         }
     }
@@ -1144,5 +1533,220 @@ mod tests {
              \"code\":\"INVALID_ARGUMENT\",\"message\":\"recv_ack called with no in-flight \
              requests to match against\",\"latency_us\":0}"
         );
+    }
+
+    /// TASK-13.2.1・#820（REPAIR-4）: `Accept` 成功イベントは `kind` を持たず、
+    /// `accept_aborted_retries` を含む。
+    #[test]
+    fn repair4_encode_server_event_accept_success_omits_kind() {
+        let event = ServerEvent {
+            op: ServerOp::Accept,
+            kind: None,
+            outcome: ServerOutcome::Success,
+            latency: Duration::from_micros(10),
+            accept_aborted_retries: 2,
+            error: None,
+        };
+
+        let encoded = encode_server_event(&event);
+        assert!(!encoded.contains("\"kind\""), "encoded={encoded}");
+        assert_eq!(
+            encoded,
+            "{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"ok\",\
+             \"accept_aborted_retries\":2,\"latency_us\":10}"
+        );
+    }
+
+    /// TASK-13.2.1・#820（IO-1・REPAIR-4）: `Recv` の拒否（`Ack` 受信）イベントは
+    /// ヘッダ検証を通過しているため `kind` を持ち、`reason` が
+    /// `rejected_invalid_frame_kind` 等ではなく `failure` になる（P1-3 の poison
+    /// 拒否〔`rejected_poisoned`〕とは区別される）。
+    #[test]
+    fn repair4_encode_server_event_recv_rejects_client_originated_ack() {
+        let message = "server does not accept client-originated response frames: Ack";
+        let event = ServerEvent {
+            op: ServerOp::Recv,
+            kind: Some(FrameKind::Ack),
+            outcome: ServerOutcome::Failure,
+            latency: Duration::from_micros(5),
+            accept_aborted_retries: 0,
+            error: Some(SendEventError {
+                code: IoErrorCode::InvalidArgument,
+                message,
+            }),
+        };
+
+        let encoded = encode_server_event(&event);
+        assert_eq!(
+            encoded,
+            "{\"event\":\"io_server\",\"op\":\"recv\",\"kind\":\"ACK\",\"outcome\":\"error\",\
+             \"reason\":\"failure\",\"code\":\"INVALID_ARGUMENT\",\
+             \"message\":\"server does not accept client-originated response frames: Ack\",\
+             \"accept_aborted_retries\":0,\"latency_us\":5}"
+        );
+    }
+
+    /// TASK-13.2.1・#820（P1-3・REPAIR-4）: poison 済み接続での `Send` 拒否は
+    /// `reason":"rejected_poisoned"` になり、他の失敗（`failure`）と区別できる。
+    #[test]
+    fn repair4_encode_server_event_send_rejects_poisoned_connection() {
+        let message = "connection is poisoned by a previous error and must be reconnected";
+        let event = ServerEvent {
+            op: ServerOp::Send,
+            kind: Some(FrameKind::Ack),
+            outcome: ServerOutcome::RejectedPoisoned,
+            latency: Duration::ZERO,
+            accept_aborted_retries: 0,
+            error: Some(SendEventError {
+                code: IoErrorCode::Unavailable,
+                message,
+            }),
+        };
+
+        let encoded = encode_server_event(&event);
+        assert_eq!(
+            encoded,
+            "{\"event\":\"io_server\",\"op\":\"send\",\"kind\":\"ACK\",\"outcome\":\"error\",\
+             \"reason\":\"rejected_poisoned\",\"code\":\"UNAVAILABLE\",\
+             \"message\":\"connection is poisoned by a previous error and must be reconnected\",\
+             \"accept_aborted_retries\":0,\"latency_us\":0}"
+        );
+    }
+
+    /// REPAIR-5（#820 レビュー指摘）: `JsonLinesServerObserver` は容量に達すると
+    /// 新規イベントを破棄し `dropped_count` を増分する（`JsonLinesSendObserver`
+    /// と同じ挙動を `BoundedJsonLines` 経由で共有していることの確認）。
+    #[test]
+    fn repair5_json_lines_server_observer_drops_newest_when_full() {
+        let mut observer =
+            JsonLinesServerObserver::with_capacity(1).expect("1 must be a valid capacity");
+        let accept_ok = |retries: u32| ServerEvent {
+            op: ServerOp::Accept,
+            kind: None,
+            outcome: ServerOutcome::Success,
+            latency: Duration::ZERO,
+            accept_aborted_retries: retries,
+            error: None,
+        };
+
+        observer.on_event(&accept_ok(0));
+        observer.on_event(&accept_ok(1));
+
+        assert_eq!(observer.len(), 1);
+        assert_eq!(observer.dropped_count(), 1);
+        let lines = observer.drain_lines();
+        assert_eq!(
+            lines,
+            vec![
+                "{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"ok\",\
+                 \"accept_aborted_retries\":0,\"latency_us\":0}"
+            ]
+        );
+        assert!(observer.is_empty());
+    }
+
+    /// REPAIR-5（#820 レビュー指摘）: `with_capacity(0)` と
+    /// `MAX_SEND_LOG_CAPACITY + 1` は `InvalidArgument` で拒否される
+    /// （`JsonLinesSendObserver::with_capacity` と同じ検証を共有していることの
+    /// 確認）。
+    #[test]
+    fn repair5_json_lines_server_observer_with_capacity_rejects_out_of_range() {
+        let zero_err =
+            JsonLinesServerObserver::with_capacity(0).expect_err("zero must be rejected");
+        assert_eq!(zero_err.code(), IoErrorCode::InvalidArgument);
+
+        let over_err = JsonLinesServerObserver::with_capacity(MAX_SEND_LOG_CAPACITY + 1)
+            .expect_err("MAX_SEND_LOG_CAPACITY + 1 must be rejected");
+        assert_eq!(over_err.code(), IoErrorCode::InvalidArgument);
+    }
+
+    /// REPAIR-5（#820 レビュー指摘）: `ServerEvent` の手書き `Debug` は `error`
+    /// フィールド経由で `SendEventError` の `Debug` へ委譲し、`message` の全量を
+    /// 出さない（`SendEvent` と同じ確認）。
+    #[test]
+    fn repair5_server_event_debug_delegates_to_error_debug() {
+        let huge_message = "c".repeat(MAX_SEND_LOG_MESSAGE_BYTES * 4);
+        let event = ServerEvent {
+            op: ServerOp::Recv,
+            kind: Some(FrameKind::Write),
+            outcome: ServerOutcome::Failure,
+            latency: Duration::from_millis(1),
+            accept_aborted_retries: 0,
+            error: Some(SendEventError {
+                code: IoErrorCode::Timeout,
+                message: &huge_message,
+            }),
+        };
+
+        let debug_output = format!("{event:?}");
+
+        assert!(
+            !debug_output.contains(&"c".repeat(MAX_SEND_LOG_MESSAGE_BYTES + 1)),
+            "ServerEvent's Debug must not leak the full untruncated message: {debug_output}"
+        );
+        assert!(debug_output.len() < huge_message.len());
+    }
+
+    /// TASK-13.2.1・#820（REPAIR-4・REPAIR-12）: 1 行の最悪ケース
+    /// （`encode_server_event` の出力が最も長くなる組み合わせ。`accept_aborted_retries`
+    /// が `u32::MAX` の場合を含む）でも [`MAX_SERVER_LOG_LINE_BYTES`] を超えない
+    /// ことを機械照合する（[`repair4_repair12_encode_send_event_worst_case_line_fits_within_max_line_bytes`]
+    /// のサーバー版。最悪ケースの根拠は同テストと同じ: `kind` は `FLUSH_ACK`
+    /// 〔9 バイトで最長〕、`outcome`/`code` は `RejectedResourceExhausted`
+    /// 相当ではなく `ServerOutcome::Failure`〔`"failure"`。`reason` の候補が
+    /// 少ないため固定〕、`code` は [`IoErrorCode::ResourceExhausted`]
+    /// 〔`"RESOURCE_EXHAUSTED"`。全 `IoErrorCode` 中最長〕、`message` は上限超過の
+    /// 1 バイト制御文字の連続〔エスケープ後 6 倍で最悪〕、`latency` は
+    /// `Duration::MAX`、`accept_aborted_retries` は `u32::MAX`
+    /// 〔実行時は `MAX_ACCEPT_ABORT_RETRIES` で頭打ちだが、フィールドの型としての
+    /// 上限を正直に見積もる〕）。
+    #[test]
+    fn repair4_repair12_encode_server_event_worst_case_line_fits_within_max_line_bytes() {
+        let oversized_control_chars = "\u{0001}".repeat(MAX_SEND_LOG_MESSAGE_BYTES + 1);
+        let event = ServerEvent {
+            op: ServerOp::Recv,
+            kind: Some(FrameKind::FlushAck),
+            outcome: ServerOutcome::Failure,
+            latency: Duration::MAX,
+            accept_aborted_retries: u32::MAX,
+            error: Some(SendEventError {
+                code: IoErrorCode::ResourceExhausted,
+                message: &oversized_control_chars,
+            }),
+        };
+
+        let encoded = encode_server_event(&event);
+
+        assert!(
+            encoded.contains("\"message_truncated\":true"),
+            "the oversized message must trigger truncation: {encoded}"
+        );
+        let escaped_control_char_count = encoded.matches("\\u0001").count();
+        assert_eq!(
+            escaped_control_char_count, MAX_SEND_LOG_MESSAGE_BYTES,
+            "expected exactly MAX_SEND_LOG_MESSAGE_BYTES escaped control characters: {encoded}"
+        );
+        assert!(
+            encoded.len() <= MAX_SERVER_LOG_LINE_BYTES,
+            "encoded line ({} bytes) must fit within MAX_SERVER_LOG_LINE_BYTES ({} bytes)",
+            encoded.len(),
+            MAX_SERVER_LOG_LINE_BYTES
+        );
+    }
+
+    /// TASK-13.2.1・#820: `NoopServerObserver` は何もしない（既定実装が accept・
+    /// 送受信経路の動作へ影響しないことの確認）。
+    #[test]
+    fn repair4_noop_server_observer_does_nothing() {
+        let mut observer = NoopServerObserver;
+        observer.on_event(&ServerEvent {
+            op: ServerOp::Accept,
+            kind: None,
+            outcome: ServerOutcome::Success,
+            latency: Duration::ZERO,
+            accept_aborted_retries: 0,
+            error: None,
+        });
+        // panic せず戻ることのみを確認する（副作用を持たない契約）。
     }
 }

@@ -16,6 +16,20 @@
 //! サーバー本体）が組み、同時接続数の上限などの運用方針もそちら側で決める
 //! （本 crate は 1 接続の送受信責務のみを負う）。
 //!
+//! # 観測（REPAIR-4・REPAIR-5・#820 reviewer/security-auditor 指摘対応）
+//!
+//! [`UdsServer::bind`]・[`UdsServer::accept`] は [`crate::observe::ServerObserver`]
+//! を必須引数として要求する（[`crate::client::PipelineClient::new`] が
+//! [`crate::observe::SendObserver`] を必須にするのと同じ理由。観測しない場合は
+//! 呼び出し元が [`crate::observe::NoopServerObserver`] を明示的に渡す。暗黙の
+//! 既定にはしない）。accept は [`UdsServer`] が構築時に受け取った観測フックへ、
+//! 1 接続内の送受信（[`FrameSender::send_frame`]・[`FrameReceiver::recv_frame`]）は
+//! [`UdsServer::accept`] が受け取る接続ごとの観測フックへ、それぞれ通知する。
+//! 全分岐（成功・各拒否・タイムアウト・poison 済みでの拒否）で必ず 1 回通知し、
+//! 通知自体は [`crate::observe::ServerObserver::on_event`] の契約どおり
+//! ブロックする I/O を行わない（[`crate::observe::ServerObserver`] のドキュメント
+//! 参照）。
+//!
 //! # OS 対応
 //!
 //! Linux / macOS では [`UdsServer`]・[`UdsConnection`] は実際に UDS を bind・
@@ -60,10 +74,31 @@
 //! から使う場合はこの前提が崩れうるため範囲外とする。
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::error::{IoError, IoErrorCode};
-use crate::protocol::Frame;
+use crate::observe::{SendEventError, ServerEvent, ServerObserver, ServerOp, ServerOutcome};
+use crate::protocol::{Frame, FrameKind};
 use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
+
+/// [`imp::ServerInner::accept`] の結果に、`ConnectionAborted` の再試行回数
+/// （[`crate::observe::ServerEvent::accept_aborted_retries`] に必要）を添えて
+/// 呼び出し元（[`UdsServer::accept`]）へ持ち帰るための非公開型（TASK-13.2.1・
+/// #820・reviewer 指摘対応。REPAIR-4）。`imp` モジュールの外へ OS 固有型を
+/// 漏らさないため、`C` は `imp::ConnectionInner` を指す型引数として使う。
+struct AcceptAttempt<C> {
+    result: Result<C, IoError>,
+    aborted_retries: u32,
+}
+
+/// [`imp::ConnectionInner::recv_frame`] の結果に、ヘッダ検証を通過した時点で
+/// 確定するフレーム種別（[`crate::observe::ServerEvent::kind`] に必要）を
+/// 添えて呼び出し元（[`UdsConnection::recv_frame`]）へ持ち帰るための非公開型
+/// （TASK-13.2.1・#820・reviewer 指摘対応。REPAIR-4）。
+struct RecvAttempt {
+    result: Result<Frame, IoError>,
+    kind: Option<FrameKind>,
+}
 
 /// UDS の接続受け付け役（TASK-13.2.1・IO-1）。
 ///
@@ -71,12 +106,19 @@ use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
 /// 「自分が bind したパスがまだソケットファイルのままであること」を
 /// `symlink_metadata` で確かめ、別種のファイルに置き換わっていた場合は
 /// 削除しない（任意のファイルを消す経路を作らないため。security.md）。
-pub struct UdsServer {
+///
+/// `O: ServerObserver` は [`Self::bind`] が受け取る必須の観測フックで、
+/// [`Self::accept`] のイベント（[`crate::observe::ServerOp::Accept`]）を
+/// 通知する（モジュール doc「観測」節参照）。
+pub struct UdsServer<O: ServerObserver> {
     inner: imp::ServerInner,
+    observer: O,
 }
 
-impl core::fmt::Debug for UdsServer {
-    /// パス以外の内部状態（socket fd 等）は出力しない。
+impl<O: ServerObserver> core::fmt::Debug for UdsServer<O> {
+    /// パス以外の内部状態（socket fd・観測フックの中身等）は出力しない
+    /// （[`crate::observe::SendObserver`] のドキュメント「`Debug` は要求しない」
+    /// と同じ方針。`O: Debug` を要求しない）。
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UdsServer")
             .field("path", &self.path())
@@ -84,7 +126,7 @@ impl core::fmt::Debug for UdsServer {
     }
 }
 
-impl UdsServer {
+impl<O: ServerObserver> UdsServer<O> {
     /// `path` に UDS を bind する。
     ///
     /// bind 前に親ディレクトリ（symlink でない・ディレクトリである・
@@ -97,15 +139,24 @@ impl UdsServer {
     /// 不一致ならソケットファイルを片付けてから拒否する。検証後はソケット
     /// ファイルを `0600` にし、listener を非ブロッキングにする。
     ///
+    /// `observer` は [`Self::accept`] が通知する Accept イベントの送り先で、
+    /// 必須引数である（観測しない場合は [`crate::observe::NoopServerObserver`]
+    /// を明示的に渡す。モジュール doc「観測」節参照）。bind 自体は
+    /// [`crate::observe::ServerOp`] に含まれないため観測イベントを発生させず、
+    /// 失敗時は `observer` を保持せずそのまま破棄する（bind 失敗はこの層より
+    /// 前の入力検証であり、accept・送受信のような繰り返し呼ばれる操作ではない
+    /// ため。#820 レビュー指摘）。
+    ///
     /// # 既知の残存リスク（bind から chmod までの窓）
     /// `UnixListener::bind` はソケットファイルの作成と listen の開始を同時に
     /// 行うため、上記の検証・`0600` へのチャモードが完了するまでの短い間、
     /// ソケットファイルの実効モードは umask 依存になる。親ディレクトリを
     /// owner 専用（`0700` 以下）にする検証が実質的な防壁であり、この窓の
     /// 間に到達できるのは親ディレクトリを辿れる者（＝ owner 本人）に限られる。
-    pub fn bind(path: &Path) -> Result<Self, IoError> {
+    pub fn bind(path: &Path, observer: O) -> Result<Self, IoError> {
         Ok(Self {
             inner: imp::ServerInner::bind(path)?,
+            observer,
         })
     }
 
@@ -114,16 +165,65 @@ impl UdsServer {
     /// 期限を過ぎても接続が来なければ [`IoErrorCode::Timeout`] を返す
     /// （REPAIR-5: 無期限にブロックしない）。呼び出し側は次の接続を待つために
     /// 再度この関数を呼ぶ（受付ループはこのモジュールの外で組む）。
-    pub fn accept(&self, timeout: IoTimeout) -> Result<UdsConnection, IoError> {
-        Ok(UdsConnection {
-            inner: self.inner.accept(timeout)?,
+    ///
+    /// `conn_observer` は返す [`UdsConnection`] が送受信イベント
+    /// （[`crate::observe::ServerOp::Recv`]・[`crate::observe::ServerOp::Send`]）を
+    /// 通知する先で、必須引数である（モジュール doc「観測」節参照）。成功・
+    /// 失敗のいずれでも、この呼び出し自体の Accept イベントは
+    /// [`Self::bind`] で渡した観測フックへ 1 回通知する（`&mut self` を要求する
+    /// のはこの通知のため）。
+    pub fn accept<C: ServerObserver>(
+        &mut self,
+        timeout: IoTimeout,
+        conn_observer: C,
+    ) -> Result<UdsConnection<C>, IoError> {
+        let started = Instant::now();
+        let attempt = self.inner.accept(timeout);
+        let elapsed = started.elapsed();
+        match &attempt.result {
+            Ok(_) => self.observer.on_event(&ServerEvent {
+                op: ServerOp::Accept,
+                kind: None,
+                outcome: ServerOutcome::Success,
+                latency: elapsed,
+                accept_aborted_retries: attempt.aborted_retries,
+                error: None,
+            }),
+            Err(err) => self.observer.on_event(&ServerEvent {
+                op: ServerOp::Accept,
+                kind: None,
+                outcome: ServerOutcome::Failure,
+                latency: elapsed,
+                accept_aborted_retries: attempt.aborted_retries,
+                error: Some(SendEventError {
+                    code: err.code(),
+                    message: err.message(),
+                }),
+            }),
+        }
+        attempt.result.map(|inner| UdsConnection {
+            inner,
             poisoned: false,
+            observer: conn_observer,
         })
     }
 
     /// bind したソケットファイルのパスを返す。
     pub fn path(&self) -> &Path {
         self.inner.path()
+    }
+
+    /// [`Self::bind`] で渡した観測フックを参照する
+    /// （[`crate::client::PipelineClient::observer`] と同じ用途）。
+    pub fn observer(&self) -> &O {
+        &self.observer
+    }
+
+    /// [`Self::bind`] で渡した観測フックを可変参照で取り出す
+    /// （[`crate::observe::JsonLinesServerObserver::drain_lines`] 等、呼び出し元が
+    /// 明示的にためた行を取り出す操作に使う）。
+    pub fn observer_mut(&mut self) -> &mut O {
+        &mut self.observer
     }
 }
 
@@ -138,13 +238,19 @@ impl UdsServer {
 /// [`IoErrorCode::Unavailable`] を返し続ける（P1-3・REPAIR-5・REPAIR-6。
 /// `FrameHeader` に同期マーカーがなく、送受信途中のエラー後はフレーム境界を
 /// 復元できないため接続を再利用しない）。
-pub struct UdsConnection {
+///
+/// `C: ServerObserver` は [`UdsServer::accept`] から受け取る必須の観測フックで、
+/// `send_frame` / `recv_frame` のすべての分岐（成功・poison による拒否・
+/// その他の失敗）を通知する（モジュール doc「観測」節参照）。
+pub struct UdsConnection<C: ServerObserver> {
     inner: imp::ConnectionInner,
     poisoned: bool,
+    observer: C,
 }
 
-impl core::fmt::Debug for UdsConnection {
-    /// socket fd 等の内部状態は出力せず、poison 状態のみを出す。
+impl<C: ServerObserver> core::fmt::Debug for UdsConnection<C> {
+    /// socket fd・観測フックの中身等の内部状態は出力せず、poison 状態のみを出す
+    /// （`C: Debug` を要求しない。[`UdsServer`] の `Debug` と同じ方針）。
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UdsConnection")
             .field("poisoned", &self.poisoned)
@@ -152,7 +258,7 @@ impl core::fmt::Debug for UdsConnection {
     }
 }
 
-impl UdsConnection {
+impl<C: ServerObserver> UdsConnection<C> {
     /// `send_frame` / `recv_frame` の結果を見て poison 状態を更新する
     /// （P1-3 の契約を守る箇所をここ 1 か所に集約する）。
     fn poison_on_err<T>(&mut self, result: Result<T, IoError>) -> Result<T, IoError> {
@@ -160,6 +266,54 @@ impl UdsConnection {
             self.poisoned = true;
         }
         result
+    }
+
+    /// 成功イベントを観測フックへ通知する（`send_frame`・`recv_frame` の成功
+    /// 分岐で共有。TASK-13.2.1・#820。REPAIR-4）。
+    fn notify_success(&mut self, op: ServerOp, kind: Option<FrameKind>, latency: Duration) {
+        self.observer.on_event(&ServerEvent {
+            op,
+            kind,
+            outcome: ServerOutcome::Success,
+            latency,
+            accept_aborted_retries: 0,
+            error: None,
+        });
+    }
+
+    /// 失敗イベントを観測フックへ通知する（`send_frame`・`recv_frame` の失敗
+    /// 分岐で共有。`outcome` は呼び出し元が [`ServerOutcome::RejectedPoisoned`]
+    /// （P1-3 の poison 拒否）と [`ServerOutcome::Failure`]（それ以外）を選ぶ。
+    /// TASK-13.2.1・#820。REPAIR-4）。
+    fn notify_failure(
+        &mut self,
+        op: ServerOp,
+        kind: Option<FrameKind>,
+        outcome: ServerOutcome,
+        latency: Duration,
+        err: &IoError,
+    ) {
+        self.observer.on_event(&ServerEvent {
+            op,
+            kind,
+            outcome,
+            latency,
+            accept_aborted_retries: 0,
+            error: Some(SendEventError {
+                code: err.code(),
+                message: err.message(),
+            }),
+        });
+    }
+
+    /// [`UdsServer::accept`] で渡した観測フックを参照する。
+    pub fn observer(&self) -> &C {
+        &self.observer
+    }
+
+    /// [`UdsServer::accept`] で渡した観測フックを可変参照で取り出す。
+    pub fn observer_mut(&mut self) -> &mut C {
+        &mut self.observer
     }
 }
 
@@ -171,27 +325,67 @@ fn unavailable_after_poison() -> IoError {
     )
 }
 
-impl FrameSender for UdsConnection {
+impl<C: ServerObserver> FrameSender for UdsConnection<C> {
     type Frame = Frame;
 
     fn send_frame(&mut self, frame: &Frame, timeout: IoTimeout) -> Result<(), IoError> {
         if self.poisoned {
-            return Err(unavailable_after_poison());
+            let err = unavailable_after_poison();
+            self.notify_failure(
+                ServerOp::Send,
+                Some(frame.kind()),
+                ServerOutcome::RejectedPoisoned,
+                Duration::ZERO,
+                &err,
+            );
+            return Err(err);
         }
+        let started = Instant::now();
         let result = self.inner.send_frame(frame, timeout);
+        let elapsed = started.elapsed();
+        match &result {
+            Ok(()) => self.notify_success(ServerOp::Send, Some(frame.kind()), elapsed),
+            Err(err) => self.notify_failure(
+                ServerOp::Send,
+                Some(frame.kind()),
+                ServerOutcome::Failure,
+                elapsed,
+                err,
+            ),
+        }
         self.poison_on_err(result)
     }
 }
 
-impl FrameReceiver for UdsConnection {
+impl<C: ServerObserver> FrameReceiver for UdsConnection<C> {
     type Frame = Frame;
 
     fn recv_frame(&mut self, timeout: IoTimeout) -> Result<Frame, IoError> {
         if self.poisoned {
-            return Err(unavailable_after_poison());
+            let err = unavailable_after_poison();
+            self.notify_failure(
+                ServerOp::Recv,
+                None,
+                ServerOutcome::RejectedPoisoned,
+                Duration::ZERO,
+                &err,
+            );
+            return Err(err);
         }
-        let result = self.inner.recv_frame(timeout);
-        self.poison_on_err(result)
+        let started = Instant::now();
+        let attempt = self.inner.recv_frame(timeout);
+        let elapsed = started.elapsed();
+        match &attempt.result {
+            Ok(frame) => self.notify_success(ServerOp::Recv, Some(frame.kind()), elapsed),
+            Err(err) => self.notify_failure(
+                ServerOp::Recv,
+                attempt.kind,
+                ServerOutcome::Failure,
+                elapsed,
+                err,
+            ),
+        }
+        self.poison_on_err(attempt.result)
     }
 }
 
@@ -260,7 +454,11 @@ mod imp {
             &self.path
         }
 
-        pub(super) fn accept(&self, timeout: IoTimeout) -> Result<ConnectionInner, IoError> {
+        /// 接続を 1 件受け付ける。戻り値には `ConnectionAborted` を再試行した
+        /// 回数（[`crate::observe::ServerEvent::accept_aborted_retries`] の
+        /// 出どころ）を必ず添える（成功・タイムアウト・retry 上限超過の
+        /// いずれでも。TASK-13.2.1・#820・reviewer 指摘対応。REPAIR-4）。
+        pub(super) fn accept(&self, timeout: IoTimeout) -> super::AcceptAttempt<ConnectionInner> {
             let deadline = Instant::now() + timeout.as_duration();
             let mut abort_retries = 0u32;
             loop {
@@ -269,21 +467,32 @@ mod imp {
                         // macOS では accept() した stream がリスナーの
                         // O_NONBLOCK を引き継ぐ（Linux では引き継がないが、
                         // 呼んでも無害なので常に呼ぶ）。
-                        stream.set_nonblocking(false).map_err(|e| {
-                            IoError::new(
-                                IoErrorCode::Internal,
-                                format!("failed to clear nonblocking mode on accepted stream: {e}"),
-                            )
-                        })?;
-                        return Ok(ConnectionInner { stream });
+                        let result = stream
+                            .set_nonblocking(false)
+                            .map_err(|e| {
+                                IoError::new(
+                                    IoErrorCode::Internal,
+                                    format!(
+                                        "failed to clear nonblocking mode on accepted stream: {e}"
+                                    ),
+                                )
+                            })
+                            .map(|()| ConnectionInner { stream });
+                        return super::AcceptAttempt {
+                            result,
+                            aborted_retries: abort_retries,
+                        };
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
-                            return Err(IoError::new(
-                                IoErrorCode::Timeout,
-                                "accept timed out waiting for a client connection",
-                            ));
+                            return super::AcceptAttempt {
+                                result: Err(IoError::new(
+                                    IoErrorCode::Timeout,
+                                    "accept timed out waiting for a client connection",
+                                )),
+                                aborted_retries: abort_retries,
+                            };
                         }
                         std::thread::sleep(remaining.min(ACCEPT_POLL_INTERVAL));
                     }
@@ -292,28 +501,39 @@ mod imp {
                         // 自体を終わらせる理由にはならない（REPAIR-5 の趣旨:
                         // 一時的な相手都合で受付が止まらないようにする）。
                         // ただし無期限にリトライしないよう、期限と回数の両方で
-                        // 打ち切る。
+                        // 打ち切る。カウンタは saturating で数える（REPAIR-4・
+                        // #820 レビュー指摘。u32 の桁あふれで別の事象に見えて
+                        // しまわないようにする）。
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
-                            return Err(IoError::new(
-                                IoErrorCode::Timeout,
-                                "accept timed out waiting for a client connection",
-                            ));
+                            return super::AcceptAttempt {
+                                result: Err(IoError::new(
+                                    IoErrorCode::Timeout,
+                                    "accept timed out waiting for a client connection",
+                                )),
+                                aborted_retries: abort_retries,
+                            };
                         }
-                        abort_retries += 1;
+                        abort_retries = abort_retries.saturating_add(1);
                         if abort_retries > MAX_ACCEPT_ABORT_RETRIES {
-                            return Err(IoError::new(
-                                IoErrorCode::Internal,
-                                "accept exceeded the retry limit after repeated peer \
-                                 disconnects before accept completed",
-                            ));
+                            return super::AcceptAttempt {
+                                result: Err(IoError::new(
+                                    IoErrorCode::Internal,
+                                    "accept exceeded the retry limit after repeated peer \
+                                     disconnects before accept completed",
+                                )),
+                                aborted_retries: abort_retries,
+                            };
                         }
                     }
                     Err(e) => {
-                        return Err(IoError::new(
-                            IoErrorCode::Internal,
-                            format!("accept failed: {e}"),
-                        ));
+                        return super::AcceptAttempt {
+                            result: Err(IoError::new(
+                                IoErrorCode::Internal,
+                                format!("accept failed: {e}"),
+                            )),
+                            aborted_retries: abort_retries,
+                        };
                     }
                 }
             }
@@ -521,24 +741,71 @@ mod imp {
         /// `MAX_CONTROL_PAYLOAD_LEN`）の確保前検証のみであり、滞留件数上限の
         /// 実効化は TASK-13.2.2（#822）が `BatchBuffer` を配線した時点で
         /// 初めて機能する。
-        pub(super) fn recv_frame(&mut self, timeout: IoTimeout) -> Result<Frame, IoError> {
+        ///
+        /// # 戻り値にフレーム種別を添える理由（観測。TASK-13.2.1・#820）
+        /// ヘッダ検証（`FrameHeader::from_bytes`）を通過した時点でフレーム種別は
+        /// 確定するため、その後の拒否（応答系種別の拒否・`admit` の拒否・本体
+        /// 読み込み失敗）でも種別を呼び出し元（[`super::UdsConnection::recv_frame`]）
+        /// へ持ち帰り、[`crate::observe::ServerEvent::kind`] に載せられるように
+        /// する。ヘッダ自体の読み込み・検証に失敗した場合は種別が確定しないため
+        /// `None` のままにする。
+        pub(super) fn recv_frame(&mut self, timeout: IoTimeout) -> super::RecvAttempt {
             let deadline = Instant::now() + timeout.as_duration();
 
             let mut header_bytes = [0u8; FRAME_HEADER_LEN];
-            read_exact_until(
+            if let Err(e) = read_exact_until(
                 &mut self.stream,
                 &mut header_bytes,
                 deadline,
                 "frame header",
-            )?;
+            ) {
+                return super::RecvAttempt {
+                    result: Err(e),
+                    kind: None,
+                };
+            }
 
-            let header = FrameHeader::from_bytes(header_bytes)?;
-            reject_client_originated_response_frame(header.kind())?;
-            let admitted = ReceiveLimits::default().admit(header, 0)?;
+            let header = match FrameHeader::from_bytes(header_bytes) {
+                Ok(header) => header,
+                Err(e) => {
+                    return super::RecvAttempt {
+                        result: Err(e),
+                        kind: None,
+                    };
+                }
+            };
+            let kind = header.kind();
 
-            let body = read_body_until(&mut self.stream, admitted.body_len(), deadline)?;
+            if let Err(e) = reject_client_originated_response_frame(kind) {
+                return super::RecvAttempt {
+                    result: Err(e),
+                    kind: Some(kind),
+                };
+            }
+            let admitted = match ReceiveLimits::default().admit(header, 0) {
+                Ok(admitted) => admitted,
+                Err(e) => {
+                    return super::RecvAttempt {
+                        result: Err(e),
+                        kind: Some(kind),
+                    };
+                }
+            };
 
-            admitted.decode_body(&body)
+            let body = match read_body_until(&mut self.stream, admitted.body_len(), deadline) {
+                Ok(body) => body,
+                Err(e) => {
+                    return super::RecvAttempt {
+                        result: Err(e),
+                        kind: Some(kind),
+                    };
+                }
+            };
+
+            super::RecvAttempt {
+                result: admitted.decode_body(&body),
+                kind: Some(kind),
+            }
         }
     }
 
@@ -862,7 +1129,7 @@ mod imp {
             match *self {}
         }
 
-        pub(super) fn accept(&self, _timeout: IoTimeout) -> Result<ConnectionInner, IoError> {
+        pub(super) fn accept(&self, _timeout: IoTimeout) -> super::AcceptAttempt<ConnectionInner> {
             match *self {}
         }
     }
@@ -879,7 +1146,7 @@ mod imp {
             match *self {}
         }
 
-        pub(super) fn recv_frame(&mut self, _timeout: IoTimeout) -> Result<Frame, IoError> {
+        pub(super) fn recv_frame(&mut self, _timeout: IoTimeout) -> super::RecvAttempt {
             match *self {}
         }
     }

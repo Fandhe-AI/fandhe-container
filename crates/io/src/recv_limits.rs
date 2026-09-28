@@ -16,7 +16,9 @@
 //! （[`IoErrorCode::ResourceExhausted`]）で拒否する。受理した場合に限り、
 //! 本体バッファを確保できる型付きの証跡（[`AdmittedHeader`]）を返す。
 //! 設定上限（`max_bytes` 由来）は `Write` 用のバッチ集約上限であり、
-//! `Ack` / `Flush` / `FlushAck` 等の制御フレームには適用しない（詳細は
+//! `Ack` / `Flush` / `FlushAck` 等の制御フレームには適用しない。その代わり
+//! 制御フレームには [`MAX_CONTROL_PAYLOAD_LEN`]（`BatchConfig` に依存しない
+//! 固定の安全弁）を適用し、確保前検証を欠かさない（詳細は
 //! [`ReceiveLimits::admit`] のドキュメンテーションコメント参照）。
 //!
 //! # 呼び出し文脈
@@ -61,7 +63,9 @@
 //! - CLI / 設定からの上限値の配線（TASK-13.3・#78）
 //! - 複数接続を跨いだ累積バイト数・未フラッシュ滞留量の上限（IO-10・TASK-16）
 //! - 上限値の実測校正（TASK-88・TASK-16）
-//! - 種別ごとのペイロード長制約（制御フレームは長さ 0 等。TASK-12・TASK-13 の後続）
+//! - 制御フレームの種別ごとの厳密なペイロード長制約（`Flush` は長さ 0 等）。
+//!   本モジュールが設ける [`MAX_CONTROL_PAYLOAD_LEN`] は種別を区別しない
+//!   暫定の固定上限に過ぎない（TASK-12・TASK-13 の後続）
 //! - ゲートが `Err` を返した後の接続の扱い（再利用禁止・`Unavailable` 化）は
 //!   `docs/design/io-protocol.md` の既存契約に従い受信ループ（#820）が担う
 
@@ -79,6 +83,28 @@ use crate::protocol::{Frame, FrameHeader, FrameKind, MAX_PAYLOAD_LEN};
 /// 参照）はまだ配線されていないため、この値自体の校正は TASK-13.3・TASK-16・
 /// TASK-88 の責務。
 pub const MAX_RECV_PENDING_FRAMES: usize = MAX_BATCH_SIZE;
+
+/// 制御フレーム（`Ack` / `Flush` / `FlushAck`）に対する、確保前の暫定ペイロード長
+/// 上限（REPAIR-3: 実装済みを装わない。PR #1110 codex レビュー指摘の P0）。
+///
+/// `Write` 用の `max_payload_len`（[`BatchConfig::max_bytes`] 由来の設定値）は
+/// 運用者がバッチ用に小さく絞ることがあり、それを制御フレームへ転用すると
+/// 正常な制御フレームまで誤って拒否しうる（P1・解決済み。[`ReceiveLimits::admit`]
+/// のドキュメンテーションコメント参照）。かといって上限を一切設けないと、
+/// 制御フレームは [`crate::protocol::FrameHeader::from_bytes`] が検証する
+/// プロトコル上限 [`MAX_PAYLOAD_LEN`]（64 MiB）まで申告長を偽装でき、
+/// `allocate_body` がその長さのバッファを確保前検証なしに確保してしまう
+/// （P0）。制御フレームのペイロードレイアウトはまだ定義されていない
+/// （モジュール doc の「スコープ外」参照）ため、`BatchConfig` に依存しない
+/// 固定の安全弁として本定数を設ける。値は [`MAX_BATCH_SIZE`]（4096）件分の
+/// request id 相当を想定しても十分な余裕を持つ 64 KiB とした。実際の
+/// 制御フレームのレイアウト確定・上限値の校正は TASK-12・TASK-13 の後続・
+/// TASK-13.3（#78）・TASK-88 の責務。
+pub const MAX_CONTROL_PAYLOAD_LEN: u32 = 64 * 1024;
+
+// MAX_CONTROL_PAYLOAD_LEN はプロトコル上限を超えてはならない不変条件を
+// コンパイル時に保証する。
+const _: () = assert!(MAX_CONTROL_PAYLOAD_LEN <= MAX_PAYLOAD_LEN);
 
 // MAX_RECV_PENDING_FRAMES は非ゼロでなければならない不変条件をコンパイル時に
 // 保証する（`batch.rs` の `const _: () = assert!(...)` と同種のパターン）。
@@ -211,11 +237,25 @@ impl ReceiveLimits {
     ///    プロトコル上限 [`MAX_PAYLOAD_LEN`] の範囲でそのまま受理する。
     ///    種別ごとの妥当な長さ上限〔制御フレームは長さ 0 等〕を設ける判断は
     ///    引き続きスコープ外（モジュール doc 参照）
-    /// 2. `header.kind() == FrameKind::Write` かつ
+    /// 2. `header.kind() != FrameKind::Write`（制御フレーム）かつ
+    ///    `header.payload_len().get() > MAX_CONTROL_PAYLOAD_LEN` の場合は
+    ///    [`IoErrorCode::ResourceExhausted`]（`Write` 用の設定上限とは独立な
+    ///    固定の安全弁。設定上限を制御フレームへ転用しない〔P1・解決済み〕
+    ///    一方で、上限を一切設けないと制御フレームがプロトコル上限
+    ///    [`MAX_PAYLOAD_LEN`]〔64 MiB〕まで申告長を偽装でき、確保前検証なしに
+    ///    `allocate_body` が巨大確保してしまう〔PR #1110 codex レビュー指摘の
+    ///    P0〕。[`MAX_CONTROL_PAYLOAD_LEN`] のドキュメンテーションコメント参照）
+    /// 3. `header.kind() == FrameKind::Write` かつ
     ///    `pending_frames >= self.max_pending_frames` の場合は
     ///    [`IoErrorCode::ResourceExhausted`]（制御フレームは滞留を排出する側
     ///    のため件数判定の対象外にする）
-    /// 3. どちらにも該当しなければ [`AdmittedHeader`] を返す
+    /// 4. いずれにも該当しなければ [`AdmittedHeader`] を返す
+    ///
+    /// 種別で分岐する `match` は `FrameKind` の全バリアントを網羅する
+    /// （`#[non_exhaustive]` は他クレートからの網羅を防ぐだけで、同一クレート
+    /// 内のこの `match` には適用されない）。将来 `FrameKind` へ新しい種別を
+    /// 追加した場合はこの `match` がコンパイルエラーになり、確保前の長さ上限を
+    /// 割り当てずに新種別を通してしまう事態を防ぐ（fail-closed）。
     ///
     /// 比較は `>=` / `>` のみで加算は行わない（オーバーフローの経路を作らない）。
     /// `message` には数値（申告長・上限・滞留件数・上限件数）のみを含め、
@@ -226,24 +266,42 @@ impl ReceiveLimits {
         pending_frames: usize,
     ) -> Result<AdmittedHeader, IoError> {
         let payload_len = header.payload_len().get();
-        if header.kind() == FrameKind::Write && payload_len > self.max_payload_len {
-            return Err(IoError::new(
-                IoErrorCode::ResourceExhausted,
-                format!(
-                    "frame payload length {payload_len} exceeds configured receive limit {}",
-                    self.max_payload_len
-                ),
-            ));
-        }
 
-        if header.kind() == FrameKind::Write && pending_frames >= self.max_pending_frames.get() {
-            return Err(IoError::new(
-                IoErrorCode::ResourceExhausted,
-                format!(
-                    "pending frame count {pending_frames} has reached configured receive limit {}",
-                    self.max_pending_frames.get()
-                ),
-            ));
+        match header.kind() {
+            FrameKind::Write => {
+                if payload_len > self.max_payload_len {
+                    return Err(IoError::new(
+                        IoErrorCode::ResourceExhausted,
+                        format!(
+                            "frame payload length {payload_len} exceeds configured receive \
+                             limit {}",
+                            self.max_payload_len
+                        ),
+                    ));
+                }
+
+                if pending_frames >= self.max_pending_frames.get() {
+                    return Err(IoError::new(
+                        IoErrorCode::ResourceExhausted,
+                        format!(
+                            "pending frame count {pending_frames} has reached configured \
+                             receive limit {}",
+                            self.max_pending_frames.get()
+                        ),
+                    ));
+                }
+            }
+            FrameKind::Ack | FrameKind::Flush | FrameKind::FlushAck => {
+                if payload_len > MAX_CONTROL_PAYLOAD_LEN {
+                    return Err(IoError::new(
+                        IoErrorCode::ResourceExhausted,
+                        format!(
+                            "control frame payload length {payload_len} exceeds fixed control \
+                             frame limit {MAX_CONTROL_PAYLOAD_LEN}"
+                        ),
+                    ));
+                }
+            }
         }
 
         Ok(AdmittedHeader { header })
@@ -558,5 +616,56 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<ReceiveLimits>();
         assert_send::<AdmittedHeader>();
+    }
+
+    /// PR #1110 codex レビュー指摘の P0（IO-1）: 制御フレーム（`Ack` /
+    /// `Flush` / `FlushAck`）の申告長が [`MAX_CONTROL_PAYLOAD_LEN`] を超える
+    /// 場合は、`Write` 用の設定上限（`max_bytes` 由来）が大きく設定されて
+    /// いても、本体バッファを確保する前に `ResourceExhausted` で拒否される
+    /// （設定上限を制御フレームへ転用しない P1 修正が、制御フレームの
+    /// 長さ検証を完全に取り除いてしまっていないことの回帰確認）。
+    #[test]
+    fn io1_admit_rejects_control_frame_over_fixed_control_limit_before_allocation() {
+        reset_allocation_recorder();
+        // Write 用の設定上限は MAX_PAYLOAD_LEN いっぱいまで大きく取り、
+        // 制御フレームの拒否が Write 用の設定上限に依存しないことを示す。
+        let limits = ReceiveLimits::new(MAX_PAYLOAD_LEN, MAX_RECV_PENDING_FRAMES)
+            .expect("valid limits must succeed");
+
+        for kind in [FrameKind::Ack, FrameKind::Flush, FrameKind::FlushAck] {
+            let header = FrameHeader::new(kind, MAX_CONTROL_PAYLOAD_LEN + 1)
+                .expect("header within protocol limit must be valid");
+
+            let err = limits
+                .admit(header, 0)
+                .expect_err("control frame payload over the fixed control limit must be rejected");
+            assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+            assert!(
+                err.message()
+                    .contains(&(MAX_CONTROL_PAYLOAD_LEN + 1).to_string())
+            );
+            assert!(err.message().contains(&MAX_CONTROL_PAYLOAD_LEN.to_string()));
+        }
+        assert_eq!(
+            allocation_count(),
+            0,
+            "rejection must happen before any body allocation"
+        );
+    }
+
+    /// IO-1: 制御フレームは申告長がちょうど [`MAX_CONTROL_PAYLOAD_LEN`]
+    /// （境界値）であれば受理される（`>` であり `>=` ではない判定）。
+    #[test]
+    fn io1_admit_accepts_control_frame_at_fixed_control_limit_boundary() {
+        let limits = ReceiveLimits::new(8, 8).expect("valid limits must succeed");
+
+        for kind in [FrameKind::Ack, FrameKind::Flush, FrameKind::FlushAck] {
+            let header = FrameHeader::new(kind, MAX_CONTROL_PAYLOAD_LEN)
+                .expect("header within protocol limit must be valid");
+
+            let _admitted = limits.admit(header, 0).expect(
+                "control frame payload exactly at the fixed control limit must be accepted",
+            );
+        }
     }
 }

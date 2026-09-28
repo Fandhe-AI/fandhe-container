@@ -54,7 +54,9 @@ pub use protocol::{
     CHECKSUM_LEN, FRAME_HEADER_LEN, Frame, FrameChecksum, FrameHeader, FrameKind, MAX_FRAME_LEN,
     MAX_PAYLOAD_LEN, PROTOCOL_VERSION, PayloadLen,
 };
-pub use recv_limits::{AdmittedHeader, MAX_RECV_PENDING_FRAMES, ReceiveLimits};
+pub use recv_limits::{
+    AdmittedHeader, MAX_CONTROL_PAYLOAD_LEN, MAX_RECV_PENDING_FRAMES, ReceiveLimits,
+};
 pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, WireFrame,
 };

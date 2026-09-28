@@ -132,6 +132,22 @@ impl InFlightRequest {
     }
 }
 
+/// [`FrameKind::Write`] / [`FrameKind::Flush`] だけを未 ACK 追跡の対象として受理する。
+///
+/// [`FrameKind::Ack`] / [`FrameKind::FlushAck`] は応答フレームであり、これらに対応する
+/// ACK は来ない。追跡対象に含めると未 ACK キューの枠を占有し続け、二度と解放されない
+/// （[`SendQueue::register`]・[`PipelineClient::send`] の両方で共有する検証。
+/// codex レビュー指摘: `register` は本検証を経ずに `Ack`/`FlushAck` を受理していた）。
+fn ensure_trackable_frame_kind(kind: FrameKind) -> Result<(), IoError> {
+    match kind {
+        FrameKind::Write | FrameKind::Flush => Ok(()),
+        FrameKind::Ack | FrameKind::FlushAck => Err(IoError::new(
+            IoErrorCode::InvalidArgument,
+            "only Write/Flush frames can be tracked as in-flight requests",
+        )),
+    }
+}
+
 /// 送信済みで ACK 未受信のリクエストを、上限件数付きで送信順に追跡するキュー
 /// （IO-1・TASK-12.1）。
 ///
@@ -217,9 +233,15 @@ impl SendQueue {
 
     /// 新しい id を採番し、末尾に登録する。
     ///
+    /// `kind` が [`FrameKind::Write`] / [`FrameKind::Flush`] 以外
+    /// （[`FrameKind::Ack`] / [`FrameKind::FlushAck`]）の場合は
+    /// [`IoErrorCode::InvalidArgument`] を返し、キューの状態を変更しない
+    /// （[`ensure_trackable_frame_kind`]。codex レビュー指摘: これらは応答フレームで
+    /// 対応する ACK が来ず、登録すると未 ACK キューの枠が解放されないまま残る）。
     /// 上限に達している場合、または id の採番が `u64` の範囲を超える場合は
     /// [`IoErrorCode::ResourceExhausted`] を返し、キューの状態を変更しない。
     pub fn register(&mut self, kind: FrameKind) -> Result<InFlightRequest, IoError> {
+        ensure_trackable_frame_kind(kind)?;
         self.ensure_can_register()?;
         let id = RequestId(self.next_id);
         // `ensure_can_register` で `checked_add` の成功を確認済みだが、ライブラリ
@@ -570,7 +592,8 @@ where
     ///    （[`FrameKind::Ack`] / [`FrameKind::FlushAck`] は応答フレームであり
     ///    対応する ACK が来ないため、未 ACK キューに載せると枠が解放されない。
     ///    IO-1 の未 ACK リクエスト追跡契約の対象外）なら
-    ///    [`IoErrorCode::InvalidArgument`] を返す
+    ///    [`IoErrorCode::InvalidArgument`] を返す（[`ensure_trackable_frame_kind`]。
+    ///    [`SendQueue::register`] も同じ検証を共有する）
     /// 3. 未 ACK 件数が上限に達していれば、あるいは id 採番が溢れるなら
     ///    [`IoErrorCode::ResourceExhausted`] を返す（この時点ではトランスポートへ
     ///    書き込まない）
@@ -601,16 +624,10 @@ where
                 "pipeline client is poisoned after an ambiguous send failure; reconnect required",
             ));
         }
-        match frame.kind() {
-            FrameKind::Write | FrameKind::Flush => {}
-            FrameKind::Ack | FrameKind::FlushAck => {
-                self.metrics
-                    .record(SendOutcome::RejectedInvalidFrameKind, Duration::ZERO);
-                return Err(IoError::new(
-                    IoErrorCode::InvalidArgument,
-                    "only Write/Flush frames can be tracked as in-flight requests",
-                ));
-            }
+        if let Err(err) = ensure_trackable_frame_kind(frame.kind()) {
+            self.metrics
+                .record(SendOutcome::RejectedInvalidFrameKind, Duration::ZERO);
+            return Err(err);
         }
         if let Err(err) = self.queue.ensure_can_register() {
             self.metrics
@@ -900,6 +917,38 @@ mod tests {
             .remove(RequestId(999))
             .expect_err("unknown id must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// IO-1・TASK-12.1（#73 codex 指摘対応。P2）: `SendQueue::register` は
+    /// [`FrameKind::Ack`] / [`FrameKind::FlushAck`] を `InvalidArgument` で拒否し、
+    /// キューの件数（採番済み id の枠）を増やさない。これらは応答フレームで対応する
+    /// ACK が来ないため、登録を許すと未 ACK キューの枠が占有されたまま解放されない
+    /// （[`PipelineClient::send`] の種別検証と同じ [`ensure_trackable_frame_kind`] を
+    /// 共有する）。
+    #[test]
+    fn io1_send_queue_register_rejects_response_frame_kinds() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut queue = SendQueue::new(limit);
+
+        let ack_err = queue
+            .register(FrameKind::Ack)
+            .expect_err("Ack must be rejected as a trackable frame kind");
+        assert_eq!(ack_err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(queue.len(), 0, "rejected Ack must not occupy a slot");
+
+        let flush_ack_err = queue
+            .register(FrameKind::FlushAck)
+            .expect_err("FlushAck must be rejected as a trackable frame kind");
+        assert_eq!(flush_ack_err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(queue.len(), 0, "rejected FlushAck must not occupy a slot");
+
+        // 拒否後も採番カウンタは進んでいないため、次に許可される種別を登録すると
+        // id は 0 から始まる（拒否がキューの内部状態を変更していないことの確認）。
+        let accepted = queue
+            .register(FrameKind::Write)
+            .expect("Write must still be accepted after rejected registrations");
+        assert_eq!(accepted.id().get(), 0);
         assert_eq!(queue.len(), 1);
     }
 

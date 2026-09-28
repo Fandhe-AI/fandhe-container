@@ -54,8 +54,9 @@ pub use error::{IoError, IoErrorCode};
 pub use observe::{
     AckEvent, AckEventError, DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver,
     JsonLinesServerObserver, MAX_SEND_LOG_BUFFER_BYTES, MAX_SEND_LOG_CAPACITY,
-    MAX_SEND_LOG_MESSAGE_BYTES, NoopSendObserver, NoopServerObserver, SendEvent, SendEventError,
-    SendObserver, ServerEvent, ServerObserver, ServerOp, ServerOutcome,
+    MAX_SEND_LOG_MESSAGE_BYTES, MAX_SERVER_AUDIT_LOG_BUFFER_BYTES, NoopSendObserver,
+    NoopServerObserver, SERVER_AUDIT_LOG_CAPACITY, SendEvent, SendEventError, SendObserver,
+    ServerEvent, ServerObserver, ServerOp, ServerOutcome,
 };
 pub use payload::{
     ACK_PAYLOAD_LEN, AckEnvelope, MAX_WRITE_BODY_LEN, REQUEST_ID_WIRE_LEN, RequestEnvelope,

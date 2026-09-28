@@ -87,10 +87,14 @@
 //! [`IoErrorCode::Unavailable`] を返す（H4・#820 security-auditor 指摘対応）。
 //!
 //! peer credential 拒否は、正常な接続が最終的に成立した場合でもそれまでの
-//! 拒否が記録から失われないよう、拒否 1 件ごとに個別のイベント
+//! 拒否の通知が取り消されないよう、拒否 1 件ごとに個別のイベント
 //! （[`crate::observe::ServerOutcome::RejectedPeerCredential`]）として
 //! [`UdsServer::bind`] で渡した観測フックへ即座に通知する（H1・#820
-//! security-auditor 指摘対応。SEC-4）。累積件数
+//! security-auditor 指摘対応。SEC-4）。既定実装の
+//! [`crate::observe::JsonLinesServerObserver`] は、このイベントを通常イベントと
+//! 別枠の有界な監査枠に積み、あふれた分は捨てずに集約行（件数・最後の接続元
+//! uid）として残す（拒否は黙って失われない。#820 codex P0 指摘対応）。
+//! 永続的な監査ログへの配線は TASK-13.2.2（#822）で行う。累積件数
 //! （[`crate::observe::ServerEvent::peer_credential_rejections`]）は最終的な
 //! Accept の成功・失敗イベントにも載る。取得できた場合の接続元 uid
 //! （[`crate::observe::ServerEvent::peer_uid`]。数値のみで秘密情報を含まない）

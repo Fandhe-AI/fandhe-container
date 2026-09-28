@@ -334,25 +334,44 @@ const _: () = assert!(
 /// `total_bytes`（[`MAX_SEND_LOG_BUFFER_BYTES`] 以下）に一致する。行を指す
 /// `VecDeque` の枠は遅延確保の償却つき成長だが、行数上限（`capacity`。最大
 /// [`MAX_SEND_LOG_CAPACITY`]）で頭打ちになるため、枠の確保量は
-/// `2 × capacity × size_of::<String>()` 程度に収まる（事前に `capacity` ぶん
-/// 確保すると、使わない観測フックにも最大容量の枠を持たせることになるため
+/// `2 × capacity × size_of::<(u64, String)>()` 程度に収まる（事前に `capacity`
+/// ぶん確保すると、使わない観測フックにも最大容量の枠を持たせることになるため
 /// 遅延確保のままにする）。
+///
+/// # 順序番号
+/// 各行は呼び出し元が付けた順序番号（`u64`）と組で保持する。
+/// [`JsonLinesServerObserver`] が通常枠と監査枠の 2 本の本型を到着順に
+/// マージするために使う（SEC-4・#820 codex P0 指摘対応）。
+/// [`JsonLinesSendObserver`] は 1 本しか持たないため常に `0` を渡し、
+/// 順序番号を使わない。
 struct BoundedJsonLines {
-    lines: VecDeque<String>,
+    lines: VecDeque<(u64, String)>,
     capacity: usize,
+    /// 合計バイト数の上限。[`JsonLinesSendObserver`]・[`JsonLinesServerObserver`]
+    /// の通常枠は [`MAX_SEND_LOG_BUFFER_BYTES`]、監査枠は
+    /// [`MAX_SERVER_AUDIT_LOG_BUFFER_BYTES`]。
+    max_bytes: usize,
     dropped: u64,
     /// `lines` にためている JSON 行のエンコード後バイト数の合計（改行を含まない）。
-    /// [`MAX_SEND_LOG_BUFFER_BYTES`] との比較にのみ使う内部カウンタで、
-    /// [`Self::drain`] で `0` へ戻す。
+    /// `max_bytes` との比較にのみ使う内部カウンタで、[`Self::drain`] ・
+    /// [`Self::drain_sequenced`] で `0` へ戻す。
     total_bytes: usize,
 }
 
 impl BoundedJsonLines {
     /// 既定容量（[`DEFAULT_SEND_LOG_CAPACITY`]）で作る。
     fn new() -> Self {
+        Self::with_limits(DEFAULT_SEND_LOG_CAPACITY, MAX_SEND_LOG_BUFFER_BYTES)
+    }
+
+    /// 行数上限・合計バイト数上限を直接指定して作る（検証しない）。呼び出し元は
+    /// `const` assert で検証済みの定数（または [`Self::try_with_capacity`] で
+    /// 検証した値）だけを渡す。
+    fn with_limits(capacity: usize, max_bytes: usize) -> Self {
         Self {
             lines: VecDeque::new(),
-            capacity: DEFAULT_SEND_LOG_CAPACITY,
+            capacity,
+            max_bytes,
             dropped: 0,
             total_bytes: 0,
         }
@@ -375,12 +394,7 @@ impl BoundedJsonLines {
                 format!("{label} capacity must be at most {MAX_SEND_LOG_CAPACITY}"),
             ));
         }
-        Ok(Self {
-            lines: VecDeque::new(),
-            capacity,
-            dropped: 0,
-            total_bytes: 0,
-        })
+        Ok(Self::with_limits(capacity, MAX_SEND_LOG_BUFFER_BYTES))
     }
 
     fn capacity(&self) -> usize {
@@ -409,7 +423,14 @@ impl BoundedJsonLines {
     /// （ファイル・ソケット・部分書き込み時の再試行を含む）は呼び出し元の責務。
     fn drain(&mut self) -> Vec<String> {
         self.total_bytes = 0;
-        self.lines.drain(..).collect()
+        self.lines.drain(..).map(|(_, line)| line).collect()
+    }
+
+    /// [`Self::drain`] の順序番号つき版（[`JsonLinesServerObserver::drain_lines`]
+    /// が 2 本のキューを到着順にマージするために使う）。
+    fn drain_sequenced(&mut self) -> VecDeque<(u64, String)> {
+        self.total_bytes = 0;
+        std::mem::take(&mut self.lines)
     }
 
     /// 行数上限に達していないか確認し、達していなければ `encode` を呼んで
@@ -426,10 +447,10 @@ impl BoundedJsonLines {
     /// はならないため）。ここでは I/O を行わない（REPAIR-5）。
     ///
     /// 戻り値は積めた場合 `true`、破棄した場合（行数上限・合計バイト数上限の
-    /// いずれでも）`false`。呼び出し元がイベント種別ごとの破棄件数を数えるため
-    /// に使う（[`JsonLinesServerObserver::dropped_peer_credential_rejections`]。
-    /// I5・#820 security-auditor 再監査指摘対応）。
-    fn push_encoded_line(&mut self, encode: impl FnOnce() -> String) -> bool {
+    /// いずれでも）`false`。[`JsonLinesServerObserver`] の監査枠は `false` の
+    /// ときに行を捨てず集約レコードへ合算する（SEC-4・#820 codex P0 指摘対応）。
+    /// `seq` は行と組で保持する順序番号（本型の doc「順序番号」節参照）。
+    fn push_encoded_line(&mut self, seq: u64, encode: impl FnOnce() -> String) -> bool {
         if self.lines.len() >= self.capacity {
             self.dropped = self.dropped.saturating_add(1);
             return false;
@@ -437,7 +458,7 @@ impl BoundedJsonLines {
         let mut encoded = encode();
         // 行数上限とは独立に、合計バイト数の上限も守る（codex P0 再指摘対応）。
         // 巨大な `message` が連続しても、キューの総メモリ使用量を有界に保つ。
-        if self.total_bytes.saturating_add(encoded.len()) > MAX_SEND_LOG_BUFFER_BYTES {
+        if self.total_bytes.saturating_add(encoded.len()) > self.max_bytes {
             self.dropped = self.dropped.saturating_add(1);
             return false;
         }
@@ -446,7 +467,7 @@ impl BoundedJsonLines {
         // （#820 codex P0 指摘〔確保容量が検証済みの長さを超える〕と同じ観点）。
         encoded.shrink_to_fit();
         self.total_bytes += encoded.len();
-        self.lines.push_back(encoded);
+        self.lines.push_back((seq, encoded));
         true
     }
 }
@@ -554,11 +575,11 @@ impl Default for JsonLinesSendObserver {
 
 impl SendObserver for JsonLinesSendObserver {
     fn on_send(&mut self, event: &SendEvent<'_>) {
-        self.buf.push_encoded_line(|| encode_send_event(event));
+        self.buf.push_encoded_line(0, || encode_send_event(event));
     }
 
     fn on_ack(&mut self, event: &AckEvent<'_>) {
-        self.buf.push_encoded_line(|| encode_ack_event(event));
+        self.buf.push_encoded_line(0, || encode_ack_event(event));
     }
 }
 
@@ -795,9 +816,12 @@ pub enum ServerOutcome {
     /// [`ServerOp::Accept`] が、接続元の peer credential 検証
     /// （PLUG-12・security.md）に失敗した接続を拒否した（H1・#820
     /// security-auditor 指摘対応。SEC-4「分離違反の試行は監査ログに記録する」）。
-    /// この拒否 1 件ごとに個別のイベントとして通知され（`crate::server` モジュール
-    /// doc「peer credential の検証」節参照）、正常な接続が最終的に成立しても
-    /// それまでの拒否が記録から失われない。
+    /// この拒否 1 件ごとに個別のイベントとして通知される（`crate::server`
+    /// モジュール doc「peer credential の検証」節参照）ため、正常な接続が
+    /// 最終的に成立しても、それまでの拒否の通知は取り消されない。通知を受けた
+    /// 観測フックがそれをどう保持するかは実装による（既定実装の
+    /// [`JsonLinesServerObserver`] は専用の監査枠に積み、あふれた分は集約行として
+    /// 残す。SEC-4・#820 codex P0 指摘対応）。
     RejectedPeerCredential,
     /// 上記以外の失敗（タイムアウト・プロトコル違反・`ReceiveLimits::admit` の
     /// 拒否・トランスポート層のエラー等）。
@@ -898,6 +922,14 @@ impl fmt::Debug for ServerEvent<'_> {
 /// I/O は別経路（呼び出し元が明示的に呼ぶ drain API 等）へ分離すること
 /// （[`JsonLinesServerObserver`] を参照）。
 ///
+/// # SEC-4（peer credential 拒否の監査記録）
+///
+/// [`ServerOutcome::RejectedPeerCredential`] のイベントは SEC-4「分離違反の
+/// 試行は監査ログに記録する」の対象である。本フックの実装は、このイベントを
+/// 黙って捨ててはならない（保持しきれない場合は、欠けたことが後から分かる
+/// 形で残す）。既定実装の [`JsonLinesServerObserver`] は専用の監査枠と集約行で
+/// これを満たす。永続的な監査ログへの配線は TASK-13.2.2（#822）で行う。
+///
 /// # `bind` は観測対象外
 ///
 /// [`ServerOp`] は `Accept`・`Recv`・`Send` のみを持つ。
@@ -951,18 +983,92 @@ const _: () = assert!(
      1 行の最大サイズが総バイト上限を超えてしまう"
 );
 
+/// [`JsonLinesServerObserver`] の監査枠（[`ServerOutcome::RejectedPeerCredential`]
+/// 専用のキュー）がためられる行数の上限（SEC-4・PLUG-12。#820 codex P0 指摘
+/// 対応）。通常イベントの行数上限（[`JsonLinesServerObserver::capacity`]）とは
+/// 別枠で、利用者は変更できない。
+pub const SERVER_AUDIT_LOG_CAPACITY: usize = 256;
+
+/// [`JsonLinesServerObserver`] の監査枠がためられる JSON 行の合計バイト数の上限
+/// （SEC-4・#820 codex P0 指摘対応。通常枠の [`MAX_SEND_LOG_BUFFER_BYTES`] とは
+/// 別枠）。1 行の最悪長の見積もり（`MAX_SERVER_LOG_LINE_BYTES` = 3584 バイト）
+/// に近い行ばかりなら、行数上限より先にこちらに達する（約 36 行）。どちらの
+/// 上限に先に達しても、以降の拒否は集約行へ回る。
+pub const MAX_SERVER_AUDIT_LOG_BUFFER_BYTES: usize = 128 * 1024;
+
+/// 監査枠が満杯のときに合算する集約行（[`encode_coalesced_rejections`]）が
+/// とりうる最大バイト数の見積もり（固定語彙のキーと `u64`・`u32` の最大桁数
+/// だけで組み立てるため 256 バイトに収まる。最悪ケースはテストで照合する）。
+const MAX_SERVER_AUDIT_GAP_LINE_BYTES: usize = 256;
+
+const _: () = assert!(
+    SERVER_AUDIT_LOG_CAPACITY > 0 && SERVER_AUDIT_LOG_CAPACITY <= MAX_SEND_LOG_CAPACITY,
+    "SERVER_AUDIT_LOG_CAPACITY は 1..=MAX_SEND_LOG_CAPACITY に収まらなければならない"
+);
+const _: () = assert!(
+    MAX_SERVER_LOG_LINE_BYTES <= MAX_SERVER_AUDIT_LOG_BUFFER_BYTES,
+    "監査枠の合計バイト数上限は、最悪長の拒否イベント 1 行を必ず収められなければならない"
+);
+const _: () = assert!(
+    MAX_SERVER_AUDIT_GAP_LINE_BYTES <= MAX_SERVER_LOG_LINE_BYTES,
+    "集約行の最悪長は、通常の 1 行の最悪長以下でなければならない"
+);
+
+/// 監査枠が満杯のときに、以降の [`ServerOutcome::RejectedPeerCredential`] を
+/// 1 件にまとめて保持する集約レコード（SEC-4・#820 codex P0 指摘対応）。
+///
+/// 文字列ではなく数値だけを保持し、[`JsonLinesServerObserver::drain_lines`] の
+/// 時点で [`encode_coalesced_rejections`] により 1 行へエンコードする（件数が
+/// 増えても確保量は変わらない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoalescedRejections {
+    /// 最初に集約した拒否の順序番号。drain 時に集約行をこの位置へ置く
+    /// （欠けた区間がどこから始まったかを他のイベントとの前後で示すため）。
+    first_seq: u64,
+    /// 集約した拒否の件数（saturating で数える）。
+    count: u64,
+    /// 最後に集約した拒否の [`ServerEvent::peer_uid`]（取得できなかった場合は
+    /// `None`。そのときは集約行から `last_peer_uid` キー自体を省く）。
+    last_peer_uid: Option<u32>,
+}
+
 /// [`ServerEvent`] を JSON Lines（1 イベント 1 行）へ変換し、上限付きのメモリ内
 /// バッファ（`BoundedJsonLines`）へためる既定実装（TASK-13.2.1・#820。P1・
-/// REPAIR-4・REPAIR-5。[`JsonLinesSendObserver`] の UDS サーバー版）。
+/// REPAIR-4・REPAIR-5・SEC-4。[`JsonLinesSendObserver`] の UDS サーバー版）。
 ///
-/// [`JsonLinesSendObserver`] と行数上限（[`DEFAULT_SEND_LOG_CAPACITY`]・
-/// [`MAX_SEND_LOG_CAPACITY`]）・合計バイト数上限（[`MAX_SEND_LOG_BUFFER_BYTES`]）・
-/// `message` の切り詰め長（[`MAX_SEND_LOG_MESSAGE_BYTES`]）・満杯時に新規
-/// イベント側を破棄する方針・`dropped_count`・`drain_lines` の契約を共有する
-/// （両者とも `BoundedJsonLines` をラップする。上限の値自体を UDS サーバー用に
-/// 分ける理由がないため、既存の定数をそのまま再利用する）。
+/// 本型は有界の一時バッファであり、永続的な監査ログではない。SEC-4
+/// 「分離違反の試行は監査ログに記録する」の永続的な監査ログへの配線
+/// （[`Self::drain_lines`] で取り出した行の書き出し先）は TASK-13.2.2（#822）で
+/// 行う。本型が保証するのは「peer credential 拒否は黙って失われない（個別の行、
+/// または欠けた区間を明示する集約行として必ず [`Self::drain_lines`] に現れる）」
+/// までである。
 ///
-/// 出力キーは [`JsonLinesSendObserver`] と共通の語彙に `op`・
+/// # 2 つの枠（SEC-4・#820 codex P0 指摘対応）
+/// - 通常枠: [`ServerOutcome::RejectedPeerCredential`] 以外のイベント。行数上限
+///   （[`Self::capacity`]。既定 [`DEFAULT_SEND_LOG_CAPACITY`]・最大
+///   [`MAX_SEND_LOG_CAPACITY`]）・合計バイト数上限（[`MAX_SEND_LOG_BUFFER_BYTES`]）・
+///   満杯時に新規イベント側を破棄して [`Self::dropped_count`] を増分する方針は
+///   [`JsonLinesSendObserver`] と共有する
+/// - 監査枠: [`ServerOutcome::RejectedPeerCredential`] のイベントだけを積む別枠
+///   （行数上限 [`SERVER_AUDIT_LOG_CAPACITY`]・合計バイト数上限
+///   [`MAX_SERVER_AUDIT_LOG_BUFFER_BYTES`]）。満杯になっても拒否を捨てず、
+///   以降の拒否を 1 件の集約レコードに合算する（件数・最後の接続元 uid）。
+///   集約が始まった後は、drain するまで以降の拒否をすべて集約する（欠けた区間を
+///   1 か所の連続した区間にするため）
+///
+/// 2 つの枠は互いに追い出し合わない（通常イベントが大量に来ても拒否イベントは
+/// 積め、拒否イベントが大量に来ても通常イベントは積める）。ためる量の上限は
+/// 通常枠 [`MAX_SEND_LOG_BUFFER_BYTES`] + 監査枠
+/// [`MAX_SERVER_AUDIT_LOG_BUFFER_BYTES`] + 集約行 1 行（数値のみ）である。
+/// `message` の切り詰め長（[`MAX_SEND_LOG_MESSAGE_BYTES`]）は両枠で共通。
+///
+/// 集約が 1 度でも起きると [`Self::audit_degraded`] が `true` になり、drain
+/// 後も `false` に戻らない（監査記録の個別行が欠けたことを後から判別できる
+/// ようにする）。集約した拒否の累計は [`Self::coalesced_peer_credential_rejections`]
+/// で得られる。
+///
+/// # 出力キー
+/// 通常の行のキーは [`JsonLinesSendObserver`] と共通の語彙に `op`・
 /// `accept_aborted_retries`・`peer_credential_rejections`・`peer_uid` を
 /// 加えたもの: `event`（常に `"io_server"`）・
 /// `op`（`"accept"`/`"recv"`/`"send"`）・`kind`（`WRITE`/`ACK`/`FLUSH`/
@@ -978,87 +1084,189 @@ const _: () = assert!(
 /// キーを出す。H1・#820）・`latency_us`。フィールドの出力順はこの記載順に
 /// 固定する。
 ///
+/// 集約行は `event`（`"io_server"`）・`op`（`"accept"`）・`outcome`
+/// （`"error"`）・`reason`（`"peer_credential_rejections_coalesced"`）・
+/// `count`（集約した件数。`u64`）・`last_peer_uid`（最後に集約した拒否の
+/// 接続元 uid。取得できなかった場合はキー自体を省く）の順で出す
+/// （`encode_coalesced_rejections`）。
+///
 /// # `on_event` は I/O をしない（REPAIR-5）
 /// [`JsonLinesSendObserver`] と同じ理由（そのドキュメント参照）で、
-/// [`ServerObserver::on_event`] は `BoundedJsonLines` へ積むだけにとどめ、
-/// 実際の書き出しは呼び出し元が [`Self::drain_lines`] で取り出して行う。
-///
-/// # peer credential 拒否イベントの破棄件数（SEC-4。I5・#820 security-auditor
-/// 再監査指摘対応）
-/// 満杯時の破棄はイベント種別を区別しないため、[`Self::dropped_count`] だけでは
-/// SEC-4「分離違反の試行は監査ログに記録する」の対象となる
-/// [`ServerOutcome::RejectedPeerCredential`] が欠けたかどうかを判別できない。
-/// そのため、このイベントの破棄件数を [`Self::dropped_peer_credential_rejections`]
-/// で別に数える（全体の [`Self::dropped_count`] にも同時に含まれる）。
+/// [`ServerObserver::on_event`] はメモリ内の枠へ積む（または集約レコードの
+/// 数値を更新する）だけにとどめ、実際の書き出しは呼び出し元が
+/// [`Self::drain_lines`] で取り出して行う。
 pub struct JsonLinesServerObserver {
+    /// 通常枠（peer credential 拒否以外）。
     buf: BoundedJsonLines,
-    /// 破棄した [`ServerOutcome::RejectedPeerCredential`] イベントの件数
-    /// （saturating で増やす）。[`Self::drain_lines`] では `0` に戻さない
-    /// （[`Self::dropped_count`] と同じく累積値）。
-    dropped_peer_credential_rejections: u64,
+    /// 監査枠（[`ServerOutcome::RejectedPeerCredential`] 専用）。この枠の
+    /// `dropped_count` は使わない（あふれた拒否は `pending_gap` へ合算する）。
+    audit: BoundedJsonLines,
+    /// 監査枠があふれてから drain するまでの拒否の集約レコード。
+    pending_gap: Option<CoalescedRejections>,
+    /// 次のイベントに付ける順序番号（`on_event` の呼び出しごとに 1 増やす。
+    /// saturating のため `u64::MAX` 回を超えると同じ番号が続くが、その場合も
+    /// マージは通常枠を先に出すだけで行は失われない）。
+    next_seq: u64,
+    /// 集約した拒否の累計（saturating。drain では戻さない）。
+    coalesced_total: u64,
+    /// 集約が 1 度でも起きたか（sticky。drain では戻さない）。
+    audit_degraded: bool,
 }
 
 impl JsonLinesServerObserver {
-    /// 既定容量（[`DEFAULT_SEND_LOG_CAPACITY`]）で観測フックを作る。
+    /// 既定容量（通常枠 [`DEFAULT_SEND_LOG_CAPACITY`]）で観測フックを作る。
     pub fn new() -> Self {
+        Self::from_normal(BoundedJsonLines::new())
+    }
+
+    /// 通常枠の容量を指定して観測フックを作る。`capacity` が `0` または
+    /// [`MAX_SEND_LOG_CAPACITY`] を超える場合は [`IoErrorCode::InvalidArgument`]
+    /// を返す（無制限確保の防止）。監査枠の上限（[`SERVER_AUDIT_LOG_CAPACITY`]・
+    /// [`MAX_SERVER_AUDIT_LOG_BUFFER_BYTES`]）は固定で、この引数の影響を受けない。
+    pub fn with_capacity(capacity: usize) -> Result<Self, IoError> {
+        Ok(Self::from_normal(BoundedJsonLines::try_with_capacity(
+            capacity,
+            "server log",
+        )?))
+    }
+
+    fn from_normal(buf: BoundedJsonLines) -> Self {
         Self {
-            buf: BoundedJsonLines::new(),
-            dropped_peer_credential_rejections: 0,
+            buf,
+            audit: BoundedJsonLines::with_limits(
+                SERVER_AUDIT_LOG_CAPACITY,
+                MAX_SERVER_AUDIT_LOG_BUFFER_BYTES,
+            ),
+            pending_gap: None,
+            next_seq: 0,
+            coalesced_total: 0,
+            audit_degraded: false,
         }
     }
 
-    /// 容量を指定して観測フックを作る。`capacity` が `0` または
-    /// [`MAX_SEND_LOG_CAPACITY`] を超える場合は [`IoErrorCode::InvalidArgument`]
-    /// を返す（無制限確保の防止）。
-    pub fn with_capacity(capacity: usize) -> Result<Self, IoError> {
-        Ok(Self {
-            buf: BoundedJsonLines::try_with_capacity(capacity, "server log")?,
-            dropped_peer_credential_rejections: 0,
-        })
-    }
-
-    /// このバッファの容量を返す。
+    /// 通常枠の容量（行数上限）を返す（監査枠の上限は
+    /// [`SERVER_AUDIT_LOG_CAPACITY`]）。
     pub fn capacity(&self) -> usize {
         self.buf.capacity()
     }
 
-    /// 現在ためている JSON 行数を返す。
+    /// 次の [`Self::drain_lines`] が返す行数（通常枠 + 監査枠 + 集約行があれば
+    /// 1）を返す。
     pub fn len(&self) -> usize {
-        self.buf.len()
+        self.buf
+            .len()
+            .saturating_add(self.audit.len())
+            .saturating_add(usize::from(self.pending_gap.is_some()))
     }
 
-    /// ためている JSON 行が 1 件もないかを返す。
+    /// 次の [`Self::drain_lines`] が返す行が 1 件もないかを返す
+    /// （集約行だけが残っている場合も `false`）。
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.buf.is_empty() && self.audit.is_empty() && self.pending_gap.is_none()
     }
 
-    /// 容量超過により破棄した（新規イベント側を破棄した）件数を返す。
+    /// 通常枠で容量超過により破棄した（新規イベント側を破棄した）件数を返す。
+    /// peer credential 拒否は破棄せず集約するため、この件数には含まれない
+    /// （集約した件数は [`Self::coalesced_peer_credential_rejections`]）。
     pub fn dropped_count(&self) -> u64 {
         self.buf.dropped_count()
     }
 
-    /// 容量超過（行数上限・合計バイト数上限のいずれか）により破棄した
-    /// [`ServerOutcome::RejectedPeerCredential`] イベントの件数を返す
-    /// （[`Self::dropped_count`] の内数。saturating で数える）。
+    /// 監査枠があふれたために個別の行ではなく集約行へ合算した
+    /// [`ServerOutcome::RejectedPeerCredential`] の件数の累計を返す（saturating。
+    /// drain しても戻らない。SEC-4・#820 codex P0 指摘対応）。
     ///
-    /// SEC-4「分離違反の試行は監査ログに記録する」の監査記録（peer credential
-    /// 拒否。PLUG-12）が欠けたかどうかを判別するためのもの（I5・#820
-    /// security-auditor 再監査指摘対応）。`0` でなければ、拒否の一部が記録に
-    /// 残っていないことを示す。
-    pub fn dropped_peer_credential_rejections(&self) -> u64 {
-        self.dropped_peer_credential_rejections
+    /// 合算した拒否は失われず、[`Self::drain_lines`] の集約行（`count`）として
+    /// 現れる。`0` でなければ、その件数ぶんの拒否は個別の行（`message`・
+    /// `latency_us` 等の詳細）を持たないことを示す。
+    pub fn coalesced_peer_credential_rejections(&self) -> u64 {
+        self.coalesced_total
     }
 
-    /// 現在ためている JSON 行の合計バイト数（改行を含まない）を返す。
+    /// 監査枠があふれて拒否の集約が 1 度でも起きたかを返す（sticky。drain
+    /// しても `false` に戻らない。SEC-4・#820 codex P0 指摘対応）。
+    ///
+    /// `true` は「監査記録の一部が個別の行ではなく集約行でしか残っていない」
+    /// 監査上の劣化を示す。呼び出し元（TASK-13.2.2・#822 の監査ログ配線）は
+    /// これを監査障害として扱い、drain の頻度を上げる等の対応をとる。
+    pub fn audit_degraded(&self) -> bool {
+        self.audit_degraded
+    }
+
+    /// 通常枠と監査枠にためている JSON 行の合計バイト数（改行を含まない）を
+    /// 返す（集約行は drain 時に組み立てるため含まない。集約行の長さは
+    /// 256 バイト以下）。
     pub fn total_bytes(&self) -> usize {
-        self.buf.total_bytes()
+        self.buf
+            .total_bytes()
+            .saturating_add(self.audit.total_bytes())
     }
 
-    /// ためている JSON 行をすべて取り出してキューを空にする（各行は改行を含まない
-    /// 完全な JSON 文字列）。書き出し・再試行は呼び出し元の責務
+    /// ためている JSON 行をすべて取り出して空にする（各行は改行を含まない完全な
+    /// JSON 文字列）。書き出し・再試行は呼び出し元の責務
     /// （[`JsonLinesSendObserver::drain_lines`] と同じ契約）。
+    ///
+    /// # 1 本の API で両枠を到着順に返す理由（SEC-4・#820 codex P0 指摘対応）
+    /// 通常枠・監査枠・集約行を、イベントが `on_event` に届いた順（順序番号順）に
+    /// マージして 1 本の `Vec` で返す。集約行は最初に集約した拒否が届いた位置に
+    /// 置き、欠けた区間が他のイベントとの前後関係のどこから始まったかを示す。
+    /// 監査枠専用の drain API を別に設けると、既存の呼び出し元
+    /// （`drain_lines` だけを呼ぶ）が監査枠を取り出さず、監査枠が満杯のまま
+    /// 集約し続ける（実質的に個別の記録が黙って失われる）ため採らない。
+    ///
+    /// 集約行を出した後は集約レコードを空に戻す（次に監査枠があふれたときは
+    /// 新しい集約行を始める）。[`Self::audit_degraded`] と
+    /// [`Self::coalesced_peer_credential_rejections`] は戻さない。
     pub fn drain_lines(&mut self) -> Vec<String> {
-        self.buf.drain()
+        let mut normal = self.buf.drain_sequenced();
+        let mut audit = self.audit.drain_sequenced();
+        if let Some(gap) = self.pending_gap.take() {
+            // 集約レコードの `first_seq` は監査枠に積めた行のどれよりも後
+            // （集約が始まった後は drain まで個別に積まない）のため、監査枠の
+            // 末尾へ足しても順序番号順が保たれる。
+            audit.push_back((gap.first_seq, encode_coalesced_rejections(&gap)));
+        }
+        let mut lines = Vec::with_capacity(normal.len().saturating_add(audit.len()));
+        loop {
+            let take_normal = match (normal.front(), audit.front()) {
+                (Some((normal_seq, _)), Some((audit_seq, _))) => normal_seq <= audit_seq,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let next = if take_normal {
+                normal.pop_front()
+            } else {
+                audit.pop_front()
+            };
+            if let Some((_, line)) = next {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
+    /// peer credential 拒否を監査枠へ積む。監査枠が満杯（または集約中）なら
+    /// 集約レコードへ合算する（捨てない）。
+    fn record_rejection(&mut self, seq: u64, event: &ServerEvent<'_>) {
+        if let Some(gap) = self.pending_gap.as_mut() {
+            gap.count = gap.count.saturating_add(1);
+            gap.last_peer_uid = event.peer_uid;
+        } else if self
+            .audit
+            .push_encoded_line(seq, || encode_server_event(event))
+        {
+            // 個別の行として積めた（集約は起きていない）。
+            return;
+        } else {
+            self.pending_gap = Some(CoalescedRejections {
+                first_seq: seq,
+                count: 1,
+                last_peer_uid: event.peer_uid,
+            });
+        }
+        self.coalesced_total = self.coalesced_total.saturating_add(1);
+        self.audit_degraded = true;
     }
 }
 
@@ -1070,10 +1278,13 @@ impl Default for JsonLinesServerObserver {
 
 impl ServerObserver for JsonLinesServerObserver {
     fn on_event(&mut self, event: &ServerEvent<'_>) {
-        let pushed = self.buf.push_encoded_line(|| encode_server_event(event));
-        if !pushed && event.outcome == ServerOutcome::RejectedPeerCredential {
-            self.dropped_peer_credential_rejections =
-                self.dropped_peer_credential_rejections.saturating_add(1);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        if event.outcome == ServerOutcome::RejectedPeerCredential {
+            self.record_rejection(seq, event);
+        } else {
+            self.buf
+                .push_encoded_line(seq, || encode_server_event(event));
         }
     }
 }
@@ -1086,13 +1297,32 @@ impl fmt::Debug for JsonLinesServerObserver {
             .field("len", &self.buf.len())
             .field("capacity", &self.buf.capacity())
             .field("dropped", &self.buf.dropped_count())
+            .field("audit_len", &self.audit.len())
+            .field("pending_gap", &self.pending_gap)
             .field(
-                "dropped_peer_credential_rejections",
-                &self.dropped_peer_credential_rejections,
+                "coalesced_peer_credential_rejections",
+                &self.coalesced_total,
             )
-            .field("total_bytes", &self.buf.total_bytes())
+            .field("audit_degraded", &self.audit_degraded)
+            .field("total_bytes", &self.total_bytes())
             .finish()
     }
+}
+
+/// 監査枠があふれた区間の集約レコードを 1 行の JSON Lines 文字列へエンコード
+/// する（改行は含まない。SEC-4・#820 codex P0 指摘対応）。数値と固定語彙だけで
+/// 組み立て、untrusted な文字列を含めない。出力長は
+/// [`MAX_SERVER_AUDIT_GAP_LINE_BYTES`] 以下（最悪ケースはテストで照合する）。
+fn encode_coalesced_rejections(gap: &CoalescedRejections) -> String {
+    let count = gap.count;
+    let last_peer_uid = match gap.last_peer_uid {
+        Some(uid) => format!(",\"last_peer_uid\":{uid}"),
+        None => String::new(),
+    };
+    format!(
+        "{{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"error\",\
+         \"reason\":\"peer_credential_rejections_coalesced\",\"count\":{count}{last_peer_uid}}}"
+    )
 }
 
 fn server_op_str(op: ServerOp) -> &'static str {
@@ -1827,111 +2057,258 @@ mod tests {
         assert!(observer.is_empty());
     }
 
-    /// I5・#820（security-auditor 再監査指摘対応。SEC-4・PLUG-12）: 満杯時に
-    /// peer credential 拒否イベントを送ると、全体の `dropped_count` と専用の
-    /// `dropped_peer_credential_rejections` の両方が増える。満杯時の通常の
-    /// イベント（Accept 成功・Recv 失敗）では専用カウンタは増えない。
-    #[test]
-    fn i5_json_lines_server_observer_counts_dropped_peer_credential_rejections_separately() {
-        let mut observer =
-            JsonLinesServerObserver::with_capacity(1).expect("1 must be a valid capacity");
-        let accept_ok = ServerEvent {
+    /// peer credential 拒否イベント（テスト用。`peer_uid` と `message` を指定する）。
+    fn rejection_event(peer_uid: Option<u32>, message: &str) -> ServerEvent<'_> {
+        ServerEvent {
+            op: ServerOp::Accept,
+            kind: None,
+            outcome: ServerOutcome::RejectedPeerCredential,
+            latency: Duration::ZERO,
+            accept_aborted_retries: 0,
+            peer_credential_rejections: 1,
+            peer_uid,
+            error: Some(SendEventError {
+                code: IoErrorCode::InvalidArgument,
+                message,
+            }),
+        }
+    }
+
+    /// Accept 成功イベント（テスト用。`accept_aborted_retries` で行を区別する）。
+    fn accept_ok_event(retries: u32) -> ServerEvent<'static> {
+        ServerEvent {
             op: ServerOp::Accept,
             kind: None,
             outcome: ServerOutcome::Success,
             latency: Duration::ZERO,
-            accept_aborted_retries: 0,
+            accept_aborted_retries: retries,
             peer_credential_rejections: 0,
             peer_uid: None,
             error: None,
-        };
-        let rejection = ServerEvent {
-            op: ServerOp::Accept,
-            kind: None,
-            outcome: ServerOutcome::RejectedPeerCredential,
-            latency: Duration::ZERO,
-            accept_aborted_retries: 0,
-            peer_credential_rejections: 1,
-            peer_uid: Some(1000),
-            error: Some(SendEventError {
-                code: IoErrorCode::InvalidArgument,
-                message: "connecting peer uid (1000) does not match",
-            }),
-        };
-        let recv_failure = ServerEvent {
-            op: ServerOp::Recv,
-            kind: Some(FrameKind::Write),
-            outcome: ServerOutcome::Failure,
-            latency: Duration::ZERO,
-            accept_aborted_retries: 0,
-            peer_credential_rejections: 0,
-            peer_uid: None,
-            error: Some(SendEventError {
-                code: IoErrorCode::Timeout,
-                message: "timed out",
-            }),
-        };
-
-        // 1 件目で満杯にする（ここまでは何も破棄されない）。
-        observer.on_event(&accept_ok);
-        assert_eq!(observer.dropped_count(), 0);
-        assert_eq!(observer.dropped_peer_credential_rejections(), 0);
-
-        // 満杯時の通常イベントは全体の件数のみを増やす。
-        observer.on_event(&accept_ok);
-        observer.on_event(&recv_failure);
-        assert_eq!(observer.dropped_count(), 2);
-        assert_eq!(observer.dropped_peer_credential_rejections(), 0);
-
-        // 満杯時の peer credential 拒否は両方を増やす。
-        observer.on_event(&rejection);
-        observer.on_event(&rejection);
-        assert_eq!(observer.dropped_count(), 4);
-        assert_eq!(observer.dropped_peer_credential_rejections(), 2);
-
-        // 空きがあるときの peer credential 拒否は破棄されず、どちらも増えない。
-        let _ = observer.drain_lines();
-        observer.on_event(&rejection);
-        assert_eq!(observer.len(), 1);
-        assert_eq!(observer.dropped_count(), 4);
-        assert_eq!(observer.dropped_peer_credential_rejections(), 2);
+        }
     }
 
-    /// I5・#820（SEC-4・PLUG-12）: 行数上限ではなく合計バイト数上限による破棄
-    /// でも、peer credential 拒否イベントなら専用カウンタが増える。
-    #[test]
-    fn i5_json_lines_server_observer_counts_rejection_dropped_by_total_bytes_limit() {
-        let mut observer =
-            JsonLinesServerObserver::with_capacity(MAX_SEND_LOG_CAPACITY).expect("valid capacity");
-        let near_max_message = "c".repeat(MAX_SEND_LOG_MESSAGE_BYTES);
-        let rejection = ServerEvent {
-            op: ServerOp::Accept,
-            kind: None,
-            outcome: ServerOutcome::RejectedPeerCredential,
-            latency: Duration::ZERO,
-            accept_aborted_retries: 0,
-            peer_credential_rejections: 1,
-            peer_uid: Some(1000),
-            error: Some(SendEventError {
-                code: IoErrorCode::InvalidArgument,
-                message: &near_max_message,
-            }),
-        };
+    fn accept_ok_line(retries: u32) -> String {
+        format!(
+            "{{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"ok\",\
+             \"accept_aborted_retries\":{retries},\"peer_credential_rejections\":0,\
+             \"latency_us\":0}}"
+        )
+    }
 
-        let mut pushed = 0usize;
-        loop {
-            let before = observer.total_bytes();
-            observer.on_event(&rejection);
-            if observer.total_bytes() == before {
-                break;
-            }
-            pushed += 1;
+    fn rejection_line(peer_uid: u32) -> String {
+        format!(
+            "{{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"error\",\
+             \"reason\":\"rejected_peer_credential\",\"code\":\"INVALID_ARGUMENT\",\
+             \"message\":\"uid mismatch\",\"accept_aborted_retries\":0,\
+             \"peer_credential_rejections\":1,\"peer_uid\":{peer_uid},\"latency_us\":0}}"
+        )
+    }
+
+    /// 監査枠を行数上限（[`SERVER_AUDIT_LOG_CAPACITY`]）ちょうどまで埋める
+    /// （`peer_uid` は `1000 + i`）。
+    fn fill_audit_queue(observer: &mut JsonLinesServerObserver) {
+        for i in 0..SERVER_AUDIT_LOG_CAPACITY {
+            let uid = 1000 + u32::try_from(i).expect("fits in u32");
+            observer.on_event(&rejection_event(Some(uid), "uid mismatch"));
+        }
+        assert_eq!(observer.coalesced_peer_credential_rejections(), 0);
+        assert!(!observer.audit_degraded());
+    }
+
+    /// SEC-4・#820（codex P0 指摘対応。(a)）: 監査枠を満杯にした後の拒否 N 件は
+    /// 捨てられず、drain で集約行 1 行（`count` == N・`last_peer_uid` は最後の
+    /// 値）として現れる。`audit_degraded` は drain 後も `true` のままで、
+    /// drain 後の次の拒否は再び個別の行として積まれる。
+    #[test]
+    fn sec4_820_json_lines_server_observer_coalesces_rejections_after_audit_queue_is_full() {
+        let mut observer = JsonLinesServerObserver::new();
+        fill_audit_queue(&mut observer);
+
+        for uid in [2000, 2001, 2002, 2003, 2004] {
+            observer.on_event(&rejection_event(Some(uid), "uid mismatch"));
         }
 
-        assert!(pushed > 0, "at least one line must fit before the limit");
-        assert!(observer.len() < MAX_SEND_LOG_CAPACITY);
-        assert_eq!(observer.dropped_count(), 1);
-        assert_eq!(observer.dropped_peer_credential_rejections(), 1);
+        assert_eq!(observer.len(), SERVER_AUDIT_LOG_CAPACITY + 1);
+        assert_eq!(observer.dropped_count(), 0);
+        assert_eq!(observer.coalesced_peer_credential_rejections(), 5);
+        assert!(observer.audit_degraded());
+
+        let lines = observer.drain_lines();
+        assert_eq!(lines.len(), SERVER_AUDIT_LOG_CAPACITY + 1);
+        assert_eq!(lines.first(), Some(&rejection_line(1000)));
+        assert_eq!(
+            lines.get(SERVER_AUDIT_LOG_CAPACITY - 1),
+            Some(&rejection_line(1255))
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(
+                "{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"error\",\
+                 \"reason\":\"peer_credential_rejections_coalesced\",\"count\":5,\
+                 \"last_peer_uid\":2004}"
+            )
+        );
+
+        // drain 後も劣化フラグと累計は戻らない。
+        assert!(observer.is_empty());
+        assert!(observer.audit_degraded());
+        assert_eq!(observer.coalesced_peer_credential_rejections(), 5);
+
+        // 集約レコードは drain で空に戻り、次の拒否は個別の行として積まれる。
+        observer.on_event(&rejection_event(Some(3000), "uid mismatch"));
+        assert_eq!(observer.drain_lines(), vec![rejection_line(3000)]);
+        assert!(observer.audit_degraded());
+        assert_eq!(observer.coalesced_peer_credential_rejections(), 5);
+    }
+
+    /// SEC-4・#820（codex P0 指摘対応）: 最後に集約した拒否で接続元 uid が
+    /// 取得できなかった場合は、集約行から `last_peer_uid` キー自体を省く
+    /// （個別の行の `peer_uid` と同じ表現）。
+    #[test]
+    fn sec4_820_json_lines_server_observer_coalesced_line_omits_unknown_last_peer_uid() {
+        let mut observer = JsonLinesServerObserver::new();
+        fill_audit_queue(&mut observer);
+        observer.on_event(&rejection_event(Some(2000), "uid mismatch"));
+        observer.on_event(&rejection_event(None, "getsockopt failed"));
+
+        let lines = observer.drain_lines();
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(
+                "{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"error\",\
+                 \"reason\":\"peer_credential_rejections_coalesced\",\"count\":2}"
+            )
+        );
+    }
+
+    /// SEC-4・#820（codex P0 指摘対応。(b)）: 通常イベントで通常枠を満杯に
+    /// しても、peer credential 拒否は追い出されず個別の行として残る。
+    /// `dropped_count` は通常枠の破棄だけを数え、集約は起きない。
+    #[test]
+    fn sec4_820_json_lines_server_observer_keeps_rejections_when_normal_queue_is_full() {
+        let mut observer =
+            JsonLinesServerObserver::with_capacity(1).expect("1 must be a valid capacity");
+
+        observer.on_event(&accept_ok_event(0));
+        observer.on_event(&accept_ok_event(1));
+        observer.on_event(&accept_ok_event(2));
+        assert_eq!(observer.dropped_count(), 2);
+
+        observer.on_event(&rejection_event(Some(1000), "uid mismatch"));
+        observer.on_event(&rejection_event(Some(1001), "uid mismatch"));
+
+        assert_eq!(observer.len(), 3);
+        assert_eq!(observer.dropped_count(), 2);
+        assert_eq!(observer.coalesced_peer_credential_rejections(), 0);
+        assert!(!observer.audit_degraded());
+        assert_eq!(
+            observer.drain_lines(),
+            vec![
+                accept_ok_line(0),
+                rejection_line(1000),
+                rejection_line(1001)
+            ]
+        );
+    }
+
+    /// SEC-4・#820（codex P0 指摘対応。(c)）: 拒否イベントで監査枠を満杯に
+    /// しても（集約中でも）、通常イベントは通常枠へ積める。drain は到着順で、
+    /// 集約行は最初に集約した拒否が届いた位置に置かれる（欠けた区間の始点が
+    /// 前後の通常イベントとの関係で分かる）。
+    #[test]
+    fn sec4_820_json_lines_server_observer_keeps_normal_events_and_order_when_audit_is_full() {
+        let mut observer = JsonLinesServerObserver::new();
+        fill_audit_queue(&mut observer);
+
+        observer.on_event(&accept_ok_event(1));
+        observer.on_event(&rejection_event(Some(2000), "uid mismatch"));
+        observer.on_event(&accept_ok_event(2));
+        observer.on_event(&rejection_event(Some(2001), "uid mismatch"));
+        observer.on_event(&accept_ok_event(3));
+
+        assert_eq!(observer.dropped_count(), 0);
+        assert_eq!(observer.coalesced_peer_credential_rejections(), 2);
+        assert_eq!(observer.len(), SERVER_AUDIT_LOG_CAPACITY + 4);
+
+        let lines = observer.drain_lines();
+        let tail: Vec<&str> = lines
+            .iter()
+            .skip(SERVER_AUDIT_LOG_CAPACITY)
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                accept_ok_line(1).as_str(),
+                "{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"error\",\
+                 \"reason\":\"peer_credential_rejections_coalesced\",\"count\":2,\
+                 \"last_peer_uid\":2001}",
+                accept_ok_line(2).as_str(),
+                accept_ok_line(3).as_str(),
+            ]
+        );
+    }
+
+    /// SEC-4・#820（codex P0 指摘対応。I5 の合計バイト数版を新しい契約へ
+    /// 書き換えたもの）: 行数上限ではなく監査枠の合計バイト数上限
+    /// （[`MAX_SERVER_AUDIT_LOG_BUFFER_BYTES`]）に先に達した場合も、以降の拒否は
+    /// 捨てられず集約される。個別に積めた行数は 1 行の長さから決まる具体値に
+    /// 一致する。
+    #[test]
+    fn sec4_820_json_lines_server_observer_coalesces_rejections_at_audit_byte_limit() {
+        let mut observer = JsonLinesServerObserver::new();
+        let near_max_message = "c".repeat(MAX_SEND_LOG_MESSAGE_BYTES);
+        let event = rejection_event(Some(1000), &near_max_message);
+        let line_len = encode_server_event(&event).len();
+        let expected_individual = MAX_SERVER_AUDIT_LOG_BUFFER_BYTES / line_len;
+        assert!(
+            expected_individual < SERVER_AUDIT_LOG_CAPACITY,
+            "the byte limit must be reached before the line limit in this test"
+        );
+
+        for _ in 0..expected_individual + 3 {
+            observer.on_event(&event);
+        }
+
+        assert_eq!(observer.total_bytes(), expected_individual * line_len);
+        assert_eq!(observer.dropped_count(), 0);
+        assert_eq!(observer.coalesced_peer_credential_rejections(), 3);
+        assert!(observer.audit_degraded());
+        let lines = observer.drain_lines();
+        assert_eq!(lines.len(), expected_individual + 1);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(
+                "{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"error\",\
+                 \"reason\":\"peer_credential_rejections_coalesced\",\"count\":3,\
+                 \"last_peer_uid\":1000}"
+            )
+        );
+    }
+
+    /// SEC-4・REPAIR-12・#820（codex P0 指摘対応。(d)）: 集約行の最悪長
+    /// （`count` が `u64::MAX`・`last_peer_uid` が `u32::MAX`）は
+    /// [`MAX_SERVER_AUDIT_GAP_LINE_BYTES`] 以下で、通常の 1 行の最悪長
+    /// [`MAX_SERVER_LOG_LINE_BYTES`] 以下に収まる。
+    #[test]
+    fn sec4_repair12_820_coalesced_line_worst_case_fits_within_max_line_bytes() {
+        let worst = CoalescedRejections {
+            first_seq: u64::MAX,
+            count: u64::MAX,
+            last_peer_uid: Some(u32::MAX),
+        };
+        let encoded = encode_coalesced_rejections(&worst);
+        assert_eq!(
+            encoded,
+            "{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"error\",\
+             \"reason\":\"peer_credential_rejections_coalesced\",\
+             \"count\":18446744073709551615,\"last_peer_uid\":4294967295}"
+        );
+        assert_eq!(encoded.len(), 157);
+        // `MAX_SERVER_AUDIT_GAP_LINE_BYTES <= MAX_SERVER_LOG_LINE_BYTES` は
+        // `const` assert で保証済み。
+        assert!(encoded.len() <= MAX_SERVER_AUDIT_GAP_LINE_BYTES);
     }
 
     /// REPAIR-5（#820 レビュー指摘）: `with_capacity(0)` と

@@ -30,14 +30,16 @@
 //! - ACK フレームの送出方針・ディスク書き込み・[`crate::batch::BatchBuffer`] との
 //!   つなぎ込み（TASK-13.2.2・#822）
 //! - 同時接続数の上限（TASK-13.4・#796）
-//! - [`recv_limits::ReceiveLimits::admit`] の滞留件数（`pending_frames`）は本
-//!   モジュールでは常に `0` を渡す（この層は単一接続しか見えず、複数接続を
-//!   跨いだ実際の準備完了キューを持たないため）。実際のキューとの配線は
-//!   [`crate::batch::BatchBuffer`] を導入する TASK-13.2.2（#822）の責務
-//!   （`crates/io/src/recv_limits.rs` モジュール doc 参照）
+//! - [`crate::recv_limits::ReceiveLimits::admit`] の滞留件数
+//!   （`pending_frames`）は本モジュールでは常に `0` を渡す（この層は単一接続
+//!   しか見えず、複数接続を跨いだ実際の準備完了キューを持たないため）。
+//!   実際のキューとの配線は [`crate::batch::BatchBuffer`] を導入する
+//!   TASK-13.2.2（#822）の責務（`crates/io/src/recv_limits.rs` モジュール
+//!   doc 参照）
 //! - peer credential の検証（`SO_PEERCRED` / `getpeereid`）: std だけでは実装
 //!   できず `libc` / `nix` の依存承認が必要（PLUG-12 の別観点。所有 UID の
-//!   照合自体は本タスクで [`imp::check_socket_owner`] により実装済み）
+//!   照合自体は本タスクで `imp::check_socket_owner`（Linux / macOS 限定の
+//!   非公開関数）により実装済み）
 //! - 送信側と受信側の分割 API（`try_clone` を使った split。TASK-12）
 //! - クライアント側の UDS 接続（`connect`）・[`crate::client::PipelineClient`]
 //!   との結合（TASK-12.2 以降）
@@ -46,8 +48,8 @@
 //!   ドキュメンテーションコメント参照）は親ディレクトリの権限で塞ぐ設計とし、
 //!   ソケットファイル自体の一時的なモードには依存しない
 //! - `path` の直近の親ディレクトリ以外（祖先のパス要素）の symlink 検査は
-//!   行わない（[`imp::validate_parent_dir`] のドキュメンテーションコメント
-//!   参照）
+//!   行わない（`imp::validate_parent_dir`（Linux / macOS 限定の非公開関数）
+//!   のドキュメンテーションコメント参照）
 //!
 //! # SIGPIPE の前提
 //!
@@ -90,7 +92,8 @@ impl UdsServer {
     /// （既存パスは拒否し、自動 unlink はしない）を検証する（security.md の
     /// UDS 観点。fail-closed）。bind 直後には、作成されたソケットファイルの
     /// 所有者（bind したプロセスの実効 uid と一致する）が親ディレクトリの
-    /// 所有者と一致することも確かめ（PLUG-12・[`imp::check_socket_owner`]）、
+    /// 所有者と一致することも確かめ（PLUG-12・`imp::check_socket_owner`。
+    /// Linux / macOS 限定の非公開関数）、
     /// 不一致ならソケットファイルを片付けてから拒否する。検証後はソケット
     /// ファイルを `0600` にし、listener を非ブロッキングにする。
     ///
@@ -373,7 +376,7 @@ mod imp {
     /// （自分が作成したので実効 uid と一致する）を実効 uid の代理として使う。
     /// uid の比較自体は純粋関数に切り出し、実機で別ユーザーを用意できない
     /// 単体テストからも具体的な uid の組で検証できるようにする
-    /// （コミット 2・項目 10）。
+    /// （#820 レビュー指摘）。
     fn check_socket_owner(socket_uid: u32, parent_uid: u32) -> Result<(), IoError> {
         if socket_uid != parent_uid {
             return Err(IoError::new(
@@ -547,7 +550,7 @@ mod imp {
     /// `WouldBlock` / `TimedOut` もここでは `Timeout` に写像するが、
     /// `read_exact_until` / `read_body_until` / `write_all_until` は
     /// これらのエラーを本関数に渡さず、`remaining_or_timeout` によるフレーム
-    /// 全体の期限の再計算へループを戻す（REPAIR-5・項目 4）。テスト
+    /// 全体の期限の再計算へループを戻す（REPAIR-5・#820 レビュー指摘）。テスト
     /// （`task13_2_1_map_io_error_maps_would_block_and_timed_out_to_timeout`）
     /// のために写像自体はここに残す。
     fn map_io_error(e: io::Error) -> IoError {
@@ -772,7 +775,7 @@ mod imp {
             assert!(remaining <= Duration::from_secs(5));
         }
 
-        /// PLUG-12・security.md（項目 3・10 の回帰テスト）: uid が一致すれば
+        /// PLUG-12・security.md（#820 レビュー指摘の回帰テスト）: uid が一致すれば
         /// `check_socket_owner` は受理する。他ユーザーを実機で用意できないため、
         /// uid の比較ロジックを具体値で確かめる純粋関数のテストに留める
         /// （`server.rs` モジュール doc「範囲外」節）。
@@ -781,7 +784,7 @@ mod imp {
             check_socket_owner(1000, 1000).expect("matching uid must be accepted");
         }
 
-        /// PLUG-12・security.md（項目 3・10 の回帰テスト）: uid が不一致なら
+        /// PLUG-12・security.md（#820 レビュー指摘の回帰テスト）: uid が不一致なら
         /// `InvalidArgument` で拒否し、両方の uid を message に含める
         /// （デバッグ容易性。秘密情報ではないため security.md の情報漏えい観点には
         /// 抵触しない）。
@@ -790,8 +793,8 @@ mod imp {
             let err = check_socket_owner(1000, 0)
                 .expect_err("a socket owned by a different uid than the parent must be rejected");
             assert_eq!(err.code(), IoErrorCode::InvalidArgument);
-            assert!(err.message().contains("1000"));
-            assert!(err.message().contains('0'));
+            assert!(err.message().contains("(uid 1000)"));
+            assert!(err.message().contains("(uid 0)"));
         }
     }
 }

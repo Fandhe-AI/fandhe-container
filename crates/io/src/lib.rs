@@ -10,19 +10,23 @@
 //! トランスポートの具象実装のうち、UDS のサーバー側（Linux / macOS）は
 //! TASK-13.2.1（#820）で実装済み（[`server::UdsServer`]・
 //! [`server::UdsConnection`]。accept・送受信のイベントは
-//! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS 接続
-//! （TASK-13.2.2・#822）・vsock・named pipe・ディスク書き込みはまだない
+//! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS `connect` と
+//! [`client::PipelineClient`] との本番結合・vsock・named pipe はまだない
 //! （REPAIR-3。スタブの明示）。
 //! [`protocol::Frame`] のペイロード内部レイアウト（request id・ACK の対応付け）は
 //! [`payload`] モジュール（TASK-12.2・#74）が定める。[`client::PipelineClient::send`]
 //! はこの形式で request id を埋め込み、[`client::PipelineClient::recv_ack`]
 //! （TASK-12.2・#74）が送信順で ACK を検証・対応付けし、タイムアウト付きで待つ。
 //! [`batch::BatchBuffer`] は受信した `Write` フレームを既定 64 件（設定可能）単位で
-//! 集約するメモリ内ロジックのみを提供し、UDS 受信ループ・ディスク書き込み・ACK 送出は
-//! TASK-13.2 系の後続 sub-issue が担う。受信フレームの長さ・件数を本体バッファ確保前に
-//! 上限検証する受理判定ゲート（[`recv_limits::ReceiveLimits`]・TASK-13.4・#796）も
-//! 持つ。バッチ write-back サーバー本体（TASK-13）もこの crate のトレイト・型を
-//! 組み合わせる形で後続タスクが追加する。
+//! 集約するメモリ内ロジックのみを提供する。その集約結果を実際にディスクへ書き込み、
+//! 書き込み完了後に通常 ACK を返すところまでは [`writeback`] モジュール
+//! （TASK-13.2.2・#822）がつなぐ（[`writeback::serve_connection`]・
+//! [`writeback::AppendFileSink`]）。FLUSH バリアの永続化保証（FlushAck・IO-2）は
+//! まだなく（TASK-15・#823・#824）、`writeback` は `Flush` 受信時に滞留分を
+//! 書き込んだ後 `Unimplemented` で処理を終える。受信フレームの長さ・件数を
+//! 本体バッファ確保前に上限検証する受理判定ゲート
+//! （[`recv_limits::ReceiveLimits`]・TASK-13.4・#796）も持つ。UDS 受信ループの
+//! 受付ループ（accept → 次の accept）・同時接続数の上限は後続 sub-issue が担う。
 //!
 //! PLUG-1 区分は core（`fandhe-container-plugin` の境界機構とは別に、コアの一部として
 //! 直接リンクされる）。crate 名 `fandhe-container-io` は
@@ -41,6 +45,7 @@ pub mod recv_limits;
 pub mod server;
 mod sys;
 pub mod transport;
+pub mod writeback;
 
 pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
@@ -72,4 +77,8 @@ pub use recv_limits::{
 pub use server::{UdsConnection, UdsServer};
 pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, WireFrame,
+};
+pub use writeback::{
+    AppendFileSink, BatchSink, SinkWriteReport, WritebackReport, WritebackStats, WritebackTimeouts,
+    serve_connection,
 };

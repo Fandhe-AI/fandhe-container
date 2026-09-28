@@ -3,9 +3,9 @@
 //! [`crate::transport`] が定めるトランスポート抽象（[`FrameSender`]・
 //! [`FrameReceiver`]）の、具象実装の 1 つ目（REPAIR-3: `transport` モジュールは
 //! 具象実装を持たないと明記していたが、本タスクで Linux / macOS 向けの UDS
-//! サーバー側を追加した）。TASK-13.2.2（#822）がこの上にバッチ書き込み・
-//! ACK 返却を積む想定で、本モジュールは「1 本の接続でフレームを送受信できる
-//! こと」までを提供する。
+//! サーバー側を追加した）。[`crate::writeback::serve_connection`]
+//! （TASK-13.2.2・#822）がこの上にバッチ書き込み・ACK 返却を積んでおり、
+//! 本モジュールは「1 本の接続でフレームを送受信できること」までを提供する。
 //!
 //! # 受付ループの組み方（呼び出し側の責務）
 //!
@@ -94,7 +94,7 @@
 //! [`crate::observe::JsonLinesServerObserver`] は、このイベントを通常イベントと
 //! 別枠の有界な監査枠に積み、あふれた分は捨てずに集約行（件数・最後の接続元
 //! uid）として残す（拒否は黙って失われない。#820 codex P0 指摘対応）。
-//! 永続的な監査ログへの配線は TASK-13.2.2（#822）で行う。累積件数
+//! 永続的な監査ログへの配線は後続 sub-issue（要起票）で行う。累積件数
 //! （[`crate::observe::ServerEvent::peer_credential_rejections`]）は最終的な
 //! Accept の成功・失敗イベントにも載る。取得できた場合の接続元 uid
 //! （[`crate::observe::ServerEvent::peer_uid`]。数値のみで秘密情報を含まない）
@@ -153,20 +153,24 @@
 //! REPAIR-3）。Windows のトランスポート（`windows-sys` を使った AF_UNIX、または
 //! named pipe）は `windows-sys` の依存承認が必要な別タスクとする。
 //!
-//! # 範囲外（TASK-13.2.2 以降・別タスク）
+//! # 範囲外（別タスク。要起票）
 //!
-//! - ACK フレームの送出方針・ディスク書き込み・[`crate::batch::BatchBuffer`] との
-//!   つなぎ込み（TASK-13.2.2・#822）
-//! - 同時接続数の上限（TASK-13.2.2・#822）
+//! ACK フレームの送出・ディスク書き込み・[`crate::batch::BatchBuffer`] との
+//! つなぎ込みは [`crate::writeback::serve_connection`]（TASK-13.2.2・#822）が
+//! 実装済み。本モジュールに残る範囲外は次のとおり:
+//!
+//! - UDS 接続受付ループ（accept → [`crate::writeback::serve_connection`] →
+//!   次の accept）・同時接続数の上限
 //! - [`crate::recv_limits::ReceiveLimits::admit`] の滞留件数
 //!   （`pending_frames`）は本モジュールでは常に `0` を渡す（この層は単一接続
-//!   しか見えず、複数接続を跨いだ実際の準備完了キューを持たないため）。
-//!   実際のキューとの配線は [`crate::batch::BatchBuffer`] を導入する
-//!   TASK-13.2.2（#822）の責務（`crates/io/src/recv_limits.rs` モジュール
-//!   doc 参照）
+//!   しか見えないため）。[`crate::writeback::serve_connection`] の write-back は
+//!   同期的（発火したバッチをその場で書き込み・ACK まで終えてから次を受信する）
+//!   で、受信時点の「排出済みだが未書き込み」のキューは常に空になるため、
+//!   この `0` は現行の呼び出し方（1 バッチ完結の同期処理）の下で構造上正確
+//!   （`crates/io/src/writeback.rs` モジュール doc「受信上限」節参照）
 //! - 送信側と受信側の分割 API（`try_clone` を使った split。TASK-12）
 //! - クライアント側の UDS 接続（`connect`）・[`crate::client::PipelineClient`]
-//!   との結合（TASK-13.2.2・#822）
+//!   との本番結合
 //! - vsock（microVM）トランスポート
 //! - `path` の直近の親ディレクトリ以外（祖先のパス要素）の symlink 検査は
 //!   行わない（`imp::validate_parent_dir`（Linux / macOS 限定の非公開関数）
@@ -346,7 +350,8 @@ impl<O: ServerObserver> UdsServer<O> {
     /// （`imp::MAX_ACCEPT_ABORT_RETRIES`）を超えた場合で、不正・無効な接続が
     /// 続いたことを示すだけであり、リスナー（[`UdsServer`]）自体は健全である。
     /// 呼び出し側は同じ [`UdsServer`] で本関数を再度呼んでよい（受付ループを
-    /// 継続できる。受付ループの扱いは TASK-13.2.2・#822）。これに対し、
+    /// 継続できる。受付ループ自体の組み方は後続 sub-issue〔要起票〕の扱い）。
+    /// これに対し、
     /// [`UdsConnection`] の送受信が返す `Unavailable` は、その接続が poison 済み
     /// （P1-3）で以後使えないことを示し、再接続が必要になる。
     ///
@@ -1338,9 +1343,12 @@ mod imp {
         /// 「範囲外」節・`crates/io/src/recv_limits.rs` モジュール doc
         /// 参照）。したがってここで効くのは `ReceiveLimits` のペイロード長
         /// 上限（`Write` は `BatchConfig` 由来の設定上限、制御フレームは
-        /// `MAX_CONTROL_PAYLOAD_LEN`）の確保前検証のみであり、滞留件数上限の
-        /// 実効化は TASK-13.2.2（#822）が `BatchBuffer` を配線した時点で
-        /// 初めて機能する。
+        /// `MAX_CONTROL_PAYLOAD_LEN`）の確保前検証のみである。滞留件数上限が
+        /// 実効化されない（常に `0` を渡す）のは、[`crate::writeback::serve_connection`]
+        /// （TASK-13.2.2・#822）の write-back が同期的で、受信時点の
+        /// 「排出済みだが未書き込み」のキューが常に空であるという前提の下で
+        /// 構造上正確だからである（`crates/io/src/writeback.rs` モジュール doc
+        /// 「受信上限」節参照。非同期化する場合はこの前提を見直す必要がある）。
         ///
         /// # 戻り値にフレーム種別を添える理由（観測。TASK-13.2.1・#820）
         /// ヘッダ検証（`FrameHeader::from_bytes`）を通過した時点でフレーム種別は

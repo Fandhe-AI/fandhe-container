@@ -12,20 +12,26 @@
 //! 検証・複数バッファ / 接続を跨いだ滞留量上限とは独立している。
 //!
 //! # スコープ外（TASK-13 の兄弟 sub-issue が担う）
-//! - ディスクへの書き込み実行・ACK フレームの返却（TASK-13.2・TASK-13.2.2）
-//! - UDS 接続受付ループ（`server.rs`。TASK-13.2.1）
+//! - UDS 接続受付ループ（`server.rs`。TASK-13.2.1）・同時接続数の上限
 //! - CLI / 設定からのバッチサイズ・バイト数上限配線（`--batch-size` 相当。TASK-13.3）
 //! - 受信フレーム長そのものの検証・複数接続を跨いだ受信経路の DoS 対策
 //!   （[`crate::recv_limits`]・TASK-13.4・#796）
-//! - FLUSH バリアの処理（IO-2・TASK-15）・未フラッシュ滞留量上限（IO-10・TASK-16）
+//! - FLUSH バリアの永続化保証（FlushAck・IO-2・TASK-15）・未フラッシュ滞留量上限
+//!   （IO-10・TASK-16）
+//!
+//! ディスクへの書き込み実行・通常 ACK フレームの返却は
+//! [`crate::writeback::serve_connection`]（TASK-13.2.2・#822）が本モジュールの上に
+//! 実装済み（下記「呼び出し文脈」節参照）。
 //!
 //! # 呼び出し文脈
-//! TASK-13.2.1 以降が新設する予定の `server.rs`（UDS 受信ループ）が、受信した
-//! `FrameKind::Write` フレームを [`BatchBuffer::push`] へ渡し、[`PushOutcome::Ready`]
-//! （まれに [`PushOutcome::ReadyTwice`]。[`BatchBuffer::push`] 参照）が返った
-//! バッチをディスク書き込み（TASK-13.2）へ引き渡す想定。接続終了時・
-//! FLUSH 受信時（TASK-15）には [`BatchBuffer::take_pending`] で件数未達分を
-//! 強制的に取り出す。
+//! [`crate::writeback::serve_connection`]（TASK-13.2.2・#822）が、UDS 等の
+//! トランスポート（`server.rs`。TASK-13.2.1）から受信した `FrameKind::Write`
+//! フレームを [`BatchBuffer::push`] へ渡し、[`PushOutcome::Ready`]（まれに
+//! [`PushOutcome::ReadyTwice`]。[`BatchBuffer::push`] 参照）が返ったバッチを
+//! ディスク書き込みへ引き渡す。[`FrameKind::Flush`] 受信時には
+//! [`BatchBuffer::take_pending`] で件数未達分を強制的に取り出して書き込み・ACK
+//! する（接続終了時は取り出さず、ACK していない保留分として破棄する。
+//! `serve_connection` のドキュメンテーションコメント参照）。
 //!
 //! 成果物名は spec（`05-tasks.md` TASK-13）上は `server.rs` だが、TASK-13.2.1
 //! （#820）・TASK-13.2.2（#822）・TASK-13.4（#796）がいずれも `server.rs` を

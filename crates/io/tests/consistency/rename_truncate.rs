@@ -64,18 +64,12 @@ fn reopen_sink(path: &Path) -> AppendFileSink {
 }
 
 /// `path` を `OpenOptions::append(true)` で開いた [`AppendFileSink`] を返す
-/// （T4 専用。非 `O_APPEND` の [`AppendFileSink::new`] は一度だけ末尾へ seek
-/// するため、ライブセッション中に外部から truncate されるとカーソルが古い
-/// ままになり、`create_sink`（通常モード）では `[0, 旧オフセット)` にゼロ埋め
-/// の穴ができる。これは非 append モードでの現在の実装の既知の限界であり
-/// （`AppendFileSink::new` のドキュメント参照）、
-/// `io4_truncate_live_session_normal_mode_post_truncate_records_intact_at_tail`
-/// （T6）はこの穴を「修正されるべき既知の不具合」として扱い、穴なしの理想値を
-/// 主目的の期待値としつつ、修正が入るまでの間だけ現行実装が生む穴あり出力も
-/// 許容する（穴を成功条件として固定はしない。T6 のドキュメンテーション
-/// コメント参照）。本関数（T4）はその対比として、`append(true)` で開くと
-/// 各 `write_all` が OS レベルで常に現在の EOF に着地し、この穴を避けられる
-/// ことを固定する）。
+/// （T4 専用）。`append(true)` では各 `write_all` が OS レベルで常に現在の
+/// EOF に着地する。通常モード（`create_sink`。非 `O_APPEND`）でも
+/// [`AppendFileSink`] の `write_batch` がバッチごとに現在の EOF へ位置合わせ
+/// するため、バッチの合間の外部 truncate 後に穴はできない（T6 で検証）。
+/// T4 と T6 は、開き方によらず truncate 後の書き込みが新しい EOF に着地する
+/// ことを対で確認する。
 fn append_mode_sink(path: &Path) -> AppendFileSink {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -564,11 +558,10 @@ fn io4_truncate_mid_record_is_detected_then_recovered() {
 }
 
 /// IO-4・REPAIR-6・TASK-14.2: `append(true)` で開いたライブセッション中に、
-/// 別ハンドルで `set_len(0)` する。`AppendFileSink` は非 `O_APPEND` だが
-/// `append(true)` で開いているため各 `write_all` が OS レベルで常に現在の
-/// EOF に着地し、ゼロ埋めの穴ができないことを確認する（`append_mode_sink`
-/// のドキュメンテーションコメントに記した、非 append モードでの古いカーソル
-/// 問題の反例として、append モードなら安全であることを固定する）。
+/// 別ハンドルで `set_len(0)` する。truncate 後の書き込みが新しい EOF（先頭）
+/// に着地し、ゼロ埋めの穴ができないことをファイル全体の完全一致で確認する
+/// （通常モードでの同じ操作は T6
+/// `io4_truncate_live_session_normal_mode_lands_at_new_eof` で確認する）。
 #[test]
 fn io4_truncate_live_session_append_mode_lands_at_new_eof() {
     const BODY_LEN: usize = 16;
@@ -606,35 +599,15 @@ fn io4_truncate_live_session_append_mode_lands_at_new_eof() {
     );
 }
 
-/// IO-4・REPAIR-6・TASK-14.2（codex/review 指摘・PR #1125 対応。
-/// `PRRT_kwDOUq78ts6mvhyC` への対応）: `create_sink`（通常モード、非
-/// `O_APPEND`）で開いたライブセッション中に、別ハンドルで `set_len(0)` する。
-///
-/// 現在の [`AppendFileSink::new`] は一度だけ現在の EOF（`N*BODY_LEN`）へ
-/// `seek` し、以後の `write_all` はその古いオフセットへ書き込み続けるため
-/// （ドキュメント参照）、外部 truncate 後もカーソルが追随せず、
-/// `[0, N*BODY_LEN)` がゼロ埋めの穴として残る（POSIX `write(2)`・Windows
-/// `WriteFile` いずれも決定的）。この穴は「修正されるべき既知の不具合」で
-/// あり、`AppendFileSink` が現在の EOF に追随するよう修正されれば消える
-/// はずのものなので、それを成功条件として固定してはならない
-/// （codex/review 指摘。将来の修正で本テストが逆に失敗する事態を避ける）。
-///
-/// 一方でモジュール doc が約束する「ファイル内容の完全一致」
-/// （IO-4・REPAIR-6・#81 受入基準）を保つには、末尾 M 件だけの比較で
-/// 穴の有無を無視するのもアサーション弱体化になる
-/// （AGENTS.md「アサーション弱体化による回帰検出の後退」P0）。
-///
-/// そこで、穴が生じない理想的な出力（`expected`。`AppendFileSink` が EOF
-/// に追随するよう修正された後の唯一の正解）を主目的の期待値としつつ、
-/// その修正が入るまでの間だけ、現行実装が決定的に生む「ゼロ埋め穴＋末尾に
-/// 正しい M 件」という具体的なバイト列（`known_defect_tolerated_until_eof_tracking_fix`）
-/// も許容する。いずれのバイト列とも一致しない出力（部分的な穴・レコードの
-/// ずれ・破損等）は引き続き失敗として検出する。`AppendFileSink` が EOF に
-/// 追随するよう修正されたら、この関数から `known_defect_tolerated_until_eof_tracking_fix`
-/// の分岐を削除し、`expected` との単純な `assert_eq!` に戻すこと
-/// （`append_mode_sink`（T4）はこの穴を避けられることの対比になる）。
+/// IO-4・REPAIR-6・TASK-14.2（Codex #1125 レビュー指摘）: `create_sink`
+/// （通常モード、非 `O_APPEND`）で開いたライブセッション中に、別ハンドルで
+/// `set_len(0)` する。[`AppendFileSink`] の `write_batch` はバッチごとに現在の
+/// EOF へ位置合わせするため、truncate 後の M 件は新しい EOF（先頭）から穴なしで
+/// 書き込まれる。穴のない期待バイト列との完全一致だけを成功条件とする
+/// （truncate 前のオフセット `N*BODY_LEN` へ書き続けて `[0, N*BODY_LEN)` を
+/// ゼロ埋めの穴にする退行は失敗として検出する）。
 #[test]
-fn io4_truncate_live_session_normal_mode_post_truncate_records_intact_at_tail() {
+fn io4_truncate_live_session_normal_mode_lands_at_new_eof() {
     const BODY_LEN: usize = 16;
     const BATCH_SIZE: usize = 4;
     const N: u32 = 4;
@@ -662,37 +635,14 @@ fn io4_truncate_live_session_normal_mode_post_truncate_records_intact_at_tail() 
     let report = session.finish();
     assert_eq!(report.stats.acks_sent, u64::from(N + M));
 
-    // 理想値（主目的の期待値）: 穴なしで、truncate 後の M 件だけが残る。
-    // `AppendFileSink` が現在の EOF に追随するよう修正されれば、実際の出力は
-    // 常にこちらと一致するようになるはずの唯一の正解。
+    // 期待値: 外部 truncate で空になったファイルへ、truncate 後の M 件だけが
+    // 穴なしで先頭から追記される（`AppendFileSink` は各バッチの書き込み前に
+    // 現在の EOF へ位置合わせする。`AppendFileSink::write_batch` 参照）。
     let expected = records(0, N..N + M, BODY_LEN);
-
-    // 既知の不具合（修正が入るまでの間だけ許容する、もう一方の具体的な
-    // バイト列）: `create_sink` は非 append モードで、`AppendFileSink::new`
-    // が truncate 前の EOF（`N*BODY_LEN`）へ一度だけ seek しているため、
-    // 外部 truncate 後の書き込みもその古いオフセットへ着地し、
-    // `[0, N*BODY_LEN)` がゼロ埋めの穴として残る（上記ドキュメンテーション
-    // コメント参照）。この分岐は許容であって成功条件の固定ではない
-    // （`AppendFileSink` が EOF に追随するよう修正されたら削除すること）。
-    let mut known_defect_tolerated_until_eof_tracking_fix = vec![0u8; N as usize * BODY_LEN];
-    known_defect_tolerated_until_eof_tracking_fix.extend(records(0, N..N + M, BODY_LEN));
-
     let actual = std::fs::read(&path).expect("must read file");
-    if actual == known_defect_tolerated_until_eof_tracking_fix && actual != expected {
-        eprintln!(
-            "io4_truncate_live_session_normal_mode_post_truncate_records_intact_at_tail: \
-             current AppendFileSink still reproduces the known zero-fill hole \
-             ([0, N*BODY_LEN)); this tolerance branch must be removed once \
-             AppendFileSink tracks the current EOF after an external truncate"
-        );
-    }
-    assert!(
-        actual == expected || actual == known_defect_tolerated_until_eof_tracking_fix,
-        "file must be either the ideal post-EOF-tracking-fix output (no hole) \
-         or the currently-known zero-fill-hole output, byte-exact; got neither.\n\
-         expected (ideal): {expected:?}\n\
-         known_defect_tolerated_until_eof_tracking_fix: {known_defect_tolerated_until_eof_tracking_fix:?}\n\
-         actual: {actual:?}"
+    assert_eq!(
+        actual, expected,
+        "post-truncate writes must land at the new EOF with no zero-fill hole"
     );
 }
 

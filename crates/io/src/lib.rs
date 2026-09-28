@@ -47,7 +47,7 @@ pub use observe::{
 };
 pub use protocol::{
     CHECKSUM_LEN, FRAME_HEADER_LEN, Frame, FrameChecksum, FrameHeader, FrameKind, MAX_FRAME_LEN,
-    MAX_PAYLOAD_LEN, PayloadLen,
+    MAX_PAYLOAD_LEN, PROTOCOL_VERSION, PayloadLen,
 };
 pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, WireFrame,

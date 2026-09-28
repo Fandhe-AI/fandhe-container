@@ -107,6 +107,19 @@ pub trait WireFrame: sealed::Sealed + Send + core::fmt::Debug {}
 /// - `&mut self` を要求し、1 つの接続を同時に使えるのは 1 スレッドのみとする
 ///   （ソケットのような状態を持つトランスポートを想定）。並行化（送信側と受信側の分割）は
 ///   TASK-12 で扱う。
+///
+/// # エラー後の接続再利用（P1-3・設計レビュー・2026-09-28 オーナー決定・REPAIR-5・
+/// REPAIR-6）
+/// [`Self::send_frame`] が [`IoErrorCode::Timeout`]・[`IoErrorCode::DataLoss`]・
+/// [`IoErrorCode::InvalidArgument`]・[`IoErrorCode::Unimplemented`] 等、いずれの
+/// エラーを返した後も、その接続は以後**使用不可**とする（fail-closed）。
+/// [`FrameHeader`](crate::protocol::FrameHeader) には同期マーカー（フレーム境界を
+/// 再同期するための番兵バイト列）がないため、送信の途中でエラーが起きると、
+/// 相手側が受信中のバイト列のどこまでを読んだかを送信側が知る手段がなく、
+/// 以後のバイト列がフレーム境界からずれて解釈される可能性がある。実装は
+/// エラーを返した後の呼び出しに対して実際の読み書きを一切行わず
+/// [`IoErrorCode::Unavailable`] を返さなければならず、呼び出し元は同じ接続を
+/// 再利用せず再接続しなければならない。
 pub trait FrameSender: Send {
     /// このトランスポートが送るフレームの型。
     type Frame: WireFrame;
@@ -124,6 +137,17 @@ pub trait FrameSender: Send {
 /// - 受信したバイト列の検証（長さ上限・チェックサム）は `Self::Frame` の構築時
 ///   （TASK-11.2・TASK-11.3）に行われ、`recv_frame` は検証済みの値のみを返す。
 /// - `&mut self` を要求し、1 つの接続を同時に使えるのは 1 スレッドのみとする。
+///
+/// # エラー後の接続再利用（P1-3・設計レビュー・2026-09-28 オーナー決定・REPAIR-5・
+/// REPAIR-6）
+/// [`FrameSender::send_frame`] のドキュメンテーションコメントと同じ契約が
+/// [`Self::recv_frame`] にも適用される。[`Self::recv_frame`] がいずれのエラー
+/// （[`IoErrorCode::Timeout`] を含む）を返した後も、その接続は以後使用不可と
+/// なる。実装は途中まで読んだ不完全なバイト列を次回呼び出しへ持ち越して
+/// 「続きから読む」処理をしてはならない（フレーム境界がずれた状態から
+/// 再開すると、以後のフレームをすべて誤ったオフセットで解釈しうるため）。
+/// エラー後の呼び出しは即座に [`IoErrorCode::Unavailable`] を返し、呼び出し元は
+/// 再接続すること。
 pub trait FrameReceiver: Send {
     /// このトランスポートが受け取るフレームの型。
     type Frame: WireFrame;
@@ -168,15 +192,27 @@ mod tests {
 
     /// テスト専用の mock トランスポート。送信したフレームをキューへ積み、
     /// 受信はキューから取り出す（キューが空なら Timeout を返す）。
+    ///
+    /// `poisoned` は P1-3（エラー後の接続再利用禁止。REPAIR-5・REPAIR-6）の契約を
+    /// 検証するための状態。[`FrameSender::send_frame`] / [`FrameReceiver::recv_frame`]
+    /// のいずれかが一度でも `Err` を返すと `true` になり、以後は両メソッドとも
+    /// キューに触れず [`IoErrorCode::Unavailable`] を返す。
     #[derive(Debug, Default)]
     struct MockTransport {
         queue: VecDeque<MockFrame>,
+        poisoned: bool,
     }
 
     impl FrameSender for MockTransport {
         type Frame = MockFrame;
 
         fn send_frame(&mut self, frame: &Self::Frame, _timeout: IoTimeout) -> Result<(), IoError> {
+            if self.poisoned {
+                return Err(IoError::new(
+                    IoErrorCode::Unavailable,
+                    "connection is poisoned by a previous error and must be reconnected",
+                ));
+            }
             self.queue.push_back(frame.clone());
             Ok(())
         }
@@ -186,9 +222,19 @@ mod tests {
         type Frame = MockFrame;
 
         fn recv_frame(&mut self, _timeout: IoTimeout) -> Result<Self::Frame, IoError> {
-            self.queue
-                .pop_front()
-                .ok_or_else(|| IoError::new(IoErrorCode::Timeout, "mock queue is empty"))
+            if self.poisoned {
+                return Err(IoError::new(
+                    IoErrorCode::Unavailable,
+                    "connection is poisoned by a previous error and must be reconnected",
+                ));
+            }
+            match self.queue.pop_front() {
+                Some(frame) => Ok(frame),
+                None => {
+                    self.poisoned = true;
+                    Err(IoError::new(IoErrorCode::Timeout, "mock queue is empty"))
+                }
+            }
         }
     }
 
@@ -282,5 +328,36 @@ mod tests {
     #[test]
     fn io1_mock_transport_is_send() {
         assert_send::<MockTransport>();
+    }
+
+    /// P1-3・REPAIR-5・REPAIR-6（設計レビュー・2026-09-28 オーナー決定）:
+    /// `recv_frame` がエラー（ここでは `Timeout`）を返した後、その接続は
+    /// `send_frame`・`recv_frame` のいずれを呼んでも `Unavailable` を返し、
+    /// キューの状態も変化しない（fail-closed。エラー後の接続再利用を禁じる契約の
+    /// 確認）。
+    #[test]
+    fn p1_3_connection_becomes_unavailable_after_error() {
+        let mut transport = MockTransport::default();
+
+        let err = transport
+            .recv_frame(test_timeout())
+            .expect_err("empty queue must time out");
+        assert_eq!(err.code(), IoErrorCode::Timeout);
+
+        // タイムアウト後、送信を試みても接続は再利用できない。
+        let err = transport
+            .send_frame(&MockFrame(1), test_timeout())
+            .expect_err("send after a prior error must be rejected");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+        assert!(
+            transport.queue.is_empty(),
+            "poisoned send must not touch the queue"
+        );
+
+        // 受信を試みても同様に再利用できない。
+        let err = transport
+            .recv_frame(test_timeout())
+            .expect_err("recv after a prior error must be rejected");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
     }
 }

@@ -25,26 +25,48 @@
 //! （`docs/design/io-protocol.md`「範囲外（真正性は保証しない）」節）。本ファイルの
 //! 各ケースはチェックサムを再計算していない改ざん（受信側が検出できる想定の破壊）
 //! のみを扱う。
+//!
+//! # ヘッダ CRC（`header_crc`）追加に伴う注記（#67・#115・REPAIR-5）
+//! [`FrameHeader`] は 2026-09-28 の設計レビューでヘッダ単体の CRC-32C
+//! （`header_crc`）を持つよう拡張された。`payload_len` フィールドだけを
+//! 生バイトで書き換える改ざんは、`header_crc` を再計算しない限り
+//! [`FrameHeader::from_bytes`] の検証（`header_crc` を最初に検証する）で
+//! `IoErrorCode::DataLoss` として即座に拒否される。本ファイルは公開 API
+//! （[`FrameHeader::new`] 経由）で `payload_len` だけを差し替えた
+//! **自己整合的な**（`header_crc` が新しい `payload_len` に対して正しく
+//! 再計算された）ヘッダへ丸ごと入れ替えることで、BREAK-2 が本来意図する
+//! 「申告長と実長の食い違い」を、ヘッダ CRC の検証を通過した状態で再現する
+//! （`tamper_declared_len`）。`MAX_PAYLOAD_LEN` を超える申告長は
+//! [`FrameHeader::new`] 自体が拒否するため公開 API では自己整合的に構築でき
+//! ず、その 1 ケース（`repair2_break2_declared_len_over_max_rejected_by_decode`）
+//! だけは元の `header_crc` を残したまま `payload_len` のみを書き換える
+//! （結果として `header_crc` 不一致で `DataLoss` になる。テストのコメント参照）。
 
 use fandhe_container_io::{
     FRAME_HEADER_LEN, Frame, FrameHeader, FrameKind, IoError, IoErrorCode, MAX_PAYLOAD_LEN,
 };
 
-/// `encoded`（`Frame::encode` の出力）の先頭 [`FRAME_HEADER_LEN`] バイトのうち、
-/// 種別バイトはそのまま残し、ペイロード長フィールド（オフセット 1..5、`u32` LE）だけを
-/// `declared` に書き換えたコピーを返す。ペイロード本体・チェックサムのバイト列は
+/// `encoded`（`Frame::encode` の出力）の先頭 [`FRAME_HEADER_LEN`] バイトを、
+/// 種別はそのまま・ペイロード長だけを `declared` に差し替えた、**自己整合的な**
+/// （`header_crc` を新しい `payload_len` に対して正しく再計算した）ヘッダへ
+/// 丸ごと入れ替えたコピーを返す。ペイロード本体・チェックサムのバイト列は
 /// 一切変更しない（BREAK-2 の「長さの申告だけを嘘にする」性質をワイヤーレベルで
-/// 再現するため）。添字代入は避け、分割・分割代入で組み立てる
-/// （coding-rust「外部入力」節）。
+/// 再現するため）。
+///
+/// `declared` が [`MAX_PAYLOAD_LEN`] を超える場合は [`FrameHeader::new`] が
+/// 拒否するため使えない（モジュール冒頭の注記参照。該当テストは別の組み立て方を
+/// 使う）。
 fn tamper_declared_len(encoded: &[u8], declared: u32) -> Vec<u8> {
     let (header_bytes, rest) = encoded
         .split_first_chunk::<FRAME_HEADER_LEN>()
         .expect("encoded frame must contain a full fixed-length header");
-    let [kind_byte, _, _, _, _] = *header_bytes;
-    let [l0, l1, l2, l3] = declared.to_le_bytes();
+    let original_header =
+        FrameHeader::from_bytes(*header_bytes).expect("original encoded header must be valid");
+    let tampered_header = FrameHeader::new(original_header.kind(), declared)
+        .expect("declared length must be within MAX_PAYLOAD_LEN for this helper");
 
     let mut tampered = Vec::with_capacity(FRAME_HEADER_LEN + rest.len());
-    tampered.extend_from_slice(&[kind_byte, l0, l1, l2, l3]);
+    tampered.extend_from_slice(&tampered_header.to_bytes());
     tampered.extend_from_slice(rest);
     tampered
 }
@@ -172,19 +194,37 @@ fn repair2_break2_declared_len_zero_rejected_by_both_paths() {
 }
 
 /// 任意ケース: 申告長を `MAX_PAYLOAD_LEN + 1` に書き換えた入力は、ヘッダ検証の時点
-/// （[`FrameHeader::from_bytes`]）で `InvalidArgument` として拒否される。
-/// アロケーション前に拒否されることの証明（DoS 対策）は `src/protocol.rs` の
-/// `repair2_decode_rejects_over_max_len_before_allocation`（TASK-83.2・#117）が行う。
-/// ここではエラーコードの確認のみを行う。
+/// （[`FrameHeader::from_bytes`]）で拒否される。
+///
+/// `MAX_PAYLOAD_LEN + 1` は [`FrameHeader::new`] 自体が拒否するため、
+/// `tamper_declared_len`（自己整合的なヘッダへの入れ替え）は使えない。ここでは
+/// 元のフレームの `header_crc` を残したまま `payload_len` フィールドだけを
+/// 生バイトで書き換えるため、`header_crc` が新しい（不正な）`payload_len` と
+/// 整合せず、[`FrameHeader::from_bytes`] の検証順序（`header_crc` を最初に
+/// 検証する。設計レビュー P1-2）により `IoErrorCode::DataLoss` として拒否される
+/// （`InvalidArgument` にはならない。仮に `header_crc` を新しい長さに対して
+/// 正しく再計算できたとしても、[`PayloadLen`]（`fandhe_container_io` 未公開）の
+/// 上限検証で最終的に `InvalidArgument` になることは `src/protocol.rs` の
+/// `repair2_decode_rejects_over_max_len_before_allocation`〔TASK-83.2・#117〕が
+/// crate 内部から `header_crc` を正しく計算した上で確認済み。アロケーション前に
+/// 拒否されることの証明も同テストが行う）。
 #[test]
 fn repair2_break2_declared_len_over_max_rejected_by_decode() {
     let frame = Frame::new(FrameKind::Write, PAYLOAD.to_vec()).expect("Frame::new must succeed");
     let encoded = frame.encode();
-    let tampered = tamper_declared_len(&encoded, MAX_PAYLOAD_LEN + 1);
+
+    let (header_bytes, rest) = encoded
+        .split_first_chunk::<FRAME_HEADER_LEN>()
+        .expect("encoded frame must contain a full fixed-length header");
+    let [version, kind_byte, _, _, _, _, c0, c1, c2, c3] = *header_bytes;
+    let [l0, l1, l2, l3] = (MAX_PAYLOAD_LEN + 1).to_le_bytes();
+    let mut tampered = Vec::with_capacity(FRAME_HEADER_LEN + rest.len());
+    tampered.extend_from_slice(&[version, kind_byte, l0, l1, l2, l3, c0, c1, c2, c3]);
+    tampered.extend_from_slice(rest);
 
     let err = Frame::decode(&tampered)
         .expect_err("declared length exceeding MAX_PAYLOAD_LEN must be rejected");
-    assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+    assert_eq!(err.code(), IoErrorCode::DataLoss);
 }
 
 /// security.md「情報漏えい」観点: 改ざん検出のエラーメッセージにペイロード内容

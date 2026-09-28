@@ -254,3 +254,103 @@ fn repair5_public_api_observer_mut_drains_buffered_send_log() {
         "unexpected drained line: {line}"
     );
 }
+/// 結合試験専用のモック sender。常に `Timeout` を返す（トランスポート失敗・
+/// 失効後の拒否を観測するために使う。`crate::client` 内のユニットテストにある
+/// 同名モックと同じ役割）。
+#[derive(Debug, Default)]
+struct AlwaysTimeoutSender;
+
+impl FrameSender for AlwaysTimeoutSender {
+    type Frame = Frame;
+
+    fn send_frame(&mut self, _frame: &Self::Frame, _timeout: IoTimeout) -> Result<(), IoError> {
+        Err(IoError::new(IoErrorCode::Timeout, "mock always times out"))
+    }
+}
+
+/// REPAIR-4・REPAIR-12（#73。Codex P1 再指摘対応・`client.rs:692`）: 観測先を
+/// 明示せずに済ませられない `PipelineClient::new`（項目 J。観測フックが必須引数）に
+/// [`JsonLinesSendObserver`] を渡した既定の利用経路で、成功・拒否系すべての結果
+/// 種別（`Success`・`RejectedInvalidFrameKind`・`RejectedResourceExhausted`・
+/// `TransportFailure`・`RejectedPoisoned`）が JSON 行として観測できることを
+/// 公開 API のみで機械照合する。`metrics()` を一切読み出さなくても、`send` の
+/// 呼び出しごとに `observer_mut().drain_lines()` から結果が取り出せることの確認
+/// （base 側 AGENTS.md の可観測性要件・REPAIR-4）。
+#[test]
+fn repair4_repair12_public_api_default_observer_path_covers_all_send_outcomes() {
+    // Success・RejectedInvalidFrameKind・RejectedResourceExhausted は
+    // 常に成功するトランスポートで再現できる。
+    let limit = InFlightLimit::new(1).expect("1 must be a valid limit");
+    let observer = JsonLinesSendObserver::new();
+    let mut client = PipelineClient::new(RecordingSender::default(), limit, observer);
+
+    client
+        .send(&write_frame(1), test_timeout())
+        .expect("1st send must succeed under the limit");
+
+    let ack_frame = Frame::new(FrameKind::Ack, Vec::new()).expect("frame must be valid");
+    client
+        .send(&ack_frame, test_timeout())
+        .expect_err("Ack frames must not be trackable as in-flight requests");
+
+    let resource_exhausted_err = client
+        .send(&write_frame(2), test_timeout())
+        .expect_err("2nd Write must be rejected: in-flight limit already reached");
+    assert_eq!(
+        resource_exhausted_err.code(),
+        IoErrorCode::ResourceExhausted
+    );
+
+    let lines = client.observer_mut().drain_lines();
+    assert_eq!(lines.len(), 3, "expected one JSON line per send() call");
+    assert!(
+        lines[0].starts_with("{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"ok\",")
+            && lines[0].ends_with('}'),
+        "unexpected success line: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("\"outcome\":\"error\"")
+            && lines[1].contains("\"reason\":\"rejected_invalid_frame_kind\""),
+        "unexpected invalid-frame-kind line: {}",
+        lines[1]
+    );
+    assert!(
+        lines[2].contains("\"outcome\":\"error\"")
+            && lines[2].contains("\"reason\":\"rejected_resource_exhausted\""),
+        "unexpected resource-exhausted line: {}",
+        lines[2]
+    );
+
+    // TransportFailure・RejectedPoisoned は失効するトランスポートで再現する
+    // （送信結果が不明なエラーの後、クライアントが失効して以降の送信を拒否する
+    // 契約。`PipelineClient::send` のドキュメント参照）。
+    let poisoning_observer = JsonLinesSendObserver::new();
+    let mut poisoning_client = PipelineClient::new(AlwaysTimeoutSender, limit, poisoning_observer);
+
+    poisoning_client
+        .send(&write_frame(1), test_timeout())
+        .expect_err("the mock sender always times out");
+    poisoning_client
+        .send(&write_frame(2), test_timeout())
+        .expect_err("poisoned client must reject further sends");
+
+    let poisoning_lines = poisoning_client.observer_mut().drain_lines();
+    assert_eq!(
+        poisoning_lines.len(),
+        2,
+        "expected one JSON line per send() call"
+    );
+    assert!(
+        poisoning_lines[0].contains("\"outcome\":\"error\"")
+            && poisoning_lines[0].contains("\"reason\":\"transport_failure\""),
+        "unexpected transport-failure line: {}",
+        poisoning_lines[0]
+    );
+    assert!(
+        poisoning_lines[1].contains("\"outcome\":\"error\"")
+            && poisoning_lines[1].contains("\"reason\":\"rejected_poisoned\""),
+        "unexpected rejected-poisoned line: {}",
+        poisoning_lines[1]
+    );
+}

@@ -1635,7 +1635,7 @@ mod tests {
     /// 取り出す。`metrics()` を明示的に読み出さなくても送信結果が観測できる
     /// ことを確認する（codex レビュー指摘の解消）。
     #[test]
-    fn repair4_with_observer_buffers_json_lines_for_each_send_outcome() {
+    fn repair4_observer_buffers_json_lines_for_each_send_outcome() {
         use crate::observe::JsonLinesSendObserver;
 
         let limit = InFlightLimit::new(1).expect("1 must be valid");
@@ -1691,7 +1691,8 @@ mod tests {
     }
 
     /// TASK-12.1（#73 codex 指摘対応。P1・REPAIR-4）: 未観測の `LatencyStats` は
-    /// `count` が `0` で `min`/`max`/`mean` が `None` になる。
+    /// `count` が `0` で `min`/`max`/`mean` が `None` になり、ヒストグラムは
+    /// すべて `0` になる（#73 codex 再指摘対応。REPAIR-4・REPAIR-12）。
     #[test]
     fn repair4_latency_stats_defaults_to_empty() {
         let stats = LatencyStats::default();
@@ -1700,6 +1701,108 @@ mod tests {
         assert_eq!(stats.min(), None);
         assert_eq!(stats.max(), None);
         assert_eq!(stats.mean(), None);
+        assert_eq!(*stats.histogram(), [0u64; LATENCY_HISTOGRAM_BUCKETS]);
+    }
+
+    /// REPAIR-4・REPAIR-12（#73。項目 K・M。コミット 2）: ヒストグラムの各バケット
+    /// 境界（`0µs`・各境界の直前・直後・`Duration::MAX`）が、
+    /// [`LATENCY_HISTOGRAM_BUCKETS`] のドキュメントどおりの区間
+    /// （バケット `i` は `[2^(i-1), 2^i)`、バケット `0` は `[0, 1)`、最後の
+    /// バケットは上限なし）に入ることを機械照合する。
+    #[test]
+    fn repair4_repair12_latency_stats_histogram_bucket_boundaries() {
+        // `0µs` はバケット `0`（`[0, 1)`）。
+        let mut zero = LatencyStats::default();
+        zero.record(Duration::ZERO);
+        assert_eq!(zero.histogram()[0], 1);
+        assert_eq!(zero.count(), 1);
+
+        // バケット `0`/`1` の境界の直後（`1µs`）、および続く `1`/`2` の境界の
+        // 直前（`1µs`）・直後（`2µs`）。
+        let mut boundary_1_2_before = LatencyStats::default();
+        boundary_1_2_before.record(Duration::from_micros(1));
+        assert_eq!(boundary_1_2_before.histogram()[1], 1);
+
+        let mut boundary_1_2_after = LatencyStats::default();
+        boundary_1_2_after.record(Duration::from_micros(2));
+        assert_eq!(boundary_1_2_after.histogram()[2], 1);
+
+        // 最後から 2 番目のバケット（`23`。`[2^22, 2^23)`）の直前（`2^23 - 1`）は
+        // バケット `23` のまま、直後（`2^23`）は上限なしの最後のバケット（`24`）
+        // へ入る。この境界が「`MAX_IO_TIMEOUT`（10 秒 = 10,000,000µs）を超える
+        // 値は最後のバケットに入る」という [`LATENCY_HISTOGRAM_BUCKETS`] の契約の
+        // 核心（`2^23 = 8_388_608 < 10_000_000` のため、10 秒を超える値は必ず
+        // このバケットより後ろ、つまり最後のバケットに入る）。
+        let last_finite_upper_bound = 1u64 << (LATENCY_HISTOGRAM_BUCKETS - 2);
+        let mut just_below_last = LatencyStats::default();
+        just_below_last.record(Duration::from_micros(last_finite_upper_bound - 1));
+        assert_eq!(
+            just_below_last.histogram()[LATENCY_HISTOGRAM_BUCKETS - 2],
+            1
+        );
+
+        let mut at_last_boundary = LatencyStats::default();
+        at_last_boundary.record(Duration::from_micros(last_finite_upper_bound));
+        assert_eq!(
+            at_last_boundary.histogram()[LATENCY_HISTOGRAM_BUCKETS - 1],
+            1
+        );
+
+        // `MAX_IO_TIMEOUT`（10 秒）を超える値・`Duration::MAX` も最後のバケットへ入る。
+        let mut over_max_io_timeout = LatencyStats::default();
+        over_max_io_timeout.record(crate::transport::MAX_IO_TIMEOUT + Duration::from_secs(1));
+        assert_eq!(
+            over_max_io_timeout.histogram()[LATENCY_HISTOGRAM_BUCKETS - 1],
+            1
+        );
+
+        let mut duration_max = LatencyStats::default();
+        duration_max.record(Duration::MAX);
+        assert_eq!(duration_max.histogram()[LATENCY_HISTOGRAM_BUCKETS - 1], 1);
+        assert_eq!(duration_max.count(), 1);
+    }
+
+    /// REPAIR-4・REPAIR-12（#73。項目 K・M）: `bucket_upper_bound_micros` は
+    /// バケット `0` からバケット `LATENCY_HISTOGRAM_BUCKETS - 2` までは
+    /// `2^index` を返し、最後のバケット（上限なし）と範囲外の `index` は
+    /// どちらも `None` を返す。
+    #[test]
+    fn repair4_repair12_latency_stats_bucket_upper_bound_micros_boundaries() {
+        assert_eq!(LatencyStats::bucket_upper_bound_micros(0), Some(1));
+        assert_eq!(LatencyStats::bucket_upper_bound_micros(1), Some(2));
+        assert_eq!(
+            LatencyStats::bucket_upper_bound_micros(LATENCY_HISTOGRAM_BUCKETS - 2),
+            Some(1u64 << (LATENCY_HISTOGRAM_BUCKETS - 2))
+        );
+        assert_eq!(
+            LatencyStats::bucket_upper_bound_micros(LATENCY_HISTOGRAM_BUCKETS - 1),
+            None,
+            "the last bucket has no upper bound"
+        );
+        assert_eq!(
+            LatencyStats::bucket_upper_bound_micros(LATENCY_HISTOGRAM_BUCKETS),
+            None,
+            "an out-of-range index must not panic and must be treated the same as \
+             the open-ended last bucket"
+        );
+    }
+
+    /// REPAIR-4・REPAIR-12（#73。項目 K・M）: ヒストグラムの各バケットは
+    /// `saturating_add` で増分するため、`u64::MAX` に達したバケットへさらに
+    /// 記録してもオーバーフローで `0` へ巻き戻らない（無制限リソース消費とは
+    /// 別種の不変条件だが、カウンタの巻き戻りによる観測値の誤りを防ぐ）。
+    #[test]
+    fn repair4_repair12_latency_stats_histogram_bucket_saturates() {
+        let mut stats = LatencyStats {
+            buckets: [u64::MAX; LATENCY_HISTOGRAM_BUCKETS],
+            ..LatencyStats::default()
+        };
+        stats.record(Duration::ZERO);
+        assert_eq!(
+            stats.histogram()[0],
+            u64::MAX,
+            "bucket count must saturate rather than wrap to 0"
+        );
     }
 
     // --- コミット 2（#73・受け入れ基準の機械照合。REPAIR-12）から追加したテスト ---

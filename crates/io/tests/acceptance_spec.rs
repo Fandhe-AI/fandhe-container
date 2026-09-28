@@ -6,12 +6,15 @@
 //!
 //! # 位置づけ
 //!
-//! - 本ファイルは TASK-91.1（#129・MS-1 Phase 2）の成果物。対象仕様の選定
-//!   一覧・照合ヘルパ・雛形テストを実装する（少なくとも 1 件が実際に動く
-//!   状態にする）
-//! - 本照合（選定した対象仕様のうち最低 2 件について、仕様未達の実装に
-//!   差し替えると実際に fail することの確認）は TASK-91.2（#130・MS-1
-//!   Phase 2）で行う
+//! - 本ファイルは TASK-91.1（#129・MS-1 Phase 2）の成果物として選定一覧・
+//!   照合ヘルパ・雛形テストを実装した後、TASK-91.2（#130・MS-1 Phase 2）で
+//!   TASK-13（IO-1）の 2 行を io の実 API（[`crate::BatchConfig`]・
+//!   [`crate::BatchBuffer`]。TASK-13.1・#76）に接続し、意図的に仕様を
+//!   満たさない観測に対して照合器が具体的な差分を返すことを固定テストとして
+//!   常設した
+//! - 残る TASK-15 / TASK-16 / TASK-17 / TASK-19 / TASK-20 の 5 行は、対応する
+//!   io の実装（TASK-11・TASK-15〜20）が入るまで未接続のまま据え置く
+//!   （REPAIR-3: 実装済みを装わない）
 //! - 配置理由: spec（`docs/spec/05-tasks.md` の TASK-91）上の成果物パスは
 //!   `crates/core/tests/acceptance_spec.rs` だが、親 #128 の受け入れ条件が
 //!   「MS-1 時点で core は雛形のみで本タスクの照合対象（io の出力仕様）を
@@ -33,7 +36,8 @@
 //!
 //! | TASK    | ビヘイビア  | 機械照合する出力仕様                                                                  | 照合方法            | 状態                          |
 //! | ------- | ----------- | -------------------------------------------------------------------------------------- | ------------------- | ----------------------------- |
-//! | TASK-13 | IO-1        | バッチサイズの既定値 64 が設定の実効値に反映されること（`batch_size=<N>`）             | 構造化 assert       | 未接続（TASK-13 で接続）      |
+//! | TASK-13 | IO-1        | バッチサイズの既定値 64 が設定の実効値に反映されること（`batch_size=<N>`）             | 構造化 assert       | 接続済み（TASK-13.1 公開 API） |
+//! | TASK-13 | IO-1        | バッチサイズが設定で変更可能で、設定した件数で発火すること（`batch_size=<N>`）         | 構造化 assert       | 接続済み（TASK-13.1 公開 API） |
 //! | TASK-15 | IO-2        | 書き込み ACK と FLUSH ACK が別種別として区別され、FLUSH ACK はバリア以前の書き込みの永続化後にのみ返ること（書き込み ACK（IO-1）自体の対応照合は本照合器の対象外で、TASK-12・13 の結合試験が担う） | 構造化 assert | 未接続（TASK-11 / TASK-15 で接続） |
 //! | TASK-16 | IO-10       | 未フラッシュ滞留量の上限が設定可能で、上限到達時に自動フラッシュが発行されること（`flush_every=<N>`） | 構造化 assert | 未接続（TASK-16 で接続）      |
 //! | TASK-17 | IO-2        | `docs/api/io-barrier.md` に ACK / FLUSH ACK の永続化保証の違いが明記されていること      | 文字列パターン照合  | 未接続（TASK-17 で文書作成後に接続） |
@@ -49,13 +53,20 @@
 //!
 //! # スタブについて（REPAIR-3）
 //!
-//! `crates/io` は雛形のみで TASK-11〜25 の本体は未実装のため、現時点では
-//! io の実 API を呼び出して出力を照合できない。本ファイルの雛形テストは
-//! 「照合器（マッチャ）そのものが仕様どおりに動くこと」を、仕様から作った
-//! 暫定サンプル行に対して検証する。サンプル文字列（`batch_size=64` 等）は
+//! `crates/io` の TASK-13（IO-1）は TASK-13.1（#76）で `BatchConfig` /
+//! `BatchBuffer` の公開 API が確定したため、本ファイルの TASK-13 の 2 行は
+//! [`observe_batch_firing`] で実際に `BatchBuffer::push` を呼び出し、実効値を
+//! 照合する。TASK-11・TASK-15〜20 の本体はまだ未実装のため、残り 5 行は
+//! 引き続き「照合器（マッチャ）そのものが仕様どおりに動くこと」を、仕様から
+//! 作った暫定サンプル行・イベント列に対して検証する雛形のままである。
+//! サンプル文字列（`batch_size=64` 等）・[`AckEvent`] 系列は
 //! fandhe-container の確定契約ではなく、PoC-12 の観測結果と TASK-91 計画を
-//! もとにした暫定値であり、io の実 API が確定するタイミング（TASK-13 の
-//! バッチ設定 API 確定・TASK-15 の ACK フレーム型確定）で実出力に接続する。
+//! もとにした暫定値であり、io の実 API が確定するタイミング（TASK-11・
+//! TASK-15 の ACK フレーム型確定）で実出力に接続する。
+
+use fandhe_container_io::{
+    BatchBuffer, BatchConfig, BatchTrigger, Frame, FrameKind, IoErrorCode, PushOutcome,
+};
 
 /// 照合方法の分類。[`AcceptanceTarget::method`] に使う。
 ///
@@ -67,22 +78,36 @@ enum MatchMethod {
     StructuredAssert,
 }
 
-/// 対象仕様がまだ io の実 API に接続されていないことを表す状態。
+/// 対象仕様が io の実 API に接続されているかどうかを表す状態。
 ///
-/// 現時点では `NotWired` のみを持つ。TASK-11〜25 の実装が進み、実出力を
-/// 呼び出せるようになった対象から `Wired` 相当の状態（将来のバリアント）
-/// を追加し、このテストファイルから実 API を呼ぶ形に差し替える
-/// （本照合は TASK-91.2・#130）。
+/// TASK-91.2（#130）で `Wired` バリアントを追加した。TASK-13（IO-1）の
+/// 2 行は `BatchConfig` / `BatchBuffer`（TASK-13.1・#76）に接続済みのため
+/// `Wired` を持ち、TASK-11・TASK-15〜20 の本体がまだ無い残り 5 行は
+/// 引き続き `NotWired` のままとする。
 ///
 /// `text` は表の状態欄のセル全体（例:
-/// `未接続（TASK-13 で接続）`・`未接続（TASK-17 で文書作成後に接続）`）と
+/// `未接続（TASK-13 で接続）`・`接続済み（TASK-13.1 公開 API）`）と
 /// 文字単位で一致させる。Codex レビュー指摘: 以前は `planned_task`
 /// （「で」より前の部分）だけを取り出して比較していたため、「TASK-13 で
 /// 接続」を「TASK-13 で接続しない」に変えても不一致を検出できなかった。
 /// 状態欄全体を保持・比較することで、欄のどの位置の改変も検出する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TargetStatus {
+    /// io の実 API に未接続（表の `未接続（...）` セルに対応）。
     NotWired { text: &'static str },
+    /// io の実 API に接続済み（表の `接続済み（...）` セルに対応。
+    /// TASK-91.2 で追加）。
+    Wired { text: &'static str },
+}
+
+impl TargetStatus {
+    /// 表の状態欄セル全体と突き合わせるための文字列を返す
+    /// （[`compare_targets_with_doc_table`] が使う）。
+    fn cell_text(self) -> &'static str {
+        match self {
+            TargetStatus::NotWired { text } | TargetStatus::Wired { text } => text,
+        }
+    }
 }
 
 /// 機械照合の対象仕様 1 件を表す。モジュールドキュメントの表と同じ内容を
@@ -108,8 +133,17 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
         behavior: "IO-1",
         spec_fact: "バッチサイズの既定値 64 が設定の実効値に反映されること（`batch_size=<N>`）",
         method: MatchMethod::StructuredAssert,
-        status: TargetStatus::NotWired {
-            text: "未接続（TASK-13 で接続）",
+        status: TargetStatus::Wired {
+            text: "接続済み（TASK-13.1 公開 API）",
+        },
+    },
+    AcceptanceTarget {
+        task: "TASK-13",
+        behavior: "IO-1",
+        spec_fact: "バッチサイズが設定で変更可能で、設定した件数で発火すること（`batch_size=<N>`）",
+        method: MatchMethod::StructuredAssert,
+        status: TargetStatus::Wired {
+            text: "接続済み（TASK-13.1 公開 API）",
         },
     },
     AcceptanceTarget {
@@ -295,6 +329,353 @@ fn repair_12_scaffold_matcher_rejects_duplicate_key_occurrence() {
     );
 }
 
+/// TASK-13（IO-1）の spec 値そのもの（「既定 64 件」）。実装側の
+/// [`fandhe_container_io::DEFAULT_BATCH_SIZE`] 定数は import せず、この
+/// テストファイル内に spec の値を直接書く（REPAIR-12 の核心: 実装側の
+/// 定数を期待値に使うと、`DEFAULT_BATCH_SIZE` を 64 のまま残しつつ
+/// `impl Default for BatchConfig` だけを 32 件に差し替える仕様違反を、
+/// 実効値を見ないと検出できない）。
+const IO1_SPEC_DEFAULT_BATCH_SIZE: usize = 64;
+
+/// [`observe_batch_firing`] が返す、io の実 API（[`BatchBuffer`]）を実際に
+/// 動かして得たバッチ発火の観測結果（REPAIR-12・IO-1・TASK-13・TASK-91.2）。
+///
+/// 真偽値ではなく具体値をフィールドとして持ち、[`check_default_batch_size`]・
+/// [`check_configured_batch_size`] が各項目を個別に spec 由来の期待値と
+/// 比較できるようにする（[coding-rust] の「期待値は具体値で書く」方針）。
+///
+/// [coding-rust]: ../../../.claude/rules/coding-rust.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BatchFiringObservation {
+    /// 観測に使った [`BatchConfig::batch_size`]（呼び出し側が設定した値）。
+    effective_batch_size: usize,
+    /// 何回目の `push` で最初に [`PushOutcome::Ready`]（発火）を観測したか
+    /// （1 始まり）。最後まで発火しなければ `None`。
+    first_fire_at_push: Option<usize>,
+    /// 発火した [`crate::batch::Batch`]（本ファイルからは直接見えないため
+    /// `fandhe_container_io::Batch`）の `len()`。
+    fired_len: Option<usize>,
+    /// 発火した `Batch` の `trigger()`。
+    trigger: Option<BatchTrigger>,
+    /// 発火する直前まで滞留していた件数（仕様どおりなら
+    /// `effective_batch_size - 1` になるはず）。
+    buffered_before_fire: usize,
+}
+
+/// `config` で作った [`BatchBuffer`] へ 1 バイトの `Write` フレームを
+/// `max_pushes` 回まで push し、最初に発火した回の観測結果を返す
+/// （REPAIR-12・IO-1・TASK-13。TASK-91.2 で io の実 API に接続した観測関数。
+/// [`ACCEPTANCE_TARGETS`] の TASK-13 の 2 行に対応）。
+///
+/// 1 バイトのペイロードを使うのは、累積バイト数上限
+/// （[`BatchConfig::max_bytes`]。既定 256 MiB）が本ファイルで使う
+/// `max_pushes`（300 以下）回の push では絶対に発火しないようにするため
+/// （件数上限〔[`BatchTrigger::SizeReached`]〕のみを観測対象にする）。
+/// `max_pushes` に達しても発火しなければ、すべて `None` / 0 のまま返す
+/// （無限ループ防止。security.md の「タイムアウト」の精神に倣い、外部条件で
+/// 終了しないループを作らない）。[`PushOutcome::ReadyTwice`]・`push` 自体の
+/// エラー・`#[non_exhaustive]` の将来バリアントは、それ自体が「最初の発火が
+/// 想定と異なる」ことを意味するため panic させず、観測を打ち切って
+/// 「発火なし」として返す（呼び出し側の `check_*` 関数が期待値との不一致
+/// として検出する）。
+fn observe_batch_firing(config: BatchConfig, max_pushes: usize) -> BatchFiringObservation {
+    let mut buffer = BatchBuffer::new(config);
+    let mut buffered_before_fire = 0usize;
+
+    for push_count in 1..=max_pushes {
+        let frame = match Frame::new(FrameKind::Write, vec![0u8]) {
+            Ok(frame) => frame,
+            Err(_) => break,
+        };
+        match buffer.push(frame) {
+            Ok(PushOutcome::Buffered { pending }) => {
+                buffered_before_fire = pending;
+            }
+            Ok(PushOutcome::Ready(batch)) => {
+                return BatchFiringObservation {
+                    effective_batch_size: config.batch_size(),
+                    first_fire_at_push: Some(push_count),
+                    fired_len: Some(batch.len()),
+                    trigger: Some(batch.trigger()),
+                    buffered_before_fire,
+                };
+            }
+            _ => break,
+        }
+    }
+
+    BatchFiringObservation {
+        effective_batch_size: config.batch_size(),
+        first_fire_at_push: None,
+        fired_len: None,
+        trigger: None,
+        buffered_before_fire,
+    }
+}
+
+/// [`check_default_batch_size`]・[`check_configured_batch_size`] が返す、
+/// 仕様との不一致 1 件（REPAIR-12）。真偽値ではなく具体値で差分を表現する
+/// （[coding-rust] の「期待値は具体値で書く」方針）。
+///
+/// [coding-rust]: ../../../.claude/rules/coding-rust.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcceptanceMismatch {
+    target: &'static str,
+    field: &'static str,
+    expected: String,
+    actual: String,
+}
+
+/// [`observe_batch_firing`] の結果が、TASK-13（IO-1）の既定値契約（既定
+/// [`IO1_SPEC_DEFAULT_BATCH_SIZE`] 件で発火し、その 1 件前までは滞留する）を
+/// 満たすかを照合する（REPAIR-12。[`ACCEPTANCE_TARGETS`] の 1 行目に対応）。
+fn check_default_batch_size(
+    observation: &BatchFiringObservation,
+) -> Result<(), Vec<AcceptanceMismatch>> {
+    const TARGET: &str = "TASK-13（IO-1・既定バッチサイズ）";
+    let mut mismatches = Vec::new();
+
+    if observation.effective_batch_size != IO1_SPEC_DEFAULT_BATCH_SIZE {
+        mismatches.push(AcceptanceMismatch {
+            target: TARGET,
+            field: "effective_batch_size",
+            expected: IO1_SPEC_DEFAULT_BATCH_SIZE.to_string(),
+            actual: observation.effective_batch_size.to_string(),
+        });
+    }
+    if observation.first_fire_at_push != Some(IO1_SPEC_DEFAULT_BATCH_SIZE) {
+        mismatches.push(AcceptanceMismatch {
+            target: TARGET,
+            field: "first_fire_at_push",
+            expected: format!("{:?}", Some(IO1_SPEC_DEFAULT_BATCH_SIZE)),
+            actual: format!("{:?}", observation.first_fire_at_push),
+        });
+    }
+    if observation.fired_len != Some(IO1_SPEC_DEFAULT_BATCH_SIZE) {
+        mismatches.push(AcceptanceMismatch {
+            target: TARGET,
+            field: "fired_len",
+            expected: format!("{:?}", Some(IO1_SPEC_DEFAULT_BATCH_SIZE)),
+            actual: format!("{:?}", observation.fired_len),
+        });
+    }
+    if observation.trigger != Some(BatchTrigger::SizeReached) {
+        mismatches.push(AcceptanceMismatch {
+            target: TARGET,
+            field: "trigger",
+            expected: format!("{:?}", Some(BatchTrigger::SizeReached)),
+            actual: format!("{:?}", observation.trigger),
+        });
+    }
+    let expected_buffered_before_fire = IO1_SPEC_DEFAULT_BATCH_SIZE - 1;
+    if observation.buffered_before_fire != expected_buffered_before_fire {
+        mismatches.push(AcceptanceMismatch {
+            target: TARGET,
+            field: "buffered_before_fire",
+            expected: expected_buffered_before_fire.to_string(),
+            actual: observation.buffered_before_fire.to_string(),
+        });
+    }
+
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(mismatches)
+    }
+}
+
+/// [`observe_batch_firing`] の結果が、TASK-13（IO-1）の「バッチサイズは
+/// 設定で変更可能で、設定した件数で発火する」契約を満たすかを照合する
+/// （REPAIR-12。[`ACCEPTANCE_TARGETS`] の 2 行目に対応。`requested` は
+/// [`BatchConfig::new`] に渡した設定値）。
+fn check_configured_batch_size(
+    requested: usize,
+    observation: &BatchFiringObservation,
+) -> Result<(), Vec<AcceptanceMismatch>> {
+    const TARGET: &str = "TASK-13（IO-1・設定可能なバッチサイズ）";
+    let mut mismatches = Vec::new();
+
+    if observation.effective_batch_size != requested {
+        mismatches.push(AcceptanceMismatch {
+            target: TARGET,
+            field: "effective_batch_size",
+            expected: requested.to_string(),
+            actual: observation.effective_batch_size.to_string(),
+        });
+    }
+    if observation.first_fire_at_push != Some(requested) {
+        mismatches.push(AcceptanceMismatch {
+            target: TARGET,
+            field: "first_fire_at_push",
+            expected: format!("{:?}", Some(requested)),
+            actual: format!("{:?}", observation.first_fire_at_push),
+        });
+    }
+    if observation.fired_len != Some(requested) {
+        mismatches.push(AcceptanceMismatch {
+            target: TARGET,
+            field: "fired_len",
+            expected: format!("{:?}", Some(requested)),
+            actual: format!("{:?}", observation.fired_len),
+        });
+    }
+    if observation.trigger != Some(BatchTrigger::SizeReached) {
+        mismatches.push(AcceptanceMismatch {
+            target: TARGET,
+            field: "trigger",
+            expected: format!("{:?}", Some(BatchTrigger::SizeReached)),
+            actual: format!("{:?}", observation.trigger),
+        });
+    }
+    let expected_buffered_before_fire = requested.saturating_sub(1);
+    if observation.buffered_before_fire != expected_buffered_before_fire {
+        mismatches.push(AcceptanceMismatch {
+            target: TARGET,
+            field: "buffered_before_fire",
+            expected: expected_buffered_before_fire.to_string(),
+            actual: observation.buffered_before_fire.to_string(),
+        });
+    }
+
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(mismatches)
+    }
+}
+
+/// TASK-13（IO-1）の既定バッチサイズ 64 が io の実 API（[`BatchConfig::default`]・
+/// [`BatchBuffer::push`]）の実効値として現れることを機械照合する（REPAIR-12・
+/// TASK-91.2。[`ACCEPTANCE_TARGETS`] の 1 行目「バッチサイズの既定値 64 が
+/// 設定の実効値に反映されること」に対応。TASK-13.1（#76）で公開された
+/// `BatchConfig`・`BatchBuffer` へ接続済み）。
+#[test]
+fn repair_12_io1_default_batch_size_is_64_in_effect() {
+    let observation = observe_batch_firing(BatchConfig::default(), 300);
+    assert_eq!(
+        check_default_batch_size(&observation),
+        Ok(()),
+        "観測結果: {observation:?}"
+    );
+}
+
+/// TASK-13（IO-1）のバッチサイズが設定で変更可能で、設定した件数で発火する
+/// ことを機械照合する（REPAIR-12・TASK-91.2。[`ACCEPTANCE_TARGETS`] の 2 行目
+/// に対応。スイープ点は PoC-12 の観測点（1・4・16・256）を使う）。
+#[test]
+fn repair_12_io1_configured_batch_size_is_honored() {
+    for requested in [1usize, 4, 16, 256] {
+        let config = BatchConfig::new(requested)
+            .unwrap_or_else(|err| panic!("batch_size={requested} must be accepted: {err:?}"));
+        let observation = observe_batch_firing(config, 300);
+        assert_eq!(
+            check_configured_batch_size(requested, &observation),
+            Ok(()),
+            "batch_size={requested} の観測結果: {observation:?}"
+        );
+    }
+
+    // 設定可能の定義域外（0 件バッチ）は IoErrorCode::InvalidArgument で
+    // 拒否される（IO-1・REPAIR-2）。上限値（crates/io/src/batch.rs の
+    // MAX_BATCH_SIZE）は実装側の暫定値（REPAIR-3）で spec の根拠を持たない
+    // ため、ここでは照合しない。
+    let err = BatchConfig::new(0).expect_err("batch_size=0 must be rejected");
+    assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+}
+
+/// [`check_default_batch_size`] が「ビルドは通るが仕様未達」の失敗モード
+/// （REPAIR-12: `DEFAULT_BATCH_SIZE` 定数は 64 のまま残しつつ
+/// `impl Default for BatchConfig` だけが 32 件で発火する回帰）を、具体的な
+/// 差分（expected 64 / actual 32 等）として検出できることを確認する
+/// （TASK-91.2 の受け入れ条件「照合が仕様違反を検出できるかを確かめる」を
+/// 常設の固定テストとして担保する。`crates/io/src/batch.rs` を実際に
+/// 差し替えての手動確認は PR の Test plan に記録する）。
+#[test]
+fn repair_12_io1_default_batch_check_detects_non_compliant_impl() {
+    let non_compliant = BatchFiringObservation {
+        effective_batch_size: 32,
+        first_fire_at_push: Some(32),
+        fired_len: Some(32),
+        trigger: Some(BatchTrigger::SizeReached),
+        buffered_before_fire: 31,
+    };
+
+    let mismatches =
+        check_default_batch_size(&non_compliant).expect_err("32 件発火は仕様違反のはず");
+
+    assert_eq!(
+        mismatches,
+        vec![
+            AcceptanceMismatch {
+                target: "TASK-13（IO-1・既定バッチサイズ）",
+                field: "effective_batch_size",
+                expected: "64".to_string(),
+                actual: "32".to_string(),
+            },
+            AcceptanceMismatch {
+                target: "TASK-13（IO-1・既定バッチサイズ）",
+                field: "first_fire_at_push",
+                expected: "Some(64)".to_string(),
+                actual: "Some(32)".to_string(),
+            },
+            AcceptanceMismatch {
+                target: "TASK-13（IO-1・既定バッチサイズ）",
+                field: "fired_len",
+                expected: "Some(64)".to_string(),
+                actual: "Some(32)".to_string(),
+            },
+            AcceptanceMismatch {
+                target: "TASK-13（IO-1・既定バッチサイズ）",
+                field: "buffered_before_fire",
+                expected: "63".to_string(),
+                actual: "31".to_string(),
+            },
+        ]
+    );
+}
+
+/// [`check_configured_batch_size`] が「設定値 +1 件で発火する」回帰
+/// （REPAIR-12: `BatchBuffer::push` の件数到達判定を 1 件ずらす仕様違反）を、
+/// 具体的な差分として検出できることを確認する。
+#[test]
+fn repair_12_io1_configured_batch_check_detects_non_compliant_impl() {
+    let requested = 16usize;
+    let off_by_one = BatchFiringObservation {
+        effective_batch_size: requested,
+        first_fire_at_push: Some(requested + 1),
+        fired_len: Some(requested + 1),
+        trigger: Some(BatchTrigger::SizeReached),
+        buffered_before_fire: requested,
+    };
+
+    let mismatches = check_configured_batch_size(requested, &off_by_one)
+        .expect_err("設定値 +1 件での発火は仕様違反のはず");
+
+    assert_eq!(
+        mismatches,
+        vec![
+            AcceptanceMismatch {
+                target: "TASK-13（IO-1・設定可能なバッチサイズ）",
+                field: "first_fire_at_push",
+                expected: format!("{:?}", Some(requested)),
+                actual: format!("{:?}", Some(requested + 1)),
+            },
+            AcceptanceMismatch {
+                target: "TASK-13（IO-1・設定可能なバッチサイズ）",
+                field: "fired_len",
+                expected: format!("{:?}", Some(requested)),
+                actual: format!("{:?}", Some(requested + 1)),
+            },
+            AcceptanceMismatch {
+                target: "TASK-13（IO-1・設定可能なバッチサイズ）",
+                field: "buffered_before_fire",
+                expected: (requested - 1).to_string(),
+                actual: requested.to_string(),
+            },
+        ]
+    );
+}
+
 /// 本ファイル自身のソース（コンパイル時に埋め込む）。
 ///
 /// [`parse_doc_table`] がこの文字列からモジュールドキュメントの表
@@ -371,15 +752,23 @@ fn parse_doc_table(source: &str) -> Result<Vec<DocTableRow<'_>>, String> {
             other => return Err(format!("未知の照合方法列: {other:?}")),
         };
 
-        // `未接続（...）` の枠組みであることだけを構造チェックし、内部の
-        // 文言（`planned_task` 部分より後ろも含む）は分解せずに `status_text`
-        // をセル全体としてそのまま保持する（枠組み自体が崩れている行は
-        // 表の書式異常として拒否する。中身の文言比較は呼び出し元が
-        // `status_text` を丸ごと [`AcceptanceTarget`] と突き合わせて行う）。
-        status_text
+        // `未接続（...）` / `接続済み（...）`（TASK-91.2 で追加）のいずれかの
+        // 枠組みであることだけを構造チェックし、内部の文言（`planned_task`
+        // 部分より後ろも含む）は分解せずに `status_text` をセル全体として
+        // そのまま保持する（枠組み自体が崩れている行は表の書式異常として
+        // 拒否する。中身の文言比較は呼び出し元が `status_text` を丸ごと
+        // [`AcceptanceTarget`] と突き合わせて行う）。
+        let recognized_framework = status_text
             .strip_prefix("未接続（")
             .and_then(|rest| rest.strip_suffix('）'))
-            .ok_or_else(|| format!("未接続の状態列の形式が想定と異なる: {status_text:?}"))?;
+            .is_some()
+            || status_text
+                .strip_prefix("接続済み（")
+                .and_then(|rest| rest.strip_suffix('）'))
+                .is_some();
+        if !recognized_framework {
+            return Err(format!("状態列の形式が想定と異なる: {status_text:?}"));
+        }
 
         rows.push(DocTableRow {
             task,
@@ -1152,7 +1541,7 @@ fn compare_targets_with_doc_table(
                 target.task, row.method, target.method
             ));
         }
-        let TargetStatus::NotWired { text } = target.status;
+        let text = target.status.cell_text();
         if text != row.status {
             return Err(format!(
                 "{}: status の不一致（表 vs データ。状態欄全体を比較）: {:?} vs {:?}",
@@ -1176,7 +1565,7 @@ fn compare_targets_with_doc_table(
 /// （[`compare_targets_with_doc_table`] に実装を委譲）。
 #[test]
 fn repair_12_acceptance_targets_are_listed() {
-    assert_eq!(ACCEPTANCE_TARGETS.len(), 6);
+    assert_eq!(ACCEPTANCE_TARGETS.len(), 7);
 
     compare_targets_with_doc_table(SOURCE, ACCEPTANCE_TARGETS)
         .expect("表と ACCEPTANCE_TARGETS の内容が一致しない");
@@ -1220,19 +1609,22 @@ fn find_doc_table_line<'a>(source: &'a str, task: &str) -> &'a str {
 /// [coding-rust]: ../../../.claude/rules/coding-rust.md
 #[test]
 fn repair_12_doc_table_column_mismatch_is_detected() {
-    let task = "TASK-13";
+    // TASK-91.2 で TASK-13 が 2 行になったため（[`find_doc_table_line`] は
+    // 最初に一致した行を返す）、5 列すべての書き換え対象は未接続のまま残る
+    // TASK-16 行に移す（TASK-13 のどちらの行にも影響しない）。
+    let task = "TASK-16";
     let original_line = find_doc_table_line(SOURCE, task);
 
     // (説明, 書き換え前の部分文字列, 書き換え後の部分文字列, エラーメッセージに
     // 含まれるべき列名の手がかり)。各部分文字列は `original_line` 内に
     // ちょうど 1 回だけ現れるものを選び、対象外の列を巻き込まないようにする。
     let cases: &[(&str, &str, &str, &str)] = &[
-        ("task 列", "| TASK-13 |", "| TASK-13X |", "task の不一致"),
-        ("behavior 列", "IO-1", "IO-1X", "behavior の不一致"),
+        ("task 列", "| TASK-16 |", "| TASK-16X |", "task の不一致"),
+        ("behavior 列", "IO-10", "IO-10X", "behavior の不一致"),
         (
             "spec_fact 列",
-            "既定値 64",
-            "既定値 65",
+            "flush_every=<N>",
+            "flush_every=<M>",
             "spec_fact の不一致",
         ),
         (
@@ -1243,8 +1635,8 @@ fn repair_12_doc_table_column_mismatch_is_detected() {
         ),
         (
             "status 列",
-            "未接続（TASK-13 で接続）",
-            "未接続（TASK-13 で接続しない）",
+            "未接続（TASK-16 で接続）",
+            "未接続（TASK-16 で接続しない）",
             "status の不一致",
         ),
     ];
@@ -1278,4 +1670,30 @@ fn repair_12_doc_table_column_mismatch_is_detected() {
                 になっていない: {err}"
         );
     }
+
+    // 接続済み（`Wired`）行の状態欄を書き換えた場合も不一致として検出できる
+    // ことを確認する（TASK-91.2 で追加。`find_doc_table_line` は TASK-13 の
+    // 2 行のうち最初の行〔既定バッチサイズの行〕を返す）。
+    let wired_task = "TASK-13";
+    let wired_original_line = find_doc_table_line(SOURCE, wired_task);
+    let wired_from = "接続済み（TASK-13.1 公開 API）";
+    let wired_to = "未接続（TASK-13.1 公開 API）";
+    assert!(
+        wired_original_line.contains(wired_from),
+        "接続済み行の書き換え対象の文言が見つからない: {wired_from:?}（行: {wired_original_line:?}）"
+    );
+
+    let wired_mutated_line = wired_original_line.replacen(wired_from, wired_to, 1);
+    let wired_mutated_source = SOURCE.replacen(wired_original_line, &wired_mutated_line, 1);
+    assert_ne!(
+        wired_mutated_source, SOURCE,
+        "接続済み行の書き換えでソース全体が変化していない"
+    );
+
+    let err = compare_targets_with_doc_table(&wired_mutated_source, ACCEPTANCE_TARGETS)
+        .expect_err("接続済み行の状態欄を未接続に書き換えても不一致を検出できていない");
+    assert!(
+        err.contains("status の不一致"),
+        "接続済み行の書き換えの不一致原因が status になっていない: {err}"
+    );
 }

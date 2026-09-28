@@ -22,11 +22,15 @@
 //! [`ReceiveLimits::admit`] のドキュメンテーションコメント参照）。
 //!
 //! # 呼び出し文脈
-//! TASK-13.2.1（#820）が新設する予定の UDS 受信ループが、[`crate::protocol::Frame`]
-//! を復元する際に `FrameHeader::from_bytes` → [`ReceiveLimits::admit`] →
-//! [`AdmittedHeader::allocate_body`] → 本体の読み込み →
-//! [`AdmittedHeader::decode_body`] → [`crate::batch::BatchBuffer::push`] の順に
-//! 呼ぶ想定（TASK-13.2.2・#822 が実際の配線を行う）。
+//! TASK-13.2.1（#820）が実装した UDS 受信ループ（`crates/io/src/server.rs` の
+//! `imp::ConnectionInner::recv_frame`）が、[`crate::protocol::Frame`] を復元する際に
+//! `FrameHeader::from_bytes` → [`ReceiveLimits::admit`] → 本体の読み込み
+//! （検証済みの [`AdmittedHeader::body_len`] を上限に少しずつ確保する。
+//! `server.rs` の `read_body_until` のドキュメンテーションコメント参照） →
+//! `AdmittedHeader::decode_body_owned`（[`AdmittedHeader::decode_body`] の
+//! 所有権を受け取る変種。本体を複製しない）の順に呼ぶ。[`crate::batch::BatchBuffer::push`]
+//! との配線（受理した `Write` フレームをバッチへ積む経路）は TASK-13.2.2・#822 が
+//! 行う。
 //!
 //! # なぜ `server.rs` ではなく独立モジュールか
 //! spec（`05-tasks.md` TASK-13）上の成果物名は `server.rs` だが、
@@ -58,7 +62,9 @@
 //! # スコープ外（TASK-13 の兄弟 sub-issue・後続タスクが担う）
 //! - `std::io::Read` / UDS のストリーム読みループ本体・読み取りタイムアウト
 //!   （REPAIR-5）・サーバー側で `Ack` / `FlushAck` を受信した場合の拒否
-//!   （TASK-13.2.1・#820）
+//!   （TASK-13.2.1・#820。`crates/io/src/server.rs` の
+//!   `imp::reject_client_originated_response_frame` が、本モジュールの
+//!   [`ReceiveLimits::admit`] より前・本体バッファ確保より前に拒否する）
 //! - 準備完了バッチ件数の実配線・ディスク書き込み・ACK 返却（TASK-13.2.2・#822）
 //! - CLI / 設定からの上限値の配線（TASK-13.3・#78）
 //! - 複数接続を跨いだ累積バイト数・未フラッシュ滞留量の上限（IO-10・TASK-16）
@@ -340,12 +346,21 @@ impl AdmittedHeader {
         self.header.body_len()
     }
 
-    /// 申告長ぶんの本体（ペイロード + チェックサム）バッファをゼロ埋めで確保する
-    /// （デコード経路で本体バッファを確保する唯一の箇所。`protocol.rs` の
+    /// 申告長ぶんの本体（ペイロード + チェックサム）バッファをゼロ埋めで一括
+    /// 確保する（一括確保する経路はここに集約する。`protocol.rs` の
     /// `copy_validated_payload` と同じ「確保箇所を 1 か所に集約する」パターン。
     /// `#[cfg(test)]` のときだけスレッドローカルの記録器〔確保回数・最後の
     /// 長さ〕を更新し、拒否テストで確保が起きていないことを機械的に確認できる
     /// ようにする）。
+    ///
+    /// # 「確保量の上限」の出どころ（B1・#820 レビュー指摘。security P2）
+    /// 確保量の上限は、[`ReceiveLimits::admit`] を通過した本型（[`AdmittedHeader`]）
+    /// からしか得られない。一括で確保する経路は本メソッドを使い、相手が遅い
+    /// 場合でも接続 1 本あたりの瞬間的なメモリ使用量を抑えたい分割読みの経路
+    /// （`crates/io/src/server.rs` の `read_body_until`）は本メソッドを経由せず
+    /// [`Self::body_len`] を読み取りの上限として使う。どちらの経路も
+    /// `AdmittedHeader` を経由しない長さを確保量へ用いてはならない、という
+    /// 契約は共通である。
     pub fn allocate_body(&self) -> Vec<u8> {
         let len = self.body_len();
         #[cfg(test)]
@@ -358,6 +373,16 @@ impl AdmittedHeader {
     /// 迂回しない。
     pub fn decode_body(self, body: &[u8]) -> Result<Frame, IoError> {
         Frame::decode_body(self.header, body)
+    }
+
+    /// [`Self::decode_body`] の所有権を受け取る変種（`Frame::decode_body_owned`
+    /// への薄い委譲。REPAIR-2・IO-1・#820）。読み込んだ本体の領域をそのまま
+    /// ペイロードとして再利用し、複製しない。UDS 受信経路
+    /// （`crates/io/src/server.rs` の `imp::ConnectionInner::recv_frame`）が使う。
+    /// Linux / macOS 以外では UDS 受信経路がスタブのため未使用になる。
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    pub(crate) fn decode_body_owned(self, body: Vec<u8>) -> Result<Frame, IoError> {
+        Frame::decode_body_owned(self.header, body)
     }
 }
 

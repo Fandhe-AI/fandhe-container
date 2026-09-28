@@ -7,8 +7,12 @@
 //! パイプライン送信クライアントの送信キュー（[`client::SendQueue`]・
 //! [`client::PipelineClient`]。TASK-12.1・#73）と、送信イベントを記録する観測フック
 //! （[`observe`]。TASK-12.1・#73 codex 指摘対応。REPAIR-4・REPAIR-5）を持つ。
-//! トランスポートの具象実装（UDS・vsock・named pipe 等）・
-//! ディスク書き込みはまだない（REPAIR-3。スタブの明示）。
+//! トランスポートの具象実装のうち、UDS のサーバー側（Linux / macOS）は
+//! TASK-13.2.1（#820）で実装済み（[`server::UdsServer`]・
+//! [`server::UdsConnection`]。accept・送受信のイベントは
+//! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS 接続
+//! （TASK-13.2.2・#822）・vsock・named pipe・ディスク書き込みはまだない
+//! （REPAIR-3。スタブの明示）。
 //! [`protocol::Frame`] のペイロード内部レイアウト（request id・ACK の対応付け）は
 //! [`payload`] モジュール（TASK-12.2・#74）が定める。[`client::PipelineClient::send`]
 //! はこの形式で request id を埋め込み、[`client::PipelineClient::recv_ack`]
@@ -34,6 +38,8 @@ pub mod observe;
 pub mod payload;
 pub mod protocol;
 pub mod recv_limits;
+pub mod server;
+mod sys;
 pub mod transport;
 
 pub use batch::{
@@ -47,8 +53,10 @@ pub use client::{
 pub use error::{IoError, IoErrorCode};
 pub use observe::{
     AckEvent, AckEventError, DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver,
-    MAX_SEND_LOG_BUFFER_BYTES, MAX_SEND_LOG_CAPACITY, MAX_SEND_LOG_MESSAGE_BYTES, NoopSendObserver,
-    SendEvent, SendEventError, SendObserver,
+    JsonLinesServerObserver, MAX_SEND_LOG_BUFFER_BYTES, MAX_SEND_LOG_CAPACITY,
+    MAX_SEND_LOG_MESSAGE_BYTES, MAX_SERVER_AUDIT_LOG_BUFFER_BYTES, NoopSendObserver,
+    NoopServerObserver, SERVER_AUDIT_LOG_CAPACITY, SendEvent, SendEventError, SendObserver,
+    ServerEvent, ServerObserver, ServerOp, ServerOutcome,
 };
 pub use payload::{
     ACK_PAYLOAD_LEN, AckEnvelope, MAX_WRITE_BODY_LEN, REQUEST_ID_WIRE_LEN, RequestEnvelope,
@@ -61,6 +69,7 @@ pub use protocol::{
 pub use recv_limits::{
     AdmittedHeader, MAX_CONTROL_PAYLOAD_LEN, MAX_RECV_PENDING_FRAMES, ReceiveLimits,
 };
+pub use server::{UdsConnection, UdsServer};
 pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, WireFrame,
 };

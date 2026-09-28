@@ -20,12 +20,14 @@ pub enum IoErrorCode {
     /// 相手の応答待ちが上限時間を超えた（REPAIR-5）。
     ///
     /// spec `error-format.md` の ERR-3 対応表の `DEADLINE_EXCEEDED` に当たる。ERR-1・
-    /// ERR-5 と I/O 共有プロトコルの `code` 文字列では `TIMEOUT` と表記する（同表の注記）。
+    /// ERR-5 と I/O 共有プロトコルの `code` 文字列では `TIMEOUT` と表記する（同表の注記。
+    /// ACK 待ち〔TASK-12〕・UDS の受付と送受信〔TASK-13.2.1〕の期限超過で返す。MS-1）。
     Timeout,
     /// 接続断・相手不在（トランスポートがすでに閉じている）。
     ///
     /// spec `error-format.md` の ERR-3 対応表の `UNAVAILABLE`。接続し直せば回復し得る
-    /// 状態を表し、`InvalidArgument`（要求内容の誤り）とは区別する。
+    /// 状態を表し、`InvalidArgument`（要求内容の誤り）とは区別する（相手が閉じた接続・
+    /// エラー後に失効した接続の再使用で返す。TASK-12・TASK-13.2.1・MS-1）。
     Unavailable,
     /// 未実装。
     Unimplemented,

@@ -143,6 +143,18 @@ impl fmt::Debug for SendEventError<'_> {
 pub struct AckEvent<'a> {
     /// [`AckOutcome`]（成功・各拒否理由・トランスポート失敗）。
     pub outcome: AckOutcome,
+    /// 受信・デコード済みの ACK フレーム種別（[`FrameKind::Ack`] は IO-1 の
+    /// バッファリング保証、[`FrameKind::FlushAck`] は IO-2 の永続化保証に対応する。
+    /// `PipelineClient::recv_ack` のドキュメント「IO-1・IO-2 の保証範囲の違い」
+    /// 参照）。`crate::payload::decode_ack` がフレームを検証する前の早期拒否
+    /// （[`AckOutcome::RejectedPoisoned`]・[`AckOutcome::RejectedNoInFlight`]・
+    /// [`AckOutcome::TransportFailure`]・[`AckOutcome::RejectedInvalidPayload`]）
+    /// では種別が確定していないため `None` になる。それ以外（送信順照合以降の
+    /// 分岐・成功）は必ず `Some` になる（TASK-12.2・#74 codex P1 再指摘対応。
+    /// IO-1・IO-2・REPAIR-4:
+    /// 通常のバッファリング ACK と永続化保証の FlushAck を構造化ログ／観測
+    /// イベントから区別できるようにする）。
+    pub ack_kind: Option<FrameKind>,
     /// `receiver.recv_frame` を実際に呼び出した呼び出しの所要時間。早期拒否
     /// （`receiver` を呼ばない分岐）の場合は `Duration::ZERO`
     /// （[`crate::client::AckMetrics`] と同じ扱い）。
@@ -157,6 +169,7 @@ impl fmt::Debug for AckEvent<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AckEvent")
             .field("outcome", &self.outcome)
+            .field("ack_kind", &self.ack_kind)
             .field("latency", &self.latency)
             .field("error", &self.error)
             .finish()
@@ -222,12 +235,18 @@ pub trait SendObserver: Send {
     /// REPAIR-4）。`event` は呼び出し中のみ有効な借用（[`AckEvent`] のドキュメント
     /// 参照）。
     ///
-    /// 既定実装は何もしない。[`on_send`](Self::on_send) と異なり必須にしない
-    /// 理由: `SendObserver` 実装は本トレイトが `on_ack` を追加する以前から
-    /// 存在し、既定実装を用意することで既存の実装（本 crate 外のものを含む）を
-    /// 壊さずに ACK 受信の観測を追加できる。ACK を観測したい実装は本メソッドを
-    /// 明示的にオーバーライドする（[`JsonLinesSendObserver`] を参照）。
-    fn on_ack(&mut self, _event: &AckEvent<'_>) {}
+    /// # 既定実装を持たない理由（#74 P1 再指摘対応）
+    ///
+    /// 過去のリビジョンは本メソッドに no-op の既定実装を用意していたが、
+    /// `on_send` のみを実装した既存の観測フックへ暗黙に `PipelineClient` を
+    /// 渡すと `recv_ack` の成功・失敗イベントが無言で失われ、AGENTS.md の
+    /// 可観測性要件（REPAIR-4）を満たせなくなる（ACK 観測の欠落を呼び出し元が
+    /// 検知する手段がなかった）。本 crate 内の実装（[`NoopSendObserver`]・
+    /// [`JsonLinesSendObserver`]）はいずれも本メソッドを明示的に実装しており、
+    /// コンパイル時にオーバーライド漏れを検出できる本方式のほうが安全側
+    /// （fail-closed）である。観測を意図的に不要とする実装は
+    /// [`NoopSendObserver`] のように本体を空にして明示する。
+    fn on_ack(&mut self, event: &AckEvent<'_>);
 }
 
 /// 何もしない実装（観測しない場合に呼び出し元が
@@ -239,6 +258,8 @@ pub struct NoopSendObserver;
 
 impl SendObserver for NoopSendObserver {
     fn on_send(&mut self, _event: &SendEvent<'_>) {}
+
+    fn on_ack(&mut self, _event: &AckEvent<'_>) {}
 }
 
 /// [`JsonLinesSendObserver::new`]（既定容量）が使う、ためられる JSON 行数の既定値
@@ -610,11 +631,29 @@ fn ack_outcome_reason_str(outcome: AckOutcome) -> &'static str {
 /// `event` フィールドは `io_send` と区別するため `"io_recv_ack"` を使う。
 /// フレーム種別（`kind`）は持たない（`recv_ack` はキューの先頭と対応付けるまで
 /// 送信時の種別が確定しないため。[`AckEvent`] のドキュメント参照）。
+/// `event.ack_kind` から `"ack_kind":"ACK",`／`"ack_kind":"FLUSH_ACK",` の
+/// 先頭カンマなし・末尾カンマありの断片を組み立てる（[`encode_ack_event`] 用の
+/// 共通処理。TASK-12.2・#74 codex P1 再指摘対応。IO-1・IO-2・REPAIR-4）。
+///
+/// `decode_ack` 前の早期拒否では種別が確定しない（[`AckEvent::ack_kind`] の
+/// ドキュメント参照）ため `None` の場合はフィールド自体を省く（空文字列を返す）。
+fn ack_kind_json_fragment(ack_kind: Option<FrameKind>) -> String {
+    match ack_kind {
+        Some(kind) => format!("\"ack_kind\":\"{}\",", frame_kind_str(kind)),
+        None => String::new(),
+    }
+}
+
+/// [`AckEvent`] を 1 行の JSON Lines 文字列へエンコードする（改行は含まない。
+/// [`encode_send_event`] の ACK 版。TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
 fn encode_ack_event(event: &AckEvent<'_>) -> String {
     let latency_us = event.latency.as_micros();
+    let ack_kind = ack_kind_json_fragment(event.ack_kind);
     match (&event.outcome, &event.error) {
         (AckOutcome::Success, _) => {
-            format!("{{\"event\":\"io_recv_ack\",\"outcome\":\"ok\",\"latency_us\":{latency_us}}}")
+            format!(
+                "{{\"event\":\"io_recv_ack\",{ack_kind}\"outcome\":\"ok\",\"latency_us\":{latency_us}}}"
+            )
         }
         (outcome, Some(error)) => {
             let reason = ack_outcome_reason_str(*outcome);
@@ -623,13 +662,13 @@ fn encode_ack_event(event: &AckEvent<'_>) -> String {
             let message = escape_json_string(truncated_message);
             if truncated {
                 format!(
-                    "{{\"event\":\"io_recv_ack\",\"outcome\":\"error\",\
+                    "{{\"event\":\"io_recv_ack\",{ack_kind}\"outcome\":\"error\",\
                      \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
                      \"message_truncated\":true,\"latency_us\":{latency_us}}}"
                 )
             } else {
                 format!(
-                    "{{\"event\":\"io_recv_ack\",\"outcome\":\"error\",\
+                    "{{\"event\":\"io_recv_ack\",{ack_kind}\"outcome\":\"error\",\
                      \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
                      \"latency_us\":{latency_us}}}"
                 )
@@ -642,7 +681,7 @@ fn encode_ack_event(event: &AckEvent<'_>) -> String {
             // 同じフォールバック方針）。
             let reason = ack_outcome_reason_str(*outcome);
             format!(
-                "{{\"event\":\"io_recv_ack\",\"outcome\":\"error\",\
+                "{{\"event\":\"io_recv_ack\",{ack_kind}\"outcome\":\"error\",\
                  \"reason\":\"{reason}\",\"latency_us\":{latency_us}}}"
             )
         }
@@ -1039,6 +1078,71 @@ mod tests {
             "encoded line ({} bytes) must fit within MAX_SEND_LOG_LINE_BYTES ({} bytes)",
             encoded.len(),
             MAX_SEND_LOG_LINE_BYTES
+        );
+    }
+
+    /// TASK-12.2・#74 codex P1 再指摘対応（IO-1・IO-2・REPAIR-4）: 成功した
+    /// [`FrameKind::Ack`] の受信は `ack_kind":"ACK"` を含み、通常のバッファリング
+    /// ACK であることが構造化ログから判別できる。
+    #[test]
+    fn repair4_encode_ack_event_success_includes_ack_kind() {
+        let event = AckEvent {
+            outcome: AckOutcome::Success,
+            ack_kind: Some(FrameKind::Ack),
+            latency: Duration::from_micros(42),
+            error: None,
+        };
+
+        assert_eq!(
+            encode_ack_event(&event),
+            "{\"event\":\"io_recv_ack\",\"ack_kind\":\"ACK\",\"outcome\":\"ok\",\"latency_us\":42}"
+        );
+    }
+
+    /// TASK-12.2・#74 codex P1 再指摘対応（IO-1・IO-2・REPAIR-4）: 成功した
+    /// [`FrameKind::FlushAck`] の受信は `ack_kind":"FLUSH_ACK"` を含み、通常の
+    /// ACK（IO-1）と永続化保証の FlushAck（IO-2）が構造化ログ上で区別できる。
+    #[test]
+    fn repair4_encode_ack_event_success_distinguishes_flush_ack() {
+        let event = AckEvent {
+            outcome: AckOutcome::Success,
+            ack_kind: Some(FrameKind::FlushAck),
+            latency: Duration::from_micros(7),
+            error: None,
+        };
+
+        assert_eq!(
+            encode_ack_event(&event),
+            "{\"event\":\"io_recv_ack\",\"ack_kind\":\"FLUSH_ACK\",\"outcome\":\"ok\",\"latency_us\":7}"
+        );
+    }
+
+    /// TASK-12.2・#74 codex P1 再指摘対応（IO-1・IO-2・REPAIR-4）: `decode_ack`
+    /// 前の早期拒否（`ack_kind: None`）は種別が確定していないため `ack_kind`
+    /// フィールド自体を出力しない（[`AckEvent::ack_kind`] のドキュメント参照）。
+    #[test]
+    fn repair4_encode_ack_event_early_reject_omits_ack_kind() {
+        let message = "recv_ack called with no in-flight requests to match against";
+        let event = AckEvent {
+            outcome: AckOutcome::RejectedNoInFlight,
+            ack_kind: None,
+            latency: Duration::ZERO,
+            error: Some(AckEventError {
+                code: IoErrorCode::InvalidArgument,
+                message,
+            }),
+        };
+
+        let encoded = encode_ack_event(&event);
+        assert!(
+            !encoded.contains("\"ack_kind\""),
+            "early-reject events must omit ack_kind entirely: {encoded}"
+        );
+        assert_eq!(
+            encoded,
+            "{\"event\":\"io_recv_ack\",\"outcome\":\"error\",\"reason\":\"rejected_no_in_flight\",\
+             \"code\":\"INVALID_ARGUMENT\",\"message\":\"recv_ack called with no in-flight \
+             requests to match against\",\"latency_us\":0}"
         );
     }
 }

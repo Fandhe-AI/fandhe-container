@@ -1262,10 +1262,21 @@ where
     /// [`Self::notify`]（送信側）と対になる ACK 受信側の入口。`err.message()` を
     /// 借用のまま [`AckEventError::message`] へ渡し、複製しない
     /// （[`SendEvent`]・[`AckEvent`] のドキュメント参照）。
-    fn notify_ack(&mut self, outcome: AckOutcome, latency: Duration, err: &IoError) {
+    ///
+    /// `ack_kind` は呼び出し元が `crate::payload::decode_ack` で復号済みの種別を
+    /// 渡す（未復号の早期拒否では `None`。[`AckEvent::ack_kind`] のドキュメント
+    /// 参照。TASK-12.2・#74 codex P1 再指摘対応。IO-1・IO-2・REPAIR-4）。
+    fn notify_ack(
+        &mut self,
+        outcome: AckOutcome,
+        ack_kind: Option<FrameKind>,
+        latency: Duration,
+        err: &IoError,
+    ) {
         self.ack_metrics.record(outcome, latency);
         self.observer.on_ack(&AckEvent {
             outcome,
+            ack_kind,
             latency,
             error: Some(AckEventError {
                 code: err.code(),
@@ -1367,7 +1378,7 @@ where
                 IoErrorCode::Unavailable,
                 "pipeline client is poisoned after an ambiguous send failure; reconnect required",
             );
-            self.notify_ack(AckOutcome::RejectedPoisoned, Duration::ZERO, &err);
+            self.notify_ack(AckOutcome::RejectedPoisoned, None, Duration::ZERO, &err);
             return Err(err);
         }
         if self.queue.is_empty() {
@@ -1375,7 +1386,7 @@ where
                 IoErrorCode::InvalidArgument,
                 "recv_ack called with no in-flight requests to match against",
             );
-            self.notify_ack(AckOutcome::RejectedNoInFlight, Duration::ZERO, &err);
+            self.notify_ack(AckOutcome::RejectedNoInFlight, None, Duration::ZERO, &err);
             return Err(err);
         }
 
@@ -1389,7 +1400,7 @@ where
                 // だけ」という再試行の余地を残さない。
                 self.poisoned = true;
                 let elapsed = started_at.elapsed();
-                self.notify_ack(AckOutcome::TransportFailure, elapsed, &err);
+                self.notify_ack(AckOutcome::TransportFailure, None, elapsed, &err);
                 return Err(err);
             }
         };
@@ -1399,7 +1410,7 @@ where
             Err(err) => {
                 self.poisoned = true;
                 let elapsed = started_at.elapsed();
-                self.notify_ack(AckOutcome::RejectedInvalidPayload, elapsed, &err);
+                self.notify_ack(AckOutcome::RejectedInvalidPayload, None, elapsed, &err);
                 return Err(err);
             }
         };
@@ -1417,7 +1428,12 @@ where
                     IoErrorCode::Internal,
                     "in-flight queue became empty between the emptiness check and oldest() lookup",
                 );
-                self.notify_ack(AckOutcome::RejectedInternal, elapsed, &err);
+                self.notify_ack(
+                    AckOutcome::RejectedInternal,
+                    Some(ack.kind()),
+                    elapsed,
+                    &err,
+                );
                 return Err(err);
             }
         };
@@ -1451,7 +1467,7 @@ where
                 )
             };
             let err = IoError::new(IoErrorCode::InvalidArgument, message);
-            self.notify_ack(outcome, elapsed, &err);
+            self.notify_ack(outcome, Some(ack.kind()), elapsed, &err);
             return Err(err);
         }
 
@@ -1468,7 +1484,12 @@ where
                     IoErrorCode::Internal,
                     "in-flight request has a non-trackable frame kind; this must not happen",
                 );
-                self.notify_ack(AckOutcome::RejectedInternal, elapsed, &err);
+                self.notify_ack(
+                    AckOutcome::RejectedInternal,
+                    Some(ack.kind()),
+                    elapsed,
+                    &err,
+                );
                 return Err(err);
             }
         };
@@ -1484,7 +1505,12 @@ where
                     ack.kind()
                 ),
             );
-            self.notify_ack(AckOutcome::RejectedAckKindMismatch, elapsed, &err);
+            self.notify_ack(
+                AckOutcome::RejectedAckKindMismatch,
+                Some(ack.kind()),
+                elapsed,
+                &err,
+            );
             return Err(err);
         }
 
@@ -1492,7 +1518,12 @@ where
             Ok(released) => released,
             Err(err) => {
                 let elapsed = started_at.elapsed();
-                self.notify_ack(AckOutcome::RejectedInternal, elapsed, &err);
+                self.notify_ack(
+                    AckOutcome::RejectedInternal,
+                    Some(ack.kind()),
+                    elapsed,
+                    &err,
+                );
                 return Err(err);
             }
         };
@@ -1500,6 +1531,7 @@ where
         self.ack_metrics.record(AckOutcome::Success, elapsed);
         self.observer.on_ack(&AckEvent {
             outcome: AckOutcome::Success,
+            ack_kind: Some(ack.kind()),
             latency: elapsed,
             error: None,
         });
@@ -2380,6 +2412,8 @@ mod tests {
                 self.captured = Some((error.message.as_ptr() as usize, error.message.len()));
             }
         }
+
+        fn on_ack(&mut self, _event: &AckEvent<'_>) {}
     }
 
     /// 項目 E（#73 P0 再指摘対応。REPAIR-5・REPAIR-12）: `PipelineClient::notify`

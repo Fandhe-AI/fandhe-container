@@ -772,12 +772,16 @@ fn repair4_public_api_ack_metrics_and_observer_cover_success_and_early_reject_ou
         lines[0].contains("\"event\":\"io_recv_ack\"")
             && lines[0].contains("\"outcome\":\"error\"")
             && lines[0].contains("\"reason\":\"rejected_no_in_flight\"")
-            && lines[0].contains("\"latency_us\":0"),
+            && lines[0].contains("\"latency_us\":0")
+            // TASK-12.2・#74 codex P1 再指摘対応（IO-1・IO-2・REPAIR-4）: `decode_ack`
+            // 前の早期拒否は ACK 種別が確定していないため `ack_kind` フィールド
+            // 自体を持たない（`AckEvent::ack_kind` のドキュメント参照）。
+            && !lines[0].contains("\"ack_kind\""),
         "unexpected no-in-flight line: {}",
         lines[0]
     );
     assert!(
-        lines[1].starts_with("{\"event\":\"io_recv_ack\",\"outcome\":\"ok\",")
+        lines[1].starts_with("{\"event\":\"io_recv_ack\",\"ack_kind\":\"ACK\",\"outcome\":\"ok\",")
             && lines[1].ends_with('}'),
         "unexpected success line: {}",
         lines[1]
@@ -911,4 +915,9 @@ fn repair4_public_api_ack_observer_covers_protocol_violation_outcomes() {
     let lines = drain_ack_lines(client.observer_mut());
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("\"reason\":\"rejected_ack_kind_mismatch\""));
+    // TASK-12.2・#74 codex P1 再指摘対応（IO-1・IO-2・REPAIR-4）: 種別対応違反でも
+    // `decode_ack` は成功しているため、実際に受信した ACK 種別（`FLUSH_ACK`）が
+    // `ack_kind` として観測イベントに残る（送信時に期待した種別ではなく、届いた
+    // 種別を記録することで通常 ACK と FlushAck を区別できる）。
+    assert!(lines[0].contains("\"ack_kind\":\"FLUSH_ACK\""));
 }

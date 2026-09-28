@@ -42,14 +42,27 @@ use crate::error::{IoError, IoErrorCode};
 use crate::protocol::FrameKind;
 
 /// [`crate::client::PipelineClient::send`] 1 回分の送信イベント（TASK-12.1・#73
-/// codex 指摘対応。P1・REPAIR-4）。
+/// codex 指摘対応。P1・REPAIR-4・REPAIR-5 P0 再指摘対応）。
 ///
 /// [`crate::client::SendMetrics`] が集計している事象（結果種別・所要時間）と対応させ、
 /// 送信対象のフレーム種別・失敗時のエラー詳細も併せて持つ。将来フィールドを
 /// 追加できるよう `#[non_exhaustive]` にする（REPAIR-3）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # 借用型である理由（#73 P0 再指摘対応。REPAIR-5「不安全な設計」観点）
+///
+/// `error` の `message`（[`SendEventError::message`]）は呼び出し元
+/// （[`crate::client::PipelineClient::notify`]）がすでに保持している
+/// [`crate::error::IoError`] の内部文字列を借用するだけで、複製しない。
+/// [`SendObserver::on_send`] は `&SendEvent<'_>` を受け取る間だけ有効な借用で、
+/// 呼び出しが終われば無効になる（`'static` としてどこかへ保持できない）。
+/// 上限確認前に複製すると、untrusted なトランスポート由来の巨大なメッセージが
+/// 送信のたびにヒープ確保を発生させ、送信経路自体の性能に無制限リソース
+/// 消費（DoS）の余地を生む。借用のままにすることで、実際にメモリへためる
+/// 判断（[`JsonLinesSendObserver`] の容量・バイト数上限）が下されるまで
+/// 複製を遅延できる。
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct SendEvent {
+pub struct SendEvent<'a> {
     /// この送信呼び出しが対象とした（呼び出し元が渡した）フレーム種別。
     /// `Ack`/`FlushAck` を拒否した場合もその種別をそのまま記録する。
     pub kind: FrameKind,
@@ -60,17 +73,57 @@ pub struct SendEvent {
     pub latency: Duration,
     /// `outcome` が失敗系だった場合の詳細（エラーコード・メッセージ）。
     /// 成功時は `None`。
-    pub error: Option<SendEventError>,
+    pub error: Option<SendEventError<'a>>,
+}
+
+/// 件数・破棄数等の要約のみを出す手書きの `Debug`。`message` は
+/// [`fmt::Debug`] for [`SendEventError`] へ委譲し、全量をダンプしない
+/// （#73 P0 再指摘対応）。
+impl fmt::Debug for SendEvent<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SendEvent")
+            .field("kind", &self.kind)
+            .field("outcome", &self.outcome)
+            .field("latency", &self.latency)
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 /// [`SendEvent::error`] が保持する失敗詳細（TASK-12.1・#73 codex 指摘対応。P1）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SendEventError {
+///
+/// # 借用は呼び出し中のみ有効（#73 P0 再指摘対応。REPAIR-5）
+///
+/// `message` は [`crate::error::IoError::message`] を複製せず借用する。
+/// untrusted な相手側（トランスポートの先）由来の文字列で、長さの上限はこの型
+/// 自体では設けていない。[`SendObserver::on_send`] の呼び出しが終わると
+/// この借用は無効になるため、`on_send` の実装が `message` を保持したい場合は、
+/// 呼び出し中に上限（[`MAX_SEND_LOG_MESSAGE_BYTES`] 等）を適用してからコピーする
+/// こと（[`JsonLinesSendObserver`] の実装を参照）。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SendEventError<'a> {
     /// 機械可読なエラーコード（ERR-1）。
     pub code: IoErrorCode,
     /// 人間可読なエラーメッセージ。トランスポート実装（untrusted な相手側）由来の
     /// 文字列を含みうるため、[`JsonLinesSendObserver`] は出力時にエスケープする。
-    pub message: String,
+    /// 借用の契約は本型のドキュメントを参照。
+    pub message: &'a str,
+}
+
+/// ためた `message` を無制限に出さないよう、長さと切り詰め済みの先頭のみを出す
+/// 手書きの `Debug`（#73 P0 再指摘対応。`{:?}` 経由で全量が出力される経路を防ぐ。
+/// [`truncate_message_bytes`] を再利用する）。
+impl fmt::Debug for SendEventError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (prefix, truncated) = truncate_message_bytes(self.message);
+        f.debug_struct("SendEventError")
+            .field("code", &self.code)
+            .field("message_len", &self.message.len())
+            .field("message_prefix", &prefix)
+            .field("message_truncated", &truncated)
+            .finish()
+    }
 }
 
 /// [`crate::client::PipelineClient::send`] の送信イベントを受け取る観測フック
@@ -93,8 +146,9 @@ pub struct SendEventError {
 /// の `#[derive(Debug)]` は `S: FrameSender` にも `Debug` を要求していないのと同じ
 /// 扱いで、`O: Debug` を実装した具象型のみが `PipelineClient` の `Debug` を使える）。
 pub trait SendObserver: Send {
-    /// 1 回の送信イベントを通知する。
-    fn on_send(&mut self, event: &SendEvent);
+    /// 1 回の送信イベントを通知する。`event` は呼び出し中のみ有効な借用
+    /// （[`SendEvent`] のドキュメント参照。#73 P0 再指摘対応）。
+    fn on_send(&mut self, event: &SendEvent<'_>);
 }
 
 /// 何もしない既定実装（観測フック未指定時に [`crate::client::PipelineClient::new`] が
@@ -103,7 +157,7 @@ pub trait SendObserver: Send {
 pub struct NoopSendObserver;
 
 impl SendObserver for NoopSendObserver {
-    fn on_send(&mut self, _event: &SendEvent) {}
+    fn on_send(&mut self, _event: &SendEvent<'_>) {}
 }
 
 /// [`JsonLinesSendObserver::new`]（既定容量）が使う、ためられる JSON 行数の既定値
@@ -113,6 +167,16 @@ pub const DEFAULT_SEND_LOG_CAPACITY: usize = 1024;
 /// [`JsonLinesSendObserver::with_capacity`] が受理する容量の最大値。無制限確保を
 /// 防ぐための上限（security.md「不安全な設計」観点）。
 pub const MAX_SEND_LOG_CAPACITY: usize = 65536;
+
+/// [`JsonLinesSendObserver::new`] は検証付きコンストラクタ（[`JsonLinesSendObserver::with_capacity`]）
+/// を経由しないため、[`DEFAULT_SEND_LOG_CAPACITY`] 自体が
+/// [`JsonLinesSendObserver::with_capacity`] の検証範囲（`1..=MAX_SEND_LOG_CAPACITY`）に
+/// 収まることをコンパイル時に保証する（初回レビュー Low 指摘対応。REPAIR-5）。
+const _: () = assert!(
+    DEFAULT_SEND_LOG_CAPACITY > 0 && DEFAULT_SEND_LOG_CAPACITY <= MAX_SEND_LOG_CAPACITY,
+    "DEFAULT_SEND_LOG_CAPACITY は with_capacity の検証範囲（1..=MAX_SEND_LOG_CAPACITY）を \
+     満たさなければならない"
+);
 
 /// [`SendEventError::message`] をエンコードする際に許容する最大バイト数
 /// （codex P0 再指摘対応。security.md「不安全な設計」観点）。
@@ -285,7 +349,7 @@ impl Default for JsonLinesSendObserver {
 }
 
 impl SendObserver for JsonLinesSendObserver {
-    fn on_send(&mut self, event: &SendEvent) {
+    fn on_send(&mut self, event: &SendEvent<'_>) {
         if self.lines.len() >= self.capacity {
             // 満杯時は新規イベントを破棄する（上記ドキュメント参照）。ここで
             // I/O は行わない（REPAIR-5）。
@@ -383,7 +447,7 @@ fn truncate_message_bytes(message: &str) -> (&str, bool) {
 }
 
 /// [`SendEvent`] を 1 行の JSON Lines 文字列へエンコードする（改行は含まない）。
-fn encode_send_event(event: &SendEvent) -> String {
+fn encode_send_event(event: &SendEvent<'_>) -> String {
     let latency_us = event.latency.as_micros();
     let kind = frame_kind_str(event.kind);
     match (&event.outcome, &event.error) {
@@ -395,7 +459,7 @@ fn encode_send_event(event: &SendEvent) -> String {
         (outcome, Some(error)) => {
             let reason = outcome_reason_str(*outcome);
             let code = error.code.as_str();
-            let (truncated_message, truncated) = truncate_message_bytes(&error.message);
+            let (truncated_message, truncated) = truncate_message_bytes(error.message);
             let message = escape_json_string(truncated_message);
             if truncated {
                 format!(
@@ -429,7 +493,7 @@ fn encode_send_event(event: &SendEvent) -> String {
 mod tests {
     use super::*;
 
-    fn success_event(latency_us: u64) -> SendEvent {
+    fn success_event(latency_us: u64) -> SendEvent<'static> {
         SendEvent {
             kind: FrameKind::Write,
             outcome: SendOutcome::Success,
@@ -438,21 +502,21 @@ mod tests {
         }
     }
 
+    // `message` の借用をそのまま `SendEvent` へ渡す（#73 P0 再指摘対応の借用型化
+    // 以降、テストヘルパーは所有型の値を返せない。呼び出し元が所有する文字列
+    // から借用する形にする）。
     fn failure_event(
         kind: FrameKind,
         outcome: SendOutcome,
         code: IoErrorCode,
         message: &str,
         latency_us: u64,
-    ) -> SendEvent {
+    ) -> SendEvent<'_> {
         SendEvent {
             kind,
             outcome,
             latency: Duration::from_micros(latency_us),
-            error: Some(SendEventError {
-                code,
-                message: message.to_string(),
-            }),
+            error: Some(SendEventError { code, message }),
         }
     }
 

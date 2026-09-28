@@ -60,6 +60,16 @@ pub const DEFAULT_IN_FLIGHT_LIMIT: usize = 64;
 /// 「不安全な設計」観点）として、`0` 件を含む検証は [`InFlightLimit::new`] が行う。
 pub const MAX_IN_FLIGHT_LIMIT: usize = 4096;
 
+/// `Default for InFlightLimit` は検証付きコンストラクタ（[`InFlightLimit::new`]）を
+/// 経由しないため、[`DEFAULT_IN_FLIGHT_LIMIT`] 自体が `InFlightLimit::new` の検証
+/// 範囲（`1..=MAX_IN_FLIGHT_LIMIT`）に収まることをコンパイル時に保証する
+/// （初回レビュー Low 指摘対応。REPAIR-5）。
+const _: () = assert!(
+    DEFAULT_IN_FLIGHT_LIMIT > 0 && DEFAULT_IN_FLIGHT_LIMIT <= MAX_IN_FLIGHT_LIMIT,
+    "DEFAULT_IN_FLIGHT_LIMIT は InFlightLimit::new の検証範囲（1..=MAX_IN_FLIGHT_LIMIT）を \
+     満たさなければならない"
+);
+
 /// 検証済みの未 ACK 件数上限（[`SendQueue`] の容量。IO-1・TASK-12.1）。
 ///
 /// フィールドは非公開で、[`Self::new`] を経由しない限り値を作れない
@@ -511,15 +521,18 @@ impl LatencyStats {
 
     /// 観測した所要時間の平均値を返す（未観測なら `None`）。
     ///
-    /// `count` は内部カウンタであり untrusted な入力ではないが、`u32` への
-    /// キャストで panic させないよう浮動小数点経由で計算する。
+    /// `count` は内部カウンタであり untrusted な入力ではないが、`Duration` の
+    /// 秒数換算は浮動小数点を経由するため、`total`（`saturating_add` で
+    /// 積算し続けた結果 `Duration::MAX` に達している）を極端に小さい `count`
+    /// で割った場合など、`Duration::from_secs_f64` なら panic しうる値
+    /// （NaN・負値・表現可能な範囲の超過）になりうる。[`Duration::try_from_secs_f64`]
+    /// で `Result` として扱い、変換できない場合は `None` を返す（panic 経路の
+    /// 除去。coding-rust「ライブラリコードでは `Result` を返し、panic させない」）。
     pub fn mean(&self) -> Option<Duration> {
         if self.count == 0 {
             return None;
         }
-        Some(Duration::from_secs_f64(
-            self.total.as_secs_f64() / self.count as f64,
-        ))
+        Duration::try_from_secs_f64(self.total.as_secs_f64() / self.count as f64).ok()
     }
 }
 
@@ -866,7 +879,13 @@ where
     }
 
     /// [`Self::send`] の各失敗分岐から共通で呼び、[`SendEvent`]（失敗詳細つき）を
-    /// [`Self::observer`] へ通知する（TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4）。
+    /// [`Self::observer`] へ通知する（TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4・
+    /// REPAIR-5 P0 再指摘対応）。
+    ///
+    /// `err.message()` を借用のまま [`SendEventError::message`] へ渡し、複製しない
+    /// （[`SendEvent`] のドキュメント参照）。呼び出し元（[`Self::send`]）はこの
+    /// 呼び出しが返ったあとに `err` を返すため、借用は `on_send` の呼び出し中に
+    /// 限られる契約と整合する。
     fn notify(&mut self, kind: FrameKind, outcome: SendOutcome, latency: Duration, err: &IoError) {
         self.observer.on_send(&SendEvent {
             kind,
@@ -874,7 +893,7 @@ where
             latency,
             error: Some(SendEventError {
                 code: err.code(),
-                message: err.message().to_string(),
+                message: err.message(),
             }),
         });
     }
@@ -931,8 +950,13 @@ mod tests {
         }
     }
 
-    /// テスト専用のモック sender。常に `Timeout` を返し、トランスポートへの
-    /// 書き込み失敗時にキューへ登録しないことを確認するために使う。
+    /// テスト専用のモック sender。常に `Timeout` を返す。
+    ///
+    /// 現行仕様（TASK-12.1・#73 codex 指摘対応）: `send_frame` が失敗しても
+    /// [`SendQueue::register`] はすでに送信前に id を確保済みのため、失敗した
+    /// リクエストの枠はキューに残ったまま回収されず、[`PipelineClient`] は
+    /// 失効（poison）して以降の送信をすべて拒否する（「登録しない」わけではなく
+    /// 「登録済みの枠を回収せずクライアントごと失効させる」）。
     #[derive(Debug, Default)]
     struct AlwaysTimeoutSender;
 
@@ -945,23 +969,26 @@ mod tests {
     }
 
     /// テスト専用のモック sender。最初の `send_frame` 呼び出しだけ `Timeout` を
-    /// 返し、以降は成功する。同一クライアント上で「失敗 → 成功」の連続を再現し、
-    /// 失敗した送信が id を消費していないことを確認するために使う。
+    /// 返し、以降は成功する実装だが、現行仕様（TASK-12.1・#73 codex 指摘対応）では
+    /// 1 回目の失敗で [`PipelineClient`] が失効（poison）するため、2 回目以降が
+    /// 実際に呼ばれることはない（失効後の送信はトランスポートへ届く前に拒否される。
+    /// `io1_pipeline_client_reserves_id_before_send_and_does_not_reuse_after_poison`
+    /// 参照）。1 回目の失敗で確保した id が、失効した接続をまたいで使い回されない
+    /// ことを確認するために使う。呼ばれない想定の 2 回目以降の送信内容は
+    /// 検証対象ではないため、送信済みフレームを記録するフィールドは持たない。
     #[derive(Debug, Default)]
     struct FailOnceSender {
         failed_once: bool,
-        sent: Vec<Frame>,
     }
 
     impl FrameSender for FailOnceSender {
         type Frame = Frame;
 
-        fn send_frame(&mut self, frame: &Self::Frame, _timeout: IoTimeout) -> Result<(), IoError> {
+        fn send_frame(&mut self, _frame: &Self::Frame, _timeout: IoTimeout) -> Result<(), IoError> {
             if !self.failed_once {
                 self.failed_once = true;
                 return Err(IoError::new(IoErrorCode::Timeout, "mock times out once"));
             }
-            self.sent.push(frame.clone());
             Ok(())
         }
     }

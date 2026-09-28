@@ -771,6 +771,13 @@ pub enum ServerOutcome {
     /// [`crate::server::UdsConnection`] が P1-3 により失効済み（poison 済み）で
     /// あるために拒否した（送受信自体をトランスポートへ渡さなかった早期拒否）。
     RejectedPoisoned,
+    /// [`ServerOp::Accept`] が、接続元の peer credential 検証
+    /// （PLUG-12・security.md）に失敗した接続を拒否した（H1・#820
+    /// security-auditor 指摘対応。SEC-4「分離違反の試行は監査ログに記録する」）。
+    /// この拒否 1 件ごとに個別のイベントとして通知され（`crate::server` モジュール
+    /// doc「peer credential の検証」節参照）、正常な接続が最終的に成立しても
+    /// それまでの拒否が記録から失われない。
+    RejectedPeerCredential,
     /// 上記以外の失敗（タイムアウト・プロトコル違反・`ReceiveLimits::admit` の
     /// 拒否・トランスポート層のエラー等）。
     Failure,
@@ -806,7 +813,27 @@ pub struct ServerEvent<'a> {
     /// 切断した）を再試行した回数。[`crate::server`] モジュール doc の
     /// 「受付ループの組み方」参照。[`ServerOp::Recv`]・[`ServerOp::Send`] では
     /// 常に `0`。
+    ///
+    /// peer credential の検証失敗による再試行（[`ServerOutcome::RejectedPeerCredential`]）
+    /// はこの件数には含めない。件数は [`Self::peer_credential_rejections`] で
+    /// 別に数える（H1・#820 security-auditor 指摘対応。`ConnectionAborted` は
+    /// 相手の都合による一時的な切断であり、peer credential の不一致は
+    /// SEC-4 の監査対象となる分離違反の試行であるため、混ぜずに区別する）。
     pub accept_aborted_retries: u32,
+    /// [`ServerOp::Accept`] が peer credential の検証失敗
+    /// （[`ServerOutcome::RejectedPeerCredential`]）により再試行した回数（H1・
+    /// #820 security-auditor 指摘対応）。個々の拒否は
+    /// [`ServerOutcome::RejectedPeerCredential`] のイベントとして 1 件ずつ
+    /// 通知され、この累積件数は最終的な Accept の成功・失敗イベントにも載る。
+    /// [`ServerOp::Recv`]・[`ServerOp::Send`] では常に `0`。
+    pub peer_credential_rejections: u32,
+    /// [`ServerOutcome::RejectedPeerCredential`] の拒否で、接続元の uid が
+    /// 取得できた場合の値（`crate::sys::peer_uid` が成功したが
+    /// `crate::sys::effective_uid` と不一致だった場合）。数値のみで秘密情報や
+    /// untrusted な文字列を含まないため、message とは独立してそのまま観測
+    /// イベントへ載せてよい（H1・#820 security-auditor 指摘対応）。取得自体に
+    /// 失敗した場合・他の `op`/`outcome` では `None`。
+    pub peer_uid: Option<u32>,
     /// `outcome` が失敗系だった場合の詳細（エラーコード・メッセージ）。
     /// 成功時は `None`。[`SendEventError`] のドキュメント参照（借用は
     /// `on_event` の呼び出し中のみ有効）。
@@ -823,6 +850,11 @@ impl fmt::Debug for ServerEvent<'_> {
             .field("outcome", &self.outcome)
             .field("latency", &self.latency)
             .field("accept_aborted_retries", &self.accept_aborted_retries)
+            .field(
+                "peer_credential_rejections",
+                &self.peer_credential_rejections,
+            )
+            .field("peer_uid", &self.peer_uid)
             .field("error", &self.error)
             .finish()
     }
@@ -876,13 +908,15 @@ impl ServerObserver for NoopServerObserver {
 
 /// [`ServerEvent`] の JSON エンコード時に固定で書き込む部分（`event`・`op`・
 /// `kind`・`outcome`・`reason`・`code`・`message_truncated`・
-/// `accept_aborted_retries`・`latency_us` のキー名・区切り文字・想定される値の
-/// 最大長）に見込む上限バイト数。[`SEND_LOG_LINE_FIXED_OVERHEAD_BYTES`] より、
-/// `op`（最大 `"\"op\":\"accept\","` 相当）・`accept_aborted_retries`（`u32` の
-/// 最大桁数 `4294967295`）ぶん余分に見積もる。[`MAX_SERVER_LOG_LINE_BYTES`] の
-/// 計算にのみ使う保守的な見積もりであり、実際のエンコード処理はこの値を直接
-/// 参照しない。
-const SERVER_LOG_LINE_FIXED_OVERHEAD_BYTES: usize = SEND_LOG_LINE_FIXED_OVERHEAD_BYTES + 128;
+/// `accept_aborted_retries`・`peer_credential_rejections`・`peer_uid`・
+/// `latency_us` のキー名・区切り文字・想定される値の最大長）に見込む上限
+/// バイト数。[`SEND_LOG_LINE_FIXED_OVERHEAD_BYTES`] より、`op`（最大
+/// `"\"op\":\"accept\","` 相当）・`accept_aborted_retries`・
+/// `peer_credential_rejections`・`peer_uid`（いずれも `u32` の最大桁数
+/// `4294967295`。H1・#820 security-auditor 指摘対応で追加）ぶん余分に見積もる。
+/// [`MAX_SERVER_LOG_LINE_BYTES`] の計算にのみ使う保守的な見積もりであり、
+/// 実際のエンコード処理はこの値を直接参照しない。
+const SERVER_LOG_LINE_FIXED_OVERHEAD_BYTES: usize = SEND_LOG_LINE_FIXED_OVERHEAD_BYTES + 256;
 
 /// [`JsonLinesServerObserver`] がためる 1 行の JSON がとりうる最大バイト数の
 /// 見積もり（[`MAX_SEND_LOG_LINE_BYTES`] のサーバー版）。
@@ -907,15 +941,20 @@ const _: () = assert!(
 /// 分ける理由がないため、既存の定数をそのまま再利用する）。
 ///
 /// 出力キーは [`JsonLinesSendObserver`] と共通の語彙に `op`・
-/// `accept_aborted_retries` を加えたもの: `event`（常に `"io_server"`）・
+/// `accept_aborted_retries`・`peer_credential_rejections`・`peer_uid` を
+/// 加えたもの: `event`（常に `"io_server"`）・
 /// `op`（`"accept"`/`"recv"`/`"send"`）・`kind`（`WRITE`/`ACK`/`FLUSH`/
 /// `FLUSH_ACK`。[`ServerEvent::kind`] が `None` の場合はキー自体を省く）・
 /// `outcome`（`"ok"`/`"error"`）・`reason`（失敗系のみ。[`ServerOutcome`] の
-/// snake_case 名。`rejected_poisoned` で P1-3 の poison 拒否を区別できる）・
+/// snake_case 名。`rejected_poisoned` で P1-3 の poison 拒否・
+/// `rejected_peer_credential` で peer credential 拒否〔H1・#820
+/// security-auditor 指摘対応〕を区別できる）・
 /// `code`（失敗系のみ・ERR-1 文字列）・`message`（失敗系のみ・切り詰め済み・
 /// エスケープ済み）・`message_truncated`（切り詰め発生時のみ `true`）・
-/// `accept_aborted_retries`（`u32`）・`latency_us`。フィールドの出力順は
-/// この記載順に固定する。
+/// `accept_aborted_retries`（`u32`）・`peer_credential_rejections`（`u32`。H1・
+/// #820）・`peer_uid`（`u32`。[`ServerEvent::peer_uid`] が `Some` の場合のみ
+/// キーを出す。H1・#820）・`latency_us`。フィールドの出力順はこの記載順に
+/// 固定する。
 ///
 /// # `on_event` は I/O をしない（REPAIR-5）
 /// [`JsonLinesSendObserver`] と同じ理由（そのドキュメント参照）で、
@@ -1014,6 +1053,7 @@ fn server_outcome_reason_str(outcome: ServerOutcome) -> &'static str {
     match outcome {
         ServerOutcome::Success => "success",
         ServerOutcome::RejectedPoisoned => "rejected_poisoned",
+        ServerOutcome::RejectedPeerCredential => "rejected_peer_credential",
         ServerOutcome::Failure => "failure",
     }
 }
@@ -1028,6 +1068,16 @@ fn server_kind_json_fragment(kind: Option<FrameKind>) -> String {
     }
 }
 
+/// `event.peer_uid` から `"peer_uid":123,` の先頭カンマなし・末尾カンマありの
+/// 断片を組み立てる（[`server_kind_json_fragment`] と同じパターン。`None` の
+/// 場合はフィールド自体を省く。H1・#820 security-auditor 指摘対応）。
+fn peer_uid_json_fragment(peer_uid: Option<u32>) -> String {
+    match peer_uid {
+        Some(uid) => format!("\"peer_uid\":{uid},"),
+        None => String::new(),
+    }
+}
+
 /// [`ServerEvent`] を 1 行の JSON Lines 文字列へエンコードする（改行は含まない。
 /// [`encode_send_event`] の UDS サーバー版。TASK-13.2.1・#820）。
 fn encode_server_event(event: &ServerEvent<'_>) -> String {
@@ -1035,11 +1085,15 @@ fn encode_server_event(event: &ServerEvent<'_>) -> String {
     let op = server_op_str(event.op);
     let kind = server_kind_json_fragment(event.kind);
     let retries = event.accept_aborted_retries;
+    let cred_rejections = event.peer_credential_rejections;
+    let peer_uid = peer_uid_json_fragment(event.peer_uid);
     match (&event.outcome, &event.error) {
         (ServerOutcome::Success, _) => {
             format!(
                 "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"ok\",\
-                 \"accept_aborted_retries\":{retries},\"latency_us\":{latency_us}}}"
+                 \"accept_aborted_retries\":{retries},\
+                 \"peer_credential_rejections\":{cred_rejections},{peer_uid}\
+                 \"latency_us\":{latency_us}}}"
             )
         }
         (outcome, Some(error)) => {
@@ -1052,13 +1106,16 @@ fn encode_server_event(event: &ServerEvent<'_>) -> String {
                     "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"error\",\
                      \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
                      \"message_truncated\":true,\"accept_aborted_retries\":{retries},\
+                     \"peer_credential_rejections\":{cred_rejections},{peer_uid}\
                      \"latency_us\":{latency_us}}}"
                 )
             } else {
                 format!(
                     "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"error\",\
                      \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
-                     \"accept_aborted_retries\":{retries},\"latency_us\":{latency_us}}}"
+                     \"accept_aborted_retries\":{retries},\
+                     \"peer_credential_rejections\":{cred_rejections},{peer_uid}\
+                     \"latency_us\":{latency_us}}}"
                 )
             }
         }
@@ -1071,6 +1128,7 @@ fn encode_server_event(event: &ServerEvent<'_>) -> String {
             format!(
                 "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"error\",\
                  \"reason\":\"{reason}\",\"accept_aborted_retries\":{retries},\
+                 \"peer_credential_rejections\":{cred_rejections},{peer_uid}\
                  \"latency_us\":{latency_us}}}"
             )
         }
@@ -1545,6 +1603,8 @@ mod tests {
             outcome: ServerOutcome::Success,
             latency: Duration::from_micros(10),
             accept_aborted_retries: 2,
+            peer_credential_rejections: 0,
+            peer_uid: None,
             error: None,
         };
 
@@ -1553,7 +1613,8 @@ mod tests {
         assert_eq!(
             encoded,
             "{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"ok\",\
-             \"accept_aborted_retries\":2,\"latency_us\":10}"
+             \"accept_aborted_retries\":2,\"peer_credential_rejections\":0,\
+             \"latency_us\":10}"
         );
     }
 
@@ -1570,6 +1631,8 @@ mod tests {
             outcome: ServerOutcome::Failure,
             latency: Duration::from_micros(5),
             accept_aborted_retries: 0,
+            peer_credential_rejections: 0,
+            peer_uid: None,
             error: Some(SendEventError {
                 code: IoErrorCode::InvalidArgument,
                 message,
@@ -1582,7 +1645,8 @@ mod tests {
             "{\"event\":\"io_server\",\"op\":\"recv\",\"kind\":\"ACK\",\"outcome\":\"error\",\
              \"reason\":\"failure\",\"code\":\"INVALID_ARGUMENT\",\
              \"message\":\"server does not accept client-originated response frames: Ack\",\
-             \"accept_aborted_retries\":0,\"latency_us\":5}"
+             \"accept_aborted_retries\":0,\"peer_credential_rejections\":0,\
+             \"latency_us\":5}"
         );
     }
 
@@ -1597,6 +1661,8 @@ mod tests {
             outcome: ServerOutcome::RejectedPoisoned,
             latency: Duration::ZERO,
             accept_aborted_retries: 0,
+            peer_credential_rejections: 0,
+            peer_uid: None,
             error: Some(SendEventError {
                 code: IoErrorCode::Unavailable,
                 message,
@@ -1609,8 +1675,63 @@ mod tests {
             "{\"event\":\"io_server\",\"op\":\"send\",\"kind\":\"ACK\",\"outcome\":\"error\",\
              \"reason\":\"rejected_poisoned\",\"code\":\"UNAVAILABLE\",\
              \"message\":\"connection is poisoned by a previous error and must be reconnected\",\
-             \"accept_aborted_retries\":0,\"latency_us\":0}"
+             \"accept_aborted_retries\":0,\"peer_credential_rejections\":0,\
+             \"latency_us\":0}"
         );
+    }
+
+    /// H1・#820（PLUG-12・security.md・SEC-4）: peer credential 拒否イベントは
+    /// `reason":"rejected_peer_credential"` になり、取得できた接続元の uid を
+    /// `peer_uid` として数値のまま JSON へ含める。
+    #[test]
+    fn h1_encode_server_event_rejects_peer_credential_includes_peer_uid() {
+        let message = "connecting peer uid (1000) does not match the server's effective uid (0)";
+        let event = ServerEvent {
+            op: ServerOp::Accept,
+            kind: None,
+            outcome: ServerOutcome::RejectedPeerCredential,
+            latency: Duration::ZERO,
+            accept_aborted_retries: 0,
+            peer_credential_rejections: 1,
+            peer_uid: Some(1000),
+            error: Some(SendEventError {
+                code: IoErrorCode::InvalidArgument,
+                message,
+            }),
+        };
+
+        let encoded = encode_server_event(&event);
+        assert_eq!(
+            encoded,
+            "{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"error\",\
+             \"reason\":\"rejected_peer_credential\",\"code\":\"INVALID_ARGUMENT\",\
+             \"message\":\"connecting peer uid (1000) does not match the server's effective \
+             uid (0)\",\"accept_aborted_retries\":0,\"peer_credential_rejections\":1,\
+             \"peer_uid\":1000,\"latency_us\":0}"
+        );
+    }
+
+    /// H1・#820: 接続元の uid の取得自体に失敗した場合（`peer_uid` は
+    /// `None`）は、`peer_uid` キー自体を省く。
+    #[test]
+    fn h1_encode_server_event_rejects_peer_credential_omits_peer_uid_when_unavailable() {
+        let message = "getsockopt(SO_PEERCRED) failed: some os error";
+        let event = ServerEvent {
+            op: ServerOp::Accept,
+            kind: None,
+            outcome: ServerOutcome::RejectedPeerCredential,
+            latency: Duration::ZERO,
+            accept_aborted_retries: 0,
+            peer_credential_rejections: 1,
+            peer_uid: None,
+            error: Some(SendEventError {
+                code: IoErrorCode::Internal,
+                message,
+            }),
+        };
+
+        let encoded = encode_server_event(&event);
+        assert!(!encoded.contains("\"peer_uid\""), "encoded={encoded}");
     }
 
     /// REPAIR-5（#820 レビュー指摘）: `JsonLinesServerObserver` は容量に達すると
@@ -1626,6 +1747,8 @@ mod tests {
             outcome: ServerOutcome::Success,
             latency: Duration::ZERO,
             accept_aborted_retries: retries,
+            peer_credential_rejections: 0,
+            peer_uid: None,
             error: None,
         };
 
@@ -1639,7 +1762,8 @@ mod tests {
             lines,
             vec![
                 "{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"ok\",\
-                 \"accept_aborted_retries\":0,\"latency_us\":0}"
+                 \"accept_aborted_retries\":0,\"peer_credential_rejections\":0,\
+                 \"latency_us\":0}"
             ]
         );
         assert!(observer.is_empty());
@@ -1672,6 +1796,8 @@ mod tests {
             outcome: ServerOutcome::Failure,
             latency: Duration::from_millis(1),
             accept_aborted_retries: 0,
+            peer_credential_rejections: 0,
+            peer_uid: None,
             error: Some(SendEventError {
                 code: IoErrorCode::Timeout,
                 message: &huge_message,
@@ -1688,16 +1814,19 @@ mod tests {
     }
 
     /// TASK-13.2.1・#820（REPAIR-4・REPAIR-12）: 1 行の最悪ケース
-    /// （`encode_server_event` の出力が最も長くなる組み合わせ。`accept_aborted_retries`
-    /// が `u32::MAX` の場合を含む）でも [`MAX_SERVER_LOG_LINE_BYTES`] を超えない
-    /// ことを機械照合する（[`repair4_repair12_encode_send_event_worst_case_line_fits_within_max_line_bytes`]
+    /// （`encode_server_event` の出力が最も長くなる組み合わせ。`accept_aborted_retries`・
+    /// `peer_credential_rejections`・`peer_uid`〔H1・#820 security-auditor
+    /// 指摘対応で追加〕がいずれも `u32::MAX` の場合を含む）でも
+    /// [`MAX_SERVER_LOG_LINE_BYTES`] を超えないことを機械照合する
+    /// （[`repair4_repair12_encode_send_event_worst_case_line_fits_within_max_line_bytes`]
     /// のサーバー版。最悪ケースの根拠は同テストと同じ: `kind` は `FLUSH_ACK`
     /// 〔9 バイトで最長〕、`outcome`/`code` は `RejectedResourceExhausted`
     /// 相当ではなく `ServerOutcome::Failure`〔`"failure"`。`reason` の候補が
     /// 少ないため固定〕、`code` は [`IoErrorCode::ResourceExhausted`]
     /// 〔`"RESOURCE_EXHAUSTED"`。全 `IoErrorCode` 中最長〕、`message` は上限超過の
     /// 1 バイト制御文字の連続〔エスケープ後 6 倍で最悪〕、`latency` は
-    /// `Duration::MAX`、`accept_aborted_retries` は `u32::MAX`
+    /// `Duration::MAX`、`accept_aborted_retries`・`peer_credential_rejections`・
+    /// `peer_uid` は `u32::MAX`
     /// 〔実行時は `MAX_ACCEPT_ABORT_RETRIES` で頭打ちだが、フィールドの型としての
     /// 上限を正直に見積もる〕）。
     #[test]
@@ -1709,6 +1838,8 @@ mod tests {
             outcome: ServerOutcome::Failure,
             latency: Duration::MAX,
             accept_aborted_retries: u32::MAX,
+            peer_credential_rejections: u32::MAX,
+            peer_uid: Some(u32::MAX),
             error: Some(SendEventError {
                 code: IoErrorCode::ResourceExhausted,
                 message: &oversized_control_chars,
@@ -1745,6 +1876,8 @@ mod tests {
             outcome: ServerOutcome::Success,
             latency: Duration::ZERO,
             accept_aborted_retries: 0,
+            peer_credential_rejections: 0,
+            peer_uid: None,
             error: None,
         });
         // panic せず戻ることのみを確認する（副作用を持たない契約）。

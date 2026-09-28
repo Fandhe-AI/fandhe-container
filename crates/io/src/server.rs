@@ -28,7 +28,10 @@
 //! 全分岐（成功・各拒否・タイムアウト・poison 済みでの拒否）で必ず 1 回通知し、
 //! 通知自体は [`crate::observe::ServerObserver::on_event`] の契約どおり
 //! ブロックする I/O を行わない（[`crate::observe::ServerObserver`] のドキュメント
-//! 参照）。
+//! 参照）。accept 1 回の呼び出しの中で peer credential 拒否（下記「peer
+//! credential の検証」節）が発生した場合は、その都度の拒否イベントに加えて
+//! 最終的な成功・失敗イベントも通知され、1 回の [`UdsServer::accept`] 呼び出しで
+//! 複数回 `on_event` が呼ばれることがある（H1・#820 security-auditor 指摘対応）。
 //!
 //! # 受信上限（[`crate::recv_limits::ReceiveLimits`]。F・#820 codex P1 指摘対応）
 //!
@@ -42,7 +45,8 @@
 //!
 //! # peer credential の検証（PLUG-12・security.md「UDS は所有者・権限・
 //! symlink を検証してから bind し、別 UID からの接続は peer credential 検証で
-//! 切断する」。E・#820 codex P0 指摘対応）
+//! 切断する」。E・#820 codex P0 指摘対応。H1・H3・H4・H6・#820 security-auditor
+//! 指摘対応）
 //!
 //! [`UdsServer::accept`] は、accept した接続の相手側 uid
 //! （`crate::sys::peer_uid`。Linux は `SO_PEERCRED`、macOS は `getpeereid(2)`）が
@@ -50,12 +54,30 @@
 //! （`imp::verify_peer_credential`。Linux / macOS 限定の非公開関数）。
 //! 不一致・取得失敗（対応していないアーキテクチャを含む）のいずれも拒否し
 //! （fail-closed）、拒否した接続はすぐに閉じる。1 件の不正な接続で受付ループ
-//! 自体は止めず（`ConnectionAborted` の再試行と同じ枠組みで、期限
-//! ・[`imp::MAX_ACCEPT_ABORT_RETRIES`] の両方で有界に再試行し、
-//! [`crate::observe::ServerEvent::accept_aborted_retries`] で件数を観測できる。
-//! `AcceptAttempt` のドキュメンテーションコメント参照）、期限内は次の接続を
-//! 待ち続ける。拒否時のエラーコードは新設せず、bind 時の所有者照合
-//! （`imp::check_socket_owner`）と同じ [`IoErrorCode::InvalidArgument`] を使う。
+//! 自体は止めない。ただし `ConnectionAborted`（相手都合の切断）と peer
+//! credential 拒否は件数を分けて数え（H1・#820 security-auditor 指摘対応。
+//! SEC-4「分離違反の試行は監査ログに記録する」の対象になる事象を、単なる
+//! 相手都合の切断と混同しないため）、それぞれ独立に期限・
+//! [`imp::MAX_ACCEPT_ABORT_RETRIES`] の両方で有界に再試行する
+//! （`AcceptAttempt` のドキュメンテーションコメント参照）。件数の加算と
+//! （peer credential 拒否の場合の）観測通知は、期限切れの判定より必ず先に
+//! 行う（H3・#820 security-auditor 指摘対応。期限の直前に起きた拒否も記録に
+//! 残すため）。再試行の上限を超えた場合のエラーコードは、実装バグを示す
+//! `Internal` ではなく、相手に起因する異常を示す
+//! [`IoErrorCode::Unavailable`] を返す（H4・#820 security-auditor 指摘対応）。
+//!
+//! peer credential 拒否は、正常な接続が最終的に成立した場合でもそれまでの
+//! 拒否が記録から失われないよう、拒否 1 件ごとに個別のイベント
+//! （[`crate::observe::ServerOutcome::RejectedPeerCredential`]）として
+//! [`UdsServer::bind`] で渡した観測フックへ即座に通知する（H1・#820
+//! security-auditor 指摘対応。SEC-4）。累積件数
+//! （[`crate::observe::ServerEvent::peer_credential_rejections`]）は最終的な
+//! Accept の成功・失敗イベントにも載る。取得できた場合の接続元 uid
+//! （[`crate::observe::ServerEvent::peer_uid`]。数値のみで秘密情報を含まない）
+//! も個々の拒否イベントに載る。通知自体は他の観測イベントと同じくブロックする
+//! I/O を行わない契約（モジュール doc「観測」節参照）を守る。拒否時の
+//! エラーコードは新設せず、bind 時の所有者照合（`imp::check_socket_owner`）と
+//! 同じ [`IoErrorCode::InvalidArgument`] を使う。
 //!
 //! # OS 対応
 //!
@@ -116,20 +138,26 @@ use crate::recv_limits::ReceiveLimits;
 use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
 
 /// [`imp::ServerInner::accept`] の結果に、受付ループ内で再試行した回数
-/// （[`crate::observe::ServerEvent::accept_aborted_retries`] に必要）を添えて
-/// 呼び出し元（[`UdsServer::accept`]）へ持ち帰るための非公開型（TASK-13.2.1・
-/// #820・reviewer 指摘対応。REPAIR-4）。`imp` モジュールの外へ OS 固有型を
-/// 漏らさないため、`C` は `imp::ConnectionInner` を指す型引数として使う。
+/// （[`crate::observe::ServerEvent::accept_aborted_retries`]・
+/// [`crate::observe::ServerEvent::peer_credential_rejections`] に必要）を
+/// 添えて呼び出し元（[`UdsServer::accept`]）へ持ち帰るための非公開型
+/// （TASK-13.2.1・#820・reviewer 指摘対応。REPAIR-4）。`imp` モジュールの外へ
+/// OS 固有型を漏らさないため、`C` は `imp::ConnectionInner` を指す型引数
+/// として使う。
 ///
-/// 再試行には 2 種類ある（E・#820 codex P0 指摘対応で追加）: 相手が accept
-/// 完了前に切断した場合（`ConnectionAborted`）と、accept 自体は完了したが
-/// peer credential の検証（`imp::verify_peer_credential`）に失敗した場合。
-/// どちらも「1 件の不正・無効な接続で受付ループ全体を止めない」という同じ
-/// 目的のため、同じカウンタ・同じ上限（`imp::MAX_ACCEPT_ABORT_RETRIES`）を
-/// 共有する。
+/// 再試行には 2 種類あり（E・#820 codex P0 指摘対応で追加）、件数は別々に
+/// 数える（H1・#820 security-auditor 指摘対応。SEC-4「分離違反の試行は
+/// 監査ログに記録する」の対象になる peer credential 拒否と、単なる相手都合の
+/// 切断を混同しないため）: 相手が accept 完了前に切断した場合
+/// （`ConnectionAborted`）は [`Self::aborted_retries`]、accept 自体は完了した
+/// が peer credential の検証（`imp::verify_peer_credential`）に失敗した場合は
+/// [`Self::peer_credential_rejections`] を増分する。どちらも「1 件の不正・
+/// 無効な接続で受付ループ全体を止めない」という同じ目的のため、同じ上限
+/// （`imp::MAX_ACCEPT_ABORT_RETRIES`）をそれぞれ独立に適用する。
 struct AcceptAttempt<C> {
     result: Result<C, IoError>,
     aborted_retries: u32,
+    peer_credential_rejections: u32,
 }
 
 /// [`imp::ConnectionInner::recv_frame`] の結果に、ヘッダ検証を通過した時点で
@@ -230,7 +258,17 @@ impl<O: ServerObserver> UdsServer<O> {
         conn_observer: C,
     ) -> Result<UdsConnection<C>, IoError> {
         let started = Instant::now();
-        let attempt = self.inner.accept(timeout);
+        // `observer` と `self.inner` は互いに素なフィールドの借用のため、
+        // `self.inner.accept(...)` へ渡すクロージャの中で `observer` を
+        // 可変借用しても衝突しない（H1・#820 security-auditor 指摘対応。
+        // peer credential 拒否の都度、`imp` 層のループから観測フックへ
+        // 個別に通知するための経路。`&mut dyn FnMut` はブロックしない・
+        // 借用は呼び出しの間だけという `ServerObserver::on_event` の契約を
+        // そのまま伝播する）。
+        let observer = &mut self.observer;
+        let attempt = self.inner.accept(timeout, &mut |event: &ServerEvent<'_>| {
+            observer.on_event(event);
+        });
         let elapsed = started.elapsed();
         match &attempt.result {
             Ok(_) => self.observer.on_event(&ServerEvent {
@@ -239,6 +277,8 @@ impl<O: ServerObserver> UdsServer<O> {
                 outcome: ServerOutcome::Success,
                 latency: elapsed,
                 accept_aborted_retries: attempt.aborted_retries,
+                peer_credential_rejections: attempt.peer_credential_rejections,
+                peer_uid: None,
                 error: None,
             }),
             Err(err) => self.observer.on_event(&ServerEvent {
@@ -247,6 +287,8 @@ impl<O: ServerObserver> UdsServer<O> {
                 outcome: ServerOutcome::Failure,
                 latency: elapsed,
                 accept_aborted_retries: attempt.aborted_retries,
+                peer_credential_rejections: attempt.peer_credential_rejections,
+                peer_uid: None,
                 error: Some(SendEventError {
                     code: err.code(),
                     message: err.message(),
@@ -335,6 +377,8 @@ impl<C: ServerObserver> UdsConnection<C> {
             outcome: ServerOutcome::Success,
             latency,
             accept_aborted_retries: 0,
+            peer_credential_rejections: 0,
+            peer_uid: None,
             error: None,
         });
     }
@@ -357,6 +401,8 @@ impl<C: ServerObserver> UdsConnection<C> {
             outcome,
             latency,
             accept_aborted_retries: 0,
+            peer_credential_rejections: 0,
+            peer_uid: None,
             error: Some(SendEventError {
                 code: err.code(),
                 message: err.message(),
@@ -459,6 +505,7 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use crate::error::{IoError, IoErrorCode};
+    use crate::observe::{SendEventError, ServerEvent, ServerOp, ServerOutcome};
     use crate::protocol::{FRAME_HEADER_LEN, Frame, FrameHeader, FrameKind};
     use crate::recv_limits::ReceiveLimits;
     use crate::transport::IoTimeout;
@@ -514,11 +561,27 @@ mod imp {
 
         /// 接続を 1 件受け付ける。戻り値には `ConnectionAborted` を再試行した
         /// 回数（[`crate::observe::ServerEvent::accept_aborted_retries`] の
-        /// 出どころ）を必ず添える（成功・タイムアウト・retry 上限超過の
-        /// いずれでも。TASK-13.2.1・#820・reviewer 指摘対応。REPAIR-4）。
-        pub(super) fn accept(&self, timeout: IoTimeout) -> super::AcceptAttempt<ConnectionInner> {
+        /// 出どころ）と peer credential 拒否により再試行した回数
+        /// （[`crate::observe::ServerEvent::peer_credential_rejections`] の
+        /// 出どころ。H1・#820 security-auditor 指摘対応）を必ず添える（成功・
+        /// タイムアウト・retry 上限超過のいずれでも。TASK-13.2.1・#820・
+        /// reviewer 指摘対応。REPAIR-4）。
+        ///
+        /// `on_event` は peer credential 拒否の都度、個別のイベントを通知する
+        /// ための呼び出し先（H1・#820 security-auditor 指摘対応。SEC-4「分離
+        /// 違反の試行は監査ログに記録する」）。`crate::observe::ServerObserver::
+        /// on_event` と同じ契約（ブロックする I/O をしない・借用は呼び出しの
+        /// 間だけ有効）を守ることは呼び出し元（[`super::UdsServer::accept`]）の
+        /// 責務であり、本関数はその契約を満たす `on_event` を受け取る前提で
+        /// 動く。
+        pub(super) fn accept(
+            &self,
+            timeout: IoTimeout,
+            on_event: &mut dyn FnMut(&ServerEvent<'_>),
+        ) -> super::AcceptAttempt<ConnectionInner> {
             let deadline = Instant::now() + timeout.as_duration();
             let mut abort_retries = 0u32;
+            let mut credential_rejections = 0u32;
             loop {
                 match self.listener.accept() {
                     Ok((stream, _addr)) => {
@@ -534,6 +597,7 @@ mod imp {
                                     ),
                                 )),
                                 aborted_retries: abort_retries,
+                                peer_credential_rejections: credential_rejections,
                             };
                         }
 
@@ -541,43 +605,48 @@ mod imp {
                         // 接続元の peer credential を検証し、自プロセスの実効
                         // uid と一致しない（取得自体に失敗した場合を含む）
                         // 接続は fail-closed で拒否する。1 件の不正な接続で
-                        // 受付ループ全体を止めないため、`ConnectionAborted` と
-                        // 同じ再試行の枠組み（期限・`MAX_ACCEPT_ABORT_RETRIES`
-                        // の両方で有界）を共有する（`AcceptAttempt` のドキュメン
-                        // テーションコメント参照）。
-                        if let Err(cred_err) = verify_peer_credential(&stream) {
+                        // 受付ループ全体を止めないため、`ConnectionAborted` とは
+                        // 別のカウンタ・同じ上限（`MAX_ACCEPT_ABORT_RETRIES`）で
+                        // 再試行する（H1・#820 security-auditor 指摘対応。
+                        // `AcceptAttempt` のドキュメンテーションコメント参照）。
+                        if let Err(rejection) = verify_peer_credential(&stream) {
                             drop(stream);
+                            // H3・#820 security-auditor 指摘対応: 件数の加算・
+                            // 拒否の通知は、期限切れの判定より必ず先に行う
+                            // （期限の直前に起きた拒否も記録に残すため）。
+                            credential_rejections = credential_rejections.saturating_add(1);
+                            on_event(&peer_credential_rejection_event(
+                                &rejection,
+                                credential_rejections,
+                            ));
+
                             let remaining = deadline.saturating_duration_since(Instant::now());
-                            if remaining.is_zero() {
+                            if let Some(err) = accept_retry_deadline_or_limit(
+                                remaining,
+                                credential_rejections,
+                                MAX_ACCEPT_ABORT_RETRIES,
+                                "accept exceeded the retry limit after repeatedly rejecting \
+                                 connections with mismatched peer credentials",
+                            ) {
                                 return super::AcceptAttempt {
-                                    result: Err(IoError::new(
-                                        IoErrorCode::Timeout,
-                                        "accept timed out waiting for a client connection",
-                                    )),
+                                    result: Err(err),
                                     aborted_retries: abort_retries,
+                                    peer_credential_rejections: credential_rejections,
                                 };
                             }
-                            abort_retries = abort_retries.saturating_add(1);
-                            if abort_retries > MAX_ACCEPT_ABORT_RETRIES {
-                                return super::AcceptAttempt {
-                                    result: Err(IoError::new(
-                                        IoErrorCode::Internal,
-                                        format!(
-                                            "accept exceeded the retry limit after repeatedly \
-                                             rejecting connections (peer disconnects before \
-                                             accept completed or peer credential mismatches; \
-                                             last rejection: {cred_err})"
-                                        ),
-                                    )),
-                                    aborted_retries: abort_retries,
-                                };
-                            }
+                            // H6・#820 security-auditor 指摘対応: WouldBlock・
+                            // ConnectionAborted の経路と同じ理由で、期限内で
+                            // あっても busy-loop せずに一呼吸置いてから再試行
+                            // する（相手が不正な接続を高頻度で繰り返す病的な
+                            // ケースで CPU を使い切らないため）。
+                            std::thread::sleep(remaining.min(ACCEPT_POLL_INTERVAL));
                             continue;
                         }
 
                         return super::AcceptAttempt {
                             result: Ok(ConnectionInner { stream }),
                             aborted_retries: abort_retries,
+                            peer_credential_rejections: credential_rejections,
                         };
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -589,6 +658,7 @@ mod imp {
                                     "accept timed out waiting for a client connection",
                                 )),
                                 aborted_retries: abort_retries,
+                                peer_credential_rejections: credential_rejections,
                             };
                         }
                         std::thread::sleep(remaining.min(ACCEPT_POLL_INTERVAL));
@@ -600,26 +670,21 @@ mod imp {
                         // ただし無期限にリトライしないよう、期限と回数の両方で
                         // 打ち切る。カウンタは saturating で数える（REPAIR-4・
                         // #820 レビュー指摘。u32 の桁あふれで別の事象に見えて
-                        // しまわないようにする）。
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            return super::AcceptAttempt {
-                                result: Err(IoError::new(
-                                    IoErrorCode::Timeout,
-                                    "accept timed out waiting for a client connection",
-                                )),
-                                aborted_retries: abort_retries,
-                            };
-                        }
+                        // しまわないようにする）。H3・#820 security-auditor
+                        // 指摘対応: 件数の加算は期限切れの判定より必ず先に行う。
                         abort_retries = abort_retries.saturating_add(1);
-                        if abort_retries > MAX_ACCEPT_ABORT_RETRIES {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if let Some(err) = accept_retry_deadline_or_limit(
+                            remaining,
+                            abort_retries,
+                            MAX_ACCEPT_ABORT_RETRIES,
+                            "accept exceeded the retry limit after repeated peer disconnects \
+                             before accept completed",
+                        ) {
                             return super::AcceptAttempt {
-                                result: Err(IoError::new(
-                                    IoErrorCode::Internal,
-                                    "accept exceeded the retry limit after repeated peer \
-                                     disconnects before accept completed",
-                                )),
+                                result: Err(err),
                                 aborted_retries: abort_retries,
+                                peer_credential_rejections: credential_rejections,
                             };
                         }
                         // WouldBlock と同じ理由で、期限内であっても busy-loop
@@ -635,6 +700,7 @@ mod imp {
                                 format!("accept failed: {e}"),
                             )),
                             aborted_retries: abort_retries,
+                            peer_credential_rejections: credential_rejections,
                         };
                     }
                 }
@@ -706,6 +772,21 @@ mod imp {
         Ok(())
     }
 
+    /// [`verify_peer_credential`] の拒否理由（H1・#820 security-auditor 指摘
+    /// 対応）。取得できた場合の接続元 uid（秘密情報を含まない数値）と、拒否の
+    /// 詳細（エラーコード・メッセージ）を両方保持し、呼び出し元
+    /// （[`ServerInner::accept`]）が観測イベント
+    /// （[`crate::observe::ServerOutcome::RejectedPeerCredential`]）へ個別に
+    /// 載せられるようにする。
+    struct PeerCredentialRejection {
+        /// `crate::sys::peer_uid` の取得自体は成功したが
+        /// `crate::sys::effective_uid` と不一致だった場合の接続元 uid。取得自体
+        /// に失敗した場合（対応していないアーキテクチャを含む）は `None`。
+        peer_uid: Option<u32>,
+        /// 拒否の詳細（エラーコード・メッセージ）。
+        error: IoError,
+    }
+
     /// 接続元（`stream`）の peer credential を検証する（E・#820 codex P0
     /// 指摘対応。PLUG-12・security.md「別 UID からの接続は peer credential
     /// 検証で切断する」）。
@@ -719,17 +800,28 @@ mod imp {
     /// （fail-closed）。拒否時のエラーコードは [`check_socket_owner`]（bind 時の
     /// 所有者照合）と同じ [`IoErrorCode::InvalidArgument`] を使い、新しいコードは
     /// 追加しない（#820 修正計画 E）。
-    fn verify_peer_credential(stream: &UnixStream) -> Result<(), IoError> {
-        let peer_uid = crate::sys::peer_uid(stream)?;
+    fn verify_peer_credential(stream: &UnixStream) -> Result<(), PeerCredentialRejection> {
+        let peer_uid = match crate::sys::peer_uid(stream) {
+            Ok(uid) => uid,
+            Err(error) => {
+                return Err(PeerCredentialRejection {
+                    peer_uid: None,
+                    error,
+                });
+            }
+        };
         let expected_uid = crate::sys::effective_uid();
         if !peer_credential_matches(peer_uid, expected_uid) {
-            return Err(IoError::new(
-                IoErrorCode::InvalidArgument,
-                format!(
-                    "connecting peer uid ({peer_uid}) does not match the server's effective \
-                     uid ({expected_uid})"
+            return Err(PeerCredentialRejection {
+                peer_uid: Some(peer_uid),
+                error: IoError::new(
+                    IoErrorCode::InvalidArgument,
+                    format!(
+                        "connecting peer uid ({peer_uid}) does not match the server's \
+                         effective uid ({expected_uid})"
+                    ),
                 ),
-            ));
+            });
         }
         Ok(())
     }
@@ -739,6 +831,66 @@ mod imp {
     /// する。E・#820）。
     fn peer_credential_matches(peer_uid: u32, expected_uid: u32) -> bool {
         peer_uid == expected_uid
+    }
+
+    /// [`PeerCredentialRejection`] から観測イベントを組み立てる（H1・#820
+    /// security-auditor 指摘対応。SEC-4）。純粋関数として切り出し、別 uid の
+    /// 接続を実機で作れなくても具体値でテストできるようにする
+    /// （[`peer_credential_matches`] と同じ方針）。`peer_credential_rejections`
+    /// は呼び出し元（[`ServerInner::accept`]）が管理する累積件数
+    /// （[`crate::observe::ServerEvent::peer_credential_rejections`]）をそのまま
+    /// 渡す。
+    fn peer_credential_rejection_event(
+        rejection: &PeerCredentialRejection,
+        peer_credential_rejections: u32,
+    ) -> ServerEvent<'_> {
+        ServerEvent {
+            op: ServerOp::Accept,
+            kind: None,
+            outcome: ServerOutcome::RejectedPeerCredential,
+            // 個々の拒否は accept() の呼び出し中に即座に検出・通知され、
+            // 別途トランスポートを介した待ち時間を持たないため `ZERO`
+            // （`notify_success`/`notify_failure` の早期拒否分岐と同じ扱い）。
+            latency: Duration::ZERO,
+            accept_aborted_retries: 0,
+            peer_credential_rejections,
+            peer_uid: rejection.peer_uid,
+            error: Some(SendEventError {
+                code: rejection.error.code(),
+                message: rejection.error.message(),
+            }),
+        }
+    }
+
+    /// 受付ループの再試行判定（H3・H4・#820 security-auditor 指摘対応）。
+    ///
+    /// `remaining` が `Duration::ZERO` なら [`IoErrorCode::Timeout`]、
+    /// `retries` が `max_retries` を超えていれば [`IoErrorCode::Unavailable`]
+    /// （相手に起因する異常であり、実装バグを示す `Internal` ではない。H4）、
+    /// どちらでもなければ `None`（再試行を続ける）を返す純粋関数。
+    ///
+    /// 呼び出し元（[`ServerInner::accept`]）は、この判定の**前に**必ず件数の
+    /// 加算・（peer credential 拒否の場合の）拒否の通知を済ませておく（H3。
+    /// 期限の直前に起きた拒否も件数・記録に残すため）。
+    fn accept_retry_deadline_or_limit(
+        remaining: Duration,
+        retries: u32,
+        max_retries: u32,
+        exceeded_message: &str,
+    ) -> Option<IoError> {
+        if remaining.is_zero() {
+            return Some(IoError::new(
+                IoErrorCode::Timeout,
+                "accept timed out waiting for a client connection",
+            ));
+        }
+        if retries > max_retries {
+            return Some(IoError::new(
+                IoErrorCode::Unavailable,
+                exceeded_message.to_string(),
+            ));
+        }
+        None
     }
 
     /// 親ディレクトリが symlink でなく・ディレクトリであり・owner 以外に
@@ -1319,6 +1471,87 @@ mod imp {
         fn e_820_peer_credential_matches_rejects_mismatched_uid() {
             assert!(!peer_credential_matches(1000, 0));
         }
+
+        /// H1・H8・#820（security-auditor 指摘対応。SEC-4）: 接続元 uid が
+        /// 取得できた（が不一致だった）拒否では、`peer_credential_rejection_event`
+        /// が組み立てるイベントに `peer_uid` を数値のまま載せる。別 uid の
+        /// 接続は実機で作れないため、イベント組み立て部分を純粋関数として
+        /// テストする。
+        #[test]
+        fn h1_peer_credential_rejection_event_includes_peer_uid_when_available() {
+            let rejection = PeerCredentialRejection {
+                peer_uid: Some(1000),
+                error: IoError::new(
+                    IoErrorCode::InvalidArgument,
+                    "connecting peer uid (1000) does not match the server's effective uid (0)",
+                ),
+            };
+
+            let event = peer_credential_rejection_event(&rejection, 3);
+
+            assert_eq!(event.op, ServerOp::Accept);
+            assert_eq!(event.outcome, ServerOutcome::RejectedPeerCredential);
+            assert_eq!(event.peer_uid, Some(1000));
+            assert_eq!(event.peer_credential_rejections, 3);
+            assert_eq!(event.accept_aborted_retries, 0);
+            let error = event.error.expect("rejection must carry error detail");
+            assert_eq!(error.code, IoErrorCode::InvalidArgument);
+            assert!(error.message.contains("1000"));
+        }
+
+        /// H1・H8・#820: 接続元 uid の取得自体に失敗した拒否では `peer_uid` が
+        /// `None` になる。
+        #[test]
+        fn h1_peer_credential_rejection_event_omits_peer_uid_when_unavailable() {
+            let rejection = PeerCredentialRejection {
+                peer_uid: None,
+                error: IoError::new(IoErrorCode::Internal, "getsockopt(SO_PEERCRED) failed"),
+            };
+
+            let event = peer_credential_rejection_event(&rejection, 1);
+
+            assert_eq!(event.peer_uid, None);
+        }
+
+        /// H3・H4・H8・#820（security-auditor 指摘対応）: 残り時間がゼロなら
+        /// `Timeout`、上限を超えていれば実装バグ用の `Internal` ではなく
+        /// 相手に起因する異常を示す `Unavailable`、どちらでもなければ再試行
+        /// （`None`）を返す。
+        #[test]
+        fn h3_h4_accept_retry_deadline_or_limit_returns_timeout_when_deadline_passed() {
+            let err = accept_retry_deadline_or_limit(
+                Duration::ZERO,
+                0,
+                MAX_ACCEPT_ABORT_RETRIES,
+                "exceeded",
+            )
+            .expect("a zero remaining duration must produce an error");
+            assert_eq!(err.code(), IoErrorCode::Timeout);
+        }
+
+        #[test]
+        fn h3_h4_accept_retry_deadline_or_limit_returns_unavailable_when_retries_exceeded() {
+            let err = accept_retry_deadline_or_limit(
+                Duration::from_secs(1),
+                MAX_ACCEPT_ABORT_RETRIES + 1,
+                MAX_ACCEPT_ABORT_RETRIES,
+                "exceeded the retry limit",
+            )
+            .expect("retries beyond the limit must produce an error");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+            assert!(err.message().contains("exceeded the retry limit"));
+        }
+
+        #[test]
+        fn h3_h4_accept_retry_deadline_or_limit_returns_none_when_retrying_is_allowed() {
+            let outcome = accept_retry_deadline_or_limit(
+                Duration::from_secs(1),
+                MAX_ACCEPT_ABORT_RETRIES,
+                MAX_ACCEPT_ABORT_RETRIES,
+                "exceeded",
+            );
+            assert!(outcome.is_none());
+        }
     }
 }
 
@@ -1332,6 +1565,7 @@ mod imp {
     use std::path::Path;
 
     use crate::error::{IoError, IoErrorCode};
+    use crate::observe::ServerEvent;
     use crate::protocol::Frame;
     use crate::recv_limits::ReceiveLimits;
     use crate::transport::IoTimeout;
@@ -1351,7 +1585,11 @@ mod imp {
             match *self {}
         }
 
-        pub(super) fn accept(&self, _timeout: IoTimeout) -> super::AcceptAttempt<ConnectionInner> {
+        pub(super) fn accept(
+            &self,
+            _timeout: IoTimeout,
+            _on_event: &mut dyn FnMut(&ServerEvent<'_>),
+        ) -> super::AcceptAttempt<ConnectionInner> {
             match *self {}
         }
     }

@@ -23,9 +23,20 @@
 //! したがって「テスト自体が無限に待たずタイムアウト秒数内で終了する」ことは
 //! 「厳密にタイムアウト未満で終わる」ではなく、**「ACK 待ちの所要時間が
 //! `timeout - ABSENT_ACK_TOLERANCE` 以上 `timeout + HANG_GUARD_GRACE` 未満で
-//! あり、シナリオ全体が watchdog（`timeout + HANG_GUARD_GRACE` での
-//! `recv_timeout`）で上限を機械的に保証されている」**と解釈する
+//! あり、シナリオ全体が二段の watchdog（準備段階は
+//! `CONNECT_RETRY_BUDGET + HANG_GUARD_GRACE`、ACK 待ち段階は
+//! `timeout + HANG_GUARD_GRACE` での `recv_timeout`）で上限を機械的に
+//! 保証されている」**と解釈する
 //! （`mod unix::repair5_missing_ack_is_detected_as_timeout` 参照）。
+//!
+//! 当初は client スレッド全体（`connect` の最大 5 秒リトライ＋送信＋
+//! `recv_ack` のタイムアウト待ち）を単一の `timeout + HANG_GUARD_GRACE` の
+//! watchdog でしか保護していなかったため、`bind` / `accept` 側が数秒
+//! 遅延すると `connect` 自体は成功していても watchdog が先に発火し、
+//! ACK タイムアウト検出がハングしたかのように誤って panic し得た
+//! （cursor Bugbot 指摘・codex P2 指摘・#1124）。本ファイルは
+//! 準備段階（`connect` 完了・送信完了まで）と ACK 待ち段階を別々の期限で
+//! 管理することでこれを解消する。
 //!
 //! タイムアウト秒数は環境変数 `FANDHE_CONTAINER_TEST_TIMEOUT_SECS` で上書きでき、
 //! 未設定時の既定値は [`DEFAULT_TEST_TIMEOUT_SECS`]（10 秒）。CI の
@@ -192,6 +203,13 @@ mod unix {
     /// 「無限に待たない」ことを機械的に保証できる範囲に収める。
     const HANG_GUARD_GRACE: Duration = Duration::from_secs(2);
 
+    /// [`connect`] が接続を試みる上限秒数。[`repair5_missing_ack_is_detected_as_timeout`]
+    /// の二段 watchdog（準備段階）が同じ値を参照することで、`connect` の
+    /// リトライ予算と watchdog の期限が乖離しないようにする（cursor Bugbot
+    /// 指摘・codex P2 指摘・#1124: watchdog が `connect` の待ち時間を
+    /// 考慮していなかったため、bind / accept 側の遅延で誤って panic し得た）。
+    const CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
+
     /// テストごとに固有かつ短いソケットディレクトリを作る（`tests/writeback.rs`
     /// の `TempSocketDir` と同じ理由・同じ実装。`sun_path` の長さ上限のため
     /// 接頭辞を短く保つ）。
@@ -232,7 +250,7 @@ mod unix {
     /// 別物のため [`response_timeout`] は使わない。`tests/writeback.rs` の
     /// `connect` と同じ方針）で接続を試みる。
     fn connect(path: &std::path::Path) -> UnixStream {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + CONNECT_RETRY_BUDGET;
         loop {
             match UnixStream::connect(path) {
                 Ok(stream) => return stream,
@@ -726,21 +744,36 @@ mod unix {
     /// 呼ばない。これにより「リクエストは届いたが ACK が返らなかった」ことを
     /// 「リクエスト自体が届かなかった」ことと区別できる。
     ///
-    /// `done_rx` で呼び出し元（テスト本体）からの完了通知を
-    /// `timeout + HANG_GUARD_GRACE` を上限に待ってから `connection` を drop
-    /// する（サーバー側でさらに `recv_frame(timeout)` を回すと、サーバーの
-    /// タイムアウトとクライアントのタイムアウトがほぼ同時刻に競合し、
-    /// アサーションが不安定になるため、受信後は完了通知待ちに専念する）。
+    /// `server` は呼び出し元が `bind` 済みのものを受け取る（bind をこの
+    /// スレッド内で行うと、client 側の `connect`（[`CONNECT_RETRY_BUDGET`]
+    /// までリトライ）が `bind` / `listen` の完了とレースし、`accept` が
+    /// 追いつくまでの遅延が watchdog の期限に含まれない、という誤検出の
+    /// 原因になっていた（cursor Bugbot 指摘・codex P2 指摘・#1124）。
+    /// `bind` は `UnixListener::bind` の時点で `listen()` 済みのため、
+    /// 呼び出し元で先に bind しておけば client の `connect` はサーバー
+    /// スレッドの起動タイミングに関わらず成功できる）。
+    ///
+    /// `done_rx` で呼び出し元（テスト本体）からの完了通知を待ってから
+    /// `connection` を drop する（サーバー側でさらに `recv_frame(timeout)`
+    /// を回すと、サーバーのタイムアウトとクライアントのタイムアウトが
+    /// ほぼ同時刻に競合し、アサーションが不安定になるため、受信後は完了
+    /// 通知待ちに専念する）。待ちは `recv()`（無期限）で行う: `done_tx` は
+    /// 呼び出し元スレッドのスタック上にあり、呼び出し元がどのような経路
+    /// （正常終了・アサーション失敗による panic・watchdog 発火）で終わっても
+    /// unwind により drop されるため、`done_tx` が送信されないまま
+    /// 呼び出し元が終了すれば `recv()` は即座に `Err` を返す。本スレッドは
+    /// critical path 上になく、呼び出し元は watchdog 通過後にしか join
+    /// しないため、無期限の `recv()` にしても「無限に待たない」という
+    /// 受け入れ条件（本ファイル冒頭 `//!`）には抵触しない（codex P2 指摘
+    /// 対応・#1124: 固定時間の先行タイマーに依存せず、完了通知まで接続を
+    /// 維持する）。
     fn spawn_silent_server(
-        socket_path: PathBuf,
+        mut server: UdsServer<NoopServerObserver>,
         timeout: IoTimeout,
         expected_count: usize,
         done_rx: mpsc::Receiver<()>,
     ) -> std::thread::JoinHandle<Vec<SilentServerRequest>> {
         std::thread::spawn(move || {
-            let mut server =
-                UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
-                    .expect("bind must succeed on a private, empty path");
             let mut connection = server
                 .accept(timeout, NoopServerObserver)
                 .expect("server must accept the client connection within the timeout");
@@ -760,7 +793,7 @@ mod unix {
             }
 
             // 意図的に send_frame を一度も呼ばない（BREAK-1 相当）。
-            let _ = done_rx.recv_timeout(timeout.as_duration() + HANG_GUARD_GRACE);
+            let _ = done_rx.recv();
             drop(connection);
 
             received
@@ -773,10 +806,21 @@ mod unix {
     /// 以後クライアントが失効（poison）して送受信を拒否することを確かめる。
     ///
     /// 受け入れ条件 2（テスト自体が無限に待たずタイムアウト秒数内で終了する
-    /// こと）の解釈は本ファイル冒頭の `//!` を参照。本テストは main 側の
-    /// watchdog（`result_rx.recv_timeout(timeout + HANG_GUARD_GRACE)`）で
-    /// critical path の待ちに上限を持たせ、ハングした場合は明示メッセージで
-    /// panic する。
+    /// こと）の解釈は本ファイル冒頭の `//!` を参照。本テストは main 側で
+    /// 二段の watchdog を持つ:
+    ///
+    /// 1. 準備段階（`connect` の最大 [`CONNECT_RETRY_BUDGET`] 秒リトライ＋
+    ///    3 件の送信）は `ready_rx.recv_timeout(CONNECT_RETRY_BUDGET +
+    ///    HANG_GUARD_GRACE)` で上限を持たせる
+    /// 2. ACK 待ち段階（`recv_ack(timeout)`）は
+    ///    `result_rx.recv_timeout(timeout + HANG_GUARD_GRACE)` で上限を持たせる
+    ///
+    /// のいずれも critical path 上に上限なしの `recv()` / `join()` を置かない
+    /// （REPAIR-5）。当初は単一の `timeout + HANG_GUARD_GRACE` の watchdog で
+    /// スレッド全体（`connect` を含む）を保護していたため、`bind` / `accept`
+    /// 側が数秒遅延すると `connect` 自体は成功していても watchdog が先に
+    /// 発火し、ACK タイムアウト検出がハングしたかのように誤って panic し得た
+    /// （cursor Bugbot 指摘・codex P2 指摘・#1124）。
     #[test]
     fn repair5_missing_ack_is_detected_as_timeout() {
         let timeout = response_timeout();
@@ -785,14 +829,13 @@ mod unix {
 
         const REQUEST_COUNT: u64 = 3;
 
-        let (done_tx, done_rx) = mpsc::channel::<()>();
-        let server_thread = spawn_silent_server(
-            socket_path.clone(),
-            timeout,
-            REQUEST_COUNT as usize,
-            done_rx,
-        );
+        let server = UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
+            .expect("bind must succeed on a private, empty path");
 
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server_thread = spawn_silent_server(server, timeout, REQUEST_COUNT as usize, done_rx);
+
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (result_tx, result_rx) = mpsc::channel();
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
@@ -806,6 +849,11 @@ mod unix {
                     .send(FrameKind::Write, &id.to_le_bytes(), timeout)
                     .unwrap_or_else(|err| panic!("send must succeed for id {id}: {err}"));
             }
+
+            // 準備段階（connect・送信）完了を main 側の watchdog へ通知する。
+            // 送信に失敗した場合はこのスレッドが上の unwrap_or_else で既に
+            // panic しているため、ここへ到達するのは準備が成功した場合のみ。
+            let _ = ready_tx.send(());
 
             let wait_started = Instant::now();
             let first_recv_ack = client.recv_ack(timeout);
@@ -844,7 +892,24 @@ mod unix {
             )
         });
 
-        // hang guard（watchdog）: client_thread の結果を上限付きで待つ。
+        // hang guard（watchdog）その 1: 準備段階（connect のリトライ＋送信）
+        // の完了通知を、connect のリトライ予算 + 猶予を上限に待つ
+        // （本関数 doc 参照。critical path 上に上限なしの recv() を置かない）。
+        let ready_deadline = CONNECT_RETRY_BUDGET + HANG_GUARD_GRACE;
+        if ready_rx.recv_timeout(ready_deadline).is_err() {
+            // client スレッドが準備段階中に panic した場合はここへは来ず
+            // join() 側で検出されるはずだが、二重の安全のため待たずに
+            // 確認する（panic メッセージをそのまま伝える）。
+            match client_thread.join() {
+                Ok(_) => panic!(
+                    "client thread finished without signalling readiness within \
+                     {ready_deadline:?} (connect + send setup did not complete in time)"
+                ),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+
+        // hang guard（watchdog）その 2: client_thread の結果を上限付きで待つ。
         // critical path 上に上限なしの recv()・join() を置かない
         // （REPAIR-5・本ファイル冒頭 `//!` の受け入れ条件 2 の解釈）。
         std::thread::spawn(move || {

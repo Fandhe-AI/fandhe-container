@@ -165,18 +165,27 @@ impl AppendFileSink {
     /// 追記先の `file` から sink を作る。`file` は呼び出し側が書き込みモードで
     /// 開いたものとする。
     ///
-    /// # 末尾への位置合わせ（Codex #822 レビュー指摘）
+    /// # 末尾への位置合わせ（Codex #822 / #1125 レビュー指摘）
     ///
     /// `AppendFileSink` は「到着順に追記する」契約（構造体ドキュメント参照）を
     /// 持つが、`file` を `OpenOptions::write(true)`（`append(true)` を付けずに）
-    /// で開んだだけでは書き込み位置が既定でファイル先頭になり、`write_batch`
+    /// で開いただけでは書き込み位置が既定でファイル先頭になり、`write_batch`
     /// の `write_all` が既存内容を上書きしてしまう。呼び出し側がどちらの
     /// モードで開いたかに関わらず追記契約を満たせるよう、ここで明示的に
-    /// `SeekFrom::End(0)` へ位置合わせしてから返す（OS の `O_APPEND` に頼ると
-    /// 各書き込みがアトミックに末尾へ移動する一方、通常モードでは `seek` は
-    /// 一度きりで以後は逐次書き込みに委ねる違いがあるが、本 sink は単一の
-    /// `serve_connection` ループからのみ使われ他プロセスとの競合書き込みを
-    /// 想定しないため、この違いは契約上問題にならない）。
+    /// `SeekFrom::End(0)` へ位置合わせしてから返す（`seek` の失敗を生成時点で
+    /// 呼び出し側へ返すため）。
+    ///
+    /// 位置合わせはここ一度きりではなく、[`BatchSink::write_batch`] の先頭でも
+    /// バッチごとに行う。通常モード（非 `O_APPEND`）で一度だけ `seek` すると、
+    /// バッチの合間に外部から truncate されたときカーソルが古い EOF に残り、
+    /// 次のバッチが `[新 EOF, 古い EOF)` をゼロ埋めの穴にして書き込むため
+    /// （IO-4・TASK-14.2。`tests/consistency/rename_truncate.rs` の T6 で検出）。
+    /// バッチ単位の位置合わせで保証するのは「バッチの合間（ACK 送出後の
+    /// 静止点）に行われた外部 truncate・拡張への追随」までであり、バッチの
+    /// 書き込み途中の外部 truncate や他プロセスとの競合書き込みは対象外
+    /// （本 sink は単一の `serve_connection` ループからのみ使われる前提。
+    /// 書き込みごとのアトミックな末尾追記が必要なら呼び出し側が
+    /// `OpenOptions::append(true)` で開く）。
     pub fn new(mut file: File) -> Result<Self, IoError> {
         file.seek(SeekFrom::End(0)).map_err(|err| {
             IoError::new(
@@ -223,6 +232,23 @@ fn sink_error_from_io(err: &io::Error, batch_len: usize) -> IoError {
 
 impl BatchSink for AppendFileSink {
     fn write_batch(&mut self, batch: &Batch) -> Result<SinkWriteReport, IoError> {
+        // バッチごとに現在の EOF へ位置合わせする（`AppendFileSink::new` の
+        // 「末尾への位置合わせ」節参照。バッチの合間の外部 truncate 後に古い
+        // オフセットへ書いてゼロ埋めの穴を作らないため。IO-4）。失敗時は `Err`
+        // を返し、呼び出し元はこのバッチへ ACK を送らない（D6）。メッセージは
+        // write 失敗と区別できるよう seek 専用にし、`new` と同じく
+        // [`IoErrorCode::Internal`] とする（データの中身・パスは含めない）。
+        self.file.seek(SeekFrom::End(0)).map_err(|err| {
+            IoError::new(
+                IoErrorCode::Internal,
+                format!(
+                    "sink seek to end failed ({:?}) before writing a batch of {} frame(s)",
+                    err.kind(),
+                    batch.len()
+                ),
+            )
+        })?;
+
         let mut frames_written: usize = 0;
         let mut bytes_written: u64 = 0;
 
@@ -912,6 +938,72 @@ mod tests {
         assert_eq!(
             contents, b"existing-new",
             "write_batch must append after existing content, not overwrite it from offset 0"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// IO-4・TASK-14.2（Codex #1125 レビュー指摘）: 通常モード（非 `O_APPEND`）
+    /// で開いた sink へ 1 バッチ書いた後、別ハンドルで `set_len(0)` してから
+    /// 次のバッチを書く。`write_batch` がバッチごとに現在の EOF へ位置合わせ
+    /// するため、次のバッチは新しい EOF（先頭）に着地し、truncate 前の
+    /// オフセットまでのゼロ埋めの穴ができないことを確認する。
+    #[test]
+    fn io4_append_file_sink_follows_external_truncate_between_batches() {
+        let dir = std::env::temp_dir().join(format!(
+            "fcio-writeback-truncate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("must create temp dir");
+        let path = dir.join("out.bin");
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("must create output file");
+        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut buffer = BatchBuffer::new(BatchConfig::new(1).expect("1 must be valid"));
+
+        let first = match buffer
+            .push(write_frame(0, b"before-truncate"))
+            .expect("push must succeed")
+        {
+            PushOutcome::Ready(batch) => batch,
+            other => panic!("expected Ready with batch_size=1, got {other:?}"),
+        };
+        sink.write_batch(&first)
+            .expect("first write_batch must succeed");
+
+        let external = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("must open for external truncate");
+        external.set_len(0).expect("external truncate must succeed");
+        drop(external);
+
+        let second = match buffer
+            .push(write_frame(1, b"after"))
+            .expect("push must succeed")
+        {
+            PushOutcome::Ready(batch) => batch,
+            other => panic!("expected Ready with batch_size=1, got {other:?}"),
+        };
+        let report = sink
+            .write_batch(&second)
+            .expect("second write_batch must succeed");
+        assert_eq!(report.frames_written, 1);
+        assert_eq!(report.bytes_written, 5);
+
+        let contents = std::fs::read(&path).expect("must read output file");
+        assert_eq!(
+            contents, b"after",
+            "write_batch must land at the post-truncate EOF, not leave a zero-fill hole"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

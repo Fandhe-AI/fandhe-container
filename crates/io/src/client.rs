@@ -567,8 +567,8 @@ where
     ///
     /// [`crate::observe::JsonLinesSendObserver`] のようにメモリ内へためるだけの
     /// 実装では、`send` の呼び出しごとに `on_send`（ブロックしない契約。REPAIR-5）
-    /// がここへ積むだけなので、実際の書き出しは呼び出し元がこの参照から
-    /// `drain_lines` / `drain_into` を呼んで行う。
+    /// がここへ積むだけなので、実際の書き出し（部分書き込み時の再試行を含む）は
+    /// 呼び出し元がこの参照から `drain_lines` を呼んで行う。
     pub fn observer_mut(&mut self) -> &mut O {
         &mut self.observer
     }

@@ -42,8 +42,9 @@ pub use client::{
 };
 pub use error::{IoError, IoErrorCode};
 pub use observe::{
-    DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver, MAX_SEND_LOG_CAPACITY, NoopSendObserver,
-    SendEvent, SendEventError, SendObserver,
+    DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver, MAX_SEND_LOG_BUFFER_BYTES,
+    MAX_SEND_LOG_CAPACITY, MAX_SEND_LOG_MESSAGE_BYTES, NoopSendObserver, SendEvent, SendEventError,
+    SendObserver,
 };
 pub use protocol::{
     CHECKSUM_LEN, FRAME_HEADER_LEN, Frame, FrameChecksum, FrameHeader, FrameKind, MAX_FRAME_LEN,

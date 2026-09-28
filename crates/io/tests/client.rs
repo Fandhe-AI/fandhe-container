@@ -167,11 +167,12 @@ fn io1_public_api_in_flight_limit_validation() {
     assert_eq!(over_err.code(), IoErrorCode::InvalidArgument);
 }
 
-/// TASK-12.1（#73 codex 再指摘対応。P1・REPAIR-4・REPAIR-5）:
+/// TASK-12.1（#73 codex/bugbot 再指摘対応。P1・REPAIR-4・REPAIR-5）:
 /// [`PipelineClient::observer_mut`] は crate 外からも観測フックへ到達でき、
-/// [`JsonLinesSendObserver`] にためた送信イベントを `drain_into` で書き出せる。
-/// `on_send`（送信経路）自体は I/O をせず、書き出しは呼び出し元が明示的に行う
-/// 契約（REPAIR-5）が公開 API として機能することを確認する。
+/// [`JsonLinesSendObserver`] にためた送信イベントを `drain_lines` で取り出せる。
+/// `on_send`（送信経路）自体は I/O をせず、取り出した行の書き出し（部分書き込み
+/// 時の再試行を含む）は呼び出し元が明示的に行う契約（REPAIR-5）が公開 API として
+/// 機能することを確認する。
 #[test]
 fn repair5_public_api_observer_mut_drains_buffered_send_log() {
     let limit = InFlightLimit::new(1).expect("1 must be valid");
@@ -182,18 +183,14 @@ fn repair5_public_api_observer_mut_drains_buffered_send_log() {
         .send(&write_frame(1), test_timeout())
         .expect("send must succeed while under the limit");
 
-    let mut buf: Vec<u8> = Vec::new();
-    let written = client
-        .observer_mut()
-        .drain_into(&mut buf)
-        .expect("writing to an in-memory buffer must not fail");
-    assert_eq!(written, 1, "expected one buffered JSON line");
+    let lines = client.observer_mut().drain_lines();
+    assert_eq!(lines.len(), 1, "expected one buffered JSON line");
     assert!(client.observer_mut().is_empty());
 
-    let output = String::from_utf8(buf).expect("output must be UTF-8");
+    let line = &lines[0];
     assert!(
-        output.starts_with("{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"ok\",")
-            && output.ends_with("}\n"),
-        "unexpected drained output: {output}"
+        line.starts_with("{\"event\":\"io_send\",\"kind\":\"WRITE\",\"outcome\":\"ok\",")
+            && line.ends_with('}'),
+        "unexpected drained line: {line}"
     );
 }

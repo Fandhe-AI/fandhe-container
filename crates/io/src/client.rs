@@ -18,24 +18,22 @@
 //! 書き出しは [`PipelineClient::observer_mut`] 経由で取り出した観測フックに対し
 //! 呼び出し元が行う。base 側 AGENTS.md の可観測性要件・REPAIR-4）。
 //!
-//! # #74（TASK-12.2）との境界
+//! [`PipelineClient::send`]（TASK-12.2・#74）は [`crate::payload::encode_request`]
+//! で request id を埋め込んだフレームを組み立てて送る。[`PipelineClient::recv_ack`]
+//! （TASK-12.2・#74）は [`crate::payload::decode_ack`] で受信 ACK を検証し、送信順
+//! （[`SendQueue::oldest`]）と対応付けてから未 ACK 枠を解放する。ワイヤー上の
+//! request id は連番（`u64`）のみで、[`RequestId`] が内部に持つ発行元キュー識別子
+//! （[`QueueId`]）はメモリ内の区別のみに使い、ワイヤー上のバイト表現には一切
+//! 影響しない（TASK-12.1・#73 codex 再指摘対応。P1）。
 //!
-//! 本モジュールが持つのは「送信済みで ACK 未受信のリクエストを追跡する」ところと、
-//! 検証済み ACK の request id を渡されたら未 ACK 枠を解放する入口
-//! （[`PipelineClient::acknowledge`]）まで。次の範囲は #74（TASK-12.2）以降が担い、
-//! ここでは実装しない（REPAIR-3。スタブの明示）:
-//! - ACK フレームの受信・デコードと、request id との対応付け（検証した上で
-//!   [`PipelineClient::acknowledge`] を呼ぶのは #74 の責務）
-//! - タイムアウト付きの ACK 待ち・ブロッキング送信 API
-//! - request id のワイヤー表現（ペイロード内レイアウト）。[`RequestId`] は
-//!   クライアントがローカルに振る連番であり、ペイロードには含めない。
-//!   [`RequestId`] が内部に持つ発行元キュー識別子（[`QueueId`]）もメモリ内の
-//!   区別のみに使い、ワイヤー上のバイト表現には一切影響しない
-//!   （TASK-12.1・#73 codex 再指摘対応。P1）
+//! # #74（TASK-12.2）以降に残る範囲
 //!
-//! 未フラッシュ滞留量（バイト数）の上限・自動フラッシュは IO-10（別タスク）の範囲。
-//! 送信側と受信側をスレッド間で分割する API も #74 以降で扱い、本モジュールの
-//! [`PipelineClient`] は `&mut self` を要求する単一スレッド前提の型として実装する。
+//! 送信側と受信側をスレッド間で分割する API（`split()` 等）は持たず、本モジュールの
+//! [`PipelineClient`] は `&mut self` を要求する単一スレッド前提の型のまま実装する
+//! （別タスクの範囲）。未フラッシュ滞留量（バイト数）の上限・自動フラッシュは
+//! IO-10（別タスク）の範囲。ACK に status バイトを持たせるかどうか（サーバー側の
+//! 失敗を伝える手段）は [`crate::payload`] モジュールドキュメントの「status バイトを
+//! 持たせない理由」を参照（導入する場合は `PROTOCOL_VERSION` を上げる必要がある）。
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,9 +42,10 @@ use std::time::{Duration, Instant};
 use crate::error::{IoError, IoErrorCode};
 #[cfg(test)]
 use crate::observe::NoopSendObserver;
-use crate::observe::{SendEvent, SendEventError, SendObserver};
+use crate::observe::{AckEvent, AckEventError, SendEvent, SendEventError, SendObserver};
+use crate::payload::{self, WireRequestId};
 use crate::protocol::{Frame, FrameKind};
-use crate::transport::{FrameSender, IoTimeout};
+use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
 
 /// [`SendQueue`] の既定の未 ACK 件数上限。
 ///
@@ -350,6 +349,28 @@ impl SendQueue {
         Ok(())
     }
 
+    /// 次に [`Self::register`] が採番するであろう id を、キューの状態を変更せずに
+    /// 覗き見る（TASK-12.2・#74。[`PipelineClient::send`] が id を先に確保して
+    /// フレームを組み立てるために使う）。
+    ///
+    /// 呼び出し元は事前に [`Self::ensure_can_register`] で登録可能であることを
+    /// 確認しておくこと。本メソッド自身は上限到達・id 採番の溢れを検証せず、
+    /// [`Self::queue_id`] の枯渇（実用上起こり得ない）のみを
+    /// [`IoErrorCode::ResourceExhausted`] として検出する（[`Self::register`] と
+    /// 同じフォールバック。`unwrap`・`expect` を使わず `Result` で扱う）。
+    pub(crate) fn peek_next_id(&self) -> Result<RequestId, IoError> {
+        let queue_id = self.queue_id.ok_or_else(|| {
+            IoError::new(
+                IoErrorCode::ResourceExhausted,
+                "queue id counter would overflow u64; this queue can no longer register requests",
+            )
+        })?;
+        Ok(RequestId {
+            queue_id,
+            seq: self.next_id,
+        })
+    }
+
     /// 新しい id を採番し、末尾に登録する。
     ///
     /// `kind` が [`FrameKind::Write`] / [`FrameKind::Flush`] 以外
@@ -470,6 +491,14 @@ pub enum SendOutcome {
     /// （[`QueueId`]）の採番カウンタ枯渇（TASK-12.1・#73 codex 再指摘対応。P1。
     /// 実用上起こり得ない）で拒否した。
     RejectedResourceExhausted,
+    /// [`crate::payload::encode_request`] がペイロード形式の検証（`Write` の body
+    /// 長超過・`Flush` に body がある等）で拒否した（TASK-12.2・#74）。
+    ///
+    /// 未 ACK キューへは登録前に検出されるため、キューの状態は変化しない。
+    /// `RejectedInvalidFrameKind`（フレーム種別そのものが追跡対象外）とは別に
+    /// 区別する（body 長違反を既存の種別に混ぜると誤った分類になるため。
+    /// REPAIR-4）。
+    RejectedInvalidPayload,
     /// トランスポートへの書き込みが失敗し、クライアントを失効させた。
     TransportFailure,
 }
@@ -622,6 +651,7 @@ pub struct SendMetrics {
     rejected_poisoned_count: u64,
     rejected_invalid_frame_kind_count: u64,
     rejected_resource_exhausted_count: u64,
+    rejected_invalid_payload_count: u64,
     transport_failure_count: u64,
     /// トランスポートへ実際に書き込んだ呼び出し（`Success`・`TransportFailure`）
     /// の所要時間分布。早期に拒否した呼び出し（`RejectedPoisoned` 等）はここへ
@@ -646,6 +676,10 @@ impl SendMetrics {
             SendOutcome::RejectedResourceExhausted => {
                 self.rejected_resource_exhausted_count =
                     self.rejected_resource_exhausted_count.saturating_add(1);
+            }
+            SendOutcome::RejectedInvalidPayload => {
+                self.rejected_invalid_payload_count =
+                    self.rejected_invalid_payload_count.saturating_add(1);
             }
             SendOutcome::TransportFailure => {
                 self.transport_failure_count = self.transport_failure_count.saturating_add(1);
@@ -676,6 +710,12 @@ impl SendMetrics {
         self.rejected_resource_exhausted_count
     }
 
+    /// [`crate::payload::encode_request`] のペイロード形式検証（`Write` の body
+    /// 長超過・`Flush` に body がある等）により拒否した回数（TASK-12.2・#74）。
+    pub fn rejected_invalid_payload_count(&self) -> u64 {
+        self.rejected_invalid_payload_count
+    }
+
     /// トランスポートへの書き込みが失敗し、クライアントを失効させた回数。
     pub fn transport_failure_count(&self) -> u64 {
         self.transport_failure_count
@@ -685,6 +725,169 @@ impl SendMetrics {
     /// 所要時間分布を返す。
     pub fn write_latency(&self) -> LatencyStats {
         self.write_latency
+    }
+}
+
+/// [`PipelineClient::recv_ack`] 1 回の結果種別（[`AckMetrics`] の内訳。TASK-12.2・#74
+/// codex 指摘対応。P1・REPAIR-4）。
+///
+/// [`PipelineClient::recv_ack`] のドキュメンテーションコメントに記した処理順の各
+/// 分岐に 1 対 1 で対応する。呼び出し元はこの内訳を使い、成功・タイムアウト・
+/// プロトコル違反（形式・送信順・種別）を区別して観測できる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AckOutcome {
+    /// 送信順・種別の対応付けまで検証し、未 ACK 枠を解放できた。
+    Success,
+    /// すでに失効済み（[`PipelineClient::is_poisoned`]）だったため拒否した
+    /// （`receiver` は呼ばない）。
+    RejectedPoisoned,
+    /// 未 ACK のリクエストが 1 件もない状態で呼ばれたため拒否した
+    /// （`receiver` は呼ばない。プロトコル違反ではないため失効させない）。
+    RejectedNoInFlight,
+    /// `receiver.recv_frame` がエラー（[`IoErrorCode::Timeout`] を含む）を返し、
+    /// クライアントを失効させた。
+    TransportFailure,
+    /// [`crate::payload::decode_ack`] のペイロード検証（種別違反・長さ違反）で
+    /// 拒否し、クライアントを失効させた。
+    RejectedInvalidPayload,
+    /// 受け取った request id がキュー内には存在するが最古ではなかった
+    /// （out-of-order ack）ため拒否し、クライアントを失効させた。
+    RejectedOutOfOrder,
+    /// 受け取った request id がキューのどこにも存在しなかった（unknown ack id）
+    /// ため拒否し、クライアントを失効させた。
+    RejectedUnknownAckId,
+    /// 送信時の [`FrameKind`] に対応する ACK 種別（`Write` → `Ack`・`Flush` →
+    /// `FlushAck`）と実際の受信種別が一致しなかったため拒否し、クライアントを
+    /// 失効させた。
+    RejectedAckKindMismatch,
+    /// 構造上起こらないはずの内部不整合（キューが空チェック後に空になった・
+    /// 追跡対象外のフレーム種別が未 ACK エントリに残っていた）を検出し、安全側に
+    /// 倒して拒否した。到達しない想定だが、`unwrap`・`expect` を避けるための
+    /// フォールバック分岐（coding-rust「ライブラリコードでは panic させない」）。
+    RejectedInternal,
+}
+
+/// [`PipelineClient::recv_ack`] の成功・失敗カウントと ACK 待機の所要時間分布を
+/// 保持する構造化メトリクス（TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
+///
+/// [`SendMetrics`] と対になる ACK 受信側の観測で、base 側 AGENTS.md が要求する
+/// 「I/O 操作の成功・失敗カウントとレイテンシ分布」を `recv_ack` についても満たす。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AckMetrics {
+    success_count: u64,
+    rejected_poisoned_count: u64,
+    rejected_no_in_flight_count: u64,
+    transport_failure_count: u64,
+    rejected_invalid_payload_count: u64,
+    rejected_out_of_order_count: u64,
+    rejected_unknown_ack_id_count: u64,
+    rejected_ack_kind_mismatch_count: u64,
+    rejected_internal_count: u64,
+    /// `receiver.recv_frame` を実際に呼び出した呼び出し（成功・失敗の両方）の
+    /// 所要時間分布。`receiver` を呼ばずに早期拒否した呼び出し
+    /// （`RejectedPoisoned`・`RejectedNoInFlight`）はここへ含めない（[`SendMetrics::write_latency`]
+    /// と同じ扱い）。
+    wait_latency: LatencyStats,
+}
+
+impl AckMetrics {
+    fn record(&mut self, outcome: AckOutcome, elapsed: Duration) {
+        match outcome {
+            AckOutcome::Success => {
+                self.success_count = self.success_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+            AckOutcome::RejectedPoisoned => {
+                self.rejected_poisoned_count = self.rejected_poisoned_count.saturating_add(1);
+            }
+            AckOutcome::RejectedNoInFlight => {
+                self.rejected_no_in_flight_count =
+                    self.rejected_no_in_flight_count.saturating_add(1);
+            }
+            AckOutcome::TransportFailure => {
+                self.transport_failure_count = self.transport_failure_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+            AckOutcome::RejectedInvalidPayload => {
+                self.rejected_invalid_payload_count =
+                    self.rejected_invalid_payload_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+            AckOutcome::RejectedOutOfOrder => {
+                self.rejected_out_of_order_count =
+                    self.rejected_out_of_order_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+            AckOutcome::RejectedUnknownAckId => {
+                self.rejected_unknown_ack_id_count =
+                    self.rejected_unknown_ack_id_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+            AckOutcome::RejectedAckKindMismatch => {
+                self.rejected_ack_kind_mismatch_count =
+                    self.rejected_ack_kind_mismatch_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+            AckOutcome::RejectedInternal => {
+                self.rejected_internal_count = self.rejected_internal_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
+        }
+    }
+
+    /// 送信順・種別の対応付けまで検証し、未 ACK 枠を解放できた回数。
+    pub fn success_count(&self) -> u64 {
+        self.success_count
+    }
+
+    /// [`PipelineClient::is_poisoned`] により拒否した回数（`receiver` を呼ばない）。
+    pub fn rejected_poisoned_count(&self) -> u64 {
+        self.rejected_poisoned_count
+    }
+
+    /// 未 ACK のリクエストが 1 件もない状態で呼ばれ拒否した回数
+    /// （`receiver` を呼ばない）。
+    pub fn rejected_no_in_flight_count(&self) -> u64 {
+        self.rejected_no_in_flight_count
+    }
+
+    /// `receiver.recv_frame` がエラー（タイムアウトを含む）を返し失効させた回数。
+    pub fn transport_failure_count(&self) -> u64 {
+        self.transport_failure_count
+    }
+
+    /// ACK ペイロードの形式検証で拒否し失効させた回数。
+    pub fn rejected_invalid_payload_count(&self) -> u64 {
+        self.rejected_invalid_payload_count
+    }
+
+    /// 受信 ACK の request id がキュー内には存在するが最古ではなく拒否し
+    /// 失効させた回数（out-of-order ack）。
+    pub fn rejected_out_of_order_count(&self) -> u64 {
+        self.rejected_out_of_order_count
+    }
+
+    /// 受信 ACK の request id がキューのどこにも存在せず拒否し失効させた回数
+    /// （unknown ack id）。
+    pub fn rejected_unknown_ack_id_count(&self) -> u64 {
+        self.rejected_unknown_ack_id_count
+    }
+
+    /// 送信時のフレーム種別に対応しない ACK 種別を受け取り拒否し失効させた回数。
+    pub fn rejected_ack_kind_mismatch_count(&self) -> u64 {
+        self.rejected_ack_kind_mismatch_count
+    }
+
+    /// 構造上起こらないはずの内部不整合を検出し拒否した回数（到達しない想定の
+    /// フォールバック分岐。[`AckOutcome::RejectedInternal`] 参照）。
+    pub fn rejected_internal_count(&self) -> u64 {
+        self.rejected_internal_count
+    }
+
+    /// `receiver.recv_frame` を実際に呼び出した呼び出し（成功・失敗の両方）の
+    /// 所要時間分布を返す。
+    pub fn wait_latency(&self) -> LatencyStats {
+        self.wait_latency
     }
 }
 
@@ -717,10 +920,15 @@ where
     /// [`Self::send`] の成功・失敗カウントとレイテンシ分布（TASK-12.1・#73 codex
     /// 指摘対応。P1・REPAIR-4）。
     metrics: SendMetrics,
+    /// [`Self::recv_ack`] の成功・失敗カウントと ACK 待機の所要時間分布
+    /// （TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
+    ack_metrics: AckMetrics,
     /// [`Self::send`] のたびに通知する送信イベントの観測フック（TASK-12.1・#73
     /// codex 指摘対応。P1・REPAIR-4）。[`Self::new`] の必須引数であり、観測しない
     /// 場合は呼び出し元が [`crate::observe::NoopSendObserver`] を明示的に渡す（codex P1 再指摘
     /// 対応。既定を暗黙に選ばず、観測先の指定を構築時の必須契約にする）。
+    /// [`Self::recv_ack`] の ACK イベントも同じ観測フック（[`SendObserver::on_ack`]）
+    /// へ通知する（TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
     observer: O,
 }
 
@@ -748,6 +956,7 @@ where
             queue: SendQueue::new(limit),
             poisoned: false,
             metrics: SendMetrics::default(),
+            ack_metrics: AckMetrics::default(),
             observer,
         }
     }
@@ -766,6 +975,18 @@ where
     /// 集計値であり、送信のたびに自動で外部へ出力する経路ではない）。
     pub fn metrics(&self) -> &SendMetrics {
         &self.metrics
+    }
+
+    /// [`Self::recv_ack`] の成功・失敗カウントと ACK 待機の所要時間分布を参照する
+    /// （TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。呼び出し元はここから
+    /// 読み出した値を、任意のログ・メトリクス基盤へ変換して出力する。
+    ///
+    /// 受信の都度リアルタイムに出力したい場合は [`Self::new`] へ渡す
+    /// [`SendObserver`]（[`SendObserver::on_ack`]）を使う（本メソッドは呼び出し元が
+    /// 明示的に読み出す集計値であり、`recv_ack` のたびに自動で外部へ出力する
+    /// 経路ではない）。
+    pub fn ack_metrics(&self) -> &AckMetrics {
+        &self.ack_metrics
     }
 
     /// [`Self::new`] へ渡した観測フックを参照する（TASK-12.1・#73
@@ -845,24 +1066,42 @@ where
         Ok(self.sender)
     }
 
-    /// フレームを送信する。ACK は待たない。
+    /// `kind`（[`FrameKind::Write`] / [`FrameKind::Flush`]）と `body` からフレームを
+    /// 組み立てて送信する。ACK は待たない（TASK-12.2・#74。TASK-12.1 の `send(&Frame,
+    /// ..)` を置き換える）。
     ///
-    /// 処理順（トランスポートへ書き込む前に上限判定・id 確保を行う。REPAIR-5・
-    /// security.md「不安全な設計」観点）:
+    /// # フレームを呼び出し元が組み立てられない理由
+    ///
+    /// request id は [`SendQueue::register`] が初めて採番するため、呼び出し元が
+    /// 送信前に完成したフレームを渡すことができない（[`crate::payload`] モジュール
+    /// ドキュメント参照）。本メソッドが [`crate::payload::encode_request`] で id を
+    /// 埋め込んだフレームを内部で組み立てる。
+    ///
+    /// 処理順（拒否したときはキューの状態を変えない。REPAIR-5・security.md
+    /// 「不安全な設計」観点）:
     /// 1. すでに失効済み（[`Self::is_poisoned`]）なら [`IoErrorCode::Unavailable`]
     ///    を返す（トランスポートへは書き込まない）
-    /// 2. `frame.kind()` が [`FrameKind::Write`] / [`FrameKind::Flush`] 以外
+    /// 2. `kind` が [`FrameKind::Write`] / [`FrameKind::Flush`] 以外
     ///    （[`FrameKind::Ack`] / [`FrameKind::FlushAck`] は応答フレームであり
     ///    対応する ACK が来ないため、未 ACK キューに載せると枠が解放されない。
     ///    IO-1 の未 ACK リクエスト追跡契約の対象外）なら
     ///    [`IoErrorCode::InvalidArgument`] を返す（[`ensure_trackable_frame_kind`]。
     ///    [`SendQueue::register`] も同じ検証を共有する）
-    /// 3. 未 ACK 件数が上限に達していれば、あるいは id 採番が溢れるなら
-    ///    [`IoErrorCode::ResourceExhausted`] を返す（この時点ではトランスポートへ
-    ///    書き込まない）
-    /// 4. [`SendQueue::register`] で id を先に確保してキューへ登録する（送信前に
-    ///    確保することで、送信結果が不明なエラーが起きても id を使い回さない）
-    /// 5. `sender.send_frame` でトランスポートへ書き出す。失敗した場合、
+    /// 3. [`SendQueue::ensure_can_register`] で未 ACK 件数の上限到達・id 採番の
+    ///    溢れを検証する。不可なら [`IoErrorCode::ResourceExhausted`] を返す
+    ///    （この時点ではトランスポートへ書き込まない）
+    /// 4. [`SendQueue::peek_next_id`] で次に採番されるであろう id を覗き見て、
+    ///    [`crate::payload::encode_request`] でフレームを組み立てる。この時点では
+    ///    まだキューへ登録せず、トランスポートへも書き込まない。ペイロード形式の
+    ///    検証（`Write` の body 長超過・`Flush` に body がある等）が失敗した場合は
+    ///    [`SendOutcome::RejectedInvalidPayload`] としてそのエラーを返す
+    /// 5. [`SendQueue::register`] で id を確保してキューへ登録する（送信前に
+    ///    確保することで、送信結果が不明なエラーが起きても id を使い回さない）。
+    ///    返った id が手順 4 で覗き見た id と一致しない場合（単一スレッド前提
+    ///    〔`&mut self`〕のこの型では構造上起こらないはずの内部不整合）は、
+    ///    誤ったペイロードを送らないよう登録を取り消して
+    ///    [`IoErrorCode::Internal`] を返す
+    /// 6. `sender.send_frame` でトランスポートへ書き出す。失敗した場合、
     ///    [`FrameSender::send_frame`] は「相手に届いていないことを保証しない」
     ///    契約であるため、届いた可能性を残したまま id を回収せず（キューの
     ///    エントリはそのまま残す）、[`Self::poisoned`] を立てて以降の送信を
@@ -876,12 +1115,17 @@ where
     /// 呼び出しごとに結果種別（[`SendOutcome`]）を [`Self::metrics`] へ記録し、
     /// [`SendEvent`] として [`Self::observer`]（`observer` フィールド。[`Self::new`]
     /// の必須引数）へも通知する。上限到達
-    /// （[`SendOutcome::RejectedResourceExhausted`]）・トランスポート失敗
+    /// （[`SendOutcome::RejectedResourceExhausted`]）・ペイロード形式違反
+    /// （[`SendOutcome::RejectedInvalidPayload`]）・トランスポート失敗
     /// （[`SendOutcome::TransportFailure`]）も含め、すべての分岐を計上・通知する。
     /// 所要時間はトランスポートへ実際に書き込んだ呼び出し（成功・失敗の両方）に
     /// ついてのみ計測する（早期拒否はトランスポートを介さないため `Duration::ZERO`）。
-    pub fn send(&mut self, frame: &Frame, timeout: IoTimeout) -> Result<InFlightRequest, IoError> {
-        let kind = frame.kind();
+    pub fn send(
+        &mut self,
+        kind: FrameKind,
+        body: &[u8],
+        timeout: IoTimeout,
+    ) -> Result<InFlightRequest, IoError> {
         if self.poisoned {
             self.metrics
                 .record(SendOutcome::RejectedPoisoned, Duration::ZERO);
@@ -914,6 +1158,34 @@ where
             );
             return Err(err);
         }
+        let peeked_id = match self.queue.peek_next_id() {
+            Ok(id) => id,
+            Err(err) => {
+                self.metrics
+                    .record(SendOutcome::RejectedResourceExhausted, Duration::ZERO);
+                self.notify(
+                    kind,
+                    SendOutcome::RejectedResourceExhausted,
+                    Duration::ZERO,
+                    &err,
+                );
+                return Err(err);
+            }
+        };
+        let frame = match payload::encode_request(kind, WireRequestId::from(peeked_id), body) {
+            Ok(frame) => frame,
+            Err(err) => {
+                self.metrics
+                    .record(SendOutcome::RejectedInvalidPayload, Duration::ZERO);
+                self.notify(
+                    kind,
+                    SendOutcome::RejectedInvalidPayload,
+                    Duration::ZERO,
+                    &err,
+                );
+                return Err(err);
+            }
+        };
         let request = match self.queue.register(kind) {
             Ok(request) => request,
             Err(err) => {
@@ -928,8 +1200,22 @@ where
                 return Err(err);
             }
         };
+        if request.id() != peeked_id {
+            // 単一スレッド前提（`&mut self`）のこの型では、手順 4（覗き見）と
+            // 手順 5（登録）の間に他の呼び出しが割り込む余地はなく、構造上
+            // 起こらないはずの内部不整合。とはいえ panic はせず（coding-rust）、
+            // 誤ったペイロード（覗き見た id で組み立て済みのフレーム）を送って
+            // しまう前に登録を取り消して拒否する。
+            let _ = self.queue.remove(request.id());
+            let err = IoError::new(
+                IoErrorCode::Internal,
+                "registered request id did not match the previously peeked id; \
+                 refusing to send a frame built for a different id",
+            );
+            return Err(err);
+        }
         let started_at = Instant::now();
-        if let Err(err) = self.sender.send_frame(frame, timeout) {
+        if let Err(err) = self.sender.send_frame(&frame, timeout) {
             // 送信結果が不明なため、request.id() をキューへ残したまま接続を
             // 失効させる（上記ドキュメンテーションコメント参照）。
             self.poisoned = true;
@@ -969,17 +1255,47 @@ where
         });
     }
 
-    /// 検証済み ACK の request id で未 ACK 枠を解放する（IO-1・TASK-12.1・#73
-    /// codex 再指摘対応。P1）。
+    /// [`Self::recv_ack`] の各失敗分岐から共通で呼び、[`Self::ack_metrics`] へ記録
+    /// したうえで [`AckEvent`]（失敗詳細つき）を [`Self::observer`] へ通知する
+    /// （TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
     ///
-    /// # ACK 検証の責務（TASK-12.2・#74 との境界）
+    /// [`Self::notify`]（送信側）と対になる ACK 受信側の入口。`err.message()` を
+    /// 借用のまま [`AckEventError::message`] へ渡し、複製しない
+    /// （[`SendEvent`]・[`AckEvent`] のドキュメント参照）。
     ///
-    /// ACK フレームの受信・デコード・ペイロード検証（request id が実在の未 ACK
-    /// リクエストに対応するかを含む）は #74（TASK-12.2）の範囲で、本メソッドは
-    /// その検証を行わない。契約は「呼び出し元がすでに検証済みの request id を
-    /// 渡す」ことであり、#74 が受信した検証済み ACK の request id でこの API を
-    /// 呼ぶ想定。現時点ではまだ ACK の受信・検証経路がないため、呼び出し元が
-    /// 自分で ACK を解釈してこの API を呼ぶ（REPAIR-3。スタブの明示）。
+    /// `ack_kind` は呼び出し元が `crate::payload::decode_ack` で復号済みの種別を
+    /// 渡す（未復号の早期拒否では `None`。[`AckEvent::ack_kind`] のドキュメント
+    /// 参照。TASK-12.2・#74 codex P1 再指摘対応。IO-1・IO-2・REPAIR-4）。
+    fn notify_ack(
+        &mut self,
+        outcome: AckOutcome,
+        ack_kind: Option<FrameKind>,
+        latency: Duration,
+        err: &IoError,
+    ) {
+        self.ack_metrics.record(outcome, latency);
+        self.observer.on_ack(&AckEvent {
+            outcome,
+            ack_kind,
+            latency,
+            error: Some(AckEventError {
+                code: err.code(),
+                message: err.message(),
+            }),
+        });
+    }
+
+    /// 検証済み ACK の request id で未 ACK 枠を解放する、メモリ内の低水準な入口
+    /// （IO-1・TASK-12.1・#73 codex 再指摘対応。P1）。
+    ///
+    /// # 呼び出し元の責務
+    ///
+    /// 本メソッドは「渡された `id` が実在の未 ACK リクエストに対応するかどうか」
+    /// （キューに存在するか・自分自身が発行元か）だけを検証し、ACK フレーム自体の
+    /// 受信・デコード・送信順の照合は行わない。ワイヤー経路（トランスポートから
+    /// 届く ACK フレーム）を扱う場合は [`Self::recv_ack`]（TASK-12.2・#74）を使う
+    /// こと。本メソッドはテストや、すでに検証済みの id を直接扱いたい場合の
+    /// 低水準な入口として残す。
     ///
     /// 未登録の id・すでに解放済み（二重 acknowledge）の id は
     /// [`IoErrorCode::InvalidArgument`] で拒否し、キューの状態を変更しない
@@ -989,6 +1305,276 @@ where
     /// 引き続き失効したまま（[`Self::is_poisoned`]）で、新しい送信は拒否され続ける。
     pub fn acknowledge(&mut self, id: RequestId) -> Result<InFlightRequest, IoError> {
         self.queue.remove(id)
+    }
+}
+
+impl<S, O> PipelineClient<S, O>
+where
+    S: FrameSender<Frame = Frame> + FrameReceiver<Frame = Frame>,
+    O: SendObserver,
+{
+    /// トランスポートから ACK フレームを 1 つ受信し、送信順（[`SendQueue::oldest`]）
+    /// で検証・対応付けしてから未 ACK 枠を解放する（IO-1・IO-2・TASK-12.2・#74）。
+    ///
+    /// # 送受信を同じ接続へ束ねる理由（TASK-12.2・#74 codex 再指摘対応。P0）
+    ///
+    /// 本メソッドは引数で任意の受信側を受け取らず、[`Self::new`] へ渡した送信用
+    /// トランスポート（`self.sender`）自身から [`FrameReceiver::recv_frame`] で
+    /// ACK を受信する（このため `S` は本 impl ブロックで [`FrameSender`] に加えて
+    /// [`FrameReceiver`] も実装している必要がある）。以前の実装は
+    /// `receiver: &mut R`（`S` とは無関係な任意のトランスポート）を引数に取って
+    /// いたが、ワイヤー上の request id は各クライアントで `0` から独立に採番される
+    /// （モジュール冒頭参照）ため、呼び出し元が誤って別接続（別
+    /// [`PipelineClient`]）の受信側を渡すと、id と種別だけの照合を通過して
+    /// 未 ACK 枠を誤って解放できてしまっていた。[`FrameKind::FlushAck`] の場合は
+    /// 実際には永続化されていない書き込みを完了扱いにしてしまい、IO-2
+    /// （フラッシュバリア保証）に反する。送受信を同じ接続オブジェクトへ束ねる
+    /// ことで、この誤対応付けを型レベルで起こせなくする（送信側と受信側を
+    /// スレッドで分ける API は引き続き範囲外〔モジュール冒頭「#74（TASK-12.2）
+    /// 以降に残る範囲」参照〕で、本メソッドは単一スレッド前提〔`&mut self`〕の
+    /// まま実装する）。
+    ///
+    /// # 処理順（拒否・失効時の分岐は fail-closed。security.md「不安全な設計」観点）
+    ///
+    /// 1. すでに失効済み（[`Self::is_poisoned`]）なら [`IoErrorCode::Unavailable`]
+    ///    を返す（`self.sender.recv_frame` は一切呼ばない）
+    /// 2. 未 ACK のリクエストが 1 件もなければ [`IoErrorCode::InvalidArgument`] を
+    ///    返す（`self.sender.recv_frame` は呼ばない。待つ対象がない呼び出しの
+    ///    誤りであり、プロトコル違反ではないため接続は失効させない）
+    /// 3. `self.sender.recv_frame(timeout)` を呼ぶ。`Err` なら本メソッドが
+    ///    [`Self::poisoned`] を立ててから、そのエラー（[`IoErrorCode::Timeout`] を
+    ///    含む）をそのまま返す。[`FrameReceiver::recv_frame`] の契約
+    ///    （P1-3・`crate::transport` モジュールドキュメント）により、エラーを
+    ///    返した接続は以後使用不可であり、「まだ ACK が来ていないので再試行」
+    ///    という意味を持たない。同じ接続でポーリングする使い方は想定しない
+    /// 4. [`crate::payload::decode_ack`] でペイロードを検証する。失敗（種別違反・
+    ///    長さ違反）したら失効させて [`IoErrorCode::InvalidArgument`] を返す
+    ///    （プロトコル違反）
+    /// 5. **送信順の照合（厳格）**: 受け取った request id が
+    ///    [`SendQueue::oldest`] の id と一致しなければ失効させて
+    ///    [`IoErrorCode::InvalidArgument`] を返す。id がキュー内には存在するが
+    ///    最古ではない場合は "out-of-order ack"、キューのどこにも存在しない場合は
+    ///    "unknown ack id" とメッセージを区別する（[`SendQueue`] は FIFO であり、
+    ///    サーバー側は送信順に ACK を返す設計〔TASK-13.2〕を前提とする。順序が
+    ///    入れ替わる必要が生じた場合は TASK-13 側で本方針を見直す）
+    /// 6. 種別の対応を確かめる。[`FrameKind::Ack`] は [`FrameKind::Write`] に、
+    ///    [`FrameKind::FlushAck`] は [`FrameKind::Flush`] に対応しなければ
+    ///    ならない。ずれていれば失効させて [`IoErrorCode::InvalidArgument`] を返す
+    /// 7. [`SendQueue::remove`] で自分のキューの id を使って解放し、
+    ///    [`AckReceipt`] を返す
+    ///
+    /// # IO-1・IO-2 の保証範囲の違い
+    ///
+    /// [`FrameKind::Ack`] は対応する書き込みがバッファリングされたことのみを
+    /// 保証し（IO-1）、[`FrameKind::FlushAck`] はそのバリア以前に受理した
+    /// すべての書き込みが永続化済みであることを保証する（IO-2）。本メソッドの
+    /// 送信順照合はどちらの種別でも同じ規則（キュー先頭との一致）を使い、
+    /// この保証範囲の違いと矛盾しない。
+    ///
+    /// # 観測（TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）
+    ///
+    /// 呼び出しごとに結果種別（[`AckOutcome`]）を [`Self::ack_metrics`] へ記録し、
+    /// [`AckEvent`] として [`Self::observer`]（`observer` フィールド。[`Self::new`]
+    /// の必須引数）へも通知する。受信成功・タイムアウトを含むトランスポート失敗
+    /// （[`AckOutcome::TransportFailure`]）・ペイロード形式違反
+    /// （[`AckOutcome::RejectedInvalidPayload`]）・送信順照合違反
+    /// （[`AckOutcome::RejectedOutOfOrder`]・[`AckOutcome::RejectedUnknownAckId`]）・
+    /// 種別対応違反（[`AckOutcome::RejectedAckKindMismatch`]）も含め、すべての
+    /// 分岐を計上・通知する。所要時間は `self.sender.recv_frame` を実際に呼び出した
+    /// 呼び出し（成功・失敗の両方）に対して計測し、それより前の早期拒否
+    /// （[`AckOutcome::RejectedPoisoned`]・[`AckOutcome::RejectedNoInFlight`]）は
+    /// [`Duration::ZERO`] とする（[`Self::send`] の早期拒否と同じ扱い）。
+    pub fn recv_ack(&mut self, timeout: IoTimeout) -> Result<AckReceipt, IoError> {
+        if self.poisoned {
+            let err = IoError::new(
+                IoErrorCode::Unavailable,
+                "pipeline client is poisoned after an ambiguous send failure; reconnect required",
+            );
+            self.notify_ack(AckOutcome::RejectedPoisoned, None, Duration::ZERO, &err);
+            return Err(err);
+        }
+        if self.queue.is_empty() {
+            let err = IoError::new(
+                IoErrorCode::InvalidArgument,
+                "recv_ack called with no in-flight requests to match against",
+            );
+            self.notify_ack(AckOutcome::RejectedNoInFlight, None, Duration::ZERO, &err);
+            return Err(err);
+        }
+
+        let started_at = Instant::now();
+
+        let frame = match self.sender.recv_frame(timeout) {
+            Ok(frame) => frame,
+            Err(err) => {
+                // P1-3（`crate::transport` モジュールドキュメント）: エラーを
+                // 返した接続はどんなエラーであれ以後使用不可。「まだ来ていない
+                // だけ」という再試行の余地を残さない。
+                self.poisoned = true;
+                let elapsed = started_at.elapsed();
+                self.notify_ack(AckOutcome::TransportFailure, None, elapsed, &err);
+                return Err(err);
+            }
+        };
+
+        let ack = match payload::decode_ack(&frame) {
+            Ok(ack) => ack,
+            Err(err) => {
+                self.poisoned = true;
+                let elapsed = started_at.elapsed();
+                self.notify_ack(AckOutcome::RejectedInvalidPayload, None, elapsed, &err);
+                return Err(err);
+            }
+        };
+
+        // `is_empty` を上で確認済みだが、`oldest` は `Option` を返す契約のため
+        // `unwrap`・`expect` は使わず `Result` 経由でフォールバックする
+        // （coding-rust「ライブラリコードでは panic させない」）。到達しない
+        // はずの経路でも `Internal` として安全側に倒す。
+        let oldest = match self.queue.oldest().copied() {
+            Some(oldest) => oldest,
+            None => {
+                self.poisoned = true;
+                let elapsed = started_at.elapsed();
+                let err = IoError::new(
+                    IoErrorCode::Internal,
+                    "in-flight queue became empty between the emptiness check and oldest() lookup",
+                );
+                self.notify_ack(
+                    AckOutcome::RejectedInternal,
+                    Some(ack.kind()),
+                    elapsed,
+                    &err,
+                );
+                return Err(err);
+            }
+        };
+
+        if oldest.id().get() != ack.id().get() {
+            self.poisoned = true;
+            let elapsed = started_at.elapsed();
+            let is_known_but_not_oldest = self
+                .queue
+                .iter()
+                .any(|entry| entry.id().get() == ack.id().get());
+            let (outcome, message) = if is_known_but_not_oldest {
+                (
+                    AckOutcome::RejectedOutOfOrder,
+                    format!(
+                        "out-of-order ack: received ack for request id {}, but the oldest \
+                         unacknowledged request id is {}",
+                        ack.id().get(),
+                        oldest.id().get()
+                    ),
+                )
+            } else {
+                (
+                    AckOutcome::RejectedUnknownAckId,
+                    format!(
+                        "unknown ack id: received ack for request id {}, which is not among \
+                         the {} in-flight request(s) tracked by this queue",
+                        ack.id().get(),
+                        self.queue.len()
+                    ),
+                )
+            };
+            let err = IoError::new(IoErrorCode::InvalidArgument, message);
+            self.notify_ack(outcome, Some(ack.kind()), elapsed, &err);
+            return Err(err);
+        }
+
+        let expected_ack_kind = match oldest.kind() {
+            FrameKind::Write => FrameKind::Ack,
+            FrameKind::Flush => FrameKind::FlushAck,
+            // `SendQueue::register`（`ensure_trackable_frame_kind` 経由）は
+            // `Write`/`Flush` 以外を受理しないため到達しないが、`unwrap`・
+            // `expect` を避け、フォールバックとして安全側（拒否）に倒す。
+            FrameKind::Ack | FrameKind::FlushAck => {
+                self.poisoned = true;
+                let elapsed = started_at.elapsed();
+                let err = IoError::new(
+                    IoErrorCode::Internal,
+                    "in-flight request has a non-trackable frame kind; this must not happen",
+                );
+                self.notify_ack(
+                    AckOutcome::RejectedInternal,
+                    Some(ack.kind()),
+                    elapsed,
+                    &err,
+                );
+                return Err(err);
+            }
+        };
+        if ack.kind() != expected_ack_kind {
+            self.poisoned = true;
+            let elapsed = started_at.elapsed();
+            let err = IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!(
+                    "ack kind mismatch: request id {} was sent as {:?} but the ack frame kind is {:?}",
+                    oldest.id().get(),
+                    oldest.kind(),
+                    ack.kind()
+                ),
+            );
+            self.notify_ack(
+                AckOutcome::RejectedAckKindMismatch,
+                Some(ack.kind()),
+                elapsed,
+                &err,
+            );
+            return Err(err);
+        }
+
+        let released = match self.queue.remove(oldest.id()) {
+            Ok(released) => released,
+            Err(err) => {
+                let elapsed = started_at.elapsed();
+                self.notify_ack(
+                    AckOutcome::RejectedInternal,
+                    Some(ack.kind()),
+                    elapsed,
+                    &err,
+                );
+                return Err(err);
+            }
+        };
+        let elapsed = started_at.elapsed();
+        self.ack_metrics.record(AckOutcome::Success, elapsed);
+        self.observer.on_ack(&AckEvent {
+            outcome: AckOutcome::Success,
+            ack_kind: Some(ack.kind()),
+            latency: elapsed,
+            error: None,
+        });
+        Ok(AckReceipt {
+            request: released,
+            ack_kind: ack.kind(),
+        })
+    }
+}
+
+/// [`PipelineClient::recv_ack`] が返す、検証・対応付け済みの ACK 受領記録
+/// （IO-1・IO-2・TASK-12.2・#74）。
+///
+/// フィールドは非公開でアクセサ経由にし、将来フィールドを追加できるようにする
+/// （coding-rust「戻り値は将来拡張できる構造を持つ型にする」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckReceipt {
+    request: InFlightRequest,
+    ack_kind: FrameKind,
+}
+
+impl AckReceipt {
+    /// この ACK が対応付けた、送信済みだった元のリクエストを返す。
+    pub fn request(&self) -> InFlightRequest {
+        self.request
+    }
+
+    /// 受信した ACK フレームの種別（[`FrameKind::Ack`] / [`FrameKind::FlushAck`]）を
+    /// 返す。
+    pub fn ack_kind(&self) -> FrameKind {
+        self.ack_kind
     }
 }
 
@@ -1002,14 +1588,24 @@ mod tests {
         IoTimeout::new(Duration::from_millis(1)).expect("1ms must be a valid timeout")
     }
 
-    fn write_frame(byte: u8) -> Frame {
-        Frame::new(FrameKind::Write, vec![byte]).expect("frame must be valid")
-    }
-
     /// テスト専用のモック sender。送信したフレームを記録し、常に成功する。
+    ///
+    /// `recv_script`・`recv_call_count` は [`FrameReceiver`] 実装用（TASK-12.2・#74
+    /// codex 再指摘対応。P0）: `recv_ack` が「送信に使うのと同じ接続オブジェクト」
+    /// からしか ACK を受信できなくなった（[`PipelineClient::recv_ack`] 参照）ため、
+    /// テストでも送信・受信を同じモック型に持たせる。台本が空なら常に
+    /// `Timeout` を返す（[`ScriptedReceiver`] と同じ挙動）。
     #[derive(Debug, Default)]
     struct RecordingSender {
         sent: Vec<Frame>,
+        recv_script: VecDeque<Result<Frame, IoError>>,
+        recv_call_count: usize,
+    }
+
+    impl RecordingSender {
+        fn recv_call_count(&self) -> usize {
+            self.recv_call_count
+        }
     }
 
     impl FrameSender for RecordingSender {
@@ -1018,6 +1614,21 @@ mod tests {
         fn send_frame(&mut self, frame: &Self::Frame, _timeout: IoTimeout) -> Result<(), IoError> {
             self.sent.push(frame.clone());
             Ok(())
+        }
+    }
+
+    impl FrameReceiver for RecordingSender {
+        type Frame = Frame;
+
+        fn recv_frame(&mut self, _timeout: IoTimeout) -> Result<Self::Frame, IoError> {
+            self.recv_call_count += 1;
+            match self.recv_script.pop_front() {
+                Some(result) => result,
+                None => Err(IoError::new(
+                    IoErrorCode::Timeout,
+                    "recording sender recv script exhausted",
+                )),
+            }
         }
     }
 
@@ -1112,7 +1723,7 @@ mod tests {
         let mut requests = Vec::new();
         for byte in [10u8, 20, 30] {
             let request = client
-                .send(&write_frame(byte), test_timeout())
+                .send(FrameKind::Write, &[byte], test_timeout())
                 .expect("send must succeed while under the limit");
             ids.push(request.id().get());
             requests.push(request);
@@ -1148,7 +1759,11 @@ mod tests {
             .expect("healthy client with a drained queue must yield its transport")
             .sent
             .iter()
-            .map(|frame| frame.payload()[0])
+            .map(|frame| {
+                payload::decode_request(frame)
+                    .expect("frame must decode as a request")
+                    .body()[0]
+            })
             .collect();
         assert_eq!(sent_bytes, vec![10, 20, 30]);
     }
@@ -1161,14 +1776,14 @@ mod tests {
         let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         let first = client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect("1st send must succeed");
         let second = client
-            .send(&write_frame(2), test_timeout())
+            .send(FrameKind::Write, &[2], test_timeout())
             .expect("2nd send must succeed");
 
         let err = client
-            .send(&write_frame(3), test_timeout())
+            .send(FrameKind::Write, &[3], test_timeout())
             .expect_err("3rd send must be rejected once the limit is reached");
         assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
 
@@ -1202,13 +1817,13 @@ mod tests {
         let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         let first = client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect("1st send must succeed");
         client
-            .send(&write_frame(2), test_timeout())
+            .send(FrameKind::Write, &[2], test_timeout())
             .expect("2nd send must succeed");
         client
-            .send(&write_frame(3), test_timeout())
+            .send(FrameKind::Write, &[3], test_timeout())
             .expect_err("3rd send must be rejected while full");
 
         client
@@ -1216,7 +1831,7 @@ mod tests {
             .expect("removing the released id must succeed");
 
         let third = client
-            .send(&write_frame(3), test_timeout())
+            .send(FrameKind::Write, &[3], test_timeout())
             .expect("send must succeed after a slot is released");
         assert_eq!(third.id().get(), 2);
 
@@ -1331,7 +1946,7 @@ mod tests {
         let mut client = PipelineClient::new(AlwaysTimeoutSender, limit, NoopSendObserver);
 
         let err = client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect_err("transport failure must propagate");
         assert_eq!(err.code(), IoErrorCode::Timeout);
         // 送信結果が不明なため id `0` の枠はキューに残ったままになる。
@@ -1340,7 +1955,7 @@ mod tests {
 
         // 失効後は再送を試みても id を再利用せず、常に `Unavailable` を返す。
         let err = client
-            .send(&write_frame(2), test_timeout())
+            .send(FrameKind::Write, &[2], test_timeout())
             .expect_err("poisoned client must reject further sends");
         assert_eq!(err.code(), IoErrorCode::Unavailable);
         assert_eq!(client.queue().len(), 1);
@@ -1357,7 +1972,7 @@ mod tests {
         let mut client = PipelineClient::new(AlwaysTimeoutSender, limit, NoopSendObserver);
 
         client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect_err("transport failure must propagate");
         assert!(client.is_poisoned());
 
@@ -1380,7 +1995,7 @@ mod tests {
         let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect("send must succeed while under the limit");
         assert!(!client.is_poisoned());
         assert_eq!(client.queue().len(), 1);
@@ -1401,7 +2016,7 @@ mod tests {
         let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         let request = client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect("send must succeed while under the limit");
         client
             .acknowledge(request.id())
@@ -1423,7 +2038,7 @@ mod tests {
         let mut client = PipelineClient::new(FailOnceSender::default(), limit, NoopSendObserver);
 
         let first_attempt = client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect_err("1st attempt must fail via the mock sender");
         assert_eq!(first_attempt.code(), IoErrorCode::Timeout);
         assert!(client.is_poisoned());
@@ -1441,7 +2056,7 @@ mod tests {
 
         // 失効した接続では id を再利用できない（Unavailable で拒否される）。
         let err = client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect_err("poisoned client must reject further sends");
         assert_eq!(err.code(), IoErrorCode::Unavailable);
 
@@ -1449,7 +2064,7 @@ mod tests {
         let mut fresh_client =
             PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
         let request = fresh_client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect("a fresh connection must succeed");
         assert_eq!(request.id().get(), 0);
         assert_eq!(fresh_client.queue().len(), 1);
@@ -1463,17 +2078,14 @@ mod tests {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
         let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
-        let ack_frame = Frame::new(FrameKind::Ack, Vec::new()).expect("frame must be valid");
         let err = client
-            .send(&ack_frame, test_timeout())
+            .send(FrameKind::Ack, &[], test_timeout())
             .expect_err("Ack frames must not be trackable as in-flight requests");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
         assert_eq!(client.queue().len(), 0);
 
-        let flush_ack_frame =
-            Frame::new(FrameKind::FlushAck, Vec::new()).expect("frame must be valid");
         let err = client
-            .send(&flush_ack_frame, test_timeout())
+            .send(FrameKind::FlushAck, &[], test_timeout())
             .expect_err("FlushAck frames must not be trackable as in-flight requests");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
         assert_eq!(client.queue().len(), 0);
@@ -1498,7 +2110,7 @@ mod tests {
         client.queue.set_next_id_for_test(u64::MAX);
 
         let err = client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect_err("id overflow must be rejected");
         assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
         assert_eq!(
@@ -1566,10 +2178,10 @@ mod tests {
         let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect("send must succeed while under the limit");
         client
-            .send(&write_frame(2), test_timeout())
+            .send(FrameKind::Write, &[2], test_timeout())
             .expect("send must succeed while under the limit");
 
         let metrics = client.metrics();
@@ -1590,10 +2202,10 @@ mod tests {
         let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
         client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect("1st send must succeed");
         let err = client
-            .send(&write_frame(2), test_timeout())
+            .send(FrameKind::Write, &[2], test_timeout())
             .expect_err("2nd send must be rejected once the limit is reached");
         assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
 
@@ -1614,10 +2226,10 @@ mod tests {
         let mut client = PipelineClient::new(AlwaysTimeoutSender, limit, NoopSendObserver);
 
         client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect_err("transport failure must propagate");
         client
-            .send(&write_frame(2), test_timeout())
+            .send(FrameKind::Write, &[2], test_timeout())
             .expect_err("poisoned client must reject further sends");
 
         let metrics = client.metrics();
@@ -1643,10 +2255,10 @@ mod tests {
         let mut client = PipelineClient::new(RecordingSender::default(), limit, observer);
 
         client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect("1st send must succeed under the limit");
         let err = client
-            .send(&write_frame(2), test_timeout())
+            .send(FrameKind::Write, &[2], test_timeout())
             .expect_err("2nd send must be rejected once the limit is reached");
         assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
         assert_eq!(
@@ -1680,9 +2292,8 @@ mod tests {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
         let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
-        let ack_frame = Frame::new(FrameKind::Ack, Vec::new()).expect("frame must be valid");
         client
-            .send(&ack_frame, test_timeout())
+            .send(FrameKind::Ack, &[], test_timeout())
             .expect_err("Ack frames must not be trackable as in-flight requests");
 
         let metrics = client.metrics();
@@ -1842,6 +2453,8 @@ mod tests {
                 self.captured = Some((error.message.as_ptr() as usize, error.message.len()));
             }
         }
+
+        fn on_ack(&mut self, _event: &AckEvent<'_>) {}
     }
 
     /// 項目 E（#73 P0 再指摘対応。REPAIR-5・REPAIR-12）: `PipelineClient::notify`
@@ -1857,7 +2470,7 @@ mod tests {
         let mut client = PipelineClient::new(HugeMessageTimeoutSender, limit, observer);
 
         let err = client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect_err("the mock sender always fails");
         assert_eq!(err.message().len(), HUGE_MESSAGE_LEN);
 
@@ -1959,7 +2572,7 @@ mod tests {
         let mut client = PipelineClient::new(AlwaysTimeoutSender, limit, NoopSendObserver);
 
         client
-            .send(&write_frame(1), test_timeout())
+            .send(FrameKind::Write, &[1], test_timeout())
             .expect_err("transport failure must poison the client");
         assert!(client.is_poisoned());
 
@@ -1987,5 +2600,109 @@ mod tests {
             "error must indicate the poisoned branch was hit, not the unacked-queue branch: {}",
             err.message()
         );
+    }
+
+    // --- TASK-12.2（#74）: ペイロード形式・ACK 受信のユニットテスト ---
+
+    /// TASK-12.2・IO-1: `SendQueue::peek_next_id` はキューの状態を変更せずに
+    /// 次の id を返す。`register` を呼んだ後の実際の id と一致する。
+    #[test]
+    fn io1_send_queue_peek_next_id_matches_next_register() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut queue = SendQueue::new(limit);
+
+        let peeked = queue.peek_next_id().expect("peek must succeed");
+        assert_eq!(peeked.get(), 0);
+        assert_eq!(queue.len(), 0, "peek must not register anything");
+
+        let registered = queue
+            .register(FrameKind::Write)
+            .expect("register must succeed");
+        assert_eq!(registered.id(), peeked);
+
+        let peeked_again = queue.peek_next_id().expect("peek must succeed again");
+        assert_eq!(peeked_again.get(), 1);
+    }
+
+    /// TASK-12.2・IO-1: `Flush` に空でない body を渡すと `send` は
+    /// `RejectedInvalidPayload`（`InvalidArgument`）で拒否し、キューへ登録しない。
+    #[test]
+    fn io1_send_rejects_invalid_payload_and_does_not_register() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
+
+        let err = client
+            .send(FrameKind::Flush, b"unexpected body", test_timeout())
+            .expect_err("flush with a body must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(client.queue().len(), 0);
+        assert_eq!(client.metrics().rejected_invalid_payload_count(), 1);
+
+        // 拒否後も採番カウンタは進んでいないため、id は 0 から始まる。
+        let request = client
+            .send(FrameKind::Flush, &[], test_timeout())
+            .expect("a valid flush must still succeed after a rejected payload");
+        assert_eq!(request.id().get(), 0);
+    }
+
+    /// TASK-12.2・IO-1: `recv_ack` は送信順に ACK を照合し、`AckReceipt` を返して
+    /// キューの枠を解放する。
+    #[test]
+    fn io1_recv_ack_matches_oldest_and_releases_slot() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
+
+        let request = client
+            .send(FrameKind::Write, &[1], test_timeout())
+            .expect("send must succeed");
+
+        let ack = payload::encode_ack(FrameKind::Ack, WireRequestId::from(request.id()))
+            .expect("encode_ack must succeed");
+        // `client` は同じモジュール内で定義されているため、テストから private
+        // フィールド `sender` へ直接アクセスできる（send/recv を同じ接続へ束ねた
+        // ことの確認のため、テスト専用の別経路は用意しない）。
+        client.sender.recv_script.push_back(Ok(ack));
+
+        let receipt = client
+            .recv_ack(test_timeout())
+            .expect("recv_ack must succeed");
+        assert_eq!(receipt.request().id().get(), request.id().get());
+        assert_eq!(receipt.ack_kind(), FrameKind::Ack);
+        assert!(client.queue().is_empty());
+        assert!(!client.is_poisoned());
+    }
+
+    /// TASK-12.2・IO-1（REPAIR-5）: 台本が空なら `recv_ack` は `Timeout` を返して
+    /// クライアントを失効させる。
+    #[test]
+    fn repair5_recv_ack_timeout_poisons_client() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
+        client
+            .send(FrameKind::Write, &[1], test_timeout())
+            .expect("send must succeed");
+
+        // `recv_script` は空のまま（台本切れは常に `Timeout` を返す。
+        // `RecordingSender::recv_frame` 参照）。
+        let err = client
+            .recv_ack(test_timeout())
+            .expect_err("empty script must time out");
+        assert_eq!(err.code(), IoErrorCode::Timeout);
+        assert!(client.is_poisoned());
+    }
+
+    /// TASK-12.2・IO-1: 未 ACK が 0 件のときの `recv_ack` は受信側に触れず
+    /// `InvalidArgument` を返す。
+    #[test]
+    fn io1_recv_ack_rejects_empty_queue_without_calling_receiver() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
+
+        let err = client
+            .recv_ack(test_timeout())
+            .expect_err("recv_ack with an empty queue must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(client.sender.recv_call_count(), 0);
+        assert!(!client.is_poisoned());
     }
 }

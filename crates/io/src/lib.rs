@@ -8,12 +8,11 @@
 //! [`client::PipelineClient`]。TASK-12.1・#73）と、送信イベントを記録する観測フック
 //! （[`observe`]。TASK-12.1・#73 codex 指摘対応。REPAIR-4・REPAIR-5）を持つ。
 //! トランスポートの具象実装（UDS・vsock・named pipe 等）・
-//! ディスク書き込み・ACK 返却はまだない（REPAIR-3。スタブの明示）。
-//! [`protocol::Frame`] はヘッダ・ペイロード・CRC-32C チェックサムのエンコード /
-//! デコードを提供するが、request id のワイヤー表現・ACK status のペイロード
-//! レイアウト、種別ごとのペイロード長制約は TASK-12.2（#74）・TASK-13（または
-//! それらの後続 sub-issue）が定める。ACK フレームの受信・対応付け・タイムアウト付き
-//! 待機は TASK-12.2（#74）が [`client`] モジュールへ追加する。
+//! ディスク書き込みはまだない（REPAIR-3。スタブの明示）。
+//! [`protocol::Frame`] のペイロード内部レイアウト（request id・ACK の対応付け）は
+//! [`payload`] モジュール（TASK-12.2・#74）が定める。[`client::PipelineClient::send`]
+//! はこの形式で request id を埋め込み、[`client::PipelineClient::recv_ack`]
+//! （TASK-12.2・#74）が送信順で ACK を検証・対応付けし、タイムアウト付きで待つ。
 //! [`batch::BatchBuffer`] は受信した `Write` フレームを既定 64 件（設定可能）単位で
 //! 集約するメモリ内ロジックのみを提供し、UDS 受信ループ・ディスク書き込み・ACK 送出は
 //! TASK-13.2 系の後続 sub-issue が担う。受信フレームの長さ・件数を本体バッファ確保前に
@@ -32,6 +31,7 @@ mod checksum;
 pub mod client;
 pub mod error;
 pub mod observe;
+pub mod payload;
 pub mod protocol;
 pub mod recv_limits;
 pub mod transport;
@@ -40,15 +40,19 @@ pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
 };
 pub use client::{
-    DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest, LATENCY_HISTOGRAM_BUCKETS,
-    LatencyStats, MAX_IN_FLIGHT_LIMIT, PipelineClient, RequestId, SendMetrics, SendOutcome,
-    SendQueue,
+    AckMetrics, AckOutcome, AckReceipt, DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest,
+    LATENCY_HISTOGRAM_BUCKETS, LatencyStats, MAX_IN_FLIGHT_LIMIT, PipelineClient, RequestId,
+    SendMetrics, SendOutcome, SendQueue,
 };
 pub use error::{IoError, IoErrorCode};
 pub use observe::{
-    DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver, MAX_SEND_LOG_BUFFER_BYTES,
-    MAX_SEND_LOG_CAPACITY, MAX_SEND_LOG_MESSAGE_BYTES, NoopSendObserver, SendEvent, SendEventError,
-    SendObserver,
+    AckEvent, AckEventError, DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver,
+    MAX_SEND_LOG_BUFFER_BYTES, MAX_SEND_LOG_CAPACITY, MAX_SEND_LOG_MESSAGE_BYTES, NoopSendObserver,
+    SendEvent, SendEventError, SendObserver,
+};
+pub use payload::{
+    ACK_PAYLOAD_LEN, AckEnvelope, MAX_WRITE_BODY_LEN, REQUEST_ID_WIRE_LEN, RequestEnvelope,
+    WireRequestId, decode_ack, decode_request, encode_ack, encode_request,
 };
 pub use protocol::{
     CHECKSUM_LEN, FRAME_HEADER_LEN, Frame, FrameChecksum, FrameHeader, FrameKind, MAX_FRAME_LEN,

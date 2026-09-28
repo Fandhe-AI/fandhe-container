@@ -37,7 +37,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
 
-use crate::client::SendOutcome;
+use crate::client::{AckOutcome, SendOutcome};
 use crate::error::{IoError, IoErrorCode};
 use crate::protocol::FrameKind;
 
@@ -126,20 +126,101 @@ impl fmt::Debug for SendEventError<'_> {
     }
 }
 
-/// [`crate::client::PipelineClient::send`] の送信イベントを受け取る観測フック
-/// （TASK-12.1・#73 codex 指摘対応。P1・REPAIR-4・REPAIR-5）。
+/// [`crate::client::PipelineClient::recv_ack`] 1 回分の ACK 受信イベント
+/// （TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
 ///
-/// 呼び出しは送信のたびに同期的・単一スレッドで行われる（[`crate::client::PipelineClient`]
-/// 自体が `&mut self` を要求し単一スレッド前提であることと同じ契約）。
+/// [`SendEvent`] の ACK 受信版で、[`crate::client::AckMetrics`] が集計している
+/// 事象（結果種別・所要時間）と対応させる。[`SendEvent`] と同様に将来フィールドを
+/// 追加できるよう `#[non_exhaustive]` にする（REPAIR-3）。
+///
+/// # 借用型である理由
+///
+/// [`SendEvent`] のドキュメント参照。`error`（[`AckEventError::message`]）は
+/// 呼び出し元（[`crate::client::PipelineClient::notify_ack`]）が保持する
+/// [`crate::error::IoError`] の内部文字列を借用するだけで、複製しない。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AckEvent<'a> {
+    /// [`AckOutcome`]（成功・各拒否理由・トランスポート失敗）。
+    pub outcome: AckOutcome,
+    /// 受信・デコード済みの ACK フレーム種別（[`FrameKind::Ack`] は IO-1 の
+    /// バッファリング保証、[`FrameKind::FlushAck`] は IO-2 の永続化保証に対応する。
+    /// `PipelineClient::recv_ack` のドキュメント「IO-1・IO-2 の保証範囲の違い」
+    /// 参照）。`crate::payload::decode_ack` がフレームを検証する前の早期拒否
+    /// （[`AckOutcome::RejectedPoisoned`]・[`AckOutcome::RejectedNoInFlight`]・
+    /// [`AckOutcome::TransportFailure`]・[`AckOutcome::RejectedInvalidPayload`]）
+    /// では種別が確定していないため `None` になる。それ以外（送信順照合以降の
+    /// 分岐・成功）は必ず `Some` になる（TASK-12.2・#74 codex P1 再指摘対応。
+    /// IO-1・IO-2・REPAIR-4:
+    /// 通常のバッファリング ACK と永続化保証の FlushAck を構造化ログ／観測
+    /// イベントから区別できるようにする）。
+    pub ack_kind: Option<FrameKind>,
+    /// `receiver.recv_frame` を実際に呼び出した呼び出しの所要時間。早期拒否
+    /// （`receiver` を呼ばない分岐）の場合は `Duration::ZERO`
+    /// （[`crate::client::AckMetrics`] と同じ扱い）。
+    pub latency: Duration,
+    /// `outcome` が失敗系だった場合の詳細（エラーコード・メッセージ）。
+    /// 成功時は `None`。
+    pub error: Option<AckEventError<'a>>,
+}
+
+/// 件数・破棄数等の要約のみを出す手書きの `Debug`（[`SendEvent`] と同じ理由）。
+impl fmt::Debug for AckEvent<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AckEvent")
+            .field("outcome", &self.outcome)
+            .field("ack_kind", &self.ack_kind)
+            .field("latency", &self.latency)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+/// [`AckEvent::error`] が保持する失敗詳細（TASK-12.2・#74 codex 指摘対応。P1）。
+///
+/// 借用の契約は [`SendEventError`] と同じ（呼び出し中のみ有効。REPAIR-5）。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AckEventError<'a> {
+    /// 機械可読なエラーコード（ERR-1）。
+    pub code: IoErrorCode,
+    /// 人間可読なエラーメッセージ。トランスポート実装（untrusted な相手側）由来の
+    /// 文字列を含みうるため、[`JsonLinesSendObserver`] は出力時にエスケープする。
+    pub message: &'a str,
+}
+
+/// [`SendEventError`] と同じ理由の手書き `Debug`。
+impl fmt::Debug for AckEventError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (prefix, truncated) = truncate_message_bytes(self.message);
+        f.debug_struct("AckEventError")
+            .field("code", &self.code)
+            .field("message_len", &self.message.len())
+            .field("message_prefix", &prefix)
+            .field("message_truncated", &truncated)
+            .finish()
+    }
+}
+
+/// [`crate::client::PipelineClient::send`] の送信イベントと
+/// [`crate::client::PipelineClient::recv_ack`] の ACK 受信イベントを受け取る
+/// 観測フック（TASK-12.1・#73／TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4・
+/// REPAIR-5）。
+///
+/// 呼び出しは送信・ACK 受信のたびに同期的・単一スレッドで行われる
+/// （[`crate::client::PipelineClient`] 自体が `&mut self` を要求し単一スレッド
+/// 前提であることと同じ契約）。
 ///
 /// # 契約: ブロックする I/O をしてはならない（REPAIR-5）
 ///
-/// `on_send` は送信経路（[`crate::client::PipelineClient::send`]）から同期で呼ばれる。
-/// ここでブロックする I/O（ソケット・pipe への書き込み・ロック待ち等）を行うと、
-/// 相手の応答を待たない送信であるはずの `send` 自体が無期限に停止しかねず、
-/// [`crate::transport::IoTimeout`] でも打ち切れない。実装はメモリ内へ積む・
-/// 非ブロッキング操作のみに留め、実際の I/O は別経路（呼び出し元が明示的に呼ぶ
-/// drain API 等）へ分離すること（[`JsonLinesSendObserver`] を参照）。
+/// `on_send`・`on_ack` は送信・受信経路（[`crate::client::PipelineClient::send`]・
+/// [`crate::client::PipelineClient::recv_ack`]）から同期で呼ばれる。ここで
+/// ブロックする I/O（ソケット・pipe への書き込み・ロック待ち等）を行うと、
+/// 相手の応答を待たない送信・ACK 待ちであるはずの呼び出し自体が無期限に
+/// 停止しかねず、[`crate::transport::IoTimeout`] でも打ち切れない。実装は
+/// メモリ内へ積む・非ブロッキング操作のみに留め、実際の I/O は別経路
+/// （呼び出し元が明示的に呼ぶ drain API 等）へ分離すること
+/// （[`JsonLinesSendObserver`] を参照）。
 ///
 /// `Debug` は要求しない。`Box<dyn Write + Send>` のような非 `Debug` な書き込み先を
 /// 保持する観測フックも実装できるようにするため（[`crate::client::PipelineClient`]
@@ -149,6 +230,23 @@ pub trait SendObserver: Send {
     /// 1 回の送信イベントを通知する。`event` は呼び出し中のみ有効な借用
     /// （[`SendEvent`] のドキュメント参照。#73 P0 再指摘対応）。
     fn on_send(&mut self, event: &SendEvent<'_>);
+
+    /// 1 回の ACK 受信イベントを通知する（TASK-12.2・#74 codex 指摘対応。P1・
+    /// REPAIR-4）。`event` は呼び出し中のみ有効な借用（[`AckEvent`] のドキュメント
+    /// 参照）。
+    ///
+    /// # 既定実装を持たない理由（#74 P1 再指摘対応）
+    ///
+    /// 過去のリビジョンは本メソッドに no-op の既定実装を用意していたが、
+    /// `on_send` のみを実装した既存の観測フックへ暗黙に `PipelineClient` を
+    /// 渡すと `recv_ack` の成功・失敗イベントが無言で失われ、AGENTS.md の
+    /// 可観測性要件（REPAIR-4）を満たせなくなる（ACK 観測の欠落を呼び出し元が
+    /// 検知する手段がなかった）。本 crate 内の実装（[`NoopSendObserver`]・
+    /// [`JsonLinesSendObserver`]）はいずれも本メソッドを明示的に実装しており、
+    /// コンパイル時にオーバーライド漏れを検出できる本方式のほうが安全側
+    /// （fail-closed）である。観測を意図的に不要とする実装は
+    /// [`NoopSendObserver`] のように本体を空にして明示する。
+    fn on_ack(&mut self, event: &AckEvent<'_>);
 }
 
 /// 何もしない実装（観測しない場合に呼び出し元が
@@ -160,6 +258,8 @@ pub struct NoopSendObserver;
 
 impl SendObserver for NoopSendObserver {
     fn on_send(&mut self, _event: &SendEvent<'_>) {}
+
+    fn on_ack(&mut self, _event: &AckEvent<'_>) {}
 }
 
 /// [`JsonLinesSendObserver::new`]（既定容量）が使う、ためられる JSON 行数の既定値
@@ -350,15 +450,22 @@ impl Default for JsonLinesSendObserver {
     }
 }
 
-impl SendObserver for JsonLinesSendObserver {
-    fn on_send(&mut self, event: &SendEvent<'_>) {
+impl JsonLinesSendObserver {
+    /// 行数上限に達していないか確認し、達していなければ `encode` を呼んで
+    /// エンコードしたうえで、合計バイト数の上限チェックのうえキューへ積む
+    /// 共通処理（[`Self::on_send`]・[`SendObserver::on_ack`] 実装で共有。
+    /// TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4・REPAIR-5）。
+    ///
+    /// `encode` を遅延評価にするのは、行数上限に達している場合はエンコード
+    /// 自体を省く（旧実装の挙動を保つ）ため。満杯・合計バイト数超過時は
+    /// 新規イベントを破棄し（上記モジュール doc 参照）、[`Self::dropped_count`]
+    /// を増分する。ここでは I/O を行わない（REPAIR-5）。
+    fn push_encoded_line(&mut self, encode: impl FnOnce() -> String) {
         if self.lines.len() >= self.capacity {
-            // 満杯時は新規イベントを破棄する（上記ドキュメント参照）。ここで
-            // I/O は行わない（REPAIR-5）。
             self.dropped = self.dropped.saturating_add(1);
             return;
         }
-        let encoded = encode_send_event(event);
+        let encoded = encode();
         // 行数上限とは独立に、合計バイト数の上限も守る（codex P0 再指摘対応）。
         // 巨大な `message` が連続しても、キューの総メモリ使用量を有界に保つ。
         if self.total_bytes.saturating_add(encoded.len()) > MAX_SEND_LOG_BUFFER_BYTES {
@@ -367,6 +474,16 @@ impl SendObserver for JsonLinesSendObserver {
         }
         self.total_bytes += encoded.len();
         self.lines.push_back(encoded);
+    }
+}
+
+impl SendObserver for JsonLinesSendObserver {
+    fn on_send(&mut self, event: &SendEvent<'_>) {
+        self.push_encoded_line(|| encode_send_event(event));
+    }
+
+    fn on_ack(&mut self, event: &AckEvent<'_>) {
+        self.push_encoded_line(|| encode_ack_event(event));
     }
 }
 
@@ -398,6 +515,7 @@ fn outcome_reason_str(outcome: SendOutcome) -> &'static str {
         SendOutcome::RejectedPoisoned => "rejected_poisoned",
         SendOutcome::RejectedInvalidFrameKind => "rejected_invalid_frame_kind",
         SendOutcome::RejectedResourceExhausted => "rejected_resource_exhausted",
+        SendOutcome::RejectedInvalidPayload => "rejected_invalid_payload",
         SendOutcome::TransportFailure => "transport_failure",
     }
 }
@@ -485,6 +603,85 @@ fn encode_send_event(event: &SendEvent<'_>) -> String {
             let reason = outcome_reason_str(*outcome);
             format!(
                 "{{\"event\":\"io_send\",\"kind\":\"{kind}\",\"outcome\":\"error\",\
+                 \"reason\":\"{reason}\",\"latency_us\":{latency_us}}}"
+            )
+        }
+    }
+}
+
+/// [`AckOutcome`] の snake_case 名を返す（[`outcome_reason_str`] の ACK 版。
+/// TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
+fn ack_outcome_reason_str(outcome: AckOutcome) -> &'static str {
+    match outcome {
+        AckOutcome::Success => "success",
+        AckOutcome::RejectedPoisoned => "rejected_poisoned",
+        AckOutcome::RejectedNoInFlight => "rejected_no_in_flight",
+        AckOutcome::TransportFailure => "transport_failure",
+        AckOutcome::RejectedInvalidPayload => "rejected_invalid_payload",
+        AckOutcome::RejectedOutOfOrder => "rejected_out_of_order",
+        AckOutcome::RejectedUnknownAckId => "rejected_unknown_ack_id",
+        AckOutcome::RejectedAckKindMismatch => "rejected_ack_kind_mismatch",
+        AckOutcome::RejectedInternal => "rejected_internal",
+    }
+}
+
+/// [`AckEvent`] を 1 行の JSON Lines 文字列へエンコードする（改行は含まない。
+/// [`encode_send_event`] の ACK 版。TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
+///
+/// `event` フィールドは `io_send` と区別するため `"io_recv_ack"` を使う。
+/// フレーム種別（`kind`）は持たない（`recv_ack` はキューの先頭と対応付けるまで
+/// 送信時の種別が確定しないため。[`AckEvent`] のドキュメント参照）。
+/// `event.ack_kind` から `"ack_kind":"ACK",`／`"ack_kind":"FLUSH_ACK",` の
+/// 先頭カンマなし・末尾カンマありの断片を組み立てる（[`encode_ack_event`] 用の
+/// 共通処理。TASK-12.2・#74 codex P1 再指摘対応。IO-1・IO-2・REPAIR-4）。
+///
+/// `decode_ack` 前の早期拒否では種別が確定しない（[`AckEvent::ack_kind`] の
+/// ドキュメント参照）ため `None` の場合はフィールド自体を省く（空文字列を返す）。
+fn ack_kind_json_fragment(ack_kind: Option<FrameKind>) -> String {
+    match ack_kind {
+        Some(kind) => format!("\"ack_kind\":\"{}\",", frame_kind_str(kind)),
+        None => String::new(),
+    }
+}
+
+/// [`AckEvent`] を 1 行の JSON Lines 文字列へエンコードする（改行は含まない。
+/// [`encode_send_event`] の ACK 版。TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）。
+fn encode_ack_event(event: &AckEvent<'_>) -> String {
+    let latency_us = event.latency.as_micros();
+    let ack_kind = ack_kind_json_fragment(event.ack_kind);
+    match (&event.outcome, &event.error) {
+        (AckOutcome::Success, _) => {
+            format!(
+                "{{\"event\":\"io_recv_ack\",{ack_kind}\"outcome\":\"ok\",\"latency_us\":{latency_us}}}"
+            )
+        }
+        (outcome, Some(error)) => {
+            let reason = ack_outcome_reason_str(*outcome);
+            let code = error.code.as_str();
+            let (truncated_message, truncated) = truncate_message_bytes(error.message);
+            let message = escape_json_string(truncated_message);
+            if truncated {
+                format!(
+                    "{{\"event\":\"io_recv_ack\",{ack_kind}\"outcome\":\"error\",\
+                     \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
+                     \"message_truncated\":true,\"latency_us\":{latency_us}}}"
+                )
+            } else {
+                format!(
+                    "{{\"event\":\"io_recv_ack\",{ack_kind}\"outcome\":\"error\",\
+                     \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
+                     \"latency_us\":{latency_us}}}"
+                )
+            }
+        }
+        (outcome, None) => {
+            // `Success` 以外は必ず `error` を伴う契約だが（`PipelineClient::notify_ack`
+            // が組み立てる）、型としては `Option` のため、万一 `None` が来ても
+            // panic せず `code`/`message` を省いた行を出す（`encode_send_event` と
+            // 同じフォールバック方針）。
+            let reason = ack_outcome_reason_str(*outcome);
+            format!(
+                "{{\"event\":\"io_recv_ack\",{ack_kind}\"outcome\":\"error\",\
                  \"reason\":\"{reason}\",\"latency_us\":{latency_us}}}"
             )
         }
@@ -881,6 +1078,71 @@ mod tests {
             "encoded line ({} bytes) must fit within MAX_SEND_LOG_LINE_BYTES ({} bytes)",
             encoded.len(),
             MAX_SEND_LOG_LINE_BYTES
+        );
+    }
+
+    /// TASK-12.2・#74 codex P1 再指摘対応（IO-1・IO-2・REPAIR-4）: 成功した
+    /// [`FrameKind::Ack`] の受信は `ack_kind":"ACK"` を含み、通常のバッファリング
+    /// ACK であることが構造化ログから判別できる。
+    #[test]
+    fn repair4_encode_ack_event_success_includes_ack_kind() {
+        let event = AckEvent {
+            outcome: AckOutcome::Success,
+            ack_kind: Some(FrameKind::Ack),
+            latency: Duration::from_micros(42),
+            error: None,
+        };
+
+        assert_eq!(
+            encode_ack_event(&event),
+            "{\"event\":\"io_recv_ack\",\"ack_kind\":\"ACK\",\"outcome\":\"ok\",\"latency_us\":42}"
+        );
+    }
+
+    /// TASK-12.2・#74 codex P1 再指摘対応（IO-1・IO-2・REPAIR-4）: 成功した
+    /// [`FrameKind::FlushAck`] の受信は `ack_kind":"FLUSH_ACK"` を含み、通常の
+    /// ACK（IO-1）と永続化保証の FlushAck（IO-2）が構造化ログ上で区別できる。
+    #[test]
+    fn repair4_encode_ack_event_success_distinguishes_flush_ack() {
+        let event = AckEvent {
+            outcome: AckOutcome::Success,
+            ack_kind: Some(FrameKind::FlushAck),
+            latency: Duration::from_micros(7),
+            error: None,
+        };
+
+        assert_eq!(
+            encode_ack_event(&event),
+            "{\"event\":\"io_recv_ack\",\"ack_kind\":\"FLUSH_ACK\",\"outcome\":\"ok\",\"latency_us\":7}"
+        );
+    }
+
+    /// TASK-12.2・#74 codex P1 再指摘対応（IO-1・IO-2・REPAIR-4）: `decode_ack`
+    /// 前の早期拒否（`ack_kind: None`）は種別が確定していないため `ack_kind`
+    /// フィールド自体を出力しない（[`AckEvent::ack_kind`] のドキュメント参照）。
+    #[test]
+    fn repair4_encode_ack_event_early_reject_omits_ack_kind() {
+        let message = "recv_ack called with no in-flight requests to match against";
+        let event = AckEvent {
+            outcome: AckOutcome::RejectedNoInFlight,
+            ack_kind: None,
+            latency: Duration::ZERO,
+            error: Some(AckEventError {
+                code: IoErrorCode::InvalidArgument,
+                message,
+            }),
+        };
+
+        let encoded = encode_ack_event(&event);
+        assert!(
+            !encoded.contains("\"ack_kind\""),
+            "early-reject events must omit ack_kind entirely: {encoded}"
+        );
+        assert_eq!(
+            encoded,
+            "{\"event\":\"io_recv_ack\",\"outcome\":\"error\",\"reason\":\"rejected_no_in_flight\",\
+             \"code\":\"INVALID_ARGUMENT\",\"message\":\"recv_ack called with no in-flight \
+             requests to match against\",\"latency_us\":0}"
         );
     }
 }

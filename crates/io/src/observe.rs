@@ -763,4 +763,122 @@ mod tests {
         observer.on_send(&success_event(1));
         // panic せず戻ることのみを確認する（副作用を持たない契約）。
     }
+
+    /// REPAIR-5 P0 再指摘対応・#73（コミット 2・受け入れ基準の機械照合。REPAIR-12）:
+    /// `SendEventError` の手書き `Debug` は `message` を全量出力せず、長さと
+    /// `MAX_SEND_LOG_MESSAGE_BYTES` 以内に切り詰めた先頭のみを出す（`{:?}` 経由で
+    /// untrusted なメッセージが無制限に出力される経路をふさいだことの確認）。
+    #[test]
+    fn repair5_send_event_error_debug_truncates_message() {
+        let huge_message = "a".repeat(MAX_SEND_LOG_MESSAGE_BYTES * 4);
+        let error = SendEventError {
+            code: IoErrorCode::Timeout,
+            message: &huge_message,
+        };
+
+        let debug_output = format!("{error:?}");
+
+        assert!(
+            debug_output.contains(&format!("message_len: {}", huge_message.len())),
+            "debug output must report the true (untruncated) message length: {debug_output}"
+        );
+        assert!(
+            debug_output.contains(&"a".repeat(MAX_SEND_LOG_MESSAGE_BYTES)),
+            "debug output must contain the truncated prefix: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains(&"a".repeat(MAX_SEND_LOG_MESSAGE_BYTES + 1)),
+            "debug output must not contain more than MAX_SEND_LOG_MESSAGE_BYTES \
+             consecutive characters of the message: {debug_output}"
+        );
+        assert!(
+            debug_output.len() < huge_message.len(),
+            "debug output ({} bytes) must be far shorter than the full message ({} bytes); \
+             a regression to dumping the whole message would fail this bound",
+            debug_output.len(),
+            huge_message.len()
+        );
+    }
+
+    /// REPAIR-5 P0 再指摘対応・#73（コミット 2・REPAIR-12）: `SendEvent` の手書き
+    /// `Debug` も `error` フィールド経由で `SendEventError` の `Debug` へ委譲し、
+    /// 同様に全量を出さない。
+    #[test]
+    fn repair5_send_event_debug_delegates_to_error_debug() {
+        let huge_message = "b".repeat(MAX_SEND_LOG_MESSAGE_BYTES * 4);
+        let event = SendEvent {
+            kind: FrameKind::Write,
+            outcome: SendOutcome::TransportFailure,
+            latency: Duration::from_millis(1),
+            error: Some(SendEventError {
+                code: IoErrorCode::Timeout,
+                message: &huge_message,
+            }),
+        };
+
+        let debug_output = format!("{event:?}");
+
+        assert!(
+            !debug_output.contains(&"b".repeat(MAX_SEND_LOG_MESSAGE_BYTES + 1)),
+            "SendEvent's Debug must not leak the full untruncated message: {debug_output}"
+        );
+        assert!(debug_output.len() < huge_message.len());
+    }
+
+    /// REPAIR-4・REPAIR-12（#73。コミット 2）: 1 行の最悪ケース（`encode_send_event`
+    /// の出力が最も長くなる組み合わせ）でも `MAX_SEND_LOG_LINE_BYTES` を超えない
+    /// ことを機械照合する。
+    ///
+    /// 最悪ケースの根拠（`encode_send_event` の実装を確認して選定）:
+    /// - `kind`: [`FrameKind::FlushAck`]（`"FLUSH_ACK"`。9 バイトで 4 種別中最長。
+    ///   [`frame_kind_str`] 参照）
+    /// - `outcome`/`reason`: [`SendOutcome::RejectedResourceExhausted`]
+    ///   （`"rejected_resource_exhausted"`。27 バイトで `"rejected_invalid_frame_kind"`
+    ///   〔同じく 27 バイト〕と並ぶ最長タイ。[`outcome_reason_str`] 参照）だが、
+    ///   対応する `code` が [`IoErrorCode::ResourceExhausted`]
+    ///   （`"RESOURCE_EXHAUSTED"`。18 バイトで全 `IoErrorCode` バリアント中最長。
+    ///   `InvalidArgument` の `"INVALID_ARGUMENT"` は 16 バイト）であるため、
+    ///   `reason` と `code` の合計ではこちらの組み合わせがより悪い
+    /// - `message`: [`MAX_SEND_LOG_MESSAGE_BYTES`] を超える長さの `\u{0001}`
+    ///   （1 バイトの制御文字）。1 バイト文字なので文字境界の調整なしに正確に
+    ///   `MAX_SEND_LOG_MESSAGE_BYTES` 文字ちょうどまで切り詰められ、
+    ///   [`escape_json_string`] がその全文字を `\u0001`（6 バイト）へ展開する
+    ///   最悪のエスケープ後サイズになる（`\n`/`\r`/`\t` は 2 バイトにしか
+    ///   展開されないため選ばない）
+    /// - `latency`: `Duration::MAX`（`as_micros()` の桁数が最大になる）
+    #[test]
+    fn repair4_repair12_encode_send_event_worst_case_line_fits_within_max_line_bytes() {
+        let oversized_control_chars = "\u{0001}".repeat(MAX_SEND_LOG_MESSAGE_BYTES + 1);
+        let event = SendEvent {
+            kind: FrameKind::FlushAck,
+            outcome: SendOutcome::RejectedResourceExhausted,
+            latency: Duration::MAX,
+            error: Some(SendEventError {
+                code: IoErrorCode::ResourceExhausted,
+                message: &oversized_control_chars,
+            }),
+        };
+
+        let encoded = encode_send_event(&event);
+
+        assert!(
+            encoded.contains("\"message_truncated\":true"),
+            "the oversized message must trigger truncation: {encoded}"
+        );
+        // 実際に 512 文字すべてが `\u0001`（6 バイト）へ展開されたことを数えて
+        // 確認する。長さの比較だけでは、6 倍のエスケープが起きていなくても
+        // たまたま緩い上限を満たしてしまう可能性がある（誤って弱いテストに
+        // ならないための直接照合）。
+        let escaped_control_char_count = encoded.matches("\\u0001").count();
+        assert_eq!(
+            escaped_control_char_count, MAX_SEND_LOG_MESSAGE_BYTES,
+            "expected exactly MAX_SEND_LOG_MESSAGE_BYTES escaped control characters: {encoded}"
+        );
+        assert!(
+            encoded.len() <= MAX_SEND_LOG_LINE_BYTES,
+            "encoded line ({} bytes) must fit within MAX_SEND_LOG_LINE_BYTES ({} bytes)",
+            encoded.len(),
+            MAX_SEND_LOG_LINE_BYTES
+        );
+    }
 }

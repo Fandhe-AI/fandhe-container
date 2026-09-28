@@ -1629,4 +1629,188 @@ mod tests {
         assert_eq!(stats.max(), None);
         assert_eq!(stats.mean(), None);
     }
+
+    // --- コミット 2（#73・受け入れ基準の機械照合。REPAIR-12）から追加したテスト ---
+
+    /// テスト専用のモック sender。常に `1 MiB` の巨大なメッセージを持つ `Timeout`
+    /// を返す（項目 E: `notify` が巨大メッセージを複製せず借用で渡すことの確認に
+    /// 使う）。
+    #[derive(Debug, Default)]
+    struct HugeMessageTimeoutSender;
+
+    /// `notify`（項目 A）が複製をなくす対象とする、ヒープ確保コストが無視できない
+    /// メッセージ長（1 MiB）。
+    const HUGE_MESSAGE_LEN: usize = 1024 * 1024;
+
+    impl FrameSender for HugeMessageTimeoutSender {
+        type Frame = Frame;
+
+        fn send_frame(&mut self, _frame: &Self::Frame, _timeout: IoTimeout) -> Result<(), IoError> {
+            Err(IoError::new(
+                IoErrorCode::Timeout,
+                "x".repeat(HUGE_MESSAGE_LEN),
+            ))
+        }
+    }
+
+    /// テスト専用の観測フック。`on_send` が受け取った `error.message` の
+    /// アドレスと長さだけを記録する（項目 E）。生ポインタは `Send` ではないため
+    /// `usize` として保持し、`SendObserver: Send` の制約を満たす。
+    #[derive(Debug, Default)]
+    struct PtrCapturingObserver {
+        captured: Option<(usize, usize)>,
+    }
+
+    impl SendObserver for PtrCapturingObserver {
+        fn on_send(&mut self, event: &SendEvent<'_>) {
+            if let Some(error) = &event.error {
+                self.captured = Some((error.message.as_ptr() as usize, error.message.len()));
+            }
+        }
+    }
+
+    /// 項目 E（#73 P0 再指摘対応。REPAIR-5・REPAIR-12）: `PipelineClient::notify`
+    /// が `SendObserver::on_send` へ渡す `SendEventError::message` は、
+    /// `PipelineClient::send` が最終的に返す `IoError::message()` と同じヒープ
+    /// バッファを指す借用であり、複製されていないことを `ptr::eq` とアドレス・
+    /// 長さの一致で照合する。複製が起きていれば、1 MiB のメッセージに対して
+    /// このアドレス一致は成立しない。
+    #[test]
+    fn repair5_repair12_notify_borrows_error_message_without_copying_huge_message() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let observer = PtrCapturingObserver::default();
+        let mut client = PipelineClient::with_observer(HugeMessageTimeoutSender, limit, observer);
+
+        let err = client
+            .send(&write_frame(1), test_timeout())
+            .expect_err("the mock sender always fails");
+        assert_eq!(err.message().len(), HUGE_MESSAGE_LEN);
+
+        let (captured_addr, captured_len) = client
+            .observer()
+            .captured
+            .expect("a transport failure must notify the observer with an error");
+        assert_eq!(
+            captured_len,
+            err.message().len(),
+            "on_send must observe the same message length as the returned error"
+        );
+        assert!(
+            std::ptr::eq(captured_addr as *const u8, err.message().as_ptr()),
+            "on_send must observe the same heap buffer as the returned error, not a copy"
+        );
+    }
+
+    /// 項目 G（REPAIR-12）: `SendQueue::remaining` は空のとき上限件数を、満杯の
+    /// ときは `0` を返す（`is_full`・`len` と矛盾しないことの機械照合）。
+    #[test]
+    fn io1_repair12_send_queue_remaining_boundaries() {
+        let limit = InFlightLimit::new(3).expect("3 must be valid");
+        let mut queue = SendQueue::new(limit);
+        assert_eq!(queue.remaining(), 3);
+        assert!(!queue.is_full());
+
+        for _ in 0..3 {
+            queue
+                .register(FrameKind::Write)
+                .expect("register must succeed while under the limit");
+        }
+
+        assert_eq!(queue.remaining(), 0);
+        assert!(queue.is_full());
+    }
+
+    /// 項目 G（REPAIR-12）: `TryFrom<usize> for InFlightLimit` は `InFlightLimit::new`
+    /// と同じ境界（`0`・`1`・`MAX_IN_FLIGHT_LIMIT`・`MAX_IN_FLIGHT_LIMIT + 1`）を
+    /// 検証する。
+    #[test]
+    fn io1_repair12_in_flight_limit_try_from_boundaries() {
+        let zero = InFlightLimit::try_from(0usize).expect_err("0 must be rejected via TryFrom");
+        assert_eq!(zero.code(), IoErrorCode::InvalidArgument);
+
+        let one = InFlightLimit::try_from(1usize).expect("1 must be accepted via TryFrom");
+        assert_eq!(one.get(), 1);
+
+        let upper = InFlightLimit::try_from(MAX_IN_FLIGHT_LIMIT)
+            .expect("MAX_IN_FLIGHT_LIMIT must be accepted via TryFrom");
+        assert_eq!(upper.get(), MAX_IN_FLIGHT_LIMIT);
+
+        let over = InFlightLimit::try_from(MAX_IN_FLIGHT_LIMIT + 1)
+            .expect_err("MAX_IN_FLIGHT_LIMIT + 1 must be rejected via TryFrom");
+        assert_eq!(over.code(), IoErrorCode::InvalidArgument);
+    }
+
+    /// 項目 H（REPAIR-12）: 3 件以上登録した状態で中間の 1 件を解放しても、残りの
+    /// エントリは送信順（`oldest`・`iter`）を保つ。
+    #[test]
+    fn io1_repair12_send_queue_remove_middle_preserves_order() {
+        let limit = InFlightLimit::new(4).expect("4 must be valid");
+        let mut queue = SendQueue::new(limit);
+
+        let first = queue
+            .register(FrameKind::Write)
+            .expect("register 1st must succeed");
+        let second = queue
+            .register(FrameKind::Write)
+            .expect("register 2nd must succeed");
+        let third = queue
+            .register(FrameKind::Write)
+            .expect("register 3rd must succeed");
+
+        queue
+            .remove(second.id())
+            .expect("removing the middle entry must succeed");
+
+        assert_eq!(
+            queue
+                .oldest()
+                .expect("the first entry must remain")
+                .id()
+                .get(),
+            first.id().get()
+        );
+        let remaining_ids: Vec<u64> = queue.iter().map(|entry| entry.id().get()).collect();
+        assert_eq!(remaining_ids, vec![first.id().get(), third.id().get()]);
+    }
+
+    /// 項目 I（REPAIR-12）: 失効（poison）後に `acknowledge` でキューを空にしても
+    /// `is_poisoned` は `true` のままで、`into_inner` は `Unavailable`（poison 起因の
+    /// メッセージ）を返す。後始末として無害だが接続自体は再利用できないという
+    /// 契約（[`PipelineClient::acknowledge`]・[`PipelineClient::into_inner`] の
+    /// ドキュメント参照）を機械照合する。
+    #[test]
+    fn io1_repair12_poisoned_client_stays_poisoned_after_draining_queue() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut client = PipelineClient::new(AlwaysTimeoutSender, limit);
+
+        client
+            .send(&write_frame(1), test_timeout())
+            .expect_err("transport failure must poison the client");
+        assert!(client.is_poisoned());
+
+        let pending_id = client
+            .queue()
+            .oldest()
+            .expect("one entry must remain after the failed send")
+            .id();
+        client
+            .acknowledge(pending_id)
+            .expect("draining the queue via a late ack must succeed");
+        assert!(client.queue().is_empty());
+
+        assert!(
+            client.is_poisoned(),
+            "poison must persist even after the queue is drained"
+        );
+
+        let err = client
+            .into_inner()
+            .expect_err("a poisoned client must not yield its transport even with an empty queue");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+        assert!(
+            err.message().contains("poisoned"),
+            "error must indicate the poisoned branch was hit, not the unacked-queue branch: {}",
+            err.message()
+        );
+    }
 }

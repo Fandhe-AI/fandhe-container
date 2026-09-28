@@ -80,8 +80,8 @@ pub use recv_limits::{
 };
 pub use server::{UdsConnection, UdsServer};
 pub use settings::{
-    BATCH_SIZE_OPTION, BATCH_SIZE_SETTING_KEY, MAX_BATCH_SIZE_ARG_LEN, WritebackSettings,
-    parse_batch_size,
+    BATCH_SIZE_OPTION, BATCH_SIZE_SETTING_KEY, BoundConnection, BoundWriteback,
+    MAX_BATCH_SIZE_ARG_LEN, WritebackSettings, parse_batch_size,
 };
 pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, WireFrame,

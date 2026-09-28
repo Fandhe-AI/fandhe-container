@@ -385,10 +385,13 @@ where
 /// （TASK-13.3・#78。両者を別々の設定値から個別に構築すると、受信ゲートと
 /// 集約ロジックのバッチサイズが食い違う経路を作れてしまう）。この対応を型で
 /// 保証したい場合は、本関数を直接呼ぶ代わりに
-/// [`crate::settings::WritebackSettings::serve_connection`] を
-/// [`crate::settings::WritebackSettings::bind`] と対で使う
-/// （REPAIR-2。両メソッドは同じ `&WritebackSettings` から値を導くため
-/// 食い違いを作れない）。
+/// [`crate::settings::WritebackSettings::bind`] が返す
+/// [`crate::settings::BoundWriteback`] と、その [`accept`][ba] が返す
+/// [`crate::settings::BoundConnection::serve`] を使う（REPAIR-2・#1115 codex
+/// レビュー指摘対応。`serve` は `BatchConfig` を引数に取らず、常に接続元の
+/// `WritebackSettings` から導くため、別の設定値を混ぜる経路自体が無い）。
+///
+/// [ba]: crate::settings::BoundWriteback::accept
 pub fn serve_connection<T, W>(
     conn: &mut T,
     config: BatchConfig,

@@ -13,19 +13,30 @@
 //! 用）と [`crate::recv_limits::ReceiveLimits`]（`UdsServer::bind` 用）——を
 //! 単一の設定値から導く。[`crate::server::UdsServer::bind`] と
 //! [`crate::writeback::serve_connection`] はそれぞれ `ReceiveLimits` /
-//! `BatchConfig` を直接受け取る独立した公開関数のままであり（他の
-//! トランスポート・テストダブルから汎用に呼べる必要があるため）、
-//! [`WritebackSettings::batch_config`] と [`WritebackSettings::receive_limits`]
+//! `BatchConfig` を直接受け取る独立した公開関数のままである（他の
+//! トランスポート・テストダブルから汎用に呼べる必要があるため）。
+//!
+//! [`WritebackSettings::batch_config`] / [`WritebackSettings::receive_limits`]
 //! を個別に呼んで別々の変数へ渡すだけでは、呼び出し側の実装ミスで異なる
-//! [`WritebackSettings`] 由来の値を渡してしまう経路を型で防げない。
-//! これを避けるため、同一の `&WritebackSettings` から両方の呼び出しを
-//! 行う組み合わせ入口として [`WritebackSettings::bind`] /
-//! [`WritebackSettings::serve_connection`] を用意する（REPAIR-2）。この 2 つの
-//! メソッドを経由して呼ぶ限り、`bind` の受信上限と `serve_connection` の
-//! 集約バッチサイズは常に同じ `self` から導かれ食い違わない。`UdsServer::bind`
-//! / `crate::writeback::serve_connection` を直接呼ぶ経路（下記 2 メソッドを
-//! 経由しない呼び出し）は本型の保証範囲外であり、呼び出し側が値の対応を
-//! 保つ責任を負う。
+//! [`WritebackSettings`] 由来の値を渡してしまう経路を型で防げない
+//! （#78 codex レビュー指摘）。過去の実装は [`WritebackSettings::bind`] /
+//! `serve_connection` という「同じ `&WritebackSettings` から呼ぶことを推奨する」
+//! 独立メソッドの対でこれに応えようとしたが、2 つの独立したメソッドである
+//! 以上、呼び出し側は `settings_a.bind(...)` で得たサーバー・接続を
+//! `settings_b` 側の呼び出しへ渡すことができてしまい、値の対応を型で保証
+//! できていなかった（#1115 codex 再指摘）。
+//!
+//! これを閉じるため、[`WritebackSettings::bind`] は素の [`UdsServer`] では
+//! なく設定を保持し続けるラッパー [`BoundWriteback`] を返す。
+//! [`BoundWriteback::accept`] が返す [`BoundConnection`] も同じ設定を保持し、
+//! バッチ集約に使う [`crate::batch::BatchConfig`] は
+//! [`BoundConnection::serve`] の呼び出し側が値として渡すのではなく、その
+//! 接続が生まれた [`WritebackSettings`] から常に取り出される。したがって、
+//! 別の [`WritebackSettings`] 由来の `BatchConfig` を混ぜて渡す経路がそもそも
+//! 存在しない（値を渡す引数自体がない）。`UdsServer::bind` /
+//! `crate::writeback::serve_connection` を直接呼ぶ経路（[`BoundWriteback`] /
+//! [`BoundConnection`] を経由しない呼び出し）は本型の保証範囲外であり、
+//! 呼び出し側が値の対応を保つ責任を負う。
 //!
 //! # 呼び出し文脈
 //! 実際の CLI バイナリ（`fandhe-container`）から `--batch-size` の値を受け取り
@@ -46,10 +57,9 @@ use std::str::FromStr;
 use crate::batch::BatchConfig;
 use crate::error::{IoError, IoErrorCode};
 use crate::observe::ServerObserver;
-use crate::protocol::Frame;
 use crate::recv_limits::ReceiveLimits;
-use crate::server::UdsServer;
-use crate::transport::{FrameReceiver, FrameSender};
+use crate::server::{UdsConnection, UdsServer};
+use crate::transport::IoTimeout;
 use crate::writeback::{self, BatchSink, WritebackReport, WritebackTimeouts};
 
 /// CLI オプション名（TASK-79 の CLI バイナリが参照する定数。本 crate 自体は
@@ -184,38 +194,24 @@ impl WritebackSettings {
     }
 
     /// [`crate::server::UdsServer::bind`] を、自身の [`Self::receive_limits`]
-    /// で呼ぶ組み合わせ入口（TASK-13.3・#78 codex レビュー指摘対応）。
+    /// で呼ぶ組み合わせ入口（TASK-13.3・#78・#1115 codex レビュー指摘対応）。
     ///
-    /// [`Self::serve_connection`] と対で、同じ `&WritebackSettings` から呼ぶ
-    /// ことで受信ゲート（`ReceiveLimits`）と集約ロジック（`BatchConfig`）の
-    /// バッチサイズが食い違う経路を型で防ぐ（REPAIR-2。モジュール doc
-    /// 参照）。`path`・`observer` の意味は [`crate::server::UdsServer::bind`]
-    /// と同じ。
+    /// 素の [`UdsServer`] ではなく、bind に使った設定を保持し続ける
+    /// [`BoundWriteback`] を返す。[`BoundWriteback::accept`] が返す
+    /// [`BoundConnection`] もこの設定を引き継ぐため、後段の
+    /// [`BoundConnection::serve`] は呼び出し側から `BatchConfig` を受け取らず
+    /// 常にこの `self` 由来の値を使う（モジュール doc 参照。REPAIR-2）。
+    /// `path`・`observer` の意味は [`crate::server::UdsServer::bind`] と同じ。
     pub fn bind<O: ServerObserver>(
         &self,
         path: &Path,
         observer: O,
-    ) -> Result<UdsServer<O>, IoError> {
-        UdsServer::bind(path, self.receive_limits(), observer)
-    }
-
-    /// [`crate::writeback::serve_connection`] を、自身の [`Self::batch_config`]
-    /// で呼ぶ組み合わせ入口（TASK-13.3・#78 codex レビュー指摘対応）。
-    ///
-    /// [`Self::bind`] と対で使うことを想定する（REPAIR-2。モジュール doc
-    /// 参照）。`conn`・`sink`・`timeouts` の意味は
-    /// [`crate::writeback::serve_connection`] と同じ。
-    pub fn serve_connection<T, W>(
-        &self,
-        conn: &mut T,
-        sink: &mut W,
-        timeouts: WritebackTimeouts,
-    ) -> WritebackReport
-    where
-        T: FrameSender<Frame = Frame> + FrameReceiver<Frame = Frame>,
-        W: BatchSink,
-    {
-        writeback::serve_connection(conn, self.batch_config(), sink, timeouts)
+    ) -> Result<BoundWriteback<O>, IoError> {
+        let server = UdsServer::bind(path, self.receive_limits(), observer)?;
+        Ok(BoundWriteback {
+            server,
+            settings: *self,
+        })
     }
 }
 
@@ -223,6 +219,103 @@ impl Default for WritebackSettings {
     /// IO-1 の既定値（[`crate::batch::DEFAULT_BATCH_SIZE`] = 64）を使う。
     fn default() -> Self {
         Self::new(BatchConfig::default())
+    }
+}
+
+/// [`WritebackSettings::bind`] が返す、bind に使った設定を保持し続ける
+/// [`UdsServer`] のラッパー（TASK-13.3・#1115 codex レビュー指摘対応）。
+///
+/// [`Self::accept`] が返す [`BoundConnection`] も同じ [`WritebackSettings`]
+/// を引き継ぐため、[`BoundConnection::serve`] は別の `WritebackSettings` 由来の
+/// `BatchConfig` を混ぜて渡すことができない（値を渡す引数自体がない。
+/// モジュール doc 参照）。
+pub struct BoundWriteback<O: ServerObserver> {
+    server: UdsServer<O>,
+    settings: WritebackSettings,
+}
+
+impl<O: ServerObserver> core::fmt::Debug for BoundWriteback<O> {
+    /// [`UdsServer`] の `Debug` と同じ方針でパス以外は出力しない
+    /// （`O: Debug` を要求しない）。
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BoundWriteback")
+            .field("path", &self.server.path())
+            .field("settings", &self.settings)
+            .finish()
+    }
+}
+
+impl<O: ServerObserver> BoundWriteback<O> {
+    /// bind したソケットのパスを返す（[`crate::server::UdsServer::path`]
+    /// への委譲）。
+    pub fn path(&self) -> &Path {
+        self.server.path()
+    }
+
+    /// bind に使った設定を返す。
+    pub fn settings(&self) -> WritebackSettings {
+        self.settings
+    }
+
+    /// [`crate::server::UdsServer::accept`] を呼び、返す接続へ bind に使った
+    /// 設定を引き継がせる（TASK-13.3・#1115 codex レビュー指摘対応）。
+    /// `timeout`・`conn_observer` の意味は
+    /// [`crate::server::UdsServer::accept`] と同じ。
+    pub fn accept<C: ServerObserver>(
+        &mut self,
+        timeout: IoTimeout,
+        conn_observer: C,
+    ) -> Result<BoundConnection<C>, IoError> {
+        let conn = self.server.accept(timeout, conn_observer)?;
+        Ok(BoundConnection {
+            conn,
+            settings: self.settings,
+        })
+    }
+}
+
+/// [`BoundWriteback::accept`] が返す、accept 元の [`BoundWriteback`] と同じ
+/// 設定を保持し続ける [`UdsConnection`] のラッパー（TASK-13.3・#1115 codex
+/// レビュー指摘対応）。
+///
+/// [`Self::serve`] は保持している設定から導いた [`BatchConfig`] だけを使う
+/// ため、この接続を bind した [`WritebackSettings`] とは別の設定値を渡す経路が
+/// 存在しない。これにより、異なる `WritebackSettings` から得た `bind` の
+/// 受信上限と `serve` の集約バッチサイズが食い違う経路を型で防ぐ
+/// （REPAIR-2。モジュール doc 参照）。
+pub struct BoundConnection<C: ServerObserver> {
+    conn: UdsConnection<C>,
+    settings: WritebackSettings,
+}
+
+impl<C: ServerObserver> core::fmt::Debug for BoundConnection<C> {
+    /// [`UdsConnection`] の `Debug` と同じ方針でソケット等の内部状態は出力
+    /// しない（`C: Debug` を要求しない）。
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BoundConnection")
+            .field("settings", &self.settings)
+            .finish()
+    }
+}
+
+impl<C: ServerObserver> BoundConnection<C> {
+    /// bind・accept に使った設定を返す。
+    pub fn settings(&self) -> WritebackSettings {
+        self.settings
+    }
+
+    /// [`crate::writeback::serve_connection`] を、自身が保持する
+    /// [`WritebackSettings::batch_config`] で呼ぶ（TASK-13.3・#78・#1115
+    /// codex レビュー指摘対応）。呼び出し側は `BatchConfig` を渡さないため、
+    /// この接続を bind した設定とは異なる `BatchConfig` を混入させる経路が
+    /// ない（モジュール doc 参照）。`sink`・`timeouts` の意味は
+    /// [`crate::writeback::serve_connection`] と同じ。
+    pub fn serve<W: BatchSink>(
+        &mut self,
+        sink: &mut W,
+        timeouts: WritebackTimeouts,
+    ) -> WritebackReport {
+        writeback::serve_connection(&mut self.conn, self.settings.batch_config(), sink, timeouts)
     }
 }
 
@@ -376,82 +469,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// IO-1・TASK-13.3・REPAIR-2・#78 codex レビュー指摘対応:
-    /// `WritebackSettings::serve_connection` は同じ `self` の `batch_config()`
-    /// を [`crate::writeback::serve_connection`] へそのまま渡す（`config` を
-    /// 別の値にすり替えて呼べないことの確認。フェイクトランスポートは
-    /// 即座に接続断（`Unavailable`）を返すだけで足り、`config` の値を
-    /// 実際に集約へ使わせるところまでは
-    /// `crate::writeback::tests` が別途検証する）。
+    /// IO-1・TASK-13.3・REPAIR-2・#1115 codex レビュー指摘対応:
+    /// [`BoundConnection::serve`] は `BatchConfig` を引数として受け取らず、
+    /// 常に自身が保持する [`WritebackSettings::batch_config`] を使う。以前は
+    /// フェイクトランスポートで「`config` をすり替えて呼べないこと」を実行時
+    /// に確認していたが、現在の設計では `serve` に `config` を渡す引数自体が
+    /// 無いため、その確認は型検査（コンパイルが通ること自体）に置き換わった
+    /// （`settings.batch_config()`・`settings.receive_limits()` の整合は
+    /// [`io1_writeback_settings_receive_limits_matches_batch_config`]、実際の
+    /// UDS 経由の bind → accept → serve の一気通貫は
+    /// `crates/io/tests/settings.rs` の `unix::run_batch_size_case` が担う）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn io1_writeback_settings_serve_connection_uses_own_batch_config() {
-        use crate::protocol::Frame;
-        use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
-        use crate::writeback::{AppendFileSink, WritebackTimeouts};
-        use std::time::Duration;
-
-        /// 受信するフレームを持たず、`recv_frame` が即座に接続断
-        /// （`Unavailable`）を返すだけの偽トランスポート
-        /// （`crate::writeback::tests::FakeTransport` の縮小版。設定値の
-        /// 配線だけを確かめたいため、本テストでは frame 送受信の中身までは
-        /// 検証しない）。
-        struct EmptyTransport;
-
-        impl FrameSender for EmptyTransport {
-            type Frame = Frame;
-
-            fn send_frame(&mut self, _frame: &Frame, _timeout: IoTimeout) -> Result<(), IoError> {
-                panic!("no frame is queued, so send_frame must not be called");
-            }
+    fn io1_bound_connection_serve_has_no_batch_config_parameter() {
+        // コンパイル時の型チェックのみで完結する回帰確認（実行時の assert は
+        // 不要）。`BoundConnection::serve` のシグネチャが `BatchConfig` を
+        // 引数に取るよう変更された場合、この関数はコンパイルが通らなくなる。
+        fn _assert_serve_signature<C: ServerObserver, W: BatchSink>(
+            conn: &mut BoundConnection<C>,
+            sink: &mut W,
+            timeouts: WritebackTimeouts,
+        ) -> WritebackReport {
+            conn.serve(sink, timeouts)
         }
-
-        impl FrameReceiver for EmptyTransport {
-            type Frame = Frame;
-
-            fn recv_frame(&mut self, _timeout: IoTimeout) -> Result<Frame, IoError> {
-                Err(IoError::new(IoErrorCode::Unavailable, "no frame queued"))
-            }
-        }
-
-        let settings =
-            WritebackSettings::from_batch_size_arg("8").expect("8 must be a valid batch size");
-        // `bind` と同じ `self` から導いた `batch_config()` が実際に
-        // `serve_connection` へ渡ることを、`ReceiveLimits` 側と対で確認する
-        // （REPAIR-2）。
-        assert_eq!(settings.batch_config().batch_size(), 8);
-
-        let mut conn = EmptyTransport;
-        let dst = tempfile_for_sink();
-        let mut sink = AppendFileSink::new(dst).expect("AppendFileSink::new must succeed");
-        let timeouts = WritebackTimeouts {
-            recv: IoTimeout::new(Duration::from_millis(50)).expect("50ms must be valid"),
-            send: IoTimeout::new(Duration::from_millis(50)).expect("50ms must be valid"),
-        };
-
-        let report = settings.serve_connection(&mut conn, &mut sink, timeouts);
-        // フレームが 1 つも届かないまま接続断で終わるため、統計はすべて 0 の
-        // ままであることを確認する（設定値の配線を確かめるのが目的で、集約の
-        // 挙動自体は `crate::writeback::tests` が担う）。
-        assert_eq!(report.stats, crate::writeback::WritebackStats::default());
-        assert_eq!(report.end.code(), IoErrorCode::Unavailable);
-    }
-
-    /// `AppendFileSink` へ渡す書き込み可能な一時ファイルを作る（テスト専用）。
-    #[cfg(test)]
-    fn tempfile_for_sink() -> std::fs::File {
-        let path = std::env::temp_dir().join(format!(
-            "fcu-settings-serve-connection-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .expect("must be able to create a temp file for the sink")
     }
 }

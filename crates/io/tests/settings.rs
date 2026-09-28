@@ -201,12 +201,15 @@ mod unix {
     }
 
     /// `WritebackSettings::from_batch_size_arg(batch_size)` を
-    /// [`WritebackSettings::bind`]／[`WritebackSettings::serve_connection`]
-    /// という組み合わせ入口経由でそれぞれ呼び、`batch_size` 件ごとに ACK が
-    /// バッチとして届くことを確認する（R1・REPAIR-2・#78 codex レビュー指摘
-    /// 対応。`bind` 側の `ReceiveLimits` と `serve_connection` 側の
+    /// [`WritebackSettings::bind`] → [`BoundWriteback::accept`] →
+    /// [`BoundConnection::serve`] という経路で呼び、`batch_size` 件ごとに
+    /// ACK がバッチとして届くことを確認する（R1・REPAIR-2・#78・#1115 codex
+    /// レビュー指摘対応。`bind` 側の `ReceiveLimits` と `serve` 側の
     /// `BatchConfig` を個別に取り出して別々に渡すのではなく、同じ
-    /// `&settings` から導く実際の呼び出し経路を検証する）。
+    /// `settings` から生まれた `BoundWriteback` / `BoundConnection` を経由する
+    /// 実際の呼び出し経路を検証する。`BoundConnection::serve` は
+    /// `BatchConfig` を引数に取らないため、別の設定値を混ぜる経路自体が
+    /// 無い）。
     fn run_batch_size_case(batch_size: usize, batches: usize) {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
@@ -246,9 +249,8 @@ mod unix {
             .expect("must open output file");
         let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
 
-        let server_thread = std::thread::spawn(move || {
-            settings.serve_connection(&mut connection, &mut sink, writeback_timeouts())
-        });
+        let server_thread =
+            std::thread::spawn(move || connection.serve(&mut sink, writeback_timeouts()));
 
         let acked_ids = client_thread.join().expect("client thread must not panic");
         assert_eq!(acked_ids, (0..total).collect::<Vec<_>>());

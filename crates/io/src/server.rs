@@ -1449,19 +1449,37 @@ mod imp {
         }
     }
 
-    /// `deadline` までの残り時間を返す。残りが 0 以下ならその場で
-    /// [`IoErrorCode::Timeout`] を返す（`Duration::ZERO` を
-    /// `set_read_timeout` / `set_write_timeout` に渡すと std がエラーに
-    /// するため、ここで先に弾く）。
+    /// `set_read_timeout` / `set_write_timeout` に渡す残り時間の下限
+    /// （#1115 codex レビュー指摘対応・macOS CI 実バグ修正）。
+    ///
+    /// これらの std API は `Duration` をマイクロ秒精度の `timeval` へ変換して
+    /// `setsockopt(2)` へ渡す。期限直前で `remaining_or_timeout` が返す残り
+    /// 時間がこの精度を下回る（例: 数百ナノ秒）と、`timeval` 変換の結果が
+    /// 実質ゼロになる。macOS はゼロの `SO_RCVTIMEO` / `SO_SNDTIMEO` を
+    /// `EINVAL` で拒否し（`is_peer_shutdown_einval` はこの `EINVAL` を「相手が
+    /// すでに切断した」と判定する既存のヒューリスティック）、相手がまだ接続
+    /// したままでも `Unavailable` を誤って返してしまう
+    /// （`repair5_uds_send_times_out_on_unresponsive_peer` の macOS CI 再現失敗。
+    /// PR #1115 の `bench-regression` 以外の rust-ci macOS ジョブで観測。
+    /// 期限を過ぎたかどうかの判定自体は変えず、`timeval` 精度未満の残り時間を
+    /// 「実質期限切れ」として扱うだけで直す）。
+    const MIN_REMAINING_TIMEOUT: Duration = Duration::from_micros(1);
+
+    /// `deadline` までの残り時間を返す。残りが [`MIN_REMAINING_TIMEOUT`] 未満
+    /// ならその場で [`IoErrorCode::Timeout`] を返す（`Duration::ZERO` を
+    /// `set_read_timeout` / `set_write_timeout` に渡すと std がエラーにする上、
+    /// それを僅かに上回るだけの残り時間も `timeval` 精度未満に丸まりうるため、
+    /// 実用上の下限を [`MIN_REMAINING_TIMEOUT`] として先に弾く）。
     fn remaining_or_timeout(deadline: Instant) -> Result<Duration, IoError> {
         let now = Instant::now();
-        if now >= deadline {
-            return Err(IoError::new(
+        let remaining = deadline.checked_duration_since(now);
+        match remaining {
+            Some(remaining) if remaining >= MIN_REMAINING_TIMEOUT => Ok(remaining),
+            _ => Err(IoError::new(
                 IoErrorCode::Timeout,
                 "frame deadline exceeded before the operation completed",
-            ));
+            )),
         }
-        Ok(deadline - now)
     }
 
     /// `io::Error` を `IoError` へ変換する（`crate::error` の `IoErrorCode`・
@@ -2585,6 +2603,22 @@ mod imp {
             let remaining = remaining_or_timeout(deadline).expect("future deadline must succeed");
             assert!(remaining > Duration::ZERO);
             assert!(remaining <= Duration::from_secs(5));
+        }
+
+        /// #1115 codex レビュー指摘対応（macOS CI 実バグ修正）:
+        /// 残り時間が [`MIN_REMAINING_TIMEOUT`] 未満（`timeval` 精度未満）なら、
+        /// 期限をまだ過ぎていなくても `Timeout` を返す。`set_write_timeout` へ
+        /// 渡した際に `timeval` 変換で実質ゼロへ丸まり、macOS で `EINVAL`
+        /// （`is_peer_shutdown_einval` に誤って「相手の切断」と判定される）を
+        /// 引き起こす経路を、値を渡す前に断つ
+        /// （`repair5_uds_send_times_out_on_unresponsive_peer` の macOS CI 再現
+        /// 失敗の根本原因）。
+        #[test]
+        fn repair5_remaining_or_timeout_returns_timeout_below_min_granularity() {
+            let deadline = Instant::now() + Duration::from_nanos(100);
+            let err = remaining_or_timeout(deadline)
+                .expect_err("sub-microsecond remaining time must be treated as timed out");
+            assert_eq!(err.code(), IoErrorCode::Timeout);
         }
 
         /// PLUG-12・security.md（#820 レビュー指摘の回帰テスト）: uid が一致すれば

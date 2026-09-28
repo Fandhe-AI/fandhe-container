@@ -886,6 +886,45 @@ mod imp {
         }
     }
 
+    /// `set_read_timeout` / `set_write_timeout` の失敗を `IoError` へ変換する
+    /// （D・#820・PR #1113 の macOS CI 失敗の修正）。
+    ///
+    /// # macOS での `EINVAL`（`InvalidInput`）
+    /// macOS の `setsockopt(2)`（`SO_RCVTIMEO` / `SO_SNDTIMEO` の設定に使う）は、
+    /// マニュアルの `[EINVAL]` 項に「ソケットが接続済みでなければならない
+    /// オプションを、接続されていないソケットに指定した」場合に返ると明記されて
+    /// おり、相手がすでに切断した（あるいは accept 前に切断された）ソケットに対して
+    /// タイムアウトを設定しようとすると発生しうる。この実装は `read_exact_until`・
+    /// `read_body_until`・`write_all_until` のループの毎回、`remaining_or_timeout`
+    /// で残り時間を計算し直した直後に `set_read_timeout` / `set_write_timeout` を
+    /// 呼び直す（B4・#820 レビュー指摘対応）ため、相手が接続直後に切断した場合
+    /// （`io1_uds_recv_reports_unavailable_on_peer_close` が再現するケース）に、
+    /// 最初のループでこの `EINVAL` を踏みうる。Linux では同じ状況でも
+    /// `setsockopt` 自体は成功し、直後の `read`/`write` が `map_io_error` の
+    /// 切断系 `ErrorKind` を返す（実装差）。
+    ///
+    /// `remaining_or_timeout` は `Duration::ZERO` を `set_*_timeout` へ渡さない
+    /// （呼び出し前に自身が `Timeout` を返して打ち切るため）ため、この経路の
+    /// `InvalidInput` が「ゼロ Duration を渡した」という別要因で起きることはなく、
+    /// 「相手の接続がすでに閉じている」ことを示すと判断して良い。したがって
+    /// `map_io_error` とは別にここで `Unavailable` へ変換し、
+    /// 切断済みの相手への操作を `Internal`（本来は実装のバグを示すコード）で
+    /// 誤って報告しないようにする。それ以外の失敗（`EBADF` 等）は引き続き
+    /// `Internal` として扱う。
+    fn map_set_timeout_error(e: io::Error) -> IoError {
+        if e.kind() == io::ErrorKind::InvalidInput {
+            IoError::new(
+                IoErrorCode::Unavailable,
+                format!("peer connection is unavailable: failed to set io timeout: {e}"),
+            )
+        } else {
+            IoError::new(
+                IoErrorCode::Internal,
+                format!("failed to set io timeout: {e}"),
+            )
+        }
+    }
+
     /// `buf` を埋め切るまで読む。フレーム全体の `deadline` を基準に毎回残り
     /// 時間を計算し直すため、1 バイトずつ小出しに送ってくる相手でも
     /// フレーム全体の期限で必ず打ち切られる（REPAIR-5）。
@@ -898,12 +937,9 @@ mod imp {
         let mut filled = 0usize;
         while filled < buf.len() {
             let remaining = remaining_or_timeout(deadline)?;
-            stream.set_read_timeout(Some(remaining)).map_err(|e| {
-                IoError::new(
-                    IoErrorCode::Internal,
-                    format!("failed to set read timeout: {e}"),
-                )
-            })?;
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(map_set_timeout_error)?;
             let Some(dst) = buf.get_mut(filled..) else {
                 return Err(IoError::new(
                     IoErrorCode::Internal,
@@ -962,12 +998,9 @@ mod imp {
         let mut chunk = [0u8; BODY_READ_CHUNK];
         while body.len() < body_len {
             let remaining = remaining_or_timeout(deadline)?;
-            stream.set_read_timeout(Some(remaining)).map_err(|e| {
-                IoError::new(
-                    IoErrorCode::Internal,
-                    format!("failed to set read timeout: {e}"),
-                )
-            })?;
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(map_set_timeout_error)?;
             let want = (body_len - body.len()).min(chunk.len());
             let Some(dst) = chunk.get_mut(..want) else {
                 return Err(IoError::new(
@@ -1014,12 +1047,9 @@ mod imp {
         let mut written = 0usize;
         while written < bytes.len() {
             let remaining = remaining_or_timeout(deadline)?;
-            stream.set_write_timeout(Some(remaining)).map_err(|e| {
-                IoError::new(
-                    IoErrorCode::Internal,
-                    format!("failed to set write timeout: {e}"),
-                )
-            })?;
+            stream
+                .set_write_timeout(Some(remaining))
+                .map_err(map_set_timeout_error)?;
             let Some(src) = bytes.get(written..) else {
                 return Err(IoError::new(
                     IoErrorCode::Internal,
@@ -1083,6 +1113,26 @@ mod imp {
         #[test]
         fn task13_2_1_map_io_error_maps_other_kinds_to_internal() {
             let err = map_io_error(io::Error::from(io::ErrorKind::PermissionDenied));
+            assert_eq!(err.code(), IoErrorCode::Internal);
+        }
+
+        /// D・#820（PR #1113 の macOS CI 失敗の修正）: `set_read_timeout` /
+        /// `set_write_timeout` の `InvalidInput`（macOS の `EINVAL`。相手が
+        /// すでに切断済みのソケットへタイムアウトを設定しようとした場合）は
+        /// `Internal` ではなく `Unavailable` に写像される
+        /// （`map_set_timeout_error` のドキュメンテーションコメント参照）。
+        #[test]
+        fn d_820_map_set_timeout_error_maps_invalid_input_to_unavailable() {
+            let err = map_set_timeout_error(io::Error::from(io::ErrorKind::InvalidInput));
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+        }
+
+        /// D・#820: `InvalidInput` 以外のタイムアウト設定失敗（例: 無効な fd を
+        /// 示す `EBADF` 相当）は引き続き `Internal` に写像される
+        /// （実装のバグを示す経路と、相手の切断を示す経路を区別する）。
+        #[test]
+        fn d_820_map_set_timeout_error_maps_other_kinds_to_internal() {
+            let err = map_set_timeout_error(io::Error::from(io::ErrorKind::PermissionDenied));
             assert_eq!(err.code(), IoErrorCode::Internal);
         }
 

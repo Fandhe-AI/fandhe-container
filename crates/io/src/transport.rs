@@ -9,6 +9,8 @@
 //!
 //! OS 固有の型（`std::os::unix` 等）・`cfg(target_os = ...)` 分岐は持たない。UDS・vsock・
 //! named pipe などの具象トランスポート実装は後続タスクの担当 crate / モジュールに置く。
+//! UDS のサーバー側（Linux / macOS）は [`crate::server`] が TASK-13.2.1（#820）で
+//! 具象実装を追加した。
 
 use std::time::Duration;
 

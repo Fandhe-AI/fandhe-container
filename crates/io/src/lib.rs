@@ -7,7 +7,9 @@
 //! パイプライン送信クライアントの送信キュー（[`client::SendQueue`]・
 //! [`client::PipelineClient`]。TASK-12.1・#73）と、送信イベントを記録する観測フック
 //! （[`observe`]。TASK-12.1・#73 codex 指摘対応。REPAIR-4・REPAIR-5）を持つ。
-//! トランスポートの具象実装（UDS・vsock・named pipe 等）・
+//! トランスポートの具象実装のうち、UDS のサーバー側（Linux / macOS）は
+//! TASK-13.2.1（#820）で実装済み（[`server::UdsServer`]・
+//! [`server::UdsConnection`]）。クライアント側の UDS 接続・vsock・named pipe・
 //! ディスク書き込みはまだない（REPAIR-3。スタブの明示）。
 //! [`protocol::Frame`] のペイロード内部レイアウト（request id・ACK の対応付け）は
 //! [`payload`] モジュール（TASK-12.2・#74）が定める。[`client::PipelineClient::send`]
@@ -34,6 +36,7 @@ pub mod observe;
 pub mod payload;
 pub mod protocol;
 pub mod recv_limits;
+pub mod server;
 pub mod transport;
 
 pub use batch::{
@@ -61,6 +64,7 @@ pub use protocol::{
 pub use recv_limits::{
     AdmittedHeader, MAX_CONTROL_PAYLOAD_LEN, MAX_RECV_PENDING_FRAMES, ReceiveLimits,
 };
+pub use server::{UdsConnection, UdsServer};
 pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, WireFrame,
 };

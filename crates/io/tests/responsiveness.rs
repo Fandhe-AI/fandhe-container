@@ -210,6 +210,20 @@ mod unix {
     /// 考慮していなかったため、bind / accept 側の遅延で誤って panic し得た）。
     const CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 
+    /// [`repair5_missing_ack_is_detected_as_timeout`] の ACK 待ち段階 watchdog
+    /// （stage 2）専用の追加猶予。client スレッドは `wait_started` を記録した
+    /// 直後に `ready_tx.send(wait_started)` を挟んでから `recv_ack` を呼ぶため、
+    /// `wait_started` の記録時刻と `recv_ack` が実際にブロッキング待ちへ入る
+    /// 時刻との間に理論上スケジューリング遅延の余地がある。この余地が
+    /// [`HANG_GUARD_GRACE`] を超えると、`recv_ack` 自体は正常にタイムアウトを
+    /// 返しているにもかかわらず main 側 watchdog が先に期限切れと誤判定し得る
+    /// （codex P2 指摘・#1124）。watchdog は「無限に待たない」ことを保証する
+    /// 安全網であり、所要時間の精密な検証は本関数末尾の `elapsed`
+    /// （client スレッド内で `wait_started` と同一スレッド上で計測される値。
+    /// クロススレッドのスケジューリング遅延の影響を受けない）で別途行うため、
+    /// この定数を widen して stage 2 の期限だけ緩めても検出精度は損なわれない。
+    const ACK_WAIT_SCHEDULING_SLACK: Duration = Duration::from_secs(2);
+
     /// テストごとに固有かつ短いソケットディレクトリを作る（`tests/writeback.rs`
     /// の `TempSocketDir` と同じ理由・同じ実装。`sun_path` の長さ上限のため
     /// 接頭辞を短く保つ）。
@@ -944,10 +958,20 @@ mod unix {
         // スケジューリング遅延を期限計算に混ぜると、通知直後に client
         // スレッドが長く待たされただけで ACK 待ちが正常なのに watchdog が
         // 先に期限切れになり得る（codex P2 指摘・#1124）。
+        //
+        // さらに、`wait_started` は `ready_tx.send()` を挟んで `recv_ack`
+        // 呼び出しの直前に記録されるため、その送信自体で client スレッドが
+        // スケジューリング遅延を受けると、`recv_ack` が実際にブロッキング
+        // 待ちへ入る時刻は `wait_started` よりわずかに後ろへずれ得る。
+        // この理論上の窓を `ACK_WAIT_SCHEDULING_SLACK` として明示的に
+        // budget へ加算し、watchdog が「無限に待たない」安全網としてのみ
+        // 機能するよう `HANG_GUARD_GRACE` 単体より広い期限にする
+        // （codex P2 指摘・#1124。所要時間の精密な検証は下記の `elapsed`
+        // assert が別途担う）。
         std::thread::spawn(move || {
             let _ = result_tx.send(client_thread.join());
         });
-        let watchdog_budget = timeout.as_duration() + HANG_GUARD_GRACE;
+        let watchdog_budget = timeout.as_duration() + HANG_GUARD_GRACE + ACK_WAIT_SCHEDULING_SLACK;
         let watchdog_deadline_instant = wait_started + watchdog_budget;
         let remaining = watchdog_deadline_instant.saturating_duration_since(Instant::now());
         let client_result = result_rx.recv_timeout(remaining).unwrap_or_else(|_| {

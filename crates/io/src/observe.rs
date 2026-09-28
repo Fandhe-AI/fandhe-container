@@ -938,12 +938,15 @@ impl fmt::Debug for ServerEvent<'_> {
 /// （bind 失敗時は観測フックの値ごと破棄される）。将来 bind を観測対象に
 /// 含める場合は `ServerOp` へバリアントを追加する（`#[non_exhaustive]`）。
 ///
-/// # 全分岐で必ず 1 回通知する
+/// # 全分岐で最終結果を 1 回通知する
 ///
 /// [`crate::server::UdsServer::accept`]・[`crate::server::UdsConnection`] の
 /// 送受信は、成功・各種拒否（プロトコル違反・`ReceiveLimits::admit` の拒否・
-/// poison 済みでの拒否）・タイムアウトのすべての分岐で、本メソッドを必ず
-/// 1 回呼ぶ（`crates/io/tests/server.rs` の結合試験で確認する）。
+/// poison 済みでの拒否）・タイムアウトのすべての分岐で、最終結果のイベントを
+/// 1 回通知する（`crates/io/tests/server.rs` の結合試験で確認する）。送受信の
+/// 通知は 1 回の呼び出しにつき 1 回だけだが、accept は最終結果の前に peer
+/// credential 拒否 1 件ごとのイベント（[`ServerOutcome::RejectedPeerCredential`]）
+/// も通知するため、1 回の呼び出しで `1 + 拒否件数` 回呼ばれうる。
 pub trait ServerObserver: Send {
     /// 1 回の操作イベントを通知する。`event` は呼び出し中のみ有効な借用
     /// （[`ServerEvent`] のドキュメント参照）。
@@ -1039,9 +1042,10 @@ struct CoalescedRejections {
 /// 本型は有界の一時バッファであり、永続的な監査ログではない。SEC-4
 /// 「分離違反の試行は監査ログに記録する」の永続的な監査ログへの配線
 /// （[`Self::drain_lines`] で取り出した行の書き出し先）は TASK-13.2.2（#822）で
-/// 行う。本型が保証するのは「peer credential 拒否は黙って失われない（個別の行、
-/// または欠けた区間を明示する集約行として必ず [`Self::drain_lines`] に現れる）」
-/// までである。
+/// 行う。本型が保証するのは「peer credential 拒否は黙って失われない（drain
+/// するまで保持し、個別の行または欠けた区間を明示する集約行として
+/// [`Self::drain_lines`] に現れる）」までである（drain せずに本型を破棄した
+/// 場合にためた行が消えるのは、他のイベントと同じく呼び出し元の責務）。
 ///
 /// # 2 つの枠（SEC-4・#820 codex P0 指摘対応）
 /// - 通常枠: [`ServerOutcome::RejectedPeerCredential`] 以外のイベント。行数上限
@@ -1076,7 +1080,8 @@ struct CoalescedRejections {
 /// `outcome`（`"ok"`/`"error"`）・`reason`（失敗系のみ。[`ServerOutcome`] の
 /// snake_case 名。`rejected_poisoned` で P1-3 の poison 拒否・
 /// `rejected_peer_credential` で peer credential 拒否〔H1・#820
-/// security-auditor 指摘対応〕を区別できる）・
+/// security-auditor 指摘対応〕を区別できる。下記の集約行だけは
+/// `peer_credential_rejections_coalesced` を使う）・
 /// `code`（失敗系のみ・ERR-1 文字列）・`message`（失敗系のみ・切り詰め済み・
 /// エスケープ済み）・`message_truncated`（切り詰め発生時のみ `true`）・
 /// `accept_aborted_retries`（`u32`）・`peer_credential_rejections`（`u32`。H1・

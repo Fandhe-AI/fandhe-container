@@ -25,7 +25,7 @@
 //! 既定にはしない）。accept は [`UdsServer`] が構築時に受け取った観測フックへ、
 //! 1 接続内の送受信（[`FrameSender::send_frame`]・[`FrameReceiver::recv_frame`]）は
 //! [`UdsServer::accept`] が受け取る接続ごとの観測フックへ、それぞれ通知する。
-//! 全分岐（成功・各拒否・タイムアウト・poison 済みでの拒否）で必ず 1 回通知し、
+//! 全分岐（成功・各拒否・タイムアウト・poison 済みでの拒否）で最終結果を 1 回通知し、
 //! 通知自体は [`crate::observe::ServerObserver::on_event`] の契約どおり
 //! ブロックする I/O を行わない（[`crate::observe::ServerObserver`] のドキュメント
 //! 参照）。accept 1 回の呼び出しの中で peer credential 拒否（下記「peer
@@ -779,7 +779,9 @@ mod imp {
                 // 拒否の各経路の `sleep` が期限をまたいだ場合に、期限後に listen
                 // キューから接続を取り出して（下の成功経路の判定で）閉じるだけに
                 // なるのを避け、その接続をキューに残したまま `Timeout` を返す。
-                // 初回は `deadline` を計算した直後のため必ず通過する。
+                // 初回は `deadline` を計算した直後のため、ごく短い timeout でない
+                // 限り通過する（通過しなくても `Timeout` を返すだけで、接続は
+                // キューに残る）。
                 if Instant::now() >= deadline {
                     return super::AcceptAttempt {
                         result: Err(accept_timeout_error()),
@@ -1541,7 +1543,9 @@ mod imp {
 
     /// `buf` を埋め切るまで読む。フレーム全体の `deadline` を基準に毎回残り
     /// 時間を計算し直すため、1 バイトずつ小出しに送ってくる相手でも
-    /// フレーム全体の期限で必ず打ち切られる（REPAIR-5）。
+    /// フレーム全体の期限で打ち切られる（期限後に read を始めず、各 read の待ちも
+    /// 残り時間が上限。超過はソケットのタイムアウトの粒度の範囲に収まる。
+    /// REPAIR-5）。
     fn read_exact_until(
         stream: &mut UnixStream,
         buf: &mut [u8],
@@ -1594,14 +1598,16 @@ mod imp {
     /// codex P0 指摘対応）。[`read_body_until`] が読み取りループの中で使う。
     ///
     /// # 確保容量の上限（#820 codex P0 指摘対応）
-    /// 容量は常に `body_len` 以下に保つ。`Vec::extend_from_slice` 等の
+    /// 容量を `body_len` 以下に保つ。`Vec::extend_from_slice` 等の
     /// 償却つき成長は容量を幾何級数的に増やすため、実際の確保容量が受理済みの
     /// `body_len` を超えうる（以前の実装の問題）。本型は次の 2 点でこれを防ぐ:
     ///
     /// - 初期容量は `min(body_len, BODY_READ_CHUNK)`
     /// - 空き領域を使い切ったときだけ `reserve_exact(min(BODY_READ_CHUNK,
-    ///   body_len - 容量))` で伸ばす（`reserve_exact` は要求どおりの容量を
-    ///   確保し、要求量は `body_len` を超えない）。`resize` は伸ばした直後に
+    ///   body_len - 容量))` で伸ばす（`reserve_exact` は償却つきの上乗せを
+    ///   せず、要求量は `body_len` を超えない。std の文書はアロケータが要求より
+    ///   多い領域を返すことを許すが、現行の `Vec` はその余剰を容量に含めない。
+    ///   容量の推移はテストで具体値を照合する）。`resize` は伸ばした直後に
     ///   その空き領域をゼロ埋めするためだけに呼び、容量ぴったりまでしか
     ///   伸ばさないので内部で再確保は起きない
     ///

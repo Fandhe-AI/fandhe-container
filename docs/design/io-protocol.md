@@ -167,7 +167,19 @@ BREAK-2 検出経路の整理:
 
 `FrameHeader` には同期マーカー（フレーム境界を再同期するための番兵バイト列）がないため、`FrameSender::send_frame` / `FrameReceiver::recv_frame` の送受信途中でエラーが起きると、以後のバイト列がフレーム境界からずれて解釈される可能性がある。両トレイトの契約として、`Timeout`・`DataLoss`・`InvalidArgument`・`Unimplemented` 等いずれのエラーを返した後も、その接続は以後使用不可（fail-closed）とする。実装はエラーを返した後の呼び出しに対して実際の読み書きを一切行わず `IoErrorCode::Unavailable` を返さなければならず、呼び出し元は同じ接続を再利用せず再接続しなければならない。`crates/io/src/transport.rs` の `MockTransport`（テスト専用）がこの契約を実装し、`p1_3_connection_becomes_unavailable_after_error` で確認する。TASK-12・TASK-13 が実装する具象トランスポート（UDS・vsock・named pipe 等）もこの契約に従う義務を負う。
 
+## 送信キュー（TASK-12.1・IO-1・#73）
+
+`crates/io/src/client.rs` の `SendQueue`・`PipelineClient` は、パイプライン送信（IO-1: ACK を待たずに連続送信する）で未 ACK 件数が際限なく増えないよう、上限件数付きで送信済みリクエストを追跡する。
+
+- 未 ACK 件数の上限は `InFlightLimit`（検証済み newtype）で表現し、既定値は `DEFAULT_IN_FLIGHT_LIMIT = 64`。根拠は PoC-2（`03-poc/io-layer-redesign`）のクライアントが使っていた in-flight window の既定値（サーバー側バッチサイズに揃えた値）
+- 上限の最大値は `MAX_IN_FLIGHT_LIMIT = 4096`（暫定値。`InFlightRequest` は id・種別のみを保持しペイロードを持たないため上限まで埋まってもメモリ量は小さい。TASK-113 のベンチ・TASK-85 の結合試験で見直してよい）
+- 上限に達した状態で `PipelineClient::send` を呼ぶと、**トランスポートへ書き込む前に** `IoErrorCode::ResourceExhausted` を返す（ブロックしない。ACK 待ちによる枠の解放は TASK-12.2〔#74〕の範囲）
+- request id（`RequestId`）はクライアントがローカルに振る単調増加の連番であり、ペイロードには含めない。ワイヤー上のレイアウトは TASK-12.2（#74）が定める
+- ACK フレームの受信・デコード・id との対応付け・タイムアウト付き ACK 待ちは本件の範囲外で、TASK-12.2（#74）が `client` モジュールへ追加する
+
+`IoErrorCode::ResourceExhausted` は `DataLoss` と同じく ERR-1/3/5 の既定表にない拡張コード（gRPC 正準コードの `RESOURCE_EXHAUSTED` を借用）。spec `error-format.md` への反映要否は spec 側への報告事項（spec-reference）。
+
 ## 見直し
 
 - `crates/io/src/protocol.rs` のフレーム形式・定数・`FrameKind` のバリアントが変わった場合は本書を追従させる
-- TASK-12（パイプライン送信クライアント）・TASK-13（バッチ write-back サーバー）がペイロード内部のレイアウト（request id・ACK status 等）を確定させた際は、本書へ追記する
+- TASK-12.2（#74）・TASK-13（バッチ write-back サーバー）がペイロード内部のレイアウト（request id・ACK status 等）を確定させた際は、本書へ追記する

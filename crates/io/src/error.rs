@@ -44,6 +44,19 @@ pub enum IoErrorCode {
     /// ため、`spec` scope での参照更新が別途必要（本リポの Issue 追跡対象。
     /// out-of-scope-tracking）。
     DataLoss,
+    /// 呼び出し側が設定した上限に達しており、これ以上の資源確保を拒否する
+    /// （TASK-12.1・IO-1・#73）。
+    ///
+    /// [`crate::client::SendQueue`] が未 ACK 件数の上限（[`crate::client::InFlightLimit`]）
+    /// に達したときに、[`crate::client::PipelineClient::send`] がトランスポートへの
+    /// 書き込み前に返す。無制限にリソースを確保し続けることを防ぐための境界であり
+    /// （security.md「不安全な設計」観点）、`InvalidArgument`（引数そのものの形式・
+    /// 範囲違反）とは区別する。
+    ///
+    /// gRPC 正準コードの `RESOURCE_EXHAUSTED` を借用した名称であり、`DataLoss` と
+    /// 同じく ERR-1/3/5 の既定表にはない拡張コード。spec `error-format.md` への
+    /// 反映要否は spec 側への報告事項（spec-reference）。
+    ResourceExhausted,
 }
 
 impl IoErrorCode {
@@ -56,6 +69,7 @@ impl IoErrorCode {
             Self::Unimplemented => "UNIMPLEMENTED",
             Self::Internal => "INTERNAL",
             Self::DataLoss => "DATA_LOSS",
+            Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
         }
     }
 }
@@ -123,6 +137,10 @@ mod tests {
         assert_eq!(IoErrorCode::Unimplemented.as_str(), "UNIMPLEMENTED");
         assert_eq!(IoErrorCode::Internal.as_str(), "INTERNAL");
         assert_eq!(IoErrorCode::DataLoss.as_str(), "DATA_LOSS");
+        assert_eq!(
+            IoErrorCode::ResourceExhausted.as_str(),
+            "RESOURCE_EXHAUSTED"
+        );
     }
 
     /// IO-1: `IoError` の `Display` が `"<CODE>: <message>"` 形式になる。

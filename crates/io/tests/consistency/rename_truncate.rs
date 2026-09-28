@@ -67,9 +67,10 @@ fn reopen_sink(path: &Path) -> AppendFileSink {
 /// （T4 専用。非 `O_APPEND` の [`AppendFileSink::new`] は一度だけ末尾へ seek
 /// するため、ライブセッション中に外部から truncate されるとカーソルが古い
 /// ままになりゼロ埋めの穴ができる。これは非 append モードでの既知の限界で、
-/// 本テストファイルの対応範囲外とし、別途の Issue 化は未実施（Issue 未起票）。
-/// `append(true)` で開くと各 `write_all` が OS レベルで常に現在の EOF に
-/// 着地するため、この穴を避けられる）。
+/// `io4_truncate_live_session_normal_mode_leaves_zero_fill_hole`（T6）が
+/// `create_sink` を使って実際にその穴が生じることを明示的に検証している。
+/// 本関数（T4）はその対比として、`append(true)` で開くと各 `write_all` が
+/// OS レベルで常に現在の EOF に着地し、この穴を避けられることを固定する）。
 fn append_mode_sink(path: &Path) -> AppendFileSink {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -396,7 +397,7 @@ fn io4_rename_concurrent_clients_each_file_renamed_mid_session() {
 }
 
 // ---------------------------------------------------------------------
-// truncate ケース（T1〜T5）
+// truncate ケース（T1〜T6）
 // ---------------------------------------------------------------------
 
 /// IO-4・REPAIR-6・TASK-14.2: セッション終了後に `set_len(0)` してから次の
@@ -597,6 +598,67 @@ fn io4_truncate_live_session_append_mode_lands_at_new_eof() {
     assert_eq!(
         actual, expected,
         "append(true) must land post-truncate writes at the new EOF with no zero-fill hole"
+    );
+}
+
+/// IO-4・REPAIR-6・TASK-14.2（codex/review 指摘・PR #1125 対応）: `create_sink`
+/// （通常モード、非 `O_APPEND`）で開いたライブセッション中に、別ハンドルで
+/// `set_len(0)` する。`append_mode_sink`（T4）のドキュメンテーションコメント
+/// に記した既知の限界（[`AppendFileSink::new`] は一度だけ現在の EOF へ
+/// `seek` するため、以後の `write_all` はその古いオフセットへ書き込み続け、
+/// 外部 truncate 後もカーソルが追随しない）を、通常モードで実際に生成される
+/// ファイルのバイト列（ゼロ埋めの穴＋その直後の新レコード）で固定する。
+/// 実装（[`AppendFileSink`]）は変更せず、この既知の破損経路を通常モードでも
+/// 明示的に検証する（T4 は `append(true)` を使うことでこの穴を避けられる
+/// ことの確認であり、本ケースはその対比として、非 append モードでは実際に
+/// 穴が生じることを確認する）。
+#[test]
+fn io4_truncate_live_session_normal_mode_leaves_zero_fill_hole() {
+    const BODY_LEN: usize = 16;
+    const BATCH_SIZE: usize = 4;
+    const N: u32 = 4;
+    const M: u32 = 4;
+    let config = BatchConfig::new(BATCH_SIZE).expect("valid batch size");
+
+    let dir = TempDir::new("truncate-live-session-normal-mode");
+    let path = dir.file_path("data.bin");
+
+    let mut session = LiveSession::start(create_sink(&path), config, (N + M) as usize + 1);
+    let bodies_n: Vec<Vec<u8>> = (0..N).map(|seq| body_for(0, seq, BODY_LEN)).collect();
+    session.write_and_ack(&bodies_n);
+
+    let external = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("must open for external truncate");
+    external
+        .set_len(0)
+        .expect("external truncate must succeed while the normal-mode sink stays open");
+    drop(external);
+
+    let bodies_m: Vec<Vec<u8>> = (0..M).map(|seq| body_for(0, N + seq, BODY_LEN)).collect();
+    session.write_and_ack(&bodies_m);
+    let report = session.finish();
+    assert_eq!(report.stats.acks_sent, u64::from(N + M));
+
+    // カーソルは truncate 前の EOF（N * BODY_LEN）のままなので、その後の
+    // write_all は同じオフセットへ着地する。truncate 済みファイルへ EOF を
+    // 越えた位置へ書くと、その間はゼロ埋めされる（POSIX `write(2)`・
+    // Windows `WriteFile` いずれも決定的）ため、[0, N*BODY_LEN) がゼロ埋めの
+    // 穴になり、その直後に M 件のレコードが続く。
+    let hole_len = u64::from(N) * BODY_LEN as u64;
+    let mut expected = vec![0u8; hole_len as usize];
+    expected.extend(records(0, N..N + M, BODY_LEN));
+    let actual = std::fs::read(&path).expect("must read file");
+    assert_eq!(
+        actual, expected,
+        "normal-mode sink must leave a zero-fill hole where the external truncate happened, \
+         with new records landing at the stale pre-truncate cursor offset \
+         (known limitation, IO-4/REPAIR-6, see append_mode_sink doc for the append-mode contrast)"
+    );
+    assert_eq!(
+        std::fs::metadata(&path).expect("metadata").len(),
+        hole_len + u64::from(M) * BODY_LEN as u64
     );
 }
 

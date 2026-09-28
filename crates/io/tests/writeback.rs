@@ -240,23 +240,33 @@ mod unix {
         let output_path_for_client = output_path.clone();
         let client_thread = std::thread::spawn(move || {
             let mut stream = connect(&connect_path);
-            for id in 0..16u64 {
+            // 1 回目のバッチ（8 件）だけを送り、8 件ぶんの ACK を読み切って
+            // からスナップショットを取る。2 回目のバッチ（残り 8 件）はまだ
+            // サーバーへ送っていないため、サーバー側がバッチ 1 の ACK 送出
+            // 直後にバッチ 2 の書き込みへ進めるとしても受信すべきフレームが
+            // 無く、スナップショット時点でバッチ 2 の書き込みが完了している
+            // ことはあり得ない（テストレースの排除。#822 レビュー指摘）。
+            for id in 0..8u64 {
                 send_write(&mut stream, id, &id.to_le_bytes());
             }
             let mut acked_ids = Vec::with_capacity(16);
-            let mut snapshot_after_8th_ack: Option<Vec<u8>> = None;
-            for i in 0..16 {
+            for _ in 0..8 {
                 let frame = recv_frame(&mut stream);
                 acked_ids.push(ack_id(&frame));
-                if i == 7 {
-                    // D2 の直接確認: 1 回目のバッチ（8 件）の最後の ACK を受け
-                    // 取った時点で、出力ファイルにはすでに 8 件ぶんの body しか
-                    // ない（2 回目のバッチの書き込みはまだ起きていない）はず。
-                    snapshot_after_8th_ack =
-                        Some(std::fs::read(&output_path_for_client).unwrap_or_default());
-                }
             }
-            (acked_ids, snapshot_after_8th_ack.unwrap_or_default())
+            // D2 の直接確認: 1 回目のバッチ（8 件）の最後の ACK を受け取った
+            // 時点で、出力ファイルにはすでに 8 件ぶんの body しかない（2 回目
+            // のバッチの書き込みはまだ起きていない）はず。
+            let snapshot_after_8th_ack = std::fs::read(&output_path_for_client).unwrap_or_default();
+
+            for id in 8..16u64 {
+                send_write(&mut stream, id, &id.to_le_bytes());
+            }
+            for _ in 8..16 {
+                let frame = recv_frame(&mut stream);
+                acked_ids.push(ack_id(&frame));
+            }
+            (acked_ids, snapshot_after_8th_ack)
         });
 
         let mut connection = server

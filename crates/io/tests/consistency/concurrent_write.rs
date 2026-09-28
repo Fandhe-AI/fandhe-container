@@ -191,6 +191,11 @@ fn io4_concurrent_write_eight_clients_many_batches_exact_bytes() {
 /// クライアントごとに抜き出した部分列（[`decompose_records`] で分解）が
 /// [`body_for`] の期待値と完全一致することを確認する（交錯によるレコード破損の
 /// 検出）。
+///
+/// 検証対象は `serve_connection` がバッチ単位で発火させる書き込みの境界が
+/// 複数接続の並行スケジューリング下でも保たれるかであり、`AppendFileSink`
+/// 単体の並行安全性ではない（直列化は [`SharedSink`] の doc 参照。codex #1123
+/// レビュー指摘への対応）。
 #[test]
 fn io4_concurrent_write_shared_file_batches_never_interleave() {
     const CLIENTS: u16 = 4;
@@ -309,6 +314,13 @@ fn io4_concurrent_write_shared_file_batches_never_interleave() {
 /// IO-4・REPAIR-6・TASK-14.1: 4 クライアント × 64 件・`batch_size = 1`（交錯が
 /// 最大になる設定）が [`SharedSink`] を共有する。クライアントごとの部分列が
 /// seq 昇順で完全一致し、レコード総数・全長が具体値と一致することを確認する。
+///
+/// `batch_size = 1` により `write_batch` 呼び出し（＝ [`SharedSink`] の
+/// `Mutex` 獲得）の頻度が最大になり、複数接続からの獲得競合が最も起きやすい
+/// 設定でも per-client の順序が壊れないことを確認する。ここでも検証対象は
+/// `serve_connection` 側のスケジューリング・直列化の正しさであり、
+/// `AppendFileSink` 単体の並行安全性ではない（[`SharedSink`] の doc 参照。
+/// codex #1123 レビュー指摘への対応）。
 #[test]
 fn io4_concurrent_write_shared_file_batch_size_one_preserves_per_client_order() {
     const CLIENTS: u16 = 4;

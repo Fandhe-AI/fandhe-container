@@ -258,6 +258,30 @@ pub fn record_seq(record: &[u8]) -> u32 {
 /// バッチ単位の直列化で「同じファイルへの並行書き込みでもレコードが交錯しない
 /// こと」を保証する。`Clone` は内部の `Arc` を複製するだけで、複製後もすべて
 /// 同じ [`AppendFileSink`]（＝同じ出力ファイル）を指す。
+///
+/// # 直列化はハーネス側の意図的な設計（codex #1123 レビュー指摘）
+///
+/// [`AppendFileSink::new`] のドキュメント（`writeback.rs`）が明記するとおり、
+/// `AppendFileSink` は単一の `serve_connection` ループからのみ使われる契約
+/// （他プロセス・他スレッドとの競合書き込みを想定しない）を持つ。本番コードに
+/// 複数接続で 1 つの `AppendFileSink` を共有する実装は存在しない（現状は
+/// 接続ごとに個別の sink を持つ想定。TASK-14 のファイル操作ペイロード拡張まで
+/// 共有 sink の本番実装は範囲外）。
+///
+/// [`SharedSink`] はこの契約を満たすために、`write_batch` の呼び出しを
+/// `Mutex` で直列化してから内部の `AppendFileSink` へ委譲する。すなわち
+/// 検証対象は「`AppendFileSink` 単体が同期なしの並行書き込みに耐えるか」
+/// ではなく、「`serve_connection` が生成するバッチ単位のスケジューリング・
+/// ACK / 件数の集計が、複数接続がスレッド並行で 1 ファイルへ書き込む状況下
+/// でも壊れないか」である
+/// （[`super::concurrent_write::io4_concurrent_write_shared_file_batches_never_interleave`]
+/// ・
+/// [`super::concurrent_write::io4_concurrent_write_shared_file_batch_size_one_preserves_per_client_order`]
+/// 参照）。ロックなしで `AppendFileSink` へ直接複数スレッドから書かせるケース
+/// は追加しない。`AppendFileSink` の契約が単一書き込み元を前提とする以上、
+/// そのようなケースは未定義動作を検証することになり、OS の `write()` の
+/// 挙動に運良く救われるだけの意味のないテストになるため（IO-4・REPAIR-6・
+/// TASK-14.1）。
 #[derive(Clone)]
 pub struct SharedSink {
     inner: Arc<Mutex<AppendFileSink>>,

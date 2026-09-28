@@ -391,6 +391,16 @@ enum FlushAckVerdict {
     /// と誤判定する。同一世代番号の 2 度目の `BarrierRequested` は、1 回目が
     /// 未完了か完了済みかによらず違反として拒否する）。
     GenerationReused { generation: u32 },
+    /// 既に `FlushAckSent` を送出済みの世代番号に対して、再度
+    /// `FlushAckSent` を観測した（Codex レビュー指摘・5 巡目 P1: 旧実装は
+    /// `FlushAckSent` の処理を `flush_ack_sent` を再び `true` にするだけの
+    /// 冪等な代入として扱っていたため、`BarrierRequested(1) →
+    /// PersistedBeforeBarrier(1) → FlushAckSent(1) → FlushAckSent(1)` が
+    /// `Ok` と誤判定されていた。1 回のバリア要求に対して複数回 FLUSH ACK を
+    /// 返す異常はクライアント側の二重処理・二重の永続化完了通知を招くため、
+    /// `GenerationReused`〔バリア要求の再利用〕とは別の専用の違反種別として
+    /// 拒否する）。
+    DuplicateFlushAck { generation: u32 },
 }
 
 /// 世代ごとの `flush_ack_follows_persistence` 内部状態。
@@ -428,16 +438,32 @@ fn generation_state_mut<'a>(
 
 /// `events` を先頭から走査し、`BarrierRequested` した各世代について、
 /// 同じ世代の `FlushAckSent` が「バリア要求後に記録された同世代の
-/// `PersistedBeforeBarrier`」より後に送出されていることを世代ごとに
-/// 個別照合する。
+/// `PersistedBeforeBarrier`」より後に、かつちょうど 1 回だけ送出されて
+/// いることを世代ごとに個別照合する。
+///
+/// # 受理する状態機械（`BarrierRequested` を観測した世代ごと）
+///
+/// 本照合器が `Ok` と判定するのは、`events` に現れる `BarrierRequested`
+/// を伴う各世代について、以下の順序をちょうど 1 回ずつ満たす場合に限る:
+///
+/// 1. `BarrierRequested { generation }` を 1 回観測する
+/// 2. その後、同じ `generation` の `PersistedBeforeBarrier` を 1 回以上
+///    観測する
+/// 3. その後、同じ `generation` の `FlushAckSent` をちょうど 1 回観測する
+///
+/// この順序に違反する系列（重複・順序逆転・未要求世代への FLUSH ACK・
+/// バリア要求前後の永続化通知の使い回し）はすべて拒否する。各違反パターンと
+/// 対応する verdict は以下のとおり:
 ///
 /// - 世代ごとに個別照合するため、他世代の永続化完了（過去に完了した
-///   世代の使い回し）では通らない（世代の使い捨て漏れの検出）
+///   世代の使い回し）では通らない（世代の使い捨て漏れの検出。
+///   [`FlushAckVerdict::PrematureFlushAck`]）
 /// - `PersistedBeforeBarrier` は同世代の `BarrierRequested` より後に
 ///   記録されたものだけを「その世代の FLUSH ACK の根拠」として数える
 ///   （Codex レビュー指摘・3 巡目: バリア要求より前の古い永続化通知を
 ///   使い回す取り違えの検出。IO-2 はバリア要求以降の永続化完了を保証と
-///   するため、要求前の通知では保証を満たさない）
+///   するため、要求前の通知では保証を満たさない。
+///   [`FlushAckVerdict::PrematureFlushAck`]）
 /// - `WriteAckSent` は永続化完了の有無を問わず許容する（IO-1・IO-2 の
 ///   契約差: 通常 ACK は永続化完了を待たずに返してよい）
 /// - 同一の世代番号に対する 2 度目の `BarrierRequested` は
@@ -445,10 +471,31 @@ fn generation_state_mut<'a>(
 ///   レビュー指摘・4 巡目: 世代番号を使い捨てにしないと、1 回目のバリアの
 ///   永続化完了フラグが 2 回目のバリアの FLUSH ACK の根拠として使い回され、
 ///   IO-2 の世代ごとの永続化完了保証を満たさないまま `Ok` と誤判定する）
+/// - 既に `FlushAckSent` を送出済みの世代番号への 2 度目の `FlushAckSent`
+///   は [`FlushAckVerdict::DuplicateFlushAck`] として即座に拒否する
+///   （Codex レビュー指摘・5 巡目 P1: `BarrierRequested(1) →
+///   PersistedBeforeBarrier(1) → FlushAckSent(1) → FlushAckSent(1)` の
+///   ように、1 回の要求に対して複数回 FLUSH ACK を返す異常を見逃さない）
 /// - `BarrierRequested` した世代のうち 1 つでも `FlushAckSent` が最後まで
 ///   現れなければ [`FlushAckVerdict::NoFlushAck`] を返す（Codex レビュー
 ///   指摘・3 巡目: 従来は最後に処理した世代の判定結果で上書きされ、他の
 ///   世代の応答欠落を見逃していた。全世代を走査し終えてから確定する）
+///
+/// # 無視する入力（違反として拒否せず、`Ok` の根拠にもしない）
+///
+/// IO-2 が制約するのは FLUSH ACK の送出条件（バリア以前の書き込みの
+/// 永続化完了後にのみ返すこと）であり、バックグラウンドの永続化完了
+/// 通知そのものの発生タイミングは制約しない。そのため以下は違反として
+/// 拒否しない（Codex レビュー指摘・5 巡目 P1 の追加確認: 状態機械の
+/// 説明を「ちょうど 1 回ずつ」と書いたことで、これらの通知が実際には
+/// 無視されている実装との乖離が生じないよう明記する）:
+///
+/// - 一度も `BarrierRequested` を観測していない世代の `PersistedBeforeBarrier`
+///   （バックグラウンドの fsync 完了。まだバリア要求が来ていないだけで
+///   不正ではない）
+/// - 同じ世代の `FlushAckSent` より後に記録された `PersistedBeforeBarrier`
+///   （次のバリアに備えた継続的な永続化。この世代の判定には影響しない）
+/// - `WriteAckSent`（`generation` を問わず何回現れても判定に影響しない）
 fn flush_ack_follows_persistence(events: &[AckEvent]) -> FlushAckVerdict {
     let mut order: Vec<u32> = Vec::new();
     let mut states: Vec<(u32, GenerationState)> = Vec::new();
@@ -482,6 +529,11 @@ fn flush_ack_follows_persistence(events: &[AckEvent]) -> FlushAckVerdict {
                 }
                 if !state.persisted_after_request {
                     return FlushAckVerdict::PrematureFlushAck {
+                        generation: *generation,
+                    };
+                }
+                if state.flush_ack_sent {
+                    return FlushAckVerdict::DuplicateFlushAck {
                         generation: *generation,
                     };
                 }
@@ -739,6 +791,202 @@ fn repair_12_scaffold_matcher_rejects_duplicate_barrier_request_before_ack() {
         FlushAckVerdict::GenerationReused { generation: 1 },
         "未完了の世代番号への重複バリア要求をマッチャが検出できていない"
     );
+}
+
+/// マッチャが、既に `FlushAckSent` まで完了した世代番号への 2 度目の
+/// `FlushAckSent`（FLUSH ACK の重複送出）を検出できることを確認する
+/// （REPAIR-12・IO-2。Codex レビュー指摘・5 巡目 P1: `FlushAckSent` の処理が
+/// `flush_ack_sent` を再び `true` にするだけだったため、
+/// `BarrierRequested(1) → PersistedBeforeBarrier(1) → FlushAckSent(1) →
+/// FlushAckSent(1)` が `Ok` となり、1 回の要求に対する複数回の FLUSH ACK
+/// 送出という異常を見逃していた）。
+#[test]
+fn repair_12_scaffold_matcher_rejects_duplicate_flush_ack() {
+    let duplicate_flush_ack = [
+        AckEvent::BarrierRequested { generation: 1 },
+        AckEvent::PersistedBeforeBarrier { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+        AckEvent::FlushAckSent { generation: 1 },
+    ];
+    assert_eq!(
+        flush_ack_follows_persistence(&duplicate_flush_ack),
+        FlushAckVerdict::DuplicateFlushAck { generation: 1 },
+        "送出済みの世代番号への 2 度目の FlushAckSent（FLUSH ACK の \
+            重複送出）をマッチャが検出できていない"
+    );
+}
+
+/// [`flush_ack_follows_persistence`] のドキュメントコメントに明記した
+/// 状態機械（各世代について: `BarrierRequested` 1 回 →
+/// `PersistedBeforeBarrier` 1 回以上 → `FlushAckSent` 1 回、の順）を
+/// 表駆動で網羅的に確認する（REPAIR-12・IO-2。Codex レビュー指摘・5 巡目:
+/// 個別の回帰テストが増えるたびに規則の全体像が見えにくくなるのを防ぐため、
+/// 受理する系列・拒否する系列（重複・順序逆転・未要求世代への ACK・
+/// 未要求世代の永続化）を 1 箇所の表にまとめる）。
+#[test]
+fn repair_12_flush_ack_state_machine_table() {
+    let cases: &[(&str, &[AckEvent], FlushAckVerdict)] = &[
+        (
+            "単一世代・仕様どおりの順序",
+            &[
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+            ],
+            FlushAckVerdict::Ok,
+        ),
+        (
+            "複数世代・各世代とも仕様どおりの順序",
+            &[
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+                AckEvent::BarrierRequested { generation: 2 },
+                AckEvent::PersistedBeforeBarrier { generation: 2 },
+                AckEvent::FlushAckSent { generation: 2 },
+            ],
+            FlushAckVerdict::Ok,
+        ),
+        (
+            "通常書き込み ACK が混在しても仕様どおりと判定される",
+            &[
+                AckEvent::WriteAckSent { generation: 1 },
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+            ],
+            FlushAckVerdict::Ok,
+        ),
+        (
+            "永続化を伴わない FLUSH ACK（未接続の永続化通知）",
+            &[
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+            ],
+            FlushAckVerdict::PrematureFlushAck { generation: 1 },
+        ),
+        (
+            "永続化通知がバリア要求より前（要求前の通知の使い回し）",
+            &[
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+            ],
+            FlushAckVerdict::PrematureFlushAck { generation: 1 },
+        ),
+        (
+            "他世代の永続化完了の使い回し（世代の使い捨て漏れ）",
+            &[
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+                AckEvent::BarrierRequested { generation: 2 },
+                AckEvent::FlushAckSent { generation: 2 },
+            ],
+            FlushAckVerdict::PrematureFlushAck { generation: 2 },
+        ),
+        (
+            "永続化完了が FLUSH ACK 送出より後（順序逆転）",
+            &[
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+            ],
+            FlushAckVerdict::PrematureFlushAck { generation: 1 },
+        ),
+        (
+            "バリア要求を伴わない FLUSH ACK（未要求世代への ACK）",
+            &[
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+            ],
+            FlushAckVerdict::FlushAckWithoutBarrier { generation: 1 },
+        ),
+        (
+            "バリア要求に通常 ACK しか返らない（FLUSH ACK 欠落）",
+            &[
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+                AckEvent::WriteAckSent { generation: 1 },
+            ],
+            FlushAckVerdict::NoFlushAck,
+        ),
+        (
+            "後続世代のバリア要求に FLUSH ACK が最後まで現れない",
+            &[
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+                AckEvent::BarrierRequested { generation: 2 },
+            ],
+            FlushAckVerdict::NoFlushAck,
+        ),
+        (
+            "未完了の世代番号への重複バリア要求",
+            &[
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::BarrierRequested { generation: 1 },
+            ],
+            FlushAckVerdict::GenerationReused { generation: 1 },
+        ),
+        (
+            "FLUSH ACK 済みの世代番号を再利用したバリア要求の重複",
+            &[
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+            ],
+            FlushAckVerdict::GenerationReused { generation: 1 },
+        ),
+        (
+            "同一世代への FLUSH ACK の重複送出",
+            &[
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+            ],
+            FlushAckVerdict::DuplicateFlushAck { generation: 1 },
+        ),
+        (
+            "未要求世代の永続化通知は無視される（違反にも Ok の根拠にもならない）",
+            &[AckEvent::PersistedBeforeBarrier { generation: 2 }],
+            FlushAckVerdict::NoFlushAck,
+        ),
+        (
+            "有効な世代 1 に、一度も要求されていない世代 2 の永続化通知が\
+                混在しても、世代 1 の判定は影響を受けない",
+            &[
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 2 },
+            ],
+            FlushAckVerdict::Ok,
+        ),
+        (
+            "FLUSH ACK 送出後に届いた同世代の永続化通知は無視される\
+                （次のバリアに備えた継続的な永続化であり、この世代の \
+                判定を覆さない）",
+            &[
+                AckEvent::BarrierRequested { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+                AckEvent::FlushAckSent { generation: 1 },
+                AckEvent::PersistedBeforeBarrier { generation: 1 },
+            ],
+            FlushAckVerdict::Ok,
+        ),
+    ];
+
+    for (description, events, expected) in cases {
+        assert_eq!(
+            flush_ack_follows_persistence(events),
+            *expected,
+            "系列 {description:?} の判定結果が状態機械の規則と一致しない: {events:?}"
+        );
+    }
 }
 
 /// 選定した対象仕様の一覧（[`ACCEPTANCE_TARGETS`]）が、モジュール

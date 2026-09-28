@@ -17,6 +17,7 @@ mod unix {
 
     use fandhe_container_io::{
         Frame, FrameKind, FrameReceiver, FrameSender, IoErrorCode, IoTimeout,
+        MAX_CONTROL_PAYLOAD_LEN,
     };
 
     /// テストごとに固有かつ短いソケットディレクトリを作る（macOS の
@@ -305,6 +306,54 @@ mod unix {
         assert_eq!(err.code(), IoErrorCode::Unavailable);
     }
 
+    /// TASK-13.4・IO-1（#796・#820 レビュー指摘の 0b・0 コミット項目）: 制御
+    /// フレーム（`Flush`）が `MAX_CONTROL_PAYLOAD_LEN` を超える長さを申告すると、
+    /// `recv_frame` は本体を読む前に `ReceiveLimits::admit` により
+    /// `ResourceExhausted` で拒否する。その後は P1-3 により `Unavailable` になる。
+    #[test]
+    fn io1_uds_recv_rejects_oversized_control_frame_before_body_read() {
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+        let server = fandhe_container_io::UdsServer::bind(&socket_path)
+            .expect("bind must succeed on a private, empty path");
+
+        let connect_path = socket_path.clone();
+        let oversized_len = MAX_CONTROL_PAYLOAD_LEN as usize + 1;
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&connect_path).expect("client must connect");
+            let frame = Frame::new(FrameKind::Flush, vec![0u8; oversized_len])
+                .expect("payload within MAX_PAYLOAD_LEN must construct a Frame");
+            // ヘッダだけ書き切れば admit の判定には十分（本体を待たずに拒否
+            // されるはずのため、本体は送らずに接続を保持する）。
+            let encoded = frame.encode();
+            let header = encoded
+                .get(..fandhe_container_io::FRAME_HEADER_LEN)
+                .expect("encoded frame must contain a full header");
+            stream
+                .write_all(header)
+                .expect("client header write must succeed");
+            std::thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        });
+
+        let mut connection = server
+            .accept(test_timeout())
+            .expect("server must accept the client connection");
+
+        let err = connection
+            .recv_frame(test_timeout())
+            .expect_err("an oversized control frame must be rejected before the body is read");
+        assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+        assert!(err.message().contains(&MAX_CONTROL_PAYLOAD_LEN.to_string()));
+
+        let err = connection
+            .recv_frame(test_timeout())
+            .expect_err("a poisoned connection must not be reused for recv");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+
+        let _ = client_thread.join();
+    }
+
     /// P1-3: エラーの後は send/recv どちらも `Unavailable` になり、socket に
     /// 追加のバイトが書き込まれない（client 側で追加データが届かないことを
     /// 短い read timeout で確かめる）。
@@ -395,7 +444,7 @@ mod unix {
         assert!(!path.exists(), "no socket file must be created");
     }
 
-    /// security.md（UDS 観点。項目 2・3 の回帰テスト）: 親ディレクトリが
+    /// security.md（UDS 観点。#820 レビュー指摘の回帰テスト）: 親ディレクトリが
     /// `0o755`（group / other は書き込めないが read / search は許す）でも、
     /// owner 以外への一切のアクセスを拒否する強化後の検証で `bind` を拒否する。
     /// 強化前（`mode & 0o022`）はこのケースを通してしまっていた。
@@ -428,7 +477,7 @@ mod unix {
         assert!(!path.exists(), "socket file must be removed after drop");
     }
 
-    /// REPAIR-5（項目 11）: 書き込みがブロックし続ける相手に対しては
+    /// REPAIR-5（#820 レビュー指摘）: 書き込みがブロックし続ける相手に対しては
     /// `send_frame` がフレーム全体の期限で `Timeout` を返し（送信側の
     /// `write_all_until` のタイムアウト経路）、その後は P1-3 により
     /// `Unavailable` になる。

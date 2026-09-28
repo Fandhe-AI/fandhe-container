@@ -204,11 +204,13 @@ BREAK-2 検出経路の整理:
 
 ### 受信・対応付け（`PipelineClient::recv_ack`）
 
-`recv_ack(receiver, timeout)` は次の順で検証し、いずれかに失敗すると `PipelineClient` を失効させる（`is_poisoned() == true`。以後の `send`・`recv_ack` はすべて `IoErrorCode::Unavailable`）:
+`recv_ack(timeout)` は引数で任意の受信側を取らず、`PipelineClient::new` へ渡した送信用トランスポート（`self.sender`）自身から `FrameReceiver::recv_frame` で ACK を受信する（このため `recv_ack` を呼ぶには `S: FrameSender<Frame = Frame> + FrameReceiver<Frame = Frame>` が必要）。以前の実装は `recv_ack(receiver: &mut R, timeout)` として送信側とは無関係な任意のトランスポートを引数に取っていたが、ワイヤー上の request id は各クライアントで `0` から独立に採番されるため、呼び出し元が誤って別接続（別 `PipelineClient`）の受信側を渡すと、id と種別だけの照合を通過して未 ACK 枠を誤って解放できてしまっていた（`FlushAck` の場合は実際には永続化されていない書き込みを完了扱いにしてしまい IO-2 に反する。TASK-12.2・#74 codex 再指摘対応。P0）。送受信を同じ接続オブジェクトへ束ねることで、この誤対応付けを型レベルで起こせなくした。
 
-1. 失効済みなら `receiver` を呼ばずに `Unavailable`
-2. 未 ACK が 0 件なら `receiver` を呼ばずに `InvalidArgument`（待つ対象がない呼び出しの誤りであり、プロトコル違反ではないため失効させない）
-3. `receiver.recv_frame(timeout)` が `Err` を返したら、そのエラー（`Timeout` を含む）をそのまま返して失効させる。`FrameReceiver::recv_frame` の P1-3 契約（エラー後は接続を再利用しない）により、同じ接続でポーリングする使い方は想定しない
+次の順で検証し、いずれかに失敗すると `PipelineClient` を失効させる（`is_poisoned() == true`。以後の `send`・`recv_ack` はすべて `IoErrorCode::Unavailable`）:
+
+1. 失効済みなら `self.sender.recv_frame` を呼ばずに `Unavailable`
+2. 未 ACK が 0 件なら `self.sender.recv_frame` を呼ばずに `InvalidArgument`（待つ対象がない呼び出しの誤りであり、プロトコル違反ではないため失効させない）
+3. `self.sender.recv_frame(timeout)` が `Err` を返したら、そのエラー（`Timeout` を含む）をそのまま返して失効させる。`FrameReceiver::recv_frame` の P1-3 契約（エラー後は接続を再利用しない）により、同じ接続でポーリングする使い方は想定しない
 4. `decode_ack` の検証に失敗したら `InvalidArgument`
 5. **送信順の照合**: 受信した request id が `SendQueue::oldest()` の id と一致しなければ `InvalidArgument`。キュー内に存在するが最古でない場合は "out-of-order ack"、キューのどこにも存在しない場合は "unknown ack id" とメッセージを区別する。`SendQueue` は FIFO であり、サーバー側は送信順に ACK を返す設計（TASK-13.2）を前提とする。順序が入れ替わる必要が生じた場合は TASK-13 側で本方針を見直す
 6. 種別対応の確認: `Ack` は元が `Write` に、`FlushAck` は元が `Flush` に対応しなければならない。ずれていれば `InvalidArgument`

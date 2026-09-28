@@ -1306,23 +1306,42 @@ where
     pub fn acknowledge(&mut self, id: RequestId) -> Result<InFlightRequest, IoError> {
         self.queue.remove(id)
     }
+}
 
+impl<S, O> PipelineClient<S, O>
+where
+    S: FrameSender<Frame = Frame> + FrameReceiver<Frame = Frame>,
+    O: SendObserver,
+{
     /// トランスポートから ACK フレームを 1 つ受信し、送信順（[`SendQueue::oldest`]）
     /// で検証・対応付けしてから未 ACK 枠を解放する（IO-1・IO-2・TASK-12.2・#74）。
     ///
-    /// `receiver` は呼び出しごとに引数で借りる（[`Self::new`] のコンストラクタは
-    /// 送信用の `sender` のみを持つ。送信側と受信側をスレッドで分ける API は
-    /// 範囲外で、本メソッドは単一スレッド前提〔`&mut self`〕のまま、呼び出し元が
-    /// 同じ接続の受信側をここへ渡す想定）。
+    /// # 送受信を同じ接続へ束ねる理由（TASK-12.2・#74 codex 再指摘対応。P0）
+    ///
+    /// 本メソッドは引数で任意の受信側を受け取らず、[`Self::new`] へ渡した送信用
+    /// トランスポート（`self.sender`）自身から [`FrameReceiver::recv_frame`] で
+    /// ACK を受信する（このため `S` は本 impl ブロックで [`FrameSender`] に加えて
+    /// [`FrameReceiver`] も実装している必要がある）。以前の実装は
+    /// `receiver: &mut R`（`S` とは無関係な任意のトランスポート）を引数に取って
+    /// いたが、ワイヤー上の request id は各クライアントで `0` から独立に採番される
+    /// （モジュール冒頭参照）ため、呼び出し元が誤って別接続（別
+    /// [`PipelineClient`]）の受信側を渡すと、id と種別だけの照合を通過して
+    /// 未 ACK 枠を誤って解放できてしまっていた。[`FrameKind::FlushAck`] の場合は
+    /// 実際には永続化されていない書き込みを完了扱いにしてしまい、IO-2
+    /// （フラッシュバリア保証）に反する。送受信を同じ接続オブジェクトへ束ねる
+    /// ことで、この誤対応付けを型レベルで起こせなくする（送信側と受信側を
+    /// スレッドで分ける API は引き続き範囲外〔モジュール冒頭「#74（TASK-12.2）
+    /// 以降に残る範囲」参照〕で、本メソッドは単一スレッド前提〔`&mut self`〕の
+    /// まま実装する）。
     ///
     /// # 処理順（拒否・失効時の分岐は fail-closed。security.md「不安全な設計」観点）
     ///
     /// 1. すでに失効済み（[`Self::is_poisoned`]）なら [`IoErrorCode::Unavailable`]
-    ///    を返す（`receiver` は一切呼ばない）
+    ///    を返す（`self.sender.recv_frame` は一切呼ばない）
     /// 2. 未 ACK のリクエストが 1 件もなければ [`IoErrorCode::InvalidArgument`] を
-    ///    返す（`receiver` は呼ばない。待つ対象がない呼び出しの誤りであり、
-    ///    プロトコル違反ではないため接続は失効させない）
-    /// 3. `receiver.recv_frame(timeout)` を呼ぶ。`Err` なら本メソッドが
+    ///    返す（`self.sender.recv_frame` は呼ばない。待つ対象がない呼び出しの
+    ///    誤りであり、プロトコル違反ではないため接続は失効させない）
+    /// 3. `self.sender.recv_frame(timeout)` を呼ぶ。`Err` なら本メソッドが
     ///    [`Self::poisoned`] を立ててから、そのエラー（[`IoErrorCode::Timeout`] を
     ///    含む）をそのまま返す。[`FrameReceiver::recv_frame`] の契約
     ///    （P1-3・`crate::transport` モジュールドキュメント）により、エラーを
@@ -1361,18 +1380,11 @@ where
     /// （[`AckOutcome::RejectedInvalidPayload`]）・送信順照合違反
     /// （[`AckOutcome::RejectedOutOfOrder`]・[`AckOutcome::RejectedUnknownAckId`]）・
     /// 種別対応違反（[`AckOutcome::RejectedAckKindMismatch`]）も含め、すべての
-    /// 分岐を計上・通知する。所要時間は `receiver.recv_frame` を実際に呼び出した
+    /// 分岐を計上・通知する。所要時間は `self.sender.recv_frame` を実際に呼び出した
     /// 呼び出し（成功・失敗の両方）に対して計測し、それより前の早期拒否
     /// （[`AckOutcome::RejectedPoisoned`]・[`AckOutcome::RejectedNoInFlight`]）は
     /// [`Duration::ZERO`] とする（[`Self::send`] の早期拒否と同じ扱い）。
-    pub fn recv_ack<R>(
-        &mut self,
-        receiver: &mut R,
-        timeout: IoTimeout,
-    ) -> Result<AckReceipt, IoError>
-    where
-        R: FrameReceiver<Frame = Frame>,
-    {
+    pub fn recv_ack(&mut self, timeout: IoTimeout) -> Result<AckReceipt, IoError> {
         if self.poisoned {
             let err = IoError::new(
                 IoErrorCode::Unavailable,
@@ -1392,7 +1404,7 @@ where
 
         let started_at = Instant::now();
 
-        let frame = match receiver.recv_frame(timeout) {
+        let frame = match self.sender.recv_frame(timeout) {
             Ok(frame) => frame,
             Err(err) => {
                 // P1-3（`crate::transport` モジュールドキュメント）: エラーを
@@ -1577,9 +1589,23 @@ mod tests {
     }
 
     /// テスト専用のモック sender。送信したフレームを記録し、常に成功する。
+    ///
+    /// `recv_script`・`recv_call_count` は [`FrameReceiver`] 実装用（TASK-12.2・#74
+    /// codex 再指摘対応。P0）: `recv_ack` が「送信に使うのと同じ接続オブジェクト」
+    /// からしか ACK を受信できなくなった（[`PipelineClient::recv_ack`] 参照）ため、
+    /// テストでも送信・受信を同じモック型に持たせる。台本が空なら常に
+    /// `Timeout` を返す（[`ScriptedReceiver`] と同じ挙動）。
     #[derive(Debug, Default)]
     struct RecordingSender {
         sent: Vec<Frame>,
+        recv_script: VecDeque<Result<Frame, IoError>>,
+        recv_call_count: usize,
+    }
+
+    impl RecordingSender {
+        fn recv_call_count(&self) -> usize {
+            self.recv_call_count
+        }
     }
 
     impl FrameSender for RecordingSender {
@@ -1588,6 +1614,21 @@ mod tests {
         fn send_frame(&mut self, frame: &Self::Frame, _timeout: IoTimeout) -> Result<(), IoError> {
             self.sent.push(frame.clone());
             Ok(())
+        }
+    }
+
+    impl FrameReceiver for RecordingSender {
+        type Frame = Frame;
+
+        fn recv_frame(&mut self, _timeout: IoTimeout) -> Result<Self::Frame, IoError> {
+            self.recv_call_count += 1;
+            match self.recv_script.pop_front() {
+                Some(result) => result,
+                None => Err(IoError::new(
+                    IoErrorCode::Timeout,
+                    "recording sender recv script exhausted",
+                )),
+            }
         }
     }
 
@@ -2604,45 +2645,6 @@ mod tests {
         assert_eq!(request.id().get(), 0);
     }
 
-    /// テスト専用のモック receiver。台本（`VecDeque<Result<Frame, IoError>>`）を
-    /// 順に返し、空になったら常に `Timeout` を返す（[`FrameReceiver::recv_frame`]
-    /// が「エラー後は接続を再利用しない」契約〔P1-3〕とは別に、単に台本切れを
-    /// 表す。呼び出し元〔`PipelineClient::recv_ack`〕側がこのエラーを見て失効
-    /// させる）。
-    #[derive(Debug, Default)]
-    struct ScriptedReceiver {
-        script: VecDeque<Result<Frame, IoError>>,
-        call_count: usize,
-    }
-
-    impl ScriptedReceiver {
-        fn new(script: Vec<Result<Frame, IoError>>) -> Self {
-            Self {
-                script: script.into(),
-                call_count: 0,
-            }
-        }
-
-        fn call_count(&self) -> usize {
-            self.call_count
-        }
-    }
-
-    impl FrameReceiver for ScriptedReceiver {
-        type Frame = Frame;
-
-        fn recv_frame(&mut self, _timeout: IoTimeout) -> Result<Self::Frame, IoError> {
-            self.call_count += 1;
-            match self.script.pop_front() {
-                Some(result) => result,
-                None => Err(IoError::new(
-                    IoErrorCode::Timeout,
-                    "scripted receiver script exhausted",
-                )),
-            }
-        }
-    }
-
     /// TASK-12.2・IO-1: `recv_ack` は送信順に ACK を照合し、`AckReceipt` を返して
     /// キューの枠を解放する。
     #[test]
@@ -2656,10 +2658,13 @@ mod tests {
 
         let ack = payload::encode_ack(FrameKind::Ack, WireRequestId::from(request.id()))
             .expect("encode_ack must succeed");
-        let mut receiver = ScriptedReceiver::new(vec![Ok(ack)]);
+        // `client` は同じモジュール内で定義されているため、テストから private
+        // フィールド `sender` へ直接アクセスできる（send/recv を同じ接続へ束ねた
+        // ことの確認のため、テスト専用の別経路は用意しない）。
+        client.sender.recv_script.push_back(Ok(ack));
 
         let receipt = client
-            .recv_ack(&mut receiver, test_timeout())
+            .recv_ack(test_timeout())
             .expect("recv_ack must succeed");
         assert_eq!(receipt.request().id().get(), request.id().get());
         assert_eq!(receipt.ack_kind(), FrameKind::Ack);
@@ -2677,27 +2682,27 @@ mod tests {
             .send(FrameKind::Write, &[1], test_timeout())
             .expect("send must succeed");
 
-        let mut receiver = ScriptedReceiver::default();
+        // `recv_script` は空のまま（台本切れは常に `Timeout` を返す。
+        // `RecordingSender::recv_frame` 参照）。
         let err = client
-            .recv_ack(&mut receiver, test_timeout())
+            .recv_ack(test_timeout())
             .expect_err("empty script must time out");
         assert_eq!(err.code(), IoErrorCode::Timeout);
         assert!(client.is_poisoned());
     }
 
-    /// TASK-12.2・IO-1: 未 ACK が 0 件のときの `recv_ack` は receiver に触れず
+    /// TASK-12.2・IO-1: 未 ACK が 0 件のときの `recv_ack` は受信側に触れず
     /// `InvalidArgument` を返す。
     #[test]
     fn io1_recv_ack_rejects_empty_queue_without_calling_receiver() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
         let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
 
-        let mut receiver = ScriptedReceiver::default();
         let err = client
-            .recv_ack(&mut receiver, test_timeout())
+            .recv_ack(test_timeout())
             .expect_err("recv_ack with an empty queue must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
-        assert_eq!(receiver.call_count(), 0);
+        assert_eq!(client.sender.recv_call_count(), 0);
         assert!(!client.is_poisoned());
     }
 }

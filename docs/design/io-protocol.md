@@ -150,6 +150,10 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 
 別 uid からの接続は root 権限がないと再現できないため結合試験の対象にはせず、uid の一致判定を純粋関数（`imp::peer_credential_matches`）へ切り出して具体値で検証する（`crates/io/src/server.rs` のユニットテスト）。拒否 1 件ごとの通知から最終イベントまでの配線は、同じファイルのユニットテストで照合関数をテスト時だけ差し替え（非公開の `imp::ServerInner::accept_with`。本番の `accept` は常に固定の照合を渡す）、実際のソケット（同一 uid の接続）で確かめる（I4・#820 security-auditor 再監査指摘対応）。同一プロセスからの自己接続（`UnixStream::pair`）で `crate::sys::peer_uid` が自プロセスの実効 uid と一致することは `crates/io/src/sys.rs` のユニットテストで確認する。
 
+### UDS の期限判定（REPAIR-5・K1・K2・#820 codex P1 指摘対応）
+
+`UdsServer::accept` は listen キューから接続を取り出す前（再試行のたびを含む）と、peer credential の照合を通過して接続を返す直前の両方で期限を判定し、期限を過ぎてから取り出しを始めず、取り出し・照合の間に期限を過ぎた接続は閉じて `Timeout` を返す（成功を返した後の接続は呼び出し元の責任になるため）。`UdsConnection` の `send_frame` / `recv_frame` は 1 回ごとの read / write を始める前に期限を判定し（待ちも残り時間を上限にする）、期限内に始めた最後の read / write が期限をわずかに超えて完了した場合は成功として返す。完了したバイト列はすでにカーネルへ渡した / ストリームから取り出した後であり、`Timeout` にすると送信では相手が完全なフレームを受け取っているのに失敗扱い（poison・再送による重複）になり、受信ではそのフレームを失うためである。
+
 ### UDS ソケットファイルのモード（PLUG-12・security.md。J2・#820 codex P0 指摘対応）
 
 `UdsServer::bind` は bind の後にソケットのパスを再解決する操作（パス経由の chmod 等）を行わない。以前は bind 後にパス経由でソケットファイルを `0600` へ chmod していたが、bind 後にパスや祖先ディレクトリを差し替えられると、symlink の参照先など別のファイルのモードをサーバープロセスの権限で変えうるため廃止した。socket fd 経由の `fchmod(2)` も代替にならない: Linux では sockfs 側の inode にしか作用せず、ファイルシステム上のソケットファイル（パスの inode）のモードは変わらない（#820 で実測。fd 側の `fstat` は `0600` に変わるが、パスの `lstat` は umask 由来のモード〔umask 022 で `0755`〕のまま）。macOS では socket fd への `fchmod(2)` 自体がエラーになる。

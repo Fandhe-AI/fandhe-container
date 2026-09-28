@@ -329,6 +329,13 @@ impl<O: ServerObserver> UdsServer<O> {
     /// （REPAIR-5: 無期限にブロックしない）。呼び出し側は次の接続を待つために
     /// 再度この関数を呼ぶ（受付ループはこのモジュールの外で組む）。
     ///
+    /// # 期限の判定位置（REPAIR-5・K1・K2・#820 codex P1 指摘対応）
+    /// 期限は listen キューから接続を取り出す前（毎回の再試行を含む）と、peer
+    /// credential の照合を通過して接続を返す直前の両方で判定する。期限を過ぎて
+    /// から取り出しを始めることはなく、取り出し・照合の間に期限を過ぎた接続は
+    /// 閉じて（クライアント側は EOF を読む）`Timeout` を返す（成功を返した後の
+    /// 接続は呼び出し元の責任になるため、期限内に返せる接続だけを返す）。
+    ///
     /// # 返す `Unavailable` の意味（I7・#820 security-auditor 再監査指摘対応）
     /// 本関数が [`IoErrorCode::Unavailable`] を返すのは、1 回の呼び出しの中で
     /// `ConnectionAborted` または peer credential 拒否が再試行上限
@@ -453,6 +460,17 @@ impl<O: ServerObserver> UdsServer<O> {
 /// [`IoErrorCode::Unavailable`] を返し続ける（P1-3・REPAIR-5・REPAIR-6。
 /// `FrameHeader` に同期マーカーがなく、送受信途中のエラー後はフレーム境界を
 /// 復元できないため接続を再利用しない）。
+///
+/// # 期限の判定位置（REPAIR-5・K2・#820）
+/// `send_frame` / `recv_frame` は 1 回ごとの read / write を始める前に必ず期限を
+/// 判定し（期限後に I/O を始めない）、各 read / write の待ちも残り時間を上限に
+/// する。期限内に始めた最後の read / write が期限をわずかに（ソケットの
+/// タイムアウトの粒度の範囲で）超えて完了した場合は成功として返す。完了した
+/// バイト列はすでにカーネルへ渡した / ストリームから取り出した後であり、
+/// `Timeout` にすると送信では相手が完全なフレームを受け取っているのに失敗扱い
+/// （poison・再接続・再送による重複）になり、受信ではそのフレームを失うため
+/// である（何も授受していない accept の成功経路とは扱いが異なる。
+/// [`UdsServer::accept`] の「期限の判定位置」節参照）。
 ///
 /// `C: ServerObserver` は [`UdsServer::accept`] から受け取る必須の観測フックで、
 /// `send_frame` / `recv_frame` のすべての分岐（成功・poison による拒否・
@@ -751,6 +769,19 @@ mod imp {
             let mut abort_retries = 0u32;
             let mut credential_rejections = 0u32;
             loop {
+                // K2・#820 codex P1 指摘対応（REPAIR-5）: 次の accept を始める前に
+                // 期限を判定する。WouldBlock・ConnectionAborted・peer credential
+                // 拒否の各経路の `sleep` が期限をまたいだ場合に、期限後に listen
+                // キューから接続を取り出して（下の成功経路の判定で）閉じるだけに
+                // なるのを避け、その接続をキューに残したまま `Timeout` を返す。
+                // 初回は `deadline` を計算した直後のため必ず通過する。
+                if Instant::now() >= deadline {
+                    return super::AcceptAttempt {
+                        result: Err(accept_timeout_error()),
+                        aborted_retries: abort_retries,
+                        peer_credential_rejections: credential_rejections,
+                    };
+                }
                 match self.listener.accept() {
                     Ok((stream, _addr)) => {
                         // macOS では accept() した stream がリスナーの
@@ -811,6 +842,23 @@ mod imp {
                             continue;
                         }
 
+                        // K1・#820 codex P1 指摘対応（REPAIR-5）: 成功経路でも、
+                        // 接続を呼び出し元へ渡す直前に期限を判定する。accept・
+                        // peer credential 照合の間に期限を過ぎた場合は、接続を
+                        // 閉じて（クライアント側は EOF を読む）`Timeout` を返す
+                        // （渡した後は呼び出し元の責任になるため、期限付き受付の
+                        // 契約はここで閉じる）。拒否経路の「件数の加算と通知は
+                        // 期限判定より先」（H3）は上の分岐で済んでおり、ここでは
+                        // 件数を変えずにそのまま添える。
+                        if Instant::now() >= deadline {
+                            drop(stream);
+                            return super::AcceptAttempt {
+                                result: Err(accept_timeout_error()),
+                                aborted_retries: abort_retries,
+                                peer_credential_rejections: credential_rejections,
+                            };
+                        }
+
                         return super::AcceptAttempt {
                             result: Ok(ConnectionInner { stream }),
                             aborted_retries: abort_retries,
@@ -821,10 +869,7 @@ mod imp {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
                             return super::AcceptAttempt {
-                                result: Err(IoError::new(
-                                    IoErrorCode::Timeout,
-                                    "accept timed out waiting for a client connection",
-                                )),
+                                result: Err(accept_timeout_error()),
                                 aborted_retries: abort_retries,
                                 peer_credential_rejections: credential_rejections,
                             };
@@ -1114,6 +1159,17 @@ mod imp {
         }
     }
 
+    /// accept の期限切れを表すエラー（[`ServerInner::accept`] の全経路で共有する。
+    /// ループ先頭・成功経路・WouldBlock・再試行判定のどこで期限切れを検出しても
+    /// 同じ `code` / `message` を返し、観測イベントの見分けがつくようにする。
+    /// REPAIR-4・REPAIR-5・#820）。
+    fn accept_timeout_error() -> IoError {
+        IoError::new(
+            IoErrorCode::Timeout,
+            "accept timed out waiting for a client connection",
+        )
+    }
+
     /// 受付ループの再試行判定（H3・H4・#820 security-auditor 指摘対応）。
     ///
     /// `remaining` が `Duration::ZERO` なら [`IoErrorCode::Timeout`]、
@@ -1131,10 +1187,7 @@ mod imp {
         exceeded_message: &str,
     ) -> Option<IoError> {
         if remaining.is_zero() {
-            return Some(IoError::new(
-                IoErrorCode::Timeout,
-                "accept timed out waiting for a client connection",
-            ));
+            return Some(accept_timeout_error());
         }
         if retries > max_retries {
             return Some(IoError::new(
@@ -2073,6 +2126,70 @@ mod imp {
                 code: Some(IoErrorCode::Unavailable),
             });
             assert_eq!(server.observer().events, expected);
+        }
+
+        /// K1・REPAIR-5・#820（codex P1 指摘対応）: accept と peer credential 照合が
+        /// 成功しても、その間に期限を過ぎていれば接続を返さず `Timeout` を返す。
+        /// 差し替えた照合の中で timeout（50ms）の 4 倍眠ってから本番の
+        /// [`verify_peer_credential`]（同一 uid なので受理）に通す。最終イベントは
+        /// Accept の Failure・`Timeout`（件数はいずれも 0）の 1 件だけで、渡さなかった
+        /// 接続はサーバー側で閉じられクライアント側は EOF を読む。
+        #[test]
+        fn k1_repair5_accept_returns_timeout_when_deadline_passes_after_success() {
+            const TIMEOUT: Duration = Duration::from_millis(50);
+            let dir = super::super::test_support::TempSocketDir::new();
+            let path = dir.socket_path();
+            let mut server = super::super::UdsServer::bind(
+                &path,
+                ReceiveLimits::default(),
+                RecordingObserver::default(),
+            )
+            .expect("bind must succeed in a 0700 directory owned by the test user");
+            // 読み取りタイムアウトは `connect_clients` が接続中に設定する（J1。
+            // macOS は相手が閉じた後の `set_read_timeout` で EINVAL を返す）。
+            let mut clients = connect_clients(&path, 1);
+
+            let mut calls = 0u32;
+            let mut verify = |stream: &UnixStream, bind_uid: u32| {
+                calls += 1;
+                std::thread::sleep(TIMEOUT * 4);
+                verify_peer_credential(stream, bind_uid)
+            };
+            let err = server
+                .accept_via(crate::observe::NoopServerObserver, |inner, on_event| {
+                    inner.accept_with(
+                        IoTimeout::new(TIMEOUT).expect("50ms must be a valid IoTimeout"),
+                        on_event,
+                        &mut verify,
+                    )
+                })
+                .expect_err("a connection verified after the deadline must not be returned");
+            assert_eq!(err.code(), IoErrorCode::Timeout);
+            assert_eq!(
+                err.message(),
+                "accept timed out waiting for a client connection"
+            );
+            assert_eq!(calls, 1);
+            assert_eq!(
+                server.observer().events,
+                vec![RecordedEvent {
+                    op: ServerOp::Accept,
+                    outcome: ServerOutcome::Failure,
+                    accept_aborted_retries: 0,
+                    peer_credential_rejections: 0,
+                    peer_uid: None,
+                    code: Some(IoErrorCode::Timeout),
+                }]
+            );
+
+            let client = clients
+                .first_mut()
+                .expect("connect_clients must return one client");
+            let mut buf = [0u8; 1];
+            let n = client
+                .read(&mut buf)
+                .expect("a connection dropped after the deadline must be closed, not left hanging");
+            assert_eq!(n, 0);
         }
 
         /// I1・#820（PLUG-12）: 実効 uid が親ディレクトリの所有者と一致すれば

@@ -1000,10 +1000,26 @@ mod unix {
         // クライアントの ACK 待ちタイムアウトより先に、REQUEST_COUNT 件の
         // 受信が完了しているはず。通知が既に受理不能でも送信失敗は無視する
         // ― サーバースレッドは自身の recv_timeout の上限で終了する）。
+        //
+        // `done_tx.send(())` はサーバースレッドが `done_rx.recv()` へ実際に
+        // 到達したことまでは保証しない。受信処理側が何らかの理由で停止して
+        // いれば、このあと `server_thread.join()` を直接無期限に呼ぶと
+        // watchdog 通過後でも CI をハングさせ得る（REPAIR-5 違反。codex P0
+        // 指摘・#1124）。stage 1（準備段階）の watchdog と同じ方式で join()
+        // を別スレッドへ隔離し、その結果を `HANG_GUARD_GRACE` を上限に待つ。
         let _ = done_tx.send(());
-        let received = server_thread
-            .join()
-            .expect("silent server thread must not panic");
+        let (server_join_tx, server_join_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = server_join_tx.send(server_thread.join());
+        });
+        let received = match server_join_rx.recv_timeout(HANG_GUARD_GRACE) {
+            Ok(join_result) => join_result.expect("silent server thread must not panic"),
+            Err(_) => panic!(
+                "silent server thread did not finish within {HANG_GUARD_GRACE:?} after \
+                 the completion notification was sent; receive handling appears hung \
+                 (timeout detection is not working)"
+            ),
+        };
 
         assert_eq!(received.len(), REQUEST_COUNT as usize);
         for (index, request) in received.iter().enumerate() {

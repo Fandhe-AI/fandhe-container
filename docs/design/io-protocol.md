@@ -3,10 +3,10 @@
 `fandhe-container-io`（`crates/io`）が提供するフレーム全体型（[`Frame`](../../crates/io/src/protocol.rs)）のバイトレイアウト・採用したチェックサムアルゴリズムの根拠・newtype 設計方針・IO-1 / REPAIR-2 対応表を記録する。
 
 - 対象ビヘイビア: IO-1（ホスト⇔ゲスト間のファイル共有プロトコル）・REPAIR-2（壊れた値を表現できない型）・REPAIR-5（タイムアウト保護・エラー後の接続再利用禁止）・REPAIR-6（整合性テスト）
-- 関連タスク: TASK-11.1（#68）・TASK-11.2（#69。ヘッダ newtype）・TASK-11.3（#70。チェックサム付きフレーム型）・TASK-11.4（#71。本節以降）・TASK-12.1（#73。送信キュー）・TASK-12.2（#74。ペイロード形式・ACK 受信）・TASK-13.1（#76。バッチ集約バッファ）・TASK-13.2.1（#820。UDS サーバー側トランスポート）・TASK-13.4（#796。受信フレームの受理判定ゲート）・TASK-83.1（#116。BREAK-2 相当のワイヤーレベル検出テスト）・TASK-83.2（#117。デコード時の範囲外長さ検証の強化とアロケーション前拒否のテスト）。ヘッダ拡張（version・header_crc）・接続再利用契約は TASK-12・TASK-13 着手前の設計レビュー（2026-09-28 オーナー決定・#67・#115）による
+- 関連タスク: TASK-11.1（#68）・TASK-11.2（#69。ヘッダ newtype）・TASK-11.3（#70。チェックサム付きフレーム型）・TASK-11.4（#71。本節以降）・TASK-12.1（#73。送信キュー）・TASK-12.2（#74。ペイロード形式・ACK 受信）・TASK-13.1（#76。バッチ集約バッファ）・TASK-13.2.1（#820。UDS サーバー側トランスポート）・TASK-13.2.2（#822。バッチ write-back の実行・ACK 返却）・TASK-13.4（#796。受信フレームの受理判定ゲート）・TASK-83.1（#116。BREAK-2 相当のワイヤーレベル検出テスト）・TASK-83.2（#117。デコード時の範囲外長さ検証の強化とアロケーション前拒否のテスト）。ヘッダ拡張（version・header_crc）・接続再利用契約は TASK-12・TASK-13 着手前の設計レビュー（2026-09-28 オーナー決定・#67・#115）による
 - 関連ビヘイビア: IO-2（Flush / FlushAck 種別）・REPAIR-5（`IoTimeout`。無期限待ちを型で表現しない）
 - 対象マイルストーン: MS-1
-- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）、TASK-12.1 で追加した送信キュー（`SendQueue`・`PipelineClient`）、TASK-12.2 で追加したペイロード内部レイアウト（[`crates/io/src/payload.rs`](../../crates/io/src/payload.rs)）と ACK 受信・対応付け（`PipelineClient::recv_ack`）、TASK-13.2.1（#820）で追加した UDS サーバー側トランスポート（[`UdsServer`・`UdsConnection`](../../crates/io/src/server.rs)。Linux / macOS）に加え、2026-09-28 の設計レビュー（TASK-12・TASK-13 着手前に P1 として指摘・オーナー決定で先行対応）で追加したヘッダの `version`・`header_crc` フィールドと、エラー後の接続再利用禁止契約を記録する。クライアント側の UDS 接続・バッチ書き込みと ACK 返却のつなぎ込み・Windows のトランスポートは TASK-13.2.2（#822）以降の sub-issue が本書へ追記する
+- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）、TASK-12.1 で追加した送信キュー（`SendQueue`・`PipelineClient`）、TASK-12.2 で追加したペイロード内部レイアウト（[`crates/io/src/payload.rs`](../../crates/io/src/payload.rs)）と ACK 受信・対応付け（`PipelineClient::recv_ack`）、TASK-13.2.1（#820）で追加した UDS サーバー側トランスポート（[`UdsServer`・`UdsConnection`](../../crates/io/src/server.rs)。Linux / macOS）、TASK-13.2.2（#822）で追加したバッチ write-back の実行と通常 ACK 返却（[`serve_connection`・`AppendFileSink`](../../crates/io/src/writeback.rs)）に加え、2026-09-28 の設計レビュー（TASK-12・TASK-13 着手前に P1 として指摘・オーナー決定で先行対応）で追加したヘッダの `version`・`header_crc` フィールドと、エラー後の接続再利用禁止契約を記録する。クライアント側の UDS 接続との本番結合・FLUSH ACK の返却・Windows のトランスポートは後続 sub-issue が本書へ追記する
 
 ## バイトレイアウト
 
@@ -267,7 +267,47 @@ BREAK-2 検出経路の整理:
 
 - 送信側と受信側をスレッドで分ける API（`split()` 等）
 - ACK status バイトの導入（導入する場合は `PROTOCOL_VERSION` の繰り上げが必要）
-- サーバー側（TASK-13.2）が本形式で ACK を返す実装と、送信順を守る義務の明記
+
+サーバー側が本形式で ACK を返す実装と送信順を守る義務は、下記「バッチ write-back と ACK 返却」節（TASK-13.2.2・#822）で実装済み。
+
+## バッチ write-back と ACK 返却（TASK-13.2.2・IO-1・#822）
+
+`crates/io/src/writeback.rs` の `serve_connection` が、`crates/io/src/batch.rs` の `BatchBuffer`（TASK-13.1）が集約したバッチを実際にディスクへ書き込み、書き込み完了後に上記「ペイロード形式と ACK 対応付け」節と同じ形式で通常 ACK（`FrameKind::Ack`）を送信順に返す。トランスポートは `FrameSender<Frame = Frame> + FrameReceiver<Frame = Frame>` の generic 境界のみを要求し、`crates/io/src/server.rs`（TASK-13.2.1・#820）の `UdsConnection` に限らない。
+
+### 書き込み先（ワイヤーにパスがない）
+
+`Write` ペイロードは `[request_id][body]` のみでパス・オフセットを持たない。`serve_connection` はファイル命名規則を独自に作らず、書き込み先を `BatchSink` トレイトへ抽象化する。既定実装 `AppendFileSink` は、呼び出し側が開いた `File` へ各 `Write` の body を到着順に `write_all` で追記するだけで、パス解決・ファイル作成・rename・truncate は行わない。パストラバーサル・symlink 経由の書き込み経路は構造上生まれない（security.md）。`body` を不透明なバイト列として追記するのはスタブの意味論であり（REPAIR-3）、ファイル操作をペイロードで表す形式（TASK-14 が前提とする）は、今後の I/O 契約拡張として別途検討する。
+
+### ACK を返す時点（IO-1 の「バッファリング時点」との対応）
+
+通常 ACK（`FrameKind::Ack`）は、1 バッチ内の全 `Write` について `BatchSink::write_batch` が `Ok` を返した時点（＝ OS のページキャッシュへの `write()` 発行が完了した時点）で送る。`fsync(2)` / `syncfs(2)` は呼ばない。プロセスが正常に動いている限りこの時点のデータは他の reader から見えるが、プロセスクラッシュ・電源断では失われうる。これが IO-1 の「バッファリング時点で ACK」の本実装における対応物である。永続化完了を保証するのは IO-2 の FLUSH ACK（`FrameKind::FlushAck`）のみであり、`serve_connection` はそれを送らない（下記「FLUSH フレームの扱い」参照）。ACK の API としての利用者向け文書化は TASK-17 で行う。
+
+### バッチが件数未達のまま残る場合の運用制約
+
+ACK をバッチ書き込みの後に返すため、クライアントが `batch_size` 未満だけ送って ACK を待つと、サーバー側に発火のきっかけがない。使える発火条件は「設定件数到達（`BatchTrigger::SizeReached`）」「累積バイト数上限到達（`BatchTrigger::BytesLimitReached`）」「`FrameKind::Flush`」の 3 つのみで、時間ベースの追い出しは範囲外（IO-10・TASK-16）。クライアントは「in-flight 上限 ≥ `batch_size`、または件数未達分の後に `Flush` を送ること」を前提とする（既定値 64 / 64 で整合）。
+
+### FLUSH フレームの扱い（FlushAck は偽装しない）
+
+`FrameKind::Flush` を受信すると、`BatchBuffer::take_pending` で件数未達分を取り出して書き込み・ACK した後、**FlushAck は送らずに** `IoErrorCode::Unimplemented` で処理を終える。FLUSH ACK は永続化の保証（IO-2）であり、`syncfs` を呼ばずに返すと契約違反になるため（fail-closed）。FlushAck の返却は TASK-15.2.2（#824）の責務。
+
+### ACK していない保留分・sink 失敗時の扱い
+
+受信エラー（EOF を含む）・プロトコル違反で処理を終えるとき、`BatchBuffer` に残った保留分は書き込まずに破棄する（`WritebackStats::discarded_pending_frames`）。ACK していない以上クライアントはそれらを前提にできず、書いてしまうと再送時に重複を生むため（P1-3 の fail-closed と一貫する）。`BatchSink::write_batch` が失敗した場合、そのバッチのフレームには ACK を 1 件も返さない。バッチの途中まで書き込まれた可能性がある（部分書き込み）ため、ACK 前の書き込みは「書かれたかどうか不定」という意味論になる。
+
+### 受信上限（`pending_frames` に `0` を渡す根拠）
+
+`serve_connection` の write-back は同期的（発火したバッチをその場で書き込み・ACK まで終えてから次のフレームを受信する）であり、受信時点で「排出済みだが未書き込み」のキューは常に空になる。したがって `crates/io/src/server.rs` が `ReceiveLimits::admit` へ渡す `pending_frames = 0` は、現行の呼び出し方の下で構造上正確（`crates/io/src/recv_limits.rs`・`crates/io/src/writeback.rs` の各モジュール doc 参照）。write-back を非同期化する場合はこの前提を見直す必要がある。
+
+### 範囲外（後続タスク。要起票）
+
+- UDS 接続受付ループ（accept → `serve_connection` → 次の accept）・同時接続数の上限
+- クライアント側の UDS `connect` と `PipelineClient` との本番結合
+- 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
+- FLUSH ACK の返却・`syncfs`（TASK-15.2.1・#823・TASK-15.2.2・#824）
+- 件数未達分を時間ベースで追い出す仕組み・未フラッシュ滞留量の上限（IO-10・TASK-16）
+- CLI からの `--batch-size` 配線（TASK-13.3・#78）
+- ファイル操作を表すペイロード形式（パス・rename・truncate。TASK-14 の前提。I/O 契約の拡張にあたる）
+- Windows のトランスポート（`windows-sys` の依存承認が必要）
 
 ## 見直し
 

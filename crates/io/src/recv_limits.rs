@@ -29,16 +29,16 @@
 //! `server.rs` の `read_body_until` のドキュメンテーションコメント参照） →
 //! `AdmittedHeader::decode_body_owned`（[`AdmittedHeader::decode_body`] の
 //! 所有権を受け取る変種。本体を複製しない）の順に呼ぶ。[`crate::batch::BatchBuffer::push`]
-//! との配線（受理した `Write` フレームをバッチへ積む経路）は TASK-13.2.2・#822 が
-//! 行う。
+//! との配線（受理した `Write` フレームをバッチへ積む経路）は
+//! [`crate::writeback::serve_connection`]（TASK-13.2.2・#822）が実装済み。
 //!
 //! # なぜ `server.rs` ではなく独立モジュールか
 //! spec（`05-tasks.md` TASK-13）上の成果物名は `server.rs` だが、
-//! TASK-13.2.1（#820）・TASK-13.2.2（#822）・TASK-13.4（本モジュール・#796）が
-//! いずれも `server.rs` を対象とし並行で着手されるため、[`crate::batch`]
-//! モジュール doc の前例（REPAIR-1: 単一責務・改修の波及最小化。並行 PR の
-//! マージ競合回避）に倣い、独立モジュールへ切り出した。`server.rs`（#820・#822）は
-//! 本モジュールを呼び出す側になる。
+//! TASK-13.2.1（#820）・TASK-13.2.2（#822。`crates/io/src/writeback.rs` へ
+//! 切り出し済み）・TASK-13.4（本モジュール・#796）がいずれも `server.rs` を
+//! 対象とし並行で着手されたため、[`crate::batch`] モジュール doc の前例
+//! （REPAIR-1: 単一責務・改修の波及最小化。並行 PR のマージ競合回避）に倣い、
+//! 独立モジュールへ切り出した。`server.rs` は本モジュールを呼び出す側になる。
 //!
 //! # エラーコードの使い分け
 //! [`ReceiveLimits::admit`] は [`IoErrorCode::ResourceExhausted`] を返す。ヘッダ
@@ -50,14 +50,19 @@
 //! 制約違反（`Write` 以外の種別・フレーム単体が `max_bytes` 超過）で返す
 //! `InvalidArgument` とは区別する。
 //!
-//! # 滞留件数の出どころ（スコープ外）
+//! # 滞留件数の出どころ
 //! [`crate::batch::BatchBuffer`] は `batch_size` に達すると自動で排出するため、
 //! `BatchBuffer::len()` 単体が [`ReceiveLimits::for_batch`] 由来の上限に達する
-//! ことはない。際限なく増えうるのは「排出済みだが未書き込みのバッチのフレーム
-//! 数」の方であり、これは TASK-13.2.2（#822）で初めて生まれる。そのため
-//! [`ReceiveLimits::admit`] は滞留件数を**呼び出し側からの入力**として受け取る。
-//! 実際の準備完了キューとの配線（`BatchBuffer::len()` + 未書き込みバッチ件数の
-//! 合算）は #822 の責務。
+//! ことはない。際限なく増えうるとすれば「排出済みだが未書き込みのバッチの
+//! フレーム数」の方だが、[`crate::writeback::serve_connection`]
+//! （TASK-13.2.2・#822）の write-back は同期的（発火したバッチをその場で
+//! 書き込み・ACK まで終えてから次のフレームを受信する）であり、受信時点で
+//! このキューは常に空になる（かつ `BatchBuffer::len() < batch_size ≤
+//! max_pending_frames` も常に成り立つ）。そのため [`ReceiveLimits::admit`]
+//! は滞留件数を**呼び出し側からの入力**として受け取る設計のまま、
+//! `crates/io/src/server.rs` は常に `0` を渡しており、これは現行の
+//! 呼び出し方（1 バッチ完結の同期処理）の下で構造上正確。write-back を
+//! 非同期化する場合はこの前提を見直す必要がある。
 //!
 //! # スコープ外（TASK-13 の兄弟 sub-issue・後続タスクが担う）
 //! - `std::io::Read` / UDS のストリーム読みループ本体・読み取りタイムアウト
@@ -65,7 +70,6 @@
 //!   （TASK-13.2.1・#820。`crates/io/src/server.rs` の
 //!   `imp::reject_client_originated_response_frame` が、本モジュールの
 //!   [`ReceiveLimits::admit`] より前・本体バッファ確保より前に拒否する）
-//! - 準備完了バッチ件数の実配線・ディスク書き込み・ACK 返却（TASK-13.2.2・#822）
 //! - CLI / 設定からの上限値の配線（TASK-13.3・#78）
 //! - 複数接続を跨いだ累積バイト数・未フラッシュ滞留量の上限（IO-10・TASK-16）
 //! - 上限値の実測校正（TASK-88・TASK-16）

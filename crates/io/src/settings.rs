@@ -229,8 +229,8 @@ mod tests {
     /// IO-1・TASK-13.3: 桁あふれ（`usize::MAX` を超える）は拒否する。
     #[test]
     fn io1_parse_batch_size_rejects_overflow() {
-        // usize::MAX (64bit: 20 桁) を 1 桁上回る 20 桁の数字列。
-        // MAX_BATCH_SIZE_ARG_LEN（20）ちょうどの長さのまま桁あふれさせる。
+        // usize::MAX（64bit: 20 桁）と同じ 20 桁のまま、値としては usize::MAX を
+        // 上回る数字列で桁あふれさせる（MAX_BATCH_SIZE_ARG_LEN の長さ検証を通過させたまま検証するため）。
         let input = "99999999999999999999"; // 21 桁は長さ検証で先に落ちるため 20 桁で構成する
         let input = &input[..MAX_BATCH_SIZE_ARG_LEN];
         let err = parse_batch_size(input).expect_err("overflowing input must be rejected");

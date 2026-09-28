@@ -27,8 +27,7 @@
 //! のみを扱う。
 
 use fandhe_container_io::{
-    CHECKSUM_LEN, FRAME_HEADER_LEN, Frame, FrameHeader, FrameKind, IoError, IoErrorCode,
-    MAX_PAYLOAD_LEN,
+    FRAME_HEADER_LEN, Frame, FrameHeader, FrameKind, IoError, IoErrorCode, MAX_PAYLOAD_LEN,
 };
 
 /// `encoded`（`Frame::encode` の出力）の先頭 [`FRAME_HEADER_LEN`] バイトのうち、
@@ -69,18 +68,9 @@ fn stream_read_frame(stream: &[u8]) -> Result<Frame, IoError> {
         })?;
     let header = FrameHeader::from_bytes(*header_bytes)?;
 
-    let payload_len = usize::try_from(header.payload_len().get()).map_err(|_| {
-        IoError::new(
-            IoErrorCode::InvalidArgument,
-            "declared payload length does not fit in usize on this platform",
-        )
-    })?;
-    let body_len = payload_len.checked_add(CHECKSUM_LEN).ok_or_else(|| {
-        IoError::new(
-            IoErrorCode::InvalidArgument,
-            "declared payload length + checksum length overflows",
-        )
-    })?;
+    // `header.body_len()` は検証済みの `payload_len` から算出されるため失敗しない
+    // （TASK-83.2・#117。手書きの `usize::try_from` / `checked_add` は不要）。
+    let body_len = header.body_len();
 
     let body = rest.get(..body_len).ok_or_else(|| {
         IoError::new(
@@ -183,8 +173,9 @@ fn repair2_break2_declared_len_zero_rejected_by_both_paths() {
 
 /// 任意ケース: 申告長を `MAX_PAYLOAD_LEN + 1` に書き換えた入力は、ヘッダ検証の時点
 /// （[`FrameHeader::from_bytes`]）で `InvalidArgument` として拒否される。
-/// アロケーション前に拒否されることの証明（DoS 対策）自体は #117（TASK-83.2）の
-/// 範囲であり、ここではエラーコードの確認のみを行う。
+/// アロケーション前に拒否されることの証明（DoS 対策）は `src/protocol.rs` の
+/// `repair2_decode_rejects_over_max_len_before_allocation`（TASK-83.2・#117）が行う。
+/// ここではエラーコードの確認のみを行う。
 #[test]
 fn repair2_break2_declared_len_over_max_rejected_by_decode() {
     let frame = Frame::new(FrameKind::Write, PAYLOAD.to_vec()).expect("Frame::new must succeed");

@@ -24,8 +24,9 @@
 #     GNU coreutils の `timeout`（Linux ホストが対象。macOS 標準環境には無い）、`jq`
 #   - --from-json モード: `jq`（fio 不要）
 #   - root 権限・`/dev/kvm` は不要
-#   - 全モード共通で `grep`・`dirname`・`wc`・`tr`・`mktemp`、run モードでは加えて
-#     `realpath`・`find`（いずれも前提ツール検証の対象。欠如は exit 3）
+#   - 全モード共通で `grep`・`dirname`・`wc`・`tr`・`mktemp`・`find`・`ln`、
+#     run モードでは加えて
+#     `realpath`（いずれも前提ツール検証の対象。欠如は exit 3）
 #
 # 書き込み先の安全性（security.md の symlink・ボリューム外書き込み対策）:
 #   fio のデータファイルは `--target-dir` 直下の固定パスではなく、実行ごとに
@@ -54,8 +55,8 @@
 #   1: fio の実行失敗（exit 0 でも出力 JSON を書かなかった場合を含む）またはタイムアウト
 #   2: 入力エラー（引数の検証失敗、fio JSON のスキーマ不正・実行条件の不一致、
 #      値が 0 以下、ファイルサイズ・総書き込み量の上限超過、symlink 等）
-#   3: 前提ツールが無い（run モードでの fio・timeout・realpath・find。全モード共通で
-#      jq・grep・dirname・wc・tr・mktemp）
+#   3: 前提ツールが無い（run モードでの fio・timeout・realpath。全モード共通で
+#      jq・grep・dirname・wc・tr・mktemp・find・ln）
 #
 # 出力（stdout。`--output <path>` を指定した場合はファイルにも書く。人が読む進捗・
 # サマリーは stderr に出す）:
@@ -228,7 +229,7 @@ fi
 # jq 以外の coreutils 系も確認する。欠如したまま進むと `set -e` でそのコマンドの
 # 終了コード（多くは 1 か 127）がスクリプトの終了コードになり、「fio 実行失敗」
 # （exit 1）と誤分類される（c2458d5 で直した誤分類と同種の穴）。
-for tool in jq grep dirname wc tr mktemp; do
+for tool in jq grep dirname wc tr mktemp find ln; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     err "missing-tool" "${tool} is required but not found in PATH"
     exit 3
@@ -243,12 +244,10 @@ if [ "$mode" = "run" ]; then
     err "missing-tool" "GNU coreutils 'timeout' is required but not found in PATH (run mode, Linux host only)"
     exit 3
   fi
-  for tool in realpath find; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-      err "missing-tool" "${tool} is required but not found in PATH (run mode)"
-      exit 3
-    fi
-  done
+  if ! command -v realpath >/dev/null 2>&1; then
+    err "missing-tool" "realpath is required but not found in PATH (run mode)"
+    exit 3
+  fi
 fi
 
 # --------------------------------------------------
@@ -309,21 +308,91 @@ if [ "$total_size_bytes" -gt "$MAX_TOTAL_SIZE_BYTES" ]; then
   exit 2
 fi
 
-# 結果 JSON を --output へ書く。事前の `-L`/`-e` 検証から書き込みまでの間に
-# symlink・ファイルを置かれても踏まないよう、noclobber（bash は対象が無ければ
-# O_CREAT|O_EXCL で開くため、dangling を含む symlink・既存ファイルでは失敗する）の
-# サブシェルで書く。失敗は入力エラー（exit 2）として扱う（set -e に任せると
-# exit 1「fio 実行失敗」と誤分類されるため）。
-# 残る制約: bash の noclobber は、既存の「通常ファイル以外」（FIFO・デバイス等。
-# それを指す symlink を含む）には O_CREAT なしで開いて書き込む仕様のため、検証後の
-# 競合でそれらを指す symlink を置かれた場合は防げない（通常ファイル・dangling
-# symlink・存在しないパスの上書きは防げる）。
-write_output_file() {
-  local content="$1"
-  if ! (set -o noclobber; printf '%s\n' "$content" >"$output_path") 2>/dev/null; then
-    err "invalid-input" "--output path could not be created exclusively (appeared after validation or is not writable): $output_path"
+# 後始末（成否・タイムアウト・シグナルに関わらず EXIT で必ず走る）。対象は
+# run モードの fio 一時出力ディレクトリ・専用サブディレクトリと、--output 用の
+# 一時ファイル。trap より先に空で初期化し、作成前に終了した経路で未定義・空パスを
+# rm しないようにする。`rm -rf`/`rm -f` は対象パス自体が symlink に差し替えられて
+# いてもリンクそのものを消すだけで、リンク先をたどらない（DoS 防止・ディスク占有を
+# 残さない。coding-rust.md のタイムアウト方針と対で、失敗経路でも後始末を漏らさない）。
+tmp_dir=""
+run_dir=""
+output_tmp=""
+# shellcheck disable=SC2329 # trap 経由で呼ばれるため直接の呼び出しは無い
+cleanup() {
+  if [ -n "$tmp_dir" ]; then
+    rm -rf -- "$tmp_dir"
+  fi
+  if [ -n "$run_dir" ]; then
+    rm -rf -- "$run_dir"
+  fi
+  if [ -n "$output_tmp" ]; then
+    rm -f -- "$output_tmp"
+  fi
+}
+trap cleanup EXIT
+
+# 他ユーザーが書き込めて sticky bit も無いディレクトリを拒否する（exit 2）。
+# そのようなディレクトリでは、本スクリプトが作ったエントリ（専用サブディレクトリ・
+# 一時ファイル）を作成直後に第三者が rename・削除して symlink へ差し替え、書き込みを
+# ディレクトリ外へ向けさせる競合が残るため（sticky bit があれば他ユーザーは自分の
+# エントリしか rename・削除できない。/tmp 等の 1777 は許容）。グループ書き込み可
+# （775 等）は、ユーザープライベートグループ既定の環境で一般的なため拒否しない
+# （同じグループのメンバーは信頼する前提）。`find` 自体が失敗した場合は判定を
+# 素通りする（fail-open）点に注意。
+# 引数: <オプション名（メッセージ用）> <ディレクトリ>
+reject_world_writable_without_sticky() {
+  local what="$1"
+  local dir="$2"
+  if [ -n "$(find "$dir" -maxdepth 0 -perm -0002 ! -perm -1000 2>/dev/null)" ]; then
+    err "invalid-input" "${what} directory is world-writable without the sticky bit, refusing to use it: ${dir}"
     exit 2
   fi
+}
+
+# 結果 JSON を --output へ書く（security.md の symlink 対策）。
+# 保証範囲: --output のパスが（検証後に置かれたものも含め）何らかの形で存在すれば
+# ─ 通常ファイル・ディレクトリ・FIFO・デバイス・それらを指す symlink・dangling
+# symlink のいずれでも ─ 書き込まずに exit 2 で止め、既存のエントリやリンク先を
+# 開かない・変更しない。手順は次のとおり:
+#   1. 出力先と同じディレクトリに `mktemp` で新しい通常ファイル（0600。O_CREAT|O_EXCL
+#      で作られ、既存の symlink をたどらない）を作り、結果を書く
+#   2. `ln -n` で --output のパスへハードリンクを張る。link(2) は宛先が既に存在すれば
+#      （symlink を含む）EEXIST で失敗し、宛先の symlink をたどらない。`-n` は宛先が
+#      ディレクトリを指す symlink のときにその中へ作らないため（GNU・BSD〔macOS〕
+#      共通のオプションで、GNU 専用の `mv -T`/`ln -T` には依存しない）
+#   3. 検証後に実ディレクトリを置かれた場合、`ln` はその中へリンクを作ってしまうため、
+#      --output のパスが一時ファイルと同一 inode の通常ファイル（symlink でない）で
+#      あることを確かめ、違えば exit 2（置かれたディレクトリの中に一時ファイル名の
+#      ハードリンクが残るが、既存のエントリは変更しない）
+#   4. 一時ファイル名を消す（--output 側のリンクが残る）
+# 1 の書き込みはパス名で開き直すが、親ディレクトリは他ユーザー書き込み可かつ
+# sticky bit 無しを拒否済みのため、他ユーザーが一時ファイルを差し替えることはできない。
+# 制約: ハードリンク非対応のファイルシステム（FAT 系等）では 2 が失敗し exit 2 になる。
+# 出力ファイルの権限は mktemp の 0600 になる。失敗はすべて入力エラー（exit 2）として
+# 扱う（set -e に任せると exit 1「fio 実行失敗」と誤分類されるため）。
+write_output_file() {
+  local content="$1"
+  local out_dir
+  out_dir=$(dirname -- "$output_path")
+  if ! output_tmp=$(mktemp "${out_dir}/.fandhe-fio-output.XXXXXXXXXX" 2>/dev/null) || [ -z "$output_tmp" ]; then
+    output_tmp=""
+    err "invalid-input" "could not create a temporary file next to --output: $output_path"
+    exit 2
+  fi
+  if ! printf '%s\n' "$content" >"$output_tmp" 2>/dev/null; then
+    err "invalid-input" "could not write the temporary file for --output: $output_tmp"
+    exit 2
+  fi
+  if ! ln -n -- "$output_tmp" "$output_path" 2>/dev/null; then
+    err "invalid-input" "--output path could not be created exclusively (it exists, possibly created after validation, or the filesystem does not support hard links): $output_path"
+    exit 2
+  fi
+  if [ -L "$output_path" ] || [ ! -f "$output_path" ] || [ ! "$output_path" -ef "$output_tmp" ]; then
+    err "invalid-input" "--output path was replaced during the write (a directory or other entry appeared after validation): $output_path"
+    exit 2
+  fi
+  rm -f -- "$output_tmp"
+  output_tmp=""
 }
 
 check_symlink_reject() {
@@ -359,6 +428,7 @@ if [ -n "$output_path" ]; then
     err "invalid-input" "--output parent directory is not writable: $output_dir"
     exit 2
   fi
+  reject_world_writable_without_sticky "--output parent" "$output_dir"
 fi
 
 # --------------------------------------------------
@@ -660,35 +730,9 @@ if [ "$target_dir_real" != "${target_dir_real//:/}" ]; then
   exit 2
 fi
 
-# 他ユーザーが書き込めて sticky bit も無いディレクトリは拒否する。そのような
-# ディレクトリでは、下の専用サブディレクトリを作った直後に第三者がそれを rename して
-# symlink へ差し替え、fio をボリューム外へ書き込ませる競合が残るため（sticky bit が
-# あれば他ユーザーは自分のエントリしか rename・削除できない。/tmp 等の 1777 は許容）。
-# グループ書き込み可（775 等）は、ユーザープライベートグループ既定の環境で一般的な
-# ため拒否しない（同じグループのメンバーは信頼する前提）。
-if [ -n "$(find "$target_dir_real" -maxdepth 0 -perm -0002 ! -perm -1000 2>/dev/null)" ]; then
-  err "invalid-input" "--target-dir is world-writable without the sticky bit, refusing to use it: $target_dir_real"
-  exit 2
-fi
-
-# trap より先に空で初期化し、作成前に終了した経路で未定義・空パスを rm しないようにする。
-tmp_dir=""
-run_dir=""
-# fio の一時出力・書き込んだデータファイルは、成否に関わらず必ず削除する（DoS 防止・
-# ディスク占有を残さないための後始末。coding-rust.md「相手の応答を待つ処理には
-# タイムアウトを設ける」と対で、タイムアウト／失敗経路でも後始末が漏れないようにする）。
-# `rm -rf` は削除対象のパス自体が symlink に差し替えられていてもリンクそのものを
-# 消すだけで、リンク先をたどって再帰削除しない。
-# shellcheck disable=SC2329 # trap 経由で呼ばれるため直接の呼び出しは無い
-cleanup() {
-  if [ -n "$tmp_dir" ]; then
-    rm -rf -- "$tmp_dir"
-  fi
-  if [ -n "$run_dir" ]; then
-    rm -rf -- "$run_dir"
-  fi
-}
-trap cleanup EXIT
+# 下の専用サブディレクトリを作った直後に第三者がそれを rename して symlink へ
+# 差し替え、fio をボリューム外へ書き込ませる競合を防ぐ（判定基準は関数側のコメント）。
+reject_world_writable_without_sticky "--target-dir" "$target_dir_real"
 
 if ! tmp_dir=$(mktemp -d 2>/dev/null) || [ -z "$tmp_dir" ]; then
   tmp_dir=""

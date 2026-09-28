@@ -278,7 +278,7 @@ PATH="$jq_only_bin" run_case_msg "missing-grep-tool" 3 "grep is required" --from
 # ツール欠如。exit 3。fio の欠如そのものを検出していることをメッセージで確認する）
 common_bin="${tmp_root}/common-bin"
 mkdir -p "$common_bin"
-for tool in jq grep dirname wc tr mktemp; do
+for tool in jq grep dirname wc tr mktemp find ln; do
   ln -s "$(command -v "$tool")" "${common_bin}/${tool}"
 done
 PATH="$common_bin" run_case_msg "missing-fio-tool" 3 "fio is required" --target-dir /tmp --label x
@@ -323,6 +323,7 @@ done
 [ -n "$dir" ] && [ -n "$fname" ] && echo stub-fio-data >"$dir/$fname"
 # 実行中に第三者が symlink を置く競合（TOCTOU）を再現するためのフック
 [ -n "${FIO_STUB_PLANT_LINK:-}" ] && ln -s "$FIO_STUB_PLANT_TARGET" "$FIO_STUB_PLANT_LINK"
+[ -n "${FIO_STUB_PLANT_DIR:-}" ] && mkdir "$FIO_STUB_PLANT_DIR"
 # 出力 JSON を書かずに成功終了する fio を再現するためのフック
 [ -n "${FIO_STUB_NO_OUTPUT:-}" ] && exit 0
 # 記録するオプションを上書きする（run モードでも実行条件の照合が効くことの確認用）
@@ -469,8 +470,9 @@ else
 fi
 
 # 回帰テスト（--output の検証後に symlink を置かれる競合。TOCTOU）: fio 実行中に
-# --output のパスへ victim を指す symlink を置いても、noclobber で排他的に作成する
-# ため書き込みを拒否し（exit 2）、victim は変更されない。
+# --output のパスへ victim（既存の通常ファイル）を指す symlink を置いても、一時ファイル
+# からのハードリンク作成（宛先が存在すれば失敗し、symlink をたどらない）で排他的に
+# 作るため書き込みを拒否し（exit 2）、victim は変更されない。
 race_target="${tmp_root}/race-target"
 mkdir -p "$race_target"
 race_victim="${tmp_root}/race-victim.txt"
@@ -486,6 +488,71 @@ if [[ "$last_output" != *'"schema_version"'* ]]; then
   echo "PASS: run-output-failure-emits-no-result"
 else
   echo "FAIL: run-output-failure-emits-no-result (result JSON was printed although --output failed)" >&2
+  failures=$((failures + 1))
+fi
+
+# 回帰テスト（Codex P0）: 検証後に --output のパスへ FIFO を指す symlink を置かれても
+# リンク先を開かない。旧実装（bash の noclobber）は既存の通常ファイル以外を
+# O_CREAT なしで開くため、読み手のいない FIFO の open で止まっていた。ハングを
+# 検出できるよう timeout 付きで起動し、124（タイムアウト）ではなく 2 を期待する。
+race_fifo="${tmp_root}/race-fifo"
+mkfifo "$race_fifo"
+race_fifo_output="${tmp_root}/race-fifo-output.json"
+fifo_actual=0
+fifo_out=$(FIO_STUB_PLANT_LINK="$race_fifo_output" FIO_STUB_PLANT_TARGET="$race_fifo" PATH="$stub_path" \
+  timeout -k 5s 30s "$bash_bin" "$target_script" --target-dir "$race_target" --label x --runtime 5 \
+  --output "$race_fifo_output" 2>&1) || fifo_actual=$?
+if [ "$fifo_actual" -eq 2 ] && [[ "$fifo_out" == *"could not be created exclusively"* ]]; then
+  echo "PASS: run-output-fifo-symlink-planted-during-run (exit=${fifo_actual})"
+else
+  echo "FAIL: run-output-fifo-symlink-planted-during-run (expected exit=2 with 'could not be created exclusively', actual exit=${fifo_actual}; 124 means the FIFO was opened)" >&2
+  print_indented "$fifo_out"
+  failures=$((failures + 1))
+fi
+if [ -p "$race_fifo" ] && [ -L "$race_fifo_output" ]; then
+  echo "PASS: run-output-fifo-and-symlink-left-untouched"
+else
+  echo "FAIL: run-output-fifo-and-symlink-left-untouched (FIFO or planted symlink was replaced)" >&2
+  failures=$((failures + 1))
+fi
+
+# 検証後にディレクトリを指す symlink を置かれても、その中へ書かない（`ln -n`）
+race_linked_dir="${tmp_root}/race-linked-dir"
+mkdir -p "$race_linked_dir"
+race_dirlink_output="${tmp_root}/race-dirlink-output.json"
+FIO_STUB_PLANT_LINK="$race_dirlink_output" FIO_STUB_PLANT_TARGET="$race_linked_dir" PATH="$stub_path" \
+  run_case_msg "run-output-dir-symlink-planted-during-run" 2 "could not be created exclusively" \
+  --target-dir "$race_target" --label x --runtime 5 --output "$race_dirlink_output"
+linked_dir_entries=$(find "$race_linked_dir" -mindepth 1 | wc -l | tr -d ' ')
+if [ "$linked_dir_entries" -eq 0 ]; then
+  echo "PASS: run-output-dir-symlink-target-unchanged"
+else
+  echo "FAIL: run-output-dir-symlink-target-unchanged (found ${linked_dir_entries} entries under $race_linked_dir)" >&2
+  failures=$((failures + 1))
+fi
+
+# 検証後に実ディレクトリを置かれた場合（`ln` がその中へリンクを作る）も、--output の
+# パスが作成した通常ファイルでないことを検出して exit 2 にする
+race_realdir_output="${tmp_root}/race-realdir-output.json"
+FIO_STUB_PLANT_DIR="$race_realdir_output" PATH="$stub_path" \
+  run_case_msg "run-output-real-dir-planted-during-run" 2 "was replaced during the write" \
+  --target-dir "$race_target" --label x --runtime 5 --output "$race_realdir_output"
+
+# --output の親ディレクトリが他ユーザー書き込み可かつ sticky bit 無しなら拒否する
+# （一時ファイルを差し替えられる競合への対策）
+ww_output_dir="${tmp_root}/world-writable-output-dir"
+mkdir -p "$ww_output_dir"
+chmod 777 "$ww_output_dir"
+run_case_msg "output-parent-world-writable-no-sticky" 2 "--output parent directory is world-writable without the sticky bit" \
+  --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "${ww_output_dir}/out.json"
+chmod 755 "$ww_output_dir"
+
+# 成功・失敗のどちらの経路でも --output 用の一時ファイルが残らない
+output_tmp_leftover=$(find "$tmp_root" -maxdepth 1 -name '.fandhe-fio-output.*' | wc -l | tr -d ' ')
+if [ "$output_tmp_leftover" -eq 0 ]; then
+  echo "PASS: output-no-leftover-temp-files"
+else
+  echo "FAIL: output-no-leftover-temp-files (found ${output_tmp_leftover} .fandhe-fio-output.* files under $tmp_root)" >&2
   failures=$((failures + 1))
 fi
 

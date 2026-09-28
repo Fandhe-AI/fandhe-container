@@ -13,9 +13,9 @@ fandhe-container の I/O 共有プロトコル経由の共有マウントはま�
 
 ## 前提条件
 
-- **run モード**（実際に fio を実行する）: fio 3.x 以上（`lat_ns`/`clat_ns` 等の `*_ns` キーを出力する版）・GNU coreutils の `timeout`・`realpath`・`find`・`jq`。**Linux ホストのみ対象**（GNU `timeout` が無い macOS 標準環境・Windows は対象外。VM ゲスト経由の経路は後続 TASK で扱う）
+- **run モード**（実際に fio を実行する）: fio 3.x 以上（`lat_ns`/`clat_ns` 等の `*_ns` キーを出力する版）・GNU coreutils の `timeout`・`realpath`・`jq`。**Linux ホストのみ対象**（GNU `timeout` が無い macOS 標準環境・Windows は対象外。VM ゲスト経由の経路は後続 TASK で扱う）
 - **`--from-json` モード**（既存の fio JSON 出力を変換するだけ）: `jq`（fio・`timeout` は不要）。bash と jq だけで動くため、fio 未導入の CI・ローカル環境でも自己テストが完結する
-- **全モード共通**: `grep`・`dirname`・`wc`・`tr`・`mktemp`（欠如時は終了コード 3。欠如したまま進むと別の終了コードへ誤分類されるため事前に検出する）
+- **全モード共通**: `grep`・`dirname`・`wc`・`tr`・`mktemp`・`find`・`ln`（欠如時は終了コード 3。欠如したまま進むと別の終了コードへ誤分類されるため事前に検出する）
 - **root 権限・`/dev/kvm` は不要**（親 #111 の受入基準）
 
 ## 使い方
@@ -63,7 +63,7 @@ fio の JSON 上のオプション表現（`job options`/`global options` は正
 | `--target-dir <dir>` | （run モード必須） | fio の書き込み先ディレクトリ。symlink 拒否・書き込み可能なディレクトリであることを検証してから `realpath` で正規化する。正規化後のパスに `:` を含む場合も拒否する（fio が `--directory`/`--filename` の `:` をディレクトリ・ファイル名リストの区切り文字として解釈するため）。他ユーザー書き込み可能で sticky bit が無いディレクトリも拒否する（`/tmp` 等の 1777 は可）。データファイルは下記「書き込み先の安全性」のとおり、このディレクトリ内に実行ごとに作る専用サブディレクトリへ書く |
 | `--from-json <path>` | （from-json モード必須） | 既存の fio `--output-format=json` 出力へのパス。symlink 拒否・サイズ上限（4 MiB）あり |
 | `--label <label>` | 必須 | `^[a-z0-9_-]{1,64}$`。出力 JSON にそのまま記録し、計測対象（Docker ベースラインか fandhe 経路か等）を表す |
-| `--output <path>` | （出力しない） | 指定時、結果 JSON をこのパスにも書く。symlink 拒否・既存ファイルへの上書きは拒否する。親ディレクトリの存在・書き込み可否も事前検証する（未検証のまま書き込みに失敗すると、呼び出し元が終了コード 1「fio 実行失敗」と誤認するため）。書き込み自体も noclobber（対象が無ければ `O_CREAT\|O_EXCL`）で行い、検証後に symlink・ファイルを置かれた場合は書かずに終了コード 2 で止める（bash の noclobber の仕様上、FIFO・デバイス等の通常ファイル以外を指す symlink を検証後に置かれた場合は対象外） |
+| `--output <path>` | （出力しない） | 指定時、結果 JSON をこのパスにも書く。symlink 拒否・既存ファイルへの上書きは拒否する。親ディレクトリの存在・書き込み可否も事前検証する（未検証のまま書き込みに失敗すると、呼び出し元が終了コード 1「fio 実行失敗」と誤認するため）。親ディレクトリが他ユーザー書き込み可かつ sticky bit 無しなら拒否する。書き込みは下記「`--output` の排他作成」の手順で行い、検証後に何かを置かれた場合も既存のエントリやリンク先を開かない |
 | `--direct 0\|1` | `1` | fio `--direct`。tmpfs・FUSE 系の共有 FS では O_DIRECT が失敗しうるため変更できる |
 | `--size <NkNmNg>` | `256m` | fio `--size`（ジョブごとの値）。`^[1-9][0-9]{0,5}[kmg]$`（先頭ゼロ不可）。DoS 防止の上限は総量で課し、`--size` × `--numjobs` が 10 GiB 以下（例: `10g`×1・`5g`×2 は可、`5g`×3 は不可）。全ジョブが同じ `--filename` を共有するためディスク上のファイルは 1 つだが、書き込み量に対して保守的に総量で制限する |
 | `--runtime <1-600>` | `30` | fio `--runtime`（秒。`--time_based` と併用）。`^[1-9][0-9]{0,3}$`（先頭ゼロ不可） |
@@ -72,13 +72,24 @@ fio の JSON 上のオプション表現（`job options`/`global options` は正
 
 先頭ゼロを拒否する理由: 先頭ゼロを許すとシェル側の算術評価が 8 進数として解釈してしまい（例: `08` は無効な 8 進数リテラルとしてエラーになる）、入力エラーであるべきケースが「fio 実行失敗」等の別の終了コードに化ける、または無効な JSON 数値として渡ってしまうため。
 
+`--rw`（`randwrite` 固定）・`--bs`（`4k` 固定）・`--ioengine`（`psync` 固定。libaio は Linux 専用のため移植性を優先）・`--end_fsync`（`1` 固定。write-back とフラッシュの意味論〔IO-2〕を含めて測るため）・`--group_reporting`（有効固定）は変更できない。有効値はすべて出力 JSON の `params` に記録する。run モードの fio 出力にも `--from-json` と同じ実行条件の照合をかけるため、`params` はどちらのモードでも fio JSON に記録された実行条件と一致する。
+
 ### 書き込み先の安全性（symlink 経由のボリューム外書き込み対策）
 
 fio はデータファイルを `O_CREAT`（`O_EXCL` なし）で開き symlink をたどるため、`--target-dir` 直下の固定パスへ書かせると、事前に同名の symlink を置かれた場合にリンク先（ボリューム外の任意ファイル）を `--size` 分上書きしてしまう（security.md のパストラバーサル・symlink 対策）。そこで run モードは実行ごとに `mktemp -d` で `--target-dir` 内へ一意な名前の専用サブディレクトリ（`fandhe-fio-randwrite-4k.XXXXXXXXXX`・0700）を新規作成し、fio にはその中の固定ファイル名 `fandhe-fio-randwrite-4k.dat` だけを渡す。後始末はそのサブディレクトリを `rm -rf` で消すだけで、symlink をたどらない。
 
 「symlink・既存ファイルなら拒否する」事前検査を採らないのは、検査から fio の open までの競合（TOCTOU）を原理的に塞げないため。`--target-dir` 直下に置かれた同名 symlink はそのまま残り、リンク先も変更されない（自己テストで照合する）。
 
-`--rw`（`randwrite` 固定）・`--bs`（`4k` 固定）・`--ioengine`（`psync` 固定。libaio は Linux 専用のため移植性を優先）・`--end_fsync`（`1` 固定。write-back とフラッシュの意味論〔IO-2〕を含めて測るため）・`--group_reporting`（有効固定）は変更できない。有効値はすべて出力 JSON の `params` に記録する。run モードの fio 出力にも `--from-json` と同じ実行条件の照合をかけるため、`params` はどちらのモードでも fio JSON に記録された実行条件と一致する。
+### `--output` の排他作成
+
+保証範囲: `--output` のパスが（検証後に置かれたものも含め）何らかの形で存在すれば、通常ファイル・ディレクトリ・FIFO・デバイス・それらを指す symlink・dangling symlink のいずれでも、書き込まずに終了コード 2 で止め、既存のエントリやリンク先を開かない・変更しない。事前検査（symlink・既存パスの拒否）は早期に分かりやすいエラーを返すためのもので、安全性は次の書き込み手順が担う。
+
+1. 出力先と同じディレクトリに `mktemp` で新しい通常ファイル（`.fandhe-fio-output.XXXXXXXXXX`・0600。`O_CREAT|O_EXCL` で作られ既存の symlink をたどらない）を作り、結果を書く
+2. `ln -n` で `--output` のパスへハードリンクを張る。link(2) は宛先が既に存在すれば（symlink を含む）失敗し、宛先の symlink をたどらない。`-n` は宛先がディレクトリを指す symlink のときにその中へ作らないためのもので、GNU・BSD（macOS）共通のオプションを使う（GNU 専用の `mv -T`/`ln -T` には依存しない。`--from-json` モードは macOS でも動く前提のため）
+3. 検証後に実ディレクトリを置かれると `ln` はその中へリンクを作るため、`--output` のパスが一時ファイルと同一 inode の通常ファイル（symlink でない）であることを確かめ、違えば終了コード 2（この場合、置かれたディレクトリの中に一時ファイル名のハードリンクが残るが、既存のエントリは変更しない）
+4. 一時ファイル名を消す（成否に関わらず EXIT 時の後始末でも消す）
+
+一時ファイルをパス名で開き直して書くため、親ディレクトリが他ユーザー書き込み可かつ sticky bit 無しの場合は拒否する（他ユーザーが一時ファイルを symlink へ差し替えられないようにするため。グループ書き込み可は同じグループのメンバーを信頼する前提で許容）。制約として、ハードリンク非対応のファイルシステム（FAT 系等）では手順 2 が失敗して終了コード 2 になる。出力ファイルの権限は 0600 になる。
 
 ## 出力スキーマ
 
@@ -119,11 +130,11 @@ fio はデータファイルを `O_CREAT`（`O_EXCL` なし）で開き symlink 
 | 0 | 成功 |
 | 1 | fio の実行失敗（exit 0 でも出力 JSON を書かなかった場合を含む）またはタイムアウト（`timeout` が保護する。SIGTERM で止まらない場合は 10 秒後に SIGKILL する。REPAIR-5） |
 | 2 | 入力エラー（引数の検証失敗、fio JSON のスキーマ不正・実行条件の不一致、値が 0 以下、ファイルサイズ・総書き込み量の上限超過、symlink 等） |
-| 3 | 前提ツールが無い（run モードでの fio・timeout・realpath・find。全モード共通で jq・grep・dirname・wc・tr・mktemp） |
+| 3 | 前提ツールが無い（run モードでの fio・timeout・realpath。全モード共通で jq・grep・dirname・wc・tr・mktemp・find・ln） |
 
 ## 自己テスト（`scripts/fio-randwrite-4k-selftest.sh`）
 
-`--from-json` モードと `scripts/testdata/fio-bench/` の固定 fixture、および最小の fio スタブ（受け取ったオプションを fio と同じ形で `job options` に記録した固定 JSON を書き出す）を使い、実 fio なしで終了コード・出力値・`check-bench-regression.sh` との round-trip 互換性、実行条件の照合（負例 fixture は照合を通る `job options` を持たせたうえで 1 点だけ壊し、拒否理由をメッセージで照合する）、総書き込み量の上限の境界、および symlink・競合に対する書き込み先の安全性（上記「書き込み先の安全性」・`--output` の排他作成）を機械照合する（REPAIR-12）。`make fio-bench-selftest` から実行し、CI の `bench-regression` ジョブにも組み込む。run モードの実 fio を使った実行確認は「実機での確認」節を参照。
+`--from-json` モードと `scripts/testdata/fio-bench/` の固定 fixture、および最小の fio スタブ（受け取ったオプションを fio と同じ形で `job options` に記録した固定 JSON を書き出す）を使い、実 fio なしで終了コード・出力値・`check-bench-regression.sh` との round-trip 互換性、実行条件の照合（負例 fixture は照合を通る `job options` を持たせたうえで 1 点だけ壊し、拒否理由をメッセージで照合する）、総書き込み量の上限の境界、および symlink・競合に対する書き込み先の安全性（上記「書き込み先の安全性」・「`--output` の排他作成」。検証後に通常ファイル・FIFO・ディレクトリを指す symlink や実ディレクトリを置く競合をスタブで再現する）を機械照合する（REPAIR-12）。`make fio-bench-selftest` から実行し、CI の `bench-regression` ジョブにも組み込む。run モードの実 fio を使った実行確認は「実機での確認」節を参照。
 
 ## 実機での確認（人間担当・TASK-25.2 との切り分け）
 

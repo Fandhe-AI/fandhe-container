@@ -17,6 +17,11 @@
 //! [`payload`] モジュール（TASK-12.2・#74）が定める。[`client::PipelineClient::send`]
 //! はこの形式で request id を埋め込み、[`client::PipelineClient::recv_ack`]
 //! （TASK-12.2・#74）が送信順で ACK を検証・対応付けし、タイムアウト付きで待つ。
+//! `recv_ack` が返す通常 ACK と FLUSH ACK は [`barrier`] モジュール
+//! （TASK-15.1・#85・IO-1・IO-2）が別の型（[`barrier::WriteAck`] /
+//! [`barrier::FlushAck`]）として区別し、取り違えをコンパイル時に検出できる
+//! ようにする。[`client::PipelineClient::flush`] は FLUSH フレームを送信し、
+//! [`barrier::FlushBarrier`] を返す。
 //! [`batch::BatchBuffer`] は受信した `Write` フレームを既定 64 件（設定可能）単位で
 //! 集約するメモリ内ロジックのみを提供する。その集約結果を実際にディスクへ書き込み、
 //! 書き込み完了後に通常 ACK を返すところまでは [`writeback`] モジュール
@@ -30,6 +35,14 @@
 //! `--batch-size` 相当の設定 API（CLI / 設定の文字列から検証済み
 //! [`batch::BatchConfig`] と [`recv_limits::ReceiveLimits`] を単一の入口から
 //! 導く）は [`settings`] モジュール（TASK-13.3・#78）が提供する。
+//! FS 正規化層は、大文字小文字を区別しないホスト（APFS / NTFS）とゲスト
+//! （ext4）の差異による黙った上書きを防ぐため、ゲスト相対パスの大文字小文字
+//! 衝突を検出する（[`fs_normalize::CaseCollisionSet`]・
+//! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。サーバーの
+//! 書き込み経路への組み込みは #100（TASK-19.2）、パス長 260 超の検証は
+//! TASK-20、Unicode 正規化（NFC / NFD）は #103（TASK-21.h1）の方針決定後に
+//! TASK-21 でそれぞれ後続実装する
+//! （REPAIR-3。本 crate はまだこれらを呼び出していない）。
 //!
 //! PLUG-1 区分は core（`fandhe-container-plugin` の境界機構とは別に、コアの一部として
 //! 直接リンクされる）。crate 名 `fandhe-container-io` は
@@ -37,10 +50,12 @@
 //! `core → io` であり、本 crate は `fandhe-container-core` に依存しない
 //! （`docs/architecture.md`「依存関係グラフ」）。
 
+pub mod barrier;
 pub mod batch;
 mod checksum;
 pub mod client;
 pub mod error;
+pub mod fs_normalize;
 pub mod observe;
 pub mod payload;
 pub mod protocol;
@@ -51,15 +66,17 @@ mod sys;
 pub mod transport;
 pub mod writeback;
 
+pub use barrier::{AckReceipt, FlushAck, FlushBarrier, WriteAck};
 pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
 };
 pub use client::{
-    AckMetrics, AckOutcome, AckReceipt, DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest,
+    AckMetrics, AckOutcome, DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest,
     LATENCY_HISTOGRAM_BUCKETS, LatencyStats, MAX_IN_FLIGHT_LIMIT, PipelineClient, RequestId,
     SendMetrics, SendOutcome, SendQueue,
 };
 pub use error::{IoError, IoErrorCode};
+pub use fs_normalize::{CaseCollisionSet, MAX_COLLISION_MESSAGE_PATH_CHARS, check_case_collisions};
 pub use observe::{
     AckEvent, AckEventError, DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver,
     JsonLinesServerObserver, MAX_SEND_LOG_BUFFER_BYTES, MAX_SEND_LOG_CAPACITY,

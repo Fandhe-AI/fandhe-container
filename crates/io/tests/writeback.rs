@@ -8,6 +8,10 @@
 //! `tests/server.rs` と同じ扱い）。Windows では `UdsServer::bind` 自体が
 //! `Unimplemented` を返すことを別テストで確認し、3 OS すべてでテストが空に
 //! ならないようにする。
+//!
+//! あわせて、ACK 受信後の静止点で外部から出力ファイルを truncate しても次の
+//! バッチが新しい EOF に穴なしで着地すること（[`fandhe_container_io::AppendFileSink`]
+//! のバッチごとの EOF 位置合わせ。IO-4・TASK-14.2）を同じ UDS 経路で確認する。
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix {
@@ -300,6 +304,104 @@ mod unix {
 
         let report = server_thread.join().expect("server thread must not panic");
         assert_eq!(report.stats.acks_sent, 16);
+        assert_eq!(report.stats.batches_written, 2);
+    }
+
+    /// IO-4・IO-1・TASK-14.2（Codex #1125 / #1127 レビュー指摘）: 通常モード
+    /// （`append(true)` を付けない `write(true)`）で開いた [`AppendFileSink`] へ
+    /// UDS 経由で 1 バッチ（4 件）送り、その ACK をすべて受け取った後（＝
+    /// バッチ書き込み完了後の静止点。D2）に別ハンドルで出力ファイルを
+    /// `set_len(0)` する。続けて 2 バッチ目（4 件）を送ると、`write_batch` が
+    /// バッチごとに現在の EOF へ位置合わせするため、2 バッチ目は新しい EOF
+    /// （先頭）から穴なしで書き込まれる。ファイル全体が 2 バッチ目の body の
+    /// 連結とバイト単位で完全一致することを確認する（truncate 前のオフセット
+    /// 〔32 バイト〕へ書き続けて先頭にゼロ埋めの穴を作る退行を検出する）。
+    #[test]
+    fn io4_io1_uds_writeback_follows_external_truncate_after_ack() {
+        const BATCH_SIZE: u64 = 4;
+
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+        let output_path = dir.output_path();
+
+        let mut server =
+            UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
+                .expect("bind must succeed on a private, empty path");
+
+        let connect_path = socket_path.clone();
+        let output_path_for_client = output_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = connect(&connect_path);
+            let mut acked_ids = Vec::with_capacity(2 * BATCH_SIZE as usize);
+
+            // 1 バッチ目を送り、ACK をすべて受け取る（この時点でバッチ 1 の
+            // 書き込みは完了しており、バッチ 2 はまだ送っていないため
+            // サーバー側に進行中の書き込みはない）。
+            for id in 0..BATCH_SIZE {
+                send_write(&mut stream, id, &id.to_le_bytes());
+            }
+            for _ in 0..BATCH_SIZE {
+                acked_ids.push(ack_id(&recv_frame(&mut stream)));
+            }
+            let snapshot_before_truncate =
+                std::fs::read(&output_path_for_client).unwrap_or_default();
+
+            // ACK 受信後の静止点で、サーバーが開いたままのファイルを外部から
+            // 切り詰める。
+            let external = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&output_path_for_client)
+                .expect("must open output file for external truncate");
+            external
+                .set_len(0)
+                .expect("external truncate must succeed while the sink stays open");
+            drop(external);
+
+            for id in BATCH_SIZE..2 * BATCH_SIZE {
+                send_write(&mut stream, id, &id.to_le_bytes());
+            }
+            for _ in BATCH_SIZE..2 * BATCH_SIZE {
+                acked_ids.push(ack_id(&recv_frame(&mut stream)));
+            }
+            (acked_ids, snapshot_before_truncate)
+        });
+
+        let mut connection = server
+            .accept(test_timeout(), NoopServerObserver)
+            .expect("server must accept the client connection within the timeout");
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&output_path)
+            .expect("must open output file");
+        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+
+        let config = BatchConfig::new(BATCH_SIZE as usize).expect("4 must be a valid batch size");
+        let server_thread = std::thread::spawn(move || {
+            serve_connection(&mut connection, config, &mut sink, writeback_timeouts())
+        });
+
+        let (acked_ids, snapshot_before_truncate) =
+            client_thread.join().expect("client thread must not panic");
+        assert_eq!(acked_ids, (0..2 * BATCH_SIZE).collect::<Vec<_>>());
+
+        let expected_first_batch: Vec<u8> =
+            (0..BATCH_SIZE).flat_map(|id| id.to_le_bytes()).collect();
+        assert_eq!(snapshot_before_truncate, expected_first_batch);
+
+        let contents = std::fs::read(&output_path).expect("must read output file");
+        let expected: Vec<u8> = (BATCH_SIZE..2 * BATCH_SIZE)
+            .flat_map(|id| id.to_le_bytes())
+            .collect();
+        assert_eq!(
+            contents, expected,
+            "the batch sent after the external truncate must land at the new EOF with no zero-fill hole"
+        );
+
+        let report = server_thread.join().expect("server thread must not panic");
+        assert_eq!(report.stats.acks_sent, 2 * BATCH_SIZE);
         assert_eq!(report.stats.batches_written, 2);
     }
 

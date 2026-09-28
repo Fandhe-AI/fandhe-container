@@ -23,8 +23,8 @@
 //! したがって「テスト自体が無限に待たずタイムアウト秒数内で終了する」ことは
 //! 「厳密にタイムアウト未満で終わる」ではなく、**「ACK 待ちの所要時間が
 //! `timeout - ABSENT_ACK_TOLERANCE` 以上 `timeout + HANG_GUARD_GRACE` 未満で
-//! あり、シナリオ全体が三段の watchdog（準備段階は `CONNECT_RETRY_BUDGET +
-//! REQUEST_COUNT * timeout + HANG_GUARD_GRACE`、ACK 待ちへの遷移は準備段階の
+//! あり、シナリオ全体が三段の watchdog（準備段階は `REQUEST_COUNT * timeout +
+//! HANG_GUARD_GRACE`、ACK 待ちへの遷移は準備段階の
 //! 期限 + `HANG_GUARD_GRACE`、ACK 待ち段階は待機開始通知の受信時刻から
 //! `timeout + HANG_GUARD_GRACE` での `recv_timeout`）で上限を機械的に
 //! 保証されている」**と解釈する
@@ -37,9 +37,13 @@
 //! ACK タイムアウト検出がハングしたかのように誤って panic し得た
 //! （cursor Bugbot 指摘・codex P2 指摘・#1124）。本ファイルは
 //! 準備段階（`connect` 完了・送信完了まで）と ACK 待ち段階を別々の期限で
-//! 管理することでこれを解消する。準備段階の期限には `connect` のリトライ
-//! 予算だけでなく、その後に行う複数件の送信（各 send は最大 `timeout` まで
-//! 掛かり得る）の予算も含める（codex P2 指摘・#1124）。ACK 待ち段階の期限は
+//! 管理することでこれを解消する。準備段階の期限には複数件の送信（各 send は
+//! 最大 `timeout` まで掛かり得る）の予算を含める（codex P2 指摘・#1124）。
+//! `connect` / `accept` は client スレッドの起動前にテスト本体上で済ませ、
+//! サーバー側の待ち（`accept`・受信）は、それが依存する client 側の工程の
+//! 完了後に始める（ACK を返さないサーバーは準備段階の完了後に起動する）
+//! ことで、client 側の予算内の遅延でサーバーが先にタイムアウトしないように
+//! する（codex P2 指摘・#1124）。ACK 待ち段階の期限は
 //! 準備完了通知とは別チャネルの待機開始通知（client 側トランスポートが
 //! `recv_frame` の `deadline` を確定した直後に送る）の受信時刻を起点にし、
 //! `recv_ack` 呼び出し前のスケジューリング遅延が期限を食い潰さないように
@@ -193,8 +197,8 @@ mod unix {
     use fandhe_container_io::transport::{FrameReceiver, FrameSender, IoTimeout};
     use fandhe_container_io::writeback::{AppendFileSink, WritebackTimeouts, serve_connection};
     use fandhe_container_io::{
-        BatchConfig, FRAME_HEADER_LEN, IoError, IoErrorCode, ReceiveLimits, UdsServer,
-        decode_request,
+        BatchConfig, FRAME_HEADER_LEN, IoError, IoErrorCode, ReceiveLimits, UdsConnection,
+        UdsServer, decode_request,
     };
 
     use super::response_timeout;
@@ -210,11 +214,12 @@ mod unix {
     /// 「無限に待たない」ことを機械的に保証できる範囲に収める。
     const HANG_GUARD_GRACE: Duration = Duration::from_secs(2);
 
-    /// [`connect`] が接続を試みる上限秒数。[`repair5_missing_ack_is_detected_as_timeout`]
-    /// の watchdog（準備段階）が同じ値を参照することで、`connect` の
-    /// リトライ予算と watchdog の期限が乖離しないようにする（cursor Bugbot
-    /// 指摘・codex P2 指摘・#1124: watchdog が `connect` の待ち時間を
-    /// 考慮していなかったため、bind / accept 側の遅延で誤って panic し得た）。
+    /// [`connect`] が接続を試みる上限秒数。`connect` は
+    /// [`connect_and_accept`] からテスト本体（main スレッド）上で、client
+    /// スレッドの起動より前に呼ばれるため、この予算は watchdog の各段階や
+    /// サーバー側の待ちとは重ならない（cursor Bugbot 指摘・codex P2 指摘・
+    /// #1124: 以前は client スレッド内で `connect` していたため、`connect`
+    /// の予算と watchdog・サーバー側 `accept` の期限を整合させる必要があった）。
     const CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 
     /// テストごとに固有かつ短いソケットディレクトリを作る（`tests/writeback.rs`
@@ -267,6 +272,31 @@ mod unix {
                 Err(err) => panic!("client failed to connect: {err}"),
             }
         }
+    }
+
+    /// テスト本体（main スレッド）上で `connect` → `accept` を順に行い、接続済み
+    /// の client 側 [`UnixStream`] とサーバー側 [`UdsConnection`] の組を返す。
+    ///
+    /// 本ファイルの各テストは、client スレッド・サーバースレッドを起動する
+    /// **前に**本関数で接続を確立する（codex P2 指摘・#1124）。`server` は
+    /// `UdsServer::bind` 済み（`UnixListener::bind` の時点で `listen()` 済み）
+    /// のため、`connect` は accept を待たずに backlog へ積まれて成功し、続く
+    /// `accept` は既に待機中の接続を取り出すだけで即座に返る。client スレッド
+    /// 内で `connect` し、別スレッドで `accept(timeout)` を並行に待つ構成では、
+    /// client スレッドの起動・実行が `timeout` 以上遅れるとサーバー側の
+    /// `accept` が先にタイムアウトし、検証対象（ACK の到達・未到達）とは
+    /// 無関係にテストが失敗し得た。本関数の `accept` はスレッド間の
+    /// スケジューリングに依存しない。
+    fn connect_and_accept(
+        server: &mut UdsServer<NoopServerObserver>,
+        path: &std::path::Path,
+        timeout: IoTimeout,
+    ) -> (UnixStream, UdsConnection<NoopServerObserver>) {
+        let stream = connect(path);
+        let connection = server
+            .accept(timeout, NoopServerObserver)
+            .expect("server must accept the already-queued client connection");
+        (stream, connection)
     }
 
     /// [`PipelineClient`] が要求する client 側トランスポート（`FrameSender` +
@@ -517,6 +547,15 @@ mod unix {
     /// 遅延していても「受信開始後にタイムアウト内で届いた」ことしか検証でき
     /// ず、REPAIR-5 の「送信した全リクエストの ACK がタイムアウト内に届く」
     /// という受け入れ条件を取りこぼす）。
+    ///
+    /// 接続は [`connect_and_accept`] でスレッド起動前に確立する。全体の所要
+    /// 時間 `total` の起点 `started` はサーバースレッド（`serve_connection`）の
+    /// 起動より前に取る: サーバーの受信待ち（`WritebackTimeouts::recv`、
+    /// 1 フレームごとに `timeout`）の区間はすべて `started` 以後に収まるため、
+    /// client 側の遅延でサーバーの受信待ちがタイムアウトする状況では必ず
+    /// `total >= timeout` となり、本テスト自身の判定でも失敗扱いになる
+    /// （サーバーが検証対象と無関係な理由で先に失敗することがない。codex
+    /// P2 指摘・#1124）。
     #[test]
     fn repair5_all_acks_arrive_within_timeout_default_batch_64() {
         let timeout = response_timeout();
@@ -528,14 +567,36 @@ mod unix {
             UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
                 .expect("bind must succeed on a private, empty path");
 
-        let connect_path = socket_path.clone();
+        let (stream, mut connection) = connect_and_accept(&mut server, &socket_path, timeout);
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&output_path)
+            .expect("must open output file");
+        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+
+        let writeback_timeouts = WritebackTimeouts {
+            recv: timeout,
+            send: timeout,
+        };
+        // サーバースレッドの起動より前に取る（本関数 doc 参照）。
+        let started = Instant::now();
+        let server_thread = std::thread::spawn(move || {
+            serve_connection(
+                &mut connection,
+                BatchConfig::default(),
+                &mut sink,
+                writeback_timeouts,
+            )
+        });
+
         let client_thread = std::thread::spawn(move || {
-            let stream = connect(&connect_path);
             let transport = UnixStreamTransport::new(stream);
             let mut client =
                 PipelineClient::new(transport, InFlightLimit::default(), NoopSendObserver);
 
-            let started = Instant::now();
             let mut send_started: Vec<Instant> = Vec::with_capacity(64);
             for id in 0..64u64 {
                 send_started.push(Instant::now());
@@ -571,31 +632,6 @@ mod unix {
             (acked_ids, per_ack_elapsed, total, ack_metrics)
         });
 
-        let mut connection = server
-            .accept(timeout, NoopServerObserver)
-            .expect("server must accept the client connection within the timeout");
-
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&output_path)
-            .expect("must open output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
-
-        let writeback_timeouts = WritebackTimeouts {
-            recv: timeout,
-            send: timeout,
-        };
-        let server_thread = std::thread::spawn(move || {
-            serve_connection(
-                &mut connection,
-                BatchConfig::default(),
-                &mut sink,
-                writeback_timeouts,
-            )
-        });
-
         let (acked_ids, per_ack_elapsed, total, ack_metrics) =
             client_thread.join().expect("client thread must not panic");
 
@@ -621,7 +657,8 @@ mod unix {
         }
         assert!(
             total < timeout.as_duration(),
-            "total time from the first send to the last ack {total:?} must be under the {:?} timeout",
+            "total time from before the server started to the last ack {total:?} must be under \
+             the {:?} timeout",
             timeout.as_duration()
         );
 
@@ -641,6 +678,12 @@ mod unix {
     /// TASK-85.1・REPAIR-5・IO-1・#119（3.5 節の追加シナリオ）:
     /// `batch_size = 1` で 1 件ずつ送受信を往復させても、各往復がタイムアウト
     /// 設定の範囲内に完了する（1 リクエストごとの応答性の確認）。
+    ///
+    /// 接続は [`connect_and_accept`] でスレッド起動前に確立する。最初の往復
+    /// の起点はサーバースレッドの起動より前に取った `started` とし、サーバー
+    /// の最初の受信待ち（起動から id 0 の到着まで）を id 0 の往復の計測窓に
+    /// 収める（`repair5_all_acks_arrive_within_timeout_default_batch_64` と
+    /// 同じ理由。codex P2 指摘・#1124）。
     #[test]
     fn repair5_each_request_ack_arrives_within_timeout_batch_1() {
         let timeout = response_timeout();
@@ -654,16 +697,36 @@ mod unix {
 
         const REQUEST_COUNT: u64 = 16;
 
-        let connect_path = socket_path.clone();
+        let (stream, mut connection) = connect_and_accept(&mut server, &socket_path, timeout);
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&output_path)
+            .expect("must open output file");
+        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+
+        let config = BatchConfig::new(1).expect("1 must be a valid batch size");
+        let writeback_timeouts = WritebackTimeouts {
+            recv: timeout,
+            send: timeout,
+        };
+        // サーバースレッドの起動より前に取る（本関数 doc 参照）。
+        let started = Instant::now();
+        let server_thread = std::thread::spawn(move || {
+            serve_connection(&mut connection, config, &mut sink, writeback_timeouts)
+        });
+
         let client_thread = std::thread::spawn(move || {
-            let stream = connect(&connect_path);
             let transport = UnixStreamTransport::new(stream);
             let mut client =
                 PipelineClient::new(transport, InFlightLimit::default(), NoopSendObserver);
 
             let mut acked_ids = Vec::with_capacity(REQUEST_COUNT as usize);
             for id in 0..REQUEST_COUNT {
-                let round_started = Instant::now();
+                // id 0 はサーバー起動前の `started` を起点にする（本関数 doc 参照）。
+                let round_started = if id == 0 { started } else { Instant::now() };
                 client
                     .send(FrameKind::Write, &id.to_le_bytes(), timeout)
                     .unwrap_or_else(|err| panic!("send must succeed for id {id}: {err}"));
@@ -680,27 +743,6 @@ mod unix {
                 acked_ids.push(receipt.request().id().get());
             }
             (acked_ids, *client.ack_metrics())
-        });
-
-        let mut connection = server
-            .accept(timeout, NoopServerObserver)
-            .expect("server must accept the client connection within the timeout");
-
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&output_path)
-            .expect("must open output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
-
-        let config = BatchConfig::new(1).expect("1 must be a valid batch size");
-        let writeback_timeouts = WritebackTimeouts {
-            recv: timeout,
-            send: timeout,
-        };
-        let server_thread = std::thread::spawn(move || {
-            serve_connection(&mut connection, config, &mut sink, writeback_timeouts)
         });
 
         let (acked_ids, ack_metrics) = client_thread.join().expect("client thread must not panic");
@@ -726,22 +768,20 @@ mod unix {
             UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
                 .expect("bind must succeed on a private, empty path");
 
-        let connect_path = socket_path.clone();
-        let client_thread = std::thread::spawn(move || {
-            let stream = connect(&connect_path);
-            let mut transport = UnixStreamTransport::new(stream);
-            let first = transport.recv_frame(response_timeout());
-            let second = transport.recv_frame(response_timeout());
-            (first, second, transport.poisoned)
-        });
-
-        // accept してすぐに接続を落とし、client 側を EOF させる。
-        let connection = server
-            .accept(response_timeout(), NoopServerObserver)
-            .expect("server must accept the client connection within the timeout");
+        // 接続を確立してから（[`connect_and_accept`]）、client が読み始める前に
+        // サーバー側の接続を落とし、client 側を確定的に EOF させる。以前は
+        // client スレッドの `recv_frame` とサーバー側の `accept` を並行に
+        // 走らせていたため、client スレッドの起動が遅れると `accept` が先に
+        // タイムアウトし得た（codex P2 指摘・#1124）。EOF 済みのソケットに
+        // 対する `recv_frame` は即座に返るため、スレッドを分ける必要もない。
+        let (stream, connection) =
+            connect_and_accept(&mut server, &socket_path, response_timeout());
         drop(connection);
 
-        let (first, second, poisoned) = client_thread.join().expect("client thread must not panic");
+        let mut transport = UnixStreamTransport::new(stream);
+        let first = transport.recv_frame(response_timeout());
+        let second = transport.recv_frame(response_timeout());
+        let poisoned = transport.poisoned;
         assert_eq!(
             first
                 .expect_err("recv_frame must fail once the peer has closed")
@@ -777,14 +817,18 @@ mod unix {
     /// 呼ばない。これにより「リクエストは届いたが ACK が返らなかった」ことを
     /// 「リクエスト自体が届かなかった」ことと区別できる。
     ///
-    /// `server` は呼び出し元が `bind` 済みのものを受け取る（bind をこの
-    /// スレッド内で行うと、client 側の `connect`（[`CONNECT_RETRY_BUDGET`]
-    /// までリトライ）が `bind` / `listen` の完了とレースし、`accept` が
-    /// 追いつくまでの遅延が watchdog の期限に含まれない、という誤検出の
-    /// 原因になっていた（cursor Bugbot 指摘・codex P2 指摘・#1124）。
-    /// `bind` は `UnixListener::bind` の時点で `listen()` 済みのため、
-    /// 呼び出し元で先に bind しておけば client の `connect` はサーバー
-    /// スレッドの起動タイミングに関わらず成功できる）。
+    /// `connection` は呼び出し元が [`connect_and_accept`] で accept 済みの
+    /// ものを受け取り、呼び出し元は client スレッドの準備段階（全件の送信）
+    /// の完了通知を受け取った**後に**本関数を呼ぶ。したがって本スレッドが
+    /// `recv_frame(timeout)` を始める時点で `expected_count` 件のフレームは
+    /// すでにソケットのバッファに届いており、各受信は即座に返る
+    /// （client が先に接続を閉じても、バッファ済みのデータは EOF より前に
+    /// 読める）。サーバー側の `accept` / 受信待ちを client の準備段階と
+    /// 並行に走らせると、client スレッドの起動・送信が `timeout` 以上
+    /// 遅れた場合（準備段階の予算 `REQUEST_COUNT * timeout +
+    /// HANG_GUARD_GRACE` の範囲内でも）サーバーが先にタイムアウトし、ACK
+    /// 未送信の検証とは無関係にテストが失敗し得た（cursor Bugbot 指摘・
+    /// codex P2 指摘・#1124）。
     ///
     /// `done_rx` で呼び出し元（テスト本体）からの完了通知を待ってから
     /// `connection` を drop する（サーバー側でさらに `recv_frame(timeout)`
@@ -801,16 +845,12 @@ mod unix {
     /// 対応・#1124: 固定時間の先行タイマーに依存せず、完了通知まで接続を
     /// 維持する）。
     fn spawn_silent_server(
-        mut server: UdsServer<NoopServerObserver>,
+        mut connection: UdsConnection<NoopServerObserver>,
         timeout: IoTimeout,
         expected_count: usize,
         done_rx: mpsc::Receiver<()>,
     ) -> std::thread::JoinHandle<Vec<SilentServerRequest>> {
         std::thread::spawn(move || {
-            let mut connection = server
-                .accept(timeout, NoopServerObserver)
-                .expect("server must accept the client connection within the timeout");
-
             let mut received = Vec::with_capacity(expected_count);
             for _ in 0..expected_count {
                 let frame = connection
@@ -861,10 +901,9 @@ mod unix {
     /// こと）の解釈は本ファイル冒頭の `//!` を参照。本テストは main 側で
     /// 三段の watchdog を持つ:
     ///
-    /// 1. 準備段階（`connect` の最大 [`CONNECT_RETRY_BUDGET`] 秒リトライ＋
-    ///    3 件の送信。各送信は最大 `timeout` まで掛かり得る）は readiness
-    ///    通知を `CONNECT_RETRY_BUDGET + REQUEST_COUNT * timeout +
-    ///    HANG_GUARD_GRACE`（テスト開始時刻起点の絶対期限）まで待つ
+    /// 1. 準備段階（3 件の送信。各送信は最大 `timeout` まで掛かり得る）は
+    ///    readiness 通知を `REQUEST_COUNT * timeout + HANG_GUARD_GRACE`
+    ///    （client スレッド起動前の時刻を起点にした絶対期限）まで待つ
     /// 2. ACK 待ちへの遷移（readiness 送信から transport の `recv_frame` が
     ///    `deadline` を確定するまで）は、別チャネルの wait_started 通知を
     ///    準備段階の絶対期限 + `HANG_GUARD_GRACE` まで待つ
@@ -880,6 +919,13 @@ mod unix {
     /// 時刻を ACK 待ち段階の起点にしていた版では、`recv_ack` 呼び出しまでの
     /// スケジューリング遅延が期限を食い潰し得たため、3. の起点を
     /// transport 内の待機開始時点へ移した（codex P2 指摘・#1124）。
+    ///
+    /// サーバー側の待ちはいずれも、それが依存する client 側の工程の完了後に
+    /// 始める（codex P2 指摘・#1124）: `connect` / `accept` は client
+    /// スレッドの起動前に [`connect_and_accept`] で済ませ、ACK を返さない
+    /// サーバー（[`spawn_silent_server`]）は準備段階の完了通知を受け取った
+    /// 後に起動する。これにより、準備段階の予算内の遅延でサーバーの
+    /// `accept` / 受信が先にタイムアウトすることがない。
     #[test]
     fn repair5_missing_ack_is_detected_as_timeout() {
         let timeout = response_timeout();
@@ -888,11 +934,12 @@ mod unix {
 
         const REQUEST_COUNT: u64 = 3;
 
-        let server = UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
-            .expect("bind must succeed on a private, empty path");
-
-        let (done_tx, done_rx) = mpsc::channel::<()>();
-        let server_thread = spawn_silent_server(server, timeout, REQUEST_COUNT as usize, done_rx);
+        // `server`（listener）はテスト終了まで保持する（accept 済みの接続とは
+        // 独立だが、途中で drop してソケットファイルを片付ける理由もない）。
+        let mut server =
+            UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
+                .expect("bind must succeed on a private, empty path");
+        let (stream, connection) = connect_and_accept(&mut server, &socket_path, timeout);
 
         // 準備段階の完了通知（readiness）と ACK 待ちの開始通知（wait_started）
         // は別チャネルに分ける（codex P2 指摘・#1124）。readiness は準備段階
@@ -903,12 +950,11 @@ mod unix {
         // 先に発火し得た。
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (wait_started_tx, wait_started_rx) = mpsc::channel::<()>();
-        let connect_path = socket_path.clone();
         // 準備段階の期限の起点。client スレッドの起動より前に取り、スレッド
-        // 起動の遅延も準備段階の予算に含める。
+        // 起動の遅延も準備段階の予算に含める（`connect` は上で完了済みのため
+        // 予算に含めない）。
         let setup_started = Instant::now();
         let client_thread = std::thread::spawn(move || {
-            let stream = connect(&connect_path);
             // wait_started は transport が `recv_frame` の `deadline` を確定
             // した直後に送る（`UnixStreamTransport` の doc 参照）。client
             // スレッド側で `recv_ack` の直前に送るより後ろ、すなわち実際の
@@ -970,19 +1016,15 @@ mod unix {
             )
         });
 
-        // hang guard（watchdog）その 1: 準備段階（connect のリトライ＋
-        // REQUEST_COUNT 件の送信）の完了通知を、connect のリトライ予算 +
-        // 送信分の予算（各 send は最大 `timeout` まで掛かり得るため
-        // `REQUEST_COUNT * timeout` を加算する）+ 猶予を上限に待つ
-        // （本関数 doc 参照。critical path 上に上限なしの recv() を置かない）。
-        // 送信分を含めていないと、`connect` 自体は速く終わっても 3 件の送信が
-        // 詰まった場合に準備段階の完了通知が `CONNECT_RETRY_BUDGET +
-        // HANG_GUARD_GRACE` を超えて遅れ、実際にはまだ送信中（＝ハングでは
-        // ない）にもかかわらず watchdog が誤って「準備段階がハングした」と
-        // 判定し得る（codex P2 指摘・#1124）。
-        let ready_budget = CONNECT_RETRY_BUDGET
-            + timeout.as_duration() * (REQUEST_COUNT as u32)
-            + HANG_GUARD_GRACE;
+        // hang guard（watchdog）その 1: 準備段階（REQUEST_COUNT 件の送信）の
+        // 完了通知を、送信分の予算（各 send は最大 `timeout` まで掛かり得る
+        // ため `REQUEST_COUNT * timeout`）+ 猶予を上限に待つ（本関数 doc
+        // 参照。critical path 上に上限なしの recv() を置かない）。送信分を
+        // 含めていないと、3 件の送信が詰まった場合に実際にはまだ送信中
+        // （＝ハングではない）にもかかわらず watchdog が誤って「準備段階が
+        // ハングした」と判定し得る（codex P2 指摘・#1124）。`connect` は
+        // client スレッドの起動前に完了済みのため予算に含めない。
+        let ready_budget = timeout.as_duration() * (REQUEST_COUNT as u32) + HANG_GUARD_GRACE;
         let ready_deadline = setup_started + ready_budget;
         if ready_rx
             .recv_timeout(ready_deadline.saturating_duration_since(Instant::now()))
@@ -990,24 +1032,33 @@ mod unix {
         {
             // client スレッドが準備段階中に panic した場合は送信側が drop
             // されて即座にここへ来る。panic メッセージをそのまま伝えるため
-            // join 結果を確認するが、join() を直接無期限に呼ぶと connect /
-            // 送信が真にハングしているケースで join() 自体が無期限停止し、
+            // join 結果を確認するが、join() を直接無期限に呼ぶと送信が真に
+            // ハングしているケースで join() 自体が無期限停止し、
             // REPAIR-5（有限時間でのハング検出）に違反する（codex レビュー
             // P0 指摘・#1124）。`join_within` で上限付きにする。
             match join_within(client_thread, HANG_GUARD_GRACE) {
                 Some(Ok(_)) => panic!(
                     "client thread finished without signalling readiness within \
-                     {ready_budget:?} (connect + send setup did not complete in time)"
+                     {ready_budget:?} (send setup did not complete in time)"
                 ),
                 Some(Err(payload)) => std::panic::resume_unwind(payload),
                 None => panic!(
                     "client thread did not finish within {ready_budget:?} + \
                      {HANG_GUARD_GRACE:?} after readiness notification was not \
-                     received; connect/send setup appears hung \
+                     received; send setup appears hung \
                      (timeout detection is not working)"
                 ),
             }
         }
+
+        // 準備段階（全件の送信）が完了したので、ACK を返さないサーバーを
+        // ここで起動する。送信済みのフレームはソケットのバッファに届いて
+        // いるため、サーバーの `recv_frame(timeout)` は即座に返り、client の
+        // 準備段階の予算内の遅延でサーバーが先にタイムアウトすることはない
+        // （[`spawn_silent_server`] doc 参照。codex P2 指摘・#1124）。
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server_thread =
+            spawn_silent_server(connection, timeout, REQUEST_COUNT as usize, done_rx);
 
         // hang guard（watchdog）その 2: readiness から ACK 待ち開始
         // （transport の `recv_frame` が `deadline` を確定した時点）までの
@@ -1113,10 +1164,11 @@ mod unix {
         assert_eq!(send_after_poison_code, IoErrorCode::Unavailable);
         assert_eq!(ack_metrics_after_second_call.rejected_poisoned_count(), 1);
 
-        // サーバー側: 完了を通知して受信内容を回収する（サーバー受信自体は
-        // クライアントの ACK 待ちタイムアウトより先に、REQUEST_COUNT 件の
-        // 受信が完了しているはず。通知が既に受理不能でも送信失敗は無視する
-        // ― サーバースレッドは自身の recv_timeout の上限で終了する）。
+        // サーバー側: 完了を通知して受信内容を回収する（サーバーは準備段階の
+        // 完了後に起動し、バッファ済みの REQUEST_COUNT 件を読むだけなので、
+        // client の ACK 待ち（`timeout` 秒）の間に受信を終えているはず。
+        // 通知が既に受理不能でも送信失敗は無視する ― その場合サーバー
+        // スレッドは受信の失敗で既に終了している）。
         //
         // `done_tx.send(())` はサーバースレッドが `done_rx.recv()` へ実際に
         // 到達したことまでは保証しない。受信処理側が何らかの理由で停止して

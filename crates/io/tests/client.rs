@@ -36,27 +36,21 @@ impl FrameSender for RecordingSender {
 
 /// IO-1・TASK-12.1: 未 ACK 件数が上限に達すると `send` は
 /// `IoErrorCode::ResourceExhausted` を返し、それ以上未 ACK 件数は増えない
-/// （`queue().len()` が上限のまま変わらないことで確認する）。
-///
-/// # `into_inner` が未 ACK 保持中にトランスポートを返さないことについて
-/// （TASK-12.1・#73 codex レビュー指摘対応。P1）
-///
-/// 未 ACK の枠を解放する [`PipelineClient::remove_in_flight`] は `pub(crate)`
-/// （上記 P0 指摘対応）のため、本ファイルのような crate 外の結合試験からは
-/// キューを空にできない。そのため本テストでは、送信済みバイト列を
-/// `into_inner` 経由で取り出す代わりに `queue().len()` で未 ACK 件数のみを
-/// 確認する。未 ACK が残ったままの `into_inner` が `Unavailable` を返し
-/// トランスポートを渡さないことの確認は crate 内部の `src/client.rs` の
-/// `io1_pipeline_client_into_inner_rejects_unacked_requests` が担う。
+/// （`queue().len()` が上限のまま変わらないことで確認する）。上限到達後に
+/// [`PipelineClient::acknowledge`]（TASK-12.1・#73 codex 再指摘対応。P1）で
+/// すべての枠を解放すれば `into_inner` がトランスポートを返し、送信済み
+/// バイト列を確認できる。
 #[test]
 fn io1_public_api_pipeline_client_rejects_when_limit_reached() {
     let limit = InFlightLimit::new(3).expect("3 must be a valid limit");
     let mut client = PipelineClient::new(RecordingSender::default(), limit);
 
+    let mut ids = Vec::new();
     for byte in 0u8..3 {
-        client
+        let request = client
             .send(&write_frame(byte), test_timeout())
             .expect("send must succeed while under the limit");
+        ids.push(request.id());
     }
 
     let err = client
@@ -65,16 +59,100 @@ fn io1_public_api_pipeline_client_rejects_when_limit_reached() {
     assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
 
     assert_eq!(client.queue().len(), 3);
+
+    for id in ids {
+        client
+            .acknowledge(id)
+            .expect("acknowledging a verified id must succeed");
+    }
+
+    let sent_bytes: Vec<u8> = client
+        .into_inner()
+        .expect("client with a drained queue must yield its transport")
+        .sent
+        .iter()
+        .map(|frame| frame.payload()[0])
+        .collect();
+    assert_eq!(sent_bytes, vec![0, 1, 2]);
 }
 
-// IO-1・TASK-12.1（#73 codex 指摘対応。P0）: 未 ACK 枠の解放
-// （`PipelineClient::remove_in_flight`）は `pub(crate)` に変更済みで、本ファイルの
-// ような crate 外の結合試験からは呼び出せない（公開 API のままだと、ACK を
-// 確認せずに枠を解放でき `InFlightLimit` の上限を無視して送信を続けられてしまう
-// という P0 指摘に対応するため）。解放・再利用フローそのものの検証は crate 内部の
-// `src/client.rs` の `io1_pipeline_client_accepts_after_slot_released` が担う。
-// 以前ここにあった `io1_public_api_pipeline_client_releases_slot_and_keeps_order`
-// は公開 API 経由の解放を前提にしていたため、可視性変更に伴い削除した。
+/// IO-1・TASK-12.1（#73 codex 再指摘対応。P1）: 満杯のあと
+/// [`PipelineClient::acknowledge`] で検証済み ACK の request id を渡して 1 枠
+/// 解放すると、公開 API だけで次の送信が成功し、id は単調増加を続ける。
+#[test]
+fn io1_public_api_pipeline_client_releases_slot_and_keeps_order() {
+    let limit = InFlightLimit::new(2).expect("2 must be a valid limit");
+    let mut client = PipelineClient::new(RecordingSender::default(), limit);
+
+    let first = client
+        .send(&write_frame(1), test_timeout())
+        .expect("1st send must succeed");
+    client
+        .send(&write_frame(2), test_timeout())
+        .expect("2nd send must succeed");
+    client
+        .send(&write_frame(3), test_timeout())
+        .expect_err("3rd send must be rejected while full");
+
+    client
+        .acknowledge(first.id())
+        .expect("acknowledging the verified id must succeed");
+
+    let third = client
+        .send(&write_frame(3), test_timeout())
+        .expect("send must succeed after a slot is released");
+    assert_eq!(third.id().get(), 2);
+
+    let remaining_ids: Vec<u64> = client
+        .queue()
+        .iter()
+        .map(|entry| entry.id().get())
+        .collect();
+    assert_eq!(remaining_ids, vec![1, 2]);
+}
+
+/// IO-1・TASK-12.1（#73 codex 再指摘対応。P1）: 未登録の id・二重に acknowledge
+/// 済みの id は `InvalidArgument` で拒否し、キューの状態を変更しない
+/// （二重解放の防止）。`RequestId` は crate 外から任意の値を作れない
+/// （フィールド非公開）ため、「このクライアントに未登録の id」は、別の
+/// `PipelineClient` で採番させた（値としては重複しうるが、このクライアントの
+/// キューには存在しない）id を使って再現する。
+#[test]
+fn io1_public_api_pipeline_client_acknowledge_rejects_unknown_and_duplicate() {
+    let limit = InFlightLimit::new(2).expect("2 must be a valid limit");
+    let mut client = PipelineClient::new(RecordingSender::default(), limit);
+    let mut other_client = PipelineClient::new(RecordingSender::default(), limit);
+
+    let request = client
+        .send(&write_frame(1), test_timeout())
+        .expect("send must succeed while under the limit");
+    // `other_client` 側で id `0`（`request` と同値）・`1` を採番させ、`client` の
+    // キューには存在しない id `1` を「未登録の id」として使う。
+    other_client
+        .send(&write_frame(9), test_timeout())
+        .expect("other client's 1st send must succeed");
+    let unknown_to_client = other_client
+        .send(&write_frame(10), test_timeout())
+        .expect("other client's 2nd send must succeed");
+    assert_ne!(unknown_to_client.id().get(), request.id().get());
+
+    let unknown_id_err = client
+        .acknowledge(unknown_to_client.id())
+        .expect_err("id unregistered on this client's queue must be rejected");
+    assert_eq!(unknown_id_err.code(), IoErrorCode::InvalidArgument);
+    assert_eq!(client.queue().len(), 1);
+
+    client
+        .acknowledge(request.id())
+        .expect("acknowledging the verified id must succeed");
+    assert!(client.queue().is_empty());
+
+    let duplicate_err = client
+        .acknowledge(request.id())
+        .expect_err("acknowledging the same id twice must be rejected");
+    assert_eq!(duplicate_err.code(), IoErrorCode::InvalidArgument);
+    assert!(client.queue().is_empty());
+}
 
 /// IO-1・TASK-12.1: `InFlightLimit` は `0` と `MAX_IN_FLIGHT_LIMIT` 超過を
 /// `InvalidArgument` として拒否する。

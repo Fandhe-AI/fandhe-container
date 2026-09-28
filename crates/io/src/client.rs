@@ -14,10 +14,12 @@
 //!
 //! # #74（TASK-12.2）との境界
 //!
-//! 本モジュールが持つのは「送信済みで ACK 未受信のリクエストを追跡する」ところまで。
-//! 次の範囲は #74（TASK-12.2）以降が担い、ここでは実装しない（REPAIR-3。スタブの
-//! 明示）:
-//! - ACK フレームの受信・デコードと、request id との対応付け
+//! 本モジュールが持つのは「送信済みで ACK 未受信のリクエストを追跡する」ところと、
+//! 検証済み ACK の request id を渡されたら未 ACK 枠を解放する入口
+//! （[`PipelineClient::acknowledge`]）まで。次の範囲は #74（TASK-12.2）以降が担い、
+//! ここでは実装しない（REPAIR-3。スタブの明示）:
+//! - ACK フレームの受信・デコードと、request id との対応付け（検証した上で
+//!   [`PipelineClient::acknowledge`] を呼ぶのは #74 の責務）
 //! - タイムアウト付きの ACK 待ち・ブロッキング送信 API
 //! - request id のワイヤー表現（ペイロード内レイアウト）。[`RequestId`] は
 //!   クライアントがローカルに振る連番であり、ペイロードには含めない
@@ -263,27 +265,25 @@ impl SendQueue {
         Ok(request)
     }
 
-    /// 指定した id の未 ACK リクエストを取り外す（ACK 受信時に #74 が呼ぶ入口）。
+    /// 指定した id の未 ACK リクエストを取り外す（検証済み ACK に基づく解放。
+    /// TASK-12.1・#73 codex 再指摘対応。P1）。
     ///
     /// `id` はキューには無関係な由来（ACK フレーム。untrusted）でありうるため、
     /// `position` と `Option` 経由で探し、`unwrap`・`expect`・添字アクセスは使わない。
-    /// 未登録の id を渡された場合は [`IoErrorCode::InvalidArgument`] を返し、
-    /// キューの状態を変更しない。
+    /// 未登録の id・すでに解放済みの id を渡された場合は
+    /// [`IoErrorCode::InvalidArgument`] を返し、キューの状態を変更しない
+    /// （二重解放の防止）。
     ///
-    /// # 公開範囲（TASK-12.1・#73 codex 指摘対応。P0）
+    /// # 公開範囲と ACK 検証の責務（TASK-12.1・#73 codex 再指摘対応。P1）
     ///
-    /// `pub(crate)` に留め、crate 外へは公開しない。`SendQueue` は
-    /// [`crate::client`] の外から `pub use` で参照できる型だが、枠の解放は
-    /// 「ACK を確認できた側だけが行える」よう、[`PipelineClient::send`] が返す
-    /// [`RequestId`] をそのまま外部から渡して解放できないようにする（ACK 未受信の
-    /// まま `InFlightLimit` を回避して送信し続けられる、という P0 指摘への対応）。
-    /// ACK フレームを検証してから取り外す実装は #74（TASK-12.2）が本 crate 内に
-    /// 追加する（REPAIR-3。それまでは crate 内のテストのみが呼び出す）。
-    // `pub(crate)` の唯一の呼び出し元は #74（TASK-12.2）が追加する ACK 処理だが、
-    // 本 PR（#73）時点ではまだ実装されておらず、テスト以外から呼ばれないため
-    // `dead_code` を明示的に許容する（REPAIR-3: スタブであることの明示）。
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn remove(&mut self, id: RequestId) -> Result<InFlightRequest, IoError> {
+    /// 公開 API だが、「渡された `id` がすでに検証済みの ACK に対応する」ことは
+    /// 呼び出し元の責務であり、本メソッド自身は ACK フレームの検証を行わない
+    /// （キューに存在する id かどうかの整合性チェックのみ行う）。ACK フレームの
+    /// 受信・デコード・ペイロード検証（request id が実在の未 ACK リクエストに
+    /// 対応するかを含む）は #74（TASK-12.2）の範囲で、#74 が受信した検証済み ACK
+    /// の request id を使ってこの入口を呼ぶことを想定する（REPAIR-3。それまでは
+    /// 呼び出し元が ACK を解釈してこのメソッドを呼ぶ）。
+    pub fn remove(&mut self, id: RequestId) -> Result<InFlightRequest, IoError> {
         let position = self
             .entries
             .iter()
@@ -729,23 +729,25 @@ where
         });
     }
 
-    /// 指定した id の未 ACK リクエストを取り外す（#74 の ACK 処理から呼ばれる入口）。
+    /// 検証済み ACK の request id で未 ACK 枠を解放する（IO-1・TASK-12.1・#73
+    /// codex 再指摘対応。P1）。
     ///
-    /// # 公開範囲（TASK-12.1・#73 codex 指摘対応。P0）
+    /// # ACK 検証の責務（TASK-12.2・#74 との境界）
     ///
-    /// `pub(crate)` に留める。[`Self::send`] が返す [`RequestId`] を外部の
-    /// 呼び出し元がそのままここへ渡せると、ACK を確認せずに未 ACK 枠を解放でき、
-    /// `InFlightLimit` を実質的に無視して送信を続けられてしまう
-    /// （`InFlightLimit` は「未 ACK のまま送れる件数」の上限であり、ACK 未受信の
-    /// 枠を勝手に解放されると上限の意味がなくなる）。ACK フレームを受信・検証して
-    /// から取り外す経路は #74（TASK-12.2）が本 crate 内（[`crate::client`] モジュール
-    /// 自身か、そこから呼ばれる同一 crate 内のコード）に実装し、その経路だけが
-    /// この関数を呼べるようにする（REPAIR-3。それまでは crate 内のテストのみが
-    /// 呼び出す）。
-    // `remove` と同様、#74（TASK-12.2）の ACK 処理が実装されるまでテスト以外の
-    // 呼び出し元がなく `dead_code` になるため、明示的に許容する（REPAIR-3）。
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn remove_in_flight(&mut self, id: RequestId) -> Result<InFlightRequest, IoError> {
+    /// ACK フレームの受信・デコード・ペイロード検証（request id が実在の未 ACK
+    /// リクエストに対応するかを含む）は #74（TASK-12.2）の範囲で、本メソッドは
+    /// その検証を行わない。契約は「呼び出し元がすでに検証済みの request id を
+    /// 渡す」ことであり、#74 が受信した検証済み ACK の request id でこの API を
+    /// 呼ぶ想定。現時点ではまだ ACK の受信・検証経路がないため、呼び出し元が
+    /// 自分で ACK を解釈してこの API を呼ぶ（REPAIR-3。スタブの明示）。
+    ///
+    /// 未登録の id・すでに解放済み（二重 acknowledge）の id は
+    /// [`IoErrorCode::InvalidArgument`] で拒否し、キューの状態を変更しない
+    /// （二重解放の防止）。`self.poisoned` はここでは変更しない。失効済みの
+    /// 接続でも、送信結果が不明なまま残っていたリクエストの遅延 ACK を
+    /// 受け取ってキューを空にすることは許すが（後始末として無害）、接続自体は
+    /// 引き続き失効したまま（[`Self::is_poisoned`]）で、新しい送信は拒否され続ける。
+    pub fn acknowledge(&mut self, id: RequestId) -> Result<InFlightRequest, IoError> {
         self.queue.remove(id)
     }
 }
@@ -887,7 +889,7 @@ mod tests {
         // 枠を ACK 済み相当として解放しておく。
         for id in [0u64, 1, 2] {
             client
-                .remove_in_flight(RequestId(id))
+                .acknowledge(RequestId(id))
                 .expect("removing an acknowledged id must succeed");
         }
 
@@ -928,7 +930,7 @@ mod tests {
         // ACK 済み相当として解放しておく。
         for id in [0u64, 1] {
             client
-                .remove_in_flight(RequestId(id))
+                .acknowledge(RequestId(id))
                 .expect("removing an acknowledged id must succeed");
         }
 
@@ -960,7 +962,7 @@ mod tests {
             .expect_err("3rd send must be rejected while full");
 
         client
-            .remove_in_flight(first.id())
+            .acknowledge(first.id())
             .expect("removing the released id must succeed");
 
         let third = client
@@ -1097,7 +1099,7 @@ mod tests {
     }
 
     /// IO-1・TASK-12.1（#73 codex レビュー指摘対応。P1 の回帰確認）: 送信済みの
-    /// リクエストがすべて `remove_in_flight`（#74 の ACK 処理が呼ぶ想定の入口）で
+    /// リクエストがすべて `acknowledge`（#74 の ACK 処理が呼ぶ想定の入口）で
     /// 解放され、未 ACK 件数が `0` に戻っていれば `into_inner` は通常どおり
     /// トランスポートを返す（不要に厳しくなっていないことの確認）。
     #[test]
@@ -1109,7 +1111,7 @@ mod tests {
             .send(&write_frame(1), test_timeout())
             .expect("send must succeed while under the limit");
         client
-            .remove_in_flight(request.id())
+            .acknowledge(request.id())
             .expect("removing the acknowledged id must succeed");
         assert!(client.queue().is_empty());
 

@@ -323,13 +323,17 @@ fio-bench-selftest: ## fio ベンチスクリプトの自己テスト（REPAIR-1
 
 # 実機での run モード実行（fio・GNU coreutils の timeout が必要。root 権限・
 # /dev/kvm は不要）。TARGET_DIR 未指定時は案内を出して止める。
+# make 変数はレシピのシェルへ文字列として展開されるため、二重引用符で囲むだけでは
+# 値中の `"`・`$(...)`・バッククォートがシェルに解釈される。単一引用符で囲み、値中の
+# `'` を `'\''` に置換してから渡す（値の検証自体はスクリプト側の許可リストが担う）。
+fio_bench_sq = '$(subst ','\'',$(1))'
 .PHONY: fio-bench
 fio-bench: ## fio 4K ランダム write ベンチを実行する（要 fio・実機。TARGET_DIR/LABEL 必須）
-	@if [ -z "$(TARGET_DIR)" ] || [ -z "$(LABEL)" ]; then \
+	@if [ -z $(call fio_bench_sq,$(TARGET_DIR)) ] || [ -z $(call fio_bench_sq,$(LABEL)) ]; then \
 		echo "usage: make fio-bench TARGET_DIR=<dir> LABEL=<label> [RUNTIME=<seconds>]" >&2; \
 		exit 2; \
 	fi
-	bash scripts/fio-randwrite-4k.sh --target-dir "$(TARGET_DIR)" --label "$(LABEL)" --runtime "$(or $(RUNTIME),30)"
+	bash scripts/fio-randwrite-4k.sh --target-dir $(call fio_bench_sq,$(TARGET_DIR)) --label $(call fio_bench_sq,$(LABEL)) --runtime $(call fio_bench_sq,$(or $(RUNTIME),30))
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）

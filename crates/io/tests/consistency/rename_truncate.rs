@@ -70,11 +70,12 @@ fn reopen_sink(path: &Path) -> AppendFileSink {
 /// の穴ができる。これは非 append モードでの現在の実装の既知の限界であり
 /// （`AppendFileSink::new` のドキュメント参照）、
 /// `io4_truncate_live_session_normal_mode_post_truncate_records_intact_at_tail`
-/// （T6）が、この穴を含むファイル全体の具体的なバイト列との完全一致で固定
-/// している（将来 `AppendFileSink` が現在の EOF に追随するよう修正された
-/// 場合は T6 の期待値を更新すること）。本関数（T4）はその対比として、
-/// `append(true)` で開くと各 `write_all` が OS レベルで常に現在の EOF に
-/// 着地し、この穴を避けられることを固定する）。
+/// （T6）はこの穴を「修正されるべき既知の不具合」として扱い、穴なしの理想値を
+/// 主目的の期待値としつつ、修正が入るまでの間だけ現行実装が生む穴あり出力も
+/// 許容する（穴を成功条件として固定はしない。T6 のドキュメンテーション
+/// コメント参照）。本関数（T4）はその対比として、`append(true)` で開くと
+/// 各 `write_all` が OS レベルで常に現在の EOF に着地し、この穴を避けられる
+/// ことを固定する）。
 fn append_mode_sink(path: &Path) -> AppendFileSink {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -606,24 +607,32 @@ fn io4_truncate_live_session_append_mode_lands_at_new_eof() {
 }
 
 /// IO-4・REPAIR-6・TASK-14.2（codex/review 指摘・PR #1125 対応。
-/// `PRRT_kwDOUq78ts6mvTBb` への対応）: `create_sink`（通常モード、非
+/// `PRRT_kwDOUq78ts6mvhyC` への対応）: `create_sink`（通常モード、非
 /// `O_APPEND`）で開いたライブセッション中に、別ハンドルで `set_len(0)` する。
 ///
 /// 現在の [`AppendFileSink::new`] は一度だけ現在の EOF（`N*BODY_LEN`）へ
 /// `seek` し、以後の `write_all` はその古いオフセットへ書き込み続けるため
 /// （ドキュメント参照）、外部 truncate 後もカーソルが追随せず、
 /// `[0, N*BODY_LEN)` がゼロ埋めの穴として残る（POSIX `write(2)`・Windows
-/// `WriteFile` いずれも決定的）。モジュール doc が約束する「ファイル内容の
-/// 完全一致」（IO-4・REPAIR-6・#81 受入基準）を満たすため、この穴を含む
-/// 現在のファイル全体を具体的なバイト列（ゼロ埋め `N*BODY_LEN` バイト＋
-/// truncate 後の M 件）と完全一致で検証する。末尾 M 件だけの比較では
-/// この穴が残っても成功してしまい、アサーション弱体化になる
+/// `WriteFile` いずれも決定的）。この穴は「修正されるべき既知の不具合」で
+/// あり、`AppendFileSink` が現在の EOF に追随するよう修正されれば消える
+/// はずのものなので、それを成功条件として固定してはならない
+/// （codex/review 指摘。将来の修正で本テストが逆に失敗する事態を避ける）。
+///
+/// 一方でモジュール doc が約束する「ファイル内容の完全一致」
+/// （IO-4・REPAIR-6・#81 受入基準）を保つには、末尾 M 件だけの比較で
+/// 穴の有無を無視するのもアサーション弱体化になる
 /// （AGENTS.md「アサーション弱体化による回帰検出の後退」P0）。
 ///
-/// 将来 [`AppendFileSink`] が現在の EOF に追随するよう修正され、この穴が
-/// 生じなくなった場合は、このケースの期待値（`expected` の構築）を
-/// 更新すること（`append_mode_sink`（T4）はこの穴を避けられることの
-/// 対比になる）。
+/// そこで、穴が生じない理想的な出力（`expected`。`AppendFileSink` が EOF
+/// に追随するよう修正された後の唯一の正解）を主目的の期待値としつつ、
+/// その修正が入るまでの間だけ、現行実装が決定的に生む「ゼロ埋め穴＋末尾に
+/// 正しい M 件」という具体的なバイト列（`known_defect_tolerated_until_eof_tracking_fix`）
+/// も許容する。いずれのバイト列とも一致しない出力（部分的な穴・レコードの
+/// ずれ・破損等）は引き続き失敗として検出する。`AppendFileSink` が EOF に
+/// 追随するよう修正されたら、この関数から `known_defect_tolerated_until_eof_tracking_fix`
+/// の分岐を削除し、`expected` との単純な `assert_eq!` に戻すこと
+/// （`append_mode_sink`（T4）はこの穴を避けられることの対比になる）。
 #[test]
 fn io4_truncate_live_session_normal_mode_post_truncate_records_intact_at_tail() {
     const BODY_LEN: usize = 16;
@@ -653,22 +662,37 @@ fn io4_truncate_live_session_normal_mode_post_truncate_records_intact_at_tail() 
     let report = session.finish();
     assert_eq!(report.stats.acks_sent, u64::from(N + M));
 
-    // `create_sink` は非 append モードで、`AppendFileSink::new` が truncate
-    // 前の EOF（`N*BODY_LEN`）へ一度だけ seek しているため、外部 truncate 後
-    // の書き込みもその古いオフセットへ着地し、`[0, N*BODY_LEN)` がゼロ埋め
-    // の穴として残る（上記ドキュメンテーションコメント参照）。この穴を
-    // 含めてファイル全体を具体的なバイト列と完全一致で検証する。
-    let mut expected = vec![0u8; N as usize * BODY_LEN];
-    expected.extend(records(0, N..N + M, BODY_LEN));
+    // 理想値（主目的の期待値）: 穴なしで、truncate 後の M 件だけが残る。
+    // `AppendFileSink` が現在の EOF に追随するよう修正されれば、実際の出力は
+    // 常にこちらと一致するようになるはずの唯一の正解。
+    let expected = records(0, N..N + M, BODY_LEN);
+
+    // 既知の不具合（修正が入るまでの間だけ許容する、もう一方の具体的な
+    // バイト列）: `create_sink` は非 append モードで、`AppendFileSink::new`
+    // が truncate 前の EOF（`N*BODY_LEN`）へ一度だけ seek しているため、
+    // 外部 truncate 後の書き込みもその古いオフセットへ着地し、
+    // `[0, N*BODY_LEN)` がゼロ埋めの穴として残る（上記ドキュメンテーション
+    // コメント参照）。この分岐は許容であって成功条件の固定ではない
+    // （`AppendFileSink` が EOF に追随するよう修正されたら削除すること）。
+    let mut known_defect_tolerated_until_eof_tracking_fix = vec![0u8; N as usize * BODY_LEN];
+    known_defect_tolerated_until_eof_tracking_fix.extend(records(0, N..N + M, BODY_LEN));
 
     let actual = std::fs::read(&path).expect("must read file");
-    assert_eq!(
-        actual, expected,
-        "current AppendFileSink implementation must reproduce the known \
-         zero-fill hole ([0, N*BODY_LEN)) followed by the byte-exact \
-         post-truncate ACKed records at EOF (IO-4/REPAIR-6); update this \
-         expected value if AppendFileSink is changed to track the current \
-         EOF after an external truncate"
+    if actual == known_defect_tolerated_until_eof_tracking_fix && actual != expected {
+        eprintln!(
+            "io4_truncate_live_session_normal_mode_post_truncate_records_intact_at_tail: \
+             current AppendFileSink still reproduces the known zero-fill hole \
+             ([0, N*BODY_LEN)); this tolerance branch must be removed once \
+             AppendFileSink tracks the current EOF after an external truncate"
+        );
+    }
+    assert!(
+        actual == expected || actual == known_defect_tolerated_until_eof_tracking_fix,
+        "file must be either the ideal post-EOF-tracking-fix output (no hole) \
+         or the currently-known zero-fill-hole output, byte-exact; got neither.\n\
+         expected (ideal): {expected:?}\n\
+         known_defect_tolerated_until_eof_tracking_fix: {known_defect_tolerated_until_eof_tracking_fix:?}\n\
+         actual: {actual:?}"
     );
 }
 

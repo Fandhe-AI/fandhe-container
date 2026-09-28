@@ -67,8 +67,8 @@ fn reopen_sink(path: &Path) -> AppendFileSink {
 /// （T4 専用）。`append(true)` では各 `write_all` が OS レベルで常に現在の
 /// EOF に着地する。通常モード（`create_sink`。非 `O_APPEND`）でも
 /// [`AppendFileSink`] の `write_batch` がバッチごとに現在の EOF へ位置合わせ
-/// するため、バッチの合間の外部 truncate 後に穴はできない（T6 で検証）。
-/// T4 と T6 は、開き方によらず truncate 後の書き込みが新しい EOF に着地する
+/// するため、バッチの合間の外部 truncate 後に穴はできない（T5 で検証）。
+/// T4 と T5 は、開き方によらず truncate 後の書き込みが新しい EOF に着地する
 /// ことを対で確認する。
 fn append_mode_sink(path: &Path) -> AppendFileSink {
     let file = std::fs::OpenOptions::new()
@@ -142,7 +142,7 @@ fn records(client: u16, seqs: std::ops::Range<u32>, body_len: usize) -> Vec<u8> 
 // rename ケース（R1〜R5）
 // ---------------------------------------------------------------------
 
-/// IO-4・REPAIR-6・TASK-14.2: セッション終了後に `rename(a → b)` し、次の
+/// IO-4・REPAIR-6・TASK-14.2（R1）: セッション終了後に `rename(a → b)` し、次の
 /// セッションで `b` へ追記する。`b` が旧セッション分＋新セッション分の
 /// 全件と完全一致し、`a` が存在しないことを確認する。
 #[test]
@@ -182,7 +182,7 @@ fn io4_rename_between_sessions_appends_to_renamed_file() {
     assert!(!a_path.exists());
 }
 
-/// IO-4・REPAIR-6・TASK-14.2: ライブセッション中に、開いているファイルを
+/// IO-4・REPAIR-6・TASK-14.2（R2）: ライブセッション中に、開いているファイルを
 /// 移動元として `rename(a → b)` する（Rust std の既定 `share_mode` は
 /// `FILE_SHARE_DELETE` を含むため Windows でも成功する見込み。`tests/
 /// consistency.rs`「実行する OS の方針」参照）。書き込みはパスではなく開いた
@@ -223,20 +223,28 @@ fn io4_rename_live_session_writes_follow_open_handle() {
     assert!(!a_path.exists());
 }
 
-/// IO-4・REPAIR-6・TASK-14.2: 既存ファイル（`target.bin`。別のバイト列で
-/// 事前作成）へ、閉じた状態の一時ファイル（`target.tmp`）を atomic replace
-/// する典型パターン。Windows では開いているファイルへの上書き rename は
-/// 失敗するため、移動先を閉じた状態でだけ実行する（`tests/consistency.rs`
-/// 「実行する OS の方針」参照）。`target` が新しい内容だけで、旧バイト列が
-/// 1 バイトも残らないことを確認する。
+/// IO-4・REPAIR-6・TASK-14.2（R3）: write-back が書き終えて閉じた一時ファイル
+/// （`target.tmp`）を、既存ファイル（`target.bin`。別のバイト列・別の長さで
+/// 事前作成）へ上書きで rename する（一時ファイル経由の置換パターンの手順）。
+/// 置換後の `target` がセッションで書いたレコード列とバイト単位で完全一致し
+/// （旧バイト列が 1 バイトも残らない）、`target.tmp` が存在しないことを
+/// 確認する。
+///
+/// 検証するのは置換後の最終状態だけである。置換の原子性（置換と並行する
+/// 読み手が旧内容・新内容のどちらかだけを観測すること）は OS の rename が
+/// 担う性質で、本 crate（[`AppendFileSink`]・write-back 経路）の保証範囲では
+/// ないため対象外とする（#81 の受入基準は「操作後のファイル状態を具体値で
+/// 検証する」）。Windows では開いているファイルへの上書き rename は失敗
+/// しうるため、移動先を閉じた状態でだけ実行する（`tests/consistency.rs`
+/// 「実行する OS の方針」参照）。
 #[test]
-fn io4_rename_atomic_replace_over_existing_target() {
+fn io4_rename_over_existing_target_leaves_only_new_content() {
     const BODY_LEN: usize = 16;
     const BATCH_SIZE: usize = 4;
     const N: u32 = 8;
     let config = BatchConfig::new(BATCH_SIZE).expect("valid batch size");
 
-    let dir = TempDir::new("rename-atomic-replace");
+    let dir = TempDir::new("rename-over-existing-target");
     let tmp_path = dir.file_path("target.tmp");
     let target_path = dir.file_path("target.bin");
 
@@ -249,10 +257,10 @@ fn io4_rename_atomic_replace_over_existing_target() {
     assert_eq!(report.stats.acks_sent, u64::from(N));
 
     std::fs::rename(&tmp_path, &target_path)
-        .expect("atomic replace over existing target must succeed");
+        .expect("rename over an existing closed target must succeed");
     assert!(
         !tmp_path.exists(),
-        "tmp path must not exist after atomic replace"
+        "tmp path must not exist after replacing the target"
     );
 
     let expected = records(0, 0..N, BODY_LEN);
@@ -263,7 +271,7 @@ fn io4_rename_atomic_replace_over_existing_target() {
     );
 }
 
-/// IO-4・REPAIR-6・TASK-14.2: ライブセッション中に `rename(a → b)` した後、
+/// IO-4・REPAIR-6・TASK-14.2（R4）: ライブセッション中に `rename(a → b)` した後、
 /// 元のパス `a` を無関係な内容で再作成する。サーバーの書き込みが `b` から
 /// 漏れて `a` に混ざらないこと・`a` が無関係なバイト列だけであることを確認
 /// する。
@@ -307,7 +315,7 @@ fn io4_rename_then_recreate_original_path_no_leak() {
     );
 }
 
-/// IO-4・REPAIR-6・TASK-14.2: 4 クライアントがそれぞれ自分のファイルへ書き、
+/// IO-4・REPAIR-6・TASK-14.2（R5）: 4 クライアントがそれぞれ自分のファイルへ書き、
 /// ACK の境界（静止点）で自分のファイルを rename してから、さらに書く。
 /// rename 後の各ファイルが自クライアントの全件と完全一致し、他クライアントの
 /// バイトが混ざらず、元のパスがすべて存在しないことを確認する。
@@ -399,7 +407,7 @@ fn io4_rename_concurrent_clients_each_file_renamed_mid_session() {
 // truncate ケース（T1〜T6）
 // ---------------------------------------------------------------------
 
-/// IO-4・REPAIR-6・TASK-14.2: セッション終了後に `set_len(0)` してから次の
+/// IO-4・REPAIR-6・TASK-14.2（T1）: セッション終了後に `set_len(0)` してから次の
 /// セッションで書く。ファイルが新しいセッション分だけになることを確認する。
 #[test]
 fn io4_truncate_to_zero_between_sessions_keeps_only_new_records() {
@@ -439,10 +447,10 @@ fn io4_truncate_to_zero_between_sessions_keeps_only_new_records() {
     );
 }
 
-/// IO-4・REPAIR-6・TASK-14.2: セッション終了後にレコード境界（先頭 K 件分）で
+/// IO-4・REPAIR-6・TASK-14.2（T2）: セッション終了後にレコード境界（先頭 K 件分）で
 /// `set_len` してから追記する。内容が「先頭 K 件＋新しい M 件」になり、
-/// [`AppendFileSink::new`] が truncate 後の EOF に正しく位置合わせすることを
-/// 確認する。
+/// 再オープンした [`AppendFileSink`]（[`reopen_sink`]）が truncate 後の EOF
+/// から追記することを確認する。
 #[test]
 fn io4_truncate_to_record_boundary_then_append() {
     const BODY_LEN: usize = 16;
@@ -479,7 +487,7 @@ fn io4_truncate_to_record_boundary_then_append() {
     );
 }
 
-/// IO-4・REPAIR-6・TASK-14.2（REPAIR-6 の検出ケース）: 最後のレコードの
+/// IO-4・REPAIR-6・TASK-14.2（T3。REPAIR-6 の検出ケース）: 最後のレコードの
 /// 途中で `set_len` した破損状態を [`harness::decompose_records`] へ渡し、
 /// panic で検出されることを確認する（実際の I/O 実装から生じたファイルに
 /// 対する破損検出。REPAIR-6「実際の I/O 実装へ適用され破損を検出できる」の
@@ -557,10 +565,10 @@ fn io4_truncate_mid_record_is_detected_then_recovered() {
     );
 }
 
-/// IO-4・REPAIR-6・TASK-14.2: `append(true)` で開いたライブセッション中に、
+/// IO-4・REPAIR-6・TASK-14.2（T4）: `append(true)` で開いたライブセッション中に、
 /// 別ハンドルで `set_len(0)` する。truncate 後の書き込みが新しい EOF（先頭）
 /// に着地し、ゼロ埋めの穴ができないことをファイル全体の完全一致で確認する
-/// （通常モードでの同じ操作は T6
+/// （通常モードでの同じ操作は T5
 /// `io4_truncate_live_session_normal_mode_lands_at_new_eof` で確認する）。
 #[test]
 fn io4_truncate_live_session_append_mode_lands_at_new_eof() {
@@ -599,7 +607,7 @@ fn io4_truncate_live_session_append_mode_lands_at_new_eof() {
     );
 }
 
-/// IO-4・REPAIR-6・TASK-14.2（Codex #1125 レビュー指摘）: `create_sink`
+/// IO-4・REPAIR-6・TASK-14.2（T5。Codex #1125 レビュー指摘）: `create_sink`
 /// （通常モード、非 `O_APPEND`）で開いたライブセッション中に、別ハンドルで
 /// `set_len(0)` する。[`AppendFileSink`] の `write_batch` はバッチごとに現在の
 /// EOF へ位置合わせするため、truncate 後の M 件は新しい EOF（先頭）から穴なしで
@@ -646,7 +654,7 @@ fn io4_truncate_live_session_normal_mode_lands_at_new_eof() {
     );
 }
 
-/// IO-4・REPAIR-6・TASK-14.2: セッション終了後に `set_len` でファイルを拡張
+/// IO-4・REPAIR-6・TASK-14.2（T6）: セッション終了後に `set_len` でファイルを拡張
 /// （レコード境界を跨がない端数バイトぶん）してから追記する。拡張分が
 /// ゼロ埋めされ、その後ろに新しいレコードが続くことを確認する（拡張時の
 /// ゼロ埋めは POSIX（`ftruncate`）・Windows（`SetEndOfFile`）双方で決定的）。

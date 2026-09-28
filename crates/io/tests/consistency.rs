@@ -45,13 +45,16 @@
 //! ため、実ソケット越しの並行性を追加で補強するケースは範囲外とし、
 //! out-of-scope-tracking で追跡する（`fandhe_container_io::server` モジュール
 //! doc の「範囲外」節が同じ理由で UDS 受付ループ自体を後続 sub-issue としている
-//! ことと整合させる）。[`rename_truncate`] の 10 件も同じ [`harness::DuplexEnd`]
-//! 基盤で 3 OS すべてで動くが、1 点だけ OS 差の前提を置く: Rust std の既定
-//! `share_mode` には `FILE_SHARE_DELETE` が含まれるため、開いているファイルを
-//! **移動元**として rename するのは Windows でも成功する見込みだが、開いている
-//! ファイルへ**上書きで rename する**（atomic replace）操作は Windows では
-//! 失敗しうる。そのため atomic replace 系のケースは移動先を閉じた状態でだけ
-//! 実行する。
+//! ことと整合させる）。[`rename_truncate`] の 11 件（R1〜R5・T1〜T6）も
+//! 同じ [`harness::DuplexEnd`] 基盤で 3 OS すべてで動くが、1 点だけ OS 差の
+//! 前提を置く: Rust std の既定 `share_mode` には `FILE_SHARE_DELETE` が
+//! 含まれるため、開いているファイルを**移動元**として rename するのは
+//! Windows でも成功する見込みだが、開いているファイルへ**上書きで rename
+//! する**（既存ファイルの置換）操作は Windows では失敗しうる。そのため
+//! 置換のケース（R3）は移動先を閉じた状態でだけ実行する。なお置換の原子性
+//! （並行する読み手が旧内容・新内容のどちらかだけを観測すること）は OS の
+//! rename が担う性質で本スイートの検証対象外とし、R3 は置換後の最終内容の
+//! 完全一致だけを確認する。
 
 #[path = "consistency/harness.rs"]
 mod harness;

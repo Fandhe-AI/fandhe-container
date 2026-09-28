@@ -73,9 +73,16 @@ enum MatchMethod {
 /// 呼び出せるようになった対象から `Wired` 相当の状態（将来のバリアント）
 /// を追加し、このテストファイルから実 API を呼ぶ形に差し替える
 /// （本照合は TASK-91.2・#130）。
+///
+/// `text` は表の状態欄のセル全体（例:
+/// `未接続（TASK-13 で接続）`・`未接続（TASK-17 で文書作成後に接続）`）と
+/// 文字単位で一致させる。Codex レビュー指摘: 以前は `planned_task`
+/// （「で」より前の部分）だけを取り出して比較していたため、「TASK-13 で
+/// 接続」を「TASK-13 で接続しない」に変えても不一致を検出できなかった。
+/// 状態欄全体を保持・比較することで、欄のどの位置の改変も検出する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TargetStatus {
-    NotWired { planned_task: &'static str },
+    NotWired { text: &'static str },
 }
 
 /// 機械照合の対象仕様 1 件を表す。モジュールドキュメントの表と同じ内容を
@@ -102,7 +109,7 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
         spec_fact: "バッチサイズの既定値 64 が設定の実効値に反映されること（`batch_size=<N>`）",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
-            planned_task: "TASK-13",
+            text: "未接続（TASK-13 で接続）",
         },
     },
     AcceptanceTarget {
@@ -114,7 +121,7 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
             TASK-12・13 の結合試験が担う）",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
-            planned_task: "TASK-11 / TASK-15",
+            text: "未接続（TASK-11 / TASK-15 で接続）",
         },
     },
     AcceptanceTarget {
@@ -124,7 +131,7 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
             上限到達時に自動フラッシュが発行されること（`flush_every=<N>`）",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
-            planned_task: "TASK-16",
+            text: "未接続（TASK-16 で接続）",
         },
     },
     AcceptanceTarget {
@@ -133,7 +140,7 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
         spec_fact: "`docs/api/io-barrier.md` に ACK / FLUSH ACK の永続化保証の違いが明記されていること",
         method: MatchMethod::StringPattern,
         status: TargetStatus::NotWired {
-            planned_task: "TASK-17",
+            text: "未接続（TASK-17 で文書作成後に接続）",
         },
     },
     AcceptanceTarget {
@@ -143,7 +150,7 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
             構造化エラー（`code`・`message`）で返ること",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
-            planned_task: "TASK-19",
+            text: "未接続（TASK-19 で接続）",
         },
     },
     AcceptanceTarget {
@@ -153,7 +160,7 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
             （しきい値 260/261 の境界）",
         method: MatchMethod::StructuredAssert,
         status: TargetStatus::NotWired {
-            planned_task: "TASK-20",
+            text: "未接続（TASK-20 で接続）",
         },
     },
 ];
@@ -304,16 +311,18 @@ const SOURCE: &str = include_str!(concat!(
 /// [`parse_doc_table`] が抽出した、モジュールドキュメントの表 1 行分。
 ///
 /// フィールドは表の列（TASK・ビヘイビア・機械照合する出力仕様・照合方法・
-/// 状態）にそれぞれ対応する。`status` 列は `未接続（<planned_task> で
-/// 接続）` / `未接続（<planned_task> で文書作成後に接続）` の形式を前提に
-/// `planned_task` 部分だけを取り出す（現時点で表に現れる状態は `NotWired`
-/// のみのため）。
+/// 状態）にそれぞれ対応する。`status` は状態欄のセル全体（例:
+/// `未接続（TASK-13 で接続）`）をそのまま保持する（Codex レビュー指摘:
+/// 以前は `未接続（` 〜 `）` を剥がした上で「で」より前の `planned_task`
+/// 部分だけを取り出していたため、「で」より後ろの文言（「接続」/
+/// 「接続しない」/「文書作成後に接続」等）の改変を検出できなかった。
+/// セル全体を保持して [`AcceptanceTarget`] 側の全文と突き合わせる）。
 struct DocTableRow<'a> {
     task: &'a str,
     behavior: &'a str,
     spec_fact: &'a str,
     method: MatchMethod,
-    planned_task: &'a str,
+    status: &'a str,
 }
 
 /// `source` からモジュールドキュメントの表の行（`//! | TASK-... | ... |`
@@ -362,21 +371,22 @@ fn parse_doc_table(source: &str) -> Result<Vec<DocTableRow<'_>>, String> {
             other => return Err(format!("未知の照合方法列: {other:?}")),
         };
 
-        let inner = status_text
+        // `未接続（...）` の枠組みであることだけを構造チェックし、内部の
+        // 文言（`planned_task` 部分より後ろも含む）は分解せずに `status_text`
+        // をセル全体としてそのまま保持する（枠組み自体が崩れている行は
+        // 表の書式異常として拒否する。中身の文言比較は呼び出し元が
+        // `status_text` を丸ごと [`AcceptanceTarget`] と突き合わせて行う）。
+        status_text
             .strip_prefix("未接続（")
             .and_then(|rest| rest.strip_suffix('）'))
             .ok_or_else(|| format!("未接続の状態列の形式が想定と異なる: {status_text:?}"))?;
-        let planned_task = inner
-            .split(" で")
-            .next()
-            .ok_or_else(|| format!("状態列から planned_task を抽出できない: {status_text:?}"))?;
 
         rows.push(DocTableRow {
             task,
             behavior,
             spec_fact,
             method,
-            planned_task,
+            status: status_text,
         });
     }
 
@@ -1069,6 +1079,91 @@ fn repair_12_flush_ack_state_machine_table() {
     }
 }
 
+/// `source` から解析した表と `targets` を突き合わせ、両者が完全一致する
+/// ことを確認する。
+///
+/// 照合対象として意味のある列（`task`・`behavior`・`spec_fact`・`method`・
+/// `status`）はすべて全体を完全一致で比較する（Codex レビュー指摘:
+/// 状態欄を `未接続（` 〜 `）` の枠組みだけ確認して中身の「で」より前の
+/// `planned_task` 部分だけを比較する実装では、「TASK-13 で接続」を
+/// 「TASK-13 で接続しない」に変えても不一致を検出できない。状態欄は
+/// セル全体の文字列を [`AcceptanceTarget::status`] 側で組み立てた全文と
+/// 完全一致で比較する）。
+///
+/// panic させず `Result` で返すのは、本関数を [`repair_12_acceptance_targets_are_listed`]
+/// （正常系。`Ok` を期待）と
+/// [`repair_12_doc_table_mismatch_is_detected`]（表を改変した異常系。`Err`
+/// を期待）の双方から使い、異常系のテスト自体が意図せず panic しないように
+/// するため（[coding-rust] の「期待値は具体値で書く」方針に沿い、`Err` の
+/// メッセージにどの列のどの値が食い違ったかを含める）。
+///
+/// [coding-rust]: ../../../.claude/rules/coding-rust.md
+fn compare_targets_with_doc_table(
+    source: &str,
+    targets: &[AcceptanceTarget],
+) -> Result<(), String> {
+    for target in targets {
+        if !target.task.starts_with("TASK-") {
+            return Err(format!("task は TASK- 接頭辞を持つ想定: {:?}", target.task));
+        }
+        if target.behavior.is_empty() {
+            return Err(format!("behavior（ビヘイビア ID）は必須: {target:?}"));
+        }
+        if target.spec_fact.is_empty() {
+            return Err(format!(
+                "spec_fact（照合する出力仕様の説明）は必須: {target:?}"
+            ));
+        }
+    }
+
+    let doc_rows = parse_doc_table(source)
+        .map_err(|err| format!("モジュールドキュメントの表の解析に失敗した: {err}"))?;
+
+    if targets.len() != doc_rows.len() {
+        return Err(format!(
+            "モジュールドキュメントの表の行数（{}）と ACCEPTANCE_TARGETS の件数（{}）が一致しない",
+            doc_rows.len(),
+            targets.len()
+        ));
+    }
+
+    for (target, row) in targets.iter().zip(doc_rows.iter()) {
+        if target.task != row.task {
+            return Err(format!(
+                "task の不一致（表 vs データ）: {:?} vs {:?}",
+                row.task, target.task
+            ));
+        }
+        if target.behavior != row.behavior {
+            return Err(format!(
+                "{}: behavior の不一致（表 vs データ）: {:?} vs {:?}",
+                target.task, row.behavior, target.behavior
+            ));
+        }
+        if target.spec_fact != row.spec_fact {
+            return Err(format!(
+                "{}: spec_fact の不一致（表 vs データ）: {:?} vs {:?}",
+                target.task, row.spec_fact, target.spec_fact
+            ));
+        }
+        if target.method != row.method {
+            return Err(format!(
+                "{}: method の不一致（表 vs データ）: {:?} vs {:?}",
+                target.task, row.method, target.method
+            ));
+        }
+        let TargetStatus::NotWired { text } = target.status;
+        if text != row.status {
+            return Err(format!(
+                "{}: status の不一致（表 vs データ。状態欄全体を比較）: {:?} vs {:?}",
+                target.task, row.status, text
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// 選定した対象仕様の一覧（[`ACCEPTANCE_TARGETS`]）が、モジュール
 /// ドキュメントの表と一致する件数・内容を持つことを機械照合する
 /// （TASK-91.1 の受け入れ条件「一覧化」を機械照合するテスト）。
@@ -1077,57 +1172,110 @@ fn repair_12_flush_ack_state_machine_table() {
 /// （Codex レビュー指摘・4 巡目）ため、[`parse_doc_table`] で本ファイル
 /// 自身のソースからモジュールドキュメントの表を実際に解析し、
 /// [`ACCEPTANCE_TARGETS`] の全行を `task`・`behavior`・`spec_fact`・
-/// `method`・`status`（`planned_task`）まで個別に照合する。
+/// `method`・`status`（状態欄全体）まで個別に照合する
+/// （[`compare_targets_with_doc_table`] に実装を委譲）。
 #[test]
 fn repair_12_acceptance_targets_are_listed() {
     assert_eq!(ACCEPTANCE_TARGETS.len(), 6);
 
-    for target in ACCEPTANCE_TARGETS {
-        assert!(
-            target.task.starts_with("TASK-"),
-            "task は TASK- 接頭辞を持つ想定: {:?}",
-            target.task
-        );
-        assert!(
-            !target.behavior.is_empty(),
-            "behavior（ビヘイビア ID）は必須: {target:?}"
-        );
-        assert!(
-            !target.spec_fact.is_empty(),
-            "spec_fact（照合する出力仕様の説明）は必須: {target:?}"
-        );
-    }
+    compare_targets_with_doc_table(SOURCE, ACCEPTANCE_TARGETS)
+        .expect("表と ACCEPTANCE_TARGETS の内容が一致しない");
+}
 
-    let doc_rows = parse_doc_table(SOURCE)
-        .expect("モジュールドキュメントの表の解析に失敗した（表の書式を確認する）");
-    assert_eq!(
-        ACCEPTANCE_TARGETS.len(),
-        doc_rows.len(),
-        "モジュールドキュメントの表の行数と ACCEPTANCE_TARGETS の件数が一致しない"
-    );
+/// `source` から `//! | <task> | ...` の形式で始まる表の行（1 行分の生の
+/// テキスト）を検索する。表の行数・順序に依存させず、対象タスクの行だけを
+/// 特定するための回帰テスト専用ヘルパ。
+///
+/// 呼び出し元は [`repair_12_doc_table_column_mismatch_is_detected`]。
+/// 見つからない場合は `panic` する（テスト内部の固定入力に対する整合性
+/// チェックであり、外部入力を扱わないため）。
+fn find_doc_table_line<'a>(source: &'a str, task: &str) -> &'a str {
+    let needle = format!("| {task} |");
+    source
+        .lines()
+        .find(|line| {
+            line.trim_start()
+                .strip_prefix("//!")
+                .map(|content| content.trim_start().starts_with(&needle))
+                .unwrap_or(false)
+        })
+        .unwrap_or_else(|| panic!("表の行が見つからない（対象タスク: {task}）"))
+}
 
-    for (target, row) in ACCEPTANCE_TARGETS.iter().zip(doc_rows.iter()) {
-        assert_eq!(target.task, row.task, "task の不一致（表 vs データ）");
-        assert_eq!(
-            target.behavior, row.behavior,
-            "{}: behavior の不一致（表 vs データ）",
-            target.task
+/// 表の行 1 箇所（列ごとに異なる箇所）を書き換えると、
+/// [`compare_targets_with_doc_table`] が対応する列の不一致として検出できる
+/// ことを確認する回帰テスト（Codex レビュー指摘:
+/// 「TASK-13 で接続」を「TASK-13 で接続しない」に変えても検出できない
+/// 実装への回帰を防ぐ。加えて「表の各列すべてを完全一致で比較しているか
+/// 見直す」よう指摘されたため、status 列だけでなく 5 列すべてを表駆動で
+/// 検証する）。
+///
+/// 各ケースは `TASK-13` の行から特定の列の文言だけを書き換え、
+/// [`compare_targets_with_doc_table`] の結果が `Err` になること、かつ
+/// エラーメッセージに書き換えた列名（`task` / `behavior` / `spec_fact` /
+/// `method` / `status`）を含むことまで確認する（真偽値のみの `is_err()`
+/// では「別の列の比較が偶然失敗しただけ」を見逃せるため、[coding-rust]
+/// の「期待値は具体値で書く」方針に沿い、原因列まで特定する）。
+///
+/// [coding-rust]: ../../../.claude/rules/coding-rust.md
+#[test]
+fn repair_12_doc_table_column_mismatch_is_detected() {
+    let task = "TASK-13";
+    let original_line = find_doc_table_line(SOURCE, task);
+
+    // (説明, 書き換え前の部分文字列, 書き換え後の部分文字列, エラーメッセージに
+    // 含まれるべき列名の手がかり)。各部分文字列は `original_line` 内に
+    // ちょうど 1 回だけ現れるものを選び、対象外の列を巻き込まないようにする。
+    let cases: &[(&str, &str, &str, &str)] = &[
+        ("task 列", "| TASK-13 |", "| TASK-13X |", "task の不一致"),
+        ("behavior 列", "IO-1", "IO-1X", "behavior の不一致"),
+        (
+            "spec_fact 列",
+            "既定値 64",
+            "既定値 65",
+            "spec_fact の不一致",
+        ),
+        (
+            "method 列",
+            "構造化 assert",
+            "文字列パターン照合",
+            "method の不一致",
+        ),
+        (
+            "status 列",
+            "未接続（TASK-13 で接続）",
+            "未接続（TASK-13 で接続しない）",
+            "status の不一致",
+        ),
+    ];
+
+    for (description, from, to, expected_message_fragment) in cases {
+        assert!(
+            original_line.contains(from),
+            "{description}: 書き換え対象の文言が表の行に見つからない: {from:?}（行: {original_line:?}）"
         );
-        assert_eq!(
-            target.spec_fact, row.spec_fact,
-            "{}: spec_fact の不一致（表 vs データ）",
-            target.task
+
+        let mutated_line = original_line.replacen(from, to, 1);
+        assert_ne!(
+            &mutated_line, original_line,
+            "{description}: 書き換えたはずの行が変化していない"
         );
-        assert_eq!(
-            target.method, row.method,
-            "{}: method の不一致（表 vs データ）",
-            target.task
+
+        let mutated_source = SOURCE.replacen(original_line, &mutated_line, 1);
+        assert_ne!(
+            mutated_source, SOURCE,
+            "{description}: 書き換えたはずのソース全体が変化していない"
         );
-        let TargetStatus::NotWired { planned_task } = target.status;
-        assert_eq!(
-            planned_task, row.planned_task,
-            "{}: status（planned_task）の不一致（表 vs データ）",
-            target.task
+
+        let err = compare_targets_with_doc_table(&mutated_source, ACCEPTANCE_TARGETS).expect_err(
+            &format!(
+                "{description}: 表の行を書き換えても不一致を検出できていない（部分比較への回帰）"
+            ),
+        );
+        assert!(
+            err.contains(expected_message_fragment),
+            "{description}: 不一致の原因が意図した列（{expected_message_fragment:?}）\
+                になっていない: {err}"
         );
     }
 }

@@ -39,7 +39,10 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::barrier::{AckReceipt, FlushBarrier};
+/// ACK 受信結果の型。定義は [`crate::barrier`]（TASK-15.1・IO-2）へ移したが、
+/// 従来の公開パス `fandhe_container_io::client::AckReceipt` を維持するため再エクスポートする。
+pub use crate::barrier::AckReceipt;
+use crate::barrier::FlushBarrier;
 use crate::error::{IoError, IoErrorCode};
 #[cfg(test)]
 use crate::observe::NoopSendObserver;

@@ -433,7 +433,9 @@ require_trusted_dir_chain() {
   if [ -n "$rest" ]; then
     IFS='/' read -r -a parts <<<"$rest"
   fi
-  for comp in "${parts[@]}"; do
+  # 空配列（resolved が / のとき）の "${parts[@]}" は、bash 4.4 未満（macOS 標準の
+  # bash 3.2 を含む）では set -u で unbound variable になるため、要素があるときだけ展開する
+  for comp in ${parts[@]+"${parts[@]}"}; do
     if [ -z "$comp" ]; then
       continue
     fi
@@ -455,7 +457,17 @@ check_trusted_dir_component() {
     err "invalid-input" "${what} path component ${comp} is a symlink (it may have been replaced after resolution), refusing to use it: ${given}"
     exit 2
   fi
-  verdict=$(find "$comp" -maxdepth 0 -type d \
+  # POSIX の primary だけで書く（-maxdepth は POSIX に無いため使わない）。先頭の -prune は
+  # 常に真で、始点（comp）の中へ降りないようにする。これにより評価対象は始点 1 つだけに
+  # なり、出力は `safe` か `unsafe` のどちらか 1 回になる（中へ降りると子ごとに出力が
+  # 増え、`safe` との完全一致が崩れて拒否側に倒れる）。
+  #   -type d                      : symlink でないディレクトリ（find は既定で symlink を
+  #                                  たどらず lstat で判定する）
+  #   -user <数値 uid> / -user 0   : 所有者が実行ユーザーか root（POSIX: 数値はユーザー名と
+  #                                  して見つからなければ UID として解釈される）
+  #   ! -perm -0020 ! -perm -0002  : group・other のどちらにも書き込みビットが無い
+  #   -perm -1000                  : sticky bit（上の例外）
+  verdict=$(find "$comp" -prune -type d \
     \( -user "$uid" -o -user 0 \) \
     \( \( ! -perm -0020 ! -perm -0002 \) -o -perm -1000 \) \
     -exec printf safe \; -o -exec printf unsafe \; 2>&1) || rc=$?

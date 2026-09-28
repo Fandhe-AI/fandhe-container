@@ -18,6 +18,14 @@ fandhe-container の I/O 共有プロトコル経由の共有マウントはま�
 - **全モード共通**: `grep`・`dirname`・`basename`・`wc`・`tr`・`mktemp`・`find`・`ln`・`head`・`sleep`・`id`（欠如時は終了コード 3。欠如したまま進むと別の終了コードへ誤分類されるため事前に検出する）
 - **root 権限・`/dev/kvm` は不要**（親 #111 の受入基準）
 
+### 移植性の前提
+
+- `--from-json` モードは GNU（Linux）と BSD（macOS）の両方のユーザーランドで動く前提で書く。外部コマンドのオプションは POSIX にあるもの、または GNU と BSD（FreeBSD・macOS の man page の記述）の両方にあるものに限る。run モードは GNU coreutils の `timeout` を要するため Linux ホストのみ対象
+- bash は macOS 標準の 3.2 でも動く書き方にする（連想配列・`mapfile`・`${var,,}` 等の bash 4 以降の機能を使わない。空配列の `"${arr[@]}"` は bash 4.4 未満で `set -u` に引っかかるため `${arr[@]+"${arr[@]}"}` で展開する）
+- jq は 1.6 以降（`IN` を使うため）。正規表現系（`test`・`capture`）を使うため、正規表現ライブラリ（Oniguruma）付きでビルドされた jq が必要。数値の文字列表現は版で異なる（1.6 は `1000.0` を `1000`、1.7 以降はリテラルのまま）ため、比較は JSON の値として行う
+- 自己テスト（`make fio-bench-selftest`）を CI で実行するのは ubuntu（GNU）のみで、macOS（BSD）での実行は CI 外（手動確認の対象。現時点で未実施）。自己テスト自体は `timeout`・`find -mindepth`/`-maxdepth` 等を使い、Linux（GNU coreutils）前提
+- 使用する外部コマンドとオプションの一覧（POSIX・GNU・BSD の有無）は PR #1129 のレビュー返信に記録した。POSIX に無く GNU・BSD の両方にあるもの: `head -c`・`mktemp -d <template>`・`ln -n`・`/dev/fd/N`。GNU のみ: `timeout`（run モード専用）
+
 ## 使い方
 
 ### run モード（Docker ベースラインの計測例）
@@ -105,7 +113,7 @@ fio はデータファイルを `O_CREAT`（`O_EXCL` なし）で開き symlink 
 
 制約: グループ書き込み可（775 等。umask 002 で作ったディレクトリ）は、同じグループのメンバーが差し替えられるため、祖先を含めて拒否する。他の一般ユーザーが所有するディレクトリ（共有ディレクトリ等）も拒否する。root は対象外（root はすべてを差し替えられるため信頼する）。`--from-json` の入力ファイルは読み取りのみで書き込まないため、この検証の対象外（下記「変換対象 JSON の読み取り」の手順で 1 回だけ読む）。
 
-判定は要素ごとに fail-closed で、`find` が条件を満たすと判定して終了コード 0 かつ出力がその判定結果と完全一致したときだけ通す。`find` の失敗・エラー出力・空出力はすべて拒否になる（空出力を合格とみなす判定は `find` の失敗時に素通りするため採らない）。
+判定には POSIX の `find` の primary だけを使う（`-maxdepth` は POSIX に無いため、始点だけを評価するために `-prune` を使う。所有者は `-user <数値 UID>`・`-user 0`）。判定は要素ごとに fail-closed で、`find` が条件を満たすと判定して終了コード 0 かつ出力がその判定結果と完全一致したときだけ通す。`find` の失敗・エラー出力・空出力はすべて拒否になる（空出力を合格とみなす判定は `find` の失敗時に素通りするため採らない）。
 
 ### 総書き込み量と runtime
 

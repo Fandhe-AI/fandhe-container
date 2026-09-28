@@ -26,13 +26,17 @@
 //!   [`PipelineClient::acknowledge`] を呼ぶのは #74 の責務）
 //! - タイムアウト付きの ACK 待ち・ブロッキング送信 API
 //! - request id のワイヤー表現（ペイロード内レイアウト）。[`RequestId`] は
-//!   クライアントがローカルに振る連番であり、ペイロードには含めない
+//!   クライアントがローカルに振る連番であり、ペイロードには含めない。
+//!   [`RequestId`] が内部に持つ発行元キュー識別子（[`QueueId`]）もメモリ内の
+//!   区別のみに使い、ワイヤー上のバイト表現には一切影響しない
+//!   （TASK-12.1・#73 codex 再指摘対応。P1）
 //!
 //! 未フラッシュ滞留量（バイト数）の上限・自動フラッシュは IO-10（別タスク）の範囲。
 //! 送信側と受信側をスレッド間で分割する API も #74 以降で扱い、本モジュールの
 //! [`PipelineClient`] は `&mut self` を要求する単一スレッド前提の型として実装する。
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::error::{IoError, IoErrorCode};
@@ -104,18 +108,76 @@ impl Default for InFlightLimit {
     }
 }
 
+/// プロセス内で一意な [`SendQueue`] の発行元識別子（TASK-12.1・#73 codex 再指摘
+/// 対応。P1）。
+///
+/// codex 指摘: [`RequestId`] の数値部分（連番）は各 [`SendQueue`] が `0` から
+/// 独立に採番するため、別の [`PipelineClient`] が発行した同値の id を渡されても
+/// [`SendQueue::remove`] が数値だけで一致判定すると誤って解放してしまう。本型を
+/// [`RequestId`] へ埋め込み、id の発行元キューが自分自身と一致するかを検証してから
+/// 解放できるようにする。
+///
+/// [`Self::allocate`] は `counter`（[`SendQueue::new`] からは
+/// プロセス全体で共有する `static` を渡す）を `checked_add` 相当
+/// （[`AtomicU64::fetch_update`]）で進め、`u64` の範囲を超える採番を
+/// [`IoErrorCode::ResourceExhausted`] として検出する。`u64::MAX` 個の
+/// [`SendQueue`] を単一プロセス内で生成することは実用上起こり得ないが、
+/// 万一そこへ到達しても値を巻き戻して重複させることはない（`fetch_update` は
+/// 失敗時にカウンタを変更しないため、以降のすべての採番も同じエラーで拒否され
+/// 続ける。整数オーバーフローによる id の再利用・衝突を防ぐ。security.md
+/// 「不安全な設計」観点）。
+///
+/// `Ordering::Relaxed` で十分な理由: この counter が保証すべき性質は
+/// 「返す値がプロセス内で重複しない」ことのみで、他のメモリ操作との
+/// happens-before 関係を必要としない（この値を経由して他のデータを
+/// 公開・参照することはない）ため、より強い順序付けは不要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QueueId(u64);
+
+impl QueueId {
+    /// `counter` から次の値を採番する。`u64` の範囲を超える場合は
+    /// [`IoErrorCode::ResourceExhausted`] を返し、`counter` の状態は変更しない
+    /// （`fetch_update` が失敗時にカウンタを変更しない契約を利用する）。
+    fn allocate(counter: &AtomicU64) -> Result<Self, IoError> {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map(Self)
+            .map_err(|_| {
+                IoError::new(
+                    IoErrorCode::ResourceExhausted,
+                    "queue id counter would overflow u64",
+                )
+            })
+    }
+}
+
+/// プロセス全体で共有する [`QueueId`] の採番カウンタ（[`SendQueue::new`] が使う）。
+static NEXT_QUEUE_ID: AtomicU64 = AtomicU64::new(0);
+
 /// クライアントがローカルに振る、送信リクエストの単調増加な識別子（TASK-12.1）。
 ///
 /// ワイヤー上のレイアウト（ペイロードへどう載せるか）は #74（TASK-12.2）が定める。
 /// 本型は crate 外から任意の値を作れないようにし（採番は [`SendQueue::register`] の
-/// みが行う）、`get()` で値の読み出しのみ許す。
+/// みが行う）、`get()` で連番部分の読み出しのみ許す。発行元キュー
+/// （[`QueueId`]。TASK-12.1・#73 codex 再指摘対応。P1）はメモリ内の区別にのみ使い、
+/// ワイヤー上のバイト表現には一切影響しない（本モジュール冒頭の「#74（TASK-12.2）
+/// との境界」を参照）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RequestId(u64);
+pub struct RequestId {
+    queue_id: QueueId,
+    seq: u64,
+}
 
 impl RequestId {
-    /// 識別子を `u64` として返す。
+    /// この識別子を発行した [`SendQueue`] の連番部分を `u64` として返す。
+    ///
+    /// 発行元が異なれば同じ値が返りうる（各 [`SendQueue`] が独立に `0` から
+    /// 採番するため）。発行元ごとの一意性は [`QueueId`] が担う（非公開。
+    /// [`SendQueue::remove`] の照合にのみ使う）。
     pub fn get(self) -> u64 {
-        self.0
+        self.seq
     }
 }
 
@@ -171,16 +233,43 @@ pub struct SendQueue {
     entries: VecDeque<InFlightRequest>,
     next_id: u64,
     limit: InFlightLimit,
+    /// このキューの発行元識別子（TASK-12.1・#73 codex 再指摘対応。P1）。
+    ///
+    /// [`QueueId::allocate`] がプロセス全体の `static` カウンタの枯渇
+    /// （実用上起こり得ない）を検出した場合のみ `None` になる。`None` の
+    /// キューは [`Self::ensure_can_register`] が常に
+    /// [`IoErrorCode::ResourceExhausted`] を返すため、二度と id を発行できない
+    /// （枯渇したカウンタから重複した [`QueueId`] を割り当てて衝突させるより、
+    /// このキューを恒久的に使用不能にする方を選ぶ。無効な `RequestId` を
+    /// 一切生成しない）。
+    queue_id: Option<QueueId>,
 }
 
 impl SendQueue {
-    /// 上限件数を指定してキューを作る。
+    /// 上限件数を指定してキューを作る。発行元識別子はプロセス全体で共有する
+    /// `static` カウンタ（[`NEXT_QUEUE_ID`]）から採番する。
     pub fn new(limit: InFlightLimit) -> Self {
+        Self::with_queue_id_counter(limit, &NEXT_QUEUE_ID)
+    }
+
+    /// [`Self::new`] の内部実装。テストでは枯渇済みのローカルカウンタを渡し、
+    /// `queue_id` が `None` になる経路を再現する（`static` を汚染せずに済む）。
+    fn with_queue_id_counter(limit: InFlightLimit, counter: &AtomicU64) -> Self {
         Self {
             entries: VecDeque::new(),
             next_id: 0,
             limit,
+            queue_id: QueueId::allocate(counter).ok(),
         }
+    }
+
+    /// テスト専用: 枯渇済みのローカルカウンタから作ったキュー（`queue_id` が
+    /// `None`）を返す（[`QueueId`] 枯渇時に `register` が恒久的に拒否することを
+    /// 確認するために使う）。
+    #[cfg(test)]
+    fn new_exhausted_for_test(limit: InFlightLimit) -> Self {
+        let exhausted_counter = AtomicU64::new(u64::MAX);
+        Self::with_queue_id_counter(limit, &exhausted_counter)
     }
 
     /// このキューの上限件数を返す。
@@ -222,6 +311,12 @@ impl SendQueue {
     /// トランスポートへ書き込む前に呼び出し元がエラーを返せるようにする
     /// （[`PipelineClient::send`] が使う）。
     fn ensure_can_register(&self) -> Result<(), IoError> {
+        if self.queue_id.is_none() {
+            return Err(IoError::new(
+                IoErrorCode::ResourceExhausted,
+                "queue id counter would overflow u64; this queue can no longer register requests",
+            ));
+        }
         if self.is_full() {
             return Err(IoError::new(
                 IoErrorCode::ResourceExhausted,
@@ -253,11 +348,22 @@ impl SendQueue {
     pub fn register(&mut self, kind: FrameKind) -> Result<InFlightRequest, IoError> {
         ensure_trackable_frame_kind(kind)?;
         self.ensure_can_register()?;
-        let id = RequestId(self.next_id);
-        // `ensure_can_register` で `checked_add` の成功を確認済みだが、ライブラリ
-        // コードは panic させない方針（coding-rust）のため、ここでも `expect` では
-        // なく `Result` 経由でオーバーフローを扱う（到達しないはずの経路も含めて
+        // `ensure_can_register` で `queue_id` が `Some` であることを確認済みだが、
+        // ライブラリコードは panic させない方針（coding-rust）のため、ここでも
+        // `expect` ではなく `Result` 経由で扱う（到達しないはずの経路も含めて
         // panic 経路を作らない）。
+        let queue_id = self.queue_id.ok_or_else(|| {
+            IoError::new(
+                IoErrorCode::ResourceExhausted,
+                "queue id counter would overflow u64; this queue can no longer register requests",
+            )
+        })?;
+        let id = RequestId {
+            queue_id,
+            seq: self.next_id,
+        };
+        // 上記と同様、`ensure_can_register` で `checked_add` の成功を確認済みだが、
+        // ここでも `Result` 経由でオーバーフローを扱う。
         self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
             IoError::new(
                 IoErrorCode::ResourceExhausted,
@@ -278,6 +384,15 @@ impl SendQueue {
     /// [`IoErrorCode::InvalidArgument`] を返し、キューの状態を変更しない
     /// （二重解放の防止）。
     ///
+    /// # 発行元キューの検証（TASK-12.1・#73 codex 再指摘対応。P1）
+    ///
+    /// `id` が自分自身（`self`）以外の [`SendQueue`] で発行された場合、キューの
+    /// 内部連番（`seq`）が同値でも [`IoErrorCode::InvalidArgument`] で拒否し、
+    /// キューの状態を変更しない。各 [`SendQueue`] は連番を独立に `0` から
+    /// 採番するため、この検証がなければ別クライアントが受け取った ACK 未受信の
+    /// id を渡すだけで、対応する ACK を一度も受けていない自分自身の枠を
+    /// 誤って解放できてしまう（codex レビュー指摘）。
+    ///
     /// # 公開範囲と ACK 検証の責務（TASK-12.1・#73 codex 再指摘対応。P1）
     ///
     /// 公開 API だが、「渡された `id` がすでに検証済みの ACK に対応する」ことは
@@ -288,6 +403,16 @@ impl SendQueue {
     /// の request id を使ってこの入口を呼ぶことを想定する（REPAIR-3。それまでは
     /// 呼び出し元が ACK を解釈してこのメソッドを呼ぶ）。
     pub fn remove(&mut self, id: RequestId) -> Result<InFlightRequest, IoError> {
+        if self.queue_id != Some(id.queue_id) {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!(
+                    "in-flight request id {} was issued by another queue and cannot be \
+                     released here",
+                    id.get()
+                ),
+            ));
+        }
         let position = self
             .entries
             .iter()
@@ -327,7 +452,9 @@ pub enum SendOutcome {
     RejectedPoisoned,
     /// `Ack`/`FlushAck` など追跡対象外のフレーム種別だったため拒否した。
     RejectedInvalidFrameKind,
-    /// 未 ACK 件数の上限到達、または id 採番の溢れで拒否した。
+    /// 未 ACK 件数の上限到達、id（連番）採番の溢れ、または発行元キュー識別子
+    /// （[`QueueId`]）の採番カウンタ枯渇（TASK-12.1・#73 codex 再指摘対応。P1。
+    /// 実用上起こり得ない）で拒否した。
     RejectedResourceExhausted,
     /// トランスポートへの書き込みが失敗し、クライアントを失効させた。
     TransportFailure,
@@ -456,8 +583,9 @@ impl SendMetrics {
         self.rejected_invalid_frame_kind_count
     }
 
-    /// 未 ACK 件数の上限到達・id 採番の溢れにより拒否した回数（`InFlightLimit`
-    /// への到達を観測する指標。TASK-12.1）。
+    /// 未 ACK 件数の上限到達・id 採番の溢れ・[`QueueId`] 採番カウンタ枯渇
+    /// （実用上起こり得ない）により拒否した回数（`InFlightLimit` への到達を
+    /// 観測する指標。TASK-12.1）。
     pub fn rejected_resource_exhausted_count(&self) -> u64 {
         self.rejected_resource_exhausted_count
     }
@@ -883,11 +1011,13 @@ mod tests {
         let mut client = PipelineClient::new(RecordingSender::default(), limit);
 
         let mut ids = Vec::new();
+        let mut requests = Vec::new();
         for byte in [10u8, 20, 30] {
             let request = client
                 .send(&write_frame(byte), test_timeout())
                 .expect("send must succeed while under the limit");
             ids.push(request.id().get());
+            requests.push(request);
         }
 
         assert_eq!(ids, vec![0, 1, 2]);
@@ -909,9 +1039,9 @@ mod tests {
         // `into_inner` は未 ACK が残る限りトランスポートを返さない（#73 codex
         // レビュー指摘対応。P1）ため、送信済みバイト列を確認する前に、すべての
         // 枠を ACK 済み相当として解放しておく。
-        for id in [0u64, 1, 2] {
+        for request in requests {
             client
-                .acknowledge(RequestId(id))
+                .acknowledge(request.id())
                 .expect("removing an acknowledged id must succeed");
         }
 
@@ -932,10 +1062,10 @@ mod tests {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
         let mut client = PipelineClient::new(RecordingSender::default(), limit);
 
-        client
+        let first = client
             .send(&write_frame(1), test_timeout())
             .expect("1st send must succeed");
-        client
+        let second = client
             .send(&write_frame(2), test_timeout())
             .expect("2nd send must succeed");
 
@@ -950,9 +1080,9 @@ mod tests {
         // `into_inner` は未 ACK が残る限りトランスポートを返さない（#73 codex
         // レビュー指摘対応。P1）ため、送信件数を確認する前に両方の枠を
         // ACK 済み相当として解放しておく。
-        for id in [0u64, 1] {
+        for request in [first, second] {
             client
-                .acknowledge(RequestId(id))
+                .acknowledge(request.id())
                 .expect("removing an acknowledged id must succeed");
         }
 
@@ -1006,15 +1136,58 @@ mod tests {
     fn io1_send_queue_remove_unknown_id_is_rejected() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
         let mut queue = SendQueue::new(limit);
-        queue
+        let registered = queue
             .register(FrameKind::Write)
             .expect("register must succeed while under the limit");
 
+        // 同じキュー（同じ `queue_id`）で採番されていない `seq` を渡し、
+        // 「発行元は自分自身だが未登録の seq」を再現する（発行元自体が異なる
+        // ケースは `io1_send_queue_remove_rejects_id_from_another_queue` が担う）。
+        let unknown_id = RequestId {
+            queue_id: registered.id().queue_id,
+            seq: 999,
+        };
         let err = queue
-            .remove(RequestId(999))
+            .remove(unknown_id)
             .expect_err("unknown id must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
         assert_eq!(queue.len(), 1);
+    }
+
+    /// IO-1・TASK-12.1（#73 codex 再指摘対応。P1）: 別の [`SendQueue`] が発行した
+    /// [`RequestId`]（連番の数値としては自分のキューにも存在しうる値）を渡すと、
+    /// `queue_id` の不一致により `InvalidArgument` で拒否され、キューの状態は
+    /// 変わらない。数値だけを見て解放してしまう codex 指摘の再現テスト。
+    #[test]
+    fn io1_send_queue_remove_rejects_id_from_another_queue() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut queue_a = SendQueue::new(limit);
+        let mut queue_b = SendQueue::new(limit);
+
+        let a_request = queue_a
+            .register(FrameKind::Write)
+            .expect("queue_a register must succeed");
+        let b_request = queue_b
+            .register(FrameKind::Write)
+            .expect("queue_b register must succeed");
+        // 両キューとも `0` から独立に採番するため、連番の数値は同値になる。
+        assert_eq!(a_request.id().get(), b_request.id().get());
+
+        let err = queue_a
+            .remove(b_request.id())
+            .expect_err("id issued by another queue must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert!(
+            err.message().contains("another queue"),
+            "unexpected message: {}",
+            err.message()
+        );
+        assert_eq!(queue_a.len(), 1, "queue_a's entry must remain untouched");
+
+        queue_a
+            .remove(a_request.id())
+            .expect("queue_a's own id must still be removable");
+        assert_eq!(queue_a.len(), 0);
     }
 
     /// IO-1・TASK-12.1（#73 codex 指摘対応。P2）: `SendQueue::register` は
@@ -1237,6 +1410,43 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    /// TASK-12.1（#73 codex 再指摘対応。P1）: [`QueueId::allocate`] はカウンタが
+    /// `u64::MAX` に達していると `ResourceExhausted` を返し、カウンタの値は
+    /// `u64::MAX` のまま変わらない（`fetch_update` が失敗時に状態を変更しない
+    /// 契約により、以降の呼び出しもすべて同じエラーで拒否され続けることを
+    /// 確認する）。
+    #[test]
+    fn repair2_queue_id_allocate_rejects_counter_overflow() {
+        let counter = AtomicU64::new(u64::MAX);
+
+        let err = QueueId::allocate(&counter).expect_err("u64::MAX must reject allocation");
+        assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+
+        // カウンタが変化していないため、続けて呼んでも同じエラーで拒否され続ける
+        // （id を巻き戻して重複させることがないことの確認）。
+        let err_again =
+            QueueId::allocate(&counter).expect_err("repeated allocation must still fail");
+        assert_eq!(err_again.code(), IoErrorCode::ResourceExhausted);
+    }
+
+    /// IO-1・TASK-12.1（#73 codex 再指摘対応。P1）: `queue_id` の採番カウンタが
+    /// 枯渇した [`SendQueue`]（[`SendQueue::new_exhausted_for_test`]）は
+    /// `register` が常に `ResourceExhausted` を返し、未 ACK キューへ何も
+    /// 積まない（枯渇したカウンタから重複した `QueueId` を割り当てて別の
+    /// キューと衝突させるより、このキューを恒久的に使用不能にする設計の確認）。
+    #[test]
+    fn io1_send_queue_register_rejects_when_queue_id_exhausted() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut queue = SendQueue::new_exhausted_for_test(limit);
+
+        let err = queue
+            .register(FrameKind::Write)
+            .expect_err("register must fail when the queue id counter is exhausted");
+        assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+        assert_eq!(queue.len(), 0);
     }
 
     fn assert_send<T: Send>() {}

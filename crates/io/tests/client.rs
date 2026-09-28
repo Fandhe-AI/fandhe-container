@@ -116,8 +116,12 @@ fn io1_public_api_pipeline_client_releases_slot_and_keeps_order() {
 /// 済みの id は `InvalidArgument` で拒否し、キューの状態を変更しない
 /// （二重解放の防止）。`RequestId` は crate 外から任意の値を作れない
 /// （フィールド非公開）ため、「このクライアントに未登録の id」は、別の
-/// `PipelineClient` で採番させた（値としては重複しうるが、このクライアントの
-/// キューには存在しない）id を使って再現する。
+/// `PipelineClient` で採番させた（このケースでは連番の数値が異なる）id を
+/// 使って再現する。連番の数値が偶然一致するケースは
+/// `io1_public_api_pipeline_client_acknowledge_rejects_same_numbered_id_from_another_client`
+/// が担う（codex 再指摘: 発行元キューの区別なしに数値だけで一致判定すると、
+/// このテストは連番が異なる値しか試していないため本来検出すべき誤解放を
+/// 見逃す）。
 #[test]
 fn io1_public_api_pipeline_client_acknowledge_rejects_unknown_and_duplicate() {
     let limit = InFlightLimit::new(2).expect("2 must be a valid limit");
@@ -153,6 +157,62 @@ fn io1_public_api_pipeline_client_acknowledge_rejects_unknown_and_duplicate() {
         .expect_err("acknowledging the same id twice must be rejected");
     assert_eq!(duplicate_err.code(), IoErrorCode::InvalidArgument);
     assert!(client.queue().is_empty());
+}
+
+/// IO-1・TASK-12.1（#73 codex 再指摘対応。P1）: 別の `PipelineClient` が発行した
+/// `RequestId` の連番部分がたまたま同値（両方とも 1 回目の送信で得た `id=0`）
+/// であっても、発行元キューが異なれば `acknowledge` は `InvalidArgument` で
+/// 拒否し、対応する ACK を一度も受けていない自分自身の枠を解放しない。
+/// 各 `PipelineClient` は連番を独立に `0` から採番するため、この検証がなければ
+/// 別クライアントの id を渡すだけで未 ACK 枠を誤って解放できてしまう
+/// （codex レビュー指摘の再現テスト）。
+#[test]
+fn io1_public_api_pipeline_client_acknowledge_rejects_same_numbered_id_from_another_client() {
+    let limit = InFlightLimit::new(2).expect("2 must be a valid limit");
+    let mut client_a = PipelineClient::new(RecordingSender::default(), limit);
+    let mut client_b = PipelineClient::new(RecordingSender::default(), limit);
+
+    let request_a = client_a
+        .send(&write_frame(1), test_timeout())
+        .expect("client_a's send must succeed");
+    let request_b = client_b
+        .send(&write_frame(2), test_timeout())
+        .expect("client_b's send must succeed");
+    // 両クライアントとも 1 回目の送信のため、連番の数値は同値になる。
+    assert_eq!(request_a.id().get(), 0);
+    assert_eq!(request_b.id().get(), 0);
+
+    let err = client_a
+        .acknowledge(request_b.id())
+        .expect_err("id issued by another client's queue must be rejected");
+    assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+    assert!(
+        err.message().contains("another queue"),
+        "unexpected message: {}",
+        err.message()
+    );
+    assert_eq!(
+        client_a.queue().len(),
+        1,
+        "client_a's own entry must remain untouched"
+    );
+
+    // 対称のケース（client_b が client_a の id を渡す場合）も同様に拒否される。
+    let err = client_b
+        .acknowledge(request_a.id())
+        .expect_err("id issued by another client's queue must be rejected");
+    assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+    assert_eq!(client_b.queue().len(), 1);
+
+    // 自分自身が発行した id は引き続き解放できる（不要に厳しくなっていないことの確認）。
+    client_a
+        .acknowledge(request_a.id())
+        .expect("acknowledging the verified id issued by the same queue must succeed");
+    assert!(client_a.queue().is_empty());
+    client_b
+        .acknowledge(request_b.id())
+        .expect("acknowledging the verified id issued by the same queue must succeed");
+    assert!(client_b.queue().is_empty());
 }
 
 /// IO-1・TASK-12.1: `InFlightLimit` は `0` と `MAX_IN_FLIGHT_LIMIT` 超過を

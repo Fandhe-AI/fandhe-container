@@ -43,7 +43,7 @@
 //!
 //! - ACK フレームの送出方針・ディスク書き込み・[`crate::batch::BatchBuffer`] との
 //!   つなぎ込み（TASK-13.2.2・#822）
-//! - 同時接続数の上限（TASK-13.4・#796）
+//! - 同時接続数の上限（TASK-13.2.2・#822）
 //! - [`crate::recv_limits::ReceiveLimits::admit`] の滞留件数
 //!   （`pending_frames`）は本モジュールでは常に `0` を渡す（この層は単一接続
 //!   しか見えず、複数接続を跨いだ実際の準備完了キューを持たないため）。
@@ -56,14 +56,24 @@
 //!   非公開関数）により実装済み）
 //! - 送信側と受信側の分割 API（`try_clone` を使った split。TASK-12）
 //! - クライアント側の UDS 接続（`connect`）・[`crate::client::PipelineClient`]
-//!   との結合（TASK-12.2 以降）
+//!   との結合（TASK-13.2.2・#822）
 //! - vsock（microVM）トランスポート
 //! - bind から `0600` への chmod 完了までの短い窓（[`UdsServer::bind`] の
 //!   ドキュメンテーションコメント参照）は親ディレクトリの権限で塞ぐ設計とし、
 //!   ソケットファイル自体の一時的なモードには依存しない
 //! - `path` の直近の親ディレクトリ以外（祖先のパス要素）の symlink 検査は
 //!   行わない（`imp::validate_parent_dir`（Linux / macOS 限定の非公開関数）
-//!   のドキュメンテーションコメント参照）
+//!   のドキュメンテーションコメント参照）。祖先ディレクトリが bind 後に
+//!   symlink へ差し替えられた場合、[`UdsServer`] の [`Drop`] が呼ぶ
+//!   `imp::cleanup_socket_file`（自分が bind したソケットファイルの自動削除）
+//!   が意図しないパスを操作しうるが、これも本タスクの範囲外とする
+//!   （security P2・#820 レビュー指摘。`cleanup_socket_file` 自体は削除直前に
+//!   `symlink_metadata` でソケットのままであることを確かめるため、任意の
+//!   ファイルを消す経路にはならない）
+//! - macOS の ACL（Access Control List）は `st_mode` のパーミッションビット
+//!   検査の対象外であり、`imp::validate_parent_dir` の owner 専用チェックを
+//!   ACL で上書きされていても検出できない（security Low・#820 レビュー指摘。
+//!   POSIX パーミッションのみを信頼境界として扱う既定方針は他の crate と共通）
 //!
 //! # SIGPIPE の前提
 //!
@@ -525,6 +535,11 @@ mod imp {
                                 aborted_retries: abort_retries,
                             };
                         }
+                        // WouldBlock と同じ理由で、期限内であっても busy-loop
+                        // せずに一呼吸置いてから再試行する（B4・#820 レビュー
+                        // 指摘。相手が接続の確立と切断を高頻度で繰り返す病的な
+                        // ケースで CPU を使い切らないため）。
+                        std::thread::sleep(remaining.min(ACCEPT_POLL_INTERVAL));
                     }
                     Err(e) => {
                         return super::AcceptAttempt {
@@ -926,6 +941,18 @@ mod imp {
 
     /// `body_len` バイトの本体を、届いた分だけ少しずつ確保しながら読む
     /// （申告された長さだけで一度に確保しない。security.md の DoS 対策）。
+    ///
+    /// # `AdmittedHeader::allocate_body` を経由しない理由（B1・#820 レビュー
+    /// 指摘。security P2）
+    /// `crate::recv_limits::AdmittedHeader::allocate_body` は一括確保する経路
+    /// （`crate::protocol::Frame::decode_body` 等が本体をまるごと読める場合
+    /// 向け）であり、本関数は相手が遅い・悪意ある場合でも接続 1 本あたりの
+    /// 瞬間的なメモリ使用量を抑えるため、あえて `body_len` 分を分割して読む。
+    /// どちらの経路でも「確保量の上限は `admit` を通過した
+    /// `AdmittedHeader`（ここでは `body_len`）からしか得ない」という契約は
+    /// 変わらない（`crates/io/src/recv_limits.rs` モジュール doc「埋める穴」
+    /// 節・`AdmittedHeader::allocate_body` のドキュメンテーションコメント
+    /// 参照）。
     fn read_body_until(
         stream: &mut UnixStream,
         body_len: usize,

@@ -10,8 +10,9 @@
 //! トランスポートの具象実装のうち、UDS のサーバー側（Linux / macOS）は
 //! TASK-13.2.1（#820）で実装済み（[`server::UdsServer`]・
 //! [`server::UdsConnection`]。accept・送受信のイベントは
-//! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS 接続・
-//! vsock・named pipe・ディスク書き込みはまだない（REPAIR-3。スタブの明示）。
+//! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS 接続
+//! （TASK-13.2.2・#822）・vsock・named pipe・ディスク書き込みはまだない
+//! （REPAIR-3。スタブの明示）。
 //! [`protocol::Frame`] のペイロード内部レイアウト（request id・ACK の対応付け）は
 //! [`payload`] モジュール（TASK-12.2・#74）が定める。[`client::PipelineClient::send`]
 //! はこの形式で request id を埋め込み、[`client::PipelineClient::recv_ack`]

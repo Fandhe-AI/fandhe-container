@@ -11,9 +11,14 @@
 //! （P0: 無制限確保による DoS の防止）、下記スコープ外の「受信経路」自体の
 //! 検証・複数バッファ / 接続を跨いだ滞留量上限とは独立している。
 //!
+//! `--batch-size` 相当の設定 API（CLI / 設定の文字列から検証済み
+//! [`BatchConfig`] を得る入口。TASK-13.3・#78）は [`crate::settings`] が担う。
+//! 実際の CLI バイナリ（`fandhe-container`）からその値を受け取る配線は
+//! TASK-79 の責務。
+//!
 //! # スコープ外（TASK-13 の兄弟 sub-issue が担う）
 //! - UDS 接続受付ループ（`server.rs`。TASK-13.2.1）・同時接続数の上限
-//! - CLI / 設定からのバッチサイズ・バイト数上限配線（`--batch-size` 相当。TASK-13.3）
+//! - 実際の CLI バイナリでの `--batch-size` 引数の解釈（`crates/cli`。TASK-79）
 //! - 受信フレーム長そのものの検証・複数接続を跨いだ受信経路の DoS 対策
 //!   （[`crate::recv_limits`]・TASK-13.4・#796）
 //! - FLUSH バリアの永続化保証（FlushAck・IO-2・TASK-15）・未フラッシュ滞留量上限
@@ -63,8 +68,9 @@ pub const DEFAULT_BATCH_SIZE: usize = 64;
 /// [`crate::recv_limits`]（TASK-13.4・#796）・IO-10（TASK-16）の責務であり、
 /// 本モジュールが持つのは「1 つの [`BatchBuffer`] インスタンスが確保し続ける
 /// メモリ量」自体の上限）。
-/// この値自体も TASK-13.3・TASK-13.4・TASK-16・TASK-88（ベンチ校正）で
-/// 見直してよい暫定値（REPAIR-3）。
+/// この値自体も TASK-13.4・TASK-16・TASK-88（ベンチ校正）で見直してよい
+/// 暫定値（REPAIR-3）。TASK-13.3（`--batch-size` 相当の設定 API・#78）は
+/// この値を検証範囲の上限として使うのみで、値そのものは据え置く。
 pub const MAX_BATCH_SIZE: usize = 4096;
 
 /// バッチ 1 つあたりの累積ペイロードバイト数の既定上限（P0: 無制限確保による
@@ -127,7 +133,9 @@ const _: () = assert!(MAX_ALLOWED_BATCH_BYTES / 4 == MAX_BATCH_BYTES);
 /// [`Self::with_max_bytes`] を経由しない限り `1..=MAX_BATCH_SIZE`（件数）・
 /// `1..=MAX_ALLOWED_BATCH_BYTES`（累積バイト数。P0: PR #1105 codex
 /// レビュー指摘を受け `usize::MAX` を含む無制限の値は拒否する）の範囲外の
-/// 値を表現できない（REPAIR-2: 壊れた値を表現できない型）。
+/// 値を表現できない（REPAIR-2: 壊れた値を表現できない型）。CLI / 設定の
+/// 文字列値からは [`std::str::FromStr`]（[`crate::settings::parse_batch_size`]
+/// へ委譲。TASK-13.3・#78）で得られる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BatchConfig {
     batch_size: NonZeroUsize,

@@ -3,10 +3,10 @@
 `fandhe-container-io`（`crates/io`）が提供するフレーム全体型（[`Frame`](../../crates/io/src/protocol.rs)）のバイトレイアウト・採用したチェックサムアルゴリズムの根拠・newtype 設計方針・IO-1 / REPAIR-2 対応表を記録する。
 
 - 対象ビヘイビア: IO-1（ホスト⇔ゲスト間のファイル共有プロトコル）・REPAIR-2（壊れた値を表現できない型）・REPAIR-5（タイムアウト保護・エラー後の接続再利用禁止）・REPAIR-6（整合性テスト）
-- 関連タスク: TASK-11.1（#68）・TASK-11.2（#69。ヘッダ newtype）・TASK-11.3（#70。チェックサム付きフレーム型）・TASK-11.4（#71。本節以降）・TASK-12.1（#73。送信キュー）・TASK-12.2（#74。ペイロード形式・ACK 受信）・TASK-13.1（#76。バッチ集約バッファ）・TASK-13.2.1（#820。UDS サーバー側トランスポート）・TASK-13.2.2（#822。バッチ write-back の実行・ACK 返却）・TASK-13.4（#796。受信フレームの受理判定ゲート）・TASK-83.1（#116。BREAK-2 相当のワイヤーレベル検出テスト）・TASK-83.2（#117。デコード時の範囲外長さ検証の強化とアロケーション前拒否のテスト）。ヘッダ拡張（version・header_crc）・接続再利用契約は TASK-12・TASK-13 着手前の設計レビュー（2026-09-28 オーナー決定・#67・#115）による
+- 関連タスク: TASK-11.1（#68）・TASK-11.2（#69。ヘッダ newtype）・TASK-11.3（#70。チェックサム付きフレーム型）・TASK-11.4（#71。本節以降）・TASK-12.1（#73。送信キュー）・TASK-12.2（#74。ペイロード形式・ACK 受信）・TASK-13.1（#76。バッチ集約バッファ）・TASK-13.2.1（#820。UDS サーバー側トランスポート）・TASK-13.2.2（#822。バッチ write-back の実行・ACK 返却）・TASK-13.3（#78。バッチサイズ設定 API）・TASK-13.4（#796。受信フレームの受理判定ゲート）・TASK-83.1（#116。BREAK-2 相当のワイヤーレベル検出テスト）・TASK-83.2（#117。デコード時の範囲外長さ検証の強化とアロケーション前拒否のテスト）。ヘッダ拡張（version・header_crc）・接続再利用契約は TASK-12・TASK-13 着手前の設計レビュー（2026-09-28 オーナー決定・#67・#115）による
 - 関連ビヘイビア: IO-2（Flush / FlushAck 種別）・REPAIR-5（`IoTimeout`。無期限待ちを型で表現しない）
 - 対象マイルストーン: MS-1
-- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）、TASK-12.1 で追加した送信キュー（`SendQueue`・`PipelineClient`）、TASK-12.2 で追加したペイロード内部レイアウト（[`crates/io/src/payload.rs`](../../crates/io/src/payload.rs)）と ACK 受信・対応付け（`PipelineClient::recv_ack`）、TASK-13.2.1（#820）で追加した UDS サーバー側トランスポート（[`UdsServer`・`UdsConnection`](../../crates/io/src/server.rs)。Linux / macOS）、TASK-13.2.2（#822）で追加したバッチ write-back の実行と通常 ACK 返却（[`serve_connection`・`AppendFileSink`](../../crates/io/src/writeback.rs)）に加え、2026-09-28 の設計レビュー（TASK-12・TASK-13 着手前に P1 として指摘・オーナー決定で先行対応）で追加したヘッダの `version`・`header_crc` フィールドと、エラー後の接続再利用禁止契約を記録する。クライアント側の UDS 接続との本番結合・FLUSH ACK の返却・Windows のトランスポートは後続 sub-issue が本書へ追記する
+- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）、TASK-12.1 で追加した送信キュー（`SendQueue`・`PipelineClient`）、TASK-12.2 で追加したペイロード内部レイアウト（[`crates/io/src/payload.rs`](../../crates/io/src/payload.rs)）と ACK 受信・対応付け（`PipelineClient::recv_ack`）、TASK-13.2.1（#820）で追加した UDS サーバー側トランスポート（[`UdsServer`・`UdsConnection`](../../crates/io/src/server.rs)。Linux / macOS）、TASK-13.2.2（#822）で追加したバッチ write-back の実行と通常 ACK 返却（[`serve_connection`・`AppendFileSink`](../../crates/io/src/writeback.rs)）、TASK-13.3（#78）で追加したバッチサイズ設定 API（[`parse_batch_size`・`WritebackSettings`](../../crates/io/src/settings.rs)）に加え、2026-09-28 の設計レビュー（TASK-12・TASK-13 着手前に P1 として指摘・オーナー決定で先行対応）で追加したヘッダの `version`・`header_crc` フィールドと、エラー後の接続再利用禁止契約を記録する。クライアント側の UDS 接続との本番結合・FLUSH ACK の返却・Windows のトランスポートは後続 sub-issue が本書へ追記する
 
 ## バイトレイアウト
 
@@ -125,8 +125,9 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 | IO-1 | 既定 64 件（設定可能）単位でのバッチ集約 | `crates/io/src/batch.rs` の `BatchBuffer::push`・`BatchConfig`（既定値 `DEFAULT_BATCH_SIZE = 64`・上限 `MAX_BATCH_SIZE = 4096`〔暫定〕） | `io1_batch_buffer_fires_at_default_64`・`io1_batch_buffer_fires_at_custom_size_8`・`io1_batch_config_default_is_64`・`io1_batch_config_rejects_zero`・`io1_batch_config_rejects_above_max`・`tests/batch.rs` の `io1_public_api_batch_buffer_fires_at_default_size`・`io1_public_api_batch_config_custom_size_fires`・`io1_public_api_batch_config_rejects_zero` |
 | P0 | バッチ 1 つあたりの累積ペイロードバイト数の上限（無制限確保による DoS の防止） | `BatchConfig::max_bytes` / `BatchConfig::with_max_bytes`（既定 `MAX_BATCH_BYTES = 256 MiB`〔暫定〕）。累積が上限を超える手前で `BatchBuffer::push` が既存滞留分を `BatchTrigger::BytesLimitReached` として強制発火させる（件数上限 `MAX_BATCH_SIZE` × 1 フレーム最大長 `MAX_PAYLOAD_LEN` の理論値〔約 256 GiB〕とは独立した安全弁。PR #1105 codex レビュー指摘）。フレーム単体のペイロード長が `max_bytes` を超える場合は `pending` の状態によらず追加前に `INVALID_ARGUMENT` で拒否し、`pending_bytes` が `max_bytes` を上回った状態を作らない（`with_max_bytes` は `MAX_PAYLOAD_LEN` より小さい値も個別設定できるため。PR #1105 codex レビュー指摘・2 巡目） | `batch_config_rejects_zero_max_bytes`・`batch_config_default_max_bytes_is_max_batch_bytes`・`batch_buffer_fires_on_bytes_limit_before_size_limit`・`batch_buffer_does_not_fire_when_bytes_exactly_at_limit`・`batch_buffer_rejects_single_frame_larger_than_max_bytes`・`batch_buffer_accepts_single_frame_exactly_at_max_bytes`・`max_batch_bytes_bounds_worst_case_far_below_size_only_limit` |
 | TASK-13.4 | 受信フレームの長さ・滞留件数を、本体バッファ確保前に設定上限で検証する受理判定ゲート（無制限確保による DoS の防止） | `crates/io/src/recv_limits.rs` の `ReceiveLimits::admit`（`BatchConfig` から `for_batch` で導出。`RESOURCE_EXHAUSTED` で拒否）・`AdmittedHeader::allocate_body`（受理後に一括で本体バッファを確保する経路） | `io1_admit_rejects_payload_over_limit_before_allocation`・`io1_admit_rejects_pending_at_limit_before_allocation`・`io1_admit_pending_check_ignores_control_frames`・`io1_admit_accepts_boundaries`・`io1_admitted_allocates_exactly_once`（陽性対照）・`io1_admitted_decode_body_round_trips`・`tests/recv_limits.rs` の `io1_public_api_under_limit_frames_are_buffered`・`io1_public_api_over_config_max_bytes_rejected_before_batch_push` |
+| TASK-13.3 | `--batch-size` 相当の設定 API（CLI / 設定の文字列から検証済み `BatchConfig`・`ReceiveLimits` を単一の入口から導く） | `crates/io/src/settings.rs` の `parse_batch_size`・`WritebackSettings`（`FromStr for BatchConfig` も同じ検証へ委譲） | `settings.rs` の `io1_parse_batch_size_accepts_one`・`io1_parse_batch_size_accepts_max`・`io1_parse_batch_size_rejects_zero_and_out_of_range`・`io1_parse_batch_size_rejects_non_ascii_digit`・`io1_parse_batch_size_rejects_overflow`・`io1_writeback_settings_receive_limits_match_batch_config`・`tests/settings.rs` の `io1_settings_rejects_zero_and_negative`・`io1_settings_rejects_non_numeric_and_out_of_range`・`unix::io1_settings_batch_size_{1,5,64}_via_uds_fires_at_configured_count` |
 
-補足: TASK-13.1（#76）でバッチ集約バッファ（`BatchBuffer`）と設定 API（`BatchConfig`）を追加した。TASK-13.2.1（#820）で UDS サーバー側トランスポート（`UdsServer`・`UdsConnection`。Linux / macOS。1 接続の期限付き送受信までを提供し、受付ループ自体は呼び出し側が組む）を追加した。ディスク書き込み・ACK 返却・`BatchBuffer` とのつなぎ込み・クライアント側の UDS 接続・CLI からのバッチサイズ配線（`--batch-size` 相当）は本書時点では未実装であり、TASK-13.2.2（#822）・TASK-13.3 の範囲で扱う（REPAIR-3: 実装済みを装わない）。累積バイト数上限（`MAX_BATCH_BYTES`）は `BatchBuffer` 単体の確保量を抑える安全弁であり、受信経路の長さ・件数検証は `recv_limits`（TASK-13.4・#796）が担う。複数接続を跨いだ累積・未フラッシュ滞留量上限（IO-10・TASK-16）とは別物。
+補足: TASK-13.1（#76）でバッチ集約バッファ（`BatchBuffer`）と設定 API（`BatchConfig`）を追加した。TASK-13.2.1（#820）で UDS サーバー側トランスポート（`UdsServer`・`UdsConnection`。Linux / macOS。1 接続の期限付き送受信までを提供し、受付ループ自体は呼び出し側が組む）を追加した。TASK-13.2.2（#822）でディスク書き込み・ACK 返却・`BatchBuffer` とのつなぎ込み（`serve_connection`・`AppendFileSink`）を追加した。TASK-13.3（#78）で `--batch-size` 相当の設定 API（CLI / 設定の文字列から検証済み `BatchConfig` と `ReceiveLimits` を単一の入口から導く `WritebackSettings`・`parse_batch_size`）を追加した（「バッチサイズ設定 API」節参照）。実際の CLI バイナリ（`fandhe-container`）からその値を受け取る配線・クライアント側の UDS 接続は本書時点では未実装であり、TASK-79・後続タスクの範囲で扱う（REPAIR-3: 実装済みを装わない）。累積バイト数上限（`MAX_BATCH_BYTES`）は `BatchBuffer` 単体の確保量を抑える安全弁であり、受信経路の長さ・件数検証は `recv_limits`（TASK-13.4・#796）が担う。複数接続を跨いだ累積・未フラッシュ滞留量上限（IO-10・TASK-16）とは別物。
 
 「確保量の上限は `admit` を通過した `AdmittedHeader` からしか得られない」という契約には 2 つの経路がある（#820 レビュー指摘。security P2）: 一括確保する経路は `AdmittedHeader::allocate_body`（`Frame::decode_body` 等が本体をまるごと読める場合向け）を使い、相手が遅い・悪意ある場合でも接続 1 本あたりの瞬間的なメモリ使用量を抑えたい分割読みの経路（`crates/io/src/server.rs` の `read_body_until`。UDS 受信ループが使う）は本メソッドを経由せず `AdmittedHeader::body_len` を読み取りの上限として使う。どちらの経路も `AdmittedHeader` を経由しない長さを確保量へ用いてはならない。分割読みの経路は、確保容量そのものも `body_len` 以下に保つ（`imp::BodyBuffer`。初期容量 `min(body_len, 64 KiB)`、空きを使い切ったときだけ `reserve_exact` で最大 64 KiB ずつ伸ばし、償却つきの成長〔2 倍化〕で `body_len` を超えて確保しない。読み込み先は `Vec` の領域そのもので中間バッファを持たない。#820 codex P0 指摘対応）。復号は所有権を受け取る crate 内部の変種（`AdmittedHeader::decode_body_owned` → `Frame::decode_body_owned`。検証は `Frame::decode_body` と共通の `Frame::verify_body`）で行い、チェックサム検証後に末尾のチェックサムを落とした同じ領域をペイロードとして使う（複製しない）。したがって 1 フレームの受信で申告長に比例して確保するのは `body_len` ぶんの 1 回だけである（#820 codex P0 指摘対応）。
 
@@ -298,6 +299,22 @@ ACK をバッチ書き込みの後に返すため、クライアントが `batch
 
 `serve_connection` の write-back は同期的（発火したバッチをその場で書き込み・ACK まで終えてから次のフレームを受信する）であり、受信時点で「排出済みだが未書き込み」のキューは常に空になる。したがって `crates/io/src/server.rs` が `ReceiveLimits::admit` へ渡す `pending_frames = 0` は、現行の呼び出し方の下で構造上正確（`crates/io/src/recv_limits.rs`・`crates/io/src/writeback.rs` の各モジュール doc 参照）。write-back を非同期化する場合はこの前提を見直す必要がある。
 
+## バッチサイズ設定 API（TASK-13.3・IO-1・#78）
+
+`crates/io/src/settings.rs` の `parse_batch_size` が、CLI / 設定の文字列値から検証済み `BatchConfig` を作る入口。`WritebackSettings` はその `BatchConfig` と、`UdsServer::bind` が使う `ReceiveLimits` を同じ内部値から導く単一の入口（`WritebackSettings::receive_limits()` は常に `WritebackSettings::batch_config()` と整合する。REPAIR-2: `bind` と `serve_connection` に別々の設定を渡してしまう経路を型で塞ぐ）。
+
+パース規則（fail-closed の順で検査する）:
+
+1. 空文字列 → `INVALID_ARGUMENT`
+2. `MAX_BATCH_SIZE_ARG_LEN`（20 バイト。`u64::MAX` の桁数）を超える長さ → パースを試みる前に `INVALID_ARGUMENT`（P0: 無制限確保による DoS の防止）
+3. ASCII 数字（`0`-`9`）以外を 1 文字でも含む（符号・空白・桁区切り `_`・全角数字・`0x` 表記を含む） → `INVALID_ARGUMENT`
+4. `usize::from_str` が桁あふれで失敗 → `INVALID_ARGUMENT`
+5. 範囲（`1..=MAX_BATCH_SIZE`）の検証は二重に持たず `BatchConfig::new` へ委譲する（`0` または `MAX_BATCH_SIZE` 超は `INVALID_ARGUMENT`）
+
+先頭ゼロ（`"064"`）は `usize::from_str` と同じく 64 として受理する。エラーメッセージには入力値そのものを含めない（security.md「情報漏えい」観点。任意長・制御文字を含みうる外部入力をログ・構造化エラーへそのまま流し込まないため）。
+
+CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設定のキー名（`BATCH_SIZE_SETTING_KEY = "batch_size"`）は定数として予約するのみで、実際の CLI バイナリ（`fandhe-container`）からの配線は TASK-79（`crates/cli`）、TOML 等の宣言的設定ファイルからの読み込みは CLI-4（TASK-82）の範囲。`max_bytes`（累積バイト数上限）用の CLI / 設定値（`--batch-bytes` 相当）は本タスクの対象外（IO-10・TASK-16）であり、`WritebackSettings` を `#[non_exhaustive]` にすることで後から非公開フィールドとして追加できる形にしている。
+
 ### 範囲外（後続タスク。要起票）
 
 - UDS 接続受付ループ（accept → `serve_connection` → 次の accept）・同時接続数の上限
@@ -305,7 +322,7 @@ ACK をバッチ書き込みの後に返すため、クライアントが `batch
 - 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
 - FLUSH ACK の返却・`syncfs`（TASK-15.2.1・#823・TASK-15.2.2・#824）
 - 件数未達分を時間ベースで追い出す仕組み・未フラッシュ滞留量の上限（IO-10・TASK-16）
-- CLI からの `--batch-size` 配線（TASK-13.3・#78）
+- 実際の CLI バイナリ（`fandhe-container`）での `--batch-size` 引数の解釈・`crates/cli → crates/io` の依存追加（TASK-79）
 - ファイル操作を表すペイロード形式（パス・rename・truncate。TASK-14 の前提。I/O 契約の拡張にあたる）
 - Windows のトランスポート（`windows-sys` の依存承認が必要）
 

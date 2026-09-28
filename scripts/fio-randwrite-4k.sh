@@ -41,8 +41,12 @@
 #   `error` は 0 で、`global options` と `job options` を合わせた fio オプションは
 #   run モードが渡すものと同じ集合（name・directory・filename・rw・bs・ioengine・direct・
 #   size・runtime・time_based・iodepth・numjobs・end_fsync・group_reporting）に限る。
-#   値は rw=randwrite・bs=4k（4k/4K/4096）・ioengine=psync・filename=固定名・
-#   end_fsync=1 で、direct・size・runtime・iodepth・numjobs は本スクリプトの
+#   これらはすべて必須（存在する場合だけ照合する項目は置かない。`global options`
+#   だけは fio が空のとき出力しないため省略可）。
+#   値は name=`fandhe-fio-randwrite-4k`・rw=randwrite・bs=4k（4k/4K/4096）・
+#   ioengine=psync・filename=固定名・end_fsync=1 で、directory は ':' を含まない
+#   空でない絶対パス（run モードでは本スクリプトが作った専用サブディレクトリと一致）、
+#   direct・size・runtime・iodepth・numjobs は本スクリプトの
 #   同名オプション（既定値含む）と一致しなければならない。これにより出力の `params` は
 #   元の fio 実行条件と一致することが保証される。条件不一致・欠落・未知のオプションは
 #   exit 2。fio の JSON 上のオプション表現（`job options`/`global options` は
@@ -489,7 +493,9 @@ def fio_flag_enabled:
   else . end
 # 実行条件の検証（IO-8: fio_randwrite_4k_* の名前で出してよいのは 4K ランダム write の
 # 条件で実行された結果だけ）。global options に job options を上書きした実効値で判定する。
-| ($doc["global options"] // {}) as $gopts
+# global options は fio が空のとき出力しないため省略可。`//` は false も省略扱いに
+# してしまうため has で判定し、存在するならオブジェクトであることを要求する。
+| (if ($doc | has("global options")) then $doc["global options"] else {} end) as $gopts
 | if (($gopts | type) != "object") then error("\"global options\" must be an object") else . end
 | ($job["job options"]) as $jopts
 | if (($jopts | type) != "object") then
@@ -506,8 +512,26 @@ def fio_flag_enabled:
 | if ($nonstring | length) > 0 then
     error("fio options must be strings: \($nonstring | join(", "))")
   else . end
-| if (($o | has("name")) and ($o.name != $expect.jobname)) then
-    error("fio option name must be \"\($expect.jobname)\" (got \($o.name | tojson))")
+# 許可リストの項目はすべて必須（「値があるときだけ照合」にしない）。欠落は null として
+# 以下の各比較で不一致になる。
+| if ($o.name != $expect.jobname) then
+    error("fio option name must be present and equal to \"\($expect.jobname)\" (got \($o.name | tojson))")
+  else . end
+# directory: fio の --directory。run モードと同じくコロン（fio のディレクトリ・ファイル名
+# リストの区切り文字）を含まない空でない絶対パスを要求する（Windows 版 fio の
+# ドライブレター形式は受け付けない）。run モードでは $expect.directory に本スクリプトが
+# 作った専用サブディレクトリが入り、完全一致を要求する（--from-json では null）。
+| if ((($o.directory | type) != "string") or ($o.directory == "")) then
+    error("fio option directory must be present and non-empty (got \($o.directory | tojson))")
+  else . end
+| if (($o.directory | startswith("/")) | not) then
+    error("fio option directory must be an absolute path (got \($o.directory | tojson))")
+  else . end
+| if ($o.directory | contains(":")) then
+    error("fio option directory must not contain a colon (got \($o.directory | tojson))")
+  else . end
+| if (($expect.directory != null) and ($o.directory != $expect.directory)) then
+    error("fio option directory must be the private working directory of this run \($expect.directory | tojson) (got \($o.directory | tojson))")
   else . end
 | if ($o.rw != "randwrite") then
     error("fio option rw must be \"randwrite\" (got \($o.rw | tojson))")
@@ -646,7 +670,10 @@ expect_json=$(jq -n \
   --argjson size_bytes "$size_bytes" \
   --argjson runtime "$runtime" \
   '{jobname: $jobname, filename: $filename, direct: $direct, iodepth: $iodepth,
-    numjobs: $numjobs, size: $size, size_bytes: $size_bytes, runtime: $runtime}')
+    numjobs: $numjobs, size: $size, size_bytes: $size_bytes, runtime: $runtime,
+    directory: null}')
+# directory の期待値は run モードでのみ、専用サブディレクトリ作成後に設定する
+# （--from-json では元の実行先を知り得ないため null のまま。形式の照合だけ行う）。
 
 # 変換結果を出す。--output を先に書き、失敗したら stdout には何も出さず exit 2 に
 # する（呼び出し元は exit 0 のときだけ stdout を結果として読む前提）。
@@ -755,6 +782,9 @@ if ! run_dir=$(mktemp -d "${target_dir_real}/fandhe-fio-randwrite-4k.XXXXXXXXXX"
   err "invalid-input" "could not create a private working directory under --target-dir: $target_dir_real"
   exit 2
 fi
+# run モードの fio 出力は、fio の directory がこの専用サブディレクトリと一致することまで
+# 照合する（--from-json では形式のみ。convert_jq_program の directory の照合を参照）。
+expect_json=$(jq -c --arg directory "$run_dir" '.directory = $directory' <<<"$expect_json")
 
 fio_args=(
   --name="$FIO_JOB_NAME"

@@ -157,6 +157,31 @@ run_case "from-json-global-options" 0 --from-json "${fixtures_dir}/fio-3-global-
 # --target-dir は run モード専用。併用すると黙って無視されるため拒否する
 run_case_msg "from-json-with-target-dir" 2 "cannot be combined with --from-json" --from-json "${fixtures_dir}/fio-3-ok.json" --label x --target-dir /tmp
 
+# 必須オプションの欠落（Codex P1: 「値があるときだけ照合」の穴を塞いだことの確認）。
+# 許可リストの 14 項目それぞれを fio-3-ok.json の job options から 1 つだけ消した
+# JSON を作り、どれを消しても exit 2 かつその項目名を挙げて拒否することを照合する。
+missing_dir="${tmp_root}/missing-option-fixtures"
+mkdir -p "$missing_dir"
+for key in name directory filename rw bs ioengine direct size runtime time_based iodepth numjobs end_fsync group_reporting; do
+  missing_fixture="${missing_dir}/fio-3-missing-${key}.json"
+  jq --arg k "$key" 'del(.jobs[0]["job options"][$k])' "${fixtures_dir}/fio-3-ok.json" >"$missing_fixture" 2>/dev/null || true
+  run_case_msg "from-json-missing-option-${key}" 2 "fio option ${key} " --from-json "$missing_fixture" --label x
+done
+
+# directory の形式（空でない・絶対パス・':' を含まない）と global options の型
+make_variant() {
+  # 引数: <出力ファイル名> <jq フィルタ>。fio-3-ok.json を jq で 1 点だけ変えた JSON を作る
+  jq "$2" "${fixtures_dir}/fio-3-ok.json" >"${missing_dir}/$1" 2>/dev/null || true
+}
+make_variant "empty-directory.json" '.jobs[0]["job options"].directory = ""'
+make_variant "relative-directory.json" '.jobs[0]["job options"].directory = "relative/dir"'
+make_variant "colon-directory.json" '.jobs[0]["job options"].directory = "/data:/other"'
+make_variant "global-options-false.json" '. + {"global options": false}'
+run_case_msg "from-json-empty-directory" 2 "fio option directory must be present and non-empty" --from-json "${missing_dir}/empty-directory.json" --label x
+run_case_msg "from-json-relative-directory" 2 "fio option directory must be an absolute path" --from-json "${missing_dir}/relative-directory.json" --label x
+run_case_msg "from-json-colon-directory" 2 "fio option directory must not contain a colon" --from-json "${missing_dir}/colon-directory.json" --label x
+run_case_msg "from-json-global-options-not-object" 2 '"global options" must be an object' --from-json "${missing_dir}/global-options-false.json" --label x
+
 # symlink 入力の拒否（security.md のパストラバーサル・symlink 対策）
 sym_input="${tmp_root}/sym-input.json"
 ln -s "${fixtures_dir}/fio-3-ok.json" "$sym_input"
@@ -389,6 +414,8 @@ run_case_msg "from-json-total-size-over-cap" 2 "total cap" --from-json "${fixtur
 opts_target="${tmp_root}/opts-target"
 mkdir -p "$opts_target"
 FIO_STUB_OVERRIDE_OPTS='{"rw":"randrw"}' PATH="$stub_path" run_case_msg "run-fio-options-mismatch" 2 "fio option rw must be" --target-dir "$opts_target" --label x --runtime 5
+# run モードでは directory が本スクリプトの作った専用サブディレクトリと一致することまで照合する
+FIO_STUB_OVERRIDE_OPTS='{"directory":"/somewhere/else"}' PATH="$stub_path" run_case_msg "run-fio-directory-mismatch" 2 "must be the private working directory of this run" --target-dir "$opts_target" --label x --runtime 5
 
 # fio が exit 0 でも出力 JSON を書かなかった場合は fio 側の失敗（exit 1）として扱う
 FIO_STUB_NO_OUTPUT=1 PATH="$stub_path" run_case_msg "run-fio-no-output" 1 "did not write its JSON output" --target-dir "$opts_target" --label x --runtime 5

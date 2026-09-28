@@ -49,7 +49,9 @@ bash scripts/fio-randwrite-4k.sh --from-json /tmp/fio-out.json --label docker_bi
 
 - `jobs` はちょうど 1 件（`--group_reporting` を付け、ジョブセクションは 1 つ）、`jobname` は `fandhe-fio-randwrite-4k`、`error` は 0
 - `global options` と `jobs[0]["job options"]` を合わせた（job 側を優先した）fio オプションは、run モードが渡すもの（`name`・`directory`・`filename`・`rw`・`bs`・`ioengine`・`direct`・`size`・`runtime`・`time_based`・`iodepth`・`numjobs`・`end_fsync`・`group_reporting`）に限る。これ以外のオプション（`rate_iops`・`fsync`・`percentile_list` 等）が 1 つでもあれば拒否する。`job options` が無い JSON も拒否する
-- 固定値: `rw=randwrite`・`bs=4k`（`4k`/`4K`/`4096`）・`ioengine=psync`・`filename=fandhe-fio-randwrite-4k.dat`・`end_fsync=1`・`time_based` と `group_reporting` が有効（値なし、または `1`）
+- 上記 14 項目はすべて必須で、1 つでも欠ければ拒否する（値があるときだけ照合する項目は置かない）。`global options` は fio が空のとき出力しないため省略可だが、存在する場合はオブジェクトでなければ拒否する
+- 固定値: `name=fandhe-fio-randwrite-4k`・`rw=randwrite`・`bs=4k`（`4k`/`4K`/`4096`）・`ioengine=psync`・`filename=fandhe-fio-randwrite-4k.dat`・`end_fsync=1`・`time_based` と `group_reporting` が有効（値なし、または `1`）
+- `directory`: 空でない絶対パス（`/` で始まる）で、コロン（`:`。fio がディレクトリ・ファイル名リストの区切り文字として解釈する）を含まないこと（run モードの `--target-dir` と同じ制約。Windows 版 fio のドライブレター形式は受け付けない）。run モードではさらに、本スクリプトが作った専用サブディレクトリ（下記「書き込み先の安全性」）と完全一致することを要求する。`--from-json` では元の実行先を知り得ないため形式のみを照合し、値は出力の `params` に含めない
 - 本スクリプトの同名オプション（既定値を含む）との一致: `direct`・`iodepth`・`numjobs`（文字列として一致）、`size`（`k`/`m`/`g` の大文字小文字・単位なしのバイト数を正規化して一致）、`runtime`（秒。末尾 `s` は可）。元の fio 実行が既定値と異なる条件なら、変換時に同じ値を `--size`・`--runtime`・`--iodepth`・`--numjobs`・`--direct` へ渡す
 
 fio の JSON 上のオプション表現（`job options`/`global options` は正規オプション名→入力文字列の組で、値なしフラグは空文字列）は fio 本体（axboe/fio）の `parse.c`（`add_to_dump_list`）・`stat.c`（`json_add_job_opts`）・`json.h` を直接参照して確認した。実 fio の出力での照合は未実施（実機での確認は下記「実機での確認」節）。
@@ -134,7 +136,7 @@ fio はデータファイルを `O_CREAT`（`O_EXCL` なし）で開き symlink 
 
 ## 自己テスト（`scripts/fio-randwrite-4k-selftest.sh`）
 
-`--from-json` モードと `scripts/testdata/fio-bench/` の固定 fixture、および最小の fio スタブ（受け取ったオプションを fio と同じ形で `job options` に記録した固定 JSON を書き出す）を使い、実 fio なしで終了コード・出力値・`check-bench-regression.sh` との round-trip 互換性、実行条件の照合（負例 fixture は照合を通る `job options` を持たせたうえで 1 点だけ壊し、拒否理由をメッセージで照合する）、総書き込み量の上限の境界、および symlink・競合に対する書き込み先の安全性（上記「書き込み先の安全性」・「`--output` の排他作成」。検証後に通常ファイル・FIFO・ディレクトリを指す symlink や実ディレクトリを置く競合をスタブで再現する）を機械照合する（REPAIR-12）。`make fio-bench-selftest` から実行し、CI の `bench-regression` ジョブにも組み込む。run モードの実 fio を使った実行確認は「実機での確認」節を参照。
+`--from-json` モードと `scripts/testdata/fio-bench/` の固定 fixture、および最小の fio スタブ（受け取ったオプションを fio と同じ形で `job options` に記録した固定 JSON を書き出す）を使い、実 fio なしで終了コード・出力値・`check-bench-regression.sh` との round-trip 互換性、実行条件の照合（負例 fixture は照合を通る `job options` を持たせたうえで 1 点だけ壊し、拒否理由をメッセージで照合する。必須 14 項目は 1 つずつ欠落させた JSON を selftest 内で生成して照合する）、総書き込み量の上限の境界、および symlink・競合に対する書き込み先の安全性（上記「書き込み先の安全性」・「`--output` の排他作成」。検証後に通常ファイル・FIFO・ディレクトリを指す symlink や実ディレクトリを置く競合をスタブで再現する）を機械照合する（REPAIR-12）。`make fio-bench-selftest` から実行し、CI の `bench-regression` ジョブにも組み込む。run モードの実 fio を使った実行確認は「実機での確認」節を参照。
 
 ## 実機での確認（人間担当・TASK-25.2 との切り分け）
 

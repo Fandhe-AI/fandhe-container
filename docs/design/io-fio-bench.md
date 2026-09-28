@@ -47,10 +47,10 @@ bash scripts/fio-randwrite-4k.sh --from-json /tmp/fio-out.json --label docker_bi
 
 | オプション | 既定値 | 説明 |
 | ---- | ---- | ---- |
-| `--target-dir <dir>` | （run モード必須） | fio の書き込み先ディレクトリ。symlink 拒否・書き込み可能なディレクトリであることを検証してから `realpath` で正規化する |
+| `--target-dir <dir>` | （run モード必須） | fio の書き込み先ディレクトリ。symlink 拒否・書き込み可能なディレクトリであることを検証してから `realpath` で正規化する。正規化後のパスに `:` を含む場合も拒否する（fio が `--directory`/`--filename` の `:` をディレクトリ・ファイル名リストの区切り文字として解釈するため） |
 | `--from-json <path>` | （from-json モード必須） | 既存の fio `--output-format=json` 出力へのパス。symlink 拒否・サイズ上限（4 MiB）あり |
 | `--label <label>` | 必須 | `^[a-z0-9_-]{1,64}$`。出力 JSON にそのまま記録し、計測対象（Docker ベースラインか fandhe 経路か等）を表す |
-| `--output <path>` | （出力しない） | 指定時、結果 JSON をこのパスにも書く。symlink 拒否・既存ファイルへの上書きは拒否する |
+| `--output <path>` | （出力しない） | 指定時、結果 JSON をこのパスにも書く。symlink 拒否・既存ファイルへの上書きは拒否する。親ディレクトリの存在・書き込み可否も事前検証する（未検証のまま書き込みに失敗すると、呼び出し元が終了コード 1「fio 実行失敗」と誤認するため） |
 | `--direct 0\|1` | `1` | fio `--direct`。tmpfs・FUSE 系の共有 FS では O_DIRECT が失敗しうるため変更できる |
 | `--size <NkNmNg>` | `256m` | fio `--size`。`^[1-9][0-9]{0,5}[kmg]$`（先頭ゼロ不可）かつ 10 GiB 以下（DoS 防止の上限） |
 | `--runtime <1-600>` | `30` | fio `--runtime`（秒。`--time_based` と併用）。`^[1-9][0-9]{0,3}$`（先頭ゼロ不可） |

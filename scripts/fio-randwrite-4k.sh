@@ -81,7 +81,8 @@ usage:
   fio-randwrite-4k.sh --from-json <fio-output.json> --label <label> [options]
 
 common options:
-  --output <path>     also write the result JSON to this path (must not exist)
+  --output <path>     also write the result JSON to this path (must not exist;
+                       parent directory must already exist and be writable)
   -h, --help          show this help
 
 run-mode-only options:
@@ -262,6 +263,22 @@ if [ -n "$output_path" ]; then
     err "invalid-input" "--output path already exists, refusing to overwrite: $output_path"
     exit 2
   fi
+  # 親ディレクトリの存在・書き込み可否をここで検証する。検証せずに後段の
+  # `printf ... >"$output_path"` に任せると、`set -e` 下でその書き込み失敗が
+  # そのままスクリプトを終了させ、fio 実行失敗（exit 1）または fio-3-legacy 等の
+  # 別要因と誤分類される（呼び出し元が exit 1 を見て「fio 自体が失敗した」と
+  # 誤認し、実際には計測・変換自体は成功していたケースを再計測ループに入れる、
+  # または exit 2 を期待する検証コードを素通りさせる）。入力エラー（exit 2）として
+  # fail-closed に倒す（docs/design/io-fio-bench.md の終了コード契約と整合）。
+  output_dir=$(dirname -- "$output_path")
+  if [ ! -d "$output_dir" ]; then
+    err "invalid-input" "--output parent directory does not exist: $output_dir"
+    exit 2
+  fi
+  if [ ! -w "$output_dir" ]; then
+    err "invalid-input" "--output parent directory is not writable: $output_dir"
+    exit 2
+  fi
 fi
 
 # --------------------------------------------------
@@ -423,6 +440,21 @@ if [ ! -w "$target_dir" ]; then
   exit 2
 fi
 target_dir_real=$(realpath -- "$target_dir")
+
+# fio の `--directory`/`--filename` は ':' をリスト区切り文字として解釈し
+# （fio 本体の `filename.c` の `add_file`/`get_next_filename` 周辺が
+# `FIO_ARR_SEP`（':'）でディレクトリ・ファイル名リストを分割する。マニュアルの
+# `directory=str`/`filename=str` の「複数指定は ':' 区切り」という記述と一致する。
+# エスケープは `\:`。この環境に fio が無く実機での再現確認はしていない）、
+# ':' を含む正規化後のパスを渡すと fio が意図しない複数ディレクトリへ書き込みうる。
+# `cleanup()` は固定の 1 ファイルしか消さないため、他の書き込み先にデータファイルが
+# 残留する（security.md の「ボリューム外へ書き込める経路を作らない」に反する）。
+# realpath 後の値を検証し、シンボリックリンク解決や相対解釈で ':' が入り込む
+# 余地を残さない。
+if [ "$target_dir_real" != "${target_dir_real//:/}" ]; then
+  err "invalid-input" "--target-dir must not contain ':' (fio treats ':' as a directory/filename list separator): $target_dir_real"
+  exit 2
+fi
 
 tmp_dir=$(mktemp -d)
 fio_out_json="${tmp_dir}/fio-output.json"

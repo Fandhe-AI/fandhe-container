@@ -142,6 +142,23 @@ else
 fi
 run_case "output-refuse-overwrite" 2 --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "$out_path"
 
+# --output の親ディレクトリが存在しない場合は入力エラー（exit 2）として弾く
+# （回帰テスト: `printf ... >"$output_path"` の書き込み失敗に丸投げすると
+# `set -e` 経由で「fio 実行失敗」（exit 1）に誤分類されていた）。
+run_case "output-parent-missing" 2 --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "${tmp_root}/no-such-dir-xyz/out.json"
+
+# --output の親ディレクトリが書き込み不可の場合も同様に exit 2（root 実行では
+# permission bit が強制されないため他の readonly ケースと同様に skip する）。
+readonly_output_dir="${tmp_root}/readonly-output-dir"
+mkdir -p "$readonly_output_dir"
+chmod 555 "$readonly_output_dir"
+if [ "$(id -u)" -eq 0 ]; then
+  echo "SKIP: output-parent-readonly (running as root, permission bits are not enforced)"
+else
+  run_case "output-parent-readonly" 2 --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "${readonly_output_dir}/out.json"
+fi
+chmod 755 "$readonly_output_dir"
+
 # --------------------------------------------------
 # run モード: 引数検証・ツール欠如検出（実 fio は使わない）
 # --------------------------------------------------
@@ -219,6 +236,13 @@ real_target="${tmp_root}/real-target"
 mkdir -p "$real_target"
 ln -s "$real_target" "$sym_target"
 PATH="$stub_path" run_case "run-symlink-target-dir" 2 --target-dir "$sym_target" --label x
+
+# ':' を含む --target-dir の拒否（fio が --directory/--filename の ':' を
+# ディレクトリ・ファイル名リストの区切り文字として解釈する仕様への対策。
+# security.md の「ボリューム外へ書き込める経路を作らない」）
+colon_target="${tmp_root}/colon:target"
+mkdir -p "$colon_target"
+PATH="$stub_path" run_case "run-target-dir-with-colon" 2 --target-dir "$colon_target" --label x
 
 readonly_target="${tmp_root}/readonly-target"
 mkdir -p "$readonly_target"

@@ -372,6 +372,28 @@ mod tests {
         }
     }
 
+    /// テスト専用のモック sender。最初の `send_frame` 呼び出しだけ `Timeout` を
+    /// 返し、以降は成功する。同一クライアント上で「失敗 → 成功」の連続を再現し、
+    /// 失敗した送信が id を消費していないことを確認するために使う。
+    #[derive(Debug, Default)]
+    struct FailOnceSender {
+        failed_once: bool,
+        sent: Vec<Frame>,
+    }
+
+    impl FrameSender for FailOnceSender {
+        type Frame = Frame;
+
+        fn send_frame(&mut self, frame: &Self::Frame, _timeout: IoTimeout) -> Result<(), IoError> {
+            if !self.failed_once {
+                self.failed_once = true;
+                return Err(IoError::new(IoErrorCode::Timeout, "mock times out once"));
+            }
+            self.sent.push(frame.clone());
+            Ok(())
+        }
+    }
+
     /// IO-1: `InFlightLimit::new(0)` は `InvalidArgument` で拒否される。
     #[test]
     fn io1_in_flight_limit_rejects_zero() {
@@ -525,7 +547,8 @@ mod tests {
     }
 
     /// IO-1・TASK-12.1: トランスポートへの書き込みが失敗した場合はキューへ登録
-    /// せず、id も消費しない（次に成功したときの id が `0` から始まる）。
+    /// せず、id も消費しない（同一クライアントで「1 回失敗 → 成功」を再現し、
+    /// 成功した送信の id が `0` から始まることを確認する）。
     #[test]
     fn io1_pipeline_client_does_not_register_on_transport_error() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
@@ -537,13 +560,20 @@ mod tests {
         assert_eq!(err.code(), IoErrorCode::Timeout);
         assert_eq!(client.queue().len(), 0);
 
-        // sender を成功するものへ差し替えても、失敗した送信は id を消費していない
-        // ことを確認する（新しいクライアントで id が 0 から始まる）。
-        let mut client = PipelineClient::new(RecordingSender::default(), limit);
+        // 同一クライアント上で「1 回失敗 → その後成功」を再現し、失敗した送信が
+        // id を消費していないことを確認する（成功した送信の id が `0` から始まる）。
+        let mut client = PipelineClient::new(FailOnceSender::default(), limit);
+        let first_attempt = client
+            .send(&write_frame(1), test_timeout())
+            .expect_err("1st attempt must fail via the mock sender");
+        assert_eq!(first_attempt.code(), IoErrorCode::Timeout);
+        assert_eq!(client.queue().len(), 0);
+
         let request = client
             .send(&write_frame(1), test_timeout())
-            .expect("send must succeed with a working sender");
+            .expect("2nd attempt must succeed once the mock sender stops failing");
         assert_eq!(request.id().get(), 0);
+        assert_eq!(client.queue().len(), 1);
     }
 
     /// IO-1・TASK-12.1: id の採番が `u64` の範囲を超える場合は `ResourceExhausted`

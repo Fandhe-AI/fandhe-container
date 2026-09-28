@@ -1,16 +1,21 @@
 //! バッチ write-back サーバー（TASK-13）の最初の部品として、受信した書き込み
 //! フレームをメモリ内で集約するバッファ（TASK-13.1・IO-1・#76・MS-1）。
 //!
-//! 本モジュールが持つのは「一定件数（既定 [`DEFAULT_BATCH_SIZE`]）ぶんの
-//! [`crate::protocol::Frame`] を溜め、件数に達した時点でバッチ（値）を返す」
-//! 純粋なメモリ内ロジックのみ。ソケット・スレッド・ディスク書き込み・ACK 返却・
-//! タイマーは一切持たない（REPAIR-3: 実装済みを装わない）。
+//! 本モジュールが持つのは「一定件数（既定 [`DEFAULT_BATCH_SIZE`]）・
+//! 一定累積バイト数（既定 [`MAX_BATCH_BYTES`]）ぶんの [`crate::protocol::Frame`]
+//! を溜め、いずれかの上限に達した時点でバッチ（値）を返す」純粋なメモリ内
+//! ロジックのみ。ソケット・スレッド・ディスク書き込み・ACK 返却・タイマーは
+//! 一切持たない（REPAIR-3: 実装済みを装わない）。累積バイト数上限は
+//! [`BatchBuffer`] 単体が確保し続けるメモリ量そのものを抑える安全弁であり
+//! （P0: 無制限確保による DoS の防止）、下記スコープ外の「受信経路」自体の
+//! 検証・複数バッファ / 接続を跨いだ滞留量上限とは独立している。
 //!
 //! # スコープ外（TASK-13 の兄弟 sub-issue が担う）
 //! - ディスクへの書き込み実行・ACK フレームの返却（TASK-13.2・TASK-13.2.2）
 //! - UDS 接続受付ループ（`server.rs`。TASK-13.2.1）
-//! - CLI / 設定からのバッチサイズ配線（`--batch-size` 相当。TASK-13.3）
-//! - 受信フレーム長・累積件数 / バイト数の上限検証（受信経路の DoS 対策。TASK-13.4）
+//! - CLI / 設定からのバッチサイズ・バイト数上限配線（`--batch-size` 相当。TASK-13.3）
+//! - 受信フレーム長そのものの検証・複数接続を跨いだ受信経路の DoS 対策
+//!   （TASK-13.4）
 //! - FLUSH バリアの処理（IO-2・TASK-15）・未フラッシュ滞留量上限（IO-10・TASK-16）
 //!
 //! # 呼び出し文脈
@@ -45,11 +50,31 @@ pub const DEFAULT_BATCH_SIZE: usize = 64;
 /// IO-1 は既定値（64 件）のみを定め、上限は定めていない。PoC-12 のスイープ
 /// 最大値（256）に対し 16 倍の余裕として 4096 を暫定的に置く。件数の上限だけ
 /// では 1 フレームあたり最大 64 MiB（[`crate::protocol::MAX_PAYLOAD_LEN`]）の
-/// ペイロード合計バイト数は抑えられない。バイト数上限は IO-10（TASK-16）・
-/// 受信側の検証は TASK-13.4（#796）の責務であり、本モジュールは関知しない。
+/// ペイロード合計バイト数は抑えられない（この累積バイト数の上限は
+/// [`MAX_BATCH_BYTES`] が別途担う。受信経路自体の長さ・件数検証は
+/// IO-10（TASK-16）・TASK-13.4（#796）の責務であり、本モジュールが持つのは
+/// 「1 つの [`BatchBuffer`] インスタンスが確保し続けるメモリ量」自体の上限）。
 /// この値自体も TASK-13.3・TASK-13.4・TASK-16・TASK-88（ベンチ校正）で
 /// 見直してよい暫定値（REPAIR-3）。
 pub const MAX_BATCH_SIZE: usize = 4096;
+
+/// バッチ 1 つあたりの累積ペイロードバイト数の既定上限（P0: 無制限確保による
+/// DoS の防止。security.md「長さ・件数を上限検証してからアロケーションに
+/// 使う」）。
+///
+/// [`MAX_BATCH_SIZE`]（4096 件）は 1 フレームあたり最大
+/// [`crate::protocol::MAX_PAYLOAD_LEN`]（64 MiB）のペイロードを持つ
+/// `Write` フレームを許すため、件数のみの制限では 1 バッファが理論上
+/// 約 256 GiB（4096 × 64 MiB）ものペイロードを滞留させられてしまう
+/// （#76 PR #1105 codex レビュー指摘）。本定数は [`BatchBuffer`] が
+/// 実際にヒープへ保持し続けるバイト数そのものに独立した上限を設け、
+/// 件数上限とは別の安全弁として累積量を抑える。
+///
+/// 256 MiB という値自体は「256 GiB という桁を潰す」以上の根拠を持たない
+/// 暫定値であり、実測に基づく校正は IO-10・TASK-13.4・TASK-16・TASK-88
+/// の責務（REPAIR-3: 実装済みを装わない）。呼び出し側が独自の上限を
+/// 必要とする場合は [`BatchConfig::with_max_bytes`] で個別に指定できる。
+pub const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
 
 // DEFAULT_BATCH_SIZE は 1..=MAX_BATCH_SIZE の範囲内でなければならない不変条件を
 // コンパイル時に保証する（`protocol.rs` の `MAX_PAYLOAD_LEN < u32::MAX` と同種の
@@ -57,22 +82,40 @@ pub const MAX_BATCH_SIZE: usize = 4096;
 // が将来 MAX_BATCH_SIZE の変更で実行時パニックへ化けることを防ぐ。
 const _: () = assert!(DEFAULT_BATCH_SIZE >= 1 && DEFAULT_BATCH_SIZE <= MAX_BATCH_SIZE);
 
-/// [`BatchBuffer`] の集約単位（件数）を表す設定値（IO-1）。
+// MAX_BATCH_BYTES は非ゼロでなければならない（`NonZeroUsize` で表現するため）。
+const _: () = assert!(MAX_BATCH_BYTES > 0);
+
+/// [`BatchBuffer`] の集約単位（件数・累積バイト数）を表す設定値（IO-1）。
 ///
-/// 非公開フィールドに `NonZeroUsize` を持ち、[`Self::new`] を経由しない限り
-/// `1..=MAX_BATCH_SIZE` の範囲外の値を表現できない（REPAIR-2: 壊れた値を
-/// 表現できない型）。
+/// 非公開フィールドに `NonZeroUsize` を持ち、[`Self::new`] /
+/// [`Self::with_max_bytes`] を経由しない限り `1..=MAX_BATCH_SIZE`（件数）・
+/// `1..=usize::MAX`（累積バイト数）の範囲外の値を表現できない
+/// （REPAIR-2: 壊れた値を表現できない型）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BatchConfig {
     batch_size: NonZeroUsize,
+    max_bytes: NonZeroUsize,
 }
 
 impl BatchConfig {
-    /// `batch_size` からバッチ設定を作る。
+    /// `batch_size` からバッチ設定を作る。累積バイト数上限は既定
+    /// [`MAX_BATCH_BYTES`] を使う。
     ///
     /// `0` または [`MAX_BATCH_SIZE`] を超える値は
     /// [`IoErrorCode::InvalidArgument`] として拒否する。
     pub fn new(batch_size: usize) -> Result<Self, IoError> {
+        Self::with_max_bytes(batch_size, MAX_BATCH_BYTES)
+    }
+
+    /// `batch_size`・累積ペイロードバイト数上限（`max_bytes`）を指定して
+    /// バッチ設定を作る（P0: 無制限確保による DoS の防止。呼び出し側〔TASK-13.3
+    /// の `--batch-size` 相当の配線・TASK-16 の滞留量上限〕が既定
+    /// [`MAX_BATCH_BYTES`] と異なる上限を必要とする場合に使う）。
+    ///
+    /// `batch_size` が `0` または [`MAX_BATCH_SIZE`] を超える値、
+    /// あるいは `max_bytes` が `0` の場合は
+    /// [`IoErrorCode::InvalidArgument`] として拒否する。
+    pub fn with_max_bytes(batch_size: usize, max_bytes: usize) -> Result<Self, IoError> {
         if batch_size == 0 {
             return Err(IoError::new(
                 IoErrorCode::InvalidArgument,
@@ -85,25 +128,42 @@ impl BatchConfig {
                 format!("batch size must be at most {MAX_BATCH_SIZE}"),
             ));
         }
-        // 上の 2 分岐で 1..=MAX_BATCH_SIZE の範囲を確認済みのため、
-        // NonZeroUsize::new は必ず Some を返す。
+        if max_bytes == 0 {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                "max batch bytes must be at least 1",
+            ));
+        }
+        // 上の分岐で 1..=MAX_BATCH_SIZE・1..=usize::MAX の範囲を確認済みのため、
+        // 以下の NonZeroUsize::new は必ず Some を返す。
         let batch_size = NonZeroUsize::new(batch_size)
             .ok_or_else(|| IoError::new(IoErrorCode::Internal, "unexpected zero batch size"))?;
-        Ok(Self { batch_size })
+        let max_bytes = NonZeroUsize::new(max_bytes)
+            .ok_or_else(|| IoError::new(IoErrorCode::Internal, "unexpected zero max bytes"))?;
+        Ok(Self {
+            batch_size,
+            max_bytes,
+        })
     }
 
     /// 検証済みのバッチサイズを返す。
     pub fn batch_size(&self) -> usize {
         self.batch_size.get()
     }
+
+    /// 検証済みの累積ペイロードバイト数上限を返す。
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes.get()
+    }
 }
 
 impl Default for BatchConfig {
-    /// IO-1 の既定値（[`DEFAULT_BATCH_SIZE`] = 64）を使う。
+    /// IO-1 の既定値（[`DEFAULT_BATCH_SIZE`] = 64・[`MAX_BATCH_BYTES`]）を使う。
     fn default() -> Self {
         // 上記の `const _: () = assert!(...)` により DEFAULT_BATCH_SIZE は
-        // 1..=MAX_BATCH_SIZE 範囲内であることがコンパイル時に保証されているため、
-        // この expect は到達不能であり実行時パニックにはならない。
+        // 1..=MAX_BATCH_SIZE 範囲内、MAX_BATCH_BYTES は非ゼロであることが
+        // コンパイル時に保証されているため、この expect は到達不能であり
+        // 実行時パニックにはならない。
         Self::new(DEFAULT_BATCH_SIZE).expect("DEFAULT_BATCH_SIZE must be a valid batch size")
     }
 }
@@ -125,6 +185,9 @@ impl TryFrom<usize> for BatchConfig {
 pub enum BatchTrigger {
     /// 設定件数（[`BatchConfig::batch_size`]）に到達して自動発火した。
     SizeReached,
+    /// 累積ペイロードバイト数が上限（[`BatchConfig::max_bytes`]）に達し、
+    /// 件数未達のまま自動発火した（P0: 無制限確保による DoS の防止）。
+    BytesLimitReached,
     /// [`BatchBuffer::take_pending`] により、件数未達のまま強制的に取り出された。
     Drained,
 }
@@ -213,12 +276,21 @@ pub enum PushOutcome {
 /// - バッファは設定件数を超えて溜まらない（到達した時点で `push` 内部で
 ///   自動的にバッチを取り出して返すため、「満杯なのに未 drain」の状態を
 ///   構造上作らない）
+/// - バッファは累積ペイロードバイト数（[`BatchConfig::max_bytes`]。既定
+///   [`MAX_BATCH_BYTES`]）も超えて溜まらない。新しいフレームを加えると
+///   上限を超える場合は、そのフレームを加える前に既存の滞留分を
+///   [`BatchTrigger::BytesLimitReached`] として強制発火させる（P0: 無制限
+///   確保による DoS の防止。件数上限とは独立した安全弁）
 /// - 時間ベースの追い出しは持たない。件数未達のまま残るフレームの扱い
 ///   （接続終了・FLUSH・滞留量上限）は [`Self::take_pending`] を呼ぶ側
 ///   （TASK-13.2.2・TASK-15・TASK-16）の責務
 pub struct BatchBuffer {
     config: BatchConfig,
     pending: Vec<Frame>,
+    /// `pending` 内の全フレームのペイロードバイト数の合計
+    /// （[`BatchConfig::max_bytes`] との比較に使う。`pending` から独立して
+    /// 保持することで、push のたびに `pending` 全体を走査し直す必要をなくす）。
+    pending_bytes: usize,
 }
 
 impl BatchBuffer {
@@ -229,7 +301,11 @@ impl BatchBuffer {
     /// 「長さ・件数を上限検証してからアロケーションに使う」）。
     pub fn new(config: BatchConfig) -> Self {
         let pending = Vec::with_capacity(config.batch_size());
-        Self { config, pending }
+        Self {
+            config,
+            pending,
+            pending_bytes: 0,
+        }
     }
 
     /// このバッファのバッチ設定を返す。
@@ -247,14 +323,42 @@ impl BatchBuffer {
         self.pending.is_empty()
     }
 
+    /// 現在の滞留ペイロードバイト数の合計を返す（[`BatchConfig::max_bytes`]
+    /// との比較対象。REPAIR-4: 可観測性）。
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
+    /// `pending` を空の新しいバッファへ差し替え、それまでの内容を `trigger`
+    /// 付きの [`Batch`] として取り出す共通処理（`push` の件数 / バイト数上限
+    /// 到達・`take_pending` の 3 箇所から呼ばれる）。`pending_bytes` も
+    /// 合わせて `0` へリセットする。
+    fn drain_pending(&mut self, trigger: BatchTrigger) -> Batch {
+        let batch_size = self.config.batch_size();
+        let frames = std::mem::replace(&mut self.pending, Vec::with_capacity(batch_size));
+        self.pending_bytes = 0;
+        Batch { frames, trigger }
+    }
+
     /// フレームを 1 件バッファへ追加する。
     ///
     /// `frame` が [`FrameKind::Write`] 以外の場合は
     /// [`IoErrorCode::InvalidArgument`] を返し、バッファの内容は変更しない。
-    /// 追加後の滞留件数が設定件数（[`BatchConfig::batch_size`]）に到達した場合、
-    /// バッファ内のフレームをすべて取り出して [`PushOutcome::Ready`] として返し、
-    /// バッファは空の状態（次バッチぶんの容量を確保済み）に戻る。到達しなければ
-    /// [`PushOutcome::Buffered`] を返す。
+    ///
+    /// 追加前に、このフレームを加えると累積ペイロードバイト数が設定上限
+    /// （[`BatchConfig::max_bytes`]）を超えると判明した場合（かつ既に滞留分が
+    /// ある場合）は、そのフレームを加える前に既存の滞留分を
+    /// [`BatchTrigger::BytesLimitReached`] な [`PushOutcome::Ready`] として
+    /// 強制的に取り出し、渡された `frame` は空になったバッファへ新たに
+    /// 積む（次回以降の呼び出しで扱われる。P0: 無制限確保による DoS の防止。
+    /// 1 フレーム自体の長さは [`crate::protocol::MAX_PAYLOAD_LEN`] で
+    /// 別途検証済みのため、単独のフレームが理由で拒否されることはない）。
+    ///
+    /// 上記のバイト数上限に抵触せず追加できた場合、追加後の滞留件数が設定件数
+    /// （[`BatchConfig::batch_size`]）に到達したときも同様にバッファ内の
+    /// フレームをすべて [`BatchTrigger::SizeReached`] として取り出して返し、
+    /// バッファは空の状態（次バッチぶんの容量を確保済み）に戻る。
+    /// どちらの上限にも到達しなければ [`PushOutcome::Buffered`] を返す。
     pub fn push(&mut self, frame: Frame) -> Result<PushOutcome, IoError> {
         if frame.kind() != FrameKind::Write {
             return Err(IoError::new(
@@ -263,15 +367,23 @@ impl BatchBuffer {
             ));
         }
 
+        let frame_len = frame.payload().len();
+
+        if !self.pending.is_empty()
+            && self.pending_bytes.saturating_add(frame_len) > self.config.max_bytes()
+        {
+            let flushed = self.drain_pending(BatchTrigger::BytesLimitReached);
+            self.pending.push(frame);
+            self.pending_bytes = frame_len;
+            return Ok(PushOutcome::Ready(flushed));
+        }
+
         self.pending.push(frame);
+        self.pending_bytes = self.pending_bytes.saturating_add(frame_len);
 
         if self.pending.len() >= self.config.batch_size() {
-            let batch_size = self.config.batch_size();
-            let frames = std::mem::replace(&mut self.pending, Vec::with_capacity(batch_size));
-            return Ok(PushOutcome::Ready(Batch {
-                frames,
-                trigger: BatchTrigger::SizeReached,
-            }));
+            let batch = self.drain_pending(BatchTrigger::SizeReached);
+            return Ok(PushOutcome::Ready(batch));
         }
 
         Ok(PushOutcome::Buffered {
@@ -288,12 +400,7 @@ impl BatchBuffer {
         if self.pending.is_empty() {
             return None;
         }
-        let batch_size = self.config.batch_size();
-        let frames = std::mem::replace(&mut self.pending, Vec::with_capacity(batch_size));
-        Some(Batch {
-            frames,
-            trigger: BatchTrigger::Drained,
-        })
+        Some(self.drain_pending(BatchTrigger::Drained))
     }
 }
 
@@ -496,5 +603,141 @@ mod tests {
     fn io1_batch_buffer_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<BatchBuffer>();
+    }
+
+    /// `frame` を指定バイト数のペイロードで作る（`write_frame` と異なり、
+    /// バイト数上限のテストでは中身ではなくペイロード長のみが意味を持つ）。
+    fn write_frame_of_len(len: usize) -> Frame {
+        Frame::new(FrameKind::Write, vec![0u8; len]).expect("Frame::new must succeed")
+    }
+
+    /// P0（PR #1105 codex 指摘）・REPAIR-2: `max_bytes` に `0` は拒否される。
+    #[test]
+    fn batch_config_rejects_zero_max_bytes() {
+        let err = BatchConfig::with_max_bytes(DEFAULT_BATCH_SIZE, 0)
+            .expect_err("max_bytes == 0 must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+    }
+
+    /// P0: 既定設定の `max_bytes` は [`MAX_BATCH_BYTES`] に一致する。
+    #[test]
+    fn batch_config_default_max_bytes_is_max_batch_bytes() {
+        assert_eq!(BatchConfig::default().max_bytes(), MAX_BATCH_BYTES);
+    }
+
+    /// P0（PR #1105 codex 指摘）: 累積バイト数が `max_bytes` を超える手前
+    /// （境界値ちょうど）までは `Buffered` のまま滞留し、超える 1 件目で
+    /// それまでの滞留分が `BytesLimitReached` として発火する。件数上限
+    /// （[`MAX_BATCH_SIZE`]）には遠く及ばない設定でも、バイト数だけを理由に
+    /// 発火することを確認する。
+    #[test]
+    fn batch_buffer_fires_on_bytes_limit_before_size_limit() {
+        // batch_size は十分大きく、bytes 側の上限（10 バイト）だけが効くように
+        // する。1 件 4 バイトのフレームを 2 件（計 8 バイト）までは収まり、
+        // 3 件目（計 12 バイト）で 10 バイトを超えるため、3 件目の push で
+        // 直前までの 2 件が BytesLimitReached として発火する。
+        let config =
+            BatchConfig::with_max_bytes(MAX_BATCH_SIZE, 10).expect("valid config must succeed");
+        let mut buffer = BatchBuffer::new(config);
+
+        let outcome = buffer
+            .push(write_frame_of_len(4))
+            .expect("push must succeed");
+        assert!(matches!(outcome, PushOutcome::Buffered { pending: 1 }));
+        assert_eq!(buffer.pending_bytes(), 4);
+
+        let outcome = buffer
+            .push(write_frame_of_len(4))
+            .expect("push must succeed");
+        assert!(matches!(outcome, PushOutcome::Buffered { pending: 2 }));
+        assert_eq!(buffer.pending_bytes(), 8);
+
+        // 3 件目（計 12 バイト）は上限 10 バイトを超えるため、追加前に
+        // それまでの 2 件が発火する。3 件目自体はリセット後の新しいバッファへ
+        // 積まれ、失われない。
+        let outcome = buffer
+            .push(write_frame_of_len(4))
+            .expect("push must succeed");
+        let batch = match outcome {
+            PushOutcome::Ready(batch) => batch,
+            PushOutcome::Buffered { .. } => panic!("bytes limit must fire before size limit"),
+        };
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch.trigger(), BatchTrigger::BytesLimitReached);
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.pending_bytes(), 4);
+
+        // 発火後もフレームは失われず、次の take_pending で回収できる。
+        let drained = buffer
+            .take_pending()
+            .expect("the 3rd frame must remain buffered");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained.trigger(), BatchTrigger::Drained);
+    }
+
+    /// P0: 累積バイト数がちょうど `max_bytes` に達する境界値では、まだ
+    /// 上限を超えていないため発火しない（`>` であり `>=` ではない）。
+    #[test]
+    fn batch_buffer_does_not_fire_when_bytes_exactly_at_limit() {
+        let config =
+            BatchConfig::with_max_bytes(MAX_BATCH_SIZE, 8).expect("valid config must succeed");
+        let mut buffer = BatchBuffer::new(config);
+
+        let first_outcome = buffer
+            .push(write_frame_of_len(4))
+            .expect("push must succeed");
+        assert!(matches!(
+            first_outcome,
+            PushOutcome::Buffered { pending: 1 }
+        ));
+        let outcome = buffer
+            .push(write_frame_of_len(4))
+            .expect("push must succeed");
+        // 累積 8 バイト = 上限 8 バイトちょうど。超過ではないため発火しない。
+        assert!(matches!(outcome, PushOutcome::Buffered { pending: 2 }));
+        assert_eq!(buffer.pending_bytes(), 8);
+    }
+
+    /// P0: 1 件のフレーム単体が `max_bytes` を超える場合でも、
+    /// フレーム自体が失われたり拒否されたりはしない（分割できないため、
+    /// そのフレーム単独のバッチとして次回発火する）。
+    #[test]
+    fn batch_buffer_accepts_single_frame_larger_than_max_bytes() {
+        let config =
+            BatchConfig::with_max_bytes(MAX_BATCH_SIZE, 4).expect("valid config must succeed");
+        let mut buffer = BatchBuffer::new(config);
+
+        let outcome = buffer
+            .push(write_frame_of_len(100))
+            .expect("push must succeed even if it alone exceeds max_bytes");
+        assert!(matches!(outcome, PushOutcome::Buffered { pending: 1 }));
+        assert_eq!(buffer.pending_bytes(), 100);
+
+        // 次のフレームを積もうとすると、単体で上限超過済みの滞留分が
+        // 先に発火する。
+        let outcome = buffer
+            .push(write_frame_of_len(1))
+            .expect("push must succeed");
+        let batch = match outcome {
+            PushOutcome::Ready(batch) => batch,
+            PushOutcome::Buffered { .. } => panic!("oversized pending frame must flush first"),
+        };
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.trigger(), BatchTrigger::BytesLimitReached);
+    }
+
+    /// P0: バイト数上限（暫定 256 GiB 規模の DoS）に対する回帰確認として、
+    /// `MAX_BATCH_SIZE`（4096 件）× 1 フレーム最大長
+    /// （[`crate::protocol::MAX_PAYLOAD_LEN`] = 64 MiB）の理論上の最大滞留量が
+    /// 既定 [`MAX_BATCH_BYTES`]（256 MiB）を大きく上回ること（＝件数上限のみでは
+    /// 抑止できないこと）を明示し、既定設定がその桁を実際に縮小することを
+    /// 数値で確認する。
+    #[test]
+    fn max_batch_bytes_bounds_worst_case_far_below_size_only_limit() {
+        let worst_case_size_only_bytes =
+            MAX_BATCH_SIZE as u128 * crate::protocol::MAX_PAYLOAD_LEN as u128;
+        assert!(worst_case_size_only_bytes > 200 * 1024 * 1024 * 1024); // 約 256 GiB
+        assert!((MAX_BATCH_BYTES as u128) < worst_case_size_only_bytes);
+        assert_eq!(MAX_BATCH_BYTES, 256 * 1024 * 1024);
     }
 }

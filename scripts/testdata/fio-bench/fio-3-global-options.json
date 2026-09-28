@@ -20,7 +20,6 @@
         "filename": "fandhe-fio-randwrite-4k.dat",
         "size": "256m",
         "runtime": "30",
-        "time_based": "",
         "iodepth": "1",
         "numjobs": "1"
       },

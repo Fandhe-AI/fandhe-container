@@ -24,9 +24,8 @@
 #     GNU coreutils の `timeout`（Linux ホストが対象。macOS 標準環境には無い）、`jq`
 #   - --from-json モード: `jq`（fio 不要）
 #   - root 権限・`/dev/kvm` は不要
-#   - 全モード共通で `grep`・`dirname`・`wc`・`tr`・`mktemp`・`find`・`ln`・`head`・
-#     `sleep`・`id`、run モードでは加えて `realpath`（いずれも前提ツール検証の対象。
-#     欠如は exit 3）
+#   - 全モード共通で `grep`・`dirname`・`basename`・`wc`・`tr`・`mktemp`・`find`・`ln`・
+#     `head`・`sleep`・`id`（いずれも前提ツール検証の対象。欠如は exit 3）
 #
 # 書き込み先の安全性（security.md の symlink・ボリューム外書き込み対策）:
 #   fio のデータファイルは `--target-dir` 直下の固定パスではなく、実行ごとに
@@ -35,12 +34,23 @@
 #   たどる）に踏ませないための構造的対策で、後始末もそのサブディレクトリを
 #   `rm -rf` で消すだけにする（symlink をたどらない）。
 #
+# 総書き込み量と runtime（DoS 防止。IO-8 の計測契約）:
+#   fio に --time_based を渡さない。--time_based があると fio はファイルを書き終えても
+#   runtime いっぱいまで同じワークロードを繰り返すため、書き込み量が --size × --numjobs
+#   の上限を超えて runtime に比例して増える。--time_based なしの fio は各ジョブが
+#   --size 分（4K ブロックを重複なく 1 巡。fio の既定の random map）を書いた時点か
+#   runtime に達した時点の早い方で止まるため、総書き込み量は --size × --numjobs 以下に
+#   なり、--runtime は打ち切り時間として働く。IOPS はこの 1 巡（または runtime までの
+#   区間）の平均になる（詳細と計測上の影響は docs/design/io-fio-bench.md）。runtime・
+#   time_based の挙動は fio 本体（axboe/fio master）の HOWTO.rst の記述で確認した。
+#
 # --from-json と run モードの契約（IO-8 の計測条件をベンチ名と一致させる）:
 #   変換対象の fio JSON は run モードと同じ条件で実行されたものだけを受け付ける。
 #   `jobs` はちょうど 1 件（--group_reporting）・`jobname` は `fandhe-fio-randwrite-4k`・
 #   `error` は 0 で、`global options` と `job options` を合わせた fio オプションは
 #   run モードが渡すものと同じ集合（name・directory・filename・rw・bs・ioengine・direct・
-#   size・runtime・time_based・iodepth・numjobs・end_fsync・group_reporting）に限る。
+#   size・runtime・iodepth・numjobs・end_fsync・group_reporting）に限る（time_based は
+#   総書き込み量の上限を無効にするため含めない。下の「総書き込み量と runtime」参照）。
 #   これらはすべて必須（存在する場合だけ照合する項目は置かない。`global options`
 #   だけは fio が空のとき出力しないため省略可）。
 #   値は name=`fandhe-fio-randwrite-4k`・rw=randwrite・bs=4k（4k/4K/4096）・
@@ -59,8 +69,8 @@
 #   1: fio の実行失敗（exit 0 でも出力 JSON を書かなかった場合を含む）またはタイムアウト
 #   2: 入力エラー（引数の検証失敗、fio JSON のスキーマ不正・実行条件の不一致、
 #      値が 0 以下、ファイルサイズ・総書き込み量の上限超過、symlink 等）
-#   3: 前提ツールが無い（run モードでの fio・timeout・realpath。全モード共通で
-#      jq・grep・dirname・wc・tr・mktemp・find・ln・head・sleep・id）
+#   3: 前提ツールが無い（run モードでの fio・timeout。全モード共通で
+#      jq・grep・dirname・basename・wc・tr・mktemp・find・ln・head・sleep・id）
 #
 # 出力（stdout。`--output <path>` を指定した場合はファイルにも書く。人が読む進捗・
 # サマリーは stderr に出す）:
@@ -130,8 +140,10 @@ workload options (run mode: passed to fio; --from-json mode: the fio JSON's
 job options must match these values, defaults included):
   --direct 0|1        O_DIRECT flag (default: 1)
   --size <NkNmNg>      fio --size per job (default: 256m; --size x --numjobs
-                       is capped at 10 GiB in total)
-  --runtime <1-600>    fio --runtime in seconds (default: 30)
+                       is capped at 10 GiB in total, and is the upper bound
+                       on the bytes written)
+  --runtime <1-600>    fio --runtime in seconds, an upper bound on the run
+                       (default: 30; fio stops earlier once --size is written)
   --iodepth <1-64>     fio --iodepth (default: 1)
   --numjobs <1-16>     fio --numjobs (default: 1)
 
@@ -238,7 +250,7 @@ fi
 # jq 以外の coreutils 系も確認する。欠如したまま進むと `set -e` でそのコマンドの
 # 終了コード（多くは 1 か 127）がスクリプトの終了コードになり、「fio 実行失敗」
 # （exit 1）と誤分類される（c2458d5 で直した誤分類と同種の穴）。
-for tool in jq grep dirname wc tr mktemp find ln head sleep id; do
+for tool in jq grep dirname basename wc tr mktemp find ln head sleep id; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     err "missing-tool" "${tool} is required but not found in PATH"
     exit 3
@@ -251,10 +263,6 @@ if [ "$mode" = "run" ]; then
   fi
   if ! command -v timeout >/dev/null 2>&1; then
     err "missing-tool" "GNU coreutils 'timeout' is required but not found in PATH (run mode, Linux host only)"
-    exit 3
-  fi
-  if ! command -v realpath >/dev/null 2>&1; then
-    err "missing-tool" "realpath is required but not found in PATH (run mode)"
     exit 3
   fi
 fi
@@ -346,53 +354,96 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 外部コマンドへパスを渡すときに、`-` で始まる相対パスがオプションとして解釈される
-# のを防ぐ（例: --output の親ディレクトリ名が `-delete` だと `find -delete ...` に
-# なる）。絶対パスはそのまま、相対パスは `./` を前置する。
-as_path_arg() {
-  case "$1" in
-    /*) printf '%s' "$1" ;;
-    *) printf './%s' "$1" ;;
-  esac
-}
-
-# 本スクリプトがエントリ（専用サブディレクトリ・一時ファイル）を作るディレクトリが、
-# 自分と root 以外に書き換えられないことを確かめる（exit 2）。条件は次の両方:
-#   - 所有者が自分（実行ユーザー）または root（ディレクトリの所有者は sticky bit が
-#     あっても任意のエントリを rename・削除できるため）
-#   - 他ユーザー書き込み不可、または sticky bit あり（sticky bit があれば他ユーザーは
-#     自分のエントリしか rename・削除できない。/tmp 等の 1777 は許容）
-# これを満たさないと、作成直後のエントリを第三者が symlink へ差し替え、書き込みを
-# ディレクトリ外へ向けさせる競合が残る。グループ書き込み可（775 等）は、ユーザー
-# プライベートグループ既定の環境で一般的なため拒否しない（同じグループのメンバーは
-# 信頼する前提）。
-# 判定は fail-closed: find が安全と判定したときに限り `safe` を 1 回だけ出力させ、
-# find の終了コードが 0 かつ出力（stderr を含む）が `safe` と完全一致するときだけ
-# 通す。find の失敗・エラー出力・空出力・`unsafe` はすべて拒否になる（出力が空なら
-# 合格とする判定は、find が失敗したときに素通りするため採らない）。
+# 本スクリプトがエントリを作るディレクトリ（--target-dir・--output の親・一時
+# ディレクトリ）について、ルートから最終ディレクトリまでの全パス要素が第三者に
+# 差し替えられないことを確かめる（OpenSSH の StrictModes と同じ考え方。exit 2）。
+# 各要素（`cd` と `pwd -P` で symlink を解決した実体のパス）に次を要求する:
+#   - symlink でないディレクトリである
+#   - 所有者が実行ユーザーまたは root
+#   - group・other に書き込み権限が無い。ただし sticky bit 付き（/tmp 等）は許す
+# 根拠: ディレクトリのエントリを rename・削除・作成できるのは、そのディレクトリへの
+# 書き込み権限を持つ者（sticky bit 付きなら、エントリの所有者・ディレクトリの
+# 所有者・root のみ）に限られる。上の条件を満たす要素の直下のエントリは、実行
+# ユーザーと root 以外には差し替えられないため、全要素が条件を満たせば、検証から
+# 書き込みまでの間に祖先を symlink 等へ差し替えられることは起きない。sticky bit 付き
+# ディレクトリ（所有者は実行ユーザーか root に限る）の直下に mktemp で作った 0700 の
+# ディレクトリは実行ユーザーの所有なので、以降も同じ理由で安全になる。
+# 判定は要素ごとに fail-closed: find が条件を満たすと判定して `safe` を 1 回だけ出力し、
+# 終了コード 0 かつ出力（stderr を含む）が `safe` と完全一致したときだけ通す。find の
+# 失敗・エラー出力・空出力・`unsafe` はすべて拒否する。
+# 成功時は解決済みの絶対パスを trusted_dir に入れる。呼び出し側は以後この値だけを
+# 使い、利用者が渡したパス（symlink を含みうる）を解決し直さない。
 # 引数: <オプション名（メッセージ用）> <ディレクトリ>
-reject_unless_private_enough() {
+trusted_dir=""
+require_trusted_dir_chain() {
   local what="$1"
-  local dir
+  local given="$2"
+  local resolved
   local uid
-  local verdict
-  local rc=0
-  dir=$(as_path_arg "$2")
-  if ! uid=$(id -u 2>&1) || ! printf '%s' "$uid" | grep -Eq '^[0-9]+$'; then
-    err "invalid-input" "could not determine the current user id to check ${what} directory ownership: ${uid}"
+  local rest
+  local cur=""
+  local comp
+  local -a parts=()
+  trusted_dir=""
+  if ! resolved=$(CDPATH='' cd -- "$given" 2>/dev/null && pwd -P) || [ -z "$resolved" ]; then
+    err "invalid-input" "${what} directory could not be resolved: ${given}"
     exit 2
   fi
-  verdict=$(find "$dir" -maxdepth 0 \
-    \( \( -user "$uid" -o -user 0 \) \( ! -perm -0002 -o -perm -1000 \) -exec printf safe \; \) \
-    -o -exec printf unsafe \; 2>&1) || rc=$?
+  case "$resolved" in
+    /*) ;;
+    *)
+      err "invalid-input" "${what} directory did not resolve to an absolute path: ${resolved}"
+      exit 2
+      ;;
+  esac
+  # 改行・制御文字を含むパスは要素分割と表示が曖昧になるため拒否する
+  if [[ "$resolved" == *[[:cntrl:]]* ]]; then
+    err "invalid-input" "${what} directory path contains control characters, refusing to use it"
+    exit 2
+  fi
+  if ! uid=$(id -u 2>&1) || ! printf '%s' "$uid" | grep -Eq '^[0-9]+$'; then
+    err "invalid-input" "could not determine the current user id to check ${what} directory: ${uid}"
+    exit 2
+  fi
+  check_trusted_dir_component "$what" "/" "$uid" "$given"
+  rest="${resolved#/}"
+  if [ -n "$rest" ]; then
+    IFS='/' read -r -a parts <<<"$rest"
+  fi
+  for comp in "${parts[@]}"; do
+    if [ -z "$comp" ]; then
+      continue
+    fi
+    cur="${cur}/${comp}"
+    check_trusted_dir_component "$what" "$cur" "$uid" "$given"
+  done
+  trusted_dir="$resolved"
+}
+
+# require_trusted_dir_chain の 1 要素分の判定。引数: <what> <絶対パス> <uid> <元の指定>
+check_trusted_dir_component() {
+  local what="$1"
+  local comp="$2"
+  local uid="$3"
+  local given="$4"
+  local verdict
+  local rc=0
+  if [ -L "$comp" ]; then
+    err "invalid-input" "${what} path component ${comp} is a symlink (it may have been replaced after resolution), refusing to use it: ${given}"
+    exit 2
+  fi
+  verdict=$(find "$comp" -maxdepth 0 -type d \
+    \( -user "$uid" -o -user 0 \) \
+    \( \( ! -perm -0020 ! -perm -0002 \) -o -perm -1000 \) \
+    -exec printf safe \; -o -exec printf unsafe \; 2>&1) || rc=$?
   if [ "$rc" -eq 0 ] && [ "$verdict" = "safe" ]; then
     return 0
   fi
   if [ "$rc" -eq 0 ] && [ "$verdict" = "unsafe" ]; then
-    err "invalid-input" "${what} directory can be modified by other users (it must be owned by you or root, and must not be world-writable without the sticky bit), refusing to use it: $2"
+    err "invalid-input" "${what} path component ${comp} can be modified by other users (every directory from / must be owned by you or root and must not be writable by group or others unless it has the sticky bit), refusing to use it: ${given}"
     exit 2
   fi
-  err "invalid-input" "could not verify the permissions of ${what} directory (find exited with ${rc}: ${verdict}), refusing to use it: $2"
+  err "invalid-input" "could not verify the permissions of ${what} path component ${comp} (find exited with ${rc}: ${verdict}), refusing to use it: ${given}"
   exit 2
 }
 
@@ -412,17 +463,16 @@ reject_unless_private_enough() {
 #      あることを確かめ、違えば exit 2（置かれたディレクトリの中に一時ファイル名の
 #      ハードリンクが残るが、既存のエントリは変更しない）
 #   4. 一時ファイル名を消す（--output 側のリンクが残る）
-# 1 の書き込みはパス名で開き直すが、親ディレクトリは reject_unless_private_enough で
-# 「自分か root の所有、かつ他ユーザー書き込み不可または sticky bit あり」を確認済みの
-# ため、他ユーザー（同じグループのメンバーを除く）が一時ファイルを差し替えることはできない。
+# 1 の書き込みはパス名で開き直すが、親ディレクトリは require_trusted_dir_chain で
+# ルートからの全要素が第三者に差し替えられないことを確認済みで、以後は解決済みの
+# パス（output_final）だけを使うため、他ユーザーが一時ファイルや祖先を差し替える
+# ことはできない。
 # 制約: ハードリンク非対応のファイルシステム（FAT 系等）では 2 が失敗し exit 2 になる。
 # 出力ファイルの権限は mktemp の 0600 になる。失敗はすべて入力エラー（exit 2）として
 # 扱う（set -e に任せると exit 1「fio 実行失敗」と誤分類されるため）。
 write_output_file() {
   local content="$1"
-  local out_dir
-  out_dir=$(as_path_arg "$(dirname -- "$output_path")")
-  if ! output_tmp=$(mktemp "${out_dir}/.fandhe-fio-output.XXXXXXXXXX" 2>/dev/null) || [ -z "$output_tmp" ]; then
+  if ! output_tmp=$(mktemp "${output_dir_real}/.fandhe-fio-output.XXXXXXXXXX" 2>/dev/null) || [ -z "$output_tmp" ]; then
     output_tmp=""
     err "invalid-input" "could not create a temporary file next to --output: $output_path"
     exit 2
@@ -431,11 +481,11 @@ write_output_file() {
     err "invalid-input" "could not write the temporary file for --output: $output_tmp"
     exit 2
   fi
-  if ! ln -n -- "$output_tmp" "$output_path" 2>/dev/null; then
+  if ! ln -n -- "$output_tmp" "$output_final" 2>/dev/null; then
     err "invalid-input" "--output path could not be created exclusively (it exists, possibly created after validation, or the filesystem does not support hard links): $output_path"
     exit 2
   fi
-  if [ -L "$output_path" ] || [ ! -f "$output_path" ] || [ ! "$output_path" -ef "$output_tmp" ]; then
+  if [ -L "$output_final" ] || [ ! -f "$output_final" ] || [ ! "$output_final" -ef "$output_tmp" ]; then
     err "invalid-input" "--output path was replaced during the write (a directory or other entry appeared after validation): $output_path"
     exit 2
   fi
@@ -476,7 +526,29 @@ if [ -n "$output_path" ]; then
     err "invalid-input" "--output parent directory is not writable: $output_dir"
     exit 2
   fi
-  reject_unless_private_enough "--output parent" "$output_dir"
+  require_trusted_dir_chain "--output parent" "$output_dir"
+  output_dir_real="$trusted_dir"
+  # 書き込み先は解決済みの親ディレクトリ＋最終要素で組み立て直す（以後、利用者が
+  # 渡したパスを解決し直さない）。最終要素が `.`・`..`・空（末尾 `/`）なら拒否する。
+  output_base=$(basename -- "$output_path")
+  case "$output_path" in
+    */)
+      err "invalid-input" "--output must be a file path, not a directory: $output_path"
+      exit 2
+      ;;
+  esac
+  case "$output_base" in
+    "" | . | .. | /)
+      err "invalid-input" "--output must name a file: $output_path"
+      exit 2
+      ;;
+  esac
+  output_final="${output_dir_real}/${output_base}"
+  check_symlink_reject "$output_final"
+  if [ -e "$output_final" ]; then
+    err "invalid-input" "--output path already exists, refusing to overwrite: $output_path"
+    exit 2
+  fi
 fi
 
 # --------------------------------------------------
@@ -507,7 +579,7 @@ def fio_runtime_secs:
   | if $c == null then null else ($c.n | tonumber) end
   end;
 
-# 値なしフラグ（time_based・group_reporting）: fio は値なしを空文字列で記録する。
+# 値なしフラグ（group_reporting）: fio は値なしを空文字列で記録する。
 # `=1` は有効、`=0` は無効化なので拒否する。
 def fio_flag_enabled:
   (type == "string") and (. == "" or . == "1");
@@ -547,7 +619,7 @@ def fio_flag_enabled:
   else . end
 | ($gopts + $jopts) as $o
 | (["name", "directory", "filename", "rw", "bs", "ioengine", "direct", "size", "runtime",
-    "time_based", "iodepth", "numjobs", "end_fsync", "group_reporting"]) as $allowed
+    "iodepth", "numjobs", "end_fsync", "group_reporting"]) as $allowed
 | (($o | keys) - $allowed) as $unexpected
 | if ($unexpected | length) > 0 then
     error("unexpected fio options (only the options passed in run mode are accepted): \($unexpected | join(", "))")
@@ -591,9 +663,6 @@ def fio_flag_enabled:
   else . end
 | if ($o.end_fsync != "1") then
     error("fio option end_fsync must be \"1\" (got \($o.end_fsync | tojson))")
-  else . end
-| if (($o.time_based | fio_flag_enabled) | not) then
-    error("fio option time_based must be enabled (got \($o.time_based | tojson))")
   else . end
 | if (($o.group_reporting | fio_flag_enabled) | not) then
     error("fio option group_reporting must be enabled (got \($o.group_reporting | tojson))")
@@ -745,6 +814,11 @@ if ! tmp_dir=$(mktemp -d 2>/dev/null) || [ -z "$tmp_dir" ] || [ ! -d "$tmp_dir" 
   err "invalid-input" "could not create a private temporary directory"
   exit 2
 fi
+# 一時ディレクトリ（TMPDIR 配下）も祖先を含めて検証する。TMPDIR が第三者に書き換え
+# 可能な場所だと、スナップショットを差し替えられてサイズ判定済みの内容と変換する
+# 内容がずれる。以後は解決済みのパスだけを使う（後始末も同じパスを消す）。
+require_trusted_dir_chain "temporary (TMPDIR)" "$tmp_dir"
+tmp_dir="$trusted_dir"
 
 # 変換対象 JSON を 1 回だけ読み、内容を固定したコピー（tmp_dir 内に mktemp で作る
 # 0600 の新規ファイル。パスは snapshot_path に入れて返す）を作る。
@@ -854,10 +928,11 @@ if [ ! -w "$target_dir" ]; then
   err "invalid-input" "--target-dir is not writable: $target_dir"
   exit 2
 fi
-if ! target_dir_real=$(realpath -- "$target_dir" 2>/dev/null) || [ -z "$target_dir_real" ]; then
-  err "invalid-input" "--target-dir could not be resolved: $target_dir"
-  exit 2
-fi
+# symlink を解決した実体のパスについて、ルートからの全要素が第三者に差し替えられない
+# ことを確かめる（祖先を含む。判定基準と根拠は require_trusted_dir_chain のコメント）。
+# 以後は解決済みの target_dir_real だけを使い、利用者が渡したパスを解決し直さない。
+require_trusted_dir_chain "--target-dir" "$target_dir"
+target_dir_real="$trusted_dir"
 
 # fio の `--directory`/`--filename` は ':' をリスト区切り文字として解釈し
 # （fio 本体の `filename.c` の `add_file`/`get_next_filename` 周辺が
@@ -867,16 +942,12 @@ fi
 # ':' を含む正規化後のパスを渡すと fio が意図しない複数ディレクトリへ書き込みうる。
 # `cleanup()` は専用サブディレクトリ 1 つしか消さないため、他の書き込み先にデータファイルが
 # 残留する（security.md の「ボリューム外へ書き込める経路を作らない」に反する）。
-# realpath 後の値を検証し、シンボリックリンク解決や相対解釈で ':' が入り込む
+# 解決後の値を検証し、シンボリックリンク解決や相対解釈で ':' が入り込む
 # 余地を残さない。
 if [ "$target_dir_real" != "${target_dir_real//:/}" ]; then
   err "invalid-input" "--target-dir must not contain ':' (fio treats ':' as a directory/filename list separator): $target_dir_real"
   exit 2
 fi
-
-# 下の専用サブディレクトリを作った直後に第三者がそれを rename して symlink へ
-# 差し替え、fio をボリューム外へ書き込ませる競合を防ぐ（判定基準は関数側のコメント）。
-reject_unless_private_enough "--target-dir" "$target_dir_real"
 
 fio_out_json="${tmp_dir}/fio-output.json"
 
@@ -894,6 +965,9 @@ if ! run_dir=$(mktemp -d "${target_dir_real}/fandhe-fio-randwrite-4k.XXXXXXXXXX"
   err "invalid-input" "could not create a private working directory under --target-dir: $target_dir_real"
   exit 2
 fi
+# 作成した専用サブディレクトリ自体（0700・実行ユーザー所有）も同じ条件で確かめる
+require_trusted_dir_chain "--target-dir working" "$run_dir"
+run_dir="$trusted_dir"
 # run モードの fio 出力は、fio の directory がこの専用サブディレクトリと一致することまで
 # 照合する（--from-json では形式のみ。convert_jq_program の directory の照合を参照）。
 if ! expect_json=$(jq -c --arg directory "$run_dir" '.directory = $directory' <<<"$expect_json") || [ -z "$expect_json" ]; then
@@ -911,7 +985,6 @@ fio_args=(
   --direct="$direct"
   --size="$size"
   --runtime="$runtime"
-  --time_based
   --iodepth="$iodepth"
   --numjobs="$numjobs"
   --end_fsync=1

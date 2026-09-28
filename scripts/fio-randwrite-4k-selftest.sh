@@ -24,6 +24,9 @@
 # サマリーが出なくなるため、ヘルパーは常に 0 を返し、ケース結果は変数で渡す）。
 
 set -euo pipefail
+# 対象スクリプトは書き込み先の全パス要素に「group・other が書き込めない」ことを要求する。
+# 作業ディレクトリの権限が実行環境の umask（002 等）に左右されないよう固定する。
+umask 022
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 target_script="${script_dir}/fio-randwrite-4k.sh"
@@ -166,7 +169,8 @@ run_case_msg "from-json-wrong-jobname" 2 "jobs[0].jobname must be" --from-json "
 run_case_msg "from-json-extra-option" 2 "unexpected fio options (only the options passed in run mode are accepted): rate_iops" --from-json "${fixtures_dir}/fio-3-extra-option.json" --label x
 run_case_msg "from-json-two-jobs" 2 "exactly one entry" --from-json "${fixtures_dir}/fio-3-two-jobs.json" --label x
 run_case_msg "from-json-job-error" 2 "jobs[0].error must be present and 0 (got 5)" --from-json "${fixtures_dir}/fio-3-job-error.json" --label x
-run_case_msg "from-json-time-based-off" 2 "time_based must be enabled" --from-json "${fixtures_dir}/fio-3-time-based-off.json" --label x
+# time_based は総書き込み量の上限を無効にするため受け付けない（Codex P1）
+run_case_msg "from-json-time-based-present" 2 "unexpected fio options (only the options passed in run mode are accepted): time_based" --from-json "${fixtures_dir}/fio-3-time-based-present.json" --label x
 # 同じ fixture でも、CLI の条件（既定値を含む）と食い違えば拒否する（出力の params が
 # 元の fio 実行条件と一致することの保証）
 run_case_msg "from-json-size-mismatch" 2 "size must match --size 512m" --from-json "${fixtures_dir}/fio-3-ok.json" --label x --size 512m
@@ -187,7 +191,7 @@ run_case_msg "from-json-with-target-dir" 2 "cannot be combined with --from-json"
 # JSON を作り、どれを消しても exit 2 かつその項目名を挙げて拒否することを照合する。
 missing_dir="${tmp_root}/missing-option-fixtures"
 mkdir -p "$missing_dir"
-for key in name directory filename rw bs ioengine direct size runtime time_based iodepth numjobs end_fsync group_reporting; do
+for key in name directory filename rw bs ioengine direct size runtime iodepth numjobs end_fsync group_reporting; do
   missing_fixture="${missing_dir}/fio-3-missing-${key}.json"
   jq --arg k "$key" 'del(.jobs[0]["job options"][$k])' "${fixtures_dir}/fio-3-ok.json" >"$missing_fixture" 2>/dev/null || true
   run_case_msg "from-json-missing-option-${key}" 2 "fio option ${key} " --from-json "$missing_fixture" --label x
@@ -361,7 +365,7 @@ PATH="$jq_only_bin" run_case_msg "missing-grep-tool" 3 "grep is required" --from
 # ツール欠如。exit 3。fio の欠如そのものを検出していることをメッセージで確認する）
 common_bin="${tmp_root}/common-bin"
 mkdir -p "$common_bin"
-for tool in jq grep dirname wc tr mktemp find ln head sleep id; do
+for tool in jq grep dirname basename wc tr mktemp find ln head sleep id; do
   ln -s "$(command -v "$tool")" "${common_bin}/${tool}"
 done
 PATH="$common_bin" run_case_msg "missing-fio-tool" 3 "fio is required" --target-dir /tmp --label x
@@ -371,7 +375,7 @@ PATH="$common_bin" run_case_msg "missing-fio-tool" 3 "fio is required" --target-
 # 使う既存 PATH は残すため、以降のケースは stub_bin を PATH の先頭に prefix する）。
 stub_bin="${tmp_root}/stub-bin"
 mkdir -p "$stub_bin"
-# fio スタブは実 fio と同じく、受け取った `--key=value`・値なしフラグ（`--time_based` 等）
+# fio スタブは実 fio と同じく、受け取った `--key=value`・値なしフラグ（`--group_reporting` 等）
 # を `jobs[0]["job options"]` に正規名→入力文字列（フラグは空文字列）で記録した JSON を
 # --output へ書く（fio 本体の parse.c `add_to_dump_list`・stat.c `json_add_job_opts` と
 # 同じ形。run モードの出力も --from-json と同じ実行条件の照合を通ることを確かめるため）。
@@ -409,6 +413,8 @@ done
 [ -n "${FIO_STUB_PLANT_DIR:-}" ] && mkdir "$FIO_STUB_PLANT_DIR"
 # 出力 JSON を書かずに成功終了する fio を再現するためのフック
 [ -n "${FIO_STUB_NO_OUTPUT:-}" ] && exit 0
+# 受け取ったオプション（上書き前）を記録する（run モードが渡す引数の照合用）
+[ -n "${FIO_STUB_OPTS_LOG:-}" ] && printf '%s\n' "$opts" >"$FIO_STUB_OPTS_LOG"
 # 記録するオプションを上書きする（run モードでも実行条件の照合が効くことの確認用）
 [ -n "${FIO_STUB_OVERRIDE_OPTS:-}" ] && opts=$(jq -c --argjson o "$FIO_STUB_OVERRIDE_OPTS" '. + $o' <<<"$opts")
 jq --argjson o "$opts" '.jobs[0]["job options"] = $o' "$fixture" >"$out"
@@ -488,7 +494,7 @@ chmod 755 "$readonly_target"
 ww_target="${tmp_root}/world-writable-target"
 mkdir -p "$ww_target"
 chmod 777 "$ww_target"
-PATH="$stub_path" run_case_msg "run-world-writable-no-sticky-target-dir" 2 "world-writable without the sticky bit" --target-dir "$ww_target" --label x
+PATH="$stub_path" run_case_msg "run-world-writable-no-sticky-target-dir" 2 "can be modified by other users" --target-dir "$ww_target" --label x
 chmod 755 "$ww_target"
 
 # sticky bit 付き（/tmp と同じ 1777）は許容する
@@ -622,7 +628,7 @@ FIO_STUB_PLANT_DIR="$race_realdir_output" PATH="$stub_path" \
 ww_output_dir="${tmp_root}/world-writable-output-dir"
 mkdir -p "$ww_output_dir"
 chmod 777 "$ww_output_dir"
-run_case_msg "output-parent-world-writable-no-sticky" 2 "--output parent directory can be modified by other users" \
+run_case_msg "output-parent-world-writable-no-sticky" 2 "--output parent path component ${ww_output_dir} can be modified by other users" \
   --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "${ww_output_dir}/out.json"
 chmod 755 "$ww_output_dir"
 
@@ -642,23 +648,28 @@ fi
 # ディレクトリの権限確認は find が「安全」と判定したときだけ通す（fail-closed）。
 # find が失敗する・何も出力しない（旧実装は空出力を合格扱いにしていた）状況を
 # find スタブで再現する。スタブ以外のツールは実物を使う。
+# スタブは対象のディレクトリ（名前に perm-check- を含むもの）の判定だけを壊し、
+# それ以外（一時ディレクトリ等の祖先の判定）は実物の find に渡す。
 find_fail_bin="${tmp_root}/find-fail-bin"
 find_empty_bin="${tmp_root}/find-empty-bin"
 mkdir -p "$find_fail_bin" "$find_empty_bin"
-printf '#!/usr/bin/env bash\necho "find: simulated failure" >&2\nexit 1\n' >"${find_fail_bin}/find"
-printf '#!/usr/bin/env bash\nexit 0\n' >"${find_empty_bin}/find"
+real_find=$(command -v find)
+# shellcheck disable=SC2016 # スタブへ書き出す文字列であり、$1 等はスタブ側で展開させる
+printf '#!/usr/bin/env bash\ncase "$1" in *perm-check-*) echo "find: simulated failure" >&2; exit 1 ;; esac\nexec "%s" "$@"\n' "$real_find" >"${find_fail_bin}/find"
+# shellcheck disable=SC2016 # 同上
+printf '#!/usr/bin/env bash\ncase "$1" in *perm-check-*) exit 0 ;; esac\nexec "%s" "$@"\n' "$real_find" >"${find_empty_bin}/find"
 chmod +x "${find_fail_bin}/find" "${find_empty_bin}/find"
 perm_out_dir="${tmp_root}/perm-check-output"
 mkdir -p "$perm_out_dir"
-PATH="${find_fail_bin}:${PATH}" run_case_msg "output-parent-permission-check-find-fails" 2 "could not verify the permissions of --output parent directory" \
+PATH="${find_fail_bin}:${PATH}" run_case_msg "output-parent-permission-check-find-fails" 2 "could not verify the permissions of --output parent path component" \
   --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "${perm_out_dir}/a.json"
-PATH="${find_empty_bin}:${PATH}" run_case_msg "output-parent-permission-check-find-empty" 2 "could not verify the permissions of --output parent directory" \
+PATH="${find_empty_bin}:${PATH}" run_case_msg "output-parent-permission-check-find-empty" 2 "could not verify the permissions of --output parent path component" \
   --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "${perm_out_dir}/b.json"
 perm_target="${tmp_root}/perm-check-target"
 mkdir -p "$perm_target"
-PATH="${find_fail_bin}:${stub_path}" run_case_msg "target-dir-permission-check-find-fails" 2 "could not verify the permissions of --target-dir directory" \
+PATH="${find_fail_bin}:${stub_path}" run_case_msg "target-dir-permission-check-find-fails" 2 "could not verify the permissions of --target-dir path component" \
   --target-dir "$perm_target" --label x --runtime 5
-PATH="${find_empty_bin}:${stub_path}" run_case_msg "target-dir-permission-check-find-empty" 2 "could not verify the permissions of --target-dir directory" \
+PATH="${find_empty_bin}:${stub_path}" run_case_msg "target-dir-permission-check-find-empty" 2 "could not verify the permissions of --target-dir path component" \
   --target-dir "$perm_target" --label x --runtime 5
 perm_leftover=$(count_entries "$perm_out_dir" "$perm_target" -mindepth 1)
 if is_count "$perm_leftover" 0; then
@@ -698,6 +709,83 @@ TMPDIR="$rm_fail_tmp" PATH="${rm_fail_bin}:${PATH}" run_case_msg "cleanup-failur
   --from-json "${fixtures_dir}/fio-3-ok.json" --label x
 TMPDIR="$rm_fail_tmp" PATH="${rm_fail_bin}:${PATH}" run_case_msg "cleanup-failure-keeps-exit-2" 2 "warning: cleanup-failed" \
   --from-json "${fixtures_dir}/fio-3-wrong-rw.json" --label x
+
+# ルートからの全パス要素の検証（Codex P0: 祖先ディレクトリの差し替え）。祖先・最終
+# ディレクトリのどれかが group 書き込み可なら拒否し、何も作らない（chmod で再現できる範囲）
+gw_parent="${tmp_root}/group-writable-ancestor"
+mkdir -p "${gw_parent}/inner-target" "${gw_parent}/inner-output"
+chmod 775 "$gw_parent"
+PATH="$stub_path" run_case_msg "run-group-writable-ancestor-target-dir" 2 "path component ${gw_parent} can be modified by other users" \
+  --target-dir "${gw_parent}/inner-target" --label x --runtime 5
+run_case_msg "output-group-writable-ancestor" 2 "path component ${gw_parent} can be modified by other users" \
+  --from-json "${fixtures_dir}/fio-3-ok.json" --label x --output "${gw_parent}/inner-output/out.json"
+gw_leftover=$(count_entries "${gw_parent}/inner-target" "${gw_parent}/inner-output" -mindepth 1)
+if is_count "$gw_leftover" 0; then
+  echo "PASS: group-writable-ancestor-writes-nothing"
+else
+  echo "FAIL: group-writable-ancestor-writes-nothing (found ${gw_leftover} entries)" >&2
+  failures=$((failures + 1))
+fi
+chmod 755 "$gw_parent"
+gw_final="${tmp_root}/group-writable-final"
+mkdir -p "$gw_final"
+chmod 775 "$gw_final"
+PATH="$stub_path" run_case_msg "run-group-writable-final-target-dir" 2 "path component ${gw_final} can be modified by other users" \
+  --target-dir "$gw_final" --label x --runtime 5
+chmod 755 "$gw_final"
+
+# 途中に symlink を含む --target-dir は実体へ解決してから全要素を検証し、以後は解決
+# 済みのパスだけを使う（fio の --directory も実体側の専用サブディレクトリになる）
+link_real_parent="${tmp_root}/link-real-parent"
+mkdir -p "${link_real_parent}/target"
+ln -s "$link_real_parent" "${tmp_root}/link-to-parent"
+link_dir_log="${tmp_root}/fio-stub-dir-link.log"
+FIO_STUB_DIR_LOG="$link_dir_log" PATH="$stub_path" run_case "run-target-dir-through-symlinked-ancestor" 0 \
+  --target-dir "${tmp_root}/link-to-parent/target" --label x --runtime 5
+link_stub_dir=$(cat -- "$link_dir_log" 2>/dev/null || true)
+case "$link_stub_dir" in
+  "${link_real_parent}"/target/fandhe-fio-randwrite-4k.??????????)
+    echo "PASS: run-target-dir-resolved-before-use (${link_stub_dir})"
+    ;;
+  *)
+    echo "FAIL: run-target-dir-resolved-before-use (fio --directory was '${link_stub_dir}', expected under ${link_real_parent}/target)" >&2
+    failures=$((failures + 1))
+    ;;
+esac
+# 途中の symlink の先が第三者に書き換え可能な場所なら、解決後の検証で拒否する
+link_gw_parent="${tmp_root}/link-gw-parent"
+mkdir -p "${link_gw_parent}/target"
+chmod 775 "$link_gw_parent"
+ln -s "$link_gw_parent" "${tmp_root}/link-to-gw-parent"
+PATH="$stub_path" run_case_msg "run-target-dir-symlink-into-group-writable" 2 "path component ${link_gw_parent} can be modified by other users" \
+  --target-dir "${tmp_root}/link-to-gw-parent/target" --label x --runtime 5
+chmod 755 "$link_gw_parent"
+
+# 一時ディレクトリ（TMPDIR）の祖先も検証する（スナップショットの差し替え対策）
+gw_tmpdir="${tmp_root}/group-writable-tmpdir"
+mkdir -p "$gw_tmpdir"
+chmod 775 "$gw_tmpdir"
+TMPDIR="$gw_tmpdir" run_case_msg "from-json-group-writable-tmpdir" 2 "temporary (TMPDIR) path component ${gw_tmpdir} can be modified by other users" \
+  --from-json "${fixtures_dir}/fio-3-ok.json" --label x
+gw_tmp_leftover=$(count_entries "$gw_tmpdir" -mindepth 1)
+if is_count "$gw_tmp_leftover" 0; then
+  echo "PASS: group-writable-tmpdir-cleaned-up"
+else
+  echo "FAIL: group-writable-tmpdir-cleaned-up (found ${gw_tmp_leftover} entries)" >&2
+  failures=$((failures + 1))
+fi
+chmod 755 "$gw_tmpdir"
+
+# run モードは --time_based を渡さない（総書き込み量が --size × --numjobs 以下に
+# なることの前提）。スタブが記録したオプションに time_based が無いことを照合する
+nt_target="${tmp_root}/no-time-based-target"
+mkdir -p "$nt_target"
+nt_out="${tmp_root}/no-time-based-out.json"
+nt_opts_log="${tmp_root}/fio-stub-opts.log"
+FIO_STUB_OPTS_LOG="$nt_opts_log" PATH="$stub_path" run_case "run-without-time-based" 0 \
+  --target-dir "$nt_target" --label x --runtime 5 --output "$nt_out"
+check_json_value "run-fio-args-have-no-time-based" "$nt_opts_log" 'has("time_based")' 'false'
+check_json_value "run-fio-args-runtime-and-size" "$nt_opts_log" '[.runtime, .size, .numjobs]' '["5", "256m", "1"]'
 
 # 変換対象 JSON のスナップショット（snapshot_json_input）の単体照合。検証後の差し替え
 # （FIFO・デバイス）は起動経路からは決定的に再現できないため、対象スクリプトから関数

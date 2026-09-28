@@ -13,9 +13,9 @@ fandhe-container の I/O 共有プロトコル経由の共有マウントはま�
 
 ## 前提条件
 
-- **run モード**（実際に fio を実行する）: fio 3.x 以上（`lat_ns`/`clat_ns` 等の `*_ns` キーを出力する版）・GNU coreutils の `timeout`・`realpath`・`jq`。**Linux ホストのみ対象**（GNU `timeout` が無い macOS 標準環境・Windows は対象外。VM ゲスト経由の経路は後続 TASK で扱う）
+- **run モード**（実際に fio を実行する）: fio 3.x 以上（`lat_ns`/`clat_ns` 等の `*_ns` キーを出力する版）・GNU coreutils の `timeout`・`jq`。**Linux ホストのみ対象**（GNU `timeout` が無い macOS 標準環境・Windows は対象外。VM ゲスト経由の経路は後続 TASK で扱う）
 - **`--from-json` モード**（既存の fio JSON 出力を変換するだけ）: `jq`（fio・`timeout` は不要）。bash と jq だけで動くため、fio 未導入の CI・ローカル環境でも自己テストが完結する
-- **全モード共通**: `grep`・`dirname`・`wc`・`tr`・`mktemp`・`find`・`ln`・`head`・`sleep`・`id`（欠如時は終了コード 3。欠如したまま進むと別の終了コードへ誤分類されるため事前に検出する）
+- **全モード共通**: `grep`・`dirname`・`basename`・`wc`・`tr`・`mktemp`・`find`・`ln`・`head`・`sleep`・`id`（欠如時は終了コード 3。欠如したまま進むと別の終了コードへ誤分類されるため事前に検出する）
 - **root 権限・`/dev/kvm` は不要**（親 #111 の受入基準）
 
 ## 使い方
@@ -40,7 +40,7 @@ fandhe 経路（共有マウント）の計測は、共有マウントが公開�
 ```bash
 fio --name=fandhe-fio-randwrite-4k --directory=/path/to/target \
     --filename=fandhe-fio-randwrite-4k.dat --rw=randwrite --bs=4k --ioengine=psync \
-    --direct=1 --size=256m --runtime=30 --time_based --iodepth=1 --numjobs=1 \
+    --direct=1 --size=256m --runtime=30 --iodepth=1 --numjobs=1 \
     --end_fsync=1 --group_reporting --output-format=json --output=/tmp/fio-out.json
 bash scripts/fio-randwrite-4k.sh --from-json /tmp/fio-out.json --label docker_bind_mount
 ```
@@ -48,9 +48,9 @@ bash scripts/fio-randwrite-4k.sh --from-json /tmp/fio-out.json --label docker_bi
 `--from-json` は run モードと同じ条件で実行された fio JSON だけを受け付ける（IO-8: `fio_randwrite_4k_*` の名前で出す結果は 4K ランダム write の条件で計測されたものに限る）。照合内容は次のとおりで、1 つでも満たさなければ終了コード 2 で拒否する。
 
 - `jobs` はちょうど 1 件（`--group_reporting` を付け、ジョブセクションは 1 つ）、`jobname` は `fandhe-fio-randwrite-4k`、`error` は 0
-- `global options` と `jobs[0]["job options"]` を合わせた（job 側を優先した）fio オプションは、run モードが渡すもの（`name`・`directory`・`filename`・`rw`・`bs`・`ioengine`・`direct`・`size`・`runtime`・`time_based`・`iodepth`・`numjobs`・`end_fsync`・`group_reporting`）に限る。これ以外のオプション（`rate_iops`・`fsync`・`percentile_list` 等）が 1 つでもあれば拒否する。`job options` が無い JSON も拒否する
-- 上記 14 項目はすべて必須で、1 つでも欠ければ拒否する（値があるときだけ照合する項目は置かない）。`global options` は fio が空のとき出力しないため省略可だが、存在する場合はオブジェクトでなければ拒否する
-- 固定値: `name=fandhe-fio-randwrite-4k`・`rw=randwrite`・`bs=4k`（`4k`/`4K`/`4096`）・`ioengine=psync`・`filename=fandhe-fio-randwrite-4k.dat`・`end_fsync=1`・`time_based` と `group_reporting` が有効（値なし、または `1`）
+- `global options` と `jobs[0]["job options"]` を合わせた（job 側を優先した）fio オプションは、run モードが渡すもの（`name`・`directory`・`filename`・`rw`・`bs`・`ioengine`・`direct`・`size`・`runtime`・`iodepth`・`numjobs`・`end_fsync`・`group_reporting`）に限る。これ以外のオプション（`time_based`・`rate_iops`・`fsync`・`percentile_list` 等）が 1 つでもあれば拒否する（`time_based` は下記「総書き込み量と runtime」のとおり総書き込み量の上限を無効にするため）。`job options` が無い JSON も拒否する
+- 上記 13 項目はすべて必須で、1 つでも欠ければ拒否する（値があるときだけ照合する項目は置かない）。`global options` は fio が空のとき出力しないため省略可だが、存在する場合はオブジェクトでなければ拒否する
+- 固定値: `name=fandhe-fio-randwrite-4k`・`rw=randwrite`・`bs=4k`（`4k`/`4K`/`4096`）・`ioengine=psync`・`filename=fandhe-fio-randwrite-4k.dat`・`end_fsync=1`・`group_reporting` が有効（値なし、または `1`）
 - `directory`: 空でない絶対パス（`/` で始まる）で、コロン（`:`。fio がディレクトリ・ファイル名リストの区切り文字として解釈する）を含まないこと（run モードの `--target-dir` と同じ制約。Windows 版 fio のドライブレター形式は受け付けない）。run モードではさらに、本スクリプトが作った専用サブディレクトリ（下記「書き込み先の安全性」）と完全一致することを要求する。`--from-json` では元の実行先を知り得ないため形式のみを照合し、値は出力の `params` に含めない
 - 本スクリプトの同名オプション（既定値を含む）との一致: `direct`・`iodepth`・`numjobs`（文字列として一致）、`size`（`k`/`m`/`g` の大文字小文字・単位なしのバイト数を正規化して一致）、`runtime`（秒。末尾 `s` は可）。元の fio 実行が既定値と異なる条件なら、変換時に同じ値を `--size`・`--runtime`・`--iodepth`・`--numjobs`・`--direct` へ渡す
 
@@ -62,13 +62,13 @@ fio の JSON 上のオプション表現（`job options`/`global options` は正
 
 | オプション | 既定値 | 説明 |
 | ---- | ---- | ---- |
-| `--target-dir <dir>` | （run モード必須） | fio の書き込み先ディレクトリ。symlink 拒否・書き込み可能なディレクトリであることを検証してから `realpath` で正規化する。正規化後のパスに `:` を含む場合も拒否する（fio が `--directory`/`--filename` の `:` をディレクトリ・ファイル名リストの区切り文字として解釈するため）。下記「ディレクトリの権限確認」を満たさないディレクトリも拒否する。データファイルは下記「書き込み先の安全性」のとおり、このディレクトリ内に実行ごとに作る専用サブディレクトリへ書く |
+| `--target-dir <dir>` | （run モード必須） | fio の書き込み先ディレクトリ。symlink 拒否・書き込み可能なディレクトリであることを検証してから、`cd` と `pwd -P` で symlink を解決した実体のパスへ正規化する（以後は正規化後のパスだけを使う）。正規化後のパスに `:` を含む場合も拒否する（fio が `--directory`/`--filename` の `:` をディレクトリ・ファイル名リストの区切り文字として解釈するため）。ルートからの全パス要素が下記「ディレクトリの権限確認」を満たさなければ拒否する。データファイルは下記「書き込み先の安全性」のとおり、このディレクトリ内に実行ごとに作る専用サブディレクトリへ書く |
 | `--from-json <path>` | （from-json モード必須） | 既存の fio `--output-format=json` 出力へのパス。symlink・通常ファイル以外を拒否し、サイズ上限（4 MiB）あり。下記「変換対象 JSON の読み取り」のとおり 1 回だけ読んだコピーを判定・変換に使う |
 | `--label <label>` | 必須 | `^[a-z0-9_-]{1,64}$`。出力 JSON にそのまま記録し、計測対象（Docker ベースラインか fandhe 経路か等）を表す |
 | `--output <path>` | （出力しない） | 指定時、結果 JSON をこのパスにも書く。symlink 拒否・既存ファイルへの上書きは拒否する。親ディレクトリの存在・書き込み可否も事前検証する（未検証のまま書き込みに失敗すると、呼び出し元が終了コード 1「fio 実行失敗」と誤認するため）。親ディレクトリが下記「ディレクトリの権限確認」を満たさなければ拒否する。書き込みは下記「`--output` の排他作成」の手順で行い、検証後に何かを置かれた場合も既存のエントリやリンク先を開かない |
 | `--direct 0\|1` | `1` | fio `--direct`。tmpfs・FUSE 系の共有 FS では O_DIRECT が失敗しうるため変更できる |
-| `--size <NkNmNg>` | `256m` | fio `--size`（ジョブごとの値）。`^[1-9][0-9]{0,5}[kmg]$`（先頭ゼロ不可）。DoS 防止の上限は総量で課し、`--size` × `--numjobs` が 10 GiB 以下（例: `10g`×1・`5g`×2 は可、`5g`×3 は不可）。全ジョブが同じ `--filename` を共有するためディスク上のファイルは 1 つだが、書き込み量に対して保守的に総量で制限する |
-| `--runtime <1-600>` | `30` | fio `--runtime`（秒。`--time_based` と併用）。`^[1-9][0-9]{0,3}$`（先頭ゼロ不可） |
+| `--size <NkNmNg>` | `256m` | fio `--size`（ジョブごとの値）。`^[1-9][0-9]{0,5}[kmg]$`（先頭ゼロ不可）。DoS 防止の上限は総量で課し、`--size` × `--numjobs` が 10 GiB 以下（例: `10g`×1・`5g`×2 は可、`5g`×3 は不可）。`--time_based` を使わないため、これが fio の総書き込み量の上限になる（下記「総書き込み量と runtime」）。全ジョブが同じ `--filename` を共有するためディスク上のファイルは 1 つ（`--size`）になる |
+| `--runtime <1-600>` | `30` | fio `--runtime`（秒）。実行時間の上限として働き、`--size` 分を書き終えればそれより早く終わる（`--time_based` は使わない）。`^[1-9][0-9]{0,3}$`（先頭ゼロ不可） |
 | `--iodepth <1-64>` | `1` | fio `--iodepth`（`ioengine=psync` では実質 1。記録用）。`^[1-9][0-9]{0,2}$`（先頭ゼロ不可） |
 | `--numjobs <1-16>` | `1` | fio `--numjobs`。`^[1-9][0-9]{0,2}$`（先頭ゼロ不可） |
 
@@ -91,16 +91,29 @@ fio はデータファイルを `O_CREAT`（`O_EXCL` なし）で開き symlink 
 3. 検証後に実ディレクトリを置かれると `ln` はその中へリンクを作るため、`--output` のパスが一時ファイルと同一 inode の通常ファイル（symlink でない）であることを確かめ、違えば終了コード 2（この場合、置かれたディレクトリの中に一時ファイル名のハードリンクが残るが、既存のエントリは変更しない）
 4. 一時ファイル名を消す（成否に関わらず EXIT 時の後始末でも消す）
 
-一時ファイルをパス名で開き直して書くため、親ディレクトリが下記「ディレクトリの権限確認」を満たさない場合は拒否する（他ユーザーが一時ファイルを symlink へ差し替えられないようにするため）。`-` で始まる相対パスは `./` を前置して外部コマンドへ渡し、オプションとして解釈させない。制約として、ハードリンク非対応のファイルシステム（FAT 系等）では手順 2 が失敗して終了コード 2 になる。出力ファイルの権限は 0600 になる。
+一時ファイルをパス名で開き直して書くため、親ディレクトリが下記「ディレクトリの権限確認」を満たさない場合は拒否する（他ユーザーが一時ファイルを symlink へ差し替えられないようにするため）。親ディレクトリは `cd --` と `pwd -P` で解決した実体のパスに固定し、以後の一時ファイル作成・リンク作成はその解決済みパスで行う（`-` で始まる相対パスもオプションとして解釈されない）。制約として、ハードリンク非対応のファイルシステム（FAT 系等）では手順 2 が失敗して終了コード 2 になる。出力ファイルの権限は 0600 になる。
 
 ### ディレクトリの権限確認
 
-本スクリプトがエントリを作るディレクトリ（`--target-dir` の正規化後のパス・`--output` の親ディレクトリ）は、次の両方を満たさなければ終了コード 2 で拒否する。作成直後のエントリを第三者が symlink へ差し替え、書き込みをディレクトリ外へ向けさせる競合を防ぐため。
+本スクリプトがエントリを作るディレクトリ（`--target-dir`・`--output` の親ディレクトリ・一時ディレクトリ〔`TMPDIR` 配下〕・専用サブディレクトリ）は、`cd` と `pwd -P` で symlink を解決した実体のパスについて、ルート（`/`）から最終ディレクトリまでの全パス要素が次をすべて満たさなければ終了コード 2 で拒否する（OpenSSH の StrictModes と同じ考え方）。
 
-- 所有者が実行ユーザーまたは root（ディレクトリの所有者は sticky bit があっても任意のエントリを rename・削除できるため）
-- 他ユーザー書き込み不可、または sticky bit あり（`/tmp` 等の 1777 は可）
+- symlink でないディレクトリである
+- 所有者が実行ユーザーまたは root
+- group・other に書き込み権限が無い。ただし sticky bit 付き（`/tmp` 等の 1777）は許す
 
-グループ書き込み可（775 等）は、ユーザープライベートグループ既定の環境で一般的なため許容する（同じグループのメンバーは信頼する前提）。判定は fail-closed で、`find` が「安全」と判定して終了コード 0 かつ出力がその判定結果と完全一致したときだけ通す。`find` の失敗・エラー出力・空出力はすべて拒否になる（空出力を合格とみなす判定は `find` の失敗時に素通りするため採らない）。
+保証範囲と根拠: ディレクトリのエントリを rename・削除・作成できるのは、そのディレクトリへの書き込み権限を持つ者に限られ、sticky bit 付きならさらにエントリの所有者・ディレクトリの所有者・root に限られる。上の条件を満たす要素の直下のエントリは実行ユーザーと root 以外には差し替えられないため、全要素が条件を満たせば、検証から書き込みまでの間に祖先ディレクトリを symlink 等へ差し替えられることは原理的に起きない。以後の処理は解決済みのパスだけを使い、利用者が渡したパス（途中に symlink を含みうる）を解決し直さない。sticky bit 付きディレクトリの直下に `mktemp` で作った 0700 のディレクトリは実行ユーザーの所有になるため、以降も同じ理由で安全になる。sticky bit 付きのディレクトリは所有者が root の場合に加え、所有者が実行ユーザーの場合も許す（sticky bit により他ユーザーは自分のエントリしか rename・削除できず、ディレクトリの所有者は実行ユーザー自身のため）。
+
+制約: グループ書き込み可（775 等。umask 002 で作ったディレクトリ）は、同じグループのメンバーが差し替えられるため、祖先を含めて拒否する。他の一般ユーザーが所有するディレクトリ（共有ディレクトリ等）も拒否する。root は対象外（root はすべてを差し替えられるため信頼する）。`--from-json` の入力ファイルは読み取りのみで書き込まないため、この検証の対象外（下記「変換対象 JSON の読み取り」の手順で 1 回だけ読む）。
+
+判定は要素ごとに fail-closed で、`find` が条件を満たすと判定して終了コード 0 かつ出力がその判定結果と完全一致したときだけ通す。`find` の失敗・エラー出力・空出力はすべて拒否になる（空出力を合格とみなす判定は `find` の失敗時に素通りするため採らない）。
+
+### 総書き込み量と runtime
+
+fio に `--time_based` を渡さない。`--time_based` があると fio はファイルを書き終えても runtime いっぱいまで同じワークロードを繰り返すため、書き込み量が `--size` × `--numjobs` の上限を超えて runtime に比例して増える（DoS 防止の上限が効かない）。fio の `runtime` は「設定した I/O を終えるか、この時間に達するかの早い方で終わる」上限であり、`--time_based` なしでは各ジョブが `--size` 分（4K ブロックを重複なく 1 巡。fio の既定の random map）を書いた時点か `--runtime` に達した時点で止まる。したがって総書き込み量は `--size` × `--numjobs` 以下、実行時間は `--runtime`（＋起動・終了の余裕。`timeout` で保護）以下になる。
+
+`--io_size` で総量を制限する案（`--time_based` と併用）は、両者を併用したときに上限が効くことを fio の文書から確認できなかったため採らない。`runtime`・`time_based`・`io_size` の挙動は fio 本体（axboe/fio master）の `HOWTO.rst` の各オプションの記述で確認した（実 fio での確認は未実施）。
+
+計測への影響（IO-8）: IOPS は「`--size` のファイルを 4K ランダム write で 1 巡する区間」（または `--runtime` までの区間）の平均になる。`--time_based` で同じファイルを何巡もする計測と比べ、2 巡目以降の上書き（ファイルシステム・ストレージのキャッシュや割り当て済み領域の影響を受ける）の区間が含まれない。1 巡目は割り当て済みでない領域への書き込みを含むため、定常状態の IOPS を測るには `--size` を十分大きく（例: 数 GiB）し、`--runtime` を打ち切りとして使う。Docker ベースラインと fandhe 経路は同じ `--size`・`--runtime` で比べる（TASK-25.2 の計測条件として記録する）。
 
 ### 変換対象 JSON の読み取り
 
@@ -156,11 +169,11 @@ fio はデータファイルを `O_CREAT`（`O_EXCL` なし）で開き symlink 
 | 0 | 成功 |
 | 1 | fio の実行失敗（exit 0 でも出力 JSON を書かなかった場合を含む）またはタイムアウト（`timeout` が保護する。SIGTERM で止まらない場合は 10 秒後に SIGKILL する。REPAIR-5） |
 | 2 | 入力エラー（引数の検証失敗、fio JSON のスキーマ不正・実行条件の不一致、値が 0 以下、ファイルサイズ・総書き込み量の上限超過、symlink 等） |
-| 3 | 前提ツールが無い（run モードでの fio・timeout・realpath。全モード共通で jq・grep・dirname・wc・tr・mktemp・find・ln・head・sleep・id） |
+| 3 | 前提ツールが無い（run モードでの fio・timeout。全モード共通で jq・grep・dirname・basename・wc・tr・mktemp・find・ln・head・sleep・id） |
 
 ## 自己テスト（`scripts/fio-randwrite-4k-selftest.sh`）
 
-`--from-json` モードと `scripts/testdata/fio-bench/` の固定 fixture、および最小の fio スタブ（受け取ったオプションを fio と同じ形で `job options` に記録した固定 JSON を書き出す）を使い、実 fio なしで終了コード・出力値・`check-bench-regression.sh` との round-trip 互換性、実行条件の照合（負例 fixture は照合を通る `job options` を持たせたうえで 1 点だけ壊し、拒否理由をメッセージで照合する。必須 14 項目は 1 つずつ欠落させた JSON を selftest 内で生成して照合する）、総書き込み量の上限の境界、および symlink・競合に対する書き込み先の安全性（上記「書き込み先の安全性」・「`--output` の排他作成」。検証後に通常ファイル・FIFO・ディレクトリを指す symlink や実ディレクトリを置く競合をスタブで再現する）を機械照合する（REPAIR-12）。`make fio-bench-selftest` から実行し、CI の `bench-regression` ジョブにも組み込む。run モードの実 fio を使った実行確認は「実機での確認」節を参照。
+`--from-json` モードと `scripts/testdata/fio-bench/` の固定 fixture、および最小の fio スタブ（受け取ったオプションを fio と同じ形で `job options` に記録した固定 JSON を書き出す）を使い、実 fio なしで終了コード・出力値・`check-bench-regression.sh` との round-trip 互換性、実行条件の照合（負例 fixture は照合を通る `job options` を持たせたうえで 1 点だけ壊し、拒否理由をメッセージで照合する。必須 13 項目は 1 つずつ欠落させた JSON を selftest 内で生成して照合する）、総書き込み量の上限の境界、および symlink・競合に対する書き込み先の安全性（上記「書き込み先の安全性」・「`--output` の排他作成」。検証後に通常ファイル・FIFO・ディレクトリを指す symlink や実ディレクトリを置く競合をスタブで再現する）を機械照合する（REPAIR-12）。`make fio-bench-selftest` から実行し、CI の `bench-regression` ジョブにも組み込む。run モードの実 fio を使った実行確認は「実機での確認」節を参照。
 
 ## 実機での確認（人間担当・TASK-25.2 との切り分け）
 

@@ -16,7 +16,6 @@
         "direct": "1",
         "size": "256m",
         "runtime": "30",
-        "time_based": "",
         "iodepth": "1",
         "numjobs": "1",
         "end_fsync": "1",

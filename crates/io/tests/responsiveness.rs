@@ -898,14 +898,29 @@ mod unix {
         let ready_deadline = CONNECT_RETRY_BUDGET + HANG_GUARD_GRACE;
         if ready_rx.recv_timeout(ready_deadline).is_err() {
             // client スレッドが準備段階中に panic した場合はここへは来ず
-            // join() 側で検出されるはずだが、二重の安全のため待たずに
-            // 確認する（panic メッセージをそのまま伝える）。
-            match client_thread.join() {
-                Ok(_) => panic!(
+            // join() 側で検出されるはずだが、二重の安全のため確認する
+            // （panic メッセージをそのまま伝える）。ただし join() をこの
+            // watchdog スレッド上で直接無期限に呼ぶと、connect / 送信が
+            // 真にハングしているケースではこの join() 自体が無期限停止し、
+            // REPAIR-5（有限時間でのハング検出）に違反する
+            // （codex レビュー P0 指摘・#1124）。join() は別スレッドへ
+            // 隔離し、その結果を `HANG_GUARD_GRACE` を上限に待つ。
+            let (join_tx, join_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = join_tx.send(client_thread.join());
+            });
+            match join_rx.recv_timeout(HANG_GUARD_GRACE) {
+                Ok(Ok(_)) => panic!(
                     "client thread finished without signalling readiness within \
                      {ready_deadline:?} (connect + send setup did not complete in time)"
                 ),
-                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(Err(payload)) => std::panic::resume_unwind(payload),
+                Err(_) => panic!(
+                    "client thread did not finish within {ready_deadline:?} + \
+                     {HANG_GUARD_GRACE:?} after readiness notification was not \
+                     received; connect/send setup appears hung \
+                     (timeout detection is not working)"
+                ),
             }
         }
 

@@ -39,6 +39,10 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// ACK 受信結果の型。定義は [`crate::barrier`]（TASK-15.1・IO-2）へ移したが、
+/// 従来の公開パス `fandhe_container_io::client::AckReceipt` を維持するため再エクスポートする。
+pub use crate::barrier::AckReceipt;
+use crate::barrier::FlushBarrier;
 use crate::error::{IoError, IoErrorCode};
 #[cfg(test)]
 use crate::observe::NoopSendObserver;
@@ -1360,8 +1364,11 @@ where
     /// 6. 種別の対応を確かめる。[`FrameKind::Ack`] は [`FrameKind::Write`] に、
     ///    [`FrameKind::FlushAck`] は [`FrameKind::Flush`] に対応しなければ
     ///    ならない。ずれていれば失効させて [`IoErrorCode::InvalidArgument`] を返す
-    /// 7. [`SendQueue::remove`] で自分のキューの id を使って解放し、
-    ///    [`AckReceipt`] を返す
+    /// 7. `crate::barrier::AckReceipt::from_matched` で種別ごとの
+    ///    [`AckReceipt`]（[`AckReceipt::Write`] / [`AckReceipt::Flush`]）を
+    ///    組み立ててから [`SendQueue::remove`] で自分のキューの id を使って
+    ///    解放し、その [`AckReceipt`] を返す（[`crate::barrier`] モジュール
+    ///    ドキュメント「構築経路」参照。TASK-15.1・#85）
     ///
     /// # IO-1・IO-2 の保証範囲の違い
     ///
@@ -1369,7 +1376,11 @@ where
     /// 保証し（IO-1）、[`FrameKind::FlushAck`] はそのバリア以前に受理した
     /// すべての書き込みが永続化済みであることを保証する（IO-2）。本メソッドの
     /// 送信順照合はどちらの種別でも同じ規則（キュー先頭との一致）を使い、
-    /// この保証範囲の違いと矛盾しない。
+    /// この保証範囲の違いと矛盾しない。戻り値の [`AckReceipt`] は
+    /// [`AckReceipt::Write`]（[`crate::barrier::WriteAck`]）と
+    /// [`AckReceipt::Flush`]（[`crate::barrier::FlushAck`]）を別バリアントとして
+    /// 区別するため、呼び出し元がこの保証範囲の違いを取り違えることはできない
+    /// （TASK-15.1・#85）。
     ///
     /// # 観測（TASK-12.2・#74 codex 指摘対応。P1・REPAIR-4）
     ///
@@ -1526,9 +1537,15 @@ where
             return Err(err);
         }
 
-        let released = match self.queue.remove(oldest.id()) {
-            Ok(released) => released,
+        // `AckReceipt` を `SendQueue::remove`（枠の解放）より前に組み立てる。
+        // ここまでの検証（`expected_ack_kind` との一致）により
+        // `AckReceipt::from_matched` が `Err` を返すことは到達しないはずだが、
+        // 万一そうなった場合でもまだ枠を解放していない状態で拒否できる
+        // （fail-closed。TASK-15.1・#85 セキュリティ考慮・IO-2 のデータ損失防止）。
+        let receipt = match AckReceipt::from_matched(oldest, ack.kind()) {
+            Ok(receipt) => receipt,
             Err(err) => {
+                self.poisoned = true;
                 let elapsed = started_at.elapsed();
                 self.notify_ack(
                     AckOutcome::RejectedInternal,
@@ -1539,6 +1556,20 @@ where
                 return Err(err);
             }
         };
+
+        // 戻り値は `oldest` から組み立てた `receipt` を使うため、`remove` の
+        // 戻り値そのものは枠を解放した事実の確認以上の意味を持たない
+        // （`remove` は id 一致のみを検証し、`oldest` と同一エントリを返す契約）。
+        if let Err(err) = self.queue.remove(oldest.id()) {
+            let elapsed = started_at.elapsed();
+            self.notify_ack(
+                AckOutcome::RejectedInternal,
+                Some(ack.kind()),
+                elapsed,
+                &err,
+            );
+            return Err(err);
+        }
         let elapsed = started_at.elapsed();
         self.ack_metrics.record(AckOutcome::Success, elapsed);
         self.observer.on_ack(&AckEvent {
@@ -1547,34 +1578,32 @@ where
             latency: elapsed,
             error: None,
         });
-        Ok(AckReceipt {
-            request: released,
-            ack_kind: ack.kind(),
+        Ok(receipt)
+    }
+
+    /// [`Self::send`] の薄いラッパーで、[`FrameKind::Flush`] フレームを送信する
+    /// （IO-2・TASK-15.1・#85）。
+    ///
+    /// body は常に空（`Flush` に body を渡すと `payload::encode_request` が
+    /// 拒否する。`docs/design/io-protocol.md` のペイロード形式と整合）。観測・
+    /// 計上・失効の扱いは [`Self::send`] と同一。成功時は発行済みリクエストを
+    /// [`FlushBarrier`] へ包んで返し、呼び出し元は対応する
+    /// [`crate::barrier::FlushAck::barrier`] と突き合わせて、待っていた
+    /// バリアの ACK であることを確認できる。
+    ///
+    /// [`Self::send`] が返す [`InFlightRequest`] は種別 `Flush` で登録済みの
+    /// ため、[`FlushBarrier::try_from`] の変換が失敗することは構造上ない。
+    /// とはいえ `unwrap`・`expect` は使わず、万一失敗した場合は
+    /// [`IoErrorCode::Internal`] として返す（panic させない。coding-rust）。
+    pub fn flush(&mut self, timeout: IoTimeout) -> Result<FlushBarrier, IoError> {
+        let request = self.send(FrameKind::Flush, &[], timeout)?;
+        FlushBarrier::try_from(request).map_err(|_| {
+            IoError::new(
+                IoErrorCode::Internal,
+                "PipelineClient::send(Flush) returned a request whose kind is not Flush; \
+                 this must not happen",
+            )
         })
-    }
-}
-
-/// [`PipelineClient::recv_ack`] が返す、検証・対応付け済みの ACK 受領記録
-/// （IO-1・IO-2・TASK-12.2・#74）。
-///
-/// フィールドは非公開でアクセサ経由にし、将来フィールドを追加できるようにする
-/// （coding-rust「戻り値は将来拡張できる構造を持つ型にする」）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AckReceipt {
-    request: InFlightRequest,
-    ack_kind: FrameKind,
-}
-
-impl AckReceipt {
-    /// この ACK が対応付けた、送信済みだった元のリクエストを返す。
-    pub fn request(&self) -> InFlightRequest {
-        self.request
-    }
-
-    /// 受信した ACK フレームの種別（[`FrameKind::Ack`] / [`FrameKind::FlushAck`]）を
-    /// 返す。
-    pub fn ack_kind(&self) -> FrameKind {
-        self.ack_kind
     }
 }
 
@@ -2667,7 +2696,7 @@ mod tests {
             .recv_ack(test_timeout())
             .expect("recv_ack must succeed");
         assert_eq!(receipt.request().id().get(), request.id().get());
-        assert_eq!(receipt.ack_kind(), FrameKind::Ack);
+        assert!(matches!(receipt, AckReceipt::Write(_)));
         assert!(client.queue().is_empty());
         assert!(!client.is_poisoned());
     }

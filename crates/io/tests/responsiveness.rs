@@ -160,7 +160,7 @@ mod unix {
     use fandhe_container_io::transport::{FrameReceiver, FrameSender, IoTimeout};
     use fandhe_container_io::writeback::{AppendFileSink, WritebackTimeouts, serve_connection};
     use fandhe_container_io::{
-        BatchConfig, FRAME_HEADER_LEN, IoError, IoErrorCode, ReceiveLimits, UdsServer,
+        AckReceipt, BatchConfig, FRAME_HEADER_LEN, IoError, IoErrorCode, ReceiveLimits, UdsServer,
     };
 
     use super::response_timeout;
@@ -472,8 +472,14 @@ mod unix {
                 let receipt = client
                     .recv_ack(timeout)
                     .expect("recv_ack must succeed within the timeout");
-                assert_eq!(receipt.ack_kind(), FrameKind::Ack);
-                let acked_id = receipt.request().id().get();
+                // IO-1・IO-2・TASK-15.1（#85）: Write に対する ACK は通常 ACK
+                // （`AckReceipt::Write`）でなければならない。種別は判別フィールド
+                // ではなくバリアントで表現されるため、バリアントで確かめる。
+                let AckReceipt::Write(write_ack) = receipt else {
+                    panic!("expected a Write ack (FrameKind::Ack), got {receipt:?}");
+                };
+                assert_eq!(write_ack.request().kind(), FrameKind::Write);
+                let acked_id = write_ack.request().id().get();
                 let send_time = send_started.get(acked_id as usize).unwrap_or_else(|| {
                     panic!("acked id {acked_id} must have a recorded send time")
                 });
@@ -598,8 +604,13 @@ mod unix {
                     "round-trip for id {id} took {round_elapsed:?}, which must be under the {:?} timeout",
                     timeout.as_duration()
                 );
-                assert_eq!(receipt.ack_kind(), FrameKind::Ack);
-                acked_ids.push(receipt.request().id().get());
+                // IO-1・IO-2・TASK-15.1（#85）: 上と同じく、通常 ACK
+                // （`AckReceipt::Write`）であることをバリアントで確かめる。
+                let AckReceipt::Write(write_ack) = receipt else {
+                    panic!("expected a Write ack (FrameKind::Ack) for id {id}, got {receipt:?}");
+                };
+                assert_eq!(write_ack.request().kind(), FrameKind::Write);
+                acked_ids.push(write_ack.request().id().get());
             }
             (acked_ids, *client.ack_metrics())
         });

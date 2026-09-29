@@ -1,13 +1,22 @@
-//! SIGKILL 耐性テスト（IO-3・TASK-18）の結合試験の最小スケルトン（TASK-18.1.1・#825）。
+//! SIGKILL 耐性テスト（IO-3・TASK-18）の結合試験とハーネス（TASK-18.1.1・#825、TASK-18.1.2・#826）。
 //!
 //! `tests/bin/crash_test_server.rs`（専用 feature `crash-test-server` でのみビルドされる
-//! テスト用サーバー）を子プロセスとして起動できること、および SIGKILL で強制終了できることを
-//! 確かめる。ACK の観測・無効試行の除外（#826）、フラッシュ済み / 未フラッシュの対照ケース
-//! （#95）は後続 issue で追加する（現時点は未実装。REPAIR-3）。
+//! テスト用サーバー）を子プロセスとして起動し、SIGKILL で強制終了できることを確かめる（#825）。
+//! さらに #826 で、クライアント側の ACK 観測・kill 位置の制御（`unix::KillPoint`）・
+//! 有効 / 無効試行の判定（`trial` モジュール）・有効試行を集める試行ループを追加した。
+//! 判定ロジックは OS 非依存の `trial` に置き 3 OS でユニットテストする。
+//!
+//! 未実装（後続 issue #95・TASK-18.2）: 損失件数の計測（ディスク上のレコード照合）・
+//! フラッシュ済み / 未フラッシュの対照ケース・「有効 10/10 で損失 0」のアサーション。
+//! ここの結合試験は CI 時間を抑えるため小さい目標数で試行ループの挙動だけを確かめる（REPAIR-3）。
 //! Windows など UDS 未対応 OS では、未対応終了コード 5 を返すことだけを確かめる。
+
+#[path = "crash_safety/trial.rs"]
+mod trial;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix {
+    use std::io::Write as _;
     use std::io::{BufRead, BufReader, Read};
     use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::PermissionsExt;
@@ -18,6 +27,17 @@ mod unix {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    use fandhe_container_io::{
+        AckReceipt, FRAME_HEADER_LEN, Frame, FrameHeader, FrameKind, FrameReceiver, FrameSender,
+        InFlightLimit, IoError, IoErrorCode, IoTimeout, NoopSendObserver, PipelineClient,
+        persist_support,
+    };
+
+    use crate::trial::{
+        InvalidReason, ServerExit, TrialLedger, TrialObservation, TrialSummary, TrialVerdict,
+        classify_trial, run_until_valid,
+    };
+
     const READY_WAIT: Duration = Duration::from_secs(10);
     const EXIT_WAIT: Duration = Duration::from_secs(15);
 
@@ -26,7 +46,11 @@ mod unix {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("fcio-cs-{}-{tag}", std::process::id()));
+            // 並行テスト・複数試行で同じ tag が重なっても衝突しないよう連番を足す
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("fcio-cs-{}-{tag}-{n}", std::process::id()));
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&dir)
@@ -53,8 +77,14 @@ mod unix {
         }
     }
 
-    fn spawn_server(dir: &TempDir) -> ChildGuard {
-        let child = Command::new(env!("CARGO_BIN_EXE_crash_test_server"))
+    /// `batch_size` を `Some` にすると `--batch-size` を渡す（通常 ACK はバッチ書き込み後に返るため、
+    /// 「n 件の Write に n 件の ACK が返る」試行では n をバッチサイズに合わせる）。
+    fn spawn_server(dir: &TempDir, batch_size: Option<u64>) -> ChildGuard {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_crash_test_server"));
+        if let Some(n) = batch_size {
+            command.arg("--batch-size").arg(n.to_string());
+        }
+        let child = command
             .arg("--socket")
             .arg(dir.0.join("s.sock"))
             .arg("--data-dir")
@@ -99,7 +129,7 @@ mod unix {
     #[test]
     fn io3_crash_test_server_spawns_and_accepts() {
         let dir = TempDir::new("ok");
-        let mut child = spawn_server(&dir);
+        let mut child = spawn_server(&dir, None);
         wait_ready(&mut child);
         // 接続直後に閉じると、サーバーが accept する前に切断が listen キューへ届く競合が
         // 起こり得る。accept を済ませて recv 待ちに入る猶予を与えてから閉じる。
@@ -126,11 +156,328 @@ mod unix {
     #[test]
     fn io3_crash_test_server_can_be_sigkilled() {
         let dir = TempDir::new("kill");
-        let mut child = spawn_server(&dir);
+        let mut child = spawn_server(&dir, None);
         wait_ready(&mut child);
         child.0.kill().expect("kill (SIGKILL) must succeed");
         let status = wait_exit(&mut child);
         assert_eq!(status.signal(), Some(9));
+    }
+
+    /// テスト用の UDS クライアント端点（`FrameSender` + `FrameReceiver`）。
+    ///
+    /// `src/` には UDS のクライアント側具象実装がないため（`client.rs` の doc 参照）、
+    /// 本テストで `PipelineClient` を使えるよう std の `UnixStream` を包む。ACK の順序・種別の
+    /// 検証は `PipelineClient::recv_ack` に任せ、ここでは観測数を水増ししない。
+    /// 一度でも `Err` を返したら以後は `Unavailable` を返す（transport の poison 契約と同じ）。
+    struct UnixClientEnd {
+        stream: UnixStream,
+        poisoned: bool,
+    }
+
+    impl UnixClientEnd {
+        fn new(stream: UnixStream) -> Self {
+            Self {
+                stream,
+                poisoned: false,
+            }
+        }
+
+        fn fail(&mut self, e: &std::io::Error) -> IoError {
+            self.poisoned = true;
+            let code = match e.kind() {
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                    IoErrorCode::Timeout
+                }
+                _ => IoErrorCode::Unavailable,
+            };
+            IoError::new(code, format!("unix client io failed: {e}"))
+        }
+
+        fn poisoned_error() -> IoError {
+            IoError::new(
+                IoErrorCode::Unavailable,
+                "unix client end is poisoned by a previous error",
+            )
+        }
+    }
+
+    impl FrameSender for UnixClientEnd {
+        type Frame = Frame;
+
+        fn send_frame(&mut self, frame: &Frame, timeout: IoTimeout) -> Result<(), IoError> {
+            if self.poisoned {
+                return Err(Self::poisoned_error());
+            }
+            let result = self
+                .stream
+                .set_write_timeout(Some(timeout.as_duration()))
+                .and_then(|()| self.stream.write_all(&frame.encode()));
+            result.map_err(|e| self.fail(&e))
+        }
+    }
+
+    impl FrameReceiver for UnixClientEnd {
+        type Frame = Frame;
+
+        fn recv_frame(&mut self, timeout: IoTimeout) -> Result<Frame, IoError> {
+            if self.poisoned {
+                return Err(Self::poisoned_error());
+            }
+            let mut header_bytes = [0u8; FRAME_HEADER_LEN];
+            if let Err(e) = self
+                .stream
+                .set_read_timeout(Some(timeout.as_duration()))
+                .and_then(|()| self.stream.read_exact(&mut header_bytes))
+            {
+                return Err(self.fail(&e));
+            }
+            let header = match FrameHeader::from_bytes(header_bytes) {
+                Ok(h) => h,
+                Err(e) => {
+                    self.poisoned = true;
+                    return Err(e);
+                }
+            };
+            // body 長は検証済みの FrameHeader（MAX_FRAME_LEN 以内）の値だけを使う
+            let mut body = vec![0u8; header.body_len()];
+            if let Err(e) = self.stream.read_exact(&mut body) {
+                return Err(self.fail(&e));
+            }
+            match Frame::decode_body(header, &body) {
+                Ok(frame) => Ok(frame),
+                Err(e) => {
+                    self.poisoned = true;
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// SIGKILL を打つ位置（IO-3・TASK-18.1.2）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum KillPoint {
+        /// `n` 件の Write を送り、通常 ACK を `n` 件観測した直後に kill する（未フラッシュ状態。
+        /// サーバーのバッチサイズを `n` に合わせ、ACK が確実に返るようにする）。
+        AfterWriteAcks(u64),
+        /// `writes`（バッチサイズ未満）件の Write と Flush を送り、通常 ACK `writes` 件と
+        /// FLUSH ACK を観測した直後に kill する。FLUSH ACK 非対応環境（Linux 5.8 未満等）では
+        /// サーバーが接続を閉じるため、無効試行として分類される。
+        AfterFlushAck { writes: u64 },
+        /// 何も送らずに切断し、サーバーが自然終了した後に kill する（サーバー早期終了の
+        /// 無効試行の再現用。除外ロジックの検証専用）。
+        DisconnectBeforeKill,
+    }
+
+    impl KillPoint {
+        fn label(self) -> &'static str {
+            match self {
+                Self::AfterWriteAcks(_) => "w",
+                Self::AfterFlushAck { .. } => "f",
+                Self::DisconnectBeforeKill => "d",
+            }
+        }
+    }
+
+    fn server_exit(status: ExitStatus) -> ServerExit {
+        ServerExit {
+            code: status.code(),
+            signal: status.signal(),
+        }
+    }
+
+    fn io_timeout(secs: u64) -> IoTimeout {
+        IoTimeout::new(Duration::from_secs(secs)).expect("timeout must be within the IoTimeout cap")
+    }
+
+    /// 期限付きで子プロセスの終了を待ち、回収できた状態を返す（REPAIR-5）。
+    fn try_reap(child: &mut ChildGuard, wait: Duration) -> Option<ServerExit> {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Ok(Some(status)) = child.0.try_wait() {
+                return Some(server_exit(status));
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// クライアントの送受信部分。ACK 観測数などを `obs` へ逐次書き込み、失敗コードを返す。
+    /// 各 ACK 待ちは期限付き（REPAIR-5。FLUSH ACK は syncfs のため上限の 10 秒）。
+    /// 成功時は kill まで接続を生かすため client を返す（先に閉じるとサーバーが正常終了してしまう）。
+    fn drive_client(
+        stream: UnixStream,
+        kill_point: KillPoint,
+        obs: &mut TrialObservation,
+    ) -> Result<PipelineClient<UnixClientEnd, NoopSendObserver>, IoErrorCode> {
+        let (writes, flush) = match kill_point {
+            KillPoint::AfterWriteAcks(n) => (n, false),
+            KillPoint::AfterFlushAck { writes } => (writes, true),
+            KillPoint::DisconnectBeforeKill => return Err(IoErrorCode::InvalidArgument),
+        };
+        let limit =
+            InFlightLimit::new(usize::try_from(writes).unwrap_or(0) + 2).map_err(|e| e.code())?;
+        let mut client = PipelineClient::new(UnixClientEnd::new(stream), limit, NoopSendObserver);
+        let send_timeout = io_timeout(5);
+        for seq in 0..writes {
+            client
+                .send(FrameKind::Write, &seq.to_le_bytes(), send_timeout)
+                .map_err(|e| e.code())?;
+        }
+        if flush {
+            client
+                .send(FrameKind::Flush, &[], send_timeout)
+                .map_err(|e| e.code())?;
+        }
+        for _ in 0..writes {
+            client.recv_ack(io_timeout(5)).map_err(|e| e.code())?;
+            obs.acks_observed += 1;
+        }
+        if flush {
+            match client.recv_ack(io_timeout(10)) {
+                Ok(AckReceipt::Flush(_)) => obs.flush_ack_observed = true,
+                Ok(_) => return Err(IoErrorCode::Internal),
+                Err(e) => return Err(e.code()),
+            }
+        }
+        Ok(client)
+    }
+
+    /// 1 試行を実行して観測値を返す（判定は [`classify_trial`] が行う）。
+    /// 試行ごとに新しいパスを使う（SIGKILL 後はソケットが残るため。`crash_test_server` の doc 参照）。
+    fn run_trial(index: usize, kill_point: KillPoint) -> TrialObservation {
+        let (ack_target, flush_required, batch_size) = match kill_point {
+            KillPoint::AfterWriteAcks(n) => (n, false, Some(n)),
+            KillPoint::AfterFlushAck { writes } => (writes, true, None),
+            KillPoint::DisconnectBeforeKill => (0, false, None),
+        };
+        let mut obs = TrialObservation {
+            acks_observed: 0,
+            ack_target,
+            flush_ack_required: flush_required,
+            flush_ack_observed: false,
+            server_exited_before_kill: None,
+            client_error: None,
+            final_exit: None,
+        };
+        let dir = TempDir::new(&format!("{}{index}", kill_point.label()));
+        let mut child = spawn_server(&dir, batch_size);
+        wait_ready(&mut child);
+        let stream = UnixStream::connect(dir.0.join("s.sock")).expect("connect must succeed");
+
+        let _client = if kill_point == KillPoint::DisconnectBeforeKill {
+            // accept 済みで recv 待ちに入る猶予を与えてから切断し、サーバーの自然終了を待つ
+            std::thread::sleep(Duration::from_millis(300));
+            drop(stream);
+            obs.server_exited_before_kill = try_reap(&mut child, EXIT_WAIT);
+            None
+        } else {
+            match drive_client(stream, kill_point, &mut obs) {
+                Ok(client) => Some(client),
+                Err(code) => {
+                    obs.client_error = Some(code);
+                    None
+                }
+            }
+        };
+
+        if obs.server_exited_before_kill.is_none() {
+            // kill 直前の状態確認（待たない）
+            obs.server_exited_before_kill = try_reap(&mut child, Duration::ZERO);
+        }
+        // 失敗しても後段の判定（NotKilledBySigkill）と ChildGuard の Drop が後始末する
+        let _ = child.0.kill();
+        obs.final_exit = try_reap(&mut child, EXIT_WAIT);
+        obs
+    }
+
+    /// 試行ループ。結果を JSON 1 行の構造化ログとして stderr へ出す（REPAIR-4）。
+    fn run_trials(
+        kill_point: KillPoint,
+        target_valid: usize,
+        max_attempts: usize,
+    ) -> (TrialLedger, TrialSummary) {
+        let mut ledger = TrialLedger::new(target_valid, max_attempts);
+        let summary = run_until_valid(&mut ledger, |index| {
+            let obs = run_trial(index, kill_point);
+            eprintln!(
+                "{{\"event\":\"crash_trial\",\"index\":{index},\"kill_point\":\"{kill_point:?}\",\"acks_observed\":{},\"verdict\":\"{:?}\"}}",
+                obs.acks_observed,
+                classify_trial(&obs)
+            );
+            obs
+        });
+        (ledger, summary)
+    }
+
+    /// IO-3・TASK-18.1.2: 通常 ACK を 30 件観測した直後に SIGKILL した試行は有効になる。
+    #[test]
+    fn io3_trial_after_write_acks_is_valid() {
+        let obs = run_trial(0, KillPoint::AfterWriteAcks(30));
+        assert_eq!(obs.acks_observed, 30);
+        assert_eq!(
+            obs.final_exit,
+            Some(ServerExit {
+                code: None,
+                signal: Some(9)
+            })
+        );
+        assert_eq!(
+            classify_trial(&obs),
+            TrialVerdict::Valid { acks_observed: 30 }
+        );
+    }
+
+    /// IO-3・TASK-18.1.2: FLUSH ACK 対応環境では有効、非対応環境ではハングせず無効に分類される。
+    #[test]
+    fn io3_trial_after_flush_ack_is_classified_by_persist_support() {
+        let obs = run_trial(0, KillPoint::AfterFlushAck { writes: 5 });
+        let verdict = classify_trial(&obs);
+        if persist_support().is_supported() {
+            assert!(obs.flush_ack_observed);
+            assert_eq!(verdict, TrialVerdict::Valid { acks_observed: 5 });
+        } else {
+            assert!(!obs.flush_ack_observed);
+            assert!(
+                matches!(verdict, TrialVerdict::Invalid(_)),
+                "unsupported persist must be excluded, got {verdict:?}"
+            );
+        }
+    }
+
+    /// IO-3・TASK-18.1.2: kill 前にサーバーが終了していた試行は ServerExitedEarly で除外される。
+    #[test]
+    fn io3_invalid_when_server_exits_before_kill() {
+        let obs = run_trial(0, KillPoint::DisconnectBeforeKill);
+        assert_eq!(
+            classify_trial(&obs),
+            TrialVerdict::Invalid(InvalidReason::ServerExitedEarly(ServerExit {
+                code: Some(0),
+                signal: None
+            }))
+        );
+    }
+
+    /// IO-3・TASK-18.1.2: 試行ループが有効試行を目標数（ここでは 2）まで集める。
+    /// 本番の目標（有効 10・上限 30）は #95 の対照ケースで使う。
+    #[test]
+    fn io3_harness_collects_valid_trials_until_target() {
+        let (ledger, summary) = run_trials(KillPoint::AfterWriteAcks(30), 2, 6);
+        assert_eq!(summary.valid, 2);
+        assert!(!summary.aborted);
+        assert_eq!(ledger.valid_trials().count(), 2);
+    }
+
+    /// IO-3・TASK-18.1.2: 無効試行しか得られない場合は上限で打ち切られ、有効数は 0 のまま。
+    #[test]
+    fn io3_harness_aborts_when_every_trial_is_invalid() {
+        let (ledger, summary) = run_trials(KillPoint::DisconnectBeforeKill, 2, 3);
+        assert_eq!(summary.attempts, 3);
+        assert_eq!(summary.valid, 0);
+        assert_eq!(summary.invalid, 3);
+        assert!(summary.aborted);
+        assert_eq!(ledger.valid_trials().count(), 0);
     }
 }
 

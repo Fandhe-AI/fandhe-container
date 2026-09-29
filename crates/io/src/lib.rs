@@ -69,7 +69,10 @@ mod sys;
 pub mod transport;
 pub mod writeback;
 
-pub use barrier::{AckReceipt, FlushAck, FlushBarrier, PersistSupport, WriteAck, persist_support};
+pub use barrier::{
+    AckReceipt, FlushAck, FlushBarrier, MaxConcurrentPersist, PersistSupport, WriteAck,
+    max_concurrent_persist, persist_support, set_max_concurrent_persist,
+};
 pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
 };

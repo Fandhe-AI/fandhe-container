@@ -37,9 +37,12 @@
 //!
 //! - macOS / Windows には代替フラッシュがなく `Unimplemented` を返す
 //!   （TASK-15.3・#88）。
-//! - 同時並行する FLUSH の合流とレート制限はない。ただし [`crate::writeback::AppendFileSink`]
+//! - FLUSH による増幅（#824 の A4）への対策は 2 つ: [`crate::writeback::AppendFileSink`]
 //!   は直近の成功以降に書き込みがなければ syncfs を再発行しない（書き込みを
-//!   伴わない連続 FLUSH の増幅対策）。書き込みを挟む FLUSH のレート制限は後続課題。
+//!   伴わない連続 FLUSH の合流）。また、プロセス全体で同時に実行中の syncfs の
+//!   数を [`MaxConcurrentPersist`]（既定 2）までに抑え、超えた FLUSH は期限内で
+//!   枠を待つ（接続を増やしても同時負荷は上限まで）。syncfs の回数そのものは
+//!   減らさず（各 sink が自分の fd で発行する）、頻度（間隔）の制限も行わない。
 //! - Linux 5.8 未満のカーネルは `syncfs(2)` が書き戻しエラーを報告しないため、
 //!   [`persist_support`] が `/proc/sys/kernel/osrelease` で版数を確認し、5.8 未満・
 //!   判定不能なら `Unimplemented` で拒否して FlushAck を返さない（fail-closed）。
@@ -51,6 +54,7 @@
 use std::fs::File;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::client::{InFlightRequest, RequestId};
@@ -250,57 +254,189 @@ impl TryFrom<AckReceipt> for FlushAck {
     }
 }
 
-/// 戻らない `syncfs` helper スレッドの同時存在数の上限（プロセス全体）。
+/// 永続化 helper スレッド（＝実行中の `syncfs`）の同時存在数の絶対上限
+/// （プロセス全体）。
 ///
 /// `syncfs(2)` は中断できないため、タイムアウトしたスレッドは detach して
 /// 戻るまで残る。D state でハングし続ける場合にスレッドが際限なく増えない
-/// ようにする DoS 対策であり（REPAIR-5・security.md「無制限リソース確保」）、
-/// 通常の同時実行を絞る値ではない。同時 Flush を出す結合試験・並列テスト
-/// でも到達しない程度に大きく取る。
+/// ようにする DoS 対策（REPAIR-5・security.md「無制限リソース確保」）。
+/// 設定できる同時実行数（[`MaxConcurrentPersist`]）はこの値以下に制限する
+/// ため、helper スレッドの数がこの値を超えることはない。
 pub(crate) const MAX_PERSIST_THREADS: usize = 64;
 
-/// 実行中の永続化 helper スレッド数を数え、上限を超える起動を拒否する。
-pub(crate) struct PersistLimiter {
-    running: AtomicUsize,
-    max: usize,
-}
+/// 同時に実行中の `syncfs` の数の上限（プロセス全体。IO-2・#824 の A4・
+/// TASK-15.2.2）。
+///
+/// `syncfs(2)` はファイルシステム全体を同期するため、接続元が接続を増やして
+/// 並行に FLUSH を送っても、同時に走る `syncfs` はこの上限までに留める。
+/// 上限に達している FLUSH は、その FLUSH の期限（`AppendFileSink::with_flush_timeout`。
+/// REPAIR-5）の範囲内で枠が空くのをブロッキングで待つ。
+///
+/// # 保証の範囲
+/// - 抑えるのは同時実行数だけで、`syncfs` の回数は減らない（各 sink は自分の
+///   fd で必ず `syncfs` を発行する。書き戻しエラー〔errseq〕は `struct file`
+///   ごとに報告されるため、他の sink の結果を流用すると未報告のエラーを見逃す）
+/// - 頻度（間隔）の制限は行わない
+///
+/// 値は 1 以上 [`MAX_PERSIST_THREADS`]（64）以下。0 は FLUSH が永久に進まない
+/// ため、64 超は helper スレッドの絶対上限と矛盾するため拒否する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxConcurrentPersist(usize);
 
-impl PersistLimiter {
-    pub(crate) const fn new(max: usize) -> Self {
-        Self {
-            running: AtomicUsize::new(0),
-            max,
+impl MaxConcurrentPersist {
+    /// 既定値（2）。
+    pub const DEFAULT: Self = Self(2);
+
+    /// 上限値を検証して作る。0 または 64 超は [`IoErrorCode::InvalidArgument`]。
+    pub fn new(limit: usize) -> Result<Self, IoError> {
+        if (1..=MAX_PERSIST_THREADS).contains(&limit) {
+            Ok(Self(limit))
+        } else {
+            Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!(
+                    "max concurrent persist must be between 1 and {MAX_PERSIST_THREADS} (got {limit})"
+                ),
+            ))
         }
     }
 
-    /// 枠を 1 つ確保する。上限到達なら [`IoErrorCode::ResourceExhausted`]。
-    fn acquire(&'static self) -> Result<PersistSlot, IoError> {
-        self.running
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                if n < self.max { n.checked_add(1) } else { None }
-            })
-            .map(|_| PersistSlot { limiter: self })
-            .map_err(|_| {
-                IoError::new(
-                    IoErrorCode::ResourceExhausted,
-                    "too many persist operations are still running",
-                )
-            })
+    /// 上限値。
+    pub fn get(self) -> usize {
+        self.0
     }
 }
 
-/// [`PersistLimiter`] の枠。Drop（helper スレッド終了時）で解放する。
-struct PersistSlot {
+impl Default for MaxConcurrentPersist {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// プロセス全体の `syncfs` 同時実行数の上限を変更する（既定は
+/// [`MaxConcurrentPersist::DEFAULT`]）。
+///
+/// 実行中の `syncfs` には影響しない。上限を下げても既に走っているものは
+/// 完了まで続き、新しい FLUSH は実行数が新しい上限を下回るまで待つ。上限を
+/// 上げると待機中の FLUSH を起こす。
+pub fn set_max_concurrent_persist(limit: MaxConcurrentPersist) {
+    PERSIST_LIMITER.set_limit(limit);
+}
+
+/// 現在のプロセス全体の `syncfs` 同時実行数の上限。
+pub fn max_concurrent_persist() -> MaxConcurrentPersist {
+    PERSIST_LIMITER.limit()
+}
+
+/// 実行中の永続化 helper スレッド（`syncfs`）の数を数え、上限に達していれば
+/// 期限まで枠が空くのを待つ計数セマフォ（`Mutex` + `Condvar`。ビジーウェイト
+/// しない）。
+///
+/// 枠（[`PersistSlot`]）は helper スレッドが所有し、`work` が戻るまで保持する。
+/// タイムアウトして detach された helper も、中断できない `syncfs` が実際に
+/// 走り続けている間は枠を占有し続ける（ハングした `syncfs` の分だけ新しい
+/// `syncfs` を起動しないため）。そのため同時実行数と helper スレッドの数は
+/// 常に一致し、上限（≤ [`MAX_PERSIST_THREADS`]）を超えてスレッドを作らない。
+/// 待機は呼び出し側のスレッドで行い、待機中は helper スレッドを作らない。
+pub(crate) struct PersistLimiter {
+    running: Mutex<usize>,
+    released: Condvar,
+    limit: AtomicUsize,
+}
+
+impl PersistLimiter {
+    /// `limit` を上限とする limiter を作る（`static` 用。単体テストは 0 など
+    /// 公開 API で拒否される値も直接与えられる）。
+    pub(crate) const fn new(limit: usize) -> Self {
+        Self {
+            running: Mutex::new(0),
+            released: Condvar::new(),
+            limit: AtomicUsize::new(limit),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, usize> {
+        // 保護対象は計数だけで、途中で panic しても不整合な中間状態を
+        // 残さない（加減算のみ）ため、poison は無視して続行する。
+        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn effective_limit(&self) -> usize {
+        self.limit.load(Ordering::Acquire).min(MAX_PERSIST_THREADS)
+    }
+
+    pub(crate) fn set_limit(&self, limit: MaxConcurrentPersist) {
+        self.limit.store(limit.get(), Ordering::Release);
+        // 計数のロックを取ってから起こし、待機側の判定と取りこぼしなく同期する。
+        let _guard = self.lock();
+        self.released.notify_all();
+    }
+
+    fn limit(&self) -> MaxConcurrentPersist {
+        MaxConcurrentPersist(self.limit.load(Ordering::Acquire))
+    }
+
+    /// 現在実行中の数（テスト・観測用）。
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> usize {
+        *self.lock()
+    }
+
+    /// 枠を 1 つ確保する。上限に達していれば `deadline` まで待ち、期限を
+    /// 過ぎたら [`IoErrorCode::Timeout`]（何も発行していない失敗）。
+    ///
+    /// コードを `ResourceExhausted` でなく `Timeout` にするのは、失敗の本質が
+    /// 「その FLUSH の期限（REPAIR-5）が枠待ちの間に尽きた」ことで、syncfs が
+    /// 期限内に終わらない場合と利用者から見て同じ扱い（再接続して再送）になる
+    /// ため。また `Timeout` は spec の ERR-3 対応表の `DEADLINE_EXCEEDED` に
+    /// 当たる定義済みのコードだが、`ResourceExhausted` は ERR-3 にまだない
+    /// 拡張コードである（`crate::error::IoErrorCode` 参照）。
+    pub(crate) fn acquire(&'static self, deadline: Instant) -> Result<PersistSlot, IoError> {
+        let mut running = self.lock();
+        loop {
+            if *running < self.effective_limit() {
+                *running = running.checked_add(1).ok_or_else(|| {
+                    IoError::new(IoErrorCode::Internal, "persist slot counter overflow")
+                })?;
+                return Ok(PersistSlot { limiter: self });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(IoError::new(
+                    IoErrorCode::Timeout,
+                    "timed out waiting for a free syncfs slot (max concurrent persist reached)",
+                ));
+            }
+            running = self
+                .released
+                .wait_timeout(running, remaining)
+                .map(|(guard, _)| guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner().0);
+        }
+    }
+}
+
+/// [`PersistLimiter`] の枠。Drop（helper スレッド終了時。panic による巻き戻しを
+/// 含む）で解放し、待機中の FLUSH を起こす。
+pub(crate) struct PersistSlot {
     limiter: &'static PersistLimiter,
 }
 
 impl Drop for PersistSlot {
     fn drop(&mut self) {
-        self.limiter.running.fetch_sub(1, Ordering::AcqRel);
+        let mut running = self.limiter.lock();
+        *running = running.saturating_sub(1);
+        drop(running);
+        self.limiter.released.notify_all();
     }
 }
 
-static PERSIST_LIMITER: PersistLimiter = PersistLimiter::new(MAX_PERSIST_THREADS);
+static PERSIST_LIMITER: PersistLimiter = PersistLimiter::new(MaxConcurrentPersist::DEFAULT.0);
+
+/// プロセス全体の limiter（`AppendFileSink` の既定。テストは別の limiter を注入する）。
+pub(crate) fn default_persist_limiter() -> &'static PersistLimiter {
+    &PERSIST_LIMITER
+}
 
 /// ブロッキングする `work` を helper スレッドで実行し、`timeout` まで待つ
 /// （IO-2・REPAIR-5・TASK-15.2.2）。`work` は 1 回だけ実行し再試行しない。
@@ -320,10 +456,13 @@ where
     run_with_deadline_tracked(limiter, timeout, work, &mut dispatched)
 }
 
-/// [`run_with_deadline`] の本体。`work` を helper スレッドへ渡せた時点で
-/// `dispatched` を真にする（以後は `work` が実行されうるため、呼び出し側は
-/// 失敗を「syscall 発行済み」として扱う）。枠の確保・スレッド生成の失敗では
-/// 偽のまま返る（何も発行していない一時的な失敗。Bugbot #1142 指摘）。
+/// [`run_with_deadline`] の本体。`timeout` は枠待ちと `work` の実行を合わせた
+/// 期限で、枠待ちで期限が尽きたら `work` を実行せず [`IoErrorCode::Timeout`]。
+///
+/// `work` を helper スレッドへ渡せた時点で `dispatched` を真にする（以後は
+/// `work` が実行されうるため、呼び出し側は失敗を「syscall 発行済み」として
+/// 扱う）。枠待ちの期限切れ・スレッド生成の失敗では偽のまま返る（何も発行して
+/// いない一時的な失敗。Bugbot #1142 指摘）。
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "Linux の syncfs 経路と単体テストのみが使う")
@@ -337,13 +476,17 @@ fn run_with_deadline_tracked<F>(
 where
     F: FnOnce() -> Result<(), IoError> + Send + 'static,
 {
-    let slot = limiter.acquire()?;
-    let (tx, rx) = mpsc::sync_channel::<Result<(), IoError>>(1);
     let started = Instant::now();
+    let deadline = started
+        .checked_add(timeout.as_duration())
+        .ok_or_else(|| IoError::new(IoErrorCode::Internal, "persist deadline overflow"))?;
+    let slot = limiter.acquire(deadline)?;
+    let (tx, rx) = mpsc::sync_channel::<Result<(), IoError>>(1);
     std::thread::Builder::new()
         .name("fandhe-io-persist".to_owned())
         .stack_size(64 * 1024)
         .spawn(move || {
+            // 枠は work が戻る（または panic で巻き戻る）まで保持する。
             let _slot = slot;
             // 受信側がタイムアウトで離脱済みなら送信は失敗するが問題ない。
             let _ = tx.send(work());
@@ -355,7 +498,8 @@ where
             )
         })?;
     *dispatched = true;
-    match rx.recv_timeout(timeout.as_duration()) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(remaining) {
         Ok(Ok(())) => Ok(started.elapsed()),
         Ok(Err(err)) => Err(err),
         Err(RecvTimeoutError::Timeout) => Err(IoError::new(
@@ -456,15 +600,23 @@ pub fn persist_support() -> PersistSupport {
 /// 呼び出し側の sink がポイズンする）。それ以外は syscall を発行せず
 /// [`IoErrorCode::Unimplemented`]（`issued == false`。sink はポイズンしない）。
 ///
-/// 判定を引数で受けるのは、5.8 以上のホストでも非対応経路（旧カーネル・非 Linux）
-/// を単体テストで決定的に照合するため。
+/// `syncfs` の同時実行数は `limiter`（既定はプロセス全体の
+/// [`default_persist_limiter`]。上限は [`set_max_concurrent_persist`]）で抑え、
+/// 上限に達していれば `timeout` の範囲内で枠を待つ。期限切れは
+/// [`IoErrorCode::Timeout`]（`issued == false`）。枠を得ても `syncfs` は必ず
+/// 呼び出し元の `file` の fd で発行し、他の sink の結果を流用しない（errseq は
+/// `struct file` ごとに報告されるため）。
+///
+/// 判定・limiter を引数で受けるのは、5.8 以上のホストでも非対応経路（旧カーネル・
+/// 非 Linux）や枠待ちの期限切れを単体テストで決定的に照合するため。
 pub(crate) fn persist_file_system(
     support: PersistSupport,
+    limiter: &'static PersistLimiter,
     file: &File,
     timeout: IoTimeout,
 ) -> Result<Duration, PersistFailure> {
     match support {
-        PersistSupport::Supported => sync_file_system(file, timeout),
+        PersistSupport::Supported => sync_file_system(limiter, file, timeout),
         PersistSupport::KernelTooOld => Err(PersistFailure::not_issued(IoError::new(
             IoErrorCode::Unimplemented,
             "kernel older than 5.8 (or unknown) cannot report syncfs write-back errors; refusing to send FlushAck",
@@ -479,7 +631,11 @@ pub(crate) fn persist_file_system(
 /// Linux の永続化本体: dup した fd に `syncfs(2)` をタイムアウト付きで 1 回だけ
 /// 発行する（REPAIR-5）。fd 複製の失敗は発行前（`issued == false`）。
 #[cfg(target_os = "linux")]
-fn sync_file_system(file: &File, timeout: IoTimeout) -> Result<Duration, PersistFailure> {
+fn sync_file_system(
+    limiter: &'static PersistLimiter,
+    file: &File,
+    timeout: IoTimeout,
+) -> Result<Duration, PersistFailure> {
     let dup = file.try_clone().map_err(|err| {
         PersistFailure::not_issued(IoError::new(
             IoErrorCode::Internal,
@@ -488,7 +644,7 @@ fn sync_file_system(file: &File, timeout: IoTimeout) -> Result<Duration, Persist
     })?;
     let mut dispatched = false;
     run_with_deadline_tracked(
-        &PERSIST_LIMITER,
+        limiter,
         timeout,
         move || crate::sys::syncfs(&dup),
         &mut dispatched,
@@ -503,8 +659,11 @@ fn sync_file_system(file: &File, timeout: IoTimeout) -> Result<Duration, Persist
 /// [`PersistSupport::Supported`] を返さないため通常は到達しないが、判定を
 /// 注入された場合も syscall を発行せず fail-closed で拒否する。
 #[cfg(not(target_os = "linux"))]
-fn sync_file_system(_file: &File, _timeout: IoTimeout) -> Result<Duration, PersistFailure> {
-    let _ = &PERSIST_LIMITER;
+fn sync_file_system(
+    _limiter: &'static PersistLimiter,
+    _file: &File,
+    _timeout: IoTimeout,
+) -> Result<Duration, PersistFailure> {
     Err(PersistFailure::not_issued(IoError::new(
         IoErrorCode::Unimplemented,
         "persist is not implemented on this OS (TASK-15.3, #88)",
@@ -565,9 +724,11 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
-    /// REPAIR-5・TASK-15.2.2: 枠を占有中は `ResourceExhausted`、解放後は `Ok`。
+    /// REPAIR-5・IO-2（#824 A4）: 枠を占有中の FLUSH は期限まで待ち、期限を
+    /// 過ぎたら `work` を実行せず `Timeout`（未発行）。タイムアウトして detach
+    /// された helper は `work` が戻るまで枠を占有し続け、戻ったら解放する。
     #[test]
-    fn repair5_run_with_deadline_rejects_when_limit_reached() {
+    fn repair5_persist_limiter_waits_then_times_out_without_running() {
         static L: PersistLimiter = PersistLimiter::new(1);
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let err = run_with_deadline(&L, ms(30), move || {
@@ -576,20 +737,179 @@ mod tests {
         })
         .expect_err("must time out while blocked");
         assert_eq!(err.code(), IoErrorCode::Timeout);
+        // タイムアウト後も helper は work 実行中のため枠を占有し続ける。
+        assert_eq!(L.running(), 1);
 
-        let busy = run_with_deadline(&L, ms(200), || Ok(())).expect_err("limit reached");
-        assert_eq!(busy.code(), IoErrorCode::ResourceExhausted);
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let ran_in_work = std::sync::Arc::clone(&ran);
+        let mut dispatched = false;
+        let started = Instant::now();
+        let busy = run_with_deadline_tracked(
+            &L,
+            ms(150),
+            move || {
+                ran_in_work.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            &mut dispatched,
+        )
+        .expect_err("limit reached until the deadline");
+        assert_eq!(busy.code(), IoErrorCode::Timeout);
+        assert!(busy.message().contains("syncfs slot"), "{}", busy.message());
+        assert!(!dispatched);
+        // 期限いっぱいまで待ってから諦める（即時拒否ではない）。
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
 
         release_tx.send(()).expect("helper still waiting");
-        // helper が枠を返すまで短く待つ（最大 2 秒）。
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if run_with_deadline(&L, ms(500), || Ok(())).is_ok() {
-                break;
-            }
-            assert!(Instant::now() < deadline, "slot was never released");
-            std::thread::sleep(Duration::from_millis(10));
+        // helper が戻れば枠が解放され、次の FLUSH は待たずに成功する。
+        run_with_deadline(&L, ms(2000), || Ok(())).expect("slot must be released");
+        assert_eq!(L.running(), 0);
+    }
+
+    /// IO-2（#824 A4）: 枠が埋まっていても、期限内に空けば待っていた FLUSH は
+    /// 成功する（Condvar による起床。ビジーウェイトしない）。
+    #[test]
+    fn io2_persist_limiter_waiter_succeeds_when_slot_frees_in_time() {
+        static L: PersistLimiter = PersistLimiter::new(1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            run_with_deadline(&L, ms(5000), move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+                Ok(())
+            })
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("holder must start its work");
+        assert_eq!(L.running(), 1);
+
+        static RELEASED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            RELEASED.store(true, Ordering::SeqCst);
+            release_tx.send(()).expect("holder still waiting");
+        });
+        // 待機側の work は、holder が枠を手放した後にしか実行されない。
+        run_with_deadline(&L, ms(5000), || {
+            assert!(
+                RELEASED.load(Ordering::SeqCst),
+                "waiter ran before the slot was freed"
+            );
+            Ok(())
+        })
+        .expect("waiter must get the freed slot");
+        releaser.join().expect("releaser must not panic");
+        holder
+            .join()
+            .expect("holder must not panic")
+            .expect("holder work must succeed");
+        assert_eq!(L.running(), 0);
+    }
+
+    /// IO-2（#824 A4）: 多数の FLUSH を並行に出しても、同時に実行される work は
+    /// 上限（2）を超えない。全件が期限内に成功する。
+    #[test]
+    fn io2_persist_limiter_never_exceeds_limit() {
+        static L: PersistLimiter = PersistLimiter::new(2);
+        static CURRENT: AtomicUsize = AtomicUsize::new(0);
+        static PEAK: AtomicUsize = AtomicUsize::new(0);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    run_with_deadline(&L, ms(10_000), || {
+                        let now = CURRENT.fetch_add(1, Ordering::SeqCst) + 1;
+                        PEAK.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(30));
+                        CURRENT.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .expect("worker must not panic")
+                .expect("every flush must succeed within its deadline");
         }
+        let peak = PEAK.load(Ordering::SeqCst);
+        assert!(peak <= 2, "observed {peak} concurrent persists");
+        assert!(peak >= 1);
+        assert_eq!(L.running(), 0);
+    }
+
+    /// IO-2（#824 A4）: 上限を上げると、待機中の FLUSH が起こされて進む。
+    #[test]
+    fn io2_persist_limiter_raising_limit_wakes_waiter() {
+        static L: PersistLimiter = PersistLimiter::new(1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            run_with_deadline(&L, ms(5000), move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+                Ok(())
+            })
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("holder must start its work");
+        let raiser = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            L.set_limit(MaxConcurrentPersist::new(2).expect("valid limit"));
+        });
+        run_with_deadline(&L, ms(5000), || Ok(())).expect("raised limit must admit the waiter");
+        raiser.join().expect("raiser must not panic");
+        release_tx.send(()).expect("holder still waiting");
+        holder
+            .join()
+            .expect("holder must not panic")
+            .expect("holder work must succeed");
+    }
+
+    /// IO-2（#824 A4）: work が panic しても枠は巻き戻しで解放される。
+    #[test]
+    fn io2_persist_limiter_releases_slot_on_panic() {
+        static L: PersistLimiter = PersistLimiter::new(1);
+        let err = run_with_deadline(&L, ms(2000), || panic!("injected panic in persist work"))
+            .expect_err("panicking work must fail");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+        run_with_deadline(&L, ms(2000), || Ok(())).expect("slot must be released after panic");
+        assert_eq!(L.running(), 0);
+    }
+
+    /// IO-2（#824 A4）: 上限値は 1 以上 64 以下だけを受け付け、既定値は 2。
+    #[test]
+    fn io2_max_concurrent_persist_validates_range() {
+        for bad in [0usize, MAX_PERSIST_THREADS + 1, usize::MAX] {
+            let err = MaxConcurrentPersist::new(bad).expect_err("out of range must be rejected");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument, "{bad}");
+        }
+        assert_eq!(MaxConcurrentPersist::new(1).expect("1 is valid").get(), 1);
+        assert_eq!(
+            MaxConcurrentPersist::new(MAX_PERSIST_THREADS)
+                .expect("64 is valid")
+                .get(),
+            64
+        );
+        assert_eq!(MaxConcurrentPersist::DEFAULT.get(), 2);
+        assert_eq!(
+            MaxConcurrentPersist::default(),
+            MaxConcurrentPersist::DEFAULT
+        );
+        // プロセス全体の既定値（他のテストは変更しないため既定のまま）。
+        set_max_concurrent_persist(MaxConcurrentPersist::DEFAULT);
+        assert_eq!(max_concurrent_persist(), MaxConcurrentPersist::DEFAULT);
+    }
+
+    /// 内部で上限を 64 超に設定されても、helper スレッドの絶対上限を超えない。
+    #[test]
+    fn repair5_persist_limiter_clamps_to_thread_cap() {
+        static L: PersistLimiter = PersistLimiter::new(usize::MAX);
+        assert_eq!(L.effective_limit(), MAX_PERSIST_THREADS);
     }
 
     /// IO-2・TASK-15.2.2: 処理のエラーはそのまま伝播する。
@@ -627,6 +947,7 @@ mod tests {
         let support = persist_support();
         let result = persist_file_system(
             support,
+            default_persist_limiter(),
             &file,
             IoTimeout::new(crate::MAX_IO_TIMEOUT).expect("valid timeout"),
         );
@@ -678,8 +999,8 @@ mod tests {
         let file = File::create(&path).expect("create temp file");
         let _ = std::fs::remove_file(&path);
         for support in [PersistSupport::KernelTooOld, PersistSupport::UnsupportedOs] {
-            let failure =
-                persist_file_system(support, &file, ms(100)).expect_err("must be rejected");
+            let failure = persist_file_system(support, default_persist_limiter(), &file, ms(100))
+                .expect_err("must be rejected");
             assert_eq!(
                 failure.error.code(),
                 IoErrorCode::Unimplemented,
@@ -702,15 +1023,15 @@ mod tests {
         file
     }
 
-    /// IO-2（Bugbot #1142）: 枠が埋まって helper を起動できない失敗は
-    /// 「未発行」（dispatched = false）で、sink を poison させない。
+    /// IO-2（Bugbot #1142）: 枠が空かず期限を過ぎた失敗は「未発行」
+    /// （dispatched = false）で、sink を poison させない。
     #[test]
     fn io2_run_with_deadline_not_dispatched_when_limit_reached() {
         static L: PersistLimiter = PersistLimiter::new(0);
         let mut dispatched = false;
         let err = run_with_deadline_tracked(&L, ms(50), || Ok(()), &mut dispatched)
             .expect_err("no slot available");
-        assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+        assert_eq!(err.code(), IoErrorCode::Timeout);
         assert!(!dispatched);
     }
 
@@ -741,8 +1062,9 @@ mod tests {
         let file = File::create(&path).expect("create temp file");
         let _ = std::fs::remove_file(&path);
         assert_eq!(persist_support(), PersistSupport::UnsupportedOs);
-        let failure = persist_file_system(persist_support(), &file, ms(100))
-            .expect_err("must be unimplemented");
+        let failure =
+            persist_file_system(persist_support(), default_persist_limiter(), &file, ms(100))
+                .expect_err("must be unimplemented");
         assert!(!failure.issued);
         let err = failure.error;
         assert_eq!(err.code(), IoErrorCode::Unimplemented);

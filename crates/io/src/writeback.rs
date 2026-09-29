@@ -224,7 +224,12 @@ impl SinkPersistReport {
 /// `serve_connection` ループからのみ使われる前提」と同じ契約）。書き込みを伴わない
 /// FLUSH で syncfs を省略するのは、同一 UID の接続元が FS 全体の同期を繰り返し
 /// 起動できる増幅（#824 の A4・Codex #1142 の P1 指摘）への対策であり、FLUSH ごとに
-/// 無条件で syncfs を発行する方式には戻さない。
+/// 無条件で syncfs を発行する方式には戻さない。書き込みを挟む FLUSH については、
+/// プロセス全体で同時に実行中の syncfs の数を [`crate::barrier::MaxConcurrentPersist`]
+/// （既定 2）までに抑え、超えた FLUSH は `with_flush_timeout` の期限内で枠を待つ
+/// （期限切れは FlushAck なしの `Timeout`・ポイズンなし）。接続を増やしても同時負荷は
+/// 上限までに留まるが、syncfs の回数そのものは減らさず（この sink は必ず自分の fd で
+/// 発行する）、頻度（間隔）の制限も行わない。
 ///
 /// 未対応の範囲（REPAIR-3）: タイムアウトは最大 10 秒で、未書き戻しデータが
 /// 大量にあると超えうる（その場合 FlushAck は返らない）。fd を開く前に起きた
@@ -242,6 +247,9 @@ pub struct AppendFileSink {
     /// 追跡するのは `write_batch` 経由の書き込みだけで、sink の外のハンドルからの
     /// 書き込みは反映しない（構造体 doc「保証範囲と単一書き込み元の前提」）。
     dirty_since_persist: bool,
+    /// `syncfs` の同時実行数を抑える limiter（既定はプロセス全体の
+    /// `crate::barrier::default_persist_limiter`。単体テストだけが差し替える）。
+    persist_limiter: &'static crate::barrier::PersistLimiter,
 }
 
 impl AppendFileSink {
@@ -287,11 +295,16 @@ impl AppendFileSink {
             flush_timeout: IoTimeout::new(MAX_IO_TIMEOUT)?,
             persist_poisoned: false,
             dirty_since_persist: true,
+            persist_limiter: crate::barrier::default_persist_limiter(),
         })
     }
 
     /// [`BatchSink::persist`] のタイムアウトを差し替える（既定は
     /// [`MAX_IO_TIMEOUT`]。REPAIR-5）。
+    ///
+    /// この期限は `syncfs` の同時実行数の枠待ち（[`crate::barrier::MaxConcurrentPersist`]）
+    /// と `syncfs` 本体の実行を合わせたもの。枠待ちで期限が尽きたら FlushAck を
+    /// 返さず [`IoErrorCode::Timeout`] で確定する（syncfs 未発行のためポイズンしない）。
     pub fn with_flush_timeout(mut self, timeout: IoTimeout) -> Self {
         self.flush_timeout = timeout;
         self
@@ -402,7 +415,12 @@ impl AppendFileSink {
             // 済みのため、FS 全体同期を再発行せず合流する。
             return Ok(SinkPersistReport::new(Duration::ZERO));
         }
-        match crate::barrier::persist_file_system(support, &self.file, self.flush_timeout) {
+        match crate::barrier::persist_file_system(
+            support,
+            self.persist_limiter,
+            &self.file,
+            self.flush_timeout,
+        ) {
             Ok(elapsed) => {
                 self.dirty_since_persist = false;
                 Ok(SinkPersistReport::new(elapsed))
@@ -1325,6 +1343,73 @@ mod tests {
         }
     }
 
+    /// IO-2（#824 A4）・REPAIR-5: syncfs の同時実行数の枠が埋まったまま FLUSH の
+    /// 期限を過ぎると、FlushAck を返さず `Timeout` で確定する（Write の ACK は届く）。
+    /// syncfs は未発行のため sink はポイズンされず dirty のままで、枠が空けば次の
+    /// persist は成功する。
+    ///
+    /// `serve_connection` 経由の期待値は production と同じ判定（`persist_support`）で
+    /// 分ける（非対応環境では枠を待たず `Unimplemented`）。枠待ちの経路そのものは
+    /// 判定を `Supported` に注入してどのカーネル版数でも照合する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io2_writeback_flush_times_out_waiting_for_syncfs_slot() {
+        use crate::barrier::{PersistLimiter, PersistSupport};
+        static L: PersistLimiter = PersistLimiter::new(1);
+        // 枠を占有する helper（戻るまで枠を保持する）。
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let slot = L
+                .acquire(std::time::Instant::now() + Duration::from_secs(5))
+                .expect("holder must get the only slot");
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            drop(slot);
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("holder must take the slot");
+
+        let mut sink = temp_append_sink("slot-timeout");
+        sink.persist_limiter = &L;
+        sink.flush_timeout = IoTimeout::new(Duration::from_millis(100)).expect("valid timeout");
+        let mut conn = FakeTransport::new(vec![write_frame(0, b"a"), flush_frame(1)]);
+
+        let report = serve_connection(&mut conn, BatchConfig::default(), &mut sink, timeouts());
+
+        assert_eq!(report.stats.flush_acks_sent, 0);
+        assert_eq!(report.stats.persist_failed, 1);
+        assert_eq!(conn.sent.len(), 1);
+        assert_eq!(conn.sent[0].kind(), FrameKind::Ack);
+        let support = crate::barrier::persist_support();
+        if support.is_supported() {
+            assert_eq!(report.end.code(), IoErrorCode::Timeout);
+            assert!(report.end.message().contains("syncfs slot"));
+        } else {
+            assert_eq!(report.end.code(), IoErrorCode::Unimplemented, "{support:?}");
+        }
+        assert!(!sink.persist_poisoned);
+        assert!(sink.dirty_since_persist);
+
+        // 判定を注入した枠待ちの経路（カーネル版数に依存しない）。
+        let err = sink
+            .persist_with_support(PersistSupport::Supported)
+            .expect_err("slot is still occupied");
+        assert_eq!(err.code(), IoErrorCode::Timeout);
+        assert!(!sink.persist_poisoned);
+        assert!(sink.dirty_since_persist);
+
+        // 枠が空けば、同じ sink の persist は自分の fd で syncfs を発行して成功する。
+        release_tx.send(()).expect("holder still waiting");
+        holder.join().expect("holder must not panic");
+        sink.flush_timeout = test_timeout();
+        sink.persist_with_support(PersistSupport::Supported)
+            .expect("persist must succeed once the slot is free");
+        assert!(!sink.dirty_since_persist);
+        assert_eq!(L.running(), 0);
+    }
+
     /// IO-2・TASK-15.2.2（受け入れ条件 2）: 実際の `syncfs` ラッパーが失敗
     /// （O_PATH の fd は EBADF）すると FlushAck を返さず `Internal` で終わり、
     /// sink はポイズンされて以後の persist は syscall なしで `Internal`。
@@ -1353,6 +1438,7 @@ mod tests {
             flush_timeout: test_timeout(),
             persist_poisoned: false,
             dirty_since_persist: true,
+            persist_limiter: crate::barrier::default_persist_limiter(),
         };
         let mut conn = FakeTransport::new(vec![flush_frame(0)]);
 

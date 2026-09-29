@@ -9,12 +9,14 @@ name: CI
 # ci.yml から取り込み済み。
 # ruleset（branch protection）の必須チェックには、implement-issue-tree の自動マージ前
 # ゲート（G0。PR 上の全 check-run context が必須チェックに含まれることを要求する）に
-# 適合させるため、本 workflow が生成する check-run 28 件（ci-complete・
+# 適合させるため、本 workflow が生成する check-run 29 件（ci-complete・
 # lint-docs / * 5 件・rust-ci (<os>) / * 15 件・rust-ci-default-features (<os>) 3 件・
-# integration-test (<os>) 3 件・bench-regression 1 件）をすべて個別に登録済み
-# （オーナー判断 2026-09-27。TASK-86.2〔#36〕の integration-test (<os>) 3 件・
-# TASK-86.3〔#37〕の bench-regression 1 件を含む。下の ci-complete・
-# integration-test・bench-regression ジョブのコメントを参照）。
+# integration-test (<os>) 3 件・bench-regression 1 件・aarch64-linux-check 1 件）を
+# すべて個別に登録済み（aarch64-linux-check を除く 28 件はオーナー判断 2026-09-27。
+# TASK-86.2〔#36〕の integration-test (<os>) 3 件・TASK-86.3〔#37〕の
+# bench-regression 1 件を含む。aarch64-linux-check（#1120）は 2026-09-29 に
+# #4 の自律開発方針に基づき main セッションが登録済み。下の ci-complete・
+# integration-test・bench-regression・aarch64-linux-check ジョブのコメントを参照）。
 # ジョブの追加・改名・matrix 変更で check-run 名が変わる場合は ruleset 側も
 # 同時に更新する（リポジトリ設定の変更のためオーナー作業とする）
 on:
@@ -451,10 +453,52 @@ jobs:
         run: make bench-check
 
   # --------------------------------------------------
+  # aarch64-linux-check（Linux aarch64 向けクロス型検査: #1120・REPAIR-7 第 1 段階を補うアーキ網羅）
+  # --------------------------------------------------
+  # `cfg(target_arch = "aarch64")` 分岐（crates/io/src/sys.rs の SO_PEERCRED 等。
+  # 今後は TASK-38 の seccomp syscall 番号表など）を x86_64 ランナー上で
+  # aarch64-unknown-linux-gnu 向けに型検査し、コンパイルエラーや aarch64 でのみ
+  # 出る警告を PR ごとに検出する。check / clippy のみでリンクもテスト実行もしない
+  # ため、aarch64 での実行時の正しさ（struct ucred のレイアウト等）は保証しない。
+  # ネイティブ arm64 ランナーでのテスト実行は将来の課題（ci.md 参照）。
+  #
+  # 現在は外部依存が 0 件のためクロスリンカ無しで成立する。cc 等ネイティブビルドを
+  # 伴う依存を承認・追加した場合は、cross toolchain かネイティブ arm64 ランナーへ
+  # 切り替えること。--locked・cache を使わないのは rust-ci-default-features と
+  # 条件をそろえるため。ビルド・テストのゲートではなく型検査ゲートのため、
+  # 3 OS matrix・ネイティブランナー規則の対象外とする（bench-regression と同じ整理。
+  # ci.md「3 OS CI」参照）。
+  #
+  # --all-features を付けるのは、required-features を持つ target（crates/io の
+  # crash_test_server bin・crash_safety test。`crash-test-server` feature が必要）を
+  # --all-targets だけでは型検査できないため。現状の feature は
+  # fandhe-container-io の `crash-test-server` 1 件のみで相互排他の feature はなく、
+  # ソース中に cfg(feature) 分岐もないため、--all-features の検査は既定 feature 構成を
+  # 包含する。相互排他の feature や cfg(not(feature = ...)) 分岐を追加した場合は、
+  # 既定 feature での検査の追加か対象 feature の明示へ切り替えること。
+  aarch64-linux-check:
+    runs-on: ubuntu-latest
+    # ハングに対する多層防御（rust-ci-default-features と同じ値）
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: clippy
+          targets: aarch64-unknown-linux-gnu
+      - name: cargo check（aarch64-unknown-linux-gnu・クロス型検査）
+        run: cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu
+      - name: cargo clippy（aarch64-unknown-linux-gnu）
+        run: cargo clippy --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu -- -D warnings
+
+  # --------------------------------------------------
   # ci-complete（全ジョブ結果の fail-closed 集約ゲート）
   # --------------------------------------------------
   # lint-docs・rust-ci・rust-ci-default-features・integration-test・
-  # bench-regression の結果を集約し、いずれかが失敗・キャンセルされれば
+  # bench-regression・aarch64-linux-check の結果を集約し、いずれかが失敗・キャンセルされれば
   # 本ジョブも failure にする fail-closed ゲート。rust-ci・
   # rust-ci-default-features・integration-test は 3 OS matrix ジョブの
   # ため、needs 上では OS ごとの結果ではなく 1 つの result に集約される
@@ -470,9 +514,11 @@ jobs:
   # 残ると新たな check-run が報告されず全 PR がマージ不能になる）。ruleset の
   # 変更はリポジトリ設定の変更のためオーナー承認を経る。TASK-86.2（#36）の
   # integration-test (<os>) 3 件・TASK-86.3（#37）の bench-regression 1 件は
-  # いずれも ruleset へ登録済み（オーナー承認 2026-09-27。合計 28 件。冒頭
-  # コメントの内訳〔1 + lint-docs 5 + rust-ci 15 + rust-ci-default-features 3 +
-  # integration-test 3 + bench-regression 1 = 28〕と一致させる）。
+  # いずれも ruleset へ登録済み（オーナー承認 2026-09-27。冒頭コメントの内訳
+  # 〔1 + lint-docs 5 + rust-ci 15 + rust-ci-default-features 3 +
+  # integration-test 3 + bench-regression 1 + aarch64-linux-check 1 = 29〕と
+  # 一致させる）。#1120 の aarch64-linux-check 1 件も 2026-09-29 に ruleset へ
+  # 登録済み（#4 の自律開発方針に基づき main セッションが登録）。
   ci-complete:
     needs:
       [
@@ -481,6 +527,7 @@ jobs:
         rust-ci-default-features,
         integration-test,
         bench-regression,
+        aarch64-linux-check,
       ]
     if: always()
     permissions: {}

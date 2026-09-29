@@ -46,8 +46,8 @@
 //! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。ファイル
 //! 作成経路への組み込みは [`guest_files::GuestFileCreator`]（TASK-19.2・#100。
 //! ワイヤー形式は変えないサーバー側 API で、ワイヤー上の作成要求は未実装〔REPAIR-3〕）
-//! が担い、検査済みの [`writeback::AppendFileSink`] を返す。パス長 260 超の検証は
-//! TASK-20、Unicode 正規化（NFC / NFD）は #103（TASK-21.h1）の方針決定後に
+//! が担い、検査済みの [`writeback::AppendFileSink`] を返す。パス長 260 超の検証関数は
+//! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102。作成経路への組み込みは未実装）、Unicode 正規化（NFC / NFD）は #103（TASK-21.h1）の方針決定後に
 //! TASK-21 で後続実装する。
 //!
 //! PLUG-1 区分は core（`fandhe-container-plugin` の境界機構とは別に、コアの一部として
@@ -86,7 +86,10 @@ pub use client::{
     SendMetrics, SendOutcome, SendQueue,
 };
 pub use error::{IoError, IoErrorCode};
-pub use fs_normalize::{CaseCollisionSet, MAX_COLLISION_MESSAGE_PATH_CHARS, check_case_collisions};
+pub use fs_normalize::{
+    CaseCollisionSet, HostPathLength, MAX_COLLISION_MESSAGE_PATH_CHARS, MAX_HOST_PATH_CHARS,
+    check_case_collisions, check_host_path_length, measure_host_path_length,
+};
 pub use guest_files::{GuestFileCreator, MAX_GUEST_PATH_BYTES, MAX_TRACKED_GUEST_PATHS};
 pub use observe::{
     AckEvent, AckEventError, CoalescedServerEvents, DEFAULT_SEND_LOG_CAPACITY,

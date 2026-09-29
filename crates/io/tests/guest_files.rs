@@ -194,6 +194,21 @@ fn io5_creator_rejects_escape_and_does_not_pollute_index() {
         assert_eq!(err.code(), IoErrorCode::InvalidArgument, "path {path:?}");
     }
     assert_eq!(std::fs::read_dir(&root).expect("read_dir").count(), 0);
+    // 共有ルートの外（親）にも脱出先の痕跡が無い。親には試験ハーネスが置く
+    // ファイル（`TempDir::new` の永続化の暖機用）がありうるため、件数ではなく
+    // 名前で確かめる。
     let parent = root.parent().expect("parent");
-    assert_eq!(std::fs::read_dir(parent).expect("read_dir").count(), 1);
+    let names: Vec<String> = std::fs::read_dir(parent)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().any(|n| n == "root"), "{names:?}");
+    assert!(!names.iter().any(|n| n.contains("escape")), "{names:?}");
+    assert!(
+        !parent
+            .parent()
+            .expect("grandparent")
+            .join("escape")
+            .exists()
+    );
 }

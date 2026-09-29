@@ -646,7 +646,7 @@ fn escape_json_string(input: &str) -> String {
 /// UTF-8 の文字境界を跨がないよう、上限に収まる最後の文字境界で切る（`str` の
 /// 添字アクセスで不正境界を指すと panic するため、`char_indices` で安全に判定
 /// する）。戻り値は `(切り詰め後の文字列, 切り詰めが発生したか)`。
-fn truncate_message_bytes(message: &str) -> (&str, bool) {
+pub(crate) fn truncate_message_bytes(message: &str) -> (&str, bool) {
     if message.len() <= MAX_SEND_LOG_MESSAGE_BYTES {
         return (message, false);
     }
@@ -880,10 +880,51 @@ pub struct ServerEvent<'a> {
     /// イベントへ載せてよい（H1・#820 security-auditor 指摘対応）。取得自体に
     /// 失敗した場合・他の `op`/`outcome` では `None`。
     pub peer_uid: Option<u32>,
+    /// 複数の操作を 1 件にまとめた集約イベントであれば、その集約値（件数・所要時間の
+    /// 合計。[`CoalescedServerEvents`] 参照。REPAIR-4・#1118）。通常の 1 操作 1 イベント
+    /// では `None`。
+    ///
+    /// `Some` のとき、他のフィールドの意味は次のとおり変わる。
+    /// - `op`・`kind`・`outcome`・`error.code` は集約したすべての操作で同じ値（集約の
+    ///   キー）
+    /// - `latency` は集約した操作の所要時間の **最大値**（合計は
+    ///   [`CoalescedServerEvents::latency_sum`]）
+    /// - `error.message` は最後に集約した操作のメッセージ（切り詰め済み）
+    ///
+    /// 操作別・結果別の件数を数える観測フックは、このイベントを
+    /// [`CoalescedServerEvents::count`] 件として数える。
+    pub coalesced: Option<CoalescedServerEvents>,
     /// `outcome` が失敗系だった場合の詳細（エラーコード・メッセージ）。
     /// 成功時は `None`。[`SendEventError`] のドキュメント参照（借用は
     /// `on_event` の呼び出し中のみ有効）。
     pub error: Option<SendEventError<'a>>,
+}
+
+/// [`ServerEvent::coalesced`] の集約値（REPAIR-4・#1118）。
+///
+/// 分割後の送信側・受信側（[`crate::server::UdsSendHalf`]・
+/// [`crate::server::UdsRecvHalf`]）が共有する観測フックの保留キューがあふれた
+/// とき、あふれた操作を `(op, kind, outcome, error code)` ごとに 1 件へまとめた
+/// 集約イベントに付く。個々の操作のイベントを捨てる代わりに、操作別・結果別の
+/// 件数と所要時間（最大値は [`ServerEvent::latency`]、合計はここ）を失わずに
+/// 残す（`JsonLinesServerObserver` の peer credential 拒否の集約行
+/// 〔`CoalescedRejections`〕と同じ考え方）。将来フィールドを追加できるよう
+/// `#[non_exhaustive]` にする（REPAIR-3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CoalescedServerEvents {
+    /// 集約した操作の件数（1 以上。saturating で数える）。
+    pub count: u64,
+    /// 集約した操作の所要時間の合計（saturating で足す）。平均は
+    /// `latency_sum / count` で求められる。
+    pub latency_sum: Duration,
+}
+
+impl CoalescedServerEvents {
+    /// 集約値を作る（`crate::server` の保留キューの集約が組み立てる）。
+    pub(crate) fn new(count: u64, latency_sum: Duration) -> Self {
+        Self { count, latency_sum }
+    }
 }
 
 /// 件数・破棄数等の要約のみを出す手書きの `Debug`（[`SendEvent`] と同じ理由。
@@ -901,6 +942,7 @@ impl fmt::Debug for ServerEvent<'_> {
                 &self.peer_credential_rejections,
             )
             .field("peer_uid", &self.peer_uid)
+            .field("coalesced", &self.coalesced)
             .field("error", &self.error)
             .finish()
     }
@@ -947,6 +989,12 @@ impl fmt::Debug for ServerEvent<'_> {
 /// 通知は 1 回の呼び出しにつき 1 回だけだが、accept は最終結果の前に peer
 /// credential 拒否 1 件ごとのイベント（[`ServerOutcome::RejectedPeerCredential`]）
 /// も通知するため、1 回の呼び出しで `1 + 拒否件数` 回呼ばれうる。
+///
+/// 例外として、分割後の送信側・受信側（[`crate::server::UdsSendHalf`]・
+/// [`crate::server::UdsRecvHalf`]）が共有する保留キューがあふれた場合は、あふれた
+/// 複数回の呼び出しの結果が `(op, kind, outcome, code)` ごとに 1 件の集約イベント
+/// （[`ServerEvent::coalesced`] が `Some`）にまとまる（#1118・REPAIR-4）。件数を
+/// 数える実装は [`CoalescedServerEvents::count`] を使う。
 pub trait ServerObserver: Send {
     /// 1 回の操作イベントを通知する。`event` は呼び出し中のみ有効な借用
     /// （[`ServerEvent`] のドキュメント参照）。
@@ -970,10 +1018,12 @@ impl ServerObserver for NoopServerObserver {
 /// バイト数。[`SEND_LOG_LINE_FIXED_OVERHEAD_BYTES`] より、`op`（最大
 /// `"\"op\":\"accept\","` 相当）・`accept_aborted_retries`・
 /// `peer_credential_rejections`・`peer_uid`（いずれも `u32` の最大桁数
-/// `4294967295`。H1・#820 security-auditor 指摘対応で追加）ぶん余分に見積もる。
+/// `4294967295`。H1・#820 security-auditor 指摘対応で追加）ぶん余分に見積もり、
+/// さらに集約イベントの `coalesced`・`count`（`u64`）・`latency_sum_us`
+/// （`Duration::MAX` のマイクロ秒）ぶん（#1118）を 128 バイト足す。
 /// [`MAX_SERVER_LOG_LINE_BYTES`] の計算にのみ使う保守的な見積もりであり、
 /// 実際のエンコード処理はこの値を直接参照しない。
-const SERVER_LOG_LINE_FIXED_OVERHEAD_BYTES: usize = SEND_LOG_LINE_FIXED_OVERHEAD_BYTES + 256;
+const SERVER_LOG_LINE_FIXED_OVERHEAD_BYTES: usize = SEND_LOG_LINE_FIXED_OVERHEAD_BYTES + 384;
 
 /// [`JsonLinesServerObserver`] がためる 1 行の JSON がとりうる最大バイト数の
 /// 見積もり（[`MAX_SEND_LOG_LINE_BYTES`] のサーバー版）。
@@ -994,8 +1044,8 @@ pub const SERVER_AUDIT_LOG_CAPACITY: usize = 256;
 
 /// [`JsonLinesServerObserver`] の監査枠がためられる JSON 行の合計バイト数の上限
 /// （SEC-4・#820 codex P0 指摘対応。通常枠の [`MAX_SEND_LOG_BUFFER_BYTES`] とは
-/// 別枠）。1 行の最悪長の見積もり（`MAX_SERVER_LOG_LINE_BYTES` = 3584 バイト）
-/// に近い行ばかりなら、行数上限より先にこちらに達する（約 36 行）。どちらの
+/// 別枠）。1 行の最悪長の見積もり（`MAX_SERVER_LOG_LINE_BYTES` = 3712 バイト）
+/// に近い行ばかりなら、行数上限より先にこちらに達する（約 35 行）。どちらの
 /// 上限に先に達しても、以降の拒否は集約行へ回る。
 pub const MAX_SERVER_AUDIT_LOG_BUFFER_BYTES: usize = 128 * 1024;
 
@@ -1086,8 +1136,17 @@ struct CoalescedRejections {
 /// エスケープ済み）・`message_truncated`（切り詰め発生時のみ `true`）・
 /// `accept_aborted_retries`（`u32`）・`peer_credential_rejections`（`u32`。H1・
 /// #820）・`peer_uid`（`u32`。[`ServerEvent::peer_uid`] が `Some` の場合のみ
-/// キーを出す。H1・#820）・`latency_us`。フィールドの出力順はこの記載順に
-/// 固定する。
+/// キーを出す。H1・#820）・`coalesced`・`count`・`latency_sum_us`（下記の集約
+/// イベントのみ）・`latency_us`。フィールドの出力順はこの記載順に固定する。
+///
+/// [`ServerEvent::coalesced`] が `Some` の集約イベント（分割後の両半分が共有する
+/// 保留キューがあふれた分を `(op, kind, outcome, code)` ごとにまとめたもの。
+/// #1118・REPAIR-4）は、通常の行と同じキーに `"coalesced":true`・`count`
+/// （集約した操作の件数。`u64`）・`latency_sum_us`（所要時間の合計）を
+/// `latency_us` の直前へ加え、`latency_us` は **最大値** を表す。`reason`・`code`
+/// は集約した操作の値そのもので、`message` は最後に集約した操作のもの。
+/// これらのキーがない行は 1 行 1 操作である（件数を数える側は、`count` があれば
+/// その値、なければ 1 として数える）。
 ///
 /// 集約行は `event`（`"io_server"`）・`op`（`"accept"`）・`outcome`
 /// （`"error"`）・`reason`（`"peer_credential_rejections_coalesced"`）・
@@ -1370,6 +1429,19 @@ fn peer_uid_json_fragment(peer_uid: Option<u32>) -> String {
     }
 }
 
+/// `event.coalesced` から `"coalesced":true,"count":N,"latency_sum_us":S,` の
+/// 末尾カンマありの断片を組み立てる（`None` の場合は何も出さない。#1118）。
+fn coalesced_json_fragment(coalesced: Option<CoalescedServerEvents>) -> String {
+    match coalesced {
+        Some(c) => format!(
+            "\"coalesced\":true,\"count\":{},\"latency_sum_us\":{},",
+            c.count,
+            c.latency_sum.as_micros()
+        ),
+        None => String::new(),
+    }
+}
+
 /// [`ServerEvent`] を 1 行の JSON Lines 文字列へエンコードする（改行は含まない。
 /// [`encode_send_event`] の UDS サーバー版。TASK-13.2.1・#820）。出力長は
 /// [`MAX_SERVER_LOG_LINE_BYTES`] 以下（固定語彙・数値と切り詰め済みの `message`
@@ -1381,13 +1453,14 @@ fn encode_server_event(event: &ServerEvent<'_>) -> String {
     let retries = event.accept_aborted_retries;
     let cred_rejections = event.peer_credential_rejections;
     let peer_uid = peer_uid_json_fragment(event.peer_uid);
+    let coalesced = coalesced_json_fragment(event.coalesced);
     match (&event.outcome, &event.error) {
         (ServerOutcome::Success, _) => {
             format!(
                 "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"ok\",\
                  \"accept_aborted_retries\":{retries},\
                  \"peer_credential_rejections\":{cred_rejections},{peer_uid}\
-                 \"latency_us\":{latency_us}}}"
+                 {coalesced}\"latency_us\":{latency_us}}}"
             )
         }
         (outcome, Some(error)) => {
@@ -1401,7 +1474,7 @@ fn encode_server_event(event: &ServerEvent<'_>) -> String {
                      \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
                      \"message_truncated\":true,\"accept_aborted_retries\":{retries},\
                      \"peer_credential_rejections\":{cred_rejections},{peer_uid}\
-                     \"latency_us\":{latency_us}}}"
+                     {coalesced}\"latency_us\":{latency_us}}}"
                 )
             } else {
                 format!(
@@ -1409,7 +1482,7 @@ fn encode_server_event(event: &ServerEvent<'_>) -> String {
                      \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
                      \"accept_aborted_retries\":{retries},\
                      \"peer_credential_rejections\":{cred_rejections},{peer_uid}\
-                     \"latency_us\":{latency_us}}}"
+                     {coalesced}\"latency_us\":{latency_us}}}"
                 )
             }
         }
@@ -1423,7 +1496,7 @@ fn encode_server_event(event: &ServerEvent<'_>) -> String {
                 "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"error\",\
                  \"reason\":\"{reason}\",\"accept_aborted_retries\":{retries},\
                  \"peer_credential_rejections\":{cred_rejections},{peer_uid}\
-                 \"latency_us\":{latency_us}}}"
+                 {coalesced}\"latency_us\":{latency_us}}}"
             )
         }
     }
@@ -1899,6 +1972,7 @@ mod tests {
             accept_aborted_retries: 2,
             peer_credential_rejections: 0,
             peer_uid: None,
+            coalesced: None,
             error: None,
         };
 
@@ -1927,6 +2001,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 0,
             peer_uid: None,
+            coalesced: None,
             error: Some(SendEventError {
                 code: IoErrorCode::InvalidArgument,
                 message,
@@ -1957,6 +2032,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 0,
             peer_uid: None,
+            coalesced: None,
             error: Some(SendEventError {
                 code: IoErrorCode::Unavailable,
                 message,
@@ -1988,6 +2064,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 1,
             peer_uid: Some(1000),
+            coalesced: None,
             error: Some(SendEventError {
                 code: IoErrorCode::InvalidArgument,
                 message,
@@ -2018,6 +2095,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 1,
             peer_uid: None,
+            coalesced: None,
             error: Some(SendEventError {
                 code: IoErrorCode::Internal,
                 message,
@@ -2043,6 +2121,7 @@ mod tests {
             accept_aborted_retries: retries,
             peer_credential_rejections: 0,
             peer_uid: None,
+            coalesced: None,
             error: None,
         };
 
@@ -2073,6 +2152,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 1,
             peer_uid,
+            coalesced: None,
             error: Some(SendEventError {
                 code: IoErrorCode::InvalidArgument,
                 message,
@@ -2090,6 +2170,7 @@ mod tests {
             accept_aborted_retries: retries,
             peer_credential_rejections: 0,
             peer_uid: None,
+            coalesced: None,
             error: None,
         }
     }
@@ -2346,6 +2427,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 0,
             peer_uid: None,
+            coalesced: None,
             error: Some(SendEventError {
                 code: IoErrorCode::Timeout,
                 message: &huge_message,
@@ -2376,7 +2458,8 @@ mod tests {
     /// `Duration::MAX`、`accept_aborted_retries`・`peer_credential_rejections`・
     /// `peer_uid` は `u32::MAX`
     /// 〔実行時は `MAX_ACCEPT_ABORT_RETRIES` で頭打ちだが、フィールドの型としての
-    /// 上限を正直に見積もる〕）。
+    /// 上限を正直に見積もる〕、集約イベントの `count` は `u64::MAX`・`latency_sum` は
+    /// `Duration::MAX`〔#1118〕）。
     #[test]
     fn repair4_repair12_encode_server_event_worst_case_line_fits_within_max_line_bytes() {
         let oversized_control_chars = "\u{0001}".repeat(MAX_SEND_LOG_MESSAGE_BYTES + 1);
@@ -2388,6 +2471,7 @@ mod tests {
             accept_aborted_retries: u32::MAX,
             peer_credential_rejections: u32::MAX,
             peer_uid: Some(u32::MAX),
+            coalesced: Some(CoalescedServerEvents::new(u64::MAX, Duration::MAX)),
             error: Some(SendEventError {
                 code: IoErrorCode::ResourceExhausted,
                 message: &oversized_control_chars,
@@ -2396,6 +2480,14 @@ mod tests {
 
         let encoded = encode_server_event(&event);
 
+        assert!(
+            encoded.contains(&format!(
+                "\"coalesced\":true,\"count\":{},\"latency_sum_us\":{},",
+                u64::MAX,
+                Duration::MAX.as_micros()
+            )),
+            "the worst case must include the coalesced fragment: {encoded}"
+        );
         assert!(
             encoded.contains("\"message_truncated\":true"),
             "the oversized message must trigger truncation: {encoded}"
@@ -2413,6 +2505,56 @@ mod tests {
         );
     }
 
+    /// REPAIR-4・#1118: 集約イベント（`coalesced` が `Some`）の成功行は `coalesced`・
+    /// `count`・`latency_sum_us` を `latency_us`（最大値）の直前に持つ。
+    #[test]
+    fn repair4_1118_encode_server_event_coalesced_success() {
+        let event = ServerEvent {
+            op: ServerOp::Send,
+            kind: Some(FrameKind::Ack),
+            outcome: ServerOutcome::Success,
+            latency: Duration::from_micros(900),
+            accept_aborted_retries: 0,
+            peer_credential_rejections: 0,
+            peer_uid: None,
+            coalesced: Some(CoalescedServerEvents::new(3, Duration::from_micros(1500))),
+            error: None,
+        };
+        assert_eq!(
+            encode_server_event(&event),
+            "{\"event\":\"io_server\",\"op\":\"send\",\"kind\":\"ACK\",\"outcome\":\"ok\",\
+             \"accept_aborted_retries\":0,\"peer_credential_rejections\":0,\
+             \"coalesced\":true,\"count\":3,\"latency_sum_us\":1500,\"latency_us\":900}"
+        );
+    }
+
+    /// REPAIR-4・#1118: 集約イベントの失敗行は `reason`・`code`・`message` を通常の行と
+    /// 同じ位置に持ち、集約の欄を `latency_us` の直前に加える（`kind` がない場合は省く）。
+    #[test]
+    fn repair4_1118_encode_server_event_coalesced_failure() {
+        let event = ServerEvent {
+            op: ServerOp::Recv,
+            kind: None,
+            outcome: ServerOutcome::RejectedPoisoned,
+            latency: Duration::ZERO,
+            accept_aborted_retries: 0,
+            peer_credential_rejections: 0,
+            peer_uid: None,
+            coalesced: Some(CoalescedServerEvents::new(2, Duration::ZERO)),
+            error: Some(SendEventError {
+                code: IoErrorCode::Unavailable,
+                message: "poisoned",
+            }),
+        };
+        assert_eq!(
+            encode_server_event(&event),
+            "{\"event\":\"io_server\",\"op\":\"recv\",\"outcome\":\"error\",\
+             \"reason\":\"rejected_poisoned\",\"code\":\"UNAVAILABLE\",\"message\":\"poisoned\",\
+             \"accept_aborted_retries\":0,\"peer_credential_rejections\":0,\
+             \"coalesced\":true,\"count\":2,\"latency_sum_us\":0,\"latency_us\":0}"
+        );
+    }
+
     /// TASK-13.2.1・#820: `NoopServerObserver` は何もしない（既定実装が accept・
     /// 送受信経路の動作へ影響しないことの確認）。
     #[test]
@@ -2426,6 +2568,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 0,
             peer_uid: None,
+            coalesced: None,
             error: None,
         });
         // panic せず戻ることのみを確認する（副作用を持たない契約）。

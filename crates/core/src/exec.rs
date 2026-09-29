@@ -24,8 +24,12 @@
 //! - 呼び出し元は TASK-29 の `oci_runtime`（`create` / `start`）および fork 段（#831）を想定する
 //! - 常駐デーモンを前提にしない（CORE-1・D-19）
 //!
-//! # namespace 分離の契約（[`isolate`]）
+//! # namespace 分離の契約（[`isolate`]・[`isolate_rootful_host_root`]）
 //!
+//! - 分離は検証済みの計画を型で受け取る。既定は [`plan`] → [`isolate`]（user namespace 必須・
+//!   非 root 起動。SEC-5）。ホスト root のまま動く rootful 分離は [`plan_rootful_host_root`] →
+//!   [`isolate_rootful_host_root`] という別経路で、計画の型（[`IsolationPlan`] /
+//!   [`RootfulHostRootPlan`]）が異なるため既定経路が rootful へ暗黙に落ちることはない
 //! - シングルスレッドのプロセスから呼ぶこと（マルチスレッドからの `CLONE_NEWUSER` は
 //!   `EINVAL` になり、`FailedPrecondition` で返す）
 //! - `unshare(CLONE_NEWPID)` は呼び出し元自身を移動させず、**次に生成する子が PID 1** になる。
@@ -311,9 +315,22 @@ fn errno_to_code(err: SysError) -> ErrorCode {
     }
 }
 
-/// [`isolate`] の成功結果（将来拡張できる構造化された戻り値）。
+/// 分離がどの権限モデルで行われたか（[`IsolationReport::privilege`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IsolationPrivilege {
+    /// 既定経路（[`isolate`]）。非 root の自 ID をコンテナ内 0 へ写す user namespace 付き。
+    RootlessSingleId,
+    /// rootful 経路（[`isolate_rootful_host_root`]）。user namespace なしでホスト root 権限を
+    /// 保ったまま分離した。
+    RootfulHostRoot,
+}
+
+/// [`isolate`] / [`isolate_rootful_host_root`] の成功結果（将来拡張できる構造化された戻り値）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsolationReport {
+    /// どの権限モデルで分離したか。
+    pub privilege: IsolationPrivilege,
     /// 分離した namespace。
     pub namespaces: NamespaceSet,
     /// 設定した hostname。
@@ -335,6 +352,11 @@ pub struct IsolationReport {
 /// 持ち出し対策として `Clone` を実装せず、`!Send` にしている（mount namespace は
 /// `unshare(CLONE_NEWNS)` を呼んだスレッドだけが移るため、別スレッドへ渡すと前提が崩れる）。
 /// 別スレッドへは渡せない:
+///
+/// 下の `compile_fail` doctest は「コンパイルに失敗すること」しか確かめないため、`!Send` 以外の
+/// 理由（名前の誤り・モジュールが無い等）のエラーでも通ってしまう。また `exec` モジュールは
+/// Linux 限定のため、非 Linux では型が存在せず常に失敗し、この doctest は常に通る
+/// （`!Send` の実質的な確認は Linux のみ）。
 ///
 /// ```compile_fail
 /// fn assert_send<T: Send>() {}
@@ -362,6 +384,47 @@ fn nspid_depth(status: &str) -> Option<usize> {
         .lines()
         .find_map(|l| l.strip_prefix("NSpid:"))
         .map(|rest| rest.split_whitespace().count())
+}
+
+/// `/proc/self/status` の `NSpid:` 行の末尾要素（最も内側の PID namespace での PID）。
+fn nspid_innermost(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("NSpid:"))
+        .and_then(|rest| rest.split_whitespace().last())
+        .and_then(|v| v.parse().ok())
+}
+
+/// `/proc/self/status` の `Threads:` 行（スレッドグループのスレッド数）。
+fn status_threads(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Threads:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// [`MountIsolation::establish`] の前提（副作用の前に判定するテスト可能な純関数）。
+/// `pid` は `getpid()`、`status` は `/proc/self/status` の内容。
+///
+/// - PID が 1 で、`NSpid` の末尾要素も 1、かつ `NSpid` が 2 段以上（ホスト側 procfs 越しに
+///   見て入れ子の PID namespace の PID 1）
+/// - `Threads:` が 1（シングルスレッド）。`unshare(CLONE_NEWNS)` は呼んだスレッドだけを移すため、
+///   他のスレッドが古い mount namespace に残り、後続の `pivot_root`・exec（#135・#831）が別
+///   スレッドで行われるとホストの procfs・ファイルシステムが見えてしまう
+fn check_establish_preconditions(pid: u32, status: &str) -> Result<(), &'static str> {
+    if pid != 1 {
+        return Err("not PID 1; call from the first child created after unshare(CLONE_NEWPID)");
+    }
+    if nspid_innermost(status) != Some(1) {
+        return Err("NSpid does not end with 1; not PID 1 of the innermost PID namespace");
+    }
+    if nspid_depth(status).is_none_or(|d| d < 2) {
+        return Err("not in a nested PID namespace; isolate with Namespace::Pid first");
+    }
+    if status_threads(status) != Some(1) {
+        return Err("the process must be single-threaded before establishing mount isolation");
+    }
+    Ok(())
 }
 
 /// 呼び出しスレッドの namespace リンク（`/proc/thread-self/ns/<kind>`）を読む。
@@ -407,8 +470,9 @@ impl MountIsolation {
     ///
     /// 手順（前提検証はすべて副作用の前に行う）:
     ///
-    /// 1. PID が 1 で、`/proc/self/status` の `NSpid` が 2 段以上（ホスト側 procfs 越しに見て
-    ///    入れ子の PID namespace の PID 1）。満たさなければ副作用なしで `FailedPrecondition`
+    /// 1. PID が 1（`getpid()` と `NSpid` の末尾要素の両方）で、`NSpid` が 2 段以上、かつ
+    ///    シングルスレッド（`Threads: 1`）。満たさなければ副作用なしで `FailedPrecondition`
+    ///    （判定は [`check_establish_preconditions`]）
     /// 2. 呼び出しスレッドを `unshare(CLONE_NEWNS)` で新しい mount namespace へ移し、`/` を
     ///    再帰 private にする（コピーされたマウントの shared peer から切り離し、以後のマウントを
     ///    外へ伝播させない）
@@ -420,7 +484,12 @@ impl MountIsolation {
     /// rootless でも user namespace 内の CAP_SYS_ADMIN で実行でき、比較を省く分岐は持たない。
     ///
     /// 手順 2 以降の失敗は namespace を戻せない（モジュール doc の「失敗時はプロセスを破棄」の
-    /// 契約に従う）。返った証跡は同じスレッドで [`mount_proc`] に渡す。
+    /// 契約に従う）。
+    ///
+    /// **同一スレッドの契約**: 返った証跡は同じスレッドで [`mount_proc`] に渡し、以後の
+    /// `pivot_root`（#135）・exec（#831）も同じスレッドで行う。新しい mount namespace に
+    /// 移るのは呼んだスレッドだけのため、前提としてシングルスレッドであることを確かめている
+    /// （establish 後に作ったスレッドは新しい mount namespace を引き継ぐ）。
     pub fn establish() -> Result<Self, ExecError> {
         let fail = |msg: &str| {
             ExecError::new(
@@ -429,18 +498,16 @@ impl MountIsolation {
                 msg,
             )
         };
-        if std::process::id() != 1 {
+        let pid = std::process::id();
+        if pid != 1 {
+            // /proc を読む前に拒否する（PID 1 でないことは getpid だけで確定する）。
             return Err(fail(
                 "not PID 1; call from the first child created after unshare(CLONE_NEWPID)",
             ));
         }
         let status = std::fs::read_to_string("/proc/self/status")
             .map_err(|_| fail("cannot read /proc/self/status to verify the PID namespace"))?;
-        if nspid_depth(&status).is_none_or(|d| d < 2) {
-            return Err(fail(
-                "not in a nested PID namespace; isolate with Namespace::Pid first",
-            ));
-        }
+        check_establish_preconditions(pid, &status).map_err(fail)?;
         let before =
             thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
         sys::unshare_namespaces(&[NsFlag::Mount])
@@ -473,26 +540,56 @@ impl MountIsolation {
             thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
         let pid_ns =
             thread_ns_link("pid").map_err(|_| fail("cannot read /proc/thread-self/ns/pid"))?;
-        check_evidence(self, std::process::id(), &mnt_ns, &pid_ns).map_err(fail)
+        check_evidence(self, std::process::id(), &mnt_ns, &pid_ns).map_err(fail)?;
+        // getpid に加え、procfs 側の NSpid 末尾も 1 であることを確かめる（procfs を再マウント
+        // した後も NSpid の末尾は最も内側の namespace の PID）。
+        let status = std::fs::read_to_string("/proc/self/status")
+            .map_err(|_| fail("cannot read /proc/self/status to verify the PID"))?;
+        if nspid_innermost(&status) != Some(1) {
+            return Err(fail(
+                "NSpid does not end with 1; not PID 1 of the innermost PID namespace",
+            ));
+        }
+        Ok(())
     }
 }
 
-/// 前提検証の結果として得る、副作用なしの実行計画。
-#[derive(Debug, PartialEq, Eq)]
-struct Plan {
-    uid_mapping: Option<IdMapping>,
-    gid_mapping: Option<IdMapping>,
+/// 既定経路（rootless）の検証済み計画。[`plan`] だけが作り、[`isolate`] だけが受け取る。
+///
+/// user namespace を必ず含み、非 root の自 euid / egid をコンテナ内 0 へ写す単一 ID 写像を
+/// 持つ（SEC-5。subuid 範囲の写像は TASK-40・#186 で扱う）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolationPlan {
+    namespaces: NamespaceSet,
+    hostname: Option<Hostname>,
+    uid_mapping: IdMapping,
+    gid_mapping: IdMapping,
 }
 
-/// 副作用なしで設定と実行 ID を検証する（euid を引数に取りテスト可能にした純関数）。
+/// rootful 経路の検証済み計画。[`plan_rootful_host_root`] だけが作り、
+/// [`isolate_rootful_host_root`] だけが受け取る。
+///
+/// **権限条件**: sudo 等で euid 0 として起動し、user namespace を作らずに**ホストの root 権限を
+/// 保ったまま**分離する。コンテナ内 root はホスト root そのものであり、SEC-5（非 root 起動時に
+/// コンテナ内 root をホストの非特権 UID へ写す）の保護は受けない。
+///
+/// **用途**: CORE-7・CORE-9 の rootful 分離（spec 上、dev-box02 の PoC-14・15・17 で実機実証済みの
+/// 構成）。root 起動でもコンテナ内 root を非特権 UID へ写す構成は TASK-40（#186）の subuid 写像で
+/// 既定経路に加える予定で、それまでの暫定経路ではなく明示的に選ぶ別経路として分けている。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootfulHostRootPlan {
+    namespaces: NamespaceSet,
+    hostname: Option<Hostname>,
+}
+
+/// 既定・rootful に共通する設定の検証（副作用なしの純関数）。
 ///
 /// - namespace が空、または hostname 指定なのに `Uts` が無い場合は `InvalidArgument`
 ///   （ホストの hostname を書き換える経路を作らない）
 /// - `Pid` を含み `Mount` を含まない場合は `InvalidArgument`（PID 1 が外側と mount
 ///   namespace を共有した状態から始まる構成を作らない。[`MountIsolation::establish`] が
 ///   PID 1 自身で mount namespace を分けることとの二重の防御）
-/// - `User` を含み euid / egid が 0 の場合は `FailedPrecondition`（SEC-5）
-fn plan(config: &IsolationConfig, euid: u32, egid: u32) -> Result<Plan, ExecError> {
+fn validate_common(config: &IsolationConfig) -> Result<(), ExecError> {
     let invalid =
         |msg: &str| ExecError::new(ErrorCode::InvalidArgument, IsolationStage::Validate, msg);
     if config.namespaces.is_empty() {
@@ -504,11 +601,18 @@ fn plan(config: &IsolationConfig, euid: u32, egid: u32) -> Result<Plan, ExecErro
     if config.namespaces.contains(Namespace::Pid) && !config.namespaces.contains(Namespace::Mount) {
         return Err(invalid("the PID namespace requires the mount namespace"));
     }
+    Ok(())
+}
+
+/// [`plan`] の本体（euid / egid を引数に取りテスト可能にした純関数）。
+fn plan_for(config: &IsolationConfig, euid: u32, egid: u32) -> Result<IsolationPlan, ExecError> {
+    validate_common(config)?;
     if !config.namespaces.contains(Namespace::User) {
-        return Ok(Plan {
-            uid_mapping: None,
-            gid_mapping: None,
-        });
+        return Err(ExecError::new(
+            ErrorCode::InvalidArgument,
+            IsolationStage::Validate,
+            "the user namespace is required to map container root to an unprivileged host ID",
+        ));
     }
     if euid == 0 || egid == 0 {
         return Err(ExecError::new(
@@ -519,10 +623,49 @@ fn plan(config: &IsolationConfig, euid: u32, egid: u32) -> Result<Plan, ExecErro
              subordinate ID mapping is not implemented yet, see TASK-40)",
         ));
     }
-    Ok(Plan {
-        uid_mapping: Some(IdMapping::single(euid)),
-        gid_mapping: Some(IdMapping::single(egid)),
+    Ok(IsolationPlan {
+        namespaces: config.namespaces,
+        hostname: config.hostname.clone(),
+        uid_mapping: IdMapping::single(euid),
+        gid_mapping: IdMapping::single(egid),
     })
+}
+
+/// [`plan_rootful_host_root`] の本体（euid を引数に取りテスト可能にした純関数）。
+fn plan_rootful_for(config: &IsolationConfig, euid: u32) -> Result<RootfulHostRootPlan, ExecError> {
+    validate_common(config)?;
+    if config.namespaces.contains(Namespace::User) {
+        return Err(ExecError::new(
+            ErrorCode::InvalidArgument,
+            IsolationStage::Validate,
+            "the rootful host-root plan must not include the user namespace",
+        ));
+    }
+    if euid != 0 {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Validate,
+            "the rootful host-root plan requires euid 0",
+        ));
+    }
+    Ok(RootfulHostRootPlan {
+        namespaces: config.namespaces,
+        hostname: config.hostname.clone(),
+    })
+}
+
+/// 既定経路の計画を作る（副作用なし）。拒否条件は共通検証（空・hostname に Uts なし・Pid に
+/// Mount なし）に加え、`User` を含まない場合は `InvalidArgument`、euid / egid が 0 の場合は
+/// `FailedPrecondition`（SEC-5）。
+pub fn plan(config: &IsolationConfig) -> Result<IsolationPlan, ExecError> {
+    plan_for(config, sys::effective_uid(), sys::effective_gid())
+}
+
+/// rootful 経路の計画を作る（副作用なし）。用途と権限条件は [`RootfulHostRootPlan`] を参照。
+/// 共通検証に加え、`User` を含む場合は `InvalidArgument`、euid が 0 でない場合は
+/// `FailedPrecondition`。
+pub fn plan_rootful_host_root(config: &IsolationConfig) -> Result<RootfulHostRootPlan, ExecError> {
+    plan_rootful_for(config, sys::effective_uid())
 }
 
 /// `/proc/self/<name>` へ内容を 1 回の write で書く（カーネルは map を 1 回しか受け付けない）。
@@ -536,42 +679,86 @@ fn write_proc_self(name: &str, content: &str, stage: IsolationStage) -> Result<(
         .map_err(|e| ExecError::from_io(&e, stage, name))
 }
 
-/// 設定に従い、呼び出しプロセスを namespace 分離する（CORE-1・SEC-5）。
+/// 既定経路の計画に従い、呼び出しプロセスを namespace 分離する（CORE-1・SEC-5）。
 ///
-/// 処理順: 検証 → `unshare` を全フラグで 1 回 → （`User`）`setgroups` deny・`uid_map`・
+/// 処理順: 実行 ID の再検証 → `unshare` を全フラグで 1 回 → `setgroups` deny・`uid_map`・
 /// `gid_map` → （`Mount`）`/` を再帰 private 化 → （`Uts` かつ hostname）`sethostname`。
 /// 契約はモジュール doc（シングルスレッド・PID 1 は次の子・失敗時はプロセス破棄）を参照。
-pub fn isolate(config: &IsolationConfig) -> Result<IsolationReport, ExecError> {
-    // unshare 後の euid / egid は overflow id になるため、先に取得する。
-    let plan = plan(config, sys::effective_uid(), sys::effective_gid())?;
+pub fn isolate(plan: &IsolationPlan) -> Result<IsolationReport, ExecError> {
+    // unshare 後の euid / egid は overflow id になるため、先に取得する。計画作成後に
+    // setuid 等で ID が変わっていれば写像がずれるため、副作用の前に拒否する。
+    let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
+    if euid != plan.uid_mapping.host_id || egid != plan.gid_mapping.host_id {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Validate,
+            "effective uid/gid changed after the plan was created",
+        ));
+    }
+    unshare_and_configure(
+        plan.namespaces,
+        plan.hostname.as_ref(),
+        Some((plan.uid_mapping, plan.gid_mapping)),
+    )?;
+    Ok(IsolationReport {
+        privilege: IsolationPrivilege::RootlessSingleId,
+        namespaces: plan.namespaces,
+        hostname: plan.hostname.clone(),
+        uid_mapping: Some(plan.uid_mapping),
+        gid_mapping: Some(plan.gid_mapping),
+    })
+}
 
-    sys::unshare_namespaces(&config.namespaces.flags())
+/// rootful 経路の計画に従い、ホスト root 権限を保ったまま namespace 分離する（CORE-1・
+/// CORE-7・CORE-9）。用途と権限条件は [`RootfulHostRootPlan`] を参照。
+///
+/// 処理順: euid 0 の再検証 → `unshare` を全フラグで 1 回 → （`Mount`）`/` を再帰 private 化
+/// → （`Uts` かつ hostname）`sethostname`。user namespace は作らない。
+pub fn isolate_rootful_host_root(plan: &RootfulHostRootPlan) -> Result<IsolationReport, ExecError> {
+    if sys::effective_uid() != 0 {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Validate,
+            "the rootful host-root plan requires euid 0",
+        ));
+    }
+    unshare_and_configure(plan.namespaces, plan.hostname.as_ref(), None)?;
+    Ok(IsolationReport {
+        privilege: IsolationPrivilege::RootfulHostRoot,
+        namespaces: plan.namespaces,
+        hostname: plan.hostname.clone(),
+        uid_mapping: None,
+        gid_mapping: None,
+    })
+}
+
+/// 両経路に共通する副作用部（検証済みの計画からだけ呼ぶ）。
+fn unshare_and_configure(
+    namespaces: NamespaceSet,
+    hostname: Option<&Hostname>,
+    mappings: Option<(IdMapping, IdMapping)>,
+) -> Result<(), ExecError> {
+    sys::unshare_namespaces(&namespaces.flags())
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Unshare, "unshare"))?;
 
-    if let (Some(uid), Some(gid)) = (plan.uid_mapping, plan.gid_mapping) {
+    if let Some((uid, gid)) = mappings {
         // 非特権の gid_map 書き込みには setgroups の deny が先に必要。
         write_proc_self("setgroups", "deny", IsolationStage::SetGroups)?;
         write_proc_self("uid_map", &uid.to_map_line(), IsolationStage::UidMap)?;
         write_proc_self("gid_map", &gid.to_map_line(), IsolationStage::GidMap)?;
     }
 
-    if config.namespaces.contains(Namespace::Mount) {
+    if namespaces.contains(Namespace::Mount) {
         sys::mount_root_private_recursive().map_err(|e| {
             ExecError::from_sys(e, IsolationStage::MountPrivate, "mount(MS_PRIVATE)")
         })?;
     }
 
-    if let Some(hostname) = &config.hostname {
+    if let Some(hostname) = hostname {
         sys::set_hostname(hostname.as_str().as_bytes())
             .map_err(|e| ExecError::from_sys(e, IsolationStage::SetHostname, "sethostname"))?;
     }
-
-    Ok(IsolationReport {
-        namespaces: config.namespaces,
-        hostname: config.hostname.clone(),
-        uid_mapping: plan.uid_mapping,
-        gid_mapping: plan.gid_mapping,
-    })
+    Ok(())
 }
 
 /// `rootfs` 配下の `target` に procfs をマウントする。新しい PID namespace の PID 1 側で呼ぶ
@@ -858,70 +1045,89 @@ mod tests {
     /// CORE-1: 空集合は拒否。
     #[test]
     fn core1_plan_rejects_empty_namespaces() {
-        let err = plan(&cfg(NamespaceSet::empty(), None), 1000, 1000).unwrap_err();
+        let err = plan_for(&cfg(NamespaceSet::empty(), None), 1000, 1000).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        let err = plan_rootful_for(&cfg(NamespaceSet::empty(), None), 0).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 
     /// CORE-1: UTS 無しの hostname はホストの hostname を書き換え得るため拒否。
     #[test]
     fn core1_plan_rejects_hostname_without_uts() {
-        let ns = NamespaceSet::empty().with(Namespace::Pid);
-        let err = plan(&cfg(ns, Some("x")), 1000, 1000).unwrap_err();
+        let ns = NamespaceSet::empty()
+            .with(Namespace::Pid)
+            .with(Namespace::Mount);
+        let err = plan_for(&cfg(ns.with(Namespace::User), Some("x")), 1000, 1000).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert_eq!(err.stage, IsolationStage::Validate);
+        assert_eq!(err.message, "hostname requires the UTS namespace");
+        let err = plan_rootful_for(&cfg(ns, Some("x")), 0).unwrap_err();
+        assert_eq!(err.message, "hostname requires the UTS namespace");
     }
 
     /// SEC-5: root（euid 0 / egid 0）の自 ID 写像は拒否。
     #[test]
     fn sec5_plan_rejects_root_identity_mapping() {
         for (u, g) in [(0, 1000), (1000, 0), (0, 0)] {
-            let err = plan(&cfg(NamespaceSet::all(), None), u, g).unwrap_err();
+            let err = plan_for(&cfg(NamespaceSet::all(), None), u, g).unwrap_err();
             assert_eq!(err.code, ErrorCode::FailedPrecondition, "({u},{g})");
         }
     }
 
-    /// 監査 P1-1: Pid あり・Mount なしは拒否し、Mount を加えれば通る。
+    /// 監査 P1-1: Pid あり・Mount なしは両経路とも拒否し、Mount を加えれば通る。
     #[test]
     fn core1_plan_rejects_pid_without_mount() {
         let pid_only = NamespaceSet::empty()
             .with(Namespace::Pid)
             .with(Namespace::Uts);
-        let err = plan(&cfg(pid_only, None), 0, 0).unwrap_err();
+        let err = plan_rootful_for(&cfg(pid_only, None), 0).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert_eq!(err.stage, IsolationStage::Validate);
         assert_eq!(
             err.message,
             "the PID namespace requires the mount namespace"
         );
-        assert!(plan(&cfg(pid_only.with(Namespace::Mount), None), 0, 0).is_ok());
+        let err = plan_for(&cfg(pid_only.with(Namespace::User), None), 1000, 1000).unwrap_err();
+        assert_eq!(
+            err.message,
+            "the PID namespace requires the mount namespace"
+        );
+        assert!(plan_rootful_for(&cfg(pid_only.with(Namespace::Mount), None), 0).is_ok());
     }
 
     /// SEC-5（監査 P2-4）: 拒否文言は弱い分離ではなく subuid / subgid 写像へ案内する。
     #[test]
     fn sec5_rejection_message_points_to_subordinate_ids() {
-        let err = plan(&cfg(NamespaceSet::all(), None), 0, 0).unwrap_err();
+        let err = plan_for(&cfg(NamespaceSet::all(), None), 0, 0).unwrap_err();
         assert!(err.message.contains("/etc/subuid"), "{}", err.message);
         assert!(err.message.contains("TASK-40"), "{}", err.message);
         assert!(!err.message.contains("rootful"), "{}", err.message);
     }
 
-    /// SEC-5: 非 root では自 ID を 0 へ写す単一写像を計画し、root は User 無しなら通る。
+    /// SEC-5: 既定経路は非 root の自 ID を 0 へ写す単一写像を計画する。
     #[test]
     fn sec5_plan_maps_unprivileged_ids_to_zero() {
-        let p = plan(&cfg(NamespaceSet::all(), None), 1000, 1001).unwrap();
-        assert_eq!(p.uid_mapping.unwrap().to_map_line(), "0 1000 1\n");
-        assert_eq!(p.gid_mapping.unwrap().to_map_line(), "0 1001 1\n");
+        let p = plan_for(&cfg(NamespaceSet::all(), Some("h")), 1000, 1001).unwrap();
+        assert_eq!(p.uid_mapping.to_map_line(), "0 1000 1\n");
+        assert_eq!(p.gid_mapping.to_map_line(), "0 1001 1\n");
+        assert_eq!(p.namespaces, NamespaceSet::all());
+        assert_eq!(p.hostname.as_ref().map(Hostname::as_str), Some("h"));
+    }
+
+    /// CORE-7・CORE-9: rootful 経路は euid 0 で User なしの構成を計画する。
+    #[test]
+    fn rootful_plan_accepts_root_without_user() {
         let rootful = NamespaceSet::empty()
             .with(Namespace::Pid)
             .with(Namespace::Mount)
             .with(Namespace::Uts)
             .with(Namespace::Ipc);
-        let p = plan(&cfg(rootful, Some("h")), 0, 0).unwrap();
+        let p = plan_rootful_for(&cfg(rootful, Some("h")), 0).unwrap();
         assert_eq!(
             p,
-            Plan {
-                uid_mapping: None,
-                gid_mapping: None
+            RootfulHostRootPlan {
+                namespaces: rootful,
+                hostname: Some(Hostname::new("h").unwrap()),
             }
         );
     }

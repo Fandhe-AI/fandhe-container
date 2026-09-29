@@ -43,7 +43,8 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        Hostname, IsolationConfig, MountIsolation, Namespace, NamespaceSet, isolate, mount_proc,
+        Hostname, IsolationConfig, IsolationPrivilege, MountIsolation, Namespace, NamespaceSet,
+        isolate, isolate_rootful_host_root, mount_proc, plan, plan_rootful_host_root,
     };
 
     const HOSTNAME: &str = "fandhe-probe";
@@ -73,7 +74,8 @@ mod linux {
     }
 
     fn parent() {
-        // euid 0 での自 ID 写像は SEC-5 で拒否されるため、root では User を除く rootful 構成にする。
+        // euid 0 での自 ID 写像は SEC-5 で拒否されるため、root では User を除く rootful 構成
+        // （CORE-7・CORE-9。`plan_rootful_host_root`）にする。
         let is_root = std::fs::read_to_string("/proc/self/status")
             .expect("read status")
             .lines()
@@ -95,9 +97,21 @@ mod linux {
         };
 
         let host_before = read_hostname();
-        match isolate(&config) {
+        // root は sudo 起動の rootful 経路（ホスト root のまま・User なし）、非 root は既定経路。
+        let result = if is_root {
+            plan_rootful_host_root(&config).and_then(|p| isolate_rootful_host_root(&p))
+        } else {
+            plan(&config).and_then(|p| isolate(&p))
+        };
+        match result {
             Ok(report) => {
                 assert_eq!(report.namespaces, namespaces);
+                let want = if is_root {
+                    IsolationPrivilege::RootfulHostRoot
+                } else {
+                    IsolationPrivilege::RootlessSingleId
+                };
+                assert_eq!(report.privilege, want);
                 assert_eq!(read_hostname(), HOSTNAME);
                 assert_ne!(
                     host_before, HOSTNAME,

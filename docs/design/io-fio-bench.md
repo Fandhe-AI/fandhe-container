@@ -3,9 +3,9 @@
 `scripts/fio-randwrite-4k.sh`（DB 書き込み相当の 4K ランダム write ワークロードを fio 経由で計測し、IOPS・レイテンシを機械可読形式で出力するスクリプト）の前提条件・使い方・パラメータ・出力スキーマ・終了コードを記録する。
 
 - 対象ビヘイビア: IO-8（fio 4K ランダム write ベンチ実施・目標値設定。DB 書き込み相当のワークロードを I/O 共有プロトコル経由で実行し、Docker ベースライン比で IOPS を計測する）
-- 関連タスク: TASK-25.1（#112。本スクリプトの実装）・TASK-25.2（#113。Docker ベースライン比の実測と目標値案。人間共同）・TASK-25.h1（#114。目標値の妥当性判断。人間担当）
+- 関連タスク: TASK-25.1（#112。本スクリプトの実装）・TASK-25.2（#113。Docker ベースライン比の計測手順・比率算出・目標値案。人間共同。実測は人間実施待ち）・TASK-25.h1（#114。目標値の妥当性判断。人間担当）
 - 対象マイルストーン: MS-1 Phase 2
-- ステータス: 本ドキュメントは TASK-25.1 で確定したスクリプトの契約（前提条件・パラメータ・出力スキーマ・終了コード）を記録する。Docker ベースラインの実測レポートと目標値案は TASK-25.2 が追記する
+- ステータス: 本ドキュメントは TASK-25.1 で確定したスクリプトの契約（前提条件・パラメータ・出力スキーマ・終了コード）に加え、TASK-25.2 が Docker ベースラインの計測 runbook・比率算出手段（`scripts/fio-baseline-ratio.sh`）・実測レポートの枠・目標値案を追記した。**実測値（IOPS・レイテンシ・倍率）はまだ記入されていない**（下記「実測レポート」参照。fandhe 経路が未公開かつ実機実測は人間担当のため）
 
 ## 現状の制約（実装済みを装わない。REPAIR-3）
 
@@ -42,6 +42,8 @@ make fio-bench TARGET_DIR=/path/to/docker/bind-mount LABEL=docker_bind_mount RUN
 ```
 
 fandhe 経路（共有マウント）の計測は、共有マウントが公開されてから同じスクリプトで `--target-dir` にそのマウントポイントを渡す（上記「現状の制約」を参照）。
+
+上記の例はホストの fio がバインドマウントの実体パス（またはボリュームの実体パス）を直接測っており、Docker の I/O 経路を通さない。**Docker ベースラインとして測るときは、下記「Docker ベースラインの計測手順」のとおりコンテナの中で fio を実行する**（PoC linux-real-machine の方法論と同じ）。
 
 ### `--from-json` モード（既存の fio 出力を変換するだけ）
 
@@ -177,6 +179,7 @@ fio に `--time_based` を渡さない。`--time_based` があると fio はフ�
 ```
 
 - `target_kind` は実行経路を表す（`run`: fio を実際に実行した、`from_json`: 既存出力の変換のみで実測を伴わない）。Docker ベースラインか fandhe 経路かの区別は `--label` で表現する契約
+- `target_kind: from_json` は「このスクリプト自身は fio を実行していない」という意味に過ぎない。変換元の fio をどの経路（Docker コンテナ内・ホスト直接等）でどう実行したかは、本スクリプトの出力には残らないため、下記「Docker ベースラインの計測手順」の runbook 側に記録する
 - `params` は run・`--from-json` のどちらのモードでも、fio JSON に記録された実行条件と照合済みの値である（照合内容は上記「`--from-json` モード」節。不一致なら出力せず終了コード 2）
 - IOPS・レイテンシが 0 以下・欠落・非有限のときは出力せず、終了コード 2 で止める（fail-closed）
 - fio 2.x 系の `lat`/`clat`（usec 単位・キー名も異なる）は非対応。`"fio version"` の major が 3 未満、または `lat_ns`/`clat_ns` キーが無い場合は終了コード 2 で拒否する
@@ -195,6 +198,92 @@ fio に `--time_based` を渡さない。`--time_based` があると fio はフ�
 ## 自己テスト（`scripts/fio-randwrite-4k-selftest.sh`）
 
 `--from-json` モードと `scripts/testdata/fio-bench/` の固定 fixture、および最小の fio スタブ（受け取ったオプションを fio と同じ形で `job options` に記録した固定 JSON を書き出す）を使い、実 fio なしで終了コード・出力値・`check-bench-regression.sh` との round-trip 互換性、実行条件の照合（負例 fixture は照合を通る `job options` を持たせたうえで 1 点だけ壊し、拒否理由をメッセージで照合する。必須 13 項目は 1 つずつ欠落させた JSON を selftest 内で生成して照合する）、総書き込み量の上限の境界、および symlink・競合に対する書き込み先の安全性（上記「書き込み先の安全性」・「`--output` の排他作成」。検証後に通常ファイル・FIFO・ディレクトリを指す symlink や実ディレクトリを置く競合をスタブで再現する）を機械照合する（REPAIR-12）。`make fio-bench-selftest` から実行し、CI の `bench-regression` ジョブにも組み込む。run モードの実 fio を使った実行確認は「実機での確認」節を参照。
+
+`scripts/fio-baseline-ratio.sh`（IOPS・レイテンシの倍率算出。TASK-25.2）の自己テストは `scripts/fio-baseline-ratio-selftest.sh`・`scripts/testdata/fio-baseline/` に分離しており、`make fio-baseline-ratio-selftest` から実行する（同じく実 fio 不要。CI の `bench-regression` ジョブに組み込み済み）。
+
+## Docker ベースラインの計測手順（TASK-25.2・IO-8・人間実施）
+
+Docker ベースラインは **fio をコンテナの中で実行して**計測する（PoC linux-real-machine の方法論と同じ）。ホストの fio でバインドマウントの実体パス（またはボリュームの実体パス）を直接測ると、Docker の overlay/bind・named volume の I/O 経路を通らず、Docker 経路の計測にならない（上記「run モード」節の注記）。
+
+### コマンド例
+
+```bash
+# 1) bind mount（<host-dir> はホスト側の空ディレクトリ、<out-dir> は結果 JSON の出力先）
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v <host-dir>:/data -v <out-dir>:/out \
+  <fio 入りイメージ> \
+  fio --name=fandhe-fio-randwrite-4k --directory=/data \
+      --filename=fandhe-fio-randwrite-4k.dat --rw=randwrite --bs=4k --ioengine=psync \
+      --direct=1 --size=256m --runtime=30 --iodepth=1 --numjobs=1 \
+      --end_fsync=1 --group_reporting --output-format=json --output=/out/fio.json
+
+# 2) named volume（<volume> は事前に作成した docker volume 名。実体パスは root しか
+#    読み書きできないため、コンテナ内 fio 経由でしか --user 実行できない。下記「注意点」参照）
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v <volume>:/data -v <out-dir>:/out \
+  <fio 入りイメージ> \
+  fio --name=fandhe-fio-randwrite-4k --directory=/data \
+      --filename=fandhe-fio-randwrite-4k.dat --rw=randwrite --bs=4k --ioengine=psync \
+      --direct=1 --size=256m --runtime=30 --iodepth=1 --numjobs=1 \
+      --end_fsync=1 --group_reporting --output-format=json --output=/out/fio.json
+
+# 3) fio JSON を results.json 形式へ変換（label は docker_bind_mount / docker_named_volume）
+bash scripts/fio-randwrite-4k.sh --from-json <out-dir>/fio.json --label docker_bind_mount
+
+# 4) 倍率の算出（BASELINE=Docker、CANDIDATE=fandhe 経路。共有マウント公開後）
+make fio-baseline-ratio BASELINE=<docker-results.json> CANDIDATE=<fandhe-results.json>
+```
+
+fio コマンドに渡す job options は「`--from-json` モード」節の許可リスト 13 項目に限る（`--output-format`・`--output` は fio のコマンドラインオプションであり job options には含まれない）。それ以外を付けると `fio-randwrite-4k.sh --from-json` が終了コード 2 で拒否する。
+
+fio 入りイメージは特定のサードパーティイメージへ固定せず、実施者が選ぶ（fio 3.x 以上で `*_ns` キーと `job options` を出力するものに限る。ライセンスは `.claude/rules/licensing.md`「非 Cargo 資産」に従い実施者が確認する）。
+
+REPAIR-5（相手の応答を待つ処理にはタイムアウトを設ける）に合わせ、`docker run` は `timeout -k 10 <runtime+60>` で包む。`timeout` が発火してコンテナが残った場合は `docker kill` で片付ける。
+
+記録する項目: 計測環境（OS・カーネル・ファイルシステム・デバイス種別。ホスト名は書かない。spec-reference.md）、fio の版、試行回数（5 試行の中央値を推奨）。
+
+### 注意点
+
+- コンテナの root で書き込むと、bind mount 側にホストから見て root 所有のファイルが残る（PoC linux-real-machine で実際に後片付けが必要になった）。`--user "$(id -u):$(id -g)"` を指定するか、コンテナ内で明示的に後片付けする
+- named volume の実体（`/var/lib/docker/volumes/...`）はホスト側では root しか読み書きできない。`--user` で書けるようにするには、volume 内の所有権を事前に調整するか、root で実行してから `docker volume rm` で作り直す
+- 実 fio の JSON を初めて照合するのがこの計測になる（`--from-json` の実行条件照合は fio 本体のソースコードから導いたもので、実 fio 出力での確認は本 runbook が最初）。`unexpected fio options` や `jobs[0]["job options"] is missing` 等で拒否されたら回避せず、fio の版と出力 JSON を添えて #114（TASK-25.h1）に報告する
+- tmpfs・FUSE 環境で `--direct=1` が失敗する場合は `--direct=0` の行を別に取る。`fio-baseline-ratio.sh` は params が完全一致した組み合わせしか比較しないため、`direct` の値ごとに baseline/candidate を揃えて比較する
+
+## 実測レポート（IO-8）
+
+**未計測。** fandhe 経路は I/O 共有プロトコル経由の共有マウントが未公開（上記「現状の制約」）、Docker ベースラインは実機実測が人間担当（`.claude/rules/ci.md`「実機前提テスト」）のため、Claude Code の実装（本 TASK-25.2）では数値を計測していない（REPAIR-3: 実装済みを装わない）。以下は上記「Docker ベースラインの計測手順」を実施した後に埋める表の枠と、算出手段（`make fio-baseline-ratio` / `scripts/fio-baseline-ratio.sh`）である。
+
+| label | target_kind | IOPS | lat_mean (us) | p50 (us) | p95 (us) | p99 (us) |
+| ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| `docker_bind_mount` | run | 未計測 | 未計測 | 未計測 | 未計測 | 未計測 |
+| `docker_named_volume` | run | 未計測 | 未計測 | 未計測 | 未計測 | 未計測 |
+| `fandhe_shared_mount` | run | 未計測（共有マウント公開待ち） | 未計測 | 未計測 | 未計測 | 未計測 |
+
+IOPS 倍率（candidate ÷ baseline。`make fio-baseline-ratio` の `ratios.iops.value`）: **未計測（fandhe 経路の公開と実機実測を待つ）**。
+
+### 参考値（条件が違うため比較できない）
+
+PoC（Linux 実機。PoC linux-real-machine）で得られた fio 値を参考として記録するが、計測条件（`--direct=0`・`--size=64m`・`--runtime=15`・`--name=randwrite`）が本スクリプトの契約（`direct=1`・`size=256m`・`runtime=30`・`end_fsync=1`・`ioengine=psync`）と異なるため、上記の倍率の分母には使わない。
+
+| label | IOPS（参考） | 出典 |
+| ---- | ---- | ---- |
+| bind mount | 約 376,000 | PoC linux-real-machine |
+| named volume | 約 319,000 | PoC linux-real-machine |
+
+## 目標値案（IO-8。最終判断は #114・TASK-25.h1）
+
+以下はすべて **案**であり、確定した目標値ではない。最終判断は人間担当の TASK-25.h1（#114）で行う。
+
+根拠 1（IO-6 の判定構造）: IO-6 は「Docker ベースライン比で IOPS 1.5 倍以上、または壁時計時間 20% 以上の短縮」という判定構造を採る。
+
+根拠 2（PoC linux-real-machine の知見）: Linux では計測されたマウント方式間の差が 8% 以内で、Docker bind mount はほぼネイティブファイルシステム相当だった。IO-6 で観測された改善の実体は起動時間であり、FS 操作だけで比べると約 0.77 倍（劣化）だった。
+
+これらから、**Linux で UDS を介する I/O 共有経路に「Docker ベースライン比で IOPS 1.5 倍」を求めるのは物理的に達成の見込みが薄い**と整理する。UDS を挟む経路がネイティブ FS 直叩きの Docker bind mount を上回るには、ネイティブ FS 自体にない最適化（バッチ write-back 等。IO-1・IO-2）が必要になるためである。
+
+- **案 A（Linux）**: Docker bind mount 比の劣化許容幅で定める。例として IO-6 の 20% を対称に当てた「Docker bind mount 比 0.8 倍以上」を候補に挙げる（根拠は類推であり、実測後に見直す）。`direct=1`・`direct=0` の行ごとに判定する
+- **案 B（macOS・Windows の VM 越境経路）**: IO-6 型の倍率（Docker Desktop 比で IOPS 1.5 倍以上）を候補とする。VM 越境オーバーヘッドの是正が主目的のため、Linux とは別の目標値を持つ。計測は platform 系 TASK（`crates/platform-macos/`・`crates/platform-windows/`）を待つ
+
+判定には `scripts/fio-baseline-ratio.sh` の `ratios.iops.value`（candidate ÷ baseline）を使う。上記の出典（IO-6・PoC linux-real-machine）以外から数値を創作しない。
 
 ## 実機での確認（人間担当・TASK-25.2 との切り分け）
 

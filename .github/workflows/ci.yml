@@ -393,6 +393,8 @@ jobs:
           toolchain: stable
       - name: fio 4K ランダム write ベンチスクリプトの自己テスト（TASK-25.1・IO-8。実 fio は使わない）
         run: make fio-bench-selftest
+      - name: fio ベースライン比算出スクリプトの自己テスト（TASK-25.2・IO-8。実 fio は使わない）
+        run: make fio-baseline-ratio-selftest
       - name: ベンチ回帰比較スクリプトの自己テスト（受け入れ基準 2 の記録。REPAIR-12）
         run: make bench-check-selftest
       - name: ベンチ比較の配線確認（プレースホルダ・性能回帰は未検出）

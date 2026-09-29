@@ -306,8 +306,9 @@ ACK をバッチ書き込みの後に返すため、クライアントが `batch
 - `persist` が失敗・タイムアウト・未対応のときは FlushAck を送らず、そのエラーで終了する（fail-closed）。プロトコルにエラーフレームはなく、クライアントは EOF を `Unavailable` として観測する。既定の `BatchSink::persist` は `Unimplemented`
 - `syncfs` は中断できないため、dup した fd を小さなスタックの helper スレッドで 1 回だけ実行し、`AppendFileSink::with_flush_timeout`（既定 10 秒。REPAIR-5）で待つ。タイムアウトした helper は detach され、戻るまでプロセス全体で 64 本までの枠を占有する（超えたら `ResourceExhausted`）
 - 失敗・タイムアウトした `AppendFileSink` はポイズンされ、以後の `persist` は syscall なしで `Internal` を返す（errseq は 1 回しか報告されないため、再試行が 0 を返して永続化を偽装しうる）
+- Linux 5.8 未満、またはカーネル版数を判定できない場合、`persist` は `Unimplemented` で拒否する（`syncfs` が書き戻しエラーを報告するのは 5.8 以降のため、FlushAck の偽装を避ける。IO-2。実装は `crates/io/src/barrier.rs` の `ensure_syncfs_reports_errors`）
 - macOS / Windows は代替フラッシュ未実装で `Unimplemented`（TASK-15.3・#88）
-- 未対応の範囲（REPAIR-3）: 並行 FLUSH の合流・レート制限（同期範囲はファイルシステム全体）、Linux 5.8 未満の検出、fd を開く前の書き戻しエラー、電源断耐性の検証（TASK-18）
+- 未対応の範囲（REPAIR-3）: 並行 FLUSH の合流・レート制限（同期範囲はファイルシステム全体）、fd を開く前の書き戻しエラー、電源断耐性の検証（TASK-18）
 
 ### ACK していない保留分・sink 失敗時の扱い
 

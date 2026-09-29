@@ -69,7 +69,8 @@
 //!   `guest_files` で実装済み。ワイヤー上の作成要求は未実装）
 //! - パス長 260 超の検出: 検証関数は TASK-20.1（#102）で実装済み
 //!   （[`check_host_path_length`]）。書き込み経路への組み込みは後続（REPAIR-3）。
-//!   WIN-4 の per-directory case-sensitive フラグとの関係の doc は TASK-20.2（#797）
+//!   WIN-4 の per-directory case-sensitive フラグとの関係は記載済み
+//!   （[`check_host_path_length`] の doc の `# WIN-4 との関係` 節。TASK-20.2・#797）
 //! - NFC / NFD の Unicode 正規化方針 → #103（TASK-21.h1）で決定後に TASK-21
 //! - APFS / NTFS の実際の case folding 表との厳密な一致・非 UTF-8 ファイル名の
 //!   扱い → TASK-21 以降
@@ -94,6 +95,10 @@
 //! 「260 は許容・261 以上は超過」で、終端 NUL を含む Win32 の実効 259 は
 //! 参考にとどめ再解釈しない。本関数は長さ検証のみで、rootfs への閉じ込めの防御
 //! ではない（それは `guest_files` の責務）。
+//!
+//! WIN-4 の `system.wsl_case_sensitive`（per-directory case-sensitive フラグ）は
+//! 大文字小文字の区別だけを変え、`MAX_PATH` を緩めない。詳細と、シンボリックリンク
+//! 作成時の Developer Mode 前提は [`check_host_path_length`] を参照（TASK-20.2・#797）。
 //!
 //! 未実装（REPAIR-3）: 書き込み経路（`GuestFileCreator` 等）への組み込み、
 //! `\\?\` 長パス・`LongPathsEnabled` 対応、コンポーネント単位の 255 制限。
@@ -159,6 +164,8 @@ fn utf16_units(path: &Path) -> usize {
 }
 
 /// ホストパスの長さを計測する（失敗しない。呼び出し側は警告として扱える。IO-5）。
+///
+/// WIN-4 との関係・Developer Mode の前提は [`check_host_path_length`] を参照。
 pub fn measure_host_path_length(path: &Path) -> HostPathLength {
     HostPathLength {
         units: utf16_units(path),
@@ -169,6 +176,26 @@ pub fn measure_host_path_length(path: &Path) -> HostPathLength {
 ///
 /// 超過時は `IoErrorCode::InvalidArgument`（メッセージに計測値と上限を含み、
 /// パスは [`quote_for_message`] で衛生化・切り詰めて埋め込む）。
+///
+/// # WIN-4 との関係（TASK-20.2・#797）
+/// - `system.wsl_case_sensitive`（WIN-4。NTFS のディレクトリ単位の case-sensitive
+///   フラグ）が変えるのは大文字小文字の区別だけで、`MAX_PATH`（260）を緩めない。
+///   本関数はフラグの有無にかかわらず同じ閾値（[`MAX_HOST_PATH_CHARS`]）で検証する。
+///   WIN-4 の「パス長は 260 文字以内を推奨」は、260 は許容・261 以上は超過とする
+///   本関数の閾値に対応する。
+/// - io crate（本関数・本モジュール）はフラグの設定・読み取り・検証をしない。フラグの
+///   運用はセットアップ手順の担当で、TASK-68（`docs/setup/windows.md`・WIN-4）で
+///   文書化する予定であり、現時点では未実装（REPAIR-3）。
+/// - [`CaseCollisionSet`] もフラグを観測しないため、フラグを設定したディレクトリでは
+///   衝突検出は過検出側に倒れる（モジュール doc の「見逃しより過検出」の方針どおり）。
+///
+/// # 前提条件: シンボリックリンク（WIN-4）
+/// Windows ホストでシンボリックリンクを作成するには、Developer Mode の有効化
+/// （またはシンボリックリンク作成特権）が前提になる。本関数はシンボリックリンクを
+/// 作成せず、Developer Mode の有効状態も検査しない（前提条件の記載のみ）。また計測
+/// するのは渡されたパス自身の長さで、リンク先（target）パスの長さは計測しない。
+/// リンク先の長さの検証は書き込み経路への組み込み時の課題（REPAIR-3）であり、
+/// rootfs 外への脱出防止は本関数ではなく `guest_files` の責務である。
 pub fn check_host_path_length(path: &Path) -> Result<HostPathLength, IoError> {
     let length = measure_host_path_length(path);
     if length.exceeds_limit() {

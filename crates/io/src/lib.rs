@@ -34,7 +34,7 @@
 //! 呼ばれ、成功したときだけ FlushAck を返す（IO-2・TASK-15.2.2・#824。
 //! 失敗・タイムアウト・Linux 5.8 未満・その他の OS は FlushAck なしで終了。対応可否は
 //! [`barrier::persist_support`] で判定する。macOS / Windows は TASK-15.3・#88 で
-//! `File::sync_all` によるファイル単位の代替フラッシュを持ち、ファイルを開いた・作った
+//! `fcntl(F_FULLFSYNC)` / `FlushFileBuffers` の明示発行によるファイル単位の代替フラッシュを持ち、ファイルを開いた・作った
 //! ディレクトリのハンドルも同期する〔[`writeback::AppendFileSink::open_in`]・
 //! [`GuestFileCreator`]〕）。受信フレームの長さ・件数を
 //! 本体バッファ確保前に上限検証する受理判定ゲート

@@ -36,7 +36,8 @@
 //! # 未実装範囲（REPAIR-3）
 //!
 //! - macOS / Windows の代替フラッシュ（TASK-15.3・#88）は sink が持つファイル自体
-//!   （データ＋ファイルメタデータ）を `File::sync_all` で永続化したうえで、sink が
+//!   （データ＋ファイルメタデータ）を明示的な syscall（macOS は `fcntl(F_FULLFSYNC)`、
+//!   Windows は `FlushFileBuffers`）で永続化したうえで、sink が
 //!   ファイルを開いた・作ったときのディレクトリハンドル
 //!   （[`crate::writeback::AppendFileSink::open_in`]・[`crate::GuestFileCreator::create_file`]
 //!   だけが設定する。任意のパスは受け付けない）も同期し、ファイルのディレクトリ
@@ -591,7 +592,7 @@ pub enum PersistSupport {
     KernelTooOld,
     /// Linux・macOS・Windows 以外の OS。代替フラッシュが未実装。
     UnsupportedOs,
-    /// macOS / Windows（TASK-15.3・#88）。sink が持つファイルを `File::sync_all`
+    /// macOS / Windows（TASK-15.3・#88）。sink が持つファイルを明示的な syscall
     /// （macOS は `F_FULLFSYNC`、Windows は `FlushFileBuffers`）で永続化して
     /// から FlushAck を返す。
     ///
@@ -651,7 +652,8 @@ pub fn persist_support() -> PersistSupport {
 /// （[`persist_support`]）を渡して呼ばれる。[`PersistSupport::Supported`]（Linux）なら
 /// `file` を dup した fd に対し `crate::sys::syncfs` を helper スレッドで 1 回
 /// だけ実行する。[`PersistSupport::SupportedFileSync`]（macOS / Windows）なら
-/// dup したハンドルに `File::sync_all` を同じく helper スレッドで 1 回だけ実行する。
+/// dup したハンドルに `F_FULLFSYNC` / `FlushFileBuffers` を同じく helper スレッドで
+/// 1 回だけ実行する。
 /// 判定と実行 OS が食い違う値（Linux 上の `SupportedFileSync` 等）が注入された
 /// 場合も syscall を発行せず拒否する。失敗しても再試行しない（errseq は 1 回しか報告しないため。
 /// 呼び出し側の sink がポイズンする）。それ以外は syscall を発行せず
@@ -792,14 +794,14 @@ fn sync_file_system(
     })
 }
 
-/// ディレクトリのハンドルを `sync_all` し、そのエントリ（新規作成ファイルの
-/// 名前等）を永続化する（TASK-15.3・#88）。macOS は `F_FULLFSYNC`、Windows は
-/// `FlushFileBuffers`（書き込みアクセスが必要。sink へハンドルを渡す
-/// `AppendFileSink::open_in`・`GuestFileCreator` が書き込み可能なハンドルで開く）。
-/// エラーには `ErrorKind` のみを含め、パスは含めない。
+/// ディレクトリのハンドルを同期し、そのエントリ（新規作成ファイルの名前等）を
+/// 永続化する（TASK-15.3・#88。[`sync_handle`]）。Windows の `FlushFileBuffers` は
+/// 書き込みアクセスが必要なため、sink へハンドルを渡す `AppendFileSink::open_in`・
+/// `GuestFileCreator` は書き込み可能なハンドルで開く。エラーには `ErrorKind` のみを
+/// 含め、パスは含めない。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn sync_dir(handle: &File) -> Result<(), IoError> {
-    handle.sync_all().map_err(|err| {
+    sync_handle(handle).map_err(|err| {
         IoError::new(
             IoErrorCode::Internal,
             format!("directory sync failed ({:?})", err.kind()),
@@ -807,17 +809,30 @@ fn sync_dir(handle: &File) -> Result<(), IoError> {
     })
 }
 
-/// `File::sync_all`（std の安全 API）でファイルのデータとメタデータを永続化する。
-/// std は Apple では `fcntl(F_FULLFSYNC)`、Windows では `FlushFileBuffers` を使う。
+/// ファイルのデータとメタデータを永続化する（TASK-15.3・#88。[`sync_handle`]）。
 /// エラーには `ErrorKind` のみを含め、パスや内容は含めない。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn sync_file(file: &File) -> Result<(), IoError> {
-    file.sync_all().map_err(|err| {
+    sync_handle(file).map_err(|err| {
         IoError::new(
             IoErrorCode::Internal,
             format!("file sync failed ({:?})", err.kind()),
         )
     })
+}
+
+/// OS ごとの永続化の syscall を明示的に発行する（std の `File::sync_all` の実装に
+/// 依存しない。Codex #1146 P0）。macOS は `fcntl(F_FULLFSYNC)`（[`crate::sys::full_fsync`]。
+/// 非対応の FS では `fsync` へフォールバックせず失敗する）、Windows は
+/// `FlushFileBuffers`（`crate::sys_windows::flush_file_buffers`）。
+#[cfg(target_os = "macos")]
+fn sync_handle(handle: &File) -> std::io::Result<()> {
+    crate::sys::full_fsync(handle)
+}
+
+#[cfg(target_os = "windows")]
+fn sync_handle(handle: &File) -> std::io::Result<()> {
+    crate::sys_windows::flush_file_buffers(handle)
 }
 
 /// `syncfs(2)` が書き戻し失敗を報告するカーネルの最小版数（major, minor）。

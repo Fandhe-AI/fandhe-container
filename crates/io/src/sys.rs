@@ -27,6 +27,9 @@
 //!   `crate::writeback::AppendFileSink::persist` →
 //!   `crate::barrier::persist_file_system`（dup した fd・helper スレッド・
 //!   タイムアウト付き）→ 本関数、の順で呼ぶ（TASK-15.2.2・#824）。
+//! - macOS 専用: `fcntl(2)` の `F_FULLFSYNC` でファイル・ディレクトリをドライブの
+//!   キャッシュまで永続化する（[`full_fsync`]。IO-2・IO-3・TASK-15.3・#88。
+//!   `crate::barrier` の macOS の代替フラッシュが helper スレッドから呼ぶ）。
 //! - Linux（x86_64 / aarch64）・macOS: `openat(2)`・`mkdirat(2)`・`unlinkat(2)`・
 //!   `renameat(2)`・`linkat(2)`・`fdopendir(3)`/`readdir(3)` でディレクトリハンドル
 //!   相対にファイル・ディレクトリを作る・開く・消す・改名する・リンクする・列挙する（TASK-19.2・IO-5・#100。
@@ -48,7 +51,7 @@
 //!
 //! # 契約（事前承認の条件を満たす設計）
 //! - `unsafe fn` はこのモジュールの外へ公開しない。公開するのは安全な関数
-//!   （[`peer_uid`]・[`effective_uid`]・[`syncfs`]・[`mkdir_beneath`]・
+//!   （[`peer_uid`]・[`effective_uid`]・[`syncfs`]・[`full_fsync`]・[`mkdir_beneath`]・
 //!   [`open_dir_beneath`]・[`create_leaf_beneath`]・[`open_leaf_beneath`]・
 //!   [`open_dir_path`]・[`unlink_beneath`]・
 //!   [`rename_beneath`]・[`link_beneath`]・[`for_each_dir_entry`]・
@@ -353,6 +356,62 @@ pub(crate) fn syncfs(fd: impl AsFd) -> Result<(), IoError> {
     syncfs_rc_to_result(rc)
 }
 
+/// macOS の `fcntl(2)` と定数（`<sys/fcntl.h>`・`<sys/errno.h>`。x86_64 / arm64 共通）。
+#[cfg(target_os = "macos")]
+mod full_fsync_raw {
+    pub(super) const F_FULLFSYNC: i32 = 51;
+    pub(super) const EINTR: i32 = 4;
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: macOS libSystem の
+        // `int fcntl(int fildes, int cmd, ...)`（可変長引数。`F_FULLFSYNC` は第 3 引数を
+        // 読まない）と同じ型・幅。
+        pub(super) fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+}
+
+/// `EINTR` による再発行の上限（シグナルが続いても無期限に回らない。helper スレッドの
+/// 外側のタイムアウト〔REPAIR-5〕とは別の歯止め）。
+#[cfg(target_os = "macos")]
+const MAX_FULL_FSYNC_EINTR_RETRIES: u32 = 64;
+
+/// macOS: `fcntl(fd, F_FULLFSYNC)` を明示的に発行し、ファイル（またはディレクトリ）の
+/// データ・メタデータをドライブのキャッシュまで書き出す（IO-2・IO-3・TASK-15.3・#88。
+/// Codex #1146 P0: std の `File::sync_all` は `F_FULLFSYNC` を使うことを API として
+/// 保証しないため、実装に依存せず明示する）。
+///
+/// `crate::barrier` の macOS の永続化経路（helper スレッド・タイムアウト付き）から
+/// 呼ばれる。`F_FULLFSYNC` を拒否する FS（一部のネットワーク FS 等）では失敗を返し、
+/// `fsync(2)` へフォールバックしない（`fsync` はドライブのキャッシュを書き出さず、
+/// FlushAck の保証を満たさないため。呼び出し側は FlushAck を返さない）。`EINTR` は
+/// 書き出しが完了していないだけなので上限付きで再発行する。戻り値が `0`・`-1` 以外は
+/// 成功扱いにせず失敗とする（fail-closed）。
+#[cfg(target_os = "macos")]
+pub(crate) fn full_fsync(file: &std::fs::File) -> io::Result<()> {
+    for _ in 0..MAX_FULL_FSYNC_EINTR_RETRIES {
+        // SAFETY: `file` は呼び出しの間借用され続けるため fd は有効で閉じられない。
+        // `F_FULLFSYNC` はポインタ引数を取らず（可変長引数は渡さない・読まれない）、
+        // メモリへ書き込まない。戻り値 `-1` の errno は直後に拾う。
+        let rc = unsafe { full_fsync_raw::fcntl(file.as_raw_fd(), full_fsync_raw::F_FULLFSYNC) };
+        match rc {
+            0 => return Ok(()),
+            -1 => {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(full_fsync_raw::EINTR) {
+                    continue;
+                }
+                return Err(err);
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "fcntl(F_FULLFSYNC) returned an unexpected value",
+                ));
+            }
+        }
+    }
+    Err(io::Error::from(io::ErrorKind::Interrupted))
+}
+
 // ---------------------------------------------------------------------------
 // ハンドル相対のファイル操作（TASK-19.2・IO-5・#100。`crate::guest_files` 専用）
 // ---------------------------------------------------------------------------
@@ -474,7 +533,6 @@ mod beneath_consts {
     pub(super) const O_WRONLY: i32 = 0o1;
     pub(super) const O_CREAT: i32 = 0o100;
     pub(super) const O_EXCL: i32 = 0o200;
-    pub(super) const O_TRUNC: i32 = 0o1_000;
     pub(super) const O_APPEND: i32 = 0o2_000;
     pub(super) const O_NONBLOCK: i32 = 0o4_000;
     pub(super) const O_DIRECTORY: i32 = 0o200_000;
@@ -501,7 +559,6 @@ mod beneath_consts {
     pub(super) const O_WRONLY: i32 = 0o1;
     pub(super) const O_CREAT: i32 = 0o100;
     pub(super) const O_EXCL: i32 = 0o200;
-    pub(super) const O_TRUNC: i32 = 0o1_000;
     pub(super) const O_APPEND: i32 = 0o2_000;
     pub(super) const O_NONBLOCK: i32 = 0o4_000;
     // arch/arm64/include/uapi/asm/fcntl.h（asm-generic と異なる。流用しない）。
@@ -530,7 +587,6 @@ mod beneath_consts {
     pub(super) const O_WRONLY: i32 = 0x1;
     pub(super) const O_CREAT: i32 = 0x200;
     pub(super) const O_EXCL: i32 = 0x800;
-    pub(super) const O_TRUNC: i32 = 0x400;
     pub(super) const O_APPEND: i32 = 0x8;
     pub(super) const O_NONBLOCK: i32 = 0x4;
     pub(super) const O_DIRECTORY: i32 = 0x0010_0000;
@@ -747,8 +803,9 @@ mod beneath {
 
     /// `dir` 直下の通常ファイル `name` を、ハンドル相対・symlink 非追従で書き込み用に
     /// 開く（`openat` + `O_WRONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK` に `mode` ごとの
-    /// `O_CREAT|O_EXCL`・`O_CREAT|O_TRUNC`・`O_CREAT|O_APPEND` を足す。mode 0o666。
-    /// umask 適用前）。
+    /// `O_CREAT|O_EXCL`・`O_CREAT`・`O_CREAT|O_APPEND` を足す。mode 0o666。
+    /// umask 適用前）。切り詰めは行わない（呼び出し側が通常ファイルであることを
+    /// 確かめてから `set_len` で行う）。
     ///
     /// `crate::writeback::AppendFileSink::open_in`（IO-2・IO-3・TASK-15.3・#88）が、
     /// 開いたファイルが `dir` のエントリであることを構造で保証するために使う
@@ -761,15 +818,15 @@ mod beneath {
     pub(crate) fn open_leaf_beneath(
         dir: &File,
         name: &str,
-        mode: crate::writeback::SinkOpenMode,
+        mode: crate::writeback::LeafOpen,
     ) -> Result<File, BeneathError> {
-        use crate::writeback::SinkOpenMode;
+        use crate::writeback::LeafOpen;
         let cname = cstr(name)?;
         let extra = match mode {
-            SinkOpenMode::CreateNew => c::O_CREAT | c::O_EXCL,
-            SinkOpenMode::CreateOrTruncate => c::O_CREAT | c::O_TRUNC,
-            SinkOpenMode::Existing => 0,
-            SinkOpenMode::CreateOrAppend => c::O_CREAT | c::O_APPEND,
+            LeafOpen::CreateNew => c::O_CREAT | c::O_EXCL,
+            LeafOpen::CreateOrOpen => c::O_CREAT,
+            LeafOpen::Existing => 0,
+            LeafOpen::CreateOrAppend => c::O_CREAT | c::O_APPEND,
         };
         let perm: u32 = 0o666;
         // SAFETY: `dir` は呼び出し元が借用中の有効なディレクトリ fd で、呼び出しの
@@ -1041,7 +1098,7 @@ mod beneath {
     pub(crate) fn open_leaf_beneath(
         _dir: &File,
         _name: &str,
-        _mode: crate::writeback::SinkOpenMode,
+        _mode: crate::writeback::LeafOpen,
     ) -> Result<File, BeneathError> {
         Err(BeneathError::Io(io::ErrorKind::Unsupported))
     }
@@ -1202,6 +1259,32 @@ mod tests {
         );
     }
 
+    /// IO-2・TASK-15.3: macOS の `F_FULLFSYNC`（51）・`EINTR`（4）の固定値
+    /// （`<sys/fcntl.h>`・`<sys/errno.h>`。x86_64 / arm64 共通）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn io2_full_fsync_consts_macos() {
+        assert_eq!(full_fsync_raw::F_FULLFSYNC, 51);
+        assert_eq!(full_fsync_raw::EINTR, 4);
+    }
+
+    /// IO-2・TASK-15.3: `full_fsync` は書き込み用のファイルと、読み取り用に開いた
+    /// ディレクトリ（親ディレクトリの同期で使う形）の両方で成功する（CI の APFS）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn io2_full_fsync_on_file_and_dir_succeeds() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fcio-full-fsync-{}", std::process::id()));
+        let mut file = std::fs::File::create(&path).expect("create");
+        file.write_all(b"x").expect("write");
+        let result = full_fsync(&file);
+        let _ = std::fs::remove_file(&path);
+        result.expect("F_FULLFSYNC on a regular file must succeed");
+        let dir_handle = std::fs::File::open(&dir).expect("open dir");
+        full_fsync(&dir_handle).expect("F_FULLFSYNC on a directory must succeed");
+    }
+
     /// IO-5・TASK-19.2（Codex P0 指摘の照合）: Linux x86_64 の `open(2)` 等の
     /// 定数は asm-generic の値（`include/uapi/asm-generic/fcntl.h`）。
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1211,7 +1294,6 @@ mod tests {
         assert_eq!(c::O_WRONLY, 0o1);
         assert_eq!(c::O_CREAT, 0o100);
         assert_eq!(c::O_EXCL, 0o200);
-        assert_eq!(c::O_TRUNC, 0o1_000);
         assert_eq!(c::O_APPEND, 0o2_000);
         assert_eq!(c::O_NONBLOCK, 0o4_000);
         assert_eq!(c::O_DIRECTORY, 0o200_000);
@@ -1240,7 +1322,6 @@ mod tests {
         assert_eq!(c::O_WRONLY, 0o1);
         assert_eq!(c::O_CREAT, 0o100);
         assert_eq!(c::O_EXCL, 0o200);
-        assert_eq!(c::O_TRUNC, 0o1_000);
         assert_eq!(c::O_APPEND, 0o2_000);
         assert_eq!(c::O_NONBLOCK, 0o4_000);
         assert_eq!(c::O_DIRECTORY, 0o40_000);
@@ -1268,7 +1349,6 @@ mod tests {
         assert_eq!(c::O_WRONLY, 0x1);
         assert_eq!(c::O_CREAT, 0x200);
         assert_eq!(c::O_EXCL, 0x800);
-        assert_eq!(c::O_TRUNC, 0x400);
         assert_eq!(c::O_APPEND, 0x8);
         assert_eq!(c::O_NONBLOCK, 0x4);
         assert_eq!(c::O_DIRECTORY, 0x0010_0000);
@@ -1327,43 +1407,45 @@ mod tests {
         /// 作らない・書き換えない）。
         #[test]
         fn io2_open_leaf_beneath_modes_and_symlink() {
-            use crate::writeback::SinkOpenMode;
+            use crate::writeback::LeafOpen;
             use std::io::Write as _;
             let t = TmpDir::new("leaf");
             let outside = TmpDir::new("leaf-out");
             let root = t.open();
 
-            let mut f = open_leaf_beneath(&root, "a", SinkOpenMode::CreateNew).expect("create");
+            let mut f = open_leaf_beneath(&root, "a", LeafOpen::CreateNew).expect("create");
             f.write_all(b"abc").expect("write");
             drop(f);
             assert_eq!(std::fs::read(t.0.join("a")).expect("a"), b"abc");
             assert_eq!(
-                open_leaf_beneath(&root, "a", SinkOpenMode::CreateNew).err(),
+                open_leaf_beneath(&root, "a", LeafOpen::CreateNew).err(),
                 Some(BeneathError::AlreadyExists)
             );
 
-            let mut f =
-                open_leaf_beneath(&root, "a", SinkOpenMode::CreateOrAppend).expect("append");
+            let mut f = open_leaf_beneath(&root, "a", LeafOpen::CreateOrAppend).expect("append");
             f.write_all(b"de").expect("write");
             drop(f);
             assert_eq!(std::fs::read(t.0.join("a")).expect("a"), b"abcde");
 
-            let f = open_leaf_beneath(&root, "a", SinkOpenMode::CreateOrTruncate).expect("trunc");
+            let f = open_leaf_beneath(&root, "a", LeafOpen::CreateOrOpen).expect("open");
             drop(f);
-            assert_eq!(std::fs::read(t.0.join("a")).expect("a"), b"");
+            assert_eq!(std::fs::read(t.0.join("a")).expect("a"), b"abcde");
+            let f = open_leaf_beneath(&root, "b", LeafOpen::CreateOrOpen).expect("create b");
+            drop(f);
+            assert_eq!(std::fs::read(t.0.join("b")).expect("b"), b"");
 
-            assert!(open_leaf_beneath(&root, "a", SinkOpenMode::Existing).is_ok());
+            assert!(open_leaf_beneath(&root, "a", LeafOpen::Existing).is_ok());
             assert_eq!(
-                open_leaf_beneath(&root, "missing", SinkOpenMode::Existing).err(),
+                open_leaf_beneath(&root, "missing", LeafOpen::Existing).err(),
                 Some(BeneathError::Io(io::ErrorKind::NotFound))
             );
             assert!(!t.0.join("missing").exists());
 
             std::os::unix::fs::symlink(outside.0.join("victim"), t.0.join("l")).expect("symlink");
             for mode in [
-                SinkOpenMode::CreateOrTruncate,
-                SinkOpenMode::Existing,
-                SinkOpenMode::CreateOrAppend,
+                LeafOpen::CreateOrOpen,
+                LeafOpen::Existing,
+                LeafOpen::CreateOrAppend,
             ] {
                 assert!(
                     matches!(
@@ -1374,7 +1456,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                open_leaf_beneath(&root, "l", SinkOpenMode::CreateNew).err(),
+                open_leaf_beneath(&root, "l", LeafOpen::CreateNew).err(),
                 Some(BeneathError::AlreadyExists)
             );
             assert!(!outside.0.join("victim").exists());
@@ -1385,13 +1467,13 @@ mod tests {
         /// ディレクトリ以外を開かない。
         #[test]
         fn io2_open_leaf_beneath_does_not_block_on_special_files() {
-            use crate::writeback::SinkOpenMode;
+            use crate::writeback::LeafOpen;
             let t = TmpDir::new("leaf-special");
             let _listener =
                 std::os::unix::net::UnixListener::bind(t.0.join("sock")).expect("bind socket");
             std::fs::write(t.0.join("file"), b"x").expect("file");
             let root = open_dir_path(&t.0).expect("open dir");
-            assert!(open_leaf_beneath(&root, "sock", SinkOpenMode::Existing).is_err());
+            assert!(open_leaf_beneath(&root, "sock", LeafOpen::Existing).is_err());
             assert!(matches!(
                 open_dir_path(&t.0.join("file")),
                 Err(BeneathError::Io(_))

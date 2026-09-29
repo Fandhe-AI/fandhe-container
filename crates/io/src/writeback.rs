@@ -211,7 +211,8 @@ impl SinkPersistReport {
 /// # 永続化（IO-2・TASK-15.2.2）
 /// [`BatchSink::persist`] は [`crate::barrier::persist_support`] が対応と判定した
 /// 環境で永続化する（Linux 5.8 以上は `syncfs(2)`、macOS / Windows は TASK-15.3・#88 の
-/// `File::sync_all` に加え、[`AppendFileSink::open_in`] / [`crate::GuestFileCreator`] が
+/// ファイルへの `fcntl(F_FULLFSYNC)` / `FlushFileBuffers` に加え、[`AppendFileSink::open_in`] /
+/// [`crate::GuestFileCreator`] が
 /// ファイルを開いた・作ったディレクトリハンドルの同期。[`AppendFileSink::new`] で作った
 /// 親ディレクトリのない sink はエントリを保証できず `Unimplemented`。他は
 /// `Unimplemented`）。syncfs を発行した後に失敗・タイムアウトした
@@ -321,7 +322,8 @@ impl AppendFileSink {
     /// ディレクトリ `dir` 直下のファイル `name` を `mode` で開き、そのディレクトリの
     /// ハンドルを親として持つ sink を作る（IO-2・IO-3・TASK-15.3・#88）。
     ///
-    /// macOS / Windows の `persist` は、ファイル自体の `sync_all` に加えて、ここで開いた
+    /// macOS / Windows の `persist` は、ファイル自体の同期（`F_FULLFSYNC` / `FlushFileBuffers`）
+    /// に加えて、ここで開いた
     /// ディレクトリハンドルを初回成功時に同期し、ファイルのディレクトリエントリ
     /// （新規作成・再オープンのどちらでも）を永続化する。親の同一性は検証ではなく構造で
     /// 保証する: 先に `dir` を開き、ファイルはそのハンドル相対で開く（Linux / macOS は
@@ -341,7 +343,13 @@ impl AppendFileSink {
     /// `syncfs` が FS 全体を同期するため、保持したディレクトリハンドルは使わない。
     pub fn open_in(dir: &Path, name: &str, mode: SinkOpenMode) -> Result<Self, IoError> {
         validate_sink_file_name(name)?;
-        let (dir_handle, file) = open_leaf_in_dir(dir, name, mode)?;
+        let (leaf, truncate) = match mode {
+            SinkOpenMode::CreateNew => (LeafOpen::CreateNew, false),
+            SinkOpenMode::CreateOrTruncate => (LeafOpen::CreateOrOpen, true),
+            SinkOpenMode::Existing => (LeafOpen::Existing, false),
+            SinkOpenMode::CreateOrAppend => (LeafOpen::CreateOrAppend, false),
+        };
+        let (dir_handle, file) = open_leaf_in_dir(dir, name, leaf)?;
         let meta = file.metadata().map_err(|err| {
             IoError::new(
                 IoErrorCode::Internal,
@@ -361,6 +369,16 @@ impl AppendFileSink {
                 IoErrorCode::InvalidArgument,
                 "sink target is not a regular file",
             ));
+        }
+        if truncate {
+            // 通常ファイルであることを確かめてから切り詰める（開く時点で切り詰めると、
+            // Windows で reparse point 自体を開いた場合に拒否の前に中身を変えうるため）。
+            file.set_len(0).map_err(|err| {
+                IoError::new(
+                    IoErrorCode::Internal,
+                    format!("failed to truncate sink file ({:?})", err.kind()),
+                )
+            })?;
         }
         Ok(Self::new(file)?.with_parent_dir_handles(vec![dir_handle]))
     }
@@ -548,6 +566,21 @@ pub enum SinkOpenMode {
     CreateOrAppend,
 }
 
+/// `crate::sys` / `crate::sys_windows` へ渡す開き方（[`SinkOpenMode`] から切り詰めを
+/// 除いたもの）。切り詰めは [`AppendFileSink::open_in`] が通常ファイルであることを
+/// 確かめた後に行う（Windows の reparse point など、種別の確認前に中身を変えないため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeafOpen {
+    /// 新規作成のみ（既存なら失敗）。
+    CreateNew,
+    /// 無ければ作成し、あれば切り詰めずに開く。
+    CreateOrOpen,
+    /// 既存のみ（切り詰めない）。
+    Existing,
+    /// 無ければ作成し、追記モードで開く。
+    CreateOrAppend,
+}
+
 /// [`AppendFileSink::open_in`] の `name` が単一の通常の名前か（`GuestFileCreator` の
 /// コンポーネント検証と同じ基準。3 OS で挙動を揃えるため `\`・`:` も拒否する）。
 fn validate_sink_file_name(name: &str) -> Result<(), IoError> {
@@ -572,7 +605,7 @@ fn validate_sink_file_name(name: &str) -> Result<(), IoError> {
 /// `openat` ラッパー、Windows は `crate::sys_windows` の `NtCreateFile` ラッパーを使う。
 /// Windows のディレクトリハンドルは `FlushFileBuffers` のため書き込みアクセスで開く。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn open_leaf_in_dir(dir: &Path, name: &str, mode: SinkOpenMode) -> Result<(File, File), IoError> {
+fn open_leaf_in_dir(dir: &Path, name: &str, mode: LeafOpen) -> Result<(File, File), IoError> {
     use crate::sys::BeneathError;
     let map = |context: &str, err: BeneathError| match err {
         BeneathError::AlreadyExists => {
@@ -594,7 +627,7 @@ fn open_leaf_in_dir(dir: &Path, name: &str, mode: SinkOpenMode) -> Result<(File,
 }
 
 #[cfg(target_os = "windows")]
-fn open_leaf_in_dir(dir: &Path, name: &str, mode: SinkOpenMode) -> Result<(File, File), IoError> {
+fn open_leaf_in_dir(dir: &Path, name: &str, mode: LeafOpen) -> Result<(File, File), IoError> {
     use std::os::windows::fs::OpenOptionsExt;
     // FILE_FLAG_BACKUP_SEMANTICS（ディレクトリを開くのに必須）。
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -638,11 +671,7 @@ fn open_leaf_in_dir(dir: &Path, name: &str, mode: SinkOpenMode) -> Result<(File,
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn open_leaf_in_dir(
-    _dir: &Path,
-    _name: &str,
-    _mode: SinkOpenMode,
-) -> Result<(File, File), IoError> {
+fn open_leaf_in_dir(_dir: &Path, _name: &str, _mode: LeafOpen) -> Result<(File, File), IoError> {
     Err(IoError::new(
         IoErrorCode::Unimplemented,
         "opening a sink file beneath a directory is not implemented on this OS",
@@ -1656,6 +1685,35 @@ mod tests {
         assert!(AppendFileSink::open_in(&t.0, "sub", SinkOpenMode::Existing).is_err());
         assert!(AppendFileSink::open_in(&t.0.join("file"), "x", SinkOpenMode::CreateNew).is_err());
         assert!(!t.0.join("file").join("x").exists());
+    }
+
+    /// IO-2・TASK-15.3: 末端が symlink なら、どの mode でも辿らずに失敗し、リンク先を
+    /// 作らない・切り詰めない（切り詰めは通常ファイルと確かめた後にだけ行う）。
+    #[cfg(unix)]
+    #[test]
+    fn io2_open_in_does_not_follow_or_truncate_symlink_leaf() {
+        let t = TempDirGuard::new("symlink");
+        let target = t.0.join("target");
+        std::fs::write(&target, b"keep").expect("target");
+        std::os::unix::fs::symlink(&target, t.0.join("l")).expect("symlink");
+        std::os::unix::fs::symlink(t.0.join("absent"), t.0.join("dangling")).expect("dangling");
+        for mode in [
+            SinkOpenMode::CreateNew,
+            SinkOpenMode::CreateOrTruncate,
+            SinkOpenMode::Existing,
+            SinkOpenMode::CreateOrAppend,
+        ] {
+            assert!(
+                AppendFileSink::open_in(&t.0, "l", mode).is_err(),
+                "{mode:?}"
+            );
+            assert!(
+                AppendFileSink::open_in(&t.0, "dangling", mode).is_err(),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&target).expect("target"), b"keep");
+        assert!(!t.0.join("absent").exists());
     }
 
     /// IO-2・IO-3・TASK-15.3（Codex #1146 P0）: `open_in` が登録するのはファイルを開いた

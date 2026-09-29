@@ -1132,6 +1132,127 @@ mod tests {
         );
     }
 
+    /// Codex P0: 既定経路は User を含まない構成を拒否する（root でも非 root でも）。
+    #[test]
+    fn default_plan_requires_user_namespace() {
+        let no_user = NamespaceSet::empty()
+            .with(Namespace::Pid)
+            .with(Namespace::Mount)
+            .with(Namespace::Uts)
+            .with(Namespace::Ipc);
+        for (u, g) in [(1000, 1000), (0, 0)] {
+            let err = plan_for(&cfg(no_user, None), u, g).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "({u},{g})");
+            assert_eq!(err.stage, IsolationStage::Validate);
+            assert_eq!(
+                err.message,
+                "the user namespace is required to map container root to an unprivileged host ID"
+            );
+        }
+    }
+
+    /// Codex P0: rootful 経路は euid が 0 でなければ拒否する。
+    #[test]
+    fn rootful_plan_requires_euid_zero() {
+        let rootful = NamespaceSet::empty()
+            .with(Namespace::Pid)
+            .with(Namespace::Mount);
+        for euid in [1, 1000, u32::MAX] {
+            let err = plan_rootful_for(&cfg(rootful, None), euid).unwrap_err();
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "euid {euid}");
+            assert_eq!(err.stage, IsolationStage::Validate);
+            assert_eq!(err.message, "the rootful host-root plan requires euid 0");
+        }
+    }
+
+    /// Codex P0: rootful 経路は User を含められない（euid 0 でも拒否）。
+    #[test]
+    fn rootful_plan_rejects_user_namespace() {
+        let err = plan_rootful_for(&cfg(NamespaceSet::all(), None), 0).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.stage, IsolationStage::Validate);
+        assert_eq!(
+            err.message,
+            "the rootful host-root plan must not include the user namespace"
+        );
+    }
+
+    /// 既定経路の isolate は、計画作成時と実行 ID が変わっていれば副作用なしで拒否する。
+    #[test]
+    fn isolate_rejects_plan_for_other_ids() {
+        let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
+        let other = |id: u32| if id == 4242 { 4243 } else { 4242 };
+        let p = plan_for(&cfg(NamespaceSet::all(), None), other(euid), other(egid)).unwrap();
+        let err = isolate(&p).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::Validate);
+        assert_eq!(
+            err.message,
+            "effective uid/gid changed after the plan was created"
+        );
+    }
+
+    const STATUS_PID1: &str = "Name:\tx\nNSpid:\t4321\t1\nThreads:\t1\n";
+
+    /// 再監査 P2-2・P2-3: establish の前提（PID 1・NSpid 末尾 1・入れ子・シングルスレッド）。
+    #[test]
+    fn establish_preconditions() {
+        assert_eq!(check_establish_preconditions(1, STATUS_PID1), Ok(()));
+        let cases: [(u32, &str, &str); 5] = [
+            (
+                7,
+                STATUS_PID1,
+                "not PID 1; call from the first child created after unshare(CLONE_NEWPID)",
+            ),
+            (
+                1,
+                "NSpid:\t4321\t7\nThreads:\t1\n",
+                "NSpid does not end with 1; not PID 1 of the innermost PID namespace",
+            ),
+            (
+                1,
+                "NSpid:\t1\nThreads:\t1\n",
+                "not in a nested PID namespace; isolate with Namespace::Pid first",
+            ),
+            (
+                1,
+                "NSpid:\t4321\t1\nThreads:\t2\n",
+                "the process must be single-threaded before establishing mount isolation",
+            ),
+            (
+                1,
+                "NSpid:\t4321\t1\n",
+                "the process must be single-threaded before establishing mount isolation",
+            ),
+        ];
+        for (pid, status, want) in cases {
+            assert_eq!(
+                check_establish_preconditions(pid, status),
+                Err(want),
+                "{status:?}"
+            );
+        }
+    }
+
+    /// `Threads:`・`NSpid` 末尾の解析。
+    #[test]
+    fn status_fields_parsing() {
+        assert_eq!(status_threads("Threads:\t12\n"), Some(12));
+        assert_eq!(status_threads("Threads:\tx\n"), None);
+        assert_eq!(status_threads("Name:\tx\n"), None);
+        assert_eq!(nspid_innermost("NSpid:\t4321\t55\t1\n"), Some(1));
+        assert_eq!(nspid_innermost("NSpid:\t4321\n"), Some(4321));
+        assert_eq!(nspid_innermost("NSpid:\n"), None);
+        // 実プロセスの status でも取れる（libtest はマルチスレッド）。
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        assert!(status_threads(&status).is_some_and(|n| n >= 1));
+        assert_eq!(
+            nspid_innermost(&status),
+            Some(std::process::id()),
+            "innermost NSpid equals getpid"
+        );
+    }
+
     /// errno 写像の具体値。
     #[test]
     fn errno_maps_to_error_code() {

@@ -66,7 +66,9 @@
 //! 送って ACK を待つと、サーバー側に発火のきっかけがない。本実装で使える
 //! 発火条件は [`crate::batch::BatchTrigger::SizeReached`]・
 //! [`crate::batch::BatchTrigger::BytesLimitReached`]・[`FrameKind::Flush`] の
-//! 3 つのみ（時間ベースの追い出しは範囲外。IO-10・TASK-16）。呼び出し側は
+//! 3 つのみ（時間ベースの追い出しは範囲外。IO-10・TASK-16）。
+//! 未フラッシュ滞留量のカウンタは [`WritebackStats::unflushed`]（TASK-16.1・#90）で導入済みだが、
+//! 上限到達時の自動発火は未実装（TASK-16.2・#91）。呼び出し側は
 //! 「クライアントの in-flight 上限 ≥ `batch_size`、または件数未達分の後に
 //! `Flush` を送ること」を運用上の前提とする（既定値 64 / 64 で整合）。
 //!
@@ -110,6 +112,7 @@ use std::fs::File;
 use std::io::{self, Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 
+use crate::barrier::UnflushedBacklog;
 use crate::batch::{Batch, BatchBuffer, BatchConfig, PushOutcome};
 use crate::error::{IoError, IoErrorCode};
 use crate::payload::{decode_request, encode_ack};
@@ -713,6 +716,9 @@ pub struct WritebackStats {
     pub persist_elapsed_micros: u64,
     /// ACK を送らずに破棄した滞留フレーム件数（D5）。
     pub discarded_pending_frames: u64,
+    /// 最後に成功した FLUSH バリア以降に受理した未フラッシュ滞留量（IO-10・TASK-16.1）。
+    /// ループ終了時の値には `discarded_pending_frames` として破棄した分も含む。
+    pub unflushed: UnflushedBacklog,
 }
 
 /// [`serve_connection`] の戻り値（D7）。
@@ -812,6 +818,7 @@ where
 /// ループは常にエラーで終わる（[`WritebackReport`] 参照）。終了時、
 /// [`BatchBuffer`] に残っていた滞留フレームは書き込まずに破棄し件数を
 /// [`WritebackStats::discarded_pending_frames`] へ残す（D5）。
+/// 受理した `Write` は [`WritebackStats::unflushed`] に加算し、`persist` 成功で 0 に戻す（IO-10）。
 ///
 /// `config` は [`crate::settings::WritebackSettings::batch_config`] から
 /// 渡し、対応する [`crate::server::UdsServer::bind`] には同じ
@@ -869,14 +876,18 @@ where
                 // decode_request は Write フレームの形式（request id + body 長）を
                 // 検証する。8 バイト未満（request id すら入っていない）等の違反は
                 // ここで検出し、バッファへは触れずに終える。
-                if let Err(err) = decode_request(&frame) {
-                    return finish(stats, &buffer, err);
-                }
+                // push で frame が move される前に body 長だけ取り出して借用を切る。
+                let body_len = match decode_request(&frame) {
+                    Ok(envelope) => envelope.body().len(),
+                    Err(err) => return finish(stats, &buffer, err),
+                };
 
                 let outcome = match buffer.push(frame) {
                     Ok(outcome) => outcome,
                     Err(err) => return finish(stats, &buffer, err),
                 };
+                // 受理した時点で未フラッシュに数える（IO-10。通常 ACK 後も残る）。
+                stats.unflushed.record_write(body_len);
 
                 let batches: Vec<Batch> = match outcome {
                     PushOutcome::Buffered { .. } => Vec::new(),
@@ -915,6 +926,8 @@ where
                 match sink.persist() {
                     Ok(report) => {
                         stats.persist_succeeded = stats.persist_succeeded.saturating_add(1);
+                        // バリア以前の受理分はすべて永続化済み（IO-10）。失敗時は戻さない。
+                        stats.unflushed.reset();
                         let micros = u64::try_from(report.elapsed.as_micros()).unwrap_or(u64::MAX);
                         stats.persist_elapsed_micros =
                             stats.persist_elapsed_micros.saturating_add(micros);
@@ -1210,6 +1223,69 @@ mod tests {
 
         assert_eq!(report.stats.acks_sent, 0);
         assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
+    }
+
+    /// IO-10・TASK-16.1: Flush なしでは受理した Write ごとに件数・body バイトが増える。
+    #[test]
+    fn io10_writeback_unflushed_counts_each_write_without_flush() {
+        let mut conn = FakeTransport::new(vec![write_frame(0, b"a"), write_frame(1, b"bb")]);
+        let mut sink = persist_sink(None);
+        let report = serve_connection(&mut conn, BatchConfig::default(), &mut sink, timeouts());
+        assert_eq!(report.stats.unflushed.frames(), 2);
+        assert_eq!(report.stats.unflushed.bytes(), 3);
+    }
+
+    /// IO-10・TASK-16.1: FLUSH バリア成功で 0 に戻り、以後の書き込みだけが残る。
+    #[test]
+    fn io10_writeback_unflushed_resets_on_flush_barrier() {
+        let frames = vec![
+            write_frame(0, b"a"),
+            write_frame(1, b"bb"),
+            flush_frame(2),
+            write_frame(3, b"ccc"),
+        ];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = persist_sink(None);
+        let report = serve_connection(&mut conn, BatchConfig::default(), &mut sink, timeouts());
+        assert_eq!(report.stats.flush_acks_sent, 1);
+        assert_eq!(report.stats.unflushed.frames(), 1);
+        assert_eq!(report.stats.unflushed.bytes(), 3);
+    }
+
+    /// IO-10・TASK-16.1: バッチ書き込み・通常 ACK 後も未フラッシュのまま減らない。
+    #[test]
+    fn io10_writeback_unflushed_counts_across_batches() {
+        let frames: Vec<Frame> = (0..3u64).map(|id| write_frame(id, b"x")).collect();
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = persist_sink(None);
+        let config = BatchConfig::new(2).expect("2 must be valid");
+        let report = serve_connection(&mut conn, config, &mut sink, timeouts());
+        assert_eq!(report.stats.batches_written, 1);
+        assert_eq!(report.stats.unflushed.frames(), 3);
+        assert_eq!(report.stats.unflushed.bytes(), 3);
+    }
+
+    /// IO-10・IO-2・TASK-16.1: persist 失敗時は 0 に戻さない（fail-closed）。
+    #[test]
+    fn io10_writeback_unflushed_not_reset_on_persist_failure() {
+        let mut conn = FakeTransport::new(vec![write_frame(0, b"a"), flush_frame(1)]);
+        let mut sink = persist_sink(Some(IoErrorCode::Timeout));
+        let report = serve_connection(&mut conn, BatchConfig::default(), &mut sink, timeouts());
+        assert_eq!(report.end.code(), IoErrorCode::Timeout);
+        assert_eq!(report.stats.unflushed.frames(), 1);
+        assert_eq!(report.stats.unflushed.bytes(), 1);
+    }
+
+    /// IO-10・TASK-16.1: 受理前に拒否した不正 Write は数えない。
+    #[test]
+    fn io10_writeback_rejected_write_is_not_counted() {
+        let malformed =
+            Frame::new(FrameKind::Write, vec![0u8; 4]).expect("short payload must construct");
+        let mut conn = FakeTransport::new(vec![malformed]);
+        let mut sink = FakeSink::new();
+        let report = serve_connection(&mut conn, BatchConfig::default(), &mut sink, timeouts());
+        assert_eq!(report.stats.unflushed.frames(), 0);
+        assert_eq!(report.stats.unflushed.bytes(), 0);
     }
 
     /// D6: sink の失敗では、そのバッチの ACK が 0 件で、終了原因のコードが

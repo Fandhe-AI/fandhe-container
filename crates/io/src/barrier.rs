@@ -35,6 +35,8 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
+//! - 未フラッシュ滞留量のカウンタ [`UnflushedBacklog`] は実装済み（IO-10・TASK-16.1・#90）。
+//!   上限との比較・到達時の自動フラッシュは未実装で TASK-16.2・#91 が担う。
 //! - macOS / Windows の代替フラッシュ（TASK-15.3・#88）は sink が持つファイル自体
 //!   （データ＋ファイルメタデータ）を明示的な syscall（macOS は `fcntl(F_FULLFSYNC)`、
 //!   Windows は `FlushFileBuffers`）で永続化したうえで、sink が
@@ -858,6 +860,50 @@ fn release_supports_syncfs_errors(release: &str) -> bool {
     parse_kernel_release(release).is_some_and(|v| v >= MIN_SYNCFS_ERROR_REPORTING)
 }
 
+/// バッチ write-back 経路で「受理したが FLUSH バリアで永続化されていない」
+/// 滞留量のカウンタ（IO-10・TASK-16.1・#90）。
+///
+/// [`crate::writeback::serve_connection`] が `Write` を 1 件受理するたびに加算し、
+/// `Flush` の [`crate::writeback::BatchSink::persist`] が成功した時点で 0 に戻す。
+/// バッチを書き込み通常 ACK（IO-1）を返した後も「未フラッシュ」に残る点が
+/// [`crate::batch::BatchBuffer`] の滞留量（バッチ未形成分のみ。payload バイトで数える）と
+/// 異なる。バイト数は body バイト（[`crate::writeback::WritebackStats::bytes_written`]
+/// と同じ単位）。更新は crate 内専用で、crate 外は getter で読むだけとする
+/// （値の偽装による上限判定のすり抜けを防ぐ）。
+///
+/// 未実装（REPAIR-3）: 上限との比較と到達時の自動フラッシュは TASK-16.2・#91 で
+/// 実装予定（IO-10）。本型は計測のみを担う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct UnflushedBacklog {
+    frames: u64,
+    bytes: u64,
+}
+
+impl UnflushedBacklog {
+    /// 未フラッシュの `Write` 件数。
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// 未フラッシュの body 合計バイト数。
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// `Write` を 1 件受理した分を加算する（飽和加算。過小報告しない）。
+    pub(crate) fn record_write(&mut self, body_len: usize) {
+        self.frames = self.frames.saturating_add(1);
+        let len = u64::try_from(body_len).unwrap_or(u64::MAX);
+        self.bytes = self.bytes.saturating_add(len);
+    }
+
+    /// FLUSH バリア成功（永続化完了）で 0 に戻す。
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,6 +911,45 @@ mod tests {
 
     fn ms(n: u64) -> IoTimeout {
         IoTimeout::new(Duration::from_millis(n)).expect("valid timeout")
+    }
+
+    /// IO-10・TASK-16.1: 初期値は 0 件・0 バイト。
+    #[test]
+    fn io10_unflushed_backlog_starts_empty() {
+        let b = UnflushedBacklog::default();
+        assert_eq!((b.frames(), b.bytes()), (0, 0));
+    }
+
+    /// IO-10・TASK-16.1: 書き込みごとに件数と body バイトが増える。
+    #[test]
+    fn io10_unflushed_backlog_counts_each_write() {
+        let mut b = UnflushedBacklog::default();
+        b.record_write(1);
+        b.record_write(2);
+        b.record_write(0);
+        assert_eq!((b.frames(), b.bytes()), (3, 3));
+    }
+
+    /// IO-10・TASK-16.1: reset で 0 に戻り、以後また加算できる。
+    #[test]
+    fn io10_unflushed_backlog_reset_clears_counts() {
+        let mut b = UnflushedBacklog::default();
+        b.record_write(4);
+        b.reset();
+        assert_eq!((b.frames(), b.bytes()), (0, 0));
+        b.record_write(5);
+        assert_eq!((b.frames(), b.bytes()), (1, 5));
+    }
+
+    /// IO-10・TASK-16.1: 飽和し panic しない。
+    #[test]
+    fn io10_unflushed_backlog_saturates() {
+        let mut b = UnflushedBacklog {
+            frames: u64::MAX,
+            bytes: u64::MAX - 1,
+        };
+        b.record_write(10);
+        assert_eq!((b.frames(), b.bytes()), (u64::MAX, u64::MAX));
     }
 
     /// IO-2・TASK-15.2.2: 即座に成功する処理は `Ok` で経過時間が返る。

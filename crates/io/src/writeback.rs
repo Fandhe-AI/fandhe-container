@@ -39,6 +39,10 @@
 //! （IO-1 の I/O 契約変更。`PROTOCOL_VERSION` の繰り上げを伴いうる）として
 //! 別途扱う。
 //!
+//! パスを持つ作成の入口は [`crate::guest_files::GuestFileCreator`]（TASK-19.2・
+//! IO-5・#100）で、サーバー側 API が大文字小文字衝突を検査したうえでファイルを
+//! 作り、[`AppendFileSink`] を返す。ワイヤーは引き続きパスを持たない。
+//!
 //! # FLUSH フレームの扱い（IO-2・TASK-15.2.2・#824。FlushAck は偽装しない）
 //!
 //! [`FrameKind::Flush`] を受信すると、まず [`decode_request`] で形式

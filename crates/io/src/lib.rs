@@ -43,11 +43,12 @@
 //! FS 正規化層は、大文字小文字を区別しないホスト（APFS / NTFS）とゲスト
 //! （ext4）の差異による黙った上書きを防ぐため、ゲスト相対パスの大文字小文字
 //! 衝突を検出する（[`fs_normalize::CaseCollisionSet`]・
-//! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。サーバーの
-//! 書き込み経路への組み込みは #100（TASK-19.2）、パス長 260 超の検証は
+//! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。ファイル
+//! 作成経路への組み込みは [`guest_files::GuestFileCreator`]（TASK-19.2・#100。
+//! ワイヤー形式は変えないサーバー側 API で、ワイヤー上の作成要求は未実装〔REPAIR-3〕）
+//! が担い、検査済みの [`writeback::AppendFileSink`] を返す。パス長 260 超の検証は
 //! TASK-20、Unicode 正規化（NFC / NFD）は #103（TASK-21.h1）の方針決定後に
-//! TASK-21 でそれぞれ後続実装する
-//! （REPAIR-3。本 crate はまだこれらを呼び出していない）。
+//! TASK-21 で後続実装する。
 //!
 //! PLUG-1 区分は core（`fandhe-container-plugin` の境界機構とは別に、コアの一部として
 //! 直接リンクされる）。crate 名 `fandhe-container-io` は
@@ -61,6 +62,7 @@ mod checksum;
 pub mod client;
 pub mod error;
 pub mod fs_normalize;
+pub mod guest_files;
 pub mod observe;
 pub mod payload;
 pub mod protocol;
@@ -85,6 +87,7 @@ pub use client::{
 };
 pub use error::{IoError, IoErrorCode};
 pub use fs_normalize::{CaseCollisionSet, MAX_COLLISION_MESSAGE_PATH_CHARS, check_case_collisions};
+pub use guest_files::{GuestFileCreator, MAX_GUEST_PATH_BYTES, MAX_TRACKED_GUEST_PATHS};
 pub use observe::{
     AckEvent, AckEventError, CoalescedServerEvents, DEFAULT_SEND_LOG_CAPACITY,
     JsonLinesSendObserver, JsonLinesServerObserver, MAX_SEND_LOG_BUFFER_BYTES,

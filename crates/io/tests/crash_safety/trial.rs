@@ -7,13 +7,17 @@
 //! 除外するのは、spec の Linux 実機検証（`sigkill_flushack.py`・`sigkill_precise2.py`）で
 //! codex P1 指摘を受けて採った方式に揃えるため（IO-3）。
 //!
-//! 呼び出し元: `crash_safety.rs` の `unix` モジュール（実プロセスを使う 1 試行の実行）と、
-//! 後続 issue #95（TASK-18.2）の対照ケース。本モジュールは OS 非依存の純粋ロジックで、
+//! さらに #95（TASK-18.2）で、kill 後にディスク上の `data.bin` を読んだレコード列を期待値
+//! （seq 0..n）と照合する純粋関数（[`check_disk_records`]）と、有効試行の損失集計
+//! （[`loss_summary`]）を追加した。
+//!
+//! 呼び出し元: `crash_safety.rs` の `unix` モジュール（実プロセスを使う 1 試行の実行と、
+//! フラッシュ済み / 未フラッシュ対照の 2 ケース）。本モジュールは OS 非依存の純粋ロジックで、
 //! 3 OS でコンパイルしユニットテストを実行する。
 //!
-//! 境界: 損失件数の計測（ディスク上のレコード照合）・「有効 10/10 で損失 0」のアサーション・
-//! 未フラッシュ対照ケースは #95 の範囲であり、ここでは扱わない（REPAIR-3）。
-//! [`TrialRecord`] は #95 が損失件数などのフィールドを足せる構造体として置く。
+//! 境界: 損失件数を有効 / 無効の判定には使わない（[`classify_trial`] は ACK 観測と終了状態だけで
+//! 決める）。損失は有効試行について後から集計する。実測結果レポートと対照としての妥当性の
+//! 判断は TASK-18 の人間担当であり、ここでは扱わない（REPAIR-3）。
 
 use fandhe_container_io::IoErrorCode;
 
@@ -48,6 +52,88 @@ pub struct TrialObservation {
     pub client_error: Option<IoErrorCode>,
     /// kill 後に回収した最終状態。期限内に回収できなければ `None`。
     pub final_exit: Option<ServerExit>,
+    /// サーバーが標準エラーへ出した終了レポート（`event":"exit"`）に `persist_failed >= 1` があったか。
+    /// 永続化（FLUSH）非対応を終了コードではなく構造化された終了理由で特定する根拠（REPAIR-12）。
+    /// レポートが得られない（SIGKILL で終了・未回収等）場合は `false`。[`classify_trial`] は参照しない。
+    pub server_persist_failed: bool,
+    /// kill 後のディスク照合結果（#95）。照合しない試行は `None`。[`classify_trial`] は参照しない。
+    pub disk: Option<DiskObservation>,
+}
+
+/// `data.bin` の 1 レコードのバイト長（Write の body は seq の u64 LE。`drive_client` 参照）。
+pub const RECORD_LEN: usize = 8;
+
+/// ディスク上のレコード列と期待値（seq 0..expected）の照合結果（IO-3・TASK-18.2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskCheck {
+    /// 期待した件数（ACK 目標数）。
+    pub expected: u64,
+    /// ディスク上にあった完全レコードの seq（ファイル順）。
+    pub found: Vec<u64>,
+    /// 期待集合にあるのにディスクに無かった seq（昇順）。損失件数はこの長さ。
+    pub missing: Vec<u64>,
+    /// 期待集合の範囲外の値、または重複して現れた seq（ファイル順）。
+    pub unexpected: Vec<u64>,
+    /// 末尾の `RECORD_LEN` に満たない半端なバイト数。
+    pub trailing_partial_bytes: usize,
+}
+
+impl DiskCheck {
+    /// 損失件数（ACK 済みなのにディスクに無い件数）。
+    pub fn lost(&self) -> u64 {
+        u64::try_from(self.missing.len()).unwrap_or(u64::MAX)
+    }
+
+    /// 0..expected がこの順にちょうど並び、想定外も半端バイトも無い。
+    pub fn is_exact(&self) -> bool {
+        self.missing.is_empty()
+            && self.unexpected.is_empty()
+            && self.trailing_partial_bytes == 0
+            && self.found.iter().copied().eq(0..self.expected)
+    }
+}
+
+/// ディスク照合の結果。読めなかった場合も試行の記録に残す（黙って損失 0 扱いにしない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiskObservation {
+    Checked(DiskCheck),
+    /// 読み出しに失敗した（`io::ErrorKind` の Debug 表記のみ。パス・中身は含めない）。
+    ReadFailed(String),
+    /// ファイルが上限（`cap` バイト）を超えていたため読まなかった。
+    /// 構築するのは UDS 対応 OS（Linux・macOS）のハーネスのみ。他 OS では未使用になる。
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        expect(
+            dead_code,
+            reason = "constructed only by the UDS harness on Linux/macOS"
+        )
+    )]
+    TooLarge {
+        len: u64,
+        cap: u64,
+    },
+}
+
+/// `data.bin` の内容を seq 0..expected と照合する。外部入力扱いのため添字を使わない。
+pub fn check_disk_records(bytes: &[u8], expected: u64) -> DiskCheck {
+    let (chunks, remainder) = bytes.as_chunks::<RECORD_LEN>();
+    let trailing_partial_bytes = remainder.len();
+    let found: Vec<u64> = chunks.iter().map(|c| u64::from_le_bytes(*c)).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut unexpected = Vec::new();
+    for &seq in &found {
+        if seq >= expected || !seen.insert(seq) {
+            unexpected.push(seq);
+        }
+    }
+    let missing = (0..expected).filter(|s| !seen.contains(s)).collect();
+    DiskCheck {
+        expected,
+        found,
+        missing,
+        unexpected,
+        trailing_partial_bytes,
+    }
 }
 
 /// 無効試行の理由（機械可読）。
@@ -185,6 +271,47 @@ impl TrialLedger {
     }
 }
 
+/// 有効試行のディスク照合の集計（無効試行は含めない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LossSummary {
+    pub valid_trials: usize,
+    /// 照合が成立（`Checked`）した有効試行数。
+    pub checked_trials: usize,
+    pub total_lost: u64,
+    pub max_lost: u64,
+    pub trials_with_loss: usize,
+    /// 照合済みだが `is_exact` でない（想定外・半端バイト・欠落のいずれか）有効試行数。
+    pub unexact_trials: usize,
+}
+
+/// 台帳の有効試行だけを対象に損失を集計する。
+pub fn loss_summary(ledger: &TrialLedger) -> LossSummary {
+    let mut out = LossSummary {
+        valid_trials: 0,
+        checked_trials: 0,
+        total_lost: 0,
+        max_lost: 0,
+        trials_with_loss: 0,
+        unexact_trials: 0,
+    };
+    for rec in ledger.valid_trials() {
+        out.valid_trials += 1;
+        if let Some(DiskObservation::Checked(check)) = &rec.observation.disk {
+            let lost = check.lost();
+            out.checked_trials += 1;
+            out.total_lost = out.total_lost.saturating_add(lost);
+            out.max_lost = out.max_lost.max(lost);
+            if lost > 0 {
+                out.trials_with_loss += 1;
+            }
+            if !check.is_exact() {
+                out.unexact_trials += 1;
+            }
+        }
+    }
+    out
+}
+
 /// 有効試行が目標数に達するか試行上限に達するまで `run_one` を繰り返す。
 /// `run_one` には 0 始まりの試行番号を渡す。上限に達したら必ず抜ける（REPAIR-5）。
 pub fn run_until_valid<F>(ledger: &mut TrialLedger, mut run_one: F) -> TrialSummary
@@ -217,7 +344,99 @@ mod tests {
             server_exited_before_kill: None,
             client_error: None,
             final_exit: Some(KILLED),
+            server_persist_failed: false,
+            disk: None,
         }
+    }
+
+    fn bytes_of(seqs: &[u64]) -> Vec<u8> {
+        seqs.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
+
+    fn with_disk(seqs: &[u64], expected: u64) -> TrialObservation {
+        let mut obs = good(expected);
+        obs.ack_target = expected;
+        obs.disk = Some(DiskObservation::Checked(check_disk_records(
+            &bytes_of(seqs),
+            expected,
+        )));
+        obs
+    }
+
+    /// IO-3・TASK-18.2: 0..3 がちょうど並ぶと損失 0 で is_exact。
+    #[test]
+    fn io3_disk_check_exact() {
+        let c = check_disk_records(&bytes_of(&[0, 1, 2]), 3);
+        assert_eq!(c.found, vec![0, 1, 2]);
+        assert!(c.missing.is_empty() && c.unexpected.is_empty());
+        assert_eq!(c.lost(), 0);
+        assert!(c.is_exact());
+    }
+
+    /// IO-3・TASK-18.2: 末尾・途中の欠落は missing に出る。
+    #[test]
+    fn io3_disk_check_missing_tail_and_middle() {
+        let tail = check_disk_records(&bytes_of(&[0, 1]), 3);
+        assert_eq!(tail.missing, vec![2]);
+        assert_eq!(tail.lost(), 1);
+        assert!(!tail.is_exact());
+        let mid = check_disk_records(&bytes_of(&[0, 2, 3]), 4);
+        assert_eq!(mid.missing, vec![1]);
+        assert!(mid.unexpected.is_empty());
+    }
+
+    /// IO-3・TASK-18.2: 8 バイトに満たない末尾は半端バイトとして数え、損失には数えない。
+    #[test]
+    fn io3_disk_check_trailing_partial_bytes() {
+        let mut bytes = bytes_of(&[0, 1, 2]);
+        bytes.extend_from_slice(&[9, 9, 9]);
+        let c = check_disk_records(&bytes, 3);
+        assert_eq!(c.trailing_partial_bytes, 3);
+        assert_eq!(c.lost(), 0);
+        assert!(!c.is_exact());
+    }
+
+    /// IO-3・TASK-18.2: 範囲外の値と重複は unexpected に出る。
+    #[test]
+    fn io3_disk_check_unexpected_and_duplicate() {
+        let c = check_disk_records(&bytes_of(&[0, 1, 1, 7]), 3);
+        assert_eq!(c.unexpected, vec![1, 7]);
+        assert_eq!(c.missing, vec![2]);
+        assert!(!c.is_exact());
+    }
+
+    /// IO-3・TASK-18.2: 空ファイルは全件が欠落になる。
+    #[test]
+    fn io3_disk_check_empty_file_loses_everything() {
+        let c = check_disk_records(&[], 4);
+        assert_eq!(c.missing, vec![0, 1, 2, 3]);
+        assert_eq!(c.lost(), 4);
+    }
+
+    /// IO-3・TASK-18.2: loss_summary は無効試行を除外し、合計・最大・損失あり件数を出す。
+    #[test]
+    fn io3_loss_summary_counts_only_valid_trials() {
+        let mut ledger = TrialLedger::new(10, 30);
+        ledger.record(with_disk(&[0, 1, 2], 3)); // 損失 0
+        ledger.record(with_disk(&[0], 3)); // 損失 2
+        ledger.record(with_disk(&[0, 1], 3)); // 損失 1
+        let mut invalid = with_disk(&[], 3);
+        invalid.client_error = Some(IoErrorCode::Timeout); // 無効。損失 3 は集計しない
+        ledger.record(invalid);
+        let mut unread = with_disk(&[], 3);
+        unread.disk = Some(DiskObservation::ReadFailed("NotFound".into()));
+        ledger.record(unread);
+        assert_eq!(
+            loss_summary(&ledger),
+            LossSummary {
+                valid_trials: 4,
+                checked_trials: 3,
+                total_lost: 3,
+                max_lost: 2,
+                trials_with_loss: 2,
+                unexact_trials: 2,
+            }
+        );
     }
 
     fn bad() -> TrialObservation {

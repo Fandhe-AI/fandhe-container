@@ -154,6 +154,13 @@ run_case_msg "params-mismatch" 2 "direct" --baseline "${fixtures_dir}/baseline-o
 # --------------------------------------------------
 run_case_msg "baseline-zero-iops" 2 "greater than 0" --baseline "${fixtures_dir}/baseline-zero-iops.json" --candidate "${fixtures_dir}/candidate-ok.json"
 
+# 4b: 極端に小さい candidate ÷ 大きい baseline は倍率がアンダーフローで 0 になるため拒否する
+underflow_path="${tmp_root}/candidate-underflow.json"
+jq '.metrics.fio_randwrite_4k_iops.value = 1e-320' "${fixtures_dir}/candidate-ok.json" >"$underflow_path"
+underflow_base="${tmp_root}/baseline-huge.json"
+jq '.metrics.fio_randwrite_4k_iops.value = 1e300' "${fixtures_dir}/baseline-ok.json" >"$underflow_base"
+run_case_msg "ratio-underflow-to-zero" 2 "finite positive" --baseline "$underflow_base" --candidate "$underflow_path"
+
 # --------------------------------------------------
 # case 5: metric 欠落・unit 不一致・benchmark 名不一致・非 JSON
 # --------------------------------------------------

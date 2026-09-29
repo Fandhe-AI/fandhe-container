@@ -215,7 +215,7 @@ timeout -k 10 90 docker run --rm --name fandhe-fio-bench --user "$(id -u):$(id -
   fio --name=fandhe-fio-randwrite-4k --directory=/data \
       --filename=fandhe-fio-randwrite-4k.dat --rw=randwrite --bs=4k --ioengine=psync \
       --direct=1 --size=256m --runtime=30 --iodepth=1 --numjobs=1 \
-      --end_fsync=1 --group_reporting --output-format=json --output=/out/fio.json
+      --end_fsync=1 --group_reporting --output-format=json --output=/out/fio-bind.json
 
 # 2) named volume（<volume> は事前に作成した docker volume 名。実体パスは root しか
 #    読み書きできないため、コンテナ内 fio 経由でしか --user 実行できない。下記「注意点」参照）
@@ -225,16 +225,20 @@ timeout -k 10 90 docker run --rm --name fandhe-fio-bench --user "$(id -u):$(id -
   fio --name=fandhe-fio-randwrite-4k --directory=/data \
       --filename=fandhe-fio-randwrite-4k.dat --rw=randwrite --bs=4k --ioengine=psync \
       --direct=1 --size=256m --runtime=30 --iodepth=1 --numjobs=1 \
-      --end_fsync=1 --group_reporting --output-format=json --output=/out/fio.json
+      --end_fsync=1 --group_reporting --output-format=json --output=/out/fio-volume.json
 
-# 3) fio JSON を results.json 形式へ変換（label は docker_bind_mount / docker_named_volume）。
+# 3) fio JSON を results.json 形式へ変換する。計測ごとに出力ファイルを分けてあるため、
+#    それぞれを対応する label で変換する（同じ fio.json に上書きすると bind mount の結果が
+#    named volume の結果で消え、label と実測値が食い違う）。
 #    --output で変換結果をファイルへ保存する（指定しないと stdout に出すだけで、
 #    手順 4 の比較用ファイルが手元に残らない）
-bash scripts/fio-randwrite-4k.sh --from-json <out-dir>/fio.json --label docker_bind_mount \
-    --output <docker-results.json>
+bash scripts/fio-randwrite-4k.sh --from-json <out-dir>/fio-bind.json --label docker_bind_mount \
+    --output <docker-bind-results.json>
+bash scripts/fio-randwrite-4k.sh --from-json <out-dir>/fio-volume.json --label docker_named_volume \
+    --output <docker-volume-results.json>
 
 # 4) 倍率の算出（BASELINE=Docker、CANDIDATE=fandhe 経路。共有マウント公開後）
-make fio-baseline-ratio BASELINE=<docker-results.json> CANDIDATE=<fandhe-results.json>
+make fio-baseline-ratio BASELINE=<docker-bind-results.json または docker-volume-results.json> CANDIDATE=<fandhe-results.json>
 ```
 
 fio コマンドに渡す job options は「`--from-json` モード」節の許可リスト 13 項目に限る（`--output-format`・`--output` は fio のコマンドラインオプションであり job options には含まれない）。それ以外を付けると `fio-randwrite-4k.sh --from-json` が終了コード 2 で拒否する。

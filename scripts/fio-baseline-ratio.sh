@@ -309,11 +309,13 @@ fi
 # 倍精度の範囲を超えて inf/NaN になり得る。「終了コード 0 で機械可読な倍率を
 # 返す」契約が崩れるため、5 種すべての倍率が有限であることを検証する。
 # この検証は倍率を算出した同じ jq プロセス内（出力を一旦テキスト化する前）で
-# 行う必要がある。jq は出力を JSON テキストへシリアライズする際に無限大を
+# 行う必要がある。また、極端に小さい値÷大きい値は浮動小数点アンダーフローで
+# 倍率が 0 になり得る（精度喪失した 0 を成功として返さない）。入力は正数と検証済み
+# のため、正当な倍率は必ず正であり、0 以下も同じ入力エラーとして拒否する。jq は出力を JSON テキストへシリアライズする際に無限大を
 # 有限の DBL_MAX へ丸めるため、一度 stdout へ出してから改めて `isinfinite` を
 # 調べても既に有限の値に化けており検出できない。
 if ! result=$(printf '%s\n%s\n' "$baseline_content" "$candidate_content" | jq -s '
-  def check_ratio(v; name): if (v | isinfinite or isnan) then error("ratio \(name) is not finite") else v end;
+  def check_ratio(v; name): if (v | isinfinite or isnan or . <= 0) then error("ratio \(name) is not a finite positive number") else v end;
   .[0] as $b | .[1] as $c
   | ($c.metrics.fio_randwrite_4k_iops.value / $b.metrics.fio_randwrite_4k_iops.value) as $iops_ratio
   | ($c.metrics.fio_randwrite_4k_lat_mean_us.value / $b.metrics.fio_randwrite_4k_lat_mean_us.value) as $lat_mean_ratio
@@ -346,7 +348,7 @@ if ! result=$(printf '%s\n%s\n' "$baseline_content" "$candidate_content" | jq -s
     }
   }
 ' 2>&1); then
-  err "invalid-input" "computed ratio is not finite (candidate/baseline values are too extreme): ${result}"
+  err "invalid-input" "computed ratio is not a finite positive number (candidate/baseline values are too extreme): ${result}"
   exit 2
 fi
 

@@ -10,12 +10,11 @@
 //! 構造化エラーを返す純粋関数・小さな状態型を提供する。
 //!
 //! # 呼び出し文脈
-//! 本 sub-issue（#99）はこの検出ロジック単体の実装に留まる。実際の
-//! サーバーの書き込み経路（`crates/io/src/server.rs` / `crates/io/src/writeback.rs`）
-//! への組み込みは兄弟 sub-issue #100（TASK-19.2）が担う。現行の
-//! [`crate::payload::RequestEnvelope`] にはファイルパスを表すフィールドがまだ
-//! 無いため、本モジュールは現時点でどこからも呼ばれていない（REPAIR-3:
-//! 実装済みを装わない）。
+//! サーバーのファイル作成経路は [`crate::guest_files::GuestFileCreator::create_file`]
+//! （TASK-19.2・#100）が [`CaseCollisionSet`] を呼び出して衝突を検査する。
+//! 現行の [`crate::payload::RequestEnvelope`] にはファイルパスを表すフィールドが
+//! まだ無く、ワイヤー上の作成要求からの呼び出しは未実装（REPAIR-3: 実装済みを
+//! 装わない。詳細は `guest_files` のモジュール doc）。
 //!
 //! # 衝突判定の単位: パスの全祖先プレフィックス
 //! ホスト上では、パス `A/b` を作ると中間ディレクトリ `A` も実体として存在する。
@@ -60,12 +59,14 @@
 //! [`validate_guest_relative_path`] は先頭 `/`・`.`・`..`・空コンポーネント・
 //! NUL を拒否するが、これはパストラバーサルを主目的として防ぐ層ではない。
 //! rootfs 配下への閉じ込めを保証する本来の検証は、サーバー側の書き込み経路
-//! （#100 以降）の責務であり、本モジュールの検証はそれとは独立に、同一表記
+//! （[`crate::guest_files`] のコンポーネント検証・祖先確認・`create_new`。#100）の
+//! 責務であり、本モジュールの検証はそれとは独立に、同一表記
 //! ゆれ（`a//B` と `a/b` など）で衝突検出をすり抜けさせないための入力正規化に
 //! すぎない。
 //!
 //! # スコープ外（後続タスクへの引き継ぎ・既知の限界）
-//! - サーバーの書き込み経路への組み込み・結合試験 → #100（TASK-19.2）
+//! - サーバーのファイル作成経路への組み込み・結合試験 → #100（TASK-19.2。
+//!   `guest_files` で実装済み。ワイヤー上の作成要求は未実装）
 //! - パス長 260 超の検出 → TASK-20
 //! - NFC / NFD の Unicode 正規化方針 → #103（TASK-21.h1）で決定後に TASK-21
 //! - APFS / NTFS の実際の case folding 表との厳密な一致・非 UTF-8 ファイル名の
@@ -224,7 +225,7 @@ fn validate_guest_relative_path(path: &str) -> Result<Vec<&str>, IoError> {
 /// [`MAX_COLLISION_MESSAGE_PATH_CHARS`] 文字までに切り詰める。切り詰めた
 /// 場合は末尾に `...` を付ける。添字アクセス（`[]`）ではなく `chars().take`
 /// を使い、マルチバイト文字の境界を壊さない。
-fn quote_for_message(path: &str) -> String {
+pub(crate) fn quote_for_message(path: &str) -> String {
     let mut truncated: String = path
         .chars()
         .take(MAX_COLLISION_MESSAGE_PATH_CHARS)

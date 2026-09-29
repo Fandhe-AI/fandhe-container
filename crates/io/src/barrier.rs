@@ -391,21 +391,25 @@ impl PersistLimiter {
     /// ため。また `Timeout` は spec の ERR-3 対応表の `DEADLINE_EXCEEDED` に
     /// 当たる定義済みのコードだが、`ResourceExhausted` は ERR-3 にまだない
     /// 拡張コードである（`crate::error::IoErrorCode` 参照）。
+    ///
+    /// 期限は空き枠の判定より先に確認する。枠待ちの間に期限が切れた直後に枠が
+    /// 空いても、期限切れの FLUSH に枠を渡して `syncfs` を起動しない（REPAIR-5 の
+    /// 期限内で枠待ちと実行を打ち切る。Codex #1142 指摘）。
     pub(crate) fn acquire(&'static self, deadline: Instant) -> Result<PersistSlot, IoError> {
         let mut running = self.lock();
         loop {
-            if *running < self.effective_limit() {
-                *running = running.checked_add(1).ok_or_else(|| {
-                    IoError::new(IoErrorCode::Internal, "persist slot counter overflow")
-                })?;
-                return Ok(PersistSlot { limiter: self });
-            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(IoError::new(
                     IoErrorCode::Timeout,
                     "timed out waiting for a free syncfs slot (max concurrent persist reached)",
                 ));
+            }
+            if *running < self.effective_limit() {
+                *running = running.checked_add(1).ok_or_else(|| {
+                    IoError::new(IoErrorCode::Internal, "persist slot counter overflow")
+                })?;
+                return Ok(PersistSlot { limiter: self });
             }
             running = self
                 .released
@@ -481,6 +485,15 @@ where
         .checked_add(timeout.as_duration())
         .ok_or_else(|| IoError::new(IoErrorCode::Internal, "persist deadline overflow"))?;
     let slot = limiter.acquire(deadline)?;
+    // 枠を得た時点で期限が尽きていたら、`work` を起動せず未発行で打ち切る
+    // （期限切れの FLUSH のために syncfs を走らせない。REPAIR-5）。
+    if deadline.saturating_duration_since(Instant::now()).is_zero() {
+        drop(slot);
+        return Err(IoError::new(
+            IoErrorCode::Timeout,
+            "persist deadline expired before syncfs could be issued",
+        ));
+    }
     let (tx, rx) = mpsc::sync_channel::<Result<(), IoError>>(1);
     std::thread::Builder::new()
         .name("fandhe-io-persist".to_owned())
@@ -878,6 +891,28 @@ mod tests {
             .expect_err("panicking work must fail");
         assert_eq!(err.code(), IoErrorCode::Internal);
         run_with_deadline(&L, ms(2000), || Ok(())).expect("slot must be released after panic");
+        assert_eq!(L.running(), 0);
+    }
+
+    /// REPAIR-5（Codex #1142 指摘）: 期限を過ぎた後は、枠が空いていても枠を
+    /// 渡さない（期限切れの FLUSH のために syncfs を起動しない）。
+    #[test]
+    fn repair5_persist_limiter_rejects_expired_deadline_even_with_free_slot() {
+        static L: PersistLimiter = PersistLimiter::new(1);
+        let expired = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let err = L
+            .acquire(expired)
+            .err()
+            .expect("an expired deadline must not get a slot");
+        assert_eq!(err.code(), IoErrorCode::Timeout);
+        assert_eq!(L.running(), 0);
+        // 期限内なら同じ空き枠を得られる。
+        let slot = L
+            .acquire(Instant::now() + Duration::from_secs(1))
+            .expect("free slot within the deadline");
+        assert_eq!(L.running(), 1);
+        drop(slot);
         assert_eq!(L.running(), 0);
     }
 

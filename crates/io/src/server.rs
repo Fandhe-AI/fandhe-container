@@ -710,6 +710,40 @@ struct SharedObserverInner<C: ServerObserver> {
     dropped: AtomicU64,
 }
 
+/// 最後の参照（両半分と接続）が drop される時、期限切れ等で排出できず残った保留イベントを
+/// フックへ適用する（REPAIR-4: 後続の I/O がなくても観測イベントを欠落させない）。
+///
+/// この時点で他の参照は存在せずロック競合は起きない。排出は保留キューの上限
+/// （`MAX_PENDING_EVENTS`）で有界。フックが有界時間で戻ることは
+/// [`ServerObserver::on_event`] の契約に依存する。
+impl<C: ServerObserver> Drop for SharedObserverInner<C> {
+    fn drop(&mut self) {
+        let hook = self.hook.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let pending = self
+            .pending
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        let dropped = self.dropped.swap(0, Ordering::AcqRel);
+        if dropped > 0 {
+            let err = IoError::new(
+                IoErrorCode::ResourceExhausted,
+                format!("observer event queue overflowed; {dropped} events were dropped"),
+            );
+            emit_failure(
+                hook,
+                ServerOp::Send,
+                None,
+                ServerOutcome::Failure,
+                Duration::ZERO,
+                &err,
+            );
+        }
+        while let Some(event) = pending.pop_front() {
+            event(hook);
+        }
+    }
+}
+
 /// 分割後の両半分が共有する観測フック（#1118。1 接続に 1 フックの意味論を保つ）。
 ///
 /// ロックは `on_event` / [`Self::with`] の間だけ取り、I/O をまたいで保持しない
@@ -3873,5 +3907,40 @@ mod shared_observer_tests {
         observer.flush(None);
         assert_eq!(observer.lock_pending().len(), 0);
         observer.with(|rec| assert_eq!(rec.events.len(), 3));
+    }
+
+    /// 共有ログへ書き込む観測フック（drop 後に受信内容を検証するため）。
+    struct SharedLog(Arc<Mutex<Vec<bool>>>);
+
+    impl ServerObserver for SharedLog {
+        fn on_event(&mut self, event: &ServerEvent<'_>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(event.outcome == ServerOutcome::Failure);
+        }
+    }
+
+    /// REPAIR-4・#1118: 期限切れで排出できなかった保留イベントは、最後の参照の drop 時に
+    /// フックへ届く（後続の I/O がなくても欠落しない）。
+    #[test]
+    fn repair4_pending_events_are_drained_when_last_reference_drops() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let observer = SharedObserver::new(SharedLog(Arc::clone(&log)));
+        let other = observer.clone();
+        // 期限切れ（過去）の通知は排出されず保留のまま残る。
+        notify_success(
+            &observer,
+            ServerOp::Send,
+            None,
+            Duration::ZERO,
+            Instant::now(),
+        );
+        notify_success(&other, ServerOp::Recv, None, Duration::ZERO, Instant::now());
+        assert!(log.lock().unwrap().is_empty());
+        drop(observer);
+        assert!(log.lock().unwrap().is_empty(), "other half still alive");
+        drop(other);
+        assert_eq!(*log.lock().unwrap(), vec![false, false]);
     }
 }

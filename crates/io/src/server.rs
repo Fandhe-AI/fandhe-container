@@ -752,7 +752,16 @@ impl<C: ServerObserver> SharedObserver<C> {
     /// （I/O 経路の `IoTimeout` 期限を守る。REPAIR-5）。残りは保留キューに残り、
     /// 次の `notify` / `with` の排出が引き継ぐ（欠落はしない。REPAIR-4）。
     /// 欠落サマリはフック側の上限で捨てられないよう、キュー本体より先に適用する。
-    fn drain_locked(&self, hook: &mut C, budget: &mut usize) {
+    ///
+    /// `until` が `Some` のときは件数に加え時刻でも打ち切る。観測フックが遅くても
+    /// 呼び出し全体が `IoTimeout` の期限を大きく超えないようにするため（REPAIR-5）。
+    /// 期限後に残ったイベントは保留キューに残り、次の排出が引き継ぐ（REPAIR-4）。
+    /// 1 件の `on_event` 実行中は中断できないため、フックが有界時間で戻ることは
+    /// [`ServerObserver::on_event`] の契約（ブロックしない）に依存する。
+    fn drain_locked(&self, hook: &mut C, budget: &mut usize, until: Option<Instant>) {
+        if until.is_some_and(|d| Instant::now() >= d) {
+            return;
+        }
         // 上限超過で捨てた分は件数だけ記録してあるので、集約イベントで欠落を知らせる。
         let dropped = self.0.dropped.swap(0, Ordering::AcqRel);
         if dropped > 0 {
@@ -770,6 +779,9 @@ impl<C: ServerObserver> SharedObserver<C> {
             );
         }
         while *budget > 0 {
+            if until.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
             let next = self.lock_pending().pop_front();
             match next {
                 Some(event) => {
@@ -787,25 +799,30 @@ impl<C: ServerObserver> SharedObserver<C> {
             let mut guard = self.0.hook.lock().unwrap_or_else(PoisonError::into_inner);
             let r = f(&mut guard);
             let mut budget = MAX_DRAIN_PER_CALL;
-            self.drain_locked(&mut guard, &mut budget);
+            self.drain_locked(&mut guard, &mut budget, None);
             r
         };
         // 解放直前に他方が積んで try_lock に失敗した分を取りこぼさない。
-        self.flush();
+        self.flush(None);
         result
     }
 
     /// ロックが取れる間、保留イベントを排出する。取れなければ保持側に任せる。
-    fn flush(&self) {
+    ///
+    /// `until` は排出を打ち切る期限（I/O 経路では送受信の `IoTimeout` 期限。REPAIR-5）。
+    fn flush(&self, until: Option<Instant>) {
         let mut budget = MAX_DRAIN_PER_CALL;
         while budget > 0 {
+            if until.is_some_and(|d| Instant::now() >= d) {
+                return;
+            }
             {
                 let mut guard = match self.0.hook.try_lock() {
                     Ok(g) => g,
                     Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                     Err(std::sync::TryLockError::WouldBlock) => return,
                 };
-                self.drain_locked(&mut guard, &mut budget);
+                self.drain_locked(&mut guard, &mut budget, until);
             }
             if self.lock_pending().is_empty() && self.0.dropped.load(Ordering::Acquire) == 0 {
                 return;
@@ -815,7 +832,7 @@ impl<C: ServerObserver> SharedObserver<C> {
 
     /// イベントを保留キューへ積み、待たずに排出を試みる（キュー満杯なら件数を数え、
     /// 排出時に集約イベントで通知する）。
-    fn notify(&self, event: PendingEvent<C>) {
+    fn notify(&self, event: PendingEvent<C>, until: Instant) {
         {
             let mut q = self.lock_pending();
             if q.len() >= MAX_PENDING_EVENTS {
@@ -824,7 +841,7 @@ impl<C: ServerObserver> SharedObserver<C> {
                 q.push_back(event);
             }
         }
-        self.flush();
+        self.flush(Some(until));
     }
 }
 
@@ -834,8 +851,9 @@ fn notify_success<C: ServerObserver>(
     op: ServerOp,
     kind: Option<FrameKind>,
     latency: Duration,
+    until: Instant,
 ) {
-    observer.notify(Box::new(move |o| emit_success(o, op, kind, latency)));
+    observer.notify(Box::new(move |o| emit_success(o, op, kind, latency)), until);
 }
 
 /// 失敗イベントを保留キュー経由で通知する（エラーは所有データへ複製する）。
@@ -846,11 +864,13 @@ fn notify_failure<C: ServerObserver>(
     outcome: ServerOutcome,
     latency: Duration,
     err: &IoError,
+    until: Instant,
 ) {
     let err = IoError::new(err.code(), err.message().to_owned());
-    observer.notify(Box::new(move |o| {
-        emit_failure(o, op, kind, outcome, latency, &err)
-    }));
+    observer.notify(
+        Box::new(move |o| emit_failure(o, op, kind, outcome, latency, &err)),
+        until,
+    );
 }
 
 /// [`SplitTransport::split`] が返す送信側（#1118・IO-1・P1-3）。
@@ -942,6 +962,8 @@ impl<C: ServerObserver> FrameSender for UdsSendHalf<C> {
     type Frame = Frame;
 
     fn send_frame(&mut self, frame: &Frame, timeout: IoTimeout) -> Result<(), IoError> {
+        // 観測イベントの排出もこの期限までに打ち切る（REPAIR-5）。
+        let until = Instant::now() + timeout.as_duration();
         let kind = Some(frame.kind());
         if self.poison.is_poisoned() {
             let err = unavailable_after_poison();
@@ -952,6 +974,7 @@ impl<C: ServerObserver> FrameSender for UdsSendHalf<C> {
                 ServerOutcome::RejectedPoisoned,
                 Duration::ZERO,
                 &err,
+                until,
             );
             return Err(err);
         }
@@ -960,14 +983,22 @@ impl<C: ServerObserver> FrameSender for UdsSendHalf<C> {
         let elapsed = started.elapsed();
         let (result, rejected) = settle_shared(&self.inner, &self.poison, result);
         match &result {
-            Ok(()) => notify_success(&self.observer, ServerOp::Send, kind, elapsed),
+            Ok(()) => notify_success(&self.observer, ServerOp::Send, kind, elapsed, until),
             Err(err) => {
                 let outcome = if rejected {
                     ServerOutcome::RejectedPoisoned
                 } else {
                     ServerOutcome::Failure
                 };
-                notify_failure(&self.observer, ServerOp::Send, kind, outcome, elapsed, err);
+                notify_failure(
+                    &self.observer,
+                    ServerOp::Send,
+                    kind,
+                    outcome,
+                    elapsed,
+                    err,
+                    until,
+                );
             }
         }
         result
@@ -978,6 +1009,8 @@ impl<C: ServerObserver> FrameReceiver for UdsRecvHalf<C> {
     type Frame = Frame;
 
     fn recv_frame(&mut self, timeout: IoTimeout) -> Result<Frame, IoError> {
+        // 観測イベントの排出もこの期限までに打ち切る（REPAIR-5）。
+        let until = Instant::now() + timeout.as_duration();
         if self.poison.is_poisoned() {
             let err = unavailable_after_poison();
             notify_failure(
@@ -987,6 +1020,7 @@ impl<C: ServerObserver> FrameReceiver for UdsRecvHalf<C> {
                 ServerOutcome::RejectedPoisoned,
                 Duration::ZERO,
                 &err,
+                until,
             );
             return Err(err);
         }
@@ -996,9 +1030,13 @@ impl<C: ServerObserver> FrameReceiver for UdsRecvHalf<C> {
         let attempt_kind = attempt.kind;
         let (result, rejected) = settle_shared(&self.inner, &self.poison, attempt.result);
         match &result {
-            Ok(frame) => {
-                notify_success(&self.observer, ServerOp::Recv, Some(frame.kind()), elapsed)
-            }
+            Ok(frame) => notify_success(
+                &self.observer,
+                ServerOp::Recv,
+                Some(frame.kind()),
+                elapsed,
+                until,
+            ),
             Err(err) => {
                 let outcome = if rejected {
                     ServerOutcome::RejectedPoisoned
@@ -1012,6 +1050,7 @@ impl<C: ServerObserver> FrameReceiver for UdsRecvHalf<C> {
                     outcome,
                     elapsed,
                     err,
+                    until,
                 );
             }
         }
@@ -3772,7 +3811,13 @@ mod shared_observer_tests {
         // フックのロックを保持中に MAX + 3 件を通知する（すべて保留される）。
         observer.with(|_| {
             for _ in 0..(MAX_PENDING_EVENTS + 3) {
-                notify_success(&observer, ServerOp::Send, None, Duration::ZERO);
+                notify_success(
+                    &observer,
+                    ServerOp::Send,
+                    None,
+                    Duration::ZERO,
+                    Instant::now() + Duration::from_secs(60),
+                );
             }
         });
         observer.with(|rec| {
@@ -3802,11 +3847,31 @@ mod shared_observer_tests {
         }
         let mut guard = observer.0.hook.lock().unwrap();
         let mut budget = MAX_DRAIN_PER_CALL;
-        observer.drain_locked(&mut guard, &mut budget);
+        observer.drain_locked(&mut guard, &mut budget, None);
         assert_eq!(guard.events.len(), MAX_DRAIN_PER_CALL);
         assert_eq!(observer.lock_pending().len(), 5);
         let mut budget = MAX_DRAIN_PER_CALL;
-        observer.drain_locked(&mut guard, &mut budget);
+        observer.drain_locked(&mut guard, &mut budget, None);
         assert_eq!(guard.events.len(), MAX_DRAIN_PER_CALL + 5);
+    }
+
+    /// REPAIR-5・#1118: 期限を過ぎていれば保留イベントを 1 件も適用せず戻り、
+    /// イベントは失われず次の排出（期限なし）で適用される。
+    #[test]
+    fn repair5_drain_stops_at_deadline_and_keeps_events() {
+        let observer = SharedObserver::new(Recorder::default());
+        for _ in 0..3 {
+            observer
+                .lock_pending()
+                .push_back(Box::new(|o: &mut Recorder| {
+                    o.events.push((false, None));
+                }));
+        }
+        let past = Instant::now();
+        observer.flush(Some(past));
+        assert_eq!(observer.lock_pending().len(), 3);
+        observer.flush(None);
+        assert_eq!(observer.lock_pending().len(), 0);
+        observer.with(|rec| assert_eq!(rec.events.len(), 3));
     }
 }

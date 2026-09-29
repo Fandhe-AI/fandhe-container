@@ -29,10 +29,11 @@
 //! 書き込み完了後に通常 ACK を返すところまでは [`writeback`] モジュール
 //! （TASK-13.2.2・#822）がつなぐ（[`writeback::serve_connection`]・
 //! [`writeback::AppendFileSink`]）。FLUSH バリアの永続化に使う Linux 用の
-//! `syncfs(2)` FFI ラッパーは `sys` モジュール（非公開）に TASK-15.2.1・#823 で
-//! 用意済みだが、`writeback` への組み込みと FlushAck の返却（FlushAck・IO-2）は
-//! まだなく（TASK-15.2.2・#824）、`writeback` は `Flush` 受信時に滞留分を
-//! 書き込んだ後 `Unimplemented` で処理を終える。受信フレームの長さ・件数を
+//! `syncfs(2)` FFI ラッパー（`sys` モジュール・非公開。TASK-15.2.1・#823）は
+//! `writeback` の `Flush` 受信時に [`writeback::BatchSink::persist`] 経由で
+//! 呼ばれ、成功したときだけ FlushAck を返す（IO-2・TASK-15.2.2・#824。
+//! 失敗・タイムアウト・Linux 5.8 未満・非 Linux は FlushAck なしで終了。対応可否は
+//! [`barrier::persist_support`] で判定する。非 Linux の代替は TASK-15.3・#88）。受信フレームの長さ・件数を
 //! 本体バッファ確保前に上限検証する受理判定ゲート
 //! （[`recv_limits::ReceiveLimits`]・TASK-13.4・#796）も持つ。UDS 受信ループの
 //! 受付ループ（accept → 次の accept）・同時接続数の上限は後続 sub-issue が担う。
@@ -72,7 +73,10 @@ mod sys;
 pub mod transport;
 pub mod writeback;
 
-pub use barrier::{AckReceipt, FlushAck, FlushBarrier, WriteAck};
+pub use barrier::{
+    AckReceipt, FlushAck, FlushBarrier, MaxConcurrentPersist, PersistSupport, WriteAck,
+    max_concurrent_persist, persist_support, set_max_concurrent_persist,
+};
 pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
 };
@@ -112,6 +116,6 @@ pub use transport::{
     WireFrame,
 };
 pub use writeback::{
-    AppendFileSink, BatchSink, SinkWriteReport, WritebackReport, WritebackStats, WritebackTimeouts,
-    serve_connection,
+    AppendFileSink, BatchSink, SinkPersistReport, SinkWriteReport, WritebackReport, WritebackStats,
+    WritebackTimeouts, serve_connection,
 };

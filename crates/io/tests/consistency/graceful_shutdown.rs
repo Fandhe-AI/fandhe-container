@@ -488,6 +488,10 @@ fn io4_graceful_shutdown_shared_file_all_clients_flush_concurrently() {
 
     let shared = SharedSink::new(create_sink(&path));
     let barrier = Arc::new(Barrier::new(CLIENT_COUNTS.len() + 1));
+    // 全クライアントが write 送信を終えた時点で揃える 2 つ目の同期点。
+    // これがないと 1 接続が Flush まで完走してから次の接続が始まり得て、
+    // Flush の並行実行（狙った競合）を通らずに成功する（REPAIR-12）。
+    let pre_flush_barrier = Arc::new(Barrier::new(CLIENT_COUNTS.len() + 1));
 
     let mut server_handles = Vec::new();
     let mut client_handles = Vec::new();
@@ -501,6 +505,7 @@ fn io4_graceful_shutdown_shared_file_all_clients_flush_concurrently() {
         ));
 
         let barrier = Arc::clone(&barrier);
+        let pre_flush_barrier = Arc::clone(&pre_flush_barrier);
         let client_id = i as u16;
         client_handles.push(std::thread::spawn(move || {
             let mut client = PipelineClient::new(
@@ -514,6 +519,8 @@ fn io4_graceful_shutdown_shared_file_all_clients_flush_concurrently() {
                 .map(|seq| body_for(client_id, seq, BODY_LEN))
                 .collect();
             send_all_writes(&mut client, &bodies, timeout());
+            // 全クライアントの write 送信完了を待ってから Flush を送る。
+            barrier_wait_within(&pre_flush_barrier, join_deadline());
             client
                 .send(FrameKind::Flush, &[], timeout())
                 .expect("flush send must succeed against an unbounded in-memory transport");
@@ -522,6 +529,7 @@ fn io4_graceful_shutdown_shared_file_all_clients_flush_concurrently() {
         }));
     }
     barrier_wait_within(&barrier, join_deadline());
+    barrier_wait_within(&pre_flush_barrier, join_deadline());
 
     for handle in client_handles {
         join_within(handle, join_deadline());

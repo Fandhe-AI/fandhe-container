@@ -797,8 +797,8 @@ impl CoalescedEntry {
         }
     }
 
-    /// 同じキーの集約値を合算する。`newer` のほうが後に集約された分で、メッセージは
-    /// そちらを優先する（期限切れで表へ戻す経路で使う）。
+    /// 同じキーの集約値（`older`: 期限切れで表へ戻す、先に集約された分）を合算する。
+    /// メッセージは後に集約された `self` のものを優先する。
     fn merge_older(&mut self, older: CoalescedEntry) {
         self.count = self.count.saturating_add(older.count);
         self.latency_max = self.latency_max.max(older.latency_max);
@@ -4678,6 +4678,10 @@ mod shared_observer_tests {
     /// `message` は最後に集約した操作のもの。集約行はキュー本体の行より先に並ぶ。
     #[test]
     fn repair4_json_lines_observer_renders_coalesced_events() {
+        // 既定の行数上限（1024 行）は MAX_PENDING_EVENTS と同じで、1 回の排出
+        // （サマリ 1 + 集約 ≤ 128 + キュー 1024 件）ではフック自身の上限（新しい行を捨てて
+        // dropped_count を増やす #820 の方針）に達する。ここでは行の形を照合するため、
+        // 上限を広げてフック側の破棄が起きないようにする（dropped == 0 で確認）。
         let hook = JsonLinesServerObserver::with_capacity(MAX_SEND_LOG_CAPACITY)
             .expect("capacity within bounds");
         let observer = SharedObserver::new(hook);

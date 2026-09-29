@@ -60,12 +60,13 @@
 //! [`harness::timeout`]。REPAIR-5）。
 
 use std::path::Path;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::time::Duration;
 
 use fandhe_container_io::{
-    AppendFileSink, BatchConfig, FrameKind, InFlightLimit, IoErrorCode, NoopSendObserver,
-    PipelineClient, WritebackReport, WritebackTimeouts,
+    AppendFileSink, BatchConfig, Frame, FrameKind, FrameReceiver, FrameSender, InFlightLimit,
+    IoError, IoErrorCode, IoTimeout, NoopSendObserver, PipelineClient, WritebackReport,
+    WritebackTimeouts, serve_connection,
 };
 
 use super::harness::{
@@ -215,6 +216,90 @@ impl Session {
     fn abort(self) -> WritebackReport {
         drop(self.client);
         join_within(self.server, join_deadline())
+    }
+}
+
+/// サーバー側の [`DuplexEnd`] を包み、`recv_frame` が呼ばれるたびにその通算
+/// 回数を通知するラッパー（G5 の同期点。`sleep` を使わずに「サーバーがここまでの
+/// フレームを取り込み終えた」ことを確認するために使う）。
+///
+/// `serve_connection` は 1 フレームを `recv_frame` で受け取り、`BatchBuffer` へ
+/// 積む・ACK を返すまでを終えてから次の `recv_frame` を呼ぶ。したがって
+/// `n + 1` 回目の `recv_frame` 呼び出しの通知は「先頭 `n` フレームの処理完了」
+/// を意味する（`send_writes` の mpsc 送信完了ではサーバーの取り込みを保証
+/// できない。codex レビュー #82 PRRT_kwDOUq78ts6m6sCi・PRRT_kwDOUq78ts6m60UW
+/// 指摘への対応。REPAIR-12）。
+struct RecvCountingEnd {
+    inner: DuplexEnd,
+    calls: u64,
+    notify: mpsc::Sender<u64>,
+}
+
+impl FrameSender for RecvCountingEnd {
+    type Frame = Frame;
+
+    fn send_frame(&mut self, frame: &Frame, timeout: IoTimeout) -> Result<(), IoError> {
+        self.inner.send_frame(frame, timeout)
+    }
+}
+
+impl FrameReceiver for RecvCountingEnd {
+    type Frame = Frame;
+
+    fn recv_frame(&mut self, timeout: IoTimeout) -> Result<Frame, IoError> {
+        self.calls += 1;
+        // 受信側（テスト）が既に drop されていても、サーバーの動作は変えない。
+        let _ = self.notify.send(self.calls);
+        self.inner.recv_frame(timeout)
+    }
+}
+
+/// [`Session::start`] と同じだが、サーバーの `recv_frame` 呼び出し回数を通知する
+/// チャネルも返す（[`wait_until_server_handled`] で同期点として使う）。
+fn start_observed_session(
+    sink: AppendFileSink,
+    config: BatchConfig,
+    in_flight: usize,
+) -> (Session, mpsc::Receiver<u64>) {
+    let (client_end, server_end) = harness::duplex();
+    let (notify, calls) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut conn = RecvCountingEnd {
+            inner: server_end,
+            calls: 0,
+            notify,
+        };
+        let mut sink = sink;
+        serve_connection(&mut conn, config, &mut sink, writeback_timeouts())
+    });
+    let client = PipelineClient::new(
+        client_end,
+        InFlightLimit::new(in_flight).expect("valid in-flight limit"),
+        NoopSendObserver,
+    );
+    (
+        Session {
+            client,
+            server,
+            unacked: 0,
+        },
+        calls,
+    )
+}
+
+/// サーバーが先頭 `handled` フレームの処理を終えるまで（= `handled + 1` 回目の
+/// `recv_frame` 呼び出しの通知が来るまで）期限付きで待つ。期限切れは panic
+/// （REPAIR-5）。
+fn wait_until_server_handled(calls: &mpsc::Receiver<u64>, handled: u64) {
+    let deadline = std::time::Instant::now() + join_deadline();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let n = calls
+            .recv_timeout(remaining)
+            .expect("server must reach the next recv_frame within the deadline");
+        if n > handled {
+            return;
+        }
     }
 }
 
@@ -516,13 +601,22 @@ fn io4_graceful_shutdown_one_connection_closed_while_other_stays_live() {
     // が無い状態だと、A の close が B の未 ACK 分に干渉する回帰
     // （誤って書き込む・破棄する等）を検出できないため）。
     let bodies_b1: Vec<Vec<u8>> = (0..4u32).map(|seq| body_for(1, seq, BODY_LEN)).collect();
-    let mut session_b = Session::start(create_sink(&b_path), config, 10);
+    let (mut session_b, b_recv_calls) = start_observed_session(create_sink(&b_path), config, 10);
     session_b.write_and_ack(&bodies_b1);
 
     let bodies_b_pending: Vec<Vec<u8>> = (0..2u32)
         .map(|seq| body_for(1, 4 + seq, BODY_LEN))
         .collect();
     session_b.send_writes(&bodies_b_pending);
+
+    // 同期点: B のサーバーが保留 2 件を含む先頭 6 フレーム（ACK 済み 4 + 保留
+    // 2）を取り込み終える（7 回目の recv_frame に入る）まで待つ。`send_writes`
+    // は mpsc への送信完了しか保証しないため、この待ち合わせが無いと A の
+    // close 時点で B の保留分が未取り込みのままになり得る。
+    wait_until_server_handled(
+        &b_recv_calls,
+        (bodies_b1.len() + bodies_b_pending.len()) as u64,
+    );
 
     // B の session はまだ live（close していない）。未 ACK の 2 件を抱えた
     // 状態で fresh open した内容を基準値として確保しておく（BATCH_SIZE 未満

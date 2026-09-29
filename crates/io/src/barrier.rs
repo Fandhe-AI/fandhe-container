@@ -510,7 +510,14 @@ mod tests {
     #[test]
     fn io2_persist_file_system_ok_on_linux() {
         let file = tempfile_in_target();
-        assert!(persist_file_system(&file, ms(5000)).is_ok());
+        // syncfs はファイルシステム全体を同期するため、並列テストや共有 runner の
+        // 書き込み負荷で数秒かかりうる。許容上限（MAX_IO_TIMEOUT）まで待ち、
+        // 失敗時は原因（Timeout / ResourceExhausted 等）を出力して診断可能にする。
+        let result = persist_file_system(
+            &file,
+            IoTimeout::new(crate::MAX_IO_TIMEOUT).expect("valid timeout"),
+        );
+        assert!(result.is_ok(), "persist_file_system failed: {result:?}");
     }
 
     #[cfg(target_os = "linux")]

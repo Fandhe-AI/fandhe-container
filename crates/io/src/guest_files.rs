@@ -33,13 +33,13 @@
 //!   `O_CREAT|O_EXCL|O_NOFOLLOW` で作る（[`crate::sys::create_file_beneath`]）。
 //!   パスを再解決しないため、祖先の symlink すり替え（TOCTOU）でも共有ルート外へ
 //!   は出られない。
-//! - Windows は祖先の TOCTOU（確認後の junction / symlink すり替え）を防ぐ
-//!   ルート相対ハンドル作成が未実装のため、祖先を持つパス（`a/b` 等）の作成を
-//!   `Unimplemented` で拒否する（fail-closed）。ルート直下の単一名だけは許す
-//!   （`NtCreateFile` のルート相対ハンドル作成への置き換えは後続。REPAIR-3）。
+//! - Windows は `NtCreateFile` のルート相対ハンドル作成が未実装のため、祖先を
+//!   1 階層ずつ「作成 → reparse point を辿らず `FILE_SHARE_DELETE` なしで開いて
+//!   保持 → 通常ディレクトリか確認」で固定し、固定済みの祖先の配下へパス結合で
+//!   葉を作る（保持ハンドルが改名・削除・差し替えを OS に拒否させる。REPAIR-3）。
 //! - 既存項目の取り込み: 索引は API 経由の登録だけでなく、作成のたびに祖先
 //!   ディレクトリの実在エントリを毎回読み直して取り込む（別プロセスが後から
-//!   足した項目も検出する。走査中の読み取り失敗は `Internal` で作成を中止する）。共有
+//!   足した項目も検出する。走査中の読み取り失敗や、既存項目どうしの大文字小文字衝突は作成を中止する）。共有
 //!   ルートに元からある `Foo` があれば `foo/bar` は衝突になる。作成が祖先の
 //!   作成後に失敗しても、残った祖先は次回の走査で取り込まれる。走査は名前の
 //!   索引化だけに使い、書き込み先の解決には使わない（非 UTF-8 名は取り込めない）。
@@ -222,17 +222,15 @@ impl GuestFileCreator {
     /// 別プロセスが共有ルートへ後から追加した項目も検出するため、走査済みの
     /// 印は持たない。走査は保持したルートのハンドル起点で行い（Linux / macOS は
     /// 各階層もハンドル相対で開く）、索引化専用で作成先の解決には使わない。
-    /// 件数上限超過は `ResourceExhausted`、読み取りの失敗は `Internal`
+    /// 件数上限超過は `ResourceExhausted`、読み取りの失敗は `Internal`、
+    /// 既存項目どうしの大文字小文字衝突は `AlreadyExists`
     /// （IO-5 の検査を完了できないまま作成へ進まない。fail-closed）。
     fn seed_existing(&self, state: &mut IndexState, ancestors: &[&str]) -> Result<(), IoError> {
         let mut cursor = ScanCursor::root(&self.root_dir, &self.root)?;
         let mut prefix = String::new();
         for level in 0..=ancestors.len() {
-            let entries = cursor.read_entries()?;
-            for entry in entries {
-                let entry =
-                    entry.map_err(|err| internal("failed to scan guest directory", err.kind()))?;
-                let name = entry.file_name();
+            let entries = cursor.read_entries(self.max_tracked)?;
+            for name in entries {
                 let Some(name) = name.to_str() else { continue };
                 if state.set.len() >= self.max_tracked {
                     return Err(IoError::new(
@@ -240,8 +238,16 @@ impl GuestFileCreator {
                         "too many tracked guest paths",
                     ));
                 }
-                // 元から衝突している項目や不正な名前は取り込めないだけで無視する。
-                let _ = state.set.try_insert(&format!("{prefix}{name}"));
+                match state.set.try_insert(&format!("{prefix}{name}")) {
+                    Ok(()) => {}
+                    // 形式不正の名前（ホストで表現できない等）は索引化できないだけで
+                    // 無視する。
+                    Err(err) if err.code() == IoErrorCode::InvalidArgument => {}
+                    // 共有ルートに元から大文字小文字違いの項目が併存している等、
+                    // 衝突検出を完了できない状態は走査順で索引が変わるため、
+                    // 握りつぶさず作成を中止する（fail-closed。IO-5）。
+                    Err(err) => return Err(err),
+                }
             }
             let Some(component) = ancestors.get(level) else {
                 break;
@@ -294,10 +300,17 @@ impl ScanCursor {
             .map_err(|err| internal("failed to scan guest directory", err.kind()))
     }
 
-    fn read_entries(&self) -> Result<std::fs::ReadDir, IoError> {
-        // fd が指す inode 固定のパス表現で読む（パス文字列の再解決を避ける）。
-        std::fs::read_dir(crate::sys::dir_fd_path(&self.0))
-            .map_err(|err| internal("failed to scan guest directory", err.kind()))
+    /// ディレクトリハンドルから直接（`fdopendir`）エントリ名を読む。パスを
+    /// 再解決しないため macOS でも動き、ルートの差し替えにも影響されない。
+    fn read_entries(&self, max_entries: usize) -> Result<Vec<std::ffi::OsString>, IoError> {
+        use crate::sys::{ReadDirError, read_dir_names};
+        read_dir_names(&self.0, max_entries).map_err(|err| match err {
+            ReadDirError::TooMany => IoError::new(
+                IoErrorCode::ResourceExhausted,
+                "too many tracked guest paths",
+            ),
+            ReadDirError::Io(kind) => internal("failed to scan guest directory", kind),
+        })
     }
 
     fn descend(&self, name: &str) -> Result<Option<Self>, IoError> {
@@ -326,9 +339,22 @@ impl ScanCursor {
         Ok(Self(root.to_path_buf()))
     }
 
-    fn read_entries(&self) -> Result<std::fs::ReadDir, IoError> {
-        std::fs::read_dir(&self.0)
-            .map_err(|err| internal("failed to scan guest directory", err.kind()))
+    fn read_entries(&self, max_entries: usize) -> Result<Vec<std::ffi::OsString>, IoError> {
+        let mut names = Vec::new();
+        let dir = std::fs::read_dir(&self.0)
+            .map_err(|err| internal("failed to scan guest directory", err.kind()))?;
+        for entry in dir {
+            let entry =
+                entry.map_err(|err| internal("failed to scan guest directory", err.kind()))?;
+            if names.len() >= max_entries {
+                return Err(IoError::new(
+                    IoErrorCode::ResourceExhausted,
+                    "too many tracked guest paths",
+                ));
+            }
+            names.push(entry.file_name());
+        }
+        Ok(names)
     }
 
     fn descend(&self, name: &str) -> Result<Option<Self>, IoError> {
@@ -375,10 +401,13 @@ fn create_beneath(
     })
 }
 
-/// Windows 等のフォールバック。祖先の TOCTOU を防ぐルート相対ハンドル作成
-/// （`NtCreateFile`）は未実装のため、祖先を持つパスは拒否する（fail-closed）。
-/// ルート直下の単一名は、保持中のルートハンドルが改名・削除を拒否している
-/// （`FILE_SHARE_DELETE` なし）ためパス結合で作成する（IO-5・REPAIR-3）。
+/// Windows 等のフォールバック。ルート直下から 1 階層ずつ、作成（`create_dir`）→
+/// 「reparse point を辿らず（`FILE_FLAG_OPEN_REPARSE_POINT`）・`FILE_SHARE_DELETE`
+/// なしで」ディレクトリを開いて保持→ reparse point / 非ディレクトリでないことを
+/// 確認、の順で祖先を固定する。保持中のハンドルは改名・削除・差し替えを OS が
+/// 拒否するため、以降のパス結合による解決は固定済みの祖先の配下に留まる
+/// （ルートハンドルと同じ方式。TOCTOU 防止。IO-5・REPAIR-3）。`NtCreateFile` の
+/// ルート相対ハンドル作成への置き換えは後続。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn create_beneath(
     _root_dir: &File,
@@ -386,23 +415,60 @@ fn create_beneath(
     ancestors: &[&str],
     leaf: &str,
 ) -> Result<File, CreateError> {
-    if !ancestors.is_empty() {
-        return Err(CreateError::Other(IoError::new(
-            IoErrorCode::Unimplemented,
-            "creating files below a subdirectory is not supported on this platform yet",
-        )));
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+    const FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE（FILE_SHARE_DELETE なし）
+    const SHARE: u32 = 0x1 | 0x2;
+    // FILE_ATTRIBUTE_REPARSE_POINT
+    const REPARSE: u32 = 0x400;
+
+    let mut path = root.to_path_buf();
+    // 固定済みの祖先ハンドル（葉の作成が終わるまで保持する）。
+    let mut pinned: Vec<File> = Vec::with_capacity(ancestors.len());
+    for name in ancestors {
+        path.push(name);
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(CreateError::Other(internal(
+                    "failed to create guest file",
+                    err.kind(),
+                )));
+            }
+        }
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(FLAGS)
+            .share_mode(SHARE)
+            .open(&path)
+            .map_err(|err| {
+                CreateError::Other(internal("failed to create guest file", err.kind()))
+            })?;
+        let meta = dir.metadata().map_err(|err| {
+            CreateError::Other(internal("failed to create guest file", err.kind()))
+        })?;
+        if !meta.is_dir() || meta.file_attributes() & REPARSE != 0 {
+            return Err(CreateError::Other(invalid(
+                "guest path ancestor is not a directory",
+            )));
+        }
+        pinned.push(dir);
     }
-    OpenOptions::new()
+    let result = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(root.join(leaf))
+        .open(path.join(leaf))
         .map_err(|err| {
             if err.kind() == ErrorKind::AlreadyExists {
                 CreateError::Exists
             } else {
                 CreateError::Other(internal("failed to create guest file", err.kind()))
             }
-        })
+        });
+    drop(pinned);
+    result
 }
 
 #[cfg(test)]
@@ -586,13 +652,14 @@ mod tests {
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn io5_fallback_rejects_paths_with_ancestors() {
+    fn io5_fallback_creates_paths_with_ancestors() {
         let t = Tmp::new();
         let c = GuestFileCreator::new(t.0.clone()).expect("creator");
-        let err = c.create_file("a/b").err().expect("must reject");
-        assert_eq!(err.code(), IoErrorCode::Unimplemented);
-        assert_eq!(entries(&t.0), 0);
+        c.create_file("a/b/c").expect("nested create");
+        assert!(t.0.join("a").join("b").join("c").is_file());
         c.create_file("top").expect("root-level file is allowed");
+        let err = c.create_file("A/x").err().expect("must collide");
+        assert!(err.message().starts_with("case-insensitive path collision"));
     }
 
     /// 別プロセスが作成後に共有ルートへ足した項目とも衝突を検出する。
@@ -638,6 +705,21 @@ mod tests {
         c.create_file("sub/f").expect("create");
         assert_eq!(entries(&outside.0), 0);
         assert!(moved.join("sub").join("f").exists());
+    }
+
+    /// 共有ルートに大文字小文字違いが元から併存する場合は、走査順に依らず作成を
+    /// 中止する（IO-5。ケース区別の FS でのみ作れるため Linux 限定）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io5_preexisting_colliding_entries_abort_create() {
+        let t = Tmp::new();
+        std::fs::write(t.0.join("Foo"), b"x").expect("Foo");
+        std::fs::write(t.0.join("foo"), b"x").expect("foo");
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let err = c.create_file("unrelated").err().expect("must abort");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(err.message().starts_with("case-insensitive path collision"));
+        assert_eq!(entries(&t.0), 2);
     }
 
     #[test]

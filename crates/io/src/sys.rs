@@ -602,15 +602,153 @@ pub(crate) fn open_dir_beneath(
     Err(BeneathError::Io(io::ErrorKind::Unsupported))
 }
 
-/// 開いているディレクトリハンドルを `read_dir` へ渡せるパスで表す
-/// （Linux は `/proc/self/fd/N`、macOS は `/dev/fd/N`）。パス解決は fd が指す
-/// inode に固定されるため、走査もハンドル起点になる。
-pub(crate) fn dir_fd_path(dir: &std::fs::File) -> std::path::PathBuf {
-    #[cfg(target_os = "linux")]
-    let base = "/proc/self/fd";
-    #[cfg(not(target_os = "linux"))]
-    let base = "/dev/fd";
-    std::path::Path::new(base).join(dir.as_raw_fd().to_string())
+/// [`read_dir_names`] の失敗種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadDirError {
+    /// エントリ数が上限を超えた（無制限確保による DoS の防止）。
+    TooMany,
+    /// OS エラー（種別のみ。パスや説明文は載せない）。
+    Io(io::ErrorKind),
+}
+
+/// `dirent` 内で `d_name` が始まるバイト位置。Linux（glibc・musl）は
+/// `d_ino(8) d_off(8) d_reclen(2) d_type(1)` の直後、macOS（64 ビット inode 版）は
+/// `d_ino(8) d_seekoff(8) d_reclen(2) d_namlen(2) d_type(1)` の直後。
+#[cfg(target_os = "linux")]
+const DIRENT_NAME_OFFSET: usize = 19;
+#[cfg(target_os = "macos")]
+const DIRENT_NAME_OFFSET: usize = 21;
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+mod dir_raw {
+    use core::ffi::c_void;
+
+    // SAFETY（宣言そのものの妥当性）: POSIX の `DIR *fdopendir(int fd)`・
+    // `struct dirent *readdir(DIR *)`・`void rewinddir(DIR *)`・
+    // `int closedir(DIR *)`。DIR は不透明ポインタ（`*mut c_void`）、dirent は
+    // 先頭バイトへのポインタとして扱い、`d_name` だけを固定オフセットで読む
+    // （`super::DIRENT_NAME_OFFSET`）。macOS の x86_64 は 64 ビット inode 版の
+    // シンボル（`$INODE64`）を明示する。`__errno_location` / `__error` は
+    // スレッドローカルな errno へのポインタを返す。
+    unsafe extern "C" {
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "fdopendir$INODE64"
+        )]
+        pub(super) fn fdopendir(fd: i32) -> *mut c_void;
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "readdir$INODE64"
+        )]
+        pub(super) fn readdir(dir: *mut c_void) -> *mut u8;
+        pub(super) fn rewinddir(dir: *mut c_void);
+        pub(super) fn closedir(dir: *mut c_void) -> i32;
+        #[cfg(target_os = "linux")]
+        pub(super) fn __errno_location() -> *mut i32;
+        #[cfg(target_os = "macos")]
+        pub(super) fn __error() -> *mut i32;
+    }
+}
+
+/// ディレクトリハンドル `dir` 直下のエントリ名（`.`・`..` を除く）を、パスを
+/// 再解決せずに `fdopendir`/`readdir` で列挙する（IO-5・TASK-19.2）。
+///
+/// `dir` は dup して使い（元の fd は閉じられない）、dup 先は元の fd と読み取り
+/// 位置を共有するため `rewinddir` で先頭へ戻す。名前は生のバイト列（`OsString`）で
+/// 返し、非 UTF-8 の扱いは呼び出し側が決める。件数が `max_entries` を超えたら
+/// `TooMany`。対応外アーキテクチャでは `Unsupported`（fail-closed）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+pub(crate) fn read_dir_names(
+    dir: &std::fs::File,
+    max_entries: usize,
+) -> Result<Vec<std::ffi::OsString>, ReadDirError> {
+    use std::ffi::CStr;
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStringExt;
+
+    fn set_errno_zero() {
+        // SAFETY: スレッドローカルな errno へのポインタを得て 0 を書くだけ。
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *dir_raw::__errno_location() = 0;
+        }
+        // SAFETY: 同上（macOS）。
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *dir_raw::__error() = 0;
+        }
+    }
+
+    let raw = dir
+        .try_clone()
+        .map_err(|err| ReadDirError::Io(err.kind()))?
+        .into_raw_fd();
+    // SAFETY: `raw` は直前に dup した有効な fd。成功すれば所有権は DIR へ移り
+    // closedir で閉じられる。
+    let handle = unsafe { dir_raw::fdopendir(raw) };
+    if handle.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: fdopendir が失敗したとき fd の所有権は移らないため、ここで閉じる。
+        drop(unsafe { OwnedFd::from_raw_fd(raw) });
+        return Err(ReadDirError::Io(err.kind()));
+    }
+    // SAFETY: `handle` は有効な DIR*。読み取り位置を先頭へ戻す。
+    unsafe { dir_raw::rewinddir(handle) };
+
+    let mut names = Vec::new();
+    let result = loop {
+        set_errno_zero();
+        // SAFETY: `handle` は closedir 前の有効な DIR*。返る dirent は次の
+        // readdir / closedir まで有効で、その前に名前をコピーする。
+        let entry = unsafe { dir_raw::readdir(handle) };
+        if entry.is_null() {
+            let err = io::Error::last_os_error();
+            break match err.raw_os_error() {
+                Some(0) | None => Ok(()),
+                Some(_) => Err(ReadDirError::Io(err.kind())),
+            };
+        }
+        // SAFETY: dirent の `d_name` は固定オフセットから始まる NUL 終端文字列で、
+        // 構造体の範囲内に収まる。
+        let name = unsafe { CStr::from_ptr(entry.add(DIRENT_NAME_OFFSET).cast()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if names.len() >= max_entries {
+            break Err(ReadDirError::TooMany);
+        }
+        names.push(std::ffi::OsString::from_vec(name.to_vec()));
+    };
+    // SAFETY: `handle` は有効な DIR* で以降使わない。dup した fd もここで閉じられる。
+    unsafe { dir_raw::closedir(handle) };
+    result.map(|()| names)
+}
+
+/// 対応外アーキテクチャ向け（fail-closed）。
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+pub(crate) fn read_dir_names(
+    _dir: &std::fs::File,
+    _max_entries: usize,
+) -> Result<Vec<std::ffi::OsString>, ReadDirError> {
+    Err(ReadDirError::Io(io::ErrorKind::Unsupported))
 }
 
 #[cfg(test)]

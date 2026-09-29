@@ -41,9 +41,10 @@
 //!   は直近の成功以降に書き込みがなければ syncfs を再発行しない（書き込みを
 //!   伴わない連続 FLUSH の増幅対策）。書き込みを挟む FLUSH のレート制限は後続課題。
 //! - Linux 5.8 未満のカーネルは `syncfs(2)` が書き戻しエラーを報告しないため、
-//!   `/proc/sys/kernel/osrelease` で版数を確認し、5.8 未満・判定不能なら
-//!   `Unimplemented` で拒否して FlushAck を返さない（fail-closed）。ディストロが
-//!   修正を旧カーネルへバックポートしていても拒否する（安全側）。
+//!   [`persist_support`] が `/proc/sys/kernel/osrelease` で版数を確認し、5.8 未満・
+//!   判定不能なら `Unimplemented` で拒否して FlushAck を返さない（fail-closed）。
+//!   ディストロが修正を旧カーネルへバックポートしていても拒否する（安全側）。
+//!   FlushAck が返る環境かは利用者・結合試験も [`persist_support`] で同じ基準で知る。
 //! - 検証するのは順序と契約までで、電源断・SIGKILL への耐性は検証しない
 //!   （TASK-18）。
 
@@ -387,20 +388,98 @@ impl PersistFailure {
     }
 }
 
+/// 実行環境が FLUSH の永続化（FlushAck の返却）に対応しているかの判定結果
+/// （IO-2・IO-3・TASK-15.2.2・#824）。
+///
+/// サーバー側の [`crate::writeback::AppendFileSink`] は [`persist_support`] が
+/// [`PersistSupport::Supported`] 以外を返す環境では `persist` を
+/// [`IoErrorCode::Unimplemented`] で拒否し、FlushAck を返さない（fail-closed）。
+/// 利用者・結合試験はこの判定で「FlushAck が返る環境か」を production と同じ
+/// 基準で知る（判定を 2 か所に持たないため）。非対応の理由を区別できるよう
+/// 列挙型で返す（将来の代替フラッシュ〔TASK-15.3・#88〕で値を足せるよう
+/// `#[non_exhaustive]`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PersistSupport {
+    /// Linux 5.8 以上。`syncfs(2)` が書き戻しエラーを報告するため、永続化の
+    /// 成否を確認してから FlushAck を返せる。
+    Supported,
+    /// Linux 5.8 未満、またはカーネル版数を判定できない。`syncfs(2)` が書き戻し
+    /// 失敗を隠して 0 を返しうるため拒否する（ディストロのバックポートも安全側で拒否）。
+    KernelTooOld,
+    /// Linux 以外の OS。代替フラッシュが未実装（TASK-15.3・#88）。
+    UnsupportedOs,
+}
+
+impl PersistSupport {
+    /// FlushAck を返せる（永続化に対応する）環境か。
+    pub fn is_supported(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+}
+
+/// 実行中の環境が FLUSH の永続化に対応しているかを返す（IO-2・TASK-15.2.2）。
+///
+/// Linux では `/proc/sys/kernel/osrelease` を読み、5.8 以上なら
+/// [`PersistSupport::Supported`]、5.8 未満・読み取り失敗・解釈不能なら
+/// [`PersistSupport::KernelTooOld`]（fail-closed）。結果はプロセス内で 1 回だけ
+/// 判定してキャッシュする。Linux 以外は [`PersistSupport::UnsupportedOs`]。
+pub fn persist_support() -> PersistSupport {
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::OnceLock;
+        static SUPPORT: OnceLock<PersistSupport> = OnceLock::new();
+        *SUPPORT.get_or_init(|| {
+            let supported = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .map(|r| release_supports_syncfs_errors(&r))
+                .unwrap_or(false);
+            if supported {
+                PersistSupport::Supported
+            } else {
+                PersistSupport::KernelTooOld
+            }
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        PersistSupport::UnsupportedOs
+    }
+}
+
 /// `file` が属するファイルシステムを永続化し、所要時間を返す（IO-2・
 /// TASK-15.2.2・#824）。
 ///
-/// [`crate::writeback::AppendFileSink::persist`] から呼ばれる。Linux では
+/// [`crate::writeback::AppendFileSink`] の `persist` から、実行環境の判定
+/// （[`persist_support`]）を渡して呼ばれる。[`PersistSupport::Supported`] なら
 /// `file` を dup した fd に対し `crate::sys::syncfs` を helper スレッドで 1 回
 /// だけ実行する。失敗しても再試行しない（errseq は 1 回しか報告しないため。
-/// 呼び出し側の sink がポイズンする）。macOS / Windows は代替フラッシュが
-/// なく [`IoErrorCode::Unimplemented`]（TASK-15.3・#88）。
-#[cfg(target_os = "linux")]
+/// 呼び出し側の sink がポイズンする）。それ以外は syscall を発行せず
+/// [`IoErrorCode::Unimplemented`]（`issued == false`。sink はポイズンしない）。
+///
+/// 判定を引数で受けるのは、5.8 以上のホストでも非対応経路（旧カーネル・非 Linux）
+/// を単体テストで決定的に照合するため。
 pub(crate) fn persist_file_system(
+    support: PersistSupport,
     file: &File,
     timeout: IoTimeout,
 ) -> Result<Duration, PersistFailure> {
-    ensure_syncfs_reports_errors().map_err(PersistFailure::not_issued)?;
+    match support {
+        PersistSupport::Supported => sync_file_system(file, timeout),
+        PersistSupport::KernelTooOld => Err(PersistFailure::not_issued(IoError::new(
+            IoErrorCode::Unimplemented,
+            "kernel older than 5.8 (or unknown) cannot report syncfs write-back errors; refusing to send FlushAck",
+        ))),
+        PersistSupport::UnsupportedOs => Err(PersistFailure::not_issued(IoError::new(
+            IoErrorCode::Unimplemented,
+            "persist is not implemented on this OS (TASK-15.3, #88)",
+        ))),
+    }
+}
+
+/// Linux の永続化本体: dup した fd に `syncfs(2)` をタイムアウト付きで 1 回だけ
+/// 発行する（REPAIR-5）。fd 複製の失敗は発行前（`issued == false`）。
+#[cfg(target_os = "linux")]
+fn sync_file_system(file: &File, timeout: IoTimeout) -> Result<Duration, PersistFailure> {
     let dup = file.try_clone().map_err(|err| {
         PersistFailure::not_issued(IoError::new(
             IoErrorCode::Internal,
@@ -418,6 +497,18 @@ pub(crate) fn persist_file_system(
         error,
         issued: dispatched,
     })
+}
+
+/// 非 Linux 版: 代替フラッシュ未実装（TASK-15.3・#88）。[`persist_support`] が
+/// [`PersistSupport::Supported`] を返さないため通常は到達しないが、判定を
+/// 注入された場合も syscall を発行せず fail-closed で拒否する。
+#[cfg(not(target_os = "linux"))]
+fn sync_file_system(_file: &File, _timeout: IoTimeout) -> Result<Duration, PersistFailure> {
+    let _ = &PERSIST_LIMITER;
+    Err(PersistFailure::not_issued(IoError::new(
+        IoErrorCode::Unimplemented,
+        "persist is not implemented on this OS (TASK-15.3, #88)",
+    )))
 }
 
 /// `syncfs(2)` が書き戻し失敗を報告するカーネルの最小版数（major, minor）。
@@ -441,41 +532,6 @@ fn parse_kernel_release(release: &str) -> Option<(u32, u32)> {
 #[cfg(any(target_os = "linux", test))]
 fn release_supports_syncfs_errors(release: &str) -> bool {
     parse_kernel_release(release).is_some_and(|v| v >= MIN_SYNCFS_ERROR_REPORTING)
-}
-
-/// 実行中カーネルが 5.8 以上であることを確認する（結果はプロセス内で 1 回だけ
-/// 判定してキャッシュ）。満たさない・判定できない場合は `Unimplemented`（IO-2・IO-3。
-/// FlushAck を返さず拒否する）。
-#[cfg(target_os = "linux")]
-fn ensure_syncfs_reports_errors() -> Result<(), IoError> {
-    use std::sync::OnceLock;
-    static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    let ok = *SUPPORTED.get_or_init(|| {
-        std::fs::read_to_string("/proc/sys/kernel/osrelease")
-            .map(|r| release_supports_syncfs_errors(&r))
-            .unwrap_or(false)
-    });
-    if ok {
-        Ok(())
-    } else {
-        Err(IoError::new(
-            IoErrorCode::Unimplemented,
-            "kernel older than 5.8 (or unknown) cannot report syncfs write-back errors; refusing to send FlushAck",
-        ))
-    }
-}
-
-/// 非 Linux 版: 代替フラッシュ未実装のため FlushAck を出せない（fail-closed）。
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn persist_file_system(
-    _file: &File,
-    _timeout: IoTimeout,
-) -> Result<Duration, PersistFailure> {
-    let _ = &PERSIST_LIMITER;
-    Err(PersistFailure::not_issued(IoError::new(
-        IoErrorCode::Unimplemented,
-        "persist is not implemented on this OS (TASK-15.3, #88)",
-    )))
 }
 
 #[cfg(test)]
@@ -568,19 +624,69 @@ mod tests {
         // syncfs はファイルシステム全体を同期するため、並列テストや共有 runner の
         // 書き込み負荷で数秒かかりうる。許容上限（MAX_IO_TIMEOUT）まで待ち、
         // 失敗時は原因（Timeout / ResourceExhausted 等）を出力して診断可能にする。
+        let support = persist_support();
         let result = persist_file_system(
+            support,
             &file,
             IoTimeout::new(crate::MAX_IO_TIMEOUT).expect("valid timeout"),
         );
-        // 版数依存を避け、実行中カーネルの版数ゲートに応じた期待値で照合する
-        // （5.8 未満は fail-closed の `Unimplemented`。ゲート自体は別テストで固定）。
-        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-        if release_supports_syncfs_errors(&release) {
-            assert!(result.is_ok(), "persist_file_system failed: {result:?}");
-        } else {
-            let failure = result.expect_err("pre-5.8 kernel must be rejected");
-            assert_eq!(failure.error.code(), IoErrorCode::Unimplemented);
-            assert!(!failure.issued);
+        // 版数依存を避け、production と同じ判定（`persist_support`）に応じた期待値で
+        // 照合する（5.8 未満は fail-closed の `Unimplemented`。非対応経路は
+        // `io2_persist_file_system_rejects_unsupported_without_issuing` でも固定）。
+        match support {
+            PersistSupport::Supported => {
+                assert!(result.is_ok(), "persist_file_system failed: {result:?}");
+            }
+            other => {
+                assert_eq!(other, PersistSupport::KernelTooOld);
+                let failure = result.expect_err("pre-5.8 kernel must be rejected");
+                assert_eq!(failure.error.code(), IoErrorCode::Unimplemented);
+                assert!(!failure.issued);
+            }
+        }
+    }
+
+    /// IO-2・IO-3: `persist_support` は Linux では `/proc/sys/kernel/osrelease`
+    /// の版数ゲートと一致し、非 Linux では `UnsupportedOs` を返す。
+    #[test]
+    fn io2_persist_support_matches_platform_gate() {
+        let support = persist_support();
+        #[cfg(target_os = "linux")]
+        {
+            let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+            let expected = if release_supports_syncfs_errors(&release) {
+                PersistSupport::Supported
+            } else {
+                PersistSupport::KernelTooOld
+            };
+            assert_eq!(support, expected, "release = {release:?}");
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(support, PersistSupport::UnsupportedOs);
+        assert_eq!(support.is_supported(), support == PersistSupport::Supported);
+    }
+
+    /// IO-2・IO-3（Codex #1142 指摘）: 非対応の判定（旧カーネル・非 Linux）を
+    /// 注入すると、実行ホストのカーネル版数に関係なく syscall を発行せず
+    /// `Unimplemented`（`issued == false`）で拒否する。
+    #[test]
+    fn io2_persist_file_system_rejects_unsupported_without_issuing() {
+        let path = std::env::temp_dir().join(format!(
+            "fandhe-io-persist-unsupported-{}",
+            std::process::id()
+        ));
+        let file = File::create(&path).expect("create temp file");
+        let _ = std::fs::remove_file(&path);
+        for support in [PersistSupport::KernelTooOld, PersistSupport::UnsupportedOs] {
+            let failure =
+                persist_file_system(support, &file, ms(100)).expect_err("must be rejected");
+            assert_eq!(
+                failure.error.code(),
+                IoErrorCode::Unimplemented,
+                "{support:?}"
+            );
+            assert!(!failure.issued, "{support:?}");
+            assert!(!support.is_supported());
         }
     }
 
@@ -634,7 +740,9 @@ mod tests {
         let path = std::env::temp_dir().join(format!("fandhe-io-persist-{}", std::process::id()));
         let file = File::create(&path).expect("create temp file");
         let _ = std::fs::remove_file(&path);
-        let failure = persist_file_system(&file, ms(100)).expect_err("must be unimplemented");
+        assert_eq!(persist_support(), PersistSupport::UnsupportedOs);
+        let failure = persist_file_system(persist_support(), &file, ms(100))
+            .expect_err("must be unimplemented");
         assert!(!failure.issued);
         let err = failure.error;
         assert_eq!(err.code(), IoErrorCode::Unimplemented);

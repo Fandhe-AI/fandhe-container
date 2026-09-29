@@ -50,8 +50,9 @@
 //! まま滞留していた分を取り出して書き込み、通常 ACK を返した後、
 //! [`BatchSink::persist`]（Linux の [`AppendFileSink`] は `syncfs(2)`）で
 //! 永続化し、**成功したときだけ** [`FrameKind::FlushAck`] を送ってループを
-//! 継続する。`persist` が失敗・タイムアウト・未対応（既定実装や非 Linux は
-//! [`crate::error::IoErrorCode::Unimplemented`]）のときは FlushAck を送らず、
+//! 継続する。`persist` が失敗・タイムアウト・未対応（既定実装・Linux 5.8 未満・
+//! 非 Linux は [`crate::error::IoErrorCode::Unimplemented`]。判定は
+//! [`crate::barrier::persist_support`]）のときは FlushAck を送らず、
 //! そのエラーで処理を終える（fail-closed。プロトコルにエラーフレームはなく、
 //! クライアントは EOF を `Unavailable` として観測する）。
 //!
@@ -200,9 +201,12 @@ impl SinkPersistReport {
 /// `File` を用意する）。
 ///
 /// # 永続化（IO-2・TASK-15.2.2）
-/// [`BatchSink::persist`] は Linux で `syncfs(2)` を発行する（他 OS は
-/// `Unimplemented`。TASK-15.3・#88）。syncfs を発行した後に失敗・タイムアウトした
-/// sink はポイズンされ（fd 複製・枠確保・スレッド生成など発行前の失敗はポイズンせず再試行可）、以後の `persist` は syscall を発行せず `Internal` を返す。
+/// [`BatchSink::persist`] は [`crate::barrier::persist_support`] が対応と判定した
+/// 環境（Linux 5.8 以上）で `syncfs(2)` を発行する（他は `Unimplemented`。
+/// 非 Linux の代替は TASK-15.3・#88）。syncfs を発行した後に失敗・タイムアウトした
+/// sink はポイズンされ（カーネル版数拒否・fd 複製・枠確保・スレッド生成など
+/// 発行前の失敗はポイズンせず再試行可）、以後の `persist` は syscall を発行せず
+/// `Internal` を返す。
 /// dup した fd は open file description を共有するため、タイムアウトした
 /// helper が後から書き戻しエラー（errseq）を消費すると、再試行の `syncfs` が
 /// 永続化されていないのに 0 を返しうるため。
@@ -210,7 +214,8 @@ impl SinkPersistReport {
 /// 未対応の範囲（REPAIR-3）: タイムアウトは最大 10 秒で、未書き戻しデータが
 /// 大量にあると超えうる（その場合 FlushAck は返らない）。fd を開く前に起きた
 /// 書き戻しエラーは報告されない。Linux 5.8 未満は書き戻しエラーが報告されないため
-/// `Unimplemented` で拒否する（`barrier` モジュール参照。ポイズンしない）。電源断への耐性は本 crate では検証しない（TASK-18）。
+/// `Unimplemented` で拒否する（`barrier` モジュール参照。ポイズンしない）。
+/// 電源断への耐性は本 crate では検証しない（TASK-18）。
 pub struct AppendFileSink {
     file: File,
     flush_timeout: IoTimeout,
@@ -355,6 +360,18 @@ impl BatchSink for AppendFileSink {
     }
 
     fn persist(&mut self) -> Result<SinkPersistReport, IoError> {
+        self.persist_with_support(crate::barrier::persist_support())
+    }
+}
+
+impl AppendFileSink {
+    /// [`BatchSink::persist`] の本体。実行環境の判定（[`crate::barrier::persist_support`]）
+    /// を引数で受け、5.8 以上のホストでも旧カーネル・非 Linux の経路（ポイズンせず
+    /// dirty のまま `Unimplemented`）を単体テストで決定的に照合できるようにする。
+    fn persist_with_support(
+        &mut self,
+        support: crate::barrier::PersistSupport,
+    ) -> Result<SinkPersistReport, IoError> {
         if self.persist_poisoned {
             return Err(IoError::new(
                 IoErrorCode::Internal,
@@ -366,7 +383,7 @@ impl BatchSink for AppendFileSink {
             // 済みのため、FS 全体同期を再発行せず合流する。
             return Ok(SinkPersistReport::new(Duration::ZERO));
         }
-        match crate::barrier::persist_file_system(&self.file, self.flush_timeout) {
+        match crate::barrier::persist_file_system(support, &self.file, self.flush_timeout) {
             Ok(elapsed) => {
                 self.dirty_since_persist = false;
                 Ok(SinkPersistReport::new(elapsed))
@@ -825,8 +842,9 @@ mod tests {
             .get()
     }
 
-    /// IO-1・D4: Write 2 件 + Flush で、ACK が 2 件・FlushAck は 0 件、
-    /// 終了原因が `Unimplemented` になる。
+    /// IO-1・D4: `persist` を実装しない sink（既定実装）では、Write 2 件 +
+    /// Flush で ACK が 2 件・FlushAck は 0 件、終了原因が `Unimplemented` になる
+    /// （実行環境に依存しない fail-closed。IO-2）。
     #[test]
     fn io1_writeback_flush_acks_pending_then_unimplemented() {
         let frames = vec![write_frame(0, b"a"), write_frame(1, b"b"), flush_frame(2)];
@@ -1235,12 +1253,8 @@ mod tests {
         Frame::new(FrameKind::Flush, Vec::new()).expect("empty flush frame must build")
     }
 
-    /// IO-2・TASK-15.2.2: 書き込みのない連続 persist は syncfs を再発行せず
-    /// 合流する（elapsed が 0）。書き込み後は再び dirty になる。
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn io2_append_file_sink_coalesces_persist_without_writes() {
-        let path = std::env::temp_dir().join(format!("fandhe-io-coalesce-{}", std::process::id()));
+    fn temp_append_sink(tag: &str) -> AppendFileSink {
+        let path = std::env::temp_dir().join(format!("fandhe-io-{tag}-{}", std::process::id()));
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -1248,27 +1262,65 @@ mod tests {
             .open(&path)
             .expect("create temp file");
         let _ = std::fs::remove_file(&path);
-        let mut sink = AppendFileSink::new(file).expect("sink must construct");
+        AppendFileSink::new(file).expect("sink must construct")
+    }
+
+    /// IO-2・TASK-15.2.2: 書き込みのない連続 persist は syncfs を再発行せず
+    /// 合流する（elapsed が 0）。書き込み後は再び dirty になる。期待値は
+    /// production と同じ判定（`persist_support`）で分け、非対応環境（5.8 未満・
+    /// 非 Linux）では `Unimplemented` で拒否され dirty・非ポイズンのままである
+    /// ことを照合する（任意のエラーで早期 return しない。Codex #1142 指摘）。
+    #[test]
+    fn io2_append_file_sink_coalesces_persist_without_writes() {
+        let mut sink = temp_append_sink("coalesce");
         assert!(sink.dirty_since_persist);
-        // 5.8 未満のカーネルでは Unimplemented で拒否され dirty のまま（合流しない）。
-        if sink.persist().is_err() {
+        let support = crate::barrier::persist_support();
+        let first = sink.persist();
+        if support.is_supported() {
+            first.expect("persist must succeed on a supported kernel");
+            assert!(!sink.dirty_since_persist);
+            let second = sink.persist().expect("coalesced persist must succeed");
+            assert_eq!(second.elapsed, Duration::ZERO);
+        } else {
+            let err = first.expect_err("unsupported environment must be rejected");
+            assert_eq!(err.code(), IoErrorCode::Unimplemented, "{support:?}");
             assert!(sink.dirty_since_persist);
-            return;
+            assert!(!sink.persist_poisoned);
         }
-        assert!(!sink.dirty_since_persist);
-        let second = sink.persist().expect("coalesced persist must succeed");
-        assert_eq!(second.elapsed, Duration::ZERO);
+    }
+
+    /// IO-2・IO-3（Codex #1142 指摘）: 旧カーネル・非 Linux の判定を注入すると、
+    /// 実行ホストに関係なく `Unimplemented` で拒否され、sink はポイズンされず
+    /// dirty のまま（errseq を消費していないため、対応環境なら再試行できる）。
+    #[test]
+    fn io2_append_file_sink_unsupported_is_not_poisoned() {
+        use crate::barrier::PersistSupport;
+        let mut sink = temp_append_sink("unsupported");
+        for support in [PersistSupport::KernelTooOld, PersistSupport::UnsupportedOs] {
+            let err = sink
+                .persist_with_support(support)
+                .expect_err("unsupported environment must be rejected");
+            assert_eq!(err.code(), IoErrorCode::Unimplemented, "{support:?}");
+            assert!(sink.dirty_since_persist, "{support:?}");
+            assert!(!sink.persist_poisoned, "{support:?}");
+        }
     }
 
     /// IO-2・TASK-15.2.2（受け入れ条件 2）: 実際の `syncfs` ラッパーが失敗
     /// （O_PATH の fd は EBADF）すると FlushAck を返さず `Internal` で終わり、
     /// sink はポイズンされて以後の persist は syscall なしで `Internal`。
+    ///
+    /// `serve_connection` 経由の期待値は production と同じ判定（`persist_support`）
+    /// で分ける（非対応環境では syscall を発行せず `Unimplemented`。Codex #1142
+    /// 指摘）。実 syscall の失敗とポイズンは、判定を `Supported` に注入して
+    /// どのカーネル版数でも照合する（EBADF はカーネル版数に依存しない）。
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     #[test]
     fn io2_writeback_real_syncfs_failure_sends_no_flush_ack_and_poisons() {
+        use crate::barrier::PersistSupport;
         use std::os::unix::fs::OpenOptionsExt as _;
         // O_PATH（x86_64・aarch64 とも 0o10000000）。`syncfs` は EBADF で失敗する。
         const O_PATH: i32 = 0o10_000_000;
@@ -1287,12 +1339,30 @@ mod tests {
 
         let report = serve_connection(&mut conn, BatchConfig::default(), &mut sink, timeouts());
 
-        assert_eq!(report.end.code(), IoErrorCode::Internal);
-        assert!(report.end.message().contains("syncfs failed"));
+        // どちらの経路でも FlushAck は送らない（fail-closed）。
         assert_eq!(report.stats.flush_acks_sent, 0);
+        assert_eq!(report.stats.persist_failed, 1);
         assert!(conn.sent.is_empty());
+        let support = crate::barrier::persist_support();
+        if support.is_supported() {
+            assert_eq!(report.end.code(), IoErrorCode::Internal);
+            assert!(report.end.message().contains("syncfs failed"));
+            assert!(sink.persist_poisoned);
+        } else {
+            // 非対応環境: syscall を発行せず拒否し、ポイズンしない。
+            assert_eq!(report.end.code(), IoErrorCode::Unimplemented, "{support:?}");
+            assert!(!sink.persist_poisoned);
+            let err = sink
+                .persist_with_support(PersistSupport::Supported)
+                .expect_err("syncfs on an O_PATH fd must fail");
+            assert_eq!(err.code(), IoErrorCode::Internal);
+            assert!(err.message().contains("syncfs failed"));
+            assert!(sink.persist_poisoned);
+        }
 
-        let err = sink.persist().expect_err("poisoned sink must fail");
+        let err = sink
+            .persist_with_support(PersistSupport::Supported)
+            .expect_err("poisoned sink must fail");
         assert_eq!(err.code(), IoErrorCode::Internal);
         assert!(err.message().contains("poisoned"));
     }

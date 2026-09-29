@@ -67,7 +67,9 @@
 //! # スコープ外（後続タスクへの引き継ぎ・既知の限界）
 //! - サーバーのファイル作成経路への組み込み・結合試験 → #100（TASK-19.2。
 //!   `guest_files` で実装済み。ワイヤー上の作成要求は未実装）
-//! - パス長 260 超の検出 → TASK-20
+//! - パス長 260 超の検出: 検証関数は TASK-20.1（#102）で実装済み
+//!   （[`check_host_path_length`]）。書き込み経路への組み込みは後続（REPAIR-3）。
+//!   WIN-4 の per-directory case-sensitive フラグとの関係の doc は TASK-20.2（#797）
 //! - NFC / NFD の Unicode 正規化方針 → #103（TASK-21.h1）で決定後に TASK-21
 //! - APFS / NTFS の実際の case folding 表との厳密な一致・非 UTF-8 ファイル名の
 //!   扱い → TASK-21 以降
@@ -77,9 +79,28 @@
 //! - 削除・リネームは追跡しない。登録は追加のみのため、時系列上は解消済みの
 //!   衝突（`Foo` を削除してから `foo` を作る等）も衝突として報告する
 //!   （過検出側。方針どおり）
+//!
+//! # パス長検証（TASK-20.1・IO-5・WIN-4・#102）
+//! NTFS / Win32 の `MAX_PATH`（260）を超えるホストパスは Windows ホストで作成・
+//! 参照に失敗しうる。ゲスト（ext4）では作れても、ホスト共有で黙って失敗・不整合に
+//! ならないよう、[`measure_host_path_length`] / [`check_host_path_length`] で
+//! 事前に検出する（IO-5「260 文字超は警告またはエラーを明示返却」）。
+//!
+//! 衝突検出（上記）がワイヤー上のゲスト相対 `&str` を扱うのに対し、260 文字制限は
+//! **ホスト側が結合後のフルパス（共有ルート＋コンポーネント）に課す制約**なので、
+//! こちらはホストの `&Path`（`PathBuf` / `Path::join` で組み立てたもの）を受け取る。
+//! 計数単位は UTF-16 コード単位（Windows は `encode_wide`、他 OS は UTF-8 を
+//! UTF-16 換算。非 UTF-8 は過小計数を避けバイト長を上界とする）。閾値は
+//! 「260 は許容・261 以上は超過」で、終端 NUL を含む Win32 の実効 259 は
+//! 参考にとどめ再解釈しない。本関数は長さ検証のみで、rootfs への閉じ込めの防御
+//! ではない（それは `guest_files` の責務）。
+//!
+//! 未実装（REPAIR-3）: 書き込み経路（`GuestFileCreator` 等）への組み込み、
+//! `\\?\` 長パス・`LongPathsEnabled` 対応、コンポーネント単位の 255 制限。
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::path::Path;
 
 use crate::error::{IoError, IoErrorCode};
 
@@ -90,6 +111,92 @@ use crate::error::{IoError, IoErrorCode};
 /// メッセージによる資源浪費（security.md「不安全な設計」観点）につながる
 /// ため、char 境界で切り詰める。
 pub const MAX_COLLISION_MESSAGE_PATH_CHARS: usize = 128;
+
+/// ホストパスの長さ上限（UTF-16 コード単位。IO-5・WIN-4・TASK-20.1）。
+/// この値ちょうどは許容し、超えると [`check_host_path_length`] がエラーにする。
+pub const MAX_HOST_PATH_CHARS: usize = 260;
+
+/// ホストパス長の計測結果（将来の警告・詳細情報の拡張に備え真偽値にしない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostPathLength {
+    units: usize,
+}
+
+impl HostPathLength {
+    /// 計測した UTF-16 コード単位数（非 UTF-8 の非 Windows パスはバイト数の上界）。
+    pub fn units(&self) -> usize {
+        self.units
+    }
+
+    /// 適用した上限（[`MAX_HOST_PATH_CHARS`]）。
+    pub fn limit(&self) -> usize {
+        MAX_HOST_PATH_CHARS
+    }
+
+    /// 上限を超えているか（260 は false・261 は true）。
+    pub fn exceeds_limit(&self) -> bool {
+        self.units > MAX_HOST_PATH_CHARS
+    }
+}
+
+/// パスの UTF-16 コード単位数を数える（追加アロケーションなし）。
+#[cfg(windows)]
+fn utf16_units(path: &Path) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().count()
+}
+
+/// 非 Windows: UTF-8 なら UTF-16 換算、非 UTF-8 は過小計数を避けバイト長を上界にする
+/// （有効な UTF-8 ではバイト数 >= UTF-16 単位数）。`to_string_lossy` は
+/// 不正列を U+FFFD 1 文字へ潰して過小計数になるため使わない。
+#[cfg(not(windows))]
+fn utf16_units(path: &Path) -> usize {
+    let os = path.as_os_str();
+    match os.to_str() {
+        Some(s) => s.encode_utf16().count(),
+        None => os.as_encoded_bytes().len(),
+    }
+}
+
+/// ホストパスの長さを計測する（失敗しない。呼び出し側は警告として扱える。IO-5）。
+pub fn measure_host_path_length(path: &Path) -> HostPathLength {
+    HostPathLength {
+        units: utf16_units(path),
+    }
+}
+
+/// ホストパスが [`MAX_HOST_PATH_CHARS`] 以内か検証する（エラーとして扱う経路。IO-5）。
+///
+/// 超過時は `IoErrorCode::InvalidArgument`（メッセージに計測値と上限を含み、
+/// パスは [`quote_for_message`] で衛生化・切り詰めて埋め込む）。
+pub fn check_host_path_length(path: &Path) -> Result<HostPathLength, IoError> {
+    let length = measure_host_path_length(path);
+    if length.exceeds_limit() {
+        return Err(IoError::new(
+            IoErrorCode::InvalidArgument,
+            format!(
+                "host path length {} UTF-16 units exceeds limit of {} (NTFS MAX_PATH): {}",
+                length.units(),
+                length.limit(),
+                quote_for_message(&bounded_lossy_prefix(path))
+            ),
+        ));
+    }
+    Ok(length)
+}
+
+/// エラーメッセージ表示用に、パス先頭のみを有界に UTF-8 へ変換する（P0: 入力長に
+/// 比例するアロケーションを避ける。`to_string_lossy` の全体変換は使わない）。
+///
+/// 先頭 `4 * (MAX_COLLISION_MESSAGE_PATH_CHARS + 1)` バイトだけを lossy 変換する。
+/// 1 文字は最大 4 バイトのため、元が長ければ変換後は必ず上限超の文字数になり、
+/// [`quote_for_message`] が切り詰めと `...` 付与を正しく行う。
+fn bounded_lossy_prefix(path: &Path) -> String {
+    const PREFIX_BYTES: usize = 4 * (MAX_COLLISION_MESSAGE_PATH_CHARS + 1);
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let head = bytes.get(..PREFIX_BYTES).unwrap_or(bytes);
+    String::from_utf8_lossy(head).into_owned()
+}
 
 /// 木構造上のノード識別子（非公開）。[`ROOT_NODE`] が根（ゲスト相対パスの起点）。
 type NodeId = usize;
@@ -435,6 +542,82 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// IO-5: 巨大パスでもエラーメッセージ用の変換は先頭のみ（有界）で、切り詰め表示になる。
+    #[test]
+    fn io5_error_message_uses_bounded_prefix_for_huge_path() {
+        let huge = PathBuf::from("a".repeat(1_000_000));
+        let err = check_host_path_length(&huge).expect_err("huge path");
+        assert!(err.message().contains("1000000 UTF-16 units"));
+        assert!(err.message().len() < 1024);
+        assert!(err.message().ends_with("...\""));
+        assert_eq!(
+            bounded_lossy_prefix(&huge).len(),
+            4 * (MAX_COLLISION_MESSAGE_PATH_CHARS + 1)
+        );
+    }
+
+    /// IO-5: 260 は許容・261 は超過（境界値）。
+    #[test]
+    fn io5_path_length_260_is_accepted() {
+        let len = check_host_path_length(&PathBuf::from("a".repeat(260))).expect("260 is ok");
+        assert_eq!(len.units(), 260);
+        assert!(!len.exceeds_limit());
+    }
+
+    #[test]
+    fn io5_path_length_261_is_rejected() {
+        let err = check_host_path_length(&PathBuf::from("a".repeat(261))).expect_err("261");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+        assert!(err.message().contains("261") && err.message().contains("260"));
+        let m = measure_host_path_length(&PathBuf::from("a".repeat(261)));
+        assert!(m.exceeds_limit());
+        assert_eq!(m.limit(), 260);
+    }
+
+    /// `Path::join` で組んだパスの境界（区切り文字は 3 OS とも 1 単位）。
+    #[test]
+    fn io5_joined_path_length_boundary() {
+        let base = PathBuf::from("a".repeat(100));
+        assert!(check_host_path_length(&base.join("b".repeat(159))).is_ok());
+        assert!(check_host_path_length(&base.join("b".repeat(160))).is_err());
+    }
+
+    /// 計数単位は UTF-16 コード単位（非 BMP は 2 単位）。
+    #[test]
+    fn io5_path_length_counts_utf16_units() {
+        assert!(check_host_path_length(&PathBuf::from("\u{1F600}".repeat(130))).is_ok());
+        let err = check_host_path_length(&PathBuf::from("\u{1F600}".repeat(131))).unwrap_err();
+        assert!(err.message().contains("262"));
+    }
+
+    #[test]
+    fn io5_path_length_bmp_multibyte_counts_one_unit() {
+        let len = check_host_path_length(&PathBuf::from("\u{e9}".repeat(260))).expect("ok");
+        assert_eq!(len.units(), 260);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn io5_non_utf8_path_uses_byte_length_upper_bound() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let mut ok = vec![b'a'; 259];
+        ok.push(0xff);
+        assert!(check_host_path_length(Path::new(OsStr::from_bytes(&ok))).is_ok());
+        ok.push(b'a');
+        assert!(check_host_path_length(Path::new(OsStr::from_bytes(&ok))).is_err());
+    }
+
+    #[test]
+    fn io5_path_length_message_is_sanitized() {
+        let path = format!("x\n{}", "a".repeat(400));
+        let err = check_host_path_length(&PathBuf::from(path)).unwrap_err();
+        assert!(!err.message().contains('\n'));
+        assert!(err.message().contains("..."));
+    }
 
     /// IO-5: 大文字小文字だけが違う 2 パスは `AlreadyExists` として検出され、
     /// message に両方のパスが含まれる。

@@ -6,11 +6,15 @@
 //! 同じ経路（`pub use` された公開 API のみ）で、衝突検出・非衝突・不正パス拒否を
 //! 機械照合する（AGENTS.md「新機能追加時に更新すべきテスト一覧」）。
 //!
-//! `std::path` や実ファイルシステムには触れない。ここで扱うのはワイヤー上の
-//! ゲスト相対パス文字列であり、3 OS の CI で同じ結果になる必要があるため
-//! （モジュール doc「入力表現がゲスト相対パスの `&str` である理由」参照）。
+//! 衝突検出はワイヤー上のゲスト相対パス文字列、パス長検証（TASK-20.1・#102）は
+//! ホストの `Path` を扱う。いずれも実ファイルシステムには触れず、3 OS の CI で
+//! 同じ結果になる（モジュール doc「入力表現がゲスト相対パスの `&str` である理由」参照）。
 
-use fandhe_container_io::{CaseCollisionSet, IoErrorCode, check_case_collisions};
+use std::path::PathBuf;
+
+use fandhe_container_io::{
+    CaseCollisionSet, IoErrorCode, check_case_collisions, check_host_path_length,
+};
 
 /// IO-5: 公開 API 経由でも大文字小文字だけの衝突を検出できる。
 #[test]
@@ -54,4 +58,14 @@ fn io5_public_api_detects_collision_across_depths() {
         "case-insensitive path collision: \"A/b\" conflicts with existing \"a\" \
          (components \"A\" and \"a\" differ only by case)"
     );
+}
+
+/// IO-5・TASK-20.1: 公開 API 経由で 260 は許容・261 は `InvalidArgument`。
+#[test]
+fn io5_public_api_host_path_length_boundary() {
+    let base = PathBuf::from("a".repeat(100));
+    let ok = check_host_path_length(&base.join("b".repeat(159))).expect("260 is ok");
+    assert_eq!(ok.units(), 260);
+    let err = check_host_path_length(&base.join("b".repeat(160))).expect_err("261");
+    assert_eq!(err.code(), IoErrorCode::InvalidArgument);
 }

@@ -1766,6 +1766,28 @@ mod tests {
         assert_eq!(entries(&t.0.join("Dir")), 0);
     }
 
+    /// API で作った `Foo` をホスト側で削除・改名した後は、表記を変えた `foo` を作れる
+    /// （衝突索引は作成のたびに実在項目から作るため、消えた項目が残らない。Codex P1
+    /// 指摘。3 OS 共通）。
+    #[test]
+    fn io5_removed_or_renamed_entry_does_not_block_later_create() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        c.create_file("Foo").expect("first");
+        std::fs::remove_file(t.0.join("Foo")).expect("remove on the host");
+        c.create_file("foo")
+            .expect("no stale collision after removal");
+        assert_eq!(entries(&t.0), 1);
+
+        c.create_file("Dir/x").expect("nested");
+        std::fs::rename(t.0.join("Dir"), t.0.join("Other")).expect("rename on the host");
+        c.create_file("dir/x")
+            .expect("no stale collision after rename");
+        assert!(t.0.join("dir").join("x").is_file());
+        assert!(t.0.join("Other").join("x").is_file());
+    }
+
     /// 構築後にルートのパスを範囲外への symlink へ差し替えても、作成は保持した
     /// ハンドルの元のディレクトリ内に留まる（IO-5・Codex P0 指摘）。
     #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -91,7 +91,15 @@ fn io5_concurrent_case_only_creates_one_is_rejected() {
 fn io5_io1_created_sink_serves_writeback() {
     let dir = TempDir::new("gf-serve");
     let (creator, root) = creator_in(&dir, "root");
-    let sink = creator.create_file("sub/Data.bin").expect("create");
+    // Windows は祖先付き作成を未実装（fail-closed）のため、ルート直下の名前を使う。
+    // 書き込み経路の検証内容はディレクトリ深さに依存しない。
+    let (guest_path, host_rel): (&str, &[&str]) =
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            ("sub/Data.bin", &["sub", "Data.bin"])
+        } else {
+            ("Data.bin", &["Data.bin"])
+        };
+    let sink = creator.create_file(guest_path).expect("create");
     let (client_end, server_end) = duplex();
     let timeouts = WritebackTimeouts {
         recv: timeout(),
@@ -116,7 +124,8 @@ fn io5_io1_created_sink_serves_writeback() {
     let report = join_within(server, deadline());
     assert_eq!(report.stats.acks_sent, 2);
 
-    let written = std::fs::read(root.join("sub").join("Data.bin")).expect("read back");
+    let host_path = host_rel.iter().fold(root.clone(), |p, c| p.join(c));
+    let written = std::fs::read(host_path).expect("read back");
     assert_eq!(written, b"hello world".to_vec());
 }
 

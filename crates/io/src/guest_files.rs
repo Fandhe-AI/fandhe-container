@@ -38,7 +38,8 @@
 //!   `Unimplemented` で拒否する（fail-closed）。ルート直下の単一名だけは許す
 //!   （`NtCreateFile` のルート相対ハンドル作成への置き換えは後続。REPAIR-3）。
 //! - 既存項目の取り込み: 索引は API 経由の登録だけでなく、作成のたびに祖先
-//!   ディレクトリの実在エントリを（未走査のものに限り）読んで取り込む。共有
+//!   ディレクトリの実在エントリを毎回読み直して取り込む（別プロセスが後から
+//!   足した項目も検出する。走査中の読み取り失敗は `Internal` で作成を中止する）。共有
 //!   ルートに元からある `Foo` があれば `foo/bar` は衝突になる。作成が祖先の
 //!   作成後に失敗しても、残った祖先は次回の走査で取り込まれる。走査は名前の
 //!   索引化だけに使い、書き込み先の解決には使わない（非 UTF-8 名は取り込めない）。
@@ -50,7 +51,6 @@
 //! - Unicode 正規化（NFC / NFD）は行わない（#103・TASK-21）。260 文字超の検証は
 //!   TASK-20。
 
-use std::collections::HashSet;
 use std::fs::File;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::fs::OpenOptions;
@@ -78,11 +78,9 @@ pub struct GuestFileCreator {
     index: Mutex<IndexState>,
 }
 
-/// 衝突索引と、既存エントリを取り込み済みのディレクトリ（ゲスト相対の
-/// 表記どおりの接頭辞。ルートは空文字）の集合。
+/// 衝突索引。
 struct IndexState {
     set: CaseCollisionSet,
-    scanned: HashSet<String>,
 }
 
 fn invalid(message: &str) -> IoError {
@@ -134,7 +132,6 @@ impl GuestFileCreator {
             max_tracked,
             index: Mutex::new(IndexState {
                 set: CaseCollisionSet::new(),
-                scanned: HashSet::new(),
             }),
         })
     }
@@ -199,44 +196,38 @@ impl GuestFileCreator {
                     ),
                 ));
             }
-            Err(CreateError::Other(err)) => {
-                // 祖先だけ作られて葉が失敗した場合に備え、走査済み印を捨てて
-                // 次回に実在エントリを取り込み直す（索引に無い祖先の取りこぼし防止）。
-                state.scanned.clear();
-                return Err(err);
-            }
+            // 祖先だけ作られて葉が失敗しても、次回の作成で走査して取り込み直す。
+            Err(CreateError::Other(err)) => return Err(err),
         };
         set.try_insert(guest_path)?;
         AppendFileSink::new(file)
     }
 
-    /// `ancestors` に沿って実在するディレクトリの項目を、未走査のものに限り索引へ
-    /// 取り込む（表記どおりの実在ディレクトリだけを辿る。symlink は辿らない）。
-    /// 走査は索引化専用で、作成先の解決には使わない。件数上限超過は
-    /// `ResourceExhausted`。
+    /// `ancestors` に沿って実在するディレクトリの項目を、作成のたびに読み直して
+    /// 索引へ取り込む（表記どおりの実在ディレクトリだけを辿る。symlink は辿らない）。
+    /// 別プロセスが共有ルートへ後から追加した項目も検出するため、走査済みの
+    /// 印は持たない。走査は索引化専用で、作成先の解決には使わない。
+    /// 件数上限超過は `ResourceExhausted`、読み取りの失敗は `Internal`
+    /// （IO-5 の検査を完了できないまま作成へ進まない。fail-closed）。
     fn seed_existing(&self, state: &mut IndexState, ancestors: &[&str]) -> Result<(), IoError> {
         let mut dir = self.root.clone();
         let mut prefix = String::new();
         for level in 0..=ancestors.len() {
-            if !state.scanned.contains(&prefix) {
-                let entries = match std::fs::read_dir(&dir) {
-                    Ok(entries) => entries,
-                    Err(_) => return Ok(()),
-                };
-                for entry in entries {
-                    let Ok(entry) = entry else { continue };
-                    let name = entry.file_name();
-                    let Some(name) = name.to_str() else { continue };
-                    if state.set.len() >= self.max_tracked {
-                        return Err(IoError::new(
-                            IoErrorCode::ResourceExhausted,
-                            "too many tracked guest paths",
-                        ));
-                    }
-                    // 元から衝突している項目や不正な名前は取り込めないだけで無視する。
-                    let _ = state.set.try_insert(&format!("{prefix}{name}"));
+            let entries = std::fs::read_dir(&dir)
+                .map_err(|err| internal("failed to scan guest directory", err.kind()))?;
+            for entry in entries {
+                let entry =
+                    entry.map_err(|err| internal("failed to scan guest directory", err.kind()))?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if state.set.len() >= self.max_tracked {
+                    return Err(IoError::new(
+                        IoErrorCode::ResourceExhausted,
+                        "too many tracked guest paths",
+                    ));
                 }
-                state.scanned.insert(prefix.clone());
+                // 元から衝突している項目や不正な名前は取り込めないだけで無視する。
+                let _ = state.set.try_insert(&format!("{prefix}{name}"));
             }
             let Some(component) = ancestors.get(level) else {
                 break;
@@ -244,7 +235,13 @@ impl GuestFileCreator {
             dir.push(component);
             match std::fs::symlink_metadata(&dir) {
                 Ok(meta) if meta.is_dir() => {}
-                _ => return Ok(()),
+                // 未作成の祖先より下に既存項目は無い（作成時に新設される）。
+                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(err) => {
+                    return Err(internal("failed to inspect guest directory", err.kind()));
+                }
+                // 通常ファイル・symlink の祖先は作成側が拒否する。
+                Ok(_) => return Ok(()),
             }
             prefix.push_str(component);
             prefix.push('/');
@@ -494,6 +491,32 @@ mod tests {
         assert_eq!(err.code(), IoErrorCode::Unimplemented);
         assert_eq!(entries(&t.0), 0);
         c.create_file("top").expect("root-level file is allowed");
+    }
+
+    /// 別プロセスが作成後に共有ルートへ足した項目とも衝突を検出する。
+    #[test]
+    fn io5_externally_added_entry_is_detected_on_later_create() {
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        c.create_file("first").expect("first");
+        std::fs::write(t.0.join("Foo"), b"x").expect("external");
+        let err = c.create_file("foo").err().expect("must collide");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(err.message().starts_with("case-insensitive path collision"));
+        assert_eq!(entries(&t.0), 2);
+    }
+
+    /// 走査を完了できないときは索引不完全のまま作成せず構造化エラーで中止する。
+    #[test]
+    fn io5_scan_failure_aborts_create() {
+        let t = Tmp::new();
+        let root = t.0.join("root");
+        std::fs::create_dir(&root).expect("root");
+        let c = GuestFileCreator::new(root.clone()).expect("creator");
+        std::fs::remove_dir(&root).expect("remove root");
+        let err = c.create_file("a").err().expect("must abort");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+        assert_eq!(c.tracked_len().expect("len"), 0);
     }
 
     #[test]

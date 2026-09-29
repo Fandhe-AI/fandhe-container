@@ -28,8 +28,8 @@
 //!   `crate::barrier::persist_file_system`（dup した fd・helper スレッド・
 //!   タイムアウト付き）→ 本関数、の順で呼ぶ（TASK-15.2.2・#824）。
 //! - Linux（x86_64 / aarch64）・macOS: `openat(2)`・`mkdirat(2)`・`unlinkat(2)`・
-//!   `renameat(2)`・`fdopendir(3)`/`readdir(3)` でディレクトリハンドル相対に
-//!   ファイル・ディレクトリを作る・開く・消す・改名する・列挙する（TASK-19.2・IO-5・#100。
+//!   `renameat(2)`・`linkat(2)`・`fdopendir(3)`/`readdir(3)` でディレクトリハンドル
+//!   相対にファイル・ディレクトリを作る・開く・消す・改名する・リンクする・列挙する（TASK-19.2・IO-5・#100。
 //!   `crate::guest_files` が共有ルート配下への作成で使う。下記「ハンドル相対の
 //!   ファイル操作」節）。
 //!
@@ -48,7 +48,8 @@
 //! - `unsafe fn` はこのモジュールの外へ公開しない。公開するのは安全な関数
 //!   （[`peer_uid`]・[`effective_uid`]・[`syncfs`]・[`mkdir_beneath`]・
 //!   [`open_dir_beneath`]・[`create_leaf_beneath`]・[`unlink_beneath`]・
-//!   [`rename_beneath`]・[`for_each_dir_entry`]・[`read_dir_entries`]）のみで、`unsafe` はこのモジュール内に閉じる
+//!   [`rename_beneath`]・[`link_beneath`]・[`for_each_dir_entry`]・
+//!   [`read_dir_entries`]）のみで、`unsafe` はこのモジュール内に閉じる
 //! - すべての `unsafe` ブロック・`unsafe extern "C"` 宣言に `// SAFETY:` で
 //!   理由と維持すべき不変条件を明記する
 //! - `fd` は呼び出し元が `&UnixStream`（または [`syncfs`] の場合 `AsFd`）を
@@ -382,7 +383,8 @@ pub(crate) fn syncfs(fd: impl AsFd) -> Result<(), IoError> {
 // `d_ino(8) d_seekoff(8) d_reclen(2) d_namlen(2) d_type(1) d_name`。
 
 /// ハンドル相対の操作（[`mkdir_beneath`]・[`open_dir_beneath`]・
-/// [`create_leaf_beneath`]・[`unlink_beneath`]・[`rename_beneath`]）の失敗種別
+/// [`create_leaf_beneath`]・[`unlink_beneath`]・[`rename_beneath`]・[`link_beneath`]）の
+/// 失敗種別
 /// （`crate::guest_files` が `IoError` へ写す。ホストのパスや errno の説明文は
 /// 載せない）。
 #[cfg_attr(
@@ -473,6 +475,10 @@ mod beneath_consts {
     pub(super) const O_CLOEXEC: i32 = 0o2_000_000;
     // include/uapi/linux/fcntl.h。
     pub(super) const AT_REMOVEDIR: i32 = 0x200;
+    /// `linkat` の flags。`AT_SYMLINK_FOLLOW`（0x400）を付けず symlink を辿らない。
+    pub(super) const LINKAT_FLAGS: i32 = 0;
+    #[cfg(test)]
+    pub(super) const AT_SYMLINK_FOLLOW: i32 = 0x400;
     // include/uapi/asm-generic/errno-base.h・errno.h。
     pub(super) const EEXIST: i32 = 17;
     pub(super) const ENOTDIR: i32 = 20;
@@ -495,6 +501,10 @@ mod beneath_consts {
     pub(super) const O_CLOEXEC: i32 = 0o2_000_000;
     // include/uapi/linux/fcntl.h。
     pub(super) const AT_REMOVEDIR: i32 = 0x200;
+    /// `linkat` の flags。`AT_SYMLINK_FOLLOW`（0x400）を付けず symlink を辿らない。
+    pub(super) const LINKAT_FLAGS: i32 = 0;
+    #[cfg(test)]
+    pub(super) const AT_SYMLINK_FOLLOW: i32 = 0x400;
     // include/uapi/asm-generic/errno-base.h・errno.h。
     pub(super) const EEXIST: i32 = 17;
     pub(super) const ENOTDIR: i32 = 20;
@@ -514,6 +524,10 @@ mod beneath_consts {
     pub(super) const O_NOFOLLOW: i32 = 0x100;
     pub(super) const O_CLOEXEC: i32 = 0x0100_0000;
     pub(super) const AT_REMOVEDIR: i32 = 0x80;
+    /// `linkat` の flags。`AT_SYMLINK_FOLLOW`（0x40）を付けず symlink を辿らない。
+    pub(super) const LINKAT_FLAGS: i32 = 0;
+    #[cfg(test)]
+    pub(super) const AT_SYMLINK_FOLLOW: i32 = 0x40;
     pub(super) const EEXIST: i32 = 17;
     pub(super) const ENOTDIR: i32 = 20;
     pub(super) const ELOOP: i32 = 62;
@@ -523,8 +537,8 @@ mod beneath_consts {
 }
 
 pub(crate) use beneath::{
-    create_leaf_beneath, for_each_dir_entry, mkdir_beneath, open_dir_beneath, read_dir_entries,
-    rename_beneath, unlink_beneath,
+    create_leaf_beneath, for_each_dir_entry, link_beneath, mkdir_beneath, open_dir_beneath,
+    read_dir_entries, rename_beneath, unlink_beneath,
 };
 
 /// 対応アーキテクチャ（macOS・Linux の x86_64 / aarch64）向けの実装。
@@ -569,6 +583,17 @@ mod beneath {
                 old: *const c_char,
                 newdirfd: i32,
                 new: *const c_char,
+            ) -> i32;
+            // SAFETY（宣言そのものの妥当性）: POSIX の
+            // `int linkat(int olddirfd, const char *old, int newdirfd, const char *new, int flags)`
+            // （Linux の glibc・musl、macOS の libSystem とも接尾辞なしの同名シンボル・
+            // 同じ引数の型と幅）。
+            pub(super) fn linkat(
+                olddirfd: i32,
+                old: *const c_char,
+                newdirfd: i32,
+                new: *const c_char,
+                flags: i32,
             ) -> i32;
 
             // SAFETY（宣言そのものの妥当性）: POSIX の `DIR *fdopendir(int fd)`・
@@ -761,6 +786,43 @@ mod beneath {
         }
     }
 
+    /// `from_dir` 直下のエントリ `from` へのハードリンクを `to_dir` 直下の `to` に作る
+    /// （`linkat`。flags に `AT_SYMLINK_FOLLOW` を付けず、symlink は辿らずそれ自体を
+    /// リンクする）。`to` が既にあれば上書きせず `AlreadyExists` で失敗する
+    /// （`crate::guest_files` の取り消しで、退避した他者の実体を元の名前へ戻すときに、
+    /// その名前を再利用した別の実体を消さないために使う）。ハードリンクを作れない
+    /// FS・ディレクトリ・`fs.protected_hardlinks` による拒否は `Io(kind)` になる。
+    pub(crate) fn link_beneath(
+        from_dir: &File,
+        from: &str,
+        to_dir: &File,
+        to: &str,
+    ) -> Result<(), BeneathError> {
+        let cfrom = cstr(from)?;
+        let cto = cstr(to)?;
+        // SAFETY: `from_dir`・`to_dir` は呼び出し元が借用中の有効なディレクトリ fd で、
+        // 呼び出しの間閉じられない。`cfrom`・`cto` は NUL 終端の有効な C 文字列で
+        // 呼び出しの間生きている。linkat は fd を返さず、失敗時は errno を直後に拾う。
+        let rc = unsafe {
+            raw::linkat(
+                from_dir.as_raw_fd(),
+                cfrom.as_ptr(),
+                to_dir.as_raw_fd(),
+                cto.as_ptr(),
+                c::LINKAT_FLAGS,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let (errno, kind) = last_errno();
+        if errno == c::EEXIST {
+            Err(BeneathError::AlreadyExists)
+        } else {
+            Err(BeneathError::Io(kind))
+        }
+    }
+
     fn set_errno_zero() {
         // SAFETY: スレッドローカルな errno へのポインタ（常に有効・整列済み）を
         // 得て 0 を書くだけ。
@@ -917,6 +979,15 @@ mod beneath {
         Err(BeneathError::Io(io::ErrorKind::Unsupported))
     }
 
+    pub(crate) fn link_beneath(
+        _from_dir: &File,
+        _from: &str,
+        _to_dir: &File,
+        _to: &str,
+    ) -> Result<(), BeneathError> {
+        Err(BeneathError::Io(io::ErrorKind::Unsupported))
+    }
+
     pub(crate) fn for_each_dir_entry(
         _dir: &File,
         _visit: impl FnMut(&OsStr, u64) -> ControlFlow<()>,
@@ -1056,6 +1127,9 @@ mod tests {
         assert_eq!(c::O_NOFOLLOW, 0o400_000);
         assert_eq!(c::O_CLOEXEC, 0o2_000_000);
         assert_eq!(c::AT_REMOVEDIR, 0x200);
+        assert_eq!(c::AT_SYMLINK_FOLLOW, 0x400);
+        assert_eq!(c::LINKAT_FLAGS & c::AT_SYMLINK_FOLLOW, 0);
+        assert_eq!(c::LINKAT_FLAGS, 0);
         assert_eq!(c::EEXIST, 17);
         assert_eq!(c::ENOTDIR, 20);
         assert_eq!(c::ELOOP, 40);
@@ -1081,6 +1155,9 @@ mod tests {
         assert_ne!(c::O_NOFOLLOW, 0o400_000);
         assert_eq!(c::O_CLOEXEC, 0o2_000_000);
         assert_eq!(c::AT_REMOVEDIR, 0x200);
+        assert_eq!(c::AT_SYMLINK_FOLLOW, 0x400);
+        assert_eq!(c::LINKAT_FLAGS & c::AT_SYMLINK_FOLLOW, 0);
+        assert_eq!(c::LINKAT_FLAGS, 0);
         assert_eq!(c::EEXIST, 17);
         assert_eq!(c::ENOTDIR, 20);
         assert_eq!(c::ELOOP, 40);
@@ -1101,6 +1178,9 @@ mod tests {
         assert_eq!(c::O_NOFOLLOW, 0x100);
         assert_eq!(c::O_CLOEXEC, 0x0100_0000);
         assert_eq!(c::AT_REMOVEDIR, 0x80);
+        assert_eq!(c::AT_SYMLINK_FOLLOW, 0x40);
+        assert_eq!(c::LINKAT_FLAGS & c::AT_SYMLINK_FOLLOW, 0);
+        assert_eq!(c::LINKAT_FLAGS, 0);
         assert_eq!(c::EEXIST, 17);
         assert_eq!(c::ENOTDIR, 20);
         assert_eq!(c::ELOOP, 62);

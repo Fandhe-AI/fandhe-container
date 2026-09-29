@@ -88,8 +88,9 @@
 //!
 //! 取り消しは他者のデータを消さない手順で行う（`remove_file_if_same`）:
 //! 1. 読み直した葉の `d_ino` が保持 fd の inode と一致し、デバイスも一致することを
-//!    確かめる（違えば触らずに `Internal`〔`created guest file could not be rolled
-//!    back`〕）
+//!    確かめる。別の実体に差し替えられていれば触らずに、別の書き込み元との競合
+//!    として `AlreadyExists`（`concurrent writer replaced the created guest file`）を
+//!    返す
 //! 2. 葉の親に、自分だけが入れる私有ディレクトリ（`.fandhe-rollback-<pid>-<n>-<nanos>`・
 //!    mode `0o700`。開いたハンドルの所有者が自プロセスの実効 uid で、グループ・
 //!    その他の権限が無いことを確かめる）を新設し、そのハンドルへ葉を `renameat` で
@@ -98,9 +99,17 @@
 //! 3. 私有ディレクトリ内のエントリの `d_ino` が保持 fd と一致するときだけ
 //!    `unlinkat` する。私有ディレクトリへは他の uid が改名で差し込めないため、この
 //!    確認から削除までの間に別の実体へ差し替えられることはない（同じ uid・root の
-//!    プロセスを除く）。一致しなければ私有ディレクトリに残し、その名前を含めて
-//!    `Internal` を返す（運用者が戻せる）
-//! 4. 空になった私有ディレクトリを取り除く（ベストエフォート）
+//!    プロセスを除く）
+//! 4. 一致しなければ（2 で他者の実体を移していたら）、既存の名前を上書きしない
+//!    `linkat`（`AT_SYMLINK_FOLLOW` なし）で元の名前へ戻し、私有ディレクトリ側の
+//!    名前を `unlinkat` して、競合として `AlreadyExists`（同上）を返す。元の名前が
+//!    戻す前に再利用されていた、またはハードリンクを作れない（ハードリンク非対応の
+//!    FS・ディレクトリ・Linux の `fs.protected_hardlinks` による拒否）場合は、消さずに
+//!    私有ディレクトリへ残し、共有ルートからの退避先のパスを含めて `Internal`
+//!    （`created guest file could not be rolled back ... entry left at ...`）を返す
+//!    （fail-closed。退避先の実体は私有ディレクトリにあり、所有者以外はそのままでは
+//!    読めないため、運用者が戻す）
+//! 5. 空になった私有ディレクトリを取り除く（ベストエフォート）
 //!
 //! 新設した祖先は、同一性を確かめてから `unlinkat(AT_REMOVEDIR)` で取り除く。
 //! 確認から削除までの間に差し替えられても、消えうるのは空のディレクトリだけ
@@ -115,17 +124,26 @@
 //! - 本方式に従わない書き込み元（ホストの別プロセスが直接作る等）が、こちらの
 //!   再検証の読み取りより後に大小違いの項目を作った場合は検出できない（次回の
 //!   作成時の走査で既存衝突として検出され、以降の作成は中止される）。
-//! - 取り消しで他者のファイルを消しうるのは、本プロセスと同じ uid または root の
-//!   プロセスが、3 の確認から `unlinkat` までの間に私有ディレクトリの中へ別の実体を
-//!   改名で差し込んだ場合だけ（fd を指定して名前を消す POSIX API が無いため、この
-//!   窓自体は閉じられない）。そうしたプロセスは元から本プロセスのファイルを直接
-//!   消せるため、権限の昇格にはならない。この場合は検出できない。
+//! - 名前で取り消す以上、完全に原子的な取り消しはできない（POSIX には fd を指定して
+//!   名前を消す API も、移動元の inode を条件にした改名もない）。残る窓は次のとおり:
+//!   - 1 の確認から 2 の `renameat` までに他者の実体が葉の名前へ差し込まれると、
+//!     それは私有ディレクトリへ移り、4 の `linkat` で戻すまでの間（数 µs）は元の名前
+//!     から見えなくなる。戻せない場合（上記）は私有ディレクトリに残り、報告される。
+//!     いずれの場合も他者のデータは消えない
+//!   - 3 の確認から `unlinkat` までに私有ディレクトリの中へ別の実体を差し込めるのは、
+//!     本プロセスと同じ uid または root のプロセスだけ。その場合はそれを消しうる
+//!     （検出できない）が、そうしたプロセスは元から本プロセスのファイルを直接消せる
+//!     ため、権限の昇格にはならない
+//!   - 前提となる権限: 1 の窓に差し込めるのは、共有ディレクトリへの書き込み権限を
+//!     持つ者だけ（元からそのエントリを直接移動・削除できる）。本プロセスは共有
+//!     ディレクトリへの書き込み権限（作成に必要なものと同じ）以外を要しない
 //! - プロセス間で完全な排他を取るものではない（共有ルートをまたぐロックは持たない）。
 //! - 大文字小文字を区別しないホスト（既定の APFS・NTFS）では、大小違いの作成は
 //!   `O_EXCL` / `create_new` が既存として失敗するため、この競合自体が起きない。
 //!   Windows のフォールバックは再検証を行わない（ディレクトリ単位で大文字小文字の
 //!   区別を有効にした NTFS〔`setCaseSensitiveInfo`〕では競合を検出できない。
-//!   ハンドル相対の同一性確認つき削除が未実装のため。REPAIR-3）。
+//!   ハンドル相対の同一性確認つき削除が未実装のため。REPAIR-3）。取り消しも行わない
+//!   ため、Windows では他者の実体を動かすことはない。
 
 use std::fs::File;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -814,13 +832,33 @@ fn verify_created(
     Ok(created.file)
 }
 
-/// `created` を取り消し、成功すれば `cause` を、取り消せなければ取り消し失敗の
-/// `Internal`（理由と `cause` のメッセージを併記）を返す。
+/// 取り消しが元どおりにできなかった理由。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+enum RollbackError {
+    /// 自分の葉は既に別の書き込み元の実体へ差し替えられていた。その実体は元の名前に
+    /// ある（触らなかった、または退避後に元の名前へ戻した）。データの欠落も退避も
+    /// 残っておらず、別の作成者との競合として報告する。
+    Conflict(String),
+    /// 取り消しを完了できなかった（退避先に他者の実体を残した場合は、その場所を含む）。
+    Failed(String),
+}
+
+/// `created` を取り消し、成功すれば `cause` を返す。取り消しの結果に応じて、
+/// 別の書き込み元との競合（`AlreadyExists`。`concurrent writer replaced the created
+/// guest file`）か、取り消し失敗（`Internal`。`created guest file could not be
+/// rolled back`）を返す。どちらも理由と `cause` のメッセージを併記する。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rollback_after(created: &Created, ancestors: &[&str], leaf: &str, cause: IoError) -> IoError {
     match rollback_created(created, ancestors, leaf) {
         Ok(()) => cause,
-        Err(detail) => IoError::new(
+        Err(RollbackError::Conflict(detail)) => IoError::new(
+            IoErrorCode::AlreadyExists,
+            format!(
+                "concurrent writer replaced the created guest file ({detail}); cause: {}",
+                cause.message()
+            ),
+        ),
+        Err(RollbackError::Failed(detail)) => IoError::new(
             IoErrorCode::Internal,
             format!(
                 "created guest file could not be rolled back ({detail}); cause: {}",
@@ -831,14 +869,23 @@ fn rollback_after(created: &Created, ancestors: &[&str], leaf: &str, cause: IoEr
 }
 
 /// 作成した葉と、新設した空の祖先を取り消す。失敗の理由（ホストのパスを含まない。
-/// 退避先の名前を含むことがある）を返す。
+/// 共有ルートからの退避先のパスを含むことがある）を返す。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn rollback_created(created: &Created, ancestors: &[&str], leaf: &str) -> Result<(), String> {
+fn rollback_created(
+    created: &Created,
+    ancestors: &[&str],
+    leaf: &str,
+) -> Result<(), RollbackError> {
     let Some(parent) = created.dirs.last() else {
-        return Err("missing parent handle".to_string());
+        return Err(RollbackError::Failed("missing parent handle".to_string()));
     };
-    remove_file_if_same(parent, leaf, &created.file)?;
-    rollback_dirs(&created.dirs, &created.made, ancestors)
+    let parent_path: String = ancestors.iter().map(|a| format!("{a}/")).collect();
+    let leaf_result = remove_file_if_same(parent, leaf, &created.file, &parent_path);
+    // 葉が他者の実体に差し替えられていても、新設した祖先は空なら取り除く（葉が
+    // 残っていれば空でないため、取り除かれない）。
+    let dirs_result = rollback_dirs(&created.dirs, &created.made, ancestors);
+    leaf_result?;
+    dirs_result.map_err(RollbackError::Failed)
 }
 
 /// 深い方から、本呼び出しが新設した祖先ディレクトリを空であれば取り除く
@@ -923,10 +970,11 @@ fn quarantine_name() -> String {
 const QUARANTINE_ENTRY: &str = "entry";
 
 /// 作成した葉 `parent`/`name` を取り消す（他者のデータを消さない手順。モジュール
-/// doc「プロセス間の競合」）。
+/// doc「プロセス間の競合」）。`parent_path` は共有ルートから `parent` までのゲスト
+/// 相対パス（`a/b/` の形。報告にだけ使う）。
 ///
 /// 1. 読み直した `name` の inode が保持 fd `expected` と一致することを確かめる
-///    （無ければ取り消す対象がなく成功。違えば触らずに失敗）
+///    （無ければ取り消す対象がなく成功。違えば触らずに `Conflict`）
 /// 2. `parent` 直下に自分だけが入れる私有ディレクトリ（`mkdirat` の mode `0o700`。
 ///    開いたハンドルの所有者が自プロセスの実効 uid で、グループ・その他の権限が
 ///    無いことを確かめる）を作り、そのハンドルへ `name` を `renameat` で移す。
@@ -934,22 +982,34 @@ const QUARANTINE_ENTRY: &str = "entry";
 ///    いても、それは消えずに私有ディレクトリへ移るだけになる
 /// 3. 私有ディレクトリ内のエントリの inode が `expected` と一致するときだけ
 ///    `unlinkat` する。私有ディレクトリへは他の uid が改名で差し込めないため、
-///    この確認から削除までの間に別の実体へ差し替えられない（同じ uid・root を除く）。
-///    一致しなければ私有ディレクトリに残して失敗し、その名前を報告する
-/// 4. 空になった私有ディレクトリを取り除く（ベストエフォート）
+///    この確認から削除までの間に別の実体へ差し替えられない（同じ uid・root を除く）
+/// 4. 一致しなければ（2 で他者の実体を移していたら）、上書きしない `linkat` で元の
+///    名前へ戻し、私有ディレクトリ側の名前を `unlinkat` して `Conflict` を返す。
+///    元の名前が既に再利用されていた・ハードリンクを作れない（ハードリンク非対応の
+///    FS・ディレクトリ・`fs.protected_hardlinks` による拒否）場合は、消さずに
+///    私有ディレクトリに残し、その場所を含めて `Failed` を返す（fail-closed）
+/// 5. 空になった私有ディレクトリを取り除く（ベストエフォート）
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn remove_file_if_same(parent: &File, name: &str, expected: &File) -> Result<(), String> {
+fn remove_file_if_same(
+    parent: &File,
+    name: &str,
+    expected: &File,
+    parent_path: &str,
+) -> Result<(), RollbackError> {
     use crate::sys::{
         BeneathError, DirMode, UnlinkTarget, effective_uid, mkdir_beneath, open_dir_beneath,
         rename_beneath, unlink_beneath,
     };
     use std::os::unix::fs::MetadataExt;
 
-    let (found, ino) = entry_ino(parent, name, expected)?;
+    let failed = RollbackError::Failed;
+    let (found, ino) = entry_ino(parent, name, expected).map_err(failed)?;
     match found {
         None => return Ok(()),
         Some(found) if found != ino => {
-            return Err("entry was replaced by another object".to_string());
+            return Err(RollbackError::Conflict(
+                "the entry was already replaced and was left untouched".to_string(),
+            ));
         }
         Some(_) => {}
     }
@@ -965,22 +1025,24 @@ fn remove_file_if_same(parent: &File, name: &str, expected: &File) -> Result<(),
                 break;
             }
             Ok(false) => {}
-            Err(_) => return Err("cannot create quarantine directory".to_string()),
+            Err(_) => return Err(failed("cannot create quarantine directory".to_string())),
         }
     }
     let Some(quarantine) = quarantine else {
-        return Err("no free quarantine name".to_string());
+        return Err(failed("no free quarantine name".to_string()));
     };
+    // 報告用の退避先（共有ルートからのゲスト相対パス。衛生化して埋め込む）。
+    let left_at = quote_for_message(&format!("{parent_path}{quarantine}/{QUARANTINE_ENTRY}"));
     let qdir = open_dir_beneath(parent, &quarantine)
-        .map_err(|_| format!("cannot open quarantine directory {quarantine:?}"))?;
+        .map_err(|_| failed(format!("cannot open quarantine directory {quarantine:?}")))?;
     let qmeta = qdir
         .metadata()
-        .map_err(|_| format!("cannot stat quarantine directory {quarantine:?}"))?;
+        .map_err(|_| failed(format!("cannot stat quarantine directory {quarantine:?}")))?;
     if qmeta.uid() != effective_uid() || qmeta.mode() & 0o077 != 0 {
         // 作成直後に同名へ他者のディレクトリが差し込まれた。触らずに止める。
-        return Err(format!(
+        return Err(failed(format!(
             "quarantine directory {quarantine:?} is not private"
-        ));
+        )));
     }
 
     #[cfg(test)]
@@ -993,30 +1055,71 @@ fn remove_file_if_same(parent: &File, name: &str, expected: &File) -> Result<(),
         }
         Err(_) => {
             let _ = remove_empty_dir_if_same(parent, &quarantine, &qdir);
-            return Err("rename to quarantine failed".to_string());
+            return Err(failed("rename to quarantine failed".to_string()));
         }
     }
-    let moved = find_in_handle(&qdir, QUARANTINE_ENTRY)
-        .map_err(|_| format!("cannot re-read quarantine; entry left in {quarantine:?}"))?;
-    match moved {
-        Some(moved) if moved == ino => {}
-        Some(_) => {
-            return Err(format!(
-                "entry was replaced before rollback; moved entry left in {quarantine:?}"
-            ));
+    let moved = find_in_handle(&qdir, QUARANTINE_ENTRY).map_err(|_| {
+        failed(format!(
+            "cannot re-read quarantine; entry left at {left_at}"
+        ))
+    })?;
+    let outcome = match moved {
+        None => Ok(()),
+        Some(moved) if moved == ino => {
+            match unlink_beneath(&qdir, QUARANTINE_ENTRY, UnlinkTarget::File) {
+                Ok(()) | Err(BeneathError::Io(ErrorKind::NotFound)) => Ok(()),
+                Err(_) => Err(failed(format!("unlink failed; entry left at {left_at}"))),
+            }
         }
-        None => {}
-    }
-    if moved.is_some() {
-        match unlink_beneath(&qdir, QUARANTINE_ENTRY, UnlinkTarget::File) {
-            Ok(()) | Err(BeneathError::Io(ErrorKind::NotFound)) => {}
-            Err(_) => return Err(format!("unlink failed; entry left in {quarantine:?}")),
-        }
-    }
-    // 空の私有ディレクトリの後始末（失敗しても取り消し自体は済んでいる）。
+        // 確認の直後に差し込まれた他者の実体を移してしまった。上書きしない linkat で
+        // 元の名前へ戻す。
+        Some(_) => restore_moved(parent, name, &qdir, &left_at),
+    };
+    // 空の私有ディレクトリの後始末（中に他者の実体を残した場合は空でないため残る）。
     let _ = remove_empty_dir_if_same(parent, &quarantine, &qdir);
-    Ok(())
+    outcome
 }
+
+/// 取り消しで私有ディレクトリ `qdir` へ移してしまった他者の実体を、上書きしない
+/// `linkat` で `parent`/`name` へ戻す（[`remove_file_if_same`] の 4）。戻せたら
+/// 私有ディレクトリ側の名前を消して `Conflict`、戻せなければ消さずに残して `Failed`
+/// （`left_at` は報告用の退避先）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn restore_moved(
+    parent: &File,
+    name: &str,
+    qdir: &File,
+    left_at: &str,
+) -> Result<(), RollbackError> {
+    use crate::sys::{BeneathError, UnlinkTarget, link_beneath, unlink_beneath};
+    #[cfg(test)]
+    fault::run_hook(fault::Hook::BeforeRestore);
+    match link_beneath(qdir, QUARANTINE_ENTRY, parent, name) {
+        Ok(()) => {}
+        Err(BeneathError::AlreadyExists) => {
+            return Err(RollbackError::Failed(format!(
+                "the name was reused before the replaced entry could be moved back; \
+                 entry left at {left_at}"
+            )));
+        }
+        Err(_) => {
+            return Err(RollbackError::Failed(format!(
+                "the replaced entry could not be linked back; entry left at {left_at}"
+            )));
+        }
+    }
+    // 元の名前にも同じ inode のリンクができたので、私有ディレクトリ側を消す（私有
+    // ディレクトリへは他の uid が差し込めない）。
+    match unlink_beneath(qdir, QUARANTINE_ENTRY, UnlinkTarget::File) {
+        Ok(()) | Err(BeneathError::Io(ErrorKind::NotFound)) => Err(RollbackError::Conflict(
+            "the replaced entry was moved back to its name".to_string(),
+        )),
+        Err(_) => Err(RollbackError::Failed(format!(
+            "the replaced entry was moved back but an extra link is left at {left_at}"
+        ))),
+    }
+}
+
 /// Windows 等のフォールバック。ルート直下から 1 階層ずつ、作成（`create_dir`）→
 /// 「reparse point を辿らず（`FILE_FLAG_OPEN_REPARSE_POINT`）・`FILE_SHARE_DELETE`
 /// なしで」ディレクトリを開いて保持→ reparse point / 非ディレクトリでないことを
@@ -1108,6 +1211,9 @@ mod fault {
         /// 取り消しで葉を退避名へ改名する直前（同一性確認の後。Linux / macOS）。
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         BeforeQuarantine,
+        /// 取り消しで移してしまった他者の実体を元の名前へ戻す直前（Linux / macOS）。
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        BeforeRestore,
     }
 
     type HookFn = Box<dyn FnOnce()>;
@@ -1119,6 +1225,8 @@ mod fault {
         static AFTER_CREATE: RefCell<Option<HookFn>> = const { RefCell::new(None) };
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         static BEFORE_QUARANTINE: RefCell<Option<HookFn>> = const { RefCell::new(None) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        static BEFORE_RESTORE: RefCell<Option<HookFn>> = const { RefCell::new(None) };
     }
 
     /// 注入状態を初期化する（各テストの先頭で呼ぶ）。
@@ -1129,6 +1237,8 @@ mod fault {
         AFTER_CREATE.with(|h| h.borrow_mut().take());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         BEFORE_QUARANTINE.with(|h| h.borrow_mut().take());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        BEFORE_RESTORE.with(|h| h.borrow_mut().take());
     }
 
     /// 以降の走査の読み取りのうち `n` 回目（0 起点）を失敗させる。
@@ -1154,6 +1264,8 @@ mod fault {
             Hook::AfterCreate => &AFTER_CREATE,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Hook::BeforeQuarantine => &BEFORE_QUARANTINE,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Hook::BeforeRestore => &BEFORE_RESTORE,
         };
         slot.with(|h| *h.borrow_mut() = Some(Box::new(f)));
     }
@@ -1165,6 +1277,8 @@ mod fault {
             Hook::AfterCreate => &AFTER_CREATE,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Hook::BeforeQuarantine => &BEFORE_QUARANTINE,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Hook::BeforeRestore => &BEFORE_RESTORE,
         };
         if let Some(f) = slot.with(|h| h.borrow_mut().take()) {
             f();
@@ -1545,10 +1659,10 @@ mod tests {
             std::fs::write(root.join("Foo"), b"variant").expect("variant");
         });
         let err = c.create_file("foo").err().expect("must fail");
-        assert_eq!(err.code(), IoErrorCode::Internal);
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
         assert!(
             err.message().starts_with(
-                "created guest file could not be rolled back (entry was replaced by another object); cause: created guest path was replaced during create"
+                "concurrent writer replaced the created guest file (the entry was already replaced and was left untouched); cause: created guest path was replaced during create"
             ),
             "{}",
             err.message()
@@ -1604,56 +1718,89 @@ mod tests {
         assert!(!t.0.join("d").exists());
     }
 
+    /// 共有ルート直下の `.fandhe-rollback-*`（取り消しの私有ディレクトリ）の名前。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn quarantine_dirs(root: &Path) -> Vec<String> {
+        std::fs::read_dir(root)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".fandhe-rollback-"))
+            .collect()
+    }
+
     /// 取り消しの同一性確認の直後に、葉の名前へ他者のファイルが差し込まれた場合、
-    /// それを消さずに私有ディレクトリへ移して残し、その名前を報告する（Codex P0
-    /// 指摘。大小違いを作れるのは大文字小文字を区別する FS のみのため Linux 限定）。
-    #[cfg(target_os = "linux")]
+    /// 私有ディレクトリへ移してしまったそれを上書きしない `linkat` で元の名前へ戻し、
+    /// 競合（`AlreadyExists`）として報告する（Codex P0 指摘。取り消しは再検証の
+    /// 読み取り失敗の注入で起こす）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn io5_rollback_race_moves_foreign_file_to_quarantine() {
-        use std::os::unix::fs::MetadataExt;
+    fn io5_rollback_race_restores_foreign_file() {
         fault::reset();
         let t = Tmp::new();
         let c = GuestFileCreator::new(t.0.clone()).expect("creator");
-        let external = t.0.join("Foo");
-        fault::set_hook(fault::Hook::BeforeCreate, move || {
-            std::fs::write(external, b"variant").expect("variant");
-        });
+        // 0 回目はルートの走査、1 回目が再検証のルート階層。
+        fault::fail_scan_at(1);
         let root = t.0.clone();
         fault::set_hook(fault::Hook::BeforeQuarantine, move || {
             std::fs::write(root.join("other"), b"theirs").expect("other");
             std::fs::rename(root.join("other"), root.join("foo")).expect("replace");
         });
         let err = c.create_file("foo").err().expect("must fail");
-        assert_eq!(err.code(), IoErrorCode::Internal);
-        assert!(
-            err.message().starts_with(
-                "created guest file could not be rolled back (entry was replaced before rollback; moved entry left in \".fandhe-rollback-"
-            ),
-            "{}",
-            err.message()
-        );
-        let quarantined: Vec<_> = std::fs::read_dir(&t.0)
-            .expect("read_dir")
-            .map(|e| e.expect("entry").file_name().into_string().expect("utf-8"))
-            .filter(|n| n.starts_with(".fandhe-rollback-"))
-            .collect();
-        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
-        let qdir = t.0.join(quarantined.first().expect("quarantine dir"));
-        assert!(
-            err.message()
-                .contains(quarantined.first().expect("name").as_str()),
-            "{}",
-            err.message()
-        );
-        let meta = std::fs::metadata(&qdir).expect("quarantine meta");
-        assert!(meta.is_dir());
-        assert_eq!(meta.mode() & 0o077, 0, "quarantine must be private");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
         assert_eq!(
-            std::fs::read(qdir.join("entry")).expect("moved foreign file"),
-            b"theirs"
+            err.message(),
+            "concurrent writer replaced the created guest file (the replaced entry was \
+             moved back to its name); cause: failed to verify guest directory (Other)"
         );
-        assert!(!t.0.join("foo").exists());
-        assert_eq!(std::fs::read(t.0.join("Foo")).expect("read"), b"variant");
+        assert_eq!(std::fs::read(t.0.join("foo")).expect("restored"), b"theirs");
+        assert!(
+            quarantine_dirs(&t.0).is_empty(),
+            "{:?}",
+            quarantine_dirs(&t.0)
+        );
+        assert_eq!(entries(&t.0), 1);
+    }
+
+    /// 元の名前が戻す前に再利用されていたら、移してしまった他者のファイルは消さずに
+    /// 私有ディレクトリへ残し、その場所を含めて `Internal` で報告する。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn io5_rollback_race_keeps_foreign_file_when_name_is_reused() {
+        use std::os::unix::fs::MetadataExt;
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        fault::fail_scan_at(1);
+        let root = t.0.clone();
+        fault::set_hook(fault::Hook::BeforeQuarantine, move || {
+            std::fs::write(root.join("other"), b"theirs").expect("other");
+            std::fs::rename(root.join("other"), root.join("foo")).expect("replace");
+        });
+        let root = t.0.clone();
+        fault::set_hook(fault::Hook::BeforeRestore, move || {
+            std::fs::write(root.join("foo"), b"third").expect("reuse the name");
+        });
+        let err = c.create_file("foo").err().expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+        let dirs = quarantine_dirs(&t.0);
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        let qname = dirs.first().expect("quarantine dir");
+        assert_eq!(
+            err.message(),
+            format!(
+                "created guest file could not be rolled back (the name was reused before the \
+                 replaced entry could be moved back; entry left at \"{qname}/entry\"); cause: \
+                 failed to verify guest directory (Other)"
+            )
+        );
+        let qdir = t.0.join(qname);
+        assert_eq!(
+            std::fs::metadata(&qdir).expect("quarantine").mode() & 0o077,
+            0,
+            "quarantine must be private"
+        );
+        assert_eq!(std::fs::read(qdir.join("entry")).expect("kept"), b"theirs");
+        assert_eq!(std::fs::read(t.0.join("foo")).expect("reused"), b"third");
     }
 
     /// 件数上限は要求パスの祖先に沿って取り込む実在項目の合計に掛かる。上限以内なら

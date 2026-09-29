@@ -153,6 +153,11 @@ read_input() {
     exec 3<"$path" || exit 10
     # /dev/fd/3 の stat は開いた fd 自体を指す（Linux・macOS 共通）
     [ -f /dev/fd/3 ] || exit 11
+    # open 後に再検証する。open 直前に symlink へ差し替えられていた場合、fd はリンク先を
+    # 指すが、パスは（差し替えが続く限り）symlink のままか、fd と別の inode になる。
+    # パスが symlink でなく、かつ開いた fd と同一ファイルであることを確かめる。
+    [ ! -L "$path" ] || exit 12
+    [ "$path" -ef /dev/fd/3 ] || exit 12
     exec head -c "$((MAX_INPUT_BYTES + 1))" <&3 >"$dst"
   ) 2>/dev/null &
   reader_pid=$!
@@ -172,6 +177,11 @@ read_input() {
     11)
       rm -f -- "$dst"
       err "invalid-input" "${what} is not a regular file (it may have been replaced after validation): ${path}"
+      exit 2
+      ;;
+    12)
+      rm -f -- "$dst"
+      err "invalid-input" "${what} is a symlink or was replaced while opening, refusing to use it: ${path}"
       exit 2
       ;;
     137)

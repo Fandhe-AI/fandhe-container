@@ -28,10 +28,10 @@
 //!
 //! | code | 意味 |
 //! | ---- | ---- |
-//! | 0 | `serve` がピアの切断（`UNAVAILABLE`）で終わった |
+//! | 0 | `serve` がフレーム境界でのピア切断（`UNAVAILABLE`・正常切断）で終わった |
 //! | 2 | 引数エラー |
 //! | 3 | 起動処理の失敗（sink open・bind・accept の失敗やタイムアウト） |
-//! | 4 | `serve` が `UNAVAILABLE` 以外のエラーで終わった |
+//! | 4 | `serve` が正常切断以外（フレーム途中の切断・接続リセット・その他のエラー）で終わった |
 //! | 5 | 未対応 OS（Linux / macOS 以外） |
 //!
 //! 終了時は標準エラーへ JSON を 1 行出す（SIGKILL 時は出ない）。accept・recv・send は
@@ -48,7 +48,7 @@ const EXIT_USAGE: u8 = 2;
 /// 終了コード: 起動処理の失敗。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const EXIT_STARTUP: u8 = 3;
-/// 終了コード: `serve` が切断以外で終了。
+/// 終了コード: `serve` が正常切断以外で終了。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const EXIT_SERVE: u8 = 4;
 /// 終了コード: 未対応 OS。
@@ -220,6 +220,20 @@ mod app {
         }
     }
 
+    /// フレーム境界での正常なピア切断（1 バイトも読めていない EOF）のメッセージ。
+    /// `crates/io/src/server.rs` の `read_exact_with` が返す文言と一致させる
+    /// （`crates/io/tests/server.rs` の drain 後の recv テストが同じ文言を固定している）。
+    const CLEAN_DISCONNECT_MESSAGE: &str =
+        "peer closed the connection before sending a complete frame header";
+
+    /// `serve` の終了理由が「フレーム境界での正常な切断」かを判定する。
+    /// `UNAVAILABLE` にはフレーム途中の切断・接続リセット・poison 済み接続も含まれるため、
+    /// コードだけでは判定せず、メッセージで正常切断だけを選ぶ（IO-3。不完全なフレームでの
+    /// 切断を正常終了にすると後続のクラッシュ耐性試験が異常終了を見逃す）。
+    fn is_clean_peer_disconnect(end: &IoError) -> bool {
+        end.code() == IoErrorCode::Unavailable && end.message() == CLEAN_DISCONNECT_MESSAGE
+    }
+
     fn run_server(args: &ServerArgs) -> Exit {
         let batch = match &args.batch_size {
             Some(v) => match parse_batch_size(v) {
@@ -268,7 +282,7 @@ mod app {
                 send: timeout,
             },
         );
-        let code = if report.end.code() == IoErrorCode::Unavailable {
+        let code = if is_clean_peer_disconnect(&report.end) {
             EXIT_OK
         } else {
             EXIT_SERVE
@@ -277,6 +291,28 @@ mod app {
             code,
             error: report.end,
             stats: Some(report.stats),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// IO-3・TASK-18.1.1: 正常切断だけが終了コード 0 の対象になる。
+        #[test]
+        fn only_clean_disconnect_is_ok() {
+            let clean = IoError::new(IoErrorCode::Unavailable, CLEAN_DISCONNECT_MESSAGE);
+            assert!(is_clean_peer_disconnect(&clean));
+            for msg in [
+                "peer closed the connection in the middle of a frame header",
+                "peer closed the connection before sending a complete frame body",
+                "peer connection is unavailable: connection reset",
+            ] {
+                let e = IoError::new(IoErrorCode::Unavailable, msg);
+                assert!(!is_clean_peer_disconnect(&e), "{msg}");
+            }
+            let other = IoError::new(IoErrorCode::Internal, CLEAN_DISCONNECT_MESSAGE);
+            assert!(!is_clean_peer_disconnect(&other));
         }
     }
 

@@ -2513,13 +2513,24 @@ mod imp {
         what: &'static str,
         wait: &mut ReadWait,
     ) -> Result<(), IoError> {
-        let peer_closed = || {
-            IoError::new(
-                IoErrorCode::Unavailable,
-                format!("peer closed the connection before sending a complete {what}"),
-            )
-        };
+        // 1 バイトも読めていない EOF はフレーム境界での正常な切断、読み途中の EOF は
+        // 不完全なフレームでの切断なので、メッセージで区別する
+        // （SIGKILL テスト用サーバー `crash_test_server` が正常切断だけを終了コード 0 に
+        // するため。TASK-18.1.1・#825・IO-3）。
         let mut filled = 0usize;
+        let peer_closed = |filled: usize| {
+            if filled == 0 {
+                IoError::new(
+                    IoErrorCode::Unavailable,
+                    format!("peer closed the connection before sending a complete {what}"),
+                )
+            } else {
+                IoError::new(
+                    IoErrorCode::Unavailable,
+                    format!("peer closed the connection in the middle of a {what}"),
+                )
+            }
+        };
         while filled < buf.len() {
             wait.before_read(stream, deadline)?;
             let Some(dst) = buf.get_mut(filled..) else {
@@ -2529,12 +2540,12 @@ mod imp {
                 ));
             };
             match stream.read(dst) {
-                Ok(0) => return Err(peer_closed()),
+                Ok(0) => return Err(peer_closed(filled)),
                 Ok(n) => filled += n,
                 // drain モード（相手が切断済み）で受信バッファが尽きた。EOF と
                 // 同じ扱いにする（ReadWait 参照）。
                 Err(e) if wait.is_draining() && e.kind() == io::ErrorKind::WouldBlock => {
-                    return Err(peer_closed());
+                    return Err(peer_closed(filled));
                 }
                 Err(e)
                     if matches!(
@@ -3032,6 +3043,24 @@ mod imp {
             assert_eq!(
                 err.message(),
                 "peer closed the connection before sending a complete frame header"
+            );
+        }
+
+        /// IO-3・#825: 読み途中の EOF は正常切断と別メッセージ（不完全なフレームでの切断）。
+        #[test]
+        fn io3_825_partial_header_eof_has_distinct_message() {
+            use std::io::Write as _;
+            let (mut reader, mut writer) = UnixStream::pair().expect("socketpair");
+            writer.write_all(&[1u8, 2, 3]).expect("write partial");
+            drop(writer);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut buf = [0u8; 8];
+            let err = read_exact_until(&mut reader, &mut buf, deadline, "frame header")
+                .expect_err("EOF mid-header must fail");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+            assert_eq!(
+                err.message(),
+                "peer closed the connection in the middle of a frame header"
             );
         }
 

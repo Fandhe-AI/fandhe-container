@@ -305,6 +305,30 @@ impl CaseCollisionSet {
         self.path_count == 0
     }
 
+    /// `path` が（大文字小文字まで完全一致で）登録済みのパスかを返す（索引は変更
+    /// しない。形式不正のパスは `false`）。
+    ///
+    /// 呼び出し側が「新規登録になる場合だけ件数上限を適用する」判定に使う
+    /// （TASK-19.2・IO-5。`crate::guest_files` の索引上限。完全一致の再登録は
+    /// [`Self::len`] を増やさないため上限の対象外）。
+    pub fn contains(&self, path: &str) -> bool {
+        let Ok(components) = validate_guest_relative_path(path) else {
+            return false;
+        };
+        let mut parent = ROOT_NODE;
+        let mut is_path_end = false;
+        for component in &components {
+            match self.nodes.get(&CaseFoldKey::new(parent, component)) {
+                Some(entry) if entry.original == *component => {
+                    parent = entry.id;
+                    is_path_end = entry.is_path_end;
+                }
+                _ => return false,
+            }
+        }
+        is_path_end
+    }
+
     /// `path` を登録せずに、[`Self::try_insert`] が衝突で失敗するかだけを検査する
     /// （索引は変更しない。TASK-19.2・IO-5。ファイル作成の成功後に
     /// [`Self::try_insert`] で登録を確定する呼び出し側が、失敗した作成の登録を

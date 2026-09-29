@@ -48,7 +48,9 @@
 //! - 索引の確定: 衝突は [`CaseCollisionSet::check_insertable`] で先に検査し、
 //!   実ファイルの作成に成功してから登録を確定する。作成が失敗しても索引は
 //!   汚れない（末端が既存で `AlreadyExists` のときは実体があるため登録する）。
-//! - 件数上限は完全一致の再登録も含めて先に判定する（判定を単純にするため）。
+//! - 件数上限（[`GuestFileCreator::with_max_tracked_paths`]）は新規登録になる
+//!   ときだけ適用する（完全一致の再登録は件数を増やさないため対象外。上限到達後も
+//!   既存パスは `AlreadyExists`、大小違いは衝突として報告する）。
 //! - 作成は全接続で直列化される（性能最適化は範囲外）。
 //! - Unicode 正規化（NFC / NFD）は行わない（#103・TASK-21）。260 文字超の検証は
 //!   TASK-20。
@@ -179,7 +181,7 @@ impl GuestFileCreator {
     /// 大文字小文字だけが違う既存パスと衝突する場合は `AlreadyExists`
     /// （`case-insensitive path collision: ...`）、同一パスが既に存在する場合は
     /// `AlreadyExists`（`guest file already exists: ...`）、不正なパスは
-    /// `InvalidArgument`、索引の件数上限超過は `ResourceExhausted`
+    /// `InvalidArgument`、新規登録で索引の件数上限を超える場合は `ResourceExhausted`
     /// （IO-5・TASK-19.2）。
     pub fn create_file(&self, guest_path: &str) -> Result<AppendFileSink, IoError> {
         if guest_path.len() > MAX_GUEST_PATH_BYTES {
@@ -201,15 +203,17 @@ impl GuestFileCreator {
         // 共有ルートに元からある項目（表記違いの祖先など）を先に索引へ取り込む。
         self.seed_existing(state, ancestors)?;
         let set = &mut state.set;
-        if set.len() >= self.max_tracked {
+        // 衝突の検査を件数上限より先に行い、上限到達後も衝突を衝突として報告する。
+        // 索引は変更せず、実ファイルの作成に成功してから登録を確定する
+        // （作成失敗で実体のないパスが索引に残らないようにする）。
+        set.check_insertable(guest_path)?;
+        // 上限は新規登録になるときだけ適用する（完全一致の再登録は件数を増やさない）。
+        if !set.contains(guest_path) && set.len() >= self.max_tracked {
             return Err(IoError::new(
                 IoErrorCode::ResourceExhausted,
                 "too many tracked guest paths",
             ));
         }
-        // 索引は変更せず衝突だけ検査し、実ファイルの作成に成功してから登録を
-        // 確定する（作成失敗で実体のないパスが索引に残らないようにする）。
-        set.check_insertable(guest_path)?;
 
         let file = match create_beneath(&self.root_dir, &self.base, ancestors, leaf) {
             Ok(file) => file,
@@ -236,7 +240,8 @@ impl GuestFileCreator {
     /// 別プロセスが共有ルートへ後から追加した項目も検出するため、走査済みの
     /// 印は持たない。走査は保持したルートのハンドル起点で行い（Linux / macOS は
     /// 各階層もハンドル相対で開く）、索引化専用で作成先の解決には使わない。
-    /// 件数上限超過は `ResourceExhausted`、読み取りの失敗は `Internal`、
+    /// 登録済みの項目は件数上限の対象にせず、新規登録で上限を超えるときだけ
+    /// `ResourceExhausted`。読み取りの失敗は `Internal`、
     /// 既存項目どうしの大文字小文字衝突は `AlreadyExists`
     /// （IO-5 の検査を完了できないまま作成へ進まない。fail-closed）。
     fn seed_existing(&self, state: &mut IndexState, ancestors: &[&str]) -> Result<(), IoError> {
@@ -246,13 +251,19 @@ impl GuestFileCreator {
             let entries = cursor.read_entries(self.max_tracked)?;
             for name in entries {
                 let Some(name) = name.to_str() else { continue };
+                let path = format!("{prefix}{name}");
+                // 登録済みの項目（前回の走査・作成で取り込んだもの）は件数に
+                // 影響しないため、上限より先に読み飛ばす。
+                if state.set.contains(&path) {
+                    continue;
+                }
                 if state.set.len() >= self.max_tracked {
                     return Err(IoError::new(
                         IoErrorCode::ResourceExhausted,
                         "too many tracked guest paths",
                     ));
                 }
-                match state.set.try_insert(&format!("{prefix}{name}")) {
+                match state.set.try_insert(&path) {
                     Ok(()) => {}
                     // 形式不正の名前（ホストで表現できない等）は索引化できないだけで
                     // 無視する。

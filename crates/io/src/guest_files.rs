@@ -136,7 +136,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::error::{IoError, IoErrorCode};
-use crate::fs_normalize::{CaseCollisionSet, quote_for_message};
+use crate::fs_normalize::{CaseCollisionSet, collision_error, quote_for_message};
 use crate::writeback::AppendFileSink;
 
 /// ゲスト相対パスのバイト長の上限（Linux の PATH_MAX 相当。DoS 防止のため
@@ -325,6 +325,17 @@ impl GuestFileCreator {
                         "guest file already exists: {}",
                         quote_for_message(guest_path)
                     ),
+                ));
+            }
+            Err(CreateError::ExistsAs(existing)) => {
+                // 走査の後に別の作成者が大小違いの項目を作り、大文字小文字を区別しない
+                // ホストが既存として拒否した。要求の表記では登録せず衝突として返す。
+                let prefix: String = ancestors.iter().map(|a| format!("{a}/")).collect();
+                return Err(collision_error(
+                    guest_path,
+                    &format!("{prefix}{existing}"),
+                    leaf,
+                    &existing,
                 ));
             }
             Err(CreateError::Other(err)) => return Err(err),
@@ -581,10 +592,52 @@ impl ScanCursor {
 
 /// [`create_beneath`] の失敗種別。
 enum CreateError {
-    /// 末端が既に存在する。
+    /// 末端が同じ表記で既に存在する。
     Exists,
+    /// 末端の作成が既存として失敗し、親ディレクトリには大文字小文字だけが違う
+    /// 表記（値）のエントリがあった（大文字小文字を区別しないホストで、走査の後に
+    /// 別の作成者が作った場合）。
+    ExistsAs(String),
     /// 構造化済みのその他のエラー。
     Other(IoError),
+}
+
+/// 末端の作成が既存として失敗したとき、親ディレクトリ `parent` で実在する表記を
+/// 確かめる（Windows 等のフォールバック。親は固定済みの祖先のため、パス結合による
+/// 読み直しも範囲内に留まる）。同じ表記があれば `Exists`、大文字小文字だけが違う
+/// 表記があれば `ExistsAs`、どちらも無ければ（作成の失敗後に消えた）`Exists`。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn classify_existing(parent: &Path, leaf: &str) -> CreateError {
+    use crate::fs_normalize::fold_component;
+    let dir = match std::fs::read_dir(parent) {
+        Ok(dir) => dir,
+        Err(err) => {
+            return CreateError::Other(internal("failed to inspect guest directory", err.kind()));
+        }
+    };
+    let folded = fold_component(leaf);
+    let mut variant = None;
+    for entry in dir {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                return CreateError::Other(internal(
+                    "failed to inspect guest directory",
+                    err.kind(),
+                ));
+            }
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name == leaf {
+            return CreateError::Exists;
+        }
+        if variant.is_none() && fold_component(&name) == folded {
+            variant = Some(name);
+        }
+    }
+    variant.map_or(CreateError::Exists, CreateError::ExistsAs)
 }
 
 /// 作成に成功した結果（Linux / macOS）。再検証・取り消しは、作成に使った
@@ -669,6 +722,31 @@ fn create_beneath(
     };
     match create_leaf_beneath(parent, leaf) {
         Ok(file) => Ok(Created { file, dirs, made }),
+        Err(BeneathError::AlreadyExists) => {
+            // 実在する表記を確かめる（大文字小文字を区別しないホストでは、走査の後に
+            // 作られた大小違いの項目でも `O_EXCL` が既存として失敗するため）。
+            let folded = crate::fs_normalize::fold_component(leaf);
+            let mut exact = false;
+            let mut variant: Option<String> = None;
+            let scanned = visit_handle(parent, "failed to inspect guest directory", |name, _| {
+                if name == leaf {
+                    exact = true;
+                    return std::ops::ControlFlow::Break(());
+                }
+                if variant.is_none()
+                    && let Some(name) = name.to_str()
+                    && crate::fs_normalize::fold_component(name) == folded
+                {
+                    variant = Some(name.to_string());
+                }
+                std::ops::ControlFlow::Continue(())
+            });
+            match scanned {
+                Err(err) => Err(CreateError::Other(err)),
+                Ok(()) if exact => Err(CreateError::Exists),
+                Ok(()) => Err(variant.map_or(CreateError::Exists, CreateError::ExistsAs)),
+            }
+        }
         Err(err) => {
             let _ = rollback_dirs(&dirs, &made, ancestors);
             Err(map(err))
@@ -696,7 +774,7 @@ fn verify_created(
     ancestors: &[&str],
     leaf: &str,
 ) -> Result<File, IoError> {
-    use crate::fs_normalize::{collision_error, fold_component};
+    use crate::fs_normalize::fold_component;
     use std::ops::ControlFlow;
     use std::os::unix::fs::MetadataExt;
 
@@ -725,7 +803,7 @@ fn verify_created(
         };
         let folded = fold_component(component);
         let mut own_ino = None;
-        let mut other: Option<String> = None;
+        let mut other: Option<(String, u64)> = None;
         let scanned = visit_handle(dir, "failed to verify guest directory", |name, ino| {
             if name == component {
                 own_ino = Some(ino);
@@ -733,7 +811,7 @@ fn verify_created(
                 && let Some(name) = name.to_str()
                 && fold_component(name) == folded
             {
-                other = Some(name.to_string());
+                other = Some((name.to_string(), ino));
             }
             ControlFlow::Continue(())
         });
@@ -751,15 +829,22 @@ fn verify_created(
                     return Err(fail(&created, err));
                 }
                 None => {
-                    let err = IoError::new(
-                        IoErrorCode::Internal,
-                        "created guest path was removed or renamed during create",
-                    );
+                    // 大文字小文字を区別しないホストでは、走査の後に作られた表記違いの
+                    // 祖先をそのまま開いて作成しうる。その場合は衝突として返す。
+                    let err = match &other {
+                        Some((name, ino)) if *ino == child_meta.ino() => {
+                            collision_error(guest_path, &format!("{prefix}{name}"), component, name)
+                        }
+                        _ => IoError::new(
+                            IoErrorCode::Internal,
+                            "created guest path was removed or renamed during create",
+                        ),
+                    };
                     return Err(fail(&created, err));
                 }
             }
         }
-        if let Some(other) = other {
+        if let Some((other, _)) = other {
             let err = collision_error(guest_path, &format!("{prefix}{other}"), component, &other);
             return Err(fail(&created, err));
         }
@@ -1045,7 +1130,9 @@ fn create_beneath(
         .map(|file| Created { file })
         .map_err(|err| {
             if err.kind() == ErrorKind::AlreadyExists {
-                CreateError::Exists
+                // 実在する表記を確かめる（NTFS は大文字小文字を区別しないため、走査の
+                // 後に作られた大小違いの項目でも `create_new` が既存として失敗する）。
+                classify_existing(&path, leaf)
             } else {
                 CreateError::Other(internal("failed to create guest file", err.kind()))
             }

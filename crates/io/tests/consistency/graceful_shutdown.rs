@@ -189,7 +189,7 @@ impl Session {
     /// `Flush` を送り、`unacked` 件の Write ACK だけを受け取ってからクライアント
     /// を drop し、サーバーの終了を待つ（グレースフルシャットダウン (a)。
     /// persist 対応環境では Write ACK の後に FlushAck も受け取り、非対応環境
-    /// 〔Linux 5.8 未満・非 Linux。TASK-15.3・#88〕では FlushAck の代わりに EOF を
+    /// 〔Linux 5.8 未満・その他の OS〕では FlushAck の代わりに EOF を
     /// 確認する〔IO-2・TASK-15.2.2・#824〕）。
     fn shutdown_with_flush(mut self) -> WritebackReport {
         self.client

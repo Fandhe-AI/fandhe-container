@@ -496,7 +496,7 @@ pub fn recv_flush_ack_if_supported(
 /// Flush を送って ACK を受け取ったクライアントが接続を閉じた後の、サーバーの
 /// 終了コード期待値（production と同じ判定で分ける）。対応環境は FlushAck を
 /// 返してループを続け、EOF で `Unavailable`。非対応環境は persist が
-/// `Unimplemented` で拒否されてそのコードで終わる（5.8 未満・非 Linux〔#88〕）。
+/// `Unimplemented` で拒否されてそのコードで終わる（5.8 未満・その他の OS）。
 pub fn flush_session_end_code() -> IoErrorCode {
     if fandhe_container_io::persist_support().is_supported() {
         IoErrorCode::Unavailable

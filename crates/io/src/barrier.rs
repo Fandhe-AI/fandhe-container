@@ -35,8 +35,14 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - macOS / Windows には代替フラッシュがなく `Unimplemented` を返す
-//!   （TASK-15.3・#88）。
+//! - macOS / Windows の代替フラッシュ（TASK-15.3・#88）は sink が持つファイル自体
+//!   （データ＋ファイルメタデータ）だけを `File::sync_all` で永続化する
+//!   （[`PersistSupport::SupportedFileSync`]）。Linux の `syncfs` と違い、新規作成
+//!   ファイルの親ディレクトリエントリの永続化は保証しない（sink が親ディレクトリを
+//!   知らないため。追跡は out-of-scope）。macOS は `F_FULLFSYNC` を使うため、それを
+//!   拒否する FS（一部のネットワーク FS 等）では `fsync` へフォールバックせず
+//!   失敗として FlushAck を返さない（fail-closed）。Linux・macOS・Windows 以外の OS は
+//!   `Unimplemented` を返す。
 //! - FLUSH による増幅（#824 の A4）への対策は 2 つ: [`crate::writeback::AppendFileSink`]
 //!   は直近の成功以降に書き込みがなければ syncfs を再発行しない（書き込みを
 //!   伴わない連続 FLUSH の合流）。また、プロセス全体で同時に実行中の syncfs の
@@ -476,8 +482,8 @@ where
 /// 解放済み（[`PersistSlot`] 参照）。タイムアウトで返るときは detach された
 /// helper が `work` が戻るまで枠を保持し続ける。
 #[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "Linux の syncfs 経路と単体テストのみが使う")
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code, reason = "対応 OS の永続化経路と単体テストのみが使う")
 )]
 fn run_with_deadline_tracked<F>(
     limiter: &'static PersistLimiter,
@@ -569,8 +575,7 @@ impl PersistFailure {
 /// [`IoErrorCode::Unimplemented`] で拒否し、FlushAck を返さない（fail-closed）。
 /// 利用者・結合試験はこの判定で「FlushAck が返る環境か」を production と同じ
 /// 基準で知る（判定を 2 か所に持たないため）。非対応の理由を区別できるよう
-/// 列挙型で返す（将来の代替フラッシュ〔TASK-15.3・#88〕で値を足せるよう
-/// `#[non_exhaustive]`）。
+/// 列挙型で返す（値を足せるよう `#[non_exhaustive]`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PersistSupport {
@@ -580,14 +585,22 @@ pub enum PersistSupport {
     /// Linux 5.8 未満、またはカーネル版数を判定できない。`syncfs(2)` が書き戻し
     /// 失敗を隠して 0 を返しうるため拒否する（ディストロのバックポートも安全側で拒否）。
     KernelTooOld,
-    /// Linux 以外の OS。代替フラッシュが未実装（TASK-15.3・#88）。
+    /// Linux・macOS・Windows 以外の OS。代替フラッシュが未実装。
     UnsupportedOs,
+    /// macOS / Windows（TASK-15.3・#88）。sink が持つファイルを `File::sync_all`
+    /// （macOS は `F_FULLFSYNC`、Windows は `FlushFileBuffers`）で永続化して
+    /// から FlushAck を返す。
+    ///
+    /// REPAIR-3: 保証範囲は sink のファイル自体（データ＋ファイルメタデータ）のみで、
+    /// Linux の `syncfs` と異なり新規作成ファイルの親ディレクトリエントリは
+    /// 対象外。`F_FULLFSYNC` 非対応の FS では失敗し FlushAck を返さない。
+    SupportedFileSync,
 }
 
 impl PersistSupport {
     /// FlushAck を返せる（永続化に対応する）環境か。
     pub fn is_supported(self) -> bool {
-        matches!(self, Self::Supported)
+        matches!(self, Self::Supported | Self::SupportedFileSync)
     }
 }
 
@@ -596,7 +609,8 @@ impl PersistSupport {
 /// Linux では `/proc/sys/kernel/osrelease` を読み、5.8 以上なら
 /// [`PersistSupport::Supported`]、5.8 未満・読み取り失敗・解釈不能なら
 /// [`PersistSupport::KernelTooOld`]（fail-closed）。結果はプロセス内で 1 回だけ
-/// 判定してキャッシュする。Linux 以外は [`PersistSupport::UnsupportedOs`]。
+/// 判定してキャッシュする。macOS / Windows は [`PersistSupport::SupportedFileSync`]、
+/// それ以外の OS は [`PersistSupport::UnsupportedOs`]。
 pub fn persist_support() -> PersistSupport {
     #[cfg(target_os = "linux")]
     {
@@ -613,7 +627,11 @@ pub fn persist_support() -> PersistSupport {
             }
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        PersistSupport::SupportedFileSync
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         PersistSupport::UnsupportedOs
     }
@@ -623,9 +641,12 @@ pub fn persist_support() -> PersistSupport {
 /// TASK-15.2.2・#824）。
 ///
 /// [`crate::writeback::AppendFileSink`] の `persist` から、実行環境の判定
-/// （[`persist_support`]）を渡して呼ばれる。[`PersistSupport::Supported`] なら
+/// （[`persist_support`]）を渡して呼ばれる。[`PersistSupport::Supported`]（Linux）なら
 /// `file` を dup した fd に対し `crate::sys::syncfs` を helper スレッドで 1 回
-/// だけ実行する。失敗しても再試行しない（errseq は 1 回しか報告しないため。
+/// だけ実行する。[`PersistSupport::SupportedFileSync`]（macOS / Windows）なら
+/// dup したハンドルに `File::sync_all` を同じく helper スレッドで 1 回だけ実行する。
+/// 判定と実行 OS が食い違う値（Linux 上の `SupportedFileSync` 等）が注入された
+/// 場合も syscall を発行せず拒否する。失敗しても再試行しない（errseq は 1 回しか報告しないため。
 /// 呼び出し側の sink がポイズンする）。それ以外は syscall を発行せず
 /// [`IoErrorCode::Unimplemented`]（`issued == false`。sink はポイズンしない）。
 ///
@@ -645,16 +666,44 @@ pub(crate) fn persist_file_system(
     timeout: IoTimeout,
 ) -> Result<Duration, PersistFailure> {
     match support {
-        PersistSupport::Supported => sync_file_system(limiter, file, timeout),
+        PersistSupport::Supported => {
+            #[cfg(target_os = "linux")]
+            {
+                sync_file_system(limiter, file, timeout)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(mismatched_support())
+            }
+        }
+        PersistSupport::SupportedFileSync => {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            {
+                sync_file_system(limiter, file, timeout)
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                Err(mismatched_support())
+            }
+        }
         PersistSupport::KernelTooOld => Err(PersistFailure::not_issued(IoError::new(
             IoErrorCode::Unimplemented,
             "kernel older than 5.8 (or unknown) cannot report syncfs write-back errors; refusing to send FlushAck",
         ))),
         PersistSupport::UnsupportedOs => Err(PersistFailure::not_issued(IoError::new(
             IoErrorCode::Unimplemented,
-            "persist is not implemented on this OS (TASK-15.3, #88)",
+            "persist is not implemented on this OS",
         ))),
     }
+}
+
+/// 判定値が実行 OS と食い違う（他 OS 用の値が注入された）場合の拒否。syscall は
+/// 発行しない（`issued == false`）。
+fn mismatched_support() -> PersistFailure {
+    PersistFailure::not_issued(IoError::new(
+        IoErrorCode::Unimplemented,
+        "persist support does not match this OS; refusing to send FlushAck",
+    ))
 }
 
 /// Linux の永続化本体: dup した fd に `syncfs(2)` をタイムアウト付きで 1 回だけ
@@ -684,19 +733,43 @@ fn sync_file_system(
     })
 }
 
-/// 非 Linux 版: 代替フラッシュ未実装（TASK-15.3・#88）。[`persist_support`] が
-/// [`PersistSupport::Supported`] を返さないため通常は到達しないが、判定を
-/// 注入された場合も syscall を発行せず fail-closed で拒否する。
-#[cfg(not(target_os = "linux"))]
+/// macOS / Windows の永続化本体（TASK-15.3・#88）: dup したハンドルに
+/// [`sync_file`] を helper スレッドで 1 回だけ発行する（REPAIR-5）。limiter・
+/// タイムアウト・発行後失敗の扱いは Linux 版と同一。発行後の失敗は sink が
+/// ポイズンする（fsync 系の失敗後はページが clean 扱いになりうるため、再試行の
+/// 成功は永続化を意味しない）。ハンドル複製の失敗は発行前（`issued == false`）。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn sync_file_system(
-    _limiter: &'static PersistLimiter,
-    _file: &File,
-    _timeout: IoTimeout,
+    limiter: &'static PersistLimiter,
+    file: &File,
+    timeout: IoTimeout,
 ) -> Result<Duration, PersistFailure> {
-    Err(PersistFailure::not_issued(IoError::new(
-        IoErrorCode::Unimplemented,
-        "persist is not implemented on this OS (TASK-15.3, #88)",
-    )))
+    let dup = file.try_clone().map_err(|err| {
+        PersistFailure::not_issued(IoError::new(
+            IoErrorCode::Internal,
+            format!("failed to duplicate handle for persist ({:?})", err.kind()),
+        ))
+    })?;
+    let mut dispatched = false;
+    run_with_deadline_tracked(limiter, timeout, move || sync_file(&dup), &mut dispatched).map_err(
+        |error| PersistFailure {
+            error,
+            issued: dispatched,
+        },
+    )
+}
+
+/// `File::sync_all`（std の安全 API）でファイルのデータとメタデータを永続化する。
+/// std は Apple では `fcntl(F_FULLFSYNC)`、Windows では `FlushFileBuffers` を使う。
+/// エラーには `ErrorKind` のみを含め、パスや内容は含めない。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn sync_file(file: &File) -> Result<(), IoError> {
+    file.sync_all().map_err(|err| {
+        IoError::new(
+            IoErrorCode::Internal,
+            format!("file sync failed ({:?})", err.kind()),
+        )
+    })
 }
 
 /// `syncfs(2)` が書き戻し失敗を報告するカーネルの最小版数（major, minor）。
@@ -1013,10 +1086,10 @@ mod tests {
         assert!(!release_supports_syncfs_errors("5.x"));
     }
 
-    /// IO-2・TASK-15.2.2: Linux では実ファイルへの persist が成功する。
-    #[cfg(target_os = "linux")]
+    /// IO-2・TASK-15.2.2・TASK-15.3: 対応環境（Linux 5.8 以上・macOS・Windows）では
+    /// 実ファイルへの persist が成功する。
     #[test]
-    fn io2_persist_file_system_ok_on_linux() {
+    fn io2_persist_file_system_ok_when_supported() {
         let file = tempfile_in_target();
         // syncfs はファイルシステム全体を同期するため、並列テストや共有 runner の
         // 書き込み負荷で数秒かかりうる。許容上限（MAX_IO_TIMEOUT）まで待ち、
@@ -1035,8 +1108,17 @@ mod tests {
             PersistSupport::Supported => {
                 assert!(result.is_ok(), "persist_file_system failed: {result:?}");
             }
+            PersistSupport::SupportedFileSync => {
+                assert!(result.is_ok(), "persist_file_system failed: {result:?}");
+            }
             other => {
-                assert_eq!(other, PersistSupport::KernelTooOld);
+                assert!(
+                    matches!(
+                        other,
+                        PersistSupport::KernelTooOld | PersistSupport::UnsupportedOs
+                    ),
+                    "{other:?}"
+                );
                 let failure = result.expect_err("pre-5.8 kernel must be rejected");
                 assert_eq!(failure.error.code(), IoErrorCode::Unimplemented);
                 assert!(!failure.issued);
@@ -1044,8 +1126,9 @@ mod tests {
         }
     }
 
-    /// IO-2・IO-3: `persist_support` は Linux では `/proc/sys/kernel/osrelease`
-    /// の版数ゲートと一致し、非 Linux では `UnsupportedOs` を返す。
+    /// IO-2・IO-3・TASK-15.3: `persist_support` は Linux では
+    /// `/proc/sys/kernel/osrelease` の版数ゲートと一致し、macOS / Windows では
+    /// `SupportedFileSync`、それ以外では `UnsupportedOs` を返す。
     #[test]
     fn io2_persist_support_matches_platform_gate() {
         let support = persist_support();
@@ -1059,9 +1142,17 @@ mod tests {
             };
             assert_eq!(support, expected, "release = {release:?}");
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(support, PersistSupport::SupportedFileSync);
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         assert_eq!(support, PersistSupport::UnsupportedOs);
-        assert_eq!(support.is_supported(), support == PersistSupport::Supported);
+        assert_eq!(
+            support.is_supported(),
+            matches!(
+                support,
+                PersistSupport::Supported | PersistSupport::SupportedFileSync
+            )
+        );
     }
 
     /// IO-2・IO-3（Codex #1142 指摘）: 非対応の判定（旧カーネル・非 Linux）を
@@ -1075,7 +1166,16 @@ mod tests {
         ));
         let file = File::create(&path).expect("create temp file");
         let _ = std::fs::remove_file(&path);
-        for support in [PersistSupport::KernelTooOld, PersistSupport::UnsupportedOs] {
+        // 実行 OS と食い違う対応値（他 OS 用）も syscall を発行せず拒否する。
+        #[cfg(target_os = "linux")]
+        let mismatched = PersistSupport::SupportedFileSync;
+        #[cfg(not(target_os = "linux"))]
+        let mismatched = PersistSupport::Supported;
+        for support in [
+            PersistSupport::KernelTooOld,
+            PersistSupport::UnsupportedOs,
+            mismatched,
+        ] {
             let failure = persist_file_system(support, default_persist_limiter(), &file, ms(100))
                 .expect_err("must be rejected");
             assert_eq!(
@@ -1084,11 +1184,9 @@ mod tests {
                 "{support:?}"
             );
             assert!(!failure.issued, "{support:?}");
-            assert!(!support.is_supported());
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn tempfile_in_target() -> File {
         let path = std::env::temp_dir().join(format!(
             "fandhe-io-persist-{}-{:?}",
@@ -1131,10 +1229,10 @@ mod tests {
         assert!(dispatched);
     }
 
-    /// IO-2・TASK-15.3: 非 Linux では `Unimplemented`（#88 で代替を実装）。
-    #[cfg(not(target_os = "linux"))]
+    /// IO-2・TASK-15.3: Linux・macOS・Windows 以外では `Unimplemented`。
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     #[test]
-    fn io2_persist_file_system_unimplemented_off_linux() {
+    fn io2_persist_file_system_unimplemented_on_other_os() {
         let path = std::env::temp_dir().join(format!("fandhe-io-persist-{}", std::process::id()));
         let file = File::create(&path).expect("create temp file");
         let _ = std::fs::remove_file(&path);
@@ -1143,8 +1241,30 @@ mod tests {
             persist_file_system(persist_support(), default_persist_limiter(), &file, ms(100))
                 .expect_err("must be unimplemented");
         assert!(!failure.issued);
-        let err = failure.error;
-        assert_eq!(err.code(), IoErrorCode::Unimplemented);
+        assert_eq!(failure.error.code(), IoErrorCode::Unimplemented);
+    }
+
+    /// IO-2・TASK-15.3: Windows の `FlushFileBuffers` は書き込みアクセスが必須のため、
+    /// 読み取り専用ハンドルへの persist は発行後の失敗（`issued == true`。sink は
+    /// ポイズン対象）になり、成功を偽装しない（fail-closed）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn io2_persist_file_system_read_only_handle_fails_issued_on_windows() {
+        let path =
+            std::env::temp_dir().join(format!("fandhe-io-persist-ro-{}", std::process::id()));
+        File::create(&path).expect("create temp file");
+        let file = File::open(&path).expect("open read-only");
+        let failure = persist_file_system(
+            PersistSupport::SupportedFileSync,
+            default_persist_limiter(),
+            &file,
+            IoTimeout::new(crate::MAX_IO_TIMEOUT).expect("valid timeout"),
+        )
+        .expect_err("read-only handle must fail");
+        assert!(failure.issued);
+        assert_eq!(failure.error.code(), IoErrorCode::Internal);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// テスト専用: 指定した種別の [`InFlightRequest`] を、公開 API

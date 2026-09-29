@@ -209,8 +209,9 @@ impl SinkPersistReport {
 ///
 /// # 永続化（IO-2・TASK-15.2.2）
 /// [`BatchSink::persist`] は [`crate::barrier::persist_support`] が対応と判定した
-/// 環境（Linux 5.8 以上）で `syncfs(2)` を発行する（他は `Unimplemented`。
-/// 非 Linux の代替は TASK-15.3・#88）。syncfs を発行した後に失敗・タイムアウトした
+/// 環境で永続化する（Linux 5.8 以上は `syncfs(2)`、macOS / Windows は TASK-15.3・#88 の
+/// `File::sync_all`。sink のファイル自体のみが対象で、新規作成ファイルの親ディレクトリ
+/// エントリの永続化は保証しない。他は `Unimplemented`）。syncfs を発行した後に失敗・タイムアウトした
 /// sink はポイズンされ（カーネル版数拒否・fd 複製・枠確保・スレッド生成など
 /// 発行前の失敗はポイズンせず再試行可）、以後の `persist` は syscall を発行せず
 /// `Internal` を返す。

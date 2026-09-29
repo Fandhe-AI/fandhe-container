@@ -606,7 +606,7 @@ mod unix {
 
     /// IO-1・IO-2: Write 3 件 + Flush で、滞留分の ACK 3 件が届いた後、
     /// persist 対応環境では FlushAck 3 が届いてクライアントの切断で `Unavailable`、
-    /// 非対応環境（Linux 5.8 未満・非 Linux。代替フラッシュは TASK-15.3・#88）では
+    /// 非対応環境（Linux 5.8 未満・その他の OS）では
     /// FlushAck なしで EOF になり `Unimplemented` で終わる（D4 の fail-closed。
     /// 期待値は `persist_support` で分け、どちらの経路も照合する）。
     #[test]

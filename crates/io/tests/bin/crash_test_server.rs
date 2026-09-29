@@ -294,6 +294,19 @@ mod app {
         }
     }
 
+    pub fn run() -> ExitCode {
+        let args = match parse_args(std::env::args_os().skip(1)) {
+            Ok(a) => a,
+            Err(e) => {
+                report_exit(&e, None);
+                return ExitCode::from(EXIT_USAGE);
+            }
+        };
+        let exit = run_server(&args);
+        report_exit(&exit.error, exit.stats.as_ref());
+        ExitCode::from(exit.code)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -314,19 +327,6 @@ mod app {
             let other = IoError::new(IoErrorCode::Internal, CLEAN_DISCONNECT_MESSAGE);
             assert!(!is_clean_peer_disconnect(&other));
         }
-    }
-
-    pub fn run() -> ExitCode {
-        let args = match parse_args(std::env::args_os().skip(1)) {
-            Ok(a) => a,
-            Err(e) => {
-                report_exit(&e, None);
-                return ExitCode::from(EXIT_USAGE);
-            }
-        };
-        let exit = run_server(&args);
-        report_exit(&exit.error, exit.stats.as_ref());
-        ExitCode::from(exit.code)
     }
 }
 

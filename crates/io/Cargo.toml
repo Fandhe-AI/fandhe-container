@@ -21,7 +21,6 @@ crash-test-server = []
 name = "crash_test_server"
 path = "tests/bin/crash_test_server.rs"
 required-features = ["crash-test-server"]
-test = false
 bench = false
 doc = false
 

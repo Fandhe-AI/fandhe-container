@@ -360,6 +360,8 @@ jobs:
             exit 0
           fi
           cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server
+          # crash_test_server bin 内のユニットテスト（--test '*' の対象外）も実行する
+          cargo test -p fandhe-container-io --bins --features crash-test-server
 
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）

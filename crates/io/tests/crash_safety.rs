@@ -101,7 +101,11 @@ mod unix {
         let dir = TempDir::new("ok");
         let mut child = spawn_server(&dir);
         wait_ready(&mut child);
-        drop(UnixStream::connect(dir.0.join("s.sock")).expect("connect must succeed"));
+        // 接続直後に閉じると、サーバーが accept する前に切断が listen キューへ届く競合が
+        // 起こり得る。accept を済ませて recv 待ちに入る猶予を与えてから閉じる。
+        let stream = UnixStream::connect(dir.0.join("s.sock")).expect("connect must succeed");
+        std::thread::sleep(Duration::from_millis(300));
+        drop(stream);
         let status = wait_exit(&mut child);
         let mut stderr = String::new();
         child

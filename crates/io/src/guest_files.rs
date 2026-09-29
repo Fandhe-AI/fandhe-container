@@ -33,8 +33,15 @@
 //!   `O_CREAT|O_EXCL|O_NOFOLLOW` で作る（[`crate::sys::create_file_beneath`]）。
 //!   パスを再解決しないため、祖先の symlink すり替え（TOCTOU）でも共有ルート外へ
 //!   は出られない。
-//! - Windows のフォールバックは `symlink_metadata` での祖先確認＋`create_new` で、
-//!   祖先の TOCTOU は未対策（ルート相対ハンドル作成への置き換えは後続。REPAIR-3）。
+//! - Windows は祖先の TOCTOU（確認後の junction / symlink すり替え）を防ぐ
+//!   ルート相対ハンドル作成が未実装のため、祖先を持つパス（`a/b` 等）の作成を
+//!   `Unimplemented` で拒否する（fail-closed）。ルート直下の単一名だけは許す
+//!   （`NtCreateFile` のルート相対ハンドル作成への置き換えは後続。REPAIR-3）。
+//! - 既存項目の取り込み: 索引は API 経由の登録だけでなく、作成のたびに祖先
+//!   ディレクトリの実在エントリを（未走査のものに限り）読んで取り込む。共有
+//!   ルートに元からある `Foo` があれば `foo/bar` は衝突になる。作成が祖先の
+//!   作成後に失敗しても、残った祖先は次回の走査で取り込まれる。走査は名前の
+//!   索引化だけに使い、書き込み先の解決には使わない（非 UTF-8 名は取り込めない）。
 //! - 索引の確定: 衝突は [`CaseCollisionSet::check_insertable`] で先に検査し、
 //!   実ファイルの作成に成功してから登録を確定する。作成が失敗しても索引は
 //!   汚れない（末端が既存で `AlreadyExists` のときは実体があるため登録する）。
@@ -43,6 +50,7 @@
 //! - Unicode 正規化（NFC / NFD）は行わない（#103・TASK-21）。260 文字超の検証は
 //!   TASK-20。
 
+use std::collections::HashSet;
 use std::fs::File;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::fs::OpenOptions;
@@ -67,7 +75,14 @@ pub const MAX_TRACKED_GUEST_PATHS: usize = 1 << 20;
 pub struct GuestFileCreator {
     root: PathBuf,
     max_tracked: usize,
-    index: Mutex<CaseCollisionSet>,
+    index: Mutex<IndexState>,
+}
+
+/// 衝突索引と、既存エントリを取り込み済みのディレクトリ（ゲスト相対の
+/// 表記どおりの接頭辞。ルートは空文字）の集合。
+struct IndexState {
+    set: CaseCollisionSet,
+    scanned: HashSet<String>,
 }
 
 fn invalid(message: &str) -> IoError {
@@ -117,7 +132,10 @@ impl GuestFileCreator {
         Ok(Self {
             root,
             max_tracked,
-            index: Mutex::new(CaseCollisionSet::new()),
+            index: Mutex::new(IndexState {
+                set: CaseCollisionSet::new(),
+                scanned: HashSet::new(),
+            }),
         })
     }
 
@@ -128,7 +146,7 @@ impl GuestFileCreator {
 
     /// 索引に登録済みのパス件数。
     pub fn tracked_len(&self) -> Result<usize, IoError> {
-        Ok(self.index.lock().map_err(|_| poisoned())?.len())
+        Ok(self.index.lock().map_err(|_| poisoned())?.set.len())
     }
 
     /// ゲスト相対パス `guest_path`（`/` 区切り）のファイルを新規作成して sink を返す。
@@ -149,7 +167,15 @@ impl GuestFileCreator {
         }
 
         // 検査から作成・登録までを同じガードで直列化する。
-        let mut set = self.index.lock().map_err(|_| poisoned())?;
+        let mut state = self.index.lock().map_err(|_| poisoned())?;
+        let state = &mut *state;
+        let (ancestors, leaf) = match components.split_last() {
+            Some((leaf, ancestors)) => (ancestors, *leaf),
+            None => return Err(invalid("guest path is empty")),
+        };
+        // 共有ルートに元からある項目（表記違いの祖先など）を先に索引へ取り込む。
+        self.seed_existing(state, ancestors)?;
+        let set = &mut state.set;
         if set.len() >= self.max_tracked {
             return Err(IoError::new(
                 IoErrorCode::ResourceExhausted,
@@ -160,10 +186,6 @@ impl GuestFileCreator {
         // 確定する（作成失敗で実体のないパスが索引に残らないようにする）。
         set.check_insertable(guest_path)?;
 
-        let (ancestors, leaf) = match components.split_last() {
-            Some((leaf, ancestors)) => (ancestors, *leaf),
-            None => return Err(invalid("guest path is empty")),
-        };
         let file = match create_beneath(&self.root, ancestors, leaf) {
             Ok(file) => file,
             Err(CreateError::Exists) => {
@@ -177,10 +199,57 @@ impl GuestFileCreator {
                     ),
                 ));
             }
-            Err(CreateError::Other(err)) => return Err(err),
+            Err(CreateError::Other(err)) => {
+                // 祖先だけ作られて葉が失敗した場合に備え、走査済み印を捨てて
+                // 次回に実在エントリを取り込み直す（索引に無い祖先の取りこぼし防止）。
+                state.scanned.clear();
+                return Err(err);
+            }
         };
         set.try_insert(guest_path)?;
         AppendFileSink::new(file)
+    }
+
+    /// `ancestors` に沿って実在するディレクトリの項目を、未走査のものに限り索引へ
+    /// 取り込む（表記どおりの実在ディレクトリだけを辿る。symlink は辿らない）。
+    /// 走査は索引化専用で、作成先の解決には使わない。件数上限超過は
+    /// `ResourceExhausted`。
+    fn seed_existing(&self, state: &mut IndexState, ancestors: &[&str]) -> Result<(), IoError> {
+        let mut dir = self.root.clone();
+        let mut prefix = String::new();
+        for level in 0..=ancestors.len() {
+            if !state.scanned.contains(&prefix) {
+                let entries = match std::fs::read_dir(&dir) {
+                    Ok(entries) => entries,
+                    Err(_) => return Ok(()),
+                };
+                for entry in entries {
+                    let Ok(entry) = entry else { continue };
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else { continue };
+                    if state.set.len() >= self.max_tracked {
+                        return Err(IoError::new(
+                            IoErrorCode::ResourceExhausted,
+                            "too many tracked guest paths",
+                        ));
+                    }
+                    // 元から衝突している項目や不正な名前は取り込めないだけで無視する。
+                    let _ = state.set.try_insert(&format!("{prefix}{name}"));
+                }
+                state.scanned.insert(prefix.clone());
+            }
+            let Some(component) = ancestors.get(level) else {
+                break;
+            };
+            dir.push(component);
+            match std::fs::symlink_metadata(&dir) {
+                Ok(meta) if meta.is_dir() => {}
+                _ => return Ok(()),
+            }
+            prefix.push_str(component);
+            prefix.push('/');
+        }
+        Ok(())
     }
 }
 
@@ -212,20 +281,22 @@ fn create_beneath(root: &Path, ancestors: &[&str], leaf: &str) -> Result<File, C
     })
 }
 
-/// Windows 等のフォールバック（パス再解決あり。祖先の TOCTOU は未対策で、
-/// 後続で `NtCreateFile` のルート相対ハンドル作成へ置き換える。IO-5・REPAIR-3）。
+/// Windows 等のフォールバック。祖先の TOCTOU を防ぐルート相対ハンドル作成
+/// （`NtCreateFile`）は未実装のため、祖先を持つパスは拒否する（fail-closed）。
+/// ルート直下の単一名はルートが信頼済みで再解決の余地がないため作成する
+/// （IO-5・REPAIR-3）。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn create_beneath(root: &Path, ancestors: &[&str], leaf: &str) -> Result<File, CreateError> {
-    let mut host = root.to_path_buf();
-    for component in ancestors {
-        host.push(component);
-        ensure_real_directory(&host).map_err(CreateError::Other)?;
+    if !ancestors.is_empty() {
+        return Err(CreateError::Other(IoError::new(
+            IoErrorCode::Unimplemented,
+            "creating files below a subdirectory is not supported on this platform yet",
+        )));
     }
-    host.push(leaf);
     OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&host)
+        .open(root.join(leaf))
         .map_err(|err| {
             if err.kind() == ErrorKind::AlreadyExists {
                 CreateError::Exists
@@ -233,37 +304,6 @@ fn create_beneath(root: &Path, ancestors: &[&str], leaf: &str) -> Result<File, C
                 CreateError::Other(internal("failed to create guest file", err.kind()))
             }
         })
-}
-
-/// `dir` が実ディレクトリであることを保証する（無ければ作る。symlink・非
-/// ディレクトリは拒否する）。フォールバック専用。
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn ensure_real_directory(dir: &Path) -> Result<(), IoError> {
-    let check = |dir: &Path| -> Result<bool, IoError> {
-        match std::fs::symlink_metadata(dir) {
-            Ok(meta) if meta.is_dir() => Ok(true),
-            Ok(_) => Err(invalid("guest path ancestor is not a directory")),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(internal(
-                "failed to inspect guest path ancestor",
-                err.kind(),
-            )),
-        }
-    };
-    if check(dir)? {
-        return Ok(());
-    }
-    match std::fs::create_dir(dir) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-            if check(dir)? {
-                Ok(())
-            } else {
-                Err(invalid("guest path ancestor is not a directory"))
-            }
-        }
-        Err(err) => Err(internal("failed to create guest directory", err.kind())),
-    }
 }
 
 #[cfg(test)]
@@ -388,6 +428,7 @@ mod tests {
         assert_eq!(entries(&outside.0), 0);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn io5_failed_create_does_not_pollute_index() {
         let t = Tmp::new();
@@ -396,10 +437,7 @@ mod tests {
         std::fs::write(t.0.join("a"), b"x").expect("write");
         let err = c.create_file("a/b").err().expect("must fail");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
-        assert_eq!(c.tracked_len().expect("len"), 0);
-        // a をディレクトリへ直すと、大小違いの A/b も衝突扱いにならず作成できる。
-        std::fs::remove_file(t.0.join("a")).expect("rm");
-        c.create_file("A/b").expect("no stale collision");
+        // 取り込まれるのは実在する `a` だけで、失敗した `a/b` は登録されない。
         assert_eq!(c.tracked_len().expect("len"), 1);
     }
 
@@ -414,6 +452,48 @@ mod tests {
         let err = c.create_file("f").err().expect("must reject");
         assert_eq!(err.code(), IoErrorCode::AlreadyExists);
         assert!(!target.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn io5_preexisting_directory_case_variant_collides() {
+        let t = Tmp::new();
+        std::fs::create_dir(t.0.join("Foo")).expect("dir");
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let err = c.create_file("foo/bar").err().expect("must collide");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(err.message().starts_with("case-insensitive path collision"));
+        assert_eq!(entries(&t.0.join("Foo")), 0);
+        c.create_file("Foo/bar").expect("same spelling is fine");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn io5_ancestors_left_after_leaf_failure_are_indexed() {
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        // 葉が長すぎて作成に失敗する（祖先 `a` は作成済みで残る）。
+        let long = "x".repeat(300);
+        let err = c
+            .create_file(&format!("a/{long}"))
+            .err()
+            .expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+        assert!(t.0.join("a").is_dir());
+        let err = c.create_file("A/b").err().expect("must collide");
+        assert!(err.message().starts_with("case-insensitive path collision"));
+        c.create_file("a/b").expect("real spelling still works");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn io5_fallback_rejects_paths_with_ancestors() {
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let err = c.create_file("a/b").err().expect("must reject");
+        assert_eq!(err.code(), IoErrorCode::Unimplemented);
+        assert_eq!(entries(&t.0), 0);
+        c.create_file("top").expect("root-level file is allowed");
     }
 
     #[test]

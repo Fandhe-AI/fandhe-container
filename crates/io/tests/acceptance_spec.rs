@@ -12,7 +12,9 @@
 //!   [`crate::BatchBuffer`]。TASK-13.1・#76）に接続し、意図的に仕様を
 //!   満たさない観測に対して照合器が具体的な差分を返すことを固定テストとして
 //!   常設した
-//! - 残る TASK-15 / TASK-16 / TASK-17 / TASK-19 / TASK-20 の 5 行は、対応する
+//! - TASK-19.2（#100）で TASK-19（IO-5）の行を io の実 API
+//!   （[`fandhe_container_io::GuestFileCreator`]）に接続した
+//! - 残る TASK-15 / TASK-16 / TASK-17 / TASK-20 の 4 行は、対応する
 //!   io の実装（TASK-11・TASK-15〜20）が入るまで未接続のまま据え置く
 //!   （REPAIR-3: 実装済みを装わない）
 //! - 配置理由: spec（`docs/spec/05-tasks.md` の TASK-91）上の成果物パスは
@@ -41,7 +43,7 @@
 //! | TASK-15 | IO-2        | 書き込み ACK と FLUSH ACK が別種別として区別され、FLUSH ACK はバリア以前の書き込みの永続化後にのみ返ること（書き込み ACK（IO-1）自体の対応照合は本照合器の対象外で、TASK-12・13 の結合試験が担う） | 構造化 assert | 未接続（TASK-11 / TASK-15 で接続） |
 //! | TASK-16 | IO-10       | 未フラッシュ滞留量の上限が設定可能で、上限到達時に自動フラッシュが発行されること（`flush_every=<N>`） | 構造化 assert | 未接続（TASK-16 で接続）      |
 //! | TASK-17 | IO-2        | `docs/api/io-barrier.md` に ACK / FLUSH ACK の永続化保証の違いが明記されていること      | 文字列パターン照合  | 未接続（TASK-17 で文書作成後に接続） |
-//! | TASK-19 | IO-5        | 大文字小文字の違いのみで衝突する 2 ファイル作成が構造化エラー（`code`・`message`）で返ること | 構造化 assert  | 未接続（TASK-19 で接続）      |
+//! | TASK-19 | IO-5        | 大文字小文字の違いのみで衝突する 2 ファイル作成が構造化エラー（`code`・`message`）で返ること | 構造化 assert  | 接続済み（TASK-19.2 公開 API） |
 //! | TASK-20 | IO-5・WIN-4 | 260 文字を超える共有パスに警告またはエラーが返ること（しきい値 260/261 の境界）        | 構造化 assert       | 未接続（TASK-20 で接続）      |
 //!
 //! 対象外にした TASK と理由:
@@ -183,8 +185,8 @@ const ACCEPTANCE_TARGETS: &[AcceptanceTarget] = &[
         spec_fact: "大文字小文字の違いのみで衝突する 2 ファイル作成が\
             構造化エラー（`code`・`message`）で返ること",
         method: MatchMethod::StructuredAssert,
-        status: TargetStatus::NotWired {
-            text: "未接続（TASK-19 で接続）",
+        status: TargetStatus::Wired {
+            text: "接続済み（TASK-19.2 公開 API）",
         },
     },
     AcceptanceTarget {
@@ -1695,5 +1697,27 @@ fn repair_12_doc_table_column_mismatch_is_detected() {
     assert!(
         err.contains("status の不一致"),
         "接続済み行の書き換えの不一致原因が status になっていない: {err}"
+    );
+}
+
+/// TASK-19（IO-5）: 大文字小文字の違いのみで衝突する 2 ファイル作成が
+/// 構造化エラー（`code`・`message`）で返ること（TASK-19.2・#100）。
+#[test]
+fn repair_12_io5_case_collision_returns_structured_error() {
+    let root = std::env::temp_dir().join(format!("fcio-acc-io5-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("root must be creatable");
+    let creator = fandhe_container_io::GuestFileCreator::new(root.clone()).expect("creator");
+    creator.create_file("Foo.txt").expect("first create");
+    let err = creator
+        .create_file("foo.txt")
+        .err()
+        .expect("case-only collision must be an error");
+    let code = err.code().as_str();
+    let message = err.message().to_string();
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(code, "ALREADY_EXISTS");
+    assert!(
+        message.starts_with("case-insensitive path collision"),
+        "message: {message}"
     );
 }

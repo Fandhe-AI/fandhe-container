@@ -12,7 +12,9 @@
 //! [`server::UdsConnection`]。accept・送受信のイベントは
 //! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS `connect` と
 //! [`client::PipelineClient`] との本番結合・vsock・named pipe はまだない
-//! （REPAIR-3。スタブの明示）。
+//! （REPAIR-3。スタブの明示）。1 本の接続を送信側・受信側へ分けて並行に使う API は
+//! [`transport::SplitTransport`]（#1118）で、UDS サーバー側が
+//! [`server::UdsSendHalf`]・[`server::UdsRecvHalf`] として実装する。
 //! [`protocol::Frame`] のペイロード内部レイアウト（request id・ACK の対応付け）は
 //! [`payload`] モジュール（TASK-12.2・#74）が定める。[`client::PipelineClient::send`]
 //! はこの形式で request id を埋め込み、[`client::PipelineClient::recv_ack`]
@@ -27,10 +29,11 @@
 //! 書き込み完了後に通常 ACK を返すところまでは [`writeback`] モジュール
 //! （TASK-13.2.2・#822）がつなぐ（[`writeback::serve_connection`]・
 //! [`writeback::AppendFileSink`]）。FLUSH バリアの永続化に使う Linux 用の
-//! `syncfs(2)` FFI ラッパーは `sys` モジュール（非公開）に TASK-15.2.1・#823 で
-//! 用意済みだが、`writeback` への組み込みと FlushAck の返却（FlushAck・IO-2）は
-//! まだなく（TASK-15.2.2・#824）、`writeback` は `Flush` 受信時に滞留分を
-//! 書き込んだ後 `Unimplemented` で処理を終える。受信フレームの長さ・件数を
+//! `syncfs(2)` FFI ラッパー（`sys` モジュール・非公開。TASK-15.2.1・#823）は
+//! `writeback` の `Flush` 受信時に [`writeback::BatchSink::persist`] 経由で
+//! 呼ばれ、成功したときだけ FlushAck を返す（IO-2・TASK-15.2.2・#824。
+//! 失敗・タイムアウト・Linux 5.8 未満・非 Linux は FlushAck なしで終了。対応可否は
+//! [`barrier::persist_support`] で判定する。非 Linux の代替は TASK-15.3・#88）。受信フレームの長さ・件数を
 //! 本体バッファ確保前に上限検証する受理判定ゲート
 //! （[`recv_limits::ReceiveLimits`]・TASK-13.4・#796）も持つ。UDS 受信ループの
 //! 受付ループ（accept → 次の accept）・同時接続数の上限は後続 sub-issue が担う。
@@ -40,11 +43,12 @@
 //! FS 正規化層は、大文字小文字を区別しないホスト（APFS / NTFS）とゲスト
 //! （ext4）の差異による黙った上書きを防ぐため、ゲスト相対パスの大文字小文字
 //! 衝突を検出する（[`fs_normalize::CaseCollisionSet`]・
-//! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。サーバーの
-//! 書き込み経路への組み込みは #100（TASK-19.2）、パス長 260 超の検証は
+//! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。ファイル
+//! 作成経路への組み込みは [`guest_files::GuestFileCreator`]（TASK-19.2・#100。
+//! ワイヤー形式は変えないサーバー側 API で、ワイヤー上の作成要求は未実装〔REPAIR-3〕）
+//! が担い、検査済みの [`writeback::AppendFileSink`] を返す。パス長 260 超の検証は
 //! TASK-20、Unicode 正規化（NFC / NFD）は #103（TASK-21.h1）の方針決定後に
-//! TASK-21 でそれぞれ後続実装する
-//! （REPAIR-3。本 crate はまだこれらを呼び出していない）。
+//! TASK-21 で後続実装する。
 //!
 //! PLUG-1 区分は core（`fandhe-container-plugin` の境界機構とは別に、コアの一部として
 //! 直接リンクされる）。crate 名 `fandhe-container-io` は
@@ -58,6 +62,7 @@ mod checksum;
 pub mod client;
 pub mod error;
 pub mod fs_normalize;
+pub mod guest_files;
 pub mod observe;
 pub mod payload;
 pub mod protocol;
@@ -68,7 +73,10 @@ mod sys;
 pub mod transport;
 pub mod writeback;
 
-pub use barrier::{AckReceipt, FlushAck, FlushBarrier, WriteAck};
+pub use barrier::{
+    AckReceipt, FlushAck, FlushBarrier, MaxConcurrentPersist, PersistSupport, WriteAck,
+    max_concurrent_persist, persist_support, set_max_concurrent_persist,
+};
 pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
 };
@@ -79,12 +87,13 @@ pub use client::{
 };
 pub use error::{IoError, IoErrorCode};
 pub use fs_normalize::{CaseCollisionSet, MAX_COLLISION_MESSAGE_PATH_CHARS, check_case_collisions};
+pub use guest_files::{GuestFileCreator, MAX_GUEST_PATH_BYTES, MAX_TRACKED_GUEST_PATHS};
 pub use observe::{
-    AckEvent, AckEventError, DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver,
-    JsonLinesServerObserver, MAX_SEND_LOG_BUFFER_BYTES, MAX_SEND_LOG_CAPACITY,
-    MAX_SEND_LOG_MESSAGE_BYTES, MAX_SERVER_AUDIT_LOG_BUFFER_BYTES, NoopSendObserver,
-    NoopServerObserver, SERVER_AUDIT_LOG_CAPACITY, SendEvent, SendEventError, SendObserver,
-    ServerEvent, ServerObserver, ServerOp, ServerOutcome,
+    AckEvent, AckEventError, CoalescedServerEvents, DEFAULT_SEND_LOG_CAPACITY,
+    JsonLinesSendObserver, JsonLinesServerObserver, MAX_SEND_LOG_BUFFER_BYTES,
+    MAX_SEND_LOG_CAPACITY, MAX_SEND_LOG_MESSAGE_BYTES, MAX_SERVER_AUDIT_LOG_BUFFER_BYTES,
+    NoopSendObserver, NoopServerObserver, SERVER_AUDIT_LOG_CAPACITY, SendEvent, SendEventError,
+    SendObserver, ServerEvent, ServerObserver, ServerOp, ServerOutcome,
 };
 pub use payload::{
     ACK_PAYLOAD_LEN, AckEnvelope, MAX_WRITE_BODY_LEN, REQUEST_ID_WIRE_LEN, RequestEnvelope,
@@ -97,15 +106,16 @@ pub use protocol::{
 pub use recv_limits::{
     AdmittedHeader, MAX_CONTROL_PAYLOAD_LEN, MAX_RECV_PENDING_FRAMES, ReceiveLimits,
 };
-pub use server::{UdsConnection, UdsServer};
+pub use server::{UdsConnection, UdsRecvHalf, UdsSendHalf, UdsServer};
 pub use settings::{
     BATCH_SIZE_OPTION, BATCH_SIZE_SETTING_KEY, BoundConnection, BoundWriteback,
     MAX_BATCH_SIZE_ARG_LEN, WritebackSettings, parse_batch_size,
 };
 pub use transport::{
-    FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, WireFrame,
+    FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, SplitTransport,
+    WireFrame,
 };
 pub use writeback::{
-    AppendFileSink, BatchSink, SinkWriteReport, WritebackReport, WritebackStats, WritebackTimeouts,
-    serve_connection,
+    AppendFileSink, BatchSink, SinkPersistReport, SinkWriteReport, WritebackReport, WritebackStats,
+    WritebackTimeouts, serve_connection,
 };

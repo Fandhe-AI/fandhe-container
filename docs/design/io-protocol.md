@@ -6,7 +6,7 @@
 - 関連タスク: TASK-11.1（#68）・TASK-11.2（#69。ヘッダ newtype）・TASK-11.3（#70。チェックサム付きフレーム型）・TASK-11.4（#71。本節以降）・TASK-12.1（#73。送信キュー）・TASK-12.2（#74。ペイロード形式・ACK 受信）・TASK-13.1（#76。バッチ集約バッファ）・TASK-13.2.1（#820。UDS サーバー側トランスポート）・TASK-13.2.2（#822。バッチ write-back の実行・ACK 返却）・TASK-13.3（#78。バッチサイズ設定 API）・TASK-13.4（#796。受信フレームの受理判定ゲート）・TASK-15.1（#85。FLUSH バリア API 型定義・通常 ACK との区別）・TASK-83.1（#116。BREAK-2 相当のワイヤーレベル検出テスト）・TASK-83.2（#117。デコード時の範囲外長さ検証の強化とアロケーション前拒否のテスト）。ヘッダ拡張（version・header_crc）・接続再利用契約は TASK-12・TASK-13 着手前の設計レビュー（2026-09-28 オーナー決定・#67・#115）による
 - 関連ビヘイビア: IO-2（Flush / FlushAck 種別）・REPAIR-5（`IoTimeout`。無期限待ちを型で表現しない）
 - 対象マイルストーン: MS-1
-- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）、TASK-12.1 で追加した送信キュー（`SendQueue`・`PipelineClient`）、TASK-12.2 で追加したペイロード内部レイアウト（[`crates/io/src/payload.rs`](../../crates/io/src/payload.rs)）と ACK 受信・対応付け（`PipelineClient::recv_ack`）、TASK-13.2.1（#820）で追加した UDS サーバー側トランスポート（[`UdsServer`・`UdsConnection`](../../crates/io/src/server.rs)。Linux / macOS）、TASK-13.2.2（#822）で追加したバッチ write-back の実行と通常 ACK 返却（[`serve_connection`・`AppendFileSink`](../../crates/io/src/writeback.rs)）、TASK-13.3（#78）で追加したバッチサイズ設定 API（[`parse_batch_size`・`WritebackSettings`](../../crates/io/src/settings.rs)）、TASK-15.1（#85）で追加した FLUSH バリア API の ACK 型分離（[`barrier`](../../crates/io/src/barrier.rs) モジュールの `WriteAck`・`FlushAck`・`FlushBarrier`・`AckReceipt`、`PipelineClient::flush`）に加え、2026-09-28 の設計レビュー（TASK-12・TASK-13 着手前に P1 として指摘・オーナー決定で先行対応）で追加したヘッダの `version`・`header_crc` フィールドと、エラー後の接続再利用禁止契約を記録する。クライアント側の UDS 接続との本番結合・FLUSH ACK の返却・Windows のトランスポートは後続 sub-issue が本書へ追記する
+- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）、TASK-12.1 で追加した送信キュー（`SendQueue`・`PipelineClient`）、TASK-12.2 で追加したペイロード内部レイアウト（[`crates/io/src/payload.rs`](../../crates/io/src/payload.rs)）と ACK 受信・対応付け（`PipelineClient::recv_ack`）、TASK-13.2.1（#820）で追加した UDS サーバー側トランスポート（[`UdsServer`・`UdsConnection`](../../crates/io/src/server.rs)。Linux / macOS）、TASK-13.2.2（#822）で追加したバッチ write-back の実行と通常 ACK 返却（[`serve_connection`・`AppendFileSink`](../../crates/io/src/writeback.rs)）、TASK-13.3（#78）で追加したバッチサイズ設定 API（[`parse_batch_size`・`WritebackSettings`](../../crates/io/src/settings.rs)）、TASK-15.1（#85）で追加した FLUSH バリア API の ACK 型分離（[`barrier`](../../crates/io/src/barrier.rs) モジュールの `WriteAck`・`FlushAck`・`FlushBarrier`・`AckReceipt`、`PipelineClient::flush`）に加え、2026-09-28 の設計レビュー（TASK-12・TASK-13 着手前に P1 として指摘・オーナー決定で先行対応）で追加したヘッダの `version`・`header_crc` フィールドと、エラー後の接続再利用禁止契約を記録する。TASK-15.2.2（#824）で追加した FLUSH バリアの永続化（`syncfs`）と FLUSH ACK 返却（Linux）に加え、クライアント側の UDS 接続との本番結合・非 Linux の代替フラッシュ（TASK-15.3・#88）・Windows のトランスポートは後続 sub-issue が本書へ追記する
 
 ## バイトレイアウト
 
@@ -135,12 +135,20 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 
 `UdsServer::bind`・`UdsServer::accept`（`crates/io/src/server.rs`）は `crate::observe::ServerObserver` を必須引数として要求する（観測しない場合は呼び出し元が `NoopServerObserver` を明示的に渡す。暗黙の既定にはしない。TASK-12.1・#73 の `SendObserver` と同じ方針）。accept（`ServerOp::Accept`）は `bind` で渡した観測フックへ、1 接続内の送受信（`ServerOp::Recv`・`ServerOp::Send`）は `accept` が受け取る接続ごとの観測フックへ、成功・各拒否（プロトコル違反・`ReceiveLimits::admit` の拒否・poison 済みでの拒否）・タイムアウトを含む全分岐で最終結果のイベントを 1 回通知する。送受信は 1 回の呼び出しにつき 1 回だが、`accept` の中で peer credential 拒否が起きた場合は、拒否 1 件ごとのイベント（`reason` が `rejected_peer_credential`）に加えて最終的な成功・失敗イベントも通知するため、1 回の `accept` 呼び出しで `1 + 拒否件数` 回通知される（H1・#820 security-auditor 指摘対応。「UDS の peer credential 検証」節参照）。`on_event` はブロックする I/O を行わない（`crate::observe::JsonLinesServerObserver` はメモリ内バッファへ積むだけにとどめ、実際の書き出しは呼び出し元が `drain_lines` を呼んで行う）。
 
-既定実装 `JsonLinesServerObserver` の出力キーは `JsonLinesSendObserver`（TASK-12.1・#73）と共通の語彙に揃え、次の順で固定する: `event`（常に `"io_server"`）・`op`（`"accept"`/`"recv"`/`"send"`）・`kind`（`WRITE`/`ACK`/`FLUSH`/`FLUSH_ACK`。`Accept` やヘッダ検証前の拒否ではキー自体を省く）・`outcome`（`"ok"`/`"error"`）・`reason`（失敗系のみ。`success`/`rejected_poisoned`/`rejected_peer_credential`/`failure` のいずれかで、P1-3 の poison 拒否〔`rejected_poisoned`〕・peer credential 拒否〔`rejected_peer_credential`。H1・#820 security-auditor 指摘対応〕とそれ以外の失敗〔`failure`〕を区別できる。ただし監査枠があふれたときの集約行〔後述〕だけは `peer_credential_rejections_coalesced` を使う）・`code`（失敗系のみ・ERR-1 文字列）・`message`（失敗系のみ・512 バイトで切り詰め・エスケープ済み）・`message_truncated`（切り詰め発生時のみ `true`）・`accept_aborted_retries`（`u32`。`Accept` が `ConnectionAborted`〔相手が accept 完了前に切断した〕により受付ループ内で再試行した回数。`Recv`/`Send` では常に `0`）・`peer_credential_rejections`（`u32`。`Accept` が peer credential の検証失敗により再試行した回数。`accept_aborted_retries` とは別に数える。H1・#820 security-auditor 指摘対応。「UDS の peer credential 検証」節参照。`Recv`/`Send` では常に `0`）・`peer_uid`（`u32`。peer credential 拒否で接続元の uid が取得できた場合のみキーを出す。H1・#820）・`latency_us`。`JsonLinesServerObserver` は有界の一時バッファであり、永続的な SEC-4 監査ログではない（`drain_lines` で取り出した行を永続的な監査ログへ書き出す配線は TASK-13.2.2・#822 で行う）。バッファは 2 つの枠に分かれ、互いに追い出し合わない（#820 codex P0 指摘対応）:
+既定実装 `JsonLinesServerObserver` の出力キーは `JsonLinesSendObserver`（TASK-12.1・#73）と共通の語彙に揃え、次の順で固定する: `event`（常に `"io_server"`）・`op`（`"accept"`/`"recv"`/`"send"`）・`kind`（`WRITE`/`ACK`/`FLUSH`/`FLUSH_ACK`。`Accept` やヘッダ検証前の拒否ではキー自体を省く）・`outcome`（`"ok"`/`"error"`）・`reason`（失敗系のみ。`success`/`rejected_poisoned`/`rejected_peer_credential`/`failure` のいずれかで、P1-3 の poison 拒否〔`rejected_poisoned`〕・peer credential 拒否〔`rejected_peer_credential`。H1・#820 security-auditor 指摘対応〕とそれ以外の失敗〔`failure`〕を区別できる。ただし監査枠があふれたときの集約行〔後述〕だけは `peer_credential_rejections_coalesced` を使う）・`code`（失敗系のみ・ERR-1 文字列）・`message`（失敗系のみ・512 バイトで切り詰め・エスケープ済み）・`message_truncated`（切り詰め発生時のみ `true`）・`accept_aborted_retries`（`u32`。`Accept` が `ConnectionAborted`〔相手が accept 完了前に切断した〕により受付ループ内で再試行した回数。`Recv`/`Send` では常に `0`）・`peer_credential_rejections`（`u32`。`Accept` が peer credential の検証失敗により再試行した回数。`accept_aborted_retries` とは別に数える。H1・#820 security-auditor 指摘対応。「UDS の peer credential 検証」節参照。`Recv`/`Send` では常に `0`）・`peer_uid`（`u32`。peer credential 拒否で接続元の uid が取得できた場合のみキーを出す。H1・#820）・`coalesced`・`count`・`latency_sum_us`（分割後の保留キューがあふれた分の集約イベントのみ。下記「分割後の観測と集約イベント」節。#1118）・`latency_us`（集約イベントでは最大値）。`JsonLinesServerObserver` は有界の一時バッファであり、永続的な SEC-4 監査ログではない（`drain_lines` で取り出した行を永続的な監査ログへ書き出す配線は TASK-13.2.2・#822 で行う）。バッファは 2 つの枠に分かれ、互いに追い出し合わない（#820 codex P0 指摘対応）:
 
 - 通常枠（peer credential 拒否以外）: 行数上限（`DEFAULT_SEND_LOG_CAPACITY`・`MAX_SEND_LOG_CAPACITY`）・合計バイト数上限（`MAX_SEND_LOG_BUFFER_BYTES` = 1 MiB）・満杯時に新規イベント側を破棄して `dropped_count` を増やす方針を `JsonLinesSendObserver` と共有する
 - 監査枠（`reason` が `rejected_peer_credential` のイベント専用）: 行数上限 `SERVER_AUDIT_LOG_CAPACITY`（256 行）・合計バイト数上限 `MAX_SERVER_AUDIT_LOG_BUFFER_BYTES`（128 KiB）。満杯になっても拒否を捨てず、以降の拒否を 1 件の集約レコードに合算する（集約が始まったら drain まで以降の拒否はすべて集約する）。集約行は `{"event":"io_server","op":"accept","outcome":"error","reason":"peer_credential_rejections_coalesced","count":N,"last_peer_uid":U}`（`last_peer_uid` は最後に集約した拒否の接続元 uid で、取得できなかった場合はキー自体を省く）
 
 ためる量の上限は通常枠 1 MiB + 監査枠 128 KiB + 集約行 1 行（数値のみ・256 バイト以下）で、`message` の切り詰め長（`MAX_SEND_LOG_MESSAGE_BYTES`）は両枠で共通。`drain_lines` は両枠と集約行を `on_event` に届いた順にマージして 1 本で返し、集約行は最初に集約した拒否が届いた位置に置く（欠けた区間の始点を前後のイベントとの関係で示す。監査枠専用の drain API を別に設けると、`drain_lines` だけを呼ぶ呼び出し元が監査枠を取り出さず集約し続けるため採らない）。契約は「peer credential 拒否は黙って失われない（個別の行、または欠けた区間を明示する集約行として `drain_lines` に現れる）」。集約した件数の累計は `coalesced_peer_credential_rejections()`、集約が 1 度でも起きたかは `audit_degraded()`（drain 後も `false` に戻らない）で得られ、通常枠の破棄件数 `dropped_count` には拒否は含まれない。`bind` 自体（`ServerOp` に `Bind` は含まれない）は観測イベントを発生させない。
+
+#### 分割後の観測と集約イベント（REPAIR-4・REPAIR-5・#1118）
+
+`UdsConnection` を `SplitTransport::split` で `UdsSendHalf` / `UdsRecvHalf` に分けると、両半分は 1 つの観測フックを共有する。送受信の結果はいったん有界の保留キュー（`MAX_PENDING_EVENTS` = 1024 件）へ積み、フックのロックが取れたときに順序どおり適用する。I/O 経路はロックを待たず、排出も件数（`MAX_DRAIN_PER_CALL`）と送受信の `IoTimeout` 期限で打ち切る（REPAIR-5）。期限で残ったイベントは次の送受信・`with_observer`（クロージャの実行前に排出する）・最後の参照の drop のいずれかで必ず適用する。
+
+保留キューが満杯のときは、あふれた操作を捨てずに `(op, kind, outcome, code)` ごとの集約値へ合算する。集約値は、件数・所要時間の最大値と合計・最後のメッセージ（切り詰め済み）を持つ。分割後の両半分から届くキーは最大 100 種類で、表の上限は `MAX_COALESCED_KEYS` = 128 件（op 2 × kind 5 × 〔`(Success, なし)`・`(RejectedPoisoned, UNAVAILABLE)`・`(Failure, エラーコード 8 種類)`〕= 100。`Accept` と `RejectedPeerCredential` はこの経路を通らない）。表も満杯の場合は fail-closed で件数だけを数え、`ResourceExhausted` の欠落サマリ（`observer event queue overflowed; N events were dropped`）で通知する。排出の順序は 欠落サマリ → 集約イベント → キュー本体とする。時系列では集約分のほうが後だが、フック側の行数上限（既定 1024 行 = キュー上限）で捨てられないよう先に出す。
+
+集約値はフックへ `ServerEvent::coalesced = Some(CoalescedServerEvents { count, latency_sum })` の 1 イベントとして届く。このとき `latency` は集約した操作の **最大値** で、合計は `latency_sum` に入る（平均は `latency_sum / count`）。`JsonLinesServerObserver` はこれを、通常の行と同じキーに `"coalesced":true`・`count`（`u64`）・`latency_sum_us` を `latency_us` の直前へ加えた 1 行で出す。この行の `latency_us` は最大値である。例: `{"event":"io_server","op":"recv","kind":"WRITE","outcome":"error","reason":"failure","code":"TIMEOUT","message":"last","accept_aborted_retries":0,"peer_credential_rejections":0,"coalesced":true,"count":2,"latency_sum_us":11000,"latency_us":8000}`。`count` のない行は 1 行 1 操作なので、操作別・結果別の件数は「`count` があればその値、なければ 1」の合計で求められる。
 
 ### UDS の受信上限（[`ReceiveLimits`]。F・#820 codex P1 指摘対応）
 
@@ -274,11 +282,11 @@ BREAK-2 検出経路の整理:
 - `TryFrom<AckReceipt> for FlushAck` / `for WriteAck`: 「FLUSH ACK だけを待つ」呼び出し元が型で絞り込める変換（逆種別なら `InvalidArgument`）
 - 構築経路: `WriteAck`・`FlushAck`・`AckReceipt` はいずれもフィールドが非公開で、`pub(crate)` の `AckReceipt::from_matched(request, ack_kind)` だけが生成できる。crate 外のコードは `recv_ack` に実際に受信した ACK を通す以外の方法でこれらの値を得られない（`pub(crate)` のため crate 内の他コードからは `from_matched` を直接呼べるが、`client.rs`（`recv_ack`）以外の呼び出し箇所は用意しない）
 
-未実装範囲（変更なし。REPAIR-3）: サーバー側で FLUSH バリア以前の書き込みを実際に永続化してから FLUSH ACK を送出する処理はまだない（下記「FLUSH フレームの扱い」・TASK-15.2・#823・#824）。本節が定めるのはクライアント側の型契約のみ。
+本節が定めるのはクライアント側の型契約のみ。サーバー側の永続化と FLUSH ACK 送出は下記「FLUSH フレームの扱い」（TASK-15.2.2・#824）が定める。
 
 ### 範囲外（後続タスク）
 
-- 送信側と受信側をスレッドで分ける API（`split()` 等）
+- `PipelineClient` 自体の送受信分割（共有 `SendQueue` を持つ送信側・ACK 受信側）。トランスポート層の分割は `transport::SplitTransport`（#1118・IO-1・P1-3）で定義済みで、`UdsConnection`（サーバー側）が `UdsSendHalf` / `UdsRecvHalf` へ分けられる（poison を両半分で共有し、片側のエラーで `shutdown(Both)`。期限・受信上限の契約は分割前と同じ）
 - ACK status バイトの導入（導入する場合は `PROTOCOL_VERSION` の繰り上げが必要）
 
 サーバー側が本形式で ACK を返す実装と送信順を守る義務は、下記「バッチ write-back と ACK 返却」節（TASK-13.2.2・#822）で実装済み。
@@ -293,15 +301,28 @@ BREAK-2 検出経路の整理:
 
 ### ACK を返す時点（IO-1 の「バッファリング時点」との対応）
 
-通常 ACK（`FrameKind::Ack`）は、1 バッチ内の全 `Write` について `BatchSink::write_batch` が `Ok` を返した時点（＝ OS のページキャッシュへの `write()` 発行が完了した時点）で送る。`fsync(2)` / `syncfs(2)` は呼ばない。プロセスが正常に動いている限りこの時点のデータは他の reader から見えるが、プロセスクラッシュ・電源断では失われうる。これが IO-1 の「バッファリング時点で ACK」の本実装における対応物である。永続化完了を保証するのは IO-2 の FLUSH ACK（`FrameKind::FlushAck`）のみであり、`serve_connection` はそれを送らない（下記「FLUSH フレームの扱い」参照）。ACK の API としての利用者向け文書化は TASK-17 で行う。
+通常 ACK（`FrameKind::Ack`）は、1 バッチ内の全 `Write` について `BatchSink::write_batch` が `Ok` を返した時点（＝ OS のページキャッシュへの `write()` 発行が完了した時点）で送る。`fsync(2)` / `syncfs(2)` は呼ばない。プロセスが正常に動いている限りこの時点のデータは他の reader から見えるが、プロセスクラッシュ・電源断では失われうる。これが IO-1 の「バッファリング時点で ACK」の本実装における対応物である。永続化完了を保証するのは IO-2 の FLUSH ACK（`FrameKind::FlushAck`）のみであり、`serve_connection` は `Flush` の永続化成功後にだけ送る（下記「FLUSH フレームの扱い」参照）。ACK の API としての利用者向け文書化は TASK-17 で行う。
 
 ### バッチが件数未達のまま残る場合の運用制約
 
 ACK をバッチ書き込みの後に返すため、クライアントが `batch_size` 未満だけ送って ACK を待つと、サーバー側に発火のきっかけがない。使える発火条件は「設定件数到達（`BatchTrigger::SizeReached`）」「累積バイト数上限到達（`BatchTrigger::BytesLimitReached`）」「`FrameKind::Flush`」の 3 つのみで、時間ベースの追い出しは範囲外（IO-10・TASK-16）。クライアントは「in-flight 上限 ≥ `batch_size`、または件数未達分の後に `Flush` を送ること」を前提とする（既定値 64 / 64 で整合）。
 
-### FLUSH フレームの扱い（FlushAck は偽装しない）
+### FLUSH フレームの扱い（IO-2・TASK-15.2.2・#824。FlushAck は偽装しない）
 
-`FrameKind::Flush` を受信すると、`BatchBuffer::take_pending` で件数未達分を取り出して書き込み・ACK した後、**FlushAck は送らずに** `IoErrorCode::Unimplemented` で処理を終える。FLUSH ACK は永続化の保証（IO-2）であり、`syncfs` を呼ばずに返すと契約違反になるため（fail-closed）。FlushAck の返却は TASK-15.2.2（#824）の責務。Linux 用の `syncfs(2)` FFI ラッパーは `crates/io/src/sys.rs`（非公開モジュール。TASK-15.2.1・#823）に用意済みだが、上記のとおりまだ呼び出していない（#824）。
+`FrameKind::Flush` を受信すると、`BatchBuffer::take_pending` で件数未達分を取り出して書き込み・通常 ACK した後、`BatchSink::persist`（`AppendFileSink` は Linux で `syncfs(2)`）で永続化し、**成功したときだけ** `FrameKind::FlushAck` を送ってループを継続する（IO-2）。
+
+- `persist` が失敗・タイムアウト・未対応のときは FlushAck を送らず、そのエラーで終了する（fail-closed）。プロトコルにエラーフレームはなく、クライアントは EOF を `Unavailable` として観測する。既定の `BatchSink::persist` は `Unimplemented`
+- `syncfs` は中断できないため、dup した fd を小さなスタックの helper スレッドで 1 回だけ実行し、`AppendFileSink::with_flush_timeout`（既定 10 秒。REPAIR-5）で待つ。この期限は下記の同時実行数の枠待ちと `syncfs` 本体を合わせたもの。タイムアウトした helper は detach され、中断できない `syncfs` が戻るまで同時実行数の枠を占有し続ける（ハングした分だけ新しい `syncfs` を起動しない。helper スレッドの数は常に同時実行数と一致し、絶対上限 64 本を超えない）
+- `syncfs` を発行した後に失敗・タイムアウトした `AppendFileSink` はポイズンされ、以後の `persist` は syscall なしで `Internal` を返す（errseq は 1 回しか報告されないため、再試行が 0 を返して永続化を偽装しうる）。カーネル版数による拒否・fd 複製・枠確保・スレッド生成など発行前の失敗は errseq を消費しないためポイズンしない
+- Linux 5.8 未満、またはカーネル版数を判定できない場合、`persist` は `Unimplemented` で拒否する（`syncfs` が書き戻しエラーを報告するのは 5.8 以降のため、FlushAck の偽装を避ける。IO-2）。判定は公開関数 `persist_support()`（`PersistSupport`。`crates/io/src/barrier.rs`）に集約し、利用者・結合試験も同じ関数で「FlushAck が返る環境か」を知る
+- macOS / Windows は代替フラッシュ未実装で `Unimplemented`（TASK-15.3・#88）
+- 増幅対策（#824 の A4）:
+  - `AppendFileSink` は直近の成功以降に書き込みがなければ `syncfs` を再発行せず合流する（書き込みを伴わない連続 FLUSH）
+  - プロセス全体で同時に実行中の `syncfs` の数を `MaxConcurrentPersist`（既定 2。`set_max_concurrent_persist` で 1〜64 に設定。0 と 64 超は `InvalidArgument`）までに抑える。上限に達している FLUSH は、その FLUSH の期限内で枠が空くのを `Condvar` で待ち（ビジーウェイトしない）、期限を過ぎたら FlushAck を返さず `Timeout` で確定する（`syncfs` 未発行のため sink はポイズンしない。接続は他の persist 失敗と同じく終了する）
+  - `Timeout` を選ぶ理由: 失敗の本質は「その FLUSH の期限（REPAIR-5）が枠待ちの間に尽きた」ことで、`syncfs` が期限内に終わらない場合と利用者から見て同じ扱い（再接続して再送）になる。また `Timeout` は spec の ERR-3 対応表の `DEADLINE_EXCEEDED` に当たる定義済みのコードだが、`ResourceExhausted` は ERR-3 にまだない拡張コードである
+  - 保証の範囲: 接続を増やしても `syncfs` の同時負荷は上限までに留まる。`syncfs` の回数そのものは減らない（書き戻しエラーは `struct file` ごとに報告されるため、各 sink は必ず自分の fd で発行し、他の sink の結果を流用しない）。頻度（間隔）の制限は行わない
+- 保証範囲: FlushAck が保証するのは `write_batch` 経由で受理した書き込み（IO-2 の「バリア以前に受理した書き込み」）の永続化に限る。呼び出し側が保持する別の `File` ハンドル（`new` に渡す前の `try_clone()` 等）・別プロセスからの書き込みは対象外で、dirty 追跡にも反映されない。`AppendFileSink` の利用者は対象ファイルへの書き込みを sink に一本化する（単一書き込み元の前提）
+- 未対応の範囲（REPAIR-3）: FLUSH の頻度（間隔）の制限、fd を開く前の書き戻しエラー、電源断耐性の検証（TASK-18）
 
 ### ACK していない保留分・sink 失敗時の扱い
 
@@ -332,7 +353,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 - UDS 接続受付ループ（accept → `serve_connection` → 次の accept）・同時接続数の上限
 - クライアント側の UDS `connect` と `PipelineClient` との本番結合
 - 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
-- FLUSH ACK の返却・`syncfs`（TASK-15.2.1・#823・TASK-15.2.2・#824）
+- 非 Linux の代替フラッシュ（TASK-15.3・#88）・FLUSH の頻度（間隔）の制限
 - 件数未達分を時間ベースで追い出す仕組み・未フラッシュ滞留量の上限（IO-10・TASK-16）
 - 実際の CLI バイナリ（`fandhe-container`）での `--batch-size` 引数の解釈・`crates/cli → crates/io` の依存追加（TASK-79）
 - ファイル操作を表すペイロード形式（パス・rename・truncate。TASK-14 の前提。I/O 契約の拡張にあたる）

@@ -882,6 +882,15 @@ mod fault {
         FAIL_SCAN_AT.with(|f| f.get() == Some(n))
     }
 
+    /// `hook` の位置で 1 回だけ `f` を実行させる。
+    pub(super) fn set_hook(hook: Hook, f: impl FnOnce() + 'static) {
+        let slot = match hook {
+            Hook::BeforeCreate => &BEFORE_CREATE,
+            Hook::AfterCreate => &AFTER_CREATE,
+        };
+        slot.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
     /// `hook` の位置に登録された処理があれば取り出して実行する。
     pub(super) fn run_hook(hook: Hook) {
         let slot = match hook {
@@ -1129,6 +1138,151 @@ mod tests {
         fault::reset();
         c.create_file("a")
             .expect("create succeeds once scanning works");
+    }
+
+    /// 祖先の階層の走査に失敗しても、祖先を作らずに中止する。
+    #[test]
+    fn io5_nested_scan_failure_creates_nothing() {
+        fault::reset();
+        let t = Tmp::new();
+        std::fs::create_dir(t.0.join("d")).expect("d");
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        // 0 回目はルート、1 回目は `d` の走査。
+        fault::fail_scan_at(1);
+        let err = c.create_file("d/e/f").err().expect("must abort");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+        assert_eq!(err.message(), "failed to scan guest directory (Other)");
+        assert_eq!(entries(&t.0.join("d")), 0);
+        assert_eq!(c.tracked_len().expect("len"), 1);
+    }
+
+    /// 作成直前に同じ名前が外部で作られた場合は既存として報告する（3 OS 共通）。
+    #[test]
+    fn io5_same_name_created_before_create_reports_exists() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let external = t.0.join("a");
+        fault::set_hook(fault::Hook::BeforeCreate, move || {
+            std::fs::write(external, b"theirs").expect("external write");
+        });
+        let err = c.create_file("a").err().expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(err.message().starts_with("guest file already exists"));
+        assert_eq!(std::fs::read(t.0.join("a")).expect("read"), b"theirs");
+        assert_eq!(c.tracked_len().expect("len"), 1);
+    }
+
+    /// 上限 1: 既登録のパスは上限に阻まれず既存・衝突として報告され、新規だけが
+    /// `ResourceExhausted` になる（Codex P1 指摘）。
+    #[test]
+    fn io5_limit_applies_only_to_new_paths() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::with_max_tracked_paths(t.0.clone(), 1).expect("creator");
+        c.create_file("a").expect("first");
+        let err = c.create_file("a").err().expect("exists");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(err.message().starts_with("guest file already exists"));
+        let err = c.create_file("A").err().expect("collision");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(err.message().starts_with("case-insensitive path collision"));
+        let err = c.create_file("b").err().expect("limit");
+        assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+        assert_eq!(err.message(), "too many tracked guest paths");
+        assert_eq!(c.tracked_len().expect("len"), 1);
+        assert_eq!(entries(&t.0), 1);
+    }
+
+    /// 作成直後の再検証で読み取りに失敗したら、作成した葉と新設した祖先を
+    /// 取り消して `Internal` を返す（sink を返さない。fail-closed）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn io5_verify_failure_rolls_back_created_entries() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        // 0 回目はルートの走査（`d` は未作成で降りない）、1 回目が再検証の
+        // ルート階層。
+        fault::fail_scan_at(1);
+        let err = c.create_file("d/e/f").err().expect("must abort");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+        assert_eq!(err.message(), "failed to verify guest directory (Other)");
+        assert_eq!(entries(&t.0), 0);
+        assert_eq!(c.tracked_len().expect("len"), 0);
+    }
+
+    /// 走査から作成までの間に別プロセスが大小違いの葉を作った場合、作成後の
+    /// 再検証で検出し、自分の葉だけを取り消す（Codex P1 指摘。大文字小文字を
+    /// 区別する FS でのみ両方作れるため Linux 限定）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io5_external_case_variant_before_create_is_rolled_back() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let external = t.0.join("Foo");
+        fault::set_hook(fault::Hook::BeforeCreate, move || {
+            std::fs::write(external, b"theirs").expect("external write");
+        });
+        let err = c.create_file("foo").err().expect("must collide");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(err.message().starts_with("case-insensitive path collision"));
+        assert!(err.message().contains("\"Foo\""), "{}", err.message());
+        assert!(!t.0.join("foo").exists());
+        assert_eq!(std::fs::read(t.0.join("Foo")).expect("read"), b"theirs");
+        assert_eq!(c.tracked_len().expect("len"), 0);
+    }
+
+    /// 祖先の大小違いが割り込んだ場合は、葉と本呼び出しが新設した祖先を取り消す
+    /// （空の `dir` を残すと以降の走査が既存衝突で中止し続けるため）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io5_external_ancestor_variant_rolls_back_created_dirs() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let external = t.0.join("Dir");
+        fault::set_hook(fault::Hook::BeforeCreate, move || {
+            std::fs::create_dir(external).expect("external dir");
+        });
+        let err = c.create_file("dir/sub/x").err().expect("must collide");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(err.message().starts_with("case-insensitive path collision"));
+        assert!(!t.0.join("dir").exists());
+        assert!(t.0.join("Dir").is_dir());
+        assert_eq!(entries(&t.0), 1);
+        // 残っているのは外部の `Dir` だけなので、その表記では作れる。
+        c.create_file("Dir/sub/x")
+            .expect("create under the existing spelling");
+    }
+
+    /// 取り消しの前に同じ名前が別の実体へ差し替えられていたら、消さずに残して
+    /// `Internal` を返す（他者のデータを消さない。Linux 限定の理由は上と同じ）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io5_rollback_does_not_remove_replaced_entry() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let root = t.0.clone();
+        fault::set_hook(fault::Hook::AfterCreate, move || {
+            std::fs::write(root.join("other"), b"theirs").expect("other");
+            std::fs::rename(root.join("other"), root.join("foo")).expect("replace");
+            std::fs::write(root.join("Foo"), b"variant").expect("variant");
+        });
+        let err = c.create_file("foo").err().expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+        assert!(
+            err.message().starts_with(
+                "created guest file could not be rolled back (entry was replaced by another object); cause: case-insensitive path collision"
+            ),
+            "{}",
+            err.message()
+        );
+        assert_eq!(std::fs::read(t.0.join("foo")).expect("read"), b"theirs");
+        assert_eq!(std::fs::read(t.0.join("Foo")).expect("read"), b"variant");
+        assert_eq!(c.tracked_len().expect("len"), 0);
     }
 
     /// 構築後にルートのパスを範囲外への symlink へ差し替えても、作成は保持した

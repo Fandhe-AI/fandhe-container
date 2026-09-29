@@ -85,6 +85,55 @@ fn io5_concurrent_case_only_creates_one_is_rejected() {
     }
 }
 
+/// IO-5・TASK-19.2（Codex P1 指摘）: 同じ共有ルートに別々の
+/// [`GuestFileCreator`] インスタンス（プロセス間の競合を模す。`Mutex` は共有
+/// しない）から大文字小文字だけが違う作成を同時に出しても、大小違いの項目が
+/// 両方とも残ることはなく、成功した件数と残った項目の件数が一致する（作成後の
+/// 再検証と取り消し。両方が取り消して 0 件になることは許容する）。大文字小文字を
+/// 区別する FS でのみ両方の作成が通りうるため Linux 限定。
+#[cfg(target_os = "linux")]
+#[test]
+fn io5_separate_instances_never_leave_both_case_variants() {
+    let dir = TempDir::new("gf-xinst");
+    for round in 0..50 {
+        let root = dir.file_path(&format!("root-{round}"));
+        std::fs::create_dir_all(&root).expect("root must be creatable");
+        let a = Arc::new(GuestFileCreator::new(root.clone()).expect("creator a"));
+        let b = Arc::new(GuestFileCreator::new(root.clone()).expect("creator b"));
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = [(a, "Report.txt"), (b, "report.txt")]
+            .into_iter()
+            .map(|(creator, path)| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier_wait_within(&barrier, deadline());
+                    creator.create_file(path).map(|_| ())
+                })
+            })
+            .collect();
+        barrier_wait_within(&barrier, deadline());
+        let results: Vec<Result<(), IoError>> = handles
+            .into_iter()
+            .map(|h| join_within(h, deadline()))
+            .collect();
+        let oks = results.iter().filter(|r| r.is_ok()).count();
+        for err in results.iter().filter_map(|r| r.as_ref().err()) {
+            assert_eq!(err.code(), IoErrorCode::AlreadyExists, "{err:?}");
+            assert!(
+                err.message().starts_with("case-insensitive path collision"),
+                "message: {}",
+                err.message()
+            );
+        }
+        let survivors = std::fs::read_dir(&root).expect("read_dir").count();
+        assert!(
+            survivors <= 1,
+            "round {round}: {survivors} entries survived"
+        );
+        assert_eq!(oks, survivors, "round {round}: results {results:?}");
+    }
+}
+
 /// IO-5・IO-1・TASK-19.2: 作成した sink を `serve_connection` へつなぎ、
 /// 書き込みがファイルへ到着順に反映され ACK が返る。
 #[test]

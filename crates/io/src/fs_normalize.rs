@@ -823,4 +823,21 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<CaseCollisionSet>();
     }
+
+    /// IO-5・TASK-19.2: `contains` は完全一致で登録済みのパスだけを `true` にする
+    /// （祖先として暗黙に作られたノード・大小違い・形式不正は `false`）。
+    #[test]
+    fn io5_contains_matches_exact_registered_paths_only() {
+        let mut set = CaseCollisionSet::new();
+        set.try_insert("a/b").expect("insert");
+        assert!(set.contains("a/b"));
+        assert!(!set.contains("a"));
+        assert!(!set.contains("A/b"));
+        assert!(!set.contains("a/B"));
+        assert!(!set.contains("a/b/c"));
+        assert!(!set.contains("a//b"));
+        set.try_insert("a").expect("insert ancestor as a path");
+        assert!(set.contains("a"));
+        assert_eq!(set.len(), 2);
+    }
 }

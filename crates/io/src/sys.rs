@@ -940,4 +940,222 @@ mod tests {
             "message must describe EBADF: {err:?}"
         );
     }
+
+    /// IO-5・TASK-19.2（Codex P0 指摘の照合）: Linux x86_64 の `open(2)` 等の
+    /// 定数は asm-generic の値（`include/uapi/asm-generic/fcntl.h`）。
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn io5_beneath_consts_linux_x86_64() {
+        use super::beneath_consts as c;
+        assert_eq!(c::O_WRONLY, 0o1);
+        assert_eq!(c::O_CREAT, 0o100);
+        assert_eq!(c::O_EXCL, 0o200);
+        assert_eq!(c::O_DIRECTORY, 0o200_000);
+        assert_eq!(c::O_NOFOLLOW, 0o400_000);
+        assert_eq!(c::O_CLOEXEC, 0o2_000_000);
+        assert_eq!(c::AT_REMOVEDIR, 0x200);
+        assert_eq!(c::EEXIST, 17);
+        assert_eq!(c::ENOTDIR, 20);
+        assert_eq!(c::ELOOP, 40);
+        assert_eq!(core::mem::size_of::<c::ModeT>(), 4);
+        assert_eq!(c::DIRENT_INO_OFFSET, 0);
+        assert_eq!(c::DIRENT_NAME_OFFSET, 19);
+    }
+
+    /// IO-5・TASK-19.2（Codex P0 指摘の照合）: Linux aarch64 は
+    /// `arch/arm64/include/uapi/asm/fcntl.h` が `O_DIRECTORY`・`O_NOFOLLOW` を
+    /// asm-generic と異なる値（0o40000・0o100000）で定義し直す。asm-generic の
+    /// 0o200000・0o400000 は arm64 では `O_DIRECT`・`O_LARGEFILE` にあたる。
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn io5_beneath_consts_linux_aarch64() {
+        use super::beneath_consts as c;
+        assert_eq!(c::O_WRONLY, 0o1);
+        assert_eq!(c::O_CREAT, 0o100);
+        assert_eq!(c::O_EXCL, 0o200);
+        assert_eq!(c::O_DIRECTORY, 0o40_000);
+        assert_eq!(c::O_NOFOLLOW, 0o100_000);
+        assert_ne!(c::O_DIRECTORY, 0o200_000);
+        assert_ne!(c::O_NOFOLLOW, 0o400_000);
+        assert_eq!(c::O_CLOEXEC, 0o2_000_000);
+        assert_eq!(c::AT_REMOVEDIR, 0x200);
+        assert_eq!(c::EEXIST, 17);
+        assert_eq!(c::ENOTDIR, 20);
+        assert_eq!(c::ELOOP, 40);
+        assert_eq!(core::mem::size_of::<c::ModeT>(), 4);
+        assert_eq!(c::DIRENT_INO_OFFSET, 0);
+        assert_eq!(c::DIRENT_NAME_OFFSET, 19);
+    }
+
+    /// IO-5・TASK-19.2: macOS（x86_64 / arm64 共通）の定数。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn io5_beneath_consts_macos() {
+        use super::beneath_consts as c;
+        assert_eq!(c::O_WRONLY, 0x1);
+        assert_eq!(c::O_CREAT, 0x200);
+        assert_eq!(c::O_EXCL, 0x800);
+        assert_eq!(c::O_DIRECTORY, 0x0010_0000);
+        assert_eq!(c::O_NOFOLLOW, 0x100);
+        assert_eq!(c::O_CLOEXEC, 0x0100_0000);
+        assert_eq!(c::AT_REMOVEDIR, 0x80);
+        assert_eq!(c::EEXIST, 17);
+        assert_eq!(c::ENOTDIR, 20);
+        assert_eq!(c::ELOOP, 62);
+        assert_eq!(core::mem::size_of::<c::ModeT>(), 2);
+        assert_eq!(c::DIRENT_INO_OFFSET, 0);
+        assert_eq!(c::DIRENT_NAME_OFFSET, 21);
+    }
+
+    /// ハンドル相対の操作の実行時の照合（対応アーキテクチャのみ。対応外では実装が
+    /// ビルドから除外され常に `Unsupported` になる）。
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    mod beneath_runtime {
+        use super::*;
+
+        /// テスト用の一時ディレクトリ（drop で削除する）。
+        struct TmpDir(std::path::PathBuf);
+        impl TmpDir {
+            fn new(tag: &str) -> Self {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                let p = std::env::temp_dir().join(format!(
+                    "fcio-sys-{tag}-{}-{}",
+                    std::process::id(),
+                    N.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::create_dir_all(&p).expect("temp dir");
+                Self(p)
+            }
+            fn open(&self) -> std::fs::File {
+                std::fs::File::open(&self.0).expect("open dir")
+            }
+        }
+        impl Drop for TmpDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// IO-5・TASK-19.2: 実行中のアーキテクチャで `O_DIRECTORY`・`O_NOFOLLOW` が
+        /// 実際に効く（symlink も通常ファイルも開けず、ディレクトリだけが開ける）。
+        #[test]
+        fn io5_open_dir_beneath_rejects_symlink_and_file() {
+            let t = TmpDir::new("open");
+            std::fs::create_dir(t.0.join("d")).expect("d");
+            std::fs::write(t.0.join("f"), b"x").expect("f");
+            std::os::unix::fs::symlink(t.0.join("d"), t.0.join("l")).expect("symlink");
+            let root = t.open();
+            assert!(
+                open_dir_beneath(&root, "d")
+                    .expect("dir")
+                    .metadata()
+                    .expect("meta")
+                    .is_dir()
+            );
+            assert_eq!(
+                open_dir_beneath(&root, "l").err(),
+                Some(BeneathError::AncestorNotDirectory)
+            );
+            assert_eq!(
+                open_dir_beneath(&root, "f").err(),
+                Some(BeneathError::AncestorNotDirectory)
+            );
+            assert_eq!(
+                open_dir_beneath(&root, "missing").err(),
+                Some(BeneathError::Io(io::ErrorKind::NotFound))
+            );
+        }
+
+        /// IO-5・TASK-19.2: `mkdir_beneath` は新設で `true`・既存で `false`、
+        /// `create_leaf_beneath` は既存（symlink を含む。辿らない）で `AlreadyExists`。
+        #[test]
+        fn io5_mkdir_and_create_leaf_beneath() {
+            let t = TmpDir::new("mk");
+            let outside = TmpDir::new("mk-out");
+            let root = t.open();
+            assert_eq!(mkdir_beneath(&root, "d"), Ok(true));
+            assert_eq!(mkdir_beneath(&root, "d"), Ok(false));
+            let dir = open_dir_beneath(&root, "d").expect("open d");
+            create_leaf_beneath(&dir, "f").expect("create f");
+            assert!(t.0.join("d").join("f").is_file());
+            assert_eq!(
+                create_leaf_beneath(&dir, "f").err(),
+                Some(BeneathError::AlreadyExists)
+            );
+            let victim = outside.0.join("victim");
+            std::os::unix::fs::symlink(&victim, t.0.join("d").join("l")).expect("symlink");
+            assert_eq!(
+                create_leaf_beneath(&dir, "l").err(),
+                Some(BeneathError::AlreadyExists)
+            );
+            assert!(!victim.exists());
+        }
+
+        /// IO-5・TASK-19.2: `read_dir_entries` は `.`・`..` を除く名前と、std の
+        /// `ino()` と一致する `d_ino` を返す（`dirent` の固定オフセットの実行時照合）。
+        /// 件数上限を超えたら `TooMany`。
+        #[test]
+        fn io5_read_dir_entries_returns_names_and_inodes() {
+            use std::os::unix::fs::MetadataExt;
+            let t = TmpDir::new("rd");
+            std::fs::write(t.0.join("alpha"), b"x").expect("alpha");
+            std::fs::create_dir(t.0.join("Beta")).expect("Beta");
+            let root = t.open();
+            let mut entries = read_dir_entries(&root, 10).expect("read");
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let names: Vec<_> = entries
+                .iter()
+                .map(|e| e.name.to_str().expect("utf-8").to_string())
+                .collect();
+            assert_eq!(names, vec!["Beta".to_string(), "alpha".to_string()]);
+            for entry in &entries {
+                let meta = std::fs::symlink_metadata(t.0.join(&entry.name)).expect("meta");
+                assert_eq!(entry.ino, meta.ino(), "entry {:?}", entry.name);
+            }
+            // 2 回目も先頭から読み直す（dup した fd の読み取り位置を共有しても rewind）。
+            assert_eq!(read_dir_entries(&root, 10).expect("again").len(), 2);
+            assert_eq!(read_dir_entries(&root, 1), Err(ReadDirError::TooMany));
+        }
+
+        /// IO-5・TASK-19.2: `unlink_beneath` は通常ファイル・空ディレクトリを消し、
+        /// 空でないディレクトリは消さない。
+        #[test]
+        fn io5_unlink_beneath_file_and_empty_dir() {
+            let t = TmpDir::new("rm");
+            std::fs::write(t.0.join("f"), b"x").expect("f");
+            std::fs::create_dir(t.0.join("e")).expect("e");
+            std::fs::create_dir(t.0.join("n")).expect("n");
+            std::fs::write(t.0.join("n").join("inner"), b"x").expect("inner");
+            let root = t.open();
+            assert_eq!(unlink_beneath(&root, "f", UnlinkTarget::File), Ok(()));
+            assert!(!t.0.join("f").exists());
+            assert_eq!(
+                unlink_beneath(&root, "e", UnlinkTarget::EmptyDirectory),
+                Ok(())
+            );
+            assert!(!t.0.join("e").exists());
+            let err = unlink_beneath(&root, "n", UnlinkTarget::EmptyDirectory).err();
+            assert!(
+                matches!(
+                    err,
+                    Some(BeneathError::Io(
+                        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists
+                    ))
+                ),
+                "{err:?}"
+            );
+            assert!(t.0.join("n").join("inner").exists());
+            assert_eq!(
+                unlink_beneath(&root, "missing", UnlinkTarget::File),
+                Err(BeneathError::Io(io::ErrorKind::NotFound))
+            );
+        }
+    }
 }

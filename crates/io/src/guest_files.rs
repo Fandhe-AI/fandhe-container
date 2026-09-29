@@ -74,6 +74,12 @@ pub const MAX_TRACKED_GUEST_PATHS: usize = 1 << 20;
 /// （モジュール doc 参照。IO-5・TASK-19.2）。
 pub struct GuestFileCreator {
     root: PathBuf,
+    /// 構築時に開いた共有ルートのディレクトリハンドル。走査・作成の起点はこの
+    /// ハンドルで、`root` のパスは開き直さない（検証後にパスや親のエントリが
+    /// 差し替えられても共有範囲外へ出ない。security.md の境界。IO-5）。
+    /// Windows ではこのハンドルを `FILE_SHARE_DELETE` なしで保持し、ルートと祖先の
+    /// 改名・削除を OS に拒否させる。
+    root_dir: File,
     max_tracked: usize,
     index: Mutex<IndexState>,
 }
@@ -108,7 +114,8 @@ fn validate_host_component(component: &str) -> Result<(), IoError> {
 
 impl GuestFileCreator {
     /// `root`（共有ルート。ディレクトリであること）を起点に作成する入口を作る。
-    /// root は信頼できる設定値として扱い、root 自体が symlink でも許す。
+    /// root は信頼できる設定値として扱い、root 自体が symlink でも許す（構築時に
+    /// 1 回だけ辿って開き、以降はそのハンドルを起点にする）。
     pub fn new(root: PathBuf) -> Result<Self, IoError> {
         Self::with_max_tracked_paths(root, MAX_TRACKED_GUEST_PATHS)
     }
@@ -118,7 +125,13 @@ impl GuestFileCreator {
         if max_tracked == 0 || max_tracked > MAX_TRACKED_GUEST_PATHS {
             return Err(invalid("max tracked guest paths is out of range"));
         }
-        let meta = std::fs::metadata(&root).map_err(|err| {
+        let root_dir = open_root_handle(&root).map_err(|err| {
+            IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!("guest file root is not accessible ({:?})", err.kind()),
+            )
+        })?;
+        let meta = root_dir.metadata().map_err(|err| {
             IoError::new(
                 IoErrorCode::InvalidArgument,
                 format!("guest file root is not accessible ({:?})", err.kind()),
@@ -129,6 +142,7 @@ impl GuestFileCreator {
         }
         Ok(Self {
             root,
+            root_dir,
             max_tracked,
             index: Mutex::new(IndexState {
                 set: CaseCollisionSet::new(),
@@ -183,7 +197,7 @@ impl GuestFileCreator {
         // 確定する（作成失敗で実体のないパスが索引に残らないようにする）。
         set.check_insertable(guest_path)?;
 
-        let file = match create_beneath(&self.root, ancestors, leaf) {
+        let file = match create_beneath(&self.root_dir, &self.root, ancestors, leaf) {
             Ok(file) => file,
             Err(CreateError::Exists) => {
                 // 実体が既に存在する。索引にも確定させたうえで報告する。
@@ -206,15 +220,15 @@ impl GuestFileCreator {
     /// `ancestors` に沿って実在するディレクトリの項目を、作成のたびに読み直して
     /// 索引へ取り込む（表記どおりの実在ディレクトリだけを辿る。symlink は辿らない）。
     /// 別プロセスが共有ルートへ後から追加した項目も検出するため、走査済みの
-    /// 印は持たない。走査は索引化専用で、作成先の解決には使わない。
+    /// 印は持たない。走査は保持したルートのハンドル起点で行い（Linux / macOS は
+    /// 各階層もハンドル相対で開く）、索引化専用で作成先の解決には使わない。
     /// 件数上限超過は `ResourceExhausted`、読み取りの失敗は `Internal`
     /// （IO-5 の検査を完了できないまま作成へ進まない。fail-closed）。
     fn seed_existing(&self, state: &mut IndexState, ancestors: &[&str]) -> Result<(), IoError> {
-        let mut dir = self.root.clone();
+        let mut cursor = ScanCursor::root(&self.root_dir, &self.root)?;
         let mut prefix = String::new();
         for level in 0..=ancestors.len() {
-            let entries = std::fs::read_dir(&dir)
-                .map_err(|err| internal("failed to scan guest directory", err.kind()))?;
+            let entries = cursor.read_entries()?;
             for entry in entries {
                 let entry =
                     entry.map_err(|err| internal("failed to scan guest directory", err.kind()))?;
@@ -232,21 +246,99 @@ impl GuestFileCreator {
             let Some(component) = ancestors.get(level) else {
                 break;
             };
-            dir.push(component);
-            match std::fs::symlink_metadata(&dir) {
-                Ok(meta) if meta.is_dir() => {}
-                // 未作成の祖先より下に既存項目は無い（作成時に新設される）。
-                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-                Err(err) => {
-                    return Err(internal("failed to inspect guest directory", err.kind()));
-                }
-                // 通常ファイル・symlink の祖先は作成側が拒否する。
-                Ok(_) => return Ok(()),
+            // 未作成・通常ファイル・symlink の祖先より下に取り込む項目は無い
+            // （作成時に新設される、または作成側が拒否する）。
+            match cursor.descend(component)? {
+                Some(next) => cursor = next,
+                None => return Ok(()),
             }
             prefix.push_str(component);
             prefix.push('/');
         }
         Ok(())
+    }
+}
+
+/// 共有ルートを開く（symlink は構築時のこの 1 回だけ辿る）。Windows では
+/// `FILE_FLAG_BACKUP_SEMANTICS` でディレクトリを開き、`FILE_SHARE_DELETE` を
+/// 付けずに共有してルートと祖先の改名・削除を拒否させる。
+#[cfg(not(windows))]
+fn open_root_handle(root: &Path) -> std::io::Result<File> {
+    File::open(root)
+}
+
+#[cfg(windows)]
+fn open_root_handle(root: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_BACKUP_SEMANTICS
+    const FLAGS: u32 = 0x0200_0000;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE（FILE_SHARE_DELETE は含めない）
+    const SHARE: u32 = 0x1 | 0x2;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FLAGS)
+        .share_mode(SHARE)
+        .open(root)
+}
+
+/// 走査位置（Linux / macOS はディレクトリハンドル）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct ScanCursor(File);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl ScanCursor {
+    fn root(root_dir: &File, _root: &Path) -> Result<Self, IoError> {
+        root_dir
+            .try_clone()
+            .map(Self)
+            .map_err(|err| internal("failed to scan guest directory", err.kind()))
+    }
+
+    fn read_entries(&self) -> Result<std::fs::ReadDir, IoError> {
+        // fd が指す inode 固定のパス表現で読む（パス文字列の再解決を避ける）。
+        std::fs::read_dir(crate::sys::dir_fd_path(&self.0))
+            .map_err(|err| internal("failed to scan guest directory", err.kind()))
+    }
+
+    fn descend(&self, name: &str) -> Result<Option<Self>, IoError> {
+        use crate::sys::{BeneathError, open_dir_beneath};
+        match open_dir_beneath(&self.0, name) {
+            Ok(dir) => Ok(Some(Self(dir))),
+            Err(BeneathError::AncestorNotDirectory) => Ok(None),
+            Err(BeneathError::Io(ErrorKind::NotFound)) => Ok(None),
+            Err(BeneathError::Io(kind)) => Err(internal("failed to inspect guest directory", kind)),
+            Err(BeneathError::AlreadyExists) => Err(internal(
+                "failed to inspect guest directory",
+                ErrorKind::Other,
+            )),
+        }
+    }
+}
+
+/// Windows 等のフォールバック（パス走査）。ルートは `open_root_handle` の
+/// 共有拒否で改名・削除されないため、ルート配下のパス解決は範囲内に留まる。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+struct ScanCursor(PathBuf);
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl ScanCursor {
+    fn root(_root_dir: &File, root: &Path) -> Result<Self, IoError> {
+        Ok(Self(root.to_path_buf()))
+    }
+
+    fn read_entries(&self) -> Result<std::fs::ReadDir, IoError> {
+        std::fs::read_dir(&self.0)
+            .map_err(|err| internal("failed to scan guest directory", err.kind()))
+    }
+
+    fn descend(&self, name: &str) -> Result<Option<Self>, IoError> {
+        let next = self.0.join(name);
+        match std::fs::symlink_metadata(&next) {
+            Ok(meta) if meta.is_dir() => Ok(Some(Self(next))),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(internal("failed to inspect guest directory", err.kind())),
+            Ok(_) => Ok(None),
+        }
     }
 }
 
@@ -267,9 +359,14 @@ fn internal(context: &str, kind: ErrorKind) -> IoError {
 /// 末端を新規作成する（Linux / macOS。`openat` 系。TOCTOU 防止。
 /// [`crate::sys::create_file_beneath`]）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn create_beneath(root: &Path, ancestors: &[&str], leaf: &str) -> Result<File, CreateError> {
+fn create_beneath(
+    root_dir: &File,
+    _root: &Path,
+    ancestors: &[&str],
+    leaf: &str,
+) -> Result<File, CreateError> {
     use crate::sys::{BeneathError, create_file_beneath};
-    create_file_beneath(root, ancestors, leaf).map_err(|err| match err {
+    create_file_beneath(root_dir, ancestors, leaf).map_err(|err| match err {
         BeneathError::AlreadyExists => CreateError::Exists,
         BeneathError::AncestorNotDirectory => {
             CreateError::Other(invalid("guest path ancestor is not a directory"))
@@ -280,10 +377,15 @@ fn create_beneath(root: &Path, ancestors: &[&str], leaf: &str) -> Result<File, C
 
 /// Windows 等のフォールバック。祖先の TOCTOU を防ぐルート相対ハンドル作成
 /// （`NtCreateFile`）は未実装のため、祖先を持つパスは拒否する（fail-closed）。
-/// ルート直下の単一名はルートが信頼済みで再解決の余地がないため作成する
-/// （IO-5・REPAIR-3）。
+/// ルート直下の単一名は、保持中のルートハンドルが改名・削除を拒否している
+/// （`FILE_SHARE_DELETE` なし）ためパス結合で作成する（IO-5・REPAIR-3）。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn create_beneath(root: &Path, ancestors: &[&str], leaf: &str) -> Result<File, CreateError> {
+fn create_beneath(
+    _root_dir: &File,
+    root: &Path,
+    ancestors: &[&str],
+    leaf: &str,
+) -> Result<File, CreateError> {
     if !ancestors.is_empty() {
         return Err(CreateError::Other(IoError::new(
             IoErrorCode::Unimplemented,
@@ -507,6 +609,7 @@ mod tests {
     }
 
     /// 走査を完了できないときは索引不完全のまま作成せず構造化エラーで中止する。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn io5_scan_failure_aborts_create() {
         let t = Tmp::new();
@@ -517,6 +620,24 @@ mod tests {
         let err = c.create_file("a").err().expect("must abort");
         assert_eq!(err.code(), IoErrorCode::Internal);
         assert_eq!(c.tracked_len().expect("len"), 0);
+    }
+
+    /// 構築後にルートのパスを範囲外への symlink へ差し替えても、作成は保持した
+    /// ハンドルの元のディレクトリ内に留まる（IO-5・Codex P0 指摘）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn io5_swapped_root_path_does_not_escape() {
+        let t = Tmp::new();
+        let outside = Tmp::new();
+        let root = t.0.join("root");
+        std::fs::create_dir(&root).expect("root");
+        let c = GuestFileCreator::new(root.clone()).expect("creator");
+        let moved = t.0.join("moved");
+        std::fs::rename(&root, &moved).expect("rename");
+        std::os::unix::fs::symlink(&outside.0, &root).expect("symlink");
+        c.create_file("sub/f").expect("create");
+        assert_eq!(entries(&outside.0), 0);
+        assert!(moved.join("sub").join("f").exists());
     }
 
     #[test]

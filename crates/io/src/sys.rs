@@ -431,7 +431,7 @@ mod beneath_raw {
     }
 }
 
-/// `root`（信頼する共有ルート。root 自体が symlink でもよい）を起点に、
+/// `root`（構築時に開いた共有ルートのディレクトリハンドル）を起点に、
 /// `ancestors` を 1 個ずつハンドル相対（`openat`/`mkdirat`・`O_NOFOLLOW`）で
 /// 開き（無ければ作り）、末端 `leaf` を `O_CREAT|O_EXCL|O_NOFOLLOW` で新規作成する
 /// （IO-5・TASK-19.2）。
@@ -449,7 +449,7 @@ mod beneath_raw {
     )
 ))]
 pub(crate) fn create_file_beneath(
-    root: &std::path::Path,
+    root: &std::fs::File,
     ancestors: &[&str],
     leaf: &str,
 ) -> Result<std::fs::File, BeneathError> {
@@ -465,8 +465,10 @@ pub(crate) fn create_file_beneath(
         (err.raw_os_error().unwrap_or(0), err.kind())
     }
 
-    // root は信頼する設定値のため通常の open（symlink を辿る）で開く。
-    let mut dir: OwnedFd = std::fs::File::open(root)
+    // root は構築時に開いて保持しているディレクトリハンドル。パスを開き直さないため、
+    // 構築後にルートやその親のエントリが差し替えられても起点は変わらない。
+    let mut dir: OwnedFd = root
+        .try_clone()
         .map_err(|err| BeneathError::Io(err.kind()))?
         .into();
 
@@ -536,11 +538,79 @@ pub(crate) fn create_file_beneath(
     )
 )))]
 pub(crate) fn create_file_beneath(
-    _root: &std::path::Path,
+    _root: &std::fs::File,
     _ancestors: &[&str],
     _leaf: &str,
 ) -> Result<std::fs::File, BeneathError> {
     Err(BeneathError::Io(io::ErrorKind::Unsupported))
+}
+
+/// ディレクトリハンドル `dir` 直下のサブディレクトリ `name` を、ハンドル相対・
+/// symlink 非追従（`openat` + `O_DIRECTORY|O_NOFOLLOW`）で開く（走査用。
+/// IO-5・TASK-19.2）。symlink・非ディレクトリは `AncestorNotDirectory`。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+pub(crate) fn open_dir_beneath(
+    dir: &std::fs::File,
+    name: &str,
+) -> Result<std::fs::File, BeneathError> {
+    use beneath_consts as c;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let cname =
+        std::ffi::CString::new(name).map_err(|_| BeneathError::Io(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `dir` は呼び出し元が借用中の有効なディレクトリ fd、`cname` は
+    // NUL 終端の有効な C 文字列。O_CREAT を指定しないため可変長引数は読まれない。
+    // 成功時の戻り値は本関数が唯一所有する新規 fd。
+    let fd = unsafe {
+        beneath_raw::openat(
+            dir.as_raw_fd(),
+            cname.as_ptr(),
+            c::O_DIRECTORY | c::O_NOFOLLOW | c::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        let err = io::Error::last_os_error();
+        let errno = err.raw_os_error().unwrap_or(0);
+        return Err(if errno == c::ELOOP || errno == c::ENOTDIR {
+            BeneathError::AncestorNotDirectory
+        } else {
+            BeneathError::Io(err.kind())
+        });
+    }
+    // SAFETY: `fd` は直前の openat が返した有効な fd で、他に所有者がいない。
+    Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+/// 対応外アーキテクチャ向け（fail-closed）。
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+pub(crate) fn open_dir_beneath(
+    _dir: &std::fs::File,
+    _name: &str,
+) -> Result<std::fs::File, BeneathError> {
+    Err(BeneathError::Io(io::ErrorKind::Unsupported))
+}
+
+/// 開いているディレクトリハンドルを `read_dir` へ渡せるパスで表す
+/// （Linux は `/proc/self/fd/N`、macOS は `/dev/fd/N`）。パス解決は fd が指す
+/// inode に固定されるため、走査もハンドル起点になる。
+pub(crate) fn dir_fd_path(dir: &std::fs::File) -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    let base = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    let base = "/dev/fd";
+    std::path::Path::new(base).join(dir.as_raw_fd().to_string())
 }
 
 #[cfg(test)]

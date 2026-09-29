@@ -132,6 +132,19 @@ if [ "$last_case_passed" -eq 1 ]; then
 fi
 
 # --------------------------------------------------
+# case 2b: argv 長上限の回避確認（Linux の 1 引数あたりの上限〔MAX_ARG_STRLEN・
+# 通常 128 KiB〕を、4 MiB まで許す契約の入力〔ここでは約 300 KiB〕で越え、
+# `--argjson` 経由なら `Argument list too long` で終了コード 126 になっていた
+# ケースが、stdin 経由になったことで exit 0・正しい比率を返すことを照合する）
+# --------------------------------------------------
+padded_path="${tmp_root}/baseline-padded.json"
+jq '.pad = ("a" * 300000)' "${fixtures_dir}/baseline-ok.json" >"$padded_path"
+run_case "padded-input-exceeds-argv-limit" 0 --baseline "$padded_path" --candidate "${fixtures_dir}/candidate-ok.json"
+if [ "$last_case_passed" -eq 1 ]; then
+  check_jq_value "padded-input-ratio-iops" "1.5" ".ratios.iops.value"
+fi
+
+# --------------------------------------------------
 # case 3: params 不一致
 # --------------------------------------------------
 run_case_msg "params-mismatch" 2 "direct" --baseline "${fixtures_dir}/baseline-ok.json" --candidate "${fixtures_dir}/candidate-params-mismatch.json"
@@ -185,21 +198,33 @@ run_case_msg "fio-version-mismatch-warns" 0 "fio_version differs" --baseline "$f
 # --------------------------------------------------
 # case 9: 前提ツール欠如（jq を PATH から外す）
 # --------------------------------------------------
-no_jq_dir="${tmp_root}/no-jq-path"
-mkdir -p "$no_jq_dir"
-for tool in bash grep head wc tr cat mktemp; do
+# 前提ツール一式（jq・grep・head・wc・tr）を PATH に揃えたディレクトリを作り、
+# 対象を 1 つずつ外して欠如時に終了コード 3 になることを照合する
+# （対象スクリプトの前提ツール確認一覧との整合。fio-randwrite-4k-selftest.sh と
+# 同方針）。
+all_tools_dir="${tmp_root}/all-tools-path"
+mkdir -p "$all_tools_dir"
+for tool in bash jq grep head wc tr cat mktemp; do
   tool_path="$(command -v "$tool")"
-  ln -sf "$tool_path" "${no_jq_dir}/${tool}"
+  ln -sf "$tool_path" "${all_tools_dir}/${tool}"
 done
-actual=0
-last_output=$(PATH="$no_jq_dir" "$bash_bin" "$target_script" --baseline "${fixtures_dir}/baseline-ok.json" --candidate "${fixtures_dir}/candidate-ok.json" 2>&1) || actual=$?
-if [ "$actual" -eq 3 ]; then
-  echo "PASS: missing-jq (exit=${actual})"
-else
-  echo "FAIL: missing-jq (expected exit=3, actual exit=${actual})" >&2
-  print_indented "$last_output"
-  failures=$((failures + 1))
-fi
+for missing_tool in jq grep head wc tr; do
+  case_dir="${tmp_root}/no-${missing_tool}-path"
+  mkdir -p "$case_dir"
+  for tool in bash jq grep head wc tr cat mktemp; do
+    [ "$tool" = "$missing_tool" ] && continue
+    ln -sf "${all_tools_dir}/${tool}" "${case_dir}/${tool}"
+  done
+  actual=0
+  last_output=$(PATH="$case_dir" "$bash_bin" "$target_script" --baseline "${fixtures_dir}/baseline-ok.json" --candidate "${fixtures_dir}/candidate-ok.json" 2>&1) || actual=$?
+  if [ "$actual" -eq 3 ]; then
+    echo "PASS: missing-${missing_tool} (exit=${actual})"
+  else
+    echo "FAIL: missing-${missing_tool} (expected exit=3, actual exit=${actual})" >&2
+    print_indented "$last_output"
+    failures=$((failures + 1))
+  fi
+done
 
 # --------------------------------------------------
 # サマリー

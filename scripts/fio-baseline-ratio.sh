@@ -8,13 +8,22 @@
 # 「Docker ベースラインの計測手順」節（人間が実機実測の最後に実行する）。
 # 本スクリプト自身は fio を実行しない（比較専用。実測は fio-randwrite-4k.sh の役目）。
 #
-# 前提条件: jq（コメント規約に合わせ fio-randwrite-4k.sh と同じ前提ツール確認方式）
+# 前提条件: jq・grep・head・wc・tr（fio-randwrite-4k.sh と同じ前提ツール確認方式。
+# 欠如したまま進むと `set -e` によりそのコマンドの終了コード（多くは 127）が
+# そのままスクリプトの終了コードになり、別の理由による失敗と誤分類されるため、
+# 入力の検証より先に確認する）
 #
 # 入力の安全性（security.md・fio-randwrite-4k.sh と同方針）:
 #   - symlink・通常ファイル以外は拒否する（パストラバーサル・symlink 対策）
 #   - 読み取りは `head -c <上限+1>` で 1 回だけ行い、以後はその内容（変数）だけを
 #     使う（検証と変換の間に元のパスを差し替えられても影響しない。TOCTOU 対策）
 #   - サイズ上限は fio-randwrite-4k.sh の MAX_FROM_JSON_BYTES と同じ 4 MiB
+#   - fio-randwrite-4k.sh の snapshot_json_input のような fd ベースの通常ファイル
+#     確認・読み取りタイムアウトの見張りは持たない（100〜150 行規模という本
+#     スクリプトの想定に合わせた簡略化）。検証後に入力パスを FIFO へ差し替えられると
+#     `head` が無期限に待ち得るため、入力ファイルの親ディレクトリは他ユーザーが
+#     書き込めない前提とする（呼び出し元は fio-randwrite-4k.sh の出力をそのまま
+#     渡す運用を想定）
 #
 # 検証（いずれか 1 つでも満たさなければ exit 2。fail-closed）:
 #   - JSON として解析できる
@@ -100,10 +109,12 @@ if [ -z "$baseline_path" ] || [ -z "$candidate_path" ]; then
   exit 2
 fi
 
-if ! command -v jq >/dev/null 2>&1; then
-  err "missing-tool" "jq is required but not found in PATH"
-  exit 3
-fi
+for tool in jq grep head wc tr; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    err "missing-tool" "${tool} is required but not found in PATH"
+    exit 3
+  fi
+done
 
 # 1 回だけ読み込んだ内容を変数に格納し、以後の判定・変換はすべてこの内容に対して
 # 行う（検証と使用の間で元のパスが差し替えられても影響しない。TOCTOU 対策）。
@@ -183,9 +194,14 @@ validate_content "$baseline_content" "--baseline (${baseline_path})"
 validate_content "$candidate_content" "--candidate (${candidate_path})"
 
 # params の完全一致（正当性ゲート）。不一致キーを stderr へ列挙してから exit 2。
-params_diff=$(jq -n --argjson b "$baseline_content" --argjson c "$candidate_content" '
-  ($b.params) as $bp
-  | ($c.params) as $cp
+# baseline/candidate の内容は `--argjson`（コマンドライン引数）ではなく stdin 経由で
+# jq へ渡す。Linux の 1 引数あたりの上限（MAX_ARG_STRLEN・通常 128 KiB）を、
+# 4 MiB まで許す本スクリプトの契約の入力が越えると `Argument list too long` で
+# `set -e` により想定外の終了コード（126）になるのを避けるため
+# （fio-randwrite-4k.sh の誤分類対策と同種の対策）。
+params_diff=$(printf '%s\n%s\n' "$baseline_content" "$candidate_content" | jq -s '
+  (.[0].params) as $bp
+  | (.[1].params) as $cp
   | ([$bp, $cp] | add | keys_unsorted | unique) as $keys
   | [ $keys[] | select($bp[.] != $cp[.]) ]
 ')
@@ -202,8 +218,9 @@ if [ "$baseline_fio_version" != "$candidate_fio_version" ]; then
   echo "warning: fio_version differs between baseline (${baseline_fio_version}) and candidate (${candidate_fio_version})" >&2
 fi
 
-result=$(jq -n --argjson b "$baseline_content" --argjson c "$candidate_content" '
-  {
+result=$(printf '%s\n%s\n' "$baseline_content" "$candidate_content" | jq -s '
+  .[0] as $b | .[1] as $c
+  | {
     schema_version: 1,
     comparison: "fio_randwrite_4k_baseline_ratio",
     baseline: {

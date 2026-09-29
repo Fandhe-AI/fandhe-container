@@ -178,11 +178,24 @@ pub fn check_host_path_length(path: &Path) -> Result<HostPathLength, IoError> {
                 "host path length {} UTF-16 units exceeds limit of {} (NTFS MAX_PATH): {}",
                 length.units(),
                 length.limit(),
-                quote_for_message(&path.to_string_lossy())
+                quote_for_message(&bounded_lossy_prefix(path))
             ),
         ));
     }
     Ok(length)
+}
+
+/// エラーメッセージ表示用に、パス先頭のみを有界に UTF-8 へ変換する（P0: 入力長に
+/// 比例するアロケーションを避ける。`to_string_lossy` の全体変換は使わない）。
+///
+/// 先頭 `4 * (MAX_COLLISION_MESSAGE_PATH_CHARS + 1)` バイトだけを lossy 変換する。
+/// 1 文字は最大 4 バイトのため、元が長ければ変換後は必ず上限超の文字数になり、
+/// [`quote_for_message`] が切り詰めと `...` 付与を正しく行う。
+fn bounded_lossy_prefix(path: &Path) -> String {
+    const PREFIX_BYTES: usize = 4 * (MAX_COLLISION_MESSAGE_PATH_CHARS + 1);
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let head = bytes.get(..PREFIX_BYTES).unwrap_or(bytes);
+    String::from_utf8_lossy(head).into_owned()
 }
 
 /// 木構造上のノード識別子（非公開）。[`ROOT_NODE`] が根（ゲスト相対パスの起点）。
@@ -530,6 +543,20 @@ where
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// IO-5: 巨大パスでもエラーメッセージ用の変換は先頭のみ（有界）で、切り詰め表示になる。
+    #[test]
+    fn io5_error_message_uses_bounded_prefix_for_huge_path() {
+        let huge = PathBuf::from("a".repeat(1_000_000));
+        let err = check_host_path_length(&huge).expect_err("huge path");
+        assert!(err.message().contains("1000000 UTF-16 units"));
+        assert!(err.message().len() < 1024);
+        assert!(err.message().ends_with("...\""));
+        assert_eq!(
+            bounded_lossy_prefix(&huge).len(),
+            4 * (MAX_COLLISION_MESSAGE_PATH_CHARS + 1)
+        );
+    }
 
     /// IO-5: 260 は許容・261 は超過（境界値）。
     #[test]

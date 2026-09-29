@@ -304,13 +304,17 @@ ACK をバッチ書き込みの後に返すため、クライアントが `batch
 `FrameKind::Flush` を受信すると、`BatchBuffer::take_pending` で件数未達分を取り出して書き込み・通常 ACK した後、`BatchSink::persist`（`AppendFileSink` は Linux で `syncfs(2)`）で永続化し、**成功したときだけ** `FrameKind::FlushAck` を送ってループを継続する（IO-2）。
 
 - `persist` が失敗・タイムアウト・未対応のときは FlushAck を送らず、そのエラーで終了する（fail-closed）。プロトコルにエラーフレームはなく、クライアントは EOF を `Unavailable` として観測する。既定の `BatchSink::persist` は `Unimplemented`
-- `syncfs` は中断できないため、dup した fd を小さなスタックの helper スレッドで 1 回だけ実行し、`AppendFileSink::with_flush_timeout`（既定 10 秒。REPAIR-5）で待つ。タイムアウトした helper は detach され、戻るまでプロセス全体で 64 本までの枠を占有する（超えたら `ResourceExhausted`）
+- `syncfs` は中断できないため、dup した fd を小さなスタックの helper スレッドで 1 回だけ実行し、`AppendFileSink::with_flush_timeout`（既定 10 秒。REPAIR-5）で待つ。この期限は下記の同時実行数の枠待ちと `syncfs` 本体を合わせたもの。タイムアウトした helper は detach され、中断できない `syncfs` が戻るまで同時実行数の枠を占有し続ける（ハングした分だけ新しい `syncfs` を起動しない。helper スレッドの数は常に同時実行数と一致し、絶対上限 64 本を超えない）
 - `syncfs` を発行した後に失敗・タイムアウトした `AppendFileSink` はポイズンされ、以後の `persist` は syscall なしで `Internal` を返す（errseq は 1 回しか報告されないため、再試行が 0 を返して永続化を偽装しうる）。カーネル版数による拒否・fd 複製・枠確保・スレッド生成など発行前の失敗は errseq を消費しないためポイズンしない
 - Linux 5.8 未満、またはカーネル版数を判定できない場合、`persist` は `Unimplemented` で拒否する（`syncfs` が書き戻しエラーを報告するのは 5.8 以降のため、FlushAck の偽装を避ける。IO-2）。判定は公開関数 `persist_support()`（`PersistSupport`。`crates/io/src/barrier.rs`）に集約し、利用者・結合試験も同じ関数で「FlushAck が返る環境か」を知る
 - macOS / Windows は代替フラッシュ未実装で `Unimplemented`（TASK-15.3・#88）
-- 増幅対策: `AppendFileSink` は直近の成功以降に書き込みがなければ `syncfs` を再発行せず合流する（書き込みを伴わない連続 FLUSH）
+- 増幅対策（#824 の A4）:
+  - `AppendFileSink` は直近の成功以降に書き込みがなければ `syncfs` を再発行せず合流する（書き込みを伴わない連続 FLUSH）
+  - プロセス全体で同時に実行中の `syncfs` の数を `MaxConcurrentPersist`（既定 2。`set_max_concurrent_persist` で 1〜64 に設定。0 と 64 超は `InvalidArgument`）までに抑える。上限に達している FLUSH は、その FLUSH の期限内で枠が空くのを `Condvar` で待ち（ビジーウェイトしない）、期限を過ぎたら FlushAck を返さず `Timeout` で確定する（`syncfs` 未発行のため sink はポイズンしない。接続は他の persist 失敗と同じく終了する）
+  - `Timeout` を選ぶ理由: 失敗の本質は「その FLUSH の期限（REPAIR-5）が枠待ちの間に尽きた」ことで、`syncfs` が期限内に終わらない場合と利用者から見て同じ扱い（再接続して再送）になる。また `Timeout` は spec の ERR-3 対応表の `DEADLINE_EXCEEDED` に当たる定義済みのコードだが、`ResourceExhausted` は ERR-3 にまだない拡張コードである
+  - 保証の範囲: 接続を増やしても `syncfs` の同時負荷は上限までに留まる。`syncfs` の回数そのものは減らない（書き戻しエラーは `struct file` ごとに報告されるため、各 sink は必ず自分の fd で発行し、他の sink の結果を流用しない）。頻度（間隔）の制限は行わない
 - 保証範囲: FlushAck が保証するのは `write_batch` 経由で受理した書き込み（IO-2 の「バリア以前に受理した書き込み」）の永続化に限る。呼び出し側が保持する別の `File` ハンドル（`new` に渡す前の `try_clone()` 等）・別プロセスからの書き込みは対象外で、dirty 追跡にも反映されない。`AppendFileSink` の利用者は対象ファイルへの書き込みを sink に一本化する（単一書き込み元の前提）
-- 未対応の範囲（REPAIR-3）: 書き込みを挟む FLUSH のレート制限・接続をまたぐ並行 FLUSH の合流（同期範囲はファイルシステム全体）、fd を開く前の書き戻しエラー、電源断耐性の検証（TASK-18）
+- 未対応の範囲（REPAIR-3）: FLUSH の頻度（間隔）の制限、fd を開く前の書き戻しエラー、電源断耐性の検証（TASK-18）
 
 ### ACK していない保留分・sink 失敗時の扱い
 
@@ -341,7 +345,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 - UDS 接続受付ループ（accept → `serve_connection` → 次の accept）・同時接続数の上限
 - クライアント側の UDS `connect` と `PipelineClient` との本番結合
 - 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
-- 非 Linux の代替フラッシュ（TASK-15.3・#88）・書き込みを挟む FLUSH のレート制限と接続をまたぐ合流
+- 非 Linux の代替フラッシュ（TASK-15.3・#88）・FLUSH の頻度（間隔）の制限
 - 件数未達分を時間ベースで追い出す仕組み・未フラッシュ滞留量の上限（IO-10・TASK-16）
 - 実際の CLI バイナリ（`fandhe-container`）での `--batch-size` 引数の解釈・`crates/cli → crates/io` の依存追加（TASK-79）
 - ファイル操作を表すペイロード形式（パス・rename・truncate。TASK-14 の前提。I/O 契約の拡張にあたる）

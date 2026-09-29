@@ -361,6 +361,16 @@ impl GuestFileCreator {
                 if state.set.contains_node(&path) {
                     continue;
                 }
+                // 衝突は件数上限より先に報告する（大文字小文字を区別しないホストでは
+                // 表記違いの祖先がそのまま開けるため、要求の表記で数えた項目が既存の
+                // ノードと衝突しうる。上限到達後も衝突を衝突として返す）。
+                match state.set.check_insertable(&path) {
+                    Ok(()) => {}
+                    // 形式不正の名前（ホストで表現できない等）は索引化できないだけで
+                    // 無視する。
+                    Err(err) if err.code() == IoErrorCode::InvalidArgument => continue,
+                    Err(err) => return Err(err),
+                }
                 if state.set.len() >= self.max_tracked {
                     return Err(too_many());
                 }

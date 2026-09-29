@@ -336,8 +336,6 @@ where
     })
 }
 
-/// [`std::thread::JoinHandle::join`] を無期限に待たず、`deadline` 以内に
-/// 終わらなければ panic する（REPAIR-5: スレッドの join にも期限を設ける。
 /// プロセス内で 1 回だけ、テスト出力先のファイルシステムに対して `persist`
 /// （Linux では `syncfs(2)`）を先行実行する（TASK-15.2.2・#824）。
 ///
@@ -362,6 +360,8 @@ fn warm_up_persist(dir: &std::path::Path) {
     });
 }
 
+/// [`std::thread::JoinHandle::join`] を無期限に待たず、`deadline` 以内に
+/// 終わらなければ panic する（REPAIR-5: スレッドの join にも期限を設ける。
 /// ACK 未送信等の実装バグによるハングを、テストのタイムアウトではなく
 /// 明示的なメッセージで検出できるようにする）。
 ///
@@ -453,9 +453,15 @@ pub fn drain_acks(
     }
 }
 
-/// Flush 後にクライアントが受け取るべき FlushAck を待つ（IO-2・TASK-15.2.2・
-/// #824）。FlushAck を返せるのは `syncfs` を持つ Linux のみで、それ以外の OS
-/// では代替フラッシュ（TASK-15.3・#88）が未実装のため何も受け取らない。
+/// Flush 後のクライアント側の期待値を照合する（IO-2・TASK-15.2.2・#824）。
+///
+/// 期待値は production と同じ判定（[`fandhe_container_io::persist_support`]）で
+/// 分け、実行ホストのカーネル版数・OS に依存させない（Codex #1142 指摘）:
+/// - 対応環境（Linux 5.8 以上）: FlushAck を受け取る
+/// - 非対応環境（Linux 5.8 未満・判定不能・非 Linux）: FlushAck は来ず、サーバーが
+///   接続を閉じるため `recv_ack` は `Unavailable`（EOF）で終わる
+///
+/// どちらの経路でも何かを照合し、非対応側を「何もしない」で済ませない。
 pub fn recv_flush_ack_if_supported(
     client: &mut fandhe_container_io::PipelineClient<
         DuplexEnd,
@@ -463,8 +469,7 @@ pub fn recv_flush_ack_if_supported(
     >,
     timeout: IoTimeout,
 ) {
-    #[cfg(target_os = "linux")]
-    {
+    if fandhe_container_io::persist_support().is_supported() {
         // syncfs は FS 全体を書き戻すため通常の ACK 待ちより長い上限を使う
         // （IoTimeout の上限 10 秒。CI runner の初回 syncfs 遅延対策）。
         let _ = timeout;
@@ -475,20 +480,33 @@ pub fn recv_flush_ack_if_supported(
             .expect("recv_ack must return the FlushAck");
         fandhe_container_io::FlushAck::try_from(receipt)
             .expect("the ack after a flush must be a FlushAck");
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (client, timeout);
+    } else {
+        let err = client
+            .recv_ack(timeout)
+            .expect_err("no FlushAck may arrive where persist is unsupported");
+        assert_eq!(
+            err.code(),
+            IoErrorCode::Unavailable,
+            "the server must close the connection instead of sending a FlushAck ({:?}): {err}",
+            fandhe_container_io::persist_support()
+        );
     }
 }
 
 /// Flush を送って ACK を受け取ったクライアントが接続を閉じた後の、サーバーの
-/// 終了コード期待値。Linux は FlushAck を返してループを続け、EOF で
-/// `Unavailable`。それ以外は persist 未対応のため `Unimplemented`（#88）。
+/// 終了コード期待値（production と同じ判定で分ける）。対応環境は FlushAck を
+/// 返してループを続け、EOF で `Unavailable`。非対応環境は persist が
+/// `Unimplemented` で拒否されてそのコードで終わる（5.8 未満・非 Linux〔#88〕）。
 pub fn flush_session_end_code() -> IoErrorCode {
-    if cfg!(target_os = "linux") {
+    if fandhe_container_io::persist_support().is_supported() {
         IoErrorCode::Unavailable
     } else {
         IoErrorCode::Unimplemented
     }
+}
+
+/// Flush 1 回あたりにサーバーが送る FlushAck の件数の期待値（対応環境で 1・
+/// 非対応環境で 0。`WritebackStats::flush_acks_sent` の照合用）。
+pub fn flush_acks_per_flush() -> u64 {
+    u64::from(fandhe_container_io::persist_support().is_supported())
 }

@@ -1403,7 +1403,9 @@ mod tests {
         // 枠が空けば、同じ sink の persist は自分の fd で syncfs を発行して成功する。
         release_tx.send(()).expect("holder still waiting");
         holder.join().expect("holder must not panic");
-        sink.flush_timeout = test_timeout();
+        // 実 syncfs はファイルシステム全体を書き戻すため、CI runner では数秒
+        // かかりうる。許容上限（MAX_IO_TIMEOUT）まで待つ。
+        sink.flush_timeout = IoTimeout::new(MAX_IO_TIMEOUT).expect("valid timeout");
         sink.persist_with_support(PersistSupport::Supported)
             .expect("persist must succeed once the slot is free");
         assert!(!sink.dirty_since_persist);
@@ -1424,8 +1426,11 @@ mod tests {
     ))]
     #[test]
     fn io2_writeback_real_syncfs_failure_sends_no_flush_ack_and_poisons() {
-        use crate::barrier::PersistSupport;
+        use crate::barrier::{PersistLimiter, PersistSupport};
         use std::os::unix::fs::OpenOptionsExt as _;
+        // 並列に走る他のテストの実 syncfs とプロセス全体の枠を奪い合わないよう、
+        // このテスト専用の limiter を使う（枠待ちの期限切れで Timeout にならない）。
+        static L: PersistLimiter = PersistLimiter::new(1);
         // O_PATH（x86_64・aarch64 とも 0o10000000）。`syncfs` は EBADF で失敗する。
         const O_PATH: i32 = 0o10_000_000;
         let file = std::fs::OpenOptions::new()
@@ -1438,7 +1443,7 @@ mod tests {
             flush_timeout: test_timeout(),
             persist_poisoned: false,
             dirty_since_persist: true,
-            persist_limiter: crate::barrier::default_persist_limiter(),
+            persist_limiter: &L,
         };
         let mut conn = FakeTransport::new(vec![flush_frame(0)]);
 

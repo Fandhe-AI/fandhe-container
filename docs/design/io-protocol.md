@@ -305,10 +305,11 @@ ACK をバッチ書き込みの後に返すため、クライアントが `batch
 
 - `persist` が失敗・タイムアウト・未対応のときは FlushAck を送らず、そのエラーで終了する（fail-closed）。プロトコルにエラーフレームはなく、クライアントは EOF を `Unavailable` として観測する。既定の `BatchSink::persist` は `Unimplemented`
 - `syncfs` は中断できないため、dup した fd を小さなスタックの helper スレッドで 1 回だけ実行し、`AppendFileSink::with_flush_timeout`（既定 10 秒。REPAIR-5）で待つ。タイムアウトした helper は detach され、戻るまでプロセス全体で 64 本までの枠を占有する（超えたら `ResourceExhausted`）
-- 失敗・タイムアウトした `AppendFileSink` はポイズンされ、以後の `persist` は syscall なしで `Internal` を返す（errseq は 1 回しか報告されないため、再試行が 0 を返して永続化を偽装しうる）
-- Linux 5.8 未満、またはカーネル版数を判定できない場合、`persist` は `Unimplemented` で拒否する（`syncfs` が書き戻しエラーを報告するのは 5.8 以降のため、FlushAck の偽装を避ける。IO-2。実装は `crates/io/src/barrier.rs` の `ensure_syncfs_reports_errors`）
+- `syncfs` を発行した後に失敗・タイムアウトした `AppendFileSink` はポイズンされ、以後の `persist` は syscall なしで `Internal` を返す（errseq は 1 回しか報告されないため、再試行が 0 を返して永続化を偽装しうる）。カーネル版数による拒否・fd 複製・枠確保・スレッド生成など発行前の失敗は errseq を消費しないためポイズンしない
+- Linux 5.8 未満、またはカーネル版数を判定できない場合、`persist` は `Unimplemented` で拒否する（`syncfs` が書き戻しエラーを報告するのは 5.8 以降のため、FlushAck の偽装を避ける。IO-2）。判定は公開関数 `persist_support()`（`PersistSupport`。`crates/io/src/barrier.rs`）に集約し、利用者・結合試験も同じ関数で「FlushAck が返る環境か」を知る
 - macOS / Windows は代替フラッシュ未実装で `Unimplemented`（TASK-15.3・#88）
-- 未対応の範囲（REPAIR-3）: 並行 FLUSH の合流・レート制限（同期範囲はファイルシステム全体）、fd を開く前の書き戻しエラー、電源断耐性の検証（TASK-18）
+- 増幅対策: `AppendFileSink` は直近の成功以降に書き込みがなければ `syncfs` を再発行せず合流する（書き込みを伴わない連続 FLUSH）
+- 未対応の範囲（REPAIR-3）: 書き込みを挟む FLUSH のレート制限・接続をまたぐ並行 FLUSH の合流（同期範囲はファイルシステム全体）、fd を開く前の書き戻しエラー、電源断耐性の検証（TASK-18）
 
 ### ACK していない保留分・sink 失敗時の扱い
 
@@ -339,7 +340,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 - UDS 接続受付ループ（accept → `serve_connection` → 次の accept）・同時接続数の上限
 - クライアント側の UDS `connect` と `PipelineClient` との本番結合
 - 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
-- 非 Linux の代替フラッシュ（TASK-15.3・#88）・並行 FLUSH の合流とレート制限
+- 非 Linux の代替フラッシュ（TASK-15.3・#88）・書き込みを挟む FLUSH のレート制限と接続をまたぐ合流
 - 件数未達分を時間ベースで追い出す仕組み・未フラッシュ滞留量の上限（IO-10・TASK-16）
 - 実際の CLI バイナリ（`fandhe-container`）での `--batch-size` 引数の解釈・`crates/cli → crates/io` の依存追加（TASK-79）
 - ファイル操作を表すペイロード形式（パス・rename・truncate。TASK-14 の前提。I/O 契約の拡張にあたる）

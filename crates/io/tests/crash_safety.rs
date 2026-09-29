@@ -437,18 +437,26 @@ mod unix {
         }
     }
 
+    /// crash_test_server が `serve` を正常切断以外で終了したときの終了コード
+    /// （`tests/bin/crash_test_server.rs` の `EXIT_SERVE`）。永続化失敗はこの経路で終了する。
+    const SERVER_EXIT_SERVE: i32 = 4;
+
     /// 永続化（FLUSH）非対応環境で許容する無効理由。通常 ACK は全件届いた前提で、
     /// FLUSH ACK 待ちの失敗（未観測・接続断・タイムアウト）またはその失敗に伴う
-    /// サーバー終了に限る。内部エラー等それ以外のクライアント失敗は許容しない。
+    /// サーバー終了に限る。サーバー終了は `serve` 異常終了（終了コード 4・シグナルなし）だけを
+    /// 許容し、正常終了（0）・起動失敗・シグナル死など無関係な早期終了は失敗させる（REPAIR-12）。
+    /// 内部エラー等それ以外のクライアント失敗も許容しない。
     fn is_persist_unsupported_reason(verdict: &TrialVerdict) -> bool {
-        matches!(
-            verdict,
+        match verdict {
+            TrialVerdict::Invalid(InvalidReason::ServerExitedEarly(exit)) => {
+                exit.code == Some(SERVER_EXIT_SERVE) && exit.signal.is_none()
+            }
             TrialVerdict::Invalid(
                 InvalidReason::FlushAckMissing
-                    | InvalidReason::ServerExitedEarly(_)
-                    | InvalidReason::ClientFailed(IoErrorCode::Unavailable | IoErrorCode::Timeout)
-            )
-        )
+                | InvalidReason::ClientFailed(IoErrorCode::Unavailable | IoErrorCode::Timeout),
+            ) => true,
+            _ => false,
+        }
     }
 
     /// 構造化ログ用のディスク照合フィールド（件数のみ。データ本体・パスは出さない）。
@@ -539,7 +547,7 @@ mod unix {
             // 通常 ACK は全件届き、FLUSH ACK 待ちだけが失敗した経路であることを確認する
             // （接続失敗・通常 ACK 未達・SIGKILL 不成立による無効化を除外。REPAIR-12）。
             // 永続化失敗でサーバーが通常 ACK 送出後に終了し、kill 直前の回収で観測された場合は
-            // ServerExitedEarly になるため、これも同経路として許容する（回収の可否で結果が揺れない）。
+            // ServerExitedEarly（serve 異常終了の終了コード 4）になるため、これも同経路として許容する。
             assert_eq!(obs.acks_observed, 5);
             assert!(
                 is_persist_unsupported_reason(&verdict),
@@ -559,6 +567,21 @@ mod unix {
                 signal: None
             }))
         );
+    }
+
+    /// REPAIR-12: 永続化非対応の許容は serve 異常終了（コード 4）だけで、無関係な早期終了は拒否する。
+    #[test]
+    fn persist_unsupported_reason_rejects_unrelated_server_exit() {
+        let exit = |code, signal| {
+            TrialVerdict::Invalid(InvalidReason::ServerExitedEarly(ServerExit {
+                code,
+                signal,
+            }))
+        };
+        assert!(is_persist_unsupported_reason(&exit(Some(4), None)));
+        assert!(!is_persist_unsupported_reason(&exit(Some(0), None)));
+        assert!(!is_persist_unsupported_reason(&exit(Some(3), None)));
+        assert!(!is_persist_unsupported_reason(&exit(None, Some(9))));
     }
 
     /// IO-3・TASK-18.1.2: 試行ループが有効試行を目標数（ここでは 2）まで集める。

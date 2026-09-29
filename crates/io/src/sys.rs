@@ -1188,6 +1188,13 @@ mod tests {
             let root = t.open();
             assert_eq!(mkdir_beneath(&root, "d", DirMode::Shared), Ok(true));
             assert_eq!(mkdir_beneath(&root, "d", DirMode::Shared), Ok(false));
+            assert_eq!(mkdir_beneath(&root, "p", DirMode::Private), Ok(true));
+            {
+                use std::os::unix::fs::MetadataExt;
+                let meta = std::fs::metadata(t.0.join("p")).expect("p");
+                assert_eq!(meta.mode() & 0o077, 0, "private dir must deny group/other");
+                assert_eq!(meta.uid(), effective_uid());
+            }
             let dir = open_dir_beneath(&root, "d").expect("open d");
             create_leaf_beneath(&dir, "f").expect("create f");
             assert!(t.0.join("d").join("f").is_file());
@@ -1250,6 +1257,14 @@ mod tests {
                     .is_symlink()
             );
             assert!(!outside.0.join("victim").exists());
+            // 別のディレクトリハンドルへの改名（取り消しの私有ディレクトリへの退避）。
+            std::fs::create_dir(t.0.join("q")).expect("q");
+            let q = open_dir_beneath(&root, "q").expect("open q");
+            assert_eq!(rename_beneath(&root, "b", &q, "entry"), Ok(()));
+            assert_eq!(
+                std::fs::read(t.0.join("q").join("entry")).expect("entry"),
+                b"payload"
+            );
             assert_eq!(
                 rename_beneath(&root, "missing", &root, "x"),
                 Err(BeneathError::Io(io::ErrorKind::NotFound))

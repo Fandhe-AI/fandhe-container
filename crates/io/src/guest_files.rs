@@ -1611,6 +1611,66 @@ mod tests {
         assert_eq!(std::fs::read(t.0.join("Foo")).expect("read"), b"variant");
     }
 
+    /// 上限 1 でネストしたパスを登録した後も、暗黙の祖先が走査で上限に数えられず、
+    /// 既存・衝突を正しく報告する（Cursor・Codex P1 指摘）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn io5_limit_does_not_count_implicit_ancestors() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::with_max_tracked_paths(t.0.clone(), 1).expect("creator");
+        c.create_file("a/b").expect("first");
+        let err = c.create_file("a/b").err().expect("exists");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(err.message().starts_with("guest file already exists"));
+        for path in ["A/b", "a/B"] {
+            let err = c.create_file(path).err().expect("collision");
+            assert_eq!(err.code(), IoErrorCode::AlreadyExists, "{path}");
+            assert!(
+                err.message().starts_with("case-insensitive path collision"),
+                "{path}: {}",
+                err.message()
+            );
+        }
+        // 暗黙の祖先 `a`（ディレクトリ）は既存として報告し、件数は増やさない。
+        let err = c.create_file("a").err().expect("exists");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(err.message().starts_with("guest file already exists"));
+        let err = c.create_file("a/c").err().expect("limit");
+        assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+        assert_eq!(c.tracked_len().expect("len"), 1);
+    }
+
+    /// 親ディレクトリのエントリ数がちょうど上限のときに作成して上限を 1 つ超えても、
+    /// 再検証・取り消しは一覧を保持しない走査で行うため失敗せず、衝突なら作成した
+    /// ファイルを残さない（Codex P1 指摘。非 UTF-8 名は索引に入らないが走査では
+    /// 数えられる。大小違いを作れるのは Linux のみ）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io5_verify_and_rollback_work_past_entry_limit() {
+        use std::os::unix::ffi::OsStrExt;
+        fault::reset();
+        let t = Tmp::new();
+        std::fs::write(t.0.join(std::ffi::OsStr::from_bytes(b"raw-\xff")), b"x").expect("non-utf8");
+        // 上限 1・既存 1 件（ちょうど上限）の状態から作成して 2 件になっても成功する。
+        let c = GuestFileCreator::with_max_tracked_paths(t.0.clone(), 1).expect("creator");
+        c.create_file("ok")
+            .expect("create past the per-directory entry limit");
+        // 上限 2・既存 2 件の状態で、作成直前に大小違いが足されて 4 件になっても、
+        // 衝突を検出して自分の作成を取り消す。
+        let c = GuestFileCreator::with_max_tracked_paths(t.0.clone(), 2).expect("creator");
+        let external = t.0.join("Foo");
+        fault::set_hook(fault::Hook::BeforeCreate, move || {
+            std::fs::write(external, b"variant").expect("variant");
+        });
+        let err = c.create_file("foo").err().expect("must collide");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists, "{err:?}");
+        assert!(err.message().starts_with("case-insensitive path collision"));
+        assert!(!t.0.join("foo").exists());
+        assert_eq!(entries(&t.0), 3);
+        assert!(t.0.join("ok").is_file());
+    }
+
     /// 構築後にルートのパスを範囲外への symlink へ差し替えても、作成は保持した
     /// ハンドルの元のディレクトリ内に留まる（IO-5・Codex P0 指摘）。
     #[cfg(any(target_os = "linux", target_os = "macos"))]

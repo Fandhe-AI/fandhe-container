@@ -110,9 +110,10 @@ impl LiveSession {
         drain_acks(&mut self.client, bodies.len(), timeout());
     }
 
-    /// クライアントを切断してセッションを終える（`Flush` は使わない。D4 の
-    /// とおり `Flush` はサーバーを `Unimplemented` で終了させ、以後の
-    /// write_and_ack ができなくなるため、セッションの最終確定にのみ使う）。
+    /// クライアントを切断してセッションを終える（`Flush` は使わない。`Flush` は
+    /// persist 非対応環境〔Linux 5.8 未満・非 Linux〕ではサーバーを
+    /// `Unimplemented` で終了させ、以後の write_and_ack ができなくなるため、
+    /// セッションの最終確定にのみ使う。IO-2・TASK-15.2.2）。
     /// 内部の [`AppendFileSink`] が閉じるのはこの呼び出しが戻った後
     /// （[`join_within`] がサーバースレッドの終了を待つため）。
     fn finish(self) -> WritebackReport {

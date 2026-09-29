@@ -405,10 +405,39 @@ mod unix {
         assert_eq!(report.stats.batches_written, 2);
     }
 
-    /// D4: Write 3 件 + Flush で、ACK 3 件の後に EOF が届く（FlushAck は
-    /// 送られない）。
+    /// クライアント役で、EOF までに届いたフレームの（種別・request id）を集める。
+    /// EOF 以外のエラー（読み取りタイムアウト等）は panic させる。
+    fn collect_until_eof(stream: &mut UnixStream) -> Vec<(FrameKind, u64)> {
+        let mut received = Vec::new();
+        loop {
+            let mut header = [0u8; fandhe_container_io::FRAME_HEADER_LEN];
+            match stream.read_exact(&mut header) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => panic!("unexpected error while reading (not a clean EOF): {err}"),
+            }
+            let parsed = FrameHeader::from_bytes(header).expect("response header must be valid");
+            let mut body = vec![0u8; parsed.body_len()];
+            stream.read_exact(&mut body).expect("must read body");
+            let frame = Frame::decode_body(parsed, &body).expect("response frame must decode");
+            let ack = fandhe_container_io::decode_ack(&frame).expect("must be a valid ack");
+            received.push((ack.kind(), ack.id().get()));
+        }
+        received
+    }
+
+    /// IO-2・TASK-15.2.2・#824: Write 0〜2 → Flush 3 → Write 4 → Flush 5。
+    ///
+    /// 期待値は production と同じ判定（`persist_support`）で分ける（実行ホストの
+    /// カーネル版数・OS に依存させない。Codex #1142 指摘）:
+    /// - 対応環境（Linux 5.8 以上）: Ack 0,1,2・FlushAck 3・Ack 4・FlushAck 5 の順に
+    ///   届き、セッションは Flush の後も継続する。EOF でサーバーは `Unavailable`
+    /// - 非対応環境（Linux 5.8 未満・非 Linux）: Ack 0,1,2 の後 FlushAck なしで EOF。
+    ///   サーバーは `Unimplemented` で終わる（クライアントは最初の Flush 以降を
+    ///   送らない。閉じた接続への送信で EPIPE を起こさないため）
     #[test]
-    fn io1_uds_writeback_flush_acks_pending_then_closes() {
+    fn io2_uds_writeback_flush_returns_flush_ack_after_persist() {
+        let supported = fandhe_container_io::persist_support().is_supported();
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
         let output_path = dir.output_path();
@@ -424,35 +453,191 @@ mod unix {
                 send_write(&mut stream, id, &id.to_le_bytes());
             }
             send_flush(&mut stream, 3);
-
-            let mut acked_ids = Vec::new();
-            loop {
-                let mut header = [0u8; fandhe_container_io::FRAME_HEADER_LEN];
-                match stream.read_exact(&mut header) {
-                    Ok(()) => {}
-                    // `read_exact` が返すエラーのうち、サーバーが接続を正常に
-                    // 閉じた場合（EOF）だけを `UnexpectedEof` として区別する
-                    // （Codex #822 レビュー指摘）。読み取りタイムアウト
-                    // （`WouldBlock` / `TimedOut`。サーバーが ACK を送らずに
-                    // ハングするバグの兆候）まで一律に「接続が閉じた」扱いに
-                    // すると、その種のバグを見逃したままテストが成功してしまう
-                    // ため、それ以外の種別は panic させて検出可能にする。
-                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(err) => panic!(
-                        "unexpected error while reading response header (not a clean EOF): {err}"
-                    ),
-                }
-                let parsed_header =
-                    FrameHeader::from_bytes(header).expect("response header must be valid");
-                let mut body = vec![0u8; parsed_header.body_len()];
+            if supported {
+                send_write(&mut stream, 4, &4u64.to_le_bytes());
+                send_flush(&mut stream, 5);
+                // 送信側を閉じる（サーバーは EOF を観測して終わる）。
                 stream
-                    .read_exact(&mut body)
-                    .expect("client must read the response body");
-                let frame =
-                    Frame::decode_body(parsed_header, &body).expect("response frame must decode");
-                acked_ids.push(ack_id(&frame));
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("shutdown write half");
             }
-            acked_ids
+            collect_until_eof(&mut stream)
+        });
+
+        let mut connection = server
+            .accept(test_timeout(), NoopServerObserver)
+            .expect("server must accept the client connection within the timeout");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&output_path)
+            .expect("must open output file");
+        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+
+        let report = serve_connection(
+            &mut connection,
+            BatchConfig::default(),
+            &mut sink,
+            writeback_timeouts(),
+        );
+        drop(connection);
+        let received = client_thread.join().expect("client thread must not panic");
+        let contents = std::fs::read(&output_path).expect("must read output file");
+
+        if supported {
+            assert_eq!(
+                report.end.code(),
+                fandhe_container_io::IoErrorCode::Unavailable
+            );
+            assert_eq!(report.stats.flush_acks_sent, 2);
+            assert_eq!(report.stats.acks_sent, 4);
+            assert_eq!(
+                received,
+                vec![
+                    (FrameKind::Ack, 0),
+                    (FrameKind::Ack, 1),
+                    (FrameKind::Ack, 2),
+                    (FrameKind::FlushAck, 3),
+                    (FrameKind::Ack, 4),
+                    (FrameKind::FlushAck, 5),
+                ]
+            );
+            let expected: Vec<u8> = [0u64, 1, 2, 4]
+                .iter()
+                .flat_map(|id| id.to_le_bytes())
+                .collect();
+            assert_eq!(contents, expected);
+        } else {
+            assert_eq!(
+                report.end.code(),
+                fandhe_container_io::IoErrorCode::Unimplemented,
+                "{:?}",
+                fandhe_container_io::persist_support()
+            );
+            assert_eq!(report.stats.flush_acks_sent, 0);
+            assert_eq!(report.stats.acks_sent, 3);
+            assert_eq!(
+                received,
+                vec![
+                    (FrameKind::Ack, 0),
+                    (FrameKind::Ack, 1),
+                    (FrameKind::Ack, 2)
+                ]
+            );
+            let expected: Vec<u8> = (0..3u64).flat_map(|id| id.to_le_bytes()).collect();
+            assert_eq!(contents, expected);
+        }
+    }
+
+    /// 書き込みは `AppendFileSink` に委譲し、`persist` が常に失敗する sink
+    /// （公開 API だけで作れる `BatchSink` 実装）。
+    struct FailingPersistSink {
+        inner: AppendFileSink,
+    }
+
+    impl fandhe_container_io::BatchSink for FailingPersistSink {
+        fn write_batch(
+            &mut self,
+            batch: &fandhe_container_io::Batch,
+        ) -> Result<fandhe_container_io::SinkWriteReport, fandhe_container_io::IoError> {
+            self.inner.write_batch(batch)
+        }
+
+        fn persist(
+            &mut self,
+        ) -> Result<fandhe_container_io::SinkPersistReport, fandhe_container_io::IoError> {
+            Err(fandhe_container_io::IoError::new(
+                fandhe_container_io::IoErrorCode::Internal,
+                "injected persist failure",
+            ))
+        }
+    }
+
+    /// IO-2・TASK-15.2.2・#824: persist が失敗すると、Write の ACK は届くが
+    /// FlushAck は届かず EOF になる（Linux / macOS 共通）。
+    #[test]
+    fn io2_uds_writeback_persist_failure_closes_without_flush_ack() {
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+        let output_path = dir.output_path();
+
+        let mut server =
+            UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
+                .expect("bind must succeed on a private, empty path");
+
+        let connect_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = connect(&connect_path);
+            send_write(&mut stream, 0, b"x");
+            send_flush(&mut stream, 1);
+            collect_until_eof(&mut stream)
+        });
+
+        let mut connection = server
+            .accept(test_timeout(), NoopServerObserver)
+            .expect("server must accept the client connection within the timeout");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&output_path)
+            .expect("must open output file");
+        let mut sink = FailingPersistSink {
+            inner: AppendFileSink::new(file).expect("seek to end must succeed"),
+        };
+
+        let report = serve_connection(
+            &mut connection,
+            BatchConfig::default(),
+            &mut sink,
+            writeback_timeouts(),
+        );
+        assert_eq!(
+            report.end.code(),
+            fandhe_container_io::IoErrorCode::Internal
+        );
+        assert_eq!(report.stats.flush_acks_sent, 0);
+        drop(connection);
+
+        let received = client_thread.join().expect("client thread must not panic");
+        assert_eq!(received, vec![(FrameKind::Ack, 0)]);
+    }
+
+    /// IO-1・IO-2: Write 3 件 + Flush で、滞留分の ACK 3 件が届いた後、
+    /// persist 対応環境では FlushAck 3 が届いてクライアントの切断で `Unavailable`、
+    /// 非対応環境（Linux 5.8 未満・非 Linux。代替フラッシュは TASK-15.3・#88）では
+    /// FlushAck なしで EOF になり `Unimplemented` で終わる（D4 の fail-closed。
+    /// 期待値は `persist_support` で分け、どちらの経路も照合する）。
+    #[test]
+    fn io1_uds_writeback_flush_acks_pending_then_closes() {
+        let supported = fandhe_container_io::persist_support().is_supported();
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+        let output_path = dir.output_path();
+
+        let mut server =
+            UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
+                .expect("bind must succeed on a private, empty path");
+
+        let connect_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = connect(&connect_path);
+            for id in 0..3u64 {
+                send_write(&mut stream, id, &id.to_le_bytes());
+            }
+            send_flush(&mut stream, 3);
+            if supported {
+                // 対応環境ではサーバーが Flush 後も継続するため、送信側を閉じて
+                // EOF で終わらせる。
+                stream
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("shutdown write half");
+            }
+            // `collect_until_eof` は EOF（`UnexpectedEof`）以外の読み取りエラー
+            // （サーバーが応答せずハングした場合の読み取りタイムアウト等）を
+            // panic させる（Codex #822 レビュー指摘の区別を維持する）。
+            collect_until_eof(&mut stream)
         });
 
         let mut connection = server
@@ -473,18 +658,35 @@ mod unix {
             &mut sink,
             writeback_timeouts(),
         );
-        assert_eq!(
-            report.end.code(),
-            fandhe_container_io::IoErrorCode::Unimplemented
-        );
         assert_eq!(report.stats.acks_sent, 3);
         // serve_connection が接続を閉じる（drop する）のは呼び出し元がこの
         // 関数から抜けた後なので、ここで connection を明示的に落としてから
         // クライアントの EOF 検出を待つ。
         drop(connection);
 
-        let acked_ids = client_thread.join().expect("client thread must not panic");
-        assert_eq!(acked_ids, vec![0, 1, 2]);
+        let received = client_thread.join().expect("client thread must not panic");
+        let mut expected_received = vec![
+            (FrameKind::Ack, 0),
+            (FrameKind::Ack, 1),
+            (FrameKind::Ack, 2),
+        ];
+        if supported {
+            assert_eq!(
+                report.end.code(),
+                fandhe_container_io::IoErrorCode::Unavailable
+            );
+            assert_eq!(report.stats.flush_acks_sent, 1);
+            expected_received.push((FrameKind::FlushAck, 3));
+        } else {
+            assert_eq!(
+                report.end.code(),
+                fandhe_container_io::IoErrorCode::Unimplemented,
+                "{:?}",
+                fandhe_container_io::persist_support()
+            );
+            assert_eq!(report.stats.flush_acks_sent, 0);
+        }
+        assert_eq!(received, expected_received);
 
         let contents = std::fs::read(&output_path).expect("must read output file");
         let expected: Vec<u8> = (0..3u64).flat_map(|id| id.to_le_bytes()).collect();

@@ -37,8 +37,9 @@
 //!
 //! - macOS / Windows には代替フラッシュがなく `Unimplemented` を返す
 //!   （TASK-15.3・#88）。
-//! - 同時並行する FLUSH の合流とレート制限はない（同期範囲がファイルシステム
-//!   全体に及ぶ増幅への対策。後続課題）。
+//! - 同時並行する FLUSH の合流とレート制限はない。ただし [`crate::writeback::AppendFileSink`]
+//!   は直近の成功以降に書き込みがなければ syncfs を再発行しない（書き込みを
+//!   伴わない連続 FLUSH の増幅対策）。書き込みを挟む FLUSH のレート制限は後続課題。
 //! - Linux 5.8 未満のカーネルは `syncfs(2)` が書き戻しエラーを報告しないため、
 //!   `/proc/sys/kernel/osrelease` で版数を確認し、5.8 未満・判定不能なら
 //!   `Unimplemented` で拒否して FlushAck を返さない（fail-closed）。ディストロが
@@ -517,7 +518,15 @@ mod tests {
             &file,
             IoTimeout::new(crate::MAX_IO_TIMEOUT).expect("valid timeout"),
         );
-        assert!(result.is_ok(), "persist_file_system failed: {result:?}");
+        // 版数依存を避け、実行中カーネルの版数ゲートに応じた期待値で照合する
+        // （5.8 未満は fail-closed の `Unimplemented`。ゲート自体は別テストで固定）。
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        if release_supports_syncfs_errors(&release) {
+            assert!(result.is_ok(), "persist_file_system failed: {result:?}");
+        } else {
+            let err = result.expect_err("pre-5.8 kernel must be rejected");
+            assert_eq!(err.code(), IoErrorCode::Unimplemented);
+        }
     }
 
     #[cfg(target_os = "linux")]

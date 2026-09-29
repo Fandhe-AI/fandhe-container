@@ -215,6 +215,11 @@ pub struct AppendFileSink {
     file: File,
     flush_timeout: IoTimeout,
     persist_poisoned: bool,
+    /// 直近の成功した `persist` 以降に書き込み（失敗した書き込みの一部書き込みを
+    /// 含む）が発生した可能性があるか。初期値は真（既存内容の永続化状態が不明）。
+    /// 偽のとき `persist` は syncfs を再発行せず成功を返す（連続 FLUSH による
+    /// FS 全体同期の増幅を防ぐ合流。IO-2・security.md「無制限リソース確保」）。
+    dirty_since_persist: bool,
 }
 
 impl AppendFileSink {
@@ -257,6 +262,7 @@ impl AppendFileSink {
             file,
             flush_timeout: IoTimeout::new(MAX_IO_TIMEOUT)?,
             persist_poisoned: false,
+            dirty_since_persist: true,
         })
     }
 
@@ -302,6 +308,8 @@ fn sink_error_from_io(err: &io::Error, batch_len: usize) -> IoError {
 
 impl BatchSink for AppendFileSink {
     fn write_batch(&mut self, batch: &Batch) -> Result<SinkWriteReport, IoError> {
+        // 書き込み前に立てる（途中失敗でも一部が書かれうるため。persist の合流判定）。
+        self.dirty_since_persist = true;
         // バッチごとに現在の EOF へ位置合わせする（`AppendFileSink::new` の
         // 「末尾への位置合わせ」節参照。バッチの合間の外部 truncate 後に古い
         // オフセットへ書いてゼロ埋めの穴を作らないため。IO-4）。失敗時は `Err`
@@ -354,8 +362,16 @@ impl BatchSink for AppendFileSink {
                 "persist is poisoned by an earlier failure",
             ));
         }
+        if !self.dirty_since_persist {
+            // 直近の成功以降に書き込みがなく、その成功が既に全書き込みを永続化
+            // 済みのため、FS 全体同期を再発行せず合流する。
+            return Ok(SinkPersistReport::new(Duration::ZERO));
+        }
         match crate::barrier::persist_file_system(&self.file, self.flush_timeout) {
-            Ok(elapsed) => Ok(SinkPersistReport::new(elapsed)),
+            Ok(elapsed) => {
+                self.dirty_since_persist = false;
+                Ok(SinkPersistReport::new(elapsed))
+            }
             Err(err) => {
                 // `Unimplemented` は syscall を発行していない（非 Linux・5.8 未満
                 // カーネルの拒否）ため errseq は消費されておらずポイズン不要。
@@ -396,6 +412,12 @@ pub struct WritebackStats {
     pub acks_sent: u64,
     /// 送出した FLUSH ACK（[`FrameKind::FlushAck`]）の総数（IO-2）。
     pub flush_acks_sent: u64,
+    /// [`BatchSink::persist`] が成功した回数（REPAIR-4）。
+    pub persist_succeeded: u64,
+    /// [`BatchSink::persist`] が失敗した回数（タイムアウト・未対応を含む。REPAIR-4）。
+    pub persist_failed: u64,
+    /// 成功した persist の所要時間の合計（マイクロ秒。飽和加算。REPAIR-4）。
+    pub persist_elapsed_micros: u64,
     /// ACK を送らずに破棄した滞留フレーム件数（D5）。
     pub discarded_pending_frames: u64,
 }
@@ -597,8 +619,17 @@ where
                 // IO-2・TASK-15.2.2: FLUSH ACK は永続化の保証であり、persist が
                 // `Ok` を返したときだけ送る（エラー・タイムアウト・未対応は
                 // FlushAck を送らず終了。fail-closed）。
-                if let Err(err) = sink.persist() {
-                    return finish(stats, &buffer, err);
+                match sink.persist() {
+                    Ok(report) => {
+                        stats.persist_succeeded = stats.persist_succeeded.saturating_add(1);
+                        let micros = u64::try_from(report.elapsed.as_micros()).unwrap_or(u64::MAX);
+                        stats.persist_elapsed_micros =
+                            stats.persist_elapsed_micros.saturating_add(micros);
+                    }
+                    Err(err) => {
+                        stats.persist_failed = stats.persist_failed.saturating_add(1);
+                        return finish(stats, &buffer, err);
+                    }
                 }
                 let flush_ack = match encode_ack(FrameKind::FlushAck, envelope.id()) {
                     Ok(ack) => ack,
@@ -1207,6 +1238,31 @@ mod tests {
         Frame::new(FrameKind::Flush, Vec::new()).expect("empty flush frame must build")
     }
 
+    /// IO-2・TASK-15.2.2: 書き込みのない連続 persist は syncfs を再発行せず
+    /// 合流する（elapsed が 0）。書き込み後は再び dirty になる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io2_append_file_sink_coalesces_persist_without_writes() {
+        let path = std::env::temp_dir().join(format!("fandhe-io-coalesce-{}", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .expect("create temp file");
+        let _ = std::fs::remove_file(&path);
+        let mut sink = AppendFileSink::new(file).expect("sink must construct");
+        assert!(sink.dirty_since_persist);
+        // 5.8 未満のカーネルでは Unimplemented で拒否され dirty のまま（合流しない）。
+        if sink.persist().is_err() {
+            assert!(sink.dirty_since_persist);
+            return;
+        }
+        assert!(!sink.dirty_since_persist);
+        let second = sink.persist().expect("coalesced persist must succeed");
+        assert_eq!(second.elapsed, Duration::ZERO);
+    }
+
     /// IO-2・TASK-15.2.2（受け入れ条件 2）: 実際の `syncfs` ラッパーが失敗
     /// （O_PATH の fd は EBADF）すると FlushAck を返さず `Internal` で終わり、
     /// sink はポイズンされて以後の persist は syscall なしで `Internal`。
@@ -1228,6 +1284,7 @@ mod tests {
             file,
             flush_timeout: test_timeout(),
             persist_poisoned: false,
+            dirty_since_persist: true,
         };
         let mut conn = FakeTransport::new(vec![flush_frame(0)]);
 

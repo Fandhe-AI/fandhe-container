@@ -189,8 +189,9 @@ unsafe extern "C" {
     // 異なる ABI で未定義動作になる）。可変長部は mode で、O_CREAT / O_TMPFILE 不使用の
     // ため渡さない（カーネル・libc は読まない）。
     fn openat(dirfd: i32, path: *const core::ffi::c_char, flags: i32, ...) -> i32;
-    // SAFETY（宣言そのものの妥当性）: `uid_t geteuid(void)` / `gid_t getegid(void)`（u32）。
+    // SAFETY（宣言そのものの妥当性）: `uid_t geteuid(void)`（Linux の `uid_t` は u32）。
     fn geteuid() -> u32;
+    // SAFETY（宣言そのものの妥当性）: `gid_t getegid(void)`（Linux の `gid_t` は u32）。
     fn getegid() -> u32;
 }
 

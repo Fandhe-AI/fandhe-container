@@ -43,6 +43,8 @@
 //! `--batch-size` 相当の設定 API（CLI / 設定の文字列から検証済み
 //! [`batch::BatchConfig`] と [`recv_limits::ReceiveLimits`] を単一の入口から
 //! 導く）は [`settings`] モジュール（TASK-13.3・#78）が提供する。
+//! 未フラッシュ滞留量のカウンタは [`barrier::UnflushedBacklog`]（TASK-16.1・#90・IO-10）で、
+//! 上限到達時の自動フラッシュは TASK-16.2・#91 で後続実装する（未実装。REPAIR-3）。
 //! FS 正規化層は、大文字小文字を区別しないホスト（APFS / NTFS）とゲスト
 //! （ext4）の差異による黙った上書きを防ぐため、ゲスト相対パスの大文字小文字
 //! 衝突を検出する（[`fs_normalize::CaseCollisionSet`]・
@@ -80,8 +82,8 @@ pub mod transport;
 pub mod writeback;
 
 pub use barrier::{
-    AckReceipt, FlushAck, FlushBarrier, MaxConcurrentPersist, PersistSupport, WriteAck,
-    max_concurrent_persist, persist_support, set_max_concurrent_persist,
+    AckReceipt, FlushAck, FlushBarrier, MaxConcurrentPersist, PersistSupport, UnflushedBacklog,
+    WriteAck, max_concurrent_persist, persist_support, set_max_concurrent_persist,
 };
 pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,

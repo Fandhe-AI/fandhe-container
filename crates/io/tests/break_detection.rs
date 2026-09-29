@@ -428,8 +428,17 @@ fn wire_id(value: u64) -> WireRequestId {
     WireRequestId::from(last.expect("loop runs at least once"))
 }
 
+/// サーバー側の受信・送信タイムアウトに使う短いタイムアウト（[`response_timeout`]
+/// より十分短く、`serve_connection` を確定的に短時間で終わらせるため）。
+///
+/// 200ms では、CI ランナーのスケジューリング遅延で `serve_connection` の起動が
+/// クライアント側の最初の送信と競合し、ACK 破棄以外の理由（サーバーが
+/// `Write` 到達前にタイムアウトする）で試験が失敗しうるため 1 秒に広げてある
+/// （Cursor Bugbot 指摘・#122・PR #1134）。[`response_timeout`] の既定値（10 秒・
+/// 最小 5 秒）より十分短いままなので、テストの意図（サーバー側を先に確定的に
+/// タイムアウトさせる）は変わらない。
 fn short_timeout() -> IoTimeout {
-    IoTimeout::new(Duration::from_millis(200)).expect("200ms must be a valid timeout")
+    IoTimeout::new(Duration::from_secs(1)).expect("1s must be a valid timeout")
 }
 
 /// TASK-89.1・REPAIR-5・#122（対照）: [`AckDropping`] を挟まない通常の
@@ -465,7 +474,10 @@ fn repair7_repair5_break1_control_ack_arrives_without_injection() {
         (receipt, is_poisoned)
     });
 
-    let (receipt, is_poisoned) = client_thread.join().expect("client thread must not panic");
+    let (receipt, is_poisoned) =
+        join_within(client_thread, timeout.as_duration() + HANG_GUARD_GRACE)
+            .expect("client thread must finish within the watchdog")
+            .expect("client thread must not panic");
     let AckReceipt::Write(write_ack) = receipt else {
         panic!("expected a Write ack, got {receipt:?}");
     };
@@ -624,7 +636,12 @@ fn repair7_repair2_break2_declared_len_shorter_rejected_by_server() {
     let frame =
         encode_request(FrameKind::Write, wire_id(0), PAYLOAD).expect("encode_request must succeed");
     let encoded = frame.encode();
-    let shorter = u32::try_from(PAYLOAD.len() - 1).expect("small length fits in u32");
+    // `frame` のペイロードは request id（8 バイト。REQUEST_ID_WIRE_LEN）+ `PAYLOAD`
+    // であり、`PAYLOAD.len() - 1` はフレームの実申告長にならない
+    // （`encode_request` が 8 バイトを加算するため）。境界の 1 バイト差を検証する
+    // REPAIR-12 の受け入れ試験として、`frame.header().payload_len()`（実ペイロード長）から
+    // 1 を引く。
+    let shorter = frame.header().payload_len().get() - 1;
     let tampered = tamper_declared_len(&encoded, shorter);
     client_end
         .send_raw(&tampered)
@@ -666,7 +683,10 @@ fn repair7_repair2_break2_error_message_omits_payload_content() {
     let frame =
         encode_request(FrameKind::Write, wire_id(0), PAYLOAD).expect("encode_request must succeed");
     let encoded = frame.encode();
-    let shorter = u32::try_from(PAYLOAD.len() - 1).expect("small length fits in u32");
+    // `frame.header().payload_len()`（request id 8 バイト + `PAYLOAD`）から 1 を引く
+    // （`PAYLOAD.len() - 1` は実申告長にならない。上の declared_len_shorter_rejected
+    // ケースと同じ理由）。
+    let shorter = frame.header().payload_len().get() - 1;
     let tampered = tamper_declared_len(&encoded, shorter);
     client_end
         .send_raw(&tampered)
@@ -850,7 +870,9 @@ mod unix {
         let frame = encode_request(FrameKind::Write, wire_id(0), PAYLOAD)
             .expect("encode_request must succeed");
         let encoded = frame.encode();
-        let shorter = u32::try_from(PAYLOAD.len() - 1).expect("small length fits in u32");
+        // `frame.header().payload_len()`（request id 8 バイト + `PAYLOAD`）から 1 を引く
+        // （`PAYLOAD.len() - 1` は実申告長にならない。上の非 UDS ケースと同じ理由）。
+        let shorter = frame.header().payload_len().get() - 1;
         let tampered = tamper_declared_len(&encoded, shorter);
 
         let mut stream = stream;

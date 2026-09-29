@@ -98,7 +98,7 @@ make fio-baseline-ratio BASELINE=<results.json> CANDIDATE=<results.json>  # Dock
 | ---- | ---- | ---- | ---- |
 | ユニットテスト | 各 crate の `src/` 内 `#[cfg(test)]` | `make test` | — |
 | 結合試験 | 各 crate の `tests/*.rs`（integration test target） | `make test-integration` | `crates/io/tests/` に導入済み。他 crate の結合試験は各機能タスクで追加する。件数は `make test-integration` が出力する `integration test targets: N` 行で確認する |
-| SIGKILL 耐性（IO-3・TASK-18.3.1） | `crates/io/tests/crash_safety.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-io --features crash-test-server --test crash_safety` | 既定 CI 集合（`integration-test` 3 OS・`rust-ci`）で実行し、実機前提ではない。`integration-test` は「crash_safety の存在確認」ステップで glob による無言除外を検出する。電源断後の媒体永続化（IO-2）と実測レポート・妥当性判断（TASK-18 の人間担当）は保証しない |
+| SIGKILL 耐性（IO-3・TASK-18.3.1。実測は [io-crash-safety](docs/design/io-crash-safety.md)） | `crates/io/tests/crash_safety.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-io --features crash-test-server --test crash_safety` | 既定 CI 集合（`integration-test` 3 OS・`rust-ci`）で実行し、実機前提ではない。`integration-test` は「crash_safety の存在確認」ステップで glob による無言除外を検出する。電源断後の媒体永続化（IO-2）と実測レポート・妥当性判断（TASK-18 の人間担当）は保証しない |
 | ベンチ回帰 | `benches/benches/*.rs`・`benches/baseline.json` | `make bench-check` | プレースホルダ段階。実ベンチは TASK-113、基準値の校正は TASK-88 |
 | fio 4K ランダム write ベンチ | `scripts/fio-randwrite-4k.sh`・`scripts/testdata/fio-bench/` | `make fio-bench-selftest`（自己テスト）・`make fio-bench`（実機） | TASK-25.1 で実装済み |
 | fio ベースライン比算出 | `scripts/fio-baseline-ratio.sh`・`scripts/testdata/fio-baseline/` | `make fio-baseline-ratio-selftest`（自己テスト）・`make fio-baseline-ratio`（比率算出） | TASK-25.2: 手順・比率算出・目標値案は整備済み。Docker ベースライン比の実測値は人間実施待ち（#114） |

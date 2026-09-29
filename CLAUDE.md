@@ -47,6 +47,8 @@ fandhe-container/
 ├── benches/                       # crate をまたぐベンチ回帰（REPAIR-8。root の workspace メンバー crate fandhe-container-benches、publish = false。benches/benches/regression_placeholder.rs は TASK-86.3 のプレースホルダベンチ、baseline.json は暫定基準値。実ベンチ本体は TASK-113、基準値の校正は TASK-88）
 ├── docs/
 │   ├── architecture.md            # crate 境界・依存関係グラフ・確定済み設計判断の索引（TASK-6・REPAIR-3・PLUG-1）
+│   ├── api/                       # 利用者向け API 契約
+│   │   └── io-barrier.md          # I/O 共有層の ACK と永続化保証の契約（TASK-17・IO-2）
 │   ├── design/                    # 設計決定・拡張点・リソース効率目標
 │   │   ├── orchestration-scope.md # オーケストレーション スコープ（TASK-5・CRI-8）
 │   │   ├── from-scratch-policy.md # フルスクラッチ方針・依存基準（TASK-7・MS-0）

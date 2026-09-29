@@ -416,6 +416,60 @@ mod unix {
         received
     }
 
+    /// IO-10・TASK-16.1: UDS 経由でも、未フラッシュ滞留量は FLUSH バリア成功で 0 に戻る。
+    ///
+    /// - 対応環境: W0, W1, Flush2, W3 → FlushAck 後に 0 に戻り、W3 の 1 件・8 バイトだけ残る
+    /// - 非対応環境: Flush で FlushAck なしに終わるため戻らず、2 件・16 バイト
+    #[test]
+    fn io10_uds_writeback_unflushed_counter_resets_on_flush_barrier() {
+        let supported = fandhe_container_io::persist_support().is_supported();
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+
+        let mut server =
+            UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
+                .expect("bind must succeed on a private, empty path");
+
+        let connect_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = connect(&connect_path);
+            send_write(&mut stream, 0, &0u64.to_le_bytes());
+            send_write(&mut stream, 1, &1u64.to_le_bytes());
+            send_flush(&mut stream, 2);
+            if supported {
+                send_write(&mut stream, 3, &3u64.to_le_bytes());
+                stream
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("shutdown write half");
+            }
+            collect_until_eof(&mut stream)
+        });
+
+        let mut connection = server
+            .accept(test_timeout(), NoopServerObserver)
+            .expect("server must accept the client connection within the timeout");
+        let mut sink = dir.output_sink();
+
+        let report = serve_connection(
+            &mut connection,
+            BatchConfig::default(),
+            &mut sink,
+            writeback_timeouts(),
+        );
+        drop(connection);
+        client_thread.join().expect("client thread must not panic");
+
+        if supported {
+            assert_eq!(report.stats.flush_acks_sent, 1);
+            assert_eq!(report.stats.unflushed.frames(), 1);
+            assert_eq!(report.stats.unflushed.bytes(), 8);
+        } else {
+            assert_eq!(report.stats.flush_acks_sent, 0);
+            assert_eq!(report.stats.unflushed.frames(), 2);
+            assert_eq!(report.stats.unflushed.bytes(), 16);
+        }
+    }
+
     /// IO-2・TASK-15.2.2・#824: Write 0〜2 → Flush 3 → Write 4 → Flush 5。
     ///
     /// 期待値は production と同じ判定（`persist_support`）で分ける（実行ホストの

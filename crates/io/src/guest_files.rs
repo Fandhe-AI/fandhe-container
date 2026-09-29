@@ -410,8 +410,11 @@ fn open_root_handle(root: &Path) -> std::io::Result<File> {
     const FLAGS: u32 = 0x0200_0000;
     // FILE_SHARE_READ | FILE_SHARE_WRITE（FILE_SHARE_DELETE は含めない）
     const SHARE: u32 = 0x1 | 0x2;
+    // 書き込み権限付き: 作成側がこのハンドルを複製してディレクトリ同期
+    // （`FlushFileBuffers`。書き込み権限が必要）に使い、パスを開き直さないため。
     OpenOptions::new()
         .read(true)
+        .write(true)
         .custom_flags(FLAGS)
         .share_mode(SHARE)
         .open(root)
@@ -588,8 +591,11 @@ fn open_pinned_dir(path: &Path) -> std::io::Result<Option<File>> {
     const SHARE: u32 = 0x1 | 0x2;
     // FILE_ATTRIBUTE_REPARSE_POINT
     const REPARSE: u32 = 0x400;
+    // 書き込み権限付き: 作成側がこのハンドルを複製してディレクトリ同期に使い、
+    // 固定後にパスを開き直さない（別ディレクトリへの差し替え防止。IO-2・IO-3）。
     let dir = OpenOptions::new()
         .read(true)
+        .write(true)
         .custom_flags(FLAGS)
         .share_mode(SHARE)
         .open(path)?;
@@ -598,6 +604,13 @@ fn open_pinned_dir(path: &Path) -> std::io::Result<Option<File>> {
         return Ok(None);
     }
     Ok(Some(dir))
+}
+
+/// 固定済みディレクトリのハンドルを複製する（同一実体。パスの再解決をしない）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn dup_dir(dir: &File) -> Result<File, CreateError> {
+    dir.try_clone()
+        .map_err(|err| CreateError::Other(internal("failed to create guest file", err.kind())))
 }
 
 /// [`create_beneath`] の失敗種別。
@@ -1199,7 +1212,7 @@ fn restore_moved(
 /// ルート相対ハンドル作成への置き換えは後続。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn create_beneath(
-    _root_dir: &File,
+    root_dir: &File,
     root: &Path,
     ancestors: &[&str],
     leaf: &str,
@@ -1208,9 +1221,9 @@ fn create_beneath(
     // 固定済みの祖先ハンドル（葉の作成が終わるまで保持する）。
     let mut pinned: Vec<File> = Vec::with_capacity(ancestors.len());
     // 同期用の書き込み可能ハンドル（root から順。最後に反転して末端の親から返す）。
-    // 固定中に開くため、パスは固定済みの同じディレクトリに解決される。
+    // パスを開き直さず、固定済みハンドルの複製（同一のディレクトリ実体を指す）を使う。
     let mut sync_dirs: Vec<File> = Vec::with_capacity(ancestors.len().saturating_add(1));
-    sync_dirs.push(crate::barrier::open_dir_handle(root).map_err(CreateError::Other)?);
+    sync_dirs.push(dup_dir(root_dir)?);
     for name in ancestors {
         path.push(name);
         match std::fs::create_dir(&path) {
@@ -1226,8 +1239,8 @@ fn create_beneath(
         let dir = open_pinned_dir(&path)
             .map_err(|err| CreateError::Other(internal("failed to create guest file", err.kind())))?
             .ok_or_else(|| CreateError::Other(invalid("guest path ancestor is not a directory")))?;
+        sync_dirs.push(dup_dir(&dir)?);
         pinned.push(dir);
-        sync_dirs.push(crate::barrier::open_dir_handle(&path).map_err(CreateError::Other)?);
     }
     sync_dirs.reverse();
     let result = OpenOptions::new()

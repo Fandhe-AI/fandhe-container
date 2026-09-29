@@ -102,7 +102,7 @@
 
 ## 利用例
 
-トランスポート（`FrameSender` 実装）は呼び出し側が用意する。クライアント側の UDS `connect` は未実装である（REPAIR-3）。
+トランスポートは呼び出し側が用意する。送信（`send`・`flush`）には `FrameSender<Frame = Frame>` の実装があれば足りるが、ACK の受信（`recv_ack`）を使うには同じトランスポートが `FrameReceiver<Frame = Frame>` も実装している必要がある（両方を満たす型は `FrameTransport` として扱われる）。クライアント側の UDS `connect` は未実装である（REPAIR-3）。
 
 ```rust,ignore
 use fandhe_container_io::barrier::{AckReceipt, FlushAck};
@@ -110,6 +110,7 @@ use fandhe_container_io::client::PipelineClient;
 use fandhe_container_io::protocol::FrameKind;
 
 // PipelineClient::new(sender, limit, observer) で構築済みとする
+// （sender は FrameSender + FrameReceiver の両方を実装する。recv_ack に FrameReceiver が必要）
 client.send(FrameKind::Write, &body, timeout)?;
 let barrier = client.flush(timeout)?;
 loop {

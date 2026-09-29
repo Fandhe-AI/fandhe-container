@@ -157,7 +157,8 @@
 //!   (3) I/O 完了後に poison を再確認し、立っていれば結果（受信済みフレームを含む）を
 //!   捨てて `Unavailable` を返す（死んだ接続のフレームを上位へ渡さない）。
 //! - 観測フックは両半分で 1 つを `Arc<Mutex<_>>` 共有する（1 接続に 1 フック）。ロックは
-//!   `on_event` の間だけ取り、I/O をまたいで保持しない。
+//!   `on_event` の間だけ取り、I/O をまたいで保持しない。ロック保持中の通知は
+//!   有界の保留キューへ積み、保持側が解放時に排出する（欠落させない）。
 //! - 送信側の drop は poison されていなければ `shutdown(Write)`（half-close）を呼ぶ。
 //!   受信側の drop は何もしない。
 //! - **`O_NONBLOCK` 共有の不変条件**: `O_NONBLOCK` は複製した fd と共有される
@@ -220,6 +221,7 @@
 //! [`IoErrorCode::Unavailable`] へ変換する。本 library を Rust 以外の実行時
 //! から使う場合はこの前提が崩れうるため範囲外とする。
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -689,16 +691,29 @@ impl<C: ServerObserver> FrameReceiver for UdsConnection<C> {
     }
 }
 
+/// 観測フックへ後から適用する保留イベント（所有データのみを持つ）。
+type PendingEvent<C> = Box<dyn FnOnce(&mut C) + Send>;
+
+/// 保留イベントの上限件数（無制限確保の防止。security.md）。超えた分は破棄する。
+const MAX_PENDING_EVENTS: usize = 1024;
+
+struct SharedObserverInner<C: ServerObserver> {
+    hook: Mutex<C>,
+    pending: Mutex<VecDeque<PendingEvent<C>>>,
+}
+
 /// 分割後の両半分が共有する観測フック（#1118。1 接続に 1 フックの意味論を保つ）。
 ///
 /// ロックは `on_event` / [`Self::with`] の間だけ取り、I/O をまたいで保持しない
 /// （両半分の間でデッドロックしない）。他方のスレッドが panic してロックが poison
 /// されても `into_inner` で続行し、ここから panic を伝播させない。
 ///
-/// I/O 経路（`send_frame` / `recv_frame`）からの通知は [`Self::try_with`] を使い、
-/// 呼び出し側の `with_observer` クロージャがロックを保持している間は待たずに
-/// イベントを捨てる（期限を超えてブロックしない。REPAIR-5。観測はベストエフォート）。
-struct SharedObserver<C: ServerObserver>(Arc<Mutex<C>>);
+/// I/O 経路（`send_frame` / `recv_frame`）からの通知は [`Self::notify`] を使う。
+/// イベントをいったん保留キューへ積み、フックのロックが取れれば待たずに順序どおり
+/// 適用する。他方（`with_observer` のクロージャや別スレッドの通知）がロックを保持
+/// 中ならブロックせずに戻り（期限を超えない。REPAIR-5）、ロック保持側が解放後に
+/// キューを排出する（REPAIR-4: 並行終了でもイベントを欠落させない）。
+struct SharedObserver<C: ServerObserver>(Arc<SharedObserverInner<C>>);
 
 impl<C: ServerObserver> Clone for SharedObserver<C> {
     fn clone(&self) -> Self {
@@ -707,20 +722,98 @@ impl<C: ServerObserver> Clone for SharedObserver<C> {
 }
 
 impl<C: ServerObserver> SharedObserver<C> {
-    fn with<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
-        let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        f(&mut guard)
+    fn new(hook: C) -> Self {
+        Self(Arc::new(SharedObserverInner {
+            hook: Mutex::new(hook),
+            pending: Mutex::new(VecDeque::new()),
+        }))
     }
 
-    /// ロックを待たずに `f` を適用する。他方が保持中なら `None`（`f` は呼ばない）。
-    fn try_with<R>(&self, f: impl FnOnce(&mut C) -> R) -> Option<R> {
-        let mut guard = match self.0.try_lock() {
-            Ok(g) => g,
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-        };
-        Some(f(&mut guard))
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, VecDeque<PendingEvent<C>>> {
+        self.0
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// 保留キューを空になるまでフックへ適用する（フックのロック保持中に呼ぶ）。
+    /// キューのロックは `on_event` の実行中は保持しない。
+    fn drain_locked(&self, hook: &mut C) {
+        loop {
+            let next = self.lock_pending().pop_front();
+            match next {
+                Some(event) => event(hook),
+                None => break,
+            }
+        }
+    }
+
+    /// ロックを取って `f` を適用し、その間に積まれた保留イベントも排出する。
+    fn with<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
+        let result = {
+            let mut guard = self.0.hook.lock().unwrap_or_else(PoisonError::into_inner);
+            let r = f(&mut guard);
+            self.drain_locked(&mut guard);
+            r
+        };
+        // 解放直前に他方が積んで try_lock に失敗した分を取りこぼさない。
+        self.flush();
+        result
+    }
+
+    /// ロックが取れる間、保留イベントを排出する。取れなければ保持側に任せる。
+    fn flush(&self) {
+        loop {
+            {
+                let mut guard = match self.0.hook.try_lock() {
+                    Ok(g) => g,
+                    Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return,
+                };
+                self.drain_locked(&mut guard);
+            }
+            if self.lock_pending().is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// イベントを保留キューへ積み、待たずに排出を試みる（キュー満杯なら破棄）。
+    fn notify(&self, event: PendingEvent<C>) {
+        {
+            let mut q = self.lock_pending();
+            if q.len() >= MAX_PENDING_EVENTS {
+                return;
+            }
+            q.push_back(event);
+        }
+        self.flush();
+    }
+}
+
+/// 成功イベントを保留キュー経由で通知する。
+fn notify_success<C: ServerObserver>(
+    observer: &SharedObserver<C>,
+    op: ServerOp,
+    kind: Option<FrameKind>,
+    latency: Duration,
+) {
+    observer.notify(Box::new(move |o| emit_success(o, op, kind, latency)));
+}
+
+/// 失敗イベントを保留キュー経由で通知する（エラーは所有データへ複製する）。
+fn notify_failure<C: ServerObserver>(
+    observer: &SharedObserver<C>,
+    op: ServerOp,
+    kind: Option<FrameKind>,
+    outcome: ServerOutcome,
+    latency: Duration,
+    err: &IoError,
+) {
+    let err = IoError::new(err.code(), err.message().to_owned());
+    observer.notify(Box::new(move |o| {
+        emit_failure(o, op, kind, outcome, latency, &err)
+    }));
 }
 
 /// [`SplitTransport::split`] が返す送信側（#1118・IO-1・P1-3）。
@@ -764,7 +857,8 @@ impl<C: ServerObserver> core::fmt::Debug for UdsRecvHalf<C> {
 impl<C: ServerObserver> UdsSendHalf<C> {
     /// 両半分で共有している観測フックへ、ロックを取って `f` を適用する
     /// （[`UdsConnection::observer_mut`] の分割後の代替）。`f` の実行中に他方の半分が
-    /// 通知しようとしたイベントは待たずに捨てられる（I/O 期限を守るため）。
+    /// 通知したイベントは待たずに保留キューへ積まれ、`f` の後に順序どおり適用される
+    /// （I/O 期限を守りつつ欠落させない）。
     pub fn with_observer<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
         self.observer.with(f)
     }
@@ -773,7 +867,8 @@ impl<C: ServerObserver> UdsSendHalf<C> {
 impl<C: ServerObserver> UdsRecvHalf<C> {
     /// 両半分で共有している観測フックへ、ロックを取って `f` を適用する
     /// （[`UdsConnection::observer_mut`] の分割後の代替）。`f` の実行中に他方の半分が
-    /// 通知しようとしたイベントは待たずに捨てられる（I/O 期限を守るため）。
+    /// 通知したイベントは待たずに保留キューへ積まれ、`f` の後に順序どおり適用される
+    /// （I/O 期限を守りつつ欠落させない）。
     pub fn with_observer<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
         self.observer.with(f)
     }
@@ -791,9 +886,15 @@ fn settle_shared<T>(
 ) -> (Result<T, IoError>, bool) {
     match result {
         Err(e) => {
-            poison.poison();
+            // 他方がすでに poison を立てていた場合、この Err は多くが shutdown(Both) で
+            // 起こされた結果の I/O エラーなので、元のエラーではなく `Unavailable` に揃える。
+            let already = poison.poison();
             inner.shutdown_both();
-            (Err(e), false)
+            if already {
+                (Err(unavailable_after_poison()), true)
+            } else {
+                (Err(e), false)
+            }
         }
         Ok(_) if poison.is_poisoned() => (Err(unavailable_after_poison()), true),
         Ok(v) => (Ok(v), false),
@@ -807,33 +908,31 @@ impl<C: ServerObserver> FrameSender for UdsSendHalf<C> {
         let kind = Some(frame.kind());
         if self.poison.is_poisoned() {
             let err = unavailable_after_poison();
-            let _ = self.observer.try_with(|o| {
-                emit_failure(
-                    o,
-                    ServerOp::Send,
-                    kind,
-                    ServerOutcome::RejectedPoisoned,
-                    Duration::ZERO,
-                    &err,
-                )
-            });
+            notify_failure(
+                &self.observer,
+                ServerOp::Send,
+                kind,
+                ServerOutcome::RejectedPoisoned,
+                Duration::ZERO,
+                &err,
+            );
             return Err(err);
         }
         let started = Instant::now();
         let result = self.inner.send_frame(frame, timeout);
         let elapsed = started.elapsed();
         let (result, rejected) = settle_shared(&self.inner, &self.poison, result);
-        let _ = self.observer.try_with(|o| match &result {
-            Ok(()) => emit_success(o, ServerOp::Send, kind, elapsed),
+        match &result {
+            Ok(()) => notify_success(&self.observer, ServerOp::Send, kind, elapsed),
             Err(err) => {
                 let outcome = if rejected {
                     ServerOutcome::RejectedPoisoned
                 } else {
                     ServerOutcome::Failure
                 };
-                emit_failure(o, ServerOp::Send, kind, outcome, elapsed, err);
+                notify_failure(&self.observer, ServerOp::Send, kind, outcome, elapsed, err);
             }
-        });
+        }
         result
     }
 }
@@ -844,16 +943,14 @@ impl<C: ServerObserver> FrameReceiver for UdsRecvHalf<C> {
     fn recv_frame(&mut self, timeout: IoTimeout) -> Result<Frame, IoError> {
         if self.poison.is_poisoned() {
             let err = unavailable_after_poison();
-            let _ = self.observer.try_with(|o| {
-                emit_failure(
-                    o,
-                    ServerOp::Recv,
-                    None,
-                    ServerOutcome::RejectedPoisoned,
-                    Duration::ZERO,
-                    &err,
-                )
-            });
+            notify_failure(
+                &self.observer,
+                ServerOp::Recv,
+                None,
+                ServerOutcome::RejectedPoisoned,
+                Duration::ZERO,
+                &err,
+            );
             return Err(err);
         }
         let started = Instant::now();
@@ -861,17 +958,26 @@ impl<C: ServerObserver> FrameReceiver for UdsRecvHalf<C> {
         let elapsed = started.elapsed();
         let attempt_kind = attempt.kind;
         let (result, rejected) = settle_shared(&self.inner, &self.poison, attempt.result);
-        let _ = self.observer.try_with(|o| match &result {
-            Ok(frame) => emit_success(o, ServerOp::Recv, Some(frame.kind()), elapsed),
+        match &result {
+            Ok(frame) => {
+                notify_success(&self.observer, ServerOp::Recv, Some(frame.kind()), elapsed)
+            }
             Err(err) => {
                 let outcome = if rejected {
                     ServerOutcome::RejectedPoisoned
                 } else {
                     ServerOutcome::Failure
                 };
-                emit_failure(o, ServerOp::Recv, attempt_kind, outcome, elapsed, err);
+                notify_failure(
+                    &self.observer,
+                    ServerOp::Recv,
+                    attempt_kind,
+                    outcome,
+                    elapsed,
+                    err,
+                );
             }
-        });
+        }
         result
     }
 }
@@ -899,7 +1005,7 @@ impl<C: ServerObserver> SplitTransport for UdsConnection<C> {
         }
         let recv_inner = self.inner.try_clone()?;
         let poison = SharedPoison::new();
-        let observer = SharedObserver(Arc::new(Mutex::new(self.observer)));
+        let observer = SharedObserver::new(self.observer);
         Ok((
             UdsSendHalf {
                 inner: self.inner,

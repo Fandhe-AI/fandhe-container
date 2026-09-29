@@ -197,8 +197,11 @@ impl SharedPoison {
     }
 
     /// poison を立てる。もう片側の Acquire 読み出しから観測できるよう Release にする。
-    pub(crate) fn poison(&self) {
-        self.0.store(true, Ordering::Release);
+    ///
+    /// 戻り値は「呼び出し前にすでに poison 済みだったか」。両側が同時に失敗した場合に
+    /// 先に立てた側だけが元のエラーを返し、後の側を `Unavailable` に揃えるために使う。
+    pub(crate) fn poison(&self) -> bool {
+        self.0.swap(true, Ordering::AcqRel)
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {
@@ -538,8 +541,12 @@ mod tests {
         let a = SharedPoison::new();
         let b = a.clone();
         assert!(!b.is_poisoned());
-        a.poison();
+        assert!(!a.poison(), "first poison call reports not-yet-poisoned");
         assert!(b.is_poisoned());
+        assert!(
+            b.poison(),
+            "second call from a clone reports already poisoned"
+        );
     }
 
     /// IO-1: `FrameSender` / `FrameReceiver` の実装は `Send` を満たす。

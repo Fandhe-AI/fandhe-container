@@ -1306,6 +1306,51 @@ mod unix {
             assert!(client.read(&mut buf).expect("client read") == 1);
         }
 
+        /// REPAIR-4・#1118: `with_observer` のクロージャが保持中に送信側が I/O を終えても、
+        /// そのイベントは欠落せず、保持側が解放した後にフックへ適用される。
+        #[test]
+        fn a3_1118_event_during_held_observer_is_not_lost() {
+            let dir = TempSocketDir::new();
+            let (_server, connection, mut client) = connected(
+                &dir,
+                ReceiveLimits::default(),
+                NoopServerObserver,
+                JsonLinesServerObserver::new(),
+            );
+            let (mut send, recv) = connection.split().expect("split must succeed");
+            let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                recv.with_observer(|_| {
+                    held_tx.send(()).expect("held signal");
+                    let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                });
+                recv
+            });
+            held_rx.recv().expect("observer must be held");
+
+            let ack = Frame::new(FrameKind::Ack, vec![7]).expect("ack must construct");
+            send.send_frame(&ack, test_timeout())
+                .expect("send must succeed while the observer is held");
+            release_tx.send(()).expect("release");
+            let recv = holder.join().expect("holder must not panic");
+
+            let lines = recv.with_observer(|o| o.drain_lines());
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| l.contains("\"op\":\"send\"") && l.contains("\"outcome\":\"ok\""))
+                    .count(),
+                1,
+                "the send event must be preserved exactly once: {lines:?}"
+            );
+            let mut buf = [0u8; 1];
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            assert!(client.read(&mut buf).expect("client read") == 1);
+        }
+
         /// REPAIR-5・#1118（受け入れ基準 3）: 沈黙する相手に対し受信側は期限で `Timeout`、
         /// 以後は `Unavailable`。
         #[test]

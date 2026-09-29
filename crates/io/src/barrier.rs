@@ -910,6 +910,32 @@ mod tests {
         assert_eq!(L.running(), 0);
     }
 
+    /// IO-2・REPAIR-5: `work` の結果（成功・エラー・panic）が返った時点で枠は
+    /// 解放済み。helper が結果を送った後に枠を解放すると、負荷時に呼び出し側が
+    /// 占有中の枠を観測する（main CI の `io2_persist_limiter_*` 断続失敗）。
+    /// 競合の窓を踏みやすいよう各経路を繰り返し、毎回直後に計数を照合する。
+    #[test]
+    fn io2_persist_slot_released_before_result_is_returned() {
+        static L: PersistLimiter = PersistLimiter::new(1);
+        for round in 0..200 {
+            run_with_deadline(&L, ms(2000), || Ok(())).expect("fast work must succeed");
+            assert_eq!(L.running(), 0, "after Ok (round {round})");
+
+            let err = run_with_deadline(&L, ms(2000), || {
+                Err(IoError::new(IoErrorCode::Internal, "injected"))
+            })
+            .expect_err("error must propagate");
+            assert_eq!(err.code(), IoErrorCode::Internal);
+            assert_eq!(L.running(), 0, "after Err (round {round})");
+        }
+        for round in 0..20 {
+            let err = run_with_deadline(&L, ms(2000), || panic!("injected panic in persist work"))
+                .expect_err("panicking work must fail");
+            assert_eq!(err.code(), IoErrorCode::Internal);
+            assert_eq!(L.running(), 0, "after panic (round {round})");
+        }
+    }
+
     /// REPAIR-5（Codex #1142 指摘）: 期限を過ぎた後は、枠が空いていても枠を
     /// 渡さない（期限切れの FLUSH のために syncfs を起動しない）。
     #[test]

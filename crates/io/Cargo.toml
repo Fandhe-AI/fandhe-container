@@ -9,3 +9,25 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+# SIGKILL 耐性テスト（IO-3・TASK-18）用の子プロセス起動エントリポイントを、専用 feature でのみ
+# ビルドする（TASK-18.1.1・#825）。feature を付けないビルド（リリース成果物を含む）では
+# この bin 自体がビルドされないため、テスト専用の起動経路が本番の配布物に入らない。
+# 中身のない feature で、依存は引き込まない。
+[features]
+crash-test-server = []
+
+[[bin]]
+name = "crash_test_server"
+path = "tests/bin/crash_test_server.rs"
+required-features = ["crash-test-server"]
+test = false
+bench = false
+doc = false
+
+# `env!("CARGO_BIN_EXE_crash_test_server")` は bin がビルドされたときにだけ定義されるため、
+# 呼び出し側の結合試験も同じ feature で有効にする（TASK-18.1.2 = #826 が拡張する）。
+[[test]]
+name = "crash_safety"
+path = "tests/crash_safety.rs"
+required-features = ["crash-test-server"]

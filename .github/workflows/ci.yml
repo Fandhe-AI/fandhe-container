@@ -342,7 +342,7 @@ jobs:
               ;;
           esac
           for name in "${expected[@]}"; do
-            if ! printf '%s\n' "${listed}" | grep -Fxq "${name}: test"; then
+            if ! grep -Fxq "${name}: test" <<< "${listed}"; then
               echo "::error::crash_safety test not listed: ${name}" >&2
               exit 1
             fi

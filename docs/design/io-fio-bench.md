@@ -227,8 +227,11 @@ docker run --rm --user "$(id -u):$(id -g)" \
       --direct=1 --size=256m --runtime=30 --iodepth=1 --numjobs=1 \
       --end_fsync=1 --group_reporting --output-format=json --output=/out/fio.json
 
-# 3) fio JSON を results.json 形式へ変換（label は docker_bind_mount / docker_named_volume）
-bash scripts/fio-randwrite-4k.sh --from-json <out-dir>/fio.json --label docker_bind_mount
+# 3) fio JSON を results.json 形式へ変換（label は docker_bind_mount / docker_named_volume）。
+#    --output で変換結果をファイルへ保存する（指定しないと stdout に出すだけで、
+#    手順 4 の比較用ファイルが手元に残らない）
+bash scripts/fio-randwrite-4k.sh --from-json <out-dir>/fio.json --label docker_bind_mount \
+    --output <docker-results.json>
 
 # 4) 倍率の算出（BASELINE=Docker、CANDIDATE=fandhe 経路。共有マウント公開後）
 make fio-baseline-ratio BASELINE=<docker-results.json> CANDIDATE=<fandhe-results.json>

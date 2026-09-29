@@ -139,14 +139,22 @@ read_input() {
     err "invalid-input" "${what} is not a regular file: ${path}"
     exit 2
   fi
-  if ! content=$(head -c "$((MAX_INPUT_BYTES + 1))" -- "$path" 2>/dev/null); then
+  # コマンド置換 `$( )` は末尾改行をすべて取り除くため、`content` へ代入した
+  # 後の `wc -c` では元ファイルの実バイト数（末尾改行を含む）を測れない
+  # （改行付き JSON が上限をわずかに超えていても代入後は上限以下に見え、通って
+  # しまう）。サイズ判定はコマンド置換を介さないパイプ（`head | wc -c`）で行い、
+  # `wc` 自身の出力（数字文字列）だけをコマンド置換で受け取る。
+  local bytes
+  if ! bytes=$(head -c "$((MAX_INPUT_BYTES + 1))" -- "$path" 2>/dev/null | wc -c | tr -d ' '); then
     err "invalid-input" "${what} could not be read: ${path}"
     exit 2
   fi
-  local bytes
-  bytes=$(printf '%s' "$content" | wc -c | tr -d ' ')
   if ! printf '%s' "$bytes" | grep -Eq '^[0-9]+$' || [ "$bytes" -gt "$MAX_INPUT_BYTES" ]; then
     err "invalid-input" "${what} exceeds ${MAX_INPUT_BYTES} bytes: ${path}"
+    exit 2
+  fi
+  if ! content=$(head -c "$((MAX_INPUT_BYTES + 1))" -- "$path" 2>/dev/null); then
+    err "invalid-input" "${what} could not be read: ${path}"
     exit 2
   fi
   printf '%s' "$content"
@@ -237,8 +245,27 @@ if [ "$baseline_fio_version" != "$candidate_fio_version" ]; then
   echo "warning: fio_version differs between baseline (${baseline_fio_version}) and candidate (${candidate_fio_version})" >&2
 fi
 
-result=$(printf '%s\n%s\n' "$baseline_content" "$candidate_content" | jq -s '
+# 分母・分子の値はそれぞれ validate_jq_program で有限の正数と確認済みだが、
+# 極端な組み合わせ（非常に大きい値÷非常に小さい値）では倍率自体が IEEE754
+# 倍精度の範囲を超えて inf/NaN になり得る。「終了コード 0 で機械可読な倍率を
+# 返す」契約が崩れるため、5 種すべての倍率が有限であることを検証する。
+# この検証は倍率を算出した同じ jq プロセス内（出力を一旦テキスト化する前）で
+# 行う必要がある。jq は出力を JSON テキストへシリアライズする際に無限大を
+# 有限の DBL_MAX へ丸めるため、一度 stdout へ出してから改めて `isinfinite` を
+# 調べても既に有限の値に化けており検出できない。
+if ! result=$(printf '%s\n%s\n' "$baseline_content" "$candidate_content" | jq -s '
+  def check_ratio(v; name): if (v | isinfinite or isnan) then error("ratio \(name) is not finite") else v end;
   .[0] as $b | .[1] as $c
+  | ($c.metrics.fio_randwrite_4k_iops.value / $b.metrics.fio_randwrite_4k_iops.value) as $iops_ratio
+  | ($c.metrics.fio_randwrite_4k_lat_mean_us.value / $b.metrics.fio_randwrite_4k_lat_mean_us.value) as $lat_mean_ratio
+  | ($c.metrics.fio_randwrite_4k_clat_p50_us.value / $b.metrics.fio_randwrite_4k_clat_p50_us.value) as $clat_p50_ratio
+  | ($c.metrics.fio_randwrite_4k_clat_p95_us.value / $b.metrics.fio_randwrite_4k_clat_p95_us.value) as $clat_p95_ratio
+  | ($c.metrics.fio_randwrite_4k_clat_p99_us.value / $b.metrics.fio_randwrite_4k_clat_p99_us.value) as $clat_p99_ratio
+  | check_ratio($iops_ratio; "iops")
+  | check_ratio($lat_mean_ratio; "lat_mean_us")
+  | check_ratio($clat_p50_ratio; "clat_p50_us")
+  | check_ratio($clat_p95_ratio; "clat_p95_us")
+  | check_ratio($clat_p99_ratio; "clat_p99_us")
   | {
     schema_version: 1,
     comparison: "fio_randwrite_4k_baseline_ratio",
@@ -252,29 +279,17 @@ result=$(printf '%s\n%s\n' "$baseline_content" "$candidate_content" | jq -s '
     },
     params: $b.params,
     ratios: {
-      iops: {
-        value: ($c.metrics.fio_randwrite_4k_iops.value / $b.metrics.fio_randwrite_4k_iops.value),
-        direction: "higher_is_better"
-      },
-      lat_mean_us: {
-        value: ($c.metrics.fio_randwrite_4k_lat_mean_us.value / $b.metrics.fio_randwrite_4k_lat_mean_us.value),
-        direction: "lower_is_better"
-      },
-      clat_p50_us: {
-        value: ($c.metrics.fio_randwrite_4k_clat_p50_us.value / $b.metrics.fio_randwrite_4k_clat_p50_us.value),
-        direction: "lower_is_better"
-      },
-      clat_p95_us: {
-        value: ($c.metrics.fio_randwrite_4k_clat_p95_us.value / $b.metrics.fio_randwrite_4k_clat_p95_us.value),
-        direction: "lower_is_better"
-      },
-      clat_p99_us: {
-        value: ($c.metrics.fio_randwrite_4k_clat_p99_us.value / $b.metrics.fio_randwrite_4k_clat_p99_us.value),
-        direction: "lower_is_better"
-      }
+      iops: { value: $iops_ratio, direction: "higher_is_better" },
+      lat_mean_us: { value: $lat_mean_ratio, direction: "lower_is_better" },
+      clat_p50_us: { value: $clat_p50_ratio, direction: "lower_is_better" },
+      clat_p95_us: { value: $clat_p95_ratio, direction: "lower_is_better" },
+      clat_p99_us: { value: $clat_p99_ratio, direction: "lower_is_better" }
     }
   }
-')
+' 2>&1); then
+  err "invalid-input" "computed ratio is not finite (candidate/baseline values are too extreme): ${result}"
+  exit 2
+fi
 
 printf '%s\n' "$result"
 

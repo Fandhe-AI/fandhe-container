@@ -278,7 +278,7 @@ BREAK-2 検出経路の整理:
 
 ### 範囲外（後続タスク）
 
-- 送信側と受信側をスレッドで分ける API（`split()` 等）
+- `PipelineClient` 自体の送受信分割（共有 `SendQueue` を持つ送信側・ACK 受信側）。トランスポート層の分割は `transport::SplitTransport`（#1118・IO-1・P1-3）で定義済みで、`UdsConnection`（サーバー側）が `UdsSendHalf` / `UdsRecvHalf` へ分けられる（poison を両半分で共有し、片側のエラーで `shutdown(Both)`。期限・受信上限の契約は分割前と同じ）
 - ACK status バイトの導入（導入する場合は `PROTOCOL_VERSION` の繰り上げが必要）
 
 サーバー側が本形式で ACK を返す実装と送信順を守る義務は、下記「バッチ write-back と ACK 返却」節（TASK-13.2.2・#822）で実装済み。

@@ -11,7 +11,12 @@
 //! named pipe などの具象トランスポート実装は後続タスクの担当 crate / モジュールに置く。
 //! UDS のサーバー側（Linux / macOS）は [`crate::server`] が TASK-13.2.1（#820）で
 //! 具象実装を追加した。
+//!
+//! 1 本の接続を送信側・受信側へ分けて別スレッドから並行に使う API は
+//! [`SplitTransport`]（#1118・IO-1・P1-3・REPAIR-5）が定める。
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::error::{IoError, IoErrorCode};
@@ -107,8 +112,8 @@ pub trait WireFrame: sealed::Sealed + Send + core::fmt::Debug {}
 /// - `timeout` 以内に書き出せなければ [`IoErrorCode::Timeout`] を返す（REPAIR-5:
 ///   無期限にブロックしない）。
 /// - `&mut self` を要求し、1 つの接続を同時に使えるのは 1 スレッドのみとする
-///   （ソケットのような状態を持つトランスポートを想定）。並行化（送信側と受信側の分割）は
-///   TASK-12 で扱う。
+///   （ソケットのような状態を持つトランスポートを想定）。送信側と受信側を別スレッドで
+///   並行に使いたい場合は [`SplitTransport::split`] で分割する（#1118）。
 ///
 /// # エラー後の接続再利用（P1-3・設計レビュー・2026-09-28 オーナー決定・REPAIR-5・
 /// REPAIR-6）
@@ -162,9 +167,8 @@ pub trait FrameReceiver: Send {
 /// 送受信を両方持つトランスポートの名前（IO-1）。
 ///
 /// 送信スレッドと ACK 受信スレッドを並行に動かすパイプライン送信のため、
-/// [`FrameSender`]・[`FrameReceiver`] を別トレイトに分けている。送信側・受信側への
-/// 分割 API（`split()` 等）は OS ごとのソケット実装に依存するため、本件では定義せず
-/// TASK-12 で決める。
+/// [`FrameSender`]・[`FrameReceiver`] を別トレイトに分けている。1 本の接続を送信側・
+/// 受信側へ分ける API は [`SplitTransport`]（#1118）が定める。
 ///
 /// フレーム型の一致（`FrameSender::Frame == FrameReceiver::Frame`）は、supertrait の
 /// 宣言で `FrameReceiver<Frame = <Self as FrameSender>::Frame>` という関連型の等式
@@ -178,6 +182,58 @@ pub trait FrameTransport:
 }
 
 impl<T> FrameTransport for T where T: FrameSender + FrameReceiver<Frame = <T as FrameSender>::Frame> {}
+
+/// 両半分が共有する poison 状態（P1-3・#1118）。
+///
+/// 分割後の送信側・受信側のどちらかがエラーを返したら立て、もう片側の以後の呼び出しを
+/// I/O なしで [`IoErrorCode::Unavailable`] にする（fail-closed）。具象トランスポート
+/// （[`crate::server`] の分割型）が使う内部部品で、公開面は増やさない。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SharedPoison(Arc<AtomicBool>);
+
+impl SharedPoison {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// poison を立てる。もう片側の Acquire 読み出しから観測できるよう Release にする。
+    pub(crate) fn poison(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// 1 本の接続を送信側・受信側へ分けられるトランスポート（IO-1・P1-3・REPAIR-5・#1118）。
+///
+/// パイプライン送信で送信スレッドと ACK 受信スレッドを並行に動かすために使う。
+/// OS 非依存のトレイトで、UDS サーバー側の [`crate::server::UdsConnection`]
+/// （Linux / macOS）が実装する。将来のクライアント接続型も同じ形で実装する。
+///
+/// # 契約
+/// - [`Self::split`] は `self` を消費する。分割前の値は分割後に使えない（型で保証）。
+/// - すでに poison 済み（エラー後）の接続の `split` は [`IoErrorCode::Unavailable`] を
+///   返し、接続は閉じる（P1-3: 再利用させない）。fd の複製に失敗した場合も `Err` を
+///   返し、接続は閉じる（呼び出し元は再接続する）。
+/// - **poison の共有（P1-3）**: 両半分は poison 状態を共有する。片側がエラーを返したら
+///   もう片側の以後の呼び出しは I/O なしで `Unavailable` を返し、ブロック中の
+///   呼び出しも接続の shutdown で速やかに `Unavailable` になる。
+/// - **期限（REPAIR-5）・受信上限**: 各呼び出しは [`IoTimeout`] で打ち切られ、受信側の
+///   受信上限（`ReceiveLimits`。TASK-13.4）も分割前と同じ。
+/// - **片側だけ drop した場合**: 送信側の drop は（poison されていなければ）書き込み側の
+///   half-close となり、相手は EOF を受けるが受信側はそのまま使える。受信側の drop は
+///   何もしない。どちらの drop も poison を立てない。
+pub trait SplitTransport: FrameTransport + Sized {
+    /// 分割後の送信側。
+    type SendHalf: FrameSender<Frame = <Self as FrameSender>::Frame> + Send;
+    /// 分割後の受信側。
+    type RecvHalf: FrameReceiver<Frame = <Self as FrameSender>::Frame> + Send;
+
+    /// 接続を送信側・受信側へ分ける。
+    fn split(self) -> Result<(Self::SendHalf, Self::RecvHalf), IoError>;
+}
 
 #[cfg(test)]
 mod tests {
@@ -325,6 +381,166 @@ mod tests {
     }
 
     fn assert_send<T: Send>() {}
+
+    /// 共有 poison を持つ分割可能な mock（#1118）。`fail_next` が立つと次の呼び出しが
+    /// `Timeout` を返して poison を立てる。
+    #[derive(Debug, Default)]
+    struct MockSplit {
+        queue: VecDeque<MockFrame>,
+        poison: SharedPoison,
+        fail_next: bool,
+    }
+
+    #[derive(Debug)]
+    struct MockSendHalf {
+        queue: std::sync::Arc<std::sync::Mutex<VecDeque<MockFrame>>>,
+        poison: SharedPoison,
+        fail_next: bool,
+    }
+
+    #[derive(Debug)]
+    struct MockRecvHalf {
+        queue: std::sync::Arc<std::sync::Mutex<VecDeque<MockFrame>>>,
+        poison: SharedPoison,
+        fail_next: bool,
+    }
+
+    fn poisoned_err() -> IoError {
+        IoError::new(
+            IoErrorCode::Unavailable,
+            "connection is poisoned by a previous error and must be reconnected",
+        )
+    }
+
+    impl FrameSender for MockSplit {
+        type Frame = MockFrame;
+        fn send_frame(&mut self, frame: &MockFrame, _t: IoTimeout) -> Result<(), IoError> {
+            if self.poison.is_poisoned() {
+                return Err(poisoned_err());
+            }
+            self.queue.push_back(frame.clone());
+            Ok(())
+        }
+    }
+
+    impl FrameReceiver for MockSplit {
+        type Frame = MockFrame;
+        fn recv_frame(&mut self, _t: IoTimeout) -> Result<MockFrame, IoError> {
+            if self.poison.is_poisoned() {
+                return Err(poisoned_err());
+            }
+            self.queue
+                .pop_front()
+                .ok_or_else(|| IoError::new(IoErrorCode::Timeout, "mock queue is empty"))
+        }
+    }
+
+    impl FrameSender for MockSendHalf {
+        type Frame = MockFrame;
+        fn send_frame(&mut self, frame: &MockFrame, _t: IoTimeout) -> Result<(), IoError> {
+            if self.poison.is_poisoned() {
+                return Err(poisoned_err());
+            }
+            if self.fail_next {
+                self.poison.poison();
+                return Err(IoError::new(IoErrorCode::Timeout, "mock send failed"));
+            }
+            self.queue
+                .lock()
+                .expect("mock lock")
+                .push_back(frame.clone());
+            Ok(())
+        }
+    }
+
+    impl FrameReceiver for MockRecvHalf {
+        type Frame = MockFrame;
+        fn recv_frame(&mut self, _t: IoTimeout) -> Result<MockFrame, IoError> {
+            if self.poison.is_poisoned() {
+                return Err(poisoned_err());
+            }
+            if self.fail_next {
+                self.poison.poison();
+                return Err(IoError::new(IoErrorCode::Timeout, "mock recv failed"));
+            }
+            self.queue
+                .lock()
+                .expect("mock lock")
+                .pop_front()
+                .ok_or_else(|| IoError::new(IoErrorCode::Timeout, "mock queue is empty"))
+        }
+    }
+
+    impl SplitTransport for MockSplit {
+        type SendHalf = MockSendHalf;
+        type RecvHalf = MockRecvHalf;
+        fn split(self) -> Result<(MockSendHalf, MockRecvHalf), IoError> {
+            if self.poison.is_poisoned() {
+                return Err(poisoned_err());
+            }
+            let queue = std::sync::Arc::new(std::sync::Mutex::new(self.queue));
+            Ok((
+                MockSendHalf {
+                    queue: queue.clone(),
+                    poison: self.poison.clone(),
+                    fail_next: false,
+                },
+                MockRecvHalf {
+                    queue,
+                    poison: self.poison,
+                    fail_next: self.fail_next,
+                },
+            ))
+        }
+    }
+
+    /// IO-1・#1118: 分割後の両半分は `Send`（別スレッドへ移せる）。
+    #[test]
+    fn io1_split_transport_halves_are_send() {
+        assert_send::<MockSendHalf>();
+        assert_send::<MockRecvHalf>();
+    }
+
+    /// P1-3・#1118: 片側がエラーを返すともう片側の次の呼び出しが `Unavailable` になり、
+    /// キューに触れない。
+    #[test]
+    fn p1_3_split_poison_propagates_to_other_half() {
+        let transport = MockSplit {
+            fail_next: true,
+            ..MockSplit::default()
+        };
+        let (mut send, mut recv) = transport.split().expect("split must succeed");
+        let err = recv
+            .recv_frame(test_timeout())
+            .expect_err("recv half must fail");
+        assert_eq!(err.code(), IoErrorCode::Timeout);
+        let err = send
+            .send_frame(&MockFrame(1), test_timeout())
+            .expect_err("send half must be poisoned");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+        assert!(send.queue.lock().expect("mock lock").is_empty());
+    }
+
+    /// P1-3・#1118: poison 済みの接続の `split` は `Unavailable` で拒否される。
+    #[test]
+    fn p1_3_split_rejects_poisoned_transport() {
+        let transport = MockSplit::default();
+        transport.poison.poison();
+        let err = transport
+            .split()
+            .expect_err("poisoned transport must not split");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
+    }
+
+    /// `SharedPoison` の clone は同じ状態を共有する。
+    #[test]
+    fn p1_3_shared_poison_is_shared_between_clones() {
+        let a = SharedPoison::new();
+        let b = a.clone();
+        assert!(!b.is_poisoned());
+        a.poison();
+        assert!(b.is_poisoned());
+    }
 
     /// IO-1: `FrameSender` / `FrameReceiver` の実装は `Send` を満たす。
     #[test]

@@ -144,6 +144,32 @@
 //! 限られ、それらは窓がなくても同じファイルを直接操作できるため、新たな
 //! 権限昇格の経路にはならない。
 //!
+//! # 分割（split。#1118・IO-1・P1-3・REPAIR-5）
+//!
+//! [`UdsConnection`] は [`SplitTransport`] を実装し、[`UdsSendHalf`]・[`UdsRecvHalf`] へ
+//! 分けて別スレッドから並行に使える（契約の全体は [`SplitTransport`] を参照）。
+//! 実装上の要点:
+//!
+//! - fd は `UnixStream::try_clone` で複製する。poison は `SharedPoison`（内部型）で共有する。
+//!   各呼び出しは (1) I/O の前に共有 poison を確認して立っていれば I/O せず
+//!   `Unavailable`、(2) I/O が `Err` なら poison を立てて `shutdown(Both)`（もう片側で
+//!   ブロック中の read / write を起こし、EOF / EPIPE で速やかに `Unavailable` にする）、
+//!   (3) I/O 完了後に poison を再確認し、立っていれば結果（受信済みフレームを含む）を
+//!   捨てて `Unavailable` を返す（死んだ接続のフレームを上位へ渡さない）。
+//! - 観測フックは両半分で 1 つを `Arc<Mutex<_>>` 共有する（1 接続に 1 フック）。ロックは
+//!   `on_event` の間だけ取り、I/O をまたいで保持しない。
+//! - 送信側の drop は poison されていなければ `shutdown(Write)`（half-close）を呼ぶ。
+//!   受信側の drop は何もしない。
+//! - **`O_NONBLOCK` 共有の不変条件**: `O_NONBLOCK` は複製した fd と共有される
+//!   （open file description のフラグ）。受信側の drain モード（`ReadWait`）が
+//!   nonblocking に切り替えるのは、macOS で `set_read_timeout` が `EINVAL` を返した
+//!   とき、すなわち相手が送受信とも shutdown 済みと見なせるときだけである。この
+//!   状態の送信は `set_write_timeout` の `EINVAL` か write の EPIPE で直ちに
+//!   `Unavailable` になり、仮に `WouldBlock` で再試行しても期限（REPAIR-5）で
+//!   打ち切られる。`SO_RCVTIMEO` / `SO_SNDTIMEO` は別オプションで互いに干渉しない。
+//!   drain を `recv(MSG_DONTWAIT)` に置き換えて fd の状態を変えない方式は `unsafe` を
+//!   伴うため本件の範囲外（要起票）。
+//!
 //! # OS 対応
 //!
 //! Linux / macOS では [`UdsServer`]・[`UdsConnection`] は実際に UDS を bind・
@@ -168,7 +194,6 @@
 //!   で、受信時点の「排出済みだが未書き込み」のキューは常に空になるため、
 //!   この `0` は現行の呼び出し方（1 バッチ完結の同期処理）の下で構造上正確
 //!   （`crates/io/src/writeback.rs` モジュール doc「受信上限」節参照）
-//! - 送信側と受信側の分割 API（`try_clone` を使った split。TASK-12）
 //! - クライアント側の UDS 接続（`connect`）・[`crate::client::PipelineClient`]
 //!   との本番結合
 //! - vsock（microVM）トランスポート
@@ -196,13 +221,14 @@
 //! から使う場合はこの前提が崩れうるため範囲外とする。
 
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::error::{IoError, IoErrorCode};
 use crate::observe::{SendEventError, ServerEvent, ServerObserver, ServerOp, ServerOutcome};
 use crate::protocol::{Frame, FrameKind};
 use crate::recv_limits::ReceiveLimits;
-use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
+use crate::transport::{FrameReceiver, FrameSender, IoTimeout, SharedPoison, SplitTransport};
 
 /// [`imp::ServerInner::accept`] の結果に、受付ループ内で再試行した回数
 /// （[`crate::observe::ServerEvent::accept_aborted_retries`]・
@@ -518,16 +544,7 @@ impl<C: ServerObserver> UdsConnection<C> {
     /// 成功イベントを観測フックへ通知する（`send_frame`・`recv_frame` の成功
     /// 分岐で共有。TASK-13.2.1・#820。REPAIR-4）。
     fn notify_success(&mut self, op: ServerOp, kind: Option<FrameKind>, latency: Duration) {
-        self.observer.on_event(&ServerEvent {
-            op,
-            kind,
-            outcome: ServerOutcome::Success,
-            latency,
-            accept_aborted_retries: 0,
-            peer_credential_rejections: 0,
-            peer_uid: None,
-            error: None,
-        });
+        emit_success(&mut self.observer, op, kind, latency);
     }
 
     /// 失敗イベントを観測フックへ通知する（`send_frame`・`recv_frame` の失敗
@@ -542,19 +559,7 @@ impl<C: ServerObserver> UdsConnection<C> {
         latency: Duration,
         err: &IoError,
     ) {
-        self.observer.on_event(&ServerEvent {
-            op,
-            kind,
-            outcome,
-            latency,
-            accept_aborted_retries: 0,
-            peer_credential_rejections: 0,
-            peer_uid: None,
-            error: Some(SendEventError {
-                code: err.code(),
-                message: err.message(),
-            }),
-        });
+        emit_failure(&mut self.observer, op, kind, outcome, latency, err);
     }
 
     /// [`UdsServer::accept`] で渡した観測フックを参照する。
@@ -566,6 +571,50 @@ impl<C: ServerObserver> UdsConnection<C> {
     pub fn observer_mut(&mut self) -> &mut C {
         &mut self.observer
     }
+}
+
+/// 成功イベントを組み立てて `observer` へ通知する（[`UdsConnection`] と分割後の
+/// 両半分が共有。REPAIR-4）。
+fn emit_success<C: ServerObserver>(
+    observer: &mut C,
+    op: ServerOp,
+    kind: Option<FrameKind>,
+    latency: Duration,
+) {
+    observer.on_event(&ServerEvent {
+        op,
+        kind,
+        outcome: ServerOutcome::Success,
+        latency,
+        accept_aborted_retries: 0,
+        peer_credential_rejections: 0,
+        peer_uid: None,
+        error: None,
+    });
+}
+
+/// 失敗イベントを組み立てて `observer` へ通知する（[`emit_success`] の失敗版）。
+fn emit_failure<C: ServerObserver>(
+    observer: &mut C,
+    op: ServerOp,
+    kind: Option<FrameKind>,
+    outcome: ServerOutcome,
+    latency: Duration,
+    err: &IoError,
+) {
+    observer.on_event(&ServerEvent {
+        op,
+        kind,
+        outcome,
+        latency,
+        accept_aborted_retries: 0,
+        peer_credential_rejections: 0,
+        peer_uid: None,
+        error: Some(SendEventError {
+            code: err.code(),
+            message: err.message(),
+        }),
+    });
 }
 
 /// poison 済み接続への呼び出しに返すエラー（P1-3）。
@@ -637,6 +686,233 @@ impl<C: ServerObserver> FrameReceiver for UdsConnection<C> {
             ),
         }
         self.poison_on_err(attempt.result)
+    }
+}
+
+/// 分割後の両半分が共有する観測フック（#1118。1 接続に 1 フックの意味論を保つ）。
+///
+/// ロックは `on_event` / [`Self::with`] の間だけ取り、I/O をまたいで保持しない
+/// （両半分の間でデッドロックしない）。他方のスレッドが panic してロックが poison
+/// されても `into_inner` で続行し、ここから panic を伝播させない。
+///
+/// I/O 経路（`send_frame` / `recv_frame`）からの通知は [`Self::try_with`] を使い、
+/// 呼び出し側の `with_observer` クロージャがロックを保持している間は待たずに
+/// イベントを捨てる（期限を超えてブロックしない。REPAIR-5。観測はベストエフォート）。
+struct SharedObserver<C: ServerObserver>(Arc<Mutex<C>>);
+
+impl<C: ServerObserver> Clone for SharedObserver<C> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<C: ServerObserver> SharedObserver<C> {
+    fn with<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
+        let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        f(&mut guard)
+    }
+
+    /// ロックを待たずに `f` を適用する。他方が保持中なら `None`（`f` は呼ばない）。
+    fn try_with<R>(&self, f: impl FnOnce(&mut C) -> R) -> Option<R> {
+        let mut guard = match self.0.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(f(&mut guard))
+    }
+}
+
+/// [`SplitTransport::split`] が返す送信側（#1118・IO-1・P1-3）。
+///
+/// [`UdsConnection`] の複製 fd を持つ。契約は [`SplitTransport`] とモジュール doc
+/// 「分割」節を参照。drop 時、poison されていなければ書き込み側を half-close する。
+pub struct UdsSendHalf<C: ServerObserver> {
+    inner: imp::ConnectionInner,
+    poison: SharedPoison,
+    observer: SharedObserver<C>,
+}
+
+/// [`SplitTransport::split`] が返す受信側（#1118・IO-1・P1-3）。
+///
+/// [`UdsConnection`] が持っていた `ReceiveLimits`（TASK-13.4）をそのまま引き継ぎ、
+/// 本体バッファ確保前の受理判定も分割前と同じ。
+pub struct UdsRecvHalf<C: ServerObserver> {
+    inner: imp::ConnectionInner,
+    poison: SharedPoison,
+    observer: SharedObserver<C>,
+    limits: ReceiveLimits,
+}
+
+impl<C: ServerObserver> core::fmt::Debug for UdsSendHalf<C> {
+    /// poison 状態のみを出す（[`UdsConnection`] の `Debug` と同じ方針）。
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UdsSendHalf")
+            .field("poisoned", &self.poison.is_poisoned())
+            .finish()
+    }
+}
+
+impl<C: ServerObserver> core::fmt::Debug for UdsRecvHalf<C> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UdsRecvHalf")
+            .field("poisoned", &self.poison.is_poisoned())
+            .finish()
+    }
+}
+
+impl<C: ServerObserver> UdsSendHalf<C> {
+    /// 両半分で共有している観測フックへ、ロックを取って `f` を適用する
+    /// （[`UdsConnection::observer_mut`] の分割後の代替）。`f` の実行中に他方の半分が
+    /// 通知しようとしたイベントは待たずに捨てられる（I/O 期限を守るため）。
+    pub fn with_observer<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
+        self.observer.with(f)
+    }
+}
+
+impl<C: ServerObserver> UdsRecvHalf<C> {
+    /// 両半分で共有している観測フックへ、ロックを取って `f` を適用する
+    /// （[`UdsConnection::observer_mut`] の分割後の代替）。`f` の実行中に他方の半分が
+    /// 通知しようとしたイベントは待たずに捨てられる（I/O 期限を守るため）。
+    pub fn with_observer<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
+        self.observer.with(f)
+    }
+}
+
+/// I/O の結果に共有 poison の規則（モジュール doc「分割」節の (2)・(3)）を適用する。
+///
+/// `Err` なら poison を立てて `shutdown(Both)` でもう片側を起こす。`Ok` でも他方が
+/// 既に poison を立てていれば結果を捨てて `Unavailable` にする。戻り値の bool は
+/// 「poison 済みのため結果を捨てた」（観測上 [`ServerOutcome::RejectedPoisoned`]）。
+fn settle_shared<T>(
+    inner: &imp::ConnectionInner,
+    poison: &SharedPoison,
+    result: Result<T, IoError>,
+) -> (Result<T, IoError>, bool) {
+    match result {
+        Err(e) => {
+            poison.poison();
+            inner.shutdown_both();
+            (Err(e), false)
+        }
+        Ok(_) if poison.is_poisoned() => (Err(unavailable_after_poison()), true),
+        Ok(v) => (Ok(v), false),
+    }
+}
+
+impl<C: ServerObserver> FrameSender for UdsSendHalf<C> {
+    type Frame = Frame;
+
+    fn send_frame(&mut self, frame: &Frame, timeout: IoTimeout) -> Result<(), IoError> {
+        let kind = Some(frame.kind());
+        if self.poison.is_poisoned() {
+            let err = unavailable_after_poison();
+            let _ = self.observer.try_with(|o| {
+                emit_failure(
+                    o,
+                    ServerOp::Send,
+                    kind,
+                    ServerOutcome::RejectedPoisoned,
+                    Duration::ZERO,
+                    &err,
+                )
+            });
+            return Err(err);
+        }
+        let started = Instant::now();
+        let result = self.inner.send_frame(frame, timeout);
+        let elapsed = started.elapsed();
+        let (result, rejected) = settle_shared(&self.inner, &self.poison, result);
+        let _ = self.observer.try_with(|o| match &result {
+            Ok(()) => emit_success(o, ServerOp::Send, kind, elapsed),
+            Err(err) => {
+                let outcome = if rejected {
+                    ServerOutcome::RejectedPoisoned
+                } else {
+                    ServerOutcome::Failure
+                };
+                emit_failure(o, ServerOp::Send, kind, outcome, elapsed, err);
+            }
+        });
+        result
+    }
+}
+
+impl<C: ServerObserver> FrameReceiver for UdsRecvHalf<C> {
+    type Frame = Frame;
+
+    fn recv_frame(&mut self, timeout: IoTimeout) -> Result<Frame, IoError> {
+        if self.poison.is_poisoned() {
+            let err = unavailable_after_poison();
+            let _ = self.observer.try_with(|o| {
+                emit_failure(
+                    o,
+                    ServerOp::Recv,
+                    None,
+                    ServerOutcome::RejectedPoisoned,
+                    Duration::ZERO,
+                    &err,
+                )
+            });
+            return Err(err);
+        }
+        let started = Instant::now();
+        let attempt = self.inner.recv_frame(timeout, self.limits);
+        let elapsed = started.elapsed();
+        let attempt_kind = attempt.kind;
+        let (result, rejected) = settle_shared(&self.inner, &self.poison, attempt.result);
+        let _ = self.observer.try_with(|o| match &result {
+            Ok(frame) => emit_success(o, ServerOp::Recv, Some(frame.kind()), elapsed),
+            Err(err) => {
+                let outcome = if rejected {
+                    ServerOutcome::RejectedPoisoned
+                } else {
+                    ServerOutcome::Failure
+                };
+                emit_failure(o, ServerOp::Recv, attempt_kind, outcome, elapsed, err);
+            }
+        });
+        result
+    }
+}
+
+impl<C: ServerObserver> Drop for UdsSendHalf<C> {
+    /// poison されていなければ書き込み側を half-close する（相手は送信済みデータを
+    /// 読み切った後に EOF を受ける。受信側は使い続けられる）。shutdown の失敗
+    /// （ENOTCONN 等）は無視する。
+    fn drop(&mut self) {
+        if !self.poison.is_poisoned() {
+            self.inner.shutdown_write();
+        }
+    }
+}
+
+impl<C: ServerObserver> SplitTransport for UdsConnection<C> {
+    type SendHalf = UdsSendHalf<C>;
+    type RecvHalf = UdsRecvHalf<C>;
+
+    /// poison 済みなら `Unavailable`（接続はここで drop して閉じる）。fd の複製に
+    /// 失敗した場合もエラーを返し、接続は閉じる。
+    fn split(self) -> Result<(UdsSendHalf<C>, UdsRecvHalf<C>), IoError> {
+        if self.poisoned {
+            return Err(unavailable_after_poison());
+        }
+        let recv_inner = self.inner.try_clone()?;
+        let poison = SharedPoison::new();
+        let observer = SharedObserver(Arc::new(Mutex::new(self.observer)));
+        Ok((
+            UdsSendHalf {
+                inner: self.inner,
+                poison: poison.clone(),
+                observer: observer.clone(),
+            },
+            UdsRecvHalf {
+                inner: recv_inner,
+                poison,
+                observer,
+                limits: self.limits,
+            },
+        ))
     }
 }
 
@@ -1308,6 +1584,26 @@ mod imp {
     }
 
     impl ConnectionInner {
+        /// fd を複製して分割後の受信側用の `ConnectionInner` を作る（#1118）。
+        /// `O_NONBLOCK` は複製間で共有される点は上位モジュール doc「分割」節参照。
+        pub(super) fn try_clone(&self) -> Result<Self, IoError> {
+            self.stream
+                .try_clone()
+                .map(|stream| Self { stream })
+                .map_err(map_io_error)
+        }
+
+        /// 読み書きの両方向を shutdown する。もう片側でブロック中の read / write を
+        /// 起こすために使う。失敗（ENOTCONN 等）は無視する。
+        pub(super) fn shutdown_both(&self) {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        }
+
+        /// 書き込み方向のみ shutdown する（half-close）。失敗は無視する。
+        pub(super) fn shutdown_write(&self) {
+            let _ = self.stream.shutdown(std::net::Shutdown::Write);
+        }
+
         /// `frame.encode()` の結果を、フレーム単位の期限つきで最後まで書き切る。
         pub(super) fn send_frame(
             &mut self,
@@ -3264,6 +3560,18 @@ mod imp {
     pub(super) enum ConnectionInner {}
 
     impl ConnectionInner {
+        pub(super) fn try_clone(&self) -> Result<Self, IoError> {
+            match *self {}
+        }
+
+        pub(super) fn shutdown_both(&self) {
+            match *self {}
+        }
+
+        pub(super) fn shutdown_write(&self) {
+            match *self {}
+        }
+
         pub(super) fn send_frame(
             &mut self,
             _frame: &Frame,

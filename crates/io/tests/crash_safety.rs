@@ -6,9 +6,14 @@
 //! 有効 / 無効試行の判定（`trial` モジュール）・有効試行を集める試行ループを追加した。
 //! 判定ロジックは OS 非依存の `trial` に置き 3 OS でユニットテストする。
 //!
-//! 未実装（後続 issue #95・TASK-18.2）: 損失件数の計測（ディスク上のレコード照合）・
-//! フラッシュ済み / 未フラッシュの対照ケース・「有効 10/10 で損失 0」のアサーション。
-//! ここの結合試験は CI 時間を抑えるため小さい目標数で試行ループの挙動だけを確かめる（REPAIR-3）。
+//! #95（TASK-18.2）で、kill 後に `data.bin` を読んで seq 0..n と照合する損失計測と、
+//! 2 つの対照ケースを追加した。
+//! - フラッシュ済み（`io3_flushed_data_survives_10_valid_sigkills`）: 有効 10/10 で損失 0 を検証する。
+//! - 未フラッシュ対照（`io3_unflushed_control_records_loss_without_asserting`）: 損失件数は
+//!   記録するだけで、件数ではテストを失敗させない。
+//!
+//! 未実装（TASK-18 の人間担当・#827）: 実測結果レポートと対照としての妥当性の判断、CI 回帰への
+//! 組み込み。ここの小さい目標数の結合試験（`io3_harness_*`）は試行ループの挙動だけを確かめる（REPAIR-3）。
 //! Windows など UDS 未対応 OS では、未対応終了コード 5 を返すことだけを確かめる。
 
 #[path = "crash_safety/trial.rs"]
@@ -34,8 +39,9 @@ mod unix {
     };
 
     use crate::trial::{
-        InvalidReason, ServerExit, TrialLedger, TrialObservation, TrialSummary, TrialVerdict,
-        classify_trial, run_until_valid,
+        DiskObservation, InvalidReason, MAX_ATTEMPTS, RECORD_LEN, ServerExit, TARGET_VALID_TRIALS,
+        TrialLedger, TrialObservation, TrialSummary, TrialVerdict, check_disk_records,
+        classify_trial, loss_summary, run_until_valid,
     };
 
     const READY_WAIT: Duration = Duration::from_secs(10);
@@ -360,6 +366,7 @@ mod unix {
             server_exited_before_kill: None,
             client_error: None,
             final_exit: None,
+            disk: None,
         };
         let dir = TempDir::new(&format!("{}{index}", kill_point.label()));
         let mut child = spawn_server(&dir, batch_size);
@@ -389,7 +396,79 @@ mod unix {
         // 失敗しても後段の判定（NotKilledBySigkill）と ChildGuard の Drop が後始末する
         let _ = child.0.kill();
         obs.final_exit = try_reap(&mut child, EXIT_WAIT);
+        // TempDir を破棄する前にディスク上の状態を照合する（IO-3・TASK-18.2）。
+        // サーバーは回収済み（または kill 済み）なので、以降ファイルは変化しない。
+        if kill_point != KillPoint::DisconnectBeforeKill {
+            obs.disk = Some(observe_disk(&dir, ack_target));
+        }
         obs
+    }
+
+    /// `data.bin` を上限付きで読み、seq 0..expected と照合する。
+    /// 上限は期待サイズ + 余裕。超過ファイルは読まずに `TooLarge` にして無制限確保を避ける。
+    fn observe_disk(dir: &TempDir, expected: u64) -> DiskObservation {
+        const SLACK: u64 = 4096;
+        let cap = expected
+            .saturating_mul(RECORD_LEN as u64)
+            .saturating_add(SLACK);
+        let path = dir.0.join("data.bin");
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => return DiskObservation::ReadFailed(format!("{:?}", e.kind())),
+        };
+        match file.metadata() {
+            Ok(m) if m.len() > cap => {
+                return DiskObservation::TooLarge { len: m.len(), cap };
+            }
+            Ok(_) => {}
+            Err(e) => return DiskObservation::ReadFailed(format!("{:?}", e.kind())),
+        }
+        let mut bytes = Vec::new();
+        match file.take(cap.saturating_add(1)).read_to_end(&mut bytes) {
+            Ok(_) if bytes.len() as u64 > cap => DiskObservation::TooLarge {
+                len: bytes.len() as u64,
+                cap,
+            },
+            Ok(_) => DiskObservation::Checked(check_disk_records(&bytes, expected)),
+            Err(e) => DiskObservation::ReadFailed(format!("{:?}", e.kind())),
+        }
+    }
+
+    /// 構造化ログ用のディスク照合フィールド（件数のみ。データ本体・パスは出さない）。
+    fn disk_log_fields(disk: &Option<DiskObservation>) -> String {
+        match disk {
+            Some(DiskObservation::Checked(c)) => format!(
+                "\"disk\":\"checked\",\"lost\":{},\"found\":{},\"unexpected\":{},\"trailing_partial_bytes\":{}",
+                c.lost(),
+                c.found.len(),
+                c.unexpected.len(),
+                c.trailing_partial_bytes
+            ),
+            Some(DiskObservation::ReadFailed(kind)) => {
+                format!("\"disk\":\"read_failed\",\"error_kind\":\"{kind}\"")
+            }
+            Some(DiskObservation::TooLarge { len, cap }) => {
+                format!("\"disk\":\"too_large\",\"len\":{len},\"cap\":{cap}")
+            }
+            None => "\"disk\":\"none\"".to_string(),
+        }
+    }
+
+    /// ケースごとのサマリー行（実測結果レポートの材料。REPAIR-4）。
+    fn log_case_summary(case: &str, ledger: &TrialLedger, summary: &TrialSummary) {
+        let loss = loss_summary(ledger);
+        eprintln!(
+            "{{\"event\":\"crash_summary\",\"case\":\"{case}\",\"attempts\":{},\"valid\":{},\"invalid\":{},\"aborted\":{},\"checked\":{},\"total_lost\":{},\"max_lost\":{},\"trials_with_loss\":{},\"unexact\":{}}}",
+            summary.attempts,
+            summary.valid,
+            summary.invalid,
+            summary.aborted,
+            loss.checked_trials,
+            loss.total_lost,
+            loss.max_lost,
+            loss.trials_with_loss,
+            loss.unexact_trials
+        );
     }
 
     /// 試行ループ。結果を JSON 1 行の構造化ログとして stderr へ出す（REPAIR-4）。
@@ -402,9 +481,10 @@ mod unix {
         let summary = run_until_valid(&mut ledger, |index| {
             let obs = run_trial(index, kill_point);
             eprintln!(
-                "{{\"event\":\"crash_trial\",\"index\":{index},\"kill_point\":\"{kill_point:?}\",\"acks_observed\":{},\"verdict\":\"{:?}\"}}",
+                "{{\"event\":\"crash_trial\",\"index\":{index},\"kill_point\":\"{kill_point:?}\",\"acks_observed\":{},\"verdict\":\"{:?}\",{}}}",
                 obs.acks_observed,
-                classify_trial(&obs)
+                classify_trial(&obs),
+                disk_log_fields(&obs.disk)
             );
             obs
         });
@@ -479,6 +559,91 @@ mod unix {
         assert_eq!(summary.valid, 2);
         assert!(!summary.aborted);
         assert_eq!(ledger.valid_trials().count(), 2);
+    }
+
+    /// IO-3・TASK-18.2: フラッシュ済みケース。バッチ未満の 30 件を書いて Flush し、FLUSH ACK を
+    /// 観測した直後に SIGKILL する試行を有効 10 回集め、すべてで 30 件が欠落・重複なく並ぶこと
+    /// （損失 0）を検証する。FLUSH ACK を返せない環境（Linux 5.8 未満等）では有効試行が
+    /// 成立しないため、全試行が FLUSH ACK 経路で無効になることを確認する。これは CI を通すための
+    /// 弱体化ではなく、ACK 自体が存在しない環境の契約確認である（対応環境では必ず 10/10・損失 0）。
+    #[test]
+    fn io3_flushed_data_survives_10_valid_sigkills() {
+        let (ledger, summary) = run_trials(
+            KillPoint::AfterFlushAck { writes: 30 },
+            TARGET_VALID_TRIALS,
+            MAX_ATTEMPTS,
+        );
+        let loss = loss_summary(&ledger);
+        log_case_summary("flushed", &ledger, &summary);
+        if persist_support().is_supported() {
+            assert!(!summary.aborted, "summary: {summary:?}");
+            assert_eq!(summary.valid, 10);
+            let expected: Vec<u64> = (0..30).collect();
+            for rec in ledger.valid_trials() {
+                match &rec.observation.disk {
+                    Some(DiskObservation::Checked(c)) => {
+                        assert_eq!(c.found, expected, "trial {}", rec.index);
+                        assert!(c.missing.is_empty(), "trial {}", rec.index);
+                        assert!(c.unexpected.is_empty(), "trial {}", rec.index);
+                        assert_eq!(c.trailing_partial_bytes, 0, "trial {}", rec.index);
+                    }
+                    other => panic!("trial {} must be disk-checked, got {other:?}", rec.index),
+                }
+            }
+            assert_eq!(loss.checked_trials, 10);
+            assert_eq!(loss.total_lost, 0);
+            assert_eq!(loss.trials_with_loss, 0);
+            assert_eq!(loss.unexact_trials, 0);
+        } else {
+            assert!(summary.aborted);
+            assert_eq!(summary.valid, 0);
+            for rec in ledger.invalid_trials() {
+                assert!(
+                    matches!(
+                        rec.verdict,
+                        TrialVerdict::Invalid(
+                            InvalidReason::ClientFailed(_)
+                                | InvalidReason::FlushAckMissing
+                                | InvalidReason::ServerExitedEarly(_)
+                        )
+                    ),
+                    "trial {}: {:?}",
+                    rec.index,
+                    rec.verdict
+                );
+            }
+            eprintln!(
+                "{{\"event\":\"crash_summary\",\"case\":\"flushed\",\"persist_supported\":false}}"
+            );
+        }
+    }
+
+    /// IO-3・TASK-18.2: 未フラッシュ対照ケース。ACK 30 件を観測した直後（Flush なし）に SIGKILL
+    /// する試行を有効 10 回集め、ディスク上の損失件数を記録・報告する。**損失件数ではテストを
+    /// 失敗させない**（対照データの記録とレポートが目的。アサートするのは計測が成立したことだけ）。
+    ///
+    /// 本実装は通常 ACK を `write()` 完了後に返し、SIGKILL ではページキャッシュが失われないため、
+    /// ACK 済みデータの損失はほぼ 0 と予想される。spec の PoC で見られた損失は ACK を書き込みより
+    /// 先に返す実装によるもので、本実装にその状態は無い。電源断相当の耐久性はこの試験の範囲外。
+    /// 対照として十分かどうかの判断は TASK-18 の人間担当に委ねる。
+    #[test]
+    fn io3_unflushed_control_records_loss_without_asserting() {
+        let (ledger, summary) = run_trials(
+            KillPoint::AfterWriteAcks(30),
+            TARGET_VALID_TRIALS,
+            MAX_ATTEMPTS,
+        );
+        log_case_summary("unflushed_control", &ledger, &summary);
+        assert!(!summary.aborted, "summary: {summary:?}");
+        assert_eq!(summary.valid, 10);
+        for rec in ledger.valid_trials() {
+            assert!(
+                matches!(rec.observation.disk, Some(DiskObservation::Checked(_))),
+                "trial {} must be disk-checked, got {:?}",
+                rec.index,
+                rec.observation.disk
+            );
+        }
     }
 
     /// IO-3・TASK-18.1.2: 無効試行しか得られない場合は上限で打ち切られ、有効数は 0 のまま。

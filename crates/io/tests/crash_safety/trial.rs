@@ -52,6 +52,10 @@ pub struct TrialObservation {
     pub client_error: Option<IoErrorCode>,
     /// kill 後に回収した最終状態。期限内に回収できなければ `None`。
     pub final_exit: Option<ServerExit>,
+    /// サーバーが標準エラーへ出した終了レポート（`event":"exit"`）に `persist_failed >= 1` があったか。
+    /// 永続化（FLUSH）非対応を終了コードではなく構造化された終了理由で特定する根拠（REPAIR-12）。
+    /// レポートが得られない（SIGKILL で終了・未回収等）場合は `false`。[`classify_trial`] は参照しない。
+    pub server_persist_failed: bool,
     /// kill 後のディスク照合結果（#95）。照合しない試行は `None`。[`classify_trial`] は参照しない。
     pub disk: Option<DiskObservation>,
 }
@@ -340,6 +344,7 @@ mod tests {
             server_exited_before_kill: None,
             client_error: None,
             final_exit: Some(KILLED),
+            server_persist_failed: false,
             disk: None,
         }
     }

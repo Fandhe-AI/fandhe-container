@@ -369,6 +369,7 @@ mod unix {
             server_exited_before_kill: None,
             client_error: None,
             final_exit: None,
+            server_persist_failed: false,
             disk: None,
         };
         let dir = TempDir::new(&format!("{}{index}", kill_point.label()));
@@ -396,9 +397,25 @@ mod unix {
             // kill 直前の状態確認（待たない）
             obs.server_exited_before_kill = try_reap(&mut child, Duration::ZERO);
         }
+        if obs.server_exited_before_kill.is_none()
+            && obs.flush_ack_required
+            && !obs.flush_ack_observed
+        {
+            // 永続化失敗ならサーバーは自ら終了レポートを出して終わる。kill で終了レポートを
+            // 失わないよう、FLUSH ACK 未観測の試行に限り短く終了を待つ（REPAIR-5・REPAIR-12）。
+            obs.server_exited_before_kill = try_reap(&mut child, Duration::from_secs(3));
+        }
         // 失敗しても後段の判定（NotKilledBySigkill）と ChildGuard の Drop が後始末する
         let _ = child.0.kill();
         obs.final_exit = try_reap(&mut child, EXIT_WAIT);
+        if obs.final_exit.is_some() {
+            // 子は回収済み（stderr は EOF 済み）なので読み取りでブロックしない。上限付き。
+            obs.server_persist_failed = child
+                .0
+                .stderr
+                .take()
+                .is_some_and(|mut e| stderr_reports_persist_failure(&mut e));
+        }
         // TempDir を破棄する前にディスク上の状態を照合する（IO-3・TASK-18.2）。
         // サーバーは回収済み（または kill 済み）なので、以降ファイルは変化しない。
         if kill_point != KillPoint::DisconnectBeforeKill {
@@ -437,16 +454,43 @@ mod unix {
         }
     }
 
+    /// サーバーの標準エラーを上限付きで読み、終了レポート行（`"event":"exit"`）の統計に
+    /// `persist_failed >= 1` があるかを返す。読み取り失敗は `false`（fail-closed）。
+    fn stderr_reports_persist_failure(stderr: &mut impl Read) -> bool {
+        const CAP: u64 = 64 * 1024;
+        let mut text = String::new();
+        if stderr.take(CAP).read_to_string(&mut text).is_err() {
+            return false;
+        }
+        text_reports_persist_failure(&text)
+    }
+
+    /// 終了レポート行から `"persist_failed":N` を取り出して `N >= 1` を判定する（純粋関数）。
+    fn text_reports_persist_failure(text: &str) -> bool {
+        const KEY: &str = "\"persist_failed\":";
+        text.lines()
+            .filter(|l| l.contains("\"event\":\"exit\""))
+            .filter_map(|l| l.split_once(KEY))
+            .filter_map(|(_, rest)| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse::<u64>().ok()
+            })
+            .any(|n| n >= 1)
+    }
+
     /// crash_test_server が `serve` を正常切断以外で終了したときの終了コード
     /// （`tests/bin/crash_test_server.rs` の `EXIT_SERVE`）。永続化失敗はこの経路で終了する。
     const SERVER_EXIT_SERVE: i32 = 4;
 
     /// 永続化（FLUSH）非対応環境で許容する無効理由。通常 ACK は全件届いた前提で、
-    /// FLUSH ACK 待ちの失敗（未観測・接続断・タイムアウト）またはその失敗に伴う
-    /// サーバー終了に限る。サーバー終了は `serve` 異常終了（終了コード 4・シグナルなし）だけを
-    /// 許容し、正常終了（0）・起動失敗・シグナル死など無関係な早期終了は失敗させる（REPAIR-12）。
-    /// 内部エラー等それ以外のクライアント失敗も許容しない。
-    fn is_persist_unsupported_reason(verdict: &TrialVerdict) -> bool {
+    /// FLUSH ACK 待ちの失敗（未観測・接続断・タイムアウト）またはその失敗に伴うサーバー終了に限り、
+    /// かつサーバーの構造化された終了レポートが `persist_failed >= 1` を示していることを必須とする。
+    /// `SERVER_EXIT_SERVE`（4）は書き込み失敗など別の serve 異常終了にも使われるため、終了コードだけでは
+    /// 永続化非対応と判定しない（REPAIR-12）。サーバー終了はコード 4・シグナルなしのみ許容する。
+    fn is_persist_unsupported_reason(obs: &TrialObservation, verdict: &TrialVerdict) -> bool {
+        if !obs.server_persist_failed {
+            return false;
+        }
         match verdict {
             TrialVerdict::Invalid(InvalidReason::ServerExitedEarly(exit)) => {
                 exit.code == Some(SERVER_EXIT_SERVE) && exit.signal.is_none()
@@ -550,7 +594,7 @@ mod unix {
             // ServerExitedEarly（serve 異常終了の終了コード 4）になるため、これも同経路として許容する。
             assert_eq!(obs.acks_observed, 5);
             assert!(
-                is_persist_unsupported_reason(&verdict),
+                is_persist_unsupported_reason(&obs, &verdict),
                 "unsupported persist must be excluded by the FLUSH ACK path, got {verdict:?}"
             );
         }
@@ -569,19 +613,68 @@ mod unix {
         );
     }
 
-    /// REPAIR-12: 永続化非対応の許容は serve 異常終了（コード 4）だけで、無関係な早期終了は拒否する。
+    /// REPAIR-12: 永続化非対応の許容は persist_failed を示す終了レポートを必須とし、
+    /// 終了コード 4 だけ・無関係な早期終了は拒否する。
     #[test]
-    fn persist_unsupported_reason_rejects_unrelated_server_exit() {
+    fn persist_unsupported_reason_requires_structured_persist_failure() {
         let exit = |code, signal| {
             TrialVerdict::Invalid(InvalidReason::ServerExitedEarly(ServerExit {
                 code,
                 signal,
             }))
         };
-        assert!(is_persist_unsupported_reason(&exit(Some(4), None)));
-        assert!(!is_persist_unsupported_reason(&exit(Some(0), None)));
-        assert!(!is_persist_unsupported_reason(&exit(Some(3), None)));
-        assert!(!is_persist_unsupported_reason(&exit(None, Some(9))));
+        let obs = |persist_failed| TrialObservation {
+            acks_observed: 30,
+            ack_target: 30,
+            flush_ack_required: true,
+            flush_ack_observed: false,
+            server_exited_before_kill: None,
+            client_error: None,
+            final_exit: None,
+            server_persist_failed: persist_failed,
+            disk: None,
+        };
+        assert!(is_persist_unsupported_reason(
+            &obs(true),
+            &exit(Some(4), None)
+        ));
+        // 終了コード 4 でも persist_failed の根拠がなければ別障害として拒否する
+        assert!(!is_persist_unsupported_reason(
+            &obs(false),
+            &exit(Some(4), None)
+        ));
+        assert!(!is_persist_unsupported_reason(
+            &obs(false),
+            &TrialVerdict::Invalid(InvalidReason::FlushAckMissing)
+        ));
+        assert!(!is_persist_unsupported_reason(
+            &obs(true),
+            &exit(Some(0), None)
+        ));
+        assert!(!is_persist_unsupported_reason(
+            &obs(true),
+            &exit(Some(3), None)
+        ));
+        assert!(!is_persist_unsupported_reason(
+            &obs(true),
+            &exit(None, Some(9))
+        ));
+    }
+
+    /// REPAIR-12: 終了レポートの persist_failed だけを根拠にする（書き込み失敗等は対象外）。
+    #[test]
+    fn text_reports_persist_failure_parses_exit_report_only() {
+        let base = |n: u64| {
+            format!(
+                "{{\"event\":\"exit\",\"code\":\"INTERNAL\",\"message\":\"x\",\"stats\":{{\"persist_succeeded\":0,\"persist_failed\":{n},\"auto_flushes\":0}}}}\n"
+            )
+        };
+        assert!(text_reports_persist_failure(&base(1)));
+        assert!(!text_reports_persist_failure(&base(0)));
+        assert!(!text_reports_persist_failure(""));
+        assert!(!text_reports_persist_failure(
+            "{\"event\":\"other\",\"persist_failed\":3}\n"
+        ));
     }
 
     /// IO-3・TASK-18.1.2: 試行ループが有効試行を目標数（ここでは 2）まで集める。
@@ -638,7 +731,7 @@ mod unix {
                 assert_eq!(rec.observation.acks_observed, 30, "trial {}", rec.index);
                 assert!(!rec.observation.flush_ack_observed, "trial {}", rec.index);
                 assert!(
-                    is_persist_unsupported_reason(&rec.verdict),
+                    is_persist_unsupported_reason(&rec.observation, &rec.verdict),
                     "trial {}: {:?}",
                     rec.index,
                     rec.verdict

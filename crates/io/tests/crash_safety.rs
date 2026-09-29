@@ -440,13 +440,17 @@ mod unix {
         } else {
             assert!(!obs.flush_ack_observed);
             // 通常 ACK は全件届き、FLUSH ACK 待ちだけが失敗した経路であることを確認する
-            // （接続失敗・通常 ACK 未達・サーバー早期終了・SIGKILL 不成立による無効化を除外。REPAIR-12）
+            // （接続失敗・通常 ACK 未達・SIGKILL 不成立による無効化を除外。REPAIR-12）。
+            // 永続化失敗でサーバーが通常 ACK 送出後に終了し、kill 直前の回収で観測された場合は
+            // ServerExitedEarly になるため、これも同経路として許容する（回収の可否で結果が揺れない）。
             assert_eq!(obs.acks_observed, 5);
             assert!(
                 matches!(
                     verdict,
                     TrialVerdict::Invalid(
-                        InvalidReason::ClientFailed(_) | InvalidReason::FlushAckMissing
+                        InvalidReason::ClientFailed(_)
+                            | InvalidReason::FlushAckMissing
+                            | InvalidReason::ServerExitedEarly(_)
                     )
                 ),
                 "unsupported persist must be excluded by the FLUSH ACK path, got {verdict:?}"

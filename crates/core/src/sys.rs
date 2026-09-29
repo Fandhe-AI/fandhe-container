@@ -293,6 +293,9 @@ pub(crate) fn open_dir_path_nofollow(
 ///
 /// `crate::exec::mount_proc` は検証済みの O_PATH fd を指す `/proc/self/fd/N` を渡す
 /// （magic link は fd の実体へ解決されるため、パス文字列を再解決しない）。
+// テストビルドでは `crate::exec` の dry-run 差し込み点（`mount_proc_syscall`）が本関数を
+// 呼ばないため、dead_code を許可する（本番ビルドでは使われる）。
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn mount_proc_at(target: &CStr) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);

@@ -29,9 +29,10 @@
 //! - シングルスレッドのプロセスから呼ぶこと（マルチスレッドからの `CLONE_NEWUSER` は
 //!   `EINVAL` になり、`FailedPrecondition` で返す）
 //! - `unshare(CLONE_NEWPID)` は呼び出し元自身を移動させず、**次に生成する子が PID 1** になる。
-//!   その PID 1 側で [`MountIsolation::verify_current`] により実行時検証（PID 1・入れ子の
-//!   PID namespace・分離済み mount namespace）を通し、[`mount_proc`] を呼んで初めて `/proc`
-//!   からホストのプロセスが見えなくなる。検証は呼び出し側の申告に依存しない（fail-closed）
+//!   その PID 1 側で [`MountIsolation::establish`]（PID 1・入れ子の PID namespace の実行時
+//!   検証と、PID 1 自身による新しい mount namespace の作成）を通し、[`mount_proc`] を呼んで
+//!   初めて `/proc` からホストのプロセスが見えなくなる。証跡は呼び出し側の申告に依存しない
+//!   （fail-closed）
 //! - 途中で失敗しても namespace を元へ戻す手段はない。呼び出し元はそのプロセスを破棄する
 //!   （長寿命のホストプロセスで呼ばない）
 //! - user namespace は自 euid / egid を コンテナ内 0 へ写す単一 ID 写像のみ提供する。
@@ -323,19 +324,36 @@ pub struct IsolationReport {
     pub gid_mapping: Option<IdMapping>,
 }
 
-/// [`mount_proc`] を呼べる状態（新しい PID namespace の PID 1・ホストと分離した mount
-/// namespace）を実行時に検証済みであることの証跡（CORE-1・SEC-4）。
+/// [`mount_proc`] を呼べる状態（新しい PID namespace の PID 1 で、そのスレッドだけが属する
+/// 新しい mount namespace にいる）を、PID 1 自身が作って確かめた証跡（CORE-1）。前提を
+/// 満たさない呼び出しは fail-closed で拒否する。拒否の監査ログ記録（SEC-4）は未実装（REPAIR-3）。
 ///
-/// 生成は [`MountIsolation::verify_current`] のみで、呼び出し側の申告では作れない。
-/// exec を跨ぐ経路（親が [`isolate`]、子が exec 後に呼ぶ）でも、子自身が現在の状態を
-/// 検証するため親の申告に依存しない。証跡は検証時の mount namespace に紐づき、別 namespace
-/// では [`mount_proc`] が拒否する。procfs を再マウントした後は、ホスト側 `/proc` 越しの
-/// 検証ができなくなるため、再マウントを繰り返す呼び出し側（#135 の `pivot_root` 後等）は
-/// 最初のマウント前に取得した証跡を使い回す。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 生成は [`MountIsolation::establish`] のみで、呼び出し側の申告では作れない。証跡は作成時の
+/// mount namespace・PID namespace に束縛され、[`mount_proc`] は呼び出し直前に「PID 1 である
+/// こと」「呼び出しスレッドの両 namespace が証跡と一致すること」を再検証する。
+///
+/// 持ち出し対策として `Clone` を実装せず、`!Send` にしている（mount namespace は
+/// `unshare(CLONE_NEWNS)` を呼んだスレッドだけが移るため、別スレッドへ渡すと前提が崩れる）。
+/// 別スレッドへは渡せない:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<fandhe_container_core::exec::MountIsolation>();
+/// ```
+///
+/// procfs を再マウントした後は `/proc/thread-self` が新しい procfs を指すが、namespace の
+/// 識別子（`mnt:[inode]` 等）は procfs に依存しないため、再マウントを繰り返す呼び出し側
+/// （#135 の `pivot_root` 後等）は同じ証跡を使い回せる。
+#[derive(Debug, PartialEq, Eq)]
 pub struct MountIsolation {
-    /// 検証時の `/proc/self/ns/mnt` のリンク先（`mnt:[inode]`）。
+    /// 作成した mount namespace（`/proc/thread-self/ns/mnt` のリンク先 `mnt:[inode]`）。
     mnt_ns: String,
+    /// 作成時の PID namespace（`/proc/thread-self/ns/pid`）。procfs はマウントした
+    /// プロセス自身の PID namespace（`ns/pid`）を映すため、子向けの `pid_for_children`
+    /// ではなくこちらを束縛する。
+    pid_ns: String,
+    /// `!Send`・`!Sync` にするための印（生ポインタは Send / Sync でない）。
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 /// `/proc/self/status` の `NSpid:` 行の要素数（PID namespace の入れ子段数）。
@@ -346,29 +364,64 @@ fn nspid_depth(status: &str) -> Option<usize> {
         .map(|rest| rest.split_whitespace().count())
 }
 
-/// `uid_map` が初期 user namespace の恒等写像（`0 0 4294967295` のみ）か。
-fn is_initial_userns_uid_map(uid_map: &str) -> bool {
-    let mut lines = uid_map.lines().filter(|l| !l.trim().is_empty());
-    let (Some(line), None) = (lines.next(), lines.next()) else {
-        return false;
-    };
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    fields == ["0", "0", "4294967295"]
+/// 呼び出しスレッドの namespace リンク（`/proc/thread-self/ns/<kind>`）を読む。
+///
+/// `unshare(CLONE_NEWNS)` はマルチスレッドのプロセスでは呼んだスレッドだけを移すため、
+/// スレッドグループの代表を指す `/proc/self` ではなく `/proc/thread-self` を使う。
+fn thread_ns_link(kind: &str) -> std::io::Result<String> {
+    std::fs::read_link(Path::new("/proc/thread-self/ns").join(kind))
+        .map(|l| l.to_string_lossy().into_owned())
+}
+
+/// [`MountIsolation::establish`] の mount namespace 判定（テスト可能な純関数）。
+/// `unshare(CLONE_NEWNS)` の前後でリンク先が変わっていなければ拒否する。
+fn check_fresh_mount_ns(before: &str, after: &str) -> Result<(), &'static str> {
+    if before == after {
+        return Err("unshare(CLONE_NEWNS) did not move the thread to a new mount namespace");
+    }
+    Ok(())
+}
+
+/// [`mount_proc`] 直前の証跡の再検証（テスト可能な純関数）。`pid` は `getpid()`、
+/// `mnt_ns` / `pid_ns` は呼び出しスレッドの現在のリンク先。
+fn check_evidence(
+    evidence: &MountIsolation,
+    pid: u32,
+    mnt_ns: &str,
+    pid_ns: &str,
+) -> Result<(), &'static str> {
+    if pid != 1 {
+        return Err("mount_proc must be called by PID 1 of the isolated PID namespace");
+    }
+    if mnt_ns != evidence.mnt_ns {
+        return Err("isolation evidence does not belong to the current mount namespace");
+    }
+    if pid_ns != evidence.pid_ns {
+        return Err("isolation evidence does not belong to the current PID namespace");
+    }
+    Ok(())
 }
 
 impl MountIsolation {
-    /// 現在のプロセスが procfs を安全にマウントできる状態かを実行時に検証して証跡を得る。
+    /// 新しい PID namespace の PID 1 が、自分だけの mount namespace を作って証跡を得る。
     ///
-    /// すべて満たさなければ `FailedPrecondition`（fail-closed。副作用なし）:
+    /// 手順（前提検証はすべて副作用の前に行う）:
     ///
-    /// - PID が 1 で、`/proc/self/status` の `NSpid` が 2 段以上（ホスト側 procfs 越しに見て
-    ///   入れ子の PID namespace の PID 1。Mount だけ分離したプロセスや、ホストの PID
-    ///   namespace のプロセスでは procfs にホストの PID が見えてしまうため拒否する）
-    /// - 初期 user namespace（rootful）では、`/proc/1/ns/mnt`（ホスト init）と自身の mount
-    ///   namespace が異なること。読めない場合も拒否する。非初期 user namespace（rootless）
-    ///   では mount namespace の所有者がその user namespace であることをカーネルが保証し、
-    ///   別 mount namespace の共有マウントは変更できないため、この比較は省略する
-    pub fn verify_current() -> Result<Self, ExecError> {
+    /// 1. PID が 1 で、`/proc/self/status` の `NSpid` が 2 段以上（ホスト側 procfs 越しに見て
+    ///    入れ子の PID namespace の PID 1）。満たさなければ副作用なしで `FailedPrecondition`
+    /// 2. 呼び出しスレッドを `unshare(CLONE_NEWNS)` で新しい mount namespace へ移し、`/` を
+    ///    再帰 private にする（コピーされたマウントの shared peer から切り離し、以後のマウントを
+    ///    外へ伝播させない）
+    /// 3. `unshare` の前後で `/proc/thread-self/ns/mnt` が変わったことを確かめ、作成直後の
+    ///    mount namespace と PID namespace を証跡に記録する
+    ///
+    /// この mount namespace の所属は作成直後は呼び出しスレッドだけであり、他プロセスとの
+    /// 共有がないことを他プロセスの情報（`/proc/1/ns/mnt` 等）を読まずに自分で保証する。
+    /// rootless でも user namespace 内の CAP_SYS_ADMIN で実行でき、比較を省く分岐は持たない。
+    ///
+    /// 手順 2 以降の失敗は namespace を戻せない（モジュール doc の「失敗時はプロセスを破棄」の
+    /// 契約に従う）。返った証跡は同じスレッドで [`mount_proc`] に渡す。
+    pub fn establish() -> Result<Self, ExecError> {
         let fail = |msg: &str| {
             ExecError::new(
                 ErrorCode::FailedPrecondition,
@@ -388,30 +441,39 @@ impl MountIsolation {
                 "not in a nested PID namespace; isolate with Namespace::Pid first",
             ));
         }
-        let mnt_ns = std::fs::read_link("/proc/self/ns/mnt")
-            .map_err(|_| fail("cannot read /proc/self/ns/mnt to verify the mount namespace"))?
-            .to_string_lossy()
-            .into_owned();
-        let uid_map = std::fs::read_to_string("/proc/self/uid_map")
-            .map_err(|_| fail("cannot read /proc/self/uid_map to verify the user namespace"))?;
-        if is_initial_userns_uid_map(&uid_map) {
-            let host_mnt = std::fs::read_link("/proc/1/ns/mnt")
-                .map_err(|_| fail("cannot read /proc/1/ns/mnt to compare mount namespaces"))?
-                .to_string_lossy()
-                .into_owned();
-            if host_mnt == mnt_ns {
-                return Err(fail(
-                    "mount namespace is shared with the host; isolate with Namespace::Mount first",
-                ));
-            }
-        }
-        Ok(Self { mnt_ns })
+        let before =
+            thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
+        sys::unshare_namespaces(&[NsFlag::Mount])
+            .map_err(|e| ExecError::from_sys(e, IsolationStage::Unshare, "unshare(CLONE_NEWNS)"))?;
+        sys::mount_root_private_recursive().map_err(|e| {
+            ExecError::from_sys(e, IsolationStage::MountPrivate, "mount(MS_PRIVATE)")
+        })?;
+        let mnt_ns =
+            thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
+        check_fresh_mount_ns(&before, &mnt_ns).map_err(fail)?;
+        let pid_ns =
+            thread_ns_link("pid").map_err(|_| fail("cannot read /proc/thread-self/ns/pid"))?;
+        Ok(Self {
+            mnt_ns,
+            pid_ns,
+            _not_send: std::marker::PhantomData,
+        })
     }
 
-    /// 証跡が現在の mount namespace のものか。
-    fn matches_current(&self) -> bool {
-        std::fs::read_link("/proc/self/ns/mnt")
-            .is_ok_and(|l| l.to_string_lossy() == self.mnt_ns.as_str())
+    /// 呼び出し元の現在の状態（PID・スレッドの mount / PID namespace）が証跡と一致するか。
+    fn verify_caller(&self) -> Result<(), ExecError> {
+        let fail = |msg: &str| {
+            ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::MountProc,
+                msg,
+            )
+        };
+        let mnt_ns =
+            thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
+        let pid_ns =
+            thread_ns_link("pid").map_err(|_| fail("cannot read /proc/thread-self/ns/pid"))?;
+        check_evidence(self, std::process::id(), &mnt_ns, &pid_ns).map_err(fail)
     }
 }
 
@@ -426,6 +488,9 @@ struct Plan {
 ///
 /// - namespace が空、または hostname 指定なのに `Uts` が無い場合は `InvalidArgument`
 ///   （ホストの hostname を書き換える経路を作らない）
+/// - `Pid` を含み `Mount` を含まない場合は `InvalidArgument`（PID 1 が外側と mount
+///   namespace を共有した状態から始まる構成を作らない。[`MountIsolation::establish`] が
+///   PID 1 自身で mount namespace を分けることとの二重の防御）
 /// - `User` を含み euid / egid が 0 の場合は `FailedPrecondition`（SEC-5）
 fn plan(config: &IsolationConfig, euid: u32, egid: u32) -> Result<Plan, ExecError> {
     let invalid =
@@ -435,6 +500,9 @@ fn plan(config: &IsolationConfig, euid: u32, egid: u32) -> Result<Plan, ExecErro
     }
     if config.hostname.is_some() && !config.namespaces.contains(Namespace::Uts) {
         return Err(invalid("hostname requires the UTS namespace"));
+    }
+    if config.namespaces.contains(Namespace::Pid) && !config.namespaces.contains(Namespace::Mount) {
+        return Err(invalid("the PID namespace requires the mount namespace"));
     }
     if !config.namespaces.contains(Namespace::User) {
         return Ok(Plan {
@@ -447,7 +515,8 @@ fn plan(config: &IsolationConfig, euid: u32, egid: u32) -> Result<Plan, ExecErro
             ErrorCode::FailedPrecondition,
             IsolationStage::Validate,
             "refusing identity mapping of host root into the user namespace \
-             (use a rootful configuration without User or subuid mapping)",
+             (map a subordinate ID range from /etc/subuid and /etc/subgid instead; \
+             subordinate ID mapping is not implemented yet, see TASK-40)",
         ));
     }
     Ok(Plan {
@@ -511,8 +580,9 @@ pub fn isolate(config: &IsolationConfig) -> Result<IsolationReport, ExecError> {
 /// マウント前に次をすべて検証し、1 つでも満たさなければ副作用なしで拒否する（fail-closed。
 /// security.md「rootfs の外へ書き込める経路を作らない」）。
 ///
-/// - 呼び出し側が [`MountIsolation::verify_current`] で得た証跡（新しい PID namespace の
-///   PID 1・分離済み mount namespace の実行時検証結果）を提示し、現在の mount namespace と一致する
+/// - 呼び出し側が [`MountIsolation::establish`] で得た証跡を提示し、呼び出し直前の状態が
+///   証跡と一致する（PID 1 であること・呼び出しスレッドの mount / PID namespace が作成時と
+///   同じこと）。証跡を受け取った親・PID 1 が fork した子・別スレッドからの呼び出しは拒否する
 /// - `rootfs` 自体とその祖先に symlink がない（`canonicalize` した実パスが `rootfs` と一致）
 /// - `rootfs` / `target` は絶対パスで NUL・`..` を含まず、`target` は `rootfs` より下の専用ディレクトリ
 ///   （`target == rootfs` は拒否）
@@ -530,15 +600,16 @@ pub fn mount_proc(
     rootfs: &Path,
     target: &Path,
 ) -> Result<(), ExecError> {
+    isolation.verify_caller()?;
+    mount_proc_verified(rootfs, target)
+}
+
+/// [`mount_proc`] の証跡検証後の本体（パス検証 → fd 固定 → propagation 検査 → マウント）。
+/// 証跡を取らないため、単体テストは証跡を偽造せずにパス検証を直接確かめられる（最終段の
+/// `mount(2)` はテストビルドでは dry-run）。
+fn mount_proc_verified(rootfs: &Path, target: &Path) -> Result<(), ExecError> {
     let invalid =
         |msg: &str| ExecError::new(ErrorCode::InvalidArgument, IsolationStage::MountProc, msg);
-    if !isolation.matches_current() {
-        return Err(ExecError::new(
-            ErrorCode::FailedPrecondition,
-            IsolationStage::MountProc,
-            "isolation evidence does not belong to the current mount namespace",
-        ));
-    }
     for (label, p) in [("rootfs", rootfs), ("proc mount target", target)] {
         if !p.is_absolute() {
             return Err(invalid(&format!("{label} must be an absolute path")));
@@ -586,8 +657,24 @@ pub fn mount_proc(
     // fd が指す実体へマウントする（`/proc/self/fd/N` は fd の dentry へ解決される）。
     let c_target = CString::new(format!("/proc/self/fd/{}", dir.as_raw_fd()))
         .map_err(|_| invalid("proc mount target must not contain NUL"))?;
-    sys::mount_proc_at(&c_target)
+    mount_proc_syscall(&c_target)
         .map_err(|e| ExecError::from_sys(e, IsolationStage::MountProc, "mount(proc)"))
+}
+
+/// [`mount_proc`] の最終段（`mount(2)`）。本番ビルドでは [`sys::mount_proc_at`] を呼ぶ。
+#[cfg(not(test))]
+fn mount_proc_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
+    sys::mount_proc_at(target)
+}
+
+/// テストビルドの dry-run 差し込み点。`mount(2)` を呼ばず、渡されたマウント先をスレッド
+/// ローカルに記録するだけにする。単体テストは検証を通さない証跡で [`mount_proc`] を呼ぶ
+/// ため、将来検証が後退しても root 実行のテストからホストへ `mount(2)` が届かないことを
+/// cfg で構造的に保証する。
+#[cfg(test)]
+fn mount_proc_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
+    tests::DRY_RUN_MOUNTS.with(|m| m.borrow_mut().push(target.to_string_lossy().into_owned()));
+    Ok(())
 }
 
 /// `/` から `real_root`（symlink を含まない正規化済み絶対パス）の各要素、続けて `names` を
@@ -832,42 +919,27 @@ mod tests {
         );
     }
 
-    /// 検証を通さず作る、テスト専用の証跡（現在の mount namespace に紐づく）。
-    fn test_evidence() -> MountIsolation {
-        MountIsolation {
-            mnt_ns: std::fs::read_link("/proc/self/ns/mnt")
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-        }
+    thread_local! {
+        /// dry-run の `mount_proc_syscall` が記録したマウント先（テストスレッドごと）。
+        pub(super) static DRY_RUN_MOUNTS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    /// `mount_proc` は相対パス・NUL を副作用なしで拒否する。
+    /// パス検証は相対パス・NUL を副作用なしで拒否する。
     #[test]
     fn mount_proc_rejects_bad_targets() {
-        let iso = test_evidence();
-        let rel = mount_proc(&iso, Path::new("/"), Path::new("proc")).unwrap_err();
+        let rel = mount_proc_verified(Path::new("/"), Path::new("proc")).unwrap_err();
         assert_eq!(rel.code, ErrorCode::InvalidArgument);
         assert_eq!(rel.stage, IsolationStage::MountProc);
-        let nul = mount_proc(&iso, Path::new("/"), Path::new("/pr\0oc")).unwrap_err();
+        let nul = mount_proc_verified(Path::new("/"), Path::new("/pr\0oc")).unwrap_err();
         assert_eq!(nul.code, ErrorCode::InvalidArgument);
     }
 
-    /// 別 mount namespace の証跡は副作用なしで拒否する（CORE-1）。
+    /// テストプロセスは PID 1 ではないため、証跡の作成は副作用なしで拒否される
+    /// （CORE-1・fail-closed）。
     #[test]
-    fn mount_proc_rejects_foreign_evidence() {
-        let iso = MountIsolation {
-            mnt_ns: "mnt:[0]".to_string(),
-        };
-        let err = mount_proc(&iso, Path::new("/"), Path::new("/proc")).unwrap_err();
-        assert_eq!(err.code, ErrorCode::FailedPrecondition);
-        assert_eq!(err.stage, IsolationStage::MountProc);
-    }
-
-    /// テストプロセスは PID 1 ではないため、証跡の取得は拒否される（CORE-1・fail-closed）。
-    #[test]
-    fn verify_current_rejects_non_pid1() {
-        let err = MountIsolation::verify_current().unwrap_err();
+    fn establish_rejects_non_pid1() {
+        let err = MountIsolation::establish().unwrap_err();
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(err.stage, IsolationStage::MountProc);
     }
@@ -878,19 +950,6 @@ mod tests {
         assert_eq!(nspid_depth("Name:\tx\nNSpid:\t1234\t1\nUid:\t0\n"), Some(2));
         assert_eq!(nspid_depth("NSpid:\t1\n"), Some(1));
         assert_eq!(nspid_depth("Name:\tx\n"), None);
-    }
-
-    /// 初期 user namespace の uid_map のみ恒等写像として判定する。
-    #[test]
-    fn initial_userns_uid_map_detection() {
-        assert!(is_initial_userns_uid_map(
-            "         0          0 4294967295\n"
-        ));
-        assert!(!is_initial_userns_uid_map(
-            "         0       1000          1\n"
-        ));
-        assert!(!is_initial_userns_uid_map("0 0 4294967295\n1 5 3\n"));
-        assert!(!is_initial_userns_uid_map(""));
     }
 
     const MI_SHARED: &str = "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n";
@@ -973,7 +1032,6 @@ mod tests {
         std::fs::write(root.join("file"), b"").unwrap();
         std::os::unix::fs::symlink("/", root.join("link")).unwrap();
         std::os::unix::fs::symlink(root.join("real"), root.join("dirlink")).unwrap();
-        let iso = test_evidence();
         let not_dir = "must be directories, not symlinks";
         let cases = [
             (root.join("real/../real"), "must not contain '..'"),
@@ -986,7 +1044,7 @@ mod tests {
             (root.clone(), "not rootfs itself"),
         ];
         for (target, want) in &cases {
-            let err = mount_proc(&iso, &root, target).unwrap_err();
+            let err = mount_proc_verified(&root, target).unwrap_err();
             assert_eq!(err.code, ErrorCode::InvalidArgument, "{target:?}");
             assert_eq!(err.stage, IsolationStage::MountProc, "{target:?}");
             assert!(err.message.contains(want), "{target:?}: {}", err.message);
@@ -994,7 +1052,7 @@ mod tests {
         // rootfs 自体が symlink（実体は base/root）の場合は拒否する。
         let alias = t.base.join("alias");
         std::os::unix::fs::symlink(&root, &alias).unwrap();
-        let err = mount_proc(&iso, &alias, &alias.join("real")).unwrap_err();
+        let err = mount_proc_verified(&alias, &alias.join("real")).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument, "rootfs symlink");
         assert!(err.message.contains("canonical path"), "{}", err.message);
     }

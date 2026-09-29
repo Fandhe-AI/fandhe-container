@@ -141,7 +141,7 @@ mod linux {
             1,
             "child must be PID 1 of the new PID namespace"
         );
-        let isolation = MountIsolation::verify_current().expect("verify isolation");
+        let isolation = MountIsolation::establish().expect("establish mount isolation");
         mount_proc(&isolation, Path::new("/"), Path::new("/proc")).expect("mount proc");
         let mut pids: Vec<String> = std::fs::read_dir("/proc")
             .expect("read /proc")

@@ -49,7 +49,7 @@
 | Windows | `FlushFileBuffers` と、ディレクトリハンドルの同期 |
 | 上記以外（親ディレクトリのハンドルを持たない sink の macOS / Windows、Linux 5.8 未満、版数判定不能、その他の OS） | `Unimplemented` で拒否し、FLUSH ACK を返さない（fail-closed） |
 
-- FLUSH ACK が返りうる環境かは `barrier::persist_support()` と `PersistSupport::is_supported()` で判定できる
+- `barrier::persist_support()` と `PersistSupport::is_supported()` が示すのは OS・カーネル版数レベルの対応可否だけである。`true` でも FLUSH ACK が返る保証にはならない。macOS / Windows では `AppendFileSink` に親ディレクトリのハンドルが未設定だと、`persist_with_support` が `Unimplemented` を返し FLUSH ACK は返らない。FLUSH ACK の可否は、sink の設定（親ディレクトリのハンドル）と各回の永続化の成功まで含めて判断する（IO-2・REPAIR-3）
 - 直前の成功から書き込みがない `Flush` は `syncfs` を省略して成功を返す（増幅対策）。保証は前回の成功で満たされている
 - 永続化の同時実行数はプロセス全体で `MaxConcurrentPersist`（既定 2・上限 64）に制限し、待ち時間には期限（既定・上限 10 秒。`with_flush_timeout`）を設ける。期限を過ぎると `Timeout` を返し、FLUSH ACK は返さない（REPAIR-5）
 - `syncfs` を発行した後の失敗・タイムアウトでは sink が使用不能になり、以後の永続化は `Internal` を返す

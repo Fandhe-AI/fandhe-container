@@ -51,9 +51,10 @@
 //! - 索引の確定: 衝突は [`CaseCollisionSet::check_insertable`] で先に検査し、
 //!   実ファイルの作成と再検証に成功してから登録を確定する。作成が失敗しても索引は
 //!   汚れない（末端が既存で `AlreadyExists` のときは実体があるため登録する）。
-//! - 件数上限（[`GuestFileCreator::with_max_tracked_paths`]）は新規登録になる
-//!   ときだけ適用する（完全一致の再登録は件数を増やさないため対象外。上限到達後も
-//!   既存パスは `AlreadyExists`、大小違いは衝突として報告する）。1 ディレクトリの
+//! - 件数上限（[`GuestFileCreator::with_max_tracked_paths`]）は索引に新しいノードを
+//!   足すときだけ適用する（登録済みのパスと、登録済みパスの祖先として既にある
+//!   ディレクトリは対象外。上限到達後も既存パスは `AlreadyExists`、大小違いは衝突
+//!   として報告する）。1 ディレクトリの
 //!   エントリ数が上限を超える場合も `ResourceExhausted` で中止する。
 //! - 後始末: 作成が葉で失敗した・再検証で取り消した場合、本呼び出しが新設した
 //!   祖先ディレクトリは空であれば同一性を確かめてから取り除く（ベストエフォート。
@@ -179,6 +180,21 @@ fn too_many() -> IoError {
     )
 }
 
+/// `path` を索引へ登録する。ただし、登録済みパスの祖先として既にあるノードを
+/// パスとして数え直すと件数が上限を超える場合は登録を省く（ノードは既にあり衝突
+/// 検出には影響しない）。新しいノードを足す登録は、呼び出し元が事前に上限を
+/// 検査している前提。
+fn register_within_limit(
+    set: &mut CaseCollisionSet,
+    path: &str,
+    max_tracked: usize,
+) -> Result<(), IoError> {
+    if set.contains_node(path) && !set.contains(path) && set.len() >= max_tracked {
+        return Ok(());
+    }
+    set.try_insert(path)
+}
+
 /// 単一のゲストパスコンポーネントがホスト上でちょうど 1 個の `Normal` に
 /// なることを確かめる（`..`・空・`.`・`\`・`:`・NUL を拒否する）。
 fn validate_host_component(component: &str) -> Result<(), IoError> {
@@ -284,8 +300,9 @@ impl GuestFileCreator {
         // 索引は変更せず、実ファイルの作成と再検証に成功してから登録を確定する
         // （作成失敗で実体のないパスが索引に残らないようにする）。
         set.check_insertable(guest_path)?;
-        // 上限は新規登録になるときだけ適用する（完全一致の再登録は件数を増やさない）。
-        if !set.contains(guest_path) && set.len() >= self.max_tracked {
+        // 上限は新しいノードを足すときだけ適用する（登録済みのパスや、登録済みパスの
+        // 祖先として既にあるノードは索引を増やさない）。
+        if !set.contains_node(guest_path) && set.len() >= self.max_tracked {
             return Err(too_many());
         }
 
@@ -300,9 +317,8 @@ impl GuestFileCreator {
         ) {
             Ok(created) => created,
             Err(CreateError::Exists) => {
-                // 実体が既に存在する。索引にも確定させたうえで報告する（新規登録なら
-                // 直前の上限検査を通っている）。
-                let _ = set.try_insert(guest_path);
+                // 実体が既に存在する。索引にも確定させたうえで報告する。
+                register_within_limit(set, guest_path, self.max_tracked)?;
                 return Err(IoError::new(
                     IoErrorCode::AlreadyExists,
                     format!(
@@ -318,7 +334,7 @@ impl GuestFileCreator {
         // 走査から作成までの間に別プロセスが足した大小違いの項目を再検証する
         // （見つかれば自分の作成を取り消して返す。モジュール doc「プロセス間の競合」）。
         let file = verify_created(created, guest_path, ancestors, leaf, self.max_tracked)?;
-        set.try_insert(guest_path)?;
+        register_within_limit(set, guest_path, self.max_tracked)?;
         AppendFileSink::new(file)
     }
 
@@ -327,8 +343,8 @@ impl GuestFileCreator {
     /// 別プロセスが共有ルートへ後から追加した項目も検出するため、走査済みの
     /// 印は持たない。走査は保持したルートのハンドル起点で行い（Linux / macOS は
     /// 各階層もハンドル相対で開く）、索引化専用で作成先の解決には使わない。
-    /// 登録済みの項目は件数上限の対象にせず、新規登録で上限を超えるときだけ
-    /// `ResourceExhausted`。読み取りの失敗は `Internal`、既存項目どうしの大文字
+    /// 索引に既にあるノード（登録済みの項目・暗黙の祖先）は件数上限の対象にせず、
+    /// 新しいノードを足して上限を超えるときだけ `ResourceExhausted`。読み取りの失敗は `Internal`、既存項目どうしの大文字
     /// 小文字衝突は `AlreadyExists`（IO-5 の検査を完了できないまま作成へ進まない。
     /// fail-closed）。
     fn seed_existing(&self, state: &mut IndexState, ancestors: &[&str]) -> Result<(), IoError> {
@@ -339,9 +355,10 @@ impl GuestFileCreator {
             for name in entries {
                 let Some(name) = name.to_str() else { continue };
                 let path = format!("{prefix}{name}");
-                // 登録済みの項目（前回の走査・作成で取り込んだもの）は件数に
+                // 索引に既にあるノード（前回の走査・作成で取り込んだ項目や、登録済み
+                // パスの祖先として暗黙にあるディレクトリ）は衝突検出に足りており件数にも
                 // 影響しないため、上限より先に読み飛ばす。
-                if state.set.contains(&path) {
+                if state.set.contains_node(&path) {
                     continue;
                 }
                 if state.set.len() >= self.max_tracked {

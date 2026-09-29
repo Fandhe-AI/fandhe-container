@@ -329,6 +329,29 @@ impl CaseCollisionSet {
         is_path_end
     }
 
+    /// `path` の全コンポーネントが（大文字小文字まで完全一致で）索引のノードとして
+    /// 既にあるかを返す（索引は変更しない。形式不正のパスは `false`）。明示的に
+    /// 登録したパスに加え、登録済みパスの祖先として暗黙に作られたノード（`"a/b"` を
+    /// 登録したときの `"a"`）も真になる。
+    ///
+    /// 真のとき [`Self::try_insert`] は新しいノードを作らない（完全一致の再登録か、
+    /// 暗黙のノードをパスとして数え直すだけ）。呼び出し側が件数上限を「新しい
+    /// ノードを足すときだけ」適用する判定に使う（TASK-19.2・IO-5。
+    /// `crate::guest_files` の索引上限）。
+    pub fn contains_node(&self, path: &str) -> bool {
+        let Ok(components) = validate_guest_relative_path(path) else {
+            return false;
+        };
+        let mut parent = ROOT_NODE;
+        for component in &components {
+            match self.nodes.get(&CaseFoldKey::new(parent, component)) {
+                Some(entry) if entry.original == *component => parent = entry.id,
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// `path` を登録せずに、[`Self::try_insert`] が衝突で失敗するかだけを検査する
     /// （索引は変更しない。TASK-19.2・IO-5。ファイル作成の成功後に
     /// [`Self::try_insert`] で登録を確定する呼び出し側が、失敗した作成の登録を

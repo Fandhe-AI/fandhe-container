@@ -876,6 +876,31 @@ mod tests {
         }
     }
 
+    /// 監査 P1-1: Pid あり・Mount なしは拒否し、Mount を加えれば通る。
+    #[test]
+    fn core1_plan_rejects_pid_without_mount() {
+        let pid_only = NamespaceSet::empty()
+            .with(Namespace::Pid)
+            .with(Namespace::Uts);
+        let err = plan(&cfg(pid_only, None), 0, 0).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.stage, IsolationStage::Validate);
+        assert_eq!(
+            err.message,
+            "the PID namespace requires the mount namespace"
+        );
+        assert!(plan(&cfg(pid_only.with(Namespace::Mount), None), 0, 0).is_ok());
+    }
+
+    /// SEC-5（監査 P2-4）: 拒否文言は弱い分離ではなく subuid / subgid 写像へ案内する。
+    #[test]
+    fn sec5_rejection_message_points_to_subordinate_ids() {
+        let err = plan(&cfg(NamespaceSet::all(), None), 0, 0).unwrap_err();
+        assert!(err.message.contains("/etc/subuid"), "{}", err.message);
+        assert!(err.message.contains("TASK-40"), "{}", err.message);
+        assert!(!err.message.contains("rootful"), "{}", err.message);
+    }
+
     /// SEC-5: 非 root では自 ID を 0 へ写す単一写像を計画し、root は User 無しなら通る。
     #[test]
     fn sec5_plan_maps_unprivileged_ids_to_zero() {
@@ -939,9 +964,71 @@ mod tests {
     /// （CORE-1・fail-closed）。
     #[test]
     fn establish_rejects_non_pid1() {
+        let before = thread_ns_link("mnt").unwrap();
         let err = MountIsolation::establish().unwrap_err();
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(err.stage, IsolationStage::MountProc);
+        assert!(err.message.starts_with("not PID 1"), "{}", err.message);
+        // unshare 前に拒否しており、スレッドの mount namespace は変わらない。
+        assert_eq!(thread_ns_link("mnt").unwrap(), before);
+    }
+
+    fn evidence(mnt_ns: &str, pid_ns: &str) -> MountIsolation {
+        MountIsolation {
+            mnt_ns: mnt_ns.to_string(),
+            pid_ns: pid_ns.to_string(),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// CORE-1（Codex P0）: 証跡の再検証は PID 1・mount ns・PID ns のすべての一致を要求する。
+    #[test]
+    fn check_evidence_requires_pid1_and_both_namespaces() {
+        let e = evidence("mnt:[10]", "pid:[20]");
+        assert_eq!(check_evidence(&e, 1, "mnt:[10]", "pid:[20]"), Ok(()));
+        // 証跡を受け取った親や PID 1 が fork した子（PID が 1 でない）。
+        assert_eq!(
+            check_evidence(&e, 42, "mnt:[10]", "pid:[20]"),
+            Err("mount_proc must be called by PID 1 of the isolated PID namespace")
+        );
+        // 別の mount namespace（別スレッド・親）。
+        assert_eq!(
+            check_evidence(&e, 1, "mnt:[11]", "pid:[20]"),
+            Err("isolation evidence does not belong to the current mount namespace")
+        );
+        // 同じ mount namespace だが別の PID namespace（procfs が別の PID 集合を映す）。
+        assert_eq!(
+            check_evidence(&e, 1, "mnt:[10]", "pid:[21]"),
+            Err("isolation evidence does not belong to the current PID namespace")
+        );
+    }
+
+    /// CORE-1（Codex P0・監査 P1-1）: unshare の前後で mount ns が変わらなければ拒否する。
+    #[test]
+    fn check_fresh_mount_ns_rejects_unchanged_namespace() {
+        assert_eq!(check_fresh_mount_ns("mnt:[1]", "mnt:[2]"), Ok(()));
+        assert_eq!(
+            check_fresh_mount_ns("mnt:[1]", "mnt:[1]"),
+            Err("unshare(CLONE_NEWNS) did not move the thread to a new mount namespace")
+        );
+    }
+
+    /// 現在のスレッドの値で作った証跡でも、PID 1 でなければ mount_proc は副作用なしで拒否し、
+    /// dry-run の mount にも到達しない。
+    #[test]
+    fn mount_proc_rejects_caller_that_is_not_pid1() {
+        let e = evidence(
+            &thread_ns_link("mnt").unwrap(),
+            &thread_ns_link("pid").unwrap(),
+        );
+        let err = mount_proc(&e, Path::new("/"), Path::new("/proc")).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::MountProc);
+        assert_eq!(
+            err.message,
+            "mount_proc must be called by PID 1 of the isolated PID namespace"
+        );
+        DRY_RUN_MOUNTS.with(|m| assert_eq!(*m.borrow(), Vec::<String>::new()));
     }
 
     /// `NSpid` の入れ子段数（1 段 = 初期 namespace、2 段以上 = 入れ子）。
@@ -1049,6 +1136,7 @@ mod tests {
             assert_eq!(err.stage, IsolationStage::MountProc, "{target:?}");
             assert!(err.message.contains(want), "{target:?}: {}", err.message);
         }
+        DRY_RUN_MOUNTS.with(|m| assert_eq!(*m.borrow(), Vec::<String>::new()));
         // rootfs 自体が symlink（実体は base/root）の場合は拒否する。
         let alias = t.base.join("alias");
         std::os::unix::fs::symlink(&root, &alias).unwrap();

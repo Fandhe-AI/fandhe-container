@@ -72,7 +72,7 @@ make fio-baseline-ratio BASELINE=<results.json> CANDIDATE=<results.json>  # Dock
 | `lint`・`test`（既定 feature） | `rust-ci-default-features`（`--all-features` 側は `rust-ci`） |
 | `test-integration` | `integration-test` |
 | `bench-check-selftest`・`bench-check` | `bench-regression` |
-| （対応 target なし。`rustup target add aarch64-unknown-linux-gnu` の後に `cargo check --workspace --all-targets --target aarch64-unknown-linux-gnu` と `cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu -- -D warnings`） | `aarch64-linux-check` |
+| （対応 target なし。`rustup target add aarch64-unknown-linux-gnu` の後に `cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu` と `cargo clippy --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu -- -D warnings`） | `aarch64-linux-check` |
 | `lint-docs` | `lint-docs` |
 | `check-workspace-manifest`（`make ci` の一部） | 専用の CI ジョブはない（ローカルゲート専用）。workspace manifest が不正なら各 cargo ジョブのビルドが失敗するため、CI では間接的に検出される |
 

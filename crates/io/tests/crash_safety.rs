@@ -439,9 +439,17 @@ mod unix {
             assert_eq!(verdict, TrialVerdict::Valid { acks_observed: 5 });
         } else {
             assert!(!obs.flush_ack_observed);
+            // 通常 ACK は全件届き、FLUSH ACK 待ちだけが失敗した経路であることを確認する
+            // （接続失敗・通常 ACK 未達・サーバー早期終了・SIGKILL 不成立による無効化を除外。REPAIR-12）
+            assert_eq!(obs.acks_observed, 5);
             assert!(
-                matches!(verdict, TrialVerdict::Invalid(_)),
-                "unsupported persist must be excluded, got {verdict:?}"
+                matches!(
+                    verdict,
+                    TrialVerdict::Invalid(
+                        InvalidReason::ClientFailed(_) | InvalidReason::FlushAckMissing
+                    )
+                ),
+                "unsupported persist must be excluded by the FLUSH ACK path, got {verdict:?}"
             );
         }
     }

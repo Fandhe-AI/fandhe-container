@@ -46,14 +46,18 @@
 //! TOML 等の宣言的設定ファイル（CLI-4・TASK-82）からの読み込みも同様に
 //! 対象外だが、そのキー名として [`BATCH_SIZE_SETTING_KEY`] を予約する。
 //!
-//! `max_bytes`（累積バイト数上限）の CLI / 設定値（`--batch-bytes` 相当）は
-//! 本タスクの対象外（IO-10・TASK-16）。[`WritebackSettings`] を
-//! `#[non_exhaustive]` にしているのは、その値を後から非公開フィールドとして
-//! 追加できる形にしておくため。
+//! `max_bytes`（バッチの累積バイト数上限）の CLI / 設定値（`--batch-bytes` 相当）は
+//! 対象外（REPAIR-3）。一方、未フラッシュ滞留量の上限（IO-10・TASK-16.2・#91）は
+//! [`WritebackSettings::with_unflushed_limit`] と [`parse_unflushed_limit`]
+//! （オプション名 [`UNFLUSHED_MAX_FRAMES_OPTION`]・[`UNFLUSHED_MAX_BYTES_OPTION`]、
+//! 設定キー [`UNFLUSHED_MAX_FRAMES_SETTING_KEY`]・[`UNFLUSHED_MAX_BYTES_SETTING_KEY`]）で
+//! 変更できる。CLI バイナリへの配線は TASK-79、TOML からの読み込みは TASK-82 が
+//! 担う（REPAIR-3）。
 
 use std::path::Path;
 use std::str::FromStr;
 
+use crate::barrier::UnflushedLimit;
 use crate::batch::BatchConfig;
 use crate::error::{IoError, IoErrorCode};
 use crate::observe::ServerObserver;
@@ -68,6 +72,22 @@ pub const BATCH_SIZE_OPTION: &str = "--batch-size";
 
 /// 宣言的設定（TOML 等。CLI-4・TASK-82）でのキー名の予約。
 pub const BATCH_SIZE_SETTING_KEY: &str = "batch_size";
+
+/// 未フラッシュ滞留量の件数上限の CLI オプション名（IO-10・TASK-16.2。TASK-79 が参照）。
+pub const UNFLUSHED_MAX_FRAMES_OPTION: &str = "--unflushed-max-frames";
+
+/// 未フラッシュ滞留量のバイト上限の CLI オプション名（IO-10・TASK-16.2）。
+pub const UNFLUSHED_MAX_BYTES_OPTION: &str = "--unflushed-max-bytes";
+
+/// 宣言的設定（TASK-82）での件数上限のキー名の予約（IO-10・TASK-16.2）。
+pub const UNFLUSHED_MAX_FRAMES_SETTING_KEY: &str = "unflushed_max_frames";
+
+/// 宣言的設定（TASK-82）でのバイト上限のキー名の予約（IO-10・TASK-16.2）。
+pub const UNFLUSHED_MAX_BYTES_SETTING_KEY: &str = "unflushed_max_bytes";
+
+/// [`parse_unflushed_limit`] がパース前に検査する入力文字列長の上限
+/// （`u64::MAX` の 20 桁。DoS 防止）。
+pub const MAX_UNFLUSHED_ARG_LEN: usize = 20;
 
 /// [`parse_batch_size`] がパースを試みる前に検査する入力文字列長の上限
 /// （P0: 無制限確保による DoS の防止。security.md「長さ・件数を上限検証
@@ -132,6 +152,58 @@ pub fn parse_batch_size(value: &str) -> Result<BatchConfig, IoError> {
     BatchConfig::new(batch_size)
 }
 
+/// 10 進 ASCII 数字のみの文字列を `u64` に変換する（外部入力の許可リスト検証）。
+/// エラーメッセージには入力値を含めない。`what` は項目名（メッセージ用）。
+fn parse_decimal_u64(value: &str, what: &'static str) -> Result<u64, IoError> {
+    if value.is_empty() {
+        return Err(IoError::new(
+            IoErrorCode::InvalidArgument,
+            format!("{what} must not be empty"),
+        ));
+    }
+    if value.len() > MAX_UNFLUSHED_ARG_LEN {
+        return Err(IoError::new(
+            IoErrorCode::InvalidArgument,
+            format!("{what} argument must be at most {MAX_UNFLUSHED_ARG_LEN} bytes long"),
+        ));
+    }
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(IoError::new(
+            IoErrorCode::InvalidArgument,
+            format!("{what} must be a decimal integer composed of ASCII digits only"),
+        ));
+    }
+    value.parse().map_err(|_| {
+        IoError::new(
+            IoErrorCode::InvalidArgument,
+            format!("{what} does not fit in u64"),
+        )
+    })
+}
+
+/// 未フラッシュ滞留量の上限の文字列（`--unflushed-max-frames` /
+/// `--unflushed-max-bytes` 相当）を検証済み [`UnflushedLimit`] へ変換する
+/// （IO-10・TASK-16.2・#91）。`None` の項目は既定値のまま。
+///
+/// 形式は [`parse_batch_size`] と同じ 10 進 ASCII 数字のみ。範囲（`1..=MAX_UNFLUSHED_MAX_*`）
+/// の検証は [`UnflushedLimit::new`] に委譲する。エラーはすべて
+/// [`IoErrorCode::InvalidArgument`] で、メッセージに入力値を含めない。
+pub fn parse_unflushed_limit(
+    max_frames: Option<&str>,
+    max_bytes: Option<&str>,
+) -> Result<UnflushedLimit, IoError> {
+    let default = UnflushedLimit::default();
+    let frames = match max_frames {
+        Some(v) => parse_decimal_u64(v, "unflushed max frames")?,
+        None => default.max_frames(),
+    };
+    let bytes = match max_bytes {
+        Some(v) => parse_decimal_u64(v, "unflushed max bytes")?,
+        None => default.max_bytes(),
+    };
+    UnflushedLimit::new(frames, bytes)
+}
+
 impl FromStr for BatchConfig {
     type Err = IoError;
 
@@ -156,20 +228,36 @@ impl FromStr for BatchConfig {
 /// `UdsServer::bind` 呼び出しと組み合わせるなど、値だけを取り出したい
 /// 呼び出し元向けに残す。
 ///
-/// `max_bytes`（累積バイト数上限）用の CLI / 設定値はまだ持たない
-/// （モジュール doc の「スコープ外」参照）。`#[non_exhaustive]` かつ
-/// 非公開フィールドのみを持つことで、後方互換を保ったままそれを追加できる
-/// 形にしておく。
+/// 未フラッシュ滞留量の上限（[`UnflushedLimit`]。IO-10・TASK-16.2）も保持し、
+/// [`BoundConnection::serve`] が接続元の設定から取り出して自動フラッシュに使う。
+/// バッチの `max_bytes` 用の CLI / 設定値はまだ持たない（モジュール doc 参照）。
+/// `#[non_exhaustive]` かつ非公開フィールドのみを持つことで、後方互換を保ったまま
+/// 項目を追加できる形にしておく。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct WritebackSettings {
     batch: BatchConfig,
+    unflushed: UnflushedLimit,
 }
 
 impl WritebackSettings {
     /// 検証済みの [`BatchConfig`] から設定を作る。
     pub fn new(batch: BatchConfig) -> Self {
-        Self { batch }
+        Self {
+            batch,
+            unflushed: UnflushedLimit::default(),
+        }
+    }
+
+    /// 未フラッシュ滞留量の上限を差し替える（IO-10・TASK-16.2）。
+    pub fn with_unflushed_limit(mut self, limit: UnflushedLimit) -> Self {
+        self.unflushed = limit;
+        self
+    }
+
+    /// 未フラッシュ滞留量の上限を返す（既定は [`UnflushedLimit::default`]）。
+    pub fn unflushed_limit(&self) -> UnflushedLimit {
+        self.unflushed
     }
 
     /// `--batch-size`（または同等の設定値）の文字列から設定を作る
@@ -350,7 +438,13 @@ impl<C: ServerObserver> BoundConnection<C> {
         sink: &mut W,
         timeouts: WritebackTimeouts,
     ) -> WritebackReport {
-        writeback::serve_connection(&mut self.conn, self.settings.batch_config(), sink, timeouts)
+        writeback::serve_connection_with_limit(
+            &mut self.conn,
+            self.settings.batch_config(),
+            self.settings.unflushed_limit(),
+            sink,
+            timeouts,
+        )
     }
 }
 
@@ -527,5 +621,55 @@ mod tests {
         ) -> WritebackReport {
             conn.serve(sink, timeouts)
         }
+    }
+
+    /// IO-10・TASK-16.2: 設定の既定上限と差し替えの往復。
+    #[test]
+    fn io10_settings_unflushed_limit_default_and_override() {
+        let settings = WritebackSettings::default();
+        assert_eq!(settings.unflushed_limit(), UnflushedLimit::default());
+        let limit = UnflushedLimit::new(3, 10).expect("valid");
+        assert_eq!(
+            settings.with_unflushed_limit(limit).unflushed_limit(),
+            limit
+        );
+    }
+
+    /// IO-10・TASK-16.2: `None` は既定値、`Some` は反映される。
+    #[test]
+    fn io10_parse_unflushed_limit_defaults_and_values() {
+        let d = parse_unflushed_limit(None, None).expect("defaults");
+        assert_eq!(d, UnflushedLimit::default());
+        let l = parse_unflushed_limit(Some("3"), Some("100")).expect("valid");
+        assert_eq!((l.max_frames(), l.max_bytes()), (3, 100));
+        let l = parse_unflushed_limit(Some("3"), None).expect("valid");
+        assert_eq!(l.max_bytes(), UnflushedLimit::default().max_bytes());
+    }
+
+    /// IO-10・TASK-16.2: 不正入力は `InvalidArgument` で、入力値をエコーしない。
+    #[test]
+    fn io10_parse_unflushed_limit_rejects_invalid_without_echo() {
+        let long = "1".repeat(21);
+        for bad in [
+            "",
+            "-1",
+            " 3",
+            "0x3",
+            "0",
+            "3_0",
+            long.as_str(),
+            "99999999999999999999",
+        ] {
+            let err = parse_unflushed_limit(Some(bad), None).expect_err("must reject");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument, "input {bad:?}");
+            if bad.len() >= 2 {
+                assert!(!err.message().contains(bad), "input {bad:?} echoed");
+            }
+            let err = parse_unflushed_limit(None, Some(bad)).expect_err("must reject");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument, "input {bad:?}");
+        }
+        // 上限超（20 桁以内・u64 に収まるが範囲外）
+        let err = parse_unflushed_limit(Some("1048577"), None).expect_err("over max");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
     }
 }

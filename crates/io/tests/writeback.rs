@@ -24,7 +24,8 @@ mod unix {
 
     use fandhe_container_io::{
         AppendFileSink, BatchConfig, Frame, FrameHeader, FrameKind, IoTimeout, NoopServerObserver,
-        ReceiveLimits, SinkOpenMode, UdsServer, WritebackTimeouts, serve_connection,
+        ReceiveLimits, SinkOpenMode, UdsServer, UnflushedLimit, WritebackSettings,
+        WritebackTimeouts, serve_connection, serve_connection_with_limit,
     };
 
     /// テストごとに固有かつ短いソケットディレクトリを作る（`tests/server.rs`
@@ -467,6 +468,191 @@ mod unix {
             assert_eq!(report.stats.flush_acks_sent, 0);
             assert_eq!(report.stats.unflushed.frames(), 2);
             assert_eq!(report.stats.unflushed.bytes(), 16);
+        }
+    }
+
+    /// 書き込みを `AppendFileSink` へ委譲し、`persist` 呼び出し時点までに書き込んだ
+    /// フレーム数を記録する sink（自動フラッシュの発火タイミングの照合用。IO-10）。
+    struct RecordingSink {
+        inner: AppendFileSink,
+        written_frames: usize,
+        persists: Vec<usize>,
+    }
+
+    impl RecordingSink {
+        fn new(inner: AppendFileSink) -> Self {
+            Self {
+                inner,
+                written_frames: 0,
+                persists: Vec::new(),
+            }
+        }
+    }
+
+    impl fandhe_container_io::BatchSink for RecordingSink {
+        fn write_batch(
+            &mut self,
+            batch: &fandhe_container_io::Batch,
+        ) -> Result<fandhe_container_io::SinkWriteReport, fandhe_container_io::IoError> {
+            let report = self.inner.write_batch(batch)?;
+            self.written_frames += report.frames_written;
+            Ok(report)
+        }
+
+        fn persist(
+            &mut self,
+        ) -> Result<fandhe_container_io::SinkPersistReport, fandhe_container_io::IoError> {
+            self.persists.push(self.written_frames);
+            self.inner.persist()
+        }
+    }
+
+    /// IO-10・TASK-16.2・#91: 件数上限 3（batch_size 8）を設定経由で与えると、
+    /// 3 件目の受理直後に自動フラッシュされる（lockstep で「直後」を判定する:
+    /// 自動フラッシュがなければ batch_size 未達で ACK が届かず、読み取り
+    /// タイムアウトで失敗する）。FlushAck は送られない。
+    ///
+    /// - 対応環境: W0〜W2 → ACK 0〜2、W3〜W5 → ACK 3〜5、W6 で切断。persist 記録 `[3, 6]`
+    /// - 非対応環境: W0〜W2 → ACK 0〜2 の後、persist 未対応で `Unimplemented` 終了
+    #[test]
+    fn io10_uds_auto_flush_fires_right_after_frame_limit_via_settings() {
+        let supported = fandhe_container_io::persist_support().is_supported();
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+
+        let limit = UnflushedLimit::new(3, fandhe_container_io::DEFAULT_UNFLUSHED_MAX_BYTES)
+            .expect("limit must be valid");
+        let settings = WritebackSettings::from_batch_size_arg("8")
+            .expect("8 must be a valid batch size")
+            .with_unflushed_limit(limit);
+        let mut server = settings
+            .bind(&socket_path, NoopServerObserver)
+            .expect("bind must succeed on a private, empty path");
+
+        let connect_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = connect(&connect_path);
+            let mut acked = Vec::new();
+            let rounds: u64 = if supported { 2 } else { 1 };
+            for round in 0..rounds {
+                for id in (round * 3)..(round * 3 + 3) {
+                    send_write(&mut stream, id, &id.to_le_bytes());
+                }
+                for _ in 0..3 {
+                    acked.push(ack_id(&recv_frame(&mut stream)));
+                }
+            }
+            if supported {
+                send_write(&mut stream, 6, &6u64.to_le_bytes());
+                stream
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("shutdown write half");
+            }
+            let rest = collect_until_eof(&mut stream);
+            (acked, rest)
+        });
+
+        let mut connection = server
+            .accept(test_timeout(), NoopServerObserver)
+            .expect("server must accept the client connection within the timeout");
+        let mut sink = RecordingSink::new(dir.output_sink());
+
+        let report = connection.serve(&mut sink, writeback_timeouts());
+        drop(connection);
+        let (acked, rest) = client_thread.join().expect("client thread must not panic");
+
+        assert!(rest.is_empty(), "no FlushAck may be sent by auto flush");
+        assert_eq!(report.stats.flush_acks_sent, 0);
+        if supported {
+            assert_eq!(acked, vec![0, 1, 2, 3, 4, 5]);
+            assert_eq!(sink.persists, vec![3, 6]);
+            assert_eq!(report.stats.auto_flushes, 2);
+            assert_eq!(report.stats.unflushed.frames(), 1);
+            assert_eq!(report.stats.discarded_pending_frames, 1);
+            assert_eq!(
+                report.end.code(),
+                fandhe_container_io::IoErrorCode::Unavailable
+            );
+            let expected: Vec<u8> = (0..6u64).flat_map(|id| id.to_le_bytes()).collect();
+            assert_eq!(
+                std::fs::read(dir.output_path()).expect("read output"),
+                expected
+            );
+        } else {
+            assert_eq!(acked, vec![0, 1, 2]);
+            assert_eq!(sink.persists, vec![3]);
+            assert_eq!(report.stats.auto_flushes, 0);
+            assert_eq!(report.stats.persist_failed, 1);
+            assert_eq!(
+                report.end.code(),
+                fandhe_container_io::IoErrorCode::Unimplemented
+            );
+        }
+    }
+
+    /// IO-10・TASK-16.2・#91: バイト上限 16（8 バイト body × 2）でも 2 件目の受理直後に
+    /// 自動フラッシュされる（`serve_connection_with_limit` を直接使う経路。lockstep）。
+    #[test]
+    fn io10_uds_auto_flush_fires_right_after_byte_limit() {
+        let supported = fandhe_container_io::persist_support().is_supported();
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+
+        let mut server =
+            UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
+                .expect("bind must succeed on a private, empty path");
+
+        let connect_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = connect(&connect_path);
+            send_write(&mut stream, 0, &0u64.to_le_bytes());
+            send_write(&mut stream, 1, &1u64.to_le_bytes());
+            let acked = vec![
+                ack_id(&recv_frame(&mut stream)),
+                ack_id(&recv_frame(&mut stream)),
+            ];
+            if supported {
+                stream
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("shutdown write half");
+            }
+            let rest = collect_until_eof(&mut stream);
+            (acked, rest)
+        });
+
+        let mut connection = server
+            .accept(test_timeout(), NoopServerObserver)
+            .expect("server must accept the client connection within the timeout");
+        let mut sink = RecordingSink::new(dir.output_sink());
+        let limit = UnflushedLimit::new(1000, 16).expect("limit must be valid");
+        let config = BatchConfig::new(8).expect("8 must be valid");
+
+        let report = serve_connection_with_limit(
+            &mut connection,
+            config,
+            limit,
+            &mut sink,
+            writeback_timeouts(),
+        );
+        drop(connection);
+        let (acked, rest) = client_thread.join().expect("client thread must not panic");
+
+        assert_eq!(acked, vec![0, 1]);
+        assert!(rest.is_empty(), "no FlushAck may be sent by auto flush");
+        assert_eq!(sink.persists, vec![2]);
+        if supported {
+            assert_eq!(report.stats.auto_flushes, 1);
+            assert_eq!(report.stats.unflushed.bytes(), 0);
+            assert_eq!(
+                report.end.code(),
+                fandhe_container_io::IoErrorCode::Unavailable
+            );
+        } else {
+            assert_eq!(report.stats.auto_flushes, 0);
+            assert_eq!(
+                report.end.code(),
+                fandhe_container_io::IoErrorCode::Unimplemented
+            );
         }
     }
 

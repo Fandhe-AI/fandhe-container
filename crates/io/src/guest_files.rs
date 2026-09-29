@@ -325,19 +325,11 @@ impl GuestFileCreator {
         fault::run_hook(fault::Hook::AfterCreate);
         // 走査から作成までの間に別プロセスが足した大小違いの項目を再検証する
         // （見つかれば自分の作成を取り消して返す。モジュール doc「プロセス間の競合」）。
-        let file = verify_created(created, guest_path, ancestors, leaf)?;
+        let (file, dir_handles) = verify_created(created, guest_path, ancestors, leaf)?;
         // 新規作成したファイル（と祖先ディレクトリ）のエントリを macOS / Windows の
-        // persist で永続化するため、末端の親から root まで全階層を渡す（IO-2・TASK-15.3）。
-        let dirs: Vec<PathBuf> = (0..=ancestors.len())
-            .rev()
-            .map(|depth| {
-                ancestors
-                    .iter()
-                    .take(depth)
-                    .fold(self.base.clone(), |dir, name| dir.join(name))
-            })
-            .collect();
-        AppendFileSink::new(file).map(|sink| sink.with_parent_dirs(dirs))
+        // persist で永続化するため、作成に使った保持済みのハンドルを末端の親から root まで
+        // 全階層渡す（パスは再解決しない。IO-2・TASK-15.3）。
+        AppendFileSink::new(file).map(|sink| sink.with_parent_dir_handles(dir_handles))
     }
 
     /// `ancestors` に沿って実在するディレクトリの項目を読み、この作成限りの衝突
@@ -676,6 +668,9 @@ struct Created {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct Created {
     file: File,
+    /// 同期用の書き込み可能なディレクトリハンドル（末端の親から root の順）。
+    /// 祖先を固定している間に開くため、作成後に改名されても同じディレクトリを指す。
+    dirs: Vec<File>,
 }
 
 /// ルートのディレクトリハンドル起点・symlink 非追従で祖先を開き（無ければ作り）
@@ -797,7 +792,7 @@ fn verify_created(
     guest_path: &str,
     ancestors: &[&str],
     leaf: &str,
-) -> Result<File, IoError> {
+) -> Result<(File, Vec<File>), IoError> {
     use crate::fs_normalize::fold_component;
     use std::ops::ControlFlow;
     use std::os::unix::fs::MetadataExt;
@@ -875,7 +870,11 @@ fn verify_created(
         prefix.push_str(component);
         prefix.push('/');
     }
-    Ok(created.file)
+    // 作成に使った保持済みハンドルを、末端の親から root の順で返す（sink が
+    // パスを再解決せずに同期するため。IO-2・IO-3）。
+    let Created { file, mut dirs, .. } = created;
+    dirs.reverse();
+    Ok((file, dirs))
 }
 
 /// 再検証を行わないフォールバック（Windows 等。モジュール doc の既知の限界）。
@@ -885,8 +884,8 @@ fn verify_created(
     _guest_path: &str,
     _ancestors: &[&str],
     _leaf: &str,
-) -> Result<File, IoError> {
-    Ok(created.file)
+) -> Result<(File, Vec<File>), IoError> {
+    Ok((created.file, created.dirs))
 }
 
 /// 取り消しが元どおりにできなかった理由。
@@ -1208,6 +1207,10 @@ fn create_beneath(
     let mut path = root.to_path_buf();
     // 固定済みの祖先ハンドル（葉の作成が終わるまで保持する）。
     let mut pinned: Vec<File> = Vec::with_capacity(ancestors.len());
+    // 同期用の書き込み可能ハンドル（root から順。最後に反転して末端の親から返す）。
+    // 固定中に開くため、パスは固定済みの同じディレクトリに解決される。
+    let mut sync_dirs: Vec<File> = Vec::with_capacity(ancestors.len().saturating_add(1));
+    sync_dirs.push(crate::barrier::open_dir_handle(root).map_err(CreateError::Other)?);
     for name in ancestors {
         path.push(name);
         match std::fs::create_dir(&path) {
@@ -1224,12 +1227,17 @@ fn create_beneath(
             .map_err(|err| CreateError::Other(internal("failed to create guest file", err.kind())))?
             .ok_or_else(|| CreateError::Other(invalid("guest path ancestor is not a directory")))?;
         pinned.push(dir);
+        sync_dirs.push(crate::barrier::open_dir_handle(&path).map_err(CreateError::Other)?);
     }
+    sync_dirs.reverse();
     let result = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path.join(leaf))
-        .map(|file| Created { file })
+        .map(|file| Created {
+            file,
+            dirs: sync_dirs,
+        })
         .map_err(|err| {
             if err.kind() == ErrorKind::AlreadyExists {
                 // 実在する表記を確かめる（NTFS は大文字小文字を区別しないため、走査の

@@ -60,7 +60,6 @@
 //!   （TASK-18）。
 
 use std::fs::File;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -667,7 +666,7 @@ pub(crate) fn persist_file_system(
     support: PersistSupport,
     limiter: &'static PersistLimiter,
     file: &File,
-    dirs: &[PathBuf],
+    dirs: &[File],
     timeout: IoTimeout,
 ) -> Result<Duration, PersistFailure> {
     match support {
@@ -750,10 +749,20 @@ fn sync_file_system(
 fn sync_file_system(
     limiter: &'static PersistLimiter,
     file: &File,
-    dirs: &[PathBuf],
+    dirs: &[File],
     timeout: IoTimeout,
 ) -> Result<Duration, PersistFailure> {
-    let dirs = dirs.to_vec();
+    // 作成時に保持したハンドルを複製して同期する（パスを再解決しない）。
+    let dirs = dirs
+        .iter()
+        .map(File::try_clone)
+        .collect::<Result<Vec<File>, _>>()
+        .map_err(|err| {
+            PersistFailure::not_issued(IoError::new(
+                IoErrorCode::Internal,
+                format!("failed to duplicate directory handle ({:?})", err.kind()),
+            ))
+        })?;
     let dup = file.try_clone().map_err(|err| {
         PersistFailure::not_issued(IoError::new(
             IoErrorCode::Internal,
@@ -769,7 +778,7 @@ fn sync_file_system(
             // 新規作成ファイルのディレクトリエントリはファイル自体の sync では
             // 永続化されないため、呼び出し側が渡した親ディレクトリも同期する。
             // 1 つでも失敗すれば FlushAck を返さない（fail-closed）。
-            dirs.iter().try_for_each(|dir| sync_dir(dir))
+            dirs.iter().try_for_each(sync_dir)
         },
         &mut dispatched,
     )
@@ -779,12 +788,28 @@ fn sync_file_system(
     })
 }
 
-/// ディレクトリ `dir` を開いて `sync_all` し、そのエントリ（新規作成ファイルの
+/// ディレクトリのハンドルを `sync_all` し、そのエントリ（新規作成ファイルの
 /// 名前等）を永続化する（TASK-15.3・#88）。macOS は `F_FULLFSYNC`、Windows は
-/// `FILE_FLAG_BACKUP_SEMANTICS` 付きの書き込みハンドルで `FlushFileBuffers`。
+/// `FlushFileBuffers`（[`open_dir_handle`] が書き込みハンドルで開く）。
 /// エラーには `ErrorKind` のみを含め、パスは含めない。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn sync_dir(dir: &std::path::Path) -> Result<(), IoError> {
+fn sync_dir(handle: &File) -> Result<(), IoError> {
+    handle.sync_all().map_err(|err| {
+        IoError::new(
+            IoErrorCode::Internal,
+            format!("directory sync failed ({:?})", err.kind()),
+        )
+    })
+}
+
+/// 親ディレクトリのハンドルを開く（TASK-15.3・#88。IO-2・IO-3）。
+/// `AppendFileSink::with_parent_dirs` が設定時に 1 回だけ呼び、以後の Flush は
+/// このハンドルを同期する。Flush 時にパスを開き直すと、作成後に親ディレクトリが
+/// rename・置換された場合に別ディレクトリを同期して成功扱いになるため。
+/// Windows は `FILE_FLAG_BACKUP_SEMANTICS` 付きの書き込みハンドル
+/// （`FlushFileBuffers` に必要）、それ以外は読み取りハンドルで開く。
+/// エラーには `ErrorKind` のみを含め、パスは含めない。
+pub(crate) fn open_dir_handle(dir: &std::path::Path) -> Result<File, IoError> {
     let mut options = std::fs::OpenOptions::new();
     #[cfg(target_os = "windows")]
     {
@@ -793,20 +818,14 @@ fn sync_dir(dir: &std::path::Path) -> Result<(), IoError> {
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "windows"))]
     {
         options.read(true);
     }
-    let handle = options.open(dir).map_err(|err| {
+    options.open(dir).map_err(|err| {
         IoError::new(
             IoErrorCode::Internal,
             format!("failed to open directory for sync ({:?})", err.kind()),
-        )
-    })?;
-    handle.sync_all().map_err(|err| {
-        IoError::new(
-            IoErrorCode::Internal,
-            format!("directory sync failed ({:?})", err.kind()),
         )
     })
 }

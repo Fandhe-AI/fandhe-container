@@ -261,7 +261,7 @@ pub struct AppendFileSink {
     /// （TASK-15.3・#88。macOS / Windows 専用。Linux は `syncfs` が FS 全体を
     /// 同期するため使わない）。`None` は未指定で、その環境では新規作成ファイルの
     /// 名前が電源断で失われうるため `persist` は `Unimplemented` で拒否する。
-    parent_dirs: Option<Vec<PathBuf>>,
+    parent_dirs: Option<Vec<File>>,
     /// `parent_dirs` の同期が成功済みか。エントリは作成時に 1 回永続化すれば足りる
     /// ため、成功後の `persist` では再同期しない。
     parent_dirs_synced: bool,
@@ -327,7 +327,7 @@ impl AppendFileSink {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
             _ => PathBuf::from("."),
         };
-        Ok(sink.with_parent_dirs(vec![parent]))
+        sink.with_parent_dirs(vec![parent])
     }
 
     /// 対象ファイルのディレクトリエントリを永続化するために同期するディレクトリを
@@ -340,9 +340,31 @@ impl AppendFileSink {
     /// この環境では `Unimplemented` で FlushAck を拒否する（fail-closed）。空の `dirs` も
     /// 未指定と同じ扱いで拒否する（永続化すべきディレクトリが無いため）。Linux は
     /// `syncfs` が FS 全体を同期するため指定は不要（無視される）。
-    pub fn with_parent_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+    ///
+    /// ディレクトリはここで開いてハンドルを保持し、Flush ではそのハンドルを同期する
+    /// （パスを再解決しない。作成後に親が rename・置換されても別ディレクトリを同期して
+    /// 成功扱いにならない。IO-2・IO-3）。設定変更は未永続化状態として扱い、次の Flush で
+    /// 必ず同期する。開けないディレクトリがあれば `Internal` を返す。
+    pub fn with_parent_dirs(mut self, dirs: Vec<PathBuf>) -> Result<Self, IoError> {
+        let handles = dirs
+            .iter()
+            .map(|dir| crate::barrier::open_dir_handle(dir))
+            .collect::<Result<Vec<File>, IoError>>()?;
+        self.parent_dirs = Some(handles);
+        self.parent_dirs_synced = false;
+        // persist 済みの sink でも、追加ディレクトリを次の persist で必ず同期させる。
+        self.dirty_since_persist = true;
+        Ok(self)
+    }
+
+    /// 呼び出し側が作成時に保持していたディレクトリハンドルをそのまま登録する
+    /// （[`AppendFileSink::with_parent_dirs`] のパスを開く経路を経ない版。
+    /// `GuestFileCreator` が、作成に使ったハンドルで同期させるために使う。IO-2・IO-3）。
+    /// 設定変更は未永続化状態として扱う。
+    pub(crate) fn with_parent_dir_handles(mut self, dirs: Vec<File>) -> Self {
         self.parent_dirs = Some(dirs);
         self.parent_dirs_synced = false;
+        self.dirty_since_persist = true;
         self
     }
 
@@ -473,7 +495,7 @@ impl AppendFileSink {
             // 済みのため、FS 全体同期を再発行せず合流する。
             return Ok(SinkPersistReport::new(Duration::ZERO));
         }
-        let dirs: &[PathBuf] = match (&self.parent_dirs, self.parent_dirs_synced) {
+        let dirs: &[File] = match (&self.parent_dirs, self.parent_dirs_synced) {
             (Some(dirs), false) => dirs,
             _ => &[],
         };
@@ -1433,8 +1455,9 @@ mod tests {
         use crate::barrier::PersistSupport;
         let mut sink = AppendFileSink::new(temp_append_sink("empty-parent-dirs").into_inner())
             .expect("sink")
-            .with_parent_dirs(vec![]);
-        assert_eq!(sink.parent_dirs, Some(vec![]));
+            .with_parent_dirs(vec![])
+            .expect("empty dirs must construct");
+        assert_eq!(sink.parent_dirs.as_ref().map(Vec::len), Some(0));
         let err = sink
             .persist_with_support(PersistSupport::SupportedFileSync)
             .expect_err("empty parent dirs must be rejected");
@@ -1453,10 +1476,34 @@ mod tests {
         let file = std::fs::File::create(&path).expect("create temp file");
         let sink = AppendFileSink::new_at(file, &path).expect("sink must construct");
         let _ = std::fs::remove_file(&path);
-        assert_eq!(sink.parent_dirs, Some(vec![dir]));
+        assert_eq!(sink.parent_dirs.as_ref().map(Vec::len), Some(1));
+        let _ = dir;
         let file = tempfile_for_new_at();
         let sink = AppendFileSink::new_at(file, Path::new("relative-name")).expect("sink");
-        assert_eq!(sink.parent_dirs, Some(vec![PathBuf::from(".")]));
+        assert_eq!(sink.parent_dirs.as_ref().map(Vec::len), Some(1));
+    }
+
+    /// IO-2・IO-3（Codex #1146 P0）: persist 済みの sink に `with_parent_dirs` を
+    /// 呼ぶと未永続化状態へ戻り、次の persist が追加ディレクトリを必ず同期する。
+    /// 存在しないディレクトリは設定時に拒否される（パスを Flush 時に再解決しない）。
+    #[test]
+    fn io2_with_parent_dirs_after_persist_marks_dirty() {
+        let mut sink =
+            AppendFileSink::new(temp_append_sink("dirs-dirty").into_inner()).expect("sink");
+        sink.dirty_since_persist = false;
+        sink.parent_dirs_synced = true;
+        let sink = sink
+            .with_parent_dirs(vec![std::env::temp_dir()])
+            .expect("temp dir must open");
+        assert!(sink.dirty_since_persist);
+        assert!(!sink.parent_dirs_synced);
+        let missing = std::env::temp_dir().join("fandhe-io-no-such-dir-xyz");
+        let err = AppendFileSink::new(temp_append_sink("dirs-missing").into_inner())
+            .expect("sink")
+            .with_parent_dirs(vec![missing])
+            .err()
+            .expect("missing dir must be rejected");
+        assert_eq!(err.code(), IoErrorCode::Internal);
     }
 
     fn tempfile_for_new_at() -> File {

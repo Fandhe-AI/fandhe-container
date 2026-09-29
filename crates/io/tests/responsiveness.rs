@@ -575,7 +575,8 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink =
+            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
 
         let writeback_timeouts = WritebackTimeouts {
             recv: timeout,
@@ -711,7 +712,8 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink =
+            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
 
         let config = BatchConfig::new(1).expect("1 must be a valid batch size");
         let writeback_timeouts = WritebackTimeouts {

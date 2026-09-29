@@ -99,7 +99,7 @@ fn create_sink(path: &Path) -> AppendFileSink {
         .truncate(true)
         .open(path)
         .expect("must be able to create the test output file");
-    AppendFileSink::new(file).expect("seek to end must succeed on a freshly created file")
+    AppendFileSink::new_at(file, path).expect("seek to end must succeed on a freshly created file")
 }
 
 /// 既存の `path` を書き込みモード（切り詰めなし）で開き、末尾へ位置合わせした
@@ -109,7 +109,7 @@ fn reopen_sink(path: &Path) -> AppendFileSink {
     std::fs::OpenOptions::new()
         .write(true)
         .open(path)
-        .map(|file| AppendFileSink::new(file).expect("seek to end must succeed on reopen"))
+        .map(|file| AppendFileSink::new_at(file, path).expect("seek to end must succeed on reopen"))
         .expect("must be able to reopen the existing test output file")
 }
 

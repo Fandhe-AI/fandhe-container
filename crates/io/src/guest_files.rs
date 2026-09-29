@@ -326,7 +326,18 @@ impl GuestFileCreator {
         // 走査から作成までの間に別プロセスが足した大小違いの項目を再検証する
         // （見つかれば自分の作成を取り消して返す。モジュール doc「プロセス間の競合」）。
         let file = verify_created(created, guest_path, ancestors, leaf)?;
-        AppendFileSink::new(file)
+        // 新規作成したファイル（と祖先ディレクトリ）のエントリを macOS / Windows の
+        // persist で永続化するため、末端の親から root まで全階層を渡す（IO-2・TASK-15.3）。
+        let dirs: Vec<PathBuf> = (0..=ancestors.len())
+            .rev()
+            .map(|depth| {
+                ancestors
+                    .iter()
+                    .take(depth)
+                    .fold(self.base.clone(), |dir, name| dir.join(name))
+            })
+            .collect();
+        AppendFileSink::new(file).map(|sink| sink.with_parent_dirs(dirs))
     }
 
     /// `ancestors` に沿って実在するディレクトリの項目を読み、この作成限りの衝突

@@ -36,10 +36,12 @@
 //! # 未実装範囲（REPAIR-3）
 //!
 //! - macOS / Windows の代替フラッシュ（TASK-15.3・#88）は sink が持つファイル自体
-//!   （データ＋ファイルメタデータ）だけを `File::sync_all` で永続化する
-//!   （[`PersistSupport::SupportedFileSync`]）。Linux の `syncfs` と違い、新規作成
-//!   ファイルの親ディレクトリエントリの永続化は保証しない（sink が親ディレクトリを
-//!   知らないため。追跡は out-of-scope）。macOS は `F_FULLFSYNC` を使うため、それを
+//!   （データ＋ファイルメタデータ）を `File::sync_all` で永続化したうえで、sink が
+//!   呼び出し側から受け取った親ディレクトリ（[`crate::writeback::AppendFileSink::with_parent_dirs`]）
+//!   も同期し、新規作成ファイルのディレクトリエントリを永続化する
+//!   （[`PersistSupport::SupportedFileSync`]）。親ディレクトリが未指定の sink は
+//!   エントリの永続化を保証できないため `Unimplemented` で拒否し FlushAck を返さない
+//!   （fail-closed。IO-2・IO-3）。macOS は `F_FULLFSYNC` を使うため、それを
 //!   拒否する FS（一部のネットワーク FS 等）では `fsync` へフォールバックせず
 //!   失敗として FlushAck を返さない（fail-closed）。Linux・macOS・Windows 以外の OS は
 //!   `Unimplemented` を返す。
@@ -58,6 +60,7 @@
 //!   （TASK-18）。
 
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -591,9 +594,10 @@ pub enum PersistSupport {
     /// （macOS は `F_FULLFSYNC`、Windows は `FlushFileBuffers`）で永続化して
     /// から FlushAck を返す。
     ///
-    /// REPAIR-3: 保証範囲は sink のファイル自体（データ＋ファイルメタデータ）のみで、
-    /// Linux の `syncfs` と異なり新規作成ファイルの親ディレクトリエントリは
-    /// 対象外。`F_FULLFSYNC` 非対応の FS では失敗し FlushAck を返さない。
+    /// 保証範囲は sink のファイル自体（データ＋ファイルメタデータ）と、sink に
+    /// 指定された親ディレクトリのエントリ。親ディレクトリ未指定の sink は
+    /// 拒否する（新規作成ファイルの名前が電源断で失われうるため）。
+    /// `F_FULLFSYNC` 非対応の FS では失敗し FlushAck を返さない。
     SupportedFileSync,
 }
 
@@ -663,12 +667,16 @@ pub(crate) fn persist_file_system(
     support: PersistSupport,
     limiter: &'static PersistLimiter,
     file: &File,
+    dirs: &[PathBuf],
     timeout: IoTimeout,
 ) -> Result<Duration, PersistFailure> {
     match support {
         PersistSupport::Supported => {
             #[cfg(target_os = "linux")]
             {
+                // syncfs は FS 全体（ディレクトリエントリを含む）を同期するため
+                // `dirs` は使わない。
+                let _ = dirs;
                 sync_file_system(limiter, file, timeout)
             }
             #[cfg(not(target_os = "linux"))]
@@ -679,7 +687,7 @@ pub(crate) fn persist_file_system(
         PersistSupport::SupportedFileSync => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                sync_file_system(limiter, file, timeout)
+                sync_file_system(limiter, file, dirs, timeout)
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
@@ -742,8 +750,10 @@ fn sync_file_system(
 fn sync_file_system(
     limiter: &'static PersistLimiter,
     file: &File,
+    dirs: &[PathBuf],
     timeout: IoTimeout,
 ) -> Result<Duration, PersistFailure> {
+    let dirs = dirs.to_vec();
     let dup = file.try_clone().map_err(|err| {
         PersistFailure::not_issued(IoError::new(
             IoErrorCode::Internal,
@@ -751,12 +761,54 @@ fn sync_file_system(
         ))
     })?;
     let mut dispatched = false;
-    run_with_deadline_tracked(limiter, timeout, move || sync_file(&dup), &mut dispatched).map_err(
-        |error| PersistFailure {
-            error,
-            issued: dispatched,
+    run_with_deadline_tracked(
+        limiter,
+        timeout,
+        move || {
+            sync_file(&dup)?;
+            // 新規作成ファイルのディレクトリエントリはファイル自体の sync では
+            // 永続化されないため、呼び出し側が渡した親ディレクトリも同期する。
+            // 1 つでも失敗すれば FlushAck を返さない（fail-closed）。
+            dirs.iter().try_for_each(|dir| sync_dir(dir))
         },
+        &mut dispatched,
     )
+    .map_err(|error| PersistFailure {
+        error,
+        issued: dispatched,
+    })
+}
+
+/// ディレクトリ `dir` を開いて `sync_all` し、そのエントリ（新規作成ファイルの
+/// 名前等）を永続化する（TASK-15.3・#88）。macOS は `F_FULLFSYNC`、Windows は
+/// `FILE_FLAG_BACKUP_SEMANTICS` 付きの書き込みハンドルで `FlushFileBuffers`。
+/// エラーには `ErrorKind` のみを含め、パスは含めない。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn sync_dir(dir: &std::path::Path) -> Result<(), IoError> {
+    let mut options = std::fs::OpenOptions::new();
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_BACKUP_SEMANTICS（ディレクトリを開くのに必須）。
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        options.read(true);
+    }
+    let handle = options.open(dir).map_err(|err| {
+        IoError::new(
+            IoErrorCode::Internal,
+            format!("failed to open directory for sync ({:?})", err.kind()),
+        )
+    })?;
+    handle.sync_all().map_err(|err| {
+        IoError::new(
+            IoErrorCode::Internal,
+            format!("directory sync failed ({:?})", err.kind()),
+        )
+    })
 }
 
 /// `File::sync_all`（std の安全 API）でファイルのデータとメタデータを永続化する。
@@ -1099,6 +1151,7 @@ mod tests {
             support,
             default_persist_limiter(),
             &file,
+            &[],
             IoTimeout::new(crate::MAX_IO_TIMEOUT).expect("valid timeout"),
         );
         // 版数依存を避け、production と同じ判定（`persist_support`）に応じた期待値で
@@ -1176,8 +1229,9 @@ mod tests {
             PersistSupport::UnsupportedOs,
             mismatched,
         ] {
-            let failure = persist_file_system(support, default_persist_limiter(), &file, ms(100))
-                .expect_err("must be rejected");
+            let failure =
+                persist_file_system(support, default_persist_limiter(), &file, &[], ms(100))
+                    .expect_err("must be rejected");
             assert_eq!(
                 failure.error.code(),
                 IoErrorCode::Unimplemented,
@@ -1237,9 +1291,14 @@ mod tests {
         let file = File::create(&path).expect("create temp file");
         let _ = std::fs::remove_file(&path);
         assert_eq!(persist_support(), PersistSupport::UnsupportedOs);
-        let failure =
-            persist_file_system(persist_support(), default_persist_limiter(), &file, ms(100))
-                .expect_err("must be unimplemented");
+        let failure = persist_file_system(
+            persist_support(),
+            default_persist_limiter(),
+            &file,
+            &[],
+            ms(100),
+        )
+        .expect_err("must be unimplemented");
         assert!(!failure.issued);
         assert_eq!(failure.error.code(), IoErrorCode::Unimplemented);
     }
@@ -1258,6 +1317,7 @@ mod tests {
             PersistSupport::SupportedFileSync,
             default_persist_limiter(),
             &file,
+            &[],
             IoTimeout::new(crate::MAX_IO_TIMEOUT).expect("valid timeout"),
         )
         .expect_err("read-only handle must fail");

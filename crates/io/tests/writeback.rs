@@ -192,7 +192,8 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink =
+            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
 
         // serve_connection はエラーで終わるまでブロックするため、別スレッドで
         // 動かし、64 件ぶんの ACK を読み終えたクライアントスレッドと合流する
@@ -283,7 +284,8 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink =
+            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
 
         let config = BatchConfig::new(8).expect("8 must be a valid batch size");
         let server_thread = std::thread::spawn(move || {
@@ -376,7 +378,8 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink =
+            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
 
         let config = BatchConfig::new(BATCH_SIZE as usize).expect("4 must be a valid batch size");
         let server_thread = std::thread::spawn(move || {
@@ -473,7 +476,8 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink =
+            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
 
         let report = serve_connection(
             &mut connection,
@@ -584,7 +588,7 @@ mod unix {
             .open(&output_path)
             .expect("must open output file");
         let mut sink = FailingPersistSink {
-            inner: AppendFileSink::new(file).expect("seek to end must succeed"),
+            inner: AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed"),
         };
 
         let report = serve_connection(
@@ -650,7 +654,8 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink =
+            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
 
         let report = serve_connection(
             &mut connection,
@@ -740,7 +745,8 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink =
+            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
 
         let report = serve_connection(
             &mut connection,

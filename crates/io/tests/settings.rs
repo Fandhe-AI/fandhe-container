@@ -247,7 +247,8 @@ mod unix {
             .truncate(true)
             .open(&output_path)
             .expect("must open output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink =
+            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
 
         let server_thread =
             std::thread::spawn(move || connection.serve(&mut sink, writeback_timeouts()));

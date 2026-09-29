@@ -108,6 +108,7 @@
 
 use std::fs::File;
 use std::io::{self, Seek as _, SeekFrom, Write as _};
+use std::path::{Path, PathBuf};
 
 use crate::batch::{Batch, BatchBuffer, BatchConfig, PushOutcome};
 use crate::error::{IoError, IoErrorCode};
@@ -210,8 +211,9 @@ impl SinkPersistReport {
 /// # 永続化（IO-2・TASK-15.2.2）
 /// [`BatchSink::persist`] は [`crate::barrier::persist_support`] が対応と判定した
 /// 環境で永続化する（Linux 5.8 以上は `syncfs(2)`、macOS / Windows は TASK-15.3・#88 の
-/// `File::sync_all`。sink のファイル自体のみが対象で、新規作成ファイルの親ディレクトリ
-/// エントリの永続化は保証しない。他は `Unimplemented`）。syncfs を発行した後に失敗・タイムアウトした
+/// `File::sync_all` に加え、[`AppendFileSink::with_parent_dirs`] で指定された親ディレクトリの
+/// 同期。未指定の sink は新規作成ファイルのエントリを保証できず `Unimplemented`。他は
+/// `Unimplemented`）。syncfs を発行した後に失敗・タイムアウトした
 /// sink はポイズンされ（カーネル版数拒否・fd 複製・枠確保・スレッド生成など
 /// 発行前の失敗はポイズンせず再試行可）、以後の `persist` は syscall を発行せず
 /// `Internal` を返す。
@@ -255,6 +257,14 @@ pub struct AppendFileSink {
     /// `syncfs` の同時実行数を抑える limiter（既定はプロセス全体の
     /// `crate::barrier::default_persist_limiter`。単体テストだけが差し替える）。
     persist_limiter: &'static crate::barrier::PersistLimiter,
+    /// 対象ファイルのディレクトリエントリを永続化するために同期する親ディレクトリ
+    /// （TASK-15.3・#88。macOS / Windows 専用。Linux は `syncfs` が FS 全体を
+    /// 同期するため使わない）。`None` は未指定で、その環境では新規作成ファイルの
+    /// 名前が電源断で失われうるため `persist` は `Unimplemented` で拒否する。
+    parent_dirs: Option<Vec<PathBuf>>,
+    /// `parent_dirs` の同期が成功済みか。エントリは作成時に 1 回永続化すれば足りる
+    /// ため、成功後の `persist` では再同期しない。
+    parent_dirs_synced: bool,
 }
 
 impl AppendFileSink {
@@ -301,7 +311,38 @@ impl AppendFileSink {
             persist_poisoned: false,
             dirty_since_persist: true,
             persist_limiter: crate::barrier::default_persist_limiter(),
+            parent_dirs: None,
+            parent_dirs_synced: false,
         })
+    }
+
+    /// [`AppendFileSink::new`] に加え、`path`（`file` を開いたパス）の親ディレクトリを
+    /// [`AppendFileSink::with_parent_dirs`] として登録する便宜コンストラクタ。
+    /// 親ディレクトリだけが対象で、祖先ディレクトリも新規作成した場合は
+    /// `with_parent_dirs` で作成した全階層を渡すこと（IO-2・TASK-15.3）。
+    pub fn new_at(file: File, path: &Path) -> Result<Self, IoError> {
+        let sink = Self::new(file)?;
+        // 親のない相対パス（`Path::new("f")`）は現在のディレクトリを親とみなす。
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        Ok(sink.with_parent_dirs(vec![parent]))
+    }
+
+    /// 対象ファイルのディレクトリエントリを永続化するために同期するディレクトリを
+    /// 指定する（TASK-15.3・#88。IO-2・IO-3）。
+    ///
+    /// macOS / Windows の `persist` は、ファイル自体の `sync_all` に加えて初回成功時に
+    /// これらのディレクトリを同期する（新規作成ファイルの名前が FlushAck 後の電源断で
+    /// 失われないようにするため）。ファイルとともに新規作成したディレクトリがあれば
+    /// 作成した全階層（末端の親から順に、既存の最も近い祖先まで）を渡す。未指定の sink は
+    /// この環境では `Unimplemented` で FlushAck を拒否する（fail-closed）。Linux は
+    /// `syncfs` が FS 全体を同期するため指定は不要（無視される）。
+    pub fn with_parent_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.parent_dirs = Some(dirs);
+        self.parent_dirs_synced = false;
+        self
     }
 
     /// [`BatchSink::persist`] のタイムアウトを差し替える（既定は
@@ -415,19 +456,36 @@ impl AppendFileSink {
                 "persist is poisoned by an earlier failure",
             ));
         }
+        if support == crate::barrier::PersistSupport::SupportedFileSync
+            && self.parent_dirs.is_none()
+        {
+            // ファイル自体の sync だけでは新規作成ファイルのディレクトリエントリが
+            // 永続化されない。親ディレクトリが不明な sink は保証できないため、
+            // syscall を発行せず拒否する（ポイズンしない。IO-2・IO-3）。
+            return Err(IoError::new(
+                IoErrorCode::Unimplemented,
+                "parent directories are not configured; cannot persist the directory entry, refusing to send FlushAck",
+            ));
+        }
         if !self.dirty_since_persist {
             // 直近の成功以降に書き込みがなく、その成功が既に全書き込みを永続化
             // 済みのため、FS 全体同期を再発行せず合流する。
             return Ok(SinkPersistReport::new(Duration::ZERO));
         }
+        let dirs: &[PathBuf] = match (&self.parent_dirs, self.parent_dirs_synced) {
+            (Some(dirs), false) => dirs,
+            _ => &[],
+        };
         match crate::barrier::persist_file_system(
             support,
             self.persist_limiter,
             &self.file,
+            dirs,
             self.flush_timeout,
         ) {
             Ok(elapsed) => {
                 self.dirty_since_persist = false;
+                self.parent_dirs_synced = true;
                 Ok(SinkPersistReport::new(elapsed))
             }
             Err(failure) => {
@@ -1054,7 +1112,7 @@ mod tests {
             .open(&path)
             .expect("must open output file");
 
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink = AppendFileSink::new_at(file, &path).expect("seek to end must succeed");
         let mut buffer = BatchBuffer::new(BatchConfig::new(2).expect("2 must be valid"));
         let batch = match buffer
             .push(write_frame(0, b"ab"))
@@ -1110,7 +1168,7 @@ mod tests {
             .open(&path)
             .expect("must open existing output file");
 
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink = AppendFileSink::new_at(file, &path).expect("seek to end must succeed");
         let mut buffer = BatchBuffer::new(BatchConfig::new(1).expect("1 must be valid"));
         let batch = match buffer
             .push(write_frame(0, b"-new"))
@@ -1157,7 +1215,7 @@ mod tests {
             .truncate(true)
             .open(&path)
             .expect("must create output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink = AppendFileSink::new_at(file, &path).expect("seek to end must succeed");
         let mut buffer = BatchBuffer::new(BatchConfig::new(1).expect("1 must be valid"));
 
         let first = match buffer
@@ -1304,7 +1362,7 @@ mod tests {
             .open(&path)
             .expect("create temp file");
         let _ = std::fs::remove_file(&path);
-        AppendFileSink::new(file).expect("sink must construct")
+        AppendFileSink::new_at(file, &path).expect("sink must construct")
     }
 
     /// IO-2・TASK-15.2.2: 書き込みのない連続 persist は syncfs を再発行せず
@@ -1346,6 +1404,48 @@ mod tests {
             assert!(sink.dirty_since_persist, "{support:?}");
             assert!(!sink.persist_poisoned, "{support:?}");
         }
+    }
+
+    /// IO-2・IO-3（Codex #1146 P0）: macOS / Windows 方式の判定
+    /// （`SupportedFileSync`）では、親ディレクトリが未指定の sink は新規作成
+    /// ファイルのエントリを永続化できないため、実行 OS に関係なく syscall を
+    /// 発行せず `Unimplemented` で拒否し、ポイズンも dirty 解除もしない。
+    #[test]
+    fn io2_file_sync_without_parent_dirs_is_rejected() {
+        use crate::barrier::PersistSupport;
+        let mut sink =
+            AppendFileSink::new(temp_append_sink("no-parent-dirs").into_inner()).expect("sink");
+        assert!(sink.parent_dirs.is_none());
+        let err = sink
+            .persist_with_support(PersistSupport::SupportedFileSync)
+            .expect_err("missing parent dirs must be rejected");
+        assert_eq!(err.code(), IoErrorCode::Unimplemented);
+        assert!(err.message().contains("parent directories"), "{err:?}");
+        assert!(sink.dirty_since_persist);
+        assert!(!sink.persist_poisoned);
+    }
+
+    /// TASK-15.3: `new_at` は `path` の親ディレクトリを、親のない相対パスでは
+    /// `.` を登録する。
+    #[test]
+    fn io2_new_at_registers_parent_dir() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fandhe-io-new-at-{}", std::process::id()));
+        let file = std::fs::File::create(&path).expect("create temp file");
+        let sink = AppendFileSink::new_at(file, &path).expect("sink must construct");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(sink.parent_dirs, Some(vec![dir]));
+        let file = tempfile_for_new_at();
+        let sink = AppendFileSink::new_at(file, Path::new("relative-name")).expect("sink");
+        assert_eq!(sink.parent_dirs, Some(vec![PathBuf::from(".")]));
+    }
+
+    fn tempfile_for_new_at() -> File {
+        let path =
+            std::env::temp_dir().join(format!("fandhe-io-new-at-rel-{}", std::process::id()));
+        let file = File::create(&path).expect("create temp file");
+        let _ = std::fs::remove_file(&path);
+        file
     }
 
     /// IO-2（#824 A4）・REPAIR-5: syncfs の同時実行数の枠が埋まったまま FLUSH の
@@ -1449,6 +1549,8 @@ mod tests {
             persist_poisoned: false,
             dirty_since_persist: true,
             persist_limiter: &L,
+            parent_dirs: None,
+            parent_dirs_synced: false,
         };
         let mut conn = FakeTransport::new(vec![flush_frame(0)]);
 

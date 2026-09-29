@@ -44,7 +44,7 @@ fn new_sink(path: &std::path::Path) -> AppendFileSink {
         .truncate(true)
         .open(path)
         .expect("must be able to create the test output file");
-    AppendFileSink::new(file).expect("seek to end must succeed on a freshly created file")
+    AppendFileSink::new_at(file, path).expect("seek to end must succeed on a freshly created file")
 }
 
 /// クライアント数分の [`DuplexEnd`] ペアを作り、`(client_ends, server_ends)`

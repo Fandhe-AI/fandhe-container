@@ -354,7 +354,7 @@ fn warm_up_persist(dir: &std::path::Path) {
         else {
             return;
         };
-        if let Ok(mut sink) = AppendFileSink::new(file) {
+        if let Ok(mut sink) = AppendFileSink::new_at(file, &dir.join("warm-up.bin")) {
             let _ = sink.persist();
         }
     });

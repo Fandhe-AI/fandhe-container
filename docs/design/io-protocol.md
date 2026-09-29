@@ -315,7 +315,7 @@ ACK をバッチ書き込みの後に返すため、クライアントが `batch
 - `syncfs` は中断できないため、dup した fd を小さなスタックの helper スレッドで 1 回だけ実行し、`AppendFileSink::with_flush_timeout`（既定 10 秒。REPAIR-5）で待つ。この期限は下記の同時実行数の枠待ちと `syncfs` 本体を合わせたもの。タイムアウトした helper は detach され、中断できない `syncfs` が戻るまで同時実行数の枠を占有し続ける（ハングした分だけ新しい `syncfs` を起動しない。helper スレッドの数は常に同時実行数と一致し、絶対上限 64 本を超えない）
 - `syncfs` を発行した後に失敗・タイムアウトした `AppendFileSink` はポイズンされ、以後の `persist` は syscall なしで `Internal` を返す（errseq は 1 回しか報告されないため、再試行が 0 を返して永続化を偽装しうる）。カーネル版数による拒否・fd 複製・枠確保・スレッド生成など発行前の失敗は errseq を消費しないためポイズンしない
 - Linux 5.8 未満、またはカーネル版数を判定できない場合、`persist` は `Unimplemented` で拒否する（`syncfs` が書き戻しエラーを報告するのは 5.8 以降のため、FlushAck の偽装を避ける。IO-2）。判定は公開関数 `persist_support()`（`PersistSupport`。`crates/io/src/barrier.rs`）に集約し、利用者・結合試験も同じ関数で「FlushAck が返る環境か」を知る
-- macOS / Windows は `File::sync_all`（macOS は `F_FULLFSYNC`、Windows は `FlushFileBuffers`）による代替フラッシュ（`PersistSupport::SupportedFileSync`。TASK-15.3・#88）。永続化するのは sink のファイル自体（データ＋ファイルメタデータ）のみで、新規作成ファイルの親ディレクトリエントリは保証しない（Linux の `syncfs` との差）。`F_FULLFSYNC` 非対応の FS では失敗し FlushAck を返さない。Linux・macOS・Windows 以外の OS は `Unimplemented`
+- macOS / Windows は `File::sync_all`（macOS は `F_FULLFSYNC`、Windows は `FlushFileBuffers`）による代替フラッシュ（`PersistSupport::SupportedFileSync`。TASK-15.3・#88）。永続化するのは sink のファイル自体（データ＋ファイルメタデータ）に加え、`AppendFileSink::with_parent_dirs`（または `new_at`）で指定された親ディレクトリ（初回成功時に同期し、新規作成ファイルのエントリを永続化する。Linux の `syncfs` は FS 全体を同期するため不要）。親ディレクトリ未指定の sink は `Unimplemented` で拒否し FlushAck を返さない（fail-closed。IO-2・IO-3。Codex #1146 指摘）。`F_FULLFSYNC` 非対応の FS では失敗し FlushAck を返さない。Linux・macOS・Windows 以外の OS は `Unimplemented`
 - 増幅対策（#824 の A4）:
   - `AppendFileSink` は直近の成功以降に書き込みがなければ `syncfs` を再発行せず合流する（書き込みを伴わない連続 FLUSH）
   - プロセス全体で同時に実行中の `syncfs` の数を `MaxConcurrentPersist`（既定 2。`set_max_concurrent_persist` で 1〜64 に設定。0 と 64 超は `InvalidArgument`）までに抑える。上限に達している FLUSH は、その FLUSH の期限内で枠が空くのを `Condvar` で待ち（ビジーウェイトしない）、期限を過ぎたら FlushAck を返さず `Timeout` で確定する（`syncfs` 未発行のため sink はポイズンしない。接続は他の persist 失敗と同じく終了する）
@@ -353,7 +353,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 - UDS 接続受付ループ（accept → `serve_connection` → 次の accept）・同時接続数の上限
 - クライアント側の UDS `connect` と `PipelineClient` との本番結合
 - 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
-- macOS / Windows での親ディレクトリエントリの永続化・FLUSH の頻度（間隔）の制限
+- FLUSH の頻度（間隔）の制限
 - 件数未達分を時間ベースで追い出す仕組み・未フラッシュ滞留量の上限（IO-10・TASK-16）
 - 実際の CLI バイナリ（`fandhe-container`）での `--batch-size` 引数の解釈・`crates/cli → crates/io` の依存追加（TASK-79）
 - ファイル操作を表すペイロード形式（パス・rename・truncate。TASK-14 の前提。I/O 契約の拡張にあたる）

@@ -236,6 +236,19 @@ cat "${fixtures_dir}/baseline-ok.json" "${fixtures_dir}/candidate-ok.json" >"$mu
 run_case_msg "multi-json-value-rejected" 2 "exactly one JSON value" --baseline "$multi_value_path" --candidate "${fixtures_dir}/candidate-ok.json"
 
 # --------------------------------------------------
+# case 10b: NUL バイトを含む入力の拒否
+# Bash の変数格納で NUL が除去されると、除去後の内容が正しい JSON なら検証を
+# 通過してしまうため、変数格納前に元ファイルの NUL を拒否できることを照合する。
+# --------------------------------------------------
+nul_path="${tmp_root}/baseline-nul.json"
+{
+  head -c 10 "${fixtures_dir}/baseline-ok.json"
+  printf '\000'
+  tail -c +11 "${fixtures_dir}/baseline-ok.json"
+} >"$nul_path"
+run_case_msg "nul-byte-rejected" 2 "contains NUL bytes" --baseline "$nul_path" --candidate "${fixtures_dir}/candidate-ok.json"
+
+# --------------------------------------------------
 # case 11: params のキー欠落と null の区別
 # baseline 側に params.extra = null（キーは存在する）を追加し、candidate 側には
 # そのキー自体が無い場合、`$bp[.] != $cp[.]`（値のみの比較）だと両者とも

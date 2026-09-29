@@ -132,7 +132,7 @@ read_input() {
   local reader_pid
   local watchdog_pid
   local rc=0
-  local bytes
+  local bytes nonnul_bytes
   if [ -L "$path" ]; then
     err "invalid-input" "${what} is a symlink, refusing to use it: ${path}"
     exit 2
@@ -195,6 +195,19 @@ read_input() {
   if [ "$bytes" -gt "$MAX_INPUT_BYTES" ]; then
     rm -f -- "$dst"
     err "invalid-input" "${what} exceeds ${MAX_INPUT_BYTES} bytes: ${path}"
+    exit 2
+  fi
+  # Bash の変数は NUL を保持できず `$(cat)` が黙って除去するため、NUL を含む不正な JSON が
+  # 除去後の内容で検証を通過しうる。変数へ格納する前に、コピーしたファイル上で NUL の
+  # 有無（NUL を除いたバイト数との比較）を検査して拒否する。
+  if ! nonnul_bytes=$(tr -d '\000' <"$dst" | wc -c | tr -d ' ') || ! printf '%s' "$nonnul_bytes" | grep -Eq '^[0-9]+$'; then
+    rm -f -- "$dst"
+    err "invalid-input" "${what} could not be read: ${path}"
+    exit 2
+  fi
+  if [ "$nonnul_bytes" -ne "$bytes" ]; then
+    rm -f -- "$dst"
+    err "invalid-input" "${what} contains NUL bytes: ${path}"
     exit 2
   fi
   if ! content=$(cat -- "$dst" 2>/dev/null); then

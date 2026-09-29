@@ -11,12 +11,12 @@ name: CI
 # ゲート（G0。PR 上の全 check-run context が必須チェックに含まれることを要求する）に
 # 適合させるため、本 workflow が生成する check-run 29 件（ci-complete・
 # lint-docs / * 5 件・rust-ci (<os>) / * 15 件・rust-ci-default-features (<os>) 3 件・
-# integration-test (<os>) 3 件・bench-regression 1 件・aarch64-linux-check 1 件）のうち、
-# aarch64-linux-check（#1120）を除く 28 件を個別に登録済み
-# （オーナー判断 2026-09-27。TASK-86.2〔#36〕の integration-test (<os>) 3 件・
-# TASK-86.3〔#37〕の bench-regression 1 件を含む。下の ci-complete・
-# integration-test・bench-regression ジョブのコメントを参照）。aarch64-linux-check は
-# 未登録のため、オーナーによる ruleset への登録が必要（登録までは自動マージが G0 で止まる）。
+# integration-test (<os>) 3 件・bench-regression 1 件・aarch64-linux-check 1 件）を
+# すべて個別に登録済み（aarch64-linux-check を除く 28 件はオーナー判断 2026-09-27。
+# TASK-86.2〔#36〕の integration-test (<os>) 3 件・TASK-86.3〔#37〕の
+# bench-regression 1 件を含む。aarch64-linux-check（#1120）は 2026-09-29 に
+# #4 の自律開発方針に基づき main セッションが登録済み。下の ci-complete・
+# integration-test・bench-regression・aarch64-linux-check ジョブのコメントを参照）。
 # ジョブの追加・改名・matrix 変更で check-run 名が変わる場合は ruleset 側も
 # 同時に更新する（リポジトリ設定の変更のためオーナー作業とする）
 on:
@@ -509,8 +509,8 @@ jobs:
   # いずれも ruleset へ登録済み（オーナー承認 2026-09-27。冒頭コメントの内訳
   # 〔1 + lint-docs 5 + rust-ci 15 + rust-ci-default-features 3 +
   # integration-test 3 + bench-regression 1 + aarch64-linux-check 1 = 29〕と
-  # 一致させる）。#1120 の aarch64-linux-check 1 件は ruleset 未登録で、
-  # オーナー作業として登録が必要。
+  # 一致させる）。#1120 の aarch64-linux-check 1 件も 2026-09-29 に ruleset へ
+  # 登録済み（#4 の自律開発方針に基づき main セッションが登録）。
   ci-complete:
     needs:
       [

@@ -507,10 +507,20 @@ fn io4_graceful_shutdown_one_connection_closed_while_other_stays_live() {
     let a_path = dir.file_path("a.bin");
     let b_path = dir.file_path("b.bin");
 
-    // B をまず 4 件 ACK 済みまで進めて開いたままにする。
+    // B をまず 4 件 ACK 済みまで進めて開いたままにする（静止点。write_and_ack が
+    // 戻った時点でファイル状態が確定する。Session::write_and_ack のコメント参照）。
     let bodies_b1: Vec<Vec<u8>> = (0..4u32).map(|seq| body_for(1, seq, BODY_LEN)).collect();
     let mut session_b = Session::start(create_sink(&b_path), config, 10);
     session_b.write_and_ack(&bodies_b1);
+
+    // B の session はまだ live（close していない）が、静止点で fresh open した
+    // 内容を基準値として確保しておく。A の close が B に影響しないことを、
+    // 後続の「A close 直後」の再読み取りと突き合わせて確認するための対照点
+    // （codex レビュー #82 PRRT_kwDOUq78ts6m6THE 指摘への対応。既存の
+    // `a_after_a_closed`（A 側だけの before/after 比較）は B 側の変化を検出
+    // できないため、B 側も A の close 前後で fresh open して比較する）。
+    let b_before_a_closed = read_fresh(&b_path);
+    assert_eq!(b_before_a_closed, records(1, 0..4, BODY_LEN));
 
     // A は 6 件 + Flush で閉じる。B には一切触れていない。
     let bodies_a: Vec<Vec<u8>> = (0..6u32).map(|seq| body_for(0, seq, BODY_LEN)).collect();
@@ -523,6 +533,16 @@ fn io4_graceful_shutdown_one_connection_closed_while_other_stays_live() {
     // B はまだ開いている状態で、A を fresh open して独立性を確認する。
     let a_after_a_closed = read_fresh(&a_path);
     assert_eq!(a_after_a_closed, records(0, 0..6, BODY_LEN));
+
+    // A の close 直後、B へまだ追加の書き込み・close を一切行っていない時点で
+    // B を fresh open し、A の close 前に取った基準値と比較する。B 自身の
+    // 追加書き込み・close が起きる前に比較することで、A の close が B の
+    // 未 close 状態（一時的な変化を含む）に影響しないことを検出できる。
+    let b_after_a_closed = read_fresh(&b_path);
+    assert_eq!(
+        b_after_a_closed, b_before_a_closed,
+        "closing A must not affect B's not-yet-closed content"
+    );
 
     // B へさらに 5 件を追加して Flush で閉じる。
     let bodies_b2: Vec<Vec<u8>> = (0..5u32)

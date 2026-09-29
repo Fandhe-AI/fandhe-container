@@ -248,7 +248,8 @@ ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 		echo "notice: integration test target が 0 件のため実行対象なし"; \
 		exit 0; \
 	fi; \
-	cargo test --workspace --test '*'
+	cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server && \
+	cargo test -p fandhe-container-io --bins --features crash-test-server
 else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test-integration をスキップ"
 endif

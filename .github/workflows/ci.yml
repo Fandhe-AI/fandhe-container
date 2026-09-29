@@ -218,8 +218,7 @@ jobs:
   # （`#[cfg(test)]`）は rust-ci / rust-ci-default-features（ステージ 2）が
   # 既に担っており、ここでは重複させない。
   #
-  # 現時点では integration test target が 0 件（各機能タスクで tests/*.rs が
-  # 追加され次第この件数は増える）。0 件のまま `cargo test --workspace --test '*'`
+  # integration test target が 0 件のまま `cargo test --workspace --test '*'`
   # を呼ぶと「no test target matches pattern」で非 0 終了するため、実行前に
   # `cargo metadata` + jq で件数を数え、0 件なら notice を出して成功で終える
   # （無言の skip にはしない）。jq の失敗は fail-closed で扱う。
@@ -229,10 +228,26 @@ jobs:
   # （PoC-8 実測に基づく 5〜10 秒のレンジ）は TASK-87.1（#40）で
   # FANDHE_CONTAINER_TEST_TIMEOUT_SECS（下記 env）として設定済み。3 OS matrix
   # （特に macOS/Windows runner のノイズ）を踏まえ上限寄りの 10 秒を採用した。
-  # 値を渡すだけで、これを読んで Duration を組み立て recv_timeout 等へ使う
-  # 消費側コードは integration test target が 0 件の現時点では存在せず、
-  # TASK-85（`crates/io/tests/responsiveness.rs` 等）以降で実装される
-  # 未実装状態にある（実装済みを装わない。REPAIR-3）。
+  # 値を渡すだけで、これを読んで Duration を組み立て recv_timeout 等へ使うのは
+  # 各テスト側の責務である。消費側は `crates/io/tests/responsiveness.rs` と
+  # `crates/io/tests/break_detection.rs`（いずれも TEST_TIMEOUT_ENV 定数で読む）で
+  # 実装済み。crash_safety は本値を読まず（自前の試行ループで制御）、他のテストは
+  # 対象テストごとに順次消費側になる（未実装のテストは実装済みを装わない。REPAIR-3）。
+  #
+  # crash_safety（`crates/io/tests/crash_safety.rs`。IO-3・TASK-18.3.1・#827）:
+  # SIGKILL 耐性の結合試験は本ジョブ（3 OS）の既定 CI 集合で実行し、root・KVM・
+  # GPU・WSL2 を要する実機前提テストとしては分離しない（ci.md「実機前提テスト」）。
+  # SIGKILL の対象はテスト自身が起動した子プロセス（crash_test_server）のみで、
+  # UDS は 0700 の一時ディレクトリ内に作るためホストの設定に触れない。カーネル版数
+  # 依存の永続化対応可否は skip ではなくテスト内の分岐で契約として検証する。
+  # Windows は UDS 未対応の段階なので「未対応終了コード」の契約確認のみ行う。
+  # 本 CI が保証しない範囲: 電源断・カーネルクラッシュ後の媒体永続化（IO-2）、
+  # および実測レポート・対照の妥当性判断（TASK-18 の人間担当分）。
+  # crash_safety と crash_test_server は required-features 付きのため、
+  # `--test '*'` の glob は feature が欠けると黙って除外する（fail-open）。
+  # そこで「crash_safety の存在確認」ステップを置き、ビルド・確認・実行の 3 箇所が
+  # 同一の INTEGRATION_TEST_FEATURES を参照する形で feature 欠落を検出する。
+  # rust-ci の `--all-features` でも同テストは重複して実行される。
   #
   # TASK-87.2（#41）: CI ジョブ全体のハング防止の最終確認について。下記の
   # ハングプローブ機構自体は TASK-86.2（#36）で実装済み。本 concurrency
@@ -280,10 +295,14 @@ jobs:
       # run: スクリプトへ `${{ }}` を直接埋め込まない（スクリプトインジェクション対策）
       HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.hang-probe == true }}
       # 個別テスト 1 件ごとの推奨タイムアウト値（秒。PoC-8 実測に基づく
-      # 5〜10 秒のレンジの上限寄り。TASK-87.1・#40・REPAIR-5）。現時点では
-      # integration test target が 0 件のため、この値を読んで使う消費側
-      # コードはまだ無い（TASK-85 以降で追加予定。REPAIR-3）
+      # 5〜10 秒のレンジの上限寄り。TASK-87.1・#40・REPAIR-5）。この値を読んで
+      # 使う消費側は `crates/io/tests/responsiveness.rs` と
+      # `crates/io/tests/break_detection.rs` で実装済み（REPAIR-3）。crash_safety は
+      # 本値を読まず、他のテストは対象ごとに順次消費側になる
       FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"
+      # crash_safety 等 required-features 付き結合試験を有効化する feature。
+      # ビルド・存在確認・実行の全ステップで同一値を参照する（#827）
+      INTEGRATION_TEST_FEATURES: fandhe-container-io/crash-test-server
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
@@ -302,7 +321,36 @@ jobs:
 
       - name: 結合試験のビルド（ステージ 3。実行タイムアウトの時間枠を消費しないよう分離）
         if: steps.count.outputs.count != '0' && env.HANG_PROBE != 'true'
-        run: cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server --no-run
+        run: cargo test --workspace --test '*' --features "${INTEGRATION_TEST_FEATURES}" --no-run
+
+      - name: crash_safety の存在確認（IO-3・TASK-18.3.1。glob による無言除外の検出）
+        if: steps.count.outputs.count != '0' && env.HANG_PROBE != 'true'
+        run: |
+          set -euo pipefail
+          listed="$(cargo test --workspace --test '*' --features "${INTEGRATION_TEST_FEATURES}" -- --list)"
+          case "${RUNNER_OS}" in
+            Linux|macOS)
+              expected=(
+                "unix::io3_flushed_data_survives_10_valid_sigkills"
+                "unix::io3_unflushed_control_records_loss_without_asserting"
+              )
+              ;;
+            Windows)
+              expected=("other::io3_crash_test_server_reports_unsupported_platform")
+              ;;
+            *)
+              echo "::error::unsupported RUNNER_OS: ${RUNNER_OS}" >&2
+              exit 1
+              ;;
+          esac
+          for name in "${expected[@]}"; do
+            if ! grep -Fxq "${name}: test" <<< "${listed}"; then
+              echo "::error::crash_safety test not listed: ${name}" >&2
+              exit 1
+            fi
+          done
+          echo "crash_safety (IO-3) listed: ${expected[*]}" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::crash_safety (IO-3) listed"
 
       - name: ハングプローブ crate の生成（workflow_dispatch の hang-probe=true 時のみ）
         if: env.HANG_PROBE == 'true'
@@ -359,7 +407,7 @@ jobs:
             echo "::notice::integration test targets: 0 (nothing to run)"
             exit 0
           fi
-          cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server
+          cargo test --workspace --test '*' --features "${INTEGRATION_TEST_FEATURES}"
           # crash_test_server bin 内のユニットテスト（--test '*' の対象外）も実行する
           cargo test -p fandhe-container-io --bins --features crash-test-server
 

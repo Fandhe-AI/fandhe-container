@@ -229,7 +229,7 @@ endif
 # （`make test` が既に同じ workspace のテストを一括で走らせるため、`make ci` から
 # 呼ぶと二重実行になる）。
 .PHONY: test-integration
-test-integration: ## cargo test --workspace --test '*'（結合試験。0 件なら notice で成功終了）
+test-integration: ## cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server（結合試験。0 件なら notice で成功終了）
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	@command -v jq >/dev/null 2>&1 || { \
 		echo "jq 未導入: 導入してから再実行してください（brew install jq / apt-get install jq 等）" >&2; \

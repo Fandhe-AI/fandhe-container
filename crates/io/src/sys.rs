@@ -31,7 +31,9 @@
 //!   `renameat(2)`・`linkat(2)`・`fdopendir(3)`/`readdir(3)` でディレクトリハンドル
 //!   相対にファイル・ディレクトリを作る・開く・消す・改名する・リンクする・列挙する（TASK-19.2・IO-5・#100。
 //!   `crate::guest_files` が共有ルート配下への作成で使う。下記「ハンドル相対の
-//!   ファイル操作」節）。
+//!   ファイル操作」節）。`crate::writeback::AppendFileSink::open_in` も、書き込み先の
+//!   ファイルをディレクトリハンドル相対で開き、そのハンドルを親ディレクトリとして
+//!   同期させるために使う（IO-2・IO-3・TASK-15.3・#88）。
 //!
 //! # 「実 uid」ではなく「接続時点の実効 uid（euid）」（H2・#820
 //! security-auditor 指摘対応）
@@ -47,7 +49,8 @@
 //! # 契約（事前承認の条件を満たす設計）
 //! - `unsafe fn` はこのモジュールの外へ公開しない。公開するのは安全な関数
 //!   （[`peer_uid`]・[`effective_uid`]・[`syncfs`]・[`mkdir_beneath`]・
-//!   [`open_dir_beneath`]・[`create_leaf_beneath`]・[`unlink_beneath`]・
+//!   [`open_dir_beneath`]・[`create_leaf_beneath`]・[`open_leaf_beneath`]・
+//!   [`open_dir_path`]・[`unlink_beneath`]・
 //!   [`rename_beneath`]・[`link_beneath`]・[`for_each_dir_entry`]・
 //!   [`read_dir_entries`]）のみで、`unsafe` はこのモジュール内に閉じる
 //! - すべての `unsafe` ブロック・`unsafe extern "C"` 宣言に `// SAFETY:` で
@@ -383,7 +386,8 @@ pub(crate) fn syncfs(fd: impl AsFd) -> Result<(), IoError> {
 // `d_ino(8) d_seekoff(8) d_reclen(2) d_namlen(2) d_type(1) d_name`。
 
 /// ハンドル相対の操作（[`mkdir_beneath`]・[`open_dir_beneath`]・
-/// [`create_leaf_beneath`]・[`unlink_beneath`]・[`rename_beneath`]・[`link_beneath`]）の
+/// [`create_leaf_beneath`]・[`open_leaf_beneath`]・[`unlink_beneath`]・[`rename_beneath`]・
+/// [`link_beneath`]）の
 /// 失敗種別
 /// （`crate::guest_files` が `IoError` へ写す。ホストのパスや errno の説明文は
 /// 載せない）。
@@ -470,6 +474,9 @@ mod beneath_consts {
     pub(super) const O_WRONLY: i32 = 0o1;
     pub(super) const O_CREAT: i32 = 0o100;
     pub(super) const O_EXCL: i32 = 0o200;
+    pub(super) const O_TRUNC: i32 = 0o1_000;
+    pub(super) const O_APPEND: i32 = 0o2_000;
+    pub(super) const O_NONBLOCK: i32 = 0o4_000;
     pub(super) const O_DIRECTORY: i32 = 0o200_000;
     pub(super) const O_NOFOLLOW: i32 = 0o400_000;
     pub(super) const O_CLOEXEC: i32 = 0o2_000_000;
@@ -494,6 +501,9 @@ mod beneath_consts {
     pub(super) const O_WRONLY: i32 = 0o1;
     pub(super) const O_CREAT: i32 = 0o100;
     pub(super) const O_EXCL: i32 = 0o200;
+    pub(super) const O_TRUNC: i32 = 0o1_000;
+    pub(super) const O_APPEND: i32 = 0o2_000;
+    pub(super) const O_NONBLOCK: i32 = 0o4_000;
     // arch/arm64/include/uapi/asm/fcntl.h（asm-generic と異なる。流用しない）。
     pub(super) const O_DIRECTORY: i32 = 0o40_000;
     pub(super) const O_NOFOLLOW: i32 = 0o100_000;
@@ -520,6 +530,9 @@ mod beneath_consts {
     pub(super) const O_WRONLY: i32 = 0x1;
     pub(super) const O_CREAT: i32 = 0x200;
     pub(super) const O_EXCL: i32 = 0x800;
+    pub(super) const O_TRUNC: i32 = 0x400;
+    pub(super) const O_APPEND: i32 = 0x8;
+    pub(super) const O_NONBLOCK: i32 = 0x4;
     pub(super) const O_DIRECTORY: i32 = 0x0010_0000;
     pub(super) const O_NOFOLLOW: i32 = 0x100;
     pub(super) const O_CLOEXEC: i32 = 0x0100_0000;
@@ -538,7 +551,7 @@ mod beneath_consts {
 
 pub(crate) use beneath::{
     create_leaf_beneath, for_each_dir_entry, link_beneath, mkdir_beneath, open_dir_beneath,
-    read_dir_entries, rename_beneath, unlink_beneath,
+    open_dir_path, open_leaf_beneath, read_dir_entries, rename_beneath, unlink_beneath,
 };
 
 /// 対応アーキテクチャ（macOS・Linux の x86_64 / aarch64）向けの実装。
@@ -730,6 +743,69 @@ mod beneath {
                 BeneathError::Io(kind)
             }
         })
+    }
+
+    /// `dir` 直下の通常ファイル `name` を、ハンドル相対・symlink 非追従で書き込み用に
+    /// 開く（`openat` + `O_WRONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK` に `mode` ごとの
+    /// `O_CREAT|O_EXCL`・`O_CREAT|O_TRUNC`・`O_CREAT|O_APPEND` を足す。mode 0o666。
+    /// umask 適用前）。
+    ///
+    /// `crate::writeback::AppendFileSink::open_in`（IO-2・IO-3・TASK-15.3・#88）が、
+    /// 開いたファイルが `dir` のエントリであることを構造で保証するために使う
+    /// （パスを再解決しないため、呼び出し後に `dir` のパスが差し替えられても、返す
+    /// fd は `dir` のハンドルが指すディレクトリの中で開いたもの）。末端の symlink は
+    /// `ELOOP` で失敗する（`Io(kind)`）。`O_NONBLOCK` は、末端が FIFO のときに読み手を
+    /// 無期限に待たないため（REPAIR-5。読み手がいなければ `ENXIO`）。通常ファイルでは
+    /// 効果がない。通常ファイルかどうかの確認は呼び出し側が開いた fd で行う。
+    /// `CreateNew` で既存（symlink を含む）は `AlreadyExists`。
+    pub(crate) fn open_leaf_beneath(
+        dir: &File,
+        name: &str,
+        mode: crate::writeback::SinkOpenMode,
+    ) -> Result<File, BeneathError> {
+        use crate::writeback::SinkOpenMode;
+        let cname = cstr(name)?;
+        let extra = match mode {
+            SinkOpenMode::CreateNew => c::O_CREAT | c::O_EXCL,
+            SinkOpenMode::CreateOrTruncate => c::O_CREAT | c::O_TRUNC,
+            SinkOpenMode::Existing => 0,
+            SinkOpenMode::CreateOrAppend => c::O_CREAT | c::O_APPEND,
+        };
+        let perm: u32 = 0o666;
+        // SAFETY: `dir` は呼び出し元が借用中の有効なディレクトリ fd で、呼び出しの
+        // 間閉じられない。`cname` は NUL 終端の有効な C 文字列で呼び出しの間生きて
+        // いる。可変長引数の mode は `c_uint` 幅（`mode_t` の既定の引数昇格後の幅）で
+        // 渡す（`O_CREAT` を含まない `Existing` では読まれない）。戻り値は `own_fd` が
+        // 唯一の所有者になる。
+        let fd = unsafe {
+            raw::openat(
+                dir.as_raw_fd(),
+                cname.as_ptr(),
+                c::O_WRONLY | c::O_NOFOLLOW | c::O_CLOEXEC | c::O_NONBLOCK | extra,
+                perm,
+            )
+        };
+        own_fd(fd, |errno, kind| {
+            if errno == c::EEXIST {
+                BeneathError::AlreadyExists
+            } else {
+                BeneathError::Io(kind)
+            }
+        })
+    }
+
+    /// `path` のディレクトリを読み取り用に開く（`O_DIRECTORY`。std の
+    /// `OpenOptions` が `O_CLOEXEC` を付ける。`unsafe` なし）。`path` 自体の symlink は
+    /// 辿る（呼び出し側が指定した場所を開く）。ディレクトリでなければ FIFO 等を開いて
+    /// 待たずに失敗する（`ENOTDIR`。REPAIR-5）。[`open_leaf_beneath`] の起点を開くために
+    /// `crate::writeback::AppendFileSink::open_in` が使う。
+    pub(crate) fn open_dir_path(path: &std::path::Path) -> Result<File, BeneathError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(c::O_DIRECTORY)
+            .open(path)
+            .map_err(|err| BeneathError::Io(err.kind()))
     }
 
     /// `dir` 直下のエントリ `name` を `unlinkat` で消す（symlink は辿らない。
@@ -962,6 +1038,18 @@ mod beneath {
         Err(BeneathError::Io(io::ErrorKind::Unsupported))
     }
 
+    pub(crate) fn open_leaf_beneath(
+        _dir: &File,
+        _name: &str,
+        _mode: crate::writeback::SinkOpenMode,
+    ) -> Result<File, BeneathError> {
+        Err(BeneathError::Io(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn open_dir_path(_path: &std::path::Path) -> Result<File, BeneathError> {
+        Err(BeneathError::Io(io::ErrorKind::Unsupported))
+    }
+
     pub(crate) fn unlink_beneath(
         _dir: &File,
         _name: &str,
@@ -1123,6 +1211,9 @@ mod tests {
         assert_eq!(c::O_WRONLY, 0o1);
         assert_eq!(c::O_CREAT, 0o100);
         assert_eq!(c::O_EXCL, 0o200);
+        assert_eq!(c::O_TRUNC, 0o1_000);
+        assert_eq!(c::O_APPEND, 0o2_000);
+        assert_eq!(c::O_NONBLOCK, 0o4_000);
         assert_eq!(c::O_DIRECTORY, 0o200_000);
         assert_eq!(c::O_NOFOLLOW, 0o400_000);
         assert_eq!(c::O_CLOEXEC, 0o2_000_000);
@@ -1149,6 +1240,9 @@ mod tests {
         assert_eq!(c::O_WRONLY, 0o1);
         assert_eq!(c::O_CREAT, 0o100);
         assert_eq!(c::O_EXCL, 0o200);
+        assert_eq!(c::O_TRUNC, 0o1_000);
+        assert_eq!(c::O_APPEND, 0o2_000);
+        assert_eq!(c::O_NONBLOCK, 0o4_000);
         assert_eq!(c::O_DIRECTORY, 0o40_000);
         assert_eq!(c::O_NOFOLLOW, 0o100_000);
         assert_ne!(c::O_DIRECTORY, 0o200_000);
@@ -1174,6 +1268,9 @@ mod tests {
         assert_eq!(c::O_WRONLY, 0x1);
         assert_eq!(c::O_CREAT, 0x200);
         assert_eq!(c::O_EXCL, 0x800);
+        assert_eq!(c::O_TRUNC, 0x400);
+        assert_eq!(c::O_APPEND, 0x8);
+        assert_eq!(c::O_NONBLOCK, 0x4);
         assert_eq!(c::O_DIRECTORY, 0x0010_0000);
         assert_eq!(c::O_NOFOLLOW, 0x100);
         assert_eq!(c::O_CLOEXEC, 0x0100_0000);
@@ -1223,6 +1320,86 @@ mod tests {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
+        }
+
+        /// IO-2・IO-3・TASK-15.3: `open_leaf_beneath` は mode ごとに作成・切り詰め・
+        /// 追記・既存のみを使い分け、末端の symlink は辿らず失敗する（外の実体を
+        /// 作らない・書き換えない）。
+        #[test]
+        fn io2_open_leaf_beneath_modes_and_symlink() {
+            use crate::writeback::SinkOpenMode;
+            use std::io::Write as _;
+            let t = TmpDir::new("leaf");
+            let outside = TmpDir::new("leaf-out");
+            let root = t.open();
+
+            let mut f = open_leaf_beneath(&root, "a", SinkOpenMode::CreateNew).expect("create");
+            f.write_all(b"abc").expect("write");
+            drop(f);
+            assert_eq!(std::fs::read(t.0.join("a")).expect("a"), b"abc");
+            assert_eq!(
+                open_leaf_beneath(&root, "a", SinkOpenMode::CreateNew).err(),
+                Some(BeneathError::AlreadyExists)
+            );
+
+            let mut f =
+                open_leaf_beneath(&root, "a", SinkOpenMode::CreateOrAppend).expect("append");
+            f.write_all(b"de").expect("write");
+            drop(f);
+            assert_eq!(std::fs::read(t.0.join("a")).expect("a"), b"abcde");
+
+            let f = open_leaf_beneath(&root, "a", SinkOpenMode::CreateOrTruncate).expect("trunc");
+            drop(f);
+            assert_eq!(std::fs::read(t.0.join("a")).expect("a"), b"");
+
+            assert!(open_leaf_beneath(&root, "a", SinkOpenMode::Existing).is_ok());
+            assert_eq!(
+                open_leaf_beneath(&root, "missing", SinkOpenMode::Existing).err(),
+                Some(BeneathError::Io(io::ErrorKind::NotFound))
+            );
+            assert!(!t.0.join("missing").exists());
+
+            std::os::unix::fs::symlink(outside.0.join("victim"), t.0.join("l")).expect("symlink");
+            for mode in [
+                SinkOpenMode::CreateOrTruncate,
+                SinkOpenMode::Existing,
+                SinkOpenMode::CreateOrAppend,
+            ] {
+                assert!(
+                    matches!(
+                        open_leaf_beneath(&root, "l", mode),
+                        Err(BeneathError::Io(_))
+                    ),
+                    "{mode:?}"
+                );
+            }
+            assert_eq!(
+                open_leaf_beneath(&root, "l", SinkOpenMode::CreateNew).err(),
+                Some(BeneathError::AlreadyExists)
+            );
+            assert!(!outside.0.join("victim").exists());
+        }
+
+        /// IO-2・TASK-15.3・REPAIR-5: 末端が読み手のいない FIFO 相当（UDS のソケット
+        /// ファイル）でも `open_leaf_beneath` は待たずに失敗し、`open_dir_path` は
+        /// ディレクトリ以外を開かない。
+        #[test]
+        fn io2_open_leaf_beneath_does_not_block_on_special_files() {
+            use crate::writeback::SinkOpenMode;
+            let t = TmpDir::new("leaf-special");
+            let _listener =
+                std::os::unix::net::UnixListener::bind(t.0.join("sock")).expect("bind socket");
+            std::fs::write(t.0.join("file"), b"x").expect("file");
+            let root = open_dir_path(&t.0).expect("open dir");
+            assert!(open_leaf_beneath(&root, "sock", SinkOpenMode::Existing).is_err());
+            assert!(matches!(
+                open_dir_path(&t.0.join("file")),
+                Err(BeneathError::Io(_))
+            ));
+            assert!(matches!(
+                open_dir_path(&t.0.join("missing")),
+                Err(BeneathError::Io(io::ErrorKind::NotFound))
+            ));
         }
 
         /// IO-5・TASK-19.2: 実行中のアーキテクチャで `O_DIRECTORY`・`O_NOFOLLOW` が

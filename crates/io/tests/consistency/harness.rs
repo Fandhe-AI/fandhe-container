@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use fandhe_container_io::{
     AppendFileSink, Batch, BatchSink, Frame, FrameReceiver, FrameSender, IoError, IoErrorCode,
-    IoTimeout, SinkPersistReport, SinkWriteReport,
+    IoTimeout, SinkOpenMode, SinkPersistReport, SinkWriteReport,
 };
 
 /// 相手の応答を待つ処理の既定タイムアウト（REPAIR-5。既存の結合試験
@@ -336,6 +336,21 @@ where
     })
 }
 
+/// `path`（親ディレクトリ＋ファイル名）を `mode` で開いた [`AppendFileSink`] を返す。
+/// 親ディレクトリのハンドル相対で開き、そのハンドルを sink の親として持たせる
+/// （[`AppendFileSink::open_in`]。macOS / Windows でも FlushAck の前提となる
+/// 親ディレクトリの同期ができる。IO-2・TASK-15.3）。
+pub fn open_sink(path: &std::path::Path, mode: SinkOpenMode) -> Result<AppendFileSink, IoError> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| IoError::new(IoErrorCode::InvalidArgument, "path has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| IoError::new(IoErrorCode::InvalidArgument, "path has no UTF-8 file name"))?;
+    AppendFileSink::open_in(dir, name, mode)
+}
+
 /// プロセス内で 1 回だけ、テスト出力先のファイルシステムに対して `persist`
 /// （Linux では `syncfs(2)`）を先行実行する（TASK-15.2.2・#824）。
 ///
@@ -347,14 +362,9 @@ where
 fn warm_up_persist(dir: &std::path::Path) {
     static WARM_UP: std::sync::Once = std::sync::Once::new();
     WARM_UP.call_once(|| {
-        let Ok(file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("warm-up.bin"))
-        else {
-            return;
-        };
-        if let Ok(mut sink) = AppendFileSink::new_at(file, &dir.join("warm-up.bin")) {
+        if let Ok(mut sink) =
+            AppendFileSink::open_in(dir, "warm-up.bin", SinkOpenMode::CreateOrAppend)
+        {
             let _ = sink.persist();
         }
     });

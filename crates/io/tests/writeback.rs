@@ -24,7 +24,7 @@ mod unix {
 
     use fandhe_container_io::{
         AppendFileSink, BatchConfig, Frame, FrameHeader, FrameKind, IoTimeout, NoopServerObserver,
-        ReceiveLimits, UdsServer, WritebackTimeouts, serve_connection,
+        ReceiveLimits, SinkOpenMode, UdsServer, WritebackTimeouts, serve_connection,
     };
 
     /// テストごとに固有かつ短いソケットディレクトリを作る（`tests/server.rs`
@@ -52,6 +52,14 @@ mod unix {
 
         fn output_path(&self) -> PathBuf {
             self.path.join("out.bin")
+        }
+
+        /// [`Self::output_path`] を作り直して（既存なら切り詰めて）開いた sink。
+        /// ディレクトリハンドル相対で開き、そのハンドルを親として持つため、
+        /// macOS でも FlushAck の前提（親ディレクトリの同期）を満たす（IO-2・TASK-15.3）。
+        fn output_sink(&self) -> AppendFileSink {
+            AppendFileSink::open_in(&self.path, "out.bin", SinkOpenMode::CreateOrTruncate)
+                .expect("seek to end must succeed")
         }
     }
 
@@ -186,14 +194,7 @@ mod unix {
             .accept(test_timeout(), NoopServerObserver)
             .expect("server must accept the client connection within the timeout");
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&output_path)
-            .expect("must open output file");
-        let mut sink =
-            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
+        let mut sink = dir.output_sink();
 
         // serve_connection はエラーで終わるまでブロックするため、別スレッドで
         // 動かし、64 件ぶんの ACK を読み終えたクライアントスレッドと合流する
@@ -278,14 +279,7 @@ mod unix {
             .accept(test_timeout(), NoopServerObserver)
             .expect("server must accept the client connection within the timeout");
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&output_path)
-            .expect("must open output file");
-        let mut sink =
-            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
+        let mut sink = dir.output_sink();
 
         let config = BatchConfig::new(8).expect("8 must be a valid batch size");
         let server_thread = std::thread::spawn(move || {
@@ -372,14 +366,7 @@ mod unix {
             .accept(test_timeout(), NoopServerObserver)
             .expect("server must accept the client connection within the timeout");
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&output_path)
-            .expect("must open output file");
-        let mut sink =
-            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
+        let mut sink = dir.output_sink();
 
         let config = BatchConfig::new(BATCH_SIZE as usize).expect("4 must be a valid batch size");
         let server_thread = std::thread::spawn(move || {
@@ -470,14 +457,7 @@ mod unix {
         let mut connection = server
             .accept(test_timeout(), NoopServerObserver)
             .expect("server must accept the client connection within the timeout");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&output_path)
-            .expect("must open output file");
-        let mut sink =
-            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
+        let mut sink = dir.output_sink();
 
         let report = serve_connection(
             &mut connection,
@@ -564,7 +544,6 @@ mod unix {
     fn io2_uds_writeback_persist_failure_closes_without_flush_ack() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let output_path = dir.output_path();
 
         let mut server =
             UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
@@ -581,14 +560,8 @@ mod unix {
         let mut connection = server
             .accept(test_timeout(), NoopServerObserver)
             .expect("server must accept the client connection within the timeout");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&output_path)
-            .expect("must open output file");
         let mut sink = FailingPersistSink {
-            inner: AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed"),
+            inner: dir.output_sink(),
         };
 
         let report = serve_connection(
@@ -648,14 +621,7 @@ mod unix {
             .accept(test_timeout(), NoopServerObserver)
             .expect("server must accept the client connection within the timeout");
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&output_path)
-            .expect("must open output file");
-        let mut sink =
-            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
+        let mut sink = dir.output_sink();
 
         let report = serve_connection(
             &mut connection,
@@ -704,7 +670,6 @@ mod unix {
     fn io1_uds_writeback_malformed_write_closes_without_ack() {
         let dir = TempSocketDir::new();
         let socket_path = dir.socket_path();
-        let output_path = dir.output_path();
 
         let mut server =
             UdsServer::bind(&socket_path, ReceiveLimits::default(), NoopServerObserver)
@@ -739,14 +704,7 @@ mod unix {
             .accept(test_timeout(), NoopServerObserver)
             .expect("server must accept the client connection within the timeout");
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&output_path)
-            .expect("must open output file");
-        let mut sink =
-            AppendFileSink::new_at(file, &output_path).expect("seek to end must succeed");
+        let mut sink = dir.output_sink();
 
         let report = serve_connection(
             &mut connection,

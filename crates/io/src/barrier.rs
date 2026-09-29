@@ -37,9 +37,11 @@
 //!
 //! - macOS / Windows の代替フラッシュ（TASK-15.3・#88）は sink が持つファイル自体
 //!   （データ＋ファイルメタデータ）を `File::sync_all` で永続化したうえで、sink が
-//!   呼び出し側から受け取った親ディレクトリ（[`crate::writeback::AppendFileSink::with_parent_dirs`]）
-//!   も同期し、新規作成ファイルのディレクトリエントリを永続化する
-//!   （[`PersistSupport::SupportedFileSync`]）。親ディレクトリが未指定の sink は
+//!   ファイルを開いた・作ったときのディレクトリハンドル
+//!   （[`crate::writeback::AppendFileSink::open_in`]・[`crate::GuestFileCreator::create_file`]
+//!   だけが設定する。任意のパスは受け付けない）も同期し、ファイルのディレクトリ
+//!   エントリを永続化する（[`PersistSupport::SupportedFileSync`]）。親ディレクトリの
+//!   ハンドルを持たない sink（[`crate::writeback::AppendFileSink::new`]）は
 //!   エントリの永続化を保証できないため `Unimplemented` で拒否し FlushAck を返さない
 //!   （fail-closed。IO-2・IO-3）。macOS は `F_FULLFSYNC` を使うため、それを
 //!   拒否する FS（一部のネットワーク FS 等）では `fsync` へフォールバックせず
@@ -593,10 +595,12 @@ pub enum PersistSupport {
     /// （macOS は `F_FULLFSYNC`、Windows は `FlushFileBuffers`）で永続化して
     /// から FlushAck を返す。
     ///
-    /// 保証範囲は sink のファイル自体（データ＋ファイルメタデータ）と、sink に
-    /// 指定された親ディレクトリのエントリ。親ディレクトリ未指定の sink は
-    /// 拒否する（新規作成ファイルの名前が電源断で失われうるため）。
-    /// `F_FULLFSYNC` 非対応の FS では失敗し FlushAck を返さない。
+    /// 保証範囲は sink のファイル自体（データ＋ファイルメタデータ）と、sink が
+    /// ファイルを開いた・作ったディレクトリのエントリ（新設した祖先を含む）。
+    /// 親ディレクトリのハンドルを持たない sink は拒否する（新規作成ファイルの名前が
+    /// 電源断で失われうるため）。`F_FULLFSYNC` 非対応の FS（一部のネットワーク FS 等）
+    /// では `fsync` へフォールバックせず失敗し、FlushAck を返さない（`fsync` は
+    /// ドライブのキャッシュを書き出さず IO-2 の保証を満たさないため）。
     SupportedFileSync,
 }
 
@@ -790,7 +794,8 @@ fn sync_file_system(
 
 /// ディレクトリのハンドルを `sync_all` し、そのエントリ（新規作成ファイルの
 /// 名前等）を永続化する（TASK-15.3・#88）。macOS は `F_FULLFSYNC`、Windows は
-/// `FlushFileBuffers`（[`open_dir_handle`] が書き込みハンドルで開く）。
+/// `FlushFileBuffers`（書き込みアクセスが必要。sink へハンドルを渡す
+/// `AppendFileSink::open_in`・`GuestFileCreator` が書き込み可能なハンドルで開く）。
 /// エラーには `ErrorKind` のみを含め、パスは含めない。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn sync_dir(handle: &File) -> Result<(), IoError> {
@@ -798,34 +803,6 @@ fn sync_dir(handle: &File) -> Result<(), IoError> {
         IoError::new(
             IoErrorCode::Internal,
             format!("directory sync failed ({:?})", err.kind()),
-        )
-    })
-}
-
-/// 親ディレクトリのハンドルを開く（TASK-15.3・#88。IO-2・IO-3）。
-/// `AppendFileSink::with_parent_dirs` が設定時に 1 回だけ呼び、以後の Flush は
-/// このハンドルを同期する。Flush 時にパスを開き直すと、作成後に親ディレクトリが
-/// rename・置換された場合に別ディレクトリを同期して成功扱いになるため。
-/// Windows は `FILE_FLAG_BACKUP_SEMANTICS` 付きの書き込みハンドル
-/// （`FlushFileBuffers` に必要）、それ以外は読み取りハンドルで開く。
-/// エラーには `ErrorKind` のみを含め、パスは含めない。
-pub(crate) fn open_dir_handle(dir: &std::path::Path) -> Result<File, IoError> {
-    let mut options = std::fs::OpenOptions::new();
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // FILE_FLAG_BACKUP_SEMANTICS（ディレクトリを開くのに必須）。
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        options.read(true);
-    }
-    options.open(dir).map_err(|err| {
-        IoError::new(
-            IoErrorCode::Internal,
-            format!("failed to open directory for sync ({:?})", err.kind()),
         )
     })
 }

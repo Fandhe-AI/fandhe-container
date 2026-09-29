@@ -501,7 +501,7 @@ impl ScanCursor {
         )
     }
 
-    fn descend(&self, name: &str) -> Result<Option<Self>, IoError> {
+    fn descend(self, name: &str) -> Result<Option<Self>, IoError> {
         use crate::sys::{BeneathError, open_dir_beneath};
         match open_dir_beneath(&self.0, name) {
             Ok(dir) => Ok(Some(Self(dir))),
@@ -517,14 +517,24 @@ impl ScanCursor {
 }
 
 /// Windows 等のフォールバック（パス走査）。ルートは `open_root_handle` の
-/// 共有拒否で改名・削除されないため、ルート配下のパス解決は範囲内に留まる。
+/// 共有拒否で改名・削除されない。降りる祖先は作成側と同じ判定・同じ方式
+/// （[`open_pinned_dir`]。reparse point を辿らず、通常ディレクトリだけを
+/// `FILE_SHARE_DELETE` なしで開いて保持）で固定するため、走査のパス解決も固定済みの
+/// 祖先の配下に留まり、リンク先のエントリを読まない。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-struct ScanCursor(PathBuf);
+struct ScanCursor {
+    path: PathBuf,
+    /// 降りた祖先の保持ハンドル（走査が終わるまで改名・削除・差し替えを拒否させる）。
+    pinned: Vec<File>,
+}
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl ScanCursor {
     fn root(_root_dir: &File, root: &Path) -> Result<Self, IoError> {
-        Ok(Self(root.to_path_buf()))
+        Ok(Self {
+            path: root.to_path_buf(),
+            pinned: Vec::new(),
+        })
     }
 
     fn read_entries(&self, max_entries: usize) -> Result<Vec<std::ffi::OsString>, IoError> {
@@ -533,7 +543,7 @@ impl ScanCursor {
             return Err(internal("failed to scan guest directory", ErrorKind::Other));
         }
         let mut names = Vec::new();
-        let dir = std::fs::read_dir(&self.0)
+        let dir = std::fs::read_dir(&self.path)
             .map_err(|err| internal("failed to scan guest directory", err.kind()))?;
         for entry in dir {
             let entry =
@@ -546,15 +556,45 @@ impl ScanCursor {
         Ok(names)
     }
 
-    fn descend(&self, name: &str) -> Result<Option<Self>, IoError> {
-        let next = self.0.join(name);
-        match std::fs::symlink_metadata(&next) {
-            Ok(meta) if meta.is_dir() => Ok(Some(Self(next))),
+    fn descend(mut self, name: &str) -> Result<Option<Self>, IoError> {
+        let next = self.path.join(name);
+        match open_pinned_dir(&next) {
+            Ok(Some(dir)) => {
+                self.pinned.push(dir);
+                self.path = next;
+                Ok(Some(self))
+            }
+            // reparse point・非ディレクトリより下は読まない（作成側も拒否する）。
+            Ok(None) => Ok(None),
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
             Err(err) => Err(internal("failed to inspect guest directory", err.kind())),
-            Ok(_) => Ok(None),
         }
     }
+}
+
+/// Windows: `path` を reparse point を辿らず（`FILE_FLAG_OPEN_REPARSE_POINT`）・
+/// `FILE_SHARE_DELETE` なしで開き、通常ディレクトリ（reparse point でない）なら保持用の
+/// ハンドルを返す（そうでなければ `None`）。保持中は OS が改名・削除・差し替えを拒否
+/// する。走査（`ScanCursor::descend`）と作成（[`create_beneath`]）で同じ判定を使う。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_pinned_dir(path: &Path) -> std::io::Result<Option<File>> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+    const FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE（FILE_SHARE_DELETE なし）
+    const SHARE: u32 = 0x1 | 0x2;
+    // FILE_ATTRIBUTE_REPARSE_POINT
+    const REPARSE: u32 = 0x400;
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(FLAGS)
+        .share_mode(SHARE)
+        .open(path)?;
+    let meta = dir.metadata()?;
+    if !meta.is_dir() || meta.file_attributes() & REPARSE != 0 {
+        return Ok(None);
+    }
+    Ok(Some(dir))
 }
 
 /// [`create_beneath`] の失敗種別。
@@ -708,11 +748,15 @@ fn create_beneath(
                 }
                 std::ops::ControlFlow::Continue(())
             });
-            match scanned {
-                Err(err) => Err(CreateError::Other(err)),
-                Ok(()) if exact => Err(CreateError::Exists),
-                Ok(()) => Err(variant.map_or(CreateError::Exists, CreateError::ExistsAs)),
-            }
+            let outcome = match scanned {
+                Err(err) => CreateError::Other(err),
+                Ok(()) if exact => CreateError::Exists,
+                Ok(()) => variant.map_or(CreateError::Exists, CreateError::ExistsAs),
+            };
+            // 作成は失敗したので、本呼び出しが新設した祖先を同一性を確かめて取り除く
+            // （葉を他者が作っていれば親は空でないため残る）。
+            let _ = rollback_dirs(&dirs, &made, ancestors);
+            Err(outcome)
         }
         Err(err) => {
             let _ = rollback_dirs(&dirs, &made, ancestors);
@@ -965,6 +1009,20 @@ fn quarantine_name() -> String {
     format!(".fandhe-rollback-{}-{n}-{nanos}", std::process::id())
 }
 
+/// 取り消しで他者の実体を残した場所の報告文字列。私有ディレクトリ名（本モジュールが
+/// 生成した短い安全な名前で、共有ルート内で一意）は切り詰めずに先頭へ置き、親の
+/// ゲスト相対パスだけを [`quote_for_message`] で衛生化・切り詰める（深い親でも
+/// 退避先を特定できるようにする。Cursor 指摘）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quarantine_location(parent_path: &str, quarantine: &str) -> String {
+    let entry = format!("\"{quarantine}/{QUARANTINE_ENTRY}\"");
+    if parent_path.is_empty() {
+        entry
+    } else {
+        format!("{entry} under {}", quote_for_message(parent_path))
+    }
+}
+
 /// 私有ディレクトリ内で退避した葉を置く名前。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const QUARANTINE_ENTRY: &str = "entry";
@@ -1032,7 +1090,7 @@ fn remove_file_if_same(
         return Err(failed("no free quarantine name".to_string()));
     };
     // 報告用の退避先（共有ルートからのゲスト相対パス。衛生化して埋め込む）。
-    let left_at = quote_for_message(&format!("{parent_path}{quarantine}/{QUARANTINE_ENTRY}"));
+    let left_at = quarantine_location(parent_path, &quarantine);
     let qdir = open_dir_beneath(parent, &quarantine)
         .map_err(|_| failed(format!("cannot open quarantine directory {quarantine:?}")))?;
     let qmeta = qdir
@@ -1134,14 +1192,6 @@ fn create_beneath(
     ancestors: &[&str],
     leaf: &str,
 ) -> Result<Created, CreateError> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
-    const FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
-    // FILE_SHARE_READ | FILE_SHARE_WRITE（FILE_SHARE_DELETE なし）
-    const SHARE: u32 = 0x1 | 0x2;
-    // FILE_ATTRIBUTE_REPARSE_POINT
-    const REPARSE: u32 = 0x400;
-
     let mut path = root.to_path_buf();
     // 固定済みの祖先ハンドル（葉の作成が終わるまで保持する）。
     let mut pinned: Vec<File> = Vec::with_capacity(ancestors.len());
@@ -1157,22 +1207,9 @@ fn create_beneath(
                 )));
             }
         }
-        let dir = OpenOptions::new()
-            .read(true)
-            .custom_flags(FLAGS)
-            .share_mode(SHARE)
-            .open(&path)
-            .map_err(|err| {
-                CreateError::Other(internal("failed to create guest file", err.kind()))
-            })?;
-        let meta = dir.metadata().map_err(|err| {
-            CreateError::Other(internal("failed to create guest file", err.kind()))
-        })?;
-        if !meta.is_dir() || meta.file_attributes() & REPARSE != 0 {
-            return Err(CreateError::Other(invalid(
-                "guest path ancestor is not a directory",
-            )));
-        }
+        let dir = open_pinned_dir(&path)
+            .map_err(|err| CreateError::Other(internal("failed to create guest file", err.kind())))?
+            .ok_or_else(|| CreateError::Other(invalid("guest path ancestor is not a directory")))?;
         pinned.push(dir);
     }
     let result = OpenOptions::new()

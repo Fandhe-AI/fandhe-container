@@ -26,10 +26,12 @@
 //! # 未実装範囲（REPAIR-3）
 //!
 //! 本モジュールが表すのはクライアント側のプロトコル契約（型の区別）のみ。
-//! サーバー側で FLUSH バリア以前の書き込みを実際に永続化（`syncfs` 等）して
-//! から [`FrameKind::FlushAck`] を送出する処理はまだない
-//! （`crates/io/src/writeback.rs` は `Flush` 受信時に `Unimplemented` で終える。
-//! TASK-15.2・#823・#824 の範囲。`docs/design/io-protocol.md` の「FLUSH フレーム
+//! サーバー側で FLUSH バリア以前の書き込みを実際に永続化してから
+//! [`FrameKind::FlushAck`] を送出する処理はまだない。永続化に使う
+//! `crate::sys::syncfs`（Linux 用の `syncfs(2)` FFI ラッパー）は
+//! TASK-15.2.1・#823 で実装済みだが、`crates/io/src/writeback.rs` の `Flush`
+//! 受信ハンドラからの呼び出し・FlushAck の送出への組み込みはまだ行っていない
+//! （TASK-15.2.2・#824 の範囲。`docs/design/io-protocol.md` の「FLUSH フレーム
 //! の扱い」参照）。
 
 use crate::client::{InFlightRequest, RequestId};

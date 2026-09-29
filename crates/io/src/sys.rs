@@ -47,7 +47,7 @@
 //! - `unsafe fn` はこのモジュールの外へ公開しない。公開するのは安全な関数
 //!   （[`peer_uid`]・[`effective_uid`]・[`syncfs`]・[`mkdir_beneath`]・
 //!   [`open_dir_beneath`]・[`create_leaf_beneath`]・[`unlink_beneath`]・
-//!   [`rename_beneath`]・[`read_dir_entries`]）のみで、`unsafe` はこのモジュール内に閉じる
+//!   [`rename_beneath`]・[`for_each_dir_entry`]・[`read_dir_entries`]）のみで、`unsafe` はこのモジュール内に閉じる
 //! - すべての `unsafe` ブロック・`unsafe extern "C"` 宣言に `// SAFETY:` で
 //!   理由と維持すべき不変条件を明記する
 //! - `fd` は呼び出し元が `&UnixStream`（または [`syncfs`] の場合 `AsFd`）を
@@ -421,6 +421,16 @@ pub(crate) enum UnlinkTarget {
     EmptyDirectory,
 }
 
+/// [`mkdir_beneath`] で作るディレクトリの mode（umask 適用前）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirMode {
+    /// 共有ルート配下の通常の祖先（`0o777`）。
+    Shared,
+    /// 所有者だけが読み書き・探索できる作業用ディレクトリ（`0o700`。
+    /// `crate::guest_files` の取り消しの退避先）。
+    Private,
+}
+
 /// [`read_dir_entries`] の失敗種別。
 #[cfg_attr(
     not(any(
@@ -517,8 +527,8 @@ mod beneath_consts {
 }
 
 pub(crate) use beneath::{
-    create_leaf_beneath, mkdir_beneath, open_dir_beneath, read_dir_entries, rename_beneath,
-    unlink_beneath,
+    create_leaf_beneath, for_each_dir_entry, mkdir_beneath, open_dir_beneath, read_dir_entries,
+    rename_beneath, unlink_beneath,
 };
 
 /// 対応アーキテクチャ（macOS・Linux の x86_64 / aarch64）向けの実装。
@@ -531,12 +541,13 @@ pub(crate) use beneath::{
 ))]
 mod beneath {
     use super::beneath_consts as c;
-    use super::{BeneathError, DirEntryName, ReadDirError, UnlinkTarget};
-    use std::ffi::{CStr, CString, OsString};
+    use super::{BeneathError, DirEntryName, DirMode, ReadDirError, UnlinkTarget};
+    use std::ffi::{CStr, CString, OsStr};
     use std::fs::File;
     use std::io;
+    use std::ops::ControlFlow;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::ffi::OsStrExt;
 
     mod raw {
         use core::ffi::{c_char, c_void};
@@ -622,16 +633,24 @@ mod beneath {
         Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
-    /// `dir` 直下にディレクトリ `name` を作る（`mkdirat`・mode 0o777 は umask
-    /// 適用前）。作ったら `Ok(true)`、既に何か（symlink を含む）があれば
+    /// `dir` 直下にディレクトリ `name` を `mode`（umask 適用前）で作る
+    /// （`mkdirat`）。作ったら `Ok(true)`、既に何か（symlink を含む）があれば
     /// `Ok(false)`（その実体が辿れるディレクトリかは [`open_dir_beneath`] が
     /// `O_NOFOLLOW` で確かめる）。
-    pub(crate) fn mkdir_beneath(dir: &File, name: &str) -> Result<bool, BeneathError> {
+    pub(crate) fn mkdir_beneath(
+        dir: &File,
+        name: &str,
+        mode: DirMode,
+    ) -> Result<bool, BeneathError> {
         let cname = cstr(name)?;
+        let mode: c::ModeT = match mode {
+            DirMode::Shared => 0o777,
+            DirMode::Private => 0o700,
+        };
         // SAFETY: `dir` は呼び出し元が借用中の有効なディレクトリ fd で、呼び出しの
         // 間閉じられない。`cname` は NUL 終端の有効な C 文字列で呼び出しの間生きて
         // いる。mkdirat は fd を返さず、失敗時は errno を直後に拾う。
-        let rc = unsafe { raw::mkdirat(dir.as_raw_fd(), cname.as_ptr(), 0o777) };
+        let rc = unsafe { raw::mkdirat(dir.as_raw_fd(), cname.as_ptr(), mode) };
         if rc == 0 {
             return Ok(true);
         }
@@ -716,18 +735,29 @@ mod beneath {
         }
     }
 
-    /// `dir` 直下のエントリ `from` を同じ `dir` 直下の `to` へ改名する
-    /// （`renameat`。symlink は辿らない）。`to` が既にあれば置き換える POSIX の
-    /// 意味論のため、呼び出し元は `to` に他者が使わない名前を渡す
-    /// （`crate::guest_files` の取り消し用の退避名）。
-    pub(crate) fn rename_beneath(dir: &File, from: &str, to: &str) -> Result<(), BeneathError> {
+    /// `from_dir` 直下のエントリ `from` を `to_dir` 直下の `to` へ改名する
+    /// （`renameat`。symlink は辿らず、名前の付け替えは原子的）。`to` が既にあれば
+    /// 置き換える POSIX の意味論のため、呼び出し元は `to` に他者が触れない場所を渡す
+    /// （`crate::guest_files` の取り消し用の私有ディレクトリ）。
+    pub(crate) fn rename_beneath(
+        from_dir: &File,
+        from: &str,
+        to_dir: &File,
+        to: &str,
+    ) -> Result<(), BeneathError> {
         let cfrom = cstr(from)?;
         let cto = cstr(to)?;
-        let fd = dir.as_raw_fd();
-        // SAFETY: `dir` は呼び出し元が借用中の有効なディレクトリ fd（旧・新の
-        // 両方に同じ fd を渡す）。`cfrom`・`cto` は NUL 終端の有効な C 文字列で
+        // SAFETY: `from_dir`・`to_dir` は呼び出し元が借用中の有効なディレクトリ fd で、
+        // 呼び出しの間閉じられない。`cfrom`・`cto` は NUL 終端の有効な C 文字列で
         // 呼び出しの間生きている。renameat は fd を返さず、失敗時は errno を直後に拾う。
-        let rc = unsafe { raw::renameat(fd, cfrom.as_ptr(), fd, cto.as_ptr()) };
+        let rc = unsafe {
+            raw::renameat(
+                from_dir.as_raw_fd(),
+                cfrom.as_ptr(),
+                to_dir.as_raw_fd(),
+                cto.as_ptr(),
+            )
+        };
         if rc == 0 {
             Ok(())
         } else {
@@ -750,14 +780,18 @@ mod beneath {
     }
 
     /// `dir` 直下のエントリ（`.`・`..` を除く）を、パスを再解決せずに
-    /// `fdopendir`/`readdir` で列挙する。`dir` は dup して使い（元の fd は
-    /// 閉じない）、dup 先は元の fd と読み取り位置を共有するため `rewinddir` で
-    /// 先頭へ戻す（`rewinddir` 以前から存在し削除されていないエントリはすべて
-    /// 返る。POSIX readdir）。件数が `max_entries` を超えたら `TooMany`。
-    pub(crate) fn read_dir_entries(
+    /// `fdopendir`/`readdir` で 1 件ずつ `visit`（名前と `d_ino`）へ渡す。名前は
+    /// 次の `readdir` までしか有効でない借用のため、`visit` の外へは持ち出せない
+    /// （複製が必要なら `visit` 内でコピーする）。`visit` が `Break` を返したら
+    /// 打ち切る。一覧を確保しないため、エントリ数に比例したメモリを使わない。
+    ///
+    /// `dir` は dup して使い（元の fd は閉じない）、dup 先は元の fd と読み取り
+    /// 位置を共有するため `rewinddir` で先頭へ戻す（`rewinddir` 以前から存在し
+    /// 削除されていないエントリはすべて返る。POSIX readdir）。
+    pub(crate) fn for_each_dir_entry(
         dir: &File,
-        max_entries: usize,
-    ) -> Result<Vec<DirEntryName>, ReadDirError> {
+        mut visit: impl FnMut(&OsStr, u64) -> ControlFlow<()>,
+    ) -> Result<(), ReadDirError> {
         let raw_fd = dir
             .try_clone()
             .map_err(|err| ReadDirError::Io(err.kind()))?
@@ -775,11 +809,10 @@ mod beneath {
         // SAFETY: `handle` は fdopendir が返した有効な DIR*。読み取り位置を先頭へ戻す。
         unsafe { raw::rewinddir(handle) };
 
-        let mut entries = Vec::new();
         let result = loop {
             set_errno_zero();
             // SAFETY: `handle` は closedir 前の有効な DIR*。返る dirent は次の
-            // readdir / closedir まで有効で、その前に必要な値をコピーする。
+            // readdir / closedir まで有効で、`visit` へ渡す借用もその間に限る。
             let entry = unsafe { raw::readdir(handle) };
             if entry.is_null() {
                 let err = io::Error::last_os_error();
@@ -795,9 +828,6 @@ mod beneath {
             if name == b"." || name == b".." {
                 continue;
             }
-            if entries.len() >= max_entries {
-                break Err(ReadDirError::TooMany);
-            }
             // SAFETY: `d_ino` は `DIRENT_INO_OFFSET` にある u64 で、dirent の範囲内。
             // 整列を仮定しないよう read_unaligned で読む。
             let ino = unsafe {
@@ -806,14 +836,39 @@ mod beneath {
                     .cast::<u64>()
                     .read_unaligned()
             };
-            entries.push(DirEntryName {
-                name: OsString::from_vec(name.to_vec()),
-                ino,
-            });
+            if visit(OsStr::from_bytes(name), ino).is_break() {
+                break Ok(());
+            }
         };
         // SAFETY: `handle` は有効な DIR* で以降使わない。dup した fd もここで閉じられる。
         unsafe { raw::closedir(handle) };
-        result.map(|()| entries)
+        result
+    }
+
+    /// `dir` 直下のエントリ（`.`・`..` を除く）を集めて返す（[`for_each_dir_entry`]）。
+    /// 件数が `max_entries` を超えたら `TooMany`（無制限確保の防止）。
+    pub(crate) fn read_dir_entries(
+        dir: &File,
+        max_entries: usize,
+    ) -> Result<Vec<DirEntryName>, ReadDirError> {
+        let mut entries = Vec::new();
+        let mut too_many = false;
+        for_each_dir_entry(dir, |name, ino| {
+            if entries.len() >= max_entries {
+                too_many = true;
+                return ControlFlow::Break(());
+            }
+            entries.push(DirEntryName {
+                name: name.to_os_string(),
+                ino,
+            });
+            ControlFlow::Continue(())
+        })?;
+        if too_many {
+            Err(ReadDirError::TooMany)
+        } else {
+            Ok(entries)
+        }
     }
 }
 
@@ -827,11 +882,17 @@ mod beneath {
     )
 )))]
 mod beneath {
-    use super::{BeneathError, DirEntryName, ReadDirError, UnlinkTarget};
+    use super::{BeneathError, DirEntryName, DirMode, ReadDirError, UnlinkTarget};
+    use std::ffi::OsStr;
     use std::fs::File;
     use std::io;
+    use std::ops::ControlFlow;
 
-    pub(crate) fn mkdir_beneath(_dir: &File, _name: &str) -> Result<bool, BeneathError> {
+    pub(crate) fn mkdir_beneath(
+        _dir: &File,
+        _name: &str,
+        _mode: DirMode,
+    ) -> Result<bool, BeneathError> {
         Err(BeneathError::Io(io::ErrorKind::Unsupported))
     }
 
@@ -851,8 +912,20 @@ mod beneath {
         Err(BeneathError::Io(io::ErrorKind::Unsupported))
     }
 
-    pub(crate) fn rename_beneath(_dir: &File, _from: &str, _to: &str) -> Result<(), BeneathError> {
+    pub(crate) fn rename_beneath(
+        _from_dir: &File,
+        _from: &str,
+        _to_dir: &File,
+        _to: &str,
+    ) -> Result<(), BeneathError> {
         Err(BeneathError::Io(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn for_each_dir_entry(
+        _dir: &File,
+        _visit: impl FnMut(&OsStr, u64) -> ControlFlow<()>,
+    ) -> Result<(), ReadDirError> {
+        Err(ReadDirError::Io(io::ErrorKind::Unsupported))
     }
 
     pub(crate) fn read_dir_entries(
@@ -1113,8 +1186,8 @@ mod tests {
             let t = TmpDir::new("mk");
             let outside = TmpDir::new("mk-out");
             let root = t.open();
-            assert_eq!(mkdir_beneath(&root, "d"), Ok(true));
-            assert_eq!(mkdir_beneath(&root, "d"), Ok(false));
+            assert_eq!(mkdir_beneath(&root, "d", DirMode::Shared), Ok(true));
+            assert_eq!(mkdir_beneath(&root, "d", DirMode::Shared), Ok(false));
             let dir = open_dir_beneath(&root, "d").expect("open d");
             create_leaf_beneath(&dir, "f").expect("create f");
             assert!(t.0.join("d").join("f").is_file());
@@ -1166,10 +1239,10 @@ mod tests {
             std::fs::write(t.0.join("a"), b"payload").expect("a");
             std::os::unix::fs::symlink(outside.0.join("victim"), t.0.join("l")).expect("symlink");
             let root = t.open();
-            assert_eq!(rename_beneath(&root, "a", "b"), Ok(()));
+            assert_eq!(rename_beneath(&root, "a", &root, "b"), Ok(()));
             assert!(!t.0.join("a").exists());
             assert_eq!(std::fs::read(t.0.join("b")).expect("b"), b"payload");
-            assert_eq!(rename_beneath(&root, "l", "m"), Ok(()));
+            assert_eq!(rename_beneath(&root, "l", &root, "m"), Ok(()));
             assert!(
                 std::fs::symlink_metadata(t.0.join("m"))
                     .expect("m")
@@ -1178,7 +1251,7 @@ mod tests {
             );
             assert!(!outside.0.join("victim").exists());
             assert_eq!(
-                rename_beneath(&root, "missing", "x"),
+                rename_beneath(&root, "missing", &root, "x"),
                 Err(BeneathError::Io(io::ErrorKind::NotFound))
             );
         }

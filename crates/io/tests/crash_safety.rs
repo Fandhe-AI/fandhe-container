@@ -9,6 +9,9 @@
 //! #95（TASK-18.2）で、kill 後に `data.bin` を読んで seq 0..n と照合する損失計測と、
 //! 2 つの対照ケースを追加した。
 //! - フラッシュ済み（`io3_flushed_data_survives_10_valid_sigkills`）: 有効 10/10 で損失 0 を検証する。
+//!   保証範囲は「プロセス強制終了（SIGKILL）後に、FLUSH ACK 済みデータが OS 経由の再読込で
+//!   欠落・重複なく見えること」に限る。再読込はページキャッシュ経由のため、電源断・カーネル
+//!   クラッシュ後の媒体上の永続化（IO-2 の fsync 等価の保証）はこの試験では検証しない。
 //! - 未フラッシュ対照（`io3_unflushed_control_records_loss_without_asserting`）: 損失件数は
 //!   記録するだけで、件数ではテストを失敗させない。
 //!
@@ -434,6 +437,20 @@ mod unix {
         }
     }
 
+    /// 永続化（FLUSH）非対応環境で許容する無効理由。通常 ACK は全件届いた前提で、
+    /// FLUSH ACK 待ちの失敗（未観測・接続断・タイムアウト）またはその失敗に伴う
+    /// サーバー終了に限る。内部エラー等それ以外のクライアント失敗は許容しない。
+    fn is_persist_unsupported_reason(verdict: &TrialVerdict) -> bool {
+        matches!(
+            verdict,
+            TrialVerdict::Invalid(
+                InvalidReason::FlushAckMissing
+                    | InvalidReason::ServerExitedEarly(_)
+                    | InvalidReason::ClientFailed(IoErrorCode::Unavailable | IoErrorCode::Timeout)
+            )
+        )
+    }
+
     /// 構造化ログ用のディスク照合フィールド（件数のみ。データ本体・パスは出さない）。
     fn disk_log_fields(disk: &Option<DiskObservation>) -> String {
         match disk {
@@ -525,14 +542,7 @@ mod unix {
             // ServerExitedEarly になるため、これも同経路として許容する（回収の可否で結果が揺れない）。
             assert_eq!(obs.acks_observed, 5);
             assert!(
-                matches!(
-                    verdict,
-                    TrialVerdict::Invalid(
-                        InvalidReason::ClientFailed(_)
-                            | InvalidReason::FlushAckMissing
-                            | InvalidReason::ServerExitedEarly(_)
-                    )
-                ),
+                is_persist_unsupported_reason(&verdict),
                 "unsupported persist must be excluded by the FLUSH ACK path, got {verdict:?}"
             );
         }
@@ -561,7 +571,8 @@ mod unix {
         assert_eq!(ledger.valid_trials().count(), 2);
     }
 
-    /// IO-3・TASK-18.2: フラッシュ済みケース。バッチ未満の 30 件を書いて Flush し、FLUSH ACK を
+    /// IO-3・TASK-18.2: フラッシュ済みケース。保証範囲は SIGKILL 後の可視性（ページキャッシュ経由の
+    /// 再読込）に限り、電源断後の媒体永続化は検証しない。バッチ未満の 30 件を書いて Flush し、FLUSH ACK を
     /// 観測した直後に SIGKILL する試行を有効 10 回集め、すべてで 30 件が欠落・重複なく並ぶこと
     /// （損失 0）を検証する。FLUSH ACK を返せない環境（Linux 5.8 未満等）では有効試行が
     /// 成立しないため、全試行が FLUSH ACK 経路で無効になることを確認する。これは CI を通すための
@@ -597,16 +608,14 @@ mod unix {
         } else {
             assert!(summary.aborted);
             assert_eq!(summary.valid, 0);
+            assert!(summary.invalid > 0, "summary: {summary:?}");
             for rec in ledger.invalid_trials() {
+                // 通常 ACK 30 件を全件観測した上で FLUSH ACK だけが得られなかった試行に限る
+                // （接続失敗・ACK 未達を「永続化非対応」に紛れ込ませない。REPAIR-12）。
+                assert_eq!(rec.observation.acks_observed, 30, "trial {}", rec.index);
+                assert!(!rec.observation.flush_ack_observed, "trial {}", rec.index);
                 assert!(
-                    matches!(
-                        rec.verdict,
-                        TrialVerdict::Invalid(
-                            InvalidReason::ClientFailed(_)
-                                | InvalidReason::FlushAckMissing
-                                | InvalidReason::ServerExitedEarly(_)
-                        )
-                    ),
+                    is_persist_unsupported_reason(&rec.verdict),
                     "trial {}: {:?}",
                     rec.index,
                     rec.verdict

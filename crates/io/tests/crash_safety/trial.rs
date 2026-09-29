@@ -96,6 +96,14 @@ pub enum DiskObservation {
     /// 読み出しに失敗した（`io::ErrorKind` の Debug 表記のみ。パス・中身は含めない）。
     ReadFailed(String),
     /// ファイルが上限（`cap` バイト）を超えていたため読まなかった。
+    /// 構築するのは UDS 対応 OS（Linux・macOS）のハーネスのみ。他 OS では未使用になる。
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        expect(
+            dead_code,
+            reason = "constructed only by the UDS harness on Linux/macOS"
+        )
+    )]
     TooLarge {
         len: u64,
         cap: u64,

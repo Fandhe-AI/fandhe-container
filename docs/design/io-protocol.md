@@ -309,6 +309,7 @@ ACK をバッチ書き込みの後に返すため、クライアントが `batch
 - Linux 5.8 未満、またはカーネル版数を判定できない場合、`persist` は `Unimplemented` で拒否する（`syncfs` が書き戻しエラーを報告するのは 5.8 以降のため、FlushAck の偽装を避ける。IO-2）。判定は公開関数 `persist_support()`（`PersistSupport`。`crates/io/src/barrier.rs`）に集約し、利用者・結合試験も同じ関数で「FlushAck が返る環境か」を知る
 - macOS / Windows は代替フラッシュ未実装で `Unimplemented`（TASK-15.3・#88）
 - 増幅対策: `AppendFileSink` は直近の成功以降に書き込みがなければ `syncfs` を再発行せず合流する（書き込みを伴わない連続 FLUSH）
+- 保証範囲: FlushAck が保証するのは `write_batch` 経由で受理した書き込み（IO-2 の「バリア以前に受理した書き込み」）の永続化に限る。呼び出し側が保持する別の `File` ハンドル（`new` に渡す前の `try_clone()` 等）・別プロセスからの書き込みは対象外で、dirty 追跡にも反映されない。`AppendFileSink` の利用者は対象ファイルへの書き込みを sink に一本化する（単一書き込み元の前提）
 - 未対応の範囲（REPAIR-3）: 書き込みを挟む FLUSH のレート制限・接続をまたぐ並行 FLUSH の合流（同期範囲はファイルシステム全体）、fd を開く前の書き戻しエラー、電源断耐性の検証（TASK-18）
 
 ### ACK していない保留分・sink 失敗時の扱い

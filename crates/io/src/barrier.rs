@@ -79,7 +79,8 @@ use crate::transport::IoTimeout;
 ///
 /// 対応する書き込みが受信プロセスにバッファリングされたことのみを保証し、
 /// **永続化は保証しない**。永続化完了の保証が必要な呼び出し元は
-/// [`FlushAck`] を待つこと。
+/// [`FlushAck`] を待つこと。プロセスクラッシュでは、この ACK 済みのデータも
+/// 失われうる（IO-1・IO-2。契約は `docs/api/io-barrier.md`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteAck {
     request: InFlightRequest,
@@ -95,6 +96,10 @@ impl WriteAck {
 /// FLUSH バリアに対する ACK（[`FrameKind::FlushAck`]）の受領記録（IO-2）。
 ///
 /// このバリア以前に受理したすべての書き込みが永続化済みであることを保証する。
+/// 「以前」は同一接続の受信順で `Flush` より前に受理した書き込みを指し、別接続・
+/// 別ハンドル・別プロセスからの書き込みは対象外。実証済みなのは SIGKILL 耐性
+/// までで、電源断・OS クラッシュへの耐性は未検証（IO-3）。詳細は
+/// `docs/api/io-barrier.md`（TASK-17）を参照。
 /// [`WriteAck`] とは異なる型であるため、呼び出し元が誤って通常 ACK を
 /// 永続化済みとして扱うことはコンパイル時に防がれる（本モジュールの
 /// `//!` ドキュメント「構築経路」参照）。

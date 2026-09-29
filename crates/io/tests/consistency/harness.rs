@@ -138,6 +138,7 @@ impl TempDir {
         let pid = std::process::id();
         let dir = std::env::temp_dir().join(format!("fcio-consistency-{tag}-{pid}-{n}"));
         std::fs::create_dir_all(&dir).expect("must be able to create a temp dir for test output");
+        warm_up_persist(&dir);
         Self { path: dir }
     }
 
@@ -337,6 +338,30 @@ where
 
 /// [`std::thread::JoinHandle::join`] を無期限に待たず、`deadline` 以内に
 /// 終わらなければ panic する（REPAIR-5: スレッドの join にも期限を設ける。
+/// プロセス内で 1 回だけ、テスト出力先のファイルシステムに対して `persist`
+/// （Linux では `syncfs(2)`）を先行実行する（TASK-15.2.2・#824）。
+///
+/// `syncfs` はファイルシステム全体の dirty ページを書き戻すため、CI runner の
+/// ように直前のビルド成果物が大量に未書き戻しだと最初の FLUSH だけが数秒かかり、
+/// クライアント側の FlushAck 待ちタイムアウトを超えうる。その初回コストを
+/// 個々のテストの待ち時間から切り離す。失敗・タイムアウトは無視する（本体の
+/// 検証対象ではなく、本体側の persist が結果を判定する）。
+fn warm_up_persist(dir: &std::path::Path) {
+    static WARM_UP: std::sync::Once = std::sync::Once::new();
+    WARM_UP.call_once(|| {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("warm-up.bin"))
+        else {
+            return;
+        };
+        if let Ok(mut sink) = AppendFileSink::new(file) {
+            let _ = sink.persist();
+        }
+    });
+}
+
 /// ACK 未送信等の実装バグによるハングを、テストのタイムアウトではなく
 /// 明示的なメッセージで検出できるようにする）。
 ///
@@ -440,6 +465,11 @@ pub fn recv_flush_ack_if_supported(
 ) {
     #[cfg(target_os = "linux")]
     {
+        // syncfs は FS 全体を書き戻すため通常の ACK 待ちより長い上限を使う
+        // （IoTimeout の上限 10 秒。CI runner の初回 syncfs 遅延対策）。
+        let _ = timeout;
+        let timeout =
+            IoTimeout::new(Duration::from_secs(10)).expect("10s must be a valid IoTimeout");
         let receipt = client
             .recv_ack(timeout)
             .expect("recv_ack must return the FlushAck");

@@ -991,8 +991,8 @@ mod tests {
     }
 
     /// [`AppendFileSink`] は body を到着順に追記し、`into_inner` で
-    /// 内部の `File` を取り出せる（TASK-15.2.2・#824 が fd を必要とする想定の
-    /// 回帰点）。
+    /// 内部の `File` を取り出せる（`&File` を返す `get_ref` は dirty 追跡を
+    /// 迂回するため提供しない。IO-2・TASK-15.2.2・#824）。
     #[test]
     fn append_file_sink_appends_bodies_in_order() {
         let dir = std::env::temp_dir().join(format!(

@@ -3973,4 +3973,102 @@ mod shared_observer_tests {
         drop(other);
         assert_eq!(*log.lock().unwrap(), vec![false, false]);
     }
+
+    /// REPAIR-4・#1118（PRRT_kwDOUq78ts6m7uwW）: 期限切れで保留のまま残ったイベントは、
+    /// `with` のクロージャより前にフックへ適用される（`with_observer(|o| o.drain_lines())`
+    /// で取りこぼさない）。順序は保留分 → クロージャの順。
+    #[test]
+    fn repair4_with_applies_pending_events_before_closure() {
+        let observer = SharedObserver::new(Recorder::default());
+        let expired = Instant::now();
+        notify_success(&observer, ServerOp::Send, None, Duration::ZERO, expired);
+        let err = IoError::new(IoErrorCode::Timeout, "pending failure");
+        notify_failure(
+            &observer,
+            ServerOp::Recv,
+            None,
+            ServerOutcome::Failure,
+            Duration::ZERO,
+            &err,
+            expired,
+        );
+        assert_eq!(observer.lock_pending().len(), 2, "both events stay pending");
+
+        let seen = observer.with(|rec| {
+            let snapshot = rec.events.clone();
+            rec.events.push((false, Some("closure".to_owned())));
+            snapshot
+        });
+        assert_eq!(
+            seen,
+            vec![(false, None), (true, Some("pending failure".to_owned()))]
+        );
+        assert_eq!(observer.lock_pending().len(), 0);
+        observer.with(|rec| {
+            assert_eq!(
+                rec.events,
+                vec![
+                    (false, None),
+                    (true, Some("pending failure".to_owned())),
+                    (false, Some("closure".to_owned())),
+                ]
+            );
+        });
+    }
+
+    /// REPAIR-4・#1118: 欠落サマリも `with` のクロージャより前に適用される
+    /// （サマリ → 保留キュー本体 → クロージャの順。サマリ先行は PRRT_kwDOUq78ts6m7eEo）。
+    #[test]
+    fn repair4_with_applies_overflow_summary_before_closure() {
+        let observer = SharedObserver::new(Recorder::default());
+        let expired = Instant::now();
+        for _ in 0..(MAX_PENDING_EVENTS + 2) {
+            notify_success(&observer, ServerOp::Send, None, Duration::ZERO, expired);
+        }
+        assert_eq!(observer.lock_pending().len(), MAX_PENDING_EVENTS);
+
+        let (len, first) = observer.with(|rec| (rec.events.len(), rec.events.first().cloned()));
+        assert_eq!(len, MAX_PENDING_EVENTS + 1);
+        assert_eq!(
+            first,
+            Some((
+                true,
+                Some("observer event queue overflowed; 2 events were dropped".to_owned())
+            ))
+        );
+        assert_eq!(observer.lock_pending().len(), 0);
+        assert_eq!(observer.0.dropped.load(Ordering::Acquire), 0);
+    }
+
+    /// REPAIR-4・#1118: `with` で排出済みのイベントは、最後の参照の drop 時に再適用されない
+    /// （保留分は `with` で 1 回、drop 時には残件のみ。欠落も二重通知もない）。
+    #[test]
+    fn repair4_pending_events_are_delivered_exactly_once_across_with_and_drop() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let observer = SharedObserver::new(SharedLog(Arc::clone(&log)));
+        let other = observer.clone();
+        let expired = Instant::now();
+        notify_success(&observer, ServerOp::Send, None, Duration::ZERO, expired);
+        notify_success(&other, ServerOp::Recv, None, Duration::ZERO, expired);
+        assert!(log.lock().unwrap().is_empty());
+
+        let seen_in_closure = other.with(|_| log.lock().unwrap().len());
+        assert_eq!(seen_in_closure, 2, "pending events precede the closure");
+
+        // with の後に残った 1 件だけが drop 時に届く。
+        let err = IoError::new(IoErrorCode::Timeout, "late failure");
+        notify_failure(
+            &observer,
+            ServerOp::Recv,
+            None,
+            ServerOutcome::Failure,
+            Duration::ZERO,
+            &err,
+            expired,
+        );
+        drop(observer);
+        assert_eq!(*log.lock().unwrap(), vec![false, false]);
+        drop(other);
+        assert_eq!(*log.lock().unwrap(), vec![false, false, true]);
+    }
 }

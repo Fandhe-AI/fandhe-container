@@ -178,7 +178,7 @@ fn io5_io1_created_sink_serves_writeback() {
     assert_eq!(written, b"hello world".to_vec());
 }
 
-/// IO-5・TASK-19.2: 脱出を試みるパスは拒否され、索引にも FS にも痕跡を残さない。
+/// IO-5・TASK-19.2: 脱出を試みるパスは拒否され、FS に痕跡を残さない。
 #[test]
 fn io5_creator_rejects_escape_and_does_not_pollute_index() {
     let dir = TempDir::new("gf-escape");
@@ -193,7 +193,6 @@ fn io5_creator_rejects_escape_and_does_not_pollute_index() {
         let err = creator.create_file(path).err().expect("must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument, "path {path:?}");
     }
-    assert_eq!(creator.tracked_len().expect("len"), 0);
     assert_eq!(std::fs::read_dir(&root).expect("read_dir").count(), 0);
     let parent = root.parent().expect("parent");
     assert_eq!(std::fs::read_dir(parent).expect("read_dir").count(), 1);

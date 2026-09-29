@@ -305,57 +305,10 @@ impl CaseCollisionSet {
         self.path_count == 0
     }
 
-    /// `path` が（大文字小文字まで完全一致で）登録済みのパスかを返す（索引は変更
-    /// しない。形式不正のパスは `false`）。
-    ///
-    /// 呼び出し側が「新規登録になる場合だけ件数上限を適用する」判定に使う
-    /// （TASK-19.2・IO-5。`crate::guest_files` の索引上限。完全一致の再登録は
-    /// [`Self::len`] を増やさないため上限の対象外）。
-    pub fn contains(&self, path: &str) -> bool {
-        let Ok(components) = validate_guest_relative_path(path) else {
-            return false;
-        };
-        let mut parent = ROOT_NODE;
-        let mut is_path_end = false;
-        for component in &components {
-            match self.nodes.get(&CaseFoldKey::new(parent, component)) {
-                Some(entry) if entry.original == *component => {
-                    parent = entry.id;
-                    is_path_end = entry.is_path_end;
-                }
-                _ => return false,
-            }
-        }
-        is_path_end
-    }
-
-    /// `path` の全コンポーネントが（大文字小文字まで完全一致で）索引のノードとして
-    /// 既にあるかを返す（索引は変更しない。形式不正のパスは `false`）。明示的に
-    /// 登録したパスに加え、登録済みパスの祖先として暗黙に作られたノード（`"a/b"` を
-    /// 登録したときの `"a"`）も真になる。
-    ///
-    /// 真のとき [`Self::try_insert`] は新しいノードを作らない（完全一致の再登録か、
-    /// 暗黙のノードをパスとして数え直すだけ）。呼び出し側が件数上限を「新しい
-    /// ノードを足すときだけ」適用する判定に使う（TASK-19.2・IO-5。
-    /// `crate::guest_files` の索引上限）。
-    pub fn contains_node(&self, path: &str) -> bool {
-        let Ok(components) = validate_guest_relative_path(path) else {
-            return false;
-        };
-        let mut parent = ROOT_NODE;
-        for component in &components {
-            match self.nodes.get(&CaseFoldKey::new(parent, component)) {
-                Some(entry) if entry.original == *component => parent = entry.id,
-                _ => return false,
-            }
-        }
-        true
-    }
-
     /// `path` を登録せずに、[`Self::try_insert`] が衝突で失敗するかだけを検査する
-    /// （索引は変更しない。TASK-19.2・IO-5。ファイル作成の成功後に
-    /// [`Self::try_insert`] で登録を確定する呼び出し側が、失敗した作成の登録を
-    /// 索引へ残さないために使う）。
+    /// （索引は変更しない。TASK-19.2・IO-5。`crate::guest_files` が、実在項目から
+    /// 作った索引に対して要求パスを検査するときや、件数上限より先に衝突を判定する
+    /// ときに使う）。
     ///
     /// 形式不正は [`IoErrorCode::InvalidArgument`]、大文字小文字だけが違う既存
     /// コンポーネントとの衝突は [`IoErrorCode::AlreadyExists`]（メッセージは
@@ -845,22 +798,5 @@ mod tests {
     fn io5_case_collision_set_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<CaseCollisionSet>();
-    }
-
-    /// IO-5・TASK-19.2: `contains` は完全一致で登録済みのパスだけを `true` にする
-    /// （祖先として暗黙に作られたノード・大小違い・形式不正は `false`）。
-    #[test]
-    fn io5_contains_matches_exact_registered_paths_only() {
-        let mut set = CaseCollisionSet::new();
-        set.try_insert("a/b").expect("insert");
-        assert!(set.contains("a/b"));
-        assert!(!set.contains("a"));
-        assert!(!set.contains("A/b"));
-        assert!(!set.contains("a/B"));
-        assert!(!set.contains("a/b/c"));
-        assert!(!set.contains("a//b"));
-        set.try_insert("a").expect("insert ancestor as a path");
-        assert!(set.contains("a"));
-        assert_eq!(set.len(), 2);
     }
 }

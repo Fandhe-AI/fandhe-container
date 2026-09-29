@@ -42,20 +42,19 @@
 //!   葉を作る（保持ハンドルが改名・削除・差し替えを OS に拒否させる。REPAIR-3）。
 //!   共有ルート自体が symlink のときは構築時に 1 回だけ正規化し、以降のパス結合は
 //!   その正規パス（保持ハンドルと同じ実体）から始めて元のルートは再解決しない。
-//! - 既存項目の取り込み: 索引は API 経由の登録だけでなく、作成のたびに祖先
-//!   ディレクトリの実在エントリを毎回読み直して取り込む（別プロセスが後から
-//!   足した項目も検出する）。走査中の読み取り失敗や、既存項目どうしの大文字
-//!   小文字衝突は作成を中止する（fail-closed）。共有ルートに元からある `Foo` が
-//!   あれば `foo/bar` は衝突になる。走査は名前の索引化だけに使い、書き込み先の
-//!   解決には使わない（非 UTF-8 名は取り込めない）。
-//! - 索引の確定: 衝突は [`CaseCollisionSet::check_insertable`] で先に検査し、
-//!   実ファイルの作成と再検証に成功してから登録を確定する。作成が失敗しても索引は
-//!   汚れない（末端が既存で `AlreadyExists` のときは実体があるため登録する）。
-//! - 件数上限（[`GuestFileCreator::with_max_tracked_paths`]）は索引に新しいノードを
-//!   足すときだけ適用する（登録済みのパスと、登録済みパスの祖先として既にある
-//!   ディレクトリは対象外。上限到達後も既存パスは `AlreadyExists`、大小違いは衝突
-//!   として報告する）。1 ディレクトリの
-//!   エントリ数が上限を超える場合も `ResourceExhausted` で中止する。
+//! - 衝突索引は実在項目だけから作る: 作成のたびに、要求パスの祖先に沿って実在する
+//!   ディレクトリのエントリを読み直し、その場限りの [`CaseCollisionSet`] を作って
+//!   衝突を検査する（ディスクが唯一の正。インスタンスをまたいで持ち越す索引は持たない
+//!   ため、ホスト側で消した・改名した項目が後の作成を拒否し続けることはなく、失敗した
+//!   作成が索引を汚すこともない）。別プロセスが後から足した項目も検出する。走査中の
+//!   読み取り失敗や、既存項目どうしの大文字小文字衝突は作成を中止する
+//!   （fail-closed）。共有ルートに元からある `Foo` があれば `foo/bar` は衝突になる。
+//!   走査は衝突の検査だけに使い、書き込み先の解決には使わない（非 UTF-8 名は
+//!   取り込めない）。
+//! - 件数上限（[`GuestFileCreator::with_max_tracked_paths`]）は、1 回の作成で索引へ
+//!   取り込む実在項目の件数と、1 ディレクトリから読むエントリ数の上限（無制限確保の
+//!   防止）。超えると `ResourceExhausted` で中止する。衝突は上限より先に検査し、
+//!   衝突として返す。
 //! - 後始末: 作成が葉で失敗した・再検証で取り消した場合、本呼び出しが新設した
 //!   祖先ディレクトリは空であれば同一性を確かめてから取り除く（ベストエフォート。
 //!   他者が中に作った等で空でなければ残す）。Windows のフォールバックは祖先を
@@ -162,13 +161,11 @@ pub struct GuestFileCreator {
     /// Windows ではこのハンドルを `FILE_SHARE_DELETE` なしで保持し、ルートと祖先の
     /// 改名・削除を OS に拒否させる。
     root_dir: File,
+    /// 1 回の作成で索引へ取り込む実在項目の件数・1 ディレクトリから読むエントリ数の
+    /// 上限。
     max_tracked: usize,
-    index: Mutex<IndexState>,
-}
-
-/// 衝突索引。
-struct IndexState {
-    set: CaseCollisionSet,
+    /// 同じインスタンス内の作成を、走査から作成・再検証まで直列化する。
+    lock: Mutex<()>,
 }
 
 fn invalid(message: &str) -> IoError {
@@ -176,7 +173,7 @@ fn invalid(message: &str) -> IoError {
 }
 
 fn poisoned() -> IoError {
-    IoError::new(IoErrorCode::Internal, "guest file index lock is poisoned")
+    IoError::new(IoErrorCode::Internal, "guest file creator lock is poisoned")
 }
 
 fn too_many() -> IoError {
@@ -184,21 +181,6 @@ fn too_many() -> IoError {
         IoErrorCode::ResourceExhausted,
         "too many tracked guest paths",
     )
-}
-
-/// `path` を索引へ登録する。ただし、登録済みパスの祖先として既にあるノードを
-/// パスとして数え直すと件数が上限を超える場合は登録を省く（ノードは既にあり衝突
-/// 検出には影響しない）。新しいノードを足す登録は、呼び出し元が事前に上限を
-/// 検査している前提。
-fn register_within_limit(
-    set: &mut CaseCollisionSet,
-    path: &str,
-    max_tracked: usize,
-) -> Result<(), IoError> {
-    if set.contains_node(path) && !set.contains(path) && set.len() >= max_tracked {
-        return Ok(());
-    }
-    set.try_insert(path)
 }
 
 /// 単一のゲストパスコンポーネントがホスト上でちょうど 1 個の `Normal` に
@@ -224,9 +206,9 @@ impl GuestFileCreator {
         Self::with_max_tracked_paths(root, MAX_TRACKED_GUEST_PATHS)
     }
 
-    /// 索引の件数上限（`1..=`[`MAX_TRACKED_GUEST_PATHS`]）を指定して作る。
-    /// 上限は新規登録になるパスにだけ適用し、1 ディレクトリのエントリ数の上限にも
-    /// 使う（モジュール doc「契約と既知の限界」）。
+    /// 1 回の作成で索引へ取り込む実在項目の件数上限（`1..=`[`MAX_TRACKED_GUEST_PATHS`]。
+    /// 1 ディレクトリから読むエントリ数の上限にも使う）を指定して作る（モジュール doc
+    /// 「契約と既知の限界」）。
     pub fn with_max_tracked_paths(root: PathBuf, max_tracked: usize) -> Result<Self, IoError> {
         if max_tracked == 0 || max_tracked > MAX_TRACKED_GUEST_PATHS {
             return Err(invalid("max tracked guest paths is out of range"));
@@ -257,9 +239,7 @@ impl GuestFileCreator {
             base,
             root_dir,
             max_tracked,
-            index: Mutex::new(IndexState {
-                set: CaseCollisionSet::new(),
-            }),
+            lock: Mutex::new(()),
         })
     }
 
@@ -268,57 +248,40 @@ impl GuestFileCreator {
         &self.root
     }
 
-    /// 索引に登録済みのパス件数。
-    pub fn tracked_len(&self) -> Result<usize, IoError> {
-        Ok(self.index.lock().map_err(|_| poisoned())?.set.len())
-    }
-
     /// ゲスト相対パス `guest_path`（`/` 区切り）のファイルを新規作成して sink を返す。
     ///
     /// 大文字小文字だけが違う既存パスと衝突する場合（作成後の再検証で別プロセスの
     /// 項目を見つけて取り消した場合を含む）は `AlreadyExists`
     /// （`case-insensitive path collision: ...`）、同一パスが既に存在する場合は
     /// `AlreadyExists`（`guest file already exists: ...`）、不正なパスは
-    /// `InvalidArgument`、新規登録で索引の件数上限を超える場合は
-    /// `ResourceExhausted`、走査・再検証・取り消しの失敗は `Internal`
+    /// `InvalidArgument`、実在項目が件数上限を超える場合は `ResourceExhausted`、
+    /// 走査・再検証・取り消しの失敗は `Internal`
     /// （IO-5・TASK-19.2）。
     pub fn create_file(&self, guest_path: &str) -> Result<AppendFileSink, IoError> {
         if guest_path.len() > MAX_GUEST_PATH_BYTES {
             return Err(invalid("guest path is too long"));
         }
-        // 索引を汚さないよう、ロックと try_insert の前にホスト側の検証を済ませる。
+        // ロックと走査の前にホスト側の検証を済ませる。
         let components: Vec<&str> = guest_path.split('/').collect();
         for component in &components {
             validate_host_component(component)?;
         }
 
-        // 検査から作成・登録までを同じガードで直列化する。
-        let mut state = self.index.lock().map_err(|_| poisoned())?;
-        let state = &mut *state;
+        // 走査から作成・再検証までを同じガードで直列化する。
+        let _guard = self.lock.lock().map_err(|_| poisoned())?;
         let (ancestors, leaf) = match components.split_last() {
             Some((leaf, ancestors)) => (ancestors, *leaf),
             None => return Err(invalid("guest path is empty")),
         };
-        // 共有ルートに元からある項目（表記違いの祖先など）を先に索引へ取り込む。
-        self.seed_existing(state, ancestors)?;
-        let set = &mut state.set;
-        // 衝突の検査を件数上限より先に行い、上限到達後も衝突を衝突として報告する。
-        // 索引は変更せず、実ファイルの作成と再検証に成功してから登録を確定する
-        // （作成失敗で実体のないパスが索引に残らないようにする）。
-        set.check_insertable(guest_path)?;
-        // 上限は新しいノードを足すときだけ適用する（登録済みのパスや、登録済みパスの
-        // 祖先として既にあるノードは索引を増やさない）。
-        if !set.contains_node(guest_path) && set.len() >= self.max_tracked {
-            return Err(too_many());
-        }
+        // 実在する項目（表記違いの祖先など）から、この作成限りの索引を作って検査する。
+        let existing = self.index_existing(ancestors)?;
+        existing.check_insertable(guest_path)?;
 
         #[cfg(test)]
         fault::run_hook(fault::Hook::BeforeCreate);
         let created = match create_beneath(&self.root_dir, &self.base, ancestors, leaf) {
             Ok(created) => created,
             Err(CreateError::Exists) => {
-                // 実体が既に存在する。索引にも確定させたうえで報告する。
-                register_within_limit(set, guest_path, self.max_tracked)?;
                 return Err(IoError::new(
                     IoErrorCode::AlreadyExists,
                     format!(
@@ -329,7 +292,7 @@ impl GuestFileCreator {
             }
             Err(CreateError::ExistsAs(existing)) => {
                 // 走査の後に別の作成者が大小違いの項目を作り、大文字小文字を区別しない
-                // ホストが既存として拒否した。要求の表記では登録せず衝突として返す。
+                // ホストが既存として拒否した。衝突として返す。
                 let prefix: String = ancestors.iter().map(|a| format!("{a}/")).collect();
                 return Err(collision_error(
                     guest_path,
@@ -345,20 +308,18 @@ impl GuestFileCreator {
         // 走査から作成までの間に別プロセスが足した大小違いの項目を再検証する
         // （見つかれば自分の作成を取り消して返す。モジュール doc「プロセス間の競合」）。
         let file = verify_created(created, guest_path, ancestors, leaf)?;
-        register_within_limit(set, guest_path, self.max_tracked)?;
         AppendFileSink::new(file)
     }
 
-    /// `ancestors` に沿って実在するディレクトリの項目を、作成のたびに読み直して
-    /// 索引へ取り込む（表記どおりの実在ディレクトリだけを辿る。symlink は辿らない）。
-    /// 別プロセスが共有ルートへ後から追加した項目も検出するため、走査済みの
-    /// 印は持たない。走査は保持したルートのハンドル起点で行い（Linux / macOS は
-    /// 各階層もハンドル相対で開く）、索引化専用で作成先の解決には使わない。
-    /// 索引に既にあるノード（登録済みの項目・暗黙の祖先）は件数上限の対象にせず、
-    /// 新しいノードを足して上限を超えるときだけ `ResourceExhausted`。読み取りの失敗は `Internal`、既存項目どうしの大文字
-    /// 小文字衝突は `AlreadyExists`（IO-5 の検査を完了できないまま作成へ進まない。
-    /// fail-closed）。
-    fn seed_existing(&self, state: &mut IndexState, ancestors: &[&str]) -> Result<(), IoError> {
+    /// `ancestors` に沿って実在するディレクトリの項目を読み、この作成限りの衝突
+    /// 索引を作る（表記どおりの実在ディレクトリだけを辿る。symlink は辿らない）。
+    /// 走査は保持したルートのハンドル起点で行い（Linux / macOS は各階層もハンドル
+    /// 相対で開く）、衝突の検査専用で作成先の解決には使わない。取り込む項目が件数
+    /// 上限を超えたら `ResourceExhausted`、読み取りの失敗は `Internal`、既存項目
+    /// どうしの大文字小文字衝突は `AlreadyExists`（IO-5 の検査を完了できないまま
+    /// 作成へ進まない。fail-closed）。
+    fn index_existing(&self, ancestors: &[&str]) -> Result<CaseCollisionSet, IoError> {
+        let mut set = CaseCollisionSet::new();
         let mut cursor = ScanCursor::root(&self.root_dir, &self.base)?;
         let mut prefix = String::new();
         for level in 0..=ancestors.len() {
@@ -366,35 +327,23 @@ impl GuestFileCreator {
             for name in entries {
                 let Some(name) = name.to_str() else { continue };
                 let path = format!("{prefix}{name}");
-                // 索引に既にあるノード（前回の走査・作成で取り込んだ項目や、登録済み
-                // パスの祖先として暗黙にあるディレクトリ）は衝突検出に足りており件数にも
-                // 影響しないため、上限より先に読み飛ばす。
-                if state.set.contains_node(&path) {
-                    continue;
-                }
                 // 衝突は件数上限より先に報告する（大文字小文字を区別しないホストでは
-                // 表記違いの祖先がそのまま開けるため、要求の表記で数えた項目が既存の
-                // ノードと衝突しうる。上限到達後も衝突を衝突として返す）。
-                match state.set.check_insertable(&path) {
+                // 表記違いの祖先がそのまま開けるため、要求の表記で数えた項目が前の
+                // 階層の項目と衝突しうる。上限に達していても衝突として返す）。
+                match set.check_insertable(&path) {
                     Ok(()) => {}
                     // 形式不正の名前（ホストで表現できない等）は索引化できないだけで
                     // 無視する。
                     Err(err) if err.code() == IoErrorCode::InvalidArgument => continue,
-                    Err(err) => return Err(err),
-                }
-                if state.set.len() >= self.max_tracked {
-                    return Err(too_many());
-                }
-                match state.set.try_insert(&path) {
-                    Ok(()) => {}
-                    // 形式不正の名前（ホストで表現できない等）は索引化できないだけで
-                    // 無視する。
-                    Err(err) if err.code() == IoErrorCode::InvalidArgument => {}
                     // 共有ルートに元から大文字小文字違いの項目が併存している等、
-                    // 衝突検出を完了できない状態は走査順で索引が変わるため、
+                    // 衝突検出を完了できない状態は走査順で結果が変わるため、
                     // 握りつぶさず作成を中止する（fail-closed。IO-5）。
                     Err(err) => return Err(err),
                 }
+                if set.len() >= self.max_tracked {
+                    return Err(too_many());
+                }
+                set.try_insert(&path)?;
             }
             let Some(component) = ancestors.get(level) else {
                 break;
@@ -403,12 +352,12 @@ impl GuestFileCreator {
             // （作成時に新設される、または作成側が拒否する）。
             match cursor.descend(component)? {
                 Some(next) => cursor = next,
-                None => return Ok(()),
+                None => break,
             }
             prefix.push_str(component);
             prefix.push('/');
         }
-        Ok(())
+        Ok(set)
     }
 }
 
@@ -1303,7 +1252,6 @@ mod tests {
             let err = c.create_file(p).err().expect("must be rejected");
             assert_eq!(err.code(), IoErrorCode::InvalidArgument, "path {p:?}");
         }
-        assert_eq!(c.tracked_len().expect("len"), 0);
         assert_eq!(entries(&t.0), 0);
     }
 
@@ -1312,8 +1260,13 @@ mod tests {
         let t = Tmp::new();
         let c = GuestFileCreator::with_max_tracked_paths(t.0.clone(), 1).expect("creator");
         c.create_file("a").expect("first");
-        let err = c.create_file("b").err().expect("limit");
+        // 既存 1 件（上限ちょうど）までは取り込める。
+        c.create_file("b").expect("second");
+        // 既存が 2 件になり、1 回の作成で取り込む上限を超える。
+        let err = c.create_file("c").err().expect("limit");
         assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+        assert_eq!(err.message(), "too many tracked guest paths");
+        assert_eq!(entries(&t.0), 2);
         for n in [0, MAX_TRACKED_GUEST_PATHS + 1] {
             let err = GuestFileCreator::with_max_tracked_paths(t.0.clone(), n)
                 .err()
@@ -1354,8 +1307,9 @@ mod tests {
         std::fs::write(t.0.join("a"), b"x").expect("write");
         let err = c.create_file("a/b").err().expect("must fail");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
-        // 取り込まれるのは実在する `a` だけで、失敗した `a/b` は登録されない。
-        assert_eq!(c.tracked_len().expect("len"), 1);
+        // 失敗した `a/b` は何も残さず、実在する `a` はそのまま。
+        assert!(t.0.join("a").is_file());
+        c.create_file("b").expect("later create is unaffected");
     }
 
     #[cfg(unix)]
@@ -1453,7 +1407,6 @@ mod tests {
         let err = c.create_file("a").err().expect("must abort");
         assert_eq!(err.code(), IoErrorCode::Internal);
         assert_eq!(err.message(), "failed to scan guest directory (Other)");
-        assert_eq!(c.tracked_len().expect("len"), 0);
         assert_eq!(entries(&t.0), 0);
         fault::reset();
         c.create_file("a")
@@ -1473,7 +1426,6 @@ mod tests {
         assert_eq!(err.code(), IoErrorCode::Internal);
         assert_eq!(err.message(), "failed to scan guest directory (Other)");
         assert_eq!(entries(&t.0.join("d")), 0);
-        assert_eq!(c.tracked_len().expect("len"), 1);
     }
 
     /// 作成直前に同じ名前が外部で作られた場合は既存として報告する（3 OS 共通）。
@@ -1490,11 +1442,11 @@ mod tests {
         assert_eq!(err.code(), IoErrorCode::AlreadyExists);
         assert!(err.message().starts_with("guest file already exists"));
         assert_eq!(std::fs::read(t.0.join("a")).expect("read"), b"theirs");
-        assert_eq!(c.tracked_len().expect("len"), 1);
     }
 
-    /// 上限 1: 既登録のパスは上限に阻まれず既存・衝突として報告され、新規だけが
-    /// `ResourceExhausted` になる（Codex P1 指摘）。
+    /// 上限 1: 実在項目が上限以内なら、既存は既存・大小違いは衝突として報告し、
+    /// 新しい名前も作れる。実在項目が上限を超えたディレクトリでは
+    /// `ResourceExhausted` になる（Codex P1 指摘への対応後の契約）。
     #[test]
     fn io5_limit_applies_only_to_new_paths() {
         fault::reset();
@@ -1507,11 +1459,12 @@ mod tests {
         let err = c.create_file("A").err().expect("collision");
         assert_eq!(err.code(), IoErrorCode::AlreadyExists);
         assert!(err.message().starts_with("case-insensitive path collision"));
-        let err = c.create_file("b").err().expect("limit");
+        c.create_file("b")
+            .expect("one existing entry is within the bound");
+        let err = c.create_file("c").err().expect("limit");
         assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
         assert_eq!(err.message(), "too many tracked guest paths");
-        assert_eq!(c.tracked_len().expect("len"), 1);
-        assert_eq!(entries(&t.0), 1);
+        assert_eq!(entries(&t.0), 2);
     }
 
     /// 作成直後の再検証で読み取りに失敗したら、作成した葉と新設した祖先を
@@ -1529,7 +1482,6 @@ mod tests {
         assert_eq!(err.code(), IoErrorCode::Internal);
         assert_eq!(err.message(), "failed to verify guest directory (Other)");
         assert_eq!(entries(&t.0), 0);
-        assert_eq!(c.tracked_len().expect("len"), 0);
     }
 
     /// 走査から作成までの間に別プロセスが大小違いの葉を作った場合、作成後の
@@ -1553,7 +1505,6 @@ mod tests {
         assert_eq!(std::fs::read(t.0.join("Foo")).expect("read"), b"theirs");
         // 退避名も残らない（自分の葉は退避名へ移したうえで消した）。
         assert_eq!(entries(&t.0), 1);
-        assert_eq!(c.tracked_len().expect("len"), 0);
     }
 
     /// 祖先の大小違いが割り込んだ場合は、葉と本呼び出しが新設した祖先を取り消す
@@ -1604,7 +1555,6 @@ mod tests {
         );
         assert_eq!(std::fs::read(t.0.join("foo")).expect("read"), b"theirs");
         assert_eq!(std::fs::read(t.0.join("Foo")).expect("read"), b"variant");
-        assert_eq!(c.tracked_len().expect("len"), 0);
     }
 
     /// 作成直後に葉が改名された場合（大小違いは無い）、返す fd は共有パスから
@@ -1628,7 +1578,6 @@ mod tests {
         );
         assert!(t.0.join("bar").is_file());
         assert!(!t.0.join("foo").exists());
-        assert_eq!(c.tracked_len().expect("len"), 0);
     }
 
     /// 作成直後に祖先が改名された場合も同様に拒否し、改名先の中の自分の葉は
@@ -1653,7 +1602,6 @@ mod tests {
         );
         assert!(!t.0.join("moved").join("f").exists());
         assert!(!t.0.join("d").exists());
-        assert_eq!(c.tracked_len().expect("len"), 0);
     }
 
     /// 取り消しの同一性確認の直後に、葉の名前へ他者のファイルが差し込まれた場合、
@@ -1708,14 +1656,15 @@ mod tests {
         assert_eq!(std::fs::read(t.0.join("Foo")).expect("read"), b"variant");
     }
 
-    /// 上限 1 でネストしたパスを登録した後も、暗黙の祖先が走査で上限に数えられず、
-    /// 既存・衝突を正しく報告する（Cursor・Codex P1 指摘）。
+    /// 件数上限は要求パスの祖先に沿って取り込む実在項目の合計に掛かる。上限以内なら
+    /// ネストしたパスの既存・衝突を正しく報告する（Cursor・Codex P1 指摘への対応後の
+    /// 契約）。
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn io5_limit_does_not_count_implicit_ancestors() {
         fault::reset();
         let t = Tmp::new();
-        let c = GuestFileCreator::with_max_tracked_paths(t.0.clone(), 1).expect("creator");
+        let c = GuestFileCreator::with_max_tracked_paths(t.0.clone(), 2).expect("creator");
         c.create_file("a/b").expect("first");
         let err = c.create_file("a/b").err().expect("exists");
         assert_eq!(err.code(), IoErrorCode::AlreadyExists);
@@ -1729,13 +1678,15 @@ mod tests {
                 err.message()
             );
         }
-        // 暗黙の祖先 `a`（ディレクトリ）は既存として報告し、件数は増やさない。
         let err = c.create_file("a").err().expect("exists");
         assert_eq!(err.code(), IoErrorCode::AlreadyExists);
         assert!(err.message().starts_with("guest file already exists"));
-        let err = c.create_file("a/c").err().expect("limit");
+        // `a`・`a/b` の 2 件は上限以内。
+        c.create_file("a/c").expect("within the bound");
+        // `a`・`a/b`・`a/c` の 3 件で上限を超える。
+        let err = c.create_file("a/d").err().expect("limit");
         assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
-        assert_eq!(c.tracked_len().expect("len"), 1);
+        assert_eq!(entries(&t.0.join("a")), 2);
     }
 
     /// 親ディレクトリのエントリ数がちょうど上限のときに作成して上限を 1 つ超えても、
@@ -1789,7 +1740,6 @@ mod tests {
             err.message()
         );
         assert!(err.message().contains("\"Foo\""), "{}", err.message());
-        assert_eq!(c.tracked_len().expect("len"), 0);
         assert_eq!(std::fs::read(t.0.join("Foo")).expect("read"), b"theirs");
         assert_eq!(entries(&t.0), 1);
     }
@@ -1814,7 +1764,6 @@ mod tests {
             err.message()
         );
         assert_eq!(entries(&t.0.join("Dir")), 0);
-        assert_eq!(c.tracked_len().expect("len"), 0);
     }
 
     /// 構築後にルートのパスを範囲外への symlink へ差し替えても、作成は保持した

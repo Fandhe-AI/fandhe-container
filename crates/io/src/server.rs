@@ -491,8 +491,9 @@ impl<O: ServerObserver> UdsServer<O> {
 ///
 /// [`FrameSender`]・[`FrameReceiver`] を実装し（blanket impl により
 /// [`crate::transport::FrameTransport`] にもなる）、単一スレッドで `&mut self`
-/// を使う前提とする（`transport` モジュールの契約どおり。送信側・受信側の
-/// 分割は TASK-12 の範囲）。
+/// を使う前提とする（`transport` モジュールの契約どおり。送信側・受信側を別スレッドで
+/// 並行に使う場合は [`SplitTransport::split`] で [`UdsSendHalf`]・[`UdsRecvHalf`] へ
+/// 分ける。#1118）。
 ///
 /// `send_frame` / `recv_frame` のいずれかが一度でも `Err` を返すと以後
 /// [`IoErrorCode::Unavailable`] を返し続ける（P1-3・REPAIR-5・REPAIR-6。
@@ -755,6 +756,11 @@ impl<C: ServerObserver> Drop for SharedObserverInner<C> {
 /// 適用する。他方（`with_observer` のクロージャや別スレッドの通知）がロックを保持
 /// 中ならブロックせずに戻り（期限を超えない。REPAIR-5）、ロック保持側が解放後に
 /// キューを排出する（REPAIR-4: 並行終了でもイベントを欠落させない）。
+///
+/// ロックの順序は `hook` → `pending` の一方向のみ（`pending` を保持したまま `hook` を
+/// 取らない。`pending` のガードは pop / push の文の中だけで解放する）。`notify` は
+/// `pending` を解放してから `hook` を `try_lock` するため、両半分・`with` の間で
+/// デッドロックしない。
 struct SharedObserver<C: ServerObserver>(Arc<SharedObserverInner<C>>);
 
 impl<C: ServerObserver> Clone for SharedObserver<C> {
@@ -827,10 +833,20 @@ impl<C: ServerObserver> SharedObserver<C> {
         }
     }
 
-    /// ロックを取って `f` を適用し、その間に積まれた保留イベントも排出する。
+    /// ロックを取り、呼び出し時点で保留中のイベントを排出してから `f` を適用し、
+    /// `f` の実行中に積まれた保留イベントも排出する。
+    ///
+    /// `f` より前の排出は、期限切れ（`IoTimeout`）で I/O 経路が排出しきれなかった
+    /// イベントを `f`（例: `drain_lines`）が取りこぼさないためのもの（REPAIR-4）。
+    /// 保留キューは FIFO で件数が `MAX_PENDING_EVENTS`（= `MAX_DRAIN_PER_CALL`）以下
+    /// のため、呼び出し時点で積まれていたイベントは 1 回の排出ですべて `f` より前に
+    /// 適用される。並行して積まれた分はその後ろに並び、`f` の後の排出が引き継ぐ。
+    /// I/O 経路ではないため期限は設けないが、件数上限（REPAIR-5）は保つ。
     fn with<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
         let result = {
             let mut guard = self.0.hook.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut budget = MAX_DRAIN_PER_CALL;
+            self.drain_locked(&mut guard, &mut budget, None);
             let r = f(&mut guard);
             let mut budget = MAX_DRAIN_PER_CALL;
             self.drain_locked(&mut guard, &mut budget, None);
@@ -947,9 +963,16 @@ impl<C: ServerObserver> core::fmt::Debug for UdsRecvHalf<C> {
 
 impl<C: ServerObserver> UdsSendHalf<C> {
     /// 両半分で共有している観測フックへ、ロックを取って `f` を適用する
-    /// （[`UdsConnection::observer_mut`] の分割後の代替）。`f` の実行中に他方の半分が
-    /// 通知したイベントは待たずに保留キューへ積まれ、`f` の後に順序どおり適用される
-    /// （I/O 期限を守りつつ欠落させない）。
+    /// （[`UdsConnection::observer_mut`] の分割後の代替）。
+    ///
+    /// 呼び出し時点で保留中のイベント（送受信の期限で排出が打ち切られた分など）は
+    /// `f` より前に順序どおり適用されるため、`f` で全イベントを取り出せる（REPAIR-4）。
+    /// `f` の実行中に他方の半分が通知したイベントは待たずに保留キューへ積まれ、`f` の
+    /// 後に順序どおり適用される（I/O 期限を守りつつ欠落させない。REPAIR-5）。
+    ///
+    /// `f` の中から（どちらの半分の）`with_observer` も呼ばないこと（フックのロックは
+    /// 再入できず、デッドロックする）。`f` の中で他方の半分の `send_frame` /
+    /// `recv_frame` を呼ぶのは可（通知はロックを待たず保留キューへ積まれる）。
     pub fn with_observer<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
         self.observer.with(f)
     }
@@ -957,9 +980,16 @@ impl<C: ServerObserver> UdsSendHalf<C> {
 
 impl<C: ServerObserver> UdsRecvHalf<C> {
     /// 両半分で共有している観測フックへ、ロックを取って `f` を適用する
-    /// （[`UdsConnection::observer_mut`] の分割後の代替）。`f` の実行中に他方の半分が
-    /// 通知したイベントは待たずに保留キューへ積まれ、`f` の後に順序どおり適用される
-    /// （I/O 期限を守りつつ欠落させない）。
+    /// （[`UdsConnection::observer_mut`] の分割後の代替）。
+    ///
+    /// 呼び出し時点で保留中のイベント（送受信の期限で排出が打ち切られた分など）は
+    /// `f` より前に順序どおり適用されるため、`f` で全イベントを取り出せる（REPAIR-4）。
+    /// `f` の実行中に他方の半分が通知したイベントは待たずに保留キューへ積まれ、`f` の
+    /// 後に順序どおり適用される（I/O 期限を守りつつ欠落させない。REPAIR-5）。
+    ///
+    /// `f` の中から（どちらの半分の）`with_observer` も呼ばないこと（フックのロックは
+    /// 再入できず、デッドロックする）。`f` の中で他方の半分の `send_frame` /
+    /// `recv_frame` を呼ぶのは可（通知はロックを待たず保留キューへ積まれる）。
     pub fn with_observer<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
         self.observer.with(f)
     }

@@ -305,7 +305,23 @@ BREAK-2 検出経路の整理:
 
 ### バッチが件数未達のまま残る場合の運用制約
 
-ACK をバッチ書き込みの後に返すため、クライアントが `batch_size` 未満だけ送って ACK を待つと、サーバー側に発火のきっかけがない。使える発火条件は「設定件数到達（`BatchTrigger::SizeReached`）」「累積バイト数上限到達（`BatchTrigger::BytesLimitReached`）」「`FrameKind::Flush`」の 3 つのみで、時間ベースの追い出しは範囲外（IO-10・TASK-16）。クライアントは「in-flight 上限 ≥ `batch_size`、または件数未達分の後に `Flush` を送ること」を前提とする（既定値 64 / 64 で整合）。
+ACK をバッチ書き込みの後に返すため、クライアントが `batch_size` 未満だけ送って ACK を待つと、サーバー側に発火のきっかけがない。使える発火条件は「設定件数到達（`BatchTrigger::SizeReached`）」「累積バイト数上限到達（`BatchTrigger::BytesLimitReached`）」「`FrameKind::Flush`」「未フラッシュ滞留量の上限到達（自動フラッシュ。IO-10・TASK-16.2・#91。次節）」のみで、時間ベースの追い出しは範囲外。クライアントは「in-flight 上限 ≥ `batch_size`、または件数未達分の後に `Flush` を送ること」を前提とする（既定値 64 / 64 で整合）。
+
+### 未フラッシュ滞留量の上限と自動フラッシュ（IO-10・TASK-16.2・#91）
+
+未フラッシュ滞留量（受理したが FLUSH バリアで永続化されていない `Write` の件数と body バイト。`WritebackStats::unflushed`）が上限 `UnflushedLimit` に達したら、サーバー側が自動フラッシュを発行し、滞留量が上限を超えて増えないようにする。根拠は PoC-2 のクラッシュ境界（SIGKILL で未フラッシュ分が失われる。IO-3 と同じ）。
+
+| 項目 | 既定値（暫定。校正は TASK-88） | 許容範囲 |
+| ---- | ------------------------------ | -------- |
+| 件数上限 `max_frames` | 4096（`DEFAULT_UNFLUSHED_MAX_FRAMES`。`MAX_BATCH_SIZE` と同値） | 1..=1048576（`MAX_UNFLUSHED_MAX_FRAMES`） |
+| バイト上限 `max_bytes` | 256 MiB（`DEFAULT_UNFLUSHED_MAX_BYTES`。`MAX_BATCH_BYTES` と同値） | 1..=16 GiB（`MAX_UNFLUSHED_MAX_BYTES`） |
+
+- **変更方法**: `UnflushedLimit::new(max_frames, max_bytes)`（検証付き）を `WritebackSettings::with_unflushed_limit` へ渡す（`BoundConnection::serve` が設定側の上限を使う）。文字列は `parse_unflushed_limit(Some("3"), None)`（10 進 ASCII 数字のみ。不正入力は `InvalidArgument`）。予約済みの名前は CLI が `--unflushed-max-frames` / `--unflushed-max-bytes`、設定キーが `unflushed_max_frames` / `unflushed_max_bytes`。CLI バイナリへの配線は TASK-79、TOML 読み込みは TASK-82 の範囲（REPAIR-3）。`serve_connection` は既定値、`serve_connection_with_limit` は任意の上限で動く。
+- **発火条件**: 件数またはバイトのどちらかが上限以上になったとき（Write の受理・バッチ書き込みの直後）。加えて、受理するとバイト上限を超える Write は、受理する前に既存の滞留分を自動フラッシュする。上限が `batch_size` より小さい場合、バッチが満杯になる前に発火する。
+- **保証**: 件数は常に `max_frames` 以下。バイトは、単独の body が `max_bytes` を超える場合を除き `max_bytes` 以下（超える場合も受理直後に自動フラッシュして 0 に戻す）。
+- **動作**: 滞留バッチを書き込んで通常 ACK を送り、`persist` して滞留量を 0 に戻す。同期処理のため受信上限の不変条件（`pending_frames = 0`）は保たれる。**FlushAck は送らない**（クライアントの request id がなく、要求されていない FlushAck は ACK 順序対応付けの契約を壊すため）。永続化の保証が必要なクライアントは従来どおり明示 `Flush` と FlushAck を使う（IO-2）。
+- **失敗時（fail-closed）**: write・persist の失敗・タイムアウト・未対応はそのエラーで接続を終える（事前チェックで失敗した Write は受理も計上もされず ACK も返らない）。`persist` 非対応環境（Linux 5.8 未満・既定の `persist` の sink）では、Flush を送らないまま上限に達した接続は `Unimplemented` で終わる（上限超過の防止を優先する）。
+- **可観測性**: `WritebackStats::auto_flushes`（成功回数）。`persist_*` は自動フラッシュ分を含む。
 
 ### FLUSH フレームの扱い（IO-2・TASK-15.2.2・#824。FlushAck は偽装しない）
 
@@ -346,7 +362,7 @@ ACK をバッチ書き込みの後に返すため、クライアントが `batch
 
 先頭ゼロ（`"064"`）は `usize::from_str` と同じく 64 として受理する。エラーメッセージには入力値そのものを含めない（security.md「情報漏えい」観点。任意長・制御文字を含みうる外部入力をログ・構造化エラーへそのまま流し込まないため）。
 
-CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設定のキー名（`BATCH_SIZE_SETTING_KEY = "batch_size"`）は定数として予約するのみで、実際の CLI バイナリ（`fandhe-container`）からの配線は TASK-79（`crates/cli`）、TOML 等の宣言的設定ファイルからの読み込みは CLI-4（TASK-82）の範囲。`max_bytes`（累積バイト数上限）用の CLI / 設定値（`--batch-bytes` 相当）は本タスクの対象外（IO-10・TASK-16）であり、`WritebackSettings` を `#[non_exhaustive]` にすることで後から非公開フィールドとして追加できる形にしている。
+CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設定のキー名（`BATCH_SIZE_SETTING_KEY = "batch_size"`）は定数として予約するのみで、実際の CLI バイナリ（`fandhe-container`）からの配線は TASK-79（`crates/cli`）、TOML 等の宣言的設定ファイルからの読み込みは CLI-4（TASK-82）の範囲。バッチの `max_bytes`（累積バイト数上限）用の CLI / 設定値（`--batch-bytes` 相当）は対象外であり、`WritebackSettings` を `#[non_exhaustive]` にすることで後から非公開フィールドとして追加できる形にしている。未フラッシュ滞留量の上限は `with_unflushed_limit` で持つ（次節）。
 
 ### 範囲外（後続タスク。要起票）
 
@@ -354,7 +370,8 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 - クライアント側の UDS `connect` と `PipelineClient` との本番結合
 - 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
 - FLUSH の頻度（間隔）の制限
-- 件数未達分を時間ベースで追い出す仕組み・未フラッシュ滞留量の上限（IO-10・TASK-16）
+- 件数未達分を時間ベースで追い出す仕組み
+- 未フラッシュ滞留量の上限のクライアント側計測・自動 Flush 送出、`--unflushed-max-*` の CLI バイナリ配線（TASK-79）・TOML 読み込み（TASK-82）
 - 実際の CLI バイナリ（`fandhe-container`）での `--batch-size` 引数の解釈・`crates/cli → crates/io` の依存追加（TASK-79）
 - ファイル操作を表すペイロード形式（パス・rename・truncate。TASK-14 の前提。I/O 契約の拡張にあたる）
 - Windows のトランスポート（`windows-sys` の依存承認が必要）

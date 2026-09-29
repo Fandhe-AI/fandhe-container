@@ -43,8 +43,9 @@
 //! `--batch-size` 相当の設定 API（CLI / 設定の文字列から検証済み
 //! [`batch::BatchConfig`] と [`recv_limits::ReceiveLimits`] を単一の入口から
 //! 導く）は [`settings`] モジュール（TASK-13.3・#78）が提供する。
-//! 未フラッシュ滞留量のカウンタは [`barrier::UnflushedBacklog`]（TASK-16.1・#90・IO-10）で、
-//! 上限到達時の自動フラッシュは TASK-16.2・#91 で後続実装する（未実装。REPAIR-3）。
+//! 未フラッシュ滞留量のカウンタは [`barrier::UnflushedBacklog`]（TASK-16.1・#90・IO-10）、
+//! その上限は [`barrier::UnflushedLimit`]、上限到達時の自動フラッシュは
+//! [`writeback::serve_connection_with_limit`]（TASK-16.2・#91・IO-10）が担う。
 //! FS 正規化層は、大文字小文字を区別しないホスト（APFS / NTFS）とゲスト
 //! （ext4）の差異による黙った上書きを防ぐため、ゲスト相対パスの大文字小文字
 //! 衝突を検出する（[`fs_normalize::CaseCollisionSet`]・
@@ -82,8 +83,10 @@ pub mod transport;
 pub mod writeback;
 
 pub use barrier::{
-    AckReceipt, FlushAck, FlushBarrier, MaxConcurrentPersist, PersistSupport, UnflushedBacklog,
-    WriteAck, max_concurrent_persist, persist_support, set_max_concurrent_persist,
+    AckReceipt, DEFAULT_UNFLUSHED_MAX_BYTES, DEFAULT_UNFLUSHED_MAX_FRAMES, FlushAck, FlushBarrier,
+    MAX_UNFLUSHED_MAX_BYTES, MAX_UNFLUSHED_MAX_FRAMES, MaxConcurrentPersist, PersistSupport,
+    UnflushedBacklog, UnflushedLimit, WriteAck, max_concurrent_persist, persist_support,
+    set_max_concurrent_persist,
 };
 pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
@@ -120,7 +123,9 @@ pub use recv_limits::{
 pub use server::{UdsConnection, UdsRecvHalf, UdsSendHalf, UdsServer};
 pub use settings::{
     BATCH_SIZE_OPTION, BATCH_SIZE_SETTING_KEY, BoundConnection, BoundWriteback,
-    MAX_BATCH_SIZE_ARG_LEN, WritebackSettings, parse_batch_size,
+    MAX_BATCH_SIZE_ARG_LEN, MAX_UNFLUSHED_ARG_LEN, UNFLUSHED_MAX_BYTES_OPTION,
+    UNFLUSHED_MAX_BYTES_SETTING_KEY, UNFLUSHED_MAX_FRAMES_OPTION, UNFLUSHED_MAX_FRAMES_SETTING_KEY,
+    WritebackSettings, parse_batch_size, parse_unflushed_limit,
 };
 pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, SplitTransport,
@@ -128,5 +133,5 @@ pub use transport::{
 };
 pub use writeback::{
     AppendFileSink, BatchSink, SinkOpenMode, SinkPersistReport, SinkWriteReport, WritebackReport,
-    WritebackStats, WritebackTimeouts, serve_connection,
+    WritebackStats, WritebackTimeouts, serve_connection, serve_connection_with_limit,
 };

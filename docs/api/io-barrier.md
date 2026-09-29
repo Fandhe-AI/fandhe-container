@@ -3,7 +3,7 @@
 `fandhe-container-io`（`crates/io`）の 2 種類の ACK（通常 ACK・FLUSH ACK）が何を保証し、何を保証しないかを利用者向けに定める。
 
 - 関連タスク: TASK-17（#92。本書）・TASK-15（#84・#85・#87・#88。FLUSH バリアの型分離と永続化）・MS-1
-- 関連ビヘイビア: IO-1（バッファリング時点の ACK）・IO-2（通常 ACK と FLUSH ACK の区別）・IO-3（SIGKILL 耐性の実測と未検証範囲）・IO-10（自動フラッシュ。未実装）・ERR-3（`DATA_LOSS`）・REPAIR-3（未実装を装わない）・REPAIR-5（タイムアウト）
+- 関連ビヘイビア: IO-1（バッファリング時点の ACK）・IO-2（通常 ACK と FLUSH ACK の区別）・IO-3（SIGKILL 耐性の実測と未検証範囲）・IO-10（未フラッシュ滞留量の上限と自動フラッシュ）・ERR-3（`DATA_LOSS`）・REPAIR-3（未実装を装わない）・REPAIR-5（タイムアウト）
 - 仕様の SSOT は spec リポ（`docs/spec` submodule の `04-behavior/`）である。本書と食い違う場合は spec を正とする。ワイヤー形式の詳細は [io-protocol.md](../design/io-protocol.md) を参照
 
 ## 要点
@@ -124,9 +124,13 @@ loop {
 }
 ```
 
+## 自動フラッシュ（IO-10・TASK-16.2）
+
+サーバーは未フラッシュ滞留量が上限（既定 4096 件・256 MiB。暫定値）に達すると自動でフラッシュを発行する。**自動フラッシュはクライアントへの永続化の通知ではない**（FlushAck は送られない）。永続化の保証が必要なら、従来どおり明示 `Flush` を送り FLUSH ACK を待つこと。詳細・変更方法は `docs/design/io-protocol.md`「未フラッシュ滞留量の上限と自動フラッシュ」を参照。
+
 ## 未実装範囲（REPAIR-3）
 
-- 自動フラッシュと未フラッシュ滞留量の上限（IO-10。TASK-16）
+- クライアント側での滞留量計測・自動 Flush 送出、`--unflushed-max-*` の CLI / TOML 配線（TASK-79・TASK-82）
 - クラッシュ安全性テスト（TASK-18）
 - クライアント側の UDS `connect` と `PipelineClient` の本番結合
 - vsock・named pipe のトランスポート

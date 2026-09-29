@@ -35,8 +35,10 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - 未フラッシュ滞留量のカウンタ [`UnflushedBacklog`] は実装済み（IO-10・TASK-16.1・#90）。
-//!   上限との比較・到達時の自動フラッシュは未実装で TASK-16.2・#91 が担う。
+//! - 未フラッシュ滞留量のカウンタ [`UnflushedBacklog`]（IO-10・TASK-16.1・#90）と、
+//!   その上限 [`UnflushedLimit`]・到達時の自動フラッシュ（IO-10・TASK-16.2・#91。
+//!   発行は [`crate::writeback`] が担う）は実装済み。クライアント側での滞留量計測・
+//!   自動 Flush 送出は未実装（REPAIR-3）。
 //! - macOS / Windows の代替フラッシュ（TASK-15.3・#88）は sink が持つファイル自体
 //!   （データ＋ファイルメタデータ）を明示的な syscall（macOS は `fcntl(F_FULLFSYNC)`、
 //!   Windows は `FlushFileBuffers`）で永続化したうえで、sink が
@@ -876,8 +878,8 @@ fn release_supports_syncfs_errors(release: &str) -> bool {
 /// と同じ単位）。更新は crate 内専用で、crate 外は getter で読むだけとする
 /// （値の偽装による上限判定のすり抜けを防ぐ）。
 ///
-/// 未実装（REPAIR-3）: 上限との比較と到達時の自動フラッシュは TASK-16.2・#91 で
-/// 実装予定（IO-10）。本型は計測のみを担う。
+/// 本型は計測のみを担う。上限との比較は [`UnflushedLimit`]、到達時の自動フラッシュは
+/// [`crate::writeback::serve_connection_with_limit`]（IO-10・TASK-16.2・#91）が行う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct UnflushedBacklog {
@@ -896,6 +898,11 @@ impl UnflushedBacklog {
         self.bytes
     }
 
+    /// 滞留が 1 件もないか（`frames == 0`）。
+    pub fn is_empty(&self) -> bool {
+        self.frames == 0
+    }
+
     /// `Write` を 1 件受理した分を加算する（飽和加算。過小報告しない）。
     pub(crate) fn record_write(&mut self, body_len: usize) {
         self.frames = self.frames.saturating_add(1);
@@ -906,6 +913,103 @@ impl UnflushedBacklog {
     /// FLUSH バリア成功（永続化完了）で 0 に戻す。
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// [`UnflushedLimit`] の既定の件数上限（IO-10・TASK-16.2・#91）。
+///
+/// [`crate::batch::MAX_BATCH_SIZE`] と同じ値で、既定のままでも合法な
+/// [`crate::batch::BatchConfig`] のバッチを途中で打ち切らない。暫定値で、
+/// 実測に基づく校正は TASK-88（REPAIR-3）。
+pub const DEFAULT_UNFLUSHED_MAX_FRAMES: u64 = 4096;
+
+/// [`UnflushedLimit`] の既定のバイト上限（256 MiB。IO-10・TASK-16.2・#91）。
+///
+/// [`crate::batch::MAX_BATCH_BYTES`] と同じ値で、[`crate::protocol::MAX_PAYLOAD_LEN`]
+/// 以上のため、既定では 1 フレームだけで上限を超えることがない。暫定値（校正は TASK-88）。
+pub const DEFAULT_UNFLUSHED_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// [`UnflushedLimit::new`] が受け付ける件数上限の最大値（上限の事実上の無効化を拒否する）。
+pub const MAX_UNFLUSHED_MAX_FRAMES: u64 = 1 << 20;
+
+/// [`UnflushedLimit::new`] が受け付けるバイト上限の最大値（16 GiB）。
+pub const MAX_UNFLUSHED_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+const _: () = assert!(DEFAULT_UNFLUSHED_MAX_FRAMES <= MAX_UNFLUSHED_MAX_FRAMES);
+const _: () = assert!(DEFAULT_UNFLUSHED_MAX_BYTES <= MAX_UNFLUSHED_MAX_BYTES);
+
+/// 未フラッシュ滞留量の上限（IO-10・TASK-16.2・#91）。
+///
+/// [`UnflushedBacklog`] が件数（`max_frames`）または body バイト数（`max_bytes`）の
+/// どちらかの上限に達したら、[`crate::writeback::serve_connection_with_limit`] が
+/// 自動フラッシュ（滞留分の書き込み・ACK と `persist`）を発行する。根拠は PoC-2 の
+/// クラッシュ境界（SIGKILL で未フラッシュ分が失われる。IO-3 と同じ）。
+///
+/// 既定は [`DEFAULT_UNFLUSHED_MAX_FRAMES`] 件・[`DEFAULT_UNFLUSHED_MAX_BYTES`] バイト
+/// （暫定値。REPAIR-3・TASK-88 で校正）。変更は [`Self::new`]（検証付き）から
+/// [`crate::settings::WritebackSettings::with_unflushed_limit`] へ渡すか、文字列は
+/// [`crate::settings::parse_unflushed_limit`] を使う。上限が `batch_size` より小さい
+/// 場合、バッチが満杯になる前に自動フラッシュが発火する（許容）。
+///
+/// 保証: 件数は常に `max_frames` 以下。バイト数は、単独の body が `max_bytes` を超える
+/// 場合を除き `max_bytes` 以下（単独で超えた場合も受理直後に自動フラッシュして 0 に戻す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct UnflushedLimit {
+    max_frames: u64,
+    max_bytes: u64,
+}
+
+impl UnflushedLimit {
+    /// 検証付きで上限を作る。`0`、または `MAX_UNFLUSHED_MAX_*` 超は
+    /// [`IoErrorCode::InvalidArgument`]（メッセージに入力値は含めない）。
+    pub fn new(max_frames: u64, max_bytes: u64) -> Result<Self, IoError> {
+        if max_frames == 0 || max_frames > MAX_UNFLUSHED_MAX_FRAMES {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!("unflushed max frames must be in 1..={MAX_UNFLUSHED_MAX_FRAMES}"),
+            ));
+        }
+        if max_bytes == 0 || max_bytes > MAX_UNFLUSHED_MAX_BYTES {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!("unflushed max bytes must be in 1..={MAX_UNFLUSHED_MAX_BYTES}"),
+            ));
+        }
+        Ok(Self {
+            max_frames,
+            max_bytes,
+        })
+    }
+
+    /// 件数上限。
+    pub fn max_frames(&self) -> u64 {
+        self.max_frames
+    }
+
+    /// body バイト数の上限。
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    /// 滞留量がどちらかの上限に達している（以上）か。
+    pub(crate) fn is_reached(&self, backlog: &UnflushedBacklog) -> bool {
+        backlog.frames() >= self.max_frames || backlog.bytes() >= self.max_bytes
+    }
+
+    /// `body_len` の Write を加えるとバイト上限を超えるか（事前フラッシュの判定）。
+    pub(crate) fn would_exceed_bytes(&self, backlog: &UnflushedBacklog, body_len: usize) -> bool {
+        let len = u64::try_from(body_len).unwrap_or(u64::MAX);
+        backlog.bytes().saturating_add(len) > self.max_bytes
+    }
+}
+
+impl Default for UnflushedLimit {
+    fn default() -> Self {
+        Self {
+            max_frames: DEFAULT_UNFLUSHED_MAX_FRAMES,
+            max_bytes: DEFAULT_UNFLUSHED_MAX_BYTES,
+        }
     }
 }
 
@@ -1526,5 +1630,59 @@ mod tests {
             .expect("must accept (Flush, FlushAck)");
         let err = WriteAck::try_from(receipt).expect_err("Flush receipt must be rejected");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+    }
+
+    fn backlog(frames: u64, bytes: u64) -> UnflushedBacklog {
+        UnflushedBacklog { frames, bytes }
+    }
+
+    /// IO-10・TASK-16.2: 既定値。
+    #[test]
+    fn io10_unflushed_limit_default_values() {
+        let l = UnflushedLimit::default();
+        assert_eq!(l.max_frames(), 4096);
+        assert_eq!(l.max_bytes(), 268_435_456);
+    }
+
+    /// IO-10・TASK-16.2: 0 と上限超は拒否する。
+    #[test]
+    fn io10_unflushed_limit_rejects_zero_and_over_max() {
+        for (f, b) in [
+            (0, 1),
+            (1, 0),
+            (MAX_UNFLUSHED_MAX_FRAMES + 1, 1),
+            (1, MAX_UNFLUSHED_MAX_BYTES + 1),
+        ] {
+            let err = UnflushedLimit::new(f, b).expect_err("must reject");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        }
+        let ok = UnflushedLimit::new(MAX_UNFLUSHED_MAX_FRAMES, MAX_UNFLUSHED_MAX_BYTES)
+            .expect("max is accepted");
+        assert_eq!(ok.max_frames(), 1 << 20);
+    }
+
+    /// IO-10・TASK-16.2: 件数の境界（max-1 は未到達、max で到達）。
+    #[test]
+    fn io10_unflushed_limit_is_reached_on_frames() {
+        let l = UnflushedLimit::new(3, 100).expect("valid");
+        assert!(!l.is_reached(&backlog(2, 0)));
+        assert!(l.is_reached(&backlog(3, 0)));
+    }
+
+    /// IO-10・TASK-16.2: バイトの境界。
+    #[test]
+    fn io10_unflushed_limit_is_reached_on_bytes() {
+        let l = UnflushedLimit::new(100, 10).expect("valid");
+        assert!(!l.is_reached(&backlog(1, 9)));
+        assert!(l.is_reached(&backlog(1, 10)));
+    }
+
+    /// IO-10・TASK-16.2: 事前チェックの境界（ちょうど上限は超えない）。
+    #[test]
+    fn io10_unflushed_limit_would_exceed_bytes_boundary() {
+        let l = UnflushedLimit::new(100, 10).expect("valid");
+        assert!(!l.would_exceed_bytes(&backlog(1, 7), 3));
+        assert!(l.would_exceed_bytes(&backlog(1, 7), 4));
+        assert!(l.would_exceed_bytes(&backlog(1, u64::MAX), usize::MAX));
     }
 }

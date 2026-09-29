@@ -65,12 +65,26 @@
 //! ACK をバッチ書き込みの後に返すため、クライアントが `batch_size` 未満だけ
 //! 送って ACK を待つと、サーバー側に発火のきっかけがない。本実装で使える
 //! 発火条件は [`crate::batch::BatchTrigger::SizeReached`]・
-//! [`crate::batch::BatchTrigger::BytesLimitReached`]・[`FrameKind::Flush`] の
-//! 3 つのみ（時間ベースの追い出しは範囲外。IO-10・TASK-16）。
-//! 未フラッシュ滞留量のカウンタは [`WritebackStats::unflushed`]（TASK-16.1・#90）で導入済みだが、
-//! 上限到達時の自動発火は未実装（TASK-16.2・#91）。呼び出し側は
+//! [`crate::batch::BatchTrigger::BytesLimitReached`]・[`FrameKind::Flush`]、および
+//! 未フラッシュ滞留量の上限到達（自動フラッシュ。下記「自動フラッシュ」節）のみ
+//! （時間ベースの追い出しは範囲外）。呼び出し側は
 //! 「クライアントの in-flight 上限 ≥ `batch_size`、または件数未達分の後に
 //! `Flush` を送ること」を運用上の前提とする（既定値 64 / 64 で整合）。
+//!
+//! # 自動フラッシュ（IO-10・TASK-16.2・#91）
+//!
+//! 未フラッシュ滞留量（[`WritebackStats::unflushed`]）が [`UnflushedLimit`]
+//! （件数またはバイト。既定 4096 件・256 MiB。暫定値で校正は TASK-88）に達したら、
+//! サーバー側が同期的に滞留分の書き込み・通常 ACK と `persist` を行い、滞留量を 0 に
+//! 戻す。Write を加えるとバイト上限を超える場合は、その Write を受理する前に既存の
+//! 滞留分を自動フラッシュする。**FlushAck は送らない**（クライアントの request id が
+//! なく、要求されていない FlushAck は ACK 順序対応付けの契約を壊すため）。したがって
+//! 自動フラッシュはクライアントへの永続化の通知ではなく、永続化の保証が必要なら従来どおり
+//! 明示 `Flush` と FlushAck を使う（IO-2）。自動フラッシュの失敗（write・persist の
+//! 失敗・タイムアウト・未対応）は明示 Flush と同じく fail-closed でそのエラーで接続を終える。
+//! 特に `persist` 非対応環境では、Flush を送らないまま上限に達した接続は
+//! [`IoErrorCode::Unimplemented`] で終わる（上限超過の防止を優先する）。
+//! 上限は [`serve_connection_with_limit`] で指定し、[`serve_connection`] は既定値を使う。
 //!
 //! # ACK していない保留分の扱い（D5。接続断・エラー時は破棄）
 //!
@@ -96,7 +110,7 @@
 //! 由来の場合）も常に成り立つ。したがって [`crate::recv_limits::ReceiveLimits::admit`]
 //! へ渡す `pending_frames` は常に `0` で構造上正確であり（[`crate::server`]・
 //! [`crate::recv_limits`] も同じ不変条件を前提とする）、本モジュールが独自に
-//! 別の値を計算する必要はない。write-back を非同期化する場合はこの前提を
+//! 別の値を計算する必要はない。自動フラッシュも同期処理のためこの不変条件を保つ。write-back を非同期化する場合はこの前提を
 //! 見直す必要がある。
 //!
 //! # 呼び出し文脈
@@ -112,7 +126,7 @@ use std::fs::File;
 use std::io::{self, Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 
-use crate::barrier::UnflushedBacklog;
+use crate::barrier::{UnflushedBacklog, UnflushedLimit};
 use crate::batch::{Batch, BatchBuffer, BatchConfig, PushOutcome};
 use crate::error::{IoError, IoErrorCode};
 use crate::payload::{decode_request, encode_ack};
@@ -708,9 +722,11 @@ pub struct WritebackStats {
     pub acks_sent: u64,
     /// 送出した FLUSH ACK（[`FrameKind::FlushAck`]）の総数（IO-2）。
     pub flush_acks_sent: u64,
-    /// [`BatchSink::persist`] が成功した回数（REPAIR-4）。
+    /// 自動フラッシュ（IO-10・TASK-16.2）が成功した回数（REPAIR-4）。
+    pub auto_flushes: u64,
+    /// [`BatchSink::persist`] が成功した回数（自動フラッシュ分を含む。REPAIR-4）。
     pub persist_succeeded: u64,
-    /// [`BatchSink::persist`] が失敗した回数（タイムアウト・未対応を含む。REPAIR-4）。
+    /// [`BatchSink::persist`] が失敗した回数（タイムアウト・未対応・自動フラッシュ分を含む。REPAIR-4）。
     pub persist_failed: u64,
     /// 成功した persist の所要時間の合計（マイクロ秒。飽和加算。REPAIR-4）。
     pub persist_elapsed_micros: u64,
@@ -799,6 +815,51 @@ where
     send_acks_in_order(conn, batch, timeout, stats)
 }
 
+/// `persist` を実行し、成功時のみ統計を更新して未フラッシュ滞留量を 0 に戻す
+/// （明示 Flush と自動フラッシュ〔IO-10・TASK-16.2〕が共有する。挙動のずれを防ぐ）。
+/// 失敗時は滞留量を戻さず `persist_failed` を加算して `Err` を返す。
+fn persist_and_reset<W: BatchSink>(
+    sink: &mut W,
+    stats: &mut WritebackStats,
+) -> Result<(), IoError> {
+    match sink.persist() {
+        Ok(report) => {
+            stats.persist_succeeded = stats.persist_succeeded.saturating_add(1);
+            // バリア以前の受理分はすべて永続化済み（IO-10）。失敗時は戻さない。
+            stats.unflushed.reset();
+            let micros = u64::try_from(report.elapsed.as_micros()).unwrap_or(u64::MAX);
+            stats.persist_elapsed_micros = stats.persist_elapsed_micros.saturating_add(micros);
+            Ok(())
+        }
+        Err(err) => {
+            stats.persist_failed = stats.persist_failed.saturating_add(1);
+            Err(err)
+        }
+    }
+}
+
+/// 上限到達時の自動フラッシュ（IO-10・TASK-16.2・#91）。滞留バッチを書き込んで
+/// 通常 ACK を送り、`persist` して滞留量を 0 に戻す。FlushAck は送らない
+/// （モジュール doc「自動フラッシュ」参照）。失敗はそのまま返し呼び出し側が終了する。
+fn auto_flush<T, W>(
+    conn: &mut T,
+    sink: &mut W,
+    buffer: &mut BatchBuffer,
+    timeout: IoTimeout,
+    stats: &mut WritebackStats,
+) -> Result<(), IoError>
+where
+    T: FrameSender<Frame = Frame>,
+    W: BatchSink,
+{
+    if let Some(batch) = buffer.take_pending() {
+        write_batch_and_ack(conn, sink, &batch, timeout, stats)?;
+    }
+    persist_and_reset(sink, stats)?;
+    stats.auto_flushes = stats.auto_flushes.saturating_add(1);
+    Ok(())
+}
+
 /// 1 接続分のバッチ write-back を実行する（TASK-13.2.2・IO-1・#822）。
 ///
 /// `conn` は [`FrameSender`] + [`FrameReceiver`]（[`Frame`] を扱う）を実装する
@@ -819,6 +880,7 @@ where
 /// [`BatchBuffer`] に残っていた滞留フレームは書き込まずに破棄し件数を
 /// [`WritebackStats::discarded_pending_frames`] へ残す（D5）。
 /// 受理した `Write` は [`WritebackStats::unflushed`] に加算し、`persist` 成功で 0 に戻す（IO-10）。
+/// 既定の [`UnflushedLimit`] で自動フラッシュが働く（[`serve_connection_with_limit`] 参照）。
 ///
 /// `config` は [`crate::settings::WritebackSettings::batch_config`] から
 /// 渡し、対応する [`crate::server::UdsServer::bind`] には同じ
@@ -837,6 +899,29 @@ where
 pub fn serve_connection<T, W>(
     conn: &mut T,
     config: BatchConfig,
+    sink: &mut W,
+    timeouts: WritebackTimeouts,
+) -> WritebackReport
+where
+    T: FrameSender<Frame = Frame> + FrameReceiver<Frame = Frame>,
+    W: BatchSink,
+{
+    serve_connection_with_limit(conn, config, UnflushedLimit::default(), sink, timeouts)
+}
+
+/// [`serve_connection`] に未フラッシュ滞留量の上限 `limit` を指定する版
+/// （IO-10・TASK-16.2・#91）。
+///
+/// 滞留量が `limit` に達したら自動フラッシュを発行する（モジュール doc
+/// 「自動フラッシュ」参照）。Write ごとに、(1) 受理するとバイト上限を超えるなら
+/// 受理前に既存の滞留分を自動フラッシュ、(2) 受理・バッチ書き込みの後に上限到達なら
+/// 自動フラッシュ、の順で判定する。自動フラッシュの失敗はそのエラーで接続を終える
+/// （fail-closed。事前チェックで失敗した Write は受理も計上もされない）。
+/// [`crate::settings::BoundConnection::serve`] は設定側の上限でこれを呼ぶ。
+pub fn serve_connection_with_limit<T, W>(
+    conn: &mut T,
+    config: BatchConfig,
+    limit: UnflushedLimit,
     sink: &mut W,
     timeouts: WritebackTimeouts,
 ) -> WritebackReport
@@ -882,6 +967,15 @@ where
                     Err(err) => return finish(stats, &buffer, err),
                 };
 
+                // IO-10: 受理するとバイト上限を超えるなら、受理前に既存滞留分を
+                // 自動フラッシュする（超過を 1 フレーム分に抑える）。
+                if !stats.unflushed.is_empty()
+                    && limit.would_exceed_bytes(&stats.unflushed, body_len)
+                    && let Err(err) = auto_flush(conn, sink, &mut buffer, timeouts.send, &mut stats)
+                {
+                    return finish(stats, &buffer, err);
+                }
+
                 let outcome = match buffer.push(frame) {
                     Ok(outcome) => outcome,
                     Err(err) => return finish(stats, &buffer, err),
@@ -900,6 +994,12 @@ where
                     {
                         return finish(stats, &buffer, err);
                     }
+                }
+                // IO-10: 受理後に上限へ達したら自動フラッシュする。
+                if limit.is_reached(&stats.unflushed)
+                    && let Err(err) = auto_flush(conn, sink, &mut buffer, timeouts.send, &mut stats)
+                {
+                    return finish(stats, &buffer, err);
                 }
             }
             FrameKind::Flush => {
@@ -923,19 +1023,8 @@ where
                 // IO-2・TASK-15.2.2: FLUSH ACK は永続化の保証であり、persist が
                 // `Ok` を返したときだけ送る（エラー・タイムアウト・未対応は
                 // FlushAck を送らず終了。fail-closed）。
-                match sink.persist() {
-                    Ok(report) => {
-                        stats.persist_succeeded = stats.persist_succeeded.saturating_add(1);
-                        // バリア以前の受理分はすべて永続化済み（IO-10）。失敗時は戻さない。
-                        stats.unflushed.reset();
-                        let micros = u64::try_from(report.elapsed.as_micros()).unwrap_or(u64::MAX);
-                        stats.persist_elapsed_micros =
-                            stats.persist_elapsed_micros.saturating_add(micros);
-                    }
-                    Err(err) => {
-                        stats.persist_failed = stats.persist_failed.saturating_add(1);
-                        return finish(stats, &buffer, err);
-                    }
+                if let Err(err) = persist_and_reset(sink, &mut stats) {
+                    return finish(stats, &buffer, err);
                 }
                 let flush_ack = match encode_ack(FrameKind::FlushAck, envelope.id()) {
                     Ok(ack) => ack,
@@ -1585,6 +1674,174 @@ mod tests {
         assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
         assert_eq!(sink.persist_calls, 0);
         assert_eq!(report.stats.flush_acks_sent, 0);
+    }
+
+    fn limit(frames: u64, bytes: u64) -> UnflushedLimit {
+        UnflushedLimit::new(frames, bytes).expect("limit must be valid")
+    }
+
+    fn sent_kinds(conn: &FakeTransport) -> Vec<FrameKind> {
+        conn.sent.iter().map(|f| f.kind()).collect()
+    }
+
+    /// IO-10・TASK-16.2: 件数上限に達した直後に自動フラッシュし、FlushAck は送らない。
+    #[test]
+    fn io10_auto_flush_fires_when_frame_limit_reached() {
+        let frames = (0..3u64).map(|i| write_frame(i, b"x")).collect();
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = persist_sink(None);
+        let config = BatchConfig::new(8).expect("valid");
+
+        let report =
+            serve_connection_with_limit(&mut conn, config, limit(3, 1024), &mut sink, timeouts());
+
+        assert_eq!(sent_kinds(&conn), vec![FrameKind::Ack; 3]);
+        assert_eq!(
+            conn.sent.iter().map(ack_id).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(sink.persist_calls, 1);
+        assert_eq!(report.stats.auto_flushes, 1);
+        assert_eq!(report.stats.flush_acks_sent, 0);
+        assert_eq!(report.stats.unflushed.frames(), 0);
+        assert_eq!(report.stats.unflushed.bytes(), 0);
+    }
+
+    /// IO-10・TASK-16.2: バイト上限到達（2 件目の受理直後）で発火する。
+    #[test]
+    fn io10_auto_flush_fires_when_byte_limit_reached() {
+        let frames = vec![write_frame(0, b"ab"), write_frame(1, b"cd")];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = persist_sink(None);
+        let config = BatchConfig::new(8).expect("valid");
+
+        let report =
+            serve_connection_with_limit(&mut conn, config, limit(100, 4), &mut sink, timeouts());
+
+        assert_eq!(report.stats.auto_flushes, 1);
+        assert_eq!(sink.persist_calls, 1);
+        assert_eq!(report.stats.acks_sent, 2);
+        assert_eq!(report.stats.unflushed.bytes(), 0);
+    }
+
+    /// IO-10・TASK-16.2: 超過する Write は受理前に既存滞留分を自動フラッシュする。
+    #[test]
+    fn io10_auto_flush_precheck_flushes_before_exceeding_bytes() {
+        let frames = vec![write_frame(0, b"abc"), write_frame(1, b"def")];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = persist_sink(None);
+        let config = BatchConfig::new(8).expect("valid");
+
+        let report =
+            serve_connection_with_limit(&mut conn, config, limit(100, 4), &mut sink, timeouts());
+
+        assert_eq!(report.stats.auto_flushes, 1);
+        assert_eq!(sink.persist_calls, 1);
+        assert_eq!(report.stats.unflushed.frames(), 1);
+        assert_eq!(report.stats.unflushed.bytes(), 3);
+        // 2 件目は未 ACK のままバッファに残り、終了時に破棄される。
+        assert_eq!(report.stats.acks_sent, 1);
+        assert_eq!(report.stats.discarded_pending_frames, 1);
+    }
+
+    /// IO-10・TASK-16.2: 単独で上限を超える Write は受理直後に自動フラッシュする。
+    #[test]
+    fn io10_auto_flush_oversized_single_write_flushes_immediately() {
+        let mut conn = FakeTransport::new(vec![write_frame(0, b"abcde")]);
+        let mut sink = persist_sink(None);
+        let config = BatchConfig::new(8).expect("valid");
+
+        let report =
+            serve_connection_with_limit(&mut conn, config, limit(100, 2), &mut sink, timeouts());
+
+        assert_eq!(report.stats.auto_flushes, 1);
+        assert_eq!(report.stats.acks_sent, 1);
+        assert_eq!(report.stats.unflushed.bytes(), 0);
+    }
+
+    /// IO-10・TASK-16.2: 自動フラッシュの persist 失敗はそのコードで終わる（fail-closed）。
+    #[test]
+    fn io10_auto_flush_persist_failure_ends_with_that_code() {
+        let frames = vec![
+            write_frame(0, b"a"),
+            write_frame(1, b"b"),
+            write_frame(2, b"c"),
+        ];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = persist_sink(Some(IoErrorCode::Timeout));
+        let config = BatchConfig::new(8).expect("valid");
+
+        let report =
+            serve_connection_with_limit(&mut conn, config, limit(2, 1024), &mut sink, timeouts());
+
+        assert_eq!(report.end.code(), IoErrorCode::Timeout);
+        assert_eq!(sent_kinds(&conn), vec![FrameKind::Ack; 2]);
+        assert_eq!(report.stats.persist_failed, 1);
+        assert_eq!(report.stats.auto_flushes, 0);
+        assert_eq!(report.stats.unflushed.frames(), 2);
+        assert_eq!(report.stats.frames_received, 2);
+    }
+
+    /// IO-10・TASK-16.2: persist 未対応（既定実装）の sink は `Unimplemented` で終わる。
+    #[test]
+    fn io10_auto_flush_unimplemented_persist_ends_connection() {
+        let frames = vec![write_frame(0, b"a"), write_frame(1, b"b")];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = FakeSink::new();
+        let config = BatchConfig::new(8).expect("valid");
+
+        let report =
+            serve_connection_with_limit(&mut conn, config, limit(2, 1024), &mut sink, timeouts());
+
+        assert_eq!(report.end.code(), IoErrorCode::Unimplemented);
+        assert_eq!(report.stats.auto_flushes, 0);
+    }
+
+    /// IO-10・TASK-16.2: 自動フラッシュ後も明示 Flush は FlushAck を返す。
+    #[test]
+    fn io10_explicit_flush_after_auto_flush_still_returns_flush_ack() {
+        let frames = vec![
+            write_frame(0, b"a"),
+            write_frame(1, b"b"),
+            write_frame(2, b"c"),
+            flush_frame(3),
+        ];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = persist_sink(None);
+        let config = BatchConfig::new(8).expect("valid");
+
+        let report =
+            serve_connection_with_limit(&mut conn, config, limit(2, 1024), &mut sink, timeouts());
+
+        assert_eq!(
+            sent_kinds(&conn),
+            vec![
+                FrameKind::Ack,
+                FrameKind::Ack,
+                FrameKind::Ack,
+                FrameKind::FlushAck
+            ]
+        );
+        assert_eq!(
+            conn.sent.iter().map(ack_id).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(sink.persist_calls, 2);
+        assert_eq!(report.stats.auto_flushes, 1);
+        assert_eq!(report.stats.flush_acks_sent, 1);
+    }
+
+    /// IO-10・TASK-16.2: 既定の上限では 64 件程度で発火しない（既存挙動の回帰確認）。
+    #[test]
+    fn io10_default_limit_does_not_fire_below_defaults() {
+        let frames = (0..64u64).map(|i| write_frame(i, b"x")).collect();
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = FakeSink::new();
+
+        let report = serve_connection(&mut conn, BatchConfig::default(), &mut sink, timeouts());
+
+        assert_eq!(report.stats.auto_flushes, 0);
+        assert_eq!(report.stats.unflushed.frames(), 64);
     }
 
     fn encode_request_raw_flush() -> Frame {

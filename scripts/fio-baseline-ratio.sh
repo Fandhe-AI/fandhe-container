@@ -26,13 +26,17 @@
 #     渡す運用を想定）
 #
 # 検証（いずれか 1 つでも満たさなければ exit 2。fail-closed）:
-#   - JSON として解析できる
+#   - JSON として解析できる、かつちょうど 1 個の JSON 値だけを含む（複数の JSON
+#     値が連結された入力は、後段の `jq -s` が先頭 2 個〔.[0]/.[1]〕しか使わず
+#     意図しない値同士の比率を算出しうるため拒否する）
 #   - schema_version == 1 かつ benchmark == "fio_randwrite_4k"
 #   - label が ^[a-z0-9_-]{1,64}$（fio-randwrite-4k.sh の --label と同じ制約）
 #   - metrics の 5 項目（iops・lat_mean_us・clat_p50/95/99_us）が揃い、value が
 #     有限の正数、unit が期待値と一致（0 除算の防止も兼ねる）
-#   - baseline と candidate の params が JSON の値として完全一致（異なる条件の
-#     結果同士を比較しない正当性ゲート。不一致なら差分キーを stderr に出す）
+#   - baseline と candidate の params が JSON の値として完全一致（キーの存在有無
+#     も含めて比較する。片方にキーが無く、もう片方でそのキーが null で存在する
+#     場合は不一致として扱う。異なる条件の結果同士を比較しない正当性ゲート。
+#     不一致なら差分キーを stderr に出す）
 #   - fio_version の不一致・label の一致は拒否せず stderr に警告するだけ
 #     （同一条件の繰り返し計測は正当な使い方のため）
 #
@@ -181,7 +185,22 @@ def check(cond; msg): if cond then . else error(msg) end;
 validate_content() {
   local content="$1"
   local what="$2"
+  local value_count
   local msg
+  # `jq -e` が受け付ける入力ストリームは JSON 値が複数個（ホワイトスペース区切りで
+  # 連結された JSON）でも順に処理してしまい、後段の `jq -s` は先頭 2 個
+  # （.[0]/.[1]）しか使わない。そのため 1 ファイルに複数の fio 結果が連結されて
+  # いても検証を通過し、意図しない値同士の比率を算出しうる。`jq -c '.'` は入力
+  # ストリーム中の JSON 値ごとに 1 行を出力するため、出力行数で「ちょうど 1 個」
+  # であることを確認する（invalid-input・fail-closed）。
+  if ! value_count=$(printf '%s' "$content" | jq -c '.' 2>/dev/null | wc -l | tr -d ' '); then
+    err "invalid-input" "${what} is not valid JSON"
+    exit 2
+  fi
+  if [ "$value_count" -ne 1 ]; then
+    err "invalid-input" "${what} must contain exactly one JSON value (found ${value_count})"
+    exit 2
+  fi
   if ! msg=$(printf '%s' "$content" | jq -e "$validate_jq_program" 2>&1 >/dev/null); then
     err "invalid-input" "${what} failed schema validation: ${msg}"
     exit 2
@@ -203,7 +222,7 @@ params_diff=$(printf '%s\n%s\n' "$baseline_content" "$candidate_content" | jq -s
   (.[0].params) as $bp
   | (.[1].params) as $cp
   | ([$bp, $cp] | add | keys_unsorted | unique) as $keys
-  | [ $keys[] | select($bp[.] != $cp[.]) ]
+  | [ $keys[] as $k | select(($bp | has($k)) != ($cp | has($k)) or $bp[$k] != $cp[$k]) | $k ]
 ')
 if [ "$(printf '%s' "$params_diff" | jq 'length')" -gt 0 ]; then
   err "invalid-input" "baseline and candidate params differ: $(printf '%s' "$params_diff" | jq -c '.')"

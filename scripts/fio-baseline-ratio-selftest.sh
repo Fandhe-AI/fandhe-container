@@ -227,6 +227,26 @@ for missing_tool in jq grep head wc tr; do
 done
 
 # --------------------------------------------------
+# case 10: 1 ファイルに JSON 値が複数連結されている（--baseline）
+# 後段の `jq -s` が先頭 2 個（.[0]/.[1]）しか使わないため、検証をすり抜けて
+# 意図しない値同士の比率を算出しうる入力を拒否できることを照合する。
+# --------------------------------------------------
+multi_value_path="${tmp_root}/baseline-multi-value.json"
+cat "${fixtures_dir}/baseline-ok.json" "${fixtures_dir}/candidate-ok.json" >"$multi_value_path"
+run_case_msg "multi-json-value-rejected" 2 "exactly one JSON value" --baseline "$multi_value_path" --candidate "${fixtures_dir}/candidate-ok.json"
+
+# --------------------------------------------------
+# case 11: params のキー欠落と null の区別
+# baseline 側に params.extra = null（キーは存在する）を追加し、candidate 側には
+# そのキー自体が無い場合、`$bp[.] != $cp[.]`（値のみの比較）だと両者とも
+# jq 上で null になり一致と誤判定してしまう。キーの存在も比較対象にして
+# 不一致として検出できることを照合する。
+# --------------------------------------------------
+params_null_path="${tmp_root}/baseline-params-null-key.json"
+jq '.params.extra = null' "${fixtures_dir}/baseline-ok.json" >"$params_null_path"
+run_case_msg "params-missing-vs-null-key" 2 "params differ" --baseline "$params_null_path" --candidate "${fixtures_dir}/candidate-ok.json"
+
+# --------------------------------------------------
 # サマリー
 # --------------------------------------------------
 if [ "$failures" -eq 0 ]; then

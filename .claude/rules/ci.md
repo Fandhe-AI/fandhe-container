@@ -20,7 +20,7 @@ make ci          # 上記 + lint-docs + deny を一括実行
 4. ベンチ回帰チェック（15% 超の悪化で fail。REPAIR-8）
 5. セキュリティチェック（`cargo deny`・禁止 API / 禁止クレート検査。REPAIR-9・MVM-4）
 
-現状の `.github/workflows/ci.yml` は lint-docs・1・2・3（`integration-test` ジョブ）・4 の比較の仕組み（`bench-regression` ジョブ）・5（rust-base-ci）相当のすべてを持ち、発火条件は `workflow_dispatch`・`pull_request`・`push`（main）で稼働している（TASK-86.1・TASK-86.2・TASK-86.3・REPAIR-7）。
+現状の `.github/workflows/ci.yml` は lint-docs・1・2・3（`integration-test` ジョブ）・4 の比較の仕組み（`bench-regression` ジョブ）・5（rust-base-ci）相当のすべてに加え、アーキ網羅の型検査ゲート（`aarch64-linux-check` ジョブ）を持ち、発火条件は `workflow_dispatch`・`pull_request`・`push`（main）で稼働している（TASK-86.1・TASK-86.2・TASK-86.3・REPAIR-7）。
 
 ステージ 3（タイムアウト保護された結合試験）は `integration-test` ジョブ（3 OS matrix。実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes）が担う（TASK-86.2・#36）。
 
@@ -32,6 +32,7 @@ make ci          # 上記 + lint-docs + deny を一括実行
 - matrix は ubuntu / macos / windows の 3 OS を必須とし、特定 OS のみの skip で CI を通さない
 - OS 依存のファイルシステム挙動（パス・大文字小文字・ロック・改行）のテストは 3 OS すべてで実行する
 - ベンチ回帰チェック（`bench-regression` ジョブ）は例外として ubuntu-latest 単独で実行する。ベンチの数値は OS 間の実行環境差で比較できず、3 OS matrix にしても意味のある回帰検出にならないため（本節の「3 OS 必須」はビルド・テストのゲートを対象とする規則であり、ベンチ回帰チェックはその対象外）
+- Linux aarch64 向けクロス型検査（`aarch64-linux-check` ジョブ。#1120・REPAIR-7）も例外として ubuntu-latest（x86_64）単独で実行する。`cargo check` / `cargo clippy --target aarch64-unknown-linux-gnu` で `cfg(target_arch = "aarch64")` 分岐をコンパイル検査するだけで、リンクもテスト実行もしないアーキ網羅の型検査ゲートであり、ビルド・テストのゲートではないため「ネイティブランナーでビルド・テスト」「3 OS 必須」の対象外とする。aarch64 での実行時の正しさの検証はネイティブ arm64 ランナーでのテスト実行がフォローアップ課題であり、現状は保証しない。外部依存が 0 件でクロスリンカ不要という前提のため、`cc` 等ネイティブビルドを伴う依存を追加する場合は見直す
 
 ## 実機前提テスト
 

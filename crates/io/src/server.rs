@@ -699,6 +699,10 @@ type PendingEvent<C> = Box<dyn FnOnce(&mut C) + Send>;
 /// フックへ集約イベント（`ResourceExhausted`）として通知する（REPAIR-4）。
 const MAX_PENDING_EVENTS: usize = 1024;
 
+/// 1 回の `notify` / `with` が排出する保留イベントの最大件数（REPAIR-5: 並行通知が続いても
+/// I/O 経路が期限内に戻れるよう有限にする）。保留キューの上限と同じ値にし、静穏時は 1 回で全件を排出できる。
+const MAX_DRAIN_PER_CALL: usize = MAX_PENDING_EVENTS;
+
 struct SharedObserverInner<C: ServerObserver> {
     hook: Mutex<C>,
     pending: Mutex<VecDeque<PendingEvent<C>>>,
@@ -741,16 +745,14 @@ impl<C: ServerObserver> SharedObserver<C> {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// 保留キューを空になるまでフックへ適用する（フックのロック保持中に呼ぶ）。
+    /// 保留キューを最大 `budget` 件までフックへ適用する（フックのロック保持中に呼ぶ）。
     /// キューのロックは `on_event` の実行中は保持しない。
-    fn drain_locked(&self, hook: &mut C) {
-        loop {
-            let next = self.lock_pending().pop_front();
-            match next {
-                Some(event) => event(hook),
-                None => break,
-            }
-        }
+    ///
+    /// 並行して通知が積まれ続けても 1 回の排出が有限で終わるよう件数で打ち切る
+    /// （I/O 経路の `IoTimeout` 期限を守る。REPAIR-5）。残りは保留キューに残り、
+    /// 次の `notify` / `with` の排出が引き継ぐ（欠落はしない。REPAIR-4）。
+    /// 欠落サマリはフック側の上限で捨てられないよう、キュー本体より先に適用する。
+    fn drain_locked(&self, hook: &mut C, budget: &mut usize) {
         // 上限超過で捨てた分は件数だけ記録してあるので、集約イベントで欠落を知らせる。
         let dropped = self.0.dropped.swap(0, Ordering::AcqRel);
         if dropped > 0 {
@@ -767,6 +769,16 @@ impl<C: ServerObserver> SharedObserver<C> {
                 &err,
             );
         }
+        while *budget > 0 {
+            let next = self.lock_pending().pop_front();
+            match next {
+                Some(event) => {
+                    event(hook);
+                    *budget -= 1;
+                }
+                None => break,
+            }
+        }
     }
 
     /// ロックを取って `f` を適用し、その間に積まれた保留イベントも排出する。
@@ -774,7 +786,8 @@ impl<C: ServerObserver> SharedObserver<C> {
         let result = {
             let mut guard = self.0.hook.lock().unwrap_or_else(PoisonError::into_inner);
             let r = f(&mut guard);
-            self.drain_locked(&mut guard);
+            let mut budget = MAX_DRAIN_PER_CALL;
+            self.drain_locked(&mut guard, &mut budget);
             r
         };
         // 解放直前に他方が積んで try_lock に失敗した分を取りこぼさない。
@@ -784,14 +797,15 @@ impl<C: ServerObserver> SharedObserver<C> {
 
     /// ロックが取れる間、保留イベントを排出する。取れなければ保持側に任せる。
     fn flush(&self) {
-        loop {
+        let mut budget = MAX_DRAIN_PER_CALL;
+        while budget > 0 {
             {
                 let mut guard = match self.0.hook.try_lock() {
                     Ok(g) => g,
                     Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                     Err(std::sync::TryLockError::WouldBlock) => return,
                 };
-                self.drain_locked(&mut guard);
+                self.drain_locked(&mut guard, &mut budget);
             }
             if self.lock_pending().is_empty() && self.0.dropped.load(Ordering::Acquire) == 0 {
                 return;
@@ -3763,12 +3777,36 @@ mod shared_observer_tests {
         });
         observer.with(|rec| {
             assert_eq!(rec.events.len(), MAX_PENDING_EVENTS + 1);
-            let (failed, msg) = rec.events.last().cloned().expect("summary event");
+            // サマリはキュー本体より先に適用される（フック側の上限で捨てられないため）。
+            let (failed, msg) = rec.events.first().cloned().expect("summary event");
             assert!(failed);
             assert_eq!(
                 msg.as_deref(),
                 Some("observer event queue overflowed; 3 events were dropped")
             );
         });
+    }
+
+    /// REPAIR-5・#1118: 1 回の排出は `MAX_DRAIN_PER_CALL` 件で打ち切り、残りは保留のまま
+    /// 次の排出が引き継ぐ（並行通知で I/O 経路が戻れなくならない）。
+    #[test]
+    fn repair5_drain_is_bounded_per_call_and_remainder_is_kept() {
+        let observer = SharedObserver::new(Recorder::default());
+        {
+            let mut q = observer.lock_pending();
+            for _ in 0..(MAX_DRAIN_PER_CALL + 5) {
+                q.push_back(Box::new(|o: &mut Recorder| {
+                    o.events.push((false, None));
+                }));
+            }
+        }
+        let mut guard = observer.0.hook.lock().unwrap();
+        let mut budget = MAX_DRAIN_PER_CALL;
+        observer.drain_locked(&mut guard, &mut budget);
+        assert_eq!(guard.events.len(), MAX_DRAIN_PER_CALL);
+        assert_eq!(observer.lock_pending().len(), 5);
+        let mut budget = MAX_DRAIN_PER_CALL;
+        observer.drain_locked(&mut guard, &mut budget);
+        assert_eq!(guard.events.len(), MAX_DRAIN_PER_CALL + 5);
     }
 }

@@ -1406,6 +1406,8 @@ mod tests {
         assert!(err.message().contains("\"Foo\""), "{}", err.message());
         assert!(!t.0.join("foo").exists());
         assert_eq!(std::fs::read(t.0.join("Foo")).expect("read"), b"theirs");
+        // 退避名も残らない（自分の葉は退避名へ移したうえで消した）。
+        assert_eq!(entries(&t.0), 1);
         assert_eq!(c.tracked_len().expect("len"), 0);
     }
 
@@ -1458,6 +1460,95 @@ mod tests {
         assert_eq!(std::fs::read(t.0.join("foo")).expect("read"), b"theirs");
         assert_eq!(std::fs::read(t.0.join("Foo")).expect("read"), b"variant");
         assert_eq!(c.tracked_len().expect("len"), 0);
+    }
+
+    /// 作成直後に葉が改名された場合（大小違いは無い）、返す fd は共有パスから
+    /// 辿れないため sink を返さず `Internal` にする（Codex P1 指摘。改名先の実体には
+    /// 触らない）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn io5_leaf_renamed_after_create_is_rejected() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let root = t.0.clone();
+        fault::set_hook(fault::Hook::AfterCreate, move || {
+            std::fs::rename(root.join("foo"), root.join("bar")).expect("rename");
+        });
+        let err = c.create_file("foo").err().expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "created guest path was removed or renamed during create"
+        );
+        assert!(t.0.join("bar").is_file());
+        assert!(!t.0.join("foo").exists());
+        assert_eq!(c.tracked_len().expect("len"), 0);
+    }
+
+    /// 作成直後に祖先が改名された場合も同様に拒否し、改名先の中の自分の葉は
+    /// 保持ハンドル経由で取り消す。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn io5_ancestor_renamed_after_create_is_rejected() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let root = t.0.clone();
+        fault::set_hook(fault::Hook::AfterCreate, move || {
+            std::fs::rename(root.join("d"), root.join("moved")).expect("rename");
+        });
+        let err = c.create_file("d/f").err().expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+        assert!(
+            err.message()
+                .ends_with("created guest path was removed or renamed during create"),
+            "{}",
+            err.message()
+        );
+        assert!(!t.0.join("moved").join("f").exists());
+        assert!(!t.0.join("d").exists());
+        assert_eq!(c.tracked_len().expect("len"), 0);
+    }
+
+    /// 取り消しの同一性確認の直後に、葉の名前へ他者のファイルが差し込まれた場合、
+    /// それを消さずに退避名へ移して残し、退避名を報告する（Codex P0 指摘。
+    /// 大小違いを作れるのは大文字小文字を区別する FS のみのため Linux 限定）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io5_rollback_race_moves_foreign_file_to_quarantine() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let external = t.0.join("Foo");
+        fault::set_hook(fault::Hook::BeforeCreate, move || {
+            std::fs::write(external, b"variant").expect("variant");
+        });
+        let root = t.0.clone();
+        fault::set_hook(fault::Hook::BeforeQuarantine, move || {
+            std::fs::write(root.join("other"), b"theirs").expect("other");
+            std::fs::rename(root.join("other"), root.join("foo")).expect("replace");
+        });
+        let err = c.create_file("foo").err().expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+        assert!(
+            err.message().starts_with(
+                "created guest file could not be rolled back (entry was replaced before rollback; moved entry left at \".fandhe-rollback-"
+            ),
+            "{}",
+            err.message()
+        );
+        let quarantined: Vec<_> = std::fs::read_dir(&t.0)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().into_string().expect("utf-8"))
+            .filter(|n| n.starts_with(".fandhe-rollback-"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        let moved = quarantined.first().expect("quarantined entry");
+        assert!(err.message().contains(moved.as_str()), "{}", err.message());
+        assert_eq!(std::fs::read(t.0.join(moved)).expect("read"), b"theirs");
+        assert!(!t.0.join("foo").exists());
+        assert_eq!(std::fs::read(t.0.join("Foo")).expect("read"), b"variant");
     }
 
     /// 構築後にルートのパスを範囲外への symlink へ差し替えても、作成は保持した

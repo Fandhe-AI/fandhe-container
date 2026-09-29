@@ -1157,6 +1157,32 @@ mod tests {
             assert_eq!(read_dir_entries(&root, 1), Err(ReadDirError::TooMany));
         }
 
+        /// IO-5・TASK-19.2: `rename_beneath` は同じディレクトリ内で改名し（symlink は
+        /// 辿らず symlink 自体を移す）、元が無ければ `Io(NotFound)`。
+        #[test]
+        fn io5_rename_beneath_moves_entry_within_dir() {
+            let t = TmpDir::new("mv");
+            let outside = TmpDir::new("mv-out");
+            std::fs::write(t.0.join("a"), b"payload").expect("a");
+            std::os::unix::fs::symlink(outside.0.join("victim"), t.0.join("l")).expect("symlink");
+            let root = t.open();
+            assert_eq!(rename_beneath(&root, "a", "b"), Ok(()));
+            assert!(!t.0.join("a").exists());
+            assert_eq!(std::fs::read(t.0.join("b")).expect("b"), b"payload");
+            assert_eq!(rename_beneath(&root, "l", "m"), Ok(()));
+            assert!(
+                std::fs::symlink_metadata(t.0.join("m"))
+                    .expect("m")
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(!outside.0.join("victim").exists());
+            assert_eq!(
+                rename_beneath(&root, "missing", "x"),
+                Err(BeneathError::Io(io::ErrorKind::NotFound))
+            );
+        }
+
         /// IO-5・TASK-19.2: `unlink_beneath` は通常ファイル・空ディレクトリを消し、
         /// 空でないディレクトリは消さない。
         #[test]

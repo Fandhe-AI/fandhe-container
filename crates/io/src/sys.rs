@@ -27,8 +27,8 @@
 //!   `crate::writeback::AppendFileSink::get_ref()` が返す `&File` の fd を渡して
 //!   呼ぶ想定（本 issue の時点ではまだ呼び出し元がない。REPAIR-3）。
 //! - Linux（x86_64 / aarch64）・macOS: `openat(2)`・`mkdirat(2)`・`unlinkat(2)`・
-//!   `fdopendir(3)`/`readdir(3)` でディレクトリハンドル相対にファイル・
-//!   ディレクトリを作る・開く・消す・列挙する（TASK-19.2・IO-5・#100。
+//!   `renameat(2)`・`fdopendir(3)`/`readdir(3)` でディレクトリハンドル相対に
+//!   ファイル・ディレクトリを作る・開く・消す・改名する・列挙する（TASK-19.2・IO-5・#100。
 //!   `crate::guest_files` が共有ルート配下への作成で使う。下記「ハンドル相対の
 //!   ファイル操作」節）。
 //!
@@ -47,7 +47,7 @@
 //! - `unsafe fn` はこのモジュールの外へ公開しない。公開するのは安全な関数
 //!   （[`peer_uid`]・[`effective_uid`]・[`syncfs`]・[`mkdir_beneath`]・
 //!   [`open_dir_beneath`]・[`create_leaf_beneath`]・[`unlink_beneath`]・
-//!   [`read_dir_entries`]）のみで、`unsafe` はこのモジュール内に閉じる
+//!   [`rename_beneath`]・[`read_dir_entries`]）のみで、`unsafe` はこのモジュール内に閉じる
 //! - すべての `unsafe` ブロック・`unsafe extern "C"` 宣言に `// SAFETY:` で
 //!   理由と維持すべき不変条件を明記する
 //! - `fd` は呼び出し元が `&UnixStream`（または [`syncfs`] の場合 `AsFd`）を
@@ -386,7 +386,7 @@ pub(crate) fn syncfs(fd: impl AsFd) -> Result<(), IoError> {
 // `d_ino(8) d_seekoff(8) d_reclen(2) d_namlen(2) d_type(1) d_name`。
 
 /// ハンドル相対の操作（[`mkdir_beneath`]・[`open_dir_beneath`]・
-/// [`create_leaf_beneath`]・[`unlink_beneath`]）の失敗種別
+/// [`create_leaf_beneath`]・[`unlink_beneath`]・[`rename_beneath`]）の失敗種別
 /// （`crate::guest_files` が `IoError` へ写す。ホストのパスや errno の説明文は
 /// 載せない）。
 #[cfg_attr(
@@ -517,7 +517,8 @@ mod beneath_consts {
 }
 
 pub(crate) use beneath::{
-    create_leaf_beneath, mkdir_beneath, open_dir_beneath, read_dir_entries, unlink_beneath,
+    create_leaf_beneath, mkdir_beneath, open_dir_beneath, read_dir_entries, rename_beneath,
+    unlink_beneath,
 };
 
 /// 対応アーキテクチャ（macOS・Linux の x86_64 / aarch64）向けの実装。
@@ -553,6 +554,15 @@ mod beneath {
             // SAFETY（宣言そのものの妥当性）: POSIX の
             // `int unlinkat(int dirfd, const char *path, int flags)`。
             pub(super) fn unlinkat(dirfd: i32, path: *const c_char, flags: i32) -> i32;
+            // SAFETY（宣言そのものの妥当性）: POSIX の
+            // `int renameat(int olddirfd, const char *old, int newdirfd, const char *new)`
+            // （Linux・macOS とも接尾辞なしの同名シンボル）。
+            pub(super) fn renameat(
+                olddirfd: i32,
+                old: *const c_char,
+                newdirfd: i32,
+                new: *const c_char,
+            ) -> i32;
 
             // SAFETY（宣言そのものの妥当性）: POSIX の `DIR *fdopendir(int fd)`・
             // `struct dirent *readdir(DIR *)`・`void rewinddir(DIR *)`・
@@ -706,6 +716,25 @@ mod beneath {
         }
     }
 
+    /// `dir` 直下のエントリ `from` を同じ `dir` 直下の `to` へ改名する
+    /// （`renameat`。symlink は辿らない）。`to` が既にあれば置き換える POSIX の
+    /// 意味論のため、呼び出し元は `to` に他者が使わない名前を渡す
+    /// （`crate::guest_files` の取り消し用の退避名）。
+    pub(crate) fn rename_beneath(dir: &File, from: &str, to: &str) -> Result<(), BeneathError> {
+        let cfrom = cstr(from)?;
+        let cto = cstr(to)?;
+        let fd = dir.as_raw_fd();
+        // SAFETY: `dir` は呼び出し元が借用中の有効なディレクトリ fd（旧・新の
+        // 両方に同じ fd を渡す）。`cfrom`・`cto` は NUL 終端の有効な C 文字列で
+        // 呼び出しの間生きている。renameat は fd を返さず、失敗時は errno を直後に拾う。
+        let rc = unsafe { raw::renameat(fd, cfrom.as_ptr(), fd, cto.as_ptr()) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(BeneathError::Io(last_errno().1))
+        }
+    }
+
     fn set_errno_zero() {
         // SAFETY: スレッドローカルな errno へのポインタ（常に有効・整列済み）を
         // 得て 0 を書くだけ。
@@ -819,6 +848,10 @@ mod beneath {
         _name: &str,
         _target: UnlinkTarget,
     ) -> Result<(), BeneathError> {
+        Err(BeneathError::Io(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn rename_beneath(_dir: &File, _from: &str, _to: &str) -> Result<(), BeneathError> {
         Err(BeneathError::Io(io::ErrorKind::Unsupported))
     }
 

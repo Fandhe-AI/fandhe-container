@@ -68,17 +68,36 @@
 //! 別インスタンスが大小違いの項目（`Foo` に対する `foo`）を作ると、大文字小文字を
 //! 区別するホスト（Linux・大文字小文字を区別する APFS）では両方の作成が成功し
 //! うる。そこで `O_EXCL` での作成の直後に、作成に使ったのと同じディレクトリ
-//! ハンドル（名前で開き直さない）を各階層で読み直し、自分のコンポーネントと
-//! 大文字小文字だけが違うエントリが現れていないかを再検証する。見つかれば、
-//! 自分が作った葉（と新設した空の祖先）だけを取り消して `AlreadyExists`
-//! （`case-insensitive path collision`）を返す。再検証の読み取りに失敗した場合も
-//! 取り消して `Internal` を返す（検証できないまま sink を返さない）。
+//! ハンドル（名前で開き直さない）を各階層で読み直し、次の 2 点を再検証する。
+//! - 同一性: 自分のコンポーネント名のエントリが、保持している祖先のハンドル・
+//!   葉の fd と同じ inode を指している（作成直後に改名・削除・差し替えされて
+//!   いれば、返す fd は共有パスから辿れないため取り消して `Internal`）。親と子の
+//!   デバイスが違う階層はマウントポイントとして照合しない（readdir は下層の inode を
+//!   返し、マウントポイントは改名・削除が EBUSY で拒否される）
+//! - 衝突: 自分のコンポーネントと大文字小文字だけが違うエントリが現れていない
+//!   （見つかれば、自分が作った葉と新設した空の祖先だけを取り消して
+//!   `AlreadyExists`〔`case-insensitive path collision`〕）
 //!
-//! 取り消しは「親ハンドルを読み直したエントリの `d_ino` が、保持している作成済み
-//! fd の inode と一致し、両者のデバイスも一致する」ことを確かめてから
-//! `unlinkat` する。一致しない（別の実体へ差し替えられた）・確かめられない場合は
-//! 消さずに残し、`Internal`（`created guest file could not be rolled back`）を
-//! 返す（他者のデータを消さない側に倒す）。
+//! 再検証の読み取りに失敗した場合も取り消して `Internal` を返す（検証できないまま
+//! sink を返さない）。同一性の照合は `d_ino` と `st_ino` が一致する FS（ext4・xfs・
+//! btrfs・APFS・同一 FS 上の overlayfs 等）を前提とし、一致しない FS では作成が
+//! `Internal` で失敗する（fail-closed）。
+//!
+//! 取り消しは他者のデータを消さない手順で行う（`remove_file_if_same`）:
+//! 1. 読み直した葉の `d_ino` が保持 fd の inode と一致し、デバイスも一致することを
+//!    確かめる（違えば触らずに `Internal`〔`created guest file could not be rolled
+//!    back`〕）
+//! 2. 葉を、他者が使わない退避名（`.fandhe-rollback-<pid>-<n>-<nanos>`）へ
+//!    `renameat` で移す。名前の付け替えは原子的なので、1 の直後に別の実体が葉の
+//!    名前へ差し込まれていても、それは消えずに退避名へ移るだけになる
+//! 3. 退避名の `d_ino` が保持 fd と一致するときだけ `unlinkat` する。一致しなければ
+//!    退避名のまま残し、退避名を含めて `Internal` を返す（運用者が戻せる）
+//! 4. `unlinkat` の後に保持 fd のリンク数が 1 減ったことを確かめる。減っていなければ
+//!    他者のエントリを消した可能性として `Internal` を返す（黙って成功にしない）
+//!
+//! 新設した祖先は、同一性を確かめてから `unlinkat(AT_REMOVEDIR)` で取り除く。
+//! 確認から削除までの間に差し替えられても、消えうるのは空のディレクトリだけ
+//! （空でなければ失敗し、そこで取り消しを止めて残す）。
 //!
 //! 保証の範囲:
 //! - 本方式に従う作成者（本型の別インスタンス・別プロセス）どうしでは、大小違いの
@@ -89,9 +108,12 @@
 //! - 本方式に従わない書き込み元（ホストの別プロセスが直接作る等）が、こちらの
 //!   再検証の読み取りより後に大小違いの項目を作った場合は検出できない（次回の
 //!   作成時の走査で既存衝突として検出され、以降の作成は中止される）。
-//! - 同一性の確認から `unlinkat` までの間に、別プロセスが同じ名前へ別の実体を
-//!   rename で差し込むと、その実体を消しうる（fd を指定して名前を消す POSIX API が
-//!   無いため閉じられない窓。確認と削除は連続して行い窓を最小にする）。
+//! - 取り消しで他者のファイルを消しうるのは、3 の確認から `unlinkat` までの間に
+//!   退避名へ別の実体を rename で差し込まれた場合だけ（fd を指定して名前を消す
+//!   POSIX API が無いため閉じられない窓）。退避名は予測されにくく、正当な書き込み
+//!   元が狙う名前ではない。これを狙える者は共有ディレクトリへの書き込み権限を持ち、
+//!   元から任意のエントリを直接消せるため、権限の昇格にもならない。起きた場合も
+//!   4 で検出して報告する。
 //! - プロセス間で完全な排他を取るものではない（共有ルートをまたぐロックは持たない）。
 //! - 大文字小文字を区別しないホスト（既定の APFS・NTFS）では、大小違いの作成は
 //!   `O_EXCL` / `create_new` が既存として失敗するため、この競合自体が起きない。
@@ -592,9 +614,16 @@ fn create_beneath(
 }
 
 /// 作成直後の再検証（Linux / macOS。モジュール doc「プロセス間の競合」）。
-/// 各階層で、作成に使ったディレクトリハンドルを読み直し、自分のコンポーネントと
-/// 大文字小文字だけが違うエントリがあれば取り消して衝突を返す。読み取りに
-/// 失敗した場合も取り消して返す（検証できないまま sink を返さない。fail-closed）。
+/// 各階層で、作成に使ったディレクトリハンドルを読み直し、次の 2 点を確かめる。
+/// - 同一性: 自分のコンポーネント名のエントリが、保持しているハンドル（祖先の
+///   ディレクトリ・葉のファイル）と同じ inode を指している（作成直後に改名・削除・
+///   差し替えされていれば、返す fd は共有パスから辿れないため `Internal`）。親と子の
+///   デバイスが違う階層はマウントポイント（readdir は下層の inode を返す。改名・
+///   削除は EBUSY で拒否される）のため照合しない
+/// - 衝突: 自分のコンポーネントと大文字小文字だけが違うエントリが無い
+///
+/// どちらかを満たさない・読み取りに失敗した場合は取り消して返す（検証できないまま
+/// sink を返さない。fail-closed）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn verify_created(
     created: Created,
@@ -604,18 +633,56 @@ fn verify_created(
     max_entries: usize,
 ) -> Result<File, IoError> {
     use crate::fs_normalize::{collision_error, fold_component};
+    use std::os::unix::fs::MetadataExt;
 
+    let fail = |created: &Created, err: IoError| {
+        rollback_after(created, ancestors, leaf, max_entries, err)
+    };
     let mut prefix = String::new();
     for level in 0..=ancestors.len() {
         let component = ancestors.get(level).copied().unwrap_or(leaf);
-        let Some(dir) = created.dirs.get(level) else {
+        let child = if level < ancestors.len() {
+            created.dirs.get(level + 1)
+        } else {
+            Some(&created.file)
+        };
+        let (Some(dir), Some(child)) = (created.dirs.get(level), child) else {
             let err = internal("failed to verify guest directory", ErrorKind::Other);
-            return Err(rollback_after(&created, ancestors, leaf, max_entries, err));
+            return Err(fail(&created, err));
+        };
+        let metas = dir
+            .metadata()
+            .and_then(|d| child.metadata().map(|c| (d, c)));
+        let (dir_meta, child_meta) = match metas {
+            Ok(metas) => metas,
+            Err(err) => {
+                let err = internal("failed to verify guest directory", err.kind());
+                return Err(fail(&created, err));
+            }
         };
         let entries = match scan_handle(dir, max_entries, "failed to verify guest directory") {
             Ok(entries) => entries,
-            Err(err) => return Err(rollback_after(&created, ancestors, leaf, max_entries, err)),
+            Err(err) => return Err(fail(&created, err)),
         };
+        if dir_meta.dev() == child_meta.dev() {
+            match entries.iter().find(|entry| entry.name == component) {
+                Some(entry) if entry.ino == child_meta.ino() => {}
+                Some(_) => {
+                    let err = IoError::new(
+                        IoErrorCode::Internal,
+                        "created guest path was replaced during create",
+                    );
+                    return Err(fail(&created, err));
+                }
+                None => {
+                    let err = IoError::new(
+                        IoErrorCode::Internal,
+                        "created guest path was removed or renamed during create",
+                    );
+                    return Err(fail(&created, err));
+                }
+            }
+        }
         let folded = fold_component(component);
         let other = entries
             .iter()
@@ -623,7 +690,7 @@ fn verify_created(
             .find(|name| *name != component && fold_component(name) == folded);
         if let Some(other) = other {
             let err = collision_error(guest_path, &format!("{prefix}{other}"), component, other);
-            return Err(rollback_after(&created, ancestors, leaf, max_entries, err));
+            return Err(fail(&created, err));
         }
         prefix.push_str(component);
         prefix.push('/');
@@ -644,7 +711,7 @@ fn verify_created(
 }
 
 /// `created` を取り消し、成功すれば `cause` を、取り消せなければ取り消し失敗の
-/// `Internal`（`cause` のメッセージを併記）を返す。
+/// `Internal`（理由と `cause` のメッセージを併記）を返す。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rollback_after(
     created: &Created,
@@ -665,29 +732,19 @@ fn rollback_after(
     }
 }
 
-/// 取り消しで 1 エントリを消した結果。
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-enum Removal {
-    /// 同一性を確かめて消した、または既に無かった。
-    Done,
-    /// ディレクトリが空でなかった（他者が中に作った）ため残した。
-    InUse,
-}
-
-/// 作成した葉と、新設した空の祖先を取り消す。失敗の理由（パスを含まない固定文言）
-/// を返す。
+/// 作成した葉と、新設した空の祖先を取り消す。失敗の理由（ホストのパスを含まない。
+/// 退避名を含むことがある）を返す。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rollback_created(
     created: &Created,
     ancestors: &[&str],
     leaf: &str,
     max_entries: usize,
-) -> Result<(), &'static str> {
-    use crate::sys::UnlinkTarget;
+) -> Result<(), String> {
     let Some(parent) = created.dirs.last() else {
-        return Err("missing parent handle");
+        return Err("missing parent handle".to_string());
     };
-    remove_if_same(parent, leaf, &created.file, UnlinkTarget::File, max_entries)?;
+    remove_file_if_same(parent, leaf, &created.file, max_entries)?;
     rollback_dirs(&created.dirs, &created.made, ancestors, max_entries)
 }
 
@@ -699,8 +756,7 @@ fn rollback_dirs(
     made: &[bool],
     ancestors: &[&str],
     max_entries: usize,
-) -> Result<(), &'static str> {
-    use crate::sys::UnlinkTarget;
+) -> Result<(), String> {
     for level in (0..made.len()).rev() {
         if made.get(level) != Some(&true) {
             return Ok(());
@@ -708,56 +764,164 @@ fn rollback_dirs(
         let (Some(parent), Some(dir), Some(name)) =
             (dirs.get(level), dirs.get(level + 1), ancestors.get(level))
         else {
-            return Err("missing ancestor handle");
+            return Err("missing ancestor handle".to_string());
         };
-        match remove_if_same(parent, name, dir, UnlinkTarget::EmptyDirectory, max_entries)? {
-            Removal::Done => {}
-            Removal::InUse => return Ok(()),
+        if !remove_empty_dir_if_same(parent, name, dir, max_entries)? {
+            return Ok(());
         }
     }
     Ok(())
 }
 
-/// `parent` 直下の `name` が、保持しているハンドル `expected` と同じ実体
-/// （デバイスと inode が一致）であることを確かめてから `unlinkat` で消す。
-/// 一致しない・確かめられない場合は消さずにエラーを返す（他者のデータを消さない）。
+/// `parent` を読み直し、`name` のエントリの inode を返す（無ければ `None`）。
+/// `expected` と `parent` のデバイスが違う場合は同一性を確かめられないため失敗する。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn remove_if_same(
+fn entry_ino(
     parent: &File,
     name: &str,
     expected: &File,
-    target: crate::sys::UnlinkTarget,
     max_entries: usize,
-) -> Result<Removal, &'static str> {
-    use crate::sys::{BeneathError, UnlinkTarget, unlink_beneath};
+) -> Result<(Option<u64>, Vec<crate::sys::DirEntryName>, u64), String> {
     use std::os::unix::fs::MetadataExt;
-
     let expected_meta = expected
         .metadata()
-        .map_err(|_| "cannot stat created entry")?;
-    let parent_meta = parent.metadata().map_err(|_| "cannot stat parent")?;
+        .map_err(|_| "cannot stat created entry".to_string())?;
+    let parent_meta = parent
+        .metadata()
+        .map_err(|_| "cannot stat parent".to_string())?;
     if expected_meta.dev() != parent_meta.dev() {
-        return Err("created entry is on a different device");
+        return Err("created entry is on a different device".to_string());
     }
     let entries = scan_handle(parent, max_entries, "failed to scan guest directory")
-        .map_err(|_| "cannot re-read parent directory")?;
-    let Some(entry) = entries.iter().find(|entry| entry.name == name) else {
-        // 既に無い（他者が消した・改名した）。取り消す対象がない。
-        return Ok(Removal::Done);
-    };
-    if entry.ino != expected_meta.ino() {
-        return Err("entry was replaced by another object");
-    }
-    match unlink_beneath(parent, name, target) {
-        Ok(()) | Err(BeneathError::Io(ErrorKind::NotFound)) => Ok(Removal::Done),
-        // rmdir の非空は ENOTEMPTY（POSIX は EEXIST も許す）。
-        Err(BeneathError::Io(ErrorKind::DirectoryNotEmpty | ErrorKind::AlreadyExists))
-            if target == UnlinkTarget::EmptyDirectory =>
-        {
-            Ok(Removal::InUse)
+        .map_err(|_| "cannot re-read parent directory".to_string())?;
+    let ino = entries
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.ino);
+    Ok((ino, entries, expected_meta.ino()))
+}
+
+/// 本呼び出しが新設した空の祖先 `parent`/`name` を、保持ハンドル `expected` と
+/// 同じ inode であることを確かめてから `unlinkat(AT_REMOVEDIR)` で取り除く。
+/// 取り除いた・既に無い場合は `true`、空でない（他者が中に作った）ため残した場合は
+/// `false`。確認から削除までの間に差し替えられても、消えうるのは空のディレクトリ
+/// だけ（`AT_REMOVEDIR` は空でなければ失敗する）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_empty_dir_if_same(
+    parent: &File,
+    name: &str,
+    expected: &File,
+    max_entries: usize,
+) -> Result<bool, String> {
+    use crate::sys::{BeneathError, UnlinkTarget, unlink_beneath};
+    let (found, _, ino) = entry_ino(parent, name, expected, max_entries)?;
+    match found {
+        None => return Ok(true),
+        Some(found) if found != ino => {
+            return Err("ancestor was replaced by another object".to_string());
         }
-        Err(_) => Err("unlink failed"),
+        Some(_) => {}
     }
+    match unlink_beneath(parent, name, UnlinkTarget::EmptyDirectory) {
+        Ok(()) | Err(BeneathError::Io(ErrorKind::NotFound)) => Ok(true),
+        // rmdir の非空は ENOTEMPTY（POSIX は EEXIST も許す）。
+        Err(BeneathError::Io(ErrorKind::DirectoryNotEmpty | ErrorKind::AlreadyExists)) => Ok(false),
+        Err(_) => Err("rmdir failed".to_string()),
+    }
+}
+
+/// 取り消し用の退避名を決める（小文字・数字・`-`・`.` だけで、既存のエントリ名と
+/// 重ならないもの。大文字小文字の衝突も起こさない）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quarantine_name(entries: &[crate::sys::DirEntryName]) -> Option<String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    (0..8).find_map(|_| {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".fandhe-rollback-{}-{n}-{nanos}", std::process::id());
+        let taken = entries
+            .iter()
+            .any(|entry| entry.name.as_encoded_bytes() == name.as_bytes());
+        (!taken).then_some(name)
+    })
+}
+
+/// 作成した葉 `parent`/`name` を取り消す（他者のデータを消さない手順）。
+///
+/// 1. 読み直した `name` の inode が保持 fd `expected` と一致することを確かめる
+///    （無ければ取り消す対象がなく成功。違えば触らずに失敗）
+/// 2. `name` を他者が使わない退避名へ `renameat` で移す（名前の付け替えは原子的で、
+///    この時点で `name` に他者が差し込んだ実体があっても消さずに退避名へ移るだけ）
+/// 3. 読み直した退避名の inode が `expected` と一致するときだけ `unlinkat` する。
+///    一致しなければ退避名に残して失敗し、退避名を報告する（運用者が戻せる）
+/// 4. `unlinkat` の後に `expected` のリンク数が 1 減ったことを確かめ、減っていなければ
+///    他者のエントリを消した可能性として失敗を報告する（黙って成功にしない）
+///
+/// 残る窓は 3 の確認から `unlinkat` までの間に退避名へ別の実体を rename で差し込む
+/// 場合だけで、退避名は予測されにくく、正当な書き込み元が狙う名前ではない。これを
+/// 狙える者は共有ディレクトリへの書き込み権限を持ち、元から任意のエントリを消せる
+/// ため権限の昇格にはならない（モジュール doc「プロセス間の競合」）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_file_if_same(
+    parent: &File,
+    name: &str,
+    expected: &File,
+    max_entries: usize,
+) -> Result<(), String> {
+    use crate::sys::{BeneathError, UnlinkTarget, rename_beneath, unlink_beneath};
+    use std::os::unix::fs::MetadataExt;
+
+    let (found, entries, ino) = entry_ino(parent, name, expected, max_entries)?;
+    match found {
+        None => return Ok(()),
+        Some(found) if found != ino => {
+            return Err("entry was replaced by another object".to_string());
+        }
+        Some(_) => {}
+    }
+    let Some(quarantine) = quarantine_name(&entries) else {
+        return Err("no free quarantine name".to_string());
+    };
+    #[cfg(test)]
+    fault::run_hook(fault::Hook::BeforeQuarantine);
+    match rename_beneath(parent, name, &quarantine) {
+        Ok(()) => {}
+        Err(BeneathError::Io(ErrorKind::NotFound)) => return Ok(()),
+        Err(_) => return Err("rename to quarantine failed".to_string()),
+    }
+    let (found, _, _) = entry_ino(parent, &quarantine, expected, max_entries)
+        .map_err(|detail| format!("{detail}; entry left at {quarantine:?}"))?;
+    match found {
+        None => return Ok(()),
+        Some(found) if found != ino => {
+            return Err(format!(
+                "entry was replaced before rollback; moved entry left at {quarantine:?}"
+            ));
+        }
+        Some(_) => {}
+    }
+    let before = expected
+        .metadata()
+        .map_err(|_| format!("cannot stat created entry; entry left at {quarantine:?}"))?
+        .nlink();
+    match unlink_beneath(parent, &quarantine, UnlinkTarget::File) {
+        Ok(()) => {}
+        Err(BeneathError::Io(ErrorKind::NotFound)) => return Ok(()),
+        Err(_) => return Err(format!("unlink failed; entry left at {quarantine:?}")),
+    }
+    let after = expected
+        .metadata()
+        .map_err(|_| "cannot stat created entry after unlink".to_string())?
+        .nlink();
+    if after.saturating_add(1) != before {
+        return Err(format!(
+            "unlink of {quarantine:?} may have removed a foreign entry"
+        ));
+    }
+    Ok(())
 }
 
 /// Windows 等のフォールバック。ルート直下から 1 階層ずつ、作成（`create_dir`）→
@@ -847,6 +1011,9 @@ mod fault {
         BeforeCreate,
         /// 作成の直後、再検証の直前。
         AfterCreate,
+        /// 取り消しで葉を退避名へ改名する直前（同一性確認の後。Linux / macOS）。
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        BeforeQuarantine,
     }
 
     type HookFn = Box<dyn FnOnce()>;
@@ -856,6 +1023,8 @@ mod fault {
         static FAIL_SCAN_AT: Cell<Option<usize>> = const { Cell::new(None) };
         static BEFORE_CREATE: RefCell<Option<HookFn>> = const { RefCell::new(None) };
         static AFTER_CREATE: RefCell<Option<HookFn>> = const { RefCell::new(None) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        static BEFORE_QUARANTINE: RefCell<Option<HookFn>> = const { RefCell::new(None) };
     }
 
     /// 注入状態を初期化する（各テストの先頭で呼ぶ）。
@@ -864,6 +1033,8 @@ mod fault {
         FAIL_SCAN_AT.with(|f| f.set(None));
         BEFORE_CREATE.with(|h| h.borrow_mut().take());
         AFTER_CREATE.with(|h| h.borrow_mut().take());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        BEFORE_QUARANTINE.with(|h| h.borrow_mut().take());
     }
 
     /// 以降の走査の読み取りのうち `n` 回目（0 起点）を失敗させる。
@@ -887,6 +1058,8 @@ mod fault {
         let slot = match hook {
             Hook::BeforeCreate => &BEFORE_CREATE,
             Hook::AfterCreate => &AFTER_CREATE,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Hook::BeforeQuarantine => &BEFORE_QUARANTINE,
         };
         slot.with(|h| *h.borrow_mut() = Some(Box::new(f)));
     }
@@ -896,6 +1069,8 @@ mod fault {
         let slot = match hook {
             Hook::BeforeCreate => &BEFORE_CREATE,
             Hook::AfterCreate => &AFTER_CREATE,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Hook::BeforeQuarantine => &BEFORE_QUARANTINE,
         };
         if let Some(f) = slot.with(|h| h.borrow_mut().take()) {
             f();
@@ -1275,7 +1450,7 @@ mod tests {
         assert_eq!(err.code(), IoErrorCode::Internal);
         assert!(
             err.message().starts_with(
-                "created guest file could not be rolled back (entry was replaced by another object); cause: case-insensitive path collision"
+                "created guest file could not be rolled back (entry was replaced by another object); cause: created guest path was replaced during create"
             ),
             "{}",
             err.message()

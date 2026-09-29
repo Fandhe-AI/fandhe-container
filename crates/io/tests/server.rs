@@ -164,6 +164,10 @@ mod unix {
 
     /// REPAIR-5: 接続だけして何も送らない相手に対しては `recv_frame` が上限時間で
     /// `Timeout` を返す。
+    ///
+    /// #1130: client は固定 sleep ではなく、server の判定完了の合図
+    /// （`release_tx`）まで接続を保持する（`repair5_uds_recv_times_out_on_trickling_peer`
+    /// と同じ形。C2・#820）。
     #[test]
     fn repair5_uds_recv_times_out_on_silent_peer() {
         let dir = TempSocketDir::new();
@@ -175,11 +179,13 @@ mod unix {
         )
         .expect("bind must succeed on a private, empty path");
 
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
             let stream = UnixStream::connect(&connect_path).expect("client must connect");
-            // 何も送らずに、server 側の recv がタイムアウトするまで接続を保持する。
-            std::thread::sleep(Duration::from_millis(600));
+            // 何も送らずに、server 側の判定完了の合図まで接続を保持する
+            // （待ちは最大 10 秒。無期限にしない。REPAIR-5）。
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
             drop(stream);
         });
 
@@ -194,10 +200,15 @@ mod unix {
             .expect_err("recv from a silent peer must time out");
         let elapsed = started.elapsed();
 
-        assert_eq!(err.code(), IoErrorCode::Timeout);
+        assert_eq!(
+            err.code(),
+            IoErrorCode::Timeout,
+            "err={err:?} elapsed={elapsed:?}"
+        );
         assert!(elapsed >= Duration::from_millis(300), "elapsed={elapsed:?}");
         assert!(elapsed <= Duration::from_secs(2), "elapsed={elapsed:?}");
 
+        let _ = release_tx.send(());
         client_thread.join().expect("client thread must not panic");
     }
 
@@ -625,12 +636,18 @@ mod unix {
         )
         .expect("bind must succeed on a private, empty path");
 
+        // #1130: client は server が recv の Timeout と poison 後の send 拒否を
+        // 確認し終えるまで何も読まず接続を保持する。client の read timeout が
+        // server の recv 期限より先に切れて接続が閉じ、server 側が Timeout でなく
+        // Unavailable（EOF）になるレースを無くす。
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
             let stream = UnixStream::connect(&connect_path).expect("client must connect");
-            // 何も送らないまま保持する（recv がタイムアウトで poison するのを待つ）。
+            // 待ちは最大 10 秒。無期限にしない（REPAIR-5）。
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
             stream
-                .set_read_timeout(Some(Duration::from_millis(700)))
+                .set_read_timeout(Some(Duration::from_millis(200)))
                 .expect("set_read_timeout must succeed");
             let mut buf = [0u8; 16];
             let mut client_stream = stream;
@@ -660,7 +677,7 @@ mod unix {
         let err = connection
             .recv_frame(timeout)
             .expect_err("recv from a silent peer must time out and poison the connection");
-        assert_eq!(err.code(), IoErrorCode::Timeout);
+        assert_eq!(err.code(), IoErrorCode::Timeout, "err={err:?}");
 
         let err = connection
             .send_frame(
@@ -670,6 +687,8 @@ mod unix {
             .expect_err("send after poisoning must be rejected without touching the socket");
         assert_eq!(err.code(), IoErrorCode::Unavailable);
 
+        // server の判定が済んでから client に「バイトが届いていないこと」を確認させる。
+        let _ = release_tx.send(());
         client_thread.join().expect("client thread must not panic");
     }
 
@@ -881,6 +900,11 @@ mod unix {
     /// `send_frame` がフレーム全体の期限で `Timeout` を返し（送信側の
     /// `write_all_until` のタイムアウト経路）、その後は P1-3 により
     /// `Unavailable` になる。
+    ///
+    /// #1130: client は固定 sleep ではなく、server の判定完了の合図
+    /// （`release_tx`）まで接続を保持する。固定 sleep だと、遅い CI（macOS 等）で
+    /// 16 MiB の準備が client の close に間に合わず、1 回目が `Timeout` でなく
+    /// `Unavailable` になっていた（REPAIR-5・TASK-13.2.1）。
     #[test]
     fn repair5_uds_send_times_out_on_unresponsive_peer() {
         let dir = TempSocketDir::new();
@@ -892,23 +916,26 @@ mod unix {
         )
         .expect("bind must succeed on a private, empty path");
 
+        // 重い準備（16 MiB のフレーム構築と CRC）は client 起動前に済ませる。
+        let big_payload = vec![0x5au8; 16 * 1024 * 1024];
+        let big_frame =
+            Frame::new(FrameKind::Write, big_payload).expect("large frame must construct");
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let connect_path = socket_path.clone();
         let client_thread = std::thread::spawn(move || {
             let stream = UnixStream::connect(&connect_path).expect("client must connect");
             // 接続を保持したまま何も読まない。カーネルの送信バッファ（既定は
             // 数百 KiB 程度）を溢れさせるには十分大きいペイロードが必要
-            // （send_frame のテスト側で 16 MiB を送る）。
-            std::thread::sleep(Duration::from_millis(900));
+            // （send_frame のテスト側で 16 MiB を送る）。server の判定完了の合図まで
+            // 保持する（待ちは最大 10 秒。無期限にしない。REPAIR-5）。
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
             drop(stream);
         });
 
         let mut connection = server
             .accept(test_timeout(), NoopServerObserver)
             .expect("server must accept the client connection");
-
-        let big_payload = vec![0x5au8; 16 * 1024 * 1024];
-        let big_frame =
-            Frame::new(FrameKind::Write, big_payload).expect("large frame must construct");
 
         let timeout = IoTimeout::new(Duration::from_millis(300)).expect("300ms must be valid");
         let started = Instant::now();
@@ -917,15 +944,22 @@ mod unix {
             .expect_err("send to an unresponsive peer must time out");
         let elapsed = started.elapsed();
 
-        assert_eq!(err.code(), IoErrorCode::Timeout);
+        assert_eq!(
+            err.code(),
+            IoErrorCode::Timeout,
+            "err={err:?} elapsed={elapsed:?}"
+        );
         assert!(elapsed >= Duration::from_millis(300), "elapsed={elapsed:?}");
         assert!(elapsed <= Duration::from_secs(3), "elapsed={elapsed:?}");
 
+        // poison 済みの接続は socket に触れずに拒否するため、client が閉じたか
+        // どうかに依存しない。合図の前に確認する。
         let err = connection
             .send_frame(&big_frame, test_timeout())
             .expect_err("connection must be poisoned after a send timeout");
         assert_eq!(err.code(), IoErrorCode::Unavailable);
 
+        let _ = release_tx.send(());
         let _ = client_thread.join();
     }
 

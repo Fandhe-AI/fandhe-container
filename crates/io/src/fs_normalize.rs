@@ -305,6 +305,41 @@ impl CaseCollisionSet {
         self.path_count == 0
     }
 
+    /// `path` を登録せずに、[`Self::try_insert`] が衝突で失敗するかだけを検査する
+    /// （索引は変更しない。TASK-19.2・IO-5。ファイル作成の成功後に
+    /// [`Self::try_insert`] で登録を確定する呼び出し側が、失敗した作成の登録を
+    /// 索引へ残さないために使う）。
+    ///
+    /// 形式不正は [`IoErrorCode::InvalidArgument`]、大文字小文字だけが違う既存
+    /// コンポーネントとの衝突は [`IoErrorCode::AlreadyExists`]（メッセージは
+    /// [`Self::try_insert`] と同じ）。既存ノードが無い位置から下はすべて新設に
+    /// なり衝突しえないため、そこで検査を打ち切る。
+    pub fn check_insertable(&self, path: &str) -> Result<(), IoError> {
+        let components = validate_guest_relative_path(path)?;
+        let mut parent = ROOT_NODE;
+        for component in &components {
+            match self.nodes.get(&CaseFoldKey::new(parent, component)) {
+                Some(entry) => {
+                    if entry.original != *component {
+                        let existing_path = self
+                            .origins
+                            .get(entry.introduced_by)
+                            .map_or("", String::as_str);
+                        return Err(collision_error(
+                            path,
+                            existing_path,
+                            component,
+                            &entry.original,
+                        ));
+                    }
+                    parent = entry.id;
+                }
+                None => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
     /// `path` を検証・畳み込みしたうえで索引へ登録する。
     ///
     /// # 挙動

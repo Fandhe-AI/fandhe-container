@@ -347,6 +347,202 @@ pub(crate) fn syncfs(fd: impl AsFd) -> Result<(), IoError> {
     syncfs_rc_to_result(rc)
 }
 
+// ---------------------------------------------------------------------------
+// ハンドル相対のファイル作成（TASK-19.2・IO-5・#100。Codex P0 指摘対応）
+// ---------------------------------------------------------------------------
+
+/// [`create_file_beneath`] の失敗種別（`crate::guest_files` が `IoError` へ
+/// 写す。ホストのパスや errno の説明文は載せない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BeneathError {
+    /// 祖先が symlink または非ディレクトリだった（symlink は辿らない）。
+    AncestorNotDirectory,
+    /// 末端が既に存在した（symlink を含む。辿らない）。
+    AlreadyExists,
+    /// 上記以外の OS エラー。
+    Io(io::ErrorKind),
+}
+
+/// `open(2)` フラグ・errno の値（Linux はアーキテクチャごと、macOS は共通。
+/// coding-rust.md「定数を流用しない」に従い cfg ごとに個別定義する）。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod beneath_consts {
+    pub(super) const O_WRONLY: i32 = 0o1;
+    pub(super) const O_CREAT: i32 = 0o100;
+    pub(super) const O_EXCL: i32 = 0o200;
+    pub(super) const O_DIRECTORY: i32 = 0o200_000;
+    pub(super) const O_NOFOLLOW: i32 = 0o400_000;
+    pub(super) const O_CLOEXEC: i32 = 0o2_000_000;
+    pub(super) const ELOOP: i32 = 40;
+    pub(super) const ENOTDIR: i32 = 20;
+    pub(super) const EEXIST: i32 = 17;
+    pub(super) type ModeT = u32;
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod beneath_consts {
+    pub(super) const O_WRONLY: i32 = 0o1;
+    pub(super) const O_CREAT: i32 = 0o100;
+    pub(super) const O_EXCL: i32 = 0o200;
+    pub(super) const O_DIRECTORY: i32 = 0o40_000;
+    pub(super) const O_NOFOLLOW: i32 = 0o100_000;
+    pub(super) const O_CLOEXEC: i32 = 0o2_000_000;
+    pub(super) const ELOOP: i32 = 40;
+    pub(super) const ENOTDIR: i32 = 20;
+    pub(super) const EEXIST: i32 = 17;
+    pub(super) type ModeT = u32;
+}
+
+#[cfg(target_os = "macos")]
+mod beneath_consts {
+    pub(super) const O_WRONLY: i32 = 0x1;
+    pub(super) const O_CREAT: i32 = 0x200;
+    pub(super) const O_EXCL: i32 = 0x800;
+    pub(super) const O_DIRECTORY: i32 = 0x0010_0000;
+    pub(super) const O_NOFOLLOW: i32 = 0x100;
+    pub(super) const O_CLOEXEC: i32 = 0x0100_0000;
+    pub(super) const ELOOP: i32 = 62;
+    pub(super) const ENOTDIR: i32 = 20;
+    pub(super) const EEXIST: i32 = 17;
+    pub(super) type ModeT = u16;
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+mod beneath_raw {
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の
+        // `int openat(int dirfd, const char *path, int flags, ...)`
+        // （可変長引数は mode。`O_CREAT` のときだけ読まれる）と同じ型・幅。
+        // 呼び出し側の不変条件は `super::create_file_beneath` の SAFETY 参照。
+        pub(super) fn openat(dirfd: i32, path: *const core::ffi::c_char, flags: i32, ...) -> i32;
+        // SAFETY（宣言そのものの妥当性）: POSIX の
+        // `int mkdirat(int dirfd, const char *path, mode_t mode)`。
+        pub(super) fn mkdirat(
+            dirfd: i32,
+            path: *const core::ffi::c_char,
+            mode: super::beneath_consts::ModeT,
+        ) -> i32;
+    }
+}
+
+/// `root`（信頼する共有ルート。root 自体が symlink でもよい）を起点に、
+/// `ancestors` を 1 個ずつハンドル相対（`openat`/`mkdirat`・`O_NOFOLLOW`）で
+/// 開き（無ければ作り）、末端 `leaf` を `O_CREAT|O_EXCL|O_NOFOLLOW` で新規作成する
+/// （IO-5・TASK-19.2）。
+///
+/// パス文字列を再解決しないため、検査と作成の間に別プロセスが祖先を symlink へ
+/// 差し替えても、開いたディレクトリ fd の外へは出られない（TOCTOU 防止）。
+/// 各要素は呼び出し元が「`/`・NUL を含まない単一の `Normal` 名」であることを
+/// 検証済みの前提（`crate::guest_files`）。対応外アーキテクチャでは
+/// `Unsupported` を返す（fail-closed）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+pub(crate) fn create_file_beneath(
+    root: &std::path::Path,
+    ancestors: &[&str],
+    leaf: &str,
+) -> Result<std::fs::File, BeneathError> {
+    use beneath_consts as c;
+    use std::ffi::CString;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    fn cstr(name: &str) -> Result<CString, BeneathError> {
+        CString::new(name).map_err(|_| BeneathError::Io(io::ErrorKind::InvalidInput))
+    }
+    fn last_errno() -> (i32, io::ErrorKind) {
+        let err = io::Error::last_os_error();
+        (err.raw_os_error().unwrap_or(0), err.kind())
+    }
+
+    // root は信頼する設定値のため通常の open（symlink を辿る）で開く。
+    let mut dir: OwnedFd = std::fs::File::open(root)
+        .map_err(|err| BeneathError::Io(err.kind()))?
+        .into();
+
+    for name in ancestors {
+        let cname = cstr(name)?;
+        // SAFETY: `dir` は本関数が所有する有効なディレクトリ fd で、呼び出しの間
+        // 生きている。`cname` は NUL 終端の有効な C 文字列。mkdirat は fd を
+        // 返さず、失敗時は errno を直後に拾う。
+        let rc = unsafe { beneath_raw::mkdirat(dir.as_raw_fd(), cname.as_ptr(), 0o777) };
+        if rc == -1 {
+            let (errno, kind) = last_errno();
+            if errno != c::EEXIST {
+                return Err(BeneathError::Io(kind));
+            }
+        }
+        // SAFETY: 同上。可変長引数は O_CREAT を指定しないため読まれない。
+        // 成功時の戻り値は本関数が唯一所有する新規 fd で、直後に OwnedFd へ渡す。
+        let fd = unsafe {
+            beneath_raw::openat(
+                dir.as_raw_fd(),
+                cname.as_ptr(),
+                c::O_DIRECTORY | c::O_NOFOLLOW | c::O_CLOEXEC,
+            )
+        };
+        if fd == -1 {
+            let (errno, kind) = last_errno();
+            return Err(if errno == c::ELOOP || errno == c::ENOTDIR {
+                BeneathError::AncestorNotDirectory
+            } else {
+                BeneathError::Io(kind)
+            });
+        }
+        // SAFETY: `fd` は直前の openat が返した有効な fd で、他に所有者がいない。
+        dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+
+    let cleaf = cstr(leaf)?;
+    let mode: u32 = 0o666;
+    // SAFETY: `dir`・`cleaf` は上記と同じ。O_CREAT を指定するため可変長引数の
+    // mode を `c_uint` 幅で渡す（宣言どおり読まれる）。成功時の戻り値は新規 fd。
+    let fd = unsafe {
+        beneath_raw::openat(
+            dir.as_raw_fd(),
+            cleaf.as_ptr(),
+            c::O_WRONLY | c::O_CREAT | c::O_EXCL | c::O_NOFOLLOW | c::O_CLOEXEC,
+            mode,
+        )
+    };
+    if fd == -1 {
+        let (errno, kind) = last_errno();
+        return Err(if errno == c::EEXIST {
+            BeneathError::AlreadyExists
+        } else {
+            BeneathError::Io(kind)
+        });
+    }
+    // SAFETY: `fd` は直前の openat が返した有効な fd で、他に所有者がいない。
+    Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+/// 対応外アーキテクチャ向け（fail-closed）。
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+pub(crate) fn create_file_beneath(
+    _root: &std::path::Path,
+    _ancestors: &[&str],
+    _leaf: &str,
+) -> Result<std::fs::File, BeneathError> {
+    Err(BeneathError::Io(io::ErrorKind::Unsupported))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -201,8 +201,8 @@ impl SinkPersistReport {
 ///
 /// # 永続化（IO-2・TASK-15.2.2）
 /// [`BatchSink::persist`] は Linux で `syncfs(2)` を発行する（他 OS は
-/// `Unimplemented`。TASK-15.3・#88）。一度失敗・タイムアウトした sink は
-/// ポイズンされ、以後の `persist` は syscall を発行せず `Internal` を返す。
+/// `Unimplemented`。TASK-15.3・#88）。syncfs を発行した後に失敗・タイムアウトした
+/// sink はポイズンされ（fd 複製・枠確保・スレッド生成など発行前の失敗はポイズンせず再試行可）、以後の `persist` は syscall を発行せず `Internal` を返す。
 /// dup した fd は open file description を共有するため、タイムアウトした
 /// helper が後から書き戻しエラー（errseq）を消費すると、再試行の `syncfs` が
 /// 永続化されていないのに 0 を返しうるため。
@@ -273,12 +273,11 @@ impl AppendFileSink {
         self
     }
 
-    /// 内部の [`File`] を参照で取り出す。
-    pub fn get_ref(&self) -> &File {
-        &self.file
-    }
-
     /// 内部の [`File`] を所有権ごと取り出す。
+    ///
+    /// `&File` を返す `get_ref` は意図的に提供しない: 共有参照経由の書き込みは
+    /// `dirty_since_persist` に反映されず、次の `persist` が syncfs を省略して
+    /// 未永続化のまま FlushAck を送りうるため（IO-2。Codex #1142 指摘）。
     pub fn into_inner(self) -> File {
         self.file
     }
@@ -372,14 +371,14 @@ impl BatchSink for AppendFileSink {
                 self.dirty_since_persist = false;
                 Ok(SinkPersistReport::new(elapsed))
             }
-            Err(err) => {
-                // `Unimplemented` は syscall を発行していない（非 Linux・5.8 未満
-                // カーネルの拒否）ため errseq は消費されておらずポイズン不要。
-                // 共有 sink の他接続にも同じ `Unimplemented` を返すため。
-                if err.code() != IoErrorCode::Unimplemented {
+            Err(failure) => {
+                // syncfs を発行した（発行しうる）失敗だけポイズンする。カーネル版数
+                // 拒否・fd 複製・枠確保・スレッド生成の失敗は errseq を消費して
+                // おらず一時的なため、ポイズンせず次の Flush で再試行できる。
+                if failure.issued {
                     self.persist_poisoned = true;
                 }
-                Err(err)
+                Err(failure.error)
             }
         }
     }
@@ -973,7 +972,7 @@ mod tests {
         assert_eq!(sink.written, vec![b"aaaa".to_vec()]);
     }
 
-    /// [`AppendFileSink`] は body を到着順に追記し、`get_ref` / `into_inner` で
+    /// [`AppendFileSink`] は body を到着順に追記し、`into_inner` で
     /// 内部の `File` を取り出せる（TASK-15.2.2・#824 が fd を必要とする想定の
     /// 回帰点）。
     #[test]
@@ -1017,9 +1016,7 @@ mod tests {
         assert_eq!(report.frames_written, 2);
         assert_eq!(report.bytes_written, 4);
 
-        // `get_ref` で内部の File に触れられることを確認してから、`path` 経由で
-        // 書き込み内容を読む（`File` 自体からパスを復元する API はない）。
-        let _ = sink.get_ref();
+        // `path` 経由で書き込み内容を読む（`File` からパスを復元する API はない）。
         let contents = std::fs::read(&path).expect("must read output file");
         assert_eq!(contents, b"abcd");
 

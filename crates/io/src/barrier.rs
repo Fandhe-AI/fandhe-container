@@ -306,14 +306,32 @@ static PERSIST_LIMITER: PersistLimiter = PersistLimiter::new(MAX_PERSIST_THREADS
 ///
 /// タイムアウトした場合 helper スレッドは detach され、`work` が戻るまで
 /// `limiter` の枠を占有する。
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "Linux の syncfs 経路と単体テストのみが使う")
-)]
+#[cfg(test)]
 fn run_with_deadline<F>(
     limiter: &'static PersistLimiter,
     timeout: IoTimeout,
     work: F,
+) -> Result<Duration, IoError>
+where
+    F: FnOnce() -> Result<(), IoError> + Send + 'static,
+{
+    let mut dispatched = false;
+    run_with_deadline_tracked(limiter, timeout, work, &mut dispatched)
+}
+
+/// [`run_with_deadline`] の本体。`work` を helper スレッドへ渡せた時点で
+/// `dispatched` を真にする（以後は `work` が実行されうるため、呼び出し側は
+/// 失敗を「syscall 発行済み」として扱う）。枠の確保・スレッド生成の失敗では
+/// 偽のまま返る（何も発行していない一時的な失敗。Bugbot #1142 指摘）。
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "Linux の syncfs 経路と単体テストのみが使う")
+)]
+fn run_with_deadline_tracked<F>(
+    limiter: &'static PersistLimiter,
+    timeout: IoTimeout,
+    work: F,
+    dispatched: &mut bool,
 ) -> Result<Duration, IoError>
 where
     F: FnOnce() -> Result<(), IoError> + Send + 'static,
@@ -335,6 +353,7 @@ where
                 "failed to spawn persist thread",
             )
         })?;
+    *dispatched = true;
     match rx.recv_timeout(timeout.as_duration()) {
         Ok(Ok(())) => Ok(started.elapsed()),
         Ok(Err(err)) => Err(err),
@@ -349,6 +368,25 @@ where
     }
 }
 
+/// [`persist_file_system`] の失敗。`issued` は `syncfs` を発行した（または
+/// helper スレッドが発行しうる）かを表す。偽なら errseq は消費されておらず、
+/// 呼び出し側の sink は poison せず再試行できる（IO-2）。
+#[derive(Debug)]
+pub(crate) struct PersistFailure {
+    pub(crate) error: IoError,
+    pub(crate) issued: bool,
+}
+
+impl PersistFailure {
+    /// syscall 発行前の失敗（カーネル版数拒否・fd 複製・枠確保・スレッド生成）。
+    fn not_issued(error: IoError) -> Self {
+        Self {
+            error,
+            issued: false,
+        }
+    }
+}
+
 /// `file` が属するファイルシステムを永続化し、所要時間を返す（IO-2・
 /// TASK-15.2.2・#824）。
 ///
@@ -358,15 +396,28 @@ where
 /// 呼び出し側の sink がポイズンする）。macOS / Windows は代替フラッシュが
 /// なく [`IoErrorCode::Unimplemented`]（TASK-15.3・#88）。
 #[cfg(target_os = "linux")]
-pub(crate) fn persist_file_system(file: &File, timeout: IoTimeout) -> Result<Duration, IoError> {
-    ensure_syncfs_reports_errors()?;
+pub(crate) fn persist_file_system(
+    file: &File,
+    timeout: IoTimeout,
+) -> Result<Duration, PersistFailure> {
+    ensure_syncfs_reports_errors().map_err(PersistFailure::not_issued)?;
     let dup = file.try_clone().map_err(|err| {
-        IoError::new(
+        PersistFailure::not_issued(IoError::new(
             IoErrorCode::Internal,
             format!("failed to duplicate fd for persist ({:?})", err.kind()),
-        )
+        ))
     })?;
-    run_with_deadline(&PERSIST_LIMITER, timeout, move || crate::sys::syncfs(&dup))
+    let mut dispatched = false;
+    run_with_deadline_tracked(
+        &PERSIST_LIMITER,
+        timeout,
+        move || crate::sys::syncfs(&dup),
+        &mut dispatched,
+    )
+    .map_err(|error| PersistFailure {
+        error,
+        issued: dispatched,
+    })
 }
 
 /// `syncfs(2)` が書き戻し失敗を報告するカーネルの最小版数（major, minor）。
@@ -416,12 +467,15 @@ fn ensure_syncfs_reports_errors() -> Result<(), IoError> {
 
 /// 非 Linux 版: 代替フラッシュ未実装のため FlushAck を出せない（fail-closed）。
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn persist_file_system(_file: &File, _timeout: IoTimeout) -> Result<Duration, IoError> {
+pub(crate) fn persist_file_system(
+    _file: &File,
+    _timeout: IoTimeout,
+) -> Result<Duration, PersistFailure> {
     let _ = &PERSIST_LIMITER;
-    Err(IoError::new(
+    Err(PersistFailure::not_issued(IoError::new(
         IoErrorCode::Unimplemented,
         "persist is not implemented on this OS (TASK-15.3, #88)",
-    ))
+    )))
 }
 
 #[cfg(test)]
@@ -524,8 +578,9 @@ mod tests {
         if release_supports_syncfs_errors(&release) {
             assert!(result.is_ok(), "persist_file_system failed: {result:?}");
         } else {
-            let err = result.expect_err("pre-5.8 kernel must be rejected");
-            assert_eq!(err.code(), IoErrorCode::Unimplemented);
+            let failure = result.expect_err("pre-5.8 kernel must be rejected");
+            assert_eq!(failure.error.code(), IoErrorCode::Unimplemented);
+            assert!(!failure.issued);
         }
     }
 
@@ -541,6 +596,37 @@ mod tests {
         file
     }
 
+    /// IO-2（Bugbot #1142）: 枠が埋まって helper を起動できない失敗は
+    /// 「未発行」（dispatched = false）で、sink を poison させない。
+    #[test]
+    fn io2_run_with_deadline_not_dispatched_when_limit_reached() {
+        static L: PersistLimiter = PersistLimiter::new(0);
+        let mut dispatched = false;
+        let err = run_with_deadline_tracked(&L, ms(50), || Ok(()), &mut dispatched)
+            .expect_err("no slot available");
+        assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+        assert!(!dispatched);
+    }
+
+    /// IO-2: タイムアウトは helper が syscall を発行しうるため dispatched = true。
+    #[test]
+    fn io2_run_with_deadline_dispatched_on_timeout() {
+        static L: PersistLimiter = PersistLimiter::new(1);
+        let mut dispatched = false;
+        let err = run_with_deadline_tracked(
+            &L,
+            ms(30),
+            || {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(())
+            },
+            &mut dispatched,
+        )
+        .expect_err("must time out");
+        assert_eq!(err.code(), IoErrorCode::Timeout);
+        assert!(dispatched);
+    }
+
     /// IO-2・TASK-15.3: 非 Linux では `Unimplemented`（#88 で代替を実装）。
     #[cfg(not(target_os = "linux"))]
     #[test]
@@ -548,7 +634,9 @@ mod tests {
         let path = std::env::temp_dir().join(format!("fandhe-io-persist-{}", std::process::id()));
         let file = File::create(&path).expect("create temp file");
         let _ = std::fs::remove_file(&path);
-        let err = persist_file_system(&file, ms(100)).expect_err("must be unimplemented");
+        let failure = persist_file_system(&file, ms(100)).expect_err("must be unimplemented");
+        assert!(!failure.issued);
+        let err = failure.error;
         assert_eq!(err.code(), IoErrorCode::Unimplemented);
     }
 

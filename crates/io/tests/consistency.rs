@@ -9,6 +9,23 @@
 //! グレースフルシャットダウン close-to-open）と成果物パスを共有する入口の
 //! `mod` 宣言のみを持つ（並行する PR 同士の衝突を最小にするため。REPAIR-1）。
 //!
+//! # 「グレースフルシャットダウン / close-to-open」の定義（TASK-14.3・#82 の範囲）
+//!
+//! ワイヤー形式・`serve_connection` の終了原因は上記と共通（D1・D4・D5）。
+//! [`graceful_shutdown`] は次の 2 経路をグレースフルシャットダウンと定義する:
+//! (a) write の後に `Flush` を送り、残りが書き込まれ ACK された後
+//! `Unimplemented` で終わる経路（FlushAck・syncfs の返却は TASK-15.2.2・#824
+//! の担当。着手時点で未マージ）、(b) 送った write の ACK をすべて受け取って
+//! から切断する経路（`Unavailable`・`discarded_pending_frames == 0`）。
+//! close は `serve_connection` の join（[`harness::join_within`]）で sink が
+//! 確実に閉じた状態、open はその後に新しいハンドルで読むこと
+//! （[`graceful_shutdown::read_fresh`]）と定義する。PoC
+//! （`03-poc/io-layer-redesign`）は EOF で残りを flush する前提だったが、
+//! 現行の `serve_connection` は EOF 時点で未 ACK の保留分を破棄する（D5）ため、
+//! 本スイートはこの現行実装を基準に定義し直している（詳細は
+//! [`graceful_shutdown`] モジュール doc 参照。spec 側の変更は不要と判断）。
+//! クラッシュ耐性（fsync・電源断時の永続化。IO-2・IO-3・TASK-15）は対象外。
+//!
 //! # 「並行 write」の定義（本ファイル・TASK-14.1・#80 の範囲）
 //!
 //! ワイヤー形式（[`fandhe_container_io::payload`]）はパスもオフセットも
@@ -54,7 +71,9 @@
 //! 置換のケース（R3）は移動先を閉じた状態でだけ実行する。なお置換の原子性
 //! （並行する読み手が旧内容・新内容のどちらかだけを観測すること）は OS の
 //! rename が担う性質で本スイートの検証対象外とし、R3 は置換後の最終内容の
-//! 完全一致だけを確認する。
+//! 完全一致だけを確認する。[`graceful_shutdown`] の 5 件（G1〜G5）も同じ
+//! [`harness::DuplexEnd`] 基盤（実ソケットを使わない）で 3 OS すべてで動き、
+//! OS 差の前提は置かない（合計 24 件）。
 
 #[path = "consistency/harness.rs"]
 mod harness;
@@ -64,3 +83,6 @@ mod concurrent_write;
 
 #[path = "consistency/rename_truncate.rs"]
 mod rename_truncate;
+
+#[path = "consistency/graceful_shutdown.rs"]
+mod graceful_shutdown;

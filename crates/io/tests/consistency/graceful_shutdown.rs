@@ -494,9 +494,10 @@ fn io4_graceful_shutdown_shared_file_all_clients_flush_concurrently() {
     );
 }
 
-/// IO-4・REPAIR-6・TASK-14.3（G5）: 別ファイルの 2 セッション（A・B）で、A が
-/// Flush で閉じても B がまだ開いたままなら B の内容には影響せず、B を fresh
-/// open した結果も A の close 前後で変化しないことを確認する（close の独立性）。
+/// IO-4・REPAIR-6・TASK-14.3（G5）: 別ファイルの 2 セッション（A・B）で、B に
+/// 未 ACK の端数を残したまま A が Flush で閉じても B の内容・保留分には影響
+/// せず、B を fresh open した結果も A の close 前後で変化しないことを確認する
+/// （close の独立性）。
 #[test]
 fn io4_graceful_shutdown_one_connection_closed_while_other_stays_live() {
     const BODY_LEN: usize = 16;
@@ -507,18 +508,27 @@ fn io4_graceful_shutdown_one_connection_closed_while_other_stays_live() {
     let a_path = dir.file_path("a.bin");
     let b_path = dir.file_path("b.bin");
 
-    // B をまず 4 件 ACK 済みまで進めて開いたままにする（静止点。write_and_ack が
-    // 戻った時点でファイル状態が確定する。Session::write_and_ack のコメント参照）。
+    // B をまず 4 件 ACK 済みまで進めて静止点を作る（write_and_ack が戻った
+    // 時点でファイル状態が確定する。Session::write_and_ack のコメント参照）。
+    // その後さらに 2 件を ACK を待たずに送り、B に未 ACK の端数
+    // （`unacked`）を残したまま A の close を迎えさせる（codex レビュー #82
+    // PRRT_kwDOUq78ts6m6iBl 指摘への対応。B が全件 ACK 済みで保留中の書き込み
+    // が無い状態だと、A の close が B の未 ACK 分に干渉する回帰
+    // （誤って書き込む・破棄する等）を検出できないため）。
     let bodies_b1: Vec<Vec<u8>> = (0..4u32).map(|seq| body_for(1, seq, BODY_LEN)).collect();
     let mut session_b = Session::start(create_sink(&b_path), config, 10);
     session_b.write_and_ack(&bodies_b1);
 
-    // B の session はまだ live（close していない）が、静止点で fresh open した
-    // 内容を基準値として確保しておく。A の close が B に影響しないことを、
-    // 後続の「A close 直後」の再読み取りと突き合わせて確認するための対照点
-    // （codex レビュー #82 PRRT_kwDOUq78ts6m6THE 指摘への対応。既存の
-    // `a_after_a_closed`（A 側だけの before/after 比較）は B 側の変化を検出
-    // できないため、B 側も A の close 前後で fresh open して比較する）。
+    let bodies_b_pending: Vec<Vec<u8>> = (0..2u32)
+        .map(|seq| body_for(1, 4 + seq, BODY_LEN))
+        .collect();
+    session_b.send_writes(&bodies_b_pending);
+
+    // B の session はまだ live（close していない）。未 ACK の 2 件を抱えた
+    // 状態で fresh open した内容を基準値として確保しておく（BATCH_SIZE 未満
+    // のためまだディスクへ書き出されておらず、ACK 済みの 4 件のみが見える
+    // はず）。A の close が B に影響しないことを、後続の「A close 直後」の
+    // 再読み取りと突き合わせて確認するための対照点。
     let b_before_a_closed = read_fresh(&b_path);
     assert_eq!(b_before_a_closed, records(1, 0..4, BODY_LEN));
 
@@ -537,21 +547,26 @@ fn io4_graceful_shutdown_one_connection_closed_while_other_stays_live() {
     // A の close 直後、B へまだ追加の書き込み・close を一切行っていない時点で
     // B を fresh open し、A の close 前に取った基準値と比較する。B 自身の
     // 追加書き込み・close が起きる前に比較することで、A の close が B の
-    // 未 close 状態（一時的な変化を含む）に影響しないことを検出できる。
+    // 未 close・未 ACK 状態（一時的な変化・誤った書き込みを含む）に影響しない
+    // ことを検出できる。
     let b_after_a_closed = read_fresh(&b_path);
     assert_eq!(
         b_after_a_closed, b_before_a_closed,
         "closing A must not affect B's not-yet-closed content"
     );
 
-    // B へさらに 5 件を追加して Flush で閉じる。
-    let bodies_b2: Vec<Vec<u8>> = (0..5u32)
-        .map(|seq| body_for(1, 4 + seq, BODY_LEN))
+    // B へさらに 3 件を追加して Flush で閉じる（先の未 ACK 2 件と合わせて
+    // 4 + 2 + 3 = 9 件）。A の close 前後で保留にしていた 2 件を含め、
+    // discarded_pending_frames == 0・acks_sent == 9 まで正常に完了することを
+    // 確認し、A の close が B の保留分を破棄していないことも検証する。
+    let bodies_b2: Vec<Vec<u8>> = (0..3u32)
+        .map(|seq| body_for(1, 6 + seq, BODY_LEN))
         .collect();
     session_b.send_writes(&bodies_b2);
     let report_b = session_b.shutdown_with_flush();
     assert_flush_terminated(&report_b);
     assert_eq!(report_b.stats.acks_sent, 9);
+    assert_eq!(report_b.stats.discarded_pending_frames, 0);
 
     // A を再度 fresh open し、B の close 後も変化していないことを確認する。
     let a_after_b_closed = read_fresh(&a_path);

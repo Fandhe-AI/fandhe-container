@@ -1768,6 +1768,55 @@ mod tests {
         assert!(t.0.join("ok").is_file());
     }
 
+    /// 大文字小文字を区別しないホスト（既定の APFS・NTFS）で、走査の後に別の作成者が
+    /// 大小違いの項目を作った場合、作成は既存として失敗するが、実在する表記を確かめて
+    /// 衝突として返し、要求の表記では登録しない（Codex P1 指摘）。
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn io5_case_insensitive_host_reports_late_variant_as_collision() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let external = t.0.join("Foo");
+        fault::set_hook(fault::Hook::BeforeCreate, move || {
+            std::fs::write(external, b"theirs").expect("external write");
+        });
+        let err = c.create_file("foo").err().expect("must collide");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(
+            err.message().starts_with("case-insensitive path collision"),
+            "{}",
+            err.message()
+        );
+        assert!(err.message().contains("\"Foo\""), "{}", err.message());
+        assert_eq!(c.tracked_len().expect("len"), 0);
+        assert_eq!(std::fs::read(t.0.join("Foo")).expect("read"), b"theirs");
+        assert_eq!(entries(&t.0), 1);
+    }
+
+    /// 大文字小文字を区別しない macOS で、走査の後に大小違いの祖先が作られると、
+    /// 作成はその祖先をそのまま開いて進むが、再検証で衝突として取り消す。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn io5_case_insensitive_host_rolls_back_under_late_ancestor_variant() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let external = t.0.join("Dir");
+        fault::set_hook(fault::Hook::BeforeCreate, move || {
+            std::fs::create_dir(external).expect("external dir");
+        });
+        let err = c.create_file("dir/x").err().expect("must collide");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(
+            err.message().starts_with("case-insensitive path collision"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(entries(&t.0.join("Dir")), 0);
+        assert_eq!(c.tracked_len().expect("len"), 0);
+    }
+
     /// 構築後にルートのパスを範囲外への symlink へ差し替えても、作成は保持した
     /// ハンドルの元のディレクトリ内に留まる（IO-5・Codex P0 指摘）。
     #[cfg(any(target_os = "linux", target_os = "macos"))]

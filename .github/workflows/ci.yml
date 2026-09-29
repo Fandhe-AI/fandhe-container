@@ -468,6 +468,14 @@ jobs:
   # 条件をそろえるため。ビルド・テストのゲートではなく型検査ゲートのため、
   # 3 OS matrix・ネイティブランナー規則の対象外とする（bench-regression と同じ整理。
   # ci.md「3 OS CI」参照）。
+  #
+  # --all-features を付けるのは、required-features を持つ target（crates/io の
+  # crash_test_server bin・crash_safety test。`crash-test-server` feature が必要）を
+  # --all-targets だけでは型検査できないため。現状の feature は
+  # fandhe-container-io の `crash-test-server` 1 件のみで相互排他の feature はなく、
+  # ソース中に cfg(feature) 分岐もないため、--all-features の検査は既定 feature 構成を
+  # 包含する。相互排他の feature や cfg(not(feature = ...)) 分岐を追加した場合は、
+  # 既定 feature での検査の追加か対象 feature の明示へ切り替えること。
   aarch64-linux-check:
     runs-on: ubuntu-latest
     # ハングに対する多層防御（rust-ci-default-features と同じ値）
@@ -482,9 +490,9 @@ jobs:
           components: clippy
           targets: aarch64-unknown-linux-gnu
       - name: cargo check（aarch64-unknown-linux-gnu・クロス型検査）
-        run: cargo check --workspace --all-targets --target aarch64-unknown-linux-gnu
+        run: cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu
       - name: cargo clippy（aarch64-unknown-linux-gnu）
-        run: cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu -- -D warnings
 
   # --------------------------------------------------
   # ci-complete（全ジョブ結果の fail-closed 集約ゲート）

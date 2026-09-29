@@ -209,7 +209,7 @@ Docker ベースラインは **fio をコンテナの中で実行して**計測�
 
 ```bash
 # 1) bind mount（<host-dir> はホスト側の空ディレクトリ、<out-dir> は結果 JSON の出力先）
-docker run --rm --user "$(id -u):$(id -g)" \
+timeout -k 10 90 docker run --rm --name fandhe-fio-bench --user "$(id -u):$(id -g)" \
   -v <host-dir>:/data -v <out-dir>:/out \
   <fio 入りイメージ> \
   fio --name=fandhe-fio-randwrite-4k --directory=/data \
@@ -219,7 +219,7 @@ docker run --rm --user "$(id -u):$(id -g)" \
 
 # 2) named volume（<volume> は事前に作成した docker volume 名。実体パスは root しか
 #    読み書きできないため、コンテナ内 fio 経由でしか --user 実行できない。下記「注意点」参照）
-docker run --rm --user "$(id -u):$(id -g)" \
+timeout -k 10 90 docker run --rm --name fandhe-fio-bench --user "$(id -u):$(id -g)" \
   -v <volume>:/data -v <out-dir>:/out \
   <fio 入りイメージ> \
   fio --name=fandhe-fio-randwrite-4k --directory=/data \
@@ -241,7 +241,7 @@ fio コマンドに渡す job options は「`--from-json` モード」節の許�
 
 fio 入りイメージは特定のサードパーティイメージへ固定せず、実施者が選ぶ（fio 3.x 以上で `*_ns` キーと `job options` を出力するものに限る。ライセンスは `.claude/rules/licensing.md`「非 Cargo 資産」に従い実施者が確認する）。
 
-REPAIR-5（相手の応答を待つ処理にはタイムアウトを設ける）に合わせ、`docker run` は `timeout -k 10 <runtime+60>` で包む。`timeout` が発火してコンテナが残った場合は `docker kill` で片付ける。
+REPAIR-5（相手の応答を待つ処理にはタイムアウトを設ける）に合わせ、上記の例は `docker run` を `timeout -k 10 <runtime+60>`（`--runtime=30` なので 90 秒）で包み、コンテナに `--name` を付けている。`timeout` が発火するとクライアントプロセスだけが止まりコンテナが残り得るため、失敗・タイムアウト後は `docker rm -f fandhe-fio-bench` で片付ける（コンテナ名が無い場合は `docker ps` で残存を確認する）。`--runtime` を変えたときは `timeout` の秒数も `runtime+60` に合わせる。
 
 記録する項目: 計測環境（OS・カーネル・ファイルシステム・デバイス種別。ホスト名は書かない。spec-reference.md）、fio の版、試行回数（5 試行の中央値を推奨）。
 
@@ -258,9 +258,11 @@ REPAIR-5（相手の応答を待つ処理にはタイムアウトを設ける）
 
 | label | target_kind | IOPS | lat_mean (us) | p50 (us) | p95 (us) | p99 (us) |
 | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
-| `docker_bind_mount` | run | 未計測 | 未計測 | 未計測 | 未計測 | 未計測 |
-| `docker_named_volume` | run | 未計測 | 未計測 | 未計測 | 未計測 | 未計測 |
+| `docker_bind_mount` | from_json | 未計測 | 未計測 | 未計測 | 未計測 | 未計測 |
+| `docker_named_volume` | from_json | 未計測 | 未計測 | 未計測 | 未計測 | 未計測 |
 | `fandhe_shared_mount` | run | 未計測（共有マウント公開待ち） | 未計測 | 未計測 | 未計測 | 未計測 |
+
+Docker 2 行の `target_kind` は、コンテナ内で実行した fio の出力を `fio-randwrite-4k.sh --from-json` で変換するため `from_json` になる（コンテナ内で fio を実行した経路は `target_kind` ではなく `--label`（`docker_bind_mount`・`docker_named_volume`）と上記「Docker ベースラインの計測手順」で示す）。`fandhe_shared_mount` 行は、共有マウント上で `fio-randwrite-4k.sh` を run モードで直接実行する想定のため `run` のままとする。
 
 IOPS 倍率（candidate ÷ baseline。`make fio-baseline-ratio` の `ratios.iops.value`）: **未計測（fandhe 経路の公開と実機実測を待つ）**。
 

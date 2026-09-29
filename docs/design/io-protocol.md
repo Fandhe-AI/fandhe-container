@@ -301,7 +301,7 @@ ACK をバッチ書き込みの後に返すため、クライアントが `batch
 
 ### FLUSH フレームの扱い（FlushAck は偽装しない）
 
-`FrameKind::Flush` を受信すると、`BatchBuffer::take_pending` で件数未達分を取り出して書き込み・ACK した後、**FlushAck は送らずに** `IoErrorCode::Unimplemented` で処理を終える。FLUSH ACK は永続化の保証（IO-2）であり、`syncfs` を呼ばずに返すと契約違反になるため（fail-closed）。FlushAck の返却は TASK-15.2.2（#824）の責務。
+`FrameKind::Flush` を受信すると、`BatchBuffer::take_pending` で件数未達分を取り出して書き込み・ACK した後、**FlushAck は送らずに** `IoErrorCode::Unimplemented` で処理を終える。FLUSH ACK は永続化の保証（IO-2）であり、`syncfs` を呼ばずに返すと契約違反になるため（fail-closed）。FlushAck の返却は TASK-15.2.2（#824）の責務。Linux 用の `syncfs(2)` FFI ラッパーは `crates/io/src/sys.rs`（非公開モジュール。TASK-15.2.1・#823）に用意済みだが、上記のとおりまだ呼び出していない（#824）。
 
 ### ACK していない保留分・sink 失敗時の扱い
 

@@ -337,7 +337,8 @@ impl AppendFileSink {
     /// これらのディレクトリを同期する（新規作成ファイルの名前が FlushAck 後の電源断で
     /// 失われないようにするため）。ファイルとともに新規作成したディレクトリがあれば
     /// 作成した全階層（末端の親から順に、既存の最も近い祖先まで）を渡す。未指定の sink は
-    /// この環境では `Unimplemented` で FlushAck を拒否する（fail-closed）。Linux は
+    /// この環境では `Unimplemented` で FlushAck を拒否する（fail-closed）。空の `dirs` も
+    /// 未指定と同じ扱いで拒否する（永続化すべきディレクトリが無いため）。Linux は
     /// `syncfs` が FS 全体を同期するため指定は不要（無視される）。
     pub fn with_parent_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
         self.parent_dirs = Some(dirs);
@@ -457,7 +458,7 @@ impl AppendFileSink {
             ));
         }
         if support == crate::barrier::PersistSupport::SupportedFileSync
-            && self.parent_dirs.is_none()
+            && self.parent_dirs.as_ref().is_none_or(|dirs| dirs.is_empty())
         {
             // ファイル自体の sync だけでは新規作成ファイルのディレクトリエントリが
             // 永続化されない。親ディレクトリが不明な sink は保証できないため、
@@ -1419,6 +1420,24 @@ mod tests {
         let err = sink
             .persist_with_support(PersistSupport::SupportedFileSync)
             .expect_err("missing parent dirs must be rejected");
+        assert_eq!(err.code(), IoErrorCode::Unimplemented);
+        assert!(err.message().contains("parent directories"), "{err:?}");
+        assert!(sink.dirty_since_persist);
+        assert!(!sink.persist_poisoned);
+    }
+
+    /// IO-2・IO-3（Codex #1146 P0）: `with_parent_dirs(vec![])` は未指定と同じく
+    /// `SupportedFileSync` で `Unimplemented` となり、ポイズンも dirty 解除もしない。
+    #[test]
+    fn io2_file_sync_with_empty_parent_dirs_is_rejected() {
+        use crate::barrier::PersistSupport;
+        let mut sink = AppendFileSink::new(temp_append_sink("empty-parent-dirs").into_inner())
+            .expect("sink")
+            .with_parent_dirs(vec![]);
+        assert_eq!(sink.parent_dirs, Some(vec![]));
+        let err = sink
+            .persist_with_support(PersistSupport::SupportedFileSync)
+            .expect_err("empty parent dirs must be rejected");
         assert_eq!(err.code(), IoErrorCode::Unimplemented);
         assert!(err.message().contains("parent directories"), "{err:?}");
         assert!(sink.dirty_since_persist);

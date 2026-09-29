@@ -26,6 +26,11 @@
 //!   （`crate::writeback` の `Flush` 受信ハンドラ）から、TASK-15.2.2・#824 で
 //!   `crate::writeback::AppendFileSink::get_ref()` が返す `&File` の fd を渡して
 //!   呼ぶ想定（本 issue の時点ではまだ呼び出し元がない。REPAIR-3）。
+//! - Linux（x86_64 / aarch64）・macOS: `openat(2)`・`mkdirat(2)`・`unlinkat(2)`・
+//!   `fdopendir(3)`/`readdir(3)` でディレクトリハンドル相対にファイル・
+//!   ディレクトリを作る・開く・消す・列挙する（TASK-19.2・IO-5・#100。
+//!   `crate::guest_files` が共有ルート配下への作成で使う。下記「ハンドル相対の
+//!   ファイル操作」節）。
 //!
 //! # 「実 uid」ではなく「接続時点の実効 uid（euid）」（H2・#820
 //! security-auditor 指摘対応）
@@ -40,8 +45,9 @@
 //!
 //! # 契約（事前承認の条件を満たす設計）
 //! - `unsafe fn` はこのモジュールの外へ公開しない。公開するのは安全な関数
-//!   （[`peer_uid`]・[`effective_uid`]・[`syncfs`]）のみで、`unsafe` はこの
-//!   モジュール内に閉じる
+//!   （[`peer_uid`]・[`effective_uid`]・[`syncfs`]・[`mkdir_beneath`]・
+//!   [`open_dir_beneath`]・[`create_leaf_beneath`]・[`unlink_beneath`]・
+//!   [`read_dir_entries`]）のみで、`unsafe` はこのモジュール内に閉じる
 //! - すべての `unsafe` ブロック・`unsafe extern "C"` 宣言に `// SAFETY:` で
 //!   理由と維持すべき不変条件を明記する
 //! - `fd` は呼び出し元が `&UnixStream`（または [`syncfs`] の場合 `AsFd`）を
@@ -348,261 +354,87 @@ pub(crate) fn syncfs(fd: impl AsFd) -> Result<(), IoError> {
 }
 
 // ---------------------------------------------------------------------------
-// ハンドル相対のファイル作成（TASK-19.2・IO-5・#100。Codex P0 指摘対応）
+// ハンドル相対のファイル操作（TASK-19.2・IO-5・#100。`crate::guest_files` 専用）
 // ---------------------------------------------------------------------------
+//
+// `crate::guest_files::GuestFileCreator` が共有ルートのディレクトリハンドルを
+// 起点に、パス文字列を再解決せずに祖先を 1 個ずつ辿る・作る・消すための薄い
+// ラッパー群。祖先の走査（どの名前をどの順で辿るか）・衝突の再検証・取り消しの
+// 判断は安全なコード（`guest_files`）が持ち、本節は 1 回の syscall / libc 呼び出し
+// ごとの安全な入口だけを提供する（unsafe の範囲を最小にするため）。
+//
+// # アーキテクチャ差（Codex P0 指摘への確認記録を含む）
+// `open(2)` のフラグは Linux でもアーキテクチャごとに値が違う。x86_64 は
+// `include/uapi/asm-generic/fcntl.h` の値（`O_DIRECTORY = 0o200000`・
+// `O_NOFOLLOW = 0o400000`）を使うが、arm64 は
+// `arch/arm64/include/uapi/asm/fcntl.h` が AArch32 互換のため独自に
+// `O_DIRECTORY = 0o40000`・`O_NOFOLLOW = 0o100000`（`O_DIRECT = 0o200000`・
+// `O_LARGEFILE = 0o400000`）を定義し直している。asm-generic の値を arm64 へ
+// 流用すると、`O_DIRECTORY` のつもりで `O_DIRECT`、`O_NOFOLLOW` のつもりで
+// `O_LARGEFILE` を渡すことになり、symlink 非追従の保証が失われる。そのため
+// 定数は `beneath_consts` で OS・アーキテクチャごとに個別定義し、値を固定値の
+// テストで照合する（coding-rust.md「定数を流用しない」）。対応外のアーキ
+// テクチャ（Linux の x86_64 / aarch64 以外）では実装を丸ごとビルドから除外し、
+// 同じシグネチャの関数が常に `Unsupported` を返す（fail-closed。`guest_files`
+// は作成も走査も行えずエラーを返す）。
+//
+// # 構造体レイアウトの前提
+// `struct dirent` は全体を宣言せず、先頭からの固定オフセットで `d_ino`（u64）と
+// `d_name`（NUL 終端）だけを読む。Linux（glibc・musl の 64 ビット版）は
+// `d_ino(8) d_off(8) d_reclen(2) d_type(1) d_name`、macOS（64 ビット inode 版。
+// arm64 は常にこの版、x86_64 は `$INODE64` シンボルで明示）は
+// `d_ino(8) d_seekoff(8) d_reclen(2) d_namlen(2) d_type(1) d_name`。
 
-/// [`create_file_beneath`] の失敗種別（`crate::guest_files` が `IoError` へ
-/// 写す。ホストのパスや errno の説明文は載せない）。
+/// ハンドル相対の操作（[`mkdir_beneath`]・[`open_dir_beneath`]・
+/// [`create_leaf_beneath`]・[`unlink_beneath`]）の失敗種別
+/// （`crate::guest_files` が `IoError` へ写す。ホストのパスや errno の説明文は
+/// 載せない）。
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )),
+    allow(
+        dead_code,
+        reason = "対応外アーキテクチャでは常に Unsupported を返すため未構築の variant がある"
+    )
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BeneathError {
-    /// 祖先が symlink または非ディレクトリだった（symlink は辿らない）。
+    /// 辿ろうとした要素が symlink または非ディレクトリだった（symlink は辿らない）。
     AncestorNotDirectory,
-    /// 末端が既に存在した（symlink を含む。辿らない）。
+    /// 作ろうとした末端が既に存在した（symlink を含む。辿らない）。
     AlreadyExists,
-    /// 上記以外の OS エラー。
+    /// 上記以外の OS エラー（`io::ErrorKind` だけを持つ）。
     Io(io::ErrorKind),
 }
 
-/// `open(2)` フラグ・errno の値（Linux はアーキテクチャごと、macOS は共通。
-/// coding-rust.md「定数を流用しない」に従い cfg ごとに個別定義する）。
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod beneath_consts {
-    pub(super) const O_WRONLY: i32 = 0o1;
-    pub(super) const O_CREAT: i32 = 0o100;
-    pub(super) const O_EXCL: i32 = 0o200;
-    pub(super) const O_DIRECTORY: i32 = 0o200_000;
-    pub(super) const O_NOFOLLOW: i32 = 0o400_000;
-    pub(super) const O_CLOEXEC: i32 = 0o2_000_000;
-    pub(super) const ELOOP: i32 = 40;
-    pub(super) const ENOTDIR: i32 = 20;
-    pub(super) const EEXIST: i32 = 17;
-    pub(super) type ModeT = u32;
+/// [`unlink_beneath`] で消す対象の種類（`unlinkat(2)` の `AT_REMOVEDIR` の有無）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnlinkTarget {
+    /// 通常ファイル（`flags = 0`）。
+    File,
+    /// 空のディレクトリ（`AT_REMOVEDIR`。空でなければ失敗する）。
+    EmptyDirectory,
 }
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-mod beneath_consts {
-    pub(super) const O_WRONLY: i32 = 0o1;
-    pub(super) const O_CREAT: i32 = 0o100;
-    pub(super) const O_EXCL: i32 = 0o200;
-    pub(super) const O_DIRECTORY: i32 = 0o40_000;
-    pub(super) const O_NOFOLLOW: i32 = 0o100_000;
-    pub(super) const O_CLOEXEC: i32 = 0o2_000_000;
-    pub(super) const ELOOP: i32 = 40;
-    pub(super) const ENOTDIR: i32 = 20;
-    pub(super) const EEXIST: i32 = 17;
-    pub(super) type ModeT = u32;
-}
-
-#[cfg(target_os = "macos")]
-mod beneath_consts {
-    pub(super) const O_WRONLY: i32 = 0x1;
-    pub(super) const O_CREAT: i32 = 0x200;
-    pub(super) const O_EXCL: i32 = 0x800;
-    pub(super) const O_DIRECTORY: i32 = 0x0010_0000;
-    pub(super) const O_NOFOLLOW: i32 = 0x100;
-    pub(super) const O_CLOEXEC: i32 = 0x0100_0000;
-    pub(super) const ELOOP: i32 = 62;
-    pub(super) const ENOTDIR: i32 = 20;
-    pub(super) const EEXIST: i32 = 17;
-    pub(super) type ModeT = u16;
-}
-
-#[cfg(any(
-    target_os = "macos",
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )
-))]
-mod beneath_raw {
-    unsafe extern "C" {
-        // SAFETY（宣言そのものの妥当性）: POSIX の
-        // `int openat(int dirfd, const char *path, int flags, ...)`
-        // （可変長引数は mode。`O_CREAT` のときだけ読まれる）と同じ型・幅。
-        // 呼び出し側の不変条件は `super::create_file_beneath` の SAFETY 参照。
-        pub(super) fn openat(dirfd: i32, path: *const core::ffi::c_char, flags: i32, ...) -> i32;
-        // SAFETY（宣言そのものの妥当性）: POSIX の
-        // `int mkdirat(int dirfd, const char *path, mode_t mode)`。
-        pub(super) fn mkdirat(
-            dirfd: i32,
-            path: *const core::ffi::c_char,
-            mode: super::beneath_consts::ModeT,
-        ) -> i32;
-    }
-}
-
-/// `root`（構築時に開いた共有ルートのディレクトリハンドル）を起点に、
-/// `ancestors` を 1 個ずつハンドル相対（`openat`/`mkdirat`・`O_NOFOLLOW`）で
-/// 開き（無ければ作り）、末端 `leaf` を `O_CREAT|O_EXCL|O_NOFOLLOW` で新規作成する
-/// （IO-5・TASK-19.2）。
-///
-/// パス文字列を再解決しないため、検査と作成の間に別プロセスが祖先を symlink へ
-/// 差し替えても、開いたディレクトリ fd の外へは出られない（TOCTOU 防止）。
-/// 各要素は呼び出し元が「`/`・NUL を含まない単一の `Normal` 名」であることを
-/// 検証済みの前提（`crate::guest_files`）。対応外アーキテクチャでは
-/// `Unsupported` を返す（fail-closed）。
-#[cfg(any(
-    target_os = "macos",
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )
-))]
-pub(crate) fn create_file_beneath(
-    root: &std::fs::File,
-    ancestors: &[&str],
-    leaf: &str,
-) -> Result<std::fs::File, BeneathError> {
-    use beneath_consts as c;
-    use std::ffi::CString;
-    use std::os::fd::{FromRawFd, OwnedFd};
-
-    fn cstr(name: &str) -> Result<CString, BeneathError> {
-        CString::new(name).map_err(|_| BeneathError::Io(io::ErrorKind::InvalidInput))
-    }
-    fn last_errno() -> (i32, io::ErrorKind) {
-        let err = io::Error::last_os_error();
-        (err.raw_os_error().unwrap_or(0), err.kind())
-    }
-
-    // root は構築時に開いて保持しているディレクトリハンドル。パスを開き直さないため、
-    // 構築後にルートやその親のエントリが差し替えられても起点は変わらない。
-    let mut dir: OwnedFd = root
-        .try_clone()
-        .map_err(|err| BeneathError::Io(err.kind()))?
-        .into();
-
-    for name in ancestors {
-        let cname = cstr(name)?;
-        // SAFETY: `dir` は本関数が所有する有効なディレクトリ fd で、呼び出しの間
-        // 生きている。`cname` は NUL 終端の有効な C 文字列。mkdirat は fd を
-        // 返さず、失敗時は errno を直後に拾う。
-        let rc = unsafe { beneath_raw::mkdirat(dir.as_raw_fd(), cname.as_ptr(), 0o777) };
-        if rc == -1 {
-            let (errno, kind) = last_errno();
-            if errno != c::EEXIST {
-                return Err(BeneathError::Io(kind));
-            }
-        }
-        // SAFETY: 同上。可変長引数は O_CREAT を指定しないため読まれない。
-        // 成功時の戻り値は本関数が唯一所有する新規 fd で、直後に OwnedFd へ渡す。
-        let fd = unsafe {
-            beneath_raw::openat(
-                dir.as_raw_fd(),
-                cname.as_ptr(),
-                c::O_DIRECTORY | c::O_NOFOLLOW | c::O_CLOEXEC,
-            )
-        };
-        if fd == -1 {
-            let (errno, kind) = last_errno();
-            return Err(if errno == c::ELOOP || errno == c::ENOTDIR {
-                BeneathError::AncestorNotDirectory
-            } else {
-                BeneathError::Io(kind)
-            });
-        }
-        // SAFETY: `fd` は直前の openat が返した有効な fd で、他に所有者がいない。
-        dir = unsafe { OwnedFd::from_raw_fd(fd) };
-    }
-
-    let cleaf = cstr(leaf)?;
-    let mode: u32 = 0o666;
-    // SAFETY: `dir`・`cleaf` は上記と同じ。O_CREAT を指定するため可変長引数の
-    // mode を `c_uint` 幅で渡す（宣言どおり読まれる）。成功時の戻り値は新規 fd。
-    let fd = unsafe {
-        beneath_raw::openat(
-            dir.as_raw_fd(),
-            cleaf.as_ptr(),
-            c::O_WRONLY | c::O_CREAT | c::O_EXCL | c::O_NOFOLLOW | c::O_CLOEXEC,
-            mode,
+/// [`read_dir_entries`] の失敗種別。
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
         )
-    };
-    if fd == -1 {
-        let (errno, kind) = last_errno();
-        return Err(if errno == c::EEXIST {
-            BeneathError::AlreadyExists
-        } else {
-            BeneathError::Io(kind)
-        });
-    }
-    // SAFETY: `fd` は直前の openat が返した有効な fd で、他に所有者がいない。
-    Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
-}
-
-/// 対応外アーキテクチャ向け（fail-closed）。
-#[cfg(not(any(
-    target_os = "macos",
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    allow(
+        dead_code,
+        reason = "対応外アーキテクチャでは常に Unsupported を返すため未構築の variant がある"
     )
-)))]
-pub(crate) fn create_file_beneath(
-    _root: &std::fs::File,
-    _ancestors: &[&str],
-    _leaf: &str,
-) -> Result<std::fs::File, BeneathError> {
-    Err(BeneathError::Io(io::ErrorKind::Unsupported))
-}
-
-/// ディレクトリハンドル `dir` 直下のサブディレクトリ `name` を、ハンドル相対・
-/// symlink 非追従（`openat` + `O_DIRECTORY|O_NOFOLLOW`）で開く（走査用。
-/// IO-5・TASK-19.2）。symlink・非ディレクトリは `AncestorNotDirectory`。
-#[cfg(any(
-    target_os = "macos",
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )
-))]
-pub(crate) fn open_dir_beneath(
-    dir: &std::fs::File,
-    name: &str,
-) -> Result<std::fs::File, BeneathError> {
-    use beneath_consts as c;
-    use std::os::fd::{FromRawFd, OwnedFd};
-
-    let cname =
-        std::ffi::CString::new(name).map_err(|_| BeneathError::Io(io::ErrorKind::InvalidInput))?;
-    // SAFETY: `dir` は呼び出し元が借用中の有効なディレクトリ fd、`cname` は
-    // NUL 終端の有効な C 文字列。O_CREAT を指定しないため可変長引数は読まれない。
-    // 成功時の戻り値は本関数が唯一所有する新規 fd。
-    let fd = unsafe {
-        beneath_raw::openat(
-            dir.as_raw_fd(),
-            cname.as_ptr(),
-            c::O_DIRECTORY | c::O_NOFOLLOW | c::O_CLOEXEC,
-        )
-    };
-    if fd == -1 {
-        let err = io::Error::last_os_error();
-        let errno = err.raw_os_error().unwrap_or(0);
-        return Err(if errno == c::ELOOP || errno == c::ENOTDIR {
-            BeneathError::AncestorNotDirectory
-        } else {
-            BeneathError::Io(err.kind())
-        });
-    }
-    // SAFETY: `fd` は直前の openat が返した有効な fd で、他に所有者がいない。
-    Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
-}
-
-/// 対応外アーキテクチャ向け（fail-closed）。
-#[cfg(not(any(
-    target_os = "macos",
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )
-)))]
-pub(crate) fn open_dir_beneath(
-    _dir: &std::fs::File,
-    _name: &str,
-) -> Result<std::fs::File, BeneathError> {
-    Err(BeneathError::Io(io::ErrorKind::Unsupported))
-}
-
-/// [`read_dir_names`] の失敗種別。
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadDirError {
     /// エントリ数が上限を超えた（無制限確保による DoS の防止）。
@@ -611,58 +443,84 @@ pub(crate) enum ReadDirError {
     Io(io::ErrorKind),
 }
 
-/// `dirent` 内で `d_name` が始まるバイト位置。Linux（glibc・musl）は
-/// `d_ino(8) d_off(8) d_reclen(2) d_type(1)` の直後、macOS（64 ビット inode 版）は
-/// `d_ino(8) d_seekoff(8) d_reclen(2) d_namlen(2) d_type(1)` の直後。
-#[cfg(target_os = "linux")]
-const DIRENT_NAME_OFFSET: usize = 19;
-#[cfg(target_os = "macos")]
-const DIRENT_NAME_OFFSET: usize = 21;
-
-#[cfg(any(
-    target_os = "macos",
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )
-))]
-mod dir_raw {
-    use core::ffi::c_void;
-
-    // SAFETY（宣言そのものの妥当性）: POSIX の `DIR *fdopendir(int fd)`・
-    // `struct dirent *readdir(DIR *)`・`void rewinddir(DIR *)`・
-    // `int closedir(DIR *)`。DIR は不透明ポインタ（`*mut c_void`）、dirent は
-    // 先頭バイトへのポインタとして扱い、`d_name` だけを固定オフセットで読む
-    // （`super::DIRENT_NAME_OFFSET`）。macOS の x86_64 は 64 ビット inode 版の
-    // シンボル（`$INODE64`）を明示する。`__errno_location` / `__error` は
-    // スレッドローカルな errno へのポインタを返す。
-    unsafe extern "C" {
-        #[cfg_attr(
-            all(target_os = "macos", target_arch = "x86_64"),
-            link_name = "fdopendir$INODE64"
-        )]
-        pub(super) fn fdopendir(fd: i32) -> *mut c_void;
-        #[cfg_attr(
-            all(target_os = "macos", target_arch = "x86_64"),
-            link_name = "readdir$INODE64"
-        )]
-        pub(super) fn readdir(dir: *mut c_void) -> *mut u8;
-        pub(super) fn rewinddir(dir: *mut c_void);
-        pub(super) fn closedir(dir: *mut c_void) -> i32;
-        #[cfg(target_os = "linux")]
-        pub(super) fn __errno_location() -> *mut i32;
-        #[cfg(target_os = "macos")]
-        pub(super) fn __error() -> *mut i32;
-    }
+/// [`read_dir_entries`] が返す 1 エントリ（名前は生のバイト列、`ino` は
+/// `dirent.d_ino`。取り消し前の同一性確認〔`crate::guest_files`〕に使う）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirEntryName {
+    /// エントリ名（`.`・`..` は含まない）。
+    pub(crate) name: std::ffi::OsString,
+    /// エントリの inode 番号（`d_ino`）。
+    pub(crate) ino: u64,
 }
 
-/// ディレクトリハンドル `dir` 直下のエントリ名（`.`・`..` を除く）を、パスを
-/// 再解決せずに `fdopendir`/`readdir` で列挙する（IO-5・TASK-19.2）。
-///
-/// `dir` は dup して使い（元の fd は閉じられない）、dup 先は元の fd と読み取り
-/// 位置を共有するため `rewinddir` で先頭へ戻す。名前は生のバイト列（`OsString`）で
-/// 返し、非 UTF-8 の扱いは呼び出し側が決める。件数が `max_entries` を超えたら
-/// `TooMany`。対応外アーキテクチャでは `Unsupported`（fail-closed）。
+/// `open(2)` フラグ・`unlinkat(2)` フラグ・errno・`mode_t`・`dirent` の
+/// オフセット（Linux はアーキテクチャごと、macOS は共通。上記「アーキテクチャ差」
+/// 参照）。値は `sys::tests::io5_beneath_consts_*` で固定値として照合する。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod beneath_consts {
+    // include/uapi/asm-generic/fcntl.h（x86_64 は上書きしない）。
+    pub(super) const O_WRONLY: i32 = 0o1;
+    pub(super) const O_CREAT: i32 = 0o100;
+    pub(super) const O_EXCL: i32 = 0o200;
+    pub(super) const O_DIRECTORY: i32 = 0o200_000;
+    pub(super) const O_NOFOLLOW: i32 = 0o400_000;
+    pub(super) const O_CLOEXEC: i32 = 0o2_000_000;
+    // include/uapi/linux/fcntl.h。
+    pub(super) const AT_REMOVEDIR: i32 = 0x200;
+    // include/uapi/asm-generic/errno-base.h・errno.h。
+    pub(super) const EEXIST: i32 = 17;
+    pub(super) const ENOTDIR: i32 = 20;
+    pub(super) const ELOOP: i32 = 40;
+    pub(super) type ModeT = u32;
+    pub(super) const DIRENT_INO_OFFSET: usize = 0;
+    pub(super) const DIRENT_NAME_OFFSET: usize = 19;
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod beneath_consts {
+    // include/uapi/asm-generic/fcntl.h（arm64 が上書きしない値）。
+    pub(super) const O_WRONLY: i32 = 0o1;
+    pub(super) const O_CREAT: i32 = 0o100;
+    pub(super) const O_EXCL: i32 = 0o200;
+    // arch/arm64/include/uapi/asm/fcntl.h（asm-generic と異なる。流用しない）。
+    pub(super) const O_DIRECTORY: i32 = 0o40_000;
+    pub(super) const O_NOFOLLOW: i32 = 0o100_000;
+    // include/uapi/asm-generic/fcntl.h。
+    pub(super) const O_CLOEXEC: i32 = 0o2_000_000;
+    // include/uapi/linux/fcntl.h。
+    pub(super) const AT_REMOVEDIR: i32 = 0x200;
+    // include/uapi/asm-generic/errno-base.h・errno.h。
+    pub(super) const EEXIST: i32 = 17;
+    pub(super) const ENOTDIR: i32 = 20;
+    pub(super) const ELOOP: i32 = 40;
+    pub(super) type ModeT = u32;
+    pub(super) const DIRENT_INO_OFFSET: usize = 0;
+    pub(super) const DIRENT_NAME_OFFSET: usize = 19;
+}
+
+#[cfg(target_os = "macos")]
+mod beneath_consts {
+    // <sys/fcntl.h>・<sys/errno.h>・<sys/dirent.h>（x86_64 / arm64 共通）。
+    pub(super) const O_WRONLY: i32 = 0x1;
+    pub(super) const O_CREAT: i32 = 0x200;
+    pub(super) const O_EXCL: i32 = 0x800;
+    pub(super) const O_DIRECTORY: i32 = 0x0010_0000;
+    pub(super) const O_NOFOLLOW: i32 = 0x100;
+    pub(super) const O_CLOEXEC: i32 = 0x0100_0000;
+    pub(super) const AT_REMOVEDIR: i32 = 0x80;
+    pub(super) const EEXIST: i32 = 17;
+    pub(super) const ENOTDIR: i32 = 20;
+    pub(super) const ELOOP: i32 = 62;
+    pub(super) type ModeT = u16;
+    pub(super) const DIRENT_INO_OFFSET: usize = 0;
+    pub(super) const DIRENT_NAME_OFFSET: usize = 21;
+}
+
+pub(crate) use beneath::{
+    create_leaf_beneath, mkdir_beneath, open_dir_beneath, read_dir_entries, unlink_beneath,
+};
+
+/// 対応アーキテクチャ（macOS・Linux の x86_64 / aarch64）向けの実装。
 #[cfg(any(
     target_os = "macos",
     all(
@@ -670,73 +528,268 @@ mod dir_raw {
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
-pub(crate) fn read_dir_names(
-    dir: &std::fs::File,
-    max_entries: usize,
-) -> Result<Vec<std::ffi::OsString>, ReadDirError> {
-    use std::ffi::CStr;
-    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+mod beneath {
+    use super::beneath_consts as c;
+    use super::{BeneathError, DirEntryName, ReadDirError, UnlinkTarget};
+    use std::ffi::{CStr, CString, OsString};
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
     use std::os::unix::ffi::OsStringExt;
 
+    mod raw {
+        use core::ffi::{c_char, c_void};
+
+        unsafe extern "C" {
+            // SAFETY（宣言そのものの妥当性）: POSIX の
+            // `int openat(int dirfd, const char *path, int flags, ...)`
+            // （可変長引数は mode。`O_CREAT` のときだけ読まれる）と同じ型・幅。
+            // 呼び出し側の不変条件は各呼び出し箇所の SAFETY 参照。
+            pub(super) fn openat(dirfd: i32, path: *const c_char, flags: i32, ...) -> i32;
+            // SAFETY（宣言そのものの妥当性）: POSIX の
+            // `int mkdirat(int dirfd, const char *path, mode_t mode)`
+            // （`mode_t` は Linux が u32、macOS が u16。`beneath_consts::ModeT`）。
+            pub(super) fn mkdirat(dirfd: i32, path: *const c_char, mode: super::c::ModeT) -> i32;
+            // SAFETY（宣言そのものの妥当性）: POSIX の
+            // `int unlinkat(int dirfd, const char *path, int flags)`。
+            pub(super) fn unlinkat(dirfd: i32, path: *const c_char, flags: i32) -> i32;
+
+            // SAFETY（宣言そのものの妥当性）: POSIX の `DIR *fdopendir(int fd)`・
+            // `struct dirent *readdir(DIR *)`・`void rewinddir(DIR *)`・
+            // `int closedir(DIR *)`。DIR は不透明ポインタ（`*mut c_void`）、dirent は
+            // 先頭バイトへのポインタとして扱い、`d_ino`・`d_name` だけを固定
+            // オフセットで読む（`beneath_consts::DIRENT_*`）。macOS の x86_64 は
+            // 64 ビット inode 版の DIR / dirent を扱うシンボル（`$INODE64`）を
+            // fdopendir・readdir・rewinddir で揃えて明示する（混在させると DIR の
+            // レイアウトが食い違う。closedir は版を持たない）。arm64 の macOS は
+            // 64 ビット inode 版のみのため接尾辞を付けない。
+            #[cfg_attr(
+                all(target_os = "macos", target_arch = "x86_64"),
+                link_name = "fdopendir$INODE64"
+            )]
+            pub(super) fn fdopendir(fd: i32) -> *mut c_void;
+            #[cfg_attr(
+                all(target_os = "macos", target_arch = "x86_64"),
+                link_name = "readdir$INODE64"
+            )]
+            pub(super) fn readdir(dir: *mut c_void) -> *mut u8;
+            #[cfg_attr(
+                all(target_os = "macos", target_arch = "x86_64"),
+                link_name = "rewinddir$INODE64"
+            )]
+            pub(super) fn rewinddir(dir: *mut c_void);
+            pub(super) fn closedir(dir: *mut c_void) -> i32;
+            // SAFETY（宣言そのものの妥当性）: スレッドローカルな errno への
+            // ポインタを返す（glibc・musl は `__errno_location`、macOS は `__error`）。
+            #[cfg(target_os = "linux")]
+            pub(super) fn __errno_location() -> *mut i32;
+            #[cfg(target_os = "macos")]
+            pub(super) fn __error() -> *mut i32;
+        }
+    }
+
+    fn cstr(name: &str) -> Result<CString, BeneathError> {
+        CString::new(name).map_err(|_| BeneathError::Io(io::ErrorKind::InvalidInput))
+    }
+
+    /// 直前の libc 呼び出しの errno を（他の処理を挟まずに）取り出す。
+    fn last_errno() -> (i32, io::ErrorKind) {
+        let err = io::Error::last_os_error();
+        (err.raw_os_error().unwrap_or(0), err.kind())
+    }
+
+    /// `openat` の戻り値を所有 fd へ変換する（`-1` は errno を `map` で写す）。
+    fn own_fd(
+        fd: i32,
+        map: impl FnOnce(i32, io::ErrorKind) -> BeneathError,
+    ) -> Result<File, BeneathError> {
+        if fd < 0 {
+            let (errno, kind) = last_errno();
+            return Err(map(errno, kind));
+        }
+        // SAFETY: `fd` は直前の openat が返した有効な新規 fd（非負）で、他に
+        // 所有者がいない。ここで `OwnedFd` へ渡し、以降は drop で閉じる。
+        Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// `dir` 直下にディレクトリ `name` を作る（`mkdirat`・mode 0o777 は umask
+    /// 適用前）。作ったら `Ok(true)`、既に何か（symlink を含む）があれば
+    /// `Ok(false)`（その実体が辿れるディレクトリかは [`open_dir_beneath`] が
+    /// `O_NOFOLLOW` で確かめる）。
+    pub(crate) fn mkdir_beneath(dir: &File, name: &str) -> Result<bool, BeneathError> {
+        let cname = cstr(name)?;
+        // SAFETY: `dir` は呼び出し元が借用中の有効なディレクトリ fd で、呼び出しの
+        // 間閉じられない。`cname` は NUL 終端の有効な C 文字列で呼び出しの間生きて
+        // いる。mkdirat は fd を返さず、失敗時は errno を直後に拾う。
+        let rc = unsafe { raw::mkdirat(dir.as_raw_fd(), cname.as_ptr(), 0o777) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let (errno, kind) = last_errno();
+        if errno == c::EEXIST {
+            Ok(false)
+        } else {
+            Err(BeneathError::Io(kind))
+        }
+    }
+
+    /// `dir` 直下のサブディレクトリ `name` を、ハンドル相対・symlink 非追従
+    /// （`openat` + `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`）で開く。symlink・
+    /// 非ディレクトリは `AncestorNotDirectory`、無ければ `Io(NotFound)`。
+    pub(crate) fn open_dir_beneath(dir: &File, name: &str) -> Result<File, BeneathError> {
+        let cname = cstr(name)?;
+        // SAFETY: `dir`・`cname` は mkdir_beneath と同じ。O_CREAT を指定しない
+        // ため可変長引数は読まれない。戻り値は `own_fd` が唯一の所有者になる。
+        let fd = unsafe {
+            raw::openat(
+                dir.as_raw_fd(),
+                cname.as_ptr(),
+                c::O_DIRECTORY | c::O_NOFOLLOW | c::O_CLOEXEC,
+            )
+        };
+        own_fd(fd, |errno, kind| {
+            if errno == c::ELOOP || errno == c::ENOTDIR {
+                BeneathError::AncestorNotDirectory
+            } else {
+                BeneathError::Io(kind)
+            }
+        })
+    }
+
+    /// `dir` 直下に通常ファイル `name` を `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|
+    /// O_CLOEXEC`（mode 0o666。umask 適用前）で新規作成する。既存（symlink を
+    /// 含む。辿らない）は `AlreadyExists`。
+    pub(crate) fn create_leaf_beneath(dir: &File, name: &str) -> Result<File, BeneathError> {
+        let cname = cstr(name)?;
+        let mode: u32 = 0o666;
+        // SAFETY: `dir`・`cname` は上記と同じ。O_CREAT を指定するため可変長引数の
+        // mode を `c_uint` 幅（`mode_t` の既定の引数昇格後の幅）で渡す。戻り値は
+        // `own_fd` が唯一の所有者になる。
+        let fd = unsafe {
+            raw::openat(
+                dir.as_raw_fd(),
+                cname.as_ptr(),
+                c::O_WRONLY | c::O_CREAT | c::O_EXCL | c::O_NOFOLLOW | c::O_CLOEXEC,
+                mode,
+            )
+        };
+        own_fd(fd, |errno, kind| {
+            if errno == c::EEXIST {
+                BeneathError::AlreadyExists
+            } else {
+                BeneathError::Io(kind)
+            }
+        })
+    }
+
+    /// `dir` 直下のエントリ `name` を `unlinkat` で消す（symlink は辿らない。
+    /// `EmptyDirectory` は空でなければ `Io(DirectoryNotEmpty)` 等で失敗する）。
+    /// 消す対象が呼び出し元の意図した実体かどうかは確かめない（同一性の確認は
+    /// 呼び出し元〔`crate::guest_files` の取り消し〕の責務）。
+    pub(crate) fn unlink_beneath(
+        dir: &File,
+        name: &str,
+        target: UnlinkTarget,
+    ) -> Result<(), BeneathError> {
+        let cname = cstr(name)?;
+        let flags = match target {
+            UnlinkTarget::File => 0,
+            UnlinkTarget::EmptyDirectory => c::AT_REMOVEDIR,
+        };
+        // SAFETY: `dir`・`cname` は上記と同じ。unlinkat は fd を返さず、失敗時は
+        // errno を直後に拾う。
+        let rc = unsafe { raw::unlinkat(dir.as_raw_fd(), cname.as_ptr(), flags) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(BeneathError::Io(last_errno().1))
+        }
+    }
+
     fn set_errno_zero() {
-        // SAFETY: スレッドローカルな errno へのポインタを得て 0 を書くだけ。
+        // SAFETY: スレッドローカルな errno へのポインタ（常に有効・整列済み）を
+        // 得て 0 を書くだけ。
         #[cfg(target_os = "linux")]
         unsafe {
-            *dir_raw::__errno_location() = 0;
+            *raw::__errno_location() = 0;
         }
         // SAFETY: 同上（macOS）。
         #[cfg(target_os = "macos")]
         unsafe {
-            *dir_raw::__error() = 0;
+            *raw::__error() = 0;
         }
     }
 
-    let raw = dir
-        .try_clone()
-        .map_err(|err| ReadDirError::Io(err.kind()))?
-        .into_raw_fd();
-    // SAFETY: `raw` は直前に dup した有効な fd。成功すれば所有権は DIR へ移り
-    // closedir で閉じられる。
-    let handle = unsafe { dir_raw::fdopendir(raw) };
-    if handle.is_null() {
-        let err = io::Error::last_os_error();
-        // SAFETY: fdopendir が失敗したとき fd の所有権は移らないため、ここで閉じる。
-        drop(unsafe { OwnedFd::from_raw_fd(raw) });
-        return Err(ReadDirError::Io(err.kind()));
-    }
-    // SAFETY: `handle` は有効な DIR*。読み取り位置を先頭へ戻す。
-    unsafe { dir_raw::rewinddir(handle) };
-
-    let mut names = Vec::new();
-    let result = loop {
-        set_errno_zero();
-        // SAFETY: `handle` は closedir 前の有効な DIR*。返る dirent は次の
-        // readdir / closedir まで有効で、その前に名前をコピーする。
-        let entry = unsafe { dir_raw::readdir(handle) };
-        if entry.is_null() {
+    /// `dir` 直下のエントリ（`.`・`..` を除く）を、パスを再解決せずに
+    /// `fdopendir`/`readdir` で列挙する。`dir` は dup して使い（元の fd は
+    /// 閉じない）、dup 先は元の fd と読み取り位置を共有するため `rewinddir` で
+    /// 先頭へ戻す（`rewinddir` 以前から存在し削除されていないエントリはすべて
+    /// 返る。POSIX readdir）。件数が `max_entries` を超えたら `TooMany`。
+    pub(crate) fn read_dir_entries(
+        dir: &File,
+        max_entries: usize,
+    ) -> Result<Vec<DirEntryName>, ReadDirError> {
+        let raw_fd = dir
+            .try_clone()
+            .map_err(|err| ReadDirError::Io(err.kind()))?
+            .into_raw_fd();
+        // SAFETY: `raw_fd` は直前に dup した有効な fd で、他に所有者がいない。
+        // 成功すれば所有権は DIR へ移り closedir で閉じられる。
+        let handle = unsafe { raw::fdopendir(raw_fd) };
+        if handle.is_null() {
             let err = io::Error::last_os_error();
-            break match err.raw_os_error() {
-                Some(0) | None => Ok(()),
-                Some(_) => Err(ReadDirError::Io(err.kind())),
+            // SAFETY: fdopendir が失敗したとき fd の所有権は移らないため、まだ
+            // 唯一の所有者である本関数がここで閉じる。
+            drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+            return Err(ReadDirError::Io(err.kind()));
+        }
+        // SAFETY: `handle` は fdopendir が返した有効な DIR*。読み取り位置を先頭へ戻す。
+        unsafe { raw::rewinddir(handle) };
+
+        let mut entries = Vec::new();
+        let result = loop {
+            set_errno_zero();
+            // SAFETY: `handle` は closedir 前の有効な DIR*。返る dirent は次の
+            // readdir / closedir まで有効で、その前に必要な値をコピーする。
+            let entry = unsafe { raw::readdir(handle) };
+            if entry.is_null() {
+                let err = io::Error::last_os_error();
+                break match err.raw_os_error() {
+                    Some(0) | None => Ok(()),
+                    Some(_) => Err(ReadDirError::Io(err.kind())),
+                };
+            }
+            // SAFETY: dirent の `d_name` は `DIRENT_NAME_OFFSET` から始まり、
+            // カーネル / libc が NUL 終端を保証する（構造体の範囲内に収まる）。
+            let name =
+                unsafe { CStr::from_ptr(entry.add(c::DIRENT_NAME_OFFSET).cast()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if entries.len() >= max_entries {
+                break Err(ReadDirError::TooMany);
+            }
+            // SAFETY: `d_ino` は `DIRENT_INO_OFFSET` にある u64 で、dirent の範囲内。
+            // 整列を仮定しないよう read_unaligned で読む。
+            let ino = unsafe {
+                entry
+                    .add(c::DIRENT_INO_OFFSET)
+                    .cast::<u64>()
+                    .read_unaligned()
             };
-        }
-        // SAFETY: dirent の `d_name` は固定オフセットから始まる NUL 終端文字列で、
-        // 構造体の範囲内に収まる。
-        let name = unsafe { CStr::from_ptr(entry.add(DIRENT_NAME_OFFSET).cast()) }.to_bytes();
-        if name == b"." || name == b".." {
-            continue;
-        }
-        if names.len() >= max_entries {
-            break Err(ReadDirError::TooMany);
-        }
-        names.push(std::ffi::OsString::from_vec(name.to_vec()));
-    };
-    // SAFETY: `handle` は有効な DIR* で以降使わない。dup した fd もここで閉じられる。
-    unsafe { dir_raw::closedir(handle) };
-    result.map(|()| names)
+            entries.push(DirEntryName {
+                name: OsString::from_vec(name.to_vec()),
+                ino,
+            });
+        };
+        // SAFETY: `handle` は有効な DIR* で以降使わない。dup した fd もここで閉じられる。
+        unsafe { raw::closedir(handle) };
+        result.map(|()| entries)
+    }
 }
 
-/// 対応外アーキテクチャ向け（fail-closed）。
+/// 対応外アーキテクチャ向け（fail-closed）。実装（unsafe を含む）はビルドから
+/// 除外し、同じシグネチャで常に `Unsupported` を返す。
 #[cfg(not(any(
     target_os = "macos",
     all(
@@ -744,11 +797,37 @@ pub(crate) fn read_dir_names(
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 )))]
-pub(crate) fn read_dir_names(
-    _dir: &std::fs::File,
-    _max_entries: usize,
-) -> Result<Vec<std::ffi::OsString>, ReadDirError> {
-    Err(ReadDirError::Io(io::ErrorKind::Unsupported))
+mod beneath {
+    use super::{BeneathError, DirEntryName, ReadDirError, UnlinkTarget};
+    use std::fs::File;
+    use std::io;
+
+    pub(crate) fn mkdir_beneath(_dir: &File, _name: &str) -> Result<bool, BeneathError> {
+        Err(BeneathError::Io(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn open_dir_beneath(_dir: &File, _name: &str) -> Result<File, BeneathError> {
+        Err(BeneathError::Io(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn create_leaf_beneath(_dir: &File, _name: &str) -> Result<File, BeneathError> {
+        Err(BeneathError::Io(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn unlink_beneath(
+        _dir: &File,
+        _name: &str,
+        _target: UnlinkTarget,
+    ) -> Result<(), BeneathError> {
+        Err(BeneathError::Io(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn read_dir_entries(
+        _dir: &File,
+        _max_entries: usize,
+    ) -> Result<Vec<DirEntryName>, ReadDirError> {
+        Err(ReadDirError::Io(io::ErrorKind::Unsupported))
+    }
 }
 
 #[cfg(test)]

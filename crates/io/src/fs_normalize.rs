@@ -122,7 +122,7 @@ const ROOT_NODE: NodeId = 0;
 /// （Unicode simple case folding では非衝突）。モジュール doc の方針
 /// 「見逃しよりも過検出を選ぶ」どおりの意図した挙動であり、
 /// `io5_sharp_s_is_detected_as_collision` で固定する。
-fn fold_component(component: &str) -> String {
+pub(crate) fn fold_component(component: &str) -> String {
     component
         .chars()
         .flat_map(char::to_lowercase)
@@ -239,7 +239,7 @@ pub(crate) fn quote_for_message(path: &str) -> String {
 
 /// 衝突を表す構造化エラーを組み立てる。パス・コンポーネントはすべて
 /// [`quote_for_message`] で衛生化してから埋め込む（生の値を埋め込まない）。
-fn collision_error(
+pub(crate) fn collision_error(
     path: &str,
     existing_path: &str,
     component: &str,

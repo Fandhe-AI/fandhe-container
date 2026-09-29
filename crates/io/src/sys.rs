@@ -22,10 +22,11 @@
 //!   〔`crate::server::imp::verify_peer_credential`〕の基準にする）
 //! - Linux 専用: `syncfs(2)` で fd が属するファイルシステム全体を永続化する
 //!   （IO-2・TASK-15.2.1・#823）。FLUSH バリア（[`crate::barrier::FlushBarrier`]）
-//!   以前の書き込みを実際に永続化してから FlushAck を返す処理
-//!   （`crate::writeback` の `Flush` 受信ハンドラ）から、TASK-15.2.2・#824 で
-//!   `crate::writeback::AppendFileSink::get_ref()` が返す `&File` の fd を渡して
-//!   呼ぶ想定（本 issue の時点ではまだ呼び出し元がない。REPAIR-3）。
+//!   以前の書き込みを実際に永続化してから FlushAck を返す処理は、
+//!   `crate::writeback::serve_connection`（`Flush` 受信）→
+//!   `crate::writeback::AppendFileSink::persist` →
+//!   `crate::barrier::persist_file_system`（dup した fd・helper スレッド・
+//!   タイムアウト付き）→ 本関数、の順で呼ぶ（TASK-15.2.2・#824）。
 //!
 //! # 「実 uid」ではなく「接続時点の実効 uid（euid）」（H2・#820
 //! security-auditor 指摘対応）
@@ -310,9 +311,11 @@ fn syncfs_rc_to_result(rc: i32) -> Result<(), IoError> {
 /// **ファイルシステム全体**である（man 2 syncfs）。FLUSH バリア
 /// （[`crate::barrier::FlushBarrier`]）以前の書き込みが永続化済みであることを
 /// 保証する FlushAck（IO-2）は、この意味論を前提に組み立てる
-/// （呼び出し元は TASK-15.2.2・#824 で追加する `crate::writeback` の `Flush`
-/// 受信ハンドラで、`crate::writeback::AppendFileSink::get_ref()` が返す
-/// `&File` を渡す想定。本 issue の時点ではまだ呼び出し元がない）。
+/// （呼び出し元は `crate::barrier::persist_file_system`。TASK-15.2.2・#824）。
+///
+/// エラーを返したら同じ fd で再試行しない（errseq は `struct file` ごとに
+/// 1 回だけ報告するため、再試行が 0 を返して永続化を偽装しうる。呼び出し側の
+/// sink はポイズンする）。
 ///
 /// # カーネル版数の要件（IO-2 の保証範囲）
 /// `syncfs(2)` は Linux 2.6.39・glibc 2.14 で追加された（man 2 syncfs の
@@ -329,13 +332,6 @@ fn syncfs_rc_to_result(rc: i32) -> Result<(), IoError> {
 /// シグナル割り込みによる失敗は定義されていない）。エラー時は
 /// [`IoErrorCode::Internal`] を返し、panic しない。
 #[cfg(target_os = "linux")]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "TASK-15.2.2・#824 で writeback の Flush 処理から呼ぶまで未使用"
-    )
-)]
 pub(crate) fn syncfs(fd: impl AsFd) -> Result<(), IoError> {
     let raw_fd = fd.as_fd().as_raw_fd();
 

@@ -23,20 +23,36 @@
 //! `recv_ack` に通す以外の方法で `FlushAck` を得られず、「バッファリング ACK を
 //! 永続化済みとして偽装する」経路は型として存在しない。
 //!
+//! # サーバー側の永続化（TASK-15.2.2・#824）
+//!
+//! サーバー側の永続化実行体は本モジュールの `persist_file_system`
+//! （`pub(crate)`）で、[`crate::writeback::AppendFileSink`] の
+//! [`crate::writeback::BatchSink::persist`] から呼ばれる。
+//! [`crate::writeback::serve_connection`] は `Flush` 受信時に persist の成功を
+//! 確認してから [`FrameKind::FlushAck`] を送出する。Linux では
+//! `crate::sys::syncfs`（`syncfs(2)`）を、中断できない syscall をタイムアウト
+//! 付きの helper スレッドで待つ形で実行する（REPAIR-5）。
+//!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! 本モジュールが表すのはクライアント側のプロトコル契約（型の区別）のみ。
-//! サーバー側で FLUSH バリア以前の書き込みを実際に永続化してから
-//! [`FrameKind::FlushAck`] を送出する処理はまだない。永続化に使う
-//! `crate::sys::syncfs`（Linux 用の `syncfs(2)` FFI ラッパー）は
-//! TASK-15.2.1・#823 で実装済みだが、`crates/io/src/writeback.rs` の `Flush`
-//! 受信ハンドラからの呼び出し・FlushAck の送出への組み込みはまだ行っていない
-//! （TASK-15.2.2・#824 の範囲。`docs/design/io-protocol.md` の「FLUSH フレーム
-//! の扱い」参照）。
+//! - macOS / Windows には代替フラッシュがなく `Unimplemented` を返す
+//!   （TASK-15.3・#88）。
+//! - 同時並行する FLUSH の合流とレート制限はない（同期範囲がファイルシステム
+//!   全体に及ぶ増幅への対策。後続課題）。
+//! - Linux 5.8 未満のカーネルは書き戻しエラーを報告しないが、検出・拒否は
+//!   していない（`crate::sys::syncfs` の doc 参照）。
+//! - 検証するのは順序と契約までで、電源断・SIGKILL への耐性は検証しない
+//!   （TASK-18）。
+
+use std::fs::File;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use crate::client::{InFlightRequest, RequestId};
 use crate::error::{IoError, IoErrorCode};
 use crate::protocol::FrameKind;
+use crate::transport::IoTimeout;
 
 /// 通常 ACK（[`FrameKind::Ack`]）の受領記録（IO-1）。
 ///
@@ -230,10 +246,234 @@ impl TryFrom<AckReceipt> for FlushAck {
     }
 }
 
+/// 戻らない `syncfs` helper スレッドの同時存在数の上限（プロセス全体）。
+///
+/// `syncfs(2)` は中断できないため、タイムアウトしたスレッドは detach して
+/// 戻るまで残る。D state でハングし続ける場合にスレッドが際限なく増えない
+/// ようにする DoS 対策であり（REPAIR-5・security.md「無制限リソース確保」）、
+/// 通常の同時実行を絞る値ではない。同時 Flush を出す結合試験・並列テスト
+/// でも到達しない程度に大きく取る。
+pub(crate) const MAX_PERSIST_THREADS: usize = 64;
+
+/// 実行中の永続化 helper スレッド数を数え、上限を超える起動を拒否する。
+pub(crate) struct PersistLimiter {
+    running: AtomicUsize,
+    max: usize,
+}
+
+impl PersistLimiter {
+    pub(crate) const fn new(max: usize) -> Self {
+        Self {
+            running: AtomicUsize::new(0),
+            max,
+        }
+    }
+
+    /// 枠を 1 つ確保する。上限到達なら [`IoErrorCode::ResourceExhausted`]。
+    fn acquire(&'static self) -> Result<PersistSlot, IoError> {
+        self.running
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                if n < self.max { n.checked_add(1) } else { None }
+            })
+            .map(|_| PersistSlot { limiter: self })
+            .map_err(|_| {
+                IoError::new(
+                    IoErrorCode::ResourceExhausted,
+                    "too many persist operations are still running",
+                )
+            })
+    }
+}
+
+/// [`PersistLimiter`] の枠。Drop（helper スレッド終了時）で解放する。
+struct PersistSlot {
+    limiter: &'static PersistLimiter,
+}
+
+impl Drop for PersistSlot {
+    fn drop(&mut self) {
+        self.limiter.running.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+static PERSIST_LIMITER: PersistLimiter = PersistLimiter::new(MAX_PERSIST_THREADS);
+
+/// ブロッキングする `work` を helper スレッドで実行し、`timeout` まで待つ
+/// （IO-2・REPAIR-5・TASK-15.2.2）。`work` は 1 回だけ実行し再試行しない。
+///
+/// タイムアウトした場合 helper スレッドは detach され、`work` が戻るまで
+/// `limiter` の枠を占有する。
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "Linux の syncfs 経路と単体テストのみが使う")
+)]
+fn run_with_deadline<F>(
+    limiter: &'static PersistLimiter,
+    timeout: IoTimeout,
+    work: F,
+) -> Result<Duration, IoError>
+where
+    F: FnOnce() -> Result<(), IoError> + Send + 'static,
+{
+    let slot = limiter.acquire()?;
+    let (tx, rx) = mpsc::sync_channel::<Result<(), IoError>>(1);
+    let started = Instant::now();
+    std::thread::Builder::new()
+        .name("fandhe-io-persist".to_owned())
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let _slot = slot;
+            // 受信側がタイムアウトで離脱済みなら送信は失敗するが問題ない。
+            let _ = tx.send(work());
+        })
+        .map_err(|_| {
+            IoError::new(
+                IoErrorCode::ResourceExhausted,
+                "failed to spawn persist thread",
+            )
+        })?;
+    match rx.recv_timeout(timeout.as_duration()) {
+        Ok(Ok(())) => Ok(started.elapsed()),
+        Ok(Err(err)) => Err(err),
+        Err(RecvTimeoutError::Timeout) => Err(IoError::new(
+            IoErrorCode::Timeout,
+            "persist did not complete before the timeout",
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(IoError::new(
+            IoErrorCode::Internal,
+            "persist thread terminated unexpectedly",
+        )),
+    }
+}
+
+/// `file` が属するファイルシステムを永続化し、所要時間を返す（IO-2・
+/// TASK-15.2.2・#824）。
+///
+/// [`crate::writeback::AppendFileSink::persist`] から呼ばれる。Linux では
+/// `file` を dup した fd に対し `crate::sys::syncfs` を helper スレッドで 1 回
+/// だけ実行する。失敗しても再試行しない（errseq は 1 回しか報告しないため。
+/// 呼び出し側の sink がポイズンする）。macOS / Windows は代替フラッシュが
+/// なく [`IoErrorCode::Unimplemented`]（TASK-15.3・#88）。
+#[cfg(target_os = "linux")]
+pub(crate) fn persist_file_system(file: &File, timeout: IoTimeout) -> Result<Duration, IoError> {
+    let dup = file.try_clone().map_err(|err| {
+        IoError::new(
+            IoErrorCode::Internal,
+            format!("failed to duplicate fd for persist ({:?})", err.kind()),
+        )
+    })?;
+    run_with_deadline(&PERSIST_LIMITER, timeout, move || crate::sys::syncfs(&dup))
+}
+
+/// 非 Linux 版: 代替フラッシュ未実装のため FlushAck を出せない（fail-closed）。
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn persist_file_system(_file: &File, _timeout: IoTimeout) -> Result<Duration, IoError> {
+    let _ = &PERSIST_LIMITER;
+    Err(IoError::new(
+        IoErrorCode::Unimplemented,
+        "persist is not implemented on this OS (TASK-15.3, #88)",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::{InFlightLimit, SendQueue};
+
+    fn ms(n: u64) -> IoTimeout {
+        IoTimeout::new(Duration::from_millis(n)).expect("valid timeout")
+    }
+
+    /// IO-2・TASK-15.2.2: 即座に成功する処理は `Ok` で経過時間が返る。
+    #[test]
+    fn io2_run_with_deadline_returns_ok_for_fast_work() {
+        static L: PersistLimiter = PersistLimiter::new(4);
+        assert!(run_with_deadline(&L, ms(2000), || Ok(())).is_ok());
+    }
+
+    /// REPAIR-5・TASK-15.2.2: タイムアウトより長い処理は `Timeout` になり、
+    /// 待ちはタイムアウト程度で打ち切られる。
+    #[test]
+    fn repair5_run_with_deadline_times_out() {
+        static L: PersistLimiter = PersistLimiter::new(4);
+        let started = Instant::now();
+        let err = run_with_deadline(&L, ms(50), || {
+            std::thread::sleep(Duration::from_millis(600));
+            Ok(())
+        })
+        .expect_err("must time out");
+        assert_eq!(err.code(), IoErrorCode::Timeout);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    /// REPAIR-5・TASK-15.2.2: 枠を占有中は `ResourceExhausted`、解放後は `Ok`。
+    #[test]
+    fn repair5_run_with_deadline_rejects_when_limit_reached() {
+        static L: PersistLimiter = PersistLimiter::new(1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let err = run_with_deadline(&L, ms(30), move || {
+            let _ = release_rx.recv();
+            Ok(())
+        })
+        .expect_err("must time out while blocked");
+        assert_eq!(err.code(), IoErrorCode::Timeout);
+
+        let busy = run_with_deadline(&L, ms(200), || Ok(())).expect_err("limit reached");
+        assert_eq!(busy.code(), IoErrorCode::ResourceExhausted);
+
+        release_tx.send(()).expect("helper still waiting");
+        // helper が枠を返すまで短く待つ（最大 2 秒）。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if run_with_deadline(&L, ms(500), || Ok(())).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "slot was never released");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// IO-2・TASK-15.2.2: 処理のエラーはそのまま伝播する。
+    #[test]
+    fn io2_run_with_deadline_propagates_error() {
+        static L: PersistLimiter = PersistLimiter::new(4);
+        let err = run_with_deadline(&L, ms(2000), || {
+            Err(IoError::new(IoErrorCode::Internal, "injected"))
+        })
+        .expect_err("must propagate");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+    }
+
+    /// IO-2・TASK-15.2.2: Linux では実ファイルへの persist が成功する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io2_persist_file_system_ok_on_linux() {
+        let file = tempfile_in_target();
+        assert!(persist_file_system(&file, ms(5000)).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tempfile_in_target() -> File {
+        let path = std::env::temp_dir().join(format!(
+            "fandhe-io-persist-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = File::create(&path).expect("create temp file");
+        let _ = std::fs::remove_file(&path);
+        file
+    }
+
+    /// IO-2・TASK-15.3: 非 Linux では `Unimplemented`（#88 で代替を実装）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn io2_persist_file_system_unimplemented_off_linux() {
+        let path = std::env::temp_dir().join(format!("fandhe-io-persist-{}", std::process::id()));
+        let file = File::create(&path).expect("create temp file");
+        let _ = std::fs::remove_file(&path);
+        let err = persist_file_system(&file, ms(100)).expect_err("must be unimplemented");
+        assert_eq!(err.code(), IoErrorCode::Unimplemented);
+    }
 
     /// テスト専用: 指定した種別の [`InFlightRequest`] を、公開 API
     /// （[`SendQueue::register`]）経由で作る。

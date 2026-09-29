@@ -12,9 +12,9 @@
 //!   - (a) クライアントが write の後に `Flush` を送る。サーバーは
 //!     [`fandhe_container_io::writeback::serve_connection`] の
 //!     [`fandhe_container_io::batch::BatchBuffer::take_pending`] で残りを
-//!     書き込み、ACK を返してから [`IoErrorCode::Unimplemented`] で終わる
-//!     （D4。FlushAck と syncfs は TASK-15.2.2・#824 の担当で、本ケースの
-//!     着手時点では未マージ）。
+//!     書き込み、ACK を返してから Linux では FlushAck を返して継続し、
+//!     クライアント切断で終わる（非 Linux は `Unimplemented`。FlushAck は
+//!     #824 で実装）。
 //!   - (b) 送った write の ACK をすべて受け取ってから切断する（EOF →
 //!     `Unavailable`・`discarded_pending_frames == 0`）。
 //! - **非グレースフル**: ACK していない端数を残したまま切断すること。D5 に
@@ -71,7 +71,8 @@ use fandhe_container_io::{
 
 use super::harness::{
     self, DuplexEnd, SharedSink, TempDir, barrier_wait_within, body_for, decompose_records,
-    drain_acks, join_within, record_client, record_seq, send_all_writes, spawn_server, timeout,
+    drain_acks, flush_session_end_code, join_within, record_client, record_seq,
+    recv_flush_ack_if_supported, send_all_writes, spawn_server, timeout,
 };
 
 /// [`harness::join_within`] / [`harness::barrier_wait_within`] に渡す上限時間
@@ -185,16 +186,16 @@ impl Session {
     }
 
     /// `Flush` を送り、`unacked` 件の Write ACK だけを受け取ってからクライアント
-    /// を drop し、サーバーの終了を待つ（グレースフルシャットダウン (a)。D4 の
-    /// とおり FlushAck は来ない — #824〔TASK-15.2.2〕がマージされ FlushAck が
-    /// 実装されたら、ここでの FlushAck 受信と [`assert_flush_terminated`] の
-    /// 期待コードだけを直せばよい構造にしてある）。
+    /// を drop し、サーバーの終了を待つ（グレースフルシャットダウン (a)。
+    /// Linux では Write ACK の後に FlushAck も受け取る〔IO-2・TASK-15.2.2・#824〕。
+    /// 非 Linux は代替フラッシュ未実装〔TASK-15.3・#88〕のため FlushAck は来ない）。
     fn shutdown_with_flush(mut self) -> WritebackReport {
         self.client
             .send(FrameKind::Flush, &[], timeout())
             .expect("flush send must succeed against an unbounded in-memory transport");
         let unacked = self.unacked;
         drain_acks(&mut self.client, unacked, timeout());
+        recv_flush_ack_if_supported(&mut self.client, timeout());
         drop(self.client);
         join_within(self.server, join_deadline())
     }
@@ -304,15 +305,15 @@ fn wait_until_server_handled(calls: &mpsc::Receiver<u64>, handled: u64) {
 }
 
 /// [`Session::shutdown_with_flush`] が返した [`WritebackReport`] の終了コードが
-/// 期待値（現状 `Unimplemented`）であることを確認する（この 1 か所に集約する
-/// ことで、#824〔TASK-15.2.2〕マージ後の追随を最小にする。`writeback.rs`
-/// モジュール doc「FLUSH フレームの扱い（D4）」参照）。
+/// 期待値であることを確認する（この 1 か所に集約する。Linux は FlushAck 後に
+/// クライアントの切断で `Unavailable`、非 Linux は `Unimplemented`。`writeback.rs`
+/// モジュール doc「FLUSH フレームの扱い」参照）。
 fn assert_flush_terminated(report: &WritebackReport) {
     assert_eq!(
         report.end.code(),
-        IoErrorCode::Unimplemented,
-        "flush-terminated sessions must currently end with Unimplemented (D4; \
-         FlushAck return is TASK-15.2.2 / #824)"
+        flush_session_end_code(),
+        "flush-terminated sessions end with Unavailable on Linux (FlushAck sent, then EOF) \
+         and Unimplemented elsewhere (TASK-15.3 / #88)"
     );
 }
 

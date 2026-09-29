@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use fandhe_container_io::{
     AppendFileSink, Batch, BatchSink, Frame, FrameReceiver, FrameSender, IoError, IoErrorCode,
-    IoTimeout, SinkWriteReport,
+    IoTimeout, SinkPersistReport, SinkWriteReport,
 };
 
 /// 相手の応答を待つ処理の既定タイムアウト（REPAIR-5。既存の結合試験
@@ -308,6 +308,14 @@ impl BatchSink for SharedSink {
             .expect("SharedSink mutex must not be poisoned during a test run");
         guard.write_batch(batch)
     }
+
+    fn persist(&mut self) -> Result<SinkPersistReport, IoError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("SharedSink mutex must not be poisoned during a test run");
+        guard.persist()
+    }
 }
 
 /// `serve_connection` を別スレッドで動かす（呼び出し元がバッチ集約設定・
@@ -417,5 +425,40 @@ pub fn drain_acks(
         client
             .recv_ack(timeout)
             .expect("recv_ack must succeed while draining expected acks");
+    }
+}
+
+/// Flush 後にクライアントが受け取るべき FlushAck を待つ（IO-2・TASK-15.2.2・
+/// #824）。FlushAck を返せるのは `syncfs` を持つ Linux のみで、それ以外の OS
+/// では代替フラッシュ（TASK-15.3・#88）が未実装のため何も受け取らない。
+pub fn recv_flush_ack_if_supported(
+    client: &mut fandhe_container_io::PipelineClient<
+        DuplexEnd,
+        fandhe_container_io::NoopSendObserver,
+    >,
+    timeout: IoTimeout,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        let receipt = client
+            .recv_ack(timeout)
+            .expect("recv_ack must return the FlushAck");
+        fandhe_container_io::FlushAck::try_from(receipt)
+            .expect("the ack after a flush must be a FlushAck");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (client, timeout);
+    }
+}
+
+/// Flush を送って ACK を受け取ったクライアントが接続を閉じた後の、サーバーの
+/// 終了コード期待値。Linux は FlushAck を返してループを続け、EOF で
+/// `Unavailable`。それ以外は persist 未対応のため `Unimplemented`（#88）。
+pub fn flush_session_end_code() -> IoErrorCode {
+    if cfg!(target_os = "linux") {
+        IoErrorCode::Unavailable
+    } else {
+        IoErrorCode::Unimplemented
     }
 }

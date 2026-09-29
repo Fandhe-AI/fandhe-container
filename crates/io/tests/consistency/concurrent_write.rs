@@ -18,7 +18,8 @@ use fandhe_container_io::{
 
 use super::harness::{
     self, DuplexEnd, SharedSink, TempDir, barrier_wait_within, body_for, decompose_records,
-    drain_acks, join_within, record_client, record_seq, send_all_writes, spawn_server, timeout,
+    drain_acks, flush_session_end_code, join_within, record_client, record_seq,
+    recv_flush_ack_if_supported, send_all_writes, spawn_server, timeout,
 };
 
 /// `join_within` に渡す上限時間（各 `serve_connection`・クライアントスレッドの
@@ -524,9 +525,10 @@ fn io4_concurrent_write_bytes_limit_trigger_exact_bytes() {
             client
                 .send(FrameKind::Flush, &[], timeout())
                 .expect("flush send must succeed");
-            // Flush 自体は FlushAck を返さない（D4）ため、Write フレームの
-            // 分だけ ACK を受け取る。
+            // Write フレームの分の ACK の後、Linux では FlushAck も届く
+            // （IO-2・TASK-15.2.2）。
             drain_acks(&mut client, bodies.len(), timeout());
+            recv_flush_ack_if_supported(&mut client, timeout());
         }));
     }
     barrier_wait_within(&barrier, join_deadline());
@@ -540,7 +542,7 @@ fn io4_concurrent_write_bytes_limit_trigger_exact_bytes() {
         assert_eq!(report.stats.acks_sent, u64::from(FRAMES));
         assert_eq!(report.stats.batches_written, 2);
         assert_eq!(report.stats.discarded_pending_frames, 0);
-        assert_eq!(report.end.code(), IoErrorCode::Unimplemented);
+        assert_eq!(report.end.code(), flush_session_end_code());
 
         let expected: Vec<u8> = (0..FRAMES)
             .flat_map(|seq| body_for(i as u16, seq, BODY_LEN))
@@ -594,6 +596,7 @@ fn io4_concurrent_write_partial_batch_flushed_by_flush_frame() {
                 .send(FrameKind::Flush, &[], timeout())
                 .expect("flush send must succeed");
             drain_acks(&mut client, bodies.len(), timeout());
+            recv_flush_ack_if_supported(&mut client, timeout());
         }));
     }
     barrier_wait_within(&barrier, join_deadline());
@@ -607,7 +610,7 @@ fn io4_concurrent_write_partial_batch_flushed_by_flush_frame() {
         assert_eq!(report.stats.acks_sent, u64::from(FRAMES));
         assert_eq!(report.stats.batches_written, 3);
         assert_eq!(report.stats.discarded_pending_frames, 0);
-        assert_eq!(report.end.code(), IoErrorCode::Unimplemented);
+        assert_eq!(report.end.code(), flush_session_end_code());
 
         let expected: Vec<u8> = (0..FRAMES)
             .flat_map(|seq| body_for(i as u16, seq, BODY_LEN))

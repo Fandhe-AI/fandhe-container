@@ -6,7 +6,7 @@
 - 関連タスク: TASK-11.1（#68）・TASK-11.2（#69。ヘッダ newtype）・TASK-11.3（#70。チェックサム付きフレーム型）・TASK-11.4（#71。本節以降）・TASK-12.1（#73。送信キュー）・TASK-12.2（#74。ペイロード形式・ACK 受信）・TASK-13.1（#76。バッチ集約バッファ）・TASK-13.2.1（#820。UDS サーバー側トランスポート）・TASK-13.2.2（#822。バッチ write-back の実行・ACK 返却）・TASK-13.3（#78。バッチサイズ設定 API）・TASK-13.4（#796。受信フレームの受理判定ゲート）・TASK-15.1（#85。FLUSH バリア API 型定義・通常 ACK との区別）・TASK-83.1（#116。BREAK-2 相当のワイヤーレベル検出テスト）・TASK-83.2（#117。デコード時の範囲外長さ検証の強化とアロケーション前拒否のテスト）。ヘッダ拡張（version・header_crc）・接続再利用契約は TASK-12・TASK-13 着手前の設計レビュー（2026-09-28 オーナー決定・#67・#115）による
 - 関連ビヘイビア: IO-2（Flush / FlushAck 種別）・REPAIR-5（`IoTimeout`。無期限待ちを型で表現しない）
 - 対象マイルストーン: MS-1
-- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）、TASK-12.1 で追加した送信キュー（`SendQueue`・`PipelineClient`）、TASK-12.2 で追加したペイロード内部レイアウト（[`crates/io/src/payload.rs`](../../crates/io/src/payload.rs)）と ACK 受信・対応付け（`PipelineClient::recv_ack`）、TASK-13.2.1（#820）で追加した UDS サーバー側トランスポート（[`UdsServer`・`UdsConnection`](../../crates/io/src/server.rs)。Linux / macOS）、TASK-13.2.2（#822）で追加したバッチ write-back の実行と通常 ACK 返却（[`serve_connection`・`AppendFileSink`](../../crates/io/src/writeback.rs)）、TASK-13.3（#78）で追加したバッチサイズ設定 API（[`parse_batch_size`・`WritebackSettings`](../../crates/io/src/settings.rs)）、TASK-15.1（#85）で追加した FLUSH バリア API の ACK 型分離（[`barrier`](../../crates/io/src/barrier.rs) モジュールの `WriteAck`・`FlushAck`・`FlushBarrier`・`AckReceipt`、`PipelineClient::flush`）に加え、2026-09-28 の設計レビュー（TASK-12・TASK-13 着手前に P1 として指摘・オーナー決定で先行対応）で追加したヘッダの `version`・`header_crc` フィールドと、エラー後の接続再利用禁止契約を記録する。クライアント側の UDS 接続との本番結合・FLUSH ACK の返却・Windows のトランスポートは後続 sub-issue が本書へ追記する
+- ステータス: 本ドキュメントは TASK-11.1〜11.4 で確定したフレーム形式（バイトレイアウト・newtype 設計・IO-1 / REPAIR-2 対応）、TASK-13.1 で追加したバッチ集約バッファ（[`BatchBuffer`](../../crates/io/src/batch.rs)・`BatchConfig`）、TASK-12.1 で追加した送信キュー（`SendQueue`・`PipelineClient`）、TASK-12.2 で追加したペイロード内部レイアウト（[`crates/io/src/payload.rs`](../../crates/io/src/payload.rs)）と ACK 受信・対応付け（`PipelineClient::recv_ack`）、TASK-13.2.1（#820）で追加した UDS サーバー側トランスポート（[`UdsServer`・`UdsConnection`](../../crates/io/src/server.rs)。Linux / macOS）、TASK-13.2.2（#822）で追加したバッチ write-back の実行と通常 ACK 返却（[`serve_connection`・`AppendFileSink`](../../crates/io/src/writeback.rs)）、TASK-13.3（#78）で追加したバッチサイズ設定 API（[`parse_batch_size`・`WritebackSettings`](../../crates/io/src/settings.rs)）、TASK-15.1（#85）で追加した FLUSH バリア API の ACK 型分離（[`barrier`](../../crates/io/src/barrier.rs) モジュールの `WriteAck`・`FlushAck`・`FlushBarrier`・`AckReceipt`、`PipelineClient::flush`）に加え、2026-09-28 の設計レビュー（TASK-12・TASK-13 着手前に P1 として指摘・オーナー決定で先行対応）で追加したヘッダの `version`・`header_crc` フィールドと、エラー後の接続再利用禁止契約を記録する。TASK-15.2.2（#824）で追加した FLUSH バリアの永続化（`syncfs`）と FLUSH ACK 返却（Linux）に加え、クライアント側の UDS 接続との本番結合・非 Linux の代替フラッシュ（TASK-15.3・#88）・Windows のトランスポートは後続 sub-issue が本書へ追記する
 
 ## バイトレイアウト
 
@@ -274,7 +274,7 @@ BREAK-2 検出経路の整理:
 - `TryFrom<AckReceipt> for FlushAck` / `for WriteAck`: 「FLUSH ACK だけを待つ」呼び出し元が型で絞り込める変換（逆種別なら `InvalidArgument`）
 - 構築経路: `WriteAck`・`FlushAck`・`AckReceipt` はいずれもフィールドが非公開で、`pub(crate)` の `AckReceipt::from_matched(request, ack_kind)` だけが生成できる。crate 外のコードは `recv_ack` に実際に受信した ACK を通す以外の方法でこれらの値を得られない（`pub(crate)` のため crate 内の他コードからは `from_matched` を直接呼べるが、`client.rs`（`recv_ack`）以外の呼び出し箇所は用意しない）
 
-未実装範囲（変更なし。REPAIR-3）: サーバー側で FLUSH バリア以前の書き込みを実際に永続化してから FLUSH ACK を送出する処理はまだない（下記「FLUSH フレームの扱い」・TASK-15.2・#823・#824）。本節が定めるのはクライアント側の型契約のみ。
+本節が定めるのはクライアント側の型契約のみ。サーバー側の永続化と FLUSH ACK 送出は下記「FLUSH フレームの扱い」（TASK-15.2.2・#824）が定める。
 
 ### 範囲外（後続タスク）
 
@@ -293,15 +293,21 @@ BREAK-2 検出経路の整理:
 
 ### ACK を返す時点（IO-1 の「バッファリング時点」との対応）
 
-通常 ACK（`FrameKind::Ack`）は、1 バッチ内の全 `Write` について `BatchSink::write_batch` が `Ok` を返した時点（＝ OS のページキャッシュへの `write()` 発行が完了した時点）で送る。`fsync(2)` / `syncfs(2)` は呼ばない。プロセスが正常に動いている限りこの時点のデータは他の reader から見えるが、プロセスクラッシュ・電源断では失われうる。これが IO-1 の「バッファリング時点で ACK」の本実装における対応物である。永続化完了を保証するのは IO-2 の FLUSH ACK（`FrameKind::FlushAck`）のみであり、`serve_connection` はそれを送らない（下記「FLUSH フレームの扱い」参照）。ACK の API としての利用者向け文書化は TASK-17 で行う。
+通常 ACK（`FrameKind::Ack`）は、1 バッチ内の全 `Write` について `BatchSink::write_batch` が `Ok` を返した時点（＝ OS のページキャッシュへの `write()` 発行が完了した時点）で送る。`fsync(2)` / `syncfs(2)` は呼ばない。プロセスが正常に動いている限りこの時点のデータは他の reader から見えるが、プロセスクラッシュ・電源断では失われうる。これが IO-1 の「バッファリング時点で ACK」の本実装における対応物である。永続化完了を保証するのは IO-2 の FLUSH ACK（`FrameKind::FlushAck`）のみであり、`serve_connection` は `Flush` の永続化成功後にだけ送る（下記「FLUSH フレームの扱い」参照）。ACK の API としての利用者向け文書化は TASK-17 で行う。
 
 ### バッチが件数未達のまま残る場合の運用制約
 
 ACK をバッチ書き込みの後に返すため、クライアントが `batch_size` 未満だけ送って ACK を待つと、サーバー側に発火のきっかけがない。使える発火条件は「設定件数到達（`BatchTrigger::SizeReached`）」「累積バイト数上限到達（`BatchTrigger::BytesLimitReached`）」「`FrameKind::Flush`」の 3 つのみで、時間ベースの追い出しは範囲外（IO-10・TASK-16）。クライアントは「in-flight 上限 ≥ `batch_size`、または件数未達分の後に `Flush` を送ること」を前提とする（既定値 64 / 64 で整合）。
 
-### FLUSH フレームの扱い（FlushAck は偽装しない）
+### FLUSH フレームの扱い（IO-2・TASK-15.2.2・#824。FlushAck は偽装しない）
 
-`FrameKind::Flush` を受信すると、`BatchBuffer::take_pending` で件数未達分を取り出して書き込み・ACK した後、**FlushAck は送らずに** `IoErrorCode::Unimplemented` で処理を終える。FLUSH ACK は永続化の保証（IO-2）であり、`syncfs` を呼ばずに返すと契約違反になるため（fail-closed）。FlushAck の返却は TASK-15.2.2（#824）の責務。Linux 用の `syncfs(2)` FFI ラッパーは `crates/io/src/sys.rs`（非公開モジュール。TASK-15.2.1・#823）に用意済みだが、上記のとおりまだ呼び出していない（#824）。
+`FrameKind::Flush` を受信すると、`BatchBuffer::take_pending` で件数未達分を取り出して書き込み・通常 ACK した後、`BatchSink::persist`（`AppendFileSink` は Linux で `syncfs(2)`）で永続化し、**成功したときだけ** `FrameKind::FlushAck` を送ってループを継続する（IO-2）。
+
+- `persist` が失敗・タイムアウト・未対応のときは FlushAck を送らず、そのエラーで終了する（fail-closed）。プロトコルにエラーフレームはなく、クライアントは EOF を `Unavailable` として観測する。既定の `BatchSink::persist` は `Unimplemented`
+- `syncfs` は中断できないため、dup した fd を小さなスタックの helper スレッドで 1 回だけ実行し、`AppendFileSink::with_flush_timeout`（既定 10 秒。REPAIR-5）で待つ。タイムアウトした helper は detach され、戻るまでプロセス全体で 64 本までの枠を占有する（超えたら `ResourceExhausted`）
+- 失敗・タイムアウトした `AppendFileSink` はポイズンされ、以後の `persist` は syscall なしで `Internal` を返す（errseq は 1 回しか報告されないため、再試行が 0 を返して永続化を偽装しうる）
+- macOS / Windows は代替フラッシュ未実装で `Unimplemented`（TASK-15.3・#88）
+- 未対応の範囲（REPAIR-3）: 並行 FLUSH の合流・レート制限（同期範囲はファイルシステム全体）、Linux 5.8 未満の検出、fd を開く前の書き戻しエラー、電源断耐性の検証（TASK-18）
 
 ### ACK していない保留分・sink 失敗時の扱い
 
@@ -332,7 +338,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 - UDS 接続受付ループ（accept → `serve_connection` → 次の accept）・同時接続数の上限
 - クライアント側の UDS `connect` と `PipelineClient` との本番結合
 - 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
-- FLUSH ACK の返却・`syncfs`（TASK-15.2.1・#823・TASK-15.2.2・#824）
+- 非 Linux の代替フラッシュ（TASK-15.3・#88）・並行 FLUSH の合流とレート制限
 - 件数未達分を時間ベースで追い出す仕組み・未フラッシュ滞留量の上限（IO-10・TASK-16）
 - 実際の CLI バイナリ（`fandhe-container`）での `--batch-size` 引数の解釈・`crates/cli → crates/io` の依存追加（TASK-79）
 - ファイル操作を表すペイロード形式（パス・rename・truncate。TASK-14 の前提。I/O 契約の拡張にあたる）

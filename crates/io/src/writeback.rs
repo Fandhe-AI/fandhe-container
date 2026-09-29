@@ -19,8 +19,8 @@
 //! これは IO-1 が言う「バッファリング時点で ACK」の、本実装における対応物である。
 //!
 //! 永続化完了を保証するのは IO-2 の FLUSH ACK（[`FrameKind::FlushAck`]）のみで
-//! あり、本モジュールはそれを送らない（下記「FLUSH フレームの扱い」節）。
-//! FLUSH ACK の返却・syncfs の呼び出しは TASK-15.2.2（#824）の責務。ACK の
+//! あり、`Flush` 受信時に [`BatchSink::persist`] の成功を待ってから送る
+//! （下記「FLUSH フレームの扱い」節。TASK-15.2.2・#824）。ACK の
 //! API としての文書化（利用者向けの説明）は TASK-17 で行う。
 //!
 //! # 書き込み先（ワイヤーにパスがない。D1）
@@ -39,7 +39,7 @@
 //! （IO-1 の I/O 契約変更。`PROTOCOL_VERSION` の繰り上げを伴いうる）として
 //! 別途扱う。
 //!
-//! # FLUSH フレームの扱い（D4。FlushAck は偽装しない）
+//! # FLUSH フレームの扱い（IO-2・TASK-15.2.2・#824。FlushAck は偽装しない）
 //!
 //! [`FrameKind::Flush`] を受信すると、まず [`decode_request`] で形式
 //! （request id がちょうど 8 バイト・body が空）を検証する（Codex #822
@@ -48,9 +48,12 @@
 //! クライアントが ACK していない保留分を誤って確定させてしまうため）。
 //! 検証を通ったら [`crate::batch::BatchBuffer::take_pending`] で件数未達の
 //! まま滞留していた分を取り出して書き込み、通常 ACK を返した後、
-//! **FlushAck は送らずに** [`crate::error::IoErrorCode::Unimplemented`] で
-//! 処理を終える。FLUSH ACK は永続化の保証（IO-2）であり、`syncfs` を呼ばずに
-//! 返すと契約違反になるため（fail-closed）。呼び出し側は接続を閉じる。
+//! [`BatchSink::persist`]（Linux の [`AppendFileSink`] は `syncfs(2)`）で
+//! 永続化し、**成功したときだけ** [`FrameKind::FlushAck`] を送ってループを
+//! 継続する。`persist` が失敗・タイムアウト・未対応（既定実装や非 Linux は
+//! [`crate::error::IoErrorCode::Unimplemented`]）のときは FlushAck を送らず、
+//! そのエラーで処理を終える（fail-closed。プロトコルにエラーフレームはなく、
+//! クライアントは EOF を `Unavailable` として観測する）。
 //!
 //! # バッチが件数未達のまま残る場合の発火条件（D3。運用制約）
 //!
@@ -105,7 +108,8 @@ use crate::batch::{Batch, BatchBuffer, BatchConfig, PushOutcome};
 use crate::error::{IoError, IoErrorCode};
 use crate::payload::{decode_request, encode_ack};
 use crate::protocol::{Frame, FrameKind};
-use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
+use crate::transport::{FrameReceiver, FrameSender, IoTimeout, MAX_IO_TIMEOUT};
+use std::time::Duration;
 
 /// [`BatchSink::write_batch`] が書き込んだ内容の要約（REPAIR-4: 可観測性）。
 ///
@@ -149,6 +153,43 @@ impl SinkWriteReport {
 pub trait BatchSink {
     /// バッチ内の各 [`FrameKind::Write`] フレームの body を、挿入順に書き込む。
     fn write_batch(&mut self, batch: &Batch) -> Result<SinkWriteReport, IoError>;
+
+    /// これまでに `write_batch` が `Ok` を返した書き込みをすべて永続化する
+    /// （FLUSH バリア用。IO-2・TASK-15.2.2・#824）。
+    ///
+    /// [`serve_connection`] が `Flush` 受信時に、滞留分の書き込みと通常 ACK の
+    /// 後に呼び、`Ok` のときだけ [`FrameKind::FlushAck`] を送る。
+    ///
+    /// # 契約
+    /// - `Ok` を返してよいのは、本呼び出し前に `write_batch` が `Ok` を返した
+    ///   書き込みがすべて永続化済みのときだけ
+    /// - 1 回の呼び出しで永続化の syscall は 1 回だけ発行し、失敗しても
+    ///   再試行しない
+    ///
+    /// 既定実装は [`IoErrorCode::Unimplemented`] を返す（fail-closed。永続化を
+    /// 実装しない sink は FlushAck を出せない）。
+    fn persist(&mut self) -> Result<SinkPersistReport, IoError> {
+        Err(IoError::new(
+            IoErrorCode::Unimplemented,
+            "this sink does not implement persist (IO-2)",
+        ))
+    }
+}
+
+/// [`BatchSink::persist`] の結果の要約（REPAIR-4: 可観測性）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SinkPersistReport {
+    /// 永続化に要した時間。
+    pub elapsed: Duration,
+}
+
+impl SinkPersistReport {
+    /// `elapsed` から [`SinkPersistReport`] を作る（crate 外の [`BatchSink`]
+    /// 実装が戻り値を作る唯一の入口。`#[non_exhaustive]` のため）。
+    pub fn new(elapsed: Duration) -> Self {
+        Self { elapsed }
+    }
 }
 
 /// [`BatchSink`] の最小実装: 呼び出し側が開いた [`File`] へ、バッチ内の各
@@ -157,8 +198,23 @@ pub trait BatchSink {
 /// パス解決・ファイルの作成・rename・truncate は行わない（それらはワイヤーに
 /// 表現がなく、TASK-14 のファイル操作ペイロード拡張までは呼び出し側が
 /// `File` を用意する）。
+///
+/// # 永続化（IO-2・TASK-15.2.2）
+/// [`BatchSink::persist`] は Linux で `syncfs(2)` を発行する（他 OS は
+/// `Unimplemented`。TASK-15.3・#88）。一度失敗・タイムアウトした sink は
+/// ポイズンされ、以後の `persist` は syscall を発行せず `Internal` を返す。
+/// dup した fd は open file description を共有するため、タイムアウトした
+/// helper が後から書き戻しエラー（errseq）を消費すると、再試行の `syncfs` が
+/// 永続化されていないのに 0 を返しうるため。
+///
+/// 未対応の範囲（REPAIR-3）: タイムアウトは最大 10 秒で、未書き戻しデータが
+/// 大量にあると超えうる（その場合 FlushAck は返らない）。fd を開く前に起きた
+/// 書き戻しエラーは報告されない。Linux 5.8 未満は書き戻しエラーが報告されない
+/// （検出・拒否は範囲外）。電源断への耐性は本 crate では検証しない（TASK-18）。
 pub struct AppendFileSink {
     file: File,
+    flush_timeout: IoTimeout,
+    persist_poisoned: bool,
 }
 
 impl AppendFileSink {
@@ -197,11 +253,21 @@ impl AppendFileSink {
                 format!("failed to seek to end of file ({:?})", err.kind()),
             )
         })?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            flush_timeout: IoTimeout::new(MAX_IO_TIMEOUT)?,
+            persist_poisoned: false,
+        })
     }
 
-    /// 内部の [`File`] を参照で取り出す（TASK-15.2.2・#824 が `fsync` /
-    /// `syncfs` 用に fd を取るために使う想定）。
+    /// [`BatchSink::persist`] のタイムアウトを差し替える（既定は
+    /// [`MAX_IO_TIMEOUT`]。REPAIR-5）。
+    pub fn with_flush_timeout(mut self, timeout: IoTimeout) -> Self {
+        self.flush_timeout = timeout;
+        self
+    }
+
+    /// 内部の [`File`] を参照で取り出す。
     pub fn get_ref(&self) -> &File {
         &self.file
     }
@@ -280,6 +346,22 @@ impl BatchSink for AppendFileSink {
 
         Ok(SinkWriteReport::new(frames_written, bytes_written))
     }
+
+    fn persist(&mut self) -> Result<SinkPersistReport, IoError> {
+        if self.persist_poisoned {
+            return Err(IoError::new(
+                IoErrorCode::Internal,
+                "persist is poisoned by an earlier failure",
+            ));
+        }
+        match crate::barrier::persist_file_system(&self.file, self.flush_timeout) {
+            Ok(elapsed) => Ok(SinkPersistReport::new(elapsed)),
+            Err(err) => {
+                self.persist_poisoned = true;
+                Err(err)
+            }
+        }
+    }
 }
 
 /// [`serve_connection`] が送受信それぞれに使うタイムアウト（REPAIR-5）。
@@ -307,6 +389,8 @@ pub struct WritebackStats {
     pub bytes_written: u64,
     /// 送出した通常 ACK（[`FrameKind::Ack`]）の総数。
     pub acks_sent: u64,
+    /// 送出した FLUSH ACK（[`FrameKind::FlushAck`]）の総数（IO-2）。
+    pub flush_acks_sent: u64,
     /// ACK を送らずに破棄した滞留フレーム件数（D5）。
     pub discarded_pending_frames: u64,
 }
@@ -398,8 +482,9 @@ where
 ///
 /// 受信した [`FrameKind::Write`] を [`BatchBuffer::push`] へ渡し、発火した
 /// バッチを `sink` へ書き込んでから到着順に ACK を送る。[`FrameKind::Flush`]
-/// は滞留分を書き込み・ACK した後 [`IoErrorCode::Unimplemented`] で終える
-/// （D4）。[`FrameKind::Ack`] / [`FrameKind::FlushAck`]（クライアントが送る
+/// は滞留分を書き込み・ACK した後 [`BatchSink::persist`] を呼び、成功したら
+/// [`FrameKind::FlushAck`] を送って継続する（失敗時は FlushAck なしで
+/// そのエラーで終える。IO-2）。[`FrameKind::Ack`] / [`FrameKind::FlushAck`]（クライアントが送る
 /// べきでない種別。UDS 経由では [`crate::server`] の受信層が先に拒否するが、
 /// generic なトランスポート向けの防御として本関数でも拒否する）は
 /// [`IoErrorCode::InvalidArgument`] で終える。
@@ -493,9 +578,10 @@ where
                 // 欠けている・余分な body を持つ不正な Flush をバリアとして
                 // 扱うと、クライアントが ACK していない書き込みを誤って
                 // 確定させてしまうため（D5 の fail-closed と一貫させる）。
-                if let Err(err) = decode_request(&frame) {
-                    return finish(stats, &buffer, err);
-                }
+                let envelope = match decode_request(&frame) {
+                    Ok(envelope) => envelope,
+                    Err(err) => return finish(stats, &buffer, err),
+                };
 
                 if let Some(batch) = buffer.take_pending()
                     && let Err(err) =
@@ -503,13 +589,20 @@ where
                 {
                     return finish(stats, &buffer, err);
                 }
-                // D4: FLUSH ACK は永続化の保証（IO-2）であり、syncfs を呼ばずに
-                // 返すと契約違反になるため偽装しない。返却は TASK-15.2.2（#824）。
-                let err = IoError::new(
-                    IoErrorCode::Unimplemented,
-                    "flush barrier is not implemented yet (TASK-15)",
-                );
-                return finish(stats, &buffer, err);
+                // IO-2・TASK-15.2.2: FLUSH ACK は永続化の保証であり、persist が
+                // `Ok` を返したときだけ送る（エラー・タイムアウト・未対応は
+                // FlushAck を送らず終了。fail-closed）。
+                if let Err(err) = sink.persist() {
+                    return finish(stats, &buffer, err);
+                }
+                let flush_ack = match encode_ack(FrameKind::FlushAck, envelope.id()) {
+                    Ok(ack) => ack,
+                    Err(err) => return finish(stats, &buffer, err),
+                };
+                if let Err(err) = conn.send_frame(&flush_ack, timeouts.send) {
+                    return finish(stats, &buffer, err);
+                }
+                stats.flush_acks_sent = stats.flush_acks_sent.saturating_add(1);
             }
             FrameKind::Ack | FrameKind::FlushAck => {
                 let err = IoError::new(
@@ -1020,5 +1113,128 @@ mod tests {
     fn io1_fake_transport_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<FakeTransport>();
+    }
+
+    /// テスト専用 sink: 書き込みは `FakeSink` に委譲し、`persist` の成否と
+    /// 呼び出しを共有ログへ記録する。
+    struct PersistSink {
+        inner: FakeSink,
+        persist_calls: usize,
+        persist_result: Option<IoErrorCode>,
+    }
+
+    impl BatchSink for PersistSink {
+        fn write_batch(&mut self, batch: &Batch) -> Result<SinkWriteReport, IoError> {
+            self.inner.write_batch(batch)
+        }
+
+        fn persist(&mut self) -> Result<SinkPersistReport, IoError> {
+            self.persist_calls += 1;
+            match self.persist_result {
+                Some(code) => Err(IoError::new(code, "injected persist failure")),
+                None => Ok(SinkPersistReport::new(Duration::from_millis(1))),
+            }
+        }
+    }
+
+    fn persist_sink(persist_result: Option<IoErrorCode>) -> PersistSink {
+        PersistSink {
+            inner: FakeSink::new(),
+            persist_calls: 0,
+            persist_result,
+        }
+    }
+
+    /// IO-2・TASK-15.2.2: Write 2 件 + Flush で、通常 ACK 0・1 → FlushAck 2 の
+    /// 順に送られ、セッションは継続して EOF（`Unavailable`）で終わる。
+    #[test]
+    fn io2_writeback_flush_returns_flush_ack_after_persist() {
+        let frames = vec![write_frame(0, b"a"), write_frame(1, b"b"), flush_frame(2)];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = persist_sink(None);
+
+        let report = serve_connection(&mut conn, BatchConfig::default(), &mut sink, timeouts());
+
+        assert_eq!(report.end.code(), IoErrorCode::Unavailable);
+        assert_eq!(report.stats.acks_sent, 2);
+        assert_eq!(report.stats.flush_acks_sent, 1);
+        assert_eq!(sink.persist_calls, 1);
+        let kinds: Vec<FrameKind> = conn.sent.iter().map(|f| f.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![FrameKind::Ack, FrameKind::Ack, FrameKind::FlushAck]
+        );
+        let ids: Vec<u64> = conn.sent.iter().map(ack_id).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+    }
+
+    /// IO-2・TASK-15.2.2: persist が失敗したら FlushAck を送らず、注入した
+    /// エラーコードで終わる（Write の ACK は届く）。
+    #[test]
+    fn io2_writeback_persist_failure_sends_no_flush_ack() {
+        let frames = vec![write_frame(0, b"a"), flush_frame(1)];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = persist_sink(Some(IoErrorCode::Timeout));
+
+        let report = serve_connection(&mut conn, BatchConfig::default(), &mut sink, timeouts());
+
+        assert_eq!(report.end.code(), IoErrorCode::Timeout);
+        assert_eq!(report.stats.flush_acks_sent, 0);
+        assert_eq!(conn.sent.len(), 1);
+        assert_eq!(conn.sent[0].kind(), FrameKind::Ack);
+    }
+
+    /// IO-2・REPAIR-2: 形式が不正な Flush では persist を呼ばない。
+    #[test]
+    fn io2_writeback_malformed_flush_does_not_persist() {
+        let bad = encode_request_raw_flush();
+        let mut conn = FakeTransport::new(vec![bad]);
+        let mut sink = persist_sink(None);
+
+        let report = serve_connection(&mut conn, BatchConfig::default(), &mut sink, timeouts());
+
+        assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(sink.persist_calls, 0);
+        assert_eq!(report.stats.flush_acks_sent, 0);
+    }
+
+    fn encode_request_raw_flush() -> Frame {
+        Frame::new(FrameKind::Flush, Vec::new()).expect("empty flush frame must build")
+    }
+
+    /// IO-2・TASK-15.2.2（受け入れ条件 2）: 実際の `syncfs` ラッパーが失敗
+    /// （O_PATH の fd は EBADF）すると FlushAck を返さず `Internal` で終わり、
+    /// sink はポイズンされて以後の persist は syscall なしで `Internal`。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn io2_writeback_real_syncfs_failure_sends_no_flush_ack_and_poisons() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // O_PATH（x86_64・aarch64 とも 0o10000000）。`syncfs` は EBADF で失敗する。
+        const O_PATH: i32 = 0o10_000_000;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_PATH)
+            .open(std::env::temp_dir())
+            .expect("open temp dir with O_PATH");
+        let mut sink = AppendFileSink {
+            file,
+            flush_timeout: test_timeout(),
+            persist_poisoned: false,
+        };
+        let mut conn = FakeTransport::new(vec![flush_frame(0)]);
+
+        let report = serve_connection(&mut conn, BatchConfig::default(), &mut sink, timeouts());
+
+        assert_eq!(report.end.code(), IoErrorCode::Internal);
+        assert!(report.end.message().contains("syncfs failed"));
+        assert_eq!(report.stats.flush_acks_sent, 0);
+        assert!(conn.sent.is_empty());
+
+        let err = sink.persist().expect_err("poisoned sink must fail");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+        assert!(err.message().contains("poisoned"));
     }
 }

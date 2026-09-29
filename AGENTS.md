@@ -46,7 +46,7 @@
 make fmt-check              # cargo fmt --all --check
 make lint                   # cargo clippy --workspace --all-targets -- -D warnings（既定 feature）
 make test                   # cargo test --workspace（既定 feature）
-make test-integration       # cargo test --workspace --test '*'（結合試験。integration test target が 0 件なら notice を出して成功終了する。現時点では 0 件）
+make test-integration       # cargo test --workspace --test '*'（結合試験。integration test target が 0 件なら notice を出して成功終了する）
 make deny                   # cargo deny --locked check advisories bans licenses sources
 make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + deny を一括実行
 make bench-check-selftest   # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
@@ -55,7 +55,7 @@ make fio-bench-selftest     # fio 4K ランダム write ベンチスクリプト
 make fio-bench TARGET_DIR=<dir> LABEL=<label> [RUNTIME=<seconds>]  # fio 4K ランダム write ベンチを実行する（実機前提。下記「実機前提テスト」節を参照）
 ```
 
-- `make test-integration`: 終了コード 0 が成功基準。integration test target が 0 件のときの `notice:` 出力での成功終了は現状の正常動作。jq 未導入時は fail-closed で終了コード非 0 になる
+- `make test-integration`: 終了コード 0 が成功基準。`notice:` 出力での成功終了は、全 crate から `tests/*.rs` が無くなった場合のフォールバック。通常は `cargo test --workspace --test '*'` が実行される。実行された件数は Makefile・CI が出力する `integration test targets: N` 行で確認する。`notice:` での成功終了は結合試験が 1 件も実行されていないことを意味し、`tests/*.rs` を追加・変更した PR の合格根拠にしない（冒頭の `skip:` と同じ扱い）。jq 未導入時は fail-closed で終了コード非 0 になる
 - `make bench-check-selftest` / `make bench-check`: 終了コード 0 が成功基準。`bench-check` を呼ぶ比較スクリプト（`scripts/check-bench-regression.sh`）自体の終了コードは 0（合格）/ 1（回帰検出）/ 2（入力エラー）の 3 値で、詳細は下記「タイムアウト保護された結合試験・ベンチ回帰」節 (4) を参照する。**現時点では計測対象がプレースホルダのため、`bench-check` の成功を性能回帰がない根拠として扱わない**
 - `make fio-bench-selftest`: 終了コード 0 が成功基準。`--from-json` モードと固定 fixture（`scripts/testdata/fio-bench/`）・fio スタブで完結し、実 fio は使わない。CI の `bench-regression` ジョブにも組み込まれている
 - `make fio-bench`: 実機前提（fio・GNU coreutils の `timeout`・Linux ホスト）。`TARGET_DIR`・`LABEL` 未指定時は案内を出して終了コード 2 で止まる。詳細は下記「実機前提テスト」節・[docs/design/io-fio-bench.md](docs/design/io-fio-bench.md) を参照
@@ -79,7 +79,7 @@ make fio-bench TARGET_DIR=<dir> LABEL=<label> [RUNTIME=<seconds>]  # fio 4K ラ�
 | 結合試験の実行ステップ | 10 分 | `integration-test` ジョブの実行ステップ `timeout-minutes: 10` | TASK-86.2（#36）・TASK-87 |
 | ジョブ全体 | `integration-test` 30 分・`bench-regression` 15 分・`ci-complete` 5 分 | 各ジョブの `timeout-minutes` | 多層防御 |
 
-- この env を読んで `Duration` を組み立て `recv_timeout` 等に使う消費側コードは、integration test target が 0 件の現時点では存在せず、TASK-85 以降で実装される（実装済みを装わない。REPAIR-3）
+- この env を読んで `IoTimeout` を組み立てる消費側コードは `crates/io/tests/responsiveness.rs`（TASK-85.1・#119、TASK-85.2・#120。REPAIR-5）。範囲外・非数値の値は fail-closed で panic し、未設定時の既定は 10 秒。UDS 対応 OS（Linux / macOS）でのみコンパイルされ、Windows では当該経路は対象外。他の結合試験（スタブのトランスポートを使うもの）は env を読まず、固定の短いタイムアウトを使う
 - 新しく書く応答待ち処理は 5〜10 秒の範囲を既定とする。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5。詳細は下記「タイムアウト保護された結合試験・ベンチ回帰」節および「レビュー観点」のタイムアウト項目）
 - タイムアウト値を検出が弱まる方向（上限の撤廃・大幅な延長）へ変える差分は、根拠の記録がなければ「回帰検出の後退」として扱う（bench 閾値の既存記述と同じ扱い）
 - ハングプローブ（TASK-87.2・#41）の実施記録は下記「タイムアウト保護された結合試験・ベンチ回帰」節に記載済み
@@ -93,7 +93,7 @@ make fio-bench TARGET_DIR=<dir> LABEL=<label> [RUNTIME=<seconds>]  # fio 4K ラ�
 | カテゴリ | 置き場所 | 実行コマンド | 現状 |
 | ---- | ---- | ---- | ---- |
 | ユニットテスト | 各 crate の `src/` 内 `#[cfg(test)]` | `make test` | — |
-| 結合試験 | 各 crate の `tests/*.rs`（integration test target） | `make test-integration` | 現時点では 0 件。最初の追加は各機能タスクが担う |
+| 結合試験 | 各 crate の `tests/*.rs`（integration test target） | `make test-integration` | `crates/io/tests/` に導入済み。他 crate の結合試験は各機能タスクで追加する。件数は `make test-integration` が出力する `integration test targets: N` 行で確認する |
 | ベンチ回帰 | `benches/benches/*.rs`・`benches/baseline.json` | `make bench-check` | プレースホルダ段階。実ベンチは TASK-113、基準値の校正は TASK-88 |
 | fio 4K ランダム write ベンチ | `scripts/fio-randwrite-4k.sh`・`scripts/testdata/fio-bench/` | `make fio-bench-selftest`（自己テスト）・`make fio-bench`（実機） | TASK-25.1 で実装済み。Docker ベースライン比の実測は TASK-25.2（人間共同） |
 | 実機前提テスト | 既定のテスト集合から分離する | 分離の仕組みは該当タスクで決める | 下記「実機前提テスト」節・[ci](.claude/rules/ci.md)「実機前提テスト」を参照 |
@@ -132,11 +132,11 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
 (3) の内容:
 
 - 対象: Cargo の integration test target（各 crate の `tests/*.rs`。lib 内 unit test は rust-ci / rust-ci-default-features が担うため対象外）
-- 実行コマンド: `make test-integration`（`cargo test --workspace --test '*'`。integration test target が 0 件の場合は notice を出して成功終了する。現時点では 0 件）
-- 判定基準: CI（ci.yml の `integration-test` ジョブ。3 OS matrix）は実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes でハングを検出して fail させる。テスト 1 件ごとの推奨タイムアウト値（PoC-8 実測に基づく 5〜10 秒のレンジ）は `integration-test` ジョブの env `FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"` として TASK-87.1（#40）で設定済み。この値を読んで `Duration` を組み立て `recv_timeout` 等に使う消費側コードは integration test target が 0 件の現時点では存在せず、TASK-85 以降で実装される（実装済みを装わない）
+- 実行コマンド: `make test-integration`（`cargo test --workspace --test '*'`。integration test target が 0 件の場合は notice を出して成功終了する）
+- 判定基準: CI（ci.yml の `integration-test` ジョブ。3 OS matrix）は実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes でハングを検出して fail させる。テスト 1 件ごとの推奨タイムアウト値（PoC-8 実測に基づく 5〜10 秒のレンジ）は `integration-test` ジョブの env `FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"` として TASK-87.1（#40）で設定済み。この値を読む消費側コードの実装状況は上記「推奨タイムアウト値」節を参照する（`crates/io/tests/responsiveness.rs`。Linux / macOS のみ。実装済みを装わない。REPAIR-3）
 - TASK-87.2（#41）: ハングプローブ実施済み（REPAIR-5・REPAIR-7）。2026-09-27、main（4469898）に対し `gh workflow run ci.yml --ref main -f hang-probe=true` を実行した（[run 36335480476](https://github.com/Fandhe-AI/fandhe-container/actions/runs/36335480476)）。integration-test の 3 OS すべてで実行ステップが「has timed out after 10 minutes」で fail し、ジョブ全体は約 10〜11 分で終了した（ジョブの timeout-minutes 30 分に達する前に詰まらず fail）。`main` への `workflow_dispatch` は `push`（main）の通常 CI と同一 concurrency グループ（`cancel-in-progress: true`）になり互いを cancel し合うため、再実行は並列自動マージ中を避け、衝突しない時間帯または ref で行う
 - ハングプローブ: `gh workflow run ci.yml --ref <branch> -f hang-probe=true` で起動する。リポ外の使い捨て crate に仕込んだハングするテストを実行し、実行ステップの timeout で 3 OS とも fail することを実証するための手動トリガー（PR・push イベントでは動かない）
-- 最初の integration test target の追加は各機能タスクが担当する。追加する差分は、実行ステップの `timeout-minutes` 内で完走することを PR 本文で確認しているか
+- integration test target の追加・変更は各機能タスクが担当する。追加・変更する差分は、実行ステップの `timeout-minutes` 内で完走することを PR 本文で確認しているか
 
 (4) の内容: `.github/workflows/ci.yml` の `bench-regression` ジョブ（ubuntu-latest 単独。3 OS matrix にはしない。理由は ci.yml のジョブコメントおよび `.claude/rules/ci.md` を参照）で比較の仕組みを導入済み（TASK-86.3）。現時点では計測対象がプレースホルダのため性能回帰を検出しない。判定基準:
 

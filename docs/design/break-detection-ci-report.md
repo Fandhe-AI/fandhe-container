@@ -15,7 +15,7 @@ REPAIR-7 の 5 段階 CI 構成が、PoC-8 の破壊 2 種（BREAK-1: ACK 未送
 | 破壊 | 注入 | 検出機構 | 期待結果 | 注入テスト / 対照テスト |
 | ---- | ---- | -------- | -------- | ---------------------- |
 | BREAK-1（ACK 未送信） | テストローカルの `AckDropping` が Ack / FlushAck を握りつぶす | `recv_ack` の有限時間打ち切り（REPAIR-5） | `IoErrorCode::Timeout` | `repair7_repair5_break1_ack_dropping_server_detected_as_timeout` / `repair7_repair5_break1_control_ack_arrives_without_injection` |
-| BREAK-2（フレーム長破壊。インメモリ・全 OS） | `tamper_declared_len` で申告長を改ざん | `header_crc` と本体チェックサム（REPAIR-2） | `IoErrorCode::DataLoss`。書き込まれたバッチ 0・ACK 0 | `repair7_repair2_break2_declared_len_shorter_rejected_by_server` / `repair7_repair2_break2_control_well_formed_frame_is_written` |
+| BREAK-2（フレーム長破壊。インメモリ・全 OS） | `tamper_declared_len` で申告長を改ざん | 本体チェックサム不一致（REPAIR-2。`tamper_declared_len` はヘッダーを再生成し `header_crc` も再計算するため、`header_crc` 不一致は検出要因にならない） | `IoErrorCode::DataLoss`。書き込まれたバッチ 0・ACK 0 | `repair7_repair2_break2_declared_len_shorter_rejected_by_server` / `repair7_repair2_break2_control_well_formed_frame_is_written` |
 | BREAK-2（同上。エラー文面） | 同上 | エラーメッセージにペイロードを含めない | 文面にペイロード内容なし | `repair7_repair2_break2_error_message_omits_payload_content` |
 | BREAK-2（UDS。linux / macos のみ） | 同上 | 本番の受信経路（`mod unix`） | `IoErrorCode::DataLoss` | `unix::repair7_repair2_break2_uds_declared_len_shorter_rejected_by_production_recv` / `unix::repair7_repair2_break2_uds_control_well_formed_frame_is_written` |
 

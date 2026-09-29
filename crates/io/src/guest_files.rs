@@ -727,6 +727,8 @@ fn create_beneath(
             ErrorKind::Other,
         )));
     };
+    #[cfg(test)]
+    fault::run_hook(fault::Hook::BeforeLeaf);
     match create_leaf_beneath(parent, leaf) {
         Ok(file) => Ok(Created { file, dirs, made }),
         Err(BeneathError::AlreadyExists) => {
@@ -1251,6 +1253,9 @@ mod fault {
         /// 取り消しで移してしまった他者の実体を元の名前へ戻す直前（Linux / macOS）。
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         BeforeRestore,
+        /// 祖先を作った後、葉を作る直前（Linux / macOS）。
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        BeforeLeaf,
     }
 
     type HookFn = Box<dyn FnOnce()>;
@@ -1264,6 +1269,8 @@ mod fault {
         static BEFORE_QUARANTINE: RefCell<Option<HookFn>> = const { RefCell::new(None) };
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         static BEFORE_RESTORE: RefCell<Option<HookFn>> = const { RefCell::new(None) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        static BEFORE_LEAF: RefCell<Option<HookFn>> = const { RefCell::new(None) };
     }
 
     /// 注入状態を初期化する（各テストの先頭で呼ぶ）。
@@ -1276,6 +1283,8 @@ mod fault {
         BEFORE_QUARANTINE.with(|h| h.borrow_mut().take());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         BEFORE_RESTORE.with(|h| h.borrow_mut().take());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        BEFORE_LEAF.with(|h| h.borrow_mut().take());
     }
 
     /// 以降の走査の読み取りのうち `n` 回目（0 起点）を失敗させる。
@@ -1303,6 +1312,8 @@ mod fault {
             Hook::BeforeQuarantine => &BEFORE_QUARANTINE,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Hook::BeforeRestore => &BEFORE_RESTORE,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Hook::BeforeLeaf => &BEFORE_LEAF,
         };
         slot.with(|h| *h.borrow_mut() = Some(Box::new(f)));
     }
@@ -1316,6 +1327,8 @@ mod fault {
             Hook::BeforeQuarantine => &BEFORE_QUARANTINE,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Hook::BeforeRestore => &BEFORE_RESTORE,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Hook::BeforeLeaf => &BEFORE_LEAF,
         };
         if let Some(f) = slot.with(|h| h.borrow_mut().take()) {
             f();
@@ -2005,6 +2018,62 @@ mod tests {
             .expect("no stale collision after rename");
         assert!(t.0.join("dir").join("x").is_file());
         assert!(t.0.join("Other").join("x").is_file());
+    }
+
+    /// 退避先の報告は、親のパスが長く切り詰められても一意な私有ディレクトリ名を
+    /// 欠かさない（Cursor 指摘）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn io5_quarantine_location_keeps_unique_name() {
+        let qname = ".fandhe-rollback-1-2-3";
+        assert_eq!(
+            quarantine_location("", qname),
+            "\".fandhe-rollback-1-2-3/entry\""
+        );
+        let parent = format!("{}/", "d".repeat(300));
+        let reported = quarantine_location(&parent, qname);
+        assert!(
+            reported.starts_with("\".fandhe-rollback-1-2-3/entry\" under \"ddd"),
+            "{reported}"
+        );
+        assert!(reported.ends_with("...\""), "{reported}");
+    }
+
+    /// 祖先を新設した後に葉が他者に作られて作成が既存で失敗しても、他者の葉と、それを
+    /// 含む祖先は残す（空でない祖先は後始末で取り除かれない。Codex P1 指摘）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn io5_exists_after_new_ancestors_keeps_foreign_leaf() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let root = t.0.clone();
+        fault::set_hook(fault::Hook::BeforeLeaf, move || {
+            std::fs::write(root.join("d").join("e").join("f"), b"theirs").expect("foreign");
+        });
+        let err = c.create_file("d/e/f").err().expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+        assert!(err.message().starts_with("guest file already exists"));
+        assert_eq!(
+            std::fs::read(t.0.join("d").join("e").join("f")).expect("kept"),
+            b"theirs"
+        );
+    }
+
+    /// Windows: 祖先が reparse point（symlink またはジャンクション）なら、走査も作成も
+    /// それを辿らない（リンク先のエントリを衝突索引へ取り込まず、作成は拒否する。
+    /// Codex P1 指摘）。
+    #[cfg(windows)]
+    #[test]
+    fn io5_windows_reparse_ancestor_is_not_scanned() {
+        let t = Tmp::new();
+        let outside = Tmp::new();
+        std::fs::write(outside.0.join("Foo"), b"outside").expect("outside");
+        link_dir(&outside.0, &t.0.join("j"));
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let err = c.create_file("j/foo").err().expect("must reject");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument, "{err:?}");
+        assert_eq!(entries(&outside.0), 1);
     }
 
     /// 構築後にルートのパスを範囲外への symlink へ差し替えても、作成は保持した

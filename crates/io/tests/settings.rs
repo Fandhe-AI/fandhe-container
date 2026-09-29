@@ -107,7 +107,7 @@ mod unix {
     use std::time::{Duration, Instant};
 
     use fandhe_container_io::{
-        AppendFileSink, Frame, FrameHeader, FrameKind, IoTimeout, NoopServerObserver,
+        AppendFileSink, Frame, FrameHeader, FrameKind, IoTimeout, NoopServerObserver, SinkOpenMode,
         WritebackSettings, WritebackTimeouts,
     };
 
@@ -134,6 +134,14 @@ mod unix {
 
         fn output_path(&self) -> PathBuf {
             self.path.join("out.bin")
+        }
+
+        /// [`Self::output_path`] を作り直して（既存なら切り詰めて）開いた sink。
+        /// ディレクトリハンドル相対で開き、そのハンドルを親として持つため、
+        /// macOS でも FlushAck の前提（親ディレクトリの同期）を満たす（IO-2・TASK-15.3）。
+        fn output_sink(&self) -> AppendFileSink {
+            AppendFileSink::open_in(&self.path, "out.bin", SinkOpenMode::CreateOrTruncate)
+                .expect("seek to end must succeed")
         }
     }
 
@@ -241,13 +249,7 @@ mod unix {
             .accept(test_timeout(), NoopServerObserver)
             .expect("server must accept the client connection within the timeout");
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&output_path)
-            .expect("must open output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink = dir.output_sink();
 
         let server_thread =
             std::thread::spawn(move || connection.serve(&mut sink, writeback_timeouts()));

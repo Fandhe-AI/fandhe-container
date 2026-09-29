@@ -32,8 +32,11 @@
 //! `syncfs(2)` FFI ラッパー（`sys` モジュール・非公開。TASK-15.2.1・#823）は
 //! `writeback` の `Flush` 受信時に [`writeback::BatchSink::persist`] 経由で
 //! 呼ばれ、成功したときだけ FlushAck を返す（IO-2・TASK-15.2.2・#824。
-//! 失敗・タイムアウト・Linux 5.8 未満・非 Linux は FlushAck なしで終了。対応可否は
-//! [`barrier::persist_support`] で判定する。非 Linux の代替は TASK-15.3・#88）。受信フレームの長さ・件数を
+//! 失敗・タイムアウト・Linux 5.8 未満・その他の OS は FlushAck なしで終了。対応可否は
+//! [`barrier::persist_support`] で判定する。macOS / Windows は TASK-15.3・#88 で
+//! `fcntl(F_FULLFSYNC)` / `FlushFileBuffers` の明示発行によるファイル単位の代替フラッシュを持ち、ファイルを開いた・作った
+//! ディレクトリのハンドルも同期する〔[`writeback::AppendFileSink::open_in`]・
+//! [`GuestFileCreator`]〕）。受信フレームの長さ・件数を
 //! 本体バッファ確保前に上限検証する受理判定ゲート
 //! （[`recv_limits::ReceiveLimits`]・TASK-13.4・#796）も持つ。UDS 受信ループの
 //! 受付ループ（accept → 次の accept）・同時接続数の上限は後続 sub-issue が担う。
@@ -70,6 +73,9 @@ pub mod recv_limits;
 pub mod server;
 pub mod settings;
 mod sys;
+#[cfg(windows)]
+#[path = "sys/windows.rs"]
+mod sys_windows;
 pub mod transport;
 pub mod writeback;
 
@@ -119,6 +125,6 @@ pub use transport::{
     WireFrame,
 };
 pub use writeback::{
-    AppendFileSink, BatchSink, SinkPersistReport, SinkWriteReport, WritebackReport, WritebackStats,
-    WritebackTimeouts, serve_connection,
+    AppendFileSink, BatchSink, SinkOpenMode, SinkPersistReport, SinkWriteReport, WritebackReport,
+    WritebackStats, WritebackTimeouts, serve_connection,
 };

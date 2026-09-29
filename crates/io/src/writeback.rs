@@ -108,6 +108,7 @@
 
 use std::fs::File;
 use std::io::{self, Seek as _, SeekFrom, Write as _};
+use std::path::Path;
 
 use crate::batch::{Batch, BatchBuffer, BatchConfig, PushOutcome};
 use crate::error::{IoError, IoErrorCode};
@@ -209,8 +210,12 @@ impl SinkPersistReport {
 ///
 /// # 永続化（IO-2・TASK-15.2.2）
 /// [`BatchSink::persist`] は [`crate::barrier::persist_support`] が対応と判定した
-/// 環境（Linux 5.8 以上）で `syncfs(2)` を発行する（他は `Unimplemented`。
-/// 非 Linux の代替は TASK-15.3・#88）。syncfs を発行した後に失敗・タイムアウトした
+/// 環境で永続化する（Linux 5.8 以上は `syncfs(2)`、macOS / Windows は TASK-15.3・#88 の
+/// ファイルへの `fcntl(F_FULLFSYNC)` / `FlushFileBuffers` に加え、[`AppendFileSink::open_in`] /
+/// [`crate::GuestFileCreator`] が
+/// ファイルを開いた・作ったディレクトリハンドルの同期。[`AppendFileSink::new`] で作った
+/// 親ディレクトリのない sink はエントリを保証できず `Unimplemented`。他は
+/// `Unimplemented`）。syncfs を発行した後に失敗・タイムアウトした
 /// sink はポイズンされ（カーネル版数拒否・fd 複製・枠確保・スレッド生成など
 /// 発行前の失敗はポイズンせず再試行可）、以後の `persist` は syscall を発行せず
 /// `Internal` を返す。
@@ -254,6 +259,15 @@ pub struct AppendFileSink {
     /// `syncfs` の同時実行数を抑える limiter（既定はプロセス全体の
     /// `crate::barrier::default_persist_limiter`。単体テストだけが差し替える）。
     persist_limiter: &'static crate::barrier::PersistLimiter,
+    /// 対象ファイルのディレクトリエントリを永続化するために同期する親ディレクトリ
+    /// （TASK-15.3・#88。macOS / Windows 専用。Linux は `syncfs` が FS 全体を
+    /// 同期するため使わない）。ファイルを開いた・作ったハンドルだけが入る
+    /// （[`AppendFileSink::open_in`]・`GuestFileCreator`）。`None` は未指定で、その環境
+    /// ではファイルの名前が電源断で失われうるため `persist` は `Unimplemented` で拒否する。
+    parent_dirs: Option<Vec<File>>,
+    /// `parent_dirs` の同期が成功済みか。エントリは作成時に 1 回永続化すれば足りる
+    /// ため、成功後の `persist` では再同期しない。
+    parent_dirs_synced: bool,
 }
 
 impl AppendFileSink {
@@ -300,7 +314,86 @@ impl AppendFileSink {
             persist_poisoned: false,
             dirty_since_persist: true,
             persist_limiter: crate::barrier::default_persist_limiter(),
+            parent_dirs: None,
+            parent_dirs_synced: false,
         })
+    }
+
+    /// ディレクトリ `dir` 直下のファイル `name` を `mode` で開き、そのディレクトリの
+    /// ハンドルを親として持つ sink を作る（IO-2・IO-3・TASK-15.3・#88）。
+    ///
+    /// macOS / Windows の `persist` は、ファイル自体の同期（`F_FULLFSYNC` / `FlushFileBuffers`）
+    /// に加えて、ここで開いた
+    /// ディレクトリハンドルを初回成功時に同期し、ファイルのディレクトリエントリ
+    /// （新規作成・再オープンのどちらでも）を永続化する。親の同一性は検証ではなく構造で
+    /// 保証する: 先に `dir` を開き、ファイルはそのハンドル相対で開く（Linux / macOS は
+    /// `openat`、Windows は `NtCreateFile` の `RootDirectory`）。パスを再解決しないため、
+    /// 途中で `dir` のパスが差し替えられても、同期するディレクトリはファイルを開いた
+    /// ディレクトリそのもの（Codex #1146 P0 指摘への対応。任意の親ディレクトリを後から
+    /// 登録する API は持たない）。
+    ///
+    /// `name` は区切り文字・`.`・`..`・`\`・`:`・NUL を含まない単一の名前に限る
+    /// （`InvalidArgument`）。末端の symlink・reparse point は辿らず、通常ファイル以外は
+    /// 拒否する（`InvalidArgument` または `Internal`。FIFO を開いて待ち続けない）。
+    /// [`SinkOpenMode::CreateNew`] で既存なら `AlreadyExists`。それ以外の失敗は
+    /// `Internal`（`ErrorKind` だけを含め、パスは含めない）。Linux・macOS・Windows
+    /// 以外の OS（および `crate::sys` が対応しない Linux のアーキテクチャ）では開けず
+    /// エラーを返す。`dir`・`name` はホスト側の信頼できる設定値として扱い、ゲスト由来の
+    /// パスは [`crate::GuestFileCreator`] を経由させること（IO-5）。Linux の `persist` は
+    /// `syncfs` が FS 全体を同期するため、保持したディレクトリハンドルは使わない。
+    pub fn open_in(dir: &Path, name: &str, mode: SinkOpenMode) -> Result<Self, IoError> {
+        validate_sink_file_name(name)?;
+        let (leaf, truncate) = match mode {
+            SinkOpenMode::CreateNew => (LeafOpen::CreateNew, false),
+            SinkOpenMode::CreateOrTruncate => (LeafOpen::CreateOrOpen, true),
+            SinkOpenMode::Existing => (LeafOpen::Existing, false),
+            SinkOpenMode::CreateOrAppend => (LeafOpen::CreateOrAppend, false),
+        };
+        let (dir_handle, file) = open_leaf_in_dir(dir, name, leaf)?;
+        let meta = file.metadata().map_err(|err| {
+            IoError::new(
+                IoErrorCode::Internal,
+                format!("failed to inspect sink file ({:?})", err.kind()),
+            )
+        })?;
+        #[cfg(windows)]
+        let is_reparse = {
+            use std::os::windows::fs::MetadataExt;
+            // FILE_ATTRIBUTE_REPARSE_POINT
+            meta.file_attributes() & 0x400 != 0
+        };
+        #[cfg(not(windows))]
+        let is_reparse = false;
+        if !meta.is_file() || is_reparse {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                "sink target is not a regular file",
+            ));
+        }
+        if truncate {
+            // 通常ファイルであることを確かめてから切り詰める（開く時点で切り詰めると、
+            // Windows で reparse point 自体を開いた場合に拒否の前に中身を変えうるため）。
+            file.set_len(0).map_err(|err| {
+                IoError::new(
+                    IoErrorCode::Internal,
+                    format!("failed to truncate sink file ({:?})", err.kind()),
+                )
+            })?;
+        }
+        Ok(Self::new(file)?.with_parent_dir_handles(vec![dir_handle]))
+    }
+
+    /// ファイルを開いた・作ったときに使ったディレクトリハンドルを、同期する親として
+    /// 登録する（crate 内専用。`open_in` と `GuestFileCreator::create_file` だけが、
+    /// 自分が開いたハンドルを渡す。外部から任意のディレクトリを登録させない。IO-2・IO-3・
+    /// TASK-15.3・Codex #1146 P0）。`dirs` は末端の親から順に、ファイルとともに新設した
+    /// 祖先を含める。空の `dirs` は `persist` が未指定と同じく拒否する。登録は未永続化
+    /// 状態として扱い、次の Flush で必ず同期する。
+    pub(crate) fn with_parent_dir_handles(mut self, dirs: Vec<File>) -> Self {
+        self.parent_dirs = Some(dirs);
+        self.parent_dirs_synced = false;
+        self.dirty_since_persist = true;
+        self
     }
 
     /// [`BatchSink::persist`] のタイムアウトを差し替える（既定は
@@ -414,19 +507,36 @@ impl AppendFileSink {
                 "persist is poisoned by an earlier failure",
             ));
         }
+        if support == crate::barrier::PersistSupport::SupportedFileSync
+            && self.parent_dirs.as_ref().is_none_or(|dirs| dirs.is_empty())
+        {
+            // ファイル自体の sync だけでは新規作成ファイルのディレクトリエントリが
+            // 永続化されない。親ディレクトリが不明な sink は保証できないため、
+            // syscall を発行せず拒否する（ポイズンしない。IO-2・IO-3）。
+            return Err(IoError::new(
+                IoErrorCode::Unimplemented,
+                "parent directories are not configured; cannot persist the directory entry, refusing to send FlushAck",
+            ));
+        }
         if !self.dirty_since_persist {
             // 直近の成功以降に書き込みがなく、その成功が既に全書き込みを永続化
             // 済みのため、FS 全体同期を再発行せず合流する。
             return Ok(SinkPersistReport::new(Duration::ZERO));
         }
+        let dirs: &[File] = match (&self.parent_dirs, self.parent_dirs_synced) {
+            (Some(dirs), false) => dirs,
+            _ => &[],
+        };
         match crate::barrier::persist_file_system(
             support,
             self.persist_limiter,
             &self.file,
+            dirs,
             self.flush_timeout,
         ) {
             Ok(elapsed) => {
                 self.dirty_since_persist = false;
+                self.parent_dirs_synced = true;
                 Ok(SinkPersistReport::new(elapsed))
             }
             Err(failure) => {
@@ -440,6 +550,132 @@ impl AppendFileSink {
             }
         }
     }
+}
+
+/// [`AppendFileSink::open_in`] の開き方（IO-2・TASK-15.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SinkOpenMode {
+    /// 新規作成のみ（既存なら `AlreadyExists`。symlink を含む）。
+    CreateNew,
+    /// 無ければ作成し、あれば長さ 0 に切り詰める。
+    CreateOrTruncate,
+    /// 既存のファイルを切り詰めずに開く（無ければ失敗）。
+    Existing,
+    /// 無ければ作成し、追記モード（`O_APPEND` / `FILE_APPEND_DATA` のみ）で開く。
+    CreateOrAppend,
+}
+
+/// `crate::sys` / `crate::sys_windows` へ渡す開き方（[`SinkOpenMode`] から切り詰めを
+/// 除いたもの）。切り詰めは [`AppendFileSink::open_in`] が通常ファイルであることを
+/// 確かめた後に行う（Windows の reparse point など、種別の確認前に中身を変えないため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeafOpen {
+    /// 新規作成のみ（既存なら失敗）。
+    CreateNew,
+    /// 無ければ作成し、あれば切り詰めずに開く。
+    CreateOrOpen,
+    /// 既存のみ（切り詰めない）。
+    Existing,
+    /// 無ければ作成し、追記モードで開く。
+    CreateOrAppend,
+}
+
+/// [`AppendFileSink::open_in`] の `name` が単一の通常の名前か（`GuestFileCreator` の
+/// コンポーネント検証と同じ基準。3 OS で挙動を揃えるため `\`・`:` も拒否する）。
+fn validate_sink_file_name(name: &str) -> Result<(), IoError> {
+    let invalid = || {
+        IoError::new(
+            IoErrorCode::InvalidArgument,
+            "sink file name must be a single normal path component",
+        )
+    };
+    if name.contains(['\\', ':', '\0']) {
+        return Err(invalid());
+    }
+    let mut parts = Path::new(name).components();
+    match (parts.next(), parts.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => Err(invalid()),
+    }
+}
+
+/// `dir` を開き、そのハンドル相対で `name` を開く（[`AppendFileSink::open_in`] の OS 別
+/// 本体。戻り値は `(ディレクトリハンドル, ファイル)`）。Linux / macOS は `crate::sys` の
+/// `openat` ラッパー、Windows は `crate::sys_windows` の `NtCreateFile` ラッパーを使う。
+/// Windows のディレクトリハンドルは `FlushFileBuffers` のため書き込みアクセスで開く。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_leaf_in_dir(dir: &Path, name: &str, mode: LeafOpen) -> Result<(File, File), IoError> {
+    use crate::sys::BeneathError;
+    let map = |context: &str, err: BeneathError| match err {
+        BeneathError::AlreadyExists => {
+            IoError::new(IoErrorCode::AlreadyExists, "sink file already exists")
+        }
+        BeneathError::AncestorNotDirectory => IoError::new(
+            IoErrorCode::InvalidArgument,
+            "sink directory is not a directory",
+        ),
+        BeneathError::Io(kind) => {
+            IoError::new(IoErrorCode::Internal, format!("{context} ({kind:?})"))
+        }
+    };
+    let dir_handle =
+        crate::sys::open_dir_path(dir).map_err(|err| map("failed to open sink directory", err))?;
+    let file = crate::sys::open_leaf_beneath(&dir_handle, name, mode)
+        .map_err(|err| map("failed to open sink file", err))?;
+    Ok((dir_handle, file))
+}
+
+#[cfg(target_os = "windows")]
+fn open_leaf_in_dir(dir: &Path, name: &str, mode: LeafOpen) -> Result<(File, File), IoError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_BACKUP_SEMANTICS（ディレクトリを開くのに必須）。
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let dir_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .map_err(|err| {
+            IoError::new(
+                IoErrorCode::Internal,
+                format!("failed to open sink directory ({:?})", err.kind()),
+            )
+        })?;
+    let is_dir = dir_handle
+        .metadata()
+        .map_err(|err| {
+            IoError::new(
+                IoErrorCode::Internal,
+                format!("failed to open sink directory ({:?})", err.kind()),
+            )
+        })?
+        .is_dir();
+    if !is_dir {
+        return Err(IoError::new(
+            IoErrorCode::InvalidArgument,
+            "sink directory is not a directory",
+        ));
+    }
+    let file = crate::sys_windows::open_file_beneath(&dir_handle, name, mode).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            IoError::new(IoErrorCode::AlreadyExists, "sink file already exists")
+        } else {
+            IoError::new(
+                IoErrorCode::Internal,
+                format!("failed to open sink file ({:?})", err.kind()),
+            )
+        }
+    })?;
+    Ok((dir_handle, file))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn open_leaf_in_dir(_dir: &Path, _name: &str, _mode: LeafOpen) -> Result<(File, File), IoError> {
+    Err(IoError::new(
+        IoErrorCode::Unimplemented,
+        "opening a sink file beneath a directory is not implemented on this OS",
+    ))
 }
 
 /// [`serve_connection`] が送受信それぞれに使うタイムアウト（REPAIR-5）。
@@ -1046,14 +1282,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("must create temp dir");
         let path = dir.join("out.bin");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .expect("must open output file");
-
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink = AppendFileSink::open_in(&dir, "out.bin", SinkOpenMode::CreateOrTruncate)
+            .expect("seek to end must succeed");
         let mut buffer = BatchBuffer::new(BatchConfig::new(2).expect("2 must be valid"));
         let batch = match buffer
             .push(write_frame(0, b"ab"))
@@ -1103,13 +1333,9 @@ mod tests {
 
         // `append(true)` を付けず、`truncate` もしない（=呼び出し側が
         // 追記の作法を守らなくても `AppendFileSink::new` 自身が末尾へ
-        // 位置合わせすることの確認）。
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .expect("must open existing output file");
-
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        // 位置合わせすることの確認。`Existing` は `O_APPEND` なしで開く）。
+        let mut sink = AppendFileSink::open_in(&dir, "out.bin", SinkOpenMode::Existing)
+            .expect("seek to end must succeed");
         let mut buffer = BatchBuffer::new(BatchConfig::new(1).expect("1 must be valid"));
         let batch = match buffer
             .push(write_frame(0, b"-new"))
@@ -1150,13 +1376,8 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("must create temp dir");
         let path = dir.join("out.bin");
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .expect("must create output file");
-        let mut sink = AppendFileSink::new(file).expect("seek to end must succeed");
+        let mut sink = AppendFileSink::open_in(&dir, "out.bin", SinkOpenMode::CreateOrTruncate)
+            .expect("seek to end must succeed");
         let mut buffer = BatchBuffer::new(BatchConfig::new(1).expect("1 must be valid"));
 
         let first = match buffer
@@ -1295,15 +1516,12 @@ mod tests {
     }
 
     fn temp_append_sink(tag: &str) -> AppendFileSink {
-        let path = std::env::temp_dir().join(format!("fandhe-io-{tag}-{}", std::process::id()));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&path)
-            .expect("create temp file");
-        let _ = std::fs::remove_file(&path);
-        AppendFileSink::new(file).expect("sink must construct")
+        let dir = std::env::temp_dir();
+        let name = format!("fandhe-io-{tag}-{}", std::process::id());
+        let sink = AppendFileSink::open_in(&dir, &name, SinkOpenMode::CreateOrTruncate)
+            .expect("sink must construct");
+        let _ = std::fs::remove_file(dir.join(&name));
+        sink
     }
 
     /// IO-2・TASK-15.2.2: 書き込みのない連続 persist は syncfs を再発行せず
@@ -1345,6 +1563,217 @@ mod tests {
             assert!(sink.dirty_since_persist, "{support:?}");
             assert!(!sink.persist_poisoned, "{support:?}");
         }
+    }
+
+    /// IO-2・IO-3（Codex #1146 P0）: macOS / Windows 方式の判定
+    /// （`SupportedFileSync`）では、親ディレクトリが未指定の sink は新規作成
+    /// ファイルのエントリを永続化できないため、実行 OS に関係なく syscall を
+    /// 発行せず `Unimplemented` で拒否し、ポイズンも dirty 解除もしない。
+    #[test]
+    fn io2_file_sync_without_parent_dirs_is_rejected() {
+        use crate::barrier::PersistSupport;
+        let mut sink =
+            AppendFileSink::new(temp_append_sink("no-parent-dirs").into_inner()).expect("sink");
+        assert!(sink.parent_dirs.is_none());
+        let err = sink
+            .persist_with_support(PersistSupport::SupportedFileSync)
+            .expect_err("missing parent dirs must be rejected");
+        assert_eq!(err.code(), IoErrorCode::Unimplemented);
+        assert!(err.message().contains("parent directories"), "{err:?}");
+        assert!(sink.dirty_since_persist);
+        assert!(!sink.persist_poisoned);
+    }
+
+    /// IO-2・IO-3（Codex #1146 P0）: 空のハンドル列を登録した sink も未指定と同じく
+    /// `SupportedFileSync` で `Unimplemented` となり、ポイズンも dirty 解除もしない。
+    #[test]
+    fn io2_file_sync_with_empty_parent_dirs_is_rejected() {
+        use crate::barrier::PersistSupport;
+        let mut sink = AppendFileSink::new(temp_append_sink("empty-parent-dirs").into_inner())
+            .expect("sink")
+            .with_parent_dir_handles(vec![]);
+        assert_eq!(sink.parent_dirs.as_ref().map(Vec::len), Some(0));
+        let err = sink
+            .persist_with_support(PersistSupport::SupportedFileSync)
+            .expect_err("empty parent dirs must be rejected");
+        assert_eq!(err.code(), IoErrorCode::Unimplemented);
+        assert!(err.message().contains("parent directories"), "{err:?}");
+        assert!(sink.dirty_since_persist);
+        assert!(!sink.persist_poisoned);
+    }
+
+    /// 一時ディレクトリ（テストごとに一意）を作り、drop で消す。
+    struct TempDirGuard(std::path::PathBuf);
+    impl TempDirGuard {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "fcio-open-in-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
+        }
+    }
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// IO-2・IO-3・TASK-15.3（Codex #1146 P0）: `open_in` はファイルを開いたディレクトリの
+    /// ハンドルを 1 つだけ親として登録し、未同期・dirty の状態で返す。mode ごとに作成・
+    /// 既存のみ・追記・切り詰めを使い分け、ファイルは `dir` 直下にだけ作る。
+    #[test]
+    fn io2_open_in_registers_opening_directory() {
+        let t = TempDirGuard::new("modes");
+        let sink = AppendFileSink::open_in(&t.0, "a", SinkOpenMode::CreateNew).expect("create");
+        assert_eq!(sink.parent_dirs.as_ref().map(Vec::len), Some(1));
+        assert!(!sink.parent_dirs_synced);
+        assert!(sink.dirty_since_persist);
+        drop(sink);
+        std::fs::write(t.0.join("a"), b"seed").expect("seed");
+        assert_eq!(
+            AppendFileSink::open_in(&t.0, "a", SinkOpenMode::CreateNew)
+                .err()
+                .map(|err| err.code()),
+            Some(IoErrorCode::AlreadyExists)
+        );
+        assert!(AppendFileSink::open_in(&t.0, "a", SinkOpenMode::Existing).is_ok());
+        assert!(AppendFileSink::open_in(&t.0, "a", SinkOpenMode::CreateOrAppend).is_ok());
+        assert_eq!(std::fs::read(t.0.join("a")).expect("a"), b"seed");
+        assert!(AppendFileSink::open_in(&t.0, "a", SinkOpenMode::CreateOrTruncate).is_ok());
+        assert_eq!(std::fs::read(t.0.join("a")).expect("a"), b"");
+        assert_eq!(
+            AppendFileSink::open_in(&t.0, "missing", SinkOpenMode::Existing)
+                .err()
+                .map(|err| err.code()),
+            Some(IoErrorCode::Internal)
+        );
+        assert!(!t.0.join("missing").exists());
+    }
+
+    /// IO-2・IO-5・TASK-15.3: `open_in` の `name` は単一の通常の名前に限り、`dir` の外や
+    /// 祖先を指す名前は何も開かずに `InvalidArgument` で拒否する。
+    #[test]
+    fn io2_open_in_rejects_names_outside_directory() {
+        let t = TempDirGuard::new("names");
+        let inner = t.0.join("inner");
+        std::fs::create_dir(&inner).expect("inner");
+        for name in ["", ".", "..", "../x", "a/b", "a\\b", "a:b", "a\0b"] {
+            assert_eq!(
+                AppendFileSink::open_in(&inner, name, SinkOpenMode::CreateOrTruncate)
+                    .err()
+                    .map(|err| err.code()),
+                Some(IoErrorCode::InvalidArgument),
+                "{name:?}"
+            );
+        }
+        assert_eq!(std::fs::read_dir(&inner).expect("inner").count(), 0);
+        assert_eq!(std::fs::read_dir(&t.0).expect("outer").count(), 1);
+    }
+
+    /// IO-2・TASK-15.3: `open_in` は通常ファイル以外（ディレクトリ）を sink にしない。
+    /// `dir` がディレクトリでなければ失敗する。
+    #[test]
+    fn io2_open_in_rejects_non_regular_targets() {
+        let t = TempDirGuard::new("nonreg");
+        std::fs::create_dir(t.0.join("sub")).expect("sub");
+        std::fs::write(t.0.join("file"), b"x").expect("file");
+        assert!(AppendFileSink::open_in(&t.0, "sub", SinkOpenMode::Existing).is_err());
+        assert!(AppendFileSink::open_in(&t.0.join("file"), "x", SinkOpenMode::CreateNew).is_err());
+        assert!(!t.0.join("file").join("x").exists());
+    }
+
+    /// IO-2・TASK-15.3: 末端が symlink なら、どの mode でも辿らずに失敗し、リンク先を
+    /// 作らない・切り詰めない（切り詰めは通常ファイルと確かめた後にだけ行う）。
+    #[cfg(unix)]
+    #[test]
+    fn io2_open_in_does_not_follow_or_truncate_symlink_leaf() {
+        let t = TempDirGuard::new("symlink");
+        let target = t.0.join("target");
+        std::fs::write(&target, b"keep").expect("target");
+        std::os::unix::fs::symlink(&target, t.0.join("l")).expect("symlink");
+        std::os::unix::fs::symlink(t.0.join("absent"), t.0.join("dangling")).expect("dangling");
+        for mode in [
+            SinkOpenMode::CreateNew,
+            SinkOpenMode::CreateOrTruncate,
+            SinkOpenMode::Existing,
+            SinkOpenMode::CreateOrAppend,
+        ] {
+            assert!(
+                AppendFileSink::open_in(&t.0, "l", mode).is_err(),
+                "{mode:?}"
+            );
+            assert!(
+                AppendFileSink::open_in(&t.0, "dangling", mode).is_err(),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&target).expect("target"), b"keep");
+        assert!(!t.0.join("absent").exists());
+    }
+
+    /// IO-2・IO-3・TASK-15.3（Codex #1146 P0）: `open_in` が登録するのはファイルを開いた
+    /// ディレクトリの実体で、開いた後に `dir` のパスが別のディレクトリへ差し替えられても
+    /// 変わらない（パスを再解決しない）。差し替え後のパスに同名のファイルがあっても、sink の
+    /// 書き込みは元のディレクトリのファイルに入る。
+    #[cfg(unix)]
+    #[test]
+    fn io2_open_in_keeps_directory_after_path_swap() {
+        use std::os::unix::fs::MetadataExt;
+        let t = TempDirGuard::new("swap");
+        let dir = t.0.join("d");
+        std::fs::create_dir(&dir).expect("d");
+        let sink = AppendFileSink::open_in(&dir, "f", SinkOpenMode::CreateNew).expect("sink");
+        let original = std::fs::metadata(&dir).expect("meta").ino();
+        std::fs::rename(&dir, t.0.join("moved")).expect("move d");
+        std::fs::create_dir(&dir).expect("new d");
+        std::fs::write(dir.join("f"), b"decoy").expect("decoy");
+        let handles = sink.parent_dirs.as_ref().expect("parent dirs");
+        assert_eq!(handles.len(), 1);
+        let held = handles
+            .first()
+            .expect("one handle")
+            .metadata()
+            .expect("meta");
+        assert_eq!(held.ino(), original);
+        assert_ne!(held.ino(), std::fs::metadata(&dir).expect("meta").ino());
+        let mut sink = sink;
+        let mut buffer = BatchBuffer::new(BatchConfig::new(1).expect("1 must be valid"));
+        let batch = match buffer.push(write_frame(0, b"x")).expect("push") {
+            PushOutcome::Ready(batch) => batch,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        sink.write_batch(&batch).expect("write");
+        assert_eq!(std::fs::read(t.0.join("moved").join("f")).expect("f"), b"x");
+        assert_eq!(std::fs::read(dir.join("f")).expect("decoy"), b"decoy");
+    }
+
+    /// IO-2・IO-3（Codex #1146 P0）: persist 済みの sink にハンドルを登録し直すと
+    /// 未永続化状態へ戻り、次の persist が登録したディレクトリを必ず同期する。
+    #[test]
+    fn io2_parent_dir_handles_after_persist_marks_dirty() {
+        let t = TempDirGuard::new("dirty");
+        let mut sink =
+            AppendFileSink::new(temp_append_sink("dirs-dirty").into_inner()).expect("sink");
+        sink.dirty_since_persist = false;
+        sink.parent_dirs_synced = true;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_BACKUP_SEMANTICS（ディレクトリを開くのに必須）。
+            options.custom_flags(0x0200_0000);
+        }
+        let handle = options.open(&t.0).expect("open dir");
+        let sink = sink.with_parent_dir_handles(vec![handle]);
+        assert!(sink.dirty_since_persist);
+        assert!(!sink.parent_dirs_synced);
+        assert_eq!(sink.parent_dirs.as_ref().map(Vec::len), Some(1));
     }
 
     /// IO-2（#824 A4）・REPAIR-5: syncfs の同時実行数の枠が埋まったまま FLUSH の
@@ -1448,6 +1877,8 @@ mod tests {
             persist_poisoned: false,
             dirty_since_persist: true,
             persist_limiter: &L,
+            parent_dirs: None,
+            parent_dirs_synced: false,
         };
         let mut conn = FakeTransport::new(vec![flush_frame(0)]);
 

@@ -325,8 +325,11 @@ impl GuestFileCreator {
         fault::run_hook(fault::Hook::AfterCreate);
         // 走査から作成までの間に別プロセスが足した大小違いの項目を再検証する
         // （見つかれば自分の作成を取り消して返す。モジュール doc「プロセス間の競合」）。
-        let file = verify_created(created, guest_path, ancestors, leaf)?;
-        AppendFileSink::new(file)
+        let (file, dir_handles) = verify_created(created, guest_path, ancestors, leaf)?;
+        // 新規作成したファイル（と祖先ディレクトリ）のエントリを macOS / Windows の
+        // persist で永続化するため、作成に使った保持済みのハンドルを末端の親から root まで
+        // 全階層渡す（パスは再解決しない。IO-2・TASK-15.3）。
+        AppendFileSink::new(file).map(|sink| sink.with_parent_dir_handles(dir_handles))
     }
 
     /// `ancestors` に沿って実在するディレクトリの項目を読み、この作成限りの衝突
@@ -407,6 +410,8 @@ fn open_root_handle(root: &Path) -> std::io::Result<File> {
     const FLAGS: u32 = 0x0200_0000;
     // FILE_SHARE_READ | FILE_SHARE_WRITE（FILE_SHARE_DELETE は含めない）
     const SHARE: u32 = 0x1 | 0x2;
+    // 読み取り専用: 走査・固定にだけ使い、書き込み権限を要求しない（書込不可の
+    // ルート・祖先でも走査できるように）。同期用のハンドルは作成時に別に開く。
     OpenOptions::new()
         .read(true)
         .custom_flags(FLAGS)
@@ -585,6 +590,7 @@ fn open_pinned_dir(path: &Path) -> std::io::Result<Option<File>> {
     const SHARE: u32 = 0x1 | 0x2;
     // FILE_ATTRIBUTE_REPARSE_POINT
     const REPARSE: u32 = 0x400;
+    // 読み取り専用（同期用ハンドルは `open_sync_dir` が別に開く）。
     let dir = OpenOptions::new()
         .read(true)
         .custom_flags(FLAGS)
@@ -595,6 +601,37 @@ fn open_pinned_dir(path: &Path) -> std::io::Result<Option<File>> {
         return Ok(None);
     }
     Ok(Some(dir))
+}
+
+/// 同期用（`FlushFileBuffers`。書き込み権限が必要）のディレクトリハンドルを開く。
+/// 呼び出し側が祖先を固定している間に開くため、パスは固定済みの祖先の配下に留まる。
+/// reparse point を辿らず、通常ディレクトリでなければ拒否する。
+/// `FILE_SHARE_DELETE` を含めて共有するため、保持中もホスト側の改名・削除を妨げず、
+/// 改名後もハンドルは同じディレクトリ実体を指す（IO-2・IO-3）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_sync_dir(path: &Path) -> Result<File, CreateError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+    const FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    const SHARE: u32 = 0x1 | 0x2 | 0x4;
+    // FILE_ATTRIBUTE_REPARSE_POINT
+    const REPARSE: u32 = 0x400;
+    let fail = |kind| CreateError::Other(internal("failed to create guest file", kind));
+    let dir = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FLAGS)
+        .share_mode(SHARE)
+        .open(path)
+        .map_err(|err| fail(err.kind()))?;
+    let meta = dir.metadata().map_err(|err| fail(err.kind()))?;
+    if !meta.is_dir() || meta.file_attributes() & REPARSE != 0 {
+        return Err(CreateError::Other(invalid(
+            "guest path ancestor is not a directory",
+        )));
+    }
+    Ok(dir)
 }
 
 /// [`create_beneath`] の失敗種別。
@@ -665,6 +702,9 @@ struct Created {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct Created {
     file: File,
+    /// 同期用の書き込み可能なディレクトリハンドル（末端の親から root の順）。
+    /// 祖先を固定している間に開くため、作成後に改名されても同じディレクトリを指す。
+    dirs: Vec<File>,
 }
 
 /// ルートのディレクトリハンドル起点・symlink 非追従で祖先を開き（無ければ作り）
@@ -786,7 +826,7 @@ fn verify_created(
     guest_path: &str,
     ancestors: &[&str],
     leaf: &str,
-) -> Result<File, IoError> {
+) -> Result<(File, Vec<File>), IoError> {
     use crate::fs_normalize::fold_component;
     use std::ops::ControlFlow;
     use std::os::unix::fs::MetadataExt;
@@ -864,7 +904,11 @@ fn verify_created(
         prefix.push_str(component);
         prefix.push('/');
     }
-    Ok(created.file)
+    // 作成に使った保持済みハンドルを、末端の親から root の順で返す（sink が
+    // パスを再解決せずに同期するため。IO-2・IO-3）。
+    let Created { file, mut dirs, .. } = created;
+    dirs.reverse();
+    Ok((file, dirs))
 }
 
 /// 再検証を行わないフォールバック（Windows 等。モジュール doc の既知の限界）。
@@ -874,8 +918,8 @@ fn verify_created(
     _guest_path: &str,
     _ancestors: &[&str],
     _leaf: &str,
-) -> Result<File, IoError> {
-    Ok(created.file)
+) -> Result<(File, Vec<File>), IoError> {
+    Ok((created.file, created.dirs))
 }
 
 /// 取り消しが元どおりにできなかった理由。
@@ -1197,10 +1241,21 @@ fn create_beneath(
     let mut path = root.to_path_buf();
     // 固定済みの祖先ハンドル（葉の作成が終わるまで保持する）。
     let mut pinned: Vec<File> = Vec::with_capacity(ancestors.len());
+    // 階層ごとのパス（root から順）と、エントリの永続化が必要か。永続化が必要なのは
+    // 本呼び出しが新設したディレクトリの親と、葉の親だけ（既存の祖先は対象外なので
+    // 書込不可でも作成できる）。
+    let mut dir_paths: Vec<PathBuf> = Vec::with_capacity(ancestors.len().saturating_add(1));
+    let mut needs_sync: Vec<bool> = Vec::with_capacity(ancestors.len().saturating_add(1));
+    dir_paths.push(path.clone());
+    needs_sync.push(false);
     for name in ancestors {
         path.push(name);
         match std::fs::create_dir(&path) {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(parent_flag) = needs_sync.last_mut() {
+                    *parent_flag = true;
+                }
+            }
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
             Err(err) => {
                 return Err(CreateError::Other(internal(
@@ -1212,13 +1267,28 @@ fn create_beneath(
         let dir = open_pinned_dir(&path)
             .map_err(|err| CreateError::Other(internal("failed to create guest file", err.kind())))?
             .ok_or_else(|| CreateError::Other(invalid("guest path ancestor is not a directory")))?;
+        dir_paths.push(path.clone());
+        needs_sync.push(false);
         pinned.push(dir);
+    }
+    if let Some(parent_flag) = needs_sync.last_mut() {
+        *parent_flag = true;
+    }
+    // 固定している間に同期用ハンドルを開く（末端の親から root の順で返す）。
+    let mut sync_dirs: Vec<File> = Vec::with_capacity(ancestors.len().saturating_add(1));
+    for (dir_path, needed) in dir_paths.iter().zip(needs_sync.iter()).rev() {
+        if *needed {
+            sync_dirs.push(open_sync_dir(dir_path)?);
+        }
     }
     let result = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path.join(leaf))
-        .map(|file| Created { file })
+        .map(|file| Created {
+            file,
+            dirs: sync_dirs,
+        })
         .map_err(|err| {
             if err.kind() == ErrorKind::AlreadyExists {
                 // 実在する表記を確かめる（NTFS は大文字小文字を区別しないため、走査の

@@ -13,13 +13,13 @@ use std::time::Duration;
 
 use fandhe_container_io::{
     AppendFileSink, BatchConfig, FrameKind, InFlightLimit, IoErrorCode, NoopSendObserver,
-    PipelineClient, REQUEST_ID_WIRE_LEN, WritebackTimeouts,
+    PipelineClient, REQUEST_ID_WIRE_LEN, SinkOpenMode, WritebackTimeouts,
 };
 
 use super::harness::{
     self, DuplexEnd, SharedSink, TempDir, barrier_wait_within, body_for, decompose_records,
-    drain_acks, flush_acks_per_flush, flush_session_end_code, join_within, record_client,
-    record_seq, recv_flush_ack_if_supported, send_all_writes, spawn_server, timeout,
+    drain_acks, flush_acks_per_flush, flush_session_end_code, join_within, open_sink,
+    record_client, record_seq, recv_flush_ack_if_supported, send_all_writes, spawn_server, timeout,
 };
 
 /// `join_within` に渡す上限時間（各 `serve_connection`・クライアントスレッドの
@@ -38,13 +38,8 @@ fn writeback_timeouts() -> WritebackTimeouts {
 
 /// `path` に新規作成した出力ファイルから [`AppendFileSink`] を作る。
 fn new_sink(path: &std::path::Path) -> AppendFileSink {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .expect("must be able to create the test output file");
-    AppendFileSink::new(file).expect("seek to end must succeed on a freshly created file")
+    open_sink(path, SinkOpenMode::CreateOrTruncate)
+        .expect("must be able to create the test output file")
 }
 
 /// クライアント数分の [`DuplexEnd`] ペアを作り、`(client_ends, server_ends)`

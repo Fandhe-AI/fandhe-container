@@ -66,14 +66,14 @@ use std::time::Duration;
 
 use fandhe_container_io::{
     AppendFileSink, BatchConfig, Frame, FrameKind, FrameReceiver, FrameSender, InFlightLimit,
-    IoError, IoErrorCode, IoTimeout, NoopSendObserver, PipelineClient, WritebackReport,
-    WritebackTimeouts, serve_connection,
+    IoError, IoErrorCode, IoTimeout, NoopSendObserver, PipelineClient, SinkOpenMode,
+    WritebackReport, WritebackTimeouts, serve_connection,
 };
 
 use super::harness::{
     self, DuplexEnd, SharedSink, TempDir, barrier_wait_within, body_for, decompose_records,
-    drain_acks, flush_acks_per_flush, flush_session_end_code, join_within, record_client,
-    record_seq, recv_flush_ack_if_supported, send_all_writes, spawn_server, timeout,
+    drain_acks, flush_acks_per_flush, flush_session_end_code, join_within, open_sink,
+    record_client, record_seq, recv_flush_ack_if_supported, send_all_writes, spawn_server, timeout,
 };
 
 /// [`harness::join_within`] / [`harness::barrier_wait_within`] に渡す上限時間
@@ -93,23 +93,15 @@ fn writeback_timeouts() -> WritebackTimeouts {
 /// `path` に新規ファイルを作り（既存があれば切り詰め）、末尾へ位置合わせした
 /// [`AppendFileSink`] を返す（`rename_truncate.rs` の `create_sink` と同じ方針）。
 fn create_sink(path: &Path) -> AppendFileSink {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .expect("must be able to create the test output file");
-    AppendFileSink::new(file).expect("seek to end must succeed on a freshly created file")
+    open_sink(path, SinkOpenMode::CreateOrTruncate)
+        .expect("must be able to create the test output file")
 }
 
 /// 既存の `path` を書き込みモード（切り詰めなし）で開き、末尾へ位置合わせした
 /// [`AppendFileSink`] を返す（前セッションが閉じた（close 済み）ファイルの末尾
 /// から追記を再開するケースで使う）。
 fn reopen_sink(path: &Path) -> AppendFileSink {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map(|file| AppendFileSink::new(file).expect("seek to end must succeed on reopen"))
+    open_sink(path, SinkOpenMode::Existing)
         .expect("must be able to reopen the existing test output file")
 }
 
@@ -189,7 +181,7 @@ impl Session {
     /// `Flush` を送り、`unacked` 件の Write ACK だけを受け取ってからクライアント
     /// を drop し、サーバーの終了を待つ（グレースフルシャットダウン (a)。
     /// persist 対応環境では Write ACK の後に FlushAck も受け取り、非対応環境
-    /// 〔Linux 5.8 未満・非 Linux。TASK-15.3・#88〕では FlushAck の代わりに EOF を
+    /// 〔Linux 5.8 未満・その他の OS〕では FlushAck の代わりに EOF を
     /// 確認する〔IO-2・TASK-15.2.2・#824〕）。
     fn shutdown_with_flush(mut self) -> WritebackReport {
         self.client

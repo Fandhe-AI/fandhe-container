@@ -19,11 +19,11 @@ use std::time::Duration;
 
 use fandhe_container_io::{
     AppendFileSink, BatchConfig, InFlightLimit, IoErrorCode, NoopSendObserver, PipelineClient,
-    WritebackReport, WritebackTimeouts,
+    SinkOpenMode, WritebackReport, WritebackTimeouts,
 };
 
 use super::harness::{
-    self, DuplexEnd, TempDir, barrier_wait_within, body_for, drain_acks, join_within,
+    self, DuplexEnd, TempDir, barrier_wait_within, body_for, drain_acks, join_within, open_sink,
     send_all_writes, spawn_server, timeout,
 };
 
@@ -43,24 +43,16 @@ fn writeback_timeouts() -> WritebackTimeouts {
 /// `path` に新規ファイルを作り（既存があれば切り詰め）、末尾へ位置合わせした
 /// [`AppendFileSink`] を返す（`concurrent_write.rs` の `new_sink` と同じ方針）。
 fn create_sink(path: &Path) -> AppendFileSink {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .expect("must be able to create the test output file");
-    AppendFileSink::new(file).expect("seek to end must succeed on a freshly created file")
+    open_sink(path, SinkOpenMode::CreateOrTruncate)
+        .expect("must be able to create the test output file")
 }
 
 /// 既存の `path` を書き込みモード（切り詰めなし）で開き、末尾へ位置合わせした
 /// [`AppendFileSink`] を返す。前セッションが書いた内容・外部からの
 /// rename / truncate の結果の末尾から追記を再開するケースで使う。
 fn reopen_sink(path: &Path) -> AppendFileSink {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("must be able to reopen the existing test output file");
-    AppendFileSink::new(file).expect("seek to end must succeed on reopen")
+    open_sink(path, SinkOpenMode::Existing)
+        .expect("must be able to reopen the existing test output file")
 }
 
 /// `path` を `OpenOptions::append(true)` で開いた [`AppendFileSink`] を返す
@@ -71,12 +63,8 @@ fn reopen_sink(path: &Path) -> AppendFileSink {
 /// T4 と T5 は、開き方によらず truncate 後の書き込みが新しい EOF に着地する
 /// ことを対で確認する。
 fn append_mode_sink(path: &Path) -> AppendFileSink {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .expect("must be able to open the test output file in append mode");
-    AppendFileSink::new(file).expect("seek to end must succeed in append mode")
+    open_sink(path, SinkOpenMode::CreateOrAppend)
+        .expect("must be able to open the test output file in append mode")
 }
 
 /// ライブセッション（1 接続の `serve_connection` と、それに対応する 1 つの

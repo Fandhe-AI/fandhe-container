@@ -209,8 +209,8 @@ impl SinkPersistReport {
 ///
 /// 未対応の範囲（REPAIR-3）: タイムアウトは最大 10 秒で、未書き戻しデータが
 /// 大量にあると超えうる（その場合 FlushAck は返らない）。fd を開く前に起きた
-/// 書き戻しエラーは報告されない。Linux 5.8 未満は書き戻しエラーが報告されない
-/// （検出・拒否は範囲外）。電源断への耐性は本 crate では検証しない（TASK-18）。
+/// 書き戻しエラーは報告されない。Linux 5.8 未満は書き戻しエラーが報告されないため
+/// `Unimplemented` で拒否する（`barrier` モジュール参照。ポイズンしない）。電源断への耐性は本 crate では検証しない（TASK-18）。
 pub struct AppendFileSink {
     file: File,
     flush_timeout: IoTimeout,
@@ -357,7 +357,12 @@ impl BatchSink for AppendFileSink {
         match crate::barrier::persist_file_system(&self.file, self.flush_timeout) {
             Ok(elapsed) => Ok(SinkPersistReport::new(elapsed)),
             Err(err) => {
-                self.persist_poisoned = true;
+                // `Unimplemented` は syscall を発行していない（非 Linux・5.8 未満
+                // カーネルの拒否）ため errseq は消費されておらずポイズン不要。
+                // 共有 sink の他接続にも同じ `Unimplemented` を返すため。
+                if err.code() != IoErrorCode::Unimplemented {
+                    self.persist_poisoned = true;
+                }
                 Err(err)
             }
         }

@@ -39,8 +39,10 @@
 //!   （TASK-15.3・#88）。
 //! - 同時並行する FLUSH の合流とレート制限はない（同期範囲がファイルシステム
 //!   全体に及ぶ増幅への対策。後続課題）。
-//! - Linux 5.8 未満のカーネルは書き戻しエラーを報告しないが、検出・拒否は
-//!   していない（`crate::sys::syncfs` の doc 参照）。
+//! - Linux 5.8 未満のカーネルは `syncfs(2)` が書き戻しエラーを報告しないため、
+//!   `/proc/sys/kernel/osrelease` で版数を確認し、5.8 未満・判定不能なら
+//!   `Unimplemented` で拒否して FlushAck を返さない（fail-closed）。ディストロが
+//!   修正を旧カーネルへバックポートしていても拒否する（安全側）。
 //! - 検証するのは順序と契約までで、電源断・SIGKILL への耐性は検証しない
 //!   （TASK-18）。
 
@@ -356,6 +358,7 @@ where
 /// なく [`IoErrorCode::Unimplemented`]（TASK-15.3・#88）。
 #[cfg(target_os = "linux")]
 pub(crate) fn persist_file_system(file: &File, timeout: IoTimeout) -> Result<Duration, IoError> {
+    ensure_syncfs_reports_errors()?;
     let dup = file.try_clone().map_err(|err| {
         IoError::new(
             IoErrorCode::Internal,
@@ -363,6 +366,51 @@ pub(crate) fn persist_file_system(file: &File, timeout: IoTimeout) -> Result<Dur
         )
     })?;
     run_with_deadline(&PERSIST_LIMITER, timeout, move || crate::sys::syncfs(&dup))
+}
+
+/// `syncfs(2)` が書き戻し失敗を報告するカーネルの最小版数（major, minor）。
+/// 5.8 未満は `EBADF` 以外を報告せず、失敗を隠したまま 0 を返しうる（IO-2・IO-3）。
+#[cfg(any(target_os = "linux", test))]
+const MIN_SYNCFS_ERROR_REPORTING: (u32, u32) = (5, 8);
+
+/// カーネル release 文字列（例 `6.8.0-45-generic`）から `(major, minor)` を取り出す。
+/// 解釈できなければ `None`（呼び出し側は fail-closed で拒否する）。
+#[cfg(any(target_os = "linux", test))]
+fn parse_kernel_release(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.trim().split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor_raw = parts.next()?;
+    let digits: String = minor_raw.chars().take_while(char::is_ascii_digit).collect();
+    let minor = digits.parse::<u32>().ok()?;
+    Some((major, minor))
+}
+
+/// release 文字列が `syncfs` の書き戻しエラー報告に対応する版数か判定する。
+#[cfg(any(target_os = "linux", test))]
+fn release_supports_syncfs_errors(release: &str) -> bool {
+    parse_kernel_release(release).is_some_and(|v| v >= MIN_SYNCFS_ERROR_REPORTING)
+}
+
+/// 実行中カーネルが 5.8 以上であることを確認する（結果はプロセス内で 1 回だけ
+/// 判定してキャッシュ）。満たさない・判定できない場合は `Unimplemented`（IO-2・IO-3。
+/// FlushAck を返さず拒否する）。
+#[cfg(target_os = "linux")]
+fn ensure_syncfs_reports_errors() -> Result<(), IoError> {
+    use std::sync::OnceLock;
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    let ok = *SUPPORTED.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|r| release_supports_syncfs_errors(&r))
+            .unwrap_or(false)
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(IoError::new(
+            IoErrorCode::Unimplemented,
+            "kernel older than 5.8 (or unknown) cannot report syncfs write-back errors; refusing to send FlushAck",
+        ))
+    }
 }
 
 /// 非 Linux 版: 代替フラッシュ未実装のため FlushAck を出せない（fail-closed）。
@@ -442,6 +490,19 @@ mod tests {
         })
         .expect_err("must propagate");
         assert_eq!(err.code(), IoErrorCode::Internal);
+    }
+
+    /// IO-2・IO-3: 5.8 未満・解釈不能な release は拒否し、5.8 以上は許可する。
+    #[test]
+    fn io2_kernel_release_gate_rejects_pre_5_8() {
+        assert!(!release_supports_syncfs_errors("5.7.19"));
+        assert!(!release_supports_syncfs_errors("4.18.0-553.el8.x86_64"));
+        assert!(!release_supports_syncfs_errors(""));
+        assert!(!release_supports_syncfs_errors("garbage"));
+        assert!(release_supports_syncfs_errors("5.8.0"));
+        assert!(release_supports_syncfs_errors("5.10.0-rc1\n"));
+        assert!(release_supports_syncfs_errors("6.8.0-45-generic"));
+        assert!(!release_supports_syncfs_errors("5.x"));
     }
 
     /// IO-2・TASK-15.2.2: Linux では実ファイルへの persist が成功する。

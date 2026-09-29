@@ -969,7 +969,12 @@ where
 
                 // IO-10: 受理するとバイト上限を超えるなら、受理前に既存滞留分を
                 // 自動フラッシュする（超過を 1 フレーム分に抑える）。
-                if !stats.unflushed.is_empty()
+                // ただし `BatchBuffer::push` が拒否する Write（payload が
+                // `max_bytes` 超）では、保留分の書き込み・ACK・永続化を起こさず
+                // バッファへ触れずに終える契約を守るため、受理可能な場合に限る。
+                let acceptable = frame.payload().len() <= buffer.config().max_bytes();
+                if acceptable
+                    && !stats.unflushed.is_empty()
                     && limit.would_exceed_bytes(&stats.unflushed, body_len)
                     && let Err(err) = auto_flush(conn, sink, &mut buffer, timeouts.send, &mut stats)
                 {
@@ -1741,6 +1746,24 @@ mod tests {
         assert_eq!(report.stats.unflushed.bytes(), 3);
         // 2 件目は未 ACK のままバッファに残り、終了時に破棄される。
         assert_eq!(report.stats.acks_sent, 1);
+        assert_eq!(report.stats.discarded_pending_frames, 1);
+    }
+
+    /// IO-10・TASK-16.2: push に拒否される Write では既存滞留分をフラッシュしない。
+    #[test]
+    fn io10_auto_flush_precheck_skipped_for_rejected_write() {
+        let frames = vec![write_frame(0, b"abc"), write_frame(1, b"defghijklmnop")];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = persist_sink(None);
+        let max_bytes = crate::payload::REQUEST_ID_WIRE_LEN + 4;
+        let config = BatchConfig::with_max_bytes(64, max_bytes).expect("valid");
+
+        let report =
+            serve_connection_with_limit(&mut conn, config, limit(100, 4), &mut sink, timeouts());
+
+        assert_eq!(report.stats.auto_flushes, 0);
+        assert_eq!(sink.persist_calls, 0);
+        assert_eq!(report.stats.acks_sent, 0);
         assert_eq!(report.stats.discarded_pending_frames, 1);
     }
 

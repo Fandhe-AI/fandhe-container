@@ -4,7 +4,8 @@
 //! [範囲限定](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856167174)〕）。
 //!
 //! # 呼び出し文脈
-//! `crate::exec::isolate`・`crate::exec::mount_proc`（CORE-1・TASK-27.2・#134）が、
+//! `crate::exec::isolate`・`crate::exec::MountIsolation::establish`・`crate::exec::mount_proc`
+//! （CORE-1・TASK-27.2・#134）が、
 //! `unshare(2)`・`sethostname(2)`・`mount(2)`・`openat(2)`・`geteuid(2)`・`getegid(2)` を
 //! 呼ぶために使う。std だけでは提供されない
 //! syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
@@ -250,7 +251,7 @@ pub(crate) fn mount_root_private_recursive() -> Result<(), SysError> {
 /// - `O_PATH`: 読み取り権限を要求せず、経路上の search（実行）権限だけで辿れる fd を得る。
 ///   `CLONE_NEWUSER` 後はホスト所有で実行権限のみ（読み取り不可）の祖先ディレクトリが
 ///   あり得るため、読み取り可能な fd を要求すると正当なパスでも失敗する（Cursor Bugbot 指摘）。
-///   O_PATH fd は `openat` の dirfd と `/proc/self/fd/N` の magic link（`mount(2)` の
+///   O_PATH fd は `openat` の dirfd と `/proc/thread-self/fd/N` の magic link（`mount(2)` の
 ///   マウント先）に使え、本モジュールの用途はこの 2 つに限る
 /// - `O_DIRECTORY`: **symlink 拒否の要**。`O_PATH|O_NOFOLLOW` だけでは最終要素の symlink
 ///   そのものを指す fd が返る（`open(2)` の O_PATH 節）。`O_DIRECTORY` を併用することで
@@ -267,7 +268,7 @@ fn open_dir_path_flags() -> i32 {
 /// 無ければ `EACCES`。
 ///
 /// 呼び出し側が 1 要素ずつ辿ることで、検証した実体を fd で固定できる（TOCTOU 対策）。
-/// 返る fd は O_PATH のため読み書きには使えない（dirfd・`/proc/self/fd/N`・fdinfo 専用）。
+/// 返る fd は O_PATH のため読み書きには使えない（dirfd・`/proc/thread-self/fd/N`・fdinfo 専用）。
 pub(crate) fn open_dir_path_nofollow(
     parent: Option<BorrowedFd<'_>>,
     name: &CStr,
@@ -291,7 +292,7 @@ pub(crate) fn open_dir_path_nofollow(
 
 /// `target` に procfs を `nosuid,nodev,noexec` でマウントする。
 ///
-/// `crate::exec::mount_proc` は検証済みの O_PATH fd を指す `/proc/self/fd/N` を渡す
+/// `crate::exec::mount_proc` は検証済みの O_PATH fd を指す `/proc/thread-self/fd/N` を渡す
 /// （magic link は fd の実体へ解決されるため、パス文字列を再解決しない）。
 // テストビルドでは `crate::exec` の dry-run 差し込み点（`mount_proc_syscall`）が本関数を
 // 呼ばないため、dead_code を許可する（本番ビルドでは使われる）。

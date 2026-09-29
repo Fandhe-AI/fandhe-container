@@ -587,11 +587,11 @@ pub fn isolate(config: &IsolationConfig) -> Result<IsolationReport, ExecError> {
 /// - `rootfs` / `target` は絶対パスで NUL・`..` を含まず、`target` は `rootfs` より下の専用ディレクトリ
 ///   （`target == rootfs` は拒否）
 /// - `/` から `target` までを `openat(O_PATH|O_DIRECTORY|O_NOFOLLOW)` で 1 要素ずつ辿って
-///   fd で固定し（[`open_dir_beneath`]）、マウントは `/proc/self/fd/N` 経由で同じ実体に対して
+///   fd で固定し（[`open_dir_beneath`]）、マウントは `/proc/thread-self/fd/N` 経由で同じ実体に対して
 ///   行う（検証後の差し替え = TOCTOU の防止）。symlink・非ディレクトリ・不在の要素があれば
 ///   拒否する。O_PATH のため祖先に要るのは search（実行）権限だけで、user namespace 内から
 ///   読み取り不可・実行可のホスト側ディレクトリを辿れる
-/// - 固定した fd が属するマウント（`/proc/self/fdinfo/N` の `mnt_id`）の propagation が
+/// - 固定した fd が属するマウント（`/proc/thread-self/fdinfo/N` の `mnt_id`）の propagation が
 ///   `shared` でない（mount namespace 分離済みで `MS_PRIVATE` 化されていること。shared の
 ///   ままではマウントがホストへ伝播する）。パス文字列ではなく fd で判定し、検証と実マウント
 ///   の対象を一致させる
@@ -654,8 +654,10 @@ fn mount_proc_verified(rootfs: &Path, target: &Path) -> Result<(), ExecError> {
             "proc mount target is on a shared mount; isolate the mount namespace first",
         ));
     }
-    // fd が指す実体へマウントする（`/proc/self/fd/N` は fd の dentry へ解決される）。
-    let c_target = CString::new(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+    // fd が指す実体へマウントする（`/proc/thread-self/fd/N` は fd の dentry へ解決される）。
+    // `establish` は呼び出しスレッドだけを新しい mount namespace へ移すため、パス解決・
+    // mountinfo の参照はスレッドグループの代表（`/proc/self`）ではなく呼び出しスレッドで行う。
+    let c_target = CString::new(format!("/proc/thread-self/fd/{}", dir.as_raw_fd()))
         .map_err(|_| invalid("proc mount target must not contain NUL"))?;
     mount_proc_syscall(&c_target)
         .map_err(|e| ExecError::from_sys(e, IsolationStage::MountProc, "mount(proc)"))
@@ -709,7 +711,7 @@ fn open_dir_beneath(real_root: &Path, names: &[&OsStr]) -> Result<OwnedFd, ExecE
     Ok(cur)
 }
 
-/// `/proc/self/fdinfo/<fd>` の `mnt_id:` 行（fd が属するマウントの ID）を取り出す。
+/// `/proc/thread-self/fdinfo/<fd>` の `mnt_id:` 行（fd が属するマウントの ID）を取り出す。
 fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
     fdinfo
         .lines()
@@ -718,15 +720,17 @@ fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
 }
 
 /// `dir` が属するマウントが shared propagation か判定する。fdinfo の `mnt_id` と
-/// `/proc/self/mountinfo` の先頭フィールド（mount ID）を突き合わせる。読み取り・解析
+/// 呼び出しスレッドの `/proc/thread-self/mountinfo` の先頭フィールド（mount ID）を
+/// 突き合わせる（`/proc/self/mountinfo` はスレッドグループの代表の mount namespace を映し、
+/// `establish` 後の別スレッドでは一致しないため）。読み取り・解析
 /// できない場合は安全側（エラー）に倒す。
 fn mount_is_shared(dir: &OwnedFd) -> Result<bool, ExecError> {
-    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", dir.as_raw_fd()))
+    let fdinfo = std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", dir.as_raw_fd()))
         .map_err(|_| mountinfo_error("cannot read fdinfo of the proc mount target"))?;
     let mnt_id = parse_fdinfo_mnt_id(&fdinfo)
         .ok_or_else(|| mountinfo_error("no mnt_id in fdinfo of the proc mount target"))?;
-    let info = std::fs::read_to_string("/proc/self/mountinfo").map_err(|_| {
-        mountinfo_error("cannot read /proc/self/mountinfo to verify mount propagation")
+    let info = std::fs::read_to_string("/proc/thread-self/mountinfo").map_err(|_| {
+        mountinfo_error("cannot read /proc/thread-self/mountinfo to verify mount propagation")
     })?;
     mount_is_shared_in(&info, mnt_id)
 }
@@ -749,7 +753,7 @@ const MOUNTINFO_TAIL_FIELDS: usize = 3;
 /// あれば候補行かどうかに関わらずエラーにする（fail-closed。壊れた行を黙って飛ばして
 /// 非 shared と誤判定しない）。該当行が無い・同じ mount ID の行が複数ある場合もエラー。
 fn mount_is_shared_in(info: &str, mnt_id: u64) -> Result<bool, ExecError> {
-    let malformed = || mountinfo_error("malformed line in /proc/self/mountinfo");
+    let malformed = || mountinfo_error("malformed line in /proc/thread-self/mountinfo");
     let mut found: Option<bool> = None;
     for line in info.lines() {
         let fields: Vec<&str> = line.split(' ').collect();
@@ -772,7 +776,7 @@ fn mount_is_shared_in(info: &str, mnt_id: u64) -> Result<bool, ExecError> {
         }
         if found.is_some() {
             return Err(mountinfo_error(
-                "duplicate mount ID in /proc/self/mountinfo",
+                "duplicate mount ID in /proc/thread-self/mountinfo",
             ));
         }
         let shared = fields
@@ -1165,7 +1169,7 @@ mod tests {
         }
         let fd = open_dir_beneath(&root, &[OsStr::new("proc")]).unwrap();
         assert_eq!(
-            std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap(),
+            std::fs::read_link(format!("/proc/thread-self/fd/{}", fd.as_raw_fd())).unwrap(),
             root.join("proc")
         );
     }
@@ -1199,9 +1203,10 @@ mod tests {
     fn mount_is_shared_uses_mount_id_of_fd() {
         let fd = open_dir_beneath(Path::new("/"), &[]).unwrap();
         let fdinfo =
-            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).unwrap();
+            std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd()))
+                .unwrap();
         let mnt_id = parse_fdinfo_mnt_id(&fdinfo).unwrap();
-        let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let info = std::fs::read_to_string("/proc/thread-self/mountinfo").unwrap();
         let root_line = info
             .lines()
             .rev()

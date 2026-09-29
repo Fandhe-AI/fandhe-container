@@ -71,6 +71,9 @@ pub mod recv_limits;
 pub mod server;
 pub mod settings;
 mod sys;
+#[cfg(windows)]
+#[path = "sys/windows.rs"]
+mod sys_windows;
 pub mod transport;
 pub mod writeback;
 

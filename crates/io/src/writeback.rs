@@ -341,11 +341,10 @@ impl AppendFileSink {
                 "file is not linked under the parent directory; refusing to register it for sync",
             )
         };
-        let file_meta = sink.file.metadata().map_err(|_| unlinked())?;
-        let entry_meta = std::fs::symlink_metadata(path).map_err(|_| unlinked())?;
-        let handle_meta = handle.metadata().map_err(|_| unlinked())?;
-        let parent_meta = std::fs::metadata(&parent).map_err(|_| unlinked())?;
-        if !same_entity(&file_meta, &entry_meta) || !same_entity(&handle_meta, &parent_meta) {
+        // ファイルは symlink を辿らずエントリ自体を、親は辿った先を比較する。
+        if !same_entity_at(&sink.file, path, false).map_err(|_| unlinked())?
+            || !same_entity_at(&handle, &parent, true).map_err(|_| unlinked())?
+        {
             return Err(unlinked());
         }
         sink.parent_dirs = Some(vec![handle]);
@@ -548,27 +547,45 @@ impl AppendFileSink {
     }
 }
 
-/// 2 つのメタデータが同一のファイル・ディレクトリ実体を指すか。Unix 系は (dev, ino)、
-/// Windows は安定 API で得られる作成時刻・属性（と通常ファイルのサイズ）で判定する。
-/// 判定できない環境は `false`（fail-closed）。
-fn same_entity(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+/// 開いたハンドル `file` が `path` の指す実体と同一か。`follow_symlinks` が偽なら
+/// `path` の末端が symlink のときそのリンク自体と比較する（ファイル側は辿らない）。
+/// Unix 系は (dev, ino)、Windows はハンドルから得たボリューム シリアル番号とファイル
+/// インデックス（[`crate::sys_windows::file_identity`]）で判定する。判定できなければ
+/// `Err`、対応外の環境は `Ok(false)`（fail-closed。IO-2・IO-3）。
+fn same_entity_at(file: &File, path: &Path, follow_symlinks: bool) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        a.dev() == b.dev() && a.ino() == b.ino()
+        let a = file.metadata()?;
+        let b = if follow_symlinks {
+            std::fs::metadata(path)?
+        } else {
+            std::fs::symlink_metadata(path)?
+        };
+        Ok(a.dev() == b.dev() && a.ino() == b.ino())
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        a.creation_time() == b.creation_time()
-            && a.file_attributes() == b.file_attributes()
-            && a.is_dir() == b.is_dir()
-            && (a.is_dir() || a.len() == b.len())
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_BACKUP_SEMANTICS（ディレクトリを開くのに必須）と
+        // FILE_FLAG_OPEN_REPARSE_POINT（末端の reparse point を辿らない）。
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+        if !follow_symlinks {
+            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+        }
+        // アクセス権 0（属性の照会のみ）で開く。共有モードは既定（全共有）。
+        let entry = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(flags)
+            .open(path)?;
+        Ok(crate::sys_windows::file_identity(file)? == crate::sys_windows::file_identity(&entry)?)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (a, b);
-        false
+        let _ = (file, path, follow_symlinks);
+        Ok(false)
     }
 }
 

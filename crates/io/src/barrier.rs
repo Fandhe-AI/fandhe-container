@@ -420,8 +420,12 @@ impl PersistLimiter {
     }
 }
 
-/// [`PersistLimiter`] の枠。Drop（helper スレッド終了時。panic による巻き戻しを
-/// 含む）で解放し、待機中の FLUSH を起こす。
+/// [`PersistLimiter`] の枠。Drop（helper スレッドで `work` が戻った直後。panic
+/// による巻き戻しを含む）で解放し、待機中の FLUSH を起こす。
+///
+/// helper は `work` の結果を呼び出し側へ送る前に枠を解放する。そのため
+/// [`run_with_deadline_tracked`] が `work` の結果（成功・エラー・panic による
+/// 切断）を返した時点で、その枠は必ず解放済みである（IO-2・REPAIR-5）。
 pub(crate) struct PersistSlot {
     limiter: &'static PersistLimiter,
 }
@@ -467,6 +471,10 @@ where
 /// `work` が実行されうるため、呼び出し側は失敗を「syscall 発行済み」として
 /// 扱う）。枠待ちの期限切れ・スレッド生成の失敗では偽のまま返る（何も発行して
 /// いない一時的な失敗。Bugbot #1142 指摘）。
+///
+/// `work` の結果（成功・エラー・panic）を返すときは、その `work` が使った枠は
+/// 解放済み（[`PersistSlot`] 参照）。タイムアウトで返るときは detach された
+/// helper が `work` が戻るまで枠を保持し続ける。
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "Linux の syncfs 経路と単体テストのみが使う")
@@ -499,10 +507,18 @@ where
         .name("fandhe-io-persist".to_owned())
         .stack_size(64 * 1024)
         .spawn(move || {
-            // 枠は work が戻る（または panic で巻き戻る）まで保持する。
-            let _slot = slot;
+            // 枠は work が戻る（または panic で巻き戻る）まで保持し、結果を送る
+            // 前に解放する。送信後に解放すると、結果を受け取った呼び出し側から
+            // 枠がまだ占有中に見え、直後の FLUSH が不要に枠待ちする（計数の観測と
+            // 結果の到着が前後する競合）。panic 時もブロック内の `_slot` が
+            // クロージャに捕捉された `tx` より先に巻き戻しで破棄されるため、
+            // 呼び出し側が切断（Disconnected）を観測した時点で枠は解放済み。
+            let result = {
+                let _slot = slot;
+                work()
+            };
             // 受信側がタイムアウトで離脱済みなら送信は失敗するが問題ない。
-            let _ = tx.send(work());
+            let _ = tx.send(result);
         })
         .map_err(|_| {
             IoError::new(

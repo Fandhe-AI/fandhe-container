@@ -320,14 +320,38 @@ impl AppendFileSink {
     /// [`AppendFileSink::with_parent_dirs`] として登録する便宜コンストラクタ。
     /// 親ディレクトリだけが対象で、祖先ディレクトリも新規作成した場合は
     /// `with_parent_dirs` で作成した全階層を渡すこと（IO-2・TASK-15.3）。
+    ///
+    /// `path` は `file` を開いた後にパスから親を開き直すため、その間に親が rename・置換
+    /// されると別ディレクトリを同期して成功扱いにしうる。これを防ぐため、開いた親ハンドルが
+    /// `path` の現在の親と同一で、かつ `path` のエントリが `file` と同一の実体であることを
+    /// 確認し、確認できなければ `Internal` で拒否する（FlushAck を返さない。IO-2・IO-3）。
+    /// 作成時にディレクトリを固定できる呼び出し側は `GuestFileCreator` のようにハンドルを
+    /// 直接渡すこと（TOCTOU を根本的に避けられる）。
     pub fn new_at(file: File, path: &Path) -> Result<Self, IoError> {
-        let sink = Self::new(file)?;
+        let mut sink = Self::new(file)?;
         // 親のない相対パス（`Path::new("f")`）は現在のディレクトリを親とみなす。
         let parent = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
             _ => PathBuf::from("."),
         };
-        sink.with_parent_dirs(vec![parent])
+        let handle = crate::barrier::open_dir_handle(&parent)?;
+        let unlinked = || {
+            IoError::new(
+                IoErrorCode::Internal,
+                "file is not linked under the parent directory; refusing to register it for sync",
+            )
+        };
+        let file_meta = sink.file.metadata().map_err(|_| unlinked())?;
+        let entry_meta = std::fs::symlink_metadata(path).map_err(|_| unlinked())?;
+        let handle_meta = handle.metadata().map_err(|_| unlinked())?;
+        let parent_meta = std::fs::metadata(&parent).map_err(|_| unlinked())?;
+        if !same_entity(&file_meta, &entry_meta) || !same_entity(&handle_meta, &parent_meta) {
+            return Err(unlinked());
+        }
+        sink.parent_dirs = Some(vec![handle]);
+        sink.parent_dirs_synced = false;
+        sink.dirty_since_persist = true;
+        Ok(sink)
     }
 
     /// 対象ファイルのディレクトリエントリを永続化するために同期するディレクトリを
@@ -521,6 +545,30 @@ impl AppendFileSink {
                 Err(failure.error)
             }
         }
+    }
+}
+
+/// 2 つのメタデータが同一のファイル・ディレクトリ実体を指すか。Unix 系は (dev, ino)、
+/// Windows は安定 API で得られる作成時刻・属性（と通常ファイルのサイズ）で判定する。
+/// 判定できない環境は `false`（fail-closed）。
+fn same_entity(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        a.creation_time() == b.creation_time()
+            && a.file_attributes() == b.file_attributes()
+            && a.is_dir() == b.is_dir()
+            && (a.is_dir() || a.len() == b.len())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (a, b);
+        false
     }
 }
 
@@ -1384,8 +1432,9 @@ mod tests {
             .write(true)
             .open(&path)
             .expect("create temp file");
+        let sink = AppendFileSink::new_at(file, &path).expect("sink must construct");
         let _ = std::fs::remove_file(&path);
-        AppendFileSink::new_at(file, &path).expect("sink must construct")
+        sink
     }
 
     /// IO-2・TASK-15.2.2: 書き込みのない連続 persist は syncfs を再発行せず
@@ -1478,9 +1527,39 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(sink.parent_dirs.as_ref().map(Vec::len), Some(1));
         let _ = dir;
-        let file = tempfile_for_new_at();
-        let sink = AppendFileSink::new_at(file, Path::new("relative-name")).expect("sink");
-        assert_eq!(sink.parent_dirs.as_ref().map(Vec::len), Some(1));
+        let rel = format!("fandhe-io-new-at-rel-{}", std::process::id());
+        let file = File::create(&rel).expect("create file in cwd");
+        let sink = AppendFileSink::new_at(file, Path::new(&rel));
+        let _ = std::fs::remove_file(&rel);
+        assert_eq!(
+            sink.expect("sink").parent_dirs.as_ref().map(Vec::len),
+            Some(1)
+        );
+    }
+
+    /// IO-2・IO-3（Codex #1146 P0）: `path` のエントリが `file` と別の実体（親に
+    /// 所属しない）なら `new_at` は拒否し、FlushAck の根拠にしない。
+    #[test]
+    fn io2_new_at_rejects_file_not_linked_under_path() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let a = dir.join(format!("fandhe-io-new-at-a-{pid}"));
+        let b = dir.join(format!("fandhe-io-new-at-b-{pid}"));
+        let file = File::create(&a).expect("create a");
+        let _other = File::create(&b).expect("create b");
+        // 存在しないパス・別実体のパスはどちらも拒否される。
+        let gone = AppendFileSink::new_at(file.try_clone().expect("clone"), &dir.join("no-such"));
+        let other = AppendFileSink::new_at(file, &b);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+        assert_eq!(
+            gone.err().map(|err| err.code()),
+            Some(IoErrorCode::Internal)
+        );
+        assert_eq!(
+            other.err().map(|err| err.code()),
+            Some(IoErrorCode::Internal)
+        );
     }
 
     /// IO-2・IO-3（Codex #1146 P0）: persist 済みの sink に `with_parent_dirs` を
@@ -1504,14 +1583,6 @@ mod tests {
             .err()
             .expect("missing dir must be rejected");
         assert_eq!(err.code(), IoErrorCode::Internal);
-    }
-
-    fn tempfile_for_new_at() -> File {
-        let path =
-            std::env::temp_dir().join(format!("fandhe-io-new-at-rel-{}", std::process::id()));
-        let file = File::create(&path).expect("create temp file");
-        let _ = std::fs::remove_file(&path);
-        file
     }
 
     /// IO-2（#824 A4）・REPAIR-5: syncfs の同時実行数の枠が埋まったまま FLUSH の

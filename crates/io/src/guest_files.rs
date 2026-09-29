@@ -410,11 +410,10 @@ fn open_root_handle(root: &Path) -> std::io::Result<File> {
     const FLAGS: u32 = 0x0200_0000;
     // FILE_SHARE_READ | FILE_SHARE_WRITE（FILE_SHARE_DELETE は含めない）
     const SHARE: u32 = 0x1 | 0x2;
-    // 書き込み権限付き: 作成側がこのハンドルを複製してディレクトリ同期
-    // （`FlushFileBuffers`。書き込み権限が必要）に使い、パスを開き直さないため。
+    // 読み取り専用: 走査・固定にだけ使い、書き込み権限を要求しない（書込不可の
+    // ルート・祖先でも走査できるように）。同期用のハンドルは作成時に別に開く。
     OpenOptions::new()
         .read(true)
-        .write(true)
         .custom_flags(FLAGS)
         .share_mode(SHARE)
         .open(root)
@@ -591,11 +590,9 @@ fn open_pinned_dir(path: &Path) -> std::io::Result<Option<File>> {
     const SHARE: u32 = 0x1 | 0x2;
     // FILE_ATTRIBUTE_REPARSE_POINT
     const REPARSE: u32 = 0x400;
-    // 書き込み権限付き: 作成側がこのハンドルを複製してディレクトリ同期に使い、
-    // 固定後にパスを開き直さない（別ディレクトリへの差し替え防止。IO-2・IO-3）。
+    // 読み取り専用（同期用ハンドルは `open_sync_dir` が別に開く）。
     let dir = OpenOptions::new()
         .read(true)
-        .write(true)
         .custom_flags(FLAGS)
         .share_mode(SHARE)
         .open(path)?;
@@ -606,11 +603,35 @@ fn open_pinned_dir(path: &Path) -> std::io::Result<Option<File>> {
     Ok(Some(dir))
 }
 
-/// 固定済みディレクトリのハンドルを複製する（同一実体。パスの再解決をしない）。
+/// 同期用（`FlushFileBuffers`。書き込み権限が必要）のディレクトリハンドルを開く。
+/// 呼び出し側が祖先を固定している間に開くため、パスは固定済みの祖先の配下に留まる。
+/// reparse point を辿らず、通常ディレクトリでなければ拒否する。
+/// `FILE_SHARE_DELETE` を含めて共有するため、保持中もホスト側の改名・削除を妨げず、
+/// 改名後もハンドルは同じディレクトリ実体を指す（IO-2・IO-3）。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn dup_dir(dir: &File) -> Result<File, CreateError> {
-    dir.try_clone()
-        .map_err(|err| CreateError::Other(internal("failed to create guest file", err.kind())))
+fn open_sync_dir(path: &Path) -> Result<File, CreateError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+    const FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    const SHARE: u32 = 0x1 | 0x2 | 0x4;
+    // FILE_ATTRIBUTE_REPARSE_POINT
+    const REPARSE: u32 = 0x400;
+    let fail = |kind| CreateError::Other(internal("failed to create guest file", kind));
+    let dir = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FLAGS)
+        .share_mode(SHARE)
+        .open(path)
+        .map_err(|err| fail(err.kind()))?;
+    let meta = dir.metadata().map_err(|err| fail(err.kind()))?;
+    if !meta.is_dir() || meta.file_attributes() & REPARSE != 0 {
+        return Err(CreateError::Other(invalid(
+            "guest path ancestor is not a directory",
+        )));
+    }
+    Ok(dir)
 }
 
 /// [`create_beneath`] の失敗種別。
@@ -1212,7 +1233,7 @@ fn restore_moved(
 /// ルート相対ハンドル作成への置き換えは後続。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn create_beneath(
-    root_dir: &File,
+    _root_dir: &File,
     root: &Path,
     ancestors: &[&str],
     leaf: &str,
@@ -1220,14 +1241,21 @@ fn create_beneath(
     let mut path = root.to_path_buf();
     // 固定済みの祖先ハンドル（葉の作成が終わるまで保持する）。
     let mut pinned: Vec<File> = Vec::with_capacity(ancestors.len());
-    // 同期用の書き込み可能ハンドル（root から順。最後に反転して末端の親から返す）。
-    // パスを開き直さず、固定済みハンドルの複製（同一のディレクトリ実体を指す）を使う。
-    let mut sync_dirs: Vec<File> = Vec::with_capacity(ancestors.len().saturating_add(1));
-    sync_dirs.push(dup_dir(root_dir)?);
+    // 階層ごとのパス（root から順）と、エントリの永続化が必要か。永続化が必要なのは
+    // 本呼び出しが新設したディレクトリの親と、葉の親だけ（既存の祖先は対象外なので
+    // 書込不可でも作成できる）。
+    let mut dir_paths: Vec<PathBuf> = Vec::with_capacity(ancestors.len().saturating_add(1));
+    let mut needs_sync: Vec<bool> = Vec::with_capacity(ancestors.len().saturating_add(1));
+    dir_paths.push(path.clone());
+    needs_sync.push(false);
     for name in ancestors {
         path.push(name);
         match std::fs::create_dir(&path) {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(parent_flag) = needs_sync.last_mut() {
+                    *parent_flag = true;
+                }
+            }
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
             Err(err) => {
                 return Err(CreateError::Other(internal(
@@ -1239,10 +1267,20 @@ fn create_beneath(
         let dir = open_pinned_dir(&path)
             .map_err(|err| CreateError::Other(internal("failed to create guest file", err.kind())))?
             .ok_or_else(|| CreateError::Other(invalid("guest path ancestor is not a directory")))?;
-        sync_dirs.push(dup_dir(&dir)?);
+        dir_paths.push(path.clone());
+        needs_sync.push(false);
         pinned.push(dir);
     }
-    sync_dirs.reverse();
+    if let Some(parent_flag) = needs_sync.last_mut() {
+        *parent_flag = true;
+    }
+    // 固定している間に同期用ハンドルを開く（末端の親から root の順で返す）。
+    let mut sync_dirs: Vec<File> = Vec::with_capacity(ancestors.len().saturating_add(1));
+    for (dir_path, needed) in dir_paths.iter().zip(needs_sync.iter()).rev() {
+        if *needed {
+            sync_dirs.push(open_sync_dir(dir_path)?);
+        }
+    }
     let result = OpenOptions::new()
         .write(true)
         .create_new(true)

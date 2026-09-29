@@ -1803,6 +1803,41 @@ mod tests {
         assert_eq!(std::fs::read(t.0.join("foo")).expect("reused"), b"third");
     }
 
+    /// 移してしまった実体がハードリンクを作れないもの（ディレクトリ）なら、戻せないため
+    /// 消さずに私有ディレクトリへ残して報告する（ハードリンク非対応の FS・
+    /// `fs.protected_hardlinks` による拒否と同じ経路。fail-closed）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn io5_rollback_race_keeps_unlinkable_object_in_quarantine() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        fault::fail_scan_at(1);
+        let root = t.0.clone();
+        fault::set_hook(fault::Hook::BeforeQuarantine, move || {
+            std::fs::remove_file(root.join("foo")).expect("remove");
+            std::fs::create_dir(root.join("foo")).expect("dir");
+            std::fs::write(root.join("foo").join("inner"), b"theirs").expect("inner");
+        });
+        let err = c.create_file("foo").err().expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::Internal);
+        assert!(
+            err.message().starts_with(
+                "created guest file could not be rolled back (the replaced entry could not be \
+                 linked back; entry left at \".fandhe-rollback-"
+            ),
+            "{}",
+            err.message()
+        );
+        let dirs = quarantine_dirs(&t.0);
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        let kept =
+            t.0.join(dirs.first().expect("quarantine dir"))
+                .join("entry");
+        assert_eq!(std::fs::read(kept.join("inner")).expect("kept"), b"theirs");
+        assert!(!t.0.join("foo").exists());
+    }
+
     /// 件数上限は要求パスの祖先に沿って取り込む実在項目の合計に掛かる。上限以内なら
     /// ネストしたパスの既存・衝突を正しく報告する（Cursor・Codex P1 指摘への対応後の
     /// 契約）。

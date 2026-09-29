@@ -1347,6 +1347,46 @@ mod tests {
             );
         }
 
+        /// IO-5・TASK-19.2: `link_beneath` は別のディレクトリハンドルへハードリンクを作り、
+        /// 既存の名前は上書きせず `AlreadyExists`。symlink は辿らずそれ自体をリンクし、
+        /// ディレクトリはリンクできない。
+        #[test]
+        fn io5_link_beneath_does_not_overwrite() {
+            use std::os::unix::fs::MetadataExt;
+            let t = TmpDir::new("ln");
+            let outside = TmpDir::new("ln-out");
+            std::fs::create_dir(t.0.join("q")).expect("q");
+            std::fs::write(t.0.join("q").join("entry"), b"theirs").expect("entry");
+            std::fs::write(t.0.join("taken"), b"other").expect("taken");
+            std::os::unix::fs::symlink(outside.0.join("victim"), t.0.join("q").join("l"))
+                .expect("symlink");
+            let root = t.open();
+            let q = open_dir_beneath(&root, "q").expect("open q");
+            assert_eq!(link_beneath(&q, "entry", &root, "back"), Ok(()));
+            assert_eq!(std::fs::read(t.0.join("back")).expect("back"), b"theirs");
+            assert_eq!(
+                std::fs::metadata(t.0.join("back")).expect("meta").ino(),
+                std::fs::metadata(t.0.join("q").join("entry"))
+                    .expect("meta")
+                    .ino()
+            );
+            assert_eq!(
+                link_beneath(&q, "entry", &root, "taken"),
+                Err(BeneathError::AlreadyExists)
+            );
+            assert_eq!(std::fs::read(t.0.join("taken")).expect("taken"), b"other");
+            assert_eq!(link_beneath(&q, "l", &root, "l2"), Ok(()));
+            assert!(
+                std::fs::symlink_metadata(t.0.join("l2"))
+                    .expect("l2")
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(!outside.0.join("victim").exists());
+            assert!(link_beneath(&root, "q", &root, "q2").is_err());
+            assert!(!t.0.join("q2").exists());
+        }
+
         /// IO-5・TASK-19.2: `unlink_beneath` は通常ファイル・空ディレクトリを消し、
         /// 空でないディレクトリは消さない。
         #[test]

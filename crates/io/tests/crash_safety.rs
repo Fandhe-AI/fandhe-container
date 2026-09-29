@@ -132,15 +132,43 @@ mod unix {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod other {
-    use std::process::Command;
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// 子プロセス終了の待機上限（REPAIR-5: 相手の応答を待つ処理には期限を設ける）。
+    const EXIT_WAIT: Duration = Duration::from_secs(15);
 
     /// IO-3・TASK-18.1.1: UDS 未対応 OS では終了コード 5 と UNIMPLEMENTED を返す。
     #[test]
     fn io3_crash_test_server_reports_unsupported_platform() {
-        let out = Command::new(env!("CARGO_BIN_EXE_crash_test_server"))
-            .output()
+        let mut child = Command::new(env!("CARGO_BIN_EXE_crash_test_server"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
             .expect("crash_test_server must spawn");
-        assert_eq!(out.status.code(), Some(5));
-        assert!(String::from_utf8_lossy(&out.stderr).contains("UNIMPLEMENTED"));
+        // 期限付きの try_wait ループ。超過時は kill + wait して孤児とハングを防ぐ
+        let deadline = Instant::now() + EXIT_WAIT;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait must succeed") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("crash_test_server must exit within the deadline");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("stderr must be piped")
+            .read_to_string(&mut stderr)
+            .expect("stderr must be readable");
+        assert_eq!(status.code(), Some(5), "stderr: {stderr}");
+        assert!(stderr.contains("UNIMPLEMENTED"), "stderr: {stderr}");
     }
 }

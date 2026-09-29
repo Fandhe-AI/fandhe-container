@@ -302,7 +302,7 @@ jobs:
 
       - name: 結合試験のビルド（ステージ 3。実行タイムアウトの時間枠を消費しないよう分離）
         if: steps.count.outputs.count != '0' && env.HANG_PROBE != 'true'
-        run: cargo test --workspace --test '*' --no-run
+        run: cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server --no-run
 
       - name: ハングプローブ crate の生成（workflow_dispatch の hang-probe=true 時のみ）
         if: env.HANG_PROBE == 'true'
@@ -359,7 +359,7 @@ jobs:
             echo "::notice::integration test targets: 0 (nothing to run)"
             exit 0
           fi
-          cargo test --workspace --test '*'
+          cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server
 
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）

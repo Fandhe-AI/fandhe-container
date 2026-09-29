@@ -37,6 +37,8 @@
 //!   1 階層ずつ「作成 → reparse point を辿らず `FILE_SHARE_DELETE` なしで開いて
 //!   保持 → 通常ディレクトリか確認」で固定し、固定済みの祖先の配下へパス結合で
 //!   葉を作る（保持ハンドルが改名・削除・差し替えを OS に拒否させる。REPAIR-3）。
+//!   共有ルート自体が symlink のときは構築時に 1 回だけ正規化し、以降のパス結合は
+//!   その正規パス（保持ハンドルと同じ実体）から始めて元のルートは再解決しない。
 //! - 既存項目の取り込み: 索引は API 経由の登録だけでなく、作成のたびに祖先
 //!   ディレクトリの実在エントリを毎回読み直して取り込む（別プロセスが後から
 //!   足した項目も検出する。走査中の読み取り失敗や、既存項目どうしの大文字小文字衝突は作成を中止する）。共有
@@ -74,6 +76,11 @@ pub const MAX_TRACKED_GUEST_PATHS: usize = 1 << 20;
 /// （モジュール doc 参照。IO-5・TASK-19.2）。
 pub struct GuestFileCreator {
     root: PathBuf,
+    /// パス結合が必要な Windows の作成・走査が使う、symlink 解決済みの共有ルート。
+    /// 構築時に 1 回だけ解決し、`root` のパスは再解決しない（`root` 自体が symlink
+    /// でも、構築後に参照先を差し替えて共有範囲外へ書かせない。IO-5）。Linux /
+    /// macOS はハンドル起点のため `root` と同値で、パス解決には使われない。
+    base: PathBuf,
     /// 構築時に開いた共有ルートのディレクトリハンドル。走査・作成の起点はこの
     /// ハンドルで、`root` のパスは開き直さない（検証後にパスや親のエントリが
     /// 差し替えられても共有範囲外へ出ない。security.md の境界。IO-5）。
@@ -125,7 +132,13 @@ impl GuestFileCreator {
         if max_tracked == 0 || max_tracked > MAX_TRACKED_GUEST_PATHS {
             return Err(invalid("max tracked guest paths is out of range"));
         }
-        let root_dir = open_root_handle(&root).map_err(|err| {
+        let base = resolve_root_base(&root).map_err(|err| {
+            IoError::new(
+                IoErrorCode::InvalidArgument,
+                format!("guest file root is not accessible ({:?})", err.kind()),
+            )
+        })?;
+        let root_dir = open_root_handle(&base).map_err(|err| {
             IoError::new(
                 IoErrorCode::InvalidArgument,
                 format!("guest file root is not accessible ({:?})", err.kind()),
@@ -142,6 +155,7 @@ impl GuestFileCreator {
         }
         Ok(Self {
             root,
+            base,
             root_dir,
             max_tracked,
             index: Mutex::new(IndexState {
@@ -197,7 +211,7 @@ impl GuestFileCreator {
         // 確定する（作成失敗で実体のないパスが索引に残らないようにする）。
         set.check_insertable(guest_path)?;
 
-        let file = match create_beneath(&self.root_dir, &self.root, ancestors, leaf) {
+        let file = match create_beneath(&self.root_dir, &self.base, ancestors, leaf) {
             Ok(file) => file,
             Err(CreateError::Exists) => {
                 // 実体が既に存在する。索引にも確定させたうえで報告する。
@@ -226,7 +240,7 @@ impl GuestFileCreator {
     /// 既存項目どうしの大文字小文字衝突は `AlreadyExists`
     /// （IO-5 の検査を完了できないまま作成へ進まない。fail-closed）。
     fn seed_existing(&self, state: &mut IndexState, ancestors: &[&str]) -> Result<(), IoError> {
-        let mut cursor = ScanCursor::root(&self.root_dir, &self.root)?;
+        let mut cursor = ScanCursor::root(&self.root_dir, &self.base)?;
         let mut prefix = String::new();
         for level in 0..=ancestors.len() {
             let entries = cursor.read_entries(self.max_tracked)?;
@@ -263,6 +277,19 @@ impl GuestFileCreator {
         }
         Ok(())
     }
+}
+
+/// パス結合に使う共有ルートを決める。Windows では symlink を構築時に解決した
+/// 正規パスを返し（以降の作成・走査は元の `root` を再解決しない）、それ以外は
+/// ハンドル起点のため `root` をそのまま返す。
+#[cfg(windows)]
+fn resolve_root_base(root: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(root)
+}
+
+#[cfg(not(windows))]
+fn resolve_root_base(root: &Path) -> std::io::Result<PathBuf> {
+    Ok(root.to_path_buf())
 }
 
 /// 共有ルートを開く（symlink は構築時のこの 1 回だけ辿る）。Windows では
@@ -720,6 +747,28 @@ mod tests {
         assert_eq!(err.code(), IoErrorCode::AlreadyExists);
         assert!(err.message().starts_with("case-insensitive path collision"));
         assert_eq!(entries(&t.0), 2);
+    }
+
+    /// Windows: root 自体が symlink でも、構築後に参照先を差し替えて範囲外へ
+    /// 書けない（作成は構築時に解決した実体に留まる。IO-5。symlink 作成権限が
+    /// 無い環境では skip 相当で return する）。
+    #[cfg(windows)]
+    #[test]
+    fn io5_windows_swapped_root_symlink_does_not_escape() {
+        let t = Tmp::new();
+        let real = t.0.join("real");
+        let outside = Tmp::new();
+        let link = t.0.join("link");
+        std::fs::create_dir(&real).expect("real");
+        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+            return;
+        }
+        let c = GuestFileCreator::new(link.clone()).expect("creator");
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::os::windows::fs::symlink_dir(&outside.0, &link);
+        c.create_file("sub/f").expect("create");
+        assert_eq!(entries(&outside.0), 0);
+        assert!(real.join("sub").join("f").exists());
     }
 
     #[test]

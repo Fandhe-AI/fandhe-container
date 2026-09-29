@@ -14,7 +14,7 @@ I/O 共有層の SIGKILL 耐性試験（`crates/io/tests/crash_safety.rs`）を�
 | テスト | kill 位置 | アサーション |
 | ------ | --------- | ------------ |
 | `unix::io3_flushed_data_survives_10_valid_sigkills` | 30 件書き込み後、FLUSH ACK を観測した直後 | 有効試行 10 回・損失 0 |
-| `unix::io3_unflushed_control_records_loss_without_asserting` | `batch_size=30` で通常 ACK を 30 件観測した直後（フラッシュなし） | なし（損失件数は記録のみ） |
+| `unix::io3_unflushed_control_records_loss_without_asserting` | `batch_size=30` で通常 ACK を 30 件観測した直後（フラッシュなし） | `summary.aborted == false`・有効試行 10 回・各試行のディスク照合をアサートする。損失件数だけはアサートしない（記録のみ） |
 
 - 有効試行: 所定の ACK を観測したうえで SIGKILL によりサーバーが終了した試行。それ以外は無効試行として数え直す
 - 目標は有効 10 回、試行上限は 30 回（`trial.rs` の `TARGET_VALID_TRIALS` / `MAX_ATTEMPTS`）

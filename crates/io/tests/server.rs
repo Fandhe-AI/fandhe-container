@@ -1082,6 +1082,472 @@ mod unix {
         assert!(line.contains("\"reason\":\"failure\""), "line={line}");
         assert!(line.contains("\"accept_aborted_retries\":0"), "line={line}");
     }
+
+    /// 分割（split。#1118・IO-1・P1-3・REPAIR-5・TASK-13.4）の結合試験。
+    mod split {
+        use std::sync::mpsc;
+
+        use fandhe_container_io::{FRAME_HEADER_LEN, SplitTransport, UdsConnection, UdsServer};
+
+        use super::*;
+
+        /// bind → client connect → accept までを済ませ、server 側の接続と client 側の
+        /// stream を返す（listen 開始後の connect は accept 前でも成立する）。
+        fn connected<O, C>(
+            dir: &TempSocketDir,
+            limits: ReceiveLimits,
+            server_observer: O,
+            conn_observer: C,
+        ) -> (UdsServer<O>, UdsConnection<C>, UnixStream)
+        where
+            O: fandhe_container_io::ServerObserver,
+            C: fandhe_container_io::ServerObserver,
+        {
+            let mut server = UdsServer::bind(&dir.socket_path(), limits, server_observer)
+                .expect("bind must succeed on a private, empty path");
+            let client = UnixStream::connect(dir.socket_path()).expect("client must connect");
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("client read timeout must be settable");
+            let connection = server
+                .accept(test_timeout(), conn_observer)
+                .expect("server must accept the client connection");
+            (server, connection, client)
+        }
+
+        fn read_frame(stream: &mut UnixStream) -> Frame {
+            let mut header = [0u8; FRAME_HEADER_LEN];
+            stream
+                .read_exact(&mut header)
+                .expect("client must read the frame header");
+            let parsed = fandhe_container_io::FrameHeader::from_bytes(header)
+                .expect("frame header must be valid");
+            let mut body = vec![0u8; parsed.body_len()];
+            stream
+                .read_exact(&mut body)
+                .expect("client must read the frame body");
+            Frame::decode_body(parsed, &body).expect("frame must decode")
+        }
+
+        /// IO-1・#1118（受け入れ基準 1）: 分割後の送信側・受信側を別スレッドから並行に使い、
+        /// 64 件の Write に対し送信順どおり 64 件の Ack を返せる。
+        #[test]
+        fn io1_1118_split_halves_pipeline_concurrently() {
+            const N: u8 = 64;
+            let dir = TempSocketDir::new();
+            let (_server, connection, mut client) = connected(
+                &dir,
+                ReceiveLimits::default(),
+                NoopServerObserver,
+                NoopServerObserver,
+            );
+            let (mut send, mut recv) = connection.split().expect("split must succeed");
+
+            let (tx, rx) = mpsc::channel::<u8>();
+            let recv_thread = std::thread::spawn(move || {
+                for _ in 0..N {
+                    let frame = recv
+                        .recv_frame(test_timeout())
+                        .expect("recv half must receive a Write frame");
+                    assert_eq!(frame.kind(), FrameKind::Write);
+                    let id = *frame.payload().first().expect("payload must hold an id");
+                    tx.send(id).expect("send thread must be alive");
+                }
+                recv
+            });
+            let send_thread = std::thread::spawn(move || {
+                for _ in 0..N {
+                    let id = rx.recv().expect("recv thread must forward ids");
+                    let ack = Frame::new(FrameKind::Ack, vec![id]).expect("ack must construct");
+                    send.send_frame(&ack, test_timeout())
+                        .expect("send half must send the ack");
+                }
+                send
+            });
+
+            let mut writer = client.try_clone().expect("client stream must clone");
+            let client_writer = std::thread::spawn(move || {
+                for i in 0..N {
+                    let frame = Frame::new(FrameKind::Write, vec![i]).expect("frame must build");
+                    writer
+                        .write_all(&frame.encode())
+                        .expect("client write must succeed");
+                }
+            });
+            for i in 0..N {
+                let ack = read_frame(&mut client);
+                assert_eq!(ack.kind(), FrameKind::Ack);
+                assert_eq!(ack.payload(), &[i]);
+            }
+            client_writer.join().expect("client writer must not panic");
+            let _recv = recv_thread.join().expect("recv thread must not panic");
+            let _send = send_thread.join().expect("send thread must not panic");
+        }
+
+        /// P1-3・#1118（受け入れ基準 2）: 受信側がエラーになると、送信側は I/O なしで
+        /// `Unavailable` になり、client は接続の shutdown（EOF）を観測する。
+        #[test]
+        fn p1_3_1118_recv_half_error_poisons_send_half() {
+            let dir = TempSocketDir::new();
+            let (_server, connection, mut client) = connected(
+                &dir,
+                ReceiveLimits::default(),
+                NoopServerObserver,
+                NoopServerObserver,
+            );
+            let (mut send, mut recv) = connection.split().expect("split must succeed");
+
+            client
+                .write_all(&[0xFFu8; FRAME_HEADER_LEN])
+                .expect("client garbage write must succeed");
+            let err = recv
+                .recv_frame(test_timeout())
+                .expect_err("a corrupted header must be rejected");
+            assert_ne!(err.code(), IoErrorCode::Unavailable);
+
+            let ack = Frame::new(FrameKind::Ack, vec![1]).expect("ack must construct");
+            let err = send
+                .send_frame(&ack, test_timeout())
+                .expect_err("send half must be poisoned by the recv half error");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+            let err = recv
+                .recv_frame(test_timeout())
+                .expect_err("recv half stays poisoned");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+
+            let mut buf = [0u8; 1];
+            let n = client
+                .read(&mut buf)
+                .expect("client must observe EOF, not a timeout");
+            assert_eq!(n, 0);
+        }
+
+        /// P1-3・REPAIR-5・#1118（受け入れ基準 2）: 送信側のエラーは、ブロック中の
+        /// 受信側を期限（5 秒）を待たず速やかに `Unavailable` で起こす。
+        #[test]
+        fn p1_3_1118_send_half_error_poisons_recv_half_and_wakes_it() {
+            let dir = TempSocketDir::new();
+            let (_server, connection, client) = connected(
+                &dir,
+                ReceiveLimits::default(),
+                NoopServerObserver,
+                NoopServerObserver,
+            );
+            let (mut send, mut recv) = connection.split().expect("split must succeed");
+
+            let recv_thread = std::thread::spawn(move || {
+                let result = recv.recv_frame(test_timeout());
+                (recv, result, Instant::now())
+            });
+            std::thread::sleep(Duration::from_millis(200));
+
+            // client は何も読まないため、送信バッファを溢れさせる大きさのフレームは
+            // 期限で Timeout になる（EPIPE に依存せず Linux / macOS で同じ結果になる）。
+            let big = Frame::new(FrameKind::Write, vec![0x5au8; 16 * 1024 * 1024])
+                .expect("large frame must construct");
+            let short = IoTimeout::new(Duration::from_millis(300)).expect("300ms must be valid");
+            let err = send
+                .send_frame(&big, short)
+                .expect_err("send to a non-reading peer must time out");
+            assert_eq!(err.code(), IoErrorCode::Timeout);
+            let failed_at = Instant::now();
+
+            let (mut recv, result, woke_at) = recv_thread.join().expect("recv must not panic");
+            let err = result.expect_err("the blocked recv must be woken with an error");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+            assert!(
+                woke_at.saturating_duration_since(failed_at) < Duration::from_secs(2),
+                "recv must wake promptly after the send half failed"
+            );
+            let err = recv
+                .recv_frame(test_timeout())
+                .expect_err("recv half stays poisoned");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+            drop(client);
+        }
+
+        /// REPAIR-5・#1118: `with_observer` のクロージャが保持中でも、送信側の
+        /// `send_frame` は観測ロックを待たず期限内に完了する。
+        #[test]
+        fn repair5_1118_send_half_does_not_block_on_held_observer() {
+            let dir = TempSocketDir::new();
+            let (_server, connection, mut client) = connected(
+                &dir,
+                ReceiveLimits::default(),
+                NoopServerObserver,
+                NoopServerObserver,
+            );
+            let (mut send, recv) = connection.split().expect("split must succeed");
+            let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                recv.with_observer(|_| {
+                    held_tx.send(()).expect("held signal");
+                    let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                });
+                recv
+            });
+            held_rx.recv().expect("observer must be held");
+
+            let ack = Frame::new(FrameKind::Ack, vec![7]).expect("ack must construct");
+            let started = Instant::now();
+            send.send_frame(&ack, test_timeout())
+                .expect("send must succeed while the observer is held");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "send must not wait for the observer lock"
+            );
+            release_tx.send(()).expect("release");
+            let _recv = holder.join().expect("holder must not panic");
+            let mut buf = [0u8; 1];
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            assert!(client.read(&mut buf).expect("client read") == 1);
+        }
+
+        /// REPAIR-4・#1118: `with_observer` のクロージャが保持中に送信側が I/O を終えても、
+        /// そのイベントは欠落せず、保持側が解放した後にフックへ適用される。
+        #[test]
+        fn a3_1118_event_during_held_observer_is_not_lost() {
+            let dir = TempSocketDir::new();
+            let (_server, connection, mut client) = connected(
+                &dir,
+                ReceiveLimits::default(),
+                NoopServerObserver,
+                JsonLinesServerObserver::new(),
+            );
+            let (mut send, recv) = connection.split().expect("split must succeed");
+            let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                recv.with_observer(|_| {
+                    held_tx.send(()).expect("held signal");
+                    let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                });
+                recv
+            });
+            held_rx.recv().expect("observer must be held");
+
+            let ack = Frame::new(FrameKind::Ack, vec![7]).expect("ack must construct");
+            send.send_frame(&ack, test_timeout())
+                .expect("send must succeed while the observer is held");
+            release_tx.send(()).expect("release");
+            let recv = holder.join().expect("holder must not panic");
+
+            let lines = recv.with_observer(|o| o.drain_lines());
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| l.contains("\"op\":\"send\"") && l.contains("\"outcome\":\"ok\""))
+                    .count(),
+                1,
+                "the send event must be preserved exactly once: {lines:?}"
+            );
+            let mut buf = [0u8; 1];
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            assert!(client.read(&mut buf).expect("client read") == 1);
+        }
+
+        /// REPAIR-5・#1118（受け入れ基準 3）: 沈黙する相手に対し受信側は期限で `Timeout`、
+        /// 以後は `Unavailable`。
+        #[test]
+        fn repair5_1118_recv_half_times_out_on_silent_peer() {
+            let dir = TempSocketDir::new();
+            let (_server, connection, _client) = connected(
+                &dir,
+                ReceiveLimits::default(),
+                NoopServerObserver,
+                NoopServerObserver,
+            );
+            let (_send, mut recv) = connection.split().expect("split must succeed");
+
+            let timeout = IoTimeout::new(Duration::from_millis(300)).expect("300ms must be valid");
+            let started = Instant::now();
+            let err = recv
+                .recv_frame(timeout)
+                .expect_err("recv from a silent peer must time out");
+            let elapsed = started.elapsed();
+            assert_eq!(err.code(), IoErrorCode::Timeout);
+            assert!(elapsed >= Duration::from_millis(300), "elapsed={elapsed:?}");
+            assert!(elapsed <= Duration::from_secs(2), "elapsed={elapsed:?}");
+
+            let err = recv
+                .recv_frame(test_timeout())
+                .expect_err("recv half must be poisoned after a timeout");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+        }
+
+        /// TASK-13.4・#1118（受け入れ基準 3）: 受信側は bind 時の `ReceiveLimits` を引き継ぎ、
+        /// 上限超過を本体を読む前に拒否する。
+        #[test]
+        fn f_1118_recv_half_honors_receive_limits_passed_to_bind() {
+            let dir = TempSocketDir::new();
+            let small = ReceiveLimits::new(8, 8).expect("8 bytes must be a valid limit");
+            let (_server, connection, mut client) =
+                connected(&dir, small, NoopServerObserver, NoopServerObserver);
+            let (_send, mut recv) = connection.split().expect("split must succeed");
+
+            let frame = Frame::new(FrameKind::Write, vec![0u8; 9]).expect("frame must build");
+            let encoded = frame.encode();
+            let header = encoded
+                .get(..FRAME_HEADER_LEN)
+                .expect("encoded frame must contain a full header");
+            client
+                .write_all(header)
+                .expect("client header write must succeed");
+
+            let err = recv
+                .recv_frame(test_timeout())
+                .expect_err("a Write frame over the bind-time limit must be rejected");
+            assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+            assert!(err.message().contains('8'));
+            let err = recv
+                .recv_frame(test_timeout())
+                .expect_err("recv half must be poisoned");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+        }
+
+        /// IO-1・#1118: 送信側を drop すると書き込み側が half-close され client は EOF を
+        /// 読むが、受信側はその後も client からのフレームを受信できる。
+        #[test]
+        fn io1_1118_send_half_drop_half_closes_write_side() {
+            let dir = TempSocketDir::new();
+            let (_server, connection, mut client) = connected(
+                &dir,
+                ReceiveLimits::default(),
+                NoopServerObserver,
+                NoopServerObserver,
+            );
+            let (send, mut recv) = connection.split().expect("split must succeed");
+            drop(send);
+
+            let mut buf = [0u8; 1];
+            let n = client
+                .read(&mut buf)
+                .expect("client must observe EOF after the send half is dropped");
+            assert_eq!(n, 0);
+
+            let frame = Frame::new(FrameKind::Write, vec![7, 8]).expect("frame must build");
+            client
+                .write_all(&frame.encode())
+                .expect("client write must still succeed");
+            let received = recv
+                .recv_frame(test_timeout())
+                .expect("recv half must still receive after the send half is dropped");
+            assert_eq!(received.kind(), FrameKind::Write);
+            assert_eq!(received.payload(), &[7, 8]);
+        }
+
+        /// IO-1・REPAIR-5・#1118（O_NONBLOCK 共有の不変条件）: 相手が切断済みなら送信側は
+        /// 期限（5 秒）を待たず速やかに `Unavailable` を返す。
+        #[test]
+        fn io1_1118_send_half_fails_fast_after_peer_close() {
+            let dir = TempSocketDir::new();
+            let (_server, connection, client) = connected(
+                &dir,
+                ReceiveLimits::default(),
+                NoopServerObserver,
+                NoopServerObserver,
+            );
+            let (mut send, _recv) = connection.split().expect("split must succeed");
+            drop(client);
+
+            let ack = Frame::new(FrameKind::Ack, vec![1]).expect("ack must construct");
+            let started = Instant::now();
+            let err = send
+                .send_frame(&ack, test_timeout())
+                .expect_err("send to a closed peer must fail");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        /// REPAIR-4・#1118: 両半分は 1 つの観測フックを共有し、Recv / Send の成功・失敗・
+        /// poison 拒否がすべて同じフックに記録される。
+        #[test]
+        fn a3_1118_split_halves_share_observer() {
+            let dir = TempSocketDir::new();
+            let (_server, connection, mut client) = connected(
+                &dir,
+                ReceiveLimits::default(),
+                NoopServerObserver,
+                JsonLinesServerObserver::new(),
+            );
+            let (mut send, mut recv) = connection.split().expect("split must succeed");
+
+            let request = Frame::new(FrameKind::Write, vec![1]).expect("frame must build");
+            client
+                .write_all(&request.encode())
+                .expect("client write must succeed");
+            recv.recv_frame(test_timeout())
+                .expect("recv half must receive the Write frame");
+            let ack = Frame::new(FrameKind::Ack, vec![1]).expect("ack must construct");
+            send.send_frame(&ack, test_timeout())
+                .expect("send half must send the ack");
+
+            client
+                .write_all(&[0xFFu8; FRAME_HEADER_LEN])
+                .expect("client garbage write must succeed");
+            recv.recv_frame(test_timeout())
+                .expect_err("a corrupted header must be rejected");
+            send.send_frame(&ack, test_timeout())
+                .expect_err("send half must be poisoned");
+
+            // どちらの半分から見ても同じフックである。
+            let lines = send.with_observer(|o| o.drain_lines());
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("\"op\":\"recv\"") && l.contains("\"outcome\":\"ok\"")),
+                "expected a successful recv event: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("\"op\":\"send\"") && l.contains("\"outcome\":\"ok\"")),
+                "expected a successful send event: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.contains("\"reason\":\"failure\"")),
+                "expected a failed recv event: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("\"reason\":\"rejected_poisoned\"")),
+                "expected a rejected_poisoned send event: {lines:?}"
+            );
+            let rest = recv.with_observer(|o| o.drain_lines());
+            assert!(
+                rest.is_empty(),
+                "the hook is shared, so it is drained: {rest:?}"
+            );
+        }
+
+        /// P1-3・#1118: poison 済みの接続の `split` は `Unavailable`。
+        #[test]
+        fn p1_3_1118_split_rejects_poisoned_connection() {
+            let dir = TempSocketDir::new();
+            let (_server, mut connection, mut client) = connected(
+                &dir,
+                ReceiveLimits::default(),
+                NoopServerObserver,
+                NoopServerObserver,
+            );
+            client
+                .write_all(&[0xFFu8; FRAME_HEADER_LEN])
+                .expect("client garbage write must succeed");
+            connection
+                .recv_frame(test_timeout())
+                .expect_err("a corrupted header must be rejected");
+            let err = connection
+                .split()
+                .expect_err("a poisoned connection must not split");
+            assert_eq!(err.code(), IoErrorCode::Unavailable);
+        }
+    }
 }
 
 /// TASK-13.2.1: UDS が使えない OS（Windows）での期待挙動。CI 通過のための

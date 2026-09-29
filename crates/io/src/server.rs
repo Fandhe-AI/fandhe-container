@@ -144,6 +144,35 @@
 //! 限られ、それらは窓がなくても同じファイルを直接操作できるため、新たな
 //! 権限昇格の経路にはならない。
 //!
+//! # 分割（split。#1118・IO-1・P1-3・REPAIR-5）
+//!
+//! [`UdsConnection`] は [`SplitTransport`] を実装し、[`UdsSendHalf`]・[`UdsRecvHalf`] へ
+//! 分けて別スレッドから並行に使える（契約の全体は [`SplitTransport`] を参照）。
+//! 実装上の要点:
+//!
+//! - fd は `UnixStream::try_clone` で複製する。poison は `SharedPoison`（内部型）で共有する。
+//!   各呼び出しは (1) I/O の前に共有 poison を確認して立っていれば I/O せず
+//!   `Unavailable`、(2) I/O が `Err` なら poison を立てて `shutdown(Both)`（もう片側で
+//!   ブロック中の read / write を起こし、EOF / EPIPE で速やかに `Unavailable` にする）、
+//!   (3) I/O 完了後に poison を再確認し、立っていれば結果（受信済みフレームを含む）を
+//!   捨てて `Unavailable` を返す（死んだ接続のフレームを上位へ渡さない）。
+//! - 観測フックは両半分で 1 つを `Arc<Mutex<_>>` 共有する（1 接続に 1 フック）。ロックは
+//!   `on_event` の間だけ取り、I/O をまたいで保持しない。ロック保持中の通知は
+//!   有界の保留キューへ積み、保持側が解放時に排出する（欠落させない）。キューが満杯の
+//!   ときは `(op, kind, outcome, code)` ごとの集約イベント（`ServerEvent::coalesced`）へ
+//!   合算し、操作別・結果別の件数と所要時間（最大・合計）を残す（REPAIR-4）。
+//! - 送信側の drop は poison されていなければ `shutdown(Write)`（half-close）を呼ぶ。
+//!   受信側の drop は何もしない。
+//! - **`O_NONBLOCK` 共有の不変条件**: `O_NONBLOCK` は複製した fd と共有される
+//!   （open file description のフラグ）。受信側の drain モード（`ReadWait`）が
+//!   nonblocking に切り替えるのは、macOS で `set_read_timeout` が `EINVAL` を返した
+//!   とき、すなわち相手が送受信とも shutdown 済みと見なせるときだけである。この
+//!   状態の送信は `set_write_timeout` の `EINVAL` か write の EPIPE で直ちに
+//!   `Unavailable` になり、仮に `WouldBlock` で再試行しても期限（REPAIR-5）で
+//!   打ち切られる。`SO_RCVTIMEO` / `SO_SNDTIMEO` は別オプションで互いに干渉しない。
+//!   drain を `recv(MSG_DONTWAIT)` に置き換えて fd の状態を変えない方式は `unsafe` を
+//!   伴うため本件の範囲外（要起票）。
+//!
 //! # OS 対応
 //!
 //! Linux / macOS では [`UdsServer`]・[`UdsConnection`] は実際に UDS を bind・
@@ -168,7 +197,6 @@
 //!   で、受信時点の「排出済みだが未書き込み」のキューは常に空になるため、
 //!   この `0` は現行の呼び出し方（1 バッチ完結の同期処理）の下で構造上正確
 //!   （`crates/io/src/writeback.rs` モジュール doc「受信上限」節参照）
-//! - 送信側と受信側の分割 API（`try_clone` を使った split。TASK-12）
 //! - クライアント側の UDS 接続（`connect`）・[`crate::client::PipelineClient`]
 //!   との本番結合
 //! - vsock（microVM）トランスポート
@@ -195,14 +223,19 @@
 //! [`IoErrorCode::Unavailable`] へ変換する。本 library を Rust 以外の実行時
 //! から使う場合はこの前提が崩れうるため範囲外とする。
 
+use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::error::{IoError, IoErrorCode};
-use crate::observe::{SendEventError, ServerEvent, ServerObserver, ServerOp, ServerOutcome};
+use crate::observe::{
+    CoalescedServerEvents, SendEventError, ServerEvent, ServerObserver, ServerOp, ServerOutcome,
+    truncate_message_bytes,
+};
 use crate::protocol::{Frame, FrameKind};
 use crate::recv_limits::ReceiveLimits;
-use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
+use crate::transport::{FrameReceiver, FrameSender, IoTimeout, SharedPoison, SplitTransport};
 
 /// [`imp::ServerInner::accept`] の結果に、受付ループ内で再試行した回数
 /// （[`crate::observe::ServerEvent::accept_aborted_retries`]・
@@ -415,6 +448,7 @@ impl<O: ServerObserver> UdsServer<O> {
                 accept_aborted_retries: attempt.aborted_retries,
                 peer_credential_rejections: attempt.peer_credential_rejections,
                 peer_uid: None,
+                coalesced: None,
                 error: None,
             }),
             Err(err) => self.observer.on_event(&ServerEvent {
@@ -425,6 +459,7 @@ impl<O: ServerObserver> UdsServer<O> {
                 accept_aborted_retries: attempt.aborted_retries,
                 peer_credential_rejections: attempt.peer_credential_rejections,
                 peer_uid: None,
+                coalesced: None,
                 error: Some(SendEventError {
                     code: err.code(),
                     message: err.message(),
@@ -462,8 +497,9 @@ impl<O: ServerObserver> UdsServer<O> {
 ///
 /// [`FrameSender`]・[`FrameReceiver`] を実装し（blanket impl により
 /// [`crate::transport::FrameTransport`] にもなる）、単一スレッドで `&mut self`
-/// を使う前提とする（`transport` モジュールの契約どおり。送信側・受信側の
-/// 分割は TASK-12 の範囲）。
+/// を使う前提とする（`transport` モジュールの契約どおり。送信側・受信側を別スレッドで
+/// 並行に使う場合は [`SplitTransport::split`] で [`UdsSendHalf`]・[`UdsRecvHalf`] へ
+/// 分ける。#1118）。
 ///
 /// `send_frame` / `recv_frame` のいずれかが一度でも `Err` を返すと以後
 /// [`IoErrorCode::Unavailable`] を返し続ける（P1-3・REPAIR-5・REPAIR-6。
@@ -518,16 +554,7 @@ impl<C: ServerObserver> UdsConnection<C> {
     /// 成功イベントを観測フックへ通知する（`send_frame`・`recv_frame` の成功
     /// 分岐で共有。TASK-13.2.1・#820。REPAIR-4）。
     fn notify_success(&mut self, op: ServerOp, kind: Option<FrameKind>, latency: Duration) {
-        self.observer.on_event(&ServerEvent {
-            op,
-            kind,
-            outcome: ServerOutcome::Success,
-            latency,
-            accept_aborted_retries: 0,
-            peer_credential_rejections: 0,
-            peer_uid: None,
-            error: None,
-        });
+        emit_success(&mut self.observer, op, kind, latency);
     }
 
     /// 失敗イベントを観測フックへ通知する（`send_frame`・`recv_frame` の失敗
@@ -542,19 +569,7 @@ impl<C: ServerObserver> UdsConnection<C> {
         latency: Duration,
         err: &IoError,
     ) {
-        self.observer.on_event(&ServerEvent {
-            op,
-            kind,
-            outcome,
-            latency,
-            accept_aborted_retries: 0,
-            peer_credential_rejections: 0,
-            peer_uid: None,
-            error: Some(SendEventError {
-                code: err.code(),
-                message: err.message(),
-            }),
-        });
+        emit_failure(&mut self.observer, op, kind, outcome, latency, err);
     }
 
     /// [`UdsServer::accept`] で渡した観測フックを参照する。
@@ -566,6 +581,69 @@ impl<C: ServerObserver> UdsConnection<C> {
     pub fn observer_mut(&mut self) -> &mut C {
         &mut self.observer
     }
+}
+
+/// 成功イベントを組み立てて `observer` へ通知する（[`UdsConnection`] と分割後の
+/// 両半分が共有。REPAIR-4）。
+fn emit_success<C: ServerObserver>(
+    observer: &mut C,
+    op: ServerOp,
+    kind: Option<FrameKind>,
+    latency: Duration,
+) {
+    emit_event(
+        observer,
+        op,
+        kind,
+        ServerOutcome::Success,
+        latency,
+        None,
+        None,
+    );
+}
+
+/// 失敗イベントを組み立てて `observer` へ通知する（[`emit_success`] の失敗版）。
+fn emit_failure<C: ServerObserver>(
+    observer: &mut C,
+    op: ServerOp,
+    kind: Option<FrameKind>,
+    outcome: ServerOutcome,
+    latency: Duration,
+    err: &IoError,
+) {
+    emit_event(
+        observer,
+        op,
+        kind,
+        outcome,
+        latency,
+        Some((err.code(), err.message())),
+        None,
+    );
+}
+
+/// 送受信のイベントを組み立てて `observer` へ通知する共通部（accept 専用の欄は常に
+/// 0 / `None`。`coalesced` は保留キューの集約値を出すときだけ `Some`。#1118）。
+fn emit_event<C: ServerObserver>(
+    observer: &mut C,
+    op: ServerOp,
+    kind: Option<FrameKind>,
+    outcome: ServerOutcome,
+    latency: Duration,
+    error: Option<(IoErrorCode, &str)>,
+    coalesced: Option<CoalescedServerEvents>,
+) {
+    observer.on_event(&ServerEvent {
+        op,
+        kind,
+        outcome,
+        latency,
+        accept_aborted_retries: 0,
+        peer_credential_rejections: 0,
+        peer_uid: None,
+        coalesced,
+        error: error.map(|(code, message)| SendEventError { code, message }),
+    });
 }
 
 /// poison 済み接続への呼び出しに返すエラー（P1-3）。
@@ -637,6 +715,670 @@ impl<C: ServerObserver> FrameReceiver for UdsConnection<C> {
             ),
         }
         self.poison_on_err(attempt.result)
+    }
+}
+
+/// 観測フックへ後から適用する保留イベント（所有データのみを持つ。`ServerEvent` の
+/// 借用を I/O 呼び出しの外へ持ち越さないため）。
+struct OwnedServerEvent {
+    op: ServerOp,
+    kind: Option<FrameKind>,
+    outcome: ServerOutcome,
+    latency: Duration,
+    /// 失敗系のエラーコードとメッセージ（成功時は `None`）。
+    error: Option<(IoErrorCode, String)>,
+}
+
+impl OwnedServerEvent {
+    fn key(&self) -> CoalesceKey {
+        CoalesceKey {
+            op: self.op,
+            kind: self.kind,
+            outcome: self.outcome,
+            code: self.error.as_ref().map(|(code, _)| *code),
+        }
+    }
+
+    fn emit<C: ServerObserver>(&self, hook: &mut C) {
+        emit_event(
+            hook,
+            self.op,
+            self.kind,
+            self.outcome,
+            self.latency,
+            self.error
+                .as_ref()
+                .map(|(code, message)| (*code, message.as_str())),
+            None,
+        );
+    }
+}
+
+/// 保留キューがあふれた操作を集約するキー（REPAIR-4・#1118）。操作別・結果別の件数を
+/// 復元できる粒度（`op`・`kind`・`outcome`・エラーコード）にする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoalesceKey {
+    op: ServerOp,
+    kind: Option<FrameKind>,
+    outcome: ServerOutcome,
+    code: Option<IoErrorCode>,
+}
+
+/// キー 1 種類ぶんの集約値（`JsonLinesServerObserver` の `CoalescedRejections` と同じく
+/// 数値と切り詰め済みの最後のメッセージだけを持ち、件数が増えても確保量は変わらない）。
+struct CoalescedEntry {
+    key: CoalesceKey,
+    count: u64,
+    latency_max: Duration,
+    latency_sum: Duration,
+    /// 最後に集約した操作のメッセージ（`MAX_SEND_LOG_MESSAGE_BYTES` で切り詰め済み。
+    /// 成功系では `None`）。
+    last_message: Option<String>,
+}
+
+impl CoalescedEntry {
+    fn from_event(event: OwnedServerEvent) -> Self {
+        let key = event.key();
+        Self {
+            key,
+            count: 1,
+            latency_max: event.latency,
+            latency_sum: event.latency,
+            last_message: event.error.map(|(_, m)| truncate_owned(&m)),
+        }
+    }
+
+    fn add_event(&mut self, event: OwnedServerEvent) {
+        self.count = self.count.saturating_add(1);
+        self.latency_max = self.latency_max.max(event.latency);
+        self.latency_sum = self.latency_sum.saturating_add(event.latency);
+        if let Some((_, m)) = event.error {
+            self.last_message = Some(truncate_owned(&m));
+        }
+    }
+
+    /// 同じキーの集約値（`older`: 期限切れで表へ戻す、先に集約された分）を合算する。
+    /// メッセージは後に集約された `self` のものを優先する。
+    fn merge_older(&mut self, older: CoalescedEntry) {
+        self.count = self.count.saturating_add(older.count);
+        self.latency_max = self.latency_max.max(older.latency_max);
+        self.latency_sum = self.latency_sum.saturating_add(older.latency_sum);
+        if self.last_message.is_none() {
+            self.last_message = older.last_message;
+        }
+    }
+
+    fn emit<C: ServerObserver>(&self, hook: &mut C) {
+        emit_event(
+            hook,
+            self.key.op,
+            self.key.kind,
+            self.key.outcome,
+            self.latency_max,
+            self.key
+                .code
+                .map(|code| (code, self.last_message.as_deref().unwrap_or(""))),
+            Some(CoalescedServerEvents::new(self.count, self.latency_sum)),
+        );
+    }
+}
+
+/// 集約値に保持するメッセージを観測ログの切り詰め長へ揃える（無制限確保の防止）。
+fn truncate_owned(message: &str) -> String {
+    truncate_message_bytes(message).0.to_owned()
+}
+
+/// 保留イベントの上限件数（無制限確保の防止。security.md）。超えた分は捨てずに
+/// [`CoalesceKey`] ごとの集約値へ合算する（REPAIR-4）。
+const MAX_PENDING_EVENTS: usize = 1024;
+
+/// 集約値の表のキー数の上限（無制限確保の防止）。
+///
+/// 分割後の両半分から届くキーは有限で、最大 100 種類: `op` は `Send` / `Recv` の 2 種類
+/// （`Accept` は [`UdsServer`] の観測フックへ直接通知し、この表を通らない）×
+/// `kind` は `None` と `FrameKind` 4 種類の 5 通り ×（`outcome`, `code`）は
+/// `(Success, None)`・`(RejectedPoisoned, Unavailable)`・`(Failure, IoErrorCode 8 種類)`
+/// の 10 通り（`RejectedPeerCredential` は accept 専用）。将来の enum 追加に備えて余裕を
+/// 持たせる。それでも上限を超えた場合は fail-closed で件数だけを数え
+/// （[`PendingState::dropped`]）、`ResourceExhausted` の欠落サマリで通知する。
+const MAX_COALESCED_KEYS: usize = 128;
+
+/// 1 回の `notify` / `with` が保留キュー本体から排出するイベントの最大件数（REPAIR-5:
+/// 並行通知が続いても I/O 経路が期限内に戻れるよう有限にする）。保留キューの上限と
+/// 同じ値にし、静穏時は 1 回で全件を排出できる。1 回の排出で `on_event` を呼ぶ回数は
+/// 欠落サマリ 1 件 + 集約値（`MAX_COALESCED_KEYS` 以下）+ この件数で有界。
+const MAX_DRAIN_PER_CALL: usize = MAX_PENDING_EVENTS;
+
+/// 保留中の観測イベント一式（1 つの `Mutex` で守り、キュー・集約表・欠落件数を
+/// 一貫して更新する）。
+#[derive(Default)]
+struct PendingState {
+    queue: VecDeque<OwnedServerEvent>,
+    /// キューが満杯のときにあふれた操作の集約値（`MAX_COALESCED_KEYS` 件以下）。
+    coalesced: Vec<CoalescedEntry>,
+    /// 集約表も満杯で集約できなかった操作の件数（最後の砦。次の排出時に欠落サマリで
+    /// 通知して 0 に戻す）。
+    dropped: u64,
+}
+
+impl PendingState {
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty() && self.coalesced.is_empty() && self.dropped == 0
+    }
+
+    /// あふれたイベントを集約表へ合算する（表が満杯なら件数だけを数える）。
+    fn coalesce(&mut self, event: OwnedServerEvent) {
+        let key = event.key();
+        if let Some(entry) = self.coalesced.iter_mut().find(|e| e.key == key) {
+            entry.add_event(event);
+        } else if self.coalesced.len() < MAX_COALESCED_KEYS {
+            self.coalesced.push(CoalescedEntry::from_event(event));
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    /// 排出を期限で打ち切った集約値を表へ戻す（同じキーが新たに積まれていれば合算し、
+    /// 表が満杯なら件数だけを数える。欠落させない）。
+    fn restore(&mut self, older: CoalescedEntry) {
+        if let Some(entry) = self.coalesced.iter_mut().find(|e| e.key == older.key) {
+            entry.merge_older(older);
+        } else if self.coalesced.len() < MAX_COALESCED_KEYS {
+            self.coalesced.push(older);
+        } else {
+            self.dropped = self.dropped.saturating_add(older.count);
+        }
+    }
+}
+
+/// 集約表にも収まらず件数だけが残った欠落を `ResourceExhausted` で通知する。
+fn emit_dropped_summary<C: ServerObserver>(hook: &mut C, dropped: u64) {
+    let err = IoError::new(
+        IoErrorCode::ResourceExhausted,
+        format!("observer event queue overflowed; {dropped} events were dropped"),
+    );
+    emit_failure(
+        hook,
+        ServerOp::Send,
+        None,
+        ServerOutcome::Failure,
+        Duration::ZERO,
+        &err,
+    );
+}
+
+struct SharedObserverInner<C: ServerObserver> {
+    hook: Mutex<C>,
+    pending: Mutex<PendingState>,
+}
+
+/// 最後の参照（両半分と接続）が drop される時、期限切れ等で排出できず残った保留イベントを
+/// フックへ適用する（REPAIR-4: 後続の I/O がなくても観測イベントを欠落させない）。
+///
+/// 順序は排出時と同じ（欠落サマリ → 集約値 → キュー本体）。この時点で他の参照は存在せず
+/// ロック競合は起きない。排出は保留キュー・集約表の上限で有界。フックが有界時間で
+/// 戻ることは [`ServerObserver::on_event`] の契約に依存する。
+impl<C: ServerObserver> Drop for SharedObserverInner<C> {
+    fn drop(&mut self) {
+        let hook = self.hook.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let pending = self
+            .pending
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        let dropped = core::mem::take(&mut pending.dropped);
+        if dropped > 0 {
+            emit_dropped_summary(hook, dropped);
+        }
+        for entry in core::mem::take(&mut pending.coalesced) {
+            entry.emit(hook);
+        }
+        while let Some(event) = pending.queue.pop_front() {
+            event.emit(hook);
+        }
+    }
+}
+
+/// 分割後の両半分が共有する観測フック（#1118。1 接続に 1 フックの意味論を保つ）。
+///
+/// ロックは `on_event` / [`Self::with`] の間だけ取り、I/O をまたいで保持しない
+/// （両半分の間でデッドロックしない）。他方のスレッドが panic してロックが poison
+/// されても `into_inner` で続行し、ここから panic を伝播させない。
+///
+/// I/O 経路（`send_frame` / `recv_frame`）からの通知は [`Self::notify`] を使う。
+/// イベントをいったん保留キューへ積み、フックのロックが取れれば待たずに順序どおり
+/// 適用する。他方（`with_observer` のクロージャや別スレッドの通知）がロックを保持
+/// 中ならブロックせずに戻り（期限を超えない。REPAIR-5）、ロック保持側が解放後に
+/// キューを排出する（REPAIR-4: 並行終了でもイベントを欠落させない）。キューが満杯の
+/// ときは [`CoalesceKey`] ごとの集約値へ合算し、操作別・結果別の件数と所要時間
+/// （最大・合計）を残す（[`ServerEvent::coalesced`]）。
+///
+/// ロックの順序は `hook` → `pending` の一方向のみ（`pending` を保持したまま `hook` を
+/// 取らない。`pending` のガードは pop / push / take の文の中だけで解放する）。`notify` は
+/// `pending` を解放してから `hook` を `try_lock` するため、両半分・`with` の間で
+/// デッドロックしない。
+struct SharedObserver<C: ServerObserver>(Arc<SharedObserverInner<C>>);
+
+impl<C: ServerObserver> Clone for SharedObserver<C> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<C: ServerObserver> SharedObserver<C> {
+    fn new(hook: C) -> Self {
+        Self(Arc::new(SharedObserverInner {
+            hook: Mutex::new(hook),
+            pending: Mutex::new(PendingState::default()),
+        }))
+    }
+
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, PendingState> {
+        self.0
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 保留中のイベントをフックへ適用する（フックのロック保持中に呼ぶ）。
+    /// `pending` のロックは `on_event` の実行中は保持しない。
+    ///
+    /// 順序は 欠落サマリ → 集約値 → キュー本体。集約値はキュー本体より時系列では
+    /// 後だが、フック側の上限（`JsonLinesServerObserver` の既定 1024 行 = キュー上限）で
+    /// 捨てられないよう先に適用する（サマリ先行と同じ理由。PRRT_kwDOUq78ts6m7eEo）。
+    /// 集約値は呼び出し時点の表を丸ごと取り出して適用する（`MAX_COALESCED_KEYS` 件以下）。
+    ///
+    /// キュー本体は最大 `budget` 件で打ち切る（並行して通知が積まれ続けても 1 回の排出が
+    /// 有限で終わり、I/O 経路の `IoTimeout` 期限を守る。REPAIR-5）。残りは保留キューに
+    /// 残り、次の `notify` / `with` の排出が引き継ぐ（欠落はしない。REPAIR-4）。
+    ///
+    /// `until` が `Some` のときは時刻でも打ち切る。観測フックが遅くても呼び出し全体が
+    /// `IoTimeout` の期限を大きく超えないようにするため（REPAIR-5）。期限後に残った
+    /// 集約値は表へ戻し（[`PendingState::restore`]）、キュー本体は保留のまま残す
+    /// （REPAIR-4）。1 件の `on_event` 実行中は中断できないため、フックが有界時間で
+    /// 戻ることは [`ServerObserver::on_event`] の契約（ブロックしない）に依存する。
+    fn drain_locked(&self, hook: &mut C, budget: &mut usize, until: Option<Instant>) {
+        let expired = || until.is_some_and(|d| Instant::now() >= d);
+        if expired() {
+            return;
+        }
+        let (dropped, entries) = {
+            let mut state = self.lock_pending();
+            (
+                core::mem::take(&mut state.dropped),
+                core::mem::take(&mut state.coalesced),
+            )
+        };
+        if dropped > 0 {
+            emit_dropped_summary(hook, dropped);
+        }
+        let mut entries = entries.into_iter();
+        while let Some(entry) = entries.next() {
+            if expired() {
+                let mut state = self.lock_pending();
+                state.restore(entry);
+                for rest in entries {
+                    state.restore(rest);
+                }
+                return;
+            }
+            entry.emit(hook);
+        }
+        while *budget > 0 {
+            if expired() {
+                break;
+            }
+            let next = self.lock_pending().queue.pop_front();
+            match next {
+                Some(event) => {
+                    event.emit(hook);
+                    *budget -= 1;
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// ロックを取り、呼び出し時点で保留中のイベントを排出してから `f` を適用し、
+    /// `f` の実行中に積まれた保留イベントも排出する。
+    ///
+    /// `f` より前の排出は、期限切れ（`IoTimeout`）で I/O 経路が排出しきれなかった
+    /// イベントを `f`（例: `drain_lines`）が取りこぼさないためのもの（REPAIR-4）。
+    /// 集約値は表を丸ごと、保留キューは FIFO で件数が `MAX_PENDING_EVENTS`
+    /// （= `MAX_DRAIN_PER_CALL`）以下のため、呼び出し時点で積まれていたイベントは
+    /// 1 回の排出ですべて `f` より前に適用される。並行して積まれた分はその後ろに並び、
+    /// `f` の後の排出が引き継ぐ。I/O 経路ではないため期限は設けないが、件数上限
+    /// （REPAIR-5）は保つ。
+    fn with<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
+        let result = {
+            let mut guard = self.0.hook.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut budget = MAX_DRAIN_PER_CALL;
+            self.drain_locked(&mut guard, &mut budget, None);
+            let r = f(&mut guard);
+            let mut budget = MAX_DRAIN_PER_CALL;
+            self.drain_locked(&mut guard, &mut budget, None);
+            r
+        };
+        // 解放直前に他方が積んで try_lock に失敗した分を取りこぼさない。
+        self.flush(None);
+        result
+    }
+
+    /// ロックが取れる間、保留イベントを排出する。取れなければ保持側に任せる。
+    ///
+    /// `until` は排出を打ち切る期限（I/O 経路では送受信の `IoTimeout` 期限。REPAIR-5）。
+    fn flush(&self, until: Option<Instant>) {
+        let mut budget = MAX_DRAIN_PER_CALL;
+        while budget > 0 {
+            if until.is_some_and(|d| Instant::now() >= d) {
+                return;
+            }
+            {
+                let mut guard = match self.0.hook.try_lock() {
+                    Ok(g) => g,
+                    Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return,
+                };
+                self.drain_locked(&mut guard, &mut budget, until);
+            }
+            if self.lock_pending().is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// イベントを保留キューへ積み、待たずに排出を試みる（キュー満杯なら
+    /// [`CoalesceKey`] ごとの集約値へ合算する）。
+    fn notify(&self, event: OwnedServerEvent, until: Instant) {
+        {
+            let mut state = self.lock_pending();
+            if state.queue.len() >= MAX_PENDING_EVENTS {
+                state.coalesce(event);
+            } else {
+                state.queue.push_back(event);
+            }
+        }
+        self.flush(Some(until));
+    }
+}
+
+/// 成功イベントを保留キュー経由で通知する。
+fn notify_success<C: ServerObserver>(
+    observer: &SharedObserver<C>,
+    op: ServerOp,
+    kind: Option<FrameKind>,
+    latency: Duration,
+    until: Instant,
+) {
+    observer.notify(
+        OwnedServerEvent {
+            op,
+            kind,
+            outcome: ServerOutcome::Success,
+            latency,
+            error: None,
+        },
+        until,
+    );
+}
+
+/// 失敗イベントを保留キュー経由で通知する（エラーは所有データへ複製する）。
+fn notify_failure<C: ServerObserver>(
+    observer: &SharedObserver<C>,
+    op: ServerOp,
+    kind: Option<FrameKind>,
+    outcome: ServerOutcome,
+    latency: Duration,
+    err: &IoError,
+    until: Instant,
+) {
+    observer.notify(
+        OwnedServerEvent {
+            op,
+            kind,
+            outcome,
+            latency,
+            error: Some((err.code(), err.message().to_owned())),
+        },
+        until,
+    );
+}
+
+/// [`SplitTransport::split`] が返す送信側（#1118・IO-1・P1-3）。
+///
+/// [`UdsConnection`] の複製 fd を持つ。契約は [`SplitTransport`] とモジュール doc
+/// 「分割」節を参照。drop 時、poison されていなければ書き込み側を half-close する。
+pub struct UdsSendHalf<C: ServerObserver> {
+    inner: imp::ConnectionInner,
+    poison: SharedPoison,
+    observer: SharedObserver<C>,
+}
+
+/// [`SplitTransport::split`] が返す受信側（#1118・IO-1・P1-3）。
+///
+/// [`UdsConnection`] が持っていた `ReceiveLimits`（TASK-13.4）をそのまま引き継ぎ、
+/// 本体バッファ確保前の受理判定も分割前と同じ。
+pub struct UdsRecvHalf<C: ServerObserver> {
+    inner: imp::ConnectionInner,
+    poison: SharedPoison,
+    observer: SharedObserver<C>,
+    limits: ReceiveLimits,
+}
+
+impl<C: ServerObserver> core::fmt::Debug for UdsSendHalf<C> {
+    /// poison 状態のみを出す（[`UdsConnection`] の `Debug` と同じ方針）。
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UdsSendHalf")
+            .field("poisoned", &self.poison.is_poisoned())
+            .finish()
+    }
+}
+
+impl<C: ServerObserver> core::fmt::Debug for UdsRecvHalf<C> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UdsRecvHalf")
+            .field("poisoned", &self.poison.is_poisoned())
+            .finish()
+    }
+}
+
+impl<C: ServerObserver> UdsSendHalf<C> {
+    /// 両半分で共有している観測フックへ、ロックを取って `f` を適用する
+    /// （[`UdsConnection::observer_mut`] の分割後の代替）。
+    ///
+    /// 呼び出し時点で保留中のイベント（送受信の期限で排出が打ち切られた分など）は
+    /// `f` より前に順序どおり適用されるため、`f` で全イベントを取り出せる（REPAIR-4）。
+    /// `f` の実行中に他方の半分が通知したイベントは待たずに保留キューへ積まれ、`f` の
+    /// 後に順序どおり適用される（I/O 期限を守りつつ欠落させない。REPAIR-5）。
+    ///
+    /// `f` の中から（どちらの半分の）`with_observer` も呼ばないこと（フックのロックは
+    /// 再入できず、デッドロックする）。`f` の中で他方の半分の `send_frame` /
+    /// `recv_frame` を呼ぶのは可（通知はロックを待たず保留キューへ積まれる）。
+    pub fn with_observer<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
+        self.observer.with(f)
+    }
+}
+
+impl<C: ServerObserver> UdsRecvHalf<C> {
+    /// 両半分で共有している観測フックへ、ロックを取って `f` を適用する
+    /// （[`UdsConnection::observer_mut`] の分割後の代替）。
+    ///
+    /// 呼び出し時点で保留中のイベント（送受信の期限で排出が打ち切られた分など）は
+    /// `f` より前に順序どおり適用されるため、`f` で全イベントを取り出せる（REPAIR-4）。
+    /// `f` の実行中に他方の半分が通知したイベントは待たずに保留キューへ積まれ、`f` の
+    /// 後に順序どおり適用される（I/O 期限を守りつつ欠落させない。REPAIR-5）。
+    ///
+    /// `f` の中から（どちらの半分の）`with_observer` も呼ばないこと（フックのロックは
+    /// 再入できず、デッドロックする）。`f` の中で他方の半分の `send_frame` /
+    /// `recv_frame` を呼ぶのは可（通知はロックを待たず保留キューへ積まれる）。
+    pub fn with_observer<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
+        self.observer.with(f)
+    }
+}
+
+/// I/O の結果に共有 poison の規則（モジュール doc「分割」節の (2)・(3)）を適用する。
+///
+/// `Err` なら poison を立てて `shutdown(Both)` でもう片側を起こす。`Ok` でも他方が
+/// 既に poison を立てていれば結果を捨てて `Unavailable` にする。戻り値の bool は
+/// 「poison 済みのため結果を捨てた」（観測上 [`ServerOutcome::RejectedPoisoned`]）。
+fn settle_shared<T>(
+    inner: &imp::ConnectionInner,
+    poison: &SharedPoison,
+    result: Result<T, IoError>,
+) -> (Result<T, IoError>, bool) {
+    match result {
+        Err(e) => {
+            // 他方がすでに poison を立てていた場合、この Err は多くが shutdown(Both) で
+            // 起こされた結果の I/O エラーなので、元のエラーではなく `Unavailable` に揃える。
+            let already = poison.poison();
+            inner.shutdown_both();
+            if already {
+                (Err(unavailable_after_poison()), true)
+            } else {
+                (Err(e), false)
+            }
+        }
+        Ok(_) if poison.is_poisoned() => (Err(unavailable_after_poison()), true),
+        Ok(v) => (Ok(v), false),
+    }
+}
+
+impl<C: ServerObserver> FrameSender for UdsSendHalf<C> {
+    type Frame = Frame;
+
+    fn send_frame(&mut self, frame: &Frame, timeout: IoTimeout) -> Result<(), IoError> {
+        // 観測イベントの排出もこの期限までに打ち切る（REPAIR-5）。
+        let until = Instant::now() + timeout.as_duration();
+        let kind = Some(frame.kind());
+        if self.poison.is_poisoned() {
+            let err = unavailable_after_poison();
+            notify_failure(
+                &self.observer,
+                ServerOp::Send,
+                kind,
+                ServerOutcome::RejectedPoisoned,
+                Duration::ZERO,
+                &err,
+                until,
+            );
+            return Err(err);
+        }
+        let started = Instant::now();
+        let result = self.inner.send_frame(frame, timeout);
+        let elapsed = started.elapsed();
+        let (result, rejected) = settle_shared(&self.inner, &self.poison, result);
+        match &result {
+            Ok(()) => notify_success(&self.observer, ServerOp::Send, kind, elapsed, until),
+            Err(err) => {
+                let outcome = if rejected {
+                    ServerOutcome::RejectedPoisoned
+                } else {
+                    ServerOutcome::Failure
+                };
+                notify_failure(
+                    &self.observer,
+                    ServerOp::Send,
+                    kind,
+                    outcome,
+                    elapsed,
+                    err,
+                    until,
+                );
+            }
+        }
+        result
+    }
+}
+
+impl<C: ServerObserver> FrameReceiver for UdsRecvHalf<C> {
+    type Frame = Frame;
+
+    fn recv_frame(&mut self, timeout: IoTimeout) -> Result<Frame, IoError> {
+        // 観測イベントの排出もこの期限までに打ち切る（REPAIR-5）。
+        let until = Instant::now() + timeout.as_duration();
+        if self.poison.is_poisoned() {
+            let err = unavailable_after_poison();
+            notify_failure(
+                &self.observer,
+                ServerOp::Recv,
+                None,
+                ServerOutcome::RejectedPoisoned,
+                Duration::ZERO,
+                &err,
+                until,
+            );
+            return Err(err);
+        }
+        let started = Instant::now();
+        let attempt = self.inner.recv_frame(timeout, self.limits);
+        let elapsed = started.elapsed();
+        let attempt_kind = attempt.kind;
+        let (result, rejected) = settle_shared(&self.inner, &self.poison, attempt.result);
+        match &result {
+            Ok(frame) => notify_success(
+                &self.observer,
+                ServerOp::Recv,
+                Some(frame.kind()),
+                elapsed,
+                until,
+            ),
+            Err(err) => {
+                let outcome = if rejected {
+                    ServerOutcome::RejectedPoisoned
+                } else {
+                    ServerOutcome::Failure
+                };
+                notify_failure(
+                    &self.observer,
+                    ServerOp::Recv,
+                    attempt_kind,
+                    outcome,
+                    elapsed,
+                    err,
+                    until,
+                );
+            }
+        }
+        result
+    }
+}
+
+impl<C: ServerObserver> Drop for UdsSendHalf<C> {
+    /// poison されていなければ書き込み側を half-close する（相手は送信済みデータを
+    /// 読み切った後に EOF を受ける。受信側は使い続けられる）。shutdown の失敗
+    /// （ENOTCONN 等）は無視する。
+    fn drop(&mut self) {
+        if !self.poison.is_poisoned() {
+            self.inner.shutdown_write();
+        }
+    }
+}
+
+impl<C: ServerObserver> SplitTransport for UdsConnection<C> {
+    type SendHalf = UdsSendHalf<C>;
+    type RecvHalf = UdsRecvHalf<C>;
+
+    /// poison 済みなら `Unavailable`（接続はここで drop して閉じる）。fd の複製に
+    /// 失敗した場合もエラーを返し、接続は閉じる。
+    fn split(self) -> Result<(UdsSendHalf<C>, UdsRecvHalf<C>), IoError> {
+        if self.poisoned {
+            return Err(unavailable_after_poison());
+        }
+        let recv_inner = self.inner.try_clone()?;
+        let poison = SharedPoison::new();
+        let observer = SharedObserver::new(self.observer);
+        Ok((
+            UdsSendHalf {
+                inner: self.inner,
+                poison: poison.clone(),
+                observer: observer.clone(),
+            },
+            UdsRecvHalf {
+                inner: recv_inner,
+                poison,
+                observer,
+                limits: self.limits,
+            },
+        ))
     }
 }
 
@@ -1164,6 +1906,7 @@ mod imp {
             accept_aborted_retries: 0,
             peer_credential_rejections,
             peer_uid: rejection.peer_uid,
+            coalesced: None,
             error: Some(SendEventError {
                 code: rejection.error.code(),
                 message: rejection.error.message(),
@@ -1308,6 +2051,26 @@ mod imp {
     }
 
     impl ConnectionInner {
+        /// fd を複製して分割後の受信側用の `ConnectionInner` を作る（#1118）。
+        /// `O_NONBLOCK` は複製間で共有される点は上位モジュール doc「分割」節参照。
+        pub(super) fn try_clone(&self) -> Result<Self, IoError> {
+            self.stream
+                .try_clone()
+                .map(|stream| Self { stream })
+                .map_err(map_io_error)
+        }
+
+        /// 読み書きの両方向を shutdown する。もう片側でブロック中の read / write を
+        /// 起こすために使う。失敗（ENOTCONN 等）は無視する。
+        pub(super) fn shutdown_both(&self) {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        }
+
+        /// 書き込み方向のみ shutdown する（half-close）。失敗は無視する。
+        pub(super) fn shutdown_write(&self) {
+            let _ = self.stream.shutdown(std::net::Shutdown::Write);
+        }
+
         /// `frame.encode()` の結果を、フレーム単位の期限つきで最後まで書き切る。
         pub(super) fn send_frame(
             &mut self,
@@ -3264,6 +4027,18 @@ mod imp {
     pub(super) enum ConnectionInner {}
 
     impl ConnectionInner {
+        pub(super) fn try_clone(&self) -> Result<Self, IoError> {
+            match *self {}
+        }
+
+        pub(super) fn shutdown_both(&self) {
+            match *self {}
+        }
+
+        pub(super) fn shutdown_write(&self) {
+            match *self {}
+        }
+
         pub(super) fn send_frame(
             &mut self,
             _frame: &Frame,
@@ -3292,5 +4067,669 @@ mod imp {
                 .expect_err("unsupported platform must reject bind");
             assert_eq!(err.code(), IoErrorCode::Unimplemented);
         }
+    }
+}
+#[cfg(test)]
+mod shared_observer_tests {
+    use super::*;
+    use crate::observe::{JsonLinesServerObserver, MAX_SEND_LOG_CAPACITY};
+
+    /// 観測フックが受け取ったイベント 1 件の記録（所有データへ写したもの）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Rec {
+        op: ServerOp,
+        kind: Option<FrameKind>,
+        outcome: ServerOutcome,
+        code: Option<IoErrorCode>,
+        message: Option<String>,
+        latency: Duration,
+        coalesced: Option<CoalescedServerEvents>,
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        events: Vec<Rec>,
+    }
+
+    impl ServerObserver for Recorder {
+        fn on_event(&mut self, event: &ServerEvent<'_>) {
+            self.events.push(Rec {
+                op: event.op,
+                kind: event.kind,
+                outcome: event.outcome,
+                code: event.error.as_ref().map(|e| e.code),
+                message: event.error.as_ref().map(|e| e.message.to_owned()),
+                latency: event.latency,
+                coalesced: event.coalesced,
+            });
+        }
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn success(op: ServerOp, kind: Option<FrameKind>, latency: Duration) -> OwnedServerEvent {
+        OwnedServerEvent {
+            op,
+            kind,
+            outcome: ServerOutcome::Success,
+            latency,
+            error: None,
+        }
+    }
+
+    fn failure(
+        op: ServerOp,
+        kind: Option<FrameKind>,
+        outcome: ServerOutcome,
+        code: IoErrorCode,
+        message: &str,
+        latency: Duration,
+    ) -> OwnedServerEvent {
+        OwnedServerEvent {
+            op,
+            kind,
+            outcome,
+            latency,
+            error: Some((code, message.to_owned())),
+        }
+    }
+
+    /// 保留キューを満杯（`MAX_PENDING_EVENTS` 件）にする（Send 成功・所要時間 0）。
+    fn fill_queue<C: ServerObserver>(observer: &SharedObserver<C>) {
+        let mut state = observer.lock_pending();
+        while state.queue.len() < MAX_PENDING_EVENTS {
+            state.queue.push_back(success(
+                ServerOp::Send,
+                Some(FrameKind::Ack),
+                Duration::ZERO,
+            ));
+        }
+    }
+
+    /// 期限切れ（過去）で通知する（排出されず保留のまま残る）。
+    fn notify_expired<C: ServerObserver>(observer: &SharedObserver<C>, event: OwnedServerEvent) {
+        observer.notify(event, Instant::now());
+    }
+
+    fn coalesced(count: u64, latency_sum: Duration) -> Option<CoalescedServerEvents> {
+        Some(CoalescedServerEvents::new(count, latency_sum))
+    }
+
+    /// REPAIR-4・#1118（PRRT_kwDOUq78ts6m8Q4K）: 保留キューがあふれた分は
+    /// `(op, kind, outcome, code)` ごとに集約され、操作別・結果別の件数・最大レイテンシ・
+    /// 合計・最後のメッセージが失われない。集約イベントはキュー本体より先に届く。
+    #[test]
+    fn repair4_overflowed_events_are_coalesced_per_op_and_outcome() {
+        let observer = SharedObserver::new(Recorder::default());
+        fill_queue(&observer);
+        let ack = Some(FrameKind::Ack);
+        let write = Some(FrameKind::Write);
+        notify_expired(&observer, success(ServerOp::Send, ack, ms(5)));
+        notify_expired(
+            &observer,
+            failure(
+                ServerOp::Recv,
+                None,
+                ServerOutcome::Failure,
+                IoErrorCode::Timeout,
+                "first timeout",
+                ms(7),
+            ),
+        );
+        notify_expired(&observer, success(ServerOp::Send, ack, ms(9)));
+        notify_expired(
+            &observer,
+            failure(
+                ServerOp::Send,
+                ack,
+                ServerOutcome::RejectedPoisoned,
+                IoErrorCode::Unavailable,
+                "poisoned",
+                Duration::ZERO,
+            ),
+        );
+        notify_expired(
+            &observer,
+            failure(
+                ServerOp::Recv,
+                None,
+                ServerOutcome::Failure,
+                IoErrorCode::Timeout,
+                "second timeout",
+                ms(4),
+            ),
+        );
+        notify_expired(&observer, success(ServerOp::Send, ack, ms(2)));
+        notify_expired(&observer, success(ServerOp::Recv, write, ms(3)));
+        {
+            let state = observer.lock_pending();
+            assert_eq!(state.queue.len(), MAX_PENDING_EVENTS);
+            assert_eq!(state.coalesced.len(), 4);
+            assert_eq!(state.dropped, 0);
+        }
+
+        let events = observer.with(|rec| core::mem::take(&mut rec.events));
+        assert_eq!(events.len(), 4 + MAX_PENDING_EVENTS);
+        let expected_coalesced = vec![
+            Rec {
+                op: ServerOp::Send,
+                kind: ack,
+                outcome: ServerOutcome::Success,
+                code: None,
+                message: None,
+                latency: ms(9),
+                coalesced: coalesced(3, ms(16)),
+            },
+            Rec {
+                op: ServerOp::Recv,
+                kind: None,
+                outcome: ServerOutcome::Failure,
+                code: Some(IoErrorCode::Timeout),
+                message: Some("second timeout".to_owned()),
+                latency: ms(7),
+                coalesced: coalesced(2, ms(11)),
+            },
+            Rec {
+                op: ServerOp::Send,
+                kind: ack,
+                outcome: ServerOutcome::RejectedPoisoned,
+                code: Some(IoErrorCode::Unavailable),
+                message: Some("poisoned".to_owned()),
+                latency: Duration::ZERO,
+                coalesced: coalesced(1, Duration::ZERO),
+            },
+            Rec {
+                op: ServerOp::Recv,
+                kind: write,
+                outcome: ServerOutcome::Success,
+                code: None,
+                message: None,
+                latency: ms(3),
+                coalesced: coalesced(1, ms(3)),
+            },
+        ];
+        assert_eq!(events.get(..4), Some(expected_coalesced.as_slice()));
+        // 集約イベントの後ろにキュー本体（1 操作 1 イベント）が順序どおり続く。
+        assert!(
+            events
+                .iter()
+                .skip(4)
+                .all(|e| e.coalesced.is_none() && e.op == ServerOp::Send),
+            "queue body must follow the coalesced events"
+        );
+        // 件数を数える側から見て、あふれた 7 件ぶんが失われていない。
+        let total: u64 = events
+            .iter()
+            .map(|e| e.coalesced.map_or(1, |c| c.count))
+            .sum();
+        assert_eq!(total, (MAX_PENDING_EVENTS + 7) as u64);
+        let state = observer.lock_pending();
+        assert!(state.is_empty());
+    }
+
+    /// 分割後の両半分から届きうるキー（`MAX_COALESCED_KEYS` の根拠）をすべて列挙する。
+    fn reachable_keys() -> Vec<OwnedServerEvent> {
+        let kinds = [
+            None,
+            Some(FrameKind::Write),
+            Some(FrameKind::Ack),
+            Some(FrameKind::Flush),
+            Some(FrameKind::FlushAck),
+        ];
+        let codes = [
+            IoErrorCode::InvalidArgument,
+            IoErrorCode::Timeout,
+            IoErrorCode::Unavailable,
+            IoErrorCode::Unimplemented,
+            IoErrorCode::Internal,
+            IoErrorCode::DataLoss,
+            IoErrorCode::ResourceExhausted,
+            IoErrorCode::AlreadyExists,
+        ];
+        let mut all = Vec::new();
+        for op in [ServerOp::Send, ServerOp::Recv] {
+            for kind in kinds {
+                all.push(success(op, kind, ms(1)));
+                all.push(failure(
+                    op,
+                    kind,
+                    ServerOutcome::RejectedPoisoned,
+                    IoErrorCode::Unavailable,
+                    "poisoned",
+                    Duration::ZERO,
+                ));
+                for code in codes {
+                    all.push(failure(op, kind, ServerOutcome::Failure, code, "x", ms(1)));
+                }
+            }
+        }
+        all
+    }
+
+    /// REPAIR-4・#1118: 分割後の両半分から届きうる全キー（100 種類）が集約表に収まり、
+    /// 最後の砦（件数だけの欠落サマリ）に落ちない。
+    #[test]
+    fn repair4_all_reachable_keys_fit_in_the_coalesce_table() {
+        let keys = reachable_keys();
+        assert_eq!(keys.len(), 100);
+        assert!(keys.len() <= MAX_COALESCED_KEYS);
+        let observer = SharedObserver::new(Recorder::default());
+        fill_queue(&observer);
+        for event in keys {
+            notify_expired(&observer, event);
+        }
+        let state = observer.lock_pending();
+        assert_eq!(state.coalesced.len(), 100);
+        assert_eq!(state.dropped, 0);
+    }
+
+    /// REPAIR-4・#1118: 集約表も満杯なら fail-closed で件数だけを数え、
+    /// `ResourceExhausted` の欠落サマリで通知する（既存キーへの合算は続けられる）。
+    /// 順序は 欠落サマリ → 集約イベント → キュー本体。
+    #[test]
+    fn repair4_coalesce_table_overflow_falls_back_to_dropped_count() {
+        let observer = SharedObserver::new(Recorder::default());
+        fill_queue(&observer);
+        // 型の上では Accept・RejectedPeerCredential 等も表せるため、キーを
+        // MAX_COALESCED_KEYS + 2 種類作れる。
+        let kinds = [
+            None,
+            Some(FrameKind::Write),
+            Some(FrameKind::Ack),
+            Some(FrameKind::Flush),
+            Some(FrameKind::FlushAck),
+        ];
+        let mut distinct = Vec::new();
+        for op in [ServerOp::Accept, ServerOp::Send, ServerOp::Recv] {
+            for kind in kinds {
+                for outcome in [
+                    ServerOutcome::Success,
+                    ServerOutcome::RejectedPoisoned,
+                    ServerOutcome::RejectedPeerCredential,
+                    ServerOutcome::Failure,
+                ] {
+                    for code in [
+                        IoErrorCode::InvalidArgument,
+                        IoErrorCode::Timeout,
+                        IoErrorCode::Unavailable,
+                    ] {
+                        distinct.push(failure(op, kind, outcome, code, "x", ms(1)));
+                    }
+                }
+            }
+        }
+        assert!(distinct.len() >= MAX_COALESCED_KEYS + 2);
+        distinct.truncate(MAX_COALESCED_KEYS + 2);
+        for event in distinct {
+            notify_expired(&observer, event);
+        }
+        // 表が満杯でも既存キーには合算できる（欠落扱いにしない）。
+        notify_expired(
+            &observer,
+            failure(
+                ServerOp::Accept,
+                None,
+                ServerOutcome::Success,
+                IoErrorCode::InvalidArgument,
+                "x",
+                ms(4),
+            ),
+        );
+        {
+            let state = observer.lock_pending();
+            assert_eq!(state.coalesced.len(), MAX_COALESCED_KEYS);
+            assert_eq!(state.dropped, 2);
+        }
+
+        let events = observer.with(|rec| core::mem::take(&mut rec.events));
+        assert_eq!(events.len(), 1 + MAX_COALESCED_KEYS + MAX_PENDING_EVENTS);
+        let summary = events.first().expect("summary event");
+        assert_eq!(summary.code, Some(IoErrorCode::ResourceExhausted));
+        assert_eq!(
+            summary.message.as_deref(),
+            Some("observer event queue overflowed; 2 events were dropped")
+        );
+        let first_coalesced = events.get(1).expect("first coalesced event");
+        assert_eq!(first_coalesced.op, ServerOp::Accept);
+        assert_eq!(first_coalesced.coalesced, coalesced(2, ms(5)));
+        assert_eq!(first_coalesced.latency, ms(4));
+        assert!(
+            events
+                .iter()
+                .skip(1)
+                .take(MAX_COALESCED_KEYS)
+                .all(|e| e.coalesced.is_some())
+        );
+        assert!(
+            events
+                .iter()
+                .skip(1 + MAX_COALESCED_KEYS)
+                .all(|e| e.coalesced.is_none())
+        );
+    }
+
+    /// REPAIR-5・#1118: 1 回の排出はキュー本体を `MAX_DRAIN_PER_CALL` 件で打ち切り、
+    /// 残りは保留のまま次の排出が引き継ぐ（並行通知で I/O 経路が戻れなくならない）。
+    #[test]
+    fn repair5_drain_is_bounded_per_call_and_remainder_is_kept() {
+        let observer = SharedObserver::new(Recorder::default());
+        {
+            let mut state = observer.lock_pending();
+            for _ in 0..(MAX_DRAIN_PER_CALL + 5) {
+                state
+                    .queue
+                    .push_back(success(ServerOp::Send, None, Duration::ZERO));
+            }
+        }
+        let mut guard = observer.0.hook.lock().unwrap();
+        let mut budget = MAX_DRAIN_PER_CALL;
+        observer.drain_locked(&mut guard, &mut budget, None);
+        assert_eq!(guard.events.len(), MAX_DRAIN_PER_CALL);
+        assert_eq!(observer.lock_pending().queue.len(), 5);
+        let mut budget = MAX_DRAIN_PER_CALL;
+        observer.drain_locked(&mut guard, &mut budget, None);
+        assert_eq!(guard.events.len(), MAX_DRAIN_PER_CALL + 5);
+    }
+
+    /// REPAIR-5・#1118: 期限を過ぎていれば保留イベントも集約値も 1 件も適用せず戻り、
+    /// どちらも失われず次の排出（期限なし）で適用される。
+    #[test]
+    fn repair5_drain_stops_at_deadline_and_keeps_events() {
+        let observer = SharedObserver::new(Recorder::default());
+        fill_queue(&observer);
+        notify_expired(&observer, success(ServerOp::Recv, None, ms(6)));
+        let past = Instant::now();
+        observer.flush(Some(past));
+        {
+            let state = observer.lock_pending();
+            assert_eq!(state.queue.len(), MAX_PENDING_EVENTS);
+            assert_eq!(state.coalesced.len(), 1);
+        }
+        observer.flush(None);
+        assert!(observer.lock_pending().is_empty());
+        observer.with(|rec| {
+            assert_eq!(rec.events.len(), MAX_PENDING_EVENTS + 1);
+            assert_eq!(
+                rec.events.first().and_then(|e| e.coalesced),
+                coalesced(1, ms(6))
+            );
+        });
+    }
+
+    /// REPAIR-4・#1118: 期限切れで表へ戻す集約値は、同じキーが新たに積まれていれば合算し、
+    /// 表が満杯なら件数ぶんを欠落件数へ回す（どちらでも件数を失わない）。
+    #[test]
+    fn repair4_restored_coalesced_entries_are_merged_or_counted() {
+        let mut state = PendingState::default();
+        state.coalesce(failure(
+            ServerOp::Recv,
+            None,
+            ServerOutcome::Failure,
+            IoErrorCode::Timeout,
+            "newer",
+            ms(2),
+        ));
+        let mut older = CoalescedEntry::from_event(failure(
+            ServerOp::Recv,
+            None,
+            ServerOutcome::Failure,
+            IoErrorCode::Timeout,
+            "older",
+            ms(8),
+        ));
+        older.add_event(failure(
+            ServerOp::Recv,
+            None,
+            ServerOutcome::Failure,
+            IoErrorCode::Timeout,
+            "older2",
+            ms(1),
+        ));
+        state.restore(older);
+        let merged = state.coalesced.first().expect("merged entry");
+        assert_eq!(state.coalesced.len(), 1);
+        assert_eq!(merged.count, 3);
+        assert_eq!(merged.latency_max, ms(8));
+        assert_eq!(merged.latency_sum, ms(11));
+        assert_eq!(merged.last_message.as_deref(), Some("newer"));
+
+        let mut full = PendingState::default();
+        for i in 0..MAX_COALESCED_KEYS {
+            full.coalesced.push(CoalescedEntry {
+                key: CoalesceKey {
+                    op: ServerOp::Send,
+                    kind: None,
+                    outcome: ServerOutcome::Failure,
+                    code: None,
+                },
+                count: 1,
+                latency_max: ms(i as u64),
+                latency_sum: ms(i as u64),
+                last_message: None,
+            });
+        }
+        let mut other = CoalescedEntry::from_event(success(ServerOp::Recv, None, ms(1)));
+        other.add_event(success(ServerOp::Recv, None, ms(1)));
+        full.restore(other);
+        assert_eq!(full.coalesced.len(), MAX_COALESCED_KEYS);
+        assert_eq!(full.dropped, 2);
+    }
+
+    /// 共有ログへ書き込む観測フック（drop 後に受信内容を検証するため）。記録は
+    /// （失敗系か, 集約件数〔通常イベントは 1〕）。
+    struct SharedLog(Arc<Mutex<Vec<(bool, u64)>>>);
+
+    impl ServerObserver for SharedLog {
+        fn on_event(&mut self, event: &ServerEvent<'_>) {
+            self.0.lock().unwrap().push((
+                event.outcome == ServerOutcome::Failure,
+                event.coalesced.map_or(1, |c| c.count),
+            ));
+        }
+    }
+
+    /// REPAIR-4・#1118: 期限切れで排出できなかった保留イベントは、最後の参照の drop 時に
+    /// フックへ届く（後続の I/O がなくても欠落しない）。
+    #[test]
+    fn repair4_pending_events_are_drained_when_last_reference_drops() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let observer = SharedObserver::new(SharedLog(Arc::clone(&log)));
+        let other = observer.clone();
+        notify_expired(&observer, success(ServerOp::Send, None, Duration::ZERO));
+        notify_expired(&other, success(ServerOp::Recv, None, Duration::ZERO));
+        assert!(log.lock().unwrap().is_empty());
+        drop(observer);
+        assert!(log.lock().unwrap().is_empty(), "other half still alive");
+        drop(other);
+        assert_eq!(*log.lock().unwrap(), vec![(false, 1), (false, 1)]);
+    }
+
+    /// REPAIR-4・#1118: drop 時も集約値を失わず、排出時と同じ順序
+    /// （集約イベント → キュー本体）で届く。
+    #[test]
+    fn repair4_coalesced_events_are_drained_when_last_reference_drops() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let observer = SharedObserver::new(SharedLog(Arc::clone(&log)));
+        fill_queue(&observer);
+        let err = |m: &str| {
+            failure(
+                ServerOp::Recv,
+                None,
+                ServerOutcome::Failure,
+                IoErrorCode::Timeout,
+                m,
+                ms(1),
+            )
+        };
+        notify_expired(&observer, err("a"));
+        notify_expired(&observer, err("b"));
+        notify_expired(&observer, err("c"));
+        drop(observer);
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1 + MAX_PENDING_EVENTS);
+        assert_eq!(log.first(), Some(&(true, 3)));
+        assert!(log.iter().skip(1).all(|e| *e == (false, 1)));
+    }
+
+    /// REPAIR-4・#1118（PRRT_kwDOUq78ts6m7uwW）: 期限切れで保留のまま残ったイベントは、
+    /// `with` のクロージャより前にフックへ適用される（`with_observer(|o| o.drain_lines())`
+    /// で取りこぼさない）。順序は保留分 → クロージャの順。
+    #[test]
+    fn repair4_with_applies_pending_events_before_closure() {
+        let observer = SharedObserver::new(Recorder::default());
+        let expired = Instant::now();
+        notify_success(&observer, ServerOp::Send, None, Duration::ZERO, expired);
+        let err = IoError::new(IoErrorCode::Timeout, "pending failure");
+        notify_failure(
+            &observer,
+            ServerOp::Recv,
+            None,
+            ServerOutcome::Failure,
+            Duration::ZERO,
+            &err,
+            expired,
+        );
+        assert_eq!(
+            observer.lock_pending().queue.len(),
+            2,
+            "both events stay pending"
+        );
+
+        let marker = success(ServerOp::Accept, None, ms(42));
+        let seen = observer.with(|rec| {
+            let snapshot: Vec<(ServerOp, Option<String>)> = rec
+                .events
+                .iter()
+                .map(|e| (e.op, e.message.clone()))
+                .collect();
+            marker.emit(rec);
+            snapshot
+        });
+        assert_eq!(
+            seen,
+            vec![
+                (ServerOp::Send, None),
+                (ServerOp::Recv, Some("pending failure".to_owned())),
+            ]
+        );
+        assert!(observer.lock_pending().is_empty());
+        observer.with(|rec| {
+            let ops: Vec<ServerOp> = rec.events.iter().map(|e| e.op).collect();
+            assert_eq!(ops, vec![ServerOp::Send, ServerOp::Recv, ServerOp::Accept]);
+        });
+    }
+
+    /// REPAIR-4・#1118: 集約イベントも `with` のクロージャより前に適用される
+    /// （集約イベント → 保留キュー本体 → クロージャの順。集約の先行は PRRT_kwDOUq78ts6m7eEo）。
+    #[test]
+    fn repair4_with_applies_coalesced_events_before_closure() {
+        let observer = SharedObserver::new(Recorder::default());
+        fill_queue(&observer);
+        notify_expired(&observer, success(ServerOp::Send, None, ms(1)));
+        notify_expired(&observer, success(ServerOp::Send, None, ms(3)));
+
+        let (len, first) = observer.with(|rec| (rec.events.len(), rec.events.first().cloned()));
+        assert_eq!(len, MAX_PENDING_EVENTS + 1);
+        let first = first.expect("coalesced event");
+        assert_eq!(first.coalesced, coalesced(2, ms(4)));
+        assert_eq!(first.latency, ms(3));
+        assert!(observer.lock_pending().is_empty());
+    }
+
+    /// REPAIR-4・#1118: `with` で排出済みのイベントは、最後の参照の drop 時に再適用されない
+    /// （保留分は `with` で 1 回、drop 時には残件のみ。欠落も二重通知もない）。
+    #[test]
+    fn repair4_pending_events_are_delivered_exactly_once_across_with_and_drop() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let observer = SharedObserver::new(SharedLog(Arc::clone(&log)));
+        let other = observer.clone();
+        let expired = Instant::now();
+        notify_success(&observer, ServerOp::Send, None, Duration::ZERO, expired);
+        notify_success(&other, ServerOp::Recv, None, Duration::ZERO, expired);
+        assert!(log.lock().unwrap().is_empty());
+
+        let seen_in_closure = other.with(|_| log.lock().unwrap().len());
+        assert_eq!(seen_in_closure, 2, "pending events precede the closure");
+
+        // with の後に残った 1 件だけが drop 時に届く。
+        let err = IoError::new(IoErrorCode::Timeout, "late failure");
+        notify_failure(
+            &observer,
+            ServerOp::Recv,
+            None,
+            ServerOutcome::Failure,
+            Duration::ZERO,
+            &err,
+            expired,
+        );
+        drop(observer);
+        assert_eq!(*log.lock().unwrap(), vec![(false, 1), (false, 1)]);
+        drop(other);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![(false, 1), (false, 1), (true, 1)]
+        );
+    }
+
+    /// REPAIR-4・#1118: 既定の `JsonLinesServerObserver` では、集約イベントは
+    /// `coalesced`・`count`・`latency_sum_us` を持つ 1 行になり、`latency_us` は最大値、
+    /// `message` は最後に集約した操作のもの。集約行はキュー本体の行より先に並ぶ。
+    #[test]
+    fn repair4_json_lines_observer_renders_coalesced_events() {
+        // 既定の行数上限（1024 行）は MAX_PENDING_EVENTS と同じで、1 回の排出
+        // （サマリ 1 + 集約 ≤ 128 + キュー 1024 件）ではフック自身の上限（新しい行を捨てて
+        // dropped_count を増やす #820 の方針）に達する。ここでは行の形を照合するため、
+        // 上限を広げてフック側の破棄が起きないようにする（dropped == 0 で確認）。
+        let hook = JsonLinesServerObserver::with_capacity(MAX_SEND_LOG_CAPACITY)
+            .expect("capacity within bounds");
+        let observer = SharedObserver::new(hook);
+        fill_queue(&observer);
+        let err = |m: &str, latency: Duration| {
+            failure(
+                ServerOp::Recv,
+                Some(FrameKind::Write),
+                ServerOutcome::Failure,
+                IoErrorCode::Timeout,
+                m,
+                latency,
+            )
+        };
+        notify_expired(&observer, err("first", ms(3)));
+        notify_expired(&observer, err("last", ms(8)));
+        notify_expired(
+            &observer,
+            success(ServerOp::Send, Some(FrameKind::Ack), ms(2)),
+        );
+
+        let (lines, dropped) = observer.with(|o| (o.drain_lines(), o.dropped_count()));
+        assert_eq!(dropped, 0);
+        assert_eq!(lines.len(), 2 + MAX_PENDING_EVENTS);
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some(
+                "{\"event\":\"io_server\",\"op\":\"recv\",\"kind\":\"WRITE\",\"outcome\":\"error\",\
+                 \"reason\":\"failure\",\"code\":\"TIMEOUT\",\"message\":\"last\",\
+                 \"accept_aborted_retries\":0,\"peer_credential_rejections\":0,\
+                 \"coalesced\":true,\"count\":2,\"latency_sum_us\":11000,\"latency_us\":8000}"
+            )
+        );
+        assert_eq!(
+            lines.get(1).map(String::as_str),
+            Some(
+                "{\"event\":\"io_server\",\"op\":\"send\",\"kind\":\"ACK\",\"outcome\":\"ok\",\
+                 \"accept_aborted_retries\":0,\"peer_credential_rejections\":0,\
+                 \"coalesced\":true,\"count\":1,\"latency_sum_us\":2000,\"latency_us\":2000}"
+            )
+        );
+        assert_eq!(
+            lines.get(2).map(String::as_str),
+            Some(
+                "{\"event\":\"io_server\",\"op\":\"send\",\"kind\":\"ACK\",\"outcome\":\"ok\",\
+                 \"accept_aborted_retries\":0,\"peer_credential_rejections\":0,\
+                 \"latency_us\":0}"
+            )
+        );
     }
 }

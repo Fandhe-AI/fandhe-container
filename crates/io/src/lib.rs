@@ -12,7 +12,9 @@
 //! [`server::UdsConnection`]。accept・送受信のイベントは
 //! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS `connect` と
 //! [`client::PipelineClient`] との本番結合・vsock・named pipe はまだない
-//! （REPAIR-3。スタブの明示）。
+//! （REPAIR-3。スタブの明示）。1 本の接続を送信側・受信側へ分けて並行に使う API は
+//! [`transport::SplitTransport`]（#1118）で、UDS サーバー側が
+//! [`server::UdsSendHalf`]・[`server::UdsRecvHalf`] として実装する。
 //! [`protocol::Frame`] のペイロード内部レイアウト（request id・ACK の対応付け）は
 //! [`payload`] モジュール（TASK-12.2・#74）が定める。[`client::PipelineClient::send`]
 //! はこの形式で request id を埋め込み、[`client::PipelineClient::recv_ack`]
@@ -80,11 +82,11 @@ pub use client::{
 pub use error::{IoError, IoErrorCode};
 pub use fs_normalize::{CaseCollisionSet, MAX_COLLISION_MESSAGE_PATH_CHARS, check_case_collisions};
 pub use observe::{
-    AckEvent, AckEventError, DEFAULT_SEND_LOG_CAPACITY, JsonLinesSendObserver,
-    JsonLinesServerObserver, MAX_SEND_LOG_BUFFER_BYTES, MAX_SEND_LOG_CAPACITY,
-    MAX_SEND_LOG_MESSAGE_BYTES, MAX_SERVER_AUDIT_LOG_BUFFER_BYTES, NoopSendObserver,
-    NoopServerObserver, SERVER_AUDIT_LOG_CAPACITY, SendEvent, SendEventError, SendObserver,
-    ServerEvent, ServerObserver, ServerOp, ServerOutcome,
+    AckEvent, AckEventError, CoalescedServerEvents, DEFAULT_SEND_LOG_CAPACITY,
+    JsonLinesSendObserver, JsonLinesServerObserver, MAX_SEND_LOG_BUFFER_BYTES,
+    MAX_SEND_LOG_CAPACITY, MAX_SEND_LOG_MESSAGE_BYTES, MAX_SERVER_AUDIT_LOG_BUFFER_BYTES,
+    NoopSendObserver, NoopServerObserver, SERVER_AUDIT_LOG_CAPACITY, SendEvent, SendEventError,
+    SendObserver, ServerEvent, ServerObserver, ServerOp, ServerOutcome,
 };
 pub use payload::{
     ACK_PAYLOAD_LEN, AckEnvelope, MAX_WRITE_BODY_LEN, REQUEST_ID_WIRE_LEN, RequestEnvelope,
@@ -97,13 +99,14 @@ pub use protocol::{
 pub use recv_limits::{
     AdmittedHeader, MAX_CONTROL_PAYLOAD_LEN, MAX_RECV_PENDING_FRAMES, ReceiveLimits,
 };
-pub use server::{UdsConnection, UdsServer};
+pub use server::{UdsConnection, UdsRecvHalf, UdsSendHalf, UdsServer};
 pub use settings::{
     BATCH_SIZE_OPTION, BATCH_SIZE_SETTING_KEY, BoundConnection, BoundWriteback,
     MAX_BATCH_SIZE_ARG_LEN, WritebackSettings, parse_batch_size,
 };
 pub use transport::{
-    FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, WireFrame,
+    FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, SplitTransport,
+    WireFrame,
 };
 pub use writeback::{
     AppendFileSink, BatchSink, SinkWriteReport, WritebackReport, WritebackStats, WritebackTimeouts,

@@ -223,6 +223,7 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -694,12 +695,15 @@ impl<C: ServerObserver> FrameReceiver for UdsConnection<C> {
 /// 観測フックへ後から適用する保留イベント（所有データのみを持つ）。
 type PendingEvent<C> = Box<dyn FnOnce(&mut C) + Send>;
 
-/// 保留イベントの上限件数（無制限確保の防止。security.md）。超えた分は破棄する。
+/// 保留イベントの上限件数（無制限確保の防止。security.md）。超えた分は黙って捨てず、欠落件数を数えて
+/// フックへ集約イベント（`ResourceExhausted`）として通知する（REPAIR-4）。
 const MAX_PENDING_EVENTS: usize = 1024;
 
 struct SharedObserverInner<C: ServerObserver> {
     hook: Mutex<C>,
     pending: Mutex<VecDeque<PendingEvent<C>>>,
+    /// 上限超過で保留できなかったイベントの件数（次の排出時に集約通知して 0 に戻す）。
+    dropped: AtomicU64,
 }
 
 /// 分割後の両半分が共有する観測フック（#1118。1 接続に 1 フックの意味論を保つ）。
@@ -726,6 +730,7 @@ impl<C: ServerObserver> SharedObserver<C> {
         Self(Arc::new(SharedObserverInner {
             hook: Mutex::new(hook),
             pending: Mutex::new(VecDeque::new()),
+            dropped: AtomicU64::new(0),
         }))
     }
 
@@ -745,6 +750,22 @@ impl<C: ServerObserver> SharedObserver<C> {
                 Some(event) => event(hook),
                 None => break,
             }
+        }
+        // 上限超過で捨てた分は件数だけ記録してあるので、集約イベントで欠落を知らせる。
+        let dropped = self.0.dropped.swap(0, Ordering::AcqRel);
+        if dropped > 0 {
+            let err = IoError::new(
+                IoErrorCode::ResourceExhausted,
+                format!("observer event queue overflowed; {dropped} events were dropped"),
+            );
+            emit_failure(
+                hook,
+                ServerOp::Send,
+                None,
+                ServerOutcome::Failure,
+                Duration::ZERO,
+                &err,
+            );
         }
     }
 
@@ -772,20 +793,22 @@ impl<C: ServerObserver> SharedObserver<C> {
                 };
                 self.drain_locked(&mut guard);
             }
-            if self.lock_pending().is_empty() {
+            if self.lock_pending().is_empty() && self.0.dropped.load(Ordering::Acquire) == 0 {
                 return;
             }
         }
     }
 
-    /// イベントを保留キューへ積み、待たずに排出を試みる（キュー満杯なら破棄）。
+    /// イベントを保留キューへ積み、待たずに排出を試みる（キュー満杯なら件数を数え、
+    /// 排出時に集約イベントで通知する）。
     fn notify(&self, event: PendingEvent<C>) {
         {
             let mut q = self.lock_pending();
             if q.len() >= MAX_PENDING_EVENTS {
-                return;
+                self.0.dropped.fetch_add(1, Ordering::AcqRel);
+            } else {
+                q.push_back(event);
             }
-            q.push_back(event);
         }
         self.flush();
     }
@@ -3706,5 +3729,46 @@ mod imp {
                 .expect_err("unsupported platform must reject bind");
             assert_eq!(err.code(), IoErrorCode::Unimplemented);
         }
+    }
+}
+#[cfg(test)]
+mod shared_observer_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Recorder {
+        /// 受け取ったイベントの（outcome が Failure か, エラー message）。
+        events: Vec<(bool, Option<String>)>,
+    }
+
+    impl ServerObserver for Recorder {
+        fn on_event(&mut self, event: &ServerEvent<'_>) {
+            self.events.push((
+                event.outcome == ServerOutcome::Failure,
+                event.error.as_ref().map(|e| e.message.to_owned()),
+            ));
+        }
+    }
+
+    /// REPAIR-4・#1118: 保留キューが満杯でもイベントを黙って捨てず、欠落件数を
+    /// 集約イベント（`ResourceExhausted`）で通知する。
+    #[test]
+    fn repair4_overflowed_pending_events_are_reported_as_dropped_count() {
+        let observer = SharedObserver::new(Recorder::default());
+        // フックのロックを保持中に MAX + 3 件を通知する（すべて保留される）。
+        observer.with(|_| {
+            for _ in 0..(MAX_PENDING_EVENTS + 3) {
+                notify_success(&observer, ServerOp::Send, None, Duration::ZERO);
+            }
+        });
+        observer.with(|rec| {
+            assert_eq!(rec.events.len(), MAX_PENDING_EVENTS + 1);
+            let (failed, msg) = rec.events.last().cloned().expect("summary event");
+            assert!(failed);
+            assert_eq!(
+                msg.as_deref(),
+                Some("observer event queue overflowed; 3 events were dropped")
+            );
+        });
     }
 }

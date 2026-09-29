@@ -1584,9 +1584,32 @@ mod tests {
         assert_eq!(entries(&t.0), 2);
     }
 
-    /// Windows: root 自体が symlink でも、構築後に参照先を差し替えて範囲外へ
-    /// 書けない（作成は構築時に解決した実体に留まる。IO-5。symlink 作成権限が
-    /// 無い環境では skip 相当で return する）。
+    /// Windows: `link` から `target` へのディレクトリリンクを作る。symlink の作成権限
+    /// （`SeCreateSymbolicLinkPrivilege`・開発者モード）が無い環境では、権限不要の
+    /// ジャンクション（`mklink /J`）で代替する。どちらも作れなければ失敗させる
+    /// （権限不足で試験を黙って素通りさせない）。
+    #[cfg(windows)]
+    fn link_dir(target: &Path, link: &Path) {
+        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+            return;
+        }
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("cmd /C mklink /J must be runnable");
+        assert!(
+            status.success(),
+            "neither a directory symlink nor a junction could be created: {status:?}"
+        );
+    }
+
+    /// Windows: root 自体が symlink（またはジャンクション）でも、構築後に参照先を
+    /// 差し替えて範囲外へ書けない（作成は構築時に解決した実体に留まる。IO-5）。
     #[cfg(windows)]
     #[test]
     fn io5_windows_swapped_root_symlink_does_not_escape() {
@@ -1595,12 +1618,15 @@ mod tests {
         let outside = Tmp::new();
         let link = t.0.join("link");
         std::fs::create_dir(&real).expect("real");
-        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
-            return;
-        }
+        link_dir(&real, &link);
         let c = GuestFileCreator::new(link.clone()).expect("creator");
-        let _ = std::fs::remove_dir(&link);
-        let _ = std::os::windows::fs::symlink_dir(&outside.0, &link);
+        std::fs::remove_dir(&link).expect("remove the link itself");
+        link_dir(&outside.0, &link);
+        assert!(
+            std::fs::canonicalize(&link).expect("canonicalize")
+                != std::fs::canonicalize(&real).expect("canonicalize"),
+            "the link must now point outside"
+        );
         c.create_file("sub/f").expect("create");
         assert_eq!(entries(&outside.0), 0);
         assert!(real.join("sub").join("f").exists());

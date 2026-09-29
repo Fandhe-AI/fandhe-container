@@ -228,10 +228,11 @@ jobs:
   # （PoC-8 実測に基づく 5〜10 秒のレンジ）は TASK-87.1（#40）で
   # FANDHE_CONTAINER_TEST_TIMEOUT_SECS（下記 env）として設定済み。3 OS matrix
   # （特に macOS/Windows runner のノイズ）を踏まえ上限寄りの 10 秒を採用した。
-  # 値を渡すだけで、これを読んで Duration を組み立て recv_timeout 等へ使う
-  # 消費側コードは、対象テストごとに実装される。crash_safety は組み込み済みだが
-  # 本値を読まず（自前の試行ループで制御）、TASK-85（`crates/io/tests/responsiveness.rs`
-  # 等）以降のテストが順次消費側になる（未実装のテストは実装済みを装わない。REPAIR-3）。
+  # 値を渡すだけで、これを読んで Duration を組み立て recv_timeout 等へ使うのは
+  # 各テスト側の責務である。消費側は `crates/io/tests/responsiveness.rs` と
+  # `crates/io/tests/break_detection.rs`（いずれも TEST_TIMEOUT_ENV 定数で読む）で
+  # 実装済み。crash_safety は本値を読まず（自前の試行ループで制御）、他のテストは
+  # 対象テストごとに順次消費側になる（未実装のテストは実装済みを装わない。REPAIR-3）。
   #
   # crash_safety（`crates/io/tests/crash_safety.rs`。IO-3・TASK-18.3.1・#827）:
   # SIGKILL 耐性の結合試験は本ジョブ（3 OS）の既定 CI 集合で実行し、root・KVM・
@@ -294,9 +295,10 @@ jobs:
       # run: スクリプトへ `${{ }}` を直接埋め込まない（スクリプトインジェクション対策）
       HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.hang-probe == true }}
       # 個別テスト 1 件ごとの推奨タイムアウト値（秒。PoC-8 実測に基づく
-      # 5〜10 秒のレンジの上限寄り。TASK-87.1・#40・REPAIR-5）。現時点では
-      # integration test target が 0 件のため、この値を読んで使う消費側
-      # コードはまだ無い（TASK-85 以降で追加予定。REPAIR-3）
+      # 5〜10 秒のレンジの上限寄り。TASK-87.1・#40・REPAIR-5）。この値を読んで
+      # 使う消費側は `crates/io/tests/responsiveness.rs` と
+      # `crates/io/tests/break_detection.rs` で実装済み（REPAIR-3）。crash_safety は
+      # 本値を読まず、他のテストは対象ごとに順次消費側になる
       FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"
       # crash_safety 等 required-features 付き結合試験を有効化する feature。
       # ビルド・存在確認・実行の全ステップで同一値を参照する（#827）

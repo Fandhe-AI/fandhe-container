@@ -336,6 +336,29 @@ fio-bench: ## fio 4K ランダム write ベンチを実行する（要 fio・実
 	bash scripts/fio-randwrite-4k.sh --target-dir $(call fio_bench_sq,$(TARGET_DIR)) --label $(call fio_bench_sq,$(LABEL)) --runtime $(call fio_bench_sq,$(or $(RUNTIME),30))
 
 # --------------------------------------------------
+# fio ベースライン比算出（TASK-25.2・IO-8・MS-1 Phase 2）
+# --------------------------------------------------
+# `scripts/fio-baseline-ratio.sh` は fio-randwrite-4k.sh の results.json を 2 つ
+# （baseline / candidate）受け取り、IOPS・レイテンシの倍率を出す（fio 自体は
+# 実行しない。jq のみで完結するため実機前提テストへは分離しない）。
+
+.PHONY: fio-baseline-ratio-selftest
+fio-baseline-ratio-selftest: ## fio ベースライン比算出スクリプトの自己テスト（REPAIR-12。実 fio 不要）
+	@if ! command -v jq >/dev/null 2>&1; then \
+		echo "jq is required but not found: install it (e.g. brew install jq / apt-get install jq)" >&2; \
+		exit 1; \
+	fi
+	bash scripts/fio-baseline-ratio-selftest.sh
+
+.PHONY: fio-baseline-ratio
+fio-baseline-ratio: ## fio ベースライン比を算出する（BASELINE/CANDIDATE に results.json のパスを指定）
+	@if [ -z $(call fio_bench_sq,$(BASELINE)) ] || [ -z $(call fio_bench_sq,$(CANDIDATE)) ]; then \
+		echo "usage: make fio-baseline-ratio BASELINE=<results.json> CANDIDATE=<results.json>" >&2; \
+		exit 2; \
+	fi
+	bash scripts/fio-baseline-ratio.sh --baseline $(call fio_bench_sq,$(BASELINE)) --candidate $(call fio_bench_sq,$(CANDIDATE))
+
+# --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------
 

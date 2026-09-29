@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "benchmark": "fio_randwrite_4k",
+  "label": "fandhe_shared_mount",
+  "fio_version": "fio-3.35",
+  "target_kind": "from_json",
+  "params": {
+    "rw": "randwrite",
+    "bs": "4k",
+    "ioengine": "psync",
+    "direct": 1,
+    "size": "256m",
+    "runtime": 30,
+    "iodepth": 1,
+    "numjobs": 1,
+    "end_fsync": 1,
+    "group_reporting": true,
+    "filename": "fandhe-fio-randwrite-4k.dat"
+  },
+  "metrics": {
+    "fio_randwrite_4k_iops": { "value": 1500.0, "unit": "ops/s" },
+    "fio_randwrite_4k_lat_mean_us": { "value": 400.0, "unit": "us" },
+    "fio_randwrite_4k_clat_p50_us": { "value": 320.0, "unit": "us" },
+    "fio_randwrite_4k_clat_p95_us": { "value": 720.0, "unit": "us" },
+    "fio_randwrite_4k_clat_p99_us": { "value": 1040.0, "unit": "us" }
+  }
+}

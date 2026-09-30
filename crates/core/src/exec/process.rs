@@ -36,7 +36,8 @@
 //!   無い rootfs は拒否する。端末・パイプの受け渡しは TASK-29/30 の範囲
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
 //!   間にパスが差し替わる TOCTOU を防ぐ。読み取り権限のない実行専用バイナリは開けず拒否される。
-//!   fd は 3 以上に置く
+//!   fd は 3 以上に置く。シェバン付きスクリプトは、インタープリタが開き直す新 root の `/dev/fd/N` が
+//!   同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` の用意は #834 の範囲）
 //! - **fork の健全性は `sys::fork_single_threaded` が強制する**: 呼び出し元が `Threads: 1`
 //!   でなければ fork せず `FailedPrecondition` で返す。子はクロージャの結果で必ず `_exit(2)` し、
 //!   呼び出し元のスタックへ戻らない
@@ -288,6 +289,7 @@ pub fn exec_entrypoint(
 ///    検査から実行までの間のパス差し替え〔TOCTOU〕を防ぐ。memfd による自己複製は後続の課題）
 /// 3. 開いたエントリポイントが fd 0〜2 と同一 inode なら拒否する（`/proc/self/fd/{0,1,2}` 経由の参照対策。
 ///    fd 0〜2 の実体を確認できなければ拒否。エントリポイントの fd は 3 以上に置く）。
+///    シェバン付きスクリプトは新 root の `/dev/fd/N` が同じ実体に解決することを確認する（できなければ拒否）。
 ///    fd 3 以上を `CLOEXEC` にする（CVE-2024-21626 型の fd 漏えい対策。カーネル 5.11 未満は
 ///    `ENOSYS`/`EINVAL` で fail-closed）
 /// 4. `SIGPIPE` を `SIG_DFL` へ戻す（Rust ランタイムが設定した ignore は `execve` を越えて継承される）
@@ -343,6 +345,10 @@ fn exec_entrypoint_verified(
     // mark_fds_cloexec の後に fd を継承させる（読み取り専用の同一ファイルの fd のみが漏れる）。
     let mut magic = [0u8; 2];
     let is_script = matches!((&file).read(&mut magic), Ok(2)) && &magic == b"#!";
+    if is_script {
+        // インタープリタは `/dev/fd/N` を開き直すため、新 root 内でそれが同じ実体を指すことを確認する。
+        verify_script_fd_path(Path::new("/dev/fd"), &file, &meta, entry)?;
+    }
 
     mark_fds_cloexec()?;
     reset_sigpipe()?;
@@ -358,6 +364,35 @@ fn exec_entrypoint_verified(
         STAGE,
         format!("execve({:?}) failed: {}", entry.path(), describe(err)),
     ))
+}
+
+/// シェバン付きスクリプトを `execveat(AT_EMPTY_PATH)` で実行するときの前提を確認する。
+///
+/// カーネルはインタープリタへスクリプトのパスとして `/dev/fd/N`（N は実行用 fd）を渡し、
+/// インタープリタはそれを開き直す。`dev_fd_dir`（本番は新 root の `/dev/fd`）の下の `N` が開いた fd と
+/// 同じ `(st_dev, st_ino)` に解決できなければ、スクリプトは起動できないため `FailedPrecondition`
+/// （段は `Exec`・終了コード 126）で明示的に拒否する。`/dev/fd`（`/proc/self/fd` への symlink）を
+/// rootfs に用意するのはデバイス準備の範囲（#834・TASK-27.6）で、本関数は作らず検証だけを行う。
+fn verify_script_fd_path(
+    dev_fd_dir: &Path,
+    file: &std::fs::File,
+    meta: &std::fs::Metadata,
+    entry: &Entrypoint,
+) -> Result<(), ExecError> {
+    use std::os::fd::AsRawFd as _;
+    let path = dev_fd_dir.join(file.as_raw_fd().to_string());
+    match std::fs::metadata(&path) {
+        Ok(m) if (m.dev(), m.ino()) == (meta.dev(), meta.ino()) => Ok(()),
+        _ => Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Exec,
+            format!(
+                "the entrypoint {:?} is a shebang script, but {} does not resolve to it in the new root; shebang scripts require /dev/fd (a symlink to /proc/self/fd)",
+                entry.path(),
+                path.display()
+            ),
+        )),
+    }
 }
 
 /// fd 3 以上をすべて閉じる。本番ビルドの実装。

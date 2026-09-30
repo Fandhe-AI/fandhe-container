@@ -25,7 +25,10 @@
 //!   実装済みで、他の段の実体（cgroup 参加・capability 削減・seccomp・Landlock）は未実装。非 Linux ではビルド対象外のため本 doc からは
 //!   リンクしない）
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
-//! - 予定（未作成）: `oci_runtime`（TASK-29・30）・`state_store`
+//! - `oci_runtime`: OCI Runtime のライフサイクル。現状は `config.json` の型・パーサのみ
+//!   （TASK-29.1.1 実装済み・OS 非依存）。create / start は TASK-29.2 / 29.3、kill / delete は
+//!   TASK-30 で追加する予定で未実装
+//! - 予定（未作成）: `state_store`
 //!   （TASK-31・OCI-5）・`cgroups`（TASK-32・CORE-3）・`plugin_discovery`（TASK-109）
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
@@ -44,6 +47,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod exec;
+pub mod oci_runtime;
 #[cfg(target_os = "linux")]
 mod sys;
 pub mod traits;

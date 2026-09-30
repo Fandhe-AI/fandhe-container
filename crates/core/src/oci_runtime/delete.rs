@@ -133,9 +133,16 @@ mod tests {
     use std::sync::Mutex;
 
     /// テスト専用のインメモリ `StateStore`（delete は revision 照合つき）。
+    ///
+    /// revision は `StateStore::create` の再利用禁止契約どおりストア全体で 1 から単調に採番し、同じ ID の
+    /// 削除・再作成でも過去の値を再発行しない（`next_revision` は最後に払い出した値）。
     #[derive(Default)]
     struct MemStateStore {
         records: Mutex<HashMap<ContainerId, StateRecord>>,
+        next_revision: Mutex<u64>,
+        /// Some なら最初の delete の照合前に、同じ ID を別クライアントが削除してこの状態で再作成した
+        /// ことを再現する（get と delete の間の削除・再作成の競合）。
+        recreate_before_delete: Mutex<Option<ContainerStatus>>,
         /// true なら delete で常に revision 不一致を返す。
         stale_delete: bool,
         /// stale_delete 時に delete の中でレコードを消す（並行する delete の再現）。
@@ -151,6 +158,12 @@ mod tests {
             .expect("create");
             s
         }
+        /// ストア全体で一意な revision を 1 つ払い出す。
+        fn allocate_revision(&self) -> StateRevision {
+            let mut last = self.next_revision.lock().unwrap_or_else(|e| e.into_inner());
+            *last = last.checked_add(1).expect("revision overflow");
+            StateRevision::from_raw(*last)
+        }
         fn has(&self, id: &str) -> bool {
             self.records
                 .lock()
@@ -161,15 +174,16 @@ mod tests {
 
     impl StateStore for MemStateStore {
         fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+            let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+            if records.contains_key(req.id()) {
+                return Err(TraitError::new(ErrorCode::AlreadyExists, "exists"));
+            }
             let record = StateRecord::new(
                 req.status().clone(),
                 req.bundle().to_path_buf(),
-                StateRevision::from_raw(1),
+                self.allocate_revision(),
             )?;
-            self.records
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(req.id().clone(), record.clone());
+            records.insert(req.id().clone(), record.clone());
             Ok(record)
         }
         fn update(&self, _req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
@@ -187,6 +201,20 @@ mod tests {
             Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
         }
         fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+            let recreate = self
+                .recreate_before_delete
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(status) = recreate {
+                self.records
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(req.id());
+                self.create(
+                    &CreateStateRequest::new(status, std::env::temp_dir().join("b2")).expect("req"),
+                )?;
+            }
             let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
             if self.stale_delete {
                 if self.remove_on_stale {
@@ -357,6 +385,28 @@ mod tests {
             "container state changed during delete; retry"
         );
         assert!(store.has("c1"));
+    }
+
+    /// CORE-2・OCI-5: get の後に同じ ID が削除・再作成されても、新しいレコードは消さない。再作成された
+    /// レコードの revision はストア全体の単調採番で旧 revision と異なるため、delete は revision 不一致になり、
+    /// レコードが残っていることを確かめて再試行を促す `FailedPrecondition` を返す。
+    #[test]
+    fn core2_delete_does_not_remove_recreated_record() {
+        let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
+        let recreated = ContainerStatus::created(cid("c1"), None);
+        *store
+            .recreate_before_delete
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(recreated.clone());
+        let err = run(&store, "c1", false).expect_err("stale");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "container state changed during delete; retry"
+        );
+        let rec = store.get(&GetStateRequest::new(cid("c1"))).expect("kept");
+        assert_eq!(rec.status(), &recreated);
+        assert_eq!(rec.revision(), StateRevision::from_raw(2));
     }
 
     /// REPAIR-4: 成功と失敗が 1 件ずつ操作名 `delete` で記録される。

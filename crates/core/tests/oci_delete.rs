@@ -23,15 +23,27 @@ use fandhe_container_core::traits::{
 use serde_json::{Value, json};
 
 /// テスト専用のインメモリ `StateStore`。`update` / `delete` は revision を照合する。
+///
+/// revision は `StateStore::create` / `update` の契約どおりストア全体で 1 から単調に採番し、同じ ID の
+/// 削除・再作成でも過去の値を再発行しない（`last_revision` は最後に払い出した値）。
 struct MemStateStore {
     records: Mutex<HashMap<ContainerId, StateRecord>>,
+    last_revision: Mutex<u64>,
 }
 
 impl MemStateStore {
     fn new() -> Self {
         Self {
             records: Mutex::new(HashMap::new()),
+            last_revision: Mutex::new(0),
         }
+    }
+
+    /// ストア全体で一意な revision を 1 つ払い出す。
+    fn allocate_revision(&self) -> StateRevision {
+        let mut last = self.last_revision.lock().unwrap_or_else(|e| e.into_inner());
+        *last = last.checked_add(1).expect("revision overflow");
+        StateRevision::from_raw(*last)
     }
 
     fn record_of(&self, id: &str) -> Result<StateRecord, TraitError> {
@@ -48,7 +60,7 @@ impl StateStore for MemStateStore {
         let record = StateRecord::new(
             req.status().clone(),
             req.bundle().to_path_buf(),
-            StateRevision::from_raw(1),
+            self.allocate_revision(),
         )?;
         records.insert(req.id().clone(), record.clone());
         Ok(record)
@@ -65,7 +77,7 @@ impl StateStore for MemStateStore {
         let next = StateRecord::new(
             req.status().clone(),
             cur.bundle().to_path_buf(),
-            cur.revision().next()?,
+            self.allocate_revision(),
         )?;
         records.insert(req.status().id().clone(), next.clone());
         Ok(next)

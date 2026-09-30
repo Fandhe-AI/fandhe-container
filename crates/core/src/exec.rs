@@ -826,14 +826,15 @@ fn unshare_and_configure(
 /// - 呼び出し側が [`MountIsolation::establish`] で得た証跡を提示し、呼び出し直前の状態が
 ///   証跡と一致する（PID 1 であること・呼び出しスレッドの mount / PID namespace が作成時と
 ///   同じこと）。証跡を受け取った親・PID 1 が fork した子・別スレッドからの呼び出しは拒否する
-/// - `rootfs` 自体とその祖先に symlink がない（`canonicalize` した実パスが `rootfs` と一致）
 /// - `rootfs` / `target` は絶対パスで NUL・`..` を含まず、`target` は `rootfs` より下の専用ディレクトリ
 ///   （`target == rootfs` は拒否）
-/// - `/` から `target` までを `openat(O_PATH|O_DIRECTORY|O_NOFOLLOW)` で 1 要素ずつ辿って
-///   fd で固定し（`open_dir_beneath`）、マウントは `/proc/thread-self/fd/N` 経由で同じ実体に対して
-///   行う（検証後の差し替え = TOCTOU の防止）。symlink・非ディレクトリ・不在の要素があれば
-///   拒否する。O_PATH のため祖先に要るのは search（実行）権限だけで、user namespace 内から
-///   読み取り不可・実行可のホスト側ディレクトリを辿れる
+/// - `/` から `rootfs` までを `openat(O_PATH|O_DIRECTORY|O_NOFOLLOW)` で 1 要素ずつ辿って rootfs を
+///   fd で固定し（rootfs 自体・祖先に symlink・非ディレクトリがあれば拒否）、続けて**その rootfs の
+///   fd を起点に** `target` の残りの要素を同様に辿る（`open_dir_beneath`）。パスを別の操作で
+///   解決し直さないため、検証後に祖先を改名・差し替えられても、固定した rootfs の外へは出ない
+///   （TOCTOU の防止）。マウントは `/proc/thread-self/fd/N` 経由で同じ実体に対して行う。
+///   O_PATH のため祖先に要るのは search（実行）権限だけで、user namespace 内から読み取り不可・
+///   実行可のホスト側ディレクトリを辿れる
 /// - 固定した fd が属するマウント（`/proc/thread-self/fdinfo/N` の `mnt_id`）の propagation が
 ///   `shared` でない（mount namespace 分離済みで `MS_PRIVATE` 化されていること。shared の
 ///   ままではマウントがホストへ伝播する）。パス文字列ではなく fd で判定し、検証と実マウント
@@ -866,19 +867,6 @@ fn mount_proc_verified(rootfs: &Path, target: &Path) -> Result<(), ExecError> {
     let rel = target
         .strip_prefix(rootfs)
         .map_err(|_| violation(ViolationReason::TargetOutsideRootfs, target))?;
-    // rootfs 自体・祖先が symlink だとマウント先を誘導できるため、実パスとの一致を要求する。
-    // 不在は違反（呼び出し側のパス誤り）、それ以外の失敗（権限不足等）はシステムエラー。
-    // 正規化後の実パス（ホスト側の詳細）は違反記録・メッセージに含めない。
-    let real_root = std::fs::canonicalize(rootfs).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            violation(ViolationReason::RootfsMissing, rootfs)
-        } else {
-            ExecError::from_io(&e, IsolationStage::MountProc, "canonicalize(rootfs)")
-        }
-    })?;
-    if real_root.components().ne(rootfs.components()) {
-        return Err(violation(ViolationReason::RootfsNotCanonical, rootfs));
-    }
     // rootfs 自体をマウント先にすると rootfs 全体を procfs で覆えるため、専用の下位ディレクトリを要求する。
     let names: Vec<&OsStr> = rel
         .components()
@@ -890,9 +878,10 @@ fn mount_proc_verified(rootfs: &Path, target: &Path) -> Result<(), ExecError> {
     if names.is_empty() {
         return Err(violation(ViolationReason::TargetIsRootfs, target));
     }
-    // `/` から rootfs・target まで 1 要素ずつ開き、検証した実体を fd で固定する
-    // （検証後のパス差し替え = TOCTOU の防止）。以後の判定・マウントはこの fd 経由でのみ行う。
-    let dir = open_dir_beneath(&real_root, &names)?;
+    // `/` から rootfs まで 1 要素ずつ開いて rootfs を fd で固定し、その fd を起点に target を
+    // 辿る（検証と使用を同じ解決で行い、別の操作でパスを解決し直さない = TOCTOU の防止）。
+    // 以後の判定・マウントはこの fd 経由でのみ行う。
+    let dir = open_dir_beneath(rootfs, &names)?;
     if mount_is_shared(&dir)? {
         return Err(violation(ViolationReason::TargetOnSharedMount, target));
     }
@@ -928,35 +917,82 @@ fn mount_proc_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
     Ok(())
 }
 
-/// `/` から `real_root`（symlink を含まない正規化済み絶対パス）の各要素、続けて `names` を
-/// 1 要素ずつ `O_PATH|O_DIRECTORY|O_NOFOLLOW` で開き、最後の要素の fd を返す（副作用なし）。
+/// `/` から `rootfs`（絶対パス）の各要素を 1 要素ずつ `O_PATH|O_DIRECTORY|O_NOFOLLOW` で開いて
+/// rootfs を fd で固定し、続けてその fd を起点に `names` を同様に開き、最後の要素の fd を返す
+/// （副作用なし）。
 ///
 /// [`mount_proc`] のマウント先固定に使う。各要素は直前の fd を起点に開くため、途中の要素を
-/// symlink へ差し替えても辿る実体は変わらない。O_PATH は読み取り権限を要求しないため、
-/// 実行権限のみの祖先（`CLONE_NEWUSER` 後のホスト所有ディレクトリ等）も辿れる。
-/// 拒否は違反記録付きの `InvalidArgument`（symlink・非ディレクトリ・不在・NUL）。search 権限
-/// 不足（`PermissionDenied`）等のその他の errno はシステムエラー（違反記録なし）。違反記録の
-/// 対象は `real_root` と `names` を連結したパス（呼び出し側が渡したマウント先と同じ）。
-fn open_dir_beneath(real_root: &Path, names: &[&OsStr]) -> Result<OwnedFd, ExecError> {
-    let target = || names.iter().fold(real_root.to_path_buf(), |p, n| p.join(n));
-    let violation = |r: ViolationReason| ExecError::from_violation(r, Some(&target()));
-    let open_err = |e: SysError| match e {
-        // O_DIRECTORY|O_NOFOLLOW では symlink も ENOTDIR になる。ELOOP は念のため残す。
-        SysError::Os(sys::ELOOP) | SysError::Os(sys::ENOTDIR) => {
-            violation(ViolationReason::PathSymlinkOrNotDirectory)
+/// symlink へ差し替えても、祖先を改名しても、辿る実体は固定した rootfs の中に留まる。O_PATH は
+/// 読み取り権限を要求しないため、実行権限のみの祖先（`CLONE_NEWUSER` 後のホスト所有
+/// ディレクトリ等）も辿れる。
+///
+/// 拒否は違反記録付きの `InvalidArgument`:
+/// - rootfs 側（対象は `rootfs`）: symlink・非ディレクトリ → `RootfsSymlinkOrNotDirectory`、
+///   不在 → `RootfsMissing`
+/// - rootfs より下（対象は `rootfs` と `names` を連結したマウント先）: symlink・非ディレクトリ
+///   → `PathSymlinkOrNotDirectory`、不在 → `PathMissing`、NUL → `PathContainsNul`
+///
+/// search 権限不足（`PermissionDenied`）等のその他の errno はシステムエラー（違反記録なし）。
+fn open_dir_beneath(rootfs: &Path, names: &[&OsStr]) -> Result<OwnedFd, ExecError> {
+    let target = || names.iter().fold(rootfs.to_path_buf(), |p, n| p.join(n));
+    let open_err = |e: SysError, below_rootfs: bool| {
+        let (not_dir, missing) = if below_rootfs {
+            (
+                ViolationReason::PathSymlinkOrNotDirectory,
+                ViolationReason::PathMissing,
+            )
+        } else {
+            (
+                ViolationReason::RootfsSymlinkOrNotDirectory,
+                ViolationReason::RootfsMissing,
+            )
+        };
+        let violation = |r: ViolationReason| {
+            let subject = if below_rootfs {
+                target()
+            } else {
+                rootfs.to_path_buf()
+            };
+            ExecError::from_violation(r, Some(&subject))
+        };
+        match e {
+            // O_DIRECTORY|O_NOFOLLOW では symlink も ENOTDIR になる。ELOOP は念のため残す。
+            SysError::Os(sys::ELOOP) | SysError::Os(sys::ENOTDIR) => violation(not_dir),
+            SysError::Os(sys::ENOENT) => violation(missing),
+            other => ExecError::from_sys(other, IsolationStage::MountProc, "openat"),
         }
-        SysError::Os(sys::ENOENT) => violation(ViolationReason::PathMissing),
-        other => ExecError::from_sys(other, IsolationStage::MountProc, "openat"),
     };
-    let mut cur = sys::open_dir_path_nofollow(None, c"/").map_err(open_err)?;
-    let root_names = real_root.components().filter_map(|c| match c {
-        Component::Normal(n) => Some(n),
-        _ => None,
-    });
-    for name in root_names.chain(names.iter().copied()) {
-        let c_name = CString::new(name.as_bytes())
-            .map_err(|_| violation(ViolationReason::PathContainsNul))?;
-        cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c_name).map_err(open_err)?;
+    let c_name = |name: &OsStr, below_rootfs: bool| {
+        CString::new(name.as_bytes()).map_err(|_| {
+            let subject = if below_rootfs {
+                target()
+            } else {
+                rootfs.to_path_buf()
+            };
+            ExecError::from_violation(ViolationReason::PathContainsNul, Some(&subject))
+        })
+    };
+    // 1 段目: `/` から rootfs を固定する。
+    let mut cur = sys::open_dir_path_nofollow(None, c"/").map_err(|e| open_err(e, false))?;
+    for c in rootfs.components() {
+        let name = match c {
+            Component::Normal(n) => n,
+            Component::RootDir | Component::CurDir => continue,
+            // 呼び出し側で `..`・相対パスを拒否済み。ここへ来たら構成の誤りとして拒否する。
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(ExecError::from_violation(
+                    ViolationReason::PathParentComponent,
+                    Some(rootfs),
+                ));
+            }
+        };
+        let c = c_name(name, false)?;
+        cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c).map_err(|e| open_err(e, false))?;
+    }
+    // 2 段目: 固定した rootfs の fd を起点にマウント先を辿る。
+    for name in names {
+        let c = c_name(name, true)?;
+        cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c).map_err(|e| open_err(e, true))?;
     }
     Ok(cur)
 }
@@ -1564,7 +1600,12 @@ mod tests {
         std::os::unix::fs::symlink(&root, &alias).unwrap();
         let err = mount_proc_verified(&alias, &alias.join("real")).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument, "rootfs symlink");
-        assert!(err.message.contains("canonical path"), "{}", err.message);
+        assert!(
+            err.message
+                .contains("rootfs and its ancestors must be directories"),
+            "{}",
+            err.message
+        );
     }
 
     /// CORE-1（Cursor Bugbot 指摘の回帰）: rootfs の祖先に実行権限のみ（読み取り不可）の
@@ -1800,7 +1841,7 @@ mod tests {
             (
                 alias.clone(),
                 alias.join("real"),
-                "rootfs_not_canonical",
+                "rootfs_symlink_or_not_directory",
                 s(&alias),
             ),
             (

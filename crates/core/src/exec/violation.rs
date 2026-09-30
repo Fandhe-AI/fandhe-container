@@ -111,8 +111,8 @@ pub enum ViolationReason {
     TargetOutsideRootfs,
     /// rootfs が存在しない。
     RootfsMissing,
-    /// rootfs 自体または祖先に symlink がある（正規化した実パスと一致しない）。
-    RootfsNotCanonical,
+    /// rootfs 自体または祖先に symlink・非ディレクトリがある。
+    RootfsSymlinkOrNotDirectory,
     /// マウント先が rootfs そのもの。
     TargetIsRootfs,
     /// 経路上に symlink または非ディレクトリがある。
@@ -149,7 +149,7 @@ impl ViolationReason {
             Self::PathParentComponent => "path_parent_component",
             Self::TargetOutsideRootfs => "target_outside_rootfs",
             Self::RootfsMissing => "rootfs_missing",
-            Self::RootfsNotCanonical => "rootfs_not_canonical",
+            Self::RootfsSymlinkOrNotDirectory => "rootfs_symlink_or_not_directory",
             Self::TargetIsRootfs => "target_is_rootfs",
             Self::PathSymlinkOrNotDirectory => "path_symlink_or_not_directory",
             Self::PathMissing => "path_missing",
@@ -182,7 +182,7 @@ impl ViolationReason {
             | Self::PathParentComponent
             | Self::TargetOutsideRootfs
             | Self::RootfsMissing
-            | Self::RootfsNotCanonical
+            | Self::RootfsSymlinkOrNotDirectory
             | Self::TargetIsRootfs
             | Self::PathSymlinkOrNotDirectory
             | Self::PathMissing => ViolationKind::MountTarget,
@@ -214,7 +214,7 @@ impl ViolationReason {
             | Self::PathParentComponent
             | Self::TargetOutsideRootfs
             | Self::RootfsMissing
-            | Self::RootfsNotCanonical
+            | Self::RootfsSymlinkOrNotDirectory
             | Self::TargetIsRootfs
             | Self::PathSymlinkOrNotDirectory
             | Self::PathMissing => ErrorCode::InvalidArgument,
@@ -290,8 +290,8 @@ impl ViolationReason {
             Self::PathParentComponent => "rootfs and proc mount target must not contain '..'",
             Self::TargetOutsideRootfs => "proc mount target must be under rootfs",
             Self::RootfsMissing => "rootfs must exist",
-            Self::RootfsNotCanonical => {
-                "rootfs must be a canonical path without symlinks in itself or its ancestors"
+            Self::RootfsSymlinkOrNotDirectory => {
+                "rootfs and its ancestors must be directories, not symlinks"
             }
             Self::TargetIsRootfs => {
                 "proc mount target must be a dedicated directory below rootfs, not rootfs itself"

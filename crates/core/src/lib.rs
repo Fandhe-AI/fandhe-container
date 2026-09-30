@@ -18,15 +18,18 @@
 //! # モジュール構成
 //!
 //! - `traits`: 拡張点トレイト（実装済み。TASK-4 系）
-//! - `exec`: 最小実行フロー（Linux 限定・未実装スタブ。TASK-27。非 Linux ではビルド対象外のため
-//!   本 doc からはリンクしない）
+//! - `exec`: 最小実行フロー（Linux 限定。namespace 分離〔TASK-27.2〕のみ実装済みで、
+//!   `pivot_root`・fork / exec 等は未実装。非 Linux ではビルド対象外のため本 doc からは
+//!   リンクしない）
+//! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - 予定（未作成）: `devices`（TASK-27.6）・`oci_runtime`（TASK-29・30）・`state_store`
-//!   （TASK-31・OCI-5）・`cgroups`（TASK-32・CORE-3）・`plugin_discovery`（TASK-109）・
-//!   `sys`（syscall ラッパー。`unsafe` の事前承認範囲）
+//!   （TASK-31・OCI-5）・`cgroups`（TASK-32・CORE-3）・`plugin_discovery`（TASK-109）
 //!
 //! 実行層本体（namespace・cgroups v2・seccomp/Landlock・rootless 等）は G3（TASK-27〜50）で
 //! 実装する未実装のままである（REPAIR-3: 実装済みを装わず、未実装であることも隠さない）。
 
 #[cfg(target_os = "linux")]
 pub mod exec;
+#[cfg(target_os = "linux")]
+mod sys;
 pub mod traits;

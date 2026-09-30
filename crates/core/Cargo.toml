@@ -9,3 +9,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+# namespace 分離の結合試験（CORE-1・TASK-27.2）。libtest はテストをスレッドで実行し
+# CLONE_NEWUSER が EINVAL になるため、単一スレッドの独自 main（harness = false）で動かす。
+[[test]]
+name = "unshare_isolation"
+path = "tests/unshare_isolation.rs"
+harness = false

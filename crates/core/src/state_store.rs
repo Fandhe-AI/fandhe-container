@@ -999,10 +999,16 @@ impl StateDto {
     }
 
     /// 公開コンストラクタで組み直し、矛盾があれば `Internal`（壊れた値を表現させない）。
+    ///
+    /// 書き込み側（`from_record`）が拒否する値は読み込み側でも破損として拒否する（読めても
+    /// `update` で書き戻せないレコードを健全扱いにしないため。回復は `purge_corrupted`）。
     fn into_record(self, dir_id: &ContainerId) -> Result<StateRecord, TraitError> {
         let corrupted = || internal("state file is inconsistent");
         if self.oci_version != OCI_VERSION {
             return Err(internal("state file has an unsupported ociVersion"));
+        }
+        if check_bundle_len(Path::new(&self.bundle)).is_err() {
+            return Err(corrupted());
         }
         let id = ContainerId::new(self.id).map_err(|_| corrupted())?;
         if id != *dir_id {

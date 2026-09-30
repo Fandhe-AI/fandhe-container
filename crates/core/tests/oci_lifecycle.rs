@@ -111,6 +111,8 @@ impl StateStore for MemStateStore {
 #[derive(Debug, PartialEq)]
 struct LaunchRecord {
     rootfs: PathBuf,
+    /// `LaunchSpec::rootfs_dir()` の固定ハンドルを fstat した (st_dev, st_ino)（SEC-1。fd 固定契約の検証用）。
+    pinned_rootfs_id: (u64, u64),
     args: Vec<String>,
     env: Vec<String>,
     hostname: Option<String>,
@@ -181,9 +183,20 @@ impl ProcessLauncher for RecordingLauncher {
         spec: &LaunchSpec,
         _timeout: Duration,
     ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        use std::os::unix::fs::MetadataExt;
         self.launches.fetch_add(1, Ordering::SeqCst);
+        // 固定ハンドルが有効な fd であることを fstat で確かめ、指す inode を記録する。
+        let pinned = std::fs::File::from(
+            spec.rootfs_dir()
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(|_| TraitError::new(ErrorCode::Internal, "pinned rootfs fd is invalid"))?,
+        )
+        .metadata()
+        .map_err(|_| TraitError::new(ErrorCode::Internal, "pinned rootfs fstat failed"))?;
         self.records().push(LaunchRecord {
             rootfs: spec.rootfs().to_path_buf(),
+            pinned_rootfs_id: (pinned.dev(), pinned.ino()),
             args: spec.args().to_vec(),
             env: spec.env().to_vec(),
             hostname: spec.hostname().map(str::to_string),
@@ -336,10 +349,21 @@ fn oci4_core2_create_then_start_full_lifecycle() {
 
     // LaunchSpec の全フィールド。
     assert_eq!(launcher.launches(), 1);
+    // 固定ハンドルは bundle の rootfs ディレクトリそのもの（bundle 直下ではない）を指す（SEC-1）。
+    let expected_rootfs = std::fs::metadata(b.dir.join("rootfs")).expect("stat rootfs");
+    let bundle_meta = std::fs::metadata(&b.dir).expect("stat bundle");
+    let pinned_id = {
+        use std::os::unix::fs::MetadataExt;
+        let id = launcher.records()[0].pinned_rootfs_id;
+        assert_eq!(id, (expected_rootfs.dev(), expected_rootfs.ino()));
+        assert_ne!(id, (bundle_meta.dev(), bundle_meta.ino()));
+        id
+    };
     assert_eq!(
         *launcher.records(),
         [LaunchRecord {
             rootfs: b.dir.join("rootfs"),
+            pinned_rootfs_id: pinned_id,
             args: vec!["/bin/echo".to_string(), "lifecycle".to_string()],
             env: vec!["PATH=/usr/bin:/bin".to_string(), "LIFECYCLE=1".to_string()],
             hostname: Some("lifecycle".to_string()),

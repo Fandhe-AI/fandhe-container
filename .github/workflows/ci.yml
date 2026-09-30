@@ -233,7 +233,8 @@ jobs:
   # 値を渡すだけで、これを読んで Duration を組み立て recv_timeout 等へ使うのは
   # 各テスト側の責務である。消費側は `crates/io/tests/responsiveness.rs` と
   # `crates/io/tests/break_detection.rs`（いずれも TEST_TIMEOUT_ENV 定数で読む）で
-  # 実装済み。crash_safety は本値を読まず（自前の試行ループで制御）、他のテストは
+  # 実装済み。`crates/core/tests/unshare_isolation.rs` も子プロセス待ちで読む。
+  # crash_safety は本値を読まず（自前の試行ループで制御）、他のテストは
   # 対象テストごとに順次消費側になる（未実装のテストは実装済みを装わない。REPAIR-3）。
   #
   # crash_safety（`crates/io/tests/crash_safety.rs`。IO-3・TASK-18.3.1・#827）:
@@ -250,6 +251,29 @@ jobs:
   # そこで「crash_safety の存在確認」ステップを置き、ビルド・確認・実行の 3 箇所が
   # 同一の INTEGRATION_TEST_FEATURES を参照する形で feature 欠落を検出する。
   # rust-ci の `--all-features` でも同テストは重複して実行される。
+  #
+  # unshare_isolation（`crates/core/tests/unshare_isolation.rs`。CORE-1・SEC-5・
+  # TASK-27.2・#1159）: namespace 分離の実挙動を検証する実機前提テストで、
+  # `harness = false` のため `-- --ignored` を付けたときだけ分離を検証し、付けない
+  # 上記の既定実行では「ignored」を出力して成功終了するだけになる。この穴を塞ぐため、
+  # 既定の結合試験の実行ステップの後ろに Linux 限定の 3 ステップを置いて
+  # `--ignored` 付きで実行する。
+  # - Linux 限定なのは本テストが Linux 専用（`exec` モジュールが非 Linux ではビルド
+  #   対象外で OS 非該当）だからで、ポータブルなテストを特定 OS で飛ばすものではない。
+  # - 新しい check-run を増やさないため別ジョブにせず本ジョブのステップとした
+  #   （ruleset への個別登録が要るため。check-run は 29 件のまま）。
+  # - ubuntu 24.04 以降のランナーは AppArmor の
+  #   `kernel.apparmor_restrict_unprivileged_userns=1` で非特権 user namespace を
+  #   制限する。sudo で rootful 実行する案ではなく、この sysctl を 0 に緩めて非 root
+  #   のまま実行する案を採った。SEC-5 の既定である rootless 経路
+  #   （`RootlessSingleId`）を CI が検証でき、テストバイナリと cargo に特権を
+  #   与えず sudo を固定キーの sysctl 書き込みだけに限れるため。rootful
+  #   （`RootfulHostRoot`）経路は本ステップでは未検証。
+  # - sysctl の変更はジョブ終了で破棄されるエフェメラル VM のカーネル設定に閉じ、
+  #   リポジトリ・secrets・他ジョブへ影響しない。結合試験の実行ステップより後ろに
+  #   置き、他の結合試験の環境を変えない。
+  # - `harness = false` のため `--ignored` が届かなくても exit 0 になる。false-green を
+  #   防ぐため、成功行がログにあることを grep で照合する。
   #
   # TASK-87.2（#41）: CI ジョブ全体のハング防止の最終確認について。下記の
   # ハングプローブ機構自体は TASK-86.2（#36）で実装済み。本 concurrency
@@ -299,7 +323,8 @@ jobs:
       # 個別テスト 1 件ごとの推奨タイムアウト値（秒。PoC-8 実測に基づく
       # 5〜10 秒のレンジの上限寄り。TASK-87.1・#40・REPAIR-5）。この値を読んで
       # 使う消費側は `crates/io/tests/responsiveness.rs` と
-      # `crates/io/tests/break_detection.rs` で実装済み（REPAIR-3）。crash_safety は
+      # `crates/io/tests/break_detection.rs`・`crates/core/tests/unshare_isolation.rs` で
+      # 実装済み（REPAIR-3）。crash_safety は
       # 本値を読まず、他のテストは対象ごとに順次消費側になる
       FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"
       # crash_safety 等 required-features 付き結合試験を有効化する feature。
@@ -412,6 +437,42 @@ jobs:
           cargo test --workspace --test '*' --features "${INTEGRATION_TEST_FEATURES}"
           # crash_test_server bin 内のユニットテスト（--test '*' の対象外）も実行する
           cargo test -p fandhe-container-io --bins --features crash-test-server
+
+      - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          key_file="/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+          if [ -e "${key_file}" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            value="$(cat "${key_file}")"
+            if [ "${value}" != "0" ]; then
+              echo "::error::apparmor_restrict_unprivileged_userns is ${value}, expected 0" >&2
+              exit 1
+            fi
+            echo "apparmor_restrict_unprivileged_userns=${value}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::notice::apparmor_restrict_unprivileged_userns not present (nothing to relax)"
+          fi
+
+      - name: unshare_isolation のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-core --test unshare_isolation --no-run
+
+      - name: unshare_isolation の実行（実機前提テスト・--ignored。CORE-1・SEC-5・TASK-27.2）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/unshare_isolation.log"
+          cargo test -p fandhe-container-core --test unshare_isolation -- --ignored 2>&1 | tee "${log}"
+          if ! grep -Fq 'unshare_isolation: full isolation verified (root=false)' "${log}"; then
+            echo "::error::unshare_isolation did not report full isolation (possibly not executed)" >&2
+            exit 1
+          fi
+          echo "unshare_isolation: full isolation verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::unshare_isolation verified"
 
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）

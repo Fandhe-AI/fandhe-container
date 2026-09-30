@@ -14,8 +14,9 @@
 //! # 実機前提テストとしての分離
 //! 実行には root もしくは非特権 user namespace を許可するホストが必要（AppArmor の
 //! `kernel.apparmor_restrict_unprivileged_userns=1` 等の環境では `PermissionDenied` になる）。
-//! GitHub ホステッド runner で保証できないため、`#[ignore]` 相当（`-- --ignored` 指定時のみ実行）で
-//! 既定のテスト集合（`--all-features` を含む）から分離している（ci.md「実機前提テスト」）。実行された場合は分離の拒否を含め
+//! 既定のテスト集合（`--all-features` を含む）からは `#[ignore]` 相当（`-- --ignored` 指定時のみ実行）で
+//! 分離している（ci.md「実機前提テスト」）。CI では `integration-test`（ubuntu-latest）が AppArmor の
+//! 制限を緩めた上で `--ignored` 付きで実行する（#1159）。実行された場合は分離の拒否を含め
 //! あらゆる失敗を失敗として扱い、検証せずに成功終了する分岐は持たない。
 
 #[cfg(not(target_os = "linux"))]

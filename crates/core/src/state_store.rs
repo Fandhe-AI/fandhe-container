@@ -1240,6 +1240,44 @@ mod tests {
         );
     }
 
+    /// OCI-5: 破損レコードが対象ページの外（後ろ）にあっても list は fail-closed で失敗する。
+    #[test]
+    fn oci5_list_detects_corruption_outside_the_page() {
+        let t = TmpDir::new("listoutside");
+        let store = t.open();
+        create(&store, "a");
+        create(&store, "z");
+        fs::write(t.path().join("z").join("state.json"), b"{not json").unwrap();
+        let e = store.list(&list_req(1)).unwrap_err();
+        assert_eq!(e.code().as_str(), "INTERNAL");
+        assert_eq!(e.message(), "state file is corrupted");
+        // 回復すれば同じ要求が成功し、健全なレコードだけが返る。
+        store.purge_corrupted(&cid("z")).unwrap();
+        let page = store.list(&list_req(1)).unwrap();
+        let ids: Vec<&str> = page.records().iter().map(|r| r.id().as_str()).collect();
+        assert_eq!(ids, ["a"]);
+        assert!(page.next_cursor().is_none());
+    }
+
+    /// OCI-5: カーソルより前にある破損レコードも検出する（後続ページの取得でも fail-closed）。
+    #[test]
+    fn oci5_list_detects_corruption_before_the_cursor() {
+        let t = TmpDir::new("listbefore");
+        let store = t.open();
+        for id in ["a", "b", "c"] {
+            create(&store, id);
+        }
+        let first = store.list(&list_req(2)).unwrap();
+        let cursor = first.next_cursor().unwrap().clone();
+        assert_eq!(cursor.as_str(), "b");
+        let bad =
+            r#"{"ociVersion":"1.2.0","id":"z","status":"created","bundle":"/b","revision":1}"#;
+        fs::write(t.path().join("b").join("state.json"), bad).unwrap();
+        let e = store.list(&list_req(2).with_cursor(cursor)).unwrap_err();
+        assert_eq!(e.code().as_str(), "INTERNAL");
+        assert_eq!(e.message(), "state file is inconsistent");
+    }
+
     #[test]
     fn oci5_delete_removes_state_file_and_dir() {
         let t = TmpDir::new("del");

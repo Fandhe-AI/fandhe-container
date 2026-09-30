@@ -19,17 +19,34 @@
 //!   [`OpRecorder::dropped_records`] に数える
 //! - 集計は `Mutex` 1 個で保護し、poison は回復する（ロック内で panic しうる処理を置かないため状態は整合する）
 //!
+//! # 構造化出力（TASK-84.3）
+//!
+//! [`OpRecorder::export_json_lines`] が集計スナップショットを JSON Lines（1 行 1 JSON オブジェクト・
+//! LF 終端）で任意の [`std::io::Write`] へ書き出す。確定した判断は次のとおり。
+//!
+//! - 操作 1 種類につき 1 行（名前昇順）。全キーが常在する固定スキーマで、レイテンシが未取得
+//!   （0 件）でも 4 つのレイテンシキーは省略せず `null` を出す（キー集合を全行で一定にする）
+//!   `{"event":"op_stats","op":"read","success":3,"failure":2,"count":5,"min_us":1000,"mean_us":3000,"p95_us":5000,"max_us":6000}`
+//! - 末尾にメタ行を常に 1 行出す（空の記録器でも `ops:0` で出る）。記録落ちを観測可能にするため
+//!   `{"event":"op_stats_meta","ops":3,"dropped_records":0}`
+//! - 単位は整数マイクロ秒（`_us`。io の `latency_us` と揃える。PoC-8 の ms 小数表記は採らない）。
+//!   タイムスタンプ・pid 等の共通ヘッダや監査ログとの形式統一は TASK-98（ERR-4）の責務で、ここでは付けない
+//! - I/O は集計のロックを解放してから行う（出力先がブロックしても記録経路を止めない。REPAIR-5）
+//! - 出力先が `None` なら何も書かず成功を返す。書き込み・flush の失敗は panic せず
+//!   `ErrorCode::Internal` の [`TraitError`] で返す。途中失敗時は部分的な行が書かれうる
+//!   （再送・重複排除は呼び出し元の責務）
+//!
 //! # 未実装範囲（REPAIR-3）
 //!
 //! 以下は未実装である。
 //!
-//! - 構造化ログ / JSON Lines での出力: TASK-84.3
 //! - create / start / kill / delete への計装: TASK-84.4
 //! - io の read / write 向け連携点と io 側の計装: TASK-84.5・TASK-84.7
 //! - 結合テスト: TASK-84.6
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::io::Write;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -46,7 +63,7 @@ pub const MAX_TRACKED_OPS: usize = 64;
 
 /// 検証済みの操作名（`read`・`write`・`create`・`start` 等）。
 ///
-/// TASK-84.3 で JSON Lines のキー / 値として出力するため、`[A-Za-z0-9._-]` かつ
+/// TASK-84.3 の JSON Lines 出力でキー / 値として書き出すため、`[A-Za-z0-9._-]` かつ
 /// [`OP_NAME_MAX_LEN`] バイト以下に限り、改行・引用符・制御文字によるログ行の偽装や分割を
 /// 型の段階で防ぐ。閉じた enum にしないのは、TASK-84.5 で io 側の操作名を core に依存せず
 /// 渡す方式が未決定のため。資格情報やホスト側の実パスをログのフィールドになる操作名に入れない。
@@ -543,6 +560,137 @@ impl OpRecorder {
     pub fn dropped_records(&self) -> u64 {
         self.lock().dropped
     }
+
+    /// 集計スナップショットを JSON Lines として `sink` へ書き出す（REPAIR-4・TASK-84.3）。
+    ///
+    /// 形式はモジュール doc を参照。`sink` が `None` なら何も書かず `Ok` を返す。集計の取得後に
+    /// ロックを解放してから書くため、`sink` 内から同じ記録器を呼んでもデッドロックしない。
+    /// 書き込み・flush の失敗は `ErrorCode::Internal` を返す（メッセージは `ErrorKind` と
+    /// 書けた行数のみで、OS メッセージ全文は含めない）。途中失敗では部分的な行が残りうる。
+    /// 操作名に資格情報やホストの実パスを入れない契約は [`OpName`] を参照。
+    ///
+    /// ```
+    /// use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
+    /// use std::time::Duration;
+    ///
+    /// let r = OpRecorder::new();
+    /// r.record(&OpName::new("read").unwrap(), OpOutcome::Success, Duration::from_millis(2)).unwrap();
+    /// let mut out: Vec<u8> = Vec::new();
+    /// let report = r.export_json_lines(Some(&mut out)).unwrap();
+    /// assert_eq!(report.lines_written(), 2);
+    /// let text = String::from_utf8(out).unwrap();
+    /// assert!(text.ends_with("{\"event\":\"op_stats_meta\",\"ops\":1,\"dropped_records\":0}\n"));
+    /// assert_eq!(r.export_json_lines(None).unwrap().lines_written(), 0);
+    /// ```
+    pub fn export_json_lines(
+        &self,
+        sink: Option<&mut dyn Write>,
+    ) -> Result<ExportReport, TraitError> {
+        let stats = self.snapshot();
+        let dropped = self.dropped_records();
+        let ops = stats.len();
+        let Some(w) = sink else {
+            return Ok(ExportReport {
+                sink: ExportSink::None,
+                lines_written: 0,
+                ops,
+            });
+        };
+        let mut lines: Vec<String> = stats.iter().map(encode_op_stats_line).collect();
+        lines.push(encode_op_stats_meta_line(ops, dropped));
+        let mut written = 0usize;
+        for line in &lines {
+            let res = w
+                .write_all(line.as_bytes())
+                .and_then(|()| w.write_all(b"\n"));
+            if let Err(e) = res {
+                return Err(export_error(written, e.kind()));
+            }
+            written += 1;
+        }
+        w.flush().map_err(|e| export_error(written, e.kind()))?;
+        Ok(ExportReport {
+            sink: ExportSink::Provided,
+            lines_written: written,
+            ops,
+        })
+    }
+}
+
+/// 書き込み失敗を `ErrorCode::Internal` へ変換する（OS メッセージ全文は載せない）。
+fn export_error(lines: usize, kind: std::io::ErrorKind) -> TraitError {
+    TraitError::new(
+        ErrorCode::Internal,
+        format!("failed to write op_stats json lines after {lines} lines: {kind:?}"),
+    )
+}
+
+/// [`OpRecorder::export_json_lines`] の出力先の有無。
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportSink {
+    /// 出力先が未指定（何も書いていない）。
+    None,
+    /// 出力先へ書き出した。
+    Provided,
+}
+
+/// [`OpRecorder::export_json_lines`] の結果（将来の拡張に備え非網羅的な構造体）。
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportReport {
+    sink: ExportSink,
+    lines_written: usize,
+    ops: usize,
+}
+
+impl ExportReport {
+    /// 出力先の有無。
+    pub fn sink(&self) -> ExportSink {
+        self.sink
+    }
+
+    /// 書き出した行数（`op_stats` 行 + メタ行。出力先なしなら 0）。
+    pub fn lines_written(&self) -> usize {
+        self.lines_written
+    }
+
+    /// 集計対象の操作の種類数。
+    pub fn ops(&self) -> usize {
+        self.ops
+    }
+}
+
+/// レイテンシ 1 値を整数マイクロ秒または `null` の JSON 表記にする。
+fn us_or_null(v: Option<Duration>) -> String {
+    match v {
+        Some(d) => d.as_micros().to_string(),
+        None => "null".to_string(),
+    }
+}
+
+/// [`OpStats`] を JSON Lines の 1 行（改行なし）へ符号化する（TASK-84.3）。
+///
+/// 文字列値は固定リテラルと操作名のみで、エスケープは行わない。操作名は [`OpName`] が
+/// `[A-Za-z0-9._-]` に制限しているためで、[`OpName`] の制約を緩める場合はここにエスケープが必要。
+pub fn encode_op_stats_line(stats: &OpStats) -> String {
+    let lat = stats.latency();
+    format!(
+        "{{\"event\":\"op_stats\",\"op\":\"{}\",\"success\":{},\"failure\":{},\"count\":{},\"min_us\":{},\"mean_us\":{},\"p95_us\":{},\"max_us\":{}}}",
+        stats.name().as_str(),
+        stats.success(),
+        stats.failure(),
+        stats.total(),
+        us_or_null(lat.map(|l| l.min())),
+        us_or_null(lat.map(|l| l.mean())),
+        us_or_null(lat.map(|l| l.p95())),
+        us_or_null(lat.map(|l| l.max())),
+    )
+}
+
+/// 集計全体のメタ行（改行なし）を符号化する（TASK-84.3）。
+pub fn encode_op_stats_meta_line(ops: usize, dropped_records: u64) -> String {
+    format!("{{\"event\":\"op_stats_meta\",\"ops\":{ops},\"dropped_records\":{dropped_records}}}")
 }
 
 /// 計測中の操作を表すガード（[`OpRecorder::start`] が返す）。
@@ -869,5 +1017,203 @@ mod tests {
         let r = OpRecorder::new();
         assert!(r.snapshot().is_empty());
         assert_eq!(r.dropped_records(), 0);
+    }
+
+    // --- TASK-84.3 構造化出力 ---
+
+    fn lat(a: u64, b: u64, c: u64, d: u64) -> LatencySummary {
+        LatencySummary::new(ms(a), ms(b), ms(c), ms(d)).unwrap()
+    }
+
+    fn st(name: &str, s: u64, f: u64, l: Option<LatencySummary>) -> OpStats {
+        OpStats::new(OpName::new(name).unwrap(), s, f, l).unwrap()
+    }
+
+    #[test]
+    fn repair4_encode_line_with_latency() {
+        let s = st("read", 3, 2, Some(lat(1, 3, 5, 6)));
+        assert_eq!(
+            encode_op_stats_line(&s),
+            r#"{"event":"op_stats","op":"read","success":3,"failure":2,"count":5,"min_us":1000,"mean_us":3000,"p95_us":5000,"max_us":6000}"#
+        );
+    }
+
+    #[test]
+    fn repair4_encode_line_without_latency() {
+        let s = st("read", 0, 0, None);
+        assert_eq!(
+            encode_op_stats_line(&s),
+            r#"{"event":"op_stats","op":"read","success":0,"failure":0,"count":0,"min_us":null,"mean_us":null,"p95_us":null,"max_us":null}"#
+        );
+    }
+
+    #[test]
+    fn repair4_encode_meta_line() {
+        assert_eq!(
+            encode_op_stats_meta_line(3, 7),
+            r#"{"event":"op_stats_meta","ops":3,"dropped_records":7}"#
+        );
+    }
+
+    fn rec3() -> OpRecorder {
+        let r = OpRecorder::new();
+        for (n, o) in [
+            ("write", OpOutcome::Success),
+            ("create", OpOutcome::Failure),
+            ("read", OpOutcome::Success),
+        ] {
+            r.record(&OpName::new(n).unwrap(), o, ms(1)).unwrap();
+        }
+        r
+    }
+
+    #[test]
+    fn repair4_export_writes_all_ops_and_meta() {
+        let r = rec3();
+        let mut out: Vec<u8> = Vec::new();
+        let rep = r.export_json_lines(Some(&mut out)).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.ends_with('\n'));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].contains(r#""op":"create""#));
+        assert!(lines[1].contains(r#""op":"read""#));
+        assert!(lines[2].contains(r#""op":"write""#));
+        assert_eq!(
+            lines[3],
+            r#"{"event":"op_stats_meta","ops":3,"dropped_records":0}"#
+        );
+        assert_eq!(rep.lines_written(), 4);
+        assert_eq!(rep.ops(), 3);
+        assert_eq!(rep.sink(), ExportSink::Provided);
+    }
+
+    /// `"key":` の出現順を取り出す（外部 JSON パーサなしのキー集合照合用）。
+    fn keys(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = line;
+        while let Some(i) = rest.find("\":") {
+            let head = &rest[..i];
+            if let Some(j) = head.rfind('"') {
+                out.push(head[j + 1..].to_string());
+            }
+            rest = &rest[i + 2..];
+        }
+        out
+    }
+
+    #[test]
+    fn repair4_export_key_set_is_consistent() {
+        let with = st("a", 1, 0, Some(lat(1, 2, 3, 4)));
+        let without = st("b", 0, 0, None);
+        let expected = [
+            "event", "op", "success", "failure", "count", "min_us", "mean_us", "p95_us", "max_us",
+        ];
+        for s in [with, without] {
+            assert_eq!(keys(&encode_op_stats_line(&s)), expected);
+        }
+    }
+
+    #[test]
+    fn repair4_export_empty_recorder() {
+        let mut out: Vec<u8> = Vec::new();
+        let rep = OpRecorder::new().export_json_lines(Some(&mut out)).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"event\":\"op_stats_meta\",\"ops\":0,\"dropped_records\":0}\n"
+        );
+        assert_eq!(rep.lines_written(), 1);
+    }
+
+    #[test]
+    fn repair4_export_none_sink_does_not_panic() {
+        let rep = rec3().export_json_lines(None).unwrap();
+        assert_eq!(rep.lines_written(), 0);
+        assert_eq!(rep.sink(), ExportSink::None);
+        assert_eq!(rep.ops(), 3);
+    }
+
+    /// `fail_write` 回目の write、または flush で失敗する出力先。
+    struct FailingSink {
+        writes: usize,
+        fail_write: Option<usize>,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if self.fail_write == Some(self.writes) {
+                return Err(std::io::Error::other("secret /path/detail"));
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                return Err(std::io::Error::other("flush"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn repair4_export_write_failure_returns_error() {
+        let mut sink = FailingSink {
+            writes: 0,
+            fail_write: Some(3),
+            fail_flush: false,
+        };
+        let e = rec3().export_json_lines(Some(&mut sink)).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert!(!e.to_string().contains("secret"));
+        let mut sink = FailingSink {
+            writes: 0,
+            fail_write: None,
+            fail_flush: true,
+        };
+        let e = rec3().export_json_lines(Some(&mut sink)).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Internal);
+    }
+
+    #[test]
+    fn repair4_export_does_not_hold_lock_during_write() {
+        struct Reentrant<'a>(&'a OpRecorder);
+        impl Write for Reentrant<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .record(&OpName::new("inner").unwrap(), OpOutcome::Success, ms(1))
+                    .unwrap();
+                let _ = self.0.snapshot();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let r = rec3();
+        let mut w = Reentrant(&r);
+        assert_eq!(
+            r.export_json_lines(Some(&mut w)).unwrap().lines_written(),
+            4
+        );
+    }
+
+    #[test]
+    fn repair4_export_reports_dropped_records() {
+        let r = OpRecorder::new();
+        for i in 0..=MAX_TRACKED_OPS {
+            let _ = r.record(
+                &OpName::new(format!("op{i}")).unwrap(),
+                OpOutcome::Success,
+                ms(1),
+            );
+        }
+        let mut out: Vec<u8> = Vec::new();
+        r.export_json_lines(Some(&mut out)).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text.lines().last().unwrap(),
+            r#"{"event":"op_stats_meta","ops":64,"dropped_records":1}"#
+        );
     }
 }

@@ -46,7 +46,9 @@
 //!   呼び出し側が [`SubIdOwner`] に数値 uid と検証済みユーザー名を渡す方式を維持する。
 //!   ライブラリコードは `$USER` を読まない）
 //! - `oci_runtime` の `linux.uidMappings` / `gidMappings` の受理（start.rs は現状拒否のまま。後続）
-//! - ファイル所有者の検証（TASK-40.3・#189）
+//!
+//! ファイル所有者の写像（SEC-5。ns 内 0 → ホスト非特権 UID）の照合は `tests/rootless_file_owner.rs`
+//! （TASK-40.3・#189）が担う。
 
 use std::fmt;
 use std::fs::OpenOptions;

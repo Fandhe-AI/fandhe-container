@@ -64,3 +64,10 @@ harness = false
 name = "rootless_launch"
 path = "tests/rootless_launch.rs"
 harness = false
+
+# rootless でコンテナ内 root が作るファイルの所有者写像（ホスト視点 stat）の結合試験（CORE-6・SEC-5・TASK-40.3）。
+# 上と同じ理由で harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "rootless_file_owner"
+path = "tests/rootless_file_owner.rs"
+harness = false

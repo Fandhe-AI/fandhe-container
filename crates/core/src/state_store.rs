@@ -33,13 +33,26 @@
 //!   照合できないため通常の `delete` では消せない。管理操作 `find_corrupted` /
 //!   `purge_corrupted` で特定・回復する。破損・異常なレコードが 1 件でもあれば `list` はどのページでも
 //!   失敗する（fail-closed）
-//! - 書き込みは同じディレクトリの一時ファイルへ書いて `rename` する。fsync・一時ファイルの
-//!   残骸掃除・強制終了テストは TASK-31.2（#156）、結合テストは TASK-31.3（#157）で行う
+//! - 書き込みは同じディレクトリの一時ファイルへ書いて fsync してから `rename` し、ディレクトリも
+//!   fsync する。一時ファイル名の衝突回避・残骸掃除・強制終了テストは TASK-31.2（#156）、結合テストの
+//!   拡充は TASK-31.3（#157）で行う
 //! - 状態ルートは信頼境界として扱う（`bundle` のすり替えは `start` の起動先のすり替えになるため。
-//!   SEC-1・PLUG-12 と同じ姿勢）。symlink・所有者不一致（Linux）・group / other 書き込み可を
-//!   `PermissionDenied` で拒否する。Windows の ACL 検査と、Linux 以外の unix での所有者検査は
-//!   将来課題（未実装）
+//!   SEC-1・PLUG-12 と同じ姿勢）。symlink・所有者不一致・group / other 書き込み可を
+//!   `PermissionDenied` で拒否する
+//! - `@lock` は start の起動権の所有ロック（`oci_runtime` の `BundleLock`。bundle ディレクトリの
+//!   `flock`。TASK-29.3・CORE-2）とは独立している。start は `BundleLock` を保持したまま `update` を
+//!   呼び、`@lock` はその内側で取って解放する。本ストアは `BundleLock` を取らないため、ロック順序の
+//!   逆転（デッドロック）は起きない
 //! - エラーメッセージは固定の英語文言のみで、パス・errno を含めない
+//!
+//! # 対応プラットフォーム（Linux 限定。fail-closed）
+//!
+//! [`FileStateStore::open`] は Linux 以外では何も作らずに `Unimplemented` を返す。信頼境界の検査
+//! （所有者 = 実効 UID・権限ビット）は Linux でしか完結しないため（Windows の ACL・所有者 SID の
+//! 検査と保護 DACL での作成、macOS の実効 UID の取得には `sys` の FFI が要るが、`sys` は Linux 限定）。
+//! macOS / Windows では状態ルートをゲスト VM 内の Linux パスに置く（OCI-5）ため、ホスト側で本実装を
+//! 使う経路はない。start の所有ロック（`BundleLock::acquire`）が Linux 以外で `Unimplemented` を返すのと
+//! 同じ扱いである（CLI-1）
 
 use std::collections::BinaryHeap;
 use std::ffi::OsString;
@@ -218,10 +231,14 @@ struct StoreGuard<'a> {
 impl FileStateStore {
     /// 状態ルートを用意して検証する。
     ///
-    /// ルートがなければ 0700（unix）で作る。親ディレクトリは作らない（`/run` や
+    /// ルートがなければ 0700 で作る。親ディレクトリは作らない（`/run` や
     /// `$XDG_RUNTIME_DIR` がなければ `NotFound`）。symlink・ディレクトリでないもの・
-    /// （Linux で）他ユーザー所有・group / other 書き込み可のルートは `PermissionDenied`。
+    /// 他ユーザー所有・group / other 書き込み可のルートは `PermissionDenied`。
+    /// Linux 以外では何も作らずに `Unimplemented`（信頼境界を検査できないため。fail-closed。
+    /// モジュール doc「対応プラットフォーム」）。
     pub fn open(root: StateRoot) -> Result<Self, TraitError> {
+        // 副作用（ルートの作成）より前に拒否する。
+        ensure_supported_platform()?;
         let path = root.0;
         match private_dir_builder().create(&path) {
             Ok(()) => {}
@@ -676,6 +693,23 @@ impl StateStore for FileStateStore {
     }
 }
 
+/// 本実装を使えるプラットフォームか確かめる（Linux のみ。モジュール doc「対応プラットフォーム」）。
+///
+/// `open` の先頭で呼ぶ。実行時の `?` で拒否するため、以降のコードは 3 OS でコンパイル・型検査される。
+#[cfg(target_os = "linux")]
+fn ensure_supported_platform() -> Result<(), TraitError> {
+    Ok(())
+}
+
+/// Linux 以外では状態ルートの信頼境界（所有者・ACL）を検査できないため拒否する（fail-closed）。
+#[cfg(not(target_os = "linux"))]
+fn ensure_supported_platform() -> Result<(), TraitError> {
+    Err(err(
+        ErrorCode::Unimplemented,
+        "file state store requires Linux to verify the state root",
+    ))
+}
+
 /// 0700（unix）でディレクトリを作る builder。`let mut` が OS ごとに不要になる警告を避けるため
 /// 関数に切り出している。
 fn private_dir_builder() -> fs::DirBuilder {
@@ -702,15 +736,15 @@ fn canonical_root(path: &Path) -> Result<PathBuf, TraitError> {
     Ok(parent.join(name))
 }
 
-/// 祖先ディレクトリが第三者にすり替えられないか検査する（unix）。
+/// 祖先ディレクトリが第三者にすり替えられないか検査する。
 ///
 /// 各祖先は、group / other 書き込み不可（sticky ビット付きは許可。`/tmp` 等）であり、
-/// （Linux では）root か現在のユーザーの所有でなければ `PermissionDenied`。
+/// root か現在のユーザーの所有でなければ `PermissionDenied`。Linux 以外は `open` が先に拒否する
+/// ため本検査に到達しない（`#[cfg(unix)]` の枝は macOS でも型検査のためにコンパイルされる）。
 ///
 /// 制約（未実装。REPAIR-3）: 検査と使用の間の TOCTOU を閉じるには、ディレクトリ fd を基点に
 /// `openat` 系で操作する必要がある。std には無く `sys` の unsafe ラッパーが要るため、
 /// 別タスクで扱う。現状は「正規パスの固定＋祖先の権限検査」による緩和にとどまる。
-/// Windows の ACL 検査も未実装。
 fn verify_ancestors(root: &Path) -> Result<(), TraitError> {
     #[cfg(unix)]
     {
@@ -758,7 +792,7 @@ fn verify_root(path: &Path) -> Result<(), TraitError> {
                 "state root must not be writable by group or others",
             ));
         }
-        // 所有者検査は euid を取れる Linux のみ（unsafe を増やさないため。他 unix は将来課題）。
+        // 所有者検査は euid を取れる Linux のみ。他 OS は `open` が先に拒否する。
         #[cfg(target_os = "linux")]
         if meta.uid() != crate::sys::effective_uid() {
             return Err(err(
@@ -770,11 +804,11 @@ fn verify_root(path: &Path) -> Result<(), TraitError> {
     Ok(())
 }
 
-/// レコードディレクトリ `<id>/` が第三者に改変されないか検査する（unix）。
+/// レコードディレクトリ `<id>/` が第三者に改変されないか検査する。
 ///
-/// group / other の権限ビットが 1 つでもあれば（0700 限定）、Linux では加えて所有者が
-/// 現在のユーザーでなければ `PermissionDenied`（残存ディレクトリの再利用・読み取り前に
-/// 呼ぶ。`state.json` 改変・bundle すり替えの防止。OCI-5）。Windows の ACL 検査は未実装（REPAIR-3）。
+/// group / other の権限ビットが 1 つでもあれば（0700 限定）、または所有者が現在のユーザーで
+/// なければ `PermissionDenied`（残存ディレクトリの再利用・読み取り前に呼ぶ。`state.json` 改変・
+/// bundle すり替えの防止。OCI-5）。Linux 以外は `open` が先に拒否するため本検査に到達しない。
 fn verify_record_dir(meta: &fs::Metadata) -> Result<(), TraitError> {
     #[cfg(unix)]
     {
@@ -878,7 +912,7 @@ fn init_revision_file(root: &Path) -> Result<(), TraitError> {
 /// 全書き込みの唯一の経路。一時ファイルを `sync_all` してから `rename` し、unix では親
 /// ディレクトリも fsync して置き換えを永続化する（クラッシュ後の revision 再発行防止）。
 /// 一時ファイル名の衝突回避と残骸掃除は TASK-31.2（#156）で強化する予定で、現状は未実装
-/// （REPAIR-3）。Windows のディレクトリ fsync は未実装（将来課題）。
+/// （REPAIR-3）。
 fn write_file_replacing(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), TraitError> {
     let tmp = dir.join(format!("{name}.tmp"));
     let dest = dir.join(name);
@@ -908,7 +942,7 @@ fn write_file_replacing(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Trai
 }
 
 /// ディレクトリを fsync して dirent の変更（作成・rename・unlink）を永続化する。
-/// Windows では未実装（将来課題）のため何もしない。
+/// Linux 以外は `open` が先に拒否するため、非 unix の枝は型検査のためだけに残す。
 fn sync_dir(dir: &Path) -> Result<(), TraitError> {
     #[cfg(unix)]
     File::open(dir)

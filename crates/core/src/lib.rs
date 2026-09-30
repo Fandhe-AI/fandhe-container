@@ -44,8 +44,10 @@
 //!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。
 //!   start（TASK-29.3）は実装済みだが起動は `ProcessLauncher` の依存注入で、本番 launcher と実 exec は未提供。
 //!   kill（TASK-30.1）も実装済みで、送信は `ProcessSignaler` の依存注入（本番実装は supervisor 待ち）。delete は TASK-30.2 で追加する予定で未実装
-//! - `state_store`: ファイルベース `StateStore`（TASK-31.1・OCI-5）は実装済み。fsync・残骸掃除の強化は
-//!   TASK-31.2（#156）、結合テストは TASK-31.3（#157）で行う予定
+//! - `state_store`: ファイルベース `StateStore`（TASK-31.1・OCI-5）は実装済み。3 OS でコンパイルされるが
+//!   使えるのは Linux のみで、他 OS の `FileStateStore::open` は状態ルートの信頼境界（所有者・ACL）を
+//!   検査できないため `Unimplemented`（fail-closed。start の `BundleLock` と同じ扱い）。
+//!   fsync・残骸掃除の強化は TASK-31.2（#156）、結合テストの拡充は TASK-31.3（#157）で行う予定
 //! - 予定（未作成）: `cgroups`（TASK-32・CORE-3）・`plugin_discovery`（TASK-109）
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）

@@ -13,8 +13,8 @@
 //! # 受入基準の解釈（REPAIR-3）
 //! - 「非 root で一連のライフサイクルが成功する」は、create → start → kill を実行し、各段の状態・revision・
 //!   観測記録（REPAIR-4）と、起動したプロセスのホスト視点の写像（`/proc/<pid>/uid_map`・`gid_map`・
-//!   `status`）で照合する。検証できるのは **create / start / kill まで**で、delete と
-//!   Running → Stopped の遷移は未検証（下記「既知課題」）
+//!   `status`）で照合する。検証できるのは **create / start / kill と、kill 直後の delete の拒否まで**で、
+//!   Running → Stopped の遷移と停止後の delete の成功は未検証（下記「既知課題」）
 //! - 制限ステージ（seccomp: TASK-38.2/38.3、Landlock: TASK-39.3/39.4）が未適用の間、`exec_entrypoint` は
 //!   fail-closed で `Exited(126)` を返す。そのため長く動き続ける「実行中コンテナ」になれるのは
 //!   `isolate_rootless_subordinate` を通った中間プロセスだけで、これを init の代役として使う。中間プロセスは
@@ -56,9 +56,11 @@
 //!   対象にするよう置き換える
 //! - SIGKILL 以外のシグナル（SIGTERM 等）の配送: 本テストの起動ハンドルが std のみで作られており送れない。
 //!   本番の `ProcessSignaler` は supervisor（TASK-157）が提供する
-//! - delete と Running → Stopped の遷移: `oci_runtime` に delete が無く（TASK-30.2・#152）、Stopped への
-//!   遷移は起動ハンドルの所有者である supervisor（TASK-157）の責務。`kill` が状態を更新しない契約だけを
-//!   照合し、状態の書き換えによる代用はしない。実装後に本テストへ追加する
+//! - Running → Stopped の遷移と停止後の delete の成功: Stopped への遷移は起動ハンドルの所有者である
+//!   supervisor（TASK-157）の責務。`kill` が状態を更新しない契約と、その結果 kill 直後の delete
+//!   （TASK-30.2・#152）が `FailedPrecondition` で拒否され状態が残ることだけを照合し、状態の書き換えに
+//!   よる代用はしない（停止後の delete の成功は `oci_lifecycle.rs`・`oci_delete.rs` が状態を直接作って
+//!   照合する）。supervisor の実装後に本テストへ追加する
 //! - SEC-1 契約からの逸脱（テスト専用）: 固定した rootfs の fd は CLOEXEC で閉じられ、std だけでは子へ
 //!   継承できない。そのため子の側で `spec.rootfs()` を stat し、渡された (dev, ino) と一致することを
 //!   確かめてから使う。本番 launcher（TASK-29・TASK-157 系）は fd を渡す
@@ -97,17 +99,17 @@ mod linux {
     use fandhe_container_core::observability::{OpName, OpRecorder};
     use fandhe_container_core::oci_runtime::{
         KillTimeout, LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, ProcessSignaler,
-        StartTimeouts, create, kill, start,
+        StartTimeouts, create, delete, kill, start,
     };
     use fandhe_container_core::rootless::{
         DEFAULT_HELPER_TIMEOUT, HelperPaths, IdMapSet, IdMapWriter, SubIdOwner, WriterKind,
         load_subordinate_ids, rootless_mapping, single_id_mapping,
     };
     use fandhe_container_core::traits::{
-        ContainerId, ContainerState, CreateRequest, CreateStateRequest, DeleteStateRequest,
-        DeleteStateResponse, ErrorCode, GetStateRequest, KillRequest, ListStateRequest, Signal,
-        StartRequest, StateList, StateRecord, StateRevision, StateStore, TraitError,
-        UpdateStateRequest,
+        ContainerId, ContainerState, CreateRequest, CreateStateRequest, DeleteRequest,
+        DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, KillRequest,
+        ListStateRequest, Signal, StartRequest, StateList, StateRecord, StateRevision, StateStore,
+        TraitError, UpdateStateRequest,
     };
 
     const HOSTNAME: &str = "fandhe-rootless";
@@ -551,7 +553,8 @@ mod linux {
         }
     }
 
-    // ---- 最小のインメモリ StateStore（oci_lifecycle.rs と同等。delete は未実装のまま） ----
+    // ---- 最小のインメモリ StateStore（`StateStore::delete` は本テストの経路で呼ばれないため未実装のまま。
+    // delete〔TASK-30.2〕は Running のレコードを状態判定で拒否し、ここへ到達しない） ----
 
     struct MemStateStore {
         records: Mutex<HashMap<ContainerId, StateRecord>>,
@@ -868,13 +871,26 @@ mod linux {
         .expect_err("second kill");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
 
+        // kill 直後の delete は Running・pid ありとして拒否され、状態・revision は残る（CORE-2・TASK-30.2）。
+        let err =
+            delete(&store, &rec, &DeleteRequest::new(id.clone())).expect_err("delete running");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), "container is still running");
+        assert_eq!(
+            store
+                .get(&GetStateRequest::new(id.clone()))
+                .expect("stored"),
+            after
+        );
+
         // 観測記録（REPAIR-4）。
         assert_eq!(op_stats(&rec, "create"), (1, 0));
         assert_eq!(op_stats(&rec, "start"), (1, 0));
         assert_eq!(op_stats(&rec, "kill"), (1, 1));
+        assert_eq!(op_stats(&rec, "delete"), (0, 1));
 
         println!(
-            "rootless: scenario {mode} lifecycle verified (create/start/kill; host uid={euid})"
+            "rootless: scenario {mode} lifecycle verified (create/start/kill/delete-rejected; host uid={euid})"
         );
     }
 }

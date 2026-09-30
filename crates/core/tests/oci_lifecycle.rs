@@ -1,7 +1,7 @@
 //! OCI Runtime ライフサイクル `create` → `start` の一連フローの結合試験（CORE-2・OCI-4・REPAIR-4・TASK-29.4）。
 //!
-//! 末尾で create / start / kill が 1 つの `OpRecorder` を共有した際の操作別の成功・失敗・所要時間の反映も
-//! 照合する（REPAIR-4・TASK-84.4。delete は TASK-30.2 未実装のため対象外）。
+//! 末尾で create / start / kill / delete が 1 つの `OpRecorder` を共有した際の操作別の成功・失敗・所要時間の
+//! 反映も照合する（REPAIR-4・TASK-84.4・TASK-30.2）。delete 単体の契約は `oci_delete.rs` が扱う。
 //!
 //! 公開 API（`create`・`start`・`StateStore`・`ProcessLauncher`・`LaunchedProcess`・`OpRecorder`）だけを
 //! crate の外から呼び、各遷移で観測できる副作用（状態・revision・`LaunchSpec` の全フィールド・観測記録・
@@ -23,13 +23,13 @@ use std::time::Duration;
 
 use fandhe_container_core::observability::{OpName, OpRecorder};
 use fandhe_container_core::oci_runtime::{
-    KillTimeout, ProcessLauncher, ProcessSignaler, StartTimeouts, create, kill, start,
+    KillTimeout, ProcessLauncher, ProcessSignaler, StartTimeouts, create, delete, kill, start,
 };
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ContainerStatus, CreateRequest, CreateStateRequest,
-    DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, KillRequest,
-    ListStateRequest, Signal, StartRequest, StateList, StateRecord, StateRevision, StateStore,
-    TraitError, UpdateStateRequest,
+    ContainerId, ContainerState, ContainerStatus, CreateRequest, CreateStateRequest, DeleteRequest,
+    DeleteResponse, DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest,
+    KillRequest, ListStateRequest, Signal, StartRequest, StateList, StateRecord, StateRevision,
+    StateStore, TraitError, UpdateStateRequest,
 };
 use serde_json::{Value, json};
 
@@ -106,8 +106,16 @@ impl StateStore for MemStateStore {
         Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
     }
 
-    fn delete(&self, _req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
-        Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+    fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = records
+            .get(req.id())
+            .ok_or_else(|| TraitError::new(ErrorCode::NotFound, "not found"))?;
+        if cur.revision() != req.expected_revision() {
+            return Err(TraitError::new(ErrorCode::FailedPrecondition, "stale"));
+        }
+        records.remove(req.id());
+        Ok(DeleteStateResponse::new())
     }
 }
 
@@ -543,11 +551,13 @@ fn export_lines(rec: &OpRecorder) -> Vec<String> {
         .collect()
 }
 
-/// REPAIR-4・TASK-84.4: create → start → kill が 1 つの `OpRecorder` を共有し、操作ごとの成功・失敗件数と
-/// 所要時間が `OpStats` に反映され、JSON Lines にも出ること（受け入れ条件の機械照合）。
+/// REPAIR-4・TASK-84.4・TASK-30.2: create → start → kill → delete が 1 つの `OpRecorder` を共有し、操作ごとの
+/// 成功・失敗件数と所要時間が `OpStats` に反映され、JSON Lines にも出ること（受け入れ条件の機械照合）。
 ///
-/// delete は TASK-30.2 が未実装のため対象外。実装時に同じ `record_op` パターンで操作名 `delete` を記録し、
-/// 本テストへ追加する。p95 等の分布の検証は TASK-84.6（`tests/observability.rs`）の範囲。
+/// kill は状態を更新しないため、kill 直後の delete は Running・pid ありとして `FailedPrecondition` になる
+/// （CORE-2）。Stopped への遷移は起動ハンドルの所有者（supervisor。TASK-157）の責務のため、本テストでは
+/// ハンドルの回収後にその代わりとして `StateStore::update` で Stopped を書き、delete が成功して以後の get が
+/// `NotFound` になること（OCI-6）を確かめる。p95 等の分布の検証は TASK-84.6（`tests/observability.rs`）の範囲。
 #[cfg(target_os = "linux")]
 #[test]
 fn repair4_task84_4_lifecycle_ops_share_one_recorder() {
@@ -578,6 +588,14 @@ fn repair4_task84_4_lifecycle_ops_share_one_recorder() {
     )
     .expect("kill");
 
+    // 失敗: kill 直後（Running・pid あり）の delete は拒否され、状態は残る（CORE-2）。
+    let cid = ContainerId::new(id).expect("id");
+    let err = delete(&store, &rec, &DeleteRequest::new(cid.clone())).expect_err("delete running");
+    assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(err.message(), "container is still running");
+    let running = store.record_of(id).expect("kept");
+    assert_eq!(running.status().state(), ContainerState::Running);
+
     // 失敗: 重複 create・Running への再 start・未 create ID への kill。
     let err = create(&store, &rec, &b.create_request(id)).expect_err("duplicate create");
     assert_eq!(err.code(), ErrorCode::AlreadyExists);
@@ -600,10 +618,30 @@ fn repair4_task84_4_lifecycle_ops_share_one_recorder() {
     .expect_err("kill missing");
     assert_eq!(err.code(), ErrorCode::NotFound);
 
-    // 操作名は名前昇順でちょうど 3 件。各操作は成功 1・失敗 1・所要時間あり。
+    // 成功: ハンドルを回収し、supervisor（TASK-157）の代わりに Stopped を書いてから delete する（OCI-6）。
+    let (_, process) = started.into_parts();
+    process
+        .terminate(Duration::from_secs(1))
+        .expect("terminate");
+    store
+        .update(&UpdateStateRequest::new(
+            ContainerStatus::stopped(cid.clone(), Some(137)),
+            running.revision(),
+        ))
+        .expect("stopped");
+    assert_eq!(
+        delete(&store, &rec, &DeleteRequest::new(cid.clone())).expect("delete stopped"),
+        DeleteResponse::new()
+    );
+    assert_eq!(
+        store.record_of(id).expect_err("deleted").code(),
+        ErrorCode::NotFound
+    );
+
+    // 操作名は名前昇順でちょうど 4 件。各操作は成功 1・失敗 1・所要時間あり。
     let snap = rec.snapshot();
     let names: Vec<&str> = snap.iter().map(|s| s.name().as_str()).collect();
-    assert_eq!(names, ["create", "kill", "start"]);
+    assert_eq!(names, ["create", "delete", "kill", "start"]);
     for s in &snap {
         assert_eq!(s.success(), 1, "{}", s.name().as_str());
         assert_eq!(s.failure(), 1, "{}", s.name().as_str());
@@ -611,10 +649,10 @@ fn repair4_task84_4_lifecycle_ops_share_one_recorder() {
         assert!(s.latency().is_some(), "{}", s.name().as_str());
     }
 
-    // JSON Lines: op 行 3 件 + メタ行（レイテンシ値は非決定のため値照合しない）。
+    // JSON Lines: op 行 4 件 + メタ行（レイテンシ値は非決定のため値照合しない）。
     let lines = export_lines(&rec);
-    assert_eq!(lines.len(), 4);
-    for (line, op) in lines.iter().zip(["create", "kill", "start"]) {
+    assert_eq!(lines.len(), 5);
+    for (line, op) in lines.iter().zip(["create", "delete", "kill", "start"]) {
         assert!(line.contains(&format!("\"op\":\"{op}\"")), "{line}");
         assert!(
             line.contains("\"success\":1,\"failure\":1,\"count\":2"),
@@ -622,18 +660,14 @@ fn repair4_task84_4_lifecycle_ops_share_one_recorder() {
         );
     }
     assert_eq!(
-        lines[3],
-        "{\"event\":\"op_stats_meta\",\"ops\":3,\"dropped_records\":0}"
+        lines[4],
+        "{\"event\":\"op_stats_meta\",\"ops\":4,\"dropped_records\":0}"
     );
-
-    let (_, process) = started.into_parts();
-    process
-        .terminate(Duration::from_secs(1))
-        .expect("terminate");
 }
 
 /// REPAIR-4・TASK-84.4: Linux 以外でも create 成功・start（`Unimplemented`）・kill（pid なしの Created で
-/// `FailedPrecondition`）の結果が 1 つの `OpRecorder` に操作別で反映される。
+/// `FailedPrecondition`）・delete（成功と二重 delete の `NotFound`。TASK-30.2）の結果が 1 つの `OpRecorder` に
+/// 操作別で反映される。
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn repair4_task84_4_lifecycle_ops_share_one_recorder_off_linux() {
@@ -665,7 +699,18 @@ fn repair4_task84_4_lifecycle_ops_share_one_recorder_off_linux() {
     .expect_err("kill created without pid");
     assert_eq!(err.code(), ErrorCode::FailedPrecondition);
 
+    // start が予約の前に拒否したため Created・pid なしのままで、delete は成功し、二重 delete は NotFound
+    // （OCI-6・TASK-30.2）。
+    let req = DeleteRequest::new(ContainerId::new(id).expect("id"));
+    assert_eq!(
+        delete(&store, &rec, &req).expect("delete created"),
+        DeleteResponse::new()
+    );
+    let err = delete(&store, &rec, &req).expect_err("second delete");
+    assert_eq!(err.code(), ErrorCode::NotFound);
+
     assert_eq!(op_stats(&rec, "create"), (1, 0));
     assert_eq!(op_stats(&rec, "start"), (0, 1));
     assert_eq!(op_stats(&rec, "kill"), (0, 1));
+    assert_eq!(op_stats(&rec, "delete"), (1, 1));
 }

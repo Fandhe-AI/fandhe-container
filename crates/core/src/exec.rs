@@ -21,7 +21,8 @@
 //!    → Landlock → seccomp（#136・#832・#833。**枠・`NO_NEW_PRIVS`・capability 削減は実装済み**: [`StagePipeline`] が
 //!    [`StageKind::ORDER`] の固定順でフックを呼び、`NO_NEW_PRIVS` は差し替え不可の組み込み段として
 //!    常に適用する。capability の絞り込み処理 `apply_default_capabilities`（crate 内限定。SEC-1・TASK-37.1・#172）
-//!    も #173（TASK-37.2）で同じく差し替え不可の組み込み段になった。seccomp・Landlock・cgroup 参加と
+//!    も #173（TASK-37.2）で同じく差し替え不可の組み込み段になった。seccomp の適用処理 `apply_seccomp_filter`
+//!    （crate 内限定。CORE-5・TASK-38.2・#177）は実装済みだがステージ列への組み込みは #178（TASK-38.3）。Landlock・cgroup 参加と
 //!    最終的な制限の証跡は未実装のため exec は
 //!    引き続き拒否される。他の段の実体は未実装で、後続の TASK-32・37・38・39・40 が [`StageHook`] として
 //!    差し込む）。
@@ -93,6 +94,7 @@ mod devices;
 mod no_new_privs;
 mod process;
 mod rootfs;
+mod seccomp;
 mod stages;
 mod violation;
 
@@ -105,6 +107,9 @@ pub use process::{
     spawn_container, spawn_container_with_stages,
 };
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
+pub use seccomp::SeccompReport;
+#[allow(unused_imports)]
+pub(crate) use seccomp::apply_seccomp_filter;
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 
 pub use violation::{

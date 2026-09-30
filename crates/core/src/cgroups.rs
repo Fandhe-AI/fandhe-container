@@ -566,6 +566,17 @@ impl ContainerCgroup {
 pub struct Evacuated {
     /// 退避元（委譲された親）のパス。別の委譲スコープへの流用を防ぐ。
     parent: CgroupPath,
+    /// 退避元の親 cgroup ディレクトリの (dev, ino)。同パスの cgroup が置換された場合の検出に使う。
+    parent_id: (u64, u64),
+}
+
+/// `prepare` の途中失敗時に巻き戻す対象の記録。
+#[derive(Debug, Default)]
+struct Rollback {
+    /// 自プロセスを退避リーフへ移した（または移した可能性がある）。
+    moved: bool,
+    /// 退避リーフを本処理が新規作成した（既存の再利用では削除しない）。
+    leaf_created: bool,
 }
 
 impl DelegatedCgroup {
@@ -650,10 +661,11 @@ impl DelegatedCgroup {
 
     /// コンテナ用子 cgroup を作り、自プロセスを退避リーフへ移し、退避を検証する。
     ///
-    /// 検証（すべて満たさなければ `FailedPrecondition`）: 親の `cgroup.procs` に自プロセス以外が
+    /// 検証（すべて満たさなければ `FailedPrecondition`）: 自プロセスの現在の所属が検出済みの親で親の
+    /// `cgroup.procs` に自プロセスがいる・親の `cgroup.procs` に自プロセス以外が
     /// いない（他者の PID は動かさない）・退避後に親の `cgroup.procs` が空・`/proc/self/cgroup` が
     /// 退避リーフを指す・コンテナ用子 cgroup の `cgroup.procs` が空。既存の同名子 cgroup は採用せず
-    /// `AlreadyExists`。途中失敗時は、自プロセスを移していれば元の親へ戻し（失敗時はエラー文に併記）、本処理が作った子 cgroup を best-effort で削除する。
+    /// `AlreadyExists`。途中失敗時は、自プロセスを移していれば元の親へ戻し（失敗時はエラー文に併記）、本処理が作った子 cgroup・退避リーフを best-effort で削除する。
     pub fn prepare(&self, name: &CgroupName) -> Result<(ContainerCgroup, Evacuated), CgroupError> {
         let me = std::process::id();
         let parent_procs = parse_procs(
@@ -665,6 +677,18 @@ impl DelegatedCgroup {
                 PROCS_LIMIT,
             )?,
         )?;
+        // detect 後に自プロセスが別 cgroup へ移っていると、別の所属先から退避リーフへ移してしまう。
+        // 現在の所属が検出済みの親であり、親の PID 一覧に自プロセスがいることを退避前に確認する。
+        let current = read_self_cgroup().map_err(|mut e| {
+            e.step = CgroupStep::Evacuate;
+            e
+        })?;
+        if current != self.path || !parent_procs.contains(&me) {
+            return Err(CgroupError::precondition(
+                CgroupStep::Evacuate,
+                "current process is not in the detected delegated cgroup; refusing to evacuate",
+            ));
+        }
         if parent_procs.iter().any(|p| *p != me) {
             return Err(CgroupError::precondition(
                 CgroupStep::Evacuate,
@@ -676,15 +700,26 @@ impl DelegatedCgroup {
         sys::mkdir_at(self.fd.as_fd(), &child_name, CGROUP_DIR_MODE)
             .map_err(|e| sys_error(CgroupStep::CreateChild, name.as_str(), e))?;
 
-        let mut moved = false;
-        match self.evacuate_and_verify(name, &mut moved) {
+        let mut rollback = Rollback::default();
+        match self.evacuate_and_verify(name, &mut rollback) {
             Ok(result) => Ok(result),
             Err(mut err) => {
-                // 自プロセスを退避リーフへ移した後の失敗は、元の親へ戻してから子を削除する。
-                if moved && let Err(e) = self.restore_self() {
+                // 自プロセスを退避リーフへ移した後の失敗は、元の親へ戻してから子・退避リーフを削除する。
+                if rollback.moved
+                    && let Err(e) = self.restore_self()
+                {
                     err.message.push_str(&format!(
                         "; restoring process membership failed ({})",
                         e.message
+                    ));
+                }
+                if rollback.leaf_created
+                    && let Ok(leaf_c) = cstring(CgroupStep::Cleanup, EVACUATION_LEAF)
+                    && let Err(e) = sys::remove_dir_at(self.fd.as_fd(), &leaf_c)
+                {
+                    err.message.push_str(&format!(
+                        "; cleanup of {EVACUATION_LEAF} failed ({})",
+                        sys_error(CgroupStep::Cleanup, "rmdir", e).message
                     ));
                 }
                 if let Err(e) = sys::remove_dir_at(self.fd.as_fd(), &child_name) {
@@ -713,14 +748,14 @@ impl DelegatedCgroup {
     fn evacuate_and_verify(
         &self,
         name: &CgroupName,
-        moved: &mut bool,
+        rollback: &mut Rollback,
     ) -> Result<(ContainerCgroup, Evacuated), CgroupError> {
         let child_fd = open_cgroup_dir(CgroupStep::CreateChild, self.fd.as_fd(), name.as_str())?;
 
         // 退避リーフ。既存なら再利用（cgroup2 であることは open_cgroup_dir が確認する）。
         let leaf_c = cstring(CgroupStep::CreateChild, EVACUATION_LEAF)?;
         match sys::mkdir_at(self.fd.as_fd(), &leaf_c, CGROUP_DIR_MODE) {
-            Ok(()) => {}
+            Ok(()) => rollback.leaf_created = true,
             Err(SysError::Os(e)) if e == sys::EEXIST => {}
             Err(e) => return Err(sys_error(CgroupStep::CreateChild, EVACUATION_LEAF, e)),
         }
@@ -731,7 +766,7 @@ impl DelegatedCgroup {
         let wfd = sys::open_write_at(leaf_fd.as_fd(), &procs)
             .map_err(|e| sys_error(CgroupStep::Evacuate, "open leaf cgroup.procs", e))?;
         // 書き込みが部分的に効いた場合に備え、書き込み前に移動済みとして扱う（復元は冪等）。
-        *moved = true;
+        rollback.moved = true;
         File::from(wfd)
             .write_all(std::process::id().to_string().as_bytes())
             .map_err(|e| io_error(CgroupStep::Evacuate, "write leaf cgroup.procs", &e))?;
@@ -784,6 +819,7 @@ impl DelegatedCgroup {
             },
             Evacuated {
                 parent: self.path.clone(),
+                parent_id: dir_identity(self.fd.as_fd(), "stat parent cgroup")?,
             },
         ))
     }
@@ -805,6 +841,25 @@ impl DelegatedCgroup {
             ));
         }
         validate_controller_request(&self.controllers, want)?;
+        // トークン取得後に親が置換された・自プロセスが親へ戻った場合は書き込まない
+        // （no-internal-process 制約違反の防止）。
+        let current_id = dir_identity(self.fd.as_fd(), "stat parent cgroup")?;
+        if current_id != proof.parent_id {
+            return Err(CgroupError::precondition(
+                step,
+                "delegated cgroup no longer matches the evacuation proof",
+            ));
+        }
+        let remaining = parse_procs(
+            step,
+            &read_iface(step, self.fd.as_fd(), "cgroup.procs", PROCS_LIMIT)?,
+        )?;
+        if !remaining.is_empty() {
+            return Err(CgroupError::precondition(
+                step,
+                "delegated cgroup has processes again; evacuation is no longer valid",
+            ));
+        }
         let name = cstring(step, "cgroup.subtree_control")?;
         let wfd = sys::open_write_at(self.fd.as_fd(), &name)
             .map_err(|e| sys_error(step, "open cgroup.subtree_control", e))?;

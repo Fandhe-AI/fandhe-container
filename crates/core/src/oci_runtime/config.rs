@@ -191,13 +191,25 @@ impl OciConfigError {
         out
     }
 
+    /// ファイル操作の失敗を分類する。
+    ///
+    /// 同じ入力に 3 OS で同じ `code` を返すため、途中の要素が通常ファイルのパス
+    /// （`<file>/config.json`）は `NotFound` に揃える。Linux / macOS は `ENOTDIR`
+    /// （`NotADirectory`）、Windows は `ERROR_PATH_NOT_FOUND`（`NotFound`）を返すため。
     fn from_io(err: &io::Error) -> Self {
         let code = match err.kind() {
-            io::ErrorKind::NotFound => ErrorCode::NotFound,
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => ErrorCode::NotFound,
             io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
             _ => ErrorCode::Internal,
         };
         Self::new(code, OciConfigErrorKind::Io, "failed to read config.json")
+    }
+
+    /// 通常ファイルでない `config.json`（ディレクトリ・FIFO・デバイス等）。open 前の `stat` と
+    /// open 後の `fstat` のどちらで判明しても、全 OS でこの 1 か所の分類
+    /// （`InvalidArgument` / `Invalid { field: "config.json" }`）に揃える。
+    fn not_regular_file() -> Self {
+        Self::invalid("config.json")
     }
 
     fn too_large() -> Self {
@@ -935,7 +947,7 @@ pub fn parse_config_bytes(bytes: &[u8]) -> Result<OciConfig, OciConfigError> {
 ///
 /// Linux は `0o4000` を使うアーキテクチャ（x86 / x86_64 / arm / aarch64 / riscv / powerpc / s390x /
 /// loongarch64）、BSD 系（macOS・iOS・FreeBSD・NetBSD・OpenBSD・DragonFly）は `0x4`。
-/// mips・sparc 等は値が異なるためここに含めず、下記の事前 `stat` 経路に倒す。
+/// mips・sparc 等は値が異なるためここに含めず、`O_NONBLOCK` 無しで開く（事前 `stat` のみで防ぐ）。
 #[cfg(all(
     target_os = "linux",
     any(
@@ -962,14 +974,15 @@ const O_NONBLOCK: i32 = 0o4000;
 ))]
 const O_NONBLOCK: i32 = 0x4;
 
-/// 種別確認前に安全に開く（REPAIR-5）。
+/// 事前 `stat` で通常ファイルと確認済みのパスを開く（REPAIR-5）。
 ///
-/// `O_NONBLOCK` を指定できる環境では非ブロッキングで開くため、書き手のいない FIFO でも `open` が戻る
-/// （呼び出し側が開いた後の `fstat` で通常ファイルか確認するため、確認後の差し替えにも耐える）。
-/// それ以外の環境（Windows・mips / sparc の Linux 等）では `open` 前に `stat` で通常ファイル以外を
-/// 拒否してから開く。Windows には POSIX の FIFO が無く、その他は FIFO をブロックさせ得る競合窓
-/// （`stat` 後の差し替え）が残るが、fail-closed の事前拒否で通常経路の無期限ブロックは防ぐ。
-fn open_regular_candidate(path: &Path) -> io::Result<File> {
+/// 種別の確認そのものは呼び出し側（[`load_config`]）が全 OS 共通で行う（open 前の `stat` と open 後の
+/// `fstat`）。ここでは `O_NONBLOCK` を指定できる環境に限り非ブロッキングで開き、`stat` 後に FIFO へ
+/// 差し替えられても `open` が戻るようにする（差し替えは open 後の `fstat` で検出する）。それ以外の
+/// 環境（Windows・mips / sparc の Linux 等）は通常の open で、Windows には POSIX の FIFO が無く、
+/// その他は `stat` 後の差し替えによる競合窓が残るが、事前 `stat` の fail-closed な拒否で通常経路の
+/// 無期限ブロックは防ぐ。
+fn open_checked_candidate(path: &Path) -> io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(any(
@@ -999,51 +1012,26 @@ fn open_regular_candidate(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(O_NONBLOCK);
     }
-    #[cfg(not(any(
-        all(
-            target_os = "linux",
-            any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_arch = "arm",
-                target_arch = "aarch64",
-                target_arch = "riscv32",
-                target_arch = "riscv64",
-                target_arch = "powerpc",
-                target_arch = "powerpc64",
-                target_arch = "s390x",
-                target_arch = "loongarch64"
-            )
-        ),
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    )))]
-    {
-        // O_NONBLOCK を使えない環境: open がブロックし得る前に種別を確認する。
-        if !std::fs::metadata(path)?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "not a regular file",
-            ));
-        }
-    }
     opts.open(path)
 }
 
 /// ファイルから `config.json` を読み込んで検証する（TASK-29.2 の create が bundle から呼ぶ想定）。
 ///
-/// 通常ファイル以外（FIFO・デバイス等）は読み込みが無期限にブロックし得るため拒否する（REPAIR-5）。
+/// 通常ファイル以外（ディレクトリ・FIFO・デバイス等）は読み込みが無期限にブロックし得るため拒否する
+/// （REPAIR-5）。種別は open 前の `stat`（全 OS。ブロックし得る open の前に拒否する）と open 後の
+/// `fstat`（`stat` 後の差し替え対策）の 2 回確認し、どちらで判明しても同じエラー
+/// （`InvalidArgument` / `Invalid { field: "config.json" }`）を返す（OS による種別の食い違いを作らない）。
 /// サイズは `metadata` で先に拒否するが、それを信用せず読み込み量も [`CONFIG_MAX_BYTES`] + 1 で
 /// 打ち切る（読み込み中にファイルが伸びる場合への対処）。
 pub fn load_config(path: &Path) -> Result<OciConfig, OciConfigError> {
-    let file = open_regular_candidate(path).map_err(|e| OciConfigError::from_io(&e))?;
+    let pre = std::fs::metadata(path).map_err(|e| OciConfigError::from_io(&e))?;
+    if !pre.is_file() {
+        return Err(OciConfigError::not_regular_file());
+    }
+    let file = open_checked_candidate(path).map_err(|e| OciConfigError::from_io(&e))?;
     let meta = file.metadata().map_err(|e| OciConfigError::from_io(&e))?;
     if !meta.is_file() {
-        return Err(OciConfigError::invalid("config.json"));
+        return Err(OciConfigError::not_regular_file());
     }
     let len = meta.len();
     if len > CONFIG_MAX_BYTES as u64 {

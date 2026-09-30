@@ -1631,6 +1631,38 @@ mod tests {
         );
     }
 
+    /// 上限件数を超えた要素は型として組み立てずに件数超過で拒否する（OCI-4）。
+    /// 超過要素を型不一致の値・1 要素上限を超える文字列にしても、要素の検証（`Data`・
+    /// `process.args[]`）ではなく件数超過（`process.args` / `mounts`）になることで、
+    /// 超過要素をデシリアライズしていないことを照合する。
+    #[test]
+    fn oci4_element_beyond_count_limit_is_not_deserialized() {
+        for extra in [json!(1), json!("a".repeat(CONFIG_MAX_STRING_BYTES + 1))] {
+            let mut args = vec![json!("a"); CONFIG_MAX_ARGS];
+            args.push(extra);
+            let mut v = base();
+            v["process"]["args"] = Value::Array(args);
+            assert_eq!(
+                *err_of(&v).kind(),
+                OciConfigErrorKind::LimitExceeded {
+                    field: "process.args".to_owned(),
+                    limit: 4096
+                }
+            );
+        }
+        let mut mounts = vec![json!({"destination": "/a"}); CONFIG_MAX_MOUNTS];
+        mounts.push(json!({"destination": null, "options": 7}));
+        let mut v = base();
+        v["mounts"] = Value::Array(mounts);
+        assert_eq!(
+            *err_of(&v).kind(),
+            OciConfigErrorKind::LimitExceeded {
+                field: "mounts".to_owned(),
+                limit: 1024
+            }
+        );
+    }
+
     #[test]
     fn oci4_string_length_limits() {
         let mut v = base();

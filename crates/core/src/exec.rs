@@ -109,6 +109,9 @@ pub use process::{
 };
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 pub use seccomp::SeccompReport;
+/// 結合試験 `tests/seccomp_enforcement.rs` 専用の再公開（通常の利用者は呼ばない。詳細は定義側）。`unsafe` を `sys` の外へ出さないための観測専用の入口。
+#[doc(hidden)]
+pub use seccomp::{SeccompEnforcementObservation, observe_default_seccomp_enforcement};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 
 pub use violation::{

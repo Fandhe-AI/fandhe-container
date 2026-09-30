@@ -101,6 +101,67 @@ pub(crate) fn apply_default_seccomp() -> Result<SeccompReport, ExecError> {
     apply_seccomp_filter(&program)
 }
 
+/// [`observe_default_seccomp_enforcement`] の観測結果。errno は `Err(SysError::Os(n))` の `n`、成功は `None`。
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SeccompEnforcementObservation {
+    /// 適用前の `unshare(0)`（対照。フラグなしのため通常は成功し `None`）。
+    pub unshare_before: Option<i32>,
+    /// 適用した BPF 命令数。
+    pub instructions: usize,
+    /// 適用後の `/proc/thread-self/status` の `Seccomp:` 値（filter モードは `2`）。
+    pub seccomp_mode: String,
+    /// 適用後の `unshare(0)` の errno（禁止 syscall のため `EPERM`）。
+    pub unshare_after: Option<i32>,
+    /// 適用後の `mount` 系（`mount(MS_REC|MS_PRIVATE)`）の errno。
+    pub mount_after: Option<i32>,
+    /// 適用後の `pivot_root` の errno。
+    pub pivot_root_after: Option<i32>,
+    /// 適用後の `umount2` の errno。
+    pub umount_after: Option<i32>,
+}
+
+/// 本番の適用経路（[`apply_default_seccomp`]）を呼び出しスレッドへ適用し、禁止 syscall の遮断を観測する
+/// （CORE-5・TASK-38.3・#178。結合試験専用）。
+///
+/// 適用は不可逆・呼び出しスレッド単位で、単一スレッド（`Threads: 1`）を要するため、結合試験
+/// `tests/seccomp_enforcement.rs`（`harness = false` の単一スレッド `main`）から、使い捨ての子プロセス
+/// の中で呼ぶ。`unsafe` を `sys` の外へ出さないため、syscall の発行はこの関数が肩代わりする。
+/// 通常の利用者は呼ばない（起動フローは組み込み段 `StageKind::Seccomp` が適用する）。
+/// `NO_NEW_PRIVS` の設定に失敗、または適用に失敗したら `Err`。
+#[doc(hidden)]
+pub fn observe_default_seccomp_enforcement() -> Result<SeccompEnforcementObservation, ExecError> {
+    fn errno(r: Result<(), SysError>) -> Option<i32> {
+        match r {
+            Ok(()) => None,
+            Err(SysError::Os(n)) => Some(n),
+            Err(_) => Some(-1),
+        }
+    }
+    let fail =
+        |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Seccomp, m.to_string());
+    sys::set_no_new_privs().map_err(|_| fail("failed to set no_new_privs"))?;
+    let unshare_before = errno(sys::unshare_namespaces(&[]));
+    let report = apply_default_seccomp()?;
+    let status = std::fs::read_to_string("/proc/thread-self/status")
+        .map_err(|_| fail("failed to read thread status"))?;
+    let seccomp_mode = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Seccomp:"))
+        .map(|v| v.trim().to_string())
+        .ok_or_else(|| fail("Seccomp field missing"))?;
+    Ok(SeccompEnforcementObservation {
+        unshare_before,
+        instructions: report.instructions,
+        seccomp_mode,
+        unshare_after: errno(sys::unshare_namespaces(&[])),
+        mount_after: errno(sys::mount_root_private_recursive()),
+        pivot_root_after: errno(sys::pivot_root_dot()),
+        umount_after: errno(sys::umount_cwd_detach()),
+    })
+}
+
 /// 単一スレッド条件を適用の前後で検査して [`apply_filter`] を呼ぶ。事前検査は副作用の前に行う。
 fn apply_single_threaded(
     program: &SeccompProgram,

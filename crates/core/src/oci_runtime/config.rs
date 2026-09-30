@@ -4,9 +4,9 @@
 //!
 //! bundle の `config.json` を検証済みの [`OciConfig`] に変換する。TASK-29.2（create）が
 //! `load_config(<bundle>/config.json)` を呼び、結果を `exec::Entrypoint` や rootfs / mount の
-//! セットアップへ渡す想定（未実装。呼び出し側は後続 TASK）。`mounts[].destination` の rootfs 配下への
-//! 正規化とトラバーサル拒否は TASK-29.1.2 の担当で、本モジュールは「未検証のパス値」として保持する
-//! だけである。TASK-29.1.2 の検証を経ずに使ってはならない。
+//! セットアップへ渡す想定（未実装。呼び出し側は後続 TASK）。`mounts[].destination` は TASK-29.1.2 で
+//! `MountDestination` に正規化済み（`..` 等を拒否）。rootfs 内 symlink の解決は create 側
+//! （TASK-29.2・TASK-127）の担当で、本モジュールは行わない。
 //!
 //! # 型設計（REPAIR-2）
 //!
@@ -61,6 +61,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
+use super::mount_destination::MountDestination;
 use crate::traits::ErrorCode;
 
 /// `config.json` 全体の最大バイト長（4 MiB）。`args` / `env` の合計上限（1 MiB。
@@ -154,7 +155,7 @@ impl OciConfigError {
         }
     }
 
-    fn invalid(field: &'static str) -> Self {
+    pub(super) fn invalid(field: &'static str) -> Self {
         Self::new(
             ErrorCode::InvalidArgument,
             OciConfigErrorKind::Invalid { field },
@@ -912,20 +913,30 @@ impl OciProcess {
 
 /// `mounts[]` の 1 件。
 ///
-/// `destination` は未検証のパス値で、rootfs 配下への正規化と `..` 等の拒否は TASK-29.1.2 で行う。
+/// `destination` は TASK-29.1.2 で正規化・トラバーサル拒否済み（`MountDestination`）。symlink 解決は create 側の担当。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OciMount {
-    destination: PathBuf,
+    destination: MountDestination,
     fs_type: Option<String>,
     source: Option<PathBuf>,
     options: Vec<String>,
 }
 
 impl OciMount {
-    /// マウント先（未検証。TASK-29.1.2 の検証を経て使うこと）。
+    /// 正規化済みのマウント先（コンテナ内の `/` 始まりパス。CORE-2・OCI-4）。
     pub fn destination(&self) -> &Path {
+        self.destination.as_path()
+    }
+
+    /// 検証済みのマウント先型。
+    pub fn mount_destination(&self) -> &MountDestination {
         &self.destination
+    }
+
+    /// rootfs（ホスト基準の絶対パス）配下のマウント先を返す。字句上の保証のみ（`MountDestination::resolve_in`）。
+    pub fn destination_in(&self, rootfs: &Path) -> Result<PathBuf, OciConfigError> {
+        self.destination.resolve_in(rootfs)
     }
 
     /// ファイルシステム種別。
@@ -1140,7 +1151,7 @@ fn convert_process(raw: RawProcess) -> Result<OciProcess, OciConfigError> {
 
 fn convert_mount(raw: RawMount) -> Result<OciMount, OciConfigError> {
     Ok(OciMount {
-        destination: checked_path(raw.destination.0, "mounts[].destination")?,
+        destination: MountDestination::parse(&raw.destination.0)?,
         fs_type: raw.fs_type.map(|s| s.0),
         source: raw
             .source

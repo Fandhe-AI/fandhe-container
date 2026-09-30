@@ -144,3 +144,57 @@ fn oci4_parse_config_bytes_matches_load_config() {
     assert_eq!(cfg.oci_version().as_str(), "1.2.0");
     assert_eq!(cfg.unapplied_fields(), [UnappliedField::LinuxSeccomp]);
 }
+
+/// mounts を差し替えた config を組み立てる。
+fn config_with_mounts(mounts: &str) -> String {
+    VALID.replacen(
+        r#""mounts": [{"destination": "/proc", "type": "proc", "source": "proc"}]"#,
+        &format!(r#""mounts": {mounts}"#),
+        1,
+    )
+}
+
+/// OCI-4・CORE-2: トラバーサルを含む mounts destination は Err になる（3 OS 共通）。
+#[test]
+fn oci4_core2_mount_destination_traversal_rejected() {
+    for dest in [r"/../../etc", r"/a/../b", r"a\\..\\x", "/"] {
+        let json = config_with_mounts(&format!(r#"[{{"destination": "{dest}"}}]"#));
+        let e = parse_config_bytes(json.as_bytes()).expect_err(dest);
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            *e.kind(),
+            OciConfigErrorKind::Invalid {
+                field: "mounts[].destination"
+            }
+        );
+    }
+}
+
+/// OCI-4・CORE-2: 正規な destination は正規化され、rootfs 配下へ解決される。
+#[test]
+fn oci4_core2_mount_destination_normalized_and_resolved() {
+    let json = config_with_mounts(
+        r#"[{"destination": "/proc"}, {"destination": "/dev//shm/"}, {"destination": "sys"}, {"destination": "/etc"}]"#,
+    );
+    let cfg = parse_config_bytes(json.as_bytes()).expect("parse");
+    let dests: Vec<&Path> = cfg.mounts().iter().map(|m| m.destination()).collect();
+    assert_eq!(
+        dests,
+        [
+            Path::new("/proc"),
+            Path::new("/dev/shm"),
+            Path::new("/sys"),
+            Path::new("/etc")
+        ]
+    );
+    let rootfs =
+        std::env::temp_dir().join(format!("fandhe-core-oci-it-rootfs-{}", std::process::id()));
+    assert_eq!(
+        cfg.mounts()[1].destination_in(&rootfs).expect("resolve"),
+        rootfs.join("dev").join("shm")
+    );
+    // 素朴な join だとホストの /etc に脱出する絶対パスも rootfs 配下に留まる。
+    let etc = cfg.mounts()[3].destination_in(&rootfs).expect("resolve");
+    assert!(etc.starts_with(&rootfs));
+    assert_ne!(etc, Path::new("/etc"));
+}

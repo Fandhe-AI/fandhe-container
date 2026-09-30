@@ -1026,7 +1026,9 @@ fn mount_proc_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
 /// rootfs を fd で固定し、続けてその fd を起点に `names` を同様に開き、最後の要素の fd を返す
 /// （副作用なし）。
 ///
-/// [`mount_proc`] のマウント先固定に使う。各要素は直前の fd を起点に開くため、途中の要素を
+/// [`mount_proc`] のマウント先固定と、`oci_runtime` の start が bundle 配下の rootfs を固定する
+/// `RootfsDir::pin`（TASK-29.3。`rootfs` に bundle、`names` に bundle から rootfs までの要素を渡す）に
+/// 使う。各要素は直前の fd を起点に開くため、途中の要素を
 /// symlink へ差し替えても、祖先を改名しても、辿る実体は固定した rootfs の中に留まる。O_PATH は
 /// 読み取り権限を要求しないため、実行権限のみの祖先（`CLONE_NEWUSER` 後のホスト所有
 /// ディレクトリ等）も辿れる。
@@ -1038,7 +1040,7 @@ fn mount_proc_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
 ///   → `PathSymlinkOrNotDirectory`、不在 → `PathMissing`、NUL → `PathContainsNul`
 ///
 /// search 権限不足（`PermissionDenied`）等のその他の errno はシステムエラー（違反記録なし）。
-fn open_dir_beneath(rootfs: &Path, names: &[&OsStr]) -> Result<OwnedFd, ExecError> {
+pub(crate) fn open_dir_beneath(rootfs: &Path, names: &[&OsStr]) -> Result<OwnedFd, ExecError> {
     let mut cur = pin_rootfs(rootfs)?.dir;
     // 2 段目: 固定した rootfs の fd を起点にマウント先を辿る。
     for name in names {

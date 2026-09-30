@@ -720,6 +720,12 @@ impl ContainerChild {
         }
     }
 
+    /// 任意の pid からハンドルを作る（crate 内テスト専用。`oci_runtime` のアダプタの試験に使う）。
+    #[cfg(test)]
+    pub(crate) fn from_pid_for_test(pid: u32) -> Self {
+        Self::new(pid)
+    }
+
     /// 子のプロセス ID（親の PID namespace での値）。回収済みなら別プロセスに再利用され得る。
     pub fn pid(&self) -> u32 {
         self.pid
@@ -763,6 +769,50 @@ impl ContainerChild {
                 ErrorCode::Internal,
                 STAGE,
                 "the container process did not exit after SIGKILL",
+            )),
+        }
+    }
+
+    /// 子の終了を `timeout` まで待つが、期限を過ぎても kill しない（監視用。REPAIR-5・CORE-1）。
+    ///
+    /// start から起動済みプロセスのハンドルを引き取った所有者（supervisor 等）が、コンテナの終了を
+    /// 監視・回収するために使う（`oci_runtime::ContainerChildProcess` の `LaunchedProcess::wait`）。
+    /// [`Self::wait_timeout`] と同じ回収状態の排他（`poll_until`）で回収する。
+    ///
+    /// - 期限内に終われば回収して `Ok(Some(終了状態))`（回収済みなら `waitpid` せず記録を返す）
+    /// - 期限までに終わらなければ `Ok(None)`。子はそのまま動き続け、同じハンドルで再び待てる
+    ///
+    /// `timeout` は 7 日に丸める。
+    pub fn wait_for_exit(&self, timeout: Duration) -> Result<Option<ChildExit>, ExecError> {
+        let deadline = Instant::now() + timeout.min(WAIT_TIMEOUT_MAX);
+        Ok(self.poll_until(deadline)?.map(|(exit, _)| exit))
+    }
+
+    /// 子を待たずに終了させ、`timeout` まで回収を待つ（REPAIR-5。状態記録に失敗した起動の後始末用）。
+    ///
+    /// `oci_runtime` の start が起動後の状態記録に失敗したとき、`LaunchedProcess::terminate` の実装
+    /// （`oci_runtime::ContainerChildProcess`）から呼ばれる。[`Self::wait_timeout`] と同じ回収状態の
+    /// 排他（`kill_if_unreaped` → `poll_until`）を使うため、回収済み（pid 再利用され得る）の子へは
+    /// `SIGKILL` を送らない。
+    ///
+    /// - 回収済みなら `kill` せず `Ok`（記録済みの終了状態）
+    /// - 未回収なら `SIGKILL` を 1 回だけ送り、`timeout` までに回収できれば `Ok`
+    /// - `timeout` までに回収できなければ `ErrorCode::Timeout`。回収状態は `Killed` のまま残り、
+    ///   同じハンドルで再試行（回収）できる
+    ///
+    /// [`Self::wait_timeout`] の `KILL_REAP_TIMEOUT`（固定 5 秒）ではなく呼び出し側の `timeout` を使う
+    /// （呼び出し側の上限を超えて待たない）。`timeout` は 7 日に丸める。
+    pub fn kill_and_reap(&self, timeout: Duration) -> Result<ChildExit, ExecError> {
+        let deadline = Instant::now() + timeout.min(WAIT_TIMEOUT_MAX);
+        if let Some((exit, _)) = self.kill_if_unreaped()? {
+            return Ok(exit);
+        }
+        match self.poll_until(deadline)? {
+            Some((exit, _)) => Ok(exit),
+            None => Err(ExecError::new(
+                ErrorCode::Timeout,
+                IsolationStage::Wait,
+                format!("the container process was not reaped within {timeout:?} after SIGKILL"),
             )),
         }
     }
@@ -1279,6 +1329,72 @@ mod tests {
         assert_eq!(err.code, ErrorCode::Timeout);
         assert_eq!(err.stage, IsolationStage::Wait);
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    /// REPAIR-5・CORE-1（TASK-29.3）: `kill_and_reap` は未回収の子へ `SIGKILL` を 1 回だけ送って上限内に
+    /// 回収し、回収済みのハンドルへの再呼び出しでは `kill` しない（回収状態の排他を共有する）。
+    #[test]
+    fn repair5_kill_and_reap_kills_once_and_reaps() {
+        let pid = spawn_sh("exec sleep 30");
+        let handle = ContainerChild::new(pid);
+        assert_eq!(
+            handle.kill_and_reap(Duration::from_secs(10)).unwrap(),
+            ChildExit::Signaled(9)
+        );
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert_eq!(
+            handle.kill_and_reap(Duration::ZERO).unwrap(),
+            ChildExit::Signaled(9)
+        );
+        assert_eq!(
+            reap_snapshot(&handle),
+            (
+                ReapState::Reaped {
+                    exit: ChildExit::Signaled(9),
+                    killed: true
+                },
+                1
+            )
+        );
+    }
+
+    /// REPAIR-5（TASK-29.3）: 既に終了して回収済みの子には `kill_and_reap` が `SIGKILL` を送らない。
+    #[test]
+    fn repair5_kill_and_reap_skips_kill_after_reap() {
+        let handle = ContainerChild::new(spawn_sh("exit 4"));
+        assert_eq!(
+            handle.wait_timeout(Duration::from_secs(10)).unwrap(),
+            ChildExit::Exited(4)
+        );
+        assert_eq!(
+            handle.kill_and_reap(Duration::from_secs(1)).unwrap(),
+            ChildExit::Exited(4)
+        );
+        assert_eq!(reap_snapshot(&handle).1, 0);
+    }
+
+    /// CORE-1・REPAIR-5（TASK-29.3）: `wait_for_exit` は期限を過ぎても kill せず `None` を返し、終了後は
+    /// 回収して終了状態を返す。
+    #[test]
+    fn core1_wait_for_exit_polls_without_kill() {
+        let pid = spawn_sh("exec sleep 30");
+        let handle = ContainerChild::new(pid);
+        assert_eq!(
+            handle.wait_for_exit(Duration::from_millis(100)).unwrap(),
+            None
+        );
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        assert_eq!(reap_snapshot(&handle), (ReapState::Running, 0));
+        assert_eq!(
+            handle.kill_and_reap(Duration::from_secs(10)).unwrap(),
+            ChildExit::Signaled(9)
+        );
+        let handle = ContainerChild::new(spawn_sh("exit 6"));
+        assert_eq!(
+            handle.wait_for_exit(Duration::from_secs(10)).unwrap(),
+            Some(ChildExit::Exited(6))
+        );
+        assert_eq!(reap_snapshot(&handle).1, 0);
     }
 
     /// 回収状態と送った `SIGKILL` の回数を取り出す。

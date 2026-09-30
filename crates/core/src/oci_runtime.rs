@@ -3,13 +3,19 @@
 //! bundle の `config.json` を型として読み込む `config`（TASK-29.1.1）と、
 //! `mounts[].destination` の正規化・トラバーサル拒否 `mount_destination`（TASK-29.1.2）、
 //! プロセス未起動の状態初期化 `create`（TASK-29.2）が実装済み。
-//! start は TASK-29.3、kill / delete は TASK-30 で追加する予定で、現時点では未実装である
-//! （REPAIR-3: 実装済みを装わない）。純粋なデータ処理のため `cfg(target_os)` を付けず 3 OS で
-//! ビルドされる（CLI-1）。
+//! `start`（TASK-29.3）も実装済みだが、起動は依存注入する `ProcessLauncher` に委ねており、本番
+//! launcher と実プロセスの exec は未提供（制限ステージ TASK-37〜39 待ちで fail-closed）。
+//! kill / delete は TASK-30 で追加する予定で、現時点では未実装である
+//! （REPAIR-3: 実装済みを装わない）。モジュールは `cfg(target_os)` を付けず 3 OS でビルドされる（CLI-1）。
+//! 例外は start の rootfs 固定（`RootfsDir::pin`。`exec::open_dir_beneath` を使う）と
+//! `ContainerChildProcess` で、`launch.rs` 内に `cfg(target_os = "linux")` で局所化している。Linux 以外の
+//! start は rootfs を固定できないため、起動前に `Unimplemented` で拒否する（fail-closed）。
 
 mod config;
 mod create;
+mod launch;
 mod mount_destination;
+mod start;
 
 pub use config::{
     CONFIG_MAX_ADDITIONAL_GIDS, CONFIG_MAX_ARGS, CONFIG_MAX_BYTES, CONFIG_MAX_ENV,
@@ -20,4 +26,14 @@ pub use config::{
     load_config, parse_config_bytes,
 };
 pub use create::create;
+#[cfg(target_os = "linux")]
+pub use launch::ContainerChildProcess;
+pub use launch::{
+    LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, RootfsDir, START_TIMEOUT_MAX,
+    StartTimeouts,
+};
 pub use mount_destination::MountDestination;
+pub use start::{
+    LAUNCHER_REPLY_GRACE, StartedContainer, recover_interrupted_start, start,
+    take_unreaped_processes,
+};

@@ -1940,4 +1940,41 @@ mod tests {
             assert_eq!(err.violation, None);
         }
     }
+
+    /// Codex P0（rootfs の検証後の差し替え）: rootfs 自体・祖先の symlink や非ディレクトリは
+    /// rootfs を fd で固定する段で拒否し、対象は rootfs のパスになる。rootfs より下の拒否とは
+    /// 理由コードで区別する。
+    #[test]
+    fn open_dir_beneath_pins_rootfs_before_target() {
+        let t = TempTree::new("pin-rootfs");
+        let root = t.base.join("root");
+        std::fs::create_dir_all(root.join("proc")).unwrap();
+        std::fs::write(t.base.join("file"), b"").unwrap();
+        std::os::unix::fs::symlink(&t.base, t.base.join("up")).unwrap();
+        let s = |p: &Path| Some(p.to_str().unwrap().to_string());
+        let proc = [OsStr::new("proc")];
+        for (rootfs, reason) in [
+            // rootfs の祖先が symlink（実体は同じ root）。
+            (t.base.join("up/root"), "rootfs_symlink_or_not_directory"),
+            // rootfs が通常ファイル。
+            (t.base.join("file"), "rootfs_symlink_or_not_directory"),
+            (t.base.join("absent"), "rootfs_missing"),
+        ] {
+            let err = open_dir_beneath(&rootfs, &proc).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "{rootfs:?}");
+            assert_eq!(
+                violation_of(&err),
+                ("mount_target", reason, "CORE-1", s(&rootfs)),
+                "{rootfs:?}"
+            );
+        }
+        // 固定した fd は rootfs を改名しても同じ実体（改名後の rootfs 配下）を指し続ける。
+        let fd = open_dir_beneath(&root, &proc).unwrap();
+        let moved = t.base.join("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        assert_eq!(
+            std::fs::read_link(format!("/proc/thread-self/fd/{}", fd.as_raw_fd())).unwrap(),
+            moved.join("proc")
+        );
+    }
 }

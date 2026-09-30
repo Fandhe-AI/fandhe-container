@@ -6,8 +6,8 @@
 //! 起動（[`spawn_container`]・[`exec_entrypoint`]。#831・TASK-27.4.1）と、順序固定のステージ列の枠
 //! （[`StagePipeline`]。#832・TASK-27.4.2。`exec/stages.rs`）まで実装済み。各段の実体
 //! のうち `PR_SET_NO_NEW_PRIVS` は組み込みの固定ステージとして実装済み（#833・TASK-27.4.3。
-//! `exec/no_new_privs.rs`）。cgroup 参加・capability 削減・Landlock・seccomp と制限適用の
-//! 証跡は未実装で、後続の sub-issue（#137、TASK-32・37〜40）が追記する（REPAIR-3: 実装済みを装わない）。
+//! `exec/no_new_privs.rs`）、capability 削減（#173）と seccomp（#178・TASK-38.3）も同様に組み込み済み。
+//! cgroup 参加・Landlock と制限適用の証跡は未実装で、後続の sub-issue（#137、TASK-32・37〜40）が追記する（REPAIR-3: 実装済みを装わない）。
 //!
 //! # 目指すフロー（Linux 専用）
 //!
@@ -18,20 +18,21 @@
 //!    [`prepare_rootfs`] の後・[`pivot_root`] の前に呼ぶ。rootless では `mknod` が `EPERM` になり
 //!    `PermissionDenied` で fail-closed する。ホスト `/dev` の bind mount による代替は未実装）
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
-//!    → Landlock → seccomp（#136・#832・#833。**枠・`NO_NEW_PRIVS`・capability 削減は実装済み**: [`StagePipeline`] が
+//!    → Landlock → seccomp（#136・#832・#833。**枠・`NO_NEW_PRIVS`・capability 削減・seccomp は実装済み**: [`StagePipeline`] が
 //!    [`StageKind::ORDER`] の固定順でフックを呼び、`NO_NEW_PRIVS` は差し替え不可の組み込み段として
 //!    常に適用する。capability の絞り込み処理 `apply_default_capabilities`（crate 内限定。SEC-1・TASK-37.1・#172）
-//!    も #173（TASK-37.2）で同じく差し替え不可の組み込み段になった。seccomp の適用処理 `apply_seccomp_filter`
-//!    （crate 内限定。CORE-5・TASK-38.2・#177）は実装済みだがステージ列への組み込みは #178（TASK-38.3）。Landlock・cgroup 参加と
+//!    も #173（TASK-37.2）で同じく差し替え不可の組み込み段になった。seccomp の適用処理 `apply_default_seccomp`
+//!    （crate 内限定。CORE-5・TASK-38.2・#177）も #178（TASK-38.3）で同じく差し替え不可の組み込み段になり、
+//!    exec 直前に必ず適用される。Landlock・cgroup 参加と
 //!    最終的な制限の証跡は未実装のため exec は
-//!    引き続き拒否される。他の段の実体は未実装で、後続の TASK-32・37・38・39・40 が [`StageHook`] として
+//!    引き続き拒否される。他の段の実体は未実装で、後続の TASK-32・39・40 が [`StageHook`] として
 //!    差し込む）。
 //!    `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
 //!    後続実装はこの順序を崩さない
 //! 5. `fork` / `exec`（#831・TASK-27.4.1。**最小構成のみ実装済み**。[`spawn_container`] が分離済みの
 //!    親から子を fork し、子が `establish` → [`prepare_rootfs`] → [`pivot_root`] →
-//!    [`exec_entrypoint`] を行う。上の第 3・4 段〔デバイスノード・ステージ列・`NO_NEW_PRIVS`〕は
-//!    未実装のため**この最小構成は capability 削減・seccomp・Landlock を適用できず、[`exec_entrypoint`] は
+//!    [`exec_entrypoint`] を行う。上の第 3・4 段〔デバイスノード・ステージ列・`NO_NEW_PRIVS`〕のうち
+//!    Landlock・cgroup 参加が未実装のため**この最小構成は Landlock を適用できず、[`exec_entrypoint`] は
 //!    制限の適用証跡が無い限り rootful・rootless を問わず `PermissionDenied` で exec を拒否する**
 //!    （SEC-1・CORE-5。fail-closed）。親子間の同期・構造化エラーパイプも未実装で、子の失敗は
 //!    終了コードと stderr で伝える〔TASK-29/30 で扱う〕）
@@ -108,8 +109,9 @@ pub use process::{
 };
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 pub use seccomp::SeccompReport;
-#[allow(unused_imports)]
-pub(crate) use seccomp::apply_seccomp_filter;
+/// 結合試験 `tests/seccomp_enforcement.rs` 専用の再公開（通常の利用者は呼ばない。詳細は定義側）。`unsafe` を `sys` の外へ出さないための観測専用の入口。
+#[doc(hidden)]
+pub use seccomp::{SeccompEnforcementObservation, observe_default_seccomp_enforcement};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 
 pub use violation::{
@@ -340,7 +342,7 @@ pub enum IsolationStage {
     NoNewPrivs,
     /// Landlock ステージ（TASK-39。#832 のステージ列の第 4 段）。
     Landlock,
-    /// seccomp ステージ（TASK-38。#832 のステージ列の第 5 段）。
+    /// seccomp ステージ（TASK-38。#832 のステージ列の第 5 段。#178 で組み込み段）。
     Seccomp,
 }
 

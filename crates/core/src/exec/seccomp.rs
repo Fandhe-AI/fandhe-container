@@ -4,8 +4,8 @@
 //!
 //! ステージ列（`exec/stages.rs`）第 5 段「seccomp」の実体。`crate::seccomp::build_deny_filter`
 //! （TASK-38.1）が作る [`SeccompProgram`] を `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)` で呼び出し
-//! スレッドへ適用する。ステージ列（`StagePipeline`）への組み込みは TASK-38.3（#178）で未実施で、
-//! 現状どの経路からも呼ばれない（そのため [`apply_seccomp_filter`] は `dead_code` 許可付き）。
+//! スレッドへ適用する。ステージ列（`StagePipeline`）へは TASK-38.3（#178）で組み込み済みで、
+//! `stages.rs` の組み込み段が [`apply_default_seccomp`] を exec 直前に必ず呼ぶ（差し替え不可）。
 //! 最終的な制限適用の証跡型は TASK-38・TASK-39 で決めるため、[`SeccompReport`] は証跡ではなく、
 //! `process.rs::require_restriction_evidence` は本関数の成否によらず exec を拒否し続ける（REPAIR-3）。
 //!
@@ -72,10 +72,94 @@ pub struct SeccompReport {
 /// 呼び出したスレッドへ seccomp フィルタを適用する（CORE-5）。
 ///
 /// **crate 内限定**（`pub(crate)`）。`sys::fork_single_threaded` の子で、`NO_NEW_PRIVS` の後に呼ぶ。
-/// ステージ列への組み込みは TASK-38.3（#178）で行うため、それまで `dead_code` を許可する。
-#[allow(dead_code)]
+/// 本番の入口は [`apply_default_seccomp`]（ステージ列の組み込み段から呼ばれる）。
+// テストでは `stages.rs` が偽物（`testing`）へ差し替えるため、本物は未使用になる。
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn apply_seccomp_filter(program: &SeccompProgram) -> Result<SeccompReport, ExecError> {
     apply_single_threaded(program, &mut RealKernel)
+}
+
+/// ビルド対象アーキの既定 deny フィルタを構築して適用する（CORE-5・TASK-38.3・#178）。
+///
+/// `stages.rs` の組み込み `Seccomp` 段が exec 直前に呼ぶ本番の入口。`fork_single_threaded` の
+/// 子（単一スレッド）の中で BPF を構築する。構築失敗は fail-closed で exec を止める:
+/// 対応外アーキは `Unimplemented`、命令数超過は `Internal`（段はいずれも `Seccomp`）。
+///
+/// # 将来仕様（記録のみ）
+///
+/// 構築を親で事前に行い、呼び出し元へ構造化エラーを返す改善は未実施（REPAIR-3）。
+// テストでは `stages.rs` が偽物（`testing`）へ差し替えるため、本物は未使用になる。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn apply_default_seccomp() -> Result<SeccompReport, ExecError> {
+    let program = crate::seccomp::build_filter_for_target_arch().map_err(|e| {
+        let code = match e {
+            crate::seccomp::SeccompBuildError::UnsupportedArch => ErrorCode::Unimplemented,
+            _ => ErrorCode::Internal,
+        };
+        ExecError::new(code, IsolationStage::Seccomp, e.to_string())
+    })?;
+    apply_seccomp_filter(&program)
+}
+
+/// [`observe_default_seccomp_enforcement`] の観測結果。errno は `Err(SysError::Os(n))` の `n`、成功は `None`。
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SeccompEnforcementObservation {
+    /// 適用前の `unshare(0)`（対照。フラグなしのため通常は成功し `None`）。
+    pub unshare_before: Option<i32>,
+    /// 適用した BPF 命令数。
+    pub instructions: usize,
+    /// 適用後の `/proc/thread-self/status` の `Seccomp:` 値（filter モードは `2`）。
+    pub seccomp_mode: String,
+    /// 適用後の `unshare(0)` の errno（禁止 syscall のため `EPERM`）。
+    pub unshare_after: Option<i32>,
+    /// 適用後の `mount` 系（`mount(MS_REC|MS_PRIVATE)`）の errno。
+    pub mount_after: Option<i32>,
+    /// 適用後の `pivot_root` の errno。
+    pub pivot_root_after: Option<i32>,
+    /// 適用後の `umount2` の errno。
+    pub umount_after: Option<i32>,
+}
+
+/// 本番の適用経路（[`apply_default_seccomp`]）を呼び出しスレッドへ適用し、禁止 syscall の遮断を観測する
+/// （CORE-5・TASK-38.3・#178。結合試験専用）。
+///
+/// 適用は不可逆・呼び出しスレッド単位で、単一スレッド（`Threads: 1`）を要するため、結合試験
+/// `tests/seccomp_enforcement.rs`（`harness = false` の単一スレッド `main`）から、使い捨ての子プロセス
+/// の中で呼ぶ。`unsafe` を `sys` の外へ出さないため、syscall の発行はこの関数が肩代わりする。
+/// 通常の利用者は呼ばない（起動フローは組み込み段 `StageKind::Seccomp` が適用する）。
+/// `NO_NEW_PRIVS` の設定に失敗、または適用に失敗したら `Err`。
+#[doc(hidden)]
+pub fn observe_default_seccomp_enforcement() -> Result<SeccompEnforcementObservation, ExecError> {
+    fn errno(r: Result<(), SysError>) -> Option<i32> {
+        match r {
+            Ok(()) => None,
+            Err(SysError::Os(n)) => Some(n),
+            Err(_) => Some(-1),
+        }
+    }
+    let fail =
+        |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Seccomp, m.to_string());
+    sys::set_no_new_privs().map_err(|_| fail("failed to set no_new_privs"))?;
+    let unshare_before = errno(sys::unshare_namespaces(&[]));
+    let report = apply_default_seccomp()?;
+    let status = std::fs::read_to_string("/proc/thread-self/status")
+        .map_err(|_| fail("failed to read thread status"))?;
+    let seccomp_mode = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Seccomp:"))
+        .map(|v| v.trim().to_string())
+        .ok_or_else(|| fail("Seccomp field missing"))?;
+    Ok(SeccompEnforcementObservation {
+        unshare_before,
+        instructions: report.instructions,
+        seccomp_mode,
+        unshare_after: errno(sys::unshare_namespaces(&[])),
+        mount_after: errno(sys::mount_root_private_recursive()),
+        pivot_root_after: errno(sys::pivot_root_dot()),
+        umount_after: errno(sys::umount_cwd_detach()),
+    })
 }
 
 /// 単一スレッド条件を適用の前後で検査して [`apply_filter`] を呼ぶ。事前検査は副作用の前に行う。
@@ -309,5 +393,31 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+}
+
+/// テスト用の偽物。本物の BPF 構築・syscall は呼ばない（libtest のスレッドへ不可逆のフィルタを載せないため）。
+#[cfg(test)]
+pub(super) mod testing {
+    use std::cell::Cell;
+
+    use super::{ExecError, SeccompReport};
+
+    thread_local! {
+        static SECCOMP_ERR: Cell<Option<ExecError>> = const { Cell::new(None) };
+    }
+
+    /// 次の 1 回だけ、`apply_default_seccomp` の偽物を失敗させる（使うと既定へ戻る）。
+    pub(in crate::exec) fn fake_seccomp_err(e: ExecError) {
+        SECCOMP_ERR.with(|c| c.set(Some(e)));
+    }
+
+    /// `stages.rs` の組み込み段が `cfg(test)` で呼ぶ偽物。
+    pub(in crate::exec) fn apply_default_seccomp() -> Result<SeccompReport, ExecError> {
+        crate::exec::no_new_privs::testing::rec("seccomp");
+        match SECCOMP_ERR.with(Cell::take) {
+            Some(e) => Err(e),
+            None => Ok(SeccompReport { instructions: 0 }),
+        }
     }
 }

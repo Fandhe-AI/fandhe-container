@@ -15,12 +15,13 @@
 //!   ディスパッチャが自身を `--scenario capabilities <rootfs>` で再起動した別プロセスで行う。
 //!
 //! # 観測点
-//! 現状は seccomp（TASK-38）・Landlock（TASK-39）が未実装で、制限の証跡が無い間は exec が常に拒否される
+//! 現状は Landlock（TASK-39）が未実装で、制限の証跡が無い間は exec が常に拒否される
 //! （fail-closed。REPAIR-3）ため、exec 後のプロセスは観測できない。そこで組み込みでない最後の段
-//! （`StageKind::Seccomp` のフック）を、組み込みの `CapabilityDrop`・`NoNewPrivs` の後・exec の直前の
-//! 観測点として使う。フックは親と合図ファイルで同期し、親は子が停止している間に `/proc/<pid>/status` を
-//! 読む。TASK-38 で Seccomp が組み込み段になるとこの登録は `InvalidArgument` で失敗する（意図した仕掛け。
-//! そのとき観測点と `Exited(126)` の期待値を見直す）。exec 後の capability（`retained_after_exec` の
+//! （`StageKind::Landlock` のフック）を、組み込みの `CapabilityDrop`・`NoNewPrivs` の後・組み込みの
+//! seccomp（#178。観測点の後に適用される）と exec の前の観測点として使う。フックは親と合図ファイルで
+//! 同期し、親は子が停止している間に `/proc/<pid>/status` を読む。TASK-39.4 で Landlock が組み込み段に
+//! なるとこの登録は `InvalidArgument` で失敗する（意図した仕掛け。そのとき観測点と `Exited(126)` の
+//! 期待値を見直す）。exec 後の capability（`retained_after_exec` の
 //! 上限挙動を含む）の実測は、exec が許可された後の課題とする。
 //!
 //! # 実機前提テストとしての分離
@@ -337,10 +338,10 @@ mod linux {
         }
 
         let entry = Entrypoint::new(ENTRY, [ENTRY], [] as [&str; 0]).expect("entrypoint");
-        // Seccomp は現状組み込みでない最後の段。組み込みの CapabilityDrop・NoNewPrivs の後、exec の
-        // 直前に走る（TASK-38 で組み込みになるとここは InvalidArgument になる）。
+        // Landlock は現状組み込みでない最後の段。組み込みの CapabilityDrop・NoNewPrivs の後、
+        // 組み込みの seccomp と exec の前に走る（TASK-39.4 で組み込みになるとここは InvalidArgument になる）。
         let stages = StagePipeline::new()
-            .with_hook(StageKind::Seccomp, handshake_hook)
+            .with_hook(StageKind::Landlock, handshake_hook)
             .unwrap_or_else(|e| panic!("register hook: {e}"));
         let child = spawn_container_with_stages(rootfs, &entry, stages)
             .unwrap_or_else(|e| panic!("spawn: {e}"));

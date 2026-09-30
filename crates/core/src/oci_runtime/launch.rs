@@ -15,7 +15,7 @@
 //! # 本番実装が未提供である理由（REPAIR-3: 実装済みを装わない）
 //!
 //! TASK-27 の exec フロー（`exec::spawn_container`）は「分離済み・シングルスレッド・使い捨て」の
-//! 親プロセスを要求し、さらに制限ステージ（capability 削減・seccomp・Landlock。TASK-37〜39）の
+//! 親プロセスを要求し、さらに制限ステージ（capability 削減・seccomp は組み込み済み、Landlock は未実装。TASK-37〜39）の
 //! 証跡が無い限り exec を拒否する（SEC-1・CORE-5）。任意の文脈から呼ばれる `start` はこれを
 //! 保証できないため、fork した中間プロセスでの `isolate` → `spawn_container` と pid 返却・子の回収
 //! を行う本番 launcher は後続 sub-issue（TASK-29 / TASK-157 系）で提供する。現時点で本 crate に

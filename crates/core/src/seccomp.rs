@@ -10,8 +10,8 @@
 //! 本モジュールは syscall を発行しない純粋関数・データで、[`build_deny_filter`] が
 //! テーブルから BPF プログラム（`seccomp_data.arch` 検査・x32 拒否を含む。TASK-38.1.2・#838）を構築する。
 //! 適用関数は `crate::exec` の `apply_seccomp_filter`（TASK-38.2・#177）に実装済みだが、
-//! **起動フロー（`exec/stages.rs`）への組み込みは TASK-38.3・#178 で未実施**のため、現時点では
-//! コンテナは保護されない（REPAIR-3）。
+//! 起動フロー（`exec/stages.rs`）の組み込み段が exec 直前に適用する（TASK-38.3・#178）。
+//! 禁止 syscall の遮断を実環境で確かめる結合テストは TASK-38.4・#179。
 //!
 //! # 契約
 //!
@@ -444,8 +444,8 @@ impl BpfInstruction {
 
 /// 検証済みの seccomp BPF プログラム（1 以上 `BPF_MAXINSNS` 以下の命令列）。
 ///
-/// [`build_deny_filter`] が唯一の生成経路。適用関数は `exec::apply_seccomp_filter`（TASK-38.2・#177）だが、起動フローへの組み込みは
-/// TASK-38.3（#178）で未実施。本型を持つだけではコンテナは保護されない（REPAIR-3）。
+/// [`build_deny_filter`] が唯一の生成経路。適用関数は `exec::apply_seccomp_filter`（TASK-38.2・#177）で、起動フローの
+/// 組み込み段（TASK-38.3・#178）が exec 直前に適用する。遮断の結合テストは TASK-38.4・#179。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeccompProgram(Vec<BpfInstruction>);
 
@@ -514,7 +514,7 @@ impl std::error::Error for SeccompBuildError {}
 
 /// 禁止 syscall テーブルから deny-list 型の seccomp BPF プログラムを構築する純粋関数（CORE-5・TASK-38.1.2）。
 ///
-/// 生成する形は次のとおり。適用は実装済み（TASK-38.2・#177）、起動フローからの呼び出しは TASK-38.3（#178）で未実施。
+/// 生成する形は次のとおり。適用は実装済み（TASK-38.2・#177）、起動フローの組み込み段（TASK-38.3・#178）が exec 直前に呼ぶ。
 ///
 /// 1. `seccomp_data.arch` が `table.audit_arch()` と違えば `KILL_PROCESS`（compat 経由の回避を防ぐ。
 ///    スレッド単位の `KILL` ではなくプロセス単位）

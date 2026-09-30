@@ -7,7 +7,7 @@
 //! `rootless` / `exec` モジュール自体がビルド対象外（OS 非該当であり skip ではない）。
 //!
 //! # 受入基準の解釈（REPAIR-3）
-//! 制限ステージ（seccomp・Landlock 等。TASK-38・TASK-39）が未実装の間、`exec_entrypoint` は rootless でも
+//! 制限ステージ（Landlock。TASK-39。seccomp は組み込み済み）が未実装の間、`exec_entrypoint` は rootless でも
 //! exec を拒否するため、エントリポイントにファイルを作らせることはできない（exec 到達は
 //! `rootless_launch` が照合済み）。ファイル所有者はプロセスの user namespace 写像だけで決まるので、
 //! `isolate_rootless_subordinate` 成功後のシナリオプロセス（コンテナの user namespace 内 uid 0）が

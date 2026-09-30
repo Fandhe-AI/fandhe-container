@@ -22,7 +22,7 @@
 //!   rootfs 切替〔TASK-27.3〕、基本デバイスノード作成〔TASK-27.6。`exec/devices.rs`。
 //!   Issue 表記の `src/devices.rs` ではなく `exec` 配下に置く: 段の型 `ExecError`・`MountIsolation`
 //!   の検証が `exec` の非公開項目のため〕、fork / exec による子プロセス起動〔TASK-27.4.1。最小構成でフック無し〕、順序固定のステージ列の枠〔TASK-27.4.2。`exec/stages.rs`。`NO_NEW_PRIVS`〔TASK-27.4.3〕と capability 削減〔TASK-37.2〕のみ固定ステージとして実装済み〕が
-//!   実装済みで、他の段の実体（cgroup 参加・seccomp・Landlock）は未実装。非 Linux ではビルド対象外のため本 doc からは
+//!   実装済みで、他の段の実体（cgroup 参加・Landlock）は未実装（seccomp は #178 で組み込み済み）。非 Linux ではビルド対象外のため本 doc からは
 //!   リンクしない）
 //! - `capabilities`: capability 集合の型 `Capability`・`CapabilitySet`・OCI 既定集合（SEC-1・
 //!   TASK-37.1）。OS 非依存で syscall を持たない。適用関数 `apply_default_capabilities` は
@@ -38,7 +38,7 @@
 //!   `linux.uidMappings` の受理は後続、ファイル所有者検証（TASK-40.3）は未実装
 //! - `seccomp`: 禁止 syscall の一覧 `DeniedSyscall` と x86_64 / aarch64 別の番号テーブル（CORE-5・
 //!   TASK-38.1.1・#837。OS 非依存で syscall を持たない）。テーブルと BPF 構築
-//!   （TASK-38.1.2・#838）は実装済み。フィルタ適用は TASK-38.2、起動フローへの組み込みは TASK-38.3 で未実装
+//!   （TASK-38.1.2・#838）は実装済み。フィルタ適用（TASK-38.2）と起動フローへの組み込み（TASK-38.3）も実装済み
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - `oci_runtime`: OCI Runtime のライフサイクル。`config.json` の型・パーサ
 //!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。

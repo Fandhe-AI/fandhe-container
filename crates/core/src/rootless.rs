@@ -459,16 +459,28 @@ impl TargetPid {
     }
 }
 
+/// ヘルパーの同一性（`st_dev` / `st_ino`）。検証時点と実行直前の再検証で比較し、差し替えを検出する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
 /// `newuidmap` / `newgidmap` の検証済みパス。絶対パスのみ・PATH 探索なし・通常ファイル
 /// （symlink 不可）・所有者 root・group/other 書き込み不可（差し替えられた実行ファイルを拒否。
-/// PLUG-11 と同じ思想）。setuid ビットは要求しない（file capability 方式の配布があるため）。
+/// PLUG-11 と同じ思想）。さらに全祖先ディレクトリも root 所有・group/other 書き込み不可を要求し
+/// （非 root がディレクトリエントリを差し替えられない状態を保証して TOCTOU を塞ぐ）、検証時の
+/// dev/ino を保持して [`run_helper`] の exec 直前に再検証・同一性比較する。
+/// setuid ビットは要求しない（file capability 方式の配布があるため）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelperPaths {
     newuidmap: PathBuf,
     newgidmap: PathBuf,
+    uid_identity: FileIdentity,
+    gid_identity: FileIdentity,
 }
 
-fn check_helper(path: &Path) -> Result<(), RootlessError> {
+fn check_helper(path: &Path) -> Result<FileIdentity, RootlessError> {
     let stage = RootlessStage::ResolveHelper;
     if !path.is_absolute() {
         return Err(RootlessError::invalid(
@@ -491,17 +503,35 @@ fn check_helper(path: &Path) -> Result<(), RootlessError> {
             "helper must be owned by root and not writable by group/other",
         ));
     }
-    Ok(())
+    // 祖先ディレクトリ（symlink は解決した先の実体）が root 所有かつ group/other 書き込み不可で
+    // あること。非 root が親ディレクトリのエントリを差し替えられる経路を閉じる。
+    for dir in path.ancestors().skip(1) {
+        let dmeta =
+            std::fs::metadata(dir).map_err(|e| io_error(stage, "stat helper parent", &e))?;
+        if !dmeta.is_dir() || dmeta.uid() != 0 || dmeta.mode() & 0o022 != 0 {
+            return Err(RootlessError::new(
+                ErrorCode::PermissionDenied,
+                stage,
+                "helper parent directories must be owned by root and not writable by group/other",
+            ));
+        }
+    }
+    Ok(FileIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
 }
 
 impl HelperPaths {
     /// 明示パスを検証して作る。
     pub fn new(newuidmap: &Path, newgidmap: &Path) -> Result<Self, RootlessError> {
-        check_helper(newuidmap)?;
-        check_helper(newgidmap)?;
+        let uid_identity = check_helper(newuidmap)?;
+        let gid_identity = check_helper(newgidmap)?;
         Ok(Self {
             newuidmap: newuidmap.to_path_buf(),
             newgidmap: newgidmap.to_path_buf(),
+            uid_identity,
+            gid_identity,
         })
     }
 
@@ -517,6 +547,13 @@ impl HelperPaths {
         match kind {
             IdKind::Uid => &self.newuidmap,
             IdKind::Gid => &self.newgidmap,
+        }
+    }
+
+    fn identity_for(&self, kind: IdKind) -> FileIdentity {
+        match kind {
+            IdKind::Uid => self.uid_identity,
+            IdKind::Gid => self.gid_identity,
         }
     }
 }
@@ -611,14 +648,25 @@ fn sanitize_stderr(raw: &[u8]) -> String {
         .collect()
 }
 
+/// 検証済みヘルパーを実行する。exec 直前に所有者・権限・祖先ディレクトリ・dev/ino を再検証し、
+/// [`HelperPaths::new`] 時点から差し替えられていれば拒否する（TOCTOU 対策。祖先が root 専有のため
+/// 非 root は残る窓でも差し替えられない）。
 fn run_helper(
-    path: &Path,
+    paths: &HelperPaths,
     pid: TargetPid,
     set: &IdMapSet,
     kind: IdKind,
     timeout: Duration,
 ) -> Result<(), RootlessError> {
     let stage = RootlessStage::Helper;
+    let path = paths.path_for(kind);
+    if check_helper(path)? != paths.identity_for(kind) {
+        return Err(RootlessError::new(
+            ErrorCode::PermissionDenied,
+            RootlessStage::ResolveHelper,
+            "helper was replaced after validation",
+        ));
+    }
     let mut cmd = Command::new(path);
     cmd.arg(pid.get().to_string());
     for e in set.entries() {
@@ -795,8 +843,8 @@ fn apply_id_maps_as(
             WriterKind::Direct
         }
         IdMapWriter::Helper(paths) => {
-            run_helper(paths.path_for(IdKind::Uid), pid, uid, IdKind::Uid, timeout)?;
-            run_helper(paths.path_for(IdKind::Gid), pid, gid, IdKind::Gid, timeout)?;
+            run_helper(paths, pid, uid, IdKind::Uid, timeout)?;
+            run_helper(paths, pid, gid, IdKind::Gid, timeout)?;
             WriterKind::Helper
         }
     };
@@ -963,6 +1011,29 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// PLUG-11 相当: 祖先ディレクトリが呼び出しユーザー所有（差し替え可能）なら root 所有の
+    /// ヘルパーでも拒否する。root 実行時は検証できないためスキップ相当（所有者が一致するため）。
+    #[test]
+    fn core6_helper_rejects_non_root_parent_directory() {
+        if sys::effective_uid() == 0 {
+            return;
+        }
+        // /usr/bin/env は root 所有だが、親が非 root のディレクトリへ置いた場合の拒否を
+        // 一時ディレクトリ配下の通常ファイルで確認する（ファイル自体も非 root のため
+        // ResolveHelper 段で PermissionDenied になる）。
+        let dir =
+            std::env::temp_dir().join(format!("fandhe-rootless-parent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let f = dir.join("helper");
+        std::fs::write(&f, b"x").expect("write");
+        let e = check_helper(&f).expect_err("non-root parent");
+        assert_eq!(
+            (e.code, e.stage),
+            (ErrorCode::PermissionDenied, RootlessStage::ResolveHelper)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

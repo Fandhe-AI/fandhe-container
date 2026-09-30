@@ -20,7 +20,7 @@
 //!
 //! - **最小構成（フック無し）**: 子はステージ列（[`StagePipeline`]。#832）を `run_child` の pivot 後・
 //!   exec 前で固定順に実行する。組み込みの `PR_SET_NO_NEW_PRIVS`（#833）は空のパイプラインでも適用される
-//!   が、**seccomp・Landlock・cgroup 参加は未適用**（実体は TASK-32・38〜40 が差し込む。capability 削減は #173 で組み込み済み）。
+//!   が、**Landlock・cgroup 参加は未適用**（実体は TASK-32・39・40 が差し込む。capability 削減は #173、seccomp は #178 で組み込み済み）。
 //!   そのため制限が未適用の子（rootful 経路のホスト root 権限のままの子を含む）は、
 //!   `exec_entrypoint` が `PermissionDenied` で exec を拒否する（SEC-1・CORE-5。制限を適用できる
 //!   ようになるまで fail-closed。REPAIR-3: 実装済みを装わない）
@@ -254,17 +254,18 @@ fn exit_code_for(err: &ExecError) -> i32 {
 /// 適用した制限を区別できず、seccomp フィルタの中身も確認できないため、証跡として扱わない。
 /// `PR_SET_NO_NEW_PRIVS` は #833 で組み込みステージとして実装済みだが単独では証跡にせず、
 /// capability 削減は #173（TASK-37.2）で組み込み段になり、その [`CapabilityReport`] を引数で受け取る
-/// が、seccomp・Landlock のステージの実体（TASK-38・TASK-39）が未実装の間は引数の有無によらず
-/// 常に `PermissionDenied` を返す。ステージ実装時は、各ステージが適用完了を示す証跡型（形は
-/// TASK-38・TASK-39 で決める）を返し、それを本関数の引数に取って初めて許可する形へ置き換える
-/// （REPAIR-3: 実装済みを装わない）。
+/// が、Landlock のステージの実体（TASK-39.3・39.4、#183・#184）が未実装の間は引数の有無によらず
+/// 常に `PermissionDenied` を返す。seccomp は #178（TASK-38.3）で組み込み段として適用されるが、
+/// 証跡型が未確定のため本関数へは配線しない（#184 で決める）。ステージ実装時は、各ステージが
+/// 適用完了を示す証跡型（形は TASK-38・TASK-39 で決める）を返し、それを本関数の引数に取って
+/// 初めて許可する形へ置き換える（REPAIR-3: 実装済みを装わない）。
 fn require_restriction_evidence(
     _capability_report: Option<&CapabilityReport>,
 ) -> Result<(), ExecError> {
     Err(ExecError::new(
         ErrorCode::PermissionDenied,
         IsolationStage::Exec,
-        "refusing to exec: no evidence that the isolation restrictions were applied (seccomp and Landlock stages are not implemented yet)",
+        "refusing to exec: no evidence that the isolation restrictions were applied (the Landlock stage is not implemented yet)",
     ))
 }
 

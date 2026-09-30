@@ -6,7 +6,7 @@
 //! `exec` モジュール自体がビルド対象外（OS 非該当であり skip ではない）。
 //!
 //! # 受入基準の解釈（REPAIR-3）
-//! 制限ステージ（capability 削減・seccomp・Landlock。TASK-37〜39）が未実装の間、`exec_entrypoint` は
+//! 制限ステージ（Landlock。TASK-39。capability 削減・seccomp は組み込み済み）が未実装の間、`exec_entrypoint` は
 //! rootless でも `PermissionDenied` で exec を拒否する。そのため「非 root で分離から exec 段まで
 //! 到達できること」を、子が `Exited(126)` で終わり stderr に `PERMISSION_DENIED` が出る（setup 失敗の
 //! 125 ではない）ことで照合する。user namespace の作成・写像の書き込み・`MS_PRIVATE`・自己 bind・

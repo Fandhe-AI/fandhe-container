@@ -10,11 +10,13 @@
 //! ```
 //!
 //! 残りの段の実体は後続の TASK が [`StageHook`] として差し込む（cgroup 参加: TASK-32、
-//! Landlock: TASK-39、seccomp: TASK-38、rootless: TASK-40）。`CapabilityDrop`（`exec/capabilities.rs`。
-//! #173・TASK-37.2・SEC-1）と `NoNewPrivs`（`exec/no_new_privs.rs`。#833・TASK-27.4.3）は
+//! Landlock: TASK-39、rootless: TASK-40）。`CapabilityDrop`（`exec/capabilities.rs`。
+//! #173・TASK-37.2・SEC-1）・`NoNewPrivs`（`exec/no_new_privs.rs`。#833・TASK-27.4.3）・
+//! `Seccomp`（`exec/seccomp.rs`。#178・TASK-38.3・CORE-5。exec 直前の最終段）は
 //! 組み込みの固定ステージで、フックを登録しなくても必ず実行され、[`StagePipeline::with_hook`] による
 //! 差し替えは拒否する（呼び出し側の登録漏れで capability が残る経路を作らない）。
-//! 両者を Landlock / seccomp より前に固定する順序は fail-closed の前提である。
+//! capability 削減と `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
+//! seccomp は失敗すると exec に進まない。
 //!
 //! # 契約
 //!
@@ -24,7 +26,7 @@
 //!   その段に付け替える（フックが自分の段を偽れない。ERR-1）
 //! - **同じ段への二重登録は拒否する**: 既存の制限フックを no-op で上書きする経路を作らない
 //! - **組み込みの固定ステージは差し替えられない**: [`StageKind::is_builtin`] の段
-//!   （`CapabilityDrop`・`NoNewPrivs`）は `with_hook` で `InvalidArgument` になり、`run_then` はフック配列を読まず
+//!   （`CapabilityDrop`・`NoNewPrivs`・`Seccomp`）は `with_hook` で `InvalidArgument` になり、`run_then` はフック配列を読まず
 //!   組み込み処理へ直接振り分ける
 //! - **[`StageReport`] と `Applied` は制限適用の証跡ではない**: 「フックが `Ok` を返した」事実の
 //!   記録にすぎない。`process.rs::require_restriction_evidence` の判定には使わず、フック無し・
@@ -46,10 +48,14 @@ use std::fmt;
 
 #[cfg(not(test))]
 use super::capabilities::apply_default_capabilities;
+#[cfg(not(test))]
+use super::seccomp::apply_default_seccomp;
 use super::{CapabilityReport, ExecError, IsolationStage, no_new_privs};
 // テストでは本物（`Threads: 1` を要求）の代わりに偽カーネルで走る関数へ差し替える。
 #[cfg(test)]
 use super::capabilities::testing::apply_default_capabilities;
+#[cfg(test)]
+use super::seccomp::testing::apply_default_seccomp;
 use crate::traits::types::ErrorCode;
 
 /// ステージの種別。`ORDER` の順が実行順（固定）。
@@ -66,7 +72,7 @@ pub enum StageKind {
     NoNewPrivs,
     /// Landlock（TASK-39）。
     Landlock,
-    /// seccomp（TASK-38）。
+    /// seccomp（#178・TASK-38.3）。組み込みの固定ステージ（差し替え不可）。
     Seccomp,
 }
 
@@ -93,8 +99,8 @@ impl StageKind {
     /// 組み込みの固定ステージか（`with_hook` で差し替えを拒否する唯一の判定元）。
     pub fn is_builtin(self) -> bool {
         match self {
-            StageKind::CapabilityDrop | StageKind::NoNewPrivs => true,
-            StageKind::CgroupJoin | StageKind::Landlock | StageKind::Seccomp => false,
+            StageKind::CapabilityDrop | StageKind::NoNewPrivs | StageKind::Seccomp => true,
+            StageKind::CgroupJoin | StageKind::Landlock => false,
         }
     }
 
@@ -168,7 +174,7 @@ impl StageReport {
     }
 }
 
-/// 順序固定のステージ列。空のままでも組み込みの capability 削減と `NO_NEW_PRIVS` だけを適用して exec へ進み、
+/// 順序固定のステージ列。空のままでも組み込みの capability 削減・`NO_NEW_PRIVS`・seccomp だけを適用して exec へ進み、
 /// exec の fail-closed（証跡要求）は変わらない。
 pub struct StagePipeline {
     hooks: [Option<Box<dyn StageHook>>; 5],
@@ -258,7 +264,15 @@ impl StagePipeline {
     ///   は `InvalidArgument`（`Validate` 段）で拒否される。
     /// - 理由: フック登録に頼ると登録漏れで capability が残る。組み込みにして SEC-1 を fail-closed にする。
     /// - 移行方法: capability 削減は core が常に適用するため登録は不要。独自の制限は他の段
-    ///   （`CgroupJoin`・`Landlock`・`Seccomp`）のフックで行う。
+    ///   （`CgroupJoin`・`Landlock`）のフックで行う。
+    ///
+    /// # 破壊的変更と移行方法（#178・TASK-38.3）
+    ///
+    /// - 変更内容: `Seccomp` が組み込みの固定ステージになった。`with_hook(StageKind::Seccomp, …)` は
+    ///   `InvalidArgument`（`Validate` 段）で拒否される。
+    /// - 理由: 登録漏れ・no-op フックで seccomp が外れる経路をなくす（CORE-5・fail-closed）。
+    /// - 移行方法: seccomp は core が常に適用するため登録は不要。exec 直前の観測点・独自処理は、
+    ///   組み込みでない最後の段 `Landlock` を使う（TASK-39.4 で Landlock も組み込みになる可能性がある）。
     ///
     /// # 破壊的変更と移行方法（#833・TASK-27.4.3）
     ///
@@ -288,7 +302,12 @@ impl StagePipeline {
                     no_new_privs::apply_no_new_privs()
                         .map_err(|e| e.at_stage(kind.isolation_stage()))?;
                 }
-                StageKind::CgroupJoin | StageKind::Landlock | StageKind::Seccomp => {
+                StageKind::Seccomp => {
+                    // 証跡型は #184・TASK-39 で確定するため、終端へは渡さない（REPAIR-3）。
+                    let _report =
+                        apply_default_seccomp().map_err(|e| e.at_stage(kind.isolation_stage()))?;
+                }
+                StageKind::CgroupJoin | StageKind::Landlock => {
                     let Some(Some(hook)) = self.hooks.get_mut(idx) else {
                         continue;
                     };
@@ -308,6 +327,7 @@ impl StagePipeline {
 mod tests {
     use super::super::capabilities::testing::fake_capability_drop_err;
     use super::super::no_new_privs::testing::{fake, rec, take};
+    use super::super::seccomp::testing::fake_seccomp_err;
     use super::*;
     use crate::sys::{self, SysError};
 
@@ -385,7 +405,13 @@ mod tests {
         p.run_then(exec_ok).unwrap();
         assert_eq!(
             take(),
-            ["capability_drop", "no_new_privs", "landlock", "exec"]
+            [
+                "capability_drop",
+                "no_new_privs",
+                "landlock",
+                "seccomp",
+                "exec"
+            ]
         );
     }
 
@@ -394,7 +420,7 @@ mod tests {
     fn core1_partial_hooks_keep_order_and_report_skipped() {
         take();
         let p = StagePipeline::new()
-            .with_hook(StageKind::Seccomp, ok_hook(StageKind::Seccomp))
+            .with_hook(StageKind::Landlock, ok_hook(StageKind::Landlock))
             .unwrap();
         let report = p
             .run_then(|r, _| {
@@ -404,7 +430,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             take(),
-            ["capability_drop", "no_new_privs", "seccomp", "exec"]
+            [
+                "capability_drop",
+                "no_new_privs",
+                "landlock",
+                "seccomp",
+                "exec"
+            ]
         );
         let got: Vec<_> = report.iter().map(|(_, s)| s).collect();
         assert_eq!(
@@ -413,7 +445,7 @@ mod tests {
                 StageStatus::Skipped,
                 StageStatus::Applied,
                 StageStatus::Applied,
-                StageStatus::Skipped,
+                StageStatus::Applied,
                 StageStatus::Applied
             ]
         );
@@ -429,7 +461,11 @@ mod tests {
                 Ok(r.clone())
             })
             .unwrap();
-        assert_eq!(take(), ["capability_drop", "no_new_privs", "exec"]);
+        assert_eq!(
+            take(),
+            ["capability_drop", "no_new_privs", "seccomp", "exec"]
+        );
+        assert_eq!(report.status(StageKind::Seccomp), StageStatus::Applied);
         for (kind, status) in report.iter() {
             let expected = if kind.is_builtin() {
                 StageStatus::Applied
@@ -468,6 +504,11 @@ mod tests {
             match failing {
                 StageKind::CapabilityDrop => fake_capability_drop_err(SysError::Os(sys::EPERM)),
                 StageKind::NoNewPrivs => fake(Err(SysError::Os(sys::EPERM)), Ok(true)),
+                StageKind::Seccomp => fake_seccomp_err(ExecError::new(
+                    ErrorCode::PermissionDenied,
+                    IsolationStage::Validate,
+                    "boom",
+                )),
                 _ => {}
             }
             let err = p.run_then(exec_ok).unwrap_err();
@@ -478,6 +519,7 @@ mod tests {
             let last = match failing {
                 StageKind::CapabilityDrop => "capability_drop",
                 StageKind::NoNewPrivs => "no_new_privs",
+                StageKind::Seccomp => "seccomp",
                 _ => "fail",
             };
             assert_eq!(calls.last().copied(), Some(last));
@@ -539,11 +581,7 @@ mod tests {
     fn sec1_capability_drop_runs_after_cgroup_join_and_before_landlock_and_seccomp() {
         take();
         let mut p = StagePipeline::new();
-        for kind in [
-            StageKind::Seccomp,
-            StageKind::Landlock,
-            StageKind::CgroupJoin,
-        ] {
+        for kind in [StageKind::Landlock, StageKind::CgroupJoin] {
             p = p.with_hook(kind, ok_hook(kind)).unwrap();
         }
         p.run_then(exec_ok).unwrap();
@@ -558,6 +596,52 @@ mod tests {
                 "exec"
             ]
         );
+    }
+
+    /// CORE-5・TASK-38.3・MS-2（受け入れ条件）: seccomp は Landlock の直後・exec の直前に走る。
+    #[test]
+    fn core5_seccomp_runs_after_landlock_and_immediately_before_exec() {
+        take();
+        let p = StagePipeline::new()
+            .with_hook(StageKind::Landlock, ok_hook(StageKind::Landlock))
+            .unwrap();
+        p.run_then(exec_ok).unwrap();
+        assert_eq!(
+            take(),
+            [
+                "capability_drop",
+                "no_new_privs",
+                "landlock",
+                "seccomp",
+                "exec"
+            ]
+        );
+    }
+
+    /// CORE-5・TASK-38.3: seccomp は組み込みで、フックでは差し替えられない。
+    #[test]
+    fn core5_builtin_seccomp_cannot_be_replaced() {
+        let err = StagePipeline::new()
+            .with_hook(StageKind::Seccomp, || Ok(()))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.stage, IsolationStage::Validate);
+        assert!(err.message.contains("built-in"), "{}", err.message);
+    }
+
+    /// CORE-5・TASK-38.3: seccomp 適用が失敗したら exec に進まない（fail-closed）。
+    #[test]
+    fn core5_seccomp_failure_blocks_exec() {
+        take();
+        fake_seccomp_err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Validate,
+            "boom",
+        ));
+        let err = StagePipeline::new().run_then(exec_ok).unwrap_err();
+        assert_eq!(err.stage, IsolationStage::Seccomp);
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(take(), ["capability_drop", "no_new_privs", "seccomp"]);
     }
 
     /// SEC-1・TASK-37.2: 終端へ capability 削減の結果（OCI 既定集合）が渡る。

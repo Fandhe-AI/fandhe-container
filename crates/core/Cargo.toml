@@ -71,3 +71,11 @@ harness = false
 name = "rootless_file_owner"
 path = "tests/rootless_file_owner.rs"
 harness = false
+
+# rootless での OCI Runtime ライフサイクル（create → start → kill）の結合試験と既知課題の記録
+# （CORE-6・SEC-5・TASK-40.4）。CLONE_NEWUSER のため単一スレッドの main が要り harness = false。
+# `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "rootless"
+path = "tests/rootless.rs"
+harness = false

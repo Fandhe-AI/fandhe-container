@@ -435,15 +435,25 @@ mod linux {
                     "missing pipes",
                 ));
             };
-            // stderr は上限まで中継し、以降は捨てる（パイプ詰まりで子が止まらないように）。
+            // stderr は上限まで共有バッファへ蓄積し、以降は捨てる（パイプ詰まりで子が止まらないように）。
+            // 蓄積分は READY 後に拒否理由（PERMISSION_DENIED）の照合に使う。
+            let captured = std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
+            let captured_writer = std::sync::Arc::clone(&captured);
             std::thread::spawn(move || {
-                let mut head = Vec::new();
                 let mut r = stderr;
-                let _ = (&mut r).take(STDERR_CAP).read_to_end(&mut head);
-                if !head.is_empty() {
-                    eprintln!("[scenario stderr] {}", String::from_utf8_lossy(&head));
+                let mut chunk = [0u8; 1024];
+                while let Ok(n) = r.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut buf) = captured_writer.lock() {
+                        let room = STDERR_CAP as usize - buf.len().min(STDERR_CAP as usize);
+                        let take = n.min(room);
+                        if let Some(part) = chunk.get(..take) {
+                            buf.extend_from_slice(part);
+                        }
+                    }
                 }
-                let _ = std::io::copy(&mut r, &mut std::io::sink());
             });
             let (tx, rx) = mpsc::channel::<String>();
             std::thread::spawn(move || {
@@ -468,6 +478,32 @@ mod linux {
                         "the scenario did not report readiness within the timeout",
                     ));
                 }
+            }
+            // exec 拒否の理由まで照合する（SEC-1・CORE-5）。Exited(126) だけでは別の exec 失敗と区別できない。
+            // 子の stderr 書き込みは READY より前だが、蓄積スレッドの読み取りは非同期のため期限付きで待つ。
+            let deadline = Instant::now() + timeout;
+            let denied = loop {
+                let seen = captured
+                    .lock()
+                    .map(|b| String::from_utf8_lossy(&b).contains("PERMISSION_DENIED"))
+                    .unwrap_or(false);
+                if seen {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            if !denied {
+                if let Ok(b) = captured.lock() {
+                    eprintln!("[scenario stderr] {}", String::from_utf8_lossy(&b));
+                }
+                return Err(launch_failed(
+                    &mut child,
+                    ErrorCode::Internal,
+                    "scenario stderr lacked PERMISSION_DENIED (exec stage not reached via fail-closed path)",
+                ));
             }
             let Some(pid) = NonZeroU32::new(child.id()) else {
                 return Err(launch_failed(

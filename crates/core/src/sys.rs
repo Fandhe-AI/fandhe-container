@@ -6,7 +6,7 @@
 //! # 呼び出し文脈
 //! `crate::exec::isolate`・`crate::exec::MountIsolation::establish`・`crate::exec::mount_proc`
 //! （CORE-1・TASK-27.2・#134）と、`crate::exec::prepare_rootfs`・`crate::exec::pivot_root`
-//! （CORE-1・TASK-27.3・#135）と、`crate::exec::create_default_devices`（CORE-1・TASK-27.6・#834）と、`crate::cgroups`（CORE-3・TASK-32.1・#158。委譲 cgroup の検出と子 cgroup 作成）が、
+//! （CORE-1・TASK-27.3・#135）と、`crate::exec::create_default_devices`（CORE-1・TASK-27.6・#834）が、
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)` と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶほか、
 //! `unshare(2)`・`sethostname(2)`・`mount(2)`・`openat(2)`・`geteuid(2)`・`getegid(2)` に加え、
 //! `pivot_root(2)`（glibc がラッパーを持たないため `syscall(2)` 経由）・`umount2(2)`・`fchdir(2)`
@@ -15,7 +15,8 @@
 //! `waitpid(2)`・`kill(2)`・`signal(2)` と `close_range(2)`（`syscall(2)` 経由）を呼ぶために使う。
 //! さらに固定ステージ `crate::exec::no_new_privs`（CORE-1・TASK-27.4.3・#833）が `prctl(2)` を呼ぶ。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。std だけでは提供されない
-//! syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
+//! syscall のみを持ち、`crate::cgroups`（CORE-3・TASK-32.1・#158。委譲 cgroup の検出と子 cgroup 作成）も
+//! `fstatfs(2)` による cgroup2 判定などに使う。検証（hostname の文字種・パス形式等）は呼び出し側の型
 //! （`Hostname` 等）が済ませた値だけを受け取る。
 //!
 //! # 契約（事前承認の条件を満たす設計）
@@ -1118,13 +1119,14 @@ mod tests {
         assert_eq!(std::mem::size_of::<StatFs>(), 120);
     }
 
-    /// CORE-3・TASK-32.1: 実在の `/sys/fs/cgroup`（cgroup2 の場合）と `/proc`・`/tmp` の種別判定。
+    /// CORE-3・TASK-32.1: `/proc` が procfs と判定され、cgroup2 とは区別されること。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
-    fn core3_task32_1_fs_type_distinguishes_proc_from_cgroup2() {
+    fn core3_task32_1_fs_type_identifies_procfs_not_cgroup2() {
         let proc_dir = std::fs::File::open("/proc").unwrap();
         // procfs の PROC_SUPER_MAGIC（include/uapi/linux/magic.h）。
         assert_eq!(fs_type(proc_dir.as_fd()), Ok(0x9fa0));
+        assert_ne!(fs_type(proc_dir.as_fd()), Ok(CGROUP2_MAGIC));
     }
 
     /// CORE-3・TASK-32.1: `mkdir_at` / `remove_dir_at` / `open_*_at` の往復（一時ディレクトリ）。

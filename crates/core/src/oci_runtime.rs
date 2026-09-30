@@ -33,4 +33,7 @@ pub use launch::{
     StartTimeouts,
 };
 pub use mount_destination::MountDestination;
-pub use start::{LAUNCHER_REPLY_GRACE, StartedContainer, recover_interrupted_start, start};
+pub use start::{
+    LAUNCHER_REPLY_GRACE, StartedContainer, recover_interrupted_start, start,
+    take_unreaped_processes,
+};

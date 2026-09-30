@@ -475,17 +475,14 @@ fn start_inner(
         Err(err) => {
             // 状態を記録できないまま生きたプロセスを残さない。終了できなかった・上限を超えた場合は
             // 未記録プロセスが残り得ることを呼び出し元へ伝える（元のエラーで隠さない。予約は残す）。
-            let terminated = call_bounded(
-                terminate_timeout,
-                move || process.terminate(terminate_timeout),
-                drop,
-            );
-            match terminated {
-                Ok(Ok(())) => Err(release_claim(store, req.id(), &claimed, err)),
-                _ => Err(TraitError::new(
+            // 回収を確認できなかったハンドルは未回収レジストリに残り、監視側が引き取って再試行する。
+            if terminate_bounded(process, terminate_timeout) {
+                Err(release_claim(store, req.id(), &claimed, err))
+            } else {
+                Err(TraitError::new(
                     ErrorCode::Internal,
                     "failed to record running state and failed to terminate the launched process",
-                )),
+                ))
             }
         }
     }
@@ -497,17 +494,81 @@ fn start_inner(
 /// `terminate_timeout` を呼び出し境界で強制し、戻らない実装でも有限時間で予約（プロセス内）を手放す。
 /// 終了を確認できなかった場合も、状態には start が残した起動権の予約（Running・pid なし）が残るため、
 /// 回復は [`recover_interrupted_start`]（`confirm_no_process` による生存確認つき）に限られる
-/// （回復可能な失敗状態として保持する。REPAIR-5・CORE-2）。
+/// （回復可能な失敗状態として保持する。REPAIR-5・CORE-2）。ハンドルは未回収レジストリに残る
+/// （[`take_unreaped_processes`]）。
 fn late_launch_cleanup(
     late: Result<Box<dyn LaunchedProcess>, TraitError>,
     terminate_timeout: Duration,
 ) {
     if let Ok(process) = late {
-        let _ = call_bounded(
-            terminate_timeout,
-            move || process.terminate(terminate_timeout),
-            drop,
-        );
+        let _ = terminate_bounded(process, terminate_timeout);
+    }
+}
+
+/// 回収を確認できなかった起動済みプロセスのハンドル（プロセス内の未回収レジストリ。CORE-1・REPAIR-5）。
+///
+/// start の後始末（状態記録の失敗後・上限を超えて返った launch）で `terminate` が失敗した、または上限を
+/// 超えた後に失敗したハンドルを、捨てずにここへ残す。監視側（supervisor〔TASK-157・SUP 系〕等）が
+/// [`take_unreaped_processes`] で引き取り、`terminate` / `wait` を再試行して回収する。start を実行した
+/// プロセスが終了すれば子は init（または subreaper）に引き取られて回収されるため、レジストリの寿命は
+/// プロセスの寿命で足りる。
+static UNREAPED: Mutex<Vec<Box<dyn LaunchedProcess>>> = Mutex::new(Vec::new());
+
+/// 回収を確認できなかったハンドルを未回収レジストリへ残す。
+fn keep_unreaped(process: Box<dyn LaunchedProcess>) {
+    UNREAPED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(process);
+}
+
+/// start の後始末で回収を確認できなかった起動済みプロセスのハンドルをすべて引き取る（CORE-1・REPAIR-5）。
+///
+/// 返したハンドルの所有権は呼び出し元（監視側）へ移り、レジストリからは消える。呼び出し元は
+/// [`LaunchedProcess::terminate`]・[`LaunchedProcess::wait`] を再試行して回収する（ハンドルは `Drop` で
+/// 回収しないため、捨てるとゾンビが残り得る）。
+pub fn take_unreaped_processes() -> Vec<Box<dyn LaunchedProcess>> {
+    std::mem::take(&mut *UNREAPED.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// 起動済みプロセスを上限 `timeout` つきで終了・回収する。上限内に回収を確認できたら `true`。
+///
+/// terminate は `call_bounded` の実行スレッドで呼び、ハンドルは共有の枠を通して渡す。terminate が
+/// `Err` を返したら（上限の前後を問わず）ハンドルを未回収レジストリへ残し、実行スレッドを作れなかった
+/// 場合も枠に残ったハンドルをレジストリへ残す。上限を超えて戻らない場合はハンドルを実行スレッドが持ち
+/// 続け、後から `Err` で戻ればレジストリへ残す（`Ok` なら回収済みとして手放す）。
+fn terminate_bounded(process: Box<dyn LaunchedProcess>, timeout: Duration) -> bool {
+    let cell = Arc::new(Mutex::new(Some(process)));
+    let worker_cell = Arc::clone(&cell);
+    let outcome = call_bounded(
+        timeout,
+        move || {
+            let taken = worker_cell
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let Some(process) = taken else {
+                return false;
+            };
+            if process.terminate(timeout).is_ok() {
+                true
+            } else {
+                keep_unreaped(process);
+                false
+            }
+        },
+        drop,
+    );
+    match outcome {
+        Ok(reaped) => reaped,
+        Err(Unbounded::TimedOut) => false,
+        Err(Unbounded::SpawnFailed) => {
+            let left = cell.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(process) = left {
+                keep_unreaped(process);
+            }
+            false
+        }
     }
 }
 
@@ -823,6 +884,8 @@ mod tests {
         confirms_no_process: AtomicBool,
         gate: Arc<Gate>,
         term_gate: Arc<Gate>,
+        /// 起動した模擬プロセスの pid（未回収レジストリは並行テストで共有されるため、テストごとに変える）。
+        pid: std::sync::atomic::AtomicU32,
     }
 
     impl RecordingLauncher {
@@ -836,6 +899,7 @@ mod tests {
                 confirms_no_process: AtomicBool::new(false),
                 gate: Gate::new(true),
                 term_gate: Gate::new(true),
+                pid: std::sync::atomic::AtomicU32::new(4242),
             })
         }
 
@@ -857,11 +921,11 @@ mod tests {
     }
 
     /// 起動済みプロセスの模擬（terminate の回数を数え、`gate` が開くまで terminate が戻らない）。
-    struct FakeProcess(Arc<AtomicUsize>, bool, Arc<Gate>);
+    struct FakeProcess(Arc<AtomicUsize>, bool, Arc<Gate>, NonZeroU32);
 
     impl LaunchedProcess for FakeProcess {
         fn pid(&self) -> NonZeroU32 {
-            NonZeroU32::new(4242).expect("nonzero")
+            self.3
         }
 
         /// 模擬プロセスは terminate されるまで終了しない（terminate 後は SIGKILL 相当で終了済み）。
@@ -922,6 +986,7 @@ mod tests {
                 self.terminated.clone(),
                 self.fail_terminate.load(Ordering::SeqCst),
                 self.term_gate.clone(),
+                NonZeroU32::new(self.pid.load(Ordering::SeqCst)).expect("nonzero"),
             )))
         }
     }
@@ -1283,7 +1348,20 @@ mod tests {
         assert_eq!(launcher.calls(), 1);
     }
 
-    /// REPAIR-5: 状態更新と terminate の両方に失敗したら、終了失敗を Internal で伝える。
+    /// 未回収レジストリから `pid` のハンドルだけを引き取る（他のテストのハンドルは戻す）。
+    #[cfg(target_os = "linux")]
+    fn take_unreaped_pid(pid: u32) -> Vec<Box<dyn LaunchedProcess>> {
+        let (mine, others): (Vec<_>, Vec<_>) = take_unreaped_processes()
+            .into_iter()
+            .partition(|p| p.pid().get() == pid);
+        for p in others {
+            keep_unreaped(p);
+        }
+        mine
+    }
+
+    /// REPAIR-5・CORE-1: 状態更新と terminate の両方に失敗したら、終了失敗を Internal で伝え、回収を
+    /// 確認できなかったハンドルは捨てずに未回収レジストリへ残す（監視側が引き取って再試行できる）。
     #[cfg(target_os = "linux")]
     #[test]
     fn repair5_start_reports_terminate_failure() {
@@ -1293,9 +1371,48 @@ mod tests {
         let store = MemStateStore::new(Some(1));
         create(&store, &OpRecorder::new(), &b.create_req("term-fail")).expect("create");
         let launcher = RecordingLauncher::new(false);
+        launcher.pid.store(5101, Ordering::SeqCst);
         launcher.fail_terminate.store(true, Ordering::SeqCst);
         let err = run(&store, &launcher, "term-fail").expect_err("fail");
         assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(launcher.terminations(), 1);
+        let kept = take_unreaped_pid(5101);
+        assert_eq!(kept.len(), 1);
+        // 引き取った監視側は同じハンドルで再試行できる（模擬プロセスは terminate 済みとして終了扱い）。
+        let handle = kept.into_iter().next().expect("handle");
+        assert_eq!(
+            handle.wait(Duration::ZERO).expect("wait"),
+            Some(ProcessExit::Signaled(9))
+        );
+        assert_eq!(take_unreaped_pid(5101).len(), 0);
+    }
+
+    /// REPAIR-5・CORE-1: 上限を超えて返った launch の後始末で terminate が失敗しても、ハンドルは未回収
+    /// レジストリへ残る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_late_launch_keeps_unreaped_handle() {
+        let (_b, store) = created("late-unreaped");
+        let launcher = RecordingLauncher::new(false);
+        launcher.pid.store(5102, Ordering::SeqCst);
+        launcher.fail_terminate.store(true, Ordering::SeqCst);
+        launcher.gate.set_open(false);
+        let err = start(
+            &store,
+            &OpRecorder::new(),
+            &dynl(&launcher),
+            &sid("late-unreaped"),
+            &short_timeouts(),
+        )
+        .expect_err("must time out");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        launcher.gate.set_open(true);
+        let kept = Mutex::new(Vec::new());
+        assert!(eventually(Duration::from_secs(10), || {
+            let mut got = kept.lock().expect("lock");
+            got.extend(take_unreaped_pid(5102));
+            got.len() == 1
+        }));
         assert_eq!(launcher.terminations(), 1);
     }
 

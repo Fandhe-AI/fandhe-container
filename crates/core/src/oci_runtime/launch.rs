@@ -225,6 +225,15 @@ impl Eq for RootfsDir {}
 /// symlink 非追従に辿って固定し、その fd を `/proc/thread-self/fd/N` から読み取り専用で開き直して
 /// ロックする（O_PATH の fd には `flock` できないため）。Linux 以外は rootfs の固定と同じく未対応で
 /// `Unimplemented`（fail-closed）。
+///
+/// # 前提（信頼境界）
+///
+/// ロックは「いま bundle のパスが指すディレクトリ」の inode に掛かる。bundle ディレクトリ（またはその
+/// 祖先）を rename して作り直せる者は、所有者と別の inode をロックさせてこの排他を外せる。ただし bundle の
+/// パスは状態記録が指す信頼境界で、rootfs の固定（`RootfsDir::pin`）と `config.json` の読み込みも同じ前提に
+/// 立つ（その者は config.json と rootfs を丸ごと差し替えて起動内容を制御できるため、新たな能力にはならない）。
+/// bundle とその祖先を書き換えられない者に対する排他であり、パスに依存しない起動権（所有者の識別を
+/// `StateStore` 側に持つ等）は公開トレイトの変更を要するため後続で扱う（TASK-31）。
 #[derive(Debug)]
 pub(super) struct BundleLock {
     #[cfg(target_os = "linux")]

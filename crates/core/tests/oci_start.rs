@@ -187,6 +187,8 @@ struct FakeLauncher {
     launched_args: Mutex<Vec<Vec<String>>>,
     terminated: Arc<AtomicUsize>,
     confirms_no_process: AtomicBool,
+    /// 起動した模擬プロセスの terminate を失敗させるか。
+    fail_terminate: AtomicBool,
     gate: Gate,
 }
 
@@ -196,6 +198,7 @@ impl FakeLauncher {
             launched_args: Mutex::new(Vec::new()),
             terminated: Arc::new(AtomicUsize::new(0)),
             confirms_no_process: AtomicBool::new(true),
+            fail_terminate: AtomicBool::new(false),
             gate: Gate::new(true),
         })
     }
@@ -213,8 +216,9 @@ impl FakeLauncher {
     }
 }
 
-/// 模擬プロセス（terminate の回数を数え、terminate 後は SIGKILL 相当で終了済みになる）。
-struct FakeProcess(Arc<AtomicUsize>);
+/// 模擬プロセス（terminate の回数を数え、terminate 後は SIGKILL 相当で終了済みになる。第 2 要素が
+/// 真なら terminate は失敗を返す）。
+struct FakeProcess(Arc<AtomicUsize>, bool);
 
 impl LaunchedProcess for FakeProcess {
     fn pid(&self) -> NonZeroU32 {
@@ -231,6 +235,9 @@ impl LaunchedProcess for FakeProcess {
 
     fn terminate(&self, _timeout: Duration) -> Result<(), TraitError> {
         self.0.fetch_add(1, Ordering::SeqCst);
+        if self.1 {
+            return Err(TraitError::new(ErrorCode::Internal, "terminate failed"));
+        }
         Ok(())
     }
 }
@@ -246,7 +253,10 @@ impl ProcessLauncher for FakeLauncher {
             .unwrap_or_else(|e| e.into_inner())
             .push(spec.args().to_vec());
         self.gate.pass();
-        Ok(Box::new(FakeProcess(self.terminated.clone())))
+        Ok(Box::new(FakeProcess(
+            self.terminated.clone(),
+            self.fail_terminate.load(Ordering::SeqCst),
+        )))
     }
 
     fn confirm_no_process(&self, _id: &ContainerId, _timeout: Duration) -> Result<(), TraitError> {
@@ -489,6 +499,42 @@ fn repair5_start_terminates_process_when_recording_fails() {
         (status.state(), status.pid()),
         (ContainerState::Created, None)
     );
+}
+
+/// REPAIR-5・CORE-1: 記録失敗後の terminate も失敗したら Internal を返して予約を残し、回収を確認
+/// できなかったハンドルは `take_unreaped_processes` で監視側が引き取れる（この結合試験で未回収を作るのは
+/// 本試験だけ）。
+#[cfg(target_os = "linux")]
+#[test]
+fn repair5_unreaped_handle_is_handed_to_monitor() {
+    let b = Bundle::ready("unreaped", &valid_config());
+    let store = MemStateStore::new(Some(1));
+    b.create(&store, "it-unreaped");
+    let launcher = FakeLauncher::new();
+    launcher.fail_terminate.store(true, Ordering::SeqCst);
+    let err = start(
+        &store,
+        &OpRecorder::new(),
+        &dynl(&launcher),
+        &start_req("it-unreaped"),
+        &short_timeouts(),
+    )
+    .expect_err("must fail");
+    assert_eq!(err.code(), ErrorCode::Internal);
+    assert_eq!(
+        err.message(),
+        "failed to record running state and failed to terminate the launched process"
+    );
+    let status = store.status_of("it-unreaped");
+    assert_eq!(
+        (status.state(), status.pid()),
+        (ContainerState::Running, None)
+    );
+    use fandhe_container_core::oci_runtime::take_unreaped_processes;
+    let kept = take_unreaped_processes();
+    let pids: Vec<u32> = kept.iter().map(|p| p.pid().get()).collect();
+    assert_eq!(pids, [7]);
+    assert!(take_unreaped_processes().is_empty());
 }
 
 /// 中断された予約（Running・pid なし）を手で作る（start のプロセスが launch 中に異常終了した状態）。

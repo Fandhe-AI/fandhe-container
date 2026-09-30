@@ -62,9 +62,14 @@
 //!   （長寿命のホストプロセスで呼ばない）。`pivot_root` 段（[`prepare_rootfs`]・[`pivot_root`]）も同じ
 //! - rootfs の切替は `establish` → [`prepare_rootfs`] → [`pivot_root`] の順で、`/proc` は
 //!   **pivot 前に rootfs 配下へマウントする**（[`PreparedRootfs`] がその証。詳細は `rootfs` の doc）
-//! - user namespace は自 euid / egid を コンテナ内 0 へ写す単一 ID 写像のみ提供する。
-//!   euid 0 での自 ID 写像はコンテナ root がホスト root に写るため拒否する（SEC-5）。
-//!   subuid 範囲の写像は TASK-40（CORE-6）が担う
+//! - 既定経路（[`isolate`]）の user namespace は自 euid / egid を コンテナ内 0 へ写す単一 ID 写像のみ。
+//!   euid 0 での自 ID 写像はコンテナ root がホスト root に写るため拒否する（SEC-5）
+//! - subuid 範囲の写像は別経路 [`plan_rootless_subordinate`] → [`isolate_rootless_subordinate`]
+//!   （TASK-40.2・CORE-6。**実装済み**）が担う。呼び出したプロセス自身を分離する契約は [`isolate`]
+//!   と同じで、写像だけを fork した mapper（外側の user namespace に残る）が
+//!   [`crate::rootless`] で書く。rootless 経路で root 権限を要する操作をどう回避・代替するかの対応表は
+//!   [`crate::rootless`] のモジュール doc を参照。`mknod` によるデバイスノード作成は代替せず
+//!   `PermissionDenied` で fail-closed する
 
 use std::ffi::{CString, OsStr};
 use std::fmt;
@@ -72,7 +77,12 @@ use std::io::Write as _;
 use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path};
+use std::time::Duration;
 
+use crate::rootless::{
+    self, IdKind, IdMapReport, IdMapSet, IdMapWriter, MapperReply, RootlessError, TargetPid,
+    WriterKind,
+};
 use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
 
@@ -164,6 +174,12 @@ impl NamespaceSet {
     /// `ns` を加えた集合を返す。
     pub fn with(mut self, ns: Namespace) -> Self {
         self.0 |= 1 << ns.index();
+        self
+    }
+
+    /// `ns` を除いた集合を返す（[`Self::with`] の対）。
+    pub fn without(mut self, ns: Namespace) -> Self {
+        self.0 &= !(1 << ns.index());
         self
     }
 
@@ -299,6 +315,8 @@ pub enum IsolationStage {
     PivotRoot,
     /// 子プロセスの `fork(2)`。
     Spawn,
+    /// rootless の UID/GID 写像の設定（mapper との同期・書き込み・読み戻し。TASK-40.2）。
+    UserNamespaceMap,
     /// exec 直前の検証（証跡・エントリポイント・fd・シグナル状態）と `execve(2)`。
     Exec,
     /// 子の終了待ち（`waitpid(2)`）と、期限超過時の `kill(2)`。
@@ -382,6 +400,16 @@ impl ExecError {
         Self::new(code, stage, format!("{what} failed: {}", describe(err)))
     }
 
+    /// rootless 側のエラーを写す。`code` は保ち、段は `UserNamespaceMap`、message に rootless 側の
+    /// 段名を含める（ERR-1 の機械可読な文脈を失わない）。
+    fn from_rootless(err: RootlessError) -> Self {
+        Self::new(
+            err.code,
+            IsolationStage::UserNamespaceMap,
+            format!("{}: {}", err.stage.as_str(), err.message),
+        )
+    }
+
     fn from_io(err: &std::io::Error, stage: IsolationStage, what: &str) -> Self {
         let sys_err = SysError::Os(err.raw_os_error().unwrap_or(0));
         let code = errno_to_code(sys_err);
@@ -446,6 +474,9 @@ pub enum IsolationPrivilege {
     /// rootful 経路（[`isolate_rootful_host_root`]）。user namespace なしでホスト root 権限を
     /// 保ったまま分離した。
     RootfulHostRoot,
+    /// [`isolate_rootless_subordinate`]。非 root の起動ユーザーで、コンテナ root を自 ID、残りを
+    /// subuid / subgid 範囲へ写す user namespace 付き（CORE-6・SEC-5）。
+    RootlessSubordinateIds,
 }
 
 /// [`isolate`] / [`isolate_rootful_host_root`] の成功結果（将来拡張できる構造化された戻り値）。
@@ -704,7 +735,7 @@ impl MountIsolation {
 /// 既定経路（rootless）の検証済み計画。[`plan`] だけが作り、[`isolate`] だけが受け取る。
 ///
 /// user namespace を必ず含み、非 root の自 euid / egid をコンテナ内 0 へ写す単一 ID 写像を
-/// 持つ（SEC-5。subuid 範囲の写像は TASK-40・#186 で扱う）。
+/// 持つ（SEC-5。subuid 範囲の写像は [`plan_rootless_subordinate`]〔TASK-40.2〕が扱う）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsolationPlan {
     namespaces: NamespaceSet,
@@ -721,8 +752,8 @@ pub struct IsolationPlan {
 /// コンテナ内 root をホストの非特権 UID へ写す）の保護は受けない。
 ///
 /// **用途**: CORE-7・CORE-9 の rootful 分離（spec 上、dev-box02 の PoC-14・15・17 で実機実証済みの
-/// 構成）。root 起動でもコンテナ内 root を非特権 UID へ写す構成は TASK-40（#186）の subuid 写像で
-/// 既定経路に加える予定で、それまでの暫定経路ではなく明示的に選ぶ別経路として分けている。
+/// 構成）。root 起動でもコンテナ内 root を非特権 UID へ写す構成は未実装（TASK-40.2 の
+/// [`plan_rootless_subordinate`] は非 root 起動に限る）で、それまでの暫定経路ではなく明示的に選ぶ別経路として分けている。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootfulHostRootPlan {
     namespaces: NamespaceSet,
@@ -868,6 +899,258 @@ pub fn isolate_rootful_host_root(plan: &RootfulHostRootPlan) -> Result<Isolation
         uid_mapping: None,
         gid_mapping: None,
     })
+}
+
+/// 範囲写像付き rootless 経路の検証済み計画。[`plan_rootless_subordinate`] だけが作り、
+/// [`isolate_rootless_subordinate`] だけが受け取る（CORE-6・SEC-5・TASK-40.2）。
+///
+/// user namespace を必ず含み、非 root の起動ユーザー（euid / egid）がコンテナ内 0 に写る
+/// `/etc/subuid`・`/etc/subgid` 由来の範囲写像を持つ。ホスト root 起動・コンテナ 0 が起動ユーザー以外へ
+/// 写る構成は計画の段階で拒否する。フィールドは非公開（検証を経ない組み立てを防ぐ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubordinateIsolationPlan {
+    namespaces: NamespaceSet,
+    hostname: Option<Hostname>,
+    uid: IdMapSet,
+    gid: IdMapSet,
+    writer: IdMapWriter,
+    timeout: Duration,
+    euid: u32,
+    egid: u32,
+}
+
+/// [`isolate_rootless_subordinate`] の成功結果。[`IsolationReport`] は拡張できない型のため、
+/// 別の型で包む（既存 API を壊さない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootlessIsolationReport {
+    /// 分離の結果（`privilege` は `RootlessSubordinateIds`。`uid_mapping` / `gid_mapping` はコンテナ 0 の行）。
+    pub isolation: IsolationReport,
+    /// 書き込み・読み戻し検証が済んだ UID/GID 写像の全体。
+    pub id_maps: IdMapReport,
+}
+
+/// mapper の終了を待つ上限（応答受領後なので短い。REPAIR-5）。
+const MAPPER_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// [`plan_rootless_subordinate`] の本体（euid / egid を引数に取りテスト可能にした純関数）。
+///
+/// 拒否条件: 共通検証（[`validate_common`]）・`User` 無し（`UserNamespaceRequired`）・euid / egid が 0
+/// （`HostRootIdentityMapping`）・コンテナ 0 が起動ユーザー以外へ写る（`InvalidArgument`。
+/// `rootless_mapping` の形に限る fail-closed）・`timeout` が `1..=60` 秒の外（`InvalidArgument`）。
+fn plan_subordinate_for(
+    config: &IsolationConfig,
+    uid: IdMapSet,
+    gid: IdMapSet,
+    writer: IdMapWriter,
+    timeout: Duration,
+    euid: u32,
+    egid: u32,
+) -> Result<SubordinateIsolationPlan, ExecError> {
+    validate_common(config)?;
+    if !config.namespaces.contains(Namespace::User) {
+        return Err(ExecError::from_violation(
+            ViolationReason::UserNamespaceRequired,
+            None,
+        ));
+    }
+    if euid == 0 || egid == 0 {
+        return Err(ExecError::from_violation(
+            ViolationReason::HostRootIdentityMapping,
+            None,
+        ));
+    }
+    let invalid =
+        |msg: &str| ExecError::new(ErrorCode::InvalidArgument, IsolationStage::Validate, msg);
+    if uid.host_id_of(0) != Some(euid) || gid.host_id_of(0) != Some(egid) {
+        return Err(invalid(
+            "container root must map to the launching user's euid/egid",
+        ));
+    }
+    if timeout < Duration::from_secs(1) || timeout > Duration::from_secs(60) {
+        return Err(invalid("id map timeout must be within 1..=60 seconds"));
+    }
+    Ok(SubordinateIsolationPlan {
+        namespaces: config.namespaces,
+        hostname: config.hostname.clone(),
+        uid,
+        gid,
+        writer,
+        timeout,
+        euid,
+        egid,
+    })
+}
+
+/// 範囲写像付き rootless 経路の計画を作る（副作用なし。CORE-6・SEC-5・TASK-40.2）。
+///
+/// `uid` / `gid` は [`crate::rootless::rootless_mapping`] 等で作った検証済み写像、`writer` は
+/// [`IdMapWriter::Direct`]（自 ID の単一行のみ）か [`IdMapWriter::Helper`]（範囲写像）。
+/// 拒否条件: 共通検証・`User` 必須・非 root 起動・コンテナ 0 は起動ユーザーへ写すこと・
+/// `timeout` は `1..=60` 秒。
+pub fn plan_rootless_subordinate(
+    config: &IsolationConfig,
+    uid: IdMapSet,
+    gid: IdMapSet,
+    writer: IdMapWriter,
+    timeout: Duration,
+) -> Result<SubordinateIsolationPlan, ExecError> {
+    plan_subordinate_for(
+        config,
+        uid,
+        gid,
+        writer,
+        timeout,
+        sys::effective_uid(),
+        sys::effective_gid(),
+    )
+}
+
+/// 同期チャネルの入出力エラーを写す（タイムアウトは `Timeout`、その他は `Internal`）。
+fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
+    let code = match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => ErrorCode::Timeout,
+        _ => ErrorCode::Internal,
+    };
+    ExecError::new(
+        code,
+        IsolationStage::UserNamespaceMap,
+        format!("{what} failed: {e}"),
+    )
+}
+
+/// 範囲写像付き rootless 経路の計画に従い、呼び出しプロセスを namespace 分離する（CORE-6・SEC-5）。
+///
+/// 処理順: 実行 ID の再検証 → 同期チャネルと mapper の fork（外側の user namespace に残る）→
+/// 呼び出し元が `CLONE_NEWUSER` → mapper へ go → mapper が親 pid の `uid_map` / `gid_map` を書く
+/// （`newuidmap` / `newgidmap` 経由は setuid ヘルパーで root 権限を代替）→ 応答（固定 3 バイト）を
+/// 上限付き・タイムアウト付きで受領 → 自プロセスの写像を読み戻して計画と照合 → user namespace 内で
+/// uid / gid が 0 であることを確認 → 残りの namespace を分離（[`isolate`] と同じ `MS_PRIVATE`・hostname）。
+///
+/// 契約:
+/// - シングルスレッドから呼ぶこと（mapper の fork と `CLONE_NEWUSER` の制約。マルチスレッドは
+///   副作用なしで `FailedPrecondition`）
+/// - 失敗したプロセスは破棄すること（写像は write-once で戻せない。[`isolate`] と同じ）。mapper は
+///   どの失敗経路でも kill して回収する（ゾンビを残さない）
+/// - mapper は親の死を EOF で検知できない（fork で fd が複製され、子側から安全に閉じられない）ため、
+///   go の待ちは read タイムアウト（`timeout`）と `parent_id()` の再確認で止める（REPAIR-5）
+/// - pidfd は採らない（書き込み先は応答待ちでブロックしている親で、pid は解放されない。
+///   詳細は [`crate::rootless`] の doc）
+pub fn isolate_rootless_subordinate(
+    plan: &SubordinateIsolationPlan,
+) -> Result<RootlessIsolationReport, ExecError> {
+    let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
+    if euid != plan.euid || egid != plan.egid {
+        return Err(ExecError::from_violation(
+            ViolationReason::IdentityChanged,
+            None,
+        ));
+    }
+    let (mut parent_sock, mapper_sock) = std::os::unix::net::UnixStream::pair()
+        .map_err(|e| ExecError::from_io(&e, IsolationStage::UserNamespaceMap, "socketpair"))?;
+    let parent_pid = std::process::id();
+    let (uid, gid, writer, timeout) = (
+        plan.uid.clone(),
+        plan.gid.clone(),
+        plan.writer.clone(),
+        plan.timeout,
+    );
+    let mapper_pid = sys::fork_single_threaded(
+        move || rootless::run_id_map_mapper(parent_pid, mapper_sock, &uid, &gid, &writer, timeout),
+        EXIT_SETUP_FAILED,
+    )
+    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    let mapper = ContainerChild::new(mapper_pid);
+
+    let handshake = rootless_handshake(&mut parent_sock, plan);
+    drop(parent_sock);
+    match handshake {
+        Ok(()) => {
+            mapper.wait_timeout(MAPPER_REAP_TIMEOUT)?;
+        }
+        Err(e) => {
+            // 失敗しても mapper を必ず回収する。回収自体の失敗は元のエラーを優先する。
+            let _ = mapper.kill_and_reap(MAPPER_REAP_TIMEOUT);
+            return Err(e);
+        }
+    }
+
+    let rest = plan.namespaces.without(Namespace::User);
+    if !rest.is_empty() {
+        unshare_and_configure(rest, plan.hostname.as_ref(), None)?;
+    }
+    let container_root = |host_id| IdMapping {
+        container_id: 0,
+        host_id,
+        count: 1,
+    };
+    Ok(RootlessIsolationReport {
+        isolation: IsolationReport {
+            privilege: IsolationPrivilege::RootlessSubordinateIds,
+            namespaces: plan.namespaces,
+            hostname: plan.hostname.clone(),
+            uid_mapping: Some(container_root(plan.euid)),
+            gid_mapping: Some(container_root(plan.egid)),
+        },
+        id_maps: IdMapReport {
+            uid: plan.uid.clone(),
+            gid: plan.gid.clone(),
+            writer: match plan.writer {
+                IdMapWriter::Direct => WriterKind::Direct,
+                IdMapWriter::Helper(_) => WriterKind::Helper,
+            },
+        },
+    })
+}
+
+/// [`isolate_rootless_subordinate`] の親側（`unshare` → go → 応答 → 自己検証）。
+/// 失敗時の mapper 回収は呼び出し元が行う。
+fn rootless_handshake(
+    sock: &mut std::os::unix::net::UnixStream,
+    plan: &SubordinateIsolationPlan,
+) -> Result<(), ExecError> {
+    use std::io::Read as _;
+
+    rootless::unshare_user_namespace().map_err(ExecError::from_rootless)?;
+    sock.set_write_timeout(Some(plan.timeout))
+        .map_err(|e| sync_io_error(&e, "set write timeout"))?;
+    sock.write_all(&[rootless::MAPPER_GO])
+        .map_err(|e| sync_io_error(&e, "send go signal to the id map mapper"))?;
+    // Helper は uid / gid で 2 回実行するため、応答待ちの上限は 2 × timeout + 1s。
+    sock.set_read_timeout(Some(plan.timeout * 2 + Duration::from_secs(1)))
+        .map_err(|e| sync_io_error(&e, "set read timeout"))?;
+    let mut buf = [0u8; rootless::MAPPER_REPLY_LEN];
+    sock.read_exact(&mut buf)
+        .map_err(|e| sync_io_error(&e, "read the id map mapper reply"))?;
+    match MapperReply::decode(&buf).map_err(ExecError::from_rootless)? {
+        MapperReply::Ok => {}
+        MapperReply::Failed { code, stage } => {
+            return Err(ExecError::new(
+                code,
+                IsolationStage::UserNamespaceMap,
+                format!("id map mapper failed at {}", stage.as_str()),
+            ));
+        }
+    }
+    // mapper の申告に依存せず、自プロセスの写像を読み戻して計画と照合する（fail-closed）。
+    let me = TargetPid::new(std::process::id()).map_err(ExecError::from_rootless)?;
+    for (kind, set) in [(IdKind::Uid, &plan.uid), (IdKind::Gid, &plan.gid)] {
+        let got = rootless::read_id_map(me, kind).map_err(ExecError::from_rootless)?;
+        if got != set.entries() {
+            return Err(ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::UserNamespaceMap,
+                "the applied id mapping does not match the plan",
+            ));
+        }
+    }
+    if sys::effective_uid() != 0 || sys::effective_gid() != 0 {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::UserNamespaceMap,
+            "uid/gid inside the user namespace is not 0 after mapping",
+        ));
+    }
+    Ok(())
 }
 
 /// 両経路に共通する副作用部（検証済みの計画からだけ呼ぶ）。
@@ -2195,5 +2478,179 @@ mod tests {
                 Some("/r/p".to_string())
             )
         );
+    }
+
+    fn sub_maps(euid: u32, egid: u32) -> (IdMapSet, IdMapSet) {
+        let r = rootless::SubordinateRange::new(100_000, 65_536).unwrap();
+        (
+            rootless::rootless_mapping(euid, &[r]).unwrap(),
+            rootless::rootless_mapping(egid, &[r]).unwrap(),
+        )
+    }
+
+    fn sub_plan(
+        ns: NamespaceSet,
+        euid: u32,
+        egid: u32,
+        timeout_secs: u64,
+    ) -> Result<SubordinateIsolationPlan, ExecError> {
+        let (u, g) = sub_maps(1000, 1000);
+        plan_subordinate_for(
+            &cfg(ns, None),
+            u,
+            g,
+            IdMapWriter::Direct,
+            Duration::from_secs(timeout_secs),
+            euid,
+            egid,
+        )
+    }
+
+    /// CORE-6・SEC-5（TASK-40.2）: 正常系は計画の各値がそのまま保たれる。
+    #[test]
+    fn core6_sec5_subordinate_plan_keeps_values() {
+        let plan = sub_plan(NamespaceSet::all(), 1000, 1000, 5).unwrap();
+        let (u, g) = sub_maps(1000, 1000);
+        assert_eq!(plan.namespaces, NamespaceSet::all());
+        assert_eq!((plan.euid, plan.egid), (1000, 1000));
+        assert_eq!(plan.uid, u);
+        assert_eq!(plan.gid, g);
+        assert_eq!(plan.timeout, Duration::from_secs(5));
+        assert_eq!(plan.writer, IdMapWriter::Direct);
+        assert!(sub_plan(NamespaceSet::all(), 1000, 1000, 1).is_ok());
+        assert!(sub_plan(NamespaceSet::all(), 1000, 1000, 60).is_ok());
+    }
+
+    /// CORE-6・SEC-5（TASK-40.2）: user namespace 無しは違反記録付きで拒否する。
+    #[test]
+    fn core6_sec5_subordinate_plan_requires_user_namespace() {
+        let ns = NamespaceSet::empty()
+            .with(Namespace::Pid)
+            .with(Namespace::Mount);
+        let err = sub_plan(ns, 1000, 1000, 5).unwrap_err();
+        assert_eq!(violation_of(&err).1, "user_namespace_required", "{err}");
+    }
+
+    /// CORE-6・SEC-5（TASK-40.2）: euid / egid が 0 の起動は拒否する。
+    #[test]
+    fn core6_sec5_subordinate_plan_rejects_host_root() {
+        for (u, g) in [(0, 1000), (1000, 0), (0, 0)] {
+            let err = sub_plan(NamespaceSet::all(), u, g, 5).unwrap_err();
+            assert_eq!(violation_of(&err).1, "host_root_identity_mapping");
+        }
+    }
+
+    /// CORE-6・SEC-5（TASK-40.2）: コンテナ 0 が起動ユーザー以外へ写る構成は `InvalidArgument`。
+    #[test]
+    fn core6_sec5_subordinate_plan_rejects_foreign_container_root() {
+        let err = sub_plan(NamespaceSet::all(), 1001, 1000, 5).unwrap_err();
+        assert_eq!(
+            (err.code, err.stage),
+            (ErrorCode::InvalidArgument, IsolationStage::Validate)
+        );
+        let err = sub_plan(NamespaceSet::all(), 1000, 1001, 5).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    /// CORE-6（TASK-40.2）: timeout は 1..=60 秒の外を副作用の前に拒否する。
+    #[test]
+    fn core6_subordinate_plan_rejects_timeout_out_of_range() {
+        for secs in [0, 61] {
+            let err = sub_plan(NamespaceSet::all(), 1000, 1000, secs).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "{secs}s");
+        }
+    }
+
+    /// CORE-6（TASK-40.2）: `without` は対象だけを除く。
+    #[test]
+    fn core6_namespace_set_without_removes_only_target() {
+        let s = NamespaceSet::all().without(Namespace::User);
+        assert!(!s.contains(Namespace::User));
+        for ns in [
+            Namespace::Pid,
+            Namespace::Mount,
+            Namespace::Uts,
+            Namespace::Ipc,
+        ] {
+            assert!(s.contains(ns));
+        }
+        assert_eq!(
+            NamespaceSet::empty()
+                .with(Namespace::User)
+                .without(Namespace::User),
+            NamespaceSet::empty()
+        );
+    }
+
+    /// CORE-6（TASK-40.2）: rootless の失敗は `code` を保ち、段は `UserNamespaceMap`、message に
+    /// rootless 側の段名を含む。
+    #[test]
+    fn core6_exec_error_from_rootless_keeps_code_and_names_stage() {
+        let e = ExecError::from_rootless(RootlessError {
+            code: ErrorCode::PermissionDenied,
+            stage: rootless::RootlessStage::UidMap,
+            message: "denied".to_string(),
+        });
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert_eq!(e.stage, IsolationStage::UserNamespaceMap);
+        assert_eq!(e.message, "uid_map: denied");
+        assert!(e.violation.is_none());
+    }
+
+    /// CORE-6（TASK-40.2）: 計画作成後に実行 ID が変わっていれば副作用の前に拒否する
+    /// （現在の euid と異なる値を持つ計画を直接作る）。libtest はマルチスレッドだが、ID 再検証は
+    /// fork より前なので fork 段まで進まない。
+    #[test]
+    fn core6_isolate_subordinate_rejects_changed_identity() {
+        let other = sys::effective_uid().wrapping_add(1).max(1);
+        let (u, g) = sub_maps(other, other);
+        let mut plan = plan_subordinate_for(
+            &cfg(NamespaceSet::all(), None),
+            u,
+            g,
+            IdMapWriter::Direct,
+            Duration::from_secs(1),
+            other,
+            other,
+        )
+        .unwrap();
+        plan.egid = other;
+        let err = isolate_rootless_subordinate(&plan).unwrap_err();
+        assert_eq!(violation_of(&err).1, "identity_changed");
+    }
+
+    /// CORE-6（TASK-40.2）: マルチスレッドからは fork 段で副作用なしに `FailedPrecondition` で拒否される
+    /// （handshake の実動作は結合試験 `rootless_launch` で確認する）。保護用のスレッドを明示的に立て、
+    /// 単一スレッド実行でも実際に fork / unshare へ進まないようにする。root（euid 0）では計画の段階で
+    /// `host_root_identity_mapping` で拒否されることを照合する。
+    #[test]
+    fn core6_isolate_subordinate_refuses_multithreaded_caller() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let guard = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
+        let (u, g) = sub_maps(euid, egid);
+        let planned = plan_subordinate_for(
+            &cfg(NamespaceSet::all(), None),
+            u,
+            g,
+            IdMapWriter::Direct,
+            Duration::from_secs(1),
+            euid,
+            egid,
+        );
+        if euid == 0 || egid == 0 {
+            let err = planned.unwrap_err();
+            assert_eq!(violation_of(&err).1, "host_root_identity_mapping");
+        } else {
+            let err = isolate_rootless_subordinate(&planned.unwrap()).unwrap_err();
+            assert_eq!(
+                (err.code, err.stage),
+                (ErrorCode::FailedPrecondition, IsolationStage::Spawn)
+            );
+        }
+        tx.send(()).unwrap();
+        guard.join().unwrap();
     }
 }

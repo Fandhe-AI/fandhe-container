@@ -13,7 +13,7 @@
 //!       -> prepare_rootfs(&isolation, rootfs)
 //!       -> pivot_root(&isolation, prepared)            -> PivotReport
 //!       -> exec_entrypoint(&isolation, &report, &entry) // execve。成功時は戻らない
-//! 親: ContainerChild::wait_timeout(timeout)            // waitpid（期限超過で SIGKILL + 回収）
+//! 親: ContainerChild::wait_timeout(timeout)            // waitpid（期限超過で未回収に限り SIGKILL + 回収）
 //! ```
 //!
 //! # 契約
@@ -46,6 +46,9 @@
 //! - **親の待ちには必ずタイムアウトを設ける**（REPAIR-5）: [`ContainerChild::wait_timeout`] のみを
 //!   提供する。`Drop` では kill / wait しない（コンテナの寿命を親ハンドルに暗黙で縛らない）ため、
 //!   回収の責任は呼び出し元にある
+//! - **回収済みの pid へ kill しない**: 回収と期限超過の `SIGKILL` は `ContainerChild` 内の `Mutex`
+//!   の下で回収状態を確認して行い、並行に待っても回収後（pid 再利用され得る）に `SIGKILL` を送らない。
+//!   待機が `Err` で戻ってもハンドルは残り、再試行で kill・回収できる
 //! - **exec は絶対パスのみ**: PATH 探索・cwd・OCI `process` からの組み立て・`preserve_fds`・
 //!   `LISTEN_FDS` の受け渡しは TASK-29/30 の範囲
 //!
@@ -63,6 +66,7 @@ use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::sys::{self, Signal, SysError};
@@ -553,7 +557,7 @@ fn run_child(rootfs: &Path, entry: &Entrypoint) -> Result<Infallible, ExecError>
 pub fn spawn_container(rootfs: &Path, entry: &Entrypoint) -> Result<ContainerChild, ExecError> {
     let pid = sys::fork_single_threaded(|| child_main(rootfs, entry), EXIT_SETUP_FAILED)
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
-    Ok(ContainerChild { pid })
+    Ok(ContainerChild::new(pid))
 }
 
 /// 待ちのポーリング間隔。
@@ -563,45 +567,102 @@ const WAIT_TIMEOUT_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// `SIGKILL` 後に回収を待つ上限。
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 子の回収状態（[`ContainerChild`] の `Mutex` が保護する）。
+///
+/// 遷移は `Running` → `Killed` → `Reaped`、または `Running` → `Reaped` の一方向のみ。`Reaped` の後は
+/// pid がカーネルに返却済みで別プロセスへ再利用され得るため、`kill` も `waitpid` も呼ばない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReapState {
+    /// 未回収で、期限超過の `SIGKILL` もまだ送っていない。
+    Running,
+    /// 期限超過で `SIGKILL` を送った（または送る前に消えていた）が未回収。`SIGKILL` を二重に送らない。
+    Killed,
+    /// 回収済み。`killed` は期限超過の `SIGKILL` の後に回収したか（`Timeout` の判定に使う）。
+    Reaped { exit: ChildExit, killed: bool },
+}
+
+/// `Mutex` の中身。`kills_sent` は実際に送った `SIGKILL` の回数（高々 1。テストの照合用）。
+#[derive(Debug)]
+struct ReapCell {
+    state: ReapState,
+    kills_sent: u32,
+}
+
+/// 回収を観測した結果（終了状態と、期限超過の `SIGKILL` の後だったか）。
+type Observed = (ChildExit, bool);
+
 /// fork した子（コンテナの PID 1）のハンドル。
 ///
-/// `Drop` では kill / wait しない。回収の責任は呼び出し元にあり、放置すると子はゾンビとして残る。
+/// # 回収と kill の排他（PID 再利用対策。CORE-1・REPAIR-5）
+///
+/// `waitpid` による回収と期限超過の `SIGKILL` は、どちらも内部の `Mutex` を取った 1 ステップの中で
+/// 回収状態（`ReapState`）を確認・更新して行う。回収済み（`Reaped`）なら `kill` を送らないため、
+/// 複数スレッドが同じハンドルで並行に待っても、回収後に解放・再利用された pid へ `SIGKILL` が届く
+/// ことはない（回収前はゾンビが pid を保持するので再利用されない）。ロックは 1 回の
+/// `waitpid(WNOHANG)` / `kill` の間だけ持ち、ポーリングの sleep 中は持たない（各呼び出し元の期限を
+/// 守る）。この保証は「このハンドルが当該 pid の唯一の回収者」であることを前提とし、同じプロセスの
+/// 他所での `waitpid(-1)`・`SIGCHLD` の `SIG_IGN` / `SA_NOCLDWAIT` による自動回収は契約外。
+///
+/// `Drop` では kill / wait しない（コンテナの寿命を親ハンドルに暗黙で縛らない）。回収の責任は
+/// 呼び出し元にあり、放置すると子はゾンビとして残る。
 #[must_use]
 #[derive(Debug)]
 pub struct ContainerChild {
     pid: u32,
+    reap: Mutex<ReapCell>,
 }
 
 impl ContainerChild {
-    /// 子のプロセス ID（親の PID namespace での値）。
+    /// fork 直後の未回収の子のハンドルを作る。
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            reap: Mutex::new(ReapCell {
+                state: ReapState::Running,
+                kills_sent: 0,
+            }),
+        }
+    }
+
+    /// 子のプロセス ID（親の PID namespace での値）。回収済みなら別プロセスに再利用され得る。
     pub fn pid(&self) -> u32 {
         self.pid
     }
 
     /// 子の終了を `timeout` まで待つ（REPAIR-5）。
     ///
-    /// 期限を超えたら `SIGKILL` を送って回収し、`ErrorCode::Timeout`（段は `Wait`）で返す。
-    /// ハンドルを消費しない（`&self`）ため、`kill` / `waitpid` が一時的に失敗しても呼び出し元は再試行できる。
-    /// 回収済みの子に再度呼ぶと `waitpid` の `ECHILD` が `ExecError` として返る。
-    /// `waitpid(WNOHANG)` を 10ms 間隔でポーリングする。`timeout` は 7 日に丸める。
+    /// - 期限内に終われば終了状態を返す（別スレッドの待機が回収した場合も同じ値を返す）
+    /// - 期限を超えたら、未回収に限り `SIGKILL` を 1 回だけ送って回収し、`ErrorCode::Timeout`
+    ///   （段は `Wait`）で返す。自分の期限内に別スレッドの `SIGKILL` で回収された場合は
+    ///   `Ok(ChildExit::Signaled(9))` になる
+    /// - 回収済みのハンドルに再度呼ぶと、`waitpid` / `kill` を呼ばずに記録済みの終了状態を `Ok` で返す
+    ///   （期限超過で kill した後なら `Signaled(9)`）。`Timeout` になるのは、その呼び出し自身の期限が
+    ///   終了の観測より先に切れた場合だけ（最初の観測は期限の確認より前に行うため、期限 0 でも回収済みなら `Ok`）
+    /// - ハンドルを消費しない（`&self`）。`waitpid` / `kill` が失敗して `Err` で戻っても回収状態は
+    ///   変わらず、呼び出し元は同じハンドルで再試行（kill・回収）できる
+    ///
+    /// `waitpid(WNOHANG)` を 10ms 間隔でポーリングする（`EINTR` でも毎回期限を確認する）。
+    /// `timeout` は 7 日に丸める。
     pub fn wait_timeout(&self, timeout: Duration) -> Result<ChildExit, ExecError> {
         const STAGE: IsolationStage = IsolationStage::Wait;
-        let deadline = Instant::now() + timeout.min(WAIT_TIMEOUT_MAX);
-        if let Some(exit) = self.poll_until(deadline)? {
-            return Ok(exit);
-        }
-        // 期限超過: SIGKILL を送り、回収まで有限時間だけ待つ。ESRCH は既に終了済み（回収待ち）。
-        match sys::kill_pid(self.pid, Signal::Kill) {
-            Ok(()) => {}
-            Err(SysError::Os(e)) if e == sys::ESRCH => {}
-            Err(e) => return Err(ExecError::from_sys(e, STAGE, "kill(SIGKILL)")),
-        }
-        match self.poll_until(Instant::now() + KILL_REAP_TIMEOUT)? {
-            Some(_) => Err(ExecError::new(
+        let timed_out = || {
+            ExecError::new(
                 ErrorCode::Timeout,
                 STAGE,
                 format!("the container process did not exit within {timeout:?}; killed"),
-            )),
+            )
+        };
+        let deadline = Instant::now() + timeout.min(WAIT_TIMEOUT_MAX);
+        // 期限内に観測できた。期限切れの別スレッドが kill した結果でも、自分の期限内なので `Ok`。
+        if let Some((exit, _)) = self.poll_until(deadline)? {
+            return Ok(exit);
+        }
+        // 期限超過: 未回収なら SIGKILL（ロック下で状態を確認して送る。回収済みなら送らない）。
+        if let Some((exit, killed)) = self.kill_if_unreaped()? {
+            return if killed { Err(timed_out()) } else { Ok(exit) };
+        }
+        match self.poll_until(Instant::now() + KILL_REAP_TIMEOUT)? {
+            Some(_) => Err(timed_out()),
             None => Err(ExecError::new(
                 ErrorCode::Internal,
                 STAGE,
@@ -610,34 +671,79 @@ impl ContainerChild {
         }
     }
 
-    /// `deadline` まで `waitpid(WNOHANG)` でポーリングする。回収できれば `Some`、期限なら `None`。
-    fn poll_until(&self, deadline: Instant) -> Result<Option<ChildExit>, ExecError> {
+    /// 回収状態のロックを取る。
+    ///
+    /// ロック中の処理（`waitpid` / `kill` のラッパーと状態の単一代入）は panic しないため、poison
+    /// されても中身は整合している。ライブラリで panic させないよう poison は中身を取り出して続行する。
+    fn lock(&self) -> MutexGuard<'_, ReapCell> {
+        self.reap.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// ロック下で 1 回だけ回収を試みる。回収済みなら `waitpid` せず記録を返す。未終了・`EINTR` は
+    /// `Ok(None)`（呼び出し側が期限を確認する）。失敗しても状態は変えない（再試行できる）。
+    fn try_reap(&self) -> Result<Option<Observed>, ExecError> {
         const STAGE: IsolationStage = IsolationStage::Wait;
-        loop {
-            match sys::wait_pid_nohang(self.pid) {
-                Ok(Some(status)) => {
-                    return decode_wait_status(status).map(Some).ok_or_else(|| {
-                        ExecError::new(
-                            ErrorCode::Internal,
-                            STAGE,
-                            "the container process changed state without exiting",
-                        )
-                    });
-                }
-                Ok(None) => {}
-                // シグナル割り込みでも期限は必ず確認する（連続 EINTR で期限超過・SIGKILL 未到達を防ぐ）。
-                Err(SysError::Os(e)) if e == sys::EINTR => {
-                    if Instant::now() >= deadline {
-                        return Ok(None);
-                    }
-                    continue;
-                }
-                Err(e) => return Err(ExecError::from_sys(e, STAGE, "waitpid")),
+        let mut cell = self.lock();
+        if let ReapState::Reaped { exit, killed } = cell.state {
+            return Ok(Some((exit, killed)));
+        }
+        match sys::wait_pid_nohang(self.pid) {
+            Ok(Some(status)) => {
+                // stopped / continued は回収ではない（pid は保持されたまま）ので状態を変えずにエラー。
+                let exit = decode_wait_status(status).ok_or_else(|| {
+                    ExecError::new(
+                        ErrorCode::Internal,
+                        STAGE,
+                        "the container process changed state without exiting",
+                    )
+                })?;
+                let killed = cell.state == ReapState::Killed;
+                cell.state = ReapState::Reaped { exit, killed };
+                Ok(Some((exit, killed)))
             }
-            if Instant::now() >= deadline {
+            Ok(None) => Ok(None),
+            Err(SysError::Os(e)) if e == sys::EINTR => Ok(None),
+            Err(e) => Err(ExecError::from_sys(e, STAGE, "waitpid")),
+        }
+    }
+
+    /// ロック下で、未回収かつ未 kill のときだけ `SIGKILL` を送る。回収済みなら送らずに記録を返す。
+    /// `kill` の失敗（`ESRCH` 以外）は状態を `Running` のまま返す（呼び出し元が再試行できる）。
+    fn kill_if_unreaped(&self) -> Result<Option<Observed>, ExecError> {
+        let mut cell = self.lock();
+        match cell.state {
+            ReapState::Reaped { exit, killed } => return Ok(Some((exit, killed))),
+            ReapState::Killed => return Ok(None),
+            ReapState::Running => {}
+        }
+        match sys::kill_pid(self.pid, Signal::Kill) {
+            Ok(()) => cell.kills_sent = cell.kills_sent.saturating_add(1),
+            // 未回収の子が ESRCH になるのは契約外の回収者に回収された場合のみ。以後 kill しない。
+            Err(SysError::Os(e)) if e == sys::ESRCH => {}
+            Err(e) => {
+                return Err(ExecError::from_sys(
+                    e,
+                    IsolationStage::Wait,
+                    "kill(SIGKILL)",
+                ));
+            }
+        }
+        cell.state = ReapState::Killed;
+        Ok(None)
+    }
+
+    /// `deadline` まで回収をポーリングする。観測できれば `Some`、期限なら `None`。
+    fn poll_until(&self, deadline: Instant) -> Result<Option<Observed>, ExecError> {
+        loop {
+            if let Some(observed) = self.try_reap()? {
+                return Ok(Some(observed));
+            }
+            // シグナル割り込み（EINTR）でも期限は必ず確認する（連続 EINTR で SIGKILL 未到達を防ぐ）。
+            let now = Instant::now();
+            if now >= deadline {
                 return Ok(None);
             }
-            std::thread::sleep(WAIT_POLL_INTERVAL);
+            std::thread::sleep(WAIT_POLL_INTERVAL.min(deadline - now));
         }
     }
 }
@@ -898,9 +1004,7 @@ mod tests {
     /// CORE-1（TASK-27.4.1）: 終了した子を回収し、終了コードを返す。
     #[test]
     fn core1_wait_timeout_returns_exit_code() {
-        let handle = ContainerChild {
-            pid: spawn_sh("exit 3"),
-        };
+        let handle = ContainerChild::new(spawn_sh("exit 3"));
         assert_eq!(
             handle.wait_timeout(Duration::from_secs(10)).unwrap(),
             ChildExit::Exited(3)
@@ -912,7 +1016,7 @@ mod tests {
     #[test]
     fn core1_wait_timeout_kills_and_reaps_on_expiry() {
         let pid = spawn_sh("exec sleep 30");
-        let handle = ContainerChild { pid };
+        let handle = ContainerChild::new(pid);
         let err = handle.wait_timeout(Duration::from_millis(200)).unwrap_err();
         assert_eq!(err.code, ErrorCode::Timeout);
         assert_eq!(err.stage, IsolationStage::Wait);

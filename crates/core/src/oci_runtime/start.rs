@@ -435,7 +435,7 @@ mod tests {
         b.write_config(&valid_config());
         std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
         let store = MemStateStore::new(false);
-        create(&store, &OpRecorder::new(), &b.create_req("c1")).expect("create");
+        create(&store, &OpRecorder::new(), &b.create_req(name)).expect("create");
         (b, store)
     }
 
@@ -444,10 +444,10 @@ mod tests {
         let (b, store) = created(name);
         b.write_config(cfg);
         let launcher = RecordingLauncher::new(false);
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect_err("must fail");
+        let err = start(&store, &OpRecorder::new(), &launcher, &sid(name)).expect_err("must fail");
         assert_eq!(launcher.calls(), 0);
         let got = store
-            .get(&GetStateRequest::new(ContainerId::new("c1").expect("id")))
+            .get(&GetStateRequest::new(ContainerId::new(name).expect("id")))
             .expect("stored");
         assert_eq!(got.status().state(), ContainerState::Created);
         err
@@ -458,10 +458,10 @@ mod tests {
     fn oci4_start_launches_process_args_and_transitions_to_running() {
         let (b, store) = created("ok");
         let before = store
-            .get(&GetStateRequest::new(ContainerId::new("c1").expect("id")))
+            .get(&GetStateRequest::new(ContainerId::new("ok").expect("id")))
             .expect("get");
         let launcher = RecordingLauncher::new(false);
-        let record = start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect("start");
+        let record = start(&store, &OpRecorder::new(), &launcher, &sid("ok")).expect("start");
         assert_eq!(record.status().state(), ContainerState::Running);
         assert_eq!(record.status().pid(), NonZeroU32::new(4242));
         assert!(record.revision() > before.revision());
@@ -497,8 +497,8 @@ mod tests {
     fn core2_start_twice_returns_failed_precondition() {
         let (_b, store) = created("twice");
         let launcher = RecordingLauncher::new(false);
-        start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect("first");
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect_err("second");
+        start(&store, &OpRecorder::new(), &launcher, &sid("twice")).expect("first");
+        let err = start(&store, &OpRecorder::new(), &launcher, &sid("twice")).expect_err("second");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(launcher.calls(), 1);
     }
@@ -509,7 +509,8 @@ mod tests {
         let (b, store) = created("rewrite-bad");
         std::fs::write(b.dir.join("config.json"), b"{ not json").expect("write");
         let launcher = RecordingLauncher::new(false);
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect_err("fail");
+        let err =
+            start(&store, &OpRecorder::new(), &launcher, &sid("rewrite-bad")).expect_err("fail");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(launcher.calls(), 0);
     }
@@ -532,7 +533,8 @@ mod tests {
         std::fs::create_dir(b.dir.join("real")).expect("real");
         std::os::unix::fs::symlink(b.dir.join("real"), b.dir.join("rootfs")).expect("symlink");
         let launcher = RecordingLauncher::new(false);
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect_err("fail");
+        let err =
+            start(&store, &OpRecorder::new(), &launcher, &sid("swap-rootfs")).expect_err("fail");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(launcher.calls(), 0);
     }
@@ -611,9 +613,9 @@ mod tests {
         b.write_config(&valid_config());
         std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
         let store = MemStateStore::new(true);
-        create(&store, &OpRecorder::new(), &b.create_req("c1")).expect("create");
+        create(&store, &OpRecorder::new(), &b.create_req("upd-fail")).expect("create");
         let launcher = RecordingLauncher::new(false);
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect_err("fail");
+        let err = start(&store, &OpRecorder::new(), &launcher, &sid("upd-fail")).expect_err("fail");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(launcher.calls(), 1);
         assert_eq!(launcher.terminations(), 1);
@@ -634,13 +636,14 @@ mod tests {
     fn core2_start_rejects_concurrent_start_of_same_id() {
         let (_b, store) = created("concurrent");
         let launcher = RecordingLauncher::new(false);
-        let id = ContainerId::new("c1").expect("id");
+        let id = ContainerId::new("concurrent").expect("id");
         let guard = StartReservation::acquire(&id).expect("reserve");
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect_err("busy");
+        let err =
+            start(&store, &OpRecorder::new(), &launcher, &sid("concurrent")).expect_err("busy");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(launcher.calls(), 0);
         drop(guard);
-        start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect("after release");
+        start(&store, &OpRecorder::new(), &launcher, &sid("concurrent")).expect("after release");
         assert_eq!(launcher.calls(), 1);
     }
 
@@ -651,10 +654,11 @@ mod tests {
         b.write_config(&valid_config());
         std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
         let store = MemStateStore::new(true);
-        create(&store, &OpRecorder::new(), &b.create_req("c1")).expect("create");
+        create(&store, &OpRecorder::new(), &b.create_req("term-fail")).expect("create");
         let mut launcher = RecordingLauncher::new(false);
         launcher.fail_terminate = true;
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect_err("fail");
+        let err =
+            start(&store, &OpRecorder::new(), &launcher, &sid("term-fail")).expect_err("fail");
         assert_eq!(err.code(), ErrorCode::Internal);
         assert_eq!(launcher.terminations(), 1);
     }
@@ -664,10 +668,13 @@ mod tests {
     fn oci4_start_propagates_launcher_error_without_state_change() {
         let (_b, store) = created("launch-fail");
         let launcher = RecordingLauncher::new(true);
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect_err("fail");
+        let err =
+            start(&store, &OpRecorder::new(), &launcher, &sid("launch-fail")).expect_err("fail");
         assert_eq!(err.code(), ErrorCode::Internal);
         let got = store
-            .get(&GetStateRequest::new(ContainerId::new("c1").expect("id")))
+            .get(&GetStateRequest::new(
+                ContainerId::new("launch-fail").expect("id"),
+            ))
             .expect("stored");
         assert_eq!(got.status().state(), ContainerState::Created);
         assert_eq!(launcher.terminations(), 0);
@@ -679,8 +686,8 @@ mod tests {
         let (_b, store) = created("rec");
         let launcher = RecordingLauncher::new(false);
         let rec = OpRecorder::new();
-        start(&store, &rec, &launcher, &sid("c1")).expect("first");
-        start(&store, &rec, &launcher, &sid("c1")).expect_err("second");
+        start(&store, &rec, &launcher, &sid("rec")).expect("first");
+        start(&store, &rec, &launcher, &sid("rec")).expect_err("second");
         let stats = rec
             .snapshot_op(&OpName::new("start").expect("name"))
             .expect("recorded");

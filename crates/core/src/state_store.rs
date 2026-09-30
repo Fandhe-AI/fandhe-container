@@ -1250,6 +1250,23 @@ mod tests {
         assert_eq!(fs::read_to_string(t.path().join("@revision")).unwrap(), "0");
     }
 
+    /// OCI-5: 非 UTF-8 の bundle は revision の払い出し・`<id>/` の作成より前に拒否する。
+    #[test]
+    fn oci5_create_rejects_non_utf8_bundle_without_side_effects() {
+        use std::os::unix::ffi::OsStrExt;
+        let t = TmpDir::new("nonutf8");
+        let store = t.open();
+        let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/bundle-\xff"));
+        let req = CreateStateRequest::new(ContainerStatus::creating(cid("u")), bad).unwrap();
+        let e = store.create(&req).unwrap_err();
+        assert_eq!(e.code().as_str(), "INVALID_ARGUMENT");
+        assert_eq!(e.message(), "bundle path must be valid UTF-8");
+        assert!(!t.path().join("u").exists());
+        assert_eq!(fs::read_to_string(t.path().join("@revision")).unwrap(), "0");
+        // 続く正常な create は revision 0 を受け取る（欠番にならない）。
+        assert_eq!(create(&store, "v").revision(), StateRevision::INITIAL);
+    }
+
     #[test]
     fn oci5_update_fails_closed_when_revision_high_water_mark_is_behind() {
         let t = TmpDir::new("hwm");

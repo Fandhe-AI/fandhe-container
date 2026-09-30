@@ -12,6 +12,6 @@ pub use config::{
     CONFIG_MAX_HOSTNAME_BYTES, CONFIG_MAX_ID_MAPPINGS, CONFIG_MAX_MOUNT_OPTIONS, CONFIG_MAX_MOUNTS,
     CONFIG_MAX_NAMESPACES, CONFIG_MAX_OCI_VERSION_BYTES, CONFIG_MAX_PATH_BYTES,
     CONFIG_MAX_STRING_BYTES, NamespaceKind, OciConfig, OciConfigError, OciConfigErrorKind,
-    OciIdMapping, OciMount, OciNamespace, OciProcess, OciRoot, OciUser, OciVersion, load_config,
-    parse_config_bytes,
+    OciIdMapping, OciMount, OciNamespace, OciProcess, OciRoot, OciUser, OciVersion, UnappliedField,
+    load_config, parse_config_bytes,
 };

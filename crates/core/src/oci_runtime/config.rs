@@ -21,13 +21,18 @@
 //!   未知プロパティ（読み飛ばす対象）内の重複キーは検出せず受理する（無視する値であり、
 //!   解釈結果に影響しないため。既知フィールドの重複は serde の重複検出で拒否される）。
 //!
-//! # 未解釈のセクション（REPAIR-3）
+//! # 未解釈のセクション（REPAIR-3・fail-closed の判断材料）
 //!
-//! 次のセクションはパース時に無視しているだけで、適用済みではない（fail-open にならない扱いは
-//! TASK-29.2 の計画で決める）: `process.capabilities`・`process.rlimits`・`process.noNewPrivileges`
-//! （SEC-1・TASK-27.4.3 系）、`linux.seccomp`（CORE-5・TASK-38）、`linux.resources`
-//! （CORE-3/4・TASK-32〜）、`linux.maskedPaths` / `readonlyPaths`、`mounts[].uidMappings` /
-//! `gidMappings`（idmapped mount）、`hooks`、`annotations`。
+//! パースの成功（`Ok`）は「形式が正しく上限内である」ことだけを意味し、「そのまま実行してよい」
+//! ことは意味しない。OCI Runtime Spec が定義するプロパティのうち本パーサが解釈しないもの
+//! （`process.capabilities`・`process.noNewPrivileges`・`process.rlimits`〔SEC-1・TASK-27.4.3 系〕、
+//! `linux.seccomp`〔CORE-5・TASK-38〕、`linux.resources`〔CORE-3/4・TASK-32〜〕、
+//! `linux.maskedPaths` / `readonlyPaths`、`mounts[].uidMappings` / `gidMappings`、`hooks` 等）は、
+//! 値を読み飛ばすが指定の有無を [`UnappliedField`] として保持し、[`OciConfig::unapplied_fields`] で
+//! 返す（黙って破棄しない）。TASK-29.2（create）はこの一覧を必ず確認し、未対応の指定を拒否するか
+//! 最小権限で起動するかを fail-closed に決める（方針の決定は TASK-29.2 の担当）。
+//! 一覧は `schema/config-schema.json`・`defs.json`・`config-linux.json` が定義するプロパティから、
+//! 解釈済みのものと `annotations`（任意のメタデータで、ランタイムの挙動を変えない）を除いたもの。
 //!
 //! # 実行ファイルの検証
 //!
@@ -459,6 +464,85 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Obj<T> {
     }
 }
 
+macro_rules! unapplied_fields {
+    ($($variant:ident => $path:literal),* $(,)?) => {
+        /// OCI Runtime Spec が定義するが本パーサが解釈・適用しないプロパティ（指定の有無のみ保持）。
+        ///
+        /// [`OciConfig::unapplied_fields`] が返す。値は保持しない（読み飛ばす）。TASK-29.2 が
+        /// fail-closed の判断（拒否 / 最小権限で起動）に使う。モジュール doc「未解釈のセクション」参照。
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[non_exhaustive]
+        pub enum UnappliedField {
+            $(
+                #[doc = concat!("`", $path, "` が指定されている。")]
+                $variant,
+            )*
+        }
+
+        impl UnappliedField {
+            /// JSON 上のパス（例: `linux.seccomp`。配列要素は `mounts[].uidMappings` の形）。
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $path,)*
+                }
+            }
+        }
+    };
+}
+
+unapplied_fields! {
+    Hooks => "hooks",
+    Domainname => "domainname",
+    Solaris => "solaris",
+    Windows => "windows",
+    Vm => "vm",
+    Zos => "zos",
+    Freebsd => "freebsd",
+    ProcessCommandLine => "process.commandLine",
+    ProcessConsoleSize => "process.consoleSize",
+    ProcessCapabilities => "process.capabilities",
+    ProcessApparmorProfile => "process.apparmorProfile",
+    ProcessOomScoreAdj => "process.oomScoreAdj",
+    ProcessSelinuxLabel => "process.selinuxLabel",
+    ProcessIoPriority => "process.ioPriority",
+    ProcessNoNewPrivileges => "process.noNewPrivileges",
+    ProcessScheduler => "process.scheduler",
+    ProcessRlimits => "process.rlimits",
+    ProcessExecCpuAffinity => "process.execCPUAffinity",
+    ProcessUserUmask => "process.user.umask",
+    ProcessUserUsername => "process.user.username",
+    MountUidMappings => "mounts[].uidMappings",
+    MountGidMappings => "mounts[].gidMappings",
+    LinuxDevices => "linux.devices",
+    LinuxNetDevices => "linux.netDevices",
+    LinuxResources => "linux.resources",
+    LinuxCgroupsPath => "linux.cgroupsPath",
+    LinuxRootfsPropagation => "linux.rootfsPropagation",
+    LinuxSeccomp => "linux.seccomp",
+    LinuxSysctl => "linux.sysctl",
+    LinuxMaskedPaths => "linux.maskedPaths",
+    LinuxReadonlyPaths => "linux.readonlyPaths",
+    LinuxMountLabel => "linux.mountLabel",
+    LinuxIntelRdt => "linux.intelRdt",
+    LinuxMemoryPolicy => "linux.memoryPolicy",
+    LinuxPersonality => "linux.personality",
+    LinuxTimeOffsets => "linux.timeOffsets",
+}
+
+/// 解釈しない既知プロパティの「指定の有無」だけを記録するマーカー。
+///
+/// `#[serde(default)]` で省略時は `false`。キーがあれば値を `IgnoredAny` で読み飛ばし（確保しない。
+/// ネストも反復処理で辿る）、`true` にする。値を解釈しないため `null` を含むどの値でも「指定あり」と
+/// みなす（fail-closed 側に倒す）。キーの重複は既知フィールドとして serde の重複検出で拒否される。
+#[derive(Clone, Copy, Default)]
+struct Seen(bool);
+
+impl<'de> Deserialize<'de> for Seen {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        de::IgnoredAny::deserialize(deserializer).map(|_| Seen(true))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // raw 層（非公開。JSON の形をそのまま受ける）
 //
@@ -466,6 +550,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Obj<T> {
 // （`null` を省略として受理しないため）。`#[serde(default)] bool` は serde_json が `null` を
 // 型不一致として拒否するため `present` を要しない。struct 型のフィールド・配列要素は `Obj` で包み
 // （配列を struct として受理しないため）、列挙値は文字列として読む（`RawNamespaceKind`）。
+// 解釈しない既知プロパティは `#[serde(default)] Seen` で指定の有無だけを記録する（`UnappliedField`）。
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -481,6 +566,20 @@ struct RawConfig {
     mounts: Option<Bounded<Obj<RawMount>, MountsLimit>>,
     #[serde(default, deserialize_with = "present")]
     linux: Option<Obj<RawLinux>>,
+    #[serde(default)]
+    hooks: Seen,
+    #[serde(default)]
+    domainname: Seen,
+    #[serde(default)]
+    solaris: Seen,
+    #[serde(default)]
+    windows: Seen,
+    #[serde(default)]
+    vm: Seen,
+    #[serde(default)]
+    zos: Seen,
+    #[serde(default)]
+    freebsd: Seen,
 }
 
 #[derive(Deserialize)]
@@ -491,6 +590,7 @@ struct RawRoot {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawProcess {
     #[serde(default)]
     terminal: bool,
@@ -499,6 +599,28 @@ struct RawProcess {
     #[serde(default, deserialize_with = "present")]
     env: Option<Bounded<BoundedStr<EnvItemLimit>, EnvLimit>>,
     cwd: BoundedStr<CwdLimit>,
+    #[serde(default)]
+    command_line: Seen,
+    #[serde(default)]
+    console_size: Seen,
+    #[serde(default)]
+    capabilities: Seen,
+    #[serde(default)]
+    apparmor_profile: Seen,
+    #[serde(default)]
+    oom_score_adj: Seen,
+    #[serde(default)]
+    selinux_label: Seen,
+    #[serde(default)]
+    io_priority: Seen,
+    #[serde(default)]
+    no_new_privileges: Seen,
+    #[serde(default)]
+    scheduler: Seen,
+    #[serde(default)]
+    rlimits: Seen,
+    #[serde(default, rename = "execCPUAffinity")]
+    exec_cpu_affinity: Seen,
 }
 
 #[derive(Deserialize)]
@@ -508,6 +630,10 @@ struct RawUser {
     gid: u32,
     #[serde(default, deserialize_with = "present")]
     additional_gids: Option<Bounded<u32, GidsLimit>>,
+    #[serde(default)]
+    umask: Seen,
+    #[serde(default)]
+    username: Seen,
 }
 
 #[derive(Deserialize)]
@@ -519,6 +645,10 @@ struct RawMount {
     source: Option<BoundedStr<MountSourceLimit>>,
     #[serde(default, deserialize_with = "present")]
     options: Option<Bounded<BoundedStr<MountOptionLimit>, MountOptionsLimit>>,
+    #[serde(default, rename = "uidMappings")]
+    uid_mappings: Seen,
+    #[serde(default, rename = "gidMappings")]
+    gid_mappings: Seen,
 }
 
 #[derive(Deserialize)]
@@ -530,6 +660,34 @@ struct RawLinux {
     uid_mappings: Option<Bounded<Obj<RawIdMapping>, UidMappingsLimit>>,
     #[serde(default, deserialize_with = "present")]
     gid_mappings: Option<Bounded<Obj<RawIdMapping>, GidMappingsLimit>>,
+    #[serde(default)]
+    devices: Seen,
+    #[serde(default)]
+    net_devices: Seen,
+    #[serde(default)]
+    resources: Seen,
+    #[serde(default)]
+    cgroups_path: Seen,
+    #[serde(default)]
+    rootfs_propagation: Seen,
+    #[serde(default)]
+    seccomp: Seen,
+    #[serde(default)]
+    sysctl: Seen,
+    #[serde(default)]
+    masked_paths: Seen,
+    #[serde(default)]
+    readonly_paths: Seen,
+    #[serde(default)]
+    mount_label: Seen,
+    #[serde(default)]
+    intel_rdt: Seen,
+    #[serde(default)]
+    memory_policy: Seen,
+    #[serde(default)]
+    personality: Seen,
+    #[serde(default)]
+    time_offsets: Seen,
 }
 
 #[derive(Deserialize)]
@@ -851,6 +1009,9 @@ impl OciIdMapping {
 }
 
 /// 検証済みの `config.json`。生成経路は [`load_config`] / [`parse_config_bytes`] のみ。
+///
+/// 「形式が正しく上限内」であることを示すだけで、実行してよいことは示さない。解釈しない指定は
+/// [`OciConfig::unapplied_fields`] に残る。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OciConfig {
@@ -862,9 +1023,18 @@ pub struct OciConfig {
     namespaces: Vec<OciNamespace>,
     uid_mappings: Vec<OciIdMapping>,
     gid_mappings: Vec<OciIdMapping>,
+    unapplied: Vec<UnappliedField>,
 }
 
 impl OciConfig {
+    /// 指定されているが本パーサが解釈・適用しないプロパティ（[`UnappliedField`] の宣言順・重複なし）。
+    ///
+    /// 空でない場合、その指定は `OciConfig` のどのアクセサにも反映されていない。create（TASK-29.2）は
+    /// これを確認せずに起動してはならない（fail-closed。SEC-1・CORE-5）。
+    pub fn unapplied_fields(&self) -> &[UnappliedField] {
+        &self.unapplied
+    }
+
     /// `ociVersion`。
     pub fn oci_version(&self) -> &OciVersion {
         &self.oci_version
@@ -983,6 +1153,58 @@ impl RawConfig {
             path: checked_path(self.root.0.path.0, "root.path")?,
             readonly: self.root.0.readonly,
         };
+        let mut unapplied = Vec::new();
+        let mut mark = |seen: Seen, field: UnappliedField| {
+            if seen.0 {
+                unapplied.push(field);
+            }
+        };
+        mark(self.hooks, UnappliedField::Hooks);
+        mark(self.domainname, UnappliedField::Domainname);
+        mark(self.solaris, UnappliedField::Solaris);
+        mark(self.windows, UnappliedField::Windows);
+        mark(self.vm, UnappliedField::Vm);
+        mark(self.zos, UnappliedField::Zos);
+        mark(self.freebsd, UnappliedField::Freebsd);
+        if let Some(Obj(p)) = &self.process {
+            mark(p.command_line, UnappliedField::ProcessCommandLine);
+            mark(p.console_size, UnappliedField::ProcessConsoleSize);
+            mark(p.capabilities, UnappliedField::ProcessCapabilities);
+            mark(p.apparmor_profile, UnappliedField::ProcessApparmorProfile);
+            mark(p.oom_score_adj, UnappliedField::ProcessOomScoreAdj);
+            mark(p.selinux_label, UnappliedField::ProcessSelinuxLabel);
+            mark(p.io_priority, UnappliedField::ProcessIoPriority);
+            mark(p.no_new_privileges, UnappliedField::ProcessNoNewPrivileges);
+            mark(p.scheduler, UnappliedField::ProcessScheduler);
+            mark(p.rlimits, UnappliedField::ProcessRlimits);
+            mark(p.exec_cpu_affinity, UnappliedField::ProcessExecCpuAffinity);
+            mark(p.user.0.umask, UnappliedField::ProcessUserUmask);
+            mark(p.user.0.username, UnappliedField::ProcessUserUsername);
+        }
+        for Obj(m) in self.mounts.iter().flat_map(|b| b.0.iter()) {
+            mark(m.uid_mappings, UnappliedField::MountUidMappings);
+            mark(m.gid_mappings, UnappliedField::MountGidMappings);
+        }
+        if let Some(Obj(l)) = &self.linux {
+            mark(l.devices, UnappliedField::LinuxDevices);
+            mark(l.net_devices, UnappliedField::LinuxNetDevices);
+            mark(l.resources, UnappliedField::LinuxResources);
+            mark(l.cgroups_path, UnappliedField::LinuxCgroupsPath);
+            mark(l.rootfs_propagation, UnappliedField::LinuxRootfsPropagation);
+            mark(l.seccomp, UnappliedField::LinuxSeccomp);
+            mark(l.sysctl, UnappliedField::LinuxSysctl);
+            mark(l.masked_paths, UnappliedField::LinuxMaskedPaths);
+            mark(l.readonly_paths, UnappliedField::LinuxReadonlyPaths);
+            mark(l.mount_label, UnappliedField::LinuxMountLabel);
+            mark(l.intel_rdt, UnappliedField::LinuxIntelRdt);
+            mark(l.memory_policy, UnappliedField::LinuxMemoryPolicy);
+            mark(l.personality, UnappliedField::LinuxPersonality);
+            mark(l.time_offsets, UnappliedField::LinuxTimeOffsets);
+        }
+        // mounts[] は要素ごとに記録するため重複し得る。宣言順に並べて重複を除く（最大でも種別数）。
+        unapplied.sort_unstable();
+        unapplied.dedup();
+
         let process = self.process.map(|Obj(p)| convert_process(p)).transpose()?;
         let mounts = self
             .mounts
@@ -1017,6 +1239,7 @@ impl RawConfig {
             namespaces,
             uid_mappings,
             gid_mappings,
+            unapplied,
         })
     }
 }

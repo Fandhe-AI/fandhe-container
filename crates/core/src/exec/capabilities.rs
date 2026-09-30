@@ -14,8 +14,9 @@
 //! - `fork_single_threaded` による単一スレッドの子で、pivot 後・`NO_NEW_PRIVS` の前に呼ぶ。
 //!   bounding set・`capset(2)` はスレッド単位で、呼んだスレッドにしか効かない。この条件は
 //!   呼び出し側に任せず、[`apply_default_capabilities`] が `/proc/self/status` の `Threads:` が 1 で
-//!   あることを実行時に確認し、満たさない・読めないときは何も変更せず `FailedPrecondition` で失敗する
-//!   （fail-closed。他スレッドに強い capability が残ったまま `Ok` を返さない）
+//!   あることを適用の前後で実行時に確認し、事前に満たさない・読めないときは何も変更せず
+//!   `FailedPrecondition`、適用中に増えたときは `Internal` で失敗する（fail-closed。他スレッドに強い
+//!   capability が残ったまま `Ok` を返さない）。関数自体も `pub(crate)` で、外部 crate から呼べない
 //! - 許可集合は OCI 既定集合に固定し、任意の集合を渡せる公開経路は持たない（設定から危険な
 //!   capability を足せない）
 //! - bounding set は `execve` 後の uid 0 プロセスの permitted の上限を決めるため、最初に縮める。
@@ -99,14 +100,25 @@ pub struct CapabilityReport {
 
 /// 呼び出したスレッドの capability を OCI 既定集合（SEC-1）へ絞り込む。
 ///
-/// 単一スレッドの子で pivot 後・`NO_NEW_PRIVS` の前に呼ぶ前提（ステージ列への組み込みは #173）。
-/// bounding set・capset はスレッド単位で他スレッドには効かないため、`Threads:` が 1 でない（または
-/// 確認できない）場合は何も変更せず `FailedPrecondition` で失敗する（SEC-1・fail-closed）。
-pub fn apply_default_capabilities() -> Result<CapabilityReport, ExecError> {
+/// **crate 内限定**（`pub(crate)`）。外部 crate から単一スレッドでない文脈で呼べないようにし、
+/// 呼び出し経路を `sys::fork_single_threaded` の子（`exec/process.rs` のステージ列。#173 で組み込み）に
+/// 閉じる。pivot 後・`NO_NEW_PRIVS` の前に呼ぶ。
+///
+/// bounding set・capset はスレッド単位で他スレッドには効かないため、適用の前後で `Threads:` が 1
+/// であることを確認し、満たさない（または確認できない）場合は失敗する（SEC-1・fail-closed）。
+/// - 事前確認: 副作用の前に行い、満たさなければ何も変更せず `FailedPrecondition` で失敗する。
+///   `Threads: 1` のプロセスに新しいスレッドを作れるのは呼び出しスレッド自身だけで、本関数は
+///   スレッドを作らないため、確認から適用までの間に他スレッドが増えることはない
+///   （`sys::fork_single_threaded` と同じ論拠）
+/// - 事後確認: 適用後にもう一度 `Threads: 1` を確認する。万一増えていれば（呼び出し側の
+///   別経路の不具合等）`Ok` を返さず `Internal` で失敗し、権限が残った可能性を呼び出し側へ伝える
+// ステージ列へ組み込むまで（#173）呼び出し元が無い（REPAIR-3）。
+#[allow(dead_code)]
+pub(crate) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError> {
     apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut RealKernel)
 }
 
-/// 単一スレッド条件を検査してから [`apply_capabilities`] を呼ぶ。検査は副作用の前に行う。
+/// 単一スレッド条件を適用の前後で検査して [`apply_capabilities`] を呼ぶ。事前検査は副作用の前に行う。
 fn apply_capabilities_single_threaded(
     allowed: CapabilitySet,
     kernel: &mut impl CapKernel,
@@ -118,7 +130,15 @@ fn apply_capabilities_single_threaded(
             "capability drop requires a single-threaded process (Threads: 1)",
         ));
     }
-    apply_capabilities(allowed, kernel)
+    let report = apply_capabilities(allowed, kernel)?;
+    if kernel.thread_count() != Some(1) {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::CapabilityDrop,
+            "process became multi-threaded while dropping capabilities",
+        ));
+    }
+    Ok(report)
 }
 
 /// カーネルの capability 番号の上限（2 語 = 64 bit）。
@@ -267,6 +287,9 @@ pub(super) mod testing {
         pub(super) capset_arg: Option<ThreadCaps>,
         /// `thread_count` の戻り値。
         pub(super) threads: Option<u64>,
+        /// 2 回目以降の `thread_count` の戻り値（適用中にスレッドが増えた状況を作る）。`None` なら `threads` のまま。
+        pub(super) threads_later: Option<Option<u64>>,
+        pub(super) thread_queries: u32,
     }
 
     impl Fake {
@@ -286,6 +309,8 @@ pub(super) mod testing {
                 capset_noop: false,
                 capset_arg: None,
                 threads: Some(1),
+                threads_later: None,
+                thread_queries: 0,
             }
         }
     }
@@ -324,7 +349,11 @@ pub(super) mod testing {
         }
 
         fn thread_count(&mut self) -> Option<u64> {
-            self.threads
+            self.thread_queries += 1;
+            match self.threads_later {
+                Some(later) if self.thread_queries > 1 => later,
+                _ => self.threads,
+            }
         }
 
         fn set(&mut self, caps: ThreadCaps) -> Result<(), SysError> {
@@ -491,7 +520,20 @@ mod tests {
         }
     }
 
-    /// SEC-1: 公開関数はマルチスレッドの本物のプロセスで拒否し、何も変更しない。
+    /// SEC-1: 適用中にスレッドが増えた場合は `Ok` を返さず Internal で失敗する（fail-closed）。
+    #[test]
+    fn sec1_thread_appearing_during_apply_is_internal() {
+        for later in [Some(2), None] {
+            let mut k = Fake::new();
+            k.threads_later = Some(later);
+            let e = apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut k)
+                .unwrap_err();
+            assert_eq!(e.code, ErrorCode::Internal, "{later:?}");
+            assert_eq!(e.stage, IsolationStage::CapabilityDrop);
+        }
+    }
+
+    /// SEC-1: 内部関数はマルチスレッドの本物のプロセスで拒否し、何も変更しない。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn sec1_public_api_rejects_multithreaded_process() {

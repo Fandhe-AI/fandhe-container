@@ -327,17 +327,23 @@ fn mount_rights(m: &OciMount) -> AccessFs {
     let mut rights = AccessFs::READ.union(AccessFs::WRITE);
     let mut nodev = false;
     let mut writable = true;
+    let mut exec = true;
     for opt in m.options() {
         match opt.as_str() {
             "ro" => writable = false,
             "rw" => writable = true,
-            "noexec" => rights = rights.difference(AccessFs::EXECUTE),
+            "noexec" => exec = false,
+            "exec" => exec = true,
             "nodev" => nodev = true,
             _ => {}
         }
     }
     if !writable {
         rights = rights.difference(AccessFs::WRITE);
+    }
+    // noexec / exec も ro / rw と同様に最後のオプションが勝つ。
+    if !exec {
+        rights = rights.difference(AccessFs::EXECUTE);
     }
     if m.fs_type().is_some_and(|t| PSEUDO_FS.contains(&t)) {
         rights = rights.difference(AccessFs::WRITE);
@@ -537,6 +543,7 @@ mod tests {
                 {"destination": "/b", "options": ["rw", "ro"]},
                 {"destination": "/c", "options": ["ro", "rw"]},
                 {"destination": "/d", "options": ["noexec"]},
+                {"destination": "/e", "options": ["noexec", "exec"]},
                 {"destination": "/dev", "options": ["nodev"]},
             ]),
         );
@@ -553,6 +560,7 @@ mod tests {
                 .union(AccessFs::READ_DIR)
                 .union(AccessFs::WRITE)
         );
+        assert!(rule(&rs, "/e").allowed.contains(AccessFs::EXECUTE));
         assert!(
             rule(&rs, "/dev")
                 .allowed

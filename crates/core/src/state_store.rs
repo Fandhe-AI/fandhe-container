@@ -265,7 +265,7 @@ impl FileStateStore {
     fn read_record(&self, id: &ContainerId) -> Result<Option<StateRecord>, TraitError> {
         let dir = self.record_dir(id);
         match fs::symlink_metadata(&dir) {
-            Ok(m) if m.is_dir() => {}
+            Ok(m) if m.is_dir() => verify_record_dir(&m)?,
             Ok(_) => {
                 return Err(err(
                     ErrorCode::PermissionDenied,
@@ -351,6 +351,14 @@ impl FileStateStore {
         {
             return Err(internal("revision high-water mark is behind the record"));
         }
+        // ストア全体で単調採番する契約のため、更新・新規作成を問わず全レコードの revision が
+        // ハイウォーターマーク未満であることを確認する（`@revision` の巻き戻りで使用済み
+        // revision を別コンテナへ払い出さない。fail-closed）。
+        if let Some(max) = self.max_record_revision()?
+            && max >= current.value()
+        {
+            return Err(internal("revision high-water mark is behind the records"));
+        }
         let next = current.next()?;
         write_file_replacing(
             &self.root,
@@ -358,6 +366,31 @@ impl FileStateStore {
             next.value().to_string().as_bytes(),
         )?;
         Ok(current)
+    }
+
+    /// 全レコードの revision の最大値（レコードが無ければ `None`）。ロック保持下で呼ぶこと。
+    fn max_record_revision(&self) -> Result<Option<u64>, TraitError> {
+        let entries =
+            fs::read_dir(&self.root).map_err(|_| internal("failed to read the state root"))?;
+        let mut max: Option<u64> = None;
+        for entry in entries {
+            let entry = entry.map_err(|_| internal("failed to read the state root"))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(id) = ContainerId::new(&name) else {
+                continue;
+            };
+            // state.json の無い残骸ディレクトリは存在しないものとして読まない。
+            if !self.has_record(&name) {
+                continue;
+            }
+            if let Some(rec) = self.read_record(&id)? {
+                let v = rec.revision().value();
+                max = Some(max.map_or(v, |m| m.max(v)));
+            }
+        }
+        Ok(max)
     }
 
     fn any_record(&self) -> Result<bool, TraitError> {
@@ -393,7 +426,7 @@ impl StateStore for FileStateStore {
                 // 残骸ディレクトリの再利用。symlink などは read_record が拒否済みだが、
                 // 種別を再確認してから書く（多重防御）。
                 match fs::symlink_metadata(&dir) {
-                    Ok(m) if m.is_dir() => {}
+                    Ok(m) if m.is_dir() => verify_record_dir(&m)?,
                     _ => {
                         return Err(err(
                             ErrorCode::PermissionDenied,
@@ -609,6 +642,34 @@ fn verify_root(path: &Path) -> Result<(), TraitError> {
             ));
         }
     }
+    Ok(())
+}
+
+/// レコードディレクトリ `<id>/` が第三者に改変されないか検査する（unix）。
+///
+/// group / other の権限ビットが 1 つでもあれば（0700 限定）、Linux では加えて所有者が
+/// 現在のユーザーでなければ `PermissionDenied`（残存ディレクトリの再利用・読み取り前に
+/// 呼ぶ。`state.json` 改変・bundle すり替えの防止。OCI-5）。Windows の ACL 検査は未実装（REPAIR-3）。
+fn verify_record_dir(meta: &fs::Metadata) -> Result<(), TraitError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o077 != 0 {
+            return Err(err(
+                ErrorCode::PermissionDenied,
+                "state directory must not be accessible by group or others",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if meta.uid() != crate::sys::effective_uid() {
+            return Err(err(
+                ErrorCode::PermissionDenied,
+                "state directory must be owned by the current user",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = meta;
     Ok(())
 }
 
@@ -1025,8 +1086,50 @@ mod tests {
     fn oci5_create_ignores_residual_dir_without_state_json() {
         let t = TmpDir::new("resid");
         let store = t.open();
-        fs::create_dir(t.path().join("a")).unwrap();
+        let resid = t.path().join("a");
+        fs::create_dir(&resid).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&resid, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         assert_eq!(create(&store, "a").id().as_str(), "a");
+    }
+
+    /// OCI-5: 他ユーザーがアクセスできる残存ディレクトリは再利用・読み取りとも拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci5_create_rejects_group_accessible_residual_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TmpDir::new("residperm");
+        let store = t.open();
+        let resid = t.path().join("a");
+        fs::create_dir(&resid).unwrap();
+        fs::set_permissions(&resid, fs::Permissions::from_mode(0o755)).unwrap();
+        let req = CreateStateRequest::new(ContainerStatus::creating(cid("a")), bundle()).unwrap();
+        assert_eq!(code(store.create(&req)), "PERMISSION_DENIED");
+        assert!(!resid.join("state.json").exists());
+        // 既存レコードのディレクトリが緩められた場合は get も拒否する。
+        let rec = create(&store, "b");
+        fs::set_permissions(t.path().join("b"), fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(
+            code(store.get(&GetStateRequest::new(cid("b")))),
+            "PERMISSION_DENIED"
+        );
+        let _ = rec;
+    }
+
+    /// OCI-5: `@revision` が巻き戻った状態で新規作成しても使用済み revision を払い出さない。
+    #[test]
+    fn oci5_create_fails_closed_when_revision_high_water_mark_is_behind() {
+        let t = TmpDir::new("hwmcreate");
+        let store = t.open();
+        create(&store, "a");
+        create(&store, "b");
+        fs::write(t.path().join("@revision"), b"0").unwrap();
+        let req = CreateStateRequest::new(ContainerStatus::creating(cid("c")), bundle()).unwrap();
+        assert_eq!(code(store.create(&req)), "INTERNAL");
+        assert!(!t.path().join("c").join("state.json").exists());
     }
 
     #[test]

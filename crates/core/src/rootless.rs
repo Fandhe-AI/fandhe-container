@@ -18,10 +18,14 @@
 //!   （`MapperReply`）で返す。エラーは `ExecError`（段 `UserNamespaceMap`）へ写す
 //! - 写像はカーネルが write-once（1 回しか受け付けない）。途中で失敗した対象プロセスは
 //!   破棄すること（再設定できない）
-//! - pid 再利用（TOCTOU）対策: pidfd は**採らない**（新規 FFI を避ける）。mapper の書き込み先は
-//!   自分の親で、親は応答待ちでブロックしているため解放・再利用されず、書き込み直前の
-//!   `parent_id()` 再確認で reparent の窓も閉じる。単独で [`apply_id_maps`] を呼ぶ場合は、
-//!   対象を reap する前（`Child` を保持した状態）に呼ぶこと
+//! - pid 再利用（TOCTOU）対策: 書き込み先は pid 番号ではなく、対象の `/proc/<pid>` ディレクトリ fd
+//!   （[`ProcHandle`]）で固定する。mapper は先に fd を開き、その**後**に `parent_id()` が期待した親のまま
+//!   であることを確認する（開いた時点で pid は生きた親を指していたと言える）。以後の書き込み・読み戻しは
+//!   fd 経由（`/proc/self/fd/N/...`）で、対象が死んで pid が再利用されても別プロセスへは届かず失敗する。
+//!   `newuidmap` / `newgidmap` にも pid 文字列ではなく `fd:0`（stdin に渡した同じ fd）を渡す
+//!   （shadow の `fd:N` 形式。未対応の版ではヘルパーが失敗し fail-closed になる）。新規 FFI は不要
+//!   （pidfd は採らない）。単独で [`apply_id_maps`] を呼ぶ場合は pid から fd を開くため、対象を reap する前
+//!   （`Child` を保持した状態）に呼ぶこと
 //! - SEC-5: ホスト ID 0 を含む写像と、コンテナ内 0 を持たない写像は [`IdMapSet::new`] が拒否する
 //!
 //! # rootless 経路の操作対応表（CORE-6・SEC-5。root 権限を要する操作の回避・代替）
@@ -477,9 +481,37 @@ impl TargetPid {
     pub fn get(&self) -> u32 {
         self.0
     }
+}
 
+/// 対象プロセスの `/proc/<pid>` ディレクトリ fd。pid 番号ではなくプロセス同一性へ書き込み先を固定する
+/// （SEC-5・CORE-6・TASK-40.2。pid 再利用の TOCTOU 対策）。
+///
+/// fd を開いた後に対象が終了すると、fd 配下のファイル open は `ENOENT` / `ESRCH` で失敗し、同じ pid を
+/// 得た別プロセスへは届かない。
+#[derive(Debug)]
+pub struct ProcHandle {
+    dir: std::fs::File,
+    pid: TargetPid,
+}
+
+impl ProcHandle {
+    /// `/proc/<pid>` を開く。呼び出し側は、開いた**後**に対象が期待したプロセスのままであること
+    /// （例: `parent_id()`）を確認すること。
+    pub fn open(pid: TargetPid) -> Result<Self, RootlessError> {
+        let dir = std::fs::File::open(format!("/proc/{}", pid.0))
+            .map_err(|e| io_error(RootlessStage::Validate, "open target proc directory", &e))?;
+        Ok(Self { dir, pid })
+    }
+
+    /// 対象 pid（表示・検証用。書き込み先の解決には使わない）。
+    pub fn pid(&self) -> TargetPid {
+        self.pid
+    }
+
+    /// fd 配下のファイルのパス（`/proc/self/fd/N/<name>`。fd の指すプロセスへ解決される）。
     fn proc_file(&self, name: &str) -> PathBuf {
-        PathBuf::from(format!("/proc/{}/{name}", self.0))
+        use std::os::fd::AsRawFd as _;
+        PathBuf::from(format!("/proc/self/fd/{}/{name}", self.dir.as_raw_fd()))
     }
 }
 
@@ -677,7 +709,7 @@ fn sanitize_stderr(raw: &[u8]) -> String {
 /// 非 root は残る窓でも差し替えられない）。
 fn run_helper(
     paths: &HelperPaths,
-    pid: TargetPid,
+    target: &ProcHandle,
     set: &IdMapSet,
     kind: IdKind,
     timeout: Duration,
@@ -691,15 +723,20 @@ fn run_helper(
             "helper was replaced after validation",
         ));
     }
+    // 対象は pid 番号ではなく `/proc/<pid>` fd（stdin = fd 0）で渡す（pid 再利用対策）。
+    let stdin_fd = target
+        .dir
+        .try_clone()
+        .map_err(|e| io_error(stage, "duplicate target proc directory", &e))?;
     let mut cmd = Command::new(path);
-    cmd.arg(pid.get().to_string());
+    cmd.arg("fd:0");
     for e in set.entries() {
         cmd.arg(e.container_id.to_string())
             .arg(e.host_id.to_string())
             .arg(e.count.to_string());
     }
     cmd.env_clear()
-        .stdin(Stdio::null())
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(stdin_fd)))
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let mut child = cmd
@@ -789,8 +826,13 @@ pub fn parse_id_map(bytes: &[u8]) -> Result<Vec<IdMapping>, RootlessError> {
 
 /// `/proc/<pid>/{uid,gid}_map` を上限付きで読んで解析する。
 pub fn read_id_map(pid: TargetPid, kind: IdKind) -> Result<Vec<IdMapping>, RootlessError> {
+    read_id_map_of(&ProcHandle::open(pid)?, kind)
+}
+
+/// [`ProcHandle`] の指すプロセスの map を上限付きで読んで解析する。
+pub fn read_id_map_of(target: &ProcHandle, kind: IdKind) -> Result<Vec<IdMapping>, RootlessError> {
     let stage = RootlessStage::Verify;
-    let f = std::fs::File::open(pid.proc_file(kind.map_file()))
+    let f = std::fs::File::open(target.proc_file(kind.map_file()))
         .map_err(|e| io_error(stage, "open id map", &e))?;
     let mut buf = Vec::new();
     f.take(MAX_PROC_MAP_BYTES + 1)
@@ -817,8 +859,19 @@ pub fn apply_id_maps(
     writer: &IdMapWriter,
     timeout: Duration,
 ) -> Result<IdMapReport, RootlessError> {
+    apply_id_maps_to(&ProcHandle::open(pid)?, uid, gid, writer, timeout)
+}
+
+/// 開いた [`ProcHandle`] の指すプロセスへ写像を設定する（pid 再利用に耐える本体。CORE-6・SEC-5）。
+pub fn apply_id_maps_to(
+    target: &ProcHandle,
+    uid: &IdMapSet,
+    gid: &IdMapSet,
+    writer: &IdMapWriter,
+    timeout: Duration,
+) -> Result<IdMapReport, RootlessError> {
     apply_id_maps_as(
-        pid,
+        target,
         uid,
         gid,
         writer,
@@ -830,7 +883,7 @@ pub fn apply_id_maps(
 
 /// euid / egid を注入できる本体（事前検証をテストするため分離）。
 fn apply_id_maps_as(
-    pid: TargetPid,
+    pid: &ProcHandle,
     uid: &IdMapSet,
     gid: &IdMapSet,
     writer: &IdMapWriter,
@@ -873,7 +926,7 @@ fn apply_id_maps_as(
         }
     };
     for (k, set) in [(IdKind::Uid, uid), (IdKind::Gid, gid)] {
-        let got = read_id_map(pid, k)?;
+        let got = read_id_map_of(pid, k)?;
         if got != set.entries() {
             return Err(RootlessError::new(
                 ErrorCode::Internal,
@@ -980,9 +1033,9 @@ impl MapperReply {
 
 /// mapper の処理本体（fork 子が呼ぶ。成功なら終了コード 0、失敗なら 1）。
 ///
-/// 流れ: `sock` から [`MAPPER_GO`] を `timeout` まで待つ → 親が最初の親 `expected_parent` のままで
-/// あることを `parent_id()` で再確認する（reparent 後に無関係な pid へ書かない。pid 再利用・
-/// TOCTOU 対策。pidfd は採らない）→ [`apply_id_maps`] を親 pid に対して実行 → 応答フレームを返す。
+/// 流れ: `sock` から [`MAPPER_GO`] を `timeout` まで待つ → 親の `/proc/<pid>` fd を開いたうえで、親が
+/// 最初の親 `expected_parent` のままであることを `parent_id()` で再確認する（reparent 後に無関係な
+/// pid へ書かない。pid 再利用・TOCTOU 対策）→ [`apply_id_maps_to`] を fd に対して実行 → 応答フレームを返す。
 /// 親が死んでも mapper 側の fd は閉じられず EOF を当てにできないため、待ちは read タイムアウトで
 /// 止める（REPAIR-5）。詳細は stderr へ出す（自由形式の文字列は応答に載せない）。
 pub(crate) fn run_id_map_mapper(
@@ -1036,6 +1089,10 @@ fn mapper_outcome(
             "unexpected go signal byte",
         ));
     }
+    // 先に `/proc/<pid>` fd を確保し、その後で親が変わっていないことを確認する。親が生きていれば
+    // （= reparent されていなければ）fd は確実に元の親を指す。以後の書き込みは fd 経由のため、
+    // 確認後に親が死んで pid が再利用されても別プロセスへは届かない（SEC-5・TASK-40.2）。
+    let handle = ProcHandle::open(TargetPid::new(expected_parent)?)?;
     if std::os::unix::process::parent_id() != expected_parent {
         return Err(RootlessError::new(
             ErrorCode::FailedPrecondition,
@@ -1043,8 +1100,7 @@ fn mapper_outcome(
             "the parent process changed before the mapping was written",
         ));
     }
-    let pid = TargetPid::new(expected_parent)?;
-    apply_id_maps(pid, uid, gid, writer, timeout).map(|_| ())
+    apply_id_maps_to(&handle, uid, gid, writer, timeout).map(|_| ())
 }
 
 #[cfg(test)]
@@ -1238,7 +1294,8 @@ mod tests {
         assert!(check_direct_allowed(&range, &single, 1000, 1000).is_err());
         assert!(check_direct_allowed(&single, &single, 1001, 1000).is_err());
         assert!(check_direct_allowed(&range, &range, 0, 0).is_ok());
-        let pid = TargetPid::new(std::process::id()).expect("pid");
+        let pid = ProcHandle::open(TargetPid::new(std::process::id()).expect("pid")).expect("fd");
+        let pid = &pid;
         let e = apply_id_maps_as(
             pid,
             &range,

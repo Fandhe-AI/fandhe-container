@@ -1720,6 +1720,56 @@ mod tests {
         assert_eq!(code(store.list(&list_req(10))), "PERMISSION_DENIED");
     }
 
+    /// OCI-5: ファイル種別が異常なエントリ（`<id>` が symlink・通常ファイル、`state.json` が
+    /// symlink・ディレクトリ）は破損として特定・回復でき、symlink のリンク先は消さない。
+    #[test]
+    fn oci5_malformed_entries_are_found_and_purged_without_following_symlinks() {
+        let t = TmpDir::new("malformed");
+        let store = t.open();
+        for id in ["a", "c", "d"] {
+            create(&store, id);
+        }
+        // ルート外のファイル（ルート直下に置くと、それ自体が異常なエントリになる）。
+        let other = TmpDir::new("malformed-outside");
+        let outside = other.path().join("target.json");
+        fs::write(&outside, b"keep").unwrap();
+        // <id> が symlink（健全なレコード a を指す）と通常ファイル。
+        std::os::unix::fs::symlink(t.path().join("a"), t.path().join("b")).unwrap();
+        fs::write(t.path().join("e"), b"x").unwrap();
+        // state.json が symlink（ルート外のファイルを指す）とディレクトリ（中身あり）。
+        let c_state = t.path().join("c").join("state.json");
+        fs::remove_file(&c_state).unwrap();
+        std::os::unix::fs::symlink(&outside, &c_state).unwrap();
+        let d_state = t.path().join("d").join("state.json");
+        fs::remove_file(&d_state).unwrap();
+        fs::create_dir(&d_state).unwrap();
+        fs::write(d_state.join("inner"), b"x").unwrap();
+
+        let e = store.get(&GetStateRequest::new(cid("c"))).unwrap_err();
+        assert_eq!(e.message(), "state file is not a regular file");
+        assert_eq!(
+            store.find_corrupted().unwrap(),
+            vec![cid("b"), cid("c"), cid("d"), cid("e")]
+        );
+        for id in ["b", "c", "d", "e"] {
+            store.purge_corrupted(&cid(id)).unwrap();
+        }
+        assert!(!t.path().join("b").exists());
+        assert!(!t.path().join("c").exists());
+        assert!(!t.path().join("d").exists());
+        assert!(!t.path().join("e").exists());
+        // リンク先（健全なレコード a・ルート外のファイル）は残る。
+        assert_eq!(fs::read(&outside).unwrap(), b"keep");
+        let ids: Vec<String> = store
+            .list(&list_req(10))
+            .unwrap()
+            .records()
+            .iter()
+            .map(|r| r.id().as_str().to_owned())
+            .collect();
+        assert_eq!(ids, ["a"]);
+    }
+
     #[test]
     fn oci5_unsupported_oci_version_returns_internal() {
         let t = TmpDir::new("ociver");

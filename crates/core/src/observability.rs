@@ -535,19 +535,28 @@ impl OpRecorder {
 
     /// 全操作の集計スナップショットを名前の昇順で返す。
     pub fn snapshot(&self) -> Vec<OpStats> {
-        let mut copies: Vec<AccSnapshot> = {
+        self.snapshot_with_dropped().0
+    }
+
+    /// 集計と落とした件数を 1 回のロックで同一時点として取得する内部メソッド。
+    ///
+    /// `export_json_lines` のメタ行（`ops` と `dropped_records`）の整合性を保証する。
+    fn snapshot_with_dropped(&self) -> (Vec<OpStats>, u64) {
+        let (mut copies, dropped): (Vec<AccSnapshot>, u64) = {
             let state = self.lock();
-            state
+            let copies = state
                 .ops
                 .iter()
                 .map(|(name, acc)| acc.copy_out(name.clone()))
-                .collect()
+                .collect();
+            (copies, state.dropped)
         };
         copies.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
-        copies
+        let stats = copies
             .into_iter()
             .filter_map(AccSnapshot::into_stats)
-            .collect()
+            .collect();
+        (stats, dropped)
     }
 
     /// 指定した操作の集計スナップショットを返す（未記録なら `None`）。
@@ -586,8 +595,7 @@ impl OpRecorder {
         &self,
         sink: Option<&mut dyn Write>,
     ) -> Result<ExportReport, TraitError> {
-        let stats = self.snapshot();
-        let dropped = self.dropped_records();
+        let (stats, dropped) = self.snapshot_with_dropped();
         let ops = stats.len();
         let Some(w) = sink else {
             return Ok(ExportReport {

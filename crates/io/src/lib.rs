@@ -58,7 +58,9 @@
 //!
 //! read / write 操作の計装連携点（[`instrument::IoOpRecorder`]。TASK-84.5・REPAIR-4）は
 //! core を参照しない io 内のトレイトで、core の `OpRecorder` への接続は上位 crate の
-//! アダプタが担う（実計装は TASK-84.7）。
+//! アダプタが担う。write 経路の実計装は TASK-84.7 で組み込み済みで、入口は
+//! [`writeback::serve_connection_with_recorder`] / [`settings::BoundConnection::serve_with_recorder`]
+//! （既存の `serve_*` は計装しない版）。read は現状 io にファイル読み出し経路がなく未計装（REPAIR-3）。
 //!
 //! PLUG-1 区分は core（`fandhe-container-plugin` の境界機構とは別に、コアの一部として
 //! 直接リンクされる）。crate 名 `fandhe-container-io` は
@@ -142,4 +144,5 @@ pub use transport::{
 pub use writeback::{
     AppendFileSink, BatchSink, SinkOpenMode, SinkPersistReport, SinkWriteReport, WritebackReport,
     WritebackStats, WritebackTimeouts, serve_connection, serve_connection_with_limit,
+    serve_connection_with_recorder,
 };

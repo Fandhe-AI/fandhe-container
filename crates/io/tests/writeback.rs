@@ -962,6 +962,66 @@ mod unix {
         let read_bytes = client_thread.join().expect("client thread must not panic");
         assert_eq!(read_bytes, 0, "no ack bytes must be received");
     }
+
+    /// テスト専用の収集型記録先（`IoOpRecorder` 実装）。
+    #[derive(Default)]
+    struct CollectRecorder(std::sync::Mutex<Vec<fandhe_container_io::IoOpSample>>);
+
+    impl fandhe_container_io::IoOpRecorder for CollectRecorder {
+        fn record_io_op(&self, sample: &fandhe_container_io::IoOpSample) {
+            if let Ok(mut v) = self.0.lock() {
+                v.push(*sample);
+            }
+        }
+    }
+
+    /// REPAIR-4・TASK-84.7・IO-1: 実 UDS 上で `BoundConnection::serve_with_recorder` を使うと、
+    /// バッチ（batch_size 2・Write 4 件 = 2 バッチ）ごとに Write/Success が記録先へ届く。
+    #[test]
+    fn repair4_uds_writeback_records_write_samples() {
+        use fandhe_container_io::{IoOpKind, IoOpOutcome};
+
+        let dir = TempSocketDir::new();
+        let socket_path = dir.socket_path();
+        let settings =
+            WritebackSettings::from_batch_size_arg("2").expect("2 must be a valid batch size");
+        let mut server = settings
+            .bind(&socket_path, NoopServerObserver)
+            .expect("bind must succeed on a private, empty path");
+
+        let connect_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = connect(&connect_path);
+            let mut acked = Vec::new();
+            for id in 0..4u64 {
+                send_write(&mut stream, id, &id.to_le_bytes());
+            }
+            for _ in 0..4 {
+                acked.push(ack_id(&recv_frame(&mut stream)));
+            }
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("shutdown write half");
+            let _ = collect_until_eof(&mut stream);
+            acked
+        });
+
+        let mut connection = server
+            .accept(test_timeout(), NoopServerObserver)
+            .expect("server must accept the client connection within the timeout");
+        let mut sink = dir.output_sink();
+        let recorder = CollectRecorder::default();
+
+        let report = connection.serve_with_recorder(&mut sink, writeback_timeouts(), &recorder);
+        drop(connection);
+        let acked = client_thread.join().expect("client thread must not panic");
+
+        assert_eq!(acked, vec![0, 1, 2, 3]);
+        assert_eq!(report.stats.batches_written, 2);
+        let samples = recorder.0.lock().expect("recorder lock").clone();
+        let pairs: Vec<_> = samples.iter().map(|s| (s.kind(), s.outcome())).collect();
+        assert_eq!(pairs, vec![(IoOpKind::Write, IoOpOutcome::Success); 2]);
+    }
 }
 
 /// 非対応 OS（Windows）では `UdsServer::bind` が常に `Unimplemented` を返す

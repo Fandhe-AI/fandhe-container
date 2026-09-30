@@ -20,7 +20,9 @@
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
 //!    → Landlock → seccomp（#136・#832・#833。**枠と `NO_NEW_PRIVS` は実装済み**: [`StagePipeline`] が
 //!    [`StageKind::ORDER`] の固定順でフックを呼び、`NO_NEW_PRIVS` は差し替え不可の組み込み段として
-//!    常に適用する。他の段の実体は未実装で、後続の TASK-32・37・38・39・40 が [`StageHook`] として
+//!    常に適用する。capability の絞り込み処理は [`apply_default_capabilities`]（SEC-1・TASK-37.1・#172）
+//!    として実装済みだが、ステージ列へはまだ組み込んでいない（#173）。制限の証跡も未実装のため exec は
+//!    引き続き拒否される。他の段の実体は未実装で、後続の TASK-32・37・38・39・40 が [`StageHook`] として
 //!    差し込む）。
 //!    `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
 //!    後続実装はこの順序を崩さない
@@ -76,6 +78,7 @@ use std::path::{Component, Path};
 use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
 
+mod capabilities;
 mod devices;
 mod no_new_privs;
 mod process;
@@ -83,6 +86,7 @@ mod rootfs;
 mod stages;
 mod violation;
 
+pub use capabilities::{CapabilityReport, apply_default_capabilities};
 pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_default_devices};
 pub use process::{
     ChildExit, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,

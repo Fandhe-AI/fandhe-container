@@ -20,7 +20,7 @@
 //!
 //! - **最小構成（フック無し）**: 子はステージ列（[`StagePipeline`]。#832）を `run_child` の pivot 後・
 //!   exec 前で固定順に実行する。組み込みの `PR_SET_NO_NEW_PRIVS`（#833）は空のパイプラインでも適用される
-//!   が、**capability 削減・seccomp・Landlock・cgroup 参加は未適用**（実体は TASK-32・37〜40 が差し込む）。
+//!   が、**Landlock・cgroup 参加は未適用**（実体は TASK-32・39・40 が差し込む。capability 削減は #173、seccomp は #178 で組み込み済み）。
 //!   そのため制限が未適用の子（rootful 経路のホスト root 権限のままの子を含む）は、
 //!   `exec_entrypoint` が `PermissionDenied` で exec を拒否する（SEC-1・CORE-5。制限を適用できる
 //!   ようになるまで fail-closed。REPAIR-3: 実装済みを装わない）
@@ -76,8 +76,8 @@ use crate::sys::{self, Signal, SysError};
 use crate::traits::types::ErrorCode;
 
 use super::{
-    ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline, ViolationReason,
-    describe, fd_mount_id, pivot_root, prepare_rootfs,
+    CapabilityReport, ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline,
+    ViolationReason, describe, fd_mount_id, pivot_root, prepare_rootfs,
 };
 
 /// argv の要素数の上限（アロケーション前に検証する）。
@@ -253,14 +253,19 @@ fn exit_code_for(err: &ExecError) -> i32 {
 /// `/proc/self/status` の `NoNewPrivs`・`Seccomp`・`CapEff` は、親から継承した制限と子のステージが
 /// 適用した制限を区別できず、seccomp フィルタの中身も確認できないため、証跡として扱わない。
 /// `PR_SET_NO_NEW_PRIVS` は #833 で組み込みステージとして実装済みだが単独では証跡にせず、
-/// capability 削減・seccomp・Landlock のステージの実体（TASK-37〜39）が未実装の間は
-/// 常に `PermissionDenied` を返す。ステージ実装時は、各ステージが適用完了を示す証跡型を返し、
-/// それを本関数の引数に取って初めて許可する形へ置き換える（REPAIR-3: 実装済みを装わない）。
-fn require_restriction_evidence() -> Result<(), ExecError> {
+/// capability 削減は #173（TASK-37.2）で組み込み段になり、その [`CapabilityReport`] を引数で受け取る
+/// が、Landlock のステージの実体（TASK-39.3・39.4、#183・#184）が未実装の間は引数の有無によらず
+/// 常に `PermissionDenied` を返す。seccomp は #178（TASK-38.3）で組み込み段として適用されるが、
+/// 証跡型が未確定のため本関数へは配線しない（#184 で決める）。ステージ実装時は、各ステージが
+/// 適用完了を示す証跡型（形は TASK-38・TASK-39 で決める）を返し、それを本関数の引数に取って
+/// 初めて許可する形へ置き換える（REPAIR-3: 実装済みを装わない）。
+fn require_restriction_evidence(
+    _capability_report: Option<&CapabilityReport>,
+) -> Result<(), ExecError> {
     Err(ExecError::new(
         ErrorCode::PermissionDenied,
         IsolationStage::Exec,
-        "refusing to exec: no evidence that the isolation restrictions were applied (capability drop, seccomp and Landlock stages are not implemented yet)",
+        "refusing to exec: no evidence that the isolation restrictions were applied (the Landlock stage is not implemented yet)",
     ))
 }
 
@@ -276,7 +281,7 @@ pub fn exec_entrypoint(
     entry: &Entrypoint,
 ) -> Result<Infallible, ExecError> {
     isolation.verify_caller(IsolationStage::Exec)?;
-    require_restriction_evidence()?;
+    require_restriction_evidence(None)?;
     exec_entrypoint_verified(pivot.new_root_mnt_id, entry)
 }
 
@@ -622,11 +627,96 @@ fn run_child(
     entry: &Entrypoint,
     stages: StagePipeline,
 ) -> Result<Infallible, ExecError> {
+    run_child_then(rootfs, stages, |isolation, report, capability_report| {
+        // `exec_entrypoint` と同じ検証を、capability 削減の結果を添えて行う。
+        isolation.verify_caller(IsolationStage::Exec)?;
+        require_restriction_evidence(capability_report)?;
+        exec_entrypoint_verified(report.new_root_mnt_id, entry)
+    })
+}
+
+/// 子の前段（`establish` → `prepare_rootfs` → `pivot_root` → ステージ列）を共通化した本体。
+///
+/// 終端 `terminal` は組み込みステージ（capability 削減・`NO_NEW_PRIVS`・seccomp）の通過後にだけ呼ばれる。
+/// 本番の `run_child` は exec を、結合試験専用の [`spawn_container_seccomp_probe`] は exec の代わりに
+/// プローブを渡す。exec を呼べるのは `run_child` の終端だけで、fail-closed（`require_restriction_evidence`）
+/// は変わらない。
+fn run_child_then<T>(
+    rootfs: &Path,
+    stages: StagePipeline,
+    terminal: impl FnOnce(
+        &MountIsolation,
+        &PivotReport,
+        Option<&CapabilityReport>,
+    ) -> Result<T, ExecError>,
+) -> Result<T, ExecError> {
     let isolation = MountIsolation::establish()?;
     let prepared = prepare_rootfs(&isolation, rootfs)?;
     let report = pivot_root(&isolation, prepared)?;
-    // pivot 後・exec 前にステージ列を固定順で実行する。exec は終端クロージャからしか呼ばれない。
-    stages.run_then(|_stage_report| exec_entrypoint(&isolation, &report, entry))
+    // pivot 後・終端前にステージ列を固定順で実行する。
+    stages.run_then(|_stage_report, capability_report| {
+        terminal(&isolation, &report, capability_report)
+    })
+}
+
+/// 子のメイン（プローブ版）。失敗は `child_main` と同じ規約で stderr へ 1 行出して終了コードにする。
+fn child_main_probe(rootfs: &Path, stages: StagePipeline) -> i32 {
+    let result = run_child_then(rootfs, stages, |_isolation, _report, _caps| {
+        let record = super::seccomp::probe_denied_syscalls()?;
+        publish_probe_record(&record.render())
+    });
+    match result {
+        Ok(()) => 0,
+        Err(err) => {
+            let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
+            exit_code_for(&err)
+        }
+    }
+}
+
+/// 記録を pivot 後の `/seccomp-probe.tmp` へ `create_new` で書き、`/seccomp-probe` へハードリンクして
+/// から一時名を消す（`link` は宛先が存在すれば `EEXIST` で失敗するため、既存ファイル・symlink を
+/// 上書き・追従しない。`rename` は宛先を黙って置換するため使わない。親はリンク後の完成品だけを読む）。
+fn publish_probe_record(text: &str) -> Result<(), ExecError> {
+    let fail = |e: std::io::Error| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Seccomp,
+            format!("failed to publish seccomp probe record: {e}"),
+        )
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open("/seccomp-probe.tmp")
+        .map_err(fail)?;
+    f.write_all(text.as_bytes()).map_err(fail)?;
+    drop(f);
+    let linked = std::fs::hard_link("/seccomp-probe.tmp", "/seccomp-probe");
+    // 一時名は成否に関わらず片付ける（リンク失敗を優先して報告する）。
+    let removed = std::fs::remove_file("/seccomp-probe.tmp");
+    linked.map_err(fail)?;
+    removed.map_err(fail)
+}
+
+/// 結合試験専用: exec の代わりに禁止 syscall のプローブを実行する子を fork する（CORE-5・TASK-38.4・#179）。
+///
+/// 呼び出し文脈は `tests/seccomp.rs` のシナリオ（`isolate` 済みの親）。`spawn_container_with_stages` と
+/// 同じ前段（pivot 済み・capability 削減・`NO_NEW_PRIVS`・組み込み seccomp）を通した後、終端で
+/// `<rootfs>/seccomp-probe` へ記録を書いて終了コード 0 で終わる。exec は呼ばないため、権限は
+/// `spawn_container` と同じで昇格経路は増えない。通常の利用者は呼ばない。
+///
+/// # 将来仕様（記録のみ）
+///
+/// exec が許可されたら（TASK-39.4・#184）、エントリポイント内のプローブへ移して本関数は廃止する（REPAIR-3）。
+#[doc(hidden)]
+pub fn spawn_container_seccomp_probe(
+    rootfs: &Path,
+    stages: StagePipeline,
+) -> Result<ContainerChild, ExecError> {
+    let pid = sys::fork_single_threaded(|| child_main_probe(rootfs, stages), EXIT_SETUP_FAILED)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    Ok(ContainerChild::new(pid))
 }
 
 /// 分離済み（`isolate` / `isolate_rootful_host_root` の後）の親から子を fork し、子で
@@ -665,8 +755,9 @@ const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 子の回収状態（[`ContainerChild`] の `Mutex` が保護する）。
 ///
-/// 遷移は `Running` → `Killed` → `Reaped`、または `Running` → `Reaped` の一方向のみ。`Reaped` の後は
-/// pid がカーネルに返却済みで別プロセスへ再利用され得るため、`kill` も `waitpid` も呼ばない。
+/// 遷移は `Running` → `Killed` → `Reaped`、`Running` → `Reaped`、または `Running` / `Killed` → `Lost` の
+/// 一方向のみ。`Reaped` と `Lost` の後は pid がカーネルに返却済みで別プロセスへ再利用され得るため、
+/// `kill` も `waitpid` も呼ばない（終端状態）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReapState {
     /// 未回収で、期限超過の `SIGKILL` もまだ送っていない。
@@ -675,6 +766,21 @@ enum ReapState {
     Killed,
     /// 回収済み。`killed` は期限超過の `SIGKILL` の後に回収したか（`Timeout` の判定に使う）。
     Reaped { exit: ChildExit, killed: bool },
+    /// 契約外の回収者に回収された（`waitpid` が `ECHILD`、または `kill` が `ESRCH`）。終了状態は失われ、
+    /// pid は再利用され得るため以後 `kill` も `waitpid` も呼ばない終端状態。
+    Lost,
+}
+
+/// [`ContainerChild::send_signal`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SignalDelivery {
+    /// 未回収の子へシグナルを送った（終了は待たない）。
+    Delivered,
+    /// 既に回収済みのため送らなかった（記録済みの終了状態）。
+    AlreadyExited(ChildExit),
+    /// 子が既に存在しなかった（`ESRCH`。契約外の回収者による回収）ため送らなかった。
+    Gone,
 }
 
 /// `Mutex` の中身。`kills_sent` は実際に送った `SIGKILL` の回数（高々 1。テストの照合用）。
@@ -698,6 +804,9 @@ type Observed = (ChildExit, bool);
 /// `waitpid(WNOHANG)` / `kill` の間だけ持ち、ポーリングの sleep 中は持たない（各呼び出し元の期限を
 /// 守る）。この保証は「このハンドルが当該 pid の唯一の回収者」であることを前提とし、同じプロセスの
 /// 他所での `waitpid(-1)`・`SIGCHLD` の `SIG_IGN` / `SA_NOCLDWAIT` による自動回収は契約外。
+/// 契約外の回収との競合に備え、シグナルは fork 直後に開いた pidfd 経由で送る（`pidfd_send_signal`。
+/// 回収・pid 再利用後は `ESRCH` になり無関係なプロセスへ届かない）。pidfd を開けない環境（Linux 5.3 未満・
+/// seccomp 等）でのみ `kill(2)` へ退避し、その場合は上記の前提に依存する。
 ///
 /// `Drop` では kill / wait しない（コンテナの寿命を親ハンドルに暗黙で縛らない）。回収の責任は
 /// 呼び出し元にあり、放置すると子はゾンビとして残る。
@@ -705,14 +814,19 @@ type Observed = (ChildExit, bool);
 #[derive(Debug)]
 pub struct ContainerChild {
     pid: u32,
+    /// fork 直後に開いた pidfd（プロセス同一性の保持。開けない環境では `None` で `kill(2)` へ退避）。
+    pidfd: Option<OwnedFd>,
     reap: Mutex<ReapCell>,
 }
 
 impl ContainerChild {
-    /// fork 直後の未回収の子のハンドルを作る。
-    fn new(pid: u32) -> Self {
+    /// fork 直後の未回収の子のハンドルを作る（`exec` の rootless mapper の回収にも使う）。
+    pub(super) fn new(pid: u32) -> Self {
         Self {
             pid,
+            // 回収前（fork 直後）に開くので、以後 pid が再利用されても元のプロセスを指し続ける。
+            // 未対応カーネル・seccomp 等で開けなければ `None`（`signal_child` が `kill(2)` へ退避）。
+            pidfd: sys::pidfd_open(pid).ok(),
             reap: Mutex::new(ReapCell {
                 state: ReapState::Running,
                 kills_sent: 0,
@@ -817,6 +931,100 @@ impl ContainerChild {
         }
     }
 
+    /// 未回収の子へシグナルを 1 つ送る（`oci_runtime::kill` の `ContainerChildProcess::signal` から呼ばれる。
+    /// CORE-2・OCI-6・TASK-30.1）。
+    ///
+    /// 回収状態のロック下で状態を確認してから `kill` するため、回収済みの pid（別プロセスへ再利用され得る）
+    /// には送らない（[`Self::kill_and_reap`] と同じ排他。CORE-1）。回収済みなら送らずに
+    /// [`SignalDelivery::AlreadyExited`]、契約外の回収者に回収されていた（`ESRCH`）場合も送らずに
+    /// 終了済み扱いで [`SignalDelivery::Gone`] を返す（回収状態は終端の `Lost` へ進め、以後 `waitpid` も `kill` も行わない）。終了済みで未回収
+    /// （ゾンビ）の子は、ここで `waitpid(WNOHANG)` で回収して [`SignalDelivery::AlreadyExited`] を返す
+    /// （`kill(2)` はゾンビにも成功するが効かないため `Delivered` と誤報しない）。終了は待たない。
+    pub fn send_signal(&self, number: std::num::NonZeroU8) -> Result<SignalDelivery, ExecError> {
+        let mut cell = self.lock();
+        self.send_signal_locked(&mut cell, number)
+    }
+
+    /// [`Self::send_signal`] に送信期限 `deadline` を付けた版（REPAIR-5・TASK-30.1）。
+    ///
+    /// ロック待ちが `deadline` を超えた場合、またはロック取得時点で期限切れの場合は、呼び出し側が既に
+    /// `Timeout` を観測済みのため送信を抑止して `Timeout` を返す（期限後にシグナルが届かない）。
+    pub fn send_signal_until(
+        &self,
+        number: std::num::NonZeroU8,
+        deadline: Instant,
+    ) -> Result<SignalDelivery, ExecError> {
+        const STAGE: IsolationStage = IsolationStage::Wait;
+        let expired = || {
+            ExecError::new(
+                ErrorCode::Timeout,
+                STAGE,
+                "the signal was not sent before the deadline",
+            )
+        };
+        let mut cell = loop {
+            match self.reap.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(expired());
+                    }
+                    std::thread::sleep(Duration::from_millis(1).min(deadline - now));
+                }
+            }
+        };
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        self.send_signal_locked(&mut cell, number)
+    }
+
+    /// 子へシグナルを送る。pidfd があれば `pidfd_send_signal` で送り、回収後に再利用された pid へ
+    /// 届かないようにする（契約外の回収者との競合でも `ESRCH` になる。CORE-1）。pidfd が無い環境では
+    /// `kill(2)` へ退避する（この場合は「唯一の回収者」前提が残る）。
+    fn signal_child(&self, sig: Signal) -> Result<(), SysError> {
+        match &self.pidfd {
+            Some(fd) => sys::pidfd_send_signal(fd.as_fd(), sig),
+            None => sys::kill_pid(self.pid, sig),
+        }
+    }
+
+    /// ロックを保持した状態での送信本体。未回収でも終了済み（ゾンビ）の子には送らず、ここで回収する
+    /// （ゾンビへの `kill(2)` は成功するがシグナルは効かないため、`Delivered` と誤報しない）。
+    fn send_signal_locked(
+        &self,
+        cell: &mut ReapCell,
+        number: std::num::NonZeroU8,
+    ) -> Result<SignalDelivery, ExecError> {
+        match cell.state {
+            ReapState::Reaped { exit, .. } => return Ok(SignalDelivery::AlreadyExited(exit)),
+            ReapState::Lost => return Ok(SignalDelivery::Gone),
+            ReapState::Running | ReapState::Killed => {}
+        }
+        let polled = sys::wait_pid_nohang(self.pid);
+        if matches!(polled, Err(SysError::Os(e)) if e == sys::ECHILD) {
+            // 契約外の回収者が既に回収していた（`waitpid` が `ECHILD`）。pid が再利用され得るため
+            // `kill` は送らず、`ESRCH` と同じく以後の送信・回収を行わない終端状態（`Lost`）へ進める。
+            cell.state = ReapState::Lost;
+            return Ok(SignalDelivery::Gone);
+        }
+        if let Some((exit, _)) = Self::apply_wait(cell, polled)? {
+            return Ok(SignalDelivery::AlreadyExited(exit));
+        }
+        match self.signal_child(Signal::Number(number)) {
+            Ok(()) => Ok(SignalDelivery::Delivered),
+            Err(SysError::Os(e)) if e == sys::ESRCH => {
+                // 契約外の回収者に回収された。pid が再利用され得るため、以後の送信・回収を
+                // 行わない終端状態（`Lost`）へ進める（`kill_if_unreaped` と同じ扱い）。
+                cell.state = ReapState::Lost;
+                Ok(SignalDelivery::Gone)
+            }
+            Err(e) => Err(ExecError::from_sys(e, IsolationStage::Wait, "kill(signal)")),
+        }
+    }
+
     /// 回収状態のロックを取る。
     ///
     /// ロック中の処理（`waitpid` / `kill` のラッパーと状態の単一代入）は panic しないため、poison
@@ -828,12 +1036,33 @@ impl ContainerChild {
     /// ロック下で 1 回だけ回収を試みる。回収済みなら `waitpid` せず記録を返す。未終了・`EINTR` は
     /// `Ok(None)`（呼び出し側が期限を確認する）。失敗しても状態は変えない（再試行できる）。
     fn try_reap(&self) -> Result<Option<Observed>, ExecError> {
-        const STAGE: IsolationStage = IsolationStage::Wait;
         let mut cell = self.lock();
-        if let ReapState::Reaped { exit, killed } = cell.state {
-            return Ok(Some((exit, killed)));
+        self.reap_locked(&mut cell)
+    }
+
+    /// ロック保持中に 1 回だけ回収を試みる（[`Self::try_reap`] の本体）。
+    fn reap_locked(&self, cell: &mut ReapCell) -> Result<Option<Observed>, ExecError> {
+        match cell.state {
+            ReapState::Reaped { exit, killed } => return Ok(Some((exit, killed))),
+            ReapState::Lost => {
+                return Err(ExecError::new(
+                    ErrorCode::Internal,
+                    IsolationStage::Wait,
+                    "the container process was already reaped by another party",
+                ));
+            }
+            ReapState::Running | ReapState::Killed => {}
         }
-        match sys::wait_pid_nohang(self.pid) {
+        Self::apply_wait(cell, sys::wait_pid_nohang(self.pid))
+    }
+
+    /// `waitpid(WNOHANG)` の結果を回収状態へ反映する（[`Self::reap_locked`] の本体。ロック保持中）。
+    fn apply_wait(
+        cell: &mut ReapCell,
+        polled: Result<Option<i32>, SysError>,
+    ) -> Result<Option<Observed>, ExecError> {
+        const STAGE: IsolationStage = IsolationStage::Wait;
+        match polled {
             Ok(Some(status)) => {
                 // stopped / continued は回収ではない（pid は保持されたまま）ので状態を変えずにエラー。
                 let exit = decode_wait_status(status).ok_or_else(|| {
@@ -859,13 +1088,16 @@ impl ContainerChild {
         let mut cell = self.lock();
         match cell.state {
             ReapState::Reaped { exit, killed } => return Ok(Some((exit, killed))),
-            ReapState::Killed => return Ok(None),
+            ReapState::Killed | ReapState::Lost => return Ok(None),
             ReapState::Running => {}
         }
-        match sys::kill_pid(self.pid, Signal::Kill) {
+        match self.signal_child(Signal::Kill) {
             Ok(()) => cell.kills_sent = cell.kills_sent.saturating_add(1),
             // 未回収の子が ESRCH になるのは契約外の回収者に回収された場合のみ。以後 kill しない。
-            Err(SysError::Os(e)) if e == sys::ESRCH => {}
+            Err(SysError::Os(e)) if e == sys::ESRCH => {
+                cell.state = ReapState::Lost;
+                return Ok(None);
+            }
             Err(e) => {
                 return Err(ExecError::from_sys(
                     e,
@@ -1092,7 +1324,7 @@ mod tests {
     /// SEC-1・CORE-5: 制限ステージの証跡が無い間は、継承された制限の有無にかかわらず exec を拒否する。
     #[test]
     fn sec1_exec_is_denied_without_restriction_evidence() {
-        let err = require_restriction_evidence().unwrap_err();
+        let err = require_restriction_evidence(None).unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
         assert_eq!(err.stage, IsolationStage::Exec);
         assert_eq!(exit_code_for(&err), EXIT_EXEC_NOT_EXECUTABLE);
@@ -1122,7 +1354,7 @@ mod tests {
             p = p.with_hook(kind, || Ok(())).unwrap();
         }
         let err = p
-            .run_then(|_report| require_restriction_evidence())
+            .run_then(|_report, caps| require_restriction_evidence(caps))
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
         assert_eq!(err.stage, IsolationStage::Exec);
@@ -1395,6 +1627,125 @@ mod tests {
             Some(ChildExit::Exited(6))
         );
         assert_eq!(reap_snapshot(&handle).1, 0);
+    }
+
+    /// CORE-2・OCI-6（TASK-30.1）: 未回収の子へ SIGTERM を送ると `Delivered`、子は `Signaled(15)` で回収され、
+    /// 回収後の送信は `kill` せず `AlreadyExited` を返す。
+    #[test]
+    fn core2_send_signal_delivers_then_reports_already_exited() {
+        let handle = ContainerChild::new(spawn_sh("exec sleep 30"));
+        let term = std::num::NonZeroU8::new(15).unwrap();
+        assert_eq!(handle.send_signal(term).unwrap(), SignalDelivery::Delivered);
+        assert_eq!(
+            handle.wait_timeout(Duration::from_secs(10)).unwrap(),
+            ChildExit::Signaled(15)
+        );
+        assert_eq!(
+            handle.send_signal(term).unwrap(),
+            SignalDelivery::AlreadyExited(ChildExit::Signaled(15))
+        );
+    }
+
+    /// CORE-2・OCI-6（TASK-30.1）: 終了済みで未回収（ゾンビ）の子へは送らず、回収して `AlreadyExited` を返す。
+    #[test]
+    fn core2_send_signal_reports_zombie_as_already_exited() {
+        let handle = ContainerChild::new(spawn_sh("exit 4"));
+        let zombie_proc = format!("/proc/{}/stat", handle.pid());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&zombie_proc).is_ok_and(|t| t.contains(") Z")) {
+            assert!(Instant::now() < deadline, "child did not become a zombie");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let term = std::num::NonZeroU8::new(15).unwrap();
+        assert_eq!(
+            handle.send_signal(term).unwrap(),
+            SignalDelivery::AlreadyExited(ChildExit::Exited(4))
+        );
+    }
+
+    /// REPAIR-5・CORE-2（TASK-30.1）: 期限切れの `send_signal_until` は送らず `Timeout` を返し、子は生きたまま。
+    #[test]
+    fn repair5_send_signal_until_suppresses_after_deadline() {
+        let handle = ContainerChild::new(spawn_sh("exec sleep 30"));
+        let term = std::num::NonZeroU8::new(15).unwrap();
+        let err = handle
+            .send_signal_until(term, Instant::now())
+            .expect_err("expired");
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert_eq!(
+            handle.wait_for_exit(Duration::from_millis(100)).unwrap(),
+            None
+        );
+        assert_eq!(
+            handle.kill_and_reap(Duration::from_secs(10)).unwrap(),
+            ChildExit::Signaled(9)
+        );
+    }
+
+    /// CORE-2・CORE-1（TASK-30.1）: 回収済みのハンドルの pid が別プロセスに再利用されていても、
+    /// `send_signal` はそのプロセスへ送らない。
+    #[test]
+    fn core2_send_signal_never_signals_reused_pid() {
+        let mut unrelated = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let handle = ContainerChild::new(unrelated.id());
+        handle.lock().state = ReapState::Reaped {
+            exit: ChildExit::Exited(3),
+            killed: false,
+        };
+        let result = handle.send_signal(std::num::NonZeroU8::new(9).unwrap());
+        let alive = unrelated.try_wait().unwrap();
+        kill_and_reap(&mut unrelated);
+        assert_eq!(
+            result.unwrap(),
+            SignalDelivery::AlreadyExited(ChildExit::Exited(3))
+        );
+        assert_eq!(alive, None, "the unrelated process must not be signaled");
+        assert_eq!(reap_snapshot(&handle).1, 0);
+    }
+
+    /// CORE-2・CORE-1（TASK-30.1）: 契約外の回収者が先に回収済み（`waitpid` が `ECHILD`）の pid へは
+    /// `kill` せず、`Internal` ではなく `Gone` を返し、以後の送信も行わない。
+    #[test]
+    fn core2_send_signal_reports_gone_when_already_reaped_externally() {
+        let mut external = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let handle = ContainerChild::new(external.id());
+        external.wait().unwrap();
+        let term = std::num::NonZeroU8::new(15).unwrap();
+        assert_eq!(handle.send_signal(term).unwrap(), SignalDelivery::Gone);
+        assert_eq!(reap_snapshot(&handle), (ReapState::Lost, 0));
+        assert_eq!(handle.send_signal(term).unwrap(), SignalDelivery::Gone);
+        // 終端状態のため 2 回目以降も `waitpid` / `kill` を行わず状態は変わらない。
+        assert_eq!(reap_snapshot(&handle), (ReapState::Lost, 0));
+    }
+
+    /// CORE-1・CORE-2（TASK-30.1）: pidfd を保持していれば、契約外の回収者が子を回収した後の
+    /// シグナル送信は pid ではなくプロセス同一性で判定され、`ESRCH` になる（再利用 pid へ届かない）。
+    #[test]
+    fn core1_pidfd_signal_after_external_reap_is_esrch() {
+        let mut external = Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let handle = ContainerChild::new(external.id());
+        // pidfd_open 未対応のカーネルでは `kill(2)` 退避のため本検証の対象外。
+        if handle.pidfd.is_none() {
+            external.kill().unwrap();
+            external.wait().unwrap();
+            return;
+        }
+        external.kill().unwrap();
+        external.wait().unwrap();
+        let term = Signal::Number(std::num::NonZeroU8::new(15).unwrap());
+        assert_eq!(handle.signal_child(term), Err(SysError::Os(sys::ESRCH)));
     }
 
     /// 回収状態と送った `SIGKILL` の回数を取り出す。

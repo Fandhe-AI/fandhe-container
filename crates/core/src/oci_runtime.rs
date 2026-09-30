@@ -5,14 +5,19 @@
 //! プロセス未起動の状態初期化 `create`（TASK-29.2）が実装済み。
 //! `start`（TASK-29.3）も実装済みだが、起動は依存注入する `ProcessLauncher` に委ねており、本番
 //! launcher と実プロセスの exec は未提供（制限ステージ TASK-37〜39 待ちで fail-closed）。
-//! kill / delete は TASK-30 で追加する予定で、現時点では未実装である
+//! `kill`（TASK-30.1。送信は依存注入する `ProcessSignaler` に委ね、本番実装は supervisor〔TASK-157〕待ち）
+//! も実装済み。delete は TASK-30.2 で追加する予定で、現時点では未実装である
 //! （REPAIR-3: 実装済みを装わない）。モジュールは `cfg(target_os)` を付けず 3 OS でビルドされる（CLI-1）。
+//! create / start / kill は依存注入された `OpRecorder` へ固定の操作名（`create`・`start`・`kill`）で成功 / 失敗と
+//! 所要時間を記録する（REPAIR-4・TASK-84.4）。delete も TASK-30.2 で同じ `record_op` パターンにより操作名
+//! `delete` で記録する契約だが、未実装である（REPAIR-3）。
 //! 例外は start の rootfs 固定（`RootfsDir::pin`。`exec::open_dir_beneath` を使う）と
 //! `ContainerChildProcess` で、`launch.rs` 内に `cfg(target_os = "linux")` で局所化している。Linux 以外の
 //! start は rootfs を固定できないため、起動前に `Unimplemented` で拒否する（fail-closed）。
 
 mod config;
 mod create;
+mod kill;
 mod launch;
 mod mount_destination;
 mod start;
@@ -26,6 +31,7 @@ pub use config::{
     load_config, parse_config_bytes,
 };
 pub use create::create;
+pub use kill::{KillTimeout, ProcessSignaler, kill};
 #[cfg(target_os = "linux")]
 pub use launch::ContainerChildProcess;
 pub use launch::{

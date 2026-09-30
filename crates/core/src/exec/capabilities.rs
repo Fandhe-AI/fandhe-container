@@ -12,13 +12,21 @@
 //! # 契約
 //!
 //! - `fork_single_threaded` による単一スレッドの子で、pivot 後・`NO_NEW_PRIVS` の前に呼ぶ。
-//!   bounding set・`capset(2)` はスレッド単位で、呼んだスレッドにしか効かない
+//!   bounding set・`capset(2)` はスレッド単位で、呼んだスレッドにしか効かない。この条件は
+//!   呼び出し側に任せず、[`apply_default_capabilities`] が `/proc/self/status` の `Threads:` が 1 で
+//!   あることを実行時に確認し、満たさない・読めないときは何も変更せず `FailedPrecondition` で失敗する
+//!   （fail-closed。他スレッドに強い capability が残ったまま `Ok` を返さない）
 //! - 許可集合は OCI 既定集合に固定し、任意の集合を渡せる公開経路は持たない（設定から危険な
 //!   capability を足せない）
 //! - bounding set は `execve` 後の uid 0 プロセスの permitted の上限を決めるため、最初に縮める。
 //!   カーネルが知る全番号を `PR_CAPBSET_READ` で調べ、許可集合に無いものはすべて drop する。
 //!   本 crate の `Capability` が知らない新しい capability も drop される（fail-closed）
 //! - inheritable は空にする（CVE-2022-29162 の教訓。ambient は inheritable ⊆ で空に保たれる）
+//! - `retained_after_exec` は `execve` 後の権限の**上限**（適用後の permitted ∪ bounding set）で、
+//!   exec 時の資格情報に依存しない。uid 0 の `execve` では permitted に無い capability も bounding
+//!   set から再取得でき（`P'(permitted) = inheritable ∪ bounding ∪ ambient`）、`NO_NEW_PRIVS` は
+//!   その獲得を「適用前の permitted」へ丸めるにすぎないため、後段の `NO_NEW_PRIVS` に期待しない。
+//!   実プロセスでの exec 後の読み戻しによる証跡化は #174（TASK-37.3）が担う
 //! - 途中で失敗したら打ち切ってエラーを返し、部分的に成功した状態のまま `Ok` を返さない。
 //!   設定後に capget と bounding set を読み戻し、不一致なら `Internal` で失敗する
 //!
@@ -39,6 +47,8 @@ trait CapKernel {
     fn ambient_clear_all(&mut self) -> Result<(), SysError>;
     fn get(&mut self) -> Result<ThreadCaps, SysError>;
     fn set(&mut self, caps: ThreadCaps) -> Result<(), SysError>;
+    /// 呼び出したプロセスのスレッド数（`/proc/self/status` の `Threads:`）。読めない・解釈できない場合は `None`。
+    fn thread_count(&mut self) -> Option<u64>;
 }
 
 /// 本物の syscall を呼ぶ実装。
@@ -60,6 +70,10 @@ impl CapKernel for RealKernel {
     fn set(&mut self, caps: ThreadCaps) -> Result<(), SysError> {
         sys::cap_set_thread(caps)
     }
+    fn thread_count(&mut self) -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        super::status_threads(&status)
+    }
 }
 
 /// capability の適用結果。将来の拡張（証跡化。#173）に備えて `non_exhaustive` にする。
@@ -71,8 +85,11 @@ pub struct CapabilityReport {
     /// 呼び出したスレッドの現在の effective / permitted の集合（`execve` 後に保持される集合では
     /// ない。`execve` 後に保持できるのは `retained_after_exec`）。
     pub granted: CapabilitySet,
-    /// `granted` のうち bounding set にも残っている集合。`execve` 後の uid 0 プロセスが
-    /// 保持できる権限の上限（`granted` ∩ bounding）で、証跡（#173）にはこちらを使う。
+    /// 適用後の bounding set（許可集合の部分集合であることを読み戻して検証済み）。
+    pub bounding: CapabilitySet,
+    /// `execve` 後に保持し得る権限の上限（`granted` ∪ `bounding`。exec 時の資格情報によらない）。
+    /// uid 0 の `execve` は permitted に無い capability も bounding set から再取得するため、
+    /// `granted` ∩ bounding では過小評価になる。証跡（#173）にはこちらを使う。
     pub retained_after_exec: CapabilitySet,
     /// 許可集合に含まれるが、適用前の permitted に無く付与できなかったもの。
     pub unavailable: CapabilitySet,
@@ -83,10 +100,25 @@ pub struct CapabilityReport {
 /// 呼び出したスレッドの capability を OCI 既定集合（SEC-1）へ絞り込む。
 ///
 /// 単一スレッドの子で pivot 後・`NO_NEW_PRIVS` の前に呼ぶ前提（ステージ列への組み込みは #173）。
-/// bounding set・capset はスレッド単位のため、マルチスレッドのプロセスで呼んでも他スレッドには
-/// 効かない。
+/// bounding set・capset はスレッド単位で他スレッドには効かないため、`Threads:` が 1 でない（または
+/// 確認できない）場合は何も変更せず `FailedPrecondition` で失敗する（SEC-1・fail-closed）。
 pub fn apply_default_capabilities() -> Result<CapabilityReport, ExecError> {
-    apply_capabilities(CapabilitySet::oci_default(), &mut RealKernel)
+    apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut RealKernel)
+}
+
+/// 単一スレッド条件を検査してから [`apply_capabilities`] を呼ぶ。検査は副作用の前に行う。
+fn apply_capabilities_single_threaded(
+    allowed: CapabilitySet,
+    kernel: &mut impl CapKernel,
+) -> Result<CapabilityReport, ExecError> {
+    if kernel.thread_count() != Some(1) {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::CapabilityDrop,
+            "capability drop requires a single-threaded process (Threads: 1)",
+        ));
+    }
+    apply_capabilities(allowed, kernel)
 }
 
 /// カーネルの capability 番号の上限（2 語 = 64 bit）。
@@ -187,7 +219,8 @@ fn apply_capabilities(
         }
     }
 
-    let retained_after_exec = granted
+    // 検証済みなので bounding ⊆ allowed。許可集合の各 capability について保持の有無を集める。
+    let bounding = allowed
         .iter()
         .filter(|c| {
             bounding_held
@@ -196,10 +229,12 @@ fn apply_capabilities(
                 .unwrap_or(false)
         })
         .fold(CapabilitySet::empty(), |acc, c| acc.with(c));
+    let retained_after_exec = bounding.iter().fold(granted, |acc, c| acc.with(c));
 
     Ok(CapabilityReport {
         bounding_dropped: dropped,
         granted,
+        bounding,
         retained_after_exec,
         unavailable,
         last_cap,
@@ -230,6 +265,8 @@ pub(super) mod testing {
         /// capset が成功を返すが値を反映しない（読み戻し検証の不一致を作る）。
         pub(super) capset_noop: bool,
         pub(super) capset_arg: Option<ThreadCaps>,
+        /// `thread_count` の戻り値。
+        pub(super) threads: Option<u64>,
     }
 
     impl Fake {
@@ -248,6 +285,7 @@ pub(super) mod testing {
                 capset_err: None,
                 capset_noop: false,
                 capset_arg: None,
+                threads: Some(1),
             }
         }
     }
@@ -283,6 +321,10 @@ pub(super) mod testing {
         fn get(&mut self) -> Result<ThreadCaps, SysError> {
             self.calls.push("capget");
             Ok(self.caps)
+        }
+
+        fn thread_count(&mut self) -> Option<u64> {
+            self.threads
         }
 
         fn set(&mut self, caps: ThreadCaps) -> Result<(), SysError> {
@@ -326,6 +368,7 @@ mod tests {
         assert_eq!(k.bounding, DEFAULT_MASK);
         assert_eq!(report.granted, CapabilitySet::oci_default());
         assert_eq!(report.retained_after_exec, CapabilitySet::oci_default());
+        assert_eq!(report.bounding, CapabilitySet::oci_default());
         assert!(report.unavailable.is_empty());
     }
 
@@ -400,21 +443,68 @@ mod tests {
         );
         assert!(!report.granted.contains(Capability::Mknod));
         assert_eq!(report.granted.len(), 13);
-        assert_eq!(report.retained_after_exec.len(), 13);
+        // uid 0 の execve は bounding set から MKNOD を再取得し得るため、上限には残る。
+        assert!(report.bounding.contains(Capability::Mknod));
+        assert!(report.retained_after_exec.contains(Capability::Mknod));
+        assert_eq!(report.retained_after_exec.len(), 14);
         let arg = k.capset_arg.unwrap();
         assert_eq!(arg.effective, [0xA804_25FB & !(1 << 27), 0]);
     }
 
-    /// SEC-1: bounding set に無い権限は `granted` に残っても `retained_after_exec` に含めない。
+    /// SEC-1: `granted` に無くても bounding set に残る権限は `retained_after_exec` に含める
+    /// （uid 0 の execve は bounding set から再取得する）。
     #[test]
-    fn sec1_retained_after_exec_excludes_caps_missing_from_bounding() {
+    fn sec1_retained_after_exec_includes_bounding_caps_missing_from_permitted() {
         let mut k = Fake::new();
-        // CAP_MKNOD（27）を最初から bounding set に持たない。
+        // CAP_MKNOD（27）は permitted に無いが bounding set には残っている。
+        k.caps.permitted = [!(1u32 << 27), 0x1FF];
+        let report = run(&mut k).unwrap();
+        assert!(!report.granted.contains(Capability::Mknod));
+        assert!(report.bounding.contains(Capability::Mknod));
+        assert!(report.retained_after_exec.contains(Capability::Mknod));
+        assert_eq!(report.retained_after_exec, CapabilitySet::oci_default());
+    }
+
+    /// SEC-1: bounding set にも permitted にも無い権限は `retained_after_exec` に含めない。
+    #[test]
+    fn sec1_retained_after_exec_excludes_caps_missing_from_both() {
+        let mut k = Fake::new();
+        k.caps.permitted = [!(1u32 << 27), 0x1FF];
         k.bounding &= !(1u64 << 27);
         let report = run(&mut k).unwrap();
-        assert!(report.granted.contains(Capability::Mknod));
         assert!(!report.retained_after_exec.contains(Capability::Mknod));
         assert_eq!(report.retained_after_exec.len(), 13);
+    }
+
+    /// SEC-1: 単一スレッドでなければ何も変更せず FailedPrecondition（fail-closed）。
+    #[test]
+    fn sec1_multithreaded_or_unknown_thread_count_is_rejected_without_side_effects() {
+        for threads in [Some(2), Some(0), None] {
+            let mut k = Fake::new();
+            k.threads = threads;
+            let e = apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut k)
+                .unwrap_err();
+            assert_eq!(e.code, ErrorCode::FailedPrecondition, "{threads:?}");
+            assert_eq!(e.stage, IsolationStage::CapabilityDrop);
+            assert!(k.calls.is_empty());
+            assert_eq!(k.bounding, (1u64 << 41) - 1);
+        }
+    }
+
+    /// SEC-1: 公開関数はマルチスレッドの本物のプロセスで拒否し、何も変更しない。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sec1_public_api_rejects_multithreaded_process() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let helper = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let before = status_value("CapBnd:");
+        let e = apply_default_capabilities().unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(status_value("CapBnd:"), before);
+        drop(tx);
+        helper.join().unwrap();
     }
 
     /// SEC-1: drop の EPERM は PermissionDenied・段は CapabilityDrop・後続を呼ばない。
@@ -484,12 +574,14 @@ mod tests {
             let bnd_has_extra = bnd & !DEFAULT_MASK & ((1u64 << 41) - 1) != 0;
             if eff & (1 << 8) == 0 {
                 if bnd_has_extra {
-                    let e = apply_default_capabilities().unwrap_err();
+                    let e = apply_capabilities(CapabilitySet::oci_default(), &mut RealKernel)
+                        .unwrap_err();
                     assert_eq!(e.code, ErrorCode::PermissionDenied);
                     assert_eq!(e.stage, IsolationStage::CapabilityDrop);
                 }
             } else {
-                let report = apply_default_capabilities().unwrap();
+                let report =
+                    apply_capabilities(CapabilitySet::oci_default(), &mut RealKernel).unwrap();
                 assert_eq!(status_value("CapBnd:"), bnd & DEFAULT_MASK);
                 assert_eq!(status_value("CapEff:"), prm & DEFAULT_MASK);
                 assert_eq!(status_value("CapPrm:"), prm & DEFAULT_MASK);

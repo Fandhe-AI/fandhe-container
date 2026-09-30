@@ -11,17 +11,23 @@
 //!
 //! - 将来、ステージ列の Landlock 段（#184・TASK-39.4）や CLI / supervisor の事前チェックから呼ぶ。
 //!   `ExecError` / `IsolationStage` への写像は #184 で行い、本モジュールは `ErrorCode` までを決める
-//! - 検出した ABI は #182（TASK-39.2）が handled access のマスク選択に使う
+//! - 検出した ABI は #182（TASK-39.2。`rules` 子モジュール）が handled access のマスク選択に使う
 //! - syscall は `crate::sys::landlock_abi_version` のみ（読み取り専用の問い合わせ。権限を変えない）
 //! - ABI 不足は環境の前提条件違反であり、分離違反の試行ではないため SEC-4 の監査ログ対象にしない
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! ルール生成（#182）・`landlock_add_rule` / `landlock_restrict_self`（#183）・ステージ列への
-//! 組み込み（#184）は未実装。本モジュールは検出と拒否判定のみを提供する。
+//! `landlock_add_rule` / `landlock_restrict_self`（#183）・ステージ列への組み込み（#184）は未実装。
+//! 本モジュールは検出と拒否判定、および純粋関数によるルール生成（`rules` 子モジュール・#182）を提供する。
 
 use std::fmt;
 use std::num::NonZeroU32;
+
+mod rules;
+pub use rules::{
+    AccessFs, LandlockRuleError, LandlockRuleErrorKind, LandlockRuleset, MAX_LANDLOCK_RULES,
+    PathRule, RuleOrigin, RulePath, ShadowedRestriction, build_path_rules, path_rules_from_config,
+};
 
 use crate::sys::{self, SysError};
 use crate::traits::ErrorCode;

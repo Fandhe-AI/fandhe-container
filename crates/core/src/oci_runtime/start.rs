@@ -24,7 +24,8 @@
 //!
 //! start のプロセスが手順 5〜7 の間に異常終了すると Running・pid なしの予約だけが残る。この状態は
 //! `FailedPrecondition`（`start was interrupted` を含むメッセージ）で識別でき、
-//! [`recover_interrupted_start`] で Created へ戻せる（CORE-2）。
+//! [`recover_interrupted_start`] で Created へ戻せる（CORE-2）。ただし launch 後・pid 記録前の中断では
+//! 生きたプロセスが残り得るため、回復は launcher が生存プロセス無しを確認できた場合に限る（SEC-1）。
 //!
 //! 手順 1〜7 は同一 ID につきプロセス内でも排他する（並行 start の早期拒否。CORE-2）。プロセス間の
 //! 排他は手順 5 の revision 照合（`StateStore` 実装が更新を原子的に照合する契約）に依存する。
@@ -142,8 +143,13 @@ impl Drop for StartReservation {
 /// revision 照合つきで Created へ戻す。呼び出し元は、対象コンテナの start が実行中でないこと
 /// （前回の start プロセスが終了済みであること）を確認してから呼ぶ。同一プロセス内の start とは
 /// 排他する。Running・pid なし以外の状態は `FailedPrecondition`、不在は `NotFound`。
+///
+/// launch 後・pid 記録前の中断では生きたプロセスが残り得るため、Created へ戻す前に
+/// [`ProcessLauncher::confirm_no_process`] で生存プロセスが無いことを確認する。確認できない場合
+/// （既定実装を含む）はそのエラーを返して予約を残す（二重起動の防止。SEC-1・CORE-2）。
 pub fn recover_interrupted_start(
     store: &dyn StateStore,
+    launcher: &dyn ProcessLauncher,
     id: &ContainerId,
 ) -> Result<StateRecord, TraitError> {
     let _reservation = StartReservation::acquire(id)?;
@@ -154,6 +160,7 @@ pub fn recover_interrupted_start(
             "no interrupted start reservation to recover",
         ));
     }
+    launcher.confirm_no_process(id)?;
     store.update(&UpdateStateRequest::new(
         ContainerStatus::created(id.clone(), None),
         record.revision(),
@@ -297,7 +304,9 @@ fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
     // ハンドル取得後にもう一度検査し、取得までの間に祖先が symlink 化された場合を拒否する。
     let rootfs_dir = RootfsDir::open_checked(&rootfs)?;
     let (_, rechecked) = validate_bundle(bundle)?;
-    if rechecked != rootfs {
+    // 文字列比較だけでは、ハンドル取得後に rootfs や祖先が別実体へ差し替えられても通ってしまうため、
+    // 再検証したパスの実体（dev・ino）が保持ハンドルと同一であることも確認する。
+    if rechecked != rootfs || !rootfs_dir.is_same_entry(&rechecked) {
         return Err(TraitError::new(
             ErrorCode::PermissionDenied,
             "rootfs changed after validation",
@@ -481,6 +490,8 @@ mod tests {
         terminated: std::sync::Arc<AtomicUsize>,
         fail: bool,
         fail_terminate: bool,
+        /// `confirm_no_process` が生存プロセス無しを確認できるか。
+        confirms_no_process: bool,
     }
 
     impl RecordingLauncher {
@@ -490,6 +501,7 @@ mod tests {
                 terminated: std::sync::Arc::new(AtomicUsize::new(0)),
                 fail,
                 fail_terminate: false,
+                confirms_no_process: false,
             }
         }
 
@@ -519,6 +531,14 @@ mod tests {
     }
 
     impl ProcessLauncher for RecordingLauncher {
+        fn confirm_no_process(&self, _id: &ContainerId) -> Result<(), TraitError> {
+            if self.confirms_no_process {
+                Ok(())
+            } else {
+                Err(TraitError::new(ErrorCode::Unimplemented, "cannot confirm"))
+            }
+        }
+
         fn launch(&self, spec: &LaunchSpec) -> Result<Box<dyn LaunchedProcess>, TraitError> {
             self.specs
                 .lock()
@@ -908,16 +928,22 @@ mod tests {
                 rec.revision(),
             ))
             .expect("claim");
-        let launcher = RecordingLauncher::new(false);
+        let mut launcher = RecordingLauncher::new(false);
         let err = start(&store, &OpRecorder::new(), &launcher, &sid("recover")).expect_err("stuck");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(
             err.message(),
             "container start was interrupted; recover the start reservation"
         );
-        let got = recover_interrupted_start(&store, &id).expect("recover");
+        // 生存プロセス無しを確認できない launcher では予約を残す（二重起動防止。SEC-1）。
+        let err = recover_interrupted_start(&store, &launcher, &id).expect_err("unconfirmed");
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        let rec = store.get(&GetStateRequest::new(id.clone())).expect("get");
+        assert_eq!(rec.status().state(), ContainerState::Running);
+        launcher.confirms_no_process = true;
+        let got = recover_interrupted_start(&store, &launcher, &id).expect("recover");
         assert_eq!(got.status().state(), ContainerState::Created);
-        let err = recover_interrupted_start(&store, &id).expect_err("not stuck");
+        let err = recover_interrupted_start(&store, &launcher, &id).expect_err("not stuck");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         start(&store, &OpRecorder::new(), &launcher, &sid("recover")).expect("start");
         drop(b);
@@ -986,6 +1012,22 @@ mod tests {
             start(&store, &OpRecorder::new(), &launcher, &sid("claim-lost")).expect_err("lost");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(launcher.calls(), 0);
+    }
+
+    /// SEC-1: 再検証パスの実体が保持ハンドルと異なる場合（祖先・rootfs の差し替え）は同一と判定しない。
+    #[cfg(unix)]
+    #[test]
+    fn sec1_rootfs_handle_rejects_swapped_entry() {
+        let (b, _store) = created("swap");
+        let rootfs = b.dir.join("rootfs");
+        let handle = RootfsDir::open_checked(&rootfs).expect("open");
+        assert!(handle.is_same_entry(&rootfs));
+        let other = b.dir.join("other");
+        std::fs::create_dir(&other).expect("mkdir");
+        assert!(!handle.is_same_entry(&other));
+        std::fs::rename(&rootfs, b.dir.join("moved")).expect("rename");
+        std::fs::create_dir(&rootfs).expect("mkdir");
+        assert!(!handle.is_same_entry(&rootfs));
     }
 
     /// SEC-1: 成功時の LaunchSpec は検査済み rootfs のハンドルを持つ（Unix）。

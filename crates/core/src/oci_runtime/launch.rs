@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::config::NamespaceKind;
-use crate::traits::TraitError;
+use crate::traits::{ContainerId, ErrorCode, TraitError};
 
 /// 検査済み rootfs ディレクトリのハンドル（検査対象と使用対象を同一にする。SEC-1）。
 ///
@@ -72,6 +72,25 @@ impl RootfsDir {
         Ok(Self {
             file: Arc::new(file),
         })
+    }
+
+    /// `path` が現在指す実体が、保持ハンドルの実体（`st_dev`・`st_ino`）と同一かを返す（SEC-1）。
+    ///
+    /// 再検証したパスの祖先や rootfs 自体が、ハンドル取得後に別ディレクトリへ差し替えられていないことの
+    /// 確認に使う。`path` 自体が symlink の場合・調べられない場合は `false`（fail-closed）。
+    #[cfg(unix)]
+    pub(super) fn is_same_entry(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(held), Ok(named)) = (self.file.metadata(), std::fs::symlink_metadata(path)) else {
+            return false;
+        };
+        !named.file_type().is_symlink() && (held.dev(), held.ino()) == (named.dev(), named.ino())
+    }
+
+    /// Unix 以外ではハンドルを持たないため常に同一とみなす。
+    #[cfg(not(unix))]
+    pub(super) fn is_same_entry(&self, _path: &Path) -> bool {
+        true
     }
 
     /// Unix 以外ではハンドルを持たない。
@@ -200,4 +219,19 @@ pub trait LaunchedProcess: Send {
 pub trait ProcessLauncher: Send + Sync {
     /// プロセスを起動し、ハンドルを返す。
     fn launch(&self, spec: &LaunchSpec) -> Result<Box<dyn LaunchedProcess>, TraitError>;
+
+    /// `id` の起動が生存プロセスを残していないことを確認する（中断された start の回復用。CORE-2・SEC-1）。
+    ///
+    /// start は launch 後・pid 記録前に異常終了すると、pid が状態に残らないまま生きたプロセスを残し得る。
+    /// `recover_interrupted_start` は予約を Created へ戻す前に本メソッドを呼び、`Ok(())` のときだけ戻す
+    /// （戻すと同じ ID の二重起動が可能になるため）。実装は、`id` のプロセスが存在しないと確証できる場合、
+    /// または存在する場合に終了・回収したうえで `Ok(())` を返し、確証できない場合は `Err` を返すこと。
+    /// 既定実装は確認手段を持たないため fail-closed で `Unimplemented` を返す。待ちには上限を設ける（REPAIR-5）。
+    fn confirm_no_process(&self, id: &ContainerId) -> Result<(), TraitError> {
+        let _ = id;
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "the launcher cannot confirm that no process remains for this container",
+        ))
+    }
 }

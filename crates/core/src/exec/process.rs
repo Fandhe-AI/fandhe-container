@@ -665,8 +665,9 @@ const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 子の回収状態（[`ContainerChild`] の `Mutex` が保護する）。
 ///
-/// 遷移は `Running` → `Killed` → `Reaped`、または `Running` → `Reaped` の一方向のみ。`Reaped` の後は
-/// pid がカーネルに返却済みで別プロセスへ再利用され得るため、`kill` も `waitpid` も呼ばない。
+/// 遷移は `Running` → `Killed` → `Reaped`、`Running` → `Reaped`、または `Running` / `Killed` → `Lost` の
+/// 一方向のみ。`Reaped` と `Lost` の後は pid がカーネルに返却済みで別プロセスへ再利用され得るため、
+/// `kill` も `waitpid` も呼ばない（終端状態）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReapState {
     /// 未回収で、期限超過の `SIGKILL` もまだ送っていない。
@@ -675,6 +676,9 @@ enum ReapState {
     Killed,
     /// 回収済み。`killed` は期限超過の `SIGKILL` の後に回収したか（`Timeout` の判定に使う）。
     Reaped { exit: ChildExit, killed: bool },
+    /// 契約外の回収者に回収された（`waitpid` が `ECHILD`、または `kill` が `ESRCH`）。終了状態は失われ、
+    /// pid は再利用され得るため以後 `kill` も `waitpid` も呼ばない終端状態。
+    Lost,
 }
 
 /// [`ContainerChild::send_signal`] の結果。
@@ -835,7 +839,7 @@ impl ContainerChild {
     /// 回収状態のロック下で状態を確認してから `kill` するため、回収済みの pid（別プロセスへ再利用され得る）
     /// には送らない（[`Self::kill_and_reap`] と同じ排他。CORE-1）。回収済みなら送らずに
     /// [`SignalDelivery::AlreadyExited`]、契約外の回収者に回収されていた（`ESRCH`）場合も送らずに
-    /// 終了済み扱いで [`SignalDelivery::Gone`] を返す（回収状態は `Killed` へ進め、以後送らない）。終了済みで未回収
+    /// 終了済み扱いで [`SignalDelivery::Gone`] を返す（回収状態は終端の `Lost` へ進め、以後 `waitpid` も `kill` も行わない）。終了済みで未回収
     /// （ゾンビ）の子は、ここで `waitpid(WNOHANG)` で回収して [`SignalDelivery::AlreadyExited`] を返す
     /// （`kill(2)` はゾンビにも成功するが効かないため `Delivered` と誤報しない）。終了は待たない。
     pub fn send_signal(&self, number: std::num::NonZeroU8) -> Result<SignalDelivery, ExecError> {
@@ -886,16 +890,16 @@ impl ContainerChild {
         cell: &mut ReapCell,
         number: std::num::NonZeroU8,
     ) -> Result<SignalDelivery, ExecError> {
-        if let ReapState::Reaped { exit, .. } = cell.state {
-            return Ok(SignalDelivery::AlreadyExited(exit));
+        match cell.state {
+            ReapState::Reaped { exit, .. } => return Ok(SignalDelivery::AlreadyExited(exit)),
+            ReapState::Lost => return Ok(SignalDelivery::Gone),
+            ReapState::Running | ReapState::Killed => {}
         }
         let polled = sys::wait_pid_nohang(self.pid);
         if matches!(polled, Err(SysError::Os(e)) if e == sys::ECHILD) {
             // 契約外の回収者が既に回収していた（`waitpid` が `ECHILD`）。pid が再利用され得るため
-            // `kill` は送らず、`ESRCH` と同じく以後の送信・回収を行わない状態へ進める。
-            if cell.state == ReapState::Running {
-                cell.state = ReapState::Killed;
-            }
+            // `kill` は送らず、`ESRCH` と同じく以後の送信・回収を行わない終端状態（`Lost`）へ進める。
+            cell.state = ReapState::Lost;
             return Ok(SignalDelivery::Gone);
         }
         if let Some((exit, _)) = Self::apply_wait(cell, polled)? {
@@ -905,10 +909,8 @@ impl ContainerChild {
             Ok(()) => Ok(SignalDelivery::Delivered),
             Err(SysError::Os(e)) if e == sys::ESRCH => {
                 // 契約外の回収者に回収された。pid が再利用され得るため、以後の送信・回収を
-                // 行わない状態へ進める（`kill_if_unreaped` と同じ扱い）。
-                if cell.state == ReapState::Running {
-                    cell.state = ReapState::Killed;
-                }
+                // 行わない終端状態（`Lost`）へ進める（`kill_if_unreaped` と同じ扱い）。
+                cell.state = ReapState::Lost;
                 Ok(SignalDelivery::Gone)
             }
             Err(e) => Err(ExecError::from_sys(e, IsolationStage::Wait, "kill(signal)")),
@@ -932,8 +934,16 @@ impl ContainerChild {
 
     /// ロック保持中に 1 回だけ回収を試みる（[`Self::try_reap`] の本体）。
     fn reap_locked(&self, cell: &mut ReapCell) -> Result<Option<Observed>, ExecError> {
-        if let ReapState::Reaped { exit, killed } = cell.state {
-            return Ok(Some((exit, killed)));
+        match cell.state {
+            ReapState::Reaped { exit, killed } => return Ok(Some((exit, killed))),
+            ReapState::Lost => {
+                return Err(ExecError::new(
+                    ErrorCode::Internal,
+                    IsolationStage::Wait,
+                    "the container process was already reaped by another party",
+                ));
+            }
+            ReapState::Running | ReapState::Killed => {}
         }
         Self::apply_wait(cell, sys::wait_pid_nohang(self.pid))
     }
@@ -970,13 +980,16 @@ impl ContainerChild {
         let mut cell = self.lock();
         match cell.state {
             ReapState::Reaped { exit, killed } => return Ok(Some((exit, killed))),
-            ReapState::Killed => return Ok(None),
+            ReapState::Killed | ReapState::Lost => return Ok(None),
             ReapState::Running => {}
         }
         match sys::kill_pid(self.pid, Signal::Kill) {
             Ok(()) => cell.kills_sent = cell.kills_sent.saturating_add(1),
             // 未回収の子が ESRCH になるのは契約外の回収者に回収された場合のみ。以後 kill しない。
-            Err(SysError::Os(e)) if e == sys::ESRCH => {}
+            Err(SysError::Os(e)) if e == sys::ESRCH => {
+                cell.state = ReapState::Lost;
+                return Ok(None);
+            }
             Err(e) => {
                 return Err(ExecError::from_sys(
                     e,
@@ -1599,8 +1612,10 @@ mod tests {
         external.wait().unwrap();
         let term = std::num::NonZeroU8::new(15).unwrap();
         assert_eq!(handle.send_signal(term).unwrap(), SignalDelivery::Gone);
-        assert_eq!(reap_snapshot(&handle), (ReapState::Killed, 0));
+        assert_eq!(reap_snapshot(&handle), (ReapState::Lost, 0));
         assert_eq!(handle.send_signal(term).unwrap(), SignalDelivery::Gone);
+        // 終端状態のため 2 回目以降も `waitpid` / `kill` を行わず状態は変わらない。
+        assert_eq!(reap_snapshot(&handle), (ReapState::Lost, 0));
     }
 
     /// 回収状態と送った `SIGKILL` の回数を取り出す。

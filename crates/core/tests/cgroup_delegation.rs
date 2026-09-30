@@ -55,7 +55,9 @@ mod linux {
         let enabled = delegated
             .enable_controllers(&proof, &want)
             .expect("enable controllers");
-        assert!(enabled.contains(Controller::Memory) && enabled.contains(Controller::Cpu));
+        for c in want.iter() {
+            assert!(enabled.contains(c), "{c:?} missing from {enabled:?}");
+        }
         let subtree = read(&parent.join("cgroup.subtree_control"));
         assert!(
             subtree.contains("memory") && subtree.contains("cpu"),
@@ -64,6 +66,7 @@ mod linux {
         assert!(parent.join(name.as_str()).join("memory.max").exists());
 
         // 後始末。退避リーフは自プロセスが入っているため削除せず、スコープ終了時に回収される。
+        // 削除は保持 fd 経由の `cgroup.events` が ENOENT（削除済み）のときだけ成功する。
         delegated.remove_child(&child).expect("remove child cgroup");
         assert!(!parent.join(name.as_str()).exists());
     }

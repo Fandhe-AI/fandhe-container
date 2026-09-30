@@ -1178,6 +1178,67 @@ mod tests {
         assert_eq!(e.code, ErrorCode::InvalidArgument);
     }
 
+    /// CORE-3・TASK-32.1: 書き込み後に読み戻した集合が要求をすべて含むときだけ成功（不足は具体名つき）。
+    #[test]
+    fn core3_task32_1_verify_enabled_requires_all_requested() {
+        let want = ControllerSet::of(&[Controller::Cpu, Controller::Memory]);
+        assert_eq!(verify_enabled(&want, &want.clone()), Ok(()));
+        let superset = ControllerSet::of(&[Controller::Cpu, Controller::Io, Controller::Memory]);
+        assert_eq!(verify_enabled(&want, &superset), Ok(()));
+        let e = verify_enabled(&want, &ControllerSet::of(&[Controller::Cpu])).unwrap_err();
+        assert_eq!(
+            (e.code, e.step),
+            (ErrorCode::FailedPrecondition, CgroupStep::EnableControllers)
+        );
+        assert_eq!(
+            e.message,
+            "controllers not enabled after writing cgroup.subtree_control: memory"
+        );
+        let e = verify_enabled(&want, &ControllerSet::default()).unwrap_err();
+        assert_eq!(
+            e.message,
+            "controllers not enabled after writing cgroup.subtree_control: cpu memory"
+        );
+    }
+
+    /// CORE-3・TASK-32.1: 削除済みの証拠は `ENOENT` のみ（他の errno・非 OS エラーは削除済みとしない）。
+    #[test]
+    fn core3_task32_1_removal_confirmed_only_on_enoent() {
+        assert!(removal_confirmed(&SysError::Os(sys::ENOENT)));
+        for e in [
+            SysError::Os(sys::EACCES),
+            SysError::Os(sys::EPERM),
+            SysError::Os(sys::EBADF),
+            SysError::Os(sys::EINTR),
+            SysError::Os(sys::EINVAL),
+            SysError::Unsupported,
+            SysError::MultiThreaded,
+        ] {
+            assert!(!removal_confirmed(&e), "{e:?}");
+        }
+    }
+
+    /// CORE-3・TASK-32.1: `remove_verified` が頼るカーネルの挙動（削除済みディレクトリの保持 fd を起点に
+    /// した lookup は `ENOENT`）を一時ディレクトリで具体値照合する。削除前は同じ fd 起点で開ける。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core3_task32_1_lookup_under_removed_dir_is_enoent() {
+        let base = std::env::temp_dir().join(format!("fc-cgroups-rm-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("child")).unwrap();
+        std::fs::write(base.join("child").join("cgroup.events"), b"populated 0\n").unwrap();
+        let parent = File::open(&base).unwrap();
+        let name = CString::new("child").unwrap();
+        let held = sys::open_dir_path_nofollow(Some(parent.as_fd()), &name).unwrap();
+        let events = CString::new("cgroup.events").unwrap();
+        assert!(sys::open_read_at(held.as_fd(), &events).is_ok());
+        std::fs::remove_file(base.join("child").join("cgroup.events")).unwrap();
+        assert_eq!(sys::remove_dir_at(parent.as_fd(), &name), Ok(()));
+        let err = sys::open_read_at(held.as_fd(), &events).unwrap_err();
+        assert_eq!(err, SysError::Os(sys::ENOENT));
+        assert!(removal_confirmed(&err));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     /// CORE-3・TASK-32.1: errno から `ErrorCode` への写像。
     #[test]
     fn core3_task32_1_errno_mapping() {

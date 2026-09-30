@@ -1506,6 +1506,38 @@ mod tests {
         assert!(store.list(&list_req(10)).unwrap().records().is_empty());
     }
 
+    /// OCI-5: 書き込み側の上限を超える bundle を持つ state.json は破損として扱い、回復できる。
+    #[test]
+    fn oci5_overlong_bundle_on_read_is_corrupted_and_purgeable() {
+        let t = TmpDir::new("longread");
+        let store = t.open();
+        create(&store, "a");
+        let long = format!("/{}", "a".repeat(MAX_BUNDLE_PATH_BYTES));
+        assert_eq!(long.len(), MAX_BUNDLE_PATH_BYTES + 1);
+        let body = format!(
+            r#"{{"ociVersion":"1.2.0","id":"a","status":"created","bundle":"{long}","revision":0}}"#
+        );
+        fs::write(t.path().join("a").join("state.json"), body).unwrap();
+        let e = store.get(&GetStateRequest::new(cid("a"))).unwrap_err();
+        assert_eq!(e.code().as_str(), "INTERNAL");
+        assert_eq!(e.message(), "state file is inconsistent");
+        assert_eq!(store.find_corrupted().unwrap(), vec![cid("a")]);
+        store.purge_corrupted(&cid("a")).unwrap();
+        assert_eq!(
+            code(store.get(&GetStateRequest::new(cid("a")))),
+            "NOT_FOUND"
+        );
+        // 上限ちょうどの bundle は健全なレコードとして読める。
+        create(&store, "b");
+        let exact = format!("/{}", "b".repeat(MAX_BUNDLE_PATH_BYTES - 1));
+        let body = format!(
+            r#"{{"ociVersion":"1.2.0","id":"b","status":"created","bundle":"{exact}","revision":1}}"#
+        );
+        fs::write(t.path().join("b").join("state.json"), body).unwrap();
+        let got = store.get(&GetStateRequest::new(cid("b"))).unwrap();
+        assert_eq!(got.bundle().as_os_str().len(), MAX_BUNDLE_PATH_BYTES);
+    }
+
     /// OCI-5: `@revision` が失われたら、全レコード削除後でも revision を再発行しない。
     #[test]
     fn oci5_missing_revision_file_without_records_fails_closed() {

@@ -11,7 +11,7 @@
 //! `pivot_root(2)`（glibc がラッパーを持たないため `syscall(2)` 経由）・`umount2(2)`・`fchdir(2)`
 //! を呼ぶために使う。さらに fork / exec 段（CORE-1・TASK-27.4.1・#831）の `crate::exec::spawn_container`・
 //! `crate::exec::exec_entrypoint`・`crate::exec::ContainerChild` が、`fork(2)`・`_exit(2)`・`execveat(2)`・
-//! `waitpid(2)`・`kill(2)`・`signal(2)` と `close_range(2)`（`syscall(2)` 経由）を呼ぶために使う。
+//! `waitpid(2)`・`kill(2)`・`pidfd_open(2)` / `pidfd_send_signal(2)`（回収後の pid 再利用対策）・`signal(2)` と `close_range(2)`（`syscall(2)` 経由）を呼ぶために使う。
 //! `kill(2)` は `crate::oci_runtime::kill`（CORE-2・OCI-6・TASK-30.1）が `ContainerChild::send_signal`
 //! 経由で任意番号（1..=64 検証済み）を送る経路でも使う。
 //! さらに固定ステージ `crate::exec::no_new_privs`（CORE-1・TASK-27.4.3・#833）が `prctl(2)` を呼ぶ。
@@ -95,6 +95,9 @@ mod consts {
     pub const SYS_PIVOT_ROOT: i64 = 155;
     // arch/x86/entry/syscalls/syscall_64.tbl の `close_range`（436）。
     pub const SYS_CLOSE_RANGE: i64 = 436;
+    // arch/x86/entry/syscalls/syscall_64.tbl の `pidfd_send_signal`（424）・`pidfd_open`（434）。
+    pub const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
+    pub const SYS_PIDFD_OPEN: i64 = 434;
     // include/uapi/linux/close_range.h の `CLOSE_RANGE_CLOEXEC`（`1U << 2`）。
     pub const CLOSE_RANGE_CLOEXEC: i64 = 4;
     // include/uapi/linux/wait.h の `WNOHANG`。
@@ -167,6 +170,10 @@ mod consts {
     // include/uapi/asm-generic/unistd.h の `__NR_close_range`（arm64 は asm-generic の表。
     // x86_64 と値が同じでも流用せず個別に定義する）。
     pub const SYS_CLOSE_RANGE: i64 = 436;
+    // include/uapi/asm-generic/unistd.h の `__NR_pidfd_send_signal`・`__NR_pidfd_open`（arm64 は
+    // asm-generic の表。x86_64 と値が同じでも流用せず個別に定義する）。
+    pub const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
+    pub const SYS_PIDFD_OPEN: i64 = 434;
     // include/uapi/linux/close_range.h の `CLOSE_RANGE_CLOEXEC`（`1U << 2`）。
     pub const CLOSE_RANGE_CLOEXEC: i64 = 4;
     // include/uapi/linux/wait.h の `WNOHANG`。
@@ -239,6 +246,8 @@ mod consts {
     pub const MNT_DETACH: i32 = 0;
     pub const SYS_PIVOT_ROOT: i64 = 0;
     pub const SYS_CLOSE_RANGE: i64 = 0;
+    pub const SYS_PIDFD_SEND_SIGNAL: i64 = 0;
+    pub const SYS_PIDFD_OPEN: i64 = 0;
     pub const CLOSE_RANGE_CLOEXEC: i64 = 0;
     pub const WNOHANG: i32 = 0;
     pub const SIGKILL: i32 = 0;
@@ -934,6 +943,56 @@ pub(crate) fn kill_pid(pid: u32, sig: Signal) -> Result<(), SysError> {
     // プロセスグループ・全プロセス宛て（0・負値）にならない。`number` は `SIGKILL` 定数か、
     // 1..=64 を検証済みの番号だけである。
     let rc = unsafe { kill(raw, number) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 子 `pid` のプロセス同一性を保持する pidfd を開く（`pidfd_open(pid, 0)`。Linux 5.3 以降）。
+///
+/// fork 直後（回収前）に呼ぶと、以後 `pid` が回収・再利用されても fd は元のプロセスを指し続ける。
+/// [`pidfd_send_signal`] で送れば、契約外の回収者による回収後の pid 再利用でも無関係なプロセスへ
+/// シグナルが届かない（CORE-1・CORE-2・TASK-30.1）。未対応カーネル・seccomp 等で開けない場合は
+/// `ENOSYS` / `EPERM` 等を返す（呼び出し側が `kill(2)` へ退避する）。fd は close-on-exec で返る。
+pub(crate) fn pidfd_open(pid: u32) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let raw = positive_pid(pid)?;
+    // SAFETY: 引数は整数のみでポインタを取らない（glibc 2.36 未満に無いため `syscall(2)` 経由）。
+    // `raw` は正であることを確認済み。flags は 0 で、成功時は新規 fd を返す。
+    let fd = unsafe { syscall(consts::SYS_PIDFD_OPEN, i64::from(raw), 0_i64) };
+    if fd == -1 {
+        return Err(last_error());
+    }
+    let fd = i32::try_from(fd).map_err(|_| SysError::Os(EINVAL))?;
+    // SAFETY: `fd` は今 `pidfd_open` が返した新規の有効な fd で、他に所有者がいない。直後に
+    // `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// [`pidfd_open`] で得た pidfd の指すプロセスへシグナルを送る（`pidfd_send_signal(fd, sig, NULL, 0)`）。
+///
+/// 指すプロセスが既に回収済み（終了して消えた）なら `ESRCH` を返し、再利用された別プロセスには
+/// 届かない。番号は [`kill_pid`] と同じく 1..=64 だけを受ける。
+pub(crate) fn pidfd_send_signal(pidfd: BorrowedFd<'_>, sig: Signal) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let number = match sig {
+        Signal::Kill => consts::SIGKILL,
+        Signal::Number(n) if (1..=64).contains(&n.get()) => i32::from(n.get()),
+        Signal::Number(_) => return Err(SysError::Os(EINVAL)),
+    };
+    // SAFETY: `pidfd` は呼び出しの間有効な fd（`BorrowedFd`）。`info` は NULL（カーネルが siginfo を
+    // 既定値で作る）で、ポインタ引数は書き込み・読み出しされない。`number` は検証済みの値、flags は 0。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_PIDFD_SEND_SIGNAL,
+            i64::from(pidfd.as_raw_fd()),
+            i64::from(number),
+            0_i64,
+            0_i64,
+        )
+    };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 

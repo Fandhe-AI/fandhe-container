@@ -714,6 +714,9 @@ type Observed = (ChildExit, bool);
 /// `waitpid(WNOHANG)` / `kill` の間だけ持ち、ポーリングの sleep 中は持たない（各呼び出し元の期限を
 /// 守る）。この保証は「このハンドルが当該 pid の唯一の回収者」であることを前提とし、同じプロセスの
 /// 他所での `waitpid(-1)`・`SIGCHLD` の `SIG_IGN` / `SA_NOCLDWAIT` による自動回収は契約外。
+/// 契約外の回収との競合に備え、シグナルは fork 直後に開いた pidfd 経由で送る（`pidfd_send_signal`。
+/// 回収・pid 再利用後は `ESRCH` になり無関係なプロセスへ届かない）。pidfd を開けない環境（Linux 5.3 未満・
+/// seccomp 等）でのみ `kill(2)` へ退避し、その場合は上記の前提に依存する。
 ///
 /// `Drop` では kill / wait しない（コンテナの寿命を親ハンドルに暗黙で縛らない）。回収の責任は
 /// 呼び出し元にあり、放置すると子はゾンビとして残る。
@@ -721,6 +724,8 @@ type Observed = (ChildExit, bool);
 #[derive(Debug)]
 pub struct ContainerChild {
     pid: u32,
+    /// fork 直後に開いた pidfd（プロセス同一性の保持。開けない環境では `None` で `kill(2)` へ退避）。
+    pidfd: Option<OwnedFd>,
     reap: Mutex<ReapCell>,
 }
 
@@ -729,6 +734,9 @@ impl ContainerChild {
     fn new(pid: u32) -> Self {
         Self {
             pid,
+            // 回収前（fork 直後）に開くので、以後 pid が再利用されても元のプロセスを指し続ける。
+            // 未対応カーネル・seccomp 等で開けなければ `None`（`signal_child` が `kill(2)` へ退避）。
+            pidfd: sys::pidfd_open(pid).ok(),
             reap: Mutex::new(ReapCell {
                 state: ReapState::Running,
                 kills_sent: 0,
@@ -883,6 +891,16 @@ impl ContainerChild {
         self.send_signal_locked(&mut cell, number)
     }
 
+    /// 子へシグナルを送る。pidfd があれば `pidfd_send_signal` で送り、回収後に再利用された pid へ
+    /// 届かないようにする（契約外の回収者との競合でも `ESRCH` になる。CORE-1）。pidfd が無い環境では
+    /// `kill(2)` へ退避する（この場合は「唯一の回収者」前提が残る）。
+    fn signal_child(&self, sig: Signal) -> Result<(), SysError> {
+        match &self.pidfd {
+            Some(fd) => sys::pidfd_send_signal(fd.as_fd(), sig),
+            None => sys::kill_pid(self.pid, sig),
+        }
+    }
+
     /// ロックを保持した状態での送信本体。未回収でも終了済み（ゾンビ）の子には送らず、ここで回収する
     /// （ゾンビへの `kill(2)` は成功するがシグナルは効かないため、`Delivered` と誤報しない）。
     fn send_signal_locked(
@@ -905,7 +923,7 @@ impl ContainerChild {
         if let Some((exit, _)) = Self::apply_wait(cell, polled)? {
             return Ok(SignalDelivery::AlreadyExited(exit));
         }
-        match sys::kill_pid(self.pid, Signal::Number(number)) {
+        match self.signal_child(Signal::Number(number)) {
             Ok(()) => Ok(SignalDelivery::Delivered),
             Err(SysError::Os(e)) if e == sys::ESRCH => {
                 // 契約外の回収者に回収された。pid が再利用され得るため、以後の送信・回収を
@@ -983,7 +1001,7 @@ impl ContainerChild {
             ReapState::Killed | ReapState::Lost => return Ok(None),
             ReapState::Running => {}
         }
-        match sys::kill_pid(self.pid, Signal::Kill) {
+        match self.signal_child(Signal::Kill) {
             Ok(()) => cell.kills_sent = cell.kills_sent.saturating_add(1),
             // 未回収の子が ESRCH になるのは契約外の回収者に回収された場合のみ。以後 kill しない。
             Err(SysError::Os(e)) if e == sys::ESRCH => {
@@ -1616,6 +1634,28 @@ mod tests {
         assert_eq!(handle.send_signal(term).unwrap(), SignalDelivery::Gone);
         // 終端状態のため 2 回目以降も `waitpid` / `kill` を行わず状態は変わらない。
         assert_eq!(reap_snapshot(&handle), (ReapState::Lost, 0));
+    }
+
+    /// CORE-1・CORE-2（TASK-30.1）: pidfd を保持していれば、契約外の回収者が子を回収した後の
+    /// シグナル送信は pid ではなくプロセス同一性で判定され、`ESRCH` になる（再利用 pid へ届かない）。
+    #[test]
+    fn core1_pidfd_signal_after_external_reap_is_esrch() {
+        let mut external = Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let handle = ContainerChild::new(external.id());
+        // pidfd_open 未対応のカーネルでは `kill(2)` 退避のため本検証の対象外。
+        if handle.pidfd.is_none() {
+            external.kill().unwrap();
+            external.wait().unwrap();
+            return;
+        }
+        external.kill().unwrap();
+        external.wait().unwrap();
+        let term = Signal::Number(std::num::NonZeroU8::new(15).unwrap());
+        assert_eq!(handle.signal_child(term), Err(SysError::Os(sys::ESRCH)));
     }
 
     /// 回収状態と送った `SIGKILL` の回数を取り出す。

@@ -28,6 +28,10 @@
 //!   検証し、満たさなければ fail-closed で失敗する
 //! - **ホスト root は拒否する**: rootfs が `/` の指定は意味がなく危険なため
 //!   `ViolationReason::RootfsIsHostRoot` で拒否する
+//! - **既存サブマウントは拒否する**: `MS_BIND | MS_REC` は rootfs 配下の既存マウントも複製する。
+//!   複製されたサブマウントが 1 つでもあれば `ViolationReason::RootfsHasSubmounts` で拒否する
+//!   （許可リストは空。ホスト領域への bind mount が pivot 後も到達可能になるのを防ぐ）。
+//!   `/proc` は検査後に自分でマウントする
 //! - **同一スレッド**: 呼び出しスレッドだけが新しい mount namespace にいるため、
 //!   [`MountIsolation::establish`]・[`prepare_rootfs`]・[`pivot_root`] は同じスレッドで呼ぶ
 //! - **失敗時はプロセスを破棄する**: bind mount・procfs マウント・pivot の途中で失敗しても
@@ -97,7 +101,8 @@ pub struct PivotReport {
 /// 6. bind 前に得た fd は下層の dentry を指すため、保持した親 fd から同じ名前で開き直し、bind で
 ///    できた新しい mount top を得る（マウント ID が変わったこと、開き直した fd が bind 対象と同じ
 ///    `(st_dev, st_ino)` であること、新マウントの親が bind 元のマウントであることを確認する）
-/// 7. 新しい mount top 起点で `proc` を開き直し、procfs をマウントする
+/// 7. bind が複製した rootfs 配下の既存マウントが 1 つでもあれば拒否する（`RootfsHasSubmounts`）
+/// 8. 新しい mount top 起点で `proc` を開き直し、procfs をマウントする
 pub fn prepare_rootfs(
     isolation: &MountIsolation,
     rootfs: &Path,
@@ -153,6 +158,15 @@ fn prepare_rootfs_verified(rootfs: &Path) -> Result<PreparedRootfs, ExecError> {
         new_root_mnt_id,
         rootfs,
     )?;
+
+    // `MS_BIND | MS_REC` は rootfs 配下の既存マウントも新しい mount 木へ複製する。ホスト領域への
+    // bind mount が含まれていると pivot 後も到達できてしまうため、複製されたサブマウントは
+    // 1 つでも拒否する（許可リストは空。`/proc` はこの後に自分でマウントするので対象外）。
+    // `cfg(test)` の dry-run では bind が作られないため検査しない。
+    if !cfg!(test) {
+        let info = read_thread_mountinfo(STAGE)?;
+        check_no_submounts(&info, new_root_mnt_id, rootfs)?;
+    }
 
     let proc_dir = open_proc_dir(new_root.as_fd(), rootfs)?;
     mount_proc_at_dir(&proc_dir, &proc_path, STAGE)?;
@@ -246,6 +260,47 @@ fn mount_parent_in(info: &str, mnt_id: u64) -> Option<u64> {
         }
     }
     found
+}
+
+/// `mountinfo` に `root_mnt_id` の子孫マウント（親 ID を辿って到達するもの）が 1 つでもあれば
+/// `RootfsHasSubmounts` で拒否する（純関数）。パス文字列ではなくマウント ID の親子関係で判定する
+/// ため、mountinfo のエスケープやパス差異の影響を受けない。書式不正な行は fail-closed で拒否する
+/// （壊れた行を黙って飛ばして「サブマウント無し」と誤判定しない）。
+fn check_no_submounts(info: &str, root_mnt_id: u64, rootfs: &Path) -> Result<(), ExecError> {
+    const STAGE: IsolationStage = IsolationStage::PrepareRootfs;
+    let malformed = || {
+        ExecError::new(
+            ErrorCode::Internal,
+            STAGE,
+            "malformed line in /proc/thread-self/mountinfo",
+        )
+    };
+    let mut edges: Vec<(u64, u64)> = Vec::new();
+    for line in info.lines() {
+        let mut f = line.split(' ');
+        let id: u64 = f
+            .next()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(malformed)?;
+        let parent: u64 = f
+            .next()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(malformed)?;
+        edges.push((id, parent));
+    }
+    // 直接の子があれば孫以降も存在し得るが、1 つでも子があれば拒否するため直接の子だけ見れば足りる
+    // （子の子は必ず子を経由する）。
+    if edges
+        .iter()
+        .any(|&(id, parent)| parent == root_mnt_id && id != root_mnt_id)
+    {
+        return Err(ExecError::from_violation_at(
+            ViolationReason::RootfsHasSubmounts,
+            Some(rootfs),
+            STAGE,
+        ));
+    }
+    Ok(())
 }
 
 /// bind 後に開き直した `reopened` が、bind 対象 `pinned`（bind 前に固定した fd）と同じ実体で、
@@ -741,6 +796,28 @@ mod tests {
         assert_eq!(mount_parent_in(info, 11), Some(10));
         assert_eq!(mount_parent_in(info, 12), None);
         assert_eq!(mount_parent_in("10 1 a\n10 2 b\n", 10), None);
+    }
+
+    /// CORE-1: 新 root の直下に既存マウントが複製されていれば拒否し、無ければ通す。
+    #[test]
+    fn core1_check_no_submounts_rejects_cloned_mounts() {
+        let rootfs = Path::new("/r");
+        let clean = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n20 10 8:1 /r /r rw - ext4 /dev/sda1 rw\n";
+        assert!(check_no_submounts(clean, 20, rootfs).is_ok());
+        let dirty = format!("{clean}21 20 8:1 /home /r/mnt/host rw - ext4 /dev/sda1 rw\n");
+        let err = check_no_submounts(&dirty, 20, rootfs).unwrap_err();
+        assert_eq!(
+            violation_of(&err),
+            (
+                "rootfs_pivot",
+                "rootfs_has_submounts",
+                "CORE-1",
+                Some("/r".to_string())
+            )
+        );
+        assert_eq!(err.stage, IsolationStage::PrepareRootfs);
+        let err = check_no_submounts("bad line\n", 20, rootfs).unwrap_err();
+        assert_eq!(err.message, "malformed line in /proc/thread-self/mountinfo");
     }
 
     /// CORE-1: bind 後にマウント ID が変わっていなければ拒否する。

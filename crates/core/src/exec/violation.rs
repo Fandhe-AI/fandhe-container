@@ -133,6 +133,9 @@ pub enum ViolationReason {
     RootfsOnSharedMount,
     /// fd で固定した後に rootfs が改名・移動・削除された。
     RootfsMoved,
+    /// rootfs の bind mount が rootfs 配下の既存マウント（サブマウント）を複製した。許可リストは
+    /// 空のため 1 つでもあれば拒否する（ホスト領域への bind mount 経由の脱出を防ぐ）。
+    RootfsHasSubmounts,
 }
 
 impl ViolationReason {
@@ -170,6 +173,7 @@ impl ViolationReason {
             Self::RootfsIsHostRoot => "rootfs_is_host_root",
             Self::RootfsOnSharedMount => "rootfs_on_shared_mount",
             Self::RootfsMoved => "rootfs_moved",
+            Self::RootfsHasSubmounts => "rootfs_has_submounts",
         }
     }
 
@@ -206,7 +210,9 @@ impl ViolationReason {
             Self::TargetOnSharedMount | Self::RootfsOnSharedMount => {
                 ViolationKind::SharedPropagation
             }
-            Self::RootfsIsHostRoot | Self::RootfsMoved => ViolationKind::RootfsPivot,
+            Self::RootfsIsHostRoot | Self::RootfsMoved | Self::RootfsHasSubmounts => {
+                ViolationKind::RootfsPivot
+            }
         }
     }
 
@@ -254,7 +260,8 @@ impl ViolationReason {
             | Self::TargetOnSharedMount
             | Self::TargetMoved
             | Self::RootfsOnSharedMount
-            | Self::RootfsMoved => ErrorCode::FailedPrecondition,
+            | Self::RootfsMoved
+            | Self::RootfsHasSubmounts => ErrorCode::FailedPrecondition,
         }
     }
 
@@ -336,6 +343,9 @@ impl ViolationReason {
                 "rootfs is on a shared mount; isolate the mount namespace first"
             }
             Self::RootfsMoved => "rootfs was moved or removed after validation",
+            Self::RootfsHasSubmounts => {
+                "rootfs contains existing mounts; unknown submounts are not allowed"
+            }
         }
     }
 }
@@ -480,5 +490,11 @@ mod tests {
         assert_eq!(r.as_str(), "rootfs_moved");
         assert_eq!(r.kind().as_str(), "rootfs_pivot");
         assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);
+        let r = ViolationReason::RootfsHasSubmounts;
+        assert_eq!(r.as_str(), "rootfs_has_submounts");
+        assert_eq!(r.kind().as_str(), "rootfs_pivot");
+        assert_eq!(r.behavior_id(), "CORE-1");
+        assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);
+        assert_eq!(r.stage(), IsolationStage::PrepareRootfs);
     }
 }

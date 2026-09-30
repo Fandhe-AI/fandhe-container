@@ -93,7 +93,7 @@ stub_log="$work/stub.log"
 stub="$work/stub-runtime"
 cat >"$stub" <<STUB
 #!${bash_bin}
-# スタブランタイム。STUB_MODE: ok / create-fail / start-fail / start-hang / delete-fail
+# スタブランタイム。STUB_MODE: ok / create-fail / create-fail-delete-fail / start-fail / start-hang / delete-fail
 cmd="\$1"
 shift
 case "\$cmd" in
@@ -104,7 +104,7 @@ echo "\$cmd \$id" >>"\$STUB_LOG"
 case "\$cmd" in
   create)
     sleep 0.05
-    [ "\${STUB_MODE:-ok}" = create-fail ] && { echo "stub: create failed" >&2; exit 1; }
+    case "\${STUB_MODE:-ok}" in create-fail | create-fail-delete-fail) echo "stub: create failed" >&2; exit 1 ;; esac
     ;;
   start)
     [ "\${STUB_MODE:-ok}" = start-fail ] && { echo "stub: start failed" >&2; exit 1; }
@@ -112,7 +112,7 @@ case "\$cmd" in
     sleep 0.10
     ;;
   delete)
-    [ "\${STUB_MODE:-ok}" = delete-fail ] && { echo "stub: delete failed" >&2; exit 1; }
+    case "\${STUB_MODE:-ok}" in delete-fail | create-fail-delete-fail) echo "stub: delete failed" >&2; exit 1 ;; esac
     ;;
   kill) ;;
 esac
@@ -222,6 +222,12 @@ expect_rc "help" 0 --help
 reset_log
 STUB_MODE=create-fail expect_rc "create-fail" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 expect_contains "create-fail-log-tail" "stub: create failed"
+if grep -q '^delete ' "$stub_log"; then pass "create-fail-delete-called"; else fail "create-fail-delete-called"; fi
+# create 失敗後の delete も失敗する場合は kill → delete を再試行し、残存 ID を報告して exit 4。
+reset_log
+STUB_MODE=create-fail-delete-fail expect_rc "create-fail-delete-fail" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_contains "create-fail-leftover-id" "containers left behind: fandhe-startup-"
+if grep -q '^kill ' "$stub_log"; then pass "create-fail-kill-called"; else fail "create-fail-kill-called"; fi
 reset_log
 STUB_MODE=start-fail expect_rc "start-fail" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 if grep -q '^delete ' "$stub_log"; then pass "start-fail-delete-called"; else fail "start-fail-delete-called"; fi

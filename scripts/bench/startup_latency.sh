@@ -246,8 +246,9 @@ cleanup() {
   local final="$?"
   trap - EXIT INT TERM
   if [ -n "$live_id" ]; then
-    # create 自体が失敗した試行は存在しないコンテナの可能性があるため、失敗は警告に留める
-    # （live_id は create 成功後にのみ設定しているので、ここでは実在する前提で扱う）。
+    # live_id は create 試行の直前に設定される（create 失敗で中途半端に残った場合も対象）。
+    # delete 失敗時は finish_container が kill → delete を再試行し、それでも残れば
+    # leftover_ids へ記録して下で exit 4 にする。
     finish_container "$live_id" || true
     live_id=""
   fi
@@ -270,15 +271,16 @@ trap 'exit 143' TERM
 measure_once() {
   local id="$1" t0 t1 t2
   t0="${EPOCHREALTIME/./}"
+  # create が途中まで進んでから失敗・タイムアウトしても特権リソースが残り得るため、
+  # 作成を試みた時点で後始末対象として保持する。失敗時の delete（kill → delete の再試行）と
+  # 残存時の exit 4 は EXIT trap の cleanup が担う。
+  live_id="$id"
   if ! rt_create "$tmpdir/create.log" "$id"; then
     err "runtime-create-failed" "create failed or timed out for $id"
     show_log "$tmpdir/create.log"
-    # 中途半端に作られた可能性に備え best-effort で削除する（失敗は警告のみ）。
-    rt_delete "$tmpdir/cleanup-create.log" "$id" >/dev/null 2>&1 || true
     return 1
   fi
   t1="${EPOCHREALTIME/./}"
-  live_id="$id"
   if ! rt_start "$tmpdir/start.log" "$id"; then
     err "runtime-start-failed" "start failed or timed out for $id"
     show_log "$tmpdir/start.log"

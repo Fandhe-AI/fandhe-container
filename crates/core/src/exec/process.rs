@@ -767,6 +767,35 @@ impl ContainerChild {
         }
     }
 
+    /// 子を待たずに終了させ、`timeout` まで回収を待つ（REPAIR-5。状態記録に失敗した起動の後始末用）。
+    ///
+    /// `oci_runtime` の start が起動後の状態記録に失敗したとき、`LaunchedProcess::terminate` の実装
+    /// （`oci_runtime::ContainerChildProcess`）から呼ばれる。[`Self::wait_timeout`] と同じ回収状態の
+    /// 排他（`kill_if_unreaped` → `poll_until`）を使うため、回収済み（pid 再利用され得る）の子へは
+    /// `SIGKILL` を送らない。
+    ///
+    /// - 回収済みなら `kill` せず `Ok`（記録済みの終了状態）
+    /// - 未回収なら `SIGKILL` を 1 回だけ送り、`timeout` までに回収できれば `Ok`
+    /// - `timeout` までに回収できなければ `ErrorCode::Timeout`。回収状態は `Killed` のまま残り、
+    ///   同じハンドルで再試行（回収）できる
+    ///
+    /// [`Self::wait_timeout`] の `KILL_REAP_TIMEOUT`（固定 5 秒）ではなく呼び出し側の `timeout` を使う
+    /// （呼び出し側の上限を超えて待たない）。`timeout` は 7 日に丸める。
+    pub fn kill_and_reap(&self, timeout: Duration) -> Result<ChildExit, ExecError> {
+        let deadline = Instant::now() + timeout.min(WAIT_TIMEOUT_MAX);
+        if let Some((exit, _)) = self.kill_if_unreaped()? {
+            return Ok(exit);
+        }
+        match self.poll_until(deadline)? {
+            Some((exit, _)) => Ok(exit),
+            None => Err(ExecError::new(
+                ErrorCode::Timeout,
+                IsolationStage::Wait,
+                format!("the container process was not reaped within {timeout:?} after SIGKILL"),
+            )),
+        }
+    }
+
     /// 回収状態のロックを取る。
     ///
     /// ロック中の処理（`waitpid` / `kill` のラッパーと状態の単一代入）は panic しないため、poison

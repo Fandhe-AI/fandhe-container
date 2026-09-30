@@ -14,7 +14,8 @@
 //! 3. 状態の確認。`Running`・pid あり（と将来の `Created`・pid あり）だけ送信へ進む。`Running`・pid なし
 //!    （中断された start の予約）と、それ以外（`Created`・pid なし / `Creating` / `Stopped`）は
 //!    `FailedPrecondition`
-//! 4. [`ProcessSignaler::signal`] を `call_bounded` で上限つきに呼ぶ（REPAIR-5）
+//! 4. [`ProcessSignaler::signal`] を `call_bounded` で上限つきに呼ぶ（REPAIR-5）。`Timeout` 後に遅れて
+//!    起動した worker は、呼ぶ直前の印・期限確認で送信を抑止する
 //!
 //! # PID 再利用対策（SEC-1・CORE-1）
 //!
@@ -35,8 +36,10 @@
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
+use super::LAUNCHER_REPLY_GRACE;
 use super::launch::START_TIMEOUT_MAX;
 use super::start::{Unbounded, call_bounded};
 use crate::observability::{OpName, OpRecorder};
@@ -150,7 +153,25 @@ fn kill_inner(
     let s = Arc::clone(signaler);
     let id = req.id().clone();
     let signal = req.signal();
-    match call_bounded(limit, move || s.signal(&id, pid, signal, limit), drop) {
+    // 呼び出し側が `Timeout` を返した後に、遅れて起動・復帰した worker が送信しないための印。
+    // worker は signaler を呼ぶ直前に印と期限を確認し、期限切れなら送らない。
+    let expired = Arc::new(AtomicBool::new(false));
+    let worker_expired = Arc::clone(&expired);
+    let deadline = Instant::now().checked_add(limit.saturating_add(LAUNCHER_REPLY_GRACE));
+    let call = move || {
+        if worker_expired.load(Ordering::SeqCst) || deadline.is_none_or(|d| Instant::now() >= d) {
+            return Err(TraitError::new(
+                ErrorCode::Timeout,
+                "the signal delivery did not complete within the timeout",
+            ));
+        }
+        s.signal(&id, pid, signal, limit)
+    };
+    let outcome = call_bounded(limit, call, drop);
+    if outcome.is_err() {
+        expired.store(true, Ordering::SeqCst);
+    }
+    match outcome {
         Ok(result) => result?,
         Err(Unbounded::TimedOut) => {
             return Err(TraitError::new(
@@ -171,16 +192,13 @@ fn kill_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oci_runtime::LAUNCHER_REPLY_GRACE;
     use crate::traits::{
         CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ListStateRequest, StateList,
         StateRecord, StateRevision, UpdateStateRequest,
     };
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
+    use std::sync::atomic::AtomicUsize;
 
     /// テスト専用の読み取り中心のインメモリ `StateStore`（kill は get しか使わない）。
     #[derive(Default)]
@@ -189,8 +207,10 @@ mod tests {
     impl MemStateStore {
         fn with(status: ContainerStatus) -> Self {
             let s = Self::default();
-            s.create(&CreateStateRequest::new(status, PathBuf::from("/b")).expect("req"))
-                .expect("create");
+            s.create(
+                &CreateStateRequest::new(status, std::env::temp_dir().join("b")).expect("req"),
+            )
+            .expect("create");
             s
         }
     }

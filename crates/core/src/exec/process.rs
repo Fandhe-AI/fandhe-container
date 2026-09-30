@@ -835,16 +835,73 @@ impl ContainerChild {
     /// 回収状態のロック下で状態を確認してから `kill` するため、回収済みの pid（別プロセスへ再利用され得る）
     /// には送らない（[`Self::kill_and_reap`] と同じ排他。CORE-1）。回収済みなら送らずに
     /// [`SignalDelivery::AlreadyExited`]、契約外の回収者に回収されていた（`ESRCH`）場合も送らずに
-    /// 終了済み扱いで [`SignalDelivery::Gone`] を返す。回収状態は変えない（終了を待たない。
-    /// 回収は [`Self::wait_timeout`] 等の責務）。
+    /// 終了済み扱いで [`SignalDelivery::Gone`] を返す（回収状態は `Killed` へ進め、以後送らない）。終了済みで未回収
+    /// （ゾンビ）の子は、ここで `waitpid(WNOHANG)` で回収して [`SignalDelivery::AlreadyExited`] を返す
+    /// （`kill(2)` はゾンビにも成功するが効かないため `Delivered` と誤報しない）。終了は待たない。
     pub fn send_signal(&self, number: std::num::NonZeroU8) -> Result<SignalDelivery, ExecError> {
-        let cell = self.lock();
+        let mut cell = self.lock();
+        self.send_signal_locked(&mut cell, number)
+    }
+
+    /// [`Self::send_signal`] に送信期限 `deadline` を付けた版（REPAIR-5・TASK-30.1）。
+    ///
+    /// ロック待ちが `deadline` を超えた場合、またはロック取得時点で期限切れの場合は、呼び出し側が既に
+    /// `Timeout` を観測済みのため送信を抑止して `Timeout` を返す（期限後にシグナルが届かない）。
+    pub fn send_signal_until(
+        &self,
+        number: std::num::NonZeroU8,
+        deadline: Instant,
+    ) -> Result<SignalDelivery, ExecError> {
+        const STAGE: IsolationStage = IsolationStage::Wait;
+        let expired = || {
+            ExecError::new(
+                ErrorCode::Timeout,
+                STAGE,
+                "the signal was not sent before the deadline",
+            )
+        };
+        let mut cell = loop {
+            match self.reap.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(expired());
+                    }
+                    std::thread::sleep(Duration::from_millis(1).min(deadline - now));
+                }
+            }
+        };
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        self.send_signal_locked(&mut cell, number)
+    }
+
+    /// ロックを保持した状態での送信本体。未回収でも終了済み（ゾンビ）の子には送らず、ここで回収する
+    /// （ゾンビへの `kill(2)` は成功するがシグナルは効かないため、`Delivered` と誤報しない）。
+    fn send_signal_locked(
+        &self,
+        cell: &mut ReapCell,
+        number: std::num::NonZeroU8,
+    ) -> Result<SignalDelivery, ExecError> {
         if let ReapState::Reaped { exit, .. } = cell.state {
+            return Ok(SignalDelivery::AlreadyExited(exit));
+        }
+        if let Some((exit, _)) = self.reap_locked(cell)? {
             return Ok(SignalDelivery::AlreadyExited(exit));
         }
         match sys::kill_pid(self.pid, Signal::Number(number)) {
             Ok(()) => Ok(SignalDelivery::Delivered),
-            Err(SysError::Os(e)) if e == sys::ESRCH => Ok(SignalDelivery::Gone),
+            Err(SysError::Os(e)) if e == sys::ESRCH => {
+                // 契約外の回収者に回収された。pid が再利用され得るため、以後の送信・回収を
+                // 行わない状態へ進める（`kill_if_unreaped` と同じ扱い）。
+                if cell.state == ReapState::Running {
+                    cell.state = ReapState::Killed;
+                }
+                Ok(SignalDelivery::Gone)
+            }
             Err(e) => Err(ExecError::from_sys(e, IsolationStage::Wait, "kill(signal)")),
         }
     }
@@ -860,8 +917,13 @@ impl ContainerChild {
     /// ロック下で 1 回だけ回収を試みる。回収済みなら `waitpid` せず記録を返す。未終了・`EINTR` は
     /// `Ok(None)`（呼び出し側が期限を確認する）。失敗しても状態は変えない（再試行できる）。
     fn try_reap(&self) -> Result<Option<Observed>, ExecError> {
-        const STAGE: IsolationStage = IsolationStage::Wait;
         let mut cell = self.lock();
+        self.reap_locked(&mut cell)
+    }
+
+    /// ロック保持中に 1 回だけ回収を試みる（[`Self::try_reap`] の本体）。
+    fn reap_locked(&self, cell: &mut ReapCell) -> Result<Option<Observed>, ExecError> {
+        const STAGE: IsolationStage = IsolationStage::Wait;
         if let ReapState::Reaped { exit, killed } = cell.state {
             return Ok(Some((exit, killed)));
         }
@@ -1443,6 +1505,42 @@ mod tests {
         assert_eq!(
             handle.send_signal(term).unwrap(),
             SignalDelivery::AlreadyExited(ChildExit::Signaled(15))
+        );
+    }
+
+    /// CORE-2・OCI-6（TASK-30.1）: 終了済みで未回収（ゾンビ）の子へは送らず、回収して `AlreadyExited` を返す。
+    #[test]
+    fn core2_send_signal_reports_zombie_as_already_exited() {
+        let handle = ContainerChild::new(spawn_sh("exit 4"));
+        let zombie_proc = format!("/proc/{}/stat", handle.pid());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&zombie_proc).is_ok_and(|t| t.contains(") Z")) {
+            assert!(Instant::now() < deadline, "child did not become a zombie");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let term = std::num::NonZeroU8::new(15).unwrap();
+        assert_eq!(
+            handle.send_signal(term).unwrap(),
+            SignalDelivery::AlreadyExited(ChildExit::Exited(4))
+        );
+    }
+
+    /// REPAIR-5・CORE-2（TASK-30.1）: 期限切れの `send_signal_until` は送らず `Timeout` を返し、子は生きたまま。
+    #[test]
+    fn repair5_send_signal_until_suppresses_after_deadline() {
+        let handle = ContainerChild::new(spawn_sh("exec sleep 30"));
+        let term = std::num::NonZeroU8::new(15).unwrap();
+        let err = handle
+            .send_signal_until(term, Instant::now())
+            .expect_err("expired");
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert_eq!(
+            handle.wait_for_exit(Duration::from_millis(100)).unwrap(),
+            None
+        );
+        assert_eq!(
+            handle.kill_and_reap(Duration::from_secs(10)).unwrap(),
+            ChildExit::Signaled(9)
         );
     }
 

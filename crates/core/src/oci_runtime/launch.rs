@@ -464,8 +464,8 @@ impl LaunchedProcess for ContainerChildProcess {
     }
 
     /// `ContainerChild::send_signal`（回収状態のロック下で送信）へ委ねる。回収済み・既に消えていた
-    /// 場合は送らずに `FailedPrecondition` を返す。送信は即時で待たないため `timeout` は使わない。
-    fn signal(&self, signal: Signal, _timeout: Duration) -> Result<(), TraitError> {
+    /// 場合は送らずに `FailedPrecondition` を返す。`timeout` はロック待ちの上限で、超過後は送らない（REPAIR-5）。
+    fn signal(&self, signal: Signal, timeout: Duration) -> Result<(), TraitError> {
         use crate::exec::SignalDelivery;
         let number = std::num::NonZeroU8::new(signal.as_u8()).ok_or_else(|| {
             TraitError::new(
@@ -473,7 +473,13 @@ impl LaunchedProcess for ContainerChildProcess {
                 "signal number must be in 1..=64",
             )
         })?;
-        match self.child.send_signal(number) {
+        // ロック待ちが `timeout` を超えたら送信を抑止する（呼び出し側が `Timeout` を返した後に送らない）。
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                TraitError::new(ErrorCode::InvalidArgument, "signal timeout is too large")
+            })?;
+        match self.child.send_signal_until(number, deadline) {
             Ok(SignalDelivery::Delivered) => Ok(()),
             Ok(_) => Err(TraitError::new(
                 ErrorCode::FailedPrecondition,

@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -86,7 +85,7 @@ fn setup(delay: Duration) -> (MemStateStore, Arc<FakeSignaler>, ContainerId) {
         .create(
             &CreateStateRequest::new(
                 ContainerStatus::running(id.clone(), Some(pid)),
-                PathBuf::from("/bundle"),
+                std::env::temp_dir().join("bundle"),
             )
             .expect("req"),
         )

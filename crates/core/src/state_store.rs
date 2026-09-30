@@ -263,9 +263,9 @@ impl FileStateStore {
         // 副作用（ルートの作成）より前に拒否する。
         ensure_supported_platform()?;
         let path = root.0;
-        match private_dir_builder().create(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        let created = match private_dir_builder().create(&path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(err(
                     ErrorCode::NotFound,
@@ -273,12 +273,16 @@ impl FileStateStore {
                 ));
             }
             Err(_) => return Err(internal("failed to create the state root")),
-        }
+        };
         verify_root(&path)?;
         // 親パスの symlink を一度だけ解決して固定し、以降はその正規パスで操作する。
         // 祖先ディレクトリの書き込み権限も検査する（親すり替え対策。詳細は verify_ancestors）。
         let root = canonical_root(&path)?;
         verify_ancestors(&root)?;
+        // 作ったルートの dirent を永続化する（クラッシュでルートごと消えないように）。
+        if created && let Some(parent) = root.parent() {
+            sync_dir(parent)?;
+        }
         // 新規ストア（初期化途中の残骸 `@revision.init-*` 以外のエントリがない）だけ `@revision` を
         // 初期化する。`@lock` を作る前に `@revision` を確定させるため、初期化の途中失敗で
         // `@lock` だけが残って「空でない・高水位マークなし」の永久 fail-closed になることはない。
@@ -645,7 +649,10 @@ impl StateStore for FileStateStore {
         }
         let dir = self.record_dir(req.id());
         match private_dir_builder().create(&dir) {
-            Ok(()) => {}
+            // 新しい `<id>/` の dirent を永続化する。`write_record` が fsync するのは `<id>/` の
+            // 中身（state.json の rename）だけで、状態ルート側の dirent は含まないため、ここで
+            // fsync しないと成功を返した後のクラッシュで `<id>/` ごとレコードが消え得る（OCI-5）。
+            Ok(()) => sync_dir(&self.root)?,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 // 残骸ディレクトリの再利用。symlink などは read_record が拒否済みだが、
                 // 種別を再確認してから書く（多重防御）。

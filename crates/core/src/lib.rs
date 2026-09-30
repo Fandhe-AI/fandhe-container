@@ -28,7 +28,6 @@
 //! - 予定（未作成）: `oci_runtime`（TASK-29・30）・`state_store`
 //!   （TASK-31・OCI-5）・`cgroups`（TASK-32・CORE-3）・`plugin_discovery`（TASK-109）
 //!
-//!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
 //!
 //! - `exec`・`sys` は `lib.rs` の `#[cfg(target_os = "linux")]` でビルド対象から外れ、
@@ -37,8 +36,8 @@
 //!   前提の成り立たない macOS / Windows でコンパイル・リンクさせない（安全上の理由での隔離）
 //! - 新しい Linux 専用コードは `exec` / `sys` 配下に置く。それ以外に置く場合は
 //!   `cfg(target_os = "linux")` で局所化する（CLI-1）
-//! - 非 Linux ビルドの保証は CI の macos-latest / windows-latest ネイティブ runner
-//!   （`rust-ci`・`rust-ci-default-features`。clippy `-D warnings`）が担う
+//! - 非 Linux ビルドの保証は CI の macOS / Windows ネイティブ runner での
+//!   ビルド・clippy `-D warnings` が担う（3 OS 一級対応）
 //!
 //! 実行層本体（namespace・cgroups v2・seccomp/Landlock・rootless 等）は G3（TASK-27〜50）で
 //! 実装する未実装のままである（REPAIR-3: 実装済みを装わず、未実装であることも隠さない）。

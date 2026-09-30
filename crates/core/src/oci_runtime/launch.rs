@@ -211,6 +211,75 @@ impl PartialEq for RootfsDir {
 
 impl Eq for RootfsDir {}
 
+/// 起動権の所有ロック（bundle ディレクトリの inode への排他 `flock`。CORE-2・SEC-1）。
+///
+/// start は起動権の予約（状態の Created → Running・pid なし）の前に、recover は予約を Created へ戻す
+/// 前に取得し、launch（上限超過後に続く分と遅れて返ったプロセスの後始末を含む）が終わるまで保持する。
+/// `flock` はロックを持つプロセスが終了するとカーネルが解放するため、別プロセスの start の launch が
+/// 進行中である間は取得できず、そのプロセスが終了していれば取得できる。これにより
+/// `recover_interrupted_start` は呼び出し元の事前確認に依存せず、所有プロセスの終了（または launch の
+/// 完了）を回復の条件にできる。
+///
+/// ロック対象は bundle ディレクトリそのもの（ファイルを作らない。読み取り専用の bundle でも使え、
+/// 置き換え可能なロックファイルを持たない）。`/` から bundle までを `exec::open_dir_beneath` で
+/// symlink 非追従に辿って固定し、その fd を `/proc/thread-self/fd/N` から読み取り専用で開き直して
+/// ロックする（O_PATH の fd には `flock` できないため）。Linux 以外は rootfs の固定と同じく未対応で
+/// `Unimplemented`（fail-closed）。
+#[derive(Debug)]
+pub(super) struct BundleLock {
+    #[cfg(target_os = "linux")]
+    _file: std::fs::File,
+    #[cfg(not(target_os = "linux"))]
+    _never: std::convert::Infallible,
+}
+
+impl BundleLock {
+    /// `bundle`（絶対パス）の所有ロックを待たずに取得する。
+    ///
+    /// 別のロック保持者がいれば `FailedPrecondition`（`container start is in progress in another
+    /// process`）。bundle 自体や祖先が symlink・ディレクトリでなければ `InvalidArgument`。メッセージは
+    /// 固定文言のみ（パス・errno を含めない）。
+    #[cfg(target_os = "linux")]
+    pub(super) fn acquire(bundle: &Path) -> Result<Self, TraitError> {
+        use std::os::fd::AsRawFd;
+        let invalid = |msg: &'static str| TraitError::new(ErrorCode::InvalidArgument, msg);
+        if !bundle.is_absolute() {
+            return Err(invalid("bundle path must be absolute"));
+        }
+        let dir = crate::exec::open_dir_beneath(bundle, &[]).map_err(|e| {
+            if e.violation.is_some() {
+                invalid("bundle path must be a directory reachable without symlinks")
+            } else {
+                TraitError::new(e.code, "failed to open the bundle directory")
+            }
+        })?;
+        let file = std::fs::File::open(format!("/proc/thread-self/fd/{}", dir.as_raw_fd()))
+            .map_err(|_| {
+                TraitError::new(ErrorCode::Internal, "failed to open the bundle directory")
+            })?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "container start is in progress in another process",
+            )),
+            Err(std::fs::TryLockError::Error(_)) => Err(TraitError::new(
+                ErrorCode::Internal,
+                "failed to lock the bundle directory",
+            )),
+        }
+    }
+
+    /// Linux 以外では所有ロックを取れないため拒否する（fail-closed）。
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn acquire(_bundle: &Path) -> Result<Self, TraitError> {
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "start requires Linux to lock the bundle directory",
+        ))
+    }
+}
+
 /// launcher へ渡す、検証済みの起動仕様。
 ///
 /// 構築は `start` のみ（`pub(super)`）で、一度だけ読んだ `config.json` について、config パーサの上限
@@ -404,9 +473,8 @@ pub trait ProcessLauncher: Send + Sync {
     /// `recover_interrupted_start` は予約を Created へ戻す前に本メソッドを呼び、`Ok(())` のときだけ戻す
     /// （戻すと同じ ID の二重起動が可能になるため）。実装は、`id` のプロセスが存在しないと確証できる場合、
     /// または存在する場合に終了・回収したうえで `Ok(())` を返し、確証できない場合は `Err` を返すこと。
-    /// 別プロセスで実行された start の launch が進行中であり得る場合（そのプロセスが生存している等）も、
-    /// 後からプロセスが現れ得るため確証できないとして `Err` を返すこと（同一プロセス内の進行中の launch は
-    /// start 側の予約が排他する）。
+    /// 進行中の launch との排他は start 側が担う（同一プロセス内は予約、プロセス間は bundle ディレクトリの
+    /// 所有ロック。本メソッドは所有ロックを取れた後にだけ呼ばれる）ため、実装は生存プロセスの確認に専念する。
     /// 既定実装は確認手段を持たないため fail-closed で `Unimplemented` を返す。待ちは `timeout` まで。
     fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
         let _ = (id, timeout);

@@ -16,7 +16,10 @@
 //!    [`LaunchSpec`] はすべてこの 1 回の読み込み結果から作り、`config.json` を読み直さない（読み直すと
 //!    検査した内容と起動する内容が食い違い得る）
 //! 4. 適用できない指定の fail-closed 拒否・args / env の上限検証・rootfs の fd 固定（下記）
-//! 5. 起動権の予約: `StateStore::update` を revision 照合つきで呼び、Created を Running（pid なし）へ
+//! 5. 起動権の所有ロック（bundle ディレクトリの `flock`。`BundleLock`）を取得する。別プロセスの start の
+//!    launch が進行中なら `FailedPrecondition`。ロックは launch が終わるまで保持し、プロセスが終了すれば
+//!    カーネルが解放する（中断回復が所有プロセスの終了を確かめる手段。CORE-2）。続けて起動権の予約:
+//!    `StateStore::update` を revision 照合つきで呼び、Created を Running（pid なし）へ
 //!    原子的に遷移させる。別プロセスの同時 start はここで revision 不一致（`FailedPrecondition`）に
 //!    なり launch へ進めない（CORE-2）
 //! 6. launcher 起動（上限 [`StartTimeouts::launch`]）。失敗時は予約を Created へ戻す（戻せない場合は
@@ -40,11 +43,13 @@
 //!
 //! start のプロセスが手順 5〜7 の間に異常終了すると Running・pid なしの予約だけが残る。この状態は
 //! `FailedPrecondition`（`start was interrupted` を含むメッセージ）で識別でき、
-//! [`recover_interrupted_start`] で Created へ戻せる（CORE-2）。ただし launch 後・pid 記録前の中断では
-//! 生きたプロセスが残り得るため、回復は launcher が生存プロセス無しを確認できた場合に限る（SEC-1）。
+//! [`recover_interrupted_start`] で Created へ戻せる（CORE-2）。回復は、手順 5 の所有ロックを取れる
+//! （＝所有プロセスが終了済みか launch が完了済み）ことと、launch 後・pid 記録前の中断では生きた
+//! プロセスが残り得るため launcher が生存プロセス無しを確認できたことの両方を条件とする（SEC-1）。
 //!
-//! 手順 1〜7 は同一 ID につきプロセス内でも排他する（並行 start の早期拒否。CORE-2）。プロセス間の
-//! 排他は手順 5 の revision 照合（`StateStore` 実装が更新を原子的に照合する契約）に依存する。
+//! 手順 1〜7 は同一 ID につきプロセス内でも排他する（並行 start の早期拒否。CORE-2）。プロセス間では、
+//! 手順 5 の所有ロック（launch の進行中を他プロセスから観測できる）と revision 照合（`StateStore` 実装が
+//! 更新を原子的に照合する契約）で排他する。
 //!
 //! # fail-closed の拒否（SEC-1・SEC-5・CORE-5・REPAIR-3）
 //!
@@ -108,7 +113,9 @@ use std::time::{Duration, Instant};
 
 use super::config::{NamespaceKind, OciConfig};
 use super::create::validate_bundle;
-use super::launch::{LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts};
+use super::launch::{
+    BundleLock, LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts,
+};
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
@@ -225,6 +232,10 @@ where
                 on_late(value);
                 return;
             }
+            // 結果を渡す前に後始末用の捕捉（予約の複製等）を解放する。呼び出し側が結果を受け取って
+            // 戻った時点で、実行スレッド側の複製が残っていないことを保証する（直後の同一 ID の操作が
+            // 予約の残りに阻まれないようにする）。
+            drop(on_late);
             *slot = Slot::Done(value);
             cvar.notify_all();
         })
@@ -270,7 +281,14 @@ fn in_flight() -> &'static Mutex<HashSet<ContainerId>> {
 /// [`recover_interrupted_start`] の生存確認（ID 単位で終了・回収し得る）も、上限超過後に確認が終わるまで
 /// 複製を保持する。一方、上限を超えた `terminate` は特定のプロセスのハンドルに対する操作で、同じ ID の
 /// 後続のプロセスには作用しないため、上限で予約を手放す（戻らない実装で予約が永久に残るのを避ける）。
-struct StartReservation(ContainerId);
+///
+/// プロセス間の排他は、予約に載せる起動権の所有ロック（`BundleLock`。bundle ディレクトリの `flock`）が
+/// 担う。所有ロックも予約と同じ寿命（最後の複製が落ちるまで）で保持される。
+struct StartReservation {
+    id: ContainerId,
+    /// 起動権の所有ロック（取得後に載せる。予約の解放と同時に閉じてロックを解放する）。
+    owner: OnceLock<BundleLock>,
+}
 
 impl StartReservation {
     fn acquire(id: &ContainerId) -> Result<Self, TraitError> {
@@ -281,14 +299,28 @@ impl StartReservation {
                 "container start is already in progress",
             ));
         }
-        Ok(Self(id.clone()))
+        Ok(Self {
+            id: id.clone(),
+            owner: OnceLock::new(),
+        })
+    }
+
+    /// `bundle` の起動権の所有ロックを取得して予約に載せる（プロセス間の排他。CORE-2）。
+    fn lock_owner(&self, bundle: &Path) -> Result<(), TraitError> {
+        let lock = BundleLock::acquire(bundle)?;
+        // 1 つの予約で所有ロックを取るのは 1 回だけ（start・recover とも 1 回呼ぶ）。
+        let _ = self.owner.set(lock);
+        Ok(())
     }
 }
 
 impl Drop for StartReservation {
     fn drop(&mut self) {
+        // 所有ロックを先に解放してからプロセス内の予約を外す（プロセス内で予約が外れたのを見た回復が、
+        // まだ残る自分の所有ロックに阻まれないようにする）。
+        let _ = self.owner.take();
         let mut set = in_flight().lock().unwrap_or_else(|e| e.into_inner());
-        set.remove(&self.0);
+        set.remove(&self.id);
     }
 }
 
@@ -301,9 +333,14 @@ impl Drop for StartReservation {
 ///
 /// 同一プロセス内の start とは排他する。launch が上限を超えて start が `Timeout` で戻った後も、その
 /// launch が終わり遅れて返ったプロセスの後始末が済むまでは予約が解放されず、本関数は
-/// `FailedPrecondition`（`container start is already in progress`）で拒否する（CORE-2）。別プロセスで
-/// 実行された start については、呼び出し元がそのプロセスの終了（＝進行中の launch が無いこと）を
-/// 確認してから呼ぶ（start が `Timeout` で戻っても、そのプロセス内では launch が続き得る）。
+/// `FailedPrecondition`（`container start is already in progress`）で拒否する（CORE-2）。
+///
+/// 別プロセスの start とは、起動権の所有ロック（bundle ディレクトリの `flock`。`BundleLock`）で排他する。
+/// start は予約の前にこのロックを取り、launch（上限超過後に続く分を含む）が終わるまで保持する。
+/// ロックはそのプロセスが終了するとカーネルが解放するため、本関数は呼び出し元の事前確認に依存せず、
+/// ロックを取れた場合（＝所有プロセスが終了済みか launch が完了済み）に限って回復へ進む。取れなければ
+/// `FailedPrecondition`（`container start is in progress in another process`）。Linux 以外はロックを
+/// 取れないため `Unimplemented`（fail-closed）。
 ///
 /// launch 後・pid 記録前の中断では生きたプロセスが残り得るため、Created へ戻す前に
 /// [`ProcessLauncher::confirm_no_process`] で生存プロセスが無いことを確認する。確認できない場合
@@ -326,6 +363,9 @@ pub fn recover_interrupted_start(
             "no interrupted start reservation to recover",
         ));
     }
+    // 別プロセスの launch が進行中でないこと（所有プロセスの終了または launch の完了）を所有ロックで
+    // 確かめてから、生存プロセスの確認へ進む（CORE-2）。
+    reservation.lock_owner(record.bundle())?;
     let confirm = timeouts.confirm();
     let l = Arc::clone(launcher);
     let target = id.clone();
@@ -386,6 +426,10 @@ fn start_inner(
     }
 
     let spec = build_spec(record.bundle())?;
+
+    // 起動権の所有ロック（プロセス間の排他）を予約の前に取り、launch が終わるまで保持する。所有ロックを
+    // 持つプロセスが終了すればカーネルが解放するため、回復はその終了を条件にできる（CORE-2）。
+    reservation.lock_owner(record.bundle())?;
 
     // 起動権の予約。revision 照合つき更新は別プロセスの同時 start と排他になる（CORE-2）。
     let claimed = store.update(&UpdateStateRequest::new(
@@ -740,6 +784,7 @@ mod tests {
             })
         }
 
+        #[cfg(target_os = "linux")]
         fn set_open(&self, open: bool) {
             *self.open.lock().unwrap_or_else(|e| e.into_inner()) = open;
             self.cvar.notify_all();
@@ -794,6 +839,7 @@ mod tests {
             })
         }
 
+        #[cfg(target_os = "linux")]
         fn received_timeouts(&self) -> Vec<Duration> {
             self.timeouts
                 .lock()
@@ -911,6 +957,7 @@ mod tests {
     }
 
     /// `cond` が真になるまで最大 `limit` ポーリングする（固定 sleep に頼らない）。
+    #[cfg(target_os = "linux")]
     fn eventually(limit: Duration, cond: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + limit;
         while Instant::now() < deadline {
@@ -923,6 +970,7 @@ mod tests {
     }
 
     /// 起動待ち 200ms・終了待ち 1s・確認待ち 200ms の短い上限（REPAIR-5 のテスト用）。
+    #[cfg(target_os = "linux")]
     fn short_timeouts() -> StartTimeouts {
         StartTimeouts::new(
             Duration::from_millis(200),
@@ -1344,6 +1392,7 @@ mod tests {
     }
 
     /// CORE-2: 中断された予約（Running・pid なし）は識別でき、回復後に start できる。
+    #[cfg(target_os = "linux")]
     #[test]
     fn core2_interrupted_reservation_is_recoverable() {
         let (b, store) = created("recover");
@@ -1372,16 +1421,94 @@ mod tests {
         assert_eq!(got.status().state(), ContainerState::Created);
         let err = recover(&store, &launcher, &id).expect_err("not stuck");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
-        #[cfg(target_os = "linux")]
         run(&store, &launcher, "recover").expect("start");
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(
-            run(&store, &launcher, "recover")
-                .expect_err("no pinning")
-                .code(),
-            ErrorCode::Unimplemented
-        );
         drop(b);
+    }
+
+    /// 中断された予約（Running・pid なし）を手で作る。
+    fn claim_interrupted(store: &MemStateStore, id: &ContainerId) {
+        let rec = store.get(&GetStateRequest::new(id.clone())).expect("get");
+        store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(id.clone(), None),
+                rec.revision(),
+            ))
+            .expect("claim");
+    }
+
+    /// 別プロセスの所有者を模して bundle ディレクトリへ別の記述子で `flock` をかける（flock は同一
+    /// プロセス内でも別に開いた記述子同士で競合する）。
+    #[cfg(target_os = "linux")]
+    fn lock_bundle_as_other_owner(b: &Bundle) -> std::fs::File {
+        let file = std::fs::File::open(&b.dir).expect("open bundle");
+        file.try_lock().expect("lock bundle");
+        file
+    }
+
+    /// CORE-2・SEC-1: 別プロセスが起動権の所有ロックを持つ間は、生存確認が Ok を返す launcher でも回復を
+    /// 拒否し（確認も呼ばない）、所有者が終了してロックが外れれば回復できる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_recover_requires_owner_lock_across_processes() {
+        let (b, store) = created("owner-recover");
+        let id = ContainerId::new("owner-recover").expect("id");
+        claim_interrupted(&store, &id);
+        let launcher = RecordingLauncher::new(false);
+        launcher.confirms_no_process.store(true, Ordering::SeqCst);
+        let other = lock_bundle_as_other_owner(&b);
+        let err = recover(&store, &launcher, &id).expect_err("owner alive");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "container start is in progress in another process"
+        );
+        assert_eq!(launcher.received_timeouts(), [] as [Duration; 0]);
+        let got = store.get(&GetStateRequest::new(id.clone())).expect("get");
+        assert_eq!(got.status().state(), ContainerState::Running);
+        drop(other);
+        let got = recover(&store, &launcher, &id).expect("owner gone");
+        assert_eq!(got.status().state(), ContainerState::Created);
+    }
+
+    /// CORE-2: 別プロセスが所有ロックを持つ間の start は、予約・launch をせず FailedPrecondition。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_start_requires_owner_lock_across_processes() {
+        let (b, store) = created("owner-start");
+        let launcher = RecordingLauncher::new(false);
+        let other = lock_bundle_as_other_owner(&b);
+        let err = run(&store, &launcher, "owner-start").expect_err("locked");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "container start is in progress in another process"
+        );
+        assert_eq!(launcher.calls(), 0);
+        let id = ContainerId::new("owner-start").expect("id");
+        let got = store.get(&GetStateRequest::new(id)).expect("get");
+        assert_eq!(got.status().state(), ContainerState::Created);
+        drop(other);
+        run(&store, &launcher, "owner-start").expect("start after unlock");
+        assert_eq!(launcher.calls(), 1);
+    }
+
+    /// SEC-1・CLI-1: Linux 以外は起動権の所有ロックを取れないため、回復は Unimplemented で予約を残す。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn core2_recover_fails_closed_without_owner_lock() {
+        let (_b, store) = created("recover-nolinux");
+        let id = ContainerId::new("recover-nolinux").expect("id");
+        claim_interrupted(&store, &id);
+        let launcher = RecordingLauncher::new(false);
+        launcher.confirms_no_process.store(true, Ordering::SeqCst);
+        let err = recover(&store, &launcher, &id).expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert_eq!(
+            err.message(),
+            "start requires Linux to lock the bundle directory"
+        );
+        let got = store.get(&GetStateRequest::new(id)).expect("get");
+        assert_eq!(got.status().state(), ContainerState::Running);
     }
 
     /// SEC-1: 絶対指定の `root.path` でホストの `/` を rootfs にする起動は拒否する。
@@ -1531,7 +1658,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn repair5_start_times_out_when_launcher_does_not_return() {
-        let (_b, store) = created("launch-hang");
+        let (b, store) = created("launch-hang");
         let launcher = RecordingLauncher::new(false);
         launcher.gate.set_open(false);
         let begin = Instant::now();
@@ -1567,6 +1694,12 @@ mod tests {
         let err = run(&store, &launcher, "launch-hang").expect_err("launch in flight");
         assert_eq!(err.message(), "container start is already in progress");
         assert_eq!(launcher.received_timeouts(), [Duration::from_millis(200)]);
+        // 別プロセスからも、launch の進行中は所有ロック（bundle の flock）が取れないことで観測できる。
+        let probe = std::fs::File::open(&b.dir).expect("open bundle");
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
         launcher.gate.set_open(true);
         assert!(eventually(Duration::from_secs(10), || launcher
             .terminations()
@@ -1576,6 +1709,10 @@ mod tests {
                 e.message() == "container start was interrupted; recover the start reservation"
             })
         }));
+        assert!(eventually(Duration::from_secs(10), || probe
+            .try_lock()
+            .is_ok()));
+        drop(probe);
         let got = recover(&store, &launcher, &id).expect("recover after the launch ended");
         assert_eq!(got.status().state(), ContainerState::Created);
         assert_eq!(launcher.calls(), 1);
@@ -1664,6 +1801,7 @@ mod tests {
 
     /// REPAIR-5・CORE-2: 生存確認が上限内に戻らなければ回復は Timeout を返して予約を残す。確認が終わる
     /// までは同一 ID の回復・start を拒否し、確認が戻った後に回復できる。
+    #[cfg(target_os = "linux")]
     #[test]
     fn repair5_recover_times_out_when_confirmation_does_not_return() {
         let (_b, store) = created("confirm-hang");

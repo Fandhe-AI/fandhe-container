@@ -1211,6 +1211,25 @@ mod platform_tests {
         );
     }
 
+    /// OCI-5: 上書き指定は末尾の区切り文字・`.` を取り除いて保持し、`..` を含むものは拒否する。
+    #[test]
+    fn oci5_override_is_normalized_and_rejects_parent_components() {
+        let base = std::env::temp_dir().join("fandhe-root");
+        let mut trailing = base.clone().into_os_string();
+        trailing.push(std::path::MAIN_SEPARATOR_STR);
+        let root = StateRoot::from_override(PathBuf::from(trailing)).unwrap();
+        assert_eq!(root.path(), base.as_path());
+        assert_eq!(root.path().as_os_str(), base.as_os_str());
+        let dotted = StateRoot::from_override(base.join(".").join("x")).unwrap();
+        assert_eq!(dotted.path().as_os_str(), base.join("x").as_os_str());
+        let e = StateRoot::from_override(base.join("..").join("x")).unwrap_err();
+        assert_eq!(e.code().as_str(), "INVALID_ARGUMENT");
+        assert_eq!(
+            e.message(),
+            "state root must not contain parent directory components"
+        );
+    }
+
     /// OCI-5・CLI-1: Linux 以外では状態ルートを作らずに `Unimplemented` を返す（信頼境界を
     /// 検査できないため。start の `BundleLock::acquire` と同じ扱い）。
     #[cfg(not(target_os = "linux"))]
@@ -2028,6 +2047,16 @@ mod tests {
         }
         fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
         FileStateStore::open(StateRoot::from_override(real).unwrap()).unwrap();
+        // 末尾に区切り文字を付けても symlink を辿らずに拒否する（`lstat("link/")` はリンク先を返す）。
+        let mut trailing = t.path().join("link").into_os_string();
+        trailing.push("/");
+        let e = FileStateStore::open(StateRoot::from_override(PathBuf::from(trailing)).unwrap())
+            .unwrap_err();
+        assert_eq!(e.code().as_str(), "PERMISSION_DENIED");
+        assert_eq!(
+            e.message(),
+            "state root must be a directory and not a symlink"
+        );
         let fresh = t.path().join("fresh");
         FileStateStore::open(StateRoot::from_override(fresh.clone()).unwrap()).unwrap();
         assert_eq!(

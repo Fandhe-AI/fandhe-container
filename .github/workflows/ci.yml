@@ -510,6 +510,8 @@ jobs:
         run: make fio-baseline-ratio-selftest
       - name: ベンチ回帰比較スクリプトの自己テスト（受け入れ基準 2 の記録。REPAIR-12）
         run: make bench-check-selftest
+      - name: baseline.json 生成スクリプトの自己テスト（TASK-88.1・REPAIR-8・REPAIR-12）
+        run: make bench-baseline-selftest
       - name: ベンチ比較の配線確認（プレースホルダ・性能回帰は未検出）
         run: make bench-check
 

@@ -25,6 +25,9 @@
 //!
 //! - 5 メソッドはすべて「プロセス内 `Mutex` → `@lock` の `try_lock`（上限 [`STATE_LOCK_TIMEOUT`]、
 //!   超えたら `Timeout`。REPAIR-5）」を取ってから読み書きする
+//! - 既存のエントリ（`@lock`・`@revision`・`state.json`・fsync するディレクトリ）は
+//!   `O_NOFOLLOW | O_NONBLOCK` で開き（`open_nowait`）、開いた実体の種別を fstat で確かめる。
+//!   FIFO 等に置き換わっていても `open(2)` 自体が相手を待って止まらない（REPAIR-5）
 //! - revision は `@revision` のハイウォーターマークから払い出し、レコードより先に書く。
 //!   クラッシュしても欠番になるだけで再利用しない。`@revision` は新規ストアの `open` が
 //!   `@lock` より先に（hard_link で不可分に）初期化し、後から消えた場合は採番履歴を確認できないためレコードの有無によらず
@@ -54,7 +57,8 @@
 //! 検査と保護 DACL での作成、macOS の実効 UID の取得には `sys` の FFI が要るが、`sys` は Linux 限定）。
 //! macOS / Windows では状態ルートをゲスト VM 内の Linux パスに置く（OCI-5）ため、ホスト側で本実装を
 //! 使う経路はない。start の所有ロック（`BundleLock::acquire`）が Linux 以外で `Unimplemented` を返すのと
-//! 同じ扱いである（CLI-1）
+//! 同じ扱いである（CLI-1）。Linux でも `open(2)` フラグの値を `sys` が持たないアーキテクチャ
+//! （x86_64・aarch64 以外）では同様に `Unimplemented`
 
 use std::collections::BinaryHeap;
 use std::ffi::OsString;
@@ -338,9 +342,13 @@ impl FileStateStore {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let file = opts
-            .open(&path)
+        // FIFO 等に置き換わっていても open 自体で待たず（O_NONBLOCK）、開いた実体が通常ファイルで
+        // なければ拒否する（REPAIR-5: 期限判定の前に無期限に止まらない）。
+        let file = open_nowait(&path, &mut opts)
             .map_err(|_| internal("failed to open the state lock file"))?;
+        if !file.metadata().is_ok_and(|m| m.is_file()) {
+            return Err(internal("state lock file is not a regular file"));
+        }
         loop {
             match file.try_lock() {
                 Ok(()) => {
@@ -775,8 +783,17 @@ impl StateStore for FileStateStore {
 /// 本実装を使えるプラットフォームか確かめる（Linux のみ。モジュール doc「対応プラットフォーム」）。
 ///
 /// `open` の先頭で呼ぶ。実行時の `?` で拒否するため、以降のコードは 3 OS でコンパイル・型検査される。
+///
+/// Linux でも、`open_nowait` のフラグ（`O_NOFOLLOW | O_NONBLOCK`）の値を持たない対応外
+/// アーキテクチャ（x86_64・aarch64 以外）では拒否する（FIFO 等で open が止まるのを防げないため）。
 #[cfg(target_os = "linux")]
 fn ensure_supported_platform() -> Result<(), TraitError> {
+    if crate::sys::nofollow_nonblock_open_flags().is_none() {
+        return Err(err(
+            ErrorCode::Unimplemented,
+            "file state store is not supported on this architecture",
+        ));
+    }
     Ok(())
 }
 
@@ -945,9 +962,14 @@ fn check_bundle(bundle: &Path) -> Result<&str, TraitError> {
 }
 
 /// 通常ファイルを上限つきで読む。上限を超えたら `Ok(None)`（無制限確保の防止）。
-/// 開く・読むの失敗（権限・I/O）は `Err`（内容の問題とは区別する）。
+/// 開く・読むの失敗（権限・I/O）と、開いた実体が通常ファイルでない（呼び出し側の種別検査の後に
+/// FIFO 等へ置き換わった）場合は `Err`（内容の問題とは区別する）。open は `open_nowait` で待たない。
 fn read_limited(path: &Path, max: u64) -> Result<Option<Vec<u8>>, TraitError> {
-    let file = File::open(path).map_err(|_| internal("failed to open the state file"))?;
+    let file = open_nowait(path, OpenOptions::new().read(true))
+        .map_err(|_| internal("failed to open the state file"))?;
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return Err(internal("state file is not a regular file"));
+    }
     let mut buf = Vec::new();
     file.take(max.saturating_add(1))
         .read_to_end(&mut buf)
@@ -1033,15 +1055,37 @@ fn write_file_replacing(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Trai
 }
 
 /// ディレクトリを fsync して dirent の変更（作成・rename・unlink）を永続化する。
+/// open は `open_nowait` で待たず、開いた実体がディレクトリでなければ拒否する。
 /// Linux 以外は `open` が先に拒否するため、非 unix の枝は型検査のためだけに残す。
 fn sync_dir(dir: &Path) -> Result<(), TraitError> {
     #[cfg(unix)]
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|_| internal("failed to sync the state directory"))?;
+    {
+        let d = open_nowait(dir, OpenOptions::new().read(true))
+            .map_err(|_| internal("failed to sync the state directory"))?;
+        if !d.metadata().is_ok_and(|m| m.is_dir()) {
+            return Err(internal("state directory is not a directory"));
+        }
+        d.sync_all()
+            .map_err(|_| internal("failed to sync the state directory"))?;
+    }
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
+}
+
+/// 最終要素の symlink を辿らず（`O_NOFOLLOW`）、FIFO 等でも `open(2)` 自体が相手を待たない
+/// （`O_NONBLOCK`）ように開く（REPAIR-5）。種別の確認は呼び出し側が開いたハンドルの
+/// `metadata`（fstat）で行う。フラグの値はアーキテクチャ別（`sys`）で、対応外アーキテクチャでは
+/// 開かずに `Unsupported`（`open` が先に拒否するため通常は到達しない。fail-closed）。
+fn open_nowait(path: &Path, opts: &mut OpenOptions) -> std::io::Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = crate::sys::nofollow_nonblock_open_flags()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::Unsupported))?;
+        opts.custom_flags(flags);
+    }
+    opts.open(path)
 }
 
 /// `state.json` の JSON 表現（OCI Runtime Spec の state 形式。`ociVersion`・`id`・`status`・

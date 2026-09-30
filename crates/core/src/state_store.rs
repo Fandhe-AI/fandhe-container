@@ -59,6 +59,12 @@ pub const STATE_FILE_NAME: &str = "state.json";
 /// `state.json` として読み込む最大バイト数（無制限なメモリ確保の防止）。
 pub const MAX_STATE_FILE_BYTES: u64 = 64 * 1024;
 
+/// `bundle` の絶対パスとして受け付ける最大バイト数（Linux の `PATH_MAX`。TASK-31.1・OCI-5）。
+///
+/// シリアライズ前に検証し、`state.json` が [`MAX_STATE_FILE_BYTES`] を超えて書けても読めない
+/// レコードになることを防ぐ（無制限確保の防止）。
+pub const MAX_BUNDLE_PATH_BYTES: usize = 4096;
+
 /// ファイルロックを待つ上限時間（REPAIR-5: 相手を無期限に待たない）。
 pub const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -300,11 +306,24 @@ impl FileStateStore {
         let dto = StateDto::from_record(record)?;
         let bytes =
             serde_json::to_vec(&dto).map_err(|_| internal("failed to serialize the state"))?;
+        if bytes.len() as u64 > MAX_STATE_FILE_BYTES {
+            return Err(err(
+                ErrorCode::InvalidArgument,
+                "state file exceeds the size limit",
+            ));
+        }
         write_file_replacing(&self.record_dir(record.id()), STATE_FILE_NAME, &bytes)
     }
 
     /// revision を 1 つ払い出し、上限値を先に永続化する（ロック保持下で呼ぶこと）。
-    fn allocate_revision(&self) -> Result<StateRevision, TraitError> {
+    ///
+    /// `existing` は更新対象の既存レコード。ハイウォーターマークがその revision 以下なら
+    /// （クラッシュ・巻き戻り等で `@revision` が古い）revision の再発行になるため fail-closed
+    /// （`Internal`）にする。`@revision` は fsync 済みで置き換える（`write_file_replacing`）。
+    fn allocate_revision(
+        &self,
+        existing: Option<&StateRecord>,
+    ) -> Result<StateRevision, TraitError> {
         let path = self.root.join(REVISION_FILE);
         let current = match fs::symlink_metadata(&path) {
             Ok(m) if m.is_file() => {
@@ -327,6 +346,11 @@ impl FileStateStore {
             }
             Err(_) => return Err(internal("failed to inspect the revision file")),
         };
+        if let Some(rec) = existing
+            && rec.revision().value() >= current.value()
+        {
+            return Err(internal("revision high-water mark is behind the record"));
+        }
         let next = current.next()?;
         write_file_replacing(
             &self.root,
@@ -354,6 +378,7 @@ impl FileStateStore {
 
 impl StateStore for FileStateStore {
     fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+        check_bundle_len(req.bundle())?;
         let _guard = self.lock()?;
         if self.read_record(req.id())?.is_some() {
             return Err(err(
@@ -379,7 +404,7 @@ impl StateStore for FileStateStore {
             }
             Err(_) => return Err(internal("failed to create the state directory")),
         }
-        let revision = self.allocate_revision()?;
+        let revision = self.allocate_revision(None)?;
         let record = StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
         self.write_record(&record)?;
         Ok(record)
@@ -396,7 +421,7 @@ impl StateStore for FileStateStore {
                 "state revision does not match",
             ));
         }
-        let revision = self.allocate_revision()?;
+        let revision = self.allocate_revision(Some(&existing))?;
         let record = StateRecord::new(
             req.status().clone(),
             existing.bundle().to_path_buf(),
@@ -597,6 +622,17 @@ fn reject_symlink(path: &Path) -> Result<(), TraitError> {
     }
 }
 
+/// `bundle` のバイト長を上限検証する（シリアライズ前。UTF-8 でなければ別途拒否される）。
+fn check_bundle_len(bundle: &Path) -> Result<(), TraitError> {
+    if bundle.as_os_str().len() > MAX_BUNDLE_PATH_BYTES {
+        return Err(err(
+            ErrorCode::InvalidArgument,
+            "bundle path exceeds the length limit",
+        ));
+    }
+    Ok(())
+}
+
 /// 通常ファイルを上限つきで読む。上限を超えたら `Internal`（無制限確保の防止）。
 fn read_limited(path: &Path, max: u64, too_large: &'static str) -> Result<Vec<u8>, TraitError> {
     let file = File::open(path).map_err(|_| internal("failed to open the state file"))?;
@@ -612,8 +648,10 @@ fn read_limited(path: &Path, max: u64, too_large: &'static str) -> Result<Vec<u8
 
 /// 同じディレクトリの `<name>.tmp` へ書いて `rename` する（トレイト契約 4 の不可分な書き込み）。
 ///
-/// 全書き込みの唯一の経路。ファイルと親ディレクトリの fsync、一時ファイル名の衝突回避と
-/// 残骸掃除は TASK-31.2（#156）で強化する予定で、現状は未実装（REPAIR-3）。
+/// 全書き込みの唯一の経路。一時ファイルを `sync_all` してから `rename` し、unix では親
+/// ディレクトリも fsync して置き換えを永続化する（クラッシュ後の revision 再発行防止）。
+/// 一時ファイル名の衝突回避と残骸掃除は TASK-31.2（#156）で強化する予定で、現状は未実装
+/// （REPAIR-3）。Windows のディレクトリ fsync は未実装（将来課題）。
 fn write_file_replacing(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), TraitError> {
     let tmp = dir.join(format!("{name}.tmp"));
     let dest = dir.join(name);
@@ -634,9 +672,16 @@ fn write_file_replacing(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Trai
         .map_err(|_| internal("failed to create the temporary file"))?;
     file.write_all(bytes)
         .map_err(|_| internal("failed to write the temporary file"))?;
+    file.sync_all()
+        .map_err(|_| internal("failed to sync the temporary file"))?;
     drop(file);
     reject_symlink(&dest)?;
-    fs::rename(&tmp, &dest).map_err(|_| internal("failed to replace the state file"))
+    fs::rename(&tmp, &dest).map_err(|_| internal("failed to replace the state file"))?;
+    #[cfg(unix)]
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|_| internal("failed to sync the state directory"))?;
+    Ok(())
 }
 
 /// `state.json` の JSON 表現（OCI Runtime Spec の state 形式。`ociVersion`・`id`・`status`・
@@ -657,6 +702,7 @@ struct StateDto {
 
 impl StateDto {
     fn from_record(record: &StateRecord) -> Result<Self, TraitError> {
+        check_bundle_len(record.bundle())?;
         let status = record.status();
         let bundle = record
             .bundle()
@@ -781,9 +827,11 @@ mod tests {
             resolve_default(true, None).unwrap(),
             PathBuf::from("/run/fandhe-container")
         );
+        // Windows では "/run/user/1000" が絶対パスでないため、OS ごとの絶対パスを使う。
+        let xdg = std::env::temp_dir();
         assert_eq!(
-            resolve_default(false, Some(OsString::from("/run/user/1000"))).unwrap(),
-            PathBuf::from("/run/user/1000").join("fandhe-container")
+            resolve_default(false, Some(xdg.clone().into_os_string())).unwrap(),
+            xdg.join("fandhe-container")
         );
         for bad in [
             None,
@@ -804,6 +852,30 @@ mod tests {
             code(StateRoot::resolve(Some(PathBuf::from("x")))),
             "INVALID_ARGUMENT"
         );
+    }
+
+    #[test]
+    fn oci5_create_rejects_overlong_bundle_path() {
+        let t = TmpDir::new("longbundle");
+        let store = t.open();
+        let long = std::env::temp_dir().join("a".repeat(MAX_BUNDLE_PATH_BYTES + 1));
+        let req = CreateStateRequest::new(ContainerStatus::creating(cid("big")), long).unwrap();
+        assert_eq!(code(store.create(&req)), "INVALID_ARGUMENT");
+        // 拒否時は revision もレコードも消費しない。
+        assert!(!t.path().join("big").exists());
+        assert!(!t.path().join("@revision").exists());
+    }
+
+    #[test]
+    fn oci5_update_fails_closed_when_revision_high_water_mark_is_behind() {
+        let t = TmpDir::new("hwm");
+        let store = t.open();
+        let rec = create(&store, "web");
+        // @revision が巻き戻った状態（fsync 欠落クラッシュ相当）を再現する。
+        fs::write(t.path().join("@revision"), b"0").unwrap();
+        let req =
+            UpdateStateRequest::new(ContainerStatus::running(cid("web"), None), rec.revision());
+        assert_eq!(code(store.update(&req)), "INTERNAL");
     }
 
     #[test]

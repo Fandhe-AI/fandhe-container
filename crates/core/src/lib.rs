@@ -48,7 +48,10 @@
 //!   使えるのは Linux のみで、他 OS の `FileStateStore::open` は状態ルートの信頼境界（所有者・ACL）を
 //!   検査できないため `Unimplemented`（fail-closed。start の `BundleLock` と同じ扱い）。
 //!   fsync・残骸掃除の強化は TASK-31.2（#156）、結合テストの拡充は TASK-31.3（#157）で行う予定
-//! - 予定（未作成）: `cgroups`（TASK-32・CORE-3）・`plugin_discovery`（TASK-109）
+//! - `cgroups`: 委譲 cgroup v2 の検出・コンテナ用子 cgroup 作成・自プロセス退避の検証・controller
+//!   有効化（Linux 限定。TASK-32.1・CORE-3 は実装済み。`memory.max`〔TASK-32.2〕・`cpu.max`〔TASK-32.3〕・
+//!   起動フローへの組み込み〔TASK-32.4〕は未実装で、現状は起動フローから呼ばれない）
+//! - 予定（未作成）: `plugin_discovery`（TASK-109）
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
 //!
@@ -65,6 +68,8 @@
 //! 実装する未実装のままである（REPAIR-3: 実装済みを装わず、未実装であることも隠さない）。
 
 pub mod capabilities;
+#[cfg(target_os = "linux")]
+pub mod cgroups;
 #[cfg(target_os = "linux")]
 pub mod exec;
 #[cfg(target_os = "linux")]

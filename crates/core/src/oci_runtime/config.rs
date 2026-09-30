@@ -1778,6 +1778,45 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
+    /// `args` / `env` の 1 要素は上限ちょうどを受理し、1 バイト超過を拒否する（OCI-4・CORE-2）。
+    #[test]
+    fn oci4_string_item_limit_boundary() {
+        let arg = "a".repeat(CONFIG_MAX_STRING_BYTES);
+        let env = format!("K={}", "v".repeat(CONFIG_MAX_STRING_BYTES - 2));
+        let mut v = base();
+        v["process"]["args"] = json!([arg]);
+        v["process"]["env"] = json!([env]);
+        let cfg = parse(&v).expect("at limit");
+        let p = cfg.process().expect("process");
+        assert_eq!(p.args()[0].len(), 131_071);
+        assert_eq!(p.env()[0].len(), 131_071);
+
+        let mut v = base();
+        v["process"]["env"] = json!([format!("K={}", "v".repeat(CONFIG_MAX_STRING_BYTES - 1))]);
+        assert_eq!(
+            *err_of(&v).kind(),
+            OciConfigErrorKind::LimitExceeded {
+                field: "process.env[]".to_owned(),
+                limit: 131_071
+            }
+        );
+    }
+
+    /// パーサが上限ちょうどで受理した `args` / `env` を `exec::Entrypoint::new` もそのまま受理する
+    /// （パースを通った値が後段の 1 要素上限で拒否されない。CORE-2）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_parsed_items_at_limit_are_accepted_by_entrypoint() {
+        let mut v = base();
+        v["process"]["args"] = json!(["a".repeat(CONFIG_MAX_STRING_BYTES)]);
+        v["process"]["env"] = json!([format!("K={}", "v".repeat(CONFIG_MAX_STRING_BYTES - 2))]);
+        let cfg = parse(&v).expect("at limit");
+        let p = cfg.process().expect("process");
+        let ep = crate::exec::Entrypoint::new("/bin/app", p.args(), p.env())
+            .expect("entrypoint accepts parsed values at the limit");
+        assert_eq!(ep.path(), Path::new("/bin/app"));
+    }
+
     /// `exec::Entrypoint` の上限との対応を照合し、片方だけ変更されるドリフトを防ぐ
     /// （1 要素の上限は Entrypoint 側が NUL 込みのため、こちらは 1 バイト小さい）。
     #[cfg(target_os = "linux")]

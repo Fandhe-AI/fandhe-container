@@ -31,8 +31,11 @@
 //!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。
 //!   start（TASK-29.3）は実装済みだが起動は `ProcessLauncher` の依存注入で、本番 launcher と実 exec は未提供。
 //!   kill / delete は TASK-30 で追加する予定で未実装
+//! - `cgroups`: 委譲 cgroup v2 の検出・コンテナ用子 cgroup 作成・自プロセス退避の検証・controller
+//!   有効化（Linux 限定。TASK-32.1・CORE-3 は実装済み。`memory.max`〔TASK-32.2〕・`cpu.max`〔TASK-32.3〕・
+//!   起動フローへの組み込み〔TASK-32.4〕は未実装で、現状は起動フローから呼ばれない）
 //! - 予定（未作成）: `state_store`
-//!   （TASK-31・OCI-5）・`cgroups`（TASK-32・CORE-3）・`plugin_discovery`（TASK-109）
+//!   （TASK-31・OCI-5）・`plugin_discovery`（TASK-109）
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
 //!
@@ -48,6 +51,8 @@
 //! 実行層本体（namespace・cgroups v2・seccomp/Landlock・rootless 等）は G3（TASK-27〜50）で
 //! 実装する未実装のままである（REPAIR-3: 実装済みを装わず、未実装であることも隠さない）。
 
+#[cfg(target_os = "linux")]
+pub mod cgroups;
 #[cfg(target_os = "linux")]
 pub mod exec;
 pub mod observability;

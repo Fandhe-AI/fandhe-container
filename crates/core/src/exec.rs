@@ -1,7 +1,8 @@
 //! 実行層の最小実行フロー（CORE-1・TASK-27・MS-2）を担うモジュール。
 //!
 //! 現状は namespace 分離（[`isolate`]・[`mount_proc`]。#134・TASK-27.2）と、`pivot_root` による
-//! rootfs 切替（[`prepare_rootfs`]・[`pivot_root`]。#135・TASK-27.3）まで実装済み。
+//! rootfs 切替（[`prepare_rootfs`]・[`pivot_root`]。#135・TASK-27.3）、基本デバイスノード作成
+//! （[`create_default_devices`]。#834・TASK-27.6）まで実装済み。
 //! fork / exec 等の後続段は未実装で、後続の sub-issue
 //! （#136・#137・#831〜#834）が本モジュールへ追記する（REPAIR-3: 実装済みを装わない）。
 //!
@@ -10,7 +11,9 @@
 //! 1. namespace 分離（PID / mount / UTS / IPC / user。#134・TASK-27.2。**実装済み**）
 //! 2. `pivot_root` による rootfs 切替と旧 root の後始末（#135・TASK-27.3。**実装済み**。
 //!    [`prepare_rootfs`]〔自己 bind と rootfs 配下への `/proc` マウント〕→ [`pivot_root`]）
-//! 3. 基本デバイスノード 6 種の作成（#834・TASK-27.6。実体は別モジュール `devices` の予定）
+//! 3. 基本デバイスノード 6 種の作成（#834・TASK-27.6。**実装済み**。[`create_default_devices`] を
+//!    [`prepare_rootfs`] の後・[`pivot_root`] の前に呼ぶ。rootless では `mknod` が `EPERM` になり
+//!    `PermissionDenied` で fail-closed する。ホスト `/dev` の bind mount による代替は未実装）
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
 //!    → Landlock → seccomp（#136・#832・#833。後続の TASK-32・37・38・39・40 が差し込む）。
 //!    `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
@@ -60,9 +63,11 @@ use std::path::{Component, Path};
 use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
 
+mod devices;
 mod rootfs;
 mod violation;
 
+pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_default_devices};
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 
 pub use violation::{
@@ -269,6 +274,8 @@ pub enum IsolationStage {
     PrepareRootfs,
     /// `pivot_root(2)` による rootfs 切替と旧 root の切り離し。
     PivotRoot,
+    /// rootfs 配下の `dev` への基本デバイスノード作成（`mknodat(2)`）。
+    CreateDevices,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。

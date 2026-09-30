@@ -19,10 +19,12 @@
 //!
 //! - `traits`: 拡張点トレイト（実装済み。TASK-4 系）
 //! - `exec`: 最小実行フロー（Linux 限定。namespace 分離〔TASK-27.2〕と `pivot_root` による
-//!   rootfs 切替〔TASK-27.3〕が実装済みで、fork / exec 等は未実装。非 Linux ではビルド対象外のため本 doc からは
+//!   rootfs 切替〔TASK-27.3〕、基本デバイスノード作成〔TASK-27.6。`exec/devices.rs`。
+//!   Issue 表記の `src/devices.rs` ではなく `exec` 配下に置く: 段の型 `ExecError`・`MountIsolation`
+//!   の検証が `exec` の非公開項目のため〕が実装済みで、fork / exec 等は未実装。非 Linux ではビルド対象外のため本 doc からは
 //!   リンクしない）
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
-//! - 予定（未作成）: `devices`（TASK-27.6）・`oci_runtime`（TASK-29・30）・`state_store`
+//! - 予定（未作成）: `oci_runtime`（TASK-29・30）・`state_store`
 //!   （TASK-31・OCI-5）・`cgroups`（TASK-32・CORE-3）・`plugin_discovery`（TASK-109）
 //!
 //! 実行層本体（namespace・cgroups v2・seccomp/Landlock・rootless 等）は G3（TASK-27〜50）で

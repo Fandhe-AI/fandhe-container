@@ -5,7 +5,7 @@
 //! `crate::exec` の最小実行フロー第 2 段。新しい PID namespace の PID 1 が
 //! [`MountIsolation::establish`] で自分だけの mount namespace を作った後に、次の 2 段を順に通す
 //! （呼び出し元は TASK-29 の `oci_runtime` と fork 段〔#831〕を想定。基本デバイスノード作成
-//! 〔#834・TASK-27.6〕や CDI hook〔TASK-127〕は 2 段の間に差し込む）。
+//! 〔[`super::create_default_devices`]・#834・TASK-27.6〕や CDI hook〔TASK-127〕は 2 段の間に差し込む）。
 //!
 //! ```text
 //! MountIsolation::establish()
@@ -76,6 +76,14 @@ pub struct PreparedRootfs {
     new_root_mnt_id: u64,
     /// `!Send`・`!Sync` にするための印。
     _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl PreparedRootfs {
+    /// 新しい mount top を指す O_PATH fd の借用。`super::create_default_devices` が、パス文字列を
+    /// 再解決せずこの fd 起点で `dev` を開くために使う（TASK-27.6）。
+    pub(super) fn new_root(&self) -> BorrowedFd<'_> {
+        self.new_root.as_fd()
+    }
 }
 
 /// [`pivot_root`] の結果。将来の拡張（ステージ列・監査ログ）に備えて非網羅の構造体にする。

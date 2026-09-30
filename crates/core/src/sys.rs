@@ -6,10 +6,10 @@
 //! # 呼び出し文脈
 //! `crate::exec::isolate`・`crate::exec::MountIsolation::establish`・`crate::exec::mount_proc`
 //! （CORE-1・TASK-27.2・#134）と、`crate::exec::prepare_rootfs`・`crate::exec::pivot_root`
-//! （CORE-1・TASK-27.3・#135）が、
+//! （CORE-1・TASK-27.3・#135）と、`crate::exec::create_default_devices`（CORE-1・TASK-27.6・#834）が、
 //! `unshare(2)`・`sethostname(2)`・`mount(2)`・`openat(2)`・`geteuid(2)`・`getegid(2)` に加え、
 //! `pivot_root(2)`（glibc がラッパーを持たないため `syscall(2)` 経由）・`umount2(2)`・`fchdir(2)`
-//! を呼ぶために使う。std だけでは提供されない
+//! に加え、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。std だけでは提供されない
 //! syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
 //! （`Hostname` 等）が済ませた値だけを受け取る。
 //!
@@ -45,7 +45,7 @@ pub(crate) enum SysError {
 }
 
 /// errno の値（アーキテクチャごとに `consts` で個別定義。alpha / mips / sparc 等は値が違う）。
-pub(crate) use consts::{EACCES, EINVAL, ELOOP, ENOENT, ENOTDIR, EPERM};
+pub(crate) use consts::{EACCES, EEXIST, EINVAL, ELOOP, ENOENT, ENOTDIR, EPERM};
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）
 //
@@ -90,9 +90,12 @@ mod consts {
     pub const EPERM: i32 = 1;
     pub const ENOENT: i32 = 2;
     pub const EACCES: i32 = 13;
+    pub const EEXIST: i32 = 17;
     pub const ENOTDIR: i32 = 20;
     pub const EINVAL: i32 = 22;
     pub const ELOOP: i32 = 40;
+    // include/uapi/linux/stat.h の `S_IFCHR`（文字デバイス。全アーキテクチャ共通）。
+    pub const S_IFCHR: u32 = 0o020_000;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -125,9 +128,12 @@ mod consts {
     pub const EPERM: i32 = 1;
     pub const ENOENT: i32 = 2;
     pub const EACCES: i32 = 13;
+    pub const EEXIST: i32 = 17;
     pub const ENOTDIR: i32 = 20;
     pub const EINVAL: i32 = 22;
     pub const ELOOP: i32 = 40;
+    // include/uapi/linux/stat.h の `S_IFCHR`（文字デバイス。全アーキテクチャ共通）。
+    pub const S_IFCHR: u32 = 0o020_000;
 }
 
 /// 対応外アーキテクチャ: 定数は 0 で、ラッパーは `Unsupported` を返す。errno は実在しない
@@ -155,9 +161,11 @@ mod consts {
     pub const EPERM: i32 = -1;
     pub const ENOENT: i32 = -2;
     pub const EACCES: i32 = -3;
+    pub const EEXIST: i32 = -7;
     pub const ENOTDIR: i32 = -4;
     pub const EINVAL: i32 = -5;
     pub const ELOOP: i32 = -6;
+    pub const S_IFCHR: u32 = 0;
 }
 
 /// `openat(2)` の `AT_FDCWD`（絶対パス指定時は dirfd が無視される）。値は
@@ -214,6 +222,9 @@ unsafe extern "C" {
     fn umount2(target: *const core::ffi::c_char, flags: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int fchdir(int fd)`。
     fn fchdir(fd: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int mknodat(int dirfd, const char *pathname, mode_t mode,
+    // dev_t dev)`（glibc / musl の LP64 で `mode_t` は u32・`dev_t` は u64）。
+    fn mknodat(dirfd: i32, path: *const core::ffi::c_char, mode: u32, dev: u64) -> i32;
     // SAFETY（宣言そのものの妥当性）: `uid_t geteuid(void)`（Linux の `uid_t` は u32）。
     fn geteuid() -> u32;
     // SAFETY（宣言そのものの妥当性）: `gid_t getegid(void)`（Linux の `gid_t` は u32）。
@@ -406,6 +417,68 @@ pub(crate) fn change_dir_fd(fd: BorrowedFd<'_>) -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// [`open_path_nofollow`] が渡す `openat(2)` のフラグ（`O_PATH|O_NOFOLLOW|O_CLOEXEC`）。
+/// `O_DIRECTORY` を付けないため、最終要素が symlink でもそれ自体を指す fd が得られる
+/// （辿らない）。返る fd は fstat と `/proc/thread-self/fd/N` の magic link 専用。
+fn open_path_flags() -> i32 {
+    consts::O_PATH | consts::O_NOFOLLOW | consts::O_CLOEXEC
+}
+
+/// `parent` 配下の `name` を [`open_path_flags`] で開く（種別は問わない・最終要素の symlink は辿らない）。
+/// `crate::exec::create_default_devices` が、作成直後のデバイスノードを固定して種別と
+/// `rdev` を検証するために使う（検証した実体だけを chmod する TOCTOU 対策。CORE-1）。
+pub(crate) fn open_path_nofollow(parent: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = open_path_flags();
+    // SAFETY: `name` は借用した NUL 終端文字列で呼び出しの間生存する。`parent` は生存中の
+    // `BorrowedFd`。flags に O_CREAT / O_TMPFILE を含まないため可変長引数（mode）は渡さない。
+    // 成功時の戻り値は新規 fd で、直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let fd = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// glibc の `gnu_dev_makedev` と同じビット配置で `dev_t` を作る純関数（`unsafe` なし）。
+pub(crate) const fn makedev(major: u32, minor: u32) -> u64 {
+    let (major, minor) = (major as u64, minor as u64);
+    ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
+}
+
+/// `dir` 配下に文字デバイスノード `name`（1 要素の名前）を `mknodat(2)` で作る。モードは
+/// `S_IFCHR | mode` だが umask で削られ得るため、呼び出し側が作成後に補正する。既存のエントリが
+/// あれば `EEXIST`（上書きしない。最終要素の symlink も辿らない）。非特権 user namespace では
+/// `EPERM`（`CAP_MKNOD` が init user namespace でしか効かないため）。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn make_char_device(
+    dir: BorrowedFd<'_>,
+    name: &CStr,
+    mode: u32,
+    major: u32,
+    minor: u32,
+) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `name` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存する。`dir` は生存中の
+    // `BorrowedFd`（O_PATH fd も dirfd として有効）。ポインタ以外の副作用は `dir` 配下の
+    // ノード作成だけで、`name` は呼び出し側が 1 要素の静的名を渡す契約（`/` を含まない）。
+    let rc = unsafe {
+        mknodat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            consts::S_IFCHR | (mode & 0o7777),
+            makedev(major, minor),
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// 自プロセスの実効 uid。
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: 引数なし・常に成功する副作用のない syscall。
@@ -568,6 +641,42 @@ mod tests {
         assert_eq!(
             std::fs::read_link(format!("/proc/self/fd/{}", inner.as_raw_fd())).unwrap(),
             xonly.join("inner")
+        );
+    }
+
+    /// CORE-1（TASK-27.6）: 文字デバイス種別・EEXIST の具体値と `makedev` のビット配置
+    /// （glibc の `gnu_dev_makedev`）。
+    #[test]
+    fn core1_device_consts_and_makedev_are_exact() {
+        assert_eq!(consts::S_IFCHR, 0o020_000);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        assert_eq!(EEXIST, 17);
+        assert_eq!(makedev(1, 3), 0x103);
+        assert_eq!(makedev(1, 5), 0x105);
+        assert_eq!(makedev(1, 7), 0x107);
+        assert_eq!(makedev(1, 8), 0x108);
+        assert_eq!(makedev(1, 9), 0x109);
+        assert_eq!(makedev(5, 0), 0x500);
+        assert_eq!(makedev(0x1000, 0x100), 0x1000_0000_0000 | 0x10_0000);
+    }
+
+    /// CORE-1（TASK-27.6）: `open_path_nofollow` は symlink を辿らずそれ自体を開き、通常ファイルも
+    /// 開ける。不在は ENOENT。
+    #[test]
+    fn core1_open_path_nofollow_does_not_follow_symlink() {
+        use std::os::unix::fs::MetadataExt as _;
+        let t = TempTree::new("pathnf");
+        std::fs::write(t.base.join("file"), b"x").unwrap();
+        std::os::unix::fs::symlink("/nonexistent", t.base.join("link")).unwrap();
+        let parent = open_dir_path_nofollow(None, &c(&t.base)).unwrap();
+        let link = open_path_nofollow(parent.as_fd(), c"link").unwrap();
+        let meta = std::fs::File::from(link).metadata().unwrap();
+        assert!(meta.file_type().is_symlink());
+        let file = open_path_nofollow(parent.as_fd(), c"file").unwrap();
+        assert_eq!(std::fs::File::from(file).metadata().unwrap().size(), 1);
+        assert_eq!(
+            open_path_nofollow(parent.as_fd(), c"missing").unwrap_err(),
+            SysError::Os(ENOENT)
         );
     }
 

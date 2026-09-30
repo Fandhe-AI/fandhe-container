@@ -58,7 +58,7 @@ make fio-bench TARGET_DIR=<dir> LABEL=<label> [RUNTIME=<seconds>]  # fio 4K ラ�
 make fio-baseline-ratio-selftest  # fio ベースライン比算出スクリプトの自己テスト（TASK-25.2・IO-8・REPAIR-12。実 fio 不要）
 make fio-baseline-ratio BASELINE=<results.json> CANDIDATE=<results.json>  # Docker ベースライン比（IOPS・レイテンシの倍率）を算出する（実 fio 不要。results.json は fio-randwrite-4k.sh の出力）
 make idle-memory-selftest   # アイドル時常駐メモリ計測スクリプトの自己テスト（TASK-45.1・CORE-7・SUP-1。疑似 /proc のみで実計測はしない。終了コード 0 かつ FAIL 行なし。Linux・非 root 限定で、root 実行は chmod 000 系のケースが成立しないため失敗する）
-make idle-memory [IDLE_MEMORY_TIMEOUT=<秒>]  # プロセス数・PSS・RSS を JSON 出力（Linux 限定・実機計測。timeout 付き〔既定 120 秒〕）。スクリプトの終了コード: 0 = 成功、1 = --expect-zero 違反（結果は公開しない）、2 = 引数・入力エラー・非 Linux・出力先エラー、3 = 計測失敗（読めない値・識別不能・timeout 超過）
+make idle-memory [IDLE_MEMORY_TIMEOUT=<秒>]  # プロセス数・PSS・RSS を JSON 出力（Linux 限定・実機計測。timeout 付き〔既定 120 秒〕）。スクリプトの終了コード: 0 = 成功、1 = --expect-zero 違反（結果は公開しない）、2 = 引数・入力エラー・非 Linux・出力先エラー・timeout 配下で起動できない、3 = 計測失敗（読めない値・識別不能・timeout 超過・想定外の終了）。make は失敗時に自身は 2 で終わるため、レシピの値は `Error <n>` 行で確認する
 ```
 
 - `make test-integration`: 終了コード 0 が成功基準。`notice:` 出力での成功終了は、全 crate から `tests/*.rs` が無くなった場合のフォールバック。通常は `cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server` と `cargo test -p fandhe-container-io --bins --features crash-test-server` の 2 段が実行される。`crash_safety` 等 `required-features` 付きの target は `make test`（既定 feature）では実行されず、本ターゲットと CI の `integration-test`・`rust-ci`（`--all-features`）で実行される。実行された件数は Makefile・CI が出力する `integration test targets: N` 行で確認する。`notice:` での成功終了は結合試験が 1 件も実行されていないことを意味し、`tests/*.rs` を追加・変更した PR の合格根拠にしない（冒頭の `skip:` と同じ扱い）。jq 未導入時は fail-closed で終了コード非 0 になる

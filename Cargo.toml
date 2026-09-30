@@ -36,5 +36,7 @@ license = "Apache-2.0"
 repository = "https://github.com/Fandhe-AI/fandhe-container"
 
 # 共通依存の集約先。追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
-# 現時点では 0 件。
+# 採用済みは serde / serde_json の 2 件（承認: Issue #138・TASK-29.hdep1。OCI config.json のパース用）。
 [workspace.dependencies]
+serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = "=1.0.151"

@@ -31,8 +31,9 @@
 //!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。
 //!   start（TASK-29.3）は実装済みだが起動は `ProcessLauncher` の依存注入で、本番 launcher と実 exec は未提供。
 //!   kill / delete は TASK-30 で追加する予定で未実装
-//! - 予定（未作成）: `state_store`
-//!   （TASK-31・OCI-5）・`cgroups`（TASK-32・CORE-3）・`plugin_discovery`（TASK-109）
+//! - `state_store`: ファイルベース `StateStore`（TASK-31.1・OCI-5）は実装済み。fsync・残骸掃除の強化は
+//!   TASK-31.2（#156）、結合テストは TASK-31.3（#157）で行う予定
+//! - 予定（未作成）: `cgroups`（TASK-32・CORE-3）・`plugin_discovery`（TASK-109）
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
 //!
@@ -52,6 +53,7 @@
 pub mod exec;
 pub mod observability;
 pub mod oci_runtime;
+pub mod state_store;
 #[cfg(target_os = "linux")]
 mod sys;
 pub mod traits;

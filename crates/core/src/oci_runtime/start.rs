@@ -61,8 +61,15 @@
 //!   起動になる。`PermissionDenied`。SEC-5）
 //! - `linux.namespaces` に IPC namespace が無い（ホストの IPC を共有する起動を防ぐ。共有の明示許可は
 //!   未実装のため必須。`InvalidArgument`。SEC-1）
-//! - `linux.namespaces` に PID・mount namespace が無い、または hostname 指定があるのに UTS namespace が
-//!   無い（`exec::plan` の共通検証と同じ。ホストのプロセス・マウントが見える起動を防ぐ。`InvalidArgument`）
+//! - `linux.namespaces` に PID・mount・UTS namespace が無い（CORE-1 の最小分離〔PID/mount/UTS/IPC〕を
+//!   欠く起動を防ぐ。UTS は hostname 指定の有無にかかわらず必須で、無いとホストの hostname を共有・
+//!   変更し得る。`InvalidArgument`。SEC-1）
+//!
+//! 必須とする namespace は CORE-1 の最小分離（PID・mount・UTS・IPC）と user（SEC-5）。network は
+//! 指定が無ければホストの network namespace を共有する NET-6 の host モードに当たり（ネットワーク分離は
+//! `NetworkPlugin`〔NET 系〕の担当）、指定があれば作成が未実装のため上記のとおり `Unimplemented`。
+//! cgroup・time も作成が未実装で、指定が無ければ OCI の規定どおりランタイムの namespace を引き継ぐ
+//! （cgroup の分離・制限は TASK-32・CORE-3 の範囲。REPAIR-3: 未実装であることを明示する）。
 //! - `linux.uidMappings` / `gidMappings` が非空（config 指定の写像は subuid 範囲写像とともに
 //!   TASK-40・CORE-6 で対応する。SEC-5 の「コンテナ内 root をホストの非特権 UID へ写す」写像は
 //!   launcher の契約で、`exec::isolate` が呼び出しプロセスの euid / egid へ写す。`ProcessLauncher` 参照）
@@ -468,7 +475,7 @@ fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
     }
 
     let namespaces: Vec<NamespaceKind> = config.namespaces().iter().map(|n| n.kind()).collect();
-    // exec::plan の共通検証と同じ組合せ（Pid には Mount、hostname には Uts）に加え、Pid・Mount を必須とする。
+    // CORE-1 の最小分離（PID・mount・UTS・IPC）を必須とする（exec::plan の組合せ検証より強い）。
     let has = |k: NamespaceKind| namespaces.contains(&k);
     if !has(NamespaceKind::Pid) || !has(NamespaceKind::Mount) {
         return Err(TraitError::new(
@@ -484,10 +491,12 @@ fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
             "the IPC namespace is required",
         ));
     }
-    if config.hostname().is_some() && !has(NamespaceKind::Uts) {
+    // UTS namespace が無いとホストの hostname・domainname を共有し、コンテナ内から変更し得る。hostname
+    // 指定の有無にかかわらず fail-closed で必須とする（SEC-1・CORE-1）。
+    if !has(NamespaceKind::Uts) {
         return Err(TraitError::new(
             ErrorCode::InvalidArgument,
-            "hostname requires the UTS namespace",
+            "the UTS namespace is required",
         ));
     }
     // 検査済みの rootfs を、`/` から祖先を含む全要素を symlink 非追従で辿って fd で固定する（SEC-1）。
@@ -1208,7 +1217,8 @@ mod tests {
         assert!(stats.latency().is_some());
     }
 
-    /// SEC-1・SEC-5: PID / mount namespace が欠けた、または hostname に UTS が無い config は拒否する。
+    /// SEC-1・CORE-1: PID・mount・UTS・IPC namespace のいずれかが欠けた config は拒否する（UTS は
+    /// hostname 指定が無くても必須）。
     #[test]
     fn sec1_start_rejects_incomplete_namespace_sets() {
         let cases: Vec<(&str, Value, &str)> = vec![
@@ -1225,7 +1235,7 @@ mod tests {
             (
                 "no-uts",
                 json!([{"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "ipc"}]),
-                "hostname requires the UTS namespace",
+                "the UTS namespace is required",
             ),
             (
                 "no-ipc",
@@ -1240,6 +1250,14 @@ mod tests {
             assert_eq!(err.code(), ErrorCode::InvalidArgument, "case {name}");
             assert_eq!(err.message(), message, "case {name}");
         }
+        // hostname 指定が無くても UTS namespace の欠落は拒否する。
+        let mut cfg = valid_config();
+        cfg.as_object_mut().expect("object").remove("hostname");
+        cfg["linux"]["namespaces"] =
+            json!([{"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "ipc"}]);
+        let err = start_rejected_after_rewrite("ns-no-uts-no-hostname", &cfg);
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), "the UTS namespace is required");
     }
 
     /// CORE-2: 中断された予約（Running・pid なし）は識別でき、回復後に start できる。

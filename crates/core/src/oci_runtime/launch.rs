@@ -351,8 +351,7 @@ impl LaunchedProcess for ContainerChildProcess {
 /// - `linux.uidMappings` / `gidMappings` は `start` が拒否済みで `LaunchSpec` に載らない。user namespace の
 ///   写像は launcher の責務で、コンテナ内 root（uid/gid 0）をホストの非特権 UID・GID（呼び出しプロセスの
 ///   euid・egid。0 なら拒否）へ写すこと。`exec::plan` / `exec::isolate` が既定でこの写像を行う（SEC-5）
-/// - `LaunchSpec::namespaces` には Pid・Mount・User・Ipc が必ず含まれる（`start` が検証済み。hostname が
-///   あれば Uts も）
+/// - `LaunchSpec::namespaces` には Pid・Mount・User・Ipc・Uts が必ず含まれる（`start` が検証済み）
 ///
 /// 本番実装は本 crate に未提供（モジュール doc 参照）。
 pub trait ProcessLauncher: Send + Sync {

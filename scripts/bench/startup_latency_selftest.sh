@@ -112,6 +112,10 @@ cat >>"$stub" <<'STUB'
 #   create-fail-mixed-codes: create 未作成で失敗し、以後の state が NOT_FOUND と
 #                            PERMISSION_DENIED の両方を返す
 #   create-fail-plain: create が何も作らず失敗し、不存在エラーが自由文だけ（runc 相当）
+#   create-fail-nf-plus-text / -nf-plus-badjson / -nf-plus-nonstring: create 未作成で失敗し、
+#     以後の state が NOT_FOUND に加えて自由文・不正な JSON・code が文字列でない行を返す
+#   create-fail-nf-badmsg: create 未作成で失敗し、以後の state が message が文字列でない
+#     NOT_FOUND を返す
 #   start-fail / start-hang / start-flood: start が失敗 / ハング / 大量出力
 #   delete-fail: 計測は成功するが delete が常に失敗
 #   exec-delayed: start 後の state が created を 2 回返してから stopped
@@ -133,11 +137,14 @@ state_json() {
   printf '{"ociVersion":"1.0.2","id":"%s","status":"%s","pid":0,"bundle":"%s"}\n' \
     "$id" "$1" "$(cat "$m.bundle" 2>/dev/null || echo /other)"
 }
-# 不存在エラー。自由文のログ行に続けて ERR-1 の構造化エラー（code: NOT_FOUND）を出す。
-# create-fail-plain では自由文だけ（構造化エラーを持たないランタイム相当）。
+# 不存在エラー。ERR-1 の構造化エラー（code: NOT_FOUND）を出す。create-fail-plain では
+# 自由文だけ（構造化エラーを持たないランタイム相当）。
 not_exist() {
-  echo "time=\"$(date +%s)\" level=error msg=\"container $id does not exist\"" >&2
-  [ "$mode" = create-fail-plain ] || printf '{"code":"NOT_FOUND","message":"container %s does not exist"}\n' "$id" >&2
+  if [ "$mode" = create-fail-plain ]; then
+    echo "time=\"$(date +%s)\" level=error msg=\"container $id does not exist\"" >&2
+  else
+    printf '{"code":"NOT_FOUND","message":"container %s does not exist"}\n' "$id" >&2
+  fi
   exit 1
 }
 if [ "$mode" = foreign-perm ] || [ "$mode" = foreign-late ]; then
@@ -167,7 +174,7 @@ case "$cmd" in
     [ -n "${STUB_CREATE_HOOK:-}" ] && [ ! -e "$STUB_CREATE_HOOK" ] && echo preexisting >"$STUB_CREATE_HOOK"
     [ "$1" = --bundle ] && printf '%s' "$2" >"$m.bundle"
     case "$mode" in
-      create-fail | create-fail-gone | create-fail-state-error | create-fail-notfound-text | create-fail-mixed-codes | create-fail-plain)
+      create-fail | create-fail-gone | create-fail-state-error | create-fail-notfound-text | create-fail-mixed-codes | create-fail-plain | create-fail-nf-*)
         echo "stub: create failed" >&2; exit 1 ;;
       create-fail-delete-fail) touch "$m.created"; echo "stub: create failed" >&2; exit 1 ;;
     esac
@@ -185,6 +192,12 @@ case "$cmd" in
     if [ "$mode" = id-in-use ]; then state_json created; exit 0; fi
     if [ -e "$m.attempted" ] && [ ! -e "$m.created" ]; then
       [ "$mode" = create-fail-state-error ] && { echo '{"code":"PERMISSION_DENIED","message":"open state.json: permission denied"}' >&2; exit 1; }
+      case "$mode" in
+        create-fail-nf-plus-text) printf '{"code":"NOT_FOUND","message":"x"}\nstub: permission denied\n' >&2; exit 1 ;;
+        create-fail-nf-plus-badjson) printf '{"code":"NOT_FOUND","message":"x"}\n{"code":"PERMISSION_DENIED",\n' >&2; exit 1 ;;
+        create-fail-nf-plus-nonstring) printf '{"code":"NOT_FOUND","message":"x"}\n{"code":13,"message":"y"}\n' >&2; exit 1 ;;
+        create-fail-nf-badmsg) printf '{"code":"NOT_FOUND","message":5}\n' >&2; exit 1 ;;
+      esac
       if [ "$mode" = create-fail-mixed-codes ]; then
         printf '{"code":"NOT_FOUND","message":"x"}\n{"code":"PERMISSION_DENIED","message":"y"}\n' >&2
         exit 1
@@ -391,6 +404,13 @@ if grep -qE '^(delete|kill) ' "$stub_log"; then fail "create-timeout-untouched";
 reset_log
 STUB_MODE=create-fail-mixed-codes expect_rc "create-fail-mixed-codes" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 if grep -qE '^(delete|kill) ' "$stub_log"; then fail "create-fail-mixed-codes-untouched"; else pass "create-fail-mixed-codes-untouched"; fi
+# NOT_FOUND に自由文・不正な JSON・code が文字列でない行が混ざる応答や、message が文字列で
+# ない NOT_FOUND も判定不能として exit 4（Codex P1: 解析できない行を捨てて不存在と判定しない）。
+for m in nf-plus-text nf-plus-badjson nf-plus-nonstring nf-badmsg; do
+  reset_log
+  STUB_MODE="create-fail-$m" expect_rc "create-fail-$m" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+  if grep -qE '^(delete|kill) ' "$stub_log"; then fail "create-fail-$m-untouched"; else pass "create-fail-$m-untouched"; fi
+done
 # 構造化エラーを持たないランタイム（runc 相当）では create 失敗時に未作成を確定できない
 # ため、操作を送らずに exit 4（スクリプト冒頭「現状の制約」に記載の挙動）。
 reset_log

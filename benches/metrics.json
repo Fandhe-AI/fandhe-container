@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "placeholder": true,
+  "note": "TASK-88（人間担当）が実測から確定させて置き換える暫定基準値。metric は TASK-113 の実ベンチ（plugin_boundary 等）と対応付けが確定していないプレースホルダ。",
+  "metrics": {
+    "placeholder_throughput": {
+      "unit": "ops/s",
+      "direction": "higher_is_better"
+    },
+    "placeholder_latency_p95": {
+      "unit": "ms",
+      "direction": "lower_is_better"
+    }
+  }
+}

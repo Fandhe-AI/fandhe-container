@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "placeholder": false,
+  "metrics": {
+    "placeholder_throughput": {
+      "unit": "ops/s",
+      "direction": "higher_is_better"
+    },
+    "placeholder_latency_p95": {
+      "unit": "ms",
+      "direction": "lower_is_better"
+    }
+  }
+}

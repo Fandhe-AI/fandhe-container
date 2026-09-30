@@ -303,6 +303,40 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-check をスキップ"
 endif
 
+# baseline.json 生成スクリプト（scripts/bench/generate_baseline.sh）の自己テスト
+# （TASK-88.1・REPAIR-8・REPAIR-12）。bash + jq のみで完結する。
+.PHONY: bench-baseline-selftest
+bench-baseline-selftest: ## baseline.json 生成スクリプトの自己テスト（TASK-88.1・REPAIR-12）
+	@if ! command -v jq >/dev/null 2>&1; then \
+		echo "jq is required but not found: install it (e.g. brew install jq / apt-get install jq)" >&2; \
+		exit 1; \
+	fi
+	bash scripts/bench/generate_baseline_selftest.sh
+
+# 登録済みベンチを実行し、benches/metrics.json（direction・unit の SSOT）と合わせて
+# baseline.json を再生成する（TASK-88.1・REPAIR-8）。BENCH_NAMES は TASK-113 で実ベンチ
+# （files/s・起動 p95 等）を足す場所。実測値の記録は TASK-88.2（#229）が行う。
+# BENCH_ENVIRONMENT は Make 変数展開でシェル文字列へ埋め込まず、export した環境変数として
+# 引用付きで参照する（インジェクション防止）。
+BENCH_NAMES := regression_placeholder
+BENCH_METRICS ?= benches/metrics.json
+BENCH_BASELINE_OUT ?= benches/baseline.json
+BENCH_ENVIRONMENT ?=
+export BENCH_ENVIRONMENT
+
+.PHONY: bench-baseline
+bench-baseline: ## ベンチを実行し baseline.json を再生成する（TASK-88.1・REPAIR-8）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	for n in $(BENCH_NAMES); do \
+		cargo bench -p fandhe-container-benches --bench "$$n" -- --output "$$tmp/$$n.json" || exit 1; \
+	done && \
+	bash scripts/bench/generate_baseline.sh --metrics '$(BENCH_METRICS)' --output '$(BENCH_BASELINE_OUT)' \
+		$${BENCH_ENVIRONMENT:+--environment "$$BENCH_ENVIRONMENT"} "$$tmp"/*.json
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-baseline をスキップ"
+endif
+
 # --------------------------------------------------
 # fio 4K ランダム write ベンチ（TASK-25.1・IO-8・MS-1 Phase 2）
 # --------------------------------------------------

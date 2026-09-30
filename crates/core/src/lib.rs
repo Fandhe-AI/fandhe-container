@@ -27,9 +27,9 @@
 //! - `observability`: メトリクス集計型 `OpStats` 等（TASK-84.1）と記録 API `OpRecorder`
 //!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。計装は TASK-84.4 以降で未実装。io 向け連携点は io 側に定義済み（TASK-84.5）
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
-//! - `oci_runtime`: OCI Runtime のライフサイクル。現状は `config.json` の型・パーサのみ
-//!   （TASK-29.1.1 実装済み・OS 非依存）。create / start は TASK-29.2 / 29.3、kill / delete は
-//!   TASK-30 で追加する予定で未実装
+//! - `oci_runtime`: OCI Runtime のライフサイクル。`config.json` の型・パーサ
+//!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。
+//!   start は TASK-29.3、kill / delete は TASK-30 で追加する予定で未実装
 //! - 予定（未作成）: `state_store`
 //!   （TASK-31・OCI-5）・`cgroups`（TASK-32・CORE-3）・`plugin_discovery`（TASK-109）
 //!

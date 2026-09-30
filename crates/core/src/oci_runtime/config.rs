@@ -29,8 +29,9 @@
 //! `linux.seccomp`〔CORE-5・TASK-38〕、`linux.resources`〔CORE-3/4・TASK-32〜〕、
 //! `linux.maskedPaths` / `readonlyPaths`、`mounts[].uidMappings` / `gidMappings`、`hooks` 等）は、
 //! 値を読み飛ばすが指定の有無を [`UnappliedField`] として保持し、[`OciConfig::unapplied_fields`] で
-//! 返す（黙って破棄しない）。TASK-29.2（create）はこの一覧を必ず確認し、未対応の指定を拒否するか
-//! 最小権限で起動するかを fail-closed に決める（方針の決定は TASK-29.2 の担当）。
+//! 返す（黙って破棄しない）。TASK-29.2 の `create` はこの一覧が空でない config を
+//! `Unimplemented` で拒否する（fail-closed。個別フィールドの許可は、適用する後続タスクが
+//! 解釈済みへ移すことで行う）。
 //! 一覧は `schema/config-schema.json`・`defs.json`・`config-linux.json` が定義するプロパティから、
 //! 解釈済みのものと `annotations`（任意のメタデータで、ランタイムの挙動を変えない）を除いたもの。
 //!
@@ -1045,7 +1046,7 @@ impl OciConfig {
     /// 指定されているが本パーサが解釈・適用しないプロパティ（[`UnappliedField`] の宣言順・重複なし）。
     ///
     /// 空でない場合、その指定は `OciConfig` のどのアクセサにも反映されていない。create（TASK-29.2）は
-    /// これを確認せずに起動してはならない（fail-closed。SEC-1・CORE-5）。
+    /// これを確認せずに起動してはならず、実際に `Unimplemented` で拒否する（fail-closed。SEC-1・CORE-5）。
     pub fn unapplied_fields(&self) -> &[UnappliedField] {
         &self.unapplied
     }
@@ -1060,7 +1061,7 @@ impl OciConfig {
         &self.root
     }
 
-    /// `process`（省略可。create 時に必須とするかは TASK-29.2 で判断する）。
+    /// `process`（省略可。TASK-29.2 の `create` は `None` を拒否する）。
     pub fn process(&self) -> Option<&OciProcess> {
         self.process.as_ref()
     }

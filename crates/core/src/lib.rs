@@ -56,9 +56,9 @@
 pub mod exec;
 pub mod observability;
 pub mod oci_runtime;
-pub mod state_store;
 #[cfg(target_os = "linux")]
 pub mod rootless;
+pub mod state_store;
 #[cfg(target_os = "linux")]
 mod sys;
 pub mod traits;

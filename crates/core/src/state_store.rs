@@ -26,8 +26,12 @@
 //! - 5 メソッドはすべて「プロセス内 `Mutex` → `@lock` の `try_lock`（上限 [`STATE_LOCK_TIMEOUT`]、
 //!   超えたら `Timeout`。REPAIR-5）」を取ってから読み書きする
 //! - revision は `@revision` のハイウォーターマークから払い出し、レコードより先に書く。
-//!   クラッシュしても欠番になるだけで再利用しない。`@revision` が消えているのにレコードが
-//!   残っている場合は fail-closed（`Internal`）
+//!   クラッシュしても欠番になるだけで再利用しない。`@revision` は新規（空）ストアの `open` が
+//!   初期化し、後から消えた場合は採番履歴を確認できないためレコードの有無によらず
+//!   fail-closed（`Internal`）
+//! - 破損レコード（JSON 破損・ociVersion 不正・ID 不一致・状態と PID の矛盾等）は revision を
+//!   照合できないため通常の `delete` では消せない。管理操作 `find_corrupted` /
+//!   `purge_corrupted` で特定・回復する
 //! - 書き込みは同じディレクトリの一時ファイルへ書いて `rename` する。fsync・一時ファイルの
 //!   残骸掃除・強制終了テストは TASK-31.2（#156）、結合テストは TASK-31.3（#157）で行う
 //! - 状態ルートは信頼境界として扱う（`bundle` のすり替えは `start` の起動先のすり替えになるため。
@@ -73,6 +77,9 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
 /// `state.json` に書く OCI Runtime Spec のバージョン。
 const OCI_VERSION: &str = "1.2.0";
+
+/// `find_corrupted` が返す最大件数（無制限確保の防止）。
+pub const MAX_CORRUPTED_REPORT: usize = 256;
 
 const LOCK_FILE: &str = "@lock";
 const REVISION_FILE: &str = "@revision";
@@ -195,10 +202,31 @@ impl FileStateStore {
         // 祖先ディレクトリの書き込み権限も検査する（親すり替え対策。詳細は verify_ancestors）。
         let root = canonical_root(&path)?;
         verify_ancestors(&root)?;
-        Ok(Self {
+        // 空のルート（エントリが 1 つもない）だけを「新規ストア」とみなし、`@revision` を
+        // 初期化する。`@revision` が後から失われた場合は採番履歴を確認できないため、
+        // `allocate_revision` が fail-closed にする（revision 再発行の防止。OCI-5）。
+        let fresh = fs::read_dir(&root)
+            .map_err(|_| internal("failed to read the state root"))?
+            .next()
+            .is_none();
+        let store = Self {
             root,
             process_lock: Mutex::new(()),
-        })
+        };
+        if fresh {
+            let _guard = store.lock()?;
+            if matches!(
+                fs::symlink_metadata(store.root.join(REVISION_FILE)),
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+            ) {
+                write_file_replacing(
+                    &store.root,
+                    REVISION_FILE,
+                    StateRevision::INITIAL.value().to_string().as_bytes(),
+                )?;
+            }
+        }
+        Ok(store)
     }
 
     fn lock(&self) -> Result<StoreGuard<'_>, TraitError> {
@@ -292,8 +320,10 @@ impl FileStateStore {
         dto.into_record(id).map(Some)
     }
 
-    /// `<id>/` が権限検証を通り、`state.json` が通常ファイルだが JSON として読めない
-    /// （破損している）か。delete による回復可否の判定に使う。
+    /// `<id>/` が権限検証を通り、`state.json` が通常ファイルだが内容として使えない
+    /// （JSON として読めない・サイズ超過・ociVersion 不正・ID 不一致・状態と PID の矛盾等の
+    /// 構造上の不整合）か。[`FileStateStore::purge_corrupted`]・`find_corrupted` の判定に使う。
+    /// 権限不備など内容以外の理由で読めないものは破損とみなさない（fail-closed）。
     fn is_corrupted_record(&self, id: &ContainerId) -> bool {
         let dir = self.record_dir(id);
         let Ok(m) = fs::symlink_metadata(&dir) else {
@@ -312,9 +342,84 @@ impl FileStateStore {
             MAX_STATE_FILE_BYTES,
             "state file exceeds the size limit",
         ) {
-            Ok(bytes) => serde_json::from_slice::<StateDto>(&bytes).is_err(),
+            Ok(bytes) => match serde_json::from_slice::<StateDto>(&bytes) {
+                Ok(dto) => dto.into_record(id).is_err(),
+                Err(_) => true,
+            },
             Err(_) => true,
         }
+    }
+
+    /// `<id>/state.json` を削除し、空になれば `<id>/` も削除する（ロック保持下で呼ぶこと）。
+    fn remove_record(&self, id: &ContainerId) -> Result<(), TraitError> {
+        let dir = self.record_dir(id);
+        fs::remove_file(dir.join(STATE_FILE_NAME))
+            .map_err(|_| internal("failed to remove the state file"))?;
+        // 削除（unlink）の永続化のため <id>/ を fsync する。ディレクトリ自体を消した場合は
+        // その dirent の消失を永続化するため状態ルートも fsync する。
+        sync_dir(&dir)?;
+        match fs::remove_dir(&dir) {
+            Ok(()) => sync_dir(&self.root)?,
+            // 他の部品（PLUG-12 の UDS 等）がファイルを置いている場合は残す。レコードの
+            // 有無は state.json で判定するため整合する。
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(_) => return Err(internal("failed to remove the state directory")),
+        }
+        Ok(())
+    }
+
+    /// 内容が破損しているレコードの ID を返す（管理操作。最大 [`MAX_CORRUPTED_REPORT`] 件）。
+    ///
+    /// 破損レコードが 1 件でもあると `list` は fail-closed で失敗するため、回復対象の特定に
+    /// 使う。回復は [`FileStateStore::purge_corrupted`]（OCI-5）。
+    pub fn find_corrupted(&self) -> Result<Vec<ContainerId>, TraitError> {
+        let _guard = self.lock()?;
+        let entries =
+            fs::read_dir(&self.root).map_err(|_| internal("failed to read the state root"))?;
+        let mut found = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|_| internal("failed to read the state root"))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(id) = ContainerId::new(&name) else {
+                continue;
+            };
+            if self.has_record(&name) && self.is_corrupted_record(&id) {
+                found.push(id);
+                if found.len() >= MAX_CORRUPTED_REPORT {
+                    break;
+                }
+            }
+        }
+        found.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Ok(found)
+    }
+
+    /// 内容が破損したレコードを削除して回復する管理操作（OCI-5）。
+    ///
+    /// 破損レコードは revision を検証できないため、楽観的排他を持つ通常の
+    /// `StateStore::delete` とは分離している。健全なレコードには使えず
+    /// （`FailedPrecondition`）、存在しなければ `NotFound`、権限不備など内容以外の理由で
+    /// 読めないものは削除せず元のエラーを返す（fail-closed）。
+    pub fn purge_corrupted(&self, id: &ContainerId) -> Result<DeleteStateResponse, TraitError> {
+        let _guard = self.lock()?;
+        match self.read_record(id) {
+            Ok(Some(_)) => {
+                return Err(err(
+                    ErrorCode::FailedPrecondition,
+                    "state record is not corrupted",
+                ));
+            }
+            Ok(None) => return Err(err(ErrorCode::NotFound, "container state not found")),
+            Err(e) => {
+                if !self.is_corrupted_record(id) {
+                    return Err(e);
+                }
+            }
+        }
+        self.remove_record(id)?;
+        Ok(DeleteStateResponse::new())
     }
 
     /// 「`<id>/state.json` が通常ファイルとして存在するか」（list・新規ストア判定用）。
@@ -363,11 +468,11 @@ impl FileStateStore {
                 StateRevision::from_raw(value)
             }
             Ok(_) => return Err(internal("revision file is not a regular file")),
+            // 新規ストアの `@revision` は `open` が初期化する。ここで無ければ採番履歴が
+            // 失われているため、レコードの有無によらず fail-closed（過去の revision の
+            // 再発行を防ぐ）。
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if self.any_record()? {
-                    return Err(internal("revision high-water mark is missing"));
-                }
-                StateRevision::INITIAL
+                return Err(internal("revision high-water mark is missing"));
             }
             Err(_) => return Err(internal("failed to inspect the revision file")),
         };
@@ -420,21 +525,6 @@ impl FileStateStore {
             }
         }
         Ok(max)
-    }
-
-    fn any_record(&self) -> Result<bool, TraitError> {
-        let entries =
-            fs::read_dir(&self.root).map_err(|_| internal("failed to read the state root"))?;
-        for entry in entries {
-            let entry = entry.map_err(|_| internal("failed to read the state root"))?;
-            if let Some(name) = entry.file_name().to_str()
-                && ContainerId::new(name).is_ok()
-                && self.has_record(name)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 }
 
@@ -555,40 +645,20 @@ impl StateStore for FileStateStore {
         Ok(StateList::new(records, next_cursor))
     }
 
+    /// 楽観的排他付きの削除。revision を照合できない破損レコードは削除せず元のエラーを返す
+    /// （回復は管理操作 [`FileStateStore::purge_corrupted`]）。
     fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
         let _guard = self.lock()?;
-        let dir = self.record_dir(req.id());
-        match self.read_record(req.id()) {
-            Ok(Some(existing)) => {
-                if existing.revision() != req.expected_revision() {
-                    return Err(err(
-                        ErrorCode::FailedPrecondition,
-                        "state revision does not match",
-                    ));
-                }
-            }
-            Ok(None) => return Err(err(ErrorCode::NotFound, "container state not found")),
-            // 破損した state.json は revision を検証できないが、API で削除して回復できる
-            // ようにする（権限検証済みの通常ファイルに限る）。緩んだ権限のディレクトリ等は
-            // 従来どおり fail-closed で拒否する。
-            Err(e) => {
-                if !self.is_corrupted_record(req.id()) {
-                    return Err(e);
-                }
-            }
+        let existing = self
+            .read_record(req.id())?
+            .ok_or_else(|| err(ErrorCode::NotFound, "container state not found"))?;
+        if existing.revision() != req.expected_revision() {
+            return Err(err(
+                ErrorCode::FailedPrecondition,
+                "state revision does not match",
+            ));
         }
-        fs::remove_file(dir.join(STATE_FILE_NAME))
-            .map_err(|_| internal("failed to remove the state file"))?;
-        // 削除（unlink）の永続化のため <id>/ を fsync する。ディレクトリ自体を消した場合は
-        // その dirent の消失を永続化するため状態ルートも fsync する。
-        sync_dir(&dir)?;
-        match fs::remove_dir(&dir) {
-            Ok(()) => sync_dir(&self.root)?,
-            // 他の部品（PLUG-12 の UDS 等）がファイルを置いている場合は残す。レコードの
-            // 有無は state.json で判定するため整合する。
-            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-            Err(_) => return Err(internal("failed to remove the state directory")),
-        }
+        self.remove_record(req.id())?;
         Ok(DeleteStateResponse::new())
     }
 }
@@ -974,7 +1044,7 @@ mod tests {
         assert_eq!(code(store.create(&req)), "INVALID_ARGUMENT");
         // 拒否時は revision もレコードも消費しない。
         assert!(!t.path().join("big").exists());
-        assert!(!t.path().join("@revision").exists());
+        assert_eq!(fs::read_to_string(t.path().join("@revision")).unwrap(), "0");
     }
 
     #[test]
@@ -1220,11 +1290,70 @@ mod tests {
         assert!(updated.revision().value() > rec_b.revision().value());
         let req = CreateStateRequest::new(ContainerStatus::creating(cid("c")), bundle()).unwrap();
         store.create(&req).unwrap();
-        // 破損レコードは delete（revision は任意）で回復できる。
-        store
-            .delete(&DeleteStateRequest::new(cid("a"), StateRevision::INITIAL))
-            .unwrap();
+        // 通常の delete は revision を照合できないため拒否し、管理操作で回復する。
+        assert_eq!(
+            code(store.delete(&DeleteStateRequest::new(cid("a"), StateRevision::INITIAL))),
+            "INTERNAL"
+        );
+        assert!(t.path().join("a").join("state.json").exists());
+        assert_eq!(store.find_corrupted().unwrap(), vec![cid("a")]);
+        // 健全なレコードには purge_corrupted を使えない。
+        assert_eq!(
+            code(store.purge_corrupted(&cid("b"))),
+            "FAILED_PRECONDITION"
+        );
+        store.purge_corrupted(&cid("a")).unwrap();
         assert!(!t.path().join("a").exists());
+        assert_eq!(code(store.purge_corrupted(&cid("a"))), "NOT_FOUND");
+    }
+
+    /// OCI-5: 構造上の不整合（ociVersion 不正・ID 不一致・状態と PID の矛盾）も回復対象。
+    #[test]
+    fn oci5_semantically_corrupted_records_are_purgeable() {
+        let t = TmpDir::new("semcorrupt");
+        let store = t.open();
+        for id in ["a", "b", "c"] {
+            create(&store, id);
+        }
+        let w = |id: &str, body: &str| {
+            fs::write(t.path().join(id).join("state.json"), body).unwrap();
+        };
+        w(
+            "a",
+            r#"{"ociVersion":"0.9.0","id":"a","status":"created","bundle":"/b","revision":0}"#,
+        );
+        w(
+            "b",
+            r#"{"ociVersion":"1.2.0","id":"z","status":"created","bundle":"/b","revision":1}"#,
+        );
+        w(
+            "c",
+            r#"{"ociVersion":"1.2.0","id":"c","status":"stopped","pid":5,"bundle":"/b","revision":2}"#,
+        );
+        assert_eq!(code(store.list(&list_req(10))), "INTERNAL");
+        let found = store.find_corrupted().unwrap();
+        assert_eq!(found, vec![cid("a"), cid("b"), cid("c")]);
+        for id in ["a", "b", "c"] {
+            store.purge_corrupted(&cid(id)).unwrap();
+        }
+        assert!(store.list(&list_req(10)).unwrap().records().is_empty());
+    }
+
+    /// OCI-5: `@revision` が失われたら、全レコード削除後でも revision を再発行しない。
+    #[test]
+    fn oci5_missing_revision_file_without_records_fails_closed() {
+        let t = TmpDir::new("revmiss2");
+        let store = t.open();
+        let first = create(&store, "a");
+        store
+            .delete(&DeleteStateRequest::new(cid("a"), first.revision()))
+            .unwrap();
+        fs::remove_file(t.path().join("@revision")).unwrap();
+        drop(store);
+        let store = t.open();
+        let req =
+            CreateStateRequest::new(ContainerStatus::created(cid("b"), None), bundle()).unwrap();
+        assert_eq!(code(store.create(&req)), "INTERNAL");
     }
 
     #[test]

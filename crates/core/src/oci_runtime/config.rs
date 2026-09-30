@@ -487,6 +487,10 @@ macro_rules! unapplied_fields {
                 }
             }
         }
+
+        /// 全種別（宣言順）。テストでの網羅照合に使う。
+        #[cfg(test)]
+        const UNAPPLIED_FIELDS: &[UnappliedField] = &[$(UnappliedField::$variant),*];
     };
 }
 
@@ -1793,9 +1797,87 @@ mod tests {
     fn oci4_unknown_fields_are_ignored() {
         let mut v = base();
         v["annotations"] = json!({"a": "b"});
+        v["x-vendor"] = json!({"k": [1, 2]});
         v["linux"]["seccomp"] = json!({"defaultAction": "SCMP_ACT_ERRNO"});
         v["process"]["capabilities"] = json!({"bounding": ["CAP_KILL"]});
-        assert!(parse(&v).is_ok());
+        let cfg = parse(&v).expect("valid");
+        // 解釈しない既知プロパティは黙って破棄せず記録する。`annotations` と未知のプロパティは記録しない。
+        assert_eq!(
+            cfg.unapplied_fields(),
+            [
+                UnappliedField::ProcessCapabilities,
+                UnappliedField::LinuxSeccomp
+            ]
+        );
+    }
+
+    /// OCI 既知だが解釈しないプロパティは、種別ごとに指定の有無を記録する（SEC-1・CORE-5・OCI-4）。
+    /// 値が `null` でも「指定あり」とみなす（fail-closed 側）。未指定なら空。
+    #[test]
+    fn sec1_each_unapplied_field_is_reported() {
+        assert_eq!(UNAPPLIED_FIELDS.len(), 36);
+        let none: [UnappliedField; 0] = [];
+        assert_eq!(parse(&base()).expect("valid").unapplied_fields(), none);
+        for &field in UNAPPLIED_FIELDS {
+            let path = field.as_str().replace("mounts[]", "mounts.0");
+            let keys: Vec<&str> = path.split('.').collect();
+            let (last, parent) = keys.split_last().expect("non-empty path");
+            for value in [json!({"any": [1]}), Value::Null] {
+                let mut v = base();
+                value_at(&mut v, parent)
+                    .as_object_mut()
+                    .expect("object")
+                    .insert((*last).to_owned(), value);
+                let cfg = parse(&v).unwrap_or_else(|e| panic!("{path}: {e:?}"));
+                assert_eq!(cfg.unapplied_fields(), [field], "{path}");
+            }
+        }
+    }
+
+    /// `as_str` は JSON 上のパスで、種別ごとに一意（SEC-1）。
+    #[test]
+    fn sec1_unapplied_field_paths_are_unique() {
+        let mut paths: Vec<&str> = UNAPPLIED_FIELDS.iter().map(|f| f.as_str()).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths.len(), UNAPPLIED_FIELDS.len());
+        assert_eq!(UnappliedField::LinuxSeccomp.as_str(), "linux.seccomp");
+        assert_eq!(
+            UnappliedField::ProcessExecCpuAffinity.as_str(),
+            "process.execCPUAffinity"
+        );
+    }
+
+    /// 複数の mounts が同じ未解釈プロパティを持っても 1 件にまとめ、宣言順に並べる（SEC-1）。
+    #[test]
+    fn sec1_unapplied_fields_are_deduplicated_in_declaration_order() {
+        let mut v = base();
+        v["mounts"] = json!([
+            {"destination": "/a", "gidMappings": [], "uidMappings": []},
+            {"destination": "/b", "uidMappings": []}
+        ]);
+        v["linux"]["seccomp"] = json!({});
+        v["hooks"] = json!({});
+        let cfg = parse(&v).expect("valid");
+        assert_eq!(
+            cfg.unapplied_fields(),
+            [
+                UnappliedField::Hooks,
+                UnappliedField::MountUidMappings,
+                UnappliedField::MountGidMappings,
+                UnappliedField::LinuxSeccomp
+            ]
+        );
+    }
+
+    /// 未解釈の既知プロパティも既知フィールドとして重複キーを拒否する（OCI-4）。
+    #[test]
+    fn oci4_duplicate_unapplied_field_is_rejected() {
+        let text =
+            br#"{"ociVersion":"1.0.0","root":{"path":"r"},"linux":{"seccomp":{},"seccomp":{}}}"#;
+        let e = parse_config_bytes(text).expect_err("dup");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(*e.kind(), OciConfigErrorKind::Data);
     }
 
     #[test]

@@ -126,6 +126,11 @@ pub struct StateRoot(PathBuf);
 
 impl StateRoot {
     /// 明示指定（`--root` 相当）から作る。絶対パスでなければ `InvalidArgument`。
+    ///
+    /// 要素から組み直して末尾の区切り文字・`.`・重複した区切り文字を取り除く（`link/` のような
+    /// 末尾の区切り文字があると、Linux の `lstat` は最終要素の symlink を辿り、`verify_root` の
+    /// symlink 検査をすり抜けるため。OCI-5）。`..` を含むパスは最終要素・祖先の検査対象が
+    /// 字面と食い違うため `InvalidArgument` で拒否する。
     pub fn from_override(path: PathBuf) -> Result<Self, TraitError> {
         if !path.is_absolute() {
             return Err(err(
@@ -133,7 +138,16 @@ impl StateRoot {
                 "state root must be an absolute path",
             ));
         }
-        Ok(Self(path))
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(err(
+                ErrorCode::InvalidArgument,
+                "state root must not contain parent directory components",
+            ));
+        }
+        Ok(Self(path.components().collect()))
     }
 
     /// 上書き指定があればそれを、なければ既定（root: `/run/fandhe-container`、rootless:

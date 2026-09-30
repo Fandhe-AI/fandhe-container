@@ -24,7 +24,7 @@ make ci          # 上記 + lint-docs + deny を一括実行
 
 ステージ 3（タイムアウト保護された結合試験）は `integration-test` ジョブ（3 OS matrix。実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes）が担う（TASK-86.2・#36）。
 
-`bench-regression` ジョブは `make bench-check-selftest`（比較スクリプトの自己テスト）→ `make bench-baseline-selftest`（baseline.json 生成スクリプト `scripts/bench/generate_baseline.sh` の自己テスト。TASK-88.1）→ `make bench-check`（ベンチ実行・基準値比較）の順に実行する。`make bench-baseline` は登録ベンチと `benches/metrics.json`（direction・unit の SSOT）から baseline.json を再生成する道具で、実測値の記録は TASK-88.2（#229）が行う。現時点では `benches/benches/regression_placeholder.rs`（決定的な固定値の stub）と `benches/baseline.json`（`placeholder: true` の暫定値）で動作確認する段階にあり、実測を伴う本物のベンチ・基準値への置き換えはそれぞれ TASK-113・TASK-88 で行う。計測対象がプレースホルダのため、現時点では実装の性能悪化を検出せず、性能回帰ゲートとして機能しない。
+`bench-regression` ジョブは `make bench-check-selftest`（比較スクリプトの自己テスト）→ `make bench-baseline-selftest`（baseline.json 生成スクリプト `scripts/bench/generate_baseline.sh` の自己テスト。TASK-88.1）→ `make idle-memory-selftest`（アイドル時常駐メモリ計測スクリプト `scripts/bench/idle_memory.sh` の自己テスト。疑似 /proc のみで照合し実計測はしない。TASK-45.1・CORE-7・SUP-1）→ `make bench-check`（ベンチ実行・基準値比較）の順に実行する。`make bench-baseline` は登録ベンチと `benches/metrics.json`（direction・unit の SSOT）から baseline.json を再生成する道具で、実測値の記録は TASK-88.2（#229）が行う。現時点では `benches/benches/regression_placeholder.rs`（決定的な固定値の stub）と `benches/baseline.json`（`placeholder: true` の暫定値）で動作確認する段階にあり、実測を伴う本物のベンチ・基準値への置き換えはそれぞれ TASK-113・TASK-88 で行う。計測対象がプレースホルダのため、現時点では実装の性能悪化を検出せず、性能回帰ゲートとして機能しない。
 
 ## 3 OS CI（macOS・Windows・Linux 一級対応）
 

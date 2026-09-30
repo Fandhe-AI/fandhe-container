@@ -21,13 +21,13 @@
 //! - `exec`: 最小実行フロー（Linux 限定。namespace 分離〔TASK-27.2〕と `pivot_root` による
 //!   rootfs 切替〔TASK-27.3〕、基本デバイスノード作成〔TASK-27.6。`exec/devices.rs`。
 //!   Issue 表記の `src/devices.rs` ではなく `exec` 配下に置く: 段の型 `ExecError`・`MountIsolation`
-//!   の検証が `exec` の非公開項目のため〕、fork / exec による子プロセス起動〔TASK-27.4.1。最小構成でフック無し〕、順序固定のステージ列の枠〔TASK-27.4.2。`exec/stages.rs`。`NO_NEW_PRIVS` のみ固定ステージとして TASK-27.4.3 で実装済み〕が
-//!   実装済みで、他の段の実体（cgroup 参加・capability 削減・seccomp・Landlock）は未実装。非 Linux ではビルド対象外のため本 doc からは
+//!   の検証が `exec` の非公開項目のため〕、fork / exec による子プロセス起動〔TASK-27.4.1。最小構成でフック無し〕、順序固定のステージ列の枠〔TASK-27.4.2。`exec/stages.rs`。`NO_NEW_PRIVS`〔TASK-27.4.3〕と capability 削減〔TASK-37.2〕のみ固定ステージとして実装済み〕が
+//!   実装済みで、他の段の実体（cgroup 参加・seccomp・Landlock）は未実装。非 Linux ではビルド対象外のため本 doc からは
 //!   リンクしない）
 //! - `capabilities`: capability 集合の型 `Capability`・`CapabilitySet`・OCI 既定集合（SEC-1・
 //!   TASK-37.1）。OS 非依存で syscall を持たない。適用関数 `apply_default_capabilities` は
 //!   `exec/capabilities.rs`（Linux 限定）に置く: 段の型 `ExecError` の非公開コンストラクタと
-//!   errno 分類を再利用するため（`exec/devices.rs` と同じ判断）。ステージ列への組み込みは #173
+//!   errno 分類を再利用するため（`exec/devices.rs` と同じ判断）。ステージ列へは #173（TASK-37.2）で組み込み済み
 //! - `observability`: メトリクス集計型 `OpStats` 等（TASK-84.1）と記録 API `OpRecorder`
 //!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。計装は TASK-84.4 以降で未実装。io 向け連携点は io 側に定義済み（TASK-84.5）
 //! - `rootless`: user namespace の UID/GID 写像の設定・読み戻し検証（Linux 限定。CORE-6・SEC-5・

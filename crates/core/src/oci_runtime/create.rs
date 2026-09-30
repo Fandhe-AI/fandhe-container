@@ -15,7 +15,7 @@
 //!    （SEC-1・CORE-5）。個別フィールドの許可は、それを実際に適用する後続タスクが
 //!    パーサ側で解釈済みに移すことで行う。
 //! 2. `process` を持たない config は拒否する。start で起動できない config を created にしない。
-//! 3. `root.path` は `..` 要素と、bundle 配下の全パス要素（中間要素を含む）の symlink を拒否し、
+//! 3. `root.path` は `..` 要素と、bundle 配下の全パス要素（中間要素を含む）の symlink・Windows junction（reparse point）を拒否し、
 //!    存在するディレクトリであることを確認する。bundle 内の link 経由で bundle 外を rootfs に
 //!    できないようにするため（SEC-1）。bundle 外を指す絶対パスの `root.path` は設定作成者の
 //!    明示指定として受け入れ、末尾要素のみ検査する。
@@ -120,7 +120,7 @@ fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<(), TraitError> {
                 if let Component::Normal(part) = c {
                     current.push(part);
                     let meta = inspect(&current)?;
-                    if meta.file_type().is_symlink() {
+                    if is_link_like(&meta) {
                         return Err(invalid("rootfs must not contain a symlink"));
                     }
                     last = Some(meta);
@@ -133,7 +133,7 @@ fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<(), TraitError> {
     if checked.is_none() {
         // bundle 自身、または bundle 外の絶対パス。
         let meta = inspect(&rootfs)?;
-        if meta.file_type().is_symlink() {
+        if is_link_like(&meta) {
             return Err(invalid("rootfs must not be a symlink"));
         }
         checked = Some(meta);
@@ -142,6 +142,25 @@ fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<(), TraitError> {
         Some(meta) if meta.is_dir() => Ok(()),
         _ => Err(invalid("rootfs is not a directory")),
     }
+}
+
+/// symlink に加え、Windows のディレクトリ junction 等の reparse point もリンクとして扱う（SEC-1）。
+///
+/// junction は `FileType::is_symlink()` が false を返すため、属性の `FILE_ATTRIBUTE_REPARSE_POINT`
+/// で検出する。他 OS では symlink 判定のみ。
+fn is_link_like(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 fn inspect(path: &Path) -> Result<std::fs::Metadata, TraitError> {

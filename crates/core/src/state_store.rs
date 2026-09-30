@@ -1651,6 +1651,7 @@ mod tests {
         }
     }
 
+    /// OCI-5: symlink・0700 以外の既存ルートを拒否し、新規ルートは 0700 で作る。
     #[test]
     fn oci5_open_rejects_unsafe_root_and_creates_0700() {
         use std::os::unix::fs::{PermissionsExt, symlink};
@@ -1665,13 +1666,19 @@ mod tests {
             )),
             "PERMISSION_DENIED"
         );
-        fs::set_permissions(&real, fs::Permissions::from_mode(0o770)).unwrap();
-        assert_eq!(
-            code(FileStateStore::open(
-                StateRoot::from_override(real).unwrap()
-            )),
-            "PERMISSION_DENIED"
-        );
+        // 書き込みビットに加え、読み取り・実行ビットだけ（ID の列挙が可能）でも拒否する。
+        for mode in [0o770, 0o755, 0o750, 0o701] {
+            fs::set_permissions(&real, fs::Permissions::from_mode(mode)).unwrap();
+            let e =
+                FileStateStore::open(StateRoot::from_override(real.clone()).unwrap()).unwrap_err();
+            assert_eq!(e.code().as_str(), "PERMISSION_DENIED", "mode {mode:o}");
+            assert_eq!(
+                e.message(),
+                "state root must not be accessible by group or others"
+            );
+        }
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+        FileStateStore::open(StateRoot::from_override(real).unwrap()).unwrap();
         let fresh = t.path().join("fresh");
         FileStateStore::open(StateRoot::from_override(fresh.clone()).unwrap()).unwrap();
         assert_eq!(

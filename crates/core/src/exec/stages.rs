@@ -3,23 +3,28 @@
 //! # 役割と呼び出し文脈
 //!
 //! `crate::exec` の最小実行フロー第 4 段の「枠」。`process.rs::run_child` が pivot_root の後・
-//! `exec_entrypoint` の前に [`StagePipeline::run_then`] を呼び、次の順序で各段のフックを実行する。
+//! `exec_entrypoint` の前に `StagePipeline::run_then` を呼び、次の順序で各段のフックを実行する。
 //!
 //! ```text
 //! cgroup 参加 -> capability 削減 -> PR_SET_NO_NEW_PRIVS -> Landlock -> seccomp -> exec
 //! ```
 //!
 //! 各段の実体は後続の TASK が [`StageHook`] として差し込む（cgroup 参加: TASK-32、capability 削減:
-//! TASK-37、`NO_NEW_PRIVS`: #833・TASK-27.4.3、Landlock: TASK-39、seccomp: TASK-38、rootless: TASK-40）。
+//! TASK-37、Landlock: TASK-39、seccomp: TASK-38、rootless: TASK-40）。`NO_NEW_PRIVS` だけは
+//! 組み込みの固定ステージ（`exec/no_new_privs.rs`。#833・TASK-27.4.3）で、フックを登録しなくても
+//! 必ず実行され、[`StagePipeline::with_hook`] による差し替えは拒否する。
 //! `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提である。
 //!
 //! # 契約
 //!
 //! - **順序は [`StageKind::ORDER`] だけが決める**: 登録順・呼び出し側の指定では変えられない。
-//!   exec は [`StagePipeline::run_then`] の終端クロージャからしか呼べず、全段成功後に限り最後に走る
+//!   exec は `StagePipeline::run_then` の終端クロージャからしか呼べず、全段成功後に限り最後に走る
 //! - **最初の失敗で打ち切る**: 後続段と exec は呼ばない。エラーの `stage` はパイプライン側で
 //!   その段に付け替える（フックが自分の段を偽れない。ERR-1）
 //! - **同じ段への二重登録は拒否する**: 既存の制限フックを no-op で上書きする経路を作らない
+//! - **組み込みの固定ステージは差し替えられない**: [`StageKind::is_builtin`] の段
+//!   （`NoNewPrivs`）は `with_hook` で `InvalidArgument` になり、`run_then` はフック配列を読まず
+//!   組み込み処理へ直接振り分ける
 //! - **[`StageReport`] と `Applied` は制限適用の証跡ではない**: 「フックが `Ok` を返した」事実の
 //!   記録にすぎない。`process.rs::require_restriction_evidence` の判定には使わず、フック無し・
 //!   ダミーフックのどちらでも exec は `PermissionDenied` のまま拒否される（SEC-1・CORE-5）。
@@ -36,7 +41,7 @@
 
 use std::fmt;
 
-use super::{ExecError, IsolationStage};
+use super::{ExecError, IsolationStage, no_new_privs};
 use crate::traits::types::ErrorCode;
 
 /// ステージの種別。`ORDER` の順が実行順（固定）。
@@ -49,7 +54,7 @@ pub enum StageKind {
     CgroupJoin,
     /// capability 削減（TASK-37）。
     CapabilityDrop,
-    /// `PR_SET_NO_NEW_PRIVS`（#833・TASK-27.4.3）。
+    /// `PR_SET_NO_NEW_PRIVS`（#833・TASK-27.4.3）。組み込みの固定ステージ（差し替え不可）。
     NoNewPrivs,
     /// Landlock（TASK-39）。
     Landlock,
@@ -74,6 +79,17 @@ impl StageKind {
             StageKind::NoNewPrivs => 2,
             StageKind::Landlock => 3,
             StageKind::Seccomp => 4,
+        }
+    }
+
+    /// 組み込みの固定ステージか（`with_hook` で差し替えを拒否する唯一の判定元）。
+    pub fn is_builtin(self) -> bool {
+        match self {
+            StageKind::NoNewPrivs => true,
+            StageKind::CgroupJoin
+            | StageKind::CapabilityDrop
+            | StageKind::Landlock
+            | StageKind::Seccomp => false,
         }
     }
 
@@ -147,7 +163,7 @@ impl StageReport {
     }
 }
 
-/// 順序固定のステージ列。空のままでも既定動作は「何も差し込まず exec へ進む」だけで、
+/// 順序固定のステージ列。空のままでも組み込みの `NO_NEW_PRIVS` だけを適用して exec へ進み、
 /// exec の fail-closed（証跡要求）は変わらない。
 pub struct StagePipeline {
     hooks: [Option<Box<dyn StageHook>>; 5],
@@ -163,6 +179,10 @@ impl fmt::Debug for StagePipeline {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut d = f.debug_struct("StagePipeline");
         for kind in StageKind::ORDER {
+            if kind.is_builtin() {
+                d.field(kind.as_str(), &"builtin");
+                continue;
+            }
             let registered = self.hooks.get(kind.index()).is_some_and(Option::is_some);
             d.field(kind.as_str(), &registered);
         }
@@ -178,12 +198,23 @@ impl StagePipeline {
         }
     }
 
-    /// 段にフックを登録する。同じ段への二重登録は `InvalidArgument`（`Validate` 段）で拒否する。
+    /// 段にフックを登録する。同じ段への二重登録と、組み込みの固定ステージ
+    /// （[`StageKind::is_builtin`]）への登録は `InvalidArgument`（`Validate` 段）で拒否する。
     pub fn with_hook(
         mut self,
         kind: StageKind,
         hook: impl StageHook + 'static,
     ) -> Result<Self, ExecError> {
+        if kind.is_builtin() {
+            return Err(ExecError::new(
+                ErrorCode::InvalidArgument,
+                IsolationStage::Validate,
+                format!(
+                    "stage is built-in and cannot be replaced: {}",
+                    kind.as_str()
+                ),
+            ));
+        }
         let slot = self.hooks.get_mut(kind.index()).ok_or_else(|| {
             ExecError::new(
                 ErrorCode::Internal,
@@ -206,18 +237,43 @@ impl StagePipeline {
     ///
     /// 最初の `Err` で打ち切る（後続段と `exec` は呼ばない）。フックの `Err` は `stage` を
     /// その段へ付け替えて返す。`exec` へは [`StageReport`] を渡す（証跡ではない）。
-    pub fn run_then<T>(
+    ///
+    /// # 呼び出し契約
+    ///
+    /// 可視性は `pub(crate)` に限る（破壊的変更: 従来の `pub` から縮小。外部 crate からは呼べない。
+    /// 呼び出し元は `process.rs::run_child`（fork 後の子）だけで、親から誤用できない API 境界にする）。
+    /// 新たな呼び出し元を crate 内に増やす場合も fork 後の子でのみ呼ぶこと。組み込みの `NoNewPrivs` 段（TASK-27.4.3）が
+    /// 呼び出しスレッドへ `PR_SET_NO_NEW_PRIVS` を立て、これは不可逆で解除できない。
+    /// 親プロセス（supervisor 等）から呼ぶと、そのスレッドが恒久的に強化される
+    /// （setuid 実行などが以後効かなくなる）。
+    ///
+    /// # 破壊的変更と移行方法（#833・TASK-27.4.3）
+    ///
+    /// - 変更内容: `pub fn run_then` から `pub(crate) fn run_then` へ縮小した。crate 外から
+    ///   `StagePipeline::run_then` を直接呼ぶことはできなくなった。
+    /// - 理由: 組み込みの `NO_NEW_PRIVS` 段が不可逆のため、親プロセスからの誤呼び出しを型で防ぐ。
+    /// - 移行方法: 外部 crate は `StagePipeline` を `spawn_container_with_stages` に渡す。
+    ///   `run_then` は fork 後の子（`process.rs::run_child`）内で core が呼ぶ。`run_then` を
+    ///   単体で呼んでいた利用者は、ステージ列の順序・失敗時の挙動の確認を
+    ///   `spawn_container_with_stages` 経由の結合試験（`fork_exec_isolation` の `stages-order`）へ移す。
+    pub(crate) fn run_then<T>(
         mut self,
         exec: impl FnOnce(&StageReport) -> Result<T, ExecError>,
     ) -> Result<T, ExecError> {
         let mut statuses = [StageStatus::Skipped; 5];
         for kind in StageKind::ORDER {
             let idx = kind.index();
-            let Some(Some(hook)) = self.hooks.get_mut(idx) else {
-                continue;
-            };
-            hook.apply()
-                .map_err(|e| e.at_stage(kind.isolation_stage()))?;
+            if kind == StageKind::NoNewPrivs {
+                // 組み込み: フック配列のスロットは読まない（差し替えも無効化もできない）。
+                no_new_privs::apply_no_new_privs()
+                    .map_err(|e| e.at_stage(kind.isolation_stage()))?;
+            } else {
+                let Some(Some(hook)) = self.hooks.get_mut(idx) else {
+                    continue;
+                };
+                hook.apply()
+                    .map_err(|e| e.at_stage(kind.isolation_stage()))?;
+            }
             if let Some(s) = statuses.get_mut(idx) {
                 *s = StageStatus::Applied;
             }
@@ -228,21 +284,9 @@ impl StagePipeline {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
+    use super::super::no_new_privs::testing::{fake, rec, take};
     use super::*;
-
-    thread_local! {
-        static CALLS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
-    }
-
-    fn rec(name: &'static str) {
-        CALLS.with(|c| c.borrow_mut().push(name));
-    }
-
-    fn take() -> Vec<&'static str> {
-        CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
-    }
+    use crate::sys::{self, SysError};
 
     fn ok_hook(kind: StageKind) -> impl StageHook + 'static {
         move || {
@@ -254,6 +298,15 @@ mod tests {
     fn exec_ok(_: &StageReport) -> Result<(), ExecError> {
         rec("exec");
         Ok(())
+    }
+
+    /// 組み込み段を除く全段にダミーフックを登録する（逆順）。
+    fn all_hooks_reversed() -> StagePipeline {
+        let mut p = StagePipeline::new();
+        for kind in StageKind::ORDER.iter().rev().filter(|k| !k.is_builtin()) {
+            p = p.with_hook(*kind, ok_hook(*kind)).unwrap();
+        }
+        p
     }
 
     /// CORE-1・TASK-27.4.2: 順序表の機械照合。
@@ -278,11 +331,7 @@ mod tests {
     #[test]
     fn core1_dummy_hooks_run_in_fixed_order() {
         take();
-        let mut p = StagePipeline::new();
-        for kind in StageKind::ORDER.iter().rev() {
-            p = p.with_hook(*kind, ok_hook(*kind)).unwrap();
-        }
-        let report = p
+        let report = all_hooks_reversed()
             .run_then(|r| {
                 rec("exec");
                 Ok(r.clone())
@@ -302,14 +351,32 @@ mod tests {
         assert!(report.iter().all(|(_, s)| s == StageStatus::Applied));
     }
 
-    /// CORE-1・TASK-27.4.2: 一部登録でも順序を保ち、未登録は Skipped。
+    /// CORE-1・TASK-27.4.3: NO_NEW_PRIVS は capability 削減の後・Landlock の前に実行される
+    /// （受け入れ基準の機械照合。Landlock -> CapabilityDrop の逆順で登録しても崩れない）。
+    #[test]
+    fn core1_no_new_privs_runs_after_capability_drop_and_before_landlock() {
+        take();
+        let p = StagePipeline::new()
+            .with_hook(StageKind::Landlock, ok_hook(StageKind::Landlock))
+            .unwrap()
+            .with_hook(
+                StageKind::CapabilityDrop,
+                ok_hook(StageKind::CapabilityDrop),
+            )
+            .unwrap();
+        p.run_then(exec_ok).unwrap();
+        assert_eq!(
+            take(),
+            ["capability_drop", "no_new_privs", "landlock", "exec"]
+        );
+    }
+
+    /// CORE-1・TASK-27.4.2/27.4.3: 一部登録でも順序を保ち、未登録は Skipped（組み込みは常に Applied）。
     #[test]
     fn core1_partial_hooks_keep_order_and_report_skipped() {
         take();
         let p = StagePipeline::new()
             .with_hook(StageKind::Seccomp, ok_hook(StageKind::Seccomp))
-            .unwrap()
-            .with_hook(StageKind::NoNewPrivs, ok_hook(StageKind::NoNewPrivs))
             .unwrap();
         let report = p
             .run_then(|r| {
@@ -331,9 +398,9 @@ mod tests {
         );
     }
 
-    /// CORE-1・TASK-27.4.2: フック無しでも exec は 1 回呼ばれ、全段 Skipped。
+    /// CORE-1・TASK-27.4.3: フック無しでも組み込みの NO_NEW_PRIVS だけは適用され、その後 exec。
     #[test]
-    fn core1_empty_pipeline_reaches_exec_with_all_skipped() {
+    fn core1_empty_pipeline_applies_builtin_no_new_privs() {
         take();
         let report = StagePipeline::new()
             .run_then(|r| {
@@ -341,17 +408,27 @@ mod tests {
                 Ok(r.clone())
             })
             .unwrap();
-        assert_eq!(take(), ["exec"]);
-        assert!(report.iter().all(|(_, s)| s == StageStatus::Skipped));
+        assert_eq!(take(), ["no_new_privs", "exec"]);
+        for (kind, status) in report.iter() {
+            let expected = if kind == StageKind::NoNewPrivs {
+                StageStatus::Applied
+            } else {
+                StageStatus::Skipped
+            };
+            assert_eq!(status, expected, "{}", kind.as_str());
+        }
     }
 
-    /// CORE-1・TASK-27.4.2: k 段目の失敗で打ち切り、段は付け替わり code は保持される。
+    /// CORE-1・TASK-27.4.2/27.4.3: k 段目の失敗で打ち切り、段は付け替わり code は保持される。
     #[test]
     fn core1_hook_failure_stops_pipeline() {
         for (k, failing) in StageKind::ORDER.iter().enumerate() {
             take();
             let mut p = StagePipeline::new();
             for kind in StageKind::ORDER {
+                if kind.is_builtin() {
+                    continue;
+                }
                 if kind == *failing {
                     p = p
                         .with_hook(kind, || {
@@ -367,14 +444,40 @@ mod tests {
                     p = p.with_hook(kind, ok_hook(kind)).unwrap();
                 }
             }
+            if failing.is_builtin() {
+                fake(Err(SysError::Os(sys::EPERM)), Ok(true));
+            }
             let err = p.run_then(exec_ok).unwrap_err();
             assert_eq!(err.stage, failing.isolation_stage());
             assert_eq!(err.code, ErrorCode::PermissionDenied);
             let calls = take();
             assert_eq!(calls.len(), k + 1, "stopped after {}", failing.as_str());
-            assert_eq!(calls.last().copied(), Some("fail"));
+            let last = if failing.is_builtin() {
+                "no_new_privs"
+            } else {
+                "fail"
+            };
+            assert_eq!(calls.last().copied(), Some(last));
             assert!(!calls.contains(&"exec"));
         }
+    }
+
+    /// CORE-1・TASK-27.4.3: capability 削減が失敗したら NO_NEW_PRIVS には進まない。
+    #[test]
+    fn core1_capability_drop_failure_skips_no_new_privs() {
+        take();
+        let p = StagePipeline::new()
+            .with_hook(StageKind::CapabilityDrop, || {
+                Err(ExecError::new(
+                    ErrorCode::Internal,
+                    IsolationStage::Validate,
+                    "boom",
+                ))
+            })
+            .unwrap();
+        let err = p.run_then(exec_ok).unwrap_err();
+        assert_eq!(err.stage, IsolationStage::CapabilityDrop);
+        assert_eq!(take(), Vec::<&str>::new());
     }
 
     /// CORE-1・TASK-27.4.2: 同じ段への二重登録は拒否される。
@@ -389,5 +492,17 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert_eq!(err.stage, IsolationStage::Validate);
         assert_eq!(err.violation, None);
+    }
+
+    /// CORE-1・TASK-27.4.3: 組み込みの NO_NEW_PRIVS 段はフックで差し替えられない。
+    #[test]
+    fn core1_builtin_no_new_privs_cannot_be_replaced() {
+        let err = StagePipeline::new()
+            .with_hook(StageKind::NoNewPrivs, || Ok(()))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.stage, IsolationStage::Validate);
+        assert_eq!(err.violation, None);
+        assert!(err.message.contains("built-in"), "{}", err.message);
     }
 }

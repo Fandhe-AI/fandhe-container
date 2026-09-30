@@ -2,16 +2,21 @@
 //! （`fandhe_container_core::landlock::{build_path_rules, path_rules_from_config}`。
 //! CORE-5・TASK-39.2・#182。REPAIR-10・REPAIR-12 の機械照合）。
 //!
-//! `LandlockSupport` は検出（`detect_landlock_abi`）を通らないと得られない（fail-closed）ため、
-//! 検出が `Ok` のカーネルでは具体的なルールを照合し、`Err` のカーネルでは
-//! 「ルール生成に到達できない」こと自体を構造化された拒否として照合する。
+//! `LandlockSupport` は検出（`detect_landlock_abi`）を通らないと得られない（fail-closed）。
+//! 既定のテスト集合では、検出が `Ok` のカーネルなら具体的なルールを照合し、`Err` のカーネルなら
+//! ルール生成に到達できないこと自体を構造化された拒否（コード・理由・文字列表現）として照合する。
+//! どちらの分岐も何かを照合し、検証せずに成功する分岐は持たない。
+//! ABI 6 以上を要求してルールを必ず照合する実機前提テストは `-- --ignored` 指定時のみ実行する
+//! （ci.md「実機前提テスト」。`landlock_detect.rs` の `core5_detect_succeeds_on_abi6_host` と同じ条件）。
 
 #![cfg(target_os = "linux")]
 
 use fandhe_container_core::landlock::{
-    AccessFs, RuleOrigin, RulePath, build_path_rules, detect_landlock_abi, path_rules_from_config,
+    AccessFs, LandlockError, LandlockSupport, RuleOrigin, RulePath, build_path_rules,
+    detect_landlock_abi, path_rules_from_config,
 };
 use fandhe_container_core::oci_runtime::{OciConfig, parse_config_bytes};
+use fandhe_container_core::traits::ErrorCode;
 
 fn config(readonly: bool, mounts: &str) -> OciConfig {
     let json = format!(
@@ -20,54 +25,139 @@ fn config(readonly: bool, mounts: &str) -> OciConfig {
     parse_config_bytes(json.as_bytes()).expect("valid config")
 }
 
-/// CORE-5: root と mount のルールが入力どおりの具体的な権利で生成される。
-#[test]
-fn core5_path_rules_from_config_concrete_rights() {
-    let Ok(support) = detect_landlock_abi() else {
-        // 検出に失敗するカーネルではルール生成 API に到達できない（fail-closed）。
-        return;
-    };
+/// 読み書き（実行を含む）の権利。書き込み可能な root・`rw` mount の既定値。
+fn rw() -> AccessFs {
+    AccessFs::READ.union(AccessFs::WRITE)
+}
+
+/// ルール列を（パス・由来・権利ビット）の具体値に写す。
+fn summary(rules: &[fandhe_container_core::landlock::PathRule]) -> Vec<(String, RuleOrigin, u64)> {
+    rules
+        .iter()
+        .map(|r| (r.path.as_str().to_string(), r.origin, r.allowed.bits()))
+        .collect()
+}
+
+/// 検出失敗は ABI 不足等の前提条件違反として構造化された拒否になる（fail-closed）。
+fn assert_structured_rejection(e: &LandlockError) {
+    assert!(
+        matches!(
+            e.code,
+            ErrorCode::FailedPrecondition | ErrorCode::Internal | ErrorCode::Unimplemented
+        ),
+        "unexpected code {:?}",
+        e.code
+    );
+    assert!(!e.reason.as_str().is_empty());
+    assert!(!e.message.is_empty());
+    let text = e.to_string();
+    assert!(
+        text.starts_with(&format!("{}: ", e.code.as_str())),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(&format!("({})", e.reason.as_str())),
+        "{text}"
+    );
+}
+
+/// CORE-5: `path_rules_from_config` が root と mount のルールを入力どおりの具体的な権利で生成する。
+fn check_path_rules_from_config(support: &LandlockSupport) {
     let c = config(
         true,
         r#"[
             {"destination":"/data","options":["rw"]},
             {"destination":"/bin","options":["ro"]},
-            {"destination":"/x","options":["noexec","exec","ro"]}
+            {"destination":"/x","options":["exec","noexec"]},
+            {"destination":"/y","options":["noexec","exec","ro"]},
+            {"destination":"/dev","options":["nodev","dev"]},
+            {"destination":"/dev/shm","options":["dev","nodev"]}
         ]"#,
     );
-    let rs = path_rules_from_config(&support, &c).expect("rules");
+    let rs = path_rules_from_config(support, &c).expect("rules");
+    assert_eq!(rs.handled_access_fs(), AccessFs::ALL);
     let rules = rs.rules();
-    assert_eq!(rules.len(), 4);
-    assert_eq!(rules[0].path, RulePath::Root);
-    assert_eq!(rules[0].origin, RuleOrigin::Root);
-    assert_eq!(rules[0].allowed, AccessFs::READ);
-    assert_eq!(rules[1].path.as_str(), "/data");
-    assert_eq!(rules[1].allowed, AccessFs::READ.union(AccessFs::WRITE));
-    assert_eq!(rules[2].path.as_str(), "/bin");
-    assert_eq!(rules[2].allowed, AccessFs::READ);
-    // noexec の後の exec が有効になり、EXECUTE を保持する。
-    assert_eq!(rules[3].path.as_str(), "/x");
-    assert_eq!(rules[3].allowed, AccessFs::READ);
-    // 書き込み可能な root ではデバイス作成権を含まない。
-    let rw = path_rules_from_config(&support, &config(false, "[]")).expect("rules");
-    assert_eq!(rw.rules()[0].allowed.bits(), 0x77BF);
+    assert_eq!(rules.first().map(|r| &r.path), Some(&RulePath::Root));
+    assert_eq!(
+        summary(rules),
+        vec![
+            ("/".to_string(), RuleOrigin::Root, 0x000D),
+            ("/data".to_string(), RuleOrigin::Mount { index: 0 }, 0x77BF),
+            ("/bin".to_string(), RuleOrigin::Mount { index: 1 }, 0x000D),
+            // 後の noexec が勝ち、EXECUTE だけを除く。
+            ("/x".to_string(), RuleOrigin::Mount { index: 2 }, 0x77BE),
+            // noexec の後の exec が勝ち、ro で書き込みを除く。
+            ("/y".to_string(), RuleOrigin::Mount { index: 3 }, 0x000D),
+            // nodev の後の dev が勝ち、/dev 配下で IOCTL_DEV を許可する。
+            ("/dev".to_string(), RuleOrigin::Mount { index: 4 }, 0xF7BF),
+            (
+                "/dev/shm".to_string(),
+                RuleOrigin::Mount { index: 5 },
+                0x77BF
+            ),
+        ]
+    );
+    assert_eq!(rw().bits(), 0x77BF);
+    // 書き込み可能な root ではデバイス作成権（MAKE_CHAR / MAKE_BLOCK）と IOCTL_DEV を含まない。
+    let writable = path_rules_from_config(support, &config(false, "[]")).expect("rules");
+    assert_eq!(
+        summary(writable.rules()),
+        vec![("/".to_string(), RuleOrigin::Root, 0x77BF)]
+    );
 }
 
-/// CORE-5: `build_path_rules` は同一 destination を後勝ちにし、rules 件数は root + 重複排除後の mount 数になる。
-#[test]
-fn core5_build_path_rules_last_mount_wins_for_same_destination() {
-    let Ok(support) = detect_landlock_abi() else {
-        return;
-    };
+/// CORE-5: `build_path_rules` は同一 destination と、後の親マウントに隠れた子マウントのルールを除く。
+fn check_build_path_rules_hidden_mounts(support: &LandlockSupport) {
     let c = config(
         false,
         r#"[
             {"destination":"/d","options":["ro"]},
-            {"destination":"/d","options":["rw"]}
+            {"destination":"/x/y","options":["rw"]},
+            {"destination":"/d","options":["rw"]},
+            {"destination":"/x","options":["ro"]}
         ]"#,
     );
-    let rs = build_path_rules(&support, c.root(), c.mounts()).expect("rules");
-    assert_eq!(rs.rules().len(), 2);
-    assert_eq!(rs.rules()[1].path.as_str(), "/d");
-    assert_eq!(rs.rules()[1].allowed, AccessFs::READ.union(AccessFs::WRITE));
+    let rs = build_path_rules(support, c.root(), c.mounts()).expect("rules");
+    assert_eq!(
+        summary(rs.rules()),
+        vec![
+            ("/".to_string(), RuleOrigin::Root, 0x77BF),
+            ("/d".to_string(), RuleOrigin::Mount { index: 2 }, 0x77BF),
+            ("/x".to_string(), RuleOrigin::Mount { index: 3 }, 0x000D),
+        ]
+    );
+    // 書き込み可能な root の下の ro mount は Landlock では狭められず、shadowed に記録される。
+    let shadowed: Vec<(&str, u64, u64)> = rs
+        .shadowed()
+        .iter()
+        .map(|s| (s.path.as_str(), s.intended.bits(), s.effective.bits()))
+        .collect();
+    assert_eq!(shadowed, vec![("/x", 0x000D, 0x77BF)]);
+}
+
+/// CORE-5: 検出が `Ok` なら `path_rules_from_config` の生成結果を、`Err` なら構造化された拒否を照合する。
+#[test]
+fn core5_path_rules_from_config_or_structured_rejection() {
+    match detect_landlock_abi() {
+        Ok(support) => check_path_rules_from_config(&support),
+        Err(e) => assert_structured_rejection(&e),
+    }
+}
+
+/// CORE-5: 検出が `Ok` なら `build_path_rules` の隠れたマウントの除外を、`Err` なら構造化された拒否を照合する。
+#[test]
+fn core5_build_path_rules_hidden_mounts_or_structured_rejection() {
+    match detect_landlock_abi() {
+        Ok(support) => check_build_path_rules_hidden_mounts(&support),
+        Err(e) => assert_structured_rejection(&e),
+    }
+}
+
+/// CORE-5: 実機（Linux 6.12+・ABI 6+）では検出を通過し、公開 API のルール生成を必ず照合する。
+#[test]
+#[ignore = "requires Landlock ABI >= 6 (Linux 6.12+). CORE-5"]
+fn core5_path_rules_on_abi6_host() {
+    let support = detect_landlock_abi().expect("Landlock ABI >= 6 required");
+    check_path_rules_from_config(&support);
+    check_build_path_rules_hidden_mounts(&support);
 }

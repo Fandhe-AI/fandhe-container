@@ -123,7 +123,23 @@ fn apply_capabilities(
             Err(e) => return Err(fail(e, "prctl(PR_CAPBSET_READ)")),
         }
     }
-    let last_cap = last_cap.unwrap_or(CAP_INDEX_LIMIT - 1);
+    let last_cap = match last_cap {
+        Some(n) => n,
+        // 0..64 がすべて既知だった場合、番号 64 が EINVAL であること（= 63 が最後）を確認する。
+        // 認識されるなら本実装の 2 語 ABI では扱えない未知 capability が残り得るため、
+        // 対応 ABI を実装するまで fail-closed で拒否する（SEC-1）。
+        None => match kernel.bounding_contains(CAP_INDEX_LIMIT) {
+            Err(SysError::Os(e)) if e == EINVAL => CAP_INDEX_LIMIT - 1,
+            Ok(_) => {
+                return Err(ExecError::new(
+                    ErrorCode::Unimplemented,
+                    stage,
+                    "kernel recognises capability numbers beyond 63, which this implementation cannot drop",
+                ));
+            }
+            Err(e) => return Err(fail(e, "prctl(PR_CAPBSET_READ)")),
+        },
+    };
 
     // 2. ambient のクリア。
     kernel
@@ -227,7 +243,8 @@ pub(super) mod testing {
             if cap > self.last_cap {
                 return Err(SysError::Os(EINVAL));
             }
-            Ok(self.bounding & (1u64 << cap) != 0)
+            // 64 以上は bounding（u64）の範囲外。認識されるが保持していない扱いにする。
+            Ok(cap < 64 && self.bounding & (1u64 << cap) != 0)
         }
 
         fn bounding_drop(&mut self, cap: u8) -> Result<(), SysError> {
@@ -303,6 +320,30 @@ mod tests {
             assert!(report.bounding_dropped.contains(&n), "{n}");
         }
         assert_eq!(report.last_cap, 45);
+        assert_eq!(k.bounding, DEFAULT_MASK);
+    }
+
+    /// SEC-1: カーネルが番号 64 以上を認識する場合は fail-closed で拒否する。
+    #[test]
+    fn sec1_cap_number_64_recognised_is_rejected() {
+        let mut k = Fake::new();
+        k.last_cap = 64;
+        k.bounding = u64::MAX;
+        let e = run(&mut k).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Unimplemented);
+        assert_eq!(e.stage, IsolationStage::CapabilityDrop);
+        // 拒否は ambient・capset より前（以降の呼び出しは行わない）。
+        assert!(!k.calls.contains(&"capset"));
+    }
+
+    /// SEC-1: 番号 63 まで既知で 64 が EINVAL なら last_cap = 63 で成功する。
+    #[test]
+    fn sec1_cap_number_63_is_last_succeeds() {
+        let mut k = Fake::new();
+        k.last_cap = 63;
+        k.bounding = u64::MAX;
+        let report = run(&mut k).unwrap();
+        assert_eq!(report.last_cap, 63);
         assert_eq!(k.bounding, DEFAULT_MASK);
     }
 

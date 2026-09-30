@@ -31,7 +31,8 @@
 #   <runtime> state <id>                       # create 前の ID 未使用確認（計測対象外）と実行開始の観測
 #   <runtime> create --bundle <bundle> <id>    # 計測対象
 #   <runtime> start <id>                       # 計測対象
-#   <runtime> delete <id>                      # 後始末（計測対象外）。失敗時は kill <id> KILL → 待機付き delete
+#   <runtime> delete <id>                      # 後始末（計測対象外。create 成功済みの ID のみ）。
+#                                              # 失敗時は kill <id> KILL → 待機付き delete
 #   「プロセス実行開始」の定義（CORE-10 の前提「create からプロセス実行開始までの時間」）:
 #   OCI Runtime Spec の start 成功はユーザー指定プログラムの実行開始時刻を返す契約では
 #   ないため、start 復帰後に state を照会し、status が running（プログラム実行済み・未終了）
@@ -229,12 +230,9 @@ fi
 seq_no=0
 # 現在の試行で後始末対象のコンテナ ID（1 試行につき 1 つ）と、削除できなかった ID の一覧。
 live_id=""
-# create が成功していれば 1。0 の間（create の成否未確定・失敗）は、後始末の前に state で
-# 未作成か今回作ったものかを確かめる（finish_container）。
+# create が成功していれば 1。0 の間（create の成否未確定・失敗）は破壊的操作を送らず、
+# state で未作成を確定できなければ残存の可能性ありとして報告する（finish_container）。
 live_created=0
-# create 前の state が明確な不存在応答（state_not_found）だったら 1。このときに限り、
-# create 未成功後に同じ ID のコンテナが見えれば今回の create が作ったものと判定できる。
-pre_absent=0
 leftover_ids=()
 rc=0
 # create の終了コード（create 未成功時の未作成判定に使う）。
@@ -333,13 +331,6 @@ create_not_made() {
   is_runtime_error "$create_rc" && state_not_found
 }
 
-# create 未成功の ID に見えるコンテナが今回の create で作られたものか。create 前の state が
-# 明確な不存在応答だった（pre_absent=1）ときに限り、その後に現れた同じ ID のコンテナを
-# 今回のものと判定する。それ以外（作成前の不存在を確認できなかった ID）には操作を送らない。
-state_is_ours() {
-  [ "$pre_absent" = "1" ] && [ "$state_rc" -eq 0 ] && [ -n "$state_status" ]
-}
-
 # コンテナを削除する。delete が失敗したら kill KILL を送り、プロセスの終了を待ちながら
 # delete を再試行する（OCI の delete は実行中コンテナを拒否し、kill は終了を待たないため）。
 # 待機は --timeout 秒・DELETE_RETRY_MAX 回で打ち切る（REPAIR-5）。それでも残れば
@@ -347,10 +338,12 @@ state_is_ours() {
 # 引数: <id> <created>
 #   created=1: create 成功済み。OCI の create は ID 重複時に必ず失敗するため、この ID の
 #              コンテナは今回作ったものであり、そのまま delete / kill を送る。
-#   created=0: create 未成功。まず state で確かめ、未作成（create_not_made）なら何もせず
-#              成功、今回作ったもの（state_is_ours）なら削除へ進み、どちらも確かめられ
-#              なければ操作を送らずに残存の可能性ありとして記録する（所有を証明できない
-#              コンテナへ破壊的操作を送らない。特権操作の後始末）。
+#   created=0: create 未成功。同じ ID のコンテナが見えても、今回の create が作ったもの
+#              （途中まで作って失敗）か、照会後に別のプロセスが作ったもの（こちらの create は
+#              ID 重複で失敗）かを区別できないため、delete / kill は一切送らない。state で
+#              未作成（create_not_made）を確定できれば成功、できなければ残存の可能性ありとして
+#              記録し、手動での確認を促す（所有を証明できないコンテナへ破壊的操作を送らない。
+#              特権操作の後始末）。
 finish_container() {
   local id="$1" created="$2"
   local log="$tmpdir/cleanup-$id.log"
@@ -359,11 +352,9 @@ finish_container() {
     if create_not_made; then
       return 0
     fi
-    if ! state_is_ours; then
-      echo "warning: could not confirm whether $id was created by this run (state exit $state_rc, create exit $create_rc); not touching it and assuming it may be left behind" >&2
-      leftover_ids+=("$id")
-      return 1
-    fi
+    echo "warning: create did not succeed for $id and its absence could not be confirmed (state exit $state_rc, create exit $create_rc); not touching it because ownership cannot be proven, inspect it manually" >&2
+    leftover_ids+=("$id")
+    return 1
   fi
   if rt_delete "$log" "$id"; then
     return 0
@@ -388,9 +379,9 @@ cleanup() {
   local final="$?"
   trap - EXIT INT TERM
   if [ -n "$live_id" ]; then
-    # live_id は ID 未使用の確認後・create 試行の直前に設定される（create 失敗で中途半端に
-    # 残った場合も対象）。削除できなければ finish_container が leftover_ids へ記録し、
-    # 下で exit 4 にする。
+    # live_id は create 試行の直前に設定される（create 失敗で中途半端に残った場合も対象）。
+    # 削除できない・create 未成功で未作成を確定できない場合は finish_container が
+    # leftover_ids へ記録し、下で exit 4 にする。
     finish_container "$live_id" "$live_created" || true
     live_id=""
     live_created=0
@@ -421,23 +412,19 @@ trap 'exit 143' TERM
 #       （state 1 回分の所要時間を含み、Docker 比では own に不利な側へ偏る）。
 measure_once() {
   local id="$1" t0 t1 ts t2 deadline
-  # create 前に state を照会する（計測区間外）。存在を示せば触らずに中止する。明確な
-  # 不存在応答なら pre_absent=1 とし、create 失敗後に現れた同じ ID のコンテナを今回の
-  # ものとして後始末できるようにする。それ以外の照会エラーは不存在の保証にならないため
-  # pre_absent=0 のまま進み、create が成功しなかった場合はその ID に操作を送らない。
-  pre_absent=0
+  # create 前に state を照会する（計測区間外）。存在を示せば create せずに中止する
+  # （既存コンテナとの衝突を分かりやすく報告するため。安全性は finish_container が
+  # create 未成功の ID に破壊的操作を送らないことで担保する）。
   query_state "$id"
   if [ "$state_rc" -eq 0 ]; then
     err "container-id-in-use" "container $id already exists; refusing to touch it"
     return 1
   fi
-  if state_not_found; then
-    pre_absent=1
-  fi
   t0="$(now_us)"
   # create が途中まで進んでから失敗・タイムアウトしても特権リソースが残り得るため、
-  # 作成を試みた時点で後始末対象として保持する。失敗時の delete（kill → delete の再試行）と
-  # 残存時の exit 4 は EXIT trap の cleanup が担う。
+  # 作成を試みた時点で後始末対象として保持する。create 成功後の失敗は delete（kill →
+  # 待機付き delete）で片付け、create 未成功時は未作成を確定できなければ残存として報告する。
+  # いずれも EXIT trap の cleanup が担い、残存時は exit 4 にする。
   live_id="$id"
   live_created=0
   create_rc=0
@@ -460,6 +447,13 @@ measure_once() {
   while :; do
     state_polls=$((state_polls + 1))
     query_state "$id"
+    t2="$(now_us)"
+    # 期限は照会完了時刻で判定する。running / stopped を観測した照会でも、完了が期限を
+    # 過ぎていれば --timeout 内に観測できなかった計測として失敗にする（成功結果に混ぜない）。
+    if [ "$t2" -gt "$deadline" ]; then
+      err "runtime-exec-not-observed" "container $id did not reach running/stopped within ${timeout_secs}s"
+      return 1
+    fi
     case "$state_status" in
       running | stopped) break ;;
       created) ;;
@@ -469,12 +463,11 @@ measure_once() {
         return 1
         ;;
     esac
-    if [ "$state_polls" -ge "$STATE_POLL_MAX" ] || [ "$(now_us)" -ge "$deadline" ]; then
-      err "runtime-exec-not-observed" "container $id did not reach running/stopped within ${timeout_secs}s"
+    if [ "$state_polls" -ge "$STATE_POLL_MAX" ]; then
+      err "runtime-exec-not-observed" "container $id did not reach running/stopped within $STATE_POLL_MAX state queries"
       return 1
     fi
   done
-  t2="$(now_us)"
   create_us=$((t1 - t0))
   start_us=$((ts - t1))
   observe_us=$((t2 - ts))

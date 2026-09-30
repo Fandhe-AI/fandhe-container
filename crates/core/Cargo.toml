@@ -94,3 +94,11 @@ harness = false
 name = "rootless_uid_mapping"
 path = "tests/rootless_uid_mapping.rs"
 harness = false
+
+# 起動したコンテナプロセス内で禁止 syscall が遮断されることの結合試験（CORE-5・TASK-38.4・#179）。
+# CLONE_NEWUSER / 単一スレッド前提の fork のため harness = false。`-- --ignored` 指定時のみ
+# 実機前提部分を実行する（AGENTS.md）。
+[[test]]
+name = "seccomp"
+path = "tests/seccomp.rs"
+harness = false

@@ -101,6 +101,9 @@ mod violation;
 
 pub use capabilities::CapabilityReport;
 pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_default_devices};
+/// 結合試験 `tests/seccomp.rs` 専用の再公開（CORE-5・TASK-38.4・#179。通常の利用者は呼ばない。詳細は定義側）。
+#[doc(hidden)]
+pub use process::spawn_container_seccomp_probe;
 pub use process::{
     ChildExit, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,
@@ -109,6 +112,8 @@ pub use process::{
 };
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 pub use seccomp::SeccompReport;
+#[doc(hidden)]
+pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 /// 結合試験 `tests/seccomp_enforcement.rs` 専用の再公開（通常の利用者は呼ばない。詳細は定義側）。`unsafe` を `sys` の外へ出さないための観測専用の入口。
 #[doc(hidden)]
 pub use seccomp::{SeccompEnforcementObservation, observe_default_seccomp_enforcement};

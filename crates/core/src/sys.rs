@@ -22,6 +22,8 @@
 //! `prctl(PR_SET_SECCOMP)` / `prctl(PR_GET_SECCOMP)` を呼ぶ（呼び出したスレッドへのフィルタ追加。不可逆）。
 //! さらに `crate::landlock::detect_landlock_abi`（CORE-5・TASK-39.1・#181）が `landlock_create_ruleset(2)`
 //! （`syscall(2)` 経由。ABI バージョン問い合わせのみ）を呼ぶ。
+//! さらに `crate::exec` の結合試験用プローブ（CORE-5・TASK-38.4・#179）が、副作用の無い引数に固定した
+//! `ptrace(2)`・`kexec_load(2)`（`syscall(2)` 経由）を呼ぶ。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。std だけでは提供されない
 //! syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
 //! （`Hostname` 等）が済ませた値だけを受け取る。
@@ -172,6 +174,14 @@ mod consts {
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 125;
     pub const SYS_CAPSET: i64 = 126;
+    // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
+    // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
+    // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
+    // （include/linux/kexec.h）は kexec_load の segment 数の上限。
+    pub const SYS_PTRACE: i64 = 101;
+    pub const SYS_KEXEC_LOAD: i64 = 246;
+    pub const PTRACE_CONT: i64 = 7;
+    pub const KEXEC_SEGMENT_MAX: i64 = 16;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     // include/uapi/linux/prctl.h の `PR_CAPBSET_READ`（23）・`PR_CAPBSET_DROP`（24）・
@@ -277,6 +287,14 @@ mod consts {
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 90;
     pub const SYS_CAPSET: i64 = 91;
+    // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
+    // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
+    // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
+    // （include/linux/kexec.h）は kexec_load の segment 数の上限。
+    pub const SYS_PTRACE: i64 = 117;
+    pub const SYS_KEXEC_LOAD: i64 = 104;
+    pub const PTRACE_CONT: i64 = 7;
+    pub const KEXEC_SEGMENT_MAX: i64 = 16;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     // include/uapi/linux/prctl.h の `PR_CAPBSET_READ`（23）・`PR_CAPBSET_DROP`（24）・
@@ -355,6 +373,14 @@ mod consts {
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 0;
     pub const SYS_CAPSET: i64 = 0;
+    // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
+    // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
+    // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
+    // （include/linux/kexec.h）は kexec_load の segment 数の上限。
+    pub const SYS_PTRACE: i64 = 0;
+    pub const SYS_KEXEC_LOAD: i64 = 0;
+    pub const PTRACE_CONT: i64 = 0;
+    pub const KEXEC_SEGMENT_MAX: i64 = 0;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0;
     // include/uapi/linux/prctl.h の `PR_CAPBSET_READ`（23）・`PR_CAPBSET_DROP`（24）・
@@ -1321,6 +1347,58 @@ pub(crate) fn landlock_abi_version() -> Result<u32, SysError> {
     u32::try_from(rc).map_err(|_| SysError::Os(EINVAL))
 }
 
+/// `ptrace(PTRACE_CONT, pid, 0, 0)` を発行して errno を返す結合試験用プローブ（CORE-5・TASK-38.4・#179）。
+///
+/// `PTRACE_CONT` は attach 済みのトレーシー専用の要求で、フィルタが無ければ自プロセスのような
+/// 「自分がトレースしていない」対象に対し `ESRCH` で失敗し副作用が無い。seccomp の遮断が効いていれば
+/// `EPERM` になり、capability 不足との区別に使える。呼び出しは結合試験用の観測経路だけ。
+// 結合試験専用。テストビルドの単体テストは呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn ptrace_cont_probe(pid: u32) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数はすべて整数（request・pid・addr=0・data=0）でポインタを渡さず、PTRACE_CONT では
+    // カーネルは data をシグナル番号としてしか読まない（メモリは読まない）。attach を伴わないため、
+    // フィルタが欠けていても対象プロセスへの副作用は無い（`ESRCH`）。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_PTRACE,
+            consts::PTRACE_CONT,
+            i64::from(pid),
+            0_i64,
+            0_i64,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `kexec_load(0, KEXEC_SEGMENT_MAX + 1, NULL, 0xffff_ffff)` を発行して errno を返す結合試験用プローブ
+/// （CORE-5・TASK-38.4・#179）。
+///
+/// segment 数が上限超過のため、フィルタが無くても権限検査（非 root は `EPERM`）または引数検査
+/// （root は `EINVAL`）で失敗し、ロード済みカーネルの入れ替え・破棄は起きない。識別的な根拠には
+/// 使わない（capability 不足でも `EPERM` になり得る）。
+// 結合試験専用。テストビルドの単体テストは呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn kexec_load_invalid_probe() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: segments は NULL（整数 0 として渡す）。nr_segments が上限を超えるためカーネルは
+    // segments を読む前に拒否する。flags は無効値で、どの経路でもロード・アンロードに至らない。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_KEXEC_LOAD,
+            0_i64,
+            consts::KEXEC_SEGMENT_MAX + 1,
+            0_i64,
+            0xffff_ffff_i64,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// 自プロセスの実効 uid。
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: 引数なし・常に成功する副作用のない syscall。
@@ -1336,6 +1414,26 @@ pub(crate) fn effective_gid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CORE-5・TASK-38.4: プローブ用定数の固定値照合（x86_64。arch ごとの個別定義の誤り検出）。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn core5_probe_consts_are_exact_x86_64() {
+        assert_eq!(consts::SYS_PTRACE, 101);
+        assert_eq!(consts::SYS_KEXEC_LOAD, 246);
+        assert_eq!(consts::PTRACE_CONT, 7);
+        assert_eq!(consts::KEXEC_SEGMENT_MAX, 16);
+    }
+
+    /// CORE-5・TASK-38.4: プローブ用定数の固定値照合（aarch64）。
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn core5_probe_consts_are_exact_aarch64() {
+        assert_eq!(consts::SYS_PTRACE, 117);
+        assert_eq!(consts::SYS_KEXEC_LOAD, 104);
+        assert_eq!(consts::PTRACE_CONT, 7);
+        assert_eq!(consts::KEXEC_SEGMENT_MAX, 16);
+    }
 
     /// CORE-5・TASK-39.1: Landlock 関連定数の固定値照合（arch ごとに個別定義した値の誤り検出）。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

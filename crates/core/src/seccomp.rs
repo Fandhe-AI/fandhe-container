@@ -11,7 +11,7 @@
 //! テーブルから BPF プログラム（`seccomp_data.arch` 検査・x32 拒否を含む。TASK-38.1.2・#838）を構築する。
 //! 適用関数は `crate::exec` の `apply_seccomp_filter`（TASK-38.2・#177）に実装済みだが、
 //! 起動フロー（`exec/stages.rs`）の組み込み段が exec 直前に適用する（TASK-38.3・#178）。
-//! 禁止 syscall の遮断を実環境で確かめる結合テストは TASK-38.4・#179。
+//! 禁止 syscall の遮断を起動したコンテナの中で確かめる結合テストは `tests/seccomp.rs`（TASK-38.4・#179）。
 //!
 //! # 契約
 //!
@@ -445,7 +445,7 @@ impl BpfInstruction {
 /// 検証済みの seccomp BPF プログラム（1 以上 `BPF_MAXINSNS` 以下の命令列）。
 ///
 /// [`build_deny_filter`] が唯一の生成経路。適用関数は `exec::apply_seccomp_filter`（TASK-38.2・#177）で、起動フローの
-/// 組み込み段（TASK-38.3・#178）が exec 直前に適用する。遮断の結合テストは TASK-38.4・#179。
+/// 組み込み段（TASK-38.3・#178）が exec 直前に適用する。遮断の結合テストは `tests/seccomp.rs`（TASK-38.4・#179）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeccompProgram(Vec<BpfInstruction>);
 

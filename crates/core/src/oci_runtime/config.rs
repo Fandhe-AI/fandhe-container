@@ -13,7 +13,9 @@
 //! - 2 層構成: 非公開の raw 層（`#[derive(Deserialize)]`）で JSON を受け、検証を通過した値だけを
 //!   公開型に詰める。公開型のフィールドは非公開で、生成経路はパース関数のみ。
 //! - OCI Runtime Spec の拡張性規則に従い、未知のプロパティはエラーにせず無視する。
-//!   ただし重複キー・必須欠落・型不一致・未知の namespace type はエラーにする。
+//!   ただし既知フィールドの重複キー・必須欠落・型不一致・未知の namespace type はエラーにする。
+//!   未知プロパティ（読み飛ばす対象）内の重複キーは検出せず受理する（無視する値であり、
+//!   解釈結果に影響しないため。既知フィールドの重複は serde の重複検出で拒否される）。
 //!
 //! # 未解釈のセクション（REPAIR-3）
 //!
@@ -791,8 +793,9 @@ fn convert_mappings<L: Limit>(
         .unwrap_or_default()
         .into_iter()
         .map(|m| {
-            // 範囲終端（先頭 ID + size）が u32 に収まることを container 側・host 側の双方で検証する。
-            let fits = |start: u32| start.checked_add(m.size).is_some();
+            // 範囲の排他的終端（先頭 ID + size）が 2^32 以下であることを container 側・host 側の双方で
+            // 検証する。u64 に広げて比較し、u32::MAX 単独の範囲（終端がちょうど 2^32）も受理する。
+            let fits = |start: u32| u64::from(start) + u64::from(m.size) <= 1u64 << 32;
             if m.size == 0 || !fits(m.container_id) || !fits(m.host_id) {
                 return Err(OciConfigError::invalid(field));
             }
@@ -1292,6 +1295,20 @@ mod tests {
             *parse_config_bytes(text).expect_err("dup").kind(),
             OciConfigErrorKind::Data
         );
+    }
+
+    #[test]
+    fn oci4_duplicate_key_in_unknown_property_is_ignored() {
+        let text = br#"{"ociVersion":"1.0.0","root":{"path":"r"},"x":1,"x":2}"#;
+        assert!(parse_config_bytes(text).is_ok());
+    }
+
+    #[test]
+    fn oci4_id_mapping_at_u32_max_is_accepted() {
+        let text = br#"{"ociVersion":"1.0.0","root":{"path":"r"},"linux":{"uidMappings":[{"containerID":4294967295,"hostID":4294967295,"size":1}]}}"#;
+        assert!(parse_config_bytes(text).is_ok());
+        let bad = br#"{"ociVersion":"1.0.0","root":{"path":"r"},"linux":{"uidMappings":[{"containerID":4294967295,"hostID":0,"size":2}]}}"#;
+        assert!(parse_config_bytes(bad).is_err());
     }
 
     #[test]

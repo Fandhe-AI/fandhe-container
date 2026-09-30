@@ -74,12 +74,12 @@ mod linux {
         Duration::from_secs(secs)
     }
 
-    /// シナリオ全体の期限。scenario 内の各段階の上限（helper 写像の
-    /// `DEFAULT_HELPER_TIMEOUT`・子プロセス待ちの `timeout()`）の合計に、
-    /// 起動・後始末の余裕として `timeout()` を加える。
+    /// シナリオ全体の期限。scenario 内の各段階の上限（UID・GID 各 1 回の
+    /// helper 呼び出しに適用される `DEFAULT_HELPER_TIMEOUT` の 2 回分・子プロセス待ちの
+    /// `timeout()`）の合計に、mapper 回収・起動・後始末の余裕として `timeout()` を加える（REPAIR-5）。
     /// `FANDHE_CONTAINER_TEST_TIMEOUT_SECS` が小さくても正常系が打ち切られない。
     fn scenario_deadline() -> Duration {
-        DEFAULT_HELPER_TIMEOUT + timeout() * 2
+        DEFAULT_HELPER_TIMEOUT * 2 + timeout() * 2
     }
 
     fn own_ids() -> (u32, u32) {

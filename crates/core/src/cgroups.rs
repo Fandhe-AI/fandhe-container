@@ -217,12 +217,19 @@ fn validate_component(step: CgroupStep, comp: &str) -> Result<(), CgroupError> {
 
 /// `/proc/self/cgroup` の内容から v2 unified 行（`0::<path>`）のパスを取り出す。
 ///
-/// hybrid（v1 行との混在）でも `0::` 行を採用する。`0::` 行が無い・複数ある・`(deleted)` 付き・
-/// 相対 / `..` を含む・過大長はカーネル応答の異常として fail-closed（`FailedPrecondition`）にする。
+/// v1 行（`<n>:<controllers>:<path>`）が 1 行でも混在する hybrid 構成は非対応（CORE-4・SEC-6）として
+/// 拒否する。`0::` 行が無い・複数ある・`(deleted)` 付き・相対 / `..` を含む・過大長も、カーネル応答の
+/// 異常として fail-closed（`FailedPrecondition`）にする。
 fn parse_self_cgroup_v2(text: &str) -> Result<CgroupPath, CgroupError> {
     let step = CgroupStep::ReadSelfCgroup;
     let mut found: Option<&str> = None;
     for line in text.lines() {
+        if !line.is_empty() && !line.starts_with("0::") {
+            return Err(CgroupError::precondition(
+                step,
+                "cgroup v1 or hybrid hierarchy detected in /proc/self/cgroup (only pure cgroup v2 is supported)",
+            ));
+        }
         if let Some(path) = line.strip_prefix("0::") {
             if found.is_some() {
                 return Err(CgroupError::precondition(
@@ -480,6 +487,18 @@ fn read_self_cgroup() -> Result<CgroupPath, CgroupError> {
     parse_self_cgroup_v2(&text)
 }
 
+/// fd の (dev, ino)（O_PATH fd でも `fstat` できる）。同一ディレクトリ判定に使う。
+fn dir_identity(fd: BorrowedFd<'_>, what: &str) -> Result<(u64, u64), CgroupError> {
+    let step = CgroupStep::Cleanup;
+    let dup = fd
+        .try_clone_to_owned()
+        .map_err(|e| io_error(step, what, &e))?;
+    File::from(dup)
+        .metadata()
+        .map(|m| (m.dev(), m.ino()))
+        .map_err(|e| io_error(step, what, &e))
+}
+
 fn verify_cgroup2(fd: BorrowedFd<'_>, what: &str) -> Result<(), CgroupError> {
     let step = CgroupStep::VerifyCgroup2;
     let t = sys::fs_type(fd).map_err(|e| sys_error(step, what, e))?;
@@ -526,6 +545,8 @@ pub struct DelegatedCgroup {
 pub struct ContainerCgroup {
     name: CgroupName,
     fd: OwnedFd,
+    /// 作成時の親 cgroup の (dev, ino)。`remove_child` で別スコープの親への流用を拒否する。
+    parent_id: (u64, u64),
 }
 
 impl ContainerCgroup {
@@ -632,7 +653,7 @@ impl DelegatedCgroup {
     /// 検証（すべて満たさなければ `FailedPrecondition`）: 親の `cgroup.procs` に自プロセス以外が
     /// いない（他者の PID は動かさない）・退避後に親の `cgroup.procs` が空・`/proc/self/cgroup` が
     /// 退避リーフを指す・コンテナ用子 cgroup の `cgroup.procs` が空。既存の同名子 cgroup は採用せず
-    /// `AlreadyExists`。途中失敗時は本処理が作った子 cgroup を best-effort で削除する。
+    /// `AlreadyExists`。途中失敗時は、自プロセスを移していれば元の親へ戻し（失敗時はエラー文に併記）、本処理が作った子 cgroup を best-effort で削除する。
     pub fn prepare(&self, name: &CgroupName) -> Result<(ContainerCgroup, Evacuated), CgroupError> {
         let me = std::process::id();
         let parent_procs = parse_procs(
@@ -655,9 +676,17 @@ impl DelegatedCgroup {
         sys::mkdir_at(self.fd.as_fd(), &child_name, CGROUP_DIR_MODE)
             .map_err(|e| sys_error(CgroupStep::CreateChild, name.as_str(), e))?;
 
-        match self.evacuate_and_verify(name) {
+        let mut moved = false;
+        match self.evacuate_and_verify(name, &mut moved) {
             Ok(result) => Ok(result),
             Err(mut err) => {
+                // 自プロセスを退避リーフへ移した後の失敗は、元の親へ戻してから子を削除する。
+                if moved && let Err(e) = self.restore_self() {
+                    err.message.push_str(&format!(
+                        "; restoring process membership failed ({})",
+                        e.message
+                    ));
+                }
                 if let Err(e) = sys::remove_dir_at(self.fd.as_fd(), &child_name) {
                     err.message.push_str(&format!(
                         "; cleanup of {} failed ({})",
@@ -670,9 +699,21 @@ impl DelegatedCgroup {
         }
     }
 
+    /// 自プロセスを委譲された親 cgroup へ戻す（退避後に失敗した場合の巻き戻し）。
+    fn restore_self(&self) -> Result<(), CgroupError> {
+        let step = CgroupStep::Cleanup;
+        let procs = cstring(step, "cgroup.procs")?;
+        let wfd = sys::open_write_at(self.fd.as_fd(), &procs)
+            .map_err(|e| sys_error(step, "open parent cgroup.procs", e))?;
+        File::from(wfd)
+            .write_all(std::process::id().to_string().as_bytes())
+            .map_err(|e| io_error(step, "write parent cgroup.procs", &e))
+    }
+
     fn evacuate_and_verify(
         &self,
         name: &CgroupName,
+        moved: &mut bool,
     ) -> Result<(ContainerCgroup, Evacuated), CgroupError> {
         let child_fd = open_cgroup_dir(CgroupStep::CreateChild, self.fd.as_fd(), name.as_str())?;
 
@@ -689,6 +730,8 @@ impl DelegatedCgroup {
         let procs = cstring(CgroupStep::Evacuate, "cgroup.procs")?;
         let wfd = sys::open_write_at(leaf_fd.as_fd(), &procs)
             .map_err(|e| sys_error(CgroupStep::Evacuate, "open leaf cgroup.procs", e))?;
+        // 書き込みが部分的に効いた場合に備え、書き込み前に移動済みとして扱う（復元は冪等）。
+        *moved = true;
         File::from(wfd)
             .write_all(std::process::id().to_string().as_bytes())
             .map_err(|e| io_error(CgroupStep::Evacuate, "write leaf cgroup.procs", &e))?;
@@ -737,6 +780,7 @@ impl DelegatedCgroup {
             ContainerCgroup {
                 name: name.clone(),
                 fd: child_fd,
+                parent_id: dir_identity(self.fd.as_fd(), "stat parent cgroup")?,
             },
             Evacuated {
                 parent: self.path.clone(),
@@ -776,7 +820,27 @@ impl DelegatedCgroup {
     }
 
     /// コンテナ用子 cgroup を削除する（空であること。残りがあれば `FailedPrecondition`）。
+    ///
+    /// 削除前に、`child` がこの親の配下で作られたもので、親ディレクトリ上の同名エントリが `child` の
+    /// fd と同一の cgroup であることを検証する（別スコープの同名子・差し替えられた子の誤削除を防ぐ）。
     pub fn remove_child(&self, child: ContainerCgroup) -> Result<(), CgroupError> {
+        let step = CgroupStep::Cleanup;
+        if child.parent_id != dir_identity(self.fd.as_fd(), "stat parent cgroup")? {
+            return Err(CgroupError::precondition(
+                step,
+                "container cgroup does not belong to this delegated cgroup",
+            ));
+        }
+        let entry = open_cgroup_dir(step, self.fd.as_fd(), child.name.as_str())?;
+        if dir_identity(entry.as_fd(), "stat child entry")?
+            != dir_identity(child.fd.as_fd(), "stat child cgroup")?
+        {
+            return Err(CgroupError::precondition(
+                step,
+                "container cgroup entry no longer matches the held handle",
+            ));
+        }
+        drop(entry);
         let c = cstring(CgroupStep::Cleanup, child.name.as_str())?;
         sys::remove_dir_at(self.fd.as_fd(), &c)
             .map_err(|e| sys_error(CgroupStep::Cleanup, child.name.as_str(), e))
@@ -831,11 +895,18 @@ mod tests {
         assert_eq!(path("0::/\n").unwrap().display(), "/");
     }
 
-    /// CORE-3・TASK-32.1: hybrid（v1 行との混在）でも v2 行を採用する。
+    /// CORE-4・SEC-6・TASK-32.1: hybrid（v1 行との混在）は順序を問わず fail-closed で拒否する。
     #[test]
-    fn core3_task32_1_parse_self_cgroup_v2_hybrid_uses_v2_line() {
-        let p = path("12:memory:/old\n1:name=systemd:/old2\n0::/new/leaf\n").unwrap();
-        assert_eq!(p.components, vec!["new", "leaf"]);
+    fn core4_sec6_task32_1_parse_self_cgroup_v2_rejects_hybrid() {
+        for text in [
+            "12:memory:/old\n1:name=systemd:/old2\n0::/new/leaf\n",
+            "0::/new/leaf\n1:name=systemd:/old2\n",
+        ] {
+            let e = path(text).unwrap_err();
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.step, CgroupStep::ReadSelfCgroup);
+            assert!(e.message.contains("hybrid"), "{}", e.message);
+        }
     }
 
     /// CORE-3・TASK-32.1: 異常なカーネル応答は fail-closed。

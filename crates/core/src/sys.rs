@@ -24,8 +24,10 @@
 //! （`syscall(2)` 経由。ABI バージョン問い合わせのみ）を呼ぶ。
 //! さらに `crate::exec` の結合試験用プローブ（CORE-5・TASK-38.4・#179）が、副作用の無い引数に固定した
 //! `ptrace(2)`・`kexec_load(2)`（`syscall(2)` 経由）を呼ぶ。
-//! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。std だけでは提供されない
-//! syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
+//! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。
+//! 委譲 cgroup の検出と子 cgroup 作成（`crate::cgroups`。CORE-3・TASK-32.1・#158）は、
+//! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
+//! std だけでは提供されない syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
 //! （`Hostname` 等）が済ませた値だけを受け取る。
 //!
 //! # 契約（事前承認の条件を満たす設計）
@@ -65,8 +67,8 @@ pub(crate) enum SysError {
 
 /// errno の値（アーキテクチャごとに `consts` で個別定義。alpha / mips / sparc 等は値が違う）。
 pub(crate) use consts::{
-    E2BIG, EACCES, EBADF, ECHILD, EEXIST, EINTR, EINVAL, ELOOP, ENOENT, ENOEXEC, ENOSYS, ENOTDIR,
-    EOPNOTSUPP, EPERM, ESRCH,
+    E2BIG, EACCES, EBADF, EBUSY, ECHILD, EEXIST, EINTR, EINVAL, ELOOP, ENOENT, ENOEXEC, ENOSYS,
+    ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EPERM, ESRCH,
 };
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）
@@ -123,6 +125,16 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `O_NONBLOCK`（x86_64 は上書きしない）。
     pub const O_NONBLOCK: i32 = 0o4_000;
     pub const O_RDWR: i32 = 2;
+    // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
+    pub const O_RDONLY: i32 = 0;
+    pub const O_WRONLY: i32 = 1;
+    // include/uapi/linux/fcntl.h の `AT_REMOVEDIR`（全アーキテクチャ共通）。
+    pub const AT_REMOVEDIR: i32 = 0x200;
+    // include/uapi/asm-generic/errno-base.h・errno.h の EBUSY・ENOTEMPTY（cgroup 操作の分類用）。
+    pub const EBUSY: i32 = 16;
+    pub const ENOTEMPTY: i32 = 39;
+    // include/uapi/linux/magic.h の `CGROUP2_SUPER_MAGIC`（"cgrp"）。
+    pub const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
     // arch/x86/entry/syscalls/syscall_64.tbl の `execveat`。
     pub const SYS_EXECVEAT: i64 = 322;
     // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（全アーキテクチャ共通）。
@@ -235,6 +247,16 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `O_NONBLOCK`（arm64 も上書きしない）。
     pub const O_NONBLOCK: i32 = 0o4_000;
     pub const O_RDWR: i32 = 2;
+    // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
+    pub const O_RDONLY: i32 = 0;
+    pub const O_WRONLY: i32 = 1;
+    // include/uapi/linux/fcntl.h の `AT_REMOVEDIR`（全アーキテクチャ共通）。
+    pub const AT_REMOVEDIR: i32 = 0x200;
+    // include/uapi/asm-generic/errno-base.h・errno.h の EBUSY・ENOTEMPTY（cgroup 操作の分類用）。
+    pub const EBUSY: i32 = 16;
+    pub const ENOTEMPTY: i32 = 39;
+    // include/uapi/linux/magic.h の `CGROUP2_SUPER_MAGIC`（"cgrp"）。
+    pub const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
     // include/uapi/asm-generic/unistd.h の `__NR_execveat`（arm64 は asm-generic の表。
     // x86_64 の 322 を流用しない）。
     pub const SYS_EXECVEAT: i64 = 281;
@@ -336,6 +358,12 @@ mod consts {
     pub const O_PATH: i32 = 0;
     pub const O_NONBLOCK: i32 = 0;
     pub const O_RDWR: i32 = 0;
+    pub const O_RDONLY: i32 = 0;
+    pub const O_WRONLY: i32 = 0;
+    pub const AT_REMOVEDIR: i32 = 0;
+    pub const EBUSY: i32 = -16;
+    pub const ENOTEMPTY: i32 = -17;
+    pub const CGROUP2_SUPER_MAGIC: i64 = 0;
     pub const SYS_EXECVEAT: i64 = 0;
     pub const AT_EMPTY_PATH: i64 = 0;
     pub const F_SETFD: i32 = 0;
@@ -474,6 +502,39 @@ unsafe extern "C" {
     // 宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
     // 可変長部は `unsigned long`（LP64 で u64）なので呼び出し側は u64 で渡す。
     fn prctl(option: i32, ...) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int mkdirat(int dirfd, const char *path, mode_t mode)`
+    // （LP64 で `mode_t` は u32）。
+    fn mkdirat(dirfd: i32, path: *const core::ffi::c_char, mode: u32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int unlinkat(int dirfd, const char *path, int flags)`。
+    fn unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int fstatfs(int fd, struct statfs *buf)`。構造体は下の
+    // [`StatFs`]（arch 別に個別定義）で、カーネルが書く 120 バイトを確保する。
+    fn fstatfs(fd: i32, buf: *mut StatFs) -> i32;
+}
+
+/// `fstatfs(2)` の出力バッファ（x86_64）。`struct statfs` は先頭が `f_type`（`long`）、全体 120 バイト
+/// （arch/x86/include/uapi/asm/statfs.h → asm-generic/statfs.h の 64 ビット版）。先頭以外は使わない。
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct StatFs {
+    f_type: i64,
+    _rest: [i64; 14],
+}
+
+/// `fstatfs(2)` の出力バッファ（aarch64）。レイアウトは asm-generic/statfs.h の 64 ビット版で、
+/// x86_64 と同値だが他 arch の定義を流用せず個別に持つ（先頭 `f_type`、全体 120 バイト）。
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+struct StatFs {
+    f_type: i64,
+    _rest: [i64; 14],
+}
+
+/// 対応外アーキテクチャ: レイアウト未確認のためラッパーは `Unsupported` を返し、カーネルには渡さない。
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[repr(C)]
+struct StatFs {
+    f_type: i64,
 }
 
 /// 直前の失敗した syscall の errno を `SysError` にする（失敗直後に呼ぶこと）。
@@ -931,6 +992,85 @@ pub(crate) fn open_path_nofollow(parent: BorrowedFd<'_>, name: &CStr) -> Result<
     // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
+
+/// `parent` 配下に 1 要素のディレクトリ `name` を `mkdirat(2)` で作る（cgroup v2 ではこれが子 cgroup
+/// の作成になる。`crate::cgroups`・CORE-3・TASK-32.1）。既存なら `EEXIST`、権限不足は `EACCES`/`EPERM`。
+/// `name` は呼び出し側が 1 要素（`/` を含まない）に検証済みの前提。
+pub(crate) fn mkdir_at(parent: BorrowedFd<'_>, name: &CStr, mode: u32) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `name` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存する。`parent` は生存中の
+    // `BorrowedFd`。副作用は `parent` 配下へのディレクトリ作成のみで、ポインタは保持されない。
+    let rc = unsafe { mkdirat(parent.as_raw_fd(), name.as_ptr(), mode & 0o7777) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `parent` 配下の `name` を `unlinkat(2)` の `AT_REMOVEDIR` で削除する（空の cgroup のみ消せる。
+/// 子・プロセスが残っていれば `EBUSY`）。最終要素の symlink は辿らない（`AT_REMOVEDIR` は
+/// ディレクトリ以外を `ENOTDIR` で拒否する）。
+pub(crate) fn remove_dir_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `name` は NUL 終端の借用で呼び出しの間生存する。`parent` は生存中の `BorrowedFd`。
+    // 副作用は `parent` 配下の空ディレクトリ 1 件の削除のみ。
+    let rc = unsafe { unlinkat(parent.as_raw_fd(), name.as_ptr(), consts::AT_REMOVEDIR) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// [`open_read_at`] / [`open_write_at`] 共通の `openat(2)` 呼び出し。`O_NOFOLLOW|O_CLOEXEC` を常に付け、
+/// `O_CREAT` を含まない（既存ファイルだけを開く。cgroup のインターフェースファイルは作らせない）。
+fn open_file_at(parent: BorrowedFd<'_>, name: &CStr, access: i32) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = access | consts::O_NOFOLLOW | consts::O_CLOEXEC;
+    // SAFETY: `name` は借用した NUL 終端文字列で呼び出しの間生存する。`parent` は生存中の
+    // `BorrowedFd`。flags に O_CREAT / O_TMPFILE を含まないため可変長引数（mode）は渡さない。
+    // 成功時の戻り値は新規 fd で、直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let fd = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `parent` 配下の既存ファイル `name` を読み取り専用（`O_NOFOLLOW`）で開く。
+pub(crate) fn open_read_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, SysError> {
+    open_file_at(parent, name, consts::O_RDONLY)
+}
+
+/// `parent` 配下の既存ファイル `name` を書き込み専用（`O_NOFOLLOW`）で開く。
+/// `cgroup.procs`・`cgroup.subtree_control` への書き込みに使う（CORE-3）。
+pub(crate) fn open_write_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, SysError> {
+    open_file_at(parent, name, consts::O_WRONLY)
+}
+
+/// `fd` が属するファイルシステムの種別（`statfs.f_type`）を `fstatfs(2)` で返す。cgroup2 の
+/// 検証（`consts::CGROUP2_SUPER_MAGIC` との比較）に使う。O_PATH fd でも使える。
+pub(crate) fn fs_type(fd: BorrowedFd<'_>) -> Result<i64, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut buf = StatFs {
+        f_type: 0,
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        _rest: [0; 14],
+    };
+    // SAFETY: `buf` は `struct statfs`（120 バイト）と同じレイアウトの書き込み可能な領域で、
+    // 呼び出しの間生存する（対応 arch のみ。対応外は上で `Unsupported`）。`fd` は生存中の
+    // `BorrowedFd`。カーネルは `buf` の範囲内にのみ書く。
+    let rc = unsafe { fstatfs(fd.as_raw_fd(), &raw mut buf) };
+    if rc == -1 {
+        return Err(last_error());
+    }
+    Ok(buf.f_type)
+}
+
+/// CORE-3: cgroup2 の `statfs.f_type` 定数（`CGROUP2_SUPER_MAGIC`）。
+pub(crate) const CGROUP2_MAGIC: i64 = consts::CGROUP2_SUPER_MAGIC;
 
 /// glibc の `gnu_dev_makedev` と同じビット配置で `dev_t` を作る純関数（`unsafe` なし）。
 pub(crate) const fn makedev(major: u32, minor: u32) -> u64 {
@@ -1458,6 +1598,55 @@ mod tests {
         }
     }
     use std::os::fd::AsFd as _;
+
+    /// CORE-3・TASK-32.1: cgroup 操作用の定数・`statfs` バッファの具体値。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core3_task32_1_cgroup_consts_are_exact() {
+        assert_eq!((consts::O_RDONLY, consts::O_WRONLY), (0, 1));
+        assert_eq!(consts::AT_REMOVEDIR, 0x200);
+        assert_eq!((EBUSY, ENOTEMPTY), (16, 39));
+        assert_eq!(consts::CGROUP2_SUPER_MAGIC, 0x6367_7270);
+        assert_eq!(std::mem::size_of::<StatFs>(), 120);
+    }
+
+    /// CORE-3・TASK-32.1: `/proc` が procfs と判定され、cgroup2 とは区別されること。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core3_task32_1_fs_type_identifies_procfs_not_cgroup2() {
+        let proc_dir = std::fs::File::open("/proc").unwrap();
+        // procfs の PROC_SUPER_MAGIC（include/uapi/linux/magic.h）。
+        assert_eq!(fs_type(proc_dir.as_fd()), Ok(0x9fa0));
+        assert_ne!(fs_type(proc_dir.as_fd()), Ok(CGROUP2_MAGIC));
+    }
+
+    /// CORE-3・TASK-32.1: `mkdir_at` / `remove_dir_at` / `open_*_at` の往復（一時ディレクトリ）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core3_task32_1_mkdir_open_remove_roundtrip() {
+        use std::io::Write as _;
+        let base = std::env::temp_dir().join(format!("fc-sys-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = std::fs::File::open(&base).unwrap();
+        let name = CString::new("child").unwrap();
+        assert_eq!(mkdir_at(dir.as_fd(), &name, 0o755), Ok(()));
+        assert_eq!(
+            mkdir_at(dir.as_fd(), &name, 0o755),
+            Err(SysError::Os(EEXIST))
+        );
+        std::fs::write(base.join("f"), b"x").unwrap();
+        let f = CString::new("f").unwrap();
+        let mut w = std::fs::File::from(open_write_at(dir.as_fd(), &f).unwrap());
+        w.write_all(b"y").unwrap();
+        let missing = CString::new("nope").unwrap();
+        assert_eq!(
+            open_read_at(dir.as_fd(), &missing).err(),
+            Some(SysError::Os(ENOENT))
+        );
+        assert_eq!(remove_dir_at(dir.as_fd(), &name), Ok(()));
+        assert_eq!(remove_dir_at(dir.as_fd(), &name), Err(SysError::Os(ENOENT)));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     /// SEC-1・TASK-37.1: capability 関連の定数の具体値。
     #[cfg(target_arch = "x86_64")]

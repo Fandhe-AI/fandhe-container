@@ -14,6 +14,9 @@
 //!   公開型に詰める。公開型のフィールドは非公開で、生成経路はパース関数のみ。
 //! - OCI Runtime Spec の拡張性規則に従い、未知のプロパティはエラーにせず無視する。
 //!   ただし既知フィールドの重複キー・必須欠落・型不一致・未知の namespace type はエラーにする。
+//!   既知フィールドの省略はキーが無い場合に限り、キーがあって値が `null` のものは省略とみなさず
+//!   型不一致（`Data`）として拒否する（OCI の JSON Schema に `null` を許すフィールドが無いため。
+//!   根拠は `present` を参照）。
 //!   未知プロパティ（読み飛ばす対象）内の重複キーは検出せず受理する（無視する値であり、
 //!   解釈結果に影響しないため。既知フィールドの重複は serde の重複検出で拒否される）。
 //!
@@ -22,7 +25,8 @@
 //! 次のセクションはパース時に無視しているだけで、適用済みではない（fail-open にならない扱いは
 //! TASK-29.2 の計画で決める）: `process.capabilities`・`process.rlimits`・`process.noNewPrivileges`
 //! （SEC-1・TASK-27.4.3 系）、`linux.seccomp`（CORE-5・TASK-38）、`linux.resources`
-//! （CORE-3/4・TASK-32〜）、`linux.maskedPaths` / `readonlyPaths`、`hooks`、`annotations`。
+//! （CORE-3/4・TASK-32〜）、`linux.maskedPaths` / `readonlyPaths`、`mounts[].uidMappings` /
+//! `gidMappings`（idmapped mount）、`hooks`、`annotations`。
 //!
 //! # 実行ファイルの検証
 //!
@@ -375,8 +379,31 @@ fn strings<L: Limit, I: Limit>(list: Option<Bounded<BoundedStr<I>, L>>) -> Vec<S
         .unwrap_or_default()
 }
 
+/// 省略可能な既知フィールドを「省略」と「`null`」で区別して読む（OCI-4）。
+///
+/// `#[serde(default, deserialize_with = "present")]` と組み合わせ、キーが無い場合だけ `None` にする。
+/// キーがある場合は `deserialize_option` を経由せず中身の型で直接読むため、`null` は中身の型
+/// （object / array / string）に対する型不一致として serde_json が拒否し、`Data` エラーになる。
+///
+/// 根拠: OCI Runtime Spec の JSON Schema（`schema/config-schema.json`・`defs.json`・
+/// `config-linux.json`・`defs-linux.json`）は、本パーサが解釈するフィールドのいずれにも `null` 型を
+/// 許しておらず（object / array / string / boolean / uint32 のみ）、`null` が「省略」や「既定値」の
+/// 意味を持つフィールドは無い。`null` を省略扱いすると、例えば `linux: null` の誤りが黙って
+/// 「namespace・ID マッピング無し」に変わるため、fail-closed に拒否する。
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 // ---------------------------------------------------------------------------
 // raw 層（非公開。JSON の形をそのまま受ける）
+//
+// 省略可能な既知フィールドは必ず `#[serde(default, deserialize_with = "present")]` を付ける
+// （`null` を省略として受理しないため）。`#[serde(default)] bool` は serde_json が `null` を
+// 型不一致として拒否するため `present` を要しない。
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -384,13 +411,13 @@ fn strings<L: Limit, I: Limit>(list: Option<Bounded<BoundedStr<I>, L>>) -> Vec<S
 struct RawConfig {
     oci_version: BoundedStr<OciVersionLimit>,
     root: RawRoot,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     process: Option<RawProcess>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     hostname: Option<BoundedStr<HostnameLimit>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     mounts: Option<Bounded<RawMount, MountsLimit>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     linux: Option<RawLinux>,
 }
 
@@ -407,7 +434,7 @@ struct RawProcess {
     terminal: bool,
     user: RawUser,
     args: Bounded<BoundedStr<ArgLimit>, ArgsLimit>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     env: Option<Bounded<BoundedStr<EnvItemLimit>, EnvLimit>>,
     cwd: BoundedStr<CwdLimit>,
 }
@@ -417,29 +444,29 @@ struct RawProcess {
 struct RawUser {
     uid: u32,
     gid: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     additional_gids: Option<Bounded<u32, GidsLimit>>,
 }
 
 #[derive(Deserialize)]
 struct RawMount {
     destination: BoundedStr<MountDestLimit>,
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "type", deserialize_with = "present")]
     fs_type: Option<BoundedStr<MountTypeLimit>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     source: Option<BoundedStr<MountSourceLimit>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     options: Option<Bounded<BoundedStr<MountOptionLimit>, MountOptionsLimit>>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawLinux {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     namespaces: Option<Bounded<RawNamespace, NamespacesLimit>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     uid_mappings: Option<Bounded<RawIdMapping, UidMappingsLimit>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     gid_mappings: Option<Bounded<RawIdMapping, GidMappingsLimit>>,
 }
 
@@ -447,7 +474,7 @@ struct RawLinux {
 struct RawNamespace {
     #[serde(rename = "type")]
     kind: NamespaceKind,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     path: Option<BoundedStr<NamespacePathLimit>>,
 }
 

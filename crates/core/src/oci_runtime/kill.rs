@@ -14,8 +14,9 @@
 //! 3. 状態の確認。`Running`・pid あり（と将来の `Created`・pid あり）だけ送信へ進む。`Running`・pid なし
 //!    （中断された start の予約）と、それ以外（`Created`・pid なし / `Creating` / `Stopped`）は
 //!    `FailedPrecondition`
-//! 4. [`ProcessSignaler::signal`] を `call_bounded` で上限つきに呼ぶ（REPAIR-5）。`Timeout` 後に遅れて
-//!    起動した worker は、呼ぶ直前の印・期限確認で送信を抑止する
+//! 4. [`ProcessSignaler::signal`] を `call_bounded` で上限つきに呼ぶ（REPAIR-5）。kill 全体の絶対期限を
+//!    signaler 経由で `ContainerChild` まで渡し、実際の送信直前（回収状態のロック取得後）に期限を確認する。
+//!    `Timeout` 後に遅れて起動・復帰した worker は、呼ぶ直前の印・期限確認と送信直前の期限確認で送信を抑止する
 //!
 //! # PID 再利用対策（SEC-1・CORE-1）
 //!
@@ -58,7 +59,9 @@ const KILL_OP_NAME: &str = "kill";
 /// - 送る先は、自分が保持する `id` の起動ハンドル（start が返した [`super::LaunchedProcess`]）だけにする。
 ///   `pid`（状態記録の値）へ生の `kill(2)` を送ってはならない
 /// - ハンドルが無い、またはハンドルの pid と `pid` が食い違う場合は、送らずに `FailedPrecondition` を返す
-/// - 待ちは `timeout` まで（REPAIR-5）。呼び出し側も別スレッドで上限を強制する
+/// - `deadline` は [`kill`] が `Timeout` を返す時刻以前の絶対期限。実装は実際の送信の直前に確認し、
+///   期限切れなら送らずに `Timeout` を返す（期限後にシグナルが届かない。REPAIR-5）。呼び出し側も別スレッドで
+///   上限を強制する
 /// - 別スレッドから呼ばれ得るため `Send + Sync`
 ///
 /// 本番実装は supervisor（TASK-157）が提供する（本 crate には無い。REPAIR-3）。
@@ -69,7 +72,7 @@ pub trait ProcessSignaler: Send + Sync {
         id: &ContainerId,
         pid: NonZeroU32,
         signal: Signal,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<(), TraitError>;
 }
 
@@ -153,19 +156,22 @@ fn kill_inner(
     let s = Arc::clone(signaler);
     let id = req.id().clone();
     let signal = req.signal();
+    // 送信先まで引き継ぐ共通の絶対期限。`call_bounded` が `Timeout` を返す時刻（開始後に算出する
+    // `limit` ＋ 猶予）より前に切れるよう、呼び出しの前に算出する。
+    let deadline = Instant::now()
+        .checked_add(limit.saturating_add(LAUNCHER_REPLY_GRACE))
+        .ok_or_else(|| TraitError::new(ErrorCode::InvalidArgument, "kill timeout is too large"))?;
     // 呼び出し側が `Timeout` を返した後に、遅れて起動・復帰した worker が送信しないための印。
-    // worker は signaler を呼ぶ直前に印と期限を確認し、期限切れなら送らない。
     let expired = Arc::new(AtomicBool::new(false));
     let worker_expired = Arc::clone(&expired);
-    let deadline = Instant::now().checked_add(limit.saturating_add(LAUNCHER_REPLY_GRACE));
     let call = move || {
-        if worker_expired.load(Ordering::SeqCst) || deadline.is_none_or(|d| Instant::now() >= d) {
+        if worker_expired.load(Ordering::SeqCst) || Instant::now() >= deadline {
             return Err(TraitError::new(
                 ErrorCode::Timeout,
                 "the signal delivery did not complete within the timeout",
             ));
         }
-        s.signal(&id, pid, signal, limit)
+        s.signal(&id, pid, signal, deadline)
     };
     let outcome = call_bounded(limit, call, drop);
     if outcome.is_err() {
@@ -270,7 +276,7 @@ mod tests {
             id: &ContainerId,
             pid: NonZeroU32,
             signal: Signal,
-            _timeout: Duration,
+            _deadline: Instant,
         ) -> Result<(), TraitError> {
             self.count.fetch_add(1, Ordering::SeqCst);
             self.calls.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -451,7 +457,7 @@ mod tests {
             id: &ContainerId,
             pid: NonZeroU32,
             signal: Signal,
-            timeout: Duration,
+            deadline: Instant,
         ) -> Result<(), TraitError> {
             use crate::oci_runtime::LaunchedProcess;
             let map = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -459,7 +465,7 @@ mod tests {
                 .get(id)
                 .filter(|p| p.pid() == pid)
                 .ok_or_else(|| TraitError::new(ErrorCode::FailedPrecondition, "no handle"))?;
-            process.signal(signal, timeout)
+            process.signal(signal, deadline)
         }
     }
 

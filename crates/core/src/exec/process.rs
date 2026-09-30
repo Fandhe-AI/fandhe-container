@@ -889,7 +889,16 @@ impl ContainerChild {
         if let ReapState::Reaped { exit, .. } = cell.state {
             return Ok(SignalDelivery::AlreadyExited(exit));
         }
-        if let Some((exit, _)) = self.reap_locked(cell)? {
+        let polled = sys::wait_pid_nohang(self.pid);
+        if matches!(polled, Err(SysError::Os(e)) if e == sys::ECHILD) {
+            // 契約外の回収者が既に回収していた（`waitpid` が `ECHILD`）。pid が再利用され得るため
+            // `kill` は送らず、`ESRCH` と同じく以後の送信・回収を行わない状態へ進める。
+            if cell.state == ReapState::Running {
+                cell.state = ReapState::Killed;
+            }
+            return Ok(SignalDelivery::Gone);
+        }
+        if let Some((exit, _)) = Self::apply_wait(cell, polled)? {
             return Ok(SignalDelivery::AlreadyExited(exit));
         }
         match sys::kill_pid(self.pid, Signal::Number(number)) {
@@ -923,11 +932,19 @@ impl ContainerChild {
 
     /// ロック保持中に 1 回だけ回収を試みる（[`Self::try_reap`] の本体）。
     fn reap_locked(&self, cell: &mut ReapCell) -> Result<Option<Observed>, ExecError> {
-        const STAGE: IsolationStage = IsolationStage::Wait;
         if let ReapState::Reaped { exit, killed } = cell.state {
             return Ok(Some((exit, killed)));
         }
-        match sys::wait_pid_nohang(self.pid) {
+        Self::apply_wait(cell, sys::wait_pid_nohang(self.pid))
+    }
+
+    /// `waitpid(WNOHANG)` の結果を回収状態へ反映する（[`Self::reap_locked`] の本体。ロック保持中）。
+    fn apply_wait(
+        cell: &mut ReapCell,
+        polled: Result<Option<i32>, SysError>,
+    ) -> Result<Option<Observed>, ExecError> {
+        const STAGE: IsolationStage = IsolationStage::Wait;
+        match polled {
             Ok(Some(status)) => {
                 // stopped / continued は回収ではない（pid は保持されたまま）ので状態を変えずにエラー。
                 let exit = decode_wait_status(status).ok_or_else(|| {
@@ -1567,6 +1584,23 @@ mod tests {
         );
         assert_eq!(alive, None, "the unrelated process must not be signaled");
         assert_eq!(reap_snapshot(&handle).1, 0);
+    }
+
+    /// CORE-2・CORE-1（TASK-30.1）: 契約外の回収者が先に回収済み（`waitpid` が `ECHILD`）の pid へは
+    /// `kill` せず、`Internal` ではなく `Gone` を返し、以後の送信も行わない。
+    #[test]
+    fn core2_send_signal_reports_gone_when_already_reaped_externally() {
+        let mut external = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let handle = ContainerChild::new(external.id());
+        external.wait().unwrap();
+        let term = std::num::NonZeroU8::new(15).unwrap();
+        assert_eq!(handle.send_signal(term).unwrap(), SignalDelivery::Gone);
+        assert_eq!(reap_snapshot(&handle), (ReapState::Killed, 0));
+        assert_eq!(handle.send_signal(term).unwrap(), SignalDelivery::Gone);
     }
 
     /// 回収状態と送った `SIGKILL` の回数を取り出す。

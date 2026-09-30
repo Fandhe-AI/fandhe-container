@@ -65,7 +65,7 @@ impl ProcessSignaler for FakeSignaler {
         id: &ContainerId,
         pid: NonZeroU32,
         signal: Signal,
-        _timeout: Duration,
+        _deadline: std::time::Instant,
     ) -> Result<(), TraitError> {
         self.calls.lock().unwrap_or_else(|e| e.into_inner()).push((
             id.as_str().to_owned(),

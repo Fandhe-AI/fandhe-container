@@ -55,8 +55,8 @@ pub(crate) enum SysError {
 
 /// errno の値（アーキテクチャごとに `consts` で個別定義。alpha / mips / sparc 等は値が違う）。
 pub(crate) use consts::{
-    E2BIG, EACCES, EBADF, EEXIST, EINTR, EINVAL, ELOOP, ENOENT, ENOEXEC, ENOSYS, ENOTDIR, EPERM,
-    ESRCH,
+    E2BIG, EACCES, EBADF, ECHILD, EEXIST, EINTR, EINVAL, ELOOP, ENOENT, ENOEXEC, ENOSYS, ENOTDIR,
+    EPERM, ESRCH,
 };
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）
@@ -129,6 +129,8 @@ mod consts {
     pub const ELOOP: i32 = 40;
     // errno-base.h / errno.h の ESRCH・EINTR・E2BIG・ENOEXEC・EBADF・ENOSYS。
     pub const ESRCH: i32 = 3;
+    // errno-base.h の ECHILD（回収対象の子が無い。既に回収済み）。
+    pub const ECHILD: i32 = 10;
     pub const EINTR: i32 = 4;
     pub const E2BIG: i32 = 7;
     pub const ENOEXEC: i32 = 8;
@@ -202,6 +204,8 @@ mod consts {
     pub const ELOOP: i32 = 40;
     // errno-base.h / errno.h の ESRCH・EINTR・E2BIG・ENOEXEC・EBADF・ENOSYS。
     pub const ESRCH: i32 = 3;
+    // errno-base.h の ECHILD（回収対象の子が無い。既に回収済み）。
+    pub const ECHILD: i32 = 10;
     pub const EINTR: i32 = 4;
     pub const E2BIG: i32 = 7;
     pub const ENOEXEC: i32 = 8;
@@ -258,6 +262,7 @@ mod consts {
     pub const EINVAL: i32 = -5;
     pub const ELOOP: i32 = -6;
     pub const ESRCH: i32 = -8;
+    pub const ECHILD: i32 = -14;
     pub const EINTR: i32 = -9;
     pub const E2BIG: i32 = -10;
     pub const ENOEXEC: i32 = -11;

@@ -394,10 +394,12 @@ pub trait LaunchedProcess: Send {
     /// プロセスへシグナルを 1 つ送る。終了は待たない（`kill` 用。`oci_runtime::kill` の `ProcessSignaler`
     /// の本番実装が、保持する起動ハンドルへ委ねる。CORE-2・OCI-6・TASK-30.1）。
     ///
-    /// 回収済みのプロセスへは送らず `FailedPrecondition` を返すこと（pid 再利用対策。SEC-1）。待ちは
-    /// `timeout` まで（REPAIR-5）。既定実装は送信手段を持たないため fail-closed で `Unimplemented` を返す。
-    fn signal(&self, signal: Signal, timeout: Duration) -> Result<(), TraitError> {
-        let _ = (signal, timeout);
+    /// 回収済みのプロセスへは送らず `FailedPrecondition` を返すこと（pid 再利用対策。SEC-1）。
+    /// `deadline` は呼び出し側（`kill`）が `Timeout` を返す時刻以前の絶対期限で、実装は実際の送信直前に
+    /// 期限切れを確認し、切れていれば送らずに `Timeout` を返すこと（期限後にシグナルが届かない。REPAIR-5）。
+    /// 既定実装は送信手段を持たないため fail-closed で `Unimplemented` を返す。
+    fn signal(&self, signal: Signal, deadline: std::time::Instant) -> Result<(), TraitError> {
+        let _ = (signal, deadline);
         Err(TraitError::new(
             ErrorCode::Unimplemented,
             "the launched process cannot be signaled",
@@ -463,9 +465,10 @@ impl LaunchedProcess for ContainerChildProcess {
             .map_err(|e| TraitError::new(e.code, "failed to terminate the container process"))
     }
 
-    /// `ContainerChild::send_signal`（回収状態のロック下で送信）へ委ねる。回収済み・既に消えていた
-    /// 場合は送らずに `FailedPrecondition` を返す。`timeout` はロック待ちの上限で、超過後は送らない（REPAIR-5）。
-    fn signal(&self, signal: Signal, timeout: Duration) -> Result<(), TraitError> {
+    /// `ContainerChild::send_signal_until`（回収状態のロック下で送信）へ委ねる。回収済み・既に消えていた
+    /// 場合は送らずに `FailedPrecondition` を返す。`deadline` は呼び出し側から引き継いだ絶対期限で、
+    /// ロック取得後・送信直前に確認し、切れていれば送らない（REPAIR-5）。
+    fn signal(&self, signal: Signal, deadline: std::time::Instant) -> Result<(), TraitError> {
         use crate::exec::SignalDelivery;
         let number = std::num::NonZeroU8::new(signal.as_u8()).ok_or_else(|| {
             TraitError::new(
@@ -473,12 +476,6 @@ impl LaunchedProcess for ContainerChildProcess {
                 "signal number must be in 1..=64",
             )
         })?;
-        // ロック待ちが `timeout` を超えたら送信を抑止する（呼び出し側が `Timeout` を返した後に送らない）。
-        let deadline = std::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| {
-                TraitError::new(ErrorCode::InvalidArgument, "signal timeout is too large")
-            })?;
         match self.child.send_signal_until(number, deadline) {
             Ok(SignalDelivery::Delivered) => Ok(()),
             Ok(_) => Err(TraitError::new(
@@ -590,15 +587,44 @@ mod tests {
             ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
                 .expect("wrap");
         let t = Duration::from_secs(5);
-        process.signal(Signal::SIGKILL, t).expect("signal");
+        let deadline = || std::time::Instant::now() + t;
+        process.signal(Signal::SIGKILL, deadline()).expect("signal");
         assert_eq!(
             process.wait(t).expect("wait"),
             Some(ProcessExit::Signaled(9))
         );
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
-        let err = process.signal(Signal::SIGKILL, t).expect_err("exited");
+        let err = process
+            .signal(Signal::SIGKILL, deadline())
+            .expect_err("exited");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(err.message(), "the container process has already exited");
+    }
+
+    /// REPAIR-5・CORE-2（TASK-30.1）: 期限切れの絶対期限を渡された `signal` は送らずに `Timeout` を返し、
+    /// 子は生きたまま（期限後にシグナルが届かない）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_container_child_process_signal_suppressed_after_deadline() {
+        #[allow(clippy::zombie_processes)]
+        let pid = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn")
+            .id();
+        let process =
+            ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
+                .expect("wrap");
+        let err = process
+            .signal(Signal::SIGKILL, std::time::Instant::now())
+            .expect_err("expired");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(
+            process.wait(Duration::from_millis(100)).expect("wait"),
+            None
+        );
+        process.terminate(Duration::from_secs(10)).expect("cleanup");
     }
 
     /// テスト用の一意なディレクトリ（終了時に削除）。

@@ -1022,4 +1022,148 @@ mod tests {
         assert_eq!(err.stage, IsolationStage::Wait);
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
+
+    /// 回収状態と送った `SIGKILL` の回数を取り出す。
+    fn reap_snapshot(handle: &ContainerChild) -> (ReapState, u32) {
+        let cell = handle.lock();
+        (cell.state, cell.kills_sent)
+    }
+
+    /// CORE-1・REPAIR-5（TASK-27.4.1）: 同じハンドルを 2 スレッドで並行に待つと、どちらも同じ
+    /// 終了状態を受け取り、`SIGKILL` は送らない（回収は 1 回だけ）。
+    #[test]
+    fn core1_concurrent_waiters_share_exit_without_kill() {
+        let handle = ContainerChild::new(spawn_sh("sleep 0.2; exit 3"));
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(|| handle.wait_timeout(Duration::from_secs(10)));
+            let b = s.spawn(|| handle.wait_timeout(Duration::from_secs(10)));
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_eq!(a.unwrap(), ChildExit::Exited(3));
+        assert_eq!(b.unwrap(), ChildExit::Exited(3));
+        assert_eq!(
+            reap_snapshot(&handle),
+            (
+                ReapState::Reaped {
+                    exit: ChildExit::Exited(3),
+                    killed: false
+                },
+                0
+            )
+        );
+    }
+
+    /// CORE-1・REPAIR-5（TASK-27.4.1）: 回収済みのハンドルへの再呼び出しは、期限 0 でも `kill` せず
+    /// 記録済みの終了状態を返す。
+    #[test]
+    fn core1_wait_after_reap_returns_recorded_exit_without_kill() {
+        let handle = ContainerChild::new(spawn_sh("exit 5"));
+        assert_eq!(
+            handle.wait_timeout(Duration::from_secs(10)).unwrap(),
+            ChildExit::Exited(5)
+        );
+        assert_eq!(
+            handle.wait_timeout(Duration::ZERO).unwrap(),
+            ChildExit::Exited(5)
+        );
+        assert_eq!(reap_snapshot(&handle).1, 0);
+    }
+
+    /// CORE-1・REPAIR-5（TASK-27.4.1）: 回収済みのハンドルの pid が別プロセスに再利用されていても、
+    /// 期限 0 の待機でそのプロセスへ `SIGKILL` を送らない（再利用を生きた別プロセスで模擬する）。
+    #[test]
+    fn core1_reaped_handle_never_signals_reused_pid() {
+        let mut unrelated = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let handle = ContainerChild::new(unrelated.id());
+        handle.lock().state = ReapState::Reaped {
+            exit: ChildExit::Exited(7),
+            killed: false,
+        };
+        let result = handle.wait_timeout(Duration::ZERO);
+        let alive = unrelated.try_wait().unwrap();
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+        assert_eq!(result.unwrap(), ChildExit::Exited(7));
+        assert_eq!(alive, None, "the unrelated process must not be signaled");
+        assert_eq!(reap_snapshot(&handle).1, 0);
+    }
+
+    /// CORE-1・REPAIR-5（TASK-27.4.1）: 期限の短い待機が `SIGKILL` した子を、期限内の別スレッドの
+    /// 待機は `Signaled(9)` として受け取る。`SIGKILL` は 1 回だけで、子は回収済み。
+    #[test]
+    fn core1_timeout_kill_is_shared_with_concurrent_waiter() {
+        let pid = spawn_sh("exec sleep 30");
+        let handle = ContainerChild::new(pid);
+        let (short, long) = std::thread::scope(|s| {
+            let short = s.spawn(|| handle.wait_timeout(Duration::from_millis(200)));
+            let long = s.spawn(|| handle.wait_timeout(Duration::from_secs(60)));
+            (short.join().unwrap(), long.join().unwrap())
+        });
+        let err = short.unwrap_err();
+        assert_eq!(
+            (err.code, err.stage),
+            (ErrorCode::Timeout, IsolationStage::Wait)
+        );
+        assert_eq!(long.unwrap(), ChildExit::Signaled(9));
+        assert_eq!(
+            reap_snapshot(&handle),
+            (
+                ReapState::Reaped {
+                    exit: ChildExit::Signaled(9),
+                    killed: true
+                },
+                1
+            )
+        );
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        // 回収済みの後の再呼び出しは kill せず、記録済みの終了状態（`Signaled(9)`）を返す。
+        assert_eq!(
+            handle.wait_timeout(Duration::ZERO).unwrap(),
+            ChildExit::Signaled(9)
+        );
+        assert_eq!(reap_snapshot(&handle).1, 1);
+    }
+
+    /// CORE-1・REPAIR-5（TASK-27.4.1）: 同じ期限で並行に期限切れしても `SIGKILL` は 1 回だけ。
+    /// kill したスレッドは必ず `Timeout`、もう一方は観測の順序により `Timeout` か `Signaled(9)`。
+    #[test]
+    fn core1_simultaneous_timeouts_send_single_kill() {
+        let pid = spawn_sh("exec sleep 30");
+        let handle = ContainerChild::new(pid);
+        let results = std::thread::scope(|s| {
+            let a = s.spawn(|| handle.wait_timeout(Duration::from_millis(200)));
+            let b = s.spawn(|| handle.wait_timeout(Duration::from_millis(200)));
+            [a.join().unwrap(), b.join().unwrap()]
+        });
+        let timeouts = results
+            .iter()
+            .filter(|r| matches!(r, Err(e) if e.code == ErrorCode::Timeout))
+            .count();
+        let signaled = results
+            .iter()
+            .filter(|r| matches!(r, Ok(ChildExit::Signaled(9))))
+            .count();
+        assert!(timeouts >= 1, "{results:?}");
+        assert_eq!(timeouts + signaled, 2, "{results:?}");
+        assert_eq!(reap_snapshot(&handle).1, 1);
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    /// CORE-1・REPAIR-5（TASK-27.4.1）: `waitpid` が失敗して `Err` で戻っても回収状態は `Running`
+    /// のままで `kill` も送らず、呼び出し元は同じハンドルで再試行できる（自プロセスは自分の子では
+    /// ないため `waitpid` が `ECHILD` になる）。
+    #[test]
+    fn core1_wait_error_keeps_handle_retryable() {
+        let handle = ContainerChild::new(std::process::id());
+        for _ in 0..2 {
+            let err = handle.wait_timeout(Duration::ZERO).unwrap_err();
+            assert_eq!(err.stage, IsolationStage::Wait);
+            assert_eq!(err.code, ErrorCode::Internal);
+            assert_eq!(reap_snapshot(&handle), (ReapState::Running, 0));
+        }
+    }
 }

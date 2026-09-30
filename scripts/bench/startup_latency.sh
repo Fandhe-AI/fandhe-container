@@ -231,7 +231,7 @@ show_log() {
 
 # コンテナを削除する。失敗時は kill → delete を試み、それでも残れば leftover に記録する。
 # 引数: <id> [probe]（probe=1 のときは削除失敗後に state で実在を確認し、
-# 存在しなければ create が何も作らなかったとみなして成功扱いにする）
+# 応答が不存在を明示した場合のみ create が何も作らなかったとみなして成功扱いにし、照会不能なら残存扱い）
 finish_container() {
   local id="$1" probe="${2:-0}"
   local log="$tmpdir/cleanup-$id.log"
@@ -242,8 +242,18 @@ finish_container() {
   if rt_delete "$log" "$id"; then
     return 0
   fi
-  if [ "$probe" = "1" ] && ! rt_state "$log" "$id"; then
-    return 0
+  if [ "$probe" = "1" ]; then
+    local st=0
+    rt_state "$log" "$id" || st=$?
+    if [ "$st" -eq 0 ]; then
+      : # コンテナが実在するので残存扱い（下で leftover へ記録）
+    elif [ "$st" -ne 124 ] && [ "$st" -ne 137 ] && grep -qiE 'does not exist|not found|no such container' -- "$log"; then
+      # state の応答が不存在を明示した場合だけ「create が何も作らなかった」とみなす。
+      # タイムアウト・権限エラー等の照会不能は残存の可能性ありとして扱う（特権操作の後始末）。
+      return 0
+    else
+      echo "warning: could not verify container absence for $id (state exit $st); assuming it may be left behind" >&2
+    fi
   fi
   leftover_ids+=("$id")
   return 1

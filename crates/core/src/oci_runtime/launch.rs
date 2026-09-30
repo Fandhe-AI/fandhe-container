@@ -504,6 +504,9 @@ impl LaunchedProcess for ContainerChildProcess {
 /// - `linux.uidMappings` / `gidMappings` は `start` が拒否済みで `LaunchSpec` に載らない。user namespace の
 ///   写像は launcher の責務で、コンテナ内 root（uid/gid 0）をホストの非特権 UID・GID（呼び出しプロセスの
 ///   euid・egid。0 なら拒否）へ写すこと。`exec::plan` / `exec::isolate` が既定でこの写像を行う（SEC-5）
+///   subuid / subgid の範囲写像（コンテナ内に複数 UID を持たせる通常の rootless 構成）が要る場合は
+///   `exec::plan_rootless_subordinate` / `exec::isolate_rootless_subordinate` を使う（TASK-40.2・CORE-6。
+///   `linux.uidMappings` を `LaunchSpec` へ載せる経路は未実装）
 /// - `LaunchSpec::namespaces` には Pid・Mount・User・Ipc・Uts が必ず含まれる（`start` が検証済み）
 ///
 /// 本番実装は本 crate に未提供（モジュール doc 参照）。

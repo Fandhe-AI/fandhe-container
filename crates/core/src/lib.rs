@@ -29,7 +29,7 @@
 //!   `exec/capabilities.rs`（Linux 限定）に置く: 段の型 `ExecError` の非公開コンストラクタと
 //!   errno 分類を再利用するため（`exec/devices.rs` と同じ判断）。ステージ列へは #173（TASK-37.2）で組み込み済み
 //! - `observability`: メトリクス集計型 `OpStats` 等（TASK-84.1）と記録 API `OpRecorder`
-//!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。create / start / kill の計装は実装済み（TASK-84.4）、delete は TASK-30.2 待ちで未実装。io 向け連携点は io 側に定義済み（TASK-84.5）
+//!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。create / start / kill の計装は実装済み（TASK-84.4）、delete も TASK-30.2 で同じパターンにより計装済み。io 向け連携点は io 側に定義済み（TASK-84.5）
 //! - `landlock`: Landlock ABI 検出（TASK-39.1・#181）とパスルール生成（TASK-39.2・#182）を実装済み（Linux 限定。CORE-5）。適用（#183）・組み込み（#184）は未実装。
 //! - `rootless`: user namespace の UID/GID 写像の設定・読み戻し検証（Linux 限定。CORE-6・SEC-5・
 //!   TASK-40.1）。検証済み写像型・subuid/subgid 解析・`Direct` / `newuidmap` 経由の書き込みが実装済みで、
@@ -42,7 +42,7 @@
 //! - `oci_runtime`: OCI Runtime のライフサイクル。`config.json` の型・パーサ
 //!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。
 //!   start（TASK-29.3）は実装済みだが起動は `ProcessLauncher` の依存注入で、本番 launcher と実 exec は未提供。
-//!   kill（TASK-30.1）も実装済みで、送信は `ProcessSignaler` の依存注入（本番実装は supervisor 待ち）。delete は TASK-30.2 で追加する予定で未実装
+//!   kill（TASK-30.1）も実装済みで、送信は `ProcessSignaler` の依存注入（本番実装は supervisor 待ち）。delete（TASK-30.2）は `StateStore` のレコード削除のみ実装済みで、状態ファイル・cgroup の削除は TASK-30.3 で未実装
 //! - `cgroups`: 委譲 cgroup v2 の検出・コンテナ用子 cgroup 作成・自プロセス退避の検証・controller
 //!   有効化（Linux 限定。TASK-32.1・CORE-3 は実装済み。`memory.max`〔TASK-32.2〕・`cpu.max`〔TASK-32.3〕・
 //!   起動フローへの組み込み〔TASK-32.4〕は未実装で、現状は起動フローから呼ばれない）

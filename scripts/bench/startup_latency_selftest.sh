@@ -93,7 +93,7 @@ stub_log="$work/stub.log"
 stub="$work/stub-runtime"
 cat >"$stub" <<STUB
 #!${bash_bin}
-# スタブランタイム。STUB_MODE: ok / create-fail / create-fail-delete-fail / start-fail / start-hang / delete-fail
+# スタブランタイム。STUB_MODE: ok / create-fail / create-fail-delete-fail / create-fail-gone / start-fail / start-hang / delete-fail
 cmd="\$1"
 shift
 case "\$cmd" in
@@ -104,7 +104,7 @@ echo "\$cmd \$id" >>"\$STUB_LOG"
 case "\$cmd" in
   create)
     sleep 0.05
-    case "\${STUB_MODE:-ok}" in create-fail | create-fail-delete-fail) echo "stub: create failed" >&2; exit 1 ;; esac
+    case "\${STUB_MODE:-ok}" in create-fail | create-fail-delete-fail | create-fail-gone) echo "stub: create failed" >&2; exit 1 ;; esac
     ;;
   start)
     [ "\${STUB_MODE:-ok}" = start-fail ] && { echo "stub: start failed" >&2; exit 1; }
@@ -112,9 +112,13 @@ case "\$cmd" in
     sleep 0.10
     ;;
   delete)
-    case "\${STUB_MODE:-ok}" in delete-fail | create-fail-delete-fail) echo "stub: delete failed" >&2; exit 1 ;; esac
+    case "\${STUB_MODE:-ok}" in delete-fail | create-fail-delete-fail | create-fail-gone) echo "stub: delete failed" >&2; exit 1 ;; esac
     ;;
   kill) ;;
+  state)
+    # 存在しない ID は OCI 準拠ランタイムと同様に非ゼロで拒否する。
+    [ "\${STUB_MODE:-ok}" = create-fail-gone ] && { echo "stub: container does not exist" >&2; exit 1; }
+    ;;
 esac
 exit 0
 STUB
@@ -228,6 +232,12 @@ reset_log
 STUB_MODE=create-fail-delete-fail expect_rc "create-fail-delete-fail" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 expect_contains "create-fail-leftover-id" "containers left behind: fandhe-startup-"
 if grep -q '^kill ' "$stub_log"; then pass "create-fail-kill-called"; else fail "create-fail-kill-called"; fi
+# create 失敗でコンテナ未作成（state も失敗）なら後始末失敗にせず、契約どおり exit 1（Codex P1 / Bugbot 指摘）。
+reset_log
+STUB_MODE=create-fail-gone expect_rc "create-fail-gone" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_contains "create-fail-gone-create-error" "runtime-create-failed"
+if [[ "$last_output" == *"containers left behind"* ]]; then fail "create-fail-gone-no-false-leftover"; else pass "create-fail-gone-no-false-leftover"; fi
+if grep -q '^state ' "$stub_log"; then pass "create-fail-gone-state-probed"; else fail "create-fail-gone-state-probed"; fi
 reset_log
 STUB_MODE=start-fail expect_rc "start-fail" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 if grep -q '^delete ' "$stub_log"; then pass "start-fail-delete-called"; else fail "start-fail-delete-called"; fi

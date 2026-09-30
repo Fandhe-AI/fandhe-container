@@ -197,6 +197,10 @@ tmpdir="$(mktemp -d)"
 seq_no=0
 # 現在作成済みで未削除のコンテナ ID（1 試行につき 1 つ）と、削除できなかった ID の一覧。
 live_id=""
+# create 試行中（成否未確定）は 1。create 失敗でコンテナが未作成だった場合、OCI 準拠
+# ランタイムは存在しない ID の delete を拒否するため、残存確認（state）できた場合だけ
+# 後始末失敗とする。create 成功後は 0（delete 失敗は常に後始末失敗）。
+live_unverified=0
 leftover_ids=()
 rc=0
 
@@ -216,6 +220,7 @@ rt_create() { run_rt "$1" create --bundle "$bundle" "$2"; }
 rt_start() { run_rt "$1" start "$2"; }
 rt_delete() { run_rt "$1" delete "$2"; }
 rt_kill() { run_rt "$1" kill "$2" KILL; }
+rt_state() { run_rt "$1" state "$2"; }
 # ---------------------------------------------------------------------------
 
 # 失敗したコマンドのログ末尾を stderr へ出す。
@@ -225,15 +230,19 @@ show_log() {
 }
 
 # コンテナを削除する。失敗時は kill → delete を試み、それでも残れば leftover に記録する。
-# 引数: <id>
+# 引数: <id> [probe]（probe=1 のときは削除失敗後に state で実在を確認し、
+# 存在しなければ create が何も作らなかったとみなして成功扱いにする）
 finish_container() {
-  local id="$1"
+  local id="$1" probe="${2:-0}"
   local log="$tmpdir/cleanup-$id.log"
   if rt_delete "$log" "$id"; then
     return 0
   fi
   rt_kill "$log" "$id" || true
   if rt_delete "$log" "$id"; then
+    return 0
+  fi
+  if [ "$probe" = "1" ] && ! rt_state "$log" "$id"; then
     return 0
   fi
   leftover_ids+=("$id")
@@ -246,11 +255,13 @@ cleanup() {
   local final="$?"
   trap - EXIT INT TERM
   if [ -n "$live_id" ]; then
-    # live_id は create 試行の直前に設定される（create 失敗で中途半端に残った場合も対象）。
+    # live_id は create 試行の直前に設定される（create 失敗で中途半端に残った場合も対象。
+    # ただし create 未成功の間は state で実在を確認できた場合のみ残存扱い）。
     # delete 失敗時は finish_container が kill → delete を再試行し、それでも残れば
     # leftover_ids へ記録して下で exit 4 にする。
-    finish_container "$live_id" || true
+    finish_container "$live_id" "$live_unverified" || true
     live_id=""
+    live_unverified=0
   fi
   if ! rm -rf -- "$tmpdir"; then
     echo "error: cleanup-failed: could not remove temporary directory" >&2
@@ -275,11 +286,13 @@ measure_once() {
   # 作成を試みた時点で後始末対象として保持する。失敗時の delete（kill → delete の再試行）と
   # 残存時の exit 4 は EXIT trap の cleanup が担う。
   live_id="$id"
+  live_unverified=1
   if ! rt_create "$tmpdir/create.log" "$id"; then
     err "runtime-create-failed" "create failed or timed out for $id"
     show_log "$tmpdir/create.log"
     return 1
   fi
+  live_unverified=0
   t1="${EPOCHREALTIME/./}"
   if ! rt_start "$tmpdir/start.log" "$id"; then
     err "runtime-start-failed" "start failed or timed out for $id"

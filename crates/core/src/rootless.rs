@@ -12,21 +12,43 @@
 //!
 //! # 呼び出し文脈・契約
 //!
-//! - 起動フローへの組み込み（子が [`unshare_user_namespace`] → 親が子 pid に
-//!   [`apply_id_maps`]）は TASK-40.2（#188）で `exec` 側から行う予定で、本モジュールは部品のみ。
-//!   エラーは `ExecError` へ写す想定（`RootlessError` は ERR-1 と同形の `code` / `stage`）
+//! - 起動フローへの組み込みは `exec::isolate_rootless_subordinate`（TASK-40.2・#188）が担う。
+//!   呼び出し元が [`unshare_user_namespace`] し、fork した mapper（`run_id_map_mapper`。外側の
+//!   user namespace に残る）が親 pid へ [`apply_id_maps`] する。応答は型付きの固定 3 バイト
+//!   （`MapperReply`）で返す。エラーは `ExecError`（段 `UserNamespaceMap`）へ写す
 //! - 写像はカーネルが write-once（1 回しか受け付けない）。途中で失敗した対象プロセスは
 //!   破棄すること（再設定できない）
-//! - pid 再利用（TOCTOU）対策として、呼び出し側は対象を reap する前（`Child` を保持した状態）に
-//!   [`apply_id_maps`] を呼ぶこと。pidfd による固定は新規 FFI になるため未実装（#188 で判断）
+//! - pid 再利用（TOCTOU）対策: 書き込み先は pid 番号ではなく、対象の `/proc/<pid>` ディレクトリ fd
+//!   （[`ProcHandle`]）で固定する。mapper は先に fd を開き、その**後**に `parent_id()` が期待した親のまま
+//!   であることを確認する（開いた時点で pid は生きた親を指していたと言える）。以後の書き込み・読み戻しは
+//!   fd 経由（`/proc/self/fd/N/...`）で、対象が死んで pid が再利用されても別プロセスへは届かず失敗する。
+//!   `newuidmap` / `newgidmap` にも pid 文字列ではなく `fd:0`（stdin に渡した同じ fd）を渡す
+//!   （shadow の `fd:N` 形式。未対応の版ではヘルパーが失敗し fail-closed になる）。新規 FFI は不要
+//!   （pidfd は採らない）。単独で [`apply_id_maps`] を呼ぶ場合は pid から fd を開くため、対象を reap する前
+//!   （`Child` を保持した状態）に呼ぶこと
 //! - SEC-5: ホスト ID 0 を含む写像と、コンテナ内 0 を持たない写像は [`IdMapSet::new`] が拒否する
+//!
+//! # rootless 経路の操作対応表（CORE-6・SEC-5。root 権限を要する操作の回避・代替）
+//!
+//! | 操作 | rootless 経路での扱い |
+//! | ---- | ---- |
+//! | 範囲 UID/GID 写像の書き込み | setuid の `newuidmap` / `newgidmap`（[`IdMapWriter::Helper`]）で代替 |
+//! | 単一 ID 写像（自 euid → 0） | [`IdMapWriter::Direct`]（非特権で許されるのは自 ID の 1 行のみ） |
+//! | `setgroups` | Direct は `deny` を書く。Helper は `newgidmap` に任せる |
+//! | unshare（PID / mount / UTS / IPC）・`MS_PRIVATE`・`sethostname` | 写像後の user namespace 内 uid 0 で実行 |
+//! | 自己 bind・`/proc` マウント・`pivot_root` | user namespace が所有する mount namespace 内で実行 |
+//! | `mknod` によるデバイスノード作成 | 代替しない（`PermissionDenied` で fail-closed。ホスト `/dev` の bind は未実装） |
+//! | cgroup 参加 | 対象外（TASK-32・CORE-3） |
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - ユーザー名 → `/etc/subuid` 行の NSS 解決（`getpwuid_r` は新規 FFI のため採らない。
-//!   呼び出し側が [`SubIdOwner`] に数値 uid と検証済みユーザー名を渡す）。TASK-40.2（#188）で判断
-//! - `oci_runtime` の `linux.uidMappings` / `gidMappings` の受理（TASK-40.2）
-//! - ファイル所有者の検証（TASK-40.3・#189）
+//! - ユーザー名 → `/etc/subuid` 行の NSS 解決は**追加しない**（`getpwuid_r` は新規 FFI のため。
+//!   呼び出し側が [`SubIdOwner`] に数値 uid と検証済みユーザー名を渡す方式を維持する。
+//!   ライブラリコードは `$USER` を読まない）
+//! - `oci_runtime` の `linux.uidMappings` / `gidMappings` の受理（start.rs は現状拒否のまま。後続）
+//!
+//! ファイル所有者の写像（SEC-5。ns 内 0 → ホスト非特権 UID）の照合は `tests/rootless_file_owner.rs`
+//! （TASK-40.3・#189）が担う。
 
 use std::fmt;
 use std::fs::OpenOptions;
@@ -461,9 +483,37 @@ impl TargetPid {
     pub fn get(&self) -> u32 {
         self.0
     }
+}
 
+/// 対象プロセスの `/proc/<pid>` ディレクトリ fd。pid 番号ではなくプロセス同一性へ書き込み先を固定する
+/// （SEC-5・CORE-6・TASK-40.2。pid 再利用の TOCTOU 対策）。
+///
+/// fd を開いた後に対象が終了すると、fd 配下のファイル open は `ENOENT` / `ESRCH` で失敗し、同じ pid を
+/// 得た別プロセスへは届かない。
+#[derive(Debug)]
+pub struct ProcHandle {
+    dir: std::fs::File,
+    pid: TargetPid,
+}
+
+impl ProcHandle {
+    /// `/proc/<pid>` を開く。呼び出し側は、開いた**後**に対象が期待したプロセスのままであること
+    /// （例: `parent_id()`）を確認すること。
+    pub fn open(pid: TargetPid) -> Result<Self, RootlessError> {
+        let dir = std::fs::File::open(format!("/proc/{}", pid.0))
+            .map_err(|e| io_error(RootlessStage::Validate, "open target proc directory", &e))?;
+        Ok(Self { dir, pid })
+    }
+
+    /// 対象 pid（表示・検証用。書き込み先の解決には使わない）。
+    pub fn pid(&self) -> TargetPid {
+        self.pid
+    }
+
+    /// fd 配下のファイルのパス（`/proc/self/fd/N/<name>`。fd の指すプロセスへ解決される）。
     fn proc_file(&self, name: &str) -> PathBuf {
-        PathBuf::from(format!("/proc/{}/{name}", self.0))
+        use std::os::fd::AsRawFd as _;
+        PathBuf::from(format!("/proc/self/fd/{}/{name}", self.dir.as_raw_fd()))
     }
 }
 
@@ -617,7 +667,7 @@ pub fn unshare_user_namespace() -> Result<(), RootlessError> {
 
 /// 非特権（euid != 0）の `Direct` 書き込みが満たすべき条件を書き込み前に検証する
 /// （カーネルの EPERM を待たない fail-closed）。`user_namespaces(7)`: 単一行・自 euid/egid への写像。
-fn check_direct_allowed(
+pub(crate) fn check_direct_allowed(
     uid: &IdMapSet,
     gid: &IdMapSet,
     euid: u32,
@@ -661,7 +711,7 @@ fn sanitize_stderr(raw: &[u8]) -> String {
 /// 非 root は残る窓でも差し替えられない）。
 fn run_helper(
     paths: &HelperPaths,
-    pid: TargetPid,
+    target: &ProcHandle,
     set: &IdMapSet,
     kind: IdKind,
     timeout: Duration,
@@ -675,15 +725,20 @@ fn run_helper(
             "helper was replaced after validation",
         ));
     }
+    // 対象は pid 番号ではなく `/proc/<pid>` fd（stdin = fd 0）で渡す（pid 再利用対策）。
+    let stdin_fd = target
+        .dir
+        .try_clone()
+        .map_err(|e| io_error(stage, "duplicate target proc directory", &e))?;
     let mut cmd = Command::new(path);
-    cmd.arg(pid.get().to_string());
+    cmd.arg("fd:0");
     for e in set.entries() {
         cmd.arg(e.container_id.to_string())
             .arg(e.host_id.to_string())
             .arg(e.count.to_string());
     }
     cmd.env_clear()
-        .stdin(Stdio::null())
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(stdin_fd)))
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let mut child = cmd
@@ -773,8 +828,13 @@ pub fn parse_id_map(bytes: &[u8]) -> Result<Vec<IdMapping>, RootlessError> {
 
 /// `/proc/<pid>/{uid,gid}_map` を上限付きで読んで解析する。
 pub fn read_id_map(pid: TargetPid, kind: IdKind) -> Result<Vec<IdMapping>, RootlessError> {
+    read_id_map_of(&ProcHandle::open(pid)?, kind)
+}
+
+/// [`ProcHandle`] の指すプロセスの map を上限付きで読んで解析する。
+pub fn read_id_map_of(target: &ProcHandle, kind: IdKind) -> Result<Vec<IdMapping>, RootlessError> {
     let stage = RootlessStage::Verify;
-    let f = std::fs::File::open(pid.proc_file(kind.map_file()))
+    let f = std::fs::File::open(target.proc_file(kind.map_file()))
         .map_err(|e| io_error(stage, "open id map", &e))?;
     let mut buf = Vec::new();
     f.take(MAX_PROC_MAP_BYTES + 1)
@@ -801,8 +861,19 @@ pub fn apply_id_maps(
     writer: &IdMapWriter,
     timeout: Duration,
 ) -> Result<IdMapReport, RootlessError> {
+    apply_id_maps_to(&ProcHandle::open(pid)?, uid, gid, writer, timeout)
+}
+
+/// 開いた [`ProcHandle`] の指すプロセスへ写像を設定する（pid 再利用に耐える本体。CORE-6・SEC-5）。
+pub fn apply_id_maps_to(
+    target: &ProcHandle,
+    uid: &IdMapSet,
+    gid: &IdMapSet,
+    writer: &IdMapWriter,
+    timeout: Duration,
+) -> Result<IdMapReport, RootlessError> {
     apply_id_maps_as(
-        pid,
+        target,
         uid,
         gid,
         writer,
@@ -814,7 +885,7 @@ pub fn apply_id_maps(
 
 /// euid / egid を注入できる本体（事前検証をテストするため分離）。
 fn apply_id_maps_as(
-    pid: TargetPid,
+    pid: &ProcHandle,
     uid: &IdMapSet,
     gid: &IdMapSet,
     writer: &IdMapWriter,
@@ -857,7 +928,7 @@ fn apply_id_maps_as(
         }
     };
     for (k, set) in [(IdKind::Uid, uid), (IdKind::Gid, gid)] {
-        let got = read_id_map(pid, k)?;
+        let got = read_id_map_of(pid, k)?;
         if got != set.entries() {
             return Err(RootlessError::new(
                 ErrorCode::Internal,
@@ -874,6 +945,164 @@ fn apply_id_maps_as(
         gid: gid.clone(),
         writer: kind,
     })
+}
+
+/// 親へ「unshare 完了。写像を書いてよい」と知らせる 1 バイト（[`run_id_map_mapper`] が待つ）。
+pub(crate) const MAPPER_GO: u8 = 1;
+
+/// mapper の応答フレーム長（`[tag, code, stage]` の固定 3 バイト）。
+pub(crate) const MAPPER_REPLY_LEN: usize = 3;
+const REPLY_TAG_OK: u8 = 0;
+const REPLY_TAG_FAILED: u8 = 1;
+
+/// mapper（外側の user namespace に残る fork 子）が、写像を書いた呼び出し元へ返す応答（REPAIR-2）。
+///
+/// 固定 3 バイト `[tag, code, stage]` に符号化し、自由形式の文字列は載せない（詳細は mapper の
+/// stderr へ出す）。復号は完全一致のみ受け付け、未知の値・長さ不足は `Internal` で拒否する
+/// （`exec::isolate_rootless_subordinate` が読む。CORE-6・TASK-40.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MapperReply {
+    /// 写像の書き込みと読み戻し検証が済んだ。
+    Ok,
+    /// 失敗した（`RootlessError` の `code` / `stage` のみ運ぶ）。
+    Failed {
+        code: ErrorCode,
+        stage: RootlessStage,
+    },
+}
+
+/// 応答へ載せられる `ErrorCode`（`RootlessError` が取り得るものに限る）。
+const REPLY_CODES: [ErrorCode; 7] = [
+    ErrorCode::InvalidArgument,
+    ErrorCode::PermissionDenied,
+    ErrorCode::NotFound,
+    ErrorCode::Internal,
+    ErrorCode::Timeout,
+    ErrorCode::FailedPrecondition,
+    ErrorCode::Unimplemented,
+];
+
+const REPLY_STAGES: [RootlessStage; 9] = [
+    RootlessStage::Validate,
+    RootlessStage::ParseSubordinateIds,
+    RootlessStage::ResolveHelper,
+    RootlessStage::Unshare,
+    RootlessStage::SetGroups,
+    RootlessStage::UidMap,
+    RootlessStage::GidMap,
+    RootlessStage::Helper,
+    RootlessStage::Verify,
+];
+
+impl MapperReply {
+    /// 固定長フレームへ符号化する。表に無い `code`（到達しない）は `Internal` に丸める。
+    pub(crate) fn encode(&self) -> [u8; MAPPER_REPLY_LEN] {
+        match self {
+            Self::Ok => [REPLY_TAG_OK, 0, 0],
+            Self::Failed { code, stage } => {
+                let c = REPLY_CODES.iter().position(|x| x == code).unwrap_or(3);
+                let s = REPLY_STAGES.iter().position(|x| x == stage).unwrap_or(0);
+                // 表の添字は 255 に収まる（長さ 7 / 9）。
+                [REPLY_TAG_FAILED, c as u8, s as u8]
+            }
+        }
+    }
+
+    /// 完全一致のみ受け付ける復号。長さ不一致・未知の tag / code / stage は `Internal`。
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, RootlessError> {
+        let bad = |m: &str| RootlessError::new(ErrorCode::Internal, RootlessStage::Helper, m);
+        let [tag, code, stage] = match <[u8; MAPPER_REPLY_LEN]>::try_from(bytes) {
+            Ok(a) => a,
+            Err(_) => return Err(bad("malformed mapper reply length")),
+        };
+        match tag {
+            REPLY_TAG_OK if code == 0 && stage == 0 => Ok(Self::Ok),
+            REPLY_TAG_FAILED => {
+                let code = REPLY_CODES
+                    .get(usize::from(code))
+                    .copied()
+                    .ok_or_else(|| bad("unknown error code in mapper reply"))?;
+                let stage = REPLY_STAGES
+                    .get(usize::from(stage))
+                    .copied()
+                    .ok_or_else(|| bad("unknown stage in mapper reply"))?;
+                Ok(Self::Failed { code, stage })
+            }
+            _ => Err(bad("unknown tag in mapper reply")),
+        }
+    }
+}
+
+/// mapper の処理本体（fork 子が呼ぶ。成功なら終了コード 0、失敗なら 1）。
+///
+/// 流れ: `sock` から [`MAPPER_GO`] を `timeout` まで待つ → 親の `/proc/<pid>` fd を開いたうえで、親が
+/// 最初の親 `expected_parent` のままであることを `parent_id()` で再確認する（reparent 後に無関係な
+/// pid へ書かない。pid 再利用・TOCTOU 対策）→ [`apply_id_maps_to`] を fd に対して実行 → 応答フレームを返す。
+/// 親が死んでも mapper 側の fd は閉じられず EOF を当てにできないため、待ちは read タイムアウトで
+/// 止める（REPAIR-5）。詳細は stderr へ出す（自由形式の文字列は応答に載せない）。
+pub(crate) fn run_id_map_mapper(
+    expected_parent: u32,
+    mut sock: std::os::unix::net::UnixStream,
+    uid: &IdMapSet,
+    gid: &IdMapSet,
+    writer: &IdMapWriter,
+    timeout: Duration,
+) -> i32 {
+    let outcome = mapper_outcome(expected_parent, &mut sock, uid, gid, writer, timeout);
+    let (reply, code) = match outcome {
+        Ok(()) => (MapperReply::Ok, 0),
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "fandhe-container: id map mapper: {e}");
+            (
+                MapperReply::Failed {
+                    code: e.code,
+                    stage: e.stage,
+                },
+                1,
+            )
+        }
+    };
+    let _ = sock.set_write_timeout(Some(timeout));
+    let _ = sock.write_all(&reply.encode());
+    code
+}
+
+fn mapper_outcome(
+    expected_parent: u32,
+    sock: &mut std::os::unix::net::UnixStream,
+    uid: &IdMapSet,
+    gid: &IdMapSet,
+    writer: &IdMapWriter,
+    timeout: Duration,
+) -> Result<(), RootlessError> {
+    sock.set_read_timeout(Some(timeout))
+        .map_err(|e| io_error(RootlessStage::Validate, "set mapper read timeout", &e))?;
+    let mut go = [0u8; 1];
+    sock.read_exact(&mut go).map_err(|e| {
+        RootlessError::new(
+            ErrorCode::Timeout,
+            RootlessStage::Validate,
+            format!("did not receive the go signal from the parent: {e}"),
+        )
+    })?;
+    if go[0] != MAPPER_GO {
+        return Err(RootlessError::invalid(
+            RootlessStage::Validate,
+            "unexpected go signal byte",
+        ));
+    }
+    // 先に `/proc/<pid>` fd を確保し、その後で親が変わっていないことを確認する。親が生きていれば
+    // （= reparent されていなければ）fd は確実に元の親を指す。以後の書き込みは fd 経由のため、
+    // 確認後に親が死んで pid が再利用されても別プロセスへは届かない（SEC-5・TASK-40.2）。
+    let handle = ProcHandle::open(TargetPid::new(expected_parent)?)?;
+    if std::os::unix::process::parent_id() != expected_parent {
+        return Err(RootlessError::new(
+            ErrorCode::FailedPrecondition,
+            RootlessStage::Validate,
+            "the parent process changed before the mapping was written",
+        ));
+    }
+    apply_id_maps_to(&handle, uid, gid, writer, timeout).map(|_| ())
 }
 
 #[cfg(test)]
@@ -1067,7 +1296,8 @@ mod tests {
         assert!(check_direct_allowed(&range, &single, 1000, 1000).is_err());
         assert!(check_direct_allowed(&single, &single, 1001, 1000).is_err());
         assert!(check_direct_allowed(&range, &range, 0, 0).is_ok());
-        let pid = TargetPid::new(std::process::id()).expect("pid");
+        let pid = ProcHandle::open(TargetPid::new(std::process::id()).expect("pid")).expect("fd");
+        let pid = &pid;
         let e = apply_id_maps_as(
             pid,
             &range,
@@ -1093,5 +1323,139 @@ mod tests {
         )
         .expect_err("timeout range");
         assert_eq!(e.code, ErrorCode::InvalidArgument);
+    }
+
+    /// CORE-6（TASK-40.2）: mapper 応答は全 code・全 stage で往復し、固定 3 バイトになる。
+    #[test]
+    fn core6_mapper_reply_roundtrip() {
+        assert_eq!(MapperReply::Ok.encode(), [0, 0, 0]);
+        assert_eq!(
+            MapperReply::decode(&[0, 0, 0]).expect("ok"),
+            MapperReply::Ok
+        );
+        for code in REPLY_CODES {
+            for stage in REPLY_STAGES {
+                let r = MapperReply::Failed { code, stage };
+                let bytes = r.encode();
+                assert_eq!(bytes.len(), 3);
+                assert_eq!(MapperReply::decode(&bytes).expect("decode"), r);
+            }
+        }
+        assert_eq!(
+            MapperReply::Failed {
+                code: ErrorCode::Timeout,
+                stage: RootlessStage::Helper
+            }
+            .encode(),
+            [1, 4, 7]
+        );
+    }
+
+    /// CORE-6（TASK-40.2）: 未知の tag・code・stage と長さ不一致は `Internal` で拒否する（REPAIR-2）。
+    #[test]
+    fn core6_mapper_reply_rejects_malformed() {
+        let cases: [&[u8]; 9] = [
+            &[],
+            &[0],
+            &[0, 0],
+            &[0, 0, 0, 0],
+            &[2, 0, 0],
+            &[0, 1, 0],
+            &[1, 7, 0],
+            &[1, 0, 9],
+            &[1, 255, 255],
+        ];
+        for bytes in cases {
+            let e = MapperReply::decode(bytes).expect_err("malformed");
+            assert_eq!(e.code, ErrorCode::Internal, "bytes {bytes:?}");
+        }
+    }
+
+    fn mapper_fixture() -> (IdMapSet, IdMapSet) {
+        let s = single_id_mapping(1000).expect("single");
+        (s.clone(), s)
+    }
+
+    /// CORE-6（TASK-40.2）: go 信号が来ないまま timeout になると mapper は書き込まずに
+    /// `Timeout` を返して終了コード 1 になる（親の死・停止でハングしない。REPAIR-5）。
+    #[test]
+    fn core6_mapper_times_out_without_go_signal() {
+        let (parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let (uid, gid) = mapper_fixture();
+        let code = run_id_map_mapper(
+            std::os::unix::process::parent_id(),
+            mapper_end,
+            &uid,
+            &gid,
+            &IdMapWriter::Direct,
+            Duration::from_secs(1),
+        );
+        assert_eq!(code, 1);
+        let mut buf = [0u8; MAPPER_REPLY_LEN];
+        let mut p = parent_end;
+        p.read_exact(&mut buf).expect("reply");
+        assert_eq!(
+            MapperReply::decode(&buf).expect("decode"),
+            MapperReply::Failed {
+                code: ErrorCode::Timeout,
+                stage: RootlessStage::Validate
+            }
+        );
+    }
+
+    /// CORE-6・SEC-5（TASK-40.2）: 親 pid が期待と違えば（reparent 後の pid 再利用を想定）
+    /// 書き込まず `FailedPrecondition` を返す。
+    #[test]
+    fn core6_mapper_refuses_when_parent_changed() {
+        let (mut parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
+        parent_end.write_all(&[MAPPER_GO]).expect("go");
+        let (uid, gid) = mapper_fixture();
+        // 実在するが親ではない pid（自プロセス）を使う。存在しない pid だと `/proc/<pid>` の open が
+        // 先に `NotFound` で失敗し、親不一致の検証まで到達しない。
+        let wrong = std::process::id();
+        let code = run_id_map_mapper(
+            wrong,
+            mapper_end,
+            &uid,
+            &gid,
+            &IdMapWriter::Direct,
+            Duration::from_secs(1),
+        );
+        assert_eq!(code, 1);
+        let mut buf = [0u8; MAPPER_REPLY_LEN];
+        parent_end.read_exact(&mut buf).expect("reply");
+        assert_eq!(
+            MapperReply::decode(&buf).expect("decode"),
+            MapperReply::Failed {
+                code: ErrorCode::FailedPrecondition,
+                stage: RootlessStage::Validate
+            }
+        );
+    }
+
+    /// CORE-6（TASK-40.2）: go 以外のバイトは `InvalidArgument` で拒否する。
+    #[test]
+    fn core6_mapper_rejects_unexpected_go_byte() {
+        let (mut parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
+        parent_end.write_all(&[9]).expect("byte");
+        let (uid, gid) = mapper_fixture();
+        let code = run_id_map_mapper(
+            std::os::unix::process::parent_id(),
+            mapper_end,
+            &uid,
+            &gid,
+            &IdMapWriter::Direct,
+            Duration::from_secs(1),
+        );
+        assert_eq!(code, 1);
+        let mut buf = [0u8; MAPPER_REPLY_LEN];
+        parent_end.read_exact(&mut buf).expect("reply");
+        assert_eq!(
+            MapperReply::decode(&buf).expect("decode"),
+            MapperReply::Failed {
+                code: ErrorCode::InvalidArgument,
+                stage: RootlessStage::Validate
+            }
+        );
     }
 }

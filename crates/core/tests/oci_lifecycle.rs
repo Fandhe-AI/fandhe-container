@@ -1,5 +1,8 @@
 //! OCI Runtime ライフサイクル `create` → `start` の一連フローの結合試験（CORE-2・OCI-4・REPAIR-4・TASK-29.4）。
 //!
+//! 末尾で create / start / kill が 1 つの `OpRecorder` を共有した際の操作別の成功・失敗・所要時間の反映も
+//! 照合する（REPAIR-4・TASK-84.4。delete は TASK-30.2 未実装のため対象外）。
+//!
 //! 公開 API（`create`・`start`・`StateStore`・`ProcessLauncher`・`LaunchedProcess`・`OpRecorder`）だけを
 //! crate の外から呼び、各遷移で観測できる副作用（状態・revision・`LaunchSpec` の全フィールド・観測記録・
 //! ハンドルの引き渡し）を具体値で確かめる。
@@ -19,12 +22,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fandhe_container_core::observability::{OpName, OpRecorder};
-use fandhe_container_core::oci_runtime::{ProcessLauncher, StartTimeouts, create, start};
+use fandhe_container_core::oci_runtime::{
+    KillTimeout, ProcessLauncher, ProcessSignaler, StartTimeouts, create, kill, start,
+};
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ContainerStatus, CreateRequest, CreateStateRequest,
-    DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, ListStateRequest,
-    StartRequest, StateList, StateRecord, StateRevision, StateStore, TraitError,
-    UpdateStateRequest,
+    DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, KillRequest,
+    ListStateRequest, Signal, StartRequest, StateList, StateRecord, StateRevision, StateStore,
+    TraitError, UpdateStateRequest,
 };
 use serde_json::{Value, json};
 
@@ -508,4 +513,159 @@ fn oci4_core2_lifecycle_fails_closed_off_linux() {
     assert_eq!(store.record_of(id).expect("stored").revision().value(), 1);
     assert_eq!(op_stats(&rec, "create"), (1, 0));
     assert_eq!(op_stats(&rec, "start"), (0, 1));
+}
+
+/// 受け取った引数を捨てて常に成功を返す模擬 `ProcessSignaler`（実プロセスへは送信しない）。
+/// 本番実装は supervisor（TASK-157）側で提供される。
+struct NoopSignaler;
+
+impl ProcessSignaler for NoopSignaler {
+    fn signal(
+        &self,
+        _id: &ContainerId,
+        _pid: std::num::NonZeroU32,
+        _signal: Signal,
+        _deadline: std::time::Instant,
+    ) -> Result<(), TraitError> {
+        Ok(())
+    }
+}
+
+/// `export_json_lines` の出力を行単位で取り出す。
+#[cfg(target_os = "linux")]
+fn export_lines(rec: &OpRecorder) -> Vec<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    rec.export_json_lines(Some(&mut buf)).expect("export");
+    String::from_utf8(buf)
+        .expect("utf8")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// REPAIR-4・TASK-84.4: create → start → kill が 1 つの `OpRecorder` を共有し、操作ごとの成功・失敗件数と
+/// 所要時間が `OpStats` に反映され、JSON Lines にも出ること（受け入れ条件の機械照合）。
+///
+/// delete は TASK-30.2 が未実装のため対象外。実装時に同じ `record_op` パターンで操作名 `delete` を記録し、
+/// 本テストへ追加する。p95 等の分布の検証は TASK-84.6（`tests/observability.rs`）の範囲。
+#[cfg(target_os = "linux")]
+#[test]
+fn repair4_task84_4_lifecycle_ops_share_one_recorder() {
+    let b = Bundle::ready("shared-rec", &lifecycle_config("shared"));
+    let store = MemStateStore::new();
+    let rec = OpRecorder::new();
+    let launcher = RecordingLauncher::new();
+    let dynl: Arc<dyn ProcessLauncher> = launcher.clone();
+    let signaler: Arc<dyn ProcessSignaler> = Arc::new(NoopSignaler);
+    let id = "lc-shared";
+
+    // 成功: create → start → kill。
+    create(&store, &rec, &b.create_request(id)).expect("create");
+    let started = start(
+        &store,
+        &rec,
+        &dynl,
+        &start_req(id),
+        &StartTimeouts::default(),
+    )
+    .expect("start");
+    kill(
+        &store,
+        &rec,
+        &signaler,
+        &KillRequest::new(ContainerId::new(id).expect("id"), Signal::SIGTERM),
+        &KillTimeout::default(),
+    )
+    .expect("kill");
+
+    // 失敗: 重複 create・Running への再 start・未 create ID への kill。
+    let err = create(&store, &rec, &b.create_request(id)).expect_err("duplicate create");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    let err = start(
+        &store,
+        &rec,
+        &dynl,
+        &start_req(id),
+        &StartTimeouts::default(),
+    )
+    .expect_err("second start");
+    assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    let err = kill(
+        &store,
+        &rec,
+        &signaler,
+        &KillRequest::new(ContainerId::new("lc-missing").expect("id"), Signal::SIGTERM),
+        &KillTimeout::default(),
+    )
+    .expect_err("kill missing");
+    assert_eq!(err.code(), ErrorCode::NotFound);
+
+    // 操作名は名前昇順でちょうど 3 件。各操作は成功 1・失敗 1・所要時間あり。
+    let snap = rec.snapshot();
+    let names: Vec<&str> = snap.iter().map(|s| s.name().as_str()).collect();
+    assert_eq!(names, ["create", "kill", "start"]);
+    for s in &snap {
+        assert_eq!(s.success(), 1, "{}", s.name().as_str());
+        assert_eq!(s.failure(), 1, "{}", s.name().as_str());
+        assert_eq!(s.total(), 2, "{}", s.name().as_str());
+        assert!(s.latency().is_some(), "{}", s.name().as_str());
+    }
+
+    // JSON Lines: op 行 3 件 + メタ行（レイテンシ値は非決定のため値照合しない）。
+    let lines = export_lines(&rec);
+    assert_eq!(lines.len(), 4);
+    for (line, op) in lines.iter().zip(["create", "kill", "start"]) {
+        assert!(line.contains(&format!("\"op\":\"{op}\"")), "{line}");
+        assert!(
+            line.contains("\"success\":1,\"failure\":1,\"count\":2"),
+            "{line}"
+        );
+    }
+    assert_eq!(
+        lines[3],
+        "{\"event\":\"op_stats_meta\",\"ops\":3,\"dropped_records\":0}"
+    );
+
+    let (_, process) = started.into_parts();
+    process
+        .terminate(Duration::from_secs(1))
+        .expect("terminate");
+}
+
+/// REPAIR-4・TASK-84.4: Linux 以外でも create 成功・start（`Unimplemented`）・kill（pid なしの Created で
+/// `FailedPrecondition`）の結果が 1 つの `OpRecorder` に操作別で反映される。
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn repair4_task84_4_lifecycle_ops_share_one_recorder_off_linux() {
+    let b = Bundle::ready("shared-rec-nolinux", &lifecycle_config("shared"));
+    let store = MemStateStore::new();
+    let rec = OpRecorder::new();
+    let launcher = RecordingLauncher::new();
+    let dynl: Arc<dyn ProcessLauncher> = launcher.clone();
+    let signaler: Arc<dyn ProcessSignaler> = Arc::new(NoopSignaler);
+    let id = "lc-shared-nolinux";
+
+    create(&store, &rec, &b.create_request(id)).expect("create");
+    let err = start(
+        &store,
+        &rec,
+        &dynl,
+        &start_req(id),
+        &StartTimeouts::default(),
+    )
+    .expect_err("start off linux");
+    assert_eq!(err.code(), ErrorCode::Unimplemented);
+    let err = kill(
+        &store,
+        &rec,
+        &signaler,
+        &KillRequest::new(ContainerId::new(id).expect("id"), Signal::SIGTERM),
+        &KillTimeout::default(),
+    )
+    .expect_err("kill created without pid");
+    assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+
+    assert_eq!(op_stats(&rec, "create"), (1, 0));
+    assert_eq!(op_stats(&rec, "start"), (0, 1));
+    assert_eq!(op_stats(&rec, "kill"), (0, 1));
 }

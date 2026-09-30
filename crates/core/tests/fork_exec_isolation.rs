@@ -14,7 +14,7 @@
 //! - ディスパッチャ: 分離前に、手組みの静的 ELF プローブ（終了コード 42）をホスト上で直接実行して
 //!   バイト列の正しさを自己検証する（バイト列の誤りをランタイムの不具合と取り違えないため）→
 //!   シナリオごとに一時 rootfs を作り、タイムアウト付きで終了コード 0 を待つ（REPAIR-5）
-//! - 制限（capability 削減・no_new_privs・seccomp）が未適用の間は root（rootful）・非 root（rootless）とも
+//! - 制限（Landlock。capability 削減・no_new_privs・seccomp は組み込み済み）が未適用の間は root（rootful）・非 root（rootless）とも
 //!   exec は拒否されるため、全シナリオが `Exited(126)`・stderr に `PERMISSION_DENIED`（SEC-1・CORE-5）。
 //!   ステージ列（#832・#833）が適用されたら、下の想定を各シナリオ本来の値へ戻す
 //! - シナリオ `ok`: プローブへ exec し `Exited(42)`
@@ -355,7 +355,7 @@ mod linux {
             "stages-order" | "stage-fail" => format!("/{PROBE}"),
             other => panic!("unknown scenario {other}"),
         };
-        // SEC-1・CORE-5: capability 削減・no_new_privs・seccomp が未適用の間は、root / 非 root を問わず
+        // SEC-1・CORE-5: Landlock が未適用の間は、root / 非 root を問わず
         // exec が拒否される（終了コード 126・PERMISSION_DENIED）。適用後は "ok" が Exited(PROBE_EXIT)、
         // "missing" が Exited(127) に戻る。
         let mut want = ChildExit::Exited(126);
@@ -363,8 +363,8 @@ mod linux {
         let child = match name {
             "stages-order" => {
                 // 逆順に登録しても固定順（cgroup_join → [組み込みの capability_drop・no_new_privs]
-                // → landlock）で実行される。capability 削減と NO_NEW_PRIVS は組み込みのため登録しない
-                // （登録すると InvalidArgument。#173・#833）。
+                // → landlock → [組み込みの seccomp]）で実行される。capability 削減・NO_NEW_PRIVS・seccomp は組み込みのため
+                // 登録しない（登録すると InvalidArgument。#173・#833・#178）。
                 let stages = StagePipeline::new()
                     .with_hook(StageKind::Landlock, logging_hook(StageKind::Landlock))
                     .and_then(|p| {
@@ -375,11 +375,10 @@ mod linux {
             }
             "stage-fail" => {
                 // Landlock のフックが失敗する（組み込みの capability 削減・no_new_privs は成功済み）。
-                // 後続の seccomp と exec は実行されない。
+                // 後続の組み込み seccomp と exec は実行されない。
                 let stages = StagePipeline::new()
                     .with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
                     .and_then(|p| p.with_hook(StageKind::Landlock, failing_hook))
-                    .and_then(|p| p.with_hook(StageKind::Seccomp, logging_hook(StageKind::Seccomp)))
                     .unwrap_or_else(|e| panic!("register hooks: {e}"));
                 want = ChildExit::Exited(125);
                 spawn_container_with_stages(rootfs, &entry, stages)

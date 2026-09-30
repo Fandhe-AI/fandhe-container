@@ -504,11 +504,13 @@ impl OpRecorder {
 
     /// クロージャを実行して所要時間を記録する。`Ok` は成功、`Err` は失敗として数え、
     /// 戻り値はそのまま返す。クロージャはロック外で実行される。
+    ///
+    /// クロージャが panic して巻き戻った場合も、実行前に作った [`OpGuard`] が Drop で
+    /// 失敗とレイテンシを記録する（REPAIR-4。失敗件数から漏れない）。
     pub fn record_op<T, E>(&self, name: &OpName, f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
-        let started = Instant::now();
+        let guard = self.start(name.clone());
         let result = f();
-        // 計測の失敗で本来の操作の結果を変えない。落とした件数は dropped_records に残る。
-        let _ = self.record(name, OpOutcome::from_result(&result), started.elapsed());
+        guard.finish_with(&result);
         result
     }
 
@@ -817,6 +819,19 @@ mod tests {
         assert_eq!(r.record_op(&n, || Err::<u8, &str>("x")), Err("x"));
         let s = r.snapshot_op(&n).unwrap();
         assert_eq!((s.success(), s.failure()), (2, 2));
+    }
+
+    #[test]
+    fn repair4_record_op_records_failure_on_panic() {
+        let r = OpRecorder::new();
+        let n = nm("panic_op");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = r.record_op(&n, || -> Result<(), ()> { panic!("boom") });
+        }));
+        assert!(caught.is_err());
+        let s = r.snapshot_op(&n).unwrap();
+        assert_eq!((s.success(), s.failure()), (0, 1));
+        assert!(s.latency().is_some());
     }
 
     #[test]

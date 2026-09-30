@@ -37,7 +37,8 @@
 //! # 入力上限（DoS 防止）
 //!
 //! 読み込み前にバイト長を [`CONFIG_MAX_BYTES`] で制限し、デシリアライズ中は配列の件数と文字列の
-//! 長さを上限超過の時点で中断する（上限を超える件数分のアロケーションをしない）。ネスト深さは
+//! 長さを上限超過の時点で中断する（上限を超えた要素は型として組み立てず、件数分のアロケーションを
+//! しない。エスケープ展開用の serde_json の作業バッファは入力全体の上限で抑える）。ネスト深さは
 //! serde_json 既定の再帰上限（128）に任せる。
 //!
 //! # エラーの秘密情報非漏洩
@@ -328,7 +329,8 @@ limits! {
     GidMappingsLimit => ("linux.gidMappings", CONFIG_MAX_ID_MAPPINGS),
 }
 
-/// 件数上限付きの配列。`L::MAX` 件を超える要素を読んだ時点で中断する。
+/// 件数上限付きの配列。`L::MAX` 件を読んだ後に次の要素があれば、その要素を型 `T` として
+/// デシリアライズ（確保）せずに中断する。
 struct Bounded<T, L>(Vec<T>, PhantomData<L>);
 
 impl<'de, T: Deserialize<'de>, L: Limit> Deserialize<'de> for Bounded<T, L> {
@@ -345,13 +347,21 @@ impl<'de, T: Deserialize<'de>, L: Limit> Deserialize<'de> for Bounded<T, L> {
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 // size_hint は使わない（入力由来の値で事前確保しない）。
                 let mut items = Vec::new();
-                while let Some(item) = seq.next_element::<T>()? {
+                loop {
                     if items.len() >= L::MAX {
-                        return Err(limit_error::<L, A::Error>());
+                        // 上限に達したら次の要素は `IgnoredAny` で読み飛ばし（値を確保しない）、
+                        // 有無だけで判定する。上限超過の要素を `T` として組み立てないため、その
+                        // 要素が巨大な文字列・object でも確保は発生しない。
+                        return match seq.next_element::<de::IgnoredAny>()? {
+                            Some(_) => Err(limit_error::<L, A::Error>()),
+                            None => Ok(Bounded(items, PhantomData)),
+                        };
                     }
-                    items.push(item);
+                    match seq.next_element::<T>()? {
+                        Some(item) => items.push(item),
+                        None => return Ok(Bounded(items, PhantomData)),
+                    }
                 }
-                Ok(Bounded(items, PhantomData))
             }
         }
 
@@ -359,7 +369,11 @@ impl<'de, T: Deserialize<'de>, L: Limit> Deserialize<'de> for Bounded<T, L> {
     }
 }
 
-/// バイト長上限付きの文字列。上限を超える文字列はコピー（確保）せずに拒否する。
+/// バイト長上限付きの文字列。上限を超える文字列は `String` へコピー（確保）せずに拒否する。
+///
+/// エスケープを含まない文字列は入力バッファから借用して長さを判定する。エスケープを含む文字列は
+/// serde_json が内部の作業バッファへ展開してから渡すため、その一時確保は判定より前に起きるが、
+/// 大きさは入力全体の上限（[`CONFIG_MAX_BYTES`]）で抑えられ、作業バッファは再利用される。
 struct BoundedStr<L>(String, PhantomData<L>);
 
 impl<'de, L: Limit> Deserialize<'de> for BoundedStr<L> {

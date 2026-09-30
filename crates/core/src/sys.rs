@@ -15,7 +15,7 @@
 //! `kill(2)` は `crate::oci_runtime::kill`（CORE-2・OCI-6・TASK-30.1）が `ContainerChild::send_signal`
 //! 経由で任意番号（1..=64 検証済み）を送る経路でも使う。
 //! さらに固定ステージ `crate::exec::no_new_privs`（CORE-1・TASK-27.4.3・#833）が `prctl(2)` を呼ぶ。
-//! さらに `crate::exec::apply_default_capabilities`（SEC-1・TASK-37.1・#172）が `capget(2)`・`capset(2)`
+//! さらに `exec/capabilities.rs` の `apply_default_capabilities`（SEC-1・TASK-37.1・#172）が `capget(2)`・`capset(2)`
 //! （`syscall(2)` 経由）と `prctl(2)` の capability 系オプションを呼ぶ（スレッド単位の操作で、
 //! `fork_single_threaded` による単一スレッドの子で呼ぶ前提）。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。std だけでは提供されない
@@ -1097,7 +1097,7 @@ pub(crate) struct ThreadCaps {
 
 /// 呼び出したスレッドの effective / permitted / inheritable を読む（pid 0 の `capget(2)`）。
 ///
-/// `crate::exec::apply_default_capabilities`（TASK-37.1・#172）が適用前の値の取得と適用後の
+/// `exec/capabilities.rs` の `apply_default_capabilities`（TASK-37.1・#172）が適用前の値の取得と適用後の
 /// 読み戻し検証に使う。カーネルが v3 以外のバージョンを返したら `EINVAL` として fail-closed にする。
 pub(crate) fn cap_get_thread() -> Result<ThreadCaps, SysError> {
     if !consts::SUPPORTED {
@@ -1133,7 +1133,7 @@ pub(crate) fn cap_get_thread() -> Result<ThreadCaps, SysError> {
 /// 呼び出したスレッドの effective / permitted / inheritable を設定する（pid 0 の `capset(2)`）。
 ///
 /// スレッド単位の操作。`fork_single_threaded` による単一スレッドの子で呼ぶ前提
-/// （`crate::exec::apply_default_capabilities` が使う。TASK-37.1・#172）。
+/// （`exec/capabilities.rs` の `apply_default_capabilities` が使う。TASK-37.1・#172）。
 pub(crate) fn cap_set_thread(caps: ThreadCaps) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);

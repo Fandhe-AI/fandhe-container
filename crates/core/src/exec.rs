@@ -18,10 +18,11 @@
 //!    [`prepare_rootfs`] の後・[`pivot_root`] の前に呼ぶ。rootless では `mknod` が `EPERM` になり
 //!    `PermissionDenied` で fail-closed する。ホスト `/dev` の bind mount による代替は未実装）
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
-//!    → Landlock → seccomp（#136・#832・#833。**枠と `NO_NEW_PRIVS` は実装済み**: [`StagePipeline`] が
+//!    → Landlock → seccomp（#136・#832・#833。**枠・`NO_NEW_PRIVS`・capability 削減は実装済み**: [`StagePipeline`] が
 //!    [`StageKind::ORDER`] の固定順でフックを呼び、`NO_NEW_PRIVS` は差し替え不可の組み込み段として
-//!    常に適用する。capability の絞り込み処理は `apply_default_capabilities`（crate 内限定。SEC-1・TASK-37.1・#172）
-//!    として実装済みだが、ステージ列へはまだ組み込んでいない（#173）。制限の証跡も未実装のため exec は
+//!    常に適用する。capability の絞り込み処理 `apply_default_capabilities`（crate 内限定。SEC-1・TASK-37.1・#172）
+//!    も #173（TASK-37.2）で同じく差し替え不可の組み込み段になった。seccomp・Landlock・cgroup 参加と
+//!    最終的な制限の証跡は未実装のため exec は
 //!    引き続き拒否される。他の段の実体は未実装で、後続の TASK-32・37・38・39・40 が [`StageHook`] として
 //!    差し込む）。
 //!    `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
@@ -87,9 +88,6 @@ mod stages;
 mod violation;
 
 pub use capabilities::CapabilityReport;
-// SEC-1: 公開せず crate 内限定にする（単一スレッドの fork 子でしか呼べない経路に閉じる。#172）。
-#[allow(unused_imports)]
-pub(crate) use capabilities::apply_default_capabilities;
 pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_default_devices};
 pub use process::{
     ChildExit, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,

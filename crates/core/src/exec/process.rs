@@ -24,11 +24,13 @@
 //!   そのため制限が未適用の子（rootful 経路のホスト root 権限のままの子を含む）は、
 //!   `exec_entrypoint` が `PermissionDenied` で exec を拒否する（SEC-1・CORE-5。制限を適用できる
 //!   ようになるまで fail-closed。REPAIR-3: 実装済みを装わない）
-//! - **rootless 経路も同様に拒否する**: exec の直前に `/proc/self/status` で `NoNewPrivs: 1`・
-//!   `Seccomp: 2`・既定拒否 capability の不在を確認し、満たさなければ `PermissionDenied`
-//!   （SEC-1・CORE-5）。ステージ列が制限を適用すれば変更なしで通る。Landlock は観測手段がなく未検証
-//!   （#833 で証跡を追加する）。したがって本 PR 時点では実 exec は成功せず、成功経路は dry-run の
-//!   単体テストで検証する
+//! - **rootless 経路も同様に拒否する**: 制限ステージの適用証跡が無い限り exec しない。
+//!   `/proc/self/status` の `NoNewPrivs`・`Seccomp`・`CapEff` は親から継承した制限と区別できず、
+//!   seccomp の内容も確認できないため証跡にしない。ステージ列（#832・#833）が証跡型を返すように
+//!   なるまで常に `PermissionDenied`（SEC-1・CORE-5）。したがって本 PR 時点では実 exec は成功せず、
+//!   成功経路は dry-run の単体テストで検証する
+//! - **継承 fd は開く前に閉じる**: エントリポイントを開く前に fd 3 以上をすべて閉じ、fd 0〜2 と同一の
+//!   実体（rootfs 内の `/proc/self/fd/N` 経由）は拒否する。継承したホスト fd の実体を開く経路を断つ
 //! - **標準入出力は `/dev/null` へ置換する**: 呼び出し元の fd 0〜2 の実体は渡さない。`/dev/null` が
 //!   無い rootfs は拒否する。端末・パイプの受け渡しは TASK-29/30 の範囲
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
@@ -239,58 +241,19 @@ fn exit_code_for(err: &ExecError) -> i32 {
     }
 }
 
-/// SEC-1 が既定拒否する capability のビット位置（`CAP_SYS_MODULE`=16・`CAP_SYS_PTRACE`=19・
-/// `CAP_SYS_ADMIN`=21）。
-const DENIED_CAPS: [(u32, &str); 3] = [
-    (16, "CAP_SYS_MODULE"),
-    (19, "CAP_SYS_PTRACE"),
-    (21, "CAP_SYS_ADMIN"),
-];
-
-/// `/proc/self/status` の内容から、exec を許してよい制限（SEC-1・CORE-5）が適用済みかを判定する純関数。
+/// 制限ステージの適用証跡が無いままの exec を拒否する（SEC-1・CORE-5。fail-closed）。
 ///
-/// 未適用・判定不能なら理由（英語 1 行）を返す（fail-closed）。要件は `NoNewPrivs: 1`・`Seccomp: 2`
-/// （filter モード）・実効 capability に既定拒否の capability が無いこと。Landlock は status に現れず
-/// 観測できないため、ここでは検証できない（適用の証跡は #833 の Landlock ステージが追加する。
-/// REPAIR-3: 検証済みを装わない）。
-fn unrestricted_reason(status: &str) -> Option<String> {
-    let field = |name: &str| {
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix(name))
-            .map(str::trim)
-    };
-    if field("NoNewPrivs:") != Some("1") {
-        return Some("no_new_privs is not set".to_string());
-    }
-    if field("Seccomp:") != Some("2") {
-        return Some("no seccomp filter is installed".to_string());
-    }
-    let Some(cap_eff) = field("CapEff:").and_then(|v| u64::from_str_radix(v, 16).ok()) else {
-        return Some("cannot determine the effective capabilities".to_string());
-    };
-    DENIED_CAPS
-        .iter()
-        .find(|(bit, _)| cap_eff & (1u64 << bit) != 0)
-        .map(|(_, name)| format!("{name} is still in the effective capability set"))
-}
-
-/// 制限が未適用のままの exec を拒否する（SEC-1・CORE-5。fail-closed）。
-///
-/// rootful（ホスト root）か rootless かを問わず、capability 削減・`PR_SET_NO_NEW_PRIVS`・seccomp が
-/// 実際に適用されたことを `/proc/self/status` で確認できなければ拒否する。#832・#833 のステージが
-/// pivot 後・exec 前に制限を適用すれば、本関数は変更なしで通るようになる。`status` を読めない
-/// 場合も判定できないため拒否する。
-fn deny_unrestricted_exec() -> Result<(), ExecError> {
-    let deny = |msg: &str| ExecError::new(ErrorCode::PermissionDenied, IsolationStage::Exec, msg);
-    let status = std::fs::read_to_string("/proc/self/status")
-        .map_err(|_| deny("cannot read /proc/self/status to verify the applied restrictions"))?;
-    match unrestricted_reason(&status) {
-        Some(reason) => Err(deny(&format!(
-            "refusing to exec without isolation restrictions: {reason} (capability drop, no_new_privs, seccomp and Landlock are not applied yet)"
-        ))),
-        None => Ok(()),
-    }
+/// `/proc/self/status` の `NoNewPrivs`・`Seccomp`・`CapEff` は、親から継承した制限と子のステージが
+/// 適用した制限を区別できず、seccomp フィルタの中身も確認できないため、証跡として扱わない。
+/// capability 削減・`PR_SET_NO_NEW_PRIVS`・seccomp・Landlock のステージ（#832・#833）が未実装の間は
+/// 常に `PermissionDenied` を返す。ステージ実装時は、各ステージが適用完了を示す証跡型を返し、
+/// それを本関数の引数に取って初めて許可する形へ置き換える（REPAIR-3: 実装済みを装わない）。
+fn require_restriction_evidence() -> Result<(), ExecError> {
+    Err(ExecError::new(
+        ErrorCode::PermissionDenied,
+        IsolationStage::Exec,
+        "refusing to exec: no evidence that the isolation restrictions were applied (capability drop, no_new_privs, seccomp and Landlock stages are not implemented yet)",
+    ))
 }
 
 /// pivot 済みの PID 1 から、エントリポイントへ `execve` する（成功時は戻らないため戻り値の
@@ -305,7 +268,7 @@ pub fn exec_entrypoint(
     entry: &Entrypoint,
 ) -> Result<Infallible, ExecError> {
     isolation.verify_caller(IsolationStage::Exec)?;
-    deny_unrestricted_exec()?;
+    require_restriction_evidence()?;
     exec_entrypoint_verified(pivot.new_root_mnt_id, entry)
 }
 
@@ -313,11 +276,12 @@ pub fn exec_entrypoint(
 /// dry-run（単体テストは証跡を偽造せずに直接呼ぶ）。手順（順序固定）:
 ///
 /// 1. `/` のマウント ID が pivot 直後の新 root と一致する（pivot 後に root が入れ替わっていない）
-/// 2. エントリポイントを新 root 内で `open` し、その fd を `fstat` する（不在なら `NotFound`）。`/proc/self/exe`
+/// 2. fd 3 以上をすべて閉じ（継承 fd の実体を `/proc/self/fd/N` 経由で開かれない）、エントリポイントを新 root 内で `open` し、その fd を `fstat` する（不在なら `NotFound`）。`/proc/self/exe`
 ///    （ランタイム自身のホスト側バイナリ）と `(st_dev, st_ino)` が同じなら拒否する
 ///    （CVE-2019-5736 型の多層防御。検査した fd をそのまま `execveat(AT_EMPTY_PATH)` で実行し、
 ///    検査から実行までの間のパス差し替え〔TOCTOU〕を防ぐ。memfd による自己複製は後続の課題）
-/// 3. fd 3 以上を `CLOEXEC` にする（CVE-2024-21626 型の fd 漏えい対策。カーネル 5.11 未満は
+/// 3. 開いたエントリポイントが fd 0〜2 と同一 inode なら拒否する（`/proc/self/fd/{0,1,2}` 経由の参照対策）。
+///    fd 3 以上を `CLOEXEC` にする（CVE-2024-21626 型の fd 漏えい対策。カーネル 5.11 未満は
 ///    `ENOSYS`/`EINVAL` で fail-closed）
 /// 4. `SIGPIPE` を `SIG_DFL` へ戻す（Rust ランタイムが設定した ignore は `execve` を越えて継承される）
 /// 5. fd 0〜2 を新 root の `/dev/null`（1:3 を検証）へ置換する（継承されたホスト側の標準入出力を渡さない）
@@ -338,9 +302,21 @@ fn exec_entrypoint_verified(
     }
     drop::<OwnedFd>(root);
 
+    // 継承したホスト側の fd 3 以上を開く前に閉じる（rootfs 内の /proc/self/fd/N 経由で実体を開かれない）。
+    close_inherited_fds()?;
     // 検査と実行を同じ fd に固定する（パスを再解決する execve では、検査後に差し替えられうる）。
     let file = open_entrypoint(entry)?;
     let meta = file.metadata().map_err(|e| io_exec_error(&e, entry))?;
+    if is_inherited_stdio(&meta) {
+        return Err(ExecError::new(
+            ErrorCode::PermissionDenied,
+            STAGE,
+            format!(
+                "the entrypoint {:?} resolves to an inherited standard stream",
+                entry.path()
+            ),
+        ));
+    }
     if !meta.is_file() {
         return Err(ExecError::new(
             ErrorCode::PermissionDenied,
@@ -375,6 +351,48 @@ fn exec_entrypoint_verified(
         STAGE,
         format!("execve({:?}) failed: {}", entry.path(), describe(err)),
     ))
+}
+
+/// fd 3 以上をすべて閉じる。本番ビルドの実装。
+#[cfg(not(test))]
+fn close_inherited_fds() -> Result<(), ExecError> {
+    sys::close_fds_from(3).map_err(|e| {
+        let mut err = ExecError::from_sys(e, IsolationStage::Exec, "close_range(close)");
+        // Linux 5.11 未満は close_range が無い（ENOSYS）。継承 fd を残したまま進めない（fail-closed）。
+        if e == SysError::Os(sys::ENOSYS) {
+            err.code = ErrorCode::FailedPrecondition;
+        }
+        err
+    })
+}
+
+/// テストビルドの dry-run 差し込み点。呼ばれたことだけを記録する。
+#[cfg(test)]
+fn close_inherited_fds() -> Result<(), ExecError> {
+    tests::record("close_range(3,close)".to_string());
+    Ok(())
+}
+
+/// 開いたエントリポイントが fd 0〜2 の実体（継承した標準入出力）と同一の inode か。
+/// `/proc/self/fd/{0,1,2}` 経由でホスト側の実体を開いた場合を検出する（fd 3 以上は閉じ済み）。
+fn is_inherited_stdio(meta: &std::fs::Metadata) -> bool {
+    let fds = [
+        std::io::stdin().as_fd().try_clone_to_owned(),
+        std::io::stdout().as_fd().try_clone_to_owned(),
+        std::io::stderr().as_fd().try_clone_to_owned(),
+    ];
+    let ids: Vec<(u64, u64)> = fds
+        .into_iter()
+        .flatten()
+        .filter_map(|fd| std::fs::File::from(fd).metadata().ok())
+        .map(|m| (m.dev(), m.ino()))
+        .collect();
+    matches_any_identity((meta.dev(), meta.ino()), &ids)
+}
+
+/// `(st_dev, st_ino)` が `ids` のいずれかと一致するか（純関数）。
+fn matches_any_identity(id: (u64, u64), ids: &[(u64, u64)]) -> bool {
+    ids.contains(&id)
 }
 
 /// fd 3 以上を `CLOEXEC` にする。本番ビルドの実装。
@@ -774,44 +792,21 @@ mod tests {
         );
     }
 
-    /// SEC-1・CORE-5: 制限（no_new_privs・seccomp filter・既定拒否 capability の不在）が揃った
-    /// status だけを許可し、rootless の user namespace 内 root を含め、欠けや判定不能は拒否する。
+    /// SEC-1・CORE-5: 制限ステージの証跡が無い間は、継承された制限の有無にかかわらず exec を拒否する。
     #[test]
-    fn sec1_unrestricted_reason_is_exact() {
-        let ok = "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\t0000000000000000\n";
-        assert_eq!(unrestricted_reason(ok), None);
-        // OCI 既定相当の capability（CAP_CHOWN=0 等）は許可する。
-        let oci = "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\t00000000a80425fb\n";
-        assert_eq!(unrestricted_reason(oci), None);
-        let full = "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\t000001ffffffffff\n";
-        assert_eq!(
-            unrestricted_reason(full).as_deref(),
-            Some("CAP_SYS_MODULE is still in the effective capability set")
-        );
-        let admin = "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\t0000000000200000\n";
-        assert_eq!(
-            unrestricted_reason(admin).as_deref(),
-            Some("CAP_SYS_ADMIN is still in the effective capability set")
-        );
-        let no_nnp = "NoNewPrivs:\t0\nSeccomp:\t2\nCapEff:\t0\n";
-        assert_eq!(
-            unrestricted_reason(no_nnp).as_deref(),
-            Some("no_new_privs is not set")
-        );
-        let no_seccomp = "NoNewPrivs:\t1\nSeccomp:\t0\nCapEff:\t0\n";
-        assert_eq!(
-            unrestricted_reason(no_seccomp).as_deref(),
-            Some("no seccomp filter is installed")
-        );
-        let bad_cap = "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\tzz\n";
-        assert_eq!(
-            unrestricted_reason(bad_cap).as_deref(),
-            Some("cannot determine the effective capabilities")
-        );
-        assert_eq!(
-            unrestricted_reason("").as_deref(),
-            Some("no_new_privs is not set")
-        );
+    fn sec1_exec_is_denied_without_restriction_evidence() {
+        let err = require_restriction_evidence().unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(err.stage, IsolationStage::Exec);
+        assert_eq!(exit_code_for(&err), EXIT_EXEC_NOT_EXECUTABLE);
+    }
+
+    /// CORE-1・SEC-1: 継承した標準入出力と同一 inode の判定は `(dev, ino)` の完全一致だけを真にする。
+    #[test]
+    fn core1_matches_any_identity_is_exact() {
+        assert!(matches_any_identity((1, 2), &[(3, 4), (1, 2)]));
+        assert!(!matches_any_identity((1, 2), &[(1, 3), (2, 2)]));
+        assert!(!matches_any_identity((1, 2), &[]));
     }
 
     /// CORE-1（TASK-27.4.1）: dry-run で exec 前の処理が固定順に呼ばれ、`execve` に argv・env が
@@ -832,6 +827,7 @@ mod tests {
         assert_eq!(
             calls,
             vec![
+                "close_range(3,close)".to_string(),
                 "close_range(3)".to_string(),
                 "signal(SIGPIPE,SIG_DFL)".to_string(),
                 "stdio->/dev/null".to_string(),
@@ -867,7 +863,11 @@ mod tests {
             let v = err.violation.expect("violation record");
             assert_eq!(v.reason, ViolationReason::EntrypointIsRuntimeBinary);
             assert_eq!(v.behavior_id, "CORE-1");
-            assert_eq!(take_calls(), Vec::<String>::new(), "{path:?}");
+            assert_eq!(
+                take_calls(),
+                vec!["close_range(3,close)".to_string()],
+                "{path:?}"
+            );
         }
     }
 
@@ -880,7 +880,7 @@ mod tests {
         assert_eq!(err.code, ErrorCode::NotFound);
         assert_eq!(err.stage, IsolationStage::Exec);
         assert_eq!(exit_code_for(&err), EXIT_EXEC_NOT_FOUND);
-        assert_eq!(take_calls(), Vec::<String>::new());
+        assert_eq!(take_calls(), vec!["close_range(3,close)".to_string()]);
     }
 
     /// `sh -c script` を起動してその pid を返す。std の `Child` は wait せず、回収は被試験対象の

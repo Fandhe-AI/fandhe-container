@@ -710,6 +710,29 @@ pub(crate) fn mark_fds_cloexec_from(first: u32) -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// fd `first` 以上のすべてを閉じる（`close_range(first, ~0, 0)`。Linux 5.11 以降）。
+/// 呼び出し元から継承したホスト側の fd を、エントリポイントを開く前に断つ。コンテナの rootfs 内の
+/// `/proc/self/fd/N` 経由で継承 fd の実体を開かれる経路を塞ぐ（CVE-2024-21626 型）。
+/// 未対応カーネルは `ENOSYS`/`EINVAL` を返す（呼び出し側が fail-closed にする）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn close_fds_from(first: u32) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを取らない（`syscall(2)` 経由。unsigned int 引数は register
+    // 幅に拡張して渡され、カーネルは下位 32 bit を読む）。閉じる対象は `first` 以上の fd だけで、
+    // 呼び出し側（exec 直前の子）はそれらの fd をこの後使わない前提。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_CLOSE_RANGE,
+            i64::from(first),
+            i64::from(u32::MAX),
+            0i64,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// [`open_path_nofollow`] が渡す `openat(2)` のフラグ（`O_PATH|O_NOFOLLOW|O_CLOEXEC`）。
 /// `O_DIRECTORY` を付けないため、最終要素が symlink でもそれ自体を指す fd が得られる
 /// （辿らない）。返る fd は fstat と `/proc/thread-self/fd/N` の magic link 専用。

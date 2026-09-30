@@ -3,9 +3,10 @@
 //! 現状は namespace 分離（[`isolate`]・[`mount_proc`]。#134・TASK-27.2）と、`pivot_root` による
 //! rootfs 切替（[`prepare_rootfs`]・[`pivot_root`]。#135・TASK-27.3）、基本デバイスノード作成
 //! （[`create_default_devices`]。#834・TASK-27.6）、fork / exec による子プロセス
-//! 起動（[`spawn_container`]・[`exec_entrypoint`]。#831・TASK-27.4.1。最小構成でフック無し）まで実装済み。
-//! ステージ列・`PR_SET_NO_NEW_PRIVS` 等の後続段は未実装で、後続の sub-issue
-//! （#136・#137・#832・#833）が本モジュールへ追記する（REPAIR-3: 実装済みを装わない）。
+//! 起動（[`spawn_container`]・[`exec_entrypoint`]。#831・TASK-27.4.1）と、順序固定のステージ列の枠
+//! （[`StagePipeline`]。#832・TASK-27.4.2。`exec/stages.rs`）まで実装済み。各段の実体
+//! （`PR_SET_NO_NEW_PRIVS`〔#833〕・cgroup 参加・capability 削減・Landlock・seccomp）と制限適用の
+//! 証跡は未実装で、後続の sub-issue（#137・#833、TASK-32・37〜40）が追記する（REPAIR-3: 実装済みを装わない）。
 //!
 //! # 目指すフロー（Linux 専用）
 //!
@@ -16,7 +17,9 @@
 //!    [`prepare_rootfs`] の後・[`pivot_root`] の前に呼ぶ。rootless では `mknod` が `EPERM` になり
 //!    `PermissionDenied` で fail-closed する。ホスト `/dev` の bind mount による代替は未実装）
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
-//!    → Landlock → seccomp（#136・#832・#833。後続の TASK-32・37・38・39・40 が差し込む）。
+//!    → Landlock → seccomp（#136・#832・#833。**枠は実装済み**: [`StagePipeline`] が
+//!    [`StageKind::ORDER`] の固定順でフックを呼ぶ。各段の実体は未実装で、後続の TASK-32・37・38・39・40
+//!    と #833 が [`StageHook`] として差し込む）。
 //!    `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
 //!    後続実装はこの順序を崩さない
 //! 5. `fork` / `exec`（#831・TASK-27.4.1。**最小構成のみ実装済み**。[`spawn_container`] が分離済みの
@@ -74,6 +77,7 @@ use crate::traits::types::ErrorCode;
 mod devices;
 mod process;
 mod rootfs;
+mod stages;
 mod violation;
 
 pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_default_devices};
@@ -81,8 +85,10 @@ pub use process::{
     ChildExit, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,
     EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, exec_entrypoint, spawn_container,
+    spawn_container_with_stages,
 };
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
+pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 
 pub use violation::{
     IsolationViolation, VIOLATION_SUBJECT_MAX_CHARS, ViolationKind, ViolationReason,
@@ -296,6 +302,16 @@ pub enum IsolationStage {
     Wait,
     /// rootfs 配下の `dev` への基本デバイスノード作成（`mknodat(2)`）。
     CreateDevices,
+    /// cgroup 参加ステージ（TASK-32。#832 のステージ列の第 1 段）。
+    CgroupJoin,
+    /// capability 削減ステージ（TASK-37。#832 のステージ列の第 2 段）。
+    CapabilityDrop,
+    /// `PR_SET_NO_NEW_PRIVS` ステージ（#833。#832 のステージ列の第 3 段）。
+    NoNewPrivs,
+    /// Landlock ステージ（TASK-39。#832 のステージ列の第 4 段）。
+    Landlock,
+    /// seccomp ステージ（TASK-38。#832 のステージ列の第 5 段）。
+    Seccomp,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。

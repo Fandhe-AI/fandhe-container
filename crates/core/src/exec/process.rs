@@ -20,13 +20,14 @@
 //!
 //! - **最小構成（フック無し）**: 本 PR の範囲は fork と exec まで。**capability 削減・
 //!   `PR_SET_NO_NEW_PRIVS`・seccomp・Landlock・基本デバイスノード・cgroup 参加は未適用**で、
-//!   ステージ列（#832・#833・#834、TASK-37〜40）が `child_main` の pivot 後・exec 前に差し込む。
+//!   ステージ列の枠（[`StagePipeline`]。#832）が `run_child` の pivot 後・exec 前で固定順に呼ぶ（各段の
+//!   実体は #833・#834、TASK-32・37〜40 が差し込む）。
 //!   そのため制限が未適用の子（rootful 経路のホスト root 権限のままの子を含む）は、
 //!   `exec_entrypoint` が `PermissionDenied` で exec を拒否する（SEC-1・CORE-5。制限を適用できる
 //!   ようになるまで fail-closed。REPAIR-3: 実装済みを装わない）
 //! - **rootless 経路も同様に拒否する**: 制限ステージの適用証跡が無い限り exec しない。
 //!   `/proc/self/status` の `NoNewPrivs`・`Seccomp`・`CapEff` は親から継承した制限と区別できず、
-//!   seccomp の内容も確認できないため証跡にしない。ステージ列（#832・#833）が証跡型を返すように
+//!   seccomp の内容も確認できないため証跡にしない。ステージの実体（#833 以降）が証跡型を返すように
 //!   なるまで常に `PermissionDenied`（SEC-1・CORE-5）。したがって本 PR 時点では実 exec は成功せず、
 //!   成功経路は dry-run の単体テストで検証する
 //! - **継承 fd は開く前に閉じる**: エントリポイントを開く前に fd 3 以上をすべて閉じ、fd 0〜2 と同一の
@@ -76,8 +77,8 @@ use crate::sys::{self, Signal, SysError};
 use crate::traits::types::ErrorCode;
 
 use super::{
-    ExecError, IsolationStage, MountIsolation, PivotReport, ViolationReason, describe, fd_mount_id,
-    pivot_root, prepare_rootfs,
+    ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline, ViolationReason,
+    describe, fd_mount_id, pivot_root, prepare_rootfs,
 };
 
 /// argv の要素数の上限（アロケーション前に検証する）。
@@ -252,7 +253,7 @@ fn exit_code_for(err: &ExecError) -> i32 {
 ///
 /// `/proc/self/status` の `NoNewPrivs`・`Seccomp`・`CapEff` は、親から継承した制限と子のステージが
 /// 適用した制限を区別できず、seccomp フィルタの中身も確認できないため、証跡として扱わない。
-/// capability 削減・`PR_SET_NO_NEW_PRIVS`・seccomp・Landlock のステージ（#832・#833）が未実装の間は
+/// capability 削減・`PR_SET_NO_NEW_PRIVS`・seccomp・Landlock のステージの実体（#833 以降）が未実装の間は
 /// 常に `PermissionDenied` を返す。ステージ実装時は、各ステージが適用完了を示す証跡型を返し、
 /// それを本関数の引数に取って初めて許可する形へ置き換える（REPAIR-3: 実装済みを装わない）。
 fn require_restriction_evidence() -> Result<(), ExecError> {
@@ -602,11 +603,11 @@ fn do_execve(entry: &Entrypoint, _file: &std::fs::File) -> SysError {
 /// 子のメイン。`establish` → `prepare_rootfs` → `pivot_root` → `exec_entrypoint` を通し、失敗したら
 /// stderr に英語 1 行を出して終了コードを返す（戻り値は `_exit` に渡される）。
 ///
-/// ステージ列（capability 削減・`PR_SET_NO_NEW_PRIVS`・Landlock・seccomp。#832・#833）と基本デバイス
+/// ステージ列（#832。`run_child` が pivot 後・exec 前に呼ぶ）と基本デバイス
 /// ノード（#834）の差し込み位置は、pivot 後・exec 前（`exec_entrypoint` の直前）を想定する。
 /// デバイスノードを pivot の前後どちらで作るかは #834 で決める（本 PR では決めない）。
-fn child_main(rootfs: &Path, entry: &Entrypoint) -> i32 {
-    match run_child(rootfs, entry) {
+fn child_main(rootfs: &Path, entry: &Entrypoint, stages: StagePipeline) -> i32 {
+    match run_child(rootfs, entry, stages) {
         Ok(never) => match never {},
         Err(err) => {
             // env の値は message に含めない（パスと errno のみ）。stderr が閉じていても panic しない。
@@ -616,11 +617,16 @@ fn child_main(rootfs: &Path, entry: &Entrypoint) -> i32 {
     }
 }
 
-fn run_child(rootfs: &Path, entry: &Entrypoint) -> Result<Infallible, ExecError> {
+fn run_child(
+    rootfs: &Path,
+    entry: &Entrypoint,
+    stages: StagePipeline,
+) -> Result<Infallible, ExecError> {
     let isolation = MountIsolation::establish()?;
     let prepared = prepare_rootfs(&isolation, rootfs)?;
     let report = pivot_root(&isolation, prepared)?;
-    exec_entrypoint(&isolation, &report, entry)
+    // pivot 後・exec 前にステージ列を固定順で実行する。exec は終端クロージャからしか呼ばれない。
+    stages.run_then(|_stage_report| exec_entrypoint(&isolation, &report, entry))
 }
 
 /// 分離済み（`isolate` / `isolate_rootful_host_root` の後）の親から子を fork し、子で
@@ -632,7 +638,20 @@ fn run_child(rootfs: &Path, entry: &Entrypoint) -> Result<Infallible, ExecError>
 /// の最初の子だけが PID 1 になり、それが終わると namespace は以後 fork できないため、分離した親からの
 /// `spawn_container` は 1 回だけ成功する。
 pub fn spawn_container(rootfs: &Path, entry: &Entrypoint) -> Result<ContainerChild, ExecError> {
-    let pid = sys::fork_single_threaded(|| child_main(rootfs, entry), EXIT_SETUP_FAILED)
+    spawn_container_with_stages(rootfs, entry, StagePipeline::new())
+}
+
+/// [`spawn_container`] にステージ列（#832・TASK-27.4.2）を渡す版。
+///
+/// `stages` は親（fork 前）で構築し、fork で子へコピーされて子の pivot 後・exec 前に固定順で
+/// 実行される。フックの失敗・panic では exec に進まず `EXIT_SETUP_FAILED` で終わる。フック無し・
+/// ダミーフックでも制限適用の証跡にはならず、exec は引き続き拒否される（fail-closed）。
+pub fn spawn_container_with_stages(
+    rootfs: &Path,
+    entry: &Entrypoint,
+    stages: StagePipeline,
+) -> Result<ContainerChild, ExecError> {
+    let pid = sys::fork_single_threaded(|| child_main(rootfs, entry, stages), EXIT_SETUP_FAILED)
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
     Ok(ContainerChild::new(pid))
 }
@@ -1027,6 +1046,36 @@ mod tests {
         assert_eq!(err.code, ErrorCode::PermissionDenied);
         assert_eq!(err.stage, IsolationStage::Exec);
         assert_eq!(exit_code_for(&err), EXIT_EXEC_NOT_EXECUTABLE);
+    }
+
+    /// CORE-1・TASK-27.4.2: ステージの失敗（各段）は子の終了コード 125 になる。
+    #[test]
+    fn core1_failed_stage_maps_to_setup_exit_code() {
+        for stage in [
+            IsolationStage::CgroupJoin,
+            IsolationStage::CapabilityDrop,
+            IsolationStage::NoNewPrivs,
+            IsolationStage::Landlock,
+            IsolationStage::Seccomp,
+        ] {
+            let err = ExecError::new(ErrorCode::Internal, stage, "x");
+            assert_eq!(exit_code_for(&err), EXIT_SETUP_FAILED);
+        }
+    }
+
+    /// CORE-1・SEC-1（TASK-27.4.2）: 全段のダミーフックが `Ok` でも、exec の拒否（証跡要求）は解除されない。
+    #[test]
+    fn core1_stage_report_is_not_restriction_evidence() {
+        use crate::exec::StageKind;
+        let mut p = StagePipeline::new();
+        for kind in StageKind::ORDER {
+            p = p.with_hook(kind, || Ok(())).unwrap();
+        }
+        let err = p
+            .run_then(|_report| require_restriction_evidence())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(err.stage, IsolationStage::Exec);
     }
 
     /// CORE-1・SEC-1: 継承した標準入出力と同一 inode の判定は `(dev, ino)` の完全一致だけを真にする。

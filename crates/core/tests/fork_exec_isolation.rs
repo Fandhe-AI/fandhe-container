@@ -20,6 +20,11 @@
 //! - シナリオ `ok`: プローブへ exec し `Exited(42)`
 //! - シナリオ `missing`: 不在のエントリポイントで `Exited(127)`、stderr に `NOT_FOUND`
 //! - シナリオ `not-executable`: 実行権限の無いファイルで `Exited(126)`、stderr に `PERMISSION_DENIED`
+//! - シナリオ `stages-order`（#832・TASK-27.4.2。`spawn_container_with_stages`）: 逆順に登録した
+//!   3 段のフックが、子の pivot 後（`/` が新 rootfs）に固定順で実行されることをログファイルで照合し、
+//!   フックが全て成功しても証跡不在の exec は拒否される（`Exited(126)`・`PERMISSION_DENIED`）
+//! - シナリオ `stage-fail`（同上）: 途中の段のフック失敗で後続段と exec に進まず `Exited(125)`
+//!   （setup 失敗）、stderr に失敗した段（`at CapabilityDrop`）
 //!
 //! # 実機前提テストとしての分離
 //! 実行には root もしくは非特権 user namespace を許可するホストが必要（AppArmor の
@@ -69,14 +74,24 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        ChildExit, Entrypoint, IsolationConfig, Namespace, NamespaceSet, isolate,
-        isolate_rootful_host_root, plan, plan_rootful_host_root, spawn_container,
+        ChildExit, Entrypoint, ExecError, Hostname, IsolationConfig, Namespace, NamespaceSet,
+        StageKind, StagePipeline, isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
+        spawn_container, spawn_container_with_stages,
     };
 
     const PROBE: &str = "fandhe-exec-probe";
     const PROBE_EXIT: i32 = 42;
     const NOT_EXEC: &str = "not-executable";
-    const SCENARIOS: [&str; 3] = ["ok", "missing", "not-executable"];
+    /// 子が pivot 後の `/` に追記するステージ実行ログ（親からは `<rootfs>/stage-log`）。
+    const STAGE_LOG: &str = "stage-log";
+    /// (シナリオ名, stderr に含まれるべき文字列)。
+    const SCENARIOS: [(&str, &str); 5] = [
+        ("ok", "PERMISSION_DENIED"),
+        ("missing", "PERMISSION_DENIED"),
+        ("not-executable", "PERMISSION_DENIED"),
+        ("stages-order", "PERMISSION_DENIED"),
+        ("stage-fail", "at CapabilityDrop"),
+    ];
 
     fn timeout() -> Duration {
         let secs = std::env::var("FANDHE_CONTAINER_TEST_TIMEOUT_SECS")
@@ -249,7 +264,7 @@ mod linux {
     fn dispatcher() {
         verify_probe_on_host();
         let exe = std::env::current_exe().expect("current_exe");
-        for name in SCENARIOS {
+        for (name, marker) in SCENARIOS {
             let rootfs = make_rootfs(name);
             let mut child = Command::new(&exe)
                 .args(["--scenario", name])
@@ -272,10 +287,11 @@ mod linux {
                 Some(0),
                 "scenario {name} must exit with 0; stderr:\n{stderr}"
             );
-            // SEC-1・CORE-5: 制限が未適用の間は全シナリオで exec が拒否される。
+            // SEC-1・CORE-5: 制限が未適用の間は exec が拒否される（`stage-fail` はフック失敗で
+            // exec に到達しないため、失敗した段を照合する）。
             assert!(
-                stderr.contains("PERMISSION_DENIED"),
-                "stderr of scenario {name} must contain PERMISSION_DENIED; got:\n{stderr}"
+                stderr.contains(marker),
+                "stderr of scenario {name} must contain {marker}; got:\n{stderr}"
             );
         }
         let is_root = is_root();
@@ -319,17 +335,83 @@ mod linux {
             "ok" => format!("/{PROBE}"),
             "missing" => "/no-such-entrypoint".to_string(),
             "not-executable" => format!("/{NOT_EXEC}"),
+            "stages-order" | "stage-fail" => format!("/{PROBE}"),
             other => panic!("unknown scenario {other}"),
         };
         // SEC-1・CORE-5: capability 削減・no_new_privs・seccomp が未適用の間は、root / 非 root を問わず
         // exec が拒否される（終了コード 126・PERMISSION_DENIED）。適用後は "ok" が Exited(PROBE_EXIT)、
         // "missing" が Exited(127) に戻る。
-        let want = ChildExit::Exited(126);
+        let mut want = ChildExit::Exited(126);
         let entry = Entrypoint::new(&path, [path.as_str()], [] as [&str; 0]).expect("entrypoint");
-        let child = spawn_container(rootfs, &entry).unwrap_or_else(|e| panic!("spawn: {e}"));
+        let child = match name {
+            "stages-order" => {
+                // 逆順に登録しても固定順（cgroup_join → no_new_privs → seccomp）で実行される。
+                let stages = StagePipeline::new()
+                    .with_hook(StageKind::Seccomp, logging_hook(StageKind::Seccomp))
+                    .and_then(|p| {
+                        p.with_hook(StageKind::NoNewPrivs, logging_hook(StageKind::NoNewPrivs))
+                    })
+                    .and_then(|p| {
+                        p.with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
+                    })
+                    .unwrap_or_else(|e| panic!("register hooks: {e}"));
+                spawn_container_with_stages(rootfs, &entry, stages)
+            }
+            "stage-fail" => {
+                // CapabilityDrop のフックが失敗する。後続の Landlock と exec は実行されない。
+                let stages = StagePipeline::new()
+                    .with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
+                    .and_then(|p| p.with_hook(StageKind::CapabilityDrop, failing_hook))
+                    .and_then(|p| {
+                        p.with_hook(StageKind::Landlock, logging_hook(StageKind::Landlock))
+                    })
+                    .unwrap_or_else(|e| panic!("register hooks: {e}"));
+                want = ChildExit::Exited(125);
+                spawn_container_with_stages(rootfs, &entry, stages)
+            }
+            _ => spawn_container(rootfs, &entry),
+        }
+        .unwrap_or_else(|e| panic!("spawn: {e}"));
         let exit = child
             .wait_timeout(timeout())
             .unwrap_or_else(|e| panic!("wait: {e}"));
         assert_eq!(exit, want, "scenario {name}");
+
+        // 子（pivot 後の `/`）が書いたログを、親から rootfs 越しに読んで実行順・位置を照合する。
+        let log = std::fs::read_to_string(rootfs.join(STAGE_LOG)).unwrap_or_default();
+        match name {
+            // 各フックは pivot 後の `/` にプローブが見えること（root=1）を記録する。ホスト側の `/` には
+            // プローブは無いため、pivot 前に実行されていれば root=0 になる。
+            "stages-order" => assert_eq!(
+                log, "cgroup_join root=1\nno_new_privs root=1\nseccomp root=1\n",
+                "hooks must run in fixed order after pivot_root"
+            ),
+            "stage-fail" => assert_eq!(
+                log, "cgroup_join root=1\n",
+                "no stage after the failed one may run"
+            ),
+            _ => assert_eq!(log, "", "no hook is registered"),
+        }
+    }
+
+    /// 子の pivot 後の `/` に自段名と「新 rootfs が見えているか」を追記して成功するフック。
+    fn logging_hook(kind: StageKind) -> impl FnMut() -> Result<(), ExecError> + 'static {
+        move || {
+            use std::io::Write as _;
+            let root = u8::from(Path::new(&format!("/{PROBE}")).exists());
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(format!("/{STAGE_LOG}"))
+                .unwrap_or_else(|e| panic!("open stage log in the child: {e}"));
+            writeln!(f, "{} root={root}", kind.as_str())
+                .unwrap_or_else(|e| panic!("write stage log in the child: {e}"));
+            Ok(())
+        }
+    }
+
+    /// 必ず失敗するフック（公開 API で作れる `ExecError` として不正なホスト名の検証エラーを流用する）。
+    fn failing_hook() -> Result<(), ExecError> {
+        Hostname::new("").map(|_| ())
     }
 }

@@ -93,7 +93,7 @@ stub_log="$work/stub.log"
 stub="$work/stub-runtime"
 cat >"$stub" <<STUB
 #!${bash_bin}
-# スタブランタイム。STUB_MODE: ok / create-fail / create-fail-delete-fail / create-fail-gone / create-fail-state-error / start-fail / start-hang / delete-fail
+# スタブランタイム。STUB_MODE: ok / create-fail / create-fail-delete-fail / create-fail-gone / create-fail-state-error / start-fail / start-hang / start-flood / delete-fail
 cmd="\$1"
 shift
 case "\$cmd" in
@@ -109,6 +109,7 @@ case "\$cmd" in
   start)
     [ "\${STUB_MODE:-ok}" = start-fail ] && { echo "stub: start failed" >&2; exit 1; }
     [ "\${STUB_MODE:-ok}" = start-hang ] && exec sleep 30
+    [ "\${STUB_MODE:-ok}" = start-flood ] && exec yes
     sleep 0.10
     ;;
   delete)
@@ -254,6 +255,11 @@ STUB_MODE=start-hang expect_rc "start-hang" 1 --runtime "$stub" --bundle "$work/
 elapsed=$((SECONDS - started))
 if [ "$elapsed" -lt 15 ]; then pass "start-hang-elapsed (${elapsed}s < 15s)"; else fail "start-hang-elapsed (${elapsed}s)"; fi
 if grep -q '^delete ' "$stub_log"; then pass "start-hang-delete-called"; else fail "start-hang-delete-called"; fi
+
+# --- 7b. ログ出力の無制限書き込み（ulimit -f 上限超過）は計測失敗になる ---
+reset_log
+STUB_MODE=start-flood expect_rc "start-flood" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 5
+if grep -q '^delete ' "$stub_log"; then pass "start-flood-delete-called"; else fail "start-flood-delete-called"; fi
 
 # --- 8. delete 失敗: 計測成功でも exit 4、残存 ID を出力 ---
 reset_log

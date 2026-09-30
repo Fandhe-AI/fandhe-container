@@ -49,7 +49,7 @@
 #
 # セキュリティ: 引数は許可リストで検証し、ランタイムは配列で直接 exec する（eval・
 # sh -c・文字列連結なし）。sudo は内部で呼ばない（root を要する実測は人間が明示実行する）。
-# 各ランタイム呼び出しは timeout で上限を掛ける（REPAIR-5）。
+# 各ランタイム呼び出しは timeout で上限を掛け、ログ出力量にも上限（ulimit -f）を掛ける（REPAIR-5）。
 
 set -euo pipefail
 # EPOCHREALTIME の小数点がロケール依存になるのを防ぐ。
@@ -63,6 +63,9 @@ readonly EXIT_CLEANUP=4
 readonly KILL_AFTER_SECS=5
 # 失敗時に stderr へ出すログ末尾の行数上限。
 readonly LOG_TAIL_LINES=20
+# ランタイム 1 呼び出しがログファイルへ書ける最大サイズ（KiB。ulimit -f の単位）。
+# 超過した呼び出しは SIGXFSZ で打ち切られ計測失敗になる（ディスク枯渇防止。REPAIR-5）。
+readonly LOG_MAX_KIB=1024
 
 usage() {
   cat >&2 <<'USAGE'
@@ -211,7 +214,12 @@ run_rt() {
   local log="$1"
   shift
   local status=0
-  timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" "$runtime" "$@" </dev/null >"$log" 2>&1 || status=$?
+  # サブシェルで ulimit -f を掛け、出力量が上限を超えたら SIGXFSZ で失敗させる
+  # （--timeout は出力量を制限しないため）。上限はサブシェル内に閉じる。
+  (
+    ulimit -f "$LOG_MAX_KIB"
+    exec timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" "$runtime" "$@" </dev/null >"$log" 2>&1
+  ) || status=$?
   return "$status"
 }
 

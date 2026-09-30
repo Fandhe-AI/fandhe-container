@@ -30,7 +30,8 @@
 //!   なるまで常に `PermissionDenied`（SEC-1・CORE-5）。したがって本 PR 時点では実 exec は成功せず、
 //!   成功経路は dry-run の単体テストで検証する
 //! - **継承 fd は開く前に閉じる**: エントリポイントを開く前に fd 3 以上をすべて閉じ、fd 0〜2 と同一の
-//!   実体（rootfs 内の `/proc/self/fd/N` 経由）は拒否する。継承したホスト fd の実体を開く経路を断つ
+//!   実体（rootfs 内の `/proc/self/fd/N` 経由）は拒否する（fd 0〜2 の実体を確認できなければ拒否）。
+//!   継承したホスト fd の実体を開く経路を断つ
 //! - **標準入出力は `/dev/null` へ置換する**: 呼び出し元の fd 0〜2 の実体は渡さない。`/dev/null` が
 //!   無い rootfs は拒否する。端末・パイプの受け渡しは TASK-29/30 の範囲
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
@@ -284,7 +285,8 @@ pub fn exec_entrypoint(
 ///    （ランタイム自身のホスト側バイナリ）と `(st_dev, st_ino)` が同じなら拒否する
 ///    （CVE-2019-5736 型の多層防御。検査した fd をそのまま `execveat(AT_EMPTY_PATH)` で実行し、
 ///    検査から実行までの間のパス差し替え〔TOCTOU〕を防ぐ。memfd による自己複製は後続の課題）
-/// 3. 開いたエントリポイントが fd 0〜2 と同一 inode なら拒否する（`/proc/self/fd/{0,1,2}` 経由の参照対策）。
+/// 3. 開いたエントリポイントが fd 0〜2 と同一 inode なら拒否する（`/proc/self/fd/{0,1,2}` 経由の参照対策。
+///    fd 0〜2 の実体を確認できなければ拒否。エントリポイントの fd は 3 以上に置く）。
 ///    fd 3 以上を `CLOEXEC` にする（CVE-2024-21626 型の fd 漏えい対策。カーネル 5.11 未満は
 ///    `ENOSYS`/`EINVAL` で fail-closed）
 /// 4. `SIGPIPE` を `SIG_DFL` へ戻す（Rust ランタイムが設定した ignore は `execve` を越えて継承される）
@@ -311,7 +313,7 @@ fn exec_entrypoint_verified(
     // 検査と実行を同じ fd に固定する（パスを再解決する execve では、検査後に差し替えられうる）。
     let file = open_entrypoint(entry)?;
     let meta = file.metadata().map_err(|e| io_exec_error(&e, entry))?;
-    if is_inherited_stdio(&meta) {
+    if matches_any_identity((meta.dev(), meta.ino()), &inherited_stdio_identities()?) {
         return Err(ExecError::new(
             ErrorCode::PermissionDenied,
             STAGE,
@@ -377,21 +379,43 @@ fn close_inherited_fds() -> Result<(), ExecError> {
     Ok(())
 }
 
-/// 開いたエントリポイントが fd 0〜2 の実体（継承した標準入出力）と同一の inode か。
-/// `/proc/self/fd/{0,1,2}` 経由でホスト側の実体を開いた場合を検出する（fd 3 以上は閉じ済み）。
-fn is_inherited_stdio(meta: &std::fs::Metadata) -> bool {
-    let fds = [
-        std::io::stdin().as_fd().try_clone_to_owned(),
-        std::io::stdout().as_fd().try_clone_to_owned(),
-        std::io::stderr().as_fd().try_clone_to_owned(),
-    ];
-    let ids: Vec<(u64, u64)> = fds
-        .into_iter()
-        .flatten()
-        .filter_map(|fd| std::fs::File::from(fd).metadata().ok())
-        .map(|m| (m.dev(), m.ino()))
-        .collect();
-    matches_any_identity((meta.dev(), meta.ino()), &ids)
+/// fd 0〜2 の実体（継承した標準入出力）の `(st_dev, st_ino)` を集める。開いたエントリポイントと
+/// 照合し、`/proc/self/fd/{0,1,2}` 経由でホスト側の実体を開いた場合を検出する（fd 3 以上は閉じ済み）。
+///
+/// 閉じている番号（複製が `EBADF`）は `/proc/self/fd/N` として参照できる実体が無いので除く。それ以外の
+/// 複製・`fstat` の失敗は同一性を確認できないため、検査を通さず fail-closed で拒否する（SEC-1）。
+fn inherited_stdio_identities() -> Result<Vec<(u64, u64)>, ExecError> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let mut ids = Vec::with_capacity(3);
+    for (n, fd) in [(0, stdin.as_fd()), (1, stdout.as_fd()), (2, stderr.as_fd())] {
+        let probe = fd
+            .try_clone_to_owned()
+            .and_then(|owned| std::fs::File::from(owned).metadata())
+            .map(|m| (m.dev(), m.ino()));
+        if let Some(id) = classify_stdio_probe(n, probe)? {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// 標準 fd 1 本の確認結果を分類する（純関数）。取得できた実体は `Some`、閉じている（`EBADF`）なら
+/// `None`、それ以外の失敗は `PermissionDenied`（段は `Exec`）で拒否する。
+fn classify_stdio_probe(
+    n: i32,
+    probe: std::io::Result<(u64, u64)>,
+) -> Result<Option<(u64, u64)>, ExecError> {
+    match probe {
+        Ok(id) => Ok(Some(id)),
+        Err(e) if e.raw_os_error() == Some(sys::EBADF) => Ok(None),
+        Err(e) => Err(ExecError::new(
+            ErrorCode::PermissionDenied,
+            IsolationStage::Exec,
+            format!("cannot verify the inherited standard stream fd {n} ({e}); refusing to exec"),
+        )),
+    }
 }
 
 /// `(st_dev, st_ino)` が `ids` のいずれかと一致するか（純関数）。
@@ -471,20 +495,44 @@ fn reset_sigpipe() -> Result<(), ExecError> {
 }
 
 /// エントリポイントを開く。失敗は errno を `ErrorCode` に写す（不在 → `NotFound`）。
+///
+/// 返す fd は必ず 3 以上（[`keep_above_stdio`]）。呼び出し元の fd 0〜2 が閉じていると `openat` は
+/// その番号を返し、後段の標準入出力の置換（`dup2`）で実行用の fd が潰されるため。
 fn open_entrypoint(entry: &Entrypoint) -> Result<std::fs::File, ExecError> {
-    sys::open_file_read(&entry.path)
-        .map(std::fs::File::from)
-        .map_err(|e| {
-            ExecError::new(
-                exec_errno_to_code(e),
-                IsolationStage::Exec,
-                format!(
-                    "open of the entrypoint {:?} failed: {}",
-                    entry.path(),
-                    describe(e)
-                ),
-            )
-        })
+    let fd = sys::open_file_read(&entry.path).map_err(|e| {
+        ExecError::new(
+            exec_errno_to_code(e),
+            IsolationStage::Exec,
+            format!(
+                "open of the entrypoint {:?} failed: {}",
+                entry.path(),
+                describe(e)
+            ),
+        )
+    })?;
+    keep_above_stdio(fd).map(std::fs::File::from)
+}
+
+/// fd が 0〜2 なら 3 以上へ複製して元を閉じる（3 以上ならそのまま返す）。
+///
+/// 複製は std の `try_clone`（`F_DUPFD_CLOEXEC`・下限 3）。複製後も 2 以下なら fail-closed で拒否する。
+fn keep_above_stdio(fd: OwnedFd) -> Result<OwnedFd, ExecError> {
+    use std::os::fd::AsRawFd as _;
+    if fd.as_raw_fd() > 2 {
+        return Ok(fd);
+    }
+    let moved = fd
+        .try_clone()
+        .map_err(|e| ExecError::from_io(&e, IsolationStage::Exec, "dup(entrypoint)"))?;
+    if moved.as_raw_fd() <= 2 {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Exec,
+            "cannot move the entrypoint fd above the standard streams",
+        ));
+    }
+    drop(fd);
+    Ok(moved)
 }
 
 /// `std::io::Error` を `Exec` 段の `ExecError` に写す。

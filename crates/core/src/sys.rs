@@ -52,7 +52,8 @@ pub(crate) enum SysError {
 
 /// errno の値（アーキテクチャごとに `consts` で個別定義。alpha / mips / sparc 等は値が違う）。
 pub(crate) use consts::{
-    E2BIG, EACCES, EEXIST, EINTR, EINVAL, ELOOP, ENOENT, ENOEXEC, ENOSYS, ENOTDIR, EPERM, ESRCH,
+    E2BIG, EACCES, EBADF, EEXIST, EINTR, EINVAL, ELOOP, ENOENT, ENOEXEC, ENOSYS, ENOTDIR, EPERM,
+    ESRCH,
 };
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）
@@ -121,11 +122,12 @@ mod consts {
     pub const ENOTDIR: i32 = 20;
     pub const EINVAL: i32 = 22;
     pub const ELOOP: i32 = 40;
-    // errno-base.h / errno.h の ESRCH・EINTR・E2BIG・ENOEXEC・ENOSYS。
+    // errno-base.h / errno.h の ESRCH・EINTR・E2BIG・ENOEXEC・EBADF・ENOSYS。
     pub const ESRCH: i32 = 3;
     pub const EINTR: i32 = 4;
     pub const E2BIG: i32 = 7;
     pub const ENOEXEC: i32 = 8;
+    pub const EBADF: i32 = 9;
     pub const ENOSYS: i32 = 38;
     // include/uapi/linux/stat.h の `S_IFCHR`（文字デバイス。全アーキテクチャ共通）。
     pub const S_IFCHR: u32 = 0o020_000;
@@ -186,11 +188,12 @@ mod consts {
     pub const ENOTDIR: i32 = 20;
     pub const EINVAL: i32 = 22;
     pub const ELOOP: i32 = 40;
-    // errno-base.h / errno.h の ESRCH・EINTR・E2BIG・ENOEXEC・ENOSYS。
+    // errno-base.h / errno.h の ESRCH・EINTR・E2BIG・ENOEXEC・EBADF・ENOSYS。
     pub const ESRCH: i32 = 3;
     pub const EINTR: i32 = 4;
     pub const E2BIG: i32 = 7;
     pub const ENOEXEC: i32 = 8;
+    pub const EBADF: i32 = 9;
     pub const ENOSYS: i32 = 38;
     // include/uapi/linux/stat.h の `S_IFCHR`（文字デバイス。全アーキテクチャ共通）。
     pub const S_IFCHR: u32 = 0o020_000;
@@ -241,6 +244,7 @@ mod consts {
     pub const E2BIG: i32 = -10;
     pub const ENOEXEC: i32 = -11;
     pub const ENOSYS: i32 = -12;
+    pub const EBADF: i32 = -13;
     pub const S_IFCHR: u32 = 0;
 }
 

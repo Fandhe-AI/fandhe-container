@@ -12,8 +12,8 @@
 #![cfg(target_os = "linux")]
 
 use fandhe_container_core::landlock::{
-    AccessFs, LandlockError, LandlockSupport, RuleOrigin, RulePath, build_path_rules,
-    detect_landlock_abi, path_rules_from_config,
+    AccessFs, LandlockError, LandlockRuleErrorKind, LandlockSupport, RuleOrigin, RulePath,
+    build_path_rules, detect_landlock_abi, path_rules_from_config,
 };
 use fandhe_container_core::oci_runtime::{OciConfig, parse_config_bytes};
 use fandhe_container_core::traits::ErrorCode;
@@ -106,33 +106,58 @@ fn check_path_rules_from_config(support: &LandlockSupport) {
     );
 }
 
-/// CORE-5: `build_path_rules` は同一 destination と、後の親マウントに隠れた子マウントのルールを除く。
+/// CORE-5: `build_path_rules` は同一 destination と、後の親マウントに隠れた子マウントのルールを除き、
+/// 実行権だけが祖先で広がる箇所は shadowed に記録する。
 fn check_build_path_rules_hidden_mounts(support: &LandlockSupport) {
     let c = config(
-        false,
+        true,
         r#"[
             {"destination":"/d","options":["ro"]},
             {"destination":"/x/y","options":["rw"]},
             {"destination":"/d","options":["rw"]},
-            {"destination":"/x","options":["ro"]}
+            {"destination":"/x","options":["rw"]},
+            {"destination":"/x/e","options":["noexec"]}
         ]"#,
     );
     let rs = build_path_rules(support, c.root(), c.mounts()).expect("rules");
     assert_eq!(
         summary(rs.rules()),
         vec![
-            ("/".to_string(), RuleOrigin::Root, 0x77BF),
+            ("/".to_string(), RuleOrigin::Root, 0x000D),
             ("/d".to_string(), RuleOrigin::Mount { index: 2 }, 0x77BF),
-            ("/x".to_string(), RuleOrigin::Mount { index: 3 }, 0x000D),
+            ("/x".to_string(), RuleOrigin::Mount { index: 3 }, 0x77BF),
+            ("/x/e".to_string(), RuleOrigin::Mount { index: 4 }, 0x77BE),
         ]
     );
-    // 書き込み可能な root の下の ro mount は Landlock では狭められず、shadowed に記録される。
+    // 実行権は VFS の noexec が保護するため、拒否せず shadowed に記録する。
     let shadowed: Vec<(&str, u64, u64)> = rs
         .shadowed()
         .iter()
         .map(|s| (s.path.as_str(), s.intended.bits(), s.effective.bits()))
         .collect();
-    assert_eq!(shadowed, vec![("/x", 0x000D, 0x77BF)]);
+    assert_eq!(shadowed, vec![("/x/e", 0x77BE, 0x77BF)]);
+}
+
+/// CORE-5: 書き込み制限が祖先ルールで無効になる構成は構造化エラーで拒否する（fail-closed）。
+fn check_write_restriction_shadowed_is_rejected(support: &LandlockSupport) {
+    let c = config(
+        false,
+        r#"[{"destination":"/data"},{"destination":"/proc","type":"proc"}]"#,
+    );
+    let e = path_rules_from_config(support, &c).expect_err("rejected");
+    assert_eq!(
+        e.kind,
+        LandlockRuleErrorKind::WriteRestrictionShadowed {
+            index: 1,
+            granted: AccessFs::WRITE,
+        }
+    );
+    assert_eq!(e.code, ErrorCode::InvalidArgument);
+    assert_eq!(
+        e.to_string(),
+        "INVALID_ARGUMENT: mounts[1] denies write access 0x77b2 that an ancestor Landlock rule \
+         grants; use a read-only root or a writable parent mount"
+    );
 }
 
 /// CORE-5: 検出が `Ok` なら `path_rules_from_config` の生成結果を、`Err` なら構造化された拒否を照合する。
@@ -153,6 +178,15 @@ fn core5_build_path_rules_hidden_mounts_or_structured_rejection() {
     }
 }
 
+/// CORE-5: 検出が `Ok` なら書き込み制限の無効化の拒否を、`Err` なら構造化された拒否を照合する。
+#[test]
+fn core5_write_restriction_shadowed_rejected_or_structured_rejection() {
+    match detect_landlock_abi() {
+        Ok(support) => check_write_restriction_shadowed_is_rejected(&support),
+        Err(e) => assert_structured_rejection(&e),
+    }
+}
+
 /// CORE-5: 実機（Linux 6.12+・ABI 6+）では検出を通過し、公開 API のルール生成を必ず照合する。
 #[test]
 #[ignore = "requires Landlock ABI >= 6 (Linux 6.12+). CORE-5"]
@@ -160,4 +194,5 @@ fn core5_path_rules_on_abi6_host() {
     let support = detect_landlock_abi().expect("Landlock ABI >= 6 required");
     check_path_rules_from_config(&support);
     check_build_path_rules_hidden_mounts(&support);
+    check_write_restriction_shadowed_is_rejected(&support);
 }

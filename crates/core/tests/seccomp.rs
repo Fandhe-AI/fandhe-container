@@ -16,7 +16,8 @@
 //!   `EPERM` になり得るため、識別的な根拠とは扱わない
 //!
 //! 受け入れ基準の「シグナル」側（x32 番号の `SECCOMP_RET_KILL_PROCESS` → `SIGSYS`）は、本試験では
-//! 扱わない（errno による遮断の照合のみ）。
+//! 扱わない（errno による遮断の照合のみ）。シグナル側は別途の追跡対象（TASK-38.4・CORE-5。追跡 Issue は
+//! out-of-scope-tracking に従いユーザー承認後に起票する）。
 //!
 //! # 構成
 //! - 常に走る部分（3 OS 共通・既定のテスト集合）: プローブ対象が `DeniedSyscall::ALL` に含まれること、
@@ -32,6 +33,7 @@
 //! kexec_load・コンテナの mount namespace に閉じる mount 系）に固定している。実行された場合は分離の拒否・
 //! 事前条件の不成立を含めあらゆる失敗を失敗として扱い、検証せずに成功する分岐は持たない。
 
+#[cfg(target_os = "linux")]
 use fandhe_container_core::exec::{ProbeOutcome, SeccompProbeRecord};
 use fandhe_container_core::seccomp::DeniedSyscall;
 
@@ -56,7 +58,8 @@ fn core5_probed_names_are_in_deny_table() {
     }
 }
 
-/// 記録の解析を固定文字列で自己検証する（具体値・欠落・重複・未知キー・不正値の検出）。
+/// 記録の解析を固定文字列で自己検証する（`exec` は Linux 限定のため Linux のみ）（具体値・欠落・重複・未知キー・不正値の検出）。
+#[cfg(target_os = "linux")]
 fn core5_record_parser_selftest() {
     let ok = "unshare=errno=1\nptrace=errno=1\nseccomp_mode=2\ncontrol=ok\nmount=errno=1\n\
               pivot_root=errno=1\numount2=errno=1\nkexec_load=errno=1\n";
@@ -89,6 +92,7 @@ fn core5_record_parser_selftest() {
 
 fn always() {
     core5_probed_names_are_in_deny_table();
+    #[cfg(target_os = "linux")]
     core5_record_parser_selftest();
     println!("seccomp: CORE-5 probe table and record parser verified");
 }
@@ -231,6 +235,15 @@ mod linux {
             == Some("0")
     }
 
+    /// 自プロセスの `Seccomp:` 行の値（`/proc/self/status`）。
+    fn seccomp_mode_of_self() -> String {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read status")
+            .lines()
+            .find_map(|l| l.strip_prefix("Seccomp:").map(|v| v.trim().to_string()))
+            .expect("Seccomp line in /proc/self/status")
+    }
+
     fn dispatcher() {
         let exe = std::env::current_exe().expect("current_exe");
         let rootfs = make_rootfs();
@@ -264,6 +277,14 @@ mod linux {
     /// 分離 → fork したコンテナ内でプローブ → 記録を具体値で照合する。
     fn scenario(rootfs: &Path) {
         let is_root = is_root();
+        // 適用前の対照観測: このシナリオ自身（= 組み込み段を載せる前）に seccomp フィルタが無いこと。
+        // 継承したフィルタ（コンテナ・サンドボックス上のテストランナー等）が既にあると、後段の
+        // `Seccomp: 2` や `EPERM` は組み込みフィルタの成果と区別できないため、失敗として扱う（CORE-5・REPAIR-12）。
+        assert_eq!(
+            seccomp_mode_of_self(),
+            "0",
+            "precondition: the test process must not inherit a seccomp filter (cannot attribute the denial to the built-in stage)"
+        );
         let mut namespaces = NamespaceSet::empty()
             .with(Namespace::Pid)
             .with(Namespace::Mount)

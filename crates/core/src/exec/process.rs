@@ -674,8 +674,9 @@ fn child_main_probe(rootfs: &Path, stages: StagePipeline) -> i32 {
     }
 }
 
-/// 記録を pivot 後の `/seccomp-probe.tmp` へ `create_new` で書き、`/seccomp-probe` へ `rename` する
-/// （既存ファイル・symlink を上書き・追従しない。親は rename 後の完成品だけを読む）。
+/// 記録を pivot 後の `/seccomp-probe.tmp` へ `create_new` で書き、`/seccomp-probe` へハードリンクして
+/// から一時名を消す（`link` は宛先が存在すれば `EEXIST` で失敗するため、既存ファイル・symlink を
+/// 上書き・追従しない。`rename` は宛先を黙って置換するため使わない。親はリンク後の完成品だけを読む）。
 fn publish_probe_record(text: &str) -> Result<(), ExecError> {
     let fail = |e: std::io::Error| {
         ExecError::new(
@@ -691,7 +692,11 @@ fn publish_probe_record(text: &str) -> Result<(), ExecError> {
         .map_err(fail)?;
     f.write_all(text.as_bytes()).map_err(fail)?;
     drop(f);
-    std::fs::rename("/seccomp-probe.tmp", "/seccomp-probe").map_err(fail)
+    let linked = std::fs::hard_link("/seccomp-probe.tmp", "/seccomp-probe");
+    // 一時名は成否に関わらず片付ける（リンク失敗を優先して報告する）。
+    let removed = std::fs::remove_file("/seccomp-probe.tmp");
+    linked.map_err(fail)?;
+    removed.map_err(fail)
 }
 
 /// 結合試験専用: exec の代わりに禁止 syscall のプローブを実行する子を fork する（CORE-5・TASK-38.4・#179）。

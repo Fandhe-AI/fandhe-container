@@ -170,6 +170,10 @@ pub enum ProbeOutcome {
     Ok,
     /// syscall が errno で失敗した（`EPERM` = 1 なら seccomp の遮断、または capability 不足）。
     Errno(i32),
+    /// 対応外アーキテクチャで syscall を発行できなかった（[`SysError::Unsupported`]）。
+    Unsupported,
+    /// errno を伴わない失敗（プローブ自体の読み出し失敗など）。遮断とは区別する。
+    Failed,
 }
 
 impl ProbeOutcome {
@@ -177,8 +181,8 @@ impl ProbeOutcome {
         match r {
             Ok(()) => ProbeOutcome::Ok,
             Err(SysError::Os(n)) => ProbeOutcome::Errno(n),
-            // 対応外アーキ等。実在しない errno として区別する。
-            Err(_) => ProbeOutcome::Errno(-1),
+            Err(SysError::Unsupported) => ProbeOutcome::Unsupported,
+            Err(_) => ProbeOutcome::Failed,
         }
     }
 
@@ -186,12 +190,17 @@ impl ProbeOutcome {
         match self {
             ProbeOutcome::Ok => "ok".to_string(),
             ProbeOutcome::Errno(n) => format!("errno={n}"),
+            ProbeOutcome::Unsupported => "unsupported".to_string(),
+            ProbeOutcome::Failed => "failed".to_string(),
         }
     }
 
     fn parse(v: &str) -> Result<Self, String> {
-        if v == "ok" {
-            return Ok(ProbeOutcome::Ok);
+        match v {
+            "ok" => return Ok(ProbeOutcome::Ok),
+            "unsupported" => return Ok(ProbeOutcome::Unsupported),
+            "failed" => return Ok(ProbeOutcome::Failed),
+            _ => {}
         }
         v.strip_prefix("errno=")
             .and_then(|n| n.parse::<i32>().ok())
@@ -312,8 +321,11 @@ pub(crate) fn probe_denied_syscalls() -> Result<SeccompProbeRecord, ExecError> {
         .find_map(|l| l.strip_prefix("Seccomp:"))
         .map(|v| v.trim().to_string())
         .ok_or_else(|| fail("Seccomp field missing"))?;
-    let control =
-        ProbeOutcome::from_result(read_status().map(|_| ()).map_err(|_| SysError::Os(-1)));
+    // 対照: 禁止対象外の読み出しが成功すること。失敗は errno を伴わないので `Failed`。
+    let control = match read_status() {
+        Ok(_) => ProbeOutcome::Ok,
+        Err(_) => ProbeOutcome::Failed,
+    };
     Ok(SeccompProbeRecord {
         unshare: ProbeOutcome::from_result(sys::unshare_namespaces(&[])),
         ptrace: ProbeOutcome::from_result(sys::ptrace_cont_probe(std::process::id())),
@@ -325,6 +337,7 @@ pub(crate) fn probe_denied_syscalls() -> Result<SeccompProbeRecord, ExecError> {
         kexec_load: ProbeOutcome::from_result(sys::kexec_load_invalid_probe()),
     })
 }
+
 /// 単一スレッド条件を適用の前後で検査して [`apply_filter`] を呼ぶ。事前検査は副作用の前に行う。
 fn apply_single_threaded(
     program: &SeccompProgram,

@@ -4,8 +4,8 @@
 //!
 //! OCI 既定の最小セット（moby の既定 14 個。`daemon/pkg/oci/caps/defaults.go`）を表す
 //! OS 非依存のデータ型。適用処理（`capset(2)`・`prctl(2)`）は Linux 限定の
-//! `crate::exec::apply_default_capabilities`（`exec/capabilities.rs`）が担い、本モジュールの
-//! [`CapabilitySet::oci_default`] を許可集合として使う。ステージ列への組み込みは #173（TASK-37.2）。
+//! `exec/capabilities.rs` の `apply_default_capabilities` が担い、本モジュールの
+//! [`CapabilitySet::oci_default`] を許可集合として使う。組み込みのステージ（`StagePipeline::run_then`）から呼ばれる（#173・TASK-37.2）。
 //! 将来 `config.json` の `process.capabilities` を解釈する際の型としても使える
 //! （現状は `UnappliedField::ProcessCapabilities` として記録するのみ）。
 //!

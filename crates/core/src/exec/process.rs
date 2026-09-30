@@ -20,7 +20,7 @@
 //!
 //! - **最小構成（フック無し）**: 子はステージ列（[`StagePipeline`]。#832）を `run_child` の pivot 後・
 //!   exec 前で固定順に実行する。組み込みの `PR_SET_NO_NEW_PRIVS`（#833）は空のパイプラインでも適用される
-//!   が、**capability 削減・seccomp・Landlock・cgroup 参加は未適用**（実体は TASK-32・37〜40 が差し込む）。
+//!   が、**seccomp・Landlock・cgroup 参加は未適用**（実体は TASK-32・38〜40 が差し込む。capability 削減は #173 で組み込み済み）。
 //!   そのため制限が未適用の子（rootful 経路のホスト root 権限のままの子を含む）は、
 //!   `exec_entrypoint` が `PermissionDenied` で exec を拒否する（SEC-1・CORE-5。制限を適用できる
 //!   ようになるまで fail-closed。REPAIR-3: 実装済みを装わない）
@@ -76,8 +76,8 @@ use crate::sys::{self, Signal, SysError};
 use crate::traits::types::ErrorCode;
 
 use super::{
-    ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline, ViolationReason,
-    describe, fd_mount_id, pivot_root, prepare_rootfs,
+    CapabilityReport, ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline,
+    ViolationReason, describe, fd_mount_id, pivot_root, prepare_rootfs,
 };
 
 /// argv の要素数の上限（アロケーション前に検証する）。
@@ -253,14 +253,18 @@ fn exit_code_for(err: &ExecError) -> i32 {
 /// `/proc/self/status` の `NoNewPrivs`・`Seccomp`・`CapEff` は、親から継承した制限と子のステージが
 /// 適用した制限を区別できず、seccomp フィルタの中身も確認できないため、証跡として扱わない。
 /// `PR_SET_NO_NEW_PRIVS` は #833 で組み込みステージとして実装済みだが単独では証跡にせず、
-/// capability 削減・seccomp・Landlock のステージの実体（TASK-37〜39）が未実装の間は
-/// 常に `PermissionDenied` を返す。ステージ実装時は、各ステージが適用完了を示す証跡型を返し、
-/// それを本関数の引数に取って初めて許可する形へ置き換える（REPAIR-3: 実装済みを装わない）。
-fn require_restriction_evidence() -> Result<(), ExecError> {
+/// capability 削減は #173（TASK-37.2）で組み込み段になり、その [`CapabilityReport`] を引数で受け取る
+/// が、seccomp・Landlock のステージの実体（TASK-38・TASK-39）が未実装の間は引数の有無によらず
+/// 常に `PermissionDenied` を返す。ステージ実装時は、各ステージが適用完了を示す証跡型（形は
+/// TASK-38・TASK-39 で決める）を返し、それを本関数の引数に取って初めて許可する形へ置き換える
+/// （REPAIR-3: 実装済みを装わない）。
+fn require_restriction_evidence(
+    _capability_report: Option<&CapabilityReport>,
+) -> Result<(), ExecError> {
     Err(ExecError::new(
         ErrorCode::PermissionDenied,
         IsolationStage::Exec,
-        "refusing to exec: no evidence that the isolation restrictions were applied (capability drop, seccomp and Landlock stages are not implemented yet)",
+        "refusing to exec: no evidence that the isolation restrictions were applied (seccomp and Landlock stages are not implemented yet)",
     ))
 }
 
@@ -276,7 +280,7 @@ pub fn exec_entrypoint(
     entry: &Entrypoint,
 ) -> Result<Infallible, ExecError> {
     isolation.verify_caller(IsolationStage::Exec)?;
-    require_restriction_evidence()?;
+    require_restriction_evidence(None)?;
     exec_entrypoint_verified(pivot.new_root_mnt_id, entry)
 }
 
@@ -626,7 +630,12 @@ fn run_child(
     let prepared = prepare_rootfs(&isolation, rootfs)?;
     let report = pivot_root(&isolation, prepared)?;
     // pivot 後・exec 前にステージ列を固定順で実行する。exec は終端クロージャからしか呼ばれない。
-    stages.run_then(|_stage_report| exec_entrypoint(&isolation, &report, entry))
+    stages.run_then(|_stage_report, capability_report| {
+        // `exec_entrypoint` と同じ検証を、capability 削減の結果を添えて行う。
+        isolation.verify_caller(IsolationStage::Exec)?;
+        require_restriction_evidence(capability_report)?;
+        exec_entrypoint_verified(report.new_root_mnt_id, entry)
+    })
 }
 
 /// 分離済み（`isolate` / `isolate_rootful_host_root` の後）の親から子を fork し、子で
@@ -1234,7 +1243,7 @@ mod tests {
     /// SEC-1・CORE-5: 制限ステージの証跡が無い間は、継承された制限の有無にかかわらず exec を拒否する。
     #[test]
     fn sec1_exec_is_denied_without_restriction_evidence() {
-        let err = require_restriction_evidence().unwrap_err();
+        let err = require_restriction_evidence(None).unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
         assert_eq!(err.stage, IsolationStage::Exec);
         assert_eq!(exit_code_for(&err), EXIT_EXEC_NOT_EXECUTABLE);
@@ -1264,7 +1273,7 @@ mod tests {
             p = p.with_hook(kind, || Ok(())).unwrap();
         }
         let err = p
-            .run_then(|_report| require_restriction_evidence())
+            .run_then(|_report, caps| require_restriction_evidence(caps))
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
         assert_eq!(err.stage, IsolationStage::Exec);

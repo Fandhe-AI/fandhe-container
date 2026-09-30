@@ -83,8 +83,7 @@ use std::path::{Component, Path};
 use std::time::Duration;
 
 use crate::rootless::{
-    self, IdKind, IdMapReport, IdMapSet, IdMapWriter, MapperReply, RootlessError, TargetPid,
-    WriterKind,
+    self, IdMapReport, IdMapSet, IdMapWriter, MapperReply, RootlessError, WriterKind,
 };
 use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
@@ -1145,18 +1144,10 @@ fn rootless_handshake(
             ));
         }
     }
-    // mapper の申告に依存せず、自プロセスの写像を読み戻して計画と照合する（fail-closed）。
-    let me = TargetPid::new(std::process::id()).map_err(ExecError::from_rootless)?;
-    for (kind, set) in [(IdKind::Uid, &plan.uid), (IdKind::Gid, &plan.gid)] {
-        let got = rootless::read_id_map(me, kind).map_err(ExecError::from_rootless)?;
-        if got != set.entries() {
-            return Err(ExecError::new(
-                ErrorCode::Internal,
-                IsolationStage::UserNamespaceMap,
-                "the applied id mapping does not match the plan",
-            ));
-        }
-    }
+    // 写像の照合は mapper 側（親の user namespace の外側）が `apply_id_maps_to` の読み戻しで済ませ、
+    // Ok 応答はその検証通過を意味する。分離先の namespace から /proc/self/{uid,gid}_map を読むと
+    // lower ID が読み手基準（opener の user namespace）で表示され、外側の ID と直接比較できない
+    // ため、ここでは比較せず、namespace 内で uid / gid が 0 になったことだけを確かめる。
     if sys::effective_uid() != 0 || sys::effective_gid() != 0 {
         return Err(ExecError::new(
             ErrorCode::Internal,

@@ -59,8 +59,8 @@ mod linux {
         NamespaceSet, plan_rootless_subordinate, spawn_container,
     };
     use fandhe_container_core::rootless::{
-        DEFAULT_HELPER_TIMEOUT, HelperPaths, IdKind, IdMapSet, IdMapWriter, SubIdOwner, TargetPid,
-        WriterKind, load_subordinate_ids, read_id_map, rootless_mapping, single_id_mapping,
+        DEFAULT_HELPER_TIMEOUT, HelperPaths, IdMapSet, IdMapWriter, SubIdOwner, WriterKind,
+        load_subordinate_ids, rootless_mapping, single_id_mapping,
     };
 
     const ENTRY: &str = "entry";
@@ -299,21 +299,28 @@ mod linux {
         assert_eq!(report.id_maps.uid, uid);
         assert_eq!(report.id_maps.gid, gid);
 
-        // 自プロセスの写像を読み戻して、計画どおりであることを具体値で照合する。
-        let me = TargetPid::new(std::process::id()).expect("pid");
-        assert_eq!(
-            read_id_map(me, IdKind::Uid).expect("read uid_map"),
-            uid.entries()
-        );
-        assert_eq!(
-            read_id_map(me, IdKind::Gid).expect("read gid_map"),
-            gid.entries()
-        );
-        if name == "direct" {
-            let line = std::fs::read_to_string("/proc/self/uid_map").expect("uid_map");
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            assert_eq!(fields, ["0", euid.to_string().as_str(), "1"]);
-        }
+        // 写像の外側 ID との照合は mapper 側（`apply_id_maps_to`）が済ませている。分離先からの
+        // 読み戻しは lower ID が読み手基準になり外側の ID と直接比較できないため、ここでは
+        // namespace 内の ID（第 1 列）だけを具体値で確かめる。
+        let map_firsts = |file: &str| -> Vec<String> {
+            std::fs::read_to_string(file)
+                .unwrap_or_else(|e| panic!("read {file}: {e}"))
+                .lines()
+                .filter_map(|l| l.split_whitespace().next().map(str::to_owned))
+                .collect()
+        };
+        let want_uid: Vec<String> = uid
+            .entries()
+            .iter()
+            .map(|e| e.container_id.to_string())
+            .collect();
+        let want_gid: Vec<String> = gid
+            .entries()
+            .iter()
+            .map(|e| e.container_id.to_string())
+            .collect();
+        assert_eq!(map_firsts("/proc/self/uid_map"), want_uid);
+        assert_eq!(map_firsts("/proc/self/gid_map"), want_gid);
 
         let path = format!("/{ENTRY}");
         let entry = Entrypoint::new(&path, [path.as_str()], [] as [&str; 0]).expect("entrypoint");

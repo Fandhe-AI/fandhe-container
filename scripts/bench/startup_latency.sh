@@ -272,17 +272,19 @@ rt_state() { run_rt "$1" "$2" state "$3"; }
 # state の stderr（引数のファイル）が「コンテナが存在しない」ことを明確に示すか。OCI の CLI
 # 契約には不存在専用の応答がないため、fandhe-container の CLI のエラー形式（ERR-1: stderr へ
 # 機械可読な code / message の構造化エラー。不存在は ERR-3 / ERR-5 と同じ NOT_FOUND）に
-# 合わせ、JSON オブジェクト行の code がすべて NOT_FOUND（1 件以上）の場合だけ真にする。
-# 自由文の文言は解釈しない（runc 等の構造化エラーを持たないランタイムは常に偽＝不明扱い）。
-# CLI（TASK-79）のエラー形式が確定したらこの関数を合わせる。
+# 合わせる。空行を除く全行が「code・message が文字列の JSON オブジェクト」で、code がすべて
+# NOT_FOUND（1 行以上）の場合だけ真にする。自由文・不正な JSON・code が文字列でない行・
+# 別の code が 1 行でも混ざれば判定不能として偽にする（runc 等の構造化エラーを持たない
+# ランタイムは常に偽＝不明扱い）。CLI（TASK-79）のエラー形式が確定したらこの関数を合わせる。
 rt_is_not_found() {
-  local codes code
-  codes="$(jq -Rr 'fromjson? | objects | .code | strings' <"$1" 2>/dev/null)" || return 1
-  [ -n "$codes" ] || return 1
-  while IFS= read -r code; do
-    [ "$code" = "NOT_FOUND" ] || return 1
-  done <<<"$codes"
-  return 0
+  jq -Rse '
+    [split("\n")[] | select(length > 0)] as $lines
+    | ($lines | length) > 0
+      and all($lines[];
+        (try fromjson catch null) as $o
+        | ($o | type) == "object"
+          and ($o.code | type) == "string" and ($o.message | type) == "string"
+          and $o.code == "NOT_FOUND")' <"$1" >/dev/null 2>&1
 }
 # ---------------------------------------------------------------------------
 

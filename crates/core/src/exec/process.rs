@@ -773,6 +773,21 @@ impl ContainerChild {
         }
     }
 
+    /// 子の終了を `timeout` まで待つが、期限を過ぎても kill しない（監視用。REPAIR-5・CORE-1）。
+    ///
+    /// start から起動済みプロセスのハンドルを引き取った所有者（supervisor 等）が、コンテナの終了を
+    /// 監視・回収するために使う（`oci_runtime::ContainerChildProcess` の `LaunchedProcess::wait`）。
+    /// [`Self::wait_timeout`] と同じ回収状態の排他（`poll_until`）で回収する。
+    ///
+    /// - 期限内に終われば回収して `Ok(Some(終了状態))`（回収済みなら `waitpid` せず記録を返す）
+    /// - 期限までに終わらなければ `Ok(None)`。子はそのまま動き続け、同じハンドルで再び待てる
+    ///
+    /// `timeout` は 7 日に丸める。
+    pub fn wait_for_exit(&self, timeout: Duration) -> Result<Option<ChildExit>, ExecError> {
+        let deadline = Instant::now() + timeout.min(WAIT_TIMEOUT_MAX);
+        Ok(self.poll_until(deadline)?.map(|(exit, _)| exit))
+    }
+
     /// 子を待たずに終了させ、`timeout` まで回収を待つ（REPAIR-5。状態記録に失敗した起動の後始末用）。
     ///
     /// `oci_runtime` の start が起動後の状態記録に失敗したとき、`LaunchedProcess::terminate` の実装
@@ -1354,6 +1369,30 @@ mod tests {
         assert_eq!(
             handle.kill_and_reap(Duration::from_secs(1)).unwrap(),
             ChildExit::Exited(4)
+        );
+        assert_eq!(reap_snapshot(&handle).1, 0);
+    }
+
+    /// CORE-1・REPAIR-5（TASK-29.3）: `wait_for_exit` は期限を過ぎても kill せず `None` を返し、終了後は
+    /// 回収して終了状態を返す。
+    #[test]
+    fn core1_wait_for_exit_polls_without_kill() {
+        let pid = spawn_sh("exec sleep 30");
+        let handle = ContainerChild::new(pid);
+        assert_eq!(
+            handle.wait_for_exit(Duration::from_millis(100)).unwrap(),
+            None
+        );
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        assert_eq!(reap_snapshot(&handle), (ReapState::Running, 0));
+        assert_eq!(
+            handle.kill_and_reap(Duration::from_secs(10)).unwrap(),
+            ChildExit::Signaled(9)
+        );
+        let handle = ContainerChild::new(spawn_sh("exit 6"));
+        assert_eq!(
+            handle.wait_for_exit(Duration::from_secs(10)).unwrap(),
+            Some(ChildExit::Exited(6))
         );
         assert_eq!(reap_snapshot(&handle).1, 0);
     }

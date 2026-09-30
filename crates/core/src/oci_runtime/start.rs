@@ -25,7 +25,8 @@
 //!    後始末スレッドが [`LaunchedProcess::terminate`]（上限 [`StartTimeouts::terminate`] を強制）で
 //!    kill・回収する。launch と後始末が終わるまでプロセス内の予約（`StartReservation`）も保持し、
 //!    同一プロセス内の start・回復を拒否する（進行中の launch との二重起動防止。CORE-2）
-//! 7. Running（pid 付き）へ状態更新。更新に失敗した場合は起動済みプロセスを上限
+//! 7. Running（pid 付き）へ状態更新。成功したら状態と起動済みプロセスのハンドル（[`StartedContainer`]）を
+//!    返し、監視・回収の責務を呼び出し元へ引き渡す（CORE-1）。更新に失敗した場合は起動済みプロセスを上限
 //!    [`StartTimeouts::terminate`] つきで終了し、予約を Created へ戻してから、元のエラーを返す。
 //!    終了にも失敗した・上限を超えた場合は、未記録プロセスが残り得ることを示す `Internal` を返し、
 //!    元のエラーで隠さない（予約は残す。REPAIR-5）
@@ -123,9 +124,47 @@ const START_OP_NAME: &str = "start";
 /// （子を kill・回収済み）と境界の打ち切りが競合する。猶予内に応答があればそれを使い、予約を正しく戻す。
 pub const LAUNCHER_REPLY_GRACE: Duration = Duration::from_secs(1);
 
+/// start の成功結果（更新後の状態と、起動済みプロセスのハンドル）。
+///
+/// ハンドルは呼び出し元へ引き渡され、呼び出し元（supervisor〔TASK-157・SUP 系〕等）が監視・回収の
+/// 所有者になる。`ContainerChildProcess` 等のハンドルは `Drop` で回収しないため、所有者は
+/// [`LaunchedProcess::wait`] で終了を待って回収する（捨てるとゾンビが残り得る。CORE-1）。
+#[must_use = "the launched process must be monitored and reaped by its owner"]
+pub struct StartedContainer {
+    record: StateRecord,
+    process: Box<dyn LaunchedProcess>,
+}
+
+impl StartedContainer {
+    /// 更新後（Running・pid 付き）の状態。
+    pub fn record(&self) -> &StateRecord {
+        &self.record
+    }
+
+    /// 起動済みプロセスのハンドル。
+    pub fn process(&self) -> &dyn LaunchedProcess {
+        self.process.as_ref()
+    }
+
+    /// 状態とハンドルに分解する（ハンドルの所有権を監視側へ移す）。
+    pub fn into_parts(self) -> (StateRecord, Box<dyn LaunchedProcess>) {
+        (self.record, self.process)
+    }
+}
+
+impl std::fmt::Debug for StartedContainer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartedContainer")
+            .field("record", &self.record)
+            .field("pid", &self.process.pid())
+            .finish()
+    }
+}
+
 /// Created 状態のコンテナのプロセスを起動し、Running（pid 付き）へ遷移させる。
 ///
-/// 戻り値は更新後の [`StateRecord`]。未 create の ID は [`ErrorCode::NotFound`]、Created 以外は
+/// 戻り値は更新後の [`StateRecord`] と起動済みプロセスのハンドル（[`StartedContainer`]。監視・回収は
+/// 呼び出し元の責務）。未 create の ID は [`ErrorCode::NotFound`]、Created 以外は
 /// [`ErrorCode::FailedPrecondition`]、launcher の応答が上限（`timeouts`）を超えたら
 /// [`ErrorCode::Timeout`]（予約は残り [`recover_interrupted_start`] で回復する）。launcher は上限超過後も
 /// 後始末スレッドから使うため `Arc` で受ける。成功・失敗の件数と所要時間は `recorder` へ操作名 `start` で
@@ -136,7 +175,7 @@ pub fn start(
     launcher: &Arc<dyn ProcessLauncher>,
     req: &StartRequest,
     timeouts: &StartTimeouts,
-) -> Result<StateRecord, TraitError> {
+) -> Result<StartedContainer, TraitError> {
     let name = OpName::new(START_OP_NAME)?;
     recorder.record_op(&name, || start_inner(store, launcher, req, timeouts))
 }
@@ -316,7 +355,7 @@ fn start_inner(
     launcher: &Arc<dyn ProcessLauncher>,
     req: &StartRequest,
     timeouts: &StartTimeouts,
-) -> Result<StateRecord, TraitError> {
+) -> Result<StartedContainer, TraitError> {
     let reservation = Arc::new(StartReservation::acquire(req.id())?);
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     if record.status().state() != ContainerState::Created {
@@ -375,7 +414,8 @@ fn start_inner(
 
     let running = ContainerStatus::running(req.id().clone(), Some(process.pid()));
     match store.update(&UpdateStateRequest::new(running, claimed.revision())) {
-        Ok(updated) => Ok(updated),
+        // ハンドルは呼び出し元（監視・回収の所有者）へ引き渡す（捨てると回収できない。CORE-1）。
+        Ok(record) => Ok(StartedContainer { record, process }),
         Err(err) => {
             // 状態を記録できないまま生きたプロセスを残さない。終了できなかった・上限を超えた場合は
             // 未記録プロセスが残り得ることを呼び出し元へ伝える（元のエラーで隠さない。予約は残す）。
@@ -591,7 +631,7 @@ fn unsupported(field: &'static str) -> TraitError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oci_runtime::{LaunchedProcess, create};
+    use crate::oci_runtime::{LaunchedProcess, ProcessExit, create};
     use crate::traits::{
         ContainerId, CreateRequest, CreateStateRequest, DeleteStateRequest, DeleteStateResponse,
         ListStateRequest, StateList, StateRevision,
@@ -766,6 +806,15 @@ mod tests {
             NonZeroU32::new(4242).expect("nonzero")
         }
 
+        /// 模擬プロセスは terminate されるまで終了しない（terminate 後は SIGKILL 相当で終了済み）。
+        fn wait(&self, _timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            if self.0.load(Ordering::SeqCst) > 0 {
+                Ok(Some(ProcessExit::Signaled(9)))
+            } else {
+                Ok(None)
+            }
+        }
+
         fn terminate(&self, _timeout: Duration) -> Result<(), TraitError> {
             self.2.pass();
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -824,7 +873,7 @@ mod tests {
         l.clone()
     }
 
-    /// 既定の上限で start する。
+    /// 既定の上限で start し、更新後の状態を返す（模擬プロセスのハンドルは回収不要のため捨てる）。
     fn run(
         store: &MemStateStore,
         launcher: &Arc<RecordingLauncher>,
@@ -837,6 +886,7 @@ mod tests {
             &sid(id),
             &StartTimeouts::default(),
         )
+        .map(|started| started.into_parts().0)
     }
 
     /// 既定の上限で中断回復する。
@@ -954,7 +1004,8 @@ mod tests {
         err
     }
 
-    /// OCI-4: start で `process.args` 等がそのまま launcher に渡り、Running・pid 付きへ遷移する。
+    /// OCI-4・CORE-1: start で `process.args` 等がそのまま launcher に渡り、Running・pid 付きへ遷移する。
+    /// 起動済みプロセスのハンドルは終了させずに呼び出し元へ引き渡される（監視・回収の所有者）。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci4_start_launches_process_args_and_transitions_to_running() {
@@ -963,7 +1014,18 @@ mod tests {
             .get(&GetStateRequest::new(ContainerId::new("ok").expect("id")))
             .expect("get");
         let launcher = RecordingLauncher::new(false);
-        let record = run(&store, &launcher, "ok").expect("start");
+        let started = start(
+            &store,
+            &OpRecorder::new(),
+            &dynl(&launcher),
+            &sid("ok"),
+            &StartTimeouts::default(),
+        )
+        .expect("start");
+        assert_eq!(started.process().pid(), NonZeroU32::new(4242).expect("pid"));
+        assert_eq!(started.process().wait(Duration::ZERO).expect("wait"), None);
+        assert_eq!(launcher.terminations(), 0);
+        let (record, process) = started.into_parts();
         assert_eq!(record.status().state(), ContainerState::Running);
         assert_eq!(record.status().pid(), NonZeroU32::new(4242));
         assert!(record.revision() > before.revision());
@@ -986,6 +1048,15 @@ mod tests {
                 NamespaceKind::Ipc
             ]
         );
+        // 引き渡されたハンドルで所有者が終了・回収できる。
+        process
+            .terminate(Duration::from_secs(5))
+            .expect("terminate");
+        assert_eq!(
+            process.wait(Duration::ZERO).expect("wait"),
+            Some(ProcessExit::Signaled(9))
+        );
+        assert_eq!(launcher.terminations(), 1);
     }
 
     /// CORE-2: create されていない ID の start は NotFound で、launcher は呼ばれない。
@@ -1193,7 +1264,7 @@ mod tests {
         let (_b, store) = created("rec");
         let launcher = RecordingLauncher::new(false);
         let rec = OpRecorder::new();
-        start(
+        let started = start(
             &store,
             &rec,
             &dynl(&launcher),
@@ -1201,6 +1272,7 @@ mod tests {
             &StartTimeouts::default(),
         )
         .expect("first");
+        assert_eq!(started.record().status().state(), ContainerState::Running);
         start(
             &store,
             &rec,

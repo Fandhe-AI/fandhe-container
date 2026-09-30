@@ -29,7 +29,8 @@ pub use create::create;
 #[cfg(target_os = "linux")]
 pub use launch::ContainerChildProcess;
 pub use launch::{
-    LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, START_TIMEOUT_MAX, StartTimeouts,
+    LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, RootfsDir, START_TIMEOUT_MAX,
+    StartTimeouts,
 };
 pub use mount_destination::MountDestination;
-pub use start::{LAUNCHER_REPLY_GRACE, recover_interrupted_start, start};
+pub use start::{LAUNCHER_REPLY_GRACE, StartedContainer, recover_interrupted_start, start};

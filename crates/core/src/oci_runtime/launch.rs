@@ -277,12 +277,33 @@ impl LaunchSpec {
     }
 }
 
+/// 起動済みプロセスの終了状態（OS 非依存。`exec::ChildExit` 等を写す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProcessExit {
+    /// `exit` した（終了コード）。
+    Exited(i32),
+    /// シグナルで終了した（シグナル番号）。
+    Signaled(i32),
+}
+
 /// 起動済みプロセスへのハンドル。
 ///
 /// start は上限を強制するため別スレッド（上限超過後の後始末を含む）へハンドルを移すので `Send` を要求する。
+/// start が成功すると、ハンドルは `StartedContainer` として呼び出し元へ引き渡され、呼び出し元
+/// （supervisor〔TASK-157・SUP 系〕等）が監視・回収の所有者になる（[`Self::wait`]・[`Self::terminate`]）。
+/// 実装は `Drop` で kill / 回収しなくてよい（コンテナの寿命をハンドルに暗黙で縛らない）ため、所有者は
+/// 終了まで待って回収する責任を負う。
 pub trait LaunchedProcess: Send {
     /// 起動したコンテナプロセスの pid。
     fn pid(&self) -> NonZeroU32;
+
+    /// プロセスの終了を `timeout` まで待つ。期限を過ぎても kill しない（監視用。REPAIR-5）。
+    ///
+    /// 終了していれば回収して `Ok(Some(終了状態))`、期限までに終了しなければ `Ok(None)`（プロセスは
+    /// 動き続け、再び待てる）。Linux の子プロセスは `ContainerChildProcess`
+    /// （`exec::ContainerChild::wait_for_exit`）で実装できる。
+    fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError>;
 
     /// 状態の記録に失敗したとき・起動待ちが上限を超えた後に返ってきたときの後始末として、
     /// プロセスを終了（kill）させて回収（wait）する。
@@ -296,8 +317,9 @@ pub trait LaunchedProcess: Send {
 /// `exec::ContainerChild`（fork した子）を [`LaunchedProcess`] として扱うアダプタ（Linux。CORE-1・REPAIR-5）。
 ///
 /// 本番 launcher（後続 sub-issue）が `exec::spawn_container` の戻り値を包んで返すために置く。
-/// [`LaunchedProcess::terminate`] は `ContainerChild::kill_and_reap` を呼び、`wait_timeout` と同じ
-/// 回収状態の排他の下で `SIGKILL` → 回収を行う（回収済みの pid へは `SIGKILL` を送らない）。
+/// [`LaunchedProcess::terminate`] は `ContainerChild::kill_and_reap`、[`LaunchedProcess::wait`] は
+/// `ContainerChild::wait_for_exit` を呼び、`wait_timeout` と同じ回収状態の排他の下で回収する（回収済みの
+/// pid へは `SIGKILL` を送らない）。
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct ContainerChildProcess {
@@ -328,6 +350,19 @@ impl ContainerChildProcess {
 impl LaunchedProcess for ContainerChildProcess {
     fn pid(&self) -> NonZeroU32 {
         self.pid
+    }
+
+    fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
+        use crate::exec::ChildExit;
+        let exit = self
+            .child
+            .wait_for_exit(timeout)
+            .map_err(|e| TraitError::new(e.code, "failed to wait for the container process"))?;
+        match exit {
+            None => Ok(None),
+            Some(ChildExit::Exited(code)) => Ok(Some(ProcessExit::Exited(code))),
+            Some(ChildExit::Signaled(sig)) => Ok(Some(ProcessExit::Signaled(sig))),
+        }
     }
 
     fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
@@ -538,9 +573,17 @@ mod tests {
             ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
                 .expect("wrap");
         assert_eq!(process.pid().get(), pid);
+        assert_eq!(
+            process.wait(Duration::from_millis(100)).expect("wait"),
+            None
+        );
         process
             .terminate(Duration::from_secs(10))
             .expect("terminate");
+        assert_eq!(
+            process.wait(Duration::ZERO).expect("wait"),
+            Some(ProcessExit::Signaled(9))
+        );
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
         assert_eq!(
             process

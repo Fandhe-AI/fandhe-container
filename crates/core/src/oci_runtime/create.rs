@@ -120,6 +120,14 @@ fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<PathBuf, TraitError> 
         return Err(invalid("root.path must not contain '..'"));
     }
     let rootfs: PathBuf = bundle.join(root_path);
+    // 絶対指定の `root.path` は bundle を置き換える。ホストの `/` を rootfs にできないようにする（SEC-1。
+    // `exec::prepare_rootfs` の `RootfsIsHostRoot` と同じ境界を起動前にも守る）。
+    if !rootfs
+        .components()
+        .any(|c| matches!(c, Component::Normal(_)))
+    {
+        return Err(invalid("rootfs must not be the filesystem root"));
+    }
     // bundle 配下の相対部分を要素ごとに検査する。bundle 自体（親が symlink でもよい）は対象外。
     // bundle 外の絶対パスは相対部分が取れないため、末尾要素のみ検査する。
     let mut checked = match rootfs.strip_prefix(bundle) {

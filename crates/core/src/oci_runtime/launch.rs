@@ -17,10 +17,78 @@
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::config::NamespaceKind;
 use crate::traits::TraitError;
+
+/// 検査済み rootfs ディレクトリのハンドル（検査対象と使用対象を同一にする。SEC-1）。
+///
+/// `start` が rootfs を検査した直後にディレクトリを開き、そのハンドルが検査したパスの実体（`st_dev`・
+/// `st_ino`）と一致し symlink でないことを確認して保持する。launcher は `rootfs()` のパス文字列を
+/// 再解決せず、このハンドル（`/proc/self/fd/<fd>` や `fchdir` 経由）から rootfs を使うこと。
+/// 検査から使用までの間にパスが symlink 等へ差し替えられても、ハンドルは検査済みの実体を指し続ける。
+/// Unix 以外にはハンドルの実装が無く（本番 launcher も Linux のみ。CLI-1）、空の値になる。
+#[derive(Debug, Clone)]
+pub struct RootfsDir {
+    #[cfg(unix)]
+    file: Arc<std::fs::File>,
+}
+
+impl RootfsDir {
+    /// `path` のディレクトリを開き、検査済みの実体と同一であることを確認して保持する。
+    #[cfg(unix)]
+    pub(super) fn open_checked(path: &Path) -> Result<Self, TraitError> {
+        use std::os::unix::fs::MetadataExt;
+        let fail =
+            |msg: &'static str| TraitError::new(crate::traits::ErrorCode::PermissionDenied, msg);
+        let file = std::fs::File::open(path).map_err(|_| fail("cannot open rootfs directory"))?;
+        let opened = file
+            .metadata()
+            .map_err(|_| fail("cannot inspect rootfs directory"))?;
+        let named =
+            std::fs::symlink_metadata(path).map_err(|_| fail("cannot inspect rootfs directory"))?;
+        if named.file_type().is_symlink()
+            || !opened.is_dir()
+            || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
+        {
+            return Err(fail("rootfs changed after validation"));
+        }
+        Ok(Self {
+            file: Arc::new(file),
+        })
+    }
+
+    /// Unix 以外ではハンドルを持たない。
+    #[cfg(not(unix))]
+    pub(super) fn open_checked(_path: &Path) -> Result<Self, TraitError> {
+        Ok(Self {})
+    }
+
+    /// 検査済み rootfs ディレクトリのファイルハンドル。
+    #[cfg(unix)]
+    pub fn file(&self) -> &std::fs::File {
+        &self.file
+    }
+}
+
+impl PartialEq for RootfsDir {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            Arc::ptr_eq(&self.file, &other.file)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = other;
+            true
+        }
+    }
+}
+
+impl Eq for RootfsDir {}
 
 /// launcher へ渡す、検証済みの起動仕様。
 ///
@@ -31,6 +99,7 @@ use crate::traits::TraitError;
 #[non_exhaustive]
 pub struct LaunchSpec {
     rootfs: PathBuf,
+    rootfs_dir: RootfsDir,
     args: Vec<String>,
     env: Vec<String>,
     hostname: Option<String>,
@@ -40,6 +109,7 @@ pub struct LaunchSpec {
 impl LaunchSpec {
     pub(super) fn new(
         rootfs: PathBuf,
+        rootfs_dir: RootfsDir,
         args: Vec<String>,
         env: Vec<String>,
         hostname: Option<String>,
@@ -47,6 +117,7 @@ impl LaunchSpec {
     ) -> Self {
         Self {
             rootfs,
+            rootfs_dir,
             args,
             env,
             hostname,
@@ -54,9 +125,14 @@ impl LaunchSpec {
         }
     }
 
-    /// 検査済みの rootfs の絶対パス。
+    /// 検査済みの rootfs の絶対パス（表示・記録用。使用には [`Self::rootfs_dir`] を使うこと）。
     pub fn rootfs(&self) -> &Path {
         &self.rootfs
+    }
+
+    /// 検査済み rootfs のディレクトリハンドル（SEC-1。[`RootfsDir`] 参照）。
+    pub fn rootfs_dir(&self) -> &RootfsDir {
+        &self.rootfs_dir
     }
 
     /// `process.args`（そのまま。先頭は実行ファイルの絶対パス）。
@@ -101,6 +177,11 @@ pub trait LaunchedProcess: Send {
 /// - 起動確認（子からの通知待ち等）には必ず上限時間を設け、超過時は `ErrorCode::Timeout`（REPAIR-5）
 /// - exec フローの fail-closed（制限証跡なしの exec 拒否。SEC-1・CORE-5）を回避しない
 /// - 失敗時にプロセスを残さない
+/// - rootfs は [`LaunchSpec::rootfs_dir`] のハンドルから使い、`rootfs()` のパスを再解決しない（SEC-1）
+/// - `linux.uidMappings` / `gidMappings` は `start` が拒否済みで `LaunchSpec` に載らない。user namespace の
+///   写像は launcher の責務で、コンテナ内 root（uid/gid 0）をホストの非特権 UID・GID（呼び出しプロセスの
+///   euid・egid。0 なら拒否）へ写すこと。`exec::plan` / `exec::isolate` が既定でこの写像を行う（SEC-5）
+/// - `LaunchSpec::namespaces` には Pid・Mount・User が必ず含まれる（`start` が検証済み。hostname があれば Uts も）
 ///
 /// 本番実装は本 crate に未提供（モジュール doc 参照）。
 pub trait ProcessLauncher: Send + Sync {

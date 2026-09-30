@@ -13,15 +13,17 @@
 //! 2. `Created` 以外は `FailedPrecondition`（`ContainerRuntime::start` の契約）
 //! 3. `config.json` を再読込・再検証（create 後の書き換え = TOCTOU 対策。ダイジェスト保持は
 //!    `StateRecord` の拡張〔TASK-31・TASK-157.2 の領域〕を要するため採らない）
-//! 4. 適用できない指定の fail-closed 拒否（下記）
-//! 5. launcher 起動（失敗時はストア無変更）
-//! 6. Running へ状態更新。更新に失敗した場合は起動済みプロセスを上限時間つきで終了してから、
-//!    元のエラーを返す。終了にも失敗した場合（`Timeout` 等）は、未記録プロセスが残り得ることを
-//!    示す `Internal` を返し、元のエラーで隠さない（REPAIR-5）
+//! 4. 適用できない指定の fail-closed 拒否・args / env の上限検証・rootfs ハンドルの取得（下記）
+//! 5. 起動権の予約: `StateStore::update` を revision 照合つきで呼び、Created を Running（pid なし）へ
+//!    原子的に遷移させる。別プロセスの同時 start はここで revision 不一致（`FailedPrecondition`）に
+//!    なり launch へ進めない（CORE-2）
+//! 6. launcher 起動。失敗時は予約を Created へ戻す（戻せない場合は `Internal` で伝える）
+//! 7. Running（pid 付き）へ状態更新。更新に失敗した場合は起動済みプロセスを上限時間つきで終了し、
+//!    予約を Created へ戻してから、元のエラーを返す。終了にも失敗した場合（`Timeout` 等）は、
+//!    未記録プロセスが残り得ることを示す `Internal` を返し、元のエラーで隠さない（REPAIR-5）
 //!
-//! 手順 1〜6 は同一 ID につきプロセス内で排他する（起動前の予約。並行 start による二重 launch の防止。
-//! CORE-2）。別プロセス間の排他は `StateStore` の revision 照合（更新時のみ）に依存し、本関数では
-//! 保証しない（ファイルベース StateStore のロックは TASK-31 の領域）。
+//! 手順 1〜7 は同一 ID につきプロセス内でも排他する（並行 start の早期拒否。CORE-2）。プロセス間の
+//! 排他は手順 5 の revision 照合（`StateStore` 実装が更新を原子的に照合する契約）に依存する。
 //!
 //! # fail-closed の拒否（SEC-1・SEC-5・CORE-5・REPAIR-3）
 //!
@@ -37,8 +39,19 @@
 //! - `network`・`cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）
 //! - `linux.namespaces` に user namespace が無い（`process.user` は root 必須のため、ホスト root での
 //!   起動になる。`PermissionDenied`。SEC-5）
-//! - `linux.uidMappings` / `gidMappings` が非空（subuid 範囲写像は TASK-40・CORE-6）
+//! - `linux.namespaces` に PID・mount namespace が無い、または hostname 指定があるのに UTS namespace が
+//!   無い（`exec::plan` の共通検証と同じ。ホストのプロセス・マウントが見える起動を防ぐ。`InvalidArgument`）
+//! - `linux.uidMappings` / `gidMappings` が非空（config 指定の写像は subuid 範囲写像とともに
+//!   TASK-40・CORE-6 で対応する。SEC-5 の「コンテナ内 root をホストの非特権 UID へ写す」写像は
+//!   launcher の契約で、`exec::isolate` が呼び出しプロセスの euid / egid へ写す。`ProcessLauncher` 参照）
 //! - `root.readonly` が true（読み取り専用 rootfs 未実装）
+//!
+//! `process.args` / `process.env` は `exec::Entrypoint::new` と同じ上限（件数 4096・1 要素 131072 バイト・
+//! 合計 1 MiB。NUL 禁止・env は `KEY=VALUE`）を `LaunchSpec` 構築前に検証し、違反は `InvalidArgument`。
+//! `exec` は Linux 限定のため、値は本ファイルに複製し Linux では一致をテストで固定する。
+//!
+//! rootfs は検査直後にディレクトリを開いて実体の同一性を確認し、ハンドルを `LaunchSpec` に載せる
+//! （検査から使用までの差し替え = TOCTOU を閉じる。SEC-1。`RootfsDir` 参照）。
 //!
 //! `process.args[0]` がコンテナ内の絶対パス（先頭 `/`）でない場合は `InvalidArgument`（PATH 探索は未実装）。
 //! コンテナパスはホスト OS 非依存に文字列で判定する（Windows でも `/bin/echo` を受理する。3 OS 一級対応）。
@@ -59,7 +72,7 @@ use std::time::Duration;
 
 use super::config::{NamespaceKind, OciConfig};
 use super::create::validate_bundle;
-use super::launch::{LaunchSpec, ProcessLauncher};
+use super::launch::{LaunchSpec, ProcessLauncher, RootfsDir};
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
@@ -131,22 +144,49 @@ fn start_inner(
     }
 
     let spec = build_spec(record.bundle())?;
-    let process = launcher.launch(&spec)?;
+
+    // 起動権の予約。revision 照合つき更新は別プロセスの同時 start と排他になる（CORE-2）。
+    let claimed = store.update(&UpdateStateRequest::new(
+        ContainerStatus::running(req.id().clone(), None),
+        record.revision(),
+    ))?;
+
+    let process = match launcher.launch(&spec) {
+        Ok(p) => p,
+        Err(err) => return Err(release_claim(store, req.id(), &claimed, err)),
+    };
 
     let running = ContainerStatus::running(req.id().clone(), Some(process.pid()));
-    match store.update(&UpdateStateRequest::new(running, record.revision())) {
+    match store.update(&UpdateStateRequest::new(running, claimed.revision())) {
         Ok(updated) => Ok(updated),
         Err(err) => {
             // 状態を記録できないまま生きたプロセスを残さない。終了できなかった場合は
             // 未記録プロセスが残り得ることを呼び出し元へ伝える（元のエラーで隠さない）。
             match process.terminate(TERMINATE_TIMEOUT) {
-                Ok(()) => Err(err),
+                Ok(()) => Err(release_claim(store, req.id(), &claimed, err)),
                 Err(_) => Err(TraitError::new(
                     ErrorCode::Internal,
                     "failed to record running state and failed to terminate the launched process",
                 )),
             }
         }
+    }
+}
+
+/// 予約（Running・pid なし）を Created へ戻す。戻せない場合は状態が残り得ることを `Internal` で伝える。
+fn release_claim(
+    store: &dyn StateStore,
+    id: &ContainerId,
+    claimed: &StateRecord,
+    original: TraitError,
+) -> TraitError {
+    let created = ContainerStatus::created(id.clone(), None);
+    match store.update(&UpdateStateRequest::new(created, claimed.revision())) {
+        Ok(_) => original,
+        Err(_) => TraitError::new(
+            ErrorCode::Internal,
+            "start failed and the start reservation could not be released",
+        ),
     }
 }
 
@@ -167,6 +207,7 @@ fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
             "process.args[0] must be an absolute path",
         ));
     }
+    validate_entrypoint_limits(process.args(), process.env())?;
     let user = process.user();
     if process.cwd() != Path::new("/") {
         return Err(unsupported("process.cwd other than /"));
@@ -191,8 +232,33 @@ fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
     }
 
     let namespaces: Vec<NamespaceKind> = config.namespaces().iter().map(|n| n.kind()).collect();
+    // exec::plan の共通検証と同じ組合せ（Pid には Mount、hostname には Uts）に加え、Pid・Mount を必須とする。
+    let has = |k: NamespaceKind| namespaces.contains(&k);
+    if !has(NamespaceKind::Pid) || !has(NamespaceKind::Mount) {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "the PID and mount namespaces are required",
+        ));
+    }
+    if config.hostname().is_some() && !has(NamespaceKind::Uts) {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "hostname requires the UTS namespace",
+        ));
+    }
+    // 検査済みパスの実体をハンドルで固定し、検査から使用までの差し替えを閉じる（SEC-1）。
+    // ハンドル取得後にもう一度検査し、取得までの間に祖先が symlink 化された場合を拒否する。
+    let rootfs_dir = RootfsDir::open_checked(&rootfs)?;
+    let (_, rechecked) = validate_bundle(bundle)?;
+    if rechecked != rootfs {
+        return Err(TraitError::new(
+            ErrorCode::PermissionDenied,
+            "rootfs changed after validation",
+        ));
+    }
     Ok(LaunchSpec::new(
         rootfs,
+        rootfs_dir,
         process.args().to_vec(),
         process.env().to_vec(),
         config.hostname().map(str::to_owned),
@@ -224,6 +290,50 @@ fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
     Ok(())
 }
 
+/// `exec::ENTRYPOINT_MAX_ARGS`（`exec` は Linux 限定のため複製。Linux ではテストで一致を確認する）。
+const ARGS_MAX: usize = 4096;
+/// `exec::ENTRYPOINT_MAX_ENV`。
+const ENV_MAX: usize = 4096;
+/// `exec::ENTRYPOINT_MAX_STRING_BYTES`（NUL を含む 1 要素の上限）。
+const STRING_MAX_BYTES: usize = 131_072;
+/// `exec::ENTRYPOINT_MAX_TOTAL_BYTES`（path・argv・env の NUL 込み合計。path は `args[0]`）。
+const TOTAL_MAX_BYTES: usize = 1 << 20;
+
+/// `exec::Entrypoint::new` 相当の上限・形式検証を `LaunchSpec` 構築前に行う（DoS 防止・REPAIR-2）。
+///
+/// 上限の検証は要素を走査する前の件数で先に行い、以後は加算のみで確保しない。
+fn validate_entrypoint_limits(args: &[String], env: &[String]) -> Result<(), TraitError> {
+    let invalid = |msg: &'static str| TraitError::new(ErrorCode::InvalidArgument, msg);
+    if args.is_empty() || args.len() > ARGS_MAX || env.len() > ENV_MAX {
+        return Err(invalid(
+            "process.args / process.env exceed the count limits",
+        ));
+    }
+    // path（args[0]）は argv とは別に数えられるため、合計に 2 回加算される。
+    let mut total = args.first().map_or(0, |a| a.len().saturating_add(1));
+    for item in args.iter().chain(env.iter()) {
+        let size = item.len().saturating_add(1);
+        if size > STRING_MAX_BYTES {
+            return Err(invalid("a process.args / process.env element is too large"));
+        }
+        if item.contains('\0') {
+            return Err(invalid("process.args / process.env must not contain NUL"));
+        }
+        total = total.saturating_add(size);
+        if total > TOTAL_MAX_BYTES {
+            return Err(invalid(
+                "process.args / process.env exceed the total size limit",
+            ));
+        }
+    }
+    for entry in env {
+        if !matches!(entry.find('='), Some(i) if i > 0) {
+            return Err(invalid("each process.env element must be KEY=VALUE"));
+        }
+    }
+    Ok(())
+}
+
 /// 静的なフィールド名だけを含む `Unimplemented` を作る（config の値は含めない）。
 fn unsupported(field: &'static str) -> TraitError {
     TraitError::new(
@@ -250,14 +360,17 @@ mod tests {
     /// テスト専用のインメモリ `StateStore`。`update` は revision を照合し、失敗注入もできる。
     struct MemStateStore {
         records: Mutex<HashMap<ContainerId, StateRecord>>,
-        fail_update: bool,
+        /// `update` の n 回目（0 始まり）の呼び出しだけ失敗させる。
+        fail_update_at: Option<usize>,
+        update_calls: AtomicUsize,
     }
 
     impl MemStateStore {
-        fn new(fail_update: bool) -> Self {
+        fn new(fail_update_at: Option<usize>) -> Self {
             Self {
                 records: Mutex::new(HashMap::new()),
-                fail_update,
+                fail_update_at,
+                update_calls: AtomicUsize::new(0),
             }
         }
     }
@@ -278,7 +391,8 @@ mod tests {
         }
 
         fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
-            if self.fail_update {
+            let n = self.update_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_update_at == Some(n) {
                 return Err(TraitError::new(ErrorCode::FailedPrecondition, "conflict"));
             }
             let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
@@ -418,7 +532,9 @@ mod tests {
                 "env": ["PATH=/bin", "K=V"],
                 "cwd": "/"
             },
-            "linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}, {"type": "user"}]}
+            "linux": {"namespaces": [
+                {"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "uts"}
+            ]}
         })
     }
 
@@ -434,7 +550,7 @@ mod tests {
         let b = Bundle::new(name);
         b.write_config(&valid_config());
         std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
-        let store = MemStateStore::new(false);
+        let store = MemStateStore::new(None);
         create(&store, &OpRecorder::new(), &b.create_req(name)).expect("create");
         (b, store)
     }
@@ -477,7 +593,8 @@ mod tests {
             [
                 NamespaceKind::Pid,
                 NamespaceKind::Mount,
-                NamespaceKind::User
+                NamespaceKind::User,
+                NamespaceKind::Uts
             ]
         );
     }
@@ -485,7 +602,7 @@ mod tests {
     /// CORE-2: create されていない ID の start は NotFound で、launcher は呼ばれない。
     #[test]
     fn core2_start_unknown_id_returns_not_found() {
-        let store = MemStateStore::new(false);
+        let store = MemStateStore::new(None);
         let launcher = RecordingLauncher::new(false);
         let err = start(&store, &OpRecorder::new(), &launcher, &sid("nope")).expect_err("fail");
         assert_eq!(err.code(), ErrorCode::NotFound);
@@ -612,7 +729,7 @@ mod tests {
         let b = Bundle::new("upd-fail");
         b.write_config(&valid_config());
         std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
-        let store = MemStateStore::new(true);
+        let store = MemStateStore::new(Some(1));
         create(&store, &OpRecorder::new(), &b.create_req("upd-fail")).expect("create");
         let launcher = RecordingLauncher::new(false);
         let err = start(&store, &OpRecorder::new(), &launcher, &sid("upd-fail")).expect_err("fail");
@@ -653,7 +770,7 @@ mod tests {
         let b = Bundle::new("term-fail");
         b.write_config(&valid_config());
         std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
-        let store = MemStateStore::new(true);
+        let store = MemStateStore::new(Some(1));
         create(&store, &OpRecorder::new(), &b.create_req("term-fail")).expect("create");
         let mut launcher = RecordingLauncher::new(false);
         launcher.fail_terminate = true;
@@ -694,5 +811,114 @@ mod tests {
         assert_eq!(stats.success(), 1);
         assert_eq!(stats.failure(), 1);
         assert!(stats.latency().is_some());
+    }
+
+    /// SEC-1・SEC-5: PID / mount namespace が欠けた、または hostname に UTS が無い config は拒否する。
+    #[test]
+    fn sec1_start_rejects_incomplete_namespace_sets() {
+        let cases: Vec<(&str, Value, &str)> = vec![
+            (
+                "userns-only",
+                json!([{"type": "user"}, {"type": "uts"}]),
+                "the PID and mount namespaces are required",
+            ),
+            (
+                "no-mount",
+                json!([{"type": "pid"}, {"type": "user"}, {"type": "uts"}]),
+                "the PID and mount namespaces are required",
+            ),
+            (
+                "no-uts",
+                json!([{"type": "pid"}, {"type": "mount"}, {"type": "user"}]),
+                "hostname requires the UTS namespace",
+            ),
+        ];
+        for (name, namespaces, message) in cases {
+            let mut cfg = valid_config();
+            cfg["linux"]["namespaces"] = namespaces;
+            let err = start_rejected_after_rewrite(&format!("ns-{name}"), &cfg);
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "case {name}");
+            assert_eq!(err.message(), message, "case {name}");
+        }
+    }
+
+    /// SEC-1: 絶対指定の `root.path` でホストの `/` を rootfs にする起動は拒否する。
+    #[test]
+    fn sec1_start_rejects_host_root_as_rootfs() {
+        let mut cfg = valid_config();
+        cfg["root"]["path"] = json!("/");
+        let err = start_rejected_after_rewrite("hostroot", &cfg);
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), "rootfs must not be the filesystem root");
+    }
+
+    /// REPAIR-2: args / env の件数・サイズ・形式の違反は launcher に渡る前に InvalidArgument で拒否する。
+    #[test]
+    fn repair2_start_rejects_oversized_or_malformed_entrypoint() {
+        let big = "a".repeat(STRING_MAX_BYTES);
+        let many: Vec<String> = (0..=ARGS_MAX).map(|i| format!("/x{i}")).collect();
+        let cases: Vec<(&str, Value, Value)> = vec![
+            ("bigarg", json!(["/bin/echo", big]), json!(["K=V"])),
+            ("manyargs", json!(many), json!(["K=V"])),
+            (
+                "total",
+                json!(["/bin/echo", "a".repeat(100_000), "a".repeat(100_000)]),
+                Value::Array(
+                    (0..10)
+                        .map(|i| json!(format!("K{i}={}", "v".repeat(100_000))))
+                        .collect(),
+                ),
+            ),
+            ("badenv", json!(["/bin/echo"]), json!(["NOEQUALS"])),
+            ("emptykey", json!(["/bin/echo"]), json!(["=V"])),
+        ];
+        for (name, args, env) in cases {
+            let mut cfg = valid_config();
+            cfg["process"]["args"] = args;
+            cfg["process"]["env"] = env;
+            let err = start_rejected_after_rewrite(&format!("lim-{name}"), &cfg);
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "case {name}");
+        }
+    }
+
+    /// REPAIR-2: 複製した上限値が `exec::Entrypoint` の定数と一致する（Linux）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair2_entrypoint_limits_match_exec() {
+        use crate::exec;
+        assert_eq!(ARGS_MAX, exec::ENTRYPOINT_MAX_ARGS);
+        assert_eq!(ENV_MAX, exec::ENTRYPOINT_MAX_ENV);
+        assert_eq!(STRING_MAX_BYTES, exec::ENTRYPOINT_MAX_STRING_BYTES);
+        assert_eq!(TOTAL_MAX_BYTES, exec::ENTRYPOINT_MAX_TOTAL_BYTES);
+    }
+
+    /// CORE-2: 起動権の予約（Created から Running への revision 照合つき更新）に負けたら launch しない。
+    #[test]
+    fn core2_start_does_not_launch_when_claim_is_lost() {
+        let b = Bundle::new("claim-lost");
+        b.write_config(&valid_config());
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new(Some(0));
+        create(&store, &OpRecorder::new(), &b.create_req("claim-lost")).expect("create");
+        let launcher = RecordingLauncher::new(false);
+        let err =
+            start(&store, &OpRecorder::new(), &launcher, &sid("claim-lost")).expect_err("lost");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(launcher.calls(), 0);
+    }
+
+    /// SEC-1: 成功時の LaunchSpec は検査済み rootfs のハンドルを持つ（Unix）。
+    #[cfg(unix)]
+    #[test]
+    fn sec1_launch_spec_carries_rootfs_handle() {
+        use std::os::unix::fs::MetadataExt;
+        let (b, store) = created("handle");
+        let launcher = RecordingLauncher::new(false);
+        start(&store, &OpRecorder::new(), &launcher, &sid("handle")).expect("start");
+        let specs = launcher.specs.lock().expect("lock");
+        let spec = specs.first().expect("spec");
+        let handle = spec.rootfs_dir().file().metadata().expect("meta");
+        let named = std::fs::metadata(b.dir.join("rootfs")).expect("meta");
+        assert_eq!((handle.dev(), handle.ino()), (named.dev(), named.ino()));
     }
 }

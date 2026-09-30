@@ -24,6 +24,6 @@ pub use config::{
     load_config, parse_config_bytes,
 };
 pub use create::create;
-pub use launch::{LaunchSpec, LaunchedProcess, ProcessLauncher};
+pub use launch::{LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir};
 pub use mount_destination::MountDestination;
 pub use start::start;

@@ -1,13 +1,15 @@
 //! 実行層の最小実行フロー（CORE-1・TASK-27・MS-2）を担うモジュール。
 //!
-//! 現状は先頭段の namespace 分離（[`isolate`]・[`mount_proc`]。#134・TASK-27.2）のみ実装済み。
-//! `pivot_root`・fork / exec 等の後続段は未実装で、後続の sub-issue
-//! （#135・#136・#137・#831〜#834）が本モジュールへ追記する（REPAIR-3: 実装済みを装わない）。
+//! 現状は namespace 分離（[`isolate`]・[`mount_proc`]。#134・TASK-27.2）と、`pivot_root` による
+//! rootfs 切替（[`prepare_rootfs`]・[`pivot_root`]。#135・TASK-27.3）まで実装済み。
+//! fork / exec 等の後続段は未実装で、後続の sub-issue
+//! （#136・#137・#831〜#834）が本モジュールへ追記する（REPAIR-3: 実装済みを装わない）。
 //!
 //! # 目指すフロー（Linux 専用）
 //!
 //! 1. namespace 分離（PID / mount / UTS / IPC / user。#134・TASK-27.2。**実装済み**）
-//! 2. `pivot_root` による rootfs 切替と旧 root の後始末（#135・TASK-27.3。未実装）
+//! 2. `pivot_root` による rootfs 切替と旧 root の後始末（#135・TASK-27.3。**実装済み**。
+//!    [`prepare_rootfs`]〔自己 bind と rootfs 配下への `/proc` マウント〕→ [`pivot_root`]）
 //! 3. 基本デバイスノード 6 種の作成（#834・TASK-27.6。実体は別モジュール `devices` の予定）
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
 //!    → Landlock → seccomp（#136・#832・#833。後続の TASK-32・37・38・39・40 が差し込む）。
@@ -41,7 +43,9 @@
 //!   初めて `/proc` からホストのプロセスが見えなくなる。証跡は呼び出し側の申告に依存しない
 //!   （fail-closed）
 //! - 途中で失敗しても namespace を元へ戻す手段はない。呼び出し元はそのプロセスを破棄する
-//!   （長寿命のホストプロセスで呼ばない）
+//!   （長寿命のホストプロセスで呼ばない）。`pivot_root` 段（[`prepare_rootfs`]・[`pivot_root`]）も同じ
+//! - rootfs の切替は `establish` → [`prepare_rootfs`] → [`pivot_root`] の順で、`/proc` は
+//!   **pivot 前に rootfs 配下へマウントする**（[`PreparedRootfs`] がその証。詳細は `rootfs` の doc）
 //! - user namespace は自 euid / egid を コンテナ内 0 へ写す単一 ID 写像のみ提供する。
 //!   euid 0 での自 ID 写像はコンテナ root がホスト root に写るため拒否する（SEC-5）。
 //!   subuid 範囲の写像は TASK-40（CORE-6）が担う
@@ -56,7 +60,10 @@ use std::path::{Component, Path};
 use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
 
+mod rootfs;
 mod violation;
+
+pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 
 pub use violation::{
     IsolationViolation, VIOLATION_SUBJECT_MAX_CHARS, ViolationKind, ViolationReason,
@@ -258,6 +265,10 @@ pub enum IsolationStage {
     SetHostname,
     /// procfs のマウント。
     MountProc,
+    /// pivot_root の準備（rootfs の検証・自己 bind・rootfs 配下への procfs マウント）。
+    PrepareRootfs,
+    /// `pivot_root(2)` による rootfs 切替と旧 root の切り離し。
+    PivotRoot,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。
@@ -298,6 +309,26 @@ impl ExecError {
             message: reason.message().to_string(),
             violation: Some(IsolationViolation::new(reason, subject)),
         }
+    }
+
+    /// [`Self::from_violation`] の段を明示する版。理由から決まる段（`ViolationReason::stage`。
+    /// 共通のパス理由は `MountProc` に写る）ではなく、呼び出した段（rootfs 切替など）を記録する。
+    fn from_violation_at(
+        reason: ViolationReason,
+        subject: Option<&Path>,
+        stage: IsolationStage,
+    ) -> Self {
+        Self {
+            stage,
+            ..Self::from_violation(reason, subject)
+        }
+    }
+
+    /// 失敗した段だけを差し替える（共有ヘルパが返した `MountProc` 段のエラーを、呼び出した段へ
+    /// 付け替えるために使う。ERR-1 の段情報を呼び出し元の文脈に合わせる）。
+    fn at_stage(mut self, stage: IsolationStage) -> Self {
+        self.stage = stage;
+        self
     }
 
     fn from_sys(err: SysError, stage: IsolationStage, what: &str) -> Self {
@@ -405,8 +436,10 @@ pub struct IsolationReport {
 /// ```
 ///
 /// procfs を再マウントした後は `/proc/thread-self` が新しい procfs を指すが、namespace の
-/// 識別子（`mnt:[inode]` 等）は procfs に依存しないため、再マウントを繰り返す呼び出し側
-/// （#135 の `pivot_root` 後等）は同じ証跡を使い回せる。
+/// 識別子（`mnt:[inode]` 等）は procfs に依存しないため、[`prepare_rootfs`]（rootfs 配下への
+/// procfs マウント）と [`pivot_root`] は同じ証跡を使い回す。pivot 後の `/proc` は、pivot 前に
+/// rootfs 配下へマウント済みのものがそのまま `/proc` になる（pivot 後に新規マウントはしない。
+/// rootless では旧 root を切り離した後に完全に見える procfs が無く、新規マウントが拒否されるため）。
 #[derive(Debug, PartialEq, Eq)]
 pub struct MountIsolation {
     /// 作成した mount namespace（`/proc/thread-self/ns/mnt` のリンク先 `mnt:[inode]`）。
@@ -546,7 +579,7 @@ impl MountIsolation {
     /// 生成するスレッドは新しい mount namespace を引き継ぐ。
     ///
     /// **同一スレッドの契約**: 返った証跡は同じスレッドで [`mount_proc`] に渡し、以後の
-    /// `pivot_root`（#135）・exec（#831）も同じスレッドで行う。新しい mount namespace に
+    /// [`prepare_rootfs`]・[`pivot_root`]（#135）・exec（#831）も同じスレッドで行う。新しい mount namespace に
     /// 移るのは呼んだスレッドだけのため、前提としてシングルスレッドであることを確かめている
     /// （establish 後に作ったスレッドは新しい mount namespace を引き継ぐ）。
     pub fn establish() -> Result<Self, ExecError> {
@@ -591,28 +624,26 @@ impl MountIsolation {
     }
 
     /// 呼び出し元の現在の状態（PID・スレッドの mount / PID namespace）が証跡と一致するか。
-    fn verify_caller(&self) -> Result<(), ExecError> {
-        let fail = |msg: &str| {
-            ExecError::new(
-                ErrorCode::FailedPrecondition,
-                IsolationStage::MountProc,
-                msg,
-            )
-        };
+    ///
+    /// `stage` は失敗を記録する段（`mount_proc` は `MountProc`、rootfs 切替は `PrepareRootfs` /
+    /// `PivotRoot`）。
+    fn verify_caller(&self, stage: IsolationStage) -> Result<(), ExecError> {
+        let fail = |msg: &str| ExecError::new(ErrorCode::FailedPrecondition, stage, msg);
         let mnt_ns =
             thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
         let pid_ns =
             thread_ns_link("pid").map_err(|_| fail("cannot read /proc/thread-self/ns/pid"))?;
         check_evidence(self, std::process::id(), &mnt_ns, &pid_ns)
-            .map_err(|r| ExecError::from_violation(r, None))?;
+            .map_err(|r| ExecError::from_violation_at(r, None, stage))?;
         // getpid に加え、procfs 側の NSpid 末尾も 1 であることを確かめる（procfs を再マウント
         // した後も NSpid の末尾は最も内側の namespace の PID）。
         let status = std::fs::read_to_string("/proc/self/status")
             .map_err(|_| fail("cannot read /proc/self/status to verify the PID"))?;
         if nspid_innermost(&status) != Some(1) {
-            return Err(ExecError::from_violation(
+            return Err(ExecError::from_violation_at(
                 ViolationReason::EvidenceNspidNotPid1,
                 None,
+                stage,
             ));
         }
         Ok(())
@@ -817,8 +848,12 @@ fn unshare_and_configure(
     Ok(())
 }
 
-/// `rootfs` 配下の `target` に procfs をマウントする。新しい PID namespace の PID 1 側で呼ぶ
-/// （#135 の `pivot_root` 後の再マウントでも再利用する想定）。
+/// `rootfs` 配下の `target` に procfs をマウントする。新しい PID namespace の PID 1 側で呼ぶ。
+///
+/// pivot_root を行う場合は、pivot 前に [`prepare_rootfs`] が rootfs 配下へ procfs をマウントする
+/// ため、通常は本関数を pivot の前後で追加に呼ぶ必要はない（pivot 後に `mount_proc(&iso, "/",
+/// "/proc")` を呼ぶことは、pivot 前に rootfs/proc をマウント済みなら可能だが、rootless では
+/// 旧 root を切り離した後の新規 procfs マウントは拒否され得る）。
 ///
 /// マウント前に次をすべて検証し、1 つでも満たさなければ副作用なしで拒否する（fail-closed。
 /// security.md「rootfs の外へ書き込める経路を作らない」）。
@@ -844,7 +879,7 @@ pub fn mount_proc(
     rootfs: &Path,
     target: &Path,
 ) -> Result<(), ExecError> {
-    isolation.verify_caller()?;
+    isolation.verify_caller(IsolationStage::MountProc)?;
     mount_proc_verified(rootfs, target)
 }
 
@@ -882,7 +917,18 @@ fn mount_proc_verified(rootfs: &Path, target: &Path) -> Result<(), ExecError> {
     // 辿る（検証と使用を同じ解決で行い、別の操作でパスを解決し直さない = TOCTOU の防止）。
     // 以後の判定・マウントはこの fd 経由でのみ行う。
     let dir = open_dir_beneath(rootfs, &names)?;
-    if mount_is_shared(&dir)? {
+    mount_proc_at_dir(&dir, target, IsolationStage::MountProc)
+}
+
+/// 固定済みの `dir`（マウント先ディレクトリの O_PATH fd）へ procfs をマウントする共通の後半
+/// （propagation 検査 → 移動検査 → `/proc/thread-self/fd/N` 経由のマウント）。
+///
+/// [`mount_proc_verified`] と `rootfs` の `prepare_rootfs`（新しい mount top 起点で開いた
+/// `rootfs/proc`）が共有する。`target` は fd が今指しているはずのパス（移動検査と違反記録の
+/// 対象。呼び出し側が渡したパスのみ）、`stage` は失敗を記録する段。
+fn mount_proc_at_dir(dir: &OwnedFd, target: &Path, stage: IsolationStage) -> Result<(), ExecError> {
+    let violation = |r: ViolationReason, p: &Path| ExecError::from_violation_at(r, Some(p), stage);
+    if mount_is_shared(dir, stage)? {
         return Err(violation(ViolationReason::TargetOnSharedMount, target));
     }
     // fd 固定後に別プロセスがマウント先（または祖先）を改名・移動していないかを、マウント
@@ -891,7 +937,7 @@ fn mount_proc_verified(rootfs: &Path, target: &Path) -> Result<(), ExecError> {
     // 呼び出しスレッド専用の mount namespace（shared でないことを上で確認済み）に閉じ、
     // ホストや外側の namespace へは伝播しない。rootfs の外に残るマウントは #135 の
     // pivot_root で旧ルートごと切り離される。
-    if !fd_still_at(&dir, target) {
+    if !fd_still_at(dir, target) {
         return Err(violation(ViolationReason::TargetMoved, target));
     }
     // fd が指す実体へマウントする（`/proc/thread-self/fd/N` は fd の dentry へ解決される）。
@@ -902,12 +948,11 @@ fn mount_proc_verified(rootfs: &Path, target: &Path) -> Result<(), ExecError> {
         CString::new(format!("/proc/thread-self/fd/{}", dir.as_raw_fd())).map_err(|_| {
             ExecError::new(
                 ErrorCode::Internal,
-                IsolationStage::MountProc,
+                stage,
                 "failed to build the fd path of the proc mount target",
             )
         })?;
-    mount_proc_syscall(&c_target)
-        .map_err(|e| ExecError::from_sys(e, IsolationStage::MountProc, "mount(proc)"))
+    mount_proc_syscall(&c_target).map_err(|e| ExecError::from_sys(e, stage, "mount(proc)"))
 }
 
 /// [`mount_proc`] の最終段（`mount(2)`）。本番ビルドでは [`sys::mount_proc_at`] を呼ぶ。
@@ -943,46 +988,35 @@ fn mount_proc_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
 ///
 /// search 権限不足（`PermissionDenied`）等のその他の errno はシステムエラー（違反記録なし）。
 fn open_dir_beneath(rootfs: &Path, names: &[&OsStr]) -> Result<OwnedFd, ExecError> {
-    let target = || names.iter().fold(rootfs.to_path_buf(), |p, n| p.join(n));
-    let open_err = |e: SysError, below_rootfs: bool| {
-        let (not_dir, missing) = if below_rootfs {
-            (
-                ViolationReason::PathSymlinkOrNotDirectory,
-                ViolationReason::PathMissing,
-            )
-        } else {
-            (
-                ViolationReason::RootfsSymlinkOrNotDirectory,
-                ViolationReason::RootfsMissing,
-            )
-        };
-        let violation = |r: ViolationReason| {
-            let subject = if below_rootfs {
-                target()
-            } else {
-                rootfs.to_path_buf()
-            };
-            ExecError::from_violation(r, Some(&subject))
-        };
-        match e {
-            // O_DIRECTORY|O_NOFOLLOW では symlink も ENOTDIR になる。ELOOP は念のため残す。
-            SysError::Os(sys::ELOOP) | SysError::Os(sys::ENOTDIR) => violation(not_dir),
-            SysError::Os(sys::ENOENT) => violation(missing),
-            other => ExecError::from_sys(other, IsolationStage::MountProc, "openat"),
-        }
-    };
-    let c_name = |name: &OsStr, below_rootfs: bool| {
-        CString::new(name.as_bytes()).map_err(|_| {
-            let subject = if below_rootfs {
-                target()
-            } else {
-                rootfs.to_path_buf()
-            };
-            ExecError::from_violation(ViolationReason::PathContainsNul, Some(&subject))
-        })
-    };
-    // 1 段目: `/` から rootfs を固定する。
-    let mut cur = sys::open_dir_path_nofollow(None, c"/").map_err(|e| open_err(e, false))?;
+    let mut cur = pin_rootfs(rootfs)?.dir;
+    // 2 段目: 固定した rootfs の fd を起点にマウント先を辿る。
+    for name in names {
+        let c = c_name(rootfs, names, name, true)?;
+        cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c)
+            .map_err(|e| open_error(e, true, rootfs, names))?;
+    }
+    Ok(cur)
+}
+
+/// [`pin_rootfs`] の結果。
+struct PinnedRootfs {
+    /// rootfs の親ディレクトリの fd（rootfs が `/` のときは `None`）。bind mount 後に同じ
+    /// 親・同じ名前から開き直して新しい mount top を得るために保持する。
+    parent: Option<OwnedFd>,
+    /// rootfs の末尾要素名（`parent` があるときだけ `Some`）。
+    leaf: Option<CString>,
+    /// 固定した rootfs 自体の fd。
+    dir: OwnedFd,
+}
+
+/// `/` から `rootfs` までを 1 要素ずつ開いて固定する（[`open_dir_beneath`] の 1 段目）。
+/// 親 fd と末尾要素名も返す（`prepare_rootfs` が bind 後の開き直しに使う）。拒否の分類は
+/// [`open_dir_beneath`] の rootfs 側と同じ。
+fn pin_rootfs(rootfs: &Path) -> Result<PinnedRootfs, ExecError> {
+    let mut cur =
+        sys::open_dir_path_nofollow(None, c"/").map_err(|e| open_error(e, false, rootfs, &[]))?;
+    let mut parent = None;
+    let mut leaf = None;
     for c in rootfs.components() {
         let name = match c {
             Component::Normal(n) => n,
@@ -995,15 +1029,66 @@ fn open_dir_beneath(rootfs: &Path, names: &[&OsStr]) -> Result<OwnedFd, ExecErro
                 ));
             }
         };
-        let c = c_name(name, false)?;
-        cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c).map_err(|e| open_err(e, false))?;
+        let c = c_name(rootfs, &[], name, false)?;
+        let next = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c)
+            .map_err(|e| open_error(e, false, rootfs, &[]))?;
+        parent = Some(std::mem::replace(&mut cur, next));
+        leaf = Some(c);
     }
-    // 2 段目: 固定した rootfs の fd を起点にマウント先を辿る。
-    for name in names {
-        let c = c_name(name, true)?;
-        cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c).map_err(|e| open_err(e, true))?;
+    Ok(PinnedRootfs {
+        parent,
+        leaf,
+        dir: cur,
+    })
+}
+
+/// `openat` の失敗を違反記録付きの拒否（またはシステムエラー）へ写す。`below_rootfs` は
+/// rootfs より下の要素の失敗か。対象は rootfs 側なら `rootfs`、下なら `rootfs` に `names` を
+/// 連結したパス。
+fn open_error(e: SysError, below_rootfs: bool, rootfs: &Path, names: &[&OsStr]) -> ExecError {
+    let (not_dir, missing) = if below_rootfs {
+        (
+            ViolationReason::PathSymlinkOrNotDirectory,
+            ViolationReason::PathMissing,
+        )
+    } else {
+        (
+            ViolationReason::RootfsSymlinkOrNotDirectory,
+            ViolationReason::RootfsMissing,
+        )
+    };
+    let violation = |r: ViolationReason| {
+        let subject = subject_path(rootfs, names, below_rootfs);
+        ExecError::from_violation(r, Some(&subject))
+    };
+    match e {
+        // O_DIRECTORY|O_NOFOLLOW では symlink も ENOTDIR になる。ELOOP は念のため残す。
+        SysError::Os(sys::ELOOP) | SysError::Os(sys::ENOTDIR) => violation(not_dir),
+        SysError::Os(sys::ENOENT) => violation(missing),
+        other => ExecError::from_sys(other, IsolationStage::MountProc, "openat"),
     }
-    Ok(cur)
+}
+
+/// 違反記録の対象パス（rootfs 側の失敗は `rootfs`、下の失敗は `rootfs` に `names` を連結したもの）。
+fn subject_path(rootfs: &Path, names: &[&OsStr], below_rootfs: bool) -> std::path::PathBuf {
+    if below_rootfs {
+        names.iter().fold(rootfs.to_path_buf(), |p, n| p.join(n))
+    } else {
+        rootfs.to_path_buf()
+    }
+}
+
+/// 要素名を NUL 終端文字列にする。NUL を含めば違反記録付きで拒否する。
+fn c_name(
+    rootfs: &Path,
+    names: &[&OsStr],
+    name: &OsStr,
+    below_rootfs: bool,
+) -> Result<CString, ExecError> {
+    CString::new(name.as_bytes()).map_err(|_| {
+        let subject = subject_path(rootfs, names, below_rootfs);
+        ExecError::from_violation(ViolationReason::PathContainsNul, Some(&subject))
+    })
 }
 
 /// `dir` の現在の位置（`/proc/thread-self/fd/N` のリンク先）が `expected` と要素単位で一致
@@ -1026,15 +1111,29 @@ fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
 /// 突き合わせる（`/proc/self/mountinfo` はスレッドグループの代表の mount namespace を映し、
 /// `establish` 後の別スレッドでは一致しないため）。読み取り・解析
 /// できない場合は安全側（エラー）に倒す。
-fn mount_is_shared(dir: &OwnedFd) -> Result<bool, ExecError> {
+/// 失敗は `stage` の段として返す（proc マウントは `MountProc`、rootfs 切替は `PrepareRootfs`）。
+fn mount_is_shared(dir: &OwnedFd, stage: IsolationStage) -> Result<bool, ExecError> {
+    let mnt_id = fd_mount_id(dir, stage)?;
+    let info = read_thread_mountinfo(stage)?;
+    mount_is_shared_in(&info, mnt_id).map_err(|e| e.at_stage(stage))
+}
+
+/// `dir` が属するマウントの ID（`/proc/thread-self/fdinfo/N` の `mnt_id`）。読めなければ
+/// システムエラー（fail-closed）。
+fn fd_mount_id(dir: &OwnedFd, stage: IsolationStage) -> Result<u64, ExecError> {
+    let err = |msg: &str| mountinfo_error(msg).at_stage(stage);
     let fdinfo = std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", dir.as_raw_fd()))
-        .map_err(|_| mountinfo_error("cannot read fdinfo of the proc mount target"))?;
-    let mnt_id = parse_fdinfo_mnt_id(&fdinfo)
-        .ok_or_else(|| mountinfo_error("no mnt_id in fdinfo of the proc mount target"))?;
-    let info = std::fs::read_to_string("/proc/thread-self/mountinfo").map_err(|_| {
+        .map_err(|_| err("cannot read fdinfo of the pinned directory"))?;
+    parse_fdinfo_mnt_id(&fdinfo).ok_or_else(|| err("no mnt_id in fdinfo of the pinned directory"))
+}
+
+/// 呼び出しスレッドの mount namespace の mountinfo（`/proc/self/mountinfo` はスレッドグループの
+/// 代表の namespace を映すため使わない）。
+fn read_thread_mountinfo(stage: IsolationStage) -> Result<String, ExecError> {
+    std::fs::read_to_string("/proc/thread-self/mountinfo").map_err(|_| {
         mountinfo_error("cannot read /proc/thread-self/mountinfo to verify mount propagation")
-    })?;
-    mount_is_shared_in(&info, mnt_id)
+            .at_stage(stage)
+    })
 }
 
 fn mountinfo_error(msg: &str) -> ExecError {
@@ -1410,7 +1509,7 @@ mod tests {
 
     /// dry-run の記録を取り出して空にする。libtest のワーカースレッドが再利用されても、
     /// 前のテストの記録が後続のテストへ漏れないよう、照合は必ずこの関数で取り出して行う。
-    fn take_dry_run_mounts() -> Vec<String> {
+    pub(super) fn take_dry_run_mounts() -> Vec<String> {
         DRY_RUN_MOUNTS.with(|m| std::mem::take(&mut *m.borrow_mut()))
     }
 
@@ -1696,7 +1795,10 @@ mod tests {
             .split(' ')
             .skip(6)
             .any(|f| f.starts_with("shared:"));
-        assert_eq!(mount_is_shared(&fd).unwrap(), want);
+        assert_eq!(
+            mount_is_shared(&fd, IsolationStage::MountProc).unwrap(),
+            want
+        );
     }
 
     /// 違反記録の中身を具体値で取り出す（種別名・理由コード・ビヘイビア ID・対象）。
@@ -1901,7 +2003,7 @@ mod tests {
         std::fs::create_dir_all(root.join("proc")).unwrap();
         let target = root.join("proc");
         let dir = open_dir_beneath(&root, &[OsStr::new("proc")]).unwrap();
-        let shared = mount_is_shared(&dir).unwrap();
+        let shared = mount_is_shared(&dir, IsolationStage::MountProc).unwrap();
         drop(dir);
         let result = mount_proc_verified(&root, &target);
         if shared {

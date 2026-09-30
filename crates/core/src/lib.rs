@@ -18,8 +18,8 @@
 //! # モジュール構成
 //!
 //! - `traits`: 拡張点トレイト（実装済み。TASK-4 系）
-//! - `exec`: 最小実行フロー（Linux 限定。namespace 分離〔TASK-27.2〕のみ実装済みで、
-//!   `pivot_root`・fork / exec 等は未実装。非 Linux ではビルド対象外のため本 doc からは
+//! - `exec`: 最小実行フロー（Linux 限定。namespace 分離〔TASK-27.2〕と `pivot_root` による
+//!   rootfs 切替〔TASK-27.3〕が実装済みで、fork / exec 等は未実装。非 Linux ではビルド対象外のため本 doc からは
 //!   リンクしない）
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - 予定（未作成）: `devices`（TASK-27.6）・`oci_runtime`（TASK-29・30）・`state_store`

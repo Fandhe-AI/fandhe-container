@@ -5,9 +5,11 @@
 //!
 //! # 呼び出し文脈
 //! `crate::exec::isolate`・`crate::exec::MountIsolation::establish`・`crate::exec::mount_proc`
-//! （CORE-1・TASK-27.2・#134）が、
-//! `unshare(2)`・`sethostname(2)`・`mount(2)`・`openat(2)`・`geteuid(2)`・`getegid(2)` を
-//! 呼ぶために使う。std だけでは提供されない
+//! （CORE-1・TASK-27.2・#134）と、`crate::exec::prepare_rootfs`・`crate::exec::pivot_root`
+//! （CORE-1・TASK-27.3・#135）が、
+//! `unshare(2)`・`sethostname(2)`・`mount(2)`・`openat(2)`・`geteuid(2)`・`getegid(2)` に加え、
+//! `pivot_root(2)`（glibc がラッパーを持たないため `syscall(2)` 経由）・`umount2(2)`・`fchdir(2)`
+//! を呼ぶために使う。std だけでは提供されない
 //! syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
 //! （`Hostname` 等）が済ませた値だけを受け取る。
 //!
@@ -72,8 +74,13 @@ mod consts {
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
+    pub const MS_BIND: u64 = 0x1000;
     pub const MS_REC: u64 = 0x4000;
     pub const MS_PRIVATE: u64 = 0x4_0000;
+    // include/uapi/linux/mount.h の `MNT_DETACH`（umount2 のフラグ。全アーキテクチャ共通）。
+    pub const MNT_DETACH: i32 = 2;
+    // arch/x86/entry/syscalls/syscall_64.tbl の `pivot_root`。
+    pub const SYS_PIVOT_ROOT: i64 = 155;
     // include/uapi/asm-generic/fcntl.h（x86_64 は上書きしない）。
     pub const O_DIRECTORY: i32 = 0o200_000;
     pub const O_NOFOLLOW: i32 = 0o400_000;
@@ -99,8 +106,14 @@ mod consts {
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
+    pub const MS_BIND: u64 = 0x1000;
     pub const MS_REC: u64 = 0x4000;
     pub const MS_PRIVATE: u64 = 0x4_0000;
+    // include/uapi/linux/mount.h の `MNT_DETACH`（umount2 のフラグ。全アーキテクチャ共通）。
+    pub const MNT_DETACH: i32 = 2;
+    // include/uapi/asm-generic/unistd.h の `__NR_pivot_root`（arm64 は asm-generic の表を使う。
+    // x86_64 の 155 を流用しない）。
+    pub const SYS_PIVOT_ROOT: i64 = 41;
     // arch/arm64/include/uapi/asm/fcntl.h（asm-generic と異なる。x86_64 の値を流用しない。
     // 流用すると O_DIRECT / O_LARGEFILE に化ける）。
     pub const O_DIRECTORY: i32 = 0o40_000;
@@ -130,8 +143,11 @@ mod consts {
     pub const MS_NOSUID: u64 = 0;
     pub const MS_NODEV: u64 = 0;
     pub const MS_NOEXEC: u64 = 0;
+    pub const MS_BIND: u64 = 0;
     pub const MS_REC: u64 = 0;
     pub const MS_PRIVATE: u64 = 0;
+    pub const MNT_DETACH: i32 = 0;
+    pub const SYS_PIVOT_ROOT: i64 = 0;
     pub const O_DIRECTORY: i32 = 0;
     pub const O_NOFOLLOW: i32 = 0;
     pub const O_CLOEXEC: i32 = 0;
@@ -190,6 +206,14 @@ unsafe extern "C" {
     // 異なる ABI で未定義動作になる）。可変長部は mode で、O_CREAT / O_TMPFILE 不使用の
     // ため渡さない（カーネル・libc は読まない）。
     fn openat(dirfd: i32, path: *const core::ffi::c_char, flags: i32, ...) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `long syscall(long number, ...)`（glibc / musl。LP64 で
+    // `long` は i64）。`pivot_root(2)` は glibc にラッパーが無いため使う。可変長引数として宣言する
+    // （非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
+    fn syscall(number: i64, ...) -> i64;
+    // SAFETY（宣言そのものの妥当性）: `int umount2(const char *target, int flags)`。
+    fn umount2(target: *const core::ffi::c_char, flags: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int fchdir(int fd)`。
+    fn fchdir(fd: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `uid_t geteuid(void)`（Linux の `uid_t` は u32）。
     fn geteuid() -> u32;
     // SAFETY（宣言そのものの妥当性）: `gid_t getegid(void)`（Linux の `gid_t` は u32）。
@@ -315,6 +339,73 @@ pub(crate) fn mount_proc_at(target: &CStr) -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `target` を自分自身へ再帰 bind mount し（`MS_BIND|MS_REC`）、`target` をマウントポイントにする。
+///
+/// `pivot_root(2)` の new_root は「マウントポイントであること」が要件で、rootfs が単なる
+/// ディレクトリでも `crate::exec::prepare_rootfs` がこれで満たす。`target` は検証済みの O_PATH fd を
+/// 指す `/proc/thread-self/fd/N`（magic link は fd の実体へ解決される）。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn bind_mount_recursive(target: &CStr) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `target` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存する（source と target
+    // に同じポインタを渡す）。fstype / data は NULL（MS_BIND ではカーネルが参照しない）。
+    let rc = unsafe {
+        mount(
+            target.as_ptr(),
+            target.as_ptr(),
+            core::ptr::null(),
+            consts::MS_BIND | consts::MS_REC,
+            core::ptr::null(),
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `pivot_root(".", ".")`。new_root と put_old を同じ cwd にすることで put_old 用ディレクトリを
+/// 作らずに済む（固定名 `.old_root` による共有 rootfs での ENOENT 競合を避ける。TASK-27.3）。
+/// 呼び出し前に cwd を new_root（マウントポイント）の fd へ `fchdir` しておくこと。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn pivot_root_dot() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 第 2・3 引数は静的な NUL 終端文字列 `c"."` へのポインタ（`*const c_char`。可変長
+    // 引数として register 幅で渡され、カーネルは 2 引数だけ読む）。番号は arch ごとの定数。
+    // 戻り値 -1 のとき直後に errno を確保する。
+    let rc = unsafe { syscall(consts::SYS_PIVOT_ROOT, c".".as_ptr(), c".".as_ptr()) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// cwd のマウントを `MNT_DETACH` で切り離す（`umount2(".", MNT_DETACH)`）。`pivot_root(".", ".")` 後に
+/// cwd を旧 root の fd へ戻してから呼び、旧 root を mount namespace から外す。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn umount_cwd_detach() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `c"."` は静的な NUL 終端文字列。flags は定数で、ポインタ以外の副作用は
+    // 呼び出しスレッドの mount namespace の変更（`crate::exec::pivot_root` の契約として文書化済み）。
+    let rc = unsafe { umount2(c".".as_ptr(), consts::MNT_DETACH) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// cwd を `fd`（ディレクトリを指す fd。O_PATH でも可）へ変更する。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn change_dir_fd(fd: BorrowedFd<'_>) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `fd` は生存中の `BorrowedFd`。fchdir は fd を読み取るだけで所有権を取らない。
+    let rc = unsafe { fchdir(fd.as_raw_fd()) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// 自プロセスの実効 uid。
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: 引数なし・常に成功する副作用のない syscall。
@@ -356,6 +447,19 @@ mod tests {
             (EPERM, ENOENT, EACCES, ENOTDIR, EINVAL, ELOOP),
             (1, 2, 13, 20, 22, 40)
         );
+    }
+
+    /// CORE-1（TASK-27.3）: mount 系フラグ・pivot_root の syscall 番号の具体値。番号は arch ごとに
+    /// 違う（x86_64 = 155、aarch64 = 41）。
+    #[test]
+    fn core1_pivot_consts_are_exact() {
+        assert_eq!(consts::MS_BIND, 0x1000);
+        assert_eq!(consts::MS_REC, 0x4000);
+        assert_eq!(consts::MNT_DETACH, 2);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(consts::SYS_PIVOT_ROOT, 155);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(consts::SYS_PIVOT_ROOT, 41);
     }
 
     /// aarch64: O_DIRECTORY / O_NOFOLLOW は arch/arm64/include/uapi/asm/fcntl.h の上書き値

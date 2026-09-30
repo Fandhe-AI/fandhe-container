@@ -3,7 +3,8 @@
 //! # 役割と範囲
 //!
 //! `crate::exec` の各拒否経路（`plan` / `plan_rootful_host_root` / `isolate` 系の前提、
-//! `MountIsolation::establish` の前提、`mount_proc` の証跡不一致・パス検証・shared 伝播）は、
+//! `MountIsolation::establish` の前提、`mount_proc` の証跡不一致・パス検証・shared 伝播、
+//! `prepare_rootfs` / `pivot_root` の証跡不一致・rootfs パス検証・shared 伝播。TASK-27.3・#135）は、
 //! 拒否時に [`IsolationViolation`] を `ExecError::violation` に載せて呼び出し側へ返す。
 //!
 //! **本モジュールは記録の経路のみを提供する。** 違反記録の永続化・3 レイヤー（実行層・
@@ -45,8 +46,10 @@ pub enum ViolationKind {
     EvidenceMismatch,
     /// `mount_proc` のマウント先パスの検証（rootfs 境界・symlink・`..` 等）。
     MountTarget,
-    /// `mount_proc` のマウント先が shared propagation 上にある。
+    /// `mount_proc` のマウント先または `prepare_rootfs` の rootfs が shared propagation 上にある。
     SharedPropagation,
+    /// `prepare_rootfs` の rootfs 指定そのものの拒否（ホスト root の指定・固定後の移動。TASK-27.3）。
+    RootfsPivot,
 }
 
 impl ViolationKind {
@@ -58,6 +61,7 @@ impl ViolationKind {
             Self::EvidenceMismatch => "evidence_mismatch",
             Self::MountTarget => "mount_target",
             Self::SharedPropagation => "shared_propagation",
+            Self::RootfsPivot => "rootfs_pivot",
         }
     }
 }
@@ -123,6 +127,12 @@ pub enum ViolationReason {
     TargetOnSharedMount,
     /// fd で固定した後にマウント先が改名・移動・削除された。
     TargetMoved,
+    /// rootfs が `/`（ホスト root）そのもの。ホスト root への pivot は無意味かつ危険なため拒否する。
+    RootfsIsHostRoot,
+    /// rootfs が shared propagation 上にある（pivot_root は EINVAL になり、bind もホストへ伝播し得る）。
+    RootfsOnSharedMount,
+    /// fd で固定した後に rootfs が改名・移動・削除された。
+    RootfsMoved,
 }
 
 impl ViolationReason {
@@ -157,6 +167,9 @@ impl ViolationReason {
             Self::PathMissing => "path_missing",
             Self::TargetOnSharedMount => "target_on_shared_mount",
             Self::TargetMoved => "target_moved",
+            Self::RootfsIsHostRoot => "rootfs_is_host_root",
+            Self::RootfsOnSharedMount => "rootfs_on_shared_mount",
+            Self::RootfsMoved => "rootfs_moved",
         }
     }
 
@@ -190,7 +203,10 @@ impl ViolationReason {
             | Self::PathSymlinkOrNotDirectory
             | Self::PathMissing
             | Self::TargetMoved => ViolationKind::MountTarget,
-            Self::TargetOnSharedMount => ViolationKind::SharedPropagation,
+            Self::TargetOnSharedMount | Self::RootfsOnSharedMount => {
+                ViolationKind::SharedPropagation
+            }
+            Self::RootfsIsHostRoot | Self::RootfsMoved => ViolationKind::RootfsPivot,
         }
     }
 
@@ -221,7 +237,8 @@ impl ViolationReason {
             | Self::RootfsSymlinkOrNotDirectory
             | Self::TargetIsRootfs
             | Self::PathSymlinkOrNotDirectory
-            | Self::PathMissing => ErrorCode::InvalidArgument,
+            | Self::PathMissing
+            | Self::RootfsIsHostRoot => ErrorCode::InvalidArgument,
             Self::HostRootIdentityMapping
             | Self::RootfulRequiresRoot
             | Self::IdentityChanged
@@ -235,14 +252,19 @@ impl ViolationReason {
             | Self::EvidenceMountNamespaceMismatch
             | Self::EvidencePidNamespaceMismatch
             | Self::TargetOnSharedMount
-            | Self::TargetMoved => ErrorCode::FailedPrecondition,
+            | Self::TargetMoved
+            | Self::RootfsOnSharedMount
+            | Self::RootfsMoved => ErrorCode::FailedPrecondition,
         }
     }
 
-    /// 拒否した段（計画は `Validate`、それ以外は `MountProc`）。
+    /// 拒否した段の既定（計画は `Validate`、rootfs 指定は `PrepareRootfs`、それ以外は `MountProc`）。
+    /// `prepare_rootfs` / `pivot_root` が共通のパス理由を返すときは、呼び出した段を
+    /// `ExecError::from_violation_at` で明示する。
     pub(super) fn stage(self) -> IsolationStage {
         match self.kind() {
             ViolationKind::PlanRejected => IsolationStage::Validate,
+            ViolationKind::RootfsPivot => IsolationStage::PrepareRootfs,
             _ => IsolationStage::MountProc,
         }
     }
@@ -309,6 +331,11 @@ impl ViolationReason {
                 "proc mount target is on a shared mount; isolate the mount namespace first"
             }
             Self::TargetMoved => "proc mount target was moved or removed after validation",
+            Self::RootfsIsHostRoot => "rootfs must not be the host root '/'",
+            Self::RootfsOnSharedMount => {
+                "rootfs is on a shared mount; isolate the mount namespace first"
+            }
+            Self::RootfsMoved => "rootfs was moved or removed after validation",
         }
     }
 }
@@ -433,5 +460,25 @@ mod tests {
         assert_eq!(r.kind().as_str(), "shared_propagation");
         assert_eq!(r.behavior_id(), "CORE-1");
         assert_eq!(r.stage(), IsolationStage::MountProc);
+    }
+
+    /// CORE-1（TASK-27.3）: rootfs 切替の理由コード・種別・`ErrorCode`・段の具体値。
+    #[test]
+    fn core1_rootfs_reason_metadata_is_exact() {
+        let r = ViolationReason::RootfsIsHostRoot;
+        assert_eq!(r.as_str(), "rootfs_is_host_root");
+        assert_eq!(r.kind().as_str(), "rootfs_pivot");
+        assert_eq!(r.behavior_id(), "CORE-1");
+        assert_eq!(r.error_code(), ErrorCode::InvalidArgument);
+        assert_eq!(r.stage(), IsolationStage::PrepareRootfs);
+        assert_eq!(r.message(), "rootfs must not be the host root '/'");
+        let r = ViolationReason::RootfsOnSharedMount;
+        assert_eq!(r.as_str(), "rootfs_on_shared_mount");
+        assert_eq!(r.kind().as_str(), "shared_propagation");
+        assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);
+        let r = ViolationReason::RootfsMoved;
+        assert_eq!(r.as_str(), "rootfs_moved");
+        assert_eq!(r.kind().as_str(), "rootfs_pivot");
+        assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);
     }
 }

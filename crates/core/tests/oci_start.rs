@@ -5,8 +5,9 @@
 //! 応答待ちの上限超過時の後始末を具体値で確かめる。実プロセスは起動しない（launcher は模擬）。
 //!
 //! rootfs を fd で固定する start の成功経路は Linux 限定（Linux 以外は起動前に `Unimplemented`）のため、
-//! 成功を前提とする試験は `cfg(target_os = "linux")`、Linux 以外では fail-closed の拒否を具体値で確かめる。
-//! 設定検証・中断回復の試験は 3 OS の既定のテスト集合で動く。実機権限（root 等）は不要。
+//! 成功を前提とする試験と中断回復（起動権の所有ロックも Linux 限定）の試験は `cfg(target_os = "linux")`、
+//! Linux 以外では fail-closed の拒否を具体値で確かめる。設定検証の試験は 3 OS の既定のテスト集合で動く。
+//! 実機権限（root 等）は不要。
 //!
 //! 待ちの上限は CI の `integration-test` ジョブが設定する `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`
 //! （既定 10 秒。AGENTS.md「推奨タイムアウト値」・REPAIR-5）から組み立てる。
@@ -32,6 +33,7 @@ use fandhe_container_core::traits::{
 use serde_json::{Value, json};
 
 /// 1 件の待ちの上限（`FANDHE_CONTAINER_TEST_TIMEOUT_SECS`。未設定・不正値なら 10 秒）。
+#[cfg(target_os = "linux")]
 fn test_timeout() -> Duration {
     let secs = std::env::var("FANDHE_CONTAINER_TEST_TIMEOUT_SECS")
         .ok()
@@ -42,6 +44,7 @@ fn test_timeout() -> Duration {
 }
 
 /// `cond` が真になるまで `test_timeout()` までポーリングする（固定 sleep に頼らない）。
+#[cfg(target_os = "linux")]
 fn eventually(cond: impl Fn() -> bool) -> bool {
     let deadline = Instant::now() + test_timeout();
     while Instant::now() < deadline {
@@ -54,6 +57,7 @@ fn eventually(cond: impl Fn() -> bool) -> bool {
 }
 
 /// 起動待ち 200ms・終了待ち 1s・確認待ち 200ms の短い上限。
+#[cfg(target_os = "linux")]
 fn short_timeouts() -> StartTimeouts {
     StartTimeouts::new(
         Duration::from_millis(200),
@@ -154,6 +158,7 @@ impl Gate {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn set_open(&self, open: bool) {
         *self.open.lock().unwrap_or_else(|e| e.into_inner()) = open;
         self.cvar.notify_all();
@@ -443,8 +448,16 @@ fn repair5_start_bounds_hanging_launch_and_cleans_up_late_process() {
     let err = recover_interrupted_start(&store, &dynl(&launcher), &id, &short_timeouts())
         .expect_err("launch in flight");
     assert_eq!(err.message(), "container start is already in progress");
+    // 別プロセスからは、launch の進行中は所有ロック（bundle の flock）が取れないことで観測できる。
+    let probe = std::fs::File::open(&b.dir).expect("open bundle");
+    assert!(matches!(
+        probe.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
     launcher.gate.set_open(true);
     assert!(eventually(|| launcher.terminations() == 1));
+    assert!(eventually(|| probe.try_lock().is_ok()));
+    drop(probe);
     assert!(eventually(|| {
         recover_interrupted_start(&store, &dynl(&launcher), &id, &short_timeouts()).is_ok()
     }));
@@ -478,13 +491,8 @@ fn repair5_start_terminates_process_when_recording_fails() {
     );
 }
 
-/// REPAIR-5・CORE-2: 中断回復の生存確認が戻らなければ Timeout で予約を残し、確認が戻れば回復できる。
-#[test]
-fn repair5_recover_bounds_hanging_confirmation() {
-    let b = Bundle::ready("confirm", &valid_config());
-    let store = MemStateStore::new(None);
-    b.create(&store, "it-confirm");
-    let id = ContainerId::new("it-confirm").expect("id");
+/// 中断された予約（Running・pid なし）を手で作る（start のプロセスが launch 中に異常終了した状態）。
+fn claim_interrupted(store: &MemStateStore, id: &ContainerId) {
     let rec = store.get(&GetStateRequest::new(id.clone())).expect("get");
     store
         .update(&UpdateStateRequest::new(
@@ -492,6 +500,68 @@ fn repair5_recover_bounds_hanging_confirmation() {
             rec.revision(),
         ))
         .expect("claim");
+}
+
+/// CORE-2・SEC-1: 別プロセスが起動権の所有ロック（bundle ディレクトリの flock）を持つ間は回復を拒否し、
+/// 所有者が終了してロックが外れれば回復できる（呼び出し元の事前確認に依存しない）。flock は同一
+/// プロセス内でも別に開いた記述子同士で競合するため、別の記述子で別プロセスの所有者を模す。
+#[cfg(target_os = "linux")]
+#[test]
+fn core2_recover_waits_for_owner_process_across_processes() {
+    let b = Bundle::ready("owner", &valid_config());
+    let store = MemStateStore::new(None);
+    b.create(&store, "it-owner");
+    let id = ContainerId::new("it-owner").expect("id");
+    claim_interrupted(&store, &id);
+    let other_owner = std::fs::File::open(&b.dir).expect("open bundle");
+    other_owner.try_lock().expect("lock bundle");
+    let launcher = FakeLauncher::new();
+    let err = recover_interrupted_start(&store, &dynl(&launcher), &id, &short_timeouts())
+        .expect_err("owner alive");
+    assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(
+        err.message(),
+        "container start is in progress in another process"
+    );
+    assert_eq!(store.status_of("it-owner").state(), ContainerState::Running);
+    drop(other_owner);
+    let got = recover_interrupted_start(&store, &dynl(&launcher), &id, &short_timeouts())
+        .expect("owner gone");
+    assert_eq!(got.status().state(), ContainerState::Created);
+}
+
+/// SEC-1・CLI-1: Linux 以外は所有ロックを取れないため、回復は Unimplemented で予約を残す。
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn core2_recover_fails_closed_off_linux() {
+    let b = Bundle::ready("recover-nolinux", &valid_config());
+    let store = MemStateStore::new(None);
+    b.create(&store, "it-recover-nolinux");
+    let id = ContainerId::new("it-recover-nolinux").expect("id");
+    claim_interrupted(&store, &id);
+    let launcher = FakeLauncher::new();
+    let err = recover_interrupted_start(&store, &dynl(&launcher), &id, &StartTimeouts::default())
+        .expect_err("must fail");
+    assert_eq!(err.code(), ErrorCode::Unimplemented);
+    assert_eq!(
+        err.message(),
+        "start requires Linux to lock the bundle directory"
+    );
+    assert_eq!(
+        store.status_of("it-recover-nolinux").state(),
+        ContainerState::Running
+    );
+}
+
+/// REPAIR-5・CORE-2: 中断回復の生存確認が戻らなければ Timeout で予約を残し、確認が戻れば回復できる。
+#[cfg(target_os = "linux")]
+#[test]
+fn repair5_recover_bounds_hanging_confirmation() {
+    let b = Bundle::ready("confirm", &valid_config());
+    let store = MemStateStore::new(None);
+    b.create(&store, "it-confirm");
+    let id = ContainerId::new("it-confirm").expect("id");
+    claim_interrupted(&store, &id);
     let launcher = FakeLauncher::new();
     launcher.gate.set_open(false);
     let begin = Instant::now();

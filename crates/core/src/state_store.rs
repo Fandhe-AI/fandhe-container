@@ -29,7 +29,8 @@
 //!   クラッシュしても欠番になるだけで再利用しない。`@revision` は新規ストアの `open` が
 //!   `@lock` より先に（hard_link で不可分に）初期化し、後から消えた場合は採番履歴を確認できないためレコードの有無によらず
 //!   fail-closed（`Internal`）
-//! - 破損レコード（JSON 破損・ociVersion 不正・ID 不一致・状態と PID の矛盾等）は revision を
+//! - 破損レコード（JSON 破損・ociVersion 不正・ID 不一致・状態と PID の矛盾等に加え、`<id>` が
+//!   ディレクトリでない・`state.json` が通常ファイルでない等のファイル種別の異常）は revision を
 //!   照合できないため通常の `delete` では消せない。管理操作 `find_corrupted` /
 //!   `purge_corrupted` で特定・回復する。破損・異常なレコードが 1 件でもあれば `list` はどのページでも
 //!   失敗する（fail-closed）
@@ -188,7 +189,8 @@ enum RecordHealth {
     Absent,
     /// 読めて内容も整合している。
     Healthy(StateRecord),
-    /// 内容が使えない（JSON 破損・サイズ超過・ociVersion 不正・ID 不一致・状態と PID の矛盾）。
+    /// 内容が使えない（JSON 破損・サイズ超過・ociVersion 不正・ID 不一致・状態と PID の矛盾）、
+    /// またはファイル種別が異常（`<id>` がディレクトリでない・`state.json` が通常ファイルでない）。
     Corrupted(TraitError),
 }
 
@@ -213,6 +215,17 @@ impl Ord for ById {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0.id().as_str().cmp(other.0.id().as_str())
     }
+}
+
+/// `<id>/state.json` の場所の検査結果（`record_file`）。
+enum RecordEntry {
+    /// レコードがない（`<id>` がない、または残骸ディレクトリのみ）。
+    Absent,
+    /// `state.json` が通常ファイルとして存在する。
+    File(PathBuf),
+    /// ファイル種別の異常（`<id>` がディレクトリでない・`state.json` が通常ファイルでない）。
+    /// 保持するエラーは get・list が返すもの。
+    Malformed(TraitError),
 }
 
 /// ファイルベースの [`StateStore`] 実装。
@@ -352,37 +365,45 @@ impl FileStateStore {
         self.root.join(id.as_str())
     }
 
-    /// `<id>/state.json` の場所を検査して返す。レコードがなければ `None`（残骸ディレクトリのみも
-    /// `None`）。`<id>` が symlink・非ディレクトリ・権限不備、`state.json` が通常ファイルでない
-    /// などの異常は `Err`（get・list・管理操作で共通。fail-closed）。
-    fn record_file(&self, id: &ContainerId) -> Result<Option<PathBuf>, TraitError> {
+    /// `<id>/state.json` の場所をファイル種別で検査する（symlink は辿らない）。
+    ///
+    /// `<id>` がディレクトリでない（symlink・通常ファイル等）・`state.json` が通常ファイルでない
+    /// （symlink・ディレクトリ等）は `Malformed`（get・list は失敗し、回復操作で消せる）。
+    /// `<id>` の権限不備・所有者不一致と、検査自体の I/O エラーは `Err`（回復操作でも消さない。
+    /// fail-closed）。
+    fn record_file(&self, id: &ContainerId) -> Result<RecordEntry, TraitError> {
         let dir = self.record_dir(id);
         match fs::symlink_metadata(&dir) {
             Ok(m) if m.is_dir() => verify_record_dir(&m)?,
             Ok(_) => {
-                return Err(err(
+                return Ok(RecordEntry::Malformed(err(
                     ErrorCode::PermissionDenied,
                     "state entry is not a directory",
-                ));
+                )));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RecordEntry::Absent),
             Err(_) => return Err(internal("failed to inspect the state directory")),
         }
         let file_path = dir.join(STATE_FILE_NAME);
         match fs::symlink_metadata(&file_path) {
-            Ok(m) if m.is_file() => Ok(Some(file_path)),
-            Ok(_) => Err(internal("state file is not a regular file")),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Ok(m) if m.is_file() => Ok(RecordEntry::File(file_path)),
+            Ok(_) => Ok(RecordEntry::Malformed(internal(
+                "state file is not a regular file",
+            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RecordEntry::Absent),
             Err(_) => Err(internal("failed to inspect the state file")),
         }
     }
 
     /// レコードを検査する。内容の不整合（JSON 破損・サイズ超過・ociVersion 不正・ID 不一致・
-    /// 状態と PID の矛盾等）は `Corrupted`、権限・I/O 等の内容以外の失敗は `Err`
-    /// （破損とは区別する。権限・I/O エラーのレコードを回復操作で消さないため）。
+    /// 状態と PID の矛盾等）とファイル種別の異常（`record_file` の `Malformed`）は `Corrupted`、
+    /// 権限・I/O 等の失敗は `Err`（破損とは区別する。権限・I/O エラーのレコードを回復操作で
+    /// 消さないため）。
     fn inspect_record(&self, id: &ContainerId) -> Result<RecordHealth, TraitError> {
-        let Some(file_path) = self.record_file(id)? else {
-            return Ok(RecordHealth::Absent);
+        let file_path = match self.record_file(id)? {
+            RecordEntry::Absent => return Ok(RecordHealth::Absent),
+            RecordEntry::Malformed(e) => return Ok(RecordHealth::Corrupted(e)),
+            RecordEntry::File(path) => path,
         };
         let Some(bytes) = read_limited(&file_path, MAX_STATE_FILE_BYTES)? else {
             return Ok(RecordHealth::Corrupted(internal(
@@ -408,10 +429,29 @@ impl FileStateStore {
     }
 
     /// `<id>/state.json` を削除し、空になれば `<id>/` も削除する（ロック保持下で呼ぶこと）。
+    ///
+    /// ファイル種別の異常（`record_file` の `Malformed`。`purge_corrupted` からのみ到達）も消せる。
+    /// symlink はリンク自体を消し、リンク先は辿らない。`<id>` がディレクトリでなければ `<id>` の
+    /// エントリだけを消し、`state.json` がディレクトリなら `remove_dir_all`（std の実装は symlink を
+    /// 辿らない）で消す。いずれも 0700・所有者検査済みの状態ルート配下のエントリに限る。
     fn remove_record(&self, id: &ContainerId) -> Result<(), TraitError> {
         let dir = self.record_dir(id);
-        fs::remove_file(dir.join(STATE_FILE_NAME))
-            .map_err(|_| internal("failed to remove the state file"))?;
+        let dir_meta = fs::symlink_metadata(&dir)
+            .map_err(|_| internal("failed to inspect the state directory"))?;
+        if !dir_meta.is_dir() {
+            fs::remove_file(&dir).map_err(|_| internal("failed to remove the state entry"))?;
+            return sync_dir(&self.root);
+        }
+        let file = dir.join(STATE_FILE_NAME);
+        let file_is_dir = fs::symlink_metadata(&file)
+            .map_err(|_| internal("failed to inspect the state file"))?
+            .is_dir();
+        let removed = if file_is_dir {
+            fs::remove_dir_all(&file)
+        } else {
+            fs::remove_file(&file)
+        };
+        removed.map_err(|_| internal("failed to remove the state file"))?;
         // 削除（unlink）の永続化のため <id>/ を fsync する。ディレクトリ自体を消した場合は
         // その dirent の消失を永続化するため状態ルートも fsync する。
         sync_dir(&dir)?;
@@ -455,12 +495,13 @@ impl FileStateStore {
         Ok(found)
     }
 
-    /// 内容が破損したレコードを削除して回復する管理操作（OCI-5）。
+    /// 内容が破損した、またはファイル種別が異常なレコードを削除して回復する管理操作（OCI-5）。
     ///
     /// 破損レコードは revision を検証できないため、楽観的排他を持つ通常の
     /// `StateStore::delete` とは分離している。健全なレコードには使えず
-    /// （`FailedPrecondition`）、存在しなければ `NotFound`、権限不備など内容以外の理由で
-    /// 読めないものは削除せず元のエラーを返す（fail-closed）。
+    /// （`FailedPrecondition`）、存在しなければ `NotFound`。権限不備（`<id>` の 0700 以外・所有者
+    /// 不一致）や I/O エラーで検査できないものは削除せず元のエラーを返す（fail-closed）。
+    /// symlink はリンク自体だけを消す（`remove_record`）。
     pub fn purge_corrupted(&self, id: &ContainerId) -> Result<DeleteStateResponse, TraitError> {
         let _guard = self.lock()?;
         match self.inspect_record(id)? {

@@ -974,6 +974,15 @@ fn plan_subordinate_for(
     if timeout < Duration::from_secs(1) || timeout > Duration::from_secs(60) {
         return Err(invalid("id map timeout must be within 1..=60 seconds"));
     }
+    // 非特権（euid != 0。上で保証済み）の Direct は自 euid/egid への単一行のみ書ける。
+    // 違反を mapper 側の拒否（CLONE_NEWUSER 実行後）まで持ち越さず、副作用前に弾く。
+    if matches!(writer, IdMapWriter::Direct)
+        && crate::rootless::check_direct_allowed(&uid, &gid, euid, egid).is_err()
+    {
+        return Err(invalid(
+            "direct id map writer allows only a single mapping to the caller's own euid/egid; use the helper writer",
+        ));
+    }
     Ok(SubordinateIsolationPlan {
         namespaces: config.namespaces,
         hostname: config.hostname.clone(),
@@ -2493,13 +2502,40 @@ mod tests {
         )
     }
 
+    /// `Direct` writer が許す形（自 ID への単一行）の写像。
+    fn single_maps(euid: u32, egid: u32) -> (IdMapSet, IdMapSet) {
+        (
+            rootless::single_id_mapping(euid).unwrap(),
+            rootless::single_id_mapping(egid).unwrap(),
+        )
+    }
+
+    /// CORE-6・SEC-5（TASK-40.2）: 非特権の `Direct` writer と範囲写像（複数行）の組み合わせは、
+    /// 副作用の前に計画段階で `InvalidArgument` として拒否する。
+    #[test]
+    fn core6_sec5_subordinate_plan_rejects_direct_with_range_mapping() {
+        let (u, g) = sub_maps(1000, 1000);
+        let err = plan_subordinate_for(
+            &cfg(NamespaceSet::all(), None),
+            u,
+            g,
+            IdMapWriter::Direct,
+            Duration::from_secs(5),
+            1000,
+            1000,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.stage, IsolationStage::Validate);
+    }
+
     fn sub_plan(
         ns: NamespaceSet,
         euid: u32,
         egid: u32,
         timeout_secs: u64,
     ) -> Result<SubordinateIsolationPlan, ExecError> {
-        let (u, g) = sub_maps(1000, 1000);
+        let (u, g) = single_maps(1000, 1000);
         plan_subordinate_for(
             &cfg(ns, None),
             u,
@@ -2515,7 +2551,7 @@ mod tests {
     #[test]
     fn core6_sec5_subordinate_plan_keeps_values() {
         let plan = sub_plan(NamespaceSet::all(), 1000, 1000, 5).unwrap();
-        let (u, g) = sub_maps(1000, 1000);
+        let (u, g) = single_maps(1000, 1000);
         assert_eq!(plan.namespaces, NamespaceSet::all());
         assert_eq!((plan.euid, plan.egid), (1000, 1000));
         assert_eq!(plan.uid, u);
@@ -2608,7 +2644,7 @@ mod tests {
     #[test]
     fn core6_isolate_subordinate_rejects_changed_identity() {
         let other = sys::effective_uid().wrapping_add(1).max(1);
-        let (u, g) = sub_maps(other, other);
+        let (u, g) = single_maps(other, other);
         let mut plan = plan_subordinate_for(
             &cfg(NamespaceSet::all(), None),
             u,
@@ -2635,7 +2671,7 @@ mod tests {
             let _ = rx.recv();
         });
         let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
-        let (u, g) = sub_maps(euid, egid);
+        let (u, g) = single_maps(euid, egid);
         let planned = plan_subordinate_for(
             &cfg(NamespaceSet::all(), None),
             u,

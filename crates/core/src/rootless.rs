@@ -665,7 +665,7 @@ pub fn unshare_user_namespace() -> Result<(), RootlessError> {
 
 /// 非特権（euid != 0）の `Direct` 書き込みが満たすべき条件を書き込み前に検証する
 /// （カーネルの EPERM を待たない fail-closed）。`user_namespaces(7)`: 単一行・自 euid/egid への写像。
-fn check_direct_allowed(
+pub(crate) fn check_direct_allowed(
     uid: &IdMapSet,
     gid: &IdMapSet,
     euid: u32,

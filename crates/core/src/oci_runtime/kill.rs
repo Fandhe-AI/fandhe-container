@@ -30,7 +30,7 @@
 //! - kill は終了を待たず、状態も更新しない（`ContainerRuntime::kill` の契約）。戻り値は照合した時点の
 //!   状態。終了を検知して Stopped へ遷移させるのは起動ハンドルの所有者（supervisor。TASK-157）の責務
 //! - 本番の [`ProcessSignaler`] は本 crate に無い（supervisor が提供する。launcher と同じ扱い）
-//! - delete（TASK-30.2）・状態ファイル / cgroup の削除（TASK-30.3）・cgroup 配下の全プロセスへの
+//! - delete（`delete.rs`。TASK-30.2）・状態ファイル / cgroup の削除（TASK-30.3）・cgroup 配下の全プロセスへの
 //!   送信（TASK-32・CORE-3）・stop（SIGTERM → 猶予 → SIGKILL）は範囲外
 //!
 //! エラーメッセージは固定文言のみで、pid・パス・errno を含めない。

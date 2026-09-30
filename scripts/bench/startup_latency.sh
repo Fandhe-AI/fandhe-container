@@ -197,6 +197,16 @@ for tool in jq timeout mktemp tail rm; do
 done
 
 tmpdir="$(mktemp -d)"
+# コンテナ ID の実行固有部。PID だけでは過去の実行で残ったコンテナと再利用時に衝突し、
+# create 失敗時の後始末が無関係な既存コンテナを delete / kill し得るため、mktemp が返す
+# ランダムな接尾辞（実行ごとに一意）を含める。英数字以外は除去して ID に使える形にする。
+run_tag="${tmpdir##*/}"
+run_tag="${run_tag//[!A-Za-z0-9]/}"
+if [ -z "$run_tag" ]; then
+  rm -rf -- "$tmpdir"
+  err "missing-prerequisite" "could not derive a unique run id from mktemp"
+  exit "$EXIT_PREREQ"
+fi
 seq_no=0
 # 現在作成済みで未削除のコンテナ ID（1 試行につき 1 つ）と、削除できなかった ID の一覧。
 live_id=""
@@ -331,7 +341,7 @@ run_no=0
 while [ "$run_no" -lt "$total_runs" ]; do
   run_no=$((run_no + 1))
   seq_no=$((seq_no + 1))
-  id="fandhe-startup-$$-$seq_no"
+  id="fandhe-startup-$run_tag-$$-$seq_no"
   create_us=0
   start_us=0
   total_us=0

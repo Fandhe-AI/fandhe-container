@@ -50,6 +50,8 @@ pub enum ViolationKind {
     SharedPropagation,
     /// `prepare_rootfs` の rootfs 指定そのものの拒否（ホスト root の指定・固定後の移動。TASK-27.3）。
     RootfsPivot,
+    /// exec 直前のエントリポイントの検証（ランタイム自身のホスト側バイナリの指定等。TASK-27.4.1）。
+    Entrypoint,
 }
 
 impl ViolationKind {
@@ -62,6 +64,7 @@ impl ViolationKind {
             Self::MountTarget => "mount_target",
             Self::SharedPropagation => "shared_propagation",
             Self::RootfsPivot => "rootfs_pivot",
+            Self::Entrypoint => "entrypoint",
         }
     }
 }
@@ -139,6 +142,9 @@ pub enum ViolationReason {
     /// rootfs 内のファイルが rootfs の外にもハードリンクを持つ（外部 inode を共有する）。pivot 後の
     /// 書き込みが rootfs 外のファイルを書き換えるため拒否する。
     RootfsHasExternalHardlink,
+    /// エントリポイントがランタイム自身の実行ファイル（`/proc/self/exe`）と同一の inode
+    /// （CVE-2019-5736 型の多層防御。TASK-27.4.1）。
+    EntrypointIsRuntimeBinary,
 }
 
 impl ViolationReason {
@@ -178,6 +184,7 @@ impl ViolationReason {
             Self::RootfsMoved => "rootfs_moved",
             Self::RootfsHasSubmounts => "rootfs_has_submounts",
             Self::RootfsHasExternalHardlink => "rootfs_has_external_hardlink",
+            Self::EntrypointIsRuntimeBinary => "entrypoint_is_runtime_binary",
         }
     }
 
@@ -218,6 +225,7 @@ impl ViolationReason {
             | Self::RootfsMoved
             | Self::RootfsHasSubmounts
             | Self::RootfsHasExternalHardlink => ViolationKind::RootfsPivot,
+            Self::EntrypointIsRuntimeBinary => ViolationKind::Entrypoint,
         }
     }
 
@@ -268,6 +276,7 @@ impl ViolationReason {
             | Self::RootfsMoved
             | Self::RootfsHasSubmounts
             | Self::RootfsHasExternalHardlink => ErrorCode::FailedPrecondition,
+            Self::EntrypointIsRuntimeBinary => ErrorCode::PermissionDenied,
         }
     }
 
@@ -278,6 +287,7 @@ impl ViolationReason {
         match self.kind() {
             ViolationKind::PlanRejected => IsolationStage::Validate,
             ViolationKind::RootfsPivot => IsolationStage::PrepareRootfs,
+            ViolationKind::Entrypoint => IsolationStage::Exec,
             _ => IsolationStage::MountProc,
         }
     }
@@ -354,6 +364,9 @@ impl ViolationReason {
             }
             Self::RootfsHasExternalHardlink => {
                 "rootfs contains a file hard-linked to an inode outside the rootfs"
+            }
+            Self::EntrypointIsRuntimeBinary => {
+                "the entrypoint is the runtime's own executable; refusing to exec it"
             }
         }
     }
@@ -511,5 +524,16 @@ mod tests {
         assert_eq!(r.behavior_id(), "CORE-1");
         assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);
         assert_eq!(r.stage(), IsolationStage::PrepareRootfs);
+    }
+
+    /// CORE-1（TASK-27.4.1）: エントリポイント検証の理由コード・種別・`ErrorCode`・段の具体値。
+    #[test]
+    fn core1_entrypoint_reason_metadata_is_exact() {
+        let r = ViolationReason::EntrypointIsRuntimeBinary;
+        assert_eq!(r.as_str(), "entrypoint_is_runtime_binary");
+        assert_eq!(r.kind().as_str(), "entrypoint");
+        assert_eq!(r.behavior_id(), "CORE-1");
+        assert_eq!(r.error_code(), ErrorCode::PermissionDenied);
+        assert_eq!(r.stage(), IsolationStage::Exec);
     }
 }

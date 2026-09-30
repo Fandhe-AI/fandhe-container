@@ -9,7 +9,10 @@
 //! （CORE-1・TASK-27.3・#135）と、`crate::exec::create_default_devices`（CORE-1・TASK-27.6・#834）が、
 //! `unshare(2)`・`sethostname(2)`・`mount(2)`・`openat(2)`・`geteuid(2)`・`getegid(2)` に加え、
 //! `pivot_root(2)`（glibc がラッパーを持たないため `syscall(2)` 経由）・`umount2(2)`・`fchdir(2)`
-//! に加え、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。std だけでは提供されない
+//! を呼ぶために使う。さらに fork / exec 段（CORE-1・TASK-27.4.1・#831）の `crate::exec::spawn_container`・
+//! `crate::exec::exec_entrypoint`・`crate::exec::ContainerChild` が、`fork(2)`・`_exit(2)`・`execveat(2)`・
+//! `waitpid(2)`・`kill(2)`・`signal(2)` と `close_range(2)`（`syscall(2)` 経由）を呼ぶために使う。
+//! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。std だけでは提供されない
 //! syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
 //! （`Hostname` 等）が済ませた値だけを受け取る。
 //!
@@ -31,7 +34,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 
@@ -42,10 +45,15 @@ pub(crate) enum SysError {
     Unsupported,
     /// カーネルが返した errno。
     Os(i32),
+    /// シングルスレッドであることを確認できなかったため fork を拒否した（`Threads:` が 1 でない、
+    /// または `/proc/self/status` を読めない・解釈できない。fail-closed）。
+    MultiThreaded,
 }
 
 /// errno の値（アーキテクチャごとに `consts` で個別定義。alpha / mips / sparc 等は値が違う）。
-pub(crate) use consts::{EACCES, EEXIST, EINVAL, ELOOP, ENOENT, ENOTDIR, EPERM};
+pub(crate) use consts::{
+    E2BIG, EACCES, EEXIST, EINTR, EINVAL, ELOOP, ENOENT, ENOEXEC, ENOSYS, ENOTDIR, EPERM, ESRCH,
+};
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）
 //
@@ -81,11 +89,29 @@ mod consts {
     pub const MNT_DETACH: i32 = 2;
     // arch/x86/entry/syscalls/syscall_64.tbl の `pivot_root`。
     pub const SYS_PIVOT_ROOT: i64 = 155;
+    // arch/x86/entry/syscalls/syscall_64.tbl の `close_range`（436）。
+    pub const SYS_CLOSE_RANGE: i64 = 436;
+    // include/uapi/linux/close_range.h の `CLOSE_RANGE_CLOEXEC`（`1U << 2`）。
+    pub const CLOSE_RANGE_CLOEXEC: i64 = 4;
+    // include/uapi/linux/wait.h の `WNOHANG`。
+    pub const WNOHANG: i32 = 1;
+    // include/uapi/asm-generic/signal.h の `SIGKILL`・`SIGPIPE`（x86_64 は上書きしない）。
+    pub const SIGKILL: i32 = 9;
+    pub const SIGPIPE: i32 = 13;
     // include/uapi/asm-generic/fcntl.h（x86_64 は上書きしない）。
     pub const O_DIRECTORY: i32 = 0o200_000;
     pub const O_NOFOLLOW: i32 = 0o400_000;
     pub const O_CLOEXEC: i32 = 0o2_000_000;
     pub const O_PATH: i32 = 0o10_000_000;
+    // include/uapi/asm-generic/fcntl.h の `O_NONBLOCK`（x86_64 は上書きしない）。
+    pub const O_NONBLOCK: i32 = 0o4_000;
+    // arch/x86/entry/syscalls/syscall_64.tbl の `execveat`。
+    pub const SYS_EXECVEAT: i64 = 322;
+    // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（全アーキテクチャ共通）。
+    pub const AT_EMPTY_PATH: i64 = 0x1000;
+    // include/uapi/asm-generic/fcntl.h の `F_SETFD` と `FD_CLOEXEC`。
+    pub const F_SETFD: i32 = 2;
+    pub const FD_CLOEXEC: i32 = 1;
     // include/uapi/asm-generic/errno-base.h・errno.h（x86_64 は上書きしない）。
     pub const EPERM: i32 = 1;
     pub const ENOENT: i32 = 2;
@@ -94,6 +120,12 @@ mod consts {
     pub const ENOTDIR: i32 = 20;
     pub const EINVAL: i32 = 22;
     pub const ELOOP: i32 = 40;
+    // errno-base.h / errno.h の ESRCH・EINTR・E2BIG・ENOEXEC・ENOSYS。
+    pub const ESRCH: i32 = 3;
+    pub const EINTR: i32 = 4;
+    pub const E2BIG: i32 = 7;
+    pub const ENOEXEC: i32 = 8;
+    pub const ENOSYS: i32 = 38;
     // include/uapi/linux/stat.h の `S_IFCHR`（文字デバイス。全アーキテクチャ共通）。
     pub const S_IFCHR: u32 = 0o020_000;
 }
@@ -117,6 +149,16 @@ mod consts {
     // include/uapi/asm-generic/unistd.h の `__NR_pivot_root`（arm64 は asm-generic の表を使う。
     // x86_64 の 155 を流用しない）。
     pub const SYS_PIVOT_ROOT: i64 = 41;
+    // include/uapi/asm-generic/unistd.h の `__NR_close_range`（arm64 は asm-generic の表。
+    // x86_64 と値が同じでも流用せず個別に定義する）。
+    pub const SYS_CLOSE_RANGE: i64 = 436;
+    // include/uapi/linux/close_range.h の `CLOSE_RANGE_CLOEXEC`（`1U << 2`）。
+    pub const CLOSE_RANGE_CLOEXEC: i64 = 4;
+    // include/uapi/linux/wait.h の `WNOHANG`。
+    pub const WNOHANG: i32 = 1;
+    // include/uapi/asm-generic/signal.h の `SIGKILL`・`SIGPIPE`（arm64 は上書きしない）。
+    pub const SIGKILL: i32 = 9;
+    pub const SIGPIPE: i32 = 13;
     // arch/arm64/include/uapi/asm/fcntl.h（asm-generic と異なる。x86_64 の値を流用しない。
     // 流用すると O_DIRECT / O_LARGEFILE に化ける）。
     pub const O_DIRECTORY: i32 = 0o40_000;
@@ -124,6 +166,16 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h（arm64 も上書きしない）。
     pub const O_CLOEXEC: i32 = 0o2_000_000;
     pub const O_PATH: i32 = 0o10_000_000;
+    // include/uapi/asm-generic/fcntl.h の `O_NONBLOCK`（arm64 も上書きしない）。
+    pub const O_NONBLOCK: i32 = 0o4_000;
+    // include/uapi/asm-generic/unistd.h の `__NR_execveat`（arm64 は asm-generic の表。
+    // x86_64 の 322 を流用しない）。
+    pub const SYS_EXECVEAT: i64 = 281;
+    // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（全アーキテクチャ共通）。
+    pub const AT_EMPTY_PATH: i64 = 0x1000;
+    // include/uapi/asm-generic/fcntl.h の `F_SETFD` と `FD_CLOEXEC`。
+    pub const F_SETFD: i32 = 2;
+    pub const FD_CLOEXEC: i32 = 1;
     // include/uapi/asm-generic/errno-base.h・errno.h（arm64 は上書きしない）。
     pub const EPERM: i32 = 1;
     pub const ENOENT: i32 = 2;
@@ -132,6 +184,12 @@ mod consts {
     pub const ENOTDIR: i32 = 20;
     pub const EINVAL: i32 = 22;
     pub const ELOOP: i32 = 40;
+    // errno-base.h / errno.h の ESRCH・EINTR・E2BIG・ENOEXEC・ENOSYS。
+    pub const ESRCH: i32 = 3;
+    pub const EINTR: i32 = 4;
+    pub const E2BIG: i32 = 7;
+    pub const ENOEXEC: i32 = 8;
+    pub const ENOSYS: i32 = 38;
     // include/uapi/linux/stat.h の `S_IFCHR`（文字デバイス。全アーキテクチャ共通）。
     pub const S_IFCHR: u32 = 0o020_000;
 }
@@ -154,10 +212,20 @@ mod consts {
     pub const MS_PRIVATE: u64 = 0;
     pub const MNT_DETACH: i32 = 0;
     pub const SYS_PIVOT_ROOT: i64 = 0;
+    pub const SYS_CLOSE_RANGE: i64 = 0;
+    pub const CLOSE_RANGE_CLOEXEC: i64 = 0;
+    pub const WNOHANG: i32 = 0;
+    pub const SIGKILL: i32 = 0;
+    pub const SIGPIPE: i32 = 0;
     pub const O_DIRECTORY: i32 = 0;
     pub const O_NOFOLLOW: i32 = 0;
     pub const O_CLOEXEC: i32 = 0;
     pub const O_PATH: i32 = 0;
+    pub const O_NONBLOCK: i32 = 0;
+    pub const SYS_EXECVEAT: i64 = 0;
+    pub const AT_EMPTY_PATH: i64 = 0;
+    pub const F_SETFD: i32 = 0;
+    pub const FD_CLOEXEC: i32 = 0;
     pub const EPERM: i32 = -1;
     pub const ENOENT: i32 = -2;
     pub const EACCES: i32 = -3;
@@ -165,6 +233,11 @@ mod consts {
     pub const ENOTDIR: i32 = -4;
     pub const EINVAL: i32 = -5;
     pub const ELOOP: i32 = -6;
+    pub const ESRCH: i32 = -8;
+    pub const EINTR: i32 = -9;
+    pub const E2BIG: i32 = -10;
+    pub const ENOEXEC: i32 = -11;
+    pub const ENOSYS: i32 = -12;
     pub const S_IFCHR: u32 = 0;
 }
 
@@ -229,6 +302,22 @@ unsafe extern "C" {
     fn geteuid() -> u32;
     // SAFETY（宣言そのものの妥当性）: `gid_t getegid(void)`（Linux の `gid_t` は u32）。
     fn getegid() -> u32;
+    // SAFETY（宣言そのものの妥当性）: `pid_t fork(void)`（Linux の `pid_t` は i32）。
+    fn fork() -> i32;
+    // SAFETY（宣言そのものの妥当性）: `void _exit(int status)`（noreturn。atexit・デストラクタを
+    // 実行しない）。
+    fn _exit(status: i32) -> !;
+    // SAFETY（宣言そのものの妥当性）: `pid_t waitpid(pid_t pid, int *wstatus, int options)`。
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int kill(pid_t pid, int sig)`。
+    fn kill(pid: i32, sig: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `sighandler_t signal(int signum, sighandler_t handler)`。
+    // `sighandler_t`（関数ポインタ）はポインタ幅の整数として扱う（`SIG_DFL` = 0、
+    // `SIG_ERR` = `usize::MAX`）。
+    fn signal(sig: i32, handler: usize) -> usize;
+    // SAFETY（宣言そのものの妥当性）: `int fcntl(int fd, int cmd, ...)`。可変長引数として宣言する
+    // （非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
 }
 
 /// 直前の失敗した syscall の errno を `SysError` にする（失敗直後に呼ぶこと）。
@@ -417,6 +506,156 @@ pub(crate) fn change_dir_fd(fd: BorrowedFd<'_>) -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `/proc/self/status` の内容から `Threads:` が 1（シングルスレッド）かを判定する純関数。
+/// 行が無い・数値でない場合は `false`（fail-closed）。`crate::exec` の `status_threads` は
+/// 上位モジュールのため呼ばず（依存方向を保つ）、ここに最小の解析を持つ。
+fn threads_is_one(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Threads:"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        == Some(1)
+}
+
+/// `child` をシングルスレッドの呼び出し元から `fork(2)` した子で実行し、親には子の PID を返す。
+///
+/// `crate::exec::spawn_container`（CORE-1・TASK-27.4.1）が使う。fork の健全性条件を呼び出し側の
+/// 検査に依存させないため、**この関数の内側で強制する**:
+///
+/// - fork 直前に `/proc/self/status` の `Threads:` が 1 であることを確認する。満たさない・読めない
+///   ときは fork せず [`SysError::MultiThreaded`] を返す（`Threads: 1` の間、確認から fork までに
+///   新しいスレッドを作れる主体は自身以外に存在しない）
+/// - fork 前に stdout / stderr のバッファを flush する（子が親のバッファを二重出力しない）
+/// - 子は `child` を `catch_unwind` で実行し、その結果（panic なら `panic_exit`）で必ず
+///   `_exit(2)` する。呼び出し元のスタックフレームへ戻らず、`std::process::exit`（atexit・
+///   デストラクタ）も使わない
+pub(crate) fn fork_single_threaded<F: FnOnce() -> i32>(
+    child: F,
+    panic_exit: i32,
+) -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let status =
+        std::fs::read_to_string("/proc/self/status").map_err(|_| SysError::MultiThreaded)?;
+    if !threads_is_one(&status) {
+        return Err(SysError::MultiThreaded);
+    }
+    {
+        use std::io::Write as _;
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+    }
+    // SAFETY: 直前に `Threads: 1` を確認済みで、fork した子には呼び出しスレッドだけが複製される
+    // ため、他スレッドが保持していたロック・ヒープの不整合を子が引き継がない。子は下の分岐で
+    // `child` を実行して `_exit` し、呼び出し元のフレームへ戻らない。親は戻り値の pid だけを使う。
+    let pid = unsafe { fork() };
+    if pid < 0 {
+        return Err(last_error());
+    }
+    if pid == 0 {
+        let code =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(child)).unwrap_or(panic_exit);
+        // SAFETY: 引数は値渡しの整数のみ。noreturn で、子プロセスをここで終了させる
+        // （atexit・デストラクタを実行せず、親と共有している状態を触らない）。
+        unsafe { _exit(code) }
+    }
+    u32::try_from(pid).map_err(|_| SysError::Os(EINVAL))
+}
+
+/// NULL 終端のポインタ配列を作る（`execve(2)` の `argv` / `envp` 用）。各ポインタは `items` の
+/// 要素を指すため、戻り値は `items` より長く生存させない。
+fn null_terminated_ptrs(items: &[CString]) -> Vec<*const core::ffi::c_char> {
+    items
+        .iter()
+        .map(|c| c.as_ptr())
+        .chain(std::iter::once(core::ptr::null()))
+        .collect()
+}
+
+/// 絶対パス `path` を読み取り専用で開く（`O_RDONLY|O_CLOEXEC|O_NONBLOCK`。最終要素の symlink は辿る）。
+///
+/// エントリポイントの検査と実行を同じ実体に固定するための fd を得る（[`exec_fd`] と組で使う）。
+/// `O_NONBLOCK` は FIFO 等の open が相手待ちでハングするのを避けるため（REPAIR-5）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn open_file_read(path: &CStr) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = consts::O_CLOEXEC | consts::O_NONBLOCK;
+    // SAFETY: `path` は借用した NUL 終端文字列で呼び出しの間生存する。flags に O_CREAT / O_TMPFILE を
+    // 含まないため可変長引数（mode）は渡さず、カーネルも読まない。成功時の戻り値は新規 fd で、
+    // 直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let fd = unsafe { openat(AT_FDCWD, path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `fd` の close-on-exec を `on` に設定する（`fcntl(F_SETFD)`）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_cloexec(fd: BorrowedFd<'_>, on: bool) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let arg = if on { consts::FD_CLOEXEC } else { 0 };
+    // SAFETY: `fd` は生存中の `BorrowedFd`。F_SETFD は整数引数のみを取りポインタを渡さない。
+    let rc = unsafe { fcntl(fd.as_raw_fd(), consts::F_SETFD, arg) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 開いた fd の実体を `execveat(fd, "", argv, envp, AT_EMPTY_PATH)` で実行する。パスを再解決しない
+/// ため、検査した fd とは別のファイルが実行されることはない（TOCTOU 対策）。成功すると戻らず、
+/// 戻ったら常に失敗でその errno を返す。`fd` が close-on-exec のままだとシェバン付きスクリプトは
+/// `ENOENT` になる（カーネルが `/dev/fd/N` を開けないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn exec_fd(fd: BorrowedFd<'_>, argv: &[CString], envp: &[CString]) -> SysError {
+    if !consts::SUPPORTED {
+        return SysError::Unsupported;
+    }
+    let argv_ptrs = null_terminated_ptrs(argv);
+    let envp_ptrs = null_terminated_ptrs(envp);
+    // SAFETY: `fd` は生存中の `BorrowedFd`。パス引数は静的な空文字列（NUL 終端）で AT_EMPTY_PATH と
+    // 組で使う。`argv_ptrs` / `envp_ptrs` は末尾が NULL のポインタ配列で、各要素は呼び出しの間生存する
+    // `argv` / `envp`（NUL 終端の `CString`）を指す。成功時は戻らず、失敗時は配列を読み取っただけ。
+    unsafe {
+        syscall(
+            consts::SYS_EXECVEAT,
+            i64::from(fd.as_raw_fd()),
+            c"".as_ptr(),
+            argv_ptrs.as_ptr(),
+            envp_ptrs.as_ptr(),
+            consts::AT_EMPTY_PATH,
+        )
+    };
+    last_error()
+}
+
+/// fd `first` 以上のすべてを close-on-exec にする（`close_range(first, ~0, CLOSE_RANGE_CLOEXEC)`。
+/// Linux 5.11 以降）。exec 後のコンテナへホスト側の fd を漏らさない（CVE-2024-21626 型）。
+/// 未対応カーネルは `ENOSYS`/`EINVAL` を返す（呼び出し側が fail-closed にする）。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn mark_fds_cloexec_from(first: u32) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを取らない（`close_range` は glibc 2.34 未満に無いため
+    // `syscall(2)` 経由。unsigned int 引数は register 幅に拡張して渡され、カーネルは下位 32 bit を
+    // 読む）。CLOEXEC 指定のため fd は閉じず、exec までの間は引き続き使える。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_CLOSE_RANGE,
+            i64::from(first),
+            i64::from(u32::MAX),
+            consts::CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// [`open_path_nofollow`] が渡す `openat(2)` のフラグ（`O_PATH|O_NOFOLLOW|O_CLOEXEC`）。
 /// `O_DIRECTORY` を付けないため、最終要素が symlink でもそれ自体を指す fd が得られる
 /// （辿らない）。返る fd は fstat と `/proc/thread-self/fd/N` の magic link 専用。
@@ -476,6 +715,80 @@ pub(crate) fn make_char_device(
             makedev(major, minor),
         )
     };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `SIGPIPE` の disposition を `SIG_DFL` に戻す。Rust ランタイムは起動時に `SIGPIPE` を無視へ
+/// するが、無視の disposition は `execve` を越えて継承されるため、コンテナ内プロセスへ持ち込まない。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばない（libtest のプロセスの disposition を
+// 変えないため）ので、dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn reset_sigpipe_default() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数（`SIG_DFL` = 0）のみでポインタを取らない。ハンドラ関数を登録しない
+    // ため、シグナルハンドラの再入・非同期安全性の問題は生じない。
+    let prev = unsafe { signal(consts::SIGPIPE, SIG_DFL) };
+    if prev == SIG_ERR {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// `signal(2)` の `SIG_DFL`（既定動作）と `SIG_ERR`（失敗）。`sighandler_t` はポインタ幅。
+const SIG_DFL: usize = 0;
+const SIG_ERR: usize = usize::MAX;
+
+/// [`kill_pid`] が送るシグナル（生の番号を crate 外へ出さない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Signal {
+    /// `SIGKILL`。
+    Kill,
+}
+
+/// `pid` を `waitpid` / `kill` に渡せる正の `i32` に変換する。0（自プロセスグループ）と
+/// `i32` を超える値（負の pid になり、プロセスグループ・全プロセス宛てを意味し得る）は
+/// `EINVAL` で拒否する（`kill(-1, SIGKILL)` の事故防止）。
+fn positive_pid(pid: u32) -> Result<i32, SysError> {
+    match i32::try_from(pid) {
+        Ok(p) if p > 0 => Ok(p),
+        _ => Err(SysError::Os(EINVAL)),
+    }
+}
+
+/// 子 `pid` を `waitpid(WNOHANG)` で回収する。まだ生きていれば `Ok(None)`、回収できれば wait
+/// status（`decode_wait_status` 用の生の値）を返す。`EINTR` は呼び出し側が再試行する。
+pub(crate) fn wait_pid_nohang(pid: u32) -> Result<Option<i32>, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let raw = positive_pid(pid)?;
+    let mut status: i32 = 0;
+    // SAFETY: `status` は呼び出しの間生存するスタック上の i32 への有効な書き込み先。`raw` は
+    // 正であることを確認済みで、特定の子 1 つだけが対象になる（-1 や 0 を渡さない）。
+    let rc = unsafe { waitpid(raw, &mut status, consts::WNOHANG) };
+    match rc {
+        -1 => Err(last_error()),
+        0 => Ok(None),
+        r if r == raw => Ok(Some(status)),
+        _ => Err(SysError::Os(EINVAL)),
+    }
+}
+
+/// 子 `pid` へシグナルを送る。`pid` は正であることを確認してから渡す。
+pub(crate) fn kill_pid(pid: u32, sig: Signal) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let raw = positive_pid(pid)?;
+    let number = match sig {
+        Signal::Kill => consts::SIGKILL,
+    };
+    // SAFETY: 引数は整数のみでポインタを取らない。`raw` は正であることを確認済みで、
+    // プロセスグループ・全プロセス宛て（0・負値）にならない。
+    let rc = unsafe { kill(raw, number) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -549,6 +862,77 @@ mod tests {
             (EPERM, ENOENT, EACCES, ENOTDIR, EINVAL, ELOOP),
             (1, 2, 13, 20, 22, 40)
         );
+    }
+
+    /// CORE-1（TASK-27.4.1）: fork / exec / wait 系の定数の具体値。syscall 番号・フラグ・シグナル番号は
+    /// arch ごとに個別定義する（x86_64 = syscall_64.tbl、aarch64 = asm-generic/unistd.h）。
+    #[test]
+    fn core1_fork_exec_consts_are_exact() {
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(consts::SYS_EXECVEAT, 322);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(consts::SYS_EXECVEAT, 281);
+        assert_eq!(consts::AT_EMPTY_PATH, 0x1000);
+        assert_eq!(consts::O_NONBLOCK, 0o4_000);
+        assert_eq!((consts::F_SETFD, consts::FD_CLOEXEC), (2, 1));
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(consts::SYS_CLOSE_RANGE, 436);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(consts::SYS_CLOSE_RANGE, 436);
+        assert_eq!(consts::CLOSE_RANGE_CLOEXEC, 4);
+        assert_eq!(consts::WNOHANG, 1);
+        assert_eq!((consts::SIGKILL, consts::SIGPIPE), (9, 13));
+        assert_eq!((ESRCH, EINTR, E2BIG, ENOEXEC, ENOSYS), (3, 4, 7, 8, 38));
+    }
+
+    /// CORE-1（TASK-27.4.1）: `Threads:` が 1 のときだけ fork を許す（それ以外・解釈不能は拒否）。
+    #[test]
+    fn core1_threads_is_one_is_fail_closed() {
+        assert!(threads_is_one("Name:\tx\nThreads:\t1\nVmRSS:\t1 kB\n"));
+        assert!(!threads_is_one("Name:\tx\nThreads:\t2\n"));
+        assert!(!threads_is_one("Name:\tx\n"));
+        assert!(!threads_is_one("Threads:\tmany\n"));
+        assert!(!threads_is_one(""));
+    }
+
+    /// CORE-1（TASK-27.4.1）: libtest はマルチスレッドなので、fork は子を作らず `MultiThreaded` で拒否する。
+    #[test]
+    fn core1_fork_is_refused_when_multithreaded() {
+        // 別スレッドを 1 つ生かした状態で試す（libtest 本体のスレッドも存在する）。
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let helper = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let err = fork_single_threaded(|| 0, 125).unwrap_err();
+        assert_eq!(err, SysError::MultiThreaded);
+        tx.send(()).unwrap();
+        helper.join().unwrap();
+    }
+
+    /// CORE-1（TASK-27.4.1）: `execve` の引数配列は要素数 + 1 の NULL 終端。
+    #[test]
+    fn core1_null_terminated_ptrs_ends_with_null() {
+        let items = [CString::new("a").unwrap(), CString::new("bc").unwrap()];
+        let ptrs = null_terminated_ptrs(&items);
+        assert_eq!(ptrs.len(), 3);
+        assert_eq!(ptrs[0], items[0].as_ptr());
+        assert_eq!(ptrs[1], items[1].as_ptr());
+        assert!(ptrs[2].is_null());
+        let empty = null_terminated_ptrs(&[]);
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].is_null());
+    }
+
+    /// CORE-1（TASK-27.4.1）: 0 とプロセスグループ・全プロセス宛てになり得る値の pid は拒否する。
+    #[test]
+    fn core1_positive_pid_rejects_zero_and_overflow() {
+        assert_eq!(positive_pid(1), Ok(1));
+        assert_eq!(positive_pid(i32::MAX as u32), Ok(i32::MAX));
+        assert_eq!(positive_pid(0), Err(SysError::Os(EINVAL)));
+        assert_eq!(positive_pid(i32::MAX as u32 + 1), Err(SysError::Os(EINVAL)));
+        assert_eq!(positive_pid(u32::MAX), Err(SysError::Os(EINVAL)));
+        assert_eq!(wait_pid_nohang(0), Err(SysError::Os(EINVAL)));
+        assert_eq!(kill_pid(u32::MAX, Signal::Kill), Err(SysError::Os(EINVAL)));
     }
 
     /// テスト用の一時ディレクトリ（`chmod` で絞ったディレクトリを戻してから削除する）。

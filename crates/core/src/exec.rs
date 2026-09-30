@@ -885,6 +885,15 @@ fn mount_proc_verified(rootfs: &Path, target: &Path) -> Result<(), ExecError> {
     if mount_is_shared(&dir)? {
         return Err(violation(ViolationReason::TargetOnSharedMount, target));
     }
+    // fd 固定後に別プロセスがマウント先（または祖先）を改名・移動していないかを、マウント
+    // 直前に fd の現在の位置で確かめる（Codex 指摘）。移動・削除されていれば拒否する。
+    // 残る窓（この確認から mount(2) まで）で移動された場合も、マウントは establish が作った
+    // 呼び出しスレッド専用の mount namespace（shared でないことを上で確認済み）に閉じ、
+    // ホストや外側の namespace へは伝播しない。rootfs の外に残るマウントは #135 の
+    // pivot_root で旧ルートごと切り離される。
+    if !fd_still_at(&dir, target) {
+        return Err(violation(ViolationReason::TargetMoved, target));
+    }
     // fd が指す実体へマウントする（`/proc/thread-self/fd/N` は fd の dentry へ解決される）。
     // `establish` は呼び出しスレッドだけを新しい mount namespace へ移すため、パス解決・
     // mountinfo の参照はスレッドグループの代表（`/proc/self`）ではなく呼び出しスレッドで行う。
@@ -995,6 +1004,13 @@ fn open_dir_beneath(rootfs: &Path, names: &[&OsStr]) -> Result<OwnedFd, ExecErro
         cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c).map_err(|e| open_err(e, true))?;
     }
     Ok(cur)
+}
+
+/// `dir` の現在の位置（`/proc/thread-self/fd/N` のリンク先）が `expected` と要素単位で一致
+/// するか。移動・削除（リンク先に ` (deleted)` が付く）・読み取り失敗はいずれも不一致とする。
+fn fd_still_at(dir: &OwnedFd, expected: &Path) -> bool {
+    std::fs::read_link(format!("/proc/thread-self/fd/{}", dir.as_raw_fd()))
+        .is_ok_and(|now| now.components().eq(expected.components()))
 }
 
 /// `/proc/thread-self/fdinfo/<fd>` の `mnt_id:` 行（fd が属するマウントの ID）を取り出す。

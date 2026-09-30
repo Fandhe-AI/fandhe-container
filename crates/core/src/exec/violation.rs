@@ -121,6 +121,8 @@ pub enum ViolationReason {
     PathMissing,
     /// マウント先が shared propagation 上にある。
     TargetOnSharedMount,
+    /// fd で固定した後にマウント先が改名・移動・削除された。
+    TargetMoved,
 }
 
 impl ViolationReason {
@@ -154,6 +156,7 @@ impl ViolationReason {
             Self::PathSymlinkOrNotDirectory => "path_symlink_or_not_directory",
             Self::PathMissing => "path_missing",
             Self::TargetOnSharedMount => "target_on_shared_mount",
+            Self::TargetMoved => "target_moved",
         }
     }
 
@@ -185,7 +188,8 @@ impl ViolationReason {
             | Self::RootfsSymlinkOrNotDirectory
             | Self::TargetIsRootfs
             | Self::PathSymlinkOrNotDirectory
-            | Self::PathMissing => ViolationKind::MountTarget,
+            | Self::PathMissing
+            | Self::TargetMoved => ViolationKind::MountTarget,
             Self::TargetOnSharedMount => ViolationKind::SharedPropagation,
         }
     }
@@ -230,7 +234,8 @@ impl ViolationReason {
             | Self::EvidenceNspidNotPid1
             | Self::EvidenceMountNamespaceMismatch
             | Self::EvidencePidNamespaceMismatch
-            | Self::TargetOnSharedMount => ErrorCode::FailedPrecondition,
+            | Self::TargetOnSharedMount
+            | Self::TargetMoved => ErrorCode::FailedPrecondition,
         }
     }
 
@@ -303,6 +308,7 @@ impl ViolationReason {
             Self::TargetOnSharedMount => {
                 "proc mount target is on a shared mount; isolate the mount namespace first"
             }
+            Self::TargetMoved => "proc mount target was moved or removed after validation",
         }
     }
 }

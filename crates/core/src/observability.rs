@@ -25,7 +25,10 @@
 //!
 //! - 構造化ログ / JSON Lines での出力: TASK-84.3
 //! - create / start / kill / delete への計装: TASK-84.4
-//! - io の read / write 向け連携点と io 側の計装: TASK-84.5・TASK-84.7
+//! - io の read / write 向け連携点は io 側の `fandhe_container_io::instrument::IoOpRecorder`
+//!   として定義済み（TASK-84.5）。core との接続は core と io の両方に依存する上位 crate の
+//!   newtype アダプタで行う（core → io 依存辺は未承認のため core には置かない）。
+//!   io 側の計装は TASK-84.7
 //! - 結合テスト: TASK-84.6
 
 use std::collections::{HashMap, VecDeque};
@@ -48,8 +51,8 @@ pub const MAX_TRACKED_OPS: usize = 64;
 ///
 /// TASK-84.3 で JSON Lines のキー / 値として出力するため、`[A-Za-z0-9._-]` かつ
 /// [`OP_NAME_MAX_LEN`] バイト以下に限り、改行・引用符・制御文字によるログ行の偽装や分割を
-/// 型の段階で防ぐ。閉じた enum にしないのは、TASK-84.5 で io 側の操作名を core に依存せず
-/// 渡す方式が未決定のため。資格情報やホスト側の実パスをログのフィールドになる操作名に入れない。
+/// 型の段階で防ぐ。閉じた enum にしないのは、io 以外の呼び出し元も名前を渡すため。io 側は
+/// `IoOpKind::as_str()`（TASK-84.5）の固定文字列を、上位 crate のアダプタが `OpName::new` へ渡す。資格情報やホスト側の実パスをログのフィールドになる操作名に入れない。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OpName(String);
 
@@ -391,7 +394,7 @@ struct RecorderState {
 /// 操作の成功 / 失敗とレイテンシをスレッドセーフに集計する記録器（REPAIR-4・TASK-84.2）。
 ///
 /// supervisor・core のライフサイクル操作や io の read / write の計装が、`Arc<OpRecorder>` で
-/// 共有して呼ぶ想定（保持場所は TASK-84.4・84.5 で決める。グローバル static は置かない）。
+/// 共有して呼ぶ想定（保持場所は TASK-84.4 で決める。io からは io 側トレイトのアダプタ経由。TASK-84.5。グローバル static は置かない）。
 /// 集計全体を `Mutex` 1 個で保護する。`record` のロック保持は O(1)、`snapshot` / `snapshot_op` は
 /// ロック中に保持中のウィンドウ（操作あたり最大 1024 件）を複製するため、保持時間は操作数 × ウィンドウ長に
 /// 比例する上限付きの定数（ソート・集計はロック外）。ユーザーのクロージャは

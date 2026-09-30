@@ -56,6 +56,10 @@
 //! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102。作成経路への組み込みは未実装）、Unicode 正規化（NFC / NFD）は #103（TASK-21.h1）の方針決定後に
 //! TASK-21 で後続実装する。
 //!
+//! read / write 操作の計装連携点（[`instrument::IoOpRecorder`]。TASK-84.5・REPAIR-4）は
+//! core を参照しない io 内のトレイトで、core の `OpRecorder` への接続は上位 crate の
+//! アダプタが担う（実計装は TASK-84.7）。
+//!
 //! PLUG-1 区分は core（`fandhe-container-plugin` の境界機構とは別に、コアの一部として
 //! 直接リンクされる）。crate 名 `fandhe-container-io` は
 //! `docs/design/crate-naming.md`（TASK-1・REPAIR-1）で確定済み。依存方向は
@@ -69,6 +73,7 @@ pub mod client;
 pub mod error;
 pub mod fs_normalize;
 pub mod guest_files;
+pub mod instrument;
 pub mod observe;
 pub mod payload;
 pub mod protocol;
@@ -102,6 +107,9 @@ pub use fs_normalize::{
     check_case_collisions, check_host_path_length, measure_host_path_length,
 };
 pub use guest_files::{GuestFileCreator, MAX_GUEST_PATH_BYTES, MAX_TRACKED_GUEST_PATHS};
+pub use instrument::{
+    IoOpKind, IoOpOutcome, IoOpRecorder, IoOpSample, IoOpTimer, NoopIoOpRecorder, record_io_op,
+};
 pub use observe::{
     AckEvent, AckEventError, CoalescedServerEvents, DEFAULT_SEND_LOG_CAPACITY,
     JsonLinesSendObserver, JsonLinesServerObserver, MAX_SEND_LOG_BUFFER_BYTES,

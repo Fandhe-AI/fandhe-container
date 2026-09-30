@@ -31,7 +31,8 @@
 //!   fail-closed（`Internal`）
 //! - 破損レコード（JSON 破損・ociVersion 不正・ID 不一致・状態と PID の矛盾等）は revision を
 //!   照合できないため通常の `delete` では消せない。管理操作 `find_corrupted` /
-//!   `purge_corrupted` で特定・回復する
+//!   `purge_corrupted` で特定・回復する。破損・異常なレコードが 1 件でもあれば `list` はどのページでも
+//!   失敗する（fail-closed）
 //! - 書き込みは同じディレクトリの一時ファイルへ書いて `rename` する。fsync・一時ファイルの
 //!   残骸掃除・強制終了テストは TASK-31.2（#156）、結合テストは TASK-31.3（#157）で行う
 //! - 状態ルートは信頼境界として扱う（`bundle` のすり替えは `start` の起動先のすり替えになるため。
@@ -175,6 +176,29 @@ enum RecordHealth {
     Healthy(StateRecord),
     /// 内容が使えない（JSON 破損・サイズ超過・ociVersion 不正・ID 不一致・状態と PID の矛盾）。
     Corrupted(TraitError),
+}
+
+/// `list` の有界選択用に、レコードを ID の辞書順で比較するラッパー（同じルート内で ID は一意）。
+struct ById(StateRecord);
+
+impl PartialEq for ById {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id() == other.0.id()
+    }
+}
+
+impl Eq for ById {}
+
+impl PartialOrd for ById {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ById {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.id().as_str().cmp(other.0.id().as_str())
+    }
 }
 
 /// ファイルベースの [`StateStore`] 実装。
@@ -376,8 +400,9 @@ impl FileStateStore {
 
     /// 内容が破損しているレコードの ID を返す（管理操作。最大 [`MAX_CORRUPTED_REPORT`] 件）。
     ///
-    /// 破損レコードが 1 件でもあると `list` は fail-closed で失敗するため、回復対象の特定に
-    /// 使う。回復は [`FileStateStore::purge_corrupted`]（OCI-5）。
+    /// 破損レコードが 1 件でもあると `list` は（どのページでも）fail-closed で失敗するため、
+    /// 回復対象の特定に使う。回復は [`FileStateStore::purge_corrupted`]（OCI-5）。上限を超える
+    /// 場合は走査順で打ち切るため、回復後に再度呼んで残りを得る。
     pub fn find_corrupted(&self) -> Result<Vec<ContainerId>, TraitError> {
         let _guard = self.lock()?;
         let entries =
@@ -582,6 +607,12 @@ impl StateStore for FileStateStore {
 
     /// カーソルは「この ID より後」を表すキーセット方式。ページの間にカーソルの ID が
     /// 削除されても一覧が壊れないよう、その ID の存在は確認しない。
+    ///
+    /// fail-closed（OCI-5）: ページの内外・カーソルの前後を問わず、ストア内に異常なエントリ
+    /// （symlink 化・権限不備・`state.json` が通常ファイルでない）や内容が破損したレコードが 1 件でも
+    /// あれば、ページを返さず `get` と同じエラーを返す（回復は [`FileStateStore::find_corrupted`] /
+    /// [`FileStateStore::purge_corrupted`]）。そのため全レコードを読んで検証するが、保持するのは
+    /// page + 1 件に限る（ストア全体の件数に比例したメモリを確保しない）。
     fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
         let after = match req.cursor() {
             Some(c) => Some(ContainerId::new(c.as_str())?),
@@ -589,8 +620,7 @@ impl StateStore for FileStateStore {
         };
         let _guard = self.lock()?;
         let page = req.page_size().get() as usize;
-        // 保持件数を page + 1 に抑え、ストア全体の件数に比例したメモリを確保しない。
-        let mut smallest: BinaryHeap<String> = BinaryHeap::with_capacity(page.saturating_add(1));
+        let mut smallest: BinaryHeap<ById> = BinaryHeap::with_capacity(page.saturating_add(1));
         let entries =
             fs::read_dir(&self.root).map_err(|_| internal("failed to read the state root"))?;
         for entry in entries {
@@ -598,42 +628,31 @@ impl StateStore for FileStateStore {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if ContainerId::new(name.as_str()).is_err() {
+            let Ok(id) = ContainerId::new(name.as_str()) else {
                 continue;
-            }
+            };
+            // 内容まで検証してから（カーソルより前のレコードも含む）ページ対象かを判定する。
+            let Some(record) = self.read_record(&id)? else {
+                continue;
+            };
             if let Some(a) = &after
-                && name.as_str() <= a.as_str()
+                && id.as_str() <= a.as_str()
             {
                 continue;
             }
-            // 異常なエントリ（symlink 化・権限不備・state.json が通常ファイルでない）は get と
-            // 同じくエラーで返す。黙って除外しない（fail-closed）。
-            let id = ContainerId::new(name.as_str())?;
-            if self.record_file(&id)?.is_none() {
-                continue;
-            }
-            smallest.push(name);
+            smallest.push(ById(record));
             if smallest.len() > page.saturating_add(1) {
                 smallest.pop();
             }
         }
-        let mut names: Vec<String> = smallest.into_vec();
-        names.sort();
+        let mut selected: Vec<ById> = smallest.into_vec();
+        selected.sort();
         // 上の有界選択は「小さい方から page + 1 件」を残すため、超過分は最後の 1 件。
-        let has_more = names.len() > page;
-        names.truncate(page);
-        let mut records = Vec::with_capacity(names.len());
-        let mut last: Option<String> = None;
-        for name in names {
-            let id = ContainerId::new(name.as_str())?;
-            let record = self
-                .read_record(&id)?
-                .ok_or_else(|| internal("state file disappeared during listing"))?;
-            last = Some(name);
-            records.push(record);
-        }
-        let next_cursor = match (has_more, last) {
-            (true, Some(l)) => Some(StateListCursor::from_raw(l)?),
+        let has_more = selected.len() > page;
+        selected.truncate(page);
+        let records: Vec<StateRecord> = selected.into_iter().map(|r| r.0).collect();
+        let next_cursor = match (has_more, records.last()) {
+            (true, Some(l)) => Some(StateListCursor::from_raw(l.id().as_str().to_owned())?),
             _ => None,
         };
         Ok(StateList::new(records, next_cursor))

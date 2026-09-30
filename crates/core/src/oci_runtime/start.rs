@@ -1348,15 +1348,15 @@ mod tests {
         assert_eq!(launcher.calls(), 1);
     }
 
-    /// 未回収レジストリから `pid` のハンドルだけを引き取る（他のテストのハンドルは戻す）。
+    /// 未回収レジストリから `pid` のハンドルだけを引き取る。レジストリは並行テストで共有されるため、
+    /// 取り出しと残りの書き戻しを 1 回のロックの中で行い、他のテストから一時的に空に見えないようにする。
     #[cfg(target_os = "linux")]
     fn take_unreaped_pid(pid: u32) -> Vec<Box<dyn LaunchedProcess>> {
-        let (mine, others): (Vec<_>, Vec<_>) = take_unreaped_processes()
+        let mut registry = UNREAPED.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *registry)
             .into_iter()
             .partition(|p| p.pid().get() == pid);
-        for p in others {
-            keep_unreaped(p);
-        }
+        *registry = others;
         mine
     }
 

@@ -9,9 +9,9 @@
 //!
 //! 本モジュールは syscall を発行しない純粋関数・データで、[`build_deny_filter`] が
 //! テーブルから BPF プログラム（`seccomp_data.arch` 検査・x32 拒否を含む。TASK-38.1.2・#838）を構築する。
-//! **フィルタの適用・起動フローへの組み込みは未実装**（適用は TASK-38.2・#177、
-//! `exec/stages.rs` への組み込みは TASK-38.3・#178）。本モジュール単体ではコンテナを保護しない
-//! （REPAIR-3）。
+//! 適用関数は `crate::exec` の `apply_seccomp_filter`（TASK-38.2・#177）に実装済みだが、
+//! 起動フロー（`exec/stages.rs`）の組み込み段が exec 直前に適用する（TASK-38.3・#178）。
+//! 禁止 syscall の遮断を起動したコンテナの中で確かめる結合テストは `tests/seccomp.rs`（TASK-38.4・#179）。
 //!
 //! # 契約
 //!
@@ -37,8 +37,8 @@
 //!
 //! 値は Linux カーネル ABI の番号だが、syscall を発行しないデータであり、3 OS の CI
 //! （macOS arm64 runner が aarch64 テーブルを検証する）で固定値テストを走らせるため、
-//! `target_os` では分岐せず `target_arch` のみで分ける。適用（`seccomp(2)`・
-//! `prctl(PR_SET_SECCOMP)`）は TASK-38.2 で Linux 限定の `exec` / `sys` 側に置く。
+//! `target_os` では分岐せず `target_arch` のみで分ける。適用（`prctl(PR_SET_SECCOMP)`）は
+//! Linux 限定の `exec` / `sys` 側に置く（TASK-38.2・#177）。
 //!
 //! # 範囲外
 //!
@@ -395,7 +395,7 @@ const AUDIT_ARCH_X86_64_VALUE: u32 = 0xC000_003E;
 
 /// classic BPF 命令 1 個（`struct sock_filter` と同一レイアウト）。
 ///
-/// `repr(C)` なのは、適用側（TASK-38.2・#177）が `sock_fprog.filter` へ `as_ptr()` を
+/// `repr(C)` なのは、適用側（`exec::apply_seccomp_filter`。TASK-38.2・#177）が `sock_fprog.filter` へ `as_ptr()` を
 /// コピーなしで渡すため。フィールドは非公開で、任意命令はこのモジュールの構築子からしか作れない
 /// （壊れた値を表現できない型。REPAIR-2）。
 #[repr(C)]
@@ -444,8 +444,8 @@ impl BpfInstruction {
 
 /// 検証済みの seccomp BPF プログラム（1 以上 `BPF_MAXINSNS` 以下の命令列）。
 ///
-/// [`build_deny_filter`] が唯一の生成経路。適用（`seccomp(2)`・TASK-38.2・#177）は未実装で、
-/// 本型を持つだけではコンテナは保護されない（REPAIR-3）。
+/// [`build_deny_filter`] が唯一の生成経路。適用関数は `exec::apply_seccomp_filter`（TASK-38.2・#177）で、起動フローの
+/// 組み込み段（TASK-38.3・#178）が exec 直前に適用する。遮断の結合テストは `tests/seccomp.rs`（TASK-38.4・#179）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeccompProgram(Vec<BpfInstruction>);
 
@@ -514,7 +514,7 @@ impl std::error::Error for SeccompBuildError {}
 
 /// 禁止 syscall テーブルから deny-list 型の seccomp BPF プログラムを構築する純粋関数（CORE-5・TASK-38.1.2）。
 ///
-/// 生成する形は次のとおり。適用は TASK-38.2（#177）、起動フローからの呼び出しは TASK-38.3（#178）。
+/// 生成する形は次のとおり。適用は実装済み（TASK-38.2・#177）、起動フローの組み込み段（TASK-38.3・#178）が exec 直前に呼ぶ。
 ///
 /// 1. `seccomp_data.arch` が `table.audit_arch()` と違えば `KILL_PROCESS`（compat 経由の回避を防ぐ。
 ///    スレッド単位の `KILL` ではなくプロセス単位）

@@ -20,7 +20,7 @@
 //!
 //! - **最小構成（フック無し）**: 子はステージ列（[`StagePipeline`]。#832）を `run_child` の pivot 後・
 //!   exec 前で固定順に実行する。組み込みの `PR_SET_NO_NEW_PRIVS`（#833）は空のパイプラインでも適用される
-//!   が、**seccomp・Landlock・cgroup 参加は未適用**（実体は TASK-32・38〜40 が差し込む。capability 削減は #173 で組み込み済み）。
+//!   が、**Landlock・cgroup 参加は未適用**（実体は TASK-32・39・40 が差し込む。capability 削減は #173、seccomp は #178 で組み込み済み）。
 //!   そのため制限が未適用の子（rootful 経路のホスト root 権限のままの子を含む）は、
 //!   `exec_entrypoint` が `PermissionDenied` で exec を拒否する（SEC-1・CORE-5。制限を適用できる
 //!   ようになるまで fail-closed。REPAIR-3: 実装済みを装わない）
@@ -254,17 +254,18 @@ fn exit_code_for(err: &ExecError) -> i32 {
 /// 適用した制限を区別できず、seccomp フィルタの中身も確認できないため、証跡として扱わない。
 /// `PR_SET_NO_NEW_PRIVS` は #833 で組み込みステージとして実装済みだが単独では証跡にせず、
 /// capability 削減は #173（TASK-37.2）で組み込み段になり、その [`CapabilityReport`] を引数で受け取る
-/// が、seccomp・Landlock のステージの実体（TASK-38・TASK-39）が未実装の間は引数の有無によらず
-/// 常に `PermissionDenied` を返す。ステージ実装時は、各ステージが適用完了を示す証跡型（形は
-/// TASK-38・TASK-39 で決める）を返し、それを本関数の引数に取って初めて許可する形へ置き換える
-/// （REPAIR-3: 実装済みを装わない）。
+/// が、Landlock のステージの実体（TASK-39.3・39.4、#183・#184）が未実装の間は引数の有無によらず
+/// 常に `PermissionDenied` を返す。seccomp は #178（TASK-38.3）で組み込み段として適用されるが、
+/// 証跡型が未確定のため本関数へは配線しない（#184 で決める）。ステージ実装時は、各ステージが
+/// 適用完了を示す証跡型（形は TASK-38・TASK-39 で決める）を返し、それを本関数の引数に取って
+/// 初めて許可する形へ置き換える（REPAIR-3: 実装済みを装わない）。
 fn require_restriction_evidence(
     _capability_report: Option<&CapabilityReport>,
 ) -> Result<(), ExecError> {
     Err(ExecError::new(
         ErrorCode::PermissionDenied,
         IsolationStage::Exec,
-        "refusing to exec: no evidence that the isolation restrictions were applied (seccomp and Landlock stages are not implemented yet)",
+        "refusing to exec: no evidence that the isolation restrictions were applied (the Landlock stage is not implemented yet)",
     ))
 }
 
@@ -626,16 +627,96 @@ fn run_child(
     entry: &Entrypoint,
     stages: StagePipeline,
 ) -> Result<Infallible, ExecError> {
-    let isolation = MountIsolation::establish()?;
-    let prepared = prepare_rootfs(&isolation, rootfs)?;
-    let report = pivot_root(&isolation, prepared)?;
-    // pivot 後・exec 前にステージ列を固定順で実行する。exec は終端クロージャからしか呼ばれない。
-    stages.run_then(|_stage_report, capability_report| {
+    run_child_then(rootfs, stages, |isolation, report, capability_report| {
         // `exec_entrypoint` と同じ検証を、capability 削減の結果を添えて行う。
         isolation.verify_caller(IsolationStage::Exec)?;
         require_restriction_evidence(capability_report)?;
         exec_entrypoint_verified(report.new_root_mnt_id, entry)
     })
+}
+
+/// 子の前段（`establish` → `prepare_rootfs` → `pivot_root` → ステージ列）を共通化した本体。
+///
+/// 終端 `terminal` は組み込みステージ（capability 削減・`NO_NEW_PRIVS`・seccomp）の通過後にだけ呼ばれる。
+/// 本番の `run_child` は exec を、結合試験専用の [`spawn_container_seccomp_probe`] は exec の代わりに
+/// プローブを渡す。exec を呼べるのは `run_child` の終端だけで、fail-closed（`require_restriction_evidence`）
+/// は変わらない。
+fn run_child_then<T>(
+    rootfs: &Path,
+    stages: StagePipeline,
+    terminal: impl FnOnce(
+        &MountIsolation,
+        &PivotReport,
+        Option<&CapabilityReport>,
+    ) -> Result<T, ExecError>,
+) -> Result<T, ExecError> {
+    let isolation = MountIsolation::establish()?;
+    let prepared = prepare_rootfs(&isolation, rootfs)?;
+    let report = pivot_root(&isolation, prepared)?;
+    // pivot 後・終端前にステージ列を固定順で実行する。
+    stages.run_then(|_stage_report, capability_report| {
+        terminal(&isolation, &report, capability_report)
+    })
+}
+
+/// 子のメイン（プローブ版）。失敗は `child_main` と同じ規約で stderr へ 1 行出して終了コードにする。
+fn child_main_probe(rootfs: &Path, stages: StagePipeline) -> i32 {
+    let result = run_child_then(rootfs, stages, |_isolation, _report, _caps| {
+        let record = super::seccomp::probe_denied_syscalls()?;
+        publish_probe_record(&record.render())
+    });
+    match result {
+        Ok(()) => 0,
+        Err(err) => {
+            let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
+            exit_code_for(&err)
+        }
+    }
+}
+
+/// 記録を pivot 後の `/seccomp-probe.tmp` へ `create_new` で書き、`/seccomp-probe` へハードリンクして
+/// から一時名を消す（`link` は宛先が存在すれば `EEXIST` で失敗するため、既存ファイル・symlink を
+/// 上書き・追従しない。`rename` は宛先を黙って置換するため使わない。親はリンク後の完成品だけを読む）。
+fn publish_probe_record(text: &str) -> Result<(), ExecError> {
+    let fail = |e: std::io::Error| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Seccomp,
+            format!("failed to publish seccomp probe record: {e}"),
+        )
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open("/seccomp-probe.tmp")
+        .map_err(fail)?;
+    f.write_all(text.as_bytes()).map_err(fail)?;
+    drop(f);
+    let linked = std::fs::hard_link("/seccomp-probe.tmp", "/seccomp-probe");
+    // 一時名は成否に関わらず片付ける（リンク失敗を優先して報告する）。
+    let removed = std::fs::remove_file("/seccomp-probe.tmp");
+    linked.map_err(fail)?;
+    removed.map_err(fail)
+}
+
+/// 結合試験専用: exec の代わりに禁止 syscall のプローブを実行する子を fork する（CORE-5・TASK-38.4・#179）。
+///
+/// 呼び出し文脈は `tests/seccomp.rs` のシナリオ（`isolate` 済みの親）。`spawn_container_with_stages` と
+/// 同じ前段（pivot 済み・capability 削減・`NO_NEW_PRIVS`・組み込み seccomp）を通した後、終端で
+/// `<rootfs>/seccomp-probe` へ記録を書いて終了コード 0 で終わる。exec は呼ばないため、権限は
+/// `spawn_container` と同じで昇格経路は増えない。通常の利用者は呼ばない。
+///
+/// # 将来仕様（記録のみ）
+///
+/// exec が許可されたら（TASK-39.4・#184）、エントリポイント内のプローブへ移して本関数は廃止する（REPAIR-3）。
+#[doc(hidden)]
+pub fn spawn_container_seccomp_probe(
+    rootfs: &Path,
+    stages: StagePipeline,
+) -> Result<ContainerChild, ExecError> {
+    let pid = sys::fork_single_threaded(|| child_main_probe(rootfs, stages), EXIT_SETUP_FAILED)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    Ok(ContainerChild::new(pid))
 }
 
 /// 分離済み（`isolate` / `isolate_rootful_host_root` の後）の親から子を fork し、子で

@@ -1841,7 +1841,9 @@ mod tests {
     }
 
     /// OCI-5: ファイル種別が異常なエントリ（`<id>` が symlink・通常ファイル、`state.json` が
-    /// symlink・ディレクトリ）は破損として特定・回復でき、symlink のリンク先は消さない。
+    /// symlink・ディレクトリ）は破損として特定できる。回復で消すのはデータを持たないもの
+    /// （symlink はリンク自体・空ディレクトリ）だけで、リンク先・通常ファイルの `<id>`・中身のある
+    /// ディレクトリは消さずに FailedPrecondition を返す（再帰削除しない）。
     #[test]
     fn oci5_malformed_entries_are_found_and_purged_without_following_symlinks() {
         let t = TmpDir::new("malformed");
@@ -1871,13 +1873,31 @@ mod tests {
             store.find_corrupted().unwrap(),
             vec![cid("b"), cid("c"), cid("d"), cid("e")]
         );
-        for id in ["b", "c", "d", "e"] {
-            store.purge_corrupted(&cid(id)).unwrap();
-        }
-        assert!(!t.path().join("b").exists());
+        // データを持たない symlink は消せる。
+        store.purge_corrupted(&cid("b")).unwrap();
+        store.purge_corrupted(&cid("c")).unwrap();
+        assert!(fs::symlink_metadata(t.path().join("b")).is_err());
         assert!(!t.path().join("c").exists());
+        // 中身のあるディレクトリと通常ファイルの <id> は消さない。
+        let e = store.purge_corrupted(&cid("d")).unwrap_err();
+        assert_eq!(e.code().as_str(), "FAILED_PRECONDITION");
+        assert_eq!(
+            e.message(),
+            "state file is a non-empty directory and must be removed manually"
+        );
+        assert_eq!(fs::read(d_state.join("inner")).unwrap(), b"x");
+        let e = store.purge_corrupted(&cid("e")).unwrap_err();
+        assert_eq!(e.code().as_str(), "FAILED_PRECONDITION");
+        assert_eq!(
+            e.message(),
+            "state entry is a regular file and must be removed manually"
+        );
+        assert_eq!(fs::read(t.path().join("e")).unwrap(), b"x");
+        // 中身を手動で片付けて空ディレクトリになれば purge で消せる。
+        fs::remove_file(d_state.join("inner")).unwrap();
+        store.purge_corrupted(&cid("d")).unwrap();
         assert!(!t.path().join("d").exists());
-        assert!(!t.path().join("e").exists());
+        fs::remove_file(t.path().join("e")).unwrap();
         // リンク先（健全なレコード a・ルート外のファイル）は残る。
         assert_eq!(fs::read(&outside).unwrap(), b"keep");
         let ids: Vec<String> = store

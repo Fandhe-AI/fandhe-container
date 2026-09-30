@@ -26,4 +26,4 @@ pub use config::{
 pub use create::create;
 pub use launch::{LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir};
 pub use mount_destination::MountDestination;
-pub use start::start;
+pub use start::{recover_interrupted_start, start};

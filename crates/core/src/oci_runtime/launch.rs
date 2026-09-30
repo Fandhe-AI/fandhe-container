@@ -37,6 +37,12 @@ pub struct RootfsDir {
     file: Arc<std::fs::File>,
 }
 
+/// `O_NONBLOCK`（libc に依存しないため OS 別に定義する。値は x86_64・aarch64 とも同一）。
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const O_NONBLOCK: i32 = 0x0004;
+
 impl RootfsDir {
     /// `path` のディレクトリを開き、検査済みの実体と同一であることを確認して保持する。
     #[cfg(unix)]
@@ -44,7 +50,14 @@ impl RootfsDir {
         use std::os::unix::fs::MetadataExt;
         let fail =
             |msg: &'static str| TraitError::new(crate::traits::ErrorCode::PermissionDenied, msg);
-        let file = std::fs::File::open(path).map_err(|_| fail("cannot open rootfs directory"))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        // FIFO 等へ差し替えられても open がブロックしないよう O_NONBLOCK で開く（REPAIR-5）。
+        // ディレクトリでなければ下の種別検査で拒否する。
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(path)
+            .map_err(|_| fail("cannot open rootfs directory"))?;
         let opened = file
             .metadata()
             .map_err(|_| fail("cannot inspect rootfs directory"))?;

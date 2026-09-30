@@ -22,6 +22,10 @@
 //!    予約を Created へ戻してから、元のエラーを返す。終了にも失敗した場合（`Timeout` 等）は、
 //!    未記録プロセスが残り得ることを示す `Internal` を返し、元のエラーで隠さない（REPAIR-5）
 //!
+//! start のプロセスが手順 5〜7 の間に異常終了すると Running・pid なしの予約だけが残る。この状態は
+//! `FailedPrecondition`（`start was interrupted` を含むメッセージ）で識別でき、
+//! [`recover_interrupted_start`] で Created へ戻せる（CORE-2）。
+//!
 //! 手順 1〜7 は同一 ID につきプロセス内でも排他する（並行 start の早期拒否。CORE-2）。プロセス間の
 //! 排他は手順 5 の revision 照合（`StateStore` 実装が更新を原子的に照合する契約）に依存する。
 //!
@@ -39,6 +43,8 @@
 //! - `network`・`cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）
 //! - `linux.namespaces` に user namespace が無い（`process.user` は root 必須のため、ホスト root での
 //!   起動になる。`PermissionDenied`。SEC-5）
+//! - `linux.namespaces` に IPC namespace が無い（ホストの IPC を共有する起動を防ぐ。共有の明示許可は
+//!   未実装のため必須。`InvalidArgument`。SEC-1）
 //! - `linux.namespaces` に PID・mount namespace が無い、または hostname 指定があるのに UTS namespace が
 //!   無い（`exec::plan` の共通検証と同じ。ホストのプロセス・マウントが見える起動を防ぐ。`InvalidArgument`）
 //! - `linux.uidMappings` / `gidMappings` が非空（config 指定の写像は subuid 範囲写像とともに
@@ -129,6 +135,31 @@ impl Drop for StartReservation {
     }
 }
 
+/// 中断された start の起動権予約（Running・pid なし）を Created へ戻す（CORE-2）。
+///
+/// start は launch 前に状態を Running・pid なしへ更新して起動権を予約する。プロセスが launch 中に
+/// 異常終了すると予約だけが残り、次の start は `FailedPrecondition` で拒否される。本関数はその状態を
+/// revision 照合つきで Created へ戻す。呼び出し元は、対象コンテナの start が実行中でないこと
+/// （前回の start プロセスが終了済みであること）を確認してから呼ぶ。同一プロセス内の start とは
+/// 排他する。Running・pid なし以外の状態は `FailedPrecondition`、不在は `NotFound`。
+pub fn recover_interrupted_start(
+    store: &dyn StateStore,
+    id: &ContainerId,
+) -> Result<StateRecord, TraitError> {
+    let _reservation = StartReservation::acquire(id)?;
+    let record = store.get(&GetStateRequest::new(id.clone()))?;
+    if record.status().state() != ContainerState::Running || record.status().pid().is_some() {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "no interrupted start reservation to recover",
+        ));
+    }
+    store.update(&UpdateStateRequest::new(
+        ContainerStatus::created(id.clone(), None),
+        record.revision(),
+    ))
+}
+
 fn start_inner(
     store: &dyn StateStore,
     launcher: &dyn ProcessLauncher,
@@ -137,9 +168,17 @@ fn start_inner(
     let _reservation = StartReservation::acquire(req.id())?;
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     if record.status().state() != ContainerState::Created {
+        // Running・pid なしは start の起動権予約が残った状態（中断・クラッシュ後）。識別できる
+        // メッセージで返し、`recover_interrupted_start` での回復を促す（CORE-2）。
+        let interrupted =
+            record.status().state() == ContainerState::Running && record.status().pid().is_none();
         return Err(TraitError::new(
             ErrorCode::FailedPrecondition,
-            "container is not in created state",
+            if interrupted {
+                "container start was interrupted; recover the start reservation"
+            } else {
+                "container is not in created state"
+            },
         ));
     }
 
@@ -238,6 +277,14 @@ fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
         return Err(TraitError::new(
             ErrorCode::InvalidArgument,
             "the PID and mount namespaces are required",
+        ));
+    }
+    // IPC namespace が無いとホストの IPC（SysV IPC・POSIX メッセージキュー）を共有する。共有を明示許可する
+    // 仕組みが無いため fail-closed で必須とする（SEC-1）。
+    if !has(NamespaceKind::Ipc) {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "the IPC namespace is required",
         ));
     }
     if config.hostname().is_some() && !has(NamespaceKind::Uts) {
@@ -533,7 +580,8 @@ mod tests {
                 "cwd": "/"
             },
             "linux": {"namespaces": [
-                {"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "uts"}
+                {"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "uts"},
+                {"type": "ipc"}
             ]}
         })
     }
@@ -594,7 +642,8 @@ mod tests {
                 NamespaceKind::Pid,
                 NamespaceKind::Mount,
                 NamespaceKind::User,
-                NamespaceKind::Uts
+                NamespaceKind::Uts,
+                NamespaceKind::Ipc
             ]
         );
     }
@@ -819,18 +868,23 @@ mod tests {
         let cases: Vec<(&str, Value, &str)> = vec![
             (
                 "userns-only",
-                json!([{"type": "user"}, {"type": "uts"}]),
+                json!([{"type": "user"}, {"type": "uts"}, {"type": "ipc"}]),
                 "the PID and mount namespaces are required",
             ),
             (
                 "no-mount",
-                json!([{"type": "pid"}, {"type": "user"}, {"type": "uts"}]),
+                json!([{"type": "pid"}, {"type": "user"}, {"type": "uts"}, {"type": "ipc"}]),
                 "the PID and mount namespaces are required",
             ),
             (
                 "no-uts",
-                json!([{"type": "pid"}, {"type": "mount"}, {"type": "user"}]),
+                json!([{"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "ipc"}]),
                 "hostname requires the UTS namespace",
+            ),
+            (
+                "no-ipc",
+                json!([{"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "uts"}]),
+                "the IPC namespace is required",
             ),
         ];
         for (name, namespaces, message) in cases {
@@ -840,6 +894,33 @@ mod tests {
             assert_eq!(err.code(), ErrorCode::InvalidArgument, "case {name}");
             assert_eq!(err.message(), message, "case {name}");
         }
+    }
+
+    /// CORE-2: 中断された予約（Running・pid なし）は識別でき、回復後に start できる。
+    #[test]
+    fn core2_interrupted_reservation_is_recoverable() {
+        let (b, store) = created("recover");
+        let id = ContainerId::new("recover").expect("id");
+        let rec = store.get(&GetStateRequest::new(id.clone())).expect("get");
+        store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(id.clone(), None),
+                rec.revision(),
+            ))
+            .expect("claim");
+        let launcher = RecordingLauncher::new(false);
+        let err = start(&store, &OpRecorder::new(), &launcher, &sid("recover")).expect_err("stuck");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "container start was interrupted; recover the start reservation"
+        );
+        let got = recover_interrupted_start(&store, &id).expect("recover");
+        assert_eq!(got.status().state(), ContainerState::Created);
+        let err = recover_interrupted_start(&store, &id).expect_err("not stuck");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        start(&store, &OpRecorder::new(), &launcher, &sid("recover")).expect("start");
+        drop(b);
     }
 
     /// SEC-1: 絶対指定の `root.path` でホストの `/` を rootfs にする起動は拒否する。

@@ -7,9 +7,9 @@
 //! 提供するデータ層である。capability 最小化（SEC-1・TASK-37）とは独立に効く多層防御の土台で、
 //! CAP を持っていても、あるいは誤って付与しても、これらの syscall による脱出経路を塞ぐ。
 //!
-//! 本モジュールは syscall を発行しない純粋なデータで、BPF プログラムの構築（`seccomp_data.arch`
-//! 検査を含む。#838・TASK-38.1.2）が [`table_for_target_arch`] を使う予定である。
-//! **フィルタの構築・適用・起動フローへの組み込みは未実装**（適用は TASK-38.2・#177、
+//! 本モジュールは syscall を発行しない純粋関数・データで、[`build_deny_filter`] が
+//! テーブルから BPF プログラム（`seccomp_data.arch` 検査・x32 拒否を含む。TASK-38.1.2・#838）を構築する。
+//! **フィルタの適用・起動フローへの組み込みは未実装**（適用は TASK-38.2・#177、
 //! `exec/stages.rs` への組み込みは TASK-38.3・#178）。本モジュール単体ではコンテナを保護しない
 //! （REPAIR-3）。
 //!
@@ -24,12 +24,12 @@
 //!   （TASK-38.3）のため、`execve`・`execveat`・`prctl`・`capget`・`capset`・`close_range`・
 //!   `exit`・`exit_group`・`pidfd_open`・`pidfd_send_signal`・`rt_sigreturn` は禁止対象にしない
 //!   （テストで機械照合）。適用前に完了する `unshare`・`mount`・`pivot_root`・`umount2` は禁止してよい
-//! - **x32 ABI は BPF 構築側が明示的に拒否する**: x86_64 の `AUDIT_ARCH_X86_64` は x32 ABI の
+//! - **x32 ABI は BPF 構築側（[`build_deny_filter`]）が明示的に拒否する**: x86_64 の `AUDIT_ARCH_X86_64` は x32 ABI の
 //!   syscall でも同じ値になり、`arch` の照合だけでは x32 を区別できない。x32 の syscall 番号には
 //!   `0x4000_0000`（`__X32_SYSCALL_BIT`）が付くため、本テーブルの番号との単純比較では
-//!   `unshare` 等を遮断できない。#838（TASK-38.1.2）の BPF 構築は、x86_64 で
-//!   `nr & 0x4000_0000 != 0` の呼び出しを（テーブル照合の前に）無条件に拒否しなければならない。
-//!   本テーブルは x32 番号を含まず、この拒否は呼び出し側の責務である（CORE-5）
+//!   `unshare` 等を遮断できない。BPF 構築は、x86_64 で
+//!   `nr & 0x4000_0000 != 0` の呼び出しを（テーブル照合の前に）無条件に拒否する（実装済み）。
+//!   本テーブルは x32 番号を含まず、この拒否は構築側の責務である（CORE-5）
 //! - 各アーキの番号は `mod nr` に個別定義し、値が同じでも他アーキの定数を流用しない
 //!   （`sys.rs` の `consts` と同じ流儀。アーキ差の取り違えは誤遮断・遮断漏れに直結する）
 //!
@@ -345,6 +345,251 @@ impl std::error::Error for SeccompTableError {}
 /// ビルド対象アーキのテーブルを返す。対応外アーキでは `Err`（fail-closed）。
 pub fn table_for_target_arch() -> Result<&'static ArchSyscallTable, SeccompTableError> {
     nr::TABLE.ok_or(SeccompTableError::UnsupportedArch)
+}
+
+// ---- BPF フィルタ構築（TASK-38.1.2・#838） ----
+//
+// 定数はカーネル UAPI ヘッダの値（libc を使わず自前定義。本モジュールは OS 非依存のため
+// `sys::EPERM` 等の Linux 限定定義は使えない）。
+
+/// `BPF_LD`（`include/uapi/linux/bpf_common.h`）。
+const BPF_LD: u16 = 0x00;
+/// `BPF_W`（同上）。
+const BPF_W: u16 = 0x00;
+/// `BPF_ABS`（同上）。
+const BPF_ABS: u16 = 0x20;
+/// `BPF_JMP`（同上）。
+const BPF_JMP: u16 = 0x05;
+/// `BPF_JEQ`（同上）。
+const BPF_JEQ: u16 = 0x10;
+/// `BPF_JSET`（同上）。
+const BPF_JSET: u16 = 0x40;
+/// `BPF_K`（同上）。
+const BPF_K: u16 = 0x00;
+/// `BPF_RET`（同上）。
+const BPF_RET: u16 = 0x06;
+/// `BPF_MAXINSNS`（同上）。カーネルが受け付ける命令数の上限。
+const BPF_MAXINSNS: usize = 4096;
+
+/// `SECCOMP_RET_KILL_PROCESS`（`include/uapi/linux/seccomp.h`。Linux 4.14 以降）。
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+/// `SECCOMP_RET_ERRNO`（同上）。
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+/// `SECCOMP_RET_ALLOW`（同上）。
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+/// `SECCOMP_RET_DATA`（同上）。
+const SECCOMP_RET_DATA: u32 = 0x0000_ffff;
+/// `EPERM`（`include/uapi/asm-generic/errno-base.h`。全 Linux アーキ共通）。
+const EPERM: u32 = 1;
+
+/// `struct seccomp_data` の `nr` オフセット（アーキ非依存レイアウト）。
+const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+/// `struct seccomp_data` の `arch` オフセット。
+const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+
+/// x32 ABI の syscall 番号ビット（`arch/x86/include/uapi/asm/unistd.h` の `__X32_SYSCALL_BIT`）。
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+/// x86_64 の `AUDIT_ARCH_X86_64`。x32 規則を x86_64 テーブルにだけ適用する判定に使う
+/// （`cfg(target_arch)` ではなく値で判定し、どのホストでも両レイアウトをテストできるようにする）。
+const AUDIT_ARCH_X86_64_VALUE: u32 = 0xC000_003E;
+
+/// classic BPF 命令 1 個（`struct sock_filter` と同一レイアウト）。
+///
+/// `repr(C)` なのは、適用側（TASK-38.2・#177）が `sock_fprog.filter` へ `as_ptr()` を
+/// コピーなしで渡すため。フィールドは非公開で、任意命令はこのモジュールの構築子からしか作れない
+/// （壊れた値を表現できない型。REPAIR-2）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BpfInstruction {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+impl BpfInstruction {
+    const fn stmt(code: u16, k: u32) -> Self {
+        BpfInstruction {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        }
+    }
+
+    const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> Self {
+        BpfInstruction { code, jt, jf, k }
+    }
+
+    /// オペコード。
+    pub const fn code(&self) -> u16 {
+        self.code
+    }
+
+    /// 条件成立時のジャンプ量。
+    pub const fn jt(&self) -> u8 {
+        self.jt
+    }
+
+    /// 条件不成立時のジャンプ量。
+    pub const fn jf(&self) -> u8 {
+        self.jf
+    }
+
+    /// 即値・オフセット・戻り値。
+    pub const fn k(&self) -> u32 {
+        self.k
+    }
+}
+
+/// 検証済みの seccomp BPF プログラム（1 以上 `BPF_MAXINSNS` 以下の命令列）。
+///
+/// [`build_deny_filter`] が唯一の生成経路。適用（`seccomp(2)`・TASK-38.2・#177）は未実装で、
+/// 本型を持つだけではコンテナは保護されない（REPAIR-3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeccompProgram(Vec<BpfInstruction>);
+
+impl SeccompProgram {
+    /// 空・上限超過を拒否して包む。
+    fn new(insns: Vec<BpfInstruction>) -> Result<Self, SeccompBuildError> {
+        if insns.is_empty() || insns.len() > BPF_MAXINSNS {
+            return Err(SeccompBuildError::TooManyInstructions { len: insns.len() });
+        }
+        Ok(SeccompProgram(insns))
+    }
+
+    /// 命令列（`sock_filter` 配列として読める）。
+    pub fn instructions(&self) -> &[BpfInstruction] {
+        &self.0
+    }
+
+    /// 命令数（`sock_fprog.len` 用。検証により `u16` に収まる）。
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// 命令が無いか（構築検証により常に false）。
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// BPF 構築エラー。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeccompBuildError {
+    /// 対応外アーキ（fail-closed。空・全許可プログラムは返さない）。
+    UnsupportedArch,
+    /// 命令数が `BPF_MAXINSNS` を超える（`len` は必要だった命令数）。
+    TooManyInstructions {
+        /// 必要だった命令数。
+        len: usize,
+    },
+}
+
+impl From<SeccompTableError> for SeccompBuildError {
+    fn from(e: SeccompTableError) -> Self {
+        match e {
+            SeccompTableError::UnsupportedArch => SeccompBuildError::UnsupportedArch,
+        }
+    }
+}
+
+impl fmt::Display for SeccompBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SeccompBuildError::UnsupportedArch => {
+                write!(f, "seccomp filter is not available for this architecture")
+            }
+            SeccompBuildError::TooManyInstructions { len } => {
+                write!(
+                    f,
+                    "seccomp filter needs {len} instructions, exceeding the limit of {BPF_MAXINSNS}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SeccompBuildError {}
+
+/// 禁止 syscall テーブルから deny-list 型の seccomp BPF プログラムを構築する純粋関数（CORE-5・TASK-38.1.2）。
+///
+/// 生成する形は次のとおり。適用は TASK-38.2（#177）、起動フローからの呼び出しは TASK-38.3（#178）。
+///
+/// 1. `seccomp_data.arch` が `table.audit_arch()` と違えば `KILL_PROCESS`（compat 経由の回避を防ぐ。
+///    スレッド単位の `KILL` ではなくプロセス単位）
+/// 2. x86_64 のみ、`nr & 0x4000_0000 != 0`（x32 ABI）を表照合より前に `KILL_PROCESS`。
+///    ptrace のトレーサが syscall を skip させるために書く `nr = 0xFFFF_FFFF` もこれに該当する
+///    （deny-list 型のため、トレース下の挙動は範囲外）
+/// 3. `entries()` の各番号は `ERRNO(EPERM)`（`absent()` は命令を出さない）
+/// 4. それ以外は `ALLOW`（許可リスト方式への発展は TASK-128・GPU-3 で範囲外）
+///
+/// 命令数は checked 演算で事前計算し、上限検証してから確保する。
+pub fn build_deny_filter(table: &ArchSyscallTable) -> Result<SeccompProgram, SeccompBuildError> {
+    let audit_arch = table.audit_arch().get();
+    let is_x86_64 = audit_arch == AUDIT_ARCH_X86_64_VALUE;
+    let entries = table.entries();
+
+    let fixed: usize = if is_x86_64 { 4 + 2 + 1 } else { 4 + 1 };
+    let total = entries
+        .len()
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(fixed))
+        .unwrap_or(usize::MAX);
+    if total > BPF_MAXINSNS {
+        return Err(SeccompBuildError::TooManyInstructions { len: total });
+    }
+
+    let mut p = Vec::with_capacity(total);
+    p.push(BpfInstruction::stmt(
+        BPF_LD | BPF_W | BPF_ABS,
+        SECCOMP_DATA_ARCH_OFFSET,
+    ));
+    p.push(BpfInstruction::jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        audit_arch,
+        1,
+        0,
+    ));
+    p.push(BpfInstruction::stmt(
+        BPF_RET | BPF_K,
+        SECCOMP_RET_KILL_PROCESS,
+    ));
+    p.push(BpfInstruction::stmt(
+        BPF_LD | BPF_W | BPF_ABS,
+        SECCOMP_DATA_NR_OFFSET,
+    ));
+    if is_x86_64 {
+        p.push(BpfInstruction::jump(
+            BPF_JMP | BPF_JSET | BPF_K,
+            X32_SYSCALL_BIT,
+            0,
+            1,
+        ));
+        p.push(BpfInstruction::stmt(
+            BPF_RET | BPF_K,
+            SECCOMP_RET_KILL_PROCESS,
+        ));
+    }
+    for (_, nr) in entries {
+        p.push(BpfInstruction::jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            nr.get(),
+            0,
+            1,
+        ));
+        p.push(BpfInstruction::stmt(
+            BPF_RET | BPF_K,
+            SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA),
+        ));
+    }
+    p.push(BpfInstruction::stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    SeccompProgram::new(p)
+}
+
+/// ビルド対象アーキのテーブルから BPF を構築する。対応外アーキは `Err(UnsupportedArch)`（fail-closed）。
+pub fn build_filter_for_target_arch() -> Result<SeccompProgram, SeccompBuildError> {
+    build_deny_filter(table_for_target_arch()?)
 }
 
 /// x86_64 の番号（出典: `arch/x86/entry/syscalls/syscall_64.tbl`。`AUDIT_ARCH_X86_64` = EM_X86_64(62) | 64BIT | LE）。
@@ -690,6 +935,203 @@ mod tests {
         assert_eq!(
             SeccompTableError::UnsupportedArch.to_string(),
             "seccomp syscall table is not available for this architecture"
+        );
+    }
+}
+
+/// BPF 構築（TASK-38.1.2・#838）のテスト。両アーキのテーブルをリテラルで組み、ホストに依存せず検証する。
+#[cfg(test)]
+mod bpf_tests {
+    use super::*;
+
+    const X86_NRS: [u32; 43] = [
+        272, 308, 165, 166, 155, 428, 429, 430, 431, 432, 433, 442, 101, 310, 311, 312, 246, 320,
+        175, 313, 176, 169, 167, 168, 163, 179, 443, 153, 164, 227, 305, 159, 103, 212, 321, 298,
+        323, 248, 249, 250, 304, 172, 173,
+    ];
+    const AARCH_NRS: [u32; 41] = [
+        97, 268, 40, 39, 41, 428, 429, 430, 431, 432, 433, 442, 117, 270, 271, 272, 104, 294, 105,
+        273, 106, 142, 224, 225, 89, 60, 443, 58, 170, 112, 266, 171, 116, 18, 280, 241, 282, 217,
+        218, 219, 265,
+    ];
+    /// ランタイム自身が使う 11 syscall（x86_64）。
+    const X86_RUNTIME: [u32; 11] = [59, 322, 157, 125, 126, 436, 60, 231, 434, 424, 15];
+    /// 同（aarch64）。
+    const AARCH_RUNTIME: [u32; 11] = [221, 281, 167, 90, 91, 436, 93, 94, 434, 424, 139];
+
+    const KILL: u32 = 0x8000_0000;
+    const ERRNO_EPERM: u32 = 0x0005_0001;
+    const ALLOW: u32 = 0x7fff_0000;
+
+    fn leak_table(audit: u32, nrs: &[u32]) -> &'static ArchSyscallTable {
+        let entries: Vec<(DeniedSyscall, SyscallNr)> = nrs
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let d = DeniedSyscall::ALL[i % DeniedSyscall::ALL.len()];
+                (d, SyscallNr(*n))
+            })
+            .collect();
+        let absent: &'static [DeniedSyscall] = Box::leak(Vec::new().into_boxed_slice());
+        Box::leak(Box::new(ArchSyscallTable {
+            audit_arch: AuditArch(audit),
+            entries: Box::leak(entries.into_boxed_slice()),
+            absent,
+        }))
+    }
+
+    fn x86() -> &'static ArchSyscallTable {
+        leak_table(0xC000_003E, &X86_NRS)
+    }
+
+    fn aarch() -> &'static ArchSyscallTable {
+        leak_table(0xC000_00B7, &AARCH_NRS)
+    }
+
+    /// テスト専用の cBPF 評価器（LD W ABS・JEQ K・JSET K・RET K のみ）。
+    fn eval(p: &SeccompProgram, nr: u32, arch: u32) -> u32 {
+        let insns = p.instructions();
+        let (mut pc, mut a) = (0usize, 0u32);
+        loop {
+            let i = insns.get(pc).expect("pc in range");
+            match i.code() {
+                0x20 => {
+                    a = match i.k() {
+                        0 => nr,
+                        4 => arch,
+                        k => panic!("bad offset {k}"),
+                    };
+                    pc += 1;
+                }
+                0x15 => pc += 1 + usize::from(if a == i.k() { i.jt() } else { i.jf() }),
+                0x45 => pc += 1 + usize::from(if a & i.k() != 0 { i.jt() } else { i.jf() }),
+                0x06 => return i.k(),
+                c => panic!("bad opcode {c:#x}"),
+            }
+        }
+    }
+
+    #[test]
+    fn core5_task38_1_2_layout() {
+        assert_eq!(std::mem::size_of::<BpfInstruction>(), 8);
+        assert_eq!(std::mem::align_of::<BpfInstruction>(), 4);
+    }
+
+    #[test]
+    fn core5_task38_1_2_x86_64_shape() {
+        let p = build_deny_filter(x86()).unwrap();
+        assert_eq!(p.len(), 93);
+        assert!(!p.is_empty());
+        let i = p.instructions();
+        let t = |x: &BpfInstruction| (x.code(), x.jt(), x.jf(), x.k());
+        assert_eq!(t(&i[0]), (0x20, 0, 0, 4));
+        assert_eq!(t(&i[1]), (0x15, 1, 0, 0xC000_003E));
+        assert_eq!(t(&i[2]), (0x06, 0, 0, 0x8000_0000));
+        assert_eq!(t(&i[3]), (0x20, 0, 0, 0));
+        assert_eq!(t(&i[4]), (0x45, 0, 1, 0x4000_0000));
+        assert_eq!(t(&i[5]), (0x06, 0, 0, 0x8000_0000));
+        assert_eq!(t(&i[6]), (0x15, 0, 1, 272));
+        assert_eq!(t(&i[7]), (0x06, 0, 0, ERRNO_EPERM));
+        assert_eq!(t(&i[92]), (0x06, 0, 0, 0x7fff_0000));
+    }
+
+    #[test]
+    fn core5_task38_1_2_aarch64_shape() {
+        let p = build_deny_filter(aarch()).unwrap();
+        assert_eq!(p.len(), 87);
+        assert!(p.instructions().iter().all(|i| i.code() != 0x45));
+        assert!(
+            !p.instructions()
+                .iter()
+                .any(|i| { i.code() == 0x15 && (i.k() == 172 || i.k() == 173) })
+        );
+        let last = p.instructions().last().unwrap();
+        assert_eq!((last.code(), last.k()), (0x06, 0x7fff_0000));
+    }
+
+    #[test]
+    fn core5_task38_1_2_jumps_in_range() {
+        for t in [x86(), aarch()] {
+            let p = build_deny_filter(t).unwrap();
+            for (idx, i) in p.instructions().iter().enumerate() {
+                if i.code() == 0x15 || i.code() == 0x45 {
+                    assert!(idx + 1 + usize::from(i.jt()) < p.len());
+                    assert!(idx + 1 + usize::from(i.jf()) < p.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn core5_task38_1_2_evaluation() {
+        let px = build_deny_filter(x86()).unwrap();
+        for n in X86_NRS {
+            assert_eq!(eval(&px, n, 0xC000_003E), ERRNO_EPERM, "nr {n}");
+        }
+        for n in X86_RUNTIME {
+            assert_eq!(eval(&px, n, 0xC000_003E), ALLOW, "nr {n}");
+        }
+        assert_eq!(eval(&px, 272, 0xC000_00B7), KILL);
+        assert_eq!(eval(&px, 3, 0x4000_0003), KILL);
+        assert_eq!(eval(&px, 0x4000_0000 | 272, 0xC000_003E), KILL);
+        assert_eq!(eval(&px, 0x4000_0000, 0xC000_003E), KILL);
+        assert_eq!(eval(&px, 0xFFFF_FFFF, 0xC000_003E), KILL);
+
+        let pa = build_deny_filter(aarch()).unwrap();
+        for n in AARCH_NRS {
+            assert_eq!(eval(&pa, n, 0xC000_00B7), ERRNO_EPERM, "nr {n}");
+        }
+        for n in AARCH_RUNTIME {
+            assert_eq!(eval(&pa, n, 0xC000_00B7), ALLOW, "nr {n}");
+        }
+        assert_eq!(eval(&pa, 97, 0xC000_003E), KILL);
+        assert_eq!(eval(&pa, 0x4000_0000 | 97, 0xC000_00B7), ALLOW);
+    }
+
+    #[test]
+    fn core5_task38_1_2_too_many_instructions() {
+        let nrs: Vec<u32> = (0..2100).collect();
+        let t = leak_table(0xC000_00B7, &nrs);
+        assert_eq!(
+            build_deny_filter(t).unwrap_err(),
+            SeccompBuildError::TooManyInstructions { len: 4205 }
+        );
+        assert_eq!(
+            SeccompBuildError::TooManyInstructions { len: 4205 }.to_string(),
+            "seccomp filter needs 4205 instructions, exceeding the limit of 4096"
+        );
+    }
+
+    #[test]
+    fn core5_task38_1_2_errors() {
+        assert_eq!(
+            SeccompBuildError::from(SeccompTableError::UnsupportedArch),
+            SeccompBuildError::UnsupportedArch
+        );
+        assert_eq!(
+            SeccompBuildError::UnsupportedArch.to_string(),
+            "seccomp filter is not available for this architecture"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn core5_task38_1_2_native_x86_64() {
+        assert_eq!(build_filter_for_target_arch().unwrap().len(), 93);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn core5_task38_1_2_native_aarch64() {
+        assert_eq!(build_filter_for_target_arch().unwrap().len(), 87);
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[test]
+    fn core5_task38_1_2_unsupported_arch_is_fail_closed() {
+        assert_eq!(
+            build_filter_for_target_arch().unwrap_err(),
+            SeccompBuildError::UnsupportedArch
         );
     }
 }

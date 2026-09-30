@@ -635,7 +635,7 @@ impl FileStateStore {
 
 impl StateStore for FileStateStore {
     fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
-        check_bundle_len(req.bundle())?;
+        check_bundle(req.bundle())?;
         let mut guard = self.lock()?;
         if self.read_record(req.id())?.is_some() {
             return Err(err(
@@ -917,15 +917,24 @@ fn reject_symlink(path: &Path) -> Result<(), TraitError> {
     }
 }
 
-/// `bundle` のバイト長を上限検証する（シリアライズ前。UTF-8 でなければ別途拒否される）。
-fn check_bundle_len(bundle: &Path) -> Result<(), TraitError> {
+/// `bundle` を `state.json` に書ける値か検証し、UTF-8 の文字列として返す（バイト長の上限・UTF-8）。
+///
+/// 書き込み（`from_record`）・読み込み（`into_record`）・`create` のロック前検証で共通に使う。
+/// `create` はロック・revision の払い出し・`<id>/` の作成より前に呼び、拒否する要求で revision を
+/// 消費したり残骸ディレクトリを残したりしない。
+fn check_bundle(bundle: &Path) -> Result<&str, TraitError> {
     if bundle.as_os_str().len() > MAX_BUNDLE_PATH_BYTES {
         return Err(err(
             ErrorCode::InvalidArgument,
             "bundle path exceeds the length limit",
         ));
     }
-    Ok(())
+    bundle.to_str().ok_or_else(|| {
+        err(
+            ErrorCode::InvalidArgument,
+            "bundle path must be valid UTF-8",
+        )
+    })
 }
 
 /// 通常ファイルを上限つきで読む。上限を超えたら `Ok(None)`（無制限確保の防止）。
@@ -1046,18 +1055,8 @@ struct StateDto {
 
 impl StateDto {
     fn from_record(record: &StateRecord) -> Result<Self, TraitError> {
-        check_bundle_len(record.bundle())?;
+        let bundle = check_bundle(record.bundle())?.to_owned();
         let status = record.status();
-        let bundle = record
-            .bundle()
-            .to_str()
-            .ok_or_else(|| {
-                err(
-                    ErrorCode::InvalidArgument,
-                    "bundle path must be valid UTF-8",
-                )
-            })?
-            .to_owned();
         Ok(Self {
             oci_version: OCI_VERSION.to_owned(),
             id: status.id().as_str().to_owned(),
@@ -1078,7 +1077,7 @@ impl StateDto {
         if self.oci_version != OCI_VERSION {
             return Err(internal("state file has an unsupported ociVersion"));
         }
-        if check_bundle_len(Path::new(&self.bundle)).is_err() {
+        if check_bundle(Path::new(&self.bundle)).is_err() {
             return Err(corrupted());
         }
         let id = ContainerId::new(self.id).map_err(|_| corrupted())?;

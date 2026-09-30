@@ -57,11 +57,15 @@ make fio-bench-selftest     # fio 4K ランダム write ベンチスクリプト
 make fio-bench TARGET_DIR=<dir> LABEL=<label> [RUNTIME=<seconds>]  # fio 4K ランダム write ベンチを実行する（実機前提。下記「実機前提テスト」節を参照）
 make fio-baseline-ratio-selftest  # fio ベースライン比算出スクリプトの自己テスト（TASK-25.2・IO-8・REPAIR-12。実 fio 不要）
 make fio-baseline-ratio BASELINE=<results.json> CANDIDATE=<results.json>  # Docker ベースライン比（IOPS・レイテンシの倍率）を算出する（実 fio 不要。results.json は fio-randwrite-4k.sh の出力）
+make startup-latency-selftest  # 起動時間計測スクリプトの自己テスト（TASK-46.1・CORE-10・REPAIR-12。スタブランタイムで完結）
+make startup-latency RUNTIME=<abs-path> BUNDLE=<dir> [ITERATIONS=<n>] [LABEL=<label>]  # create から start 復帰までの起動時間の中央値を計測する（実機前提）
 ```
 
 - `make test-integration`: 終了コード 0 が成功基準。`notice:` 出力での成功終了は、全 crate から `tests/*.rs` が無くなった場合のフォールバック。通常は `cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server` と `cargo test -p fandhe-container-io --bins --features crash-test-server` の 2 段が実行される。`crash_safety` 等 `required-features` 付きの target は `make test`（既定 feature）では実行されず、本ターゲットと CI の `integration-test`・`rust-ci`（`--all-features`）で実行される。実行された件数は Makefile・CI が出力する `integration test targets: N` 行で確認する。`notice:` での成功終了は結合試験が 1 件も実行されていないことを意味し、`tests/*.rs` を追加・変更した PR の合格根拠にしない（冒頭の `skip:` と同じ扱い）。jq 未導入時は fail-closed で終了コード非 0 になる
 - `make bench-check-selftest` / `make bench-check`: 終了コード 0 が成功基準。`bench-check` を呼ぶ比較スクリプト（`scripts/check-bench-regression.sh`）自体の終了コードは 0（合格）/ 1（回帰検出）/ 2（入力エラー）の 3 値で、詳細は下記「タイムアウト保護された結合試験・ベンチ回帰」節 (4) を参照する。**現時点では計測対象がプレースホルダのため、`bench-check` の成功を性能回帰がない根拠として扱わない**
 - `make fio-bench-selftest`: 終了コード 0 が成功基準。`--from-json` モードと固定 fixture（`scripts/testdata/fio-bench/`）・fio スタブで完結し、実 fio は使わない。CI の `bench-regression` ジョブにも組み込まれている
+- `make startup-latency-selftest`: 終了コード 0 が成功基準。スタブランタイムで完結し実ランタイム・root は使わない。CI の `bench-regression` ジョブにも組み込まれている（TASK-46.1・CORE-10）
+- `make startup-latency`: 実機前提（OCI Runtime CLI 契約のランタイム実行ファイルと bundle が必要）。`RUNTIME`（絶対パス）・`BUNDLE` 未指定時は案内を出して終了コード 2 で止まる。スクリプトの終了コードは 0 / 1（ランタイム失敗・タイムアウト）/ 2（入力エラー）/ 3（前提ツール欠如）/ 4（後始末失敗）。`make ci` には含めない
 - `make fio-bench`: 実機前提（fio・GNU coreutils の `timeout`・Linux ホスト）。`TARGET_DIR`・`LABEL` 未指定時は案内を出して終了コード 2 で止まる。詳細は下記「実機前提テスト」節・[docs/design/io-fio-bench.md](docs/design/io-fio-bench.md) を参照
 - `make fio-baseline-ratio-selftest`: 終了コード 0 が成功基準。固定 fixture（`scripts/testdata/fio-baseline/`）で完結し、実 fio・Docker は使わない。CI の `bench-regression` ジョブにも組み込まれている
 - `make fio-baseline-ratio`: `BASELINE`・`CANDIDATE`（いずれも `fio-randwrite-4k.sh` の出力 JSON）未指定時は案内を出して終了コード 2 で止まる。fio・Docker を必要としないため実機前提テストではない
@@ -104,6 +108,7 @@ make fio-baseline-ratio BASELINE=<results.json> CANDIDATE=<results.json>  # Dock
 | SIGKILL 耐性（IO-3・TASK-18.3.1。実測は [io-crash-safety](docs/design/io-crash-safety.md)） | `crates/io/tests/crash_safety.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-io --features crash-test-server --test crash_safety` | 既定 CI 集合（`integration-test` 3 OS・`rust-ci`）で実行し、実機前提ではない。`integration-test` は「crash_safety の存在確認」ステップで glob による無言除外を検出する。電源断後の媒体永続化（IO-2）と実測レポート・妥当性判断（TASK-18 の人間担当）は保証しない |
 | ベンチ回帰 | `benches/benches/*.rs`・`benches/baseline.json`・`benches/metrics.json`・`scripts/bench/` | `make bench-check`・`make bench-baseline-selftest` | プレースホルダ段階。実ベンチは TASK-113、基準値の校正は TASK-88（校正記録: [bench-calibration](docs/design/bench-calibration.md)） |
 | fio 4K ランダム write ベンチ | `scripts/fio-randwrite-4k.sh`・`scripts/testdata/fio-bench/` | `make fio-bench-selftest`（自己テスト）・`make fio-bench`（実機） | TASK-25.1 で実装済み |
+| 起動時間計測（CORE-10） | `scripts/bench/startup_latency.sh`・`scripts/bench/startup_latency_selftest.sh` | `make startup-latency-selftest`（自己テスト）・`make startup-latency`（実機） | TASK-46.1: 計測ハーネスのみ実装済み。own 実測は CLI（TASK-79）・本番 launcher 提供後に人間が #213（TASK-46.h1）で実施。Docker 側の計測は TASK-46.2（#842） |
 | fio ベースライン比算出 | `scripts/fio-baseline-ratio.sh`・`scripts/testdata/fio-baseline/` | `make fio-baseline-ratio-selftest`（自己テスト）・`make fio-baseline-ratio`（比率算出） | TASK-25.2: 手順・比率算出・目標値案は整備済み。Docker ベースライン比の実測値は人間実施待ち（#114） |
 | 実機前提テスト | 既定のテスト集合から分離する | 分離の仕組みは該当タスクで決める | 下記「実機前提テスト」節・[ci](.claude/rules/ci.md)「実機前提テスト」を参照 |
 | 依存・ライセンス検査 | `Cargo.toml`・`deny.toml` | `make deny` | 依存を追加・更新するときのみ（ユーザー承認制。[dependency-policy](.claude/rules/dependency-policy.md)） |

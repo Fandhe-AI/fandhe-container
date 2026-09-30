@@ -74,6 +74,14 @@ mod linux {
         Duration::from_secs(secs)
     }
 
+    /// シナリオ全体の期限。scenario 内の各段階の上限（helper 写像の
+    /// `DEFAULT_HELPER_TIMEOUT`・子プロセス待ちの `timeout()`）の合計に、
+    /// 起動・後始末の余裕として `timeout()` を加える。
+    /// `FANDHE_CONTAINER_TEST_TIMEOUT_SECS` が小さくても正常系が打ち切られない。
+    fn scenario_deadline() -> Duration {
+        DEFAULT_HELPER_TIMEOUT + timeout() * 2
+    }
+
     fn own_ids() -> (u32, u32) {
         let id = |key: &str| -> u32 {
             std::fs::read_to_string("/proc/self/status")
@@ -214,7 +222,7 @@ mod linux {
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawn scenario");
-            let status = wait_deadline(&mut child, timeout() * 3)
+            let status = wait_deadline(&mut child, scenario_deadline())
                 .unwrap_or_else(|| panic!("scenario {name} did not exit within the limit"));
             let mut stderr = String::new();
             child

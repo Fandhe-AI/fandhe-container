@@ -855,6 +855,9 @@ pub(crate) fn wait_pid_nohang(pid: u32) -> Result<Option<i32>, SysError> {
 }
 
 /// 子 `pid` へシグナルを送る。`pid` は正であることを確認してから渡す。
+///
+/// 回収済みの pid は別プロセスへ再利用され得るため、呼び出し側は `pid` が未回収の自分の子で
+/// あることを保証する（`crate::exec::ContainerChild` が回収状態のロック下でのみ呼ぶ。CORE-1）。
 pub(crate) fn kill_pid(pid: u32, sig: Signal) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);

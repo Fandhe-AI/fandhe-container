@@ -22,8 +22,9 @@
 //! 5. `fork` / `exec`（#831・TASK-27.4.1。**最小構成のみ実装済み**。[`spawn_container`] が分離済みの
 //!    親から子を fork し、子が `establish` → [`prepare_rootfs`] → [`pivot_root`] →
 //!    [`exec_entrypoint`] を行う。上の第 3・4 段〔デバイスノード・ステージ列・`NO_NEW_PRIVS`〕は
-//!    未実装のため**この最小構成は capability 削減・seccomp・Landlock を適用せず、rootful 経路では
-//!    ホスト root 権限のまま exec される**。親子間の同期・構造化エラーパイプも未実装で、子の失敗は
+//!    未実装のため**この最小構成は capability 削減・seccomp・Landlock を適用できず、[`exec_entrypoint`] は
+//!    制限の適用証跡が無い限り rootful・rootless を問わず `PermissionDenied` で exec を拒否する**
+//!    （SEC-1・CORE-5。fail-closed）。親子間の同期・構造化エラーパイプも未実装で、子の失敗は
 //!    終了コードと stderr で伝える〔TASK-29/30 で扱う〕）
 //!
 //! # 前提・契約

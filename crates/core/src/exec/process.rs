@@ -265,7 +265,7 @@ fn require_restriction_evidence() -> Result<(), ExecError> {
 ///
 /// [`MountIsolation::establish`]・[`prepare_rootfs`]・[`pivot_root`] と同じスレッドから呼ぶ。
 /// 失敗しても状態は戻せないため、呼び出し元はプロセスを破棄する（子の `child_main` は終了コードで
-/// 終わる）。手順は [`exec_entrypoint_verified`] を参照。
+/// 終わる）。手順は非公開の `exec_entrypoint_verified` を参照。
 pub fn exec_entrypoint(
     isolation: &MountIsolation,
     pivot: &PivotReport,

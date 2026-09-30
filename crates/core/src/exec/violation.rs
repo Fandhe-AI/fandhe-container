@@ -136,6 +136,9 @@ pub enum ViolationReason {
     /// rootfs の bind mount が rootfs 配下の既存マウント（サブマウント）を複製した。許可リストは
     /// 空のため 1 つでもあれば拒否する（ホスト領域への bind mount 経由の脱出を防ぐ）。
     RootfsHasSubmounts,
+    /// rootfs 内のファイルが rootfs の外にもハードリンクを持つ（外部 inode を共有する）。pivot 後の
+    /// 書き込みが rootfs 外のファイルを書き換えるため拒否する。
+    RootfsHasExternalHardlink,
 }
 
 impl ViolationReason {
@@ -174,6 +177,7 @@ impl ViolationReason {
             Self::RootfsOnSharedMount => "rootfs_on_shared_mount",
             Self::RootfsMoved => "rootfs_moved",
             Self::RootfsHasSubmounts => "rootfs_has_submounts",
+            Self::RootfsHasExternalHardlink => "rootfs_has_external_hardlink",
         }
     }
 
@@ -210,9 +214,10 @@ impl ViolationReason {
             Self::TargetOnSharedMount | Self::RootfsOnSharedMount => {
                 ViolationKind::SharedPropagation
             }
-            Self::RootfsIsHostRoot | Self::RootfsMoved | Self::RootfsHasSubmounts => {
-                ViolationKind::RootfsPivot
-            }
+            Self::RootfsIsHostRoot
+            | Self::RootfsMoved
+            | Self::RootfsHasSubmounts
+            | Self::RootfsHasExternalHardlink => ViolationKind::RootfsPivot,
         }
     }
 
@@ -261,7 +266,8 @@ impl ViolationReason {
             | Self::TargetMoved
             | Self::RootfsOnSharedMount
             | Self::RootfsMoved
-            | Self::RootfsHasSubmounts => ErrorCode::FailedPrecondition,
+            | Self::RootfsHasSubmounts
+            | Self::RootfsHasExternalHardlink => ErrorCode::FailedPrecondition,
         }
     }
 
@@ -345,6 +351,9 @@ impl ViolationReason {
             Self::RootfsMoved => "rootfs was moved or removed after validation",
             Self::RootfsHasSubmounts => {
                 "rootfs contains existing mounts; unknown submounts are not allowed"
+            }
+            Self::RootfsHasExternalHardlink => {
+                "rootfs contains a file hard-linked to an inode outside the rootfs"
             }
         }
     }
@@ -492,6 +501,12 @@ mod tests {
         assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);
         let r = ViolationReason::RootfsHasSubmounts;
         assert_eq!(r.as_str(), "rootfs_has_submounts");
+        assert_eq!(r.kind().as_str(), "rootfs_pivot");
+        assert_eq!(r.behavior_id(), "CORE-1");
+        assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);
+        assert_eq!(r.stage(), IsolationStage::PrepareRootfs);
+        let r = ViolationReason::RootfsHasExternalHardlink;
+        assert_eq!(r.as_str(), "rootfs_has_external_hardlink");
         assert_eq!(r.kind().as_str(), "rootfs_pivot");
         assert_eq!(r.behavior_id(), "CORE-1");
         assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);

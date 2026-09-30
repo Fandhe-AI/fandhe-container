@@ -32,6 +32,9 @@
 //!   複製されたサブマウントが 1 つでもあれば `ViolationReason::RootfsHasSubmounts` で拒否する
 //!   （許可リストは空。ホスト領域への bind mount が pivot 後も到達可能になるのを防ぐ）。
 //!   `/proc` は検査後に自分でマウントする
+//! - **外部 inode へのハードリンクは拒否する**: rootfs 内の非ディレクトリが rootfs の外にもリンク
+//!   を持つ（`st_nlink` が rootfs 内のリンク数を超える）と、pivot 後の書き込みで外部ファイルが
+//!   変わる。bind 前に走査し `ViolationReason::RootfsHasExternalHardlink` で拒否する
 //! - **同一スレッド**: 呼び出しスレッドだけが新しい mount namespace にいるため、
 //!   [`MountIsolation::establish`]・[`prepare_rootfs`]・[`pivot_root`] は同じスレッドで呼ぶ
 //! - **失敗時はプロセスを破棄する**: bind mount・procfs マウント・pivot の途中で失敗しても
@@ -131,6 +134,8 @@ fn prepare_rootfs_verified(rootfs: &Path) -> Result<PreparedRootfs, ExecError> {
     let before_mnt_id = fd_mount_id(&pinned.dir, STAGE)?;
 
     let c_target = fd_path(&pinned.dir)?;
+    // bind の前（副作用なし）に、rootfs の外へ inode を共有するハードリンクが無いことを確認する。
+    check_no_external_hardlinks(Path::new(OsStr::from_bytes(c_target.as_bytes())), rootfs)?;
     bind_syscall(&c_target).map_err(|e| ExecError::from_sys(e, STAGE, "mount(MS_BIND)"))?;
 
     // 保持した親 fd から同じ名前で開き直す。通常要素の lookup はマウントを越えて新しい mount
@@ -244,22 +249,104 @@ fn fd_dev_ino(fd: &OwnedFd) -> std::io::Result<(u64, u64)> {
     Ok((m.dev(), m.ino()))
 }
 
-/// mountinfo から `mnt_id` のマウントの親マウント ID（第 2 フィールド）を取り出す。行が無い・
-/// 重複・書式不正は `None`（呼び出し側で fail-closed）。
-fn mount_parent_in(info: &str, mnt_id: u64) -> Option<u64> {
-    let mut found = None;
+/// mountinfo の 1 行から `(id, parent, major:minor)` を取り出す。書式不正は `None`。
+fn mount_ids_dev(line: &str) -> Option<(u64, u64, &str)> {
+    let mut f = line.split(' ');
+    let id: u64 = f.next()?.parse().ok()?;
+    let parent: u64 = f.next()?.parse().ok()?;
+    let dev = f.next()?;
+    Some((id, parent, dev))
+}
+
+/// bind 後の新マウントが今回の bind 由来であることを、bind 元の同一性と親子関係で別々に確認する
+/// （純関数。fail-closed）。
+///
+/// - 同一性: 新マウントと bind 前のマウントが同じ `major:minor`（同じ superblock）である
+/// - 親子関係: 新マウントの親が bind 前のマウント自身、またはその親である。rootfs が既存の
+///   マウントポイントのとき、カーネルは新マウントを bind 前のマウントの上（親 = bind 前のマウント）
+///   にも、それを載せているマウントの上（親 = bind 前のマウントの親）にも作り得るため、
+///   親 ID が bind 前のマウント ID に一致することだけを要求しない
+fn bind_lineage_ok(info: &str, before_mnt_id: u64, new_mnt_id: u64) -> bool {
+    let mut before = None;
+    let mut new = None;
     for line in info.lines() {
-        let mut f = line.split(' ');
-        let id: u64 = f.next()?.parse().ok()?;
-        let parent: u64 = f.next()?.parse().ok()?;
-        if id == mnt_id {
-            if found.is_some() {
-                return None;
+        let Some((id, parent, dev)) = mount_ids_dev(line) else {
+            return false;
+        };
+        if id == before_mnt_id {
+            if before.is_some() {
+                return false;
             }
-            found = Some(parent);
+            before = Some((parent, dev));
+        }
+        if id == new_mnt_id {
+            if new.is_some() {
+                return false;
+            }
+            new = Some((parent, dev));
         }
     }
-    found
+    let (Some((before_parent, before_dev)), Some((new_parent, new_dev))) = (before, new) else {
+        return false;
+    };
+    before_dev == new_dev && (new_parent == before_mnt_id || new_parent == before_parent)
+}
+
+/// 走査するエントリ数の上限（巨大 rootfs による無制限の時間・メモリ消費を防ぐ）。
+const HARDLINK_SCAN_MAX_ENTRIES: usize = 4_000_000;
+
+/// rootfs 内の非ディレクトリが、rootfs の外にもハードリンクを持たないことを確認する（CORE-1）。
+///
+/// rootfs と同じファイルシステム上の外部 inode へのハードリンクは、pivot 後の書き込みで外部ファイル
+/// を書き換えられる経路になる（サブマウントの拒否では防げない）。rootfs 配下を走査し、`st_nlink > 1`
+/// の inode ごとに rootfs 内で見つかったリンク数を数え、`st_nlink` に満たなければ外部にもリンクが
+/// あるとみなして拒否する。rootfs 内で完結するリンク（レイヤ展開由来）は許可する。別デバイスの
+/// ディレクトリ（既存サブマウント）へは降りない（bind が複製した場合は別途拒否する）。エントリ数が
+/// 上限を超える・読み取れない場合も fail-closed で拒否する。`root` は固定した rootfs fd の
+/// `/proc/thread-self/fd/N`（パス文字列を再解決しない）。
+fn check_no_external_hardlinks(root: &Path, rootfs: &Path) -> Result<(), ExecError> {
+    use std::collections::HashMap;
+    const STAGE: IsolationStage = IsolationStage::PrepareRootfs;
+    let reject = || {
+        ExecError::from_violation_at(
+            ViolationReason::RootfsHasExternalHardlink,
+            Some(rootfs),
+            STAGE,
+        )
+    };
+    let io_err = |e: std::io::Error| ExecError::from_io(&e, STAGE, "scan(rootfs hardlinks)");
+    let root_dev = std::fs::metadata(root).map_err(io_err)?.dev();
+    let mut seen: HashMap<(u64, u64), (u64, u64)> = HashMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut entries = 0usize;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(io_err)? {
+            let entry = entry.map_err(io_err)?;
+            entries += 1;
+            if entries > HARDLINK_SCAN_MAX_ENTRIES {
+                return Err(ExecError::new(
+                    ErrorCode::FailedPrecondition,
+                    STAGE,
+                    "rootfs has too many entries to scan for hard links",
+                ));
+            }
+            let meta = std::fs::symlink_metadata(entry.path()).map_err(io_err)?;
+            if meta.is_dir() {
+                if meta.dev() == root_dev {
+                    stack.push(entry.path());
+                }
+            } else if meta.nlink() > 1 {
+                let slot = seen
+                    .entry((meta.dev(), meta.ino()))
+                    .or_insert((meta.nlink(), 0));
+                slot.1 += 1;
+            }
+        }
+    }
+    if seen.values().any(|&(nlink, found)| found < nlink) {
+        return Err(reject());
+    }
+    Ok(())
 }
 
 /// `mountinfo` に `root_mnt_id` の子孫マウント（親 ID を辿って到達するもの）が 1 つでもあれば
@@ -307,9 +394,8 @@ fn check_no_submounts(info: &str, root_mnt_id: u64, rootfs: &Path) -> Result<(),
 /// かつ今回の bind が作った新しいマウントであることを確認する（fail-closed。CORE-1）。
 ///
 /// - `(st_dev, st_ino)` が `pinned` と一致する（別ディレクトリへの差し替えを検出する）
-/// - 本番ビルドでは、新しいマウントの親が bind 元のマウント（`before_mnt_id`）である
-///   （bind は元のディレクトリの上にマウントされるため。`cfg(test)` の dry-run では bind が
-///   作られないので省略する）
+/// - 本番ビルドでは、bind 元の同一性（同じ `major:minor` のデバイス）と親子関係（[`bind_lineage_ok`]）
+///   を別々に検証する（`cfg(test)` の dry-run では bind が作られないので省略する）
 fn check_reopened_is_bind_of(
     pinned: &OwnedFd,
     reopened: &OwnedFd,
@@ -328,7 +414,7 @@ fn check_reopened_is_bind_of(
     }
     if !cfg!(test) {
         let info = read_thread_mountinfo(STAGE)?;
-        if mount_parent_in(&info, new_mnt_id) != Some(before_mnt_id) {
+        if !bind_lineage_ok(&info, before_mnt_id, new_mnt_id) {
             return Err(swapped());
         }
     }
@@ -789,13 +875,64 @@ mod tests {
         assert_eq!(err.stage, IsolationStage::PrepareRootfs);
     }
 
-    /// CORE-1: mountinfo から親マウント ID を取り出す。
+    /// CORE-1: bind 元の同一性（デバイス）と親子関係を別々に検証する。rootfs が既存マウントポイント
+    /// （新マウントの親が bind 前マウントの親）でも通り、別デバイス・無関係な親・行の欠落は拒否する。
     #[test]
-    fn core1_mount_parent_in_reads_second_field() {
-        let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n11 10 0:5 / /proc rw - proc proc rw\n";
-        assert_eq!(mount_parent_in(info, 11), Some(10));
-        assert_eq!(mount_parent_in(info, 12), None);
-        assert_eq!(mount_parent_in("10 1 a\n10 2 b\n", 10), None);
+    fn core1_bind_lineage_checks_device_and_parent_separately() {
+        let base = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n";
+        // 親 = bind 前のマウント。
+        let a = format!(
+            "{base}10 1 8:1 /r /r rw - ext4 /dev/sda1 rw\n11 10 8:1 /r /r rw - ext4 /dev/sda1 rw\n"
+        );
+        assert!(bind_lineage_ok(&a, 10, 11));
+        // 親 = bind 前マウントの親（rootfs が既存マウントポイント）。
+        let b = format!(
+            "{base}10 1 8:1 /r /r rw - ext4 /dev/sda1 rw\n11 1 8:1 /r /r rw - ext4 /dev/sda1 rw\n"
+        );
+        assert!(bind_lineage_ok(&b, 10, 11));
+        // 別デバイスの差し替え。
+        let c = format!(
+            "{base}10 1 8:1 /r /r rw - ext4 /dev/sda1 rw\n11 10 8:2 / /r rw - ext4 /dev/sda2 rw\n"
+        );
+        assert!(!bind_lineage_ok(&c, 10, 11));
+        // 無関係な親。
+        let d = format!(
+            "{base}10 1 8:1 /r /r rw - ext4 /dev/sda1 rw\n11 77 8:1 /r /r rw - ext4 /dev/sda1 rw\n"
+        );
+        assert!(!bind_lineage_ok(&d, 10, 11));
+        // 行の欠落・書式不正・重複。
+        assert!(!bind_lineage_ok(base, 10, 11));
+        assert!(!bind_lineage_ok("x y z\n", 10, 11));
+        let dup = format!("{a}11 10 8:1 /r /r rw - ext4 /dev/sda1 rw\n");
+        assert!(!bind_lineage_ok(&dup, 10, 11));
+    }
+
+    /// CORE-1: rootfs 内で完結するハードリンクは許可し、rootfs 外にもリンクがあれば拒否する。
+    #[test]
+    fn core1_external_hardlink_is_rejected() {
+        let t = Tmp::new("hardlink");
+        let root = t.0.join("root");
+        let outside = t.0.join("outside");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/a"), b"x").unwrap();
+        std::fs::hard_link(root.join("etc/a"), root.join("etc/b")).unwrap();
+        // rootfs 内で完結するリンクは許可。
+        assert!(check_no_external_hardlinks(&root, &root).is_ok());
+        // 外部ファイルへのハードリンクを rootfs に置く。
+        std::fs::write(&outside, b"secret").unwrap();
+        std::fs::hard_link(&outside, root.join("etc/leak")).unwrap();
+        let err = check_no_external_hardlinks(&root, &root).unwrap_err();
+        assert_eq!(err.stage, IsolationStage::PrepareRootfs);
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(
+            violation_of(&err),
+            (
+                "rootfs_pivot",
+                "rootfs_has_external_hardlink",
+                "CORE-1",
+                Some(root.to_str().unwrap().to_string())
+            )
+        );
     }
 
     /// CORE-1: 新 root の直下に既存マウントが複製されていれば拒否し、無ければ通す。

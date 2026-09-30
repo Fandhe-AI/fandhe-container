@@ -2,9 +2,10 @@
 //!
 //! 現状は namespace 分離（[`isolate`]・[`mount_proc`]。#134・TASK-27.2）と、`pivot_root` による
 //! rootfs 切替（[`prepare_rootfs`]・[`pivot_root`]。#135・TASK-27.3）、基本デバイスノード作成
-//! （[`create_default_devices`]。#834・TASK-27.6）まで実装済み。
-//! fork / exec 等の後続段は未実装で、後続の sub-issue
-//! （#136・#137・#831〜#834）が本モジュールへ追記する（REPAIR-3: 実装済みを装わない）。
+//! （[`create_default_devices`]。#834・TASK-27.6）、fork / exec による子プロセス
+//! 起動（[`spawn_container`]・[`exec_entrypoint`]。#831・TASK-27.4.1。最小構成でフック無し）まで実装済み。
+//! ステージ列・`PR_SET_NO_NEW_PRIVS` 等の後続段は未実装で、後続の sub-issue
+//! （#136・#137・#832・#833）が本モジュールへ追記する（REPAIR-3: 実装済みを装わない）。
 //!
 //! # 目指すフロー（Linux 専用）
 //!
@@ -18,7 +19,13 @@
 //!    → Landlock → seccomp（#136・#832・#833。後続の TASK-32・37・38・39・40 が差し込む）。
 //!    `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
 //!    後続実装はこの順序を崩さない
-//! 5. `fork` / `exec`（#831・TASK-27.4。未実装）
+//! 5. `fork` / `exec`（#831・TASK-27.4.1。**最小構成のみ実装済み**。[`spawn_container`] が分離済みの
+//!    親から子を fork し、子が `establish` → [`prepare_rootfs`] → [`pivot_root`] →
+//!    [`exec_entrypoint`] を行う。上の第 3・4 段〔デバイスノード・ステージ列・`NO_NEW_PRIVS`〕は
+//!    未実装のため**この最小構成は capability 削減・seccomp・Landlock を適用できず、[`exec_entrypoint`] は
+//!    制限の適用証跡が無い限り rootful・rootless を問わず `PermissionDenied` で exec を拒否する**
+//!    （SEC-1・CORE-5。fail-closed）。親子間の同期・構造化エラーパイプも未実装で、子の失敗は
+//!    終了コードと stderr で伝える〔TASK-29/30 で扱う〕）
 //!
 //! # 前提・契約
 //!
@@ -26,7 +33,8 @@
 //!   macOS / Windows ではコンテナはゲスト VM（Linux）内で実行されるため、ホスト側から
 //!   直接呼ぶ経路は存在しない（非 Linux ビルドの確認は #137・TASK-27.5）
 //! - syscall を呼ぶ `unsafe` は `crate::sys` に閉じ込め、本ファイルには置かない
-//! - 呼び出し元は TASK-29 の `oci_runtime`（`create` / `start`）および fork 段（#831）を想定する
+//! - 呼び出し元は TASK-29 の `oci_runtime`（`create` / `start`）と supervisor（TASK-157）を想定し、fork 段は
+//!   [`spawn_container`]（#831）が担う
 //! - 常駐デーモンを前提にしない（CORE-1・D-19）
 //! - 分離違反の試行を拒否したエラーは `ExecError::violation` に構造化された違反記録
 //!   （[`IsolationViolation`]: 種別・理由コード・ビヘイビア ID・対象）を持つ。**記録の経路のみ**で、
@@ -64,10 +72,16 @@ use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
 
 mod devices;
+mod process;
 mod rootfs;
 mod violation;
 
 pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_default_devices};
+pub use process::{
+    ChildExit, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
+    ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,
+    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, exec_entrypoint, spawn_container,
+};
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 
 pub use violation::{
@@ -274,6 +288,12 @@ pub enum IsolationStage {
     PrepareRootfs,
     /// `pivot_root(2)` による rootfs 切替と旧 root の切り離し。
     PivotRoot,
+    /// 子プロセスの `fork(2)`。
+    Spawn,
+    /// exec 直前の検証（証跡・エントリポイント・fd・シグナル状態）と `execve(2)`。
+    Exec,
+    /// 子の終了待ち（`waitpid(2)`）と、期限超過時の `kill(2)`。
+    Wait,
     /// rootfs 配下の `dev` への基本デバイスノード作成（`mknodat(2)`）。
     CreateDevices,
 }
@@ -377,6 +397,10 @@ impl std::error::Error for ExecError {}
 fn describe(err: SysError) -> String {
     match err {
         SysError::Unsupported => "unsupported target architecture".to_string(),
+        SysError::MultiThreaded => {
+            "the process is multi-threaded or its thread count is unknown; refusing to fork"
+                .to_string()
+        }
         SysError::Os(errno) => std::io::Error::from_raw_os_error(errno).to_string(),
     }
 }
@@ -387,6 +411,7 @@ fn describe(err: SysError) -> String {
 fn errno_to_code(err: SysError) -> ErrorCode {
     match err {
         SysError::Unsupported => ErrorCode::Unimplemented,
+        SysError::MultiThreaded => ErrorCode::FailedPrecondition,
         SysError::Os(e) if e == sys::EPERM || e == sys::EACCES => ErrorCode::PermissionDenied,
         SysError::Os(e) if e == sys::EINVAL => ErrorCode::FailedPrecondition,
         SysError::Os(_) => ErrorCode::Internal,

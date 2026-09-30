@@ -10,6 +10,11 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# config.json のパース用（TASK-29.1.1。承認: Issue #138・TASK-29.hdep1）。3 OS 共通。
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 # namespace 分離の結合試験（CORE-1・TASK-27.2）。libtest はテストをスレッドで実行し
 # CLONE_NEWUSER が EINVAL になるため、単一スレッドの独自 main（harness = false）で動かす。
 [[test]]

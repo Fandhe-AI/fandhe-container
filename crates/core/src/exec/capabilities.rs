@@ -68,8 +68,12 @@ impl CapKernel for RealKernel {
 pub struct CapabilityReport {
     /// bounding set から drop した capability 番号（本 crate が知らない番号も表せるよう番号で持つ）。
     pub bounding_dropped: Vec<u8>,
-    /// 最終的な effective / permitted の集合。
+    /// 呼び出したスレッドの現在の effective / permitted の集合（`execve` 後に保持される集合では
+    /// ない。`execve` 後に保持できるのは `retained_after_exec`）。
     pub granted: CapabilitySet,
+    /// `granted` のうち bounding set にも残っている集合。`execve` 後の uid 0 プロセスが
+    /// 保持できる権限の上限（`granted` ∩ bounding）で、証跡（#173）にはこちらを使う。
+    pub retained_after_exec: CapabilitySet,
     /// 許可集合に含まれるが、適用前の permitted に無く付与できなかったもの。
     pub unavailable: CapabilitySet,
     /// 調べて分かったカーネルの最後の capability 番号。
@@ -166,10 +170,14 @@ fn apply_capabilities(
             "capabilities differ from the target after capset",
         ));
     }
+    let mut bounding_held = [false; CAP_INDEX_LIMIT as usize];
     for n in 0..=last_cap {
         let present = kernel
             .bounding_contains(n)
             .map_err(|e| fail(e, "prctl(PR_CAPBSET_READ)"))?;
+        if let Some(slot) = bounding_held.get_mut(usize::from(n)) {
+            *slot = present;
+        }
         if present && !allowed.contains_index(n) {
             return Err(ExecError::new(
                 ErrorCode::Internal,
@@ -179,9 +187,20 @@ fn apply_capabilities(
         }
     }
 
+    let retained_after_exec = granted
+        .iter()
+        .filter(|c| {
+            bounding_held
+                .get(usize::from(c.index()))
+                .copied()
+                .unwrap_or(false)
+        })
+        .fold(CapabilitySet::empty(), |acc, c| acc.with(c));
+
     Ok(CapabilityReport {
         bounding_dropped: dropped,
         granted,
+        retained_after_exec,
         unavailable,
         last_cap,
     })
@@ -306,6 +325,7 @@ mod tests {
         assert_eq!(report.last_cap, 40);
         assert_eq!(k.bounding, DEFAULT_MASK);
         assert_eq!(report.granted, CapabilitySet::oci_default());
+        assert_eq!(report.retained_after_exec, CapabilitySet::oci_default());
         assert!(report.unavailable.is_empty());
     }
 
@@ -380,8 +400,21 @@ mod tests {
         );
         assert!(!report.granted.contains(Capability::Mknod));
         assert_eq!(report.granted.len(), 13);
+        assert_eq!(report.retained_after_exec.len(), 13);
         let arg = k.capset_arg.unwrap();
         assert_eq!(arg.effective, [0xA804_25FB & !(1 << 27), 0]);
+    }
+
+    /// SEC-1: bounding set に無い権限は `granted` に残っても `retained_after_exec` に含めない。
+    #[test]
+    fn sec1_retained_after_exec_excludes_caps_missing_from_bounding() {
+        let mut k = Fake::new();
+        // CAP_MKNOD（27）を最初から bounding set に持たない。
+        k.bounding &= !(1u64 << 27);
+        let report = run(&mut k).unwrap();
+        assert!(report.granted.contains(Capability::Mknod));
+        assert!(!report.retained_after_exec.contains(Capability::Mknod));
+        assert_eq!(report.retained_after_exec.len(), 13);
     }
 
     /// SEC-1: drop の EPERM は PermissionDenied・段は CapabilityDrop・後続を呼ばない。

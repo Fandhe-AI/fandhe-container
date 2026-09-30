@@ -22,6 +22,11 @@
 //! （SEC-1・TASK-27.4.3 系）、`linux.seccomp`（CORE-5・TASK-38）、`linux.resources`
 //! （CORE-3/4・TASK-32〜）、`linux.maskedPaths` / `readonlyPaths`、`hooks`、`annotations`。
 //!
+//! # 実行ファイルの検証
+//!
+//! `process.args` は 1 件以上であることだけを検証する。`args[0]` の空文字・実行可能性の検証は
+//! `exec::Entrypoint` 側の担当（本モジュールでは行わない）。
+//!
 //! # 入力上限（DoS 防止）
 //!
 //! 読み込み前にバイト長を [`CONFIG_MAX_BYTES`] で制限し、デシリアライズ中は配列の件数と文字列の
@@ -157,7 +162,13 @@ impl OciConfigError {
             Category::Data => match parse_limit_marker(&err.to_string()) {
                 Some((field, limit)) => {
                     let message = format!("config.json exceeds the limit of {limit} for `{field}`");
-                    (OciConfigErrorKind::LimitExceeded { field, limit }, message)
+                    (
+                        OciConfigErrorKind::LimitExceeded {
+                            field: field.to_owned(),
+                            limit,
+                        },
+                        message,
+                    )
                 }
                 None => (
                     OciConfigErrorKind::Data,
@@ -230,16 +241,17 @@ impl fmt::Display for OciConfigError {
 impl Error for OciConfigError {}
 
 /// serde のエラー文字列から上限超過の目印を取り出す。
-fn parse_limit_marker(text: &str) -> Option<(String, usize)> {
-    let rest = text.get(text.find(LIMIT_TAG)?.checked_add(LIMIT_TAG.len())?..)?;
-    let mut parts = rest.strip_prefix('|')?.splitn(2, '|');
-    let field = parts.next()?;
-    let digits: String = parts
-        .next()?
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    Some((field.to_owned(), digits.parse().ok()?))
+///
+/// 入力値由来の文字列（unknown variant / invalid type のメッセージ等）による偽装を防ぐため、
+/// メッセージ全体が `LIMIT_TAG|<field>|<n>` の形で始まり、かつ `field` が既知の `LIMIT_TABLE` に
+/// あるものだけを採用する。返す上限値は表側の値で、メッセージ中の数値は使わない。
+fn parse_limit_marker(text: &str) -> Option<(&'static str, usize)> {
+    let rest = text.strip_prefix(LIMIT_TAG)?.strip_prefix('|')?;
+    let field = rest.split('|').next()?;
+    LIMIT_TABLE
+        .iter()
+        .find(|(name, _)| *name == field)
+        .map(|(name, max)| (*name, *max))
 }
 
 // ---------------------------------------------------------------------------
@@ -263,7 +275,11 @@ macro_rules! limits {
             const FIELD: &'static str = $field;
             const MAX: usize = $max;
         }
-    )*};
+    )*
+
+        /// 既知の上限（フィールド名と上限値）。`parse_limit_marker` の照合表。
+        const LIMIT_TABLE: &[(&str, usize)] = &[$(($field, $max)),*];
+    };
 }
 
 limits! {
@@ -846,14 +862,16 @@ pub fn parse_config_bytes(bytes: &[u8]) -> Result<OciConfig, OciConfigError> {
 
 /// ファイルから `config.json` を読み込んで検証する（TASK-29.2 の create が bundle から呼ぶ想定）。
 ///
+/// 通常ファイル以外（FIFO・デバイス等）は読み込みが無期限にブロックし得るため拒否する（REPAIR-5）。
 /// サイズは `metadata` で先に拒否するが、それを信用せず読み込み量も [`CONFIG_MAX_BYTES`] + 1 で
 /// 打ち切る（読み込み中にファイルが伸びる場合への対処）。
 pub fn load_config(path: &Path) -> Result<OciConfig, OciConfigError> {
     let file = File::open(path).map_err(|e| OciConfigError::from_io(&e))?;
-    let len = file
-        .metadata()
-        .map_err(|e| OciConfigError::from_io(&e))?
-        .len();
+    let meta = file.metadata().map_err(|e| OciConfigError::from_io(&e))?;
+    if !meta.is_file() {
+        return Err(OciConfigError::invalid("config.json"));
+    }
+    let len = meta.len();
     if len > CONFIG_MAX_BYTES as u64 {
         return Err(OciConfigError::too_large());
     }
@@ -1189,6 +1207,37 @@ mod tests {
         let e = err_of(&v);
         assert!(!e.to_string().contains("dummy-secret"));
         assert!(!format!("{e:?}").contains("dummy-secret"));
+    }
+
+    #[test]
+    fn oci4_limit_marker_in_input_value_is_not_spoofed() {
+        let mut v = base();
+        v["linux"]["namespaces"] = json!([{"type": "fandhe-limit|X|7"}]);
+        let e = err_of(&v);
+        assert_eq!(*e.kind(), OciConfigErrorKind::Data);
+        assert!(!e.to_string().contains("fandhe-limit"));
+        assert!(!format!("{e:?}").contains("fandhe-limit"));
+        assert_eq!(parse_limit_marker("fandhe-limit|X|7"), None);
+        assert_eq!(
+            parse_limit_marker("unknown variant `fandhe-limit|hostname|7`"),
+            None
+        );
+        assert_eq!(
+            parse_limit_marker("fandhe-limit|hostname|999"),
+            Some(("hostname", CONFIG_MAX_HOSTNAME_BYTES))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oci4_load_config_rejects_non_regular_file() {
+        let e = load_config(Path::new("/dev/null")).expect_err("not a file");
+        assert_eq!(
+            *e.kind(),
+            OciConfigErrorKind::Invalid {
+                field: "config.json"
+            }
+        );
     }
 
     #[test]

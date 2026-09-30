@@ -32,7 +32,7 @@ make ci          # 上記 + lint-docs + deny を一括実行
 - matrix は ubuntu / macos / windows の 3 OS を必須とし、特定 OS のみの skip で CI を通さない
 - OS 依存のファイルシステム挙動（パス・大文字小文字・ロック・改行）のテストは 3 OS すべてで実行する
 - ベンチ回帰チェック（`bench-regression` ジョブ）は例外として ubuntu-latest 単独で実行する。ベンチの数値は OS 間の実行環境差で比較できず、3 OS matrix にしても意味のある回帰検出にならないため（本節の「3 OS 必須」はビルド・テストのゲートを対象とする規則であり、ベンチ回帰チェックはその対象外）
-- Linux aarch64 向けクロス型検査（`aarch64-linux-check` ジョブ。#1120・REPAIR-7）も例外として ubuntu-latest（x86_64）単独で実行する。`cargo check` / `cargo clippy --all-features --target aarch64-unknown-linux-gnu` で `cfg(target_arch = "aarch64")` 分岐をコンパイル検査するだけで（`--all-features` は `crash-test-server` 等の feature を要する target も型検査の対象に含めるため）、リンクもテスト実行もしないアーキ網羅の型検査ゲートであり、ビルド・テストのゲートではないため「ネイティブランナーでビルド・テスト」「3 OS 必須」の対象外とする。aarch64 での実行時の正しさの検証はネイティブ arm64 ランナーでのテスト実行がフォローアップ課題であり、現状は保証しない。外部依存が 0 件でクロスリンカ不要という前提のため、`cc` 等ネイティブビルドを伴う依存を追加する場合は見直す
+- Linux aarch64 向けクロス型検査（`aarch64-linux-check` ジョブ。#1120・REPAIR-7）も例外として ubuntu-latest（x86_64）単独で実行する。`cargo check` / `cargo clippy --all-features --target aarch64-unknown-linux-gnu` で `cfg(target_arch = "aarch64")` 分岐をコンパイル検査するだけで（`--all-features` は `crash-test-server` 等の feature を要する target も型検査の対象に含めるため）、リンクもテスト実行もしないアーキ網羅の型検査ゲートであり、ビルド・テストのゲートではないため「ネイティブランナーでビルド・テスト」「3 OS 必須」の対象外とする。aarch64 での実行時の正しさの検証はネイティブ arm64 ランナーでのテスト実行がフォローアップ課題であり、現状は保証しない。外部依存は純 Rust のみ（serde / serde_json。proc-macro はホスト側でビルドされる）でクロスリンカ不要という前提のため、`cc` 等ネイティブビルドを伴う依存を追加する場合は見直す
 
 ## 実機前提テスト
 

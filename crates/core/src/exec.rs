@@ -1324,6 +1324,12 @@ mod tests {
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
+    /// dry-run の記録を取り出して空にする。libtest のワーカースレッドが再利用されても、
+    /// 前のテストの記録が後続のテストへ漏れないよう、照合は必ずこの関数で取り出して行う。
+    fn take_dry_run_mounts() -> Vec<String> {
+        DRY_RUN_MOUNTS.with(|m| std::mem::take(&mut *m.borrow_mut()))
+    }
+
     /// パス検証は相対パス・NUL を副作用なしで拒否する。
     #[test]
     fn mount_proc_rejects_bad_targets() {
@@ -1391,6 +1397,7 @@ mod tests {
     /// dry-run の mount にも到達しない。
     #[test]
     fn mount_proc_rejects_caller_that_is_not_pid1() {
+        take_dry_run_mounts();
         let e = evidence(
             &thread_ns_link("mnt").unwrap(),
             &thread_ns_link("pid").unwrap(),
@@ -1402,7 +1409,7 @@ mod tests {
             err.message,
             "mount_proc must be called by PID 1 of the isolated PID namespace"
         );
-        DRY_RUN_MOUNTS.with(|m| assert_eq!(*m.borrow(), Vec::<String>::new()));
+        assert_eq!(take_dry_run_mounts(), Vec::<String>::new());
     }
 
     /// `NSpid` の入れ子段数（1 段 = 初期 namespace、2 段以上 = 入れ子）。
@@ -1487,6 +1494,7 @@ mod tests {
     /// 副作用なしに拒否する（mount(2) へは到達しない）。
     #[test]
     fn mount_proc_rejects_escape_paths() {
+        take_dry_run_mounts();
         let t = TempTree::new("escape");
         let root = t.base.join("root");
         std::fs::create_dir_all(root.join("real")).unwrap();
@@ -1510,7 +1518,7 @@ mod tests {
             assert_eq!(err.stage, IsolationStage::MountProc, "{target:?}");
             assert!(err.message.contains(want), "{target:?}: {}", err.message);
         }
-        DRY_RUN_MOUNTS.with(|m| assert_eq!(*m.borrow(), Vec::<String>::new()));
+        assert_eq!(take_dry_run_mounts(), Vec::<String>::new());
         // rootfs 自体が symlink（実体は base/root）の場合は拒否する。
         let alias = t.base.join("alias");
         std::os::unix::fs::symlink(&root, &alias).unwrap();
@@ -1707,6 +1715,7 @@ mod tests {
     /// SEC-4（記録経路）: mount_proc のパス検証の各拒否に、理由コードと対象パスが付く。
     #[test]
     fn sec4_mount_path_rejections_carry_violation_records() {
+        take_dry_run_mounts();
         let t = TempTree::new("sec4-path");
         let root = t.base.join("root");
         std::fs::create_dir_all(root.join("real")).unwrap();
@@ -1782,13 +1791,14 @@ mod tests {
                 "{reason}"
             );
         }
-        DRY_RUN_MOUNTS.with(|m| assert_eq!(*m.borrow(), Vec::<String>::new()));
+        assert_eq!(take_dry_run_mounts(), Vec::<String>::new());
     }
 
     /// SEC-4（記録経路）: shared 伝播上のマウント先は違反記録付きで拒否し、shared でなければ
     /// dry-run の mount まで進む（実行環境の propagation に応じてどちらかを具体値で照合する）。
     #[test]
     fn sec4_shared_propagation_carries_violation_record() {
+        take_dry_run_mounts();
         let t = TempTree::new("sec4-shared");
         let root = t.base.join("root");
         std::fs::create_dir_all(root.join("proc")).unwrap();
@@ -1809,14 +1819,16 @@ mod tests {
                     Some(target.to_str().unwrap().to_string())
                 )
             );
-            DRY_RUN_MOUNTS.with(|m| assert_eq!(*m.borrow(), Vec::<String>::new()));
+            assert_eq!(take_dry_run_mounts(), Vec::<String>::new());
         } else {
             assert_eq!(result, Ok(()));
-            DRY_RUN_MOUNTS.with(|m| {
-                let m = m.borrow();
-                assert_eq!(m.len(), 1);
-                assert!(m[0].starts_with("/proc/thread-self/fd/"), "{m:?}");
-            });
+            let m = take_dry_run_mounts();
+            assert_eq!(m.len(), 1);
+            assert!(
+                m.first()
+                    .is_some_and(|t| t.starts_with("/proc/thread-self/fd/")),
+                "{m:?}"
+            );
         }
     }
 

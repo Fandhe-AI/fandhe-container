@@ -26,12 +26,12 @@
 //!
 //! # スコープ外
 //!
-//! - プロセス起動・namespace 分離・mount 適用（TASK-29.3 start）
+//! - プロセス起動（TASK-29.3 start）・namespace 分離・mount 適用
 //! - mounts の rootfs 内 symlink 解決（mount を適用する側の担当）
 //! - OCI-7 の参照テーブル登録（TASK-183 が TASK-29 完了後に組み込む）
 //! - ファイルベースの状態保存（TASK-31・OCI-5）
-//! - create 後に bundle の `config.json` が書き換えられる TOCTOU。start（TASK-29.3）で
-//!   「再検証する」か「create 時のダイジェストを保持する」かを決める課題として残す
+//! - create 後に bundle の `config.json` が書き換えられる TOCTOU は、start（TASK-29.3）が
+//!   [`validate_bundle`] で再検証して対処する（ダイジェスト保持は `StateRecord` の拡張を要するため採らない）
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -66,16 +66,26 @@ pub fn create(
 }
 
 fn create_inner(store: &dyn StateStore, req: &CreateRequest) -> Result<StateRecord, TraitError> {
-    let config = load_config(&req.bundle().join(CONFIG_FILE_NAME)).map_err(config_error)?;
-    reject_unapplied(&config)?;
-    if config.process().is_none() {
-        return Err(invalid("config.json: process is required"));
-    }
-    check_rootfs(req.bundle(), config.root().path())?;
+    validate_bundle(req.bundle())?;
 
     let status = ContainerStatus::created(req.id().clone(), None);
     let state_req = CreateStateRequest::new(status, req.bundle().to_path_buf())?;
     store.create(&state_req)
+}
+
+/// bundle の `config.json` を読み込み、起動可能な設定であることを検証する。
+///
+/// create（本モジュール）と start（`start.rs`。create 後の書き換え = TOCTOU の再検証）が同一の
+/// 検証を共有するための入口。戻り値は検証済みの設定と、検査済みの rootfs の絶対パス。
+/// 検証内容はモジュール doc の「fail-closed の判断」を参照。
+pub(super) fn validate_bundle(bundle: &Path) -> Result<(OciConfig, PathBuf), TraitError> {
+    let config = load_config(&bundle.join(CONFIG_FILE_NAME)).map_err(config_error)?;
+    reject_unapplied(&config)?;
+    if config.process().is_none() {
+        return Err(invalid("config.json: process is required"));
+    }
+    let rootfs = check_rootfs(bundle, config.root().path())?;
+    Ok((config, rootfs))
 }
 
 fn invalid(message: &str) -> TraitError {
@@ -102,7 +112,7 @@ fn reject_unapplied(config: &OciConfig) -> Result<(), TraitError> {
 
 /// `root.path` が bundle 外へ字句的に出ず、bundle 配下の全要素が symlink でない
 /// 存在するディレクトリであることを確認する。
-fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<(), TraitError> {
+fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<PathBuf, TraitError> {
     if root_path
         .components()
         .any(|c| matches!(c, Component::ParentDir))
@@ -139,7 +149,7 @@ fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<(), TraitError> {
         checked = Some(meta);
     }
     match checked {
-        Some(meta) if meta.is_dir() => Ok(()),
+        Some(meta) if meta.is_dir() => Ok(rootfs),
         _ => Err(invalid("rootfs is not a directory")),
     }
 }

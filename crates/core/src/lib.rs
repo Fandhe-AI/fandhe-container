@@ -34,6 +34,9 @@
 //!   TASK-40.1）。検証済み写像型・subuid/subgid 解析・`Direct` / `newuidmap` 経由の書き込みが実装済みで、
 //!   `exec::isolate_rootless_subordinate` による起動フローへの組み込みも実装済み（TASK-40.2）。
 //!   `linux.uidMappings` の受理は後続、ファイル所有者検証（TASK-40.3）は未実装
+//! - `seccomp`: 禁止 syscall の一覧 `DeniedSyscall` と x86_64 / aarch64 別の番号テーブル（CORE-5・
+//!   TASK-38.1.1・#837。OS 非依存で syscall を持たない）。**テーブルのみ実装済み**。BPF 構築は
+//!   #838（TASK-38.1.2）、フィルタ適用は TASK-38.2、起動フローへの組み込みは TASK-38.3 で未実装
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - `oci_runtime`: OCI Runtime のライフサイクル。`config.json` の型・パーサ
 //!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。
@@ -63,6 +66,7 @@ pub mod observability;
 pub mod oci_runtime;
 #[cfg(target_os = "linux")]
 pub mod rootless;
+pub mod seccomp;
 #[cfg(target_os = "linux")]
 mod sys;
 pub mod traits;

@@ -627,16 +627,91 @@ fn run_child(
     entry: &Entrypoint,
     stages: StagePipeline,
 ) -> Result<Infallible, ExecError> {
-    let isolation = MountIsolation::establish()?;
-    let prepared = prepare_rootfs(&isolation, rootfs)?;
-    let report = pivot_root(&isolation, prepared)?;
-    // pivot 後・exec 前にステージ列を固定順で実行する。exec は終端クロージャからしか呼ばれない。
-    stages.run_then(|_stage_report, capability_report| {
+    run_child_then(rootfs, stages, |isolation, report, capability_report| {
         // `exec_entrypoint` と同じ検証を、capability 削減の結果を添えて行う。
         isolation.verify_caller(IsolationStage::Exec)?;
         require_restriction_evidence(capability_report)?;
         exec_entrypoint_verified(report.new_root_mnt_id, entry)
     })
+}
+
+/// 子の前段（`establish` → `prepare_rootfs` → `pivot_root` → ステージ列）を共通化した本体。
+///
+/// 終端 `terminal` は組み込みステージ（capability 削減・`NO_NEW_PRIVS`・seccomp）の通過後にだけ呼ばれる。
+/// 本番の `run_child` は exec を、結合試験専用の [`spawn_container_seccomp_probe`] は exec の代わりに
+/// プローブを渡す。exec を呼べるのは `run_child` の終端だけで、fail-closed（`require_restriction_evidence`）
+/// は変わらない。
+fn run_child_then<T>(
+    rootfs: &Path,
+    stages: StagePipeline,
+    terminal: impl FnOnce(
+        &MountIsolation,
+        &PivotReport,
+        Option<&CapabilityReport>,
+    ) -> Result<T, ExecError>,
+) -> Result<T, ExecError> {
+    let isolation = MountIsolation::establish()?;
+    let prepared = prepare_rootfs(&isolation, rootfs)?;
+    let report = pivot_root(&isolation, prepared)?;
+    // pivot 後・終端前にステージ列を固定順で実行する。
+    stages.run_then(|_stage_report, capability_report| {
+        terminal(&isolation, &report, capability_report)
+    })
+}
+
+/// 子のメイン（プローブ版）。失敗は `child_main` と同じ規約で stderr へ 1 行出して終了コードにする。
+fn child_main_probe(rootfs: &Path, stages: StagePipeline) -> i32 {
+    let result = run_child_then(rootfs, stages, |_isolation, _report, _caps| {
+        let record = super::seccomp::probe_denied_syscalls()?;
+        publish_probe_record(&record.render())
+    });
+    match result {
+        Ok(()) => 0,
+        Err(err) => {
+            let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
+            exit_code_for(&err)
+        }
+    }
+}
+
+/// 記録を pivot 後の `/seccomp-probe.tmp` へ `create_new` で書き、`/seccomp-probe` へ `rename` する
+/// （既存ファイル・symlink を上書き・追従しない。親は rename 後の完成品だけを読む）。
+fn publish_probe_record(text: &str) -> Result<(), ExecError> {
+    let fail = |e: std::io::Error| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Seccomp,
+            format!("failed to publish seccomp probe record: {e}"),
+        )
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open("/seccomp-probe.tmp")
+        .map_err(fail)?;
+    f.write_all(text.as_bytes()).map_err(fail)?;
+    drop(f);
+    std::fs::rename("/seccomp-probe.tmp", "/seccomp-probe").map_err(fail)
+}
+
+/// 結合試験専用: exec の代わりに禁止 syscall のプローブを実行する子を fork する（CORE-5・TASK-38.4・#179）。
+///
+/// 呼び出し文脈は `tests/seccomp.rs` のシナリオ（`isolate` 済みの親）。`spawn_container_with_stages` と
+/// 同じ前段（pivot 済み・capability 削減・`NO_NEW_PRIVS`・組み込み seccomp）を通した後、終端で
+/// `<rootfs>/seccomp-probe` へ記録を書いて終了コード 0 で終わる。exec は呼ばないため、権限は
+/// `spawn_container` と同じで昇格経路は増えない。通常の利用者は呼ばない。
+///
+/// # 将来仕様（記録のみ）
+///
+/// exec が許可されたら（TASK-39.4・#184）、エントリポイント内のプローブへ移して本関数は廃止する（REPAIR-3）。
+#[doc(hidden)]
+pub fn spawn_container_seccomp_probe(
+    rootfs: &Path,
+    stages: StagePipeline,
+) -> Result<ContainerChild, ExecError> {
+    let pid = sys::fork_single_threaded(|| child_main_probe(rootfs, stages), EXIT_SETUP_FAILED)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    Ok(ContainerChild::new(pid))
 }
 
 /// 分離済み（`isolate` / `isolate_rootful_host_root` の後）の親から子を fork し、子で

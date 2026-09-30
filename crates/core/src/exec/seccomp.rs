@@ -162,6 +162,169 @@ pub fn observe_default_seccomp_enforcement() -> Result<SeccompEnforcementObserva
     })
 }
 
+/// コンテナ内プローブの 1 syscall 分の結果。成功は [`ProbeOutcome::Ok`]、失敗は errno。
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// syscall が成功した（遮断されていない）。
+    Ok,
+    /// syscall が errno で失敗した（`EPERM` = 1 なら seccomp の遮断、または capability 不足）。
+    Errno(i32),
+}
+
+impl ProbeOutcome {
+    fn from_result(r: Result<(), SysError>) -> Self {
+        match r {
+            Ok(()) => ProbeOutcome::Ok,
+            Err(SysError::Os(n)) => ProbeOutcome::Errno(n),
+            // 対応外アーキ等。実在しない errno として区別する。
+            Err(_) => ProbeOutcome::Errno(-1),
+        }
+    }
+
+    fn render(self) -> String {
+        match self {
+            ProbeOutcome::Ok => "ok".to_string(),
+            ProbeOutcome::Errno(n) => format!("errno={n}"),
+        }
+    }
+
+    fn parse(v: &str) -> Result<Self, String> {
+        if v == "ok" {
+            return Ok(ProbeOutcome::Ok);
+        }
+        v.strip_prefix("errno=")
+            .and_then(|n| n.parse::<i32>().ok())
+            .map(ProbeOutcome::Errno)
+            .ok_or_else(|| format!("invalid outcome {v:?}"))
+    }
+}
+
+/// コンテナ内（組み込み `Seccomp` 段の通過後）で観測した禁止 syscall の遮断記録（CORE-5・TASK-38.4・#179）。
+///
+/// [`spawn_container_seccomp_probe`](super::spawn_container_seccomp_probe) の子が `probe_denied_syscalls`
+/// で作り、pivot 後の `/seccomp-probe` へ `key=value` 行で書く。親（結合試験 `tests/seccomp.rs`）が
+/// [`SeccompProbeRecord::parse`] で読む。識別的な検査は `unshare`・`ptrace`・`seccomp_mode`、網羅確認は
+/// `mount`・`pivot_root`・`umount2`・`kexec_load`（capability 不足でも `EPERM` になり得る）。
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SeccompProbeRecord {
+    /// `unshare(0)`。フィルタが無ければ成功、有れば `EPERM`（識別的）。
+    pub unshare: ProbeOutcome,
+    /// `ptrace(PTRACE_CONT, 自 pid)`。フィルタが無ければ `ESRCH`、有れば `EPERM`（識別的）。
+    pub ptrace: ProbeOutcome,
+    /// `/proc/thread-self/status` の `Seccomp:` 値（filter モードは `2`）。
+    pub seccomp_mode: String,
+    /// 禁止対象外の対照。`/proc/thread-self/status` を読めること（`openat`・`read` が動く）。
+    pub control: ProbeOutcome,
+    /// `mount(MS_REC|MS_PRIVATE)`（網羅確認）。
+    pub mount: ProbeOutcome,
+    /// `pivot_root(".", ".")`（網羅確認）。
+    pub pivot_root: ProbeOutcome,
+    /// `umount2(".", MNT_DETACH)`（網羅確認）。
+    pub umount2: ProbeOutcome,
+    /// 無効引数の `kexec_load`（網羅確認）。
+    pub kexec_load: ProbeOutcome,
+}
+
+/// 記録のキー（直列化・解析で共通。増減時は [`SeccompProbeRecord`] と同時に直す）。
+const PROBE_KEYS: [&str; 8] = [
+    "unshare",
+    "ptrace",
+    "seccomp_mode",
+    "control",
+    "mount",
+    "pivot_root",
+    "umount2",
+    "kexec_load",
+];
+
+impl SeccompProbeRecord {
+    /// 英語の `key=value` 行（改行区切り）へ直列化する。
+    pub fn render(&self) -> String {
+        format!(
+            "unshare={}\nptrace={}\nseccomp_mode={}\ncontrol={}\nmount={}\npivot_root={}\numount2={}\nkexec_load={}\n",
+            self.unshare.render(),
+            self.ptrace.render(),
+            self.seccomp_mode,
+            self.control.render(),
+            self.mount.render(),
+            self.pivot_root.render(),
+            self.umount2.render(),
+            self.kexec_load.render(),
+        )
+    }
+
+    /// [`render`](Self::render) の出力を解析する。外部入力として扱い、未知キー・重複キー・欠落・
+    /// 不正値はすべて `Err`（パニックしない）。
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut map: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            let (k, v) = line
+                .split_once('=')
+                .ok_or_else(|| format!("malformed line {line:?}"))?;
+            if !PROBE_KEYS.contains(&k) {
+                return Err(format!("unknown key {k:?}"));
+            }
+            if map.insert(k, v).is_some() {
+                return Err(format!("duplicate key {k:?}"));
+            }
+        }
+        let get = |k: &str| -> Result<&str, String> {
+            map.get(k)
+                .copied()
+                .ok_or_else(|| format!("missing key {k:?}"))
+        };
+        let seccomp_mode = get("seccomp_mode")?;
+        if seccomp_mode.is_empty() || !seccomp_mode.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("invalid seccomp_mode {seccomp_mode:?}"));
+        }
+        Ok(SeccompProbeRecord {
+            unshare: ProbeOutcome::parse(get("unshare")?)?,
+            ptrace: ProbeOutcome::parse(get("ptrace")?)?,
+            seccomp_mode: seccomp_mode.to_string(),
+            control: ProbeOutcome::parse(get("control")?)?,
+            mount: ProbeOutcome::parse(get("mount")?)?,
+            pivot_root: ProbeOutcome::parse(get("pivot_root")?)?,
+            umount2: ProbeOutcome::parse(get("umount2")?)?,
+            kexec_load: ProbeOutcome::parse(get("kexec_load")?)?,
+        })
+    }
+}
+
+/// 組み込み `Seccomp` 段の通過後に禁止 syscall を呼んで遮断を記録する（CORE-5・TASK-38.4・#179）。
+///
+/// `process.rs::spawn_container_seccomp_probe` の子（コンテナの PID 1・pivot 済み）が、ステージ列の
+/// 終端として exec の代わりに呼ぶ。引数はいずれも副作用が出ないものに固定している（`sys` の各プローブの
+/// `// SAFETY:` 参照）。`seccomp_mode` を読めない場合は `Err`（fail-closed）。
+///
+/// # 将来仕様（記録のみ）
+///
+/// exec が許可されたら（TASK-39.4・#184）、エントリポイント側のプローブ実行へ置き換える（REPAIR-3）。
+pub(crate) fn probe_denied_syscalls() -> Result<SeccompProbeRecord, ExecError> {
+    let fail =
+        |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Seccomp, m.to_string());
+    let read_status = || std::fs::read_to_string("/proc/thread-self/status");
+    let status = read_status().map_err(|_| fail("failed to read thread status"))?;
+    let seccomp_mode = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Seccomp:"))
+        .map(|v| v.trim().to_string())
+        .ok_or_else(|| fail("Seccomp field missing"))?;
+    let control =
+        ProbeOutcome::from_result(read_status().map(|_| ()).map_err(|_| SysError::Os(-1)));
+    Ok(SeccompProbeRecord {
+        unshare: ProbeOutcome::from_result(sys::unshare_namespaces(&[])),
+        ptrace: ProbeOutcome::from_result(sys::ptrace_cont_probe(std::process::id())),
+        seccomp_mode,
+        control,
+        mount: ProbeOutcome::from_result(sys::mount_root_private_recursive()),
+        pivot_root: ProbeOutcome::from_result(sys::pivot_root_dot()),
+        umount2: ProbeOutcome::from_result(sys::umount_cwd_detach()),
+        kexec_load: ProbeOutcome::from_result(sys::kexec_load_invalid_probe()),
+    })
+}
 /// 単一スレッド条件を適用の前後で検査して [`apply_filter`] を呼ぶ。事前検査は副作用の前に行う。
 fn apply_single_threaded(
     program: &SeccompProgram,

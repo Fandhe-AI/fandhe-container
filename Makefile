@@ -395,6 +395,18 @@ fio-baseline-ratio: ## fio ベースライン比を算出する（BASELINE/CANDI
 	bash scripts/fio-baseline-ratio.sh --baseline $(call fio_bench_sq,$(BASELINE)) --candidate $(call fio_bench_sq,$(CANDIDATE))
 
 # --------------------------------------------------
+# アイドル時常駐メモリ計測（TASK-45.1・CORE-7。Linux 限定。bash のみで完結）
+# --------------------------------------------------
+
+.PHONY: idle-memory-selftest
+idle-memory-selftest: ## アイドル時常駐メモリ計測スクリプトの自己テスト（CORE-7・REPAIR-12）
+	bash scripts/bench/idle_memory_selftest.sh
+
+.PHONY: idle-memory
+idle-memory: ## アイドル時常駐メモリ（プロセス数・PSS・RSS）を JSON で出力する（CORE-7。Linux 限定）
+	bash scripts/bench/idle_memory.sh --format json
+
+# --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------
 

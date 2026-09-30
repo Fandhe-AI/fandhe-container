@@ -219,13 +219,22 @@ impl Ord for ById {
 #[derive(Debug)]
 pub struct FileStateStore {
     root: PathBuf,
-    /// プロセス内の排他。プロセス間は `@lock` のファイルロックが担う。
-    process_lock: Mutex<()>,
+    /// プロセス内の排他と、その下で読み書きするインスタンス固有の状態。プロセス間は `@lock` の
+    /// ファイルロックが担う。
+    process_lock: Mutex<LockedState>,
+}
+
+/// プロセス内ミューテックスで守る、インスタンス固有の状態。
+#[derive(Debug, Default)]
+struct LockedState {
+    /// `@revision` として受け入れる最小値（巻き戻り検出の下限）。`None` は未確定で、次の採番で
+    /// 全レコードを走査して確定する。以降は払い出しのたびに引き上げる（`allocate_revision`）。
+    revision_floor: Option<u64>,
 }
 
 /// ロックの RAII ガード。drop でファイルロックとミューテックスが解放される。
 struct StoreGuard<'a> {
-    _process: MutexGuard<'a, ()>,
+    process: MutexGuard<'a, LockedState>,
     _file: File,
 }
 
@@ -279,7 +288,7 @@ impl FileStateStore {
         }
         Ok(Self {
             root,
-            process_lock: Mutex::new(()),
+            process_lock: Mutex::new(LockedState::default()),
         })
     }
 
@@ -319,7 +328,7 @@ impl FileStateStore {
             match file.try_lock() {
                 Ok(()) => {
                     return Ok(StoreGuard {
-                        _process: process,
+                        process,
                         _file: file,
                     });
                 }
@@ -483,13 +492,22 @@ impl FileStateStore {
         write_file_replacing(&self.record_dir(record.id()), STATE_FILE_NAME, &bytes)
     }
 
-    /// revision を 1 つ払い出し、上限値を先に永続化する（ロック保持下で呼ぶこと）。
+    /// revision を 1 つ払い出し、上限値を先に永続化する（`guard` はこのストアのロック）。
     ///
     /// `existing` は更新対象の既存レコード。ハイウォーターマークがその revision 以下なら
-    /// （クラッシュ・巻き戻り等で `@revision` が古い）revision の再発行になるため fail-closed
-    /// （`Internal`）にする。`@revision` は fsync 済みで置き換える（`write_file_replacing`）。
+    /// （巻き戻り等で `@revision` が古い）revision の再発行になるため fail-closed
+    /// （`Internal`）にする。`@revision` はレコードより先に fsync 済みで置き換える
+    /// （`write_file_replacing`）ため、クラッシュでは巻き戻らない。
+    ///
+    /// ストア全体の巻き戻り検出（全レコードの revision が `@revision` 未満であること）は、
+    /// インスタンスごとの初回の採番でだけ全レコードを走査して下限（`revision_floor`）を確定し、
+    /// 以降は下限との比較で行う（採番ごとの全件走査で連続作成が O(N²) になり、ロック保持時間が
+    /// 伸びるのを避ける）。下限は自インスタンスが払い出した値で引き上げる。他インスタンスが
+    /// 進めた範囲への巻き戻り（状態ルートの所有者による外部改変でしか起きない）は、次に開いた
+    /// インスタンスの初回走査と、更新対象レコードとの比較（`existing`）で検出する。
     fn allocate_revision(
         &self,
+        guard: &mut StoreGuard<'_>,
         existing: Option<&StateRecord>,
     ) -> Result<StateRevision, TraitError> {
         let path = self.root.join(REVISION_FILE);
@@ -519,12 +537,23 @@ impl FileStateStore {
         {
             return Err(internal("revision high-water mark is behind the record"));
         }
-        // ストア全体で単調採番する契約のため、更新・新規作成を問わず全レコードの revision が
-        // ハイウォーターマーク未満であることを確認する（`@revision` の巻き戻りで使用済み
-        // revision を別コンテナへ払い出さない。fail-closed）。
-        if let Some(max) = self.max_record_revision()?
-            && max >= current.value()
-        {
+        // ストア全体で単調採番する契約のため、更新・新規作成を問わず `@revision` が下限
+        // （全レコードの revision の最大値 + 1 と、自インスタンスが払い出した値）以上であることを
+        // 確認する（`@revision` の巻き戻りで使用済み revision を別コンテナへ払い出さない。fail-closed）。
+        let floor = match guard.process.revision_floor {
+            Some(floor) => floor,
+            None => {
+                let floor = match self.max_record_revision()? {
+                    Some(max) => max
+                        .checked_add(1)
+                        .ok_or_else(|| internal("state revision overflowed"))?,
+                    None => StateRevision::INITIAL.value(),
+                };
+                guard.process.revision_floor = Some(floor);
+                floor
+            }
+        };
+        if current.value() < floor {
             return Err(internal("revision high-water mark is behind the records"));
         }
         let next = current.next()?;
@@ -533,6 +562,7 @@ impl FileStateStore {
             REVISION_FILE,
             next.value().to_string().as_bytes(),
         )?;
+        guard.process.revision_floor = Some(next.value());
         Ok(current)
     }
 
@@ -565,7 +595,7 @@ impl FileStateStore {
 impl StateStore for FileStateStore {
     fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
         check_bundle_len(req.bundle())?;
-        let _guard = self.lock()?;
+        let mut guard = self.lock()?;
         if self.read_record(req.id())?.is_some() {
             return Err(err(
                 ErrorCode::AlreadyExists,
@@ -590,14 +620,14 @@ impl StateStore for FileStateStore {
             }
             Err(_) => return Err(internal("failed to create the state directory")),
         }
-        let revision = self.allocate_revision(None)?;
+        let revision = self.allocate_revision(&mut guard, None)?;
         let record = StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
         self.write_record(&record)?;
         Ok(record)
     }
 
     fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
-        let _guard = self.lock()?;
+        let mut guard = self.lock()?;
         let existing = self
             .read_record(req.id())?
             .ok_or_else(|| err(ErrorCode::NotFound, "container state not found"))?;
@@ -607,7 +637,7 @@ impl StateStore for FileStateStore {
                 "state revision does not match",
             ));
         }
-        let revision = self.allocate_revision(Some(&existing))?;
+        let revision = self.allocate_revision(&mut guard, Some(&existing))?;
         let record = StateRecord::new(
             req.status().clone(),
             existing.bundle().to_path_buf(),

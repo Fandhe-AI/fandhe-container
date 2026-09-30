@@ -23,6 +23,9 @@
 //! - syscall を呼ぶ `unsafe` は `crate::sys` に閉じ込め、本ファイルには置かない
 //! - 呼び出し元は TASK-29 の `oci_runtime`（`create` / `start`）および fork 段（#831）を想定する
 //! - 常駐デーモンを前提にしない（CORE-1・D-19）
+//! - 分離違反の試行を拒否したエラーは `ExecError::violation` に構造化された違反記録
+//!   （[`IsolationViolation`]: 種別・理由コード・ビヘイビア ID・対象）を持つ。**記録の経路のみ**で、
+//!   保存・集約・出力先は TASK-41（#191。SEC-4）が担う。システムエラーには付かない
 //!
 //! # namespace 分離の契約（[`isolate`]・[`isolate_rootful_host_root`]）
 //!
@@ -52,6 +55,13 @@ use std::path::{Component, Path};
 
 use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
+
+mod violation;
+
+pub use violation::{
+    IsolationViolation, VIOLATION_SUBJECT_MAX_CHARS, ViolationKind, ViolationReason,
+    ViolationSubject,
+};
 
 /// 分離対象の namespace 種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -251,7 +261,12 @@ pub enum IsolationStage {
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。
+///
+/// 分離違反の試行を拒否した場合は `violation` に構造化された違反記録が入り、システム
+/// エラー（syscall 失敗・procfs の読み取り失敗等）では `None`。区別の定義と、記録の保存が
+/// 未実装（TASK-41・#191）であることは [`IsolationViolation`] のモジュール doc を参照（SEC-4）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExecError {
     /// 機械可読な分類。
     pub code: ErrorCode,
@@ -259,14 +274,29 @@ pub struct ExecError {
     pub stage: IsolationStage,
     /// 英語のメッセージ。
     pub message: String,
+    /// 分離違反の記録（違反による拒否のときだけ `Some`）。
+    pub violation: Option<IsolationViolation>,
 }
 
 impl ExecError {
+    /// 違反ではない失敗（システムエラー・入力書式エラー）を作る。
     fn new(code: ErrorCode, stage: IsolationStage, message: impl Into<String>) -> Self {
         Self {
             code,
             stage,
             message: message.into(),
+            violation: None,
+        }
+    }
+
+    /// 分離違反の拒否を作る。`code`・`stage`・`message` は理由から決まり、`subject` は
+    /// 呼び出し側が渡したパス（パス検証の拒否のときだけ）。
+    fn from_violation(reason: ViolationReason, subject: Option<&Path>) -> Self {
+        Self {
+            code: reason.error_code(),
+            stage: reason.stage(),
+            message: reason.message().to_string(),
+            violation: Some(IsolationViolation::new(reason, subject)),
         }
     }
 
@@ -290,7 +320,17 @@ impl fmt::Display for ExecError {
             self.code.as_str(),
             self.stage,
             self.message
-        )
+        )?;
+        if let Some(v) = &self.violation {
+            write!(
+                f,
+                " (violation: {}/{}, {})",
+                v.kind.as_str(),
+                v.reason.as_str(),
+                v.behavior_id
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -411,18 +451,18 @@ fn status_threads(status: &str) -> Option<u64> {
 /// - `Threads:` が 1（シングルスレッド）。`unshare(CLONE_NEWNS)` は呼んだスレッドだけを移すため、
 ///   他のスレッドが古い mount namespace に残り、後続の `pivot_root`・exec（#135・#831）が別
 ///   スレッドで行われるとホストの procfs・ファイルシステムが見えてしまう
-fn check_establish_preconditions(pid: u32, status: &str) -> Result<(), &'static str> {
+fn check_establish_preconditions(pid: u32, status: &str) -> Result<(), ViolationReason> {
     if pid != 1 {
-        return Err("not PID 1; call from the first child created after unshare(CLONE_NEWPID)");
+        return Err(ViolationReason::EstablishNotPid1);
     }
     if nspid_innermost(status) != Some(1) {
-        return Err("NSpid does not end with 1; not PID 1 of the innermost PID namespace");
+        return Err(ViolationReason::EstablishNspidNotPid1);
     }
     if nspid_depth(status).is_none_or(|d| d < 2) {
-        return Err("not in a nested PID namespace; isolate with Namespace::Pid first");
+        return Err(ViolationReason::EstablishNotNestedPidNamespace);
     }
     if status_threads(status) != Some(1) {
-        return Err("the process must be single-threaded before establishing mount isolation");
+        return Err(ViolationReason::EstablishMultiThreaded);
     }
     Ok(())
 }
@@ -438,9 +478,9 @@ fn thread_ns_link(kind: &str) -> std::io::Result<String> {
 
 /// [`MountIsolation::establish`] の mount namespace 判定（テスト可能な純関数）。
 /// `unshare(CLONE_NEWNS)` の前後でリンク先が変わっていなければ拒否する。
-fn check_fresh_mount_ns(before: &str, after: &str) -> Result<(), &'static str> {
+fn check_fresh_mount_ns(before: &str, after: &str) -> Result<(), ViolationReason> {
     if before == after {
-        return Err("unshare(CLONE_NEWNS) did not move the thread to a new mount namespace");
+        return Err(ViolationReason::EstablishMountNamespaceNotFresh);
     }
     Ok(())
 }
@@ -452,15 +492,15 @@ fn check_evidence(
     pid: u32,
     mnt_ns: &str,
     pid_ns: &str,
-) -> Result<(), &'static str> {
+) -> Result<(), ViolationReason> {
     if pid != 1 {
-        return Err("mount_proc must be called by PID 1 of the isolated PID namespace");
+        return Err(ViolationReason::EvidenceCallerNotPid1);
     }
     if mnt_ns != evidence.mnt_ns {
-        return Err("isolation evidence does not belong to the current mount namespace");
+        return Err(ViolationReason::EvidenceMountNamespaceMismatch);
     }
     if pid_ns != evidence.pid_ns {
-        return Err("isolation evidence does not belong to the current PID namespace");
+        return Err(ViolationReason::EvidencePidNamespaceMismatch);
     }
     Ok(())
 }
@@ -498,16 +538,15 @@ impl MountIsolation {
                 msg,
             )
         };
+        let violation = |r: ViolationReason| ExecError::from_violation(r, None);
         let pid = std::process::id();
         if pid != 1 {
             // /proc を読む前に拒否する（PID 1 でないことは getpid だけで確定する）。
-            return Err(fail(
-                "not PID 1; call from the first child created after unshare(CLONE_NEWPID)",
-            ));
+            return Err(violation(ViolationReason::EstablishNotPid1));
         }
         let status = std::fs::read_to_string("/proc/self/status")
             .map_err(|_| fail("cannot read /proc/self/status to verify the PID namespace"))?;
-        check_establish_preconditions(pid, &status).map_err(fail)?;
+        check_establish_preconditions(pid, &status).map_err(violation)?;
         let before =
             thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
         sys::unshare_namespaces(&[NsFlag::Mount])
@@ -517,7 +556,7 @@ impl MountIsolation {
         })?;
         let mnt_ns =
             thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
-        check_fresh_mount_ns(&before, &mnt_ns).map_err(fail)?;
+        check_fresh_mount_ns(&before, &mnt_ns).map_err(violation)?;
         let pid_ns =
             thread_ns_link("pid").map_err(|_| fail("cannot read /proc/thread-self/ns/pid"))?;
         Ok(Self {
@@ -540,14 +579,16 @@ impl MountIsolation {
             thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
         let pid_ns =
             thread_ns_link("pid").map_err(|_| fail("cannot read /proc/thread-self/ns/pid"))?;
-        check_evidence(self, std::process::id(), &mnt_ns, &pid_ns).map_err(fail)?;
+        check_evidence(self, std::process::id(), &mnt_ns, &pid_ns)
+            .map_err(|r| ExecError::from_violation(r, None))?;
         // getpid に加え、procfs 側の NSpid 末尾も 1 であることを確かめる（procfs を再マウント
         // した後も NSpid の末尾は最も内側の namespace の PID）。
         let status = std::fs::read_to_string("/proc/self/status")
             .map_err(|_| fail("cannot read /proc/self/status to verify the PID"))?;
         if nspid_innermost(&status) != Some(1) {
-            return Err(fail(
-                "NSpid does not end with 1; not PID 1 of the innermost PID namespace",
+            return Err(ExecError::from_violation(
+                ViolationReason::EvidenceNspidNotPid1,
+                None,
             ));
         }
         Ok(())
@@ -590,16 +631,15 @@ pub struct RootfulHostRootPlan {
 ///   namespace を共有した状態から始まる構成を作らない。[`MountIsolation::establish`] が
 ///   PID 1 自身で mount namespace を分けることとの二重の防御）
 fn validate_common(config: &IsolationConfig) -> Result<(), ExecError> {
-    let invalid =
-        |msg: &str| ExecError::new(ErrorCode::InvalidArgument, IsolationStage::Validate, msg);
+    let violation = |r: ViolationReason| Err(ExecError::from_violation(r, None));
     if config.namespaces.is_empty() {
-        return Err(invalid("at least one namespace must be selected"));
+        return violation(ViolationReason::NoNamespaces);
     }
     if config.hostname.is_some() && !config.namespaces.contains(Namespace::Uts) {
-        return Err(invalid("hostname requires the UTS namespace"));
+        return violation(ViolationReason::HostnameWithoutUts);
     }
     if config.namespaces.contains(Namespace::Pid) && !config.namespaces.contains(Namespace::Mount) {
-        return Err(invalid("the PID namespace requires the mount namespace"));
+        return violation(ViolationReason::PidWithoutMount);
     }
     Ok(())
 }
@@ -608,19 +648,15 @@ fn validate_common(config: &IsolationConfig) -> Result<(), ExecError> {
 fn plan_for(config: &IsolationConfig, euid: u32, egid: u32) -> Result<IsolationPlan, ExecError> {
     validate_common(config)?;
     if !config.namespaces.contains(Namespace::User) {
-        return Err(ExecError::new(
-            ErrorCode::InvalidArgument,
-            IsolationStage::Validate,
-            "the user namespace is required to map container root to an unprivileged host ID",
+        return Err(ExecError::from_violation(
+            ViolationReason::UserNamespaceRequired,
+            None,
         ));
     }
     if euid == 0 || egid == 0 {
-        return Err(ExecError::new(
-            ErrorCode::FailedPrecondition,
-            IsolationStage::Validate,
-            "refusing identity mapping of host root into the user namespace \
-             (map a subordinate ID range from /etc/subuid and /etc/subgid instead; \
-             subordinate ID mapping is not implemented yet, see TASK-40)",
+        return Err(ExecError::from_violation(
+            ViolationReason::HostRootIdentityMapping,
+            None,
         ));
     }
     Ok(IsolationPlan {
@@ -635,17 +671,15 @@ fn plan_for(config: &IsolationConfig, euid: u32, egid: u32) -> Result<IsolationP
 fn plan_rootful_for(config: &IsolationConfig, euid: u32) -> Result<RootfulHostRootPlan, ExecError> {
     validate_common(config)?;
     if config.namespaces.contains(Namespace::User) {
-        return Err(ExecError::new(
-            ErrorCode::InvalidArgument,
-            IsolationStage::Validate,
-            "the rootful host-root plan must not include the user namespace",
+        return Err(ExecError::from_violation(
+            ViolationReason::RootfulWithUserNamespace,
+            None,
         ));
     }
     if euid != 0 {
-        return Err(ExecError::new(
-            ErrorCode::FailedPrecondition,
-            IsolationStage::Validate,
-            "the rootful host-root plan requires euid 0",
+        return Err(ExecError::from_violation(
+            ViolationReason::RootfulRequiresRoot,
+            None,
         ));
     }
     Ok(RootfulHostRootPlan {
@@ -689,10 +723,9 @@ pub fn isolate(plan: &IsolationPlan) -> Result<IsolationReport, ExecError> {
     // setuid 等で ID が変わっていれば写像がずれるため、副作用の前に拒否する。
     let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
     if euid != plan.uid_mapping.host_id || egid != plan.gid_mapping.host_id {
-        return Err(ExecError::new(
-            ErrorCode::FailedPrecondition,
-            IsolationStage::Validate,
-            "effective uid/gid changed after the plan was created",
+        return Err(ExecError::from_violation(
+            ViolationReason::IdentityChanged,
+            None,
         ));
     }
     unshare_and_configure(
@@ -716,10 +749,9 @@ pub fn isolate(plan: &IsolationPlan) -> Result<IsolationReport, ExecError> {
 /// → （`Uts` かつ hostname）`sethostname`。user namespace は作らない。
 pub fn isolate_rootful_host_root(plan: &RootfulHostRootPlan) -> Result<IsolationReport, ExecError> {
     if sys::effective_uid() != 0 {
-        return Err(ExecError::new(
-            ErrorCode::FailedPrecondition,
-            IsolationStage::Validate,
-            "the rootful host-root plan requires euid 0",
+        return Err(ExecError::from_violation(
+            ViolationReason::RootfulRequiresRoot,
+            None,
         ));
     }
     unshare_and_configure(plan.namespaces, plan.hostname.as_ref(), None)?;
@@ -795,28 +827,33 @@ pub fn mount_proc(
 /// 証跡を取らないため、単体テストは証跡を偽造せずにパス検証を直接確かめられる（最終段の
 /// `mount(2)` はテストビルドでは dry-run）。
 fn mount_proc_verified(rootfs: &Path, target: &Path) -> Result<(), ExecError> {
-    let invalid =
-        |msg: &str| ExecError::new(ErrorCode::InvalidArgument, IsolationStage::MountProc, msg);
-    for (label, p) in [("rootfs", rootfs), ("proc mount target", target)] {
+    let violation = |r: ViolationReason, p: &Path| ExecError::from_violation(r, Some(p));
+    for p in [rootfs, target] {
         if !p.is_absolute() {
-            return Err(invalid(&format!("{label} must be an absolute path")));
+            return Err(violation(ViolationReason::PathNotAbsolute, p));
         }
         if p.as_os_str().as_bytes().contains(&0) {
-            return Err(invalid(&format!("{label} must not contain NUL")));
+            return Err(violation(ViolationReason::PathContainsNul, p));
         }
         if p.components().any(|c| matches!(c, Component::ParentDir)) {
-            return Err(invalid(&format!("{label} must not contain '..'")));
+            return Err(violation(ViolationReason::PathParentComponent, p));
         }
     }
     let rel = target
         .strip_prefix(rootfs)
-        .map_err(|_| invalid("proc mount target must be under rootfs"))?;
+        .map_err(|_| violation(ViolationReason::TargetOutsideRootfs, target))?;
     // rootfs 自体・祖先が symlink だとマウント先を誘導できるため、実パスとの一致を要求する。
-    let real_root = std::fs::canonicalize(rootfs).map_err(|_| invalid("rootfs must exist"))?;
+    // 不在は違反（呼び出し側のパス誤り）、それ以外の失敗（権限不足等）はシステムエラー。
+    // 正規化後の実パス（ホスト側の詳細）は違反記録・メッセージに含めない。
+    let real_root = std::fs::canonicalize(rootfs).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            violation(ViolationReason::RootfsMissing, rootfs)
+        } else {
+            ExecError::from_io(&e, IsolationStage::MountProc, "canonicalize(rootfs)")
+        }
+    })?;
     if real_root.components().ne(rootfs.components()) {
-        return Err(invalid(
-            "rootfs must be a canonical path without symlinks in itself or its ancestors",
-        ));
+        return Err(violation(ViolationReason::RootfsNotCanonical, rootfs));
     }
     // rootfs 自体をマウント先にすると rootfs 全体を procfs で覆えるため、専用の下位ディレクトリを要求する。
     let names: Vec<&OsStr> = rel
@@ -827,25 +864,26 @@ fn mount_proc_verified(rootfs: &Path, target: &Path) -> Result<(), ExecError> {
         })
         .collect();
     if names.is_empty() {
-        return Err(invalid(
-            "proc mount target must be a dedicated directory below rootfs, not rootfs itself",
-        ));
+        return Err(violation(ViolationReason::TargetIsRootfs, target));
     }
     // `/` から rootfs・target まで 1 要素ずつ開き、検証した実体を fd で固定する
     // （検証後のパス差し替え = TOCTOU の防止）。以後の判定・マウントはこの fd 経由でのみ行う。
     let dir = open_dir_beneath(&real_root, &names)?;
     if mount_is_shared(&dir)? {
-        return Err(ExecError::new(
-            ErrorCode::FailedPrecondition,
-            IsolationStage::MountProc,
-            "proc mount target is on a shared mount; isolate the mount namespace first",
-        ));
+        return Err(violation(ViolationReason::TargetOnSharedMount, target));
     }
     // fd が指す実体へマウントする（`/proc/thread-self/fd/N` は fd の dentry へ解決される）。
     // `establish` は呼び出しスレッドだけを新しい mount namespace へ移すため、パス解決・
     // mountinfo の参照はスレッドグループの代表（`/proc/self`）ではなく呼び出しスレッドで行う。
-    let c_target = CString::new(format!("/proc/thread-self/fd/{}", dir.as_raw_fd()))
-        .map_err(|_| invalid("proc mount target must not contain NUL"))?;
+    // 数値だけから組む文字列のため NUL は含まれ得ない（失敗は内部エラー扱い）。
+    let c_target =
+        CString::new(format!("/proc/thread-self/fd/{}", dir.as_raw_fd())).map_err(|_| {
+            ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::MountProc,
+                "failed to build the fd path of the proc mount target",
+            )
+        })?;
     mount_proc_syscall(&c_target)
         .map_err(|e| ExecError::from_sys(e, IsolationStage::MountProc, "mount(proc)"))
 }
@@ -857,9 +895,9 @@ fn mount_proc_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
 }
 
 /// テストビルドの dry-run 差し込み点。`mount(2)` を呼ばず、渡されたマウント先をスレッド
-/// ローカルに記録するだけにする。単体テストは検証を通さない証跡で [`mount_proc`] を呼ぶ
-/// ため、将来検証が後退しても root 実行のテストからホストへ `mount(2)` が届かないことを
-/// cfg で構造的に保証する。
+/// ローカルに記録するだけにする。単体テストは証跡の検証を経ない `mount_proc_verified` を
+/// 直接呼ぶため、将来パス検証が後退しても root 実行のテストからホストへ `mount(2)` が
+/// 届かないことを cfg で構造的に保証する。
 #[cfg(test)]
 fn mount_proc_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
     tests::DRY_RUN_MOUNTS.with(|m| m.borrow_mut().push(target.to_string_lossy().into_owned()));
@@ -872,17 +910,18 @@ fn mount_proc_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
 /// [`mount_proc`] のマウント先固定に使う。各要素は直前の fd を起点に開くため、途中の要素を
 /// symlink へ差し替えても辿る実体は変わらない。O_PATH は読み取り権限を要求しないため、
 /// 実行権限のみの祖先（`CLONE_NEWUSER` 後のホスト所有ディレクトリ等）も辿れる。
-/// 拒否は `InvalidArgument`（symlink・非ディレクトリ・不在）、search 権限不足は
-/// `PermissionDenied`、それ以外は errno に応じたコード。
+/// 拒否は違反記録付きの `InvalidArgument`（symlink・非ディレクトリ・不在・NUL）。search 権限
+/// 不足（`PermissionDenied`）等のその他の errno はシステムエラー（違反記録なし）。違反記録の
+/// 対象は `real_root` と `names` を連結したパス（呼び出し側が渡したマウント先と同じ）。
 fn open_dir_beneath(real_root: &Path, names: &[&OsStr]) -> Result<OwnedFd, ExecError> {
-    let invalid =
-        |msg: &str| ExecError::new(ErrorCode::InvalidArgument, IsolationStage::MountProc, msg);
+    let target = || names.iter().fold(real_root.to_path_buf(), |p, n| p.join(n));
+    let violation = |r: ViolationReason| ExecError::from_violation(r, Some(&target()));
     let open_err = |e: SysError| match e {
         // O_DIRECTORY|O_NOFOLLOW では symlink も ENOTDIR になる。ELOOP は念のため残す。
         SysError::Os(sys::ELOOP) | SysError::Os(sys::ENOTDIR) => {
-            invalid("proc mount target path components must be directories, not symlinks")
+            violation(ViolationReason::PathSymlinkOrNotDirectory)
         }
-        SysError::Os(sys::ENOENT) => invalid("proc mount target path must exist"),
+        SysError::Os(sys::ENOENT) => violation(ViolationReason::PathMissing),
         other => ExecError::from_sys(other, IsolationStage::MountProc, "openat"),
     };
     let mut cur = sys::open_dir_path_nofollow(None, c"/").map_err(open_err)?;
@@ -892,7 +931,7 @@ fn open_dir_beneath(real_root: &Path, names: &[&OsStr]) -> Result<OwnedFd, ExecE
     });
     for name in root_names.chain(names.iter().copied()) {
         let c_name = CString::new(name.as_bytes())
-            .map_err(|_| invalid("proc mount target must not contain NUL"))?;
+            .map_err(|_| violation(ViolationReason::PathContainsNul))?;
         cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c_name).map_err(open_err)?;
     }
     Ok(cur)
@@ -1198,31 +1237,27 @@ mod tests {
     #[test]
     fn establish_preconditions() {
         assert_eq!(check_establish_preconditions(1, STATUS_PID1), Ok(()));
-        let cases: [(u32, &str, &str); 5] = [
-            (
-                7,
-                STATUS_PID1,
-                "not PID 1; call from the first child created after unshare(CLONE_NEWPID)",
-            ),
+        let cases: [(u32, &str, ViolationReason); 5] = [
+            (7, STATUS_PID1, ViolationReason::EstablishNotPid1),
             (
                 1,
                 "NSpid:\t4321\t7\nThreads:\t1\n",
-                "NSpid does not end with 1; not PID 1 of the innermost PID namespace",
+                ViolationReason::EstablishNspidNotPid1,
             ),
             (
                 1,
                 "NSpid:\t1\nThreads:\t1\n",
-                "not in a nested PID namespace; isolate with Namespace::Pid first",
+                ViolationReason::EstablishNotNestedPidNamespace,
             ),
             (
                 1,
                 "NSpid:\t4321\t1\nThreads:\t2\n",
-                "the process must be single-threaded before establishing mount isolation",
+                ViolationReason::EstablishMultiThreaded,
             ),
             (
                 1,
                 "NSpid:\t4321\t1\n",
-                "the process must be single-threaded before establishing mount isolation",
+                ViolationReason::EstablishMultiThreaded,
             ),
         ];
         for (pid, status, want) in cases {
@@ -1320,17 +1355,17 @@ mod tests {
         // 証跡を受け取った親や PID 1 が fork した子（PID が 1 でない）。
         assert_eq!(
             check_evidence(&e, 42, "mnt:[10]", "pid:[20]"),
-            Err("mount_proc must be called by PID 1 of the isolated PID namespace")
+            Err(ViolationReason::EvidenceCallerNotPid1)
         );
         // 別の mount namespace（別スレッド・親）。
         assert_eq!(
             check_evidence(&e, 1, "mnt:[11]", "pid:[20]"),
-            Err("isolation evidence does not belong to the current mount namespace")
+            Err(ViolationReason::EvidenceMountNamespaceMismatch)
         );
         // 同じ mount namespace だが別の PID namespace（procfs が別の PID 集合を映す）。
         assert_eq!(
             check_evidence(&e, 1, "mnt:[10]", "pid:[21]"),
-            Err("isolation evidence does not belong to the current PID namespace")
+            Err(ViolationReason::EvidencePidNamespaceMismatch)
         );
     }
 
@@ -1340,7 +1375,7 @@ mod tests {
         assert_eq!(check_fresh_mount_ns("mnt:[1]", "mnt:[2]"), Ok(()));
         assert_eq!(
             check_fresh_mount_ns("mnt:[1]", "mnt:[1]"),
-            Err("unshare(CLONE_NEWNS) did not move the thread to a new mount namespace")
+            Err(ViolationReason::EstablishMountNamespaceNotFresh)
         );
     }
 

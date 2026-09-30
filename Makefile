@@ -398,7 +398,8 @@ fio-baseline-ratio: ## fio ベースライン比を算出する（BASELINE/CANDI
 # 起動時間計測（TASK-46.1・CORE-10・MS-2 Phase 3）
 # --------------------------------------------------
 # `scripts/bench/startup_latency.sh` は OCI Runtime CLI 契約のランタイムに対し
-# create から start 復帰までの時間の中央値を計測する。own 実装の実測は CLI（TASK-79）
+# create からプロセス実行開始（state が running / stopped を返した時点）までの時間の
+# 中央値を計測する。own 実装の実測は CLI（TASK-79）
 # 提供後に人間が #213（TASK-46.h1）で行う実機前提（ランタイム・bundle・場合により root）
 # のため `make ci` には含めない。自己テストはスタブランタイムで完結し CI に組み込み済み。
 .PHONY: startup-latency-selftest

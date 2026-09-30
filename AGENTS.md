@@ -58,7 +58,7 @@ make fio-bench TARGET_DIR=<dir> LABEL=<label> [RUNTIME=<seconds>]  # fio 4K ラ�
 make fio-baseline-ratio-selftest  # fio ベースライン比算出スクリプトの自己テスト（TASK-25.2・IO-8・REPAIR-12。実 fio 不要）
 make fio-baseline-ratio BASELINE=<results.json> CANDIDATE=<results.json>  # Docker ベースライン比（IOPS・レイテンシの倍率）を算出する（実 fio 不要。results.json は fio-randwrite-4k.sh の出力）
 make startup-latency-selftest  # 起動時間計測スクリプトの自己テスト（TASK-46.1・CORE-10・REPAIR-12。スタブランタイムで完結）
-make startup-latency RUNTIME=<abs-path> BUNDLE=<dir> [ITERATIONS=<n>] [LABEL=<label>]  # create から start 復帰までの起動時間の中央値を計測する（実機前提）
+make startup-latency RUNTIME=<abs-path> BUNDLE=<dir> [ITERATIONS=<n>] [LABEL=<label>]  # create からプロセス実行開始（state が running / stopped を返した時点）までの起動時間の中央値を計測する（実機前提）
 ```
 
 - `make test-integration`: 終了コード 0 が成功基準。`notice:` 出力での成功終了は、全 crate から `tests/*.rs` が無くなった場合のフォールバック。通常は `cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server` と `cargo test -p fandhe-container-io --bins --features crash-test-server` の 2 段が実行される。`crash_safety` 等 `required-features` 付きの target は `make test`（既定 feature）では実行されず、本ターゲットと CI の `integration-test`・`rust-ci`（`--all-features`）で実行される。実行された件数は Makefile・CI が出力する `integration test targets: N` 行で確認する。`notice:` での成功終了は結合試験が 1 件も実行されていないことを意味し、`tests/*.rs` を追加・変更した PR の合格根拠にしない（冒頭の `skip:` と同じ扱い）。jq 未導入時は fail-closed で終了コード非 0 になる

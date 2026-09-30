@@ -2,7 +2,8 @@
 # own 実装の起動時間計測スクリプト（TASK-46.1・CORE-10・MS-2 Phase 3）。
 #
 # 役割: OCI Runtime の CLI 契約に従うランタイム実行ファイルを `--runtime` で受け取り、
-# `create` 開始から `start` 正常復帰までの壁時計時間を複数回計測して中央値を出す。
+# `create` 開始からコンテナのプロセス実行開始（state が running / stopped を返した時点）
+# までの壁時計時間を複数回計測して中央値を出す。
 # CORE-10 は「create からプロセス実行開始までの起動時間の中央値が Docker 比で同等以下」
 # を求める（Linux の Docker ベースラインは 0.290〜0.298 秒・node4 実測）。本スクリプトは
 # TASK-46（担当: 人間）のうち Claude Code 担当分である計測ハーネスの準備までを担い、
@@ -16,19 +17,23 @@
 #     TASK-157 待ち）、ファイルベース StateStore は TASK-31 待ちのため、現時点では
 #     own 実装を CLI からエンドツーエンドで起動できない。own の実測は CLI 提供後。
 #   - fandhe-container の CLI が下記契約と異なる形になった場合は、ランタイム呼び出し部
-#     （rt_create / rt_start / rt_delete / rt_kill の 4 関数）だけを差し替える。
+#     （rt_create / rt_start / rt_delete / rt_kill / rt_state の 5 関数）だけを差し替える。
 #
 # 呼び出し元: Makefile の `startup-latency` ターゲット（自己テストは
 # scripts/bench/startup_latency_selftest.sh・`startup-latency-selftest` ターゲット）。
 # 実機前提のため `make ci` には含めない（.claude/rules/ci.md「実機前提テスト」）。
 #
 # 計測対象の起動契約（opencontainers/runtime-tools の command-line-interface・runc 互換）:
+#   <runtime> state <id>                       # create 前の ID 未使用確認（計測対象外）と実行開始の観測
 #   <runtime> create --bundle <bundle> <id>    # 計測対象
-#   <runtime> start <id>                       # 計測対象。正常復帰時点を「exec 開始」とみなす
-#   <runtime> delete <id>                      # 後始末（計測対象外）。失敗時は kill <id> KILL → delete
-#   「exec 開始」の定義: OCI Runtime Spec の start 操作は「ユーザー指定プログラムの実行」で
-#   あり、その正常復帰をプロセス実行開始とみなす。計測値 total は create 呼び出し直前から
-#   start 正常復帰直後まで（create 単体・start 単体も内訳として記録する）。
+#   <runtime> start <id>                       # 計測対象
+#   <runtime> delete <id>                      # 後始末（計測対象外）。失敗時は kill <id> KILL → 待機付き delete
+#   「プロセス実行開始」の定義（CORE-10 の前提「create からプロセス実行開始までの時間」）:
+#   OCI Runtime Spec の start 成功はユーザー指定プログラムの実行開始時刻を返す契約では
+#   ないため、start 復帰後に state を照会し、status が running（プログラム実行済み・未終了）
+#   または stopped（終了済み）を初めて返した時点を実行開始の観測点とする。計測値 total は
+#   create 呼び出し直前からその state 復帰直後まで（実行開始時刻の上側推定。内訳として
+#   create・start・観測待ち observe と state 照会回数を記録する）。
 #
 # 使い方:
 #   startup_latency.sh --runtime <絶対パス> --bundle <dir> [--iterations N] [--warmup N]
@@ -38,9 +43,10 @@
 #
 # 終了コード（呼び出し元はこの具体値で分岐する）:
 #   0: 成功
-#   1: ランタイムの create / start の失敗またはタイムアウト
+#   1: ランタイムの create / start / state の失敗・タイムアウト、実行開始を観測できない、
+#      ID が既に使用中
 #   2: 入力エラー（引数・bundle・output の検証失敗）
-#   3: 前提ツール欠如（bash 5 以上・jq・GNU timeout・mktemp・sort 等）
+#   3: 前提ツール欠如（bash 5 以上・jq・GNU timeout・mktemp・sed・sleep 等）
 #   4: 後始末失敗（作成済みコンテナを delete できない等。残存 ID を stderr に出す。最優先）
 #
 # 出力（stdout。--output 指定時は同一内容をファイルにも書く。進捗・サマリーは stderr）:
@@ -49,7 +55,8 @@
 #
 # セキュリティ: 引数は許可リストで検証し、ランタイムは配列で直接 exec する（eval・
 # sh -c・文字列連結なし）。sudo は内部で呼ばない（root を要する実測は人間が明示実行する）。
-# 各ランタイム呼び出しは timeout で上限を掛け、ログ出力量にも上限（ulimit -f）を掛ける（REPAIR-5）。
+# 各ランタイム呼び出しは timeout で上限を掛け、ログ出力量にも上限（ulimit -f）を掛ける。
+# 実行開始の観測・後始末の待機にも時間と回数の上限を設ける（REPAIR-5）。
 
 set -euo pipefail
 # EPOCHREALTIME の小数点がロケール依存になるのを防ぐ。
@@ -66,6 +73,12 @@ readonly LOG_TAIL_LINES=20
 # ランタイム 1 呼び出しがログファイルへ書ける最大サイズ（KiB。ulimit -f の単位）。
 # 超過した呼び出しは SIGXFSZ で打ち切られ計測失敗になる（ディスク枯渇防止。REPAIR-5）。
 readonly LOG_MAX_KIB=1024
+# start 復帰後に state で実行開始（running / stopped）を観測する最大照会回数。
+# 時間上限は --timeout 秒（REPAIR-5）で、先に達した方で打ち切る。
+readonly STATE_POLL_MAX=500
+# kill 後に delete を再試行する最大回数と間隔（秒）。時間上限は --timeout 秒。
+readonly DELETE_RETRY_MAX=100
+readonly DELETE_RETRY_INTERVAL=0.1
 
 usage() {
   cat >&2 <<'USAGE'
@@ -189,7 +202,7 @@ if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
   err "missing-prerequisite" "bash 5 or later is required (EPOCHREALTIME)"
   exit "$EXIT_PREREQ"
 fi
-for tool in jq timeout mktemp tail rm; do
+for tool in jq timeout mktemp tail rm sed sleep; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     err "missing-prerequisite" "required tool not found: $tool"
     exit "$EXIT_PREREQ"
@@ -200,6 +213,7 @@ tmpdir="$(mktemp -d)"
 # コンテナ ID の実行固有部。PID だけでは過去の実行で残ったコンテナと再利用時に衝突し、
 # create 失敗時の後始末が無関係な既存コンテナを delete / kill し得るため、mktemp が返す
 # ランダムな接尾辞（実行ごとに一意）を含める。英数字以外は除去して ID に使える形にする。
+# 加えて create 前に state で ID が未使用であることを確認する（measure_once）。
 run_tag="${tmpdir##*/}"
 run_tag="${run_tag//[!A-Za-z0-9]/}"
 if [ -z "$run_tag" ]; then
@@ -208,37 +222,47 @@ if [ -z "$run_tag" ]; then
   exit "$EXIT_PREREQ"
 fi
 seq_no=0
-# 現在作成済みで未削除のコンテナ ID（1 試行につき 1 つ）と、削除できなかった ID の一覧。
+# 現在の試行で後始末対象のコンテナ ID（1 試行につき 1 つ）と、削除できなかった ID の一覧。
 live_id=""
-# create 試行中（成否未確定）は 1。create 失敗でコンテナが未作成だった場合、OCI 準拠
-# ランタイムは存在しない ID の delete を拒否するため、残存確認（state）できた場合だけ
-# 後始末失敗とする。create 成功後は 0（delete 失敗は常に後始末失敗）。
-live_unverified=0
+# create が成功していれば 1。0 の間（create の成否未確定・失敗）は、削除できなかった場合に
+# create 前に取得した「不存在時の state 応答」と照合し、一致したときだけ未作成とみなす。
+live_created=0
+# create 前（ID 未使用が確定している時点）に取得した state 応答の署名（query_state・
+# state_matches_absent 参照）。
+absent_sig=""
 leftover_ids=()
 rc=0
+# query_state の結果（終了コード・status・応答署名）。
+state_rc=0
+state_status=""
+state_sig=""
 
-# ランタイム呼び出し本体。stdout/stderr はログファイルへ逃がす（コンテナ側が
-# パイプを保持して create が戻らないランタイムへの対策）。stdin は /dev/null。
-# 引数: <ログファイル> <ランタイム引数...>
+# ランタイム呼び出し本体。stdout/stderr はファイルへ逃がす（コンテナ側がパイプを
+# 保持して create が戻らないランタイムへの対策）。stdin は /dev/null。
+# 引数: <stdout ファイル> <stderr ファイル（stdout と同じパスなら併合）> <ランタイム引数...>
 run_rt() {
-  local log="$1"
-  shift
+  local out="$1" errf="$2"
+  shift 2
   local status=0
   # サブシェルで ulimit -f を掛け、出力量が上限を超えたら SIGXFSZ で失敗させる
   # （--timeout は出力量を制限しないため）。上限はサブシェル内に閉じる。
   (
     ulimit -f "$LOG_MAX_KIB"
-    exec timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" "$runtime" "$@" </dev/null >"$log" 2>&1
+    if [ "$out" = "$errf" ]; then
+      exec timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" "$runtime" "$@" </dev/null >"$out" 2>&1
+    fi
+    exec timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" "$runtime" "$@" </dev/null >"$out" 2>"$errf"
   ) || status=$?
   return "$status"
 }
 
-# --- ランタイム呼び出し部（CLI 契約が変わった場合はこの 4 関数のみ差し替える） ---
-rt_create() { run_rt "$1" create --bundle "$bundle" "$2"; }
-rt_start() { run_rt "$1" start "$2"; }
-rt_delete() { run_rt "$1" delete "$2"; }
-rt_kill() { run_rt "$1" kill "$2" KILL; }
-rt_state() { run_rt "$1" state "$2"; }
+# --- ランタイム呼び出し部（CLI 契約が変わった場合はこの 5 関数のみ差し替える） ---
+rt_create() { run_rt "$1" "$1" create --bundle "$bundle" "$2"; }
+rt_start() { run_rt "$1" "$1" start "$2"; }
+rt_delete() { run_rt "$1" "$1" delete "$2"; }
+rt_kill() { run_rt "$1" "$1" kill "$2" KILL; }
+# state は stdout（OCI state JSON）と stderr を分けて受け取る。引数: <stdout> <stderr> <id>
+rt_state() { run_rt "$1" "$2" state "$3"; }
 # ---------------------------------------------------------------------------
 
 # 失敗したコマンドのログ末尾を stderr へ出す。
@@ -247,31 +271,89 @@ show_log() {
   tail -n "$LOG_TAIL_LINES" -- "$1" >&2 || true
 }
 
-# コンテナを削除する。失敗時は kill → delete を試み、それでも残れば leftover に記録する。
-# 引数: <id> [probe]（probe=1 のときは削除失敗後に state で実在を確認し、
-# 応答が不存在を明示した場合のみ create が何も作らなかったとみなして成功扱いにし、照会不能なら残存扱い）
+# 現在時刻（マイクロ秒）。EPOCHREALTIME は LC_ALL=C で小数点が "." に固定される。
+now_us() {
+  echo "${EPOCHREALTIME/./}"
+}
+
+# state を 1 回呼び、state_rc・state_status・state_sig を設定する。
+# state_status は stdout が単一の OCI state JSON で id が一致するときだけその status、
+# それ以外は空文字。state_sig は「終了コード＋stdout＋stderr」の署名で、時刻・PID 等の
+# 揺れを吸収するため数字列を同一視する（不存在応答の照合用。absent_sig と比較する）。
+query_state() {
+  local id="$1" out="$tmpdir/state.out" errf="$tmpdir/state.err"
+  state_rc=0
+  rt_state "$out" "$errf" "$id" || state_rc=$?
+  state_status=""
+  if [ "$state_rc" -eq 0 ]; then
+    state_status="$(jq -rs --arg id "$id" \
+      'if length == 1 and (.[0] | type) == "object" and .[0].id == $id and (.[0].status | type) == "string" then .[0].status else "" end' \
+      <"$out" 2>/dev/null)" || state_status=""
+  fi
+  state_sig="rc=$state_rc
+out=$(sed -E 's/[0-9]+/N/g' -- "$out" 2>/dev/null || echo unreadable)
+err=$(sed -E 's/[0-9]+/N/g' -- "$errf" 2>/dev/null || echo unreadable)"
+}
+
+# ランタイム自身が返したエラー終了か（timeout の 124・timeout 自体の失敗 125・
+# 実行不能 126/127・シグナル終了 128 以上を除く 1〜123）。
+is_runtime_error() {
+  [ "$1" -ge 1 ] && [ "$1" -le 123 ]
+}
+
+# 直前の query_state の応答が「不存在時の応答」と一致するか。不存在時の応答は、create 前
+# （ID 未使用が確定していた時点）に同じ ID で得た state の応答（absent_sig）とする。
+# ログの文言の解釈には頼らず、照会のタイムアウト・権限エラー・別の失敗理由で応答が
+# 変われば不一致（残存の可能性あり）になる（特権操作の後始末。fail-closed）。
+# 既知の限界: create 前の照会自体が権限エラー等で失敗する環境では、その応答が基準になる
+# （その環境では create も同じ理由で失敗する想定）。
+state_matches_absent() {
+  is_runtime_error "$state_rc" && [ -n "$absent_sig" ] && [ "$state_sig" = "$absent_sig" ]
+}
+
+# create 未成功の ID が実在しないことを確かめる（state_matches_absent で判定）。
+confirm_absent() {
+  local id="$1"
+  query_state "$id"
+  if state_matches_absent; then
+    return 0
+  fi
+  echo "warning: could not confirm that $id is absent (state exit $state_rc differs from the pre-create response); assuming it may be left behind" >&2
+  return 1
+}
+
+# コンテナを削除する。delete が失敗したら kill KILL を送り、プロセスの終了を待ちながら
+# delete を再試行する（OCI の delete は実行中コンテナを拒否し、kill は終了を待たないため）。
+# 待機は --timeout 秒・DELETE_RETRY_MAX 回で打ち切る（REPAIR-5）。それでも残れば
+# leftover_ids に記録して非ゼロを返す。
+# 引数: <id> <created>（created=0 は create 未成功。削除できない場合は confirm_absent で
+# 未作成を確かめられたときだけ成功扱いにする）
 finish_container() {
-  local id="$1" probe="${2:-0}"
+  local id="$1" created="$2"
   local log="$tmpdir/cleanup-$id.log"
   if rt_delete "$log" "$id"; then
     return 0
   fi
   rt_kill "$log" "$id" || true
-  if rt_delete "$log" "$id"; then
-    return 0
-  fi
-  if [ "$probe" = "1" ]; then
-    local st=0
-    rt_state "$log" "$id" || st=$?
-    if [ "$st" -eq 0 ]; then
-      : # コンテナが実在するので残存扱い（下で leftover へ記録）
-    elif [ "$st" -ne 124 ] && [ "$st" -ne 137 ] && grep -qiE 'does not exist|not found|no such container' -- "$log"; then
-      # state の応答が不存在を明示した場合だけ「create が何も作らなかった」とみなす。
-      # タイムアウト・権限エラー等の照会不能は残存の可能性ありとして扱う（特権操作の後始末）。
+  local deadline tries=0
+  deadline=$(($(now_us) + timeout_secs * 1000000))
+  while [ "$tries" -lt "$DELETE_RETRY_MAX" ] && [ "$(now_us)" -lt "$deadline" ]; do
+    tries=$((tries + 1))
+    if rt_delete "$log" "$id"; then
       return 0
-    else
-      echo "warning: could not verify container absence for $id (state exit $st); assuming it may be left behind" >&2
     fi
+    if [ "$created" = "0" ]; then
+      # create 未成功で delete が拒否され続けるのは未作成が原因のことが多い。
+      # 応答が create 前と一致すれば待機を打ち切って成功扱いにする。
+      query_state "$id"
+      if state_matches_absent; then
+        return 0
+      fi
+    fi
+    sleep "$DELETE_RETRY_INTERVAL"
+  done
+  if [ "$created" = "0" ] && confirm_absent "$id"; then
+    return 0
   fi
   leftover_ids+=("$id")
   return 1
@@ -283,13 +365,12 @@ cleanup() {
   local final="$?"
   trap - EXIT INT TERM
   if [ -n "$live_id" ]; then
-    # live_id は create 試行の直前に設定される（create 失敗で中途半端に残った場合も対象。
-    # ただし create 未成功の間は state で実在を確認できた場合のみ残存扱い）。
-    # delete 失敗時は finish_container が kill → delete を再試行し、それでも残れば
-    # leftover_ids へ記録して下で exit 4 にする。
-    finish_container "$live_id" "$live_unverified" || true
+    # live_id は ID 未使用の確認後・create 試行の直前に設定される（create 失敗で中途半端に
+    # 残った場合も対象）。削除できなければ finish_container が leftover_ids へ記録し、
+    # 下で exit 4 にする。
+    finish_container "$live_id" "$live_created" || true
     live_id=""
-    live_unverified=0
+    live_created=0
   fi
   if ! rm -rf -- "$tmpdir"; then
     echo "error: cleanup-failed: could not remove temporary directory" >&2
@@ -305,31 +386,72 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# 1 回分の計測。成功すると create_us・start_us・total_us をグローバルへ設定する。
-# 引数: <id>。失敗時は非ゼロを返す（呼び出し側が exit 1 に変換する）。
+# 1 回分の計測。成功すると create_us・start_us・observe_us・total_us・state_polls を
+# グローバルへ設定する。引数: <id>。失敗時は非ゼロを返す（呼び出し側が exit 1 に変換する）。
+#
+# 計測点（CORE-10「create からプロセス実行開始まで」）:
+#   t0: create 呼び出し直前 / t1: create 復帰 / ts: start 復帰
+#   t2: state が running / stopped を返した時点（OCI Runtime Spec の state は running を
+#       「ユーザー指定プログラムを実行済みで未終了」、stopped を「プロセスが終了済み」と
+#       定義する）。start の復帰はプロセスの実行開始を保証しないため、実行開始を state で
+#       観測する。t2 は state 呼び出しの復帰後に取るため、実行開始時刻の上側推定になる
+#       （state 1 回分の所要時間を含み、Docker 比では own に不利な側へ偏る）。
 measure_once() {
-  local id="$1" t0 t1 t2
-  t0="${EPOCHREALTIME/./}"
+  local id="$1" t0 t1 ts t2 deadline
+  # create 前に ID が未使用であることを確認し、その応答を不存在時の署名として保持する
+  # （create 失敗後の後始末で未作成を確かめる基準。計測区間外）。
+  query_state "$id"
+  if [ "$state_rc" -eq 0 ]; then
+    err "container-id-in-use" "container $id already exists; refusing to touch it"
+    return 1
+  fi
+  if ! is_runtime_error "$state_rc"; then
+    err "runtime-state-failed" "state for unused id $id failed abnormally (exit $state_rc)"
+    return 1
+  fi
+  absent_sig="$state_sig"
+  t0="$(now_us)"
   # create が途中まで進んでから失敗・タイムアウトしても特権リソースが残り得るため、
   # 作成を試みた時点で後始末対象として保持する。失敗時の delete（kill → delete の再試行）と
   # 残存時の exit 4 は EXIT trap の cleanup が担う。
   live_id="$id"
-  live_unverified=1
+  live_created=0
   if ! rt_create "$tmpdir/create.log" "$id"; then
     err "runtime-create-failed" "create failed or timed out for $id"
     show_log "$tmpdir/create.log"
     return 1
   fi
-  live_unverified=0
-  t1="${EPOCHREALTIME/./}"
+  live_created=1
+  t1="$(now_us)"
   if ! rt_start "$tmpdir/start.log" "$id"; then
     err "runtime-start-failed" "start failed or timed out for $id"
     show_log "$tmpdir/start.log"
     return 1
   fi
-  t2="${EPOCHREALTIME/./}"
+  ts="$(now_us)"
+  state_polls=0
+  deadline=$((ts + timeout_secs * 1000000))
+  while :; do
+    state_polls=$((state_polls + 1))
+    query_state "$id"
+    case "$state_status" in
+      running | stopped) break ;;
+      created) ;;
+      *)
+        err "runtime-state-failed" "state for $id failed or returned an unexpected status (exit $state_rc)"
+        show_log "$tmpdir/state.err"
+        return 1
+        ;;
+    esac
+    if [ "$state_polls" -ge "$STATE_POLL_MAX" ] || [ "$(now_us)" -ge "$deadline" ]; then
+      err "runtime-exec-not-observed" "container $id did not reach running/stopped within ${timeout_secs}s"
+      return 1
+    fi
+  done
+  t2="$(now_us)"
   create_us=$((t1 - t0))
-  start_us=$((t2 - t1))
+  start_us=$((ts - t1))
+  observe_us=$((t2 - ts))
   total_us=$((t2 - t0))
   return 0
 }
@@ -344,22 +466,26 @@ while [ "$run_no" -lt "$total_runs" ]; do
   id="fandhe-startup-$run_tag-$$-$seq_no"
   create_us=0
   start_us=0
+  observe_us=0
   total_us=0
+  state_polls=0
   if ! measure_once "$id"; then
     rc="$EXIT_RUNTIME"
     break
   fi
-  if ! finish_container "$id"; then
+  if ! finish_container "$id" 1; then
     live_id=""
     err "cleanup-failed" "could not delete container $id"
     exit "$EXIT_CLEANUP"
   fi
   live_id=""
+  live_created=0
   if [ "$run_no" -gt "$warmup" ]; then
-    samples="$(jq -c --argjson c "$create_us" --argjson s "$start_us" --argjson t "$total_us" \
-      '. + [{create_us: $c, start_us: $s, total_us: $t}]' <<<"$samples")"
+    samples="$(jq -c --argjson c "$create_us" --argjson s "$start_us" --argjson o "$observe_us" \
+      --argjson t "$total_us" --argjson p "$state_polls" \
+      '. + [{create_us: $c, start_us: $s, observe_us: $o, total_us: $t, state_polls: $p}]' <<<"$samples")"
   fi
-  echo "  run $run_no/$total_runs: create=${create_us}us start=${start_us}us total=${total_us}us$([ "$run_no" -le "$warmup" ] && echo ' (warmup)')" >&2
+  echo "  run $run_no/$total_runs: create=${create_us}us start=${start_us}us observe=${observe_us}us total=${total_us}us polls=${state_polls}$([ "$run_no" -le "$warmup" ] && echo ' (warmup)')" >&2
 done
 
 if [ "$rc" -ne 0 ]; then

@@ -47,7 +47,8 @@
 //!   として定義済み（TASK-84.5）。core との接続は core と io の両方に依存する上位 crate の
 //!   newtype アダプタで行う（core → io 依存辺は未承認のため core には置かない）。
 //!   io 側の計装は TASK-84.7
-//! - 結合テスト: TASK-84.6
+//! - 結合テスト: 分布（min / mean / p95 / max）・件数の照合は `tests/observability.rs`
+//!   （TASK-84.6）で実装済み
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;

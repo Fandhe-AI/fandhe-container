@@ -24,6 +24,8 @@
 //!   の検証が `exec` の非公開項目のため〕、fork / exec による子プロセス起動〔TASK-27.4.1。最小構成でフック無し〕、順序固定のステージ列の枠〔TASK-27.4.2。`exec/stages.rs`。`NO_NEW_PRIVS` のみ固定ステージとして TASK-27.4.3 で実装済み〕が
 //!   実装済みで、他の段の実体（cgroup 参加・capability 削減・seccomp・Landlock）は未実装。非 Linux ではビルド対象外のため本 doc からは
 //!   リンクしない）
+//! - `observability`: メトリクス集計型 `OpStats` 等（TASK-84.1・REPAIR-4。型定義のみ実装済みで、
+//!   記録・出力・計装は TASK-84.2 以降で未実装）
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - `oci_runtime`: OCI Runtime のライフサイクル。現状は `config.json` の型・パーサのみ
 //!   （TASK-29.1.1 実装済み・OS 非依存）。create / start は TASK-29.2 / 29.3、kill / delete は
@@ -47,6 +49,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod exec;
+pub mod observability;
 pub mod oci_runtime;
 #[cfg(target_os = "linux")]
 mod sys;

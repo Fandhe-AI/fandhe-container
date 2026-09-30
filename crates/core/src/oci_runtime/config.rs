@@ -16,7 +16,8 @@
 //!   ただし既知フィールドの重複キー・必須欠落・型不一致・未知の namespace type はエラーにする。
 //!   既知フィールドの省略はキーが無い場合に限り、キーがあって値が `null` のものは省略とみなさず
 //!   型不一致（`Data`）として拒否する（OCI の JSON Schema に `null` を許すフィールドが無いため。
-//!   根拠は `present` を参照）。
+//!   根拠は `present` を参照）。object 型のフィールドに配列を書く位置指定（serde の derive が既定で
+//!   受理する形）と、列挙値（namespace type）の型不一致も同様に `Data` として拒否する。
 //!   未知プロパティ（読み飛ばす対象）内の重複キーは検出せず受理する（無視する値であり、
 //!   解釈結果に影響しないため。既知フィールドの重複は serde の重複検出で拒否される）。
 //!
@@ -52,7 +53,7 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use serde::de::{self, Deserializer, SeqAccess, Visitor};
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::traits::ErrorCode;
 
@@ -410,27 +411,57 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
+/// JSON の object だけを受ける struct の読み込み（OCI-4）。
+///
+/// serde が derive した struct の実装は、serde_json では配列も「フィールドを宣言順に並べたもの」と
+/// して受理する（例: `"root": ["rootfs", true]`・`"linux": []`）。OCI の JSON Schema でこれらは
+/// `object` 型なので、map として読んでから中身を derive 実装へ渡し、配列・`null`・スカラーは
+/// 型不一致（`Data`）として拒否する。重複キー検出・未知プロパティの無視・再帰上限は derive 実装と
+/// serde_json の挙動のまま変わらない。raw 層の struct はトップレベルも含めて必ずこれで包む。
+struct Obj<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Obj<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjVisitor<T>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjVisitor<T> {
+            type Value = Obj<T>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                T::deserialize(de::value::MapAccessDeserializer::new(map)).map(Obj)
+            }
+        }
+
+        deserializer.deserialize_map(ObjVisitor(PhantomData))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // raw 層（非公開。JSON の形をそのまま受ける）
 //
 // 省略可能な既知フィールドは必ず `#[serde(default, deserialize_with = "present")]` を付ける
 // （`null` を省略として受理しないため）。`#[serde(default)] bool` は serde_json が `null` を
-// 型不一致として拒否するため `present` を要しない。
+// 型不一致として拒否するため `present` を要しない。struct 型のフィールド・配列要素は `Obj` で包み
+// （配列を struct として受理しないため）、列挙値は文字列として読む（`RawNamespaceKind`）。
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawConfig {
     oci_version: BoundedStr<OciVersionLimit>,
-    root: RawRoot,
+    root: Obj<RawRoot>,
     #[serde(default, deserialize_with = "present")]
-    process: Option<RawProcess>,
+    process: Option<Obj<RawProcess>>,
     #[serde(default, deserialize_with = "present")]
     hostname: Option<BoundedStr<HostnameLimit>>,
     #[serde(default, deserialize_with = "present")]
-    mounts: Option<Bounded<RawMount, MountsLimit>>,
+    mounts: Option<Bounded<Obj<RawMount>, MountsLimit>>,
     #[serde(default, deserialize_with = "present")]
-    linux: Option<RawLinux>,
+    linux: Option<Obj<RawLinux>>,
 }
 
 #[derive(Deserialize)]
@@ -444,7 +475,7 @@ struct RawRoot {
 struct RawProcess {
     #[serde(default)]
     terminal: bool,
-    user: RawUser,
+    user: Obj<RawUser>,
     args: Bounded<BoundedStr<ArgLimit>, ArgsLimit>,
     #[serde(default, deserialize_with = "present")]
     env: Option<Bounded<BoundedStr<EnvItemLimit>, EnvLimit>>,
@@ -475,19 +506,63 @@ struct RawMount {
 #[serde(rename_all = "camelCase")]
 struct RawLinux {
     #[serde(default, deserialize_with = "present")]
-    namespaces: Option<Bounded<RawNamespace, NamespacesLimit>>,
+    namespaces: Option<Bounded<Obj<RawNamespace>, NamespacesLimit>>,
     #[serde(default, deserialize_with = "present")]
-    uid_mappings: Option<Bounded<RawIdMapping, UidMappingsLimit>>,
+    uid_mappings: Option<Bounded<Obj<RawIdMapping>, UidMappingsLimit>>,
     #[serde(default, deserialize_with = "present")]
-    gid_mappings: Option<Bounded<RawIdMapping, GidMappingsLimit>>,
+    gid_mappings: Option<Bounded<Obj<RawIdMapping>, GidMappingsLimit>>,
 }
 
 #[derive(Deserialize)]
 struct RawNamespace {
     #[serde(rename = "type")]
-    kind: NamespaceKind,
+    kind: RawNamespaceKind,
     #[serde(default, deserialize_with = "present")]
     path: Option<BoundedStr<NamespacePathLimit>>,
+}
+
+/// OCI Runtime Spec が定める `linux.namespaces[].type` の値（OCI-4）。
+const NAMESPACE_TYPES: &[&str] = &[
+    "pid", "network", "mount", "ipc", "uts", "user", "cgroup", "time",
+];
+
+/// `linux.namespaces[].type` を文字列として読む。
+///
+/// derive した unit variant の enum は、serde_json では文字列以外（`null`・数値・配列等）を
+/// `ExpectedSomeValue`（`Syntax`）に分類するため、構文は正しい JSON の型不一致が「構文エラー」に
+/// なる。文字列として読めば型不一致は `invalid type`、未知の値は `unknown variant` となり、
+/// どちらも他フィールドと同じ `Data` に揃う。文字列は借用で照合し、確保しない。
+struct RawNamespaceKind(NamespaceKind);
+
+impl<'de> Deserialize<'de> for RawNamespaceKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KindVisitor;
+
+        impl Visitor<'_> for KindVisitor {
+            type Value = RawNamespaceKind;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a namespace type string")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                let kind = match v {
+                    "pid" => NamespaceKind::Pid,
+                    "network" => NamespaceKind::Network,
+                    "mount" => NamespaceKind::Mount,
+                    "ipc" => NamespaceKind::Ipc,
+                    "uts" => NamespaceKind::Uts,
+                    "user" => NamespaceKind::User,
+                    "cgroup" => NamespaceKind::Cgroup,
+                    "time" => NamespaceKind::Time,
+                    _ => return Err(E::unknown_variant(v, NAMESPACE_TYPES)),
+                };
+                Ok(RawNamespaceKind(kind))
+            }
+        }
+
+        deserializer.deserialize_str(KindVisitor)
+    }
 }
 
 #[derive(Deserialize)]
@@ -688,8 +763,7 @@ impl OciMount {
 }
 
 /// `linux.namespaces[].type`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NamespaceKind {
     /// PID namespace。
@@ -825,13 +899,13 @@ fn checked_path(value: String, field: &'static str) -> Result<PathBuf, OciConfig
 }
 
 fn convert_mappings<L: Limit>(
-    list: Option<Bounded<RawIdMapping, L>>,
+    list: Option<Bounded<Obj<RawIdMapping>, L>>,
     field: &'static str,
 ) -> Result<Vec<OciIdMapping>, OciConfigError> {
     list.map(|b| b.0)
         .unwrap_or_default()
         .into_iter()
-        .map(|m| {
+        .map(|Obj(m)| {
             // 範囲の排他的終端（先頭 ID + size）が 2^32 以下であることを container 側・host 側の双方で
             // 検証する。u64 に広げて比較し、u32::MAX 単独の範囲（終端がちょうど 2^32）も受理する。
             let fits = |start: u32| u64::from(start) + u64::from(m.size) <= 1u64 << 32;
@@ -860,9 +934,9 @@ fn convert_process(raw: RawProcess) -> Result<OciProcess, OciConfigError> {
     Ok(OciProcess {
         terminal: raw.terminal,
         user: OciUser {
-            uid: raw.user.uid,
-            gid: raw.user.gid,
-            additional_gids: raw.user.additional_gids.map(|b| b.0).unwrap_or_default(),
+            uid: raw.user.0.uid,
+            gid: raw.user.0.gid,
+            additional_gids: raw.user.0.additional_gids.map(|b| b.0).unwrap_or_default(),
         },
         args,
         env: strings(raw.env),
@@ -886,24 +960,24 @@ impl RawConfig {
     fn validate(self) -> Result<OciConfig, OciConfigError> {
         let oci_version = OciVersion::parse(self.oci_version.0)?;
         let root = OciRoot {
-            path: checked_path(self.root.path.0, "root.path")?,
-            readonly: self.root.readonly,
+            path: checked_path(self.root.0.path.0, "root.path")?,
+            readonly: self.root.0.readonly,
         };
-        let process = self.process.map(convert_process).transpose()?;
+        let process = self.process.map(|Obj(p)| convert_process(p)).transpose()?;
         let mounts = self
             .mounts
             .map(|b| b.0)
             .unwrap_or_default()
             .into_iter()
-            .map(convert_mount)
+            .map(|Obj(m)| convert_mount(m))
             .collect::<Result<Vec<_>, _>>()?;
 
         let (mut namespaces, mut uid_mappings, mut gid_mappings) =
             (Vec::new(), Vec::new(), Vec::new());
-        if let Some(linux) = self.linux {
-            for ns in linux.namespaces.map(|b| b.0).unwrap_or_default() {
+        if let Some(Obj(linux)) = self.linux {
+            for Obj(ns) in linux.namespaces.map(|b| b.0).unwrap_or_default() {
                 namespaces.push(OciNamespace {
-                    kind: ns.kind,
+                    kind: ns.kind.0,
                     path: ns
                         .path
                         .map(|p| checked_path(p.0, "linux.namespaces[].path"))
@@ -938,8 +1012,8 @@ pub fn parse_config_bytes(bytes: &[u8]) -> Result<OciConfig, OciConfigError> {
     if bytes.len() > CONFIG_MAX_BYTES {
         return Err(OciConfigError::too_large());
     }
-    let raw: RawConfig =
-        serde_json::from_slice(bytes).map_err(|e| OciConfigError::from_json(&e))?;
+    let Obj(raw) = serde_json::from_slice::<Obj<RawConfig>>(bytes)
+        .map_err(|e| OciConfigError::from_json(&e))?;
     raw.validate()
 }
 

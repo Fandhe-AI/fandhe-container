@@ -84,7 +84,7 @@ make fio-baseline-ratio BASELINE=<results.json> CANDIDATE=<results.json>  # Dock
 | 結合試験の実行ステップ | 10 分 | `integration-test` ジョブの実行ステップ `timeout-minutes: 10` | TASK-86.2（#36）・TASK-87 |
 | ジョブ全体 | `integration-test` 30 分・`bench-regression` 15 分・`ci-complete` 5 分 | 各ジョブの `timeout-minutes` | 多層防御 |
 
-- この env を読んで `IoTimeout` を組み立てる消費側コードは `crates/io/tests/responsiveness.rs`（TASK-85.1・#119、TASK-85.2・#120。REPAIR-5）と `crates/core/tests/unshare_isolation.rs`（TASK-27.2・#134。Linux のみ、`-- --ignored` 時の子プロセス待ち）。範囲外・非数値の値は fail-closed で panic し、未設定時の既定は 10 秒。UDS 対応 OS（Linux / macOS）でのみコンパイルされ、Windows では当該経路は対象外。他の結合試験（スタブのトランスポートを使うもの）は env を読まず、固定の短いタイムアウトを使う
+- この env を読んで `IoTimeout` を組み立てる消費側コードは `crates/io/tests/responsiveness.rs`（TASK-85.1・#119、TASK-85.2・#120。REPAIR-5）。範囲外・非数値の値は fail-closed で panic し、未設定時の既定は 10 秒。`crates/core/tests/unshare_isolation.rs`（TASK-27.2・#134。Linux のみ、`-- --ignored` 時の子プロセス待ち）も同 env を読むが、`IoTimeout` ではなく `Duration` を組み立て、範囲外（1〜600 秒以外）・非数値の値は panic せず既定の 10 秒へフォールバックする。UDS 対応 OS（Linux / macOS）でのみコンパイルされ、Windows では当該経路は対象外。他の結合試験（スタブのトランスポートを使うもの）は env を読まず、固定の短いタイムアウトを使う
 - 新しく書く応答待ち処理は 5〜10 秒の範囲を既定とする。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5。詳細は下記「タイムアウト保護された結合試験・ベンチ回帰」節および「レビュー観点」のタイムアウト項目）
 - タイムアウト値を検出が弱まる方向（上限の撤廃・大幅な延長）へ変える差分は、根拠の記録がなければ「回帰検出の後退」として扱う（bench 閾値の既存記述と同じ扱い）
 - ハングプローブ（TASK-87.2・#41）の実施記録は下記「タイムアウト保護された結合試験・ベンチ回帰」節に記載済み

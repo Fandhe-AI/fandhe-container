@@ -17,6 +17,7 @@
 //! - 連続する `/`・`.` 要素・末尾の `/` は除き、`/a/b` 形式に正規化する。
 //! - 正規化後に要素が 0 個（`/` 等）は rootfs 全体を覆うため拒否する。
 //! - 相対パスは OCI Runtime Spec が `/` 起点として解釈することを許すため、`/` 起点に正規化して受理する。
+//!   先頭の `/` 付与で増えた正規化後の長さも `CONFIG_MAX_PATH_BYTES` 以下であることを検証する。
 //!
 //! # スコープ外（REPAIR-3）
 //!
@@ -27,7 +28,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use super::config::OciConfigError;
+use super::config::{CONFIG_MAX_PATH_BYTES, OciConfigError};
 
 const DEST_FIELD: &str = "mounts[].destination";
 const ROOT_FIELD: &str = "root.path";
@@ -56,7 +57,12 @@ impl MountDestination {
         if parts.is_empty() {
             return Err(OciConfigError::invalid(DEST_FIELD));
         }
-        Ok(Self(format!("/{}", parts.join("/"))))
+        let normalized = format!("/{}", parts.join("/"));
+        // 相対パスは先頭に `/` が付き 1 バイト増えるため、正規化後にも上限を再検証する。
+        if normalized.len() > CONFIG_MAX_PATH_BYTES {
+            return Err(OciConfigError::invalid(DEST_FIELD));
+        }
+        Ok(Self(normalized))
     }
 
     /// 正規化済みのコンテナ内パス（`/` 始まり）。
@@ -164,6 +170,17 @@ mod tests {
                 "config.json has an invalid value for `mounts[].destination`"
             );
         }
+    }
+
+    /// CORE-2: 正規化で `/` が付与されて上限を超える 4096 バイトの相対パスは拒否し、絶対 4096 バイトは受理する。
+    #[test]
+    fn core2_parse_rejects_over_limit_after_normalization() {
+        let rel = "a".repeat(CONFIG_MAX_PATH_BYTES);
+        let e = MountDestination::parse(&rel).expect_err("relative 4096 bytes");
+        assert_dest_err(&e);
+        let abs = format!("/{}", "a".repeat(CONFIG_MAX_PATH_BYTES - 1));
+        let d = MountDestination::parse(&abs).expect("absolute 4096 bytes");
+        assert_eq!(d.as_str().len(), CONFIG_MAX_PATH_BYTES);
     }
 
     /// CORE-2・OCI-4: 絶対パス destination でも rootfs 配下に解決され、ホストの `/etc` にならない。

@@ -237,6 +237,13 @@ impl StagePipeline {
     ///
     /// 最初の `Err` で打ち切る（後続段と `exec` は呼ばない）。フックの `Err` は `stage` を
     /// その段へ付け替えて返す。`exec` へは [`StageReport`] を渡す（証跡ではない）。
+    ///
+    /// # 呼び出し契約
+    ///
+    /// fork 後の子プロセスでのみ呼ぶこと。組み込みの `NoNewPrivs` 段（TASK-27.4.3）が
+    /// 呼び出しスレッドへ `PR_SET_NO_NEW_PRIVS` を立て、これは不可逆で解除できない。
+    /// 親プロセス（supervisor 等）から呼ぶと、そのスレッドが恒久的に強化される
+    /// （setuid 実行などが以後効かなくなる）。
     pub fn run_then<T>(
         mut self,
         exec: impl FnOnce(&StageReport) -> Result<T, ExecError>,

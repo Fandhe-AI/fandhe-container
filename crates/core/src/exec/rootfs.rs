@@ -95,7 +95,8 @@ pub struct PivotReport {
 /// 4. 固定した rootfs のマウントが shared propagation でなく、固定後に移動されていない
 /// 5. rootfs を自分自身へ再帰 bind mount してマウントポイントにする（`pivot_root` の new_root 要件）
 /// 6. bind 前に得た fd は下層の dentry を指すため、保持した親 fd から同じ名前で開き直し、bind で
-///    できた新しい mount top を得る（マウント ID が変わったことを確認する）
+///    できた新しい mount top を得る（マウント ID が変わったこと、開き直した fd が bind 対象と同じ
+///    `(st_dev, st_ino)` であること、新マウントの親が bind 元のマウントであることを確認する）
 /// 7. 新しい mount top 起点で `proc` を開き直し、procfs をマウントする
 pub fn prepare_rootfs(
     isolation: &MountIsolation,
@@ -141,6 +142,17 @@ fn prepare_rootfs_verified(rootfs: &Path) -> Result<PreparedRootfs, ExecError> {
     if !cfg!(test) {
         check_bind_created_mount(before_mnt_id, new_root_mnt_id)?;
     }
+    // 開き直しは名前の再解決のため、bind と開き直しの間に別プロセスが名前を差し替えて別の
+    // ディレクトリ（別のマウント）を置いていても着地し得る。マウント ID の変化だけでは同一性を
+    // 保証できないため、開き直した fd が bind 対象と同じ実体であること、および（本番では）
+    // 新しいマウントが bind 元のマウントの上に作られたものであることを確認する。
+    check_reopened_is_bind_of(
+        &pinned.dir,
+        &new_root,
+        before_mnt_id,
+        new_root_mnt_id,
+        rootfs,
+    )?;
 
     let proc_dir = open_proc_dir(new_root.as_fd(), rootfs)?;
     mount_proc_at_dir(&proc_dir, &proc_path, STAGE)?;
@@ -207,6 +219,63 @@ fn check_bind_created_mount(before: u64, after: u64) -> Result<(), ExecError> {
             IsolationStage::PrepareRootfs,
             "the rootfs bind mount did not create a new mount",
         ));
+    }
+    Ok(())
+}
+
+/// fd が指すディレクトリの `(st_dev, st_ino)`。`/proc/thread-self/fd/N` は fd の dentry へ解決される
+/// ため、bind mount の mount top は下層と同じ組を返す。
+fn fd_dev_ino(fd: &OwnedFd) -> std::io::Result<(u64, u64)> {
+    let m = std::fs::metadata(format!("/proc/thread-self/fd/{}", fd.as_raw_fd()))?;
+    Ok((m.dev(), m.ino()))
+}
+
+/// mountinfo から `mnt_id` のマウントの親マウント ID（第 2 フィールド）を取り出す。行が無い・
+/// 重複・書式不正は `None`（呼び出し側で fail-closed）。
+fn mount_parent_in(info: &str, mnt_id: u64) -> Option<u64> {
+    let mut found = None;
+    for line in info.lines() {
+        let mut f = line.split(' ');
+        let id: u64 = f.next()?.parse().ok()?;
+        let parent: u64 = f.next()?.parse().ok()?;
+        if id == mnt_id {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(parent);
+        }
+    }
+    found
+}
+
+/// bind 後に開き直した `reopened` が、bind 対象 `pinned`（bind 前に固定した fd）と同じ実体で、
+/// かつ今回の bind が作った新しいマウントであることを確認する（fail-closed。CORE-1）。
+///
+/// - `(st_dev, st_ino)` が `pinned` と一致する（別ディレクトリへの差し替えを検出する）
+/// - 本番ビルドでは、新しいマウントの親が bind 元のマウント（`before_mnt_id`）である
+///   （bind は元のディレクトリの上にマウントされるため。`cfg(test)` の dry-run では bind が
+///   作られないので省略する）
+fn check_reopened_is_bind_of(
+    pinned: &OwnedFd,
+    reopened: &OwnedFd,
+    before_mnt_id: u64,
+    new_mnt_id: u64,
+    rootfs: &Path,
+) -> Result<(), ExecError> {
+    const STAGE: IsolationStage = IsolationStage::PrepareRootfs;
+    let swapped =
+        || ExecError::from_violation_at(ViolationReason::RootfsMoved, Some(rootfs), STAGE);
+    let stat_err = |e: std::io::Error| ExecError::from_io(&e, STAGE, "stat(rootfs fd)");
+    let want = fd_dev_ino(pinned).map_err(stat_err)?;
+    let got = fd_dev_ino(reopened).map_err(stat_err)?;
+    if want != got {
+        return Err(swapped());
+    }
+    if !cfg!(test) {
+        let info = read_thread_mountinfo(STAGE)?;
+        if mount_parent_in(&info, new_mnt_id) != Some(before_mnt_id) {
+            return Err(swapped());
+        }
     }
     Ok(())
 }
@@ -645,6 +714,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// CORE-1: 開き直した fd が bind 対象と別ディレクトリなら拒否する（名前差し替えの TOCTOU）。
+    #[test]
+    fn core1_reopen_rejects_swapped_directory() {
+        let a = Tmp::new("reopen-a");
+        let b = Tmp::new("reopen-b");
+        let open = |p: &Path| {
+            sys::open_dir_path_nofollow(None, &CString::new(p.as_os_str().as_bytes()).unwrap())
+                .unwrap()
+        };
+        let fa = open(&a.0);
+        let fa2 = open(&a.0);
+        let fb = open(&b.0);
+        assert!(check_reopened_is_bind_of(&fa, &fa2, 1, 2, &a.0).is_ok());
+        let err = check_reopened_is_bind_of(&fa, &fb, 1, 2, &a.0).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::PrepareRootfs);
+    }
+
+    /// CORE-1: mountinfo から親マウント ID を取り出す。
+    #[test]
+    fn core1_mount_parent_in_reads_second_field() {
+        let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n11 10 0:5 / /proc rw - proc proc rw\n";
+        assert_eq!(mount_parent_in(info, 11), Some(10));
+        assert_eq!(mount_parent_in(info, 12), None);
+        assert_eq!(mount_parent_in("10 1 a\n10 2 b\n", 10), None);
     }
 
     /// CORE-1: bind 後にマウント ID が変わっていなければ拒否する。

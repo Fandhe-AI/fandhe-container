@@ -4,7 +4,8 @@
 # 役割: 実行のたびに mktemp -d 配下へ疑似 /proc を生成し（cmdline は NUL 区切りのバイナリ、
 # 読めない smaps は chmod 000 のため git では保持できない）、--proc-root で計測スクリプトへ
 # 渡して出力と終了コードを具体値で照合する。呼び出し元は Makefile の `idle-memory-selftest`。
-# 期待と異なる結果が 1 件でもあれば非ゼロで終了する（fail-closed）。
+# 期待と異なる結果が 1 件でもあれば非ゼロで終了する（fail-closed）。Linux・非 root 限定で、
+# 前提を満たさない環境では skip せず失敗する（ci.md「skip で CI を通さない」）。
 
 set -euo pipefail
 
@@ -18,6 +19,18 @@ root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
 
 failures=0
+
+# 前提確認: root では chmod 000 / 555 を無視して読み書きできるため、読み取り失敗系のケースが
+# 意図した経路を通らない。skip して成功扱いにしない（ci.md「skip で CI を通さない」）ため失敗させる。
+# 計測スクリプトは Linux 限定（mv -T・/dev/full を前提にする）のため、selftest も Linux 限定とする。
+if [ "$(id -u)" -eq 0 ]; then
+  echo "FAIL: selftest must not run as root (chmod-based unreadable cases would not be exercised)" >&2
+  exit 1
+fi
+if [ "$(uname -s)" != "Linux" ] || [ ! -c /dev/full ]; then
+  echo "FAIL: selftest requires Linux with /dev/full" >&2
+  exit 1
+fi
 
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
@@ -125,46 +138,46 @@ else
   fail "output-is-directory (actual=${actual})"
 fi
 
-# 書き込めない出力先ディレクトリ → 2（mktemp 失敗を終了コード 1〔--expect-zero 違反〕にしない）。
-# root は権限を無視して書けるため実行しない旨を明示する。
-if [ "$(id -u)" -eq 0 ]; then
-  echo "NOT RUN: output-dir-not-writable (running as root can write to mode 555 directories)"
+# 書き込めない出力先ディレクトリ → 2（mktemp 失敗を終了コード 1〔--expect-zero 違反〕にしない）
+rodir="${root}/rodir"
+mkdir -p "$rodir"
+chmod 555 "$rodir"
+actual=0
+bash "$target" --proc-root "$empty" --output "${rodir}/r.txt" >/dev/null 2>&1 || actual=$?
+if [ "$actual" -eq 2 ] && [ "$(find "$rodir" -mindepth 1 | wc -l)" -eq 0 ]; then
+  pass "output-dir-not-writable"
 else
-  rodir="${root}/rodir"
-  mkdir -p "$rodir"
-  chmod 555 "$rodir"
-  actual=0
-  bash "$target" --proc-root "$empty" --output "${rodir}/r.txt" >/dev/null 2>&1 || actual=$?
-  if [ "$actual" -eq 2 ] && [ "$(find "$rodir" -mindepth 1 | wc -l)" -eq 0 ]; then
-    pass "output-dir-not-writable"
-  else
-    fail "output-dir-not-writable (actual=${actual})"
-  fi
-  chmod 755 "$rodir"
+  fail "output-dir-not-writable (actual=${actual})"
 fi
+chmod 755 "$rodir"
 
 # 標準出力へ書けない（閉じている）→ 2（echo 失敗を終了コード 1 にしない）
 actual=0
 bash "$target" --proc-root "$empty" >&- 2>/dev/null || actual=$?
 if [ "$actual" -eq 2 ]; then pass "stdout-closed"; else fail "stdout-closed (actual=${actual})"; fi
-# 書き込みエラー（ENOSPC）→ 2。/dev/full は Linux にのみあるため、無い環境では実行しない旨を明示する
-if [ -c /dev/full ]; then
-  actual=0
-  bash "$target" --proc-root "$two" --format json >/dev/full 2>/dev/null || actual=$?
-  if [ "$actual" -eq 2 ]; then pass "stdout-write-error"; else fail "stdout-write-error (actual=${actual})"; fi
-else
-  echo "NOT RUN: stdout-write-error (/dev/full is not available)"
-fi
+# 書き込みエラー（ENOSPC）→ 2（/dev/full は冒頭の前提確認で存在を保証済み）
+actual=0
+bash "$target" --proc-root "$two" --format json >/dev/full 2>/dev/null || actual=$?
+if [ "$actual" -eq 2 ]; then pass "stdout-write-error"; else fail "stdout-write-error (actual=${actual})"; fi
 
-# 3. 読めない smaps_rollup → 3（root は chmod 000 でも読めるため実行しない旨を明示）
+# 標準エラー出力が閉じていても、err() の書込失敗で終了コード 1（--expect-zero 違反）にしない。
+# 引数エラー（2）・--expect-zero 違反（1）・成功（0）の本来の値を具体値で照合する
+# （計測失敗〔3〕の経路は後段の stderr-closed-measurement-failed で照合する）
+check_stderr_closed() {
+  local name="$1" want="$2" actual=0
+  shift 2
+  bash "$target" "$@" >/dev/null 2>&- || actual=$?
+  if [ "$actual" -eq "$want" ]; then pass "$name"; else fail "${name} (expected exit=${want}, actual=${actual})"; fi
+}
+check_stderr_closed "stderr-closed-invalid-argument" 2 --proc-root "$empty" --output "$outasdir"
+check_stderr_closed "stderr-closed-expect-zero-violated" 1 --proc-root "$two" --expect-zero
+check_stderr_closed "stderr-closed-success" 0 --proc-root "$empty" --expect-zero
+
+# 3. 読めない smaps_rollup → 3
 unreadable="${root}/unreadable"
 mkproc "$unreadable" 300 fandhe-container 10 10
 chmod 000 "${unreadable}/300/smaps_rollup"
-if [ "$(id -u)" -eq 0 ]; then
-  echo "NOT RUN: unreadable-smaps (running as root can read chmod 000 files)"
-else
-  check "unreadable-smaps" 3 "" --proc-root "$unreadable"
-fi
+check "unreadable-smaps" 3 "" --proc-root "$unreadable"
 
 # 3a. argv[0] の自己申告ではなく exe で識別する（CORE-7・SUP-1）
 spoof="${root}/spoof"
@@ -174,6 +187,7 @@ check "argv0-not-used-to-count" 0 "process_count=1" --proc-root "$spoof"
 spoof2="${root}/spoof2"
 mkproc "$spoof2" 310 fandhe-container 10 10 /usr/bin/bash
 check "spoofed-argv0-fails-closed" 3 "" --proc-root "$spoof2" --expect-zero
+check_stderr_closed "stderr-closed-measurement-failed" 3 --proc-root "$spoof2" --expect-zero
 check "spoofed-exe-pss" 0 "pss_kb=20" --proc-root "$spoof"
 check "deleted-exe-suffix" 0 "process_count=1" --proc-root "$(
   d="${root}/deleted"
@@ -203,25 +217,20 @@ check "unreadable-cmdline-exe-still-counted" 0 "process_count=1" --proc-root "$n
 # 3b1. 対象外 exe の cmdline / comm を開けない → 別名起動の疑いを確認できないため 3（CORE-7・SUP-1）。
 # 未初期化の argv0 を set -u で参照して終了コード 1（--expect-zero 違反と同じ値）で落ちないこと、
 # 直前の pid の argv0 を引き継いで対象外扱い（偽の 0 件）にしないことを具体値で照合する。
-# root は chmod 000 でも読めるため実行しない旨を明示する。
-if [ "$(id -u)" -eq 0 ]; then
-  echo "NOT RUN: unreadable-cmdline-* / unreadable-comm-* (running as root can read chmod 000 files)"
-else
-  nocmd_other="${root}/nocmd_other"
-  mkproc "$nocmd_other" 500 /usr/bin/bash 10 10
-  chmod 000 "${nocmd_other}/500/cmdline"
-  check "unreadable-cmdline-non-target-exe" 3 "" --proc-root "$nocmd_other" --expect-zero
-  # pid 500 は正常に読める対象外、pid 501 は cmdline を開けない対象外（glob 順で 500 → 501）。
-  nocmd_stale="${root}/nocmd_stale"
-  mkproc "$nocmd_stale" 500 /usr/bin/bash 10 10
-  mkproc "$nocmd_stale" 501 /usr/bin/other 10 10 /opt/bin/renamed-tool
-  chmod 000 "${nocmd_stale}/501/cmdline"
-  check "unreadable-cmdline-no-stale-argv0" 3 "" --proc-root "$nocmd_stale" --expect-zero
-  nocomm="${root}/nocomm"
-  mkproc "$nocomm" 510 /usr/bin/bash 10 10
-  chmod 000 "${nocomm}/510/comm"
-  check "unreadable-comm-non-target-exe" 3 "" --proc-root "$nocomm" --expect-zero
-fi
+nocmd_other="${root}/nocmd_other"
+mkproc "$nocmd_other" 500 /usr/bin/bash 10 10
+chmod 000 "${nocmd_other}/500/cmdline"
+check "unreadable-cmdline-non-target-exe" 3 "" --proc-root "$nocmd_other" --expect-zero
+# pid 500 は正常に読める対象外、pid 501 は cmdline を開けない対象外（glob 順で 500 → 501）。
+nocmd_stale="${root}/nocmd_stale"
+mkproc "$nocmd_stale" 500 /usr/bin/bash 10 10
+mkproc "$nocmd_stale" 501 /usr/bin/other 10 10 /opt/bin/renamed-tool
+chmod 000 "${nocmd_stale}/501/cmdline"
+check "unreadable-cmdline-no-stale-argv0" 3 "" --proc-root "$nocmd_stale" --expect-zero
+nocomm="${root}/nocomm"
+mkproc "$nocomm" 510 /usr/bin/bash 10 10
+chmod 000 "${nocomm}/510/comm"
+check "unreadable-comm-non-target-exe" 3 "" --proc-root "$nocomm" --expect-zero
 # 空の cmdline（EOF）は開けない場合と区別し、対象外として 0 件のまま成功する
 emptyargv="${root}/emptyargv"
 mkproc "$emptyargv" 520 x 10 10 /usr/bin/other
@@ -266,16 +275,12 @@ zombie_claim="${root}/zombie_claim"
 mkproc "$zombie_claim" 367 x 10 10 - fandhe-containe
 printf 'Name: fandhe-containe\nState:\tZ (zombie)\nPPid:\t1000\n' >"${zombie_claim}/367/status"
 check "zombie-claims-name-fails-closed" 3 "" --proc-root "$zombie_claim" --expect-zero
-# comm を開けないゾンビも 3（root は chmod 000 でも読めるため実行しない旨を明示する）
-if [ "$(id -u)" -eq 0 ]; then
-  echo "NOT RUN: zombie-unreadable-comm (running as root can read chmod 000 files)"
-else
-  zombie_nocomm="${root}/zombie_nocomm"
-  mkproc "$zombie_nocomm" 368 x 10 10 - defunct-tool
-  printf 'Name: defunct-tool\nState:\tZ (zombie)\nPPid:\t1000\n' >"${zombie_nocomm}/368/status"
-  chmod 000 "${zombie_nocomm}/368/comm"
-  check "zombie-unreadable-comm" 3 "" --proc-root "$zombie_nocomm" --expect-zero
-fi
+# comm を開けないゾンビも 3
+zombie_nocomm="${root}/zombie_nocomm"
+mkproc "$zombie_nocomm" 368 x 10 10 - defunct-tool
+printf 'Name: defunct-tool\nState:\tZ (zombie)\nPPid:\t1000\n' >"${zombie_nocomm}/368/status"
+chmod 000 "${zombie_nocomm}/368/comm"
+check "zombie-unreadable-comm" 3 "" --proc-root "$zombie_nocomm" --expect-zero
 # 実行中（State: S）で exe を読めないものは従来どおり 3（ゾンビ扱いで対象外にしない）
 running_noexe="${root}/running_noexe"
 mkproc "$running_noexe" 369 x 10 10 - defunct-tool
@@ -295,6 +300,58 @@ check "unreadable-exe-empty-cmdline-not-kthread" 3 "" --proc-root "$fakeargv" --
 bad="${root}/bad"
 mkproc "$bad" 400 fandhe-container abc 10
 check "non-numeric-pss" 3 "" --proc-root "$bad"
+# 先頭 0 付き（09 は bash 算術で 8 進エラー、010 は 8 と誤読）・13 桁超（合計の桁あふれ）→ 3
+for v in 09 010 12345678901234; do
+  badnum="${root}/badnum_${v}"
+  mkproc "$badnum" 410 fandhe-container "$v" 10
+  check "invalid-number-pss-${v}" 3 "" --proc-root "$badnum"
+  badnum_rss="${root}/badnum_rss_${v}"
+  mkproc "$badnum_rss" 411 fandhe-container 10 "$v"
+  check "invalid-number-rss-${v}" 3 "" --proc-root "$badnum_rss"
+done
+# 0 と 13 桁ちょうどは受け付ける（pss_kb=0 + 9999999999999）
+okzero="${root}/okzero"
+mkproc "$okzero" 420 fandhe-container 0 5
+mkproc "$okzero" 421 fandhe-container-supervisor 9999999999999 5
+check "zero-and-13-digits-accepted" 0 "pss_kb=9999999999999" --proc-root "$okzero"
+# 先頭 0 付きの pid ディレクトリは pid として扱わない（/proc には存在しない形）
+mkproc "$okzero" 0422 fandhe-container 7 7
+check "zero-padded-pid-ignored" 0 "process_count=2" --proc-root "$okzero"
+
+# 4a. 外部由来の文字列（exe のリンク先・argv 等）を stderr へ出す際は、制御文字を ? に置換して
+# 端末へのエスケープシーケンス注入を防ぐ（SEC 観点）。ESC（0x1b）が出力に残らないことを照合する
+esc_root="${root}/esc"
+mkdir -p "${esc_root}/430"
+ln -s "/opt/bin/evil"$'\033'"[2Jtool" "${esc_root}/430/exe"
+printf 'fandhe-container\0' >"${esc_root}/430/cmdline"
+printf 'x\n' >"${esc_root}/430/comm"
+printf 'Pss: 1 kB\n' >"${esc_root}/430/smaps_rollup"
+printf 'PPid:\t1000\nVmRSS: 1 kB\n' >"${esc_root}/430/status"
+esc_dir="${root}/esc_dir"
+mkdir -p "${esc_dir}/431"
+ln -s "/opt/b"$'\033'"]0;x"$'\007'"in/fandhe-container" "${esc_dir}/431/exe"
+printf 'fandhe-container\0' >"${esc_dir}/431/cmdline"
+printf 'x\n' >"${esc_dir}/431/comm"
+printf 'Pss: 1 kB\n' >"${esc_dir}/431/smaps_rollup"
+printf 'PPid:\t1000\nVmRSS: 1 kB\n' >"${esc_dir}/431/status"
+check_sanitized() {
+  local name="$1" want="$2" needle="$3" errout actual=0
+  shift 3
+  errout="$(bash "$target" "$@" 2>&1 >/dev/null)" || actual=$?
+  if [ "$actual" -ne "$want" ]; then
+    fail "${name} (expected exit=${want}, actual=${actual})"
+  elif [[ "$errout" == *[$'\001'-$'\037'$'\177']* ]]; then
+    fail "${name} (control character in stderr)"
+  elif ! grep -qF -- "$needle" <<<"$errout"; then
+    fail "${name} (missing stderr: ${needle})"
+  else
+    pass "$name"
+  fi
+}
+check_sanitized "sanitized-exe-basename" 3 "exe basename is 'evil?[2Jtool'" --proc-root "$esc_root"
+check_sanitized "sanitized-exe-target" 3 "outside --expected-dir: /opt/b?]0;x?in/fandhe-container" \
+  --proc-root "$esc_dir" --expected-dir /opt/bin
+check_sanitized "sanitized-unknown-argument" 2 "unknown argument: --x?[31m" "--x"$'\033'"[31m"
 
 # 5. 引数エラー・非 Linux → 2
 check "missing-proc-root" 2 "" --proc-root "${root}/nonexistent"

@@ -116,11 +116,15 @@ mod linux {
     const LINE_CAP: u64 = 256;
     const STDERR_CAP: u64 = 16 * 1024;
 
+    /// 環境変数で受け付ける上限（秒）。start の全体上限 `DEFAULT_HELPER_TIMEOUT * 2 + t * 2` が
+    /// `StartTimeouts::new` の 600 秒上限を超えないよう 295 秒で打ち切る。
+    const MAX_TIMEOUT_SECS: u64 = 295;
+
     fn timeout() -> Duration {
         let secs = std::env::var("FANDHE_CONTAINER_TEST_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .filter(|s| (1..=600).contains(s))
+            .filter(|s| (1..=MAX_TIMEOUT_SECS).contains(s))
             .unwrap_or(10);
         Duration::from_secs(secs)
     }
@@ -131,7 +135,8 @@ mod linux {
                 .expect("read status")
                 .lines()
                 .find(|l| l.starts_with(key))
-                .and_then(|l| l.split_whitespace().nth(1))
+                // 第 1 欄は real ID、第 2 欄が effective ID（兄弟テスト・plan_rootless_subordinate と同じ）。
+                .and_then(|l| l.split_whitespace().nth(2))
                 .and_then(|v| v.parse().ok())
                 .expect("parse id")
         };

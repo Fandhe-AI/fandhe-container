@@ -35,7 +35,8 @@
 //! - **標準入出力は `/dev/null` へ置換する**: 呼び出し元の fd 0〜2 の実体は渡さない。`/dev/null` が
 //!   無い rootfs は拒否する。端末・パイプの受け渡しは TASK-29/30 の範囲
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
-//!   間にパスが差し替わる TOCTOU を防ぐ。読み取り権限のない実行専用バイナリは開けず拒否される
+//!   間にパスが差し替わる TOCTOU を防ぐ。読み取り権限のない実行専用バイナリは開けず拒否される。
+//!   fd は 3 以上に置く
 //! - **fork の健全性は `sys::fork_single_threaded` が強制する**: 呼び出し元が `Threads: 1`
 //!   でなければ fork せず `FailedPrecondition` で返す。子はクロージャの結果で必ず `_exit(2)` し、
 //!   呼び出し元のスタックへ戻らない
@@ -515,22 +516,15 @@ fn open_entrypoint(entry: &Entrypoint) -> Result<std::fs::File, ExecError> {
 
 /// fd が 0〜2 なら 3 以上へ複製して元を閉じる（3 以上ならそのまま返す）。
 ///
-/// 複製は std の `try_clone`（`F_DUPFD_CLOEXEC`・下限 3）。複製後も 2 以下なら fail-closed で拒否する。
+/// 複製は `sys::dup_fd_at_least(fd, 3)`（`F_DUPFD_CLOEXEC` に下限 3 を明示。カーネルが 3 以上を
+/// 保証するため、標準 fd が複数閉じていても 0〜2 には戻らない）。
 fn keep_above_stdio(fd: OwnedFd) -> Result<OwnedFd, ExecError> {
     use std::os::fd::AsRawFd as _;
     if fd.as_raw_fd() > 2 {
         return Ok(fd);
     }
-    let moved = fd
-        .try_clone()
-        .map_err(|e| ExecError::from_io(&e, IsolationStage::Exec, "dup(entrypoint)"))?;
-    if moved.as_raw_fd() <= 2 {
-        return Err(ExecError::new(
-            ErrorCode::FailedPrecondition,
-            IsolationStage::Exec,
-            "cannot move the entrypoint fd above the standard streams",
-        ));
-    }
+    let moved = sys::dup_fd_at_least(fd.as_fd(), 3)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Exec, "fcntl(F_DUPFD_CLOEXEC)"))?;
     drop(fd);
     Ok(moved)
 }

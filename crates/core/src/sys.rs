@@ -114,6 +114,8 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `F_SETFD` と `FD_CLOEXEC`。
     pub const F_SETFD: i32 = 2;
     pub const FD_CLOEXEC: i32 = 1;
+    // include/uapi/linux/fcntl.h の `F_DUPFD_CLOEXEC`（`F_LINUX_SPECIFIC_BASE` 1024 + 6）。
+    pub const F_DUPFD_CLOEXEC: i32 = 1030;
     // include/uapi/asm-generic/errno-base.h・errno.h（x86_64 は上書きしない）。
     pub const EPERM: i32 = 1;
     pub const ENOENT: i32 = 2;
@@ -180,6 +182,8 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `F_SETFD` と `FD_CLOEXEC`。
     pub const F_SETFD: i32 = 2;
     pub const FD_CLOEXEC: i32 = 1;
+    // include/uapi/linux/fcntl.h の `F_DUPFD_CLOEXEC`（`F_LINUX_SPECIFIC_BASE` 1024 + 6）。
+    pub const F_DUPFD_CLOEXEC: i32 = 1030;
     // include/uapi/asm-generic/errno-base.h・errno.h（arm64 は上書きしない）。
     pub const EPERM: i32 = 1;
     pub const ENOENT: i32 = 2;
@@ -232,6 +236,7 @@ mod consts {
     pub const AT_EMPTY_PATH: i64 = 0;
     pub const F_SETFD: i32 = 0;
     pub const FD_CLOEXEC: i32 = 0;
+    pub const F_DUPFD_CLOEXEC: i32 = 0;
     pub const EPERM: i32 = -1;
     pub const ENOENT: i32 = -2;
     pub const EACCES: i32 = -3;
@@ -613,6 +618,28 @@ pub(crate) fn set_cloexec(fd: BorrowedFd<'_>, on: bool) -> Result<(), SysError> 
     // SAFETY: `fd` は生存中の `BorrowedFd`。F_SETFD は整数引数のみを取りポインタを渡さない。
     let rc = unsafe { fcntl(fd.as_raw_fd(), consts::F_SETFD, arg) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `fd` を `min` 以上の最小の空き番号へ複製する（`fcntl(F_DUPFD_CLOEXEC, min)`。複製は close-on-exec）。
+///
+/// エントリポイントの fd を標準入出力の番号（0〜2）の外へ置くために使う（`crate::exec` の
+/// `keep_above_stdio`）。std の `try_clone` の下限は文書化された保証ではないため、下限を明示して呼ぶ。
+/// `min` が負なら `EINVAL`。
+pub(crate) fn dup_fd_at_least(fd: BorrowedFd<'_>, min: i32) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    if min < 0 {
+        return Err(SysError::Os(EINVAL));
+    }
+    // SAFETY: `fd` は生存中の `BorrowedFd`。F_DUPFD_CLOEXEC は整数引数（下限）のみを取りポインタを
+    // 渡さない。成功時の戻り値は新規 fd で、直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let new = unsafe { fcntl(fd.as_raw_fd(), consts::F_DUPFD_CLOEXEC, min) };
+    if new < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `new` は上で成功した fcntl が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(new) })
 }
 
 /// 絶対パス `path` を読み書きで開く（`O_RDWR|O_CLOEXEC|O_NONBLOCK`。最終要素の symlink は辿る）。

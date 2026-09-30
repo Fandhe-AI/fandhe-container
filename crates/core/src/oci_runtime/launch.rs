@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::config::NamespaceKind;
-use crate::traits::{ContainerId, ErrorCode, TraitError};
+use crate::traits::{ContainerId, ErrorCode, Signal, TraitError};
 
 /// [`StartTimeouts`] の各上限が取れる最大値（無期限相当の値を型で拒否する。REPAIR-5）。
 ///
@@ -390,6 +390,19 @@ pub trait LaunchedProcess: Send {
     /// 実装が `timeout` を守ることに依存せず、呼び出し境界でも同じ上限を強制する。Linux の子プロセスは
     /// `ContainerChildProcess`（`exec::ContainerChild::kill_and_reap`）で実装できる。
     fn terminate(&self, timeout: Duration) -> Result<(), TraitError>;
+
+    /// プロセスへシグナルを 1 つ送る。終了は待たない（`kill` 用。`oci_runtime::kill` の `ProcessSignaler`
+    /// の本番実装が、保持する起動ハンドルへ委ねる。CORE-2・OCI-6・TASK-30.1）。
+    ///
+    /// 回収済みのプロセスへは送らず `FailedPrecondition` を返すこと（pid 再利用対策。SEC-1）。待ちは
+    /// `timeout` まで（REPAIR-5）。既定実装は送信手段を持たないため fail-closed で `Unimplemented` を返す。
+    fn signal(&self, signal: Signal, timeout: Duration) -> Result<(), TraitError> {
+        let _ = (signal, timeout);
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "the launched process cannot be signaled",
+        ))
+    }
 }
 
 /// `exec::ContainerChild`（fork した子）を [`LaunchedProcess`] として扱うアダプタ（Linux。CORE-1・REPAIR-5）。
@@ -448,6 +461,29 @@ impl LaunchedProcess for ContainerChildProcess {
             .kill_and_reap(timeout)
             .map(|_| ())
             .map_err(|e| TraitError::new(e.code, "failed to terminate the container process"))
+    }
+
+    /// `ContainerChild::send_signal`（回収状態のロック下で送信）へ委ねる。回収済み・既に消えていた
+    /// 場合は送らずに `FailedPrecondition` を返す。送信は即時で待たないため `timeout` は使わない。
+    fn signal(&self, signal: Signal, _timeout: Duration) -> Result<(), TraitError> {
+        use crate::exec::SignalDelivery;
+        let number = std::num::NonZeroU8::new(signal.as_u8()).ok_or_else(|| {
+            TraitError::new(
+                ErrorCode::InvalidArgument,
+                "signal number must be in 1..=64",
+            )
+        })?;
+        match self.child.send_signal(number) {
+            Ok(SignalDelivery::Delivered) => Ok(()),
+            Ok(_) => Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the container process has already exited",
+            )),
+            Err(e) => Err(TraitError::new(
+                e.code,
+                "failed to signal the container process",
+            )),
+        }
     }
 }
 
@@ -530,6 +566,33 @@ mod tests {
                 Duration::from_secs(10)
             )
         );
+    }
+
+    /// CORE-2・OCI-6（TASK-30.1）: `ContainerChildProcess::signal` は実プロセスへ SIGKILL を送り、
+    /// 回収後の再送は `FailedPrecondition` になる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_container_child_process_signal_delivers_and_reports_exited() {
+        #[allow(clippy::zombie_processes)]
+        let pid = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn")
+            .id();
+        let process =
+            ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
+                .expect("wrap");
+        let t = Duration::from_secs(5);
+        process.signal(Signal::SIGKILL, t).expect("signal");
+        assert_eq!(
+            process.wait(t).expect("wait"),
+            Some(ProcessExit::Signaled(9))
+        );
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        let err = process.signal(Signal::SIGKILL, t).expect_err("exited");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), "the container process has already exited");
     }
 
     /// テスト用の一意なディレクトリ（終了時に削除）。

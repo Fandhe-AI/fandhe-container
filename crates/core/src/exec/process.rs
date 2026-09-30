@@ -677,6 +677,18 @@ enum ReapState {
     Reaped { exit: ChildExit, killed: bool },
 }
 
+/// [`ContainerChild::send_signal`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SignalDelivery {
+    /// 未回収の子へシグナルを送った（終了は待たない）。
+    Delivered,
+    /// 既に回収済みのため送らなかった（記録済みの終了状態）。
+    AlreadyExited(ChildExit),
+    /// 子が既に存在しなかった（`ESRCH`。契約外の回収者による回収）ため送らなかった。
+    Gone,
+}
+
 /// `Mutex` の中身。`kills_sent` は実際に送った `SIGKILL` の回数（高々 1。テストの照合用）。
 #[derive(Debug)]
 struct ReapCell {
@@ -814,6 +826,26 @@ impl ContainerChild {
                 IsolationStage::Wait,
                 format!("the container process was not reaped within {timeout:?} after SIGKILL"),
             )),
+        }
+    }
+
+    /// 未回収の子へシグナルを 1 つ送る（`oci_runtime::kill` の `ContainerChildProcess::signal` から呼ばれる。
+    /// CORE-2・OCI-6・TASK-30.1）。
+    ///
+    /// 回収状態のロック下で状態を確認してから `kill` するため、回収済みの pid（別プロセスへ再利用され得る）
+    /// には送らない（[`Self::kill_and_reap`] と同じ排他。CORE-1）。回収済みなら送らずに
+    /// [`SignalDelivery::AlreadyExited`]、契約外の回収者に回収されていた（`ESRCH`）場合も送らずに
+    /// 終了済み扱いで [`SignalDelivery::Gone`] を返す。回収状態は変えない（終了を待たない。
+    /// 回収は [`Self::wait_timeout`] 等の責務）。
+    pub fn send_signal(&self, number: std::num::NonZeroU8) -> Result<SignalDelivery, ExecError> {
+        let cell = self.lock();
+        if let ReapState::Reaped { exit, .. } = cell.state {
+            return Ok(SignalDelivery::AlreadyExited(exit));
+        }
+        match sys::kill_pid(self.pid, Signal::Number(number)) {
+            Ok(()) => Ok(SignalDelivery::Delivered),
+            Err(SysError::Os(e)) if e == sys::ESRCH => Ok(SignalDelivery::Gone),
+            Err(e) => Err(ExecError::from_sys(e, IsolationStage::Wait, "kill(signal)")),
         }
     }
 
@@ -1394,6 +1426,48 @@ mod tests {
             handle.wait_for_exit(Duration::from_secs(10)).unwrap(),
             Some(ChildExit::Exited(6))
         );
+        assert_eq!(reap_snapshot(&handle).1, 0);
+    }
+
+    /// CORE-2・OCI-6（TASK-30.1）: 未回収の子へ SIGTERM を送ると `Delivered`、子は `Signaled(15)` で回収され、
+    /// 回収後の送信は `kill` せず `AlreadyExited` を返す。
+    #[test]
+    fn core2_send_signal_delivers_then_reports_already_exited() {
+        let handle = ContainerChild::new(spawn_sh("exec sleep 30"));
+        let term = std::num::NonZeroU8::new(15).unwrap();
+        assert_eq!(handle.send_signal(term).unwrap(), SignalDelivery::Delivered);
+        assert_eq!(
+            handle.wait_timeout(Duration::from_secs(10)).unwrap(),
+            ChildExit::Signaled(15)
+        );
+        assert_eq!(
+            handle.send_signal(term).unwrap(),
+            SignalDelivery::AlreadyExited(ChildExit::Signaled(15))
+        );
+    }
+
+    /// CORE-2・CORE-1（TASK-30.1）: 回収済みのハンドルの pid が別プロセスに再利用されていても、
+    /// `send_signal` はそのプロセスへ送らない。
+    #[test]
+    fn core2_send_signal_never_signals_reused_pid() {
+        let mut unrelated = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let handle = ContainerChild::new(unrelated.id());
+        handle.lock().state = ReapState::Reaped {
+            exit: ChildExit::Exited(3),
+            killed: false,
+        };
+        let result = handle.send_signal(std::num::NonZeroU8::new(9).unwrap());
+        let alive = unrelated.try_wait().unwrap();
+        kill_and_reap(&mut unrelated);
+        assert_eq!(
+            result.unwrap(),
+            SignalDelivery::AlreadyExited(ChildExit::Exited(3))
+        );
+        assert_eq!(alive, None, "the unrelated process must not be signaled");
         assert_eq!(reap_snapshot(&handle).1, 0);
     }
 

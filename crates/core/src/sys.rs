@@ -12,6 +12,8 @@
 //! を呼ぶために使う。さらに fork / exec 段（CORE-1・TASK-27.4.1・#831）の `crate::exec::spawn_container`・
 //! `crate::exec::exec_entrypoint`・`crate::exec::ContainerChild` が、`fork(2)`・`_exit(2)`・`execveat(2)`・
 //! `waitpid(2)`・`kill(2)`・`signal(2)` と `close_range(2)`（`syscall(2)` 経由）を呼ぶために使う。
+//! `kill(2)` は `crate::oci_runtime::kill`（CORE-2・OCI-6・TASK-30.1）が `ContainerChild::send_signal`
+//! 経由で任意番号（1..=64 検証済み）を送る経路でも使う。
 //! さらに固定ステージ `crate::exec::no_new_privs`（CORE-1・TASK-27.4.3・#833）が `prctl(2)` を呼ぶ。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。std だけでは提供されない
 //! syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
@@ -872,6 +874,11 @@ const SIG_ERR: usize = usize::MAX;
 pub(crate) enum Signal {
     /// `SIGKILL`。
     Kill,
+    /// 呼び出し側が 1..=64 で検証済みの任意のシグナル番号（`oci_runtime::kill`。TASK-30.1）。
+    ///
+    /// 番号体系は x86_64 / aarch64 共通の asm-generic（`traits::Signal` と同じ）を前提とする。
+    /// `kill_pid` でも範囲を再検査する（二重の防御）。
+    Number(std::num::NonZeroU8),
 }
 
 /// `pid` を `waitpid` / `kill` に渡せる正の `i32` に変換する。0（自プロセスグループ）と
@@ -914,9 +921,13 @@ pub(crate) fn kill_pid(pid: u32, sig: Signal) -> Result<(), SysError> {
     let raw = positive_pid(pid)?;
     let number = match sig {
         Signal::Kill => consts::SIGKILL,
+        // 1..=64 以外（0 は存在確認、65 以上は未定義）は送らずに拒否する。
+        Signal::Number(n) if (1..=64).contains(&n.get()) => i32::from(n.get()),
+        Signal::Number(_) => return Err(SysError::Os(EINVAL)),
     };
     // SAFETY: 引数は整数のみでポインタを取らない。`raw` は正であることを確認済みで、
-    // プロセスグループ・全プロセス宛て（0・負値）にならない。
+    // プロセスグループ・全プロセス宛て（0・負値）にならない。`number` は `SIGKILL` 定数か、
+    // 1..=64 を検証済みの番号だけである。
     let rc = unsafe { kill(raw, number) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
@@ -1147,6 +1158,39 @@ mod tests {
         assert_eq!(positive_pid(u32::MAX), Err(SysError::Os(EINVAL)));
         assert_eq!(wait_pid_nohang(0), Err(SysError::Os(EINVAL)));
         assert_eq!(kill_pid(u32::MAX, Signal::Kill), Err(SysError::Os(EINVAL)));
+    }
+
+    /// CORE-2（TASK-30.1）: 範囲外のシグナル番号は `kill` を呼ばずに `EINVAL` で拒否する。
+    #[test]
+    fn core2_kill_pid_rejects_out_of_range_signal() {
+        let pid = std::process::id();
+        let n65 = Signal::Number(std::num::NonZeroU8::new(65).unwrap());
+        assert_eq!(kill_pid(pid, n65), Err(SysError::Os(EINVAL)));
+        let n255 = Signal::Number(std::num::NonZeroU8::MAX);
+        assert_eq!(kill_pid(pid, n255), Err(SysError::Os(EINVAL)));
+    }
+
+    /// CORE-2（TASK-30.1）: 任意番号（SIGTERM=15）を子へ送ると、子が `Signaled(15)` で終了する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_kill_pid_sends_sigterm_to_child() {
+        // 子は下で `wait_pid_nohang` が回収する（`Child` の wait は使わない）。
+        #[allow(clippy::zombie_processes)]
+        let pid = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+            .id();
+        kill_pid(pid, Signal::Number(std::num::NonZeroU8::new(15).unwrap())).unwrap();
+        let status = loop {
+            match wait_pid_nohang(pid).unwrap() {
+                Some(s) => break s,
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        // 終了ステータスの下位 7 ビットが終了シグナル。
+        assert_eq!(status & 0x7f, 15);
     }
 
     /// テスト用の一時ディレクトリ（`chmod` で絞ったディレクトリを戻してから削除する）。

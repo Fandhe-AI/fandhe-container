@@ -173,13 +173,7 @@ impl FileStateStore {
     /// （Linux で）他ユーザー所有・group / other 書き込み可のルートは `PermissionDenied`。
     pub fn open(root: StateRoot) -> Result<Self, TraitError> {
         let path = root.0;
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        match builder.create(&path) {
+        match private_dir_builder().create(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -191,23 +185,48 @@ impl FileStateStore {
             Err(_) => return Err(internal("failed to create the state root")),
         }
         verify_root(&path)?;
+        // 親パスの symlink を一度だけ解決して固定し、以降はその正規パスで操作する。
+        // 祖先ディレクトリの書き込み権限も検査する（親すり替え対策。詳細は verify_ancestors）。
+        let root = canonical_root(&path)?;
+        verify_ancestors(&root)?;
         Ok(Self {
-            root: path,
+            root,
             process_lock: Mutex::new(()),
         })
     }
 
     fn lock(&self) -> Result<StoreGuard<'_>, TraitError> {
-        let process = self.process_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = Instant::now() + STATE_LOCK_TIMEOUT;
+        // プロセス内ミューテックスも有限時間で打ち切る（REPAIR-5）。毒化は状態がファイル側に
+        // あるため無視して続行する。
+        let process = loop {
+            match self.process_lock.try_lock() {
+                Ok(g) => break g,
+                Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(err(
+                            ErrorCode::Timeout,
+                            "timed out waiting for the state lock",
+                        ));
+                    }
+                    std::thread::sleep(LOCK_RETRY_INTERVAL);
+                }
+            }
+        };
         let path = self.root.join(LOCK_FILE);
         reject_symlink(&path)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
+        let mut opts = OpenOptions::new();
+        opts.create(true).truncate(false).write(true);
+        // state.json・@revision と同じ 0600 で作る（他ユーザーによるロック占有 DoS の防止）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
             .open(&path)
             .map_err(|_| internal("failed to open the state lock file"))?;
-        let deadline = Instant::now() + STATE_LOCK_TIMEOUT;
         loop {
             match file.try_lock() {
                 Ok(()) => {
@@ -343,13 +362,7 @@ impl StateStore for FileStateStore {
             ));
         }
         let dir = self.record_dir(req.id());
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        match builder.create(&dir) {
+        match private_dir_builder().create(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 // 残骸ディレクトリの再利用。symlink などは read_record が拒否済みだが、
@@ -480,6 +493,69 @@ impl StateStore for FileStateStore {
     }
 }
 
+/// 0700（unix）でディレクトリを作る builder。`let mut` が OS ごとに不要になる警告を避けるため
+/// 関数に切り出している。
+fn private_dir_builder() -> fs::DirBuilder {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+}
+
+/// 最終要素を除く親パスを正規化して結合し直す（最終要素は symlink でないこと検査済み）。
+fn canonical_root(path: &Path) -> Result<PathBuf, TraitError> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(err(
+            ErrorCode::InvalidArgument,
+            "state root must have a parent directory",
+        ));
+    };
+    let parent = fs::canonicalize(parent)
+        .map_err(|_| internal("failed to resolve the state root parent"))?;
+    Ok(parent.join(name))
+}
+
+/// 祖先ディレクトリが第三者にすり替えられないか検査する（unix）。
+///
+/// 各祖先は、group / other 書き込み不可（sticky ビット付きは許可。`/tmp` 等）であり、
+/// （Linux では）root か現在のユーザーの所有でなければ `PermissionDenied`。
+///
+/// 制約（未実装。REPAIR-3）: 検査と使用の間の TOCTOU を閉じるには、ディレクトリ fd を基点に
+/// `openat` 系で操作する必要がある。std には無く `sys` の unsafe ラッパーが要るため、
+/// 別タスクで扱う。現状は「正規パスの固定＋祖先の権限検査」による緩和にとどまる。
+/// Windows の ACL 検査も未実装。
+fn verify_ancestors(root: &Path) -> Result<(), TraitError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for ancestor in root.ancestors().skip(1) {
+            let meta = fs::metadata(ancestor)
+                .map_err(|_| internal("failed to inspect an ancestor of the state root"))?;
+            let mode = meta.mode();
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+                return Err(err(
+                    ErrorCode::PermissionDenied,
+                    "ancestor of the state root must not be writable by group or others",
+                ));
+            }
+            #[cfg(target_os = "linux")]
+            if meta.uid() != 0 && meta.uid() != crate::sys::effective_uid() {
+                return Err(err(
+                    ErrorCode::PermissionDenied,
+                    "ancestor of the state root must be owned by root or the current user",
+                ));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+    Ok(())
+}
+
 /// 状態ルートが信頼できるか検査する（symlink・種別・所有者・書き込みビット）。
 fn verify_root(path: &Path) -> Result<(), TraitError> {
     let meta =
@@ -606,6 +682,9 @@ impl StateDto {
     /// 公開コンストラクタで組み直し、矛盾があれば `Internal`（壊れた値を表現させない）。
     fn into_record(self, dir_id: &ContainerId) -> Result<StateRecord, TraitError> {
         let corrupted = || internal("state file is inconsistent");
+        if self.oci_version != OCI_VERSION {
+            return Err(internal("state file has an unsupported ociVersion"));
+        }
         let id = ContainerId::new(self.id).map_err(|_| corrupted())?;
         if id != *dir_id {
             return Err(corrupted());
@@ -896,6 +975,60 @@ mod tests {
             r#"{"ociVersion":"1.2.0","id":"z","status":"created","bundle":"/b","revision":0}"#;
         fs::write(&file, other_id).unwrap();
         assert_eq!(code(get()), "INTERNAL");
+    }
+
+    #[test]
+    fn oci5_unsupported_oci_version_returns_internal() {
+        let t = TmpDir::new("ociver");
+        let store = t.open();
+        create(&store, "a");
+        let file = t.path().join("a").join("state.json");
+        let bad =
+            r#"{"ociVersion":"0.9.0","id":"a","status":"created","bundle":"/b","revision":0}"#;
+        fs::write(&file, bad).unwrap();
+        let err = store.get(&GetStateRequest::new(cid("a"))).unwrap_err();
+        assert_eq!(err.code().as_str(), "INTERNAL");
+        assert_eq!(err.message(), "state file has an unsupported ociVersion");
+    }
+
+    /// REPAIR-5: プロセス内ミューテックスの待機も有限時間で打ち切る。
+    #[test]
+    fn oci5_process_lock_wait_times_out() {
+        let t = TmpDir::new("mutex-timeout");
+        let store = t.open();
+        let _held = store.process_lock.lock().unwrap();
+        let started = Instant::now();
+        let r = store.get(&GetStateRequest::new(cid("a")));
+        assert_eq!(code(r), "TIMEOUT");
+        assert!(started.elapsed() < STATE_LOCK_TIMEOUT + Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oci5_lock_file_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TmpDir::new("lockmode");
+        let store = t.open();
+        create(&store, "a");
+        let mode = fs::metadata(t.path().join(LOCK_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// 親ディレクトリが group / other 書き込み可（sticky なし）なら拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci5_writable_ancestor_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TmpDir::new("ancestor");
+        let parent = t.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o770)).unwrap();
+        let root = parent.join("root");
+        let r = FileStateStore::open(StateRoot::from_override(root).unwrap());
+        assert_eq!(code(r), "PERMISSION_DENIED");
     }
 
     #[test]

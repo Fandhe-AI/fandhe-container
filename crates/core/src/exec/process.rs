@@ -1310,6 +1310,48 @@ mod tests {
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
+    /// REPAIR-5・CORE-1（TASK-29.3）: `kill_and_reap` は未回収の子へ `SIGKILL` を 1 回だけ送って上限内に
+    /// 回収し、回収済みのハンドルへの再呼び出しでは `kill` しない（回収状態の排他を共有する）。
+    #[test]
+    fn repair5_kill_and_reap_kills_once_and_reaps() {
+        let pid = spawn_sh("exec sleep 30");
+        let handle = ContainerChild::new(pid);
+        assert_eq!(
+            handle.kill_and_reap(Duration::from_secs(10)).unwrap(),
+            ChildExit::Signaled(9)
+        );
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert_eq!(
+            handle.kill_and_reap(Duration::ZERO).unwrap(),
+            ChildExit::Signaled(9)
+        );
+        assert_eq!(
+            reap_snapshot(&handle),
+            (
+                ReapState::Reaped {
+                    exit: ChildExit::Signaled(9),
+                    killed: true
+                },
+                1
+            )
+        );
+    }
+
+    /// REPAIR-5（TASK-29.3）: 既に終了して回収済みの子には `kill_and_reap` が `SIGKILL` を送らない。
+    #[test]
+    fn repair5_kill_and_reap_skips_kill_after_reap() {
+        let handle = ContainerChild::new(spawn_sh("exit 4"));
+        assert_eq!(
+            handle.wait_timeout(Duration::from_secs(10)).unwrap(),
+            ChildExit::Exited(4)
+        );
+        assert_eq!(
+            handle.kill_and_reap(Duration::from_secs(1)).unwrap(),
+            ChildExit::Exited(4)
+        );
+        assert_eq!(reap_snapshot(&handle).1, 0);
+    }
+
     /// 回収状態と送った `SIGKILL` の回数を取り出す。
     fn reap_snapshot(handle: &ContainerChild) -> (ReapState, u32) {
         let cell = handle.lock();

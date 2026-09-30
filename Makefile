@@ -402,9 +402,30 @@ fio-baseline-ratio: ## fio ベースライン比を算出する（BASELINE/CANDI
 idle-memory-selftest: ## アイドル時常駐メモリ計測スクリプトの自己テスト（CORE-7・REPAIR-12）
 	bash scripts/bench/idle_memory_selftest.sh
 
+# /proc の読み取りがハングしたプロセスで止まり得るため timeout で包む（REPAIR-5）。
+# 秒数は IDLE_MEMORY_TIMEOUT で上書きできる（1〜999999 の整数。0 は timeout 無効になるため拒否）。
+# timeout の超過（124）・強制終了（137）は計測失敗（3）として報告する。
+IDLE_MEMORY_TIMEOUT ?= 120
+
 .PHONY: idle-memory
-idle-memory: ## アイドル時常駐メモリ（プロセス数・PSS・RSS）を JSON で出力する（CORE-7。Linux 限定）
-	bash scripts/bench/idle_memory.sh --format json
+idle-memory: ## アイドル時常駐メモリ（プロセス数・PSS・RSS）を JSON で出力する（CORE-7。Linux 限定・timeout 付き）
+	@t=$(call fio_bench_sq,$(IDLE_MEMORY_TIMEOUT)); \
+	case "$$t" in ''|*[!0-9]*|???????*) t=invalid ;; esac; \
+	if [ "$$t" = invalid ] || [ "$$t" -eq 0 ]; then \
+		echo "error: invalid-argument: IDLE_MEMORY_TIMEOUT must be an integer from 1 to 999999 (seconds)" >&2; \
+		exit 2; \
+	fi; \
+	if ! command -v timeout >/dev/null 2>&1; then \
+		echo "error: unsupported-os: timeout (coreutils) is required" >&2; \
+		exit 2; \
+	fi; \
+	rc=0; \
+	timeout --kill-after=10 "$$t" bash scripts/bench/idle_memory.sh --format json || rc=$$?; \
+	if [ "$$rc" -eq 124 ] || [ "$$rc" -eq 137 ]; then \
+		echo "error: measurement-failed: timed out after $${t}s reading /proc" >&2; \
+		exit 3; \
+	fi; \
+	exit "$$rc"
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）

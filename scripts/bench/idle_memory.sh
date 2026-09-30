@@ -45,6 +45,17 @@
 #   - 他ユーザーのプロセスの smaps_rollup は権限が要る。スクリプト内で sudo は呼ばない
 #     （root 権限コマンドは操作者が明示的に権限付きシェルから実行する）。読めない値を 0 として
 #     足すと過小計上になる（PoC-17 で実際に起きた不具合）ため、読めなければ終了コード 3 で止める。
+#
+# 既知の制約:
+#   - /proc の読み取り自体にはタイムアウトを設けていない（REPAIR-5）。ハングしたプロセスの
+#     smaps_rollup 等は mmap_lock 待ちで読み取りがブロックし得るため、Makefile の `idle-memory`
+#     ターゲットは `timeout` で包む（超過時は計測失敗として扱う）。uninterruptible sleep（D 状態）
+#     で止まった読み取りは SIGKILL でも即座には解除できない。
+#   - 任意のユーザーが argv[0]・comm を対象名に偽装したプロセスを起動すると、識別できないものを
+#     成功扱いにしない方針（fail-closed）により計測は終了コード 3 になる（計測の妨害は可能だが
+#     偽の成功にはならない）。エラーに出る pid を操作者が調べて取り除く前提とする。
+#   - stderr に出す外部由来の文字列（exe のリンク先・引数・パス等）は、印字可能な ASCII 以外を
+#     `?` に置換してから出す（端末へのエスケープシーケンス注入の防止）。
 
 set -euo pipefail
 
@@ -53,8 +64,15 @@ readonly MAX_PIDS=65536
 # pid 消滅で走査をやり直す最大回数。
 readonly MAX_SCAN_ATTEMPTS=10
 
+# 構造化エラーを stderr へ出す。メッセージは外部由来の文字列を含み得るため、印字可能な ASCII
+# （0x20-0x7e）以外を `?` に置換して無害化する（LC_ALL=C で 1 バイト単位に判定する）。
+# stderr が閉じている・書けない場合も終了コードを変えない（set -e で 1〔--expect-zero 違反〕に
+# ならないよう `|| true`。呼び出し側が契約どおりの値で exit する）。
 err() {
-  echo "error: $1: $2" >&2
+  local LC_ALL=C msg
+  msg="error: $1: $2"
+  msg="${msg//[^[:print:]]/?}"
+  printf '%s\n' "$msg" >&2 || true
 }
 
 usage() {
@@ -96,7 +114,10 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --help | -h)
-      usage
+      if ! usage 2>/dev/null; then
+        err "output-failed" "cannot write usage to stdout"
+        exit 2
+      fi
       exit 0
       ;;
     *)
@@ -145,7 +166,8 @@ if [ ! -d "$proc_root" ]; then
 fi
 
 if [ -n "$output" ]; then
-  # 既存ディレクトリを渡すと mv がその中へ移動して成功扱いになるため、事前に拒否する。
+  # 既存ディレクトリを渡すと mv がその中へ移動して成功扱いになるため、事前に拒否する
+  # （検査と置換の間にディレクトリが作られる TOCTOU は mv -T で防ぐ）。
   if [ -d "$output" ]; then
     err "invalid-argument" "output path is a directory: ${output}"
     exit 2
@@ -161,7 +183,10 @@ if [ -n "$output" ]; then
 fi
 
 name_re='^fandhe-container(-[a-z0-9-]+)?$'
-num_re='^[0-9]+$'
+# pid・kB 値として受け付ける 10 進数。先頭 0 付き（09・010）は bash 算術で 8 進と解釈され
+# エラー（終了コード 1）や誤読になるため拒否し、桁数は 13 桁（< 10^13 kB = 約 9 PB）までとする
+# （MAX_PIDS 件の合計でも 64 bit 符号付き整数をあふれない: 65536 * 10^13 < 2^63）。
+num_re='^(0|[1-9][0-9]{0,12})$'
 
 # 1 回の走査で集計する値。走査中に pid が消えたら不完全な結果を捨てて走査をやり直す。
 process_count=0
@@ -406,7 +431,9 @@ if [ -n "$output" ]; then
     err "expect-zero-failed" "process_count=${process_count} (expected 0); output not published"
     exit 1
   fi
-  if ! mv -f "$tmp" "$output" 2>/dev/null; then
+  # -T: 出力先をディレクトリとして扱わない（事前検査後にディレクトリが作られても、その中へ
+  # 移動して成功扱いにしない。GNU coreutils の拡張で、本スクリプトは Linux 限定）。
+  if ! mv -fT "$tmp" "$output" 2>/dev/null; then
     err "output-failed" "cannot publish output to ${output}"
     exit 2
   fi

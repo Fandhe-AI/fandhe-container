@@ -36,13 +36,16 @@
 //!   `ErrorCode::Internal` の [`TraitError`] で返す。途中失敗時は部分的な行が書かれうる
 //!   （再送・重複排除は呼び出し元の責務）
 //!
+//! # ライフサイクル操作の計装（TASK-84.4）
+//!
+//! `oci_runtime` の create（TASK-29.2）・start（TASK-29.3）・kill（TASK-30.1）・delete（TASK-30.2）は、
+//! 依存注入された `&OpRecorder` へ `record_op` で固定の操作名（`create`・`start`・`kill`・`delete`）を
+//! 記録する（全終了経路）。`tests/oci_lifecycle.rs` が 1 つの記録器を共有した際の反映を照合する。
+//!
 //! # 未実装範囲（REPAIR-3）
 //!
 //! 以下は未実装である。
 //!
-//! - delete への計装: delete 本体（TASK-30.2）が未実装のため未対応。実装時に create / start / kill と
-//!   同じ `record_op` パターンで操作名 `delete` を記録する（TASK-84.4 の引き継ぎ）。create（TASK-29.2）・
-//!   start（TASK-29.3）・kill（TASK-30.1）は計装済みで、`tests/oci_lifecycle.rs` が共有記録器で照合する
 //! - io の read / write 向け連携点は io 側の `fandhe_container_io::instrument::IoOpRecorder`
 //!   として定義済み（TASK-84.5）。core との接続は core と io の両方に依存する上位 crate の
 //!   newtype アダプタで行う（core → io 依存辺は未承認のため core には置かない）。

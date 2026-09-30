@@ -1993,4 +1993,48 @@ mod tests {
             moved.join("proc")
         );
     }
+
+    /// Codex P0（固定後のマウント先の移動）: fd の現在の位置が target と一致するときだけ
+    /// 真で、改名・移動・削除の後は偽になる。
+    #[test]
+    fn fd_still_at_detects_moved_or_removed_target() {
+        let t = TempTree::new("moved-target");
+        let root = t.base.join("root");
+        std::fs::create_dir_all(root.join("proc")).unwrap();
+        std::fs::create_dir_all(root.join("gone")).unwrap();
+        let proc = root.join("proc");
+        let fd = open_dir_beneath(&root, &[OsStr::new("proc")]).unwrap();
+        assert!(fd_still_at(&fd, &proc));
+        // rootfs の外へ移動。
+        let outside = t.base.join("outside");
+        std::fs::rename(&proc, &outside).unwrap();
+        assert!(!fd_still_at(&fd, &proc));
+        assert!(fd_still_at(&fd, &outside));
+        // 削除（リンク先に " (deleted)" が付く）。
+        let gone = root.join("gone");
+        let fd = open_dir_beneath(&root, &[OsStr::new("gone")]).unwrap();
+        std::fs::remove_dir(&gone).unwrap();
+        assert!(!fd_still_at(&fd, &gone));
+    }
+
+    /// SEC-4（記録経路）: 移動の拒否に付く違反記録の具体値。
+    #[test]
+    fn target_moved_violation_metadata() {
+        let err = ExecError::from_violation(ViolationReason::TargetMoved, Some(Path::new("/r/p")));
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::MountProc);
+        assert_eq!(
+            err.message,
+            "proc mount target was moved or removed after validation"
+        );
+        assert_eq!(
+            violation_of(&err),
+            (
+                "mount_target",
+                "target_moved",
+                "CORE-1",
+                Some("/r/p".to_string())
+            )
+        );
+    }
 }

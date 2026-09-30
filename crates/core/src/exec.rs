@@ -2005,6 +2005,10 @@ mod tests {
         let proc = root.join("proc");
         let fd = open_dir_beneath(&root, &[OsStr::new("proc")]).unwrap();
         assert!(fd_still_at(&fd, &proc));
+        // `.` を含む表記でも同じ位置と判定する（`Path::components` は先頭以外の `.` を
+        // 正規化で取り除くため、絶対パスでは `.` による誤検出はない。Cursor Bugbot 指摘の確認）。
+        assert!(fd_still_at(&fd, &root.join("./proc/.")));
+        assert!(fd_still_at(&fd, &t.base.join("./root/./proc")));
         // rootfs の外へ移動。
         let outside = t.base.join("outside");
         std::fs::rename(&proc, &outside).unwrap();

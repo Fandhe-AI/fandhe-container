@@ -365,6 +365,33 @@ actual=0
 env -u FANDHE_IDLE_MEMORY_SELFTEST FANDHE_IDLE_MEMORY_UNAME_S=Darwin bash "$target" --proc-root "$two" >/dev/null 2>&1 || actual=$?
 if [ "$actual" -eq 2 ]; then pass "proc-root-requires-selftest"; else fail "proc-root-requires-selftest (actual=${actual})"; fi
 
+# 6. Makefile の idle-memory ターゲットの終了コード変換（REPAIR-5・構造化エラー）。
+# IDLE_MEMORY_SCRIPT を stub に差し替え、実 /proc は読まない。make 自体は失敗時に 2 で終わるため、
+# レシピの終了コードは make が出す "Error <n>" の行で照合する（成功時は Error 行が無いこと）。
+repo_root="$(cd "${script_dir}/../.." && pwd)"
+check_make() {
+  local name="$1" want="$2" needle="$3" stub="$4" tmo="$5" errout
+  printf '%s\n' "$stub" >"${root}/stub.sh"
+  errout="$(make -s --no-print-directory -C "$repo_root" idle-memory \
+    IDLE_MEMORY_SCRIPT="${root}/stub.sh" IDLE_MEMORY_TIMEOUT="$tmo" 2>&1 >/dev/null)" || true
+  if [ "$want" -eq 0 ]; then
+    if grep -q 'Error [0-9]' <<<"$errout"; then fail "${name} (unexpected: ${errout})"; else pass "$name"; fi
+  elif ! grep -qE "\] Error ${want}\$" <<<"$errout"; then
+    fail "${name} (expected Error ${want}: ${errout})"
+  elif [ -n "$needle" ] && ! grep -qF -- "$needle" <<<"$errout"; then
+    fail "${name} (missing stderr: ${needle})"
+  else
+    pass "$name"
+  fi
+}
+check_make "make-passthrough-0" 0 "" "exit 0" 5
+check_make "make-passthrough-1" 1 "" "exit 1" 5
+check_make "make-passthrough-3" 3 "" "exit 3" 5
+check_make "make-timeout-to-3" 3 "measurement-failed: timed out after 1s" "sleep 30" 1
+check_make "make-unexpected-to-3" 3 "unexpected exit status 5" "exit 5" 5
+check_make "make-cannot-run-to-2" 2 "cannot run the measurement under timeout (exit 127)" "exit 127" 5
+check_make "make-invalid-timeout-2" 2 "IDLE_MEMORY_TIMEOUT must be" "exit 0" 0
+
 if [ "$failures" -ne 0 ]; then
   echo "${failures} case(s) failed" >&2
   exit 1

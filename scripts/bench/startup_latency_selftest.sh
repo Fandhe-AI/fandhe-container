@@ -105,6 +105,8 @@ cat >>"$stub" <<'STUB'
 #   foreign-perm: 同じ ID の他者のコンテナが既にあり、state は常に権限エラー、create は
 #                 ID 重複で失敗する（delete / kill が届くと FOREIGN-TOUCHED を記録する）
 #   foreign-late: foreign-perm と同じだが、2 回目以降の state は他者のコンテナを返す
+#   foreign-race: create 前の state は NOT_FOUND だが、その直後に他者が同じ ID で作成し、
+#                 create は ID 重複で失敗する（以後の state は他者のコンテナを返す）
 #   create-fail-state-error: create 未作成で失敗し、以後の state が構造化された権限エラー
 #                            （code: PERMISSION_DENIED）を返す
 #   create-fail-notfound-text: create 未作成で失敗し、以後の state が自由文の権限エラー
@@ -120,6 +122,8 @@ cat >>"$stub" <<'STUB'
 #   delete-fail: 計測は成功するが delete が常に失敗
 #   exec-delayed: start 後の state が created を 2 回返してから stopped
 #   exec-never: start 後の state が created のまま
+#   exec-late: start 後の state が 0.6 秒かけて created、次に 0.6 秒かけて running を返す
+#              （--timeout 1 では観測の完了が期限を過ぎる）
 #   running-race: start 後は running。実行中の delete を拒否し、kill 後も 2 回は拒否する
 #   never-stops: start 後は running のままで kill も効かない
 #   id-in-use: create 前から同じ ID のコンテナが存在する
@@ -147,12 +151,16 @@ not_exist() {
   fi
   exit 1
 }
-if [ "$mode" = foreign-perm ] || [ "$mode" = foreign-late ]; then
+if [ "$mode" = foreign-perm ] || [ "$mode" = foreign-late ] || [ "$mode" = foreign-race ]; then
   case "$cmd" in
     state)
-      if [ "$mode" = foreign-late ] && [ -e "$m.probed" ]; then state_json created; exit 0; fi
+      if [ "$mode" != foreign-perm ] && [ -e "$m.probed" ]; then state_json created; exit 0; fi
       touch "$m.probed"
-      echo "stub: open state.json: permission denied" >&2
+      if [ "$mode" = foreign-race ]; then
+        printf '{"code":"NOT_FOUND","message":"container %s does not exist"}\n' "$id" >&2
+      else
+        echo "stub: open state.json: permission denied" >&2
+      fi
       exit 1
       ;;
     create)
@@ -213,6 +221,10 @@ case "$cmd" in
         if [ "$n" -le 2 ]; then state_json created; else state_json stopped; fi
         ;;
       exec-never) state_json created ;;
+      exec-late)
+        sleep 0.6
+        if [ -e "$m.polled" ]; then state_json running; else touch "$m.polled"; state_json created; fi
+        ;;
       running-race | never-stops)
         if [ -e "$m.killed" ] && [ "$mode" = running-race ]; then state_json stopped; else state_json running; fi
         ;;
@@ -366,15 +378,14 @@ reset_log
 STUB_MODE=create-fail expect_rc "create-fail" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 expect_contains "create-fail-log-tail" "stub: create failed"
 expect_eq "create-fail-sequence" "state create state" "$(cut -d' ' -f1 "$stub_log" | tr '\n' ' ' | sed 's/ $//')"
-# create が途中まで作って失敗し delete も失敗する場合は kill → 待機付き delete を再試行し、
-# 残存 ID を報告して exit 4（待機は --timeout 秒で打ち切る。REPAIR-5）。
+# create が途中まで作って失敗した場合: 今回の作成物か他者の作成物かを区別できないため
+# delete / kill を送らず、残存 ID を報告して exit 4（Codex P0: create 未成功の ID に破壊的
+# 操作を送らない）。
 reset_log
-started="$SECONDS"
-STUB_MODE=create-fail-delete-fail expect_rc "create-fail-delete-fail" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
-elapsed=$((SECONDS - started))
-if [ "$elapsed" -lt 15 ]; then pass "create-fail-delete-fail-bounded (${elapsed}s < 15s)"; else fail "create-fail-delete-fail-bounded (${elapsed}s)"; fi
+STUB_MODE=create-fail-delete-fail expect_rc "create-fail-partial" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
 expect_contains "create-fail-leftover-id" "containers left behind: fandhe-startup-"
-if grep -q '^kill ' "$stub_log"; then pass "create-fail-kill-called"; else fail "create-fail-kill-called"; fi
+expect_contains "create-fail-partial-warning" "inspect it manually"
+expect_eq "create-fail-partial-sequence" "state create state" "$(cut -d' ' -f1 "$stub_log" | tr '\n' ' ' | sed 's/ $//')"
 # create 失敗でコンテナ未作成なら、state が明確な不存在応答（NOT_FOUND）を返すため後始末
 # 失敗にせず、契約どおり exit 1（Codex P1 / Bugbot 指摘）。
 reset_log
@@ -391,7 +402,7 @@ expect_contains "create-fail-state-error-leftover" "containers left behind: fand
 reset_log
 STUB_MODE=create-fail-notfound-text expect_rc "create-fail-notfound-text" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
 expect_contains "create-fail-notfound-text-leftover" "containers left behind: fandhe-startup-"
-expect_contains "create-fail-notfound-text-warning" "could not confirm whether fandhe-startup-"
+expect_contains "create-fail-notfound-text-warning" "its absence could not be confirmed"
 # 所有を確かめられない ID には delete / kill を送らない（Codex P0）。
 if grep -qE '^(delete|kill) ' "$stub_log"; then fail "create-fail-notfound-text-untouched"; else pass "create-fail-notfound-text-untouched"; fi
 # create がタイムアウトした場合は途中状態が残り得るため、state が不存在を示しても
@@ -422,12 +433,18 @@ reset_log
 STUB_MODE=foreign-perm expect_rc "foreign-perm" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 expect_eq "foreign-perm-sequence" "state create state" "$(cut -d' ' -f1 "$stub_log" | tr '\n' ' ' | sed 's/ $//')"
 if grep -q '^FOREIGN-TOUCHED ' "$stub_log"; then fail "foreign-perm-untouched"; else pass "foreign-perm-untouched"; fi
-# 後続の state が他者のコンテナ（同じ ID・同じ bundle）を返しても、create 前の不存在を確認
-# できていなければ今回のものとみなさず操作を送らない（Codex P0: bundle 一致は所有の証明に
-# ならない）。
+# 後続の state が他者のコンテナ（同じ ID・同じ bundle）を返しても操作を送らない（Codex P0:
+# bundle 一致は所有の証明にならない）。
 reset_log
 STUB_MODE=foreign-late expect_rc "foreign-late" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 if grep -q '^FOREIGN-TOUCHED ' "$stub_log"; then fail "foreign-late-untouched"; else pass "foreign-late-untouched"; fi
+# create 前の state が NOT_FOUND でも、その直後に他者が同じ ID で作成して create が ID 重複で
+# 失敗した場合は他者のコンテナに操作を送らない（Codex P0: 作成前の不存在は所有の証明に
+# ならない）。
+reset_log
+STUB_MODE=foreign-race expect_rc "foreign-race" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_eq "foreign-race-sequence" "state create state" "$(cut -d' ' -f1 "$stub_log" | tr '\n' ' ' | sed 's/ $//')"
+if grep -q '^FOREIGN-TOUCHED ' "$stub_log"; then fail "foreign-race-untouched"; else pass "foreign-race-untouched"; fi
 # create 前から同じ ID が存在する場合は触らずに exit 1（create・delete・kill を呼ばない）。
 reset_log
 STUB_MODE=id-in-use expect_rc "id-in-use" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
@@ -481,6 +498,13 @@ elapsed=$((SECONDS - started))
 if [ "$elapsed" -lt 15 ]; then pass "exec-never-bounded (${elapsed}s < 15s)"; else fail "exec-never-bounded (${elapsed}s)"; fi
 expect_contains "exec-never-error" "runtime-exec-not-observed"
 if grep -q '^delete ' "$stub_log"; then pass "exec-never-delete-called"; else fail "exec-never-delete-called"; fi
+# running を観測した照会の完了が期限（--timeout 1 秒）を過ぎた場合は成功結果に混ぜず exit 1
+# （Codex P1）。照会は 2 回（0.6 秒 + 0.6 秒）。
+reset_log
+STUB_MODE=exec-late expect_rc "exec-late" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+expect_contains "exec-late-error" "runtime-exec-not-observed"
+expect_eq "exec-late-stdout-empty" "" "$last_stdout"
+expect_eq "exec-late-state-count" "3" "$(grep -c '^state ' "$stub_log")"
 
 # --- 9. 前提ツール欠如: jq を含まない PATH で exit 3 ---
 mkdir -p "$work/emptybin"

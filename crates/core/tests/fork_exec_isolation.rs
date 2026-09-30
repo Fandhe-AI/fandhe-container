@@ -14,8 +14,9 @@
 //! - ディスパッチャ: 分離前に、手組みの静的 ELF プローブ（終了コード 42）をホスト上で直接実行して
 //!   バイト列の正しさを自己検証する（バイト列の誤りをランタイムの不具合と取り違えないため）→
 //!   シナリオごとに一時 rootfs を作り、タイムアウト付きで終了コード 0 を待つ（REPAIR-5）
-//! - root（rootful 経路）ではホスト root のままの exec は拒否されるため、全シナリオが `Exited(126)`・
-//!   stderr に `PERMISSION_DENIED`（SEC-1・CORE-5）
+//! - 制限（capability 削減・no_new_privs・seccomp）が未適用の間は root（rootful）・非 root（rootless）とも
+//!   exec は拒否されるため、全シナリオが `Exited(126)`・stderr に `PERMISSION_DENIED`（SEC-1・CORE-5）。
+//!   ステージ列（#832・#833）が適用されたら、下の想定を各シナリオ本来の値へ戻す
 //! - シナリオ `ok`: プローブへ exec し `Exited(42)`
 //! - シナリオ `missing`: 不在のエントリポイントで `Exited(127)`、stderr に `NOT_FOUND`
 //! - シナリオ `not-executable`: 実行権限の無いファイルで `Exited(126)`、stderr に `PERMISSION_DENIED`
@@ -263,18 +264,11 @@ mod linux {
                 Some(0),
                 "scenario {name} must exit with 0; stderr:\n{stderr}"
             );
-            let want = match name {
-                _ if is_root() => Some("PERMISSION_DENIED"),
-                "missing" => Some("NOT_FOUND"),
-                "not-executable" => Some("PERMISSION_DENIED"),
-                _ => None,
-            };
-            if let Some(want) = want {
-                assert!(
-                    stderr.contains(want),
-                    "stderr of scenario {name} must contain {want}; got:\n{stderr}"
-                );
-            }
+            // SEC-1・CORE-5: 制限が未適用の間は全シナリオで exec が拒否される。
+            assert!(
+                stderr.contains("PERMISSION_DENIED"),
+                "stderr of scenario {name} must contain PERMISSION_DENIED; got:\n{stderr}"
+            );
         }
         let is_root = is_root();
         println!("fork_exec_isolation: fork/exec verified (root={is_root})");
@@ -313,17 +307,16 @@ mod linux {
         };
         result.unwrap_or_else(|err| panic!("isolate failed: {err}"));
 
-        let (path, mut want) = match name {
-            "ok" => (format!("/{PROBE}"), ChildExit::Exited(PROBE_EXIT)),
-            "missing" => ("/no-such-entrypoint".to_string(), ChildExit::Exited(127)),
-            "not-executable" => (format!("/{NOT_EXEC}"), ChildExit::Exited(126)),
+        let path = match name {
+            "ok" => format!("/{PROBE}"),
+            "missing" => "/no-such-entrypoint".to_string(),
+            "not-executable" => format!("/{NOT_EXEC}"),
             other => panic!("unknown scenario {other}"),
         };
-        if is_root {
-            // SEC-1・CORE-5: capability 削減等が未適用の間、ホスト root のままの exec は拒否される
-            // （終了コード 126・PERMISSION_DENIED）。
-            want = ChildExit::Exited(126);
-        }
+        // SEC-1・CORE-5: capability 削減・no_new_privs・seccomp が未適用の間は、root / 非 root を問わず
+        // exec が拒否される（終了コード 126・PERMISSION_DENIED）。適用後は "ok" が Exited(PROBE_EXIT)、
+        // "missing" が Exited(127) に戻る。
+        let want = ChildExit::Exited(126);
         let entry = Entrypoint::new(&path, [path.as_str()], [] as [&str; 0]).expect("entrypoint");
         let child = spawn_container(rootfs, &entry).unwrap_or_else(|e| panic!("spawn: {e}"));
         let exit = child

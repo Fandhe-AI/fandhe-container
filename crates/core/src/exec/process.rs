@@ -21,9 +21,16 @@
 //! - **最小構成（フック無し）**: 本 PR の範囲は fork と exec まで。**capability 削減・
 //!   `PR_SET_NO_NEW_PRIVS`・seccomp・Landlock・基本デバイスノード・cgroup 参加は未適用**で、
 //!   ステージ列（#832・#833・#834、TASK-37〜40）が `child_main` の pivot 後・exec 前に差し込む。
-//!   そのため rootful 経路（`isolate_rootful_host_root`）のようにホスト root 権限のままの子は、
+//!   そのため制限が未適用の子（rootful 経路のホスト root 権限のままの子を含む）は、
 //!   `exec_entrypoint` が `PermissionDenied` で exec を拒否する（SEC-1・CORE-5。制限を適用できる
 //!   ようになるまで fail-closed。REPAIR-3: 実装済みを装わない）
+//! - **rootless 経路も同様に拒否する**: exec の直前に `/proc/self/status` で `NoNewPrivs: 1`・
+//!   `Seccomp: 2`・既定拒否 capability の不在を確認し、満たさなければ `PermissionDenied`
+//!   （SEC-1・CORE-5）。ステージ列が制限を適用すれば変更なしで通る。Landlock は観測手段がなく未検証
+//!   （#833 で証跡を追加する）。したがって本 PR 時点では実 exec は成功せず、成功経路は dry-run の
+//!   単体テストで検証する
+//! - **標準入出力は `/dev/null` へ置換する**: 呼び出し元の fd 0〜2 の実体は渡さない。`/dev/null` が
+//!   無い rootfs は拒否する。端末・パイプの受け渡しは TASK-29/30 の範囲
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
 //!   間にパスが差し替わる TOCTOU を防ぐ。読み取り権限のない実行専用バイナリは開けず拒否される
 //! - **fork の健全性は `sys::fork_single_threaded` が強制する**: 呼び出し元が `Threads: 1`
@@ -232,40 +239,58 @@ fn exit_code_for(err: &ExecError) -> i32 {
     }
 }
 
-/// rootful 経路のホスト root 権限（実効 uid 0 かつ初期 user namespace の恒等写像）を判定する純関数。
+/// SEC-1 が既定拒否する capability のビット位置（`CAP_SYS_MODULE`=16・`CAP_SYS_PTRACE`=19・
+/// `CAP_SYS_ADMIN`=21）。
+const DENIED_CAPS: [(u32, &str); 3] = [
+    (16, "CAP_SYS_MODULE"),
+    (19, "CAP_SYS_PTRACE"),
+    (21, "CAP_SYS_ADMIN"),
+];
+
+/// `/proc/self/status` の内容から、exec を許してよい制限（SEC-1・CORE-5）が適用済みかを判定する純関数。
 ///
-/// `uid_map` は `/proc/self/uid_map`。恒等の全域写像（`0 0 4294967295`）が唯一の行なら初期 user
-/// namespace であり、ここで uid 0 ならホストの root である。user namespace 内の uid 0（rootless）は
-/// 写像がこの形にならないため該当しない。
-fn is_host_root(euid: u32, uid_map: &str) -> bool {
-    if euid != 0 {
-        return false;
+/// 未適用・判定不能なら理由（英語 1 行）を返す（fail-closed）。要件は `NoNewPrivs: 1`・`Seccomp: 2`
+/// （filter モード）・実効 capability に既定拒否の capability が無いこと。Landlock は status に現れず
+/// 観測できないため、ここでは検証できない（適用の証跡は #833 の Landlock ステージが追加する。
+/// REPAIR-3: 検証済みを装わない）。
+fn unrestricted_reason(status: &str) -> Option<String> {
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(str::trim)
+    };
+    if field("NoNewPrivs:") != Some("1") {
+        return Some("no_new_privs is not set".to_string());
     }
-    let mut lines = uid_map.lines().filter(|l| !l.trim().is_empty());
-    match (lines.next(), lines.next()) {
-        (Some(line), None) => {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            f == ["0", "0", "4294967295"]
-        }
-        _ => false,
+    if field("Seccomp:") != Some("2") {
+        return Some("no seccomp filter is installed".to_string());
     }
+    let Some(cap_eff) = field("CapEff:").and_then(|v| u64::from_str_radix(v, 16).ok()) else {
+        return Some("cannot determine the effective capabilities".to_string());
+    };
+    DENIED_CAPS
+        .iter()
+        .find(|(bit, _)| cap_eff & (1u64 << bit) != 0)
+        .map(|(_, name)| format!("{name} is still in the effective capability set"))
 }
 
-/// ホスト root 権限のままの exec を拒否する（SEC-1・CORE-5。fail-closed）。
+/// 制限が未適用のままの exec を拒否する（SEC-1・CORE-5。fail-closed）。
 ///
-/// capability 削減・`PR_SET_NO_NEW_PRIVS`・seccomp・Landlock は #832・#833 まで未適用のため、
-/// `isolate_rootful_host_root` 経路の子は特権を落とせない。制限を適用できるようになるまで、この
-/// 経路からの exec を拒否する。`uid_map` を読めない場合も判定できないため拒否する。
-fn deny_host_root_exec() -> Result<(), ExecError> {
+/// rootful（ホスト root）か rootless かを問わず、capability 削減・`PR_SET_NO_NEW_PRIVS`・seccomp が
+/// 実際に適用されたことを `/proc/self/status` で確認できなければ拒否する。#832・#833 のステージが
+/// pivot 後・exec 前に制限を適用すれば、本関数は変更なしで通るようになる。`status` を読めない
+/// 場合も判定できないため拒否する。
+fn deny_unrestricted_exec() -> Result<(), ExecError> {
     let deny = |msg: &str| ExecError::new(ErrorCode::PermissionDenied, IsolationStage::Exec, msg);
-    let uid_map = std::fs::read_to_string("/proc/self/uid_map")
-        .map_err(|_| deny("cannot read /proc/self/uid_map to verify the privilege model"))?;
-    if is_host_root(sys::effective_uid(), &uid_map) {
-        return Err(deny(
-            "refusing to exec with host root privileges: capability drop, no_new_privs, seccomp and Landlock are not applied yet",
-        ));
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|_| deny("cannot read /proc/self/status to verify the applied restrictions"))?;
+    match unrestricted_reason(&status) {
+        Some(reason) => Err(deny(&format!(
+            "refusing to exec without isolation restrictions: {reason} (capability drop, no_new_privs, seccomp and Landlock are not applied yet)"
+        ))),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// pivot 済みの PID 1 から、エントリポイントへ `execve` する（成功時は戻らないため戻り値の
@@ -280,7 +305,7 @@ pub fn exec_entrypoint(
     entry: &Entrypoint,
 ) -> Result<Infallible, ExecError> {
     isolation.verify_caller(IsolationStage::Exec)?;
-    deny_host_root_exec()?;
+    deny_unrestricted_exec()?;
     exec_entrypoint_verified(pivot.new_root_mnt_id, entry)
 }
 
@@ -295,7 +320,8 @@ pub fn exec_entrypoint(
 /// 3. fd 3 以上を `CLOEXEC` にする（CVE-2024-21626 型の fd 漏えい対策。カーネル 5.11 未満は
 ///    `ENOSYS`/`EINVAL` で fail-closed）
 /// 4. `SIGPIPE` を `SIG_DFL` へ戻す（Rust ランタイムが設定した ignore は `execve` を越えて継承される）
-/// 5. `execveat`（開いた fd を実行。実行権限がなければ `EACCES`）。戻ってきたら失敗
+/// 5. fd 0〜2 を新 root の `/dev/null`（1:3 を検証）へ置換する（継承されたホスト側の標準入出力を渡さない）
+/// 6. `execveat`（開いた fd を実行。実行権限がなければ `EACCES`）。戻ってきたら失敗
 fn exec_entrypoint_verified(
     pivot_mnt_id: u64,
     entry: &Entrypoint,
@@ -341,6 +367,8 @@ fn exec_entrypoint_verified(
         sys::set_cloexec(file.as_fd(), false)
             .map_err(|e| ExecError::from_sys(e, STAGE, "fcntl(F_SETFD)"))?;
     }
+    // 最後に標準入出力を置換する（以降の execve 失敗の診断は stderr へ出せず、終了コードのみで通知）。
+    redirect_stdio_to_null()?;
     let err = do_execve(entry, &file);
     Err(ExecError::new(
         exec_errno_to_code(err),
@@ -366,6 +394,43 @@ fn mark_fds_cloexec() -> Result<(), ExecError> {
 #[cfg(test)]
 fn mark_fds_cloexec() -> Result<(), ExecError> {
     tests::record("close_range(3)".to_string());
+    Ok(())
+}
+
+/// fd 0〜2 を新 root の `/dev/null` へ置き換える。本番ビルドの実装。
+///
+/// 呼び出し元が引き継いだ 0〜2 番の実体（ホストのファイル・ソケット）をコンテナのエントリポイントへ
+/// 渡さない（CVE-2024-21626 型・fd 3 以上は `mark_fds_cloexec` が担当）。`/dev/null` が存在しない、
+/// または `null` デバイス（1:3）でなければ、別の実体を標準入出力にしないため fail-closed で拒否する。
+/// 標準入出力の受け渡し（端末・パイプ）は TASK-29/30 の範囲（未実装）。
+#[cfg(not(test))]
+fn redirect_stdio_to_null() -> Result<(), ExecError> {
+    use std::os::unix::fs::FileTypeExt as _;
+    let err = |msg: &str| ExecError::new(ErrorCode::PermissionDenied, IsolationStage::Exec, msg);
+    let fd = sys::open_file_rdwr(c"/dev/null").map_err(|e| {
+        ExecError::new(
+            exec_errno_to_code(e),
+            IsolationStage::Exec,
+            format!("open of /dev/null failed: {}", describe(e)),
+        )
+    })?;
+    let file = std::fs::File::from(fd);
+    let meta = file
+        .metadata()
+        .map_err(|_| err("cannot stat /dev/null to verify the stdio target"))?;
+    if !meta.file_type().is_char_device() || meta.rdev() != sys::makedev(1, 3) {
+        return Err(err(
+            "/dev/null in the new root is not the null device (1:3)",
+        ));
+    }
+    sys::redirect_stdio_to(OwnedFd::from(file))
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Exec, "dup2(/dev/null)"))
+}
+
+/// テストビルドの dry-run 差し込み点。呼ばれたことだけを記録する。
+#[cfg(test)]
+fn redirect_stdio_to_null() -> Result<(), ExecError> {
+    tests::record("stdio->/dev/null".to_string());
     Ok(())
 }
 
@@ -709,17 +774,44 @@ mod tests {
         );
     }
 
-    /// SEC-1・CORE-5: ホスト root（euid 0 かつ初期 user namespace の恒等写像）だけを拒否する。
+    /// SEC-1・CORE-5: 制限（no_new_privs・seccomp filter・既定拒否 capability の不在）が揃った
+    /// status だけを許可し、rootless の user namespace 内 root を含め、欠けや判定不能は拒否する。
     #[test]
-    fn sec1_is_host_root_is_exact() {
-        let identity = "         0          0 4294967295\n";
-        assert!(is_host_root(0, identity));
-        assert!(!is_host_root(1000, identity));
-        // rootless: 自 ID をコンテナ内 0 へ写す単一 ID 写像。
-        assert!(!is_host_root(0, "         0       1000          1\n"));
-        // 複数行・空・不正は host root 扱いにしない（判定不能は呼び出し側が別途拒否する）。
-        assert!(!is_host_root(0, ""));
-        assert!(!is_host_root(0, "0 0 4294967295\n1 1 1\n"));
+    fn sec1_unrestricted_reason_is_exact() {
+        let ok = "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\t0000000000000000\n";
+        assert_eq!(unrestricted_reason(ok), None);
+        // OCI 既定相当の capability（CAP_CHOWN=0 等）は許可する。
+        let oci = "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\t00000000a80425fb\n";
+        assert_eq!(unrestricted_reason(oci), None);
+        let full = "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\t000001ffffffffff\n";
+        assert_eq!(
+            unrestricted_reason(full).as_deref(),
+            Some("CAP_SYS_MODULE is still in the effective capability set")
+        );
+        let admin = "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\t0000000000200000\n";
+        assert_eq!(
+            unrestricted_reason(admin).as_deref(),
+            Some("CAP_SYS_ADMIN is still in the effective capability set")
+        );
+        let no_nnp = "NoNewPrivs:\t0\nSeccomp:\t2\nCapEff:\t0\n";
+        assert_eq!(
+            unrestricted_reason(no_nnp).as_deref(),
+            Some("no_new_privs is not set")
+        );
+        let no_seccomp = "NoNewPrivs:\t1\nSeccomp:\t0\nCapEff:\t0\n";
+        assert_eq!(
+            unrestricted_reason(no_seccomp).as_deref(),
+            Some("no seccomp filter is installed")
+        );
+        let bad_cap = "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\tzz\n";
+        assert_eq!(
+            unrestricted_reason(bad_cap).as_deref(),
+            Some("cannot determine the effective capabilities")
+        );
+        assert_eq!(
+            unrestricted_reason("").as_deref(),
+            Some("no_new_privs is not set")
+        );
     }
 
     /// CORE-1（TASK-27.4.1）: dry-run で exec 前の処理が固定順に呼ばれ、`execve` に argv・env が
@@ -742,6 +834,7 @@ mod tests {
             vec![
                 "close_range(3)".to_string(),
                 "signal(SIGPIPE,SIG_DFL)".to_string(),
+                "stdio->/dev/null".to_string(),
                 format!("execve({})", bin.display()),
                 "argv=probe -x".to_string(),
                 "env=K=V".to_string(),

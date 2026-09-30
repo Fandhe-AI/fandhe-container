@@ -36,7 +36,7 @@
 
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd};
 
 /// syscall 失敗の分類。`crate::exec` が `ErrorCode` へ写す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +105,7 @@ mod consts {
     pub const O_PATH: i32 = 0o10_000_000;
     // include/uapi/asm-generic/fcntl.h の `O_NONBLOCK`（x86_64 は上書きしない）。
     pub const O_NONBLOCK: i32 = 0o4_000;
+    pub const O_RDWR: i32 = 2;
     // arch/x86/entry/syscalls/syscall_64.tbl の `execveat`。
     pub const SYS_EXECVEAT: i64 = 322;
     // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（全アーキテクチャ共通）。
@@ -168,6 +169,7 @@ mod consts {
     pub const O_PATH: i32 = 0o10_000_000;
     // include/uapi/asm-generic/fcntl.h の `O_NONBLOCK`（arm64 も上書きしない）。
     pub const O_NONBLOCK: i32 = 0o4_000;
+    pub const O_RDWR: i32 = 2;
     // include/uapi/asm-generic/unistd.h の `__NR_execveat`（arm64 は asm-generic の表。
     // x86_64 の 322 を流用しない）。
     pub const SYS_EXECVEAT: i64 = 281;
@@ -222,6 +224,7 @@ mod consts {
     pub const O_CLOEXEC: i32 = 0;
     pub const O_PATH: i32 = 0;
     pub const O_NONBLOCK: i32 = 0;
+    pub const O_RDWR: i32 = 0;
     pub const SYS_EXECVEAT: i64 = 0;
     pub const AT_EMPTY_PATH: i64 = 0;
     pub const F_SETFD: i32 = 0;
@@ -318,6 +321,8 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int fcntl(int fd, int cmd, ...)`。可変長引数として宣言する
     // （非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int dup2(int oldfd, int newfd)`。
+    fn dup2(oldfd: i32, newfd: i32) -> i32;
 }
 
 /// 直前の失敗した syscall の errno を `SysError` にする（失敗直後に呼ぶこと）。
@@ -606,6 +611,55 @@ pub(crate) fn set_cloexec(fd: BorrowedFd<'_>, on: bool) -> Result<(), SysError> 
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 絶対パス `path` を読み書きで開く（`O_RDWR|O_CLOEXEC|O_NONBLOCK`。最終要素の symlink は辿る）。
+/// 呼び出し側が開いた実体の種別を検証する前提（[`redirect_stdio_to`] と組で使う）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn open_file_rdwr(path: &CStr) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = consts::O_RDWR | consts::O_CLOEXEC | consts::O_NONBLOCK;
+    // SAFETY: `path` は借用した NUL 終端文字列で呼び出しの間生存する。flags に O_CREAT / O_TMPFILE を
+    // 含まないため可変長引数（mode）は渡さない。成功時の戻り値は新規 fd で、直後に `OwnedFd` が
+    // 唯一の所有者となる（二重 close なし）。
+    let fd = unsafe { openat(AT_FDCWD, path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// fd 0・1・2 を `fd` の実体で置き換える（`dup2`。置換先は close-on-exec が外れる）。呼び出し元が
+/// 引き継いだ標準入出力の実体（ホストのファイル・ソケット）をコンテナへ渡さないために使う。
+/// `fd` 自体が 0〜2 のいずれかのときは、その番号は置換せず close-on-exec を外して保持する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn redirect_stdio_to(fd: OwnedFd) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let raw = fd.as_raw_fd();
+    for target in 0..=2 {
+        if target == raw {
+            continue;
+        }
+        // SAFETY: `raw` は `fd` が所有する生存中の fd。`target` は 0〜2 の整数で、引数はいずれも
+        // 整数のみ（ポインタなし）。既存の標準 fd は暗黙に close され置換される（意図した動作）。
+        if unsafe { dup2(raw, target) } == -1 {
+            return Err(last_error());
+        }
+    }
+    if raw <= 2 {
+        // 0〜2 のいずれかとして確保された fd は閉じずに保持する（標準 fd の役目を兼ねる）。
+        let kept = fd.into_raw_fd();
+        // SAFETY: `kept` は今 `OwnedFd` から取り出した有効な fd で、ここで所有権を手放すため
+        // 借用の間に close されない。
+        let borrowed = unsafe { BorrowedFd::borrow_raw(kept) };
+        return set_cloexec(borrowed, false);
+    }
+    Ok(())
+}
+
 /// 開いた fd の実体を `execveat(fd, "", argv, envp, AT_EMPTY_PATH)` で実行する。パスを再解決しない
 /// ため、検査した fd とは別のファイルが実行されることはない（TOCTOU 対策）。成功すると戻らず、
 /// 戻ったら常に失敗でその errno を返す。`fd` が close-on-exec のままだとシェバン付きスクリプトは
@@ -874,6 +928,7 @@ mod tests {
         assert_eq!(consts::SYS_EXECVEAT, 281);
         assert_eq!(consts::AT_EMPTY_PATH, 0x1000);
         assert_eq!(consts::O_NONBLOCK, 0o4_000);
+        assert_eq!(consts::O_RDWR, 2);
         assert_eq!((consts::F_SETFD, consts::FD_CLOEXEC), (2, 1));
         #[cfg(target_arch = "x86_64")]
         assert_eq!(consts::SYS_CLOSE_RANGE, 436);

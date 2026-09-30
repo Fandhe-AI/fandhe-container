@@ -101,6 +101,9 @@ cat >>"$stub" <<'STUB'
 #   ok: create -> created、start 後の state は stopped（`true` 相当で即終了）
 #   create-fail / create-fail-gone: create が何も作らず失敗（delete・state は不存在エラー）
 #   create-fail-delete-fail: create が途中まで作って失敗し、delete も常に失敗（state は created）
+#   create-timeout: create が何も作らずハングする（--timeout で打ち切られる）
+#   foreign-perm: 同じ ID の他者のコンテナが既にあり、state は常に権限エラー、create は
+#                 ID 重複で失敗する（delete / kill が届くと FOREIGN-TOUCHED を記録する）
 #   create-fail-state-error: create 未作成で失敗し、以後の state が権限エラーを返す
 #   create-fail-notfound-text: 同上で、権限エラーの文言に "not found" を含む
 #   start-fail / start-hang / start-flood: start が失敗 / ハング / 大量出力
@@ -119,13 +122,28 @@ case "$cmd" in
 esac
 echo "$cmd $id" >>"$STUB_LOG"
 m="$STUB_STATE/$id"
-state_json() { printf '{"ociVersion":"1.0.2","id":"%s","status":"%s","pid":0,"bundle":"/b"}\n' "$id" "$1"; }
+# bundle は create が受け取った --bundle を返す（OCI state の bundle は絶対パス）。
+state_json() {
+  printf '{"ociVersion":"1.0.2","id":"%s","status":"%s","pid":0,"bundle":"%s"}\n' \
+    "$id" "$1" "$(cat "$m.bundle" 2>/dev/null || echo /other)"
+}
 # 不存在エラー。runc のように時刻を含め、呼び出しごとに数字が揺れる形にする。
 not_exist() { echo "time=\"$(date +%s)$RANDOM\" level=error msg=\"container $id does not exist\"" >&2; exit 1; }
+if [ "$mode" = foreign-perm ]; then
+  case "$cmd" in
+    state) echo "stub: open state.json: permission denied" >&2; exit 1 ;;
+    create) sleep 0.05; echo "stub: container with id $id already exists" >&2; exit 1 ;;
+    delete | kill) echo "FOREIGN-TOUCHED $id" >>"$STUB_LOG"; exit 0 ;;
+  esac
+fi
 case "$cmd" in
   create)
     sleep 0.05
     touch "$m.attempted"
+    [ "$mode" = create-timeout ] && exec sleep 30
+    # 出力先の作成競合を再現するフック（--output の検証後にファイルを作る）。
+    [ -n "${STUB_CREATE_HOOK:-}" ] && [ ! -e "$STUB_CREATE_HOOK" ] && echo preexisting >"$STUB_CREATE_HOOK"
+    [ "$1" = --bundle ] && printf '%s' "$2" >"$m.bundle"
     case "$mode" in
       create-fail | create-fail-gone | create-fail-state-error | create-fail-notfound-text)
         echo "stub: create failed" >&2; exit 1 ;;
@@ -266,6 +284,13 @@ expect_rc "output-existing-file" 2 --runtime "$stub" --bundle "$work/bundle" --i
 ln -s "$work/nonexistent-target" "$work/link.json"
 expect_rc "output-existing-symlink" 2 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --output "$work/link.json"
 expect_rc "output-parent-missing" 2 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --output "$work/nodir/x.json"
+# 検証後・書き込み前に作られたファイルで作成に失敗した場合（Codex P2）: exit 2 かつ stdout は空。
+# 計測中（create 呼び出し時）に出力先を作って競合を再現する。
+race_out="$work/race.json"
+reset_log
+STUB_CREATE_HOOK="$race_out" expect_rc "output-create-race" 2 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --output "$race_out"
+expect_eq "output-create-race-stdout-empty" "" "$last_stdout"
+expect_eq "output-create-race-file-untouched" "preexisting" "$(cat "$race_out")"
 
 # --- 5. 入力エラー（exit 2） ---
 expect_rc "input-runtime-missing" 2 --bundle "$work/bundle"
@@ -296,10 +321,12 @@ expect_rc "input-value-missing" 2 --runtime "$stub" --bundle
 expect_rc "help" 0 --help
 
 # --- 6. create / start 失敗 ---
+# create がランタイム自身のエラーで終了し、state の応答が create 前と一致すれば未作成と
+# 確定し、delete / kill を送らずに exit 1。
 reset_log
 STUB_MODE=create-fail expect_rc "create-fail" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 expect_contains "create-fail-log-tail" "stub: create failed"
-if grep -q '^delete ' "$stub_log"; then pass "create-fail-delete-called"; else fail "create-fail-delete-called"; fi
+expect_eq "create-fail-sequence" "state create state" "$(cut -d' ' -f1 "$stub_log" | tr '\n' ' ' | sed 's/ $//')"
 # create が途中まで作って失敗し delete も失敗する場合は kill → 待機付き delete を再試行し、
 # 残存 ID を報告して exit 4（待機は --timeout 秒で打ち切る。REPAIR-5）。
 reset_log
@@ -325,7 +352,22 @@ expect_contains "create-fail-state-error-leftover" "containers left behind: fand
 reset_log
 STUB_MODE=create-fail-notfound-text expect_rc "create-fail-notfound-text" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
 expect_contains "create-fail-notfound-text-leftover" "containers left behind: fandhe-startup-"
-expect_contains "create-fail-notfound-text-warning" "could not confirm that fandhe-startup-"
+expect_contains "create-fail-notfound-text-warning" "could not confirm whether fandhe-startup-"
+# 所有を確かめられない ID には delete / kill を送らない（Codex P0）。
+if grep -qE '^(delete|kill) ' "$stub_log"; then fail "create-fail-notfound-text-untouched"; else pass "create-fail-notfound-text-untouched"; fi
+# create がタイムアウトした場合は途中状態が残り得るため、state が不存在を示しても
+# 未作成とは確定せず exit 4（所有も確かめられないので delete / kill は送らない）。
+reset_log
+STUB_MODE=create-timeout expect_rc "create-timeout" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+expect_contains "create-timeout-leftover" "containers left behind: fandhe-startup-"
+if grep -qE '^(delete|kill) ' "$stub_log"; then fail "create-timeout-untouched"; else pass "create-timeout-untouched"; fi
+# 同じ ID の他者のコンテナがあり state が権限エラーを返す場合（Codex P0）: create は ID 重複で
+# 失敗し、応答は create 前と同じ権限エラーのため未作成と判定して exit 1。他者のコンテナへ
+# delete / kill を送らない。
+reset_log
+STUB_MODE=foreign-perm expect_rc "foreign-perm" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_eq "foreign-perm-sequence" "state create state" "$(cut -d' ' -f1 "$stub_log" | tr '\n' ' ' | sed 's/ $//')"
+if grep -q '^FOREIGN-TOUCHED ' "$stub_log"; then fail "foreign-perm-untouched"; else pass "foreign-perm-untouched"; fi
 # create 前から同じ ID が存在する場合は触らずに exit 1（create・delete・kill を呼ばない）。
 reset_log
 STUB_MODE=id-in-use expect_rc "id-in-use" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0

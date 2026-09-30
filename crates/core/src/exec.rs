@@ -264,7 +264,7 @@ pub enum IsolationStage {
 ///
 /// 分離違反の試行を拒否した場合は `violation` に構造化された違反記録が入り、システム
 /// エラー（syscall 失敗・procfs の読み取り失敗等）では `None`。区別の定義と、記録の保存が
-/// 未実装（TASK-41・#191）であることは [`IsolationViolation`] のモジュール doc を参照（SEC-4）。
+/// 未実装（TASK-41・#191）であることは [`IsolationViolation`] を参照（SEC-4）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExecError {
@@ -383,7 +383,8 @@ pub struct IsolationReport {
 
 /// [`mount_proc`] を呼べる状態（新しい PID namespace の PID 1 で、そのスレッドだけが属する
 /// 新しい mount namespace にいる）を、PID 1 自身が作って確かめた証跡（CORE-1）。前提を
-/// 満たさない呼び出しは fail-closed で拒否する。拒否の監査ログ記録（SEC-4）は未実装（REPAIR-3）。
+/// 満たさない呼び出しは fail-closed で拒否し、`ExecError::violation` に違反記録を載せる
+/// （SEC-4 の記録経路。保存は TASK-41・#191 で未実装。REPAIR-3）。
 ///
 /// 生成は [`MountIsolation::establish`] のみで、呼び出し側の申告では作れない。証跡は作成時の
 /// mount namespace・PID namespace に束縛され、[`mount_proc`] は呼び出し直前に「PID 1 である
@@ -512,7 +513,7 @@ impl MountIsolation {
     ///
     /// 1. PID が 1（`getpid()` と `NSpid` の末尾要素の両方）で、`NSpid` が 2 段以上、かつ
     ///    シングルスレッド（`Threads: 1`）。満たさなければ副作用なしで `FailedPrecondition`
-    ///    （判定は [`check_establish_preconditions`]）
+    ///    （判定は `check_establish_preconditions`）
     /// 2. 呼び出しスレッドを `unshare(CLONE_NEWNS)` で新しい mount namespace へ移し、`/` を
     ///    再帰 private にする（コピーされたマウントの shared peer から切り離し、以後のマウントを
     ///    外へ伝播させない）
@@ -806,7 +807,7 @@ fn unshare_and_configure(
 /// - `rootfs` / `target` は絶対パスで NUL・`..` を含まず、`target` は `rootfs` より下の専用ディレクトリ
 ///   （`target == rootfs` は拒否）
 /// - `/` から `target` までを `openat(O_PATH|O_DIRECTORY|O_NOFOLLOW)` で 1 要素ずつ辿って
-///   fd で固定し（[`open_dir_beneath`]）、マウントは `/proc/thread-self/fd/N` 経由で同じ実体に対して
+///   fd で固定し（`open_dir_beneath`）、マウントは `/proc/thread-self/fd/N` 経由で同じ実体に対して
 ///   行う（検証後の差し替え = TOCTOU の防止）。symlink・非ディレクトリ・不在の要素があれば
 ///   拒否する。O_PATH のため祖先に要るのは search（実行）権限だけで、user namespace 内から
 ///   読み取り不可・実行可のホスト側ディレクトリを辿れる

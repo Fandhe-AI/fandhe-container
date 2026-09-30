@@ -357,6 +357,13 @@ impl ViolationSubject {
 /// 分離違反の試行を拒否したときの構造化された記録（SEC-4 の記録経路。保存は TASK-41）。
 ///
 /// `ExecError::violation` から取り出す。生成は `crate::exec` の拒否経路のみ。
+///
+/// - **記録の経路のみ**: 永続化・3 レイヤーへの集約・ログの出力先は TASK-41（#191）で扱い、
+///   未実装（REPAIR-3）。呼び出し側は受け取った記録を必要に応じて自分で扱う
+/// - **違反**（構成・呼び出し文脈・パスが分離の前提を満たさず fail-closed で拒否したもの）
+///   にだけ付く。**システムエラー**（syscall 失敗・procfs の読み取り失敗・mountinfo の書式
+///   不正・権限不足）と hostname の書式エラーには付かない
+/// - namespace の識別子や正規化後のホスト側実パスは含めない
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IsolationViolation {

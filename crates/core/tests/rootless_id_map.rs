@@ -106,7 +106,7 @@ mod linux {
         if std::env::var("FANDHE_CONTAINER_TEST_ID_HELPER").as_deref() == Ok("1") {
             let name = std::env::var("USER").ok();
             let uowner = SubIdOwner::new(euid, name.clone()).expect("uid owner");
-            let gowner = SubIdOwner::new(egid, name).expect("gid owner");
+            let gowner = SubIdOwner::new(euid, name).expect("gid owner");
             let uranges =
                 load_subordinate_ids(Path::new("/etc/subuid"), &uowner).expect("load /etc/subuid");
             let granges =

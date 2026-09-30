@@ -417,16 +417,18 @@ pub fn rootless_mapping(
         host_id,
         count: 1,
     }];
-    let mut next: u32 = 1;
+    // 終端は u64 で持つ（u32::MAX + 1 で終わる範囲も有効。次の範囲がある場合だけ u32 へ変換する）。
+    let mut next: u64 = 1;
     for r in ranges {
+        let container_id = u32::try_from(next).map_err(|_| {
+            RootlessError::invalid(RootlessStage::Validate, "container id range overflows u32")
+        })?;
         entries.push(IdMapping {
-            container_id: next,
+            container_id,
             host_id: r.start,
             count: r.count,
         });
-        next = next.checked_add(r.count).ok_or_else(|| {
-            RootlessError::invalid(RootlessStage::Validate, "container id range overflows u32")
-        })?;
+        next += u64::from(r.count);
     }
     IdMapSet::new(entries)
 }
@@ -631,6 +633,28 @@ fn run_helper(
     let mut child = cmd
         .spawn()
         .map_err(|e| io_error(stage, "spawn id map helper", &e))?;
+    // stderr は実行中に上限付きで並行読み取りする（パイプ詰まりによるヘルパー停止の防止。REPAIR-5）。
+    // 上限超過分は読み捨ててパイプを空け続ける。
+    let stderr_rx = child.stderr.take().map(|mut s| {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let room = MAX_HELPER_STDERR_BYTES.saturating_sub(kept.len());
+                        if let Some(chunk) = buf.get(..n.min(room)) {
+                            kept.extend_from_slice(chunk);
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(kept);
+        });
+        rx
+    });
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -655,13 +679,10 @@ fn run_helper(
     if status.success() {
         return Ok(());
     }
-    let mut err = Vec::new();
-    if let Some(mut s) = child.stderr.take() {
-        let _ = s
-            .by_ref()
-            .take(MAX_HELPER_STDERR_BYTES as u64)
-            .read_to_end(&mut err);
-    }
+    // 読み取りスレッドはパイプ EOF で合流する。孫プロセスが fd を保持する場合に備え待ちは有界にする。
+    let err = stderr_rx
+        .and_then(|rx| rx.recv_timeout(Duration::from_secs(1)).ok())
+        .unwrap_or_default();
     Err(RootlessError::new(
         ErrorCode::PermissionDenied,
         stage,

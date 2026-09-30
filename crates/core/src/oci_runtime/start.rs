@@ -11,9 +11,11 @@
 //!
 //! 1. 状態取得（不在は `NotFound`。launcher は呼ばない）
 //! 2. `Created` 以外は `FailedPrecondition`（`ContainerRuntime::start` の契約）
-//! 3. `config.json` を再読込・再検証（create 後の書き換え = TOCTOU 対策。ダイジェスト保持は
-//!    `StateRecord` の拡張〔TASK-31・TASK-157.2 の領域〕を要するため採らない）
-//! 4. 適用できない指定の fail-closed 拒否・args / env の上限検証・rootfs ハンドルの取得（下記）
+//! 3. `config.json` を**一度だけ**読み込んで検証する（create 後の書き換え = TOCTOU 対策。ダイジェスト保持は
+//!    `StateRecord` の拡張〔TASK-31・TASK-157.2 の領域〕を要するため採らない）。以後の検査と
+//!    [`LaunchSpec`] はすべてこの 1 回の読み込み結果から作り、`config.json` を読み直さない（読み直すと
+//!    検査した内容と起動する内容が食い違い得る）
+//! 4. 適用できない指定の fail-closed 拒否・args / env の上限検証・rootfs の fd 固定（下記）
 //! 5. 起動権の予約: `StateStore::update` を revision 照合つきで呼び、Created を Running（pid なし）へ
 //!    原子的に遷移させる。別プロセスの同時 start はここで revision 不一致（`FailedPrecondition`）に
 //!    なり launch へ進めない（CORE-2）
@@ -57,8 +59,14 @@
 //! 合計 1 MiB。NUL 禁止・env は `KEY=VALUE`）を `LaunchSpec` 構築前に検証し、違反は `InvalidArgument`。
 //! `exec` は Linux 限定のため、値は本ファイルに複製し Linux では一致をテストで固定する。
 //!
-//! rootfs は検査直後にディレクトリを開いて実体の同一性を確認し、ハンドルを `LaunchSpec` に載せる
-//! （検査から使用までの差し替え = TOCTOU を閉じる。SEC-1。`RootfsDir` 参照）。
+//! rootfs は検査後、`/` から bundle を経て rootfs までの全要素（祖先を含む）を直前の fd を起点に
+//! symlink 非追従（`O_PATH|O_DIRECTORY|O_NOFOLLOW`）で 1 要素ずつ開いて fd で固定し、その fd を
+//! `LaunchSpec` に載せる（`exec::mount_proc` と同じ `exec::open_dir_beneath` を再利用。検査から使用まで・
+//! 祖先の差し替え = TOCTOU を閉じる。SEC-1。`RootfsDir` 参照）。固定に失敗したら `PermissionDenied`
+//! （bundle 配下の差し替え）または `InvalidArgument`（bundle 自体や祖先に symlink がある。本番 launcher の
+//! `exec::prepare_rootfs` も `/` から同条件で辿るため先に拒否する。create は受理するため「create 成功・
+//! start 拒否」になる）。fd 相対の open は Linux にしか無いため、Linux 以外では固定段（予約の前）で
+//! `Unimplemented` を返し起動しない（fail-closed。本番 launcher も Linux のみ。CLI-1）。
 //!
 //! `process.args[0]` がコンテナ内の絶対パス（先頭 `/`）でない場合は `InvalidArgument`（PATH 探索は未実装）。
 //! コンテナパスはホスト OS 非依存に文字列で判定する（Windows でも `/bin/echo` を受理する。3 OS 一級対応）。
@@ -236,7 +244,8 @@ fn release_claim(
     }
 }
 
-/// bundle を再検証し、start が適用できない指定を拒否したうえで [`LaunchSpec`] を組み立てる。
+/// bundle の `config.json` を一度だけ読んで検証し、start が適用できない指定を拒否したうえで、rootfs を
+/// fd で固定して [`LaunchSpec`] を組み立てる（`config.json` は読み直さない）。
 fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
     let (config, rootfs) = validate_bundle(bundle)?;
     let process = config.process().ok_or_else(|| {
@@ -300,18 +309,9 @@ fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
             "hostname requires the UTS namespace",
         ));
     }
-    // 検査済みパスの実体をハンドルで固定し、検査から使用までの差し替えを閉じる（SEC-1）。
-    // ハンドル取得後にもう一度検査し、取得までの間に祖先が symlink 化された場合を拒否する。
-    let rootfs_dir = RootfsDir::open_checked(&rootfs)?;
-    let (_, rechecked) = validate_bundle(bundle)?;
-    // 文字列比較だけでは、ハンドル取得後に rootfs や祖先が別実体へ差し替えられても通ってしまうため、
-    // 再検証したパスの実体（dev・ino）が保持ハンドルと同一であることも確認する。
-    if rechecked != rootfs || !rootfs_dir.is_same_entry(&rechecked) {
-        return Err(TraitError::new(
-            ErrorCode::PermissionDenied,
-            "rootfs changed after validation",
-        ));
-    }
+    // 検査済みの rootfs を、`/` から祖先を含む全要素を symlink 非追従で辿って fd で固定する（SEC-1）。
+    // 以後の使用はこの fd に限るため、検査後に祖先や rootfs を差し替えても固定した実体は変わらない。
+    let rootfs_dir = RootfsDir::pin(bundle, &rootfs)?;
     Ok(LaunchSpec::new(
         rootfs,
         rootfs_dir,
@@ -638,6 +638,7 @@ mod tests {
     }
 
     /// OCI-4: start で `process.args` 等がそのまま launcher に渡り、Running・pid 付きへ遷移する。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci4_start_launches_process_args_and_transitions_to_running() {
         let (b, store) = created("ok");
@@ -679,6 +680,7 @@ mod tests {
     }
 
     /// CORE-2: Running への再 start は FailedPrecondition で、launcher は 1 回のまま。
+    #[cfg(target_os = "linux")]
     #[test]
     fn core2_start_twice_returns_failed_precondition() {
         let (_b, store) = created("twice");
@@ -793,6 +795,7 @@ mod tests {
     }
 
     /// REPAIR-5: 状態更新に失敗したら起動済みプロセスをちょうど 1 回 terminate し、元のエラーを返す。
+    #[cfg(target_os = "linux")]
     #[test]
     fn repair5_start_terminates_process_when_state_update_fails() {
         let b = Bundle::new("upd-fail");
@@ -818,6 +821,7 @@ mod tests {
     }
 
     /// CORE-2: 同一 ID の start が進行中なら二重に launch せず FailedPrecondition を返す。
+    #[cfg(target_os = "linux")]
     #[test]
     fn core2_start_rejects_concurrent_start_of_same_id() {
         let (_b, store) = created("concurrent");
@@ -834,6 +838,7 @@ mod tests {
     }
 
     /// REPAIR-5: 状態更新と terminate の両方に失敗したら、終了失敗を Internal で伝える。
+    #[cfg(target_os = "linux")]
     #[test]
     fn repair5_start_reports_terminate_failure() {
         let b = Bundle::new("term-fail");
@@ -850,6 +855,7 @@ mod tests {
     }
 
     /// OCI-4: launcher 失敗はそのまま返り、状態は Created のまま。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci4_start_propagates_launcher_error_without_state_change() {
         let (_b, store) = created("launch-fail");
@@ -867,6 +873,7 @@ mod tests {
     }
 
     /// REPAIR-4: 成功・失敗が `start` 操作名で 1 件ずつ記録される。
+    #[cfg(target_os = "linux")]
     #[test]
     fn repair4_start_records_success_and_failure() {
         let (_b, store) = created("rec");
@@ -945,7 +952,15 @@ mod tests {
         assert_eq!(got.status().state(), ContainerState::Created);
         let err = recover_interrupted_start(&store, &launcher, &id).expect_err("not stuck");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        #[cfg(target_os = "linux")]
         start(&store, &OpRecorder::new(), &launcher, &sid("recover")).expect("start");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            start(&store, &OpRecorder::new(), &launcher, &sid("recover"))
+                .expect_err("no pinning")
+                .code(),
+            ErrorCode::Unimplemented
+        );
         drop(b);
     }
 
@@ -1000,6 +1015,7 @@ mod tests {
     }
 
     /// CORE-2: 起動権の予約（Created から Running への revision 照合つき更新）に負けたら launch しない。
+    #[cfg(target_os = "linux")]
     #[test]
     fn core2_start_does_not_launch_when_claim_is_lost() {
         let b = Bundle::new("claim-lost");
@@ -1014,34 +1030,80 @@ mod tests {
         assert_eq!(launcher.calls(), 0);
     }
 
-    /// SEC-1: 再検証パスの実体が保持ハンドルと異なる場合（祖先・rootfs の差し替え）は同一と判定しない。
-    #[cfg(unix)]
-    #[test]
-    fn sec1_rootfs_handle_rejects_swapped_entry() {
-        let (b, _store) = created("swap");
-        let rootfs = b.dir.join("rootfs");
-        let handle = RootfsDir::open_checked(&rootfs).expect("open");
-        assert!(handle.is_same_entry(&rootfs));
-        let other = b.dir.join("other");
-        std::fs::create_dir(&other).expect("mkdir");
-        assert!(!handle.is_same_entry(&other));
-        std::fs::rename(&rootfs, b.dir.join("moved")).expect("rename");
-        std::fs::create_dir(&rootfs).expect("mkdir");
-        assert!(!handle.is_same_entry(&rootfs));
-    }
-
-    /// SEC-1: 成功時の LaunchSpec は検査済み rootfs のハンドルを持つ（Unix）。
-    #[cfg(unix)]
+    /// SEC-1: 成功時の LaunchSpec は検査済み rootfs を固定した fd を持つ（Linux）。
+    #[cfg(target_os = "linux")]
     #[test]
     fn sec1_launch_spec_carries_rootfs_handle() {
+        use std::os::fd::AsRawFd;
         use std::os::unix::fs::MetadataExt;
         let (b, store) = created("handle");
         let launcher = RecordingLauncher::new(false);
         start(&store, &OpRecorder::new(), &launcher, &sid("handle")).expect("start");
         let specs = launcher.specs.lock().expect("lock");
         let spec = specs.first().expect("spec");
-        let handle = spec.rootfs_dir().file().metadata().expect("meta");
+        let fd = spec.rootfs_dir().as_fd().as_raw_fd();
+        let held = std::fs::metadata(format!("/proc/thread-self/fd/{fd}")).expect("meta");
         let named = std::fs::metadata(b.dir.join("rootfs")).expect("meta");
-        assert_eq!((handle.dev(), handle.ino()), (named.dev(), named.ino()));
+        assert_eq!((held.dev(), held.ino()), (named.dev(), named.ino()));
+    }
+
+    /// SEC-1: bundle の祖先が symlink なら（create は受理しても）start は起動前に拒否し、予約もしない。
+    /// 本番 launcher の `exec::prepare_rootfs` も `/` から symlink 非追従で辿るため、先に拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_start_rejects_bundle_under_symlinked_ancestor() {
+        let base =
+            std::env::temp_dir().join(format!("fandhe-oci-start-anc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("bundle").join("rootfs")).expect("mkdir");
+        std::fs::write(
+            real.join("bundle").join("config.json"),
+            serde_json::to_vec(&valid_config()).expect("serialize"),
+        )
+        .expect("write");
+        std::os::unix::fs::symlink(&real, base.join("link")).expect("symlink");
+        let bundle = base.join("link").join("bundle");
+        let store = MemStateStore::new(None);
+        let id = ContainerId::new("anc").expect("id");
+        create(
+            &store,
+            &OpRecorder::new(),
+            &CreateRequest::new(id.clone(), bundle).expect("absolute"),
+        )
+        .expect("create accepts the bundle");
+        let launcher = RecordingLauncher::new(false);
+        let err = start(&store, &OpRecorder::new(), &launcher, &sid("anc")).expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "bundle path must be a directory reachable without symlinks"
+        );
+        assert_eq!(launcher.calls(), 0);
+        let got = store.get(&GetStateRequest::new(id)).expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Created);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// SEC-1・CLI-1: Linux 以外は rootfs を fd で固定できないため、予約・launch の前に Unimplemented で拒否する。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn sec1_start_fails_closed_without_rootfs_pinning() {
+        let (_b, store) = created("nolinux");
+        let launcher = RecordingLauncher::new(false);
+        let err =
+            start(&store, &OpRecorder::new(), &launcher, &sid("nolinux")).expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert_eq!(
+            err.message(),
+            "start requires Linux to pin the rootfs directory"
+        );
+        assert_eq!((launcher.calls(), launcher.terminations()), (0, 0));
+        let got = store
+            .get(&GetStateRequest::new(
+                ContainerId::new("nolinux").expect("id"),
+            ))
+            .expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Created);
     }
 }

@@ -15,107 +15,111 @@
 //! を行う本番 launcher は後続 sub-issue（TASK-29 / TASK-157 系）で提供する。現時点で本 crate に
 //! launcher 実装は無く、実プロセスの起動は行われない。
 
+#[cfg(target_os = "linux")]
+use std::ffi::OsStr;
 use std::num::NonZeroU32;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::path::Component;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::config::NamespaceKind;
 use crate::traits::{ContainerId, ErrorCode, TraitError};
 
-/// 検査済み rootfs ディレクトリのハンドル（検査対象と使用対象を同一にする。SEC-1）。
+/// 検査済み rootfs ディレクトリの固定ハンドル（検査対象と使用対象を同一にする。SEC-1）。
 ///
-/// `start` が rootfs を検査した直後にディレクトリを開き、そのハンドルが検査したパスの実体（`st_dev`・
-/// `st_ino`）と一致し symlink でないことを確認して保持する。launcher は `rootfs()` のパス文字列を
-/// 再解決せず、このハンドル（`/proc/self/fd/<fd>` や `fchdir` 経由）から rootfs を使うこと。
-/// 検査から使用までの間にパスが symlink 等へ差し替えられても、ハンドルは検査済みの実体を指し続ける。
-/// Unix 以外にはハンドルの実装が無く（本番 launcher も Linux のみ。CLI-1）、空の値になる。
+/// start は `/` から bundle を経て rootfs までの**全要素**（祖先を含む）を、直前の要素の fd を起点に
+/// `O_PATH|O_DIRECTORY|O_NOFOLLOW` で 1 要素ずつ開いて rootfs を固定する（`exec::mount_proc` と同じ
+/// `exec::open_dir_beneath` を再利用する）。パスを別の操作で解決し直さないため、途中の祖先を symlink に
+/// 差し替えても・改名しても、固定した実体は bundle 配下で辿った rootfs のまま変わらない（TOCTOU の防止）。
+/// `O_PATH|O_DIRECTORY` は FIFO 等を open せず `ENOTDIR` で拒否するため、差し替えで open がブロック
+/// することもない（REPAIR-5）。
+///
+/// launcher は `LaunchSpec::rootfs` のパス文字列を再解決せず、`as_fd`（Linux） の fd（dirfd・
+/// `/proc/thread-self/fd/N`・`fchdir`）から rootfs を使うこと。fd は O_PATH のため読み書きはできない。
+///
+/// fd 相対の open は Linux の `sys` モジュールにしか無く、本番 launcher も Linux のみのため、Linux 以外
+/// では値を作れない（start は固定段で `Unimplemented` を返す。fail-closed。CLI-1）。
 #[derive(Debug, Clone)]
 pub struct RootfsDir {
-    #[cfg(unix)]
-    file: Arc<std::fs::File>,
+    #[cfg(target_os = "linux")]
+    fd: Arc<OwnedFd>,
+    /// Linux 以外では構築できないことを型で表す（値を持たない型）。
+    #[cfg(not(target_os = "linux"))]
+    never: std::convert::Infallible,
 }
 
-/// `O_NONBLOCK`（libc に依存しないため OS 別に定義する。値は x86_64・aarch64 とも同一）。
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
-const O_NONBLOCK: i32 = 0o4000;
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-const O_NONBLOCK: i32 = 0x0004;
-
 impl RootfsDir {
-    /// `path` のディレクトリを開き、検査済みの実体と同一であることを確認して保持する。
-    #[cfg(unix)]
-    pub(super) fn open_checked(path: &Path) -> Result<Self, TraitError> {
-        use std::os::unix::fs::MetadataExt;
-        let fail =
-            |msg: &'static str| TraitError::new(crate::traits::ErrorCode::PermissionDenied, msg);
-        use std::os::unix::fs::OpenOptionsExt;
-        // FIFO 等へ差し替えられても open がブロックしないよう O_NONBLOCK で開く（REPAIR-5）。
-        // ディレクトリでなければ下の種別検査で拒否する。
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NONBLOCK)
-            .open(path)
-            .map_err(|_| fail("cannot open rootfs directory"))?;
-        let opened = file
-            .metadata()
-            .map_err(|_| fail("cannot inspect rootfs directory"))?;
-        let named =
-            std::fs::symlink_metadata(path).map_err(|_| fail("cannot inspect rootfs directory"))?;
-        if named.file_type().is_symlink()
-            || !opened.is_dir()
-            || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
-        {
-            return Err(fail("rootfs changed after validation"));
-        }
-        Ok(Self {
-            file: Arc::new(file),
-        })
-    }
-
-    /// `path` が現在指す実体が、保持ハンドルの実体（`st_dev`・`st_ino`）と同一かを返す（SEC-1）。
+    /// `bundle`（絶対パス）配下の `rootfs` を、祖先を含む全要素を symlink 非追従で辿って固定する。
     ///
-    /// 再検証したパスの祖先や rootfs 自体が、ハンドル取得後に別ディレクトリへ差し替えられていないことの
-    /// 確認に使う。`path` 自体が symlink の場合・調べられない場合は `false`（fail-closed）。
-    #[cfg(unix)]
-    pub(super) fn is_same_entry(&self, path: &Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        let (Ok(held), Ok(named)) = (self.file.metadata(), std::fs::symlink_metadata(path)) else {
-            return false;
-        };
-        !named.file_type().is_symlink() && (held.dev(), held.ino()) == (named.dev(), named.ino())
+    /// `rootfs` は `validate_bundle` が返した検査済みパス（`bundle` 配下・`..` なし）。検査後に
+    /// bundle 配下の要素が symlink・非ディレクトリ・不在へ変わっていれば `PermissionDenied`
+    /// （`rootfs changed after validation`）、bundle 自体やその祖先が symlink を含む・ディレクトリで
+    /// ないなら `InvalidArgument`。本番 launcher の `exec::prepare_rootfs` も `/` から同じ条件で rootfs を
+    /// 辿るため、ここで先に拒否する。メッセージは固定文言のみ（パス・errno を含めない）。
+    #[cfg(target_os = "linux")]
+    pub(super) fn pin(bundle: &Path, rootfs: &Path) -> Result<Self, TraitError> {
+        use crate::exec::ViolationReason;
+        let invalid = |msg: &'static str| TraitError::new(ErrorCode::InvalidArgument, msg);
+        if !bundle.is_absolute() {
+            return Err(invalid("bundle path must be absolute"));
+        }
+        let rel = rootfs
+            .strip_prefix(bundle)
+            .map_err(|_| invalid("rootfs must be inside the bundle"))?;
+        let mut names: Vec<&OsStr> = Vec::new();
+        for c in rel.components() {
+            match c {
+                Component::Normal(n) => names.push(n),
+                Component::CurDir => {}
+                _ => return Err(invalid("root.path must not contain '..'")),
+            }
+        }
+        let fd = crate::exec::open_dir_beneath(bundle, &names).map_err(|e| {
+            match e.violation.as_ref().map(|v| v.reason) {
+                Some(ViolationReason::PathSymlinkOrNotDirectory | ViolationReason::PathMissing) => {
+                    TraitError::new(
+                        ErrorCode::PermissionDenied,
+                        "rootfs changed after validation",
+                    )
+                }
+                Some(_) => invalid("bundle path must be a directory reachable without symlinks"),
+                None => TraitError::new(e.code, "failed to open the rootfs directory"),
+            }
+        })?;
+        Ok(Self { fd: Arc::new(fd) })
     }
 
-    /// Unix 以外ではハンドルを持たないため常に同一とみなす。
-    #[cfg(not(unix))]
-    pub(super) fn is_same_entry(&self, _path: &Path) -> bool {
-        true
+    /// Linux 以外では rootfs を fd で固定できないため、起動仕様を作らず拒否する（fail-closed）。
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn pin(_bundle: &Path, _rootfs: &Path) -> Result<Self, TraitError> {
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "start requires Linux to pin the rootfs directory",
+        ))
     }
 
-    /// Unix 以外ではハンドルを持たない。
-    #[cfg(not(unix))]
-    pub(super) fn open_checked(_path: &Path) -> Result<Self, TraitError> {
-        Ok(Self {})
-    }
-
-    /// 検査済み rootfs ディレクトリのファイルハンドル。
-    #[cfg(unix)]
-    pub fn file(&self) -> &std::fs::File {
-        &self.file
+    /// 固定した rootfs ディレクトリの fd（O_PATH。dirfd・`/proc/thread-self/fd/N`・`fchdir` 専用）。
+    #[cfg(target_os = "linux")]
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 
 impl PartialEq for RootfsDir {
     fn eq(&self, other: &Self) -> bool {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
-            Arc::ptr_eq(&self.file, &other.file)
+            Arc::ptr_eq(&self.fd, &other.fd)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         {
             let _ = other;
-            true
+            match self.never {}
         }
     }
 }
@@ -124,9 +128,9 @@ impl Eq for RootfsDir {}
 
 /// launcher へ渡す、検証済みの起動仕様。
 ///
-/// 構築は `start` のみ（`pub(super)`）で、config パーサの上限（`CONFIG_MAX_*`）検証と
-/// `validate_bundle` の rootfs 検査を通った値だけを持つ。`args` は 1 件以上・先頭は絶対パス。
-/// シェルを介さず配列のまま渡すこと（インジェクション防止）。
+/// 構築は `start` のみ（`pub(super)`）で、一度だけ読んだ `config.json` について、config パーサの上限
+/// （`CONFIG_MAX_*`）検証と `validate_bundle` の rootfs 検査・`RootfsDir::pin` の固定を通った値だけを
+/// 持つ。`args` は 1 件以上・先頭は絶対パス。シェルを介さず配列のまま渡すこと（インジェクション防止）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LaunchSpec {
@@ -162,7 +166,7 @@ impl LaunchSpec {
         &self.rootfs
     }
 
-    /// 検査済み rootfs のディレクトリハンドル（SEC-1。[`RootfsDir`] 参照）。
+    /// 検査済み rootfs の固定ハンドル（SEC-1。[`RootfsDir`] 参照）。
     pub fn rootfs_dir(&self) -> &RootfsDir {
         &self.rootfs_dir
     }
@@ -209,7 +213,7 @@ pub trait LaunchedProcess: Send {
 /// - 起動確認（子からの通知待ち等）には必ず上限時間を設け、超過時は `ErrorCode::Timeout`（REPAIR-5）
 /// - exec フローの fail-closed（制限証跡なしの exec 拒否。SEC-1・CORE-5）を回避しない
 /// - 失敗時にプロセスを残さない
-/// - rootfs は [`LaunchSpec::rootfs_dir`] のハンドルから使い、`rootfs()` のパスを再解決しない（SEC-1）
+/// - rootfs は [`LaunchSpec::rootfs_dir`] の固定ハンドルから使い、`rootfs()` のパスを再解決しない（SEC-1）
 /// - `linux.uidMappings` / `gidMappings` は `start` が拒否済みで `LaunchSpec` に載らない。user namespace の
 ///   写像は launcher の責務で、コンテナ内 root（uid/gid 0）をホストの非特権 UID・GID（呼び出しプロセスの
 ///   euid・egid。0 なら拒否）へ写すこと。`exec::plan` / `exec::isolate` が既定でこの写像を行う（SEC-5）
@@ -233,5 +237,113 @@ pub trait ProcessLauncher: Send + Sync {
             ErrorCode::Unimplemented,
             "the launcher cannot confirm that no process remains for this container",
         ))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// テスト用の一意なディレクトリ（終了時に削除）。
+    #[cfg(target_os = "linux")]
+    struct TempDir(PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("fandhe-oci-launch-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            Self(dir)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dev_ino(meta: &std::fs::Metadata) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ino())
+    }
+
+    /// 固定した fd の実体（`/proc/thread-self/fd/N` 経由の fstat 相当）。
+    #[cfg(target_os = "linux")]
+    fn held(dir: &RootfsDir) -> (u64, u64) {
+        use std::os::fd::AsRawFd;
+        let meta = std::fs::metadata(format!("/proc/thread-self/fd/{}", dir.as_fd().as_raw_fd()))
+            .expect("fd meta");
+        dev_ino(&meta)
+    }
+
+    /// SEC-1: bundle 配下の祖先が bundle 外への symlink なら固定を拒否する（検査後の差し替え = TOCTOU）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_pin_rejects_symlinked_ancestor_below_bundle() {
+        let t = TempDir::new("anc");
+        let bundle = t.0.join("bundle");
+        let outside = t.0.join("outside");
+        std::fs::create_dir_all(outside.join("rootfs")).expect("outside");
+        std::fs::create_dir_all(&bundle).expect("bundle");
+        std::os::unix::fs::symlink(&outside, bundle.join("a")).expect("symlink");
+        let err = RootfsDir::pin(&bundle, &bundle.join("a").join("rootfs")).expect_err("fail");
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert_eq!(err.message(), "rootfs changed after validation");
+    }
+
+    /// SEC-1・REPAIR-5: rootfs が FIFO に差し替えられていても open でブロックせず拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_pin_rejects_fifo_without_blocking() {
+        let t = TempDir::new("fifo");
+        let fifo = t.0.join("rootfs");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+        let err = RootfsDir::pin(&t.0, &fifo).expect_err("fail");
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert_eq!(err.message(), "rootfs changed after validation");
+    }
+
+    /// SEC-1: 固定後に祖先を改名して同名の別ディレクトリを置いても、ハンドルは元の実体を指し続ける。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_pin_keeps_original_entity_after_ancestor_rename() {
+        let t = TempDir::new("rename");
+        let rootfs = t.0.join("a").join("rootfs");
+        std::fs::create_dir_all(&rootfs).expect("rootfs");
+        let original = dev_ino(&std::fs::metadata(&rootfs).expect("meta"));
+        let dir = RootfsDir::pin(&t.0, &rootfs).expect("pin");
+        std::fs::rename(t.0.join("a"), t.0.join("moved")).expect("rename");
+        std::fs::create_dir_all(&rootfs).expect("replacement");
+        let replacement = dev_ino(&std::fs::metadata(&rootfs).expect("meta"));
+        assert_ne!(original, replacement);
+        assert_eq!(held(&dir), original);
+    }
+
+    /// SEC-1: bundle 自体（または祖先）が symlink なら InvalidArgument（本番 launcher も同条件で辿る）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_pin_rejects_symlinked_bundle() {
+        let t = TempDir::new("bl");
+        let real = t.0.join("real");
+        std::fs::create_dir_all(real.join("rootfs")).expect("real");
+        let link = t.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let err = RootfsDir::pin(&link, &link.join("rootfs")).expect_err("fail");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "bundle path must be a directory reachable without symlinks"
+        );
+        let err = RootfsDir::pin(Path::new("rel"), Path::new("rel/rootfs")).expect_err("fail");
+        assert_eq!(err.message(), "bundle path must be absolute");
     }
 }

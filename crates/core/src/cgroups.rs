@@ -389,6 +389,37 @@ fn parse_procs(step: CgroupStep, text: &str) -> Result<Vec<u32>, CgroupError> {
     Ok(pids)
 }
 
+/// `cgroup.subtree_control` へ書き込んだ後に読み戻した集合 `enabled` が、要求 `want` をすべて含むことを
+/// 検証する（CORE-3）。カーネルは 1 回の書き込みを全部か無しで適用するため、書き込み成功後の不足は
+/// 同じ親を操作する別主体の `-<controller>` 書き込み等の競合を意味する。要求を満たさない状態を成功と
+/// して返さないよう `FailedPrecondition` にする（何が有効だったかは書き込み前に分からないため巻き戻さない）。
+fn verify_enabled(want: &ControllerSet, enabled: &ControllerSet) -> Result<(), CgroupError> {
+    let missing: Vec<&str> = want
+        .iter()
+        .filter(|c| !enabled.contains(*c))
+        .map(Controller::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(CgroupError::precondition(
+        CgroupStep::EnableControllers,
+        format!(
+            "controllers not enabled after writing cgroup.subtree_control: {}",
+            missing.join(" ")
+        ),
+    ))
+}
+
+/// 削除後に保持 fd 経由で interface ファイルを開いた結果が「保持していた cgroup が削除済み」を示すか。
+///
+/// `rmdir` 成功後のディレクトリ inode は dead（`S_DEAD`）になり、それを起点にした lookup は `ENOENT`
+/// を返す。削除済みの証拠として扱うのは `ENOENT` だけで、`EACCES`・`EINTR`・`EMFILE` 等の他の失敗は
+/// 保持していた cgroup が残っている可能性を否定できないため成功扱いしない（fail-closed）。
+fn removal_confirmed(err: &SysError) -> bool {
+    matches!(err, SysError::Os(e) if *e == sys::ENOENT)
+}
+
 /// 要求された controller が利用可能集合に収まることを書き込み前に検証する。
 fn validate_controller_request(
     available: &ControllerSet,
@@ -488,8 +519,12 @@ fn read_self_cgroup() -> Result<CgroupPath, CgroupError> {
 }
 
 /// fd の (dev, ino)（O_PATH fd でも `fstat` できる）。同一ディレクトリ判定に使う。
-fn dir_identity(fd: BorrowedFd<'_>, what: &str) -> Result<(u64, u64), CgroupError> {
-    let step = CgroupStep::Cleanup;
+/// `step` は失敗時のエラーに載せる呼び出し元の段（REPAIR-4 の切り分け用）。
+fn dir_identity(
+    step: CgroupStep,
+    fd: BorrowedFd<'_>,
+    what: &str,
+) -> Result<(u64, u64), CgroupError> {
     let dup = fd
         .try_clone_to_owned()
         .map_err(|e| io_error(step, what, &e))?;
@@ -577,6 +612,25 @@ struct Rollback {
     moved: bool,
     /// 退避リーフを本処理が新規作成した（既存の再利用では削除しない）。
     leaf_created: bool,
+    /// 新規作成した退避リーフの fd（`leaf_created` のときのみ）。削除時の同一性確認に使う。
+    /// 作成後に開けなかった場合は `None` のままで、名前指定の削除に落ちる（結果に未検証と記す）。
+    leaf_fd: Option<OwnedFd>,
+}
+
+/// `parent` 配下の `name` を名前指定で削除する（保持 fd が無い巻き戻し経路専用）。
+/// 削除した実体が本処理の作成物か確認できないため、成否にかかわらず結果を `err` に併記する。
+fn remove_unverified(parent: BorrowedFd<'_>, name: &str, err: &mut CgroupError) {
+    let step = CgroupStep::Cleanup;
+    let outcome = cstring(step, name)
+        .and_then(|c| sys::remove_dir_at(parent, &c).map_err(|e| sys_error(step, "rmdir", e)));
+    match outcome {
+        Ok(()) => err.message.push_str(&format!(
+            "; {name} was removed by name without identity verification"
+        )),
+        Err(e) => err
+            .message
+            .push_str(&format!("; cleanup of {name} failed ({})", e.message)),
+    }
 }
 
 impl DelegatedCgroup {
@@ -666,7 +720,9 @@ impl DelegatedCgroup {
     /// `cgroup.procs` に自プロセスがいる・親の `cgroup.procs` に自プロセス以外が
     /// いない（他者の PID は動かさない）・退避後に親の `cgroup.procs` が空・`/proc/self/cgroup` が
     /// 退避リーフを指す・コンテナ用子 cgroup の `cgroup.procs` が空。既存の同名子 cgroup は採用せず
-    /// `AlreadyExists`。途中失敗時は、自プロセスを移していれば元の親へ戻し（失敗時はエラー文に併記）、本処理が作った子 cgroup・退避リーフを best-effort で削除する。
+    /// `AlreadyExists`。途中失敗時は、自プロセスを移していれば元の親へ戻して所属を読み戻しで検証し、
+    /// 本処理が作った子 cgroup・退避リーフを作成直後に固定した fd との同一性を確認してから best-effort で
+    /// 削除する（[`Self::remove_verified`]。巻き戻しの失敗・fd が無く名前指定で消した事実はエラー文に併記）。
     pub fn prepare(&self, name: &CgroupName) -> Result<(ContainerCgroup, Evacuated), CgroupError> {
         let me = std::process::id();
         let parent_procs = parse_procs(
@@ -700,10 +756,29 @@ impl DelegatedCgroup {
         let child_name = cstring(CgroupStep::CreateChild, name.as_str())?;
         sys::mkdir_at(self.fd.as_fd(), &child_name, CGROUP_DIR_MODE)
             .map_err(|e| sys_error(CgroupStep::CreateChild, name.as_str(), e))?;
+        // 作成直後の子を fd で固定する。以後の巻き戻しはこの fd との同一性を確認してから削除する。
+        let child_fd =
+            match open_cgroup_dir(CgroupStep::CreateChild, self.fd.as_fd(), name.as_str()) {
+                Ok(fd) => fd,
+                Err(mut err) => {
+                    remove_unverified(self.fd.as_fd(), name.as_str(), &mut err);
+                    return Err(err);
+                }
+            };
 
         let mut rollback = Rollback::default();
-        match self.evacuate_and_verify(name, &mut rollback) {
-            Ok(result) => Ok(result),
+        match self.evacuate_and_verify(child_fd.as_fd(), &mut rollback) {
+            Ok(parent_id) => Ok((
+                ContainerCgroup {
+                    name: name.clone(),
+                    fd: child_fd,
+                    parent_id,
+                },
+                Evacuated {
+                    parent: self.path.clone(),
+                    parent_id,
+                },
+            )),
             Err(mut err) => {
                 // 自プロセスを退避リーフへ移した後の失敗は、元の親へ戻してから子・退避リーフを削除する。
                 if rollback.moved
@@ -714,20 +789,24 @@ impl DelegatedCgroup {
                         e.message
                     ));
                 }
-                if rollback.leaf_created
-                    && let Ok(leaf_c) = cstring(CgroupStep::Cleanup, EVACUATION_LEAF)
-                    && let Err(e) = sys::remove_dir_at(self.fd.as_fd(), &leaf_c)
-                {
-                    err.message.push_str(&format!(
-                        "; cleanup of {EVACUATION_LEAF} failed ({})",
-                        sys_error(CgroupStep::Cleanup, "rmdir", e).message
-                    ));
+                if rollback.leaf_created {
+                    match &rollback.leaf_fd {
+                        Some(leaf_fd) => {
+                            if let Err(e) = self.remove_verified(EVACUATION_LEAF, leaf_fd.as_fd()) {
+                                err.message.push_str(&format!(
+                                    "; cleanup of {EVACUATION_LEAF} failed ({})",
+                                    e.message
+                                ));
+                            }
+                        }
+                        None => remove_unverified(self.fd.as_fd(), EVACUATION_LEAF, &mut err),
+                    }
                 }
-                if let Err(e) = sys::remove_dir_at(self.fd.as_fd(), &child_name) {
+                if let Err(e) = self.remove_verified(name.as_str(), child_fd.as_fd()) {
                     err.message.push_str(&format!(
                         "; cleanup of {} failed ({})",
                         name.as_str(),
-                        sys_error(CgroupStep::Cleanup, "rmdir", e).message
+                        e.message
                     ));
                 }
                 Err(err)
@@ -736,6 +815,9 @@ impl DelegatedCgroup {
     }
 
     /// 自プロセスを委譲された親 cgroup へ戻す（退避後に失敗した場合の巻き戻し）。
+    ///
+    /// 書き込みの成功だけでは所属の復元を確認できないため、書き込み後に `/proc/self/cgroup` が
+    /// 検出済みの親を指すことを読み戻して検証する（不一致は `FailedPrecondition`）。
     fn restore_self(&self) -> Result<(), CgroupError> {
         let step = CgroupStep::Cleanup;
         let procs = cstring(step, "cgroup.procs")?;
@@ -743,16 +825,31 @@ impl DelegatedCgroup {
             .map_err(|e| sys_error(step, "open parent cgroup.procs", e))?;
         File::from(wfd)
             .write_all(std::process::id().to_string().as_bytes())
-            .map_err(|e| io_error(step, "write parent cgroup.procs", &e))
+            .map_err(|e| io_error(step, "write parent cgroup.procs", &e))?;
+        let actual = read_self_cgroup().map_err(|mut e| {
+            e.step = step;
+            e
+        })?;
+        if actual != self.path {
+            return Err(CgroupError::precondition(
+                step,
+                format!(
+                    "self cgroup is {} after restoring, expected {}",
+                    actual.display(),
+                    self.path.display()
+                ),
+            ));
+        }
+        Ok(())
     }
 
+    /// 自プロセスを退避リーフへ移し、退避を検証する。成功時は親 cgroup の (dev, ino) を返す。
+    /// `child` は `prepare` が作成直後に固定したコンテナ用子 cgroup の fd。
     fn evacuate_and_verify(
         &self,
-        name: &CgroupName,
+        child: BorrowedFd<'_>,
         rollback: &mut Rollback,
-    ) -> Result<(ContainerCgroup, Evacuated), CgroupError> {
-        let child_fd = open_cgroup_dir(CgroupStep::CreateChild, self.fd.as_fd(), name.as_str())?;
-
+    ) -> Result<(u64, u64), CgroupError> {
         // 退避リーフ。既存なら再利用（cgroup2 であることは open_cgroup_dir が確認する）。
         let leaf_c = cstring(CgroupStep::CreateChild, EVACUATION_LEAF)?;
         match sys::mkdir_at(self.fd.as_fd(), &leaf_c, CGROUP_DIR_MODE) {
@@ -761,6 +858,14 @@ impl DelegatedCgroup {
             Err(e) => return Err(sys_error(CgroupStep::CreateChild, EVACUATION_LEAF, e)),
         }
         let leaf_fd = open_cgroup_dir(CgroupStep::Evacuate, self.fd.as_fd(), EVACUATION_LEAF)?;
+        if rollback.leaf_created {
+            // 巻き戻し時の同一性確認用に複製を持たせる（失敗時は名前指定の削除に落ちる）。
+            rollback.leaf_fd = Some(
+                leaf_fd
+                    .try_clone()
+                    .map_err(|e| io_error(CgroupStep::Evacuate, "dup leaf cgroup fd", &e))?,
+            );
+        }
 
         // TGID を書くとスレッドグループ全体が移動する。
         let procs = cstring(CgroupStep::Evacuate, "cgroup.procs")?;
@@ -803,7 +908,7 @@ impl DelegatedCgroup {
         // 検証 3: 自プロセスがコンテナ用子 cgroup の外にいる（子が空）。
         let in_child = parse_procs(
             verify,
-            &read_iface(verify, child_fd.as_fd(), "cgroup.procs", PROCS_LIMIT)?,
+            &read_iface(verify, child, "cgroup.procs", PROCS_LIMIT)?,
         )?;
         if !in_child.is_empty() {
             return Err(CgroupError::precondition(
@@ -812,23 +917,14 @@ impl DelegatedCgroup {
             ));
         }
 
-        Ok((
-            ContainerCgroup {
-                name: name.clone(),
-                fd: child_fd,
-                parent_id: dir_identity(self.fd.as_fd(), "stat parent cgroup")?,
-            },
-            Evacuated {
-                parent: self.path.clone(),
-                parent_id: dir_identity(self.fd.as_fd(), "stat parent cgroup")?,
-            },
-        ))
+        dir_identity(verify, self.fd.as_fd(), "stat parent cgroup")
     }
 
     /// 親 cgroup の `cgroup.subtree_control` で controller を有効化し、有効化後の集合を返す。
     ///
     /// 退避済みの証明 [`Evacuated`] を要求する（no-internal-process 制約。CORE-3）。`want` が
-    /// 利用可能集合に収まらない場合は書き込まず `FailedPrecondition`。
+    /// 利用可能集合に収まらない場合は書き込まず `FailedPrecondition`。書き込み後に読み戻した集合が
+    /// `want` をすべて含まない場合も `FailedPrecondition`（要求を満たさない状態を成功として返さない）。
     pub fn enable_controllers(
         &self,
         proof: &Evacuated,
@@ -844,7 +940,7 @@ impl DelegatedCgroup {
         validate_controller_request(&self.controllers, want)?;
         // トークン取得後に親が置換された・自プロセスが親へ戻った場合は書き込まない
         // （no-internal-process 制約違反の防止）。
-        let current_id = dir_identity(self.fd.as_fd(), "stat parent cgroup")?;
+        let current_id = dir_identity(step, self.fd.as_fd(), "stat parent cgroup")?;
         if current_id != proof.parent_id {
             return Err(CgroupError::precondition(
                 step,
@@ -867,55 +963,66 @@ impl DelegatedCgroup {
         File::from(wfd)
             .write_all(want.to_enable_request().as_bytes())
             .map_err(|e| io_error(step, "write cgroup.subtree_control", &e))?;
-        Ok(ControllerSet::parse(&read_iface(
+        let enabled = ControllerSet::parse(&read_iface(
             step,
             self.fd.as_fd(),
             "cgroup.subtree_control",
             SMALL_FILE_LIMIT,
-        )?))
+        )?);
+        verify_enabled(want, &enabled)?;
+        Ok(enabled)
     }
 
     /// コンテナ用子 cgroup を削除する（空であること。残りがあれば `FailedPrecondition`）。
     ///
     /// `child` は借用で受けるため、`EBUSY` 等で失敗しても呼び出し側がハンドルを保持したまま再試行できる。
-    /// 削除前に、`child` がこの親の配下で作られたもので、親ディレクトリ上の同名エントリが `child` の
-    /// fd と同一の cgroup であることを検証する（別スコープの同名子・差し替えられた子の誤削除を防ぐ）。
-    ///
-    /// cgroup の削除は fd 指定ができず名前指定の `unlinkat` のみのため、同一性確認と削除の間に
-    /// 同一 euid の別主体が同名エントリを差し替える競合は原理的に塞げない（親は euid 所有の委譲
-    /// cgroup で、他 UID は差し替えられない。削除できるのは空の cgroup のみ）。そこで削除後に保持 fd が
-    /// 失効したこと（`cgroup.events` が読めないこと）を確認し、別の cgroup を消した場合は検出して
-    /// `Internal` エラーで報告する。
+    /// `child` がこの親の配下で作られたものであることを確認したうえで、[`Self::remove_verified`] で
+    /// 同一性確認・削除・削除済み確認を行う。
     pub fn remove_child(&self, child: &ContainerCgroup) -> Result<(), CgroupError> {
         let step = CgroupStep::Cleanup;
-        if child.parent_id != dir_identity(self.fd.as_fd(), "stat parent cgroup")? {
+        if child.parent_id != dir_identity(step, self.fd.as_fd(), "stat parent cgroup")? {
             return Err(CgroupError::precondition(
                 step,
                 "container cgroup does not belong to this delegated cgroup",
             ));
         }
-        let entry = open_cgroup_dir(step, self.fd.as_fd(), child.name.as_str())?;
-        if dir_identity(entry.as_fd(), "stat child entry")?
-            != dir_identity(child.fd.as_fd(), "stat child cgroup")?
+        self.remove_verified(child.name.as_str(), child.fd.as_fd())
+    }
+
+    /// 親直下の `name` を、保持 fd `held` と同一の cgroup であることを確かめてから削除し、削除済みを確認する。
+    /// `remove_child` と `prepare` の巻き戻し（コンテナ用子 cgroup・新規作成した退避リーフ）が共用する。
+    ///
+    /// 削除前に、親ディレクトリ上の同名エントリが `held` と同一の cgroup であることを検証する
+    /// （別スコープの同名子・差し替えられた子の誤削除を防ぐ）。cgroup の削除は fd 指定ができず
+    /// 名前指定の `unlinkat` のみのため、同一性確認と削除の間に同一 euid の別主体が同名エントリを
+    /// 差し替える競合は原理的に塞げない（親は euid 所有の委譲 cgroup で、他 UID は差し替えられない。
+    /// 削除できるのは空の cgroup のみ）。そこで削除後に `held` 経由で `cgroup.events` を開き、
+    /// `ENOENT`（[`removal_confirmed`]）のときだけ成功とする。開けた場合は別の cgroup を消したとして
+    /// `Internal`、その他の失敗は保持していた cgroup が残っている可能性を否定できないためエラーを返す。
+    fn remove_verified(&self, name: &str, held: BorrowedFd<'_>) -> Result<(), CgroupError> {
+        let step = CgroupStep::Cleanup;
+        let entry = open_cgroup_dir(step, self.fd.as_fd(), name)?;
+        if dir_identity(step, entry.as_fd(), "stat cgroup entry")?
+            != dir_identity(step, held, "stat held cgroup")?
         {
             return Err(CgroupError::precondition(
                 step,
-                "container cgroup entry no longer matches the held handle",
+                "cgroup entry no longer matches the held handle",
             ));
         }
         drop(entry);
-        let c = cstring(step, child.name.as_str())?;
-        sys::remove_dir_at(self.fd.as_fd(), &c)
-            .map_err(|e| sys_error(step, child.name.as_str(), e))?;
-        // 保持 fd が指す cgroup が削除済みなら interface ファイルは開けない。
-        if read_iface(step, child.fd.as_fd(), "cgroup.events", SMALL_FILE_LIMIT).is_ok() {
-            return Err(CgroupError::new(
+        let c = cstring(step, name)?;
+        sys::remove_dir_at(self.fd.as_fd(), &c).map_err(|e| sys_error(step, name, e))?;
+        let events = cstring(step, "cgroup.events")?;
+        match sys::open_read_at(held, &events) {
+            Err(e) if removal_confirmed(&e) => Ok(()),
+            Ok(_) => Err(CgroupError::new(
                 ErrorCode::Internal,
                 step,
-                "removed cgroup entry was not the held container cgroup (concurrent replacement)",
-            ));
+                "removed cgroup entry was not the held cgroup (concurrent replacement)",
+            )),
+            Err(e) => Err(sys_error(step, "confirm removal via held cgroup.events", e)),
         }
-        Ok(())
     }
 }
 

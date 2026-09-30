@@ -154,11 +154,19 @@ if [ -e "$output_file" ] && [ ! -f "$output_file" ]; then
   err "invalid-output" "$output_file is not a regular file"
   exit 2
 fi
-out_dir="$(dirname -- "$output_file")"
-if [ ! -d "$out_dir" ]; then
+out_dir_raw="$(dirname -- "$output_file")"
+if [ ! -d "$out_dir_raw" ]; then
   err "invalid-output" "parent directory of $output_file does not exist"
   exit 2
 fi
+# 親ディレクトリを物理パス（symlink 解決済み）へ固定する。以降の候補作成・置換はこの固定パスだけを
+# 基に行い、検証後に親ディレクトリの symlink が差し替えられても書き込み先が変わらないようにする（TOCTOU 対策）。
+if ! out_dir="$(cd -- "$out_dir_raw" && pwd -P)"; then
+  err "invalid-output" "cannot resolve parent directory of $output_file"
+  exit 2
+fi
+out_name="$(basename -- "$output_file")"
+final_path="${out_dir}/${out_name}"
 
 # shellcheck disable=SC2016 # $name 等は jq 側の変数参照（シェル展開させない）。
 jq_program='
@@ -257,9 +265,15 @@ if [ "$rc" -ne 0 ]; then
 fi
 
 # 出力先と同じディレクトリの tmp から mv してアトミックに置き換える。
-cand_tmp="$(mktemp "${output_file}.XXXXXX")"
+cand_tmp="$(mktemp "${final_path}.XXXXXX")"
 cp "${tmp_dir}/baseline.json" "$cand_tmp"
 chmod 644 "$cand_tmp"
-mv -f "$cand_tmp" "$output_file"
+# 置換直前に出力先の状態を再検証する（検証〜置換の間に symlink / ディレクトリへ差し替えられた場合は拒否）。
+# 残る窓は再検証〜mv の数命令分のみで、書き込み先は固定済みの物理ディレクトリ配下に限られる。
+if [ -L "$final_path" ] || { [ -e "$final_path" ] && [ ! -f "$final_path" ]; }; then
+  err "invalid-output" "$final_path changed to a symlink or non-regular file, refusing to replace"
+  exit 2
+fi
+mv -f -- "$cand_tmp" "$final_path"
 cand_tmp=""
 echo "generated: ${output_file}"

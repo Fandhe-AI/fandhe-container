@@ -198,7 +198,7 @@ enum Slot<T> {
 }
 
 /// [`call_bounded`] が結果を得られなかった理由。
-enum Unbounded {
+pub(super) enum Unbounded {
     /// 上限（＋猶予）を過ぎた、または実行スレッドが結果を返さずに終わった（panic 等）。
     TimedOut,
     /// 実行スレッドを作れなかった（`call` は実行されていない）。
@@ -207,13 +207,13 @@ enum Unbounded {
 
 /// `call` を別スレッドで実行し、`limit` ＋ [`LAUNCHER_REPLY_GRACE`] までに戻った結果だけを返す（REPAIR-5）。
 ///
-/// launcher・起動済みプロセスへの呼び出し境界で上限を強制する。上限を過ぎたら `Unbounded::TimedOut` を
+/// launcher・起動済みプロセスへの呼び出し境界で上限を強制する（`kill.rs` の signaler 呼び出しからも使う）。上限を過ぎたら `Unbounded::TimedOut` を
 /// 返して待つのをやめ、後から戻った結果は実行スレッド上で `on_late` に渡す（起動済みプロセスの
 /// terminate 等）。結果の受け渡しと「待つのをやめた」印は同じ `Mutex` の下で行うため、戻った結果が
 /// 誰にも処理されずに捨てられることはない。実行スレッドが `call` の途中で panic した場合は結果が
 /// 無いまま上限を迎え `TimedOut` になる（結果が不明なので予約は残す側に倒す）。実装が永久に戻らない
 /// 場合、実行スレッドはプロセス終了まで残る（Rust にスレッドの強制停止は無い）が、呼び出し側は上限で戻る。
-fn call_bounded<T, F, L>(limit: Duration, call: F, on_late: L) -> Result<T, Unbounded>
+pub(super) fn call_bounded<T, F, L>(limit: Duration, call: F, on_late: L) -> Result<T, Unbounded>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,

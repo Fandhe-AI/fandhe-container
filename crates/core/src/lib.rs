@@ -26,11 +26,14 @@
 //!   リンクしない）
 //! - `observability`: メトリクス集計型 `OpStats` 等（TASK-84.1）と記録 API `OpRecorder`
 //!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。計装は TASK-84.4 以降で未実装。io 向け連携点は io 側に定義済み（TASK-84.5）
+//! - `rootless`: user namespace の UID/GID 写像の設定・読み戻し検証（Linux 限定。CORE-6・SEC-5・
+//!   TASK-40.1）。検証済み写像型・subuid/subgid 解析・`Direct` / `newuidmap` 経由の書き込みが実装済みで、
+//!   `exec` の起動フローへの組み込みは TASK-40.2（#188）で未実装
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - `oci_runtime`: OCI Runtime のライフサイクル。`config.json` の型・パーサ
 //!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。
 //!   start（TASK-29.3）は実装済みだが起動は `ProcessLauncher` の依存注入で、本番 launcher と実 exec は未提供。
-//!   kill / delete は TASK-30 で追加する予定で未実装
+//!   kill（TASK-30.1）も実装済みで、送信は `ProcessSignaler` の依存注入（本番実装は supervisor 待ち）。delete は TASK-30.2 で追加する予定で未実装
 //! - `state_store`: ファイルベース `StateStore`（TASK-31.1・OCI-5）は実装済み。fsync・残骸掃除の強化は
 //!   TASK-31.2（#156）、結合テストは TASK-31.3（#157）で行う予定
 //! - 予定（未作成）: `cgroups`（TASK-32・CORE-3）・`plugin_discovery`（TASK-109）
@@ -54,6 +57,8 @@ pub mod exec;
 pub mod observability;
 pub mod oci_runtime;
 pub mod state_store;
+#[cfg(target_os = "linux")]
+pub mod rootless;
 #[cfg(target_os = "linux")]
 mod sys;
 pub mod traits;

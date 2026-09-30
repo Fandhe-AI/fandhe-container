@@ -87,8 +87,8 @@ pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_defa
 pub use process::{
     ChildExit, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,
-    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, exec_entrypoint, spawn_container,
-    spawn_container_with_stages,
+    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, SignalDelivery, exec_entrypoint,
+    spawn_container, spawn_container_with_stages,
 };
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};

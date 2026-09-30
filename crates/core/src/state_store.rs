@@ -1837,6 +1837,82 @@ mod tests {
         assert_eq!(ids, ["a"]);
     }
 
+    fn mkfifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed: {status:?}");
+    }
+
+    /// 別スレッドで実行し、上限内に戻らなければ失敗させる（FIFO で止まる退行をハングにしない）。
+    fn within_deadline<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("must not block on a FIFO")
+    }
+
+    /// REPAIR-5・OCI-5: `@lock`・`state.json`・`@revision` が FIFO に置き換わっていても open で
+    /// 止まらず、固定メッセージのエラーを返す。`state.json` の FIFO は破損として回復できる。
+    #[test]
+    fn repair5_fifo_entries_do_not_block() {
+        let t = TmpDir::new("fifo");
+        let store = Arc::new(t.open());
+        create(&store, "a");
+        // state.json が FIFO: get は種別の異常として失敗し、purge で回復できる。
+        let a_state = t.path().join("a").join("state.json");
+        fs::remove_file(&a_state).unwrap();
+        mkfifo(&a_state);
+        let s = Arc::clone(&store);
+        let e = within_deadline(move || s.get(&GetStateRequest::new(cid("a")))).unwrap_err();
+        assert_eq!(e.message(), "state file is not a regular file");
+        assert_eq!(store.find_corrupted().unwrap(), vec![cid("a")]);
+        store.purge_corrupted(&cid("a")).unwrap();
+        assert!(!t.path().join("a").exists());
+        // @revision が FIFO: create は払い出さずに失敗する。
+        let rev = t.path().join("@revision");
+        let saved = fs::read(&rev).unwrap();
+        fs::remove_file(&rev).unwrap();
+        mkfifo(&rev);
+        let s = Arc::clone(&store);
+        let e = within_deadline(move || {
+            let req =
+                CreateStateRequest::new(ContainerStatus::creating(cid("b")), bundle()).unwrap();
+            s.create(&req)
+        })
+        .unwrap_err();
+        assert_eq!(e.message(), "revision file is not a regular file");
+        fs::remove_file(&rev).unwrap();
+        fs::write(&rev, saved).unwrap();
+        // @lock が FIFO（読み手なし）: 期限判定の前に open で止まらず、Timeout ではなく即座に失敗する。
+        let lock = t.path().join(LOCK_FILE);
+        fs::remove_file(&lock).unwrap();
+        mkfifo(&lock);
+        let s = Arc::clone(&store);
+        let started = Instant::now();
+        let e = within_deadline(move || s.get(&GetStateRequest::new(cid("a")))).unwrap_err();
+        assert_eq!(e.code().as_str(), "INTERNAL");
+        assert_eq!(e.message(), "failed to open the state lock file");
+        assert!(started.elapsed() < STATE_LOCK_TIMEOUT);
+    }
+
+    /// REPAIR-5: 種別検査の後に FIFO へ置き換わった場合（競合）も、読み込みと fsync の open が
+    /// 止まらず、開いた実体の種別検査で拒否する。
+    #[test]
+    fn repair5_open_nowait_rejects_fifo_after_type_check() {
+        let t = TmpDir::new("fifoopen");
+        let fifo = t.path().join("fifo");
+        mkfifo(&fifo);
+        let f = fifo.clone();
+        let e = within_deadline(move || read_limited(&f, MAX_STATE_FILE_BYTES)).unwrap_err();
+        assert_eq!(e.message(), "state file is not a regular file");
+        let e = within_deadline(move || sync_dir(&fifo)).unwrap_err();
+        assert_eq!(e.message(), "state directory is not a directory");
+    }
+
     #[test]
     fn oci5_unsupported_oci_version_returns_internal() {
         let t = TmpDir::new("ociver");

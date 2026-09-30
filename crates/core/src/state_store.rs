@@ -456,15 +456,26 @@ impl FileStateStore {
 
     /// `<id>/state.json` を削除し、空になれば `<id>/` も削除する（ロック保持下で呼ぶこと）。
     ///
-    /// ファイル種別の異常（`record_file` の `Malformed`。`purge_corrupted` からのみ到達）も消せる。
-    /// symlink はリンク自体を消し、リンク先は辿らない。`<id>` がディレクトリでなければ `<id>` の
-    /// エントリだけを消し、`state.json` がディレクトリなら `remove_dir_all`（std の実装は symlink を
-    /// 辿らない）で消す。いずれも 0700・所有者検査済みの状態ルート配下のエントリに限る。
+    /// ファイル種別の異常（`record_file` の `Malformed`。`purge_corrupted` からのみ到達）も、
+    /// データを持たないエントリに限って消す（回復で別用途のデータを壊さない。OCI-5）。
+    ///
+    /// - 消す: ストア自身の形式の `state.json`（通常ファイル）、symlink（リンク自体。リンク先は
+    ///   辿らない）、FIFO 等の特殊ファイル、空ディレクトリの `state.json`
+    /// - 消さずに `FailedPrecondition`: 通常ファイルの `<id>`（ストアが作らない形式で、中身の出所が
+    ///   分からない）、中身のあるディレクトリの `state.json`。手動の管理操作に委ねる
+    ///
+    /// いずれも 0700・所有者検査済みの状態ルート配下のエントリに限り、再帰削除はしない。
     fn remove_record(&self, id: &ContainerId) -> Result<(), TraitError> {
         let dir = self.record_dir(id);
         let dir_meta = fs::symlink_metadata(&dir)
             .map_err(|_| internal("failed to inspect the state directory"))?;
         if !dir_meta.is_dir() {
+            if dir_meta.is_file() {
+                return Err(err(
+                    ErrorCode::FailedPrecondition,
+                    "state entry is a regular file and must be removed manually",
+                ));
+            }
             fs::remove_file(&dir).map_err(|_| internal("failed to remove the state entry"))?;
             return sync_dir(&self.root);
         }
@@ -472,12 +483,20 @@ impl FileStateStore {
         let file_is_dir = fs::symlink_metadata(&file)
             .map_err(|_| internal("failed to inspect the state file"))?
             .is_dir();
-        let removed = if file_is_dir {
-            fs::remove_dir_all(&file)
+        if file_is_dir {
+            match fs::remove_dir(&file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    return Err(err(
+                        ErrorCode::FailedPrecondition,
+                        "state file is a non-empty directory and must be removed manually",
+                    ));
+                }
+                Err(_) => return Err(internal("failed to remove the state file")),
+            }
         } else {
-            fs::remove_file(&file)
-        };
-        removed.map_err(|_| internal("failed to remove the state file"))?;
+            fs::remove_file(&file).map_err(|_| internal("failed to remove the state file"))?;
+        }
         // 削除（unlink）の永続化のため <id>/ を fsync する。ディレクトリ自体を消した場合は
         // その dirent の消失を永続化するため状態ルートも fsync する。
         sync_dir(&dir)?;
@@ -527,7 +546,8 @@ impl FileStateStore {
     /// `StateStore::delete` とは分離している。健全なレコードには使えず
     /// （`FailedPrecondition`）、存在しなければ `NotFound`。権限不備（`<id>` の 0700 以外・所有者
     /// 不一致）や I/O エラーで検査できないものは削除せず元のエラーを返す（fail-closed）。
-    /// symlink はリンク自体だけを消す（`remove_record`）。
+    /// symlink はリンク自体だけを消し、通常ファイルの `<id>`・中身のあるディレクトリの `state.json`
+    /// は消さずに `FailedPrecondition`（別用途のデータを壊さない。`remove_record`）。
     pub fn purge_corrupted(&self, id: &ContainerId) -> Result<DeleteStateResponse, TraitError> {
         let _guard = self.lock()?;
         match self.inspect_record(id)? {

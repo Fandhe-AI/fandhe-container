@@ -462,19 +462,58 @@ struct RawIdMapping {
 // 公開型（検証済み）
 // ---------------------------------------------------------------------------
 
+/// SemVer 2.0.0 の識別子列（`.` 区切り・各要素は非空の `[0-9A-Za-z-]`）か判定する。
+/// `numeric_no_leading_zero` が真なら、数字のみの要素の先頭ゼロを拒否する（pre-release 用）。
+fn is_semver_identifiers(text: &str, numeric_no_leading_zero: bool) -> bool {
+    !text.is_empty()
+        && text.split('.').all(|id| {
+            !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !(numeric_no_leading_zero
+                    && id.len() > 1
+                    && id.starts_with('0')
+                    && id.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
+/// `1.MINOR.PATCH[-prerelease][+build]` の構文か判定する（OCI Runtime Spec の `ociVersion` は
+/// SemVer 2.0.0。OCI-4）。`1.foo`・`1..2`・`1.0` 等は拒否する。
+fn is_oci_1x_semver(value: &str) -> bool {
+    let (rest, build) = match value.split_once('+') {
+        Some((r, b)) => (r, Some(b)),
+        None => (value, None),
+    };
+    if build.is_some_and(|b| !is_semver_identifiers(b, false)) {
+        return false;
+    }
+    let (core, pre) = match rest.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (rest, None),
+    };
+    if pre.is_some_and(|p| !is_semver_identifiers(p, true)) {
+        return false;
+    }
+    let mut parts = core.split('.');
+    let (Some(major), Some(minor), Some(patch), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let numeric = |t: &str| {
+        !t.is_empty()
+            && t.bytes().all(|b| b.is_ascii_digit())
+            && (t.len() == 1 || !t.starts_with('0'))
+    };
+    major == "1" && numeric(minor) && numeric(patch)
+}
+
 /// 検証済みの OCI Runtime Spec バージョン（`1.x` 系のみ受理）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OciVersion(String);
 
 impl OciVersion {
     fn parse(value: String) -> Result<Self, OciConfigError> {
-        let valid = value.strip_prefix("1.").is_some_and(|rest| {
-            !rest.is_empty()
-                && rest
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
-        });
-        if valid {
+        if is_oci_1x_semver(&value) {
             Ok(Self(value))
         } else {
             Err(OciConfigError::invalid("ociVersion"))
@@ -752,7 +791,9 @@ fn convert_mappings<L: Limit>(
         .unwrap_or_default()
         .into_iter()
         .map(|m| {
-            if m.size == 0 {
+            // 範囲終端（先頭 ID + size）が u32 に収まることを container 側・host 側の双方で検証する。
+            let fits = |start: u32| start.checked_add(m.size).is_some();
+            if m.size == 0 || !fits(m.container_id) || !fits(m.host_id) {
                 return Err(OciConfigError::invalid(field));
             }
             Ok(OciIdMapping {
@@ -860,13 +901,41 @@ pub fn parse_config_bytes(bytes: &[u8]) -> Result<OciConfig, OciConfigError> {
     raw.validate()
 }
 
+/// `O_NONBLOCK`（`open(2)` フラグ）。Linux は x86_64 / aarch64 とも `0o4000`、macOS は `0x4`。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x4;
+
+/// 種別確認前に安全に開く。書き手のいない FIFO でも `open` が戻るよう、対応 OS では非ブロッキングで
+/// 開く（呼び出し側が開いた後の `fstat` で通常ファイルか確認するため、確認後の差し替えにも耐える。REPAIR-5）。
+fn open_regular_candidate(path: &Path) -> io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NONBLOCK);
+    }
+    opts.open(path)
+}
+
 /// ファイルから `config.json` を読み込んで検証する（TASK-29.2 の create が bundle から呼ぶ想定）。
 ///
 /// 通常ファイル以外（FIFO・デバイス等）は読み込みが無期限にブロックし得るため拒否する（REPAIR-5）。
 /// サイズは `metadata` で先に拒否するが、それを信用せず読み込み量も [`CONFIG_MAX_BYTES`] + 1 で
 /// 打ち切る（読み込み中にファイルが伸びる場合への対処）。
 pub fn load_config(path: &Path) -> Result<OciConfig, OciConfigError> {
-    let file = File::open(path).map_err(|e| OciConfigError::from_io(&e))?;
+    let file = open_regular_candidate(path).map_err(|e| OciConfigError::from_io(&e))?;
     let meta = file.metadata().map_err(|e| OciConfigError::from_io(&e))?;
     if !meta.is_file() {
         return Err(OciConfigError::invalid("config.json"));
@@ -1034,8 +1103,65 @@ mod tests {
     }
 
     #[test]
+    fn oci4_oci_version_accepts_semver_suffixes() {
+        for ok in [
+            "1.0.0",
+            "1.2.0",
+            "1.0.2-dev",
+            "1.1.0-rc.1+build.5",
+            "1.0.0+x",
+        ] {
+            let mut v = base();
+            v["ociVersion"] = json!(ok);
+            parse(&v).unwrap_or_else(|e| panic!("{ok:?}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn oci4_id_mapping_range_end_must_fit_u32() {
+        for (field, key) in [
+            ("linux.uidMappings", "uidMappings"),
+            ("linux.gidMappings", "gidMappings"),
+        ] {
+            for m in [
+                json!({"containerID": 4294967295u32, "hostID": 0, "size": 2}),
+                json!({"containerID": 0, "hostID": 4294967295u32, "size": 2}),
+            ] {
+                let mut v = base();
+                v["linux"][key] = json!([m]);
+                assert_eq!(*err_of(&v).kind(), OciConfigErrorKind::Invalid { field },);
+            }
+            let mut v = base();
+            v["linux"][key] = json!([{"containerID": 4294967294u32, "hostID": 0, "size": 1}]);
+            parse(&v).expect("end fits");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_load_config_rejects_fifo_without_blocking() {
+        let dir = std::env::temp_dir().join(format!("fandhe-oci-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let fifo = dir.join("config.json");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if matches!(status, Ok(s) if s.success()) {
+            let e = load_config(&fifo).expect_err("fifo");
+            assert_eq!(
+                *e.kind(),
+                OciConfigErrorKind::Invalid {
+                    field: "config.json"
+                }
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
     fn oci4_oci_version_must_be_1x() {
-        for bad in ["2.0.0", "", "1.", "1.0 0"] {
+        for bad in [
+            "2.0.0", "", "1.", "1.0 0", "1.foo", "1..2", "1.0", "1.0.", "1.0.0-", "1.0.0+",
+            "1.0.x", "1.0.0-01",
+        ] {
             let mut v = base();
             v["ociVersion"] = json!(bad);
             assert_eq!(

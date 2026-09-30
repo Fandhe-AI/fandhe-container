@@ -221,7 +221,7 @@ impl LandlockRuleset {
         self.handled_access_fs
     }
 
-    /// パスごとのルール（先頭が rootfs、以降は config 順）。
+    /// パスごとのルール（先頭が rootfs、以降は config 順。後のマウントに覆い隠されたマウントは含めない）。
     pub fn rules(&self) -> &[PathRule] {
         &self.rules
     }
@@ -322,33 +322,65 @@ fn is_dev_path(p: &str) -> bool {
     p == "/dev" || p.starts_with("/dev/")
 }
 
+/// 相反する mount オプション 1 組（例: `ro` / `rw`）の最終値。
+///
+/// mount(8) は相反するオプションが並ぶと後の指定が勝つ（the last option wins）。OCI Runtime Spec の
+/// Mount Options も各オプションをフラグの設定 / 解除として順に適用するため、同じ規則になる。
+/// 再帰版（`rro` 等。runtime-spec 1.1）はマウント後に `mount_setattr(2)`（`AT_RECURSIVE`）で適用されるため、
+/// 位置に関係なく非再帰版より後に効き、再帰版同士では後勝ちになる（runc と同じ解釈）。
+#[derive(Clone, Copy, Default)]
+struct MountFlagToggle {
+    /// 非再帰版の最後の指定（`true` は許可側）。
+    plain: Option<bool>,
+    /// 再帰版の最後の指定（`true` は許可側）。
+    recursive: Option<bool>,
+}
+
+impl MountFlagToggle {
+    /// 指定が無ければ `default`（カーネルの既定）を返す。
+    fn resolve(self, default: bool) -> bool {
+        self.recursive.or(self.plain).unwrap_or(default)
+    }
+}
+
 /// mount 1 件が意図する権利（config の options / fs_type / destination から導出）。
+///
+/// 許可側のオプション（`rw`・`exec`・`dev`）が後から来て制限を解除する場合も、実際のマウントはその権利を
+/// 許すため Landlock でも許可する。これは config が明示的に開けた権利を反映するだけで、実マウントより
+/// 広い権利は付けない（CORE-5 の「最小セットから明示的に開ける」と矛盾しない）。VFS より狭くする
+/// 規則（疑似 FS の書き込み禁止・`/dev` 外の `IOCTL_DEV` 不許可・`MAKE_CHAR` / `MAKE_BLOCK` 不許可）は
+/// オプションに関係なく維持する。
+/// `nosuid` / `suid` と `defaults`（runtime-spec ではフラグ 0 の no-op）は対応する Landlock の権利が
+/// 無いため権利に影響しない。
 fn mount_rights(m: &OciMount) -> AccessFs {
-    let mut rights = AccessFs::READ.union(AccessFs::WRITE);
-    let mut nodev = false;
-    let mut writable = true;
-    let mut exec = true;
+    let mut write = MountFlagToggle::default();
+    let mut exec = MountFlagToggle::default();
+    let mut dev = MountFlagToggle::default();
     for opt in m.options() {
         match opt.as_str() {
-            "ro" => writable = false,
-            "rw" => writable = true,
-            "noexec" => exec = false,
-            "exec" => exec = true,
-            "nodev" => nodev = true,
+            "ro" => write.plain = Some(false),
+            "rw" => write.plain = Some(true),
+            "noexec" => exec.plain = Some(false),
+            "exec" => exec.plain = Some(true),
+            "nodev" => dev.plain = Some(false),
+            "dev" => dev.plain = Some(true),
+            "rro" => write.recursive = Some(false),
+            "rrw" => write.recursive = Some(true),
+            "rnoexec" => exec.recursive = Some(false),
+            "rexec" => exec.recursive = Some(true),
+            "rnodev" => dev.recursive = Some(false),
+            "rdev" => dev.recursive = Some(true),
             _ => {}
         }
     }
-    if !writable {
-        rights = rights.difference(AccessFs::WRITE);
+    let mut rights = AccessFs::READ;
+    if write.resolve(true) && !m.fs_type().is_some_and(|t| PSEUDO_FS.contains(&t)) {
+        rights = rights.union(AccessFs::WRITE);
     }
-    // noexec / exec も ro / rw と同様に最後のオプションが勝つ。
-    if !exec {
+    if !exec.resolve(true) {
         rights = rights.difference(AccessFs::EXECUTE);
     }
-    if m.fs_type().is_some_and(|t| PSEUDO_FS.contains(&t)) {
-        rights = rights.difference(AccessFs::WRITE);
-    }
-    if is_dev_path(m.mount_destination().as_str()) && !nodev {
+    if is_dev_path(m.mount_destination().as_str()) && dev.resolve(true) {
         rights = rights.union(AccessFs::IOCTL_DEV);
     }
     rights
@@ -391,8 +423,12 @@ pub fn build_path_rules(
                 max: CONFIG_MAX_PATH_BYTES,
             }));
         }
-        // 同一 destination は後のものが見える（OCI のマウント積み重ね）ため後勝ちにする。
-        rules.retain(|r| r.path.as_str() != dest.as_str());
+        // 後のマウントは同一 destination とその配下にある先のマウントを覆い隠す（OCI の適用順）。
+        // 隠れたマウントのルールを残すと、後のマウント内の同名パスへ先の権利を与えるため除外する。
+        rules.retain(|r| {
+            let p = r.path.as_str();
+            p != dest.as_str() && !is_ancestor(dest.as_str(), p)
+        });
         rules.push(PathRule {
             path: RulePath::Beneath(dest.clone()),
             allowed: mount_rights(m),
@@ -534,8 +570,9 @@ mod tests {
         assert!(a.intersection(AccessFs::IOCTL_DEV).is_empty());
     }
 
+    /// CORE-5: 相反する mount オプションは後勝ち（ro/rw・noexec/exec・nodev/dev）。
     #[test]
-    fn core5_ro_rw_last_wins_and_noexec_nodev() {
+    fn core5_conflicting_mount_options_last_wins() {
         let c = cfg(
             true,
             json!([
@@ -544,29 +581,96 @@ mod tests {
                 {"destination": "/c", "options": ["ro", "rw"]},
                 {"destination": "/d", "options": ["noexec"]},
                 {"destination": "/e", "options": ["noexec", "exec"]},
+                {"destination": "/f", "options": ["exec", "noexec"]},
                 {"destination": "/dev", "options": ["nodev"]},
+                {"destination": "/dev/a", "options": ["nodev", "dev"]},
+                {"destination": "/dev/b", "options": ["dev", "nodev"]},
+                {"destination": "/g", "options": ["nosuid", "suid", "defaults"]},
             ]),
         );
         let rs = build(&c);
-        assert_eq!(rule(&rs, "/a").allowed, AccessFs::READ);
-        assert_eq!(rule(&rs, "/b").allowed, AccessFs::READ);
+        let rw = AccessFs::READ.union(AccessFs::WRITE);
+        let rw_noexec = rw.difference(AccessFs::EXECUTE);
+        let cases = [
+            ("/a", AccessFs::READ),
+            ("/b", AccessFs::READ),
+            ("/c", rw),
+            ("/d", rw_noexec),
+            ("/e", rw),
+            ("/f", rw_noexec),
+            ("/dev", rw),
+            ("/dev/a", rw.union(AccessFs::IOCTL_DEV)),
+            ("/dev/b", rw),
+            // nosuid / suid / defaults は対応する Landlock の権利が無く、既定（rw・exec）のまま。
+            ("/g", rw),
+        ];
+        for (p, want) in cases {
+            assert_eq!(rule(&rs, p).allowed.bits(), want.bits(), "{p}");
+        }
+        assert_eq!(rw.bits(), 0x77BF);
+        assert_eq!(rw_noexec.bits(), 0x77BE);
+    }
+
+    /// CORE-5: 再帰版（rro 等）は位置に関係なく非再帰版より後に効き、再帰版同士は後勝ち。
+    #[test]
+    fn core5_recursive_mount_options_override_plain() {
+        let c = cfg(
+            true,
+            json!([
+                {"destination": "/a", "options": ["rro", "rw"]},
+                {"destination": "/b", "options": ["ro", "rrw"]},
+                {"destination": "/c", "options": ["rrw", "rro"]},
+                {"destination": "/d", "options": ["rnoexec", "exec"]},
+                {"destination": "/e", "options": ["noexec", "rexec"]},
+                {"destination": "/dev", "options": ["rnodev", "dev"]},
+                {"destination": "/dev/a", "options": ["nodev", "rdev"]},
+            ]),
+        );
+        let rs = build(&c);
+        let rw = AccessFs::READ.union(AccessFs::WRITE);
+        let cases = [
+            ("/a", AccessFs::READ),
+            ("/b", rw),
+            ("/c", AccessFs::READ),
+            ("/d", rw.difference(AccessFs::EXECUTE)),
+            ("/e", rw),
+            ("/dev", rw),
+            ("/dev/a", rw.union(AccessFs::IOCTL_DEV)),
+        ];
+        for (p, want) in cases {
+            assert_eq!(rule(&rs, p).allowed.bits(), want.bits(), "{p}");
+        }
+    }
+
+    /// CORE-5: 後の親マウントに覆い隠された子マウントのルールは除外する。
+    #[test]
+    fn core5_later_parent_mount_hides_earlier_child_rules() {
+        let c = cfg(
+            true,
+            json!([
+                {"destination": "/x/y", "options": ["rw"]},
+                {"destination": "/x/y/z", "options": ["rw"]},
+                {"destination": "/xy", "options": ["rw"]},
+                {"destination": "/x", "options": ["ro"]},
+                {"destination": "/x/w", "options": ["rw"]},
+            ]),
+        );
+        let rs = build(&c);
+        let got: Vec<(&str, RuleOrigin, u64)> = rs
+            .rules()
+            .iter()
+            .map(|r| (r.path.as_str(), r.origin, r.allowed.bits()))
+            .collect();
         assert_eq!(
-            rule(&rs, "/c").allowed,
-            AccessFs::READ.union(AccessFs::WRITE)
+            got,
+            vec![
+                ("/", RuleOrigin::Root, 0x000D),
+                ("/xy", RuleOrigin::Mount { index: 2 }, 0x77BF),
+                ("/x", RuleOrigin::Mount { index: 3 }, 0x000D),
+                ("/x/w", RuleOrigin::Mount { index: 4 }, 0x77BF),
+            ]
         );
-        assert_eq!(
-            rule(&rs, "/d").allowed,
-            AccessFs::READ_FILE
-                .union(AccessFs::READ_DIR)
-                .union(AccessFs::WRITE)
-        );
-        assert!(rule(&rs, "/e").allowed.contains(AccessFs::EXECUTE));
-        assert!(
-            rule(&rs, "/dev")
-                .allowed
-                .intersection(AccessFs::IOCTL_DEV)
-                .is_empty()
-        );
+        assert!(rs.shadowed().is_empty());
     }
 
     #[test]
@@ -611,23 +715,11 @@ mod tests {
             true,
             json!([{"destination": "/d", "options": ["noexec"]}]),
         ));
+        assert_eq!(rs.shadowed().len(), 1);
         let s = &rs.shadowed()[0];
         assert_eq!(s.path.as_str(), "/d");
-        assert!(
-            s.effective.is_subset_of(
-                AccessFs::READ
-                    .union(AccessFs::WRITE)
-                    .union(AccessFs::EXECUTE)
-            )
-        );
-        assert_eq!(
-            s.effective.bits() & AccessFs::WRITE.bits(),
-            AccessFs::WRITE.bits()
-        );
-        assert_eq!(
-            s.effective.bits() & AccessFs::EXECUTE.bits(),
-            AccessFs::EXECUTE.bits()
-        );
+        assert_eq!(s.intended.bits(), 0x77BE);
+        assert_eq!(s.effective.bits(), 0x77BF);
     }
 
     #[test]

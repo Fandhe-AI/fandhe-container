@@ -12,8 +12,12 @@
 //! - #183（TASK-39.3）は各パスを `O_PATH` で開いて追加する。開いた fd がディレクトリでない場合
 //!   （bind mount された単一ファイル）は、[`AccessFs::FILE_COMPATIBLE`] と積を取ってから追加すること
 //!   （ディレクトリ専用の権利を付けると `landlock_add_rule` が EINVAL になる）。本モジュールは stat しない
-//! - Landlock は加算的で、祖先より狭い権利を子に強制できない。狭められない箇所は
-//!   [`LandlockRuleset::shadowed`] に記録し、実際の保護は VFS の `ro` 等が担う（監査は TASK-41・SEC-4）
+//! - Landlock は加算的で、祖先より狭い権利を子に強制できない。書き込み系（[`AccessFs::WRITE`]）の制限が
+//!   祖先ルールで無効になる構成（書き込み可能な root の下の `ro` mount・疑似 FS 等）は、最小権限を
+//!   保証できないため [`LandlockRuleErrorKind::WriteRestrictionShadowed`] で拒否する（fail-closed。CORE-5）。
+//!   疑似 FS の書き込み禁止は VFS の裏付けが無く Landlock だけが担うため、記録だけでは守れない
+//! - 実行・`IOCTL_DEV` だけが祖先で広がる箇所（`/dev` 配下の `noexec,nodev` mount 等）は、VFS の
+//!   `noexec` / `nodev` が必ず効くため許容し、[`LandlockRuleset::shadowed`] に記録する（監査は TASK-41・SEC-4）
 //! - `linux.readonlyPaths` / `maskedPaths` は参照しない（`unapplied_fields` 扱いで create が拒否する）
 //!
 //! # 未実装範囲（REPAIR-3）
@@ -195,6 +199,9 @@ pub struct PathRule {
 }
 
 /// Landlock では狭められない制限（祖先ルールがより広い権利を与えている）。
+///
+/// 書き込み系の権利が広がる場合は記録せず拒否する（[`LandlockRuleErrorKind::WriteRestrictionShadowed`]）
+/// ため、ここに残るのは VFS の `noexec` / `nodev` が保護する実行・`IOCTL_DEV` の差分だけである。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ShadowedRestriction {
@@ -252,6 +259,13 @@ pub enum LandlockRuleErrorKind {
     },
     /// 内部不変条件違反（handled 超過・MAKE_CHAR / MAKE_BLOCK 付与）。
     RightsExceedHandled,
+    /// mount が拒否する書き込み系の権利を祖先ルールが許可しており、Landlock で狭められない。
+    WriteRestrictionShadowed {
+        /// config の `mounts` 内の位置。
+        index: usize,
+        /// 祖先ルールによって許可されてしまう書き込み系の権利。
+        granted: AccessFs,
+    },
 }
 
 /// ルール生成の明示エラー。
@@ -280,6 +294,14 @@ impl LandlockRuleError {
             LandlockRuleErrorKind::RightsExceedHandled => (
                 ErrorCode::Internal,
                 "generated Landlock rights violate internal invariants".to_string(),
+            ),
+            LandlockRuleErrorKind::WriteRestrictionShadowed { index, granted } => (
+                ErrorCode::InvalidArgument,
+                format!(
+                    "mounts[{index}] denies write access 0x{:x} that an ancestor Landlock rule \
+                     grants; use a read-only root or a writable parent mount",
+                    granted.bits()
+                ),
             ),
         };
         Self {
@@ -438,14 +460,26 @@ pub fn build_path_rules(
 
     let mut shadowed = Vec::new();
     for r in &rules {
-        if matches!(r.origin, RuleOrigin::Root) {
+        // rootfs には祖先が無い。
+        let RuleOrigin::Mount { index } = r.origin else {
             continue;
-        }
+        };
         let effective = rules
             .iter()
             .filter(|a| is_ancestor(a.path.as_str(), r.path.as_str()))
             .fold(r.allowed, |acc, a| acc.union(a.allowed));
-        if !effective.difference(r.allowed).is_empty() {
+        let widened = effective.difference(r.allowed);
+        let granted_writes = widened.intersection(AccessFs::WRITE);
+        if !granted_writes.is_empty() {
+            // Landlock は祖先の許可を子で取り消せないため、書き込み制限を黙って失わせず拒否する。
+            return Err(LandlockRuleError::new(
+                LandlockRuleErrorKind::WriteRestrictionShadowed {
+                    index,
+                    granted: granted_writes,
+                },
+            ));
+        }
+        if !widened.is_empty() {
             shadowed.push(ShadowedRestriction {
                 path: r.path.clone(),
                 intended: r.allowed,
@@ -692,20 +726,70 @@ mod tests {
         assert!(!rule(&rs, "/").allowed.contains(AccessFs::IOCTL_DEV));
     }
 
+    /// CORE-5: 疑似 FS は書き込み権を持たず、読み取り専用 root の下では何も shadowed にならない。
     #[test]
-    fn core5_pseudo_fs_drops_write_and_records_shadowed() {
-        let m = json!([
-            {"destination": "/proc", "type": "proc"},
-            {"destination": "/sys", "type": "sysfs"}
-        ]);
-        let rs = build(&cfg(false, m.clone()));
-        assert_eq!(rule(&rs, "/proc").allowed, AccessFs::READ);
-        assert_eq!(rs.shadowed().len(), 2);
-        assert_eq!(rs.shadowed()[0].path.as_str(), "/proc");
-        assert_eq!(rs.shadowed()[0].intended.bits(), 0x000D);
-        assert_eq!(rs.shadowed()[0].effective.bits(), 0x77BF);
-        let ro = build(&cfg(true, m));
-        assert!(ro.shadowed().is_empty());
+    fn core5_pseudo_fs_drops_write_under_readonly_root() {
+        let rs = build(&cfg(
+            true,
+            json!([
+                {"destination": "/proc", "type": "proc"},
+                {"destination": "/sys", "type": "sysfs", "options": ["rw"]}
+            ]),
+        ));
+        assert_eq!(rule(&rs, "/proc").allowed.bits(), 0x000D);
+        assert_eq!(rule(&rs, "/sys").allowed.bits(), 0x000D);
+        assert!(rs.shadowed().is_empty());
+    }
+
+    /// CORE-5: 書き込み制限が祖先ルールで無効になる構成は拒否する（fail-closed）。
+    #[test]
+    fn core5_write_restriction_shadowed_by_ancestor_is_rejected() {
+        let s = evaluate_abi(6).expect("abi6");
+        let cases = [
+            // 書き込み可能な root の下の疑似 FS（VFS の裏付けが無い制限）。
+            (false, json!([{"destination": "/proc", "type": "proc"}]), 0),
+            // 書き込み可能な root の下の ro mount。
+            (
+                false,
+                json!([{"destination": "/data"}, {"destination": "/etc", "options": ["ro"]}]),
+                1,
+            ),
+            // 読み取り専用 root でも、rw mount の下の ro mount は同様に狭められない。
+            (
+                true,
+                json!([
+                    {"destination": "/data", "options": ["rw"]},
+                    {"destination": "/data/sub", "options": ["ro"]}
+                ]),
+                1,
+            ),
+        ];
+        assert_eq!(AccessFs::WRITE.bits(), 0x77B2);
+        for (readonly, mounts, index) in cases {
+            let e = path_rules_from_config(&s, &cfg(readonly, mounts)).expect_err("rejected");
+            assert_eq!(
+                e.kind,
+                LandlockRuleErrorKind::WriteRestrictionShadowed {
+                    index,
+                    granted: AccessFs::WRITE,
+                }
+            );
+            assert_eq!(e.code, ErrorCode::InvalidArgument);
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "INVALID_ARGUMENT: mounts[{index}] denies write access 0x77b2 that an \
+                     ancestor Landlock rule grants; use a read-only root or a writable parent mount"
+                )
+            );
+        }
+        // 書き込み制限を持たない mount だけなら書き込み可能な root でも生成できる。
+        let rs = build(&cfg(
+            false,
+            json!([{"destination": "/data", "options": ["rw"]}]),
+        ));
+        assert_eq!(rs.rules().len(), 2);
+        assert!(rs.shadowed().is_empty());
     }
 
     #[test]
@@ -743,7 +827,7 @@ mod tests {
     #[test]
     fn core5_default_mount_set_respects_invariants() {
         let c = cfg(
-            false,
+            true,
             json!([
                 {"destination": "/proc", "type": "proc", "source": "proc"},
                 {"destination": "/dev", "type": "tmpfs", "options": ["nosuid", "strictatime", "mode=755"]},
@@ -760,6 +844,13 @@ mod tests {
             assert!(r.allowed.intersection(AccessFs::MAKE_CHAR).is_empty());
             assert!(r.allowed.intersection(AccessFs::MAKE_BLOCK).is_empty());
         }
+        // /dev の実行・IOCTL_DEV は /dev/shm（noexec,nodev）で狭められず、VFS に委ねて記録だけする。
+        let shadowed: Vec<(&str, u64, u64)> = rs
+            .shadowed()
+            .iter()
+            .map(|s| (s.path.as_str(), s.intended.bits(), s.effective.bits()))
+            .collect();
+        assert_eq!(shadowed, vec![("/dev/shm", 0x77BE, 0xF7BF)]);
     }
 
     #[test]

@@ -1080,6 +1080,47 @@ mod tests {
         assert_eq!(keep_above_stdio(fd).unwrap().as_raw_fd(), raw);
     }
 
+    /// CORE-1（TASK-27.4.1）: シェバン付きスクリプトの `/dev/fd/N` の検証。`N` が開いた fd と同じ実体に
+    /// 解決すれば許可し、存在しない・別の実体なら `FailedPrecondition`（終了コード 126）で拒否する。
+    #[test]
+    fn core1_verify_script_fd_path_requires_same_file() {
+        use std::os::fd::AsRawFd as _;
+        let dir = TempDir::create("script-fd");
+        let script = dir.0.join("script");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&script)
+            .unwrap();
+        let file = std::fs::File::open(&script).unwrap();
+        let meta = file.metadata().unwrap();
+        let entry = Entrypoint::new(&script, ["script"], [] as [&str; 0]).unwrap();
+
+        // /proc/self/fd は /dev/fd の参照先で、N は開いた fd 自身に解決する。
+        verify_script_fd_path(Path::new("/proc/self/fd"), &file, &meta, &entry).unwrap();
+
+        // /dev/fd の無い rootfs（空ディレクトリ）は拒否する。
+        let empty = dir.0.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let err = verify_script_fd_path(&empty, &file, &meta, &entry).unwrap_err();
+        assert_eq!(
+            (err.code, err.stage),
+            (ErrorCode::FailedPrecondition, IsolationStage::Exec)
+        );
+        assert_eq!(exit_code_for(&err), EXIT_EXEC_NOT_EXECUTABLE);
+
+        // 同じ番号が別の実体を指す場合も拒否する。
+        let other = dir.0.join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(other.join(file.as_raw_fd().to_string()))
+            .unwrap();
+        let err = verify_script_fd_path(&other, &file, &meta, &entry).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+    }
+
     /// CORE-1（TASK-27.4.1）: dry-run で exec 前の処理が固定順に呼ばれ、`execve` に argv・env が
     /// そのまま渡る。dry-run の `execve` は `EINTR` を返すので `Internal` の `Exec` 段エラーになる。
     #[test]

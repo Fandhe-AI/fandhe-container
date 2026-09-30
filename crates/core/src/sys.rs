@@ -987,6 +987,7 @@ mod tests {
         assert_eq!(consts::O_NONBLOCK, 0o4_000);
         assert_eq!(consts::O_RDWR, 2);
         assert_eq!((consts::F_SETFD, consts::FD_CLOEXEC), (2, 1));
+        assert_eq!(consts::F_DUPFD_CLOEXEC, 1030);
         #[cfg(target_arch = "x86_64")]
         assert_eq!(consts::SYS_CLOSE_RANGE, 436);
         #[cfg(target_arch = "aarch64")]
@@ -1036,6 +1037,30 @@ mod tests {
         let empty = null_terminated_ptrs(&[]);
         assert_eq!(empty.len(), 1);
         assert!(empty[0].is_null());
+    }
+
+    /// CORE-1（TASK-27.4.1）: `dup_fd_at_least` は下限以上の番号へ close-on-exec で複製し、負の下限は
+    /// `EINVAL` で拒否する。
+    #[test]
+    fn core1_dup_fd_at_least_respects_minimum() {
+        let file = std::fs::File::open("/proc/self/status").unwrap();
+        for min in [3, 64] {
+            let dup = dup_fd_at_least(file.as_fd(), min).unwrap();
+            assert!(dup.as_raw_fd() >= min, "min {min}: got {}", dup.as_raw_fd());
+            // close-on-exec は fdinfo の flags（8 進）の O_CLOEXEC ビットで確かめる。
+            let info =
+                std::fs::read_to_string(format!("/proc/self/fdinfo/{}", dup.as_raw_fd())).unwrap();
+            let flags = info
+                .lines()
+                .find_map(|l| l.strip_prefix("flags:"))
+                .map(|v| i32::from_str_radix(v.trim(), 8).unwrap())
+                .unwrap();
+            assert_eq!(flags & consts::O_CLOEXEC, consts::O_CLOEXEC, "min {min}");
+        }
+        assert_eq!(
+            dup_fd_at_least(file.as_fd(), -1).unwrap_err(),
+            SysError::Os(EINVAL)
+        );
     }
 
     /// CORE-1（TASK-27.4.1）: 0 とプロセスグループ・全プロセス宛てになり得る値の pid は拒否する。

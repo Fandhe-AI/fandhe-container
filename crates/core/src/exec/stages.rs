@@ -3,7 +3,7 @@
 //! # 役割と呼び出し文脈
 //!
 //! `crate::exec` の最小実行フロー第 4 段の「枠」。`process.rs::run_child` が pivot_root の後・
-//! `exec_entrypoint` の前に [`StagePipeline::run_then`] を呼び、次の順序で各段のフックを実行する。
+//! `exec_entrypoint` の前に `StagePipeline::run_then` を呼び、次の順序で各段のフックを実行する。
 //!
 //! ```text
 //! cgroup 参加 -> capability 削減 -> PR_SET_NO_NEW_PRIVS -> Landlock -> seccomp -> exec
@@ -18,7 +18,7 @@
 //! # 契約
 //!
 //! - **順序は [`StageKind::ORDER`] だけが決める**: 登録順・呼び出し側の指定では変えられない。
-//!   exec は [`StagePipeline::run_then`] の終端クロージャからしか呼べず、全段成功後に限り最後に走る
+//!   exec は `StagePipeline::run_then` の終端クロージャからしか呼べず、全段成功後に限り最後に走る
 //! - **最初の失敗で打ち切る**: 後続段と exec は呼ばない。エラーの `stage` はパイプライン側で
 //!   その段に付け替える（フックが自分の段を偽れない。ERR-1）
 //! - **同じ段への二重登録は拒否する**: 既存の制限フックを no-op で上書きする経路を作らない
@@ -240,11 +240,13 @@ impl StagePipeline {
     ///
     /// # 呼び出し契約
     ///
-    /// fork 後の子プロセスでのみ呼ぶこと。組み込みの `NoNewPrivs` 段（TASK-27.4.3）が
+    /// 可視性は `pub(crate)` に限る（破壊的変更: 従来の `pub` から縮小。外部 crate からは呼べない。
+    /// 呼び出し元は `process.rs::run_child`（fork 後の子）だけで、親から誤用できない API 境界にする）。
+    /// 新たな呼び出し元を crate 内に増やす場合も fork 後の子でのみ呼ぶこと。組み込みの `NoNewPrivs` 段（TASK-27.4.3）が
     /// 呼び出しスレッドへ `PR_SET_NO_NEW_PRIVS` を立て、これは不可逆で解除できない。
     /// 親プロセス（supervisor 等）から呼ぶと、そのスレッドが恒久的に強化される
     /// （setuid 実行などが以後効かなくなる）。
-    pub fn run_then<T>(
+    pub(crate) fn run_then<T>(
         mut self,
         exec: impl FnOnce(&StageReport) -> Result<T, ExecError>,
     ) -> Result<T, ExecError> {

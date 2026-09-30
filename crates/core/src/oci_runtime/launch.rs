@@ -58,8 +58,9 @@ pub struct StartTimeouts {
 }
 
 impl StartTimeouts {
-    /// 既定の起動待ち上限（[`ProcessLauncher::launch`]）。
-    pub const DEFAULT_LAUNCH: Duration = Duration::from_secs(30);
+    /// 既定の起動待ち上限（[`ProcessLauncher::launch`]。子プロセスの応答待ちの推奨 5〜10 秒の範囲。
+    /// AGENTS.md・REPAIR-5）。
+    pub const DEFAULT_LAUNCH: Duration = Duration::from_secs(10);
     /// 既定の終了待ち上限（[`LaunchedProcess::terminate`]）。
     pub const DEFAULT_TERMINATE: Duration = Duration::from_secs(5);
     /// 既定の生存確認待ち上限（[`ProcessLauncher::confirm_no_process`]）。
@@ -412,7 +413,7 @@ mod tests {
         assert_eq!(
             (d.launch(), d.terminate(), d.confirm()),
             (
-                Duration::from_secs(30),
+                Duration::from_secs(10),
                 Duration::from_secs(5),
                 Duration::from_secs(10)
             )

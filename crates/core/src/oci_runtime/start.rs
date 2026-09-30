@@ -974,8 +974,8 @@ mod tests {
         assert_eq!(spec.env(), ["PATH=/bin", "K=V"]);
         assert_eq!(spec.hostname(), Some("box"));
         assert_eq!(spec.rootfs(), b.dir.join("rootfs"));
-        // REPAIR-5: 呼び出し側の上限（既定 30 秒）がそのまま launcher へ渡る。
-        assert_eq!(launcher.received_timeouts(), [Duration::from_secs(30)]);
+        // REPAIR-5: 呼び出し側の上限（既定 10 秒）がそのまま launcher へ渡る。
+        assert_eq!(launcher.received_timeouts(), [Duration::from_secs(10)]);
         assert_eq!(
             spec.namespaces(),
             [

@@ -419,12 +419,14 @@ pub struct MountIsolation {
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
-/// `/proc/self/status` の `NSpid:` 行の要素数（PID namespace の入れ子段数）。
-fn nspid_depth(status: &str) -> Option<usize> {
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("NSpid:"))
-        .map(|rest| rest.split_whitespace().count())
+/// 初期 PID namespace の inode 番号（`include/uapi/linux/nsfs.h` の `enum init_ns_ino` の
+/// `PID_NS_INIT_INO`）。初期 namespace の inode は uapi で予約された固定値で、アーキテクチャに
+/// 依存しない。
+const PID_NS_INIT_INO: u64 = 0xEFFF_FFFC;
+
+/// `/proc/thread-self/ns/pid` のリンク先（`pid:[inode]`）の inode 番号。書式に反すれば `None`。
+fn parse_pid_ns_inode(link: &str) -> Option<u64> {
+    link.strip_prefix("pid:[")?.strip_suffix(']')?.parse().ok()
 }
 
 /// `/proc/self/status` の `NSpid:` 行の末尾要素（最も内側の PID namespace での PID）。
@@ -445,21 +447,30 @@ fn status_threads(status: &str) -> Option<u64> {
 }
 
 /// [`MountIsolation::establish`] の前提（副作用の前に判定するテスト可能な純関数）。
-/// `pid` は `getpid()`、`status` は `/proc/self/status` の内容。
+/// `pid` は `getpid()`、`status` は `/proc/self/status` の内容、`pid_ns_inode` は呼び出し
+/// スレッドの PID namespace の inode 番号。
 ///
-/// - PID が 1 で、`NSpid` の末尾要素も 1、かつ `NSpid` が 2 段以上（ホスト側 procfs 越しに
-///   見て入れ子の PID namespace の PID 1）
+/// - PID が 1 で、`NSpid` の末尾要素も 1
+/// - PID namespace が初期 namespace でない（inode が `PID_NS_INIT_INO` でない）。`NSpid` の
+///   要素数は参照している procfs の PID namespace を起点にした表示で、その PID namespace 内で
+///   マウントされた procfs を見ると入れ子でも 1 段になるため、入れ子の判定には使わない
+///   （Codex 指摘）。初期 PID namespace でなければ、その PID 1 がマウントする procfs には
+///   その namespace と子孫のプロセスしか見えない
 /// - `Threads:` が 1（シングルスレッド）。`unshare(CLONE_NEWNS)` は呼んだスレッドだけを移すため、
 ///   他のスレッドが古い mount namespace に残り、後続の `pivot_root`・exec（#135・#831）が別
 ///   スレッドで行われるとホストの procfs・ファイルシステムが見えてしまう
-fn check_establish_preconditions(pid: u32, status: &str) -> Result<(), ViolationReason> {
+fn check_establish_preconditions(
+    pid: u32,
+    status: &str,
+    pid_ns_inode: u64,
+) -> Result<(), ViolationReason> {
     if pid != 1 {
         return Err(ViolationReason::EstablishNotPid1);
     }
     if nspid_innermost(status) != Some(1) {
         return Err(ViolationReason::EstablishNspidNotPid1);
     }
-    if nspid_depth(status).is_none_or(|d| d < 2) {
+    if pid_ns_inode == PID_NS_INIT_INO {
         return Err(ViolationReason::EstablishNotNestedPidNamespace);
     }
     if status_threads(status) != Some(1) {
@@ -511,8 +522,9 @@ impl MountIsolation {
     ///
     /// 手順（前提検証はすべて副作用の前に行う）:
     ///
-    /// 1. PID が 1（`getpid()` と `NSpid` の末尾要素の両方）で、`NSpid` が 2 段以上、かつ
-    ///    シングルスレッド（`Threads: 1`）。満たさなければ副作用なしで `FailedPrecondition`
+    /// 1. PID が 1（`getpid()` と `NSpid` の末尾要素の両方）で、PID namespace が初期
+    ///    namespace でなく（`ns/pid` の inode で判定）、かつシングルスレッド（`Threads: 1`）。
+    ///    満たさなければ副作用なしで `FailedPrecondition`
     ///    （判定は `check_establish_preconditions`）
     /// 2. 呼び出しスレッドを `unshare(CLONE_NEWNS)` で新しい mount namespace へ移し、`/` を
     ///    再帰 private にする（コピーされたマウントの shared peer から切り離し、以後のマウントを
@@ -553,7 +565,12 @@ impl MountIsolation {
         }
         let status = std::fs::read_to_string("/proc/self/status")
             .map_err(|_| fail("cannot read /proc/self/status to verify the PID namespace"))?;
-        check_establish_preconditions(pid, &status).map_err(violation)?;
+        let pid_ns_inode = thread_ns_link("pid")
+            .ok()
+            .as_deref()
+            .and_then(parse_pid_ns_inode)
+            .ok_or_else(|| fail("cannot read or parse /proc/thread-self/ns/pid"))?;
+        check_establish_preconditions(pid, &status, pid_ns_inode).map_err(violation)?;
         let before =
             thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
         sys::unshare_namespaces(&[NsFlag::Mount])
@@ -1244,35 +1261,50 @@ mod tests {
     /// 再監査 P2-2・P2-3: establish の前提（PID 1・NSpid 末尾 1・入れ子・シングルスレッド）。
     #[test]
     fn establish_preconditions() {
-        assert_eq!(check_establish_preconditions(1, STATUS_PID1), Ok(()));
-        let cases: [(u32, &str, ViolationReason); 5] = [
-            (7, STATUS_PID1, ViolationReason::EstablishNotPid1),
+        const NESTED: u64 = 4_026_532_001;
+        assert_eq!(
+            check_establish_preconditions(1, STATUS_PID1, NESTED),
+            Ok(())
+        );
+        // PID namespace 内でマウントした procfs を見ていて NSpid が 1 段でも、初期 PID
+        // namespace でなければ受け付ける（NSpid の要素数に依存しない。Codex 指摘）。
+        assert_eq!(
+            check_establish_preconditions(1, "NSpid:\t1\nThreads:\t1\n", NESTED),
+            Ok(())
+        );
+        let cases: [(u32, &str, u64, ViolationReason); 5] = [
+            (7, STATUS_PID1, NESTED, ViolationReason::EstablishNotPid1),
             (
                 1,
                 "NSpid:\t4321\t7\nThreads:\t1\n",
+                NESTED,
                 ViolationReason::EstablishNspidNotPid1,
             ),
+            // 初期 PID namespace の PID 1（ホストの init）。
             (
                 1,
                 "NSpid:\t1\nThreads:\t1\n",
+                PID_NS_INIT_INO,
                 ViolationReason::EstablishNotNestedPidNamespace,
             ),
             (
                 1,
                 "NSpid:\t4321\t1\nThreads:\t2\n",
+                NESTED,
                 ViolationReason::EstablishMultiThreaded,
             ),
             (
                 1,
                 "NSpid:\t4321\t1\n",
+                NESTED,
                 ViolationReason::EstablishMultiThreaded,
             ),
         ];
-        for (pid, status, want) in cases {
+        for (pid, status, ino, want) in cases {
             assert_eq!(
-                check_establish_preconditions(pid, status),
+                check_establish_preconditions(pid, status, ino),
                 Err(want),
-                "{status:?}"
+                "{status:?} {ino}"
             );
         }
     }
@@ -1412,12 +1444,20 @@ mod tests {
         assert_eq!(take_dry_run_mounts(), Vec::<String>::new());
     }
 
-    /// `NSpid` の入れ子段数（1 段 = 初期 namespace、2 段以上 = 入れ子）。
+    /// `ns/pid` の inode の解析と、初期 PID namespace の inode の具体値。
     #[test]
-    fn nspid_depth_counts_levels() {
-        assert_eq!(nspid_depth("Name:\tx\nNSpid:\t1234\t1\nUid:\t0\n"), Some(2));
-        assert_eq!(nspid_depth("NSpid:\t1\n"), Some(1));
-        assert_eq!(nspid_depth("Name:\tx\n"), None);
+    fn pid_ns_inode_parsing() {
+        assert_eq!(PID_NS_INIT_INO, 4_026_531_836);
+        assert_eq!(
+            parse_pid_ns_inode("pid:[4026531836]"),
+            Some(PID_NS_INIT_INO)
+        );
+        assert_eq!(parse_pid_ns_inode("pid:[4026532001]"), Some(4_026_532_001));
+        for bad in ["mnt:[4026531836]", "pid:[x]", "pid:4026531836", ""] {
+            assert_eq!(parse_pid_ns_inode(bad), None, "{bad:?}");
+        }
+        // 実プロセスのリンクも解析できる。
+        assert!(parse_pid_ns_inode(&thread_ns_link("pid").unwrap()).is_some());
     }
 
     const MI_SHARED: &str = "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n";

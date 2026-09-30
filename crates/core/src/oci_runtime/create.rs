@@ -110,8 +110,8 @@ fn reject_unapplied(config: &OciConfig) -> Result<(), TraitError> {
     ))
 }
 
-/// `root.path` が bundle 外へ字句的に出ず、bundle 配下の全要素が symlink でない
-/// 存在するディレクトリであることを確認する。
+/// `root.path` が bundle 配下に収まり（bundle 外の絶対指定は拒否）、bundle 配下の全要素が
+/// symlink でない存在するディレクトリであることを確認する。
 fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<PathBuf, TraitError> {
     if root_path
         .components()
@@ -129,7 +129,7 @@ fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<PathBuf, TraitError> 
         return Err(invalid("rootfs must not be the filesystem root"));
     }
     // bundle 配下の相対部分を要素ごとに検査する。bundle 自体（親が symlink でもよい）は対象外。
-    // bundle 外の絶対パスは相対部分が取れないため、末尾要素のみ検査する。
+    // bundle 外を指す絶対指定は、ホスト上の任意ディレクトリを rootfs にできてしまうため拒否する（SEC-1）。
     let mut checked = match rootfs.strip_prefix(bundle) {
         Ok(rel) => {
             let mut current = bundle.to_path_buf();
@@ -146,10 +146,10 @@ fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<PathBuf, TraitError> 
             }
             last
         }
-        Err(_) => None,
+        Err(_) => return Err(invalid("rootfs must be inside the bundle")),
     };
     if checked.is_none() {
-        // bundle 自身、または bundle 外の絶対パス。
+        // bundle 自身（相対部分が空）。
         let meta = inspect(&rootfs)?;
         if is_link_like(&meta) {
             return Err(invalid("rootfs must not be a symlink"));
@@ -433,7 +433,22 @@ mod tests {
         assert_eq!(store.len(), 1);
     }
 
-    /// OCI-4: `root.path` が絶対パスでも成功する。
+    /// SEC-1: bundle 外を指す絶対 `root.path` は実在ディレクトリでも拒否する。
+    #[test]
+    fn sec1_create_rejects_absolute_root_path_outside_bundle() {
+        let b = Bundle::new("abs-out");
+        let outside = std::env::temp_dir();
+        let mut cfg = valid_config();
+        cfg["root"]["path"] = json!(outside.to_str().expect("utf8"));
+        b.write_config(&cfg);
+        let store = MemStateStore::new();
+        let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), "rootfs must be inside the bundle");
+        assert_eq!(store.len(), 0);
+    }
+
+    /// OCI-4: bundle 配下を指す絶対 `root.path` は成功する。
     #[test]
     fn oci4_create_accepts_absolute_root_path() {
         let b = Bundle::new("abs");

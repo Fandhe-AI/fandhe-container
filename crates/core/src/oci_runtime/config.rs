@@ -1155,6 +1155,18 @@ mod tests {
         parse(v).expect_err("expected an error")
     }
 
+    /// `path`（キー名または配列の添字文字列の列）が指す値への可変参照。
+    fn value_at<'a>(v: &'a mut Value, path: &[&str]) -> &'a mut Value {
+        let mut cur = v;
+        for key in path {
+            cur = match key.parse::<usize>() {
+                Ok(i) => &mut cur[i],
+                Err(_) => &mut cur[*key],
+            };
+        }
+        cur
+    }
+
     #[test]
     fn oci4_valid_config_is_parsed_with_concrete_values() {
         let cfg = parse(&base()).expect("valid");
@@ -1304,22 +1316,114 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    /// 書き手のいない FIFO でブロックせず、非通常ファイルとして拒否する（REPAIR-5・ERR-1）。
+    /// Linux / macOS の双方で実行する（`mkfifo` の失敗は skip せずテスト失敗にする）。
+    #[cfg(unix)]
     #[test]
     fn repair5_load_config_rejects_fifo_without_blocking() {
         let dir = std::env::temp_dir().join(format!("fandhe-oci-fifo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let fifo = dir.join("config.json");
-        let status = std::process::Command::new("mkfifo").arg(&fifo).status();
-        if matches!(status, Ok(s) if s.success()) {
-            let e = load_config(&fifo).expect_err("fifo");
-            assert_eq!(
-                *e.kind(),
-                OciConfigErrorKind::Invalid {
-                    field: "config.json"
-                }
-            );
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed: {status:?}");
+        let e = load_config(&fifo).expect_err("fifo");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            *e.kind(),
+            OciConfigErrorKind::Invalid {
+                field: "config.json"
+            }
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// 既知フィールドが存在して `null` の場合は省略とみなさず `Data` で拒否する（OCI-4）。
+    /// 省略可能な既知フィールド 13 件・`bool` 2 件・必須フィールド・配列要素のすべてを照合する。
+    #[test]
+    fn oci4_null_in_known_fields_is_data_error() {
+        const OPTIONAL: [&[&str]; 13] = [
+            &["process"],
+            &["hostname"],
+            &["mounts"],
+            &["linux"],
+            &["process", "env"],
+            &["process", "user", "additionalGids"],
+            &["mounts", "0", "type"],
+            &["mounts", "0", "source"],
+            &["mounts", "0", "options"],
+            &["linux", "namespaces"],
+            &["linux", "uidMappings"],
+            &["linux", "gidMappings"],
+            &["linux", "namespaces", "1", "path"],
+        ];
+        const DEFAULT_BOOL: [&[&str]; 2] = [&["root", "readonly"], &["process", "terminal"]];
+        const REQUIRED: [&[&str]; 12] = [
+            &["ociVersion"],
+            &["root"],
+            &["root", "path"],
+            &["process", "user"],
+            &["process", "user", "uid"],
+            &["process", "args"],
+            &["process", "args", "0"],
+            &["process", "cwd"],
+            &["mounts", "0"],
+            &["mounts", "0", "destination"],
+            &["linux", "namespaces", "0", "type"],
+            &["linux", "uidMappings", "0", "size"],
+        ];
+        for path in OPTIONAL.iter().chain(&DEFAULT_BOOL).chain(&REQUIRED) {
+            let mut v = base();
+            *value_at(&mut v, path) = Value::Null;
+            let e = err_of(&v);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{path:?}");
+            assert_eq!(*e.kind(), OciConfigErrorKind::Data, "{path:?}");
         }
+        // 省略（キー自体が無い）は従来どおり受理する。
+        for path in OPTIONAL.iter().chain(&DEFAULT_BOOL) {
+            let mut v = base();
+            let (last, parent) = path.split_last().expect("non-empty path");
+            value_at(&mut v, parent)
+                .as_object_mut()
+                .expect("object")
+                .remove(*last);
+            parse(&v).unwrap_or_else(|e| panic!("{path:?}: {e:?}"));
+        }
+    }
+
+    /// 非通常ファイル（ディレクトリ）は 3 OS で同じ分類になる（ERR-1・REPAIR-5）。
+    #[test]
+    fn err1_directory_config_is_invalid_on_all_os() {
+        let dir = std::env::temp_dir().join(format!("fandhe-oci-dir-{}", std::process::id()));
+        let target = dir.join("config.json");
+        std::fs::create_dir_all(&target).expect("mkdir");
+        let e = load_config(&target).expect_err("directory");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            *e.kind(),
+            OciConfigErrorKind::Invalid {
+                field: "config.json"
+            }
+        );
+        assert_eq!(
+            e.message(),
+            "config.json has an invalid value for `config.json`"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// 途中の要素が通常ファイルのパス（`<file>/config.json`）は 3 OS で `NotFound` になる（ERR-1）。
+    #[test]
+    fn err1_path_through_regular_file_is_not_found_on_all_os() {
+        let dir = std::env::temp_dir().join(format!("fandhe-oci-notdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("bundle");
+        std::fs::write(&file, b"{}").expect("write");
+        let e = load_config(&file.join("config.json")).expect_err("not a directory");
+        assert_eq!(e.code(), ErrorCode::NotFound);
+        assert_eq!(*e.kind(), OciConfigErrorKind::Io);
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
@@ -1346,6 +1450,100 @@ mod tests {
         let mut v = base();
         v["linux"]["namespaces"] = json!([{"type": "bogus"}]);
         assert_eq!(*err_of(&v).kind(), OciConfigErrorKind::Data);
+    }
+
+    /// object 型の既知フィールドに配列を書いても、宣言順の位置指定として受理しない（OCI-4）。
+    #[test]
+    fn oci4_array_in_place_of_object_is_data_error() {
+        let cases: [(&[&str], Value); 7] = [
+            (&["root"], json!(["rootfs", true])),
+            (
+                &["process"],
+                json!([false, {"uid": 0, "gid": 0}, ["/bin/sh"], [], "/"]),
+            ),
+            (&["process", "user"], json!([0, 0])),
+            (&["mounts", "0"], json!(["/proc"])),
+            (&["linux"], json!([])),
+            (&["linux", "namespaces", "0"], json!(["pid"])),
+            (&["linux", "uidMappings", "0"], json!([0, 1000, 1])),
+        ];
+        for (path, wrong) in cases {
+            let mut v = base();
+            *value_at(&mut v, path) = wrong;
+            let e = err_of(&v);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{path:?}");
+            assert_eq!(*e.kind(), OciConfigErrorKind::Data, "{path:?}");
+        }
+        let e = parse_config_bytes(br#"["1.0.0", {"path": "r"}]"#).expect_err("top-level array");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(*e.kind(), OciConfigErrorKind::Data);
+    }
+
+    /// OCI Runtime Spec の namespace 種別 8 種を読み分ける（OCI-4）。
+    #[test]
+    fn oci4_all_namespace_types_are_parsed() {
+        let expected = [
+            ("pid", NamespaceKind::Pid),
+            ("network", NamespaceKind::Network),
+            ("mount", NamespaceKind::Mount),
+            ("ipc", NamespaceKind::Ipc),
+            ("uts", NamespaceKind::Uts),
+            ("user", NamespaceKind::User),
+            ("cgroup", NamespaceKind::Cgroup),
+            ("time", NamespaceKind::Time),
+        ];
+        assert_eq!(NAMESPACE_TYPES.len(), expected.len());
+        let mut v = base();
+        v["linux"]["namespaces"] = Value::Array(
+            expected
+                .iter()
+                .map(|(name, _)| json!({"type": name}))
+                .collect(),
+        );
+        let cfg = parse(&v).expect("valid");
+        let kinds: Vec<NamespaceKind> = cfg.namespaces().iter().map(OciNamespace::kind).collect();
+        assert_eq!(kinds, expected.map(|(_, k)| k));
+        for (name, _) in expected {
+            assert!(NAMESPACE_TYPES.contains(&name), "{name}");
+        }
+    }
+
+    /// 構文は正しい JSON の型不一致は、どの既知フィールドでも `Syntax` ではなく `Data` になる
+    /// （OCI-4。`linux.namespaces[].type` のような列挙値も含む）。
+    #[test]
+    fn oci4_type_mismatch_in_every_known_field_is_data() {
+        let cases: [(&[&str], Value); 23] = [
+            (&["ociVersion"], json!(1)),
+            (&["root"], json!("r")),
+            (&["root", "path"], json!(1)),
+            (&["root", "readonly"], json!("yes")),
+            (&["process"], json!([])),
+            (&["process", "terminal"], json!(0)),
+            (&["process", "user"], json!(1)),
+            (&["process", "user", "gid"], json!(true)),
+            (&["process", "user", "additionalGids"], json!({})),
+            (&["process", "args", "0"], json!(1)),
+            (&["process", "env"], json!("PATH=/bin")),
+            (&["process", "cwd"], json!([])),
+            (&["hostname"], json!(1)),
+            (&["mounts"], json!({})),
+            (&["mounts", "0", "destination"], json!(1)),
+            (&["mounts", "0", "type"], json!(1)),
+            (&["mounts", "0", "source"], json!([])),
+            (&["mounts", "0", "options"], json!("nosuid")),
+            (&["linux"], json!([])),
+            (&["linux", "namespaces", "0", "type"], json!(1)),
+            (&["linux", "namespaces", "1", "path"], json!(1)),
+            (&["linux", "uidMappings"], json!({})),
+            (&["linux", "gidMappings", "0", "hostID"], json!("100")),
+        ];
+        for (path, wrong) in cases {
+            let mut v = base();
+            *value_at(&mut v, path) = wrong;
+            let e = err_of(&v);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{path:?}");
+            assert_eq!(*e.kind(), OciConfigErrorKind::Data, "{path:?}");
+        }
     }
 
     #[test]
@@ -1539,6 +1737,7 @@ mod tests {
     #[test]
     fn oci4_load_config_rejects_non_regular_file() {
         let e = load_config(Path::new("/dev/null")).expect_err("not a file");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert_eq!(
             *e.kind(),
             OciConfigErrorKind::Invalid {

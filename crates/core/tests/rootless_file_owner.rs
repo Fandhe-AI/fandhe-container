@@ -146,8 +146,9 @@ mod linux {
             ));
         std::fs::create_dir(&base).expect("exclusively create work dir");
         let dir = WorkDir(base);
-        // 写像先 UID のコンテナ内 root が書けるよう、他者書き込み可にする。
-        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o777))
+        // ns 内 uid 0 は呼び出し元 euid に写像され、ディレクトリも同 euid の作成物なので
+        // 所有者のみ（0o700）で足りる。他ユーザーによる検証対象の差し替えを防ぐ（SEC-5）。
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o700))
             .expect("chmod work dir");
         dir
     }

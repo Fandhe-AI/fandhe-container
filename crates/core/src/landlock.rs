@@ -342,7 +342,19 @@ mod tests {
                 actual.expect_err("disabled").reason,
                 LandlockUnavailable::DisabledAtBoot
             ),
-            other => panic!("unexpected raw probe result: {other:?}"),
+            // seccomp 等で syscall が制限された環境・対応外アーキテクチャでも実装は拒否理由を返す。
+            Err(SysError::Os(e)) => assert_eq!(
+                actual.expect_err("probe failed").reason,
+                LandlockUnavailable::ProbeFailed { errno: e }
+            ),
+            Err(SysError::Unsupported) => assert_eq!(
+                actual.expect_err("unsupported arch").reason,
+                LandlockUnavailable::UnsupportedArchitecture
+            ),
+            other => {
+                // 0 応答・MultiThreaded は実 syscall では発生しない。必ず拒否側へ倒れることだけ確認する。
+                assert!(actual.is_err(), "unexpected raw probe result: {other:?}");
+            }
         }
     }
 

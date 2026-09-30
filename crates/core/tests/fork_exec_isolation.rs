@@ -206,7 +206,8 @@ mod linux {
             .expect("chmod");
     }
 
-    /// 子を期限付きで待つ。期限超過なら kill して回収し `None`（REPAIR-5）。
+    /// 子を期限付きで待つ。期限超過なら kill して回収し `None`（REPAIR-5）。kill 後の回収にも
+    /// 期限を設け、回収できなければ panic（失敗）にする。
     fn wait_deadline(child: &mut std::process::Child, limit: Duration) -> Option<ExitStatus> {
         let deadline = Instant::now() + limit;
         loop {
@@ -214,7 +215,14 @@ mod linux {
                 Some(status) => return Some(status),
                 None if Instant::now() >= deadline => {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    let reap_deadline = Instant::now() + Duration::from_secs(5);
+                    while child.try_wait().expect("try_wait").is_none() {
+                        assert!(
+                            Instant::now() < reap_deadline,
+                            "the child was not reaped after SIGKILL"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
                     return None;
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

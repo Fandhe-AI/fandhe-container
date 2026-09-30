@@ -775,6 +775,51 @@ mod tests {
         fd_mount_id(&root, IsolationStage::Exec).unwrap()
     }
 
+    /// テスト用の一時ディレクトリ（drop で削除）。
+    ///
+    /// 共有 temp 配下の予測可能な名前への事前配置（symlink 差し替え）を防ぐため、名前に時刻と連番を
+    /// 混ぜ、`mkdir`（既存なら失敗・リンクを辿らない）で排他的に作る。中のファイルは呼び出し側が
+    /// `create_new`（`O_EXCL`）で作る。
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn create(label: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let base = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "fandhe-{label}-{}-{nanos}-{seq}",
+                    std::process::id()
+                ));
+            std::fs::create_dir(&base).unwrap();
+            Self(base)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// std の `Child` を kill して期限付きで回収する（REPAIR-5。期限内に回収できなければ失敗）。
+    fn kill_and_reap(child: &mut std::process::Child) {
+        let _ = child.kill();
+        let deadline = Instant::now() + KILL_REAP_TIMEOUT;
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the child was not reaped after SIGKILL"
+            );
+            std::thread::sleep(WAIT_POLL_INTERVAL);
+        }
+    }
+
     fn validate_err(r: Result<Entrypoint, ExecError>) -> ExecError {
         let err = r.unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
@@ -919,15 +964,18 @@ mod tests {
     /// そのまま渡る。dry-run の `execve` は `EINTR` を返すので `Internal` の `Exec` 段エラーになる。
     #[test]
     fn core1_exec_runs_steps_in_fixed_order() {
-        let dir = std::env::temp_dir().join(format!("fandhe-exec-order-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("probe");
-        std::fs::write(&bin, b"").unwrap();
+        let dir = TempDir::create("exec-order");
+        let bin = dir.0.join("probe");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&bin)
+            .unwrap();
         let entry = Entrypoint::new(&bin, ["probe", "-x"], ["K=V"]).unwrap();
         let _ = take_calls();
         let err = exec_entrypoint_verified(current_root_mnt_id(), &entry).unwrap_err();
         let calls = take_calls();
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
         assert_eq!(err.stage, IsolationStage::Exec);
         assert_eq!(err.code, ErrorCode::Internal);
         assert_eq!(
@@ -1085,8 +1133,7 @@ mod tests {
         };
         let result = handle.wait_timeout(Duration::ZERO);
         let alive = unrelated.try_wait().unwrap();
-        let _ = unrelated.kill();
-        let _ = unrelated.wait();
+        kill_and_reap(&mut unrelated);
         assert_eq!(result.unwrap(), ChildExit::Exited(7));
         assert_eq!(alive, None, "the unrelated process must not be signaled");
         assert_eq!(reap_snapshot(&handle).1, 0);

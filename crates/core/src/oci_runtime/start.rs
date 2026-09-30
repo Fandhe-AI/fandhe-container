@@ -267,6 +267,9 @@ fn in_flight() -> &'static Mutex<HashSet<ContainerId>> {
 /// 落ちるまで（＝start が戻り、かつ進行中の launch と遅れて返ったプロセスの後始末が終わるまで）解放
 /// されないため、その間の同一プロセス内の start・[`recover_interrupted_start`] は `FailedPrecondition`
 /// で拒否される（進行中の launch が後からプロセスを作る二重起動を防ぐ。CORE-2・SEC-1）。
+/// [`recover_interrupted_start`] の生存確認（ID 単位で終了・回収し得る）も、上限超過後に確認が終わるまで
+/// 複製を保持する。一方、上限を超えた `terminate` は特定のプロセスのハンドルに対する操作で、同じ ID の
+/// 後続のプロセスには作用しないため、上限で予約を手放す（戻らない実装で予約が永久に残るのを避ける）。
 struct StartReservation(ContainerId);
 
 impl StartReservation {
@@ -307,14 +310,15 @@ impl Drop for StartReservation {
 /// （既定実装を含む）はそのエラーを返して予約を残す（二重起動の防止。SEC-1・CORE-2）。
 ///
 /// 確認の待ちは `timeouts.confirm()` まで（REPAIR-5。呼び出し境界で強制する）。超過したら `Timeout` を
-/// 返して予約を残す。
+/// 返して予約を残す。上限超過後も確認が終わるまではプロセス内の予約を保持し、同一プロセス内の回復・
+/// start を `FailedPrecondition` で拒否する（遅れた確認が後続のプロセスを終了させないため。CORE-2）。
 pub fn recover_interrupted_start(
     store: &dyn StateStore,
     launcher: &Arc<dyn ProcessLauncher>,
     id: &ContainerId,
     timeouts: &StartTimeouts,
 ) -> Result<StateRecord, TraitError> {
-    let _reservation = StartReservation::acquire(id)?;
+    let reservation = Arc::new(StartReservation::acquire(id)?);
     let record = store.get(&GetStateRequest::new(id.clone()))?;
     if record.status().state() != ContainerState::Running || record.status().pid().is_some() {
         return Err(TraitError::new(
@@ -325,9 +329,17 @@ pub fn recover_interrupted_start(
     let confirm = timeouts.confirm();
     let l = Arc::clone(launcher);
     let target = id.clone();
+    // confirm_no_process は ID 単位で「残っていれば終了・回収」し得るため、上限超過で本関数が戻った後も
+    // 確認が終わるまでプロセス内の予約を保持する（回復の再試行・新しい start が先に進み、その後に
+    // 遅れた確認が新しいプロセスを終了させることを防ぐ。CORE-2）。
+    let hold = Arc::clone(&reservation);
     match call_bounded(
         confirm,
-        move || l.confirm_no_process(&target, confirm),
+        move || {
+            let result = l.confirm_no_process(&target, confirm);
+            drop(hold);
+            result
+        },
         drop,
     ) {
         Ok(result) => result?,
@@ -899,7 +911,6 @@ mod tests {
     }
 
     /// `cond` が真になるまで最大 `limit` ポーリングする（固定 sleep に頼らない）。
-    #[cfg(target_os = "linux")]
     fn eventually(limit: Duration, cond: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + limit;
         while Instant::now() < deadline {
@@ -1651,8 +1662,8 @@ mod tests {
             == 1));
     }
 
-    /// REPAIR-5・CORE-2: 生存確認が上限内に戻らなければ回復は Timeout を返して予約を残し、
-    /// 確認が戻るようになれば回復できる。
+    /// REPAIR-5・CORE-2: 生存確認が上限内に戻らなければ回復は Timeout を返して予約を残す。確認が終わる
+    /// までは同一 ID の回復・start を拒否し、確認が戻った後に回復できる。
     #[test]
     fn repair5_recover_times_out_when_confirmation_does_not_return() {
         let (_b, store) = created("confirm-hang");
@@ -1680,8 +1691,19 @@ mod tests {
         assert_eq!(launcher.received_timeouts(), [Duration::from_millis(200)]);
         let got = store.get(&GetStateRequest::new(id.clone())).expect("get");
         assert_eq!(got.status().state(), ContainerState::Running);
+        // 確認が終わるまでは、プロセス内の回復の再試行・start を拒否する（遅れた確認との競合防止）。
+        let err = recover(&store, &launcher, &id).expect_err("confirmation in flight");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), "container start is already in progress");
+        let err = run(&store, &launcher, "confirm-hang").expect_err("confirmation in flight");
+        assert_eq!(err.message(), "container start is already in progress");
+        assert_eq!(launcher.received_timeouts(), [Duration::from_millis(200)]);
         launcher.gate.set_open(true);
-        let got = recover(&store, &launcher, &id).expect("recover");
+        assert!(eventually(Duration::from_secs(10), || recover(
+            &store, &launcher, &id
+        )
+        .is_ok()));
+        let got = store.get(&GetStateRequest::new(id.clone())).expect("get");
         assert_eq!(got.status().state(), ContainerState::Created);
         assert_eq!(
             launcher.received_timeouts(),

@@ -42,7 +42,6 @@ fn test_timeout() -> Duration {
 }
 
 /// `cond` が真になるまで `test_timeout()` までポーリングする（固定 sleep に頼らない）。
-#[cfg(target_os = "linux")]
 fn eventually(cond: impl Fn() -> bool) -> bool {
     let deadline = Instant::now() + test_timeout();
     while Instant::now() < deadline {
@@ -504,8 +503,16 @@ fn repair5_recover_bounds_hanging_confirmation() {
         store.status_of("it-confirm").state(),
         ContainerState::Running
     );
+    // 確認が終わるまでは回復の再試行を拒否する（遅れた確認が後続のプロセスを終了させないため）。
+    let err = recover_interrupted_start(&store, &dynl(&launcher), &id, &short_timeouts())
+        .expect_err("confirmation in flight");
+    assert_eq!(err.message(), "container start is already in progress");
     launcher.gate.set_open(true);
-    let got = recover_interrupted_start(&store, &dynl(&launcher), &id, &short_timeouts())
-        .expect("recover");
-    assert_eq!(got.status().state(), ContainerState::Created);
+    assert!(eventually(|| {
+        recover_interrupted_start(&store, &dynl(&launcher), &id, &short_timeouts()).is_ok()
+    }));
+    assert_eq!(
+        store.status_of("it-confirm").state(),
+        ContainerState::Created
+    );
 }

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "metrics": {
+    "placeholder_throughput": {
+      "value": 1200,
+      "unit": "ops/s"
+    },
+    "placeholder_latency_p95": {
+      "value": 80,
+      "unit": "ms"
+    },
+    "extra_metric": {
+      "value": 1,
+      "unit": "x"
+    }
+  }
+}

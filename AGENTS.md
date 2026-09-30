@@ -51,6 +51,8 @@ make deny                   # cargo deny --locked check advisories bans licenses
 make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + deny を一括実行
 make bench-check-selftest   # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
 make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
+make bench-baseline-selftest  # baseline.json 生成スクリプトの自己テスト（TASK-88.1・REPAIR-12）
+make bench-baseline         # ベンチを実行し baseline.json を再生成する（TASK-88.1。BENCH_ENVIRONMENT・BENCH_BASELINE_OUT で指定。実測の記録は TASK-88.2）
 make fio-bench-selftest     # fio 4K ランダム write ベンチスクリプトの自己テスト（TASK-25.1・IO-8・REPAIR-12。実 fio 不要）
 make fio-bench TARGET_DIR=<dir> LABEL=<label> [RUNTIME=<seconds>]  # fio 4K ランダム write ベンチを実行する（実機前提。下記「実機前提テスト」節を参照）
 make fio-baseline-ratio-selftest  # fio ベースライン比算出スクリプトの自己テスト（TASK-25.2・IO-8・REPAIR-12。実 fio 不要）
@@ -71,7 +73,7 @@ make fio-baseline-ratio BASELINE=<results.json> CANDIDATE=<results.json>  # Dock
 | `fmt-check`・`deny` | `rust-ci` |
 | `lint`・`test`（既定 feature） | `rust-ci-default-features`（`--all-features` 側は `rust-ci`） |
 | `test-integration` | `integration-test` |
-| `bench-check-selftest`・`bench-check` | `bench-regression` |
+| `bench-check-selftest`・`bench-baseline-selftest`・`bench-check` | `bench-regression` |
 | （対応 target なし。`rustup target add aarch64-unknown-linux-gnu` の後に `cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu` と `cargo clippy --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu -- -D warnings`） | `aarch64-linux-check` |
 | `lint-docs` | `lint-docs` |
 | `check-workspace-manifest`（`make ci` の一部） | 専用の CI ジョブはない（ローカルゲート専用）。workspace manifest が不正なら各 cargo ジョブのビルドが失敗するため、CI では間接的に検出される |
@@ -100,7 +102,7 @@ make fio-baseline-ratio BASELINE=<results.json> CANDIDATE=<results.json>  # Dock
 | ユニットテスト | 各 crate の `src/` 内 `#[cfg(test)]` | `make test` | — |
 | 結合試験 | 各 crate の `tests/*.rs`（integration test target） | `make test-integration` | `crates/io/tests/` に導入済み。他 crate の結合試験は各機能タスクで追加する。件数は `make test-integration` が出力する `integration test targets: N` 行で確認する |
 | SIGKILL 耐性（IO-3・TASK-18.3.1。実測は [io-crash-safety](docs/design/io-crash-safety.md)） | `crates/io/tests/crash_safety.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-io --features crash-test-server --test crash_safety` | 既定 CI 集合（`integration-test` 3 OS・`rust-ci`）で実行し、実機前提ではない。`integration-test` は「crash_safety の存在確認」ステップで glob による無言除外を検出する。電源断後の媒体永続化（IO-2）と実測レポート・妥当性判断（TASK-18 の人間担当）は保証しない |
-| ベンチ回帰 | `benches/benches/*.rs`・`benches/baseline.json` | `make bench-check` | プレースホルダ段階。実ベンチは TASK-113、基準値の校正は TASK-88 |
+| ベンチ回帰 | `benches/benches/*.rs`・`benches/baseline.json`・`benches/metrics.json`・`scripts/bench/` | `make bench-check`・`make bench-baseline-selftest` | プレースホルダ段階。実ベンチは TASK-113、基準値の校正は TASK-88（校正記録: [bench-calibration](docs/design/bench-calibration.md)） |
 | fio 4K ランダム write ベンチ | `scripts/fio-randwrite-4k.sh`・`scripts/testdata/fio-bench/` | `make fio-bench-selftest`（自己テスト）・`make fio-bench`（実機） | TASK-25.1 で実装済み |
 | fio ベースライン比算出 | `scripts/fio-baseline-ratio.sh`・`scripts/testdata/fio-baseline/` | `make fio-baseline-ratio-selftest`（自己テスト）・`make fio-baseline-ratio`（比率算出） | TASK-25.2: 手順・比率算出・目標値案は整備済み。Docker ベースライン比の実測値は人間実施待ち（#114） |
 | 実機前提テスト | 既定のテスト集合から分離する | 分離の仕組みは該当タスクで決める | 下記「実機前提テスト」節・[ci](.claude/rules/ci.md)「実機前提テスト」を参照 |
@@ -152,7 +154,7 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
 - 15% **超**の悪化を回帰として fail させる（ちょうど 15.0% の悪化は合格）。終了コードは `0`（合格）/ `1`（回帰検出）/ `2`（入力エラー。引数・ファイル・スキーマ不正等）の 3 値
 - 基準値にある metric が結果に無い、または結果にしかない metric がある場合も入力エラー（`2`）として fail する（基準値の無いベンチを素通りさせない）
 - 現時点では `benches/benches/regression_placeholder.rs`（決定的な固定値を返す stub）と `benches/baseline.json`（`placeholder: true` の暫定値）で動作確認する段階にある。実測を伴う本物のベンチと基準値への置き換えはそれぞれ TASK-113・TASK-88 で行う
-- `benches/baseline.json` の値を回帰が隠れる方向へ書き換える差分、`scripts/check-bench-regression.sh` の閾値（`THRESHOLD_PERCENT`）を変える差分、比較対象から metric を外す差分は、TASK-88 の校正記録が無い限り「回帰検出の後退」（P0）として扱う
+- `benches/baseline.json` の値を回帰が隠れる方向へ書き換える差分、`scripts/check-bench-regression.sh` の閾値（`THRESHOLD_PERCENT`）を変える差分、比較対象から metric を外す差分、`benches/metrics.json` の `direction` を変える・metric を削除する差分は、TASK-88 の校正記録が無い限り「回帰検出の後退」（P0）として扱う
 
 ### 実機前提テスト
 

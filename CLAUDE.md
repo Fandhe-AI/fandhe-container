@@ -43,7 +43,7 @@ fandhe-container/
 │   ├── cli/ / stack/              #   統一 CLI / 複数コンテナ定義（TOML スキーマ・起動順）
 │   ├── compose-convert/           #   compose.yaml → TOML 片方向変換ツール（fandhe-container-compose-convert）
 │   └── plugin-*/                  #   fandhe-container-plugin-cri / -macos / -windows / -microvm / -mcp
-├── scripts/                       # ベンチ回帰比較スクリプト（TASK-86.3・REPAIR-8）・fio 4K ランダム write ベンチスクリプト（TASK-25.1・IO-8）・fio ベースライン比の算出（TASK-25.2・IO-8。scripts/testdata/ に fixture）。依存禁止判定等は（予定）
+├── scripts/                       # ベンチ回帰比較スクリプト（TASK-86.3・REPAIR-8）・baseline.json 生成スクリプト（scripts/bench/。TASK-88.1）・fio 4K ランダム write ベンチスクリプト（TASK-25.1・IO-8）・fio ベースライン比の算出（TASK-25.2・IO-8。scripts/testdata/ に fixture）。依存禁止判定等は（予定）
 ├── benches/                       # crate をまたぐベンチ回帰（REPAIR-8。root の workspace メンバー crate fandhe-container-benches、publish = false。benches/benches/regression_placeholder.rs は TASK-86.3 のプレースホルダベンチ、baseline.json は暫定基準値。実ベンチ本体は TASK-113、基準値の校正は TASK-88）
 ├── docs/
 │   ├── architecture.md            # crate 境界・依存関係グラフ・確定済み設計判断の索引（TASK-6・REPAIR-3・PLUG-1）
@@ -58,6 +58,7 @@ fandhe-container/
 │   │   ├── io-protocol.md         # I/O 共有層のワイヤーフレーム・チェックサム（TASK-11・IO-1・REPAIR-2）
 │   │   ├── break-detection-ci-report.md  # BREAK-1/BREAK-2 の CI 検出実証レポート（TASK-89.2・REPAIR-7）
 │   │   ├── io-fio-bench.md        # fio 4K ランダム write ベンチスクリプトの契約（TASK-25.1・IO-8）・Docker ベースライン計測手順・目標値案（TASK-25.2）
+│   │   ├── bench-calibration.md   # ベンチ基準値の校正記録・試行ログ（TASK-88.2・REPAIR-8。実測は前提ベンチ未実装のため保留）
 │   │   └── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external・ci（稼働）/ release（発火条件無効化中）

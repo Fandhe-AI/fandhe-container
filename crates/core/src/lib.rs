@@ -25,7 +25,7 @@
 //!   実装済みで、他の段の実体（cgroup 参加・capability 削減・seccomp・Landlock）は未実装。非 Linux ではビルド対象外のため本 doc からは
 //!   リンクしない）
 //! - `observability`: メトリクス集計型 `OpStats` 等（TASK-84.1）と記録 API `OpRecorder`
-//!   （TASK-84.2）は実装済み（REPAIR-4）。出力・計装は TASK-84.3 以降で未実装
+//!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。計装は TASK-84.4 以降で未実装。io 向け連携点は io 側に定義済み（TASK-84.5）
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - `oci_runtime`: OCI Runtime のライフサイクル。現状は `config.json` の型・パーサのみ
 //!   （TASK-29.1.1 実装済み・OS 非依存）。create / start は TASK-29.2 / 29.3、kill / delete は

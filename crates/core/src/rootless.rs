@@ -1408,7 +1408,9 @@ mod tests {
         let (mut parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
         parent_end.write_all(&[MAPPER_GO]).expect("go");
         let (uid, gid) = mapper_fixture();
-        let wrong = std::os::unix::process::parent_id() ^ 1;
+        // 実在するが親ではない pid（自プロセス）を使う。存在しない pid だと `/proc/<pid>` の open が
+        // 先に `NotFound` で失敗し、親不一致の検証まで到達しない。
+        let wrong = std::process::id();
         let code = run_id_map_mapper(
             wrong,
             mapper_end,

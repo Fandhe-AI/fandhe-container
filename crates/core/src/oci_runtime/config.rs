@@ -904,30 +904,105 @@ pub fn parse_config_bytes(bytes: &[u8]) -> Result<OciConfig, OciConfigError> {
     raw.validate()
 }
 
-/// `O_NONBLOCK`（`open(2)` フラグ）。Linux は x86_64 / aarch64 とも `0o4000`、macOS は `0x4`。
+/// `O_NONBLOCK`（`open(2)` フラグ）を値で持つ環境の条件。
+///
+/// Linux は `0o4000` を使うアーキテクチャ（x86 / x86_64 / arm / aarch64 / riscv / powerpc / s390x /
+/// loongarch64）、BSD 系（macOS・iOS・FreeBSD・NetBSD・OpenBSD・DragonFly）は `0x4`。
+/// mips・sparc 等は値が異なるためここに含めず、下記の事前 `stat` 経路に倒す。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "s390x",
+        target_arch = "loongarch64"
+    )
 ))]
 const O_NONBLOCK: i32 = 0o4000;
-#[cfg(target_os = "macos")]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 const O_NONBLOCK: i32 = 0x4;
 
-/// 種別確認前に安全に開く。書き手のいない FIFO でも `open` が戻るよう、対応 OS では非ブロッキングで
-/// 開く（呼び出し側が開いた後の `fstat` で通常ファイルか確認するため、確認後の差し替えにも耐える。REPAIR-5）。
+/// 種別確認前に安全に開く（REPAIR-5）。
+///
+/// `O_NONBLOCK` を指定できる環境では非ブロッキングで開くため、書き手のいない FIFO でも `open` が戻る
+/// （呼び出し側が開いた後の `fstat` で通常ファイルか確認するため、確認後の差し替えにも耐える）。
+/// それ以外の環境（Windows・mips / sparc の Linux 等）では `open` 前に `stat` で通常ファイル以外を
+/// 拒否してから開く。Windows には POSIX の FIFO が無く、その他は FIFO をブロックさせ得る競合窓
+/// （`stat` 後の差し替え）が残るが、fail-closed の事前拒否で通常経路の無期限ブロックは防ぐ。
 fn open_regular_candidate(path: &Path) -> io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(any(
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "arm",
+                target_arch = "aarch64",
+                target_arch = "riscv32",
+                target_arch = "riscv64",
+                target_arch = "powerpc",
+                target_arch = "powerpc64",
+                target_arch = "s390x",
+                target_arch = "loongarch64"
+            )
         ),
-        target_os = "macos"
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
     ))]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(O_NONBLOCK);
+    }
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "arm",
+                target_arch = "aarch64",
+                target_arch = "riscv32",
+                target_arch = "riscv64",
+                target_arch = "powerpc",
+                target_arch = "powerpc64",
+                target_arch = "s390x",
+                target_arch = "loongarch64"
+            )
+        ),
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        // O_NONBLOCK を使えない環境: open がブロックし得る前に種別を確認する。
+        if !std::fs::metadata(path)?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
     }
     opts.open(path)
 }

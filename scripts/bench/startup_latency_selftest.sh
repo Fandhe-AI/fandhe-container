@@ -91,43 +91,108 @@ echo '{}' >"$work/bundle/config.json"
 stub_log="$work/stub.log"
 
 stub="$work/stub-runtime"
-cat >"$stub" <<STUB
-#!${bash_bin}
-# スタブランタイム。STUB_MODE: ok / create-fail / create-fail-delete-fail / create-fail-gone / create-fail-state-error / start-fail / start-hang / start-flood / delete-fail
-cmd="\$1"
+stub_state="$work/stub-state"
+mkdir -p "$stub_state"
+# シバンだけ展開し、本体は展開なし（'STUB'）で書く。
+printf '#!%s\n' "$bash_bin" >"$stub"
+cat >>"$stub" <<'STUB'
+# スタブランタイム。OCI Runtime CLI（state / create / start / kill / delete）を模し、
+# コンテナの状態を $STUB_STATE 配下のマーカーファイルで持つ。STUB_MODE:
+#   ok: create -> created、start 後の state は stopped（`true` 相当で即終了）
+#   create-fail / create-fail-gone: create が何も作らず失敗（delete・state は不存在エラー）
+#   create-fail-delete-fail: create が途中まで作って失敗し、delete も常に失敗（state は created）
+#   create-fail-state-error: create 未作成で失敗し、以後の state が権限エラーを返す
+#   create-fail-notfound-text: 同上で、権限エラーの文言に "not found" を含む
+#   start-fail / start-hang / start-flood: start が失敗 / ハング / 大量出力
+#   delete-fail: 計測は成功するが delete が常に失敗
+#   exec-delayed: start 後の state が created を 2 回返してから stopped
+#   exec-never: start 後の state が created のまま
+#   running-race: start 後は running。実行中の delete を拒否し、kill 後も 2 回は拒否する
+#   never-stops: start 後は running のままで kill も効かない
+#   id-in-use: create 前から同じ ID のコンテナが存在する
+mode="${STUB_MODE:-ok}"
+cmd="$1"
 shift
-case "\$cmd" in
-  create) id="\${@: -1}" ;;
-  *) id="\$1" ;;
+case "$cmd" in
+  create) id="${*: -1}" ;;
+  *) id="$1" ;;
 esac
-echo "\$cmd \$id" >>"\$STUB_LOG"
-case "\$cmd" in
+echo "$cmd $id" >>"$STUB_LOG"
+m="$STUB_STATE/$id"
+state_json() { printf '{"ociVersion":"1.0.2","id":"%s","status":"%s","pid":0,"bundle":"/b"}\n' "$id" "$1"; }
+# 不存在エラー。runc のように時刻を含め、呼び出しごとに数字が揺れる形にする。
+not_exist() { echo "time=\"$(date +%s)$RANDOM\" level=error msg=\"container $id does not exist\"" >&2; exit 1; }
+case "$cmd" in
   create)
     sleep 0.05
-    case "\${STUB_MODE:-ok}" in create-fail | create-fail-delete-fail | create-fail-gone | create-fail-state-error) echo "stub: create failed" >&2; exit 1 ;; esac
+    touch "$m.attempted"
+    case "$mode" in
+      create-fail | create-fail-gone | create-fail-state-error | create-fail-notfound-text)
+        echo "stub: create failed" >&2; exit 1 ;;
+      create-fail-delete-fail) touch "$m.created"; echo "stub: create failed" >&2; exit 1 ;;
+    esac
+    touch "$m.created"
     ;;
   start)
-    [ "\${STUB_MODE:-ok}" = start-fail ] && { echo "stub: start failed" >&2; exit 1; }
-    [ "\${STUB_MODE:-ok}" = start-hang ] && exec sleep 30
-    [ "\${STUB_MODE:-ok}" = start-flood ] && exec yes
+    [ -e "$m.created" ] || not_exist
+    [ "$mode" = start-fail ] && { echo "stub: start failed" >&2; exit 1; }
+    [ "$mode" = start-hang ] && exec sleep 30
+    [ "$mode" = start-flood ] && exec yes
     sleep 0.10
+    touch "$m.started"
+    ;;
+  state)
+    if [ "$mode" = id-in-use ]; then state_json created; exit 0; fi
+    if [ -e "$m.attempted" ] && [ ! -e "$m.created" ]; then
+      [ "$mode" = create-fail-state-error ] && { echo "stub: open state.json: permission denied" >&2; exit 1; }
+      [ "$mode" = create-fail-notfound-text ] && { echo "stub: permission denied (state file not found in cache)" >&2; exit 1; }
+    fi
+    [ -e "$m.created" ] || not_exist
+    if [ ! -e "$m.started" ]; then state_json created; exit 0; fi
+    case "$mode" in
+      exec-delayed)
+        n=$(($(cat "$m.polls" 2>/dev/null || echo 0) + 1))
+        echo "$n" >"$m.polls"
+        if [ "$n" -le 2 ]; then state_json created; else state_json stopped; fi
+        ;;
+      exec-never) state_json created ;;
+      running-race | never-stops)
+        if [ -e "$m.killed" ] && [ "$mode" = running-race ]; then state_json stopped; else state_json running; fi
+        ;;
+      *) state_json stopped ;;
+    esac
+    ;;
+  kill)
+    [ -e "$m.created" ] || not_exist
+    touch "$m.killed"
     ;;
   delete)
-    case "\${STUB_MODE:-ok}" in delete-fail | create-fail-delete-fail | create-fail-gone | create-fail-state-error) echo "stub: delete failed" >&2; exit 1 ;; esac
-    ;;
-  kill) ;;
-  state)
-    # 存在しない ID は OCI 準拠ランタイムと同様に非ゼロで拒否する。
-    [ "\${STUB_MODE:-ok}" = create-fail-gone ] && { echo "stub: container does not exist" >&2; exit 1; }
-    [ "\${STUB_MODE:-ok}" = create-fail-state-error ] && { echo "stub: permission denied" >&2; exit 1; }
+    [ -e "$m.created" ] || not_exist
+    case "$mode" in
+      delete-fail | create-fail-delete-fail) echo "stub: delete failed" >&2; exit 1 ;;
+      never-stops) [ -e "$m.started" ] && { echo "stub: cannot delete running container" >&2; exit 1; } ;;
+      running-race)
+        if [ -e "$m.started" ]; then
+          [ -e "$m.killed" ] || { echo "stub: cannot delete running container" >&2; exit 1; }
+          n=$(($(cat "$m.delete-after-kill" 2>/dev/null || echo 0) + 1))
+          echo "$n" >"$m.delete-after-kill"
+          [ "$n" -le 2 ] && { echo "stub: container is still running" >&2; exit 1; }
+        fi
+        ;;
+    esac
+    rm -f -- "$m".*
     ;;
 esac
 exit 0
 STUB
 chmod 755 "$stub"
 export STUB_LOG="$stub_log"
+export STUB_STATE="$stub_state"
 
-reset_log() { : >"$stub_log"; }
+reset_log() {
+  : >"$stub_log"
+  rm -f -- "$stub_state"/*
+}
 
 # --- 1. 正常系 ---
 reset_log
@@ -138,7 +203,9 @@ expect_eq "normal-schema_version" "1" "$(jq -r '.schema_version' <<<"$normal_jso
 expect_eq "normal-benchmark" "startup_latency" "$(jq -r '.benchmark' <<<"$normal_json")"
 expect_eq "normal-target" "own" "$(jq -r '.target' <<<"$normal_json")"
 expect_eq "normal-samples-count" "3" "$(jq -r '.samples_us | length' <<<"$normal_json")"
-expect_eq "normal-total-consistent" "true" "$(jq -r 'all(.samples_us[]; .total_us >= .create_us + .start_us and .total_us >= 150000)' <<<"$normal_json")"
+expect_eq "normal-total-consistent" "true" "$(jq -r 'all(.samples_us[]; .total_us >= .create_us + .start_us + .observe_us and .total_us >= 150000)' <<<"$normal_json")"
+# ok モードの state は start 直後から stopped を返すため、実行開始の観測は各回 1 回の照会で済む。
+expect_eq "normal-state-polls" "1 1 1" "$(jq -r '[.samples_us[].state_polls] | map(tostring) | join(" ")' <<<"$normal_json")"
 expect_eq "normal-p50-unit" "ms" "$(jq -r '.metrics.startup_latency_p50_ms.unit' <<<"$normal_json")"
 expect_eq "normal-no-path-leak" "false" "$(jq -r --arg p "$work" 'tostring | contains($p)' <<<"$normal_json")"
 
@@ -167,21 +234,25 @@ reset_log
 expect_rc "even-run" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 4 --warmup 0
 verify_stats "median-even(4)" "$last_stdout"
 
-# --- 3. 呼び出し順: warmup 込み 4 回・ID 一意・create -> start -> delete ---
+# --- 3. 呼び出し順: warmup 込み 4 回・ID 一意・state（ID 未使用確認）-> create -> start ->
+#        state（実行開始の観測。CORE-10）-> delete ---
 reset_log
 expect_rc "call-order-run" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 3 --warmup 1
 mapfile -t log_lines <"$stub_log"
-expect_eq "call-order-line-count" "12" "${#log_lines[@]}"
+expect_eq "call-order-line-count" "20" "${#log_lines[@]}"
 order_ok=1
 declare -A seen_ids=()
-for ((i = 0; i + 2 < ${#log_lines[@]}; i += 3)); do
-  read -r c1 id1 <<<"${log_lines[$i]}"
-  read -r c2 id2 <<<"${log_lines[$((i + 1))]}"
-  read -r c3 id3 <<<"${log_lines[$((i + 2))]}"
-  if [ "$c1 $c2 $c3" != "create start delete" ] || [ "$id1" != "$id2" ] || [ "$id2" != "$id3" ]; then
-    order_ok=0
-  fi
-  seen_ids["$id1"]=1
+for ((i = 0; i + 4 < ${#log_lines[@]}; i += 5)); do
+  cmds=""
+  first_id=""
+  for ((j = 0; j < 5; j++)); do
+    read -r c cid <<<"${log_lines[$((i + j))]}"
+    cmds="$cmds $c"
+    [ -z "$first_id" ] && first_id="$cid"
+    [ "$cid" = "$first_id" ] || order_ok=0
+  done
+  [ "$cmds" = " state create start state delete" ] || order_ok=0
+  seen_ids["$first_id"]=1
 done
 expect_eq "call-order-sequence" "1" "$order_ok"
 expect_eq "call-order-unique-ids" "4" "${#seen_ids[@]}"
@@ -229,21 +300,37 @@ reset_log
 STUB_MODE=create-fail expect_rc "create-fail" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 expect_contains "create-fail-log-tail" "stub: create failed"
 if grep -q '^delete ' "$stub_log"; then pass "create-fail-delete-called"; else fail "create-fail-delete-called"; fi
-# create 失敗後の delete も失敗する場合は kill → delete を再試行し、残存 ID を報告して exit 4。
+# create が途中まで作って失敗し delete も失敗する場合は kill → 待機付き delete を再試行し、
+# 残存 ID を報告して exit 4（待機は --timeout 秒で打ち切る。REPAIR-5）。
 reset_log
-STUB_MODE=create-fail-delete-fail expect_rc "create-fail-delete-fail" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+started="$SECONDS"
+STUB_MODE=create-fail-delete-fail expect_rc "create-fail-delete-fail" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+elapsed=$((SECONDS - started))
+if [ "$elapsed" -lt 15 ]; then pass "create-fail-delete-fail-bounded (${elapsed}s < 15s)"; else fail "create-fail-delete-fail-bounded (${elapsed}s)"; fi
 expect_contains "create-fail-leftover-id" "containers left behind: fandhe-startup-"
 if grep -q '^kill ' "$stub_log"; then pass "create-fail-kill-called"; else fail "create-fail-kill-called"; fi
-# create 失敗でコンテナ未作成（state も失敗）なら後始末失敗にせず、契約どおり exit 1（Codex P1 / Bugbot 指摘）。
+# create 失敗でコンテナ未作成なら、state の応答が create 前（ID 未使用時）と一致する
+# （時刻の数字だけが揺れる）ため後始末失敗にせず、契約どおり exit 1（Codex P1 / Bugbot 指摘）。
 reset_log
 STUB_MODE=create-fail-gone expect_rc "create-fail-gone" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 expect_contains "create-fail-gone-create-error" "runtime-create-failed"
 if [[ "$last_output" == *"containers left behind"* ]]; then fail "create-fail-gone-no-false-leftover"; else pass "create-fail-gone-no-false-leftover"; fi
-if grep -q '^state ' "$stub_log"; then pass "create-fail-gone-state-probed"; else fail "create-fail-gone-state-probed"; fi
-# state が不存在を明示せず失敗（権限エラー等）した場合は残存の可能性ありとして exit 4。
+expect_eq "create-fail-gone-state-probed" "2" "$(grep -c '^state ' "$stub_log")"
+# state が create 前と異なる失敗（権限エラー等）を返した場合は残存の可能性ありとして exit 4。
 reset_log
-STUB_MODE=create-fail-state-error expect_rc "create-fail-state-error" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+STUB_MODE=create-fail-state-error expect_rc "create-fail-state-error" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
 expect_contains "create-fail-state-error-leftover" "containers left behind: fandhe-startup-"
+# 文言に "not found" を含む権限エラーでも、応答が create 前と異なれば exit 4（Codex P1: 文言だけで
+# 消滅を確定しない）。
+reset_log
+STUB_MODE=create-fail-notfound-text expect_rc "create-fail-notfound-text" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+expect_contains "create-fail-notfound-text-leftover" "containers left behind: fandhe-startup-"
+expect_contains "create-fail-notfound-text-warning" "could not confirm that fandhe-startup-"
+# create 前から同じ ID が存在する場合は触らずに exit 1（create・delete・kill を呼ばない）。
+reset_log
+STUB_MODE=id-in-use expect_rc "id-in-use" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_contains "id-in-use-error" "container-id-in-use"
+expect_eq "id-in-use-untouched" "state" "$(cut -d' ' -f1 "$stub_log" | sort -u | tr '\n' ' ' | sed 's/ $//')"
 reset_log
 STUB_MODE=start-fail expect_rc "start-fail" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 if grep -q '^delete ' "$stub_log"; then pass "start-fail-delete-called"; else fail "start-fail-delete-called"; fi
@@ -263,8 +350,35 @@ if grep -q '^delete ' "$stub_log"; then pass "start-flood-delete-called"; else f
 
 # --- 8. delete 失敗: 計測成功でも exit 4、残存 ID を出力 ---
 reset_log
-STUB_MODE=delete-fail expect_rc "delete-fail" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+STUB_MODE=delete-fail expect_rc "delete-fail" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
 expect_contains "delete-fail-leftover-id" "fandhe-startup-"
+
+# --- 8b. 実行中コンテナの後始末（Bugbot 指摘）: delete 拒否 -> kill -> 終了待ちの delete 再試行で
+#         成功し exit 0。kill 後も 2 回拒否されるため、delete は計 4 回呼ばれる ---
+reset_log
+STUB_MODE=running-race expect_rc "running-race" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_eq "running-race-sequence" "state create start state delete kill delete delete delete" \
+  "$(cut -d' ' -f1 "$stub_log" | tr '\n' ' ' | sed 's/ $//')"
+# kill 後も停止しない場合は --timeout 秒で待機を打ち切り exit 4（REPAIR-5）。
+reset_log
+started="$SECONDS"
+STUB_MODE=never-stops expect_rc "never-stops" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+elapsed=$((SECONDS - started))
+if [ "$elapsed" -lt 15 ]; then pass "never-stops-bounded (${elapsed}s < 15s)"; else fail "never-stops-bounded (${elapsed}s)"; fi
+expect_contains "never-stops-leftover-id" "containers left behind: fandhe-startup-"
+
+# --- 8c. プロセス実行開始の観測（CORE-10）: state が running / stopped を返すまで照会する ---
+reset_log
+STUB_MODE=exec-delayed expect_rc "exec-delayed" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_eq "exec-delayed-state-polls" "3" "$(jq -r '.samples_us[0].state_polls' <<<"$last_stdout")"
+expect_eq "exec-delayed-total" "true" "$(jq -r '.samples_us[0] | .total_us >= .create_us + .start_us + .observe_us' <<<"$last_stdout")"
+reset_log
+started="$SECONDS"
+STUB_MODE=exec-never expect_rc "exec-never" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+elapsed=$((SECONDS - started))
+if [ "$elapsed" -lt 15 ]; then pass "exec-never-bounded (${elapsed}s < 15s)"; else fail "exec-never-bounded (${elapsed}s)"; fi
+expect_contains "exec-never-error" "runtime-exec-not-observed"
+if grep -q '^delete ' "$stub_log"; then pass "exec-never-delete-called"; else fail "exec-never-delete-called"; fi
 
 # --- 9. 前提ツール欠如: jq を含まない PATH で exit 3 ---
 mkdir -p "$work/emptybin"

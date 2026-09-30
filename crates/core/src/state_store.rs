@@ -26,8 +26,8 @@
 //! - 5 メソッドはすべて「プロセス内 `Mutex` → `@lock` の `try_lock`（上限 [`STATE_LOCK_TIMEOUT`]、
 //!   超えたら `Timeout`。REPAIR-5）」を取ってから読み書きする
 //! - revision は `@revision` のハイウォーターマークから払い出し、レコードより先に書く。
-//!   クラッシュしても欠番になるだけで再利用しない。`@revision` は新規（空）ストアの `open` が
-//!   初期化し、後から消えた場合は採番履歴を確認できないためレコードの有無によらず
+//!   クラッシュしても欠番になるだけで再利用しない。`@revision` は新規ストアの `open` が
+//!   `@lock` より先に（hard_link で不可分に）初期化し、後から消えた場合は採番履歴を確認できないためレコードの有無によらず
 //!   fail-closed（`Internal`）
 //! - 破損レコード（JSON 破損・ociVersion 不正・ID 不一致・状態と PID の矛盾等）は revision を
 //!   照合できないため通常の `delete` では消せない。管理操作 `find_corrupted` /
@@ -46,6 +46,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -83,6 +84,8 @@ pub const MAX_CORRUPTED_REPORT: usize = 256;
 
 const LOCK_FILE: &str = "@lock";
 const REVISION_FILE: &str = "@revision";
+/// `@revision` の初期化途中の一時ファイル名の接頭辞（新規ストア判定で無視する）。
+const REVISION_INIT_PREFIX: &str = "@revision.init-";
 /// `@revision` として読み込む最大バイト数（u64 の 10 進表現は 20 桁）。
 const MAX_REVISION_FILE_BYTES: u64 = 32;
 
@@ -164,6 +167,16 @@ fn resolve_default(
     }
 }
 
+/// `<id>/state.json` の検査結果（内容の破損と、権限・I/O エラーを区別する）。
+enum RecordHealth {
+    /// レコードがない（残骸ディレクトリのみも含む）。
+    Absent,
+    /// 読めて内容も整合している。
+    Healthy(StateRecord),
+    /// 内容が使えない（JSON 破損・サイズ超過・ociVersion 不正・ID 不一致・状態と PID の矛盾）。
+    Corrupted(TraitError),
+}
+
 /// ファイルベースの [`StateStore`] 実装。
 #[derive(Debug)]
 pub struct FileStateStore {
@@ -202,31 +215,30 @@ impl FileStateStore {
         // 祖先ディレクトリの書き込み権限も検査する（親すり替え対策。詳細は verify_ancestors）。
         let root = canonical_root(&path)?;
         verify_ancestors(&root)?;
-        // 空のルート（エントリが 1 つもない）だけを「新規ストア」とみなし、`@revision` を
-        // 初期化する。`@revision` が後から失われた場合は採番履歴を確認できないため、
-        // `allocate_revision` が fail-closed にする（revision 再発行の防止。OCI-5）。
-        let fresh = fs::read_dir(&root)
-            .map_err(|_| internal("failed to read the state root"))?
-            .next()
-            .is_none();
-        let store = Self {
-            root,
-            process_lock: Mutex::new(()),
-        };
-        if fresh {
-            let _guard = store.lock()?;
-            if matches!(
-                fs::symlink_metadata(store.root.join(REVISION_FILE)),
-                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
-            ) {
-                write_file_replacing(
-                    &store.root,
-                    REVISION_FILE,
-                    StateRevision::INITIAL.value().to_string().as_bytes(),
-                )?;
+        // 新規ストア（初期化途中の残骸 `@revision.init-*` 以外のエントリがない）だけ `@revision` を
+        // 初期化する。`@lock` を作る前に `@revision` を確定させるため、初期化の途中失敗で
+        // `@lock` だけが残って「空でない・高水位マークなし」の永久 fail-closed になることはない。
+        // `@revision` が後から失われた場合は採番履歴を確認できないため、`allocate_revision` が
+        // fail-closed にする（revision 再発行の防止。OCI-5）。
+        let mut fresh = true;
+        for entry in fs::read_dir(&root).map_err(|_| internal("failed to read the state root"))? {
+            let entry = entry.map_err(|_| internal("failed to read the state root"))?;
+            if !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(REVISION_INIT_PREFIX))
+            {
+                fresh = false;
+                break;
             }
         }
-        Ok(store)
+        if fresh {
+            init_revision_file(&root)?;
+        }
+        Ok(Self {
+            root,
+            process_lock: Mutex::new(()),
+        })
     }
 
     fn lock(&self) -> Result<StoreGuard<'_>, TraitError> {
@@ -289,8 +301,10 @@ impl FileStateStore {
         self.root.join(id.as_str())
     }
 
-    /// `<id>/state.json` を読む。存在しなければ `None`（残骸ディレクトリのみも `None`）。
-    fn read_record(&self, id: &ContainerId) -> Result<Option<StateRecord>, TraitError> {
+    /// `<id>/state.json` の場所を検査して返す。レコードがなければ `None`（残骸ディレクトリのみも
+    /// `None`）。`<id>` が symlink・非ディレクトリ・権限不備、`state.json` が通常ファイルでない
+    /// などの異常は `Err`（get・list・管理操作で共通。fail-closed）。
+    fn record_file(&self, id: &ContainerId) -> Result<Option<PathBuf>, TraitError> {
         let dir = self.record_dir(id);
         match fs::symlink_metadata(&dir) {
             Ok(m) if m.is_dir() => verify_record_dir(&m)?,
@@ -305,48 +319,40 @@ impl FileStateStore {
         }
         let file_path = dir.join(STATE_FILE_NAME);
         match fs::symlink_metadata(&file_path) {
-            Ok(m) if m.is_file() => {}
-            Ok(_) => return Err(internal("state file is not a regular file")),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(internal("failed to inspect the state file")),
+            Ok(m) if m.is_file() => Ok(Some(file_path)),
+            Ok(_) => Err(internal("state file is not a regular file")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(internal("failed to inspect the state file")),
         }
-        let bytes = read_limited(
-            &file_path,
-            MAX_STATE_FILE_BYTES,
-            "state file exceeds the size limit",
-        )?;
-        let dto: StateDto =
-            serde_json::from_slice(&bytes).map_err(|_| internal("state file is corrupted"))?;
-        dto.into_record(id).map(Some)
     }
 
-    /// `<id>/` が権限検証を通り、`state.json` が通常ファイルだが内容として使えない
-    /// （JSON として読めない・サイズ超過・ociVersion 不正・ID 不一致・状態と PID の矛盾等の
-    /// 構造上の不整合）か。[`FileStateStore::purge_corrupted`]・`find_corrupted` の判定に使う。
-    /// 権限不備など内容以外の理由で読めないものは破損とみなさない（fail-closed）。
-    fn is_corrupted_record(&self, id: &ContainerId) -> bool {
-        let dir = self.record_dir(id);
-        let Ok(m) = fs::symlink_metadata(&dir) else {
-            return false;
+    /// レコードを検査する。内容の不整合（JSON 破損・サイズ超過・ociVersion 不正・ID 不一致・
+    /// 状態と PID の矛盾等）は `Corrupted`、権限・I/O 等の内容以外の失敗は `Err`
+    /// （破損とは区別する。権限・I/O エラーのレコードを回復操作で消さないため）。
+    fn inspect_record(&self, id: &ContainerId) -> Result<RecordHealth, TraitError> {
+        let Some(file_path) = self.record_file(id)? else {
+            return Ok(RecordHealth::Absent);
         };
-        if !m.is_dir() || verify_record_dir(&m).is_err() {
-            return false;
+        let Some(bytes) = read_limited(&file_path, MAX_STATE_FILE_BYTES)? else {
+            return Ok(RecordHealth::Corrupted(internal(
+                "state file exceeds the size limit",
+            )));
+        };
+        let Ok(dto) = serde_json::from_slice::<StateDto>(&bytes) else {
+            return Ok(RecordHealth::Corrupted(internal("state file is corrupted")));
+        };
+        match dto.into_record(id) {
+            Ok(record) => Ok(RecordHealth::Healthy(record)),
+            Err(e) => Ok(RecordHealth::Corrupted(e)),
         }
-        let file_path = dir.join(STATE_FILE_NAME);
-        match fs::symlink_metadata(&file_path) {
-            Ok(fm) if fm.is_file() => {}
-            _ => return false,
-        }
-        match read_limited(
-            &file_path,
-            MAX_STATE_FILE_BYTES,
-            "state file exceeds the size limit",
-        ) {
-            Ok(bytes) => match serde_json::from_slice::<StateDto>(&bytes) {
-                Ok(dto) => dto.into_record(id).is_err(),
-                Err(_) => true,
-            },
-            Err(_) => true,
+    }
+
+    /// `<id>/state.json` を読む。存在しなければ `None`。内容が破損していれば `Internal`。
+    fn read_record(&self, id: &ContainerId) -> Result<Option<StateRecord>, TraitError> {
+        match self.inspect_record(id)? {
+            RecordHealth::Absent => Ok(None),
+            RecordHealth::Healthy(record) => Ok(Some(record)),
+            RecordHealth::Corrupted(e) => Err(e),
         }
     }
 
@@ -385,7 +391,8 @@ impl FileStateStore {
             let Ok(id) = ContainerId::new(&name) else {
                 continue;
             };
-            if self.has_record(&name) && self.is_corrupted_record(&id) {
+            // 権限・I/O エラーのエントリは破損として列挙せず、エラーで返す（fail-closed）。
+            if matches!(self.inspect_record(&id)?, RecordHealth::Corrupted(_)) {
                 found.push(id);
                 if found.len() >= MAX_CORRUPTED_REPORT {
                     break;
@@ -404,32 +411,20 @@ impl FileStateStore {
     /// 読めないものは削除せず元のエラーを返す（fail-closed）。
     pub fn purge_corrupted(&self, id: &ContainerId) -> Result<DeleteStateResponse, TraitError> {
         let _guard = self.lock()?;
-        match self.read_record(id) {
-            Ok(Some(_)) => {
+        match self.inspect_record(id)? {
+            RecordHealth::Healthy(_) => {
                 return Err(err(
                     ErrorCode::FailedPrecondition,
                     "state record is not corrupted",
                 ));
             }
-            Ok(None) => return Err(err(ErrorCode::NotFound, "container state not found")),
-            Err(e) => {
-                if !self.is_corrupted_record(id) {
-                    return Err(e);
-                }
+            RecordHealth::Absent => {
+                return Err(err(ErrorCode::NotFound, "container state not found"));
             }
+            RecordHealth::Corrupted(_) => {}
         }
         self.remove_record(id)?;
         Ok(DeleteStateResponse::new())
-    }
-
-    /// 「`<id>/state.json` が通常ファイルとして存在するか」（list・新規ストア判定用）。
-    fn has_record(&self, name: &str) -> bool {
-        let dir = self.root.join(name);
-        match fs::symlink_metadata(&dir) {
-            Ok(m) if m.is_dir() => {}
-            _ => return false,
-        }
-        matches!(fs::symlink_metadata(dir.join(STATE_FILE_NAME)), Ok(m) if m.is_file())
     }
 
     fn write_record(&self, record: &StateRecord) -> Result<(), TraitError> {
@@ -457,8 +452,8 @@ impl FileStateStore {
         let path = self.root.join(REVISION_FILE);
         let current = match fs::symlink_metadata(&path) {
             Ok(m) if m.is_file() => {
-                let bytes =
-                    read_limited(&path, MAX_REVISION_FILE_BYTES, "revision file is corrupted")?;
+                let bytes = read_limited(&path, MAX_REVISION_FILE_BYTES)?
+                    .ok_or_else(|| internal("revision file is corrupted"))?;
                 let text = std::str::from_utf8(&bytes)
                     .map_err(|_| internal("revision file is corrupted"))?;
                 let value: u64 = text
@@ -511,10 +506,6 @@ impl FileStateStore {
             let Ok(id) = ContainerId::new(&name) else {
                 continue;
             };
-            // state.json の無い残骸ディレクトリは存在しないものとして読まない。
-            if !self.has_record(&name) {
-                continue;
-            }
             // 読めないレコード（緩んだ権限・破損 state.json）は revision を採れないため走査から
             // 除外する。1 件の問題レコードが他コンテナの create / update を止めないようにし
             // （可用性）、単調性は `@revision` のハイウォーターマークで担保する。問題レコード
@@ -615,7 +606,10 @@ impl StateStore for FileStateStore {
             {
                 continue;
             }
-            if !self.has_record(&name) {
+            // 異常なエントリ（symlink 化・権限不備・state.json が通常ファイルでない）は get と
+            // 同じくエラーで返す。黙って除外しない（fail-closed）。
+            let id = ContainerId::new(name.as_str())?;
+            if self.record_file(&id)?.is_none() {
                 continue;
             }
             smallest.push(name);
@@ -806,17 +800,58 @@ fn check_bundle_len(bundle: &Path) -> Result<(), TraitError> {
     Ok(())
 }
 
-/// 通常ファイルを上限つきで読む。上限を超えたら `Internal`（無制限確保の防止）。
-fn read_limited(path: &Path, max: u64, too_large: &'static str) -> Result<Vec<u8>, TraitError> {
+/// 通常ファイルを上限つきで読む。上限を超えたら `Ok(None)`（無制限確保の防止）。
+/// 開く・読むの失敗（権限・I/O）は `Err`（内容の問題とは区別する）。
+fn read_limited(path: &Path, max: u64) -> Result<Option<Vec<u8>>, TraitError> {
     let file = File::open(path).map_err(|_| internal("failed to open the state file"))?;
     let mut buf = Vec::new();
     file.take(max.saturating_add(1))
         .read_to_end(&mut buf)
         .map_err(|_| internal("failed to read the state file"))?;
     if buf.len() as u64 > max {
-        return Err(internal(too_large));
+        return Ok(None);
     }
-    Ok(buf)
+    Ok(Some(buf))
+}
+
+/// `@revision` を初期値で新規作成する（既にあれば何もしない）。
+///
+/// 一時ファイルへ内容を書いて fsync し、`hard_link` で `@revision` として公開する。
+/// `hard_link` は既存の宛先を上書きしないため、複数プロセスの同時 `open` が競合しても
+/// 先に作った側の内容が残り、途中まで書かれた `@revision` が現れることもない。
+fn init_revision_file(root: &Path) -> Result<(), TraitError> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = root.join(format!(
+        "{REVISION_INIT_PREFIX}{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let dest = root.join(REVISION_FILE);
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&tmp)
+        .map_err(|_| internal("failed to create the revision file"))?;
+    let written = file
+        .write_all(StateRevision::INITIAL.value().to_string().as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    let linked = match written {
+        Ok(()) => match fs::hard_link(&tmp, &dest) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(_) => Err(internal("failed to publish the revision file")),
+        },
+        Err(_) => Err(internal("failed to write the revision file")),
+    };
+    let _ = fs::remove_file(&tmp);
+    linked?;
+    sync_dir(root)
 }
 
 /// 同じディレクトリの `<name>.tmp` へ書いて `rename` する（トレイト契約 4 の不可分な書き込み）。
@@ -1162,7 +1197,13 @@ mod tests {
         for id in ["c", "a", "b"] {
             create(&store, id);
         }
-        fs::create_dir(t.path().join("residue")).unwrap();
+        let residue = t.path().join("residue");
+        fs::create_dir(&residue).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&residue, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         fs::write(t.path().join("bad name"), b"x").unwrap();
         let p1 = store.list(&list_req(2)).unwrap();
         let ids: Vec<&str> = p1.records().iter().map(|r| r.id().as_str()).collect();
@@ -1354,6 +1395,69 @@ mod tests {
         let req =
             CreateStateRequest::new(ContainerStatus::created(cid("b"), None), bundle()).unwrap();
         assert_eq!(code(store.create(&req)), "INTERNAL");
+    }
+
+    /// OCI-5: 初期化途中の残骸（`@revision.init-*`）だけのルートは新規ストアとして初期化し直す。
+    #[test]
+    fn oci5_open_recovers_from_interrupted_revision_init() {
+        let t = TmpDir::new("initresidue");
+        fs::write(t.path().join("@revision.init-1-0"), b"0").unwrap();
+        let store = t.open();
+        assert_eq!(fs::read_to_string(t.path().join("@revision")).unwrap(), "0");
+        assert_eq!(create(&store, "a").revision(), StateRevision::INITIAL);
+    }
+
+    /// OCI-5: 新規ストアの `open` 後は `@lock` より先に `@revision` が存在する。
+    #[test]
+    fn oci5_fresh_open_creates_revision_without_lock_file() {
+        let t = TmpDir::new("freshnolock");
+        let _store = t.open();
+        assert!(t.path().join("@revision").is_file());
+        assert!(!t.path().join("@lock").exists());
+    }
+
+    /// OCI-5: 権限不備のレコードは破損として列挙・削除せず、list も get と同じくエラーを返す。
+    #[cfg(unix)]
+    #[test]
+    fn oci5_permission_error_is_not_treated_as_corruption() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TmpDir::new("permerr");
+        let store = t.open();
+        create(&store, "a");
+        create(&store, "b");
+        let dir = t.path().join("a");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            code(store.get(&GetStateRequest::new(cid("a")))),
+            "PERMISSION_DENIED"
+        );
+        assert_eq!(code(store.list(&list_req(10))), "PERMISSION_DENIED");
+        assert_eq!(code(store.find_corrupted()), "PERMISSION_DENIED");
+        assert_eq!(code(store.purge_corrupted(&cid("a"))), "PERMISSION_DENIED");
+        assert!(dir.join("state.json").is_file());
+        // state.json が読めない（I/O・権限）場合も削除しない。root 実行では権限が効かないため
+        // モード 0 で実際に読めなくなったときだけ検査する。
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let file = dir.join("state.json");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&file).is_err() {
+            assert_eq!(code(store.find_corrupted()), "INTERNAL");
+            assert_eq!(code(store.purge_corrupted(&cid("a"))), "INTERNAL");
+            assert!(file.is_file());
+        }
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// OCI-5: symlink 化した状態エントリは list でもエラーにする（黙って除外しない）。
+    #[cfg(unix)]
+    #[test]
+    fn oci5_list_reports_symlinked_entry() {
+        let t = TmpDir::new("listsymlink");
+        let store = t.open();
+        create(&store, "a");
+        let target = t.path().join("a");
+        std::os::unix::fs::symlink(&target, t.path().join("evil")).unwrap();
+        assert_eq!(code(store.list(&list_req(10))), "PERMISSION_DENIED");
     }
 
     #[test]

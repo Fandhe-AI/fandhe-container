@@ -26,6 +26,12 @@
 //!   `/proc/self/status` の `NoNewPrivs` を記録し、組み込みの固定ステージが capability 削減の後・
 //!   Landlock の前に実際に適用されたこと（Landlock の時点で 1）を照合する。フックが全て成功しても
 //!   証跡不在の exec は拒否される（`Exited(126)`・`PERMISSION_DENIED`）
+//!   検証範囲の注意: 環境（docker 等）が既に `NoNewPrivs=1` を継承していると、`PR_SET_NO_NEW_PRIVS` の
+//!   呼び出しを省いても `nnp=1` のログが一致する。その場合の本シナリオは「固定ステージが capability 削減の後・
+//!   Landlock の前に走る順序」までを検証し、設定操作そのものは次の独立経路で検証する: 偽 syscall による
+//!   `exec/stages.rs` の順序テスト（`core1_no_new_privs_runs_after_capability_drop_and_before_landlock`・
+//!   `core1_empty_pipeline_applies_builtin_no_new_privs`）と、本物の `prctl` を別スレッドで確認する
+//!   `sys.rs` の `core1_set_no_new_privs_sets_calling_thread_flag`。継承値 0 の環境では本シナリオが設定操作も検証する
 //! - シナリオ `stage-fail`（同上）: 途中の段のフック失敗で後続段と exec に進まず `Exited(125)`
 //!   （setup 失敗）、stderr に失敗した段（`at CapabilityDrop`）
 //!
@@ -317,6 +323,12 @@ mod linux {
         let is_root = is_root();
         // 環境（docker 等）が既に NO_NEW_PRIVS=1 のことがあるため、適用前の値を記録して期待値にする。
         let inherited_nnp = no_new_privs_flag();
+        if inherited_nnp == 1 {
+            // 継承済みだと設定操作の有無を nnp ログで区別できない（順序のみの検証になる）。
+            println!(
+                "fork_exec_isolation: inherited NoNewPrivs=1; set operation covered by unit tests"
+            );
+        }
         let mut namespaces = NamespaceSet::empty()
             .with(Namespace::Pid)
             .with(Namespace::Mount)

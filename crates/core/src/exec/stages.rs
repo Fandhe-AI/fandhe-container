@@ -246,6 +246,16 @@ impl StagePipeline {
     /// 呼び出しスレッドへ `PR_SET_NO_NEW_PRIVS` を立て、これは不可逆で解除できない。
     /// 親プロセス（supervisor 等）から呼ぶと、そのスレッドが恒久的に強化される
     /// （setuid 実行などが以後効かなくなる）。
+    ///
+    /// # 破壊的変更と移行方法（#833・TASK-27.4.3）
+    ///
+    /// - 変更内容: `pub fn run_then` から `pub(crate) fn run_then` へ縮小した。crate 外から
+    ///   `StagePipeline::run_then` を直接呼ぶことはできなくなった。
+    /// - 理由: 組み込みの `NO_NEW_PRIVS` 段が不可逆のため、親プロセスからの誤呼び出しを型で防ぐ。
+    /// - 移行方法: 外部 crate は `StagePipeline` を `spawn_container_with_stages` に渡す。
+    ///   `run_then` は fork 後の子（`process.rs::run_child`）内で core が呼ぶ。`run_then` を
+    ///   単体で呼んでいた利用者は、ステージ列の順序・失敗時の挙動の確認を
+    ///   `spawn_container_with_stages` 経由の結合試験（`fork_exec_isolation` の `stages-order`）へ移す。
     pub(crate) fn run_then<T>(
         mut self,
         exec: impl FnOnce(&StageReport) -> Result<T, ExecError>,

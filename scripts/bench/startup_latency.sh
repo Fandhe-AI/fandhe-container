@@ -17,7 +17,11 @@
 #     TASK-157 待ち）、ファイルベース StateStore は TASK-31 待ちのため、現時点では
 #     own 実装を CLI からエンドツーエンドで起動できない。own の実測は CLI 提供後。
 #   - fandhe-container の CLI が下記契約と異なる形になった場合は、ランタイム呼び出し部
-#     （rt_create / rt_start / rt_delete / rt_kill / rt_state の 5 関数）だけを差し替える。
+#     （rt_create / rt_start / rt_delete / rt_kill / rt_state / rt_is_not_found の 6 関数）
+#     だけを差し替える。
+#   - create が成功しなかった場合の未作成判定は、ERR-1 の構造化エラー（code: NOT_FOUND）を
+#     明確な不存在応答として使う（rt_is_not_found）。構造化エラーを出さないランタイム（runc 等）
+#     では create 失敗時に未作成を確定できず、その ID に操作を送らずに exit 4 で報告する。
 #
 # 呼び出し元: Makefile の `startup-latency` ターゲット（自己テストは
 # scripts/bench/startup_latency_selftest.sh・`startup-latency-selftest` ターゲット）。
@@ -46,8 +50,9 @@
 #   1: ランタイムの create / start / state の失敗・タイムアウト、実行開始を観測できない、
 #      ID が既に使用中
 #   2: 入力エラー（引数・bundle・output の検証失敗）
-#   3: 前提ツール欠如（bash 5 以上・jq・GNU timeout・mktemp・sed・sleep 等）
-#   4: 後始末失敗（作成済みコンテナを delete できない等。残存 ID を stderr に出す。最優先）
+#   3: 前提ツール欠如（bash 5 以上・jq・GNU timeout・mktemp・sleep 等）
+#   4: 後始末失敗（作成済みコンテナを delete できない、create 失敗後に未作成を確定できない等。
+#      残存の可能性がある ID を stderr に出す。最優先）
 #
 # 出力（stdout。--output 指定時は同一内容をファイルにも書く。進捗・サマリーは stderr）:
 #   scripts/check-bench-regression.sh の results.json スキーマ（schema_version: 1・
@@ -178,13 +183,6 @@ if [ -L "$bundle/config.json" ] || [ ! -f "$bundle/config.json" ]; then
   err "invalid-bundle" "bundle must contain a regular file config.json (symlink not allowed)"
   exit "$EXIT_INPUT"
 fi
-# bundle は物理絶対パスへ正規化してから create へ渡す。state の bundle（OCI state の必須
-# フィールド・絶対パス）と照合し、create 未成功時に後始末対象が今回作ったコンテナであること
-# を確かめるため（finish_container）。
-if ! bundle="$(cd -- "$bundle" && pwd -P)"; then
-  err "invalid-bundle" "could not resolve the absolute path of --bundle"
-  exit "$EXIT_INPUT"
-fi
 check_int iterations "$iterations" 1 1000
 check_int warmup "$warmup" 0 100
 check_int timeout "$timeout_secs" 1 60
@@ -209,7 +207,7 @@ if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
   err "missing-prerequisite" "bash 5 or later is required (EPOCHREALTIME)"
   exit "$EXIT_PREREQ"
 fi
-for tool in jq timeout mktemp tail rm sed sleep; do
+for tool in jq timeout mktemp tail rm sleep; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     err "missing-prerequisite" "required tool not found: $tool"
     exit "$EXIT_PREREQ"
@@ -234,18 +232,16 @@ live_id=""
 # create が成功していれば 1。0 の間（create の成否未確定・失敗）は、後始末の前に state で
 # 未作成か今回作ったものかを確かめる（finish_container）。
 live_created=0
-# create 前（ID 未使用が確定している時点）に取得した state 応答の署名（query_state・
-# state_matches_absent 参照）。
-absent_sig=""
+# create 前の state が明確な不存在応答（state_not_found）だったら 1。このときに限り、
+# create 未成功後に同じ ID のコンテナが見えれば今回の create が作ったものと判定できる。
+pre_absent=0
 leftover_ids=()
 rc=0
-# create の終了コード（create 未成功時の不存在判定に使う）。
+# create の終了コード（create 未成功時の未作成判定に使う）。
 create_rc=0
-# query_state の結果（終了コード・status・bundle・応答署名）。
+# query_state の結果（終了コード・status）。
 state_rc=0
 state_status=""
-state_bundle=""
-state_sig=""
 
 # ランタイム呼び出し本体。stdout/stderr はファイルへ逃がす（コンテナ側がパイプを
 # 保持して create が戻らないランタイムへの対策）。stdin は /dev/null。
@@ -266,13 +262,28 @@ run_rt() {
   return "$status"
 }
 
-# --- ランタイム呼び出し部（CLI 契約が変わった場合はこの 5 関数のみ差し替える） ---
+# --- ランタイム呼び出し部（CLI 契約が変わった場合はこの 6 関数のみ差し替える） ---
 rt_create() { run_rt "$1" "$1" create --bundle "$bundle" "$2"; }
 rt_start() { run_rt "$1" "$1" start "$2"; }
 rt_delete() { run_rt "$1" "$1" delete "$2"; }
 rt_kill() { run_rt "$1" "$1" kill "$2" KILL; }
 # state は stdout（OCI state JSON）と stderr を分けて受け取る。引数: <stdout> <stderr> <id>
 rt_state() { run_rt "$1" "$2" state "$3"; }
+# state の stderr（引数のファイル）が「コンテナが存在しない」ことを明確に示すか。OCI の CLI
+# 契約には不存在専用の応答がないため、fandhe-container の CLI のエラー形式（ERR-1: stderr へ
+# 機械可読な code / message の構造化エラー。不存在は ERR-3 / ERR-5 と同じ NOT_FOUND）に
+# 合わせ、JSON オブジェクト行の code がすべて NOT_FOUND（1 件以上）の場合だけ真にする。
+# 自由文の文言は解釈しない（runc 等の構造化エラーを持たないランタイムは常に偽＝不明扱い）。
+# CLI（TASK-79）のエラー形式が確定したらこの関数を合わせる。
+rt_is_not_found() {
+  local codes code
+  codes="$(jq -Rr 'fromjson? | objects | .code | strings' <"$1" 2>/dev/null)" || return 1
+  [ -n "$codes" ] || return 1
+  while IFS= read -r code; do
+    [ "$code" = "NOT_FOUND" ] || return 1
+  done <<<"$codes"
+  return 0
+}
 # ---------------------------------------------------------------------------
 
 # 失敗したコマンドのログ末尾を stderr へ出す。
@@ -286,32 +297,18 @@ now_us() {
   echo "${EPOCHREALTIME/./}"
 }
 
-# state を 1 回呼び、state_rc・state_status・state_bundle・state_sig を設定する。
-# state_status・state_bundle は stdout が単一の OCI state JSON で id が一致するときだけ
-# その status・bundle、それ以外は空文字。state_sig は「終了コード＋stdout＋stderr」の署名で、
-# 時刻・PID 等の揺れを吸収するため数字列を同一視する（不存在応答の照合用。absent_sig と比較する）。
+# state を 1 回呼び、state_rc・state_status を設定する。state_status は stdout が単一の
+# OCI state JSON で id が一致するときだけその status、それ以外は空文字。
 query_state() {
-  local id="$1" out="$tmpdir/state.out" errf="$tmpdir/state.err" parsed=""
+  local id="$1" out="$tmpdir/state.out"
   state_rc=0
-  rt_state "$out" "$errf" "$id" || state_rc=$?
+  rt_state "$out" "$tmpdir/state.err" "$id" || state_rc=$?
   state_status=""
-  state_bundle=""
   if [ "$state_rc" -eq 0 ]; then
-    # status と bundle を 1 行ずつ出す（どちらも文字列で改行を含まない場合だけ）。
-    parsed="$(jq -rs --arg id "$id" '
-      if length == 1 and (.[0] | type) == "object" and .[0].id == $id
-        and (.[0].status | type) == "string" and (.[0].status | length) > 0
-        and (.[0].bundle | type) == "string" and (.[0].bundle | length) > 0
-        and ((.[0].status + .[0].bundle) | test("\n") | not)
-      then .[0].status, .[0].bundle else empty end' <"$out" 2>/dev/null)" || parsed=""
-    if [ -n "$parsed" ]; then
-      state_status="${parsed%%$'\n'*}"
-      state_bundle="${parsed#*$'\n'}"
-    fi
+    state_status="$(jq -rs --arg id "$id" \
+      'if length == 1 and (.[0] | type) == "object" and .[0].id == $id and (.[0].status | type) == "string" then .[0].status else "" end' \
+      <"$out" 2>/dev/null)" || state_status=""
   fi
-  state_sig="rc=$state_rc
-out=$(sed -E 's/[0-9]+/N/g' -- "$out" 2>/dev/null || echo unreadable)
-err=$(sed -E 's/[0-9]+/N/g' -- "$errf" 2>/dev/null || echo unreadable)"
 }
 
 # ランタイム自身が返したエラー終了か（timeout の 124・timeout 自体の失敗 125・
@@ -320,29 +317,25 @@ is_runtime_error() {
   [ "$1" -ge 1 ] && [ "$1" -le 123 ]
 }
 
-# 直前の query_state の応答が「不存在時の応答」と一致するか。不存在時の応答は、create 前
-# （ID 未使用が確定していた時点）に同じ ID で得た state の応答（absent_sig）とする。
-# ログの文言の解釈には頼らず、照会のタイムアウト・権限エラー・別の失敗理由で応答が
-# 変われば不一致（残存の可能性あり）になる（特権操作の後始末。fail-closed）。
-# create 前の照会が権限エラー等で失敗する環境ではその応答が基準になるため、未作成の判定
-# （create_not_made）では create がランタイム自身のエラーで終了したことも併せて求める。
-state_matches_absent() {
-  is_runtime_error "$state_rc" && [ -n "$absent_sig" ] && [ "$state_sig" = "$absent_sig" ]
-}
-
-# 直前の query_state の応答が、今回の create で作られたコンテナ（id 一致・bundle が今回の
-# bundle と一致）を示すか。create 未成功時に delete / kill を送ってよいかの判定に使い、
-# 所有を確かめられないコンテナ（ID 衝突した既存コンテナ等）には操作を送らない。
-state_is_ours() {
-  [ "$state_rc" -eq 0 ] && [ -n "$state_status" ] && [ "$state_bundle" = "$bundle" ]
+# 直前の query_state が明確な不存在応答だったか（ランタイム自身のエラー終了かつ
+# rt_is_not_found）。タイムアウト・権限エラー・自由文だけのエラーは不明として偽になる。
+state_not_found() {
+  is_runtime_error "$state_rc" && rt_is_not_found "$tmpdir/state.err"
 }
 
 # create 未成功の ID についてコンテナが作られなかったことを確かめる。OCI Runtime Spec は
 # 操作がエラーを返した場合に環境を操作前の状態に保つことを求めるため、(a) create が
 # ランタイム自身のエラーで終了し（タイムアウト・シグナル終了は途中状態が残り得るので除く）、
-# かつ (b) state の応答が create 前と一致する場合だけ未作成とみなす。
+# かつ (b) state が明確な不存在応答を返した場合だけ未作成とみなす。
 create_not_made() {
-  is_runtime_error "$create_rc" && state_matches_absent
+  is_runtime_error "$create_rc" && state_not_found
+}
+
+# create 未成功の ID に見えるコンテナが今回の create で作られたものか。create 前の state が
+# 明確な不存在応答だった（pre_absent=1）ときに限り、その後に現れた同じ ID のコンテナを
+# 今回のものと判定する。それ以外（作成前の不存在を確認できなかった ID）には操作を送らない。
+state_is_ours() {
+  [ "$pre_absent" = "1" ] && [ "$state_rc" -eq 0 ] && [ -n "$state_status" ]
 }
 
 # コンテナを削除する。delete が失敗したら kill KILL を送り、プロセスの終了を待ちながら
@@ -354,7 +347,8 @@ create_not_made() {
 #              コンテナは今回作ったものであり、そのまま delete / kill を送る。
 #   created=0: create 未成功。まず state で確かめ、未作成（create_not_made）なら何もせず
 #              成功、今回作ったもの（state_is_ours）なら削除へ進み、どちらも確かめられ
-#              なければ操作を送らずに残存の可能性ありとして記録する（既存コンテナの保護）。
+#              なければ操作を送らずに残存の可能性ありとして記録する（所有を証明できない
+#              コンテナへ破壊的操作を送らない。特権操作の後始末）。
 finish_container() {
   local id="$1" created="$2"
   local log="$tmpdir/cleanup-$id.log"
@@ -425,20 +419,19 @@ trap 'exit 143' TERM
 #       （state 1 回分の所要時間を含み、Docker 比では own に不利な側へ偏る）。
 measure_once() {
   local id="$1" t0 t1 ts t2 deadline
-  # create 前に state を照会し、その応答を不存在時の署名として保持する（create 失敗後の
-  # 後始末で未作成を確かめる基準。計測区間外）。存在を示せば触らずに中止する。
-  # 照会エラーは不存在の保証にならないが、その場合でも create は ID 重複で失敗し、
-  # 後始末は所有を確かめられないコンテナに操作を送らない（finish_container）。
+  # create 前に state を照会する（計測区間外）。存在を示せば触らずに中止する。明確な
+  # 不存在応答なら pre_absent=1 とし、create 失敗後に現れた同じ ID のコンテナを今回の
+  # ものとして後始末できるようにする。それ以外の照会エラーは不存在の保証にならないため
+  # pre_absent=0 のまま進み、create が成功しなかった場合はその ID に操作を送らない。
+  pre_absent=0
   query_state "$id"
   if [ "$state_rc" -eq 0 ]; then
     err "container-id-in-use" "container $id already exists; refusing to touch it"
     return 1
   fi
-  if ! is_runtime_error "$state_rc"; then
-    err "runtime-state-failed" "state for unused id $id failed abnormally (exit $state_rc)"
-    return 1
+  if state_not_found; then
+    pre_absent=1
   fi
-  absent_sig="$state_sig"
   t0="$(now_us)"
   # create が途中まで進んでから失敗・タイムアウトしても特権リソースが残り得るため、
   # 作成を試みた時点で後始末対象として保持する。失敗時の delete（kill → delete の再試行）と

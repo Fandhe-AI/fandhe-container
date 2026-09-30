@@ -13,10 +13,13 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - io 側の実計装（`writeback` の `BatchSink::write_batch` 経路等からの呼び出し）: TASK-84.7
+//! - `persist`（FLUSH バリア）の計装: [`IoOpKind`] への種別追加を要するため未実装
 //! - core の `OpRecorder` との接続アダプタ: core → io（またはアダプタ配置 crate）の
 //!   workspace 内依存辺の承認後
 //! - [`IoOpKind::Read`] の呼び出し元: 現状の io にはファイル読み出し経路がなく、未使用
+//!
+//! Write 経路（`writeback` の `BatchSink::write_batch`）は TASK-84.7 で計装済み
+//! （`serve_connection_with_recorder`。サンプル単位はバッチ 1 回の書き込み）。
 //!
 //! # 機微情報
 //!
@@ -35,7 +38,7 @@ use std::time::{Duration, Instant};
 pub enum IoOpKind {
     /// ファイル読み出し（TASK-84 の対象だが、現状 io に呼び出し元はない。REPAIR-3）。
     Read,
-    /// 書き込み（想定計装先は `writeback` の `BatchSink::write_batch` 経路。TASK-84.7）。
+    /// 書き込み（`writeback` の `BatchSink::write_batch` 経路で計装済み。TASK-84.7）。
     Write,
 }
 

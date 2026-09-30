@@ -59,13 +59,18 @@ use crate::traits::ErrorCode;
 
 /// `config.json` 全体の最大バイト長（4 MiB）。`args` / `env` の合計上限（1 MiB。
 /// `exec::ENTRYPOINT_MAX_TOTAL_BYTES`）に JSON エスケープ分とその他フィールドの余裕を加えた値。
+/// 合計上限そのもの（実行パスを含む）は本モジュールでは検証せず、`exec::Entrypoint::new` が担う。
 pub const CONFIG_MAX_BYTES: usize = 4 << 20;
 /// `process.args` の最大件数（`exec::ENTRYPOINT_MAX_ARGS` と同値）。
 pub const CONFIG_MAX_ARGS: usize = 4096;
 /// `process.env` の最大件数（`exec::ENTRYPOINT_MAX_ENV` と同値）。
 pub const CONFIG_MAX_ENV: usize = 4096;
-/// `args` / `env` の 1 要素の最大バイト長（`exec::ENTRYPOINT_MAX_STRING_BYTES` と同値）。
-pub const CONFIG_MAX_STRING_BYTES: usize = 131_072;
+/// `args` / `env` の 1 要素の最大バイト長（NUL 終端を含まない。131071）。
+///
+/// `exec::ENTRYPOINT_MAX_STRING_BYTES`（Linux の `MAX_ARG_STRLEN` = 131072）は NUL 終端を含めた
+/// 上限なので、文字列長としてはその 1 バイト手前が上限になる。同値にすると上限ちょうどの要素が
+/// パースを通っても `Entrypoint::new` で拒否されるため、NUL の 1 バイトを差し引いて揃える。
+pub const CONFIG_MAX_STRING_BYTES: usize = 131_071;
 /// パス文字列の最大バイト長（`PATH_MAX` 相当）。
 pub const CONFIG_MAX_PATH_BYTES: usize = 4096;
 /// `mounts` の最大件数。
@@ -690,7 +695,8 @@ impl OciUser {
 
 /// `process`。`args` は 1 件以上、`cwd` は `/` 始まりであることを検証済み。
 ///
-/// `env` の `KEY=VALUE` 形式・NUL 検査は `exec::Entrypoint::new` が担う（ここでは件数と長さのみ）。
+/// `env` の `KEY=VALUE` 形式・NUL 検査と、実行パスを含む合計長の上限は `exec::Entrypoint::new` が
+/// 担う（ここでは件数と 1 要素の長さのみ）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OciProcess {
@@ -1772,13 +1778,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
-    /// `exec::Entrypoint` の上限との同値を照合し、片方だけ変更されるドリフトを防ぐ。
+    /// `exec::Entrypoint` の上限との対応を照合し、片方だけ変更されるドリフトを防ぐ
+    /// （1 要素の上限は Entrypoint 側が NUL 込みのため、こちらは 1 バイト小さい）。
     #[cfg(target_os = "linux")]
     #[test]
     fn core2_limits_match_exec_entrypoint_limits() {
         use crate::exec::{ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV, ENTRYPOINT_MAX_STRING_BYTES};
         assert_eq!(CONFIG_MAX_ARGS, ENTRYPOINT_MAX_ARGS);
         assert_eq!(CONFIG_MAX_ENV, ENTRYPOINT_MAX_ENV);
-        assert_eq!(CONFIG_MAX_STRING_BYTES, ENTRYPOINT_MAX_STRING_BYTES);
+        assert_eq!(CONFIG_MAX_STRING_BYTES + 1, ENTRYPOINT_MAX_STRING_BYTES);
     }
 }

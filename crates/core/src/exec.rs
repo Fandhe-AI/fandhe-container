@@ -1018,6 +1018,7 @@ fn mount_is_shared_in(info: &str, mnt_id: u64) -> Result<bool, ExecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn cfg(namespaces: NamespaceSet, hostname: Option<&str>) -> IsolationConfig {
         IsolationConfig {
@@ -1584,5 +1585,259 @@ mod tests {
             .skip(6)
             .any(|f| f.starts_with("shared:"));
         assert_eq!(mount_is_shared(&fd).unwrap(), want);
+    }
+
+    /// 違反記録の中身を具体値で取り出す（種別名・理由コード・ビヘイビア ID・対象）。
+    fn violation_of(err: &ExecError) -> (&'static str, &'static str, &'static str, Option<String>) {
+        let v = err.violation.as_ref().expect("violation record");
+        (
+            v.kind.as_str(),
+            v.reason.as_str(),
+            v.behavior_id,
+            v.subject.as_ref().map(|s| s.as_str().to_string()),
+        )
+    }
+
+    /// SEC-4（記録経路）: plan / plan_rootful_host_root / isolate の各拒否に違反記録が付く。
+    #[test]
+    fn sec4_plan_rejections_carry_violation_records() {
+        let pm = NamespaceSet::empty()
+            .with(Namespace::Pid)
+            .with(Namespace::Mount);
+        let pid_only = NamespaceSet::empty().with(Namespace::Pid);
+        let cases: [(Result<(), ExecError>, &str, &str); 7] = [
+            (
+                plan_for(&cfg(NamespaceSet::empty(), None), 1000, 1000).map(drop),
+                "no_namespaces",
+                "CORE-1",
+            ),
+            (
+                plan_for(&cfg(pm.with(Namespace::User), Some("h")), 1000, 1000).map(drop),
+                "hostname_without_uts",
+                "CORE-1",
+            ),
+            (
+                plan_rootful_for(&cfg(pid_only, None), 0).map(drop),
+                "pid_without_mount",
+                "CORE-1",
+            ),
+            (
+                plan_for(&cfg(pm, None), 1000, 1000).map(drop),
+                "user_namespace_required",
+                "SEC-5",
+            ),
+            (
+                plan_for(&cfg(NamespaceSet::all(), None), 0, 1000).map(drop),
+                "host_root_identity_mapping",
+                "SEC-5",
+            ),
+            (
+                plan_rootful_for(&cfg(NamespaceSet::all(), None), 0).map(drop),
+                "rootful_with_user_namespace",
+                "CORE-1",
+            ),
+            (
+                plan_rootful_for(&cfg(pm, None), 1000).map(drop),
+                "rootful_requires_root",
+                "CORE-1",
+            ),
+        ];
+        for (result, reason, id) in cases {
+            let err = result.unwrap_err();
+            assert_eq!(err.stage, IsolationStage::Validate, "{reason}");
+            assert_eq!(
+                violation_of(&err),
+                ("plan_rejected", reason, id, None),
+                "{reason}"
+            );
+        }
+        // isolate の実行 ID 再検証（unshare 前に拒否）。
+        let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
+        let other = |id: u32| if id == 4242 { 4243 } else { 4242 };
+        let p = plan_for(&cfg(NamespaceSet::all(), None), other(euid), other(egid)).unwrap();
+        let err = isolate(&p).unwrap_err();
+        assert_eq!(
+            violation_of(&err),
+            ("plan_rejected", "identity_changed", "SEC-5", None)
+        );
+        assert!(
+            err.to_string()
+                .ends_with("(violation: plan_rejected/identity_changed, SEC-5)")
+        );
+    }
+
+    /// SEC-4（記録経路）: establish の前提違反と証跡不一致に違反記録が付く（対象なし。
+    /// namespace の識別子は記録しない）。
+    #[test]
+    fn sec4_establish_and_evidence_rejections_carry_violation_records() {
+        let err = MountIsolation::establish().unwrap_err();
+        assert_eq!(
+            violation_of(&err),
+            (
+                "establish_precondition",
+                "establish_not_pid1",
+                "CORE-1",
+                None
+            )
+        );
+        let e = evidence(
+            &thread_ns_link("mnt").unwrap(),
+            &thread_ns_link("pid").unwrap(),
+        );
+        let err = mount_proc(&e, Path::new("/"), Path::new("/proc")).unwrap_err();
+        assert_eq!(
+            violation_of(&err),
+            (
+                "evidence_mismatch",
+                "evidence_caller_not_pid1",
+                "CORE-1",
+                None
+            )
+        );
+        assert!(!err.to_string().contains("mnt:["), "{err}");
+    }
+
+    /// SEC-4（記録経路）: mount_proc のパス検証の各拒否に、理由コードと対象パスが付く。
+    #[test]
+    fn sec4_mount_path_rejections_carry_violation_records() {
+        let t = TempTree::new("sec4-path");
+        let root = t.base.join("root");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("file"), b"").unwrap();
+        std::os::unix::fs::symlink("/", root.join("link")).unwrap();
+        let alias = t.base.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let s = |p: &Path| Some(p.to_str().unwrap().to_string());
+        let dotdot = root.join("real/../real");
+        let cases = [
+            (
+                root.clone(),
+                dotdot.clone(),
+                "path_parent_component",
+                s(&dotdot),
+            ),
+            (
+                root.clone(),
+                t.base.join("outside"),
+                "target_outside_rootfs",
+                s(&t.base.join("outside")),
+            ),
+            (
+                root.clone(),
+                root.join("link/proc"),
+                "path_symlink_or_not_directory",
+                s(&root.join("link/proc")),
+            ),
+            (
+                root.clone(),
+                root.join("file"),
+                "path_symlink_or_not_directory",
+                s(&root.join("file")),
+            ),
+            (
+                root.clone(),
+                root.join("missing"),
+                "path_missing",
+                s(&root.join("missing")),
+            ),
+            (root.clone(), root.clone(), "target_is_rootfs", s(&root)),
+            (
+                alias.clone(),
+                alias.join("real"),
+                "rootfs_not_canonical",
+                s(&alias),
+            ),
+            (
+                t.base.join("nope"),
+                t.base.join("nope/proc"),
+                "rootfs_missing",
+                s(&t.base.join("nope")),
+            ),
+            (
+                PathBuf::from("/"),
+                PathBuf::from("proc"),
+                "path_not_absolute",
+                Some("proc".to_string()),
+            ),
+            (
+                PathBuf::from("/"),
+                PathBuf::from("/pr\0oc"),
+                "path_contains_nul",
+                Some("/pr\\u{0}oc".to_string()),
+            ),
+        ];
+        for (rootfs, target, reason, subject) in cases {
+            let err = mount_proc_verified(&rootfs, &target).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "{reason}");
+            assert_eq!(
+                violation_of(&err),
+                ("mount_target", reason, "CORE-1", subject),
+                "{reason}"
+            );
+        }
+        DRY_RUN_MOUNTS.with(|m| assert_eq!(*m.borrow(), Vec::<String>::new()));
+    }
+
+    /// SEC-4（記録経路）: shared 伝播上のマウント先は違反記録付きで拒否し、shared でなければ
+    /// dry-run の mount まで進む（実行環境の propagation に応じてどちらかを具体値で照合する）。
+    #[test]
+    fn sec4_shared_propagation_carries_violation_record() {
+        let t = TempTree::new("sec4-shared");
+        let root = t.base.join("root");
+        std::fs::create_dir_all(root.join("proc")).unwrap();
+        let target = root.join("proc");
+        let dir = open_dir_beneath(&root, &[OsStr::new("proc")]).unwrap();
+        let shared = mount_is_shared(&dir).unwrap();
+        drop(dir);
+        let result = mount_proc_verified(&root, &target);
+        if shared {
+            let err = result.unwrap_err();
+            assert_eq!(err.code, ErrorCode::FailedPrecondition);
+            assert_eq!(
+                violation_of(&err),
+                (
+                    "shared_propagation",
+                    "target_on_shared_mount",
+                    "CORE-1",
+                    Some(target.to_str().unwrap().to_string())
+                )
+            );
+            DRY_RUN_MOUNTS.with(|m| assert_eq!(*m.borrow(), Vec::<String>::new()));
+        } else {
+            assert_eq!(result, Ok(()));
+            DRY_RUN_MOUNTS.with(|m| {
+                let m = m.borrow();
+                assert_eq!(m.len(), 1);
+                assert!(m[0].starts_with("/proc/thread-self/fd/"), "{m:?}");
+            });
+        }
+    }
+
+    /// SEC-4: システムエラー（syscall 失敗・mountinfo の書式不正・権限不足）と hostname の
+    /// 書式エラーには違反記録を付けない。
+    #[test]
+    fn sec4_system_errors_have_no_violation_record() {
+        let enomem = ExecError::from_sys(SysError::Os(12), IsolationStage::Unshare, "unshare");
+        assert_eq!(enomem.code, ErrorCode::Internal);
+        assert_eq!(enomem.violation, None);
+        let err = mount_is_shared_in("22 1 8:1 / / rw\n", 22).unwrap_err();
+        assert_eq!(err.violation, None);
+        assert_eq!(Hostname::new("a_b").unwrap_err().violation, None);
+        if sys::effective_uid() != 0 {
+            // search 権限の無い祖先: 走査・rootfs の正規化とも権限不足のシステムエラー。
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut t = TempTree::new("sec4-eacces");
+            let locked = t.base.join("locked");
+            std::fs::create_dir_all(locked.join("root/proc")).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            t.restore.push(locked.clone());
+            let err = open_dir_beneath(&locked.join("root"), &[OsStr::new("proc")]).unwrap_err();
+            assert_eq!(err.code, ErrorCode::PermissionDenied);
+            assert_eq!(err.violation, None);
+            let err =
+                mount_proc_verified(&locked.join("root"), &locked.join("root/proc")).unwrap_err();
+            assert_eq!(err.code, ErrorCode::PermissionDenied);
+            assert_eq!(err.violation, None);
+        }
     }
 }

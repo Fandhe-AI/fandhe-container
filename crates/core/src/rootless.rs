@@ -412,11 +412,19 @@ pub fn rootless_mapping(
     host_id: u32,
     ranges: &[SubordinateRange],
 ) -> Result<IdMapSet, RootlessError> {
-    let mut entries = vec![IdMapping {
+    // 確保前に件数を上限検証する（先頭の 1 件 + ranges。無制限確保による DoS を防ぐ）。
+    if ranges.len() >= MAX_EXTENTS {
+        return Err(RootlessError::invalid(
+            RootlessStage::Validate,
+            format!("too many id mapping extents (max {MAX_EXTENTS})"),
+        ));
+    }
+    let mut entries = Vec::with_capacity(ranges.len() + 1);
+    entries.push(IdMapping {
         container_id: 0,
         host_id,
         count: 1,
-    }];
+    });
     // 終端は u64 で持つ（u32::MAX + 1 で終わる範囲も有効。次の範囲がある場合だけ u32 へ変換する）。
     let mut next: u64 = 1;
     for r in ranges {
@@ -934,6 +942,20 @@ mod tests {
         assert_eq!(many.len(), 341);
         assert_eq!(inv(many), ErrorCode::InvalidArgument);
         assert!(IdMapSet::new(vec![m(0, u32::MAX, 1)]).is_ok());
+    }
+
+    #[test]
+    fn core6_rootless_mapping_rejects_too_many_ranges_before_allocation() {
+        let ranges: Vec<SubordinateRange> = (0..MAX_EXTENTS as u32)
+            .map(|i| SubordinateRange {
+                start: 100_000 + i * 10,
+                count: 1,
+            })
+            .collect();
+        assert_eq!(ranges.len(), MAX_EXTENTS);
+        let err = rootless_mapping(1000, &ranges).expect_err("too many");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(rootless_mapping(1000, &ranges[..MAX_EXTENTS - 1]).is_ok());
     }
 
     #[test]

@@ -16,7 +16,12 @@
 //! 4. 適用できない指定の fail-closed 拒否（下記）
 //! 5. launcher 起動（失敗時はストア無変更）
 //! 6. Running へ状態更新。更新に失敗した場合は起動済みプロセスを上限時間つきで終了してから、
-//!    元のエラーを返す（`terminate` の失敗より元のエラーを優先する。孤児プロセスを残さない）
+//!    元のエラーを返す。終了にも失敗した場合（`Timeout` 等）は、未記録プロセスが残り得ることを
+//!    示す `Internal` を返し、元のエラーで隠さない（REPAIR-5）
+//!
+//! 手順 1〜6 は同一 ID につきプロセス内で排他する（起動前の予約。並行 start による二重 launch の防止。
+//! CORE-2）。別プロセス間の排他は `StateStore` の revision 照合（更新時のみ）に依存し、本関数では
+//! 保証しない（ファイルベース StateStore のロックは TASK-31 の領域）。
 //!
 //! # fail-closed の拒否（SEC-1・SEC-5・CORE-5・REPAIR-3）
 //!
@@ -30,10 +35,13 @@
 //! - `mounts` が非空（mount 適用未実装）
 //! - `linux.namespaces[].path` の指定（既存 namespace への join 未実装）
 //! - `network`・`cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）
+//! - `linux.namespaces` に user namespace が無い（`process.user` は root 必須のため、ホスト root での
+//!   起動になる。`PermissionDenied`。SEC-5）
 //! - `linux.uidMappings` / `gidMappings` が非空（subuid 範囲写像は TASK-40・CORE-6）
 //! - `root.readonly` が true（読み取り専用 rootfs 未実装）
 //!
-//! `process.args[0]` が絶対パスでない場合は `InvalidArgument`（PATH 探索は未実装）。
+//! `process.args[0]` がコンテナ内の絶対パス（先頭 `/`）でない場合は `InvalidArgument`（PATH 探索は未実装）。
+//! コンテナパスはホスト OS 非依存に文字列で判定する（Windows でも `/bin/echo` を受理する。3 OS 一級対応）。
 //!
 //! # 到達範囲（REPAIR-3）
 //!
@@ -44,7 +52,9 @@
 //! エラーメッセージは固定文言と静的なフィールドパスのみで、config の値や OS 依存の I/O エラー
 //! 文字列を含めない。
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use super::config::{NamespaceKind, OciConfig};
@@ -52,8 +62,8 @@ use super::create::validate_bundle;
 use super::launch::{LaunchSpec, ProcessLauncher};
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
-    ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest, StateRecord,
-    StateStore, TraitError, UpdateStateRequest,
+    ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
+    StateRecord, StateStore, TraitError, UpdateStateRequest,
 };
 
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
@@ -77,11 +87,41 @@ pub fn start(
     recorder.record_op(&name, || start_inner(store, launcher, req))
 }
 
+/// プロセス内で start 実行中の ID 集合（同一 ID の並行 start による二重 launch を防ぐ予約表）。
+fn in_flight() -> &'static Mutex<HashSet<ContainerId>> {
+    static IN_FLIGHT: OnceLock<Mutex<HashSet<ContainerId>>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// ID の予約。Drop で解放する（全終了経路・panic でも残さない）。
+struct StartReservation(ContainerId);
+
+impl StartReservation {
+    fn acquire(id: &ContainerId) -> Result<Self, TraitError> {
+        let mut set = in_flight().lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(id.clone()) {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "container start is already in progress",
+            ));
+        }
+        Ok(Self(id.clone()))
+    }
+}
+
+impl Drop for StartReservation {
+    fn drop(&mut self) {
+        let mut set = in_flight().lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.0);
+    }
+}
+
 fn start_inner(
     store: &dyn StateStore,
     launcher: &dyn ProcessLauncher,
     req: &StartRequest,
 ) -> Result<StateRecord, TraitError> {
+    let _reservation = StartReservation::acquire(req.id())?;
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     if record.status().state() != ContainerState::Created {
         return Err(TraitError::new(
@@ -97,9 +137,15 @@ fn start_inner(
     match store.update(&UpdateStateRequest::new(running, record.revision())) {
         Ok(updated) => Ok(updated),
         Err(err) => {
-            // 状態を記録できないまま生きたプロセスを残さない。terminate の失敗より元のエラーを返す。
-            let _ = process.terminate(TERMINATE_TIMEOUT);
-            Err(err)
+            // 状態を記録できないまま生きたプロセスを残さない。終了できなかった場合は
+            // 未記録プロセスが残り得ることを呼び出し元へ伝える（元のエラーで隠さない）。
+            match process.terminate(TERMINATE_TIMEOUT) {
+                Ok(()) => Err(err),
+                Err(_) => Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to record running state and failed to terminate the launched process",
+                )),
+            }
         }
     }
 }
@@ -114,10 +160,7 @@ fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
         )
     })?;
 
-    let first_is_absolute = process
-        .args()
-        .first()
-        .is_some_and(|a| Path::new(a).is_absolute());
+    let first_is_absolute = process.args().first().is_some_and(|a| a.starts_with('/'));
     if !first_is_absolute {
         return Err(TraitError::new(
             ErrorCode::InvalidArgument,
@@ -135,6 +178,17 @@ fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
         return Err(unsupported("process.terminal"));
     }
     reject_unsupported_linux(&config)?;
+    // process.user は root 必須のため、user namespace が無いとホスト root で起動してしまう（SEC-5）。
+    if !config
+        .namespaces()
+        .iter()
+        .any(|n| n.kind() == NamespaceKind::User)
+    {
+        return Err(TraitError::new(
+            ErrorCode::PermissionDenied,
+            "a user namespace is required to run as root",
+        ));
+    }
 
     let namespaces: Vec<NamespaceKind> = config.namespaces().iter().map(|n| n.kind()).collect();
     Ok(LaunchSpec::new(
@@ -265,6 +319,7 @@ mod tests {
         specs: Mutex<Vec<LaunchSpec>>,
         terminated: std::sync::Arc<AtomicUsize>,
         fail: bool,
+        fail_terminate: bool,
     }
 
     impl RecordingLauncher {
@@ -273,6 +328,7 @@ mod tests {
                 specs: Mutex::new(Vec::new()),
                 terminated: std::sync::Arc::new(AtomicUsize::new(0)),
                 fail,
+                fail_terminate: false,
             }
         }
 
@@ -285,7 +341,7 @@ mod tests {
         }
     }
 
-    struct FakeProcess(std::sync::Arc<AtomicUsize>);
+    struct FakeProcess(std::sync::Arc<AtomicUsize>, bool);
 
     impl LaunchedProcess for FakeProcess {
         fn pid(&self) -> NonZeroU32 {
@@ -294,6 +350,9 @@ mod tests {
 
         fn terminate(&self, _timeout: Duration) -> Result<(), TraitError> {
             self.0.fetch_add(1, Ordering::SeqCst);
+            if self.1 {
+                return Err(TraitError::new(ErrorCode::Timeout, "terminate timed out"));
+            }
             Ok(())
         }
     }
@@ -307,7 +366,10 @@ mod tests {
             if self.fail {
                 return Err(TraitError::new(ErrorCode::Internal, "launch failed"));
             }
-            Ok(Box::new(FakeProcess(self.terminated.clone())))
+            Ok(Box::new(FakeProcess(
+                self.terminated.clone(),
+                self.fail_terminate,
+            )))
         }
     }
 
@@ -356,7 +418,7 @@ mod tests {
                 "env": ["PATH=/bin", "K=V"],
                 "cwd": "/"
             },
-            "linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}]}
+            "linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}, {"type": "user"}]}
         })
     }
 
@@ -412,7 +474,11 @@ mod tests {
         assert_eq!(spec.rootfs(), b.dir.join("rootfs"));
         assert_eq!(
             spec.namespaces(),
-            [NamespaceKind::Pid, NamespaceKind::Mount]
+            [
+                NamespaceKind::Pid,
+                NamespaceKind::Mount,
+                NamespaceKind::User
+            ]
         );
     }
 
@@ -550,6 +616,46 @@ mod tests {
         let err = start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect_err("fail");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(launcher.calls(), 1);
+        assert_eq!(launcher.terminations(), 1);
+    }
+
+    /// SEC-5: user namespace が無い config（ホスト root での起動になる）は PermissionDenied で拒否する。
+    #[test]
+    fn sec5_start_rejects_missing_user_namespace() {
+        let mut cfg = valid_config();
+        cfg["linux"]["namespaces"] = json!([{"type": "pid"}, {"type": "mount"}]);
+        let err = start_rejected_after_rewrite("no-userns", &cfg);
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert_eq!(err.message(), "a user namespace is required to run as root");
+    }
+
+    /// CORE-2: 同一 ID の start が進行中なら二重に launch せず FailedPrecondition を返す。
+    #[test]
+    fn core2_start_rejects_concurrent_start_of_same_id() {
+        let (_b, store) = created("concurrent");
+        let launcher = RecordingLauncher::new(false);
+        let id = ContainerId::new("c1").expect("id");
+        let guard = StartReservation::acquire(&id).expect("reserve");
+        let err = start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect_err("busy");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(launcher.calls(), 0);
+        drop(guard);
+        start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect("after release");
+        assert_eq!(launcher.calls(), 1);
+    }
+
+    /// REPAIR-5: 状態更新と terminate の両方に失敗したら、終了失敗を Internal で伝える。
+    #[test]
+    fn repair5_start_reports_terminate_failure() {
+        let b = Bundle::new("term-fail");
+        b.write_config(&valid_config());
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new(true);
+        create(&store, &OpRecorder::new(), &b.create_req("c1")).expect("create");
+        let mut launcher = RecordingLauncher::new(false);
+        launcher.fail_terminate = true;
+        let err = start(&store, &OpRecorder::new(), &launcher, &sid("c1")).expect_err("fail");
+        assert_eq!(err.code(), ErrorCode::Internal);
         assert_eq!(launcher.terminations(), 1);
     }
 

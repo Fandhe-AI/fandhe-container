@@ -88,6 +88,9 @@ pub trait LaunchedProcess: Send {
     /// 状態の記録に失敗したときの後始末として、プロセスを終了させる。
     ///
     /// 待ちには必ず上限時間 `timeout` を設け、超過時は `ErrorCode::Timeout` を返す（REPAIR-5）。
+    ///
+    /// 上限内に終了しない場合は強制終了（kill）と回収（wait）まで行ってから返すこと。それでも
+    /// 終了を確認できないときは `Err` を返す（`start` はこれを呼び出し元へ伝える）。
     fn terminate(&self, timeout: Duration) -> Result<(), TraitError>;
 }
 

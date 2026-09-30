@@ -24,6 +24,12 @@
 //!   （TASK-38.3）のため、`execve`・`execveat`・`prctl`・`capget`・`capset`・`close_range`・
 //!   `exit`・`exit_group`・`pidfd_open`・`pidfd_send_signal`・`rt_sigreturn` は禁止対象にしない
 //!   （テストで機械照合）。適用前に完了する `unshare`・`mount`・`pivot_root`・`umount2` は禁止してよい
+//! - **x32 ABI は BPF 構築側が明示的に拒否する**: x86_64 の `AUDIT_ARCH_X86_64` は x32 ABI の
+//!   syscall でも同じ値になり、`arch` の照合だけでは x32 を区別できない。x32 の syscall 番号には
+//!   `0x4000_0000`（`__X32_SYSCALL_BIT`）が付くため、本テーブルの番号との単純比較では
+//!   `unshare` 等を遮断できない。#838（TASK-38.1.2）の BPF 構築は、x86_64 で
+//!   `nr & 0x4000_0000 != 0` の呼び出しを（テーブル照合の前に）無条件に拒否しなければならない。
+//!   本テーブルは x32 番号を含まず、この拒否は呼び出し側の責務である（CORE-5）
 //! - 各アーキの番号は `mod nr` に個別定義し、値が同じでも他アーキの定数を流用しない
 //!   （`sys.rs` の `consts` と同じ流儀。アーキ差の取り違えは誤遮断・遮断漏れに直結する）
 //!
@@ -98,6 +104,8 @@ pub enum DeniedSyscall {
     Acct,
     /// `quotactl`: ホストのディスククォータ操作。
     Quotactl,
+    /// `quotactl_fd`: `quotactl` と同じクォータ操作を fd 指定で行う（Linux 5.14 以降。`quotactl` だけでは遮断漏れになる）。
+    QuotactlFd,
     /// `vhangup`: 制御端末の強制ハングアップ。
     Vhangup,
     /// `settimeofday`: ホスト時刻の変更。
@@ -134,7 +142,7 @@ pub enum DeniedSyscall {
 
 impl DeniedSyscall {
     /// 全 variant（テーブルの網羅性検査と #838 の走査に使う）。
-    pub const ALL: [DeniedSyscall; 42] = [
+    pub const ALL: [DeniedSyscall; 43] = [
         DeniedSyscall::Unshare,
         DeniedSyscall::Setns,
         DeniedSyscall::Mount,
@@ -161,6 +169,7 @@ impl DeniedSyscall {
         DeniedSyscall::Swapoff,
         DeniedSyscall::Acct,
         DeniedSyscall::Quotactl,
+        DeniedSyscall::QuotactlFd,
         DeniedSyscall::Vhangup,
         DeniedSyscall::Settimeofday,
         DeniedSyscall::ClockSettime,
@@ -208,6 +217,7 @@ impl DeniedSyscall {
             DeniedSyscall::Swapoff => "swapoff",
             DeniedSyscall::Acct => "acct",
             DeniedSyscall::Quotactl => "quotactl",
+            DeniedSyscall::QuotactlFd => "quotactl_fd",
             DeniedSyscall::Vhangup => "vhangup",
             DeniedSyscall::Settimeofday => "settimeofday",
             DeniedSyscall::ClockSettime => "clock_settime",
@@ -344,7 +354,7 @@ mod nr {
 
     const AUDIT_ARCH: AuditArch = AuditArch::new(0xC000_003E);
 
-    static ENTRIES: [(D, N); 42] = [
+    static ENTRIES: [(D, N); 43] = [
         (D::Unshare, N::new(272)),
         (D::Setns, N::new(308)),
         (D::Mount, N::new(165)),
@@ -371,6 +381,7 @@ mod nr {
         (D::Swapoff, N::new(168)),
         (D::Acct, N::new(163)),
         (D::Quotactl, N::new(179)),
+        (D::QuotactlFd, N::new(443)),
         (D::Vhangup, N::new(153)),
         (D::Settimeofday, N::new(164)),
         (D::ClockSettime, N::new(227)),
@@ -407,7 +418,7 @@ mod nr {
 
     const AUDIT_ARCH: AuditArch = AuditArch::new(0xC000_00B7);
 
-    static ENTRIES: [(D, N); 40] = [
+    static ENTRIES: [(D, N); 41] = [
         (D::Unshare, N::new(97)),
         (D::Setns, N::new(268)),
         (D::Mount, N::new(40)),
@@ -434,6 +445,7 @@ mod nr {
         (D::Swapoff, N::new(225)),
         (D::Acct, N::new(89)),
         (D::Quotactl, N::new(60)),
+        (D::QuotactlFd, N::new(443)),
         (D::Vhangup, N::new(58)),
         (D::Settimeofday, N::new(170)),
         (D::ClockSettime, N::new(112)),
@@ -507,6 +519,7 @@ mod tests {
         (DeniedSyscall::Swapoff, 168),
         (DeniedSyscall::Acct, 163),
         (DeniedSyscall::Quotactl, 179),
+        (DeniedSyscall::QuotactlFd, 443),
         (DeniedSyscall::Vhangup, 153),
         (DeniedSyscall::Settimeofday, 164),
         (DeniedSyscall::ClockSettime, 227),
@@ -553,6 +566,7 @@ mod tests {
         (DeniedSyscall::Swapoff, 225),
         (DeniedSyscall::Acct, 89),
         (DeniedSyscall::Quotactl, 60),
+        (DeniedSyscall::QuotactlFd, 443),
         (DeniedSyscall::Vhangup, 58),
         (DeniedSyscall::Settimeofday, 170),
         (DeniedSyscall::ClockSettime, 112),
@@ -672,7 +686,7 @@ mod tests {
         assert_eq!(DeniedSyscall::KexecLoad.name(), "kexec_load");
         assert_eq!(DeniedSyscall::Unshare.name(), "unshare");
         assert_eq!(DeniedSyscall::OpenByHandleAt.name(), "open_by_handle_at");
-        assert_eq!(DeniedSyscall::ALL.len(), 42);
+        assert_eq!(DeniedSyscall::ALL.len(), 43);
         assert_eq!(
             SeccompTableError::UnsupportedArch.to_string(),
             "seccomp syscall table is not available for this architecture"

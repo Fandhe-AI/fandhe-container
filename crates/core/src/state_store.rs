@@ -37,8 +37,9 @@
 //!   fsync する。一時ファイル名の衝突回避・残骸掃除・強制終了テストは TASK-31.2（#156）、結合テストの
 //!   拡充は TASK-31.3（#157）で行う
 //! - 状態ルートは信頼境界として扱う（`bundle` のすり替えは `start` の起動先のすり替えになるため。
-//!   SEC-1・PLUG-12 と同じ姿勢）。symlink・所有者不一致・group / other 書き込み可を
-//!   `PermissionDenied` で拒否する
+//!   SEC-1・PLUG-12 と同じ姿勢）。symlink・所有者不一致を拒否し、状態ルートと `<id>/` は既存の
+//!   ものも 0700 に限る（group / other の権限ビットがあれば `PermissionDenied`）。祖先は group / other
+//!   書き込み不可（sticky 付きは許可）を求める
 //! - `@lock` は start の起動権の所有ロック（`oci_runtime` の `BundleLock`。bundle ディレクトリの
 //!   `flock`。TASK-29.3・CORE-2）とは独立している。start は `BundleLock` を保持したまま `update` を
 //!   呼び、`@lock` はその内側で取って解放する。本ストアは `BundleLock` を取らないため、ロック順序の
@@ -233,7 +234,7 @@ impl FileStateStore {
     ///
     /// ルートがなければ 0700 で作る。親ディレクトリは作らない（`/run` や
     /// `$XDG_RUNTIME_DIR` がなければ `NotFound`）。symlink・ディレクトリでないもの・
-    /// 他ユーザー所有・group / other 書き込み可のルートは `PermissionDenied`。
+    /// 他ユーザー所有・group / other に権限ビットのある（0700 でない）ルートは `PermissionDenied`。
     /// Linux 以外では何も作らずに `Unimplemented`（信頼境界を検査できないため。fail-closed。
     /// モジュール doc「対応プラットフォーム」）。
     pub fn open(root: StateRoot) -> Result<Self, TraitError> {
@@ -773,7 +774,10 @@ fn verify_ancestors(root: &Path) -> Result<(), TraitError> {
     Ok(())
 }
 
-/// 状態ルートが信頼できるか検査する（symlink・種別・所有者・書き込みビット）。
+/// 状態ルートが信頼できるか検査する（symlink・種別・所有者・権限ビット）。
+///
+/// 既存のルートも新規作成時と同じ 0700 に限る（group / other の権限ビットが 1 つでもあれば拒否）。
+/// 読み取り・実行ビットだけでも、他ユーザーがコンテナ ID を列挙できてしまうため（OCI-5 の配置）。
 fn verify_root(path: &Path) -> Result<(), TraitError> {
     let meta =
         fs::symlink_metadata(path).map_err(|_| internal("failed to inspect the state root"))?;
@@ -786,10 +790,10 @@ fn verify_root(path: &Path) -> Result<(), TraitError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if meta.mode() & 0o022 != 0 {
+        if meta.mode() & 0o077 != 0 {
             return Err(err(
                 ErrorCode::PermissionDenied,
-                "state root must not be writable by group or others",
+                "state root must not be accessible by group or others",
             ));
         }
         // 所有者検査は euid を取れる Linux のみ。他 OS は `open` が先に拒否する。

@@ -1449,6 +1449,39 @@ mod tests {
         assert!(!t.path().join("c").join("state.json").exists());
     }
 
+    /// OCI-5: 巻き戻り検出の全レコード走査はインスタンスごとの初回の採番だけで行い、以降は下限
+    /// （払い出し済みの値）との比較で検出する。新しいインスタンスは初回に全件を走査する。
+    #[test]
+    fn oci5_revision_floor_is_scanned_once_per_instance() {
+        let t = TmpDir::new("floor");
+        let store = t.open();
+        create(&store, "a");
+        create(&store, "b");
+        // レコード側の revision を @revision（2）より大きく書き換える（外部改変相当）。
+        let b = r#"{"ociVersion":"1.2.0","id":"b","status":"created","bundle":"/b","revision":50}"#;
+        fs::write(t.path().join("b").join("state.json"), b).unwrap();
+        // 同じインスタンスは全件を読み直さないため、下限（2）との比較だけで払い出す。
+        assert_eq!(create(&store, "c").revision().value(), 2);
+        // 新しいインスタンスは初回の採番で全件を走査し、巻き戻りとして拒否する。
+        let fresh = t.open();
+        let req = CreateStateRequest::new(ContainerStatus::creating(cid("d")), bundle()).unwrap();
+        let e = fresh.create(&req).unwrap_err();
+        assert_eq!(e.code().as_str(), "INTERNAL");
+        assert_eq!(
+            e.message(),
+            "revision high-water mark is behind the records"
+        );
+        assert!(!t.path().join("d").join("state.json").exists());
+        // 同じインスタンスでも、払い出し済みの値より @revision が小さくなれば拒否する。
+        fs::write(t.path().join("@revision"), b"1").unwrap();
+        let req = CreateStateRequest::new(ContainerStatus::creating(cid("e")), bundle()).unwrap();
+        let e = store.create(&req).unwrap_err();
+        assert_eq!(
+            e.message(),
+            "revision high-water mark is behind the records"
+        );
+    }
+
     #[test]
     fn oci5_corrupted_state_json_returns_internal() {
         let t = TmpDir::new("corrupt");

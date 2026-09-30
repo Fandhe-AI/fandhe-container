@@ -6,8 +6,8 @@
 //! 決定 6 による境界は次の通り。
 //!
 //! 1. トレイト定義は本 crate（core）に置く
-//! 2. ファイルベースの既定実装も core に置く（TASK-31・OCI-5。本ファイルでは未実装。
-//!    REPAIR-3: 実装済みを装わない）。常駐デーモンを持たない CORE-1 と整合する
+//! 2. ファイルベースの既定実装も core に置く（TASK-31・OCI-5。
+//!    `crate::state_store::FileStateStore` に実装済み〔TASK-31.1〕）。常駐デーモンを持たない CORE-1 と整合する
 //! 3. 別実装（分散ストア等）は plugin として差し替えられる（TASK-107/114）。core 側の
 //!    proxy が UDS RPC に変換して `Box<dyn StateStore>` として呼び出し側へ渡す
 //! 4. supervisor は 2 つ目の実装を持たない（crate-naming.md 決定 6）

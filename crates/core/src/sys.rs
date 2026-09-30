@@ -1539,6 +1539,16 @@ pub(crate) fn kexec_load_invalid_probe() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `std::fs::OpenOptions` の `custom_flags` へ渡す `O_NOFOLLOW | O_NONBLOCK`（アーキテクチャ別の値）。
+///
+/// 状態ストア（`state_store`。OCI-5・REPAIR-5）が、最終要素の symlink を辿らず、FIFO 等でも
+/// `open(2)` 自体が相手を待って止まらないように開くために使う。`O_NONBLOCK` は通常ファイルの
+/// 読み書き・`flock` には影響しない。対応外アーキテクチャでは値を持たないため `None`（呼び出し側で
+/// fail-closed にする）。syscall を呼ばない定数の組み立てのみで、`unsafe` を含まない。
+pub(crate) fn nofollow_nonblock_open_flags() -> Option<i32> {
+    consts::SUPPORTED.then_some(consts::O_NOFOLLOW | consts::O_NONBLOCK)
+}
+
 /// 自プロセスの実効 uid。
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: 引数なし・常に成功する副作用のない syscall。
@@ -1766,6 +1776,8 @@ mod tests {
         assert_eq!(consts::O_CLOEXEC, 0o2_000_000);
         assert_eq!(consts::O_PATH, 0o10_000_000);
         assert_eq!(open_dir_path_flags(), 0o12_600_000);
+        // OCI-5・REPAIR-5: 状態ストアの非ブロッキング・symlink 非追従 open（0o400000 | 0o4000）。
+        assert_eq!(nofollow_nonblock_open_flags(), Some(0o404_000));
         assert_eq!(
             (EPERM, ENOENT, EACCES, ENOTDIR, EINVAL, ELOOP),
             (1, 2, 13, 20, 22, 40)
@@ -1795,6 +1807,8 @@ mod tests {
         assert_eq!(consts::O_CLOEXEC, 0o2_000_000);
         assert_eq!(consts::O_PATH, 0o10_000_000);
         assert_eq!(open_dir_path_flags(), 0o12_140_000);
+        // OCI-5・REPAIR-5: 状態ストアの非ブロッキング・symlink 非追従 open（0o100000 | 0o4000）。
+        assert_eq!(nofollow_nonblock_open_flags(), Some(0o104_000));
         assert_eq!(
             (EPERM, ENOENT, EACCES, ENOTDIR, EINVAL, ELOOP),
             (1, 2, 13, 20, 22, 40)

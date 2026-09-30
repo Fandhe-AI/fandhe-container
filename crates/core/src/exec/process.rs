@@ -1008,6 +1008,49 @@ mod tests {
         assert!(!matches_any_identity((1, 2), &[]));
     }
 
+    /// SEC-1・CORE-1（TASK-27.4.1）: 標準 fd の確認結果の分類。取得できた実体は照合対象、閉じている
+    /// 番号（`EBADF`）は除外、それ以外の失敗（`EMFILE`・`EIO`）は確認できないため exec を拒否する。
+    #[test]
+    fn sec1_classify_stdio_probe_is_fail_closed() {
+        assert_eq!(classify_stdio_probe(0, Ok((7, 11))).unwrap(), Some((7, 11)));
+        assert_eq!(
+            classify_stdio_probe(1, Err(std::io::Error::from_raw_os_error(sys::EBADF))).unwrap(),
+            None
+        );
+        for errno in [24, 5] {
+            let err =
+                classify_stdio_probe(2, Err(std::io::Error::from_raw_os_error(errno))).unwrap_err();
+            assert_eq!(err.code, ErrorCode::PermissionDenied, "errno {errno}");
+            assert_eq!(err.stage, IsolationStage::Exec, "errno {errno}");
+            assert_eq!(
+                exit_code_for(&err),
+                EXIT_EXEC_NOT_EXECUTABLE,
+                "errno {errno}"
+            );
+        }
+    }
+
+    /// SEC-1・CORE-1（TASK-27.4.1）: 開いている標準 fd（`/proc/self/fd/{0,1,2}` が存在する番号）は
+    /// すべて照合対象になり、確認失敗が無ければ欠けない。
+    #[test]
+    fn sec1_inherited_stdio_identities_cover_open_streams() {
+        let open = (0..3)
+            .filter(|n| std::fs::symlink_metadata(format!("/proc/self/fd/{n}")).is_ok())
+            .count();
+        assert_eq!(inherited_stdio_identities().unwrap().len(), open);
+    }
+
+    /// CORE-1（TASK-27.4.1）: 3 以上の fd は番号を変えずに返す。0〜2 の fd の移動は、テストプロセスの
+    /// 標準 fd を閉じられないため結合試験の範囲。
+    #[test]
+    fn core1_keep_above_stdio_keeps_high_fd() {
+        use std::os::fd::AsRawFd as _;
+        let fd = std::io::stdin().as_fd().try_clone_to_owned().unwrap();
+        let raw = fd.as_raw_fd();
+        assert!(raw > 2, "std dup starts at 3; got {raw}");
+        assert_eq!(keep_above_stdio(fd).unwrap().as_raw_fd(), raw);
+    }
+
     /// CORE-1（TASK-27.4.1）: dry-run で exec 前の処理が固定順に呼ばれ、`execve` に argv・env が
     /// そのまま渡る。dry-run の `execve` は `EINTR` を返すので `Internal` の `Exec` 段エラーになる。
     #[test]

@@ -967,7 +967,10 @@ mod tests {
         assert_eq!(consts::CLOSE_RANGE_CLOEXEC, 4);
         assert_eq!(consts::WNOHANG, 1);
         assert_eq!((consts::SIGKILL, consts::SIGPIPE), (9, 13));
-        assert_eq!((ESRCH, EINTR, E2BIG, ENOEXEC, ENOSYS), (3, 4, 7, 8, 38));
+        assert_eq!(
+            (ESRCH, EINTR, E2BIG, ENOEXEC, EBADF, ENOSYS),
+            (3, 4, 7, 8, 9, 38)
+        );
     }
 
     /// CORE-1（TASK-27.4.1）: `Threads:` が 1 のときだけ fork を許す（それ以外・解釈不能は拒否）。

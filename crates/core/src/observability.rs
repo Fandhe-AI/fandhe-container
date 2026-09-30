@@ -40,7 +40,7 @@
 //!
 //! 以下は未実装である。
 //!
-//! - create / start / kill / delete への計装: TASK-84.4
+//! - create / start / kill / delete への計装: TASK-84.4（create は TASK-29.2 で計装済み）
 //! - io の read / write 向け連携点は io 側の `fandhe_container_io::instrument::IoOpRecorder`
 //!   として定義済み（TASK-84.5）。core との接続は core と io の両方に依存する上位 crate の
 //!   newtype アダプタで行う（core → io 依存辺は未承認のため core には置かない）。

@@ -15,7 +15,10 @@
 //!    （SEC-1・CORE-5）。個別フィールドの許可は、それを実際に適用する後続タスクが
 //!    パーサ側で解釈済みに移すことで行う。
 //! 2. `process` を持たない config は拒否する。start で起動できない config を created にしない。
-//! 3. `root.path` は `..` 要素と末尾 symlink を拒否し、存在するディレクトリであることを確認する。
+//! 3. `root.path` は `..` 要素と、bundle 配下の全パス要素（中間要素を含む）の symlink を拒否し、
+//!    存在するディレクトリであることを確認する。bundle 内の link 経由で bundle 外を rootfs に
+//!    できないようにするため（SEC-1）。bundle 外を指す絶対パスの `root.path` は設定作成者の
+//!    明示指定として受け入れ、末尾要素のみ検査する。
 //!
 //! すべての検証は [`StateStore::create`] の前に済ませるため、失敗時にストアへ何も書かれず
 //! 後始末は不要である。エラーメッセージは固定文言と静的なフィールドパスのみで、config の値や
@@ -34,6 +37,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use super::config::{OciConfig, OciConfigError, load_config};
+use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, StateRecord, StateStore,
     TraitError,
@@ -42,12 +46,26 @@ use crate::traits::{
 /// bundle 直下の設定ファイル名（OCI Runtime Spec）。
 const CONFIG_FILE_NAME: &str = "config.json";
 
+/// [`OpRecorder`] に記録する操作名（REPAIR-4）。
+const CREATE_OP_NAME: &str = "create";
+
 /// `config.json` を検証し、プロセス未起動の「created」状態を `store` に作る。
 ///
 /// 戻り値の [`StateRecord`] は state が `Created`・pid なしで、revision は後続の start が
 /// `UpdateStateRequest` に使う。同じ ID が既にある場合は [`StateStore::create`] の
 /// [`ErrorCode::AlreadyExists`] をそのまま返す。
-pub fn create(store: &dyn StateStore, req: &CreateRequest) -> Result<StateRecord, TraitError> {
+///
+/// 成功・失敗の件数と所要時間は `recorder` へ操作名 `create` で記録する（全終了経路。REPAIR-4）。
+pub fn create(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    req: &CreateRequest,
+) -> Result<StateRecord, TraitError> {
+    let name = OpName::new(CREATE_OP_NAME)?;
+    recorder.record_op(&name, || create_inner(store, req))
+}
+
+fn create_inner(store: &dyn StateStore, req: &CreateRequest) -> Result<StateRecord, TraitError> {
     let config = load_config(&req.bundle().join(CONFIG_FILE_NAME)).map_err(config_error)?;
     reject_unapplied(&config)?;
     if config.process().is_none() {
@@ -82,7 +100,8 @@ fn reject_unapplied(config: &OciConfig) -> Result<(), TraitError> {
     ))
 }
 
-/// `root.path` が bundle 外へ字句的に出ず、存在するディレクトリ（symlink 不可）であることを確認する。
+/// `root.path` が bundle 外へ字句的に出ず、bundle 配下の全要素が symlink でない
+/// 存在するディレクトリであることを確認する。
 fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<(), TraitError> {
     if root_path
         .components()
@@ -91,7 +110,42 @@ fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<(), TraitError> {
         return Err(invalid("root.path must not contain '..'"));
     }
     let rootfs: PathBuf = bundle.join(root_path);
-    let meta = std::fs::symlink_metadata(&rootfs).map_err(|e| match e.kind() {
+    // bundle 配下の相対部分を要素ごとに検査する。bundle 自体（親が symlink でもよい）は対象外。
+    // bundle 外の絶対パスは相対部分が取れないため、末尾要素のみ検査する。
+    let mut checked = match rootfs.strip_prefix(bundle) {
+        Ok(rel) => {
+            let mut current = bundle.to_path_buf();
+            let mut last = None;
+            for c in rel.components() {
+                if let Component::Normal(part) = c {
+                    current.push(part);
+                    let meta = inspect(&current)?;
+                    if meta.file_type().is_symlink() {
+                        return Err(invalid("rootfs must not contain a symlink"));
+                    }
+                    last = Some(meta);
+                }
+            }
+            last
+        }
+        Err(_) => None,
+    };
+    if checked.is_none() {
+        // bundle 自身、または bundle 外の絶対パス。
+        let meta = inspect(&rootfs)?;
+        if meta.file_type().is_symlink() {
+            return Err(invalid("rootfs must not be a symlink"));
+        }
+        checked = Some(meta);
+    }
+    match checked {
+        Some(meta) if meta.is_dir() => Ok(()),
+        _ => Err(invalid("rootfs is not a directory")),
+    }
+}
+
+fn inspect(path: &Path) -> Result<std::fs::Metadata, TraitError> {
+    std::fs::symlink_metadata(path).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => {
             TraitError::new(ErrorCode::NotFound, "rootfs directory not found")
         }
@@ -99,14 +153,7 @@ fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<(), TraitError> {
             TraitError::new(ErrorCode::PermissionDenied, "cannot access rootfs")
         }
         _ => TraitError::new(ErrorCode::Internal, "failed to inspect rootfs"),
-    })?;
-    if meta.file_type().is_symlink() {
-        return Err(invalid("rootfs must not be a symlink"));
-    }
-    if !meta.is_dir() {
-        return Err(invalid("rootfs is not a directory"));
-    }
-    Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -230,7 +277,7 @@ mod tests {
         let b = ready_bundle("ok");
         let store = MemStateStore::new();
         let req = b.request("c1");
-        let record = create(&store, &req).expect("create succeeds");
+        let record = create(&store, &OpRecorder::new(), &req).expect("create succeeds");
         assert_eq!(record.status().state(), ContainerState::Created);
         assert_eq!(record.status().pid(), None);
         assert_eq!(record.status().exit_code(), None);
@@ -248,7 +295,7 @@ mod tests {
         std::fs::write(b.dir.join("config.json"), b"{ not json").expect("write");
         std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
         let store = MemStateStore::new();
-        let err = create(&store, &b.request("c1")).expect_err("must fail");
+        let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(store.len(), 0);
     }
@@ -258,7 +305,7 @@ mod tests {
     fn oci4_create_rejects_missing_config() {
         let b = Bundle::new("noconfig");
         let store = MemStateStore::new();
-        let err = create(&store, &b.request("c1")).expect_err("must fail");
+        let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert_eq!(store.len(), 0);
     }
@@ -271,7 +318,7 @@ mod tests {
         cfg.as_object_mut().expect("obj").remove("process");
         b.write_config(&cfg);
         let store = MemStateStore::new();
-        let err = create(&store, &b.request("c1")).expect_err("must fail");
+        let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(err.message(), "config.json: process is required");
         assert_eq!(store.len(), 0);
@@ -286,7 +333,7 @@ mod tests {
         cfg["process"]["capabilities"] = json!({"bounding": ["CAP_SYS_ADMIN"]});
         b.write_config(&cfg);
         let store = MemStateStore::new();
-        let err = create(&store, &b.request("c1")).expect_err("must fail");
+        let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
         assert_eq!(err.code(), ErrorCode::Unimplemented);
         assert!(err.message().contains("linux.seccomp"), "{}", err.message());
         assert!(
@@ -303,10 +350,10 @@ mod tests {
         let b = Bundle::new("rootfs");
         b.write_config(&valid_config());
         let store = MemStateStore::new();
-        let err = create(&store, &b.request("c1")).expect_err("missing");
+        let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("missing");
         assert_eq!(err.code(), ErrorCode::NotFound);
         std::fs::write(b.dir.join("rootfs"), b"x").expect("file");
-        let err = create(&store, &b.request("c1")).expect_err("not a dir");
+        let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("not a dir");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(store.len(), 0);
     }
@@ -319,7 +366,7 @@ mod tests {
         cfg["root"]["path"] = json!("../x");
         b.write_config(&cfg);
         let store = MemStateStore::new();
-        let err = create(&store, &b.request("c1")).expect_err("must fail");
+        let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(store.len(), 0);
     }
@@ -333,7 +380,7 @@ mod tests {
         std::fs::create_dir(b.dir.join("real")).expect("real");
         std::os::unix::fs::symlink(b.dir.join("real"), b.dir.join("rootfs")).expect("symlink");
         let store = MemStateStore::new();
-        let err = create(&store, &b.request("c1")).expect_err("must fail");
+        let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(store.len(), 0);
     }
@@ -343,8 +390,8 @@ mod tests {
     fn core2_create_twice_returns_already_exists() {
         let b = ready_bundle("twice");
         let store = MemStateStore::new();
-        create(&store, &b.request("c1")).expect("first");
-        let err = create(&store, &b.request("c1")).expect_err("second");
+        create(&store, &OpRecorder::new(), &b.request("c1")).expect("first");
+        let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("second");
         assert_eq!(err.code(), ErrorCode::AlreadyExists);
         assert_eq!(store.len(), 1);
     }
@@ -359,7 +406,40 @@ mod tests {
         cfg["root"]["path"] = json!(abs.to_str().expect("utf8"));
         b.write_config(&cfg);
         let store = MemStateStore::new();
-        let record = create(&store, &b.request("c1")).expect("create succeeds");
+        let record = create(&store, &OpRecorder::new(), &b.request("c1")).expect("create succeeds");
         assert_eq!(record.status().state(), ContainerState::Created);
+    }
+
+    /// SEC-1: 中間要素が symlink で bundle 外を指す root.path を拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn sec1_create_rejects_intermediate_symlink_rootfs() {
+        let b = Bundle::new("midlink");
+        let outside = Bundle::new("midlink-outside");
+        std::fs::create_dir(outside.dir.join("rootfs")).expect("outside rootfs");
+        std::os::unix::fs::symlink(&outside.dir, b.dir.join("link")).expect("symlink");
+        let mut cfg = valid_config();
+        cfg["root"]["path"] = json!("link/rootfs");
+        b.write_config(&cfg);
+        let store = MemStateStore::new();
+        let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(store.len(), 0);
+    }
+
+    /// REPAIR-4: 成功・失敗の両経路で件数とレイテンシが 1 件ずつ記録される。
+    #[test]
+    fn repair4_create_records_success_and_failure() {
+        let b = ready_bundle("rec");
+        let store = MemStateStore::new();
+        let rec = OpRecorder::new();
+        create(&store, &rec, &b.request("c1")).expect("first");
+        create(&store, &rec, &b.request("c1")).expect_err("dup");
+        let stats = rec
+            .snapshot_op(&OpName::new("create").expect("name"))
+            .expect("recorded");
+        assert_eq!(stats.success(), 1);
+        assert_eq!(stats.failure(), 1);
+        assert!(stats.latency().is_some());
     }
 }

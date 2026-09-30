@@ -129,6 +129,7 @@ use std::path::Path;
 use crate::barrier::{UnflushedBacklog, UnflushedLimit};
 use crate::batch::{Batch, BatchBuffer, BatchConfig, PushOutcome};
 use crate::error::{IoError, IoErrorCode};
+use crate::instrument::{IoOpKind, IoOpRecorder, IoOpTimer, NoopIoOpRecorder};
 use crate::payload::{decode_request, encode_ack};
 use crate::protocol::{Frame, FrameKind};
 use crate::transport::{FrameReceiver, FrameSender, IoTimeout, MAX_IO_TIMEOUT};
@@ -794,11 +795,16 @@ fn write_batch_and_ack<T, W>(
     batch: &Batch,
     timeout: IoTimeout,
     stats: &mut WritebackStats,
+    recorder: &dyn IoOpRecorder,
 ) -> Result<(), IoError>
 where
     T: FrameSender<Frame = Frame>,
     W: BatchSink,
 {
+    // 計装（REPAIR-4・TASK-84.7）: バッチ 1 回の書き込み = 1 サンプル。計測区間は
+    // `write_batch` と件数検証まで。`?` / 早期 return は Drop で Failure になる
+    // （fail-closed）。ACK 送信はトランスポートの処理なのでレイテンシに含めない。
+    let timer = IoOpTimer::start(recorder, IoOpKind::Write);
     let report = sink.write_batch(batch)?;
     if report.frames_written != batch.len() {
         return Err(IoError::new(
@@ -810,6 +816,7 @@ where
             ),
         ));
     }
+    timer.success();
     stats.batches_written = stats.batches_written.saturating_add(1);
     stats.bytes_written = stats.bytes_written.saturating_add(report.bytes_written);
     send_acks_in_order(conn, batch, timeout, stats)
@@ -847,13 +854,14 @@ fn auto_flush<T, W>(
     buffer: &mut BatchBuffer,
     timeout: IoTimeout,
     stats: &mut WritebackStats,
+    recorder: &dyn IoOpRecorder,
 ) -> Result<(), IoError>
 where
     T: FrameSender<Frame = Frame>,
     W: BatchSink,
 {
     if let Some(batch) = buffer.take_pending() {
-        write_batch_and_ack(conn, sink, &batch, timeout, stats)?;
+        write_batch_and_ack(conn, sink, &batch, timeout, stats, recorder)?;
     }
     persist_and_reset(sink, stats)?;
     stats.auto_flushes = stats.auto_flushes.saturating_add(1);
@@ -918,12 +926,41 @@ where
 /// 自動フラッシュ、の順で判定する。自動フラッシュの失敗はそのエラーで接続を終える
 /// （fail-closed。事前チェックで失敗した Write は受理も計上もされない）。
 /// [`crate::settings::BoundConnection::serve`] は設定側の上限でこれを呼ぶ。
+///
+/// 本関数は計装しない版（明示的に [`NoopIoOpRecorder`] を使う）。書き込み経路の
+/// 成功・失敗件数とレイテンシを記録したい呼び出し側は
+/// [`serve_connection_with_recorder`] を使う（REPAIR-4・TASK-84.7）。
 pub fn serve_connection_with_limit<T, W>(
     conn: &mut T,
     config: BatchConfig,
     limit: UnflushedLimit,
     sink: &mut W,
     timeouts: WritebackTimeouts,
+) -> WritebackReport
+where
+    T: FrameSender<Frame = Frame> + FrameReceiver<Frame = Frame>,
+    W: BatchSink,
+{
+    serve_connection_with_recorder(conn, config, limit, sink, timeouts, &NoopIoOpRecorder)
+}
+
+/// [`serve_connection_with_limit`] に計装の記録先 `recorder` を指定する版
+/// （REPAIR-4・TASK-84.7）。
+///
+/// バッチ 1 回の [`BatchSink::write_batch`]（通常バッチ・明示 Flush 時の滞留分・
+/// 自動フラッシュの書き込みのすべて）ごとに [`IoOpKind::Write`] のサンプルを 1 件
+/// `recorder` へ渡す。計測区間は `write_batch` と件数検証までで、ACK 送信と
+/// `persist`（FLUSH バリア）は含まない。`persist` の計装は [`IoOpKind`] への
+/// 種別追加を要するため未実装（REPAIR-3）。`recorder` は複数接続から `Arc` 共有して
+/// よい（[`IoOpRecorder`] は `Send + Sync`）。core の `OpStats` への反映は、
+/// core と io の両方に依存する上位 crate のアダプタが担う（[`crate::instrument`]）。
+pub fn serve_connection_with_recorder<T, W>(
+    conn: &mut T,
+    config: BatchConfig,
+    limit: UnflushedLimit,
+    sink: &mut W,
+    timeouts: WritebackTimeouts,
+    recorder: &dyn IoOpRecorder,
 ) -> WritebackReport
 where
     T: FrameSender<Frame = Frame> + FrameReceiver<Frame = Frame>,
@@ -976,7 +1013,8 @@ where
                 if acceptable
                     && !stats.unflushed.is_empty()
                     && limit.would_exceed_bytes(&stats.unflushed, body_len)
-                    && let Err(err) = auto_flush(conn, sink, &mut buffer, timeouts.send, &mut stats)
+                    && let Err(err) =
+                        auto_flush(conn, sink, &mut buffer, timeouts.send, &mut stats, recorder)
                 {
                     return finish(stats, &buffer, err);
                 }
@@ -995,14 +1033,15 @@ where
                 };
                 for batch in &batches {
                     if let Err(err) =
-                        write_batch_and_ack(conn, sink, batch, timeouts.send, &mut stats)
+                        write_batch_and_ack(conn, sink, batch, timeouts.send, &mut stats, recorder)
                     {
                         return finish(stats, &buffer, err);
                     }
                 }
                 // IO-10: 受理後に上限へ達したら自動フラッシュする。
                 if limit.is_reached(&stats.unflushed)
-                    && let Err(err) = auto_flush(conn, sink, &mut buffer, timeouts.send, &mut stats)
+                    && let Err(err) =
+                        auto_flush(conn, sink, &mut buffer, timeouts.send, &mut stats, recorder)
                 {
                     return finish(stats, &buffer, err);
                 }
@@ -1021,7 +1060,7 @@ where
 
                 if let Some(batch) = buffer.take_pending()
                     && let Err(err) =
-                        write_batch_and_ack(conn, sink, &batch, timeouts.send, &mut stats)
+                        write_batch_and_ack(conn, sink, &batch, timeouts.send, &mut stats, recorder)
                 {
                     return finish(stats, &buffer, err);
                 }
@@ -2266,5 +2305,202 @@ mod tests {
             .expect_err("poisoned sink must fail");
         assert_eq!(err.code(), IoErrorCode::Internal);
         assert!(err.message().contains("poisoned"));
+    }
+
+    // ---- 計装（REPAIR-4・TASK-84.7） ----
+
+    use crate::instrument::{IoOpOutcome, IoOpSample};
+    use std::sync::Mutex;
+
+    /// テスト専用の収集型記録先（core の `OpStats` への写像はアダプタの責務）。
+    #[derive(Default)]
+    struct CollectRecorder(Mutex<Vec<IoOpSample>>);
+
+    impl IoOpRecorder for CollectRecorder {
+        fn record_io_op(&self, sample: &IoOpSample) {
+            if let Ok(mut v) = self.0.lock() {
+                v.push(*sample);
+            }
+        }
+    }
+
+    impl CollectRecorder {
+        fn samples(&self) -> Vec<IoOpSample> {
+            self.0.lock().map(|v| v.clone()).unwrap_or_default()
+        }
+
+        fn kinds_outcomes(&self) -> Vec<(IoOpKind, IoOpOutcome)> {
+            self.samples()
+                .iter()
+                .map(|s| (s.kind(), s.outcome()))
+                .collect()
+        }
+    }
+
+    /// `frames_written` を偽る sink（件数検証の失敗経路の確認用）。
+    struct MismatchSink;
+
+    impl BatchSink for MismatchSink {
+        fn write_batch(&mut self, batch: &Batch) -> Result<SinkWriteReport, IoError> {
+            Ok(SinkWriteReport::new(batch.len() + 1, 0))
+        }
+    }
+
+    /// `write_batch` で一定時間眠る sink（レイテンシ計測の確認用）。
+    struct SlowSink(Duration);
+
+    impl BatchSink for SlowSink {
+        fn write_batch(&mut self, batch: &Batch) -> Result<SinkWriteReport, IoError> {
+            std::thread::sleep(self.0);
+            Ok(SinkWriteReport::new(batch.len(), 0))
+        }
+    }
+
+    /// REPAIR-4・IO-1: バッチ 1 回の書き込みにつき Write/Success が 1 件届く。
+    #[test]
+    fn repair4_writeback_records_write_success_per_batch() {
+        let frames: Vec<Frame> = (0..6u64).map(|id| write_frame(id, b"x")).collect();
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = FakeSink::new();
+        let rec = CollectRecorder::default();
+        let config = BatchConfig::new(3).expect("3 must be valid");
+
+        let report = serve_connection_with_recorder(
+            &mut conn,
+            config,
+            UnflushedLimit::default(),
+            &mut sink,
+            timeouts(),
+            &rec,
+        );
+
+        assert_eq!(report.stats.acks_sent, 6);
+        assert_eq!(
+            rec.kinds_outcomes(),
+            vec![(IoOpKind::Write, IoOpOutcome::Success); 2]
+        );
+    }
+
+    /// REPAIR-4: sink 失敗は Failure として記録され、ACK は返らない（D6 不変）。
+    #[test]
+    fn repair4_writeback_records_write_failure_on_sink_error() {
+        let frames: Vec<Frame> = (0..3u64).map(|id| write_frame(id, b"x")).collect();
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = FakeSink::failing_at(1);
+        let rec = CollectRecorder::default();
+        let config = BatchConfig::new(3).expect("3 must be valid");
+
+        let report = serve_connection_with_recorder(
+            &mut conn,
+            config,
+            UnflushedLimit::default(),
+            &mut sink,
+            timeouts(),
+            &rec,
+        );
+
+        assert_eq!(report.stats.acks_sent, 0);
+        assert_eq!(
+            rec.kinds_outcomes(),
+            vec![(IoOpKind::Write, IoOpOutcome::Failure)]
+        );
+    }
+
+    /// REPAIR-4: `frames_written` 不一致は Failure として記録され `Internal` で終わる。
+    #[test]
+    fn repair4_writeback_records_failure_on_frames_written_mismatch() {
+        let frames: Vec<Frame> = (0..2u64).map(|id| write_frame(id, b"x")).collect();
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = MismatchSink;
+        let rec = CollectRecorder::default();
+        let config = BatchConfig::new(2).expect("2 must be valid");
+
+        let report = serve_connection_with_recorder(
+            &mut conn,
+            config,
+            UnflushedLimit::default(),
+            &mut sink,
+            timeouts(),
+            &rec,
+        );
+
+        assert_eq!(report.end.code(), IoErrorCode::Internal);
+        assert_eq!(
+            rec.kinds_outcomes(),
+            vec![(IoOpKind::Write, IoOpOutcome::Failure)]
+        );
+    }
+
+    /// REPAIR-4・IO-2: 明示 Flush 時の滞留分の書き込みも 1 件記録される
+    /// （`persist` は計装対象外なので合計 1 件のまま）。
+    #[test]
+    fn repair4_writeback_records_flush_pending_write() {
+        let frames = vec![write_frame(0, b"a"), write_frame(1, b"b"), flush_frame(2)];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = persist_sink(None);
+        let rec = CollectRecorder::default();
+        let config = BatchConfig::new(8).expect("8 must be valid");
+
+        let _ = serve_connection_with_recorder(
+            &mut conn,
+            config,
+            UnflushedLimit::default(),
+            &mut sink,
+            timeouts(),
+            &rec,
+        );
+
+        assert_eq!(
+            rec.kinds_outcomes(),
+            vec![(IoOpKind::Write, IoOpOutcome::Success)]
+        );
+    }
+
+    /// REPAIR-4・IO-10: 自動フラッシュの書き込みも記録される。
+    #[test]
+    fn repair4_writeback_records_auto_flush_write() {
+        let frames = (0..3u64).map(|i| write_frame(i, b"x")).collect();
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = persist_sink(None);
+        let rec = CollectRecorder::default();
+        let config = BatchConfig::new(8).expect("valid");
+
+        let report = serve_connection_with_recorder(
+            &mut conn,
+            config,
+            limit(3, 1024),
+            &mut sink,
+            timeouts(),
+            &rec,
+        );
+
+        assert_eq!(report.stats.auto_flushes, 1);
+        assert_eq!(
+            rec.kinds_outcomes(),
+            vec![(IoOpKind::Write, IoOpOutcome::Success)]
+        );
+    }
+
+    /// REPAIR-4: レイテンシは sink の書き込み時間を含む（下限のみ検証。フレーク防止）。
+    #[test]
+    fn repair4_writeback_latency_includes_sink_write_time() {
+        let frames = vec![write_frame(0, b"x")];
+        let mut conn = FakeTransport::new(frames);
+        let mut sink = SlowSink(Duration::from_millis(5));
+        let rec = CollectRecorder::default();
+        let config = BatchConfig::new(1).expect("1 must be valid");
+
+        let _ = serve_connection_with_recorder(
+            &mut conn,
+            config,
+            UnflushedLimit::default(),
+            &mut sink,
+            timeouts(),
+            &rec,
+        );
+
+        let samples = rec.samples();
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].latency() >= Duration::from_millis(5));
     }
 }

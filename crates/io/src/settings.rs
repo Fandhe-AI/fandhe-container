@@ -60,6 +60,7 @@ use std::str::FromStr;
 use crate::barrier::UnflushedLimit;
 use crate::batch::BatchConfig;
 use crate::error::{IoError, IoErrorCode};
+use crate::instrument::{IoOpRecorder, NoopIoOpRecorder};
 use crate::observe::ServerObserver;
 use crate::recv_limits::ReceiveLimits;
 use crate::server::{UdsConnection, UdsServer};
@@ -433,17 +434,32 @@ impl<C: ServerObserver> BoundConnection<C> {
     /// この接続を bind した設定とは異なる `BatchConfig` を混入させる経路が
     /// ない（モジュール doc 参照）。`sink`・`timeouts` の意味は
     /// [`crate::writeback::serve_connection`] と同じ。
+    ///
+    /// 計装しない版（[`NoopIoOpRecorder`] を明示して委譲する）。
     pub fn serve<W: BatchSink>(
         &mut self,
         sink: &mut W,
         timeouts: WritebackTimeouts,
     ) -> WritebackReport {
-        writeback::serve_connection_with_limit(
+        self.serve_with_recorder(sink, timeouts, &NoopIoOpRecorder)
+    }
+
+    /// [`Self::serve`] に計装の記録先を指定する版（REPAIR-4・TASK-84.7）。
+    /// 計装のために `BoundConnection` を迂回させず、設定の不整合を防ぐ唯一の経路を保つ。
+    /// サンプルの意味は [`crate::writeback::serve_connection_with_recorder`] を参照。
+    pub fn serve_with_recorder<W: BatchSink>(
+        &mut self,
+        sink: &mut W,
+        timeouts: WritebackTimeouts,
+        recorder: &dyn IoOpRecorder,
+    ) -> WritebackReport {
+        writeback::serve_connection_with_recorder(
             &mut self.conn,
             self.settings.batch_config(),
             self.settings.unflushed_limit(),
             sink,
             timeouts,
+            recorder,
         )
     }
 }

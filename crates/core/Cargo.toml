@@ -57,3 +57,10 @@ harness = false
 name = "rootless_id_map"
 path = "tests/rootless_id_map.rs"
 harness = false
+
+# rootless 起動フローへの統合（subuid 範囲写像 → spawn_container）の結合試験（CORE-6・SEC-5・TASK-40.2）。
+# 上と同じ理由で harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "rootless_launch"
+path = "tests/rootless_launch.rs"
+harness = false

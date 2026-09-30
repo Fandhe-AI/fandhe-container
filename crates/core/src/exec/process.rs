@@ -739,8 +739,8 @@ pub struct ContainerChild {
 }
 
 impl ContainerChild {
-    /// fork 直後の未回収の子のハンドルを作る。
-    fn new(pid: u32) -> Self {
+    /// fork 直後の未回収の子のハンドルを作る（`exec` の rootless mapper の回収にも使う）。
+    pub(super) fn new(pid: u32) -> Self {
         Self {
             pid,
             // 回収前（fork 直後）に開くので、以後 pid が再利用されても元のプロセスを指し続ける。

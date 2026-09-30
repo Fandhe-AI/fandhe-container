@@ -6,6 +6,12 @@
 //! [`ProcessLauncher`] へ委ねる。`ContainerRuntime` の実装は plugin 側に置く（PLUG-1）ため、
 //! create が `StateStore` を依存注入で受けるのと同様に、起動も依存注入とした。
 //!
+//! # 時間上限（REPAIR-5）
+//!
+//! launcher・起動済みプロセスへの呼び出しの上限は呼び出し側が [`StartTimeouts`] で渡す。上限は
+//! 各メソッドの引数として実装へも渡すが、実装が守ることには依存せず、start が呼び出し境界で強制する
+//! （別スレッドで呼び、上限を過ぎたら待つのをやめる。`start.rs` の `call_bounded`）。
+//!
 //! # 本番実装が未提供である理由（REPAIR-3: 実装済みを装わない）
 //!
 //! TASK-27 の exec フロー（`exec::spawn_container`）は「分離済み・シングルスレッド・使い捨て」の
@@ -13,7 +19,9 @@
 //! 証跡が無い限り exec を拒否する（SEC-1・CORE-5）。任意の文脈から呼ばれる `start` はこれを
 //! 保証できないため、fork した中間プロセスでの `isolate` → `spawn_container` と pid 返却・子の回収
 //! を行う本番 launcher は後続 sub-issue（TASK-29 / TASK-157 系）で提供する。現時点で本 crate に
-//! launcher 実装は無く、実プロセスの起動は行われない。
+//! launcher 実装は無く、実プロセスの起動は行われない。起動済みの子の終了・回収だけは、本番 launcher が
+//! そのまま使えるよう `ContainerChildProcess`（Linux。`exec::ContainerChild` の回収状態の排他を
+//! 再利用する）として提供する。
 
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;
@@ -29,6 +37,82 @@ use std::time::Duration;
 
 use super::config::NamespaceKind;
 use crate::traits::{ContainerId, ErrorCode, TraitError};
+
+/// [`StartTimeouts`] の各上限が取れる最大値（無期限相当の値を型で拒否する。REPAIR-5）。
+///
+/// `StopRequest` の猶予上限と同じく「無期限を許さない」契約を表す暫定値。
+pub const START_TIMEOUT_MAX: Duration = Duration::from_secs(10 * 60);
+
+/// start・中断回復が launcher・起動済みプロセスを待つ上限時間（REPAIR-5）。
+///
+/// 呼び出し側（将来の plugin 側 `ContainerRuntime::start` 実装・CLI）が渡す。各値は 0 より大きく
+/// [`START_TIMEOUT_MAX`] 以下。上限は `ProcessLauncher` / `LaunchedProcess` の各メソッドへも渡すが、
+/// start は実装が守ることに依存せず呼び出し境界で強制する。境界での打ち切りは、各値に実装自身の
+/// `Timeout` 応答を受け取る猶予 `LAUNCHER_REPLY_GRACE`（1 秒）を足した時点で行う（実効の待ち上限は
+/// 各値 + 1 秒）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartTimeouts {
+    launch: Duration,
+    terminate: Duration,
+    confirm: Duration,
+}
+
+impl StartTimeouts {
+    /// 既定の起動待ち上限（[`ProcessLauncher::launch`]）。
+    pub const DEFAULT_LAUNCH: Duration = Duration::from_secs(30);
+    /// 既定の終了待ち上限（[`LaunchedProcess::terminate`]）。
+    pub const DEFAULT_TERMINATE: Duration = Duration::from_secs(5);
+    /// 既定の生存確認待ち上限（[`ProcessLauncher::confirm_no_process`]）。
+    pub const DEFAULT_CONFIRM: Duration = Duration::from_secs(10);
+
+    /// 起動・終了・生存確認の各上限から作る。0 または [`START_TIMEOUT_MAX`] 超過は `InvalidArgument`。
+    pub fn new(
+        launch: Duration,
+        terminate: Duration,
+        confirm: Duration,
+    ) -> Result<Self, TraitError> {
+        for value in [launch, terminate, confirm] {
+            if value.is_zero() || value > START_TIMEOUT_MAX {
+                return Err(TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "start timeouts must be greater than zero and at most {START_TIMEOUT_MAX:?}"
+                    ),
+                ));
+            }
+        }
+        Ok(Self {
+            launch,
+            terminate,
+            confirm,
+        })
+    }
+
+    /// [`ProcessLauncher::launch`] を待つ上限。
+    pub fn launch(&self) -> Duration {
+        self.launch
+    }
+
+    /// [`LaunchedProcess::terminate`] を待つ上限。
+    pub fn terminate(&self) -> Duration {
+        self.terminate
+    }
+
+    /// [`ProcessLauncher::confirm_no_process`] を待つ上限。
+    pub fn confirm(&self) -> Duration {
+        self.confirm
+    }
+}
+
+impl Default for StartTimeouts {
+    fn default() -> Self {
+        Self {
+            launch: Self::DEFAULT_LAUNCH,
+            terminate: Self::DEFAULT_TERMINATE,
+            confirm: Self::DEFAULT_CONFIRM,
+        }
+    }
+}
 
 /// 検査済み rootfs ディレクトリの固定ハンドル（検査対象と使用対象を同一にする。SEC-1）。
 ///
@@ -193,36 +277,91 @@ impl LaunchSpec {
 }
 
 /// 起動済みプロセスへのハンドル。
+///
+/// start は上限を強制するため別スレッド（上限超過後の後始末を含む）へハンドルを移すので `Send` を要求する。
 pub trait LaunchedProcess: Send {
     /// 起動したコンテナプロセスの pid。
     fn pid(&self) -> NonZeroU32;
 
-    /// 状態の記録に失敗したときの後始末として、プロセスを終了させる。
+    /// 状態の記録に失敗したとき・起動待ちが上限を超えた後に返ってきたときの後始末として、
+    /// プロセスを終了（kill）させて回収（wait）する。
     ///
-    /// 待ちには必ず上限時間 `timeout` を設け、超過時は `ErrorCode::Timeout` を返す（REPAIR-5）。
-    ///
-    /// 上限内に終了しない場合は強制終了（kill）と回収（wait）まで行ってから返すこと。それでも
-    /// 終了を確認できないときは `Err` を返す（`start` はこれを呼び出し元へ伝える）。
+    /// `timeout` までに回収できなければ `ErrorCode::Timeout` 等の `Err` を返す（REPAIR-5）。start は
+    /// 実装が `timeout` を守ることに依存せず、呼び出し境界でも同じ上限を強制する。Linux の子プロセスは
+    /// `ContainerChildProcess`（`exec::ContainerChild::kill_and_reap`）で実装できる。
     fn terminate(&self, timeout: Duration) -> Result<(), TraitError>;
+}
+
+/// `exec::ContainerChild`（fork した子）を [`LaunchedProcess`] として扱うアダプタ（Linux。CORE-1・REPAIR-5）。
+///
+/// 本番 launcher（後続 sub-issue）が `exec::spawn_container` の戻り値を包んで返すために置く。
+/// [`LaunchedProcess::terminate`] は `ContainerChild::kill_and_reap` を呼び、`wait_timeout` と同じ
+/// 回収状態の排他の下で `SIGKILL` → 回収を行う（回収済みの pid へは `SIGKILL` を送らない）。
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct ContainerChildProcess {
+    child: crate::exec::ContainerChild,
+    pid: NonZeroU32,
+}
+
+#[cfg(target_os = "linux")]
+impl ContainerChildProcess {
+    /// fork した子のハンドルから作る。pid が 0 のハンドルは `InvalidArgument`（fork の戻り値では生じない）。
+    pub fn new(child: crate::exec::ContainerChild) -> Result<Self, TraitError> {
+        let pid = NonZeroU32::new(child.pid()).ok_or_else(|| {
+            TraitError::new(
+                ErrorCode::InvalidArgument,
+                "the child process id must be non-zero",
+            )
+        })?;
+        Ok(Self { child, pid })
+    }
+
+    /// 包んでいる子のハンドル（終了待ち `wait_timeout` 等に使う）。
+    pub fn child(&self) -> &crate::exec::ContainerChild {
+        &self.child
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LaunchedProcess for ContainerChildProcess {
+    fn pid(&self) -> NonZeroU32 {
+        self.pid
+    }
+
+    fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
+        self.child
+            .kill_and_reap(timeout)
+            .map(|_| ())
+            .map_err(|e| TraitError::new(e.code, "failed to terminate the container process"))
+    }
 }
 
 /// [`LaunchSpec`] からコンテナプロセスを起動する境界。
 ///
 /// # 契約
 ///
-/// - 起動確認（子からの通知待ち等）には必ず上限時間を設け、超過時は `ErrorCode::Timeout`（REPAIR-5）
+/// - 各メソッドの待ちは引数 `timeout` までに打ち切り、超過時は起動した子を kill・回収してから
+///   `ErrorCode::Timeout` を返す（REPAIR-5）。start は実装が守ることに依存せず、呼び出し境界でも上限を
+///   強制する（超過後に返ってきた起動済みプロセスは start が [`LaunchedProcess::terminate`] で後始末する）。
+///   別スレッドから呼ばれ得るため `Send + Sync` とする
 /// - exec フローの fail-closed（制限証跡なしの exec 拒否。SEC-1・CORE-5）を回避しない
 /// - 失敗時にプロセスを残さない
 /// - rootfs は [`LaunchSpec::rootfs_dir`] の固定ハンドルから使い、`rootfs()` のパスを再解決しない（SEC-1）
 /// - `linux.uidMappings` / `gidMappings` は `start` が拒否済みで `LaunchSpec` に載らない。user namespace の
 ///   写像は launcher の責務で、コンテナ内 root（uid/gid 0）をホストの非特権 UID・GID（呼び出しプロセスの
 ///   euid・egid。0 なら拒否）へ写すこと。`exec::plan` / `exec::isolate` が既定でこの写像を行う（SEC-5）
-/// - `LaunchSpec::namespaces` には Pid・Mount・User が必ず含まれる（`start` が検証済み。hostname があれば Uts も）
+/// - `LaunchSpec::namespaces` には Pid・Mount・User・Ipc が必ず含まれる（`start` が検証済み。hostname が
+///   あれば Uts も）
 ///
 /// 本番実装は本 crate に未提供（モジュール doc 参照）。
 pub trait ProcessLauncher: Send + Sync {
-    /// プロセスを起動し、ハンドルを返す。
-    fn launch(&self, spec: &LaunchSpec) -> Result<Box<dyn LaunchedProcess>, TraitError>;
+    /// プロセスを起動し、ハンドルを返す。`timeout` は起動確認（子からの通知待ち等）の上限。
+    fn launch(
+        &self,
+        spec: &LaunchSpec,
+        timeout: Duration,
+    ) -> Result<Box<dyn LaunchedProcess>, TraitError>;
 
     /// `id` の起動が生存プロセスを残していないことを確認する（中断された start の回復用。CORE-2・SEC-1）。
     ///
@@ -230,9 +369,9 @@ pub trait ProcessLauncher: Send + Sync {
     /// `recover_interrupted_start` は予約を Created へ戻す前に本メソッドを呼び、`Ok(())` のときだけ戻す
     /// （戻すと同じ ID の二重起動が可能になるため）。実装は、`id` のプロセスが存在しないと確証できる場合、
     /// または存在する場合に終了・回収したうえで `Ok(())` を返し、確証できない場合は `Err` を返すこと。
-    /// 既定実装は確認手段を持たないため fail-closed で `Unimplemented` を返す。待ちには上限を設ける（REPAIR-5）。
-    fn confirm_no_process(&self, id: &ContainerId) -> Result<(), TraitError> {
-        let _ = id;
+    /// 既定実装は確認手段を持たないため fail-closed で `Unimplemented` を返す。待ちは `timeout` まで。
+    fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
+        let _ = (id, timeout);
         Err(TraitError::new(
             ErrorCode::Unimplemented,
             "the launcher cannot confirm that no process remains for this container",
@@ -240,9 +379,43 @@ pub trait ProcessLauncher: Send + Sync {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REPAIR-5: 上限は 0 と `START_TIMEOUT_MAX` 超過を拒否し、境界値は受理する。
+    #[test]
+    fn repair5_start_timeouts_reject_zero_and_unbounded() {
+        let one = Duration::from_secs(1);
+        let ok = StartTimeouts::new(one, START_TIMEOUT_MAX, Duration::from_millis(1)).expect("ok");
+        assert_eq!(
+            (ok.launch(), ok.terminate(), ok.confirm()),
+            (one, START_TIMEOUT_MAX, Duration::from_millis(1))
+        );
+        for (launch, terminate, confirm) in [
+            (Duration::ZERO, one, one),
+            (one, Duration::ZERO, one),
+            (one, one, Duration::ZERO),
+            (START_TIMEOUT_MAX + Duration::from_nanos(1), one, one),
+            (one, Duration::MAX, one),
+        ] {
+            let err = StartTimeouts::new(launch, terminate, confirm).expect_err("must fail");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            assert_eq!(
+                err.message(),
+                "start timeouts must be greater than zero and at most 600s"
+            );
+        }
+        let d = StartTimeouts::default();
+        assert_eq!(
+            (d.launch(), d.terminate(), d.confirm()),
+            (
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+                Duration::from_secs(10)
+            )
+        );
+    }
 
     /// テスト用の一意なディレクトリ（終了時に削除）。
     #[cfg(target_os = "linux")]
@@ -345,5 +518,33 @@ mod tests {
         );
         let err = RootfsDir::pin(Path::new("rel"), Path::new("rel/rootfs")).expect_err("fail");
         assert_eq!(err.message(), "bundle path must be absolute");
+    }
+
+    /// CORE-1・REPAIR-5: `ContainerChildProcess::terminate` は実プロセスを kill して回収する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_container_child_process_terminate_kills_and_reaps() {
+        #[allow(clippy::zombie_processes)]
+        let pid = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn")
+            .id();
+        let process =
+            ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
+                .expect("wrap");
+        assert_eq!(process.pid().get(), pid);
+        process
+            .terminate(Duration::from_secs(10))
+            .expect("terminate");
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert_eq!(
+            process
+                .child()
+                .wait_timeout(Duration::ZERO)
+                .expect("reaped"),
+            crate::exec::ChildExit::Signaled(9)
+        );
     }
 }

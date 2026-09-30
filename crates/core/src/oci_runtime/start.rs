@@ -19,10 +19,21 @@
 //! 5. 起動権の予約: `StateStore::update` を revision 照合つきで呼び、Created を Running（pid なし）へ
 //!    原子的に遷移させる。別プロセスの同時 start はここで revision 不一致（`FailedPrecondition`）に
 //!    なり launch へ進めない（CORE-2）
-//! 6. launcher 起動。失敗時は予約を Created へ戻す（戻せない場合は `Internal` で伝える）
-//! 7. Running（pid 付き）へ状態更新。更新に失敗した場合は起動済みプロセスを上限時間つきで終了し、
-//!    予約を Created へ戻してから、元のエラーを返す。終了にも失敗した場合（`Timeout` 等）は、
-//!    未記録プロセスが残り得ることを示す `Internal` を返し、元のエラーで隠さない（REPAIR-5）
+//! 6. launcher 起動（上限 [`StartTimeouts::launch`]）。失敗時は予約を Created へ戻す（戻せない場合は
+//!    `Internal` で伝える）。上限を超えたら待つのをやめて `Timeout` を返し、予約は残す（launch がまだ
+//!    進行中で、プロセスが後から現れ得るため Created へ戻さない）。後から返ってきた起動済みプロセスは
+//!    後始末スレッドが [`LaunchedProcess::terminate`] で kill・回収する
+//! 7. Running（pid 付き）へ状態更新。更新に失敗した場合は起動済みプロセスを上限
+//!    [`StartTimeouts::terminate`] つきで終了し、予約を Created へ戻してから、元のエラーを返す。
+//!    終了にも失敗した・上限を超えた場合は、未記録プロセスが残り得ることを示す `Internal` を返し、
+//!    元のエラーで隠さない（予約は残す。REPAIR-5）
+//!
+//! # 時間上限の強制（REPAIR-5）
+//!
+//! launcher・起動済みプロセスへの呼び出し（launch・terminate・confirm_no_process）は、上限を引数で
+//! 実装へ渡したうえで、`call_bounded` が別スレッドで呼び、上限（＋実装自身の `Timeout` 応答を受け取る
+//! 猶予 [`LAUNCHER_REPLY_GRACE`]）を過ぎたら待つのをやめる。実装が上限を守らず戻らなくても start は
+//! 有限時間で戻る。上限超過後に戻った結果は後始末スレッドが処理する（起動済みプロセスなら terminate）。
 //!
 //! start のプロセスが手順 5〜7 の間に異常終了すると Running・pid なしの予約だけが残る。この状態は
 //! `FailedPrecondition`（`start was interrupted` を含むメッセージ）で識別でき、
@@ -82,12 +93,12 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use super::config::{NamespaceKind, OciConfig};
 use super::create::validate_bundle;
-use super::launch::{LaunchSpec, ProcessLauncher, RootfsDir};
+use super::launch::{LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts};
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
@@ -97,22 +108,103 @@ use crate::traits::{
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
 const START_OP_NAME: &str = "start";
 
-/// 状態更新に失敗したときの起動済みプロセス終了の待ち上限（REPAIR-5）。
-const TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 上限を過ぎてから実装自身の `Timeout` 応答（後始末済み）を受け取るまで待つ猶予（REPAIR-5）。
+///
+/// launcher は同じ上限を引数で受け取るため、上限ちょうどで打ち切ると協調的な実装の `Timeout` 応答
+/// （子を kill・回収済み）と境界の打ち切りが競合する。猶予内に応答があればそれを使い、予約を正しく戻す。
+pub const LAUNCHER_REPLY_GRACE: Duration = Duration::from_secs(1);
 
 /// Created 状態のコンテナのプロセスを起動し、Running（pid 付き）へ遷移させる。
 ///
 /// 戻り値は更新後の [`StateRecord`]。未 create の ID は [`ErrorCode::NotFound`]、Created 以外は
-/// [`ErrorCode::FailedPrecondition`]。成功・失敗の件数と所要時間は `recorder` へ操作名 `start` で
+/// [`ErrorCode::FailedPrecondition`]、launcher の応答が上限（`timeouts`）を超えたら
+/// [`ErrorCode::Timeout`]（予約は残り [`recover_interrupted_start`] で回復する）。launcher は上限超過後も
+/// 後始末スレッドから使うため `Arc` で受ける。成功・失敗の件数と所要時間は `recorder` へ操作名 `start` で
 /// 記録する（全終了経路。REPAIR-4）。
 pub fn start(
     store: &dyn StateStore,
     recorder: &OpRecorder,
-    launcher: &dyn ProcessLauncher,
+    launcher: &Arc<dyn ProcessLauncher>,
     req: &StartRequest,
+    timeouts: &StartTimeouts,
 ) -> Result<StateRecord, TraitError> {
     let name = OpName::new(START_OP_NAME)?;
-    recorder.record_op(&name, || start_inner(store, launcher, req))
+    recorder.record_op(&name, || start_inner(store, launcher, req, timeouts))
+}
+
+/// [`call_bounded`] の結果を保持する枠（呼び出し側と実行スレッドの受け渡し）。
+enum Slot<T> {
+    /// 実行中。
+    Pending,
+    /// 上限内に戻った結果（呼び出し側が取り出す）。
+    Done(T),
+    /// 呼び出し側が上限超過で待つのをやめた。以後の結果は実行スレッドが後始末する。
+    Abandoned,
+}
+
+/// [`call_bounded`] が結果を得られなかった理由。
+enum Unbounded {
+    /// 上限（＋猶予）を過ぎた、または実行スレッドが結果を返さずに終わった（panic 等）。
+    TimedOut,
+    /// 実行スレッドを作れなかった（`call` は実行されていない）。
+    SpawnFailed,
+}
+
+/// `call` を別スレッドで実行し、`limit` ＋ [`LAUNCHER_REPLY_GRACE`] までに戻った結果だけを返す（REPAIR-5）。
+///
+/// launcher・起動済みプロセスへの呼び出し境界で上限を強制する。上限を過ぎたら `Unbounded::TimedOut` を
+/// 返して待つのをやめ、後から戻った結果は実行スレッド上で `on_late` に渡す（起動済みプロセスの
+/// terminate 等）。結果の受け渡しと「待つのをやめた」印は同じ `Mutex` の下で行うため、戻った結果が
+/// 誰にも処理されずに捨てられることはない。実行スレッドが `call` の途中で panic した場合は結果が
+/// 無いまま上限を迎え `TimedOut` になる（結果が不明なので予約は残す側に倒す）。実装が永久に戻らない
+/// 場合、実行スレッドはプロセス終了まで残る（Rust にスレッドの強制停止は無い）が、呼び出し側は上限で戻る。
+fn call_bounded<T, F, L>(limit: Duration, call: F, on_late: L) -> Result<T, Unbounded>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    L: FnOnce(T) + Send + 'static,
+{
+    let shared = Arc::new((Mutex::new(Slot::<T>::Pending), Condvar::new()));
+    let worker = Arc::clone(&shared);
+    std::thread::Builder::new()
+        .name("fandhe-start-call".to_owned())
+        .spawn(move || {
+            let value = call();
+            let (lock, cvar) = &*worker;
+            let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            if matches!(*slot, Slot::Abandoned) {
+                drop(slot);
+                on_late(value);
+                return;
+            }
+            *slot = Slot::Done(value);
+            cvar.notify_all();
+        })
+        .map_err(|_| Unbounded::SpawnFailed)?;
+    // `limit` は `StartTimeouts` が上限つきで検証済みのため加算は溢れないが、念のため checked で扱う。
+    let wait = limit.saturating_add(LAUNCHER_REPLY_GRACE);
+    let deadline = Instant::now().checked_add(wait);
+    let (lock, cvar) = &*shared;
+    let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        // 結果があれば取り出す（取り出した後は Abandoned にして二重に取り出さない）。
+        match std::mem::replace(&mut *slot, Slot::Abandoned) {
+            Slot::Done(value) => return Ok(value),
+            other => *slot = other,
+        }
+        let now = Instant::now();
+        let remaining = match deadline {
+            Some(d) if d > now => d - now,
+            _ => {
+                *slot = Slot::Abandoned;
+                return Err(Unbounded::TimedOut);
+            }
+        };
+        slot = cvar
+            .wait_timeout(slot, remaining)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
 }
 
 /// プロセス内で start 実行中の ID 集合（同一 ID の並行 start による二重 launch を防ぐ予約表）。
@@ -155,10 +247,14 @@ impl Drop for StartReservation {
 /// launch 後・pid 記録前の中断では生きたプロセスが残り得るため、Created へ戻す前に
 /// [`ProcessLauncher::confirm_no_process`] で生存プロセスが無いことを確認する。確認できない場合
 /// （既定実装を含む）はそのエラーを返して予約を残す（二重起動の防止。SEC-1・CORE-2）。
+///
+/// 確認の待ちは `timeouts.confirm()` まで（REPAIR-5。呼び出し境界で強制する）。超過したら `Timeout` を
+/// 返して予約を残す。
 pub fn recover_interrupted_start(
     store: &dyn StateStore,
-    launcher: &dyn ProcessLauncher,
+    launcher: &Arc<dyn ProcessLauncher>,
     id: &ContainerId,
+    timeouts: &StartTimeouts,
 ) -> Result<StateRecord, TraitError> {
     let _reservation = StartReservation::acquire(id)?;
     let record = store.get(&GetStateRequest::new(id.clone()))?;
@@ -168,7 +264,28 @@ pub fn recover_interrupted_start(
             "no interrupted start reservation to recover",
         ));
     }
-    launcher.confirm_no_process(id)?;
+    let confirm = timeouts.confirm();
+    let l = Arc::clone(launcher);
+    let target = id.clone();
+    match call_bounded(
+        confirm,
+        move || l.confirm_no_process(&target, confirm),
+        drop,
+    ) {
+        Ok(result) => result?,
+        Err(Unbounded::TimedOut) => {
+            return Err(TraitError::new(
+                ErrorCode::Timeout,
+                "the launcher did not confirm within the timeout; the start reservation remains",
+            ));
+        }
+        Err(Unbounded::SpawnFailed) => {
+            return Err(TraitError::new(
+                ErrorCode::Internal,
+                "failed to run the launcher confirmation",
+            ));
+        }
+    }
     store.update(&UpdateStateRequest::new(
         ContainerStatus::created(id.clone(), None),
         record.revision(),
@@ -177,8 +294,9 @@ pub fn recover_interrupted_start(
 
 fn start_inner(
     store: &dyn StateStore,
-    launcher: &dyn ProcessLauncher,
+    launcher: &Arc<dyn ProcessLauncher>,
     req: &StartRequest,
+    timeouts: &StartTimeouts,
 ) -> Result<StateRecord, TraitError> {
     let _reservation = StartReservation::acquire(req.id())?;
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
@@ -205,20 +323,51 @@ fn start_inner(
         record.revision(),
     ))?;
 
-    let process = match launcher.launch(&spec) {
-        Ok(p) => p,
-        Err(err) => return Err(release_claim(store, req.id(), &claimed, err)),
+    let launch_timeout = timeouts.launch();
+    let terminate_timeout = timeouts.terminate();
+    let l = Arc::clone(launcher);
+    let launched = call_bounded(
+        launch_timeout,
+        move || l.launch(&spec, launch_timeout),
+        // 上限超過後に起動済みプロセスが返ってきたら kill・回収する（状態には記録されていないため）。
+        move |late: Result<Box<dyn LaunchedProcess>, TraitError>| {
+            if let Ok(process) = late {
+                let _ = process.terminate(terminate_timeout);
+            }
+        },
+    );
+    let process = match launched {
+        Ok(Ok(p)) => p,
+        Ok(Err(err)) => return Err(release_claim(store, req.id(), &claimed, err)),
+        // launch は呼ばれていないため予約を戻してよい。
+        Err(Unbounded::SpawnFailed) => {
+            let err = TraitError::new(ErrorCode::Internal, "failed to run the process launcher");
+            return Err(release_claim(store, req.id(), &claimed, err));
+        }
+        // launch がまだ進行中でプロセスが後から現れ得るため、予約は Created へ戻さない（CORE-2）。
+        Err(Unbounded::TimedOut) => {
+            return Err(TraitError::new(
+                ErrorCode::Timeout,
+                "the process launch did not complete within the timeout; \
+                 the start reservation remains until recovered",
+            ));
+        }
     };
 
     let running = ContainerStatus::running(req.id().clone(), Some(process.pid()));
     match store.update(&UpdateStateRequest::new(running, claimed.revision())) {
         Ok(updated) => Ok(updated),
         Err(err) => {
-            // 状態を記録できないまま生きたプロセスを残さない。終了できなかった場合は
-            // 未記録プロセスが残り得ることを呼び出し元へ伝える（元のエラーで隠さない）。
-            match process.terminate(TERMINATE_TIMEOUT) {
-                Ok(()) => Err(release_claim(store, req.id(), &claimed, err)),
-                Err(_) => Err(TraitError::new(
+            // 状態を記録できないまま生きたプロセスを残さない。終了できなかった・上限を超えた場合は
+            // 未記録プロセスが残り得ることを呼び出し元へ伝える（元のエラーで隠さない。予約は残す）。
+            let terminated = call_bounded(
+                terminate_timeout,
+                move || process.terminate(terminate_timeout),
+                drop,
+            );
+            match terminated {
+                Ok(Ok(())) => Err(release_claim(store, req.id(), &claimed, err)),
+                _ => Err(TraitError::new(
                     ErrorCode::Internal,
                     "failed to record running state and failed to terminate the launched process",
                 )),
@@ -411,7 +560,7 @@ mod tests {
     use std::num::NonZeroU32;
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// テスト専用のインメモリ `StateStore`。`update` は revision を照合し、失敗注入もできる。
     struct MemStateStore {
@@ -484,25 +633,79 @@ mod tests {
         }
     }
 
-    /// 受け取った `LaunchSpec` を記録し、固定 pid を返す launcher。
+    /// 開くまで呼び出しを塞ぐ門（上限を守らず戻らない実装の模擬）。
+    struct Gate {
+        open: Mutex<bool>,
+        cvar: std::sync::Condvar,
+    }
+
+    impl Gate {
+        fn new(open: bool) -> Arc<Self> {
+            Arc::new(Self {
+                open: Mutex::new(open),
+                cvar: std::sync::Condvar::new(),
+            })
+        }
+
+        fn set_open(&self, open: bool) {
+            *self.open.lock().unwrap_or_else(|e| e.into_inner()) = open;
+            self.cvar.notify_all();
+        }
+
+        /// 門が開くまで待つ（テストが固まらないよう最大 30 秒で諦める）。
+        fn pass(&self) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+            while !*open {
+                let now = Instant::now();
+                if now >= deadline {
+                    return;
+                }
+                open = self
+                    .cvar
+                    .wait_timeout(open, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+        }
+    }
+
+    /// 受け取った `LaunchSpec`・上限を記録し、固定 pid を返す launcher。
+    ///
+    /// `gate` が閉じている間は launch・confirm_no_process が、`term_gate` が閉じている間は起動した
+    /// プロセスの terminate が戻らない。
     struct RecordingLauncher {
         specs: Mutex<Vec<LaunchSpec>>,
-        terminated: std::sync::Arc<AtomicUsize>,
+        /// launch・confirm_no_process に渡された上限（呼び出し順）。
+        timeouts: Mutex<Vec<Duration>>,
+        terminated: Arc<AtomicUsize>,
         fail: bool,
-        fail_terminate: bool,
+        fail_terminate: AtomicBool,
         /// `confirm_no_process` が生存プロセス無しを確認できるか。
-        confirms_no_process: bool,
+        confirms_no_process: AtomicBool,
+        gate: Arc<Gate>,
+        term_gate: Arc<Gate>,
     }
 
     impl RecordingLauncher {
-        fn new(fail: bool) -> Self {
-            Self {
+        fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self {
                 specs: Mutex::new(Vec::new()),
-                terminated: std::sync::Arc::new(AtomicUsize::new(0)),
+                timeouts: Mutex::new(Vec::new()),
+                terminated: Arc::new(AtomicUsize::new(0)),
                 fail,
-                fail_terminate: false,
-                confirms_no_process: false,
-            }
+                fail_terminate: AtomicBool::new(false),
+                confirms_no_process: AtomicBool::new(false),
+                gate: Gate::new(true),
+                term_gate: Gate::new(true),
+            })
+        }
+
+        fn received_timeouts(&self) -> Vec<Duration> {
+            self.timeouts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
 
         fn calls(&self) -> usize {
@@ -514,7 +717,8 @@ mod tests {
         }
     }
 
-    struct FakeProcess(std::sync::Arc<AtomicUsize>, bool);
+    /// 起動済みプロセスの模擬（terminate の回数を数え、`gate` が開くまで terminate が戻らない）。
+    struct FakeProcess(Arc<AtomicUsize>, bool, Arc<Gate>);
 
     impl LaunchedProcess for FakeProcess {
         fn pid(&self) -> NonZeroU32 {
@@ -522,6 +726,7 @@ mod tests {
         }
 
         fn terminate(&self, _timeout: Duration) -> Result<(), TraitError> {
+            self.2.pass();
             self.0.fetch_add(1, Ordering::SeqCst);
             if self.1 {
                 return Err(TraitError::new(ErrorCode::Timeout, "terminate timed out"));
@@ -531,27 +736,98 @@ mod tests {
     }
 
     impl ProcessLauncher for RecordingLauncher {
-        fn confirm_no_process(&self, _id: &ContainerId) -> Result<(), TraitError> {
-            if self.confirms_no_process {
+        fn confirm_no_process(
+            &self,
+            _id: &ContainerId,
+            timeout: Duration,
+        ) -> Result<(), TraitError> {
+            self.timeouts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(timeout);
+            self.gate.pass();
+            if self.confirms_no_process.load(Ordering::SeqCst) {
                 Ok(())
             } else {
                 Err(TraitError::new(ErrorCode::Unimplemented, "cannot confirm"))
             }
         }
 
-        fn launch(&self, spec: &LaunchSpec) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        fn launch(
+            &self,
+            spec: &LaunchSpec,
+            timeout: Duration,
+        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
             self.specs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(spec.clone());
+            self.timeouts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(timeout);
+            self.gate.pass();
             if self.fail {
                 return Err(TraitError::new(ErrorCode::Internal, "launch failed"));
             }
             Ok(Box::new(FakeProcess(
                 self.terminated.clone(),
-                self.fail_terminate,
+                self.fail_terminate.load(Ordering::SeqCst),
+                self.term_gate.clone(),
             )))
         }
+    }
+
+    /// `Arc<RecordingLauncher>` を start が受ける `Arc<dyn ProcessLauncher>` にする。
+    fn dynl(l: &Arc<RecordingLauncher>) -> Arc<dyn ProcessLauncher> {
+        l.clone()
+    }
+
+    /// 既定の上限で start する。
+    fn run(
+        store: &MemStateStore,
+        launcher: &Arc<RecordingLauncher>,
+        id: &str,
+    ) -> Result<StateRecord, TraitError> {
+        start(
+            store,
+            &OpRecorder::new(),
+            &dynl(launcher),
+            &sid(id),
+            &StartTimeouts::default(),
+        )
+    }
+
+    /// 既定の上限で中断回復する。
+    fn recover(
+        store: &MemStateStore,
+        launcher: &Arc<RecordingLauncher>,
+        id: &ContainerId,
+    ) -> Result<StateRecord, TraitError> {
+        recover_interrupted_start(store, &dynl(launcher), id, &StartTimeouts::default())
+    }
+
+    /// `cond` が真になるまで最大 `limit` ポーリングする（固定 sleep に頼らない）。
+    #[cfg(target_os = "linux")]
+    fn eventually(limit: Duration, cond: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    /// 起動待ち 200ms・終了待ち 1s・確認待ち 200ms の短い上限（REPAIR-5 のテスト用）。
+    fn short_timeouts() -> StartTimeouts {
+        StartTimeouts::new(
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+            Duration::from_millis(200),
+        )
+        .expect("timeouts")
     }
 
     /// テストごとに一意な bundle ディレクトリ（終了時に削除）。
@@ -628,7 +904,7 @@ mod tests {
         let (b, store) = created(name);
         b.write_config(cfg);
         let launcher = RecordingLauncher::new(false);
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid(name)).expect_err("must fail");
+        let err = run(&store, &launcher, name).expect_err("must fail");
         assert_eq!(launcher.calls(), 0);
         let got = store
             .get(&GetStateRequest::new(ContainerId::new(name).expect("id")))
@@ -646,7 +922,7 @@ mod tests {
             .get(&GetStateRequest::new(ContainerId::new("ok").expect("id")))
             .expect("get");
         let launcher = RecordingLauncher::new(false);
-        let record = start(&store, &OpRecorder::new(), &launcher, &sid("ok")).expect("start");
+        let record = run(&store, &launcher, "ok").expect("start");
         assert_eq!(record.status().state(), ContainerState::Running);
         assert_eq!(record.status().pid(), NonZeroU32::new(4242));
         assert!(record.revision() > before.revision());
@@ -657,6 +933,8 @@ mod tests {
         assert_eq!(spec.env(), ["PATH=/bin", "K=V"]);
         assert_eq!(spec.hostname(), Some("box"));
         assert_eq!(spec.rootfs(), b.dir.join("rootfs"));
+        // REPAIR-5: 呼び出し側の上限（既定 30 秒）がそのまま launcher へ渡る。
+        assert_eq!(launcher.received_timeouts(), [Duration::from_secs(30)]);
         assert_eq!(
             spec.namespaces(),
             [
@@ -674,7 +952,7 @@ mod tests {
     fn core2_start_unknown_id_returns_not_found() {
         let store = MemStateStore::new(None);
         let launcher = RecordingLauncher::new(false);
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("nope")).expect_err("fail");
+        let err = run(&store, &launcher, "nope").expect_err("fail");
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert_eq!(launcher.calls(), 0);
     }
@@ -685,8 +963,8 @@ mod tests {
     fn core2_start_twice_returns_failed_precondition() {
         let (_b, store) = created("twice");
         let launcher = RecordingLauncher::new(false);
-        start(&store, &OpRecorder::new(), &launcher, &sid("twice")).expect("first");
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("twice")).expect_err("second");
+        run(&store, &launcher, "twice").expect("first");
+        let err = run(&store, &launcher, "twice").expect_err("second");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(launcher.calls(), 1);
     }
@@ -697,8 +975,7 @@ mod tests {
         let (b, store) = created("rewrite-bad");
         std::fs::write(b.dir.join("config.json"), b"{ not json").expect("write");
         let launcher = RecordingLauncher::new(false);
-        let err =
-            start(&store, &OpRecorder::new(), &launcher, &sid("rewrite-bad")).expect_err("fail");
+        let err = run(&store, &launcher, "rewrite-bad").expect_err("fail");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(launcher.calls(), 0);
     }
@@ -721,8 +998,7 @@ mod tests {
         std::fs::create_dir(b.dir.join("real")).expect("real");
         std::os::unix::fs::symlink(b.dir.join("real"), b.dir.join("rootfs")).expect("symlink");
         let launcher = RecordingLauncher::new(false);
-        let err =
-            start(&store, &OpRecorder::new(), &launcher, &sid("swap-rootfs")).expect_err("fail");
+        let err = run(&store, &launcher, "swap-rootfs").expect_err("fail");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(launcher.calls(), 0);
     }
@@ -804,7 +1080,7 @@ mod tests {
         let store = MemStateStore::new(Some(1));
         create(&store, &OpRecorder::new(), &b.create_req("upd-fail")).expect("create");
         let launcher = RecordingLauncher::new(false);
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("upd-fail")).expect_err("fail");
+        let err = run(&store, &launcher, "upd-fail").expect_err("fail");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(launcher.calls(), 1);
         assert_eq!(launcher.terminations(), 1);
@@ -828,12 +1104,11 @@ mod tests {
         let launcher = RecordingLauncher::new(false);
         let id = ContainerId::new("concurrent").expect("id");
         let guard = StartReservation::acquire(&id).expect("reserve");
-        let err =
-            start(&store, &OpRecorder::new(), &launcher, &sid("concurrent")).expect_err("busy");
+        let err = run(&store, &launcher, "concurrent").expect_err("busy");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(launcher.calls(), 0);
         drop(guard);
-        start(&store, &OpRecorder::new(), &launcher, &sid("concurrent")).expect("after release");
+        run(&store, &launcher, "concurrent").expect("after release");
         assert_eq!(launcher.calls(), 1);
     }
 
@@ -846,10 +1121,9 @@ mod tests {
         std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
         let store = MemStateStore::new(Some(1));
         create(&store, &OpRecorder::new(), &b.create_req("term-fail")).expect("create");
-        let mut launcher = RecordingLauncher::new(false);
-        launcher.fail_terminate = true;
-        let err =
-            start(&store, &OpRecorder::new(), &launcher, &sid("term-fail")).expect_err("fail");
+        let launcher = RecordingLauncher::new(false);
+        launcher.fail_terminate.store(true, Ordering::SeqCst);
+        let err = run(&store, &launcher, "term-fail").expect_err("fail");
         assert_eq!(err.code(), ErrorCode::Internal);
         assert_eq!(launcher.terminations(), 1);
     }
@@ -860,8 +1134,7 @@ mod tests {
     fn oci4_start_propagates_launcher_error_without_state_change() {
         let (_b, store) = created("launch-fail");
         let launcher = RecordingLauncher::new(true);
-        let err =
-            start(&store, &OpRecorder::new(), &launcher, &sid("launch-fail")).expect_err("fail");
+        let err = run(&store, &launcher, "launch-fail").expect_err("fail");
         assert_eq!(err.code(), ErrorCode::Internal);
         let got = store
             .get(&GetStateRequest::new(
@@ -879,8 +1152,22 @@ mod tests {
         let (_b, store) = created("rec");
         let launcher = RecordingLauncher::new(false);
         let rec = OpRecorder::new();
-        start(&store, &rec, &launcher, &sid("rec")).expect("first");
-        start(&store, &rec, &launcher, &sid("rec")).expect_err("second");
+        start(
+            &store,
+            &rec,
+            &dynl(&launcher),
+            &sid("rec"),
+            &StartTimeouts::default(),
+        )
+        .expect("first");
+        start(
+            &store,
+            &rec,
+            &dynl(&launcher),
+            &sid("rec"),
+            &StartTimeouts::default(),
+        )
+        .expect_err("second");
         let stats = rec
             .snapshot_op(&OpName::new("start").expect("name"))
             .expect("recorded");
@@ -935,28 +1222,28 @@ mod tests {
                 rec.revision(),
             ))
             .expect("claim");
-        let mut launcher = RecordingLauncher::new(false);
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("recover")).expect_err("stuck");
+        let launcher = RecordingLauncher::new(false);
+        let err = run(&store, &launcher, "recover").expect_err("stuck");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(
             err.message(),
             "container start was interrupted; recover the start reservation"
         );
         // 生存プロセス無しを確認できない launcher では予約を残す（二重起動防止。SEC-1）。
-        let err = recover_interrupted_start(&store, &launcher, &id).expect_err("unconfirmed");
+        let err = recover(&store, &launcher, &id).expect_err("unconfirmed");
         assert_eq!(err.code(), ErrorCode::Unimplemented);
         let rec = store.get(&GetStateRequest::new(id.clone())).expect("get");
         assert_eq!(rec.status().state(), ContainerState::Running);
-        launcher.confirms_no_process = true;
-        let got = recover_interrupted_start(&store, &launcher, &id).expect("recover");
+        launcher.confirms_no_process.store(true, Ordering::SeqCst);
+        let got = recover(&store, &launcher, &id).expect("recover");
         assert_eq!(got.status().state(), ContainerState::Created);
-        let err = recover_interrupted_start(&store, &launcher, &id).expect_err("not stuck");
+        let err = recover(&store, &launcher, &id).expect_err("not stuck");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         #[cfg(target_os = "linux")]
-        start(&store, &OpRecorder::new(), &launcher, &sid("recover")).expect("start");
+        run(&store, &launcher, "recover").expect("start");
         #[cfg(not(target_os = "linux"))]
         assert_eq!(
-            start(&store, &OpRecorder::new(), &launcher, &sid("recover"))
+            run(&store, &launcher, "recover")
                 .expect_err("no pinning")
                 .code(),
             ErrorCode::Unimplemented
@@ -1024,8 +1311,7 @@ mod tests {
         let store = MemStateStore::new(Some(0));
         create(&store, &OpRecorder::new(), &b.create_req("claim-lost")).expect("create");
         let launcher = RecordingLauncher::new(false);
-        let err =
-            start(&store, &OpRecorder::new(), &launcher, &sid("claim-lost")).expect_err("lost");
+        let err = run(&store, &launcher, "claim-lost").expect_err("lost");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(launcher.calls(), 0);
     }
@@ -1038,7 +1324,7 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let (b, store) = created("handle");
         let launcher = RecordingLauncher::new(false);
-        start(&store, &OpRecorder::new(), &launcher, &sid("handle")).expect("start");
+        run(&store, &launcher, "handle").expect("start");
         let specs = launcher.specs.lock().expect("lock");
         let spec = specs.first().expect("spec");
         let fd = spec.rootfs_dir().as_fd().as_raw_fd();
@@ -1073,7 +1359,7 @@ mod tests {
         )
         .expect("create accepts the bundle");
         let launcher = RecordingLauncher::new(false);
-        let err = start(&store, &OpRecorder::new(), &launcher, &sid("anc")).expect_err("must fail");
+        let err = run(&store, &launcher, "anc").expect_err("must fail");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(
             err.message(),
@@ -1091,8 +1377,7 @@ mod tests {
     fn sec1_start_fails_closed_without_rootfs_pinning() {
         let (_b, store) = created("nolinux");
         let launcher = RecordingLauncher::new(false);
-        let err =
-            start(&store, &OpRecorder::new(), &launcher, &sid("nolinux")).expect_err("must fail");
+        let err = run(&store, &launcher, "nolinux").expect_err("must fail");
         assert_eq!(err.code(), ErrorCode::Unimplemented);
         assert_eq!(
             err.message(),
@@ -1105,5 +1390,126 @@ mod tests {
             ))
             .expect("stored");
         assert_eq!(got.status().state(), ContainerState::Created);
+    }
+
+    /// REPAIR-5・CORE-2: launch が上限内に戻らなければ start は上限＋猶予で Timeout を返し、予約は残す。
+    /// 後から返った起動済みプロセスは 1 回だけ terminate される。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_start_times_out_when_launcher_does_not_return() {
+        let (_b, store) = created("launch-hang");
+        let launcher = RecordingLauncher::new(false);
+        launcher.gate.set_open(false);
+        let begin = Instant::now();
+        let err = start(
+            &store,
+            &OpRecorder::new(),
+            &dynl(&launcher),
+            &sid("launch-hang"),
+            &short_timeouts(),
+        )
+        .expect_err("must time out");
+        let elapsed = begin.elapsed();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(
+            err.message(),
+            "the process launch did not complete within the timeout; \
+             the start reservation remains until recovered"
+        );
+        assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        assert_eq!(launcher.received_timeouts(), [Duration::from_millis(200)]);
+        let id = ContainerId::new("launch-hang").expect("id");
+        let got = store.get(&GetStateRequest::new(id)).expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Running);
+        assert_eq!(got.status().pid(), None);
+        assert_eq!(launcher.terminations(), 0);
+        launcher.gate.set_open(true);
+        assert!(eventually(Duration::from_secs(10), || launcher
+            .terminations()
+            == 1));
+        let err = run(&store, &launcher, "launch-hang").expect_err("reserved");
+        assert_eq!(
+            err.message(),
+            "container start was interrupted; recover the start reservation"
+        );
+        assert_eq!(launcher.calls(), 1);
+    }
+
+    /// REPAIR-5: 状態記録の失敗後に terminate が上限内に戻らなければ、Internal で未記録プロセスの
+    /// 残存を伝え、予約は残す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_start_bounds_terminate_after_record_failure() {
+        let b = Bundle::new("term-hang");
+        b.write_config(&valid_config());
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new(Some(1));
+        create(&store, &OpRecorder::new(), &b.create_req("term-hang")).expect("create");
+        let launcher = RecordingLauncher::new(false);
+        launcher.term_gate.set_open(false);
+        let begin = Instant::now();
+        let err = start(
+            &store,
+            &OpRecorder::new(),
+            &dynl(&launcher),
+            &sid("term-hang"),
+            &short_timeouts(),
+        )
+        .expect_err("must fail");
+        let elapsed = begin.elapsed();
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "failed to record running state and failed to terminate the launched process"
+        );
+        assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        let id = ContainerId::new("term-hang").expect("id");
+        let got = store.get(&GetStateRequest::new(id)).expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Running);
+        assert_eq!(got.status().pid(), None);
+        launcher.term_gate.set_open(true);
+        assert!(eventually(Duration::from_secs(10), || launcher
+            .terminations()
+            == 1));
+    }
+
+    /// REPAIR-5・CORE-2: 生存確認が上限内に戻らなければ回復は Timeout を返して予約を残し、
+    /// 確認が戻るようになれば回復できる。
+    #[test]
+    fn repair5_recover_times_out_when_confirmation_does_not_return() {
+        let (_b, store) = created("confirm-hang");
+        let id = ContainerId::new("confirm-hang").expect("id");
+        let rec = store.get(&GetStateRequest::new(id.clone())).expect("get");
+        store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(id.clone(), None),
+                rec.revision(),
+            ))
+            .expect("claim");
+        let launcher = RecordingLauncher::new(false);
+        launcher.confirms_no_process.store(true, Ordering::SeqCst);
+        launcher.gate.set_open(false);
+        let begin = Instant::now();
+        let err = recover_interrupted_start(&store, &dynl(&launcher), &id, &short_timeouts())
+            .expect_err("must time out");
+        let elapsed = begin.elapsed();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(
+            err.message(),
+            "the launcher did not confirm within the timeout; the start reservation remains"
+        );
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        assert_eq!(launcher.received_timeouts(), [Duration::from_millis(200)]);
+        let got = store.get(&GetStateRequest::new(id.clone())).expect("get");
+        assert_eq!(got.status().state(), ContainerState::Running);
+        launcher.gate.set_open(true);
+        let got = recover(&store, &launcher, &id).expect("recover");
+        assert_eq!(got.status().state(), ContainerState::Created);
+        assert_eq!(
+            launcher.received_timeouts(),
+            [Duration::from_millis(200), Duration::from_secs(10)]
+        );
     }
 }

@@ -720,6 +720,12 @@ impl ContainerChild {
         }
     }
 
+    /// 任意の pid からハンドルを作る（crate 内テスト専用。`oci_runtime` のアダプタの試験に使う）。
+    #[cfg(test)]
+    pub(crate) fn from_pid_for_test(pid: u32) -> Self {
+        Self::new(pid)
+    }
+
     /// 子のプロセス ID（親の PID namespace での値）。回収済みなら別プロセスに再利用され得る。
     pub fn pid(&self) -> u32 {
         self.pid

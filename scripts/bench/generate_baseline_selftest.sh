@@ -111,6 +111,32 @@ else
   fail "output-symlink (exit=${actual})"
 fi
 
+# 出力先が入力ファイルと同一（同一パス・別表記・ハードリンク）→ 拒否し、入力を書き換えない
+cp "${fx}/metrics.json" "${work}/in-metrics.json"
+cp "${fx}/results-all.json" "${work}/in-results.json"
+ln "${work}/in-results.json" "${work}/hardlink-results.json"
+mkdir -p "${work}/sub"
+same_case() {
+  local name="$1" out="$2" want_file="$3"
+  shift 3
+  local before actual=0
+  before="$(cat "$want_file")"
+  bash "$gen" --output "$out" "$@" >/dev/null 2>&1 || actual=$?
+  if [ "$actual" -eq 2 ] && [ "$(cat "$want_file")" = "$before" ]; then
+    pass "${name} (exit=2, input untouched)"
+  else
+    fail "${name} (exit=${actual})"
+  fi
+}
+same_case "output-same-as-metrics" "${work}/in-metrics.json" "${work}/in-metrics.json" \
+  --metrics "${work}/in-metrics.json" "${fx}/results-all.json"
+same_case "output-same-as-results" "${work}/in-results.json" "${work}/in-results.json" \
+  --metrics "${fx}/metrics.json" "${work}/in-results.json"
+same_case "output-same-as-input-alt-path" "${work}/sub/../in-results.json" "${work}/in-results.json" \
+  --metrics "${fx}/metrics.json" "${work}/in-results.json"
+same_case "output-hardlink-of-input" "${work}/hardlink-results.json" "${work}/in-results.json" \
+  --metrics "${fx}/metrics.json" "${work}/in-results.json"
+
 # SOURCE_DATE_EPOCH が非数値 → 入力エラー
 actual=0
 SOURCE_DATE_EPOCH=abc bash "$gen" --metrics "${fx}/metrics.json" --output "${work}/out.json" "${fx}/results-all.json" >/dev/null 2>&1 || actual=$?

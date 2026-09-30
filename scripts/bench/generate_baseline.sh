@@ -168,6 +168,18 @@ fi
 out_name="$(basename -- "$output_file")"
 final_path="${out_dir}/${out_name}"
 
+# 出力先が入力（metrics / results）と同一ファイルなら拒否する。最終の mv が入力を baseline JSON で
+# 上書きしてしまうため。`-ef` は同一 inode（相対・絶対パス表記の違い、`..` 経由、ハードリンクを含む）で判定する。
+# 入力は check_input_file で symlink を拒否済みのため、物理パスでの同一性と等価。
+if [ -e "$final_path" ]; then
+  for in_path in "$metrics_file" "${results_files[@]}"; do
+    if [ "$in_path" -ef "$final_path" ]; then
+      err "invalid-output" "$output_file is the same file as input $in_path, refusing to overwrite"
+      exit 2
+    fi
+  done
+fi
+
 # shellcheck disable=SC2016 # $name 等は jq 側の変数参照（シェル展開させない）。
 jq_program='
 def valid_name: test("^[a-z0-9_]{1,64}$");

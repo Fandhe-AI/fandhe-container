@@ -18,6 +18,8 @@
 //! さらに `exec/capabilities.rs` の `apply_default_capabilities`（SEC-1・TASK-37.1・#172）が `capget(2)`・`capset(2)`
 //! （`syscall(2)` 経由）と `prctl(2)` の capability 系オプションを呼ぶ（スレッド単位の操作で、
 //! `fork_single_threaded` による単一スレッドの子で呼ぶ前提）。
+//! さらに `crate::exec::seccomp` の `apply_seccomp_filter`（CORE-5・TASK-38.2・#177）が
+//! `prctl(PR_SET_SECCOMP)` / `prctl(PR_GET_SECCOMP)` を呼ぶ（呼び出したスレッドへのフィルタ追加。不可逆）。
 //! さらに `crate::landlock::detect_landlock_abi`（CORE-5・TASK-39.1・#181）が `landlock_create_ruleset(2)`
 //! （`syscall(2)` 経由。ABI バージョン問い合わせのみ）を呼ぶ。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。std だけでは提供されない
@@ -42,6 +44,7 @@
 
 #![cfg(target_os = "linux")]
 
+use crate::seccomp::{BpfInstruction, SeccompProgram};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd};
@@ -158,6 +161,12 @@ mod consts {
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 
+    // include/uapi/linux/prctl.h の `PR_GET_SECCOMP`（21）・`PR_SET_SECCOMP`（22）と
+    // include/uapi/linux/seccomp.h の `SECCOMP_MODE_FILTER`（2。可変長引数で渡すため u64）。
+    pub const PR_GET_SECCOMP: i32 = 21;
+    pub const PR_SET_SECCOMP: i32 = 22;
+    pub const SECCOMP_MODE_FILTER: u64 = 2;
+
     // capability 操作（TASK-37.1・#172）。`SYS_CAPGET` / `SYS_CAPSET` は glibc がラッパーを
     // 公開しないため `syscall(2)` 経由で呼ぶ。出典: x86_64 は arch/x86/entry/syscalls/syscall_64.tbl、
     // aarch64 は include/uapi/asm-generic/unistd.h。
@@ -257,6 +266,12 @@ mod consts {
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 
+    // include/uapi/linux/prctl.h の `PR_GET_SECCOMP`（21）・`PR_SET_SECCOMP`（22）と
+    // include/uapi/linux/seccomp.h の `SECCOMP_MODE_FILTER`（2。可変長引数で渡すため u64）。
+    pub const PR_GET_SECCOMP: i32 = 21;
+    pub const PR_SET_SECCOMP: i32 = 22;
+    pub const SECCOMP_MODE_FILTER: u64 = 2;
+
     // capability 操作（TASK-37.1・#172）。`SYS_CAPGET` / `SYS_CAPSET` は glibc がラッパーを
     // 公開しないため `syscall(2)` 経由で呼ぶ。出典: x86_64 は arch/x86/entry/syscalls/syscall_64.tbl、
     // aarch64 は include/uapi/asm-generic/unistd.h。
@@ -329,6 +344,11 @@ mod consts {
 
     pub const PR_SET_NO_NEW_PRIVS: i32 = 0;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 0;
+
+    // seccomp 適用の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
+    pub const PR_GET_SECCOMP: i32 = 0;
+    pub const PR_SET_SECCOMP: i32 = 0;
+    pub const SECCOMP_MODE_FILTER: u64 = 0;
 
     // capability 操作（TASK-37.1・#172）。`SYS_CAPGET` / `SYS_CAPSET` は glibc がラッパーを
     // 公開しないため `syscall(2)` 経由で呼ぶ。出典: x86_64 は arch/x86/entry/syscalls/syscall_64.tbl、
@@ -1088,6 +1108,62 @@ pub(crate) fn no_new_privs_enabled() -> Result<bool, SysError> {
     }
 }
 
+/// `struct sock_fprog`（include/uapi/linux/filter.h）。LP64 では `len` の後に 6 バイトの
+/// パディングが入り、`filter` はオフセット 8、全体 16 バイト。
+#[repr(C)]
+struct SockFprog {
+    len: u16,
+    filter: *const BpfInstruction,
+}
+
+/// 呼び出したスレッドへ seccomp フィルタを追加する（`prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`。
+/// CORE-5・TASK-38.2・#177）。
+///
+/// `crate::exec::seccomp` の `apply_seccomp_filter` だけが呼ぶ。適用は不可逆で呼び出しスレッドにのみ
+/// 効く。`NO_NEW_PRIVS` の事前確認は呼び出し側の契約（本関数は検証しない）。命令列は型
+/// （[`SeccompProgram`]）により 1 以上 4096 以下が保証される。
+pub(crate) fn seccomp_set_filter(program: &SeccompProgram) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let insns = program.instructions();
+    let Ok(len) = u16::try_from(insns.len()) else {
+        return Err(SysError::Os(EINVAL));
+    };
+    let fprog = SockFprog {
+        len,
+        filter: insns.as_ptr(),
+    };
+    // SAFETY: `fprog` と `insns`（`program` が所有）は呼び出し中生存する。カーネルは
+    // `seccomp_prepare_filter` で命令列をコピーし、呼び出し後にポインタを保持しない。`len` は実際の
+    // 命令数と一致し非ゼロ・4096 以下（`SeccompProgram` の型保証）。`BpfInstruction` は `repr(C)` で
+    // `struct sock_filter` と同一レイアウト（テストでサイズを照合）。ポインタはレジスタ幅の値として
+    // 可変長引数に渡す。副作用は呼び出しスレッドへのフィルタ追加のみ。
+    let rc = unsafe {
+        prctl(
+            consts::PR_SET_SECCOMP,
+            consts::SECCOMP_MODE_FILTER,
+            &fprog as *const SockFprog as usize as u64,
+            0u64,
+            0u64,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出したスレッドの seccomp モード（`PR_GET_SECCOMP`。0 = 無効・1 = strict・2 = filter）を返す。
+pub(crate) fn seccomp_mode() -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。読み取りだけで状態を変えない。
+    let rc = unsafe { prctl(consts::PR_GET_SECCOMP, 0u64, 0u64, 0u64, 0u64) };
+    if rc == -1 {
+        return Err(last_error());
+    }
+    u32::try_from(rc).map_err(|_| SysError::Os(EINVAL))
+}
+
 /// `capget(2)` / `capset(2)` のヘッダ（`struct __user_cap_header_struct`）。
 #[repr(C)]
 struct CapUserHeader {
@@ -1343,6 +1419,18 @@ mod tests {
     fn sec1_cap_bounding_read_beyond_last_cap_is_einval() {
         assert_eq!(cap_bounding_contains(63), Err(SysError::Os(EINVAL)));
         assert_eq!(cap_bounding_contains(0).map(|_| ()), Ok(()));
+    }
+
+    /// CORE-5・TASK-38.2: seccomp 適用の定数とレイアウトの具体値。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core5_seccomp_prctl_consts_and_layout_are_exact() {
+        assert_eq!(consts::PR_GET_SECCOMP, 21);
+        assert_eq!(consts::PR_SET_SECCOMP, 22);
+        assert_eq!(consts::SECCOMP_MODE_FILTER, 2);
+        assert_eq!(std::mem::size_of::<BpfInstruction>(), 8);
+        assert_eq!(std::mem::size_of::<SockFprog>(), 16);
+        assert_eq!(std::mem::offset_of!(SockFprog, filter), 8);
     }
 
     /// CORE-1・TASK-27.4.3: `prctl` オプションの具体値（include/uapi/linux/prctl.h）。

@@ -85,3 +85,12 @@ harness = false
 name = "rootless"
 path = "tests/rootless.rs"
 harness = false
+
+# rootless でコンテナ（PID 1・pivot 済み rootfs）内 root が作るファイルのホスト側所有者を照合する
+# ESC-09 相当の結合試験（CORE-6・SEC-5・TASK-44）。libtest のマルチスレッドでは CLONE_NEWUSER が
+# 拒否されるため単一スレッド main の harness = false。`-- --ignored` 指定時のみ実行する
+# 実機前提テスト（AGENTS.md）。
+[[test]]
+name = "rootless_uid_mapping"
+path = "tests/rootless_uid_mapping.rs"
+harness = false

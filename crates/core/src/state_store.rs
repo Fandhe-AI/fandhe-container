@@ -1024,7 +1024,69 @@ impl StateDto {
     }
 }
 
+/// 3 OS 共通の試験（状態ルートの解決規則と、Linux 以外での fail-closed。OCI-5・CLI-1）。
 #[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    fn code<T: std::fmt::Debug>(r: Result<T, TraitError>) -> &'static str {
+        r.unwrap_err().code().as_str()
+    }
+
+    #[test]
+    fn oci5_root_path_resolution() {
+        assert_eq!(
+            resolve_default(true, None).unwrap(),
+            PathBuf::from("/run/fandhe-container")
+        );
+        // Windows では "/run/user/1000" が絶対パスでないため、OS ごとの絶対パスを使う。
+        let xdg = std::env::temp_dir();
+        assert_eq!(
+            resolve_default(false, Some(xdg.clone().into_os_string())).unwrap(),
+            xdg.join("fandhe-container")
+        );
+        for bad in [
+            None,
+            Some(OsString::new()),
+            Some(OsString::from("run/user")),
+        ] {
+            assert_eq!(code(resolve_default(false, bad)), "FAILED_PRECONDITION");
+        }
+    }
+
+    #[test]
+    fn oci5_override_must_be_absolute() {
+        assert_eq!(
+            code(StateRoot::from_override(PathBuf::from("relative/root"))),
+            "INVALID_ARGUMENT"
+        );
+        assert_eq!(
+            code(StateRoot::resolve(Some(PathBuf::from("x")))),
+            "INVALID_ARGUMENT"
+        );
+    }
+
+    /// OCI-5・CLI-1: Linux 以外では状態ルートを作らずに `Unimplemented` を返す（信頼境界を
+    /// 検査できないため。start の `BundleLock::acquire` と同じ扱い）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn oci5_open_is_unimplemented_outside_linux() {
+        let root =
+            std::env::temp_dir().join(format!("fandhe-state-store-nolinux-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let e = FileStateStore::open(StateRoot::from_override(root.clone()).unwrap()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Unimplemented);
+        assert_eq!(
+            e.message(),
+            "file state store requires Linux to verify the state root"
+        );
+        assert!(!root.exists());
+    }
+}
+
+/// ストアを開く試験（Linux 限定。他 OS では `open` が `Unimplemented` を返し、その挙動は
+/// `platform_tests` が照合する。モジュール doc「対応プラットフォーム」）。
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::traits::ContainerState;
@@ -1047,7 +1109,6 @@ mod tests {
             let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(&p).unwrap();
             // umask に依存せず、状態ルートとして信頼できるモード（0700）に固定する。
-            #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1088,39 +1149,6 @@ mod tests {
 
     fn list_req(n: u32) -> ListStateRequest {
         ListStateRequest::new(NonZeroU32::new(n).unwrap()).unwrap()
-    }
-
-    #[test]
-    fn oci5_root_path_resolution() {
-        assert_eq!(
-            resolve_default(true, None).unwrap(),
-            PathBuf::from("/run/fandhe-container")
-        );
-        // Windows では "/run/user/1000" が絶対パスでないため、OS ごとの絶対パスを使う。
-        let xdg = std::env::temp_dir();
-        assert_eq!(
-            resolve_default(false, Some(xdg.clone().into_os_string())).unwrap(),
-            xdg.join("fandhe-container")
-        );
-        for bad in [
-            None,
-            Some(OsString::new()),
-            Some(OsString::from("run/user")),
-        ] {
-            assert_eq!(code(resolve_default(false, bad)), "FAILED_PRECONDITION");
-        }
-    }
-
-    #[test]
-    fn oci5_override_must_be_absolute() {
-        assert_eq!(
-            code(StateRoot::from_override(PathBuf::from("relative/root"))),
-            "INVALID_ARGUMENT"
-        );
-        assert_eq!(
-            code(StateRoot::resolve(Some(PathBuf::from("x")))),
-            "INVALID_ARGUMENT"
-        );
     }
 
     #[test]
@@ -1252,7 +1280,6 @@ mod tests {
         }
         let residue = t.path().join("residue");
         fs::create_dir(&residue).unwrap();
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&residue, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1340,7 +1367,6 @@ mod tests {
         let store = t.open();
         let resid = t.path().join("a");
         fs::create_dir(&resid).unwrap();
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&resid, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1349,7 +1375,6 @@ mod tests {
     }
 
     /// OCI-5: 他ユーザーがアクセスできる残存ディレクトリは再利用・読み取りとも拒否する。
-    #[cfg(unix)]
     #[test]
     fn oci5_create_rejects_group_accessible_residual_dir() {
         use std::os::unix::fs::PermissionsExt;
@@ -1508,7 +1533,6 @@ mod tests {
     }
 
     /// OCI-5: 権限不備のレコードは破損として列挙・削除せず、list も get と同じくエラーを返す。
-    #[cfg(unix)]
     #[test]
     fn oci5_permission_error_is_not_treated_as_corruption() {
         use std::os::unix::fs::PermissionsExt;
@@ -1540,7 +1564,6 @@ mod tests {
     }
 
     /// OCI-5: symlink 化した状態エントリは list でもエラーにする（黙って除外しない）。
-    #[cfg(unix)]
     #[test]
     fn oci5_list_reports_symlinked_entry() {
         let t = TmpDir::new("listsymlink");
@@ -1577,7 +1600,6 @@ mod tests {
         assert!(started.elapsed() < STATE_LOCK_TIMEOUT + Duration::from_secs(5));
     }
 
-    #[cfg(unix)]
     #[test]
     fn oci5_lock_file_is_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
@@ -1592,7 +1614,6 @@ mod tests {
     }
 
     /// 親ディレクトリが group / other 書き込み可（sticky なし）なら拒否する。
-    #[cfg(unix)]
     #[test]
     fn oci5_writable_ancestor_is_rejected() {
         use std::os::unix::fs::PermissionsExt;
@@ -1626,7 +1647,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn oci5_open_rejects_unsafe_root_and_creates_0700() {
         use std::os::unix::fs::{PermissionsExt, symlink};

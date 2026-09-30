@@ -22,7 +22,9 @@
 //! 6. launcher 起動（上限 [`StartTimeouts::launch`]）。失敗時は予約を Created へ戻す（戻せない場合は
 //!    `Internal` で伝える）。上限を超えたら待つのをやめて `Timeout` を返し、予約は残す（launch がまだ
 //!    進行中で、プロセスが後から現れ得るため Created へ戻さない）。後から返ってきた起動済みプロセスは
-//!    後始末スレッドが [`LaunchedProcess::terminate`] で kill・回収する
+//!    後始末スレッドが [`LaunchedProcess::terminate`]（上限 [`StartTimeouts::terminate`] を強制）で
+//!    kill・回収する。launch と後始末が終わるまでプロセス内の予約（`StartReservation`）も保持し、
+//!    同一プロセス内の start・回復を拒否する（進行中の launch との二重起動防止。CORE-2）
 //! 7. Running（pid 付き）へ状態更新。更新に失敗した場合は起動済みプロセスを上限
 //!    [`StartTimeouts::terminate`] つきで終了し、予約を Created へ戻してから、元のエラーを返す。
 //!    終了にも失敗した・上限を超えた場合は、未記録プロセスが残り得ることを示す `Internal` を返し、
@@ -214,6 +216,11 @@ fn in_flight() -> &'static Mutex<HashSet<ContainerId>> {
 }
 
 /// ID の予約。Drop で解放する（全終了経路・panic でも残さない）。
+///
+/// start は `Arc` で包み、上限を超えた launch の実行スレッドにも複製を持たせる。予約は最後の複製が
+/// 落ちるまで（＝start が戻り、かつ進行中の launch と遅れて返ったプロセスの後始末が終わるまで）解放
+/// されないため、その間の同一プロセス内の start・[`recover_interrupted_start`] は `FailedPrecondition`
+/// で拒否される（進行中の launch が後からプロセスを作る二重起動を防ぐ。CORE-2・SEC-1）。
 struct StartReservation(ContainerId);
 
 impl StartReservation {
@@ -240,9 +247,14 @@ impl Drop for StartReservation {
 ///
 /// start は launch 前に状態を Running・pid なしへ更新して起動権を予約する。プロセスが launch 中に
 /// 異常終了すると予約だけが残り、次の start は `FailedPrecondition` で拒否される。本関数はその状態を
-/// revision 照合つきで Created へ戻す。呼び出し元は、対象コンテナの start が実行中でないこと
-/// （前回の start プロセスが終了済みであること）を確認してから呼ぶ。同一プロセス内の start とは
-/// 排他する。Running・pid なし以外の状態は `FailedPrecondition`、不在は `NotFound`。
+/// revision 照合つきで Created へ戻す。Running・pid なし以外の状態は `FailedPrecondition`、不在は
+/// `NotFound`。
+///
+/// 同一プロセス内の start とは排他する。launch が上限を超えて start が `Timeout` で戻った後も、その
+/// launch が終わり遅れて返ったプロセスの後始末が済むまでは予約が解放されず、本関数は
+/// `FailedPrecondition`（`container start is already in progress`）で拒否する（CORE-2）。別プロセスで
+/// 実行された start については、呼び出し元がそのプロセスの終了（＝進行中の launch が無いこと）を
+/// 確認してから呼ぶ（start が `Timeout` で戻っても、そのプロセス内では launch が続き得る）。
 ///
 /// launch 後・pid 記録前の中断では生きたプロセスが残り得るため、Created へ戻す前に
 /// [`ProcessLauncher::confirm_no_process`] で生存プロセスが無いことを確認する。確認できない場合
@@ -298,7 +310,7 @@ fn start_inner(
     req: &StartRequest,
     timeouts: &StartTimeouts,
 ) -> Result<StateRecord, TraitError> {
-    let _reservation = StartReservation::acquire(req.id())?;
+    let reservation = Arc::new(StartReservation::acquire(req.id())?);
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     if record.status().state() != ContainerState::Created {
         // Running・pid なしは start の起動権予約が残った状態（中断・クラッシュ後）。識別できる
@@ -326,14 +338,14 @@ fn start_inner(
     let launch_timeout = timeouts.launch();
     let terminate_timeout = timeouts.terminate();
     let l = Arc::clone(launcher);
+    // 実行スレッドが launch を終えて後始末を済ませるまで、プロセス内の予約を保持する（CORE-2）。
+    let hold = Arc::clone(&reservation);
     let launched = call_bounded(
         launch_timeout,
         move || l.launch(&spec, launch_timeout),
-        // 上限超過後に起動済みプロセスが返ってきたら kill・回収する（状態には記録されていないため）。
         move |late: Result<Box<dyn LaunchedProcess>, TraitError>| {
-            if let Ok(process) = late {
-                let _ = process.terminate(terminate_timeout);
-            }
+            late_launch_cleanup(late, terminate_timeout);
+            drop(hold);
         },
     );
     let process = match launched {
@@ -373,6 +385,26 @@ fn start_inner(
                 )),
             }
         }
+    }
+}
+
+/// 上限超過後に返ってきた launch の結果を後始末する（`call_bounded` の実行スレッド上で呼ばれる）。
+///
+/// 起動済みプロセスは状態に記録されていないため kill・回収する。この terminate にも上限
+/// `terminate_timeout` を呼び出し境界で強制し、戻らない実装でも有限時間で予約（プロセス内）を手放す。
+/// 終了を確認できなかった場合も、状態には start が残した起動権の予約（Running・pid なし）が残るため、
+/// 回復は [`recover_interrupted_start`]（`confirm_no_process` による生存確認つき）に限られる
+/// （回復可能な失敗状態として保持する。REPAIR-5・CORE-2）。
+fn late_launch_cleanup(
+    late: Result<Box<dyn LaunchedProcess>, TraitError>,
+    terminate_timeout: Duration,
+) {
+    if let Ok(process) = late {
+        let _ = call_bounded(
+            terminate_timeout,
+            move || process.terminate(terminate_timeout),
+            drop,
+        );
     }
 }
 
@@ -1393,7 +1425,8 @@ mod tests {
     }
 
     /// REPAIR-5・CORE-2: launch が上限内に戻らなければ start は上限＋猶予で Timeout を返し、予約は残す。
-    /// 後から返った起動済みプロセスは 1 回だけ terminate される。
+    /// launch が進行中の間はプロセス内の予約も保持され、同一 ID の start・回復は拒否される（二重起動防止）。
+    /// 後から返った起動済みプロセスは 1 回だけ terminate され、その後は回復できる。
     #[cfg(target_os = "linux")]
     #[test]
     fn repair5_start_times_out_when_launcher_does_not_return() {
@@ -1424,16 +1457,69 @@ mod tests {
         assert_eq!(got.status().state(), ContainerState::Running);
         assert_eq!(got.status().pid(), None);
         assert_eq!(launcher.terminations(), 0);
+        // launch が進行中の間は、生存確認が「プロセスなし」を返す launcher でも回復・再 start を拒否する。
+        launcher.confirms_no_process.store(true, Ordering::SeqCst);
+        let id = ContainerId::new("launch-hang").expect("id");
+        let err = recover(&store, &launcher, &id).expect_err("launch in flight");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), "container start is already in progress");
+        let err = run(&store, &launcher, "launch-hang").expect_err("launch in flight");
+        assert_eq!(err.message(), "container start is already in progress");
+        assert_eq!(launcher.received_timeouts(), [Duration::from_millis(200)]);
         launcher.gate.set_open(true);
         assert!(eventually(Duration::from_secs(10), || launcher
             .terminations()
             == 1));
-        let err = run(&store, &launcher, "launch-hang").expect_err("reserved");
-        assert_eq!(
-            err.message(),
-            "container start was interrupted; recover the start reservation"
-        );
+        assert!(eventually(Duration::from_secs(10), || {
+            run(&store, &launcher, "launch-hang").is_err_and(|e| {
+                e.message() == "container start was interrupted; recover the start reservation"
+            })
+        }));
+        let got = recover(&store, &launcher, &id).expect("recover after the launch ended");
+        assert_eq!(got.status().state(), ContainerState::Created);
         assert_eq!(launcher.calls(), 1);
+    }
+
+    /// REPAIR-5・CORE-2: 上限超過後に返った起動済みプロセスの terminate も上限で打ち切り、プロセス内の
+    /// 予約を有限時間で手放す。終了を確認できないため状態の予約（Running・pid なし）は残す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_late_terminate_is_bounded_and_keeps_reservation() {
+        let (_b, store) = created("late-term-hang");
+        let launcher = RecordingLauncher::new(false);
+        launcher.gate.set_open(false);
+        launcher.term_gate.set_open(false);
+        let err = start(
+            &store,
+            &OpRecorder::new(),
+            &dynl(&launcher),
+            &sid("late-term-hang"),
+            &short_timeouts(),
+        )
+        .expect_err("must time out");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        launcher.gate.set_open(true);
+        let begin = Instant::now();
+        // 遅れて返ったプロセスの terminate が戻らなくても、上限 1 秒＋猶予 1 秒でプロセス内の予約が外れる。
+        assert!(eventually(Duration::from_secs(10), || {
+            run(&store, &launcher, "late-term-hang").is_err_and(|e| {
+                e.message() == "container start was interrupted; recover the start reservation"
+            })
+        }));
+        assert!(
+            begin.elapsed() >= Duration::from_secs(1),
+            "{:?}",
+            begin.elapsed()
+        );
+        assert_eq!(launcher.terminations(), 0);
+        let id = ContainerId::new("late-term-hang").expect("id");
+        let got = store.get(&GetStateRequest::new(id)).expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Running);
+        assert_eq!(got.status().pid(), None);
+        launcher.term_gate.set_open(true);
+        assert!(eventually(Duration::from_secs(10), || launcher
+            .terminations()
+            == 1));
     }
 
     /// REPAIR-5: 状態記録の失敗後に terminate が上限内に戻らなければ、Internal で未記録プロセスの

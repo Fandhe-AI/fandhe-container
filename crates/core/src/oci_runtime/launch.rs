@@ -369,6 +369,9 @@ pub trait ProcessLauncher: Send + Sync {
     /// `recover_interrupted_start` は予約を Created へ戻す前に本メソッドを呼び、`Ok(())` のときだけ戻す
     /// （戻すと同じ ID の二重起動が可能になるため）。実装は、`id` のプロセスが存在しないと確証できる場合、
     /// または存在する場合に終了・回収したうえで `Ok(())` を返し、確証できない場合は `Err` を返すこと。
+    /// 別プロセスで実行された start の launch が進行中であり得る場合（そのプロセスが生存している等）も、
+    /// 後からプロセスが現れ得るため確証できないとして `Err` を返すこと（同一プロセス内の進行中の launch は
+    /// start 側の予約が排他する）。
     /// 既定実装は確認手段を持たないため fail-closed で `Unimplemented` を返す。待ちは `timeout` まで。
     fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
         let _ = (id, timeout);

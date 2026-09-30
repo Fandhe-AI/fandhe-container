@@ -5,8 +5,9 @@
 //! （[`create_default_devices`]。#834・TASK-27.6）、fork / exec による子プロセス
 //! 起動（[`spawn_container`]・[`exec_entrypoint`]。#831・TASK-27.4.1）と、順序固定のステージ列の枠
 //! （[`StagePipeline`]。#832・TASK-27.4.2。`exec/stages.rs`）まで実装済み。各段の実体
-//! （`PR_SET_NO_NEW_PRIVS`〔#833〕・cgroup 参加・capability 削減・Landlock・seccomp）と制限適用の
-//! 証跡は未実装で、後続の sub-issue（#137・#833、TASK-32・37〜40）が追記する（REPAIR-3: 実装済みを装わない）。
+//! のうち `PR_SET_NO_NEW_PRIVS` は組み込みの固定ステージとして実装済み（#833・TASK-27.4.3。
+//! `exec/no_new_privs.rs`）。cgroup 参加・capability 削減・Landlock・seccomp と制限適用の
+//! 証跡は未実装で、後続の sub-issue（#137、TASK-32・37〜40）が追記する（REPAIR-3: 実装済みを装わない）。
 //!
 //! # 目指すフロー（Linux 専用）
 //!
@@ -17,9 +18,10 @@
 //!    [`prepare_rootfs`] の後・[`pivot_root`] の前に呼ぶ。rootless では `mknod` が `EPERM` になり
 //!    `PermissionDenied` で fail-closed する。ホスト `/dev` の bind mount による代替は未実装）
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
-//!    → Landlock → seccomp（#136・#832・#833。**枠は実装済み**: [`StagePipeline`] が
-//!    [`StageKind::ORDER`] の固定順でフックを呼ぶ。各段の実体は未実装で、後続の TASK-32・37・38・39・40
-//!    と #833 が [`StageHook`] として差し込む）。
+//!    → Landlock → seccomp（#136・#832・#833。**枠と `NO_NEW_PRIVS` は実装済み**: [`StagePipeline`] が
+//!    [`StageKind::ORDER`] の固定順でフックを呼び、`NO_NEW_PRIVS` は差し替え不可の組み込み段として
+//!    常に適用する。他の段の実体は未実装で、後続の TASK-32・37・38・39・40 が [`StageHook`] として
+//!    差し込む）。
 //!    `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
 //!    後続実装はこの順序を崩さない
 //! 5. `fork` / `exec`（#831・TASK-27.4.1。**最小構成のみ実装済み**。[`spawn_container`] が分離済みの
@@ -75,6 +77,7 @@ use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
 
 mod devices;
+mod no_new_privs;
 mod process;
 mod rootfs;
 mod stages;

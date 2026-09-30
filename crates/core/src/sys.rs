@@ -12,6 +12,7 @@
 //! を呼ぶために使う。さらに fork / exec 段（CORE-1・TASK-27.4.1・#831）の `crate::exec::spawn_container`・
 //! `crate::exec::exec_entrypoint`・`crate::exec::ContainerChild` が、`fork(2)`・`_exit(2)`・`execveat(2)`・
 //! `waitpid(2)`・`kill(2)`・`signal(2)` と `close_range(2)`（`syscall(2)` 経由）を呼ぶために使う。
+//! さらに固定ステージ `crate::exec::no_new_privs`（CORE-1・TASK-27.4.3・#833）が `prctl(2)` を呼ぶ。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。std だけでは提供されない
 //! syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
 //! （`Hostname` 等）が済ませた値だけを受け取る。
@@ -133,6 +134,11 @@ mod consts {
     pub const ENOSYS: i32 = 38;
     // include/uapi/linux/stat.h の `S_IFCHR`（文字デバイス。全アーキテクチャ共通）。
     pub const S_IFCHR: u32 = 0o020_000;
+
+    // include/uapi/linux/prctl.h の `PR_SET_NO_NEW_PRIVS`（38）・`PR_GET_NO_NEW_PRIVS`（39）。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
+    pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -201,6 +207,11 @@ mod consts {
     pub const ENOSYS: i32 = 38;
     // include/uapi/linux/stat.h の `S_IFCHR`（文字デバイス。全アーキテクチャ共通）。
     pub const S_IFCHR: u32 = 0o020_000;
+
+    // include/uapi/linux/prctl.h の `PR_SET_NO_NEW_PRIVS`（38）・`PR_GET_NO_NEW_PRIVS`（39）。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
+    pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 }
 
 /// 対応外アーキテクチャ: 定数は 0 で、ラッパーは `Unsupported` を返す。errno は実在しない
@@ -251,6 +262,9 @@ mod consts {
     pub const ENOSYS: i32 = -12;
     pub const EBADF: i32 = -13;
     pub const S_IFCHR: u32 = 0;
+
+    pub const PR_SET_NO_NEW_PRIVS: i32 = 0;
+    pub const PR_GET_NO_NEW_PRIVS: i32 = 0;
 }
 
 /// `openat(2)` の `AT_FDCWD`（絶対パス指定時は dirfd が無視される）。値は
@@ -332,6 +346,10 @@ unsafe extern "C" {
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int dup2(int oldfd, int newfd)`。
     fn dup2(oldfd: i32, newfd: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`（glibc / musl）。可変長引数として
+    // 宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
+    // 可変長部は `unsigned long`（LP64 で u64）なので呼び出し側は u64 で渡す。
+    fn prctl(option: i32, ...) -> i32;
 }
 
 /// 直前の失敗した syscall の errno を `SysError` にする（失敗直後に呼ぶこと）。
@@ -903,6 +921,36 @@ pub(crate) fn kill_pid(pid: u32, sig: Signal) -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 呼び出したスレッドに `PR_SET_NO_NEW_PRIVS` を立てる（CORE-1・TASK-27.4.3・#833）。
+///
+/// `crate::exec` の固定ステージ `no_new_privs` だけが呼ぶ。フラグはスレッド単位で、fork・clone・
+/// execve を越えて継承され、解除できない。arg3〜5 が 0 でないとカーネルは `EINVAL` を返す。
+pub(crate) fn set_no_new_privs() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 の 0 を
+    // 4 つ渡す（arg2 = 1 で有効化）。呼び出したスレッドのフラグを立てるだけでメモリには触れない。
+    let rc = unsafe { prctl(consts::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出したスレッドの `NO_NEW_PRIVS` が立っているかを返す（`PR_GET_NO_NEW_PRIVS`）。
+pub(crate) fn no_new_privs_enabled() -> Result<bool, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。arg2〜5 はすべて 0 でなければカーネルが `EINVAL`
+    // を返す。読み取りだけで状態を変えない。
+    let rc = unsafe { prctl(consts::PR_GET_NO_NEW_PRIVS, 0u64, 0u64, 0u64, 0u64) };
+    match rc {
+        -1 => Err(last_error()),
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(SysError::Os(EINVAL)),
+    }
+}
+
 /// 自プロセスの実効 uid。
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: 引数なし・常に成功する副作用のない syscall。
@@ -919,6 +967,32 @@ pub(crate) fn effective_gid() -> u32 {
 mod tests {
     use super::*;
     use std::os::fd::AsFd as _;
+
+    /// CORE-1・TASK-27.4.3: `prctl` オプションの具体値（include/uapi/linux/prctl.h）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core1_prctl_no_new_privs_consts_are_exact() {
+        assert_eq!(consts::PR_SET_NO_NEW_PRIVS, 38);
+        assert_eq!(consts::PR_GET_NO_NEW_PRIVS, 39);
+    }
+
+    /// CORE-1・TASK-27.4.3: 専用スレッドで set し、GET と /proc の値で確認する（冪等）。
+    /// フラグはスレッド単位なので、libtest の他スレッドに影響を残さないよう使い捨てスレッドで行う。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core1_set_no_new_privs_sets_calling_thread_flag() {
+        std::thread::spawn(|| {
+            // 親から継承している場合があるため、設定前の値は assert しない。
+            let _before = no_new_privs_enabled();
+            assert_eq!(set_no_new_privs(), Ok(()));
+            assert_eq!(no_new_privs_enabled(), Ok(true));
+            let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+            assert!(status.lines().any(|l| l == "NoNewPrivs:\t1"), "{status}");
+            assert_eq!(set_no_new_privs(), Ok(()));
+        })
+        .join()
+        .unwrap();
+    }
 
     /// CORE-1: フラグの具体値（Linux の CLONE_NEW* 定義）。
     #[test]

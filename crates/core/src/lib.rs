@@ -21,8 +21,8 @@
 //! - `exec`: 最小実行フロー（Linux 限定。namespace 分離〔TASK-27.2〕と `pivot_root` による
 //!   rootfs 切替〔TASK-27.3〕、基本デバイスノード作成〔TASK-27.6。`exec/devices.rs`。
 //!   Issue 表記の `src/devices.rs` ではなく `exec` 配下に置く: 段の型 `ExecError`・`MountIsolation`
-//!   の検証が `exec` の非公開項目のため〕、fork / exec による子プロセス起動〔TASK-27.4.1。最小構成でフック無し〕、順序固定のステージ列の枠〔TASK-27.4.2。`exec/stages.rs`。各段の実体は未実装〕が
-//!   実装済みで、各段の実体（`NO_NEW_PRIVS` 等）は未実装。非 Linux ではビルド対象外のため本 doc からは
+//!   の検証が `exec` の非公開項目のため〕、fork / exec による子プロセス起動〔TASK-27.4.1。最小構成でフック無し〕、順序固定のステージ列の枠〔TASK-27.4.2。`exec/stages.rs`。`NO_NEW_PRIVS` のみ固定ステージとして TASK-27.4.3 で実装済み〕が
+//!   実装済みで、他の段の実体（cgroup 参加・capability 削減・seccomp・Landlock）は未実装。非 Linux ではビルド対象外のため本 doc からは
 //!   リンクしない）
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - 予定（未作成）: `oci_runtime`（TASK-29・30）・`state_store`

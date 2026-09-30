@@ -18,17 +18,16 @@
 //!
 //! # 契約
 //!
-//! - **最小構成（フック無し）**: 本 PR の範囲は fork と exec まで。**capability 削減・
-//!   `PR_SET_NO_NEW_PRIVS`・seccomp・Landlock・基本デバイスノード・cgroup 参加は未適用**で、
-//!   ステージ列の枠（[`StagePipeline`]。#832）が `run_child` の pivot 後・exec 前で固定順に呼ぶ（各段の
-//!   実体は #833・#834、TASK-32・37〜40 が差し込む）。
+//! - **最小構成（フック無し）**: 子はステージ列（[`StagePipeline`]。#832）を `run_child` の pivot 後・
+//!   exec 前で固定順に実行する。組み込みの `PR_SET_NO_NEW_PRIVS`（#833）は空のパイプラインでも適用される
+//!   が、**capability 削減・seccomp・Landlock・cgroup 参加は未適用**（実体は TASK-32・37〜40 が差し込む）。
 //!   そのため制限が未適用の子（rootful 経路のホスト root 権限のままの子を含む）は、
 //!   `exec_entrypoint` が `PermissionDenied` で exec を拒否する（SEC-1・CORE-5。制限を適用できる
 //!   ようになるまで fail-closed。REPAIR-3: 実装済みを装わない）
 //! - **rootless 経路も同様に拒否する**: 制限ステージの適用証跡が無い限り exec しない。
 //!   `/proc/self/status` の `NoNewPrivs`・`Seccomp`・`CapEff` は親から継承した制限と区別できず、
-//!   seccomp の内容も確認できないため証跡にしない。ステージの実体（#833 以降）が証跡型を返すように
-//!   なるまで常に `PermissionDenied`（SEC-1・CORE-5）。したがって本 PR 時点では実 exec は成功せず、
+//!   seccomp の内容も確認できないため証跡にしない。残りのステージの実体（TASK-37〜39）が証跡型を返すように
+//!   なるまで常に `PermissionDenied`（`NO_NEW_PRIVS` 単独は証跡にしない。SEC-1・CORE-5）。したがって現時点では実 exec は成功せず、
 //!   成功経路は dry-run の単体テストで検証する
 //! - **継承 fd は開く前に閉じる**: エントリポイントを開く前に fd 3 以上をすべて閉じ、fd 0〜2 と同一の
 //!   実体（rootfs 内の `/proc/self/fd/N` 経由）は拒否する（fd 0〜2 の実体を確認できなければ拒否）。
@@ -253,14 +252,15 @@ fn exit_code_for(err: &ExecError) -> i32 {
 ///
 /// `/proc/self/status` の `NoNewPrivs`・`Seccomp`・`CapEff` は、親から継承した制限と子のステージが
 /// 適用した制限を区別できず、seccomp フィルタの中身も確認できないため、証跡として扱わない。
-/// capability 削減・`PR_SET_NO_NEW_PRIVS`・seccomp・Landlock のステージの実体（#833 以降）が未実装の間は
+/// `PR_SET_NO_NEW_PRIVS` は #833 で組み込みステージとして実装済みだが単独では証跡にせず、
+/// capability 削減・seccomp・Landlock のステージの実体（TASK-37〜39）が未実装の間は
 /// 常に `PermissionDenied` を返す。ステージ実装時は、各ステージが適用完了を示す証跡型を返し、
 /// それを本関数の引数に取って初めて許可する形へ置き換える（REPAIR-3: 実装済みを装わない）。
 fn require_restriction_evidence() -> Result<(), ExecError> {
     Err(ExecError::new(
         ErrorCode::PermissionDenied,
         IsolationStage::Exec,
-        "refusing to exec: no evidence that the isolation restrictions were applied (capability drop, no_new_privs, seccomp and Landlock stages are not implemented yet)",
+        "refusing to exec: no evidence that the isolation restrictions were applied (capability drop, seccomp and Landlock stages are not implemented yet)",
     ))
 }
 
@@ -1068,7 +1068,7 @@ mod tests {
     fn core1_stage_report_is_not_restriction_evidence() {
         use crate::exec::StageKind;
         let mut p = StagePipeline::new();
-        for kind in StageKind::ORDER {
+        for kind in StageKind::ORDER.iter().copied().filter(|k| !k.is_builtin()) {
             p = p.with_hook(kind, || Ok(())).unwrap();
         }
         let err = p

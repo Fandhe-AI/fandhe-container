@@ -20,9 +20,12 @@
 //! - シナリオ `ok`: プローブへ exec し `Exited(42)`
 //! - シナリオ `missing`: 不在のエントリポイントで `Exited(127)`、stderr に `NOT_FOUND`
 //! - シナリオ `not-executable`: 実行権限の無いファイルで `Exited(126)`、stderr に `PERMISSION_DENIED`
-//! - シナリオ `stages-order`（#832・TASK-27.4.2。`spawn_container_with_stages`）: 逆順に登録した
-//!   3 段のフックが、子の pivot 後（`/` が新 rootfs）に固定順で実行されることをログファイルで照合し、
-//!   フックが全て成功しても証跡不在の exec は拒否される（`Exited(126)`・`PERMISSION_DENIED`）
+//! - シナリオ `stages-order`（#832・TASK-27.4.2、#833・TASK-27.4.3。`spawn_container_with_stages`）:
+//!   逆順に登録した 3 段（cgroup 参加・capability 削減・Landlock）のフックが、子の pivot 後（`/` が
+//!   新 rootfs）に固定順で実行されることをログファイルで照合する。各フックは自分の時点の
+//!   `/proc/self/status` の `NoNewPrivs` を記録し、組み込みの固定ステージが capability 削減の後・
+//!   Landlock の前に実際に適用されたこと（Landlock の時点で 1）を照合する。フックが全て成功しても
+//!   証跡不在の exec は拒否される（`Exited(126)`・`PERMISSION_DENIED`）
 //! - シナリオ `stage-fail`（同上）: 途中の段のフック失敗で後続段と exec に進まず `Exited(125)`
 //!   （setup 失敗）、stderr に失敗した段（`at CapabilityDrop`）
 //!
@@ -312,6 +315,8 @@ mod linux {
     /// 終了状態の照合。分離の拒否を含むあらゆる失敗は panic（失敗）にする。
     fn scenario(name: &str, rootfs: &Path) {
         let is_root = is_root();
+        // 環境（docker 等）が既に NO_NEW_PRIVS=1 のことがあるため、適用前の値を記録して期待値にする。
+        let inherited_nnp = no_new_privs_flag();
         let mut namespaces = NamespaceSet::empty()
             .with(Namespace::Pid)
             .with(Namespace::Mount)
@@ -345,11 +350,15 @@ mod linux {
         let entry = Entrypoint::new(&path, [path.as_str()], [] as [&str; 0]).expect("entrypoint");
         let child = match name {
             "stages-order" => {
-                // 逆順に登録しても固定順（cgroup_join → no_new_privs → seccomp）で実行される。
+                // 逆順に登録しても固定順（cgroup_join → capability_drop → [組み込みの no_new_privs]
+                // → landlock）で実行される。NO_NEW_PRIVS は組み込みのため登録しない。
                 let stages = StagePipeline::new()
-                    .with_hook(StageKind::Seccomp, logging_hook(StageKind::Seccomp))
+                    .with_hook(StageKind::Landlock, logging_hook(StageKind::Landlock))
                     .and_then(|p| {
-                        p.with_hook(StageKind::NoNewPrivs, logging_hook(StageKind::NoNewPrivs))
+                        p.with_hook(
+                            StageKind::CapabilityDrop,
+                            logging_hook(StageKind::CapabilityDrop),
+                        )
                     })
                     .and_then(|p| {
                         p.with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
@@ -383,18 +392,38 @@ mod linux {
             // 各フックは pivot 後の `/` にプローブが見えること（root=1）を記録する。ホスト側の `/` には
             // プローブは無いため、pivot 前に実行されていれば root=0 になる。
             "stages-order" => assert_eq!(
-                log, "cgroup_join root=1\nno_new_privs root=1\nseccomp root=1\n",
-                "hooks must run in fixed order after pivot_root"
+                log,
+                format!(
+                    "cgroup_join root=1 nnp={inherited_nnp}\ncapability_drop root=1 nnp={inherited_nnp}\nlandlock root=1 nnp=1\n"
+                ),
+                "hooks must run in fixed order after pivot_root, with NO_NEW_PRIVS applied before landlock"
             ),
             "stage-fail" => assert_eq!(
-                log, "cgroup_join root=1\n",
+                log,
+                format!("cgroup_join root=1 nnp={inherited_nnp}\n"),
                 "no stage after the failed one may run"
             ),
             _ => assert_eq!(log, "", "no hook is registered"),
         }
     }
 
-    /// 子の pivot 後の `/` に自段名と「新 rootfs が見えているか」を追記して成功するフック。
+    /// 自プロセスの `/proc/self/status` の `NoNewPrivs:` の値（0 または 1）。
+    fn no_new_privs_flag() -> u8 {
+        let status = std::fs::read_to_string("/proc/self/status")
+            .unwrap_or_else(|e| panic!("read /proc/self/status: {e}"));
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("NoNewPrivs:"))
+            .unwrap_or_else(|| panic!("NoNewPrivs line missing"));
+        match line.split_whitespace().nth(1) {
+            Some("0") => 0,
+            Some("1") => 1,
+            other => panic!("unexpected NoNewPrivs value: {other:?}"),
+        }
+    }
+
+    /// 子の pivot 後の `/` に自段名・「新 rootfs が見えているか」・その時点の `NoNewPrivs` を追記して
+    /// 成功するフック。
     fn logging_hook(kind: StageKind) -> impl FnMut() -> Result<(), ExecError> + 'static {
         move || {
             use std::io::Write as _;
@@ -404,7 +433,8 @@ mod linux {
                 .append(true)
                 .open(format!("/{STAGE_LOG}"))
                 .unwrap_or_else(|e| panic!("open stage log in the child: {e}"));
-            writeln!(f, "{} root={root}", kind.as_str())
+            let nnp = no_new_privs_flag();
+            writeln!(f, "{} root={root} nnp={nnp}", kind.as_str())
                 .unwrap_or_else(|e| panic!("write stage log in the child: {e}"));
             Ok(())
         }

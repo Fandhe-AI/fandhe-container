@@ -614,7 +614,8 @@ impl DelegatedCgroup {
         if euid != 0 {
             check_owned_by(&fd, euid)?;
         }
-        // ルート cgroup には `cgroup.type` が無いため、ENOENT は domain 扱い。
+        // `cgroup.type` はルート cgroup にのみ存在しない。非ルートで欠落する場合は
+        // 委譲済みと確認できないため fail-closed でエラーにする（ENOENT を許容するのはルートのみ）。
         match read_iface(
             CgroupStep::CheckDelegation,
             fd.as_fd(),
@@ -628,7 +629,7 @@ impl DelegatedCgroup {
                 ));
             }
             Ok(_) => {}
-            Err(e) if e.code == ErrorCode::NotFound => {}
+            Err(e) if e.code == ErrorCode::NotFound && path.is_root() => {}
             Err(e) => return Err(e),
         }
         let controllers = ControllerSet::parse(&read_iface(
@@ -876,9 +877,16 @@ impl DelegatedCgroup {
 
     /// コンテナ用子 cgroup を削除する（空であること。残りがあれば `FailedPrecondition`）。
     ///
+    /// `child` は借用で受けるため、`EBUSY` 等で失敗しても呼び出し側がハンドルを保持したまま再試行できる。
     /// 削除前に、`child` がこの親の配下で作られたもので、親ディレクトリ上の同名エントリが `child` の
     /// fd と同一の cgroup であることを検証する（別スコープの同名子・差し替えられた子の誤削除を防ぐ）。
-    pub fn remove_child(&self, child: ContainerCgroup) -> Result<(), CgroupError> {
+    ///
+    /// cgroup の削除は fd 指定ができず名前指定の `unlinkat` のみのため、同一性確認と削除の間に
+    /// 同一 euid の別主体が同名エントリを差し替える競合は原理的に塞げない（親は euid 所有の委譲
+    /// cgroup で、他 UID は差し替えられない。削除できるのは空の cgroup のみ）。そこで削除後に保持 fd が
+    /// 失効したこと（`cgroup.events` が読めないこと）を確認し、別の cgroup を消した場合は検出して
+    /// `Internal` エラーで報告する。
+    pub fn remove_child(&self, child: &ContainerCgroup) -> Result<(), CgroupError> {
         let step = CgroupStep::Cleanup;
         if child.parent_id != dir_identity(self.fd.as_fd(), "stat parent cgroup")? {
             return Err(CgroupError::precondition(
@@ -896,9 +904,18 @@ impl DelegatedCgroup {
             ));
         }
         drop(entry);
-        let c = cstring(CgroupStep::Cleanup, child.name.as_str())?;
+        let c = cstring(step, child.name.as_str())?;
         sys::remove_dir_at(self.fd.as_fd(), &c)
-            .map_err(|e| sys_error(CgroupStep::Cleanup, child.name.as_str(), e))
+            .map_err(|e| sys_error(step, child.name.as_str(), e))?;
+        // 保持 fd が指す cgroup が削除済みなら interface ファイルは開けない。
+        if read_iface(step, child.fd.as_fd(), "cgroup.events", SMALL_FILE_LIMIT).is_ok() {
+            return Err(CgroupError::new(
+                ErrorCode::Internal,
+                step,
+                "removed cgroup entry was not the held container cgroup (concurrent replacement)",
+            ));
+        }
+        Ok(())
     }
 }
 

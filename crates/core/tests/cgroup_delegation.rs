@@ -64,7 +64,7 @@ mod linux {
         assert!(parent.join(name.as_str()).join("memory.max").exists());
 
         // 後始末。退避リーフは自プロセスが入っているため削除せず、スコープ終了時に回収される。
-        delegated.remove_child(child).expect("remove child cgroup");
+        delegated.remove_child(&child).expect("remove child cgroup");
         assert!(!parent.join(name.as_str()).exists());
     }
 }

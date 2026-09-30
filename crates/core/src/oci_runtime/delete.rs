@@ -31,6 +31,12 @@
 //!   Stopped へ遷移させるまで Running のままで、その間の delete は `FailedPrecondition` になる（意図した挙動）
 //! - start との排他は revision 照合だけで足りる。start は launch の前に Created → Running へ予約更新するため、
 //!   競合する delete は revision 不一致で失敗する
+//! - start の所有ロック（`BundleLock`）は取らない。launch の進行中・上限超過（`Timeout`）・後始末で回収を
+//!   確認できずハンドルを未回収レジストリ（`take_unreaped_processes`）へ残した経路では、start は予約
+//!   （Running・pid なし）を Created へ戻さないため、delete は上表どおり拒否し、生きている可能性のある
+//!   プロセスの記録を消さない。予約を Created へ戻すのは、launch がプロセスを返さなかった場合・起動済み
+//!   プロセスの回収を確認できた場合・`recover_interrupted_start` が生存プロセス無しを確かめた場合だけで
+//!   ある（CORE-2・SEC-1）
 //!
 //! # 到達範囲（REPAIR-3）
 //!

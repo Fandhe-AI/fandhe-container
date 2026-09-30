@@ -7,7 +7,11 @@
 //! launcher と実プロセスの exec は未提供（制限ステージ TASK-37〜39 待ちで fail-closed）。
 //! `kill`（TASK-30.1。送信は依存注入する `ProcessSignaler` に委ね、本番実装は supervisor〔TASK-157〕待ち）
 //! も実装済み。`delete`（TASK-30.2）は `StateStore` のレコード削除までで、状態ファイル・cgroup の
-//! 削除は TASK-30.3 で追加する予定で未実装である（REPAIR-3: 実装済みを装わない）。モジュールは `cfg(target_os)` を付けず 3 OS でビルドされる（CLI-1）。
+//! 削除は TASK-30.3 で追加する予定で未実装である（REPAIR-3: 実装済みを装わない）。モジュールは
+//! `cfg(target_os)` を付けず 3 OS でビルドされる（CLI-1）。
+//! create / start / kill / delete は依存注入された `OpRecorder` へ固定の操作名（`create`・`start`・`kill`・
+//! `delete`）で成功 / 失敗と所要時間を記録する（REPAIR-4・TASK-84.4。delete は TASK-30.2 で同じ
+//! `record_op` パターンにより計装）。
 //! 例外は start の rootfs 固定（`RootfsDir::pin`。`exec::open_dir_beneath` を使う）と
 //! `ContainerChildProcess` で、`launch.rs` 内に `cfg(target_os = "linux")` で局所化している。Linux 以外の
 //! start は rootfs を固定できないため、起動前に `Unimplemented` で拒否する（fail-closed）。

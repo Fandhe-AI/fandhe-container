@@ -15,9 +15,15 @@
 //! `kill(2)` は `crate::oci_runtime::kill`（CORE-2・OCI-6・TASK-30.1）が `ContainerChild::send_signal`
 //! 経由で任意番号（1..=64 検証済み）を送る経路でも使う。
 //! さらに固定ステージ `crate::exec::no_new_privs`（CORE-1・TASK-27.4.3・#833）が `prctl(2)` を呼ぶ。
-//! さらに `crate::exec::apply_default_capabilities`（SEC-1・TASK-37.1・#172）が `capget(2)`・`capset(2)`
+//! さらに `exec/capabilities.rs` の `apply_default_capabilities`（SEC-1・TASK-37.1・#172）が `capget(2)`・`capset(2)`
 //! （`syscall(2)` 経由）と `prctl(2)` の capability 系オプションを呼ぶ（スレッド単位の操作で、
 //! `fork_single_threaded` による単一スレッドの子で呼ぶ前提）。
+//! さらに `crate::exec::seccomp` の `apply_seccomp_filter`（CORE-5・TASK-38.2・#177）が
+//! `prctl(PR_SET_SECCOMP)` / `prctl(PR_GET_SECCOMP)` を呼ぶ（呼び出したスレッドへのフィルタ追加。不可逆）。
+//! さらに `crate::landlock::detect_landlock_abi`（CORE-5・TASK-39.1・#181）が `landlock_create_ruleset(2)`
+//! （`syscall(2)` 経由。ABI バージョン問い合わせのみ）を呼ぶ。
+//! さらに `crate::exec` の結合試験用プローブ（CORE-5・TASK-38.4・#179）が、副作用の無い引数に固定した
+//! `ptrace(2)`・`kexec_load(2)`（`syscall(2)` 経由）を呼ぶ。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。std だけでは提供されない
 //! syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
 //! （`Hostname` 等）が済ませた値だけを受け取る。
@@ -40,6 +46,7 @@
 
 #![cfg(target_os = "linux")]
 
+use crate::seccomp::{BpfInstruction, SeccompProgram};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd};
@@ -59,7 +66,7 @@ pub(crate) enum SysError {
 /// errno の値（アーキテクチャごとに `consts` で個別定義。alpha / mips / sparc 等は値が違う）。
 pub(crate) use consts::{
     E2BIG, EACCES, EBADF, ECHILD, EEXIST, EINTR, EINVAL, ELOOP, ENOENT, ENOEXEC, ENOSYS, ENOTDIR,
-    EPERM, ESRCH,
+    EOPNOTSUPP, EPERM, ESRCH,
 };
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）
@@ -132,6 +139,12 @@ mod consts {
     pub const EEXIST: i32 = 17;
     pub const ENOTDIR: i32 = 20;
     pub const EINVAL: i32 = 22;
+    // arch/x86/entry/syscalls/syscall_64.tbl の `landlock_create_ruleset`（444）。
+    pub const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
+    // include/uapi/linux/landlock.h の `LANDLOCK_CREATE_RULESET_VERSION`（`1U << 0`）。
+    pub const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+    // include/uapi/asm-generic/errno.h の `EOPNOTSUPP`（x86_64 は上書きしない）。
+    pub const EOPNOTSUPP: i32 = 95;
     pub const ELOOP: i32 = 40;
     // errno-base.h / errno.h の ESRCH・EINTR・E2BIG・ENOEXEC・EBADF・ENOSYS。
     pub const ESRCH: i32 = 3;
@@ -150,11 +163,25 @@ mod consts {
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 
+    // include/uapi/linux/prctl.h の `PR_GET_SECCOMP`（21）・`PR_SET_SECCOMP`（22）と
+    // include/uapi/linux/seccomp.h の `SECCOMP_MODE_FILTER`（2。可変長引数で渡すため u64）。
+    pub const PR_GET_SECCOMP: i32 = 21;
+    pub const PR_SET_SECCOMP: i32 = 22;
+    pub const SECCOMP_MODE_FILTER: u64 = 2;
+
     // capability 操作（TASK-37.1・#172）。`SYS_CAPGET` / `SYS_CAPSET` は glibc がラッパーを
     // 公開しないため `syscall(2)` 経由で呼ぶ。出典: x86_64 は arch/x86/entry/syscalls/syscall_64.tbl、
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 125;
     pub const SYS_CAPSET: i64 = 126;
+    // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
+    // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
+    // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
+    // （include/linux/kexec.h）は kexec_load の segment 数の上限。
+    pub const SYS_PTRACE: i64 = 101;
+    pub const SYS_KEXEC_LOAD: i64 = 246;
+    pub const PTRACE_CONT: i64 = 7;
+    pub const KEXEC_SEGMENT_MAX: i64 = 16;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     // include/uapi/linux/prctl.h の `PR_CAPBSET_READ`（23）・`PR_CAPBSET_DROP`（24）・
@@ -225,6 +252,12 @@ mod consts {
     pub const EEXIST: i32 = 17;
     pub const ENOTDIR: i32 = 20;
     pub const EINVAL: i32 = 22;
+    // include/uapi/asm-generic/unistd.h の `__NR_landlock_create_ruleset`（444。arm64 は汎用表）。
+    pub const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
+    // include/uapi/linux/landlock.h の `LANDLOCK_CREATE_RULESET_VERSION`（`1U << 0`）。
+    pub const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+    // include/uapi/asm-generic/errno.h の `EOPNOTSUPP`（arm64 は上書きしない）。
+    pub const EOPNOTSUPP: i32 = 95;
     pub const ELOOP: i32 = 40;
     // errno-base.h / errno.h の ESRCH・EINTR・E2BIG・ENOEXEC・EBADF・ENOSYS。
     pub const ESRCH: i32 = 3;
@@ -243,11 +276,25 @@ mod consts {
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 
+    // include/uapi/linux/prctl.h の `PR_GET_SECCOMP`（21）・`PR_SET_SECCOMP`（22）と
+    // include/uapi/linux/seccomp.h の `SECCOMP_MODE_FILTER`（2。可変長引数で渡すため u64）。
+    pub const PR_GET_SECCOMP: i32 = 21;
+    pub const PR_SET_SECCOMP: i32 = 22;
+    pub const SECCOMP_MODE_FILTER: u64 = 2;
+
     // capability 操作（TASK-37.1・#172）。`SYS_CAPGET` / `SYS_CAPSET` は glibc がラッパーを
     // 公開しないため `syscall(2)` 経由で呼ぶ。出典: x86_64 は arch/x86/entry/syscalls/syscall_64.tbl、
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 90;
     pub const SYS_CAPSET: i64 = 91;
+    // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
+    // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
+    // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
+    // （include/linux/kexec.h）は kexec_load の segment 数の上限。
+    pub const SYS_PTRACE: i64 = 117;
+    pub const SYS_KEXEC_LOAD: i64 = 104;
+    pub const PTRACE_CONT: i64 = 7;
+    pub const KEXEC_SEGMENT_MAX: i64 = 16;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     // include/uapi/linux/prctl.h の `PR_CAPBSET_READ`（23）・`PR_CAPBSET_DROP`（24）・
@@ -300,6 +347,9 @@ mod consts {
     pub const EEXIST: i32 = -7;
     pub const ENOTDIR: i32 = -4;
     pub const EINVAL: i32 = -5;
+    pub const SYS_LANDLOCK_CREATE_RULESET: i64 = 0;
+    pub const LANDLOCK_CREATE_RULESET_VERSION: u32 = 0;
+    pub const EOPNOTSUPP: i32 = -15;
     pub const ELOOP: i32 = -6;
     pub const ESRCH: i32 = -8;
     pub const ECHILD: i32 = -14;
@@ -313,11 +363,24 @@ mod consts {
     pub const PR_SET_NO_NEW_PRIVS: i32 = 0;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 0;
 
+    // seccomp 適用の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
+    pub const PR_GET_SECCOMP: i32 = 0;
+    pub const PR_SET_SECCOMP: i32 = 0;
+    pub const SECCOMP_MODE_FILTER: u64 = 0;
+
     // capability 操作（TASK-37.1・#172）。`SYS_CAPGET` / `SYS_CAPSET` は glibc がラッパーを
     // 公開しないため `syscall(2)` 経由で呼ぶ。出典: x86_64 は arch/x86/entry/syscalls/syscall_64.tbl、
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 0;
     pub const SYS_CAPSET: i64 = 0;
+    // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
+    // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
+    // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
+    // （include/linux/kexec.h）は kexec_load の segment 数の上限。
+    pub const SYS_PTRACE: i64 = 0;
+    pub const SYS_KEXEC_LOAD: i64 = 0;
+    pub const PTRACE_CONT: i64 = 0;
+    pub const KEXEC_SEGMENT_MAX: i64 = 0;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0;
     // include/uapi/linux/prctl.h の `PR_CAPBSET_READ`（23）・`PR_CAPBSET_DROP`（24）・
@@ -1071,6 +1134,62 @@ pub(crate) fn no_new_privs_enabled() -> Result<bool, SysError> {
     }
 }
 
+/// `struct sock_fprog`（include/uapi/linux/filter.h）。LP64 では `len` の後に 6 バイトの
+/// パディングが入り、`filter` はオフセット 8、全体 16 バイト。
+#[repr(C)]
+struct SockFprog {
+    len: u16,
+    filter: *const BpfInstruction,
+}
+
+/// 呼び出したスレッドへ seccomp フィルタを追加する（`prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`。
+/// CORE-5・TASK-38.2・#177）。
+///
+/// `crate::exec::seccomp` の `apply_seccomp_filter` だけが呼ぶ。適用は不可逆で呼び出しスレッドにのみ
+/// 効く。`NO_NEW_PRIVS` の事前確認は呼び出し側の契約（本関数は検証しない）。命令列は型
+/// （[`SeccompProgram`]）により 1 以上 4096 以下が保証される。
+pub(crate) fn seccomp_set_filter(program: &SeccompProgram) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let insns = program.instructions();
+    let Ok(len) = u16::try_from(insns.len()) else {
+        return Err(SysError::Os(EINVAL));
+    };
+    let fprog = SockFprog {
+        len,
+        filter: insns.as_ptr(),
+    };
+    // SAFETY: `fprog` と `insns`（`program` が所有）は呼び出し中生存する。カーネルは
+    // `seccomp_prepare_filter` で命令列をコピーし、呼び出し後にポインタを保持しない。`len` は実際の
+    // 命令数と一致し非ゼロ・4096 以下（`SeccompProgram` の型保証）。`BpfInstruction` は `repr(C)` で
+    // `struct sock_filter` と同一レイアウト（テストでサイズを照合）。ポインタはレジスタ幅の値として
+    // 可変長引数に渡す。副作用は呼び出しスレッドへのフィルタ追加のみ。
+    let rc = unsafe {
+        prctl(
+            consts::PR_SET_SECCOMP,
+            consts::SECCOMP_MODE_FILTER,
+            &fprog as *const SockFprog as usize as u64,
+            0u64,
+            0u64,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出したスレッドの seccomp モード（`PR_GET_SECCOMP`。0 = 無効・1 = strict・2 = filter）を返す。
+pub(crate) fn seccomp_mode() -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。読み取りだけで状態を変えない。
+    let rc = unsafe { prctl(consts::PR_GET_SECCOMP, 0u64, 0u64, 0u64, 0u64) };
+    if rc == -1 {
+        return Err(last_error());
+    }
+    u32::try_from(rc).map_err(|_| SysError::Os(EINVAL))
+}
+
 /// `capget(2)` / `capset(2)` のヘッダ（`struct __user_cap_header_struct`）。
 #[repr(C)]
 struct CapUserHeader {
@@ -1097,7 +1216,7 @@ pub(crate) struct ThreadCaps {
 
 /// 呼び出したスレッドの effective / permitted / inheritable を読む（pid 0 の `capget(2)`）。
 ///
-/// `crate::exec::apply_default_capabilities`（TASK-37.1・#172）が適用前の値の取得と適用後の
+/// `exec/capabilities.rs` の `apply_default_capabilities`（TASK-37.1・#172）が適用前の値の取得と適用後の
 /// 読み戻し検証に使う。カーネルが v3 以外のバージョンを返したら `EINVAL` として fail-closed にする。
 pub(crate) fn cap_get_thread() -> Result<ThreadCaps, SysError> {
     if !consts::SUPPORTED {
@@ -1133,7 +1252,7 @@ pub(crate) fn cap_get_thread() -> Result<ThreadCaps, SysError> {
 /// 呼び出したスレッドの effective / permitted / inheritable を設定する（pid 0 の `capset(2)`）。
 ///
 /// スレッド単位の操作。`fork_single_threaded` による単一スレッドの子で呼ぶ前提
-/// （`crate::exec::apply_default_capabilities` が使う。TASK-37.1・#172）。
+/// （`exec/capabilities.rs` の `apply_default_capabilities` が使う。TASK-37.1・#172）。
 pub(crate) fn cap_set_thread(caps: ThreadCaps) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
@@ -1202,6 +1321,84 @@ pub(crate) fn cap_ambient_clear_all() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 実行中カーネルの Landlock ABI バージョンを返す（`landlock_create_ruleset(NULL, 0, VERSION)`。
+/// CORE-5・TASK-39.1）。`0` の妥当性判定は呼び出し側（`crate::landlock`）が行う。
+/// Landlock 非対応は `ENOSYS`、起動時に無効化されていれば `EOPNOTSUPP`。
+pub(crate) fn landlock_abi_version() -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: attr は NULL・size は 0 で、VERSION フラグの問い合わせではカーネルはメモリを読まない
+    // （それ以外の組み合わせは EINVAL）。fd を作らずプロセス状態も変えない読み取り専用の問い合わせ。
+    // `landlock_create_ruleset` は glibc に無いため可変長の `syscall(2)` 経由で呼び、引数は
+    // ポインタ・`usize`・`u64` とレジスタ幅で渡す（32 bit 値を可変長で渡すと上位ビットが未規定に
+    // なり得るため、flags は `prctl` と同様に `u64` へ拡幅する。カーネルは `__u32` へ切り詰める）。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_LANDLOCK_CREATE_RULESET,
+            core::ptr::null::<core::ffi::c_void>(),
+            0usize,
+            u64::from(consts::LANDLOCK_CREATE_RULESET_VERSION),
+        )
+    };
+    if rc == -1 {
+        return Err(last_error());
+    }
+    u32::try_from(rc).map_err(|_| SysError::Os(EINVAL))
+}
+
+/// `ptrace(PTRACE_CONT, pid, 0, 0)` を発行して errno を返す結合試験用プローブ（CORE-5・TASK-38.4・#179）。
+///
+/// `PTRACE_CONT` は attach 済みのトレーシー専用の要求で、フィルタが無ければ自プロセスのような
+/// 「自分がトレースしていない」対象に対し `ESRCH` で失敗し副作用が無い。seccomp の遮断が効いていれば
+/// `EPERM` になり、capability 不足との区別に使える。呼び出しは結合試験用の観測経路だけ。
+// 結合試験専用。テストビルドの単体テストは呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn ptrace_cont_probe(pid: u32) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数はすべて整数（request・pid・addr=0・data=0）でポインタを渡さず、PTRACE_CONT では
+    // カーネルは data をシグナル番号としてしか読まない（メモリは読まない）。attach を伴わないため、
+    // フィルタが欠けていても対象プロセスへの副作用は無い（`ESRCH`）。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_PTRACE,
+            consts::PTRACE_CONT,
+            i64::from(pid),
+            0_i64,
+            0_i64,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `kexec_load(0, KEXEC_SEGMENT_MAX + 1, NULL, 0xffff_ffff)` を発行して errno を返す結合試験用プローブ
+/// （CORE-5・TASK-38.4・#179）。
+///
+/// segment 数が上限超過のため、フィルタが無くても権限検査（非 root は `EPERM`）または引数検査
+/// （root は `EINVAL`）で失敗し、ロード済みカーネルの入れ替え・破棄は起きない。識別的な根拠には
+/// 使わない（capability 不足でも `EPERM` になり得る）。
+// 結合試験専用。テストビルドの単体テストは呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn kexec_load_invalid_probe() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: segments は NULL（整数 0 として渡す）。nr_segments が上限を超えるためカーネルは
+    // segments を読む前に拒否する。flags は無効値で、どの経路でもロード・アンロードに至らない。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_KEXEC_LOAD,
+            0_i64,
+            consts::KEXEC_SEGMENT_MAX + 1,
+            0_i64,
+            0xffff_ffff_i64,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// 自プロセスの実効 uid。
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: 引数なし・常に成功する副作用のない syscall。
@@ -1217,6 +1414,49 @@ pub(crate) fn effective_gid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CORE-5・TASK-38.4: プローブ用定数の固定値照合（x86_64。arch ごとの個別定義の誤り検出）。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn core5_probe_consts_are_exact_x86_64() {
+        assert_eq!(consts::SYS_PTRACE, 101);
+        assert_eq!(consts::SYS_KEXEC_LOAD, 246);
+        assert_eq!(consts::PTRACE_CONT, 7);
+        assert_eq!(consts::KEXEC_SEGMENT_MAX, 16);
+    }
+
+    /// CORE-5・TASK-38.4: プローブ用定数の固定値照合（aarch64）。
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn core5_probe_consts_are_exact_aarch64() {
+        assert_eq!(consts::SYS_PTRACE, 117);
+        assert_eq!(consts::SYS_KEXEC_LOAD, 104);
+        assert_eq!(consts::PTRACE_CONT, 7);
+        assert_eq!(consts::KEXEC_SEGMENT_MAX, 16);
+    }
+
+    /// CORE-5・TASK-39.1: Landlock 関連定数の固定値照合（arch ごとに個別定義した値の誤り検出）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core5_landlock_consts_are_exact() {
+        assert_eq!(consts::SYS_LANDLOCK_CREATE_RULESET, 444);
+        assert_eq!(consts::LANDLOCK_CREATE_RULESET_VERSION, 1);
+        assert_eq!(consts::EOPNOTSUPP, 95);
+    }
+
+    /// CORE-5・TASK-39.1: 実 syscall の結果が想定どおりの集合に収まる（カーネル版数に依存しない）。
+    #[test]
+    fn core5_landlock_abi_version_real_syscall() {
+        match landlock_abi_version() {
+            Ok(n) => assert!(n >= 1, "abi must be >= 1, got {n}"),
+            // ENOSYS / EOPNOTSUPP のほか、seccomp 等で syscall が制限された環境の EPERM なども
+            // 実装が ProbeFailed として拒否する正当な応答。errno は正の値であることだけ確かめる。
+            Err(SysError::Os(e)) => assert!(e > 0, "errno must be positive, got {e}"),
+            // 対応外アーキテクチャは明示的な Unsupported を返す。
+            Err(SysError::Unsupported) => {}
+            Err(other) => panic!("unexpected result: {other:?}"),
+        }
+    }
     use std::os::fd::AsFd as _;
 
     /// SEC-1・TASK-37.1: capability 関連の定数の具体値。
@@ -1277,6 +1517,18 @@ mod tests {
     fn sec1_cap_bounding_read_beyond_last_cap_is_einval() {
         assert_eq!(cap_bounding_contains(63), Err(SysError::Os(EINVAL)));
         assert_eq!(cap_bounding_contains(0).map(|_| ()), Ok(()));
+    }
+
+    /// CORE-5・TASK-38.2: seccomp 適用の定数とレイアウトの具体値。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core5_seccomp_prctl_consts_and_layout_are_exact() {
+        assert_eq!(consts::PR_GET_SECCOMP, 21);
+        assert_eq!(consts::PR_SET_SECCOMP, 22);
+        assert_eq!(consts::SECCOMP_MODE_FILTER, 2);
+        assert_eq!(std::mem::size_of::<BpfInstruction>(), 8);
+        assert_eq!(std::mem::size_of::<SockFprog>(), 16);
+        assert_eq!(std::mem::offset_of!(SockFprog, filter), 8);
     }
 
     /// CORE-1・TASK-27.4.3: `prctl` オプションの具体値（include/uapi/linux/prctl.h）。

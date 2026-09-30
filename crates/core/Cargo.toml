@@ -37,8 +37,21 @@ name = "fork_exec_isolation"
 path = "tests/fork_exec_isolation.rs"
 harness = false
 
+# capability 最小化の結合試験（SEC-1・TASK-37.3）。実プロセスの `/proc/<pid>/status` を照合する。
+# 上と同じ理由で harness = false。`-- --ignored` 指定時のみ実機前提部分を実行する（AGENTS.md）。
+[[test]]
+name = "capabilities"
+path = "tests/capabilities.rs"
+harness = false
+
 # 基本デバイスノード作成（create_default_devices）の結合試験（CORE-1・TASK-27.6）。上と同じ理由で
 # harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+# seccomp 適用後の遮断の結合試験（CORE-5・TASK-38.3・#178）。適用は単一スレッドを要するため harness = false。
+[[test]]
+name = "seccomp_enforcement"
+path = "tests/seccomp_enforcement.rs"
+harness = false
+
 [[test]]
 name = "default_devices"
 path = "tests/default_devices.rs"
@@ -49,4 +62,43 @@ harness = false
 [[test]]
 name = "rootless_id_map"
 path = "tests/rootless_id_map.rs"
+harness = false
+
+# rootless 起動フローへの統合（subuid 範囲写像 → spawn_container）の結合試験（CORE-6・SEC-5・TASK-40.2）。
+# 上と同じ理由で harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "rootless_launch"
+path = "tests/rootless_launch.rs"
+harness = false
+
+# rootless でコンテナ内 root が作るファイルの所有者写像（ホスト視点 stat）の結合試験（CORE-6・SEC-5・TASK-40.3）。
+# 上と同じ理由で harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "rootless_file_owner"
+path = "tests/rootless_file_owner.rs"
+harness = false
+
+# rootless での OCI Runtime ライフサイクル（create → start → kill）の結合試験と既知課題の記録
+# （CORE-6・SEC-5・TASK-40.4）。CLONE_NEWUSER のため単一スレッドの main が要り harness = false。
+# `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "rootless"
+path = "tests/rootless.rs"
+harness = false
+
+# rootless でコンテナ（PID 1・pivot 済み rootfs）内 root が作るファイルのホスト側所有者を照合する
+# ESC-09 相当の結合試験（CORE-6・SEC-5・TASK-44）。libtest のマルチスレッドでは CLONE_NEWUSER が
+# 拒否されるため単一スレッド main の harness = false。`-- --ignored` 指定時のみ実行する
+# 実機前提テスト（AGENTS.md）。
+[[test]]
+name = "rootless_uid_mapping"
+path = "tests/rootless_uid_mapping.rs"
+harness = false
+
+# 起動したコンテナプロセス内で禁止 syscall が遮断されることの結合試験（CORE-5・TASK-38.4・#179）。
+# CLONE_NEWUSER / 単一スレッド前提の fork のため harness = false。`-- --ignored` 指定時のみ
+# 実機前提部分を実行する（AGENTS.md）。
+[[test]]
+name = "seccomp"
+path = "tests/seccomp.rs"
 harness = false

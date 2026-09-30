@@ -21,18 +21,24 @@
 //! - `exec`: 最小実行フロー（Linux 限定。namespace 分離〔TASK-27.2〕と `pivot_root` による
 //!   rootfs 切替〔TASK-27.3〕、基本デバイスノード作成〔TASK-27.6。`exec/devices.rs`。
 //!   Issue 表記の `src/devices.rs` ではなく `exec` 配下に置く: 段の型 `ExecError`・`MountIsolation`
-//!   の検証が `exec` の非公開項目のため〕、fork / exec による子プロセス起動〔TASK-27.4.1。最小構成でフック無し〕、順序固定のステージ列の枠〔TASK-27.4.2。`exec/stages.rs`。`NO_NEW_PRIVS` のみ固定ステージとして TASK-27.4.3 で実装済み〕が
-//!   実装済みで、他の段の実体（cgroup 参加・capability 削減・seccomp・Landlock）は未実装。非 Linux ではビルド対象外のため本 doc からは
+//!   の検証が `exec` の非公開項目のため〕、fork / exec による子プロセス起動〔TASK-27.4.1。最小構成でフック無し〕、順序固定のステージ列の枠〔TASK-27.4.2。`exec/stages.rs`。`NO_NEW_PRIVS`〔TASK-27.4.3〕と capability 削減〔TASK-37.2〕のみ固定ステージとして実装済み〕が
+//!   実装済みで、他の段の実体（cgroup 参加・Landlock）は未実装（seccomp は #178 で組み込み済み）。非 Linux ではビルド対象外のため本 doc からは
 //!   リンクしない）
 //! - `capabilities`: capability 集合の型 `Capability`・`CapabilitySet`・OCI 既定集合（SEC-1・
 //!   TASK-37.1）。OS 非依存で syscall を持たない。適用関数 `apply_default_capabilities` は
 //!   `exec/capabilities.rs`（Linux 限定）に置く: 段の型 `ExecError` の非公開コンストラクタと
-//!   errno 分類を再利用するため（`exec/devices.rs` と同じ判断）。ステージ列への組み込みは #173
+//!   errno 分類を再利用するため（`exec/devices.rs` と同じ判断）。ステージ列へは #173（TASK-37.2）で組み込み済み
 //! - `observability`: メトリクス集計型 `OpStats` 等（TASK-84.1）と記録 API `OpRecorder`
-//!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。計装は TASK-84.4 以降で未実装。io 向け連携点は io 側に定義済み（TASK-84.5）
+//!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。create / start / kill の計装は実装済み（TASK-84.4）、delete も TASK-30.2 で同じパターンにより計装済み。io 向け連携点は io 側に定義済み（TASK-84.5）
+//! - `landlock`: Landlock ABI 検出と fail-closed 判定（Linux 限定。CORE-5・TASK-39.1・#181）のみ実装済み。
+//!   ルール生成（#182）・適用（#183）・ステージ列への組み込み（#184）は未実装
 //! - `rootless`: user namespace の UID/GID 写像の設定・読み戻し検証（Linux 限定。CORE-6・SEC-5・
 //!   TASK-40.1）。検証済み写像型・subuid/subgid 解析・`Direct` / `newuidmap` 経由の書き込みが実装済みで、
-//!   `exec` の起動フローへの組み込みは TASK-40.2（#188）で未実装
+//!   `exec::isolate_rootless_subordinate` による起動フローへの組み込みも実装済み（TASK-40.2）。
+//!   `linux.uidMappings` の受理は後続、ファイル所有者検証（TASK-40.3）は未実装
+//! - `seccomp`: 禁止 syscall の一覧 `DeniedSyscall` と x86_64 / aarch64 別の番号テーブル（CORE-5・
+//!   TASK-38.1.1・#837。OS 非依存で syscall を持たない）。テーブルと BPF 構築
+//!   （TASK-38.1.2・#838）は実装済み。フィルタ適用（TASK-38.2）と起動フローへの組み込み（TASK-38.3）も実装済み
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - `oci_runtime`: OCI Runtime のライフサイクル。`config.json` の型・パーサ
 //!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。
@@ -58,10 +64,13 @@
 pub mod capabilities;
 #[cfg(target_os = "linux")]
 pub mod exec;
+#[cfg(target_os = "linux")]
+pub mod landlock;
 pub mod observability;
 pub mod oci_runtime;
 #[cfg(target_os = "linux")]
 pub mod rootless;
+pub mod seccomp;
 #[cfg(target_os = "linux")]
 mod sys;
 pub mod traits;

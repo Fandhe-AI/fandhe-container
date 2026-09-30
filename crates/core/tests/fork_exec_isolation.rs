@@ -14,14 +14,14 @@
 //! - ディスパッチャ: 分離前に、手組みの静的 ELF プローブ（終了コード 42）をホスト上で直接実行して
 //!   バイト列の正しさを自己検証する（バイト列の誤りをランタイムの不具合と取り違えないため）→
 //!   シナリオごとに一時 rootfs を作り、タイムアウト付きで終了コード 0 を待つ（REPAIR-5）
-//! - 制限（capability 削減・no_new_privs・seccomp）が未適用の間は root（rootful）・非 root（rootless）とも
+//! - 制限（Landlock。capability 削減・no_new_privs・seccomp は組み込み済み）が未適用の間は root（rootful）・非 root（rootless）とも
 //!   exec は拒否されるため、全シナリオが `Exited(126)`・stderr に `PERMISSION_DENIED`（SEC-1・CORE-5）。
 //!   ステージ列（#832・#833）が適用されたら、下の想定を各シナリオ本来の値へ戻す
 //! - シナリオ `ok`: プローブへ exec し `Exited(42)`
 //! - シナリオ `missing`: 不在のエントリポイントで `Exited(127)`、stderr に `NOT_FOUND`
 //! - シナリオ `not-executable`: 実行権限の無いファイルで `Exited(126)`、stderr に `PERMISSION_DENIED`
 //! - シナリオ `stages-order`（#832・TASK-27.4.2、#833・TASK-27.4.3。`spawn_container_with_stages`）:
-//!   逆順に登録した 3 段（cgroup 参加・capability 削減・Landlock）のフックが、子の pivot 後（`/` が
+//!   逆順に登録した 2 段（cgroup 参加・Landlock）のフックと、組み込みの capability 削減・NO_NEW_PRIVS が、子の pivot 後（`/` が
 //!   新 rootfs）に固定順で実行されることをログファイルで照合する。各フックは自分の時点の
 //!   `/proc/self/status` の `NoNewPrivs` を記録し、組み込みの固定ステージが capability 削減の後・
 //!   Landlock の前に実際に適用されたこと（Landlock の時点で 1）を照合する。フックが全て成功しても
@@ -30,10 +30,10 @@
 //!   呼び出しを省いても `nnp=1` のログが一致する。その場合の本シナリオは「固定ステージが capability 削減の後・
 //!   Landlock の前に走る順序」までを検証し、設定操作そのものは次の独立経路で検証する: 偽 syscall による
 //!   `exec/stages.rs` の順序テスト（`core1_no_new_privs_runs_after_capability_drop_and_before_landlock`・
-//!   `core1_empty_pipeline_applies_builtin_no_new_privs`）と、本物の `prctl` を別スレッドで確認する
+//!   `core1_empty_pipeline_applies_builtin_stages`）と、本物の `prctl` を別スレッドで確認する
 //!   `sys.rs` の `core1_set_no_new_privs_sets_calling_thread_flag`。継承値 0 の環境では本シナリオが設定操作も検証する
 //! - シナリオ `stage-fail`（同上）: 途中の段のフック失敗で後続段と exec に進まず `Exited(125)`
-//!   （setup 失敗）、stderr に失敗した段（`at CapabilityDrop`）
+//!   （setup 失敗）、stderr に失敗した段（`at Landlock`。#173 以降 capability 削減は組み込みのためフック失敗の対象外）
 //!
 //! # 実機前提テストとしての分離
 //! 実行には root もしくは非特権 user namespace を許可するホストが必要（AppArmor の
@@ -99,7 +99,7 @@ mod linux {
         ("missing", "PERMISSION_DENIED"),
         ("not-executable", "PERMISSION_DENIED"),
         ("stages-order", "PERMISSION_DENIED"),
-        ("stage-fail", "at CapabilityDrop"),
+        ("stage-fail", "at Landlock"),
     ];
 
     fn timeout() -> Duration {
@@ -355,23 +355,18 @@ mod linux {
             "stages-order" | "stage-fail" => format!("/{PROBE}"),
             other => panic!("unknown scenario {other}"),
         };
-        // SEC-1・CORE-5: capability 削減・no_new_privs・seccomp が未適用の間は、root / 非 root を問わず
+        // SEC-1・CORE-5: Landlock が未適用の間は、root / 非 root を問わず
         // exec が拒否される（終了コード 126・PERMISSION_DENIED）。適用後は "ok" が Exited(PROBE_EXIT)、
         // "missing" が Exited(127) に戻る。
         let mut want = ChildExit::Exited(126);
         let entry = Entrypoint::new(&path, [path.as_str()], [] as [&str; 0]).expect("entrypoint");
         let child = match name {
             "stages-order" => {
-                // 逆順に登録しても固定順（cgroup_join → capability_drop → [組み込みの no_new_privs]
-                // → landlock）で実行される。NO_NEW_PRIVS は組み込みのため登録しない。
+                // 逆順に登録しても固定順（cgroup_join → [組み込みの capability_drop・no_new_privs]
+                // → landlock → [組み込みの seccomp]）で実行される。capability 削減・NO_NEW_PRIVS・seccomp は組み込みのため
+                // 登録しない（登録すると InvalidArgument。#173・#833・#178）。
                 let stages = StagePipeline::new()
                     .with_hook(StageKind::Landlock, logging_hook(StageKind::Landlock))
-                    .and_then(|p| {
-                        p.with_hook(
-                            StageKind::CapabilityDrop,
-                            logging_hook(StageKind::CapabilityDrop),
-                        )
-                    })
                     .and_then(|p| {
                         p.with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
                     })
@@ -379,13 +374,11 @@ mod linux {
                 spawn_container_with_stages(rootfs, &entry, stages)
             }
             "stage-fail" => {
-                // CapabilityDrop のフックが失敗する。後続の Landlock と exec は実行されない。
+                // Landlock のフックが失敗する（組み込みの capability 削減・no_new_privs は成功済み）。
+                // 後続の組み込み seccomp と exec は実行されない。
                 let stages = StagePipeline::new()
                     .with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
-                    .and_then(|p| p.with_hook(StageKind::CapabilityDrop, failing_hook))
-                    .and_then(|p| {
-                        p.with_hook(StageKind::Landlock, logging_hook(StageKind::Landlock))
-                    })
+                    .and_then(|p| p.with_hook(StageKind::Landlock, failing_hook))
                     .unwrap_or_else(|e| panic!("register hooks: {e}"));
                 want = ChildExit::Exited(125);
                 spawn_container_with_stages(rootfs, &entry, stages)
@@ -405,10 +398,8 @@ mod linux {
             // プローブは無いため、pivot 前に実行されていれば root=0 になる。
             "stages-order" => assert_eq!(
                 log,
-                format!(
-                    "cgroup_join root=1 nnp={inherited_nnp}\ncapability_drop root=1 nnp={inherited_nnp}\nlandlock root=1 nnp=1\n"
-                ),
-                "hooks must run in fixed order after pivot_root, with NO_NEW_PRIVS applied before landlock"
+                format!("cgroup_join root=1 nnp={inherited_nnp}\nlandlock root=1 nnp=1\n"),
+                "hooks must run in fixed order after pivot_root, with the built-in capability drop and NO_NEW_PRIVS applied before landlock"
             ),
             "stage-fail" => assert_eq!(
                 log,

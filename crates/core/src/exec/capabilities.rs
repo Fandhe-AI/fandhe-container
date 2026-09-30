@@ -4,10 +4,11 @@
 //!
 //! ステージ列（`exec/stages.rs`）の第 2 段「capability 削減」の実体。呼び出したスレッドの
 //! capability を OCI 既定集合（[`CapabilitySet::oci_default`]。SEC-1）へ絞り込み、結果を読み戻して
-//! 検証する。ステージ列（`StagePipeline`）への組み込みと制限適用の証跡化は #173（TASK-37.2）、
-//! 実プロセスでの `/proc/<pid>/status` 検証は #174（TASK-37.3）が担う。
-//! **現時点ではどの経路からも呼ばれない**（REPAIR-3）。`process.rs::require_restriction_evidence` も
-//! 変えておらず、本関数の成否によらず exec は引き続き拒否される。
+//! 検証する。ステージ列（`StagePipeline`）へは #173（TASK-37.2）で組み込み済みで、`StagePipeline::run_then`
+//! が差し替え不可の組み込み段として呼ぶ（返す [`CapabilityReport`] は終端クロージャへ渡る）。
+//! 最終的な制限適用の証跡型は TASK-38・TASK-39 で決めるため、`process.rs::require_restriction_evidence`
+//! は本関数の成否によらず exec を拒否し続ける（REPAIR-3）。実プロセスでの `/proc/<pid>/status` 検証は
+//! #174（TASK-37.3）が担う。
 //!
 //! # 契約
 //!
@@ -77,7 +78,7 @@ impl CapKernel for RealKernel {
     }
 }
 
-/// capability の適用結果。将来の拡張（証跡化。#173）に備えて `non_exhaustive` にする。
+/// capability の適用結果。将来の拡張（最終的な証跡型。TASK-38・TASK-39）に備えて `non_exhaustive` にする。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CapabilityReport {
@@ -90,7 +91,7 @@ pub struct CapabilityReport {
     pub bounding: CapabilitySet,
     /// `execve` 後に保持し得る権限の上限（`granted` ∪ `bounding`。exec 時の資格情報によらない）。
     /// uid 0 の `execve` は permitted に無い capability も bounding set から再取得するため、
-    /// `granted` ∩ bounding では過小評価になる。証跡（#173）にはこちらを使う。
+    /// `granted` ∩ bounding では過小評価になる。証跡にはこちらを使う（型の確定は TASK-38・TASK-39）。
     pub retained_after_exec: CapabilitySet,
     /// 許可集合に含まれるが、適用前の permitted に無く付与できなかったもの。
     pub unavailable: CapabilitySet,
@@ -101,7 +102,7 @@ pub struct CapabilityReport {
 /// 呼び出したスレッドの capability を OCI 既定集合（SEC-1）へ絞り込む。
 ///
 /// **crate 内限定**（`pub(crate)`）。外部 crate から単一スレッドでない文脈で呼べないようにし、
-/// 呼び出し経路を `sys::fork_single_threaded` の子（`exec/process.rs` のステージ列。#173 で組み込み）に
+/// 呼び出し経路を `sys::fork_single_threaded` の子（`StagePipeline::run_then` の組み込み段。#173）に
 /// 閉じる。pivot 後・`NO_NEW_PRIVS` の前に呼ぶ。
 ///
 /// bounding set・capset はスレッド単位で他スレッドには効かないため、適用の前後で `Threads:` が 1
@@ -112,8 +113,6 @@ pub struct CapabilityReport {
 ///   （`sys::fork_single_threaded` と同じ論拠）
 /// - 事後確認: 適用後にもう一度 `Threads: 1` を確認する。万一増えていれば（呼び出し側の
 ///   別経路の不具合等）`Ok` を返さず `Internal` で失敗し、権限が残った可能性を呼び出し側へ伝える
-// ステージ列へ組み込むまで（#173）呼び出し元が無い（REPAIR-3）。
-#[allow(dead_code)]
 pub(crate) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError> {
     apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut RealKernel)
 }
@@ -271,7 +270,29 @@ fn without(set: CapabilitySet, minus: CapabilitySet) -> CapabilitySet {
 /// テスト用の偽 syscall。
 #[cfg(test)]
 pub(super) mod testing {
+    use std::cell::Cell;
+
+    use super::{CapabilityReport, CapabilitySet, ExecError, apply_capabilities_single_threaded};
     use crate::sys::{EINVAL, SysError, ThreadCaps};
+
+    thread_local! {
+        static DROP_ERR: Cell<Option<SysError>> = const { Cell::new(None) };
+    }
+
+    /// 次の 1 回だけ、`apply_default_capabilities` の偽物の bounding drop を失敗させる
+    /// （使うと既定へ戻り、後続テストへ漏れない）。
+    pub(in crate::exec) fn fake_capability_drop_err(e: SysError) {
+        DROP_ERR.with(|c| c.set(Some(e)));
+    }
+
+    /// `stages.rs` の組み込み段が `cfg(test)` で呼ぶ偽物。本物の絞り込みロジックを偽カーネルで走らせる
+    /// （本物は `Threads: 1` を要求し、マルチスレッドの libtest では動かないため）。
+    pub(in crate::exec) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError> {
+        crate::exec::no_new_privs::testing::rec("capability_drop");
+        let mut k = Fake::new();
+        k.drop_err = DROP_ERR.with(Cell::take);
+        apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut k)
+    }
 
     /// 偽カーネルの状態と、呼び出し記録・注入するエラー。
     pub(super) struct Fake {

@@ -36,16 +36,22 @@
 //!   `ErrorCode::Internal` の [`TraitError`] で返す。途中失敗時は部分的な行が書かれうる
 //!   （再送・重複排除は呼び出し元の責務）
 //!
+//! # ライフサイクル操作の計装（TASK-84.4）
+//!
+//! `oci_runtime` の create（TASK-29.2）・start（TASK-29.3）・kill（TASK-30.1）・delete（TASK-30.2）は、
+//! 依存注入された `&OpRecorder` へ `record_op` で固定の操作名（`create`・`start`・`kill`・`delete`）を
+//! 記録する（全終了経路）。`tests/oci_lifecycle.rs` が 1 つの記録器を共有した際の反映を照合する。
+//!
 //! # 未実装範囲（REPAIR-3）
 //!
 //! 以下は未実装である。
 //!
-//! - create / start / kill / delete への計装: TASK-84.4（create は TASK-29.2 で計装済み）
 //! - io の read / write 向け連携点は io 側の `fandhe_container_io::instrument::IoOpRecorder`
 //!   として定義済み（TASK-84.5）。core との接続は core と io の両方に依存する上位 crate の
 //!   newtype アダプタで行う（core → io 依存辺は未承認のため core には置かない）。
 //!   io 側の計装は TASK-84.7
-//! - 結合テスト: TASK-84.6
+//! - 結合テスト: 分布（min / mean / p95 / max）・件数の照合は `tests/observability.rs`
+//!   （TASK-84.6）で実装済み
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -411,7 +417,7 @@ struct RecorderState {
 /// 操作の成功 / 失敗とレイテンシをスレッドセーフに集計する記録器（REPAIR-4・TASK-84.2）。
 ///
 /// supervisor・core のライフサイクル操作や io の read / write の計装が、`Arc<OpRecorder>` で
-/// 共有して呼ぶ想定（保持場所は TASK-84.4 で決める。io からは io 側トレイトのアダプタ経由。TASK-84.5。グローバル static は置かない）。
+/// 共有して呼ぶ想定（呼び出し元が `&OpRecorder` を依存注入で渡し、保持者は supervisor〔TASK-157〕・CLI 側。io からは io 側トレイトのアダプタ経由。TASK-84.5。グローバル static は置かない）。
 /// 集計全体を `Mutex` 1 個で保護する。`record` のロック保持は O(1)、`snapshot` / `snapshot_op` は
 /// ロック中に保持中のウィンドウ（操作あたり最大 1024 件）を複製するため、保持時間は操作数 × ウィンドウ長に
 /// 比例する上限付きの定数（ソート・集計はロック外）。ユーザーのクロージャは

@@ -42,7 +42,9 @@
 //!
 //! - 本関数が解放するのは `StateStore` のレコードだけ。状態ファイル（ファイルベース実装）の削除確認と
 //!   cgroup の削除は TASK-30.3・TASK-32（CORE-3）、OCI-7 の参照テーブルからの参照解除は TASK-183
-//!   （`StateStore` 削除の後に組み込む予定）で、いずれも未実装
+//!   （`StateStore` 削除の後に組み込む予定）で、いずれも未実装。子 cgroup の削除 API
+//!   （`cgroups::DelegatedCgroup::remove_child`。Linux 限定・TASK-32.1）はあるが、create / start が
+//!   まだ cgroup を作らない（起動フローへの組み込みは TASK-32.4）ため delete からは呼ばない（結線は TASK-30 系）
 //! - `force`（停止してから削除。`ContainerRuntime::delete` の契約）は stop が未実装のため、生きている
 //!   可能性のある状態では `Unimplemented` で拒否する
 //!

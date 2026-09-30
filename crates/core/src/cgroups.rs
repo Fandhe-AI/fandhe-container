@@ -1,0 +1,1263 @@
+//! 委譲済み cgroup v2 の検出と、コンテナ用子 cgroup の作成（CORE-3・TASK-32.1・MS-2・#158）。
+//!
+//! # 役割
+//! 非特権ユーザーに委譲された cgroup v2 サブツリー（自プロセスが属する cgroup）を検出し、その
+//! 配下にコンテナ用の子 cgroup を作る。controller（`memory`・`cpu` 等）の有効化は、cgroup v2 の
+//! no-internal-process 制約により「自プロセスが親 cgroup から退避済み」であることが前提になる。
+//! 本モジュールはその順序を型で強制する: [`DelegatedCgroup::prepare`] が退避と検証を済ませて
+//! 証明トークン [`Evacuated`] を返し、[`DelegatedCgroup::enable_controllers`] はそのトークンを
+//! 要求する（退避前に有効化するコードはコンパイルできない）。
+//!
+//! # 呼び出し文脈・契約
+//! - 呼び出し元: 起動フロー（`oci_runtime` の start 経路。結線は TASK-32.4・#161）。本 PR では
+//!   単体の API として提供し、起動フローからはまだ呼ばれない
+//! - `unsafe` は持たない。syscall は `crate::sys` の薄いラッパー（`mkdirat`・`unlinkat`・`fstatfs`・
+//!   `O_NOFOLLOW` 付き `openat`）経由で、検証した実体を fd で固定する（TOCTOU・symlink 対策）
+//! - `/proc/self/cgroup`・`cgroup.procs` 等はカーネル応答（外部入力）として上限付きで読み、
+//!   `unwrap` / 添字アクセスを使わずに検証する
+//! - 待機を伴う処理はない（ファイル I/O のみ）ためタイムアウトは設けない
+//! - エラーは [`CgroupError`]（`ErrorCode`＋失敗した段）。`ExecError` への変換は TASK-32.4 の担当
+//!
+//! # レイアウト
+//! ```text
+//! <委譲された親 P>/            ← 自プロセスの元の所属。controller を有効化する対象
+//! ├── fc-runtime/             ← 退避リーフ（自プロセス〔runtime / supervisor〕の移動先）
+//! └── fc-<container-id>/      ← コンテナ用子 cgroup（この時点では空）
+//! ```
+//! 退避リーフは 1 supervisor = 1 委譲スコープを前提とする（CORE-1・D-19）。複数コンテナが同一
+//! スコープを共有する運用の扱いは TASK-32.4 と整合させる。退避リーフは自プロセスが入るため削除せず、
+//! スコープ終了時に systemd が回収する。
+//!
+//! # 未実装（REPAIR-3）
+//! - `memory.max` / `memory.swap.max`（TASK-32.2・#159）、`cpu.max`（TASK-32.3・#160）の書き込み
+//! - `StageHook` 化・fork 後の子の `cgroup.procs` 参加・`ExecError` への変換（TASK-32.4・#161）
+//! - OCI `linux.cgroupsPath` の反映、delete 時の cgroup 削除の結線（TASK-30 系）
+//! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
+
+use std::collections::BTreeSet;
+use std::ffi::CString;
+use std::fmt;
+use std::fs::File;
+use std::io::{Read as _, Write as _};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+use std::os::unix::fs::MetadataExt as _;
+
+use crate::sys::{self, SysError};
+use crate::traits::{ContainerId, ErrorCode};
+
+/// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
+const EVACUATION_LEAF: &str = "fc-runtime";
+/// コンテナ用子 cgroup の接頭辞。`cgroup.procs` 等のインターフェースファイル名との衝突を避ける。
+const CONTAINER_PREFIX: &str = "fc-";
+/// cgroup 名（ディレクトリ要素）の最大バイト数（`NAME_MAX`）。
+const NAME_MAX: usize = 255;
+/// `/proc/self/cgroup` の読み取り上限。
+const SELF_CGROUP_LIMIT: u64 = 64 * 1024;
+/// `cgroup.procs` の読み取り上限。
+const PROCS_LIMIT: u64 = 1024 * 1024;
+/// `cgroup.controllers` / `cgroup.subtree_control` / `cgroup.type` の読み取り上限。
+const SMALL_FILE_LIMIT: u64 = 4 * 1024;
+/// cgroup パスの要素数の上限。
+const MAX_PATH_DEPTH: usize = 64;
+/// 子 cgroup ディレクトリのモード（umask 適用前。cgroup の所有者のみ書き込み可）。
+const CGROUP_DIR_MODE: u32 = 0o755;
+
+/// 失敗した段（機械可読。AI 自己補修・ログでの切り分け用。REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CgroupStep {
+    /// `/proc/self/cgroup` の読み取り・解析。
+    ReadSelfCgroup,
+    /// `/sys/fs/cgroup` から委譲 cgroup までのディレクトリを開く段。
+    OpenRoot,
+    /// cgroup2 ファイルシステムであることの検証。
+    VerifyCgroup2,
+    /// 委譲（所有者・`cgroup.type`）の検証。
+    CheckDelegation,
+    /// `cgroup.controllers` / `cgroup.subtree_control` の読み取り。
+    ReadControllers,
+    /// 子 cgroup の作成。
+    CreateChild,
+    /// 自プロセスの退避。
+    Evacuate,
+    /// 退避状態の検証。
+    VerifyEvacuation,
+    /// controller の有効化。
+    EnableControllers,
+    /// 失敗後の後始末。
+    Cleanup,
+}
+
+/// cgroup 操作のエラー。`code` は ERR 系の機械可読コード、`message` は英語の説明。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CgroupError {
+    /// 機械可読なエラーコード。
+    pub code: ErrorCode,
+    /// 失敗した段。
+    pub step: CgroupStep,
+    /// 人間向けの説明（英語）。
+    pub message: String,
+}
+
+impl CgroupError {
+    fn new(code: ErrorCode, step: CgroupStep, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            step,
+            message: message.into(),
+        }
+    }
+
+    fn precondition(step: CgroupStep, message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::FailedPrecondition, step, message)
+    }
+}
+
+impl fmt::Display for CgroupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} at {:?}: {}",
+            self.code.as_str(),
+            self.step,
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for CgroupError {}
+
+/// errno を `ErrorCode` へ写す。
+fn errno_code(errno: i32) -> ErrorCode {
+    if errno == sys::EPERM || errno == sys::EACCES {
+        ErrorCode::PermissionDenied
+    } else if errno == sys::EBUSY || errno == sys::ENOTEMPTY {
+        ErrorCode::FailedPrecondition
+    } else if errno == sys::EEXIST {
+        ErrorCode::AlreadyExists
+    } else if errno == sys::ENOENT {
+        ErrorCode::NotFound
+    } else {
+        ErrorCode::Internal
+    }
+}
+
+fn sys_error(step: CgroupStep, what: &str, err: SysError) -> CgroupError {
+    match err {
+        SysError::Unsupported => CgroupError::new(
+            ErrorCode::Unimplemented,
+            step,
+            format!("{what}: unsupported architecture"),
+        ),
+        SysError::Os(errno) => {
+            CgroupError::new(errno_code(errno), step, format!("{what}: errno {errno}"))
+        }
+        SysError::MultiThreaded => CgroupError::new(
+            ErrorCode::FailedPrecondition,
+            step,
+            format!("{what}: multi-threaded process"),
+        ),
+    }
+}
+
+fn io_error(step: CgroupStep, what: &str, err: &std::io::Error) -> CgroupError {
+    match err.raw_os_error() {
+        Some(errno) => CgroupError::new(errno_code(errno), step, format!("{what}: errno {errno}")),
+        None => CgroupError::new(ErrorCode::Internal, step, format!("{what}: {}", err.kind())),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 純関数（カーネル応答の解析。`unsafe`・I/O なし）
+// ---------------------------------------------------------------------------------------------
+
+/// 検証済みの cgroup 相対パス（`/sys/fs/cgroup` 起点。ルート cgroup は空）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CgroupPath {
+    components: Vec<String>,
+}
+
+impl CgroupPath {
+    fn is_root(&self) -> bool {
+        self.components.is_empty()
+    }
+
+    fn child(&self, name: &str) -> Self {
+        let mut components = self.components.clone();
+        components.push(name.to_owned());
+        Self { components }
+    }
+
+    /// `"/a/b"` 形式（ルートは `"/"`）。
+    fn display(&self) -> String {
+        if self.components.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("/{}", self.components.join("/"))
+        }
+    }
+}
+
+/// パス要素 1 つを検証する（`.`・`..`・空・NUL・過大長を拒否）。
+fn validate_component(step: CgroupStep, comp: &str) -> Result<(), CgroupError> {
+    if comp.is_empty()
+        || comp == "."
+        || comp == ".."
+        || comp.len() > NAME_MAX
+        || comp.contains('\0')
+    {
+        return Err(CgroupError::precondition(
+            step,
+            "cgroup path contains an invalid component",
+        ));
+    }
+    Ok(())
+}
+
+/// `/proc/self/cgroup` の内容から v2 unified 行（`0::<path>`）のパスを取り出す。
+///
+/// v1 行（`<n>:<controllers>:<path>`）が 1 行でも混在する hybrid 構成は非対応（CORE-4・SEC-6）として
+/// 拒否する。`0::` 行が無い・複数ある・`(deleted)` 付き・相対 / `..` を含む・過大長も、カーネル応答の
+/// 異常として fail-closed（`FailedPrecondition`）にする。
+fn parse_self_cgroup_v2(text: &str) -> Result<CgroupPath, CgroupError> {
+    let step = CgroupStep::ReadSelfCgroup;
+    let mut found: Option<&str> = None;
+    for line in text.lines() {
+        if !line.is_empty() && !line.starts_with("0::") {
+            return Err(CgroupError::precondition(
+                step,
+                "cgroup v1 or hybrid hierarchy detected in /proc/self/cgroup (only pure cgroup v2 is supported)",
+            ));
+        }
+        if let Some(path) = line.strip_prefix("0::") {
+            if found.is_some() {
+                return Err(CgroupError::precondition(
+                    step,
+                    "multiple cgroup v2 entries in /proc/self/cgroup",
+                ));
+            }
+            found = Some(path);
+        }
+    }
+    let path = found.ok_or_else(|| {
+        CgroupError::precondition(
+            step,
+            "no cgroup v2 entry in /proc/self/cgroup (v1/hybrid only)",
+        )
+    })?;
+    if path.ends_with(" (deleted)") {
+        return Err(CgroupError::precondition(
+            step,
+            "own cgroup has been deleted",
+        ));
+    }
+    let rest = path.strip_prefix('/').ok_or_else(|| {
+        CgroupError::precondition(step, "cgroup path in /proc/self/cgroup is not absolute")
+    })?;
+    if rest.is_empty() {
+        return Ok(CgroupPath {
+            components: Vec::new(),
+        });
+    }
+    let mut components = Vec::new();
+    for comp in rest.split('/') {
+        validate_component(step, comp)?;
+        if components.len() >= MAX_PATH_DEPTH {
+            return Err(CgroupError::precondition(step, "cgroup path is too deep"));
+        }
+        components.push(comp.to_owned());
+    }
+    Ok(CgroupPath { components })
+}
+
+/// 既知の cgroup v2 controller。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Controller {
+    /// `cpu`（`cpu.max` 等。TASK-32.3）。
+    Cpu,
+    /// `cpuset`。
+    Cpuset,
+    /// `io`。
+    Io,
+    /// `memory`（`memory.max` 等。TASK-32.2）。
+    Memory,
+    /// `hugetlb`。
+    Hugetlb,
+    /// `pids`。
+    Pids,
+    /// `rdma`。
+    Rdma,
+    /// `misc`。
+    Misc,
+}
+
+impl Controller {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cpuset => "cpuset",
+            Self::Io => "io",
+            Self::Memory => "memory",
+            Self::Hugetlb => "hugetlb",
+            Self::Pids => "pids",
+            Self::Rdma => "rdma",
+            Self::Misc => "misc",
+        }
+    }
+
+    fn from_token(token: &str) -> Option<Self> {
+        Some(match token {
+            "cpu" => Self::Cpu,
+            "cpuset" => Self::Cpuset,
+            "io" => Self::Io,
+            "memory" => Self::Memory,
+            "hugetlb" => Self::Hugetlb,
+            "pids" => Self::Pids,
+            "rdma" => Self::Rdma,
+            "misc" => Self::Misc,
+            _ => return None,
+        })
+    }
+}
+
+/// controller の集合。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControllerSet {
+    items: BTreeSet<Controller>,
+}
+
+impl ControllerSet {
+    /// 指定した controller から集合を作る。
+    pub fn of(controllers: &[Controller]) -> Self {
+        Self {
+            items: controllers.iter().copied().collect(),
+        }
+    }
+
+    /// `cgroup.controllers` / `cgroup.subtree_control` の空白区切りトークンを解析する。
+    /// 未知のトークンは将来のカーネル互換のため無視する。
+    pub fn parse(text: &str) -> Self {
+        Self {
+            items: text
+                .split_whitespace()
+                .filter_map(Controller::from_token)
+                .collect(),
+        }
+    }
+
+    /// `controller` を含むか。
+    pub fn contains(&self, controller: Controller) -> bool {
+        self.items.contains(&controller)
+    }
+
+    /// 要素を昇順で列挙する。
+    pub fn iter(&self) -> impl Iterator<Item = Controller> + '_ {
+        self.items.iter().copied()
+    }
+
+    /// 空か。
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// `self` がすべて `other` に含まれるか。
+    fn is_subset(&self, other: &Self) -> bool {
+        self.items.is_subset(&other.items)
+    }
+
+    /// `cgroup.subtree_control` へ書く `+a +b` 形式。
+    fn to_enable_request(&self) -> String {
+        self.items
+            .iter()
+            .map(|c| format!("+{}", c.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// `cgroup.procs` の内容（改行区切りの PID 列）を解析する。非数値は `FailedPrecondition`。
+fn parse_procs(step: CgroupStep, text: &str) -> Result<Vec<u32>, CgroupError> {
+    let mut pids = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let pid = line.trim().parse::<u32>().map_err(|_| {
+            CgroupError::precondition(step, "cgroup.procs contains a non-numeric entry")
+        })?;
+        pids.push(pid);
+    }
+    Ok(pids)
+}
+
+/// `cgroup.subtree_control` へ書き込んだ後に読み戻した集合 `enabled` が、要求 `want` をすべて含むことを
+/// 検証する（CORE-3）。カーネルは 1 回の書き込みを全部か無しで適用するため、書き込み成功後の不足は
+/// 同じ親を操作する別主体の `-<controller>` 書き込み等の競合を意味する。要求を満たさない状態を成功と
+/// して返さないよう `FailedPrecondition` にする（何が有効だったかは書き込み前に分からないため巻き戻さない）。
+fn verify_enabled(want: &ControllerSet, enabled: &ControllerSet) -> Result<(), CgroupError> {
+    let missing: Vec<&str> = want
+        .iter()
+        .filter(|c| !enabled.contains(*c))
+        .map(Controller::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(CgroupError::precondition(
+        CgroupStep::EnableControllers,
+        format!(
+            "controllers not enabled after writing cgroup.subtree_control: {}",
+            missing.join(" ")
+        ),
+    ))
+}
+
+/// 削除後に保持 fd 経由で interface ファイルを開いた結果が「保持していた cgroup が削除済み」を示すか。
+///
+/// `rmdir` 成功後のディレクトリ inode は dead（`S_DEAD`）になり、それを起点にした lookup は `ENOENT`
+/// を返す。削除済みの証拠として扱うのは `ENOENT` だけで、`EACCES`・`EINTR`・`EMFILE` 等の他の失敗は
+/// 保持していた cgroup が残っている可能性を否定できないため成功扱いしない（fail-closed）。
+fn removal_confirmed(err: &SysError) -> bool {
+    matches!(err, SysError::Os(e) if *e == sys::ENOENT)
+}
+
+/// 要求された controller が利用可能集合に収まることを書き込み前に検証する。
+fn validate_controller_request(
+    available: &ControllerSet,
+    want: &ControllerSet,
+) -> Result<(), CgroupError> {
+    if want.is_empty() {
+        return Err(CgroupError::new(
+            ErrorCode::InvalidArgument,
+            CgroupStep::EnableControllers,
+            "no controllers requested",
+        ));
+    }
+    if !want.is_subset(available) {
+        return Err(CgroupError::precondition(
+            CgroupStep::EnableControllers,
+            "requested controllers are not available in the delegated cgroup",
+        ));
+    }
+    Ok(())
+}
+
+/// コンテナ用子 cgroup の名前（`fc-<container-id>`）。検証済みの 1 要素。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CgroupName(String);
+
+impl CgroupName {
+    /// `ContainerId`（文字種検証済み）から名前を作る。接頭辞込みで 255 バイトを超えると
+    /// `InvalidArgument`。`fc-runtime`（退避リーフ）と同名になる ID `runtime` は拒否する。
+    pub fn new(id: &ContainerId) -> Result<Self, CgroupError> {
+        let name = format!("{CONTAINER_PREFIX}{}", id.as_str());
+        if name.len() > NAME_MAX {
+            return Err(CgroupError::new(
+                ErrorCode::InvalidArgument,
+                CgroupStep::CreateChild,
+                "cgroup name exceeds 255 bytes",
+            ));
+        }
+        if name == EVACUATION_LEAF {
+            return Err(CgroupError::new(
+                ErrorCode::InvalidArgument,
+                CgroupStep::CreateChild,
+                "container id \"runtime\" is reserved for the evacuation leaf",
+            ));
+        }
+        Ok(Self(name))
+    }
+
+    /// 名前の文字列表現（`fc-<id>`）。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// fd ベースの操作
+// ---------------------------------------------------------------------------------------------
+
+fn cstring(step: CgroupStep, s: &str) -> Result<CString, CgroupError> {
+    CString::new(s).map_err(|_| CgroupError::precondition(step, "name contains NUL"))
+}
+
+/// fd から上限付きで UTF-8 文字列を読む。上限超過・非 UTF-8 は `FailedPrecondition`。
+fn read_limited(step: CgroupStep, fd: OwnedFd, limit: u64) -> Result<String, CgroupError> {
+    let mut buf = Vec::new();
+    File::from(fd)
+        .take(limit + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| io_error(step, "read", &e))?;
+    if buf.len() as u64 > limit {
+        return Err(CgroupError::precondition(
+            step,
+            "kernel response exceeds size limit",
+        ));
+    }
+    String::from_utf8(buf)
+        .map_err(|_| CgroupError::precondition(step, "kernel response is not valid UTF-8"))
+}
+
+/// `dir` 配下のインターフェースファイルを上限付きで読む。
+fn read_iface(
+    step: CgroupStep,
+    dir: BorrowedFd<'_>,
+    file: &str,
+    limit: u64,
+) -> Result<String, CgroupError> {
+    let name = cstring(step, file)?;
+    let fd = sys::open_read_at(dir, &name).map_err(|e| sys_error(step, file, e))?;
+    read_limited(step, fd, limit)
+}
+
+fn read_self_cgroup() -> Result<CgroupPath, CgroupError> {
+    let step = CgroupStep::ReadSelfCgroup;
+    let file = File::open("/proc/self/cgroup")
+        .map_err(|e| io_error(step, "open /proc/self/cgroup", &e))?;
+    let text = read_limited(step, OwnedFd::from(file), SELF_CGROUP_LIMIT)?;
+    parse_self_cgroup_v2(&text)
+}
+
+/// fd の (dev, ino)（O_PATH fd でも `fstat` できる）。同一ディレクトリ判定に使う。
+/// `step` は失敗時のエラーに載せる呼び出し元の段（REPAIR-4 の切り分け用）。
+fn dir_identity(
+    step: CgroupStep,
+    fd: BorrowedFd<'_>,
+    what: &str,
+) -> Result<(u64, u64), CgroupError> {
+    let dup = fd
+        .try_clone_to_owned()
+        .map_err(|e| io_error(step, what, &e))?;
+    File::from(dup)
+        .metadata()
+        .map(|m| (m.dev(), m.ino()))
+        .map_err(|e| io_error(step, what, &e))
+}
+
+fn verify_cgroup2(fd: BorrowedFd<'_>, what: &str) -> Result<(), CgroupError> {
+    let step = CgroupStep::VerifyCgroup2;
+    let t = sys::fs_type(fd).map_err(|e| sys_error(step, what, e))?;
+    if t != sys::CGROUP2_MAGIC {
+        return Err(CgroupError::precondition(
+            step,
+            format!("{what} is not a cgroup2 filesystem"),
+        ));
+    }
+    Ok(())
+}
+
+/// fd の所有者 uid（O_PATH fd でも `fstat` できる）。
+fn owner_uid(step: CgroupStep, fd: OwnedFd, what: &str) -> Result<u32, CgroupError> {
+    File::from(fd)
+        .metadata()
+        .map(|m| m.uid())
+        .map_err(|e| io_error(step, what, &e))
+}
+
+/// `dir` 配下の cgroup ディレクトリを O_PATH で開き、cgroup2 であることを確認する。
+fn open_cgroup_dir(
+    step: CgroupStep,
+    dir: BorrowedFd<'_>,
+    name: &str,
+) -> Result<OwnedFd, CgroupError> {
+    let c = cstring(step, name)?;
+    let fd = sys::open_dir_path_nofollow(Some(dir), &c).map_err(|e| sys_error(step, name, e))?;
+    verify_cgroup2(fd.as_fd(), name)?;
+    Ok(fd)
+}
+
+/// 委譲された cgroup（検出結果）。
+#[derive(Debug)]
+pub struct DelegatedCgroup {
+    path: CgroupPath,
+    fd: OwnedFd,
+    controllers: ControllerSet,
+}
+
+/// コンテナ用子 cgroup。O_PATH ディレクトリ fd を保持し、fork 後の子が fd 経由で `cgroup.procs` へ
+/// 書けるようにする（`exec/stages.rs` の契約。TASK-32.4）。
+#[derive(Debug)]
+pub struct ContainerCgroup {
+    name: CgroupName,
+    fd: OwnedFd,
+    /// 作成時の親 cgroup の (dev, ino)。`remove_child` で別スコープの親への流用を拒否する。
+    parent_id: (u64, u64),
+}
+
+impl ContainerCgroup {
+    /// cgroup 名。
+    pub fn name(&self) -> &CgroupName {
+        &self.name
+    }
+
+    /// cgroup ディレクトリの fd（O_PATH。`openat` の dirfd 専用）。
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+/// 自プロセスの退避が完了し検証済みであることの証明。`cgroups` モジュール内でのみ生成できる。
+#[derive(Debug)]
+pub struct Evacuated {
+    /// 退避元（委譲された親）のパス。別の委譲スコープへの流用を防ぐ。
+    parent: CgroupPath,
+    /// 退避元の親 cgroup ディレクトリの (dev, ino)。同パスの cgroup が置換された場合の検出に使う。
+    parent_id: (u64, u64),
+}
+
+/// `prepare` の途中失敗時に巻き戻す対象の記録。
+#[derive(Debug, Default)]
+struct Rollback {
+    /// 自プロセスを退避リーフへ移した（または移した可能性がある）。
+    moved: bool,
+    /// 退避リーフを本処理が新規作成した（既存の再利用では削除しない）。
+    leaf_created: bool,
+    /// 新規作成した退避リーフの fd（`leaf_created` のときのみ）。削除時の同一性確認に使う。
+    /// 作成後に開けなかった場合は `None` のままで、名前指定の削除に落ちる（結果に未検証と記す）。
+    leaf_fd: Option<OwnedFd>,
+}
+
+/// `parent` 配下の `name` を名前指定で削除する（保持 fd が無い巻き戻し経路専用）。
+/// 削除した実体が本処理の作成物か確認できないため、成否にかかわらず結果を `err` に併記する。
+fn remove_unverified(parent: BorrowedFd<'_>, name: &str, err: &mut CgroupError) {
+    let step = CgroupStep::Cleanup;
+    let outcome = cstring(step, name)
+        .and_then(|c| sys::remove_dir_at(parent, &c).map_err(|e| sys_error(step, "rmdir", e)));
+    match outcome {
+        Ok(()) => err.message.push_str(&format!(
+            "; {name} was removed by name without identity verification"
+        )),
+        Err(e) => err
+            .message
+            .push_str(&format!("; cleanup of {name} failed ({})", e.message)),
+    }
+}
+
+impl DelegatedCgroup {
+    /// 委譲された cgroup（自プロセスが属する cgroup v2）を検出する。
+    ///
+    /// 検証: v2 unified 行の取得・`/sys/fs/cgroup` と対象の cgroup2 確認・委譲（euid が 0、または
+    /// ディレクトリ・`cgroup.procs`・`cgroup.subtree_control` の所有者が euid）・`cgroup.type` が
+    /// `domain`。ルート cgroup は euid 0 のときのみ許可する。
+    pub fn detect() -> Result<Self, CgroupError> {
+        let path = read_self_cgroup()?;
+        let euid = sys::effective_uid();
+        if path.is_root() && euid != 0 {
+            return Err(CgroupError::new(
+                ErrorCode::PermissionDenied,
+                CgroupStep::CheckDelegation,
+                "own cgroup is the root cgroup and the process is not root",
+            ));
+        }
+        let open_step = CgroupStep::OpenRoot;
+        let mut cur = {
+            let slash = cstring(open_step, "/")?;
+            sys::open_dir_path_nofollow(None, &slash).map_err(|e| sys_error(open_step, "/", e))?
+        };
+        for comp in ["sys", "fs", "cgroup"] {
+            let c = cstring(open_step, comp)?;
+            cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c)
+                .map_err(|e| sys_error(open_step, comp, e))?;
+        }
+        verify_cgroup2(cur.as_fd(), "/sys/fs/cgroup")?;
+        for comp in &path.components {
+            cur = open_cgroup_dir(open_step, cur.as_fd(), comp)?;
+        }
+        let fd = cur;
+
+        if euid != 0 {
+            check_owned_by(&fd, euid)?;
+        }
+        // `cgroup.type` はルート cgroup にのみ存在しない。非ルートで欠落する場合は
+        // 委譲済みと確認できないため fail-closed でエラーにする（ENOENT を許容するのはルートのみ）。
+        match read_iface(
+            CgroupStep::CheckDelegation,
+            fd.as_fd(),
+            "cgroup.type",
+            SMALL_FILE_LIMIT,
+        ) {
+            Ok(t) if t.trim() != "domain" => {
+                return Err(CgroupError::precondition(
+                    CgroupStep::CheckDelegation,
+                    "delegated cgroup is not of type domain",
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.code == ErrorCode::NotFound && path.is_root() => {}
+            Err(e) => return Err(e),
+        }
+        let controllers = ControllerSet::parse(&read_iface(
+            CgroupStep::ReadControllers,
+            fd.as_fd(),
+            "cgroup.controllers",
+            SMALL_FILE_LIMIT,
+        )?);
+        Ok(Self {
+            path,
+            fd,
+            controllers,
+        })
+    }
+
+    /// 親 cgroup で利用可能な controller（`cgroup.controllers`）。
+    pub fn controllers(&self) -> &ControllerSet {
+        &self.controllers
+    }
+
+    /// 委譲された cgroup のパス（`/sys/fs/cgroup` 起点。例 `/user.slice/x.scope`）。
+    pub fn path(&self) -> String {
+        self.path.display()
+    }
+
+    /// 親 cgroup ディレクトリの fd（O_PATH）。
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
+    /// コンテナ用子 cgroup を作り、自プロセスを退避リーフへ移し、退避を検証する。
+    ///
+    /// 検証（すべて満たさなければ `FailedPrecondition`）: 自プロセスの現在の所属が検出済みの親で親の
+    /// `cgroup.procs` に自プロセスがいる・親の `cgroup.procs` に自プロセス以外が
+    /// いない（他者の PID は動かさない）・退避後に親の `cgroup.procs` が空・`/proc/self/cgroup` が
+    /// 退避リーフを指す・コンテナ用子 cgroup の `cgroup.procs` が空。既存の同名子 cgroup は採用せず
+    /// `AlreadyExists`。途中失敗時は、自プロセスを移していれば元の親へ戻して所属を読み戻しで検証し、
+    /// 本処理が作った子 cgroup・退避リーフを作成直後に固定した fd との同一性を確認してから best-effort で
+    /// 削除する（[`Self::remove_verified`]。巻き戻しの失敗・fd が無く名前指定で消した事実はエラー文に併記）。
+    pub fn prepare(&self, name: &CgroupName) -> Result<(ContainerCgroup, Evacuated), CgroupError> {
+        let me = std::process::id();
+        let parent_procs = parse_procs(
+            CgroupStep::Evacuate,
+            &read_iface(
+                CgroupStep::Evacuate,
+                self.fd.as_fd(),
+                "cgroup.procs",
+                PROCS_LIMIT,
+            )?,
+        )?;
+        // detect 後に自プロセスが別 cgroup へ移っていると、別の所属先から退避リーフへ移してしまう。
+        // 現在の所属が検出済みの親であり、親の PID 一覧に自プロセスがいることを退避前に確認する。
+        let current = read_self_cgroup().map_err(|mut e| {
+            e.step = CgroupStep::Evacuate;
+            e
+        })?;
+        if current != self.path || !parent_procs.contains(&me) {
+            return Err(CgroupError::precondition(
+                CgroupStep::Evacuate,
+                "current process is not in the detected delegated cgroup; refusing to evacuate",
+            ));
+        }
+        if parent_procs.iter().any(|p| *p != me) {
+            return Err(CgroupError::precondition(
+                CgroupStep::Evacuate,
+                "delegated cgroup contains other processes; refusing to move them",
+            ));
+        }
+
+        let child_name = cstring(CgroupStep::CreateChild, name.as_str())?;
+        sys::mkdir_at(self.fd.as_fd(), &child_name, CGROUP_DIR_MODE)
+            .map_err(|e| sys_error(CgroupStep::CreateChild, name.as_str(), e))?;
+        // 作成直後の子を fd で固定する。以後の巻き戻しはこの fd との同一性を確認してから削除する。
+        let child_fd =
+            match open_cgroup_dir(CgroupStep::CreateChild, self.fd.as_fd(), name.as_str()) {
+                Ok(fd) => fd,
+                Err(mut err) => {
+                    remove_unverified(self.fd.as_fd(), name.as_str(), &mut err);
+                    return Err(err);
+                }
+            };
+
+        let mut rollback = Rollback::default();
+        match self.evacuate_and_verify(child_fd.as_fd(), &mut rollback) {
+            Ok(parent_id) => Ok((
+                ContainerCgroup {
+                    name: name.clone(),
+                    fd: child_fd,
+                    parent_id,
+                },
+                Evacuated {
+                    parent: self.path.clone(),
+                    parent_id,
+                },
+            )),
+            Err(mut err) => {
+                // 自プロセスを退避リーフへ移した後の失敗は、元の親へ戻してから子・退避リーフを削除する。
+                if rollback.moved
+                    && let Err(e) = self.restore_self()
+                {
+                    err.message.push_str(&format!(
+                        "; restoring process membership failed ({})",
+                        e.message
+                    ));
+                }
+                if rollback.leaf_created {
+                    match &rollback.leaf_fd {
+                        Some(leaf_fd) => {
+                            if let Err(e) = self.remove_verified(EVACUATION_LEAF, leaf_fd.as_fd()) {
+                                err.message.push_str(&format!(
+                                    "; cleanup of {EVACUATION_LEAF} failed ({})",
+                                    e.message
+                                ));
+                            }
+                        }
+                        None => remove_unverified(self.fd.as_fd(), EVACUATION_LEAF, &mut err),
+                    }
+                }
+                if let Err(e) = self.remove_verified(name.as_str(), child_fd.as_fd()) {
+                    err.message.push_str(&format!(
+                        "; cleanup of {} failed ({})",
+                        name.as_str(),
+                        e.message
+                    ));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// 自プロセスを委譲された親 cgroup へ戻す（退避後に失敗した場合の巻き戻し）。
+    ///
+    /// 書き込みの成功だけでは所属の復元を確認できないため、書き込み後に `/proc/self/cgroup` が
+    /// 検出済みの親を指すことを読み戻して検証する（不一致は `FailedPrecondition`）。
+    fn restore_self(&self) -> Result<(), CgroupError> {
+        let step = CgroupStep::Cleanup;
+        let procs = cstring(step, "cgroup.procs")?;
+        let wfd = sys::open_write_at(self.fd.as_fd(), &procs)
+            .map_err(|e| sys_error(step, "open parent cgroup.procs", e))?;
+        File::from(wfd)
+            .write_all(std::process::id().to_string().as_bytes())
+            .map_err(|e| io_error(step, "write parent cgroup.procs", &e))?;
+        let actual = read_self_cgroup().map_err(|mut e| {
+            e.step = step;
+            e
+        })?;
+        if actual != self.path {
+            return Err(CgroupError::precondition(
+                step,
+                format!(
+                    "self cgroup is {} after restoring, expected {}",
+                    actual.display(),
+                    self.path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 自プロセスを退避リーフへ移し、退避を検証する。成功時は親 cgroup の (dev, ino) を返す。
+    /// `child` は `prepare` が作成直後に固定したコンテナ用子 cgroup の fd。
+    fn evacuate_and_verify(
+        &self,
+        child: BorrowedFd<'_>,
+        rollback: &mut Rollback,
+    ) -> Result<(u64, u64), CgroupError> {
+        // 退避リーフ。既存なら再利用（cgroup2 であることは open_cgroup_dir が確認する）。
+        let leaf_c = cstring(CgroupStep::CreateChild, EVACUATION_LEAF)?;
+        match sys::mkdir_at(self.fd.as_fd(), &leaf_c, CGROUP_DIR_MODE) {
+            Ok(()) => rollback.leaf_created = true,
+            Err(SysError::Os(e)) if e == sys::EEXIST => {}
+            Err(e) => return Err(sys_error(CgroupStep::CreateChild, EVACUATION_LEAF, e)),
+        }
+        let leaf_fd = open_cgroup_dir(CgroupStep::Evacuate, self.fd.as_fd(), EVACUATION_LEAF)?;
+        if rollback.leaf_created {
+            // 巻き戻し時の同一性確認用に複製を持たせる（失敗時は名前指定の削除に落ちる）。
+            rollback.leaf_fd = Some(
+                leaf_fd
+                    .try_clone()
+                    .map_err(|e| io_error(CgroupStep::Evacuate, "dup leaf cgroup fd", &e))?,
+            );
+        }
+
+        // TGID を書くとスレッドグループ全体が移動する。
+        let procs = cstring(CgroupStep::Evacuate, "cgroup.procs")?;
+        let wfd = sys::open_write_at(leaf_fd.as_fd(), &procs)
+            .map_err(|e| sys_error(CgroupStep::Evacuate, "open leaf cgroup.procs", e))?;
+        // 書き込みが部分的に効いた場合に備え、書き込み前に移動済みとして扱う（復元は冪等）。
+        rollback.moved = true;
+        File::from(wfd)
+            .write_all(std::process::id().to_string().as_bytes())
+            .map_err(|e| io_error(CgroupStep::Evacuate, "write leaf cgroup.procs", &e))?;
+
+        let verify = CgroupStep::VerifyEvacuation;
+        // 検証 1: 親に誰も残っていない。
+        let remaining = parse_procs(
+            verify,
+            &read_iface(verify, self.fd.as_fd(), "cgroup.procs", PROCS_LIMIT)?,
+        )?;
+        if !remaining.is_empty() {
+            return Err(CgroupError::precondition(
+                verify,
+                "delegated cgroup still has processes after evacuation",
+            ));
+        }
+        // 検証 2: 自プロセスの所属が退避リーフである。
+        let expected = self.path.child(EVACUATION_LEAF);
+        let actual = read_self_cgroup().map_err(|mut e| {
+            e.step = verify;
+            e
+        })?;
+        if actual != expected {
+            return Err(CgroupError::precondition(
+                verify,
+                format!(
+                    "self cgroup is {} after evacuation, expected {}",
+                    actual.display(),
+                    expected.display()
+                ),
+            ));
+        }
+        // 検証 3: 自プロセスがコンテナ用子 cgroup の外にいる（子が空）。
+        let in_child = parse_procs(
+            verify,
+            &read_iface(verify, child, "cgroup.procs", PROCS_LIMIT)?,
+        )?;
+        if !in_child.is_empty() {
+            return Err(CgroupError::precondition(
+                verify,
+                "container cgroup is not empty after evacuation",
+            ));
+        }
+
+        dir_identity(verify, self.fd.as_fd(), "stat parent cgroup")
+    }
+
+    /// 親 cgroup の `cgroup.subtree_control` で controller を有効化し、有効化後の集合を返す。
+    ///
+    /// 退避済みの証明 [`Evacuated`] を要求する（no-internal-process 制約。CORE-3）。`want` が
+    /// 利用可能集合に収まらない場合は書き込まず `FailedPrecondition`。書き込み後に読み戻した集合が
+    /// `want` をすべて含まない場合も `FailedPrecondition`（要求を満たさない状態を成功として返さない）。
+    pub fn enable_controllers(
+        &self,
+        proof: &Evacuated,
+        want: &ControllerSet,
+    ) -> Result<ControllerSet, CgroupError> {
+        let step = CgroupStep::EnableControllers;
+        if proof.parent != self.path {
+            return Err(CgroupError::precondition(
+                step,
+                "evacuation proof belongs to a different cgroup",
+            ));
+        }
+        validate_controller_request(&self.controllers, want)?;
+        // トークン取得後に親が置換された・自プロセスが親へ戻った場合は書き込まない
+        // （no-internal-process 制約違反の防止）。
+        let current_id = dir_identity(step, self.fd.as_fd(), "stat parent cgroup")?;
+        if current_id != proof.parent_id {
+            return Err(CgroupError::precondition(
+                step,
+                "delegated cgroup no longer matches the evacuation proof",
+            ));
+        }
+        let remaining = parse_procs(
+            step,
+            &read_iface(step, self.fd.as_fd(), "cgroup.procs", PROCS_LIMIT)?,
+        )?;
+        if !remaining.is_empty() {
+            return Err(CgroupError::precondition(
+                step,
+                "delegated cgroup has processes again; evacuation is no longer valid",
+            ));
+        }
+        let name = cstring(step, "cgroup.subtree_control")?;
+        let wfd = sys::open_write_at(self.fd.as_fd(), &name)
+            .map_err(|e| sys_error(step, "open cgroup.subtree_control", e))?;
+        File::from(wfd)
+            .write_all(want.to_enable_request().as_bytes())
+            .map_err(|e| io_error(step, "write cgroup.subtree_control", &e))?;
+        let enabled = ControllerSet::parse(&read_iface(
+            step,
+            self.fd.as_fd(),
+            "cgroup.subtree_control",
+            SMALL_FILE_LIMIT,
+        )?);
+        verify_enabled(want, &enabled)?;
+        Ok(enabled)
+    }
+
+    /// コンテナ用子 cgroup を削除する（空であること。残りがあれば `FailedPrecondition`）。
+    ///
+    /// `child` は借用で受けるため、`EBUSY` 等で失敗しても呼び出し側がハンドルを保持したまま再試行できる。
+    /// `child` がこの親の配下で作られたものであることを確認したうえで、[`Self::remove_verified`] で
+    /// 同一性確認・削除・削除済み確認を行う。
+    pub fn remove_child(&self, child: &ContainerCgroup) -> Result<(), CgroupError> {
+        let step = CgroupStep::Cleanup;
+        if child.parent_id != dir_identity(step, self.fd.as_fd(), "stat parent cgroup")? {
+            return Err(CgroupError::precondition(
+                step,
+                "container cgroup does not belong to this delegated cgroup",
+            ));
+        }
+        self.remove_verified(child.name.as_str(), child.fd.as_fd())
+    }
+
+    /// 親直下の `name` を、保持 fd `held` と同一の cgroup であることを確かめてから削除し、削除済みを確認する。
+    /// `remove_child` と `prepare` の巻き戻し（コンテナ用子 cgroup・新規作成した退避リーフ）が共用する。
+    ///
+    /// 削除前に、親ディレクトリ上の同名エントリが `held` と同一の cgroup であることを検証する
+    /// （別スコープの同名子・差し替えられた子の誤削除を防ぐ）。cgroup の削除は fd 指定ができず
+    /// 名前指定の `unlinkat` のみのため、同一性確認と削除の間に同一 euid の別主体が同名エントリを
+    /// 差し替える競合は原理的に塞げない（親は euid 所有の委譲 cgroup で、他 UID は差し替えられない。
+    /// 削除できるのは空の cgroup のみ）。そこで削除後に `held` 経由で `cgroup.events` を開き、
+    /// `ENOENT`（[`removal_confirmed`]）のときだけ成功とする。開けた場合は別の cgroup を消したとして
+    /// `Internal`、その他の失敗は保持していた cgroup が残っている可能性を否定できないためエラーを返す。
+    fn remove_verified(&self, name: &str, held: BorrowedFd<'_>) -> Result<(), CgroupError> {
+        let step = CgroupStep::Cleanup;
+        let entry = open_cgroup_dir(step, self.fd.as_fd(), name)?;
+        if dir_identity(step, entry.as_fd(), "stat cgroup entry")?
+            != dir_identity(step, held, "stat held cgroup")?
+        {
+            return Err(CgroupError::precondition(
+                step,
+                "cgroup entry no longer matches the held handle",
+            ));
+        }
+        drop(entry);
+        let c = cstring(step, name)?;
+        sys::remove_dir_at(self.fd.as_fd(), &c).map_err(|e| sys_error(step, name, e))?;
+        let events = cstring(step, "cgroup.events")?;
+        match sys::open_read_at(held, &events) {
+            Err(e) if removal_confirmed(&e) => Ok(()),
+            Ok(_) => Err(CgroupError::new(
+                ErrorCode::Internal,
+                step,
+                "removed cgroup entry was not the held cgroup (concurrent replacement)",
+            )),
+            Err(e) => Err(sys_error(step, "confirm removal via held cgroup.events", e)),
+        }
+    }
+}
+
+/// ディレクトリ・`cgroup.procs`・`cgroup.subtree_control` の所有者がすべて `euid` であること
+/// （カーネル文書の委譲要件）。`dir` は O_PATH fd のため複製して `fstat` する。
+fn check_owned_by(dir: &OwnedFd, euid: u32) -> Result<(), CgroupError> {
+    let step = CgroupStep::CheckDelegation;
+    let denied = |what: &str| {
+        CgroupError::new(
+            ErrorCode::PermissionDenied,
+            step,
+            format!("{what} is not owned by the current user (cgroup not delegated)"),
+        )
+    };
+    let dup = dir
+        .try_clone()
+        .map_err(|e| io_error(step, "dup cgroup fd", &e))?;
+    if owner_uid(step, dup, "stat cgroup directory")? != euid {
+        return Err(denied("cgroup directory"));
+    }
+    for file in ["cgroup.procs", "cgroup.subtree_control"] {
+        let c = cstring(step, file)?;
+        let fd = sys::open_read_at(dir.as_fd(), &c).map_err(|e| sys_error(step, file, e))?;
+        if owner_uid(step, fd, file)? != euid {
+            return Err(denied(file));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(s: &str) -> Result<CgroupPath, CgroupError> {
+        parse_self_cgroup_v2(s)
+    }
+
+    /// CORE-3・TASK-32.1: v2 unified 行の解析（具体値）。
+    #[test]
+    fn core3_task32_1_parse_self_cgroup_v2_extracts_path() {
+        let p = path("0::/user.slice/user-1000.slice/x.scope\n").unwrap();
+        assert_eq!(
+            p.components,
+            vec!["user.slice", "user-1000.slice", "x.scope"]
+        );
+        assert_eq!(p.display(), "/user.slice/user-1000.slice/x.scope");
+        assert!(path("0::/\n").unwrap().is_root());
+        assert_eq!(path("0::/\n").unwrap().display(), "/");
+    }
+
+    /// CORE-4・SEC-6・TASK-32.1: hybrid（v1 行との混在）は順序を問わず fail-closed で拒否する。
+    #[test]
+    fn core4_sec6_task32_1_parse_self_cgroup_v2_rejects_hybrid() {
+        for text in [
+            "12:memory:/old\n1:name=systemd:/old2\n0::/new/leaf\n",
+            "0::/new/leaf\n1:name=systemd:/old2\n",
+        ] {
+            let e = path(text).unwrap_err();
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.step, CgroupStep::ReadSelfCgroup);
+            assert!(e.message.contains("hybrid"), "{}", e.message);
+        }
+    }
+
+    /// CORE-3・TASK-32.1: 異常なカーネル応答は fail-closed。
+    #[test]
+    fn core3_task32_1_parse_self_cgroup_v2_rejects_anomalies() {
+        let long = format!("0::/{}\n", "a".repeat(256));
+        let deep = format!("0::/{}\n", vec!["a"; 65].join("/"));
+        let cases = [
+            "",
+            "12:memory:/x\n",
+            "0::/a\n0::/b\n",
+            "0::/a/../b\n",
+            "0::/a/./b\n",
+            "0::/a//b\n",
+            "0::relative\n",
+            "0::/a/b (deleted)\n",
+            "0::/a\0b\n",
+            long.as_str(),
+            deep.as_str(),
+        ];
+        for c in cases {
+            let e = path(c).unwrap_err();
+            assert_eq!(e.code, ErrorCode::FailedPrecondition, "case {c:?}");
+            assert_eq!(e.step, CgroupStep::ReadSelfCgroup, "case {c:?}");
+        }
+    }
+
+    /// CORE-3・TASK-32.1: controller 集合の解析（未知トークン無視・空）。
+    #[test]
+    fn core3_task32_1_controller_set_parse() {
+        let s = ControllerSet::parse("cpuset cpu io memory hugetlb pids rdma misc\n");
+        assert_eq!(s.iter().count(), 8);
+        assert!(s.contains(Controller::Memory) && s.contains(Controller::Cpu));
+        let s = ControllerSet::parse("cpu future_ctl memory");
+        assert_eq!(s, ControllerSet::of(&[Controller::Cpu, Controller::Memory]));
+        assert!(ControllerSet::parse("\n").is_empty());
+        assert_eq!(
+            ControllerSet::of(&[Controller::Memory, Controller::Cpu]).to_enable_request(),
+            "+cpu +memory"
+        );
+    }
+
+    /// CORE-3・TASK-32.1: `cgroup.procs` の解析。
+    #[test]
+    fn core3_task32_1_parse_procs() {
+        let step = CgroupStep::Evacuate;
+        assert_eq!(parse_procs(step, "").unwrap(), Vec::<u32>::new());
+        assert_eq!(parse_procs(step, "\n").unwrap(), Vec::<u32>::new());
+        assert_eq!(parse_procs(step, "123\n456\n").unwrap(), vec![123, 456]);
+        assert_eq!(
+            parse_procs(step, "12x\n").unwrap_err().code,
+            ErrorCode::FailedPrecondition
+        );
+    }
+
+    /// CORE-3・TASK-32.1: cgroup 名の生成・長さ上限・予約名。
+    #[test]
+    fn core3_task32_1_cgroup_name() {
+        let id = ContainerId::new("abc").unwrap();
+        assert_eq!(CgroupName::new(&id).unwrap().as_str(), "fc-abc");
+        let ok = ContainerId::new("a".repeat(252)).unwrap();
+        assert_eq!(CgroupName::new(&ok).unwrap().as_str().len(), 255);
+        let over = ContainerId::new("a".repeat(253)).unwrap();
+        assert_eq!(
+            CgroupName::new(&over).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        let reserved = ContainerId::new("runtime").unwrap();
+        assert_eq!(
+            CgroupName::new(&reserved).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+    }
+
+    /// CORE-3・TASK-32.1: 利用可能集合外・空の要求は書き込み前に拒否する。
+    #[test]
+    fn core3_task32_1_validate_controller_request() {
+        let avail = ControllerSet::of(&[Controller::Cpu, Controller::Memory]);
+        assert_eq!(
+            validate_controller_request(&avail, &ControllerSet::of(&[Controller::Memory])),
+            Ok(())
+        );
+        let e =
+            validate_controller_request(&avail, &ControllerSet::of(&[Controller::Io])).unwrap_err();
+        assert_eq!(
+            (e.code, e.step),
+            (ErrorCode::FailedPrecondition, CgroupStep::EnableControllers)
+        );
+        let e = validate_controller_request(&avail, &ControllerSet::default()).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+    }
+
+    /// CORE-3・TASK-32.1: 書き込み後に読み戻した集合が要求をすべて含むときだけ成功（不足は具体名つき）。
+    #[test]
+    fn core3_task32_1_verify_enabled_requires_all_requested() {
+        let want = ControllerSet::of(&[Controller::Cpu, Controller::Memory]);
+        assert_eq!(verify_enabled(&want, &want.clone()), Ok(()));
+        let superset = ControllerSet::of(&[Controller::Cpu, Controller::Io, Controller::Memory]);
+        assert_eq!(verify_enabled(&want, &superset), Ok(()));
+        let e = verify_enabled(&want, &ControllerSet::of(&[Controller::Cpu])).unwrap_err();
+        assert_eq!(
+            (e.code, e.step),
+            (ErrorCode::FailedPrecondition, CgroupStep::EnableControllers)
+        );
+        assert_eq!(
+            e.message,
+            "controllers not enabled after writing cgroup.subtree_control: memory"
+        );
+        let e = verify_enabled(&want, &ControllerSet::default()).unwrap_err();
+        assert_eq!(
+            e.message,
+            "controllers not enabled after writing cgroup.subtree_control: cpu memory"
+        );
+    }
+
+    /// CORE-3・TASK-32.1: 削除済みの証拠は `ENOENT` のみ（他の errno・非 OS エラーは削除済みとしない）。
+    #[test]
+    fn core3_task32_1_removal_confirmed_only_on_enoent() {
+        assert!(removal_confirmed(&SysError::Os(sys::ENOENT)));
+        for e in [
+            SysError::Os(sys::EACCES),
+            SysError::Os(sys::EPERM),
+            SysError::Os(sys::EBADF),
+            SysError::Os(sys::EINTR),
+            SysError::Os(sys::EINVAL),
+            SysError::Unsupported,
+            SysError::MultiThreaded,
+        ] {
+            assert!(!removal_confirmed(&e), "{e:?}");
+        }
+    }
+
+    /// CORE-3・TASK-32.1: `remove_verified` が頼るカーネルの挙動（削除済みディレクトリの保持 fd を起点に
+    /// した lookup は `ENOENT`）を一時ディレクトリで具体値照合する。削除前は同じ fd 起点で開ける。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core3_task32_1_lookup_under_removed_dir_is_enoent() {
+        let base = std::env::temp_dir().join(format!("fc-cgroups-rm-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("child")).unwrap();
+        std::fs::write(base.join("child").join("cgroup.events"), b"populated 0\n").unwrap();
+        let parent = File::open(&base).unwrap();
+        let name = CString::new("child").unwrap();
+        let held = sys::open_dir_path_nofollow(Some(parent.as_fd()), &name).unwrap();
+        let events = CString::new("cgroup.events").unwrap();
+        assert!(sys::open_read_at(held.as_fd(), &events).is_ok());
+        std::fs::remove_file(base.join("child").join("cgroup.events")).unwrap();
+        assert_eq!(sys::remove_dir_at(parent.as_fd(), &name), Ok(()));
+        let err = sys::open_read_at(held.as_fd(), &events).unwrap_err();
+        assert_eq!(err, SysError::Os(sys::ENOENT));
+        assert!(removal_confirmed(&err));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// CORE-3・TASK-32.1: errno から `ErrorCode` への写像。
+    #[test]
+    fn core3_task32_1_errno_mapping() {
+        assert_eq!(errno_code(sys::EACCES), ErrorCode::PermissionDenied);
+        assert_eq!(errno_code(sys::EPERM), ErrorCode::PermissionDenied);
+        assert_eq!(errno_code(sys::EBUSY), ErrorCode::FailedPrecondition);
+        assert_eq!(errno_code(sys::EEXIST), ErrorCode::AlreadyExists);
+        assert_eq!(errno_code(sys::ENOENT), ErrorCode::NotFound);
+        assert_eq!(errno_code(sys::EINVAL), ErrorCode::Internal);
+    }
+
+    /// CORE-3・TASK-32.1: 退避の型強制（`enable_controllers` は `&Evacuated` が必須）。
+    /// シグネチャの照合（コンパイルが通ること自体が検証）。
+    #[test]
+    fn core3_task32_1_enable_controllers_requires_proof() {
+        let _f: fn(
+            &DelegatedCgroup,
+            &Evacuated,
+            &ControllerSet,
+        ) -> Result<ControllerSet, CgroupError> = DelegatedCgroup::enable_controllers;
+    }
+}

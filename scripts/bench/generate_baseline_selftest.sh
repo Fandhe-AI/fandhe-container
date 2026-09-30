@@ -120,6 +120,16 @@ else
   fail "source-date-epoch-non-numeric (expected exit=2, actual exit=${actual})"
 fi
 
+# CDPATH が設定されていても相対 --output が cwd 基準で解決され、出力先が標準出力を汚さない
+mkdir -p "${work}/cdp/sub" "${work}/cdp/base/sub"
+actual=0
+(cd "${work}/cdp" && CDPATH="${work}/cdp/base" bash "$gen" --metrics "${fx}/metrics.json" --output "sub/out.json" "${fx}/results-all.json" >/dev/null 2>&1) || actual=$?
+if [ "$actual" -eq 0 ] && [ -f "${work}/cdp/sub/out.json" ] && [ ! -e "${work}/cdp/base/sub/out.json" ]; then
+  pass "cdpath-relative-output (exit=0, written under cwd)"
+else
+  fail "cdpath-relative-output (exit=${actual})"
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "${failures} case(s) failed" >&2
   exit 1

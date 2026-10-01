@@ -307,6 +307,13 @@ impl AuditLayer {
 #[non_exhaustive]
 pub enum AuditEvent {
     /// seccomp 違反。syscall・arch は必須。パスは持たない（ユーザー空間ポインタは TOCTOU になるため）。
+    ///
+    /// 破壊的変更（TASK-41.2・SEC-4）: TASK-41.1 の `Seccomp { syscall }` に必須の `arch` を追加した。
+    /// syscall 番号はアーキ相対で arch 無しでは解釈できず、後から任意項目にすると誤解釈した記録を
+    /// 構築できてしまうため、互換形（任意項目・別 variant）にしない。本 crate は `publish = false` で
+    /// 外部利用者がおらず、リポ内の構築・match は同 PR で追随済み。
+    /// 移行手順: 構築は `Seccomp { syscall, arch: AuditSyscallArch::from_raw(<AUDIT_ARCH_*>) }` とし、
+    /// パターンは `Seccomp { syscall, .. }` と書く（`arch` を読むなら `AuditRecord::seccomp_arch()`）。
     Seccomp {
         /// 拒否された syscall。
         syscall: AuditSyscallNr,

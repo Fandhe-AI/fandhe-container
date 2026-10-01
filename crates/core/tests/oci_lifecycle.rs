@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use fandhe_container_core::observability::{OpName, OpRecorder};
 use fandhe_container_core::oci_runtime::{
-    CgroupRemoval, ContainerCgroupRemover, KillTimeout, ProcessLauncher, ProcessSignaler,
-    StartTimeouts, create, delete, kill, start,
+    CgroupRemoval, ContainerCgroupRemover, KillTimeout, LifecycleOp, ProcessLauncher,
+    ProcessSignaler, StartTimeouts, create, delete, kill, start,
 };
 use fandhe_container_core::traits::{
     CgroupScope, ContainerId, ContainerState, ContainerStatus, CreateRequest, CreateStateRequest,
@@ -752,4 +752,41 @@ fn repair4_task84_4_lifecycle_ops_share_one_recorder_off_linux() {
     assert_eq!(op_stats(&rec, "start"), (0, 1));
     assert_eq!(op_stats(&rec, "kill"), (0, 1));
     assert_eq!(op_stats(&rec, "delete"), (1, 1));
+}
+
+/// ERR-2・TASK-96.2: create の重複と start の未作成 ID が、同一ストア・同一 recorder 上でそれぞれ
+/// op = create / start・終了コード 4 / 3 の構造化エラーになり、失敗が操作別に計数される。
+#[test]
+fn err2_lifecycle_failures_carry_op_code_and_exit_code() {
+    let b = Bundle::ready("err2", &lifecycle_config("err2"));
+    let store = MemStateStore::new();
+    let rec = OpRecorder::new();
+    let launcher = RecordingLauncher::new();
+    let dynl: Arc<dyn ProcessLauncher> = launcher.clone();
+
+    create(&store, &rec, &b.create_request("err2-a")).expect("create");
+    let dup = create(&store, &rec, &b.create_request("err2-a")).expect_err("dup");
+    assert_eq!(dup.op(), LifecycleOp::Create);
+    assert_eq!(dup.code(), ErrorCode::AlreadyExists);
+    assert_eq!(dup.exit_code().get(), 4);
+
+    let missing = start(
+        &store,
+        &rec,
+        &dynl,
+        &start_req("err2-missing"),
+        &StartTimeouts::default(),
+    )
+    .expect_err("missing");
+    assert_eq!(missing.op(), LifecycleOp::Start);
+    assert_eq!(missing.code(), ErrorCode::NotFound);
+    assert_eq!(missing.exit_code().get(), 3);
+    let mut out = Vec::new();
+    missing.write_json_line(&mut out).expect("write");
+    let v: Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(v["op"], "start");
+    assert_eq!(v["code"], "NOT_FOUND");
+    assert_eq!(launcher.launches(), 0);
+    assert_eq!(op_stats(&rec, "create"), (1, 1));
+    assert_eq!(op_stats(&rec, "start"), (0, 1));
 }

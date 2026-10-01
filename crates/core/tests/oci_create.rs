@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use fandhe_container_core::observability::{OpName, OpRecorder};
-use fandhe_container_core::oci_runtime::create;
+use fandhe_container_core::oci_runtime::{LifecycleOp, create};
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, CreateRequest, CreateStateRequest, DeleteStateRequest,
     DeleteStateResponse, ErrorCode, GetStateRequest, ListStateRequest, StateList, StateRecord,
@@ -252,4 +252,49 @@ fn repair4_create_records_success_and_failure() {
         .expect("recorded");
     assert_eq!(stats.success(), 1);
     assert_eq!(stats.failure(), 1);
+}
+
+/// ERR-2・TASK-96.2: ID 重複の失敗が公開 API 経由で op = create・code = ALREADY_EXISTS・終了コード 4・
+/// 構造化 1 行 JSON（キーは op / code / message のみ）になる。
+#[test]
+fn err2_create_duplicate_yields_structured_error() {
+    let b = ready_bundle("err2-dup");
+    let store = MemStateStore::new();
+    create(&store, &OpRecorder::new(), &b.request("c1")).expect("first");
+    let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("dup");
+    assert_eq!(err.op(), LifecycleOp::Create);
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    assert_eq!(err.exit_code().get(), 4);
+    let mut out = Vec::new();
+    err.write_json_line(&mut out).expect("write");
+    let line = String::from_utf8(out).expect("utf8");
+    assert!(line.ends_with('\n'));
+    assert_eq!(line.matches('\n').count(), 1);
+    let v: Value = serde_json::from_str(line.trim_end()).expect("json");
+    assert_eq!(v.as_object().expect("obj").len(), 3);
+    assert_eq!(v["op"], "create");
+    assert_eq!(v["code"], "ALREADY_EXISTS");
+    assert_eq!(v["message"], err.message());
+}
+
+/// ERR-2・TASK-96.2: 検証段階の失敗（config.json 不在）は NOT_FOUND・終了コード 3、
+/// 未解釈指定は UNIMPLEMENTED・終了コード 8 で、いずれも op = create。
+#[test]
+fn err2_create_validation_failures_map_to_exit_codes() {
+    let store = MemStateStore::new();
+    let b = Bundle::new("err2-noconfig");
+    let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("no config");
+    assert_eq!(err.op(), LifecycleOp::Create);
+    assert_eq!(err.code().as_str(), "NOT_FOUND");
+    assert_eq!(err.exit_code().get(), 3);
+
+    let mut cfg = valid_config();
+    cfg["linux"] = json!({"seccomp": {"defaultAction": "SCMP_ACT_ERRNO"}});
+    b.write_config(&cfg);
+    std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+    let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("unapplied");
+    assert_eq!(err.op(), LifecycleOp::Create);
+    assert_eq!(err.code().as_str(), "UNIMPLEMENTED");
+    assert_eq!(err.exit_code().get(), 8);
+    assert_eq!(store.len(), 0);
 }

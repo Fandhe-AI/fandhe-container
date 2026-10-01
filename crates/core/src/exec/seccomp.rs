@@ -373,6 +373,57 @@ pub fn probe_escape_syscall(which: EscapeSyscallProbe) -> ProbeOutcome {
     ProbeOutcome::from_result(result)
 }
 
+/// 攻撃テスト ESC-03 用: コンテナ内（PID 1・pivot 済み）から `mount(2)` を 1 回試行して結果を返す（SEC-2・TASK-42.2・#200）。
+///
+/// `tests/escape_suite.rs` の攻撃クロージャ（`spawn_container_probe` の子）から呼ばれる。テスト側は
+/// `unsafe` を書けず raw syscall を発行できないため、既存の `sys::mount_root_private_recursive`
+/// （`mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)`。propagation の変更のみで新たなマウントは作らない）を
+/// 薄く包む。新規 `unsafe`・新規 `sys` ラッパーは追加しない。
+///
+/// 誤用の封じ込め（fail-closed）: 次をすべて満たさない場合は syscall を発行せず `FailedPrecondition` を返す
+/// （ホストの `/` の propagation を変えない）。
+/// - PID 1 であること
+/// - `/proc/self/status` の `Seccomp` が 2（filter 適用済み）。組み込み filter は `mount` を `ERRNO(EPERM)` で
+///   拒否するため、filter 適用前の（ホスト側の）プロセスでは syscall を発行しない
+///
+/// この feature はテスト専用で、通常ビルドには含まれない（dev-dependency の自己参照でのみ有効化）。
+///
+/// # 将来仕様（記録のみ）
+///
+/// exec が許可されたら（証跡配線後。後続作業）、エントリポイント内のプローブへ置き換えて本関数を廃止する（REPAIR-3）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn escape_probe_mount() -> Result<ProbeOutcome, ExecError> {
+    if std::process::id() != 1 || !probe_context_is_isolated() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Seccomp,
+            "escape_probe_mount must run as PID 1 with the seccomp filter active".to_string(),
+        ));
+    }
+    Ok(ProbeOutcome::from_result(
+        sys::mount_root_private_recursive(),
+    ))
+}
+
+/// [`escape_probe_mount`] の前提検査: seccomp filter 適用済みか（読めなければ false）。
+#[cfg(feature = "escape-probe")]
+fn probe_context_is_isolated() -> bool {
+    use std::io::Read;
+    // /proc/self/status は小さい（数 KiB）。上限を設けて読む。
+    let mut text = String::new();
+    let Ok(file) = std::fs::File::open("/proc/self/status") else {
+        return false;
+    };
+    if file.take(64 * 1024).read_to_string(&mut text).is_err() {
+        return false;
+    }
+    text.lines()
+        .find_map(|l| l.strip_prefix("Seccomp:"))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        == Some(2)
+}
+
 /// 単一スレッド条件を適用の前後で検査して [`apply_filter`] を呼ぶ。事前検査は副作用の前に行う。
 fn apply_single_threaded(
     program: &SeccompProgram,

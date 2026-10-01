@@ -15,10 +15,11 @@
 //! - [`LogCapture::drain`] は期限付き（REPAIR-5）。期限切れ（孫プロセスがパイプを保持し続ける場合等）では
 //!   ブロック中の `Read` を外から中断する汎用手段がないため、リーダースレッドは切り離される。
 //!   `drain` は `Err` を返す全経路（期限切れ・溢れる timeout・リーダーの異常終了）で、返る前に捕捉を取り消す。
-//!   取消しの要求後に新しい追記は始まらない。実行中だった追記（ストリームあたり高々 1 件）は期限の内側に取った
-//!   猶予（[`CANCEL_SETTLE_TIMEOUT`] 以下）だけ完了を待ち、待ち切れなければ待たずに返る（`drain` は sink が
-//!   止まっても `timeout` 以内に返る）。したがって `drain` が `Err` を返した後に sink へ届き得るのは、
-//!   返る時点で実行中だったその追記だけである。
+//!   取消しの要求後に新しい追記は始まらない。EOF は `timeout` いっぱいまで待ち、期限内に届いた EOF は成功として扱う。
+//!   期限切れでは実行中の追記の完了を待たずに返る（`drain` は sink が止まっていても `timeout` 以内に返る）。
+//!   したがって `drain` が `Err` を返した後に sink へ届き得るのは、返る時点で実行中だった追記
+//!   （ストリームあたり高々 1 件）だけである。完了を待ってから止めたい場合は [`LogCapture::cancel`] を使う
+//!   （[`CANCEL_SETTLE_TIMEOUT`] まで待つ）。
 //!   リーダーは現在の `read` が戻った時点でスレッドとストリームを解放して終了する。
 //! - `read` が戻らない間に残るスレッド数は [`ReaderBudget`]（上限 [`MAX_LIVE_READERS`] 以下）で制限し、超える開始は
 //!   `Unavailable` で拒否する（孫プロセスがパイプを保持する場合の無制限なスレッド・ストリーム蓄積の防止。REPAIR-5）。
@@ -134,10 +135,10 @@ impl Drop for ReaderSlot {
     }
 }
 
-/// 取消し時に、実行中の sink 追記の完了を待つ猶予の上限。
+/// 期限を持たない取消し（[`LogCapture::cancel`]・不正な `timeout` での [`LogCapture::drain`]）が、
+/// 実行中の sink 追記の完了を待つ猶予の上限。
 ///
-/// [`LogCapture::drain`] は `timeout` の末尾からこの猶予（`timeout` の 1/4 が上限）を取り分け、EOF 待ちを
-/// その手前で打ち切る。猶予は `timeout` の内側にあるため、`drain` 全体は `timeout` を超えない。
+/// 期限切れの [`LogCapture::drain`] はこの猶予を使わない（`timeout` を超えて待たないため、完了を待たずに返る）。
 pub const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// [`MemoryLogSink`] の既定の保持上限（総バイト数）。
@@ -578,10 +579,9 @@ impl LogCapture {
     /// `Err` を返す全経路で、返る前に捕捉を取り消す（`self` を消費するため、呼び出し側は後から止められない）。
     /// 取消しの要求後に新しい追記は始まらず、リーダーは次に `read` が戻った時点で終了する。
     ///
-    /// sink の追記が止まっていても `timeout` 以内に返る（REPAIR-5）。そのため `timeout` の末尾から猶予
-    /// （`timeout` の 1/4 と [`CANCEL_SETTLE_TIMEOUT`] の小さい方）を取り分け、EOF 待ちはその手前で打ち切り、
-    /// 猶予の間だけ実行中の追記の完了を待つ。猶予内に終わらなかった追記（ストリームあたり高々 1 件）だけは、
-    /// `Err` が返った後に完了し得る（module doc 参照）。
+    /// EOF は `timeout` いっぱいまで待つ（期限内に届いた EOF は成功）。sink の追記が止まっていても `timeout` 以内に
+    /// 返る（REPAIR-5）ため、期限切れでは実行中の追記の完了を待たない。その時点で実行中だった追記
+    /// （ストリームあたり高々 1 件）だけは、`Err` が返った後に完了し得る（module doc 参照）。
     pub fn drain(self, timeout: Duration) -> Result<CaptureSummary, TraitError> {
         let started = Instant::now();
         // 公開 API のため直接呼ばれうる。上限超は拒否し、Duration::MAX 等で加算が溢れても panic しない。
@@ -601,10 +601,9 @@ impl LogCapture {
                 "drain timeout is too large",
             ));
         };
-        let settle = (timeout / 4).min(CANCEL_SETTLE_TIMEOUT);
-        let eof_deadline = deadline.checked_sub(settle).unwrap_or(deadline);
-        let result = self.wait_all(eof_deadline);
+        let result = self.wait_all(deadline);
         if result.is_err() {
+            // 期限（deadline）を超えては待たない。期限切れの場合は取消しを要求するだけで返る。
             self.cancel.cancel(deadline);
         }
         result
@@ -738,9 +737,14 @@ fn pump(
     };
     let mut chunk = [0u8; READ_CHUNK_BYTES];
     loop {
+        // 直前のチャンクの処理中に取り消された場合に、次の read（ブロックし得る）へ進まない。
+        // sink の失敗後は追記時の確認を通らないため、ここで必ず確認する。
+        if sp.cancelled || cancel.is_cancelled() {
+            return sp.summary;
+        }
         let r = stream.read(&mut chunk);
         // drain が取り消した後は、読めたデータも sink へ渡さず終了する（スレッド・ストリームの回収）。
-        if sp.cancelled || cancel.is_cancelled() {
+        if cancel.is_cancelled() {
             return sp.summary;
         }
         match r {
@@ -749,10 +753,6 @@ fn pump(
                 sp.summary.bytes = sp.summary.bytes.saturating_add(n as u64);
                 if let Some(data) = chunk.get(..n) {
                     sp.feed(data);
-                }
-                // 追記の直前に取消しを検知した場合は、次の read（ブロックし得る）へ進まず終了する。
-                if sp.cancelled {
-                    return sp.summary;
                 }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -871,7 +871,11 @@ mod tests {
         while sink.snapshot().unwrap().is_empty() && start.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let err = cap.drain(Duration::from_millis(50)).unwrap_err();
+        // EOF は timeout（200ms）いっぱいまで待つ（手前で打ち切らない）。
+        let drain_started = Instant::now();
+        let err = cap.drain(Duration::from_millis(200)).unwrap_err();
+        let waited = drain_started.elapsed();
+        assert!(waited >= Duration::from_millis(200), "{waited:?}");
         assert_eq!(err.code(), ErrorCode::Timeout);
         assert_eq!(
             err.message(),
@@ -981,11 +985,16 @@ mod tests {
         entered: Mutex<mpsc::Sender<()>>,
         release: Mutex<mpsc::Receiver<()>>,
         done: Mutex<Vec<Vec<u8>>>,
+        /// 解放後に失敗（`Unavailable`）を返すか。
+        fail: bool,
     }
     impl LogSink for BlockingSink {
         fn append(&self, _: StreamKind, line: &[u8]) -> Result<(), TraitError> {
             let _ = self.entered.lock().unwrap().send(());
             let _ = self.release.lock().unwrap().recv();
+            if self.fail {
+                return Err(TraitError::new(ErrorCode::Unavailable, "fake sink failure"));
+            }
             self.done.lock().unwrap().push(line.to_vec());
             Ok(())
         }
@@ -1003,6 +1012,7 @@ mod tests {
             entered: Mutex::new(entered_tx),
             release: Mutex::new(release_rx),
             done: Mutex::new(Vec::new()),
+            fail: false,
         });
         let cap = LogCapture::start(
             OutputStreams::new(&budget, Some(Box::new(reader)), None),
@@ -1045,6 +1055,7 @@ mod tests {
             entered: Mutex::new(entered_tx),
             release: Mutex::new(release_rx),
             done: Mutex::new(Vec::new()),
+            fail: false,
         });
         let cap = LogCapture::start(
             OutputStreams::new(&budget, Some(Box::new(reader)), None),

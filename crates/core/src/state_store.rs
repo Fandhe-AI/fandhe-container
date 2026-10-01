@@ -37,9 +37,15 @@
 //!   照合できないため通常の `delete` では消せない。管理操作 `find_corrupted` /
 //!   `purge_corrupted` で特定・回復する。破損・異常なレコードが 1 件でもあれば `list` はどのページでも
 //!   失敗する（fail-closed）
-//! - 書き込みは同じディレクトリの一時ファイルへ書いて fsync してから `rename` し、ディレクトリも
-//!   fsync する。一時ファイル名の衝突回避・残骸掃除・強制終了テストは TASK-31.2（#156）、結合テストの
-//!   拡充は TASK-31.3（#157）で行う
+//! - 書き込み（`write_file_replacing`。TASK-31.2・OCI-5）は同じディレクトリの一意名の一時ファイル
+//!   （`<name>.tmp-<pid>-<seq>`。`O_EXCL` で作成）へ書いて fsync してから `rename` し、ディレクトリも
+//!   fsync する。読み手は旧値か新値だけを見る（トレイト契約 4）。書き込み・fsync・rename の失敗時は
+//!   一時ファイルを消す。強制終了（SIGKILL 等）で残った一時ファイルは、`@lock` 保持下の次の書き込み・
+//!   採番（ルートの `@revision` はインスタンスごとの初回採番のみ。採番ごとの全走査を避ける）・
+//!   `remove_record` で掃除する（`sweep_temp_residue`）。全書き込みは `@lock` 保持下で行うため、
+//!   ロック中に見える一時ファイルは書き込み途中のものではなく残骸である。ロックなしで動く
+//!   `@revision` 初期化の一時ファイル（`@revision.init-` 接頭辞）は一致しないため掃除対象外。
+//!   結合テストの拡充は TASK-31.3（#157）で行う
 //! - 状態ルートは信頼境界として扱う（`bundle` のすり替えは `start` の起動先のすり替えになるため。
 //!   SEC-1・PLUG-12 と同じ姿勢）。symlink・所有者不一致を拒否し、状態ルートと `<id>/` は既存の
 //!   ものも 0700 に限る（group / other の権限ビットがあれば `PermissionDenied`）。祖先は group / other
@@ -497,6 +503,9 @@ impl FileStateStore {
         } else {
             fs::remove_file(&file).map_err(|_| internal("failed to remove the state file"))?;
         }
+        // 強制終了で残った state.json の一時ファイルがあると <id>/ を消せないため先に掃除する
+        // （`@lock` 保持下で呼ばれる）。
+        sweep_temp_residue(&dir, STATE_FILE_NAME)?;
         // 削除（unlink）の永続化のため <id>/ を fsync する。ディレクトリ自体を消した場合は
         // その dirent の消失を永続化するため状態ルートも fsync する。
         sync_dir(&dir)?;
@@ -576,7 +585,10 @@ impl FileStateStore {
                 "state file exceeds the size limit",
             ));
         }
-        write_file_replacing(&self.record_dir(record.id()), STATE_FILE_NAME, &bytes)
+        // 呼び出し元は `@lock` 保持下（sweep の安全性の前提）。
+        let dir = self.record_dir(record.id());
+        sweep_temp_residue(&dir, STATE_FILE_NAME)?;
+        write_file_replacing(&dir, STATE_FILE_NAME, &bytes)
     }
 
     /// revision を 1 つ払い出し、上限値を先に永続化する（`guard` はこのストアのロック）。
@@ -630,6 +642,11 @@ impl FileStateStore {
         let floor = match guard.process.revision_floor {
             Some(floor) => floor,
             None => {
+                // `@revision` の一時ファイル残骸（強制終了で残ったもの）はインスタンスごとの
+                // 初回採番（ルート全走査と同じ契機）でだけ `@lock` 保持下で掃除する。採番ごとに
+                // ルートを走査するとコンテナ数 N で連続作成が O(N²) になりロック保持時間が伸びる
+                // ため。他プロセスが後から残した残骸は次に開いたインスタンスの初回採番で回収する。
+                sweep_temp_residue(&self.root, REVISION_FILE)?;
                 let floor = match self.max_record_revision()? {
                     Some(max) => max
                         .checked_add(1)
@@ -1054,20 +1071,26 @@ fn init_revision_file(root: &Path) -> Result<(), TraitError> {
     sync_dir(root)
 }
 
-/// 同じディレクトリの `<name>.tmp` へ書いて `rename` する（トレイト契約 4 の不可分な書き込み）。
+/// 一時ファイル名の区切り。`<name>.tmp-<pid>-<seq>` 形式にする（旧形式の固定名 `<name>.tmp` は
+/// 掃除対象としてのみ認識する）。
+const TMP_INFIX: &str = ".tmp-";
+
+/// 同じディレクトリの一意名の一時ファイルへ書いて `rename` する（トレイト契約 4 の不可分な書き込み。
+/// TASK-31.2・OCI-5）。
 ///
-/// 全書き込みの唯一の経路。一時ファイルを `sync_all` してから `rename` し、unix では親
-/// ディレクトリも fsync して置き換えを永続化する（クラッシュ後の revision 再発行防止）。
-/// 一時ファイル名の衝突回避と残骸掃除は TASK-31.2（#156）で強化する予定で、現状は未実装
-/// （REPAIR-3）。
+/// 全書き込みの唯一の経路で、`@lock` 保持下で呼ぶこと。一時ファイル（`<name>.tmp-<pid>-<seq>`、
+/// 0600、`O_EXCL` 作成のため事前に置かれた symlink は辿らず失敗）を `sync_all` してから `rename` し、
+/// unix では親ディレクトリも fsync して置き換えを永続化する（クラッシュ後の revision 再発行防止）。
+/// 書き込み・fsync・rename が失敗したら一時ファイルを消して元のエラーを返す。強制終了で残った
+/// 一時ファイルの掃除は `sweep_temp_residue` の責務（呼び出し側が書き込み前に行う）。
 fn write_file_replacing(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), TraitError> {
-    let tmp = dir.join(format!("{name}.tmp"));
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        "{name}{TMP_INFIX}{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let dest = dir.join(name);
-    match fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(internal("failed to prepare the temporary file")),
-    }
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -1075,17 +1098,77 @@ fn write_file_replacing(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Trai
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut file = opts
-        .open(&tmp)
-        .map_err(|_| internal("failed to create the temporary file"))?;
+    let file = opts.open(&tmp).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            internal("temporary state file already exists")
+        } else {
+            internal("failed to create the temporary file")
+        }
+    })?;
+    let result = write_and_rename(file, &tmp, &dest, bytes);
+    if result.is_err() {
+        // best-effort。失敗しても元のエラーを返し、残った場合は次回の掃除に委ねる。
+        let _ = fs::remove_file(&tmp);
+    }
+    result?;
+    sync_dir(dir)
+}
+
+/// `write_file_replacing` の本体（一時ファイルへの書き込み・fsync・rename）。失敗時の一時ファイル
+/// 削除は呼び出し元が行う。
+fn write_and_rename(
+    mut file: File,
+    tmp: &Path,
+    dest: &Path,
+    bytes: &[u8],
+) -> Result<(), TraitError> {
     file.write_all(bytes)
         .map_err(|_| internal("failed to write the temporary file"))?;
     file.sync_all()
         .map_err(|_| internal("failed to sync the temporary file"))?;
     drop(file);
-    reject_symlink(&dest)?;
-    fs::rename(&tmp, &dest).map_err(|_| internal("failed to replace the state file"))?;
-    sync_dir(dir)
+    reject_symlink(dest)?;
+    fs::rename(tmp, dest).map_err(|_| internal("failed to replace the state file"))
+}
+
+/// `dir` 直下の `<name>.tmp`（旧形式）・`<name>.tmp-*` を消す（強制終了で残った書き込みの残骸掃除。
+/// TASK-31.2・OCI-5）。
+///
+/// 安全性: 全書き込み（`write_file_replacing`）は `@lock` 保持下で行うため、ロック保持中に見える
+/// 該当名は他プロセスの書き込み途中ではなく残骸である。呼び出しは `@lock` 保持下に限る。
+/// ロックなしで動く `@revision.init-*`（`init_revision_file`）は接頭辞が一致しないので消さない。
+/// 通常ファイルと symlink（リンク自体。辿らない）だけを消し、ディレクトリ等は触らない（再帰削除なし）。
+/// 1 件でも消したら unlink を永続化する。メモリは `read_dir` のストリーミングで件数に比例しない。
+fn sweep_temp_residue(dir: &Path, name: &str) -> Result<(), TraitError> {
+    let legacy = format!("{name}.tmp");
+    let prefix = format!("{name}{TMP_INFIX}");
+    let entries = fs::read_dir(dir).map_err(|_| internal("failed to scan for temporary files"))?;
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(|_| internal("failed to scan for temporary files"))?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name != legacy && !file_name.starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|_| internal("failed to inspect a temporary file"))?;
+        if !(meta.is_file() || meta.file_type().is_symlink()) {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(internal("failed to remove a temporary file")),
+        }
+    }
+    if removed {
+        sync_dir(dir)?;
+    }
+    Ok(())
 }
 
 /// ディレクトリを fsync して dirent の変更（作成・rename・unlink）を永続化する。
@@ -1560,6 +1643,160 @@ mod tests {
             code(store.get(&GetStateRequest::new(cid("b")))),
             "NOT_FOUND"
         );
+    }
+
+    /// `dir` 直下で名前に `.tmp` を含むエントリ名（ソート済み）。
+    fn tmp_entries(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn update_to_running(store: &FileStateStore, rec: &StateRecord) -> StateRecord {
+        let status = ContainerStatus::running(rec.id().clone(), NonZeroU32::new(4242));
+        store
+            .update(&UpdateStateRequest::new(status, rec.revision()))
+            .unwrap()
+    }
+
+    /// OCI-5・TASK-31.2: 空の state.json は panic せず Internal（読み取り側の `Result` 処理）。
+    #[test]
+    fn oci5_get_returns_internal_for_empty_state_file() {
+        let t = TmpDir::new("empty");
+        let store = t.open();
+        create(&store, "a");
+        fs::write(t.path().join("a").join("state.json"), b"").unwrap();
+        let e = store.get(&GetStateRequest::new(cid("a"))).unwrap_err();
+        assert_eq!(e.code().as_str(), "INTERNAL");
+        assert_eq!(e.message(), "state file is corrupted");
+    }
+
+    /// OCI-5・TASK-31.2: 途中で切れた JSON は Internal。
+    #[test]
+    fn oci5_get_returns_internal_for_truncated_state_file() {
+        let t = TmpDir::new("trunc");
+        let store = t.open();
+        create(&store, "a");
+        let path = t.path().join("a").join("state.json");
+        let bytes = fs::read(&path).unwrap();
+        fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        let e = store.get(&GetStateRequest::new(cid("a"))).unwrap_err();
+        assert_eq!(e.code().as_str(), "INTERNAL");
+        assert_eq!(e.message(), "state file is corrupted");
+    }
+
+    /// OCI-5・TASK-31.2: 非 UTF-8 バイト列は Internal。
+    #[test]
+    fn oci5_get_returns_internal_for_non_utf8_state_file() {
+        let t = TmpDir::new("nonutf8");
+        let store = t.open();
+        create(&store, "a");
+        fs::write(
+            t.path().join("a").join("state.json"),
+            [0xff, 0xfe, 0x00, 0x80],
+        )
+        .unwrap();
+        let e = store.get(&GetStateRequest::new(cid("a"))).unwrap_err();
+        assert_eq!(e.code().as_str(), "INTERNAL");
+        assert_eq!(e.message(), "state file is corrupted");
+    }
+
+    /// OCI-5・TASK-31.2: write と rename の間で落ちた状態（途中までの一時ファイルが残る）を決定的に
+    /// 再現する。読み手は旧レコードを見続け、次の更新で残骸が掃除される。
+    #[test]
+    fn oci5_temp_residue_does_not_affect_reads_and_is_swept_on_update() {
+        let t = TmpDir::new("residue");
+        let store = t.open();
+        let a = create(&store, "a");
+        let dir = t.path().join("a");
+        fs::write(dir.join("state.json.tmp-1-0"), b"{\"ociVer").unwrap();
+        fs::write(dir.join("state.json.tmp"), b"{").unwrap();
+        let got = store.get(&GetStateRequest::new(cid("a"))).unwrap();
+        assert_eq!(got.revision(), a.revision());
+        assert_eq!(
+            tmp_entries(&dir),
+            vec!["state.json.tmp".to_owned(), "state.json.tmp-1-0".to_owned()]
+        );
+        update_to_running(&store, &a);
+        assert!(tmp_entries(&dir).is_empty());
+    }
+
+    /// OCI-5・TASK-31.2: ルートの `@revision` 一時ファイル残骸はインスタンスごとの初回採番で
+    /// 掃除する（採番ごとのルート全走査を避けるため）。初回採番後に残された残骸は次に開いた
+    /// インスタンスが回収する。ロック外で動く `@revision.init-*` は消さない。
+    #[test]
+    fn oci5_root_revision_temp_residue_is_swept_on_first_allocation_per_instance() {
+        let t = TmpDir::new("rootresidue");
+        let store = t.open();
+        fs::write(t.path().join("@revision.tmp-1-0"), b"9").unwrap();
+        fs::write(t.path().join("@revision.init-1-0"), b"1").unwrap();
+        create(&store, "a");
+        assert!(!t.path().join("@revision.tmp-1-0").exists());
+        assert!(t.path().join("@revision.init-1-0").exists());
+        // 初回採番後に残された残骸は同一インスタンスでは走査せず、再 open 後の初回採番で回収される。
+        fs::write(t.path().join("@revision.tmp-2-0"), b"9").unwrap();
+        create(&store, "b");
+        assert!(t.path().join("@revision.tmp-2-0").exists());
+        let store2 = t.open();
+        create(&store2, "c");
+        assert!(!t.path().join("@revision.tmp-2-0").exists());
+        assert!(t.path().join("@revision.init-1-0").exists());
+    }
+
+    /// OCI-5・TASK-31.2: 一時ファイルの残骸があっても delete で `<id>/` ごと消える。無関係な
+    /// ファイルがあれば `<id>/` は残る（従来挙動）。
+    #[test]
+    fn oci5_delete_removes_dir_even_with_temp_residue() {
+        let t = TmpDir::new("delresidue");
+        let store = t.open();
+        let a = create(&store, "a");
+        fs::write(t.path().join("a").join("state.json.tmp-1-0"), b"{").unwrap();
+        store
+            .delete(&DeleteStateRequest::new(cid("a"), a.revision()))
+            .unwrap();
+        assert!(!t.path().join("a").exists());
+        let b = create(&store, "b");
+        fs::write(t.path().join("b").join("state.json.tmp-1-0"), b"{").unwrap();
+        fs::write(t.path().join("b").join("extra"), b"x").unwrap();
+        store
+            .delete(&DeleteStateRequest::new(cid("b"), b.revision()))
+            .unwrap();
+        assert!(t.path().join("b").join("extra").exists());
+        assert!(tmp_entries(&t.path().join("b")).is_empty());
+    }
+
+    /// OCI-5・TASK-31.2: 掃除は symlink を辿らずリンクだけを消し、ディレクトリは消さない。
+    #[test]
+    fn oci5_sweep_does_not_follow_symlinks_or_remove_dirs() {
+        let t = TmpDir::new("sweepsym");
+        let store = t.open();
+        let a = create(&store, "a");
+        let outside = t.path().join("outside-file");
+        fs::write(&outside, b"keep").unwrap();
+        let dir = t.path().join("a");
+        std::os::unix::fs::symlink(&outside, dir.join("state.json.tmp-1-0")).unwrap();
+        fs::create_dir(dir.join("state.json.tmp-2-0")).unwrap();
+        update_to_running(&store, &a);
+        assert_eq!(fs::read(&outside).unwrap(), b"keep");
+        assert_eq!(tmp_entries(&dir), vec!["state.json.tmp-2-0".to_owned()]);
+        assert!(dir.join("state.json.tmp-2-0").is_dir());
+    }
+
+    /// OCI-5・TASK-31.2: 成功した書き込みは一時ファイルを残さない。
+    #[test]
+    fn oci5_write_does_not_leave_temp_file_on_success() {
+        let t = TmpDir::new("noleak");
+        let store = t.open();
+        let mut rec = create(&store, "a");
+        for _ in 0..3 {
+            rec = update_to_running(&store, &rec);
+        }
+        assert!(tmp_entries(&t.path().join("a")).is_empty());
+        assert!(tmp_entries(t.path()).is_empty());
     }
 
     #[test]

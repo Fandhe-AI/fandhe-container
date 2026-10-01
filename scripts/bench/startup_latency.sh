@@ -62,7 +62,8 @@
 # セキュリティ: 引数は許可リストで検証し、ランタイムは配列で直接 exec する（eval・
 # sh -c・文字列連結なし）。sudo は内部で呼ばない（root を要する実測は人間が明示実行する）。
 # 各ランタイム呼び出しは timeout で上限を掛け、ログ出力量にも上限（ulimit -f）を掛ける。
-# 実行開始の観測・後始末の待機にも時間と回数の上限を設ける（REPAIR-5）。
+# 実行開始の観測と後始末は、複数回の呼び出し・待機をまとめて --timeout 秒の期限で縛る
+# （後始末の delete 再試行には回数の上限も設ける。REPAIR-5）。
 
 set -euo pipefail
 # EPOCHREALTIME の小数点がロケール依存になるのを防ぐ。
@@ -79,14 +80,17 @@ readonly LOG_TAIL_LINES=20
 # ランタイム 1 呼び出しがログファイルへ書ける最大サイズ（KiB。ulimit -f の単位）。
 # 超過した呼び出しは SIGXFSZ で打ち切られ計測失敗になる（ディスク枯渇防止。REPAIR-5）。
 readonly LOG_MAX_KIB=1024
-# start 復帰後に state で実行開始（running / stopped）を観測する最大照会回数。
-# 時間上限は --timeout 秒（REPAIR-5）で、先に達した方で打ち切る。
-readonly STATE_POLL_MAX=500
+# start 復帰後に state で実行開始（running / stopped）を観測する照会の間隔（秒）。
+# 打ち切りは --timeout 秒の観測期限だけで判定し（REPAIR-5）、照会回数は間隔により
+# 期限 / 間隔 程度に収まる。観測点の上側推定は最大でこの間隔＋state 1 回分だけ遅れる。
+readonly STATE_POLL_INTERVAL=0.01
+readonly STATE_POLL_INTERVAL_US=10000
 # kill 後に delete を再試行する最大回数と間隔（秒）。時間上限は --timeout 秒。
 readonly DELETE_RETRY_MAX=100
 readonly DELETE_RETRY_INTERVAL=0.1
 readonly DELETE_RETRY_INTERVAL_US=100000
-# 後始末で残り時間がこれ（マイクロ秒）を下回ったらランタイムを呼ばずに打ち切る。
+# 期限付きの呼び出し（実行開始の観測・後始末）で残り時間がこれ（マイクロ秒）を
+# 下回ったらランタイムを呼ばずに打ち切る。
 readonly MIN_CALL_BUDGET_US=100000
 
 usage() {
@@ -508,9 +512,10 @@ measure_once() {
         return 1
         ;;
     esac
-    if [ "$state_polls" -ge "$STATE_POLL_MAX" ]; then
-      err "runtime-exec-not-observed" "container $id did not reach running/stopped within $STATE_POLL_MAX state queries"
-      return 1
+    # created のままなら間隔を空けて再照会する（期限までの残りが間隔に満たなければ待たずに
+    # 次の照会へ進み、その照会が残り時間不足なら上の判定で打ち切る）。
+    if [ $((deadline - $(now_us))) -ge "$STATE_POLL_INTERVAL_US" ]; then
+      sleep "$STATE_POLL_INTERVAL"
     fi
   done
   create_us=$((t1 - t0))

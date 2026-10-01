@@ -22,12 +22,12 @@ use std::time::{Duration, Instant};
 use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
-/// 期限つき待機の上限（CI の実行ステップ 10 分に対して十分小さい。REPAIR-5）。
-const DEADLINE: Duration = Duration::from_secs(60);
+/// 期限つき待機の上限（AGENTS.md の推奨（子プロセス応答待ちは 5〜10 秒）に収める。REPAIR-5）。
+const DEADLINE: Duration = Duration::from_secs(10);
 /// 子プロセスの終了確認ポーリング間隔。
 const POLL: Duration = Duration::from_millis(10);
 /// コンテナ役の子がマーカー待ちを諦める上限。超過時は終了コード 99 で終わる。
-const CHILD_WAIT: Duration = Duration::from_secs(60);
+const CHILD_WAIT: Duration = Duration::from_secs(8);
 
 const ENV_GO: &str = "FANDHE_SUP_RUN_IT_GO";
 const ENV_EXIT: &str = "FANDHE_SUP_RUN_IT_EXIT";

@@ -24,6 +24,9 @@
 //!   呼び出し側（supervisor プロセス）は予算を 1 つだけ作り、再起動・再捕捉をまたいで同じものを渡す
 //!   （捕捉ごとに作り直すと残存リーダーが数えられない）。
 //! - ストリームの所有権は捕捉側へ移る。監視の引き継ぎ時に再注入はできない（引き継ぎは #239・TASK-164 で扱う）。
+//!   代わりに取っ手（[`LogCapture`]）が捕捉の継続を表す。[`crate::run::monitor_with_capture`] は終端待ちを
+//!   しなかった全経路で取っ手を返すので、呼び出し側は [`LogCapture::cancel`] で止めるか、保持して後で
+//!   [`LogCapture::drain`] する（取っ手を破棄すると止める手段が無くなる）。
 //! - OS 固有型（fd / HANDLE）は公開せず `Read` のみを受ける（CLI-1）。グローバル状態は持たない（CORE-1・D-19）。
 //!
 //! # 未実装（将来仕様。REPAIR-3）
@@ -424,14 +427,24 @@ impl CancelGate {
     }
 }
 
-/// 起動済みのリーダースレッド群への取っ手。
+/// 起動済みのリーダースレッド群への取っ手。捕捉を止める・終端を待つ唯一の手段である。
 ///
-/// [`LogCapture::drain`] を呼ばずに破棄した場合、捕捉は取り消されない（リーダーは EOF まで sink へ追記を続ける。
-/// [`crate::run::monitor_with_capture`] の停止要求時の契約）。捕捉を止めるには `drain` を呼ぶ。
+/// [`LogCapture::drain`]・[`LogCapture::cancel`] を呼ばずに破棄した場合、捕捉は取り消されない（リーダーは EOF まで
+/// sink へ追記を続け、以後は止める手段が無くなる）。そのため [`crate::run::monitor_with_capture`] は、
+/// 終端待ちをしなかった全経路（停止要求・監視の失敗）で本取っ手を呼び出し側へ返す。
 pub struct LogCapture {
     rx: mpsc::Receiver<(StreamKind, StreamSummary)>,
     expected: usize,
     cancel: Arc<CancelGate>,
+}
+
+impl std::fmt::Debug for LogCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogCapture")
+            .field("streams", &self.expected)
+            .field("cancelled", &self.cancel.is_cancelled())
+            .finish()
+    }
 }
 
 impl LogCapture {
@@ -568,6 +581,24 @@ impl LogCapture {
             self.cancel.cancel(deadline);
         }
         result
+    }
+
+    /// EOF を待たずに捕捉を取り消す（プロセスが生存したまま監視をやめる場合等。REPAIR-5）。
+    ///
+    /// 取消しの要求後に新しい追記は始まらず、リーダーは次に `read` が戻った時点で終了する。実行中の追記の完了は
+    /// [`CANCEL_SETTLE_TIMEOUT`] まで待つ。待ち切れなかった場合は `Timeout`（取消し自体は成立しており、
+    /// 実行中だった追記〔ストリームあたり高々 1 件〕だけが後から完了し得る）。ストリームは取り戻せない。
+    pub fn cancel(self) -> Result<(), TraitError> {
+        let now = Instant::now();
+        let until = now.checked_add(CANCEL_SETTLE_TIMEOUT).unwrap_or(now);
+        if self.cancel.cancel(until) {
+            Ok(())
+        } else {
+            Err(TraitError::new(
+                ErrorCode::Timeout,
+                "timed out waiting for in-flight log append to finish",
+            ))
+        }
     }
 
     /// [`LogCapture::drain`] の EOF 待ち本体（取消しは呼び出し元が行う）。

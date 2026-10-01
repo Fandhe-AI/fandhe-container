@@ -454,6 +454,7 @@ pub struct MonitoredWithCapture {
     outcome: MonitorOutcome,
     capture: Option<CaptureSummary>,
     capture_error: Option<TraitError>,
+    live_capture: Option<LogCapture>,
 }
 
 impl MonitoredWithCapture {
@@ -469,7 +470,51 @@ impl MonitoredWithCapture {
     pub fn capture_error(&self) -> Option<&TraitError> {
         self.capture_error.as_ref()
     }
+    /// 継続中の捕捉の取っ手を取り出す（1 回だけ `Some`）。
+    ///
+    /// 捕捉を開始したが終端待ちをしなかった結果（`StopRequested`・`WaitFailedUnreleased`）で `Some` になる。
+    /// 呼び出し側は [`LogCapture::cancel`] で止めるか、保持して後で [`LogCapture::drain`] する。
+    /// 取り出さずに破棄するとリーダーは EOF まで走り続け、止める手段が無くなる。
+    pub fn take_live_capture(&mut self) -> Option<LogCapture> {
+        self.live_capture.take()
+    }
 }
+
+/// [`monitor_with_capture`] の失敗。監視の失敗理由に加え、開始済みだった捕捉の取っ手を呼び出し側へ返す
+/// （失敗で取っ手を失うと、リーダーを止める手段も引き継ぐ手段も無くなるため。REPAIR-5）。
+///
+/// `TraitError` への暗黙変換（`From`）は意図的に提供しない（`?` で取っ手を黙って捨てないようにする）。
+#[derive(Debug)]
+pub struct MonitorWithCaptureError {
+    error: TraitError,
+    live_capture: Option<LogCapture>,
+}
+
+impl MonitorWithCaptureError {
+    /// 監視の失敗理由。
+    pub fn error(&self) -> &TraitError {
+        &self.error
+    }
+    /// 継続中の捕捉の取っ手を取り出す（1 回だけ `Some`）。
+    ///
+    /// 捕捉の開始後に監視が失敗した場合（`wait` の失敗・停止時の監視権解放の失敗）に `Some`。
+    /// 事前条件違反・監視権の取得失敗・捕捉開始の失敗では `None`（ストリームは未読のまま呼び出し側に残る）。
+    pub fn take_live_capture(&mut self) -> Option<LogCapture> {
+        self.live_capture.take()
+    }
+    /// 失敗理由と取っ手へ分解する。
+    pub fn into_parts(self) -> (TraitError, Option<LogCapture>) {
+        (self.error, self.live_capture)
+    }
+}
+
+impl std::fmt::Display for MonitorWithCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for MonitorWithCaptureError {}
 
 /// [`monitor_with_observer`] に stdout / stderr の行単位捕捉（[`crate::logs`]。#241・TASK-157.7）を加える。
 ///
@@ -477,8 +522,17 @@ impl MonitoredWithCapture {
 /// （ストリームを読まず）`FailedPrecondition`。この場合 `streams` は呼び出し側に残る（取り出すのは監視権の取得後のみ）。
 /// 捕捉開始の失敗で監視権の解放にも失敗したら [`MonitorOutcome::StartFailedUnreleased`] を返す。捕捉は監視権の取得後に開始し、開始に失敗したら監視権を解放して `Err`（`streams` は未読のまま呼び出し側へ戻り、再試行できる）。プロセスの終了（`Exited` / `ExitedUnrecorded`）を検知したときだけ、`drain_timeout` を上限に
 /// 全ストリームの EOF を待って集計を返す。`StopRequested` などプロセスが生存し得る結果では待たない
-/// （EOF が来ないため）。その場合リーダーは EOF まで走り sink への追記を続け、ストリームの所有権は捕捉側へ移っているため
-/// 監視の引き継ぎ時に再注入できない（#239・TASK-164 で扱う）。永続化・ローテーションは未実装（SUP-7・TASK-164）。
+/// （EOF が来ないため）。永続化・ローテーションは未実装（SUP-7・TASK-164）。
+///
+/// # 終端待ちをしなかった場合の捕捉の扱い
+/// 捕捉を開始した後は、ストリームの所有権がリーダーへ移っており再注入できない。そこで、終端待ちをしなかった
+/// 全経路で継続中の捕捉の取っ手（[`LogCapture`]）を呼び出し側へ返す。
+/// - `StopRequested`・`WaitFailedUnreleased`: [`MonitoredWithCapture::take_live_capture`]
+/// - 捕捉の開始後の `Err`（`wait` の失敗・停止時の監視権解放の失敗）: [`MonitorWithCaptureError::take_live_capture`]
+///
+/// 呼び出し側は [`LogCapture::cancel`] で捕捉を止めるか、取っ手を保持して捕捉を続け（再監視は
+/// [`monitor_with_observer`] で行う）、後で [`LogCapture::drain`] する。取っ手を破棄するとリーダーは EOF まで走り、
+/// 止める手段が無くなる。捕捉の引き継ぎの本実装は #239・TASK-164 で扱う。
 ///
 /// 生存リーダー数は `streams` を作るときに渡した [`crate::logs::ReaderBudget`] で数える（省略できない）。
 /// 過去の捕捉で終端待ちが期限切れになり残ったリーダーも同じ予算に数えられ、上限に達していれば捕捉開始は
@@ -494,31 +548,44 @@ pub fn monitor_with_capture(
     config: &MonitorConfig,
     stop: &StopToken,
     obs: &dyn MonitorObserver,
-) -> Result<MonitoredWithCapture, TraitError> {
+) -> Result<MonitoredWithCapture, MonitorWithCaptureError> {
     if !is_running_with_pid(state.record(), process.pid()) {
-        return Err(precondition(
-            "container is not running with the launched pid",
-        ));
+        return Err(MonitorWithCaptureError {
+            error: precondition("container is not running with the launched pid"),
+            live_capture: None,
+        });
     }
     // 監視権の取得後に捕捉を開始する。権限を得られない場合・開始失敗の場合に出力ストリームを消費しない。
     // `streams` は可変参照で受け、監視権の取得に成功した場合のみ中身を取り出す。取得失敗時は呼び出し側の手元に残る。
     let mut capture: Option<LogCapture> = None;
-    let outcome = monitor_after_claim(state, process, config, stop, obs, &mut || {
+    let monitored = monitor_after_claim(state, process, config, stop, obs, &mut || {
         capture = Some(observed(obs, MonitorOperation::CaptureStart, || {
             // 開始失敗時は streams が呼び出し側へ戻るため、捕捉を再試行できる。
             LogCapture::start_from(streams, Arc::clone(&sink))
         })?);
         Ok(())
-    })?;
+    });
+    let outcome = match monitored {
+        Ok(outcome) => outcome,
+        // 捕捉の開始後の失敗では、取っ手を返して呼び出し側が止められる・引き継げるようにする。
+        Err(error) => {
+            return Err(MonitorWithCaptureError {
+                error,
+                live_capture: capture,
+            });
+        }
+    };
     let exited = matches!(
         outcome,
         MonitorOutcome::Exited { .. } | MonitorOutcome::ExitedUnrecorded { .. }
     );
     if !exited {
+        // プロセスが生存し得るので EOF を待たない。継続中の捕捉は取っ手ごと呼び出し側へ返す。
         return Ok(MonitoredWithCapture {
             outcome,
             capture: None,
             capture_error: None,
+            live_capture: capture,
         });
     }
     let Some(capture) = capture else {
@@ -526,6 +593,7 @@ pub fn monitor_with_capture(
             outcome,
             capture: None,
             capture_error: None,
+            live_capture: None,
         });
     };
     // 読み取り・sink 追記の失敗は集計（StreamSummary::error_code）にだけ残り drain 自体は Ok になるため、
@@ -548,11 +616,13 @@ pub fn monitor_with_capture(
             outcome,
             capture: Some(summary),
             capture_error: None,
+            live_capture: None,
         },
         Err(e) => MonitoredWithCapture {
             outcome,
             capture: None,
             capture_error: Some(e),
+            live_capture: None,
         },
     })
 }
@@ -1304,7 +1374,10 @@ mod tests {
             &StderrLogObserver,
         )
         .unwrap_err();
-        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(e.error().code(), ErrorCode::FailedPrecondition);
+        // 捕捉を開始していないので、返す取っ手は無い。
+        let (_, live) = e.into_parts();
+        assert!(live.is_none());
         assert!(sink.snapshot().unwrap().is_empty());
     }
 
@@ -1341,7 +1414,7 @@ mod tests {
             &StderrLogObserver,
         )
         .unwrap_err();
-        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(e.error().code(), ErrorCode::FailedPrecondition);
         // 監視権を得られなかった場合、ストリームは呼び出し側に残る。
         assert!(!streams.is_empty());
         std::thread::sleep(Duration::from_millis(50));
@@ -1438,8 +1511,10 @@ mod tests {
             &rec,
         )
         .unwrap_err();
+        let (e, live) = e.into_parts();
         assert_eq!(e.code(), ErrorCode::Unavailable);
         assert_eq!(e.message(), "too many log reader threads are still alive");
+        assert!(live.is_none());
         assert_eq!(
             *rec.0.lock().unwrap(),
             vec![

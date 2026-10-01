@@ -366,3 +366,29 @@ fn oci6_core2_delete_rejected_until_stopped() {
     assert_eq!(cg.calls(), vec![(cid(id), StateRevision::from_raw(1))]);
     assert_eq!(op_stats(&rec, "delete"), (1, 3));
 }
+
+/// OCI-6・CORE-2（TASK-30.3）: 同じ ID を削除・再作成すると cgroup の instance が変わり、delete は再作成後の
+/// instance を対象にする（旧コンテナの cgroup 名 `fc-<id>@1` と新コンテナの `fc-<id>@2` は重ならない）。
+#[test]
+fn oci6_task30_3_recreated_container_gets_new_cgroup_instance() {
+    let b = Bundle::ready("recreate", &config());
+    let store = MemStateStore::new();
+    let rec = OpRecorder::new();
+    let id = "del-recreate";
+    let cg = RecordingCgroup::in_scope(SCOPE);
+    create_scoped(&store, &b, id, SCOPE);
+    delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect("first delete");
+    let recreated = create_scoped(&store, &b, id, SCOPE);
+    assert_eq!(
+        recreated.cgroup().map(|c| c.instance()),
+        Some(StateRevision::from_raw(2))
+    );
+    delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect("second delete");
+    assert_eq!(
+        cg.calls(),
+        vec![
+            (cid(id), StateRevision::from_raw(1)),
+            (cid(id), StateRevision::from_raw(2))
+        ]
+    );
+}

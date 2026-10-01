@@ -2091,4 +2091,45 @@ mod tests {
         assert_eq!(other.message(), "failed to remove container cgroup");
         assert!(!other.message().contains("errno"));
     }
+
+    /// OCI-6・TASK-30.3: instance つきの名前は `fc-<id>@<n>` で、同じ ID でも instance が違えば別名になり、
+    /// instance を持たない `fc-<id>`・退避リーフとも重ならない。255 バイトを超えると `InvalidArgument`。
+    #[test]
+    fn oci6_task30_3_cgroup_name_for_instance() {
+        let id = ContainerId::new("x").unwrap();
+        let r7 = CgroupName::for_instance(&id, StateRevision::from_raw(7)).unwrap();
+        assert_eq!(r7.as_str(), "fc-x@7");
+        let r8 = CgroupName::for_instance(&id, StateRevision::from_raw(8)).unwrap();
+        assert_eq!(r8.as_str(), "fc-x@8");
+        assert_ne!(r7, r8);
+        assert_ne!(r7, CgroupName::new(&id).unwrap());
+        // ID に `-` を含んでも、区切りの `@` は ID の許容文字に無いので組の取り違えが起きない。
+        let dashed = ContainerId::new("x-7").unwrap();
+        assert_eq!(
+            CgroupName::for_instance(&dashed, StateRevision::from_raw(0))
+                .unwrap()
+                .as_str(),
+            "fc-x-7@0"
+        );
+        // 退避リーフと同名の ID も instance つきなら衝突しない。
+        let runtime = ContainerId::new("runtime").unwrap();
+        assert_eq!(
+            CgroupName::for_instance(&runtime, StateRevision::from_raw(1))
+                .unwrap()
+                .as_str(),
+            "fc-runtime@1"
+        );
+        let max = u64::MAX;
+        let fits = ContainerId::new("a".repeat(255 - 3 - 1 - max.to_string().len())).unwrap();
+        assert_eq!(
+            CgroupName::for_instance(&fits, StateRevision::from_raw(max))
+                .unwrap()
+                .as_str()
+                .len(),
+            255
+        );
+        let over = ContainerId::new("a".repeat(252)).unwrap();
+        let err = CgroupName::for_instance(&over, StateRevision::from_raw(0)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
 }

@@ -870,4 +870,72 @@ mod tests {
         assert_eq!(rec.status(), &recreated);
         assert_eq!(rec.revision(), StateRevision::from_raw(2));
     }
+
+    /// OCI-6・CORE-2（TASK-30.3）: revision 再確認の後・cgroup 削除の最中に同じ ID が削除・再作成されても、
+    /// remove が対象にするのは読んだレコードの instance（1）で、再作成後のレコードの instance（2）とは
+    /// 異なる。実 remover の対象名は `fc-c1@1` で、再作成後の `fc-c1@2` には届かない。状態記録の削除は
+    /// revision 不一致で失敗し、再作成後のレコードは残る。
+    #[test]
+    fn oci6_task30_3_stale_delete_targets_only_its_own_instance() {
+        /// `remove` の中で同じ ID のレコードを削除・再作成する（他クライアントの delete と create の再現）。
+        struct RecreatingRemover<'a> {
+            store: &'a MemStateStore,
+            instances: Mutex<Vec<StateRevision>>,
+        }
+        impl ContainerCgroupRemover for RecreatingRemover<'_> {
+            fn scope(&self) -> Result<CgroupScope, TraitError> {
+                CgroupScope::new(SCOPE)
+            }
+            fn remove(
+                &self,
+                id: &ContainerId,
+                instance: StateRevision,
+            ) -> Result<CgroupRemoval, TraitError> {
+                self.instances
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(instance);
+                self.store
+                    .records
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(id);
+                self.store.create(
+                    &CreateStateRequest::new(
+                        ContainerStatus::created(id.clone(), None),
+                        std::env::temp_dir().join("b2"),
+                    )?
+                    .with_cgroup_scope(CgroupScope::new(SCOPE)?),
+                )?;
+                Ok(CgroupRemoval::Removed)
+            }
+        }
+
+        let store = MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+        let remover = RecreatingRemover {
+            store: &store,
+            instances: Mutex::new(Vec::new()),
+        };
+        let err = delete(
+            &store,
+            &OpRecorder::new(),
+            &remover,
+            &DeleteRequest::new(cid("c1")),
+        )
+        .expect_err("record replaced");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "container state changed during delete; retry"
+        );
+        assert_eq!(
+            *remover.instances.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![StateRevision::from_raw(1)]
+        );
+        let rec = store.get(&GetStateRequest::new(cid("c1"))).expect("kept");
+        assert_eq!(
+            rec.cgroup().map(|c| c.instance()),
+            Some(StateRevision::from_raw(2))
+        );
+    }
 }

@@ -1636,6 +1636,22 @@ mod tests {
         assert!(store.list(&list_req(10)).unwrap().records().is_empty());
     }
 
+    /// TASK-30.3・OCI-6: instance が revision と等しい（create 直後）配置は健全として読める（境界値）。
+    #[test]
+    fn oci6_task30_3_cgroup_instance_equal_to_revision_is_valid() {
+        let t = TmpDir::new("cgeq");
+        let store = t.open();
+        create(&store, "a");
+        let body = r#"{"ociVersion":"1.2.0","id":"a","status":"stopped","bundle":"/b","revision":10,"cgroupScope":"/","cgroupInstance":10}"#;
+        fs::write(t.path().join("a").join("state.json"), body).unwrap();
+        let got = store.get(&GetStateRequest::new(cid("a"))).unwrap();
+        assert_eq!(
+            got.cgroup()
+                .map(|c| (c.scope().as_str(), c.instance().value())),
+            Some(("/", 10))
+        );
+    }
+
     #[test]
     fn cri7_file_state_store_is_dyn_compatible() {
         let t = TmpDir::new("dyn");

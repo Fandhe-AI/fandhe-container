@@ -7,6 +7,8 @@
 //!
 //! # 契約
 //! - 行は LF を除いたバイト列で渡す（UTF-8 を仮定しない。CR は除去しない）。EOF 時の LF なし末尾行も 1 行として渡す。
+//!   読み取りがエラーで終わった場合、LF にも EOF にも達していない未完了の末尾は sink へ渡さず破棄する
+//!   （途中で欠けた内容を正常な行として残さない）。破棄は [`StreamSummary::discarded_lines`] に数える。
 //! - 1 行は [`MAX_LINE_BYTES`] で切り捨てる（超過ぶんは捨て、[`StreamSummary::truncated_lines`] へ数える。無制限確保の防止）。
 //! - [`LogSink::append`] が失敗したら、そのストリームでは以後 sink を呼ばない（故障した sink へ出力行数ぶんの
 //!   失敗処理を繰り返さない）。読み取りは EOF まで続けて破棄する（読みを止めるとパイプが詰まり、コンテナ側の write が
@@ -341,7 +343,8 @@ impl StreamSummary {
     pub fn truncated_lines(&self) -> u64 {
         self.truncated_lines
     }
-    /// sink の追記失敗により sink へ届かなかった行数（失敗した行と、以後に読み捨てた行）。[`Self::lines`] の内数。
+    /// sink へ届かなかった行数。sink の追記失敗によるもの（失敗した行と、以後に読み捨てた行）と、
+    /// 読み取りエラーで未完了のまま破棄した末尾行を数える。[`Self::lines`] の内数。
     pub fn discarded_lines(&self) -> u64 {
         self.discarded_lines
     }
@@ -688,6 +691,20 @@ impl LineSplitter<'_> {
         }
     }
 
+    /// 未完了の行バッファを sink へ渡さずに破棄する（読み取りエラー時）。行としては数え、届かなかった行数に計上する。
+    fn discard_partial(&mut self) {
+        if self.buf.is_empty() && !self.cut {
+            return;
+        }
+        self.summary.lines = self.summary.lines.saturating_add(1);
+        self.summary.discarded_lines = self.summary.discarded_lines.saturating_add(1);
+        if self.cut {
+            self.summary.truncated_lines = self.summary.truncated_lines.saturating_add(1);
+        }
+        self.buf.clear();
+        self.cut = false;
+    }
+
     fn emit(&mut self) {
         if self.sink_failed {
             // 故障した sink は再度呼ばない。行としては数え、届かなかった行数に計上する。
@@ -758,6 +775,8 @@ fn pump(
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => {
                 sp.summary.error_code.get_or_insert(ErrorCode::Internal);
+                // LF にも EOF にも達していない末尾は、欠けた内容を正常な行として残さないよう破棄する。
+                sp.discard_partial();
                 break;
             }
         }

@@ -6,7 +6,7 @@
 //! （TASK-38.1）が作る [`SeccompProgram`] を `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)` で呼び出し
 //! スレッドへ適用する。ステージ列（`StagePipeline`）へは TASK-38.3（#178）で組み込み済みで、
 //! `stages.rs` の組み込み段が [`apply_default_seccomp`] を exec 直前に必ず呼ぶ（差し替え不可）。
-//! 最終的な制限適用の証跡型は TASK-38・TASK-39 で決めるため、[`SeccompReport`] は証跡ではなく、
+//! 最終的な制限適用の証跡型の確定は後続作業のため、[`SeccompReport`] は証跡ではなく、
 //! `process.rs::require_restriction_evidence` は本関数の成否によらず exec を拒否し続ける（REPAIR-3）。
 //!
 //! # 契約
@@ -310,7 +310,7 @@ impl SeccompProbeRecord {
 ///
 /// # 将来仕様（記録のみ）
 ///
-/// exec が許可されたら（TASK-39.4・#184）、エントリポイント側のプローブ実行へ置き換える（REPAIR-3）。
+/// exec が許可されたら（証跡配線後。後続作業）、エントリポイント側のプローブ実行へ置き換える（REPAIR-3）。
 pub(crate) fn probe_denied_syscalls() -> Result<SeccompProbeRecord, ExecError> {
     let fail =
         |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Seccomp, m.to_string());

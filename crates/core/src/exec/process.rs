@@ -20,7 +20,7 @@
 //!
 //! - **最小構成（フック無し）**: 子はステージ列（[`StagePipeline`]。#832）を `run_child` の pivot 後・
 //!   exec 前で固定順に実行する。組み込みの `PR_SET_NO_NEW_PRIVS`（#833）は空のパイプラインでも適用される
-//!   が、**Landlock は未適用、cgroup 参加は呼び出し側が `cgroups::CgroupJoin` を登録した場合のみ適用**（Landlock・rootless の実体は TASK-39・40 が差し込む。capability 削減は #173、seccomp は #178 で組み込み済み）。
+//!   が、**Landlock は `with_landlock` 指定時のみ適用（本番 launcher からの指定は後続）、cgroup 参加は呼び出し側が `cgroups::CgroupJoin` を登録した場合のみ適用**（rootless の実体は TASK-40 が差し込む。capability 削減は #173、seccomp は #178 で組み込み済み）。
 //!   そのため制限が未適用の子（rootful 経路のホスト root 権限のままの子を含む）は、
 //!   `exec_entrypoint` が `PermissionDenied` で exec を拒否する（SEC-1・CORE-5。制限を適用できる
 //!   ようになるまで fail-closed。REPAIR-3: 実装済みを装わない）
@@ -254,9 +254,9 @@ fn exit_code_for(err: &ExecError) -> i32 {
 /// 適用した制限を区別できず、seccomp フィルタの中身も確認できないため、証跡として扱わない。
 /// `PR_SET_NO_NEW_PRIVS` は #833 で組み込みステージとして実装済みだが単独では証跡にせず、
 /// capability 削減は #173（TASK-37.2）で組み込み段になり、その [`CapabilityReport`] を引数で受け取る
-/// が、Landlock のステージの実体（TASK-39.3・39.4、#183・#184）が未実装の間は引数の有無によらず
+/// が、制限適用の証跡配線（Landlock の適用は #184 の `with_landlock` で差し込み可能だが証跡型が未確定。後続作業）が未実装の間は引数の有無によらず
 /// 常に `PermissionDenied` を返す。seccomp は #178（TASK-38.3）で組み込み段として適用されるが、
-/// 証跡型が未確定のため本関数へは配線しない（#184 で決める）。ステージ実装時は、各ステージが
+/// 証跡型が未確定のため本関数へは配線しない（Landlock も同様。確定と配線は後続作業）。ステージ実装時は、各ステージが
 /// 適用完了を示す証跡型（形は TASK-38・TASK-39 で決める）を返し、それを本関数の引数に取って
 /// 初めて許可する形へ置き換える（REPAIR-3: 実装済みを装わない）。
 fn require_restriction_evidence(
@@ -265,7 +265,7 @@ fn require_restriction_evidence(
     Err(ExecError::new(
         ErrorCode::PermissionDenied,
         IsolationStage::Exec,
-        "refusing to exec: no evidence that the isolation restrictions were applied (the Landlock stage is not implemented yet)",
+        "refusing to exec: no evidence that the isolation restrictions were applied (wiring of restriction-applied evidence into exec is not implemented yet)",
     ))
 }
 
@@ -708,7 +708,7 @@ fn publish_probe_record(text: &str) -> Result<(), ExecError> {
 ///
 /// # 将来仕様（記録のみ）
 ///
-/// exec が許可されたら（TASK-39.4・#184）、エントリポイント内のプローブへ移して本関数は廃止する（REPAIR-3）。
+/// exec が許可されたら（証跡配線後。後続作業）、エントリポイント内のプローブへ移して本関数は廃止する（REPAIR-3）。
 #[doc(hidden)]
 pub fn spawn_container_seccomp_probe(
     rootfs: &Path,

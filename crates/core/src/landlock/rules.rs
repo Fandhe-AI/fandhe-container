@@ -22,7 +22,7 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! ステージ列への組み込み（#184）は未実装（`landlock_add_rule` / `landlock_restrict_self` による適用は
+//! ステージ列への組み込み口（`with_landlock`・#184）は実装済み（`landlock_add_rule` / `landlock_restrict_self` による適用は
 //! #183・`apply` 子モジュールで実装済み）。
 //! GPU 向けの権利拡張は TASK-128（GPU-3）が後から追加する。
 
@@ -277,6 +277,18 @@ pub enum LandlockRuleErrorKind {
         /// 祖先ルールによって許可されてしまう書き込み系の権利。
         granted: AccessFs,
     },
+}
+
+impl LandlockRuleErrorKind {
+    /// 機械可読な理由コード（ERR-1。`exec` 側のエラー写像の message に含める）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TooManyRules { .. } => "too_many_rules",
+            Self::PathTooLong { .. } => "path_too_long",
+            Self::RightsExceedHandled => "rights_exceed_handled",
+            Self::WriteRestrictionShadowed { .. } => "write_restriction_shadowed",
+        }
+    }
 }
 
 /// ルール生成の明示エラー。

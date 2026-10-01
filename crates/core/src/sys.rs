@@ -30,6 +30,8 @@
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。
 //! 委譲 cgroup の検出と子 cgroup 作成（`crate::cgroups`。CORE-3・TASK-32.1・#158）は、
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
+//! さらに `crate::audit_log` のカーネル監査フォールバック（SEC-4・TASK-41.5.2・#840）が、
+//! `socket(2)`（NETLINK_AUDIT）・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶ。
 //! std だけでは提供されない syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
 //! （`Hostname` 等）が済ませた値だけを受け取る。
 //!
@@ -70,8 +72,8 @@ pub(crate) enum SysError {
 
 /// errno の値（アーキテクチャごとに `consts` で個別定義。alpha / mips / sparc 等は値が違う）。
 pub(crate) use consts::{
-    E2BIG, EACCES, EBADF, EBUSY, ECHILD, EEXIST, EINTR, EINVAL, ELOOP, ENOENT, ENOEXEC, ENOSYS,
-    ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EPERM, ESRCH,
+    E2BIG, EACCES, EAFNOSUPPORT, EBADF, EBUSY, ECHILD, ECONNREFUSED, EEXIST, EINTR, EINVAL, ELOOP,
+    ENOENT, ENOEXEC, ENOSYS, ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EPERM, EPROTONOSUPPORT, ESRCH,
 };
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）
@@ -210,6 +212,18 @@ mod consts {
     pub const PR_CAPBSET_DROP: i32 = 24;
     pub const PR_CAP_AMBIENT: i32 = 47;
     pub const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
+    // include/linux/socket.h・uapi/linux/netlink.h・uapi/asm-generic/socket.h・poll.h・errno.h の値
+    // （カーネル監査への NETLINK_AUDIT 送信用。TASK-41.5.2・#840。`SOCK_CLOEXEC` は `O_CLOEXEC` と同値）。
+    pub const AF_NETLINK: u16 = 16;
+    pub const SOCK_RAW: i32 = 3;
+    pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
+    pub const NETLINK_AUDIT: i32 = 9;
+    pub const POLLIN: i16 = 1;
+    /// `MSG_DONTWAIT`（送信側を非ブロッキングにする。x86_64・aarch64 とも 0x40）。
+    pub const MSG_DONTWAIT: i32 = 0x40;
+    pub const EPROTONOSUPPORT: i32 = 93;
+    pub const EAFNOSUPPORT: i32 = 97;
+    pub const ECONNREFUSED: i32 = 111;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -338,6 +352,18 @@ mod consts {
     pub const PR_CAPBSET_DROP: i32 = 24;
     pub const PR_CAP_AMBIENT: i32 = 47;
     pub const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
+    // include/linux/socket.h・uapi/linux/netlink.h・uapi/asm-generic/socket.h・poll.h・errno.h の値
+    // （カーネル監査への NETLINK_AUDIT 送信用。TASK-41.5.2・#840。`SOCK_CLOEXEC` は `O_CLOEXEC` と同値）。
+    pub const AF_NETLINK: u16 = 16;
+    pub const SOCK_RAW: i32 = 3;
+    pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
+    pub const NETLINK_AUDIT: i32 = 9;
+    pub const POLLIN: i16 = 1;
+    /// `MSG_DONTWAIT`（送信側を非ブロッキングにする。x86_64・aarch64 とも 0x40）。
+    pub const MSG_DONTWAIT: i32 = 0x40;
+    pub const EPROTONOSUPPORT: i32 = 93;
+    pub const EAFNOSUPPORT: i32 = 97;
+    pub const ECONNREFUSED: i32 = 111;
 }
 
 /// 対応外アーキテクチャ: 定数は 0 で、ラッパーは `Unsupported` を返す。errno は実在しない
@@ -433,6 +459,15 @@ mod consts {
     pub const PR_CAPBSET_DROP: i32 = 0;
     pub const PR_CAP_AMBIENT: i32 = 0;
     pub const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 0;
+    pub const AF_NETLINK: u16 = 0;
+    pub const SOCK_RAW: i32 = 0;
+    pub const SOCK_CLOEXEC: i32 = 0;
+    pub const NETLINK_AUDIT: i32 = 0;
+    pub const POLLIN: i16 = 0;
+    pub const MSG_DONTWAIT: i32 = 0;
+    pub const EPROTONOSUPPORT: i32 = -22;
+    pub const EAFNOSUPPORT: i32 = -23;
+    pub const ECONNREFUSED: i32 = -24;
 }
 
 /// `openat(2)` の `AT_FDCWD`（絶対パス指定時は dirfd が無視される）。値は
@@ -526,6 +561,49 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int fstatfs(int fd, struct statfs *buf)`。構造体は下の
     // [`StatFs`]（arch 別に個別定義）で、カーネルが書く 120 バイトを確保する。
     fn fstatfs(fd: i32, buf: *mut StatFs) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int socket(int domain, int type, int protocol)`。
+    fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `ssize_t sendto(int fd, const void *buf, size_t len, int flags,
+    // const struct sockaddr *addr, socklen_t addrlen)`（LP64 で `ssize_t` は i64・`socklen_t` は u32）。
+    fn sendto(
+        fd: i32,
+        buf: *const core::ffi::c_void,
+        len: usize,
+        flags: i32,
+        addr: *const SockaddrNl,
+        addrlen: u32,
+    ) -> isize;
+    // SAFETY（宣言そのものの妥当性）: `ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
+    // struct sockaddr *addr, socklen_t *addrlen)`。
+    fn recvfrom(
+        fd: i32,
+        buf: *mut core::ffi::c_void,
+        len: usize,
+        flags: i32,
+        addr: *mut SockaddrNl,
+        addrlen: *mut u32,
+    ) -> isize;
+    // SAFETY（宣言そのものの妥当性）: `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`
+    // （`nfds_t` は `unsigned long`＝LP64 で u64）。
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+}
+
+/// `struct sockaddr_nl`（include/uapi/linux/netlink.h。全アーキテクチャ共通の 12 バイト）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockaddrNl {
+    nl_family: u16,
+    nl_pad: u16,
+    nl_pid: u32,
+    nl_groups: u32,
+}
+
+/// `struct pollfd`（include/uapi/asm-generic/poll.h。全アーキテクチャ共通の 8 バイト）。
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
 }
 
 /// `fstatfs(2)` の出力バッファ（x86_64）。`struct statfs` は先頭が `f_type`（`long`）、全体 120 バイト
@@ -551,6 +629,113 @@ struct StatFs {
 #[repr(C)]
 struct StatFs {
     f_type: i64,
+}
+
+/// カーネル監査（NETLINK_AUDIT）用のソケットを開く（`SOCK_RAW|SOCK_CLOEXEC`。TASK-41.5.2・#840）。
+///
+/// `crate::audit_log` のカーネル監査フォールバックが呼び出しごとに開閉する。socket 作成自体は
+/// 非特権でも通る（権限検査は送信先のカーネルが `audit_netlink_ok` で行う）。
+pub(crate) fn netlink_audit_socket() -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数はすべて値渡しの整数でポインタを取らない。成功時の戻り値は新規 fd で、直後に
+    // `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let fd = unsafe {
+        socket(
+            i32::from(consts::AF_NETLINK),
+            consts::SOCK_RAW | consts::SOCK_CLOEXEC,
+            consts::NETLINK_AUDIT,
+        )
+    };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した socket が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `buf` 全体を 1 データグラムとしてカーネル（`nl_pid = 0`）へ送る。送れたバイト数を返す。
+///
+/// 送信は `MSG_DONTWAIT` で行い、送信キューが詰まっていても待たずに `EAGAIN` で失敗する
+/// （監査ファイル失敗時の呼び出し元を無期限にブロックさせない。SEC-4・TASK-41.5.2）。
+pub(crate) fn netlink_send_to_kernel(fd: BorrowedFd<'_>, buf: &[u8]) -> Result<usize, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let addr = SockaddrNl {
+        nl_family: consts::AF_NETLINK,
+        nl_pad: 0,
+        nl_pid: 0,
+        nl_groups: 0,
+    };
+    // SAFETY: `buf` は借用したスライスで、`buf.len()` バイトが呼び出しの間読み出し可能。`addr` は
+    // スタック上の初期化済み `SockaddrNl` で、`addrlen` はその `size_of`（12）と一致する。`fd` は生存中の
+    // `BorrowedFd`。カーネルは両バッファを呼び出しの間だけ読む。
+    let n = unsafe {
+        sendto(
+            fd.as_raw_fd(),
+            buf.as_ptr().cast(),
+            buf.len(),
+            consts::MSG_DONTWAIT,
+            &raw const addr,
+            core::mem::size_of::<SockaddrNl>() as u32,
+        )
+    };
+    usize::try_from(n).map_err(|_| last_error())
+}
+
+/// 1 データグラムを受信し、`(受信バイト数, 送信元の nl_pid)` を返す（呼び出し前に `poll_readable` で
+/// 読み取り可能を確認する。確認なしだとブロックしうる）。送信元が netlink アドレスでなければ `EINVAL`。
+pub(crate) fn netlink_recv(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<(usize, u32), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut addr = SockaddrNl {
+        nl_family: 0,
+        nl_pad: 0,
+        nl_pid: 0,
+        nl_groups: 0,
+    };
+    let mut addrlen = core::mem::size_of::<SockaddrNl>() as u32;
+    // SAFETY: `buf` は排他借用したスライスで `buf.len()` バイトが書き込み可能。`addr`・`addrlen` は
+    // スタック上の初期化済みローカルで、`addrlen` は `addr` の確保サイズ（12）を入力として渡す。
+    // カーネルは書き込んだ長さを `addrlen` へ返し、確保サイズを超えて書かない。
+    let n = unsafe {
+        recvfrom(
+            fd.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+            &raw mut addr,
+            &raw mut addrlen,
+        )
+    };
+    let n = usize::try_from(n).map_err(|_| last_error())?;
+    if addrlen < core::mem::size_of::<SockaddrNl>() as u32 || addr.nl_family != consts::AF_NETLINK {
+        return Err(SysError::Os(EINVAL));
+    }
+    Ok((n, addr.nl_pid))
+}
+
+/// `fd` が読み取り可能になるまで最大 `timeout_ms` ミリ秒待つ。可能なら `true`、時間切れなら `false`。
+/// シグナルによる中断は `Os(EINTR)` で返す（呼び出し側が残り時間で再試行する）。
+pub(crate) fn poll_readable(fd: BorrowedFd<'_>, timeout_ms: i32) -> Result<bool, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut pfd = PollFd {
+        fd: fd.as_raw_fd(),
+        events: consts::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pfd` はスタック上の初期化済み 1 要素で、`nfds` = 1 と一致する。カーネルは呼び出しの間だけ
+    // `revents` を書く。
+    let r = unsafe { poll(&raw mut pfd, 1, timeout_ms) };
+    if r < 0 {
+        return Err(last_error());
+    }
+    Ok(r > 0)
 }
 
 /// 直前の失敗した syscall の errno を `SysError` にする（失敗直後に呼ぶこと）。
@@ -1760,6 +1945,19 @@ mod tests {
         }
     }
     use std::os::fd::AsFd as _;
+
+    /// SEC-4・TASK-41.5.2: netlink 監査用の定数・構造体レイアウトの具体値（kernel の uapi と照合）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sec4_task41_5_2_netlink_consts_and_layout_are_exact() {
+        assert_eq!((consts::AF_NETLINK, consts::SOCK_RAW), (16, 3));
+        assert_eq!(consts::SOCK_CLOEXEC, 0o2_000_000);
+        assert_eq!((consts::NETLINK_AUDIT, consts::POLLIN), (9, 1));
+        assert_eq!(consts::MSG_DONTWAIT, 0x40);
+        assert_eq!((EAFNOSUPPORT, EPROTONOSUPPORT, ECONNREFUSED), (97, 93, 111));
+        assert_eq!(std::mem::size_of::<SockaddrNl>(), 12);
+        assert_eq!(std::mem::size_of::<PollFd>(), 8);
+    }
 
     /// CORE-3・TASK-32.1: cgroup 操作用の定数・`statfs` バッファの具体値。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

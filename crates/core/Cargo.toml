@@ -15,6 +15,14 @@ publish = false
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# 結合試験 tests/escape_suite.rs 専用の任意クロージャ実行経路 `spawn_container_probe` を公開する feature
+# （SEC-2・TASK-42.1・#199）。通常ビルドでは無効で、下の dev-dependency（自己参照）でテスト時のみ有効化する。
+[features]
+escape-probe = []
+
+[dev-dependencies]
+fandhe-container-core = { path = ".", features = ["escape-probe"] }
+
 # namespace 分離の結合試験（CORE-1・TASK-27.2）。libtest はテストをスレッドで実行し
 # CLONE_NEWUSER が EINVAL になるため、単一スレッドの独自 main（harness = false）で動かす。
 [[test]]
@@ -57,6 +65,21 @@ harness = false
 [[test]]
 name = "cgroups"
 path = "tests/cgroups.rs"
+harness = false
+
+# cgroups v2 実効性の回帰テスト（CORE-3・TASK-36.1・#169）。fork は単一スレッドで行い、user namespace の
+# 作成と委譲 cgroup が必要な実機前提テストのため harness = false。`-- --ignored` 指定時のみ実行する
+# （AGENTS.md）。
+[[test]]
+name = "cgroups_regression"
+path = "tests/cgroups_regression.rs"
+harness = false
+
+# OOM Kill 確認の結合試験（CORE-3・TASK-33.1・#164）。上と同じ理由で harness = false。委譲 cgroup v2 が
+# 必要な実機前提テストのため `-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "cgroups_oom"
+path = "tests/cgroups_oom.rs"
 harness = false
 
 # 基本デバイスノード作成（create_default_devices）の結合試験（CORE-1・TASK-27.6）。上と同じ理由で
@@ -131,4 +154,11 @@ harness = false
 [[test]]
 name = "landlock"
 path = "tests/landlock.rs"
+harness = false
+
+# 攻撃テストハーネス基盤（SEC-2・TASK-42.1・#199。ESC-01〜10 は #200〜#203 で追加）。CLONE_NEWUSER /
+# 単一スレッド前提の fork のため harness = false。`-- --ignored` 指定時のみ実機前提部分を実行する（AGENTS.md）。
+[[test]]
+name = "escape_suite"
+path = "tests/escape_suite.rs"
 harness = false

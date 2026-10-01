@@ -6,6 +6,7 @@
 //! `observe_landlock_path_access` 経由で使い捨ての子（テストバイナリ自身の再実行）の中で行う。
 //! 適用は不可逆・単一スレッド前提のため libtest ではなく `harness = false` の `main` で動かし、
 //! 親は子をタイムアウト付きで待つ（REPAIR-5）。
+//! 拒否 5 件に対する監査レコード 5 件とパス一致も照合する（SEC-4・TASK-41.3・#194）。
 //!
 //! # 既存テストとの対応（TASK-39.5 の AC1。ABI 検出と fail-closed）
 //!
@@ -44,6 +45,7 @@ fn main() {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 fn main() {
+    use fandhe_container_core::audit_log::AuditLayer;
     use fandhe_container_core::exec::{
         IsolationStage, LandlockAccessKind as K, LandlockAccessObservation, LandlockAccessProbe,
         observe_landlock_path_access,
@@ -149,6 +151,8 @@ fn main() {
         assert!(!o.applied);
         assert!(o.apply_error.is_none());
         assert!(o.results.is_empty(), "probes must not run");
+        assert!(o.audit_records.is_empty(), "no audit records without apply");
+        assert!(o.audit_error.is_none());
         println!("landlock child: detect-refused ({})", e.message);
     }
 
@@ -200,6 +204,22 @@ fn main() {
                     None,
                 ];
                 assert_eq!(got, expected, "results: {:?}", o.results);
+                // SEC-4・TASK-41.3: 拒否 5 件に対し監査レコードがちょうど 5 件・パス一致。
+                let want_paths = [
+                    denied.join("new"),
+                    denied.join("newdir"),
+                    denied.join("existing"),
+                    denied.join("existing"),
+                    denied.join("existing"),
+                ];
+                assert!(o.audit_error.is_none(), "{:?}", o.audit_error);
+                assert_eq!(o.audit_records.len(), 5, "{:?}", o.audit_records);
+                for (rec, want) in o.audit_records.iter().zip(want_paths.iter()) {
+                    assert_eq!(rec.layer(), AuditLayer::Landlock);
+                    assert_eq!(rec.path(), Some(want.as_path()));
+                    assert_eq!(rec.syscall(), None);
+                    assert_eq!(rec.pid().get(), std::process::id());
+                }
                 assert!(!denied.join("new").exists(), "denied create left a file");
                 assert!(!denied.join("newdir").exists(), "denied mkdir left a dir");
                 assert!(
@@ -233,6 +253,7 @@ fn main() {
                     o.results.is_empty(),
                     "probes must not run after apply failure"
                 );
+                assert!(o.audit_records.is_empty(), "no audit records without apply");
                 println!("landlock child: ok");
             }
             other => panic!("unknown child mode {other}"),

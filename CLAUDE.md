@@ -59,6 +59,8 @@ fandhe-container/
 │   │   ├── break-detection-ci-report.md  # BREAK-1/BREAK-2 の CI 検出実証レポート（TASK-89.2・REPAIR-7）
 │   │   ├── io-fio-bench.md        # fio 4K ランダム write ベンチスクリプトの契約（TASK-25.1・IO-8）・Docker ベースライン計測手順・目標値案（TASK-25.2）
 │   │   ├── bench-calibration.md   # ベンチ基準値の校正記録・試行ログ（TASK-88.2・REPAIR-8。実測は前提ベンチ未実装のため保留）
+│   │   ├── measurements/
+│   │   │   └── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
 │   │   └── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external・ci（稼働）/ release（発火条件無効化中）

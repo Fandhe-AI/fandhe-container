@@ -1211,8 +1211,6 @@ mod tests {
         assert!(StateRecord::new(status, sample_bundle(), StateRevision::INITIAL).is_ok());
     }
 
-    /// TASK-30.3・OCI-6: `CgroupScope` はルート `/` と `/a/b` 形式だけを受理し、相対・空要素・`.`・`..`・
-    /// NUL・要素長 / 深さ / 全体長の超過を `INVALID_ARGUMENT` で拒否する。
     /// SUP-1・TASK-157.2: health の文字列表現と逆変換。未知・空・大文字は `None`。
     #[test]
     fn sup1_task157_2_health_status_as_str_and_parse() {
@@ -1291,6 +1289,9 @@ mod tests {
             .unwrap();
         assert_eq!(w.supervision(), second);
     }
+
+    /// TASK-30.3・OCI-6: `CgroupScope` はルート `/` と `/a/b` 形式だけを受理し、相対・空要素・`.`・`..`・
+    /// NUL・要素長 / 深さ / 全体長の超過を `INVALID_ARGUMENT` で拒否する。
     #[test]
     fn oci6_task30_3_cgroup_scope_validation() {
         for ok in ["/", "/user.slice", "/user.slice/user-1000.slice/x.scope"] {

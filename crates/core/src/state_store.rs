@@ -1826,6 +1826,7 @@ mod tests {
         }
         assert!(store.list(&list_req(10)).unwrap().records().is_empty());
     }
+
     #[test]
     fn cri7_file_state_store_is_dyn_compatible() {
         let t = TmpDir::new("dyn");

@@ -719,6 +719,53 @@ pub fn spawn_container_seccomp_probe(
     Ok(ContainerChild::new(pid))
 }
 
+/// 結合試験専用: exec の代わりに任意の攻撃プローブを実行する子を fork する（SEC-2・TASK-42.1・#199）。
+///
+/// 呼び出し文脈は `tests/escape_suite.rs` のシナリオ（`isolate` 済みの親）。`spawn_container_with_stages`
+/// と同じ前段（pivot 済み・capability 削減・`NO_NEW_PRIVS`・Landlock〔登録時〕・組み込み seccomp）を
+/// 通した**後**にだけ `probe` を呼ぶ。exec は呼ばず `require_restriction_evidence` も迂回しないため、
+/// 権限・昇格経路は増えない。前段が失敗した場合は `probe` に到達しない（fail-closed）。通常の利用者は呼ばない。
+///
+/// # 契約
+///
+/// - 終了コード: `probe` が正常に戻れば 0、前段失敗は既存規約（`exit_code_for`）、`probe` の panic は
+///   `EXIT_SETUP_FAILED`（`fork_single_threaded` の `catch_unwind`）
+/// - probe の結果は終了コードではなく、呼び出し側が fork 前に用意した fd（pipe 等）で受け渡す
+/// - 単体テストは置かない（fork と分離環境を要するため `tests/escape_suite.rs` の結合試験でカバーする）
+///
+/// # 将来仕様（記録のみ）
+///
+/// exec が許可されたら（証跡配線後。後続作業）、エントリポイント内の攻撃プローブへ移して本関数は
+/// 廃止する（REPAIR-3）。
+#[doc(hidden)]
+pub fn spawn_container_probe<F>(
+    rootfs: &Path,
+    stages: StagePipeline,
+    probe: F,
+) -> Result<ContainerChild, ExecError>
+where
+    F: FnOnce(),
+{
+    let pid = sys::fork_single_threaded(
+        move || {
+            let result = run_child_then(rootfs, stages, |_isolation, _report, _caps| {
+                probe();
+                Ok(())
+            });
+            match result {
+                Ok(()) => 0,
+                Err(err) => {
+                    let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
+                    exit_code_for(&err)
+                }
+            }
+        },
+        EXIT_SETUP_FAILED,
+    )
+    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    Ok(ContainerChild::new(pid))
+}
+
 /// 分離済み（`isolate` / `isolate_rootful_host_root` の後）の親から子を fork し、子で
 /// `establish` → `prepare_rootfs` → `pivot_root` → `exec_entrypoint` を行う。
 ///

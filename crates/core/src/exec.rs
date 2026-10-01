@@ -109,6 +109,9 @@ pub use landlock::{
     LANDLOCK_PROBE_CONTENT_MISMATCH, LandlockAccessKind, LandlockAccessObservation,
     LandlockAccessProbe, observe_landlock_path_access,
 };
+/// 結合試験 `tests/escape_suite.rs` 専用の再公開（SEC-2・TASK-42.1・#199。通常の利用者は呼ばない。詳細は定義側）。
+#[doc(hidden)]
+pub use process::spawn_container_probe;
 /// 結合試験 `tests/seccomp.rs` 専用の再公開（CORE-5・TASK-38.4・#179。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use process::spawn_container_seccomp_probe;

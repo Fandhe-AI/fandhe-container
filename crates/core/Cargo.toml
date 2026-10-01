@@ -147,3 +147,10 @@ harness = false
 name = "landlock"
 path = "tests/landlock.rs"
 harness = false
+
+# 攻撃テストハーネス基盤（SEC-2・TASK-42.1・#199。ESC-01〜10 は #200〜#203 で追加）。CLONE_NEWUSER /
+# 単一スレッド前提の fork のため harness = false。`-- --ignored` 指定時のみ実機前提部分を実行する（AGENTS.md）。
+[[test]]
+name = "escape_suite"
+path = "tests/escape_suite.rs"
+harness = false

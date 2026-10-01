@@ -16,12 +16,21 @@
 //! 1. 事前確認: 状態が `Running` で、`status.pid()` が起動ハンドルの pid と一致すること。違えば `FailedPrecondition`。
 //! 2. 監視開始の記録: `supervisor_pid` に自プロセスの pid を書く（`health`・`restart_count` は既存値を保つ）。
 //! 3. ループ: 周回の先頭で停止要求を確認し、`wait(poll_interval)` で生存確認する。`Ok(None)` は生存、
-//!    `Ok(Some(_))` は終了（回収済み）、`Err` は握りつぶさずそのまま返す。
+//!    `Ok(Some(_))` は終了（回収済み）、`Err` は握りつぶさず返す。ただし返す前に記録済みの `supervisor_pid` を
+//!    解除する（監視していないのに自 pid が残るのを防ぐ）。解除にも失敗したら [`MonitorOutcome::WaitFailedUnreleased`] で
+//!    wait の失敗と解除の失敗の両方を返し、呼び出し側が識別できるようにする。
 //! 4. 終了の記録: `Stopped` と終了コードを書き、`supervisor_pid` を `None` に戻す。回収後の書き込み失敗は
 //!    `Err` にせず [`MonitorOutcome::ExitedUnrecorded`] で終了状態ごと返す（プロセスは回収済みで再 wait 不可。回復は #239）。本 issue ではループ終了 =
 //!    監視なしのため。再起動で監視を続ける挙動は #239 が変更する。
 //! 5. 停止要求（[`StopToken`]）: 監視をやめるだけで、プロセスは終了させない。状態は `Running` のまま
-//!    `supervisor_pid` だけ `None` に戻す。
+//!    `supervisor_pid` だけ `None` に戻す。起動ハンドルは参照渡しのため所有権は常に呼び出し側に残り、
+//!    回収責任（終了・`wait` での回収、または別の監視への引き継ぎ）は呼び出し側が負う契約とする
+//!    （[`MonitorOutcome::StopRequested`] の doc 参照）。
+//!
+//! # 可観測性（REPAIR-4）
+//! 監視開始・wait・終了記録・停止・解除の各操作について、成功 / 失敗とレイテンシを [`MonitorObserver`] へ通知する。
+//! [`monitor`] は [`StderrLogObserver`]（1 行 1 JSON の構造化ログを stderr へ出す）を使い、差し替えたい場合は
+//! [`monitor_with_observer`] を使う。`ExitedUnrecorded` は `record_exit` の失敗として必ず通知される。
 //!
 //! 終了コードの写像: `Exited(c)` は `Some(c)`、`Signaled(s)` はシェル慣習に合わせ `Some(128 + s)`
 //! （あふれたら `None`）。生の [`ProcessExit`] は [`MonitorOutcome::Exited`] で返す。
@@ -40,7 +49,7 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
 use fandhe_container_core::traits::{
@@ -133,21 +142,131 @@ pub enum MonitorOutcome {
         /// 状態書き込みの失敗理由。
         error: TraitError,
     },
+    /// `wait` が失敗し、記録済みの `supervisor_pid` の解除にも失敗した（状態に自 pid が残り得る）。
+    /// 解除に成功した場合は従来どおり `Err(wait_error)` で返る。
+    WaitFailedUnreleased {
+        /// `wait` の失敗理由。
+        wait_error: TraitError,
+        /// `supervisor_pid` 解除の失敗理由。
+        release_error: TraitError,
+    },
     /// 停止要求で監視をやめた（プロセスは kill せず、状態は `Running` のまま）。
+    ///
+    /// 起動ハンドルの回収責任は呼び出し側に残る（`monitor` は参照でしか受け取らない）。呼び出し側は
+    /// `terminate` と `wait` で終了・回収するか、再度 [`monitor`] へ渡して監視を引き継ぐこと。
+    /// 放置するとプロセスが無監視のまま残る。
     StopRequested {
         /// 書き込み後のレコード（`supervisor_pid` は `None`）。
         record: StateRecord,
     },
 }
 
-/// 起動ハンドルの生存確認と終了検知を行い、結果を状態へ記録する（処理順は module doc）。
-///
-/// 参照で受けるのは、後続（#239）が同じハンドル・状態で再起動処理を続けられるようにするため。
+/// 可観測性の対象となる操作（REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MonitorOperation {
+    /// 監視開始（`supervisor_pid` の記録）。
+    Start,
+    /// 生存確認（1 回の `wait`）。
+    Wait,
+    /// 終了状態の記録（失敗は `ExitedUnrecorded`）。
+    RecordExit,
+    /// 停止要求に伴う `supervisor_pid` の解除。
+    Stop,
+    /// `wait` 失敗後の `supervisor_pid` 解除。
+    ReleaseAfterWaitError,
+}
+
+impl MonitorOperation {
+    /// ログ・メトリクスのラベルに使う安定名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Wait => "wait",
+            Self::RecordExit => "record_exit",
+            Self::Stop => "stop",
+            Self::ReleaseAfterWaitError => "release_after_wait_error",
+        }
+    }
+}
+
+/// 1 操作の観測結果（成功 / 失敗とレイテンシ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorEvent {
+    /// 操作の種類。
+    pub operation: MonitorOperation,
+    /// 失敗時のエラーコード。成功なら `None`。
+    pub error_code: Option<ErrorCode>,
+    /// 操作に要した時間。
+    pub elapsed: Duration,
+}
+
+/// 監視操作の成功・失敗とレイテンシを受け取る（構造化ログ・メトリクスへの橋渡し。REPAIR-4）。
+pub trait MonitorObserver {
+    /// 1 操作の完了を通知する。
+    fn observe(&self, event: &MonitorEvent);
+}
+
+/// 1 行 1 JSON の構造化ログを stderr へ出す既定の観測器（値は固定語彙・数値のみ）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StderrLogObserver;
+
+impl MonitorObserver for StderrLogObserver {
+    fn observe(&self, event: &MonitorEvent) {
+        let result = if event.error_code.is_none() {
+            "ok"
+        } else {
+            "error"
+        };
+        let code = event
+            .error_code
+            .map(|c| format!("{c:?}"))
+            .unwrap_or_default();
+        eprintln!(
+            "{{\"component\":\"supervisor.monitor\",\"operation\":\"{}\",\"result\":\"{}\",\"code\":\"{}\",\"elapsed_us\":{}}}",
+            event.operation.as_str(),
+            result,
+            code,
+            event.elapsed.as_micros()
+        );
+    }
+}
+
+/// 操作を実行して所要時間と成否を通知する。
+fn observed<T>(
+    obs: &dyn MonitorObserver,
+    operation: MonitorOperation,
+    f: impl FnOnce() -> Result<T, TraitError>,
+) -> Result<T, TraitError> {
+    let started = Instant::now();
+    let r = f();
+    obs.observe(&MonitorEvent {
+        operation,
+        error_code: r.as_ref().err().map(TraitError::code),
+        elapsed: started.elapsed(),
+    });
+    r
+}
+
+/// [`monitor_with_observer`] を [`StderrLogObserver`] で呼ぶ。
 pub fn monitor(
     state: &mut SupervisedState,
     process: &dyn LaunchedProcess,
     config: &MonitorConfig,
     stop: &StopToken,
+) -> Result<MonitorOutcome, TraitError> {
+    monitor_with_observer(state, process, config, stop, &StderrLogObserver)
+}
+
+/// 起動ハンドルの生存確認と終了検知を行い、結果を状態へ記録する（処理順は module doc）。
+///
+/// 参照で受けるのは、後続（#239）が同じハンドル・状態で再起動処理を続けられるようにするため。
+pub fn monitor_with_observer(
+    state: &mut SupervisedState,
+    process: &dyn LaunchedProcess,
+    config: &MonitorConfig,
+    stop: &StopToken,
+    obs: &dyn MonitorObserver,
 ) -> Result<MonitorOutcome, TraitError> {
     let pid = process.pid();
     if !is_running_with_pid(state.record(), pid) {
@@ -158,42 +277,70 @@ pub fn monitor(
 
     let self_pid = NonZeroU32::new(std::process::id())
         .ok_or_else(|| TraitError::new(ErrorCode::Internal, "own pid is zero"))?;
-    write_with_retry(state, pid, |rec| {
-        (
-            rec.status().clone(),
-            SupervisionState::new(Some(self_pid), rec.health(), rec.restart_count()),
-        )
+    observed(obs, MonitorOperation::Start, || {
+        write_with_retry(state, pid, |rec| {
+            (
+                rec.status().clone(),
+                SupervisionState::new(Some(self_pid), rec.health(), rec.restart_count()),
+            )
+        })
     })?;
 
     loop {
         if stop.is_stop_requested() {
-            let record = write_with_retry(state, pid, |rec| {
-                (
-                    rec.status().clone(),
-                    SupervisionState::new(None, rec.health(), rec.restart_count()),
-                )
+            let record = observed(obs, MonitorOperation::Stop, || {
+                release_supervisor_pid(state, pid)
             })?;
             return Ok(MonitorOutcome::StopRequested { record });
         }
-        match process.wait(config.poll_interval())? {
-            None => continue,
-            Some(exit) => {
+        match observed(obs, MonitorOperation::Wait, || {
+            process.wait(config.poll_interval())
+        }) {
+            Ok(None) => continue,
+            Ok(Some(exit)) => {
                 let code = exit_code_of(exit);
                 let id = state.id().clone();
                 // 回収後は再 wait できないため、書き込み失敗でも終了状態を返す。
-                let written = write_with_retry(state, pid, |rec| {
-                    (
-                        ContainerStatus::stopped(id.clone(), code),
-                        SupervisionState::new(None, rec.health(), rec.restart_count()),
-                    )
+                let written = observed(obs, MonitorOperation::RecordExit, || {
+                    write_with_retry(state, pid, |rec| {
+                        (
+                            ContainerStatus::stopped(id.clone(), code),
+                            SupervisionState::new(None, rec.health(), rec.restart_count()),
+                        )
+                    })
                 });
                 return Ok(match written {
                     Ok(record) => MonitorOutcome::Exited { exit, record },
                     Err(error) => MonitorOutcome::ExitedUnrecorded { exit, error },
                 });
             }
+            Err(wait_error) => {
+                // 監視をやめるので、記録済みの自 pid を残さない。
+                return match observed(obs, MonitorOperation::ReleaseAfterWaitError, || {
+                    release_supervisor_pid(state, pid)
+                }) {
+                    Ok(_) => Err(wait_error),
+                    Err(release_error) => Ok(MonitorOutcome::WaitFailedUnreleased {
+                        wait_error,
+                        release_error,
+                    }),
+                };
+            }
         }
     }
+}
+
+/// `supervisor_pid` を `None` に戻す（`health`・`restart_count` は保つ）。
+fn release_supervisor_pid(
+    state: &mut SupervisedState,
+    pid: NonZeroU32,
+) -> Result<StateRecord, TraitError> {
+    write_with_retry(state, pid, |rec| {
+        (
+            rec.status().clone(),
+            SupervisionState::new(None, rec.health(), rec.restart_count()),
+        )
+    })
 }
 
 fn precondition(msg: &'static str) -> TraitError {
@@ -571,6 +718,92 @@ mod tests {
         let e = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap_err();
         assert_eq!(e.code(), ErrorCode::Internal);
         assert_eq!(p.waits(), 1);
+        // wait 失敗時は記録済みの supervisor_pid を解除している。
+        assert_eq!(
+            store.rec.lock().unwrap().supervision().supervisor_pid(),
+            None
+        );
+    }
+
+    /// 解除にも失敗したら WaitFailedUnreleased で両方の失敗を返す。
+    #[test]
+    fn sup1_task157_4_wait_failure_release_failure_is_identifiable() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        struct FailRacy<'a>(&'a FakeStore);
+        impl LaunchedProcess for FailRacy<'_> {
+            fn pid(&self) -> NonZeroU32 {
+                pid(42)
+            }
+            fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+                *self.0.conflicts.lock().unwrap() = 100;
+                Err(TraitError::new(ErrorCode::Internal, "fake wait failure"))
+            }
+            fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+                Ok(())
+            }
+        }
+        let p = FailRacy(&store);
+        let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
+        let MonitorOutcome::WaitFailedUnreleased {
+            wait_error,
+            release_error,
+        } = out
+        else {
+            panic!("unexpected outcome")
+        };
+        assert_eq!(wait_error.code(), ErrorCode::Internal);
+        assert_eq!(release_error.code(), ErrorCode::FailedPrecondition);
+    }
+
+    struct Rec(Mutex<Vec<(MonitorOperation, Option<ErrorCode>)>>);
+    impl MonitorObserver for Rec {
+        fn observe(&self, e: &MonitorEvent) {
+            self.0.lock().unwrap().push((e.operation, e.error_code));
+        }
+    }
+
+    /// REPAIR-4: 開始・wait・終了記録が通知され、開始失敗はエラーコード付きで通知される。
+    #[test]
+    fn sup1_task157_4_observer_reports_operations() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = FakeProc::exiting(2, ProcessExit::Exited(0));
+        let rec = Rec(Mutex::new(Vec::new()));
+        monitor_with_observer(
+            &mut s,
+            &p,
+            &MonitorConfig::default(),
+            &StopToken::new(),
+            &rec,
+        )
+        .unwrap();
+        assert_eq!(
+            *rec.0.lock().unwrap(),
+            vec![
+                (MonitorOperation::Start, None),
+                (MonitorOperation::Wait, None),
+                (MonitorOperation::Wait, None),
+                (MonitorOperation::RecordExit, None),
+            ]
+        );
+
+        let store = running_store(100);
+        let mut s = attach(&store);
+        let p = FakeProc::alive();
+        let rec = Rec(Mutex::new(Vec::new()));
+        monitor_with_observer(
+            &mut s,
+            &p,
+            &MonitorConfig::default(),
+            &StopToken::new(),
+            &rec,
+        )
+        .unwrap_err();
+        assert_eq!(
+            *rec.0.lock().unwrap(),
+            vec![(MonitorOperation::Start, Some(ErrorCode::FailedPrecondition))]
+        );
     }
 
     /// REPAIR-5: 競合 1 回は refresh 後に成功し、競合側の restart_count が保たれる。

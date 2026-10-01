@@ -1380,6 +1380,83 @@ mod tests {
         drop(writer);
     }
 
+    /// REPAIR-5・TASK-157.7: 終端待ちが期限切れになった監視の残存リーダーは、同じ予算を使う次の監視の捕捉開始でも
+    /// 数えられる。上限 1・残存 1 本なら次の捕捉開始は Unavailable で失敗し、監視権は解放され、ストリームは未読で残る。
+    #[test]
+    fn sup1_task157_7_stuck_reader_blocks_next_capture_with_shared_budget() {
+        let budget = ReaderBudget::new(1).unwrap();
+        let cfg = MonitorConfig::default()
+            .with_drain_timeout(Duration::from_millis(50))
+            .unwrap();
+        let sink = Arc::new(crate::logs::MemoryLogSink::default());
+
+        // 1 回目: 子は終了したがパイプが開いたまま（孫プロセスが保持する状況）で、終端待ちが期限切れになる。
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let (reader, writer) = std::io::pipe().unwrap();
+        let mut streams = OutputStreams::new(&budget, Some(Box::new(reader)), None);
+        let r = monitor_with_capture(
+            &mut s,
+            &FakeProc::exiting(1, ProcessExit::Exited(0)),
+            &mut streams,
+            sink.clone(),
+            &cfg,
+            &StopToken::new(),
+            &StderrLogObserver,
+        )
+        .unwrap();
+        assert_eq!(
+            r.capture_error().map(|e| e.code()),
+            Some(ErrorCode::Timeout)
+        );
+        assert_eq!(budget.live(), 1);
+
+        // 2 回目（再起動後を想定）: 新しい OutputStreams でも同じ予算で数えられ、開始が拒否される。
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let mut streams = OutputStreams::new(
+            &budget,
+            Some(Box::new(std::io::Cursor::new(b"x\n".to_vec()))),
+            None,
+        );
+        let rec = Rec(Mutex::new(Vec::new()));
+        let e = monitor_with_capture(
+            &mut s,
+            &FakeProc::alive(),
+            &mut streams,
+            sink.clone(),
+            &cfg,
+            &StopToken::new(),
+            &rec,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Unavailable);
+        assert_eq!(e.message(), "too many log reader threads are still alive");
+        assert_eq!(
+            *rec.0.lock().unwrap(),
+            vec![
+                (MonitorOperation::Start, None),
+                (MonitorOperation::CaptureStart, Some(ErrorCode::Unavailable)),
+                (MonitorOperation::ReleaseAfterWaitError, None),
+            ]
+        );
+        assert!(!streams.is_empty());
+        assert_eq!(
+            store.rec.lock().unwrap().supervision().supervisor_pid(),
+            None
+        );
+        assert_eq!(budget.live(), 1);
+        assert!(sink.snapshot().unwrap().is_empty());
+
+        // 残存リーダーが終了すれば枠が戻る。
+        drop(writer);
+        let start = Instant::now();
+        while budget.live() != 0 && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(budget.live(), 0);
+    }
+
     /// REPAIR-4・TASK-157.7: 捕捉操作が通知される。
     #[test]
     fn sup1_task157_7_observer_reports_capture_operations() {

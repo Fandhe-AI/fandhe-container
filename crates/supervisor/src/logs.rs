@@ -670,6 +670,20 @@ mod tests {
         budget.live()
     }
 
+    /// 開いたままのパイプを 1 本捕捉し、`drain` を期限切れ（50ms）にして残存リーダーを 1 本作る。
+    /// 戻り値の writer を保持している間、リーダーは `read` でブロックし続ける。
+    fn leave_stuck_reader(budget: &ReaderBudget, sink: Arc<MemoryLogSink>) -> std::io::PipeWriter {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let cap = LogCapture::start(
+            OutputStreams::new(budget, Some(Box::new(reader)), None),
+            sink,
+        )
+        .unwrap();
+        let err = cap.drain(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        writer
+    }
+
     fn line(stream: StreamKind, s: &[u8]) -> CapturedLine {
         CapturedLine {
             stream,
@@ -688,6 +702,184 @@ mod tests {
         let err = cap.drain(Duration::MAX).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(err.message(), "drain timeout is too large");
+    }
+
+    /// REPAIR-5・TASK-157.7: 溢れる timeout で返る前にも捕捉を取り消す。以後に届いた出力は sink へ追記されず、
+    /// リーダーは終了して枠を返す。
+    #[test]
+    fn sup1_task157_7_drain_overflowing_timeout_cancels_capture() {
+        let budget = ReaderBudget::new(1).unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let sink = Arc::new(MemoryLogSink::default());
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        assert_eq!(budget.live(), 1);
+        let err = cap.drain(Duration::MAX).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        writer.write_all(b"late1\nlate2\n").unwrap();
+        assert_eq!(wait_live(&budget, 0), 0);
+        assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
+        drop(writer);
+    }
+
+    /// REPAIR-5・TASK-157.7: 期限切れより前に届いた行は残り、期限切れ（Timeout）より後に届いた行は 1 行も追記されない。
+    #[test]
+    fn sup1_task157_7_no_append_after_drain_timeout() {
+        let budget = ReaderBudget::new(1).unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let sink = Arc::new(MemoryLogSink::default());
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        writer.write_all(b"before\n").unwrap();
+        let start = Instant::now();
+        while sink.snapshot().unwrap().is_empty() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let err = cap.drain(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(
+            err.message(),
+            "timed out waiting for log streams to reach EOF"
+        );
+        writer.write_all(b"after1\nafter2\n").unwrap();
+        assert_eq!(wait_live(&budget, 0), 0);
+        assert_eq!(
+            sink.snapshot().unwrap(),
+            vec![line(StreamKind::Stdout, b"before")]
+        );
+        drop(writer);
+    }
+
+    /// REPAIR-5・TASK-157.7: 取消しは実行中の追記の完了を待ち、取消しが返った後は追記が始まらない
+    /// （確認と追記の間に取消しが割り込まない）。
+    #[test]
+    fn sup1_task157_7_cancel_gate_excludes_append() {
+        let gate = CancelGate::default();
+        assert_eq!(gate.run_unless_cancelled(|| 7), Some(7));
+        assert!(!gate.is_cancelled());
+        gate.cancel();
+        assert!(gate.is_cancelled());
+        assert_eq!(gate.run_unless_cancelled(|| 7), None);
+    }
+
+    /// 追記に 300ms かかる sink。追記に入ったことを `entered` で知らせ、完了した行だけを `done` に残す。
+    struct SlowSink {
+        entered: AtomicBool,
+        done: Mutex<Vec<Vec<u8>>>,
+    }
+    impl LogSink for SlowSink {
+        fn append(&self, _: StreamKind, line: &[u8]) -> Result<(), TraitError> {
+            self.entered.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            self.done.lock().unwrap().push(line.to_vec());
+            Ok(())
+        }
+    }
+
+    /// REPAIR-5・TASK-157.7: 追記の実行中に drain が期限切れになった場合、drain は実行中の 1 行（"a"）の完了を待ってから
+    /// 返り、同じチャンクで読めていた次の行（"b"）は追記されない。返った時点の内容は以後も変わらない。
+    #[test]
+    fn sup1_task157_7_drain_error_waits_for_in_flight_append_and_stops_the_rest() {
+        let budget = ReaderBudget::new(1).unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let sink = Arc::new(SlowSink {
+            entered: AtomicBool::new(false),
+            done: Mutex::new(Vec::new()),
+        });
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        writer.write_all(b"a\nb\n").unwrap();
+        let start = Instant::now();
+        while !sink.entered.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let err = cap.drain(Duration::from_millis(1)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(*sink.done.lock().unwrap(), vec![b"a".to_vec()]);
+        // 同じチャンクの残りを処理せずに終了するため、パイプを閉じなくても枠が戻る。
+        assert_eq!(wait_live(&budget, 0), 0);
+        assert_eq!(*sink.done.lock().unwrap(), vec![b"a".to_vec()]);
+        drop(writer);
+    }
+
+    /// REPAIR-5・TASK-157.7: 予算の上限は 1 以上 MAX_LIVE_READERS（64）以下に限る（上限なしの予算を作れない）。
+    #[test]
+    fn sup1_task157_7_reader_budget_limit_is_validated() {
+        assert_eq!(MAX_LIVE_READERS, 64);
+        for bad in [0, MAX_LIVE_READERS + 1, usize::MAX] {
+            let err = ReaderBudget::new(bad).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), "live reader limit is out of range");
+        }
+        assert_eq!(ReaderBudget::new(1).unwrap().limit(), 1);
+        assert_eq!(ReaderBudget::new(MAX_LIVE_READERS).unwrap().limit(), 64);
+        assert_eq!(ReaderBudget::with_max_limit().limit(), 64);
+        assert_eq!(ReaderBudget::with_max_limit().live(), 0);
+    }
+
+    /// REPAIR-5・TASK-157.7: drain の期限切れで残ったリーダーは、同じ予算から作った別の OutputStreams の開始でも数えられる。
+    /// 上限 2・残存 2 本で 3 本目の開始は Unavailable（message 固定）で拒否され、ストリームは未読のまま残る。
+    /// 残存リーダーが終了して枠が戻れば、同じストリームで開始できる。
+    #[test]
+    fn sup1_task157_7_stuck_readers_count_against_later_captures() {
+        let budget = ReaderBudget::new(2).unwrap();
+        let sink = Arc::new(MemoryLogSink::default());
+        let w1 = leave_stuck_reader(&budget, sink.clone());
+        let w2 = leave_stuck_reader(&budget, sink.clone());
+        assert_eq!(budget.live(), 2);
+
+        let mut streams = OutputStreams::new(&budget, boxed(b"x\n"), None);
+        let err = LogCapture::start_from(&mut streams, sink.clone())
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        assert_eq!(err.message(), "too many log reader threads are still alive");
+        assert!(!streams.is_empty());
+        assert_eq!(budget.live(), 2);
+        assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
+
+        // 1 本ぶんの枠が戻れば開始でき、拒否されたストリームは 1 バイトも失われていない。
+        drop(w1);
+        assert_eq!(wait_live(&budget, 1), 1);
+        let cap = LogCapture::start_from(&mut streams, sink.clone()).unwrap();
+        let sum = cap.drain(Duration::from_secs(10)).unwrap();
+        assert_eq!(sum.stdout().unwrap().lines(), 1);
+        assert_eq!(sum.stdout().unwrap().bytes(), 2);
+        assert_eq!(
+            sink.snapshot().unwrap(),
+            vec![line(StreamKind::Stdout, b"x")]
+        );
+        drop(w2);
+        assert_eq!(wait_live(&budget, 0), 0);
+    }
+
+    /// REPAIR-5・TASK-157.7: 予算の複製は同じカウンタを共有し、別に作った予算は共有しない。
+    #[test]
+    fn sup1_task157_7_cloned_budget_shares_counter() {
+        let budget = ReaderBudget::new(1).unwrap();
+        let cloned = budget.clone();
+        let sink = Arc::new(MemoryLogSink::default());
+        let w = leave_stuck_reader(&budget, sink.clone());
+        assert_eq!(cloned.live(), 1);
+        let mut streams = OutputStreams::new(&cloned, boxed(b"x\n"), None);
+        assert_eq!(
+            LogCapture::start_from(&mut streams, sink)
+                .err()
+                .map(|e| e.code()),
+            Some(ErrorCode::Unavailable)
+        );
+        drop(w);
+        assert_eq!(wait_live(&budget, 0), 0);
+        assert_eq!(cloned.live(), 0);
     }
 
     /// TASK-157.7: 直接 append された巨大行も MAX_LINE_BYTES へ切り詰める。

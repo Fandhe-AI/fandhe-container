@@ -8,7 +8,9 @@
 //!
 //! # 呼び出し元・契約
 //!
-//! - TASK-41.2（#193 seccomp フック）・41.3（#194 Landlock フック）・41.4（#195 マウント検証/API。
+//! - TASK-41.3（#194）の Landlock フックは [`landlock_denial_record`] で実装済み（プロセス内で観測した
+//!   `EACCES` の写像まで。ワークロードの拒否の捕捉は #840）
+//! - TASK-41.2（#193 seccomp フック）・41.4（#195 マウント検証/API。
 //!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
 //! - 永続化・エンコード（JSON Lines 等）は TASK-41.5 系（#839）、カーネル監査連携・クラッシュ時の記録保持は
 //!   #840 の担当で、本モジュールは**未実装**（REPAIR-3: 実装済みを装わない）。`serde` の derive も未提供
@@ -22,6 +24,10 @@
 //! syscall 番号はアーキテクチャ相対（x86_64 / aarch64 で異なる）。アーキ識別子（`AUDIT_ARCH_*`）や
 //! コンテナ ID を持たせるかは #193 以降で決める。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
+
+mod landlock;
+
+pub use landlock::{LANDLOCK_DENIED_ERRNO, landlock_denial_record, landlock_denial_record_now};
 
 use std::fmt;
 use std::num::NonZeroU32;

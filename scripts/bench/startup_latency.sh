@@ -19,6 +19,8 @@
 #   - fandhe-container の CLI が下記契約と異なる形になった場合は、ランタイム呼び出し部
 #     （rt_create / rt_start / rt_delete / rt_kill / rt_state / rt_is_not_found の 6 関数）
 #     だけを差し替える。
+#   - Linux 専用（単調時計として /proc/uptime を使う。CORE-10 の比較対象も Linux）。各区間の
+#     値は壁時計（EPOCHREALTIME）で測り、単調時計と照合して時計の変更を検出した回は失敗にする。
 #   - create が成功しなかった場合の未作成判定は、ERR-1 の構造化エラー（code: NOT_FOUND）を
 #     明確な不存在応答として使う（rt_is_not_found）。構造化エラーを出さないランタイム（runc 等）
 #     では create 失敗時に未作成を確定できず、その ID に操作を送らずに exit 4 で報告する。
@@ -49,9 +51,9 @@
 # 終了コード（呼び出し元はこの具体値で分岐する）:
 #   0: 成功
 #   1: ランタイムの create / start / state の失敗・タイムアウト、実行開始を観測できない、
-#      ID が既に使用中
+#      ID が既に使用中、計測中の時計の変更を検出した
 #   2: 入力エラー（引数・bundle・output の検証失敗）
-#   3: 前提ツール欠如（bash 5 以上・jq・GNU timeout・GNU dd〔oflag=nofollow,nonblock〕・GNU ln〔-T〕・mktemp・sleep 等）
+#   3: 前提ツール欠如（Linux の /proc/uptime・bash 5 以上・jq・GNU timeout・GNU dd〔oflag=nofollow,nonblock〕・GNU ln〔-T〕・mktemp・sleep 等）
 #   4: 後始末失敗（作成済みコンテナを delete できない、create 失敗後に未作成を確定できない等。
 #      残存の可能性がある ID を stderr に出す。最優先）
 #
@@ -92,6 +94,10 @@ readonly DELETE_RETRY_INTERVAL_US=100000
 # 期限付きの呼び出し（実行開始の観測・後始末）で残り時間がこれ（マイクロ秒）を
 # 下回ったらランタイムを呼ばずに打ち切る。
 readonly MIN_CALL_BUDGET_US=100000
+# 計測区間の壁時計と単調時計（/proc/uptime。分解能 10ms）の許容差（マイクロ秒）。
+# 単調時計の読み取り 2 回分の丸め（各 10ms）に余裕を持たせた値。これを超える時計の
+# 変更を検出して、その回を失敗にする。
+readonly CLOCK_TOLERANCE_US=30000
 # --output の祖先ディレクトリ検査でたどる段数の上限。
 readonly PATH_DEPTH_MAX=256
 
@@ -111,6 +117,25 @@ USAGE
 
 err() {
   echo "error: $1: $2" >&2
+}
+
+# 壁時計の現在時刻（マイクロ秒）。計測区間の値（create_us 等）にだけ使う。EPOCHREALTIME は
+# LC_ALL=C で小数点が "." に固定される。bash には高分解能の単調時計がなく、外部コマンドで
+# 単調時計を読むと起動の遅延が各区間に上乗せされるため、分解能は壁時計で得て、時計の変更
+# （時刻同期のステップ・手動変更）は mono_us との照合で検出する（measure_once）。
+wall_us() {
+  echo "${EPOCHREALTIME/./}"
+}
+
+# 単調時計の現在時刻（マイクロ秒。分解能 10ms）。Linux の /proc/uptime（CLOCK_BOOTTIME。
+# 時計の変更の影響を受けない）を読む。期限（観測・後始末）の判定と、計測値の照合に使う。
+# 自己テストだけが STARTUP_LATENCY_TEST_UPTIME_FILE で読み元を差し替える（時計の変更の再現用）。
+mono_us() {
+  local up rest
+  read -r up rest <"${STARTUP_LATENCY_TEST_UPTIME_FILE:-/proc/uptime}" || return 1
+  [[ "$up" =~ ^[0-9]+\.[0-9]{2}$ ]] || return 1
+  up="${up/./}"
+  echo $((10#$up * 10000))
 }
 
 runtime=""
@@ -259,6 +284,11 @@ for tool in jq timeout mktemp tail rm sleep dd ln chmod find id; do
     exit "$EXIT_PREREQ"
   fi
 done
+# 単調時計（mono_us）の読み元。Linux の /proc/uptime が必要。
+if ! mono_us >/dev/null; then
+  err "missing-prerequisite" "a readable /proc/uptime (Linux) is required as the monotonic clock"
+  exit "$EXIT_PREREQ"
+fi
 # 出力先の祖先ディレクトリの検証は find・id を使うため前提ツールの確認後に行う。
 if [ -n "$output" ] && ! output_path_is_safe "$output_dir"; then
   err "invalid-output" "the path of --output must not contain symlinks, and every directory above it must be owned by you or root and not writable by others (unless sticky)"
@@ -307,7 +337,7 @@ run_rt() {
   local status=0 limit="$timeout_secs" grace="$KILL_AFTER_SECS"
   if [ -n "$rt_deadline_us" ]; then
     local rem g
-    rem=$((rt_deadline_us - $(now_us)))
+    rem=$((rt_deadline_us - $(mono_us)))
     if [ "$rem" -lt "$MIN_CALL_BUDGET_US" ]; then
       return 124
     fi
@@ -367,11 +397,6 @@ show_log() {
   tail -n "$LOG_TAIL_LINES" -- "$1" >&2 || true
 }
 
-# 現在時刻（マイクロ秒）。EPOCHREALTIME は LC_ALL=C で小数点が "." に固定される。
-now_us() {
-  echo "${EPOCHREALTIME/./}"
-}
-
 # state を 1 回呼び、state_rc・state_status を設定する。state_status は stdout が単一の
 # OCI state JSON で id が一致するときだけその status、それ以外は空文字。
 query_state() {
@@ -422,7 +447,7 @@ create_not_made() {
 #              特権操作の後始末）。
 finish_container() {
   local status=0
-  rt_deadline_us=$(($(now_us) + timeout_secs * 1000000))
+  rt_deadline_us=$(($(mono_us) + timeout_secs * 1000000))
   finish_container_within_deadline "$@" || status=$?
   rt_deadline_us=""
   return "$status"
@@ -446,13 +471,13 @@ finish_container_within_deadline() {
   fi
   rt_kill "$log" "$id" || true
   local tries=0
-  while [ "$tries" -lt "$DELETE_RETRY_MAX" ] && [ $((rt_deadline_us - $(now_us))) -ge "$MIN_CALL_BUDGET_US" ]; do
+  while [ "$tries" -lt "$DELETE_RETRY_MAX" ] && [ $((rt_deadline_us - $(mono_us))) -ge "$MIN_CALL_BUDGET_US" ]; do
     tries=$((tries + 1))
     if rt_delete "$log" "$id"; then
       return 0
     fi
     # 待機後に呼び出せる残り時間がなければ期限を越えて待たずに打ち切る。
-    if [ $((rt_deadline_us - $(now_us))) -lt $((DELETE_RETRY_INTERVAL_US + MIN_CALL_BUDGET_US)) ]; then
+    if [ $((rt_deadline_us - $(mono_us))) -lt $((DELETE_RETRY_INTERVAL_US + MIN_CALL_BUDGET_US)) ]; then
       break
     fi
     sleep "$DELETE_RETRY_INTERVAL"
@@ -499,7 +524,7 @@ trap 'exit 143' TERM
 #       観測する。t2 は state 呼び出しの復帰後に取るため、実行開始時刻の上側推定になる
 #       （state 1 回分の所要時間を含み、Docker 比では own に不利な側へ偏る）。
 measure_once() {
-  local id="$1" t0 t1 ts t2 deadline
+  local id="$1" t0 t1 ts t2 m0 m2 deadline wall_total mono_total diff
   # create 前に state を照会する（計測区間外）。存在を示せば create せずに中止する
   # （既存コンテナとの衝突を分かりやすく報告するため。安全性は finish_container が
   # create 未成功の ID に破壊的操作を送らないことで担保する）。
@@ -508,7 +533,8 @@ measure_once() {
     err "container-id-in-use" "container $id already exists; refusing to touch it"
     return 1
   fi
-  t0="$(now_us)"
+  m0="$(mono_us)"
+  t0="$(wall_us)"
   # create が途中まで進んでから失敗・タイムアウトしても特権リソースが残り得るため、
   # 作成を試みた時点で後始末対象として保持する。create 成功後の失敗は delete（kill →
   # 待機付き delete）で片付け、create 未成功時は未作成を確定できなければ残存として報告する。
@@ -523,26 +549,28 @@ measure_once() {
     return 1
   fi
   live_created=1
-  t1="$(now_us)"
+  t1="$(wall_us)"
   if ! rt_start "$tmpdir/start.log" "$id"; then
     err "runtime-start-failed" "start failed or timed out for $id"
     show_log "$tmpdir/start.log"
     return 1
   fi
-  ts="$(now_us)"
+  ts="$(wall_us)"
   state_polls=0
-  deadline=$((ts + timeout_secs * 1000000))
+  # 観測期限は単調時計で決める（時計の変更で期限が延び縮みしないように）。
+  deadline=$(($(mono_us) + timeout_secs * 1000000))
   while :; do
     state_polls=$((state_polls + 1))
     # 各照会には観測期限までの残り時間だけを渡す。残りがなければ呼ばずに 124 になる。
     rt_deadline_us="$deadline"
     query_state "$id"
     rt_deadline_us=""
-    t2="$(now_us)"
+    t2="$(wall_us)"
+    m2="$(mono_us)"
     # 期限は照会完了時刻で判定する。running / stopped を観測した照会でも、完了が期限を
     # 過ぎていれば --timeout 内に観測できなかった計測として失敗にする（成功結果に混ぜない）。
     # 照会が時間切れ（124）になった場合も同じ扱いにする。
-    if [ "$t2" -gt "$deadline" ] || [ "$state_rc" -eq 124 ]; then
+    if [ "$m2" -gt "$deadline" ] || [ "$state_rc" -eq 124 ]; then
       err "runtime-exec-not-observed" "container $id did not reach running/stopped within ${timeout_secs}s"
       return 1
     fi
@@ -558,10 +586,21 @@ measure_once() {
     # created のままなら間隔を空けて再照会する。待機後に照会 1 回分の残り時間
     # （MIN_CALL_BUDGET_US）が残らない場合は待たずに次の照会へ進み、最後の照会の時間を
     # 待機で失わないようにする（後始末の delete 再試行と同じ判定）。
-    if [ $((deadline - $(now_us))) -ge $((STATE_POLL_INTERVAL_US + MIN_CALL_BUDGET_US)) ]; then
+    if [ $((deadline - $(mono_us))) -ge $((STATE_POLL_INTERVAL_US + MIN_CALL_BUDGET_US)) ]; then
       sleep "$STATE_POLL_INTERVAL"
     fi
   done
+  # 壁時計の区間を単調時計と照合する。順序が逆転している、または全体の経過が単調時計と
+  # CLOCK_TOLERANCE_US を超えて食い違う場合は、計測中に時計が変更されたとみなし、この回の
+  # 値を結果に使わずに失敗にする（中央値・ベンチ比較を壊さない）。
+  wall_total=$((t2 - t0))
+  mono_total=$((m2 - m0))
+  diff=$((wall_total - mono_total))
+  [ "$diff" -lt 0 ] && diff=$((-diff))
+  if [ "$t1" -lt "$t0" ] || [ "$ts" -lt "$t1" ] || [ "$t2" -lt "$ts" ] || [ "$diff" -gt "$CLOCK_TOLERANCE_US" ]; then
+    err "clock-changed" "wall clock changed during the measurement of $id (wall ${wall_total}us vs monotonic ${mono_total}us); result discarded"
+    return 1
+  fi
   create_us=$((t1 - t0))
   start_us=$((ts - t1))
   observe_us=$((t2 - ts))

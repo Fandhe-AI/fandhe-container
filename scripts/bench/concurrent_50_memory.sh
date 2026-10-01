@@ -34,7 +34,8 @@
 #     変えないため）。ログの上限は収集側（本スクリプト）で設ける: launcher の標準出力・標準エラーは
 #     コンテナごとの FIFO へ流し、本スクリプトの直接の子である収集プロセスが先頭 LOG_MAX_KIB KiB だけを
 #     ログファイルへ書き、それ以降は読み捨てる（launcher は書き込みを拒否されず、SIGPIPE・SIGXFSZ も
-#     受けない）。ディスク消費は「起動数 × LOG_MAX_KIB KiB」を超えない（REPAIR-5）。READY 行は先頭
+#     受けない）。試行ごとのログは次の試行の前に削除するので、ディスク消費は試行回数によらず
+#     「起動数 × LOG_MAX_KIB KiB」を超えない（REPAIR-5）。READY 行は先頭
 #     LOG_MAX_KIB KiB 以内に出すこと（それより後の READY は記録されず、起動未完了として失敗になる）。
 #     収集プロセスは launcher の子孫ではないので PSS・RSS の集計には入らない（参考値の
 #     mem_available_delta_kb には、コンテナごとに 2 プロセス程度の分が含まれる）。
@@ -1035,6 +1036,13 @@ while [ "$t" -le "$trials" ]; do
 
   # 次の試行へ進む前に必ず後始末する（残存は 4 を最優先で返す）。
   ln_stop || exit 4
+  # 成功した試行のログと FIFO は次の試行へ進む前に削除する（失敗時の診断にしか使わない。残すとディスク
+  # 消費が「起動数 × 試行回数 × LOG_MAX_KIB KiB」まで増える）。失敗した試行はここへ来ずに終了し、
+  # 診断の出力後に EXIT trap が一時ディレクトリごと削除する。
+  if ! rm -f -- "$tmpdir/${id_prefix}-${t}-"*.log "$tmpdir/${id_prefix}-${t}-"*.fifo; then
+    err "measurement-failed" "trial=${t} reason=cannot-remove-trial-logs"
+    exit 1
+  fi
   t=$((t + 1))
 done
 

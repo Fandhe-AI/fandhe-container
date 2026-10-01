@@ -346,6 +346,7 @@ out_file="$work/result.json"
 reset_log
 expect_rc "output-write" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 2 --warmup 0 --output "$out_file"
 expect_eq "output-file-equals-stdout" "$last_stdout" "$(cat "$out_file")"
+expect_eq "output-write-no-staging" "" "$(find "$work" -maxdepth 1 -name '.startup_latency.*' -print)"
 expect_rc "output-existing-file" 2 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --output "$out_file"
 ln -s "$work/nonexistent-target" "$work/link.json"
 expect_rc "output-existing-symlink" 2 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --output "$work/link.json"
@@ -357,6 +358,7 @@ reset_log
 STUB_CREATE_HOOK="$race_out" expect_rc "output-create-race" 2 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --output "$race_out"
 expect_eq "output-create-race-stdout-empty" "" "$last_stdout"
 expect_eq "output-create-race-file-untouched" "preexisting" "$(cat "$race_out")"
+expect_eq "output-create-race-no-staging" "" "$(find "$work" -maxdepth 1 -name '.startup_latency.*' -print)"
 # 検証後に出力先が FIFO へ差し替えられた場合（Codex P0）: 開かずに exit 2 で終わり、
 # 無期限に待機しない。回帰時に自己テスト自体が止まらないよう外側にも timeout を掛ける。
 race_fifo="$work/race.fifo"
@@ -370,6 +372,25 @@ expect_eq "output-fifo-race-exit" "2" "$rc"
 if [ "$elapsed" -lt 30 ]; then pass "output-fifo-race-bounded (${elapsed}s < 30s)"; else fail "output-fifo-race-bounded (${elapsed}s)"; fi
 expect_eq "output-fifo-race-stdout-empty" "" "$(cat "$work/fifo.stdout")"
 if [ -p "$race_fifo" ]; then pass "output-fifo-race-still-fifo"; else fail "output-fifo-race-still-fifo"; fi
+expect_eq "output-fifo-race-no-staging" "" "$(find "$work" -maxdepth 1 -name '.startup_latency.*' -print)"
+# 書き込みが途中で失敗した場合（Codex P2）: 不完全な内容を出力先に残さず exit 2、一時ファイルも
+# 残さない。途中まで書いて失敗する dd を PATH の先頭に置いて再現する。
+mkdir -p "$work/faildd" "$work/partial"
+cat >"$work/faildd/dd" <<'FAILDD'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in of=*) printf '{"partial' >"${a#of=}" ;; esac
+done
+exit 1
+FAILDD
+chmod 755 "$work/faildd/dd"
+reset_log
+rc=0
+PATH="$work/faildd:$PATH" "$bash_bin" "$target_script" --runtime "$stub" --bundle "$work/bundle" \
+  --iterations 1 --warmup 0 --output "$work/partial/out.json" >"$work/partial.stdout" 2>/dev/null || rc=$?
+expect_eq "output-partial-write-exit" "2" "$rc"
+expect_eq "output-partial-write-no-file" "" "$(find "$work/partial" -mindepth 1 -print)"
+expect_eq "output-partial-write-stdout-empty" "" "$(cat "$work/partial.stdout")"
 
 # --- 5. 入力エラー（exit 2） ---
 expect_rc "input-runtime-missing" 2 --bundle "$work/bundle"
@@ -549,7 +570,10 @@ reset_log
 STUB_MODE=exec-after-1s expect_rc "exec-after-1s" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 3
 polls="$(jq -r '.samples_us[0].state_polls' <<<"$last_stdout")"
 if [ "$polls" -ge 2 ] && [ "$polls" -le 110 ]; then pass "exec-after-1s-poll-count ($polls in 2..110)"; else fail "exec-after-1s-poll-count ($polls)"; fi
-expect_eq "exec-after-1s-observe" "true" "$(jq -r '.samples_us[0].observe_us >= 1000000' <<<"$last_stdout")"
+# スタブは start の終了直前に時刻を記録し、その 1 秒後から running を返す。この時刻は
+# create 復帰（t1）より後なので、t1 からの経過（start_us + observe_us）は必ず 1 秒以上になる
+# （observe_us だけだと start 復帰〔ts〕との時刻差で 1 秒をわずかに下回り得る）。
+expect_eq "exec-after-1s-observe" "true" "$(jq -r '.samples_us[0] | .start_us + .observe_us >= 1000000' <<<"$last_stdout")"
 # 2 回目の照会がハングしても、観測期限（--timeout 3 秒）までの残り時間しか待たない（Codex P1。
 # REPAIR-5）。照会ごとに --timeout 秒を渡す実装では 1.5 + 3 秒を超える。
 reset_log

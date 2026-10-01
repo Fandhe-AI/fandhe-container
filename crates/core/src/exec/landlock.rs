@@ -94,7 +94,15 @@ pub struct LandlockAccessProbe {
     pub kind: LandlockAccessKind,
     /// 操作対象のパス（呼び出し側が canonicalize 済みで用意する）。
     pub path: PathBuf,
+    /// `ReadFile` で読めるはずの内容。`None` なら内容は検査しない（他の種別では無視）。
+    /// 不一致は [`LANDLOCK_PROBE_CONTENT_MISMATCH`] で報告する。
+    pub expected_content: Option<Vec<u8>>,
 }
+
+/// `ReadFile` の内容が `expected_content` と一致しなかったことを示す結果値。
+/// errno（正の値）・errno 不明の I/O 失敗（`-1`）のいずれとも衝突しない。
+#[doc(hidden)]
+pub const LANDLOCK_PROBE_CONTENT_MISMATCH: i32 = -2;
 
 /// [`observe_landlock_path_access`] の観測結果。
 #[doc(hidden)]
@@ -171,16 +179,17 @@ pub fn observe_landlock_path_access(
 }
 
 /// プローブ 1 件を実行し、成功は `None`・失敗は `Some(errno)` で返す。
+/// errno が無い I/O 失敗は `-1`、内容不一致は [`LANDLOCK_PROBE_CONTENT_MISMATCH`]。
 fn run_probe(p: &LandlockAccessProbe) -> Option<i32> {
     use std::fs::OpenOptions;
     let res: std::io::Result<()> = match p.kind {
-        LandlockAccessKind::ReadFile => std::fs::read(&p.path).and_then(|b| {
-            if b == b"probe" {
-                Ok(())
-            } else {
-                Err(std::io::Error::other("unexpected probe content"))
-            }
-        }),
+        LandlockAccessKind::ReadFile => match std::fs::read(&p.path) {
+            Ok(b) => match &p.expected_content {
+                Some(want) if *want != b => return Some(LANDLOCK_PROBE_CONTENT_MISMATCH),
+                _ => Ok(()),
+            },
+            Err(e) => Err(e),
+        },
         LandlockAccessKind::ReadDir => std::fs::read_dir(&p.path).map(|_| ()),
         LandlockAccessKind::WriteExisting => {
             OpenOptions::new().write(true).open(&p.path).map(|_| ())
@@ -272,6 +281,7 @@ mod tests {
             LandlockAccessProbe {
                 kind: LandlockAccessKind::ReadDir,
                 path: PathBuf::from("/"),
+                expected_content: None,
             };
             MAX_ACCESS_PROBES + 1
         ];

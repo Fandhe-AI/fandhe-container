@@ -105,8 +105,8 @@ pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_defa
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use landlock::{
-    LandlockAccessKind, LandlockAccessObservation, LandlockAccessProbe,
-    observe_landlock_path_access,
+    LANDLOCK_PROBE_CONTENT_MISMATCH, LandlockAccessKind, LandlockAccessObservation,
+    LandlockAccessProbe, observe_landlock_path_access,
 };
 /// 結合試験 `tests/seccomp.rs` 専用の再公開（CORE-5・TASK-38.4・#179。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]

@@ -58,7 +58,12 @@ fn main() {
     const EACCES: i32 = 13;
 
     fn probe(kind: K, path: PathBuf) -> LandlockAccessProbe {
-        LandlockAccessProbe { kind, path }
+        let expected_content = (kind == K::ReadFile).then(|| b"probe".to_vec());
+        LandlockAccessProbe {
+            kind,
+            path,
+            expected_content,
+        }
     }
 
     fn config_for(dir: &Path, extra_mount: Option<&str>) -> OciConfig {
@@ -103,13 +108,13 @@ fn main() {
                     probe(K::WriteExisting, denied.join("existing")),
                     probe(K::TruncateOpen, denied.join("existing")),
                     probe(K::RemoveFile, denied.join("existing")),
-                    probe(K::ReadFile, denied.join("existing")),
+                    probe(K::ReadFile, denied.join("readable")),
                     probe(K::ReadDir, denied.clone()),
                     probe(K::CreateFile, allowed.join("new")),
                     probe(K::MakeDir, allowed.join("newdir")),
                     probe(K::WriteExisting, allowed.join("existing")),
                     probe(K::TruncateOpen, allowed.join("existing")),
-                    probe(K::ReadFile, allowed.join("new")),
+                    probe(K::ReadFile, allowed.join("readable")),
                     probe(K::RemoveFile, allowed.join("new")),
                 ];
                 let o =
@@ -123,8 +128,7 @@ fn main() {
                 assert!(o.applied);
                 let got: Vec<Option<i32>> = o.results.iter().map(|(_, r)| *r).collect();
                 // 許可外（denied/）: 書き込み系は EACCES、読み取りは root の READ で成功。
-                // allowed/: すべて成功。ただし TruncateOpen の後に ReadFile(allowed/new) を
-                // 試すため、直前に作成した空ファイルは内容不一致となり -1 になる。
+                // allowed/: すべて成功。ReadFile は内容が確定した専用ファイル（readable）を読む。
                 let expected = vec![
                     Some(EACCES),
                     Some(EACCES),
@@ -137,7 +141,7 @@ fn main() {
                     None,
                     None,
                     None,
-                    Some(-1),
+                    None,
                     None,
                 ];
                 assert_eq!(got, expected, "results: {:?}", o.results);
@@ -202,9 +206,13 @@ fn main() {
             std::process::id(),
             mode.trim_start_matches('-')
         ));
+        // 共有 /tmp の事前作成（symlink 等）を避けるため、既存なら失敗させる。
+        std::fs::create_dir(&dir).expect("create probe dir (must not pre-exist)");
         for sub in ["allowed", "denied"] {
-            std::fs::create_dir_all(dir.join(sub)).expect("create probe dir");
-            std::fs::write(dir.join(sub).join("existing"), b"probe").expect("create existing");
+            std::fs::create_dir(dir.join(sub)).expect("create probe subdir");
+            for f in ["existing", "readable"] {
+                std::fs::write(dir.join(sub).join(f), b"probe").expect("create fixture");
+            }
         }
         let mut child = Command::new(&exe)
             .arg(mode)

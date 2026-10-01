@@ -64,7 +64,14 @@ cleanup: remove container cgroup failed after panic: PERMISSION_DENIED at Cleanu
 root 権限を要するため、Agent は実行していない。
 
 1. 手順 (i): `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` の後、非 root で上記の実行手順を実行する。終了後に sysctl を元の値へ戻す
-2. 手順 (ii): root で同じコマンドを実行する
+2. 手順 (ii): root で実行する。root には user マネージャー（`systemctl --user`）が無い環境があり、`systemd-run --user` は使えないため、system マネージャー側の scope で cgroup を委譲する（未実行・未検証。実行結果は人間が追記する）
+
+   ```text
+   sudo systemd-run --scope -p Delegate=yes <上で得た実行ファイル> --ignored
+   ```
+
+   - 前提: systemd が PID 1 で cgroup v2 の unified 階層が有効であること（`stat -fc %T /sys/fs/cgroup` が `cgroup2fs`）。`--scope` により transient scope（`run-*.scope`）が system.slice 配下に作られ、`Delegate=yes` でそのサブツリーが委譲される
+   - systemd が無い環境（コンテナ内・WSL2 の一部等）では、root が `/sys/fs/cgroup` 配下に専用サブツリーを作り、親の `cgroup.subtree_control` に `+memory` を書いて委譲してから、その cgroup へ自プロセスを移して実行する（コマンド例は人間が環境に合わせて決める）
 
 合格の判定は次の 3 点。結果は本書と #165 に追記する。
 

@@ -59,6 +59,14 @@ name = "cgroups"
 path = "tests/cgroups.rs"
 harness = false
 
+# cgroups v2 実効性の回帰テスト（CORE-3・TASK-36.1・#169）。fork は単一スレッドで行い、user namespace の
+# 作成と委譲 cgroup が必要な実機前提テストのため harness = false。`-- --ignored` 指定時のみ実行する
+# （AGENTS.md）。
+[[test]]
+name = "cgroups_regression"
+path = "tests/cgroups_regression.rs"
+harness = false
+
 # OOM Kill 確認の結合試験（CORE-3・TASK-33.1・#164）。上と同じ理由で harness = false。委譲 cgroup v2 が
 # 必要な実機前提テストのため `-- --ignored` 指定時のみ実行する（AGENTS.md）。
 [[test]]

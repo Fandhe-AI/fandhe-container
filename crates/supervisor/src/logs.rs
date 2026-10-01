@@ -244,34 +244,70 @@ impl LogCapture {
     ///
     /// 全スレッドの起動に成功してから一斉に読み取りを開始させる（起動ゲート）。途中のスレッド起動失敗は `Internal` で、
     /// 既に起動したスレッドはゲートの解放前に終了し、一行も読まず sink へも書かない（部分起動のまま走り続けない）。
-    /// この失敗経路では注入されたストリームは全て破棄される（再注入は不可。module doc 参照）。
-    pub fn start(streams: OutputStreams, sink: Arc<dyn LogSink>) -> Result<Self, TraitError> {
+    /// この失敗経路ではストリームは破棄される。破棄させたくない場合は [`LogCapture::start_from`] を使う。
+    pub fn start(mut streams: OutputStreams, sink: Arc<dyn LogSink>) -> Result<Self, TraitError> {
+        Self::start_from(&mut streams, sink)
+    }
+
+    /// [`LogCapture::start`] の可変参照版。スレッド起動に失敗した場合、ストリームは `streams` へ戻され
+    /// 一行も読まれていないため、呼び出し側が捕捉を再試行できる（成功時は中身が取り出されて空になる）。
+    /// [`crate::run::monitor_with_capture`] が開始失敗後の再試行を可能にするために使う。
+    pub fn start_from(
+        streams: &mut OutputStreams,
+        sink: Arc<dyn LogSink>,
+    ) -> Result<Self, TraitError> {
+        type Slot = Arc<Mutex<Option<Box<dyn Read + Send>>>>;
         let (tx, rx) = mpsc::channel();
         let mut gates: Vec<mpsc::Sender<()>> = Vec::new();
+        let mut slots: Vec<(StreamKind, Slot)> = Vec::new();
         for (kind, stream) in [
-            (StreamKind::Stdout, streams.stdout),
-            (StreamKind::Stderr, streams.stderr),
+            (StreamKind::Stdout, streams.stdout.take()),
+            (StreamKind::Stderr, streams.stderr.take()),
         ] {
-            let Some(stream) = stream else { continue };
+            if let Some(stream) = stream {
+                slots.push((kind, Arc::new(Mutex::new(Some(stream)))));
+            }
+        }
+        let mut failed = false;
+        for (kind, slot) in &slots {
+            let kind = *kind;
+            let slot = Arc::clone(slot);
             let tx = tx.clone();
             let sink = Arc::clone(&sink);
             let (gate_tx, gate_rx) = mpsc::channel::<()>();
-            // 失敗時は gates（と未起動分の stream）が drop され、起動済みスレッドの recv が Err になって終了する。
-            std::thread::Builder::new()
+            // 失敗時は gates が drop され、起動済みスレッドの recv が Err になって終了する（stream は slot に残る）。
+            let spawned = std::thread::Builder::new()
                 .name(format!("supervisor-log-{}", kind.as_str()))
                 .spawn(move || {
-                    // ゲートが解放されずに閉じた（部分起動の中止）なら、何も読まず stream を破棄して終わる。
+                    // ゲートが解放されずに閉じた（部分起動の中止）なら、stream に触れず終わる。
                     if gate_rx.recv().is_err() {
                         return;
                     }
+                    let stream = slot.lock().ok().and_then(|mut g| g.take());
+                    let Some(stream) = stream else { return };
                     let summary = pump(stream, kind, sink.as_ref());
                     // 受信側が drain を諦めて破棄済みなら送信失敗は無視してよい。
                     let _ = tx.send((kind, summary));
-                })
-                .map_err(|_| {
-                    TraitError::new(ErrorCode::Internal, "failed to spawn log reader thread")
-                })?;
+                });
+            if spawned.is_err() {
+                failed = true;
+                break;
+            }
             gates.push(gate_tx);
+        }
+        if failed {
+            drop(gates);
+            for (kind, slot) in slots {
+                let stream = slot.lock().ok().and_then(|mut g| g.take());
+                match kind {
+                    StreamKind::Stdout => streams.stdout = stream,
+                    StreamKind::Stderr => streams.stderr = stream,
+                }
+            }
+            return Err(TraitError::new(
+                ErrorCode::Internal,
+                "failed to spawn log reader thread",
+            ));
         }
         let expected = gates.len();
         for gate in gates {

@@ -468,7 +468,7 @@ impl MonitoredWithCapture {
 ///
 /// 事前条件（`Running` かつ pid 一致）を満たさない、または他の supervisor が既に監視権を持つ場合は、スレッドを起こさず
 /// （ストリームを読まず）`FailedPrecondition`。この場合 `streams` は呼び出し側に残る（取り出すのは監視権の取得後のみ）。
-/// 捕捉開始の失敗で監視権の解放にも失敗したら [`MonitorOutcome::StartFailedUnreleased`] を返す。捕捉は監視権の取得後に開始し、開始に失敗したら監視権を解放して `Err`。プロセスの終了（`Exited` / `ExitedUnrecorded`）を検知したときだけ、`drain_timeout` を上限に
+/// 捕捉開始の失敗で監視権の解放にも失敗したら [`MonitorOutcome::StartFailedUnreleased`] を返す。捕捉は監視権の取得後に開始し、開始に失敗したら監視権を解放して `Err`（`streams` は未読のまま呼び出し側へ戻り、再試行できる）。プロセスの終了（`Exited` / `ExitedUnrecorded`）を検知したときだけ、`drain_timeout` を上限に
 /// 全ストリームの EOF を待って集計を返す。`StopRequested` などプロセスが生存し得る結果では待たない
 /// （EOF が来ないため）。その場合リーダーは EOF まで走り sink への追記を続け、ストリームの所有権は捕捉側へ移っているため
 /// 監視の引き継ぎ時に再注入できない（#239・TASK-164 で扱う）。永続化・ローテーションは未実装（SUP-7・TASK-164）。
@@ -490,9 +490,9 @@ pub fn monitor_with_capture(
     // `streams` は可変参照で受け、監視権の取得に成功した場合のみ中身を取り出す。取得失敗時は呼び出し側の手元に残る。
     let mut capture: Option<LogCapture> = None;
     let outcome = monitor_after_claim(state, process, config, stop, obs, &mut || {
-        let streams = std::mem::take(streams);
         capture = Some(observed(obs, MonitorOperation::CaptureStart, || {
-            LogCapture::start(streams, Arc::clone(&sink))
+            // 開始失敗時は streams が呼び出し側へ戻るため、捕捉を再試行できる。
+            LogCapture::start_from(streams, Arc::clone(&sink))
         })?);
         Ok(())
     })?;

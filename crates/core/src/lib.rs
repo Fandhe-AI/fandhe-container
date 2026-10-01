@@ -27,7 +27,7 @@
 //! - `audit_log`: 分離違反の監査レコード型 `AuditRecord` 等（SEC-4・TASK-41.1・#192。OS 非依存で
 //!   型定義・マウント検証/API の記録ヘルパ〔TASK-41.4〕・seccomp フック〔TASK-41.2・#193。拒否報告→レコード→`AuditSink`〕・ローカルファイル書き込み主経路〔TASK-41.5.1・#839〕は実装済み。Landlock のフック〔TASK-41.3・#194。`landlock_denial_record` / `landlock_denial_record_now` と
 //!   `exec::observe_landlock_path_access` による適用後プローブの拒否記録〕も実装済み。配送経路〔TRAP / USER_NOTIF /
-//!   カーネル監査〕・ワークロードプロセスが受けた Landlock 拒否の捕捉・カーネル監査へのフォールバック〔#840〕は未実装）
+//!   カーネル監査〕・ワークロードプロセスが受けた Landlock 拒否の捕捉は未実装。主経路失敗時のカーネル監査フォールバック〔#840 `KernelAuditFallback`〕は実装済み・本番経路への配線は未実装）
 //! - `capabilities`: capability 集合の型 `Capability`・`CapabilitySet`・OCI 既定集合（SEC-1・
 //!   TASK-37.1）。OS 非依存で syscall を持たない。適用関数 `apply_default_capabilities` は
 //!   `exec/capabilities.rs`（Linux 限定）に置く: 段の型 `ExecError` の非公開コンストラクタと

@@ -12,7 +12,8 @@
 //!   `exec::audit_mount_violation` と `oci_runtime::audit_mount_config_error` がここを使う。
 //!   本番経路への配線・永続化は未実装）
 //! - TASK-41.3（#194）の Landlock フックは [`landlock_denial_record`] で実装済み（プロセス内で観測した
-//!   `EACCES` の写像まで。ワークロードの拒否の捕捉は #840）
+//!   `EACCES` の写像まで。ワークロードの拒否のカーネル側監査〔Linux 6.15+ の `AUDIT_LANDLOCK_*`〕による
+//!   捕捉は未実装）
 //! - TASK-41.2（#193。seccomp フックは `seccomp_hook` に実装済み。拒否報告 [`SeccompDenialReport`] から
 //!   レコードを 1 件組み立てて [`AuditSink`] へ渡す。ただし現行フィルタは禁止 syscall に `ERRNO(EPERM)` を返し
 //!   SIGSYS も通知も発生しないため、本番の配送経路〔TRAP + SIGSYS ハンドラ / USER_NOTIF + supervisor listener〕は
@@ -20,7 +21,9 @@
 //!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
 //! - ローカルファイルへの JSON Lines 書き込み（主経路）は `file_writer` で実装済み（TASK-41.5.1・#839）。
 //!   型自体に `serde` の derive は付けず、非公開 DTO でワイヤースキーマへ写す（#652 で共通ログ型へ統一予定）。
-//!   カーネル監査連携・クラッシュ時の記録保持は #840 の担当で**未実装**（REPAIR-3: 実装済みを装わない）
+//!   主経路の失敗時のカーネル監査（NETLINK_AUDIT）フォールバックは `kernel_audit` で実装済み（TASK-41.5.2・#840）。
+//!   一方、常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持、本番経路（supervisor / CLI）への配線は
+//!   **未実装**（REPAIR-3: 実装済みを装わない）
 //! - レイヤーごとのペイロードを [`AuditEvent`] の enum で持ち、「syscall の無い seccomp 違反」のような
 //!   不正な組み合わせを構築できない（REPAIR-2）。値は各 newtype の構築子が検証する
 //! - 秘密情報（資格情報・環境変数・namespace 識別子）は含めない。ホスト側の実パスを載せるかは各フックで判断する
@@ -33,6 +36,7 @@
 //! 後から追加しても破壊的変更にならない。
 
 mod file_writer;
+mod kernel_audit;
 mod landlock;
 
 pub use file_writer::{
@@ -40,6 +44,7 @@ pub use file_writer::{
     AuditWriteFailure, AuditWriteOutcome, NoAuditFallback, encode_json_line, write_with_fallback,
 };
 
+pub use kernel_audit::{KERNEL_AUDIT_ACK_TIMEOUT, KernelAuditFallback};
 pub use landlock::{LANDLOCK_DENIED_ERRNO, landlock_denial_record, landlock_denial_record_now};
 
 use std::fmt;
@@ -186,7 +191,7 @@ impl From<SyscallNr> for AuditSyscallNr {
 ///
 /// 記録したプロセス自身の PID namespace から見た PID。他の namespace（例: seccomp USER_NOTIF の
 /// listener 側 PID）の値は、呼び出し側が変換してから渡す契約（SEC-4。`seccomp_hook` 参照）。
-/// ホスト側 PID との突き合わせはカーネル監査経路（#840）の担当。
+/// ホスト側 PID との突き合わせはカーネル監査経路の担当（#840 の `KernelAuditFallback` は本 PID を本文に載せるだけで、変換はしない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditPid(NonZeroU32);
 

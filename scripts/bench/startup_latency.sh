@@ -899,7 +899,13 @@ publish_result() {
 # mode の不一致・p50 が正の数でない / unit が ms でないものは exit 2（取り違え・改ざんされた
 # 結果を統合しない）。引数: <オプション名> <file> <期待する mode>
 load_result_file() {
-  local opt="$1" f="$2" want="$3" size obj
+  local opt="$1" f="$2" want="$3" size obj want_method
+  # mode ごとの計測区間（method）は固定値で検証する。入力の自己申告で methods_differ を偽装させない。
+  case "$want" in
+    oci) want_method="create-to-exec-observed" ;;
+    docker) want_method="docker-run-rm-total" ;;
+    *) err "invalid-result" "unsupported mode $want"; exit "$EXIT_INPUT" ;;
+  esac
   if [ -L "$f" ] || [ ! -f "$f" ]; then
     err "invalid-result" "$opt must be a regular file (symlink not allowed)"
     exit "$EXIT_INPUT"
@@ -909,16 +915,16 @@ load_result_file() {
     err "invalid-result" "$opt must be at most $RESULT_MAX_BYTES bytes"
     exit "$EXIT_INPUT"
   fi
-  if ! obj="$(jq -cs --arg mode "$want" '
+  if ! obj="$(jq -cs --arg mode "$want" --arg method "$want_method" '
     if length == 1 then .[0] else error("not a single JSON value") end
     | if (type == "object" and .schema_version == 1 and .benchmark == "startup_latency"
-        and .mode == $mode and (.method | type) == "string"
+        and .mode == $mode and .method == $method
         and (.metrics.startup_latency_p50_ms | type) == "object"
         and (.metrics.startup_latency_p50_ms.value | type) == "number"
         and .metrics.startup_latency_p50_ms.value > 0
         and .metrics.startup_latency_p50_ms.unit == "ms")
       then . else error("unexpected result schema") end' "$f" 2>/dev/null)"; then
-    err "invalid-result" "$opt is not a valid startup_latency result with mode=$want (schema_version 1, positive p50 in ms)"
+    err "invalid-result" "$opt is not a valid startup_latency result with mode=$want method=$want_method (schema_version 1, positive p50 in ms)"
     exit "$EXIT_INPUT"
   fi
   printf '%s' "$obj"

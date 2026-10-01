@@ -17,8 +17,9 @@
 //!   期待するケースは `Expectation::signal` で指定する
 //! - 監査ログ: `AuditExpectation::Required(layer)` のケースは、そのレイヤーの記録が 0 件なら必ず失敗する。
 //!   監査ログの本番配線（`AuditSink` を fork 後の子へ渡す経路）は未実装（REPAIR-3）のため、現状は攻撃
-//!   クロージャが既存の記録ヘルパ（`landlock_denial_record_now`・`record_seccomp_denial` 等）経由で
-//!   `Recorder`（`AuditSink`）へ記録したレコードを pipe で回収して判定する。配線完了後は本番経路の
+//!   ハーネス（`Recorder::outcome` の拒否フック。`EscapeCase::denial_path` 指定時）が攻撃結果の errno から
+//!   既存の記録ヘルパ（`landlock_denial_record_now` 等）経由で `Recorder`（`AuditSink`）へ記録したレコード
+//!   を pipe で回収して判定する。攻撃クロージャは監査レコードを組み立てない。配線完了後は本番経路の
 //!   出力を照合する形へ置き換える
 //!
 //! # 構成
@@ -522,6 +523,10 @@ mod linux {
         /// ディスパッチャ（分離なし・ホスト視点）がシナリオ成功後・rootfs 削除前に行う検査。
         /// 別テーブルにせずフィールドにすることで、追記漏れを rebase 後のコンパイルエラーで表面化させる。
         host_check: Option<HostCheck>,
+        /// 拒否時の監査フック（`landlock_denial_record_now`）へ渡す対象パス。`Some` のケースでは、
+        /// ハーネス（`Recorder::outcome`）が攻撃結果の errno を見てフックを呼ぶ。攻撃クロージャは監査
+        /// レコードを組み立てない（攻撃側の代行生成で監査要件を満たさないため。SEC-4）。
+        denial_path: Option<&'static str>,
     }
 
     /// ホスト視点の検査関数の型。
@@ -547,6 +552,7 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_control_read_proc,
             host_check: None,
+            denial_path: None,
         },
         // 否定対照: Landlock なしなら ESC-10 と同じ作成が成功する（拒否の Landlock への帰属の裏付け）。
         EscapeCase {
@@ -559,6 +565,7 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_esc10_create_outside,
             host_check: None,
+            denial_path: None,
         },
         // ESC-10（CORE-5・SEC-4・SEC-2）。
         EscapeCase {
@@ -571,6 +578,7 @@ mod linux {
             stages: esc10_stages,
             attack: attack_esc10_create_outside,
             host_check: None,
+            denial_path: Some(ESC10_PROBE),
         },
         // ESC-09（SEC-5・SEC-2）。
         EscapeCase {
@@ -583,6 +591,7 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_esc09_create_file,
             host_check: Some(host_check_esc09_owner),
+            denial_path: None,
         },
     ];
 
@@ -624,18 +633,10 @@ mod linux {
     }
 
     /// ESC-10 / 否定対照の攻撃: readonly root の下で許可外の作成（MAKE_REG）を試みる。
-    /// `EACCES` なら landlock 拒否レコードを `AuditSink` 経由で記録する（本番配線は REPAIR-3 まで未実装）。
-    /// レコード構築・記録の失敗は panic で子の異常終了にし、黙殺しない。
+    /// 攻撃側は結果を報告するだけで監査レコードは作らない。拒否の監査記録は `Recorder::outcome` が
+    /// 拒否フック（`EscapeCase::denial_path`）経由で行う（SEC-4。本番配線は REPAIR-3 まで未実装）。
     fn attack_esc10_create_outside(rec: &Recorder) {
-        let outcome = try_create(ESC10_PROBE);
-        if let AttackOutcome::Errno(13) = outcome {
-            let record = landlock_denial_record_now(Path::new(ESC10_PROBE), Some(13))
-                .unwrap_or_else(|e| panic!("build landlock record: {e:?}"))
-                .expect("EACCES must yield a landlock record");
-            rec.record(&record)
-                .unwrap_or_else(|e| panic!("record landlock denial: {e:?}"));
-        }
-        rec.outcome(outcome);
+        rec.outcome(try_create(ESC10_PROBE));
     }
 
     /// ESC-09 の攻撃: コンテナ内（pivot 後）の root としてファイルを作る。所有者の検査はホスト側で行う。
@@ -688,6 +689,8 @@ mod linux {
     /// 既存の記録ヘルパへ渡せる。累計量は `RECORD_MAX_BYTES` で打ち切る。
     pub struct Recorder {
         inner: Mutex<RecorderState>,
+        /// 拒否フックへ渡す対象パス（`EscapeCase::denial_path`）。
+        denial_path: Option<&'static str>,
     }
 
     struct RecorderState {
@@ -697,8 +700,9 @@ mod linux {
     }
 
     impl Recorder {
-        fn new(writer: PipeWriter) -> Self {
+        fn new(writer: PipeWriter, denial_path: Option<&'static str>) -> Self {
             Recorder {
+                denial_path,
                 inner: Mutex::new(RecorderState {
                     writer,
                     written: 0,
@@ -727,6 +731,15 @@ mod linux {
                 let mut st = self.inner.lock().expect("recorder lock");
                 assert!(!st.outcome_written, "outcome must be recorded once");
                 st.outcome_written = true;
+            }
+            // 拒否フック: ハーネスが結果の errno から監査レコードを生成する（攻撃クロージャは関与しない）。
+            // フックが `None`（EACCES 以外）なら記録しない。構築・記録の失敗は panic で子の異常終了にする。
+            if let (Some(path), AttackOutcome::Errno(errno)) = (self.denial_path, outcome)
+                && let Some(record) = landlock_denial_record_now(Path::new(path), Some(errno))
+                    .unwrap_or_else(|e| panic!("build landlock record: {e:?}"))
+            {
+                self.record(&record)
+                    .unwrap_or_else(|e| panic!("record landlock denial: {e:?}"));
             }
             self.write_line(&format!("outcome={}", outcome.render()))
                 .expect("write outcome");
@@ -963,9 +976,10 @@ mod linux {
 
         let (reader, writer) = std::io::pipe().expect("create record pipe");
         let attack = case.attack;
+        let denial_path = case.denial_path;
         // 親側の writer 端は fork 時に閉じられる（クロージャは子にだけ残る）ため、子の終了で EOF になる。
         let child = spawn_container_probe(rootfs, (case.stages)(), move || {
-            let recorder = Recorder::new(writer);
+            let recorder = Recorder::new(writer, denial_path);
             attack(&recorder);
         })
         .unwrap_or_else(|e| panic!("spawn: {e}"));

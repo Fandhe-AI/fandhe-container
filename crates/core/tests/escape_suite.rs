@@ -17,10 +17,9 @@
 //!   期待するケースは `Expectation::signal` で指定する
 //! - 監査ログ: `AuditExpectation::Required(layer)` のケースは、そのレイヤーの記録が 0 件なら必ず失敗する。
 //!   監査ログの本番配線（`AuditSink` を fork 後の子へ渡す経路）は未実装（REPAIR-3）のため、現状は攻撃
-//!   クロージャが本番の観測関数 `observe_landlock_path_access`（Landlock 適用 → プローブ → 拒否の監査
-//!   レコード化までを本番コードが行う）の `audit_records` を `Recorder` へ転送し、pipe で回収して判定する。
-//!   テスト側はレコードを組み立てない（本番経路が記録を出さなければ要件は満たされない）。配線完了後は
-//!   本番経路の出力を照合する形へ置き換える
+//!   クロージャが拒否（`EACCES`）を本番の監査ヘルパ `landlock_denial_record_now` でレコード化して
+//!   `Recorder` へ転送し、pipe で回収して判定する（ESC-10 は起動ステージ適用済みの子で追加の Landlock 適用を
+//!   せず、ステージ自体の回帰を検出する）。配線完了後は本番経路の出力を照合する形へ置き換える
 //!
 //! # 構成
 //! - 常に走る部分（3 OS 共通・既定のテスト集合）: 判定ロジック `judge` と記録パーサの自己テスト
@@ -619,9 +618,8 @@ mod linux {
         AuditDelivery, AuditRecord, AuditSink, encode_json_line, landlock_denial_record_now,
     };
     use fandhe_container_core::exec::{
-        ChildExit, IsolationConfig, LandlockAccessKind, LandlockAccessProbe, Namespace,
-        NamespaceSet, StagePipeline, isolate, isolate_rootful_host_root,
-        observe_landlock_path_access, plan, plan_rootful_host_root, spawn_container_probe,
+        ChildExit, IsolationConfig, Namespace, NamespaceSet, StagePipeline, isolate,
+        isolate_rootful_host_root, plan, plan_rootful_host_root, spawn_container_probe,
     };
     use fandhe_container_core::landlock::{detect_landlock_abi, path_rules_from_config};
     use fandhe_container_core::oci_runtime::{audit_mount_config_error, parse_config_bytes};
@@ -814,42 +812,25 @@ mod linux {
         rec.outcome(try_create(ESC10_PROBE));
     }
 
-    /// ESC-10 の攻撃: readonly root の下で許可外の作成（MAKE_REG）を試みる。
-    /// 監査レコードはテスト側で組み立てない。本番の観測関数 `observe_landlock_path_access`
-    /// （Landlock 適用 → プローブ → 拒否の監査レコード化）が返した `audit_records` を転送するだけで、
-    /// 本番経路が記録を出さなければ `AuditExpectation::Required("landlock")` は満たされない（SEC-4。
-    /// 拒否の判定結果も同じプローブ試行の戻り値から取り、判定と監査記録を同一試行に結び付ける。
-    /// 子プロセスへの本番監査配線は REPAIR-3 まで未実装）。
+    /// ESC-10 の攻撃: 起動ステージ（`esc10_stages` の readonly root Landlock）が適用済みの子で、
+    /// 追加の Landlock 適用をせずに許可外の作成（MAKE_REG）をそのまま試みる。
+    /// 起動ステージの Landlock が欠落・回帰すれば作成が成功し、`Errno(13)` 期待に反してケースが失敗する
+    /// （ステージ自体の回帰検出。CORE-5）。拒否（`EACCES`）は本番の監査ヘルパ `landlock_denial_record_now`
+    /// で SEC-4 の監査レコードにし、同じ試行の結果から判定と記録を結び付ける。レコードが出なければ
+    /// `AuditExpectation::Required("landlock")` は満たされない。子プロセスへの本番監査配線は REPAIR-3 まで未実装。
     fn attack_esc10_create_outside(rec: &Recorder) {
-        let config = parse_config_bytes(ESC10_CONFIG).expect("valid config");
-        let probes = [LandlockAccessProbe {
-            kind: LandlockAccessKind::CreateFile,
-            path: PathBuf::from(ESC10_PROBE),
-            expected_content: None,
-        }];
-        let obs = observe_landlock_path_access(&config, &probes).expect("observe landlock");
-        assert!(
-            obs.applied && obs.audit_error.is_none(),
-            "landlock observation failed: {:?} {:?} {:?}",
-            obs.ruleset_error,
-            obs.apply_error,
-            obs.audit_error
-        );
-        for record in &obs.audit_records {
-            rec.record(record)
+        let outcome = try_create(ESC10_PROBE);
+        let errno = match outcome {
+            AttackOutcome::Errno(e) => Some(e),
+            _ => None,
+        };
+        if let Some(record) = landlock_denial_record_now(Path::new(ESC10_PROBE), errno)
+            .unwrap_or_else(|e| panic!("build landlock denial record: {e:?}"))
+        {
+            rec.record(&record)
                 .unwrap_or_else(|e| panic!("record landlock denial: {e:?}"));
         }
-        // 判定対象の結果は監査レコードと同じ試行（観測関数内のプローブ 1 件）から得る。
-        // 別試行（`try_create`）の拒否と監査レコードを混同しない（SEC-4）。
-        let (_, probe_result) = obs
-            .results
-            .first()
-            .unwrap_or_else(|| panic!("landlock observation returned no probe result"));
-        rec.outcome(match probe_result {
-            None => AttackOutcome::Succeeded,
-            Some(errno) if *errno < 0 => AttackOutcome::Failed,
-            Some(errno) => AttackOutcome::Errno(*errno),
-        });
+        rec.outcome(outcome);
     }
 
     /// ESC-09 の攻撃: コンテナ内（pivot 後）の root としてファイルを作る。所有者の検査はホスト側で行う。

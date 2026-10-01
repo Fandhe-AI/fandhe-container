@@ -512,9 +512,10 @@ measure_once() {
         return 1
         ;;
     esac
-    # created のままなら間隔を空けて再照会する（期限までの残りが間隔に満たなければ待たずに
-    # 次の照会へ進み、その照会が残り時間不足なら上の判定で打ち切る）。
-    if [ $((deadline - $(now_us))) -ge "$STATE_POLL_INTERVAL_US" ]; then
+    # created のままなら間隔を空けて再照会する。待機後に照会 1 回分の残り時間
+    # （MIN_CALL_BUDGET_US）が残らない場合は待たずに次の照会へ進み、最後の照会の時間を
+    # 待機で失わないようにする（後始末の delete 再試行と同じ判定）。
+    if [ $((deadline - $(now_us))) -ge $((STATE_POLL_INTERVAL_US + MIN_CALL_BUDGET_US)) ]; then
       sleep "$STATE_POLL_INTERVAL"
     fi
   done

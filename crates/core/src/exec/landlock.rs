@@ -28,12 +28,16 @@
 //! - Landlock の組み込み固定段への昇格（`with_hook(Landlock)` の拒否）は後続作業
 //! - 本番 launcher（`oci_runtime`）からの本関数の呼び出しは後続
 
+use std::path::PathBuf;
+
 use super::{ExecError, IsolationStage};
 use crate::landlock::{
     LandlockApplyError, LandlockApplyReport, LandlockError, LandlockRuleError, LandlockRuleset,
     detect_landlock_abi, path_rules_from_config,
 };
 use crate::oci_runtime::OciConfig;
+use crate::sys;
+use crate::traits::types::ErrorCode;
 
 /// 生成済みの ruleset を呼び出しスレッドへ適用する（CORE-5・TASK-39.4）。
 ///
@@ -54,13 +58,156 @@ pub(crate) fn apply_landlock_stage(
 /// # 将来仕様（記録のみ）
 ///
 /// 本番 launcher（`oci_runtime`）からの呼び出しは後続作業（REPAIR-3）。
-// 本番 launcher からの呼び出しが未配線のため、結合試験・テスト以外では未使用になりうる。
-#[allow(dead_code)]
 pub(crate) fn landlock_ruleset_from_config(
     config: &OciConfig,
 ) -> Result<LandlockRuleset, ExecError> {
     let support = detect_landlock_abi().map_err(from_landlock_unavailable)?;
     path_rules_from_config(&support, config).map_err(from_landlock_rule)
+}
+
+/// [`observe_landlock_path_access`] が 1 件ずつ試す操作の種別（CORE-5・TASK-39.5・#185）。
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LandlockAccessKind {
+    /// 既存ファイルの読み取り（成功時は内容も取得する）。
+    ReadFile,
+    /// ディレクトリの列挙。
+    ReadDir,
+    /// 既存ファイルを書き込み専用で開く。
+    WriteExisting,
+    /// 既存ファイルを `O_TRUNC` 付きで開く。
+    TruncateOpen,
+    /// 新規ファイルの作成。
+    CreateFile,
+    /// ディレクトリの作成。
+    MakeDir,
+    /// ファイルの削除。
+    RemoveFile,
+}
+
+/// 1 件の観測対象（種別とパス）。
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandlockAccessProbe {
+    /// 試す操作。
+    pub kind: LandlockAccessKind,
+    /// 操作対象のパス（呼び出し側が canonicalize 済みで用意する）。
+    pub path: PathBuf,
+    /// `ReadFile` で読めるはずの内容。`None` なら内容は検査しない（他の種別では無視）。
+    /// 不一致は [`LANDLOCK_PROBE_CONTENT_MISMATCH`] で報告する。
+    pub expected_content: Option<Vec<u8>>,
+}
+
+/// `ReadFile` の内容が `expected_content` と一致しなかったことを示す結果値。
+/// errno（正の値）・errno 不明の I/O 失敗（`-1`）のいずれとも衝突しない。
+#[doc(hidden)]
+pub const LANDLOCK_PROBE_CONTENT_MISMATCH: i32 = -2;
+
+/// [`observe_landlock_path_access`] の観測結果。
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LandlockAccessObservation {
+    /// 適用前に `NO_NEW_PRIVS` が立っていたか。
+    pub no_new_privs_before: bool,
+    /// ruleset 生成（ABI 検出・ルール生成）の失敗。`Some` なら適用もプローブもしていない（fail-closed）。
+    pub ruleset_error: Option<ExecError>,
+    /// 適用の失敗。`Some` ならプローブはしていない（起動拒否に相当）。
+    pub apply_error: Option<ExecError>,
+    /// 適用に成功したか。
+    pub applied: bool,
+    /// プローブ結果（入力順）。`None` は成功、`Some(errno)` は失敗（errno 不明は `-1`）。
+    pub results: Vec<(LandlockAccessProbe, Option<i32>)>,
+}
+
+/// 観測 1 回で試せるプローブ数の上限（呼び出し側が固定リストで渡す前提の防御）。
+const MAX_ACCESS_PROBES: usize = 32;
+
+/// 本番のステージ関数経由で Landlock を適用し、許可パス・許可外パスへの操作結果を観測する
+/// （CORE-5・TASK-39.5・#185）。
+///
+/// 結合試験 `tests/landlock.rs` の使い捨て子プロセス専用。適用は不可逆で呼び出しスレッドにしか
+/// 効かない単一スレッド前提のため、通常の利用者は呼ばない。`landlock_ruleset_from_config`
+/// （ABI 検出 → ルール生成）→ `apply_landlock_stage` の本番経路をそのまま通し、ruleset 生成・適用の
+/// いずれかが失敗したらプローブは実行しない（fail-closed の観測）。`unsafe` は追加せず、
+/// syscall は既存の `crate::sys` ラッパーに限る。
+///
+/// # 将来仕様（記録のみ）
+///
+/// exec 許可（制限適用の証跡配線）が入った後は、コンテナのエントリポイント内プローブで検証する
+/// 形へ移す（REPAIR-3）。
+#[doc(hidden)]
+pub fn observe_landlock_path_access(
+    config: &OciConfig,
+    probes: &[LandlockAccessProbe],
+) -> Result<LandlockAccessObservation, ExecError> {
+    if probes.len() > MAX_ACCESS_PROBES {
+        return Err(ExecError::new(
+            ErrorCode::InvalidArgument,
+            IsolationStage::Landlock,
+            "too many access probes",
+        ));
+    }
+    let internal = |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, m);
+    sys::set_no_new_privs().map_err(|_| internal("failed to set no_new_privs"))?;
+    let no_new_privs_before = sys::no_new_privs_enabled().unwrap_or(false);
+    let mut obs = LandlockAccessObservation {
+        no_new_privs_before,
+        ruleset_error: None,
+        apply_error: None,
+        applied: false,
+        results: Vec::new(),
+    };
+    let ruleset = match landlock_ruleset_from_config(config) {
+        Ok(r) => r,
+        Err(e) => {
+            obs.ruleset_error = Some(e);
+            return Ok(obs);
+        }
+    };
+    if let Err(e) = apply_landlock_stage(&ruleset) {
+        obs.apply_error = Some(e);
+        return Ok(obs);
+    }
+    obs.applied = true;
+    for p in probes {
+        let r = run_probe(p);
+        obs.results.push((p.clone(), r));
+    }
+    Ok(obs)
+}
+
+/// プローブ 1 件を実行し、成功は `None`・失敗は `Some(errno)` で返す。
+/// errno が無い I/O 失敗は `-1`、内容不一致は [`LANDLOCK_PROBE_CONTENT_MISMATCH`]。
+fn run_probe(p: &LandlockAccessProbe) -> Option<i32> {
+    use std::fs::OpenOptions;
+    let res: std::io::Result<()> = match p.kind {
+        LandlockAccessKind::ReadFile => match std::fs::read(&p.path) {
+            Ok(b) => match &p.expected_content {
+                Some(want) if *want != b => return Some(LANDLOCK_PROBE_CONTENT_MISMATCH),
+                _ => Ok(()),
+            },
+            Err(e) => Err(e),
+        },
+        LandlockAccessKind::ReadDir => std::fs::read_dir(&p.path).map(|_| ()),
+        LandlockAccessKind::WriteExisting => {
+            OpenOptions::new().write(true).open(&p.path).map(|_| ())
+        }
+        LandlockAccessKind::TruncateOpen => OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&p.path)
+            .map(|_| ()),
+        LandlockAccessKind::CreateFile => OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p.path)
+            .map(|_| ()),
+        LandlockAccessKind::MakeDir => std::fs::create_dir(&p.path),
+        LandlockAccessKind::RemoveFile => std::fs::remove_file(&p.path),
+    };
+    res.err().map(|e| e.raw_os_error().unwrap_or(-1))
 }
 
 fn from_landlock_apply(e: LandlockApplyError) -> ExecError {
@@ -124,6 +271,25 @@ mod tests {
     use super::*;
     use crate::landlock::{LandlockApplyErrorKind, LandlockRuleErrorKind, LandlockUnavailable};
     use crate::traits::types::ErrorCode;
+
+    /// CORE-5・TASK-39.5: プローブ件数の上限超過は適用前に InvalidArgument で拒否する。
+    #[test]
+    fn core5_access_probe_limit_is_rejected_before_apply() {
+        let json = br#"{"ociVersion":"1.2.0","root":{"path":"rootfs"}}"#;
+        let config = crate::oci_runtime::parse_config_bytes(json).expect("config");
+        let probes = vec![
+            LandlockAccessProbe {
+                kind: LandlockAccessKind::ReadDir,
+                path: PathBuf::from("/"),
+                expected_content: None,
+            };
+            MAX_ACCESS_PROBES + 1
+        ];
+        let e = observe_landlock_path_access(&config, &probes).expect_err("over limit");
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+        assert_eq!(e.stage, IsolationStage::Landlock);
+        assert_eq!(e.message, "too many access probes");
+    }
 
     /// CORE-5・TASK-39.4: 適用失敗は code を保ち stage を Landlock にする。
     #[test]

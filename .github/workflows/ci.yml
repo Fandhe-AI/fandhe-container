@@ -200,6 +200,12 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      # crates/supervisor の workspace members 登録を検証する（TASK-157.1・#235・SUP-1）。
+      # members から外れると cargo test --workspace が機械照合テストごと実行しなくなるため、
+      # workspace 外の make ターゲットで検出する。既存ジョブへの追加（新ジョブは必須チェック名が増える）
+      - name: workspace manifest・supervisor 登録の検証
+        shell: bash
+        run: make check-workspace-manifest
       - name: cargo build（既定 feature。ステージ 1）
         run: cargo build --workspace
       - name: cargo clippy（既定 feature）

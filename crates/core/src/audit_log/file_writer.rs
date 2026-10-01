@@ -60,7 +60,7 @@ pub enum AuditWriteErrorKind {
     Unsupported,
     /// 通常ファイルではない（FIFO・ディレクトリ・デバイス）。
     NotRegularFile,
-    /// 所有者が実効 uid でない、または group/other 権限を持つ。
+    /// 所有者が実効 uid でない、group/other 権限を持つ、またはハードリンク数が 1 でない。
     InsecureFile,
     /// ファイルを開けない（symlink 含む）。
     Open,
@@ -72,6 +72,8 @@ pub enum AuditWriteErrorKind {
     Write,
     /// 書き込みロックを期限内に取得できなかった。
     Lock,
+    /// ロック操作自体が I/O エラーで失敗した（タイムアウトではない）。
+    LockFailed,
     /// 永続化（fsync）に失敗した。
     Sync,
     /// フォールバック経路が未実装・利用不可。
@@ -129,6 +131,7 @@ impl AuditWriteError {
             AuditWriteErrorKind::LineTooLong => "encoded audit record exceeds the line limit",
             AuditWriteErrorKind::Write => "failed to write audit record",
             AuditWriteErrorKind::Lock => "timed out waiting for the audit log lock",
+            AuditWriteErrorKind::LockFailed => "failed to acquire the audit log lock",
             AuditWriteErrorKind::Sync => "failed to sync audit log file",
             AuditWriteErrorKind::FallbackUnavailable => "audit fallback path is not available",
         }
@@ -240,7 +243,7 @@ impl AuditFileWriter {
                     std::thread::sleep(AUDIT_LOCK_RETRY);
                 }
                 Err(std::fs::TryLockError::Error(_)) => {
-                    return Err(AuditWriteError::new(AuditWriteErrorKind::Lock));
+                    return Err(AuditWriteError::new(AuditWriteErrorKind::LockFailed));
                 }
             }
         }
@@ -372,7 +375,9 @@ fn open_checked(path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
     if !meta.file_type().is_file() {
         return Err(AuditWriteError::new(AuditWriteErrorKind::NotRegularFile));
     }
-    if meta.uid() != crate::sys::effective_uid() || meta.mode() & 0o077 != 0 {
+    // ハードリンク数が 1 でなければ、別パスの機密ファイル（同一所有者・0600）への link を
+    // 監査ログパスに仕込まれた可能性がある。追記による改変を防ぐため拒否する（SEC-4）。
+    if meta.nlink() != 1 || meta.uid() != crate::sys::effective_uid() || meta.mode() & 0o077 != 0 {
         return Err(AuditWriteError::new(AuditWriteErrorKind::InsecureFile));
     }
     // 再オープン時に末尾が LF でない（前回プロセスの torn line）場合、最初の追記前に LF を挿入して
@@ -723,6 +728,33 @@ mod tests {
         let e = AuditFileWriter::open(&parent.join("audit.log")).unwrap_err();
         assert_eq!(e.kind(), AuditWriteErrorKind::InsecureFile);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-4・TASK-41.5.1: 他パスへのハードリンクになっている既存ファイルは拒否し、内容を改変しない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_task41_5_1_rejects_hardlinked_file() {
+        let dir = fresh_dir("hardlink");
+        let secret = dir.join("secret");
+        std::fs::write(&secret, b"top-secret\n").unwrap();
+        std::fs::set_permissions(&secret, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let audit = dir.join("audit.log");
+        std::fs::hard_link(&secret, &audit).unwrap();
+        let e = AuditFileWriter::open(&audit).unwrap_err();
+        assert_eq!(e.kind(), AuditWriteErrorKind::InsecureFile);
+        assert_eq!(std::fs::read(&secret).unwrap(), b"top-secret\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ERR-4: ロック I/O 失敗はタイムアウトと区別され、Timeout コードにならない。
+    #[test]
+    fn err4_lock_failed_is_not_timeout() {
+        let e = AuditWriteError::new(AuditWriteErrorKind::LockFailed);
+        assert_eq!(e.error_code(), ErrorCode::Internal);
+        assert_eq!(e.message(), "failed to acquire the audit log lock");
+        let t = AuditWriteError::new(AuditWriteErrorKind::Lock);
+        assert_eq!(t.error_code(), ErrorCode::Timeout);
     }
 
     /// SEC-4・TASK-41.5.1: 複数 writer の並行書き込みでも全行が完全な JSON 行になる。

@@ -180,6 +180,8 @@ pub enum MonitorOperation {
     ReleaseAfterWaitError,
     /// healthcheck の判定結果（`health`）の記録（#240・SUP-4。[`crate::health`]）。
     RecordHealth,
+    /// healthcheck 判定の実行（成功・失敗・期限超過とレイテンシ。#240・REPAIR-4）。
+    Probe,
 }
 
 impl MonitorOperation {
@@ -192,6 +194,7 @@ impl MonitorOperation {
             Self::Stop => "stop",
             Self::ReleaseAfterWaitError => "release_after_wait_error",
             Self::RecordHealth => "record_health",
+            Self::Probe => "probe",
         }
     }
 }

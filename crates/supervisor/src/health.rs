@@ -12,7 +12,9 @@
 //!   その際、healthcheck 引数の検証・シェル連結の禁止・コマンド出力のログ出力の扱いも TASK-161 で決める。
 //! - スタブは `Healthy` を返さない。未検査のコンテナを healthy と公開すると `depends_on` の待ち合わせを
 //!   誤って通すため、常に `Unimplemented` を返す（fail-closed）。
-//! - probe の失敗を `Unhealthy` に読み替えるかは TASK-161 で決める。ここでは状態を書かずエラーを返す。
+//! - probe の失敗（`Err`・期限超過）は元のエラーを返す。ただし記録済みの `Healthy` が残ると `depends_on` の
+//!   healthy 条件を誤って満たすため、現在値が `Healthy` のときだけ `Unhealthy` へ落とす（古い成功を保持しない）。
+//!   未設定・`Starting`・`Unhealthy` の状態は書かない（未実装スタブが状態を書き換えない）。
 //! - テスト用フェイクは `run.rs` と別に持つ。共有化は #242（TASK-157.8）で検討する。
 //!
 //! # 契約
@@ -22,7 +24,7 @@
 //! 有限リトライで、再試行のたびに `restart_count` 等を読み直す（並行する restart の更新を消さない。REPAIR-5）。
 
 use std::num::NonZeroU32;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fandhe_container_core::oci_runtime::LaunchedProcess;
 use fandhe_container_core::traits::{
@@ -70,7 +72,11 @@ pub fn record_health(
 
 /// healthcheck 判定の拡張点（将来 TASK-161・SUP-4 が exec 共通関数〔SUP-6〕で実装する）。
 pub trait HealthProbe {
-    /// 判定を 1 回行う。`timeout` 内に終えること（REPAIR-5）。
+    /// 判定を 1 回行う。
+    ///
+    /// **実装は `timeout` 内に必ず戻ること**（子プロセスの待機はタイムアウト付きで行い、超過時は kill して回収する。
+    /// REPAIR-5）。同期呼び出しのため呼び出し側は途中で打ち切れない。呼び出し側は戻りが `timeout` を超えた場合に
+    /// その結果を破棄して失敗として扱う（[`probe_and_record`]）。
     fn probe(&self, timeout: Duration) -> Result<HealthStatus, TraitError>;
 }
 
@@ -89,9 +95,12 @@ impl HealthProbe for UnimplementedHealthProbe {
     }
 }
 
-/// `probe` を 1 回実行し、成功時のみ結果を [`record_health`] で書く。
+/// `probe` を 1 回実行し、結果を [`record_health`] で書く。
 ///
-/// `timeout` が 0 または [`MAX_POLL_INTERVAL`] 超なら `InvalidArgument`。probe が `Err` なら状態を書かずに返す。
+/// `timeout` が 0 または [`MAX_POLL_INTERVAL`] 超なら `InvalidArgument`。判定は [`MonitorOperation::Probe`] として
+/// 成否・レイテンシを通知する（REPAIR-4）。probe が `Err` を返すか、戻りが `timeout` を超えた（`Timeout`
+/// として結果を破棄）場合は、記録上の `health` が `Healthy` のときに限り `Unhealthy` へ落としたうえで
+/// 判定側のエラーを返す。落とす書き込みの失敗は判定側のエラーを優先して握りつぶさない（両方を通知で観測できる）。
 pub fn probe_and_record(
     state: &mut SupervisedState,
     process: &dyn LaunchedProcess,
@@ -105,8 +114,27 @@ pub fn probe_and_record(
             "probe timeout is out of range",
         ));
     }
-    let health = probe.probe(timeout)?;
-    record_health(state, process, health, obs)
+    let probed = observed(obs, MonitorOperation::Probe, || {
+        let started = Instant::now();
+        let r = probe.probe(timeout);
+        if started.elapsed() > timeout {
+            return Err(TraitError::new(
+                ErrorCode::Timeout,
+                "healthcheck probe exceeded its timeout",
+            ));
+        }
+        r
+    });
+    match probed {
+        Ok(health) => record_health(state, process, health, obs),
+        Err(e) => {
+            if state.record().health() == Some(HealthStatus::Healthy) {
+                // 書き込み失敗は判定側のエラーを優先する（失敗は RecordHealth として通知済み）。
+                let _ = record_health(state, process, HealthStatus::Unhealthy, obs);
+            }
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -402,5 +430,90 @@ mod tests {
         assert_eq!(ev[0].operation.as_str(), "record_health");
         assert_eq!(ev[0].error_code, None);
         assert_eq!(ev[1].error_code, Some(ErrorCode::FailedPrecondition));
+    }
+
+    struct FailingProbe;
+
+    impl HealthProbe for FailingProbe {
+        fn probe(&self, _: Duration) -> Result<HealthStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "boom"))
+        }
+    }
+
+    struct SlowProbe;
+
+    impl HealthProbe for SlowProbe {
+        fn probe(&self, t: Duration) -> Result<HealthStatus, TraitError> {
+            std::thread::sleep(t + Duration::from_millis(20));
+            Ok(HealthStatus::Healthy)
+        }
+    }
+
+    fn healthy_store() -> Arc<FakeStore> {
+        store_with(
+            ContainerStatus::running(cid(), Some(pid(42))),
+            SupervisionState::new(Some(me()), Some(HealthStatus::Healthy), 0),
+            0,
+        )
+    }
+
+    /// REPAIR-4・SUP-4: probe 失敗は Probe イベントで通知され、古い Healthy は Unhealthy へ落ちる。
+    #[test]
+    fn sup4_task157_6_probe_error_downgrades_stale_healthy_and_is_observed() {
+        let store = healthy_store();
+        let mut s = attach(&store);
+        let obs = RecObs::default();
+        let t = Duration::from_secs(1);
+        let e = probe_and_record(&mut s, &FakeProc, &FailingProbe, t, &obs).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert_eq!(s.record().health(), Some(HealthStatus::Unhealthy));
+        let ev = obs.0.lock().unwrap();
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[0].operation, MonitorOperation::Probe);
+        assert_eq!(ev[0].error_code, Some(ErrorCode::Internal));
+        assert_eq!(ev[1].operation, MonitorOperation::RecordHealth);
+        assert_eq!(ev[1].error_code, None);
+    }
+
+    /// REPAIR-5: 期限超過の結果は破棄され、Timeout として失敗扱い（Healthy を残さない）。
+    #[test]
+    fn repair5_task157_6_overrun_probe_result_is_discarded() {
+        let store = healthy_store();
+        let mut s = attach(&store);
+        let obs = RecObs::default();
+        let e = probe_and_record(
+            &mut s,
+            &FakeProc,
+            &SlowProbe,
+            Duration::from_millis(10),
+            &obs,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert_eq!(s.record().health(), Some(HealthStatus::Unhealthy));
+        assert_eq!(
+            obs.0.lock().unwrap()[0].error_code,
+            Some(ErrorCode::Timeout)
+        );
+    }
+
+    /// 成功時は Probe と RecordHealth が各 1 件通知される。
+    #[test]
+    fn sup4_task157_6_probe_success_is_observed() {
+        let store = owned_store(0);
+        let mut s = attach(&store);
+        let obs = RecObs::default();
+        probe_and_record(
+            &mut s,
+            &FakeProc,
+            &FixedProbe(HealthStatus::Healthy),
+            Duration::from_secs(1),
+            &obs,
+        )
+        .unwrap();
+        let ev = obs.0.lock().unwrap();
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[0].operation.as_str(), "probe");
+        assert_eq!(ev[0].error_code, None);
     }
 }

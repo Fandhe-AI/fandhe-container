@@ -890,6 +890,36 @@ mod tests {
         drop(writer);
     }
 
+    /// REPAIR-5・TASK-157.7: 期限内に届いた EOF は成功として扱う（drain を始めてから 100ms 後に末尾行を書いて閉じても、
+    /// 期限 10 秒の drain は集計〔2 行・10 バイト〕を返し、末尾行も sink に届く）。
+    #[test]
+    fn sup1_task157_7_drain_succeeds_when_eof_arrives_before_deadline() {
+        let budget = ReaderBudget::new(1).unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let sink = Arc::new(MemoryLogSink::default());
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        writer.write_all(b"head\n").unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            writer.write_all(b"tail\n").unwrap();
+        });
+        let sum = cap.drain(Duration::from_secs(10)).unwrap();
+        closer.join().unwrap();
+        assert_eq!(sum.stdout().unwrap().lines(), 2);
+        assert_eq!(sum.stdout().unwrap().bytes(), 10);
+        assert_eq!(
+            sink.snapshot().unwrap(),
+            vec![
+                line(StreamKind::Stdout, b"head"),
+                line(StreamKind::Stdout, b"tail")
+            ]
+        );
+    }
+
     fn far() -> Instant {
         Instant::now() + Duration::from_secs(10)
     }
@@ -998,6 +1028,36 @@ mod tests {
             self.done.lock().unwrap().push(line.to_vec());
             Ok(())
         }
+    }
+
+    /// REPAIR-5・TASK-157.7: sink の失敗後（以後の行は追記時の取消し確認を通らない）でも、チャンクの処理中に
+    /// 取り消されていれば次の read へ進まず終了する。パイプを開いたまま・追加の出力なしでも枠が 0 に戻る。
+    #[test]
+    fn sup1_task157_7_cancelled_reader_exits_after_sink_failure_without_another_read() {
+        let budget = ReaderBudget::new(1).unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let sink = Arc::new(BlockingSink {
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+            done: Mutex::new(Vec::new()),
+            fail: true,
+        });
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        writer.write_all(b"a\nb\nc\n").unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // 1 行目の追記中に期限切れ → 取消し。その後 1 行目が失敗で戻り、残りは sink を呼ばずに読み捨てられる。
+        let err = cap.drain(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        release_tx.send(()).unwrap();
+        assert_eq!(wait_live(&budget, 0), 0);
+        assert_eq!(*sink.done.lock().unwrap(), Vec::<Vec<u8>>::new());
+        drop(writer);
     }
 
     /// REPAIR-5・TASK-157.7: sink の追記が止まっていても drain は timeout（200ms）で Timeout を返す。

@@ -14,7 +14,8 @@
 //!
 //! # 処理順（[`monitor`]）
 //! 1. 事前確認: 状態が `Running` で、`status.pid()` が起動ハンドルの pid と一致すること。違えば `FailedPrecondition`。
-//! 2. 監視開始の記録: `supervisor_pid` に自プロセスの pid を書く（`health`・`restart_count` は既存値を保つ）。
+//! 2. 監視開始の記録: `supervisor_pid` が `None` のときだけ自プロセスの pid を書く（自 pid を含め既に記録があれば `FailedPrecondition`。
+//!    同一プロセス内の二重 monitor を revision 競合後の `refresh` 経由でも開始させないため。`health`・`restart_count` は既存値を保つ）。
 //! 3. ループ: 周回の先頭で停止要求を確認し、`wait(poll_interval)` で生存確認する。`Ok(None)` は生存、
 //!    `Ok(Some(_))` は終了（回収済み）、`Err` は握りつぶさず返す。ただし返す前に記録済みの `supervisor_pid` を
 //!    解除する（監視していないのに自 pid が残るのを防ぐ）。解除にも失敗したら [`MonitorOutcome::WaitFailedUnreleased`] で
@@ -279,11 +280,12 @@ pub fn monitor_with_observer(
         .ok_or_else(|| TraitError::new(ErrorCode::Internal, "own pid is zero"))?;
     observed(obs, MonitorOperation::Start, || {
         write_with_retry(state, pid, |rec| {
-            // 他の supervisor が監視中なら奪わない（SUP-1: コンテナごとの監視所有権）。
-            match rec.supervision().supervisor_pid() {
-                None => {}
-                Some(p) if p == self_pid => {}
-                Some(_) => return Err(precondition("another supervisor already owns monitoring")),
+            // 既に誰かが監視中なら（自 pid でも）開始しない（SUP-1: コンテナごとの監視所有権）。
+            // 自 pid 一致を許すと同一プロセス内の二重 monitor が revision 競合後の refresh 経由で
+            // 開始でき、同じ起動ハンドルを二重に wait して回収・状態記録が競合する。
+            // 状態ファイルの CAS（revision）だけで排他するため、グローバル状態は持たない。
+            if rec.supervision().supervisor_pid().is_some() {
+                return Err(precondition("monitoring is already owned by a supervisor"));
             }
             Ok((
                 rec.status().clone(),
@@ -689,6 +691,43 @@ mod tests {
         };
         assert_eq!(record.health(), Some(HealthStatus::Healthy));
         assert_eq!(record.restart_count(), 2);
+    }
+
+    /// SUP-1・TASK-157.4: 自プロセス pid が既に記録されていても（同一プロセス内の二重監視）開始を拒否する。
+    #[test]
+    fn sup1_task157_4_rejects_own_pid_owner_at_start() {
+        let me = pid(std::process::id());
+        let store = store_with(
+            ContainerStatus::running(cid(), Some(pid(42))),
+            SupervisionState::new(Some(me), SupervisionState::default().health(), 0),
+            0,
+        );
+        let mut s = attach(&store);
+        let p = FakeProc::alive();
+        let e = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(p.waits(), 0);
+    }
+
+    /// SUP-1・TASK-157.4: revision 競合後の refresh で他方の自 pid 記録を見たら、二重に開始しない。
+    #[test]
+    fn sup1_task157_4_rejects_double_monitor_after_conflict_refresh() {
+        let store = running_store(1);
+        let mut s2 = attach(&store);
+        // 先行する monitor が競合の隙に自 pid を記録した状況を再現する。
+        {
+            let mut g = store.rec.lock().unwrap();
+            let cur = g.clone();
+            *g = next_record(
+                &cur,
+                cur.status().clone(),
+                SupervisionState::new(Some(pid(std::process::id())), cur.health(), 0),
+            );
+        }
+        let p = FakeProc::alive();
+        let e = monitor(&mut s2, &p, &MonitorConfig::default(), &StopToken::new()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(p.waits(), 0);
     }
 
     /// SUP-1・TASK-157.4: 別 supervisor が監視中なら開始を拒否し、記録を奪わない。

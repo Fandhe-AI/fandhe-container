@@ -17,10 +17,10 @@
 //!   期待するケースは `Expectation::signal` で指定する
 //! - 監査ログ: `AuditExpectation::Required(layer)` のケースは、そのレイヤーの記録が 0 件なら必ず失敗する。
 //!   監査ログの本番配線（`AuditSink` を fork 後の子へ渡す経路）は未実装（REPAIR-3）のため、現状は攻撃
-//!   ハーネス（`Recorder::outcome` の拒否フック。`EscapeCase::denial_path` 指定時）が攻撃結果の errno から
-//!   既存の記録ヘルパ（`landlock_denial_record_now` 等）経由で `Recorder`（`AuditSink`）へ記録したレコード
-//!   を pipe で回収して判定する。攻撃クロージャは監査レコードを組み立てない。配線完了後は本番経路の
-//!   出力を照合する形へ置き換える
+//!   クロージャが本番の観測関数 `observe_landlock_path_access`（Landlock 適用 → プローブ → 拒否の監査
+//!   レコード化までを本番コードが行う）の `audit_records` を `Recorder` へ転送し、pipe で回収して判定する。
+//!   テスト側はレコードを組み立てない（本番経路が記録を出さなければ要件は満たされない）。配線完了後は
+//!   本番経路の出力を照合する形へ置き換える
 //!
 //! # 構成
 //! - 常に走る部分（3 OS 共通・既定のテスト集合）: 判定ロジック `judge` と記録パーサの自己テスト
@@ -493,12 +493,11 @@ mod linux {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::audit_log::{
-        AuditRecord, AuditSink, encode_json_line, landlock_denial_record_now,
-    };
+    use fandhe_container_core::audit_log::{AuditRecord, AuditSink, encode_json_line};
     use fandhe_container_core::exec::{
-        ChildExit, IsolationConfig, Namespace, NamespaceSet, StagePipeline, isolate,
-        isolate_rootful_host_root, plan, plan_rootful_host_root, spawn_container_probe,
+        ChildExit, IsolationConfig, LandlockAccessKind, LandlockAccessProbe, Namespace,
+        NamespaceSet, StagePipeline, isolate, isolate_rootful_host_root,
+        observe_landlock_path_access, plan, plan_rootful_host_root, spawn_container_probe,
     };
     use fandhe_container_core::landlock::{detect_landlock_abi, path_rules_from_config};
     use fandhe_container_core::oci_runtime::parse_config_bytes;
@@ -523,10 +522,6 @@ mod linux {
         /// ディスパッチャ（分離なし・ホスト視点）がシナリオ成功後・rootfs 削除前に行う検査。
         /// 別テーブルにせずフィールドにすることで、追記漏れを rebase 後のコンパイルエラーで表面化させる。
         host_check: Option<HostCheck>,
-        /// 拒否時の監査フック（`landlock_denial_record_now`）へ渡す対象パス。`Some` のケースでは、
-        /// ハーネス（`Recorder::outcome`）が攻撃結果の errno を見てフックを呼ぶ。攻撃クロージャは監査
-        /// レコードを組み立てない（攻撃側の代行生成で監査要件を満たさないため。SEC-4）。
-        denial_path: Option<&'static str>,
     }
 
     /// ホスト視点の検査関数の型。
@@ -552,7 +547,6 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_control_read_proc,
             host_check: None,
-            denial_path: None,
         },
         // 否定対照: Landlock なしなら ESC-10 と同じ作成が成功する（拒否の Landlock への帰属の裏付け）。
         EscapeCase {
@@ -563,9 +557,8 @@ mod linux {
                 audit: AuditExpectation::None,
             },
             stages: StagePipeline::new,
-            attack: attack_esc10_create_outside,
+            attack: attack_control_create_outside,
             host_check: None,
-            denial_path: None,
         },
         // ESC-10（CORE-5・SEC-4・SEC-2）。
         EscapeCase {
@@ -578,7 +571,6 @@ mod linux {
             stages: esc10_stages,
             attack: attack_esc10_create_outside,
             host_check: None,
-            denial_path: Some(ESC10_PROBE),
         },
         // ESC-09（SEC-5・SEC-2）。
         EscapeCase {
@@ -591,10 +583,12 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_esc09_create_file,
             host_check: Some(host_check_esc09_owner),
-            denial_path: None,
         },
     ];
 
+    /// ESC-10 の OCI config（readonly root・mount なし。固定リテラルでホスト側パスを含まない）。
+    const ESC10_CONFIG: &[u8] =
+        br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"mounts":[]}"#;
     /// ESC-10 が作成を試みるコンテナ内パス。
     const ESC10_PROBE: &str = "/esc-10-landlock-probe";
     /// ESC-09 が作成するコンテナ内ファイル名（ホスト側は rootfs 直下の同名ファイルとして観測する）。
@@ -605,10 +599,7 @@ mod linux {
     /// config は固定リテラルでホスト側パスを含まない。ABI 6 未満など検出・構築に失敗したら panic し、
     /// シナリオ失敗（`ScenarioFailed`）として fail-closed にする（シナリオプロセス・fork 前で呼ばれる）。
     fn esc10_stages() -> StagePipeline {
-        let config = parse_config_bytes(
-            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"mounts":[]}"#,
-        )
-        .expect("valid config");
+        let config = parse_config_bytes(ESC10_CONFIG).expect("valid config");
         let support = detect_landlock_abi()
             .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for ESC-10: {e}"));
         let ruleset =
@@ -632,11 +623,37 @@ mod linux {
         }
     }
 
-    /// ESC-10 / 否定対照の攻撃: readonly root の下で許可外の作成（MAKE_REG）を試みる。
-    /// 攻撃側は結果を報告するだけで監査レコードは作らない。拒否の監査記録は `Recorder::outcome` が
-    /// 拒否フック（`EscapeCase::denial_path`）経由で行う（SEC-4。本番配線は REPAIR-3 まで未実装）。
-    fn attack_esc10_create_outside(rec: &Recorder) {
+    /// 否定対照の攻撃: Landlock なしで ESC-10 と同じ作成を試みる（結果の報告のみ）。
+    fn attack_control_create_outside(rec: &Recorder) {
         rec.outcome(try_create(ESC10_PROBE));
+    }
+
+    /// ESC-10 の攻撃: readonly root の下で許可外の作成（MAKE_REG）を試みる。
+    /// 監査レコードはテスト側で組み立てない。本番の観測関数 `observe_landlock_path_access`
+    /// （Landlock 適用 → プローブ → 拒否の監査レコード化）が返した `audit_records` を転送するだけで、
+    /// 本番経路が記録を出さなければ `AuditExpectation::Required("landlock")` は満たされない（SEC-4。
+    /// 子プロセスへの本番監査配線は REPAIR-3 まで未実装）。
+    fn attack_esc10_create_outside(rec: &Recorder) {
+        let outcome = try_create(ESC10_PROBE);
+        let config = parse_config_bytes(ESC10_CONFIG).expect("valid config");
+        let probes = [LandlockAccessProbe {
+            kind: LandlockAccessKind::CreateFile,
+            path: PathBuf::from(ESC10_PROBE),
+            expected_content: None,
+        }];
+        let obs = observe_landlock_path_access(&config, &probes).expect("observe landlock");
+        assert!(
+            obs.applied && obs.audit_error.is_none(),
+            "landlock observation failed: {:?} {:?} {:?}",
+            obs.ruleset_error,
+            obs.apply_error,
+            obs.audit_error
+        );
+        for record in &obs.audit_records {
+            rec.record(record)
+                .unwrap_or_else(|e| panic!("record landlock denial: {e:?}"));
+        }
+        rec.outcome(outcome);
     }
 
     /// ESC-09 の攻撃: コンテナ内（pivot 後）の root としてファイルを作る。所有者の検査はホスト側で行う。
@@ -689,8 +706,6 @@ mod linux {
     /// 既存の記録ヘルパへ渡せる。累計量は `RECORD_MAX_BYTES` で打ち切る。
     pub struct Recorder {
         inner: Mutex<RecorderState>,
-        /// 拒否フックへ渡す対象パス（`EscapeCase::denial_path`）。
-        denial_path: Option<&'static str>,
     }
 
     struct RecorderState {
@@ -700,9 +715,8 @@ mod linux {
     }
 
     impl Recorder {
-        fn new(writer: PipeWriter, denial_path: Option<&'static str>) -> Self {
+        fn new(writer: PipeWriter) -> Self {
             Recorder {
-                denial_path,
                 inner: Mutex::new(RecorderState {
                     writer,
                     written: 0,
@@ -731,15 +745,6 @@ mod linux {
                 let mut st = self.inner.lock().expect("recorder lock");
                 assert!(!st.outcome_written, "outcome must be recorded once");
                 st.outcome_written = true;
-            }
-            // 拒否フック: ハーネスが結果の errno から監査レコードを生成する（攻撃クロージャは関与しない）。
-            // フックが `None`（EACCES 以外）なら記録しない。構築・記録の失敗は panic で子の異常終了にする。
-            if let (Some(path), AttackOutcome::Errno(errno)) = (self.denial_path, outcome)
-                && let Some(record) = landlock_denial_record_now(Path::new(path), Some(errno))
-                    .unwrap_or_else(|e| panic!("build landlock record: {e:?}"))
-            {
-                self.record(&record)
-                    .unwrap_or_else(|e| panic!("record landlock denial: {e:?}"));
             }
             self.write_line(&format!("outcome={}", outcome.render()))
                 .expect("write outcome");
@@ -976,10 +981,9 @@ mod linux {
 
         let (reader, writer) = std::io::pipe().expect("create record pipe");
         let attack = case.attack;
-        let denial_path = case.denial_path;
         // 親側の writer 端は fork 時に閉じられる（クロージャは子にだけ残る）ため、子の終了で EOF になる。
         let child = spawn_container_probe(rootfs, (case.stages)(), move || {
-            let recorder = Recorder::new(writer, denial_path);
+            let recorder = Recorder::new(writer);
             attack(&recorder);
         })
         .unwrap_or_else(|e| panic!("spawn: {e}"));

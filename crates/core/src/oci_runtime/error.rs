@@ -136,7 +136,12 @@ impl OciRuntimeError {
         // （untrusted な巨大メッセージによるメモリ・CPU の浪費を防ぐ）。
         let mut message = String::with_capacity(raw.len().min(OCI_ERROR_MESSAGE_MAX_BYTES));
         for c in raw.chars() {
-            let c = if c.is_control() { ' ' } else { c };
+            // `is_control()` は U+2028 / U+2029（行・段落区切り）を含まないため明示的に置換する。
+            let c = if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            };
             if message.len() + c.len_utf8() > OCI_ERROR_MESSAGE_MAX_BYTES {
                 break;
             }
@@ -263,6 +268,17 @@ mod tests {
             "a\nb\r\x1b[31mc\0",
         );
         assert_eq!(e.message(), "a b  [31mc ");
+    }
+
+    /// ERR-2: U+2028 / U+2029（行・段落区切り）も空白へ置換される。
+    #[test]
+    fn err2_message_unicode_line_separators_are_replaced() {
+        let e = OciRuntimeError::new(
+            LifecycleOp::Create,
+            ErrorCode::Internal,
+            "a\u{2028}b\u{2029}c",
+        );
+        assert_eq!(e.message(), "a b c");
     }
 
     /// ERR-2: 上限超過は文字境界で切り詰められる。

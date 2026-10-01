@@ -176,6 +176,17 @@ impl InFlightGuard {
         counter.0.fetch_add(1, Ordering::SeqCst);
         Self(Arc::clone(counter))
     }
+
+    /// 未終了が 0 本のときに限り原子的に 1 本目を確保する（確認と取得を `compare_exchange` で不可分にする）。
+    ///
+    /// 同じ [`ProbeRunner`] への並行呼び出しでも、確保に成功するのは 1 呼び出しだけ（REPAIR-5）。
+    fn try_acquire_exclusive(counter: &Arc<InFlight>) -> Option<Self> {
+        counter
+            .0
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(Self(Arc::clone(counter)))
+    }
 }
 
 impl Drop for InFlightGuard {
@@ -214,15 +225,14 @@ impl ProbeRunner {
     /// （cancel が戻らなくても呼び出し側は戻る）。cancel 後は probe スレッドの終了を `timeout` まで待って回収を
     /// 試みる。終了しなかったスレッドは [`ProbeRunner::unfinished`] に残り、戻るまで次の判定を拒否する。
     fn run(&self, timeout: Duration) -> Result<HealthStatus, TraitError> {
-        if self.unfinished() > 0 {
+        let Some(guard) = InFlightGuard::try_acquire_exclusive(&self.in_flight) else {
             return Err(TraitError::new(
                 ErrorCode::Unavailable,
                 "previous healthcheck probe has not terminated",
             ));
-        }
+        };
         let (tx, rx) = mpsc::channel();
         let worker = Arc::clone(&self.probe);
-        let guard = InFlightGuard::acquire(&self.in_flight);
         std::thread::Builder::new()
             .name("healthcheck-probe".to_owned())
             .spawn(move || {
@@ -922,6 +932,33 @@ mod tests {
     }
 
     /// REPAIR-5: cancel が戻らなくても呼び出しは期限内に戻り、未終了のスレッドが次の判定を拒否する。
+    /// REPAIR-5: 同じ ProbeRunner への並行 run でも、確保に成功するのは 1 呼び出しだけ。
+    #[test]
+    fn repair5_task157_6_concurrent_acquire_admits_exactly_one() {
+        let counter = Arc::new(InFlight::default());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let c = Arc::clone(&counter);
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    let g = InFlightGuard::try_acquire_exclusive(&c);
+                    // 全スレッドの競合が終わるまでガードを保持する。
+                    std::thread::sleep(Duration::from_millis(100));
+                    g.is_some()
+                })
+            })
+            .collect();
+        let admitted = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(admitted, 1);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn repair5_task157_6_stuck_cancel_is_bounded_and_blocks_next_probe() {
         let store = healthy_store();

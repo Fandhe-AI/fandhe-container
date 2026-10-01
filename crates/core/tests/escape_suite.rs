@@ -2,7 +2,7 @@
 //!
 //! PoC-9（`03-poc/security-isolation`）で定めた最小攻撃セット ESC-01〜ESC-10 を CI 自動テストスイート
 //! として実装する TASK-42 の土台。各 ESC ケースは `linux::CASES` へ `EscapeCase` を 1 行追加するだけで
-//! 実装できる（ESC-01〜03 は #200〔実装済み〕、04〜06 は #201、07〜08 は #202、09〜10 は #203 で追加する）。
+//! 実装できる（ESC-01〜03 は #200、04〜06 は #201、07〜08 は #202、09〜10 は #203 で実装済み）。
 //!
 //! # ESC-01〜03（SEC-2・TASK-42.2・#200）の検証範囲と監査（SEC-4）の扱い（REPAIR-3）
 //! - ESC-01（ホスト FS 書き込み）: ホスト側に用意した canary ファイルへ、ホスト絶対パス・`/proc/1/root`・
@@ -29,6 +29,7 @@
 //! - 攻撃の結果: 許可された結果の集合（`Expectation::allowed`）に入るか。ESC-06 のようにシグナル終了を
 //!   期待するケースは `Expectation::signal` で指定する
 //! - 監査ログ: `AuditExpectation::Required(layer)` のケースは、そのレイヤーの記録が 0 件なら必ず失敗する。
+//!   `AuditExpectation::Deferred(layer)` は spec 上は要求するが本番の配送経路が未配線のため合否に使わない。
 //!   監査ログの本番配線（`AuditSink` を fork 後の子へ渡す経路）は未実装（REPAIR-3）のため、現状は攻撃
 //!   クロージャが記録ヘルパで作った記録は ESC-07 など一部ケースの暫定方式であり、ESC-10 は
 //!   `Deferred`（起動ステージ適用済みの子で追加の Landlock 適用をせず、ステージ自体の回帰を攻撃結果で検出）。
@@ -48,6 +49,32 @@
 //! （root / 非 root）で前提が成立しないケース（`LauncherRequirement`）は、そのケースだけを合格ではなく
 //! 「対象外」（`verdict=not-applicable`）として理由とビヘイビア ID を出力し、他のケースは実行する。AGENTS.md への
 //! 記載と CI での分離方式の確定は #204（TASK-42.6）で行う。
+//!
+//! # ESC-04〜ESC-06（TASK-42.3・#201・MS-2）
+//! - ESC-04（cgroup の `release_agent` 書き込み）・ESC-05（`/proc/sys`・`/proc/sysrq-trigger` 書き込み）は、
+//!   書き込み用に「開くだけ」で判定し 1 バイトも書かない（制限が欠けてもホストへ作用させないため）。
+//!   ESC-04 は対象（`sys/fs/cgroup/release_agent`）を rootfs に実在させ `Absent` を受理しない。ESC-04・05 とも
+//!   `linux.maskedPaths` / `readonlyPaths` が未適用のため、実機実行では本物の欠陥として失敗し得る（期待は変えない）。
+//!   適用範囲の限定: ESC-04 は rootfs 内の「通常の空ファイル」への書き込み拒否（`maskedPaths` / `readonlyPaths`
+//!   相当のパスマスク）だけを検証し、実際の cgroup v1 `release_agent`（v1 階層の mount 経路）は検証しない
+//!   （v1 の mount 拒否は `tests/seccomp.rs`、ホスト側根拠は `tests/cgroups_release_agent.rs`）。
+//!   ESC-04・05 とも `EROFS` はそれ自体を読み取り専用の証拠として受理し、ホスト側の権限拒否でも返る
+//!   `EPERM` / `EACCES` は、対象パスに実際に適用されるマウント（mountinfo の親子関係から特定する実効マウント）が
+//!   読み取り専用であるという証拠（`has_mask_evidence`）がある場合だけ受理する。拒否理由別のより厳密な判定と
+//!   実 cgroup v1 の安全な観測は REPAIR-12 の後続課題
+//! - ESC-06（禁止 syscall の SIGSYS 強制終了＋監査記録）: SIGSYS での強制終了は spec の期待どおり必須とする。
+//!   現行の CORE-5 フィルタは `ERRNO(EPERM)` を返して戻るため、実機実行では失敗する（fail-closed。期待は弱めない）。
+//! - ESC-06 の監査（SEC-4）は `AuditExpectation::Deferred("seccomp")` とし、合否に使わない（ESC-03 と同じ扱い）。
+//!   理由: 子が SIGSYS で終了すると子からは記録を書けず、親側で取得できる本番の監査経路がまだない。
+//!   既存の記録経路はどれも使えない。`ExecError::violation`（`IsolationViolation`）は親側の分離確立時の拒否だけを
+//!   表し、seccomp の種別を持たない。`record_seccomp_denial` は SIGSYS の siginfo（`si_syscall`・`si_arch`）か
+//!   USER_NOTIF の通知から作る報告を要するが、その配送元（TRAP の SIGSYS ハンドラ / supervisor の USER_NOTIF
+//!   listener）は未実装で、親が `waitpid` で得られるのは終了シグナルだけである。親側で記録を推測生成すると
+//!   監査の偽造になるため行わない。
+//! - 将来仕様（REPAIR-3）: フィルタのアクションを TRAP / USER_NOTIF へ変える設計判断と配送経路の配線
+//!   （`audit_log/seccomp_hook.rs`）の後に、その本番経路が出力した記録を親側で回収して照合する
+//!   `Required("seccomp")` へ切り替える。`SECCOMP_RET_KILL` 系では子が記録を書く前に終了するため、親側の
+//!   listener か TRAP ハンドラ内の記録が前提になる
 //!
 //! # ESC-09・ESC-10（TASK-42.5・#203）
 //! - `esc-09-userns-owner`（SEC-5）: コンテナ内 root が作成したファイルの所有者を、ディスパッチャ（分離なし・
@@ -70,6 +97,56 @@
 //! プローブ（syscall 本体は `sys` モジュール）を経由する。
 
 use std::fmt;
+
+/// errno / シグナル番号（asm-generic の値で x86_64・aarch64 とも共通）。
+const EPERM: i32 = 1;
+const EACCES: i32 = 13;
+const EROFS: i32 = 30;
+const SIGSYS: i32 = 31;
+
+/// ESC-04 が受理する結果（SEC-2・TASK-42.3・MS-2）（権限・読み取り専用による拒否のみ）。対象を rootfs に実在させて観測するため、
+/// 対象の不在（`Absent`）は「防御を検証できていない」ことを意味し、受理しない（SEC-2）。
+const ESC04_ALLOWED: &[AttackOutcome] = &[
+    AttackOutcome::Errno(EPERM),
+    AttackOutcome::Errno(EACCES),
+    AttackOutcome::Errno(EROFS),
+];
+
+/// ESC-05 が受理する結果（SEC-2・TASK-42.3・MS-2）（対象の不在・権限・読み取り専用による拒否）。
+const ESC05_ALLOWED: &[AttackOutcome] = &[
+    AttackOutcome::Absent,
+    AttackOutcome::Errno(EPERM),
+    AttackOutcome::Errno(EACCES),
+    AttackOutcome::Errno(EROFS),
+];
+
+/// ESC-04 の期待（SEC-2・TASK-42.3・MS-2。spec は監査記録を要求しない）。
+const ESC04_EXPECT: Expectation = Expectation {
+    allowed: ESC04_ALLOWED,
+    signal: None,
+    audit: AuditExpectation::None,
+};
+
+/// ESC-05 の期待（SEC-2・TASK-42.3・MS-2。spec は監査記録を要求しない）。
+const ESC05_EXPECT: Expectation = Expectation {
+    allowed: ESC05_ALLOWED,
+    signal: None,
+    audit: AuditExpectation::None,
+};
+
+/// ESC-06 の期待（SEC-2・SEC-4・TASK-42.3・MS-2）。SIGSYS での強制終了を要求する。
+///
+/// spec は seccomp 監査記録も要求するが、子が SIGSYS で終了した後に親側で取得できる本番の監査経路がまだ
+/// ないため、監査は `Deferred("seccomp")` とし合否に使わない（ESC-03 と同じ扱い。SEC-4・REPAIR-3）。
+/// 経路の配線後に `Required("seccomp")` へ切り替える（詳細はモジュール doc の ESC-04〜ESC-06 節）。
+const ESC06_EXPECT: Expectation = Expectation {
+    allowed: &[],
+    signal: Some(SIGSYS),
+    audit: AuditExpectation::Deferred("seccomp"),
+};
+
+/// ESC-06 が発行する禁止 syscall 名（`DeniedSyscall::ALL` の名前と一致していること）。
+const ESC06_PROBED: [&str; 3] = ["unshare", "ptrace", "kexec_load"];
 
 /// 攻撃操作の結果（子が観測した事実）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,6 +546,96 @@ fn sec2_task42_1_record_parser_selftest() {
     );
 }
 
+/// ESC-06 が発行する syscall 名が CORE-5 の禁止表に含まれることを照合する。
+fn sec2_task42_3_esc06_probed_names_in_deny_table() {
+    let names: Vec<&str> = fandhe_container_core::seccomp::DeniedSyscall::ALL
+        .iter()
+        .map(|d| d.name())
+        .collect();
+    for probed in ESC06_PROBED.iter() {
+        assert!(
+            names.contains(probed),
+            "SEC-2: ESC-06 syscall {probed} must be in DeniedSyscall::ALL"
+        );
+    }
+}
+
+/// ESC-04〜06 の期待が意図どおりに判定されること（現行実装の観測が失敗になることを含む）を具体値で照合する。
+fn sec2_task42_3_case_expectation_selftest() {
+    let obs = |exit, outcome, layers: &[&str]| Observation {
+        exit,
+        outcome,
+        audit_layers: layers.iter().map(|s| s.to_string()).collect(),
+    };
+    let ok_exit = ObservedExit::Exited(0);
+    for pass in [AttackOutcome::Absent, AttackOutcome::Errno(EACCES)] {
+        assert_eq!(
+            judge(&ESC05_EXPECT, &obs(ok_exit, Some(pass), &[])),
+            CaseVerdict::Pass
+        );
+    }
+    assert_eq!(
+        judge(
+            &ESC04_EXPECT,
+            &obs(ok_exit, Some(AttackOutcome::Errno(EROFS)), &[])
+        ),
+        CaseVerdict::Pass
+    );
+    // ESC-04 は対象が実在する前提のため、不在（防御を検証できていない）と書き込み成功は失敗になる。
+    for bad in [AttackOutcome::Absent, AttackOutcome::Succeeded] {
+        assert_eq!(
+            judge(&ESC04_EXPECT, &obs(ok_exit, Some(bad), &[])),
+            CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome { got: bad }])
+        );
+    }
+    assert_eq!(
+        judge(
+            &ESC05_EXPECT,
+            &obs(ok_exit, Some(AttackOutcome::Succeeded), &[])
+        ),
+        CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
+            got: AttackOutcome::Succeeded
+        }])
+    );
+    assert_eq!(
+        judge(
+            &ESC06_EXPECT,
+            &obs(ObservedExit::Signaled(31), None, &["seccomp"])
+        ),
+        CaseVerdict::Pass
+    );
+    // 監査は Deferred のため、SIGSYS 終了なら監査記録の有無にかかわらず合格（記録を合否に使わない。SEC-4）。
+    assert_eq!(
+        judge(
+            &ESC06_EXPECT,
+            &obs(ObservedExit::Signaled(SIGSYS), None, &[])
+        ),
+        CaseVerdict::Pass
+    );
+    // SIGSYS 以外のシグナル終了は失敗。
+    assert_eq!(
+        judge(&ESC06_EXPECT, &obs(ObservedExit::Signaled(9), None, &[])),
+        CaseVerdict::Fail(vec![Mismatch::UnexpectedExit {
+            got: ObservedExit::Signaled(9)
+        }])
+    );
+    // 現行実装（EPERM で戻り、SIGSYS で終了しない）は失敗として検出される。
+    assert_eq!(
+        judge(
+            &ESC06_EXPECT,
+            &obs(ok_exit, Some(AttackOutcome::Errno(EPERM)), &[])
+        ),
+        CaseVerdict::Fail(vec![
+            Mismatch::UnexpectedExit {
+                got: ObservedExit::Exited(0)
+            },
+            Mismatch::UnexpectedOutcome {
+                got: AttackOutcome::Errno(1)
+            },
+        ])
+    );
+}
+
 /// ESC-01: ホスト FS への書き込みは成功せず（ホスト側 canary 無変更）、readonly root への書き込みは EACCES（Landlock）。
 ///
 /// `landlock` 層の監査は配送経路未配線のため `Deferred`（SEC-4・REPAIR-3）。
@@ -574,13 +741,11 @@ fn sec2_task42_2_selftest() {
 }
 
 /// Linux asm-generic の errno 値（x86_64・aarch64 共通。syscall 番号ではないため arch 分岐は不要）。
-const EPERM: i32 = 1;
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 const ENOENT: i32 = 2;
-const EACCES: i32 = 13;
 const ETXTBSY: i32 = 26;
 
 /// ESC-07（SEC-2・TASK-42.4・#202）: ランタイムバイナリへの書き込み open の期待値。
@@ -692,6 +857,168 @@ fn sec2_task42_4_expectation_selftest() {
     );
 }
 
+/// `/proc/self/mountinfo` の 1 行のうち、実効マウントの特定に要る項目（REPAIR-12・SEC-2・TASK-42.3・MS-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MountEntry<'a> {
+    /// マウント ID（第 1 欄）。
+    id: &'a str,
+    /// 親マウントの ID（第 2 欄）。
+    parent: &'a str,
+    /// マウントポイント（第 5 欄。空白等は 8 進エスケープのまま比較する）。
+    mount_point: &'a str,
+    /// マウント単位のオプション（第 6 欄）に `ro` があるか。
+    read_only: bool,
+}
+
+/// mountinfo の 1 行を解析する。欄が足りない行は `None`。
+fn parse_mount_entry(line: &str) -> Option<MountEntry<'_>> {
+    let mut f = line.split(' ');
+    let id = f.next()?;
+    let parent = f.next()?;
+    let mount_point = f.nth(2)?;
+    let opts = f.next()?;
+    Some(MountEntry {
+        id,
+        parent,
+        mount_point,
+        read_only: opts.split(',').any(|o| o == "ro"),
+    })
+}
+
+/// `mount_point` が `path` 自身またはその祖先か（パス要素単位で比較する）。
+fn mount_covers(mount_point: &str, path: &str) -> bool {
+    mount_point == "/"
+        || mount_point == path
+        || path
+            .strip_prefix(mount_point)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// `path` に実際に適用されるマウント（パス解決で最後に到達するマウント）を mountinfo から特定する
+/// （REPAIR-12・SEC-2・TASK-42.3・MS-2）。
+///
+/// 親子関係（第 1・2 欄）を `/` から辿る。開始点は `/` のマウントのうち、別の `/` マウントの親になって
+/// いない最上段のもの。各段では、現在のマウントの子のうち `path` を覆うものの中で最も浅いマウントポイントの
+/// ものへ降りる（同じ親の下でより深い子は、浅い子が後から重なって隠れているため）。同じ深さは後の行
+/// （上に積まれた側）を採る。行の欠落・最上段が 1 件に定まらない・親子の循環など、特定できない場合は
+/// `None`（呼び出し側は証拠なしとして扱う。fail-closed）。
+fn effective_mount<'a>(mountinfo: &'a str, path: &str) -> Option<MountEntry<'a>> {
+    let mut entries = Vec::new();
+    for line in mountinfo.lines().filter(|l| !l.is_empty()) {
+        entries.push(parse_mount_entry(line)?);
+    }
+    let mut tops = entries.iter().filter(|e| {
+        e.mount_point == "/"
+            && !entries
+                .iter()
+                .any(|c| c.mount_point == "/" && c.parent == e.id && c.id != e.id)
+    });
+    let mut current = *tops.next()?;
+    if tops.next().is_some() {
+        return None;
+    }
+    // 1 段ごとに別のマウントへ降りるため、正常な入力なら件数以内で終わる（循環は打ち切って `None`）。
+    for _ in 0..entries.len() {
+        let next = entries
+            .iter()
+            .filter(|c| {
+                c.parent == current.id && c.id != current.id && mount_covers(c.mount_point, path)
+            })
+            .fold(None, |best: Option<&MountEntry<'a>>, c| match best {
+                Some(b) if b.mount_point.len() < c.mount_point.len() => Some(b),
+                _ => Some(c),
+            });
+        match next {
+            Some(n) => current = *n,
+            None => return Some(current),
+        }
+    }
+    None
+}
+
+/// `/proc/self/mountinfo` の内容から、`path` に `maskedPaths` / `readonlyPaths` が適用された証拠があるかを返す
+/// （REPAIR-12・SEC-2・TASK-42.3・MS-2）。
+///
+/// 証拠は「`path` に実際に適用されるマウント（[`effective_mount`]）が読み取り専用（`ro`）で、そのマウント
+/// ポイントが `path` 自身か `/`・`/proc`・`/sys` 以外の祖先であること」。rw マウントは対象自身へのものでも
+/// 証拠にせず、読み取り専用の祖先マウントがあっても、より深い書き込み可能なマウントが重なっていれば証拠に
+/// しない。ホスト側の権限拒否（EPERM / EACCES）だけで防御ありと誤判定しないために、攻撃結果とは独立に
+/// この証拠を確認する。
+fn has_mask_evidence(mountinfo: &str, path: &str) -> bool {
+    effective_mount(mountinfo, path)
+        .is_some_and(|m| m.read_only && !["/", "/proc", "/sys"].contains(&m.mount_point))
+}
+
+/// `has_mask_evidence` の期待値を具体値で照合する（REPAIR-12・SEC-2・TASK-42.3・MS-2）。
+fn sec2_task42_3_mask_evidence_selftest() {
+    // 共通の土台: rootfs（ID 30）の上に proc（ID 40）。
+    let base = "30 20 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n\
+                40 30 0:30 / /proc rw,nosuid - proc proc rw\n";
+    let with = |extra: &str| format!("{base}{extra}");
+    let core = "/proc/sys/kernel/core_pattern";
+    let sysrq = "/proc/sysrq-trigger";
+
+    // 実効マウントの特定。
+    assert_eq!(
+        effective_mount(base, core).map(|m| (m.id, m.mount_point)),
+        Some(("40", "/proc"))
+    );
+    let ro_sys = with("41 40 0:30 /sys /proc/sys ro,nosuid - proc proc rw\n");
+    assert_eq!(
+        effective_mount(&ro_sys, core).map(|m| (m.id, m.read_only)),
+        Some(("41", true))
+    );
+
+    // readonlyPaths 相当（`/proc/sys` の ro）は配下の証拠になる。対象外のパスには及ばない。
+    assert!(has_mask_evidence(&ro_sys, core));
+    assert!(!has_mask_evidence(&ro_sys, sysrq));
+    // maskedPaths 相当（対象自身への ro マウント）は証拠。rw なら証拠にしない。
+    let mask = with("42 40 0:6 /null /proc/sysrq-trigger ro - devtmpfs dev rw\n");
+    let mask_rw = with("42 40 0:6 /null /proc/sysrq-trigger rw - devtmpfs dev rw\n");
+    assert!(has_mask_evidence(&mask, sysrq));
+    assert!(!has_mask_evidence(&mask_rw, sysrq));
+    // rw の `/proc` だけ・空入力は証拠なし。
+    assert!(!has_mask_evidence(base, core));
+    assert!(!has_mask_evidence("", sysrq));
+
+    // ro の祖先にさらに深い rw マウントが重なると、実効マウントは rw なので証拠にしない。
+    let ro_then_rw_deeper = with(
+        "41 40 0:30 /sys /proc/sys ro - proc proc rw\n43 41 0:31 / /proc/sys/kernel rw - tmpfs t rw\n",
+    );
+    assert_eq!(
+        effective_mount(&ro_then_rw_deeper, core).map(|m| m.id),
+        Some("43")
+    );
+    assert!(!has_mask_evidence(&ro_then_rw_deeper, core));
+    // より深い側も ro なら証拠になる。
+    let ro_then_ro_deeper = with(
+        "41 40 0:30 /sys /proc/sys ro - proc proc rw\n43 41 0:31 / /proc/sys/kernel ro - tmpfs t rw\n",
+    );
+    assert!(has_mask_evidence(&ro_then_ro_deeper, core));
+    // 同じマウントポイントへ積み重ねた場合は上（後の行・前の行を親に持つ側）が実効。
+    let ro_under_rw = with(
+        "41 40 0:30 /sys /proc/sys ro - proc proc rw\n44 41 0:30 /sys /proc/sys rw - proc proc rw\n",
+    );
+    let rw_under_ro = with(
+        "41 40 0:30 /sys /proc/sys rw - proc proc rw\n44 41 0:30 /sys /proc/sys ro - proc proc rw\n",
+    );
+    assert!(!has_mask_evidence(&ro_under_rw, core));
+    assert!(has_mask_evidence(&rw_under_ro, core));
+    // rootfs 上の `/proc/sys`（ro）が後から重なった `/proc` に隠れた場合は、隠れた ro を証拠にしない。
+    let hidden = "30 20 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                  41 30 0:30 /sys /proc/sys ro - proc proc rw\n\
+                  40 30 0:30 / /proc rw - proc proc rw\n";
+    assert_eq!(effective_mount(hidden, core).map(|m| m.id), Some("40"));
+    assert!(!has_mask_evidence(hidden, core));
+    // `/` 自体の ro（readonly root）は対象を絞ったマスクではないため証拠にしない。
+    let ro_root = "30 20 8:1 / / ro - ext4 /dev/sda1 rw\n";
+    assert!(!has_mask_evidence(ro_root, "/sys/fs/cgroup/release_agent"));
+    // 特定できない入力（欄の欠落・最上段の `/` が 2 件）は証拠なし（fail-closed）。
+    assert_eq!(effective_mount("30 20 8:1", core), None);
+    let two_roots = "30 20 8:1 / / ro - ext4 a ro\n31 21 8:2 / / ro - ext4 b ro\n";
+    assert_eq!(effective_mount(two_roots, core), None);
+}
+
 /// ケースが前提とする起動ユーザー（ディスパッチャ＝分離前のホスト側プロセスの実効 UID）。
 ///
 /// 起動ユーザーで前提が成立しないケースは、スイート全体を失敗させずにそのケースだけを「対象外」として
@@ -760,6 +1087,9 @@ fn always() {
     sec2_task42_1_judge_selftest();
     sec2_task42_1_record_parser_selftest();
     sec2_task42_2_selftest();
+    sec2_task42_3_esc06_probed_names_in_deny_table();
+    sec2_task42_3_case_expectation_selftest();
+    sec2_task42_3_mask_evidence_selftest();
     sec2_task42_4_expectation_selftest();
     sec2_task42_5_launcher_selftest();
     println!("escape_suite: SEC-2 judge and record parser verified");
@@ -818,9 +1148,9 @@ mod linux {
         AuditDelivery, AuditRecord, AuditSink, encode_json_line, landlock_denial_record_now,
     };
     use fandhe_container_core::exec::{
-        ChildExit, IsolationConfig, Namespace, NamespaceSet, ProbeOutcome, StagePipeline,
-        escape_probe_mount, isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
-        spawn_container_probe,
+        ChildExit, EscapeSyscallProbe, IsolationConfig, Namespace, NamespaceSet, ProbeOutcome,
+        StagePipeline, escape_probe_mount, isolate, isolate_rootful_host_root, plan,
+        plan_rootful_host_root, probe_escape_syscall, spawn_container_probe,
     };
     use fandhe_container_core::landlock::{detect_landlock_abi, path_rules_from_config};
     use fandhe_container_core::oci_runtime::{audit_mount_config_error, parse_config_bytes};
@@ -828,10 +1158,14 @@ mod linux {
 
     use super::{
         AttackOutcome, AuditExpectation, CaseVerdict, ENOENT, ESC01_EXPECTATION, ESC02_EXPECTATION,
-        ESC03_EXPECTATION, ESC07_LANDLOCK_EXPECT, ESC07_WRITE_EXPECT, ESC08_EXPECT, ESC09_LAUNCHER,
-        Expectation, LauncherRequirement, Mismatch, NotApplicable, Observation, ObservedExit,
-        RECORD_MAX_BYTES, classify_pid_view, judge, launcher_applicability, parse_record,
+        ESC03_EXPECTATION, ESC04_EXPECT, ESC05_EXPECT, ESC06_EXPECT, ESC07_LANDLOCK_EXPECT,
+        ESC07_WRITE_EXPECT, ESC08_EXPECT, ESC09_LAUNCHER, Expectation, LauncherRequirement,
+        Mismatch, NotApplicable, Observation, ObservedExit, RECORD_MAX_BYTES, classify_pid_view,
+        judge, launcher_applicability, parse_record,
     };
+
+    /// ESC-04 の攻撃対象（rootfs 内の相対パス）。rootfs 作成時に実在させる（`make_rootfs`）。
+    const ESC04_TARGET_REL: [&str; 4] = ["sys", "fs", "cgroup", "release_agent"];
 
     /// 子（コンテナ内）で攻撃を実行するクロージャの型。結果は `Recorder` へ書く。
     ///
@@ -867,8 +1201,7 @@ mod linux {
         is_root: bool,
     }
 
-    /// 登録済みケース。対照ケースと ESC-01〜03（#200）・ESC-07〜08（#202）・ESC-09〜10（#203）。
-    /// ESC-04〜06 は #201 で追加する。
+    /// 登録済みケース。対照ケースと ESC-01〜03（#200）・ESC-04〜06（#201）・ESC-07〜08（#202）・ESC-09〜10（#203）。
     const CASES: &[EscapeCase] = &[
         EscapeCase {
             id: "control-read-proc",
@@ -949,6 +1282,60 @@ mod linux {
             expectation: ESC03_EXPECTATION,
             stages: StagePipeline::new,
             attack: attack_esc03_cap_sys_admin_mount,
+            precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
+        },
+        EscapeCase {
+            id: "esc-04-release-agent",
+            expectation: ESC04_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc04_release_agent,
+            precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
+        },
+        EscapeCase {
+            id: "esc-05-proc-sys-core-pattern",
+            expectation: ESC05_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc05_proc_sys_core_pattern,
+            precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
+        },
+        EscapeCase {
+            id: "esc-05-sysrq-trigger",
+            expectation: ESC05_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc05_sysrq_trigger,
+            precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
+        },
+        EscapeCase {
+            id: "esc-06-unshare",
+            expectation: ESC06_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc06_unshare,
+            precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
+        },
+        EscapeCase {
+            id: "esc-06-ptrace",
+            expectation: ESC06_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc06_ptrace,
+            precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
+        },
+        EscapeCase {
+            id: "esc-06-kexec-load",
+            expectation: ESC06_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc06_kexec_load,
             precondition: no_precondition,
             host_check: None,
             launcher: LauncherRequirement::Any,
@@ -1343,6 +1730,109 @@ mod linux {
         rec.outcome(outcome);
     }
 
+    /// 書き込み用に開くだけ（`create` / `truncate` / `append` なし・1 バイトも書かない）で拒否を観測する。
+    /// EPERM / EACCES はマスク・読み取り専用の適用証拠（`has_mask_evidence`）が無ければ `Failed` とする（REPAIR-12）。
+    /// 開けた場合は即 drop して `Succeeded`（＝制限の欠落）を返す。ホストのカーネルへ作用させないための設計。
+    fn open_write_only(path: &str) -> AttackOutcome {
+        let outcome = open_write_raw(path);
+        // EPERM / EACCES はホスト側の権限拒否でも起こるため、マスク・読み取り専用の適用証拠が無ければ
+        // 防御の効果とみなさず `Failed`（受理されない）にする（REPAIR-12。EROFS は読み取り専用そのものの証拠）。
+        if matches!(
+            outcome,
+            AttackOutcome::Errno(super::EPERM) | AttackOutcome::Errno(super::EACCES)
+        ) {
+            let applied =
+                read_mountinfo_bounded().is_some_and(|m| super::has_mask_evidence(&m, path));
+            if !applied {
+                return AttackOutcome::Failed;
+            }
+        }
+        outcome
+    }
+
+    /// `/proc/self/mountinfo` の読み出し上限（コンテナ内のマウント表には十分な大きさ）。
+    const MOUNTINFO_MAX_BYTES: u64 = 1024 * 1024;
+
+    /// `/proc/self/mountinfo` を上限付きで読む。読めない・上限を超える場合は `None`
+    /// （呼び出し側は証拠なしとして扱う。fail-closed）。
+    fn read_mountinfo_bounded() -> Option<String> {
+        let file = std::fs::File::open("/proc/self/mountinfo").ok()?;
+        let mut text = String::new();
+        file.take(MOUNTINFO_MAX_BYTES + 1)
+            .read_to_string(&mut text)
+            .ok()?;
+        (text.len() as u64 <= MOUNTINFO_MAX_BYTES).then_some(text)
+    }
+
+    /// 書き込み用に開くだけの生の結果（`open_write_only` の下請け）。
+    fn open_write_raw(path: &str) -> AttackOutcome {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(file) => {
+                drop(file);
+                AttackOutcome::Succeeded
+            }
+            Err(e) => match e.raw_os_error() {
+                Some(ENOENT) => AttackOutcome::Absent,
+                Some(n) => AttackOutcome::Errno(n),
+                None => AttackOutcome::Failed,
+            },
+        }
+    }
+
+    /// ESC-04（SEC-2・TASK-42.3・#201・MS-2）: cgroup v1 の `release_agent` への書き込み。
+    /// 対象は rootfs 作成時に実在させる（`make_rootfs` が `sys/fs/cgroup/release_agent` を空ファイルで置く。
+    /// ホストの cgroup は触らない）。そのため `ENOENT`（`Absent`）は受理せず、`EPERM` / `EACCES` / `EROFS` の
+    /// 拒否だけを期待する。拒否の本番実装（`linux.readonlyPaths` / `maskedPaths` 適用）は未実装（REPAIR-3）のため、
+    /// 現行の実機実行では書き込み用に開けて失敗する（ESC-05 と同様に本物の欠陥として検出。期待は変えない）。
+    /// v1 階層の新規 mount の拒否は seccomp の `mount` 拒否（`tests/seccomp.rs`）、ホスト側の根拠は
+    /// `tests/cgroups_release_agent.rs`（TASK-35）にある。
+    fn attack_esc04_release_agent(rec: &Recorder, _host_canary: &Path) {
+        rec.outcome(open_write_only("/sys/fs/cgroup/release_agent"));
+    }
+
+    /// ESC-05（SEC-2・TASK-42.3・#201・MS-2）: マスク対象 `/proc/sys` 配下（`core_pattern`）への書き込み。
+    /// `maskedPaths` 未適用のため rootful では開けてしまい得る（本物の欠陥の検出。期待は変えない）。
+    fn attack_esc05_proc_sys_core_pattern(rec: &Recorder, _host_canary: &Path) {
+        rec.outcome(open_write_only("/proc/sys/kernel/core_pattern"));
+    }
+
+    /// ESC-05（SEC-2・TASK-42.3・#201・MS-2）: `/proc/sysrq-trigger` への書き込み。開くだけで書かない。
+    fn attack_esc05_sysrq_trigger(rec: &Recorder, _host_canary: &Path) {
+        rec.outcome(open_write_only("/proc/sysrq-trigger"));
+    }
+
+    /// `ProbeOutcome` を攻撃結果へ写す。
+    fn probe_to_attack(p: ProbeOutcome) -> AttackOutcome {
+        match p {
+            ProbeOutcome::Ok => AttackOutcome::Succeeded,
+            ProbeOutcome::Errno(n) => AttackOutcome::Errno(n),
+            _ => AttackOutcome::Failed,
+        }
+    }
+
+    /// ESC-06（SEC-2・TASK-42.3・#201・MS-2）: `unshare(0)`（副作用なし）。期待は spec どおり SIGSYS 終了。
+    /// 戻ってきた場合（現行は EPERM）は結果を記録し、判定側が失敗にする。seccomp 監査は親側の本番経路が
+    /// 未配線のため `Deferred`（SEC-4・REPAIR-3）で、攻撃側で監査レコードを作らない（偽造しない）。
+    fn attack_esc06_unshare(rec: &Recorder, _host_canary: &Path) {
+        rec.outcome(probe_to_attack(probe_escape_syscall(
+            EscapeSyscallProbe::Unshare,
+        )));
+    }
+
+    /// ESC-06: `ptrace(PTRACE_CONT, 自 pid)`（attach を伴わず副作用なし）。期待は `attack_esc06_unshare` と同じ。
+    fn attack_esc06_ptrace(rec: &Recorder, _host_canary: &Path) {
+        rec.outcome(probe_to_attack(probe_escape_syscall(
+            EscapeSyscallProbe::Ptrace,
+        )));
+    }
+
+    /// ESC-06: segment 数上限超過の `kexec_load`（ロードに至らない）。期待は `attack_esc06_unshare` と同じ。
+    fn attack_esc06_kexec_load(rec: &Recorder, _host_canary: &Path) {
+        rec.outcome(probe_to_attack(probe_escape_syscall(
+            EscapeSyscallProbe::KexecLoad,
+        )));
+    }
+
     /// 子側の記録器。攻撃結果を 1 回だけ、監査レコードを 0 件以上、pipe へ書く。`AuditSink` として
     /// 既存の記録ヘルパへ渡せる。累計量は `RECORD_MAX_BYTES` で打ち切る。
     pub struct Recorder {
@@ -1441,7 +1931,7 @@ mod linux {
         }
     }
 
-    /// `proc/` だけを持つ rootfs を排他的に作る（推測されにくい名前・`mkdir` は既存なら失敗）。
+    /// `proc/` と ESC-04 の攻撃対象（`sys/fs/cgroup/release_agent`）を持つ rootfs を排他的に作る（推測されにくい名前・`mkdir` は既存なら失敗）。
     fn make_rootfs() -> Rootfs {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1455,6 +1945,13 @@ mod linux {
         std::fs::set_permissions(&rootfs.0, std::fs::Permissions::from_mode(0o755))
             .expect("chmod rootfs dir");
         std::fs::create_dir(rootfs.0.join("proc")).expect("create rootfs/proc");
+        // ESC-04 の攻撃対象を rootfs 内に実在させる（ENOENT で防御を検証できないことを避ける）。
+        let target = ESC04_TARGET_REL
+            .iter()
+            .fold(rootfs.0.clone(), |p, c| p.join(c));
+        let dir = target.parent().expect("release_agent has a parent dir");
+        std::fs::create_dir_all(dir).expect("create rootfs/sys/fs/cgroup");
+        std::fs::write(&target, b"").expect("create rootfs release_agent stand-in");
         rootfs
     }
 

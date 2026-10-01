@@ -809,7 +809,7 @@ verify_stats "docker-median-odd(3)" "$docker_json"
 # warmup 込み 4 回: image inspect -> 事前の一覧 -> (run -> 後始末の一覧) x 4。rm は送られない。
 expect_eq "docker-ok-call-sequence" "image ps run ps run ps run ps run ps" "$(dlog_cmds)"
 run_line="$(grep '^run ' "$dstub_log" | head -n 1)"
-if [[ "$run_line" =~ ^run\ --rm\ --pull\ never\ --cidfile\ /[^\ ]+/cid-[0-9]+\ --name\ fandhe-startup-[A-Za-z0-9]+-[0-9]+-[0-9]+\ --label\ fandhe\.startup-latency\.run=[A-Za-z0-9]+\ alpine:3\.20\ true$ ]]; then
+if [[ "$run_line" =~ ^run\ --rm\ --pull\ never\ --cidfile\ /[^\ ]+/cid-[0-9]+\ --name\ fandhe-startup-[A-Za-z0-9]+-[0-9]+-[0-9]+\ --label\ fandhe\.startup-latency\.run=[A-Za-z0-9]+\ --entrypoint\ true\ alpine:3\.20$ ]]; then
   pass "docker-ok-run-argv"
 else
   fail "docker-ok-run-argv ($run_line)"
@@ -829,7 +829,7 @@ expect_eq "docker-output-equals-stdout" "$last_stdout" "$(cat "$docker_out")"
 reset_dlog
 expect_rc "docker-image-custom" 0 --runtime "$dstub" --iterations 1 --warmup 0 --image alpine:3.19
 expect_eq "docker-image-custom-param" "alpine:3.19" "$(jq -r '.params.image' <<<"$last_stdout")"
-if grep -q '^run .* alpine:3\.19 true$' "$dstub_log"; then pass "docker-image-custom-argv"; else fail "docker-image-custom-argv"; fi
+if grep -q '^run .* --entrypoint true alpine:3\.19$' "$dstub_log"; then pass "docker-image-custom-argv"; else fail "docker-image-custom-argv"; fi
 reset_dlog
 DSTUB_MODE=image-missing expect_rc "docker-image-missing" 1 --runtime "$dstub" --iterations 1 --warmup 0
 expect_contains "docker-image-missing-error" "image-not-present"
@@ -911,10 +911,10 @@ default_args=()
 own_fixture="$work/own-fixture.json"
 docker_fixture="$work/docker-fixture.json"
 cat >"$own_fixture" <<'JSON'
-{"schema_version":1,"benchmark":"startup_latency","mode":"oci","method":"create-to-exec-observed","target":"own","label":"own","params":{"iterations":3,"warmup":1,"timeout_secs":10},"samples_us":[{"total_us":240000}],"metrics":{"startup_latency_p50_ms":{"value":240,"unit":"ms"},"startup_latency_min_ms":{"value":230,"unit":"ms"},"startup_latency_max_ms":{"value":250,"unit":"ms"}}}
+{"schema_version":1,"benchmark":"startup_latency","mode":"oci","method":"create-to-exec-observed","target":"own","label":"own","params":{"iterations":3,"warmup":1,"timeout_secs":10},"samples_us":[{"total_us":230000},{"total_us":240000},{"total_us":250000}],"metrics":{"startup_latency_p50_ms":{"value":240,"unit":"ms"},"startup_latency_min_ms":{"value":230,"unit":"ms"},"startup_latency_max_ms":{"value":250,"unit":"ms"}}}
 JSON
 cat >"$docker_fixture" <<'JSON'
-{"schema_version":1,"benchmark":"startup_latency","mode":"docker","method":"docker-run-rm-total","target":"docker","label":"docker","params":{"iterations":3,"warmup":1,"timeout_secs":10,"image":"alpine:3.20"},"samples_us":[{"run_us":300000,"total_us":300000}],"metrics":{"startup_latency_p50_ms":{"value":300,"unit":"ms"},"startup_latency_min_ms":{"value":290,"unit":"ms"},"startup_latency_max_ms":{"value":310,"unit":"ms"}}}
+{"schema_version":1,"benchmark":"startup_latency","mode":"docker","method":"docker-run-rm-total","target":"docker","label":"docker","params":{"iterations":3,"warmup":1,"timeout_secs":10,"image":"alpine:3.20"},"samples_us":[{"run_us":290000,"total_us":290000},{"run_us":300000,"total_us":300000},{"run_us":310000,"total_us":310000}],"metrics":{"startup_latency_p50_ms":{"value":300,"unit":"ms"},"startup_latency_min_ms":{"value":290,"unit":"ms"},"startup_latency_max_ms":{"value":310,"unit":"ms"}}}
 JSON
 expect_rc "report-ok" 0 --mode report --own-result "$own_fixture" --docker-result "$docker_fixture"
 report_json="$last_stdout"
@@ -948,6 +948,18 @@ jq '.method = "create-to-exec-observed"' "$docker_fixture" >"$work/bad-method-do
 expect_rc "report-method-forged-docker" 2 --mode report --own-result "$own_fixture" --docker-result "$work/bad-method-docker.json"
 jq '.method = "other"' "$own_fixture" >"$work/bad-method-other.json"
 expect_rc "report-method-unknown" 2 --mode report --own-result "$work/bad-method-other.json" --docker-result "$docker_fixture"
+# samples_us と整合しない p50・件数不一致・不正なサンプルは拒否する（p50 だけの書き換えを防ぐ）。
+jq '.metrics.startup_latency_p50_ms.value = 1' "$own_fixture" >"$work/bad-p50-forged.json"
+expect_rc "report-p50-forged" 2 --mode report --own-result "$work/bad-p50-forged.json" --docker-result "$docker_fixture"
+expect_contains "report-p50-forged-error" "invalid-result"
+jq '.params.iterations = 5' "$docker_fixture" >"$work/bad-iter-count.json"
+expect_rc "report-iterations-mismatch" 2 --mode report --own-result "$own_fixture" --docker-result "$work/bad-iter-count.json"
+jq '.samples_us = []' "$own_fixture" >"$work/bad-samples-empty.json"
+expect_rc "report-samples-empty" 2 --mode report --own-result "$work/bad-samples-empty.json" --docker-result "$docker_fixture"
+jq '.samples_us[0].total_us = "x"' "$own_fixture" >"$work/bad-sample-type.json"
+expect_rc "report-sample-nonnumber" 2 --mode report --own-result "$work/bad-sample-type.json" --docker-result "$docker_fixture"
+jq '.metrics.startup_latency_max_ms.value = 999' "$docker_fixture" >"$work/bad-max-forged.json"
+expect_rc "report-max-forged" 2 --mode report --own-result "$own_fixture" --docker-result "$work/bad-max-forged.json"
 jq '.metrics.startup_latency_p50_ms.value = 0' "$own_fixture" >"$work/bad-zero.json"
 expect_rc "report-p50-zero" 2 --mode report --own-result "$work/bad-zero.json" --docker-result "$docker_fixture"
 jq 'del(.metrics.startup_latency_p50_ms)' "$docker_fixture" >"$work/bad-missing.json"

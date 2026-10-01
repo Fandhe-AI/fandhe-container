@@ -403,7 +403,7 @@ fio-baseline-ratio: ## fio ベースライン比を算出する（BASELINE/CANDI
 # 提供後に人間が #213（TASK-46.h1）で行う実機前提（ランタイム・bundle・場合により root）
 # のため `make ci` には含めない。自己テストはスタブランタイムで完結し CI に組み込み済み
 # （計測スクリプトが単調時計として /proc/uptime を使うため Linux 限定）。
-# `startup-latency-docker` は同じスクリプトの `--mode docker` で `docker run --rm ... true` の
+# `startup-latency-docker` は同じスクリプトの `--mode docker` で `docker run --rm ... --entrypoint true <image>` の
 # 全体時間を計測し（TASK-46.2。Docker は実機前提・イメージは事前に手動 pull）、
 # `startup-latency-report` は own と Docker の結果を 1 つのレポートに統合する。両者の計測区間は
 # 異なり（method / methods_differ に明示）、合否判定は #213（TASK-46.h1）で人間が行う。

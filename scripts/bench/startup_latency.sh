@@ -45,7 +45,8 @@
 #
 # モード（--mode。既定 oci。TASK-46.2・CORE-10）:
 #   oci:    上記の own（OCI Runtime CLI 契約）計測。method = "create-to-exec-observed"。
-#   docker: `docker run --rm --pull never ... <image> true` 全体の壁時計時間を計測する
+#   docker: `docker run --rm --pull never ... --entrypoint true <image>` 全体の壁時計時間を計測する
+#           （イメージの ENTRYPOINT は `--entrypoint true` で明示的に上書きし、固定ワークロードを保つ）
 #           （spec の Docker ベースライン 0.290〜0.298 秒と同じ手法）。method = "docker-run-rm-total"。
 #           --runtime は docker CLI の絶対パス。イメージは事前にローカルへ用意する（自動 pull
 #           しない）。実行コマンドは `true` に固定する。
@@ -601,7 +602,7 @@ finish_container_within_deadline() {
 readonly DOCKER_LABEL_KEY="fandhe.startup-latency.run"
 # 計測対象。--pull never はイメージ未取得時に暗黙の pull（ネットワーク・計測の歪み）をさせない。
 # 実行コマンドは `true` に固定し、任意コマンドを受け付けない。引数: <log> <cidfile> <name>
-dk_run() { run_rt "$1" "$1" run --rm --pull never --cidfile "$2" --name "$3" --label "$DOCKER_LABEL_KEY=$run_tag" "$image" true; }
+dk_run() { run_rt "$1" "$1" run --rm --pull never --cidfile "$2" --name "$3" --label "$DOCKER_LABEL_KEY=$run_tag" --entrypoint true "$image"; }
 # 所有を証明した ID（cidfile の 64 桁 16 進）だけに送る。引数: <log> <cid>
 dk_rm() { run_rt "$1" "$1" rm -f "$2"; }
 # この実行のラベルが付いた全コンテナ ID（停止中を含む）。引数: <stdout> <stderr>
@@ -820,7 +821,7 @@ measure_once() {
 }
 
 # docker モードの 1 回分の計測。成功すると total_us・run_us（同値）を設定する。引数: <id> <cidfile>
-# 計測区間は `docker run --rm ... true` 全体の壁時計時間（spec のベースラインと同じ手法）。
+# 計測区間は `docker run --rm ... --entrypoint true <image>` 全体の壁時計時間（spec のベースラインと同じ手法）。
 # oci モードの区間（create 直前から実行開始の観測まで）とは異なる（冒頭「モード」参照）。
 # 失敗（run の非ゼロ終了・タイムアウト・時計の変更）は非ゼロを返し、後始末は cleanup が担う。
 measure_once_docker() {
@@ -923,8 +924,26 @@ load_result_file() {
         and (.metrics.startup_latency_p50_ms.value | type) == "number"
         and .metrics.startup_latency_p50_ms.value > 0
         and .metrics.startup_latency_p50_ms.unit == "ms")
-      then . else error("unexpected result schema") end' "$f" 2>/dev/null)"; then
-    err "invalid-result" "$opt is not a valid startup_latency result with mode=$want method=$want_method (schema_version 1, positive p50 in ms)"
+      then . else error("unexpected result schema") end
+    # samples_us と params.iterations・metrics の整合を検証する（p50 だけ書き換えた入力を拒否する）。
+    # p50・min・max は samples_us の total_us から再計算し、1e-6 ms 以上の差は不一致とする。
+    | (.params.iterations) as $it
+    | ([.samples_us[]? | .total_us]) as $raw
+    | if (.samples_us | type) == "array" and ($it | type) == "number" and $it == ($it | floor)
+        and $it >= 1 and $it <= 1000 and ($raw | length) == $it
+        and ($raw | all(type == "number" and . > 0))
+      then ($raw | sort) as $t
+        | ($t | length) as $n
+        | (if $n % 2 == 1 then $t[($n - 1) / 2] else ($t[$n / 2 - 1] + $t[$n / 2]) / 2 end) as $p50
+        | def near($a; $b): (($a - $b) | if . < 0 then -. else . end) < 0.000001;
+          if (.metrics.startup_latency_min_ms.value | type) == "number"
+            and (.metrics.startup_latency_max_ms.value | type) == "number"
+            and near(.metrics.startup_latency_p50_ms.value; $p50 / 1000)
+            and near(.metrics.startup_latency_min_ms.value; $t[0] / 1000)
+            and near(.metrics.startup_latency_max_ms.value; $t[$n - 1] / 1000)
+          then . else error("metrics do not match samples_us") end
+      else error("samples_us inconsistent with params.iterations") end' "$f" 2>/dev/null)"; then
+    err "invalid-result" "$opt is not a valid startup_latency result with mode=$want method=$want_method (schema_version 1, positive p50 in ms, samples_us count equal to params.iterations, p50/min/max recomputed from samples_us)"
     exit "$EXIT_INPUT"
   fi
   printf '%s' "$obj"

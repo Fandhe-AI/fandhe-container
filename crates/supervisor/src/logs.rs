@@ -11,10 +11,15 @@
 //! - [`LogSink::append`] が失敗しても読み取りは EOF まで続けて破棄する（読みを止めるとパイプが詰まり、
 //!   コンテナ側の write がブロックするため）。最初のエラーコードだけを [`StreamSummary::error_code`] に残す。
 //! - [`LogCapture::drain`] は期限付き（REPAIR-5）。期限切れ（孫プロセスがパイプを保持し続ける場合等）では
-//!   ブロック中の `Read` を外から中断する汎用手段がないため、リーダースレッドは切り離される。ただし取消しフラグを立てるので、
-//!   現在の `read` が戻った時点で sink へ追記せずにスレッドとストリームを解放して終了する。
-//!   `read` が戻らない間に残るスレッド数は[`ReaderBudget`]（既定 [`MAX_LIVE_READERS`]）で制限し、超える開始は `Unavailable` で拒否する
-//!   （孫プロセスがパイプを保持する場合の無制限なスレッド・ストリーム蓄積の防止。REPAIR-5）。
+//!   ブロック中の `Read` を外から中断する汎用手段がないため、リーダースレッドは切り離される。
+//!   `drain` は `Err` を返す全経路（期限切れ・溢れる timeout・リーダーの異常終了）で、返る前に捕捉を取り消す。
+//!   取消しは sink への追記と排他で、`drain` が `Err` を返した後は sink へ 1 行も追記されない。
+//!   リーダーは現在の `read` が戻った時点でスレッドとストリームを解放して終了する。
+//! - `read` が戻らない間に残るスレッド数は [`ReaderBudget`]（上限 [`MAX_LIVE_READERS`] 以下）で制限し、超える開始は
+//!   `Unavailable` で拒否する（孫プロセスがパイプを保持する場合の無制限なスレッド・ストリーム蓄積の防止。REPAIR-5）。
+//!   予算は省略できない: [`OutputStreams`] は [`ReaderBudget`] を渡さないと作れず、既定の予算を暗黙に作る経路は無い。
+//!   呼び出し側（supervisor プロセス）は予算を 1 つだけ作り、再起動・再捕捉をまたいで同じものを渡す
+//!   （捕捉ごとに作り直すと残存リーダーが数えられない）。
 //! - ストリームの所有権は捕捉側へ移る。監視の引き継ぎ時に再注入はできない（引き継ぎは #239・TASK-164 で扱う）。
 //! - OS 固有型（fd / HANDLE）は公開せず `Read` のみを受ける（CLI-1）。グローバル状態は持たない（CORE-1・D-19）。
 //!
@@ -33,7 +38,7 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
@@ -44,11 +49,17 @@ pub const MAX_LINE_BYTES: usize = 64 * 1024;
 /// 1 回の読み取りに使う固定バッファのバイト数。
 pub const READ_CHUNK_BYTES: usize = 8 * 1024;
 
-/// 生存中のリーダースレッド数の上限（drain 期限切れ後に `read` でブロックし続けるスレッドの蓄積防止）。
+/// 生存中のリーダースレッド数の上限の最大値（drain 期限切れ後に `read` でブロックし続けるスレッドの蓄積防止）。
+/// [`ReaderBudget`] の上限はこの値を超えられない。
 pub const MAX_LIVE_READERS: usize = 64;
 
-/// 生存中のリーダースレッド数の予算。呼び出し側が所有し、複製は同じカウンタを共有する
-/// （再起動をまたいで残存リーダーを数えたい場合は同じ予算を使い回す。モジュール内にグローバル状態は持たない。CORE-1・D-19）。
+/// 生存中のリーダースレッド数の予算（REPAIR-5）。
+///
+/// [`OutputStreams`] を作るのに必須で、同じ予算から作ったストリームは捕捉をまたいで同じカウンタを共有する
+/// （複製も同じカウンタを指す）。drain の期限切れで残ったリーダーは、終了するまで枠を占有し続ける。
+/// supervisor プロセスにつき 1 つだけ作り、監視対象の再起動・再捕捉のたびに同じものを渡すこと。
+/// 捕捉ごとに作り直すと残存リーダーを数えられず、上限が効かない。
+/// モジュール内にグローバル状態を持たないため（CORE-1・D-19）、所有は呼び出し側にある。
 #[derive(Debug, Clone)]
 pub struct ReaderBudget {
     live: Arc<AtomicUsize>,
@@ -56,12 +67,32 @@ pub struct ReaderBudget {
 }
 
 impl ReaderBudget {
-    /// 上限 `limit` 本の予算を作る。
-    pub fn new(limit: usize) -> Self {
-        Self {
+    /// 上限 `limit` 本の予算を作る。0 または [`MAX_LIVE_READERS`] 超なら `InvalidArgument`
+    /// （上限の無い予算を作れないようにする）。
+    pub fn new(limit: usize) -> Result<Self, TraitError> {
+        if limit == 0 || limit > MAX_LIVE_READERS {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "live reader limit is out of range",
+            ));
+        }
+        Ok(Self {
             live: Arc::new(AtomicUsize::new(0)),
             limit,
+        })
+    }
+
+    /// 上限 [`MAX_LIVE_READERS`] 本の予算を作る。
+    pub fn with_max_limit() -> Self {
+        Self {
+            live: Arc::new(AtomicUsize::new(0)),
+            limit: MAX_LIVE_READERS,
         }
+    }
+
+    /// 上限（本数）。
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 
     /// 現在生存中のリーダー数。
@@ -83,12 +114,6 @@ impl ReaderBudget {
             }
         }
         Some((0..n).map(|_| ReaderSlot(Arc::clone(&self.live))).collect())
-    }
-}
-
-impl Default for ReaderBudget {
-    fn default() -> Self {
-        Self::new(MAX_LIVE_READERS)
     }
 }
 
@@ -125,7 +150,9 @@ impl StreamKind {
 }
 
 /// 注入される出力ストリーム（実パイプは core が未提供のため呼び出し側が渡す）。
-#[derive(Default)]
+///
+/// 生存リーダー数の予算（[`ReaderBudget`]）と必ず組で作る。予算なしで作る経路（`Default` 等）は意図的に提供しない
+/// （既定の予算を暗黙に作ると、捕捉を繰り返すたびに上限が振り出しに戻るため。REPAIR-5）。
 pub struct OutputStreams {
     stdout: Option<Box<dyn Read + Send>>,
     stderr: Option<Box<dyn Read + Send>>,
@@ -133,19 +160,18 @@ pub struct OutputStreams {
 }
 
 impl OutputStreams {
-    /// stdout / stderr を渡す。
-    pub fn new(stdout: Option<Box<dyn Read + Send>>, stderr: Option<Box<dyn Read + Send>>) -> Self {
+    /// stdout / stderr を、生存リーダー数を数える `budget` と組にして渡す。
+    /// `budget` は複製して保持する（カウンタは共有される）。
+    pub fn new(
+        budget: &ReaderBudget,
+        stdout: Option<Box<dyn Read + Send>>,
+        stderr: Option<Box<dyn Read + Send>>,
+    ) -> Self {
         Self {
             stdout,
             stderr,
-            budget: ReaderBudget::default(),
+            budget: budget.clone(),
         }
-    }
-
-    /// 生存リーダー数の予算を差し替える（再起動をまたいで同じ予算を共有する場合に使う）。
-    pub fn with_budget(mut self, budget: ReaderBudget) -> Self {
-        self.budget = budget;
-        self
     }
 
     /// 捕捉対象のストリームを 1 つも持たないか。
@@ -153,15 +179,18 @@ impl OutputStreams {
         self.stdout.is_none() && self.stderr.is_none()
     }
 
-    /// どちらも捕捉しない。
-    pub fn none() -> Self {
-        Self::default()
+    /// どちらも捕捉しない（リーダーを起動しないため枠は使わない）。
+    pub fn none(budget: &ReaderBudget) -> Self {
+        Self::new(budget, None, None)
     }
 }
 
 /// 捕捉した行の記録先。TASK-164（SUP-7）がファイル・ローテーション実装へ差し替える拡張点。
 pub trait LogSink: Send + Sync {
     /// 1 行（LF 抜き・[`MAX_LINE_BYTES`] 以下）を追記する。失敗は構造化エラーで返す（panic しない）。
+    ///
+    /// 有限時間で戻ること。[`LogCapture::drain`] の取消しは実行中の `append` の完了を待つため
+    /// （取消し後に追記が起きないことを保証するための排他）、戻らない `append` は `drain` を期限より長く止める。
     fn append(&self, stream: StreamKind, line: &[u8]) -> Result<(), TraitError>;
 }
 
@@ -305,11 +334,55 @@ impl CaptureSummary {
     }
 }
 
+/// 捕捉の取消し状態。リーダーは sink への追記のあいだ共有ロックを保持し、取消しは要求フラグを立ててから
+/// 排他ロックを取る。これにより「取消しが返った後は追記が 1 件も起きない」ことを保証する
+/// （確認と追記の間に取消しが返らない）。要求フラグを先に立てるので、取消しの要求後に新しい追記は始まらず、
+/// 取消しが待つのは実行中の追記（ストリームあたり高々 1 件）だけである（ロックの公平性に依存しない）。
+#[derive(Default)]
+struct CancelGate {
+    requested: AtomicBool,
+    appending: RwLock<()>,
+}
+
+impl CancelGate {
+    /// 取消し済みにする。実行中の追記があれば、その完了を待ってから返る。
+    fn cancel(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        // 共有ロックを保持中（追記中）のリーダーが抜けるのを待つ。値は持たないので毒化は無視してよい。
+        drop(
+            self.appending
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+    }
+
+    /// 取消しが要求済みか。
+    fn is_cancelled(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    /// 取消し前なら `f` を実行して `Some`、取消し済みなら実行せず `None`。`f` の間は取消しを待たせる。
+    fn run_unless_cancelled<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        let _appending = self
+            .appending
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        // 共有ロックの保持中に確認する（未要求なら、cancel はこのロックの解放まで返れない）。
+        if self.is_cancelled() {
+            return None;
+        }
+        Some(f())
+    }
+}
+
 /// 起動済みのリーダースレッド群への取っ手。
+///
+/// [`LogCapture::drain`] を呼ばずに破棄した場合、捕捉は取り消されない（リーダーは EOF まで sink へ追記を続ける。
+/// [`crate::run::monitor_with_capture`] の停止要求時の契約）。捕捉を止めるには `drain` を呼ぶ。
 pub struct LogCapture {
     rx: mpsc::Receiver<(StreamKind, StreamSummary)>,
     expected: usize,
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<CancelGate>,
 }
 
 impl LogCapture {
@@ -346,7 +419,7 @@ impl LogCapture {
                 "too many log reader threads are still alive",
             ));
         };
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(CancelGate::default());
         let (tx, rx) = mpsc::channel();
         let mut gates: Vec<mpsc::Sender<()>> = Vec::new();
         let mut slots: Vec<(StreamKind, Slot)> = Vec::new();
@@ -415,9 +488,21 @@ impl LogCapture {
         })
     }
 
-    /// 全ストリームが EOF になるまで `timeout` を上限に待つ。期限切れは `Timeout`
-    /// （リーダーは取消しフラグを受け、次に `read` が戻った時点で終了する。module doc 参照）。
+    /// 全ストリームが EOF になるまで `timeout` を上限に待つ。期限切れは `Timeout`、
+    /// 期限を表現できない `timeout`（`Duration::MAX` 等）は `InvalidArgument`。
+    ///
+    /// `Err` を返す全経路で、返る前に捕捉を取り消す（`self` を消費するため、呼び出し側は後から止められない）。
+    /// `Err` が返った後は sink へ 1 行も追記されず、リーダーは次に `read` が戻った時点で終了する（module doc 参照）。
     pub fn drain(self, timeout: Duration) -> Result<CaptureSummary, TraitError> {
+        let result = self.wait_all(timeout);
+        if result.is_err() {
+            self.cancel.cancel();
+        }
+        result
+    }
+
+    /// [`LogCapture::drain`] の待機本体（取消しは呼び出し元が行う）。
+    fn wait_all(&self, timeout: Duration) -> Result<CaptureSummary, TraitError> {
         // Duration::MAX 等で加算が溢れても panic しない（公開 API のため直接呼ばれうる）。
         let Some(deadline) = Instant::now().checked_add(timeout) else {
             return Err(TraitError::new(
@@ -432,8 +517,6 @@ impl LogCapture {
                 Ok((StreamKind::Stdout, s)) => out.stdout = Some(s),
                 Ok((_, s)) => out.stderr = Some(s),
                 Err(RecvTimeoutError::Timeout) => {
-                    // 現在の read が戻り次第、リーダーが sink へ書かずに終了して資源を解放する。
-                    self.cancel.store(true, Ordering::SeqCst);
                     return Err(TraitError::new(
                         ErrorCode::Timeout,
                         "timed out waiting for log streams to reach EOF",
@@ -455,6 +538,9 @@ impl LogCapture {
 struct LineSplitter<'a> {
     kind: StreamKind,
     sink: &'a dyn LogSink,
+    cancel: &'a CancelGate,
+    /// 取消しを検知した（以後は sink へ渡さない）。
+    cancelled: bool,
     buf: Vec<u8>,
     cut: bool,
     summary: StreamSummary,
@@ -464,6 +550,9 @@ impl LineSplitter<'_> {
     fn feed(&mut self, chunk: &[u8]) {
         let mut segs = chunk.split(|b| *b == b'\n').peekable();
         while let Some(seg) = segs.next() {
+            if self.cancelled {
+                return;
+            }
             let room = MAX_LINE_BYTES.saturating_sub(self.buf.len());
             let take = room.min(seg.len());
             if let Some(head) = seg.get(..take) {
@@ -479,7 +568,16 @@ impl LineSplitter<'_> {
     }
 
     fn emit(&mut self) {
-        if let Err(e) = self.sink.append(self.kind, &self.buf) {
+        // 取消しの確認と追記を排他にする（確認後・追記前に取消しが返ることを防ぐ）。
+        let Some(appended) = self
+            .cancel
+            .run_unless_cancelled(|| self.sink.append(self.kind, &self.buf))
+        else {
+            self.cancelled = true;
+            self.buf.clear();
+            return;
+        };
+        if let Err(e) = appended {
             // 読み取りは続ける（パイプを詰まらせない）。最初のコードだけ残す。
             self.summary.error_code.get_or_insert(e.code());
         }
@@ -497,11 +595,13 @@ fn pump(
     mut stream: Box<dyn Read + Send>,
     kind: StreamKind,
     sink: &dyn LogSink,
-    cancel: &AtomicBool,
+    cancel: &CancelGate,
 ) -> StreamSummary {
     let mut sp = LineSplitter {
         kind,
         sink,
+        cancel,
+        cancelled: false,
         buf: Vec::new(),
         cut: false,
         summary: StreamSummary::default(),
@@ -509,8 +609,8 @@ fn pump(
     let mut chunk = [0u8; READ_CHUNK_BYTES];
     loop {
         let r = stream.read(&mut chunk);
-        // drain が期限切れで諦めた後は、読めたデータも sink へ渡さず終了する（スレッド・ストリームの回収）。
-        if cancel.load(Ordering::SeqCst) {
+        // drain が取り消した後は、読めたデータも sink へ渡さず終了する（スレッド・ストリームの回収）。
+        if sp.cancelled || cancel.is_cancelled() {
             return sp.summary;
         }
         match r {
@@ -520,6 +620,10 @@ fn pump(
                 if let Some(data) = chunk.get(..n) {
                     sp.feed(data);
                 }
+                // 追記の直前に取消しを検知した場合は、次の read（ブロックし得る）へ進まず終了する。
+                if sp.cancelled {
+                    return sp.summary;
+                }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => {
@@ -528,7 +632,7 @@ fn pump(
             }
         }
     }
-    if !sp.buf.is_empty() {
+    if !sp.buf.is_empty() && !sp.cancelled {
         sp.emit();
     }
     sp.summary
@@ -548,9 +652,22 @@ mod tests {
         stderr: Option<Box<dyn Read + Send>>,
     ) -> (Arc<MemoryLogSink>, CaptureSummary) {
         let sink = Arc::new(MemoryLogSink::default());
-        let cap = LogCapture::start(OutputStreams::new(stdout, stderr), sink.clone()).unwrap();
+        let budget = ReaderBudget::with_max_limit();
+        let cap =
+            LogCapture::start(OutputStreams::new(&budget, stdout, stderr), sink.clone()).unwrap();
         let sum = cap.drain(Duration::from_secs(10)).unwrap();
+        // EOF まで読み切ったリーダーは枠を返す（送信後のスレッド終了を待つ）。
+        assert_eq!(wait_live(&budget, 0), 0);
         (sink, sum)
+    }
+
+    /// `budget.live()` が `want` になるのを最大 10 秒待ち、最後に観測した値を返す。
+    fn wait_live(budget: &ReaderBudget, want: usize) -> usize {
+        let start = Instant::now();
+        while budget.live() != want && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        budget.live()
     }
 
     fn line(stream: StreamKind, s: &[u8]) -> CapturedLine {
@@ -564,12 +681,13 @@ mod tests {
     #[test]
     fn sup1_task157_7_drain_rejects_overflowing_timeout() {
         let cap = LogCapture::start(
-            OutputStreams::new(None, None),
+            OutputStreams::none(&ReaderBudget::with_max_limit()),
             Arc::new(MemoryLogSink::default()),
         )
         .unwrap();
         let err = cap.drain(Duration::MAX).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), "drain timeout is too large");
     }
 
     /// TASK-157.7: 直接 append された巨大行も MAX_LINE_BYTES へ切り詰める。
@@ -667,7 +785,7 @@ mod tests {
     #[test]
     fn sup1_task157_7_sink_error_is_reported_and_reading_continues() {
         let cap = LogCapture::start(
-            OutputStreams::new(boxed(b"a\nb\nc\n"), None),
+            OutputStreams::new(&ReaderBudget::with_max_limit(), boxed(b"a\nb\nc\n"), None),
             Arc::new(FailSink),
         )
         .unwrap();
@@ -683,8 +801,15 @@ mod tests {
     fn sup1_task157_7_drain_times_out_when_stream_stays_open() {
         let (reader, mut writer) = std::io::pipe().unwrap();
         let sink = Arc::new(MemoryLogSink::default());
-        let cap =
-            LogCapture::start(OutputStreams::new(Some(Box::new(reader)), None), sink).unwrap();
+        let cap = LogCapture::start(
+            OutputStreams::new(
+                &ReaderBudget::with_max_limit(),
+                Some(Box::new(reader)),
+                None,
+            ),
+            sink,
+        )
+        .unwrap();
         writer.write_all(b"hello\n").unwrap();
         let err = cap.drain(Duration::from_millis(50)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::Timeout);
@@ -694,21 +819,16 @@ mod tests {
     /// REPAIR-5・TASK-157.7: drain 期限切れ後、ブロック中の read が戻ればリーダーは sink へ書かず終了し枠を返す。
     #[test]
     fn sup1_task157_7_cancelled_reader_exits_without_appending() {
-        let budget = ReaderBudget::new(4);
+        let budget = ReaderBudget::new(4).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
         let sink = Arc::new(MemoryLogSink::default());
-        let mut streams =
-            OutputStreams::new(Some(Box::new(reader)), None).with_budget(budget.clone());
+        let mut streams = OutputStreams::new(&budget, Some(Box::new(reader)), None);
         let cap = LogCapture::start_from(&mut streams, sink.clone()).unwrap();
         assert_eq!(budget.live(), 1);
         let err = cap.drain(Duration::from_millis(50)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::Timeout);
         writer.write_all(b"late\n").unwrap();
-        let start = Instant::now();
-        while budget.live() != 0 && start.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(budget.live(), 0);
+        assert_eq!(wait_live(&budget, 0), 0);
         assert!(sink.snapshot().unwrap().is_empty());
         drop(writer);
     }
@@ -717,14 +837,17 @@ mod tests {
     #[test]
     fn sup1_task157_7_start_rejects_beyond_live_reader_limit() {
         let sink = Arc::new(MemoryLogSink::default());
-        let mut streams =
-            OutputStreams::new(boxed(b"a\n"), boxed(b"b\n")).with_budget(ReaderBudget::new(1));
+        let budget = ReaderBudget::new(1).unwrap();
+        let mut streams = OutputStreams::new(&budget, boxed(b"a\n"), boxed(b"b\n"));
         let e = LogCapture::start_from(&mut streams, sink.clone())
             .err()
-            .map(|e| e.code());
-        assert_eq!(e, Some(ErrorCode::Unavailable));
+            .unwrap();
+        assert_eq!(e.code(), ErrorCode::Unavailable);
+        assert_eq!(e.message(), "too many log reader threads are still alive");
         assert!(!streams.is_empty());
-        streams.budget = ReaderBudget::new(2);
+        // 拒否は枠を 1 本も消費しない（部分確保しない）。
+        assert_eq!(budget.live(), 0);
+        streams.budget = ReaderBudget::new(2).unwrap();
         let cap = LogCapture::start_from(&mut streams, sink).unwrap();
         assert!(cap.drain(Duration::from_secs(10)).is_ok());
     }

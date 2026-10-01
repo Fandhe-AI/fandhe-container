@@ -6,7 +6,9 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fandhe_container_supervisor::logs::{LogCapture, MemoryLogSink, OutputStreams, StreamKind};
+use fandhe_container_supervisor::logs::{
+    LogCapture, MemoryLogSink, OutputStreams, ReaderBudget, StreamKind,
+};
 
 /// AC1: 別スレッドが書く stdout / stderr 相当のパイプの両方を捕捉できる。
 #[test]
@@ -15,7 +17,11 @@ fn sup1_task157_7_captures_both_streams_from_pipes() {
     let (err_r, mut err_w) = std::io::pipe().unwrap();
     let sink = Arc::new(MemoryLogSink::default());
     let cap = LogCapture::start(
-        OutputStreams::new(Some(Box::new(out_r)), Some(Box::new(err_r))),
+        OutputStreams::new(
+            &ReaderBudget::with_max_limit(),
+            Some(Box::new(out_r)),
+            Some(Box::new(err_r)),
+        ),
         sink.clone(),
     )
     .unwrap();

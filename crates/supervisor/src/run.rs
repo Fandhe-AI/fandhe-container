@@ -472,6 +472,12 @@ impl MonitoredWithCapture {
 /// 全ストリームの EOF を待って集計を返す。`StopRequested` などプロセスが生存し得る結果では待たない
 /// （EOF が来ないため）。その場合リーダーは EOF まで走り sink への追記を続け、ストリームの所有権は捕捉側へ移っているため
 /// 監視の引き継ぎ時に再注入できない（#239・TASK-164 で扱う）。永続化・ローテーションは未実装（SUP-7・TASK-164）。
+///
+/// 生存リーダー数は `streams` を作るときに渡した [`crate::logs::ReaderBudget`] で数える（省略できない）。
+/// 過去の捕捉で終端待ちが期限切れになり残ったリーダーも同じ予算に数えられ、上限に達していれば捕捉開始は
+/// `Unavailable`（`too many log reader threads are still alive`）で失敗して上記の開始失敗の扱いになる（REPAIR-5）。
+/// 呼び出し側は supervisor プロセスにつき 1 つの予算を、再起動・再捕捉をまたいで使い回すこと。
+/// 終端待ちが失敗（`Timeout` 等）した場合、捕捉は取り消され、以後 sink への追記は起きない。
 pub fn monitor_with_capture(
     state: &mut SupervisedState,
     process: &dyn LaunchedProcess,
@@ -632,6 +638,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU32;
+
+    use crate::logs::ReaderBudget;
 
     use fandhe_container_core::traits::{
         ContainerId, CreateStateRequest, DeleteStateRequest, DeleteStateResponse, GetStateRequest,
@@ -1205,6 +1213,7 @@ mod tests {
         use std::io::Cursor;
         (
             OutputStreams::new(
+                &ReaderBudget::with_max_limit(),
                 Some(Box::new(Cursor::new(out.to_vec()))),
                 Some(Box::new(Cursor::new(err.to_vec()))),
             ),
@@ -1244,7 +1253,11 @@ mod tests {
         let mut s = attach(&store);
         let p = FakeProc::alive();
         let (reader, writer) = std::io::pipe().unwrap();
-        let mut streams = OutputStreams::new(Some(Box::new(reader)), None);
+        let mut streams = OutputStreams::new(
+            &ReaderBudget::with_max_limit(),
+            Some(Box::new(reader)),
+            None,
+        );
         let stop = StopToken::new();
         stop.request_stop();
         let r = monitor_with_capture(
@@ -1305,7 +1318,11 @@ mod tests {
         let mut s = attach(&store);
         let read = Arc::new(AtomicBool::new(false));
         let sink = Arc::new(crate::logs::MemoryLogSink::default());
-        let mut streams = OutputStreams::new(Some(Box::new(Spy(read.clone()))), None);
+        let mut streams = OutputStreams::new(
+            &ReaderBudget::with_max_limit(),
+            Some(Box::new(Spy(read.clone()))),
+            None,
+        );
         let e = monitor_with_capture(
             &mut s,
             &FakeProc::alive(),
@@ -1331,7 +1348,11 @@ mod tests {
         let mut s = attach(&store);
         let p = FakeProc::exiting(1, ProcessExit::Exited(3));
         let (reader, writer) = std::io::pipe().unwrap();
-        let mut streams = OutputStreams::new(Some(Box::new(reader)), None);
+        let mut streams = OutputStreams::new(
+            &ReaderBudget::with_max_limit(),
+            Some(Box::new(reader)),
+            None,
+        );
         let cfg = MonitorConfig::default()
             .with_drain_timeout(Duration::from_millis(50))
             .unwrap();

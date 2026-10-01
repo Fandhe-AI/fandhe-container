@@ -122,9 +122,34 @@ mod linux {
     /// 一時 rootfs（drop で削除）。
     struct Rootfs(PathBuf);
 
+    /// 子プロセス（launcher / container 段）の停止を確認できなかった場合に立てる。
+    /// 立っている間は rootfs を削除しない（生存中の子が参照している可能性があるため。特権操作の後始末）。
+    static STOP_UNCONFIRMED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
     impl Drop for Rootfs {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            if STOP_UNCONFIRMED.load(std::sync::atomic::Ordering::SeqCst) {
+                // 停止未確認: 削除せず、手動回収に必要なパスを報告する。
+                eprintln!(
+                    "child stop not confirmed; keeping rootfs for manual cleanup: {}",
+                    self.0.display()
+                );
+                return;
+            }
+            match std::fs::remove_dir_all(&self.0) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    // 削除失敗は成功扱いにしない。unwind 中の panic は abort になるため報告のみに留める。
+                    let msg = format!("failed to remove rootfs {}: {e}", self.0.display());
+                    if std::thread::panicking() {
+                        eprintln!("{msg}");
+                    } else {
+                        panic!("{msg}");
+                    }
+                }
+            }
         }
     }
 
@@ -290,6 +315,9 @@ mod linux {
                     } else {
                         Ok(())
                     };
+                    if cleanup.is_err() {
+                        STOP_UNCONFIRMED.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     assert_eq!(
                         status.code(),
                         Some(0),
@@ -305,8 +333,11 @@ mod linux {
                     } else {
                         Ok(())
                     };
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // 直接の子の kill / 回収に失敗した場合も停止未確認として rootfs を保持する。
+                    let direct_stopped = child.kill().is_ok() && child.wait().is_ok();
+                    if group_result.is_err() || !direct_stopped {
+                        STOP_UNCONFIRMED.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     panic!(
                         "{flag} stage did not exit within {:?} (cleanup: {group_result:?})",
                         timeout()

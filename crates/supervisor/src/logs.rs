@@ -1363,6 +1363,75 @@ mod tests {
         }
     }
 
+    /// `data` を返し切った後、EOF ではなく読み取りエラーを返すストリーム。
+    struct FailingRead {
+        data: Cursor<Vec<u8>>,
+    }
+    impl Read for FailingRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.data.read(buf)? {
+                0 => Err(std::io::Error::other("fake read failure")),
+                n => Ok(n),
+            }
+        }
+    }
+
+    /// TASK-157.7: 読み取りがエラーで終わった場合、未完了の末尾（"par"）は sink へ渡さず破棄する。
+    /// 完了済みの 2 行だけが残り、集計は 3 行（うち届かなかった行 1）・10 バイト・Internal。
+    #[test]
+    fn sup1_task157_7_read_error_discards_incomplete_line() {
+        let sink = Arc::new(MemoryLogSink::default());
+        let stream = FailingRead {
+            data: Cursor::new(b"ok1\nok2\npar".to_vec()),
+        };
+        let cap = LogCapture::start(
+            OutputStreams::new(
+                &ReaderBudget::with_max_limit(),
+                Some(Box::new(stream)),
+                None,
+            ),
+            sink.clone(),
+        )
+        .unwrap();
+        let sum = cap.drain(Duration::from_secs(10)).unwrap();
+        let s = sum.stdout().unwrap();
+        assert_eq!(s.error_code(), Some(ErrorCode::Internal));
+        assert_eq!(s.lines(), 3);
+        assert_eq!(s.discarded_lines(), 1);
+        assert_eq!(s.bytes(), 11);
+        assert_eq!(
+            sink.snapshot().unwrap(),
+            vec![
+                line(StreamKind::Stdout, b"ok1"),
+                line(StreamKind::Stdout, b"ok2")
+            ]
+        );
+    }
+
+    /// TASK-157.7: 読み取りエラーの時点で未完了の末尾が無ければ、破棄する行は無い（2 行・届かなかった行 0）。
+    #[test]
+    fn sup1_task157_7_read_error_without_partial_line_discards_nothing() {
+        let sink = Arc::new(MemoryLogSink::default());
+        let stream = FailingRead {
+            data: Cursor::new(b"ok1\nok2\n".to_vec()),
+        };
+        let cap = LogCapture::start(
+            OutputStreams::new(
+                &ReaderBudget::with_max_limit(),
+                Some(Box::new(stream)),
+                None,
+            ),
+            sink.clone(),
+        )
+        .unwrap();
+        let sum = cap.drain(Duration::from_secs(10)).unwrap();
+        let s = sum.stdout().unwrap();
+        assert_eq!(s.error_code(), Some(ErrorCode::Internal));
+        assert_eq!(s.lines(), 2);
+        assert_eq!(s.discarded_lines(), 0);
+        assert_eq!(sink.snapshot().unwrap().len(), 2);
+    }
+
     /// 最初の `fail_after` 行までは成功し、以後は失敗する sink。呼ばれた回数を数える。
     struct FailAfterSink {
         fail_after: usize,

@@ -116,8 +116,9 @@ impl LifecycleOp {
 /// 操作種別 `op`・機械可読な `code`・人間可読な `message` を持ち、[`OciRuntimeError::exit_code`] で
 /// 非ゼロの終了コードへ写像できる。`message` に資格情報などの秘密情報を含めてはならない
 /// （[`TraitError`] と同じ契約）。`message` は plugin 応答由来の untrusted な値になり得るため、
-/// [`OciRuntimeError::new`] で制御文字を空白へ置換し、[`OCI_ERROR_MESSAGE_MAX_BYTES`] で切り詰める
-/// （行指向出力への行注入・端末制御シーケンス注入・巨大出力の防止）。
+/// [`OciRuntimeError::new`] で Unicode 一般カテゴリ Cc・Cf・Zl・Zp の文字を空白へ置換し、
+/// [`OCI_ERROR_MESSAGE_MAX_BYTES`] で切り詰める（行指向出力への行注入・端末制御シーケンス注入・
+/// 双方向制御による表示偽装・巨大出力の防止）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OciRuntimeError {
@@ -126,41 +127,85 @@ pub struct OciRuntimeError {
     message: String,
 }
 
-/// 表示を乱しうる非制御の書式文字（行・段落区切り、双方向制御、ゼロ幅文字、BOM）か判定する。
-fn is_unsafe_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{2028}' | '\u{2029}'
-            | '\u{061C}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{FEFF}'
-    )
+/// Unicode 一般カテゴリ Cf（Format）に属する符号位置の範囲（Unicode 16.0.0。昇順・重複なし・計 170 個）。
+///
+/// std は一般カテゴリを公開せず、依存も追加しないため、UnicodeData.txt の Cf を範囲表として持つ。
+/// 個々の文字を選んで列挙したものではなく、カテゴリ全体の写しである（双方向制御 U+202A〜U+202E・
+/// U+2066〜U+2069、ゼロ幅文字 U+200B〜U+200F、WORD JOINER U+2060、BOM U+FEFF、タグ文字 U+E0020〜
+/// U+E007F 等を含む）。Unicode の版を上げる際は表ごと再生成する。
+const FORMAT_CHAR_RANGES: [(char, char); 21] = [
+    ('\u{00AD}', '\u{00AD}'),
+    ('\u{0600}', '\u{0605}'),
+    ('\u{061C}', '\u{061C}'),
+    ('\u{06DD}', '\u{06DD}'),
+    ('\u{070F}', '\u{070F}'),
+    ('\u{0890}', '\u{0891}'),
+    ('\u{08E2}', '\u{08E2}'),
+    ('\u{180E}', '\u{180E}'),
+    ('\u{200B}', '\u{200F}'),
+    ('\u{202A}', '\u{202E}'),
+    ('\u{2060}', '\u{2064}'),
+    ('\u{2066}', '\u{206F}'),
+    ('\u{FEFF}', '\u{FEFF}'),
+    ('\u{FFF9}', '\u{FFFB}'),
+    ('\u{110BD}', '\u{110BD}'),
+    ('\u{110CD}', '\u{110CD}'),
+    ('\u{13430}', '\u{1343F}'),
+    ('\u{1BCA0}', '\u{1BCA3}'),
+    ('\u{1D173}', '\u{1D17A}'),
+    ('\u{E0001}', '\u{E0001}'),
+    ('\u{E0020}', '\u{E007F}'),
+];
+
+/// `message` に残すと表示・行構造を乱しうる文字か判定する。
+///
+/// 規則は Unicode 一般カテゴリで定める: Cc（制御。`char::is_control()`）・Cf（書式。
+/// [`FORMAT_CHAR_RANGES`]）・Zl（行区切り U+2028）・Zp（段落区切り U+2029）。改行・ESC による
+/// 行注入・端末制御、双方向制御による表示順の偽装、ゼロ幅文字による不可視の挿入を防ぐ。
+///
+/// 対象外（意図的）: Mn 等の結合文字（多くの文字体系の正当な表記に必須）、U+3164 等の不可視の
+/// Lo、Co（私用領域）・Cn（未割り当て。将来割り当ての追従は表の再生成で行う）。これらは行構造・
+/// 表示順を変えないため置換しない。
+fn is_display_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{2028}' | '\u{2029}')
+        || FORMAT_CHAR_RANGES
+            .iter()
+            .any(|&(lo, hi)| (lo..=hi).contains(&c))
+}
+
+/// `chars` を先頭から読み、表示を乱す文字（[`is_display_unsafe_char`]）を空白へ置換しながら
+/// `out` へ追記する。`out` の長さが `max_bytes` を超える直前で読み取りを止める（UTF-8 文字境界で
+/// 切り詰める）。
+///
+/// 入力を借用のまま 1 文字ずつ走査し、上限以降は読まないため、入力が巨大（あるいは無限）でも
+/// 追加の確保・走査は上限で頭打ちになる（untrusted 入力による DoS 防止。security.md）。
+fn push_sanitized_bounded(out: &mut String, chars: impl Iterator<Item = char>, max_bytes: usize) {
+    for c in chars {
+        let c = if is_display_unsafe_char(c) { ' ' } else { c };
+        // checked_add: `max_bytes` 近傍でも桁あふれせず上限判定する。
+        let fits = out
+            .len()
+            .checked_add(c.len_utf8())
+            .is_some_and(|next| next <= max_bytes);
+        if !fits {
+            break;
+        }
+        out.push(c);
+    }
 }
 
 impl OciRuntimeError {
-    /// エラーを構築する。`message` はサニタイズ（制御文字の置換・長さ上限での切り詰め）して保持する。
+    /// エラーを構築する。`message` はサニタイズ（表示を乱す文字の置換・長さ上限での切り詰め）して保持する。
     pub fn new(op: LifecycleOp, code: ErrorCode, message: impl AsRef<str>) -> Self {
         // `AsRef<str>` で借用のまま受け取り、入力全体を `String` へ複製しない
         // （`&str` を `Into<String>` で受けると全量確保になるため）。
         let raw: &str = message.as_ref();
-        // 全量を複製せず、出力が上限に達するまでだけサニタイズして収集する
-        // （untrusted な巨大メッセージによるメモリ・CPU の浪費を防ぐ）。
+        // 置換後の空白（1 バイト）は元の文字のバイト長以下なので、出力長は
+        // min(入力長, 上限) を超えない。よって初回確保のみで再確保は起きず、
+        // 確保量も上限で頭打ちになる。
         let mut message = String::with_capacity(raw.len().min(OCI_ERROR_MESSAGE_MAX_BYTES));
-        for c in raw.chars() {
-            // `is_control()` は U+2028 / U+2029（行・段落区切り）や双方向テキスト制御文字
-            // （U+202E 等。表示順を操作してエラー内容を偽装できる）を含まないため明示的に置換する。
-            let c = if c.is_control() || is_unsafe_format_char(c) {
-                ' '
-            } else {
-                c
-            };
-            if message.len() + c.len_utf8() > OCI_ERROR_MESSAGE_MAX_BYTES {
-                break;
-            }
-            message.push(c);
-        }
+        push_sanitized_bounded(&mut message, raw.chars(), OCI_ERROR_MESSAGE_MAX_BYTES);
         Self { op, code, message }
     }
 

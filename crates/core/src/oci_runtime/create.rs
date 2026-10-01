@@ -37,6 +37,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use super::config::{OciConfig, OciConfigError, load_config};
+use super::error::{LifecycleOp, OciRuntimeError};
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, StateRecord, StateStore,
@@ -56,13 +57,19 @@ const CREATE_OP_NAME: &str = "create";
 /// [`ErrorCode::AlreadyExists`] をそのまま返す。
 ///
 /// 成功・失敗の件数と所要時間は `recorder` へ操作名 `create` で記録する（全終了経路。REPAIR-4）。
+///
+/// 失敗は [`OciRuntimeError`]（`op` = create・内部エラーと同一の `code`・非ゼロの
+/// [`OciRuntimeError::exit_code`]）で返す。標準エラーへの書き出しと終了は呼び出し元（CLI・plugin）の
+/// 責務（ERR-2・TASK-96.2）。
 pub fn create(
     store: &dyn StateStore,
     recorder: &OpRecorder,
     req: &CreateRequest,
-) -> Result<StateRecord, TraitError> {
-    let name = OpName::new(CREATE_OP_NAME)?;
-    recorder.record_op(&name, || create_inner(store, req))
+) -> Result<StateRecord, OciRuntimeError> {
+    // 変換は最上位 1 か所のみ。内部関数は `TraitError` のまま（波及最小）。
+    let to_err = |e: TraitError| OciRuntimeError::from_trait_error(LifecycleOp::Create, e);
+    let name = OpName::new(CREATE_OP_NAME).map_err(to_err)?;
+    recorder.record_op(&name, || create_inner(store, req).map_err(to_err))
 }
 
 fn create_inner(store: &dyn StateStore, req: &CreateRequest) -> Result<StateRecord, TraitError> {
@@ -493,5 +500,43 @@ mod tests {
         assert_eq!(stats.success(), 1);
         assert_eq!(stats.failure(), 1);
         assert!(stats.latency().is_some());
+    }
+
+    /// ERR-2・TASK-96.2: ID 重複の失敗が op = create・同一 code・終了コード 4・構造化 1 行で得られる。
+    #[test]
+    fn err2_create_failure_is_wired_to_oci_runtime_error() {
+        let b = ready_bundle("err2-dup");
+        let store = MemStateStore::new();
+        let rec = OpRecorder::new();
+        create(&store, &rec, &b.request("c1")).expect("first");
+        let err = create(&store, &rec, &b.request("c1")).expect_err("dup");
+        assert_eq!(err.op(), LifecycleOp::Create);
+        assert_eq!(err.code(), ErrorCode::AlreadyExists);
+        assert_eq!(err.exit_code().get(), 4);
+        let mut out = Vec::new();
+        err.write_json_line(&mut out).expect("write");
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            format!(
+                "{{\"op\":\"create\",\"code\":\"ALREADY_EXISTS\",\"message\":{}}}\n",
+                serde_json::to_string(err.message()).expect("json")
+            )
+        );
+    }
+
+    /// ERR-2・TASK-96.2: config.json 不在（検証段階の失敗）が NOT_FOUND・終了コード 3 になり、失敗が計数される。
+    #[test]
+    fn err2_create_missing_config_is_not_found() {
+        let b = Bundle::new("err2-noconfig");
+        let store = MemStateStore::new();
+        let rec = OpRecorder::new();
+        let err = create(&store, &rec, &b.request("c1")).expect_err("no config");
+        assert_eq!(err.op(), LifecycleOp::Create);
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(err.exit_code().get(), 3);
+        let stats = rec
+            .snapshot_op(&OpName::new("create").expect("name"))
+            .expect("recorded");
+        assert_eq!(stats.failure(), 1);
     }
 }

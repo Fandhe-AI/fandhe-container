@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
-    LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, StartTimeouts, create,
+    LaunchSpec, LaunchedProcess, LifecycleOp, ProcessExit, ProcessLauncher, StartTimeouts, create,
     recover_interrupted_start, start,
 };
 use fandhe_container_core::traits::{
@@ -631,4 +631,31 @@ fn repair5_recover_bounds_hanging_confirmation() {
         store.status_of("it-confirm").state(),
         ContainerState::Created
     );
+}
+
+/// ERR-2・TASK-96.2: 未作成コンテナの start は launcher を呼ばず、op = start・code = NOT_FOUND・
+/// 終了コード 3・構造化 1 行 JSON で失敗する。
+#[test]
+fn err2_start_unknown_container_yields_structured_error() {
+    let store = MemStateStore::new(None);
+    let launcher = FakeLauncher::new();
+    let err = start(
+        &store,
+        &OpRecorder::new(),
+        &dynl(&launcher),
+        &start_req("it-err2-missing"),
+        &StartTimeouts::default(),
+    )
+    .expect_err("must fail");
+    assert_eq!(err.op(), LifecycleOp::Start);
+    assert_eq!(err.code(), ErrorCode::NotFound);
+    assert_eq!(err.exit_code().get(), 3);
+    assert_eq!(launcher.launches(), 0);
+    let mut out = Vec::new();
+    err.write_json_line(&mut out).expect("write");
+    let line = String::from_utf8(out).expect("utf8");
+    let v: Value = serde_json::from_str(line.trim_end()).expect("json");
+    assert_eq!(v["op"], "start");
+    assert_eq!(v["code"], "NOT_FOUND");
+    assert_eq!(v["message"], err.message());
 }

@@ -491,6 +491,11 @@ expect_rc "input-target-invalid" 2 --runtime "$stub" --bundle "$work/bundle" --t
 reset_log
 expect_rc "target-recorded" 0 --runtime "$stub" --bundle "$work/bundle" --target runc --iterations 1 --warmup 0
 expect_eq "target-recorded-value" "runc" "$(jq -r '.target' <<<"$last_stdout")"
+# --label を省略すると label は target と同じ値になる（Codex P2: target と label を食い違わせない）。
+expect_eq "target-default-label" "runc" "$(jq -r '.label' <<<"$last_stdout")"
+reset_log
+expect_rc "target-explicit-label" 0 --runtime "$stub" --bundle "$work/bundle" --target runc --label baseline-1 --iterations 1 --warmup 0
+expect_eq "target-explicit-label-value" "runc baseline-1" "$(jq -r '"\(.target) \(.label)"' <<<"$last_stdout")"
 default_args=(--target own)
 expect_rc "help" 0 --help
 

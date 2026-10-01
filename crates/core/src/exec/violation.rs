@@ -7,9 +7,10 @@
 //! `prepare_rootfs` / `pivot_root` の証跡不一致・rootfs パス検証・shared 伝播。TASK-27.3・#135）は、
 //! 拒否時に [`IsolationViolation`] を `ExecError::violation` に載せて呼び出し側へ返す。
 //!
-//! **本モジュールは記録の経路のみを提供する。** 違反記録の永続化・3 レイヤー（実行層・
-//! supervisor・CLI）への集約・ログの出力先は TASK-41（#191。SEC-4）で扱い、ここでは
-//! 実装していない（REPAIR-3: 実装済みを装わない）。
+//! **本モジュールは記録の経路のみを提供する。** マウント層の違反から `Mount` 監査イベントへの
+//! 写像は [`IsolationViolation::mount_audit_event`]（TASK-41.4・#195）で実装済み。違反記録の
+//! 永続化・3 レイヤーへの集約・ログの出力先は TASK-41.5 系（#839）で扱い、未実装
+//! （REPAIR-3: 実装済みを装わない）。
 //!
 //! # 違反とシステムエラーの区別
 //!
@@ -30,6 +31,7 @@
 
 use std::path::Path;
 
+use crate::audit_log::{AuditEvent, AuditPath};
 use crate::traits::types::ErrorCode;
 
 use super::IsolationStage;
@@ -419,7 +421,7 @@ impl ViolationSubject {
     }
 }
 
-/// 分離違反の試行を拒否したときの構造化された記録（SEC-4 の記録経路。保存は TASK-41）。
+/// 分離違反の試行を拒否したときの構造化された記録（SEC-4 の記録経路。マウント層の写像は TASK-41.4、保存は #839）。
 ///
 /// `ExecError::violation` から取り出す。生成は `crate::exec` の拒否経路のみ。
 ///
@@ -440,6 +442,8 @@ pub struct IsolationViolation {
     pub behavior_id: &'static str,
     /// 対象（パスの検証で拒否した場合のみ）。
     pub subject: Option<ViolationSubject>,
+    /// 監査レコード用の生パス（エスケープ・切り詰め前。`AuditPath` が 4096 バイトで切り詰める）。
+    audit_path: Option<AuditPath>,
 }
 
 impl IsolationViolation {
@@ -450,6 +454,31 @@ impl IsolationViolation {
             reason,
             behavior_id: reason.behavior_id(),
             subject: subject.map(ViolationSubject::from_path),
+            audit_path: subject.map(AuditPath::new),
+        }
+    }
+
+    /// 監査用の生パス（SEC-4・TASK-41.4）。エスケープは書き込み側（TASK-41.5 系）の責務で、
+    /// `subject` のエスケープ済み文字列は流用しない（二重エスケープ・表記ずれを避ける）。
+    pub fn audit_path(&self) -> Option<&AuditPath> {
+        self.audit_path.as_ref()
+    }
+
+    /// マウント検証層の違反なら `Mount` 監査イベントを返す（SEC-4・TASK-41.4）。
+    ///
+    /// 対象は `MountTarget`・`SharedPropagation`・`RootfsPivot`。計画・establish 前提・証跡不一致・
+    /// エントリポイントはマウント層の拒否ではないため `None`（扱いは #191 配下の後続）。
+    pub fn mount_audit_event(&self) -> Option<AuditEvent> {
+        match self.kind {
+            ViolationKind::MountTarget
+            | ViolationKind::SharedPropagation
+            | ViolationKind::RootfsPivot => Some(AuditEvent::Mount {
+                path: self.audit_path.clone(),
+            }),
+            ViolationKind::PlanRejected
+            | ViolationKind::EstablishPrecondition
+            | ViolationKind::EvidenceMismatch
+            | ViolationKind::Entrypoint => None,
         }
     }
 }
@@ -535,5 +564,62 @@ mod tests {
         assert_eq!(r.behavior_id(), "CORE-1");
         assert_eq!(r.error_code(), ErrorCode::PermissionDenied);
         assert_eq!(r.stage(), IsolationStage::Exec);
+    }
+    /// SEC-4・TASK-41.4: 理由ごとの Mount 写像の有無を具体値で照合し、生パスを保持する。
+    #[test]
+    fn sec4_task41_4_mount_audit_event_mapping() {
+        let mapped = [
+            (ViolationReason::PathParentComponent, true),
+            (ViolationReason::TargetOutsideRootfs, true),
+            (ViolationReason::TargetOnSharedMount, true),
+            (ViolationReason::RootfsIsHostRoot, true),
+            (ViolationReason::RootfsHasExternalHardlink, true),
+            (ViolationReason::NoNamespaces, false),
+            (ViolationReason::EstablishNotPid1, false),
+            (ViolationReason::EvidenceCallerNotPid1, false),
+            (ViolationReason::EntrypointIsRuntimeBinary, false),
+        ];
+        for (reason, expect) in mapped {
+            let v = IsolationViolation::new(reason, Some(Path::new("/x")));
+            assert_eq!(v.mount_audit_event().is_some(), expect, "{reason:?}");
+        }
+        let raw = Path::new("/a\nb\\c");
+        let v = IsolationViolation::new(ViolationReason::PathParentComponent, Some(raw));
+        assert_eq!(v.audit_path().map(|p| p.as_path()), Some(raw));
+        let v = IsolationViolation::new(ViolationReason::RootfsMissing, None);
+        assert_eq!(
+            v.mount_audit_event(),
+            Some(AuditEvent::Mount { path: None })
+        );
+    }
+
+    /// SEC-4・TASK-41.4: audit_mount_violation は違反のみ記録し、エラーを変えない。
+    #[test]
+    fn sec4_task41_4_audit_mount_violation_records_once() {
+        use crate::audit_log::mount::tests::VecSink;
+        use crate::audit_log::{AuditDelivery, AuditLayer};
+        use crate::exec::{ExecError, audit_mount_violation};
+
+        let sink = VecSink::new(false);
+        let err = ExecError::from_violation_at(
+            ViolationReason::PathParentComponent,
+            Some(Path::new("/tmp/a/../b")),
+            IsolationStage::PrepareRootfs,
+        );
+        let r = audit_mount_violation(err, &sink);
+        assert_eq!(r.delivery, AuditDelivery::Recorded);
+        assert_eq!(
+            r.error.violation.as_ref().map(|v| v.reason),
+            Some(ViolationReason::PathParentComponent)
+        );
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::Mount);
+        assert_eq!(recs[0].path(), Some(Path::new("/tmp/a/../b")));
+
+        let sys = ExecError::new(ErrorCode::Internal, IsolationStage::MountProc, "sys");
+        let r = audit_mount_violation(sys, &sink);
+        assert_eq!(r.delivery, AuditDelivery::NotApplicable);
+        assert_eq!(sink.snapshot().len(), 1);
     }
 }

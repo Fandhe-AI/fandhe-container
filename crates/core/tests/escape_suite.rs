@@ -461,12 +461,13 @@ const ESC02_EXPECTATION: Expectation = Expectation {
     audit: AuditExpectation::None,
 };
 
-/// ESC-03: 既定 capability セット下の `mount(2)` は EPERM（1）で拒否される。`mount` 層の監査は
-/// 配送経路未配線のため `Deferred`（SEC-4・REPAIR-3）。
+/// ESC-03: 既定 capability セット下の `mount(2)` は EPERM（1）で拒否される。拒否主体は組み込み seccomp の
+/// `ERRNO(EPERM)`（と capability 削減）で `AuditLayer::Mount` ではないため、`seccomp` 層の監査を
+/// 配送経路未配線のため `Deferred` とする（SEC-4・REPAIR-3）。
 const ESC03_EXPECTATION: Expectation = Expectation {
     allowed: &[AttackOutcome::Errno(1)],
     signal: None,
-    audit: AuditExpectation::Deferred("mount"),
+    audit: AuditExpectation::Deferred("seccomp"),
 };
 
 /// ESC-02 の判定: コンテナ内から見える PID 空間を分類する（OS 非依存の純粋関数）。

@@ -18,7 +18,7 @@
 #   5. after      : `idle_memory.sh --format json --expect-zero`（回帰判定の本体）
 #
 # 使い方:
-#   idle_memory_supervised.sh --driver <abs-path> [--expected-dir <dir>]... [--timeout <秒>]
+#   idle_memory_supervised.sh --driver <abs-path> --expected-dir <dir> [--expected-dir <dir>]... [--timeout <秒>]
 #                             [--settle <秒>] [--output <file>] [--help]
 #
 # driver 契約: 絶対パスの実行可能な通常ファイル。引数は固定の `up` / `down` のみを配列で直接 exec
@@ -168,6 +168,47 @@ if [ ! -f "$measure" ]; then
   exit 2
 fi
 
+# 実計測では --expected-dir を必須にする。省略すると idle_memory.sh は実行ファイル名だけで対象を数え、
+# 配置ディレクトリ外の同名プロセスを監視プロセスとして数えて supervised フェーズを成功扱いにできる
+# （TASK-47・CORE-7）。差し替え口と同じく selftest（FANDHE_IDLE_MEMORY_SUPERVISED_SELFTEST=1）のみ省略可。
+if [ "${#expected_dirs[@]}" -eq 0 ] && [ "${FANDHE_IDLE_MEMORY_SUPERVISED_SELFTEST:-}" != "1" ]; then
+  err "invalid-argument" "--expected-dir is required (pass the directory the supervised binaries are installed in)"
+  exit 2
+fi
+
+# 引数のディレクトリ 1 つが、他のユーザーに中のエントリを差し替えられないことを確かめる
+# （startup_latency.sh の dir_is_safe と同じ規則）。symlink でない実ディレクトリで、所有者が実行
+# ユーザーか root で、group / other の書き込み権がないか sticky ビット付きであること。
+dir_is_safe() {
+  local d="$1" uid
+  uid="$(id -u)"
+  [ -n "$(find -P "$d" -maxdepth 0 -type d \( -user "$uid" -o -user 0 \) -print 2>/dev/null)" ] || return 1
+  [ -z "$(find -P "$d" -maxdepth 0 \( -perm -0020 -o -perm -0002 \) ! -perm -1000 -print 2>/dev/null)" ]
+}
+
+# --output の親ディレクトリから / までの全ディレクトリが dir_is_safe で、パスに symlink を含まない
+# （論理パスと物理パスが一致する）ことを確かめる。root 実行時に、検査後に他ユーザーが親を差し替えて
+# 意図しない場所へ結果を出力させる経路を塞ぐ（startup_latency.sh の output_path_is_safe と同じ規則）。
+output_path_is_safe() {
+  local logical physical d parent depth
+  logical="$(cd -- "$1" && pwd -L)" || return 1
+  physical="$(cd -- "$1" && pwd -P)" || return 1
+  while [[ "$logical" == //* ]]; do logical="${logical#/}"; done
+  while [[ "$physical" == //* ]]; do physical="${physical#/}"; done
+  [ "$logical" = "$physical" ] || return 1
+  d="$physical"
+  depth=0
+  while :; do
+    dir_is_safe "$d" || return 1
+    parent="$(dirname -- "$d")"
+    [ "$parent" = "$d" ] && break
+    depth=$((depth + 1))
+    [ "$depth" -le 256 ] || return 1
+    d="$parent"
+  done
+  return 0
+}
+
 if [ -n "$output" ]; then
   if [ -d "$output" ]; then
     err "invalid-argument" "output path is a directory: ${output}"
@@ -178,6 +219,14 @@ if [ -n "$output" ]; then
   [ -n "$output_dir" ] || output_dir="/"
   if [ ! -d "$output_dir" ]; then
     err "invalid-argument" "output directory does not exist: ${output_dir}"
+    exit 2
+  fi
+  if ! command -v find >/dev/null 2>&1 || ! command -v id >/dev/null 2>&1; then
+    err "unsupported-os" "find and id are required to validate the output directory"
+    exit 2
+  fi
+  if ! output_path_is_safe "$output_dir"; then
+    err "invalid-output" "the path of --output must not contain symlinks, and every directory above it must be owned by you or root and not writable by others (unless sticky)"
     exit 2
   fi
 fi

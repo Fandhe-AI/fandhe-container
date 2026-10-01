@@ -74,6 +74,8 @@ new_case() {
   case_no=$((case_no + 1))
   STUB_DIR="${root}/case${case_no}"
   mkdir -p "$STUB_DIR"
+  # --output の親ディレクトリ検証（group / other 書き込み不可）を umask に依らず満たす。
+  chmod 700 "$STUB_DIR"
   export STUB_DIR
   printf '%s\n' "$1" >"$STUB_DIR/m1"
   printf '%s\n' "$2" >"$STUB_DIR/m2"
@@ -229,6 +231,22 @@ check_arg "arg-settle-bad" "--settle must be" --driver "$driver" --settle 99999
 check_arg "arg-output-dir" "output path is a directory" --driver "$driver" --output "$STUB_DIR"
 check_arg "arg-output-missing-dir" "output directory does not exist" --driver "$driver" --output "${STUB_DIR}/nodir/x.json"
 check_arg "arg-value-missing" "--driver requires a value" --driver
+
+# 11b. selftest フラグなし（実計測相当）では --expected-dir 省略を拒否 → 2。driver・計測は起動されない。
+new_case "0 0 0 0" "0 2 1 1" "0 0 0 0"
+actual=0
+errout="$(env -u FANDHE_IDLE_MEMORY_SUPERVISED_SELFTEST bash "$target" --driver "$driver" 2>&1 >/dev/null)" || actual=$?
+if expect_exit "arg-expected-dir-required" 2 && expect_err "arg-expected-dir-required" "--expected-dir is required"; then
+  [ ! -f "$STUB_DIR/count" ] && [ -z "$(driver_log)" ] && pass "arg-expected-dir-required" || fail "arg-expected-dir-required (something was executed)"
+fi
+
+# 11c. --output の親が symlink・他ユーザー書き込み可（sticky なし）なら拒否 → 2。何も起動されない。
+new_case "0 0 0 0" "0 2 1 1" "0 0 0 0"
+mkdir -p "${STUB_DIR}/real" "${STUB_DIR}/open"
+ln -s "${STUB_DIR}/real" "${STUB_DIR}/link"
+chmod 777 "${STUB_DIR}/open"
+check_arg "arg-output-parent-symlink" "invalid-output" --driver "$driver" --output "${STUB_DIR}/link/x.json"
+check_arg "arg-output-parent-world-writable" "invalid-output" --driver "$driver" --output "${STUB_DIR}/open/x.json"
 
 # 12. 差し替え環境変数は selftest フラグなしでは拒否 → 2。
 new_case "0 0 0 0" "0 2 1 1" "0 0 0 0"

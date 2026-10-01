@@ -3,7 +3,7 @@
 //! 常駐デーモンを持たない設計（CORE-1・D-19）の実装主体で、コンテナ 1 つにつき 1 プロセスで監視する（SUP-1）。
 //! PLUG-1 区分は core（plugin 境界〔PLUG-2〕を経由せず実行層コアの一部。crate-naming.md）。
 //!
-//! 現状は状態配線（[`state`]。TASK-157.3）と監視ループ基本（[`run`]。TASK-157.4）、restart の土台（異常終了時の `restart_count` 更新。TASK-157.5）、healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）が実装済みで、restart ポリシー本体（SUP-3）・logs 等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
+//! 現状は状態配線（[`state`]。TASK-157.3）・監視ループ基本（[`run`]。TASK-157.4）・restart の土台（異常終了時の `restart_count` 更新。TASK-157.5）・healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）・logs 捕捉の土台（[`logs`]。TASK-157.7。永続化・ローテーションは SUP-7・TASK-164 で未実装）が実装済みで、restart ポリシー本体（SUP-3）等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
 //! 本体は G12（TASK-157〜171）で、次の分割に沿って実装する。
 //!
 //! | issue | TASK | 内容 |
@@ -13,7 +13,7 @@
 //! | #238 | TASK-157.4 | 監視ループ基本（実装済み） |
 //! | #239 | TASK-157.5 | restart の土台（実装済み。ポリシー本体は SUP-3 で未実装） |
 //! | #240 | TASK-157.6 | healthcheck フックの土台（実装済み。コマンド実行・周期実行は TASK-161） |
-//! | #241 | TASK-157.7 | logs（未実装） |
+//! | #241 | TASK-157.7 | logs 捕捉の土台（実装済み。永続化・ローテーションは SUP-7・TASK-164 で未実装） |
 //! | #242 | TASK-157.8 | 結合テスト |
 //! | #1069 | TASK-157.9 | state.json 書き込み排他 |
 //!
@@ -21,5 +21,6 @@
 //! `StateStore` は core の既定実装を使い、2 つ目の実装は持たない（決定 6）。
 
 pub mod health;
+pub mod logs;
 pub mod run;
 pub mod state;

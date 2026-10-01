@@ -85,6 +85,9 @@ readonly STATE_POLL_MAX=500
 # kill 後に delete を再試行する最大回数と間隔（秒）。時間上限は --timeout 秒。
 readonly DELETE_RETRY_MAX=100
 readonly DELETE_RETRY_INTERVAL=0.1
+readonly DELETE_RETRY_INTERVAL_US=100000
+# 後始末で残り時間がこれ（マイクロ秒）を下回ったらランタイムを呼ばずに打ち切る。
+readonly MIN_CALL_BUDGET_US=100000
 
 usage() {
   cat >&2 <<'USAGE'
@@ -237,6 +240,9 @@ leftover_ids=()
 rc=0
 # create の終了コード（create 未成功時の未作成判定に使う）。
 create_rc=0
+# 後始末全体の期限（マイクロ秒）。空でなければ run_rt は各呼び出しへ残り時間だけを渡す
+# （finish_container が設定・解除する。REPAIR-5）。
+rt_deadline_us=""
 # query_state の結果（終了コード・status）。
 state_rc=0
 state_status=""
@@ -244,20 +250,41 @@ state_status=""
 # ランタイム呼び出し本体。stdout/stderr はファイルへ逃がす（コンテナ側がパイプを
 # 保持して create が戻らないランタイムへの対策）。stdin は /dev/null。
 # 引数: <stdout ファイル> <stderr ファイル（stdout と同じパスなら併合）> <ランタイム引数...>
+# 時間上限: 通常は 1 呼び出しにつき --timeout 秒（TERM 後の KILL 猶予 KILL_AFTER_SECS 秒）。
+# rt_deadline_us が設定されている間（後始末中）は、TERM までの時間と KILL 猶予の合計が
+# 期限までの残り時間に収まるよう配分し、残りが MIN_CALL_BUDGET_US 未満なら呼ばずに
+# 124（timeout と同じ値）を返す。
 run_rt() {
   local out="$1" errf="$2"
   shift 2
-  local status=0
+  local status=0 limit="$timeout_secs" grace="$KILL_AFTER_SECS"
+  if [ -n "$rt_deadline_us" ]; then
+    local rem g
+    rem=$((rt_deadline_us - $(now_us)))
+    if [ "$rem" -lt "$MIN_CALL_BUDGET_US" ]; then
+      return 124
+    fi
+    # KILL 猶予は残り時間の半分（最大 1 秒）とし、残りを TERM までの時間にする。
+    g=$((rem / 2))
+    [ "$g" -gt 1000000 ] && g=1000000
+    limit="$(us_to_secs $((rem - g)))"
+    grace="$(us_to_secs "$g")"
+  fi
   # サブシェルで ulimit -f を掛け、出力量が上限を超えたら SIGXFSZ で失敗させる
   # （--timeout は出力量を制限しないため）。上限はサブシェル内に閉じる。
   (
     ulimit -f "$LOG_MAX_KIB"
     if [ "$out" = "$errf" ]; then
-      exec timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" "$runtime" "$@" </dev/null >"$out" 2>&1
+      exec timeout --kill-after="$grace" "$limit" "$runtime" "$@" </dev/null >"$out" 2>&1
     fi
-    exec timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" "$runtime" "$@" </dev/null >"$out" 2>"$errf"
+    exec timeout --kill-after="$grace" "$limit" "$runtime" "$@" </dev/null >"$out" 2>"$errf"
   ) || status=$?
   return "$status"
+}
+
+# マイクロ秒を timeout(1) が受け付ける秒の小数表記にする（例: 1500000 -> 1.500000）。
+us_to_secs() {
+  printf '%d.%06d' $(($1 / 1000000)) $(($1 % 1000000))
 }
 
 # --- ランタイム呼び出し部（CLI 契約が変わった場合はこの 6 関数のみ差し替える） ---
@@ -333,8 +360,9 @@ create_not_made() {
 
 # コンテナを削除する。delete が失敗したら kill KILL を送り、プロセスの終了を待ちながら
 # delete を再試行する（OCI の delete は実行中コンテナを拒否し、kill は終了を待たないため）。
-# 待機は --timeout 秒・DELETE_RETRY_MAX 回で打ち切る（REPAIR-5）。それでも残れば
-# leftover_ids に記録して非ゼロを返す。
+# 後始末全体（state・delete・kill・再試行と待機）を開始時に決めた 1 つの期限（--timeout 秒）
+# 内に収め、各ランタイム呼び出しには残り時間だけを渡す（run_rt。REPAIR-5）。再試行は
+# DELETE_RETRY_MAX 回でも打ち切る。それでも残れば leftover_ids に記録して非ゼロを返す。
 # 引数: <id> <created>
 #   created=1: create 成功済み。OCI の create は ID 重複時に必ず失敗するため、この ID の
 #              コンテナは今回作ったものであり、そのまま delete / kill を送る。
@@ -345,6 +373,15 @@ create_not_made() {
 #              記録し、手動での確認を促す（所有を証明できないコンテナへ破壊的操作を送らない。
 #              特権操作の後始末）。
 finish_container() {
+  local status=0
+  rt_deadline_us=$(($(now_us) + timeout_secs * 1000000))
+  finish_container_within_deadline "$@" || status=$?
+  rt_deadline_us=""
+  return "$status"
+}
+
+# finish_container の本体（rt_deadline_us が設定された状態で呼ばれる）。
+finish_container_within_deadline() {
   local id="$1" created="$2"
   local log="$tmpdir/cleanup-$id.log"
   if [ "$created" = "0" ]; then
@@ -360,12 +397,15 @@ finish_container() {
     return 0
   fi
   rt_kill "$log" "$id" || true
-  local deadline tries=0
-  deadline=$(($(now_us) + timeout_secs * 1000000))
-  while [ "$tries" -lt "$DELETE_RETRY_MAX" ] && [ "$(now_us)" -lt "$deadline" ]; do
+  local tries=0
+  while [ "$tries" -lt "$DELETE_RETRY_MAX" ] && [ $((rt_deadline_us - $(now_us))) -ge "$MIN_CALL_BUDGET_US" ]; do
     tries=$((tries + 1))
     if rt_delete "$log" "$id"; then
       return 0
+    fi
+    # 待機後に呼び出せる残り時間がなければ期限を越えて待たずに打ち切る。
+    if [ $((rt_deadline_us - $(now_us))) -lt $((DELETE_RETRY_INTERVAL_US + MIN_CALL_BUDGET_US)) ]; then
+      break
     fi
     sleep "$DELETE_RETRY_INTERVAL"
   done

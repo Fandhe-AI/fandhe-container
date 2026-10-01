@@ -129,26 +129,79 @@ mod linux {
     }
 
     fn make_rootfs() -> Rootfs {
-        let base = std::fs::canonicalize(std::env::temp_dir())
-            .expect("canonicalize temp_dir")
-            .join(format!("fandhe-nsiso-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("proc")).expect("create rootfs/proc");
+        use std::os::unix::fs::DirBuilderExt;
+
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp_dir");
+        // 既存パスは削除せず、排他的な `mkdir`（`create_dir`。既存・symlink なら `AlreadyExists`）で
+        // 作成する。衝突時は名前を変えて少数回だけ再試行し、尽きたら中断する（破壊的な事前削除をしない）。
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let mut created = None;
+        for attempt in 0..16u32 {
+            let cand = tmp.join(format!(
+                "fandhe-nsiso-{}-{nanos}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&cand) {
+                Ok(()) => {
+                    created = Some(cand);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create rootfs dir {cand:?}: {e}"),
+            }
+        }
+        let base = created.expect("exclusive rootfs dir creation exhausted retries");
+        // 以降の失敗でも作成済みの自前ディレクトリは Drop で回収する。
+        let rootfs = Rootfs(base.clone());
+        std::fs::create_dir(base.join("proc")).expect("create rootfs/proc");
         std::fs::write(base.join(MARKER), MARKER_BODY).expect("write marker");
-        Rootfs(base)
+        rootfs
+    }
+
+    /// プロセスグループ `pgid` の全員へ SIGKILL を送る（`kill -KILL -- -<pgid>`）。
+    /// 新しい PID namespace の PID 1 も親 namespace からの SIGKILL は受け付けるため container 段も止まる。
+    /// 外部コマンドの待機にも上限を設ける（REPAIR-5）。
+    fn kill_group(pgid: u32) {
+        let Ok(mut killer) = Command::new("kill")
+            .args(["-KILL", "--"])
+            .arg(format!("-{pgid}"))
+            .stdin(Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if matches!(killer.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = killer.kill();
+        let _ = killer.wait();
     }
 
     /// 子を起動して終了コード 0 を待つ。超過時は kill して panic する（REPAIR-5）。
     fn run_stage(flag: &str, rootfs: &Path, host_pid: u32, ns: &[String]) {
+        use std::os::unix::process::CommandExt;
+
         let exe = std::env::current_exe().expect("current_exe");
-        let mut child = Command::new(exe)
-            .arg(flag)
+        let mut cmd = Command::new(exe);
+        cmd.arg(flag)
             .arg(rootfs)
             .arg(host_pid.to_string())
             .args(ns)
-            .stdin(Stdio::null())
-            .spawn()
-            .expect("spawn stage");
+            .stdin(Stdio::null());
+        // host 段が起動する launcher は新しいプロセスグループのリーダーにする。launcher が起動する
+        // container 段は同グループを継承するため、タイムアウト時にグループ全体を kill して子孫を残さない。
+        let own_group = flag == "--launcher";
+        if own_group {
+            cmd.process_group(0);
+        }
+        let mut child = cmd.spawn().expect("spawn stage");
         let deadline = Instant::now() + timeout();
         loop {
             match child.try_wait().expect("try_wait") {
@@ -157,6 +210,9 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
+                    if own_group {
+                        kill_group(child.id());
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     panic!("{flag} stage did not exit within {:?}", timeout());

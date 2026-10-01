@@ -29,9 +29,17 @@
 #   - 起動完了の通知: コンテナが実際に起動し終えたら、launcher は標準出力へ `READY` だけの行を 1 行出す
 #     （ログへ記録される）。本スクリプトはこの行を起動完了の明示的な ready 状態として扱い、プロセス数
 #     （--min-procs）だけでは完了と判定しない（起動途中の一時的な子プロセスで N/N 起動と誤判定しない）。
-#     ready 行は起動完了待ちと計測直前（measure_container）の両方で確認する。
+#     ready 行は起動完了待ち・計測直前（measure_container）・全コンテナ集計後の再確認で確認する。
+#   - ログ: launcher の標準出力・標準エラーは一時ディレクトリのログファイルへ直接書かせる。launcher と
+#     その子孫（コンテナ内の処理）へはリソース制限（ulimit -f 等）を掛けない（計測条件を変えないため）。
+#     上限は収集側（本スクリプト）で設ける: ログを読むのは先頭 LOG_MAX_KIB KiB と末尾数行だけで、
+#     READY 行はその範囲内に出すこと。ログが LOG_MAX_KIB KiB を超えたコンテナを検出したら計測を
+#     打ち切って失敗にし（log-limit-exceeded）、全 launcher を停止してログを削除する。検出は起動完了待ち・
+#     settle 待機（1 秒刻み）・集計後の各時点で行うため、超過の検出は最大で約 1 秒遅れる。
 #   - 停止: 直接の子へ SIGTERM、期限内に終了しなければ SIGKILL。launcher は SIGTERM でコンテナも
-#     終了させる。launcher が先に死んで子孫が再親化（孤児化）しても回収できるよう、起動時に環境変数
+#     終了させる。シグナルは、起動直後に記録した起動時刻（/proc/<pid>/stat の 22 番目）と親 pid が
+#     一致する場合にだけ送る（launcher の終了後に pid が再利用されても無関係なプロセスへ送らない）。
+#     launcher が先に死んで子孫が再親化（孤児化）しても回収できるよう、起動時に環境変数
 #     FANDHE_BENCH_OWNER=<実行ごとの乱数トークン> を launcher へ渡し、後始末では /proc/*/environ の
 #     トークン一致で所有プロセスを列挙して SIGKILL・残存確認する（子孫は環境を継承する。cgroup の作成には
 #     特権が要るためトークン方式にしている）。
@@ -46,17 +54,21 @@
 #
 # 計測手順（1 試行）: N 個を同時起動 → 起動完了待ち（期限 --timeout。launcher が生存し、READY 行を
 #   出力済みで、ツリーのプロセス数が --min-procs 以上）→ --settle 秒待機して再確認 → 全ツリーの Pss（smaps_rollup）・
-#   VmRSS（status）を合算 → 全 launcher を停止・回収。--trials 回繰り返し、試行ごとの集約 PSS の
+#   VmRSS（status）を合算 → 全コンテナの起動条件を再確認（集計中に終了したコンテナがあれば失敗）→
+#   全 launcher を停止・回収。--trials 回繰り返し、試行ごとの集約 PSS の
 #   中央値（偶数試行は中央 2 値の平均を小数 1 桁）を出力する。1 試行でも無効なら全体を失敗にする。
 #
 # 終了コード:
 #   0 = 全試行で N/N 起動し計測成功
 #   1 = 起動数不足・PSS 0 混入・メモリ値を読めない／数値でない・起動完了待ちの期限切れ・トークンを
-#       継承しない（後始末で回収できない）プロセスの混入（結果は公開しない）
+#       継承しない（後始末で回収できない）プロセスの混入・集計中のコンテナ終了・ログ上限超過
+#       （結果は公開しない）
 #   2 = 引数・入力エラー（--proc-root は FANDHE_CONCURRENT_MEMORY_SELFTEST=1 なしでは拒否）、出力先エラー、
 #       未対応の --mode（docker は TASK-50.2 で追加予定）
 #   3 = 前提欠如（非 Linux・smaps_rollup 非対応・bash 5 未満等。0 を返して合格に見せない）
 #   4 = 後始末失敗（起動したプロセスが残存。他の失敗より優先して返す）
+#   129 / 130 / 143 = HUP / INT / TERM による中断（後始末は必ず実行し、残存があれば 4 を優先する。
+#       後始末中に再度シグナルを受けても後始末を最後まで続ける）
 #   上記以外の値（set -e の暗黙終了等）を返さないよう、失敗しうる操作は明示的に分岐する。
 #
 # 出力（JSON。scripts/check-bench-regression.sh の results.json 互換）: schema_version・benchmark・
@@ -74,6 +86,10 @@
 #     読めない場合（環境を消去して exec・別ユーザー権限）は追跡不能として失敗にする（成功を公開しない）。
 #     launcher 正常終了後に新規に生じてトークンを持たない子孫までは検出できない（cgroup 方式は特権要）。
 #   - --output の親ディレクトリは実行ユーザー所有・group/other 書き込み不可で、祖先を含む全パス要素が非 symlink（".." 不可）に限る。
+#   - 集計後の再確認は「launcher の生存・READY・プロセス数」を見る。集計中に子孫が入れ替わっても
+#     プロセス数が --min-procs 以上なら検出しない。
+#   - 起動時刻の照合からシグナル送信までの間に pid が再利用される可能性は残る（bash からは pidfd を
+#     使えない）。照合の直後に送ることで窓を最小にしている。
 #   - /proc の読み取り自体にはタイムアウトがない（Makefile の concurrent-memory が timeout で包む）。
 #   - stderr に出す外部由来の文字列（ログ末尾等）は印字可能な ASCII 以外を `?` に置換する。
 
@@ -85,6 +101,8 @@ readonly MAX_SCAN_ATTEMPTS=10
 readonly POLL_INTERVAL=0.2
 readonly MAX_REPORT_IDS=5
 readonly MAX_LOG_TAIL=5
+# launcher 1 つのログの上限（KiB）。収集側の上限であり、launcher へ ulimit は掛けない。
+readonly LOG_MAX_KIB=2048
 # 10 進整数（先頭 0 付きは bash 算術で 8 進になるため拒否。13 桁まで）。
 readonly num_re='^(0|[1-9][0-9]{0,12})$'
 
@@ -251,13 +269,16 @@ if [ "$proc_root_given" -eq 0 ]; then
 else
   proc="${proc_root%/}"
 fi
-{ command -v sleep >/dev/null 2>&1 && command -v mktemp >/dev/null 2>&1; } || { err "unsupported-os" "sleep and mktemp are required"; exit 3; }
+for req in sleep mktemp head grep find tail; do
+  command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "sleep, mktemp, head, grep, find and tail are required"; exit 3; }
+done
 [ -r /proc/self/stat ] || { err "unsupported-os" "/proc/<pid>/stat is not available"; exit 3; }
 
 # --- 状態 ---
 tmpdir=""
 out_tmp=""
 pids=()
+pstart=()
 snaps=()
 known=()
 owner_tok=""
@@ -278,26 +299,75 @@ proc_alive() {
   return 0
 }
 
-# pid の起動時刻（pid 再利用の判別用。/proc/<pid>/stat の 22 番目）。
-proc_starttime() {
+# pid の起動時刻（pid 再利用の判別用。/proc/<pid>/stat の 22 番目）を ST へ入れる。読めなければ 1。
+# 同時起動の直後にも呼ぶため、コマンド置換（fork）を使わず変数で返す。
+read_starttime() {
   local s rest f
+  ST=""
   { IFS= read -r s <"/proc/$1/stat"; } 2>/dev/null || return 1
   rest="${s##*) }"
   read -ra f <<<"$rest"
   [ -n "${f[19]:-}" ] || return 1
-  printf '%s' "${f[19]}"
+  ST="${f[19]}"
+}
+
+# pid が「記録した起動時刻のまま生存している同一プロセス」か。消滅・ゾンビ・起動時刻の不一致（pid の
+# 再利用）・起動時刻を記録できなかった場合は 1。第 3 引数（親 pid）を渡すと親の一致も要求する。
+# stat を 1 回だけ読んで状態・親・起動時刻を同じ時点の値で判定する。
+same_proc_alive() { # <pid> <起動時刻> [<親 pid>]
+  local s rest f
+  [ -n "${2:-}" ] || return 1
+  { IFS= read -r s <"/proc/$1/stat"; } 2>/dev/null || return 1
+  rest="${s##*) }"
+  read -ra f <<<"$rest"
+  case "${f[0]:-}" in Z | X | x | '') return 1 ;; esac
+  [ "${f[19]:-}" = "$2" ] || return 1
+  [ -z "${3:-}" ] || [ "${f[1]:-}" = "$3" ]
+}
+
+# 起動時刻（と任意で親 pid）が一致する同一プロセスにだけシグナルを送る。本スクリプトのシグナル送信は
+# すべてここを通す（launcher・観測済みの子孫・トークン所有プロセス。無関係なプロセスを終了させない）。
+sig_same_proc() { # <シグナル名> <pid> <起動時刻> [<親 pid>]
+  same_proc_alive "$2" "$3" "${4:-}" || return 0
+  kill "-$1" "$2" 2>/dev/null || true
+}
+
+# コンテナ i の launcher が生存しているか（本スクリプトの直接の子で、起動時刻が起動直後の記録と一致）。
+ln_alive() { # <i>
+  same_proc_alive "${pids[$1]}" "${pstart[$1]:-}" "$$"
+}
+
+# pid が本スクリプトの直接の子として生存しているか（起動時刻は問わない）。起動時刻を照合できない
+# launcher を「シグナルは送らないが残存として報告する」ために使う（黙って残さない）。
+own_child_alive() { # <pid>
+  local s rest f
+  { IFS= read -r s <"/proc/$1/stat"; } 2>/dev/null || return 1
+  rest="${s##*) }"
+  read -ra f <<<"$rest"
+  case "${f[0]:-}" in Z | X | x | '') return 1 ;; esac
+  [ "${f[1]:-}" = "$$" ]
 }
 
 # --- launcher 契約の差し替え点（実 CLI 提供後はここだけ合わせる。REPAIR-3） ---
 
-# コンテナ 1 つ分の launcher を直接の子として起動し、pid を LAST_PID へ入れる。
-# 引数は配列で直接 exec する（eval・sh -c を使わない）。ログはサイズ上限つき。
+# コンテナ 1 つ分の launcher を直接の子として起動し、pid を LAST_PID、起動時刻を LAST_START へ入れる
+# （起動時刻を読めなければ空。空の launcher は以後「生存していない」と扱い、シグナルも送らない。
+# その pid が直接の子として生存し続けていれば、後始末で残存として報告し終了コード 4 にする）。
+# 引数は配列で直接 exec する（eval・sh -c を使わない）。launcher とその子孫へ ulimit 等のリソース制限は
+# 掛けない（コンテナ内の書き込みが失敗して計測条件が変わるため）。ログの上限は収集側（ln_ready の
+# 読み取り範囲と log_overflow の監視）で設ける。
 ln_spawn() { # <id> <logfile>
   (
-    ulimit -f 2048 2>/dev/null || true
     FANDHE_BENCH_OWNER="$owner_tok" exec "$launcher" run --id "$1" --bundle "$bundle" </dev/null >"$2" 2>&1
   ) &
   LAST_PID=$!
+  LAST_START=""
+  if read_starttime "$LAST_PID"; then LAST_START="$ST"; fi
+  # FANDHE_CONCURRENT_MEMORY_SELFTEST_STALE_START は selftest が「記録した起動時刻と一致しない pid
+  # （再利用された pid）」を模すための専用フック。一致しない pid へはシグナルを送らないことを照合する。
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ] && [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST_STALE_START:-}" = "1" ]; then
+    LAST_START="0"
+  fi
 }
 
 # pid p の子（全スレッド分）を children へ入れる。children ファイルが無い環境では PPid 走査。
@@ -363,10 +433,10 @@ ln_collect_pids() {
 # 子孫より先に死ぬと親子関係をたどれなくなる（子は親を失って再親化される）ため、生存中に観測した
 # 子孫を覚えておき、後始末で起動時刻が一致するもの（pid 再利用でないもの）にだけ SIGKILL を送る。
 record_tree() { # <i>
-  local i="$1" pid st desc
+  local i="$1" pid desc
   for pid in "${tree_pids[@]:1}"; do
-    if st="$(proc_starttime "$pid")"; then
-      desc="${pid}:${st}"
+    if read_starttime "$pid"; then
+      desc="${pid}:${ST}"
       case " ${known[i]:-} " in
         *" ${desc} "*) ;;
         *) known[i]="${known[i]:-}${desc} " ;;
@@ -376,12 +446,34 @@ record_tree() { # <i>
 }
 
 # launcher が標準出力（ログ）へ `READY` 行を出したか（起動完了の明示的な ready 状態）。
+# 読むのは先頭 LOG_MAX_KIB KiB まで（収集側の上限。巨大なログを全量読まない）。
 ln_ready() { # <logfile>
-  [ -r "$1" ] && grep -qxF -- "READY" "$1" 2>/dev/null
+  [ -r "$1" ] && grep -qxF -- "READY" < <(head -c "$((LOG_MAX_KIB * 1024))" -- "$1" 2>/dev/null) 2>/dev/null
+}
+
+# ログが上限（LOG_MAX_KIB KiB）を超えた launcher があれば、その ID を LOG_OVER へ入れて 0 を返す。
+# launcher 側を制限せずにディスク消費を抑えるための収集側の監視で、検出したら呼び出し側が計測を
+# 失敗にして後始末（全 launcher の停止とログの削除）へ進む。
+log_overflow() {
+  local f
+  LOG_OVER=""
+  f="$(find "$tmpdir" -maxdepth 1 -type f -name "${id_prefix}-*.log" -size "+${LOG_MAX_KIB}k" -print -quit 2>/dev/null || true)"
+  [ -n "$f" ] || return 1
+  f="${f##*/}"
+  LOG_OVER="${f%.log}"
+}
+
+# ログ上限超過を検出したら失敗として終了する（結果は公開しない。後始末は EXIT trap）。
+fail_on_log_overflow() { # <trial>
+  if log_overflow; then
+    err "log-limit-exceeded" "trial=$1 id=${LOG_OVER} limit_kib=${LOG_MAX_KIB}"
+    exit 1
+  fi
 }
 
 # 環境変数トークン FANDHE_BENCH_OWNER が一致する生存プロセス（launcher の孤児化した子孫を含む）を
-# OWNED へ入れる。トークンは実行ごとの乱数で、pid 再利用による誤検出は起きない。
+# 「pid:起動時刻」で OWNED へ入れる。トークンは実行ごとの乱数。列挙からシグナル送信までの間の pid
+# 再利用に備え、送信時は起動時刻とトークンを再照合する（owned_kill）。
 owned_scan() {
   local f p
   OWNED=()
@@ -390,7 +482,7 @@ owned_scan() {
     p="${f#"$proc"/}"
     p="${p%%/*}"
     [[ "$p" =~ $num_re ]] || continue
-    if proc_alive "$p"; then OWNED+=("$p"); fi
+    if read_starttime "$p" && proc_alive "$p"; then OWNED+=("${p}:${ST}"); fi
   done < <(grep -lzxF -- "FANDHE_BENCH_OWNER=${owner_tok}" "$proc"/[0-9]*/environ 2>/dev/null || true)
 }
 
@@ -400,19 +492,28 @@ owned_by_token() { # <pid>
   [ -r "$proc/$1/environ" ] && grep -qzxF -- "FANDHE_BENCH_OWNER=${owner_tok}" "$proc/$1/environ" 2>/dev/null
 }
 
+# OWNED の各プロセスへ、トークンと起動時刻を再照合してから SIGKILL を送る。
+owned_kill() {
+  local desc pid
+  for desc in "${OWNED[@]}"; do
+    pid="${desc%%:*}"
+    if owned_by_token "$pid"; then sig_same_proc KILL "$pid" "${desc#*:}"; fi
+  done
+}
+
 any_alive() {
-  local pid
-  for pid in "${pids[@]}"; do
-    if proc_alive "$pid"; then return 0; fi
+  local i
+  for i in "${!pids[@]}"; do
+    if ln_alive "$i"; then return 0; fi
   done
   return 1
 }
 
-# 全 launcher を停止・回収する（SIGTERM → 期限内に終了しなければ SIGKILL。launcher の消滅後に
-# 残った子孫は、起動時刻が一致するもの＝pid 再利用でないものにだけ SIGKILL）。残存があれば 4 を返す。
-# 成功・失敗・シグナルのいずれでも呼ばれる（EXIT trap）。何度呼んでも安全。
+# 全 launcher を停止・回収する（SIGTERM → 期限内に終了しなければ SIGKILL。launcher にも、launcher の
+# 消滅後に残った子孫にも、起動時刻が一致するもの＝pid 再利用でないものにだけシグナルを送る）。
+# 残存があれば 4 を返す。成功・失敗・シグナルのいずれでも呼ばれる（EXIT trap）。何度呼んでも安全。
 ln_stop() {
-  local i pid grace desc st waited residual=()
+  local i pid grace desc waited residual=()
   [ "${#pids[@]}" -gt 0 ] || return 0
   grace="$timeout_s"
   [ "$grace" -le 10 ] || grace=10
@@ -422,8 +523,8 @@ ln_stop() {
     record_tree "$i"
     snaps[i]="${known[i]:-}"
   done
-  for pid in "${pids[@]}"; do
-    if proc_alive "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
+  for i in "${!pids[@]}"; do
+    sig_same_proc TERM "${pids[i]}" "${pstart[i]:-}" "$$"
   done
   waited=0
   while [ "$waited" -lt "$((grace * 5))" ] && any_alive; do
@@ -432,8 +533,8 @@ ln_stop() {
   done
   # FANDHE_CONCURRENT_MEMORY_SELFTEST_NOKILL は selftest が「回収不能」を模すための専用フック。
   if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" != "1" ] || [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST_NOKILL:-}" != "1" ]; then
-    for pid in "${pids[@]}"; do
-      if proc_alive "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
+    for i in "${!pids[@]}"; do
+      sig_same_proc KILL "${pids[i]}" "${pstart[i]:-}" "$$"
     done
     waited=0
     while [ "$waited" -lt 25 ] && any_alive; do
@@ -442,15 +543,12 @@ ln_stop() {
     done
     for i in "${!pids[@]}"; do
       for desc in ${snaps[i]}; do
-        pid="${desc%%:*}"
-        if [ "$(proc_starttime "$pid" 2>/dev/null || true)" = "${desc#*:}" ] && proc_alive "$pid"; then
-          kill -KILL "$pid" 2>/dev/null || true
-        fi
+        sig_same_proc KILL "${desc%%:*}" "${desc#*:}"
       done
     done
     # launcher が先に死んで再親化された子孫は、環境変数トークンで所有プロセスとして列挙して回収する。
     owned_scan
-    for pid in "${OWNED[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
+    owned_kill
     waited=0
     while [ "$waited" -lt 25 ]; do
       owned_scan
@@ -462,22 +560,34 @@ ln_stop() {
   fi
   for i in "${!pids[@]}"; do
     pid="${pids[i]}"
-    if proc_alive "$pid"; then residual+=("pid=${pid}"); else wait "$pid" 2>/dev/null || true; fi
+    # 終了済みの launcher だけを wait で回収する。起動時刻を照合できないが本スクリプトの直接の子として
+    # 生存しているものは、シグナルを送らずに残存として報告する（黙って残さない）。それ以外の生存
+    # プロセス（再利用された pid）は本スクリプトの launcher ではないので、残存にも数えず wait もしない。
+    if ln_alive "$i" || own_child_alive "$pid"; then
+      case " ${residual[*]:-} " in
+        *" pid=${pid} "*) ;;
+        *) residual+=("pid=${pid}") ;;
+      esac
+    elif ! proc_alive "$pid"; then
+      wait "$pid" 2>/dev/null || true
+    fi
     for desc in ${snaps[i]}; do
       pid="${desc%%:*}"
-      if [ "$(proc_starttime "$pid" 2>/dev/null || true)" = "${desc#*:}" ] && proc_alive "$pid"; then
+      if same_proc_alive "$pid" "${desc#*:}"; then
         residual+=("pid=${pid}")
       fi
     done
   done
   owned_scan
-  for pid in "${OWNED[@]}"; do
+  for desc in "${OWNED[@]}"; do
+    pid="${desc%%:*}"
     case " ${residual[*]:-} " in
       *" pid=${pid} "*) ;;
       *) residual+=("pid=${pid}") ;;
     esac
   done
   pids=()
+  pstart=()
   snaps=()
   known=()
   if [ "${#residual[@]}" -gt 0 ]; then
@@ -487,8 +597,14 @@ ln_stop() {
   return 0
 }
 
+# 終了時の後始末（EXIT trap）。後始末の途中で TERM / INT / HUP を再度受けても中断しないよう、最初に
+# 3 つのシグナルを無処理（':'）へ切り替える（idle_memory_supervised.sh の cleanup と同じ方式。
+# ln_stop は最大 20 秒ほど待つため、Ctrl+C の連打や外側 timeout の再送で launcher を残さない）。
 on_exit() {
   local rc=$?
+  # 先にシグナルを無処理にしてから EXIT trap を外す（逆順だと、その間に届いたシグナルの exit で
+  # 後始末を通らずに終了する）。
+  trap ':' TERM INT HUP
   trap - EXIT
   ln_stop || rc=4
   if [ -n "$out_tmp" ]; then rm -f "$out_tmp"; fi
@@ -496,8 +612,17 @@ on_exit() {
   exit "$rc"
 }
 trap on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+
+# TERM / INT / HUP を受けたら 128+signal で exit し、EXIT trap の後始末を必ず通す。以降のシグナルは
+# 無処理にして、後始末へ入るまでの間に 2 回目のシグナルで exit し直さないようにする。
+on_signal() { # <終了コード>
+  trap ':' TERM INT HUP
+  err "interrupted" "received signal (exit $1); running cleanup"
+  exit "$1"
+}
+trap 'on_signal 143' TERM
+trap 'on_signal 130' INT
+trap 'on_signal 129' HUP
 
 if ! tmpdir="$(mktemp -d)"; then err "invalid-input" "cannot create a temporary directory"; exit 2; fi
 # 所有プロセス追跡用の実行ごとの乱数トークン（mktemp が返す英数字のディレクトリ名を流用）。
@@ -541,7 +666,7 @@ measure_container() {
     record_tree "$i"
     if [ "$rc" -ne 0 ]; then m_reason="process-tree-unavailable"; return 1; fi
     # 計測時点でも起動条件（ツリーのプロセス数 >= --min-procs）を満たすこと。満たさなければ過少計上。
-    if ! proc_alive "${pids[i]}" || [ "${#tree_pids[@]}" -lt "$min_procs" ]; then
+    if ! ln_alive "$i" || [ "${#tree_pids[@]}" -lt "$min_procs" ]; then
       m_reason="process-tree-too-small"
       return 1
     fi
@@ -581,7 +706,7 @@ measure_container() {
 
 container_ok() { # <i>
   local rc=0
-  proc_alive "${pids[$1]}" || return 1
+  ln_alive "$1" || return 1
   ln_ready "$tmpdir/${id_prefix}-${t}-$(($1 + 1)).log" || return 1
   ln_collect_pids "${pids[$1]}" || rc=$?
   record_tree "$1"
@@ -620,6 +745,7 @@ t=1
 while [ "$t" -le "$trials" ]; do
   mem_before="$(mem_available)"
   pids=()
+  pstart=()
   known=()
   ok_flags=()
   i=0
@@ -628,6 +754,7 @@ while [ "$t" -le "$trials" ]; do
     id="${id_prefix}-${t}-$((i + 1))"
     ln_spawn "$id" "$tmpdir/$id.log"
     pids+=("$LAST_PID")
+    pstart+=("$LAST_START")
     ok_flags+=(0)
     i=$((i + 1))
   done
@@ -640,16 +767,23 @@ while [ "$t" -le "$trials" ]; do
       [ "${ok_flags[i]}" = "1" ] && continue
       if container_ok "$i"; then
         ok_flags[i]=1
-      elif proc_alive "${pids[i]}"; then
+      elif ln_alive "$i"; then
         pending=1
       fi
     done
+    fail_on_log_overflow "$t"
     [ "$pending" -eq 1 ] || break
     [ "$SECONDS" -lt "$deadline" ] || break
     sleep "$POLL_INTERVAL"
   done
 
-  if [ "$settle" -gt 0 ]; then sleep "$settle"; fi
+  # settle 待機は 1 秒刻みにして、待機中もログ上限を監視する。
+  settled=0
+  while [ "$settled" -lt "$settle" ]; do
+    sleep 1
+    settled=$((settled + 1))
+    fail_on_log_overflow "$t"
+  done
   n_started=0
   for i in "${!pids[@]}"; do
     if [ "${ok_flags[i]}" = "1" ] && container_ok "$i"; then
@@ -683,6 +817,23 @@ while [ "$t" -le "$trials" ]; do
     err "measurement-failed" "trial=${t} zero_pss_count=${zero_pss} (refusing to sum containers with PSS 0)"
     exit 1
   fi
+  # 集計は 1 コンテナずつ順に行うため、先に集計したコンテナが後続の集計中に終了し得る。全コンテナの
+  # 集計後に起動条件（launcher の生存・READY・プロセス数 >= --min-procs）を全件で再確認し、1 つでも
+  # 欠けていれば「N 個同時稼働時の集約値」ではないので失敗にする（CORE-9。過少計上を公開しない）。
+  n_started=0
+  for i in "${!pids[@]}"; do
+    if container_ok "$i"; then
+      n_started=$((n_started + 1))
+    else
+      ok_flags[i]=0
+    fi
+  done
+  if [ "$n_started" -lt "$count" ]; then
+    err "measurement-failed" "trial=${t} running_after_measurement=${n_started}/${count} reason=container-exited-during-measurement"
+    report_unstarted "$t"
+    exit 1
+  fi
+  fail_on_log_overflow "$t"
   mem_after="$(mem_available)"
   trial_pss+=("$pss_total")
   trial_rss+=("$rss_total")

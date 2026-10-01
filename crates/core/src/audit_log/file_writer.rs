@@ -226,11 +226,12 @@ impl AuditFileWriter {
 #[cfg(target_os = "linux")]
 fn open_checked(path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
     use std::fs::OpenOptions;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 
     let flags = crate::sys::nofollow_nonblock_open_flags()
         .ok_or_else(|| AuditWriteError::new(AuditWriteErrorKind::Unsupported))?;
     let file = OpenOptions::new()
+        .read(true)
         .append(true)
         .create(true)
         .mode(0o600)
@@ -246,9 +247,20 @@ fn open_checked(path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
     if meta.uid() != crate::sys::effective_uid() || meta.mode() & 0o077 != 0 {
         return Err(AuditWriteError::new(AuditWriteErrorKind::InsecureFile));
     }
+    // 再オープン時に末尾が LF でない（前回プロセスの torn line）場合、最初の追記前に LF を挿入して
+    // 新レコードを既存の部分行から隔離する。pread なので O_APPEND の書き込み位置に影響しない。
+    let needs_line_break = match meta.len().checked_sub(1) {
+        None => false,
+        Some(last) => {
+            let mut b = [0u8; 1];
+            file.read_exact_at(&mut b, last)
+                .map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Open))?;
+            b[0] != b'\n'
+        }
+    };
     Ok(AuditFileWriter {
         file,
-        needs_line_break: false,
+        needs_line_break,
     })
 }
 
@@ -528,5 +540,31 @@ mod tests {
         let mut w = failing_writer();
         assert!(w.write_record(&sample()).is_err());
         assert!(w.needs_line_break);
+    }
+
+    /// SEC-4・TASK-41.5.1: 末尾が LF でない既存ファイルを再オープンしても、新レコードは独立した行になる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_task41_5_1_reopen_isolates_torn_tail() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fandhe-auditw-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.log");
+        std::fs::write(&path, b"{\"torn\":").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut w = AuditFileWriter::open(&path).unwrap();
+        w.write_record(&sample()).unwrap();
+        drop(w);
+        // LF で終わる既存ファイルの再オープンでは余分な空行を入れない。
+        let mut w = AuditFileWriter::open(&path).unwrap();
+        w.write_record(&sample()).unwrap();
+        drop(w);
+
+        let got = std::fs::read_to_string(&path).unwrap();
+        let line = text(&sample());
+        assert_eq!(got, format!("{{\"torn\":\n{line}{line}"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

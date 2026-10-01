@@ -8,6 +8,9 @@
 //!
 //! # 呼び出し元・契約
 //!
+//! - マウント検証/API レイヤーの記録ヘルパと記録先トレイトは [`mount`]・[`AuditSink`]（TASK-41.4・#195。
+//!   `exec::audit_mount_violation` と `oci_runtime::audit_mount_config_error` がここを使う。
+//!   本番経路への配線・永続化は未実装）
 //! - TASK-41.2（#193 seccomp フック）・41.3（#194 Landlock フック）・41.4（#195 マウント検証/API。
 //!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
 //! - 永続化・エンコード（JSON Lines 等）は TASK-41.5 系（#839）、カーネル監査連携・クラッシュ時の記録保持は
@@ -30,6 +33,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::seccomp::SyscallNr;
 use crate::traits::ErrorCode;
+
+pub mod mount;
+mod sink;
+
+pub use mount::{AuditDelivery, AuditedRejection, current_pid, record_mount_rejection};
+pub use sink::AuditSink;
 
 /// [`AuditPath`] が保持するバイト長の上限（Linux の `PATH_MAX` に合わせる。超過分は切り詰める）。
 pub const AUDIT_PATH_MAX_BYTES: usize = 4096;

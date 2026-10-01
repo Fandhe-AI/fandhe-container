@@ -261,7 +261,7 @@ mod linux {
         }
     }
 
-    /// 子を起動して終了コード 0 を待つ。超過時は kill して panic する（REPAIR-5）。
+    /// 子を起動して終了コード 0 を待つ。超過時・終了後はグループ全体を止めて残存を確認する（REPAIR-5）。
     fn run_stage(flag: &str, rootfs: &Path, host_pid: u32, ns: &[String]) {
         use std::os::unix::process::CommandExt;
 
@@ -283,7 +283,19 @@ mod linux {
         loop {
             match child.try_wait().expect("try_wait") {
                 Some(status) => {
-                    assert_eq!(status.code(), Some(0), "{flag} stage must exit with 0");
+                    // 正常・異常どちらの終了でも、launcher が残した container 段を止めて残存なしを確認してから
+                    // 判定する（signal 死等で container が生きたまま rootfs 削除へ進まないため）。
+                    let cleanup = if own_group {
+                        kill_group(child.id())
+                    } else {
+                        Ok(())
+                    };
+                    assert_eq!(
+                        status.code(),
+                        Some(0),
+                        "{flag} stage must exit with 0 (status: {status:?}, cleanup: {cleanup:?})"
+                    );
+                    assert_eq!(cleanup, Ok(()), "{flag} stage left processes in its group");
                     return;
                 }
                 None if Instant::now() >= deadline => {

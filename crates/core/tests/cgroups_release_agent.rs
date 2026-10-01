@@ -23,7 +23,9 @@
 //!    `notify_on_release` を作成・参照しないこと。コメント行は対象外、行末コメントは除去しない（fail-closed）。
 //! 2. Linux の実ホスト確認（既定のテスト集合・特権不要）: `/sys/fs/cgroup` が cgroup2 ならルートと自
 //!    cgroup に当該ファイルが無いこと、そうでなければ `DelegatedCgroup::detect` が構造化エラーで拒否すること。
-//!    ホスト状態に応じたテスト内分岐であり skip ではない（どの分岐も必ず assert する）。
+//!    ホスト状態に応じたテスト内分岐であり skip ではない（どの分岐も必ず assert する）。v1/hybrid 拒否は
+//!    cgroup2 検証に到達した拒否のみ成功とし、非 root のルート cgroup 所属による事前の委譲拒否は
+//!    別の期待結果（前提を確認し未検証と明示）として分離する。
 //! 3. 委譲 cgroup 上の実機確認（`#[ignore]`）: 実際に作った cgroup に当該ファイルが無く、作成も拒否される
 //!    こと。委譲された cgroup v2 サブツリーが必要で GitHub ホステッド runner では保証できないため既定の
 //!    集合から分離している（CI 通過のための弱体化ではない）。
@@ -237,15 +239,43 @@ mod linux {
             let err = DelegatedCgroup::detect()
                 .expect_err("v1/hybrid/unmounted cgroup must be rejected (CORE-4)");
             let pair = (err.code, err.step);
-            let allowed = [
+            // cgroup2 検証（`ReadSelfCgroup` / `VerifyCgroup2` / `OpenRoot`）に到達した拒否。
+            let verified = [
                 (ErrorCode::FailedPrecondition, CgroupStep::ReadSelfCgroup),
                 (ErrorCode::FailedPrecondition, CgroupStep::VerifyCgroup2),
                 (ErrorCode::NotFound, CgroupStep::OpenRoot),
-                // `detect` は cgroup2 検査より前に、ルート cgroup 所属の非 root を拒否する。
-                (ErrorCode::PermissionDenied, CgroupStep::CheckDelegation),
             ];
-            assert!(allowed.contains(&pair), "unexpected rejection: {err:?}");
+            if pair == (ErrorCode::PermissionDenied, CgroupStep::CheckDelegation) {
+                // `detect` は cgroup2 検証より前に、ルート cgroup 所属の非 root を拒否する。
+                // 検証到達とは別の期待結果として、その前提（非 root かつルート cgroup 所属）を確認し、
+                // v1/hybrid 拒否は未検証である旨を明示する。前提が成立しない委譲拒否は失敗とする。
+                assert!(
+                    non_root_in_root_cgroup(),
+                    "early delegation rejection without its precondition: {err:?}"
+                );
+                eprintln!(
+                    "note: cgroup2 verification not reached (non-root in root cgroup); \
+                     v1/hybrid rejection is not verified on this host"
+                );
+            } else {
+                assert!(verified.contains(&pair), "unexpected rejection: {err:?}");
+            }
         }
+    }
+
+    /// 非 root（実 UID が 0 以外）かつ自 cgroup がルート（`0::/`）か。`detect` の事前拒否条件と同じ。
+    fn non_root_in_root_cgroup() -> bool {
+        let status = read_limited("/proc/self/status");
+        let euid_nonzero = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|v| v.split_whitespace().nth(1)) // 2 番目が実効 UID
+            .is_some_and(|u| u != "0");
+        let in_root = read_limited("/proc/self/cgroup")
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .is_some_and(|p| p.trim() == "/");
+        euid_nonzero && in_root
     }
 
     /// 後始末（作成した子 cgroup の削除）を assert 失敗時にも走らせるためのガード。

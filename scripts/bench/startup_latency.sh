@@ -8,8 +8,8 @@
 # を求める（Linux の Docker ベースラインは 0.290〜0.298 秒・node4 実測）。本スクリプトは
 # TASK-46（担当: 人間）のうち Claude Code 担当分である計測ハーネスの準備までを担い、
 # 実機での実測・Docker 比較・Conditional Go 条件 1 の判定は #213（TASK-46.h1）で人間が行う。
-# Docker 側の同一手法計測は #842（TASK-46.2）が本スクリプトを拡張して追加する
-# （1 回分の計測を measure_once に分け、出力に計測対象 `target`〔--target で明示〕を持たせてある）。
+# Docker 側の計測と own・Docker の統合レポートは TASK-46.2（#842）で本スクリプトの
+# `--mode docker` / `--mode report` として追加した（下記「モード」）。
 #
 # 現状の制約（REPAIR-3: 実装済みを装わない）:
 #   - crates/cli は雛形で fandhe-container バイナリは未提供（TASK-79 で追加予定）。
@@ -25,8 +25,9 @@
 #     明確な不存在応答として使う（rt_is_not_found）。構造化エラーを出さないランタイム（runc 等）
 #     では create 失敗時に未作成を確定できず、その ID に操作を送らずに exit 4 で報告する。
 #
-# 呼び出し元: Makefile の `startup-latency` ターゲット（自己テストは
-# scripts/bench/startup_latency_selftest.sh・`startup-latency-selftest` ターゲット）。
+# 呼び出し元: Makefile の `startup-latency`・`startup-latency-docker`・`startup-latency-report`
+# ターゲット（自己テストは scripts/bench/startup_latency_selftest.sh・
+# `startup-latency-selftest` ターゲット）。
 # 実機前提のため `make ci` には含めない（.claude/rules/ci.md「実機前提テスト」）。
 #
 # 計測対象の起動契約（opencontainers/runtime-tools の command-line-interface・runc 互換）:
@@ -42,6 +43,19 @@
 #   create 呼び出し直前からその state 復帰直後まで（実行開始時刻の上側推定。内訳として
 #   create・start・観測待ち observe と state 照会回数を記録する）。
 #
+# モード（--mode。既定 oci。TASK-46.2・CORE-10）:
+#   oci:    上記の own（OCI Runtime CLI 契約）計測。method = "create-to-exec-observed"。
+#   docker: `docker run --rm --pull never ... <image> true` 全体の壁時計時間を計測する
+#           （spec の Docker ベースライン 0.290〜0.298 秒と同じ手法）。method = "docker-run-rm-total"。
+#           --runtime は docker CLI の絶対パス。イメージは事前にローカルへ用意する（自動 pull
+#           しない）。実行コマンドは `true` に固定する。
+#   report: --own-result（oci の出力）と --docker-result（docker の出力）を 1 つの JSON に統合する。
+#   計測区間の不一致（REPAIR-3: 実装済みを装わない）: oci は create 直前から state が
+#   running / stopped を返すまで、docker は run 全体（プロセス終了・コンテナ削除・デーモン
+#   経由のオーバーヘッドを含む）で区間が異なる。出力に method を記録し、レポートは
+#   methods_differ: true を出す。合否判定（Conditional Go 条件 1）は出さず、#213（TASK-46.h1）
+#   で人間が行う。区間をそろえる方法は spec 側の判断事項（TASK-46.2 の報告事項）。
+#
 # 使い方:
 #   startup_latency.sh --runtime <絶対パス> --bundle <dir> --target <名前> [--iterations N]
 #                      [--warmup N] [--timeout SECS] [--label NAME] [--output FILE]
@@ -49,25 +63,37 @@
 #   任意の実行ファイルを --runtime に渡せるため、取り違えを防ぐよう既定値を持たせず必須にする。
 #   bundle は人間が用意する（rootfs と config.json。基準ワークロードは alpine:3.20 相当の
 #   軽量プロセス。rootfs・config.json の生成は本スクリプトでは行わない）。
+#   startup_latency.sh --mode docker --runtime <docker の絶対パス> --target <名前> [--image <ref>]
+#                      [--iterations N] [--warmup N] [--timeout SECS] [--label NAME] [--output FILE]
+#   startup_latency.sh --mode report --own-result <file> --docker-result <file> [--timeout SECS] [--output FILE]
 #
 # 終了コード（呼び出し元はこの具体値で分岐する）:
 #   0: 成功
-#   1: ランタイムの create / start / state の失敗・タイムアウト、実行開始を観測できない、
+#   1: ランタイムの create / start / state（docker モードは image inspect / run）の失敗・タイムアウト、実行開始を観測できない、
 #      ID が既に使用中、計測中の時計の変更を検出した
 #   2: 入力エラー（引数・bundle・output の検証失敗）
 #   3: 前提ツール欠如（Linux の /proc/uptime・bash 5 以上・jq・GNU timeout・GNU dd〔oflag=nofollow,nonblock〕・GNU ln〔-T〕・mktemp・sleep 等）
-#   4: 後始末失敗（作成済みコンテナを delete できない、create 失敗後に未作成を確定できない等。
+#   4: 後始末失敗（作成済みコンテナを delete できない〔docker モードは cidfile の ID で rm -f できない、
+#      ラベル一覧を取得できない・所有を証明できないコンテナが残っている〕、create 失敗後に未作成を確定できない等。
 #      残存の可能性がある ID を stderr に出す。最優先）
 #
 # 出力（stdout。--output 指定時は同一内容をファイルにも書く。進捗・サマリーは stderr）:
 #   scripts/check-bench-regression.sh の results.json スキーマ（schema_version: 1・
-#   metrics.<name>.{value(>0), unit}）と互換。ランタイム・bundle の絶対パスは出力に含めない。
+#   metrics.<name>.{value(>0), unit}）と互換（oci・docker 共通。mode・method を追加で持つ）。
+#   ランタイム・bundle の絶対パスは出力に含めない。report モードの出力は
+#   benchmark: "startup_latency_report"（results.{own,docker}・comparison・notes）。
 #
 # セキュリティ: 引数は許可リストで検証し、ランタイムは配列で直接 exec する（eval・
 # sh -c・文字列連結なし）。sudo は内部で呼ばない（root を要する実測は人間が明示実行する）。
 # 各ランタイム呼び出しは timeout で上限を掛け、ログ出力量にも上限（ulimit -f）を掛ける。
 # 実行開始の観測と後始末は、複数回の呼び出し・待機をまとめて --timeout 秒の期限で縛る
 # （後始末の delete 再試行には回数の上限も設ける。REPAIR-5）。
+# docker モードの後始末は「所有の証明」で分ける。今回の docker client が cidfile に書いた
+# 64 桁 16 進 ID だけを `rm -f` する。cidfile がなければラベルの一覧が空のときだけ未作成と
+# みなし、1 件でも見つかれば所有を証明できないので何も送らず exit 4 にする
+# （--filter name= は部分一致のため使わない。ラベルの key=value は完全一致）。
+# docker の終了コード 125 は GNU timeout の 125 と重なるため、is_runtime_error は使わない。
+# report モードの入力 JSON は非信頼として検証する（symlink 拒否・サイズ上限・スキーマ・mode・値）。
 
 set -euo pipefail
 # EPOCHREALTIME の小数点がロケール依存になるのを防ぐ。
@@ -102,13 +128,19 @@ readonly MIN_CALL_BUDGET_US=100000
 readonly CLOCK_TOLERANCE_US=30000
 # --output の祖先ディレクトリ検査でたどる段数の上限。
 readonly PATH_DEPTH_MAX=256
+# report モードで読む入力 JSON の最大サイズ（バイト。jq に渡す前に検査する）。
+readonly RESULT_MAX_BYTES=1048576
 
 usage() {
   cat >&2 <<'USAGE'
-usage: startup_latency.sh --runtime <abs-path> --bundle <dir> [options]
-  --runtime <path>     OCI runtime executable (absolute path, required)
-  --bundle <dir>       OCI bundle directory containing config.json (required)
-  --target <name>      name of the measured runtime recorded as "target" (required, e.g. own, runc)
+usage: startup_latency.sh [--mode oci|docker|report] [options]
+  --mode <name>        oci (default), docker, or report
+  --runtime <path>     oci: OCI runtime executable / docker: docker CLI (absolute path, required)
+  --bundle <dir>       OCI bundle directory containing config.json (oci mode only, required there)
+  --image <ref>        image to run in docker mode (default: alpine:3.20; must exist locally)
+  --own-result <file>  report mode: result JSON of an oci-mode run (required there)
+  --docker-result <file> report mode: result JSON of a docker-mode run (required there)
+  --target <name>      name of the measured runtime recorded as "target" (required except report mode, e.g. own, docker)
   --iterations <1-1000> measured iterations (default: 10)
   --warmup <0-100>     warmup iterations excluded from statistics (default: 1)
   --timeout <1-60>     per runtime command timeout in seconds (default: 10)
@@ -141,6 +173,10 @@ mono_us() {
   echo $((10#$up * 10000))
 }
 
+mode="oci"
+image=""
+own_result=""
+docker_result=""
 runtime=""
 bundle=""
 iterations=10
@@ -167,7 +203,7 @@ while [ "$#" -gt 0 ]; do
       usage
       exit 0
       ;;
-    --runtime | --bundle | --target | --iterations | --warmup | --timeout | --label | --output)
+    --mode | --image | --own-result | --docker-result | --runtime | --bundle | --target | --iterations | --warmup | --timeout | --label | --output)
       opt="$1"
       if [ "$#" -lt 2 ]; then
         err "missing-value" "$opt requires a value"
@@ -175,6 +211,10 @@ while [ "$#" -gt 0 ]; do
       fi
       take_value "$opt"
       case "$opt" in
+        --mode) mode="$2" ;;
+        --image) image="$2" ;;
+        --own-result) own_result="$2" ;;
+        --docker-result) docker_result="$2" ;;
         --runtime) runtime="$2" ;;
         --bundle) bundle="$2" ;;
         --iterations) iterations="$2" ;;
@@ -203,33 +243,76 @@ check_int() {
   fi
 }
 
-if [ -z "$runtime" ]; then
-  err "missing-runtime" "--runtime is required"
-  exit "$EXIT_INPUT"
+# モードと引数の組み合わせの検証（前提ツールの検証より前。違反は exit 2）。
+case "$mode" in
+  oci | docker | report) ;;
+  *)
+    err "invalid-mode" "--mode must be one of: oci, docker, report"
+    exit "$EXIT_INPUT"
+    ;;
+esac
+# 指定済みのオプション（seen_opts）が、現在のモードで許可されていなければ拒否する。
+reject_opts() {
+  local o
+  for o in "$@"; do
+    if [[ "$seen_opts" == *" $o "* ]]; then
+      err "invalid-option-for-mode" "$o cannot be used with --mode $mode"
+      exit "$EXIT_INPUT"
+    fi
+  done
+}
+case "$mode" in
+  oci) reject_opts --image --own-result --docker-result ;;
+  docker) reject_opts --bundle --own-result --docker-result ;;
+  report) reject_opts --runtime --bundle --image --iterations --warmup --target --label ;;
+esac
+
+if [ "$mode" != "report" ]; then
+  if [ -z "$runtime" ]; then
+    err "missing-runtime" "--runtime is required"
+    exit "$EXIT_INPUT"
+  fi
+  if [[ "$runtime" != /* ]] || [ ! -f "$runtime" ] || [ ! -x "$runtime" ]; then
+    err "invalid-runtime" "--runtime must be an absolute path to an executable file"
+    exit "$EXIT_INPUT"
+  fi
+  if [ "$mode" = "oci" ] && [ -z "$bundle" ]; then
+    err "missing-bundle" "--bundle is required"
+    exit "$EXIT_INPUT"
+  fi
+  if [ -z "$target" ]; then
+    err "missing-target" "--target is required (name of the measured runtime, e.g. own)"
+    exit "$EXIT_INPUT"
+  fi
+  if ! [[ "$target" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; then
+    err "invalid-target" "target must match ^[A-Za-z0-9._-]{1,32}$"
+    exit "$EXIT_INPUT"
+  fi
 fi
-if [[ "$runtime" != /* ]] || [ ! -f "$runtime" ] || [ ! -x "$runtime" ]; then
-  err "invalid-runtime" "--runtime must be an absolute path to an executable file"
-  exit "$EXIT_INPUT"
+if [ "$mode" = "oci" ]; then
+  if [ -L "$bundle" ] || [ ! -d "$bundle" ]; then
+    err "invalid-bundle" "--bundle must be an existing directory (symlink not allowed)"
+    exit "$EXIT_INPUT"
+  fi
+  if [ -L "$bundle/config.json" ] || [ ! -f "$bundle/config.json" ]; then
+    err "invalid-bundle" "bundle must contain a regular file config.json (symlink not allowed)"
+    exit "$EXIT_INPUT"
+  fi
 fi
-if [ -z "$bundle" ]; then
-  err "missing-bundle" "--bundle is required"
-  exit "$EXIT_INPUT"
+if [ "$mode" = "docker" ]; then
+  # 既定イメージは spec のベースライン（CORE-10）と同じ alpine:3.20。先頭が英数字で、
+  # 空白・シェルのメタ文字・先頭 "-"（オプション注入）を許さない許可リストで検証する。
+  [ -n "$image" ] || image="alpine:3.20"
+  if ! [[ "$image" =~ ^[a-z0-9][a-z0-9._/:@-]{0,127}$ ]]; then
+    err "invalid-image" "image must match ^[a-z0-9][a-z0-9._/:@-]{0,127}\$"
+    exit "$EXIT_INPUT"
+  fi
 fi
-if [ -z "$target" ]; then
-  err "missing-target" "--target is required (name of the measured runtime, e.g. own)"
-  exit "$EXIT_INPUT"
-fi
-if ! [[ "$target" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; then
-  err "invalid-target" "target must match ^[A-Za-z0-9._-]{1,32}$"
-  exit "$EXIT_INPUT"
-fi
-if [ -L "$bundle" ] || [ ! -d "$bundle" ]; then
-  err "invalid-bundle" "--bundle must be an existing directory (symlink not allowed)"
-  exit "$EXIT_INPUT"
-fi
-if [ -L "$bundle/config.json" ] || [ ! -f "$bundle/config.json" ]; then
-  err "invalid-bundle" "bundle must contain a regular file config.json (symlink not allowed)"
-  exit "$EXIT_INPUT"
+if [ "$mode" = "report" ]; then
+  if [ -z "$own_result" ] || [ -z "$docker_result" ]; then
+    err "missing-result" "--own-result and --docker-result are required with --mode report"
+    exit "$EXIT_INPUT"
+  fi
 fi
 check_int iterations "$iterations" 1 1000
 check_int warmup "$warmup" 0 100
@@ -238,7 +321,7 @@ check_int timeout "$timeout_secs" 1 60
 if [ -z "$label" ]; then
   label="$target"
 fi
-if ! [[ "$label" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+if [ "$mode" != "report" ] && ! [[ "$label" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
   err "invalid-label" "label must match ^[A-Za-z0-9._-]{1,64}$"
   exit "$EXIT_INPUT"
 fi
@@ -299,14 +382,14 @@ if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
   err "missing-prerequisite" "bash 5 or later is required (EPOCHREALTIME)"
   exit "$EXIT_PREREQ"
 fi
-for tool in jq timeout mktemp tail rm sleep dd ln chmod find id; do
+for tool in jq timeout mktemp tail rm sleep dd ln chmod find id wc; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     err "missing-prerequisite" "required tool not found: $tool"
     exit "$EXIT_PREREQ"
   fi
 done
 # 単調時計（mono_us）の読み元。Linux の /proc/uptime が必要。
-if ! mono_us >/dev/null; then
+if [ "$mode" != "report" ] && ! mono_us >/dev/null; then
   err "missing-prerequisite" "a readable /proc/uptime (Linux) is required as the monotonic clock"
   exit "$EXIT_PREREQ"
 fi
@@ -334,6 +417,8 @@ live_id=""
 # create が成功していれば 1。0 の間（create の成否未確定・失敗）は破壊的操作を送らず、
 # state で未作成を確定できなければ残存の可能性ありとして報告する（finish_container）。
 live_created=0
+# docker モードで現在の試行の cidfile（docker client が作成したコンテナ ID を書く。所有の証明に使う）。
+live_cidfile=""
 leftover_ids=()
 rc=0
 # create の終了コード（create 未成功時の未作成判定に使う）。
@@ -511,6 +596,102 @@ finish_container_within_deadline() {
   return 1
 }
 
+# --- docker 呼び出し部（docker CLI の差分が出たらこの 4 関数のみ差し替える。TASK-46.2） ---
+# docker のラベル（key=value は完全一致）。--filter name= は部分一致のため所有判定に使わない。
+readonly DOCKER_LABEL_KEY="fandhe.startup-latency.run"
+# 計測対象。--pull never はイメージ未取得時に暗黙の pull（ネットワーク・計測の歪み）をさせない。
+# 実行コマンドは `true` に固定し、任意コマンドを受け付けない。引数: <log> <cidfile> <name>
+dk_run() { run_rt "$1" "$1" run --rm --pull never --cidfile "$2" --name "$3" --label "$DOCKER_LABEL_KEY=$run_tag" "$image" true; }
+# 所有を証明した ID（cidfile の 64 桁 16 進）だけに送る。引数: <log> <cid>
+dk_rm() { run_rt "$1" "$1" rm -f "$2"; }
+# この実行のラベルが付いた全コンテナ ID（停止中を含む）。引数: <stdout> <stderr>
+dk_list_by_label() { run_rt "$1" "$2" ps -a -q --no-trunc --filter "label=$DOCKER_LABEL_KEY=$run_tag"; }
+# イメージがローカルにあるか。引数: <log>
+dk_image_present() { run_rt "$1" "$1" image inspect --format '{{.Id}}' "$image"; }
+# ---------------------------------------------------------------------------
+
+# cidfile から docker client が書いたコンテナ ID を読む。64 桁の 16 進数（小文字）だけを
+# 今回作成した証明として返す（それ以外・未作成・symlink は空）。ID は docker が cidfile へ
+# 書く値で、コンテナ作成時に client 自身が得たものなので、この ID は今回の run のものと言える。
+read_cidfile() {
+  local f="$1" line=""
+  if [ -n "$f" ] && [ ! -L "$f" ] && [ -f "$f" ]; then
+    IFS= read -r -n 128 line <"$f" || true
+  fi
+  if [[ "$line" =~ ^[0-9a-f]{64}$ ]]; then
+    printf '%s' "$line"
+  fi
+}
+
+# dk_list_by_label の結果を listed_ids（64 桁 16 進の ID 配列）へ入れる。取得失敗・想定外の
+# 出力は非ゼロを返す（未作成を確定できない）。呼び出しは期限内（rt_deadline_us 設定中）で行う。
+list_run_containers() {
+  local out="$tmpdir/list.out" line rc=0
+  listed_ids=()
+  dk_list_by_label "$out" "$tmpdir/list.err" || rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    [[ "$line" =~ ^[0-9a-f]{64}$ ]] || return 1
+    listed_ids+=("$line")
+  done <"$out"
+  return 0
+}
+
+# docker モードの後始末（finish_container の docker 版）。全体を --timeout 秒の 1 つの期限に
+# 収める（REPAIR-5）。引数: <name> <cidfile>
+#   cidfile に有効な ID がある: 今回の run が作ったコンテナと証明できる。--rm で削除済みなら
+#     何もしない。残っていれば `rm -f <cid>` を期限と回数の上限内で再試行する。
+#   cidfile がない・不正: ラベル一覧が空なら未作成とみなす。1 件でも見つかれば所有を証明
+#     できないので何も送らず exit 4 の対象にする。一覧の取得失敗も未作成を確定できないので同様。
+finish_container_docker() {
+  local status=0
+  rt_deadline_us=$(($(mono_us) + timeout_secs * 1000000))
+  finish_container_docker_within_deadline "$@" || status=$?
+  rt_deadline_us=""
+  return "$status"
+}
+
+finish_container_docker_within_deadline() {
+  local id="$1"
+  local cid log="$tmpdir/cleanup-$id.log" tries=0 present x
+  cid="$(read_cidfile "$2")"
+  if [ -z "$cid" ]; then
+    if ! list_run_containers; then
+      echo "warning: could not list containers labeled $DOCKER_LABEL_KEY=$run_tag for $id; absence cannot be confirmed, inspect it manually" >&2
+      leftover_ids+=("$id")
+      return 1
+    fi
+    if [ "${#listed_ids[@]}" -eq 0 ]; then
+      return 0
+    fi
+    echo "warning: containers labeled $DOCKER_LABEL_KEY=$run_tag exist but no valid cidfile proves ownership; not touching them, inspect manually" >&2
+    leftover_ids+=("${listed_ids[@]}")
+    return 1
+  fi
+  while [ "$tries" -lt "$DELETE_RETRY_MAX" ]; do
+    tries=$((tries + 1))
+    present=1
+    if list_run_containers; then
+      present=0
+      for x in "${listed_ids[@]}"; do
+        [ "$x" = "$cid" ] && present=1
+      done
+    fi
+    # --rm で削除済み（一覧が取れて ID がない）なら完了。
+    [ "$present" -eq 0 ] && return 0
+    if dk_rm "$log" "$cid"; then
+      return 0
+    fi
+    if [ $((rt_deadline_us - $(mono_us))) -lt $((DELETE_RETRY_INTERVAL_US + MIN_CALL_BUDGET_US)) ]; then
+      break
+    fi
+    sleep "$DELETE_RETRY_INTERVAL"
+  done
+  leftover_ids+=("$cid")
+  return 1
+}
+
 # EXIT / INT / TERM で呼ばれる後始末。未削除のコンテナを削除し、一時ディレクトリを消す。
 # 後始末に失敗した場合は他の終了コードより優先して exit 4 にする。
 cleanup() {
@@ -520,9 +701,14 @@ cleanup() {
     # live_id は create 試行の直前に設定される（create 失敗で中途半端に残った場合も対象）。
     # 削除できない・create 未成功で未作成を確定できない場合は finish_container が
     # leftover_ids へ記録し、下で exit 4 にする。
-    finish_container "$live_id" "$live_created" || true
+    if [ "$mode" = "docker" ]; then
+      finish_container_docker "$live_id" "$live_cidfile" || true
+    else
+      finish_container "$live_id" "$live_created" || true
+    fi
     live_id=""
     live_created=0
+    live_cidfile=""
   fi
   if ! rm -rf -- "$tmpdir"; then
     echo "error: cleanup-failed: could not remove temporary directory" >&2
@@ -633,9 +819,168 @@ measure_once() {
   return 0
 }
 
+# docker モードの 1 回分の計測。成功すると total_us・run_us（同値）を設定する。引数: <id> <cidfile>
+# 計測区間は `docker run --rm ... true` 全体の壁時計時間（spec のベースラインと同じ手法）。
+# oci モードの区間（create 直前から実行開始の観測まで）とは異なる（冒頭「モード」参照）。
+# 失敗（run の非ゼロ終了・タイムアウト・時計の変更）は非ゼロを返し、後始末は cleanup が担う。
+measure_once_docker() {
+  local id="$1" cidfile="$2" m0 m1 t0 t1 wall_total mono_total diff run_rc=0
+  m0="$(mono_us)"
+  t0="$(wall_us)"
+  dk_run "$tmpdir/run.log" "$cidfile" "$id" || run_rc=$?
+  t1="$(wall_us)"
+  m1="$(mono_us)"
+  if [ "$run_rc" -ne 0 ]; then
+    err "docker-run-failed" "docker run failed or timed out for $id (exit $run_rc)"
+    show_log "$tmpdir/run.log"
+    return 1
+  fi
+  wall_total=$((t1 - t0))
+  mono_total=$((m1 - m0))
+  diff=$((wall_total - mono_total))
+  [ "$diff" -lt 0 ] && diff=$((-diff))
+  if [ "$t1" -lt "$t0" ] || [ "$diff" -gt "$CLOCK_TOLERANCE_US" ]; then
+    err "clock-changed" "wall clock changed during the measurement of $id (wall ${wall_total}us vs monotonic ${mono_total}us); result discarded"
+    return 1
+  fi
+  run_us="$wall_total"
+  total_us="$wall_total"
+  return 0
+}
+
+# 結果 JSON を --output（指定時）と stdout へ公開する。引数: <result json>
+publish_result() {
+  local result="$1"
+  # --output 指定時はファイル作成に成功してから stdout へ出す（作成失敗時に成功結果を
+  # stdout へ残さず、呼び出し元が失敗した計測を取り込まないようにする）。
+  if [ -n "$output" ]; then
+    # 完成した結果だけを出力先に公開する（書き込みが途中で失敗しても不完全な JSON を
+    # 出力先に残さない）。手順:
+    #   1. 結果を非公開の tmpdir に書く。
+    # 前提: output_path_is_safe により、出力先のディレクトリと祖先は他のユーザーがエントリを
+    # 差し替えられない（以下のパス指定の操作が、今回作った一時ファイル以外を指さない）。
+    #   2. 出力先と同じディレクトリに mktemp で一時ファイルを作る。mktemp は O_CREAT|O_EXCL で
+    #      未使用の名前を作成して返すため、返されたパスは今回作った通常ファイルであり、既存の
+    #      ファイルを再利用しない（失敗時に消してよいのはこのパスだけ）。
+    #   3. dd で一時ファイルへ書き込み fsync する。oflag=nofollow で symlink を辿らず、
+    #      oflag=nonblock で読み手のいない FIFO に差し替えられていても待たずに失敗する。
+    #   4. ln -T（link(2)）で一時ファイルを出力先へ公開する。link は出力先が種別を問わず既に
+    #      存在すれば EEXIST で失敗し、symlink を辿らず、-T によりディレクトリ内へも作らない。
+    #   5. 一時ファイルを消す（成功時は出力先が同じ実体を指して残る）。
+    # 失敗時は今回作成した一時ファイルだけを消して exit 2 にする。dd・ln には timeout で上限を
+    # 掛ける（REPAIR-5）。出力先のパーミッションは umask に従う（mktemp の既定 0600 を直す）。
+    printf '%s\n' "$result" >"$tmpdir/result.json"
+    staging=""
+    if ! staging="$(mktemp -- "$output_dir/.startup_latency.XXXXXXXXXX" 2>/dev/null)" || [ -z "$staging" ]; then
+      err "output-write-failed" "could not create a temporary file next to --output"
+      exit "$EXIT_INPUT"
+    fi
+    if ! chmod "$(printf '%04o' $((0666 & ~0$(umask))))" -- "$staging" ||
+      ! timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" \
+        dd if="$tmpdir/result.json" of="$staging" conv=notrunc,fsync oflag=nofollow,nonblock status=none 2>/dev/null; then
+      rm -f -- "$staging" || true
+      err "output-write-failed" "could not write the --output file"
+      exit "$EXIT_INPUT"
+    fi
+    if ! timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" ln -T -- "$staging" "$output" 2>/dev/null; then
+      rm -f -- "$staging" || true
+      err "output-write-failed" "could not create --output file (it may already exist, or hard links are unsupported)"
+      exit "$EXIT_INPUT"
+    fi
+    if ! rm -f -- "$staging"; then
+      echo "warning: could not remove the temporary file next to --output" >&2
+    fi
+  fi
+  printf '%s\n' "$result"
+}
+
+# report モードの入力 1 ファイルを非信頼 JSON として検証し、compact な JSON を stdout へ返す。
+# symlink・非通常ファイル・サイズ上限超過・単一オブジェクトでない・schema_version / benchmark /
+# mode の不一致・p50 が正の数でない / unit が ms でないものは exit 2（取り違え・改ざんされた
+# 結果を統合しない）。引数: <オプション名> <file> <期待する mode>
+load_result_file() {
+  local opt="$1" f="$2" want="$3" size obj
+  if [ -L "$f" ] || [ ! -f "$f" ]; then
+    err "invalid-result" "$opt must be a regular file (symlink not allowed)"
+    exit "$EXIT_INPUT"
+  fi
+  size="$(wc -c <"$f" 2>/dev/null | tr -d ' ')" || size=""
+  if ! [[ "$size" =~ ^[0-9]+$ ]] || [ "$size" -gt "$RESULT_MAX_BYTES" ]; then
+    err "invalid-result" "$opt must be at most $RESULT_MAX_BYTES bytes"
+    exit "$EXIT_INPUT"
+  fi
+  if ! obj="$(jq -cs --arg mode "$want" '
+    if length == 1 then .[0] else error("not a single JSON value") end
+    | if (type == "object" and .schema_version == 1 and .benchmark == "startup_latency"
+        and .mode == $mode and (.method | type) == "string"
+        and (.metrics.startup_latency_p50_ms | type) == "object"
+        and (.metrics.startup_latency_p50_ms.value | type) == "number"
+        and .metrics.startup_latency_p50_ms.value > 0
+        and .metrics.startup_latency_p50_ms.unit == "ms")
+      then . else error("unexpected result schema") end' "$f" 2>/dev/null)"; then
+    err "invalid-result" "$opt is not a valid startup_latency result with mode=$want (schema_version 1, positive p50 in ms)"
+    exit "$EXIT_INPUT"
+  fi
+  printf '%s' "$obj"
+}
+
+# own・Docker の結果を 1 つのレポートにまとめる（TASK-46.2・CORE-10）。合否判定は出さない
+# （Conditional Go 条件 1 の判定は #213 で人間が行う）。計測区間が異なるため methods_differ を
+# 明示し、比率は参考値として扱わせる（REPAIR-3）。
+run_report() {
+  local own docker report
+  own="$(load_result_file --own-result "$own_result" oci)"
+  docker="$(load_result_file --docker-result "$docker_result" docker)"
+  report="$(jq -n --argjson own "$own" --argjson docker "$docker" '
+    {
+      schema_version: 1,
+      benchmark: "startup_latency_report",
+      results: {own: $own, docker: $docker},
+      comparison: {
+        own_p50_ms: $own.metrics.startup_latency_p50_ms.value,
+        docker_p50_ms: $docker.metrics.startup_latency_p50_ms.value,
+        p50_ratio_own_to_docker: ($own.metrics.startup_latency_p50_ms.value / $docker.metrics.startup_latency_p50_ms.value),
+        methods_differ: ($own.method != $docker.method)
+      },
+      notes: [
+        "own and docker measure different intervals (see method); the ratio is informational only.",
+        "no pass/fail verdict is produced; the Conditional Go decision is made by a human (issue 213)."
+      ]
+    }')"
+  publish_result "$report"
+  echo "startup_latency_report: own p50=$(jq -r '.comparison.own_p50_ms' <<<"$report")ms docker p50=$(jq -r '.comparison.docker_p50_ms' <<<"$report")ms ratio=$(jq -r '.comparison.p50_ratio_own_to_docker' <<<"$report") methods_differ=$(jq -r '.comparison.methods_differ' <<<"$report")" >&2
+  echo "startup_latency_report: intervals differ between modes; no verdict is produced (human decision, issue 213)" >&2
+}
+
+if [ "$mode" = "report" ]; then
+  run_report
+  exit 0
+fi
+
+if [ "$mode" = "oci" ]; then
+  method="create-to-exec-observed"
+else
+  method="docker-run-rm-total"
+  # 計測区間外の事前確認。イメージが無ければ自動 pull せず（ネットワーク副作用・計測の歪み）
+  # 手動での取得を案内して終了する。
+  if ! dk_image_present "$tmpdir/image.log"; then
+    err "image-not-present" "image $image is not available locally (or docker failed); run 'docker pull $image' yourself first"
+    show_log "$tmpdir/image.log"
+    exit "$EXIT_RUNTIME"
+  fi
+  if ! list_run_containers; then
+    err "docker-list-failed" "could not list containers for this run before measuring"
+    exit "$EXIT_RUNTIME"
+  fi
+  if [ "${#listed_ids[@]}" -ne 0 ]; then
+    err "container-id-in-use" "containers labeled $DOCKER_LABEL_KEY=$run_tag already exist; refusing to touch them"
+    exit "$EXIT_RUNTIME"
+  fi
+fi
+
 samples="[]"
 total_runs=$((warmup + iterations))
-echo "startup_latency: target=$target label=$label warmup=$warmup iterations=$iterations timeout=${timeout_secs}s" >&2
+echo "startup_latency: mode=$mode target=$target label=$label warmup=$warmup iterations=$iterations timeout=${timeout_secs}s" >&2
 run_no=0
 while [ "$run_no" -lt "$total_runs" ]; do
   run_no=$((run_no + 1))
@@ -645,24 +990,53 @@ while [ "$run_no" -lt "$total_runs" ]; do
   start_us=0
   observe_us=0
   total_us=0
+  run_us=0
   state_polls=0
-  if ! measure_once "$id"; then
-    rc="$EXIT_RUNTIME"
-    break
-  fi
-  if ! finish_container "$id" 1; then
+  if [ "$mode" = "docker" ]; then
+    # 作成を試みる前から後始末対象にする（run がハングしても cleanup が cidfile で所有を判定する）。
+    # docker は cidfile が既にあると失敗するため、毎回新しいパスにする。
+    live_id="$id"
+    live_cidfile="$tmpdir/cid-$seq_no"
+    if ! measure_once_docker "$id" "$live_cidfile"; then
+      rc="$EXIT_RUNTIME"
+      break
+    fi
+    if ! finish_container_docker "$id" "$live_cidfile"; then
+      live_id=""
+      live_cidfile=""
+      err "cleanup-failed" "could not confirm removal of container $id"
+      exit "$EXIT_CLEANUP"
+    fi
     live_id=""
-    err "cleanup-failed" "could not delete container $id"
-    exit "$EXIT_CLEANUP"
+    live_cidfile=""
+  else
+    if ! measure_once "$id"; then
+      rc="$EXIT_RUNTIME"
+      break
+    fi
+    if ! finish_container "$id" 1; then
+      live_id=""
+      err "cleanup-failed" "could not delete container $id"
+      exit "$EXIT_CLEANUP"
+    fi
+    live_id=""
+    live_created=0
   fi
-  live_id=""
-  live_created=0
   if [ "$run_no" -gt "$warmup" ]; then
-    samples="$(jq -c --argjson c "$create_us" --argjson s "$start_us" --argjson o "$observe_us" \
-      --argjson t "$total_us" --argjson p "$state_polls" \
-      '. + [{create_us: $c, start_us: $s, observe_us: $o, total_us: $t, state_polls: $p}]' <<<"$samples")"
+    if [ "$mode" = "docker" ]; then
+      samples="$(jq -c --argjson r "$run_us" --argjson t "$total_us" \
+        '. + [{run_us: $r, total_us: $t}]' <<<"$samples")"
+    else
+      samples="$(jq -c --argjson c "$create_us" --argjson s "$start_us" --argjson o "$observe_us" \
+        --argjson t "$total_us" --argjson p "$state_polls" \
+        '. + [{create_us: $c, start_us: $s, observe_us: $o, total_us: $t, state_polls: $p}]' <<<"$samples")"
+    fi
   fi
-  echo "  run $run_no/$total_runs: create=${create_us}us start=${start_us}us observe=${observe_us}us total=${total_us}us polls=${state_polls}$([ "$run_no" -le "$warmup" ] && echo ' (warmup)')" >&2
+  if [ "$mode" = "docker" ]; then
+    echo "  run $run_no/$total_runs: total=${total_us}us$([ "$run_no" -le "$warmup" ] && echo ' (warmup)')" >&2
+  else
+    echo "  run $run_no/$total_runs: create=${create_us}us start=${start_us}us observe=${observe_us}us total=${total_us}us polls=${state_polls}$([ "$run_no" -le "$warmup" ] && echo ' (warmup)')" >&2
+  fi
 done
 
 if [ "$rc" -ne 0 ]; then
@@ -670,10 +1044,15 @@ if [ "$rc" -ne 0 ]; then
   exit "$rc"
 fi
 
-# total_us の中央値（偶数件は中央 2 件の平均）・最小・最大を ms で集計して JSON を組み立てる。
+# total_us の中央値（偶数件は中央 2 件の平均）・最小・最大を ms で集計して JSON を組み立てる
+# （oci・docker とも total_us から同じ方法で算出する）。mode・method は計測区間を機械可読に
+# 区別するための追加フィールド。params.image は docker モードのみ（パスは含めない）。
 result="$(jq -n \
   --arg label "$label" \
   --arg target "$target" \
+  --arg mode "$mode" \
+  --arg method "$method" \
+  --arg image "$image" \
   --argjson iterations "$iterations" \
   --argjson warmup "$warmup" \
   --argjson timeout "$timeout_secs" \
@@ -684,9 +1063,12 @@ result="$(jq -n \
   | {
       schema_version: 1,
       benchmark: "startup_latency",
+      mode: $mode,
+      method: $method,
       target: $target,
       label: $label,
-      params: {iterations: $iterations, warmup: $warmup, timeout_secs: $timeout},
+      params: ({iterations: $iterations, warmup: $warmup, timeout_secs: $timeout}
+        + (if $mode == "docker" then {image: $image} else {} end)),
       samples_us: $samples,
       metrics: {
         startup_latency_p50_ms: {value: ($p50 / 1000), unit: "ms"},
@@ -695,45 +1077,5 @@ result="$(jq -n \
       }
     }')"
 
-# --output 指定時はファイル作成に成功してから stdout へ出す（作成失敗時に成功結果を
-# stdout へ残さず、呼び出し元が失敗した計測を取り込まないようにする）。
-if [ -n "$output" ]; then
-  # 完成した結果だけを出力先に公開する（書き込みが途中で失敗しても不完全な JSON を
-  # 出力先に残さない）。手順:
-  #   1. 結果を非公開の tmpdir に書く。
-  # 前提: output_path_is_safe により、出力先のディレクトリと祖先は他のユーザーがエントリを
-  # 差し替えられない（以下のパス指定の操作が、今回作った一時ファイル以外を指さない）。
-  #   2. 出力先と同じディレクトリに mktemp で一時ファイルを作る。mktemp は O_CREAT|O_EXCL で
-  #      未使用の名前を作成して返すため、返されたパスは今回作った通常ファイルであり、既存の
-  #      ファイルを再利用しない（失敗時に消してよいのはこのパスだけ）。
-  #   3. dd で一時ファイルへ書き込み fsync する。oflag=nofollow で symlink を辿らず、
-  #      oflag=nonblock で読み手のいない FIFO に差し替えられていても待たずに失敗する。
-  #   4. ln -T（link(2)）で一時ファイルを出力先へ公開する。link は出力先が種別を問わず既に
-  #      存在すれば EEXIST で失敗し、symlink を辿らず、-T によりディレクトリ内へも作らない。
-  #   5. 一時ファイルを消す（成功時は出力先が同じ実体を指して残る）。
-  # 失敗時は今回作成した一時ファイルだけを消して exit 2 にする。dd・ln には timeout で上限を
-  # 掛ける（REPAIR-5）。出力先のパーミッションは umask に従う（mktemp の既定 0600 を直す）。
-  printf '%s\n' "$result" >"$tmpdir/result.json"
-  staging=""
-  if ! staging="$(mktemp -- "$output_dir/.startup_latency.XXXXXXXXXX" 2>/dev/null)" || [ -z "$staging" ]; then
-    err "output-write-failed" "could not create a temporary file next to --output"
-    exit "$EXIT_INPUT"
-  fi
-  if ! chmod "$(printf '%04o' $((0666 & ~0$(umask))))" -- "$staging" ||
-    ! timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" \
-      dd if="$tmpdir/result.json" of="$staging" conv=notrunc,fsync oflag=nofollow,nonblock status=none 2>/dev/null; then
-    rm -f -- "$staging" || true
-    err "output-write-failed" "could not write the --output file"
-    exit "$EXIT_INPUT"
-  fi
-  if ! timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" ln -T -- "$staging" "$output" 2>/dev/null; then
-    rm -f -- "$staging" || true
-    err "output-write-failed" "could not create --output file (it may already exist, or hard links are unsupported)"
-    exit "$EXIT_INPUT"
-  fi
-  if ! rm -f -- "$staging"; then
-    echo "warning: could not remove the temporary file next to --output" >&2
-  fi
-fi
-printf '%s\n' "$result"
+publish_result "$result"
 echo "startup_latency: p50=$(jq -r '.metrics.startup_latency_p50_ms.value' <<<"$result")ms over $iterations runs" >&2

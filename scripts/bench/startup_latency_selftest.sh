@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/bench/startup_latency.sh の自己テスト（TASK-46.1・CORE-10・REPAIR-12）。
+# scripts/bench/startup_latency.sh の自己テスト（TASK-46.1・TASK-46.2・CORE-10・REPAIR-12）。
 #
 # 役割: 実ランタイム・root を使わず、bash のスタブランタイム（create / start / delete /
 # kill を模し、固定 sleep と呼び出しログを持つ）で、終了コード・出力 JSON の値・呼び出し
@@ -708,6 +708,259 @@ JSON
 rc=0
 "$bash_bin" "$bench_check_script" "$work/baseline.json" "$work/results.json" >/dev/null 2>&1 || rc=$?
 expect_eq "bench-regression-schema-compat" "0" "$rc"
+
+# ===========================================================================
+# TASK-46.2: docker モードと report モード（CORE-10）。スタブ docker CLI で完結し、実 Docker・
+# root は使わない。実機での Docker 実測は #213（TASK-46.h1）で人間が行う。
+# ===========================================================================
+
+dstub="$work/stub-docker"
+dstub_state="$work/dstub-state"
+dstub_log="$work/dstub.log"
+printf '#!%s\n' "$bash_bin" >"$dstub"
+cat >>"$dstub" <<'DSTUB'
+# スタブ docker CLI。image inspect / run / ps / rm だけを模し、呼び出しを $DSTUB_LOG へ記録する。
+# コンテナは $DSTUB_STATE/containers/<cid> のマーカーで表す。DSTUB_MODE:
+#   ok: run が cidfile に ID を書いて成功し、--rm でコンテナは残らない
+#   leftover-after-rm: ok と同じだが、run 後もコンテナが残る（rm -f で片付く）
+#   rm-fail: leftover-after-rm と同じで、rm -f が常に失敗する
+#   list-fail: ok と同じだが、run 後の ps が失敗する
+#   image-missing: image inspect が失敗する
+#   run-fail-no-cid: run が cidfile を書かず失敗する（終了コード 125 = timeout の 125 と同値）
+#   run-hang-cid-written: cidfile を書きコンテナを作ってからハングする
+#   run-hang-no-cid-listed: cidfile を書かずコンテナだけ作ってハングする
+mode="${DSTUB_MODE:-ok}"
+echo "$*" >>"$DSTUB_LOG"
+cmd="$1"
+shift
+mkdir -p "$DSTUB_STATE/containers"
+case "$cmd" in
+  image)
+    [ "$mode" = image-missing ] && { echo "Error: No such image" >&2; exit 1; }
+    echo "sha256:0000"
+    ;;
+  run)
+    cidfile=""
+    args=("$@")
+    for ((i = 0; i < ${#args[@]}; i++)); do
+      [ "${args[$i]}" = --cidfile ] && cidfile="${args[$((i + 1))]}"
+    done
+    touch "$DSTUB_STATE/ran"
+    n=$(($(cat "$DSTUB_STATE/counter" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$DSTUB_STATE/counter"
+    cid="$(printf '%064x' "$n")"
+    case "$mode" in
+      run-fail-no-cid) echo "docker: daemon error" >&2; exit 125 ;;
+      ok | list-fail) printf '%s' "$cid" >"$cidfile"; sleep 0.05 ;;
+      leftover-after-rm | rm-fail) printf '%s' "$cid" >"$cidfile"; touch "$DSTUB_STATE/containers/$cid"; sleep 0.05 ;;
+      run-hang-cid-written) printf '%s' "$cid" >"$cidfile"; touch "$DSTUB_STATE/containers/$cid"; exec sleep 30 ;;
+      run-hang-no-cid-listed) touch "$DSTUB_STATE/containers/$cid"; exec sleep 30 ;;
+    esac
+    ;;
+  ps)
+    [ "$mode" = list-fail ] && [ -e "$DSTUB_STATE/ran" ] && { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+    for f in "$DSTUB_STATE"/containers/*; do
+      [ -e "$f" ] && basename "$f"
+    done
+    ;;
+  rm)
+    cid="${*: -1}"
+    [ "$mode" = rm-fail ] && { echo "stub: rm failed" >&2; exit 1; }
+    [ -e "$DSTUB_STATE/containers/$cid" ] || { echo "Error: No such container" >&2; exit 1; }
+    rm -f -- "$DSTUB_STATE/containers/$cid"
+    echo "$cid"
+    ;;
+  *) echo "stub: unsupported command $cmd" >&2; exit 1 ;;
+esac
+exit 0
+DSTUB
+chmod 755 "$dstub"
+export DSTUB_LOG="$dstub_log"
+export DSTUB_STATE="$dstub_state"
+
+reset_dlog() {
+  : >"$dstub_log"
+  rm -rf -- "$dstub_state"
+  mkdir -p "$dstub_state"
+}
+dlog_cmds() {
+  cut -d' ' -f1 "$dstub_log" | tr '\n' ' ' | sed 's/ $//'
+}
+
+# 他のケースで使う引数（--target を含まない既定）を docker 用に差し替える。
+default_args=(--mode docker --target docker)
+
+# --- D1. 正常系: argv・出力スキーマ・統計の独立再計算 ---
+reset_dlog
+export DSTUB_MODE=ok
+expect_rc "docker-ok" 0 --runtime "$dstub" --iterations 3 --warmup 1
+docker_json="$last_stdout"
+expect_eq "docker-ok-schema_version" "1" "$(jq -r '.schema_version' <<<"$docker_json")"
+expect_eq "docker-ok-benchmark" "startup_latency" "$(jq -r '.benchmark' <<<"$docker_json")"
+expect_eq "docker-ok-mode" "docker" "$(jq -r '.mode' <<<"$docker_json")"
+expect_eq "docker-ok-method" "docker-run-rm-total" "$(jq -r '.method' <<<"$docker_json")"
+expect_eq "docker-ok-target" "docker" "$(jq -r '.target' <<<"$docker_json")"
+expect_eq "docker-ok-image" "alpine:3.20" "$(jq -r '.params.image' <<<"$docker_json")"
+expect_eq "docker-ok-samples-count" "3" "$(jq -r '.samples_us | length' <<<"$docker_json")"
+expect_eq "docker-ok-sample-keys" "run_us total_us" "$(jq -r '.samples_us[0] | keys_unsorted | join(" ")' <<<"$docker_json")"
+expect_eq "docker-ok-run-ge-50ms" "true" "$(jq -r 'all(.samples_us[]; .total_us >= 50000 and .run_us == .total_us)' <<<"$docker_json")"
+expect_eq "docker-ok-no-path-leak" "false" "$(jq -r --arg p "$work" 'tostring | contains($p)' <<<"$docker_json")"
+verify_stats "docker-median-odd(3)" "$docker_json"
+# warmup 込み 4 回: image inspect -> 事前の一覧 -> (run -> 後始末の一覧) x 4。rm は送られない。
+expect_eq "docker-ok-call-sequence" "image ps run ps run ps run ps run ps" "$(dlog_cmds)"
+run_line="$(grep '^run ' "$dstub_log" | head -n 1)"
+if [[ "$run_line" =~ ^run\ --rm\ --pull\ never\ --cidfile\ /[^\ ]+/cid-[0-9]+\ --name\ fandhe-startup-[A-Za-z0-9]+-[0-9]+-[0-9]+\ --label\ fandhe\.startup-latency\.run=[A-Za-z0-9]+\ alpine:3\.20\ true$ ]]; then
+  pass "docker-ok-run-argv"
+else
+  fail "docker-ok-run-argv ($run_line)"
+fi
+expect_eq "docker-ok-unique-names" "4" "$(grep '^run ' "$dstub_log" | sed 's/.*--name \([^ ]*\) .*/\1/' | sort -u | wc -l | tr -d ' ')"
+expect_eq "docker-ok-ps-argv" "true" "$(grep -c '^ps -a -q --no-trunc --filter label=fandhe\.startup-latency\.run=[A-Za-z0-9]*$' "$dstub_log" | awk '{print ($1 == 5) ? "true" : "false"}')"
+reset_dlog
+expect_rc "docker-even-run" 0 --runtime "$dstub" --iterations 4 --warmup 0
+verify_stats "docker-median-even(4)" "$last_stdout"
+# --output は oci モードと同じ公開手順で書かれる。
+reset_dlog
+docker_out="$work/docker-result.json"
+expect_rc "docker-output-write" 0 --runtime "$dstub" --iterations 2 --warmup 0 --output "$docker_out"
+expect_eq "docker-output-equals-stdout" "$last_stdout" "$(cat "$docker_out")"
+
+# --- D2. イメージ指定 ---
+reset_dlog
+expect_rc "docker-image-custom" 0 --runtime "$dstub" --iterations 1 --warmup 0 --image alpine:3.19
+expect_eq "docker-image-custom-param" "alpine:3.19" "$(jq -r '.params.image' <<<"$last_stdout")"
+if grep -q '^run .* alpine:3\.19 true$' "$dstub_log"; then pass "docker-image-custom-argv"; else fail "docker-image-custom-argv"; fi
+reset_dlog
+DSTUB_MODE=image-missing expect_rc "docker-image-missing" 1 --runtime "$dstub" --iterations 1 --warmup 0
+expect_contains "docker-image-missing-error" "image-not-present"
+expect_eq "docker-image-missing-sequence" "image" "$(dlog_cmds)"
+
+# --- D3. 後始末: 所有の証明（cidfile）とラベル一覧 ---
+# run が失敗して cidfile がなく、一覧も空なら何も送らず exit 1（終了コード 125 は GNU timeout の
+# 125 と同値だが、docker モードは終了コードで所有を判定しない）。
+reset_dlog
+DSTUB_MODE=run-fail-no-cid expect_rc "docker-run-fail-no-cid" 1 --runtime "$dstub" --iterations 1 --warmup 0
+expect_contains "docker-run-fail-no-cid-error" "docker-run-failed"
+if grep -q '^rm ' "$dstub_log"; then fail "docker-run-fail-no-cid-no-rm"; else pass "docker-run-fail-no-cid-no-rm"; fi
+# run がハングし cidfile が書かれていれば、その ID だけに rm -f を 1 回送る。
+reset_dlog
+started="$SECONDS"
+DSTUB_MODE=run-hang-cid-written expect_rc "docker-run-hang-cid-written" 1 --runtime "$dstub" --iterations 1 --warmup 0 --timeout 1
+elapsed=$((SECONDS - started))
+if [ "$elapsed" -lt 15 ]; then pass "docker-run-hang-bounded (${elapsed}s < 15s)"; else fail "docker-run-hang-bounded (${elapsed}s)"; fi
+expect_eq "docker-run-hang-cid-written-rm" "rm -f $(printf '%064x' 1)" "$(grep '^rm ' "$dstub_log")"
+# cidfile がなく一覧にコンテナが見つかる場合は所有を証明できないので何も送らず exit 4。
+reset_dlog
+DSTUB_MODE=run-hang-no-cid-listed expect_rc "docker-run-hang-no-cid-listed" 4 --runtime "$dstub" --iterations 1 --warmup 0 --timeout 1
+expect_contains "docker-run-hang-no-cid-listed-leftover" "containers left behind: $(printf '%064x' 1)"
+if grep -q '^rm ' "$dstub_log"; then fail "docker-run-hang-no-cid-listed-untouched"; else pass "docker-run-hang-no-cid-listed-untouched"; fi
+# rm -f が失敗し続けたら期限内で打ち切って exit 4。
+reset_dlog
+started="$SECONDS"
+DSTUB_MODE=rm-fail expect_rc "docker-rm-fail" 4 --runtime "$dstub" --iterations 1 --warmup 0 --timeout 1
+elapsed=$((SECONDS - started))
+if [ "$elapsed" -lt 15 ]; then pass "docker-rm-fail-bounded (${elapsed}s < 15s)"; else fail "docker-rm-fail-bounded (${elapsed}s)"; fi
+expect_contains "docker-rm-fail-leftover" "containers left behind: $(printf '%064x' 1)"
+# 一覧の取得に失敗したら削除の確認ができないので exit 4。
+reset_dlog
+DSTUB_MODE=list-fail expect_rc "docker-list-fail" 4 --runtime "$dstub" --iterations 1 --warmup 0 --timeout 1
+expect_contains "docker-list-fail-leftover" "containers left behind: $(printf '%064x' 1)"
+# --rm の後にコンテナが残っていれば、cidfile の ID を指定した rm -f で片付けて成功する。
+reset_dlog
+DSTUB_MODE=leftover-after-rm expect_rc "docker-leftover-after-rm" 0 --runtime "$dstub" --iterations 1 --warmup 0
+expect_eq "docker-leftover-after-rm-rm" "rm -f $(printf '%064x' 1)" "$(grep '^rm ' "$dstub_log")"
+expect_eq "docker-leftover-after-rm-cleaned" "" "$(find "$dstub_state/containers" -type f -print)"
+
+# --- D4. 入力エラー（exit 2） ---
+reset_dlog
+expect_rc "docker-bundle-given" 2 --runtime "$dstub" --bundle "$work/bundle"
+expect_contains "docker-bundle-given-error" "invalid-option-for-mode"
+expect_rc "docker-image-invalid-dash" 2 --runtime "$dstub" --image -v
+expect_rc "docker-image-invalid-space" 2 --runtime "$dstub" --image "alpine 3"
+expect_rc "docker-image-invalid-semicolon" 2 --runtime "$dstub" --image 'alpine;id'
+expect_rc "docker-image-duplicate" 2 --runtime "$dstub" --image a --image b
+expect_rc "docker-runtime-relative" 2 --runtime docker
+expect_eq "docker-input-errors-no-calls" "" "$(cat "$dstub_log")"
+default_args=(--target own)
+expect_rc "image-in-oci-mode" 2 --runtime "$stub" --bundle "$work/bundle" --image alpine:3.20
+expect_contains "image-in-oci-mode-error" "invalid-option-for-mode"
+expect_rc "mode-invalid" 2 --mode podman --runtime "$stub" --bundle "$work/bundle"
+expect_contains "mode-invalid-error" "invalid-mode"
+expect_rc "mode-duplicate" 2 --mode oci --mode docker --runtime "$stub" --bundle "$work/bundle"
+expect_rc "mode-oci-explicit" 0 --mode oci --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_eq "oci-mode-field" "oci" "$(jq -r '.mode' <<<"$last_stdout")"
+expect_eq "oci-method-field" "create-to-exec-observed" "$(jq -r '.method' <<<"$last_stdout")"
+expect_eq "oci-no-image-param" "false" "$(jq -r '.params | has("image")' <<<"$last_stdout")"
+oci_json="$last_stdout"
+
+# --- D5. check-bench-regression.sh のスキーマ互換（docker・oci 両方） ---
+reset_dlog
+default_args=(--mode docker --target docker)
+run_target --runtime "$dstub" --iterations 2 --warmup 0
+printf '%s\n' "$last_stdout" >"$work/docker-results.json"
+rc=0
+"$bash_bin" "$bench_check_script" "$work/baseline.json" "$work/docker-results.json" >/dev/null 2>&1 || rc=$?
+expect_eq "docker-bench-regression-schema-compat" "0" "$rc"
+printf '%s\n' "$oci_json" >"$work/oci-results.json"
+rc=0
+"$bash_bin" "$bench_check_script" "$work/baseline.json" "$work/oci-results.json" >/dev/null 2>&1 || rc=$?
+expect_eq "oci-bench-regression-schema-compat-with-mode" "0" "$rc"
+
+# --- R. report モード ---
+default_args=()
+own_fixture="$work/own-fixture.json"
+docker_fixture="$work/docker-fixture.json"
+cat >"$own_fixture" <<'JSON'
+{"schema_version":1,"benchmark":"startup_latency","mode":"oci","method":"create-to-exec-observed","target":"own","label":"own","params":{"iterations":3,"warmup":1,"timeout_secs":10},"samples_us":[{"total_us":240000}],"metrics":{"startup_latency_p50_ms":{"value":240,"unit":"ms"},"startup_latency_min_ms":{"value":230,"unit":"ms"},"startup_latency_max_ms":{"value":250,"unit":"ms"}}}
+JSON
+cat >"$docker_fixture" <<'JSON'
+{"schema_version":1,"benchmark":"startup_latency","mode":"docker","method":"docker-run-rm-total","target":"docker","label":"docker","params":{"iterations":3,"warmup":1,"timeout_secs":10,"image":"alpine:3.20"},"samples_us":[{"run_us":300000,"total_us":300000}],"metrics":{"startup_latency_p50_ms":{"value":300,"unit":"ms"},"startup_latency_min_ms":{"value":290,"unit":"ms"},"startup_latency_max_ms":{"value":310,"unit":"ms"}}}
+JSON
+expect_rc "report-ok" 0 --mode report --own-result "$own_fixture" --docker-result "$docker_fixture"
+report_json="$last_stdout"
+expect_eq "report-benchmark" "startup_latency_report" "$(jq -r '.benchmark' <<<"$report_json")"
+expect_eq "report-schema_version" "1" "$(jq -r '.schema_version' <<<"$report_json")"
+expect_eq "report-comparison" "240 300 0.8 true" "$(jq -r '.comparison | [.own_p50_ms, .docker_p50_ms, .p50_ratio_own_to_docker, .methods_differ] | map(tostring) | join(" ")' <<<"$report_json")"
+expect_eq "report-results-embedded" "own docker" "$(jq -r '[.results.own.target, .results.docker.target] | join(" ")' <<<"$report_json")"
+expect_eq "report-no-verdict" "false" "$(jq -r '[.. | objects | keys[]] | any(test("^(verdict|pass|passed|fail|failed|go)$"; "i"))' <<<"$report_json")"
+expect_eq "report-no-path-leak" "false" "$(jq -r --arg p "$work" 'tostring | contains($p)' <<<"$report_json")"
+report_out="$work/report.json"
+expect_rc "report-output-write" 0 --mode report --own-result "$own_fixture" --docker-result "$docker_fixture" --output "$report_out"
+expect_eq "report-output-equals-stdout" "$last_stdout" "$(cat "$report_out")"
+expect_rc "report-output-existing" 2 --mode report --own-result "$own_fixture" --docker-result "$docker_fixture" --output "$report_out"
+# 実際の own / docker の出力（スタブ計測）からも統合できる。
+printf '%s\n' "$oci_json" >"$work/oci-real.json"
+expect_rc "report-from-real-outputs" 0 --mode report --own-result "$work/oci-real.json" --docker-result "$work/docker-results.json"
+expect_eq "report-from-real-outputs-differ" "true" "$(jq -r '.comparison.methods_differ' <<<"$last_stdout")"
+
+# report の入力エラー（exit 2）。
+echo 'not json' >"$work/bad-notjson.json"
+expect_rc "report-not-json" 2 --mode report --own-result "$work/bad-notjson.json" --docker-result "$docker_fixture"
+expect_contains "report-not-json-error" "invalid-result"
+jq '.benchmark = "other"' "$own_fixture" >"$work/bad-benchmark.json"
+expect_rc "report-benchmark-mismatch" 2 --mode report --own-result "$work/bad-benchmark.json" --docker-result "$docker_fixture"
+expect_rc "report-mode-swapped" 2 --mode report --own-result "$docker_fixture" --docker-result "$own_fixture"
+jq '.metrics.startup_latency_p50_ms.value = 0' "$own_fixture" >"$work/bad-zero.json"
+expect_rc "report-p50-zero" 2 --mode report --own-result "$work/bad-zero.json" --docker-result "$docker_fixture"
+jq 'del(.metrics.startup_latency_p50_ms)' "$docker_fixture" >"$work/bad-missing.json"
+expect_rc "report-p50-missing" 2 --mode report --own-result "$own_fixture" --docker-result "$work/bad-missing.json"
+jq '.metrics.startup_latency_p50_ms.unit = "s"' "$own_fixture" >"$work/bad-unit.json"
+expect_rc "report-unit-mismatch" 2 --mode report --own-result "$work/bad-unit.json" --docker-result "$docker_fixture"
+jq '.schema_version = 2' "$own_fixture" >"$work/bad-version.json"
+expect_rc "report-schema-version" 2 --mode report --own-result "$work/bad-version.json" --docker-result "$docker_fixture"
+cat "$own_fixture" "$own_fixture" >"$work/bad-two-docs.json"
+expect_rc "report-two-documents" 2 --mode report --own-result "$work/bad-two-docs.json" --docker-result "$docker_fixture"
+ln -sf "$own_fixture" "$work/own-link.json"
+expect_rc "report-symlink" 2 --mode report --own-result "$work/own-link.json" --docker-result "$docker_fixture"
+expect_rc "report-missing-file" 2 --mode report --own-result "$work/no-such.json" --docker-result "$docker_fixture"
+head -c 1048577 /dev/zero | tr '\0' ' ' >"$work/bad-big.json"
+expect_rc "report-too-big" 2 --mode report --own-result "$work/bad-big.json" --docker-result "$docker_fixture"
+expect_rc "report-missing-arg" 2 --mode report --own-result "$own_fixture"
+expect_rc "report-extra-runtime" 2 --mode report --own-result "$own_fixture" --docker-result "$docker_fixture" --runtime "$dstub"
+expect_rc "report-extra-bundle" 2 --mode report --own-result "$own_fixture" --docker-result "$docker_fixture" --bundle "$work/bundle"
+expect_rc "report-extra-iterations" 2 --mode report --own-result "$own_fixture" --docker-result "$docker_fixture" --iterations 3
+expect_rc "own-result-in-oci-mode" 2 --mode oci --target own --runtime "$stub" --bundle "$work/bundle" --own-result "$own_fixture"
+default_args=(--target own)
 
 if [ "$failures" -ne 0 ]; then
   echo "startup_latency_selftest: $failures failure(s)" >&2

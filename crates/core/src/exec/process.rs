@@ -20,7 +20,7 @@
 //!
 //! - **最小構成（フック無し）**: 子はステージ列（[`StagePipeline`]。#832）を `run_child` の pivot 後・
 //!   exec 前で固定順に実行する。組み込みの `PR_SET_NO_NEW_PRIVS`（#833）は空のパイプラインでも適用される
-//!   が、**Landlock・cgroup 参加は未適用**（実体は TASK-32・39・40 が差し込む。capability 削減は #173、seccomp は #178 で組み込み済み）。
+//!   が、**Landlock は未適用、cgroup 参加は呼び出し側が `cgroups::CgroupJoin` を登録した場合のみ適用**（Landlock・rootless の実体は TASK-39・40 が差し込む。capability 削減は #173、seccomp は #178 で組み込み済み）。
 //!   そのため制限が未適用の子（rootful 経路のホスト root 権限のままの子を含む）は、
 //!   `exec_entrypoint` が `PermissionDenied` で exec を拒否する（SEC-1・CORE-5。制限を適用できる
 //!   ようになるまで fail-closed。REPAIR-3: 実装済みを装わない）

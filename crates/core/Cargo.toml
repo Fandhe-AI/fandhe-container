@@ -44,6 +44,13 @@ name = "capabilities"
 path = "tests/capabilities.rs"
 harness = false
 
+# 起動フローへの cgroup 参加（CgroupJoin 段）の結合試験（CORE-3・TASK-32.4）。上と同じ理由で harness = false。
+# 委譲 cgroup v2 が必要な実機前提テストのため `-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "cgroup_join"
+path = "tests/cgroup_join.rs"
+harness = false
+
 # 基本デバイスノード作成（create_default_devices）の結合試験（CORE-1・TASK-27.6）。上と同じ理由で
 # harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
 # seccomp 適用後の遮断の結合試験（CORE-5・TASK-38.3・#178）。適用は単一スレッドを要するため harness = false。

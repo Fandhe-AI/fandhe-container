@@ -9,8 +9,9 @@
 //! cgroup 参加 -> capability 削減 -> PR_SET_NO_NEW_PRIVS -> Landlock -> seccomp -> exec
 //! ```
 //!
-//! 残りの段の実体は後続の TASK が [`StageHook`] として差し込む（cgroup 参加: TASK-32、
-//! Landlock: TASK-39、rootless: TASK-40）。`CapabilityDrop`（`exec/capabilities.rs`。
+//! cgroup 参加の実体は `crate::cgroups::CgroupJoin`（TASK-32.4・#161。[`StageHook`] 実装済みで、
+//! `ContainerCgroup::join_hook` が返すものを呼び出し側が `with_hook(StageKind::CgroupJoin, ..)` で登録する）。
+//! 残りの段の実体は後続の TASK が [`StageHook`] として差し込む（Landlock: TASK-39、rootless: TASK-40）。`CapabilityDrop`（`exec/capabilities.rs`。
 //! #173・TASK-37.2・SEC-1）・`NoNewPrivs`（`exec/no_new_privs.rs`。#833・TASK-27.4.3）・
 //! `Seccomp`（`exec/seccomp.rs`。#178・TASK-38.3・CORE-5。exec 直前の最終段）は
 //! 組み込みの固定ステージで、フックを登録しなくても必ず実行され、[`StagePipeline::with_hook`] による
@@ -39,10 +40,10 @@
 //!   `catch_unwind` により `EXIT_SETUP_FAILED` で `_exit` する（fail-closed）
 //! - **フックの実装者は core crate 内のモジュール**を想定する（`ExecError::new` は非公開）
 //!
-//! # 将来仕様（記録のみ）
+//! # cgroup 参加（TASK-32.4）
 //!
-//! pivot 後はホストの `/sys/fs/cgroup` が見えないため、TASK-32 の cgroup 参加フックは fork 前に
-//! cgroup ディレクトリの `OwnedFd` を確保し、fd 経由で `cgroup.procs` へ書く設計にする。
+//! pivot 後はホストの `/sys/fs/cgroup` が見えないため、参加フックは fork 前に確保した cgroup
+//! ディレクトリの `OwnedFd` 経由で `cgroup.procs` へ書く。本番 launcher からの結線は未実装（REPAIR-3）。
 
 use std::fmt;
 
@@ -139,6 +140,13 @@ pub trait StageHook {
 impl<F: FnMut() -> Result<(), ExecError>> StageHook for F {
     fn apply(&mut self) -> Result<(), ExecError> {
         self()
+    }
+}
+
+/// cgroup 参加（TASK-32.4）。fork 後の子（pivot 後・capability 削減前）でのみ呼ばれる契約。
+impl StageHook for crate::cgroups::CgroupJoin {
+    fn apply(&mut self) -> Result<(), ExecError> {
+        self.join_current_process().map_err(ExecError::from_cgroup)
     }
 }
 
@@ -596,6 +604,60 @@ mod tests {
                 "exec"
             ]
         );
+    }
+
+    /// CORE-3・TASK-32.4（受け入れ条件）: 実 `CgroupJoin` は capability 削減・Landlock・seccomp・exec の
+    /// いずれより前に走る。Landlock 時点で既に `cgroup.procs` へ PID が書かれていることで機械照合する。
+    #[test]
+    fn core3_task32_4_cgroup_join_runs_before_other_stages() {
+        use crate::cgroups::{CgroupJoin, CgroupName};
+        use crate::traits::ContainerId;
+        use std::os::fd::OwnedFd;
+
+        take();
+        let dir = std::env::temp_dir().join(format!("fandhe-stages-cgjoin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let procs = dir.join("cgroup.procs");
+        std::fs::write(&procs, "").unwrap();
+        let fd = OwnedFd::from(std::fs::File::open(&dir).unwrap());
+        let name = CgroupName::new(&ContainerId::new("t").unwrap()).unwrap();
+        let mut real = CgroupJoin::from_dir_for_test(name, fd);
+        let join = move || {
+            real.apply()?;
+            rec("cgroup_join");
+            Ok(())
+        };
+        let procs_for_landlock = procs.clone();
+        let landlock = move || {
+            let seen = std::fs::read_to_string(&procs_for_landlock).unwrap();
+            // Landlock 時点で自 PID が書かれていれば "landlock"、そうでなければ別名で記録する。
+            rec(if seen == std::process::id().to_string() {
+                "landlock"
+            } else {
+                "landlock:not_joined"
+            });
+            Ok(())
+        };
+        StagePipeline::new()
+            .with_hook(StageKind::Landlock, landlock)
+            .unwrap()
+            .with_hook(StageKind::CgroupJoin, join)
+            .unwrap()
+            .run_then(exec_ok)
+            .unwrap();
+        assert_eq!(
+            take(),
+            [
+                "cgroup_join",
+                "capability_drop",
+                "no_new_privs",
+                "landlock",
+                "seccomp",
+                "exec"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CORE-5・TASK-38.3・MS-2（受け入れ条件）: seccomp は Landlock の直後・exec の直前に走る。

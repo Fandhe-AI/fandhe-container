@@ -8,10 +8,12 @@
 //!
 //! # 呼び出し元・契約
 //!
+//! - TASK-41.3（#194）の Landlock フックは [`landlock_denial_record`] で実装済み（プロセス内で観測した
+//!   `EACCES` の写像まで。ワークロードの拒否の捕捉は #840）
 //! - TASK-41.2（#193。seccomp フックは `seccomp_hook` に実装済み。拒否報告 [`SeccompDenialReport`] から
 //!   レコードを 1 件組み立てて [`AuditSink`] へ渡す。ただし現行フィルタは禁止 syscall に `ERRNO(EPERM)` を返し
 //!   SIGSYS も通知も発生しないため、本番の配送経路〔TRAP + SIGSYS ハンドラ / USER_NOTIF + supervisor listener〕は
-//!   **未実装**で、フックはまだ本番経路から呼ばれない。REPAIR-3）・41.3（#194 Landlock フック）・41.4（#195 マウント検証/API。
+//!   **未実装**で、フックはまだ本番経路から呼ばれない。REPAIR-3）・41.4（#195 マウント検証/API。
 //!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
 //! - 永続化・エンコード（JSON Lines 等）は TASK-41.5 系（#839）、カーネル監査連携・クラッシュ時の記録保持は
 //!   #840 の担当で、本モジュールは**未実装**（REPAIR-3: 実装済みを装わない）。`serde` の derive も未提供
@@ -26,6 +28,10 @@
 //! アーキ識別子（`AUDIT_ARCH_*`。[`AuditSyscallArch`]）を併せて持つ（#193 で決定）。
 //! コンテナ ID を持たせるかは #194 以降で決める。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
+
+mod landlock;
+
+pub use landlock::{LANDLOCK_DENIED_ERRNO, landlock_denial_record, landlock_denial_record_now};
 
 use std::fmt;
 use std::num::NonZeroU32;

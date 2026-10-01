@@ -22,6 +22,9 @@
 //! `prctl(PR_SET_SECCOMP)` / `prctl(PR_GET_SECCOMP)` を呼ぶ（呼び出したスレッドへのフィルタ追加。不可逆）。
 //! さらに `crate::landlock::detect_landlock_abi`（CORE-5・TASK-39.1・#181）が `landlock_create_ruleset(2)`
 //! （`syscall(2)` 経由。ABI バージョン問い合わせのみ）を呼ぶ。
+//! さらに `crate::landlock::apply_landlock_ruleset`（CORE-5・TASK-39.3・#183）が `landlock_create_ruleset(2)`・
+//! `landlock_add_rule(2)`・`landlock_restrict_self(2)`（いずれも `syscall(2)` 経由）を呼ぶ
+//! （restrict は呼び出したスレッドへの不可逆な適用）。
 //! さらに `crate::exec` の結合試験用プローブ（CORE-5・TASK-38.4・#179）が、副作用の無い引数に固定した
 //! `ptrace(2)`・`kexec_load(2)`（`syscall(2)` 経由）を呼ぶ。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。
@@ -155,6 +158,11 @@ mod consts {
     pub const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
     // include/uapi/linux/landlock.h の `LANDLOCK_CREATE_RULESET_VERSION`（`1U << 0`）。
     pub const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+    // arch/x86/entry/syscalls/syscall_64.tbl の `landlock_add_rule`（445）・`landlock_restrict_self`（446）。
+    pub const SYS_LANDLOCK_ADD_RULE: i64 = 445;
+    pub const SYS_LANDLOCK_RESTRICT_SELF: i64 = 446;
+    // include/uapi/linux/landlock.h の `enum landlock_rule_type` の `LANDLOCK_RULE_PATH_BENEATH`。
+    pub const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
     // include/uapi/asm-generic/errno.h の `EOPNOTSUPP`（x86_64 は上書きしない）。
     pub const EOPNOTSUPP: i32 = 95;
     pub const ELOOP: i32 = 40;
@@ -278,6 +286,11 @@ mod consts {
     pub const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
     // include/uapi/linux/landlock.h の `LANDLOCK_CREATE_RULESET_VERSION`（`1U << 0`）。
     pub const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+    // include/uapi/asm-generic/unistd.h の `landlock_add_rule`（445）・`landlock_restrict_self`（446）。
+    pub const SYS_LANDLOCK_ADD_RULE: i64 = 445;
+    pub const SYS_LANDLOCK_RESTRICT_SELF: i64 = 446;
+    // include/uapi/linux/landlock.h の `enum landlock_rule_type` の `LANDLOCK_RULE_PATH_BENEATH`。
+    pub const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
     // include/uapi/asm-generic/errno.h の `EOPNOTSUPP`（arm64 は上書きしない）。
     pub const EOPNOTSUPP: i32 = 95;
     pub const ELOOP: i32 = 40;
@@ -377,6 +390,9 @@ mod consts {
     pub const EINVAL: i32 = -5;
     pub const SYS_LANDLOCK_CREATE_RULESET: i64 = 0;
     pub const LANDLOCK_CREATE_RULESET_VERSION: u32 = 0;
+    pub const SYS_LANDLOCK_ADD_RULE: i64 = 0;
+    pub const SYS_LANDLOCK_RESTRICT_SELF: i64 = 0;
+    pub const LANDLOCK_RULE_PATH_BENEATH: u32 = 0;
     pub const EOPNOTSUPP: i32 = -15;
     pub const ELOOP: i32 = -6;
     pub const ESRCH: i32 = -8;
@@ -1487,6 +1503,105 @@ pub(crate) fn landlock_abi_version() -> Result<u32, SysError> {
     u32::try_from(rc).map_err(|_| SysError::Os(EINVAL))
 }
 
+/// `struct landlock_ruleset_attr`（include/uapi/linux/landlock.h。ABI 6 時点の 24 バイト版）。
+/// `handled_access_net`・`scoped` は本実装では使わず 0（`MIN_LANDLOCK_ABI` = 6 によりカーネルは
+/// 常にこのサイズを理解する）。
+#[repr(C)]
+struct LandlockRulesetAttr {
+    handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
+}
+
+/// `struct landlock_path_beneath_attr`（include/uapi/linux/landlock.h。`__attribute__((packed))`
+/// のため 12 バイトで、`parent_fd` はオフセット 8）。
+#[repr(C, packed)]
+struct LandlockPathBeneathAttr {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+/// fs アクセス権 `handled_fs` を扱う ruleset を作り、その fd を返す（`landlock_create_ruleset(2)`。
+/// CORE-5・TASK-39.3・#183）。fd はカーネルが `O_CLOEXEC` 付きで返す。この時点ではプロセスを制限しない。
+pub(crate) fn landlock_create_ruleset_fs(handled_fs: u64) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let attr = LandlockRulesetAttr {
+        handled_access_fs: handled_fs,
+        handled_access_net: 0,
+        scoped: 0,
+    };
+    // SAFETY: `attr` はスタック上の `#[repr(C)]` 値（24 バイト）で呼び出しの間有効。カーネルは
+    // `size` バイトを読んでコピーするだけでポインタを保持しない。`size` は実際の構造体サイズと一致する。
+    // flags は 0。可変長 `syscall(2)` へはポインタ・`usize`・`u64` とレジスタ幅で渡す。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_LANDLOCK_CREATE_RULESET,
+            &raw const attr,
+            core::mem::size_of::<LandlockRulesetAttr>(),
+            0u64,
+        )
+    };
+    if rc < 0 {
+        return Err(last_error());
+    }
+    let fd = i32::try_from(rc).map_err(|_| SysError::Os(EINVAL))?;
+    // SAFETY: `fd` は上で成功した syscall が返した、他に所有者のいない有効な fd（二重 close なし）。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// ruleset に「`parent`（O_PATH 可）配下に `allowed` を許可する」ルールを追加する
+/// （`landlock_add_rule(2)` の `LANDLOCK_RULE_PATH_BENEATH`。CORE-5・TASK-39.3・#183）。
+/// `allowed` が空なら `ENOMSG`、handled に含まれない権利を含むと `EINVAL`。
+pub(crate) fn landlock_add_path_beneath(
+    ruleset: BorrowedFd<'_>,
+    allowed: u64,
+    parent: BorrowedFd<'_>,
+) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let attr = LandlockPathBeneathAttr {
+        allowed_access: allowed,
+        parent_fd: parent.as_raw_fd(),
+    };
+    // SAFETY: `attr` はスタック上の packed `#[repr(C)]` 値（12 バイト）で呼び出しの間有効。
+    // カーネルは読み取りのみでポインタを保持しない。`ruleset`・`parent` は生存中の `BorrowedFd`。
+    // flags は 0。可変長引数はレジスタ幅（`i32` は `i64` へ拡幅して符号を保つ）で渡す。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_LANDLOCK_ADD_RULE,
+            i64::from(ruleset.as_raw_fd()),
+            u64::from(consts::LANDLOCK_RULE_PATH_BENEATH),
+            &raw const attr,
+            0u64,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// ruleset を呼び出したスレッドへ適用する（`landlock_restrict_self(2)`。CORE-5・TASK-39.3・#183）。
+///
+/// 適用は不可逆で、呼び出したスレッド（と以後 fork・clone する子）にのみ効く。`NO_NEW_PRIVS` と
+/// 単一スレッドの事前確認は呼び出し側（`crate::landlock`）の契約で、本関数は検証しない。
+/// flags は 0（ABI 7 のログ系フラグは使わない）。
+pub(crate) fn landlock_restrict_self(ruleset: BorrowedFd<'_>) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は生存中の `BorrowedFd` の fd 番号と flags 0 の整数のみでポインタを渡さない。
+    // メモリには触れず、影響は呼び出したスレッドの Landlock ドメインの追加（権限を減らす方向）のみ。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_LANDLOCK_RESTRICT_SELF,
+            i64::from(ruleset.as_raw_fd()),
+            0u64,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// `ptrace(PTRACE_CONT, pid, 0, 0)` を発行して errno を返す結合試験用プローブ（CORE-5・TASK-38.4・#179）。
 ///
 /// `PTRACE_CONT` は attach 済みのトレーシー専用の要求で、フィルタが無ければ自プロセスのような
@@ -1592,6 +1707,43 @@ mod tests {
         assert_eq!(consts::SYS_LANDLOCK_CREATE_RULESET, 444);
         assert_eq!(consts::LANDLOCK_CREATE_RULESET_VERSION, 1);
         assert_eq!(consts::EOPNOTSUPP, 95);
+    }
+
+    /// CORE-5・TASK-39.3: Landlock 適用系の定数・構造体レイアウトの固定値照合。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core5_landlock_apply_consts_and_layout_are_exact() {
+        assert_eq!(consts::SYS_LANDLOCK_ADD_RULE, 445);
+        assert_eq!(consts::SYS_LANDLOCK_RESTRICT_SELF, 446);
+        assert_eq!(consts::LANDLOCK_RULE_PATH_BENEATH, 1);
+        assert_eq!(core::mem::size_of::<LandlockRulesetAttr>(), 24);
+        assert_eq!(core::mem::size_of::<LandlockPathBeneathAttr>(), 12);
+        assert_eq!(core::mem::offset_of!(LandlockPathBeneathAttr, parent_fd), 8);
+    }
+
+    /// CORE-5・TASK-39.3: ruleset 作成とルール追加は fd に触れるだけでプロセスを制限しないため
+    /// libtest 内で実 syscall を呼べる（`landlock_restrict_self` は不可逆のため呼ばない）。
+    #[test]
+    fn core5_landlock_create_and_add_rule_real_syscall() {
+        use std::os::fd::AsFd as _;
+        const READ_DIR: u64 = 1 << 3;
+        match landlock_create_ruleset_fs(READ_DIR) {
+            Ok(rs) => {
+                let root = open_dir_path_nofollow(None, c"/").expect("open /");
+                assert_eq!(
+                    landlock_add_path_beneath(rs.as_fd(), READ_DIR, root.as_fd()),
+                    Ok(())
+                );
+                // 空の allowed はカーネルが拒否する（ENOMSG = 42）。
+                assert_eq!(
+                    landlock_add_path_beneath(rs.as_fd(), 0, root.as_fd()),
+                    Err(SysError::Os(42))
+                );
+            }
+            Err(SysError::Os(e)) => assert!(e > 0, "errno must be positive, got {e}"),
+            Err(SysError::Unsupported) => {}
+            Err(other) => panic!("unexpected result: {other:?}"),
+        }
     }
 
     /// CORE-5・TASK-39.1: 実 syscall の結果が想定どおりの集合に収まる（カーネル版数に依存しない）。

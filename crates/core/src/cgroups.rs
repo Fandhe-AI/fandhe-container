@@ -28,8 +28,12 @@
 //! スコープを共有する運用の扱いは TASK-32.4 と整合させる。退避リーフは自プロセスが入るため削除せず、
 //! スコープ終了時に systemd が回収する。
 //!
+//! # 実装済みの資源制限
+//! - `cpu.max`（TASK-32.3・#160）: [`ContainerCgroup::set_cpu_max`]（`cpu` サブモジュール。起動フローからは
+//!   未呼び出しで、結線は TASK-32.4・#161）
+//!
 //! # 未実装（REPAIR-3）
-//! - `memory.max` / `memory.swap.max`（TASK-32.2・#159）、`cpu.max`（TASK-32.3・#160）の書き込み
+//! - `memory.max` / `memory.swap.max`（TASK-32.2・#159）の書き込み
 //! - `StageHook` 化・fork 後の子の `cgroup.procs` 参加・`ExecError` への変換（TASK-32.4・#161）
 //! - OCI `linux.cgroupsPath` の反映、delete 時の cgroup 削除の結線（TASK-30 系）
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
@@ -44,6 +48,9 @@ use std::os::unix::fs::MetadataExt as _;
 
 use crate::sys::{self, SysError};
 use crate::traits::{ContainerId, ErrorCode};
+
+mod cpu;
+pub use cpu::{CpuMax, CpuQuota};
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
 const EVACUATION_LEAF: &str = "fc-runtime";
@@ -86,6 +93,8 @@ pub enum CgroupStep {
     EnableControllers,
     /// 失敗後の後始末。
     Cleanup,
+    /// `cpu.max` の検証・書き込み・読み戻し。
+    SetCpuMax,
 }
 
 /// cgroup 操作のエラー。`code` は ERR 系の機械可読コード、`message` は英語の説明。

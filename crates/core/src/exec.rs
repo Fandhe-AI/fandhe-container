@@ -2636,8 +2636,8 @@ mod tests {
         );
     }
 
-    /// CORE-6（TASK-40.2）: rootless の失敗は `code` を保ち、段は `UserNamespaceMap`、message に
-    /// rootless 側の段名を含む。
+    /// CORE-3（TASK-32.4）: cgroup 参加の失敗は `code` を保ち、段は `CgroupJoin`、message に
+    /// cgroup 側の段名を含む。
     #[test]
     fn core3_task32_4_exec_error_from_cgroup_keeps_code_and_names_stage() {
         use crate::cgroups::{CgroupError, CgroupStep};
@@ -2652,6 +2652,8 @@ mod tests {
         assert!(e.violation.is_none());
     }
 
+    /// CORE-6（TASK-40.2）: rootless の失敗は `code` を保ち、段は `UserNamespaceMap`、message に
+    /// rootless 側の段名を含む。
     #[test]
     fn core6_exec_error_from_rootless_keeps_code_and_names_stage() {
         let e = ExecError::from_rootless(RootlessError {

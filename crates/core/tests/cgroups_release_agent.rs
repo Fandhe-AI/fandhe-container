@@ -143,7 +143,7 @@ fn sec6_task35_scanner_detects_code_and_ignores_comments() {
 #[cfg(target_os = "linux")]
 mod linux {
     use fandhe_container_core::cgroups::{
-        CgroupName, CgroupStep, ContainerCgroup, Controller, ControllerSet, DelegatedCgroup,
+        CgroupName, CgroupStep, ContainerCgroup, DelegatedCgroup,
     };
     use fandhe_container_core::traits::{ContainerId, ErrorCode};
     use std::fs;
@@ -154,12 +154,18 @@ mod linux {
     /// カーネル応答の読み取り上限。
     const READ_LIMIT: u64 = 1024 * 1024;
 
+    /// 上限付きで読む。上限を超える入力は途切れた内容を完全な入力として扱わないよう失敗させる。
     fn read_limited(path: &str) -> String {
         let f = fs::File::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
         let mut s = String::new();
-        f.take(READ_LIMIT)
+        // 1 バイト余分に読み、上限到達（切り詰め）を検出する。
+        f.take(READ_LIMIT + 1)
             .read_to_string(&mut s)
             .unwrap_or_else(|e| panic!("read {path}: {e}"));
+        assert!(
+            s.len() as u64 <= READ_LIMIT,
+            "{path} exceeds the {READ_LIMIT} byte read limit"
+        );
         s
     }
 
@@ -188,18 +194,28 @@ mod linux {
         }
     }
 
-    /// 自 cgroup のディレクトリ（検証済み要素のみ join）。解決できなければ `None`。
-    fn own_cgroup_dir() -> Option<PathBuf> {
+    /// 自 cgroup のディレクトリ（検証済み要素のみ join）。解決できなければ原因付きの `Err`。
+    fn own_cgroup_dir() -> Result<PathBuf, String> {
         let text = read_limited("/proc/self/cgroup");
-        let path = text.lines().find_map(|l| l.strip_prefix("0::"))?;
+        let path = text
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .ok_or_else(|| "no cgroup v2 entry (`0::`) in /proc/self/cgroup".to_owned())?;
         let mut dir = PathBuf::from(CGROUP_ROOT);
         for comp in path.split('/').filter(|c| !c.is_empty()) {
             if comp == ".." || comp == "." || comp.contains('\0') {
-                return None;
+                return Err(format!("unsafe component {comp:?} in cgroup path {path:?}"));
             }
             dir.push(comp);
         }
-        dir.is_dir().then_some(dir)
+        if dir.is_dir() {
+            Ok(dir)
+        } else {
+            Err(format!(
+                "own cgroup directory {} (from {path:?}) is not visible",
+                dir.display()
+            ))
+        }
     }
 
     /// SEC-6・CORE-4・TASK-35: 実ホストの cgroup 階層に応じ、v2 では v1 専用ファイルの不在を、
@@ -213,10 +229,10 @@ mod linux {
             assert!(root.join("cgroup.procs").exists());
             assert!(root.join("cgroup.controllers").exists());
             assert_no_v1_files(root);
-            if let Some(own) = own_cgroup_dir() {
-                assert!(own.join("cgroup.procs").exists(), "{}", own.display());
-                assert_no_v1_files(&own);
-            }
+            // 解決できない場合は黙って省略せず、原因付きで失敗させる（REPAIR-12）。
+            let own = own_cgroup_dir().unwrap_or_else(|e| panic!("cannot resolve own cgroup: {e}"));
+            assert!(own.join("cgroup.procs").exists(), "{}", own.display());
+            assert_no_v1_files(&own);
         } else {
             let err = DelegatedCgroup::detect()
                 .expect_err("v1/hybrid/unmounted cgroup must be rejected (CORE-4)");
@@ -231,14 +247,38 @@ mod linux {
     }
 
     /// 後始末（作成した子 cgroup の削除）を assert 失敗時にも走らせるためのガード。
+    ///
+    /// 成功経路では `finish` で削除結果を検証する。`finish` 前に drop された場合（assert 失敗等）も
+    /// 削除を試み、失敗は標準エラーへ報告する（unwind 中でなければ panic する）。
     struct Cleanup<'a> {
         delegated: &'a DelegatedCgroup,
-        child: ContainerCgroup,
+        child: Option<ContainerCgroup>,
+    }
+
+    impl Cleanup<'_> {
+        /// 子 cgroup を削除し、結果を返す。
+        fn finish(mut self) -> Result<(), String> {
+            match self.child.take() {
+                Some(child) => self
+                    .delegated
+                    .remove_child(&child)
+                    .map_err(|e| format!("remove_child failed: {e:?}")),
+                None => Ok(()),
+            }
+        }
     }
 
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {
-            let _ = self.delegated.remove_child(&self.child);
+            let Some(child) = self.child.take() else {
+                return;
+            };
+            if let Err(e) = self.delegated.remove_child(&child) {
+                eprintln!("cleanup: remove_child failed: {e:?}");
+                if !std::thread::panicking() {
+                    panic!("cleanup: remove_child failed: {e:?}");
+                }
+            }
         }
     }
 
@@ -251,17 +291,13 @@ mod linux {
         let parent = PathBuf::from(CGROUP_ROOT).join(delegated.path().trim_start_matches('/'));
         let id = ContainerId::new(format!("t{}", std::process::id())).unwrap();
         let name = CgroupName::new(&id).unwrap();
-        let (child, proof) = delegated.prepare(&name).expect("prepare");
-        let _cleanup = Cleanup {
+        // controller の有効化は v1 専用ファイルの不在確認に不要なので行わない
+        // （委譲サブツリーに Memory / Cpu が委譲されていなくても試験できるようにする）。
+        let (child, _proof) = delegated.prepare(&name).expect("prepare");
+        let cleanup = Cleanup {
             delegated: &delegated,
-            child,
+            child: Some(child),
         };
-        delegated
-            .enable_controllers(
-                &proof,
-                &ControllerSet::of(&[Controller::Memory, Controller::Cpu]),
-            )
-            .expect("enable controllers");
 
         let child_dir = parent.join(name.as_str());
         for dir in [&parent, &parent.join("fc-runtime"), &child_dir] {
@@ -280,5 +316,9 @@ mod linux {
             assert!(res.is_err(), "creating {} must fail", target.display());
             assert!(!target.exists(), "{}", target.display());
         }
+
+        // 成功経路でも削除結果を検証する。
+        cleanup.finish().expect("remove container cgroup");
+        assert!(!child_dir.exists(), "{}", child_dir.display());
     }
 }

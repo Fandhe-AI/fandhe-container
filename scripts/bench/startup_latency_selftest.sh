@@ -427,6 +427,14 @@ done
 reset_log
 expect_rc "output-sticky-dir" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --output "$work/sticky/out.json"
 expect_eq "output-sticky-dir-written" "$last_stdout" "$(cat "$work/sticky/out.json")"
+# 先頭が "//" のパスでも祖先の検査が終わる（Bugbot: dirname の不動点 "//" で止まる）。
+# 回帰時に自己テスト自体が止まらないよう外側に timeout を掛ける。
+reset_log
+rc=0
+timeout 60 "$bash_bin" "$target_script" --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 \
+  --output "/$work/sticky/out2.json" >/dev/null 2>&1 || rc=$?
+expect_eq "output-double-slash-exit" "0" "$rc"
+expect_eq "output-double-slash-written" "own" "$(jq -r '.target' "$work/sticky/out2.json" 2>/dev/null)"
 # 出力ファイルのパーミッションは umask に従う（umask 022 で 644）。
 expect_eq "output-mode-follows-umask" "644" "$(stat -c '%a' "$out_file" 2>/dev/null || stat -f '%Lp' "$out_file")"
 

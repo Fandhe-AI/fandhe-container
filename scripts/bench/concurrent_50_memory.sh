@@ -85,6 +85,7 @@
 #   - 後始末は環境変数トークンで所有プロセスを追跡する。計測時に子孫の environ がトークンを持たない・
 #     読めない場合（環境を消去して exec・別ユーザー権限）は追跡不能として失敗にする（成功を公開しない）。
 #     launcher 正常終了後に新規に生じてトークンを持たない子孫までは検出できない（cgroup 方式は特権要）。
+#   - --output は新規ファイルに限る（既存のパスは拒否し、上書きしない）。公開は ln -T（hard link）で行う。
 #   - --output の親ディレクトリは実行ユーザー所有・group/other 書き込み不可で、祖先を含む全パス要素が非 symlink（".." 不可）に限る。
 #   - 集計後の再確認は「launcher の生存・READY・プロセス数」を見る。集計中に子孫が入れ替わっても
 #     プロセス数が --min-procs 以上なら検出しない。
@@ -201,8 +202,11 @@ if [ "$proc_root_given" -eq 1 ]; then
 fi
 
 if [ -n "$output" ]; then
-  if [ -d "$output" ] || [ -L "$output" ]; then
-    err "invalid-argument" "output path is a directory or symlink"
+  # 既存のパス（種別を問わない。symlink・ディレクトリを含む）は拒否し、上書きしない（出力先の取り違えで
+  # 既存データを失わない。startup_latency.sh の --output と同じ契約）。計測前に検査して早く止め、公開時にも
+  # ln -T で「存在しない場合だけ作成」を保証する。
+  if [ -e "$output" ] || [ -L "$output" ]; then
+    err "invalid-argument" "output path already exists (refusing to overwrite; --output must be a new file)"
     exit 2
   fi
   output_dir="${output%/*}"
@@ -269,8 +273,8 @@ if [ "$proc_root_given" -eq 0 ]; then
 else
   proc="${proc_root%/}"
 fi
-for req in sleep mktemp head grep find tail; do
-  command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "sleep, mktemp, head, grep, find and tail are required"; exit 3; }
+for req in sleep mktemp head grep find tail ln; do
+  command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "sleep, mktemp, head, grep, find, tail and ln are required"; exit 3; }
 done
 [ -r /proc/self/stat ] || { err "unsupported-os" "/proc/<pid>/stat is not available"; exit 3; }
 
@@ -906,7 +910,14 @@ fi
 if [ -n "$output" ]; then
   if ! out_tmp="$(mktemp "${output}.XXXXXX" 2>/dev/null)"; then err "output-failed" "cannot create temporary file next to the output"; exit 2; fi
   if ! printf '%s' "$out_buf" 2>/dev/null >"$out_tmp"; then err "output-failed" "cannot write temporary file"; exit 2; fi
-  if ! mv -fT "$out_tmp" "$output" 2>/dev/null; then err "output-failed" "cannot publish output"; exit 2; fi
+  # ln -T（link(2)）で公開する（startup_latency.sh の publish_result と同じ方式）。出力先が種別を問わず
+  # 既に存在すれば失敗し、symlink を辿らず、ディレクトリ内へも作らない。計測中に同名のファイルが
+  # 作られていても上書きしない。一時ファイルは成功・失敗のどちらでも消す（失敗時は EXIT trap）。
+  if ! ln -T -- "$out_tmp" "$output" 2>/dev/null; then
+    err "output-failed" "cannot publish output (it may already exist, or hard links are unsupported)"
+    exit 2
+  fi
+  rm -f -- "$out_tmp" || true
   out_tmp=""
 else
   if ! printf '%s' "$out_buf" 2>/dev/null; then err "output-failed" "cannot write to stdout"; exit 2; fi

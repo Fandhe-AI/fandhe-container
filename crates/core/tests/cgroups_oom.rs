@@ -21,8 +21,11 @@
 //!
 //! ```text
 //! cargo test -p fandhe-container-core --test cgroups_oom --no-run
-//! systemd-run --user --scope -p Delegate=yes <target/debug/deps/cgroups_oom-XXXX> --ignored
+//! systemd-run --user --scope -p Delegate=yes <実行ファイル> --ignored
 //! ```
+//!
+//! 実行ファイルのパスは `--no-run` の出力の `target/debug/deps/cgroups_oom-<hash>` から求める。
+//! 実行手順と非特権ローカルでの試行結果は `docs/design/measurements/cgroups-oom-local.md`（TASK-33.2）を参照。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

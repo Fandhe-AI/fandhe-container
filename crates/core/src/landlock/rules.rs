@@ -22,7 +22,8 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! `landlock_add_rule` / `landlock_restrict_self`（#183）、ステージ列への組み込み（#184）は未実装。
+//! ステージ列への組み込み（#184）は未実装（`landlock_add_rule` / `landlock_restrict_self` による適用は
+//! #183・`apply` 子モジュールで実装済み）。
 //! GPU 向けの権利拡張は TASK-128（GPU-3）が後から追加する。
 
 use std::fmt;
@@ -223,6 +224,16 @@ pub struct LandlockRuleset {
 }
 
 impl LandlockRuleset {
+    /// 結合試験用観測関数 `observe_landlock_enforcement` と単体テストが、config を経由せず ABI から
+    /// handled access を決めて組み立てる（CORE-5・TASK-39.3・#183。公開 API は増やさない）。
+    pub(crate) fn for_observation(abi: u32, rules: Vec<PathRule>) -> Self {
+        Self {
+            handled_access_fs: handled_for_abi(abi),
+            rules,
+            shadowed: Vec::new(),
+        }
+    }
+
     /// ruleset 属性へ渡す handled access。
     pub fn handled_access_fs(&self) -> AccessFs {
         self.handled_access_fs

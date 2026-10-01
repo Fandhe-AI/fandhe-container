@@ -6,7 +6,7 @@
 //! 「created・pid なし」の状態を 1 件作る。将来の plugin 側 `ContainerRuntime::create` 実装・CLI・
 //! TASK-29.3（start）が呼び出し元になる。`ContainerRuntime` の実装は plugin 側に置く（PLUG-1）ため、
 //! 本関数はトレイト実装ではなく `StateStore` を依存注入で受け取る自由関数とした。ファイルベースの
-//! `StateStore` 既定実装は TASK-31（OCI-5）の担当でまだ存在しない。
+//! `StateStore` の既定実装は `crate::state_store::FileStateStore`（TASK-31.1・OCI-5）。
 //!
 //! # fail-closed の判断（config.rs が本タスクへ委ねた判断の結果）
 //!

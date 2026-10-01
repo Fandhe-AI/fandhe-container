@@ -257,6 +257,9 @@ mod linux {
                 .expect("set memory limits");
             assert_eq!(applied.memory_max, MemoryLimit::Bytes(67_108_864));
             assert_eq!(applied.swap_max, Some(MemoryLimit::Bytes(0)));
+            // 戻り値だけでなく子 cgroup の実ファイルを読み戻して照合する（計測レポートの期待値）。
+            assert_eq!(read(&dir.join("memory.max")).trim_end(), "67108864");
+            assert_eq!(read(&dir.join("memory.swap.max")).trim_end(), "0");
             let join = container.join_hook().expect("join hook");
             let exit = launch(&rootfs.0, join);
             // 回収後・remove_child 前に読む。oom_kill が OOM による kill の決め手。

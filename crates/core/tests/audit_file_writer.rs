@@ -27,6 +27,7 @@ fn rec(n: i32) -> AuditRecord {
         AuditPid::new(n).unwrap(),
         AuditEvent::Seccomp {
             syscall: AuditSyscallNr::new(272).unwrap(),
+            arch: fandhe_container_core::audit_log::AuditSyscallArch::from_raw(3221225534),
         },
     )
 }

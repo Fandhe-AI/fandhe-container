@@ -13,8 +13,11 @@
 //!   本番経路への配線・永続化は未実装）
 //! - TASK-41.3（#194）の Landlock フックは [`landlock_denial_record`] で実装済み（プロセス内で観測した
 //!   `EACCES` の写像まで。ワークロードの拒否の捕捉は #840）
-//! - TASK-41.2（#193 seccomp フック）が、違反検知時に [`AuditRecord`] を組み立てる
-//!   （`exec::IsolationViolation` からの写像もここで扱う）
+//! - TASK-41.2（#193。seccomp フックは `seccomp_hook` に実装済み。拒否報告 [`SeccompDenialReport`] から
+//!   レコードを 1 件組み立てて [`AuditSink`] へ渡す。ただし現行フィルタは禁止 syscall に `ERRNO(EPERM)` を返し
+//!   SIGSYS も通知も発生しないため、本番の配送経路〔TRAP + SIGSYS ハンドラ / USER_NOTIF + supervisor listener〕は
+//!   **未実装**で、フックはまだ本番経路から呼ばれない。REPAIR-3）・41.4（#195 マウント検証/API。
+//!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
 //! - ローカルファイルへの JSON Lines 書き込み（主経路）は `file_writer` で実装済み（TASK-41.5.1・#839）。
 //!   型自体に `serde` の derive は付けず、非公開 DTO でワイヤースキーマへ写す（#652 で共通ログ型へ統一予定）。
 //!   カーネル監査連携・クラッシュ時の記録保持は #840 の担当で**未実装**（REPAIR-3: 実装済みを装わない）
@@ -24,8 +27,9 @@
 //!
 //! # 将来仕様
 //!
-//! syscall 番号はアーキテクチャ相対（x86_64 / aarch64 で異なる）。アーキ識別子（`AUDIT_ARCH_*`）や
-//! コンテナ ID を持たせるかは #193 以降で決める。フィールドは非公開かつ `#[non_exhaustive]` なので、
+//! syscall 番号はアーキテクチャ相対（x86_64 / aarch64 で異なる）ため、seccomp レコードは
+//! アーキ識別子（`AUDIT_ARCH_*`。[`AuditSyscallArch`]）を併せて持つ（#193 で決定）。
+//! コンテナ ID を持たせるかは #194 以降で決める。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
 
 mod file_writer;
@@ -43,13 +47,15 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::seccomp::SyscallNr;
+use crate::seccomp::{AuditArch, SyscallNr};
 use crate::traits::ErrorCode;
 
 pub mod mount;
+mod seccomp_hook;
 mod sink;
 
 pub use mount::{AuditDelivery, AuditedRejection, current_pid, record_mount_rejection};
+pub use seccomp_hook::{SeccompDenialReport, SeccompReportSource, record_seccomp_denial};
 pub use sink::AuditSink;
 
 /// [`AuditPath`] が保持するバイト長の上限（Linux の `PATH_MAX` に合わせる。超過分は切り詰める）。
@@ -65,6 +71,8 @@ pub enum AuditRecordErrorKind {
     SyscallNegative,
     /// 時計が UNIX エポックより前を指している。
     ClockBeforeEpoch,
+    /// SIGSYS の `si_code` が `SYS_SECCOMP` ではない（seccomp 由来でないシグナル）。
+    NotSeccompSignal,
 }
 
 /// 監査レコード構築エラー（ERR 系の構造化形式）。
@@ -98,6 +106,7 @@ impl AuditRecordError {
             AuditRecordErrorKind::PidNotPositive => "audit pid must be positive",
             AuditRecordErrorKind::SyscallNegative => "audit syscall number must not be negative",
             AuditRecordErrorKind::ClockBeforeEpoch => "system clock is before the UNIX epoch",
+            AuditRecordErrorKind::NotSeccompSignal => "signal is not a seccomp report",
         }
     }
 }
@@ -125,9 +134,44 @@ impl AuditSyscallNr {
             .map_err(|_| AuditRecordError::new(AuditRecordErrorKind::SyscallNegative))
     }
 
+    /// `seccomp_data.nr`（カーネルの `int`）のビットパターンを u32 として保持する（失敗しない）。
+    ///
+    /// BPF は `nr` を u32 として比較するため、`syscall(-1)`（0xFFFF_FFFF）や x32 ビット付き番号も
+    /// フィルタで拒否されうる。[`AuditSyscallNr::new`] は負値を拒否するので、拒否された試行の記録が
+    /// 落ちないよう seccomp 報告経路ではこちらを使う（SEC-4 の 100% 記録）。
+    pub const fn from_seccomp_data_nr(nr: i32) -> Self {
+        Self(nr.cast_unsigned())
+    }
+
     /// 番号を返す。
     pub const fn get(self) -> u32 {
         self.0
+    }
+}
+
+/// syscall 番号を解釈するためのアーキ識別子（`AUDIT_ARCH_*` の生の値）。
+///
+/// `KILL_PROCESS` は対象アーキと異なる arch で発火するため、外部アーキの値こそ記録対象になる。
+/// そのためどんな値でも受け付ける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditSyscallArch(u32);
+
+impl AuditSyscallArch {
+    /// カーネル報告値から構築する（失敗しない）。
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// `AUDIT_ARCH_*` の値を返す。
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<AuditArch> for AuditSyscallArch {
+    /// 禁止テーブル由来の値を取り込む。
+    fn from(a: AuditArch) -> Self {
+        Self(a.get())
     }
 }
 
@@ -140,8 +184,9 @@ impl From<SyscallNr> for AuditSyscallNr {
 
 /// 監査対象のプロセス ID（`pid_t` の有効範囲 `1..=i32::MAX`）。
 ///
-/// 記録したプロセスの PID namespace から見た PID。ホスト側 PID との突き合わせは
-/// カーネル監査経路（#840）の担当。
+/// 記録したプロセス自身の PID namespace から見た PID。他の namespace（例: seccomp USER_NOTIF の
+/// listener 側 PID）の値は、呼び出し側が変換してから渡す契約（SEC-4。`seccomp_hook` 参照）。
+/// ホスト側 PID との突き合わせはカーネル監査経路（#840）の担当。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditPid(NonZeroU32);
 
@@ -281,10 +326,19 @@ impl AuditLayer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuditEvent {
-    /// seccomp 違反。syscall は必須。パスは持たない（ユーザー空間ポインタは TOCTOU になるため）。
+    /// seccomp 違反。syscall・arch は必須。パスは持たない（ユーザー空間ポインタは TOCTOU になるため）。
+    ///
+    /// 破壊的変更（TASK-41.2・SEC-4）: TASK-41.1 の `Seccomp { syscall }` に必須の `arch` を追加した。
+    /// syscall 番号はアーキ相対で arch 無しでは解釈できず、後から任意項目にすると誤解釈した記録を
+    /// 構築できてしまうため、互換形（任意項目・別 variant）にしない。本 crate は `publish = false` で
+    /// 外部利用者がおらず、リポ内の構築・match は同 PR で追随済み。
+    /// 移行手順: 構築は `Seccomp { syscall, arch: AuditSyscallArch::from_raw(<AUDIT_ARCH_*>) }` とし、
+    /// パターンは `Seccomp { syscall, .. }` と書く（`arch` を読むなら `AuditRecord::seccomp_arch()`）。
     Seccomp {
         /// 拒否された syscall。
         syscall: AuditSyscallNr,
+        /// syscall 番号の解釈に必要なアーキ識別子。
+        arch: AuditSyscallArch,
     },
     /// Landlock 違反。パスは必須、syscall は観測できた場合のみ。
     Landlock {
@@ -353,9 +407,17 @@ impl AuditRecord {
     /// syscall があれば返す。
     pub fn syscall(&self) -> Option<AuditSyscallNr> {
         match &self.event {
-            AuditEvent::Seccomp { syscall } => Some(*syscall),
+            AuditEvent::Seccomp { syscall, .. } => Some(*syscall),
             AuditEvent::Landlock { syscall, .. } => *syscall,
             AuditEvent::Mount { .. } => None,
+        }
+    }
+
+    /// seccomp レコードのアーキ識別子（他レイヤーでは `None`）。
+    pub fn seccomp_arch(&self) -> Option<AuditSyscallArch> {
+        match &self.event {
+            AuditEvent::Seccomp { arch, .. } => Some(*arch),
+            _ => None,
         }
     }
 
@@ -388,7 +450,12 @@ mod tests {
             pid(42),
             AuditEvent::Seccomp {
                 syscall: AuditSyscallNr::new(272).unwrap(),
+                arch: AuditSyscallArch::from_raw(0xC000_003E),
             },
+        );
+        assert_eq!(
+            r.seccomp_arch().map(AuditSyscallArch::get),
+            Some(0xC000_003E)
         );
         assert_eq!(r.layer(), AuditLayer::Seccomp);
         assert_eq!(r.syscall().map(AuditSyscallNr::get), Some(272));

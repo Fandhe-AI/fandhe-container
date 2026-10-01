@@ -155,6 +155,8 @@ struct AuditLineDto {
     ts_nsec: u32,
     pid: u32,
     syscall: Option<u32>,
+    /// seccomp のみ: syscall 番号を解釈するための `AUDIT_ARCH_*`（番号はアーキ相対のため併記）。
+    arch: Option<u32>,
     path: Option<String>,
     path_truncated: Option<bool>,
     path_original_len: Option<usize>,
@@ -177,6 +179,7 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         ts_nsec: ts.subsec_nanos(),
         pid: record.pid().get(),
         syscall,
+        arch: record.seccomp_arch().map(|a| a.get()),
         path: path.map(|p| p.as_path().to_string_lossy().into_owned()),
         path_truncated: path.map(|p| p.is_truncated()),
         path_original_len: path.map(|p| p.original_len()),
@@ -340,21 +343,38 @@ fn open_trusted_parent(dir: &Path) -> Result<std::os::fd::OwnedFd, AuditWriteErr
 fn open_checked(path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
     use std::fs::OpenOptions;
     use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let open_err = || AuditWriteError::new(AuditWriteErrorKind::Open);
     let flags = crate::sys::nofollow_nonblock_open_flags()
         .ok_or_else(|| AuditWriteError::new(AuditWriteErrorKind::Unsupported))?;
+    // 最終要素は親要素と同じくバイト列として扱う（Linux の正当な非 UTF-8 ファイル名を拒否しない）。
+    // 検証は空・NUL のみ（NUL は open(2) に渡せない値のため明示的に弾く）。
     let name = path
         .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty())
+        .filter(|n| !n.is_empty() && !n.as_bytes().contains(&0))
         .ok_or_else(open_err)?;
     let parent = path.parent().ok_or_else(open_err)?;
     // 親を fd で固定してから、その fd の magic link 経由で最終要素を開く（検証後の差し替えを防ぐ）。
     let parent_fd = open_trusted_parent(parent)?;
     let via_fd =
         std::path::PathBuf::from(format!("/proc/self/fd/{}", parent_fd.as_raw_fd())).join(name);
+    // 書き込み可能 fd を開く前に、副作用のない lstat（open しない）で既存エントリの種別を確認する。
+    // デバイス・FIFO 等は open(2) 自体が副作用を持ち得るため、通常ファイル以外は開かずに拒否する。
+    // 不在（NotFound）は新規作成のため許可。lstat と open の間の差し替えは、親が信頼済み
+    // （所有者・権限検証済みで fd 固定）であること、O_NOFOLLOW|O_NONBLOCK、および open 後の
+    // fstat 再検証で防ぐ。
+    match std::fs::symlink_metadata(&via_fd) {
+        // symlink・ディレクトリは従来どおり Open 失敗として扱う（open(2) の ELOOP / EISDIR 相当）。
+        Ok(m) if m.file_type().is_symlink() || m.file_type().is_dir() => return Err(open_err()),
+        Ok(m) if !m.file_type().is_file() => {
+            return Err(AuditWriteError::new(AuditWriteErrorKind::NotRegularFile));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(open_err()),
+    }
     let file = OpenOptions::new()
         .read(true)
         .append(true)
@@ -480,7 +500,7 @@ pub fn write_with_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit_log::{AuditPath, AuditPid, AuditSyscallNr, AuditTimestamp};
+    use crate::audit_log::{AuditPath, AuditPid, AuditSyscallArch, AuditSyscallNr, AuditTimestamp};
     use std::time::Duration;
 
     fn ts() -> AuditTimestamp {
@@ -502,11 +522,12 @@ mod tests {
             42,
             AuditEvent::Seccomp {
                 syscall: AuditSyscallNr::new(272).unwrap(),
+                arch: AuditSyscallArch::from_raw(3221225534),
             },
         );
         assert_eq!(
             text(&r),
-            "{\"event\":\"audit\",\"layer\":\"seccomp\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":42,\"syscall\":272,\"path\":null,\"path_truncated\":null,\"path_original_len\":null}\n"
+            "{\"event\":\"audit\",\"layer\":\"seccomp\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":42,\"syscall\":272,\"arch\":3221225534,\"path\":null,\"path_truncated\":null,\"path_original_len\":null}\n"
         );
     }
 
@@ -522,12 +543,12 @@ mod tests {
         );
         assert_eq!(
             text(&l),
-            "{\"event\":\"audit\",\"layer\":\"landlock\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":7,\"syscall\":null,\"path\":\"/etc/shadow\",\"path_truncated\":false,\"path_original_len\":11}\n"
+            "{\"event\":\"audit\",\"layer\":\"landlock\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":7,\"syscall\":null,\"arch\":null,\"path\":\"/etc/shadow\",\"path_truncated\":false,\"path_original_len\":11}\n"
         );
         let m = rec(8, AuditEvent::Mount { path: None });
         assert_eq!(
             text(&m),
-            "{\"event\":\"audit\",\"layer\":\"mount\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null}\n"
+            "{\"event\":\"audit\",\"layer\":\"mount\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null}\n"
         );
     }
 
@@ -745,6 +766,37 @@ mod tests {
         let e = AuditFileWriter::open(&audit).unwrap_err();
         assert_eq!(e.kind(), AuditWriteErrorKind::InsecureFile);
         assert_eq!(std::fs::read(&secret).unwrap(), b"top-secret\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-4・TASK-41.5.1: 既存の非通常ファイル（FIFO）は open せず NotRegularFile で拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_task41_5_1_rejects_fifo_without_opening() {
+        let dir = fresh_dir("fifo");
+        let fifo = dir.join("audit.fifo");
+        // unsafe を避けるため mkfifo(1) で作る（coreutils。無ければテスト環境不備として失敗させる）。
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let e = AuditFileWriter::open(&fifo).unwrap_err();
+        assert_eq!(e.kind(), AuditWriteErrorKind::NotRegularFile);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-41.5.1: 正当な非 UTF-8 ファイル名（Linux）でも開ける。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_task41_5_1_accepts_non_utf8_file_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = fresh_dir("nonutf8");
+        let path = dir.join(std::ffi::OsStr::from_bytes(b"audit-\xff.log"));
+        let mut w = AuditFileWriter::open(&path).unwrap();
+        w.write_record(&sample()).unwrap();
+        drop(w);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text(&sample()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

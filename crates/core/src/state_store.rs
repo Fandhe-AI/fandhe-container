@@ -45,7 +45,8 @@
 //!   `remove_record` で掃除する（`sweep_temp_residue`）。全書き込みは `@lock` 保持下で行うため、
 //!   ロック中に見える一時ファイルは書き込み途中のものではなく残骸である。ロックなしで動く
 //!   `@revision` 初期化の一時ファイル（`@revision.init-` 接頭辞）は一致しないため掃除対象外。
-//!   結合テストの拡充は TASK-31.3（#157）で行う
+//!   ライフサイクル操作（create / start / delete）経由の `state.json` の内容・存在・権限の照合は
+//!   結合テスト `tests/state_store.rs`（TASK-31.3・#157）が担う
 //! - 状態ルートは信頼境界として扱う（`bundle` のすり替えは `start` の起動先のすり替えになるため。
 //!   SEC-1・PLUG-12 と同じ姿勢）。symlink・所有者不一致を拒否し、状態ルートと `<id>/` は既存の
 //!   ものも 0700 に限る（group / other の権限ビットがあれば `PermissionDenied`）。祖先は group / other

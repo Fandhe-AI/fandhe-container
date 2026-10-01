@@ -178,8 +178,9 @@ case "$cmd" in
     sleep 0.05
     touch "$m.attempted"
     [ "$mode" = create-timeout ] && exec sleep 30
-    # 出力先の作成競合を再現するフック（--output の検証後にファイルを作る）。
+    # 出力先の作成競合を再現するフック（--output の検証後にファイル・FIFO を作る）。
     [ -n "${STUB_CREATE_HOOK:-}" ] && [ ! -e "$STUB_CREATE_HOOK" ] && echo preexisting >"$STUB_CREATE_HOOK"
+    [ -n "${STUB_CREATE_FIFO:-}" ] && [ ! -e "$STUB_CREATE_FIFO" ] && mkfifo "$STUB_CREATE_FIFO"
     [ "$1" = --bundle ] && printf '%s' "$2" >"$m.bundle"
     case "$mode" in
       create-fail | create-fail-gone | create-fail-state-error | create-fail-notfound-text | create-fail-mixed-codes | create-fail-plain | create-fail-nf-*)
@@ -342,6 +343,19 @@ reset_log
 STUB_CREATE_HOOK="$race_out" expect_rc "output-create-race" 2 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --output "$race_out"
 expect_eq "output-create-race-stdout-empty" "" "$last_stdout"
 expect_eq "output-create-race-file-untouched" "preexisting" "$(cat "$race_out")"
+# 検証後に出力先が FIFO へ差し替えられた場合（Codex P0）: 開かずに exit 2 で終わり、
+# 無期限に待機しない。回帰時に自己テスト自体が止まらないよう外側にも timeout を掛ける。
+race_fifo="$work/race.fifo"
+reset_log
+rc=0
+started="$SECONDS"
+STUB_CREATE_FIFO="$race_fifo" timeout 60 "$bash_bin" "$target_script" --runtime "$stub" --bundle "$work/bundle" \
+  --iterations 1 --warmup 0 --timeout 2 --output "$race_fifo" >"$work/fifo.stdout" 2>/dev/null || rc=$?
+elapsed=$((SECONDS - started))
+expect_eq "output-fifo-race-exit" "2" "$rc"
+if [ "$elapsed" -lt 30 ]; then pass "output-fifo-race-bounded (${elapsed}s < 30s)"; else fail "output-fifo-race-bounded (${elapsed}s)"; fi
+expect_eq "output-fifo-race-stdout-empty" "" "$(cat "$work/fifo.stdout")"
+if [ -p "$race_fifo" ]; then pass "output-fifo-race-still-fifo"; else fail "output-fifo-race-still-fifo"; fi
 
 # --- 5. 入力エラー（exit 2） ---
 expect_rc "input-runtime-missing" 2 --bundle "$work/bundle"

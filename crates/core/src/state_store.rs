@@ -41,7 +41,8 @@
 //!   （`<name>.tmp-<pid>-<seq>`。`O_EXCL` で作成）へ書いて fsync してから `rename` し、ディレクトリも
 //!   fsync する。読み手は旧値か新値だけを見る（トレイト契約 4）。書き込み・fsync・rename の失敗時は
 //!   一時ファイルを消す。強制終了（SIGKILL 等）で残った一時ファイルは、`@lock` 保持下の次の書き込み・
-//!   採番・`remove_record` で掃除する（`sweep_temp_residue`）。全書き込みは `@lock` 保持下で行うため、
+//!   採番（ルートの `@revision` はインスタンスごとの初回採番のみ。採番ごとの全走査を避ける）・
+//!   `remove_record` で掃除する（`sweep_temp_residue`）。全書き込みは `@lock` 保持下で行うため、
 //!   ロック中に見える一時ファイルは書き込み途中のものではなく残骸である。ロックなしで動く
 //!   `@revision` 初期化の一時ファイル（`@revision.init-` 接頭辞）は一致しないため掃除対象外。
 //!   結合テストの拡充は TASK-31.3（#157）で行う
@@ -641,6 +642,11 @@ impl FileStateStore {
         let floor = match guard.process.revision_floor {
             Some(floor) => floor,
             None => {
+                // `@revision` の一時ファイル残骸（強制終了で残ったもの）はインスタンスごとの
+                // 初回採番（ルート全走査と同じ契機）でだけ `@lock` 保持下で掃除する。採番ごとに
+                // ルートを走査するとコンテナ数 N で連続作成が O(N²) になりロック保持時間が伸びる
+                // ため。他プロセスが後から残した残骸は次に開いたインスタンスの初回採番で回収する。
+                sweep_temp_residue(&self.root, REVISION_FILE)?;
                 let floor = match self.max_record_revision()? {
                     Some(max) => max
                         .checked_add(1)
@@ -655,9 +661,6 @@ impl FileStateStore {
             return Err(internal("revision high-water mark is behind the records"));
         }
         let next = current.next()?;
-        // 別プロセスが書き込み中に強制終了して残した `@revision` の残骸も回収するため、採番のたびに
-        // `@lock` 保持下で掃除する（インスタンス単位で 1 回に限ると他プロセスの残骸を取りこぼす）。
-        sweep_temp_residue(&self.root, REVISION_FILE)?;
         write_file_replacing(
             &self.root,
             REVISION_FILE,
@@ -1722,11 +1725,11 @@ mod tests {
         assert!(tmp_entries(&dir).is_empty());
     }
 
-    /// OCI-5・TASK-31.2: ルートの `@revision` 一時ファイル残骸は採番のたびに掃除する（同一
-    /// インスタンスの初回採番後に別プロセスが強制終了して残したものも含む）。ロック外で動く
-    /// `@revision.init-*` は消さない。
+    /// OCI-5・TASK-31.2: ルートの `@revision` 一時ファイル残骸はインスタンスごとの初回採番で
+    /// 掃除する（採番ごとのルート全走査を避けるため）。初回採番後に残された残骸は次に開いた
+    /// インスタンスが回収する。ロック外で動く `@revision.init-*` は消さない。
     #[test]
-    fn oci5_root_revision_temp_residue_is_swept_on_every_allocation() {
+    fn oci5_root_revision_temp_residue_is_swept_on_first_allocation_per_instance() {
         let t = TmpDir::new("rootresidue");
         let store = t.open();
         fs::write(t.path().join("@revision.tmp-1-0"), b"9").unwrap();
@@ -1734,9 +1737,12 @@ mod tests {
         create(&store, "a");
         assert!(!t.path().join("@revision.tmp-1-0").exists());
         assert!(t.path().join("@revision.init-1-0").exists());
-        // 初回採番後に別プロセスが残した残骸も、同一インスタンスの次の採番で回収される。
+        // 初回採番後に残された残骸は同一インスタンスでは走査せず、再 open 後の初回採番で回収される。
         fs::write(t.path().join("@revision.tmp-2-0"), b"9").unwrap();
         create(&store, "b");
+        assert!(t.path().join("@revision.tmp-2-0").exists());
+        let store2 = t.open();
+        create(&store2, "c");
         assert!(!t.path().join("@revision.tmp-2-0").exists());
         assert!(t.path().join("@revision.init-1-0").exists());
     }

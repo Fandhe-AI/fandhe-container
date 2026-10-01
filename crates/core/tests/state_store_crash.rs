@@ -103,9 +103,12 @@ mod linux {
     }
 
     /// 子プロセスを上限時間つきで回収する。超過したら失敗させる（REPAIR-5）。
-    fn reap(child: &mut Child) {
+    fn reap(child: &mut Child) -> std::process::ExitStatus {
         let deadline = Instant::now() + WAIT_DEADLINE;
-        while child.try_wait().unwrap().is_none() {
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
             assert!(Instant::now() < deadline, "child did not exit after kill");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -159,9 +162,19 @@ mod linux {
             }
             // 可変オフセットで待ってから kill する（書き込みの様々な局面を狙う）。
             std::thread::sleep(Duration::from_millis((i * 3) % 17));
-            // 子が先に終了していた場合の `InvalidInput` は許容する。
-            let _ = child.kill();
-            reap(&mut child);
+            // 子は無限に更新を続けるため、kill 時点で稼働中でなければならない（先に終了していたら
+            // 試験の前提が崩れているので失敗させる）。
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "child exited before kill"
+            );
+            child.kill().unwrap();
+            let status = reap(&mut child);
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(9),
+                "child was not terminated by SIGKILL: {status:?}"
+            );
 
             // 再 open（新しいインスタンス）して照合する。
             let reopened = open(&root);

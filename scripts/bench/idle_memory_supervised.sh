@@ -36,7 +36,8 @@
 #   2 = 引数・入力エラー、非 Linux、前提ツール（GNU timeout）欠如、出力先エラー
 #   3 = 計測失敗（idle_memory.sh が 3・想定外の値、driver の up / down 失敗・タイムアウト、
 #       JSON から値を取り出せない）。down に失敗した場合はコンテナ・監視プロセスが残存している
-#       可能性を stderr に明示する（後始末未確定を成功扱いにしない）
+#       可能性を stderr に明示する（後始末未確定を成功扱いにしない）。EXIT trap の down が失敗した
+#       場合も、元の終了コード（1 等）より優先して 3（`error: cleanup-failed:`）で返す
 #
 # 前提・現状の制約:
 #   - Linux 限定。スクリプト内で sudo は呼ばない（実計測は操作者が権限付きシェルで明示実行する。
@@ -188,17 +189,21 @@ down_exit=0
 tmp=""
 
 # 終了時の後始末。up を試みて down 未実施なら必ず down を試みる（コンテナを残さない）。
-# ここでの失敗は元の終了コードを変えず、残存の可能性だけを警告する。
+# down の失敗は元の終了コード（1・2・3 のいずれでも）より優先し、終了コード 3
+# （stderr の `error: cleanup-failed:`）で返す。後始末の失敗を期待違反などの陰に埋もれさせない
+# （AGENTS.md「特権操作の後始末」）。Makefile の外側 timeout はこの down が完走できる猶予を取る。
 cleanup() {
-  local rc=0
+  local orig=$? rc=0
   if [ "$up_attempted" -eq 1 ] && [ "$down_done" -eq 0 ]; then
     down_done=1
     timeout --kill-after=10 "$timeout_s" "$driver" down >/dev/null || rc=$?
     if [ "$rc" -ne 0 ]; then
       err "cleanup-failed" "driver down failed (exit ${rc}); the container or supervisor may still be running"
+      orig=3
     fi
   fi
   [ -z "$tmp" ] || rm -f "$tmp"
+  exit "$orig"
 }
 trap cleanup EXIT
 

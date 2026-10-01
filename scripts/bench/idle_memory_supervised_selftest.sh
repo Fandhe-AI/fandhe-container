@@ -188,6 +188,12 @@ run_target --driver "$driver"
 expect_exit "driver-down-fail" 3 && expect_err "driver-down-fail" "may still be running" &&
   [ "$(driver_log)" = "up,down," ] && pass "driver-down-fail" || fail "driver-down-fail (driver: $(driver_log))"
 
+# 9b. 期待違反（exit 1）の後に cleanup の down が失敗 → 後始末失敗が優先され 3。
+new_case "0 0 0 0" "0 0 0 0" "0 0 0 0"
+echo 9 >"$STUB_DIR/down_rc"
+run_target --driver "$driver"
+expect_exit "cleanup-fail-priority-violation" 3 && expect_err "cleanup-fail-priority-violation" "cleanup-failed" && pass "cleanup-fail-priority" || fail "cleanup-fail-priority"
+
 # 10. 正常系の --output はアトミックに公開される（JSON 全体を具体値で照合）。
 new_case "0 0 0 0" "0 3 210 640" "0 0 0 0"
 run_target --driver "$driver" --output "${STUB_DIR}/result.json"

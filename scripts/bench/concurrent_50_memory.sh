@@ -89,6 +89,8 @@
 #     launcher 正常終了後に新規に生じてトークンを持たない子孫までは検出できない（cgroup 方式は特権要）。
 #   - --output は新規ファイルに限る（既存のパスは拒否し、上書きしない）。公開は ln -T（hard link）で行う。
 #   - --output の親ディレクトリは実行ユーザー所有・group/other 書き込み不可で、祖先を含む全パス要素が非 symlink（".." 不可）に限る。
+#     / までの祖先ディレクトリは、所有者が実行ユーザーか root で、group/other 書き込み不可か sticky 付きに限る
+#     （startup_latency.sh・idle_memory_supervised.sh と同じ規則）。
 #   - 集計後の再確認は「launcher の生存・READY・プロセス数」を見る。集計中に子孫が入れ替わっても
 #     プロセス数が --min-procs 以上なら検出しない。
 #   - 起動時刻の照合からシグナル送信までの間に pid が再利用される可能性は残る（bash からは pidfd を
@@ -204,6 +206,41 @@ if [ "$proc_root_given" -eq 1 ]; then
   [ -d "$proc_root" ] || { err "invalid-argument" "proc root is not a directory"; exit 2; }
 fi
 
+# 引数のディレクトリ 1 つが、他のユーザーに中のエントリを差し替えられないことを確かめる
+# （startup_latency.sh・idle_memory_supervised.sh の dir_is_safe と同じ規則）。symlink でない実ディレクトリで、
+# 所有者が実行ユーザーか root で、group / other の書き込み権がないか sticky ビット付きであること。
+dir_is_safe() {
+  local d="$1" uid
+  uid="$(id -u)"
+  [ -n "$(find -P "$d" -maxdepth 0 -type d \( -user "$uid" -o -user 0 \) -print 2>/dev/null)" ] || return 1
+  [ -z "$(find -P "$d" -maxdepth 0 \( -perm -0020 -o -perm -0002 \) ! -perm -1000 -print 2>/dev/null)" ]
+}
+
+# --output の親ディレクトリから / までの全ディレクトリが dir_is_safe で、パスに symlink を含まない
+# （論理パスと物理パスが一致する）ことを確かめる（startup_latency.sh・idle_memory_supervised.sh の
+# output_path_is_safe と同じ規則）。権限付きで実行したときに、検査後に他のユーザーが祖先ディレクトリを
+# 差し替えて、後段の mktemp・ln を意図しない場所へ誘導する経路を塞ぐ。経路上の全ディレクトリへ
+# 書き込めるのが実行ユーザーと root だけであることが、検証から公開までパスが変わらないことの根拠になる。
+output_path_is_safe() {
+  local logical physical d parent depth
+  logical="$(cd -- "$1" && pwd -L)" || return 1
+  physical="$(cd -- "$1" && pwd -P)" || return 1
+  while [[ "$logical" == //* ]]; do logical="${logical#/}"; done
+  while [[ "$physical" == //* ]]; do physical="${physical#/}"; done
+  [ "$logical" = "$physical" ] || return 1
+  d="$physical"
+  depth=0
+  while :; do
+    dir_is_safe "$d" || return 1
+    parent="$(dirname -- "$d")"
+    [ "$parent" = "$d" ] && break
+    depth=$((depth + 1))
+    [ "$depth" -le 256 ] || return 1
+    d="$parent"
+  done
+  return 0
+}
+
 if [ -n "$output" ]; then
   # 既存のパス（種別を問わない。symlink・ディレクトリを含む）は拒否し、上書きしない（出力先の取り違えで
   # 既存データを失わない。startup_latency.sh の --output と同じ契約）。計測前に検査して早く止め、公開時にも
@@ -259,6 +296,17 @@ if [ -n "$output" ]; then
   fi
   if [ $((8#$od_mode & 8#022)) -ne 0 ]; then
     err "invalid-argument" "output directory is writable by group or others"
+    exit 2
+  fi
+  # 親だけでなく / までの祖先ディレクトリも検証する（他のユーザーが書き込める祖先があると、検査後に
+  # 途中のディレクトリを差し替えられる）。親ディレクトリには上の検査（実行ユーザー所有・group / other
+  # 書き込み不可）をそのまま課し、祖先には main の他の計測スクリプトと同じ規則を使う。
+  if ! command -v find >/dev/null 2>&1 || ! command -v id >/dev/null 2>&1 || ! command -v dirname >/dev/null 2>&1; then
+    err "unsupported-os" "find, id and dirname are required to validate the output directory"
+    exit 3
+  fi
+  if ! output_path_is_safe "$output_dir"; then
+    err "invalid-argument" "the path of --output must not contain symlinks, and every directory above it must be owned by you or root and not writable by others (unless sticky)"
     exit 2
   fi
   case "$output_dir" in

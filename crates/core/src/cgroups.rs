@@ -1190,8 +1190,13 @@ impl ContainerCgroupRemover for DelegatedCgroup {
         match self.open_child(&name).map_err(removal_error)? {
             None => Ok(CgroupRemoval::NotPresent),
             Some(child) => {
-                self.remove_child(&child).map_err(removal_error)?;
-                Ok(CgroupRemoval::Removed)
+                match self.remove_child(&child) {
+                    Ok(()) => Ok(CgroupRemoval::Removed),
+                    // open_child の後に並行 delete 等で既に消えた。目的の状態（cgroup 無し）に
+                    // 到達済みなので成功扱いにする（OCI-6。TraitError にするとレコードが残る）。
+                    Err(e) if e.code == ErrorCode::NotFound => Ok(CgroupRemoval::NotPresent),
+                    Err(e) => Err(removal_error(e)),
+                }
             }
         }
     }

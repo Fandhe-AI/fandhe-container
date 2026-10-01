@@ -129,6 +129,16 @@ fn delete_inner(
 ) -> Result<DeleteResponse, TraitError> {
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     check_deletable(&record, req.force())?;
+    // cgroup 削除の直前に revision を再確認し、並行 delete + 再 create で作られた新しい `fc-<id>` を
+    // 古い get の結果に基づいて破棄する窓を狭める。revision が変わっていれば cgroup に触れず再試行を促す。
+    // 確認と削除の間の窓は `StateStore` に cgroup 削除を含む原子的操作が無いため残る（OCI-6・CORE-2）。
+    let current = store.get(&GetStateRequest::new(req.id().clone()))?;
+    if current.revision() != record.revision() {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "container state changed during delete; retry",
+        ));
+    }
     // Removed / NotPresent はどちらも「cgroup が無い」状態に到達したので次へ進む。失敗はレコードを残して返す。
     match cgroups.remove(req.id())? {
         CgroupRemoval::Removed | CgroupRemoval::NotPresent => {}

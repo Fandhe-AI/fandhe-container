@@ -31,6 +31,7 @@
 use std::path::PathBuf;
 
 use super::{ExecError, IsolationStage};
+use crate::audit_log::{AuditRecord, AuditRecordError, landlock_denial_record_now};
 use crate::landlock::{
     LandlockApplyError, LandlockApplyReport, LandlockError, LandlockRuleError, LandlockRuleset,
     detect_landlock_abi, path_rules_from_config,
@@ -119,6 +120,11 @@ pub struct LandlockAccessObservation {
     pub applied: bool,
     /// プローブ結果（入力順）。`None` は成功、`Some(errno)` は失敗（errno 不明は `-1`）。
     pub results: Vec<(LandlockAccessProbe, Option<i32>)>,
+    /// `EACCES` になった試行ごとの監査レコード（入力順。SEC-4・TASK-41.3・#194）。適用に成功した場合のみ入る。
+    /// `EACCES` は DAC 由来でも返るため Landlock 由来の確定証拠ではない（帰属は #840）。
+    pub audit_records: Vec<AuditRecord>,
+    /// 監査レコード構築（PID・時刻取得）の失敗。黙殺せず表面化する（最初の 1 件を保持）。
+    pub audit_error: Option<AuditRecordError>,
 }
 
 /// 観測 1 回で試せるプローブ数の上限（呼び出し側が固定リストで渡す前提の防御）。
@@ -132,6 +138,9 @@ const MAX_ACCESS_PROBES: usize = 32;
 /// （ABI 検出 → ルール生成）→ `apply_landlock_stage` の本番経路をそのまま通し、ruleset 生成・適用の
 /// いずれかが失敗したらプローブは実行しない（fail-closed の観測）。`unsafe` は追加せず、
 /// syscall は既存の `crate::sys` ラッパーに限る。
+///
+/// 適用後に `EACCES` となった試行は `crate::audit_log::landlock_denial_record_now` で監査レコード化し
+/// `audit_records` に入れる（SEC-4・TASK-41.3・#194）。ワークロードプロセスの拒否の捕捉は #840。
 ///
 /// # 将来仕様（記録のみ）
 ///
@@ -158,6 +167,8 @@ pub fn observe_landlock_path_access(
         apply_error: None,
         applied: false,
         results: Vec::new(),
+        audit_records: Vec::new(),
+        audit_error: None,
     };
     let ruleset = match landlock_ruleset_from_config(config) {
         Ok(r) => r,
@@ -173,6 +184,14 @@ pub fn observe_landlock_path_access(
     obs.applied = true;
     for p in probes {
         let r = run_probe(p);
+        // 拒否試行は SEC-4 の監査レコードにする（TASK-41.3）。件数はプローブ上限で抑えられる。
+        match landlock_denial_record_now(&p.path, r) {
+            Ok(Some(rec)) => obs.audit_records.push(rec),
+            Ok(None) => {}
+            Err(e) => {
+                obs.audit_error.get_or_insert(e);
+            }
+        }
         obs.results.push((p.clone(), r));
     }
     Ok(obs)

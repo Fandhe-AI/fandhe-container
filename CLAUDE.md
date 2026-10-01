@@ -55,6 +55,7 @@ fandhe-container/
 │   │   ├── resource-efficiency-target.md  # リソース効率目標値（TASK-48・CORE-8）
 │   │   ├── declarative-config.md  # 宣言的起動設定の方針メモ（TASK-82・CLI-4）
 │   │   ├── small-model-repair-policy.md  # 小型モデル自己補修方針（TASK-92・REPAIR-11/13/14）
+│   │   ├── cgroups.md             # cgroups v2 単独対応・v1 / systemd cgroup driver 非対応（TASK-34・CORE-4）
 │   │   ├── io-protocol.md         # I/O 共有層のワイヤーフレーム・チェックサム（TASK-11・IO-1・REPAIR-2）
 │   │   ├── break-detection-ci-report.md  # BREAK-1/BREAK-2 の CI 検出実証レポート（TASK-89.2・REPAIR-7）
 │   │   ├── io-fio-bench.md        # fio 4K ランダム write ベンチスクリプトの契約（TASK-25.1・IO-8）・Docker ベースライン計測手順・目標値案（TASK-25.2）

@@ -30,9 +30,9 @@
 //!   期待するケースは `Expectation::signal` で指定する
 //! - 監査ログ: `AuditExpectation::Required(layer)` のケースは、そのレイヤーの記録が 0 件なら必ず失敗する。
 //!   監査ログの本番配線（`AuditSink` を fork 後の子へ渡す経路）は未実装（REPAIR-3）のため、現状は攻撃
-//!   クロージャが拒否（`EACCES`）を本番の監査ヘルパ `landlock_denial_record_now` でレコード化して
-//!   `Recorder` へ転送し、pipe で回収して判定する（ESC-10 は起動ステージ適用済みの子で追加の Landlock 適用を
-//!   せず、ステージ自体の回帰を検出する）。配線完了後は本番経路の出力を照合する形へ置き換える
+//!   クロージャが記録ヘルパで作った記録は ESC-07 など一部ケースの暫定方式であり、ESC-10 は
+//!   `Deferred`（起動ステージ適用済みの子で追加の Landlock 適用をせず、ステージ自体の回帰を攻撃結果で検出）。
+//!   配線完了後は本番経路の出力を照合する形へ置き換える
 //!
 //! # 構成
 //! - 常に走る部分（3 OS 共通・既定のテスト集合）: 判定ロジック `judge` と記録パーサの自己テスト
@@ -827,7 +827,8 @@ mod linux {
             expectation: Expectation {
                 allowed: &[AttackOutcome::Errno(13)],
                 signal: None,
-                audit: AuditExpectation::Required("landlock"),
+                // 配送経路未配線のため Deferred（テスト側生成の記録を合格証拠にしない。SEC-4・REPAIR-3）。
+                audit: AuditExpectation::Deferred("landlock"),
             },
             stages: esc10_stages,
             attack: attack_esc10_create_outside,
@@ -1117,22 +1118,10 @@ mod linux {
     /// ESC-10 の攻撃: 起動ステージ（`esc10_stages` の readonly root Landlock）が適用済みの子で、
     /// 追加の Landlock 適用をせずに許可外の作成（MAKE_REG）をそのまま試みる。
     /// 起動ステージの Landlock が欠落・回帰すれば作成が成功し、`Errno(13)` 期待に反してケースが失敗する
-    /// （ステージ自体の回帰検出。CORE-5）。拒否（`EACCES`）は本番の監査ヘルパ `landlock_denial_record_now`
-    /// で SEC-4 の監査レコードにし、同じ試行の結果から判定と記録を結び付ける。レコードが出なければ
-    /// `AuditExpectation::Required("landlock")` は満たされない。子プロセスへの本番監査配線は REPAIR-3 まで未実装。
+    /// （ステージ自体の回帰検出。CORE-5）。監査レコードは作らない（テスト側生成の記録は SEC-4 の証拠にならない）。
+    /// 期待は `Deferred`。本番の監査配送経路の配線後（REPAIR-3）に実出力を回収して `Required` へ切り替える。
     fn attack_esc10_create_outside(rec: &Recorder, _host_canary: &Path) {
-        let outcome = try_create(ESC10_PROBE);
-        let errno = match outcome {
-            AttackOutcome::Errno(e) => Some(e),
-            _ => None,
-        };
-        if let Some(record) = landlock_denial_record_now(Path::new(ESC10_PROBE), errno)
-            .unwrap_or_else(|e| panic!("build landlock denial record: {e:?}"))
-        {
-            rec.record(&record)
-                .unwrap_or_else(|e| panic!("record landlock denial: {e:?}"));
-        }
-        rec.outcome(outcome);
+        rec.outcome(try_create(ESC10_PROBE));
     }
 
     /// ESC-09 の攻撃: コンテナ内（pivot 後）の root としてファイルを作る。所有者の検査はホスト側で行う。

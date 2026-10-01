@@ -1,0 +1,330 @@
+//! namespace 分離の実証テスト（CORE-1・TASK-28.1・#145）。
+//!
+//! TASK-27 で実装済みの分離フロー（`fandhe_container_core::exec` の `isolate` →
+//! `MountIsolation::establish` → `prepare_rootfs` → `pivot_root`）を 1 つのコンテナプロセスで通しで実行し、
+//! 分離後のコンテナ側から (a) ホストのプロセスが見えない・(b) hostname が独自・(c) rootfs が独自、の
+//! 3 点を具体値で確認する。あわせて、コンテナの namespace がホストのものと別であることを
+//! `/proc/self/ns/*` の識別子で照合し、ホスト側から見て hostname・ファイルシステムが無傷であることを事後確認する。
+//! 個別検証の `unshare_isolation`（TASK-27.2。PID・hostname）・`pivot_root_isolation`（TASK-27.3。rootfs）とは
+//! 別に、3 点をホスト視点の照合つきで通す統合の実証として置く（既存 2 本は変更しない）。
+//!
+//! # 3 段構成
+//! - host 段（`--ignored`。分離しない）: 一時 rootfs を作り、ホストの hostname・namespace 識別子を記録して
+//!   `--launcher` を起動する。終了後にホスト側の不変を照合する
+//! - launcher 段（`--launcher`）: 分離（User 〔非 root のみ〕/ Pid / Mount / Uts / Ipc・hostname 設定）して
+//!   `--container` を起動する。分離後の最初の子なので新しい PID namespace の PID 1 になる
+//! - container 段（`--container`）: pivot_root 後に 3 点と namespace の独立を照合する
+//!
+//! すべての子待機にタイムアウトを設ける（REPAIR-5）。
+//!
+//! # 実機前提テストとしての分離
+//! libtest はテストをスレッドで実行し、マルチスレッドからの `CLONE_NEWUSER` は `EINVAL` になるため
+//! `harness = false` の単一スレッド `main` で動かす（`Cargo.toml` の `[[test]]`）。実行には root もしくは
+//! 非特権 user namespace を許可するホストが必要（AppArmor の
+//! `kernel.apparmor_restrict_unprivileged_userns=1` 等の環境では `PermissionDenied` になる）。
+//! GitHub ホステッド runner で保証できないため、`-- --ignored` 指定時のみ実行して既定のテスト集合から
+//! 分離している（ci.md「実機前提テスト」）。実行された場合は分離の拒否を含めあらゆる失敗を失敗として扱い、
+//! 検証せずに成功終了する分岐は持たない。非 Linux では `exec` モジュール自体がビルド対象外
+//! （OS 非該当であり skip ではない）。
+//!
+//! # 未実装（別 Issue）
+//! 「コンテナ 0 個時点のデーモンレス確認」は #146（TASK-28.2・CORE-1）が本ファイルへ追加する予定で、
+//! 現時点では未実装。追加時は `linux::run` から呼ぶシナリオ関数として並べる。
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    println!("namespace_isolation: Linux only, not applicable on this OS");
+}
+
+#[cfg(target_os = "linux")]
+fn main() {
+    // `-- --ignored` を付けたときだけ実行する。子は `--launcher` / `--container` で再入する。
+    if std::env::args().any(|a| a == "--ignored" || a == "--launcher" || a == "--container") {
+        linux::run();
+    } else {
+        println!(
+            "namespace_isolation: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use fandhe_container_core::exec::{
+        Hostname, IsolationConfig, IsolationPrivilege, MountIsolation, Namespace, NamespaceSet,
+        isolate, isolate_rootful_host_root, pivot_root, plan, plan_rootful_host_root,
+        prepare_rootfs,
+    };
+
+    /// コンテナ側に設定する hostname（ホストの値とは異なる固定値）。
+    const HOSTNAME: &str = "fandhe-nsiso";
+    const MARKER: &str = "marker.txt";
+    const MARKER_BODY: &[u8] = b"fandhe-nsiso-marker";
+    /// 比較する namespace 種別（`/proc/self/ns/<name>`）。
+    const NS_NAMES: [&str; 4] = ["pid", "mnt", "uts", "ipc"];
+
+    fn timeout() -> Duration {
+        let secs = std::env::var("FANDHE_CONTAINER_TEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| (1..=600).contains(s))
+            .unwrap_or(10);
+        Duration::from_secs(secs)
+    }
+
+    /// 実機前提の分離実証の入口。引数で host / launcher / container 段を切り替える。
+    pub fn run() {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--container") {
+            container(args.get(i + 1..).expect("container args"));
+        } else if let Some(i) = args.iter().position(|a| a == "--launcher") {
+            launcher(args.get(i + 1..).expect("launcher args"));
+        } else {
+            unshare_isolation_scenario();
+        }
+    }
+
+    fn read_hostname() -> String {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .expect("read hostname")
+            .trim()
+            .to_string()
+    }
+
+    fn is_root() -> bool {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read status")
+            .lines()
+            .find(|l| l.starts_with("Uid:"))
+            .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
+            .as_deref()
+            == Some("0")
+    }
+
+    /// 自プロセスの namespace 識別子（`/proc/self/ns/<name>` のリンク先）を `NS_NAMES` の順で返す。
+    fn ns_ids() -> Vec<String> {
+        NS_NAMES
+            .iter()
+            .map(|n| {
+                std::fs::read_link(format!("/proc/self/ns/{n}"))
+                    .expect("read ns link")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    /// 一時 rootfs（drop で削除）。
+    struct Rootfs(PathBuf);
+
+    impl Drop for Rootfs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn make_rootfs() -> Rootfs {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonicalize temp_dir")
+            .join(format!("fandhe-nsiso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("proc")).expect("create rootfs/proc");
+        std::fs::write(base.join(MARKER), MARKER_BODY).expect("write marker");
+        Rootfs(base)
+    }
+
+    /// 子を起動して終了コード 0 を待つ。超過時は kill して panic する（REPAIR-5）。
+    fn run_stage(flag: &str, rootfs: &Path, host_pid: u32, ns: &[String]) {
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = Command::new(exe)
+            .arg(flag)
+            .arg(rootfs)
+            .arg(host_pid.to_string())
+            .args(ns)
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn stage");
+        let deadline = Instant::now() + timeout();
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => {
+                    assert_eq!(status.code(), Some(0), "{flag} stage must exit with 0");
+                    return;
+                }
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{flag} stage did not exit within {:?}", timeout());
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    /// host 段。分離せずに基準値を記録し、launcher を走らせた後にホスト側の不変を照合する（CORE-1・TASK-28.1）。
+    fn unshare_isolation_scenario() {
+        let rootfs = make_rootfs();
+        let host_hostname = read_hostname();
+        let host_pid = std::process::id();
+        let host_ns = ns_ids();
+        assert_ne!(
+            host_hostname, HOSTNAME,
+            "host hostname must differ from the container one"
+        );
+
+        run_stage("--launcher", &rootfs.0, host_pid, &host_ns);
+
+        // ホスト側は無傷: hostname 不変・namespace 不変・rootfs 内の marker が残存・ホストの `/` に marker が出ていない。
+        assert_eq!(
+            read_hostname(),
+            host_hostname,
+            "host hostname must be unchanged"
+        );
+        assert_eq!(ns_ids(), host_ns, "host namespaces must be unchanged");
+        assert_eq!(
+            std::fs::read(rootfs.0.join(MARKER)).expect("read marker from host"),
+            MARKER_BODY
+        );
+        assert!(
+            !Path::new("/").join(MARKER).exists(),
+            "container rootfs must not leak into the host /"
+        );
+        println!(
+            "namespace_isolation: unshare isolation verified (root={})",
+            is_root()
+        );
+    }
+
+    /// launcher 段。分離して container 段を起動する。
+    fn launcher(args: &[String]) {
+        let rootfs = args.first().expect("rootfs path");
+        let host_pid: u32 = args
+            .get(1)
+            .expect("host pid")
+            .parse()
+            .expect("host pid number");
+        let host_ns = args.get(2..).expect("host ns ids");
+
+        // euid 0 での自 ID 写像は SEC-5 で拒否されるため、root では User を除く rootful 構成にする。
+        let root = is_root();
+        let mut namespaces = NamespaceSet::empty()
+            .with(Namespace::Pid)
+            .with(Namespace::Mount)
+            .with(Namespace::Uts)
+            .with(Namespace::Ipc);
+        if !root {
+            namespaces = namespaces.with(Namespace::User);
+        }
+        let config = IsolationConfig {
+            namespaces,
+            hostname: Some(Hostname::new(HOSTNAME).expect("valid hostname")),
+        };
+        let result = if root {
+            plan_rootful_host_root(&config).and_then(|p| isolate_rootful_host_root(&p))
+        } else {
+            plan(&config).and_then(|p| isolate(&p))
+        };
+        let report = match result {
+            Ok(r) => r,
+            Err(err) => panic!("isolate failed: {err}"),
+        };
+        assert_eq!(report.namespaces, namespaces);
+        let want = if root {
+            IsolationPrivilege::RootfulHostRoot
+        } else {
+            IsolationPrivilege::RootlessSingleId
+        };
+        assert_eq!(report.privilege, want);
+        assert_eq!(read_hostname(), HOSTNAME);
+
+        run_stage("--container", Path::new(rootfs), host_pid, host_ns);
+    }
+
+    /// container 段（新しい PID namespace の PID 1）。pivot 後に 3 点と namespace の独立を照合する。
+    fn container(args: &[String]) {
+        let rootfs = Path::new(args.first().expect("rootfs path"));
+        let host_pid: u32 = args
+            .get(1)
+            .expect("host pid")
+            .parse()
+            .expect("host pid number");
+        let host_ns = args.get(2..).expect("host ns ids");
+
+        assert_eq!(
+            std::process::id(),
+            1,
+            "container must be PID 1 of the new PID namespace"
+        );
+        // pivot 後は元の実行ファイルのパスが見えなくなるため、先に取得しておく。
+        let exe = std::env::current_exe().expect("current_exe");
+
+        let isolation = MountIsolation::establish().expect("establish mount isolation");
+        let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
+        let report = pivot_root(&isolation, prepared).expect("pivot_root");
+        assert!(report.old_root_detached);
+        assert!(report.proc_mounted);
+
+        // (a) ホストのプロセスが見えない。
+        let pids: BTreeSet<String> = std::fs::read_dir("/proc")
+            .expect("read /proc")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .collect();
+        let want: BTreeSet<String> = ["1".to_string()].into_iter().collect();
+        assert_eq!(pids, want, "host processes must be invisible");
+        assert_ne!(host_pid, 1, "host stage must not be PID 1");
+        assert!(
+            !Path::new(&format!("/proc/{host_pid}")).exists(),
+            "host stage process must be invisible"
+        );
+
+        // (b) hostname が独自。
+        assert_eq!(read_hostname(), HOSTNAME);
+
+        // (c) rootfs が独自。
+        let names: BTreeSet<String> = std::fs::read_dir("/")
+            .expect("read /")
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let want: BTreeSet<String> = ["proc", MARKER].iter().map(|s| s.to_string()).collect();
+        assert_eq!(names, want, "/ must contain only the container rootfs");
+        assert_eq!(
+            std::fs::read("/marker.txt").expect("read marker"),
+            MARKER_BODY
+        );
+        for host_path in [rootfs, exe.as_path()] {
+            let err = std::fs::metadata(host_path).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::NotFound,
+                "{host_path:?} must be invisible"
+            );
+        }
+        assert_eq!(std::env::current_dir().expect("cwd"), Path::new("/"));
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+        let mount_points: BTreeSet<String> = mountinfo
+            .lines()
+            .map(|l| l.split(' ').nth(4).expect("mount point field").to_string())
+            .collect();
+        let want: BTreeSet<String> = ["/", "/proc"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(mount_points, want, "only / and /proc must be mounted");
+
+        // namespace の独立: ホスト段の識別子とすべて異なる。
+        let mine = ns_ids();
+        assert_eq!(host_ns.len(), NS_NAMES.len(), "host ns ids must be passed");
+        for ((name, theirs), ours) in NS_NAMES.iter().zip(host_ns).zip(&mine) {
+            assert_ne!(ours, theirs, "{name} namespace must differ from the host");
+        }
+    }
+}

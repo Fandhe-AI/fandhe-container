@@ -162,3 +162,11 @@ harness = false
 name = "escape_suite"
 path = "tests/escape_suite.rs"
 harness = false
+
+# namespace 分離の実証テスト（CORE-1・TASK-28.1・#145）。分離後のコンテナから見たプロセス不可視・独自 hostname・
+# 独自 rootfs を通しで照合する。上と同じ理由で harness = false。`-- --ignored` 指定時のみ実行する
+# 実機前提テスト（AGENTS.md）。
+[[test]]
+name = "namespace_isolation"
+path = "tests/namespace_isolation.rs"
+harness = false

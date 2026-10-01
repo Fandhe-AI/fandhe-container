@@ -295,6 +295,12 @@ cpids=()
 cstart=()
 snaps=()
 known=()
+# 起動した子プロセス（収集プロセス・launcher）を配列へ登録し終えるまでの間は 1。この間に受けた
+# TERM / INT / HUP は pending_sig へ記録するだけにして、登録後に処理する（on_signal・spawn_section_end）。
+in_spawn=0
+pending_sig=""
+# launcher を起動し得る区間へ入ったら 1。pids が空でも、所有トークンでの走査・回収を省略しない。
+need_sweep=0
 owner_tok=""
 OWNED=()
 tree_pids=()
@@ -443,6 +449,11 @@ ln_spawn() { # <id> <logfile>
     FANDHE_BENCH_OWNER="$owner_tok" exec "$launcher" run --id "$1" --bundle "$bundle" </dev/null >"$2.fifo" 2>&1
   ) &
   LAST_PID=$!
+  # FANDHE_CONCURRENT_MEMORY_SELFTEST_SIGNAL_IN_SPAWN は selftest が「launcher を起動した直後、pid を
+  # 登録する前にシグナルを受ける」状況を模すための専用フック（その launcher も回収されることを照合する）。
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ] && [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST_SIGNAL_IN_SPAWN:-}" = "1" ]; then
+    kill -TERM "$$"
+  fi
   LAST_START=""
   if read_starttime "$LAST_PID"; then LAST_START="$ST"; fi
   # FANDHE_CONCURRENT_MEMORY_SELFTEST_STALE_START は selftest が「記録した起動時刻と一致しない pid
@@ -595,9 +606,11 @@ any_alive() {
 # 残存があれば 4 を返す。成功・失敗・シグナルのいずれでも呼ばれる（EXIT trap）。何度呼んでも安全。
 ln_stop() {
   local i pid grace desc waited residual=()
-  # launcher を 1 つも起動していなくても、先に起動した収集プロセスは必ず回収する（FIFO の作成失敗や、
+  # launcher を 1 つも登録していなくても、先に起動した収集プロセスは必ず回収する（FIFO の作成失敗や、
   # 収集プロセスの起動中に受けたシグナルで終了する場合。FIFO の open 待ちのまま残さない）。
-  if [ "${#pids[@]}" -eq 0 ]; then
+  # 起動区間へ入った後（need_sweep=1）は pids が空でも以降の処理を省略せず、所有トークンでの走査・
+  # 回収・残存確認まで行う（配列は空なので launcher 向けのループは何もしない）。
+  if [ "${#pids[@]}" -eq 0 ] && [ "$need_sweep" -eq 0 ]; then
     collectors_stop
     return 0
   fi
@@ -679,6 +692,7 @@ ln_stop() {
   pstart=()
   snaps=()
   known=()
+  need_sweep=0
   if [ "${#residual[@]}" -gt 0 ]; then
     err "cleanup-failed" "processes still running: ${residual[*]}"
     return 4
@@ -704,7 +718,14 @@ trap on_exit EXIT
 
 # TERM / INT / HUP を受けたら 128+signal で exit し、EXIT trap の後始末を必ず通す。以降のシグナルは
 # 無処理にして、後始末へ入るまでの間に 2 回目のシグナルで exit し直さないようにする。
+# 子プロセスの起動から配列への登録までの間（in_spawn=1）に受けた場合は、記録だけして戻る。登録前に
+# 後始末へ入ると、起動済みで未登録の子（launcher は exec 前で所有トークンも持たない）を回収できない。
+# 記録したシグナルは登録の直後に spawn_section_end が処理する。
 on_signal() { # <終了コード>
+  if [ "$in_spawn" -eq 1 ]; then
+    pending_sig="$1"
+    return 0
+  fi
   trap ':' TERM INT HUP
   err "interrupted" "received signal (exit $1); running cleanup"
   exit "$1"
@@ -712,6 +733,12 @@ on_signal() { # <終了コード>
 trap 'on_signal 143' TERM
 trap 'on_signal 130' INT
 trap 'on_signal 129' HUP
+
+# 起動〜登録の区間を閉じ、区間中に受けたシグナルがあれば処理する（後始末へ進む）。
+spawn_section_end() {
+  in_spawn=0
+  if [ -n "$pending_sig" ]; then on_signal "$pending_sig"; fi
+}
 
 if ! tmpdir="$(mktemp -d)"; then err "invalid-input" "cannot create a temporary directory"; exit 2; fi
 # 所有プロセス追跡用の実行ごとの乱数トークン（mktemp が返す英数字のディレクトリ名を流用）。
@@ -854,22 +881,28 @@ while [ "$t" -le "$trials" ]; do
   i=0
   while [ "$i" -lt "$count" ]; do
     id="${id_prefix}-${t}-$((i + 1))"
+    in_spawn=1
     if ! log_collector_start "$tmpdir/$id.log"; then
+      in_spawn=0
       err "measurement-failed" "trial=${t} id=${id} reason=cannot-create-log-fifo"
       exit 1
     fi
     cpids+=("$LAST_CPID")
     cstart+=("$LAST_CSTART")
+    spawn_section_end
     i=$((i + 1))
   done
   i=0
+  need_sweep=1
   # 起動をずらさず、できるだけ同時に起動する（起動競合も計測条件に含める）。
   while [ "$i" -lt "$count" ]; do
     id="${id_prefix}-${t}-$((i + 1))"
+    in_spawn=1
     ln_spawn "$id" "$tmpdir/$id.log"
     pids+=("$LAST_PID")
     pstart+=("$LAST_START")
     ok_flags+=(0)
+    spawn_section_end
     i=$((i + 1))
   done
 

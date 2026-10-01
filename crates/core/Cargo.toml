@@ -116,3 +116,11 @@ harness = false
 name = "landlock_enforcement"
 path = "tests/landlock_enforcement.rs"
 harness = false
+
+# Landlock の許可パス / 許可外パスの区別を観測する結合試験（CORE-5・TASK-39.5・#185）。適用は不可逆・
+# 単一スレッド前提のため harness = false（使い捨ての子プロセス内で適用する）。Linux 6.12+・ABI 6+ の
+# フル照合は `-- --ignored` 指定時のみ必須（AGENTS.md）。
+[[test]]
+name = "landlock"
+path = "tests/landlock.rs"
+harness = false

@@ -34,11 +34,52 @@
 //! 事前条件の不成立を含めあらゆる失敗を失敗として扱い、検証せずに成功する分岐は持たない。AGENTS.md への
 //! 記載と CI での分離方式の確定は #204（TASK-42.6）で行う。
 //!
+//! # ESC-04〜ESC-06（TASK-42.3・#201）
+//! - ESC-04（cgroup の `release_agent` 書き込み）・ESC-05（`/proc/sys`・`/proc/sysrq-trigger` 書き込み）は、
+//!   書き込み用に「開くだけ」で判定し 1 バイトも書かない（制限が欠けてもホストへ作用させないため）。
+//!   ESC-05 は `linux.maskedPaths` / `readonlyPaths` が未適用のため、rootful の実機実行では本物の欠陥として
+//!   失敗し得る（期待は変えない）
+//! - ESC-06（禁止 syscall の SIGSYS 強制終了＋監査記録）は spec の期待で書く。現行の CORE-5 フィルタは
+//!   `ERRNO(EPERM)` を返し、SIGSYS 化と監査記録の配送は未実装のため、実機実行では失敗する（fail-closed。
+//!   期待の弱体化や監査レコードの偽造はしない）
+//!
 //! ケースの攻撃操作は、制限が欠けていてもホストへ副作用が出ない引数・対象に限る（`seccomp.rs` と同方針）。
 //! 攻撃クロージャ・ハーネスは `unsafe` を書かない。raw syscall が要る攻撃は core 側の `#[doc(hidden)]`
 //! プローブ（syscall 本体は `sys` モジュール）を経由する。
 
 use std::fmt;
+
+/// errno / シグナル番号（asm-generic の値で x86_64・aarch64 とも共通）。
+const EPERM: i32 = 1;
+const ENOENT: i32 = 2;
+const EACCES: i32 = 13;
+const EROFS: i32 = 30;
+const SIGSYS: i32 = 31;
+
+/// ESC-04・05 が受理する結果（対象の不在・権限・読み取り専用による拒否）。
+const ESC04_05_ALLOWED: &[AttackOutcome] = &[
+    AttackOutcome::Absent,
+    AttackOutcome::Errno(EPERM),
+    AttackOutcome::Errno(EACCES),
+    AttackOutcome::Errno(EROFS),
+];
+
+/// ESC-04・05 の期待（SEC-2。spec は監査記録を要求しない）。
+const ESC04_05_EXPECT: Expectation = Expectation {
+    allowed: ESC04_05_ALLOWED,
+    signal: None,
+    audit: AuditExpectation::None,
+};
+
+/// ESC-06 の期待（SEC-2・SEC-4）。SIGSYS での強制終了と seccomp 監査記録を要求する。
+const ESC06_EXPECT: Expectation = Expectation {
+    allowed: &[],
+    signal: Some(SIGSYS),
+    audit: AuditExpectation::Required("seccomp"),
+};
+
+/// ESC-06 が発行する禁止 syscall 名（`DeniedSyscall::ALL` の名前と一致していること）。
+const ESC06_PROBED: [&str; 3] = ["unshare", "ptrace", "kexec_load"];
 
 /// 攻撃操作の結果（子が観測した事実）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,9 +459,73 @@ fn sec2_task42_1_record_parser_selftest() {
     );
 }
 
+/// ESC-06 が発行する syscall 名が CORE-5 の禁止表に含まれることを照合する。
+fn sec2_task42_3_esc06_probed_names_in_deny_table() {
+    let names: Vec<&str> = fandhe_container_core::seccomp::DeniedSyscall::ALL
+        .iter()
+        .map(|d| d.name())
+        .collect();
+    for probed in ESC06_PROBED.iter() {
+        assert!(
+            names.contains(probed),
+            "SEC-2: ESC-06 syscall {probed} must be in DeniedSyscall::ALL"
+        );
+    }
+}
+
+/// ESC-04〜06 の期待が意図どおりに判定されること（現行実装の観測が失敗になることを含む）を具体値で照合する。
+fn sec2_task42_3_case_expectation_selftest() {
+    let obs = |exit, outcome, layers: &[&str]| Observation {
+        exit,
+        outcome,
+        audit_layers: layers.iter().map(|s| s.to_string()).collect(),
+    };
+    let ok_exit = ObservedExit::Exited(0);
+    for pass in [AttackOutcome::Absent, AttackOutcome::Errno(EACCES)] {
+        assert_eq!(
+            judge(&ESC04_05_EXPECT, &obs(ok_exit, Some(pass), &[])),
+            CaseVerdict::Pass
+        );
+    }
+    assert_eq!(
+        judge(
+            &ESC04_05_EXPECT,
+            &obs(ok_exit, Some(AttackOutcome::Succeeded), &[])
+        ),
+        CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
+            got: AttackOutcome::Succeeded
+        }])
+    );
+    assert_eq!(
+        judge(
+            &ESC06_EXPECT,
+            &obs(ObservedExit::Signaled(31), None, &["seccomp"])
+        ),
+        CaseVerdict::Pass
+    );
+    // 現行実装（EPERM で戻り、SIGSYS も監査記録もない）は失敗として検出される。
+    assert_eq!(
+        judge(
+            &ESC06_EXPECT,
+            &obs(ok_exit, Some(AttackOutcome::Errno(EPERM)), &[])
+        ),
+        CaseVerdict::Fail(vec![
+            Mismatch::UnexpectedExit {
+                got: ObservedExit::Exited(0)
+            },
+            Mismatch::UnexpectedOutcome {
+                got: AttackOutcome::Errno(1)
+            },
+            Mismatch::MissingAudit { layer: "seccomp" },
+        ])
+    );
+}
+
 fn always() {
     sec2_task42_1_judge_selftest();
     sec2_task42_1_record_parser_selftest();
+    sec2_task42_3_esc06_probed_names_in_deny_table();
+    sec2_task42_3_case_expectation_selftest();
     println!("escape_suite: SEC-2 judge and record parser verified");
 }
 
@@ -475,14 +580,15 @@ mod linux {
 
     use fandhe_container_core::audit_log::{AuditRecord, AuditSink, encode_json_line};
     use fandhe_container_core::exec::{
-        ChildExit, IsolationConfig, Namespace, NamespaceSet, StagePipeline, isolate,
-        isolate_rootful_host_root, plan, plan_rootful_host_root, spawn_container_probe,
+        ChildExit, EscapeSyscallProbe, IsolationConfig, Namespace, NamespaceSet, ProbeOutcome,
+        StagePipeline, isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
+        probe_escape_syscall, spawn_container_probe,
     };
     use fandhe_container_core::traits::{ErrorCode, TraitError};
 
     use super::{
-        AttackOutcome, AuditExpectation, CaseVerdict, Expectation, Mismatch, Observation,
-        ObservedExit, RECORD_MAX_BYTES, judge, parse_record,
+        AttackOutcome, AuditExpectation, CaseVerdict, ENOENT, ESC04_05_EXPECT, ESC06_EXPECT,
+        Expectation, Mismatch, Observation, ObservedExit, RECORD_MAX_BYTES, judge, parse_record,
     };
 
     /// 子（コンテナ内）で攻撃を実行するクロージャの型。結果は `Recorder` へ書く。
@@ -498,17 +604,55 @@ mod linux {
         attack: Attack,
     }
 
-    /// 登録済みケース。本 PR は、ハーネスが end-to-end で動くことを示す対照ケースのみ。
-    const CASES: &[EscapeCase] = &[EscapeCase {
-        id: "control-read-proc",
-        expectation: Expectation {
-            allowed: &[AttackOutcome::Succeeded],
-            signal: None,
-            audit: AuditExpectation::None,
+    /// 登録済みケース。対照ケースと ESC-04〜06（#201）。ESC-01〜03・07〜10 は #200・#202・#203 で追加する。
+    const CASES: &[EscapeCase] = &[
+        EscapeCase {
+            id: "control-read-proc",
+            expectation: Expectation {
+                allowed: &[AttackOutcome::Succeeded],
+                signal: None,
+                audit: AuditExpectation::None,
+            },
+            stages: StagePipeline::new,
+            attack: attack_control_read_proc,
         },
-        stages: StagePipeline::new,
-        attack: attack_control_read_proc,
-    }];
+        EscapeCase {
+            id: "esc-04-release-agent",
+            expectation: ESC04_05_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc04_release_agent,
+        },
+        EscapeCase {
+            id: "esc-05-proc-sys-core-pattern",
+            expectation: ESC04_05_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc05_proc_sys_core_pattern,
+        },
+        EscapeCase {
+            id: "esc-05-sysrq-trigger",
+            expectation: ESC04_05_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc05_sysrq_trigger,
+        },
+        EscapeCase {
+            id: "esc-06-unshare",
+            expectation: ESC06_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc06_unshare,
+        },
+        EscapeCase {
+            id: "esc-06-ptrace",
+            expectation: ESC06_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc06_ptrace,
+        },
+        EscapeCase {
+            id: "esc-06-kexec-load",
+            expectation: ESC06_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc06_kexec_load,
+        },
+    ];
 
     /// 対照: 禁止対象外の操作（`/proc/self/status` の読み出し）が制限下でも動くこと。
     fn attack_control_read_proc(rec: &Recorder) {
@@ -520,6 +664,72 @@ mod linux {
                 .map_or(AttackOutcome::Failed, AttackOutcome::Errno),
         };
         rec.outcome(outcome);
+    }
+
+    /// 書き込み用に開くだけ（`create` / `truncate` / `append` なし・1 バイトも書かない）で拒否を観測する。
+    /// 開けた場合は即 drop して `Succeeded`（＝制限の欠落）を返す。ホストのカーネルへ作用させないための設計。
+    fn open_write_only(path: &str) -> AttackOutcome {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(file) => {
+                drop(file);
+                AttackOutcome::Succeeded
+            }
+            Err(e) => match e.raw_os_error() {
+                Some(ENOENT) => AttackOutcome::Absent,
+                Some(n) => AttackOutcome::Errno(n),
+                None => AttackOutcome::Failed,
+            },
+        }
+    }
+
+    /// ESC-04（SEC-2・TASK-42.3・#201）: cgroup v1 の `release_agent` への書き込み。
+    /// 子の rootfs は `proc/` のみで `/sys/fs/cgroup` が存在しないため `Absent` が構造上の期待。v1 階層の
+    /// 新規 mount は seccomp の `mount` 拒否（`tests/seccomp.rs`）で塞がれ、ホスト側の根拠は
+    /// `tests/cgroups_release_agent.rs`（TASK-35）にある。
+    fn attack_esc04_release_agent(rec: &Recorder) {
+        rec.outcome(open_write_only("/sys/fs/cgroup/release_agent"));
+    }
+
+    /// ESC-05（SEC-2・TASK-42.3・#201）: マスク対象 `/proc/sys` 配下（`core_pattern`）への書き込み。
+    /// `maskedPaths` 未適用のため rootful では開けてしまい得る（本物の欠陥の検出。期待は変えない）。
+    fn attack_esc05_proc_sys_core_pattern(rec: &Recorder) {
+        rec.outcome(open_write_only("/proc/sys/kernel/core_pattern"));
+    }
+
+    /// ESC-05（SEC-2・TASK-42.3・#201）: `/proc/sysrq-trigger` への書き込み。開くだけで書かない。
+    fn attack_esc05_sysrq_trigger(rec: &Recorder) {
+        rec.outcome(open_write_only("/proc/sysrq-trigger"));
+    }
+
+    /// `ProbeOutcome` を攻撃結果へ写す。
+    fn probe_to_attack(p: ProbeOutcome) -> AttackOutcome {
+        match p {
+            ProbeOutcome::Ok => AttackOutcome::Succeeded,
+            ProbeOutcome::Errno(n) => AttackOutcome::Errno(n),
+            _ => AttackOutcome::Failed,
+        }
+    }
+
+    /// ESC-06（SEC-2・TASK-42.3・#201）: `unshare(0)`（副作用なし）。期待は spec どおり SIGSYS 終了＋seccomp
+    /// 監査記録。戻ってきた場合（現行は EPERM）は結果を記録し、判定側が失敗にする。監査レコードは偽造しない。
+    fn attack_esc06_unshare(rec: &Recorder) {
+        rec.outcome(probe_to_attack(probe_escape_syscall(
+            EscapeSyscallProbe::Unshare,
+        )));
+    }
+
+    /// ESC-06: `ptrace(PTRACE_CONT, 自 pid)`（attach を伴わず副作用なし）。期待は `attack_esc06_unshare` と同じ。
+    fn attack_esc06_ptrace(rec: &Recorder) {
+        rec.outcome(probe_to_attack(probe_escape_syscall(
+            EscapeSyscallProbe::Ptrace,
+        )));
+    }
+
+    /// ESC-06: segment 数上限超過の `kexec_load`（ロードに至らない）。期待は `attack_esc06_unshare` と同じ。
+    fn attack_esc06_kexec_load(rec: &Recorder) {
+        rec.outcome(probe_to_attack(probe_escape_syscall(
+            EscapeSyscallProbe::KexecLoad,
+        )));
     }
 
     /// 子側の記録器。攻撃結果を 1 回だけ、監査レコードを 0 件以上、pipe へ書く。`AuditSink` として

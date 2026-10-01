@@ -338,6 +338,41 @@ pub(crate) fn probe_denied_syscalls() -> Result<SeccompProbeRecord, ExecError> {
     })
 }
 
+/// ESC-06 の攻撃クロージャが発行する禁止 syscall の種別（SEC-2・TASK-42.3・#201）。
+///
+/// 各バリアントは [`probe_escape_syscall`] が呼ぶ既存 `sys` プローブに 1 対 1 で対応する。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscapeSyscallProbe {
+    /// `unshare(0)`。
+    Unshare,
+    /// `ptrace(PTRACE_CONT, 自 pid)`（attach を伴わない）。
+    Ptrace,
+    /// segment 数が上限超過の `kexec_load`（ロードに至らない）。
+    KexecLoad,
+}
+
+/// 結合試験 `tests/escape_suite.rs` の ESC-06 から呼ぶ、禁止 syscall の安全な入口（SEC-2・TASK-42.3・#201）。
+///
+/// `spawn_container_probe` の子（組み込み Seccomp 段の通過後）で呼ばれる。`unsafe` を `sys` の外へ出さない
+/// ための薄い入口で、引数は副作用のない値に固定している（根拠は各 `sys` プローブの `// SAFETY:`）。
+///
+/// # 将来仕様（REPAIR-3）
+///
+/// 現行フィルタは `EPERM` を返して戻る。禁止 syscall が SIGSYS（KILL / TRAP）化された後は戻らず、
+/// 子がシグナル終了する（ESC-06 の期待。CORE-5・SEC-4）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn probe_escape_syscall(which: EscapeSyscallProbe) -> ProbeOutcome {
+    let result = match which {
+        EscapeSyscallProbe::Unshare => sys::unshare_namespaces(&[]),
+        EscapeSyscallProbe::Ptrace => sys::ptrace_cont_probe(std::process::id()),
+        EscapeSyscallProbe::KexecLoad => sys::kexec_load_invalid_probe(),
+    };
+    ProbeOutcome::from_result(result)
+}
+
 /// 単一スレッド条件を適用の前後で検査して [`apply_filter`] を呼ぶ。事前検査は副作用の前に行う。
 fn apply_single_threaded(
     program: &SeccompProgram,

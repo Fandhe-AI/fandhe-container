@@ -21,6 +21,14 @@
 //!   別スレッドで呼び（これも `timeout` で打ち切る）、実装側に子プロセスの kill・回収を促し、結果は破棄する。
 //!   打ち切り後に戻っていない probe / cancel スレッドは [`ProbeRunner`] が数え、残っている間は新しい判定を
 //!   `Unavailable` で拒否する（スレッド・子プロセスの累積を防ぐ。同時に走る判定は最大 1 本）。
+//! - 所有権の確認・判定・記録・失敗時の降格は、[`ProbeRunner`] ごとの 1 つの排他区間で行う（SUP-4・REPAIR-5）。
+//!   区間の取得は待たない（取れなければ即 `Unavailable`）。先行する呼び出しが記録を終える前に次の判定を
+//!   始めさせないので、古い判定の記録・降格が新しい判定の結果を後から上書きしない。拒否された呼び出しは
+//!   probe も状態の書き込みもしない（状態の遷移は区間を持つ呼び出しだけが行う）。
+//!   区間内の待ちはすべて有限（probe・cancel・回収は `timeout`、書き込みは [`MAX_WRITE_ATTEMPTS`] 回と
+//!   core のロック待ち上限）で、ロックを持ったまま無期限に待つ経路はない。
+//!   [`record_health`] を直接呼ぶ経路はこの排他の外にある。同じコンテナの `health` を書く呼び出し元は、
+//!   1 つの [`ProbeRunner`]（clone は排他を共有する）を通して [`probe_and_record`] を使うこと。
 //! - `Unhealthy` 等の記録に失敗した場合も、既存の `Healthy` を降格する（失敗は [`ProbeFailure::demotion`] で識別できる）。
 //! - テスト用フェイクは `run.rs` と別に持つ。共有化は #242（TASK-157.8）で検討する。
 //!
@@ -32,7 +40,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
@@ -51,6 +59,9 @@ use crate::state::SupervisedState;
 ///
 /// 将来の healthcheck 周期処理（TASK-161・SUP-4）から呼ばれる。可観測性は
 /// [`MonitorOperation::RecordHealth`] で通知する（REPAIR-4）。
+///
+/// 本関数は呼び出し間の順序を保証しない（[`ProbeRunner`] の排他の外）。判定結果を書く経路は
+/// [`probe_and_record`] を使い、判定から記録までを 1 つの排他区間に収める。
 pub fn record_health(
     state: &mut SupervisedState,
     process: &dyn LaunchedProcess,
@@ -114,7 +125,8 @@ impl HealthProbe for UnimplementedHealthProbe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Demotion {
-    /// 降格は不要だった（最新レコードの `health` が `Healthy` でない、または probe 前の失敗）。
+    /// 降格は不要だった（最新レコードの `health` が `Healthy` でない、または probe 前の失敗・
+    /// 別の呼び出しが判定〜記録の途中で拒否された）。
     NotNeeded,
     /// `Unhealthy` を書いた。
     Applied,
@@ -199,10 +211,28 @@ impl Drop for InFlightGuard {
 ///
 /// 期限超過で打ち切った probe スレッドが戻っていない間は、新しい判定を開始せず `Unavailable` を返す
 /// （同時に走る判定は最大 1 本。REPAIR-5）。
+///
+/// [`probe_and_record`] は判定から記録・降格までを本型の排他区間（`busy`）の中で行う。区間は待たずに取得し、
+/// 使用中なら `Unavailable` を返す（SUP-4・REPAIR-5）。`clone` は計数と排他区間を共有する。
 #[derive(Clone)]
 pub struct ProbeRunner {
     probe: Arc<dyn HealthProbe>,
     in_flight: Arc<InFlight>,
+    /// [`probe_and_record`] の 1 呼び出しが判定〜記録の区間を保持している間 `true`。
+    busy: Arc<AtomicBool>,
+}
+
+/// [`ProbeRunner`] の排他区間を保持する RAII ガード（判定・記録・降格の間ずっと保持する。panic でも解放される）。
+///
+/// 取得は [`ProbeRunner::try_begin`] の `compare_exchange` だけで、待たない（REPAIR-5）。
+struct ProbeSession<'a> {
+    runner: &'a ProbeRunner,
+}
+
+impl Drop for ProbeSession<'_> {
+    fn drop(&mut self) {
+        self.runner.busy.store(false, Ordering::SeqCst);
+    }
 }
 
 impl ProbeRunner {
@@ -211,7 +241,16 @@ impl ProbeRunner {
         Self {
             probe,
             in_flight: Arc::new(InFlight::default()),
+            busy: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// 排他区間を待たずに取得する。別の呼び出しが保持中なら `None`（確認と取得は不可分。REPAIR-5）。
+    fn try_begin(&self) -> Option<ProbeSession<'_>> {
+        self.busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(ProbeSession { runner: self })
     }
 
     /// 打ち切り後もまだ終了していない probe / cancel スレッドの数（診断用）。
@@ -219,26 +258,60 @@ impl ProbeRunner {
         self.in_flight.0.load(Ordering::SeqCst)
     }
 
+    /// `cancel` を別スレッドで呼び、`timeout` までしか待たない。戻らない cancel も未終了として計数する。
+    fn cancel_bounded(&self, timeout: Duration) {
+        let (tx, rx) = mpsc::channel();
+        let worker = Arc::clone(&self.probe);
+        let guard = InFlightGuard::acquire(&self.in_flight);
+        let spawned = std::thread::Builder::new()
+            .name("healthcheck-cancel".to_owned())
+            .spawn(move || {
+                // probe スレッドと同じく、計数を戻してから完了を知らせる（panic 時も解放が先）。
+                let tx = tx;
+                let guard = guard;
+                worker.cancel();
+                drop(guard);
+                let _ = tx.send(());
+            });
+        if spawned.is_ok() {
+            // 期限内に戻らなくても待たない（Timeout / Disconnected はどちらも打ち切り）。
+            let _ = rx.recv_timeout(timeout);
+        }
+    }
+}
+
+impl ProbeSession<'_> {
     /// `probe` を別スレッドで実行し、`timeout` で待ちを打ち切る（REPAIR-5）。
     ///
     /// 超過時は [`HealthProbe::cancel`] を別スレッドで呼び、これも `timeout` で待ちを打ち切る
     /// （cancel が戻らなくても呼び出し側は戻る）。cancel 後は probe スレッドの終了を `timeout` まで待って回収を
     /// 試みる。終了しなかったスレッドは [`ProbeRunner::unfinished`] に残り、戻るまで次の判定を拒否する。
+    ///
+    /// 排他区間（[`ProbeSession`]）の保持者だけが呼べる。戻った後も区間は呼び出し元が保持し続け、
+    /// 記録・降格が終わるまで次の判定は始まらない（SUP-4）。
     fn run(&self, timeout: Duration) -> Result<HealthStatus, TraitError> {
-        let Some(guard) = InFlightGuard::try_acquire_exclusive(&self.in_flight) else {
+        let runner = self.runner;
+        let Some(guard) = InFlightGuard::try_acquire_exclusive(&runner.in_flight) else {
             return Err(TraitError::new(
                 ErrorCode::Unavailable,
                 "previous healthcheck probe has not terminated",
             ));
         };
         let (tx, rx) = mpsc::channel();
-        let worker = Arc::clone(&self.probe);
+        let worker = Arc::clone(&runner.probe);
         std::thread::Builder::new()
             .name("healthcheck-probe".to_owned())
             .spawn(move || {
-                let _guard = guard;
+                // ローカル変数は宣言の逆順に破棄される。panic 時も計数の解放が送信側の切断より先になるよう、
+                // `tx` を先に束縛する。
+                let tx = tx;
+                let guard = guard;
+                let result = worker.probe(timeout);
+                // 結果を渡す前に計数を戻す。受信した呼び出し側が戻った直後の次の判定を、終了処理中の
+                // このスレッドが誤って `Unavailable` にしないため（次の判定は排他区間の解放後にしか始まらない）。
+                drop(guard);
                 // 受信側が打ち切り済みなら送信失敗になるが、結果は不要なので無視する。
-                let _ = tx.send(worker.probe(timeout));
+                let _ = tx.send(result);
             })
             .map_err(|_| {
                 TraitError::new(ErrorCode::Internal, "failed to spawn healthcheck probe")
@@ -246,7 +319,7 @@ impl ProbeRunner {
         match rx.recv_timeout(timeout) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
-                self.cancel_bounded(timeout);
+                runner.cancel_bounded(timeout);
                 // 回収の確認: cancel の効果で probe が戻れば結果は破棄してスレッドを手放す。
                 let _ = rx.recv_timeout(timeout);
                 Err(TraitError::new(
@@ -258,24 +331,6 @@ impl ProbeRunner {
                 ErrorCode::Internal,
                 "healthcheck probe terminated abnormally",
             )),
-        }
-    }
-
-    /// `cancel` を別スレッドで呼び、`timeout` までしか待たない。戻らない cancel も未終了として計数する。
-    fn cancel_bounded(&self, timeout: Duration) {
-        let (tx, rx) = mpsc::channel();
-        let worker = Arc::clone(&self.probe);
-        let guard = InFlightGuard::acquire(&self.in_flight);
-        let spawned = std::thread::Builder::new()
-            .name("healthcheck-cancel".to_owned())
-            .spawn(move || {
-                let _guard = guard;
-                worker.cancel();
-                let _ = tx.send(());
-            });
-        if spawned.is_ok() {
-            // 期限内に戻らなくても待たない（Timeout / Disconnected はどちらも打ち切り）。
-            let _ = rx.recv_timeout(timeout);
         }
     }
 }
@@ -319,7 +374,9 @@ fn demote_if_healthy(
 
 /// `probe` を 1 回実行し、結果を [`record_health`] で書く。
 ///
-/// `timeout` が 0 または [`MAX_POLL_INTERVAL`] 超なら `InvalidArgument`。probe の前に最新レコードで `Running`・
+/// `timeout` が 0 または [`MAX_POLL_INTERVAL`] 超なら `InvalidArgument`。同じ [`ProbeRunner`] で別の呼び出しが
+/// 判定〜記録の途中なら、probe も書き込みもせず `Unavailable`（降格は [`Demotion::NotNeeded`]。状態の遷移は
+/// 先行する呼び出しが行う。待たずに戻る。SUP-4・REPAIR-5）。probe の前に最新レコードで `Running`・
 /// 起動 pid・`supervisor_pid` の所有を確認し、満たさなければ probe せず `FailedPrecondition`（SUP-1）。
 /// 判定は [`MonitorOperation::Probe`] として成否・レイテンシを通知する（REPAIR-4）。probe が `Err` を返すか
 /// `timeout` を超えた（待ちを打ち切り `Timeout`）場合は、最新の `health` が `Healthy` のときに限り `Unhealthy`
@@ -344,8 +401,18 @@ pub fn probe_and_record(
             Demotion::NotNeeded,
         )
     })?;
+    // 所有権の確認から記録・降格までを 1 つの排他区間に収める。`session` は関数の終わりまで保持する
+    // （古い判定の記録・降格が、後から始まった判定の結果を上書きしないため。SUP-4）。
+    let Some(session) = probe.try_begin() else {
+        let busy = TraitError::new(ErrorCode::Unavailable, "another healthcheck is in progress");
+        // 拒否も判定の失敗として観測できるようにする（REPAIR-4）。
+        let _ = observed(obs, MonitorOperation::Probe, || {
+            Err::<HealthStatus, _>(busy.clone())
+        });
+        return Err(ProbeFailure::new(busy, Demotion::NotNeeded));
+    };
     verify_owned(state, pid, self_pid).map_err(|e| ProbeFailure::new(e, Demotion::NotNeeded))?;
-    match observed(obs, MonitorOperation::Probe, || probe.run(timeout)) {
+    match observed(obs, MonitorOperation::Probe, || session.run(timeout)) {
         Ok(health) => match record_health(state, process, health, obs) {
             Ok(rec) => Ok(rec),
             // Unhealthy / Starting を書けないと既存の Healthy が残るため、降格を試みて結果を返す（SUP-4）。

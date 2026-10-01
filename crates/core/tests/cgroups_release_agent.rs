@@ -241,6 +241,8 @@ mod linux {
                 (ErrorCode::FailedPrecondition, CgroupStep::ReadSelfCgroup),
                 (ErrorCode::FailedPrecondition, CgroupStep::VerifyCgroup2),
                 (ErrorCode::NotFound, CgroupStep::OpenRoot),
+                // `detect` は cgroup2 検査より前に、ルート cgroup 所属の非 root を拒否する。
+                (ErrorCode::PermissionDenied, CgroupStep::CheckDelegation),
             ];
             assert!(allowed.contains(&pair), "unexpected rejection: {err:?}");
         }
@@ -257,14 +259,18 @@ mod linux {
 
     impl Cleanup<'_> {
         /// 子 cgroup を削除し、結果を返す。
+        ///
+        /// 削除に失敗した場合はハンドルを保持したまま返し、`Drop` で再試行できるようにする。
         fn finish(mut self) -> Result<(), String> {
-            match self.child.take() {
-                Some(child) => self
-                    .delegated
-                    .remove_child(&child)
-                    .map_err(|e| format!("remove_child failed: {e:?}")),
-                None => Ok(()),
-            }
+            let Some(child) = self.child.as_ref() else {
+                return Ok(());
+            };
+            self.delegated
+                .remove_child(child)
+                .map_err(|e| format!("remove_child failed: {e:?}"))?;
+            // 削除に成功したときだけハンドルを手放す。
+            self.child = None;
+            Ok(())
         }
     }
 

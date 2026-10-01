@@ -22,8 +22,14 @@
 //! ```text
 //! <委譲された親 P>/            ← 自プロセスの元の所属。controller を有効化する対象
 //! ├── fc-runtime/             ← 退避リーフ（自プロセス〔runtime / supervisor〕の移動先）
-//! └── fc-<container-id>/      ← コンテナ用子 cgroup（この時点では空）
+//! └── fc-<container-id>@<n>/  ← コンテナ用子 cgroup（この時点では空。名前は [`CgroupName::for_instance`]）
 //! ```
+//! コンテナ用子 cgroup の名前は、状態記録の create で割り当てた revision（instance `n`。ストア全体で再利用
+//! されない）を含む `fc-<id>@<n>` とする（TASK-30.3・OCI-6）。同じ ID の削除・再作成をまたいでも名前が
+//! 重ならないため、古いレコードを読んだ delete が再作成後のコンテナの cgroup を名前で消すことはない。
+//! `@` は `ContainerId` の許容文字に無いため、`fc-runtime` や ID だけの名前とも衝突しない。
+//! [`CgroupName::new`]（`fc-<id>`）は instance を持たない名前で、TASK-32 の結合試験が使う。delete はこの名前の
+//! cgroup を削除しないので、本番 launcher は `for_instance` で作る。
 //! 退避リーフは 1 supervisor = 1 委譲スコープを前提とする（CORE-1・D-19）。複数コンテナが同一
 //! スコープを共有する運用の扱いは本番 launcher（TASK-29 / TASK-157 系）で整合させる。退避リーフは自プロセスが入るため削除せず、
 //! スコープ終了時に systemd が回収する。
@@ -36,10 +42,18 @@
 //! - fork 後の子の `cgroup.procs` 参加（TASK-32.4・#161）: [`ContainerCgroup::join_hook`] が返す
 //!   [`CgroupJoin`] を `exec::StagePipeline` の `CgroupJoin` 段へ登録する（`exec::StageHook` 実装済み）
 //!
+//! - delete 時の cgroup 削除（TASK-30.3・OCI-6）: [`DelegatedCgroup::open_child`] で名前から既存の子 cgroup を
+//!   検証つきで開き、`oci_runtime::ContainerCgroupRemover` の実装として [`DelegatedCgroup::remove_child`] へ渡す
+//!   （`oci_runtime::delete` が状態記録の削除の前に呼ぶ。本番の呼び出し元による結線は未実装）。
+//!   `ContainerCgroupRemover::scope` は検出した委譲パス（[`DelegatedCgroup::path`] と同じ文字列）を返し、
+//!   delete は状態に記録された配置（`StateRecord::cgroup`）のスコープと一致するときだけ、記録された instance の
+//!   名前（`fc-<id>@<n>`）で削除・不存在確認を行う
+//!
 //! # 未実装（REPAIR-3）
 //! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映、本番 launcher での
 //!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
-//! - OCI `linux.cgroupsPath` の反映、delete 時の cgroup 削除の結線（TASK-30 系）
+//! - OCI `linux.cgroupsPath` の反映・create での委譲スコープの記録（`CreateStateRequest::with_cgroup_scope`）と
+//!   delete への本番の呼び出し元（CLI / plugin / supervisor）からの結線
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
 
 use std::collections::BTreeSet;
@@ -50,8 +64,9 @@ use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 
+use crate::oci_runtime::{CgroupRemoval, ContainerCgroupRemover};
 use crate::sys::{self, SysError};
-use crate::traits::{ContainerId, ErrorCode};
+use crate::traits::{CgroupScope, ContainerId, ErrorCode, StateRevision, TraitError};
 
 mod cpu;
 pub use cpu::{CpuMax, CpuQuota};
@@ -60,6 +75,8 @@ pub use cpu::{CpuMax, CpuQuota};
 const EVACUATION_LEAF: &str = "fc-runtime";
 /// コンテナ用子 cgroup の接頭辞。`cgroup.procs` 等のインターフェースファイル名との衝突を避ける。
 const CONTAINER_PREFIX: &str = "fc-";
+/// コンテナ ID と instance の区切り（`ContainerId` の許容文字に含まれない。TASK-30.3）。
+const INSTANCE_SEPARATOR: char = '@';
 /// cgroup 名（ディレクトリ要素）の最大バイト数（`NAME_MAX`）。
 const NAME_MAX: usize = 255;
 /// `/proc/self/cgroup` の読み取り上限。
@@ -458,7 +475,7 @@ fn validate_controller_request(
     Ok(())
 }
 
-/// コンテナ用子 cgroup の名前（`fc-<container-id>`）。検証済みの 1 要素。
+/// コンテナ用子 cgroup の名前（`fc-<container-id>@<instance>` または `fc-<container-id>`）。検証済みの 1 要素。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CgroupName(String);
 
@@ -484,7 +501,29 @@ impl CgroupName {
         Ok(Self(name))
     }
 
-    /// 名前の文字列表現（`fc-<id>`）。
+    /// 状態記録の cgroup 配置の instance（create 時の revision）を含む名前 `fc-<id>@<n>` を作る
+    /// （TASK-30.3・OCI-6。本番のコンテナ用 cgroup の名前。モジュール doc「レイアウト」）。
+    ///
+    /// instance はストア全体で再利用されないため、同じ ID でも別のレコードとは名前が重ならない。
+    /// 255 バイトを超えると `InvalidArgument`（`prepare` でも delete でも同じ規則なので、作れない名前の
+    /// cgroup は存在しない）。
+    pub fn for_instance(id: &ContainerId, instance: StateRevision) -> Result<Self, CgroupError> {
+        let name = format!(
+            "{CONTAINER_PREFIX}{}{INSTANCE_SEPARATOR}{}",
+            id.as_str(),
+            instance.value()
+        );
+        if name.len() > NAME_MAX {
+            return Err(CgroupError::new(
+                ErrorCode::InvalidArgument,
+                CgroupStep::CreateChild,
+                "cgroup name exceeds 255 bytes",
+            ));
+        }
+        Ok(Self(name))
+    }
+
+    /// 名前の文字列表現（`fc-<id>@<n>` または `fc-<id>`）。
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -833,6 +872,12 @@ impl DelegatedCgroup {
     /// `AlreadyExists`。途中失敗時は、自プロセスを移していれば元の親へ戻して所属を読み戻しで検証し、
     /// 本処理が作った子 cgroup・退避リーフを作成直後に固定した fd との同一性を確認してから best-effort で
     /// 削除する（[`Self::remove_verified`]。巻き戻しの失敗・fd が無く名前指定で消した事実はエラー文に併記）。
+    ///
+    /// 呼び出し元は、本関数で子 cgroup を作る前にこの委譲スコープ（`ContainerCgroupRemover::scope`）を
+    /// 状態記録へ記録し（`CreateStateRequest::with_cgroup_scope`。TASK-30.3・OCI-6）、返された配置の instance
+    /// から [`CgroupName::for_instance`] で作った名前を渡す。記録の無いレコードの `oci_runtime::delete` は
+    /// cgroup に触れず、`fc-<id>@<n>` 以外の名前の cgroup も削除しないため、それ以外の手順で作った子 cgroup は
+    /// 回収されない。
     pub fn prepare(&self, name: &CgroupName) -> Result<(ContainerCgroup, Evacuated), CgroupError> {
         let me = std::process::id();
         let parent_procs = parse_procs(
@@ -1099,6 +1144,41 @@ impl DelegatedCgroup {
         self.remove_verified(child.name.as_str(), child.fd.as_fd())
     }
 
+    /// 名前で既存のコンテナ用子 cgroup を検証つきで開く（TASK-30.3・別プロセスの delete 用）。
+    ///
+    /// `prepare` と同じ `ContainerCgroup` ハンドルを、作成した同一プロセス内に限らず再取得するために使う。
+    /// 存在しなければ `Ok(None)`。`O_NOFOLLOW`・O_PATH で開いて cgroup2 を確認し、euid が 0 でなければ
+    /// 所有者が euid であることも確かめる（他主体が作った同名ディレクトリを採用しない。不一致は
+    /// `PermissionDenied`）。返すハンドルの `parent_id` は本スコープの親で、[`Self::remove_child`] の
+    /// 親照合を通る。開いた後の差し替えは `remove_verified` の同一性確認が検出する。
+    pub fn open_child(&self, name: &CgroupName) -> Result<Option<ContainerCgroup>, CgroupError> {
+        let step = CgroupStep::Cleanup;
+        let fd = match open_cgroup_dir(step, self.fd.as_fd(), name.as_str()) {
+            Ok(fd) => fd,
+            Err(e) if e.code == ErrorCode::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let euid = sys::effective_uid();
+        if euid != 0 {
+            let dup = fd
+                .try_clone()
+                .map_err(|e| io_error(step, "dup container cgroup", &e))?;
+            if owner_uid(step, dup, "stat container cgroup")? != euid {
+                return Err(CgroupError::new(
+                    ErrorCode::PermissionDenied,
+                    step,
+                    "container cgroup is not owned by the effective user",
+                ));
+            }
+        }
+        let parent_id = dir_identity(step, self.fd.as_fd(), "stat parent cgroup")?;
+        Ok(Some(ContainerCgroup {
+            name: name.clone(),
+            fd,
+            parent_id,
+        }))
+    }
+
     /// 親直下の `name` を、保持 fd `held` と同一の cgroup であることを確かめてから削除し、削除済みを確認する。
     /// `remove_child` と `prepare` の巻き戻し（コンテナ用子 cgroup・新規作成した退避リーフ）が共用する。
     ///
@@ -1134,6 +1214,55 @@ impl DelegatedCgroup {
             Err(e) => Err(sys_error(step, "confirm removal via held cgroup.events", e)),
         }
     }
+}
+
+/// `oci_runtime::delete` が使う cgroup 削除（TASK-30.3・OCI-6）。対象は `fc-<id>@<instance>`（CORE-3 で作った子）だけ。
+///
+/// 待機を伴わないファイル I/O のみのためタイムアウトは持たない（REPAIR-5 の対象外）。
+impl ContainerCgroupRemover for DelegatedCgroup {
+    /// 検出した委譲パス（[`DelegatedCgroup::path`]。ルートは `"/"`）を [`CgroupScope`] にして返す。
+    ///
+    /// 要素は `detect` で検証済み（`validate_component` と [`CgroupScope`] は同じ要素規則）のため、
+    /// 失敗するのは全体長が `MAX_CGROUP_SCOPE_BYTES` を超える場合だけである。その場合は記録と照合
+    /// できないので `InvalidArgument` を返す（delete は状態記録を削除しない）。
+    fn scope(&self) -> Result<CgroupScope, TraitError> {
+        CgroupScope::new(&self.path.display())
+    }
+
+    fn remove(
+        &self,
+        id: &ContainerId,
+        instance: StateRevision,
+    ) -> Result<CgroupRemoval, TraitError> {
+        // 名前を作れない（長さ超過）cgroup は `prepare` に渡す名前も同じ規則で作れないため存在し得ない。
+        // 失敗にすると該当レコードが永久に削除不能になるので NotPresent とする。
+        let Ok(name) = CgroupName::for_instance(id, instance) else {
+            return Ok(CgroupRemoval::NotPresent);
+        };
+        match self.open_child(&name).map_err(removal_error)? {
+            None => Ok(CgroupRemoval::NotPresent),
+            Some(child) => {
+                match self.remove_child(&child) {
+                    Ok(()) => Ok(CgroupRemoval::Removed),
+                    // open_child の後に並行 delete 等で既に消えた。目的の状態（cgroup 無し）に
+                    // 到達済みなので成功扱いにする（OCI-6。TraitError にするとレコードが残る）。
+                    Err(e) if e.code == ErrorCode::NotFound => Ok(CgroupRemoval::NotPresent),
+                    Err(e) => Err(removal_error(e)),
+                }
+            }
+        }
+    }
+}
+
+/// `CgroupError` を `TraitError` へ写す。`code` だけを保ち、メッセージは固定文言にする
+/// （errno・パスを `oci_runtime::delete` の呼び出し元へ漏らさない）。
+fn removal_error(e: CgroupError) -> TraitError {
+    let message = match e.code {
+        ErrorCode::FailedPrecondition => "container cgroup is not empty or changed; retry",
+        ErrorCode::PermissionDenied => "container cgroup is not owned by the effective user",
+        _ => "failed to remove container cgroup",
+    };
+    TraitError::new(e.code, message)
 }
 
 /// ディレクトリ・`cgroup.procs`・`cgroup.subtree_control` の所有者がすべて `euid` であること
@@ -1937,5 +2066,70 @@ mod tests {
         );
         assert!(r.is_err());
         assert_eq!(read(&tmp, "target"), "untouched");
+    }
+
+    /// OCI-6・TASK-30.3: cgroup 削除の失敗は `code` を保ち、errno・パスを含まない固定文言へ写す。
+    #[test]
+    fn oci6_removal_error_keeps_code_and_hides_errno() {
+        let busy = CgroupError::new(
+            ErrorCode::FailedPrecondition,
+            CgroupStep::Cleanup,
+            "fc-c1: errno 16",
+        );
+        let mapped = removal_error(busy);
+        assert_eq!(mapped.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            mapped.message(),
+            "container cgroup is not empty or changed; retry"
+        );
+        let other = removal_error(CgroupError::new(
+            ErrorCode::Internal,
+            CgroupStep::Cleanup,
+            "/sys/fs/cgroup/x: errno 5",
+        ));
+        assert_eq!(other.code(), ErrorCode::Internal);
+        assert_eq!(other.message(), "failed to remove container cgroup");
+        assert!(!other.message().contains("errno"));
+    }
+
+    /// OCI-6・TASK-30.3: instance つきの名前は `fc-<id>@<n>` で、同じ ID でも instance が違えば別名になり、
+    /// instance を持たない `fc-<id>`・退避リーフとも重ならない。255 バイトを超えると `InvalidArgument`。
+    #[test]
+    fn oci6_task30_3_cgroup_name_for_instance() {
+        let id = ContainerId::new("x").unwrap();
+        let r7 = CgroupName::for_instance(&id, StateRevision::from_raw(7)).unwrap();
+        assert_eq!(r7.as_str(), "fc-x@7");
+        let r8 = CgroupName::for_instance(&id, StateRevision::from_raw(8)).unwrap();
+        assert_eq!(r8.as_str(), "fc-x@8");
+        assert_ne!(r7, r8);
+        assert_ne!(r7, CgroupName::new(&id).unwrap());
+        // ID に `-` を含んでも、区切りの `@` は ID の許容文字に無いので組の取り違えが起きない。
+        let dashed = ContainerId::new("x-7").unwrap();
+        assert_eq!(
+            CgroupName::for_instance(&dashed, StateRevision::from_raw(0))
+                .unwrap()
+                .as_str(),
+            "fc-x-7@0"
+        );
+        // 退避リーフと同名の ID も instance つきなら衝突しない。
+        let runtime = ContainerId::new("runtime").unwrap();
+        assert_eq!(
+            CgroupName::for_instance(&runtime, StateRevision::from_raw(1))
+                .unwrap()
+                .as_str(),
+            "fc-runtime@1"
+        );
+        let max = u64::MAX;
+        let fits = ContainerId::new("a".repeat(255 - 3 - 1 - max.to_string().len())).unwrap();
+        assert_eq!(
+            CgroupName::for_instance(&fits, StateRevision::from_raw(max))
+                .unwrap()
+                .as_str()
+                .len(),
+            255
+        );
+        let over = ContainerId::new("a".repeat(252)).unwrap();
+        let err = CgroupName::for_instance(&over, StateRevision::from_raw(0)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 }

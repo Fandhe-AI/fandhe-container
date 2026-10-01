@@ -2,16 +2,26 @@
 //!
 //! # 役割と呼び出し元
 //!
-//! 停止済み（または未起動）のコンテナの状態記録を `StateStore` から削除する。将来の plugin 側
+//! 停止済み（または未起動）のコンテナの cgroup（CORE-3）と状態記録を削除する（TASK-30.2・TASK-30.3）。
+//! 状態記録の削除は `StateStore`（ファイルベース実装では `<id>/state.json` と空の `<id>/`。OCI-5）が担い、
+//! cgroup の削除は依存注入された [`ContainerCgroupRemover`] が担う。将来の plugin 側
 //! `ContainerRuntime::delete` 実装・CLI が呼び出し元になる。`ContainerRuntime` の実装は plugin 側に置く
-//! （PLUG-1）ため、create / kill と同じく `StateStore` と `OpRecorder` を依存注入で受ける自由関数とした。
+//! （PLUG-1）ため、create / kill と同じく `StateStore`・`OpRecorder`・cgroup 削除を依存注入で受ける自由関数とした。
+//! cgroup 削除の本番実装は Linux 限定の `cgroups::DelegatedCgroup`（`ContainerCgroupRemover` を実装）で、
+//! 本モジュールは Linux 固有の型に依存しない（3 OS でビルドする。CLI-1）。
 //!
 //! # 処理順（ERR-2・REPAIR-4）
 //!
 //! 1. 操作名 `delete` で `OpRecorder` に記録する（全終了経路）
 //! 2. `StateStore::get`。未 create または削除済みの ID は `NotFound`（二重 delete の 2 回目も同じ）
-//! 3. 状態の確認（下表）。生きている可能性がある状態は fail-closed で拒否する
-//! 4. `StateStore::delete` を get で得た revision つきで呼ぶ（楽観的排他）。revision 不一致
+//! 3. 状態の確認（下表）。生きている可能性がある状態は fail-closed で拒否する（拒否した状態では cgroup に触れない）
+//! 4. cgroup の削除（TASK-30.3・OCI-6）。レコードに cgroup の配置（[`StateRecord::cgroup`]）が
+//!    記録されていなければ cgroup を作っていないので触れずに手順 5 へ進む。記録されていれば、
+//!    `ContainerCgroupRemover::scope` が記録のスコープと一致することを確かめ（不一致は `FailedPrecondition` で、
+//!    cgroup にもレコードにも触れない）、revision を再確認してから、記録された instance で
+//!    `ContainerCgroupRemover::remove` を呼ぶ。`Removed` / `NotPresent` は成功として次へ進み、エラーはそのまま
+//!    返してレコードを削除しない
+//! 5. `StateStore::delete` を get で得た revision つきで呼ぶ（楽観的排他）。revision 不一致
 //!    （`FailedPrecondition`）なら get を 1 回だけやり直し、`NotFound` なら並行する delete が先に削除
 //!    したとみなして `NotFound`、レコードが残っていれば再試行を促す `FailedPrecondition` を返す
 //!
@@ -24,8 +34,37 @@
 //! | `Running` | なし（中断された start の予約） | `FailedPrecondition` | 同左 |
 //! | `Creating` | - | `FailedPrecondition` | 同左 |
 //!
+//! # cgroup を先に消す理由（OCI-6・CORE-3）
+//!
+//! cgroup を先に消すので、削除に失敗したとき（孤児プロセスが残って空でない場合は `FailedPrecondition`）も
+//! レコードが残り、再実行できる（fail-closed）。逆順にすると、cgroup の削除に失敗した時点で再試行の
+//! 手掛かりが消え、cgroup がリークする。cgroup を消した後で手順 5 が revision 不一致になっても、再実行時の
+//! remover は `NotPresent` を返すため冪等である。
+//!
+//! # 委譲スコープの照合（OCI-6・CORE-3）
+//!
+//! remover は自分の委譲スコープの下でコンテナ用 cgroup を探すため、create と別の委譲スコープから呼ばれると
+//! 実在する cgroup を見つけられず `NotPresent` を返す。照合なしにそれを成功扱いにすると、cgroup を
+//! 残したまま再試行の手掛かりである状態記録だけを消してしまう。そこで作成時のスコープを状態に記録し
+//! （`CreateStateRequest::with_cgroup_scope`）、削除側のスコープが一致したときだけ `NotPresent` を
+//! 「cgroup 無し」の確認として扱う。一致しなければ正しいスコープでの再実行を促す
+//! `FailedPrecondition` を返し、状態記録は残す（fail-closed）。
+//!
+//! # 削除・再作成との競合（OCI-6・CORE-2）
+//!
+//! cgroup の削除は名前指定（`unlinkat`）で、`StateStore` の楽観的排他とは原子的に組み合わせられない。
+//! そこでコンテナ用 cgroup の名前に、レコードの create で割り当てた revision（instance。[`StateRecord::cgroup`]）
+//! を含める（`fc-<id>@<instance>`）。revision はストア全体で再利用されないため、同じ ID が削除・再作成されると
+//! 新しいコンテナの cgroup は別の名前になる。古いレコードを読んだ delete が消せるのは、そのレコードの
+//! instance の名前（既に消えていれば `NotPresent`）だけで、再作成後のコンテナの cgroup には届かない。
+//! 手順 4 の revision 再確認は無駄な cgroup 操作を省く早期終了で、この安全性の根拠ではない。
+//!
 //! # 安全性（SEC-1・CORE-1）
 //!
+//! - start との競合: 削除できる状態は `Stopped` と pid のない `Created` だけである。並行する start が予約した
+//!   あとで子 cgroup にプロセスが参加済みなら cgroup は空でないため削除できず（`FailedPrecondition`）、
+//!   空の段階で消された場合は子の参加（fd 経由の `cgroup.procs` 書き込み）が失敗して start は fail-closed で
+//!   終わる。生きているプロセスの cgroup を消す経路は無い
 //! - 記録された pid の生存確認（`kill(pid, 0)`・`/proc`）はしない。PID 再利用の恐れがあるため、判定の
 //!   正は `StateStore` の状態とする。kill は状態を更新しないので、kill 直後は supervisor（TASK-157）が
 //!   Stopped へ遷移させるまで Running のままで、その間の delete は `FailedPrecondition` になる（意図した挙動）
@@ -40,11 +79,12 @@
 //!
 //! # 到達範囲（REPAIR-3）
 //!
-//! - 本関数が解放するのは `StateStore` のレコードだけ。状態ファイル（ファイルベース実装）の削除確認と
-//!   cgroup の削除は TASK-30.3・TASK-32（CORE-3）、OCI-7 の参照テーブルからの参照解除は TASK-183
-//!   （`StateStore` 削除の後に組み込む予定）で、いずれも未実装。子 cgroup の削除 API
-//!   （`cgroups::DelegatedCgroup::remove_child`。Linux 限定・TASK-32.1）はあるが、create / start が
-//!   まだ cgroup を作らない（起動フローへの組み込みは TASK-32.4）ため delete からは呼ばない（結線は TASK-30 系）
+//! - 本関数が解放するのは cgroup（[`ContainerCgroupRemover`]）と `StateStore` のレコード（ファイルベース実装では
+//!   状態ファイル）である。OCI-7 の参照テーブルからの参照解除は TASK-183（`StateStore` 削除の後に組み込む
+//!   予定）で未実装
+//! - 本番の呼び出し元（CLI / plugin / supervisor）が `DelegatedCgroup::detect` で得たスコープを渡す結線と、
+//!   本番の create がスコープを記録する結線（`oci_runtime::create` は記録しない）は未実装（create / start が
+//!   本番ではまだ cgroup を作らないため。TASK-29 / TASK-157 系）
 //! - `force`（停止してから削除。`ContainerRuntime::delete` の契約）は stop が未実装のため、生きている
 //!   可能性のある状態では `Unimplemented` で拒否する
 //!
@@ -52,14 +92,59 @@
 
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
-    ContainerState, DeleteRequest, DeleteResponse, DeleteStateRequest, ErrorCode, GetStateRequest,
-    StateRecord, StateStore, TraitError,
+    CgroupScope, ContainerId, ContainerState, DeleteRequest, DeleteResponse, DeleteStateRequest,
+    ErrorCode, GetStateRequest, StateRecord, StateRevision, StateStore, TraitError,
 };
 
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
 const DELETE_OP_NAME: &str = "delete";
 
-/// 停止済みまたは未起動のコンテナの状態記録を削除する。
+/// [`ContainerCgroupRemover::remove`] の結果（将来の拡張に備え非網羅）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CgroupRemoval {
+    /// 対応する cgroup を削除した。
+    Removed,
+    /// 対応する cgroup が存在しなかった（削除済み・未作成。成功扱い）。
+    NotPresent,
+}
+
+/// コンテナ用 cgroup の削除（CORE-3・OCI-6・TASK-30.3）。[`delete`] が状態記録の削除の前に呼ぶ。
+///
+/// 本番実装は Linux 限定の `cgroups::DelegatedCgroup`。呼び出し元（CLI / plugin / supervisor）が検出した
+/// 委譲スコープを渡す。契約:
+///
+/// - 対象は `id` と instance（状態記録の create で割り当てた revision）に対応する、このランタイムが CORE-3 で
+///   作ったコンテナ用子 cgroup（Linux では `fc-<id>@<instance>`）だけである。同じ ID でも instance が違う
+///   cgroup（削除・再作成後のコンテナ）には触れない
+/// - [`Self::scope`] は `remove` が探索する委譲スコープを、[`CgroupScope`] の正規形で返す。[`delete`] は
+///   これを状態に記録されたスコープと照合し、一致したときだけ `remove` を呼ぶ
+/// - 存在しなければ [`CgroupRemoval::NotPresent`] を返す（成功扱い。再実行の冪等性のため）。`NotPresent` は
+///   [`Self::scope`] の配下に無いことだけを意味する
+/// - プロセスが残っていて空でない場合は [`ErrorCode::FailedPrecondition`] を返す
+/// - 待機を伴わないファイル I/O（`openat` / `unlinkat` / `fstat`）だけで完結する。そのため
+///   タイムアウトは持たない（REPAIR-5 の対象外）
+/// - エラーのメッセージにパス・errno を含めない（`code` だけを機械可読な判定に使う）
+pub trait ContainerCgroupRemover: Send + Sync {
+    /// `remove` が対象とする委譲スコープ（コンテナ用子 cgroup の親）を返す。
+    ///
+    /// 正規形にできない場合はエラーを返す（[`delete`] は照合できないため状態記録を削除しない）。
+    fn scope(&self) -> Result<CgroupScope, TraitError>;
+
+    /// `id` と `instance`（[`crate::traits::CgroupPlacement::instance`]）に対応する cgroup を削除する。
+    fn remove(
+        &self,
+        id: &ContainerId,
+        instance: StateRevision,
+    ) -> Result<CgroupRemoval, TraitError>;
+}
+
+/// 停止済みまたは未起動のコンテナの cgroup と状態記録を削除する。
+///
+/// 状態の確認後、`cgroups` で cgroup を削除してから状態記録を削除する（順序の根拠はモジュール doc）。
+/// cgroup の削除に失敗した場合はそのエラーを返し、状態記録は残す。レコードに cgroup スコープが
+/// 記録されていなければ cgroup には触れず、記録されたスコープと `cgroups.scope()` が一致しなければ
+/// [`ErrorCode::FailedPrecondition`] を返して cgroup にも状態記録にも触れない。
 ///
 /// 未 create・削除済みの ID は [`ErrorCode::NotFound`]（二重 delete は 2 回目が `NotFound`）、
 /// 生きている可能性のある状態は [`ErrorCode::FailedPrecondition`]、`force` で生きているコンテナを
@@ -68,15 +153,45 @@ const DELETE_OP_NAME: &str = "delete";
 pub fn delete(
     store: &dyn StateStore,
     recorder: &OpRecorder,
+    cgroups: &dyn ContainerCgroupRemover,
     req: &DeleteRequest,
 ) -> Result<DeleteResponse, TraitError> {
     let name = OpName::new(DELETE_OP_NAME)?;
-    recorder.record_op(&name, || delete_inner(store, req))
+    recorder.record_op(&name, || delete_inner(store, cgroups, req))
 }
 
-fn delete_inner(store: &dyn StateStore, req: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+fn delete_inner(
+    store: &dyn StateStore,
+    cgroups: &dyn ContainerCgroupRemover,
+    req: &DeleteRequest,
+) -> Result<DeleteResponse, TraitError> {
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     check_deletable(&record, req.force())?;
+    // 配置の記録が無いレコードは cgroup を作っていない（`StateRecord::cgroup`）ので触れない。
+    if let Some(placement) = record.cgroup() {
+        // 別の委譲スコープでの `NotPresent` は「cgroup 無し」の確認にならない（モジュール doc
+        // 「委譲スコープの照合」）。一致しなければ cgroup にもレコードにも触れずに返す。
+        if cgroups.scope()? != *placement.scope() {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "delegated cgroup scope does not match the recorded scope",
+            ));
+        }
+        // revision が変わっていれば cgroup に触れず再試行を促す早期終了。再作成後のコンテナの cgroup を
+        // 消さないことは、instance を含む名前の一意性で保証する（モジュール doc「削除・再作成との競合」）。
+        let current = store.get(&GetStateRequest::new(req.id().clone()))?;
+        if current.revision() != record.revision() {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "container state changed during delete; retry",
+            ));
+        }
+        // Removed / NotPresent はどちらも記録されたスコープ・instance で「cgroup が無い」状態に到達したので
+        // 次へ進む。失敗はレコードを残して返す。
+        match cgroups.remove(req.id(), placement.instance())? {
+            CgroupRemoval::Removed | CgroupRemoval::NotPresent => {}
+        }
+    }
     let delete_req = DeleteStateRequest::new(req.id().clone(), record.revision());
     match store.delete(&delete_req) {
         Ok(_) => Ok(DeleteResponse::new()),
@@ -127,8 +242,8 @@ fn check_deletable(record: &StateRecord, force: bool) -> Result<(), TraitError> 
 mod tests {
     use super::*;
     use crate::traits::{
-        ContainerId, ContainerStatus, CreateStateRequest, DeleteStateResponse, ListStateRequest,
-        StateList, StateRevision, UpdateStateRequest,
+        CgroupPlacement, ContainerId, ContainerStatus, CreateStateRequest, DeleteStateResponse,
+        ListStateRequest, StateList, StateRevision, UpdateStateRequest,
     };
     use std::collections::HashMap;
     use std::num::NonZeroU32;
@@ -145,6 +260,11 @@ mod tests {
         /// Some なら最初の delete の照合前に、同じ ID を別クライアントが削除してこの状態で再作成した
         /// ことを再現する（get と delete の間の削除・再作成の競合）。
         recreate_before_delete: Mutex<Option<ContainerStatus>>,
+        /// Some なら 2 回目の get の前に、同じ ID を別クライアントが削除してこの状態で再作成した
+        /// ことを再現する（最初の get と cgroup 削除前の revision 再確認の間の削除・再作成の競合）。
+        recreate_before_second_get: Mutex<Option<ContainerStatus>>,
+        /// get の呼び出し回数。
+        gets: Mutex<u32>,
         /// true なら delete で常に revision 不一致を返す。
         stale_delete: bool,
         /// stale_delete 時に delete の中でレコードを消す（並行する delete の再現）。
@@ -156,6 +276,17 @@ mod tests {
             let s = Self::default();
             s.create(
                 &CreateStateRequest::new(status, std::env::temp_dir().join("b")).expect("req"),
+            )
+            .expect("create");
+            s
+        }
+        /// cgroup スコープ `scope` を記録したレコードを 1 件持つストア（TASK-30.3）。
+        fn with_scope(status: ContainerStatus, scope: &str) -> Self {
+            let s = Self::default();
+            s.create(
+                &CreateStateRequest::new(status, std::env::temp_dir().join("b"))
+                    .expect("req")
+                    .with_cgroup_scope(CgroupScope::new(scope).expect("scope")),
             )
             .expect("create");
             s
@@ -180,11 +311,13 @@ mod tests {
             if records.contains_key(req.id()) {
                 return Err(TraitError::new(ErrorCode::AlreadyExists, "exists"));
             }
-            let record = StateRecord::new(
-                req.status().clone(),
-                req.bundle().to_path_buf(),
-                self.allocate_revision(),
-            )?;
+            let revision = self.allocate_revision();
+            let mut record =
+                StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
+            // `StateStore` の契約 8: instance はこの create で割り当てた revision。
+            if let Some(scope) = req.cgroup_scope() {
+                record = record.with_cgroup(CgroupPlacement::new(scope.clone(), revision));
+            }
             records.insert(req.id().clone(), record.clone());
             Ok(record)
         }
@@ -192,6 +325,29 @@ mod tests {
             Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
         }
         fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            let nth = {
+                let mut gets = self.gets.lock().unwrap_or_else(|e| e.into_inner());
+                *gets += 1;
+                *gets
+            };
+            if nth == 2 {
+                let recreate = self
+                    .recreate_before_second_get
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                if let Some(status) = recreate {
+                    self.records
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(req.id());
+                    self.create(
+                        &CreateStateRequest::new(status, std::env::temp_dir().join("b2"))
+                            .expect("req")
+                            .with_cgroup_scope(CgroupScope::new(SCOPE).expect("scope")),
+                    )?;
+                }
+            }
             self.records
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -249,11 +405,96 @@ mod tests {
         Some(NonZeroU32::new(n).expect("pid"))
     }
 
-    fn run(store: &MemStateStore, id: &str, force: bool) -> Result<DeleteResponse, TraitError> {
+    /// テストで記録する委譲スコープ（`RecordingRemover` の既定スコープと同じ）。
+    const SCOPE: &str = "/user.slice/user-1000.slice/a.scope";
+
+    /// テスト専用の記録用 `ContainerCgroupRemover`。`remove` に渡された ID・instance と `scope` の呼び出し回数を
+    /// 記録し、決まった結果を返す。
+    struct RecordingRemover {
+        calls: Mutex<Vec<ContainerId>>,
+        instances: Mutex<Vec<StateRevision>>,
+        scope_calls: Mutex<u32>,
+        scope: Result<CgroupScope, TraitError>,
+        result: Mutex<Result<CgroupRemoval, TraitError>>,
+    }
+
+    impl RecordingRemover {
+        fn returning(result: Result<CgroupRemoval, TraitError>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                instances: Mutex::new(Vec::new()),
+                scope_calls: Mutex::new(0),
+                scope: CgroupScope::new(SCOPE),
+                result: Mutex::new(result),
+            }
+        }
+        /// 委譲スコープを差し替える（`Err` は `scope` の失敗を再現する）。
+        fn in_scope(mut self, scope: Result<CgroupScope, TraitError>) -> Self {
+            self.scope = scope;
+            self
+        }
+        fn scope_calls(&self) -> u32 {
+            *self.scope_calls.lock().unwrap_or_else(|e| e.into_inner())
+        }
+        fn removed() -> Self {
+            Self::returning(Ok(CgroupRemoval::Removed))
+        }
+        fn calls(&self) -> Vec<ContainerId> {
+            self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+        fn instances(&self) -> Vec<StateRevision> {
+            self.instances
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    impl ContainerCgroupRemover for RecordingRemover {
+        fn scope(&self) -> Result<CgroupScope, TraitError> {
+            *self.scope_calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            self.scope.clone()
+        }
+        fn remove(
+            &self,
+            id: &ContainerId,
+            instance: StateRevision,
+        ) -> Result<CgroupRemoval, TraitError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(id.clone());
+            self.instances
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(instance);
+            self.result
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    fn run_with(
+        store: &MemStateStore,
+        remover: &RecordingRemover,
+        id: &str,
+        force: bool,
+    ) -> Result<DeleteResponse, TraitError> {
         delete(
             store,
             &OpRecorder::new(),
+            remover,
             &DeleteRequest::new(cid(id)).with_force(force),
+        )
+    }
+
+    fn run(store: &MemStateStore, id: &str, force: bool) -> Result<DeleteResponse, TraitError> {
+        run_with(
+            store,
+            &RecordingRemover::returning(Ok(CgroupRemoval::NotPresent)),
+            id,
+            force,
         )
     }
 
@@ -411,17 +652,290 @@ mod tests {
         assert_eq!(rec.revision(), StateRevision::from_raw(2));
     }
 
+    /// OCI-6・CORE-3（AC2）: Stopped は cgroup 削除がちょうど 1 回、正しい ID で呼ばれ、レコードも消える。
+    #[test]
+    fn oci6_delete_stopped_removes_cgroup_then_record() {
+        let store = MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+        let remover = RecordingRemover::removed();
+        run_with(&store, &remover, "c1", false).expect("delete");
+        assert_eq!(remover.calls(), vec![cid("c1")]);
+        // instance はレコードの create で割り当てた revision（`fc-c1@1` を対象にする）。
+        assert_eq!(remover.instances(), vec![StateRevision::from_raw(1)]);
+        assert!(!store.has("c1"));
+    }
+
+    /// OCI-6: pid のない Created でも呼ばれ、記録と同じスコープでの `NotPresent` なら成功する。
+    #[test]
+    fn oci6_delete_created_without_pid_calls_remover() {
+        let store = MemStateStore::with_scope(ContainerStatus::created(cid("c1"), None), SCOPE);
+        let remover = RecordingRemover::returning(Ok(CgroupRemoval::NotPresent));
+        run_with(&store, &remover, "c1", false).expect("delete");
+        assert_eq!(remover.calls(), vec![cid("c1")]);
+        assert!(!store.has("c1"));
+    }
+
+    /// CORE-2: 拒否される状態では cgroup に触れない。
+    #[test]
+    fn core2_delete_rejected_states_do_not_touch_cgroup() {
+        let cases = [
+            (ContainerStatus::running(cid("c1"), pid(4242)), false),
+            (ContainerStatus::running(cid("c1"), None), false),
+            (ContainerStatus::created(cid("c1"), pid(11)), false),
+            (ContainerStatus::creating(cid("c1")), false),
+            (ContainerStatus::running(cid("c1"), pid(4242)), true),
+        ];
+        for (status, force) in cases {
+            let store = MemStateStore::with_scope(status, SCOPE);
+            let remover = RecordingRemover::removed();
+            run_with(&store, &remover, "c1", force).expect_err("rejected");
+            assert_eq!(remover.calls(), Vec::<ContainerId>::new());
+            assert_eq!(remover.scope_calls(), 0);
+            assert!(store.has("c1"));
+        }
+    }
+
+    /// OCI-6: 未 create の ID は `NotFound` で、cgroup には触れない。
+    #[test]
+    fn oci6_delete_not_found_does_not_call_remover() {
+        let store = MemStateStore::default();
+        let remover = RecordingRemover::removed();
+        let err = run_with(&store, &remover, "missing", false).expect_err("not found");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(remover.calls(), Vec::<ContainerId>::new());
+    }
+
+    /// CORE-2・OCI-6: cgroup の削除に失敗したら code をそのまま返し、レコードと revision は変わらない。
+    #[test]
+    fn core2_delete_cgroup_failure_keeps_record() {
+        let status = ContainerStatus::stopped(cid("c1"), Some(0));
+        let store = MemStateStore::with_scope(status.clone(), SCOPE);
+        let remover = RecordingRemover::returning(Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "container cgroup is not empty or changed; retry",
+        )));
+        let recorder = OpRecorder::new();
+        let err = delete(&store, &recorder, &remover, &DeleteRequest::new(cid("c1")))
+            .expect_err("cgroup busy");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "container cgroup is not empty or changed; retry"
+        );
+        let rec = store.get(&GetStateRequest::new(cid("c1"))).expect("kept");
+        assert_eq!(rec.status(), &status);
+        assert_eq!(rec.revision(), StateRevision::from_raw(1));
+        let stats = recorder
+            .snapshot_op(&OpName::new("delete").expect("name"))
+            .expect("recorded");
+        assert_eq!((stats.success(), stats.failure()), (0, 1));
+    }
+
+    /// CORE-2・OCI-6: revision 不一致で失敗した後の再実行は、remover が `NotPresent` を返すので冪等に成功する。
+    #[test]
+    fn core2_delete_retry_after_record_race_is_idempotent() {
+        let mut store =
+            MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+        store.stale_delete = true;
+        let remover = RecordingRemover::returning(Ok(CgroupRemoval::Removed));
+        run_with(&store, &remover, "c1", false).expect_err("stale");
+        store.stale_delete = false;
+        *remover.result.lock().unwrap_or_else(|e| e.into_inner()) = Ok(CgroupRemoval::NotPresent);
+        run_with(&store, &remover, "c1", false).expect("retry");
+        assert_eq!(remover.calls(), vec![cid("c1"), cid("c1")]);
+        assert_eq!(
+            remover.instances(),
+            vec![StateRevision::from_raw(1), StateRevision::from_raw(1)]
+        );
+        assert!(!store.has("c1"));
+    }
+
     /// REPAIR-4: 成功と失敗が 1 件ずつ操作名 `delete` で記録される。
     #[test]
     fn repair4_delete_records_success_and_failure() {
-        let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
+        let store = MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
         let recorder = OpRecorder::new();
         let req = DeleteRequest::new(cid("c1"));
-        delete(&store, &recorder, &req).expect("ok");
-        delete(&store, &recorder, &req).expect_err("ng");
+        let remover = RecordingRemover::removed();
+        delete(&store, &recorder, &remover, &req).expect("ok");
+        delete(&store, &recorder, &remover, &req).expect_err("ng");
         let stats = recorder
             .snapshot_op(&OpName::new("delete").expect("name"))
             .expect("recorded");
         assert_eq!((stats.success(), stats.failure()), (1, 1));
+    }
+
+    /// OCI-6・CORE-3（TASK-30.3）: 記録と異なる委譲スコープからの delete は `FailedPrecondition` で、
+    /// cgroup の削除を呼ばず、レコードと revision を残す（別スコープでの `NotPresent` を「cgroup 無し」と
+    /// 誤認して状態記録だけを消さない）。正しいスコープでの再実行は成功する。
+    #[test]
+    fn oci6_task30_3_delete_rejects_mismatched_scope_and_keeps_record() {
+        let status = ContainerStatus::stopped(cid("c1"), Some(0));
+        let store = MemStateStore::with_scope(status.clone(), SCOPE);
+        let other = RecordingRemover::returning(Ok(CgroupRemoval::NotPresent))
+            .in_scope(CgroupScope::new("/user.slice/user-1000.slice/b.scope"));
+        let err = run_with(&store, &other, "c1", false).expect_err("scope mismatch");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "delegated cgroup scope does not match the recorded scope"
+        );
+        assert_eq!(other.calls(), Vec::<ContainerId>::new());
+        assert_eq!(other.scope_calls(), 1);
+        let rec = store.get(&GetStateRequest::new(cid("c1"))).expect("kept");
+        assert_eq!(rec.status(), &status);
+        assert_eq!(rec.revision(), StateRevision::from_raw(1));
+        assert_eq!(
+            rec.cgroup().map(|c| (c.scope().as_str(), c.instance())),
+            Some((SCOPE, StateRevision::from_raw(1)))
+        );
+
+        let right = RecordingRemover::removed();
+        run_with(&store, &right, "c1", false).expect("delete in the recorded scope");
+        assert_eq!(right.calls(), vec![cid("c1")]);
+        assert!(!store.has("c1"));
+    }
+
+    /// OCI-6（TASK-30.3）: ルート `/` と非ルートのスコープも文字列の完全一致で照合する（接頭辞一致を
+    /// 一致とみなさない）。
+    #[test]
+    fn oci6_task30_3_scope_match_is_exact() {
+        for (recorded, actual) in [
+            ("/", SCOPE),
+            (SCOPE, "/"),
+            ("/user.slice/user-1000.slice", SCOPE),
+            (SCOPE, "/user.slice/user-1000.slice/a.scope/sub"),
+        ] {
+            let store =
+                MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), None), recorded);
+            let remover = RecordingRemover::removed().in_scope(CgroupScope::new(actual));
+            let err = run_with(&store, &remover, "c1", false).expect_err("mismatch");
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(remover.calls(), Vec::<ContainerId>::new());
+            assert!(store.has("c1"));
+        }
+    }
+
+    /// OCI-6（TASK-30.3）: remover が自分のスコープを返せない場合は照合できないため、そのエラーを返して
+    /// cgroup にもレコードにも触れない（fail-closed）。
+    #[test]
+    fn oci6_task30_3_scope_error_keeps_record() {
+        let store = MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+        let remover = RecordingRemover::removed().in_scope(Err(TraitError::new(
+            ErrorCode::Internal,
+            "failed to determine the delegated cgroup scope",
+        )));
+        let err = run_with(&store, &remover, "c1", false).expect_err("scope error");
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "failed to determine the delegated cgroup scope"
+        );
+        assert_eq!(remover.calls(), Vec::<ContainerId>::new());
+        assert!(store.has("c1"));
+    }
+
+    /// OCI-6（TASK-30.3）: cgroup スコープの記録が無いレコード（cgroup を作っていない。導入前の
+    /// 状態ファイルも同じ）は、remover の `scope` / `remove` をどちらも呼ばずに状態記録だけを消す。
+    /// remover のスコープが取れない環境でも削除できる。
+    #[test]
+    fn oci6_task30_3_record_without_scope_does_not_touch_cgroup() {
+        let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
+        let remover = RecordingRemover::removed()
+            .in_scope(Err(TraitError::new(ErrorCode::Internal, "unused")));
+        run_with(&store, &remover, "c1", false).expect("delete");
+        assert_eq!(remover.calls(), Vec::<ContainerId>::new());
+        assert_eq!(remover.scope_calls(), 0);
+        assert!(!store.has("c1"));
+    }
+
+    /// CORE-2・OCI-6: 最初の get の後に同じ ID が削除・再作成された場合、cgroup 削除の直前の revision
+    /// 再確認で検出し、新しいコンテナの cgroup に触れずに再試行を促す `FailedPrecondition` を返す。
+    #[test]
+    fn core2_delete_revision_recheck_protects_recreated_cgroup() {
+        let store = MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+        let recreated = ContainerStatus::created(cid("c1"), None);
+        *store
+            .recreate_before_second_get
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(recreated.clone());
+        let remover = RecordingRemover::removed();
+        let err = run_with(&store, &remover, "c1", false).expect_err("recreated");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "container state changed during delete; retry"
+        );
+        assert_eq!(remover.calls(), Vec::<ContainerId>::new());
+        let rec = store.get(&GetStateRequest::new(cid("c1"))).expect("kept");
+        assert_eq!(rec.status(), &recreated);
+        assert_eq!(rec.revision(), StateRevision::from_raw(2));
+    }
+
+    /// OCI-6・CORE-2（TASK-30.3）: revision 再確認の後・cgroup 削除の最中に同じ ID が削除・再作成されても、
+    /// remove が対象にするのは読んだレコードの instance（1）で、再作成後のレコードの instance（2）とは
+    /// 異なる。実 remover の対象名は `fc-c1@1` で、再作成後の `fc-c1@2` には届かない。状態記録の削除は
+    /// revision 不一致で失敗し、再作成後のレコードは残る。
+    #[test]
+    fn oci6_task30_3_stale_delete_targets_only_its_own_instance() {
+        /// `remove` の中で同じ ID のレコードを削除・再作成する（他クライアントの delete と create の再現）。
+        struct RecreatingRemover<'a> {
+            store: &'a MemStateStore,
+            instances: Mutex<Vec<StateRevision>>,
+        }
+        impl ContainerCgroupRemover for RecreatingRemover<'_> {
+            fn scope(&self) -> Result<CgroupScope, TraitError> {
+                CgroupScope::new(SCOPE)
+            }
+            fn remove(
+                &self,
+                id: &ContainerId,
+                instance: StateRevision,
+            ) -> Result<CgroupRemoval, TraitError> {
+                self.instances
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(instance);
+                self.store
+                    .records
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(id);
+                self.store.create(
+                    &CreateStateRequest::new(
+                        ContainerStatus::created(id.clone(), None),
+                        std::env::temp_dir().join("b2"),
+                    )?
+                    .with_cgroup_scope(CgroupScope::new(SCOPE)?),
+                )?;
+                Ok(CgroupRemoval::Removed)
+            }
+        }
+
+        let store = MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+        let remover = RecreatingRemover {
+            store: &store,
+            instances: Mutex::new(Vec::new()),
+        };
+        let err = delete(
+            &store,
+            &OpRecorder::new(),
+            &remover,
+            &DeleteRequest::new(cid("c1")),
+        )
+        .expect_err("record replaced");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "container state changed during delete; retry"
+        );
+        assert_eq!(
+            *remover.instances.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![StateRevision::from_raw(1)]
+        );
+        let rec = store.get(&GetStateRequest::new(cid("c1"))).expect("kept");
+        assert_eq!(
+            rec.cgroup().map(|c| c.instance()),
+            Some(StateRevision::from_raw(2))
+        );
     }
 }

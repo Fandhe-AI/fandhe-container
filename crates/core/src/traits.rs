@@ -36,8 +36,9 @@ pub use network_plugin::{
 };
 pub use state_store::{
     CgroupPlacement, CgroupScope, CreateStateRequest, DeleteStateRequest, DeleteStateResponse,
-    GetStateRequest, ListStateRequest, MAX_CGROUP_SCOPE_BYTES, MAX_CURSOR_LEN, MAX_PAGE_SIZE,
-    StateList, StateListCursor, StateRecord, StateRevision, StateStore, UpdateStateRequest,
+    GetStateRequest, HealthStatus, ListStateRequest, MAX_CGROUP_SCOPE_BYTES, MAX_CURSOR_LEN,
+    MAX_PAGE_SIZE, StateList, StateListCursor, StateRecord, StateRevision, StateStore,
+    SupervisionState, UpdateStateRequest,
 };
 pub use types::{ContainerId, ErrorCode, TraitError};
 pub use volume_provider::{

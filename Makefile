@@ -401,7 +401,8 @@ fio-baseline-ratio: ## fio ベースライン比を算出する（BASELINE/CANDI
 # create からプロセス実行開始（state が running / stopped を返した時点）までの時間の
 # 中央値を計測する。own 実装の実測は CLI（TASK-79）
 # 提供後に人間が #213（TASK-46.h1）で行う実機前提（ランタイム・bundle・場合により root）
-# のため `make ci` には含めない。自己テストはスタブランタイムで完結し CI に組み込み済み。
+# のため `make ci` には含めない。自己テストはスタブランタイムで完結し CI に組み込み済み
+# （計測スクリプトが単調時計として /proc/uptime を使うため Linux 限定）。
 .PHONY: startup-latency-selftest
 startup-latency-selftest: ## 起動時間計測スクリプトの自己テスト（REPAIR-12。実ランタイム不要）
 	@if ! command -v jq >/dev/null 2>&1; then \

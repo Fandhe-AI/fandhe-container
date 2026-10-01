@@ -57,7 +57,7 @@ make fio-bench-selftest     # fio 4K ランダム write ベンチスクリプト
 make fio-bench TARGET_DIR=<dir> LABEL=<label> [RUNTIME=<seconds>]  # fio 4K ランダム write ベンチを実行する（実機前提。下記「実機前提テスト」節を参照）
 make fio-baseline-ratio-selftest  # fio ベースライン比算出スクリプトの自己テスト（TASK-25.2・IO-8・REPAIR-12。実 fio 不要）
 make fio-baseline-ratio BASELINE=<results.json> CANDIDATE=<results.json>  # Docker ベースライン比（IOPS・レイテンシの倍率）を算出する（実 fio 不要。results.json は fio-randwrite-4k.sh の出力）
-make startup-latency-selftest  # 起動時間計測スクリプトの自己テスト（TASK-46.1・CORE-10・REPAIR-12。スタブランタイムで完結）
+make startup-latency-selftest  # 起動時間計測スクリプトの自己テスト（TASK-46.1・CORE-10・REPAIR-12。スタブランタイムで完結。Linux 限定）
 make startup-latency RUNTIME=<abs-path> BUNDLE=<dir> TARGET=<name> [ITERATIONS=<n>] [LABEL=<label>]  # create からプロセス実行開始（state が running / stopped を返した時点）までの起動時間の中央値を計測する（実機前提）
 make idle-memory-selftest   # アイドル時常駐メモリ計測スクリプトの自己テスト（TASK-45.1・CORE-7・SUP-1。疑似 /proc のみで実計測はしない。終了コード 0 かつ FAIL 行なし。Linux・非 root 限定で、root 実行は chmod 000 系のケースが成立しないため失敗する）
 make idle-memory [IDLE_MEMORY_TIMEOUT=<秒>]  # プロセス数・PSS・RSS を JSON 出力（Linux 限定・実機計測。timeout 付き〔既定 120 秒〕）。スクリプトの終了コード: 0 = 成功、1 = --expect-zero 違反（結果は公開しない）、2 = 引数・入力エラー・非 Linux・出力先エラー・timeout 配下で起動できない、3 = 計測失敗（読めない値・識別不能・timeout 超過・想定外の終了）。make は失敗時に自身は 2 で終わるため、レシピの値は `Error <n>` 行で確認する
@@ -66,8 +66,16 @@ make idle-memory [IDLE_MEMORY_TIMEOUT=<秒>]  # プロセス数・PSS・RSS を 
 - `make test-integration`: 終了コード 0 が成功基準。`notice:` 出力での成功終了は、全 crate から `tests/*.rs` が無くなった場合のフォールバック。通常は `cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server` と `cargo test -p fandhe-container-io --bins --features crash-test-server` の 2 段が実行される。`crash_safety` 等 `required-features` 付きの target は `make test`（既定 feature）では実行されず、本ターゲットと CI の `integration-test`・`rust-ci`（`--all-features`）で実行される。実行された件数は Makefile・CI が出力する `integration test targets: N` 行で確認する。`notice:` での成功終了は結合試験が 1 件も実行されていないことを意味し、`tests/*.rs` を追加・変更した PR の合格根拠にしない（冒頭の `skip:` と同じ扱い）。jq 未導入時は fail-closed で終了コード非 0 になる
 - `make bench-check-selftest` / `make bench-check`: 終了コード 0 が成功基準。`bench-check` を呼ぶ比較スクリプト（`scripts/check-bench-regression.sh`）自体の終了コードは 0（合格）/ 1（回帰検出）/ 2（入力エラー）の 3 値で、詳細は下記「タイムアウト保護された結合試験・ベンチ回帰」節 (4) を参照する。**現時点では計測対象がプレースホルダのため、`bench-check` の成功を性能回帰がない根拠として扱わない**
 - `make fio-bench-selftest`: 終了コード 0 が成功基準。`--from-json` モードと固定 fixture（`scripts/testdata/fio-bench/`）・fio スタブで完結し、実 fio は使わない。CI の `bench-regression` ジョブにも組み込まれている
-- `make startup-latency-selftest`: 終了コード 0 が成功基準。スタブランタイムで完結し実ランタイム・root は使わない。CI の `bench-regression` ジョブにも組み込まれている（TASK-46.1・CORE-10）
-- `make startup-latency`: 実機前提（OCI Runtime CLI 契約のランタイム実行ファイルと bundle が必要）。`RUNTIME`（絶対パス）・`BUNDLE`・`TARGET`（計測対象のランタイム名。出力の `target` に記録。例: `own`）未指定時は案内を出して終了コード 2 で止まる。スクリプトの終了コードは 0 / 1（ランタイム失敗・タイムアウト）/ 2（入力エラー）/ 3（前提ツール欠如）/ 4（後始末失敗）。`make ci` には含めない
+- `make startup-latency-selftest`: 終了コード 0 が成功基準。スタブランタイムで完結し実ランタイム・root は使わない。Linux 限定（計測スクリプトが単調時計として `/proc/uptime` を必須とするため、macOS 等では前提欠如で失敗する）。CI の `bench-regression` ジョブにも組み込まれている（TASK-46.1・CORE-10）
+- `make startup-latency`: 実機前提（OCI Runtime CLI 契約のランタイム実行ファイルと bundle が必要）。`RUNTIME`（絶対パス）・`BUNDLE`・`TARGET`（計測対象のランタイム名。出力の `target` に記録。例: `own`）未指定時は案内を出して終了コード 2 で止まる。Linux 限定。スクリプトの終了コードは次のとおり。
+
+  - 0: 成功
+  - 1: create / start / state の失敗・タイムアウト、実行開始（state が running / stopped）を期限内に観測できない、ID が既に使用中、計測中の時計の変更を検出した
+  - 2: 入力エラー（`--output` の親から `/` までに symlink や他ユーザーが書き込めるディレクトリ〔sticky を除く〕がある場合を含む）
+  - 3: 前提欠如（`/proc/uptime`・GNU timeout / dd / ln 等）
+  - 4: 後始末失敗（作成済みコンテナを削除できない、または create が成功せず未作成を確定できない。後者では ID に操作を送らず、手動確認を促す。ERR-1 の構造化エラー〔code: NOT_FOUND〕を出さない runc 等では、create 失敗時は常に 4）
+
+  `make ci` には含めない
 - `make fio-bench`: 実機前提（fio・GNU coreutils の `timeout`・Linux ホスト）。`TARGET_DIR`・`LABEL` 未指定時は案内を出して終了コード 2 で止まる。詳細は下記「実機前提テスト」節・[docs/design/io-fio-bench.md](docs/design/io-fio-bench.md) を参照
 - `make fio-baseline-ratio-selftest`: 終了コード 0 が成功基準。固定 fixture（`scripts/testdata/fio-baseline/`）で完結し、実 fio・Docker は使わない。CI の `bench-regression` ジョブにも組み込まれている
 - `make fio-baseline-ratio`: `BASELINE`・`CANDIDATE`（いずれも `fio-randwrite-4k.sh` の出力 JSON）未指定時は案内を出して終了コード 2 で止まる。fio・Docker を必要としないため実機前提テストではない

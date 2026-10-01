@@ -76,7 +76,7 @@ use fandhe_container_core::traits::{
     ContainerState, ContainerStatus, ErrorCode, StateRecord, SupervisionState, TraitError,
 };
 
-use crate::logs::{CaptureSummary, LogCapture, LogSink, OutputStreams};
+use crate::logs::{CaptureSummary, LogCapture, LogSink, OutputStreams, StreamSummary};
 use crate::state::SupervisedState;
 
 /// 捕捉の終端待ち（drain）の既定の上限。
@@ -514,8 +514,20 @@ pub fn monitor_with_capture(
             capture_error: None,
         });
     };
-    let drained = observed(obs, MonitorOperation::CaptureDrain, || {
-        capture.drain(config.drain_timeout())
+    // 読み取り・sink 追記の失敗は集計（StreamSummary::error_code）にだけ残り drain 自体は Ok になるため、
+    // 観測イベントには集計内の最初の失敗コードを載せる（失敗カウント・監視に現れるように。REPAIR-4）。
+    let drain_started = Instant::now();
+    let drained = capture.drain(config.drain_timeout());
+    obs.observe(&MonitorEvent {
+        operation: MonitorOperation::CaptureDrain,
+        error_code: match &drained {
+            Ok(summary) => summary
+                .stdout()
+                .and_then(StreamSummary::error_code)
+                .or_else(|| summary.stderr().and_then(StreamSummary::error_code)),
+            Err(e) => Some(e.code()),
+        },
+        elapsed: drain_started.elapsed(),
     });
     Ok(match drained {
         Ok(summary) => MonitoredWithCapture {
@@ -1377,6 +1389,40 @@ mod tests {
         );
         assert_eq!(MonitorOperation::CaptureStart.as_str(), "capture_start");
         assert_eq!(MonitorOperation::CaptureDrain.as_str(), "capture_drain");
+    }
+
+    /// REPAIR-4・TASK-157.7: sink 追記の失敗は CaptureDrain の観測イベントに失敗コードとして現れる。
+    #[test]
+    fn sup1_task157_7_sink_failure_is_reported_in_drain_event() {
+        struct FailSink;
+        impl LogSink for FailSink {
+            fn append(&self, _: crate::logs::StreamKind, _: &[u8]) -> Result<(), TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "fake sink failure"))
+            }
+        }
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = FakeProc::exiting(1, ProcessExit::Exited(0));
+        let (mut streams, _) = capture_streams(b"a\n", b"");
+        let rec = Rec(Mutex::new(Vec::new()));
+        let r = monitor_with_capture(
+            &mut s,
+            &p,
+            &mut streams,
+            Arc::new(FailSink),
+            &MonitorConfig::default(),
+            &StopToken::new(),
+            &rec,
+        )
+        .unwrap();
+        assert_eq!(
+            r.capture().unwrap().stdout().unwrap().error_code(),
+            Some(ErrorCode::Internal)
+        );
+        assert_eq!(
+            rec.0.lock().unwrap().last().copied(),
+            Some((MonitorOperation::CaptureDrain, Some(ErrorCode::Internal)))
+        );
     }
 
     /// TASK-157.7: drain_timeout の検証（0・上限超は拒否、境界は受理）。

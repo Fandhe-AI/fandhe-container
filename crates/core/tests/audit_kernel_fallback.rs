@@ -5,8 +5,8 @@
 //! - 既定のテスト集合（否定側）: 期待値を環境から決定的に導く。初期 user namespace の外では ACK が
 //!   `ECONNREFUSED` なので `KernelAuditUnavailable`、初期 namespace で `CAP_AUDIT_WRITE` が無ければ
 //!   `EPERM` なので `KernelAuditPermissionDenied`。いずれも何も書き込まない。`CAP_AUDIT_WRITE` を持つ
-//!   環境では送信するとホストの監査ログへ書き込んでしまうため、否定側テストは送信せず失敗させる
-//!   （その環境は肯定側テストの対象）
+//!   環境では送信するとホストの監査ログへ書き込んでしまうため、否定側テストは送信せず
+//!   見送る（失敗にしない。その環境は肯定側テストの対象）
 //! - 実機前提（肯定側）: `#[ignore]`。`CAP_AUDIT_WRITE` を持つ初期 user namespace でのみ実行する
 //!   （AGENTS.md「実機前提テスト」）
 
@@ -62,11 +62,14 @@ fn send() -> Result<(), AuditWriteError> {
 fn sec4_task41_5_2_real_kernel_rejects_without_privilege() {
     let initial_ns = in_initial_user_namespace();
     let cap = has_cap_audit_write();
-    assert!(
-        !(initial_ns && cap),
-        "CAP_AUDIT_WRITE in the initial user namespace would write to the host audit log; \
-         run the ignored positive test instead"
-    );
+    if initial_ns && cap {
+        // 送ると実際にホストの監査ログへ書き込んでしまうため送信せず見送る。この環境の送信経路は
+        // 実機前提の肯定側テストが検証する（AGENTS.md「実機前提テスト」）。
+        eprintln!(
+            "skipped: CAP_AUDIT_WRITE in the initial user namespace (see the ignored positive test)"
+        );
+        return;
+    }
     let err = send().unwrap_err();
     if initial_ns {
         assert_eq!(err.kind(), AuditWriteErrorKind::KernelAuditPermissionDenied);

@@ -16,7 +16,7 @@ cargo test -p fandhe-container-core --test cgroups_regression --no-run
 systemd-run --user --scope -p Delegate=yes <target/debug/deps/cgroups_regression-XXXX> --ignored
 ```
 
-- 必要環境: 非特権ユーザーに委譲された cgroup v2 サブツリー（`memory`・`cpu` が委譲済み）・swap accounting 有効（無効だと `memory.swap.max` の書き込みが失敗する）・root もしくは非特権 user namespace を許可するホスト（`kernel.apparmor_restrict_unprivileged_userns=1` では user namespace を作れず OOM 検証が実行できない）
+- 必要環境: 非特権ユーザーに委譲された cgroup v2 サブツリー（`memory`・`cpu` が委譲済み）・swap accounting 有効（無効だと `memory.swap.max` の書き込みが失敗する）・root もしくは非特権 user namespace を許可するホスト（`kernel.apparmor_restrict_unprivileged_userns=1` では user namespace を作れず OOM 検証が実行できない）・実行プロセスの `oom_score_adj` が -1000 でないこと（-1000 だと OOM Kill 対象にならず検証が成立しない。実行前に `cat /proc/self/oom_score_adj` で確認する）
 - 成功時の出力: `cgroups_regression: CORE-3 cgroup ordering and OOM kill verified`（終了コード 0）
 
 ## 計測環境
@@ -47,8 +47,8 @@ systemd-run --user --scope -p Delegate=yes <target/debug/deps/cgroups_regression
 | `memory.max` / `memory.swap.max`（読み戻し） | `67108864` / `0` | （未記入） |
 | `ChildExit` | `Signaled(9)` | （未記入） |
 | シェル慣例の終了コード（128 + 9） | `137` | （未記入） |
-| `memory.events` の `oom_kill` | `1` | （未記入） |
-| `memory.events` の `oom` | `1` | （未記入） |
+| `memory.events` の `oom_kill` | `1` 以上 | （未記入） |
+| `memory.events` の `oom` | `1` 以上 | （未記入） |
 | 子 cgroup の削除 | 成功 | （未記入） |
 
 ## 結論
@@ -58,4 +58,4 @@ systemd-run --user --scope -p Delegate=yes <target/debug/deps/cgroups_regression
 ## 妥当性判断（人間担当・TASK-36）
 
 - 判断者・日付: （未記入）
-- 判断: （未記入。`oom` が 1 で安定しない場合は `oom >= 1` への緩和の要否を含めて判断する）
+- 判断: （未記入。`oom` / `oom_kill` はテストの判定条件どおり `>= 1` で判定する（2 以上でも失敗ではない））

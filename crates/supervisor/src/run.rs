@@ -1540,6 +1540,106 @@ mod tests {
         assert_eq!(budget.live(), 0);
     }
 
+    /// REPAIR-5・TASK-157.7: 捕捉の開始後に wait が失敗して Err になっても、継続中の捕捉の取っ手が返る。
+    /// 呼び出し側は cancel で止められ、以後に届いた行は追記されず、リーダーは終了して枠を返す。
+    #[test]
+    fn sup1_task157_7_wait_failure_returns_live_capture_handle() {
+        let budget = ReaderBudget::new(1).unwrap();
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let mut streams = OutputStreams::new(&budget, Some(Box::new(reader)), None);
+        let sink = Arc::new(crate::logs::MemoryLogSink::default());
+        let mut e = monitor_with_capture(
+            &mut s,
+            &FakeProc::failing(),
+            &mut streams,
+            sink.clone(),
+            &MonitorConfig::default(),
+            &StopToken::new(),
+            &StderrLogObserver,
+        )
+        .unwrap_err();
+        assert_eq!(e.error().code(), ErrorCode::Internal);
+        assert_eq!(e.error().message(), "fake wait failure");
+        assert_eq!(e.to_string(), "INTERNAL: fake wait failure");
+        // 監視権は解放済みで、ストリームはリーダーへ移っている（取っ手が捕捉の継続を表す）。
+        assert_eq!(
+            store.rec.lock().unwrap().supervision().supervisor_pid(),
+            None
+        );
+        assert!(streams.is_empty());
+        assert_eq!(budget.live(), 1);
+
+        let live = e.take_live_capture().unwrap();
+        assert!(e.take_live_capture().is_none());
+        assert_eq!(live.cancel(), Ok(()));
+        std::io::Write::write_all(&mut writer, b"late\n").unwrap();
+        let start = Instant::now();
+        while budget.live() != 0 && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(budget.live(), 0);
+        assert!(sink.snapshot().unwrap().is_empty());
+        drop(writer);
+    }
+
+    /// REPAIR-5・TASK-157.7: 停止要求では終端待ちをせず、継続中の捕捉の取っ手を返す。
+    /// 取っ手を保持すれば捕捉は続き、後で drain して集計（1 行・2 バイト）を得られる。
+    #[test]
+    fn sup1_task157_7_stop_requested_returns_live_capture_handle() {
+        let budget = ReaderBudget::new(1).unwrap();
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let mut streams = OutputStreams::new(&budget, Some(Box::new(reader)), None);
+        let sink = Arc::new(crate::logs::MemoryLogSink::default());
+        let stop = StopToken::new();
+        stop.request_stop();
+        let mut r = monitor_with_capture(
+            &mut s,
+            &FakeProc::alive(),
+            &mut streams,
+            sink.clone(),
+            &MonitorConfig::default(),
+            &stop,
+            &StderrLogObserver,
+        )
+        .unwrap();
+        assert!(matches!(r.outcome(), MonitorOutcome::StopRequested { .. }));
+        assert!(r.capture().is_none());
+        assert!(r.capture_error().is_none());
+        let live = r.take_live_capture().unwrap();
+        assert!(r.take_live_capture().is_none());
+
+        std::io::Write::write_all(&mut writer, b"a\n").unwrap();
+        drop(writer);
+        let sum = live.drain(Duration::from_secs(10)).unwrap();
+        assert_eq!(sum.stdout().unwrap().lines(), 1);
+        assert_eq!(sum.stdout().unwrap().bytes(), 2);
+        assert_eq!(sink.snapshot().unwrap().len(), 1);
+    }
+
+    /// TASK-157.7: 終了を検知して終端待ちをした結果では、返す取っ手は無い（drain が消費済み）。
+    #[test]
+    fn sup1_task157_7_exited_returns_no_live_capture_handle() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let (mut streams, sink) = capture_streams(b"a\n", b"");
+        let mut r = monitor_with_capture(
+            &mut s,
+            &FakeProc::exiting(1, ProcessExit::Exited(0)),
+            &mut streams,
+            sink,
+            &MonitorConfig::default(),
+            &StopToken::new(),
+            &StderrLogObserver,
+        )
+        .unwrap();
+        assert_eq!(r.capture().unwrap().stdout().unwrap().lines(), 1);
+        assert!(r.take_live_capture().is_none());
+    }
+
     /// REPAIR-4・TASK-157.7: 捕捉操作が通知される。
     #[test]
     fn sup1_task157_7_observer_reports_capture_operations() {

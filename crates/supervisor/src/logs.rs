@@ -917,6 +917,28 @@ mod tests {
         assert!(gate.cancel(far()));
     }
 
+    /// REPAIR-5・TASK-157.7: cancel は EOF を待たずに捕捉を止める。以後に届いた行は追記されず、リーダーは終了して枠を返す。
+    #[test]
+    fn sup1_task157_7_cancel_stops_capture_without_eof() {
+        let budget = ReaderBudget::new(1).unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let sink = Arc::new(MemoryLogSink::default());
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{cap:?}"),
+            "LogCapture { streams: 1, cancelled: false }"
+        );
+        assert_eq!(cap.cancel(), Ok(()));
+        writer.write_all(b"late\n").unwrap();
+        assert_eq!(wait_live(&budget, 0), 0);
+        assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
+        drop(writer);
+    }
+
     /// 解放されるまで追記が戻らない sink。追記に入ったことを `entered` で知らせ、完了した行だけを `done` に残す。
     struct BlockingSink {
         entered: Mutex<mpsc::Sender<()>>,
@@ -968,6 +990,42 @@ mod tests {
         assert_eq!(budget.live(), 1);
 
         // 追記が再開しても、完了するのは実行中だった 1 行だけ。パイプを閉じなくてもリーダーは終了する。
+        release_tx.send(()).unwrap();
+        assert_eq!(wait_live(&budget, 0), 0);
+        assert_eq!(*sink.done.lock().unwrap(), vec![b"a".to_vec()]);
+        drop(writer);
+    }
+
+    /// REPAIR-5・TASK-157.7: sink の追記が止まっていると cancel は猶予（100ms）で Timeout を返す（無期限に待たない）。
+    /// 取消し自体は成立しており、後から届くのは実行中だった 1 行（"a"）だけ。
+    #[test]
+    fn sup1_task157_7_cancel_reports_timeout_if_sink_append_blocks() {
+        let budget = ReaderBudget::new(1).unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let sink = Arc::new(BlockingSink {
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+            done: Mutex::new(Vec::new()),
+        });
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        writer.write_all(b"a\nb\n").unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let start = Instant::now();
+        let err = cap.cancel().unwrap_err();
+        let waited = start.elapsed();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(
+            err.message(),
+            "timed out waiting for in-flight log append to finish"
+        );
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
         release_tx.send(()).unwrap();
         assert_eq!(wait_live(&budget, 0), 0);
         assert_eq!(*sink.done.lock().unwrap(), vec![b"a".to_vec()]);

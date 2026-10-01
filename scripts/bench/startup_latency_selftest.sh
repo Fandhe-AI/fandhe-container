@@ -44,11 +44,14 @@ pass() {
   echo "PASS: $1"
 }
 
+# 各ケースで既定として渡す引数（必須の --target）。--target 自体を検査するケースだけ空にする。
+default_args=(--target own)
+
 # 対象スクリプトを実行し、stdout・stdout+stderr・終了コードを保持する（常に 0 を返す）。
 run_target() {
   local errfile="$tmp_root/stderr.txt"
   last_rc=0
-  last_stdout="$("$bash_bin" "$target_script" "$@" 2>"$errfile")" || last_rc=$?
+  last_stdout="$("$bash_bin" "$target_script" "${default_args[@]}" "$@" 2>"$errfile")" || last_rc=$?
   last_output="${last_stdout}"$'\n'"$(cat "$errfile")"
 }
 
@@ -365,7 +368,7 @@ race_fifo="$work/race.fifo"
 reset_log
 rc=0
 started="$SECONDS"
-STUB_CREATE_FIFO="$race_fifo" timeout 60 "$bash_bin" "$target_script" --runtime "$stub" --bundle "$work/bundle" \
+STUB_CREATE_FIFO="$race_fifo" timeout 60 "$bash_bin" "$target_script" --target own --runtime "$stub" --bundle "$work/bundle" \
   --iterations 1 --warmup 0 --timeout 2 --output "$race_fifo" >"$work/fifo.stdout" 2>/dev/null || rc=$?
 elapsed=$((SECONDS - started))
 expect_eq "output-fifo-race-exit" "2" "$rc"
@@ -386,7 +389,7 @@ FAILDD
 chmod 755 "$work/faildd/dd"
 reset_log
 rc=0
-PATH="$work/faildd:$PATH" "$bash_bin" "$target_script" --runtime "$stub" --bundle "$work/bundle" \
+PATH="$work/faildd:$PATH" "$bash_bin" "$target_script" --target own --runtime "$stub" --bundle "$work/bundle" \
   --iterations 1 --warmup 0 --output "$work/partial/out.json" >"$work/partial.stdout" 2>/dev/null || rc=$?
 expect_eq "output-partial-write-exit" "2" "$rc"
 expect_eq "output-partial-write-no-file" "" "$(find "$work/partial" -mindepth 1 -print)"
@@ -404,7 +407,7 @@ FAILMKTEMP
 chmod 755 "$work/failmktemp/mktemp"
 reset_log
 rc=0
-PATH="$work/failmktemp:$PATH" "$bash_bin" "$target_script" --runtime "$stub" --bundle "$work/bundle" \
+PATH="$work/failmktemp:$PATH" "$bash_bin" "$target_script" --target own --runtime "$stub" --bundle "$work/bundle" \
   --iterations 1 --warmup 0 --output "$work/collide/out.json" >/dev/null 2>&1 || rc=$?
 expect_eq "output-staging-collision-exit" "2" "$rc"
 expect_eq "output-staging-collision-kept" "other" "$(cat "$work/collide/.startup_latency.taken")"
@@ -431,7 +434,7 @@ expect_eq "output-sticky-dir-written" "$last_stdout" "$(cat "$work/sticky/out.js
 # 回帰時に自己テスト自体が止まらないよう外側に timeout を掛ける。
 reset_log
 rc=0
-timeout 60 "$bash_bin" "$target_script" --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 \
+timeout 60 "$bash_bin" "$target_script" --target own --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 \
   --output "/$work/sticky/out2.json" >/dev/null 2>&1 || rc=$?
 expect_eq "output-double-slash-exit" "0" "$rc"
 expect_eq "output-double-slash-written" "own" "$(jq -r '.target' "$work/sticky/out2.json" 2>/dev/null)"
@@ -472,6 +475,16 @@ expect_rc "input-label-invalid" 2 --runtime "$stub" --bundle "$work/bundle" --la
 expect_rc "input-unknown-option" 2 --runtime "$stub" --bundle "$work/bundle" --bogus
 expect_rc "input-duplicate-option" 2 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --iterations 2
 expect_rc "input-value-missing" 2 --runtime "$stub" --bundle
+# --target は必須で、出力の target にそのまま記録する（Codex P2: 任意のランタイムを own と
+# 記録しない）。
+default_args=()
+expect_rc "input-target-missing" 2 --runtime "$stub" --bundle "$work/bundle"
+expect_contains "input-target-missing-error" "missing-target"
+expect_rc "input-target-invalid" 2 --runtime "$stub" --bundle "$work/bundle" --target 'run c'
+reset_log
+expect_rc "target-recorded" 0 --runtime "$stub" --bundle "$work/bundle" --target runc --iterations 1 --warmup 0
+expect_eq "target-recorded-value" "runc" "$(jq -r '.target' <<<"$last_stdout")"
+default_args=(--target own)
 expect_rc "help" 0 --help
 
 # --- 6. create / start 失敗 ---
@@ -652,7 +665,7 @@ STARTUP_LATENCY_TEST_UPTIME_FILE="$work/no-such-uptime" expect_rc "missing-monot
 # --- 9. 前提ツール欠如: jq を含まない PATH で exit 3 ---
 mkdir -p "$work/emptybin"
 rc=0
-PATH="$work/emptybin" "$bash_bin" "$target_script" --runtime "$stub" --bundle "$work/bundle" >/dev/null 2>&1 || rc=$?
+PATH="$work/emptybin" "$bash_bin" "$target_script" --target own --runtime "$stub" --bundle "$work/bundle" >/dev/null 2>&1 || rc=$?
 expect_eq "missing-jq-exit3" "3" "$rc"
 
 # --- 10. 出力が check-bench-regression.sh のスキーマと互換（機械照合） ---

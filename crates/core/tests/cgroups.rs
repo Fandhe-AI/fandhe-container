@@ -155,24 +155,6 @@ mod linux {
         let name = CgroupName::new(&id).expect("cgroup name");
         // detect / prepare / 制限設定 / join_hook は isolate より前（pivot 後はホストの cgroupfs が見えない）。
         let (container, proof) = delegated.prepare(&name).expect("prepare container cgroup");
-        let enabled = delegated
-            .enable_controllers(
-                &proof,
-                &ControllerSet::of(&[Controller::Memory, Controller::Cpu]),
-            )
-            .expect("enable memory and cpu controllers");
-        let applied = container
-            .set_memory_limits(
-                &enabled,
-                &MemoryLimits {
-                    memory_max: MemoryLimit::parse("64M").expect("memory limit"),
-                    swap_max: Some(MemoryLimit::Bytes(0)),
-                },
-            )
-            .expect("set memory limits");
-        let cpu = CpuMax::new(CpuQuota::Micros(50_000), 100_000).expect("cpu.max value");
-        let applied_cpu = container.set_cpu_max(&cpu).expect("set cpu.max");
-        let join = container.join_hook().expect("join hook");
         let dir = PathBuf::from("/sys/fs/cgroup")
             .join(delegated.path().trim_start_matches('/'))
             .join(name.as_str());
@@ -181,17 +163,37 @@ mod linux {
             delegated.path().trim_end_matches('/'),
             name.as_str()
         );
+        let cpu = CpuMax::new(CpuQuota::Micros(50_000), 100_000).expect("cpu.max value");
 
         let rootfs = make_rootfs();
-        // `launch` が panic しても（子は `ChildReaper` の drop で unwind 中に kill・回収済みなので）
-        // 子 cgroup の削除まで到達できるよう、panic を捕捉して後始末後に再送出する。
+        // 子 cgroup の作成直後から、制限設定（enable_controllers・set_memory_limits・set_cpu_max・join_hook）
+        // と `launch` のどこで panic しても子 cgroup の削除まで到達できるよう、panic を捕捉して後始末後に
+        // 再送出する（子は `ChildReaper` の drop で unwind 中に kill・回収済み）。
         let verify = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            launch(&rootfs.0, join, &dir)
+            let enabled = delegated
+                .enable_controllers(
+                    &proof,
+                    &ControllerSet::of(&[Controller::Memory, Controller::Cpu]),
+                )
+                .expect("enable memory and cpu controllers");
+            let applied = container
+                .set_memory_limits(
+                    &enabled,
+                    &MemoryLimits {
+                        memory_max: MemoryLimit::parse("64M").expect("memory limit"),
+                        swap_max: Some(MemoryLimit::Bytes(0)),
+                    },
+                )
+                .expect("set memory limits");
+            let applied_cpu = container.set_cpu_max(&cpu).expect("set cpu.max");
+            let join = container.join_hook().expect("join hook");
+            let (observed, record, pid, exit) = launch(&rootfs.0, join, &dir);
+            (applied, applied_cpu, observed, record, pid, exit)
         }));
         // 後始末は成否に関わらず先に行う（子は回収済みで cgroup は空）。
         let removed = delegated.remove_child(&container);
         let gone = !dir.exists();
-        let (observed, record, pid, exit) = match verify {
+        let (applied, applied_cpu, observed, record, pid, exit) = match verify {
             Ok(v) => v,
             Err(payload) => {
                 if let Err(e) = &removed {

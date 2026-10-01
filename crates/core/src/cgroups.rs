@@ -1210,15 +1210,21 @@ fn parse_kernel_limit(text: &str) -> Result<MemoryLimit, CgroupError> {
     Ok(MemoryLimit::Bytes(n))
 }
 
+/// カーネルのページ切り下げ幅の上限。Linux の最大ページサイズ（aarch64 の 64 KiB）を採る。
+const MAX_PAGE_SIZE_BYTES: u64 = 64 * 1024;
+
 /// 要求値と読み戻した実効値を照合し、実効値を返す。カーネルはページ境界へ切り下げるため
-/// `Bytes` は実効値が要求以下であれば成功とし、要求を上回る・`max` への化けは `FailedPrecondition`。
+/// `Bytes` は実効値が「要求以下かつ切り下げ幅がページサイズ上限（64 KiB）未満」であれば成功とし、
+/// 要求を上回る・大幅な低下（64 MiB 要求で 0 が読み戻される等）・`max` への化けは `FailedPrecondition`。
 fn verify_effective(
     requested: MemoryLimit,
     effective: MemoryLimit,
 ) -> Result<MemoryLimit, CgroupError> {
     let ok = match (requested, effective) {
         (MemoryLimit::Max, MemoryLimit::Max) => true,
-        (MemoryLimit::Bytes(req), MemoryLimit::Bytes(eff)) => eff <= req,
+        (MemoryLimit::Bytes(req), MemoryLimit::Bytes(eff)) => {
+            eff <= req && req - eff < MAX_PAGE_SIZE_BYTES
+        }
         _ => false,
     };
     if ok {
@@ -1614,6 +1620,11 @@ mod tests {
         );
         assert_eq!(verify_effective(Max, Max).expect("max"), Max);
         assert!(verify_effective(Bytes(4096), Bytes(8192)).is_err());
+        assert!(verify_effective(Bytes(64 * 1024 * 1024), Bytes(0)).is_err());
+        assert_eq!(
+            verify_effective(Bytes(8191), Bytes(4096)).expect("floor"),
+            Bytes(4096)
+        );
         assert!(verify_effective(Max, Bytes(1)).is_err());
         assert!(verify_effective(Bytes(1), Max).is_err());
     }

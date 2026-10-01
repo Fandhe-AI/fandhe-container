@@ -92,6 +92,8 @@ readonly DELETE_RETRY_INTERVAL_US=100000
 # 期限付きの呼び出し（実行開始の観測・後始末）で残り時間がこれ（マイクロ秒）を
 # 下回ったらランタイムを呼ばずに打ち切る。
 readonly MIN_CALL_BUDGET_US=100000
+# --output の祖先ディレクトリ検査でたどる段数の上限。
+readonly PATH_DEPTH_MAX=256
 
 usage() {
   cat >&2 <<'USAGE'
@@ -213,15 +215,21 @@ dir_is_safe() {
 # 論理パス（symlink を含むまま）と物理パス（pwd -P）の両方の祖先をたどる。これにより、
 # 一時ファイルの作成から公開まで（mktemp・chmod・dd・ln）の間に他のユーザーがパスを
 # 差し替えられないことを保証する（root での実測で別ファイルを変更させないため）。
+# 祖先は dirname が変化しなくなる点（"/"。先頭が "//" のパスでは "//"）で止め、念のため
+# 段数にも上限（PATH_DEPTH_MAX）を設ける（無限ループ防止）。
 output_path_is_safe() {
-  local logical physical d
+  local logical physical d parent depth
   logical="$(cd -- "$1" && pwd -L)" || return 1
   physical="$(cd -- "$1" && pwd -P)" || return 1
   for d in "$logical" "$physical"; do
+    depth=0
     while :; do
       dir_is_safe "$d" || return 1
-      [ "$d" = "/" ] && break
-      d="$(dirname -- "$d")"
+      parent="$(dirname -- "$d")"
+      [ "$parent" = "$d" ] && break
+      depth=$((depth + 1))
+      [ "$depth" -le "$PATH_DEPTH_MAX" ] || return 1
+      d="$parent"
     done
   done
   return 0

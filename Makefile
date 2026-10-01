@@ -551,7 +551,7 @@ idle-memory-supervised: ## 監視プロセス込みのアイドル常駐メモ�
 # スクリプトの終了コード 0〜4 はそのまま返し、timeout 超過（124・137）と想定外の値は 1、起動不能（125〜127）は 2。
 CONCURRENT_MEMORY_TIMEOUT ?= 1800
 CONCURRENT_MEMORY_SCRIPT ?= scripts/bench/concurrent_50_memory.sh
-# timeout の --kill-after（TERM 後に KILL するまでの猶予。60 秒固定）。スクリプトの後始末（ln_stop）の最悪所要時間〔launcher 終了待ち最大 10 秒＋強制終了後の確認 5 秒＋所有プロセス回収 5 秒＋/proc 走査〕より十分長く取り、
+# timeout の --kill-after（TERM 後に KILL するまでの猶予。60 秒固定）。スクリプトの後始末（ln_stop）の最悪所要時間〔launcher 終了待ち最大 10 秒＋強制終了後の確認 5 秒＋所有プロセス回収 5 秒＋ログ収集プロセスの終了待ち 2 秒＋/proc 走査〕より十分長く取り、
 # 後始末の途中で KILL して起動プロセスを残さないようにする（REPAIR-5）。
 
 .PHONY: concurrent-memory-selftest

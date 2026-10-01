@@ -30,12 +30,14 @@
 #     （ログへ記録される）。本スクリプトはこの行を起動完了の明示的な ready 状態として扱い、プロセス数
 #     （--min-procs）だけでは完了と判定しない（起動途中の一時的な子プロセスで N/N 起動と誤判定しない）。
 #     ready 行は起動完了待ち・計測直前（measure_container）・全コンテナ集計後の再確認で確認する。
-#   - ログ: launcher の標準出力・標準エラーは一時ディレクトリのログファイルへ直接書かせる。launcher と
-#     その子孫（コンテナ内の処理）へはリソース制限（ulimit -f 等）を掛けない（計測条件を変えないため）。
-#     上限は収集側（本スクリプト）で設ける: ログを読むのは先頭 LOG_MAX_KIB KiB と末尾数行だけで、
-#     READY 行はその範囲内に出すこと。ログが LOG_MAX_KIB KiB を超えたコンテナを検出したら計測を
-#     打ち切って失敗にし（log-limit-exceeded）、全 launcher を停止してログを削除する。検出は起動完了待ち・
-#     settle 待機（1 秒刻み）・集計後の各時点で行うため、超過の検出は最大で約 1 秒遅れる。
+#   - ログ: launcher とその子孫（コンテナ内の処理）へはリソース制限（ulimit -f 等）を掛けない（計測条件を
+#     変えないため）。ログの上限は収集側（本スクリプト）で設ける: launcher の標準出力・標準エラーは
+#     コンテナごとの FIFO へ流し、本スクリプトの直接の子である収集プロセスが先頭 LOG_MAX_KIB KiB だけを
+#     ログファイルへ書き、それ以降は読み捨てる（launcher は書き込みを拒否されず、SIGPIPE・SIGXFSZ も
+#     受けない）。ディスク消費は「起動数 × LOG_MAX_KIB KiB」を超えない（REPAIR-5）。READY 行は先頭
+#     LOG_MAX_KIB KiB 以内に出すこと（それより後の READY は記録されず、起動未完了として失敗になる）。
+#     収集プロセスは launcher の子孫ではないので PSS・RSS の集計には入らない（参考値の
+#     mem_available_delta_kb には、コンテナごとに 2 プロセス程度の分が含まれる）。
 #   - 停止: 直接の子へ SIGTERM、期限内に終了しなければ SIGKILL。launcher は SIGTERM でコンテナも
 #     終了させる。シグナルは、起動直後に記録した起動時刻（/proc/<pid>/stat の 22 番目）と親 pid が
 #     一致する場合にだけ送る（launcher の終了後に pid が再利用されても無関係なプロセスへ送らない）。
@@ -61,8 +63,8 @@
 # 終了コード:
 #   0 = 全試行で N/N 起動し計測成功
 #   1 = 起動数不足・PSS 0 混入・メモリ値を読めない／数値でない・起動完了待ちの期限切れ・トークンを
-#       継承しない（後始末で回収できない）プロセスの混入・集計中のコンテナ終了・ログ上限超過
-#       （結果は公開しない）
+#       継承しない（後始末で回収できない）プロセスの混入・集計中のコンテナ終了・子プロセス一覧を
+#       読めない（結果は公開しない）
 #   2 = 引数・入力エラー（--proc-root は FANDHE_CONCURRENT_MEMORY_SELFTEST=1 なしでは拒否）、出力先エラー、
 #       未対応の --mode（docker は TASK-50.2 で追加予定）
 #   3 = 前提欠如（非 Linux・smaps_rollup 非対応・bash 5 未満等。0 を返して合格に見せない）
@@ -102,8 +104,9 @@ readonly MAX_SCAN_ATTEMPTS=10
 readonly POLL_INTERVAL=0.2
 readonly MAX_REPORT_IDS=5
 readonly MAX_LOG_TAIL=5
-# launcher 1 つのログの上限（KiB）。収集側の上限であり、launcher へ ulimit は掛けない。
-readonly LOG_MAX_KIB=2048
+# launcher 1 つのログの上限（KiB）。収集プロセスがこの量だけをログへ書き、以降は読み捨てる（launcher へ
+# ulimit は掛けない）。ディスク消費の上限は「--count の最大 1024 × 256 KiB = 256 MiB」になる。
+readonly LOG_MAX_KIB=256
 # 10 進整数（先頭 0 付きは bash 算術で 8 進になるため拒否。13 桁まで）。
 readonly num_re='^(0|[1-9][0-9]{0,12})$'
 
@@ -273,9 +276,14 @@ if [ "$proc_root_given" -eq 0 ]; then
 else
   proc="${proc_root%/}"
 fi
-for req in sleep mktemp head grep find tail ln; do
-  command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "sleep, mktemp, head, grep, find, tail and ln are required"; exit 3; }
+for req in sleep mktemp grep tail ln mkfifo dd cat wc; do
+  command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "sleep, mktemp, grep, tail, ln, mkfifo, dd, cat and wc are required"; exit 3; }
 done
+# ログ収集は dd の status=none（進捗を stderr へ出さない指定）を使う。使えない dd では止める。
+if [ "$(printf 'xy' | dd bs=1 count=1 status=none 2>/dev/null || true)" != "x" ]; then
+  err "unsupported-os" "dd with status=none is required (GNU coreutils 8.21 or later)"
+  exit 3
+fi
 [ -r /proc/self/stat ] || { err "unsupported-os" "/proc/<pid>/stat is not available"; exit 3; }
 
 # --- 状態 ---
@@ -283,6 +291,8 @@ tmpdir=""
 out_tmp=""
 pids=()
 pstart=()
+cpids=()
+cstart=()
 snaps=()
 known=()
 owner_tok=""
@@ -354,15 +364,83 @@ own_child_alive() { # <pid>
 
 # --- launcher 契約の差し替え点（実 CLI 提供後はここだけ合わせる。REPAIR-3） ---
 
+# コンテナ 1 つ分のログ収集プロセスを起動し、pid を LAST_CPID、起動時刻を LAST_CSTART へ入れる。
+# FIFO（<logfile>.fifo）から読み、先頭 LOG_MAX_KIB KiB だけを <logfile> へ書いて、以降は EOF まで
+# 読み捨てる（読み手を残すことで launcher の書き込みを止めず、SIGPIPE も起こさない）。dd は bs=1 で
+# 1 バイトずつ読んでその都度書く。FIFO からの read は書き込み単位ごとの部分読みになり、dd は部分読みも
+# 1 レコードと数えるため、bs を大きくすると短い行を count 回読んだ時点で（上限バイト数より前に）打ち切って
+# READY を取りこぼす。bs=1 なら count がそのままバイト数になり、READY 行も出力された時点でログに現れる
+# （head -c は標準出力がファイルのとき stdio でバッファするため使わない）。launcher の起動を遅らせないよう、全コンテナ
+# 分を launcher より先に起動しておく（FIFO の open は launcher 側の open と揃うまで待つ）。
+# 本スクリプトの直接の子で、環境変数トークンを持たず launcher のツリーにも入らない。TERM / HUP / INT は
+# 無視させ（外側 timeout はプロセスグループ全体へ送る）、全書き手の終了による EOF で自然に終わる。
+# 残った場合は後始末（collectors_stop）が SIGKILL する。FIFO を作れなければ 1。
+log_collector_start() { # <logfile>
+  LAST_CPID=""
+  LAST_CSTART=""
+  # FANDHE_CONCURRENT_MEMORY_SELFTEST_FIFO_FAIL_AT は selftest が「途中のコンテナで FIFO を作れない」
+  # 状況を模すための専用フック（それまでに起動した収集プロセスを残さないことを照合する）。
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ] && [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST_FIFO_FAIL_AT:-}" = "$((${#cpids[@]} + 1))" ]; then
+    return 1
+  fi
+  mkfifo -m 600 -- "$1.fifo" 2>/dev/null || return 1
+  (
+    trap '' TERM HUP INT
+    exec <"$1.fifo" >"$1" || exit 0
+    dd bs=1 count="$((LOG_MAX_KIB * 1024))" status=none 2>/dev/null || true
+    exec cat >/dev/null
+  ) &
+  LAST_CPID=$!
+  if read_starttime "$LAST_CPID"; then LAST_CSTART="$ST"; fi
+}
+
+# 収集プロセスを回収する。launcher と子孫（FIFO の書き手）が全て終了していれば EOF で自然に終わるので、
+# まず最大 2 秒待つ。残ったもの（書き手が残存している・FIFO の open 待ちのまま）は、起動時刻と親 pid を
+# 照合してから SIGKILL する。収集プロセスが dd を実行中なら、その子（dd）も起動時刻を照合して終了させる。
+collectors_stop() {
+  local i waited=0 alive c desc kids
+  [ "${#cpids[@]}" -gt 0 ] || return 0
+  while [ "$waited" -lt 10 ]; do
+    alive=0
+    for i in "${!cpids[@]}"; do
+      if same_proc_alive "${cpids[i]}" "${cstart[i]:-}" "$$"; then alive=1; break; fi
+    done
+    [ "$alive" -eq 1 ] || break
+    sleep "$POLL_INTERVAL"
+    waited=$((waited + 1))
+  done
+  for i in "${!cpids[@]}"; do
+    if same_proc_alive "${cpids[i]}" "${cstart[i]:-}" "$$"; then
+      kids=""
+      c=()
+      { read -ra c <"/proc/${cpids[i]}/task/${cpids[i]}/children"; } 2>/dev/null || true
+      for desc in "${c[@]}"; do
+        [[ "$desc" =~ $num_re ]] || continue
+        if read_starttime "$desc"; then kids+="${desc}:${ST} "; fi
+      done
+      sig_same_proc KILL "${cpids[i]}" "${cstart[i]}" "$$"
+      for desc in $kids; do
+        sig_same_proc KILL "${desc%%:*}" "${desc#*:}"
+      done
+    fi
+    # 終了済み・SIGKILL 済みの収集プロセスを回収する（照合できない生存プロセスは待たない）。
+    if ! own_child_alive "${cpids[i]}" || [ -n "${cstart[i]:-}" ]; then
+      wait "${cpids[i]}" 2>/dev/null || true
+    fi
+  done
+  cpids=()
+  cstart=()
+}
+
 # コンテナ 1 つ分の launcher を直接の子として起動し、pid を LAST_PID、起動時刻を LAST_START へ入れる
 # （起動時刻を読めなければ空。空の launcher は以後「生存していない」と扱い、シグナルも送らない。
 # その pid が直接の子として生存し続けていれば、後始末で残存として報告し終了コード 4 にする）。
 # 引数は配列で直接 exec する（eval・sh -c を使わない）。launcher とその子孫へ ulimit 等のリソース制限は
-# 掛けない（コンテナ内の書き込みが失敗して計測条件が変わるため）。ログの上限は収集側（ln_ready の
-# 読み取り範囲と log_overflow の監視）で設ける。
+# 掛けない（コンテナ内の書き込みが失敗して計測条件が変わるため）。標準出力・標準エラーは
+# log_collector_start が用意した FIFO（<logfile>.fifo）へ流し、ログの上限は収集プロセス側で設ける。
 ln_spawn() { # <id> <logfile>
   (
-    FANDHE_BENCH_OWNER="$owner_tok" exec "$launcher" run --id "$1" --bundle "$bundle" </dev/null >"$2" 2>&1
+    FANDHE_BENCH_OWNER="$owner_tok" exec "$launcher" run --id "$1" --bundle "$bundle" </dev/null >"$2.fifo" 2>&1
   ) &
   LAST_PID=$!
   LAST_START=""
@@ -375,40 +453,59 @@ ln_spawn() { # <id> <logfile>
 }
 
 # pid p の子（全スレッド分）を children へ入れる。children ファイルが無い環境では PPid 走査。
+# 存在するのに読めない一覧（権限不足・スレッドの終了）が 1 つでもあれば 1 を返す。読めた分だけで成功に
+# すると、読めなかったスレッドの子孫が集計から抜けて過少計上になるため（CORE-9・SUP-1）。プロセス p 自体が
+# 消えた場合は 0（消滅は呼び出し側がメモリ値の読み取り時に検出して走査をやり直す）。
 ln_children() {
-  local p="$1" f d line got=0 ppid
+  local p="$1" f d line got=0 ppid opened
   children=()
   for f in "$proc/$p/task/"*/children; do
-    if [ -r "$f" ]; then
-      got=1
-      line=()
-      read -ra line <"$f" 2>/dev/null || true
-      children+=("${line[@]}")
+    # glob が一致しない（children 非対応のカーネル）場合はパターン文字列のまま来るので除く。
+    [ -e "$f" ] || continue
+    got=1
+    # 空の一覧（子なし）でも read は非 0 を返すので、終了コードでは open の失敗と区別できない。番兵を
+    # 入れておき、read が実行されなかった（open に失敗した）場合だけ番兵が残ることで判定する。
+    line=("unread")
+    read -ra line 2>/dev/null <"$f" || true
+    if [ "${line[0]:-}" = "unread" ]; then
+      [ -d "$proc/$p" ] || return 0
+      return 1
     fi
+    children+=("${line[@]}")
   done
   [ "$got" -eq 0 ] || return 0
   [ -d "$proc/$p" ] || return 0
   for d in "$proc"/[0-9]*/status; do
-    [ -r "$d" ] || continue
-    while IFS= read -r line; do
-      case "$line" in
-        PPid:*)
-          ppid="${line#PPid:}"
-          ppid="${ppid//[[:space:]]/}"
-          if [ "$ppid" = "$p" ]; then
-            d="${d%/status}"
-            children+=("${d##*/}")
-          fi
-          break
-          ;;
-      esac
-    done <"$d"
+    [ -e "$d" ] || continue
+    ppid=""
+    opened=0
+    {
+      opened=1
+      while IFS= read -r line; do
+        case "$line" in
+          PPid:*)
+            ppid="${line#PPid:}"
+            ppid="${ppid//[[:space:]]/}"
+            break
+            ;;
+        esac
+      done
+    } 2>/dev/null <"$d" || true
+    if [ "$opened" -eq 0 ]; then
+      # 走査中に終了したプロセスは対象外。存在するのに読めない status は親を判定できないので失敗。
+      [ -e "$d" ] || continue
+      return 1
+    fi
+    if [ "$ppid" = "$p" ]; then
+      d="${d%/status}"
+      children+=("${d##*/}")
+    fi
   done
 }
 
 # launcher の pid を根とする子孫（根を含む）を tree_pids へ入れる。根が消えていれば 1、プロセス数の
-# 上限超過は 2、深さ上限（MAX_DEPTH）に達しても未探索の子孫が残る場合は 3 を返す（過少計上を成功に
-# しない）。失敗時の tree_pids は「それまでに見つけた分」で、後始末（ln_stop）が利用する。
+# 上限超過は 2、深さ上限（MAX_DEPTH）に達しても未探索の子孫が残る場合は 3、子プロセス一覧を読めない
+# プロセスがある場合は 4 を返す（過少計上を成功にしない）。失敗時の tree_pids は「それまでに見つけた分」で、後始末（ln_stop）が利用する。
 ln_collect_pids() {
   local root="$1" depth=0 p c cur next
   tree_pids=()
@@ -418,7 +515,7 @@ ln_collect_pids() {
   while [ "${#cur[@]}" -gt 0 ] && [ "$depth" -lt "$MAX_DEPTH" ]; do
     next=()
     for p in "${cur[@]}"; do
-      ln_children "$p"
+      ln_children "$p" || return 4
       for c in "${children[@]}"; do
         [[ "$c" =~ $num_re ]] || continue
         tree_pids+=("$c")
@@ -450,29 +547,9 @@ record_tree() { # <i>
 }
 
 # launcher が標準出力（ログ）へ `READY` 行を出したか（起動完了の明示的な ready 状態）。
-# 読むのは先頭 LOG_MAX_KIB KiB まで（収集側の上限。巨大なログを全量読まない）。
+# ログは収集プロセスが LOG_MAX_KIB KiB で打ち切るため、読む量もその範囲に収まる。
 ln_ready() { # <logfile>
-  [ -r "$1" ] && grep -qxF -- "READY" < <(head -c "$((LOG_MAX_KIB * 1024))" -- "$1" 2>/dev/null) 2>/dev/null
-}
-
-# ログが上限（LOG_MAX_KIB KiB）を超えた launcher があれば、その ID を LOG_OVER へ入れて 0 を返す。
-# launcher 側を制限せずにディスク消費を抑えるための収集側の監視で、検出したら呼び出し側が計測を
-# 失敗にして後始末（全 launcher の停止とログの削除）へ進む。
-log_overflow() {
-  local f
-  LOG_OVER=""
-  f="$(find "$tmpdir" -maxdepth 1 -type f -name "${id_prefix}-*.log" -size "+${LOG_MAX_KIB}k" -print -quit 2>/dev/null || true)"
-  [ -n "$f" ] || return 1
-  f="${f##*/}"
-  LOG_OVER="${f%.log}"
-}
-
-# ログ上限超過を検出したら失敗として終了する（結果は公開しない。後始末は EXIT trap）。
-fail_on_log_overflow() { # <trial>
-  if log_overflow; then
-    err "log-limit-exceeded" "trial=$1 id=${LOG_OVER} limit_kib=${LOG_MAX_KIB}"
-    exit 1
-  fi
+  [ -r "$1" ] && grep -qxF -- "READY" "$1" 2>/dev/null
 }
 
 # 環境変数トークン FANDHE_BENCH_OWNER が一致する生存プロセス（launcher の孤児化した子孫を含む）を
@@ -518,7 +595,12 @@ any_alive() {
 # 残存があれば 4 を返す。成功・失敗・シグナルのいずれでも呼ばれる（EXIT trap）。何度呼んでも安全。
 ln_stop() {
   local i pid grace desc waited residual=()
-  [ "${#pids[@]}" -gt 0 ] || return 0
+  # launcher を 1 つも起動していなくても、先に起動した収集プロセスは必ず回収する（FIFO の作成失敗や、
+  # 収集プロセスの起動中に受けたシグナルで終了する場合。FIFO の open 待ちのまま残さない）。
+  if [ "${#pids[@]}" -eq 0 ]; then
+    collectors_stop
+    return 0
+  fi
   grace="$timeout_s"
   [ "$grace" -le 10 ] || grace=10
   for i in "${!pids[@]}"; do
@@ -562,6 +644,9 @@ ln_stop() {
     done
     sleep "$POLL_INTERVAL"
   fi
+  # launcher と子孫の停止後にログ収集プロセスを回収する（残存の判定には含めない。本スクリプトが
+  # 起動時刻を照合して SIGKILL する直接の子で、計測対象のプロセスではない）。
+  collectors_stop
   for i in "${!pids[@]}"; do
     pid="${pids[i]}"
     # 終了済みの launcher だけを wait で回収する。起動時刻を照合できないが本スクリプトの直接の子として
@@ -657,7 +742,7 @@ read_kb() {
 
 # コンテナ i のツリーを集計する。結果は m_pss・m_rss・m_n。0 = 成功、1 = 無効（m_reason に理由）。
 measure_container() {
-  local i="$1" attempt=0 pid rc vanished
+  local i="$1" attempt=0 pid rc vanished unreadable=0
   m_reason=""
   while [ "$attempt" -lt "$MAX_SCAN_ATTEMPTS" ]; do
     attempt=$((attempt + 1))
@@ -668,6 +753,10 @@ measure_container() {
     rc=0
     ln_collect_pids "${pids[i]}" || rc=$?
     record_tree "$i"
+    # 子プロセス一覧を読めない（4）のは、走査中のスレッド終了など一時的な場合があるのでやり直す。
+    # 続く場合は試行回数の上限で process-tree-unreadable として失敗にする。
+    if [ "$rc" -eq 4 ]; then unreadable=1; continue; fi
+    unreadable=0
     if [ "$rc" -ne 0 ]; then m_reason="process-tree-unavailable"; return 1; fi
     # 計測時点でも起動条件（ツリーのプロセス数 >= --min-procs）を満たすこと。満たさなければ過少計上。
     if ! ln_alive "$i" || [ "${#tree_pids[@]}" -lt "$min_procs" ]; then
@@ -705,6 +794,7 @@ measure_container() {
     if [ "$vanished" -eq 0 ]; then return 0; fi
   done
   m_reason="process-tree-unstable"
+  if [ "$unreadable" -eq 1 ]; then m_reason="process-tree-unreadable"; fi
   return 1
 }
 
@@ -724,7 +814,7 @@ mem_available() {
 
 # 起動数不足の詳細（未起動 ID とログ末尾。件数・行数上限つき）を stderr へ出す。
 report_unstarted() { # <trial>
-  local i shown=0 id line
+  local i shown=0 id line sz
   for i in "${!pids[@]}"; do
     [ "${ok_flags[i]}" = "1" ] && continue
     [ "$shown" -lt "$MAX_REPORT_IDS" ] || break
@@ -732,6 +822,12 @@ report_unstarted() { # <trial>
     id="${id_prefix}-$1-$((i + 1))"
     err "unstarted" "id=${id}"
     if [ -r "$tmpdir/$id.log" ]; then
+      # ログが上限に達していれば、それ以降の出力（READY を含む）は記録されていないことを示す。
+      sz="$(wc -c <"$tmpdir/$id.log" 2>/dev/null || true)"
+      sz="${sz//[[:space:]]/}"
+      if [[ "$sz" =~ $num_re ]] && [ "$sz" -ge "$((LOG_MAX_KIB * 1024))" ]; then
+        err "unstarted-log-truncated" "id=${id} bytes=${sz} limit_kib=${LOG_MAX_KIB}"
+      fi
       while IFS= read -r line; do
         err "unstarted-log" "${id}: $(sanitize "$line")"
       done < <(tail -n "$MAX_LOG_TAIL" "$tmpdir/$id.log" 2>/dev/null || true)
@@ -750,8 +846,22 @@ while [ "$t" -le "$trials" ]; do
   mem_before="$(mem_available)"
   pids=()
   pstart=()
+  cpids=()
+  cstart=()
   known=()
   ok_flags=()
+  # ログ収集プロセスを全コンテナ分、launcher より先に起動する（launcher の同時起動の間に挟まない）。
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    id="${id_prefix}-${t}-$((i + 1))"
+    if ! log_collector_start "$tmpdir/$id.log"; then
+      err "measurement-failed" "trial=${t} id=${id} reason=cannot-create-log-fifo"
+      exit 1
+    fi
+    cpids+=("$LAST_CPID")
+    cstart+=("$LAST_CSTART")
+    i=$((i + 1))
+  done
   i=0
   # 起動をずらさず、できるだけ同時に起動する（起動競合も計測条件に含める）。
   while [ "$i" -lt "$count" ]; do
@@ -775,18 +885,17 @@ while [ "$t" -le "$trials" ]; do
         pending=1
       fi
     done
-    fail_on_log_overflow "$t"
     [ "$pending" -eq 1 ] || break
     [ "$SECONDS" -lt "$deadline" ] || break
     sleep "$POLL_INTERVAL"
   done
 
-  # settle 待機は 1 秒刻みにして、待機中もログ上限を監視する。
+  # settle 待機は 1 秒刻みにする（bash は実行中の sleep が終わるまで trap を動かさないため、長い sleep
+  # 1 回だと TERM / INT / HUP を受けてから後始末を始めるまでが settle 秒だけ遅れる）。
   settled=0
   while [ "$settled" -lt "$settle" ]; do
     sleep 1
     settled=$((settled + 1))
-    fail_on_log_overflow "$t"
   done
   n_started=0
   for i in "${!pids[@]}"; do
@@ -837,7 +946,6 @@ while [ "$t" -le "$trials" ]; do
     report_unstarted "$t"
     exit 1
   fi
-  fail_on_log_overflow "$t"
   mem_after="$(mem_available)"
   trial_pss+=("$pss_total")
   trial_rss+=("$rss_total")

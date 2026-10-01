@@ -112,7 +112,7 @@ usage: startup_latency.sh --runtime <abs-path> --bundle <dir> [options]
   --iterations <1-1000> measured iterations (default: 10)
   --warmup <0-100>     warmup iterations excluded from statistics (default: 1)
   --timeout <1-60>     per runtime command timeout in seconds (default: 10)
-  --label <name>       label recorded in the output (default: own)
+  --label <name>       label recorded in the output (default: same as --target)
   --output <file>      also write the JSON result to a new file (must not exist)
   -h, --help           show this help
 USAGE
@@ -146,7 +146,7 @@ bundle=""
 iterations=10
 warmup=1
 timeout_secs=10
-label="own"
+label=""
 target=""
 output=""
 seen_opts=" "
@@ -234,6 +234,10 @@ fi
 check_int iterations "$iterations" 1 1000
 check_int warmup "$warmup" 0 100
 check_int timeout "$timeout_secs" 1 60
+# ラベルの既定値は計測対象名（target と label が食い違って取り違えないように）。
+if [ -z "$label" ]; then
+  label="$target"
+fi
 if ! [[ "$label" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
   err "invalid-label" "label must match ^[A-Za-z0-9._-]{1,64}$"
   exit "$EXIT_INPUT"

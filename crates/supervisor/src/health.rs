@@ -1015,7 +1015,6 @@ mod tests {
         }
     }
 
-    /// REPAIR-5: cancel が戻らなくても呼び出しは期限内に戻り、未終了のスレッドが次の判定を拒否する。
     /// REPAIR-5: 同じ ProbeRunner への並行 run でも、確保に成功するのは 1 呼び出しだけ。
     #[test]
     fn repair5_task157_6_concurrent_acquire_admits_exactly_one() {
@@ -1043,6 +1042,7 @@ mod tests {
         assert_eq!(counter.0.load(Ordering::SeqCst), 0);
     }
 
+    /// REPAIR-5: cancel が戻らなくても呼び出しは期限内に戻り、未終了のスレッドが次の判定を拒否する。
     #[test]
     fn repair5_task157_6_stuck_cancel_is_bounded_and_blocks_next_probe() {
         let store = healthy_store();
@@ -1100,6 +1100,192 @@ mod tests {
         match e.demotion() {
             Demotion::Failed(d) => assert_eq!(d.code(), ErrorCode::Internal),
             other => panic!("unexpected demotion: {other:?}"),
+        }
+    }
+
+    /// 最初の `update` 1 回だけを、テストが解放するまで止めるストア（判定後・記録中の区間を作る）。
+    ///
+    /// 止まったことを `entered` で知らせ、`release` を待つ。順序はチャネルの受け渡しで決まり、sleep に依存しない。
+    struct GatedStore {
+        inner: Arc<FakeStore>,
+        armed: std::sync::atomic::AtomicBool,
+        entered: Mutex<mpsc::Sender<()>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    /// テストがハングしないための安全弁（通常は即座に受け渡される）。
+    const GATE_LIMIT: Duration = Duration::from_secs(10);
+
+    impl StateStore for GatedStore {
+        fn create(&self, r: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+            self.inner.create(r)
+        }
+        fn update(&self, r: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let _ = self.entered.lock().unwrap().send(());
+                let _ = self.release.lock().unwrap().recv_timeout(GATE_LIMIT);
+            }
+            self.inner.update(r)
+        }
+        fn get(&self, r: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            self.inner.get(r)
+        }
+        fn list(&self, r: &ListStateRequest) -> Result<StateList, TraitError> {
+            self.inner.list(r)
+        }
+        fn delete(&self, r: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+            self.inner.delete(r)
+        }
+    }
+
+    /// `inner` を包み、(ストア, 停止通知の受信側, 解放の送信側) を返す。
+    fn gated(inner: &Arc<FakeStore>) -> (Arc<GatedStore>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let store = Arc::new(GatedStore {
+            inner: Arc::clone(inner),
+            armed: std::sync::atomic::AtomicBool::new(true),
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        });
+        (store, entered_rx, release_tx)
+    }
+
+    /// 呼ばれるたびに先頭から順に結果を返す probe（呼び出し回数 = 取り出した件数）。
+    struct SeqProbe {
+        results: Mutex<std::collections::VecDeque<Result<HealthStatus, TraitError>>>,
+        calls: AtomicU32,
+    }
+
+    impl SeqProbe {
+        fn new(results: Vec<Result<HealthStatus, TraitError>>) -> Arc<Self> {
+            Arc::new(Self {
+                results: Mutex::new(results.into()),
+                calls: AtomicU32::new(0),
+            })
+        }
+    }
+
+    impl HealthProbe for SeqProbe {
+        fn probe(&self, _: Duration) -> Result<HealthStatus, TraitError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(TraitError::new(ErrorCode::Internal, "exhausted")))
+        }
+    }
+
+    /// SUP-4・REPAIR-5: 先行する判定が Healthy を記録している最中（probe は終了済み）の並行呼び出しは、
+    /// probe も書き込みもせず `Unavailable` で拒否される。古い Healthy が新しい Unhealthy を後から上書きしない。
+    #[test]
+    fn sup4_repair5_task157_6_concurrent_call_is_rejected_while_recording() {
+        let inner = owned_store(0);
+        let (store, entered, release) = gated(&inner);
+        let probe = SeqProbe::new(vec![Ok(HealthStatus::Healthy), Ok(HealthStatus::Unhealthy)]);
+        let runner = ProbeRunner::new(probe.clone());
+        let t = Duration::from_secs(1);
+
+        let (a_store, a_runner) = (store.clone(), runner.clone());
+        let a = std::thread::spawn(move || {
+            let mut s = SupervisedState::attach(a_store, cid()).unwrap();
+            probe_and_record(&mut s, &FakeProc, &a_runner, t, &RecObs::default())
+        });
+        // A の probe は Healthy を返し終え、記録の書き込みで止まっている。
+        entered.recv_timeout(GATE_LIMIT).unwrap();
+
+        let mut s = SupervisedState::attach(store.clone(), cid()).unwrap();
+        let obs = RecObs::default();
+        let e = probe_and_record(&mut s, &FakeProc, &runner, t, &obs).unwrap_err();
+        assert_eq!(e.error().code(), ErrorCode::Unavailable);
+        assert_eq!(e.demotion(), &Demotion::NotNeeded);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.updates.load(Ordering::SeqCst), 0);
+        {
+            // 拒否は Probe イベント 1 件として観測でき、RecordHealth は出ない（REPAIR-4）。
+            let ev = obs.0.lock().unwrap();
+            assert_eq!(ev.len(), 1);
+            assert_eq!(ev[0].operation, MonitorOperation::Probe);
+            assert_eq!(ev[0].error_code, Some(ErrorCode::Unavailable));
+        }
+
+        release.send(()).unwrap();
+        let rec = a.join().unwrap().unwrap();
+        assert_eq!(rec.health(), Some(HealthStatus::Healthy));
+        assert_eq!(rec.revision().value(), 2);
+        assert_eq!(inner.updates.load(Ordering::SeqCst), 1);
+
+        // A の終了後は判定でき、新しい Unhealthy が最後に残る。
+        let rec = probe_and_record(&mut s, &FakeProc, &runner, t, &RecObs::default()).unwrap();
+        assert_eq!(rec.health(), Some(HealthStatus::Unhealthy));
+        assert_eq!(rec.revision().value(), 3);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(runner.unfinished(), 0);
+    }
+
+    /// SUP-4・REPAIR-5: 先行する判定の失敗が降格を書いている最中の並行呼び出しも拒否される。
+    /// 古い失敗の降格が、後から記録された新しい Healthy を消さない。
+    #[test]
+    fn sup4_repair5_task157_6_concurrent_call_is_rejected_while_demoting() {
+        let inner = healthy_store();
+        let (store, entered, release) = gated(&inner);
+        let probe = SeqProbe::new(vec![
+            Err(TraitError::new(ErrorCode::Internal, "boom")),
+            Ok(HealthStatus::Healthy),
+        ]);
+        let runner = ProbeRunner::new(probe.clone());
+        let t = Duration::from_secs(1);
+
+        let (a_store, a_runner) = (store.clone(), runner.clone());
+        let a = std::thread::spawn(move || {
+            let mut s = SupervisedState::attach(a_store, cid()).unwrap();
+            probe_and_record(&mut s, &FakeProc, &a_runner, t, &RecObs::default())
+        });
+        // A の probe は失敗を返し終え、降格（Healthy → Unhealthy）の書き込みで止まっている。
+        entered.recv_timeout(GATE_LIMIT).unwrap();
+
+        let mut s = SupervisedState::attach(store.clone(), cid()).unwrap();
+        let e = probe_and_record(&mut s, &FakeProc, &runner, t, &RecObs::default()).unwrap_err();
+        assert_eq!(e.error().code(), ErrorCode::Unavailable);
+        assert_eq!(e.demotion(), &Demotion::NotNeeded);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.updates.load(Ordering::SeqCst), 0);
+
+        release.send(()).unwrap();
+        let f = a.join().unwrap().unwrap_err();
+        assert_eq!(f.error().code(), ErrorCode::Internal);
+        assert_eq!(f.demotion(), &Demotion::Applied);
+        assert_eq!(
+            inner.rec.lock().unwrap().health(),
+            Some(HealthStatus::Unhealthy)
+        );
+
+        // A の終了後の新しい Healthy は、古い失敗の降格に消されず最後に残る。
+        let rec = probe_and_record(&mut s, &FakeProc, &runner, t, &RecObs::default()).unwrap();
+        assert_eq!(rec.health(), Some(HealthStatus::Healthy));
+        assert_eq!(rec.revision().value(), 3);
+        assert_eq!(inner.updates.load(Ordering::SeqCst), 2);
+    }
+
+    /// REPAIR-5・SUP-4: 連続した呼び出しは、直前の判定スレッドの終了処理と競合して拒否されない
+    /// （結果を渡す前に計数を戻すため、戻った時点で未終了は 0 本）。
+    #[test]
+    fn repair5_task157_6_back_to_back_calls_are_never_rejected() {
+        let store = owned_store(0);
+        let mut s = attach(&store);
+        let runner = ProbeRunner::new(Arc::new(FixedProbe(HealthStatus::Healthy)));
+        for i in 0..200_u64 {
+            let rec = probe_and_record(
+                &mut s,
+                &FakeProc,
+                &runner,
+                Duration::from_secs(1),
+                &RecObs::default(),
+            )
+            .unwrap();
+            assert_eq!(rec.revision().value(), i + 2);
+            assert_eq!(runner.unfinished(), 0);
         }
     }
 }

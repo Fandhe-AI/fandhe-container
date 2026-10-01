@@ -865,6 +865,8 @@ expect_contains "docker-rm-fail-leftover" "containers left behind: $(printf '%06
 reset_dlog
 DSTUB_MODE=list-fail expect_rc "docker-list-fail" 4 --runtime "$dstub" --iterations 1 --warmup 0 --timeout 1
 expect_contains "docker-list-fail-leftover" "containers left behind: $(printf '%064x' 1)"
+# 一覧が取れない状態では所有・残存を確認できないので rm -f を送らない（fail-closed）。
+if grep -q '^rm ' "$dstub_log"; then fail "docker-list-fail-no-rm"; else pass "docker-list-fail-no-rm"; fi
 # --rm の後にコンテナが残っていれば、cidfile の ID を指定した rm -f で片付けて成功する。
 reset_dlog
 DSTUB_MODE=leftover-after-rm expect_rc "docker-leftover-after-rm" 0 --runtime "$dstub" --iterations 1 --warmup 0

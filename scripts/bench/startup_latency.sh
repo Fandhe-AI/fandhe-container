@@ -672,13 +672,17 @@ finish_container_docker_within_deadline() {
   fi
   while [ "$tries" -lt "$DELETE_RETRY_MAX" ]; do
     tries=$((tries + 1))
-    present=1
-    if list_run_containers; then
-      present=0
-      for x in "${listed_ids[@]}"; do
-        [ "$x" = "$cid" ] && present=1
-      done
+    # 一覧の取得に失敗したら残存状態を確認できないので、削除せず未確認として exit 4 の対象にする
+    # （fail-closed。daemon 接続失敗等で盲目的に rm -f しない）。
+    if ! list_run_containers; then
+      echo "warning: could not list containers labeled $DOCKER_LABEL_KEY=$run_tag for $id; leftover state of $cid cannot be confirmed, not removing it, inspect manually" >&2
+      leftover_ids+=("$cid")
+      return 1
     fi
+    present=0
+    for x in "${listed_ids[@]}"; do
+      [ "$x" = "$cid" ] && present=1
+    done
     # --rm で削除済み（一覧が取れて ID がない）なら完了。
     [ "$present" -eq 0 ] && return 0
     if dk_rm "$log" "$cid"; then

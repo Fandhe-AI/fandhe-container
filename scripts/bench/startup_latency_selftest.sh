@@ -427,7 +427,7 @@ done
 reset_log
 expect_rc "output-sticky-dir" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --output "$work/sticky/out.json"
 expect_eq "output-sticky-dir-written" "$last_stdout" "$(cat "$work/sticky/out.json")"
-# 先頭が "//" のパスでも祖先の検査が終わる（Bugbot: dirname の不動点 "//" で止まる）。
+# 先頭が "//" のパスでも祖先の検査が終わる（Bugbot: GNU dirname の不動点 "//" で止まる）。
 # 回帰時に自己テスト自体が止まらないよう外側に timeout を掛ける。
 reset_log
 rc=0
@@ -435,6 +435,14 @@ timeout 60 "$bash_bin" "$target_script" --runtime "$stub" --bundle "$work/bundle
   --output "/$work/sticky/out2.json" >/dev/null 2>&1 || rc=$?
 expect_eq "output-double-slash-exit" "0" "$rc"
 expect_eq "output-double-slash-written" "own" "$(jq -r '.target' "$work/sticky/out2.json" 2>/dev/null)"
+# sticky な共有ディレクトリにある symlink（他人が所有すれば検査後に差し替えられる）を経由する
+# 出力先は、参照先が安全でも拒否する（Codex P0: パス上の symlink を拒否する）。
+mkdir -p "$work/safe-target"
+ln -s "$work/safe-target" "$work/sticky/link"
+reset_log
+expect_rc "output-symlink-in-sticky" 2 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --output "$work/sticky/link/out.json"
+expect_contains "output-symlink-in-sticky-error" "invalid-output"
+expect_eq "output-symlink-in-sticky-no-runtime-call" "0" "$(wc -l <"$stub_log" | tr -d ' ')"
 # 出力ファイルのパーミッションは umask に従う（umask 022 で 644）。
 expect_eq "output-mode-follows-umask" "644" "$(stat -c '%a' "$out_file" 2>/dev/null || stat -f '%Lp' "$out_file")"
 
@@ -628,6 +636,18 @@ STUB_MODE=exec-hang-poll expect_rc "exec-hang-poll" 1 --runtime "$stub" --bundle
 observe_ms=$(((${EPOCHREALTIME/./} - observe_t0) / 1000))
 if [ "$observe_ms" -lt 4000 ]; then pass "exec-hang-poll-bounded (${observe_ms}ms < 4000ms)"; else fail "exec-hang-poll-bounded (${observe_ms}ms)"; fi
 expect_contains "exec-hang-poll-error" "runtime-exec-not-observed"
+
+# --- 8d. 計測中の時計の変更（Codex P1）: 壁時計の区間を単調時計（/proc/uptime）と照合し、
+#         食い違えばその回を結果に使わず exit 1、stdout は空。単調時計が進まない読み元に
+#         差し替えて、壁時計だけが 150ms 以上進む状況（時計の変更と同じ食い違い）を再現する ---
+echo "100.00 0.00" >"$work/frozen-uptime"
+reset_log
+STARTUP_LATENCY_TEST_UPTIME_FILE="$work/frozen-uptime" expect_rc "clock-changed" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_contains "clock-changed-error" "clock-changed"
+expect_eq "clock-changed-stdout-empty" "" "$last_stdout"
+if grep -q '^delete ' "$stub_log"; then pass "clock-changed-delete-called"; else fail "clock-changed-delete-called"; fi
+# 単調時計の読み元が読めなければ前提欠如として exit 3。
+STARTUP_LATENCY_TEST_UPTIME_FILE="$work/no-such-uptime" expect_rc "missing-monotonic-clock" 3 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 
 # --- 9. 前提ツール欠如: jq を含まない PATH で exit 3 ---
 mkdir -p "$work/emptybin"

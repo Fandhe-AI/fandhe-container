@@ -201,36 +201,37 @@ if ! [[ "$label" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
   exit "$EXIT_INPUT"
 fi
 # 引数のディレクトリ 1 つが、他のユーザーに中のエントリを差し替えられないことを確かめる。
-# 所有者が実行ユーザーか root で、group / other の書き込み権がないか sticky ビット付き
-# （sticky なら他人は自分のエントリを rename / unlink できない）であること。find -H で
-# 引数自体の symlink は辿って参照先を検査する（symlink のエントリは親ディレクトリで守る）。
+# symlink でない実ディレクトリで、所有者が実行ユーザーか root で、group / other の書き込み権が
+# ないか sticky ビット付き（sticky なら他人は自分のエントリを rename / unlink できない）で
+# あること。find は引数の symlink を辿らない（-P）ため、symlink は -type d に一致せず拒否される。
 dir_is_safe() {
   local d="$1" uid
   uid="$(id -u)"
-  [ -n "$(find -H "$d" -maxdepth 0 -type d \( -user "$uid" -o -user 0 \) -print 2>/dev/null)" ] || return 1
-  [ -z "$(find -H "$d" -maxdepth 0 \( -perm -0020 -o -perm -0002 \) ! -perm -1000 -print 2>/dev/null)" ]
+  [ -n "$(find -P "$d" -maxdepth 0 -type d \( -user "$uid" -o -user 0 \) -print 2>/dev/null)" ] || return 1
+  [ -z "$(find -P "$d" -maxdepth 0 \( -perm -0020 -o -perm -0002 \) ! -perm -1000 -print 2>/dev/null)" ]
 }
 
 # --output の親ディレクトリから / までの全ディレクトリが dir_is_safe であることを確かめる。
-# 論理パス（symlink を含むまま）と物理パス（pwd -P）の両方の祖先をたどる。これにより、
-# 一時ファイルの作成から公開まで（mktemp・chmod・dd・ln）の間に他のユーザーがパスを
-# 差し替えられないことを保証する（root での実測で別ファイルを変更させないため）。
+# パスに symlink を含むものは拒否する（論理パスと物理パスが一致すること）。sticky な共有
+# ディレクトリ（/tmp 等）にある他人の symlink は、その所有者が検査後に差し替えられるため。
+# これにより、一時ファイルの作成から公開まで（mktemp・chmod・dd・ln）の間に他のユーザーが
+# パスを差し替えられないことを保証する（root での実測で別ファイルを変更させないため）。
 # 祖先は dirname が変化しなくなる点（"/"。先頭が "//" のパスでは "//"）で止め、念のため
 # 段数にも上限（PATH_DEPTH_MAX）を設ける（無限ループ防止）。
 output_path_is_safe() {
   local logical physical d parent depth
   logical="$(cd -- "$1" && pwd -L)" || return 1
   physical="$(cd -- "$1" && pwd -P)" || return 1
-  for d in "$logical" "$physical"; do
-    depth=0
-    while :; do
-      dir_is_safe "$d" || return 1
-      parent="$(dirname -- "$d")"
-      [ "$parent" = "$d" ] && break
-      depth=$((depth + 1))
-      [ "$depth" -le "$PATH_DEPTH_MAX" ] || return 1
-      d="$parent"
-    done
+  [ "$logical" = "$physical" ] || return 1
+  d="$physical"
+  depth=0
+  while :; do
+    dir_is_safe "$d" || return 1
+    parent="$(dirname -- "$d")"
+    [ "$parent" = "$d" ] && break
+    depth=$((depth + 1))
+    [ "$depth" -le "$PATH_DEPTH_MAX" ] || return 1
+    d="$parent"
   done
   return 0
 }
@@ -260,7 +261,7 @@ for tool in jq timeout mktemp tail rm sleep dd ln chmod find id; do
 done
 # 出力先の祖先ディレクトリの検証は find・id を使うため前提ツールの確認後に行う。
 if [ -n "$output" ] && ! output_path_is_safe "$output_dir"; then
-  err "invalid-output" "every directory above --output must be owned by you or root and not writable by others (unless sticky)"
+  err "invalid-output" "the path of --output must not contain symlinks, and every directory above it must be owned by you or root and not writable by others (unless sticky)"
   exit "$EXIT_INPUT"
 fi
 

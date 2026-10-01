@@ -20,7 +20,11 @@
 #     <接頭辞>.<i> へ書く。書けなければ READY を出さずに終了する（launcher の子孫へのファイルサイズ
 #     制限の有無を照合する）
 #   STUB_TOUCH=<パス>: READY の前にそのパスへ `raced` と書く（計測中に出力先が作られる状況の模擬）
-#   STUB_NOISE_KIB=<N>: READY の前に N KiB を標準出力へ書く（ログ上限超過の模擬）
+#   STUB_NOISE_KIB=<N>: READY の前に N KiB を標準出力へ書く（ログ上限超過の模擬）。書き終えたら
+#     STUB_NOISE_DONE のパスへ `done` と書く（launcher が書き込みを止められていないことの照合用）
+#   STUB_LINES=<N>: READY の前に短い行を N 行、1 行ずつ標準出力へ書く（小さな書き込みの連続）
+#   STUB_UNREADABLE_CHILDREN=1（疑似 /proc 使用時のみ）: launcher に読めない children 一覧を持つ
+#     スレッド（task/999999）を足す
 #   STUB_MID=launcher|child（疑似 /proc 使用時のみ）: 1 番目のコンテナが「自分の集計が始まった瞬間」に
 #     launcher ごと（launcher）または子だけ（child）終了する。子の smaps_rollup を FIFO にして計測
 #     スクリプトの読み取りと同期し、2 番目以降は 1 番目の終了を待ってから値を返す（集計中の終了を
@@ -134,9 +138,13 @@ if [ -n "${STUB_BIGWRITE:-}" ]; then
   head -c 3145728 /dev/zero >"${STUB_BIGWRITE}.${idx}" || { echo "stub: bigwrite failed" >&2; exit 9; }
 fi
 if [ -n "${STUB_TOUCH:-}" ]; then echo raced >"$STUB_TOUCH"; fi
+if [ -n "${STUB_LINES:-}" ]; then
+  for n in $(seq 1 "$STUB_LINES"); do echo "line $n"; done
+fi
 if [ -n "${STUB_NOISE_KIB:-}" ]; then
   head -c "$((STUB_NOISE_KIB * 1024))" /dev/zero | tr '\0' 'x'
   echo
+  [ -z "${STUB_NOISE_DONE:-}" ] || echo done >"$STUB_NOISE_DONE"
 fi
 if [ -n "${FAKE_PROC:-}" ] && [ "$mode" != "hang" ]; then
   IFS=, read -ra vals <<<"${STUB_PSS_BY_TRIAL:-1000}"
@@ -152,6 +160,11 @@ if [ -n "${FAKE_PROC:-}" ] && [ "$mode" != "hang" ]; then
   [ -z "$child" ] || mk "$child" "$v"
   mk "$$" "$lp"
   [ -z "$child" ] || printf '%s \n' "$child" >"$FAKE_PROC/$$/task/$$/children"
+  if [ -n "${STUB_UNREADABLE_CHILDREN:-}" ]; then
+    mkdir -p "$FAKE_PROC/$$/task/999999"
+    : >"$FAKE_PROC/$$/task/999999/children"
+    chmod 000 "$FAKE_PROC/$$/task/999999/children"
+  fi
   if [ -n "${STUB_MID:-}" ] && [ -n "$child" ]; then
     fifo="$FAKE_PROC/$child/smaps_rollup"
     rm -f "$fifo"
@@ -402,15 +415,43 @@ expect_eq "bigwrite-size-1" 3145728 "$(wc -c <"$work/big.1" 2>/dev/null || echo 
 expect_eq "bigwrite-size-2" 3145728 "$(wc -c <"$work/big.2" 2>/dev/null || echo missing)"
 expect_eq "bigwrite-no-residual" 0 "$(alive_stub_count)"
 
-# --- 12g. ログの上限は収集側で設ける: 上限（2048 KiB）を超えるログを出す launcher は計測失敗にして
-#          停止する（結果は公開しない。REPAIR-5 のリソース上限） ---
-start=$SECONDS
-STUB_NOISE_KIB=3072 run_fake --count 1 --trials 1 --timeout 20
+# --- 12g. ログの上限は収集側で設ける（REPAIR-5）: 上限（256 KiB = 262144 バイト）を超えた分は記録せず
+#          読み捨てる。launcher は 3 MiB を書き切れる（書き込みを止められず、SIGPIPE も受けない）。上限より
+#          後の READY は記録されないので起動未完了になり、ログが上限ちょうどで打ち切られたことを報告する ---
+rm -f "$work/noise-done"
+STUB_NOISE_KIB=3072 STUB_NOISE_DONE="$work/noise-done" run_fake --count 1 --trials 1 --timeout 3
 expect_eq "log-limit-exit1" 1 "$rc"
-expect_has "log-limit-stderr" "$errf" "log-limit-exceeded: trial=1 id=fc-bench50-1-1 limit_kib=2048"
+expect_has "log-limit-startup-incomplete" "$errf" "startup-incomplete: trial=1 started=0/1"
+expect_has "log-limit-truncated" "$errf" "unstarted-log-truncated: id=fc-bench50-1-1 bytes=262144 limit_kib=256"
+expect_eq "log-limit-launcher-wrote-all" "done" "$(cat "$work/noise-done" 2>/dev/null || echo missing)"
 expect_eq "log-limit-stdout-empty" 0 "$(wc -c <"$out")"
-if [ $((SECONDS - start)) -le 15 ]; then pass "log-limit-detected-before-timeout"; else fail "log-limit-detected-before-timeout"; fi
 expect_eq "log-limit-no-residual" 0 "$(alive_stub_count)"
+# 上限内（100 KiB の出力の後）の READY は記録され、N/N 起動として計測できる
+STUB_NOISE_KIB=100 run_fake --count 2 --trials 1
+expect_eq "log-within-limit-exit0" 0 "$rc"
+expect_eq "log-within-limit-started" 2 "$(jq -r '.n_started_min' "$out")"
+expect_eq "log-within-limit-no-residual" 0 "$(alive_stub_count)"
+
+# 短い行を 300 行（上限よりずっと少ないバイト数）出した後の READY も記録される（収集は書き込み回数では
+# なくバイト数で打ち切る。FIFO からの部分読みを 1 レコードと数えて早く打ち切らない）
+STUB_LINES=300 run_fake --count 2 --trials 1
+expect_eq "log-short-lines-exit0" 0 "$rc"
+expect_eq "log-short-lines-started" 2 "$(jq -r '.n_started_min' "$out")"
+expect_eq "log-short-lines-no-residual" 0 "$(alive_stub_count)"
+# 途中のコンテナで FIFO を作れない場合（selftest 専用フック）、先に起動した収集プロセスを残さない
+FANDHE_CONCURRENT_MEMORY_SELFTEST_FIFO_FAIL_AT=3 run_fake --count 4 --trials 1
+expect_eq "fifo-fail-exit1" 1 "$rc"
+expect_has "fifo-fail-stderr" "$errf" "measurement-failed: trial=1 id=fc-bench50-1-3 reason=cannot-create-log-fifo"
+expect_eq "fifo-fail-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "fifo-fail-no-leaked-collector" 0 "$(alive_stub_count)"
+
+# --- 12g2. 子プロセス一覧（task/<tid>/children）に読めないものがあれば、読めた分だけで集計しない
+#           （CORE-9・SUP-1。過少計上を成功にしない。非 root で実行されるため chmod 000 で模擬できる） ---
+STUB_UNREADABLE_CHILDREN=1 run_fake --count 2 --trials 1 --timeout 2
+expect_eq "unreadable-children-exit1" 1 "$rc"
+expect_has "unreadable-children-stderr" "$errf" "startup-incomplete: trial=1 started=0/2"
+expect_eq "unreadable-children-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "unreadable-children-no-residual" 0 "$(alive_stub_count)"
 
 # --- 12h. 集計中に終了したコンテナを検出する（CORE-9・SUP-1。先に集計したコンテナの launcher が、後続の
 #          集計中に終了しても N/N として公開しない） ---

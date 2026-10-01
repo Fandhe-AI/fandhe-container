@@ -22,6 +22,8 @@
 #   STUB_TOUCH=<パス>: READY の前にそのパスへ `raced` と書く（計測中に出力先が作られる状況の模擬）
 #   STUB_NOISE_KIB=<N>: READY の前に N KiB を標準出力へ書く（ログ上限超過の模擬）。書き終えたら
 #     STUB_NOISE_DONE のパスへ `done` と書く（launcher が書き込みを止められていないことの照合用）
+#   STUB_PREV_LOGS=<ファイル>: 2 試行目以降の launcher が、前の試行のログファイル数（自分の標準出力の
+#     FIFO と同じディレクトリにある <prefix>-<前の試行>-*.log の数）をこのファイルへ 1 行追記する
 #   STUB_LINES=<N>: READY の前に短い行を N 行、1 行ずつ標準出力へ書く（小さな書き込みの連続）
 #   STUB_UNREADABLE_CHILDREN=1（疑似 /proc 使用時のみ）: launcher に読めない children 一覧を持つ
 #     スレッド（task/999999）を足す
@@ -138,6 +140,10 @@ if [ -n "${STUB_BIGWRITE:-}" ]; then
   head -c 3145728 /dev/zero >"${STUB_BIGWRITE}.${idx}" || { echo "stub: bigwrite failed" >&2; exit 9; }
 fi
 if [ -n "${STUB_TOUCH:-}" ]; then echo raced >"$STUB_TOUCH"; fi
+if [ -n "${STUB_PREV_LOGS:-}" ] && [ "$trial" -ge 2 ]; then
+  logdir="$(dirname "$(readlink "/proc/$$/fd/1")")"
+  find "$logdir" -maxdepth 1 -name "*-$((trial - 1))-*.log" | wc -l >>"$STUB_PREV_LOGS"
+fi
 if [ -n "${STUB_LINES:-}" ]; then
   for n in $(seq 1 "$STUB_LINES"); do echo "line $n"; done
 fi
@@ -444,6 +450,13 @@ expect_eq "fifo-fail-exit1" 1 "$rc"
 expect_has "fifo-fail-stderr" "$errf" "measurement-failed: trial=1 id=fc-bench50-1-3 reason=cannot-create-log-fifo"
 expect_eq "fifo-fail-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "fifo-fail-no-leaked-collector" 0 "$(alive_stub_count)"
+
+# 試行ごとのログは次の試行の前に削除する（ディスク消費を「起動数 × 256 KiB」に保つ。REPAIR-5）。2・3 試行目の
+# launcher 各 2 個が見た「前の試行のログ数」がすべて 0 であること
+rm -f "$work/prev-logs"
+STUB_PREV_LOGS="$work/prev-logs" run_fake --count 2 --trials 3
+expect_eq "trial-logs-removed-exit0" 0 "$rc"
+expect_eq "trial-logs-removed-counts" "0,0,0,0" "$(tr -d ' ' <"$work/prev-logs" | paste -sd, -)"
 
 # --- 12g2. 子プロセス一覧（task/<tid>/children）に読めないものがあれば、読めた分だけで集計しない
 #           （CORE-9・SUP-1。過少計上を成功にしない。非 root で実行されるため chmod 000 で模擬できる） ---

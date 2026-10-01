@@ -194,6 +194,10 @@ mod linux {
     }
 
     const SAMEID_ROOT_ENV: &str = "FANDHE_STATE_IT_SAMEID_ROOT";
+    /// 子が準備完了（`@lock` 越しに開ける状態）を親へ知らせるマーカーのパス。
+    const SAMEID_READY_ENV: &str = "FANDHE_STATE_IT_SAMEID_READY";
+    /// 親が開始合図を出すマーカーのパス。子はこれが現れるまで更新を始めない。
+    const SAMEID_GO_ENV: &str = "FANDHE_STATE_IT_SAMEID_GO";
     const SAMEID_CHILD_TEST: &str = "linux::child_supervisor_updates_same_id";
     const HOLD_ROOT_ENV: &str = "FANDHE_STATE_IT_HOLD_ROOT";
     const HOLD_READY_ENV: &str = "FANDHE_STATE_IT_HOLD_READY";
@@ -214,21 +218,31 @@ mod linux {
         cmd.spawn().unwrap()
     }
 
-    /// 後着負け（`FAILED_PRECONDITION`）のときだけ `get` からやり直して 1 回書く。成功した revision を返す。
+    /// 後着負け（`FAILED_PRECONDITION`）のときだけ `get` からやり直して 1 回書く。
+    /// 成功した revision と、後着負けで取り直した回数を返す。
     fn write_with_retry(
         store: &FileStateStore,
         id: &ContainerId,
         build: &dyn Fn(&fandhe_container_core::traits::StateRecord) -> UpdateStateRequest,
-    ) -> u64 {
-        for _ in 0..MAX_RETRIES_PER_WRITE {
+    ) -> (u64, u32) {
+        for retries in 0..MAX_RETRIES_PER_WRITE {
             let cur = store.get(&GetStateRequest::new(id.clone())).unwrap();
             match store.update(&build(&cur)) {
-                Ok(rec) => return rec.revision().value(),
+                Ok(rec) => return (rec.revision().value(), retries),
                 Err(e) if e.code() == ErrorCode::FailedPrecondition => continue,
                 Err(e) => panic!("unexpected update error: {e:?}"),
             }
         }
         panic!("update kept losing the revision race");
+    }
+
+    /// マーカーファイルが現れるまで期限付きで待つ（REPAIR-5: 無限待ちにしない）。
+    fn wait_for_marker(path: &Path, what: &str) {
+        let deadline = Instant::now() + CHILD_DEADLINE;
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// 子プロセス側（supervisor 役）。`SAMEID_ROOT_ENV` があるときだけ動く。
@@ -240,12 +254,18 @@ mod linux {
         let store = open(Path::new(&root));
         let id = cid("web");
         let pid = NonZeroU32::new(std::process::id()).unwrap();
+        // 準備完了を知らせ、親の開始合図まで待つ（親子の更新開始を揃えて競合を保証する）。
+        fs::write(std::env::var_os(SAMEID_READY_ENV).unwrap(), b"ready").unwrap();
+        let go = std::path::PathBuf::from(std::env::var_os(SAMEID_GO_ENV).unwrap());
+        wait_for_marker(&go, "go marker");
         for i in 1..=SAME_ID_WRITES {
             write_with_retry(&store, &id, &|cur| {
                 UpdateStateRequest::new(cur.status().clone(), cur.revision()).with_supervision(
                     SupervisionState::new(Some(pid), Some(HealthStatus::Healthy), i),
                 )
             });
+            // supervisor の監視ループ間隔を模して短く譲り、親の更新と時間的に重ねる。
+            std::thread::sleep(Duration::from_millis(3));
         }
     }
 
@@ -257,13 +277,39 @@ mod linux {
         let parent = open(t.path());
         let id = cid("web");
         parent.create(&create_req("web")).unwrap();
-        let child = spawn_worker(SAMEID_CHILD_TEST, &[(SAMEID_ROOT_ENV, t.path())]);
+        let marker_dir = TmpDir::new("sameid-marker");
+        let ready = marker_dir.path().join("ready");
+        let go = marker_dir.path().join("go");
+        let mut child = spawn_worker(
+            SAMEID_CHILD_TEST,
+            &[
+                (SAMEID_ROOT_ENV, t.path()),
+                (SAMEID_READY_ENV, &ready),
+                (SAMEID_GO_ENV, &go),
+            ],
+        );
+        // 子の準備完了を待ってから開始合図を出し、双方が同時に更新を始める。
+        let deadline = Instant::now() + CHILD_DEADLINE;
+        while !ready.exists() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not become ready within the deadline");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fs::write(&go, b"go").unwrap();
         // CLI 役: supervision 未指定で status だけを往復させる（既存の supervision は引き継がれる）。
-        let mut last_status = "created";
+        let mut last_status;
         let mut observed = Vec::new();
-        for i in 0..SAME_ID_WRITES {
-            let creating = i % 2 == 0;
-            let rev = write_with_retry(&parent, &id, &|cur| {
+        let mut child_progress = Vec::new();
+        let write_deadline = Instant::now() + CHILD_DEADLINE;
+        // 最低 N 回、かつ子が N 回書き終えたと観測するまで書き続ける。親が子の開始前に終わって
+        // 直列実行になるのを防ぐ（子が進行中の値を親が観測できる = 同時書き込みの証拠）。
+        let mut i = 0u32;
+        loop {
+            let creating = i.is_multiple_of(2);
+            let (rev, _retries) = write_with_retry(&parent, &id, &|cur| {
                 let status = if creating {
                     ContainerStatus::creating(cid("web"))
                 } else {
@@ -274,13 +320,19 @@ mod linux {
             last_status = if creating { "creating" } else { "created" };
             observed.push(rev);
             // 競合中も常に完全なレコードが読める。
-            assert_eq!(
-                parent
-                    .get(&GetStateRequest::new(id.clone()))
-                    .unwrap()
-                    .id()
-                    .as_str(),
-                "web"
+            let seen = parent.get(&GetStateRequest::new(id.clone())).unwrap();
+            assert_eq!(seen.id().as_str(), "web");
+            child_progress.push(seen.restart_count());
+            i += 1;
+            // ロック取得は期限付きのポーリングのため、親が連続して取り直すと子が割り込めない。
+            // 実際の CLI 操作間隔を模して短く譲り、双方が交互にロックを取れるようにする。
+            std::thread::sleep(Duration::from_millis(2));
+            if i >= SAME_ID_WRITES && seen.restart_count() >= SAME_ID_WRITES {
+                break;
+            }
+            assert!(
+                Instant::now() < write_deadline,
+                "child did not finish its writes in time: {child_progress:?}"
             );
         }
         wait_with_deadline(child);
@@ -288,13 +340,22 @@ mod linux {
             observed.windows(2).all(|w| w[0] < w[1]),
             "parent revisions must be strictly increasing: {observed:?}"
         );
+        // 競合の発生を確認する: 親が更新を続けている最中に、子の進行が途中値（0 < n < N）で観測された。
+        // 親子の更新が時間的に重なっていなければ、同一 ID への同時書き込みを検証できていない。
+        assert!(
+            child_progress.iter().any(|&c| c > 0 && c < SAME_ID_WRITES),
+            "parent never observed the child mid-run (writes were serialized by timing): {child_progress:?}"
+        );
         let fin = parent.get(&GetStateRequest::new(id.clone())).unwrap();
         assert_eq!(fin.status().state().as_str(), last_status);
         assert_eq!(fin.restart_count(), SAME_ID_WRITES);
         assert_eq!(fin.health(), Some(HealthStatus::Healthy));
         assert!(fin.supervisor_pid().is_some());
-        // create が revision 0、その後に親子の成功した更新が 2N 回（lost update なし）。
-        assert_eq!(fin.revision().value(), 2 * u64::from(SAME_ID_WRITES));
+        // create が revision 0、その後に親子の成功した更新が（親 observed.len() + 子 N）回（lost update なし）。
+        assert_eq!(
+            fin.revision().value(),
+            observed.len() as u64 + u64::from(SAME_ID_WRITES)
+        );
         assert_eq!(parent.find_corrupted().unwrap(), Vec::<ContainerId>::new());
         let entries: Vec<String> = fs::read_dir(t.path().join("web"))
             .unwrap()

@@ -90,6 +90,7 @@
 //!
 //! エラーメッセージは固定文言のみで、pid・パス・errno を含めない。
 
+use super::error::{LifecycleOp, OciRuntimeError};
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     CgroupScope, ContainerId, ContainerState, DeleteRequest, DeleteResponse, DeleteStateRequest,
@@ -150,14 +151,19 @@ pub trait ContainerCgroupRemover: Send + Sync {
 /// 生きている可能性のある状態は [`ErrorCode::FailedPrecondition`]、`force` で生きているコンテナを
 /// 削除する要求は [`ErrorCode::Unimplemented`]。成功・失敗の件数と所要時間は `recorder` へ操作名
 /// `delete` で記録する（全終了経路。REPAIR-4）。
+///
+/// 失敗は [`OciRuntimeError`]（op = delete・内部エラーと同一の code・非ゼロの `exit_code`）で返す。標準エラーへの
+/// 書き出しとプロセス終了は呼び出し元（CLI・plugin）の責務（ERR-2・TASK-96.3）。
 pub fn delete(
     store: &dyn StateStore,
     recorder: &OpRecorder,
     cgroups: &dyn ContainerCgroupRemover,
     req: &DeleteRequest,
-) -> Result<DeleteResponse, TraitError> {
-    let name = OpName::new(DELETE_OP_NAME)?;
-    recorder.record_op(&name, || delete_inner(store, cgroups, req))
+) -> Result<DeleteResponse, OciRuntimeError> {
+    // 変換は最上位 1 か所のみ。内部関数は `TraitError` のまま（波及最小）。
+    let to_err = |e: TraitError| OciRuntimeError::from_trait_error(LifecycleOp::Delete, e);
+    let name = OpName::new(DELETE_OP_NAME).map_err(to_err)?;
+    recorder.record_op(&name, || delete_inner(store, cgroups, req).map_err(to_err))
 }
 
 fn delete_inner(
@@ -480,7 +486,7 @@ mod tests {
         remover: &RecordingRemover,
         id: &str,
         force: bool,
-    ) -> Result<DeleteResponse, TraitError> {
+    ) -> Result<DeleteResponse, OciRuntimeError> {
         delete(
             store,
             &OpRecorder::new(),
@@ -489,7 +495,11 @@ mod tests {
         )
     }
 
-    fn run(store: &MemStateStore, id: &str, force: bool) -> Result<DeleteResponse, TraitError> {
+    fn run(
+        store: &MemStateStore,
+        id: &str,
+        force: bool,
+    ) -> Result<DeleteResponse, OciRuntimeError> {
         run_with(
             store,
             &RecordingRemover::returning(Ok(CgroupRemoval::NotPresent)),
@@ -596,6 +606,41 @@ mod tests {
         run(&store, "c1", false).expect("first");
         let err = run(&store, "c1", false).expect_err("second");
         assert_eq!(err.code(), ErrorCode::NotFound);
+    }
+
+    /// ERR-2・TASK-96.3: delete の失敗は op = delete・終了コード・stderr 向け 1 行 JSON を備え、失敗が計数される。
+    #[test]
+    fn err2_delete_failure_is_structured() {
+        let store = MemStateStore::default();
+        let rec = OpRecorder::new();
+        let remover = RecordingRemover::returning(Ok(CgroupRemoval::NotPresent));
+        let err = delete(&store, &rec, &remover, &DeleteRequest::new(cid("missing")))
+            .expect_err("not found");
+        assert_eq!(err.op(), LifecycleOp::Delete);
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(err.exit_code().get(), 3);
+        let mut out = Vec::new();
+        err.write_json_line(&mut out).expect("write");
+        let line = String::from_utf8(out).expect("utf8");
+        assert!(line.starts_with("{\"op\":\"delete\",\"code\":\"NOT_FOUND\",\"message\":"));
+        assert!(line.ends_with("}\n"));
+        let stats = rec
+            .snapshot_op(&OpName::new(DELETE_OP_NAME).expect("name"))
+            .expect("recorded");
+        assert_eq!((stats.success(), stats.failure()), (0, 1));
+    }
+
+    /// ERR-2・TASK-96.3: 実行中の delete は終了コード 5、生存中の force は終了コード 8。
+    #[test]
+    fn err2_delete_live_exit_codes() {
+        let store = MemStateStore::with(ContainerStatus::running(cid("c1"), pid(4242)));
+        let err = run(&store, "c1", false).expect_err("precondition");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(err.exit_code().get(), 5);
+        let err = run(&store, "c1", true).expect_err("unimplemented");
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert_eq!(err.exit_code().get(), 8);
+        assert!(store.has("c1"));
     }
 
     /// OCI-6: 未 create の ID は `NotFound`。

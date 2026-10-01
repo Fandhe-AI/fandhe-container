@@ -6,8 +6,8 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! create / start の失敗経路への結線は TASK-96.2 で済み（公開関数の戻り値が [`OciRuntimeError`]）、
-//! kill / delete は TASK-96.3 で結線する。標準エラー向けの構造化 1 行は
+//! create / start（TASK-96.2）・kill / delete（TASK-96.3）の失敗経路への結線は済み（4 操作の公開関数の
+//! 戻り値が [`OciRuntimeError`]）。標準エラー向けの構造化 1 行は
 //! [`OciRuntimeError::write_json_line`] が任意の `Write` へ書く。キーは `op` / `code` / `message` の
 //! 3 つ固定（`code` は [`ErrorCode::as_str`] の文字列で ERR-1 と同一体系）。共通ヘッダ（`event`・
 //! タイムスタンプ等）は付けない（形式統一は TASK-98・ERR-4）。

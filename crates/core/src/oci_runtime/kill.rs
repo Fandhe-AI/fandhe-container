@@ -9,7 +9,7 @@
 //!
 //! # 処理順（ERR-2・REPAIR-4）
 //!
-//! 1. 操作名 `kill` で `OpRecorder` に記録する（全終了経路）
+//! 1. 操作名 `kill` で `OpRecorder` に記録する（全終了経路）。失敗は公開境界で `OciRuntimeError` へ変換する（TASK-96.3）
 //! 2. `StateStore::get`。未 create の ID は `NotFound`（signaler は呼ばない）
 //! 3. 状態の確認。`Running`・pid あり（と将来の `Created`・pid あり）だけ送信へ進む。`Running`・pid なし
 //!    （中断された start の予約）と、それ以外（`Created`・pid なし / `Creating` / `Stopped`）は
@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::LAUNCHER_REPLY_GRACE;
+use super::error::{LifecycleOp, OciRuntimeError};
 use super::launch::START_TIMEOUT_MAX;
 use super::start::{Unbounded, call_bounded};
 use crate::observability::{OpName, OpRecorder};
@@ -116,15 +117,23 @@ impl Default for KillTimeout {
 /// [`ErrorCode::NotFound`]、送信できない状態は [`ErrorCode::FailedPrecondition`]、signaler の応答が上限
 /// （`timeout`）を超えたら [`ErrorCode::Timeout`]。成功・失敗の件数と所要時間は `recorder` へ操作名
 /// `kill` で記録する（全終了経路。REPAIR-4）。
+///
+/// 失敗は [`OciRuntimeError`]（op = kill・内部エラーと同一の code・非ゼロの `exit_code`）で返す。標準エラーへの
+/// 書き出しとプロセス終了は呼び出し元（CLI・plugin）の責務（ERR-2・TASK-96.3）。`KillTimeout::new` は
+/// 4 操作の外なので `TraitError` のまま。
 pub fn kill(
     store: &dyn StateStore,
     recorder: &OpRecorder,
     signaler: &Arc<dyn ProcessSignaler>,
     req: &KillRequest,
     timeout: &KillTimeout,
-) -> Result<ContainerStatus, TraitError> {
-    let name = OpName::new(KILL_OP_NAME)?;
-    recorder.record_op(&name, || kill_inner(store, signaler, req, timeout))
+) -> Result<ContainerStatus, OciRuntimeError> {
+    // 変換は最上位 1 か所のみ。内部関数は `TraitError` のまま（波及最小）。
+    let to_err = |e: TraitError| OciRuntimeError::from_trait_error(LifecycleOp::Kill, e);
+    let name = OpName::new(KILL_OP_NAME).map_err(to_err)?;
+    recorder.record_op(&name, || {
+        kill_inner(store, signaler, req, timeout).map_err(to_err)
+    })
 }
 
 fn kill_inner(
@@ -301,7 +310,7 @@ mod tests {
         store: &MemStateStore,
         signaler: &Arc<FakeSignaler>,
         id: &str,
-    ) -> Result<ContainerStatus, TraitError> {
+    ) -> Result<ContainerStatus, OciRuntimeError> {
         let dynamic: Arc<dyn ProcessSignaler> = signaler.clone();
         kill(
             store,
@@ -320,6 +329,46 @@ mod tests {
         let err = run(&store, &signaler, "missing").expect_err("not found");
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert_eq!(signaler.count.load(Ordering::SeqCst), 0);
+    }
+
+    /// ERR-2・TASK-96.3: kill の失敗は op = kill・終了コード・stderr 向け 1 行 JSON を備え、失敗が計数される。
+    #[test]
+    fn err2_kill_failure_is_structured() {
+        let store = MemStateStore::default();
+        let signaler = FakeSignaler::new(Duration::ZERO);
+        let dynamic: Arc<dyn ProcessSignaler> = signaler.clone();
+        let rec = OpRecorder::new();
+        let err = kill(
+            &store,
+            &rec,
+            &dynamic,
+            &req("missing", Signal::SIGTERM),
+            &KillTimeout::default(),
+        )
+        .expect_err("not found");
+        assert_eq!(err.op(), LifecycleOp::Kill);
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(err.exit_code().get(), 3);
+        let mut out = Vec::new();
+        err.write_json_line(&mut out).expect("write");
+        let line = String::from_utf8(out).expect("utf8");
+        assert!(line.starts_with("{\"op\":\"kill\",\"code\":\"NOT_FOUND\",\"message\":"));
+        assert!(line.ends_with("}\n"));
+        let stats = rec
+            .snapshot_op(&OpName::new(KILL_OP_NAME).expect("name"))
+            .expect("recorded");
+        assert_eq!((stats.success(), stats.failure()), (0, 1));
+    }
+
+    /// ERR-2・TASK-96.3: 非実行状態への kill は `FailedPrecondition`・終了コード 5。
+    #[test]
+    fn err2_kill_stopped_exit_code_is_five() {
+        let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
+        let signaler = FakeSignaler::new(Duration::ZERO);
+        let err = run(&store, &signaler, "c1").expect_err("rejected");
+        assert_eq!(err.op(), LifecycleOp::Kill);
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(err.exit_code().get(), 5);
     }
 
     /// CORE-2: pid のない Created・Stopped・Creating は送らず `FailedPrecondition`。

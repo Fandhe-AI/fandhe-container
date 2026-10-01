@@ -66,14 +66,54 @@ fn main() {
         }
     }
 
+    /// 文字列を JSON 文字列リテラル（引用符込み）へエスケープする。`"`・`\`・制御文字を処理する。
+    fn json_str(s: &str) -> String {
+        let mut out = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// 予測困難な名前（`/dev/urandom` 由来）で 0700 の専用ディレクトリを新規作成する。
+    /// 既存名と衝突した場合（`AlreadyExists`）は別の乱数で再試行し、symlink 等の事前作成を踏まない。
+    fn create_unique_dir(base: &Path, mode: &str) -> PathBuf {
+        use std::io::Read;
+        use std::os::unix::fs::DirBuilderExt;
+        for _ in 0..16 {
+            let mut buf = [0u8; 8];
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| f.read_exact(&mut buf))
+                .expect("read /dev/urandom");
+            let dir = base.join(format!(
+                "fandhe-landlock-{}-{:016x}-{}",
+                std::process::id(),
+                u64::from_le_bytes(buf),
+                mode.trim_start_matches('-')
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => return dir,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create probe dir: {e}"),
+            }
+        }
+        panic!("could not create a unique probe dir");
+    }
+
     fn config_for(dir: &Path, extra_mount: Option<&str>) -> OciConfig {
         let allowed = dir.join("allowed");
-        let allowed = allowed.to_str().expect("utf8 path");
+        let allowed = json_str(allowed.to_str().expect("utf8 path"));
         let extra = extra_mount
-            .map(|m| format!(r#",{{"destination":"{m}","options":["rw"]}}"#))
+            .map(|m| format!(r#",{{"destination":{},"options":["rw"]}}"#, json_str(m)))
             .unwrap_or_default();
         let json = format!(
-            r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":true}},"mounts":[{{"destination":"{allowed}","options":["rw"]}}{extra}]}}"#
+            r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":true}},"mounts":[{{"destination":{allowed},"options":["rw"]}}{extra}]}}"#
         );
         parse_config_bytes(json.as_bytes()).expect("valid config")
     }
@@ -216,13 +256,7 @@ fn main() {
     // RealKernel のルールパス解決は symlink を拒否するため canonicalize 済みの一時領域を使う。
     let base = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp dir");
     for mode in ["--child-access", "--child-missing-rule"] {
-        let dir = base.join(format!(
-            "fandhe-landlock-{}-{}",
-            std::process::id(),
-            mode.trim_start_matches('-')
-        ));
-        // 共有 /tmp の事前作成（symlink 等）を避けるため、既存なら失敗させる。
-        std::fs::create_dir(&dir).expect("create probe dir (must not pre-exist)");
+        let dir = create_unique_dir(&base, mode);
         for sub in ["allowed", "denied"] {
             std::fs::create_dir(dir.join(sub)).expect("create probe subdir");
             for f in ["existing", "readable"] {

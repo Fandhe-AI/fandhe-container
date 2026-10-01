@@ -338,6 +338,34 @@ pub(crate) fn probe_denied_syscalls() -> Result<SeccompProbeRecord, ExecError> {
     })
 }
 
+/// 攻撃テスト ESC-03 用: コンテナ内（PID 1・pivot 済み）から `mount(2)` を 1 回試行して結果を返す（SEC-2・TASK-42.2・#200）。
+///
+/// `tests/escape_suite.rs` の攻撃クロージャ（`spawn_container_probe` の子）から呼ばれる。テスト側は
+/// `unsafe` を書けず raw syscall を発行できないため、既存の `sys::mount_root_private_recursive`
+/// （`mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)`。propagation の変更のみで新たなマウントは作らない）を
+/// 薄く包む。新規 `unsafe`・新規 `sys` ラッパーは追加しない。
+///
+/// 誤用の封じ込め: PID 1 以外（= 分離の外のホストプロセス）から呼ばれた場合は syscall を発行せず
+/// `FailedPrecondition` を返す（ホストの `/` の propagation を変えない。fail-closed）。
+///
+/// # 将来仕様（記録のみ）
+///
+/// exec が許可されたら（証跡配線後。後続作業）、エントリポイント内のプローブへ置き換えて本関数を廃止する（REPAIR-3）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn escape_probe_mount() -> Result<ProbeOutcome, ExecError> {
+    if std::process::id() != 1 {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Seccomp,
+            "escape_probe_mount must run as PID 1 inside the container".to_string(),
+        ));
+    }
+    Ok(ProbeOutcome::from_result(
+        sys::mount_root_private_recursive(),
+    ))
+}
+
 /// 単一スレッド条件を適用の前後で検査して [`apply_filter`] を呼ぶ。事前検査は副作用の前に行う。
 fn apply_single_threaded(
     program: &SeccompProgram,

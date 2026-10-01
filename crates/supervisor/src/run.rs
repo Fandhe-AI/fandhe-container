@@ -83,8 +83,8 @@ use crate::state::SupervisedState;
 /// 捕捉の終端待ち（drain）の既定の上限。
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `drain_timeout` の上限。これを超える値は拒否する（REPAIR-5）。
-pub const MAX_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// `drain_timeout` の上限。これを超える値は拒否する（REPAIR-5）。[`LogCapture::drain`] の上限と同じ値。
+pub const MAX_DRAIN_TIMEOUT: Duration = crate::logs::MAX_DRAIN_TIMEOUT;
 
 /// 1 回の `wait` の既定の上限。
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);

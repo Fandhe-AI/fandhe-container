@@ -8,8 +8,10 @@
 //! # 契約
 //! - 行は LF を除いたバイト列で渡す（UTF-8 を仮定しない。CR は除去しない）。EOF 時の LF なし末尾行も 1 行として渡す。
 //! - 1 行は [`MAX_LINE_BYTES`] で切り捨てる（超過ぶんは捨て、[`StreamSummary::truncated_lines`] へ数える。無制限確保の防止）。
-//! - [`LogSink::append`] が失敗しても読み取りは EOF まで続けて破棄する（読みを止めるとパイプが詰まり、
-//!   コンテナ側の write がブロックするため）。最初のエラーコードだけを [`StreamSummary::error_code`] に残す。
+//! - [`LogSink::append`] が失敗したら、そのストリームでは以後 sink を呼ばない（故障した sink へ出力行数ぶんの
+//!   失敗処理を繰り返さない）。読み取りは EOF まで続けて破棄する（読みを止めるとパイプが詰まり、コンテナ側の write が
+//!   ブロックするため）。失敗コードを [`StreamSummary::error_code`] に、sink へ届かなかった行数（失敗した行を含む）を
+//!   [`StreamSummary::discarded_lines`] に残す。
 //! - [`LogCapture::drain`] は期限付き（REPAIR-5）。期限切れ（孫プロセスがパイプを保持し続ける場合等）では
 //!   ブロック中の `Read` を外から中断する汎用手段がないため、リーダースレッドは切り離される。
 //!   `drain` は `Err` を返す全経路（期限切れ・溢れる timeout・リーダーの異常終了）で、返る前に捕捉を取り消す。
@@ -141,6 +143,13 @@ pub const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
 /// [`MemoryLogSink`] の既定の保持上限（総バイト数）。
 pub const DEFAULT_MEMORY_SINK_BYTES: usize = 1024 * 1024;
 
+/// [`MemoryLogSink`] の保持上限に指定できる最大値（総バイト数）。非信頼な出力で supervisor のメモリを
+/// 使い尽くせないよう、これを超える容量は拒否する（常駐メモリを抑える設計目標とも整合。CORE-8）。
+pub const MAX_MEMORY_SINK_BYTES: usize = 64 * 1024 * 1024;
+
+/// [`LogCapture::drain`] の `timeout` に指定できる最大値（REPAIR-5）。
+pub const MAX_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 出力の種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -200,6 +209,7 @@ impl OutputStreams {
 /// 捕捉した行の記録先。TASK-164（SUP-7）がファイル・ローテーション実装へ差し替える拡張点。
 pub trait LogSink: Send + Sync {
     /// 1 行（LF 抜き・[`MAX_LINE_BYTES`] 以下）を追記する。失敗は構造化エラーで返す（panic しない）。
+    /// `Err` を返すと、そのストリームでは以後呼ばれない（残りの行は読み捨てられる）。
     ///
     /// 有限時間で戻ること。戻らない `append` はリーダースレッドとその枠（[`ReaderBudget`]）を占有し続け、
     /// パイプが詰まってコンテナ側の write を止める。[`LogCapture::drain`] は `append` の完了を期限を超えて待たない。
@@ -239,11 +249,18 @@ pub struct MemoryLogSink {
 
 impl MemoryLogSink {
     /// `capacity_bytes` が最大 1 行ぶん（[`MAX_LINE_BYTES`] + 行ごとの固定費）未満なら `InvalidArgument`（1 行が保持できなくなるため）。
+    /// [`MAX_MEMORY_SINK_BYTES`] 超も `InvalidArgument`（保持量に上限の無い sink を作れないようにする）。
     pub fn new(capacity_bytes: usize) -> Result<Self, TraitError> {
         if capacity_bytes < line_cost(MAX_LINE_BYTES) {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 "memory sink capacity is smaller than the maximum line size",
+            ));
+        }
+        if capacity_bytes > MAX_MEMORY_SINK_BYTES {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "memory sink capacity is larger than the maximum",
             ));
         }
         Ok(Self {
@@ -306,6 +323,7 @@ pub struct StreamSummary {
     lines: u64,
     bytes: u64,
     truncated_lines: u64,
+    discarded_lines: u64,
     error_code: Option<ErrorCode>,
 }
 
@@ -321,6 +339,10 @@ impl StreamSummary {
     /// [`MAX_LINE_BYTES`] で切り捨てた行数。
     pub fn truncated_lines(&self) -> u64 {
         self.truncated_lines
+    }
+    /// sink の追記失敗により sink へ届かなかった行数（失敗した行と、以後に読み捨てた行）。[`Self::lines`] の内数。
+    pub fn discarded_lines(&self) -> u64 {
+        self.discarded_lines
     }
     /// 読み取りまたは sink 追記で最初に起きた失敗のコード。
     pub fn error_code(&self) -> Option<ErrorCode> {
@@ -551,7 +573,7 @@ impl LogCapture {
     }
 
     /// 全ストリームが EOF になるまで `timeout` を上限に待つ。期限切れは `Timeout`、
-    /// 期限を表現できない `timeout`（`Duration::MAX` 等）は `InvalidArgument`。
+    /// [`MAX_DRAIN_TIMEOUT`] を超える `timeout`（`Duration::MAX` 等）は `InvalidArgument`。
     ///
     /// `Err` を返す全経路で、返る前に捕捉を取り消す（`self` を消費するため、呼び出し側は後から止められない）。
     /// 取消しの要求後に新しい追記は始まらず、リーダーは次に `read` が戻った時点で終了する。
@@ -562,9 +584,14 @@ impl LogCapture {
     /// `Err` が返った後に完了し得る（module doc 参照）。
     pub fn drain(self, timeout: Duration) -> Result<CaptureSummary, TraitError> {
         let started = Instant::now();
-        // Duration::MAX 等で加算が溢れても panic しない（公開 API のため直接呼ばれうる）。
-        let Some(deadline) = started.checked_add(timeout) else {
-            // 期限を表現できない場合も取り消してから返す。待つのは固定の猶予まで。
+        // 公開 API のため直接呼ばれうる。上限超は拒否し、Duration::MAX 等で加算が溢れても panic しない。
+        let deadline = if timeout > MAX_DRAIN_TIMEOUT {
+            None
+        } else {
+            started.checked_add(timeout)
+        };
+        let Some(deadline) = deadline else {
+            // 不正な timeout でも取り消してから返す。待つのは固定の猶予まで。
             let until = started
                 .checked_add(CANCEL_SETTLE_TIMEOUT)
                 .unwrap_or(started);
@@ -634,6 +661,8 @@ struct LineSplitter<'a> {
     cancel: &'a CancelGate,
     /// 取消しを検知した（以後は sink へ渡さない）。
     cancelled: bool,
+    /// sink の追記が失敗した（以後は sink を呼ばず、読み捨てる）。
+    sink_failed: bool,
     buf: Vec<u8>,
     cut: bool,
     summary: StreamSummary,
@@ -661,18 +690,25 @@ impl LineSplitter<'_> {
     }
 
     fn emit(&mut self) {
-        // 取消しの確認と「実行中」の計上を不可分にする（要求後に新しい追記を始めない）。
-        let Some(appended) = self
-            .cancel
-            .run_unless_cancelled(|| self.sink.append(self.kind, &self.buf))
-        else {
-            self.cancelled = true;
-            self.buf.clear();
-            return;
-        };
-        if let Err(e) = appended {
-            // 読み取りは続ける（パイプを詰まらせない）。最初のコードだけ残す。
-            self.summary.error_code.get_or_insert(e.code());
+        if self.sink_failed {
+            // 故障した sink は再度呼ばない。行としては数え、届かなかった行数に計上する。
+            self.summary.discarded_lines = self.summary.discarded_lines.saturating_add(1);
+        } else {
+            // 取消しの確認と「実行中」の計上を不可分にする（要求後に新しい追記を始めない）。
+            let Some(appended) = self
+                .cancel
+                .run_unless_cancelled(|| self.sink.append(self.kind, &self.buf))
+            else {
+                self.cancelled = true;
+                self.buf.clear();
+                return;
+            };
+            if let Err(e) = appended {
+                // 読み取りは続ける（パイプを詰まらせない）が、以後このストリームでは sink を呼ばない。
+                self.summary.error_code.get_or_insert(e.code());
+                self.summary.discarded_lines = self.summary.discarded_lines.saturating_add(1);
+                self.sink_failed = true;
+            }
         }
         self.summary.lines = self.summary.lines.saturating_add(1);
         if self.cut {
@@ -695,6 +731,7 @@ fn pump(
         sink,
         cancel,
         cancelled: false,
+        sink_failed: false,
         buf: Vec::new(),
         cut: false,
         summary: StreamSummary::default(),
@@ -1249,6 +1286,7 @@ mod tests {
         assert_eq!(s.error_code(), Some(ErrorCode::Internal));
         assert_eq!(s.bytes(), 6);
         assert_eq!(s.lines(), 3);
+        assert_eq!(s.discarded_lines(), 3);
     }
 
     /// REPAIR-5・TASK-157.7: 閉じないストリームでは drain が Timeout になる。

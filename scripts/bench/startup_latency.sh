@@ -198,6 +198,35 @@ if ! [[ "$label" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
   err "invalid-label" "label must match ^[A-Za-z0-9._-]{1,64}$"
   exit "$EXIT_INPUT"
 fi
+# 引数のディレクトリ 1 つが、他のユーザーに中のエントリを差し替えられないことを確かめる。
+# 所有者が実行ユーザーか root で、group / other の書き込み権がないか sticky ビット付き
+# （sticky なら他人は自分のエントリを rename / unlink できない）であること。find -H で
+# 引数自体の symlink は辿って参照先を検査する（symlink のエントリは親ディレクトリで守る）。
+dir_is_safe() {
+  local d="$1" uid
+  uid="$(id -u)"
+  [ -n "$(find -H "$d" -maxdepth 0 -type d \( -user "$uid" -o -user 0 \) -print 2>/dev/null)" ] || return 1
+  [ -z "$(find -H "$d" -maxdepth 0 \( -perm -0020 -o -perm -0002 \) ! -perm -1000 -print 2>/dev/null)" ]
+}
+
+# --output の親ディレクトリから / までの全ディレクトリが dir_is_safe であることを確かめる。
+# 論理パス（symlink を含むまま）と物理パス（pwd -P）の両方の祖先をたどる。これにより、
+# 一時ファイルの作成から公開まで（mktemp・chmod・dd・ln）の間に他のユーザーがパスを
+# 差し替えられないことを保証する（root での実測で別ファイルを変更させないため）。
+output_path_is_safe() {
+  local logical physical d
+  logical="$(cd -- "$1" && pwd -L)" || return 1
+  physical="$(cd -- "$1" && pwd -P)" || return 1
+  for d in "$logical" "$physical"; do
+    while :; do
+      dir_is_safe "$d" || return 1
+      [ "$d" = "/" ] && break
+      d="$(dirname -- "$d")"
+    done
+  done
+  return 0
+}
+
 if [ -n "$output" ]; then
   if [ -e "$output" ] || [ -L "$output" ]; then
     err "invalid-output" "--output must not already exist"
@@ -215,12 +244,17 @@ if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
   err "missing-prerequisite" "bash 5 or later is required (EPOCHREALTIME)"
   exit "$EXIT_PREREQ"
 fi
-for tool in jq timeout mktemp tail rm sleep dd ln chmod; do
+for tool in jq timeout mktemp tail rm sleep dd ln chmod find id; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     err "missing-prerequisite" "required tool not found: $tool"
     exit "$EXIT_PREREQ"
   fi
 done
+# 出力先の祖先ディレクトリの検証は find・id を使うため前提ツールの確認後に行う。
+if [ -n "$output" ] && ! output_path_is_safe "$output_dir"; then
+  err "invalid-output" "every directory above --output must be owned by you or root and not writable by others (unless sticky)"
+  exit "$EXIT_INPUT"
+fi
 
 tmpdir="$(mktemp -d)"
 # コンテナ ID の実行固有部。PID だけでは過去の実行で残ったコンテナと再利用時に衝突し、
@@ -593,6 +627,8 @@ if [ -n "$output" ]; then
   # 完成した結果だけを出力先に公開する（書き込みが途中で失敗しても不完全な JSON を
   # 出力先に残さない）。手順:
   #   1. 結果を非公開の tmpdir に書く。
+  # 前提: output_path_is_safe により、出力先のディレクトリと祖先は他のユーザーがエントリを
+  # 差し替えられない（以下のパス指定の操作が、今回作った一時ファイル以外を指さない）。
   #   2. 出力先と同じディレクトリに mktemp で一時ファイルを作る。mktemp は O_CREAT|O_EXCL で
   #      未使用の名前を作成して返すため、返されたパスは今回作った通常ファイルであり、既存の
   #      ファイルを再利用しない（失敗時に消してよいのはこのパスだけ）。

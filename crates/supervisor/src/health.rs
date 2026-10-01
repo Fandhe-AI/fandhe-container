@@ -17,8 +17,11 @@
 //!   （古い成功を保持しない。revision 競合時は読み直して再判定する）。降格の成否は [`ProbeFailure::demotion`] で
 //!   呼び出し側が識別できる（降格に失敗した場合は `Healthy` が残り得る。SUP-4）。
 //!   未設定・`Starting`・`Unhealthy` の状態は書かない（未実装スタブが状態を書き換えない）。
-//! - probe は呼び出し側が所有する別スレッドで実行し、`timeout` で待ちを打ち切る（REPAIR-5）。超過時は
-//!   [`HealthProbe::cancel`] を呼んで実装側に子プロセスの kill・回収を促し、結果は破棄する。
+//! - probe は別スレッドで実行し、`timeout` で待ちを打ち切る（REPAIR-5）。超過時は [`HealthProbe::cancel`] を
+//!   別スレッドで呼び（これも `timeout` で打ち切る）、実装側に子プロセスの kill・回収を促し、結果は破棄する。
+//!   打ち切り後に戻っていない probe / cancel スレッドは [`ProbeRunner`] が数え、残っている間は新しい判定を
+//!   `Unavailable` で拒否する（スレッド・子プロセスの累積を防ぐ。同時に走る判定は最大 1 本）。
+//! - `Unhealthy` 等の記録に失敗した場合も、既存の `Healthy` を降格する（失敗は [`ProbeFailure::demotion`] で識別できる）。
 //! - テスト用フェイクは `run.rs` と別に持つ。共有化は #242（TASK-157.8）で検討する。
 //!
 //! # 契約
@@ -29,6 +32,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
@@ -157,32 +161,112 @@ fn verify_owned(
     ensure_owner(rec, self_pid)
 }
 
-/// `probe` を別スレッドで実行し、`timeout` で待ちを打ち切る。超過時は [`HealthProbe::cancel`] を呼ぶ（REPAIR-5）。
+/// 未終了（打ち切り後に残った probe / cancel）のスレッドを数える。生存中は新しい判定を始めさせない。
 ///
-/// 打ち切った後も probe スレッドは戻るまで残り得る（実装が `cancel` で子プロセスを回収して戻る前提）。
-fn run_probe(probe: &Arc<dyn HealthProbe>, timeout: Duration) -> Result<HealthStatus, TraitError> {
-    let (tx, rx) = mpsc::channel();
-    let worker = Arc::clone(probe);
-    std::thread::Builder::new()
-        .name("healthcheck-probe".to_owned())
-        .spawn(move || {
-            // 受信側が打ち切り済みなら送信失敗になるが、結果は不要なので無視する。
-            let _ = tx.send(worker.probe(timeout));
-        })
-        .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to spawn healthcheck probe"))?;
-    match rx.recv_timeout(timeout) {
-        Ok(r) => r,
-        Err(RecvTimeoutError::Timeout) => {
-            probe.cancel();
-            Err(TraitError::new(
-                ErrorCode::Timeout,
-                "healthcheck probe exceeded its timeout",
-            ))
+/// 判定ごとのスレッド・子プロセスが周期実行のたびに累積するのを防ぐ（REPAIR-5・リソース上限）。
+/// 状態は [`ProbeRunner`] ごとに持ち、グローバル状態は使わない。
+#[derive(Debug, Default)]
+struct InFlight(AtomicUsize);
+
+/// スレッドの生存期間だけ [`InFlight`] を保持する RAII ガード（panic でも解放される）。
+struct InFlightGuard(Arc<InFlight>);
+
+impl InFlightGuard {
+    fn acquire(counter: &Arc<InFlight>) -> Self {
+        counter.0.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// [`HealthProbe`] と未終了スレッドの計数をまとめた実行単位（1 コンテナの 1 healthcheck につき 1 つ持つ）。
+///
+/// 期限超過で打ち切った probe スレッドが戻っていない間は、新しい判定を開始せず `Unavailable` を返す
+/// （同時に走る判定は最大 1 本。REPAIR-5）。
+#[derive(Clone)]
+pub struct ProbeRunner {
+    probe: Arc<dyn HealthProbe>,
+    in_flight: Arc<InFlight>,
+}
+
+impl ProbeRunner {
+    /// `probe` を包む。
+    pub fn new(probe: Arc<dyn HealthProbe>) -> Self {
+        Self {
+            probe,
+            in_flight: Arc::new(InFlight::default()),
         }
-        Err(RecvTimeoutError::Disconnected) => Err(TraitError::new(
-            ErrorCode::Internal,
-            "healthcheck probe terminated abnormally",
-        )),
+    }
+
+    /// 打ち切り後もまだ終了していない probe / cancel スレッドの数（診断用）。
+    pub fn unfinished(&self) -> usize {
+        self.in_flight.0.load(Ordering::SeqCst)
+    }
+
+    /// `probe` を別スレッドで実行し、`timeout` で待ちを打ち切る（REPAIR-5）。
+    ///
+    /// 超過時は [`HealthProbe::cancel`] を別スレッドで呼び、これも `timeout` で待ちを打ち切る
+    /// （cancel が戻らなくても呼び出し側は戻る）。cancel 後は probe スレッドの終了を `timeout` まで待って回収を
+    /// 試みる。終了しなかったスレッドは [`ProbeRunner::unfinished`] に残り、戻るまで次の判定を拒否する。
+    fn run(&self, timeout: Duration) -> Result<HealthStatus, TraitError> {
+        if self.unfinished() > 0 {
+            return Err(TraitError::new(
+                ErrorCode::Unavailable,
+                "previous healthcheck probe has not terminated",
+            ));
+        }
+        let (tx, rx) = mpsc::channel();
+        let worker = Arc::clone(&self.probe);
+        let guard = InFlightGuard::acquire(&self.in_flight);
+        std::thread::Builder::new()
+            .name("healthcheck-probe".to_owned())
+            .spawn(move || {
+                let _guard = guard;
+                // 受信側が打ち切り済みなら送信失敗になるが、結果は不要なので無視する。
+                let _ = tx.send(worker.probe(timeout));
+            })
+            .map_err(|_| {
+                TraitError::new(ErrorCode::Internal, "failed to spawn healthcheck probe")
+            })?;
+        match rx.recv_timeout(timeout) {
+            Ok(r) => r,
+            Err(RecvTimeoutError::Timeout) => {
+                self.cancel_bounded(timeout);
+                // 回収の確認: cancel の効果で probe が戻れば結果は破棄してスレッドを手放す。
+                let _ = rx.recv_timeout(timeout);
+                Err(TraitError::new(
+                    ErrorCode::Timeout,
+                    "healthcheck probe exceeded its timeout",
+                ))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(TraitError::new(
+                ErrorCode::Internal,
+                "healthcheck probe terminated abnormally",
+            )),
+        }
+    }
+
+    /// `cancel` を別スレッドで呼び、`timeout` までしか待たない。戻らない cancel も未終了として計数する。
+    fn cancel_bounded(&self, timeout: Duration) {
+        let (tx, rx) = mpsc::channel();
+        let worker = Arc::clone(&self.probe);
+        let guard = InFlightGuard::acquire(&self.in_flight);
+        let spawned = std::thread::Builder::new()
+            .name("healthcheck-cancel".to_owned())
+            .spawn(move || {
+                let _guard = guard;
+                worker.cancel();
+                let _ = tx.send(());
+            });
+        if spawned.is_ok() {
+            // 期限内に戻らなくても待たない（Timeout / Disconnected はどちらも打ち切り）。
+            let _ = rx.recv_timeout(timeout);
+        }
     }
 }
 
@@ -233,7 +317,7 @@ fn demote_if_healthy(
 pub fn probe_and_record(
     state: &mut SupervisedState,
     process: &dyn LaunchedProcess,
-    probe: &Arc<dyn HealthProbe>,
+    probe: &ProbeRunner,
     timeout: Duration,
     obs: &dyn MonitorObserver,
 ) -> Result<StateRecord, ProbeFailure> {
@@ -251,9 +335,16 @@ pub fn probe_and_record(
         )
     })?;
     verify_owned(state, pid, self_pid).map_err(|e| ProbeFailure::new(e, Demotion::NotNeeded))?;
-    match observed(obs, MonitorOperation::Probe, || run_probe(probe, timeout)) {
-        Ok(health) => record_health(state, process, health, obs)
-            .map_err(|e| ProbeFailure::new(e, Demotion::NotNeeded)),
+    match observed(obs, MonitorOperation::Probe, || probe.run(timeout)) {
+        Ok(health) => match record_health(state, process, health, obs) {
+            Ok(rec) => Ok(rec),
+            // Unhealthy / Starting を書けないと既存の Healthy が残るため、降格を試みて結果を返す（SUP-4）。
+            Err(e) if health != HealthStatus::Healthy => {
+                let demotion = demote_if_healthy(state, pid, self_pid, obs);
+                Err(ProbeFailure::new(e, demotion))
+            }
+            Err(e) => Err(ProbeFailure::new(e, Demotion::NotNeeded)),
+        },
         Err(e) => {
             let demotion = demote_if_healthy(state, pid, self_pid, obs);
             Err(ProbeFailure::new(e, demotion))
@@ -507,7 +598,7 @@ mod tests {
         let e = probe_and_record(
             &mut s,
             &FakeProc,
-            &(Arc::new(UnimplementedHealthProbe) as Arc<dyn HealthProbe>),
+            &ProbeRunner::new(Arc::new(UnimplementedHealthProbe)),
             t,
             &RecObs::default(),
         )
@@ -524,7 +615,7 @@ mod tests {
     fn sup4_task157_6_probe_and_record_applies_result_and_validates_timeout() {
         let store = owned_store(0);
         let mut s = attach(&store);
-        let probe: Arc<dyn HealthProbe> = Arc::new(FixedProbe(HealthStatus::Unhealthy));
+        let probe = ProbeRunner::new(Arc::new(FixedProbe(HealthStatus::Unhealthy)));
         let obs = RecObs::default();
         let rec =
             probe_and_record(&mut s, &FakeProc, &probe, Duration::from_secs(1), &obs).unwrap();
@@ -589,7 +680,7 @@ mod tests {
         let mut s = attach(&store);
         let obs = RecObs::default();
         let t = Duration::from_secs(1);
-        let p: Arc<dyn HealthProbe> = Arc::new(FailingProbe);
+        let p = ProbeRunner::new(Arc::new(FailingProbe));
         let e = probe_and_record(&mut s, &FakeProc, &p, t, &obs).unwrap_err();
         assert_eq!(e.error().code(), ErrorCode::Internal);
         assert_eq!(e.demotion(), &Demotion::Applied);
@@ -611,7 +702,7 @@ mod tests {
         let e = probe_and_record(
             &mut s,
             &FakeProc,
-            &(Arc::new(SlowProbe) as Arc<dyn HealthProbe>),
+            &ProbeRunner::new(Arc::new(SlowProbe)),
             Duration::from_millis(10),
             &obs,
         )
@@ -634,7 +725,7 @@ mod tests {
         probe_and_record(
             &mut s,
             &FakeProc,
-            &(Arc::new(FixedProbe(HealthStatus::Healthy)) as Arc<dyn HealthProbe>),
+            &ProbeRunner::new(Arc::new(FixedProbe(HealthStatus::Healthy))),
             Duration::from_secs(1),
             &obs,
         )
@@ -664,7 +755,7 @@ mod tests {
         let store = healthy_store();
         let mut s = attach(&store);
         let cancels = Arc::new(AtomicU32::new(0));
-        let p: Arc<dyn HealthProbe> = Arc::new(HangingProbe(cancels.clone()));
+        let p = ProbeRunner::new(Arc::new(HangingProbe(cancels.clone())));
         let started = std::time::Instant::now();
         let e = probe_and_record(
             &mut s,
@@ -692,7 +783,7 @@ mod tests {
         }
         let other = pid(std::process::id().wrapping_add(1).max(1));
         let runs = Arc::new(AtomicU32::new(0));
-        let p: Arc<dyn HealthProbe> = Arc::new(CountingProbe(runs.clone()));
+        let p = ProbeRunner::new(Arc::new(CountingProbe(runs.clone())));
         for status in [
             ContainerStatus::running(cid(), Some(pid(42))),
             ContainerStatus::running(cid(), Some(pid(43))),
@@ -755,7 +846,7 @@ mod tests {
             updates: AtomicU32::new(0),
         }));
         let mut s = SupervisedState::attach(store, cid()).unwrap();
-        let p: Arc<dyn HealthProbe> = Arc::new(FailingProbe);
+        let p = ProbeRunner::new(Arc::new(FailingProbe));
         let e = probe_and_record(
             &mut s,
             &FakeProc,
@@ -781,7 +872,7 @@ mod tests {
             let sup = SupervisionState::new(Some(me()), Some(HealthStatus::Unhealthy), 0);
             *g = next_record(&g, g.status().clone(), sup);
         }
-        let p: Arc<dyn HealthProbe> = Arc::new(FailingProbe);
+        let p = ProbeRunner::new(Arc::new(FailingProbe));
         let e = probe_and_record(
             &mut s,
             &FakeProc,
@@ -803,7 +894,7 @@ mod tests {
             1,
         );
         let mut s = attach(&store);
-        let p: Arc<dyn HealthProbe> = Arc::new(FailingProbe);
+        let p = ProbeRunner::new(Arc::new(FailingProbe));
         let e = probe_and_record(
             &mut s,
             &FakeProc,
@@ -815,5 +906,79 @@ mod tests {
         assert_eq!(e.demotion(), &Demotion::Applied);
         assert_eq!(s.record().health(), Some(HealthStatus::Unhealthy));
         assert_eq!(s.record().restart_count(), 1);
+    }
+
+    /// cancel が戻らない probe。
+    struct StuckCancelProbe;
+
+    impl HealthProbe for StuckCancelProbe {
+        fn probe(&self, _: Duration) -> Result<HealthStatus, TraitError> {
+            std::thread::sleep(Duration::from_millis(600));
+            Ok(HealthStatus::Healthy)
+        }
+        fn cancel(&self) {
+            std::thread::sleep(Duration::from_millis(600));
+        }
+    }
+
+    /// REPAIR-5: cancel が戻らなくても呼び出しは期限内に戻り、未終了のスレッドが次の判定を拒否する。
+    #[test]
+    fn repair5_task157_6_stuck_cancel_is_bounded_and_blocks_next_probe() {
+        let store = healthy_store();
+        let mut s = attach(&store);
+        let runner = ProbeRunner::new(Arc::new(StuckCancelProbe));
+        let started = std::time::Instant::now();
+        let e = probe_and_record(
+            &mut s,
+            &FakeProc,
+            &runner,
+            Duration::from_millis(50),
+            &RecObs::default(),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(e.error().code(), ErrorCode::Timeout);
+        assert_eq!(e.demotion(), &Demotion::Applied);
+        assert_eq!(runner.unfinished(), 2);
+        let e2 = probe_and_record(
+            &mut s,
+            &FakeProc,
+            &runner,
+            Duration::from_millis(50),
+            &RecObs::default(),
+        )
+        .unwrap_err();
+        assert_eq!(e2.error().code(), ErrorCode::Unavailable);
+        // スレッドが戻れば再び判定できる。
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(runner.unfinished(), 0);
+    }
+
+    /// 書き込みは常に失敗するが、get は Healthy を返し続けるストア（Unhealthy を記録できない状況）。
+    /// SUP-4: Unhealthy の記録に失敗したら降格を試み、失敗を Demotion::Failed で伝える。
+    #[test]
+    fn sup4_task157_6_unhealthy_record_failure_is_reported_as_demotion_failure() {
+        let inner = healthy_store();
+        let rec = inner.rec.lock().unwrap().clone();
+        let store = Arc::new(FailingWriteStore(FakeStore {
+            rec: Mutex::new(rec),
+            conflicts: Mutex::new(0),
+            updates: AtomicU32::new(0),
+        }));
+        let mut s = SupervisedState::attach(store, cid()).unwrap();
+        let p = ProbeRunner::new(Arc::new(FixedProbe(HealthStatus::Unhealthy)));
+        let e = probe_and_record(
+            &mut s,
+            &FakeProc,
+            &p,
+            Duration::from_secs(1),
+            &RecObs::default(),
+        )
+        .unwrap_err();
+        assert_eq!(e.error().code(), ErrorCode::Internal);
+        match e.demotion() {
+            Demotion::Failed(d) => assert_eq!(d.code(), ErrorCode::Internal),
+            other => panic!("unexpected demotion: {other:?}"),
+        }
     }
 }

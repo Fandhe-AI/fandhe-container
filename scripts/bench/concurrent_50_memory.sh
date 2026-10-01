@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# 50 コンテナ同時起動時の集約メモリ計測スクリプト（own 側。TASK-50.1・CORE-9・SUP-1）。
+# 50 コンテナ同時起動時の集約メモリ計測スクリプト（own 側 TASK-50.1・Docker 側と統合レポート TASK-50.2・CORE-9・SUP-1）。
 #
 # 役割: N（既定 50）個のコンテナを完全に同時に起動し、全コンテナが起動し終えた状態の PSS 合計
 # （主指標）と RSS 合計（参考）を /proc から集計して、試行ごとの中央値を出力する。CORE-9（50 コンテナ
 # 同時起動時の集約メモリ。PSS 合計が主指標）と SUP-1（監視プロセス込みの集約メモリが Docker の 80%
-# 以下）は同一の測定で、本スクリプトはその own 側の計測ハーネスである。Docker 側の同一手法の計測は
-# TASK-50.2（#218）、実機での実測と合否判定は人間担当の TASK-50.h1（#219）で行う。
-# 呼び出し元は Makefile の `concurrent-memory` ターゲット。アイドル時メモリ（idle_memory.sh。TASK-45.1）
+# 以下）は同一の測定で、本スクリプトはその計測ハーネスである。`--mode own`（TASK-50.1）が own 側、
+# `--mode docker`（TASK-50.2）が Docker 側を同じ手法で測り、`--mode report`（TASK-50.2）が両者の結果を
+# 1 つのレポートへまとめる。実機での実測と合否判定（SUP-1 の 80% 以下）は人間担当の TASK-50.h1（#219）で行い、
+# 本スクリプトは合否を出さない。
+# 呼び出し元は Makefile の `concurrent-memory`・`concurrent-memory-docker`・`concurrent-memory-report`
+# ターゲット。アイドル時メモリ（idle_memory.sh。TASK-45.1）
 # と起動時間（startup_latency.sh。TASK-46.1）の計測スクリプトと同じ流儀（fail-closed・終了コード・
 # 出力スキーマ）に揃えてある。
 #
@@ -21,6 +24,37 @@
 #   concurrent_50_memory.sh --launcher <絶対パス> --bundle <dir> --target <名前>
 #       [--mode own] [--count N] [--trials N] [--min-procs N] [--settle SECS] [--timeout SECS]
 #       [--id-prefix STR] [--format json|text] [--output FILE] [--help]
+#   concurrent_50_memory.sh --mode docker --docker <docker CLI の絶対パス> --target <名前>
+#       [--image REF] [--count N] [--trials N] [--min-procs N] [--settle SECS] [--timeout SECS]
+#       [--id-prefix STR] [--format json|text] [--output FILE]
+#   concurrent_50_memory.sh --mode report --own-result <file> --docker-result <file> [--output FILE]
+#
+# 「同一手法」の定義（own・docker 共通。違うのは集計対象のプロセス集合だけで、出力の method で区別する）:
+#   指標 = /proc/<pid>/smaps_rollup の Pss 合計（主）と status の VmRSS 合計（参考）。N 個（既定 50）をずらさず
+#   同時に起動し、N/N 起動を必須とし（未達・PSS 0・読めない値・数値でない値は失敗で結果を公開しない）、試行ごとの
+#   集約値の中央値（偶数試行は中央 2 値の平均を小数 1 桁）を出す。JSON スキーマも共通（加算フィールドのみ異なる）。
+#   method: own = "launcher-tree"（launcher を根とする子孫全体）、
+#           docker = "docker-daemons-and-shim-trees"（PoC-17 の measure_docker と同じ集合。comm が dockerd・
+#           containerd のプロセス＋コンテナごとの containerd-shim を根とする子孫ツリー）。
+#
+# docker モードの契約（差し替え点は dk_* 関数群に隔離している）:
+#   - 起動: `docker run -d --pull never --cidfile <tmp>/<id>.cid --label fandhe.concurrent-memory.run=<実行ごとの
+#     トークン> <image> sleep <秒>` を N 個、バックグラウンドで同時に起動する（配列で直接 exec。eval・sh -c 不使用。
+#     --privileged・マウント・ポート公開は付けない）。イメージは事前に手動で pull しておく（暗黙の取得をしない）。
+#   - 所有の証明: cidfile の 64 桁小文字 16 進 ID だけを、本スクリプトが起動したコンテナの証明として扱う。破壊的操作
+#     （docker rm -f）はこの ID だけに行い、ラベルが一致しても cidfile で証明できないコンテナには触れず、残存として
+#     報告して終了コード 4 にする。
+#   - 起動完了: 全 ID が State.Status=running・State.Pid が正で、ローカルの /proc に存在すること（リモートの
+#     デーモンは拒否）。--settle 後に再確認し、集計後にも全件 running のままであることを再確認する。
+#   - 計測前の拒否（結果は公開しない）: イメージ未取得（image-not-present）・他のコンテナが稼働中
+#     （foreign-containers-running。他コンテナの shim とデーモン負荷が合算値を歪めるため）・ローカルに dockerd が
+#     見つからない（docker-daemon-not-local）。
+#   - docker の全呼び出しを timeout で包む（REPAIR-5）。計測は権限付きシェルから実行する前提で、スクリプト内で sudo は呼ばない。
+#   - 停止: 試行ごとに cidfile で証明した ID を docker rm -f し、ラベルでの一覧が空になることを確認する。
+#
+# report モード: own・docker の結果ファイルを非信頼 JSON として検証し（symlink・1 MiB 超・スキーマ・mode と method の
+#   固定値・N/N 起動・中央値の再計算。count が own と docker で一致しなければ拒否）、1 つのレポート
+#   （benchmark = concurrent_memory_report）へまとめる。SUP-1 の合否は出さない（#219 で人間が判定）。jq が必要。
 #
 # launcher 契約（差し替え点は ln_spawn / ln_stop / ln_collect_pids の 3 関数に隔離している）:
 #   - 起動: `<launcher> run --id <id> --bundle <bundle>` を本スクリプトの直接の子としてバックグラウンドで
@@ -63,13 +97,15 @@
 #
 # 終了コード:
 #   0 = 全試行で N/N 起動し計測成功
-#   1 = 起動数不足・PSS 0 混入・メモリ値を読めない／数値でない・起動完了待ちの期限切れ・トークンを
+#   1 = （docker モードでは計測前の拒否・docker 呼び出しの失敗も含む）起動数不足・PSS 0 混入・メモリ値を読めない／数値でない・起動完了待ちの期限切れ・トークンを
 #       継承しない（後始末で回収できない）プロセスの混入・集計中のコンテナ終了・子プロセス一覧を
 #       読めない（結果は公開しない）
 #   2 = 引数・入力エラー（--proc-root は FANDHE_CONCURRENT_MEMORY_SELFTEST=1 なしでは拒否）、出力先エラー、
-#       未対応の --mode（docker は TASK-50.2 で追加予定）
-#   3 = 前提欠如（非 Linux・smaps_rollup 非対応・bash 5 未満等。0 を返して合格に見せない）
-#   4 = 後始末失敗（起動したプロセスが残存。他の失敗より優先して返す）
+#       未対応の --mode、report モードの入力（結果ファイル）の検証失敗
+#   3 = 前提欠如（非 Linux・smaps_rollup 非対応・bash 5 未満・docker モードの timeout 欠如・report の jq 欠如等。
+#       0 を返して合格に見せない）
+#   4 = 後始末失敗（起動したプロセス・コンテナが残存。他の失敗より優先して返す。docker モードでは
+#       docker rm -f の後にラベル一致のコンテナが残る場合を含む）
 #   129 / 130 / 143 = HUP / INT / TERM による中断（後始末は必ず実行し、残存があれば 4 を優先する。
 #       後始末中に再度シグナルを受けても後始末を最後まで続ける）
 #   上記以外の値（set -e の暗黙終了等）を返さないよう、失敗しうる操作は明示的に分岐する。
@@ -77,7 +113,9 @@
 # 出力（JSON。scripts/check-bench-regression.sh の results.json 互換）: schema_version・benchmark・
 #   behavior・task・mode・target・timestamp・kernel・arch・count・trials・n_started_min・metrics
 #   （concurrent_<count>_pss_median_kb と参考の ..._rss_median_kb。unit kB）・trial_results[]。
-#   launcher・bundle のパス、cmdline、環境変数は出力しない。
+#   加算フィールド: 両モードに method、docker のみ params.image と trial_results[] の daemon_pss_kb・
+#   containers_pss_kb・daemon_process_count（デーモン固定分の内訳。#219 が見る）。text 形式は両モード共通の 4 行。
+#   launcher・bundle・docker CLI のパス、コンテナ ID、cmdline、環境変数は出力しない。
 #
 # 既知の制約:
 #   - launcher が親子関係を切ると過少計上になる。--min-procs 未達として検出し失敗にする。
@@ -96,7 +134,15 @@
 #     プロセス数が --min-procs 以上なら検出しない。
 #   - 起動時刻の照合からシグナル送信までの間に pid が再利用される可能性は残る（bash からは pidfd を
 #     使えない）。照合の直後に送ることで窓を最小にしている。
-#   - /proc の読み取り自体にはタイムアウトがない（Makefile の concurrent-memory が timeout で包む）。
+#   - /proc の読み取り自体にはタイムアウトがない（Makefile の各ターゲットが timeout で包む）。
+#   - docker モードは、ローカルの rootful Docker（dockerd・containerd・containerd-shim）だけを対象にする。
+#     rootless Docker・リモートデーモン・containerd 以外のランタイム構成・1 つの shim を複数コンテナで共有する
+#     構成は対象外（失敗として検出する）。他のコンテナが稼働していると計測を拒否する。
+#   - docker モードの値はデーモン（dockerd・containerd）の固定分を含む。own には対応する常駐デーモンがないため、
+#     比較時は daemon_pss_kb の内訳を見る（methods_differ は report が明示する）。CORE-9・SUP-1 の Docker 基準値
+#     （PoC-17。n=50 の PSS 中央値）との整合確認は #219 で人間が行う。
+#   - 実 Docker での計測（50 コンテナの起動・docker rm -f）は実機前提で、本スクリプトの自己テストは
+#     スタブ docker CLI・疑似 /proc でのみ行い、実測値は未取得（TASK-50.h1 の担当）。
 #   - stderr に出す外部由来の文字列（ログ末尾等）は印字可能な ASCII 以外を `?` に置換する。
 
 set -euo pipefail
@@ -126,6 +172,12 @@ usage() {
 
 launcher=""
 bundle=""
+docker=""
+image="alpine:3.20"
+own_result=""
+docker_result=""
+# 明示指定されたオプション名（モードごとに無関係なオプションを拒否するため。値は含めない）。
+given=" "
 target_name=""
 mode="own"
 count=50
@@ -142,9 +194,14 @@ proc_root_given=0
 need_val() { [ "$1" -ge 2 ] || { err "invalid-argument" "$2 requires a value"; exit 2; }; }
 
 while [ $# -gt 0 ]; do
+  case "$1" in --*) given+="$1 " ;; esac
   case "$1" in
     --launcher) need_val $# "$1"; launcher="$2"; shift 2 ;;
     --bundle) need_val $# "$1"; bundle="$2"; shift 2 ;;
+    --docker) need_val $# "$1"; docker="$2"; shift 2 ;;
+    --image) need_val $# "$1"; image="$2"; shift 2 ;;
+    --own-result) need_val $# "$1"; own_result="$2"; shift 2 ;;
+    --docker-result) need_val $# "$1"; docker_result="$2"; shift 2 ;;
     --target) need_val $# "$1"; target_name="$2"; shift 2 ;;
     --mode) need_val $# "$1"; mode="$2"; shift 2 ;;
     --count) need_val $# "$1"; count="$2"; shift 2 ;;
@@ -178,24 +235,55 @@ check_range --min-procs "$min_procs" 2 16
 check_range --settle "$settle" 0 600
 check_range --timeout "$timeout_s" 1 3600
 
-[[ "$target_name" =~ ^[a-z0-9][a-z0-9._-]{0,31}$ ]] || { err "invalid-argument" "--target is required (^[a-z0-9][a-z0-9._-]{0,31}\$)"; exit 2; }
-[[ "$id_prefix" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { err "invalid-argument" "--id-prefix must match ^[a-z0-9][a-z0-9-]{0,31}\$"; exit 2; }
+case "$mode" in own | docker | report) ;; *) err "invalid-argument" "--mode must be own, docker or report"; exit 2 ;; esac
 case "$format" in json | text) ;; *) err "invalid-argument" "--format must be json or text"; exit 2 ;; esac
+
+# モードに無関係なオプションを黙って無視しない（取り違えた計測を成立させない）。
+reject_opts() { # <オプション名...>
+  local o
+  for o in "$@"; do
+    case "$given" in
+      *" $o "*) err "invalid-argument" "$o is not valid with --mode $mode"; exit 2 ;;
+    esac
+  done
+}
+
 case "$mode" in
-  own) ;;
-  docker) err "unsupported-mode" "docker mode is added by TASK-50.2"; exit 2 ;;
-  *) err "invalid-argument" "--mode must be own"; exit 2 ;;
+  own) reject_opts --docker --image --own-result --docker-result ;;
+  docker) reject_opts --launcher --bundle --own-result --docker-result ;;
+  report)
+    reject_opts --launcher --bundle --target --docker --image --count --trials --min-procs --settle --timeout --id-prefix --proc-root
+    [ "$format" = "json" ] || { err "invalid-argument" "--format must be json with --mode report"; exit 2; }
+    [ -n "$own_result" ] && [ -n "$docker_result" ] || { err "invalid-argument" "--own-result and --docker-result are required with --mode report"; exit 2; }
+    ;;
 esac
 
-case "$launcher" in
-  /*) ;;
-  *) err "invalid-argument" "--launcher must be an absolute path (no default: avoids measuring the wrong binary)"; exit 2 ;;
-esac
-{ [ -f "$launcher" ] && [ -x "$launcher" ]; } || { err "invalid-argument" "--launcher is not an executable file"; exit 2; }
-case "$bundle" in
-  '' | -*) err "invalid-argument" "--bundle is required and must not start with '-'"; exit 2 ;;
-esac
-[ -d "$bundle" ] || { err "invalid-argument" "--bundle is not a directory"; exit 2; }
+if [ "$mode" != "report" ]; then
+  [[ "$target_name" =~ ^[a-z0-9][a-z0-9._-]{0,31}$ ]] || { err "invalid-argument" "--target is required (^[a-z0-9][a-z0-9._-]{0,31}\$)"; exit 2; }
+  [[ "$id_prefix" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { err "invalid-argument" "--id-prefix must match ^[a-z0-9][a-z0-9-]{0,31}\$"; exit 2; }
+fi
+
+if [ "$mode" = "own" ]; then
+  case "$launcher" in
+    /*) ;;
+    *) err "invalid-argument" "--launcher must be an absolute path (no default: avoids measuring the wrong binary)"; exit 2 ;;
+  esac
+  { [ -f "$launcher" ] && [ -x "$launcher" ]; } || { err "invalid-argument" "--launcher is not an executable file"; exit 2; }
+  case "$bundle" in
+    '' | -*) err "invalid-argument" "--bundle is required and must not start with '-'"; exit 2 ;;
+  esac
+  [ -d "$bundle" ] || { err "invalid-argument" "--bundle is not a directory"; exit 2; }
+fi
+
+if [ "$mode" = "docker" ]; then
+  case "$docker" in
+    /*) ;;
+    *) err "invalid-argument" "--docker must be an absolute path to the docker CLI (no PATH lookup: avoids measuring the wrong binary)"; exit 2 ;;
+  esac
+  { [ -f "$docker" ] && [ -x "$docker" ]; } || { err "invalid-argument" "--docker is not an executable file"; exit 2; }
+  # イメージ参照は許可リストで検証する（先頭 - を拒否してオプション注入を防ぐ）。
+  [[ "$image" =~ ^[a-z0-9][A-Za-z0-9._/:@-]{0,255}$ ]] || { err "invalid-argument" "--image must match ^[a-z0-9][A-Za-z0-9._/:@-]{0,255}\$"; exit 2; }
+fi
 
 # --proc-root（疑似 /proc）は selftest 専用。通常利用で実 /proc を迂回できないようにする。
 if [ "$proc_root_given" -eq 1 ]; then
@@ -318,22 +406,36 @@ fi
 
 # --- 前提確認（欠如は 3。0 を返して合格に見せない） ---
 if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then err "unsupported-os" "bash 5 or later is required"; exit 3; fi
-if [ "$(uname -s 2>/dev/null || true)" != "Linux" ]; then err "unsupported-os" "only Linux is supported"; exit 3; fi
-if [ "$proc_root_given" -eq 0 ]; then
+if [ "$mode" = "report" ]; then
+  # report は結果ファイル（JSON）を読むだけで /proc を使わない。
+  for req in jq mktemp ln wc; do
+    command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "jq, mktemp, ln and wc are required for --mode report"; exit 3; }
+  done
+fi
+if [ "$(uname -s 2>/dev/null || true)" != "Linux" ] && [ "$mode" != "report" ]; then err "unsupported-os" "only Linux is supported"; exit 3; fi
+if [ "$mode" = "report" ]; then
+  proc="/proc"
+elif [ "$proc_root_given" -eq 0 ]; then
   proc="/proc"
   [ -r /proc/self/smaps_rollup ] || { err "unsupported-os" "/proc/<pid>/smaps_rollup is not available (Linux 4.14+ required)"; exit 3; }
 else
   proc="${proc_root%/}"
 fi
-for req in sleep mktemp grep tail ln mkfifo dd cat wc; do
-  command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "sleep, mktemp, grep, tail, ln, mkfifo, dd, cat and wc are required"; exit 3; }
-done
-# ログ収集は dd の status=none（進捗を stderr へ出さない指定）を使う。使えない dd では止める。
-if [ "$(printf 'xy' | dd bs=1 count=1 status=none 2>/dev/null || true)" != "x" ]; then
-  err "unsupported-os" "dd with status=none is required (GNU coreutils 8.21 or later)"
-  exit 3
+if [ "$mode" != "report" ]; then
+  for req in sleep mktemp grep tail ln mkfifo dd cat wc; do
+    command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "sleep, mktemp, grep, tail, ln, mkfifo, dd, cat and wc are required"; exit 3; }
+  done
+  # ログ収集は dd の status=none（進捗を stderr へ出さない指定）を使う。使えない dd では止める。
+  if [ "$(printf 'xy' | dd bs=1 count=1 status=none 2>/dev/null || true)" != "x" ]; then
+    err "unsupported-os" "dd with status=none is required (GNU coreutils 8.21 or later)"
+    exit 3
+  fi
+  [ -r /proc/self/stat ] || { err "unsupported-os" "/proc/<pid>/stat is not available"; exit 3; }
 fi
-[ -r /proc/self/stat ] || { err "unsupported-os" "/proc/<pid>/stat is not available"; exit 3; }
+# docker モードは全ての docker 呼び出しを timeout（coreutils）で包む（REPAIR-5）。
+if [ "$mode" = "docker" ]; then
+  command -v timeout >/dev/null 2>&1 || { err "unsupported-os" "timeout (coreutils) is required for --mode docker"; exit 3; }
+fi
 
 # --- 状態 ---
 tmpdir=""
@@ -355,6 +457,12 @@ OWNED=()
 tree_pids=()
 children=()
 ok_flags=()
+# docker モードの状態（TASK-50.2）。dk_active は最初のコンテナ起動を試みる直前から 1（on_exit が dk_stop を通す）。
+dk_active=0
+dk_cpids=()
+dk_ids=()
+dk_pid=()
+DK_LISTED=()
 
 # 外部由来の文字列を stderr 用に無害化する（印字可能な ASCII 以外を ? へ）。
 sanitize() { local LC_ALL=C s="$1"; printf '%s' "${s//[^[:print:]]/?}"; }
@@ -759,6 +867,8 @@ on_exit() {
   trap ':' TERM INT HUP
   trap - EXIT
   ln_stop || rc=4
+  # dk_stop は計測本体の手前で定義される。それより前（mktemp 失敗等）の exit でも終了コードを変えない。
+  if declare -F dk_stop >/dev/null 2>&1; then dk_stop || rc=4; fi
   if [ -n "$out_tmp" ]; then rm -f "$out_tmp"; fi
   if [ -n "$tmpdir" ]; then rm -rf "$tmpdir"; fi
   exit "$rc"
@@ -911,14 +1021,578 @@ report_unstarted() { # <trial>
   done
 }
 
+# --- 結果の公開と report モード（TASK-50.2） ---
+
+# 結果（out_buf）を公開する。全試行（report では両入力）の検証後に 1 回だけ呼ぶ（失敗した計測結果を正規の
+# 成果物として残さない）。--output 指定時は ln -T、未指定時は標準出力。
+publish_out() {
+  if [ -n "$output" ]; then
+    if ! out_tmp="$(mktemp "${output}.XXXXXX" 2>/dev/null)"; then err "output-failed" "cannot create temporary file next to the output"; exit 2; fi
+    if ! printf '%s' "$out_buf" 2>/dev/null >"$out_tmp"; then err "output-failed" "cannot write temporary file"; exit 2; fi
+    # ln -T（link(2)）で公開する（startup_latency.sh の publish_result と同じ方式）。出力先が種別を問わず
+    # 既に存在すれば失敗し、symlink を辿らず、ディレクトリ内へも作らない。計測中に同名のファイルが
+    # 作られていても上書きしない。一時ファイルは成功・失敗のどちらでも消す（失敗時は EXIT trap）。
+    if ! ln -T -- "$out_tmp" "$output" 2>/dev/null; then
+      err "output-failed" "cannot publish output (it may already exist, or hard links are unsupported)"
+      exit 2
+    fi
+    rm -f -- "$out_tmp" || true
+    out_tmp=""
+  else
+    if ! printf '%s' "$out_buf" 2>/dev/null; then err "output-failed" "cannot write to stdout"; exit 2; fi
+  fi
+}
+
+readonly RESULT_MAX_BYTES=1048576
+
+# report の入力（own・docker の結果ファイル）を非信頼 JSON として検証し、単一行の JSON を標準出力へ返す
+# （違反は 2）。symlink・非通常ファイル・1 MiB 超を拒否し、mode と method は固定値で照合する（入力の自己申告で
+# methods_differ を偽装させない）。N/N 起動・PSS 0 なし・中央値の再計算一致を要求する（CORE-9。無効な計測を
+# 比較に混ぜない）。
+load_result_file() { # <オプション名> <ファイル> <own|docker>
+  local opt="$1" f="$2" want="$3" want_method size obj
+  case "$want" in
+    own) want_method="launcher-tree" ;;
+    docker) want_method="docker-daemons-and-shim-trees" ;;
+    *) err "invalid-result" "unsupported mode $want"; exit 2 ;;
+  esac
+  if [ -L "$f" ] || [ ! -f "$f" ]; then
+    err "invalid-result" "$opt must be a regular file (symlink not allowed)"
+    exit 2
+  fi
+  size="$(wc -c <"$f" 2>/dev/null)" || size=""
+  size="${size//[[:space:]]/}"
+  if ! [[ "$size" =~ $num_re ]] || [ "$size" -gt "$RESULT_MAX_BYTES" ]; then
+    err "invalid-result" "$opt must be at most $RESULT_MAX_BYTES bytes"
+    exit 2
+  fi
+  if ! obj="$(jq -cs --arg mode "$want" --arg method "$want_method" '
+    def near($a; $b): (($a - $b) | if . < 0 then -. else . end) < 0.000001;
+    def posint($x): ($x | type) == "number" and $x == ($x | floor) and $x >= 1;
+    if length == 1 then .[0] else error("not a single JSON value") end
+    | if (type == "object" and .schema_version == 1 and .benchmark == "concurrent_memory"
+        and .mode == $mode and .method == $method
+        and posint(.count) and .count <= 1024 and posint(.trials) and .trials <= 20
+        and .n_started_min == .count)
+      then . else error("unexpected result schema") end
+    | .count as $c
+    | ("concurrent_\($c)_pss_median_kb") as $k
+    | .trial_results as $tr
+    | if ($tr | type) == "array" and ($tr | length) == .trials
+        and ($tr | all(type == "object" and .n_expected == $c and .n_started == $c and .zero_pss_count == 0
+          and (.pss_total_kb | type) == "number" and .pss_total_kb > 0))
+        and (.metrics[$k].unit == "kB") and (.metrics[$k].value | type) == "number" and .metrics[$k].value > 0
+      then ([$tr[].pss_total_kb] | sort) as $t
+        | ($t | length) as $n
+        | (if $n % 2 == 1 then $t[($n - 1) / 2] else ($t[$n / 2 - 1] + $t[$n / 2]) / 2 end) as $med
+        | if near(.metrics[$k].value; $med) then . else error("median does not match trial_results") end
+      else error("trial_results inconsistent with count and trials") end' "$f" 2>/dev/null)"; then
+    err "invalid-result" "$opt is not a valid concurrent_memory result with mode=$want method=$want_method (schema_version 1, n_started_min == count, all trials N/N started with no zero PSS, median recomputed from trial_results)"
+    exit 2
+  fi
+  printf '%s' "$obj"
+}
+
+# own・docker の結果を 1 つのレポートへまとめる（TASK-50.2・CORE-9・SUP-1）。分母を揃えるため count の不一致は
+# 拒否する。SUP-1（80% 以下）の合否は出さない（#219 で人間が判定。REPAIR-3）。
+run_report() {
+  local own dk oc dc
+  own="$(load_result_file --own-result "$own_result" own)" || exit $?
+  dk="$(load_result_file --docker-result "$docker_result" docker)" || exit $?
+  oc="$(jq -r '.count' <<<"$own")"
+  dc="$(jq -r '.count' <<<"$dk")"
+  if [ "$oc" != "$dc" ]; then
+    err "invalid-result" "count differs between own ($oc) and docker ($dc); the comparison needs the same container count"
+    exit 2
+  fi
+  if ! out_buf="$(jq -n --argjson own "$own" --argjson docker "$dk" '
+    $own.count as $c
+    | ("concurrent_\($c)_pss_median_kb") as $k
+    | $own.metrics[$k].value as $o
+    | $docker.metrics[$k].value as $d
+    | {
+        schema_version: 1,
+        benchmark: "concurrent_memory_report",
+        behavior: ["CORE-9", "SUP-1"],
+        task: "TASK-50",
+        results: {own: $own, docker: $docker},
+        comparison: {
+          count: $c,
+          own_pss_median_kb: $o,
+          docker_pss_median_kb: $d,
+          pss_ratio_own_to_docker: ($o / $d),
+          pss_reduction_percent: ((1 - $o / $d) * 100),
+          methods_differ: ($own.method != $docker.method)
+        },
+        notes: [
+          "own and docker aggregate different process sets (see method); docker includes the dockerd and containerd daemons (see daemon_pss_kb).",
+          "no pass/fail verdict is produced; the SUP-1 decision (own at or below 80% of docker) is made by a human (issue 219)."
+        ]
+      }' 2>/dev/null)"; then
+    err "output-failed" "cannot build the report"
+    exit 2
+  fi
+  out_buf+=$'\n'
+  publish_out
+  echo "concurrent_memory_report: count=${oc} own_pss_median_kb=$(jq -r '.comparison.own_pss_median_kb' <<<"$out_buf") docker_pss_median_kb=$(jq -r '.comparison.docker_pss_median_kb' <<<"$out_buf") ratio=$(jq -r '.comparison.pss_ratio_own_to_docker' <<<"$out_buf")" >&2
+  echo "concurrent_memory_report: process sets differ between modes; no verdict is produced (human decision, issue 219)" >&2
+}
+
+# --- docker モード（TASK-50.2）。docker CLI・Docker のプロセス構成との接点は dk_* 関数群に隔離する ---
+#
+# 呼び出し元は計測本体の dk_trials（--mode docker）と、EXIT trap の on_exit（dk_stop）。own モードの
+# ln_* 群（launcher の直接の子・FIFO ログの READY 行・環境変数トークンに依存する）は、Docker のプロセスが
+# それらを継承しないため再利用できない。共通で使うのは read_kb・ln_collect_pids（任意 pid を根とする
+# 子孫の幅優先列挙）・median・出力部だけで、起動・起動完了の判定・集計対象・後始末を dk_* で独立させる。
+# 所有の証明は cidfile の 64 桁 16 進 ID（本スクリプトが起動した docker run が書く）だけで、破壊的操作
+# （docker rm -f）はこの ID にしか行わない（ラベルは残存確認にだけ使う）。
+
+readonly DK_LABEL_KEY="fandhe.concurrent-memory.run"
+readonly hex64_re='^[0-9a-f]{64}$'
+DK_STATE=""
+DK_PID=""
+DK_DAEMONS=()
+DK_DOCKERD_N=0
+DK_N=0
+DK_PENDING=0
+dk_ok=()
+dk_added=()
+declare -A dk_seen=()
+acc_pss=0
+acc_rss=0
+acc_n=0
+dk_sleep=0
+
+# docker CLI を timeout で包んで呼ぶ（REPAIR-5）。docker は絶対パスの引数だけを使う（PATH 探索しない）。
+dk() { timeout --kill-after=5 "$timeout_s" "$docker" "$@"; }
+
+dk_image_present() { dk image inspect "$image" >/dev/null 2>&1; }
+
+# 稼働中のコンテナが 1 つもないこと。0 = なし、1 = ある、2 = docker の失敗。
+dk_no_foreign() {
+  local out
+  out="$(dk ps -q 2>/dev/null)" || return 2
+  [ -z "$out" ]
+}
+
+# 今回の実行トークンのラベルを持つコンテナの ID（停止中を含む）を DK_LISTED へ入れる。失敗・不正な出力は 1。
+dk_list_labeled() {
+  local out line
+  DK_LISTED=()
+  out="$(dk ps -a -q --no-trunc --filter "label=${DK_LABEL_KEY}=${owner_tok}" 2>/dev/null)" || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [[ "$line" =~ $hex64_re ]] || return 1
+    DK_LISTED+=("$line")
+  done <<<"$out"
+}
+
+# コンテナ 1 つの State.Status・State.Pid を DK_STATE・DK_PID へ入れる。出力が固定の形でなければ 1
+# （docker の出力を検証してから使う）。id は cidfile で検証済みの 64 桁 16 進。
+dk_inspect() { # <id>
+  local out
+  DK_STATE=""
+  DK_PID=""
+  out="$(dk inspect -f '{{.State.Status}} {{.State.Pid}}' "$1" 2>/dev/null)" || return 1
+  if [[ "$out" =~ ^(created|running|paused|restarting|removing|exited|dead)\ (0|[1-9][0-9]{0,9})$ ]]; then
+    DK_STATE="${BASH_REMATCH[1]}"
+    DK_PID="${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+# comm が完全一致で dockerd・containerd のプロセスを DK_DAEMONS へ入れる（PoC-17 の measure_docker と同じ
+# 集合。pgrep ではなく $proc/*/comm を走査するので、疑似 /proc でも実 /proc でも同じ挙動になる）。
+dk_scan_daemons() {
+  local f comm p
+  DK_DAEMONS=()
+  DK_DOCKERD_N=0
+  for f in "$proc"/[0-9]*/comm; do
+    [ -e "$f" ] || continue
+    comm=""
+    { IFS= read -r comm <"$f"; } 2>/dev/null || true
+    case "$comm" in dockerd | containerd) ;; *) continue ;; esac
+    p="${f#"$proc"/}"
+    p="${p%%/*}"
+    [[ "$p" =~ $num_re ]] || continue
+    DK_DAEMONS+=("$p")
+    if [ "$comm" = "dockerd" ]; then DK_DOCKERD_N=$((DK_DOCKERD_N + 1)); fi
+  done
+}
+
+# pid の親 pid（status の PPid）を READ_PPID へ入れる。読めない・数値でなければ 1。
+read_ppid() {
+  local line
+  READ_PPID=""
+  [ -r "$proc/$1/status" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      PPid:*)
+        line="${line#PPid:}"
+        line="${line//[[:space:]]/}"
+        [[ "$line" =~ $num_re ]] || return 1
+        READ_PPID="$line"
+        return 0
+        ;;
+    esac
+  done <"$proc/$1/status" 2>/dev/null || return 1
+  return 1
+}
+
+# コンテナ N 個の docker run をバックグラウンドで同時に起動する（ずらさない。起動競合も計測条件）。
+# 配列で直接 exec する（eval・sh -c を使わない）。--privileged・マウント・ポート公開は付けない。
+# docker run -d は ID を cidfile へ書いて終了する（コンテナ自体は Docker 側で動き続ける）。
+dk_spawn() { # <trial>
+  local i=0 id
+  dk_cpids=()
+  dk_active=1
+  while [ "$i" -lt "$count" ]; do
+    id="${id_prefix}-$1-$((i + 1))"
+    in_spawn=1
+    timeout --kill-after=5 "$timeout_s" "$docker" run -d --pull never --cidfile "$tmpdir/cid/$id.cid" \
+      --label "${DK_LABEL_KEY}=${owner_tok}" "$image" sleep "$dk_sleep" </dev/null >/dev/null 2>"$tmpdir/cid/$id.err" &
+    dk_cpids+=("$!")
+    spawn_section_end
+    i=$((i + 1))
+  done
+}
+
+# docker run クライアントの終了を期限つきで待って回収する。期限を過ぎたものは TERM を送る（本スクリプトの
+# 未回収の直接の子なので pid は再利用されない）。失敗は件数と先頭数件の stderr 末尾（無害化）を報告する。
+dk_wait_clients() { # <trial>
+  local p i alive rc failed=0 shown=0 id line deadline
+  deadline=$((SECONDS + timeout_s))
+  while :; do
+    alive=0
+    for p in "${dk_cpids[@]}"; do
+      if proc_alive "$p"; then alive=1; break; fi
+    done
+    [ "$alive" -eq 1 ] || break
+    [ "$SECONDS" -lt "$deadline" ] || break
+    sleep "$POLL_INTERVAL"
+  done
+  for i in "${!dk_cpids[@]}"; do
+    p="${dk_cpids[i]}"
+    if proc_alive "$p"; then kill -TERM "$p" 2>/dev/null || true; fi
+    rc=0
+    wait "$p" 2>/dev/null || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      failed=$((failed + 1))
+      if [ "$shown" -lt "$MAX_REPORT_IDS" ]; then
+        shown=$((shown + 1))
+        id="${id_prefix}-$1-$((i + 1))"
+        err "docker-run-failed" "id=${id} exit=${rc}"
+        while IFS= read -r line; do
+          err "docker-run-log" "${id}: $(sanitize "$line")"
+        done < <(tail -n "$MAX_LOG_TAIL" "$tmpdir/cid/$id.err" 2>/dev/null || true)
+      fi
+    fi
+  done
+  dk_cpids=()
+  if [ "$failed" -gt 0 ]; then err "docker-run-failed" "trial=$1 failed=${failed}/${count}"; fi
+}
+
+# cidfile から所有を証明できた ID を dk_ids へ入れる（コンテナ i の ID が dk_ids[i]。無効・欠如は空）。
+# symlink・通常ファイルでないもの・64 桁小文字 16 進でない内容は証明にならない。
+dk_read_cids() { # <trial>
+  local i=0 cf v
+  dk_ids=()
+  while [ "$i" -lt "$count" ]; do
+    cf="$tmpdir/cid/${id_prefix}-$1-$((i + 1)).cid"
+    v=""
+    if [ -f "$cf" ] && [ ! -L "$cf" ]; then
+      { IFS= read -r v <"$cf"; } 2>/dev/null || true
+    fi
+    [[ "$v" =~ $hex64_re ]] || v=""
+    dk_ids+=("$v")
+    i=$((i + 1))
+  done
+}
+
+# 全コンテナの状態を確認し、running かつ Pid が正でローカルの /proc に存在し、Pid が以前の確認と同じものの
+# 数を DK_N へ、created・restarting（起動途中）が残っているかを DK_PENDING へ入れる。リモートのデーモン
+# （Pid がローカルに無い）は起動済みに数えない。
+dk_check_all() {
+  local i n=0
+  DK_PENDING=0
+  for i in "${!dk_ids[@]}"; do
+    dk_ok[i]=0
+    [ -n "${dk_ids[i]}" ] || continue
+    dk_inspect "${dk_ids[i]}" || continue
+    case "$DK_STATE" in created | restarting) DK_PENDING=1; continue ;; esac
+    [ "$DK_STATE" = "running" ] || continue
+    [ "$DK_PID" != "0" ] || continue
+    [ -d "$proc/$DK_PID" ] || continue
+    if [ -n "${dk_pid[i]:-}" ] && [ "${dk_pid[i]}" != "$DK_PID" ]; then continue; fi
+    dk_pid[i]="$DK_PID"
+    dk_ok[i]=1
+    n=$((n + 1))
+  done
+  DK_N="$n"
+}
+
+# 起動数不足の詳細（未起動の通し番号・件数上限つき）を stderr へ出す。コンテナ ID は出さない。
+dk_report_unstarted() { # <trial>
+  local i shown=0 id line
+  for i in "${!dk_ids[@]}"; do
+    [ "${dk_ok[i]:-0}" = "1" ] && continue
+    [ "$shown" -lt "$MAX_REPORT_IDS" ] || break
+    shown=$((shown + 1))
+    id="${id_prefix}-$1-$((i + 1))"
+    err "unstarted" "id=${id} state=$([ -n "${dk_ids[i]}" ] && echo not-running || echo no-cidfile)"
+    while IFS= read -r line; do
+      err "unstarted-log" "${id}: $(sanitize "$line")"
+    done < <(tail -n "$MAX_LOG_TAIL" "$tmpdir/cid/$id.err" 2>/dev/null || true)
+  done
+}
+
+# pid 1 つの Pss・VmRSS を acc_* へ加算する（同じ pid は二重に数えない）。0 = 成功、1 = 無効（m_reason）、
+# 2 = 消滅（呼び出し側が走査をやり直す）。読めない・数値でない値を 0 として足さない（CORE-9）。
+dk_add_pid() { # <pid>
+  local rc=0 pss
+  [ -z "${dk_seen[$1]:-}" ] || return 0
+  read_kb "$proc/$1/smaps_rollup" Pss || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    pss="$READ_KB"
+    read_kb "$proc/$1/status" VmRSS || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      acc_pss=$((acc_pss + pss))
+      acc_rss=$((acc_rss + READ_KB))
+      acc_n=$((acc_n + 1))
+      dk_seen[$1]=1
+      dk_added+=("$1")
+      return 0
+    fi
+  fi
+  if [ ! -e "$proc/$1" ]; then return 2; fi
+  m_reason="unreadable-memory-value"
+  if [ "$rc" -eq 3 ]; then m_reason="non-numeric-memory-value"; fi
+  return 1
+}
+
+# コンテナ i（init pid = dk_pid[i]）の親を containerd-shim として検証し、shim を根とする子孫ツリー全体を
+# acc_* へ加算する。shim が見つからない・comm が containerd-shim で始まらない・1 つの shim を複数コンテナが共有
+# している・ツリーに init が含まれない・プロセス数が --min-procs 未満は無効（m_reason）。0 = 成功、1 = 無効。
+dk_measure_container() { # <i>
+  local i="$1" shim comm attempt=0 rc p unreadable=0 s_pss s_rss s_n
+  m_reason=""
+  if ! read_ppid "${dk_pid[i]}" || [ "$READ_PPID" -le 1 ]; then m_reason="shim-not-found"; return 1; fi
+  shim="$READ_PPID"
+  comm=""
+  { IFS= read -r comm <"$proc/$shim/comm"; } 2>/dev/null || true
+  case "$comm" in containerd-shim*) ;; *) m_reason="shim-comm-mismatch"; return 1 ;; esac
+  if [ -n "${dk_seen[$shim]:-}" ]; then m_reason="shared-shim-unsupported"; return 1; fi
+  while [ "$attempt" -lt "$MAX_SCAN_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+    s_pss="$acc_pss"
+    s_rss="$acc_rss"
+    s_n="$acc_n"
+    dk_added=()
+    rc=0
+    ln_collect_pids "$shim" || rc=$?
+    # 子プロセス一覧を読めない（4）のは走査中のスレッド終了など一時的な場合があるのでやり直す。
+    if [ "$rc" -eq 4 ]; then unreadable=1; continue; fi
+    unreadable=0
+    if [ "$rc" -ne 0 ]; then m_reason="process-tree-unavailable"; return 1; fi
+    if [ "${#tree_pids[@]}" -lt "$min_procs" ]; then m_reason="process-tree-too-small"; return 1; fi
+    rc=1
+    for p in "${tree_pids[@]}"; do
+      if [ "$p" = "${dk_pid[i]}" ]; then rc=0; break; fi
+    done
+    if [ "$rc" -ne 0 ]; then m_reason="container-not-under-shim"; return 1; fi
+    rc=0
+    for p in "${tree_pids[@]}"; do
+      dk_add_pid "$p" || { rc=$?; break; }
+    done
+    if [ "$rc" -eq 0 ]; then return 0; fi
+    if [ "$rc" -eq 1 ]; then return 1; fi
+    # 走査中にプロセスが消えた: 加算を巻き戻して走査をやり直す。
+    for p in "${dk_added[@]}"; do unset "dk_seen[$p]"; done
+    acc_pss="$s_pss"
+    acc_rss="$s_rss"
+    acc_n="$s_n"
+  done
+  m_reason="process-tree-unstable"
+  if [ "$unreadable" -eq 1 ]; then m_reason="process-tree-unreadable"; fi
+  return 1
+}
+
+# 今回の試行のコンテナを止めて残存を確認する。cidfile で所有を証明した ID だけを docker rm -f し、ラベルでの
+# 一覧が空になることを確認する。残存・確認不能は 4（ラベルが一致しても所有を証明できないコンテナには触れず、
+# 件数だけ報告する）。何度呼んでも安全（EXIT trap からも呼ばれる）。
+dk_stop() {
+  local f v p waited=0 alive owned=() rc=0 id o unowned=0 found
+  [ "$dk_active" -eq 1 ] || return 0
+  dk_active=0
+  # 起動中の docker run クライアントを先に終える（終了前の中断でコンテナが作られた後に ID を読むため）。
+  while [ "$waited" -lt 50 ]; do
+    alive=0
+    for p in "${dk_cpids[@]}"; do
+      if proc_alive "$p"; then alive=1; break; fi
+    done
+    [ "$alive" -eq 1 ] || break
+    sleep "$POLL_INTERVAL"
+    waited=$((waited + 1))
+  done
+  for p in "${dk_cpids[@]}"; do
+    if proc_alive "$p"; then kill -KILL "$p" 2>/dev/null || true; fi
+    wait "$p" 2>/dev/null || true
+  done
+  dk_cpids=()
+  for f in "$tmpdir"/cid/*.cid; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    v=""
+    { IFS= read -r v <"$f"; } 2>/dev/null || true
+    if [[ "$v" =~ $hex64_re ]]; then owned+=("$v"); fi
+  done
+  if [ "${#owned[@]}" -gt 0 ]; then dk rm -f "${owned[@]}" >/dev/null 2>&1 || true; fi
+  if ! dk_list_labeled; then
+    err "cleanup-failed" "cannot confirm that all containers of this run were removed"
+    rc=4
+  elif [ "${#DK_LISTED[@]}" -gt 0 ]; then
+    for id in "${DK_LISTED[@]}"; do
+      found=0
+      for o in "${owned[@]}"; do
+        if [ "$o" = "$id" ]; then found=1; break; fi
+      done
+      if [ "$found" -eq 0 ]; then unowned=$((unowned + 1)); fi
+    done
+    err "cleanup-failed" "containers of this run still present: ${#DK_LISTED[@]} (not provable by cidfile, left untouched: ${unowned})"
+    rc=4
+  fi
+  rm -f -- "$tmpdir"/cid/*.cid "$tmpdir"/cid/*.err 2>/dev/null || true
+  return "$rc"
+}
+
+# docker モードの全試行を実行して trial_* 配列・n_started_min を埋める。失敗は結果を公開せず exit 1。
+# 計測区間は own と同じ（N/N 起動 → --settle → 集計 → 再確認）で、集計対象だけが違う（デーモン＋各コンテナの
+# shim ツリー）。n=0 のベースライン計測はしない（TASK-50.2 の最小構成。内訳は daemon と containers の 2 区分）。
+dk_trials() {
+  local t=1 i id mem_before mem_after deadline settled n_started rc pss_total rss_total zero_pss
+  local d_pss d_n c_pss p c_before
+  mkdir -m 700 "$tmpdir/cid" 2>/dev/null || { err "invalid-input" "cannot create the cidfile directory"; exit 1; }
+  # コンテナは計測の全期間（起動完了待ち・settle・集計）より長く生きる。後始末は docker rm -f で行う。
+  dk_sleep=$((timeout_s + settle + 600))
+  if ! dk_image_present; then
+    err "image-not-present" "image $image is not available locally (or docker failed); run 'docker pull' yourself first"
+    exit 1
+  fi
+  rc=0
+  dk_no_foreign || rc=$?
+  case "$rc" in
+    0) ;;
+    1) err "foreign-containers-running" "other containers are running; stop them first (their shims and daemon load would distort the aggregate)"; exit 1 ;;
+    *) err "docker-list-failed" "could not list running containers"; exit 1 ;;
+  esac
+  if ! dk_list_labeled; then err "docker-list-failed" "could not list containers of this run before measuring"; exit 1; fi
+  if [ "${#DK_LISTED[@]}" -ne 0 ]; then err "container-id-in-use" "containers of this run already exist; refusing to touch them"; exit 1; fi
+  dk_scan_daemons
+  if [ "$DK_DOCKERD_N" -lt 1 ]; then err "docker-daemon-not-local" "no dockerd process found locally (remote or rootless daemons are not supported)"; exit 1; fi
+
+  while [ "$t" -le "$trials" ]; do
+    mem_before="$(mem_available)"
+    dk_ids=()
+    dk_pid=()
+    dk_ok=()
+    dk_spawn "$t"
+    dk_wait_clients "$t"
+    dk_read_cids "$t"
+    # 起動完了待ち（期限つき。REPAIR-5）。作成直後・再起動中のコンテナがなくなれば待たない。
+    deadline=$((SECONDS + timeout_s))
+    while :; do
+      dk_check_all
+      [ "$DK_PENDING" -eq 1 ] || break
+      [ "$SECONDS" -lt "$deadline" ] || break
+      sleep "$POLL_INTERVAL"
+    done
+    # settle 待機は 1 秒刻みにする（own と同じ。シグナル後の後始末を遅らせない）。
+    settled=0
+    while [ "$settled" -lt "$settle" ]; do
+      sleep 1
+      settled=$((settled + 1))
+    done
+    dk_check_all
+    n_started="$DK_N"
+    if [ "$n_started" -lt "$count" ]; then
+      err "startup-incomplete" "trial=${t} started=${n_started}/${count}"
+      dk_report_unstarted "$t"
+      exit 1
+    fi
+    if [ "$n_started" -lt "$n_started_min" ]; then n_started_min="$n_started"; fi
+
+    dk_scan_daemons
+    if [ "$DK_DOCKERD_N" -lt 1 ]; then err "docker-daemon-not-local" "no dockerd process found locally"; exit 1; fi
+    dk_seen=()
+    acc_pss=0
+    acc_rss=0
+    acc_n=0
+    for p in "${DK_DAEMONS[@]}"; do
+      rc=0
+      dk_add_pid "$p" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 2 ]; then m_reason="daemon-vanished"; fi
+        err "measurement-failed" "trial=${t} daemon reason=${m_reason}"
+        exit 1
+      fi
+    done
+    d_pss="$acc_pss"
+    d_n="$acc_n"
+    zero_pss=0
+    for i in "${!dk_ids[@]}"; do
+      c_before="$acc_pss"
+      if ! dk_measure_container "$i"; then
+        err "measurement-failed" "trial=${t} id=${id_prefix}-${t}-$((i + 1)) reason=${m_reason}"
+        exit 1
+      fi
+      if [ "$((acc_pss - c_before))" -le 0 ]; then zero_pss=$((zero_pss + 1)); fi
+    done
+    if [ "$zero_pss" -gt 0 ]; then
+      err "measurement-failed" "trial=${t} zero_pss_count=${zero_pss} (refusing to sum containers with PSS 0)"
+      exit 1
+    fi
+    c_pss=$((acc_pss - d_pss))
+    pss_total="$acc_pss"
+    rss_total="$acc_rss"
+    # 集計は 1 コンテナずつ順に行うため、集計中に終了したコンテナがあれば「N 個同時稼働時の集約値」ではない。
+    # 全件の再確認で 1 つでも欠けていれば失敗にする（CORE-9。過少計上を公開しない）。
+    dk_check_all
+    if [ "$DK_N" -lt "$count" ]; then
+      err "measurement-failed" "trial=${t} running_after_measurement=${DK_N}/${count} reason=container-exited-during-measurement"
+      dk_report_unstarted "$t"
+      exit 1
+    fi
+    mem_after="$(mem_available)"
+    trial_pss+=("$pss_total")
+    trial_rss+=("$rss_total")
+    trial_json+=("$(printf '{"trial": %s, "n_expected": %s, "n_started": %s, "zero_pss_count": %s, "pss_total_kb": %s, "rss_total_kb": %s, "mem_available_delta_kb": %s, "process_count": %s, "daemon_pss_kb": %s, "containers_pss_kb": %s, "daemon_process_count": %s}' \
+      "$t" "$count" "$n_started" "$zero_pss" "$pss_total" "$rss_total" "$((mem_before - mem_after))" "$acc_n" "$d_pss" "$c_pss" "$d_n")")
+    # 次の試行へ進む前に必ず後始末する（残存は 4 を最優先で返す）。
+    dk_stop || exit 4
+    t=$((t + 1))
+  done
+}
+
+out_buf=""
+if [ "$mode" = "report" ]; then
+  run_report
+  exit 0
+fi
+
 # --- 計測本体 ---
 trial_pss=()
 trial_rss=()
 trial_json=()
 n_started_min="$count"
 
+# docker モードは dk_trials が全試行を実行する。以降の own の試行ループは own モードのときだけ回す
+# （docker では 0 回。ループ本体は own 専用で、launcher・READY 行・環境変数トークンに依存する）。
+own_trials="$trials"
+if [ "$mode" != "own" ]; then own_trials=0; fi
+if [ "$mode" = "docker" ]; then dk_trials; fi
+
 t=1
-while [ "$t" -le "$trials" ]; do
+while [ "$t" -le "$own_trials" ]; do
   mem_before="$(mem_available)"
   pids=()
   pstart=()
@@ -1068,7 +1742,9 @@ fi
 kernel="${kernel//[^A-Za-z0-9._+-]/}"
 arch="${arch//[^A-Za-z0-9._-]/}"
 
-# JSON へ埋め込む文字列は検証済み（target・mode）か上で安全な文字だけに絞った値のみ。
+# JSON へ埋め込む文字列は検証済み（target・mode・image）か上で安全な文字だけに絞った値のみ。
+method="launcher-tree"
+if [ "$mode" = "docker" ]; then method="docker-daemons-and-shim-trees"; fi
 out_buf=""
 if [ "$format" = "json" ]; then
   out_buf+='{'$'\n'
@@ -1077,12 +1753,14 @@ if [ "$format" = "json" ]; then
   out_buf+='  "behavior": ["CORE-9", "SUP-1"],'$'\n'
   out_buf+='  "task": "TASK-50",'$'\n'
   out_buf+="  \"mode\": \"${mode}\","$'\n'
+  out_buf+="  \"method\": \"${method}\","$'\n'
   out_buf+="  \"target\": \"${target_name}\","$'\n'
   out_buf+="  \"timestamp\": \"${ts}\","$'\n'
   out_buf+="  \"kernel\": \"${kernel}\","$'\n'
   out_buf+="  \"arch\": \"${arch}\","$'\n'
   out_buf+="  \"count\": ${count},"$'\n'
   out_buf+="  \"trials\": ${trials},"$'\n'
+  if [ "$mode" = "docker" ]; then out_buf+="  \"params\": {\"image\": \"${image}\"},"$'\n'; fi
   out_buf+="  \"n_started_min\": ${n_started_min},"$'\n'
   out_buf+='  "metrics": {'$'\n'
   out_buf+="    \"concurrent_${count}_pss_median_kb\": {\"value\": ${pss_median}, \"unit\": \"kB\"},"$'\n'
@@ -1103,20 +1781,5 @@ else
   out_buf+="rss_median_kb=${rss_median}"$'\n'
 fi
 
-# 公開は全試行の検証後に 1 回だけ行う（失敗した計測結果を正規の成果物として残さない）。
-if [ -n "$output" ]; then
-  if ! out_tmp="$(mktemp "${output}.XXXXXX" 2>/dev/null)"; then err "output-failed" "cannot create temporary file next to the output"; exit 2; fi
-  if ! printf '%s' "$out_buf" 2>/dev/null >"$out_tmp"; then err "output-failed" "cannot write temporary file"; exit 2; fi
-  # ln -T（link(2)）で公開する（startup_latency.sh の publish_result と同じ方式）。出力先が種別を問わず
-  # 既に存在すれば失敗し、symlink を辿らず、ディレクトリ内へも作らない。計測中に同名のファイルが
-  # 作られていても上書きしない。一時ファイルは成功・失敗のどちらでも消す（失敗時は EXIT trap）。
-  if ! ln -T -- "$out_tmp" "$output" 2>/dev/null; then
-    err "output-failed" "cannot publish output (it may already exist, or hard links are unsupported)"
-    exit 2
-  fi
-  rm -f -- "$out_tmp" || true
-  out_tmp=""
-else
-  if ! printf '%s' "$out_buf" 2>/dev/null; then err "output-failed" "cannot write to stdout"; exit 2; fi
-fi
+publish_out
 exit 0

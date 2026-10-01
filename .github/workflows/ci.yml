@@ -524,8 +524,8 @@ jobs:
       # 非 root で実行されるため chmod 000 を使う読み取り失敗ケースも実行される
       - name: アイドル時常駐メモリ計測スクリプトの自己テスト（TASK-45.1・CORE-7・SUP-1・REPAIR-12）
         run: make idle-memory-selftest
-      # スタブ launcher と疑似 /proc だけで照合し、実コンテナ・実ランタイムは使わない
-      - name: 50 コンテナ同時起動メモリ計測スクリプトの自己テスト（TASK-50.1・CORE-9・SUP-1・REPAIR-12）
+      # スタブ launcher・スタブ docker CLI と疑似 /proc だけで照合し、実コンテナ・実ランタイム・実 Docker は使わない（docker・report モードを含む）
+      - name: 50 コンテナ同時起動メモリ計測スクリプトの自己テスト（TASK-50.1・TASK-50.2・CORE-9・SUP-1・REPAIR-12）
         run: make concurrent-memory-selftest
       # スタブ計測・スタブ driver だけで照合し、実コンテナ・実プロセスは起動しない。実計測は root の操作者が明示実行する
       - name: 監視プロセス込みアイドル常駐メモリ回帰テストの自己テスト（TASK-47・CORE-7・SUP-1・REPAIR-12）

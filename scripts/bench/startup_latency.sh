@@ -51,7 +51,7 @@
 #   1: ランタイムの create / start / state の失敗・タイムアウト、実行開始を観測できない、
 #      ID が既に使用中
 #   2: 入力エラー（引数・bundle・output の検証失敗）
-#   3: 前提ツール欠如（bash 5 以上・jq・GNU timeout・mktemp・sleep 等）
+#   3: 前提ツール欠如（bash 5 以上・jq・GNU timeout・GNU dd〔conv=excl〕・mktemp・sleep 等）
 #   4: 後始末失敗（作成済みコンテナを delete できない、create 失敗後に未作成を確定できない等。
 #      残存の可能性がある ID を stderr に出す。最優先）
 #
@@ -208,7 +208,7 @@ if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
   err "missing-prerequisite" "bash 5 or later is required (EPOCHREALTIME)"
   exit "$EXIT_PREREQ"
 fi
-for tool in jq timeout mktemp tail rm sleep; do
+for tool in jq timeout mktemp tail rm sleep dd; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     err "missing-prerequisite" "required tool not found: $tool"
     exit "$EXIT_PREREQ"
@@ -539,11 +539,14 @@ result="$(jq -n \
 # --output 指定時はファイル作成に成功してから stdout へ出す（作成失敗時に成功結果を
 # stdout へ残さず、呼び出し元が失敗した計測を取り込まないようにする）。
 if [ -n "$output" ]; then
-  # noclobber で上書き・symlink 追従を防ぐ（検証後に作られたパスも拒否する）。
-  if ! (
-    set -o noclobber
-    printf '%s\n' "$result" >"$output"
-  ); then
+  # 結果は非公開の tmpdir に書いてから、dd の conv=excl（open の O_CREAT|O_EXCL）で出力先を
+  # 排他的に新規作成し、その記述子へ書き込む。O_EXCL は既存のパス（通常ファイル・symlink・
+  # FIFO 等の種別を問わない）で EEXIST となるため、検証後に出力先が FIFO や symlink へ
+  # 差し替えられても開かずに失敗する（noclobber は通常ファイル以外を開いてしまい、読み手の
+  # いない FIFO で無期限に待機し得る）。念のため timeout でも上限を掛ける（REPAIR-5）。
+  printf '%s\n' "$result" >"$tmpdir/result.json"
+  if ! timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" \
+    dd if="$tmpdir/result.json" of="$output" conv=excl status=none 2>/dev/null; then
     err "output-write-failed" "could not create --output file"
     exit "$EXIT_INPUT"
   fi

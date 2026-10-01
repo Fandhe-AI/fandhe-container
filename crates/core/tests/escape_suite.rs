@@ -93,7 +93,7 @@
 //! - `control-esc-10-no-landlock`: 同じ操作が Landlock なしでは成功する否定対照（拒否が DAC 等ではなく Landlock
 //!   に帰属することの裏付け）
 //!
-//! ESC-07 は Landlock ABI 6+（Linux 6.12+）を要する。
+//! ESC-01・ESC-07・ESC-10（Landlock を使うケース）は Landlock ABI 6+（Linux 6.12+）を要する。
 //!
 //! ケースの攻撃操作は、制限が欠けていてもホストへ副作用が出ない引数・対象に限る（`seccomp.rs` と同方針）。
 //! 攻撃クロージャ・ハーネスは `unsafe` を書かない。raw syscall が要る攻撃は core 側の `#[doc(hidden)]`

@@ -29,6 +29,7 @@
 //! - 攻撃の結果: 許可された結果の集合（`Expectation::allowed`）に入るか。ESC-06 のようにシグナル終了を
 //!   期待するケースは `Expectation::signal` で指定する
 //! - 監査ログ: `AuditExpectation::Required(layer)` のケースは、そのレイヤーの記録が 0 件なら必ず失敗する。
+//!   `AuditExpectation::Deferred(layer)` は spec 上は要求するが本番の配送経路が未配線のため合否に使わない。
 //!   監査ログの本番配線（`AuditSink` を fork 後の子へ渡す経路）は未実装（REPAIR-3）のため、現状は攻撃
 //!   クロージャが既存の記録ヘルパ（`landlock_denial_record_now`・`record_seccomp_denial` 等）経由で
 //!   `Recorder`（`AuditSink`）へ記録したレコードを pipe で回収して判定する。配線完了後は本番経路の
@@ -59,13 +60,19 @@
 //!   `EPERM` / `EACCES` は、対象パスに実際に適用されるマウント（mountinfo の親子関係から特定する実効マウント）が
 //!   読み取り専用であるという証拠（`has_mask_evidence`）がある場合だけ受理する。拒否理由別のより厳密な判定と
 //!   実 cgroup v1 の安全な観測は REPAIR-12 の後続課題
-//! - ESC-06（禁止 syscall の SIGSYS 強制終了＋監査記録）は spec の期待で書く。現行の CORE-5 フィルタは
-//!   `ERRNO(EPERM)` を返し、SIGSYS 化と監査記録の配送は未実装のため、実機実行では失敗する（fail-closed。
-//!   期待の弱体化や監査レコードの偽造はしない）。監査記録の回収経路は、子が持つ `Recorder` の pipe を本番の
-//!   SIGSYS 経路（`SECCOMP_RET_TRAP` のハンドラが `record_seccomp_denial` へ渡す `AuditSink`）の書き込み先に
-//!   する想定で、親が読む。`SECCOMP_RET_KILL` 系では死ぬ前に書けないため、TRAP＋ハンドラ内記録が前提
-//!   （`audit_log/seccomp_hook.rs`・REPAIR-3。本番配線は後続作業）。親側で取得できる本番監査経路が接続されるまで
-//!   ESC-06 は成立しない（監査記録の偽造・親側での推測生成はしない。期待を弱めず、実機実行では失敗として残す）
+//! - ESC-06（禁止 syscall の SIGSYS 強制終了＋監査記録）: SIGSYS での強制終了は spec の期待どおり必須とする。
+//!   現行の CORE-5 フィルタは `ERRNO(EPERM)` を返して戻るため、実機実行では失敗する（fail-closed。期待は弱めない）。
+//! - ESC-06 の監査（SEC-4）は `AuditExpectation::Deferred("seccomp")` とし、合否に使わない（ESC-03 と同じ扱い）。
+//!   理由: 子が SIGSYS で終了すると子からは記録を書けず、親側で取得できる本番の監査経路がまだない。
+//!   既存の記録経路はどれも使えない。`ExecError::violation`（`IsolationViolation`）は親側の分離確立時の拒否だけを
+//!   表し、seccomp の種別を持たない。`record_seccomp_denial` は SIGSYS の siginfo（`si_syscall`・`si_arch`）か
+//!   USER_NOTIF の通知から作る報告を要するが、その配送元（TRAP の SIGSYS ハンドラ / supervisor の USER_NOTIF
+//!   listener）は未実装で、親が `waitpid` で得られるのは終了シグナルだけである。親側で記録を推測生成すると
+//!   監査の偽造になるため行わない。
+//! - 将来仕様（REPAIR-3）: フィルタのアクションを TRAP / USER_NOTIF へ変える設計判断と配送経路の配線
+//!   （`audit_log/seccomp_hook.rs`）の後に、その本番経路が出力した記録を親側で回収して照合する
+//!   `Required("seccomp")` へ切り替える。`SECCOMP_RET_KILL` 系では子が記録を書く前に終了するため、親側の
+//!   listener か TRAP ハンドラ内の記録が前提になる
 //!
 //! ESC-07 は Landlock ABI 6+（Linux 6.12+）を要する。
 //!
@@ -111,11 +118,15 @@ const ESC05_EXPECT: Expectation = Expectation {
     audit: AuditExpectation::None,
 };
 
-/// ESC-06 の期待（SEC-2・SEC-4・TASK-42.3・MS-2）。SIGSYS での強制終了と seccomp 監査記録を要求する。
+/// ESC-06 の期待（SEC-2・SEC-4・TASK-42.3・MS-2）。SIGSYS での強制終了を要求する。
+///
+/// spec は seccomp 監査記録も要求するが、子が SIGSYS で終了した後に親側で取得できる本番の監査経路がまだ
+/// ないため、監査は `Deferred("seccomp")` とし合否に使わない（ESC-03 と同じ扱い。SEC-4・REPAIR-3）。
+/// 経路の配線後に `Required("seccomp")` へ切り替える（詳細はモジュール doc の ESC-04〜ESC-06 節）。
 const ESC06_EXPECT: Expectation = Expectation {
     allowed: &[],
     signal: Some(SIGSYS),
-    audit: AuditExpectation::Required("seccomp"),
+    audit: AuditExpectation::Deferred("seccomp"),
 };
 
 /// ESC-06 が発行する禁止 syscall 名（`DeniedSyscall::ALL` の名前と一致していること）。
@@ -569,7 +580,22 @@ fn sec2_task42_3_case_expectation_selftest() {
         ),
         CaseVerdict::Pass
     );
-    // 現行実装（EPERM で戻り、SIGSYS も監査記録もない）は失敗として検出される。
+    // 監査は Deferred のため、SIGSYS 終了なら監査記録の有無にかかわらず合格（記録を合否に使わない。SEC-4）。
+    assert_eq!(
+        judge(
+            &ESC06_EXPECT,
+            &obs(ObservedExit::Signaled(SIGSYS), None, &[])
+        ),
+        CaseVerdict::Pass
+    );
+    // SIGSYS 以外のシグナル終了は失敗。
+    assert_eq!(
+        judge(&ESC06_EXPECT, &obs(ObservedExit::Signaled(9), None, &[])),
+        CaseVerdict::Fail(vec![Mismatch::UnexpectedExit {
+            got: ObservedExit::Signaled(9)
+        }])
+    );
+    // 現行実装（EPERM で戻り、SIGSYS で終了しない）は失敗として検出される。
     assert_eq!(
         judge(
             &ESC06_EXPECT,
@@ -582,7 +608,6 @@ fn sec2_task42_3_case_expectation_selftest() {
             Mismatch::UnexpectedOutcome {
                 got: AttackOutcome::Errno(1)
             },
-            Mismatch::MissingAudit { layer: "seccomp" },
         ])
     );
 }
@@ -1523,8 +1548,9 @@ mod linux {
         }
     }
 
-    /// ESC-06（SEC-2・TASK-42.3・#201・MS-2）: `unshare(0)`（副作用なし）。期待は spec どおり SIGSYS 終了＋seccomp
-    /// 監査記録。戻ってきた場合（現行は EPERM）は結果を記録し、判定側が失敗にする。監査レコードは偽造しない。
+    /// ESC-06（SEC-2・TASK-42.3・#201・MS-2）: `unshare(0)`（副作用なし）。期待は spec どおり SIGSYS 終了。
+    /// 戻ってきた場合（現行は EPERM）は結果を記録し、判定側が失敗にする。seccomp 監査は親側の本番経路が
+    /// 未配線のため `Deferred`（SEC-4・REPAIR-3）で、攻撃側で監査レコードを作らない（偽造しない）。
     fn attack_esc06_unshare(rec: &Recorder, _host_canary: &Path) {
         rec.outcome(probe_to_attack(probe_escape_syscall(
             EscapeSyscallProbe::Unshare,

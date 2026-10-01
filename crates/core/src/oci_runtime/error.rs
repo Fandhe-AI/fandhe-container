@@ -130,16 +130,15 @@ impl OciRuntimeError {
     /// エラーを構築する。`message` はサニタイズ（制御文字の置換・長さ上限での切り詰め）して保持する。
     pub fn new(op: LifecycleOp, code: ErrorCode, message: impl Into<String>) -> Self {
         let raw: String = message.into();
-        let mut message: String = raw
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
-        if message.len() > OCI_ERROR_MESSAGE_MAX_BYTES {
-            let mut end = OCI_ERROR_MESSAGE_MAX_BYTES;
-            while end > 0 && !message.is_char_boundary(end) {
-                end -= 1;
+        // 全量を複製せず、出力が上限に達するまでだけサニタイズして収集する
+        // （untrusted な巨大メッセージによるメモリ・CPU の浪費を防ぐ）。
+        let mut message = String::with_capacity(raw.len().min(OCI_ERROR_MESSAGE_MAX_BYTES));
+        for c in raw.chars() {
+            let c = if c.is_control() { ' ' } else { c };
+            if message.len() + c.len_utf8() > OCI_ERROR_MESSAGE_MAX_BYTES {
+                break;
             }
-            message.truncate(end);
+            message.push(c);
         }
         Self { op, code, message }
     }

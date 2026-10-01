@@ -205,9 +205,10 @@ mod linux {
             .join(delegated.path().trim_start_matches('/'))
             .join(name.as_str());
 
-        let rootfs = make_rootfs();
-        // どこで panic しても子 cgroup の削除まで到達できるよう捕捉し、後始末後に再送出する。
+        // rootfs 作成を含めどこで panic しても子 cgroup の削除まで到達できるよう捕捉し、
+        // 後始末後に再送出する（rootfs は Drop で削除される）。
         let verify = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let rootfs = make_rootfs();
             let enabled = delegated
                 .enable_controllers(&proof, &ControllerSet::of(&[Controller::Memory]))
                 .expect("enable memory controller");

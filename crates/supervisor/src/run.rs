@@ -9,7 +9,9 @@
 //! - 本番の `ProcessLauncher` は core に未提供のため、起動ハンドル（`LaunchedProcess`）は呼び出し側から注入する。
 //!   supervisor のバイナリ入口（`main.rs`）は本 issue では追加しない（実プロセスを起動できないため実装済みを装わない）。
 //!   「コンテナ 0 個で supervisor プロセスが残存しない」ことの検証は結合テスト（#242・TASK-157.8）の担当。
-//! - restart 判定・`restart_count` 更新（#239・SUP-3）、health 更新（#240・SUP-4）、stdout / stderr 捕捉（#241）は未実装。
+//! - restart 判定・`restart_count` 更新（#239・SUP-3）、health 更新（#240・SUP-4）は未実装。
+//!   stdout / stderr 捕捉の土台は [`crate::logs`] と [`monitor_with_capture`]（#241・TASK-157.7）。永続化・ローテーションは未実装
+//!   （SUP-7・TASK-164）で、実パイプは core が未提供のため注入式。
 //!   終了検知後の分岐（再起動するか Stopped に落とすか）は、[`monitor`] の手順 4 が拡張点になる。
 //!
 //! # 処理順（[`monitor`]）
@@ -57,7 +59,14 @@ use fandhe_container_core::traits::{
     ContainerState, ContainerStatus, ErrorCode, StateRecord, SupervisionState, TraitError,
 };
 
+use crate::logs::{CaptureSummary, LogCapture, LogSink, OutputStreams};
 use crate::state::SupervisedState;
+
+/// 捕捉の終端待ち（drain）の既定の上限。
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `drain_timeout` の上限。これを超える値は拒否する（REPAIR-5）。
+pub const MAX_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 1 回の `wait` の既定の上限。
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -72,6 +81,7 @@ pub const MAX_WRITE_ATTEMPTS: u32 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorConfig {
     poll_interval: Duration,
+    drain_timeout: Duration,
 }
 
 impl MonitorConfig {
@@ -83,7 +93,30 @@ impl MonitorConfig {
                 "poll interval is out of range",
             ));
         }
-        Ok(Self { poll_interval })
+        Ok(Self {
+            poll_interval,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+        })
+    }
+
+    /// 捕捉の終端待ちの上限を設定する（[`monitor_with_capture`] のみが使う）。
+    /// 0 または [`MAX_DRAIN_TIMEOUT`] 超なら `InvalidArgument`。
+    pub fn with_drain_timeout(self, drain_timeout: Duration) -> Result<Self, TraitError> {
+        if drain_timeout.is_zero() || drain_timeout > MAX_DRAIN_TIMEOUT {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "drain timeout is out of range",
+            ));
+        }
+        Ok(Self {
+            drain_timeout,
+            ..self
+        })
+    }
+
+    /// 捕捉の終端待ちの上限。
+    pub fn drain_timeout(&self) -> Duration {
+        self.drain_timeout
     }
 
     /// 1 回の `wait` の上限。
@@ -96,6 +129,7 @@ impl Default for MonitorConfig {
     fn default() -> Self {
         Self {
             poll_interval: DEFAULT_POLL_INTERVAL,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
         }
     }
 }
@@ -176,6 +210,10 @@ pub enum MonitorOperation {
     Stop,
     /// `wait` 失敗後の `supervisor_pid` 解除。
     ReleaseAfterWaitError,
+    /// 出力捕捉の開始（リーダースレッドの起動。#241）。
+    CaptureStart,
+    /// 終了検知後の出力捕捉の終端待ち（#241）。
+    CaptureDrain,
 }
 
 impl MonitorOperation {
@@ -187,6 +225,8 @@ impl MonitorOperation {
             Self::RecordExit => "record_exit",
             Self::Stop => "stop",
             Self::ReleaseAfterWaitError => "release_after_wait_error",
+            Self::CaptureStart => "capture_start",
+            Self::CaptureDrain => "capture_drain",
         }
     }
 }
@@ -337,6 +377,82 @@ pub fn monitor_with_observer(
             }
         }
     }
+}
+
+/// [`monitor_with_capture`] の結果。監視結果を捕捉の失敗で失わないよう、両者を別々に返す。
+#[derive(Debug)]
+pub struct MonitoredWithCapture {
+    outcome: MonitorOutcome,
+    capture: Option<CaptureSummary>,
+    capture_error: Option<TraitError>,
+}
+
+impl MonitoredWithCapture {
+    /// 監視ループの結果。
+    pub fn outcome(&self) -> &MonitorOutcome {
+        &self.outcome
+    }
+    /// 捕捉の集計。プロセス終了を検知し終端待ちに成功した場合のみ `Some`。
+    pub fn capture(&self) -> Option<&CaptureSummary> {
+        self.capture.as_ref()
+    }
+    /// 終端待ちの失敗（`Timeout` 等）。監視結果とは独立。
+    pub fn capture_error(&self) -> Option<&TraitError> {
+        self.capture_error.as_ref()
+    }
+}
+
+/// [`monitor_with_observer`] に stdout / stderr の行単位捕捉（[`crate::logs`]。#241・TASK-157.7）を加える。
+///
+/// 事前条件（`Running` かつ pid 一致）を満たさなければスレッドを起こさず `FailedPrecondition`。捕捉の開始に失敗しても
+/// 監視は始めず `Err`。プロセスの終了（`Exited` / `ExitedUnrecorded`）を検知したときだけ、`drain_timeout` を上限に
+/// 全ストリームの EOF を待って集計を返す。`StopRequested` などプロセスが生存し得る結果では待たない
+/// （EOF が来ないため）。その場合リーダーは EOF まで走り sink への追記を続け、ストリームの所有権は捕捉側へ移っているため
+/// 監視の引き継ぎ時に再注入できない（#239・TASK-164 で扱う）。永続化・ローテーションは未実装（SUP-7・TASK-164）。
+pub fn monitor_with_capture(
+    state: &mut SupervisedState,
+    process: &dyn LaunchedProcess,
+    streams: OutputStreams,
+    sink: Arc<dyn LogSink>,
+    config: &MonitorConfig,
+    stop: &StopToken,
+    obs: &dyn MonitorObserver,
+) -> Result<MonitoredWithCapture, TraitError> {
+    if !is_running_with_pid(state.record(), process.pid()) {
+        return Err(precondition(
+            "container is not running with the launched pid",
+        ));
+    }
+    let capture = observed(obs, MonitorOperation::CaptureStart, || {
+        LogCapture::start(streams, sink)
+    })?;
+    let outcome = monitor_with_observer(state, process, config, stop, obs)?;
+    let exited = matches!(
+        outcome,
+        MonitorOutcome::Exited { .. } | MonitorOutcome::ExitedUnrecorded { .. }
+    );
+    if !exited {
+        return Ok(MonitoredWithCapture {
+            outcome,
+            capture: None,
+            capture_error: None,
+        });
+    }
+    let drained = observed(obs, MonitorOperation::CaptureDrain, || {
+        capture.drain(config.drain_timeout())
+    });
+    Ok(match drained {
+        Ok(summary) => MonitoredWithCapture {
+            outcome,
+            capture: Some(summary),
+            capture_error: None,
+        },
+        Err(e) => MonitoredWithCapture {
+            outcome,
+            capture: None,
+            capture_error: Some(e),
+        },
+    })
 }
 
 /// `supervisor_pid` を `None` に戻す（`health`・`restart_count` は保つ）。
@@ -953,6 +1069,184 @@ mod tests {
                 .unwrap()
                 .poll_interval(),
             MAX_POLL_INTERVAL
+        );
+    }
+
+    fn capture_streams(out: &[u8], err: &[u8]) -> (OutputStreams, Arc<crate::logs::MemoryLogSink>) {
+        use std::io::Cursor;
+        (
+            OutputStreams::new(
+                Some(Box::new(Cursor::new(out.to_vec()))),
+                Some(Box::new(Cursor::new(err.to_vec()))),
+            ),
+            Arc::new(crate::logs::MemoryLogSink::default()),
+        )
+    }
+
+    /// SUP-1・TASK-157.7: 終了検知後に drain し、行数・バイト数が具体値で返る。
+    #[test]
+    fn sup1_task157_7_monitor_with_capture_drains_after_exit() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = FakeProc::exiting(1, ProcessExit::Exited(0));
+        let (streams, sink) = capture_streams(b"a\nb\n", b"e\n");
+        let r = monitor_with_capture(
+            &mut s,
+            &p,
+            streams,
+            sink.clone(),
+            &MonitorConfig::default(),
+            &StopToken::new(),
+            &StderrLogObserver,
+        )
+        .unwrap();
+        assert!(matches!(r.outcome(), MonitorOutcome::Exited { .. }));
+        assert!(r.capture_error().is_none());
+        let c = r.capture().unwrap();
+        assert_eq!(c.stdout().unwrap().lines(), 2);
+        assert_eq!(c.stderr().unwrap().bytes(), 2);
+        assert_eq!(sink.snapshot().unwrap().len(), 3);
+    }
+
+    /// REPAIR-5・TASK-157.7: 停止要求では drain を待たない（writer を開いたままでも戻る）。
+    #[test]
+    fn sup1_task157_7_stop_requested_does_not_wait_for_drain() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = FakeProc::alive();
+        let (reader, writer) = std::io::pipe().unwrap();
+        let streams = OutputStreams::new(Some(Box::new(reader)), None);
+        let stop = StopToken::new();
+        stop.request_stop();
+        let r = monitor_with_capture(
+            &mut s,
+            &p,
+            streams,
+            Arc::new(crate::logs::MemoryLogSink::default()),
+            &MonitorConfig::default(),
+            &stop,
+            &StderrLogObserver,
+        )
+        .unwrap();
+        assert!(matches!(r.outcome(), MonitorOutcome::StopRequested { .. }));
+        assert!(r.capture().is_none());
+        drop(writer);
+    }
+
+    /// TASK-157.7: 事前条件違反では捕捉を始めず sink は空のまま。
+    #[test]
+    fn sup1_task157_7_precondition_failure_starts_no_capture() {
+        let store = store_with(
+            ContainerStatus::stopped(cid(), Some(0)),
+            SupervisionState::default(),
+            0,
+        );
+        let mut s = attach(&store);
+        let p = FakeProc::alive();
+        let (streams, sink) = capture_streams(b"x\n", b"y\n");
+        let e = monitor_with_capture(
+            &mut s,
+            &p,
+            streams,
+            sink.clone(),
+            &MonitorConfig::default(),
+            &StopToken::new(),
+            &StderrLogObserver,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(sink.snapshot().unwrap().is_empty());
+    }
+
+    /// TASK-157.7: drain が Timeout でも監視結果は失われない。
+    #[test]
+    fn sup1_task157_7_drain_timeout_keeps_outcome() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = FakeProc::exiting(1, ProcessExit::Exited(3));
+        let (reader, writer) = std::io::pipe().unwrap();
+        let streams = OutputStreams::new(Some(Box::new(reader)), None);
+        let cfg = MonitorConfig::default()
+            .with_drain_timeout(Duration::from_millis(50))
+            .unwrap();
+        let r = monitor_with_capture(
+            &mut s,
+            &p,
+            streams,
+            Arc::new(crate::logs::MemoryLogSink::default()),
+            &cfg,
+            &StopToken::new(),
+            &StderrLogObserver,
+        )
+        .unwrap();
+        assert!(matches!(
+            r.outcome(),
+            MonitorOutcome::Exited {
+                exit: ProcessExit::Exited(3),
+                ..
+            }
+        ));
+        assert_eq!(
+            r.capture_error().map(|e| e.code()),
+            Some(ErrorCode::Timeout)
+        );
+        drop(writer);
+    }
+
+    /// REPAIR-4・TASK-157.7: 捕捉操作が通知される。
+    #[test]
+    fn sup1_task157_7_observer_reports_capture_operations() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = FakeProc::exiting(1, ProcessExit::Exited(0));
+        let (streams, sink) = capture_streams(b"", b"");
+        let rec = Rec(Mutex::new(Vec::new()));
+        monitor_with_capture(
+            &mut s,
+            &p,
+            streams,
+            sink,
+            &MonitorConfig::default(),
+            &StopToken::new(),
+            &rec,
+        )
+        .unwrap();
+        assert_eq!(
+            *rec.0.lock().unwrap(),
+            vec![
+                (MonitorOperation::CaptureStart, None),
+                (MonitorOperation::Start, None),
+                (MonitorOperation::Wait, None),
+                (MonitorOperation::RecordExit, None),
+                (MonitorOperation::CaptureDrain, None),
+            ]
+        );
+        assert_eq!(MonitorOperation::CaptureStart.as_str(), "capture_start");
+        assert_eq!(MonitorOperation::CaptureDrain.as_str(), "capture_drain");
+    }
+
+    /// TASK-157.7: drain_timeout の検証（0・上限超は拒否、境界は受理）。
+    #[test]
+    fn sup1_task157_7_drain_timeout_validation() {
+        for bad in [Duration::ZERO, MAX_DRAIN_TIMEOUT + Duration::from_nanos(1)] {
+            assert_eq!(
+                MonitorConfig::default()
+                    .with_drain_timeout(bad)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::InvalidArgument
+            );
+        }
+        assert_eq!(
+            MonitorConfig::default()
+                .with_drain_timeout(MAX_DRAIN_TIMEOUT)
+                .unwrap()
+                .drain_timeout(),
+            MAX_DRAIN_TIMEOUT
+        );
+        assert_eq!(
+            MonitorConfig::default().drain_timeout(),
+            DEFAULT_DRAIN_TIMEOUT
         );
     }
 }

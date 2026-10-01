@@ -1,0 +1,515 @@
+//! 監視対象プロセスの stdout / stderr を行単位で捕捉する土台（TASK-157.7・#241・SUP-1。関連: CORE-1・D-19・REPAIR-3・REPAIR-5）。
+//!
+//! [`crate::run::monitor_with_capture`] が、呼び出し側から注入された出力ストリーム（[`OutputStreams`]）を
+//! ストリームごとのリーダースレッドで読み、LF 区切りの 1 行ずつを [`LogSink`] へ渡す。
+//! 子の出力は非信頼データとして不透明なバイト列のまま扱い、解釈・パス / コマンドへの連結・
+//! supervisor 自身のログやエラーメッセージへの混入をしない。
+//!
+//! # 契約
+//! - 行は LF を除いたバイト列で渡す（UTF-8 を仮定しない。CR は除去しない）。EOF 時の LF なし末尾行も 1 行として渡す。
+//! - 1 行は [`MAX_LINE_BYTES`] で切り捨てる（超過ぶんは捨て、[`StreamSummary::truncated_lines`] へ数える。無制限確保の防止）。
+//! - [`LogSink::append`] が失敗しても読み取りは EOF まで続けて破棄する（読みを止めるとパイプが詰まり、
+//!   コンテナ側の write がブロックするため）。最初のエラーコードだけを [`StreamSummary::error_code`] に残す。
+//! - [`LogCapture::drain`] は期限付き（REPAIR-5）。期限切れ（孫プロセスがパイプを保持し続ける場合等）では
+//!   リーダースレッドは切り離されたまま EOF まで走り続け、sink への追記も続く。
+//! - ストリームの所有権は捕捉側へ移る。監視の引き継ぎ時に再注入はできない（引き継ぎは #239・TASK-164 で扱う）。
+//! - OS 固有型（fd / HANDLE）は公開せず `Read` のみを受ける（CLI-1）。グローバル状態は持たない（CORE-1・D-19）。
+//!
+//! # 未実装（将来仕様。REPAIR-3）
+//! 本モジュールは捕捉経路の土台だけで、次は未実装である。
+//! - ファイルへの永続化、ローテーション（1MiB × 3 世代等）、ローテーション下で欠落・重複 0 行の保証: SUP-7・TASK-164。
+//!   ログファイルの権限・配置・symlink 検証も TASK-164 で扱う。
+//! - ローテーション失敗時のエラー形式: ERR-1（TASK-164）。
+//! - `logs` コマンドからの読み出し経路: TASK-164 以降 / CLI 側。
+//! - 実パイプの取得: core の本番 launcher が子の stdio をパイプへ接続して渡す経路は未提供
+//!   （現状 core は子の標準入出力を null へ向けている）。そのため入力は注入式である。
+//!
+//! 既定の [`MemoryLogSink`] はメモリ保持のみ（上限付き）で、supervisor 終了時に失われる。
+
+use std::collections::VecDeque;
+use std::io::{ErrorKind, Read};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use fandhe_container_core::traits::{ErrorCode, TraitError};
+
+/// 1 行の上限バイト数（超過ぶんは切り捨てる）。
+pub const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// 1 回の読み取りに使う固定バッファのバイト数。
+pub const READ_CHUNK_BYTES: usize = 8 * 1024;
+
+/// [`MemoryLogSink`] の既定の保持上限（総バイト数）。
+pub const DEFAULT_MEMORY_SINK_BYTES: usize = 1024 * 1024;
+
+/// 出力の種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StreamKind {
+    /// 標準出力。
+    Stdout,
+    /// 標準エラー出力。
+    Stderr,
+}
+
+impl StreamKind {
+    /// ログ・スレッド名に使う安定名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+/// 注入される出力ストリーム（実パイプは core が未提供のため呼び出し側が渡す）。
+#[derive(Default)]
+pub struct OutputStreams {
+    stdout: Option<Box<dyn Read + Send>>,
+    stderr: Option<Box<dyn Read + Send>>,
+}
+
+impl OutputStreams {
+    /// stdout / stderr を渡す。
+    pub fn new(stdout: Option<Box<dyn Read + Send>>, stderr: Option<Box<dyn Read + Send>>) -> Self {
+        Self { stdout, stderr }
+    }
+
+    /// どちらも捕捉しない。
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
+/// 捕捉した行の記録先。TASK-164（SUP-7）がファイル・ローテーション実装へ差し替える拡張点。
+pub trait LogSink: Send + Sync {
+    /// 1 行（LF 抜き・[`MAX_LINE_BYTES`] 以下）を追記する。失敗は構造化エラーで返す（panic しない）。
+    fn append(&self, stream: StreamKind, line: &[u8]) -> Result<(), TraitError>;
+}
+
+/// [`MemoryLogSink`] が保持する 1 行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedLine {
+    /// 出力の種別。
+    pub stream: StreamKind,
+    /// LF を除いた行のバイト列。
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct MemoryInner {
+    lines: VecDeque<CapturedLine>,
+    total_bytes: usize,
+    dropped_lines: u64,
+}
+
+/// 上限付きメモリ保持のスタブ sink。永続化・ローテーションは行わずプロセス終了で失われる
+/// （SUP-7・TASK-164 で置き換える。REPAIR-3）。上限超過時は古い行から捨て、件数を数える。
+pub struct MemoryLogSink {
+    capacity: usize,
+    inner: Mutex<MemoryInner>,
+}
+
+impl MemoryLogSink {
+    /// `capacity_bytes` が [`MAX_LINE_BYTES`] 未満なら `InvalidArgument`（1 行が保持できなくなるため）。
+    pub fn new(capacity_bytes: usize) -> Result<Self, TraitError> {
+        if capacity_bytes < MAX_LINE_BYTES {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "memory sink capacity is smaller than the maximum line size",
+            ));
+        }
+        Ok(Self {
+            capacity: capacity_bytes,
+            inner: Mutex::new(MemoryInner::default()),
+        })
+    }
+
+    /// 現在保持している行の複製（古い順）。
+    pub fn snapshot(&self) -> Result<Vec<CapturedLine>, TraitError> {
+        Ok(self.lock()?.lines.iter().cloned().collect())
+    }
+
+    /// 上限超過で捨てた行数。
+    pub fn dropped_lines(&self) -> Result<u64, TraitError> {
+        Ok(self.lock()?.dropped_lines)
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, MemoryInner>, TraitError> {
+        self.inner
+            .lock()
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "memory log sink lock poisoned"))
+    }
+}
+
+impl Default for MemoryLogSink {
+    fn default() -> Self {
+        Self {
+            capacity: DEFAULT_MEMORY_SINK_BYTES,
+            inner: Mutex::new(MemoryInner::default()),
+        }
+    }
+}
+
+impl LogSink for MemoryLogSink {
+    fn append(&self, stream: StreamKind, line: &[u8]) -> Result<(), TraitError> {
+        let mut g = self.lock()?;
+        g.total_bytes = g.total_bytes.saturating_add(line.len());
+        g.lines.push_back(CapturedLine {
+            stream,
+            bytes: line.to_vec(),
+        });
+        while g.total_bytes > self.capacity {
+            let Some(old) = g.lines.pop_front() else {
+                break;
+            };
+            g.total_bytes = g.total_bytes.saturating_sub(old.bytes.len());
+            g.dropped_lines = g.dropped_lines.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
+/// 1 ストリームの捕捉結果。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StreamSummary {
+    lines: u64,
+    bytes: u64,
+    truncated_lines: u64,
+    error_code: Option<ErrorCode>,
+}
+
+impl StreamSummary {
+    /// 取り出した行数。
+    pub fn lines(&self) -> u64 {
+        self.lines
+    }
+    /// ストリームから読んだ総バイト数（LF を含み、切り捨て前）。
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    /// [`MAX_LINE_BYTES`] で切り捨てた行数。
+    pub fn truncated_lines(&self) -> u64 {
+        self.truncated_lines
+    }
+    /// 読み取りまたは sink 追記で最初に起きた失敗のコード。
+    pub fn error_code(&self) -> Option<ErrorCode> {
+        self.error_code
+    }
+}
+
+/// 捕捉全体の結果（注入されなかったストリームは `None`）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CaptureSummary {
+    stdout: Option<StreamSummary>,
+    stderr: Option<StreamSummary>,
+}
+
+impl CaptureSummary {
+    /// stdout の結果。
+    pub fn stdout(&self) -> Option<&StreamSummary> {
+        self.stdout.as_ref()
+    }
+    /// stderr の結果。
+    pub fn stderr(&self) -> Option<&StreamSummary> {
+        self.stderr.as_ref()
+    }
+}
+
+/// 起動済みのリーダースレッド群への取っ手。
+pub struct LogCapture {
+    rx: mpsc::Receiver<(StreamKind, StreamSummary)>,
+    expected: usize,
+}
+
+impl LogCapture {
+    /// ストリームごとにリーダースレッドを起動する。スレッド起動失敗は `Internal`
+    /// （先に起動したスレッドは EOF まで走り続ける）。
+    pub fn start(streams: OutputStreams, sink: Arc<dyn LogSink>) -> Result<Self, TraitError> {
+        let (tx, rx) = mpsc::channel();
+        let mut expected = 0usize;
+        for (kind, stream) in [
+            (StreamKind::Stdout, streams.stdout),
+            (StreamKind::Stderr, streams.stderr),
+        ] {
+            let Some(stream) = stream else { continue };
+            let tx = tx.clone();
+            let sink = Arc::clone(&sink);
+            std::thread::Builder::new()
+                .name(format!("supervisor-log-{}", kind.as_str()))
+                .spawn(move || {
+                    let summary = pump(stream, kind, sink.as_ref());
+                    // 受信側が drain を諦めて破棄済みなら送信失敗は無視してよい。
+                    let _ = tx.send((kind, summary));
+                })
+                .map_err(|_| {
+                    TraitError::new(ErrorCode::Internal, "failed to spawn log reader thread")
+                })?;
+            expected += 1;
+        }
+        Ok(Self { rx, expected })
+    }
+
+    /// 全ストリームが EOF になるまで `timeout` を上限に待つ。期限切れは `Timeout`
+    /// （リーダースレッドは切り離されて走り続ける。module doc 参照）。
+    pub fn drain(self, timeout: Duration) -> Result<CaptureSummary, TraitError> {
+        let deadline = Instant::now() + timeout;
+        let mut out = CaptureSummary::default();
+        for _ in 0..self.expected {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(remaining) {
+                Ok((StreamKind::Stdout, s)) => out.stdout = Some(s),
+                Ok((_, s)) => out.stderr = Some(s),
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(TraitError::new(
+                        ErrorCode::Timeout,
+                        "timed out waiting for log streams to reach EOF",
+                    ));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(TraitError::new(
+                        ErrorCode::Internal,
+                        "log reader thread terminated unexpectedly",
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// 行バッファ（上限付き）と集計を持ち、読んだチャンクを行へ分割して sink へ渡す。
+struct LineSplitter<'a> {
+    kind: StreamKind,
+    sink: &'a dyn LogSink,
+    buf: Vec<u8>,
+    cut: bool,
+    summary: StreamSummary,
+}
+
+impl LineSplitter<'_> {
+    fn feed(&mut self, chunk: &[u8]) {
+        let mut segs = chunk.split(|b| *b == b'\n').peekable();
+        while let Some(seg) = segs.next() {
+            let room = MAX_LINE_BYTES.saturating_sub(self.buf.len());
+            let take = room.min(seg.len());
+            if let Some(head) = seg.get(..take) {
+                self.buf.extend_from_slice(head);
+            }
+            if take < seg.len() {
+                self.cut = true;
+            }
+            if segs.peek().is_some() {
+                self.emit();
+            }
+        }
+    }
+
+    fn emit(&mut self) {
+        if let Err(e) = self.sink.append(self.kind, &self.buf) {
+            // 読み取りは続ける（パイプを詰まらせない）。最初のコードだけ残す。
+            self.summary.error_code.get_or_insert(e.code());
+        }
+        self.summary.lines = self.summary.lines.saturating_add(1);
+        if self.cut {
+            self.summary.truncated_lines = self.summary.truncated_lines.saturating_add(1);
+        }
+        self.buf.clear();
+        self.cut = false;
+    }
+}
+
+/// 1 ストリームを EOF まで読み、行単位で sink へ渡す。
+fn pump(mut stream: Box<dyn Read + Send>, kind: StreamKind, sink: &dyn LogSink) -> StreamSummary {
+    let mut sp = LineSplitter {
+        kind,
+        sink,
+        buf: Vec::new(),
+        cut: false,
+        summary: StreamSummary::default(),
+    };
+    let mut chunk = [0u8; READ_CHUNK_BYTES];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                sp.summary.bytes = sp.summary.bytes.saturating_add(n as u64);
+                if let Some(data) = chunk.get(..n) {
+                    sp.feed(data);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => {
+                sp.summary.error_code.get_or_insert(ErrorCode::Internal);
+                break;
+            }
+        }
+    }
+    if !sp.buf.is_empty() {
+        sp.emit();
+    }
+    sp.summary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    fn boxed(data: &[u8]) -> Option<Box<dyn Read + Send>> {
+        Some(Box::new(Cursor::new(data.to_vec())))
+    }
+
+    fn run(
+        stdout: Option<Box<dyn Read + Send>>,
+        stderr: Option<Box<dyn Read + Send>>,
+    ) -> (Arc<MemoryLogSink>, CaptureSummary) {
+        let sink = Arc::new(MemoryLogSink::default());
+        let cap = LogCapture::start(OutputStreams::new(stdout, stderr), sink.clone()).unwrap();
+        let sum = cap.drain(Duration::from_secs(10)).unwrap();
+        (sink, sum)
+    }
+
+    fn line(stream: StreamKind, s: &[u8]) -> CapturedLine {
+        CapturedLine {
+            stream,
+            bytes: s.to_vec(),
+        }
+    }
+
+    /// SUP-1・TASK-157.7: stdout / stderr の両方を種別付きで捕捉する。
+    #[test]
+    fn sup1_task157_7_captures_stdout_and_stderr() {
+        let (sink, sum) = run(boxed(b"out1\nout2\n"), boxed(b"err1\n"));
+        let mut got = sink.snapshot().unwrap();
+        got.sort_by_key(|l| l.stream.as_str());
+        assert_eq!(
+            got,
+            vec![
+                line(StreamKind::Stderr, b"err1"),
+                line(StreamKind::Stdout, b"out1"),
+                line(StreamKind::Stdout, b"out2"),
+            ]
+        );
+        assert_eq!(sum.stdout().unwrap().lines(), 2);
+        assert_eq!(sum.stdout().unwrap().bytes(), 10);
+        assert_eq!(sum.stderr().unwrap().lines(), 1);
+        assert_eq!(sum.stderr().unwrap().error_code(), None);
+    }
+
+    /// TASK-157.7: LF のない末尾行も 1 行として渡る。
+    #[test]
+    fn sup1_task157_7_partial_line_at_eof() {
+        let (sink, _) = run(boxed(b"a\nb"), None);
+        assert_eq!(
+            sink.snapshot().unwrap(),
+            vec![
+                line(StreamKind::Stdout, b"a"),
+                line(StreamKind::Stdout, b"b")
+            ]
+        );
+    }
+
+    /// TASK-157.7: CR は除去しない。
+    #[test]
+    fn sup1_task157_7_crlf_is_preserved() {
+        let (sink, _) = run(boxed(b"x\r\n"), None);
+        assert_eq!(
+            sink.snapshot().unwrap(),
+            vec![line(StreamKind::Stdout, b"x\r")]
+        );
+    }
+
+    /// TASK-157.7: 非 UTF-8 バイトも不透明に保持する。
+    #[test]
+    fn sup1_task157_7_non_utf8_bytes_are_preserved() {
+        let (sink, _) = run(None, boxed(&[0xff, 0xfe, b'\n']));
+        assert_eq!(
+            sink.snapshot().unwrap(),
+            vec![line(StreamKind::Stderr, &[0xff, 0xfe])]
+        );
+    }
+
+    /// TASK-157.7: 空行は空の行として渡る。
+    #[test]
+    fn sup1_task157_7_empty_lines_are_kept() {
+        let (sink, sum) = run(boxed(b"\n\nz\n"), None);
+        assert_eq!(sink.snapshot().unwrap().len(), 3);
+        assert_eq!(sum.stdout().unwrap().lines(), 3);
+    }
+
+    /// TASK-157.7: 上限超過の行は切り捨てて件数を数える（チャンク境界をまたぐ長さ）。
+    #[test]
+    fn sup1_task157_7_oversized_line_is_truncated() {
+        let mut data = vec![b'a'; MAX_LINE_BYTES + 20_000];
+        data.push(b'\n');
+        data.extend_from_slice(b"ok\n");
+        let (sink, sum) = run(boxed(&data), None);
+        let got = sink.snapshot().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].bytes.len(), MAX_LINE_BYTES);
+        assert_eq!(got[1].bytes, b"ok".to_vec());
+        assert_eq!(sum.stdout().unwrap().truncated_lines(), 1);
+    }
+
+    struct FailSink;
+    impl LogSink for FailSink {
+        fn append(&self, _: StreamKind, _: &[u8]) -> Result<(), TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "fake sink failure"))
+        }
+    }
+
+    /// TASK-157.7: sink が失敗しても EOF まで読み切り、最初のエラーコードを返す。
+    #[test]
+    fn sup1_task157_7_sink_error_is_reported_and_reading_continues() {
+        let cap = LogCapture::start(
+            OutputStreams::new(boxed(b"a\nb\nc\n"), None),
+            Arc::new(FailSink),
+        )
+        .unwrap();
+        let sum = cap.drain(Duration::from_secs(10)).unwrap();
+        let s = sum.stdout().unwrap();
+        assert_eq!(s.error_code(), Some(ErrorCode::Internal));
+        assert_eq!(s.bytes(), 6);
+        assert_eq!(s.lines(), 3);
+    }
+
+    /// REPAIR-5・TASK-157.7: 閉じないストリームでは drain が Timeout になる。
+    #[test]
+    fn sup1_task157_7_drain_times_out_when_stream_stays_open() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let sink = Arc::new(MemoryLogSink::default());
+        let cap =
+            LogCapture::start(OutputStreams::new(Some(Box::new(reader)), None), sink).unwrap();
+        writer.write_all(b"hello\n").unwrap();
+        let err = cap.drain(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        drop(writer);
+    }
+
+    /// TASK-157.7: メモリ sink は上限で古い行から捨てる。
+    #[test]
+    fn sup1_task157_7_memory_sink_is_bounded() {
+        let sink = MemoryLogSink::new(MAX_LINE_BYTES).unwrap();
+        for _ in 0..3 {
+            sink.append(StreamKind::Stdout, &[b'x'; 30_000]).unwrap();
+        }
+        assert_eq!(sink.snapshot().unwrap().len(), 2);
+        assert_eq!(sink.dropped_lines().unwrap(), 1);
+        assert_eq!(
+            MemoryLogSink::new(MAX_LINE_BYTES - 1)
+                .err()
+                .map(|e| e.code()),
+            Some(ErrorCode::InvalidArgument)
+        );
+    }
+
+    /// TASK-157.7: ストリーム未注入なら空の結果。
+    #[test]
+    fn sup1_task157_7_no_streams_yields_empty_summary() {
+        let (sink, sum) = run(None, None);
+        assert_eq!(sum, CaptureSummary::default());
+        assert!(sink.snapshot().unwrap().is_empty());
+    }
+}

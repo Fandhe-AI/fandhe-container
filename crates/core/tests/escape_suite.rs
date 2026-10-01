@@ -681,6 +681,18 @@ mod linux {
             .unwrap_or_else(|e| panic!("with_landlock: {e}"))
     }
 
+    /// ESC-01 の対照ファイル（rootfs 直下。シナリオが fork 前に作成し、rootfs と共に削除される）。
+    const CONTROL_NAME: &str = "esc-01-control";
+    /// pivot 後の名前空間から見た対照ファイルのパス。
+    const CONTROL_PATH: &str = "/esc-01-control";
+
+    /// `prefix` 配下にホスト絶対パス `host` を連結した経路（`/proc/1/root` 等経由）を作る。
+    fn via(prefix: &str, host: &Path) -> PathBuf {
+        let mut p = PathBuf::from(prefix);
+        p.extend(host.components().skip(1));
+        p
+    }
+
     /// 既存ファイルへの書き込みオープンを試みる（作成・切り詰めはしない。成功しても内容は変わらない）。
     fn try_open_for_write(target: &Path) -> AttackOutcome {
         match std::fs::OpenOptions::new().write(true).open(target) {
@@ -693,6 +705,8 @@ mod linux {
 
     /// ESC-01: pivot_root 後にホスト FS へ書き込めないこと（SEC-2・TASK-42.2）。
     ///
+    /// 0. 対照: rootfs 内の既存ファイルへの書き込みが EACCES（Landlock）で拒否されること。経路自体が機能して
+    ///    いることを先に確かめ、以降のホスト経路の ENOENT を「到達不能」（正常な隔離）と読めるようにする。
     /// 1. ホスト側に用意した canary（`host_canary`。rootfs の外）へ、ホスト絶対パス・`/proc/1/root`・
     ///    `/proc/self/root` 経由で書き込みオープンを試みる。いずれかが成功したら `Succeeded`（エスケープ）。
     ///    ENOENT / EACCES / EPERM 以外の errno はその errno を結果にして期待と不一致にする。
@@ -703,15 +717,24 @@ mod linux {
     /// 制限が欠けて 2 が成功してもマーカーは一時 rootfs 内に作られ `Rootfs::drop` で削除される。
     /// 監査記録は作らない（攻撃側生成の記録は SEC-4 の証拠にならない。期待は `Deferred`）。
     fn attack_esc01_host_fs_write(rec: &Recorder, host_canary: &Path) {
-        let via = |prefix: &str| {
-            let mut p = PathBuf::from(prefix);
-            p.extend(host_canary.components().skip(1));
-            p
-        };
+        // 対照経路: pivot 後の rootfs 内の既存ファイル（シナリオが fork 前に作成）への書き込みオープン。
+        // パス解決・オープンの経路自体は機能しており Landlock（readonly root）が EACCES で拒否する、
+        // という前提を先に確認する。ENOENT（経路の不備）や成功（Landlock 欠落）なら以降の
+        // ホスト経路の ENOENT を「到達不能」と読めないため、その結果を記録して失敗にする。
+        match try_open_for_write(Path::new(CONTROL_PATH)) {
+            AttackOutcome::Errno(13) => {}
+            other => {
+                rec.outcome(other);
+                return;
+            }
+        }
+        // ホスト経路: ENOENT = ホスト FS は pivot 後の名前空間から到達不能（正常な隔離）。
+        // EACCES / EPERM = 到達はしたが書き込みは拒否された（ここでも成功ではない）。
+        // 成功・その他の errno は期待（EACCES）と不一致にする。
         let routes = [
             host_canary.to_path_buf(),
-            via("/proc/1/root"),
-            via("/proc/self/root"),
+            via("/proc/1/root", host_canary),
+            via("/proc/self/root", host_canary),
         ];
         for route in &routes {
             match try_open_for_write(route) {
@@ -964,6 +987,9 @@ mod linux {
     fn run_case(case: &EscapeCase) -> CaseVerdict {
         let exe = std::env::current_exe().expect("current_exe");
         let rootfs = make_rootfs();
+        // シナリオの異常終了・panic でも canary ディレクトリが残らないよう、ディスパッチャ側でも
+        // 全終了経路（drop）で削除する（未作成なら no-op）。
+        let _canary_cleanup = Rootfs(canary_dir_for(&rootfs.0));
         let mut child = Command::new(&exe)
             .args(["--scenario", case.id])
             .arg(&rootfs.0)
@@ -1083,6 +1109,9 @@ mod linux {
         std::fs::write(&canary, CANARY_CONTENT).expect("write canary");
         std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o666))
             .expect("chmod canary");
+
+        // ESC-01 の対照ファイル（rootfs 内。rootfs と共にディスパッチャが削除する）。
+        std::fs::write(rootfs.join(CONTROL_NAME), b"control\n").expect("write control file");
 
         let (reader, writer) = std::io::pipe().expect("create record pipe");
         let attack = case.attack;

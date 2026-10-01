@@ -51,12 +51,14 @@
 //! - ESC-04（cgroup の `release_agent` 書き込み）・ESC-05（`/proc/sys`・`/proc/sysrq-trigger` 書き込み）は、
 //!   書き込み用に「開くだけ」で判定し 1 バイトも書かない（制限が欠けてもホストへ作用させないため）。
 //!   ESC-04 は対象（`sys/fs/cgroup/release_agent`）を rootfs に実在させ `Absent` を受理しない。ESC-04・05 とも
-//!   `linux.maskedPaths` / `readonlyPaths` が未適用のため、実機実行では本物の欠陥として失敗し得る（期待は変えない）
+//!   `linux.maskedPaths` / `readonlyPaths` が未適用のため、実機実行では本物の欠陥として失敗し得る（期待は変えない）。
 //!   適用範囲の限定: ESC-04 は rootfs 内の「通常の空ファイル」への書き込み拒否（`maskedPaths` / `readonlyPaths`
 //!   相当のパスマスク）だけを検証し、実際の cgroup v1 `release_agent`（v1 階層の mount 経路）は検証しない
-//!   （v1 の mount 拒否は `tests/seccomp.rs`、ホスト側根拠は `tests/cgroups_release_agent.rs`）。ESC-05 も
-//!   `EPERM` / `EACCES` / `EROFS` を区別せず「書き込み用に開けない」ことだけを見る。拒否理由別の厳密判定
-//!   と実 cgroup v1 の安全な観測は REPAIR-12 の後続課題
+//!   （v1 の mount 拒否は `tests/seccomp.rs`、ホスト側根拠は `tests/cgroups_release_agent.rs`）。
+//!   ESC-04・05 とも `EROFS` はそれ自体を読み取り専用の証拠として受理し、ホスト側の権限拒否でも返る
+//!   `EPERM` / `EACCES` は、対象パスに実際に適用されるマウント（mountinfo の親子関係から特定する実効マウント）が
+//!   読み取り専用であるという証拠（`has_mask_evidence`）がある場合だけ受理する。拒否理由別のより厳密な判定と
+//!   実 cgroup v1 の安全な観測は REPAIR-12 の後続課題
 //! - ESC-06（禁止 syscall の SIGSYS 強制終了＋監査記録）は spec の期待で書く。現行の CORE-5 フィルタは
 //!   `ERRNO(EPERM)` を返し、SIGSYS 化と監査記録の配送は未実装のため、実機実行では失敗する（fail-closed。
 //!   期待の弱体化や監査レコードの偽造はしない）。監査記録の回収経路は、子が持つ `Recorder` の pipe を本番の
@@ -806,44 +808,166 @@ fn sec2_task42_4_expectation_selftest() {
     );
 }
 
-/// `/proc/self/mountinfo` の内容から、`path` に `maskedPaths` / `readonlyPaths` が適用された証拠があるかを返す
-/// （REPAIR-12・SEC-2・TASK-42.3・MS-2）。証拠は「`path` 自身への読み取り専用（`ro`）マウント（マスク）」または「`path` の祖先
-/// （`/` と `/proc` と `/sys` は除く）への読み取り専用（`ro`）マウント」。どちらも `ro` を必須とし、rw マウントは
-/// 対象自身へのものでも証拠にしない。ホスト側の権限拒否（EPERM / EACCES）
-/// だけで防御ありと誤判定しないために、攻撃結果とは独立にこの証拠を確認する。
-fn has_mask_evidence(mountinfo: &str, path: &str) -> bool {
-    mountinfo.lines().any(|line| {
-        let mut f = line.split(' ');
-        let (Some(mount_point), Some(opts)) = (f.nth(4), f.next()) else {
-            return false;
-        };
-        // 書き込みを実際に遮断する設定（`ro`）でなければ証拠にしない。無関係な rw マウントが対象パスにあっても、
-        // ホスト側の権限拒否（EPERM / EACCES）を防御の効果と誤認しないため（REPAIR-12）。
-        if !opts.split(',').any(|o| o == "ro") {
-            return false;
-        }
-        if mount_point == path {
-            return true;
-        }
-        let ancestor = path
-            .strip_prefix(mount_point)
-            .is_some_and(|rest| rest.starts_with('/'));
-        ancestor && !["/", "/proc", "/sys"].contains(&mount_point)
+/// `/proc/self/mountinfo` の 1 行のうち、実効マウントの特定に要る項目（REPAIR-12・SEC-2・TASK-42.3・MS-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MountEntry<'a> {
+    /// マウント ID（第 1 欄）。
+    id: &'a str,
+    /// 親マウントの ID（第 2 欄）。
+    parent: &'a str,
+    /// マウントポイント（第 5 欄。空白等は 8 進エスケープのまま比較する）。
+    mount_point: &'a str,
+    /// マウント単位のオプション（第 6 欄）に `ro` があるか。
+    read_only: bool,
+}
+
+/// mountinfo の 1 行を解析する。欄が足りない行は `None`。
+fn parse_mount_entry(line: &str) -> Option<MountEntry<'_>> {
+    let mut f = line.split(' ');
+    let id = f.next()?;
+    let parent = f.next()?;
+    let mount_point = f.nth(2)?;
+    let opts = f.next()?;
+    Some(MountEntry {
+        id,
+        parent,
+        mount_point,
+        read_only: opts.split(',').any(|o| o == "ro"),
     })
 }
 
-/// `has_mask_evidence` の期待値を具体値で照合する（REPAIR-12・TASK-42.3）。
+/// `mount_point` が `path` 自身またはその祖先か（パス要素単位で比較する）。
+fn mount_covers(mount_point: &str, path: &str) -> bool {
+    mount_point == "/"
+        || mount_point == path
+        || path
+            .strip_prefix(mount_point)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// `path` に実際に適用されるマウント（パス解決で最後に到達するマウント）を mountinfo から特定する
+/// （REPAIR-12・SEC-2・TASK-42.3・MS-2）。
+///
+/// 親子関係（第 1・2 欄）を `/` から辿る。開始点は `/` のマウントのうち、別の `/` マウントの親になって
+/// いない最上段のもの。各段では、現在のマウントの子のうち `path` を覆うものの中で最も浅いマウントポイントの
+/// ものへ降りる（同じ親の下でより深い子は、浅い子が後から重なって隠れているため）。同じ深さは後の行
+/// （上に積まれた側）を採る。行の欠落・最上段が 1 件に定まらない・親子の循環など、特定できない場合は
+/// `None`（呼び出し側は証拠なしとして扱う。fail-closed）。
+fn effective_mount<'a>(mountinfo: &'a str, path: &str) -> Option<MountEntry<'a>> {
+    let mut entries = Vec::new();
+    for line in mountinfo.lines().filter(|l| !l.is_empty()) {
+        entries.push(parse_mount_entry(line)?);
+    }
+    let mut tops = entries.iter().filter(|e| {
+        e.mount_point == "/"
+            && !entries
+                .iter()
+                .any(|c| c.mount_point == "/" && c.parent == e.id && c.id != e.id)
+    });
+    let mut current = *tops.next()?;
+    if tops.next().is_some() {
+        return None;
+    }
+    // 1 段ごとに別のマウントへ降りるため、正常な入力なら件数以内で終わる（循環は打ち切って `None`）。
+    for _ in 0..entries.len() {
+        let next = entries
+            .iter()
+            .filter(|c| {
+                c.parent == current.id && c.id != current.id && mount_covers(c.mount_point, path)
+            })
+            .fold(None, |best: Option<&MountEntry<'a>>, c| match best {
+                Some(b) if b.mount_point.len() < c.mount_point.len() => Some(b),
+                _ => Some(c),
+            });
+        match next {
+            Some(n) => current = *n,
+            None => return Some(current),
+        }
+    }
+    None
+}
+
+/// `/proc/self/mountinfo` の内容から、`path` に `maskedPaths` / `readonlyPaths` が適用された証拠があるかを返す
+/// （REPAIR-12・SEC-2・TASK-42.3・MS-2）。
+///
+/// 証拠は「`path` に実際に適用されるマウント（[`effective_mount`]）が読み取り専用（`ro`）で、そのマウント
+/// ポイントが `path` 自身か `/`・`/proc`・`/sys` 以外の祖先であること」。rw マウントは対象自身へのものでも
+/// 証拠にせず、読み取り専用の祖先マウントがあっても、より深い書き込み可能なマウントが重なっていれば証拠に
+/// しない。ホスト側の権限拒否（EPERM / EACCES）だけで防御ありと誤判定しないために、攻撃結果とは独立に
+/// この証拠を確認する。
+fn has_mask_evidence(mountinfo: &str, path: &str) -> bool {
+    effective_mount(mountinfo, path)
+        .is_some_and(|m| m.read_only && !["/", "/proc", "/sys"].contains(&m.mount_point))
+}
+
+/// `has_mask_evidence` の期待値を具体値で照合する（REPAIR-12・SEC-2・TASK-42.3・MS-2）。
 fn sec2_task42_3_mask_evidence_selftest() {
-    let ro = "40 30 0:30 /sys /proc/sys ro,nosuid - proc proc rw";
-    let rw = "40 30 0:30 / /proc rw,nosuid - proc proc rw";
-    let mask = "41 30 0:6 /null /proc/sysrq-trigger ro - devtmpfs dev rw";
-    let mask_rw = "41 30 0:6 /null /proc/sysrq-trigger rw - devtmpfs dev rw";
-    assert!(has_mask_evidence(ro, "/proc/sys/kernel/core_pattern"));
-    assert!(has_mask_evidence(mask, "/proc/sysrq-trigger"));
-    assert!(!has_mask_evidence(mask_rw, "/proc/sysrq-trigger"));
-    assert!(!has_mask_evidence(rw, "/proc/sys/kernel/core_pattern"));
-    assert!(!has_mask_evidence(ro, "/proc/sysrq-trigger"));
-    assert!(!has_mask_evidence("", "/proc/sysrq-trigger"));
+    // 共通の土台: rootfs（ID 30）の上に proc（ID 40）。
+    let base = "30 20 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n\
+                40 30 0:30 / /proc rw,nosuid - proc proc rw\n";
+    let with = |extra: &str| format!("{base}{extra}");
+    let core = "/proc/sys/kernel/core_pattern";
+    let sysrq = "/proc/sysrq-trigger";
+
+    // 実効マウントの特定。
+    assert_eq!(
+        effective_mount(base, core).map(|m| (m.id, m.mount_point)),
+        Some(("40", "/proc"))
+    );
+    let ro_sys = with("41 40 0:30 /sys /proc/sys ro,nosuid - proc proc rw\n");
+    assert_eq!(
+        effective_mount(&ro_sys, core).map(|m| (m.id, m.read_only)),
+        Some(("41", true))
+    );
+
+    // readonlyPaths 相当（`/proc/sys` の ro）は配下の証拠になる。対象外のパスには及ばない。
+    assert!(has_mask_evidence(&ro_sys, core));
+    assert!(!has_mask_evidence(&ro_sys, sysrq));
+    // maskedPaths 相当（対象自身への ro マウント）は証拠。rw なら証拠にしない。
+    let mask = with("42 40 0:6 /null /proc/sysrq-trigger ro - devtmpfs dev rw\n");
+    let mask_rw = with("42 40 0:6 /null /proc/sysrq-trigger rw - devtmpfs dev rw\n");
+    assert!(has_mask_evidence(&mask, sysrq));
+    assert!(!has_mask_evidence(&mask_rw, sysrq));
+    // rw の `/proc` だけ・空入力は証拠なし。
+    assert!(!has_mask_evidence(base, core));
+    assert!(!has_mask_evidence("", sysrq));
+
+    // ro の祖先にさらに深い rw マウントが重なると、実効マウントは rw なので証拠にしない。
+    let ro_then_rw_deeper = with(
+        "41 40 0:30 /sys /proc/sys ro - proc proc rw\n43 41 0:31 / /proc/sys/kernel rw - tmpfs t rw\n",
+    );
+    assert_eq!(
+        effective_mount(&ro_then_rw_deeper, core).map(|m| m.id),
+        Some("43")
+    );
+    assert!(!has_mask_evidence(&ro_then_rw_deeper, core));
+    // より深い側も ro なら証拠になる。
+    let ro_then_ro_deeper = with(
+        "41 40 0:30 /sys /proc/sys ro - proc proc rw\n43 41 0:31 / /proc/sys/kernel ro - tmpfs t rw\n",
+    );
+    assert!(has_mask_evidence(&ro_then_ro_deeper, core));
+    // 同じマウントポイントへ積み重ねた場合は上（後の行・前の行を親に持つ側）が実効。
+    let ro_under_rw = with(
+        "41 40 0:30 /sys /proc/sys ro - proc proc rw\n44 41 0:30 /sys /proc/sys rw - proc proc rw\n",
+    );
+    let rw_under_ro = with(
+        "41 40 0:30 /sys /proc/sys rw - proc proc rw\n44 41 0:30 /sys /proc/sys ro - proc proc rw\n",
+    );
+    assert!(!has_mask_evidence(&ro_under_rw, core));
+    assert!(has_mask_evidence(&rw_under_ro, core));
+    // rootfs 上の `/proc/sys`（ro）が後から重なった `/proc` に隠れた場合は、隠れた ro を証拠にしない。
+    let hidden = "30 20 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                  41 30 0:30 /sys /proc/sys ro - proc proc rw\n\
+                  40 30 0:30 / /proc rw - proc proc rw\n";
+    assert_eq!(effective_mount(hidden, core).map(|m| m.id), Some("40"));
+    assert!(!has_mask_evidence(hidden, core));
+    // `/` 自体の ro（readonly root）は対象を絞ったマスクではないため証拠にしない。
+    let ro_root = "30 20 8:1 / / ro - ext4 /dev/sda1 rw\n";
+    assert!(!has_mask_evidence(ro_root, "/sys/fs/cgroup/release_agent"));
+    // 特定できない入力（欄の欠落・最上段の `/` が 2 件）は証拠なし（fail-closed）。
+    assert_eq!(effective_mount("30 20 8:1", core), None);
+    let two_roots = "30 20 8:1 / / ro - ext4 a ro\n31 21 8:2 / / ro - ext4 b ro\n";
+    assert_eq!(effective_mount(two_roots, core), None);
 }
 
 fn always() {
@@ -1330,13 +1454,27 @@ mod linux {
             outcome,
             AttackOutcome::Errno(super::EPERM) | AttackOutcome::Errno(super::EACCES)
         ) {
-            let applied = std::fs::read_to_string("/proc/self/mountinfo")
-                .is_ok_and(|m| super::has_mask_evidence(&m, path));
+            let applied =
+                read_mountinfo_bounded().is_some_and(|m| super::has_mask_evidence(&m, path));
             if !applied {
                 return AttackOutcome::Failed;
             }
         }
         outcome
+    }
+
+    /// `/proc/self/mountinfo` の読み出し上限（コンテナ内のマウント表には十分な大きさ）。
+    const MOUNTINFO_MAX_BYTES: u64 = 1024 * 1024;
+
+    /// `/proc/self/mountinfo` を上限付きで読む。読めない・上限を超える場合は `None`
+    /// （呼び出し側は証拠なしとして扱う。fail-closed）。
+    fn read_mountinfo_bounded() -> Option<String> {
+        let file = std::fs::File::open("/proc/self/mountinfo").ok()?;
+        let mut text = String::new();
+        file.take(MOUNTINFO_MAX_BYTES + 1)
+            .read_to_string(&mut text)
+            .ok()?;
+        (text.len() as u64 <= MOUNTINFO_MAX_BYTES).then_some(text)
     }
 
     /// 書き込み用に開くだけの生の結果（`open_write_only` の下請け）。

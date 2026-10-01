@@ -126,6 +126,7 @@ cat >>"$stub" <<'STUB'
 #              （--timeout 1 では観測の完了が期限を過ぎる）
 #   running-race: start 後は running。実行中の delete を拒否し、kill 後も 2 回は拒否する
 #   never-stops: start 後は running のままで kill も効かない
+#   cleanup-hang: start 後は running のままで、delete・kill がいずれも応答しない（ハング）
 #   id-in-use: create 前から同じ ID のコンテナが存在する
 mode="${STUB_MODE:-ok}"
 cmd="$1"
@@ -226,7 +227,7 @@ case "$cmd" in
         sleep 0.6
         if [ -e "$m.polled" ]; then state_json running; else touch "$m.polled"; state_json created; fi
         ;;
-      running-race | never-stops)
+      running-race | never-stops | cleanup-hang)
         if [ -e "$m.killed" ] && [ "$mode" = running-race ]; then state_json stopped; else state_json running; fi
         ;;
       *) state_json stopped ;;
@@ -234,11 +235,13 @@ case "$cmd" in
     ;;
   kill)
     [ -e "$m.created" ] || not_exist
+    [ "$mode" = cleanup-hang ] && exec sleep 30
     touch "$m.killed"
     ;;
   delete)
     [ -e "$m.created" ] || not_exist
     case "$mode" in
+      cleanup-hang) exec sleep 30 ;;
       delete-fail | create-fail-delete-fail) echo "stub: delete failed" >&2; exit 1 ;;
       never-stops) [ -e "$m.started" ] && { echo "stub: cannot delete running container" >&2; exit 1; } ;;
       running-race)
@@ -499,6 +502,16 @@ STUB_MODE=never-stops expect_rc "never-stops" 4 --runtime "$stub" --bundle "$wor
 elapsed=$((SECONDS - started))
 if [ "$elapsed" -lt 15 ]; then pass "never-stops-bounded (${elapsed}s < 15s)"; else fail "never-stops-bounded (${elapsed}s)"; fi
 expect_contains "never-stops-leftover-id" "containers left behind: fandhe-startup-"
+
+# 後始末の delete・kill がいずれもハングしても、後始末全体を 1 つの期限（--timeout 2 秒）内に
+# 収めて exit 4（Codex P1。REPAIR-5）。期限が呼び出しごとに延びる実装（delete・kill が各
+# --timeout 秒＋KILL 猶予を使い、その後さらに再試行）では 6 秒を超える。
+reset_log
+cleanup_t0="${EPOCHREALTIME/./}"
+STUB_MODE=cleanup-hang expect_rc "cleanup-hang" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 2
+cleanup_ms=$(((${EPOCHREALTIME/./} - cleanup_t0) / 1000))
+if [ "$cleanup_ms" -lt 4000 ]; then pass "cleanup-hang-bounded (${cleanup_ms}ms < 4000ms)"; else fail "cleanup-hang-bounded (${cleanup_ms}ms)"; fi
+expect_contains "cleanup-hang-leftover-id" "containers left behind: fandhe-startup-"
 
 # --- 8c. プロセス実行開始の観測（CORE-10）: state が running / stopped を返すまで照会する ---
 reset_log

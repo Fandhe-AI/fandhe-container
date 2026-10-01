@@ -137,10 +137,10 @@ impl Default for InFlightLimit {
 ///
 /// [`Self::allocate`] は `counter`（[`SendQueue::new`] からは
 /// プロセス全体で共有する `static` を渡す）を `checked_add` 相当
-/// （[`AtomicU64::fetch_update`]）で進め、`u64` の範囲を超える採番を
+/// （[`AtomicU64::try_update`]）で進め、`u64` の範囲を超える採番を
 /// [`IoErrorCode::ResourceExhausted`] として検出する。`u64::MAX` 個の
 /// [`SendQueue`] を単一プロセス内で生成することは実用上起こり得ないが、
-/// 万一そこへ到達しても値を巻き戻して重複させることはない（`fetch_update` は
+/// 万一そこへ到達しても値を巻き戻して重複させることはない（`try_update` は
 /// 失敗時にカウンタを変更しないため、以降のすべての採番も同じエラーで拒否され
 /// 続ける。整数オーバーフローによる id の再利用・衝突を防ぐ。security.md
 /// 「不安全な設計」観点）。
@@ -155,10 +155,10 @@ pub struct QueueId(u64);
 impl QueueId {
     /// `counter` から次の値を採番する。`u64` の範囲を超える場合は
     /// [`IoErrorCode::ResourceExhausted`] を返し、`counter` の状態は変更しない
-    /// （`fetch_update` が失敗時にカウンタを変更しない契約を利用する）。
+    /// （`try_update` が失敗時にカウンタを変更しない契約を利用する）。
     fn allocate(counter: &AtomicU64) -> Result<Self, IoError> {
         counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map(Self)
@@ -2155,7 +2155,7 @@ mod tests {
 
     /// TASK-12.1（#73 codex 再指摘対応。P1）: [`QueueId::allocate`] はカウンタが
     /// `u64::MAX` に達していると `ResourceExhausted` を返し、カウンタの値は
-    /// `u64::MAX` のまま変わらない（`fetch_update` が失敗時に状態を変更しない
+    /// `u64::MAX` のまま変わらない（`try_update` が失敗時に状態を変更しない
     /// 契約により、以降の呼び出しもすべて同じエラーで拒否され続けることを
     /// 確認する）。
     #[test]

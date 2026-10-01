@@ -136,7 +136,11 @@ enum Mismatch {
     MissingAudit {
         layer: &'static str,
     },
-    /// シナリオ側の失敗（ディスパッチャが子プロセスの失敗を報告する）。
+    /// シナリオ側の失敗（ディスパッチャが子プロセスの失敗を報告する）。実プロセス部（Linux）でのみ構築される。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     ScenarioFailed {
         detail: String,
     },
@@ -748,7 +752,17 @@ mod linux {
         };
         result.unwrap_or_else(|err| panic!("isolate failed: {err}"));
 
-        let (mut reader, writer) = std::io::pipe().expect("create record pipe");
+        let (reader, writer) = std::io::pipe().expect("create record pipe");
+        // パイプ容量を超える記録でも子が write で詰まらないよう、子の待機と並行して別スレッドで読む（REPAIR-5）。
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let res = reader
+                .take(RECORD_MAX_BYTES as u64 + 1)
+                .read_to_string(&mut text)
+                .map(|_| text);
+            let _ = tx.send(res);
+        });
         let attack = case.attack;
         // 親側の writer 端は fork 時に閉じられる（クロージャは子にだけ残る）ため、子の終了で EOF になる。
         let child = spawn_container_probe(rootfs, (case.stages)(), move || {
@@ -766,12 +780,11 @@ mod linux {
             other => panic!("unexpected child exit {other:?}"),
         };
 
-        // 子の終了後にだけ読む（上限 + 1 バイトで打ち切り、超過は記録として不正）。
-        let mut text = String::new();
-        reader
-            .by_ref()
-            .take(RECORD_MAX_BYTES as u64 + 1)
-            .read_to_string(&mut text)
+        // 上限 + 1 バイトで打ち切り（超過は記録として不正）。子孫が writer を保持し続けても EOF 待ちで
+        // 無期限にブロックしないよう、回収には期限を設けて超過なら失敗にする。
+        let text = rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("record read did not finish in time: {e}"))
             .expect("read record");
         let observation = match parse_record(&text) {
             Ok(rec) => Observation {

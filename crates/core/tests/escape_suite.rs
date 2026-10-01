@@ -34,6 +34,8 @@
 //! 事前条件の不成立を含めあらゆる失敗を失敗として扱い、検証せずに成功する分岐は持たない。AGENTS.md への
 //! 記載と CI での分離方式の確定は #204（TASK-42.6）で行う。
 //!
+//! ESC-07 は Landlock ABI 6+（Linux 6.12+）を要する。
+//!
 //! ケースの攻撃操作は、制限が欠けていてもホストへ副作用が出ない引数・対象に限る（`seccomp.rs` と同方針）。
 //! 攻撃クロージャ・ハーネスは `unsafe` を書かない。raw syscall が要る攻撃は core 側の `#[doc(hidden)]`
 //! プローブ（syscall 本体は `sys` モジュール）を経由する。
@@ -418,9 +420,129 @@ fn sec2_task42_1_record_parser_selftest() {
     );
 }
 
+/// Linux asm-generic の errno 値（x86_64・aarch64 共通。syscall 番号ではないため arch 分岐は不要）。
+const EPERM: i32 = 1;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const ENOENT: i32 = 2;
+const EACCES: i32 = 13;
+const ETXTBSY: i32 = 26;
+
+/// ESC-07（SEC-2・TASK-42.4・#202）: ランタイムバイナリへの書き込み open の期待値。
+/// 書き込みの拒否は Landlock（EACCES）のほか、実行中バイナリへの書き込み拒否（ETXTBSY）や DAC（EACCES・EPERM）
+/// でも起こり得るため、いずれも許可する。成功（`Succeeded`）だけが失敗。spec は監査を要求しない。
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    allow(dead_code)
+)]
+const ESC07_WRITE_EXPECT: Expectation = Expectation {
+    allowed: &[
+        AttackOutcome::Errno(EACCES),
+        AttackOutcome::Errno(ETXTBSY),
+        AttackOutcome::Errno(EPERM),
+        AttackOutcome::Absent,
+    ],
+    signal: None,
+    audit: AuditExpectation::None,
+};
+
+/// ESC-07 の Landlock 帰属確認（読み取り open。ETXTBSY に覆われない）。EACCES と landlock 層の記録が必須。
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    allow(dead_code)
+)]
+const ESC07_LANDLOCK_EXPECT: Expectation = Expectation {
+    allowed: &[AttackOutcome::Errno(EACCES)],
+    signal: None,
+    audit: AuditExpectation::Required("landlock"),
+};
+
+/// ESC-08: マウント先ホワイトリスト外の要求は拒否（`Failed`）され、mount 層の監査記録が必須。
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    allow(dead_code)
+)]
+const ESC08_EXPECT: Expectation = Expectation {
+    allowed: &[AttackOutcome::Failed],
+    signal: None,
+    audit: AuditExpectation::Required("mount"),
+};
+
+/// ESC-07・ESC-08 の期待値の機械照合（REPAIR-12・SEC-2・TASK-42.4）。非 Linux でも定数を使う。
+fn sec2_task42_4_expectation_selftest() {
+    let obs = |outcome: AttackOutcome, layers: &[&str]| Observation {
+        exit: ObservedExit::Exited(0),
+        outcome: Some(outcome),
+        audit_layers: layers.iter().map(|l| (*l).to_string()).collect(),
+    };
+    assert_eq!(
+        judge(&ESC07_WRITE_EXPECT, &obs(AttackOutcome::Succeeded, &[])),
+        CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
+            got: AttackOutcome::Succeeded
+        }])
+    );
+    for o in [
+        AttackOutcome::Errno(EACCES),
+        AttackOutcome::Errno(ETXTBSY),
+        AttackOutcome::Errno(EPERM),
+        AttackOutcome::Absent,
+    ] {
+        assert_eq!(judge(&ESC07_WRITE_EXPECT, &obs(o, &[])), CaseVerdict::Pass);
+    }
+    assert_eq!(
+        judge(
+            &ESC07_LANDLOCK_EXPECT,
+            &obs(AttackOutcome::Errno(EACCES), &["landlock"])
+        ),
+        CaseVerdict::Pass
+    );
+    assert_eq!(
+        judge(
+            &ESC07_LANDLOCK_EXPECT,
+            &obs(AttackOutcome::Errno(EACCES), &[])
+        ),
+        CaseVerdict::Fail(vec![Mismatch::MissingAudit { layer: "landlock" }])
+    );
+    assert_eq!(
+        judge(
+            &ESC07_LANDLOCK_EXPECT,
+            &obs(AttackOutcome::Errno(ETXTBSY), &["landlock"])
+        ),
+        CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
+            got: AttackOutcome::Errno(ETXTBSY)
+        }])
+    );
+    assert_eq!(
+        judge(&ESC08_EXPECT, &obs(AttackOutcome::Failed, &["mount"])),
+        CaseVerdict::Pass
+    );
+    assert_eq!(
+        judge(&ESC08_EXPECT, &obs(AttackOutcome::Failed, &[])),
+        CaseVerdict::Fail(vec![Mismatch::MissingAudit { layer: "mount" }])
+    );
+    assert_eq!(
+        judge(&ESC08_EXPECT, &obs(AttackOutcome::Succeeded, &["mount"])),
+        CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
+            got: AttackOutcome::Succeeded
+        }])
+    );
+}
+
 fn always() {
     sec2_task42_1_judge_selftest();
     sec2_task42_1_record_parser_selftest();
+    sec2_task42_4_expectation_selftest();
     println!("escape_suite: SEC-2 judge and record parser verified");
 }
 
@@ -473,16 +595,21 @@ mod linux {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::audit_log::{AuditRecord, AuditSink, encode_json_line};
+    use fandhe_container_core::audit_log::{
+        AuditDelivery, AuditRecord, AuditSink, encode_json_line, landlock_denial_record_now,
+    };
     use fandhe_container_core::exec::{
         ChildExit, IsolationConfig, Namespace, NamespaceSet, StagePipeline, isolate,
         isolate_rootful_host_root, plan, plan_rootful_host_root, spawn_container_probe,
     };
+    use fandhe_container_core::landlock::{detect_landlock_abi, path_rules_from_config};
+    use fandhe_container_core::oci_runtime::{audit_mount_config_error, parse_config_bytes};
     use fandhe_container_core::traits::{ErrorCode, TraitError};
 
     use super::{
-        AttackOutcome, AuditExpectation, CaseVerdict, Expectation, Mismatch, Observation,
-        ObservedExit, RECORD_MAX_BYTES, judge, parse_record,
+        AttackOutcome, AuditExpectation, CaseVerdict, ENOENT, ESC07_LANDLOCK_EXPECT,
+        ESC07_WRITE_EXPECT, ESC08_EXPECT, Expectation, Mismatch, Observation, ObservedExit,
+        RECORD_MAX_BYTES, judge, parse_record,
     };
 
     /// 子（コンテナ内）で攻撃を実行するクロージャの型。結果は `Recorder` へ書く。
@@ -496,19 +623,164 @@ mod linux {
         /// 子の制限ステージ列（Landlock を伴うケースは `with_landlock` を載せて返す）。
         stages: fn() -> StagePipeline,
         attack: Attack,
+        /// Landlock 適用前（親側）に走らせる対照。制限が拒否の原因であることを示すために使う（既定は何もしない）。
+        precondition: fn(),
     }
 
-    /// 登録済みケース。本 PR は、ハーネスが end-to-end で動くことを示す対照ケースのみ。
-    const CASES: &[EscapeCase] = &[EscapeCase {
-        id: "control-read-proc",
-        expectation: Expectation {
-            allowed: &[AttackOutcome::Succeeded],
-            signal: None,
-            audit: AuditExpectation::None,
+    /// 登録済みケース。ハーネスが end-to-end で動くことを示す対照ケースと、ESC 各ケース（#200〜#203）。
+    const CASES: &[EscapeCase] = &[
+        EscapeCase {
+            id: "control-read-proc",
+            expectation: Expectation {
+                allowed: &[AttackOutcome::Succeeded],
+                signal: None,
+                audit: AuditExpectation::None,
+            },
+            stages: StagePipeline::new,
+            attack: attack_control_read_proc,
+            precondition: no_precondition,
         },
-        stages: StagePipeline::new,
-        attack: attack_control_read_proc,
-    }];
+        // ESC-07〜08（TASK-42.4・#202）
+        EscapeCase {
+            id: "esc-07-runtime-binary-write",
+            expectation: ESC07_WRITE_EXPECT,
+            stages: landlock_rootfs_only_stages,
+            attack: attack_esc07_runtime_binary_write,
+            precondition: no_precondition,
+        },
+        EscapeCase {
+            id: "esc-07-runtime-binary-landlock",
+            expectation: ESC07_LANDLOCK_EXPECT,
+            stages: landlock_rootfs_only_stages,
+            attack: attack_esc07_runtime_binary_landlock,
+            precondition: precondition_esc07_exe_readable,
+        },
+        EscapeCase {
+            id: "esc-08-mount-outside-whitelist",
+            expectation: ESC08_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc08_mount_outside_whitelist,
+            precondition: no_precondition,
+        },
+    ];
+
+    // ---- ESC-07〜08（SEC-2・TASK-42.4・#202） ----
+
+    /// 対照なし（既定）。
+    fn no_precondition() {}
+
+    /// ESC-07 の対照: Landlock 適用前（ディスパッチ後・fork 前の親側）に `/proc/self/exe` を読み取りで開けることを
+    /// 確認する。開けない場合は DAC 等が拒否原因になり得るため、子の EACCES を Landlock の効果と言えない。失敗は panic。
+    /// 子は fork で同一 UID・同一実行ファイルを引き継ぐため、同じ対象への対照になる。
+    fn precondition_esc07_exe_readable() {
+        std::fs::File::open("/proc/self/exe").unwrap_or_else(|e| {
+            panic!("control: /proc/self/exe must be readable before Landlock: {e}")
+        });
+    }
+
+    /// rootfs のみを許可する Landlock ステージ列（`EscapeCase::stages`。シナリオの親で fork 前に評価される）。
+    /// ホスト側ファイル（`/proc/self/exe` の実体等）は許可ツリーの外になる。Landlock ABI 6+ が無い環境では
+    /// 成功扱いにせず panic し、シナリオ失敗にする（検証せずに成功する分岐を持たない）。ESC-10 等でも再利用できる。
+    fn landlock_rootfs_only_stages() -> StagePipeline {
+        let json =
+            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":false},"mounts":[]}"#;
+        let config = parse_config_bytes(json).unwrap_or_else(|e| panic!("valid config: {e}"));
+        let support = detect_landlock_abi()
+            .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for this case: {e}"));
+        let ruleset = path_rules_from_config(&support, &config)
+            .unwrap_or_else(|e| panic!("landlock rules: {e}"));
+        StagePipeline::new()
+            .with_landlock(ruleset)
+            .unwrap_or_else(|e| panic!("with_landlock: {e}"))
+    }
+
+    /// `std::io::Error` を攻撃結果へ写す（ENOENT は `Absent`）。
+    fn outcome_of_error(e: &std::io::Error) -> AttackOutcome {
+        match e.raw_os_error() {
+            Some(n) if n == ENOENT => AttackOutcome::Absent,
+            Some(n) => AttackOutcome::Errno(n),
+            None => AttackOutcome::Failed,
+        }
+    }
+
+    /// EACCES なら Landlock 拒否の監査レコードを記録する（SEC-4 の記録経路との整合）。
+    fn record_landlock_denial(rec: &Recorder, outcome: AttackOutcome, path: &str) {
+        if let AttackOutcome::Errno(n) = outcome {
+            match landlock_denial_record_now(Path::new(path), Some(n)) {
+                Ok(Some(r)) => rec.record(&r).expect("record landlock denial"),
+                Ok(None) => {}
+                Err(e) => panic!("build landlock audit record: {e:?}"),
+            }
+        }
+    }
+
+    /// ESC-07（SEC-2・TASK-42.4・#202。CVE-2019-5736 系）: `/proc/self/exe`（fork しただけの子ではホスト側
+    /// テスト実行ファイル＝ランタイムバイナリの代役。magic link のため pivot 後もホストの実体へ解決される）を
+    /// 書き込みモードで開こうとする。truncate・create・append は付けず、開けても即 drop して 1 バイトも
+    /// 書かないため、制限が全て欠けてもホストは変わらない（`Succeeded` を記録して失敗するだけ）。
+    /// ETXTBSY は LSM の file_open より先に判定されるため許可する（Landlock 帰属は別ケースで確認）。
+    fn attack_esc07_runtime_binary_write(rec: &Recorder) {
+        let outcome = match std::fs::OpenOptions::new()
+            .write(true)
+            .open("/proc/self/exe")
+        {
+            Ok(_) => AttackOutcome::Succeeded,
+            Err(e) => outcome_of_error(&e),
+        };
+        record_landlock_denial(rec, outcome, "/proc/self/exe");
+        rec.outcome(outcome);
+    }
+
+    /// ESC-07 の補助（SEC-2・TASK-42.4・#202）: ETXTBSY に覆われない読み取り open で、Landlock が
+    /// ホスト側バイナリ（rootfs の許可ツリー外）の経路を塞いでいることを独立に示す。読み込みはしない。
+    fn attack_esc07_runtime_binary_landlock(rec: &Recorder) {
+        let outcome = match std::fs::File::open("/proc/self/exe") {
+            Ok(_) => AttackOutcome::Succeeded,
+            Err(e) => outcome_of_error(&e),
+        };
+        record_landlock_denial(rec, outcome, "/proc/self/exe");
+        rec.outcome(outcome);
+    }
+
+    /// ESC-08（SEC-2・SEC-4・TASK-42.4・#202）: マウント先ホワイトリスト外の要求（rootfs 外への遡り・rootfs
+    /// 全体・相対 `..`。source はホストの機密パスを例示）を API 層（config パース）で検証し、拒否と Mount
+    /// 監査記録を確認する。実マウントは行わない（純粋関数のみ）。
+    /// 注意（実装済みを装わない）: マウント元（source）側のホワイトリストは未実装で、start は空でない mounts
+    /// を一律 `Unimplemented` で拒否するが監査されない。コンテナ内から生の `mount(2)` を試すケースは
+    /// raw syscall プローブが必要なため範囲外。本ケースは監査経路が実装済みの destination 側を検証する。
+    fn attack_esc08_mount_outside_whitelist(rec: &Recorder) {
+        for dest in ["/../../run/fandhe-container", "/", "run/../../../etc"] {
+            let before = rec.audit_count();
+            let json = format!(
+                r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs"}},"mounts":[{{"destination":"{dest}","type":"bind","source":"/run/fandhe-container","options":["bind"]}}]}}"#
+            );
+            match parse_config_bytes(json.as_bytes()) {
+                Ok(_) => {
+                    rec.outcome(AttackOutcome::Succeeded);
+                    return;
+                }
+                Err(err) => {
+                    assert_eq!(
+                        err.code(),
+                        ErrorCode::InvalidArgument,
+                        "mount rejection must be InvalidArgument"
+                    );
+                    let audited = audit_mount_config_error(err, rec);
+                    assert_eq!(
+                        audited.delivery,
+                        AuditDelivery::Recorded,
+                        "mount rejection must be audited"
+                    );
+                    assert_eq!(
+                        rec.audit_count(),
+                        before + 1,
+                        "each rejected mount request ({dest}) must add exactly one audit record"
+                    );
+                }
+            }
+        }
+        rec.outcome(AttackOutcome::Failed);
+    }
 
     /// 対照: 禁止対象外の操作（`/proc/self/status` の読み出し）が制限下でも動くこと。
     fn attack_control_read_proc(rec: &Recorder) {
@@ -532,6 +804,7 @@ mod linux {
         writer: PipeWriter,
         written: usize,
         outcome_written: bool,
+        audits: usize,
     }
 
     impl Recorder {
@@ -541,6 +814,7 @@ mod linux {
                     writer,
                     written: 0,
                     outcome_written: false,
+                    audits: 0,
                 }),
             }
         }
@@ -557,6 +831,11 @@ mod linux {
                 .map_err(|_| fail("failed to write the record"))?;
             st.written += line.len() + 1;
             Ok(())
+        }
+
+        /// これまでに記録した監査レコードの件数（要求ごとの記録確認用）。
+        fn audit_count(&self) -> usize {
+            self.inner.lock().expect("recorder lock").audits
         }
 
         /// 攻撃の結果を記録する（1 回だけ。2 回目は panic し、子の異常終了として失敗にする）。
@@ -577,7 +856,9 @@ mod linux {
                 .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to encode record"))?;
             let text = String::from_utf8(bytes)
                 .map_err(|_| TraitError::new(ErrorCode::Internal, "record is not UTF-8"))?;
-            self.write_line(&format!("audit={}", text.trim_end_matches('\n')))
+            self.write_line(&format!("audit={}", text.trim_end_matches('\n')))?;
+            self.inner.lock().expect("recorder lock").audits += 1;
+            Ok(())
         }
     }
 
@@ -775,6 +1056,7 @@ mod linux {
         result.unwrap_or_else(|err| panic!("isolate failed: {err}"));
 
         let (reader, writer) = std::io::pipe().expect("create record pipe");
+        (case.precondition)();
         let attack = case.attack;
         // 親側の writer 端は fork 時に閉じられる（クロージャは子にだけ残る）ため、子の終了で EOF になる。
         let child = spawn_container_probe(rootfs, (case.stages)(), move || {

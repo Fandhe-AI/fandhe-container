@@ -632,9 +632,9 @@ mod linux {
     /// 監査レコードはテスト側で組み立てない。本番の観測関数 `observe_landlock_path_access`
     /// （Landlock 適用 → プローブ → 拒否の監査レコード化）が返した `audit_records` を転送するだけで、
     /// 本番経路が記録を出さなければ `AuditExpectation::Required("landlock")` は満たされない（SEC-4。
+    /// 拒否の判定結果も同じプローブ試行の戻り値から取り、判定と監査記録を同一試行に結び付ける。
     /// 子プロセスへの本番監査配線は REPAIR-3 まで未実装）。
     fn attack_esc10_create_outside(rec: &Recorder) {
-        let outcome = try_create(ESC10_PROBE);
         let config = parse_config_bytes(ESC10_CONFIG).expect("valid config");
         let probes = [LandlockAccessProbe {
             kind: LandlockAccessKind::CreateFile,
@@ -653,7 +653,17 @@ mod linux {
             rec.record(record)
                 .unwrap_or_else(|e| panic!("record landlock denial: {e:?}"));
         }
-        rec.outcome(outcome);
+        // 判定対象の結果は監査レコードと同じ試行（観測関数内のプローブ 1 件）から得る。
+        // 別試行（`try_create`）の拒否と監査レコードを混同しない（SEC-4）。
+        let (_, probe_result) = obs
+            .results
+            .first()
+            .unwrap_or_else(|| panic!("landlock observation returned no probe result"));
+        rec.outcome(match probe_result {
+            None => AttackOutcome::Succeeded,
+            Some(errno) if *errno < 0 => AttackOutcome::Failed,
+            Some(errno) => AttackOutcome::Errno(*errno),
+        });
     }
 
     /// ESC-09 の攻撃: コンテナ内（pivot 後）の root としてファイルを作る。所有者の検査はホスト側で行う。

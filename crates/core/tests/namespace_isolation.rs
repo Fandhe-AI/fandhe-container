@@ -186,12 +186,14 @@ mod linux {
 
     /// プロセスグループ `pgid` に属する生存プロセス（ゾンビを除く）の PID を `/proc` から列挙する。
     /// 新しい PID namespace 内のプロセスもホストの `/proc` からはホスト側 PID で見える。
-    fn group_members(pgid: u32) -> Vec<u32> {
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return Vec::new();
-        };
+    /// 列挙・読み取り・解析の失敗は「全員停止」と区別できないため `Err` で返す（fail-closed）。
+    /// 列挙中に終了して消えたプロセス（`NotFound`）のみ生存者ではないとして無視する。
+    fn group_members(pgid: u32) -> Result<Vec<u32>, String> {
+        let entries =
+            std::fs::read_dir("/proc").map_err(|e| format!("read_dir /proc failed: {e}"))?;
         let mut pids = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read /proc entry failed: {e}"))?;
             let Some(pid) = entry
                 .file_name()
                 .to_str()
@@ -199,31 +201,38 @@ mod linux {
             else {
                 continue;
             };
-            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-                continue;
+            let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("read /proc/{pid}/stat failed: {e}")),
             };
             // 形式: `pid (comm) state ppid pgrp ...`。comm は括弧を含み得るため最後の `)` 以降を分解する。
-            let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
-                continue;
-            };
+            let rest = stat
+                .rsplit_once(')')
+                .map(|(_, r)| r)
+                .ok_or_else(|| format!("malformed /proc/{pid}/stat: {stat:?}"))?;
             let mut fields = rest.split_whitespace();
             let state = fields.next();
             let _ppid = fields.next();
-            let pgrp = fields.next().and_then(|f| f.parse::<u32>().ok());
-            if pgrp == Some(pgid) && state != Some("Z") && state != Some("X") {
+            let pgrp = fields
+                .next()
+                .and_then(|f| f.parse::<u32>().ok())
+                .ok_or_else(|| format!("malformed /proc/{pid}/stat: {stat:?}"))?;
+            if pgrp == pgid && state != Some("Z") && state != Some("X") {
                 pids.push(pid);
             }
         }
-        pids
+        Ok(pids)
     }
 
     /// `pgid` のグループが空になるまで最大 `limit` 待つ。残存 PID を返す（空なら全員停止）。
-    fn wait_group_gone(pgid: u32, limit: Duration) -> Vec<u32> {
+    /// 列挙に失敗した場合は停止を確認できないため `Err` を返す。
+    fn wait_group_gone(pgid: u32, limit: Duration) -> Result<Vec<u32>, String> {
         let deadline = Instant::now() + limit;
         loop {
-            let members = group_members(pgid);
+            let members = group_members(pgid)?;
             if members.is_empty() || Instant::now() >= deadline {
-                return members;
+                return Ok(members);
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -231,17 +240,18 @@ mod linux {
 
     /// プロセスグループ `pgid` の全員へ SIGKILL を送り、全員が止まったことまで確認する（特権操作の後始末）。
     /// 新しい PID namespace の PID 1 も親 namespace からの SIGKILL は受け付けるため container 段も止まる。
-    /// グループ送信に失敗した場合は残存プロセスへ個別に送るフォールバックを試み、それでも残れば `Err` を返す。
+    /// グループ送信に失敗した場合は残存プロセスへ個別に送るフォールバックを試み、それでも残る・
+    /// プロセス一覧を取得できない場合は `Err` を返す（停止を確認できるまで成功としない）。
     fn kill_group(pgid: u32) -> Result<(), String> {
         let group_result = run_kill(&[format!("-{pgid}")]);
-        let mut survivors = wait_group_gone(pgid, Duration::from_secs(2));
+        let mut survivors = wait_group_gone(pgid, Duration::from_secs(2))?;
         if survivors.is_empty() {
             return Ok(());
         }
         // フォールバック: 残存 PID へ個別に SIGKILL を送る。
         let targets: Vec<String> = survivors.iter().map(u32::to_string).collect();
         let individual_result = run_kill(&targets);
-        survivors = wait_group_gone(pgid, Duration::from_secs(5));
+        survivors = wait_group_gone(pgid, Duration::from_secs(5))?;
         if survivors.is_empty() {
             Ok(())
         } else {
@@ -250,6 +260,7 @@ mod linux {
             ))
         }
     }
+
     /// 子を起動して終了コード 0 を待つ。超過時は kill して panic する（REPAIR-5）。
     fn run_stage(flag: &str, rootfs: &Path, host_pid: u32, ns: &[String]) {
         use std::os::unix::process::CommandExt;

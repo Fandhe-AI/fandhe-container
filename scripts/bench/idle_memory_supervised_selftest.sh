@@ -45,10 +45,12 @@ n=$((n + 1))
 echo "$n" >"$STUB_DIR/count"
 printf '%s\n' "$*" >"$STUB_DIR/m$n.args"
 read -r rc pc pss rss <"$STUB_DIR/m$n"
+pname=fandhe-container-supervisor
+[ ! -f "$STUB_DIR/m$n.name" ] || pname="$(cat "$STUB_DIR/m$n.name")"
 [ ! -f "$STUB_DIR/m$n.sleep" ] || sleep "$(cat "$STUB_DIR/m$n.sleep")"
 [ "$rc" -eq 0 ] || exit "$rc"
 case " $* " in *" --expect-zero "*) [ "$pc" -eq 0 ] || exit 1 ;; esac
-printf '{\n  "schema_version": 1,\n  "process_count": %s,\n  "pss_kb": %s,\n  "rss_kb": %s,\n  "vanished_count": 0,\n  "processes": [\n    {"pid": 1, "name": "x", "pss_kb": 9, "rss_kb": 9}\n  ]\n}\n' "$pc" "$pss" "$rss"
+printf '{\n  "schema_version": 1,\n  "process_count": %s,\n  "pss_kb": %s,\n  "rss_kb": %s,\n  "vanished_count": 0,\n  "processes": [\n    {"pid": 1, "name": "%s", "pss_kb": 9, "rss_kb": 9}\n  ]\n}\n' "$pc" "$pss" "$rss" "$pname"
 STUB
 
 # スタブ driver。呼び出しを $STUB_DIR/driver.log へ記録し、up_rc / down_rc / up_sleep で挙動を変える。
@@ -62,7 +64,13 @@ case "$1" in
     [ ! -f "$STUB_DIR/up_sleep" ] || sleep "$(cat "$STUB_DIR/up_sleep")"
     exit "$(cat "$STUB_DIR/up_rc" 2>/dev/null || echo 0)"
     ;;
-  down) exit "$(cat "$STUB_DIR/down_rc" 2>/dev/null || echo 0)" ;;
+  down)
+    # down_sleep があれば最初の down 呼び出しだけ sleep する（実行中の down を中断するテスト用）。
+    if [ -f "$STUB_DIR/down_sleep" ] && [ "$(grep -c '^down$' "$STUB_DIR/driver.log")" -eq 1 ]; then
+      sleep "$(cat "$STUB_DIR/down_sleep")"
+    fi
+    exit "$(cat "$STUB_DIR/down_rc" 2>/dev/null || echo 0)"
+    ;;
   *) exit 64 ;;
 esac
 STUB
@@ -139,6 +147,14 @@ if expect_exit "supervised-zero" 1 && expect_err "supervised-zero" "supervised-z
   [ -z "$out" ] && [ "$(driver_log)" = "up,down," ] && pass "supervised-zero" || fail "supervised-zero (got: $(driver_log))"
 fi
 
+# 3b. process_count >= 1 でも processes に監視プロセス名がなければ（CLI のみ）失敗する。
+new_case "0 0 0 0" "0 1 10 10" "0 0 0 0"
+echo fandhe-container-cli >"$STUB_DIR/m2.name"
+run_target --driver "$driver"
+if expect_exit "supervisor-name-missing" 1 && expect_err "supervisor-name-missing" "no fandhe-container-supervisor process"; then
+  [ -z "$out" ] && [ "$(driver_log)" = "up,down," ] && pass "supervisor-name-missing" || fail "supervisor-name-missing (got: $(driver_log))"
+fi
+
 # 4. after が 0 でない → 1。stdout は空、--output は未公開、既存ファイルは不変。
 new_case "0 0 0 0" "0 2 150 500" "0 1 20 40"
 printf 'keep\n' >"${STUB_DIR}/result.json"
@@ -188,7 +204,7 @@ new_case "0 0 0 0" "0 2 1 1" "0 0 0 0"
 echo 9 >"$STUB_DIR/down_rc"
 run_target --driver "$driver"
 expect_exit "driver-down-fail" 3 && expect_err "driver-down-fail" "may still be running" &&
-  [ "$(driver_log)" = "up,down," ] && pass "driver-down-fail" || fail "driver-down-fail (driver: $(driver_log))"
+  [ "$(driver_log)" = "up,down,down," ] && pass "driver-down-fail" || fail "driver-down-fail (driver: $(driver_log))"
 
 # 9b. 期待違反（exit 1）の後に cleanup の down が失敗 → 後始末失敗が優先され 3。
 new_case "0 0 0 0" "0 0 0 0" "0 0 0 0"
@@ -292,6 +308,18 @@ wait "$tpid" || actual=$?
 errout="$(cat "${root}/stderr")"
 expect_exit "sigterm-down-fail" 3 && expect_err "sigterm-down-fail" "cleanup-failed" &&
   [ "$(driver_log)" = "up,down," ] && pass "sigterm-down-fail" || fail "sigterm-down-fail (driver: $(driver_log))"
+
+# 11f. 本流の down 実行中の SIGTERM でも、中断された down を EXIT trap が再試行する → 143。
+new_case "0 0 0 0" "0 2 1 1" "0 0 0 0"
+echo 30 >"$STUB_DIR/down_sleep"
+FANDHE_IDLE_MEMORY_SUPERVISED_MEASURE="${root}/measure.sh" bash "$target" --driver "$driver" 2>"${root}/stderr" >/dev/null &
+tpid=$!
+for _ in $(seq 1 50); do [ "$(driver_log)" = "up,down," ] && break; sleep 0.1; done
+kill -TERM "$tpid" 2>/dev/null || true
+actual=0
+wait "$tpid" || actual=$?
+errout="$(cat "${root}/stderr")"
+expect_exit "sigterm-during-down-retries" 143 && [ "$(driver_log)" = "up,down,down," ] && pass "sigterm-during-down-retries" || fail "sigterm-during-down-retries (driver: $(driver_log))"
 
 # 12. 差し替え環境変数は selftest フラグなしでは拒否 → 2。
 new_case "0 0 0 0" "0 2 1 1" "0 0 0 0"

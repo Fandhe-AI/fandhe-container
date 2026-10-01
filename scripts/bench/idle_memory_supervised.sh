@@ -12,9 +12,11 @@
 # フェーズ:
 #   1. before     : `idle_memory.sh --format json --expect-zero`（開始時点が 0 でなければ残留を帰属できない）
 #   2. up         : `<driver> up`（1 コンテナを監視プロセス込みで起動して復帰する）
-#   3. supervised : `idle_memory.sh --format json`（process_count >= 1 でなければ監視プロセス込み構成
-#                   になっていないとして失敗する。0 のまま合格にしない）
-#   4. down       : `<driver> down`（停止・削除。up を試みたら成否に関わらず終了時に必ず呼ぶ）
+#   3. supervised : `idle_memory.sh --format json`（process_count >= 1 かつ `processes` に監視プロセス名
+#                   `fandhe-container-supervisor` が含まれなければ、監視プロセス込み構成になっていない
+#                   として失敗する。CLI 等の同系名プロセスだけでは合格にしない）
+#   4. down       : `<driver> down`（停止・削除。up を試みたら、down の完了を確認できるまで終了時に
+#                   必ず呼ぶ。中断・失敗した down は EXIT trap で再試行する）
 #   5. after      : `idle_memory.sh --format json --expect-zero`（回帰判定の本体）
 #
 # 使い方:
@@ -27,7 +29,8 @@
 #   symlink なし・所有者が実行ユーザーか root・他者書き込み不可（sticky 除く）であること（root 実行時の差し替え防止。
 #   違反は `error: invalid-driver:` で終了コード 2）。
 #   TERM / INT / HUP を受けても EXIT trap の `down` を必ず実行し、失敗は `cleanup-failed` で報告する。
-#   `down` は停止・削除して復帰する。いずれも終了コード 0 で成功を示す。driver の標準出力は破棄し、
+#   `down` は停止・削除して復帰する。中断された down の後や、既に停止済みの状態でも再実行できる
+#   （冪等）こと。いずれも終了コード 0 で成功を示す。driver の標準出力は破棄し、
 #   標準エラーはそのまま流す。driver の絶対パス・引数は結果 JSON に出さない。
 #
 # 出力 JSON（契約として固定）: schema_version / behavior / task / timestamp / kernel / arch /
@@ -274,11 +277,13 @@ cleanup() {
   local orig=$? rc=0
   trap ':' TERM INT HUP
   if [ "$up_attempted" -eq 1 ] && [ "$down_done" -eq 0 ]; then
-    down_done=1
+    # 本流の down が中断・失敗した場合もここへ来る（down_done は完了確認後にだけ立てる）。
     timeout --kill-after=10 "$timeout_s" "$driver" down >/dev/null || rc=$?
     if [ "$rc" -ne 0 ]; then
       err "cleanup-failed" "driver down failed (exit ${rc}); the container or supervisor may still be running"
       orig=3
+    else
+      down_done=1
     fi
   fi
   [ -z "$tmp" ] || rm -f "$tmp"
@@ -393,8 +398,14 @@ if [ "$s_pc" -lt 1 ]; then
   err "supervised-zero" "process_count=0 while a container is up; not a supervised configuration"
   exit 1
 fi
+# process_count >= 1 だけでは CLI 等の同系名プロセスでも通るため、processes に監視プロセス名があることを確かめる。
+if ! printf '%s\n' "$phase_out" | grep -Eq '"name": "fandhe-container-supervisor"'; then
+  err "supervised-zero" "no fandhe-container-supervisor process while a container is up; not a supervised configuration"
+  exit 1
+fi
 
-down_done=1
+# down_done は down の完了を確認してからだけ立てる。中断（TERM / INT / HUP）・失敗した down は
+# 終了時に cleanup が再試行する（root で起動した container / supervisor を残さない）。
 rc=0
 run_driver down || rc=$?
 down_exit="$rc"
@@ -402,6 +413,7 @@ if [ "$rc" -ne 0 ]; then
   err "driver-failed" "driver down failed or timed out (exit ${rc}); the container or supervisor may still be running"
   exit 3
 fi
+down_done=1
 
 if [ "$settle" -gt 0 ]; then
   sleep "$settle"

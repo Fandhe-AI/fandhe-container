@@ -613,6 +613,7 @@ expect_has "help-mentions-task-50-2" "$out" "TASK-50.2"
 #   STUB_DK_ZERO_PSS=1 / STUB_DK_BAD_PSS=<文字列> / STUB_DK_NO_SMAPS=1: 値の異常 / STUB_DK_SHIM_COMM=<名前>: shim の comm
 #   STUB_DK_RM_FAIL=1: docker rm -f が何もせず失敗する / STUB_DK_RUN_SLEEP=<秒>: docker run が作成前に待つ
 #   STUB_SEED_NO_DOCKERD=1: 疑似 /proc に dockerd を置かない
+#   STUB_SEED_NO_CONTAINERD=1: 疑似 /proc に containerd を置かない
 dkstub="$work/stub-docker"
 {
   printf '#!%s\n' "$bash_bin"
@@ -738,6 +739,7 @@ dk_reset() {
   for spec in "500001 dockerd 2000" "500002 containerd 500"; do
     read -r pid comm pss <<<"$spec"
     if [ "$comm" = "dockerd" ] && [ -n "${STUB_SEED_NO_DOCKERD:-}" ]; then continue; fi
+    if [ "$comm" = "containerd" ] && [ -n "${STUB_SEED_NO_CONTAINERD:-}" ]; then continue; fi
     mkdir -p "$work/fake/$pid/task/$pid"
     printf '%s\n' "$comm" >"$work/fake/$pid/comm"
     printf 'Name: %s\nVmRSS: %s kB\n' "$comm" "$((pss * 2))" >"$work/fake/$pid/status"
@@ -815,8 +817,8 @@ expect_eq "dk-exited-no-residual" 0 "$(dk_remaining)"
 # docker run の失敗 → exit 1（残りは後始末される）
 STUB_DK_RUN_FAIL_I=2 run_dk --count 5 --trials 1
 expect_eq "dk-run-fail-exit1" 1 "$rc"
-expect_has "dk-run-fail-stderr" "$errf" "startup-incomplete: trial=1 started=4/5"
-expect_has "dk-run-fail-reported" "$errf" "docker-run-failed"
+expect_has "dk-run-fail-reported" "$errf" "docker-run-failed: trial=1 failed=1/5"
+expect_eq "dk-run-fail-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "dk-run-fail-no-residual" 0 "$(dk_remaining)"
 
 # 期限切れ（docker run が --timeout を超える）→ exit 1 かつ所定時間内。作成済みの分は後始末される
@@ -861,6 +863,11 @@ STUB_SEED_NO_DOCKERD=1 run_dk --count 3 --trials 1
 expect_eq "dk-no-dockerd-exit1" 1 "$rc"
 expect_has "dk-no-dockerd-stderr" "$errf" "docker-daemon-not-local"
 expect_eq "dk-no-dockerd-rm-count" 0 "$(dk_rm_count)"
+STUB_SEED_NO_CONTAINERD=1 run_dk --count 3 --trials 1
+expect_eq "dk-no-containerd-exit1" 1 "$rc"
+expect_has "dk-no-containerd-stderr" "$errf" "no containerd process found locally"
+expect_eq "dk-no-containerd-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "dk-no-containerd-rm-count" 0 "$(dk_rm_count)"
 
 # --- D8. 集計中にコンテナが終了したら exit 1（CORE-9。N 個同時稼働時の値ではない） ---
 STUB_DK_EXIT_AFTER=2 run_dk --count 3 --trials 1

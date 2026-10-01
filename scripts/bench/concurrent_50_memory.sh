@@ -463,6 +463,7 @@ dk_active=0
 in_exit=0
 dk_sig=""
 dk_cpids=()
+DK_CLIENT_FAILED=0
 dk_ids=()
 dk_pid=()
 DK_LISTED=()
@@ -1212,6 +1213,7 @@ dk_scan_daemons() {
   local f comm p
   DK_DAEMONS=()
   DK_DOCKERD_N=0
+  DK_CONTAINERD_N=0
   for f in "$proc"/[0-9]*/comm; do
     [ -e "$f" ] || continue
     comm=""
@@ -1222,6 +1224,7 @@ dk_scan_daemons() {
     [[ "$p" =~ $num_re ]] || continue
     DK_DAEMONS+=("$p")
     if [ "$comm" = "dockerd" ]; then DK_DOCKERD_N=$((DK_DOCKERD_N + 1)); fi
+    if [ "$comm" = "containerd" ]; then DK_CONTAINERD_N=$((DK_CONTAINERD_N + 1)); fi
   done
 }
 
@@ -1294,6 +1297,8 @@ dk_wait_clients() { # <trial>
     fi
   done
   dk_cpids=()
+  # 呼び出し元（dk_trials）が失敗試行を公開しないよう、失敗件数を DK_CLIENT_FAILED へ返す。
+  DK_CLIENT_FAILED="$failed"
   if [ "$failed" -gt 0 ]; then err "docker-run-failed" "trial=$1 failed=${failed}/${count}"; fi
 }
 
@@ -1480,7 +1485,9 @@ dk_stop() {
     trap 'on_signal 143' TERM
     trap 'on_signal 130' INT
     trap 'on_signal 129' HUP
-    if [ -n "$dk_sig" ]; then on_signal "$dk_sig"; fi
+    # 残存・確認不能（rc=4）のときは終了コード 4 を最優先する。ここでシグナルの終了コードで exit すると、
+    # dk_active が 0 のため on_exit の dk_stop が no-op になり 4 が失われる。呼び出し元が 4 で exit する。
+    if [ -n "$dk_sig" ] && [ "$rc" -eq 0 ]; then on_signal "$dk_sig"; fi
   fi
   return "$rc"
 }
@@ -1509,6 +1516,7 @@ dk_trials() {
   if [ "${#DK_LISTED[@]}" -ne 0 ]; then err "container-id-in-use" "containers of this run already exist; refusing to touch them"; exit 1; fi
   dk_scan_daemons
   if [ "$DK_DOCKERD_N" -lt 1 ]; then err "docker-daemon-not-local" "no dockerd process found locally (remote or rootless daemons are not supported)"; exit 1; fi
+  if [ "$DK_CONTAINERD_N" -lt 1 ]; then err "docker-daemon-not-local" "no containerd process found locally (its PSS would be missing from the aggregate)"; exit 1; fi
 
   while [ "$t" -le "$trials" ]; do
     mem_before="$(mem_available)"
@@ -1517,6 +1525,7 @@ dk_trials() {
     dk_ok=()
     dk_spawn "$t"
     dk_wait_clients "$t"
+    if [ "$DK_CLIENT_FAILED" -gt 0 ]; then exit 1; fi
     dk_read_cids "$t"
     # 起動完了待ち（期限つき。REPAIR-5）。作成直後・再起動中のコンテナがなくなれば待たない。
     deadline=$((SECONDS + timeout_s))
@@ -1543,6 +1552,7 @@ dk_trials() {
 
     dk_scan_daemons
     if [ "$DK_DOCKERD_N" -lt 1 ]; then err "docker-daemon-not-local" "no dockerd process found locally"; exit 1; fi
+    if [ "$DK_CONTAINERD_N" -lt 1 ]; then err "docker-daemon-not-local" "no containerd process found locally"; exit 1; fi
     dk_seen=()
     acc_pss=0
     acc_rss=0

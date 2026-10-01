@@ -46,7 +46,7 @@
 //! - `state_store`: ファイルベース `StateStore`（TASK-31.1・OCI-5）は実装済み。3 OS でコンパイルされるが
 //!   使えるのは Linux のみで、他 OS の `FileStateStore::open` は状態ルートの信頼境界（所有者・ACL）を
 //!   検査できないため `Unimplemented`（fail-closed。start の `BundleLock` と同じ扱い）。
-//!   fsync・残骸掃除の強化は TASK-31.2（#156）、結合テストの拡充は TASK-31.3（#157）で行う予定
+//!   fsync・残骸掃除の強化は TASK-31.2（#156）、結合テスト（ライフサイクル経由の `state.json` 照合）は TASK-31.3（#157）で実装済み
 //! - `cgroups`: 委譲 cgroup v2 の検出・コンテナ用子 cgroup 作成・自プロセス退避の検証・controller
 //!   有効化・`memory.max` / `memory.swap.max` 設定・`cpu.max` 設定（Linux 限定。TASK-32.1・TASK-32.2・
 //!   TASK-32.3・CORE-3 は実装済み。起動フローへの組み込み〔TASK-32.4〕は未実装で、現状は起動フローから呼ばれない）

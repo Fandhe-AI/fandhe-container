@@ -254,6 +254,55 @@ fn create_scoped(store: &MemStateStore, b: &Bundle, id: &str, scope: &str) -> St
         .expect("create scoped record")
 }
 
+/// OCI-6・CORE-3（TASK-30.3 の受入基準 2）: スコープが記録されたコンテナの delete は、同じスコープの remover で
+/// 当該 ID の cgroup 削除をちょうど 1 回呼んでから状態記録を消す（2 回目の delete は NotFound で呼ばない）。
+#[test]
+fn oci6_task30_3_scoped_delete_removes_cgroup_once() {
+    let b = Bundle::ready("scoped", &config());
+    let store = MemStateStore::new();
+    let rec = OpRecorder::new();
+    let id = "del-scoped";
+    create_scoped(&store, &b, id, SCOPE);
+
+    let cg = RecordingCgroup::in_scope(SCOPE);
+    delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect("delete");
+    assert_eq!(cg.calls(), vec![cid(id)]);
+    assert_eq!(
+        store.record_of(id).expect_err("gone").code(),
+        ErrorCode::NotFound
+    );
+    let err = delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect_err("second delete");
+    assert_eq!(err.code(), ErrorCode::NotFound);
+    assert_eq!(cg.calls(), vec![cid(id)]);
+    assert_eq!(op_stats(&rec, "delete"), (1, 1));
+}
+
+/// OCI-6・CORE-3（TASK-30.3）: 記録と異なる委譲スコープからの delete は `FailedPrecondition` で、cgroup の削除を
+/// 呼ばず、状態記録（revision を含む）を残す。記録どおりのスコープで再実行すれば削除できる（fail-closed）。
+#[test]
+fn oci6_task30_3_delete_from_other_scope_keeps_state() {
+    let b = Bundle::ready("otherscope", &config());
+    let store = MemStateStore::new();
+    let rec = OpRecorder::new();
+    let id = "del-other-scope";
+    let created = create_scoped(&store, &b, id, SCOPE);
+
+    let other = RecordingCgroup::in_scope("/user.slice/user-1000.slice/b.scope");
+    let err = delete(&store, &rec, &other, &DeleteRequest::new(cid(id))).expect_err("mismatch");
+    assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(
+        err.message(),
+        "delegated cgroup scope does not match the recorded scope"
+    );
+    assert_eq!(other.calls(), Vec::<ContainerId>::new());
+    assert_eq!(store.record_of(id).expect("kept"), created);
+
+    let right = RecordingCgroup::in_scope(SCOPE);
+    delete(&store, &rec, &right, &DeleteRequest::new(cid(id))).expect("delete");
+    assert_eq!(right.calls(), vec![cid(id)]);
+    assert_eq!(op_stats(&rec, "delete"), (1, 1));
+}
+
 /// OCI-6・CORE-2: 実行中は拒否され、停止（supervisor の代わりにテストが遷移）後に削除できる。
 #[test]
 fn oci6_core2_delete_rejected_until_stopped() {

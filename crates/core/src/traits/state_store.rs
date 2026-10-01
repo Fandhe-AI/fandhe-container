@@ -1010,6 +1010,86 @@ mod tests {
         assert!(StateRecord::new(status, sample_bundle(), StateRevision::INITIAL).is_ok());
     }
 
+    /// TASK-30.3・OCI-6: `CgroupScope` はルート `/` と `/a/b` 形式だけを受理し、相対・空要素・`.`・`..`・
+    /// NUL・要素長 / 深さ / 全体長の超過を `INVALID_ARGUMENT` で拒否する。
+    #[test]
+    fn oci6_task30_3_cgroup_scope_validation() {
+        for ok in ["/", "/user.slice", "/user.slice/user-1000.slice/x.scope"] {
+            assert_eq!(CgroupScope::new(ok).expect(ok).as_str(), ok);
+        }
+        let long_comp = format!("/{}", "a".repeat(256));
+        let deep = "/a".repeat(65);
+        let too_long = format!("/{}", vec!["b".repeat(200); 21].join("/"));
+        let rejected = [
+            "",
+            "relative",
+            "a/b",
+            "//",
+            "/a/",
+            "/a//b",
+            "/./a",
+            "/a/..",
+            "/a/../b",
+            "/a\0b",
+            long_comp.as_str(),
+            deep.as_str(),
+            too_long.as_str(),
+        ];
+        for bad in rejected {
+            let err = CgroupScope::new(bad).expect_err(bad);
+            assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+            assert_eq!(err.message(), "invalid cgroup scope path");
+        }
+        // 境界値: 要素長 255・深さ 64 は受理する。
+        let max_comp = format!("/{}", "a".repeat(255));
+        assert!(CgroupScope::new(&max_comp).is_ok());
+        let max_depth = "/a".repeat(64);
+        assert!(CgroupScope::new(&max_depth).is_ok());
+    }
+
+    /// TASK-30.3・OCI-6（契約 8）: create で記録した cgroup_scope は get で返り、update でも引き継がれる。
+    /// 未設定のレコードは `None`。
+    #[test]
+    fn oci6_task30_3_cgroup_scope_round_trips_through_store() {
+        let store = StubStateStore::new();
+        let scope = CgroupScope::new("/user.slice/x.scope").expect("scope");
+        let id = sample_id("scoped");
+        let created = store
+            .create(
+                &CreateStateRequest::new(
+                    ContainerStatus::created(id.clone(), None),
+                    sample_bundle(),
+                )
+                .expect("req")
+                .with_cgroup_scope(scope.clone()),
+            )
+            .expect("create");
+        assert_eq!(created.cgroup_scope(), Some(&scope));
+        let updated = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::stopped(id.clone(), Some(0)),
+                created.revision(),
+            ))
+            .expect("update");
+        assert_eq!(updated.cgroup_scope(), Some(&scope));
+        let got = store.get(&GetStateRequest::new(id)).expect("get");
+        assert_eq!(
+            got.cgroup_scope().map(CgroupScope::as_str),
+            Some("/user.slice/x.scope")
+        );
+
+        let plain = store
+            .create(
+                &CreateStateRequest::new(
+                    ContainerStatus::created(sample_id("plain"), None),
+                    sample_bundle(),
+                )
+                .expect("req"),
+            )
+            .expect("create");
+        assert_eq!(plain.cgroup_scope(), None);
+    }
+
     /// `StateRevision::next` は `INITIAL` の次を +1 にし、`u64::MAX` からの
     /// `next()` は `"INTERNAL"` を返す（オーバーフロー検出）。
     #[test]

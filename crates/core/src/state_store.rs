@@ -1506,6 +1506,93 @@ mod tests {
         assert_eq!(rec.cgroup_scope(), None);
     }
 
+    /// TASK-30.3・OCI-6: create で記録した cgroup スコープは `state.json` の `cgroupScope` に書かれ、
+    /// get で返り、update（start の Created → Running 相当）の後も引き継がれる。
+    #[test]
+    fn oci6_task30_3_cgroup_scope_is_persisted_and_kept_on_update() {
+        let t = TmpDir::new("cgscope");
+        let store = t.open();
+        let scope = CgroupScope::new("/user.slice/user-1000.slice/x.scope").unwrap();
+        let req = CreateStateRequest::new(ContainerStatus::created(cid("web"), None), bundle())
+            .unwrap()
+            .with_cgroup_scope(scope.clone());
+        let rec = store.create(&req).unwrap();
+        assert_eq!(rec.cgroup_scope(), Some(&scope));
+        let read_scope = || {
+            let text = fs::read_to_string(t.path().join("web").join("state.json")).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            v["cgroupScope"].clone()
+        };
+        assert_eq!(read_scope(), "/user.slice/user-1000.slice/x.scope");
+        let updated = update_to_running(&store, &rec);
+        assert_eq!(updated.cgroup_scope(), Some(&scope));
+        assert_eq!(read_scope(), "/user.slice/user-1000.slice/x.scope");
+        let got = store.get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(
+            got.cgroup_scope().map(CgroupScope::as_str),
+            Some("/user.slice/user-1000.slice/x.scope")
+        );
+        // 別インスタンス（別プロセスの delete 相当）から読んでも同じ値になる。
+        let reopened = t.open();
+        let got = reopened.get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(got.cgroup_scope(), Some(&scope));
+    }
+
+    /// TASK-30.3・OCI-6: `cgroupScope` を持たない既存の `state.json`（導入前の版が書いたもの）は
+    /// 破損扱いにせず、cgroup スコープの記録なし（`None`）として読み、通常の delete で消せる。
+    #[test]
+    fn oci6_task30_3_legacy_state_without_cgroup_scope_reads_as_none() {
+        let t = TmpDir::new("cglegacy");
+        let store = t.open();
+        let rec = create(&store, "old");
+        let legacy = format!(
+            r#"{{"ociVersion":"1.2.0","id":"old","status":"stopped","bundle":"{}","revision":{}}}"#,
+            bundle().to_str().unwrap(),
+            rec.revision().value()
+        );
+        fs::write(t.path().join("old").join("state.json"), legacy).unwrap();
+        let got = store.get(&GetStateRequest::new(cid("old"))).unwrap();
+        assert_eq!(got.cgroup_scope(), None);
+        assert_eq!(got.status(), &ContainerStatus::stopped(cid("old"), None));
+        assert!(store.find_corrupted().unwrap().is_empty());
+        assert_eq!(store.list(&list_req(10)).unwrap().records().len(), 1);
+        store
+            .delete(&DeleteStateRequest::new(cid("old"), got.revision()))
+            .unwrap();
+        assert!(!t.path().join("old").exists());
+    }
+
+    /// TASK-30.3・OCI-6: 形式を満たさない `cgroupScope`（相対・`..`・空要素・非文字列）は破損として
+    /// `Internal` になり、`find_corrupted` / `purge_corrupted` で回復できる。
+    #[test]
+    fn oci6_task30_3_invalid_cgroup_scope_is_corrupted_and_purgeable() {
+        let t = TmpDir::new("cgbad");
+        let store = t.open();
+        let bad = [
+            ("a", r#""relative""#),
+            ("b", r#""/a/../b""#),
+            ("c", r#""/a//b""#),
+            ("d", "5"),
+        ];
+        for (id, value) in bad {
+            let rec = create(&store, id);
+            let body = format!(
+                r#"{{"ociVersion":"1.2.0","id":"{id}","status":"stopped","bundle":"/b","revision":{},"cgroupScope":{value}}}"#,
+                rec.revision().value()
+            );
+            fs::write(t.path().join(id).join("state.json"), body).unwrap();
+            let e = store.get(&GetStateRequest::new(cid(id))).unwrap_err();
+            assert_eq!(e.code().as_str(), "INTERNAL");
+        }
+        assert_eq!(code(store.list(&list_req(10))), "INTERNAL");
+        let found = store.find_corrupted().unwrap();
+        assert_eq!(found, vec![cid("a"), cid("b"), cid("c"), cid("d")]);
+        for (id, _) in bad {
+            store.purge_corrupted(&cid(id)).unwrap();
+        }
+        assert!(store.list(&list_req(10)).unwrap().records().is_empty());
+    }
+
     #[test]
     fn cri7_file_state_store_is_dyn_compatible() {
         let t = TmpDir::new("dyn");

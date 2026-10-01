@@ -35,6 +35,13 @@
 //! - シナリオ `stage-fail`（同上）: 途中の段のフック失敗で後続段と exec に進まず `Exited(125)`
 //!   （setup 失敗）、stderr に失敗した段（`at Landlock`。#173 以降 capability 削減は組み込みのためフック失敗の対象外）
 //!
+//! - シナリオ `landlock-apply-ro` / `landlock-apply-rw` / `landlock-fail`（#184・TASK-39.4・CORE-5。
+//!   `with_landlock` + `spawn_container_seccomp_probe`）: 実カーネルの Landlock を fork した子で適用する。
+//!   ro は適用成功後に終端の書き込みが拒否され（`Exited(125)`・`Permission denied`）、rw は書き込みが
+//!   許可され（`Exited(0)`）、存在しない mount 先は適用失敗で起動拒否（`Exited(125)`・
+//!   `landlock_open_path_failed`）になる。いずれも Landlock の前段（cgroup 参加）は制限前に実行済み。
+//!   ABI 6 未満のホストでは検出失敗で panic する（実機前提）
+//!
 //! # 実機前提テストとしての分離
 //! 実行には root もしくは非特権 user namespace を許可するホストが必要（AppArmor の
 //! `kernel.apparmor_restrict_unprivileged_userns=1` 等の環境では `PermissionDenied` になる）。
@@ -85,8 +92,12 @@ mod linux {
     use fandhe_container_core::exec::{
         ChildExit, Entrypoint, ExecError, Hostname, IsolationConfig, Namespace, NamespaceSet,
         StageKind, StagePipeline, isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
-        spawn_container, spawn_container_with_stages,
+        spawn_container, spawn_container_seccomp_probe, spawn_container_with_stages,
     };
+    use fandhe_container_core::landlock::{
+        LandlockRuleset, detect_landlock_abi, path_rules_from_config,
+    };
+    use fandhe_container_core::oci_runtime::parse_config_bytes;
 
     const PROBE: &str = "fandhe-exec-probe";
     const PROBE_EXIT: i32 = 42;
@@ -94,12 +105,15 @@ mod linux {
     /// 子が pivot 後の `/` に追記するステージ実行ログ（親からは `<rootfs>/stage-log`）。
     const STAGE_LOG: &str = "stage-log";
     /// (シナリオ名, stderr に含まれるべき文字列)。
-    const SCENARIOS: [(&str, &str); 5] = [
+    const SCENARIOS: [(&str, &str); 8] = [
         ("ok", "PERMISSION_DENIED"),
         ("missing", "PERMISSION_DENIED"),
         ("not-executable", "PERMISSION_DENIED"),
         ("stages-order", "PERMISSION_DENIED"),
         ("stage-fail", "at Landlock"),
+        ("landlock-apply-ro", "Permission denied"),
+        ("landlock-apply-rw", ""),
+        ("landlock-fail", "landlock_open_path_failed"),
     ];
 
     fn timeout() -> Duration {
@@ -352,7 +366,8 @@ mod linux {
             "ok" => format!("/{PROBE}"),
             "missing" => "/no-such-entrypoint".to_string(),
             "not-executable" => format!("/{NOT_EXEC}"),
-            "stages-order" | "stage-fail" => format!("/{PROBE}"),
+            "stages-order" | "stage-fail" | "landlock-apply-ro" | "landlock-apply-rw"
+            | "landlock-fail" => format!("/{PROBE}"),
             other => panic!("unknown scenario {other}"),
         };
         // SEC-1・CORE-5: Landlock が未適用の間は、root / 非 root を問わず
@@ -383,6 +398,33 @@ mod linux {
                 want = ChildExit::Exited(125);
                 spawn_container_with_stages(rootfs, &entry, stages)
             }
+            "landlock-apply-ro" | "landlock-apply-rw" | "landlock-fail" => {
+                // CORE-5・TASK-39.4・#184: 実カーネルの Landlock を、fork した子の本番経路
+                // （`spawn_container_*` → pivot → 組み込みの capability 削減・NO_NEW_PRIVS → Landlock → seccomp）で適用する。
+                // exec は証跡配線前で拒否されるため、終端は exec の代わりに pivot 後の `/` へ
+                // 記録ファイルを書くプローブ（`spawn_container_seccomp_probe`）を使い、書き込みの成否で
+                // Landlock の適用有無を観測する。
+                let (readonly, mounts) = match name {
+                    "landlock-apply-ro" => (true, "[]"),
+                    "landlock-apply-rw" => (false, "[]"),
+                    // 子の rootfs に存在しない mount 先: ルール対象を開けず適用が失敗する。
+                    _ => (
+                        false,
+                        r#"[{"destination":"/no-such-landlock-dir","options":["rw"]}]"#,
+                    ),
+                };
+                let ruleset = landlock_ruleset(readonly, mounts);
+                let stages = StagePipeline::new()
+                    .with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
+                    .and_then(|p| p.with_landlock(ruleset))
+                    .unwrap_or_else(|e| panic!("register landlock: {e}"));
+                want = match name {
+                    "landlock-apply-rw" => ChildExit::Exited(0),
+                    // 適用成功後の書き込み拒否（ro）と適用失敗（fail）はどちらも起動拒否（非 0）。
+                    _ => ChildExit::Exited(125),
+                };
+                spawn_container_seccomp_probe(rootfs, stages)
+            }
             _ => spawn_container(rootfs, &entry),
         }
         .unwrap_or_else(|e| panic!("spawn: {e}"));
@@ -406,8 +448,34 @@ mod linux {
                 format!("cgroup_join root=1 nnp={inherited_nnp}\n"),
                 "no stage after the failed one may run"
             ),
+            "landlock-apply-ro" | "landlock-apply-rw" | "landlock-fail" => {
+                // Landlock の前段（cgroup 参加）は、制限が掛かる前に pivot 後の `/` へ書けている。
+                assert_eq!(
+                    log,
+                    format!("cgroup_join root=1 nnp={inherited_nnp}\n"),
+                    "the pre-landlock stage must run before restriction"
+                );
+                // プローブ記録（終端の書き込み）は、Landlock が許可した場合のみ存在する。
+                let published = rootfs.join("seccomp-probe").exists();
+                assert_eq!(
+                    published,
+                    name == "landlock-apply-rw",
+                    "terminal write must succeed only when Landlock allows it ({name})"
+                );
+            }
             _ => assert_eq!(log, "", "no hook is registered"),
         }
+    }
+
+    /// `root.readonly` と mounts から実カーネルの ABI を検出して Landlock ruleset を作る（親・fork 前）。
+    fn landlock_ruleset(readonly: bool, mounts: &str) -> LandlockRuleset {
+        let json = format!(
+            r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":{readonly}}},"mounts":{mounts}}}"#
+        );
+        let config = parse_config_bytes(json.as_bytes()).expect("valid config");
+        let support = detect_landlock_abi()
+            .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for this test: {e}"));
+        path_rules_from_config(&support, &config).unwrap_or_else(|e| panic!("rules: {e}"))
     }
 
     /// 自プロセスの `/proc/self/status` の `NoNewPrivs:` の値（0 または 1）。

@@ -128,6 +128,7 @@ cat >>"$stub" <<'STUB'
 #   never-stops: start 後は running のままで kill も効かない
 #   cleanup-hang: start 後は running のままで、delete・kill がいずれも応答しない（ハング）
 #   exec-hang-poll: start 後の state が 1.5 秒かけて created を返し、2 回目以降はハングする
+#   exec-after-1s: start 後 1 秒間は state が即座に created を返し、その後 running を返す
 #   id-in-use: create 前から同じ ID のコンテナが存在する
 mode="${STUB_MODE:-ok}"
 cmd="$1"
@@ -197,7 +198,7 @@ case "$cmd" in
     [ "$mode" = start-hang ] && exec sleep 30
     [ "$mode" = start-flood ] && exec yes
     sleep 0.10
-    touch "$m.started"
+    echo "${EPOCHREALTIME/./}" >"$m.started"
     ;;
   state)
     if [ "$mode" = id-in-use ]; then state_json created; exit 0; fi
@@ -224,6 +225,9 @@ case "$cmd" in
         if [ "$n" -le 2 ]; then state_json created; else state_json stopped; fi
         ;;
       exec-never) state_json created ;;
+      exec-after-1s)
+        if [ $((${EPOCHREALTIME/./} - $(cat "$m.started"))) -ge 1000000 ]; then state_json running; else state_json created; fi
+        ;;
       exec-hang-poll)
         if [ -e "$m.polled" ]; then exec sleep 30; fi
         touch "$m.polled"
@@ -539,6 +543,13 @@ STUB_MODE=exec-late expect_rc "exec-late" 1 --runtime "$stub" --bundle "$work/bu
 expect_contains "exec-late-error" "runtime-exec-not-observed"
 expect_eq "exec-late-stdout-empty" "" "$last_stdout"
 expect_eq "exec-late-state-count" "3" "$(grep -c '^state ' "$stub_log")"
+# 実行開始まで 1 秒かかるランタイムでも、照会回数ではなく期限（--timeout 3 秒）で打ち切る
+# ため成功し、照会は間隔（10ms）を空けるので回数が 1 秒 / 10ms 程度に収まる（Codex P1）。
+reset_log
+STUB_MODE=exec-after-1s expect_rc "exec-after-1s" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 3
+polls="$(jq -r '.samples_us[0].state_polls' <<<"$last_stdout")"
+if [ "$polls" -ge 2 ] && [ "$polls" -le 110 ]; then pass "exec-after-1s-poll-count ($polls in 2..110)"; else fail "exec-after-1s-poll-count ($polls)"; fi
+expect_eq "exec-after-1s-observe" "true" "$(jq -r '.samples_us[0].observe_us >= 1000000' <<<"$last_stdout")"
 # 2 回目の照会がハングしても、観測期限（--timeout 3 秒）までの残り時間しか待たない（Codex P1。
 # REPAIR-5）。照会ごとに --timeout 秒を渡す実装では 1.5 + 3 秒を超える。
 reset_log

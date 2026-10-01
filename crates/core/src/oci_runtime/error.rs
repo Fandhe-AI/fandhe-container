@@ -163,12 +163,18 @@ const FORMAT_CHAR_RANGES: [(char, char); 21] = [
 /// [`FORMAT_CHAR_RANGES`]）・Zl（行区切り U+2028）・Zp（段落区切り U+2029）。改行・ESC による
 /// 行注入・端末制御、双方向制御による表示順の偽装、ゼロ幅文字による不可視の挿入を防ぐ。
 ///
+/// 加えて U+2065 も置換する。現行では未割り当て（Cn）だが、書式文字ブロック U+2060〜U+206F の
+/// 内側に予約された符号位置で、将来 Cf として割り当てられうるため、ブロック全体を閉じておく
+/// （fail-closed）。
+///
 /// 対象外（意図的）: Mn 等の結合文字（多くの文字体系の正当な表記に必須）、U+3164 等の不可視の
-/// Lo、Co（私用領域）・Cn（未割り当て。将来割り当ての追従は表の再生成で行う）。これらは行構造・
-/// 表示順を変えないため置換しない。
+/// Lo、Co（私用領域）、上記以外の Cn（未割り当て。将来割り当ての追従は表の再生成で行う）。
+/// これらは行構造・表示順を変えないため置換しない。
+///
+/// Cc の判定は std の Unicode 版に従うが、Cc は U+0000〜U+001F・U+007F〜U+009F で版によらず不変。
 fn is_display_unsafe_char(c: char) -> bool {
     c.is_control()
-        || matches!(c, '\u{2028}' | '\u{2029}')
+        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{2065}')
         || FORMAT_CHAR_RANGES
             .iter()
             .any(|&(lo, hi)| (lo..=hi).contains(&c))
@@ -379,11 +385,12 @@ mod tests {
     }
 
     /// ERR-2: 規則（Cc・Cf・Zl・Zp）の各カテゴリの代表と Cf 範囲の両端が空白へ置換され、
-    /// 範囲の直外（U+00AC・U+2065〔未割り当て〕・U+2070・U+E0080）や通常の文字は保持される。
+    /// 書式文字ブロック内の予約位置 U+2065 も置換される。範囲の直外（U+00AC・U+2070・U+E0080）や
+    /// 結合文字・通常の文字は保持される。
     #[test]
     fn err2_message_general_category_rule() {
-        // Cc（U+007F・U+0085）・Zl・Zp・各 Cf 範囲の両端。
-        let mut unsafe_chars = vec!['\u{007F}', '\u{0085}', '\u{2028}', '\u{2029}'];
+        // Cc（U+007F・U+0085）・Zl・Zp・U+2065・各 Cf 範囲の両端。
+        let mut unsafe_chars = vec!['\u{007F}', '\u{0085}', '\u{2028}', '\u{2029}', '\u{2065}'];
         for (lo, hi) in FORMAT_CHAR_RANGES {
             unsafe_chars.push(lo);
             unsafe_chars.push(hi);
@@ -393,12 +400,9 @@ mod tests {
             let e = OciRuntimeError::new(LifecycleOp::Create, ErrorCode::Internal, &input);
             assert_eq!(e.message(), "a b", "U+{:04X}", u32::from(c));
         }
-        let kept = "\u{00AC}\u{2065}\u{2070}\u{E0080}e\u{0301}é漢字 x";
+        let kept = "\u{00AC}\u{2070}\u{E0080}e\u{0301}é漢字 x";
         let e = OciRuntimeError::new(LifecycleOp::Create, ErrorCode::Internal, kept);
-        assert_eq!(
-            e.message(),
-            "\u{00AC}\u{2065}\u{2070}\u{E0080}e\u{0301}é漢字 x"
-        );
+        assert_eq!(e.message(), "\u{00AC}\u{2070}\u{E0080}e\u{0301}é漢字 x");
     }
 
     /// ERR-2: 走査は上限で止まる。無限の入力でも終了し、読み取るのは上限 + 1 文字まで。

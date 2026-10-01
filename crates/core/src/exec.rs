@@ -7,7 +7,7 @@
 //! （[`StagePipeline`]。#832・TASK-27.4.2。`exec/stages.rs`）まで実装済み。各段の実体
 //! のうち `PR_SET_NO_NEW_PRIVS` は組み込みの固定ステージとして実装済み（#833・TASK-27.4.3。
 //! `exec/no_new_privs.rs`）、capability 削減（#173）と seccomp（#178・TASK-38.3）も同様に組み込み済み。
-//! cgroup 参加・Landlock と制限適用の証跡は未実装で、後続の sub-issue（#137、TASK-32・37〜40）が追記する（REPAIR-3: 実装済みを装わない）。
+//! cgroup 参加は `cgroups::CgroupJoin`（TASK-32.4・#161）が `StageHook` として実装済み（登録は呼び出し側）。Landlock と制限適用の証跡は未実装で、後続の sub-issue（#137、TASK-39・40）が追記する（REPAIR-3: 実装済みを装わない）。
 //!
 //! # 目指すフロー（Linux 専用）
 //!
@@ -23,16 +23,16 @@
 //!    常に適用する。capability の絞り込み処理 `apply_default_capabilities`（crate 内限定。SEC-1・TASK-37.1・#172）
 //!    も #173（TASK-37.2）で同じく差し替え不可の組み込み段になった。seccomp の適用処理 `apply_default_seccomp`
 //!    （crate 内限定。CORE-5・TASK-38.2・#177）も #178（TASK-38.3）で同じく差し替え不可の組み込み段になり、
-//!    exec 直前に必ず適用される。Landlock・cgroup 参加と
+//!    exec 直前に必ず適用される。Landlock と
 //!    最終的な制限の証跡は未実装のため exec は
-//!    引き続き拒否される。他の段の実体は未実装で、後続の TASK-32・39・40 が [`StageHook`] として
+//!    引き続き拒否される。cgroup 参加は `cgroups::CgroupJoin` を呼び出し側が登録して使う。他の段の実体は未実装で、後続の TASK-39・40 が [`StageHook`] として
 //!    差し込む）。
 //!    `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
 //!    後続実装はこの順序を崩さない
 //! 5. `fork` / `exec`（#831・TASK-27.4.1。**最小構成のみ実装済み**。[`spawn_container`] が分離済みの
 //!    親から子を fork し、子が `establish` → [`prepare_rootfs`] → [`pivot_root`] →
 //!    [`exec_entrypoint`] を行う。上の第 3・4 段〔デバイスノード・ステージ列・`NO_NEW_PRIVS`〕のうち
-//!    Landlock・cgroup 参加が未実装のため**この最小構成は Landlock を適用できず、[`exec_entrypoint`] は
+//!    Landlock が未実装のため**この最小構成は Landlock を適用できず、[`exec_entrypoint`] は
 //!    制限の適用証跡が無い限り rootful・rootless を問わず `PermissionDenied` で exec を拒否する**
 //!    （SEC-1・CORE-5。fail-closed）。親子間の同期・構造化エラーパイプも未実装で、子の失敗は
 //!    終了コードと stderr で伝える〔TASK-29/30 で扱う〕）
@@ -423,6 +423,16 @@ impl ExecError {
             err.code,
             IsolationStage::UserNamespaceMap,
             format!("{}: {}", err.stage.as_str(), err.message),
+        )
+    }
+
+    /// cgroup 参加の失敗（`CgroupError`）を変換する。`code` を保持し、段は `CgroupJoin`、
+    /// message に失敗した `CgroupStep` を載せる（TASK-32.4。`stages.rs` の `CgroupJoin` 実装から呼ぶ）。
+    fn from_cgroup(err: crate::cgroups::CgroupError) -> Self {
+        Self::new(
+            err.code,
+            IsolationStage::CgroupJoin,
+            format!("{:?}: {}", err.step, err.message),
         )
     }
 
@@ -2628,6 +2638,20 @@ mod tests {
 
     /// CORE-6（TASK-40.2）: rootless の失敗は `code` を保ち、段は `UserNamespaceMap`、message に
     /// rootless 側の段名を含む。
+    #[test]
+    fn core3_task32_4_exec_error_from_cgroup_keeps_code_and_names_stage() {
+        use crate::cgroups::{CgroupError, CgroupStep};
+        let e = ExecError::from_cgroup(CgroupError {
+            code: ErrorCode::PermissionDenied,
+            step: CgroupStep::JoinContainer,
+            message: "denied".to_string(),
+        });
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert_eq!(e.stage, IsolationStage::CgroupJoin);
+        assert_eq!(e.message, "JoinContainer: denied");
+        assert!(e.violation.is_none());
+    }
+
     #[test]
     fn core6_exec_error_from_rootless_keeps_code_and_names_stage() {
         let e = ExecError::from_rootless(RootlessError {

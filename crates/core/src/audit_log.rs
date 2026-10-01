@@ -171,8 +171,9 @@ impl From<SyscallNr> for AuditSyscallNr {
 
 /// 監査対象のプロセス ID（`pid_t` の有効範囲 `1..=i32::MAX`）。
 ///
-/// 記録したプロセスの PID namespace から見た PID。ホスト側 PID との突き合わせは
-/// カーネル監査経路（#840）の担当。
+/// 記録したプロセス自身の PID namespace から見た PID。他の namespace（例: seccomp USER_NOTIF の
+/// listener 側 PID）の値は、呼び出し側が変換してから渡す契約（SEC-4。`seccomp_hook` 参照）。
+/// ホスト側 PID との突き合わせはカーネル監査経路（#840）の担当。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditPid(NonZeroU32);
 

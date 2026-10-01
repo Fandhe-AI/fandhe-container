@@ -68,11 +68,22 @@ impl SeccompDenialReport {
         })
     }
 
-    /// `seccomp_notif`（`pid`・`data.nr`・`data.arch`）の値から構築する。
+    /// `seccomp_notif`（`data.nr`・`data.arch`）と、違反プロセスの PID から構築する。
     ///
-    /// `pid` が 0 または `i32::MAX` 超なら `PidNotPositive`。
-    pub fn from_user_notif(pid: u32, nr: i32, arch: u32) -> Result<Self, AuditRecordError> {
-        let pid = i32::try_from(pid)
+    /// `seccomp_notif.pid` は **listener（受信側）の PID namespace** での PID であり、そのままでは
+    /// [`AuditPid`] の契約（記録対象プロセス自身の PID namespace から見た PID）を満たさない。
+    /// 呼び出し側（supervisor の USER_NOTIF listener）は、`/proc/<notif.pid>/status` の `NSpid` 等で
+    /// 違反プロセス自身の PID namespace での PID へ変換した値を `pid_in_process_ns` に渡すこと
+    /// （SIGSYS 経路の `from_sigsys` が渡す自 PID と同じ名前空間に揃う。変換の実装は listener 側
+    /// で後続作業。REPAIR-3）。`seccomp_notif.pid` を無変換で渡してはならない。
+    ///
+    /// `pid_in_process_ns` が 0 または `i32::MAX` 超なら `PidNotPositive`。
+    pub fn from_user_notif(
+        pid_in_process_ns: u32,
+        nr: i32,
+        arch: u32,
+    ) -> Result<Self, AuditRecordError> {
+        let pid = i32::try_from(pid_in_process_ns)
             .map_err(|_| AuditRecordError::new(AuditRecordErrorKind::PidNotPositive))
             .and_then(AuditPid::new)?;
         Ok(Self {

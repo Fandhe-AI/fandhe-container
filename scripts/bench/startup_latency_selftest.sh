@@ -127,6 +127,7 @@ cat >>"$stub" <<'STUB'
 #   running-race: start 後は running。実行中の delete を拒否し、kill 後も 2 回は拒否する
 #   never-stops: start 後は running のままで kill も効かない
 #   cleanup-hang: start 後は running のままで、delete・kill がいずれも応答しない（ハング）
+#   exec-hang-poll: start 後の state が 1.5 秒かけて created を返し、2 回目以降はハングする
 #   id-in-use: create 前から同じ ID のコンテナが存在する
 mode="${STUB_MODE:-ok}"
 cmd="$1"
@@ -223,6 +224,12 @@ case "$cmd" in
         if [ "$n" -le 2 ]; then state_json created; else state_json stopped; fi
         ;;
       exec-never) state_json created ;;
+      exec-hang-poll)
+        if [ -e "$m.polled" ]; then exec sleep 30; fi
+        touch "$m.polled"
+        sleep 1.5
+        state_json created
+        ;;
       exec-late)
         sleep 0.6
         if [ -e "$m.polled" ]; then state_json running; else touch "$m.polled"; state_json created; fi
@@ -532,6 +539,14 @@ STUB_MODE=exec-late expect_rc "exec-late" 1 --runtime "$stub" --bundle "$work/bu
 expect_contains "exec-late-error" "runtime-exec-not-observed"
 expect_eq "exec-late-stdout-empty" "" "$last_stdout"
 expect_eq "exec-late-state-count" "3" "$(grep -c '^state ' "$stub_log")"
+# 2 回目の照会がハングしても、観測期限（--timeout 3 秒）までの残り時間しか待たない（Codex P1。
+# REPAIR-5）。照会ごとに --timeout 秒を渡す実装では 1.5 + 3 秒を超える。
+reset_log
+observe_t0="${EPOCHREALTIME/./}"
+STUB_MODE=exec-hang-poll expect_rc "exec-hang-poll" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 3
+observe_ms=$(((${EPOCHREALTIME/./} - observe_t0) / 1000))
+if [ "$observe_ms" -lt 4000 ]; then pass "exec-hang-poll-bounded (${observe_ms}ms < 4000ms)"; else fail "exec-hang-poll-bounded (${observe_ms}ms)"; fi
+expect_contains "exec-hang-poll-error" "runtime-exec-not-observed"
 
 # --- 9. 前提ツール欠如: jq を含まない PATH で exit 3 ---
 mkdir -p "$work/emptybin"

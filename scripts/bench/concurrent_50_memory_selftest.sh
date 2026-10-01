@@ -516,6 +516,16 @@ expect_eq "resignal-exit143" 143 "$r"
 expect_eq "resignal-no-residual" 0 "$(alive_stub_count)"
 expect_eq "resignal-no-orphan-child" 0 "$(orphan_sleep_count)"
 
+# --- 12l. launcher を起動した直後・pid を登録する前にシグナルを受けても（selftest 専用フックで模擬）、
+#          その launcher を登録してから後始末へ進み、残さない（REPAIR-5） ---
+: >"$STUB_PIDFILE"
+FANDHE_CONCURRENT_MEMORY_SELFTEST=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_SIGNAL_IN_SPAWN=1 run_target --count 2 --trials 1 --timeout 5
+expect_eq "signal-in-spawn-exit143" 143 "$rc"
+expect_has "signal-in-spawn-stderr" "$errf" "interrupted: received signal (exit 143); running cleanup"
+expect_eq "signal-in-spawn-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "signal-in-spawn-no-residual" 0 "$(alive_stub_count)"
+expect_eq "signal-in-spawn-no-orphan-child" 0 "$(orphan_sleep_count)"
+
 # --- 13. 引数エラーは exit 2 ---
 expect_rc2() { # <名前> <引数...>
   local name="$1"; shift

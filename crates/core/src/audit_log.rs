@@ -187,7 +187,7 @@ pub struct AuditPath {
 impl AuditPath {
     /// 任意のパスから構築する（失敗しない）。
     ///
-    /// 上限以下ならそのまま保持する。超過時のみ lossy UTF-8 に変換した上で文字境界まで切り詰める
+    /// 上限以下ならそのまま保持する。超過時のみ先頭上限バイトを lossy UTF-8 に変換した上で文字境界まで切り詰める
     /// （非 UTF-8 バイトは U+FFFD に置換される）。保持バイト長は常に [`AUDIT_PATH_MAX_BYTES`] 以下。
     pub fn new<P: AsRef<Path> + ?Sized>(path: &P) -> Self {
         let path = path.as_ref();
@@ -198,7 +198,14 @@ impl AuditPath {
                 original_len,
             };
         }
-        let lossy = path.to_string_lossy();
+        // 先頭 AUDIT_PATH_MAX_BYTES バイトだけを lossy 変換する（入力全体に比例する確保を避ける。
+        // 非 UTF-8 バイトは 1 バイト→3 バイトに膨らむが、確保は上限の定数倍に収まる）。
+        let head = path
+            .as_os_str()
+            .as_encoded_bytes()
+            .get(..AUDIT_PATH_MAX_BYTES)
+            .unwrap_or_default();
+        let lossy = String::from_utf8_lossy(head);
         let mut end = AUDIT_PATH_MAX_BYTES.min(lossy.len());
         while end > 0 && !lossy.is_char_boundary(end) {
             end -= 1;
@@ -457,6 +464,19 @@ mod tests {
         let exact = AuditPath::new(&"a".repeat(AUDIT_PATH_MAX_BYTES));
         assert!(!exact.is_truncated());
         assert_eq!(exact.as_path().as_os_str().len(), AUDIT_PATH_MAX_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sec4_task41_1_path_truncates_non_utf8_within_limit() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = vec![0xffu8; AUDIT_PATH_MAX_BYTES * 4];
+        let p = AuditPath::new(OsStr::from_bytes(&bytes));
+        assert!(p.is_truncated());
+        assert_eq!(p.original_len(), AUDIT_PATH_MAX_BYTES * 4);
+        // U+FFFD（3 バイト）単位で境界まで切り詰められる。
+        assert_eq!(p.as_path().as_os_str().len(), 4095);
     }
 
     #[test]

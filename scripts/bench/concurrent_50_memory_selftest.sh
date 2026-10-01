@@ -19,6 +19,7 @@
 #   STUB_BIGWRITE=<パス接頭辞>: READY の前に、子プロセス（head）で 3 MiB（3145728 バイト）のファイルを
 #     <接頭辞>.<i> へ書く。書けなければ READY を出さずに終了する（launcher の子孫へのファイルサイズ
 #     制限の有無を照合する）
+#   STUB_TOUCH=<パス>: READY の前にそのパスへ `raced` と書く（計測中に出力先が作られる状況の模擬）
 #   STUB_NOISE_KIB=<N>: READY の前に N KiB を標準出力へ書く（ログ上限超過の模擬）
 #   STUB_MID=launcher|child（疑似 /proc 使用時のみ）: 1 番目のコンテナが「自分の集計が始まった瞬間」に
 #     launcher ごと（launcher）または子だけ（child）終了する。子の smaps_rollup を FIFO にして計測
@@ -132,6 +133,7 @@ fi
 if [ -n "${STUB_BIGWRITE:-}" ]; then
   head -c 3145728 /dev/zero >"${STUB_BIGWRITE}.${idx}" || { echo "stub: bigwrite failed" >&2; exit 9; }
 fi
+if [ -n "${STUB_TOUCH:-}" ]; then echo raced >"$STUB_TOUCH"; fi
 if [ -n "${STUB_NOISE_KIB:-}" ]; then
   head -c "$((STUB_NOISE_KIB * 1024))" /dev/zero | tr '\0' 'x'
   echo
@@ -282,6 +284,21 @@ expect_has "text-started" "$work/pub.txt" "started=3/3"
 expect_has "text-pss" "$work/pub.txt" "pss_median_kb=3300"
 expect_eq "text-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "no-leftover-tmp" 1 "$(find "$work" -maxdepth 1 -name 'pub.txt*' | wc -l)"
+
+# --- 4b. --output は新規ファイルに限る: 既存ファイルは計測前に拒否し、内容を変えない ---
+echo keep >"$work/existing.json"
+run_fake --count 2 --trials 1 --output "$work/existing.json"
+expect_eq "output-exists-exit2" 2 "$rc"
+expect_has "output-exists-stderr" "$errf" "output path already exists"
+expect_eq "output-exists-unchanged" keep "$(cat "$work/existing.json")"
+expect_eq "output-exists-no-residual" 0 "$(alive_stub_count)"
+# 計測中に同名のファイルが作られた場合も上書きしない（公開は ln -T。一時ファイルも残さない）
+STUB_TOUCH="$work/raced.json" run_fake --count 1 --trials 1 --output "$work/raced.json"
+expect_eq "output-raced-exit2" 2 "$rc"
+expect_has "output-raced-stderr" "$errf" "output-failed: cannot publish output"
+expect_eq "output-raced-unchanged" raced "$(cat "$work/raced.json")"
+expect_eq "output-raced-no-leftover-tmp" 1 "$(find "$work" -maxdepth 1 -name 'raced.json*' | wc -l)"
+expect_eq "output-raced-stdout-empty" 0 "$(wc -c <"$out")"
 
 # --- 5. 既定 --count は 50（実 /proc・疑似 /proc いずれでも 50/50 起動できる） ---
 run_fake --trials 1 --timeout 60
@@ -443,7 +460,11 @@ sig_pid=$!
 for _ in $(seq 1 50); do [ "$(wc -l <"$STUB_PIDFILE")" -lt 2 ] || break; sleep 0.2; done
 expect_eq "resignal-stubs-started" 2 "$(wc -l <"$STUB_PIDFILE")"
 kill -TERM "$sig_pid"
-for _ in $(seq 1 50); do ! grep -qF "interrupted" "$errf" || break; sleep 0.1; done
+# 1 回目のシグナルが処理され後始末が始まった（interrupted が出た）ことを確認してから再送する。
+for _ in $(seq 1 50); do
+  if grep -qF "interrupted" "$errf"; then break; fi
+  sleep 0.1
+done
 expect_has "resignal-first-signal-handled" "$errf" "interrupted: received signal (exit 143); running cleanup"
 kill -TERM "$sig_pid" 2>/dev/null || true
 sleep 0.3

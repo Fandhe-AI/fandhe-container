@@ -157,6 +157,10 @@ fn judge(expect: &Expectation, obs: &Observation) -> CaseVerdict {
             if obs.exit != ObservedExit::Signaled(sig) {
                 mismatches.push(Mismatch::UnexpectedExit { got: obs.exit });
             }
+            // 攻撃が成功（結果を記録）した後に別経路でシグナル終了した場合と区別する。
+            if let Some(got) = obs.outcome {
+                mismatches.push(Mismatch::UnexpectedOutcome { got });
+            }
         }
         None => {
             if obs.exit != ObservedExit::Exited(0) {
@@ -309,6 +313,19 @@ fn sec2_task42_1_judge_selftest() {
     assert_eq!(
         judge(&sig, &obs(ObservedExit::Signaled(31), None, &[])),
         CaseVerdict::Pass
+    );
+    assert_eq!(
+        judge(
+            &sig,
+            &obs(
+                ObservedExit::Signaled(31),
+                Some(AttackOutcome::Succeeded),
+                &[]
+            )
+        ),
+        CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
+            got: AttackOutcome::Succeeded
+        }])
     );
 }
 
@@ -627,6 +644,17 @@ mod linux {
             .expect("Seccomp line in /proc/self/status")
     }
 
+    /// パイプを別スレッドで上限付きに読み切り、結果を channel で返す（呼び出し側が期限付きで待つ）。
+    fn drain<R: std::io::Read + Send + 'static>(r: R) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = r.take(RECORD_MAX_BYTES as u64).read_to_string(&mut buf);
+            let _ = tx.send(buf);
+        });
+        rx
+    }
+
     /// 共通関数（ディスパッチャ側）: 1 ケースを「起動 → 攻撃 → 判定 → 後始末」で実行する。
     ///
     /// rootfs の作成・自身のシナリオ再起動・期限付き待機・出力回収を行い、rootfs は drop で削除する。
@@ -647,12 +675,17 @@ mod linux {
         let status = wait_deadline(&mut child, limit);
         let mut stdout = String::new();
         let mut stderr = String::new();
-        // 出力は小さく、子は既に終了（または kill 済み）のため読み出しはブロックしない。
-        if let Some(s) = child.stdout.take() {
-            let _ = s.take(RECORD_MAX_BYTES as u64).read_to_string(&mut stdout);
+        // 孫プロセスが fd を保持したまま残ると EOF が来ないため、読み出しは別スレッドで行い期限付きで待つ。
+        let readers = [
+            child.stdout.take().map(drain),
+            child.stderr.take().map(drain),
+        ];
+        let [out_rx, err_rx] = readers;
+        if let Some(rx) = out_rx {
+            stdout = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
         }
-        if let Some(s) = child.stderr.take() {
-            let _ = s.take(RECORD_MAX_BYTES as u64).read_to_string(&mut stderr);
+        if let Some(rx) = err_rx {
+            stderr = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
         }
         print!("{stdout}");
         match status {

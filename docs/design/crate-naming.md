@@ -115,7 +115,7 @@ D-14（`01-brainstorm.md`「設計上の論点」6）の推奨に合わせ、com
 
 - supervisor は 2 つ目の実装を持たず、core の既定実装を使う（supervisor → core の一方向依存）
 - `state.json` の形式と、supervisor が使う項目（`supervisor_pid`・`health`・`restart_count`）は core の型に含める
-- CLI と supervisor の書き込みの排他は TASK-157 で詰める
+- CLI と supervisor の書き込みの排他は core の既定実装内で完結する（TASK-157.9・#1069）。ストア全体の `@lock` に対する std `File::try_lock` を期限つき（`STATE_LOCK_TIMEOUT`。超過は `TIMEOUT`）で再試行して直列化し、同じ ID への同時 `update` は `expected_revision` による楽観的排他で後着が `FAILED_PRECONDITION` になる。追加依存なし。後着側の再試行方針は呼び出し側（supervisor・CLI）の責務
 - spec の TASK-157 の記述（現状 `crates/supervisor/src/state.rs` を `StateStore` トレイトの実装として記載）の修正は、spec リポジトリ側で行う
 
 ### 決定 7: `benches/` の置き場所
@@ -135,7 +135,7 @@ D-14（`01-brainstorm.md`「設計上の論点」6）の推奨に合わせ、com
   - TASK-107・108・110・112・123・124 の crate 名・成果物パス（`crates/plugin-api/` → `crates/plugin/`、crate 名 `fandhe-container-plugin-api` → `fandhe-container-plugin`）
   - TASK-151・152・153・154・156・182 の成果物パス（`crates/stack/` → `crates/compose-convert/`）
   - TASK-157 の `StateStore` 実装箇所の記述
-- TASK-157 で CLI と supervisor の `state.json` 書き込みの排他を詰める
+- CLI と supervisor の `state.json` 書き込みの排他は TASK-157.9（#1069）で決着済み（決定 6 を参照）
 - TASK-109（plugin 発見・登録の実装）は、決定 3 の判定対象 3 点（core ソース sha256・core 依存木・core バイナリ sha256）を踏まえて実装する
 - root の `benches/` を `fandhe-container-benches` crate として置く際、Cargo の bench 自動発見は crate 内の `benches/` を探すため、実際の配置は `benches/benches/*.rs` になるか `[[bench]] path` の明示指定が要る。#10・#11 の雛形作成時にこの点と、TASK-113（`benches/plugin_boundary.rs`）・TASK-88（`benches/baseline.json`）の成果物パスの解釈を確認する
 

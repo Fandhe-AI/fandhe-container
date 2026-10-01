@@ -1,4 +1,4 @@
-//! ファイルベース `StateStore` の結合試験（TASK-31.3・OCI-5・CRI-7）。
+//! ファイルベース `StateStore` の結合試験（TASK-31.3・OCI-5・CRI-7。TASK-157.9・SUP-1・REPAIR-5）。
 //!
 //! 公開 API（`FileStateStore`・`StateRoot`・`StateStore`）だけを crate の外から呼び、
 //! 別プロセスとの状態共有・ファイルロックによる排他・再起動（再 open）後の永続性・破損回復を
@@ -10,6 +10,10 @@
 //! 「対応プラットフォーム」）のため、ストアを使う試験は `linux` モジュールに置き、macOS / Windows では
 //! fail-closed の挙動（何も作らずに `Unimplemented`）を `oci5_open_is_unimplemented_outside_linux` で
 //! 照合する（CLI-1）。
+//!
+//! TASK-157.9（#1069）: CLI 役（親）と supervisor 役（子プロセス）が同じ ID の `state.json` へ同時に
+//! 書いても破損・lost update がないこと、別プロセスが `@lock` を保持している間の書き込みが期限で
+//! `TIMEOUT` になることを照合する。
 
 /// OCI-5・CLI-1: Linux 以外では状態ルートを作らずに `Unimplemented` を返す。
 #[cfg(not(target_os = "linux"))]
@@ -38,10 +42,13 @@ mod linux {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+    use fandhe_container_core::state_store::{
+        FileStateStore, LOCK_FILE_NAME, STATE_FILE_NAME, STATE_LOCK_TIMEOUT, StateRoot,
+    };
     use fandhe_container_core::traits::{
         ContainerId, ContainerStatus, CreateStateRequest, DeleteStateRequest, ErrorCode,
-        GetStateRequest, ListStateRequest, StateStore, UpdateStateRequest,
+        GetStateRequest, HealthStatus, ListStateRequest, StateStore, SupervisionState,
+        UpdateStateRequest,
     };
 
     const ROOT_ENV: &str = "FANDHE_STATE_IT_ROOT";
@@ -184,6 +191,247 @@ mod linux {
         // 子が更新した結果（creating）が親から見える。
         let rec = parent.get(&GetStateRequest::new(cid("c0-0"))).unwrap();
         assert_eq!(rec.status().state().as_str(), "creating");
+    }
+
+    const SAMEID_ROOT_ENV: &str = "FANDHE_STATE_IT_SAMEID_ROOT";
+    /// 子が準備完了（`@lock` 越しに開ける状態）を親へ知らせるマーカーのパス。
+    const SAMEID_READY_ENV: &str = "FANDHE_STATE_IT_SAMEID_READY";
+    /// 親が開始合図を出すマーカーのパス。子はこれが現れるまで更新を始めない。
+    const SAMEID_GO_ENV: &str = "FANDHE_STATE_IT_SAMEID_GO";
+    const SAMEID_CHILD_TEST: &str = "linux::child_supervisor_updates_same_id";
+    const HOLD_ROOT_ENV: &str = "FANDHE_STATE_IT_HOLD_ROOT";
+    const HOLD_READY_ENV: &str = "FANDHE_STATE_IT_HOLD_READY";
+    const HOLD_CHILD_TEST: &str = "linux::child_holds_state_lock";
+    /// 同一 ID への書き込み回数（親子それぞれ）。
+    const SAME_ID_WRITES: u32 = 30;
+    /// `FAILED_PRECONDITION`（後着負け）での取り直し再試行の上限（REPAIR-5: 無限ループにしない）。
+    const MAX_RETRIES_PER_WRITE: u32 = 1000;
+
+    fn spawn_worker(test: &str, envs: &[(&str, &Path)]) -> Child {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.spawn().unwrap()
+    }
+
+    /// 後着負け（`FAILED_PRECONDITION`）のときだけ `get` からやり直して 1 回書く。
+    /// 成功した revision と、後着負けで取り直した回数を返す。
+    fn write_with_retry(
+        store: &FileStateStore,
+        id: &ContainerId,
+        build: &dyn Fn(&fandhe_container_core::traits::StateRecord) -> UpdateStateRequest,
+    ) -> (u64, u32) {
+        for retries in 0..MAX_RETRIES_PER_WRITE {
+            let cur = store.get(&GetStateRequest::new(id.clone())).unwrap();
+            match store.update(&build(&cur)) {
+                Ok(rec) => return (rec.revision().value(), retries),
+                Err(e) if e.code() == ErrorCode::FailedPrecondition => continue,
+                Err(e) => panic!("unexpected update error: {e:?}"),
+            }
+        }
+        panic!("update kept losing the revision race");
+    }
+
+    /// マーカーファイルが現れるまで期限付きで待つ（REPAIR-5: 無限待ちにしない）。
+    fn wait_for_marker(path: &Path, what: &str) {
+        let deadline = Instant::now() + CHILD_DEADLINE;
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 子プロセス側（supervisor 役）。`SAMEID_ROOT_ENV` があるときだけ動く。
+    #[test]
+    fn child_supervisor_updates_same_id() {
+        let Some(root) = std::env::var_os(SAMEID_ROOT_ENV) else {
+            return;
+        };
+        let store = open(Path::new(&root));
+        let id = cid("web");
+        let pid = NonZeroU32::new(std::process::id()).unwrap();
+        // 準備完了を知らせ、親の開始合図まで待つ（親子の更新開始を揃えて競合を保証する）。
+        fs::write(std::env::var_os(SAMEID_READY_ENV).unwrap(), b"ready").unwrap();
+        let go = std::path::PathBuf::from(std::env::var_os(SAMEID_GO_ENV).unwrap());
+        wait_for_marker(&go, "go marker");
+        for i in 1..=SAME_ID_WRITES {
+            write_with_retry(&store, &id, &|cur| {
+                UpdateStateRequest::new(cur.status().clone(), cur.revision()).with_supervision(
+                    SupervisionState::new(Some(pid), Some(HealthStatus::Healthy), i),
+                )
+            });
+            // supervisor の監視ループ間隔を模して短く譲り、親の更新と時間的に重ねる。
+            std::thread::sleep(Duration::from_millis(3));
+        }
+    }
+
+    /// SUP-1・OCI-5・TASK-157.9: CLI 役（親）と supervisor 役（子プロセス）が同じ ID へ同時に書いても、
+    /// `@lock` で直列化され、部分書き込み・lost update・一時ファイルの残骸がない。
+    #[test]
+    fn sup1_task157_9_cli_and_supervisor_writes_to_same_id_are_serialized() {
+        let t = TmpDir::new("sameid");
+        let parent = open(t.path());
+        let id = cid("web");
+        parent.create(&create_req("web")).unwrap();
+        let marker_dir = TmpDir::new("sameid-marker");
+        let ready = marker_dir.path().join("ready");
+        let go = marker_dir.path().join("go");
+        let mut child = spawn_worker(
+            SAMEID_CHILD_TEST,
+            &[
+                (SAMEID_ROOT_ENV, t.path()),
+                (SAMEID_READY_ENV, &ready),
+                (SAMEID_GO_ENV, &go),
+            ],
+        );
+        // 子の準備完了を待ってから開始合図を出し、双方が同時に更新を始める。
+        let deadline = Instant::now() + CHILD_DEADLINE;
+        while !ready.exists() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not become ready within the deadline");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fs::write(&go, b"go").unwrap();
+        // CLI 役: supervision 未指定で status だけを往復させる（既存の supervision は引き継がれる）。
+        let mut last_status;
+        let mut observed = Vec::new();
+        let mut child_progress = Vec::new();
+        let write_deadline = Instant::now() + CHILD_DEADLINE;
+        // 最低 N 回、かつ子が N 回書き終えたと観測するまで書き続ける。親が子の開始前に終わって
+        // 直列実行になるのを防ぐ（子が進行中の値を親が観測できる = 同時書き込みの証拠）。
+        let mut i = 0u32;
+        loop {
+            let creating = i.is_multiple_of(2);
+            let (rev, _retries) = write_with_retry(&parent, &id, &|cur| {
+                let status = if creating {
+                    ContainerStatus::creating(cid("web"))
+                } else {
+                    ContainerStatus::created(cid("web"), None)
+                };
+                UpdateStateRequest::new(status, cur.revision())
+            });
+            last_status = if creating { "creating" } else { "created" };
+            observed.push(rev);
+            // 競合中も常に完全なレコードが読める。
+            let seen = parent.get(&GetStateRequest::new(id.clone())).unwrap();
+            assert_eq!(seen.id().as_str(), "web");
+            child_progress.push(seen.restart_count());
+            i += 1;
+            // ロック取得は期限付きのポーリングのため、親が連続して取り直すと子が割り込めない。
+            // 実際の CLI 操作間隔を模して短く譲り、双方が交互にロックを取れるようにする。
+            std::thread::sleep(Duration::from_millis(2));
+            if i >= SAME_ID_WRITES && seen.restart_count() >= SAME_ID_WRITES {
+                break;
+            }
+            assert!(
+                Instant::now() < write_deadline,
+                "child did not finish its writes in time: {child_progress:?}"
+            );
+        }
+        wait_with_deadline(child);
+        assert!(
+            observed.windows(2).all(|w| w[0] < w[1]),
+            "parent revisions must be strictly increasing: {observed:?}"
+        );
+        // 競合の発生を確認する: 親が更新を続けている最中に、子の進行が途中値（0 < n < N）で観測された。
+        // 親子の更新が時間的に重なっていなければ、同一 ID への同時書き込みを検証できていない。
+        assert!(
+            child_progress.iter().any(|&c| c > 0 && c < SAME_ID_WRITES),
+            "parent never observed the child mid-run (writes were serialized by timing): {child_progress:?}"
+        );
+        let fin = parent.get(&GetStateRequest::new(id.clone())).unwrap();
+        assert_eq!(fin.status().state().as_str(), last_status);
+        assert_eq!(fin.restart_count(), SAME_ID_WRITES);
+        assert_eq!(fin.health(), Some(HealthStatus::Healthy));
+        assert!(fin.supervisor_pid().is_some());
+        // create が revision 0、その後に親子の成功した更新が（親 observed.len() + 子 N）回（lost update なし）。
+        assert_eq!(
+            fin.revision().value(),
+            observed.len() as u64 + u64::from(SAME_ID_WRITES)
+        );
+        assert_eq!(parent.find_corrupted().unwrap(), Vec::<ContainerId>::new());
+        let entries: Vec<String> = fs::read_dir(t.path().join("web"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec![STATE_FILE_NAME.to_owned()]);
+        let raw = fs::read(t.path().join("web").join(STATE_FILE_NAME)).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(json["id"], "web");
+    }
+
+    /// 子プロセス側。`@lock` を保持して準備完了マーカーを書き、有限時間だけ寝て終了する。
+    #[test]
+    fn child_holds_state_lock() {
+        let Some(root) = std::env::var_os(HOLD_ROOT_ENV) else {
+            return;
+        };
+        let ready = std::env::var_os(HOLD_READY_ENV).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(Path::new(&root).join(LOCK_FILE_NAME))
+            .unwrap();
+        lock.lock().unwrap();
+        fs::write(&ready, b"ready").unwrap();
+        std::thread::sleep(STATE_LOCK_TIMEOUT + Duration::from_secs(3));
+        drop(lock);
+    }
+
+    /// REPAIR-5・TASK-157.9: 別プロセスが `@lock` を保持している間の書き込みは、期限で `TIMEOUT` になり、
+    /// 失敗した更新は反映されない。保持プロセスが終われば書ける。
+    #[test]
+    fn repair5_task157_9_lock_held_by_another_process_times_out() {
+        let t = TmpDir::new("holdlock");
+        let marker_dir = TmpDir::new("holdlock-marker");
+        let ready = marker_dir.path().join("ready");
+        let store = open(t.path());
+        let rec = store.create(&create_req("web")).unwrap();
+        let mut child = spawn_worker(
+            HOLD_CHILD_TEST,
+            &[(HOLD_ROOT_ENV, t.path()), (HOLD_READY_ENV, &ready)],
+        );
+        let deadline = Instant::now() + CHILD_DEADLINE;
+        while !ready.exists() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not take the lock within the deadline");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let started = Instant::now();
+        let e = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::creating(cid("web")),
+                rec.revision(),
+            ))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert_eq!(e.code().as_str(), "TIMEOUT");
+        assert_eq!(e.message(), "timed out waiting for the state lock");
+        assert!(elapsed >= STATE_LOCK_TIMEOUT, "{elapsed:?}");
+        assert!(elapsed < STATE_LOCK_TIMEOUT + Duration::from_secs(5));
+        // 保持側を終わらせると（OS がロックを解放）書ける。失敗した更新は反映されていない。
+        let _ = child.kill();
+        let _ = child.wait();
+        let cur = store.get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(cur, rec);
+        let next = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::creating(cid("web")),
+                rec.revision(),
+            ))
+            .unwrap();
+        assert_eq!(next.revision().value(), rec.revision().value() + 1);
     }
 
     /// OCI-5: ストアを閉じて開き直して（再起動相当）も状態が残り、削除済みの revision を再発行しない。

@@ -25,6 +25,11 @@
 //!
 //! - 5 メソッドはすべて「プロセス内 `Mutex` → `@lock` の `try_lock`（上限 [`STATE_LOCK_TIMEOUT`]、
 //!   超えたら `Timeout`。REPAIR-5）」を取ってから読み書きする
+//! - CLI と supervisor は別プロセスから同じ `state.json` を書く（常駐デーモンなし。CORE-1・
+//!   TASK-157.9・SUP-1）。排他は上記の `@lock` が担い、同じ ID への同時 `update` は直列化され、
+//!   後着は古い `expected_revision` のため `FAILED_PRECONDITION` になる（黙って上書きしない）。
+//!   後着側は `get` で最新の revision を取り直して再試行する（再試行の方針は呼び出し側の責務）。
+//!   ロックはストア全体で 1 つで、保持は 1 操作の間だけ。保持プロセスが死ねば OS が解放する
 //! - 既存のエントリ（`@lock`・`@revision`・`state.json`・fsync するディレクトリ）は
 //!   `O_NOFOLLOW | O_NONBLOCK` で開き（`open_nowait`）、開いた実体の種別を fstat で確かめる。
 //!   FIFO 等に置き換わっていても `open(2)` 自体が相手を待って止まらない（REPAIR-5）
@@ -110,7 +115,11 @@ const OCI_VERSION: &str = "1.2.0";
 /// `find_corrupted` が返す最大件数（無制限確保の防止）。
 pub const MAX_CORRUPTED_REPORT: usize = 256;
 
-const LOCK_FILE: &str = "@lock";
+/// ストア全体の排他に使うロックファイル名（状態ルート直下。TASK-157.9・OCI-5）。
+///
+/// 別プロセス（CLI・supervisor）が同じ状態ルートへ書く競合の試験が、保持側を再現するために
+/// 参照する。名前のみの公開で、ロックの取得・解放・検査を迂回する API ではない。
+pub const LOCK_FILE_NAME: &str = "@lock";
 const REVISION_FILE: &str = "@revision";
 /// `@revision` の初期化途中の一時ファイル名の接頭辞（新規ストア判定で無視する）。
 const REVISION_INIT_PREFIX: &str = "@revision.init-";
@@ -354,7 +363,7 @@ impl FileStateStore {
                 }
             }
         };
-        let path = self.root.join(LOCK_FILE);
+        let path = self.root.join(LOCK_FILE_NAME);
         reject_symlink(&path)?;
         let mut opts = OpenOptions::new();
         opts.create(true).truncate(false).write(true);
@@ -371,28 +380,11 @@ impl FileStateStore {
         if !file.metadata().is_ok_and(|m| m.is_file()) {
             return Err(internal("state lock file is not a regular file"));
         }
-        loop {
-            match file.try_lock() {
-                Ok(()) => {
-                    return Ok(StoreGuard {
-                        process,
-                        _file: file,
-                    });
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    if Instant::now() >= deadline {
-                        return Err(err(
-                            ErrorCode::Timeout,
-                            "timed out waiting for the state lock",
-                        ));
-                    }
-                    std::thread::sleep(LOCK_RETRY_INTERVAL);
-                }
-                Err(std::fs::TryLockError::Error(_)) => {
-                    return Err(internal("failed to lock the state store"));
-                }
-            }
-        }
+        lock_file_until(&file, deadline)?;
+        Ok(StoreGuard {
+            process,
+            _file: file,
+        })
     }
 
     fn record_dir(&self, id: &ContainerId) -> PathBuf {
@@ -1350,6 +1342,32 @@ impl StateDto {
     }
 }
 
+/// 期限つきでファイルの排他ロックを取る（REPAIR-5）。
+///
+/// `FileStateStore::lock` から呼ばれ、`@lock` を別プロセス（CLI・supervisor。TASK-157.9・SUP-1）が
+/// 保持している間は 5ms 間隔で再試行し、`deadline` を過ぎたら `Timeout` で失敗する（無期限に待たない）。
+/// std の `File::try_lock` のみを使うため追加依存なしで 3 OS で動く。ロックは `file` を閉じると解放され、
+/// 保持プロセスが死んでも OS が解放する。
+fn lock_file_until(file: &File, deadline: Instant) -> Result<(), TraitError> {
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(err(
+                        ErrorCode::Timeout,
+                        "timed out waiting for the state lock",
+                    ));
+                }
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+            Err(std::fs::TryLockError::Error(_)) => {
+                return Err(internal("failed to lock the state store"));
+            }
+        }
+    }
+}
+
 /// 3 OS 共通の試験（状態ルートの解決規則と、Linux 以外での fail-closed。OCI-5・CLI-1）。
 #[cfg(test)]
 mod platform_tests {
@@ -1357,6 +1375,65 @@ mod platform_tests {
 
     fn code<T: std::fmt::Debug>(r: Result<T, TraitError>) -> &'static str {
         r.unwrap_err().code().as_str()
+    }
+
+    fn scratch_lock_file(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-state-lockfile-{tag}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join(LOCK_FILE_NAME)
+    }
+
+    fn open_lock(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap()
+    }
+
+    /// REPAIR-5・TASK-157.9: 別の記述子が保持するロックは期限で打ち切り、`Timeout` で失敗する（3 OS）。
+    #[test]
+    fn repair5_task157_9_lock_file_until_times_out_when_held() {
+        let path = scratch_lock_file("timeout");
+        let holder = open_lock(&path);
+        holder.try_lock().unwrap();
+        let waiter = open_lock(&path);
+        let started = Instant::now();
+        let e = lock_file_until(&waiter, started + Duration::from_millis(200)).unwrap_err();
+        assert_eq!(e.code().as_str(), "TIMEOUT");
+        assert_eq!(e.message(), "timed out waiting for the state lock");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        drop(holder);
+        drop(waiter);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// TASK-157.9: 保持側が解放すれば（即時でも期限内の遅延でも）取得できる（3 OS）。
+    #[test]
+    fn repair5_task157_9_lock_file_until_acquires_after_release() {
+        let path = scratch_lock_file("acquire");
+        let holder = open_lock(&path);
+        holder.try_lock().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(holder);
+        });
+        let waiter = open_lock(&path);
+        lock_file_until(&waiter, Instant::now() + Duration::from_secs(5)).unwrap();
+        releaser.join().unwrap();
+        drop(waiter);
+        // 解放済みなら即座に取れる。
+        let again = open_lock(&path);
+        lock_file_until(&again, Instant::now() + Duration::from_secs(1)).unwrap();
+        drop(again);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -2550,7 +2627,7 @@ mod tests {
         fs::remove_file(&rev).unwrap();
         fs::write(&rev, saved).unwrap();
         // @lock が FIFO（読み手なし）: 期限判定の前に open で止まらず、Timeout ではなく即座に失敗する。
-        let lock = t.path().join(LOCK_FILE);
+        let lock = t.path().join(LOCK_FILE_NAME);
         fs::remove_file(&lock).unwrap();
         mkfifo(&lock);
         let s = Arc::clone(&store);
@@ -2601,13 +2678,43 @@ mod tests {
         assert!(started.elapsed() < STATE_LOCK_TIMEOUT + Duration::from_secs(5));
     }
 
+    /// REPAIR-5・TASK-157.9: `@lock` を別の記述子（別プロセスの保持相当）が持つ間、書き込みは期限で
+    /// `Timeout` になり、失敗した書き込みは痕跡を残さない。
+    #[test]
+    fn oci5_task157_9_file_lock_wait_times_out() {
+        let t = TmpDir::new("filelock-timeout");
+        let store = t.open();
+        let rec = create(&store, "a");
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(t.path().join(LOCK_FILE_NAME))
+            .unwrap();
+        holder.lock().unwrap();
+        let started = Instant::now();
+        let e = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::creating(cid("a")),
+                rec.revision(),
+            ))
+            .unwrap_err();
+        assert_eq!(e.code().as_str(), "TIMEOUT");
+        assert_eq!(e.message(), "timed out waiting for the state lock");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= STATE_LOCK_TIMEOUT, "{elapsed:?}");
+        assert!(elapsed < STATE_LOCK_TIMEOUT + Duration::from_secs(5));
+        drop(holder);
+        let got = store.get(&GetStateRequest::new(cid("a"))).unwrap();
+        assert_eq!(got, rec);
+    }
+
     #[test]
     fn oci5_lock_file_is_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
         let t = TmpDir::new("lockmode");
         let store = t.open();
         create(&store, "a");
-        let mode = fs::metadata(t.path().join(LOCK_FILE))
+        let mode = fs::metadata(t.path().join(LOCK_FILE_NAME))
             .unwrap()
             .permissions()
             .mode();

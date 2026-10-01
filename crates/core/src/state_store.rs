@@ -81,9 +81,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::traits::{
     CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, CreateStateRequest,
-    DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, ListStateRequest,
-    StateList, StateListCursor, StateRecord, StateRevision, StateStore, TraitError,
-    UpdateStateRequest,
+    DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, HealthStatus,
+    ListStateRequest, StateList, StateListCursor, StateRecord, StateRevision, StateStore,
+    SupervisionState, TraitError, UpdateStateRequest,
 };
 
 /// 各コンテナの状態ファイル名（OCI-5）。
@@ -737,6 +737,10 @@ impl StateStore for FileStateStore {
         if let Some(scope) = req.cgroup_scope() {
             record = record.with_cgroup(CgroupPlacement::new(scope.clone(), revision));
         }
+        // 監視状態は指定があればその値、なければ既定値（トレイト契約 9。SUP-1・TASK-157.2）。
+        if let Some(sup) = req.supervision() {
+            record = record.with_supervision(sup);
+        }
         self.write_record(&record)?;
         Ok(record)
     }
@@ -763,6 +767,9 @@ impl StateStore for FileStateStore {
         if let Some(cgroup) = existing.cgroup() {
             record = record.with_cgroup(cgroup.clone());
         }
+        // 監視状態は指定があれば置き換え、なければ引き継ぐ（トレイト契約 9。CLI 側の status 更新で
+        // supervisor の項目を消さないため。SUP-1・TASK-157.2）。
+        record = record.with_supervision(req.supervision().unwrap_or(existing.supervision()));
         self.write_record(&record)?;
         Ok(record)
     }
@@ -1229,6 +1236,13 @@ fn open_nowait(path: &Path, opts: &mut OpenOptions) -> std::io::Result<File> {
 /// 本番経路で cgroup を作らない（`cgroups::DelegatedCgroup::prepare` は起動フローに未結線）ため、
 /// フィールドの無いレコードに対応する cgroup は存在せず、「cgroup を作っていない」（delete は cgroup に
 /// 触れない）と読むのが正しい。
+///
+/// `supervisorPid`・`health`・`restartCount`（TASK-157.2・SUP-1。supervisor が使う項目）は
+/// [`SupervisionState`] に対応する。`supervisorPid` と `health` は `None` なら書かず、`restartCount` は
+/// 常に書く。`supervisorPid` が 0・`health` が `starting` / `healthy` / `unhealthy` 以外の文字列の場合は
+/// 破損（`Internal`）とする（型不一致・負値・`u32` 超過は JSON 復号の失敗として同じく破損扱い）。
+/// 3 つとも持たない既存の `state.json`（導入前の版が書いたもの）は PID なし・未設定・0 回として読む
+/// （導入前は supervisor がこれらを書いていないため、破損にしない）。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StateDto {
@@ -1245,6 +1259,12 @@ struct StateDto {
     cgroup_scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cgroup_instance: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervisor_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    health: Option<String>,
+    #[serde(default)]
+    restart_count: u32,
 }
 
 impl StateDto {
@@ -1261,6 +1281,9 @@ impl StateDto {
             exit_code: status.exit_code(),
             cgroup_scope: record.cgroup().map(|c| c.scope().as_str().to_owned()),
             cgroup_instance: record.cgroup().map(|c| c.instance().value()),
+            supervisor_pid: record.supervisor_pid().map(NonZeroU32::get),
+            health: record.health().map(|h| h.as_str().to_owned()),
+            restart_count: record.restart_count(),
         })
     }
 
@@ -1301,12 +1324,25 @@ impl StateDto {
             }
             _ => return Err(corrupted()),
         };
+        let supervisor_pid = match self.supervisor_pid {
+            Some(p) => Some(NonZeroU32::new(p).ok_or_else(corrupted)?),
+            None => None,
+        };
+        let health = match self.health.as_deref() {
+            Some(h) => Some(HealthStatus::parse(h).ok_or_else(corrupted)?),
+            None => None,
+        };
         let record = StateRecord::new(
             status,
             PathBuf::from(self.bundle),
             StateRevision::from_raw(self.revision),
         )
-        .map_err(|_| corrupted())?;
+        .map_err(|_| corrupted())?
+        .with_supervision(SupervisionState::new(
+            supervisor_pid,
+            health,
+            self.restart_count,
+        ));
         Ok(match cgroup {
             Some(c) => record.with_cgroup(c),
             None => record,
@@ -1650,6 +1686,145 @@ mod tests {
                 .map(|c| (c.scope().as_str(), c.instance().value())),
             Some(("/", 10))
         );
+    }
+
+    fn sup(pid: u32, health: Option<HealthStatus>, count: u32) -> SupervisionState {
+        SupervisionState::new(NonZeroU32::new(pid), health, count)
+    }
+
+    fn read_json(t: &TmpDir, id: &str) -> serde_json::Value {
+        let text = fs::read_to_string(t.path().join(id).join("state.json")).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// SUP-1・TASK-157.2: create で指定した監視状態が `state.json` に書かれ、update で置き換え・
+    /// 未指定で引き継ぎ、別インスタンスの get・list でも同じ値が復元される。
+    #[test]
+    fn sup1_task157_2_supervision_is_persisted_and_round_trips() {
+        let t = TmpDir::new("sup");
+        let store = t.open();
+        let first = sup(4242, Some(HealthStatus::Starting), 0);
+        let req = CreateStateRequest::new(ContainerStatus::created(cid("web"), None), bundle())
+            .unwrap()
+            .with_supervision(first);
+        let rec = store.create(&req).unwrap();
+        assert_eq!(rec.supervision(), first);
+        let v = read_json(&t, "web");
+        assert_eq!(v["supervisorPid"], serde_json::json!(4242));
+        assert_eq!(v["health"], serde_json::json!("starting"));
+        assert_eq!(v["restartCount"], serde_json::json!(0));
+
+        let second = sup(4243, Some(HealthStatus::Unhealthy), 7);
+        let status = ContainerStatus::running(cid("web"), NonZeroU32::new(100));
+        let updated = store
+            .update(&UpdateStateRequest::new(status, rec.revision()).with_supervision(second))
+            .unwrap();
+        assert_eq!(updated.supervision(), second);
+        let reopened = t.open();
+        let got = reopened.get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(got.supervision(), second);
+        assert_eq!(got.supervisor_pid(), NonZeroU32::new(4243));
+        assert_eq!(got.health(), Some(HealthStatus::Unhealthy));
+        assert_eq!(got.restart_count(), 7);
+
+        // supervision 指定なしの update は既存の値を引き継ぐ。
+        let status = ContainerStatus::stopped(cid("web"), Some(0));
+        let kept = store
+            .update(&UpdateStateRequest::new(status, got.revision()))
+            .unwrap();
+        assert_eq!(kept.supervision(), second);
+        let listed = t.open().list(&list_req(10)).unwrap();
+        assert_eq!(listed.records().len(), 1);
+        assert_eq!(listed.records()[0].supervision(), second);
+    }
+
+    /// SUP-1・TASK-157.2: health の全値・PID の有無・restart_count の境界値が往復し、None のキーは書かない。
+    #[test]
+    fn sup1_task157_2_all_health_values_round_trip() {
+        let t = TmpDir::new("suphealth");
+        let store = t.open();
+        let cases = [
+            ("a", sup(0, None, 0)),
+            ("b", sup(1, Some(HealthStatus::Starting), 1)),
+            ("c", sup(2, Some(HealthStatus::Healthy), 2)),
+            ("d", sup(u32::MAX, Some(HealthStatus::Unhealthy), u32::MAX)),
+            ("e", sup(0, Some(HealthStatus::Healthy), 0)),
+        ];
+        for (id, state) in cases {
+            let req = CreateStateRequest::new(ContainerStatus::created(cid(id), None), bundle())
+                .unwrap()
+                .with_supervision(state);
+            store.create(&req).unwrap();
+            let got = t.open().get(&GetStateRequest::new(cid(id))).unwrap();
+            assert_eq!(got.supervision(), state, "{id}");
+        }
+        let v = read_json(&t, "a");
+        assert!(v.get("supervisorPid").is_none());
+        assert!(v.get("health").is_none());
+        assert_eq!(v["restartCount"], serde_json::json!(0));
+        assert_eq!(
+            read_json(&t, "d")["restartCount"],
+            serde_json::json!(u32::MAX)
+        );
+    }
+
+    /// SUP-1・TASK-157.2: 3 項目を持たない既存の `state.json` は既定値で読め、破損にならず delete できる。
+    #[test]
+    fn sup1_task157_2_legacy_state_without_supervision_reads_as_default() {
+        let t = TmpDir::new("suplegacy");
+        let store = t.open();
+        let rec = create(&store, "old");
+        let legacy = format!(
+            r#"{{"ociVersion":"1.2.0","id":"old","status":"stopped","bundle":"{}","revision":{}}}"#,
+            bundle().to_str().unwrap(),
+            rec.revision().value()
+        );
+        fs::write(t.path().join("old").join("state.json"), legacy).unwrap();
+        let got = store.get(&GetStateRequest::new(cid("old"))).unwrap();
+        assert_eq!(got.supervision(), sup(0, None, 0));
+        assert_eq!(got.supervisor_pid(), None);
+        assert_eq!(got.health(), None);
+        assert_eq!(got.restart_count(), 0);
+        assert!(store.find_corrupted().unwrap().is_empty());
+        store
+            .delete(&DeleteStateRequest::new(cid("old"), got.revision()))
+            .unwrap();
+        assert!(!t.path().join("old").exists());
+    }
+
+    /// SUP-1・TASK-157.2: 不正な監視状態（PID 0・負値・型違い・未知の health・範囲外の回数）は破損として
+    /// `Internal` になり、`find_corrupted` / `purge_corrupted` で回復できる。
+    #[test]
+    fn sup1_task157_2_invalid_supervision_is_corrupted_and_purgeable() {
+        let t = TmpDir::new("supbad");
+        let store = t.open();
+        let bad = [
+            ("a", r#""supervisorPid":0"#),
+            ("b", r#""supervisorPid":-1"#),
+            ("c", r#""supervisorPid":"1""#),
+            ("d", r#""health":"ok""#),
+            ("e", r#""health":1"#),
+            ("f", r#""restartCount":-1"#),
+            ("g", r#""restartCount":4294967296"#),
+            ("h", r#""restartCount":"1""#),
+        ];
+        let ids: Vec<&str> = bad.iter().map(|(id, _)| *id).collect();
+        for (id, fields) in bad {
+            create(&store, id);
+            let body = format!(
+                r#"{{"ociVersion":"1.2.0","id":"{id}","status":"stopped","bundle":"/b","revision":10,{fields}}}"#
+            );
+            fs::write(t.path().join(id).join("state.json"), body).unwrap();
+            let e = store.get(&GetStateRequest::new(cid(id))).unwrap_err();
+            assert_eq!(e.code().as_str(), "INTERNAL", "{id}");
+        }
+        assert_eq!(code(store.list(&list_req(10))), "INTERNAL");
+        let found = store.find_corrupted().unwrap();
+        assert_eq!(found, ids.iter().map(|id| cid(id)).collect::<Vec<_>>());
+        for id in ids {
+            store.purge_corrupted(&cid(id)).unwrap();
+        }
+        assert!(store.list(&list_req(10)).unwrap().records().is_empty());
     }
 
     #[test]

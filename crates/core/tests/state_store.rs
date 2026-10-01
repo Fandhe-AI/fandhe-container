@@ -250,7 +250,8 @@ mod linux {
                 "id": id,
                 "status": "created",
                 "bundle": bundle_str,
-                "revision": 0
+                "revision": 0,
+                "restartCount": 0
             })
         );
         assert_record_layout(root, id);
@@ -270,7 +271,8 @@ mod linux {
             "status": "running",
             "pid": 101,
             "bundle": bundle_str,
-            "revision": 2
+            "revision": 2,
+            "restartCount": 0
         });
         assert_eq!(read_state_json(root, id), running_json);
         assert_record_layout(root, id);
@@ -311,6 +313,7 @@ mod linux {
                 "status": "stopped",
                 "bundle": bundle_str,
                 "revision": 3,
+                "restartCount": 0,
                 "exitCode": 137
             })
         );
@@ -350,7 +353,8 @@ mod linux {
                 "id": id,
                 "status": "created",
                 "bundle": bundle_str,
-                "revision": 4
+                "revision": 4,
+                "restartCount": 0
             })
         );
         assert_record_layout(root, id);

@@ -36,6 +36,13 @@
 //!    返す。plugin 実装も同じく往復させる（落とすと delete が cgroup の削除を飛ばし、cgroup がリークする）。
 //!    revision の再利用禁止（[`StateStore::create`]）により instance も再利用されず、instance を含む
 //!    cgroup 名（`fc-<id>@<instance>`）は同じ ID の削除・再作成をまたいでも重ならない
+//! 9. [`StateRecord::supervision`]（`supervisor_pid`・`health`・`restart_count`。supervisor〔TASK-157〕が
+//!    使う項目。SUP-1）は、`create` で [`CreateStateRequest::with_supervision`] の指定があればその値、
+//!    なければ既定値（PID なし・healthcheck 未設定・再起動 0 回）で記録する。`update` は
+//!    [`UpdateStateRequest::with_supervision`] の指定があれば置き換え、なければ既存の値を引き継ぐ
+//!    （CLI 側の status 更新で supervisor の項目を消さないため）。`get` / `list` で返す。plugin 実装も
+//!    同じく往復させる。3 項目の相互関係や `status` との制約は本トレイトでは課さない（監視ループの仕様は
+//!    supervisor 側のタスクで決める）
 //!
 //! メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 //! `ContainerRuntime`（TASK-4.1）と同じく dyn 互換（object safety）を保つ。
@@ -250,12 +257,95 @@ impl CgroupPlacement {
     }
 }
 
+/// healthcheck の結果（supervisor〔TASK-157〕が使う。SUP-1・SUP-4）。
+///
+/// 未知の値を表現できない enum で、STACK-2 の `depends_on` の `healthy` 条件が参照する文字列と
+/// 対応する（[`Self::as_str`]）。healthcheck が未設定なら [`StateRecord::health`] は `None`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum HealthStatus {
+    /// 起動直後でまだ判定が出ていない（supervisor が使う。SUP-1・SUP-4）。
+    Starting,
+    /// healthcheck が成功している（supervisor が使う。SUP-1・SUP-4）。
+    Healthy,
+    /// healthcheck が失敗している（supervisor が使う。SUP-1・SUP-4）。
+    Unhealthy,
+}
+
+impl HealthStatus {
+    /// 状態ファイル・ログで使う固定の文字列表現を返す。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Healthy => "healthy",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
+
+    /// [`Self::as_str`] の逆変換。未知の文字列（大文字小文字違いを含む）は `None`。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "starting" => Some(Self::Starting),
+            "healthy" => Some(Self::Healthy),
+            "unhealthy" => Some(Self::Unhealthy),
+            _ => None,
+        }
+    }
+}
+
+/// supervisor（TASK-157）が使う監視状態の 3 項目（`supervisor_pid`・`health`・`restart_count`。SUP-1）。
+///
+/// [`StateRecord`] への設定・取得と、[`CreateStateRequest`] / [`UpdateStateRequest`] での受け渡しに使う。
+/// `Default` は PID なし・healthcheck 未設定・再起動 0 回。3 項目間や `status` との制約は課さない
+/// （監視ループの仕様は supervisor 側のタスクで決める）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SupervisionState {
+    supervisor_pid: Option<NonZeroU32>,
+    health: Option<HealthStatus>,
+    restart_count: u32,
+}
+
+impl SupervisionState {
+    /// 3 項目から作る。PID 0・負の再起動回数・未知の health は型で表現できない。
+    pub fn new(
+        supervisor_pid: Option<NonZeroU32>,
+        health: Option<HealthStatus>,
+        restart_count: u32,
+    ) -> Self {
+        Self {
+            supervisor_pid,
+            health,
+            restart_count,
+        }
+    }
+
+    /// 監視プロセス（supervisor）の PID。supervisor（TASK-157）が使う（SUP-1）。
+    ///
+    /// `None` は監視プロセスが付いていない（未起動・孤児化）。記録値であり PID は再利用され得るため、
+    /// この値をそのままシグナル送信先・権限判断に使ってはならない（使う側で生存・同一性を検証する。
+    /// SUP-5・SUP-8）。
+    pub fn supervisor_pid(&self) -> Option<NonZeroU32> {
+        self.supervisor_pid
+    }
+
+    /// healthcheck の結果。supervisor（TASK-157）が使う（SUP-1・SUP-4）。`None` は healthcheck 未設定。
+    pub fn health(&self) -> Option<HealthStatus> {
+        self.health
+    }
+
+    /// 再起動回数。supervisor（TASK-157）が使う（SUP-1）。既定は 0。
+    pub fn restart_count(&self) -> u32 {
+        self.restart_count
+    }
+}
+
 /// コンテナ状態のレコード（[`StateStore`] が保持・返却する単位）。
 ///
 /// 真偽値やフラットな文字列ではなく、将来の拡張に備えて構造化された型にする
-/// （coding-rust.md）。supervisor が使う項目（`supervisor_pid`・`health`・
-/// `restart_count`。crate-naming.md 決定 6・TASK-157）や Pod サンドボックス状態
-/// （CRI 系）は、`#[non_exhaustive]` のもとで後続タスクが追加する想定。
+/// （coding-rust.md）。supervisor が使う項目（`supervisor_pid`・`health`・`restart_count`。
+/// crate-naming.md 決定 6・TASK-157.2・SUP-1）は [`SupervisionState`] として追加済み。Pod サンドボックス状態
+/// （CRI 系）は未追加で、`#[non_exhaustive]` のもとで後続タスクが追加する想定（REPAIR-3）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StateRecord {
@@ -263,6 +353,12 @@ pub struct StateRecord {
     bundle: PathBuf,
     revision: StateRevision,
     cgroup: Option<CgroupPlacement>,
+    /// 監視プロセスの PID。supervisor（TASK-157）が使う（SUP-1）。記録値で、PID 再利用があり得る。
+    supervisor_pid: Option<NonZeroU32>,
+    /// healthcheck の結果。supervisor（TASK-157）が使う（SUP-1・SUP-4）。`None` は未設定。
+    health: Option<HealthStatus>,
+    /// 再起動回数。supervisor（TASK-157）が使う（SUP-1）。
+    restart_count: u32,
 }
 
 impl StateRecord {
@@ -287,7 +383,20 @@ impl StateRecord {
             bundle,
             revision,
             cgroup: None,
+            supervisor_pid: None,
+            health: None,
+            restart_count: 0,
         })
+    }
+
+    /// 監視状態（`supervisor_pid`・`health`・`restart_count`）を設定する（[`Self::supervision`]）。
+    /// ストア実装が create・update・読み込みで使う。
+    #[must_use]
+    pub fn with_supervision(mut self, supervision: SupervisionState) -> Self {
+        self.supervisor_pid = supervision.supervisor_pid();
+        self.health = supervision.health();
+        self.restart_count = supervision.restart_count();
+        self
     }
 
     /// コンテナ用 cgroup の配置を設定する（[`Self::cgroup`]）。ストア実装が create・読み込みで使う。
@@ -327,6 +436,29 @@ impl StateRecord {
     pub fn cgroup(&self) -> Option<&CgroupPlacement> {
         self.cgroup.as_ref()
     }
+
+    /// 監視プロセスの PID を返す。supervisor（TASK-157）が使う（SUP-1）。
+    ///
+    /// 記録値であり PID は再利用され得るため、そのままシグナル送信先・権限判断に使わない
+    /// （[`SupervisionState::supervisor_pid`]）。
+    pub fn supervisor_pid(&self) -> Option<NonZeroU32> {
+        self.supervisor_pid
+    }
+
+    /// healthcheck の結果を返す。supervisor（TASK-157）が使う（SUP-1・SUP-4）。`None` は未設定。
+    pub fn health(&self) -> Option<HealthStatus> {
+        self.health
+    }
+
+    /// 再起動回数を返す。supervisor（TASK-157）が使う（SUP-1）。
+    pub fn restart_count(&self) -> u32 {
+        self.restart_count
+    }
+
+    /// 監視状態の 3 項目をまとめて返す（SUP-1・TASK-157）。
+    pub fn supervision(&self) -> SupervisionState {
+        SupervisionState::new(self.supervisor_pid, self.health, self.restart_count)
+    }
 }
 
 /// [`StateStore::create`] の要求。
@@ -339,6 +471,7 @@ pub struct CreateStateRequest {
     status: ContainerStatus,
     bundle: PathBuf,
     cgroup_scope: Option<CgroupScope>,
+    supervision: Option<SupervisionState>,
 }
 
 impl CreateStateRequest {
@@ -356,7 +489,20 @@ impl CreateStateRequest {
             status,
             bundle,
             cgroup_scope: None,
+            supervision: None,
         })
+    }
+
+    /// 記録する監視状態を指定する（supervisor〔TASK-157〕が使う。SUP-1。契約 9）。未指定なら既定値で作る。
+    #[must_use]
+    pub fn with_supervision(mut self, supervision: SupervisionState) -> Self {
+        self.supervision = Some(supervision);
+        self
+    }
+
+    /// 指定された監視状態を返す（未指定なら `None`）。
+    pub fn supervision(&self) -> Option<SupervisionState> {
+        self.supervision
     }
 
     /// コンテナ用 cgroup を作る委譲スコープを記録する（[`StateRecord::cgroup`]）。
@@ -398,6 +544,7 @@ impl CreateStateRequest {
 pub struct UpdateStateRequest {
     status: ContainerStatus,
     expected_revision: StateRevision,
+    supervision: Option<SupervisionState>,
 }
 
 impl UpdateStateRequest {
@@ -406,7 +553,21 @@ impl UpdateStateRequest {
         Self {
             status,
             expected_revision,
+            supervision: None,
         }
+    }
+
+    /// 更新後の監視状態を指定する（supervisor〔TASK-157〕が使う。SUP-1。契約 9）。
+    /// 未指定の update は既存の値を引き継ぐ。
+    #[must_use]
+    pub fn with_supervision(mut self, supervision: SupervisionState) -> Self {
+        self.supervision = Some(supervision);
+        self
+    }
+
+    /// 指定された監視状態を返す（未指定なら `None`。その場合は既存の値を引き継ぐ）。
+    pub fn supervision(&self) -> Option<SupervisionState> {
+        self.supervision
     }
 
     /// 対象コンテナの ID を返す（`status().id()` への委譲）。
@@ -687,6 +848,10 @@ mod tests {
             if let Some(scope) = req.cgroup_scope() {
                 record = record.with_cgroup(CgroupPlacement::new(scope.clone(), revision));
             }
+            // 契約 9: 監視状態は指定があればその値、なければ既定値。
+            if let Some(sup) = req.supervision() {
+                record = record.with_supervision(sup);
+            }
             records.insert(req.id().clone(), record.clone());
             Ok(record)
         }
@@ -709,6 +874,8 @@ mod tests {
             if let Some(cgroup) = current.cgroup() {
                 updated = updated.with_cgroup(cgroup.clone());
             }
+            // 契約 9: 監視状態は指定があれば置き換え、なければ引き継ぐ。
+            updated = updated.with_supervision(req.supervision().unwrap_or(current.supervision()));
             records.insert(req.id().clone(), updated.clone());
             Ok(updated)
         }
@@ -1042,6 +1209,85 @@ mod tests {
         .expect_err("relative path must be rejected");
         assert_eq!(err2.code().as_str(), "INVALID_ARGUMENT");
         assert!(StateRecord::new(status, sample_bundle(), StateRevision::INITIAL).is_ok());
+    }
+
+    /// SUP-1・TASK-157.2: health の文字列表現と逆変換。未知・空・大文字は `None`。
+    #[test]
+    fn sup1_task157_2_health_status_as_str_and_parse() {
+        let all = [
+            (HealthStatus::Starting, "starting"),
+            (HealthStatus::Healthy, "healthy"),
+            (HealthStatus::Unhealthy, "unhealthy"),
+        ];
+        for (h, s) in all {
+            assert_eq!(h.as_str(), s);
+            assert_eq!(HealthStatus::parse(s), Some(h));
+        }
+        for bad in ["", "Healthy", "ok", "healthy "] {
+            assert_eq!(HealthStatus::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    /// SUP-1・TASK-157.2: `StateRecord::new` 直後は既定値、`with_supervision` で指定値になる。
+    #[test]
+    fn sup1_task157_2_state_record_defaults_and_with_supervision() {
+        let status = ContainerStatus::created(ContainerId::new("a").unwrap(), None);
+        let bundle = std::env::temp_dir().join("b");
+        let rec = StateRecord::new(status, bundle, StateRevision::INITIAL).unwrap();
+        assert_eq!(rec.supervisor_pid(), None);
+        assert_eq!(rec.health(), None);
+        assert_eq!(rec.restart_count(), 0);
+        assert_eq!(rec.supervision(), SupervisionState::default());
+        let state = SupervisionState::new(NonZeroU32::new(4242), Some(HealthStatus::Healthy), 3);
+        let rec = rec.with_supervision(state);
+        assert_eq!(rec.supervisor_pid(), NonZeroU32::new(4242));
+        assert_eq!(rec.health(), Some(HealthStatus::Healthy));
+        assert_eq!(rec.restart_count(), 3);
+        assert_eq!(rec.supervision(), state);
+    }
+
+    /// SUP-1・TASK-157.2: create の指定・既定、update の置き換え・引き継ぎがストア越しに往復する（契約 9）。
+    #[test]
+    fn sup1_task157_2_supervision_round_trips_through_store() {
+        let store = StubStateStore::new();
+        let bundle = std::env::temp_dir().join("b");
+        let id = |s: &str| ContainerId::new(s).unwrap();
+        let plain =
+            CreateStateRequest::new(ContainerStatus::created(id("p"), None), bundle.clone())
+                .unwrap();
+        assert_eq!(
+            store.create(&plain).unwrap().supervision(),
+            SupervisionState::default()
+        );
+        let first = SupervisionState::new(NonZeroU32::new(4242), Some(HealthStatus::Starting), 0);
+        let req = CreateStateRequest::new(ContainerStatus::created(id("w"), None), bundle)
+            .unwrap()
+            .with_supervision(first);
+        let created = store.create(&req).unwrap();
+        assert_eq!(created.supervision(), first);
+        let got = store.get(&GetStateRequest::new(id("w"))).unwrap();
+        assert_eq!(got.supervision(), first);
+
+        let second = SupervisionState::new(NonZeroU32::new(4243), Some(HealthStatus::Unhealthy), 7);
+        let status = ContainerStatus::running(id("w"), None);
+        let replaced = store
+            .update(&UpdateStateRequest::new(status, got.revision()).with_supervision(second))
+            .unwrap();
+        assert_eq!(replaced.supervision(), second);
+        let status = ContainerStatus::stopped(id("w"), Some(0));
+        let kept = store
+            .update(&UpdateStateRequest::new(status, replaced.revision()))
+            .unwrap();
+        assert_eq!(kept.supervision(), second);
+        let listed = store
+            .list(&ListStateRequest::new(NonZeroU32::new(10).unwrap()).unwrap())
+            .unwrap();
+        let w = listed
+            .records()
+            .iter()
+            .find(|r| r.id() == &id("w"))
+            .unwrap();
+        assert_eq!(w.supervision(), second);
     }
 
     /// TASK-30.3・OCI-6: `CgroupScope` はルート `/` と `/a/b` 形式だけを受理し、相対・空要素・`.`・`..`・

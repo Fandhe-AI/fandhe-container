@@ -833,6 +833,116 @@ mod tests {
         assert_eq!(gate.run_unless_cancelled(|| 7), None);
     }
 
+    /// REPAIR-5・TASK-157.7: 期限に余裕があれば、取消しは実行中の追記（200ms）の完了を待ってから true で返る。
+    /// 返った時点で追記は完了済み（done = 1）で、以後の追記は実行されない。
+    #[test]
+    fn sup1_task157_7_cancel_gate_waits_for_in_flight_append() {
+        let gate = Arc::new(CancelGate::default());
+        let done = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let t = {
+            let (gate, done) = (Arc::clone(&gate), Arc::clone(&done));
+            std::thread::spawn(move || {
+                gate.run_unless_cancelled(|| {
+                    entered_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(200));
+                    done.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+        };
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(gate.cancel(far()));
+        assert_eq!(done.load(Ordering::SeqCst), 1);
+        assert_eq!(t.join().unwrap(), Some(()));
+        assert_eq!(gate.run_unless_cancelled(|| 7), None);
+    }
+
+    /// REPAIR-5・TASK-157.7: 追記が止まっていても取消しは期限（50ms）で false を返し、無期限に待たない。
+    /// 追記が panic しても実行中の件数は戻る（次の取消しは待たずに true）。
+    #[test]
+    fn sup1_task157_7_cancel_gate_does_not_wait_past_deadline() {
+        let gate = Arc::new(CancelGate::default());
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let t = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                gate.run_unless_cancelled(|| {
+                    entered_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                    panic!("fake sink panic");
+                })
+            })
+        };
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let start = Instant::now();
+        assert!(!gate.cancel(Instant::now() + Duration::from_millis(50)));
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(50), "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        assert_eq!(gate.run_unless_cancelled(|| 7), None);
+        release_tx.send(()).unwrap();
+        assert!(t.join().is_err());
+        assert!(gate.cancel(far()));
+    }
+
+    /// 解放されるまで追記が戻らない sink。追記に入ったことを `entered` で知らせ、完了した行だけを `done` に残す。
+    struct BlockingSink {
+        entered: Mutex<mpsc::Sender<()>>,
+        release: Mutex<mpsc::Receiver<()>>,
+        done: Mutex<Vec<Vec<u8>>>,
+    }
+    impl LogSink for BlockingSink {
+        fn append(&self, _: StreamKind, line: &[u8]) -> Result<(), TraitError> {
+            let _ = self.entered.lock().unwrap().send(());
+            let _ = self.release.lock().unwrap().recv();
+            self.done.lock().unwrap().push(line.to_vec());
+            Ok(())
+        }
+    }
+
+    /// REPAIR-5・TASK-157.7: sink の追記が止まっていても drain は timeout（200ms）で Timeout を返す。
+    /// 返った後に sink へ届くのは実行中だった 1 行（"a"）だけで、同じチャンクで読めていた次の行（"b"）は追記されない。
+    #[test]
+    fn sup1_task157_7_drain_times_out_even_if_sink_append_blocks() {
+        let budget = ReaderBudget::new(1).unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let sink = Arc::new(BlockingSink {
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+            done: Mutex::new(Vec::new()),
+        });
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        writer.write_all(b"a\nb\n").unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let start = Instant::now();
+        let err = cap.drain(Duration::from_millis(200)).unwrap_err();
+        let waited = start.elapsed();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(
+            err.message(),
+            "timed out waiting for log streams to reach EOF"
+        );
+        assert!(waited >= Duration::from_millis(200), "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        assert_eq!(*sink.done.lock().unwrap(), Vec::<Vec<u8>>::new());
+        // 止まった追記はリーダーと枠を占有し続ける（上限で数えられる）。
+        assert_eq!(budget.live(), 1);
+
+        // 追記が再開しても、完了するのは実行中だった 1 行だけ。パイプを閉じなくてもリーダーは終了する。
+        release_tx.send(()).unwrap();
+        assert_eq!(wait_live(&budget, 0), 0);
+        assert_eq!(*sink.done.lock().unwrap(), vec![b"a".to_vec()]);
+        drop(writer);
+    }
+
     /// 追記に 20ms かかる sink。追記に入ったことを `entered` で知らせ、完了した行だけを `done` に残す。
     struct SlowSink {
         entered: Mutex<mpsc::Sender<()>>,

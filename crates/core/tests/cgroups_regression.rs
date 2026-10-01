@@ -7,7 +7,7 @@
 //!    確認する（no-internal-process 制約。逆順のコードは `Evacuated` トークンにより型でコンパイルできない）
 //! 2. OOM Kill: `memory.max=64M`・`memory.swap.max=0` の下で `CgroupJoin` 段の直後に 300 MiB を確保した
 //!    プロセスが SIGKILL（`Signaled(9)`、シェル慣例の終了コード 137）され、`memory.events` の
-//!    `oom_kill` が 1 になる
+//!    `oom_kill` が 1 以上になる
 //!
 //! # 観測点
 //! 負荷は entrypoint ではなく `CgroupJoin` 段のフック内（参加直後）で実行する。exec は制限の証跡が無い間
@@ -214,9 +214,9 @@ mod linux {
         assert_eq!(err.raw_os_error(), Some(EBUSY), "expected EBUSY, got {err}");
 
         let (container, proof) = delegated.prepare(&name).expect("prepare container cgroup");
-        let rootfs = make_rootfs();
-        // 子 cgroup の作成後はどこで panic しても remove_child まで到達できるよう、捕捉して後始末後に再送出する。
+        // 子 cgroup の作成後は rootfs 作成を含めどこで panic しても remove_child まで到達できるよう、捕捉して後始末後に再送出する。
         let verify = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let rootfs = make_rootfs();
             // --- AC1: prepare 後 ---
             assert!(dir.is_dir(), "child cgroup must exist after prepare");
             assert_eq!(read(&dir.join("cgroup.procs")), "");
@@ -282,12 +282,13 @@ mod linux {
         // pid ns の PID 1 でもカーネルが強制する SIGKILL は init の保護を受けない（Docker の OOMKilled と同じ）。
         assert_eq!(exit, ChildExit::Signaled(9), "must be OOM killed");
         assert_eq!(shell_exit_code(exit), 137);
-        assert_eq!(
-            event_count(&events, "oom_kill"),
-            Some(1),
-            "events: {events:?}"
-        );
-        assert_eq!(event_count(&events, "oom"), Some(1), "events: {events:?}");
+        // 300 MiB 確保中に OOM 判定が複数回起き得るため、カウンタは 1 以上で照合する。
+        for key in ["oom_kill", "oom"] {
+            assert!(
+                event_count(&events, key).is_some_and(|n| n >= 1),
+                "{key} must be >= 1; events: {events:?}"
+            );
+        }
     }
 
     /// 起動して OOM Kill された子の終了状態を返す。失敗（panic）経路でも子は `ChildReaper` が回収する。

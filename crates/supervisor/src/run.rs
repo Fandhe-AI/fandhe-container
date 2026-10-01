@@ -1,0 +1,546 @@
+//! 1 コンテナ分の監視ループ（生存確認と終了検知）の基本実装（TASK-157.4・#238・SUP-1。関連: CORE-1・D-19・REPAIR-3・REPAIR-5・SEC-1）。
+//!
+//! 将来の supervisor 入口（コンテナごとの別プロセス）が [`crate::state::open_default_store`] →
+//! [`crate::state::SupervisedState::attach`] → [`monitor`] の順に呼ぶ。1 回の [`monitor`] 呼び出しは
+//! 1 コンテナ・1 起動ハンドルだけを扱い、グローバルなレジストリや複数コンテナを束ねる構造を持たない
+//! （常駐デーモンを前提にしない。CORE-1・D-19）。
+//!
+//! # 実装範囲の線引き（REPAIR-3）
+//! - 本番の `ProcessLauncher` は core に未提供のため、起動ハンドル（`LaunchedProcess`）は呼び出し側から注入する。
+//!   supervisor のバイナリ入口（`main.rs`）は本 issue では追加しない（実プロセスを起動できないため実装済みを装わない）。
+//!   「コンテナ 0 個で supervisor プロセスが残存しない」ことの検証は結合テスト（#242・TASK-157.8）の担当。
+//! - restart 判定・`restart_count` 更新（#239・SUP-3）、health 更新（#240・SUP-4）、stdout / stderr 捕捉（#241）は未実装。
+//!   終了検知後の分岐（再起動するか Stopped に落とすか）は、[`monitor`] の手順 4 が拡張点になる。
+//!
+//! # 処理順（[`monitor`]）
+//! 1. 事前確認: 状態が `Running` で、`status.pid()` が起動ハンドルの pid と一致すること。違えば `FailedPrecondition`。
+//! 2. 監視開始の記録: `supervisor_pid` に自プロセスの pid を書く（`health`・`restart_count` は既存値を保つ）。
+//! 3. ループ: 周回の先頭で停止要求を確認し、`wait(poll_interval)` で生存確認する。`Ok(None)` は生存、
+//!    `Ok(Some(_))` は終了（回収済み）、`Err` は握りつぶさずそのまま返す。
+//! 4. 終了の記録: `Stopped` と終了コードを書き、`supervisor_pid` を `None` に戻す。本 issue ではループ終了 =
+//!    監視なしのため。再起動で監視を続ける挙動は #239 が変更する。
+//! 5. 停止要求（[`StopToken`]）: 監視をやめるだけで、プロセスは終了させない。状態は `Running` のまま
+//!    `supervisor_pid` だけ `None` に戻す。
+//!
+//! 終了コードの写像: `Exited(c)` は `Some(c)`、`Signaled(s)` はシェル慣習に合わせ `Some(128 + s)`
+//! （あふれたら `None`）。生の [`ProcessExit`] は [`MonitorOutcome::Exited`] で返す。
+//!
+//! # pid 再利用対策（SEC-1）
+//! 生存確認と回収は保持する起動ハンドル経由のみで行う。状態に記録された pid を `kill(2)`・`waitpid(2)`・
+//! `/proc` の宛先に使わない（記録値は再利用され得る）。
+//!
+//! # 書き込みの再試行（REPAIR-5）
+//! state.rs が呼び出し側に委ねた判断として、revision 不一致（`FailedPrecondition`）のときだけ
+//! `refresh` して再構築・再書き込みする。回数は [`MAX_WRITE_ATTEMPTS`] で打ち切り、待ち時間は入れない。
+//! 再試行のたびに `health`・`restart_count` を読み直し、他者の更新を上書きで消さない。`refresh` 後に状態が
+//! 「`Running` かつ自分の pid」でなくなっていれば書かずに `FailedPrecondition` を返す。書き込み排他の最終仕様
+//! （TASK-157.9・#1069）の意味論には依存しない。
+
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
+use fandhe_container_core::traits::{
+    ContainerState, ContainerStatus, ErrorCode, StateRecord, SupervisionState, TraitError,
+};
+
+use crate::state::SupervisedState;
+
+/// 1 回の `wait` の既定の上限。
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// `poll_interval` の上限。これを超える値は拒否する（停止要求への反応が遅れ過ぎるのを防ぐ。REPAIR-5）。
+pub const MAX_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 状態書き込みの試行回数の上限（初回を含む）。
+pub const MAX_WRITE_ATTEMPTS: u32 = 3;
+
+/// 監視ループの設定。検証付きコンストラクタ経由でのみ作れる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorConfig {
+    poll_interval: Duration,
+}
+
+impl MonitorConfig {
+    /// `poll_interval` が 0 または [`MAX_POLL_INTERVAL`] 超なら `InvalidArgument`。
+    pub fn new(poll_interval: Duration) -> Result<Self, TraitError> {
+        if poll_interval.is_zero() || poll_interval > MAX_POLL_INTERVAL {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "poll interval is out of range",
+            ));
+        }
+        Ok(Self { poll_interval })
+    }
+
+    /// 1 回の `wait` の上限。
+    pub fn poll_interval(&self) -> Duration {
+        self.poll_interval
+    }
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: DEFAULT_POLL_INTERVAL,
+        }
+    }
+}
+
+/// 監視ループを有限時間で止めるための取り消しトークン（複製して共有できる）。
+///
+/// テストと将来の停止経路（SUP 系）が使う。
+#[derive(Debug, Clone, Default)]
+pub struct StopToken(Arc<AtomicBool>);
+
+impl StopToken {
+    /// 停止要求のないトークンを作る。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 停止を要求する。
+    pub fn request_stop(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// 停止が要求済みか。
+    pub fn is_stop_requested(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// [`monitor`] の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MonitorOutcome {
+    /// 終了を検知し、`Stopped` を記録した。
+    Exited {
+        /// 起動ハンドルが回収した終了状態。
+        exit: ProcessExit,
+        /// 書き込み後のレコード。
+        record: StateRecord,
+    },
+    /// 停止要求で監視をやめた（プロセスは kill せず、状態は `Running` のまま）。
+    StopRequested {
+        /// 書き込み後のレコード（`supervisor_pid` は `None`）。
+        record: StateRecord,
+    },
+}
+
+/// 起動ハンドルの生存確認と終了検知を行い、結果を状態へ記録する（処理順は module doc）。
+///
+/// 参照で受けるのは、後続（#239）が同じハンドル・状態で再起動処理を続けられるようにするため。
+pub fn monitor(
+    state: &mut SupervisedState,
+    process: &dyn LaunchedProcess,
+    config: &MonitorConfig,
+    stop: &StopToken,
+) -> Result<MonitorOutcome, TraitError> {
+    let pid = process.pid();
+    if !is_running_with_pid(state.record(), pid) {
+        return Err(precondition(
+            "container is not running with the launched pid",
+        ));
+    }
+
+    let self_pid = NonZeroU32::new(std::process::id())
+        .ok_or_else(|| TraitError::new(ErrorCode::Internal, "own pid is zero"))?;
+    write_with_retry(state, pid, |rec| {
+        (
+            rec.status().clone(),
+            SupervisionState::new(Some(self_pid), rec.health(), rec.restart_count()),
+        )
+    })?;
+
+    loop {
+        if stop.is_stop_requested() {
+            let record = write_with_retry(state, pid, |rec| {
+                (
+                    rec.status().clone(),
+                    SupervisionState::new(None, rec.health(), rec.restart_count()),
+                )
+            })?;
+            return Ok(MonitorOutcome::StopRequested { record });
+        }
+        match process.wait(config.poll_interval())? {
+            None => continue,
+            Some(exit) => {
+                let code = exit_code_of(exit);
+                let id = state.id().clone();
+                let record = write_with_retry(state, pid, |rec| {
+                    (
+                        ContainerStatus::stopped(id.clone(), code),
+                        SupervisionState::new(None, rec.health(), rec.restart_count()),
+                    )
+                })?;
+                return Ok(MonitorOutcome::Exited { exit, record });
+            }
+        }
+    }
+}
+
+fn precondition(msg: &'static str) -> TraitError {
+    TraitError::new(ErrorCode::FailedPrecondition, msg)
+}
+
+fn is_running_with_pid(rec: &StateRecord, pid: NonZeroU32) -> bool {
+    rec.status().state() == ContainerState::Running && rec.status().pid() == Some(pid)
+}
+
+/// 終了状態を状態ファイルへ記録する終了コードへ写す（`Signaled(s)` は `128 + s`）。
+fn exit_code_of(exit: ProcessExit) -> Option<i32> {
+    match exit {
+        ProcessExit::Exited(c) => Some(c),
+        ProcessExit::Signaled(s) => 128i32.checked_add(s),
+        _ => None,
+    }
+}
+
+/// revision 不一致のときだけ `refresh` して再構築・再書き込みする（上限 [`MAX_WRITE_ATTEMPTS`]）。
+fn write_with_retry<F>(
+    state: &mut SupervisedState,
+    pid: NonZeroU32,
+    build: F,
+) -> Result<StateRecord, TraitError>
+where
+    F: Fn(&StateRecord) -> (ContainerStatus, SupervisionState),
+{
+    let mut last_err = precondition("state write attempts exhausted");
+    for attempt in 0..MAX_WRITE_ATTEMPTS {
+        if attempt > 0 {
+            state.refresh()?;
+            if !is_running_with_pid(state.record(), pid) {
+                return Err(precondition(
+                    "container state changed while writing supervision",
+                ));
+            }
+        }
+        let (status, supervision) = build(state.record());
+        match state.write(status, supervision) {
+            Ok(rec) => return Ok(rec.clone()),
+            Err(e) if e.code() == ErrorCode::FailedPrecondition => last_err = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU32;
+
+    use fandhe_container_core::traits::{
+        ContainerId, CreateStateRequest, DeleteStateRequest, DeleteStateResponse, GetStateRequest,
+        HealthStatus, ListStateRequest, StateList, StateRevision, StateStore, UpdateStateRequest,
+    };
+
+    fn cid() -> ContainerId {
+        ContainerId::new("c1").unwrap()
+    }
+
+    fn pid(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).unwrap()
+    }
+
+    fn next_record(cur: &StateRecord, status: ContainerStatus, s: SupervisionState) -> StateRecord {
+        StateRecord::new(
+            status,
+            cur.bundle().to_path_buf(),
+            StateRevision::from_raw(cur.revision().value() + 1),
+        )
+        .unwrap()
+        .with_supervision(s)
+    }
+
+    /// メモリ上の 1 レコードストア。`conflicts` 回だけ外部更新（restart_count +1）で競合させる。
+    struct FakeStore {
+        rec: Mutex<StateRecord>,
+        conflicts: Mutex<u32>,
+        updates: AtomicU32,
+    }
+
+    impl StateStore for FakeStore {
+        fn create(&self, _: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "fake"))
+        }
+        fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+            self.updates.fetch_add(1, Ordering::SeqCst);
+            let mut g = self.rec.lock().unwrap();
+            let mut c = self.conflicts.lock().unwrap();
+            let sup = g.supervision();
+            if *c > 0 {
+                *c -= 1;
+                let s = SupervisionState::new(
+                    sup.supervisor_pid(),
+                    sup.health(),
+                    sup.restart_count() + 1,
+                );
+                *g = next_record(&g, g.status().clone(), s);
+                return Err(TraitError::new(ErrorCode::FailedPrecondition, "stale"));
+            }
+            if g.revision() != req.expected_revision() {
+                return Err(TraitError::new(ErrorCode::FailedPrecondition, "stale"));
+            }
+            let s = req.supervision().unwrap_or(sup);
+            let next = next_record(&g, req.status().clone(), s);
+            *g = next.clone();
+            Ok(next)
+        }
+        fn get(&self, _: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            Ok(self.rec.lock().unwrap().clone())
+        }
+        fn list(&self, _: &ListStateRequest) -> Result<StateList, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "fake"))
+        }
+        fn delete(&self, _: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "fake"))
+        }
+    }
+
+    fn store_with(
+        status: ContainerStatus,
+        sup: SupervisionState,
+        conflicts: u32,
+    ) -> Arc<FakeStore> {
+        let rec = StateRecord::new(
+            status,
+            std::env::temp_dir().join("b"),
+            StateRevision::from_raw(1),
+        )
+        .unwrap()
+        .with_supervision(sup);
+        Arc::new(FakeStore {
+            rec: Mutex::new(rec),
+            conflicts: Mutex::new(conflicts),
+            updates: AtomicU32::new(0),
+        })
+    }
+
+    fn running_store(conflicts: u32) -> Arc<FakeStore> {
+        store_with(
+            ContainerStatus::running(cid(), Some(pid(42))),
+            SupervisionState::default(),
+            conflicts,
+        )
+    }
+
+    /// `exit_at` 回目の `wait` で終了を返す（`None` なら常に生存）。`fail` なら常に Err。
+    struct FakeProc {
+        exit_at: Option<(u32, ProcessExit)>,
+        fail: bool,
+        waits: AtomicU32,
+    }
+
+    impl FakeProc {
+        fn new(exit_at: Option<(u32, ProcessExit)>, fail: bool) -> Self {
+            Self {
+                exit_at,
+                fail,
+                waits: AtomicU32::new(0),
+            }
+        }
+        fn exiting(at: u32, e: ProcessExit) -> Self {
+            Self::new(Some((at, e)), false)
+        }
+        fn alive() -> Self {
+            Self::new(None, false)
+        }
+        fn failing() -> Self {
+            Self::new(None, true)
+        }
+        fn waits(&self) -> u32 {
+            self.waits.load(Ordering::SeqCst)
+        }
+    }
+
+    impl LaunchedProcess for FakeProc {
+        fn pid(&self) -> NonZeroU32 {
+            pid(42)
+        }
+        fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            let n = self.waits.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail {
+                return Err(TraitError::new(ErrorCode::Internal, "fake wait failure"));
+            }
+            Ok(match self.exit_at {
+                Some((at, e)) if n >= at => Some(e),
+                _ => None,
+            })
+        }
+        fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+            Ok(())
+        }
+    }
+
+    fn attach(store: &Arc<FakeStore>) -> SupervisedState {
+        SupervisedState::attach(store.clone(), cid()).unwrap()
+    }
+
+    /// SUP-1・TASK-157.4: 3 回目の wait で exit を検知し Stopped を記録する。
+    #[test]
+    fn sup1_task157_4_detects_exit() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = FakeProc::exiting(3, ProcessExit::Exited(7));
+        let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
+        let MonitorOutcome::Exited { exit, record } = out else {
+            panic!("unexpected outcome")
+        };
+        assert_eq!(exit, ProcessExit::Exited(7));
+        assert_eq!(record.status().state(), ContainerState::Stopped);
+        assert_eq!(record.status().exit_code(), Some(7));
+        assert_eq!(record.status().pid(), None);
+        assert_eq!(record.supervisor_pid(), None);
+        assert_eq!(p.waits(), 3);
+        // 初期 1 + 監視開始 + 終了
+        assert_eq!(record.revision().value(), 3);
+    }
+
+    /// TASK-157.4: シグナル終了は 128 + 番号。
+    #[test]
+    fn sup1_task157_4_signal_exit_code() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = FakeProc::exiting(1, ProcessExit::Signaled(9));
+        let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
+        let MonitorOutcome::Exited { exit, record } = out else {
+            panic!("unexpected outcome")
+        };
+        assert_eq!(exit, ProcessExit::Signaled(9));
+        assert_eq!(record.status().exit_code(), Some(137));
+        assert_eq!(exit_code_of(ProcessExit::Signaled(i32::MAX)), None);
+    }
+
+    /// TASK-157.4: 監視開始時に supervisor_pid が自プロセスの pid で記録される（停止要求の直前に確認）。
+    #[test]
+    fn sup1_task157_4_records_supervisor_pid_while_alive() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = FakeProc::alive();
+        let stop = StopToken::new();
+        // 周回中の状態を観測するため、別スレッドは使わず wait 内で観測する代わりに、
+        // 監視開始後のレコードを StopRequested の前段（revision 2）で確認する。
+        let before = store.rec.lock().unwrap().revision().value();
+        assert_eq!(before, 1);
+        stop.request_stop();
+        monitor(&mut s, &p, &MonitorConfig::default(), &stop).unwrap();
+        // 監視開始（rev 2）→ 停止要求による解除（rev 3）。
+        assert_eq!(store.rec.lock().unwrap().revision().value(), 3);
+        assert_eq!(store.updates.load(Ordering::SeqCst), 2);
+    }
+
+    /// TASK-157.4: health・restart_count は終了後も保持される。
+    #[test]
+    fn sup1_task157_4_preserves_health_and_restart_count() {
+        let store = store_with(
+            ContainerStatus::running(cid(), Some(pid(42))),
+            SupervisionState::new(None, Some(HealthStatus::Healthy), 2),
+            0,
+        );
+        let mut s = attach(&store);
+        let p = FakeProc::exiting(2, ProcessExit::Exited(0));
+        let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
+        let MonitorOutcome::Exited { record, .. } = out else {
+            panic!("unexpected outcome")
+        };
+        assert_eq!(record.health(), Some(HealthStatus::Healthy));
+        assert_eq!(record.restart_count(), 2);
+    }
+
+    /// TASK-157.4: 停止要求で戻り、Running のまま supervisor_pid を外す（プロセスは kill しない）。
+    #[test]
+    fn sup1_task157_4_stop_requested() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = FakeProc::alive();
+        let stop = StopToken::new();
+        stop.request_stop();
+        let out = monitor(&mut s, &p, &MonitorConfig::default(), &stop).unwrap();
+        let MonitorOutcome::StopRequested { record } = out else {
+            panic!("unexpected outcome")
+        };
+        assert_eq!(record.status().state(), ContainerState::Running);
+        assert_eq!(record.status().pid(), Some(pid(42)));
+        assert_eq!(record.supervisor_pid(), None);
+        assert_eq!(p.waits(), 0);
+    }
+
+    /// TASK-157.4: Created / Stopped / pid 不一致は FailedPrecondition で wait は呼ばれない。
+    #[test]
+    fn sup1_task157_4_precondition() {
+        let cases = [
+            ContainerStatus::created(cid(), Some(pid(42))),
+            ContainerStatus::stopped(cid(), Some(0)),
+            ContainerStatus::running(cid(), Some(pid(43))),
+            ContainerStatus::running(cid(), None),
+        ];
+        for st in cases {
+            let store = store_with(st, SupervisionState::default(), 0);
+            let mut s = attach(&store);
+            let p = FakeProc::alive();
+            let e = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(p.waits(), 0);
+            assert_eq!(store.updates.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    /// REPAIR-5: wait の失敗は 1 回で返る。
+    #[test]
+    fn sup1_task157_4_wait_failure_is_returned() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = FakeProc::failing();
+        let e = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert_eq!(p.waits(), 1);
+    }
+
+    /// REPAIR-5: 競合 1 回は refresh 後に成功し、競合側の restart_count が保たれる。
+    #[test]
+    fn sup1_task157_4_retry_succeeds_and_keeps_foreign_update() {
+        let store = running_store(1);
+        let mut s = attach(&store);
+        let p = FakeProc::exiting(1, ProcessExit::Exited(0));
+        let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
+        let MonitorOutcome::Exited { record, .. } = out else {
+            panic!("unexpected outcome")
+        };
+        assert_eq!(record.restart_count(), 1);
+        assert_eq!(record.status().state(), ContainerState::Stopped);
+    }
+
+    /// REPAIR-5: 競合が続けば MAX_WRITE_ATTEMPTS 回で打ち切る。
+    #[test]
+    fn sup1_task157_4_retry_is_bounded() {
+        let store = running_store(100);
+        let mut s = attach(&store);
+        let p = FakeProc::alive();
+        let e = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(store.updates.load(Ordering::SeqCst), MAX_WRITE_ATTEMPTS);
+    }
+
+    /// 設定検証: 0 と上限超過は拒否し、境界値は受理する。
+    #[test]
+    fn sup1_task157_4_config_validation() {
+        for bad in [Duration::ZERO, MAX_POLL_INTERVAL + Duration::from_nanos(1)] {
+            assert_eq!(
+                MonitorConfig::new(bad).unwrap_err().code(),
+                ErrorCode::InvalidArgument
+            );
+        }
+        assert!(MonitorConfig::new(Duration::from_nanos(1)).is_ok());
+        assert_eq!(
+            MonitorConfig::new(MAX_POLL_INTERVAL)
+                .unwrap()
+                .poll_interval(),
+            MAX_POLL_INTERVAL
+        );
+    }
+}

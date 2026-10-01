@@ -16,6 +16,8 @@ fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("afw-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
+    // 親ディレクトリは group/other 書き込み不可でなければ拒否される（SEC-4）ため 0700 にする。
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
     d
 }
 
@@ -72,9 +74,18 @@ fn sec4_task41_5_1_rejects_unsafe_targets() {
         AuditWriteErrorKind::Open
     );
 
+    let sub = d.join("sub");
+    fs::create_dir(&sub).unwrap();
     assert_eq!(
-        AuditFileWriter::open(&d).unwrap_err().kind(),
+        AuditFileWriter::open(&sub).unwrap_err().kind(),
         AuditWriteErrorKind::Open
+    );
+    // 直接の親が group/other 書き込み可（sticky の /tmp 等）なら拒否する。
+    assert_eq!(
+        AuditFileWriter::open(&std::env::temp_dir().join("afw-direct-child.log"))
+            .unwrap_err()
+            .kind(),
+        AuditWriteErrorKind::InsecureFile
     );
 
     let loose = d.join("loose");

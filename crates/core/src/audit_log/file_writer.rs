@@ -14,7 +14,13 @@
 //! - 全キー常在の固定スキーマ。値が無いものは `null`。`path` は lossy UTF-8 で、制御文字・改行・NUL は
 //!   JSON エスケープされる（ログ注入対策: 生の LF は行末の 1 個だけ）
 //! - [`AuditFileWriter::open`] は symlink・FIFO・他者所有・group/other 権限付きのファイルを拒否する。
-//!   **親ディレクトリの信頼性（所有者・権限）の検証は呼び出し側の責務**
+//!   親ディレクトリも `/` から 1 要素ずつ `O_NOFOLLOW|O_DIRECTORY` で辿って fd で固定し、いずれかが
+//!   symlink・非ディレクトリ・root でも実効 uid 所有でもない・group/other 書き込み可（sticky 付きの祖先は
+//!   許容。直接の親は不可）なら拒否する。ファイルは固定した親 fd の `/proc/self/fd/N/<name>` 経由で開き、
+//!   検証後の親の差し替え（TOCTOU）を防ぐ
+//! - 書き込みは `flock`（排他）を `AUDIT_LOCK_TIMEOUT` を上限に取得してから 1 レコードずつ行う。複数の
+//!   writer（同一プロセス内・別プロセス）が同じファイルを開いても、`write_all` の複数 write の間に他者の
+//!   追記が割り込まず、行が混ざらない。ロック下で末尾が LF でなければ行頭 LF で破損行を隔離する
 //! - 部分書き込みで壊れた行は、次回書き込みの行頭に LF を付けて独立した行に隔離する（読み手は破損行を
 //!   読み飛ばす）。失敗時の重複（主経路に部分書き込み＋フォールバックにも記録）は許容し、欠落は許容しない
 //! - 非 Linux では symlink・所有者の信頼境界を検査できないため `open` は `Unimplemented` 相当の
@@ -29,11 +35,17 @@ use std::fmt;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use super::{AuditEvent, AuditRecord};
 use crate::traits::ErrorCode;
+
+/// 書き込みロック取得の待ち時間上限（REPAIR-5: 無期限に待たない）。
+const AUDIT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// ロック取得のリトライ間隔。
+const AUDIT_LOCK_RETRY: Duration = Duration::from_millis(5);
 
 /// 1 行（LF 含む）のバイト長上限。パス 4096 バイトの JSON エスケープ最大 6 倍＋固定部に収まる値。
 pub const AUDIT_LINE_MAX_BYTES: usize = 32 * 1024;
@@ -58,6 +70,8 @@ pub enum AuditWriteErrorKind {
     LineTooLong,
     /// 書き込みに失敗した。
     Write,
+    /// 書き込みロックを期限内に取得できなかった。
+    Lock,
     /// 永続化（fsync）に失敗した。
     Sync,
     /// フォールバック経路が未実装・利用不可。
@@ -96,6 +110,7 @@ impl AuditWriteError {
             AuditWriteErrorKind::NotRegularFile | AuditWriteErrorKind::InsecureFile => {
                 ErrorCode::PermissionDenied
             }
+            AuditWriteErrorKind::Lock => ErrorCode::Timeout,
             _ => ErrorCode::Internal,
         }
     }
@@ -113,6 +128,7 @@ impl AuditWriteError {
             AuditWriteErrorKind::Encode => "failed to encode audit record",
             AuditWriteErrorKind::LineTooLong => "encoded audit record exceeds the line limit",
             AuditWriteErrorKind::Write => "failed to write audit record",
+            AuditWriteErrorKind::Lock => "timed out waiting for the audit log lock",
             AuditWriteErrorKind::Sync => "failed to sync audit log file",
             AuditWriteErrorKind::FallbackUnavailable => "audit fallback path is not available",
         }
@@ -200,16 +216,43 @@ impl AuditFileWriter {
         }
     }
 
-    /// 1 レコードを 1 回の `write_all` で書き、`sync_data` まで行う。
+    /// 1 レコードを排他ロック下で `write_all` し、`sync_data` まで行う。
     ///
     /// 失敗時は panic せず `Err` を返す。呼び出し側は [`write_with_fallback`] で代替経路へ回す。
     pub fn write_record(&mut self, record: &AuditRecord) -> Result<(), AuditWriteError> {
         let line = encode_json_line(record)?;
+        self.lock_exclusive()?;
+        let result = self.write_locked(&line);
+        // 解放失敗は致命的ではない（fd を閉じれば解放される）。結果は書き込みの成否で決める。
+        let _ = self.file.unlock();
+        result
+    }
+
+    fn lock_exclusive(&self) -> Result<(), AuditWriteError> {
+        let deadline = Instant::now() + AUDIT_LOCK_TIMEOUT;
+        loop {
+            match self.file.try_lock() {
+                Ok(()) => return Ok(()),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(AuditWriteError::new(AuditWriteErrorKind::Lock));
+                    }
+                    std::thread::sleep(AUDIT_LOCK_RETRY);
+                }
+                Err(std::fs::TryLockError::Error(_)) => {
+                    return Err(AuditWriteError::new(AuditWriteErrorKind::Lock));
+                }
+            }
+        }
+    }
+
+    fn write_locked(&mut self, line: &[u8]) -> Result<(), AuditWriteError> {
         let mut buf = Vec::with_capacity(line.len() + 1);
-        if self.needs_line_break {
+        // 自身の直前の失敗、またはロック下で観測した他 writer の部分行が末尾に残っていれば隔離する。
+        if self.needs_line_break || tail_is_unterminated(&self.file) {
             buf.push(b'\n');
         }
-        buf.extend_from_slice(&line);
+        buf.extend_from_slice(line);
         if self.file.write_all(&buf).is_err() {
             self.needs_line_break = true;
             return Err(AuditWriteError::new(AuditWriteErrorKind::Write));
@@ -223,24 +266,109 @@ impl AuditFileWriter {
     }
 }
 
+/// ファイル末尾が LF で終わっていない（空ファイルは終端済み扱い）か。読めない場合は安全側で `true`。
+#[cfg(unix)]
+fn tail_is_unterminated(file: &File) -> bool {
+    use std::os::unix::fs::FileExt;
+    let Ok(meta) = file.metadata() else {
+        return true;
+    };
+    let Some(last) = meta.len().checked_sub(1) else {
+        return false;
+    };
+    let mut b = [0u8; 1];
+    match file.read_exact_at(&mut b, last) {
+        Ok(()) => b[0] != b'\n',
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn tail_is_unterminated(_file: &File) -> bool {
+    false
+}
+
+/// `/` から `dir` まで 1 要素ずつ `O_NOFOLLOW|O_DIRECTORY` で辿り、各要素の所有者・権限を検証して
+/// 最後の要素の fd（O_PATH）を返す。`..`・相対要素は拒否する。
+#[cfg(target_os = "linux")]
+fn open_trusted_parent(dir: &Path) -> Result<std::os::fd::OwnedFd, AuditWriteError> {
+    use std::ffi::CString;
+    use std::os::fd::AsFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    let open_err = || AuditWriteError::new(AuditWriteErrorKind::Open);
+    let insecure = || AuditWriteError::new(AuditWriteErrorKind::InsecureFile);
+    let euid = crate::sys::effective_uid();
+
+    let mut names = Vec::new();
+    for c in dir.components() {
+        match c {
+            Component::RootDir => {}
+            Component::Normal(n) => names.push(CString::new(n.as_bytes()).map_err(|_| open_err())?),
+            _ => return Err(open_err()),
+        }
+    }
+    let mut cur = crate::sys::open_dir_path_nofollow(None, c"/").map_err(|_| open_err())?;
+    let total = names.len();
+    // 検証は root 自身（index なし）から: 祖先すべてを同じ基準で検査する。
+    let check = |fd: &std::os::fd::OwnedFd, is_parent: bool| -> Result<(), AuditWriteError> {
+        let meta = File::from(fd.as_fd().try_clone_to_owned().map_err(|_| open_err())?)
+            .metadata()
+            .map_err(|_| open_err())?;
+        if !meta.file_type().is_dir() {
+            return Err(AuditWriteError::new(AuditWriteErrorKind::NotRegularFile));
+        }
+        let owner_ok = meta.uid() == 0 || meta.uid() == euid;
+        let mode = meta.mode();
+        // group/other 書き込み可は、sticky 付きの祖先（/tmp 等）のみ許容する。直接の親は不可。
+        let writable_ok = mode & 0o022 == 0 || (!is_parent && mode & 0o1000 != 0);
+        if owner_ok && writable_ok {
+            Ok(())
+        } else {
+            Err(insecure())
+        }
+    };
+    check(&cur, total == 0)?;
+    for (i, name) in names.iter().enumerate() {
+        let next =
+            crate::sys::open_dir_path_nofollow(Some(cur.as_fd()), name).map_err(|_| open_err())?;
+        check(&next, i + 1 == total)?;
+        cur = next;
+    }
+    Ok(cur)
+}
+
 #[cfg(target_os = "linux")]
 fn open_checked(path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
     use std::fs::OpenOptions;
-    use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+    let open_err = || AuditWriteError::new(AuditWriteErrorKind::Open);
     let flags = crate::sys::nofollow_nonblock_open_flags()
         .ok_or_else(|| AuditWriteError::new(AuditWriteErrorKind::Unsupported))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(open_err)?;
+    let parent = path.parent().ok_or_else(open_err)?;
+    // 親を fd で固定してから、その fd の magic link 経由で最終要素を開く（検証後の差し替えを防ぐ）。
+    let parent_fd = open_trusted_parent(parent)?;
+    let via_fd =
+        std::path::PathBuf::from(format!("/proc/self/fd/{}", parent_fd.as_raw_fd())).join(name);
     let file = OpenOptions::new()
         .read(true)
         .append(true)
         .create(true)
         .mode(0o600)
         .custom_flags(flags)
-        .open(path)
-        .map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Open))?;
-    let meta = file
-        .metadata()
-        .map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Open))?;
+        .open(&via_fd)
+        .map_err(|_| open_err())?;
+    drop(parent_fd);
+    let meta = file.metadata().map_err(|_| open_err())?;
     if !meta.file_type().is_file() {
         return Err(AuditWriteError::new(AuditWriteErrorKind::NotRegularFile));
     }
@@ -248,16 +376,8 @@ fn open_checked(path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
         return Err(AuditWriteError::new(AuditWriteErrorKind::InsecureFile));
     }
     // 再オープン時に末尾が LF でない（前回プロセスの torn line）場合、最初の追記前に LF を挿入して
-    // 新レコードを既存の部分行から隔離する。pread なので O_APPEND の書き込み位置に影響しない。
-    let needs_line_break = match meta.len().checked_sub(1) {
-        None => false,
-        Some(last) => {
-            let mut b = [0u8; 1];
-            file.read_exact_at(&mut b, last)
-                .map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Open))?;
-            b[0] != b'\n'
-        }
-    };
+    // 新レコードを既存の部分行から隔離する（書き込み時にもロック下で再判定する）。
+    let needs_line_break = tail_is_unterminated(&file);
     Ok(AuditFileWriter {
         file,
         needs_line_break,
@@ -547,9 +667,7 @@ mod tests {
     #[test]
     fn sec4_task41_5_1_reopen_isolates_torn_tail() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("fandhe-auditw-torn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = fresh_dir("torn");
         let path = dir.join("audit.log");
         std::fs::write(&path, b"{\"torn\":").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -565,6 +683,85 @@ mod tests {
         let got = std::fs::read_to_string(&path).unwrap();
         let line = text(&sample());
         assert_eq!(got, format!("{{\"torn\":\n{line}{line}"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fandhe-auditw-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    /// SEC-4・TASK-41.5.1: 親ディレクトリが symlink なら拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_task41_5_1_rejects_symlinked_parent() {
+        let dir = fresh_dir("symparent");
+        let real = dir.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = AuditFileWriter::open(&link.join("audit.log")).unwrap_err();
+        assert_eq!(e.kind(), AuditWriteErrorKind::Open);
+        assert!(!real.join("audit.log").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-4・TASK-41.5.1: group/other が書き込める親ディレクトリは拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_task41_5_1_rejects_world_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fresh_dir("wwparent");
+        let parent = dir.join("p");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let e = AuditFileWriter::open(&parent.join("audit.log")).unwrap_err();
+        assert_eq!(e.kind(), AuditWriteErrorKind::InsecureFile);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-4・TASK-41.5.1: 複数 writer の並行書き込みでも全行が完全な JSON 行になる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_task41_5_1_concurrent_writers_do_not_interleave() {
+        let dir = fresh_dir("concurrent");
+        let path = dir.join("audit.log");
+        let long = format!("/{}", "a".repeat(3000));
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let path = path.clone();
+                let long = long.clone();
+                std::thread::spawn(move || {
+                    let mut w = AuditFileWriter::open(&path).unwrap();
+                    for _ in 0..25 {
+                        let r = rec(
+                            t + 1,
+                            AuditEvent::Mount {
+                                path: Some(AuditPath::new(&long)),
+                            },
+                        );
+                        w.write_record(&r).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let got = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = got.lines().collect();
+        assert_eq!(lines.len(), 100);
+        for l in lines {
+            assert!(
+                l.starts_with("{\"event\":\"audit\"") && l.ends_with('}'),
+                "{l}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -16,9 +16,11 @@
 //!   落とさないよう値を保存する（SEC-4 の 100% 記録）
 //! - シンクの失敗は握りつぶさず `Err` で伝播する。リトライ・フォールバックは #840 の担当
 
+use crate::traits::TraitError;
+
 use super::{
     AuditEvent, AuditPid, AuditRecord, AuditRecordError, AuditRecordErrorKind, AuditSink,
-    AuditSinkError, AuditSyscallArch, AuditSyscallNr, AuditTimestamp,
+    AuditSyscallArch, AuditSyscallNr, AuditTimestamp,
 };
 
 /// `SYS_SECCOMP`（`si_code`。`include/uapi/asm-generic/siginfo.h`。アーキ共通の汎用値）。
@@ -122,9 +124,9 @@ impl SeccompDenialReport {
 pub fn record_seccomp_denial<S: AuditSink + ?Sized>(
     report: &SeccompDenialReport,
     timestamp: AuditTimestamp,
-    sink: &mut S,
-) -> Result<(), AuditSinkError> {
-    sink.record(AuditRecord::new(
+    sink: &S,
+) -> Result<(), TraitError> {
+    sink.record(&AuditRecord::new(
         timestamp,
         report.pid,
         AuditEvent::Seccomp {
@@ -136,6 +138,7 @@ pub fn record_seccomp_denial<S: AuditSink + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::*;
@@ -144,15 +147,15 @@ mod tests {
 
     #[derive(Default)]
     struct VecSink {
-        records: Vec<AuditRecord>,
+        records: Mutex<Vec<AuditRecord>>,
         fail: bool,
     }
 
     impl AuditSink for VecSink {
-        fn record(&mut self, record: AuditRecord) -> Result<(), AuditSinkError> {
-            self.records.push(record);
+        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+            self.records.lock().unwrap().push(record.clone());
             if self.fail {
-                Err(AuditSinkError::new(ErrorCode::Internal, "sink failed"))
+                Err(TraitError::new(ErrorCode::Internal, "sink failed"))
             } else {
                 Ok(())
             }
@@ -164,10 +167,11 @@ mod tests {
     }
 
     fn record_one(report: &SeccompDenialReport) -> AuditRecord {
-        let mut sink = VecSink::default();
-        record_seccomp_denial(report, ts(), &mut sink).unwrap();
-        assert_eq!(sink.records.len(), 1);
-        sink.records.remove(0)
+        let sink = VecSink::default();
+        record_seccomp_denial(report, ts(), &sink).unwrap();
+        let mut records = sink.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        records.remove(0)
     }
 
     #[test]
@@ -254,14 +258,14 @@ mod tests {
     #[test]
     fn sec4_task41_2_sink_error_is_propagated_after_single_call() {
         let report = SeccompDenialReport::from_sigsys(1, 272, 0xC000_003E, 42).unwrap();
-        let mut sink = VecSink {
+        let sink = VecSink {
             fail: true,
             ..VecSink::default()
         };
-        let err = record_seccomp_denial(&report, ts(), &mut sink).unwrap_err();
-        assert_eq!(err.error_code(), ErrorCode::Internal);
+        let err = record_seccomp_denial(&report, ts(), &sink).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Internal);
         assert_eq!(err.message(), "sink failed");
-        assert_eq!(sink.records.len(), 1);
+        assert_eq!(sink.records.lock().unwrap().len(), 1);
     }
 
     #[test]

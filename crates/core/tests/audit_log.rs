@@ -5,13 +5,14 @@
 //! 3 OS の CI で実行され、型が OS 非依存であることの保証にもなる。
 
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use fandhe_container_core::audit_log::{
     AuditEvent, AuditLayer, AuditPath, AuditPid, AuditRecord, AuditRecordErrorKind, AuditSink,
-    AuditSinkError, AuditSyscallArch, AuditSyscallNr, AuditTimestamp, SeccompDenialReport,
-    record_seccomp_denial,
+    AuditSyscallArch, AuditSyscallNr, AuditTimestamp, SeccompDenialReport, record_seccomp_denial,
 };
+use fandhe_container_core::traits::TraitError;
 
 fn ts() -> AuditTimestamp {
     AuditTimestamp::from_unix_duration(Duration::from_secs(1_700_000_000))
@@ -69,11 +70,11 @@ fn sec4_task41_1_invalid_values_cannot_be_constructed() {
 }
 
 #[derive(Default)]
-struct VecSink(Vec<AuditRecord>);
+struct VecSink(Mutex<Vec<AuditRecord>>);
 
 impl AuditSink for VecSink {
-    fn record(&mut self, record: AuditRecord) -> Result<(), AuditSinkError> {
-        self.0.push(record);
+    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+        self.0.lock().unwrap().push(record.clone());
         Ok(())
     }
 }
@@ -81,15 +82,15 @@ impl AuditSink for VecSink {
 /// SEC-4・TASK-41.2: 拒否報告 1 件につきレコードが 1 件、番号・arch・pid が報告と一致する。
 #[test]
 fn sec4_task41_2_denial_report_yields_exactly_one_matching_record() {
-    let mut sink = VecSink::default();
+    let sink = VecSink::default();
     let sigsys = SeccompDenialReport::from_sigsys(1, 272, 0xC000_003E, 42).unwrap();
-    record_seccomp_denial(&sigsys, ts(), &mut sink).unwrap();
-    assert_eq!(sink.0.len(), 1);
+    record_seccomp_denial(&sigsys, ts(), &sink).unwrap();
+    assert_eq!(sink.0.lock().unwrap().len(), 1);
     let notif = SeccompDenialReport::from_user_notif(7, 97, 0xC000_00B7).unwrap();
-    record_seccomp_denial(&notif, ts(), &mut sink).unwrap();
-    assert_eq!(sink.0.len(), 2);
-    let got: Vec<(u32, u32, u32)> = sink
-        .0
+    record_seccomp_denial(&notif, ts(), &sink).unwrap();
+    assert_eq!(sink.0.lock().unwrap().len(), 2);
+    let records = sink.0.lock().unwrap();
+    let got: Vec<(u32, u32, u32)> = records
         .iter()
         .map(|r| {
             (
@@ -100,7 +101,7 @@ fn sec4_task41_2_denial_report_yields_exactly_one_matching_record() {
         })
         .collect();
     assert_eq!(got, vec![(272, 0xC000_003E, 42), (97, 0xC000_00B7, 7)]);
-    assert!(sink.0.iter().all(|r| r.layer().as_str() == "seccomp"));
+    assert!(records.iter().all(|r| r.layer().as_str() == "seccomp"));
 }
 
 #[test]

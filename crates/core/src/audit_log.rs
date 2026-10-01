@@ -8,6 +8,9 @@
 //!
 //! # 呼び出し元・契約
 //!
+//! - マウント検証/API レイヤーの記録ヘルパと記録先トレイトは [`mount`]・[`AuditSink`]（TASK-41.4・#195。
+//!   `exec::audit_mount_violation` と `oci_runtime::audit_mount_config_error` がここを使う。
+//!   本番経路への配線・永続化は未実装）
 //! - TASK-41.3（#194）の Landlock フックは [`landlock_denial_record`] で実装済み（プロセス内で観測した
 //!   `EACCES` の写像まで。ワークロードの拒否の捕捉は #840）
 //! - TASK-41.2（#193。seccomp フックは `seccomp_hook` に実装済み。拒否報告 [`SeccompDenialReport`] から
@@ -41,9 +44,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::seccomp::{AuditArch, SyscallNr};
 use crate::traits::ErrorCode;
 
+pub mod mount;
 mod seccomp_hook;
+mod sink;
 
+pub use mount::{AuditDelivery, AuditedRejection, current_pid, record_mount_rejection};
 pub use seccomp_hook::{SeccompDenialReport, SeccompReportSource, record_seccomp_denial};
+pub use sink::AuditSink;
 
 /// [`AuditPath`] が保持するバイト長の上限（Linux の `PATH_MAX` に合わせる。超過分は切り詰める）。
 pub const AUDIT_PATH_MAX_BYTES: usize = 4096;
@@ -417,48 +424,6 @@ impl AuditRecord {
         }
     }
 }
-
-/// 監査レコードの記録先境界（SEC-4）。
-///
-/// 本 crate が定義するのは境界のみ。ファイル書き込み・エンコード・フォールバックは #839・#840 が
-/// このトレイトを実装して提供する。実装は失敗を握りつぶさず `Err` で返すこと（100% 記録の契約）。
-pub trait AuditSink {
-    /// レコードを 1 件記録する。
-    fn record(&mut self, record: AuditRecord) -> Result<(), AuditSinkError>;
-}
-
-/// [`AuditSink::record`] の失敗（ERR 系の構造化形式）。メッセージにレコードの内容を含めない。
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct AuditSinkError {
-    code: ErrorCode,
-    message: &'static str,
-}
-
-impl AuditSinkError {
-    /// 構造化コードと固定文言（英語）から構築する。
-    pub fn new(code: ErrorCode, message: &'static str) -> Self {
-        Self { code, message }
-    }
-
-    /// 構造化エラーコード。
-    pub fn error_code(&self) -> ErrorCode {
-        self.code
-    }
-
-    /// 人間向け説明（英語）。
-    pub fn message(&self) -> &'static str {
-        self.message
-    }
-}
-
-impl fmt::Display for AuditSinkError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code.as_str(), self.message)
-    }
-}
-
-impl std::error::Error for AuditSinkError {}
 
 #[cfg(test)]
 mod tests {

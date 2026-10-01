@@ -19,6 +19,11 @@
 //! - 相対パスは OCI Runtime Spec が `/` 起点として解釈することを許すため、`/` 起点に正規化して受理する。
 //!   先頭の `/` 付与で増えた正規化後の長さも `CONFIG_MAX_PATH_BYTES` 以下であることを検証する。
 //!
+//! # 監査記録（SEC-4・TASK-41.4・#195）
+//!
+//! 拒否を `Mount` 監査レコードにする [`MountDestination::resolve_in_audited`]・[`audit_mount_config_error`]
+//! を持つ。本番経路への配線・永続化は未実装（TASK-41.5 系・#839）。
+//!
 //! # スコープ外（REPAIR-3）
 //!
 //! 字句的な正規化のみで、rootfs 内の symlink は解決しない。[`MountDestination::resolve_in`] の返り値は
@@ -28,7 +33,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use super::config::{CONFIG_MAX_PATH_BYTES, OciConfigError};
+use super::config::{CONFIG_MAX_PATH_BYTES, OciConfigError, OciConfigErrorKind};
+use crate::audit_log::{AuditSink, AuditedRejection, record_mount_rejection};
 
 const DEST_FIELD: &str = "mounts[].destination";
 const ROOT_FIELD: &str = "root.path";
@@ -101,6 +107,51 @@ impl MountDestination {
             return Err(OciConfigError::invalid(DEST_FIELD));
         }
         Ok(out)
+    }
+
+    /// [`Self::resolve_in`] の拒否を監査記録する版（SEC-4・TASK-41.4・#195）。
+    ///
+    /// 成功時は `resolve_in` と同じ値。`mounts[].destination` 起因の拒否時は正規化済みのコンテナ内パス（ホスト側 rootfs の実パスは
+    /// 載せない）を `Mount` レコードとして `sink` へ 1 件渡し、エラーはそのまま返す（fail-closed）。
+    /// 本番経路への配線は未実装（TASK-29.2）。
+    pub fn resolve_in_audited(
+        &self,
+        rootfs: &Path,
+        sink: &dyn AuditSink,
+    ) -> Result<PathBuf, Box<AuditedRejection<OciConfigError>>> {
+        self.resolve_in(rootfs).map_err(|e| {
+            // `root.path`（rootfs 引数）起因の拒否はマウント先の違反ではないため記録しない。
+            let is_dest = matches!(
+                e.kind(),
+                OciConfigErrorKind::Invalid { field } if *field == DEST_FIELD
+            );
+            Box::new(if is_dest {
+                record_mount_rejection(e, Some(self.as_path()), sink)
+            } else {
+                AuditedRejection::not_applicable(e)
+            })
+        })
+    }
+}
+
+/// config.json のパース拒否が `mounts[].destination` の検証によるものなら `Mount` レコードを
+/// 記録する（SEC-4・OCI-4・TASK-41.4・#195）。
+///
+/// エラーは入力値を保持しないため `path` なしで記録する（計画段階の拒否）。他フィールドの拒否は
+/// 記録せず `NotApplicable`。エラーは常にそのまま返る。
+pub fn audit_mount_config_error(
+    err: OciConfigError,
+    sink: &dyn AuditSink,
+) -> AuditedRejection<OciConfigError> {
+    let is_dest = match err.kind() {
+        OciConfigErrorKind::Invalid { field } => *field == DEST_FIELD,
+        OciConfigErrorKind::LimitExceeded { field, .. } => field == DEST_FIELD,
+        _ => false,
+    };
+    if is_dest {
+        record_mount_rejection(err, None, sink)
+    } else {
+        AuditedRejection::not_applicable(err)
     }
 }
 
@@ -236,5 +287,33 @@ mod tests {
             .resolve_in(&r)
             .unwrap();
         assert_eq!(got, r.join("C:").join("x"));
+    }
+    /// SEC-4・TASK-41.4: resolve_in の成功時は記録しない（destination 起因の拒否は
+    /// 字句正規化後は Linux では到達しないため、記録経路は `audit_mount_config_error` 側で検証する）。
+    #[test]
+    fn sec4_task41_4_resolve_in_audited_success_records_nothing() {
+        use crate::audit_log::mount::tests::VecSink;
+
+        let dest = MountDestination::parse("/etc").expect("parse");
+        let ok_sink = VecSink::new(false);
+        let root = std::env::temp_dir();
+        let out = dest.resolve_in_audited(&root, &ok_sink).expect("ok");
+        assert_eq!(out, root.join("etc"));
+        assert_eq!(ok_sink.snapshot().len(), 0);
+    }
+
+    /// SEC-4・TASK-41.4: root.path 起因の拒否は Mount レコードにしない。
+    #[test]
+    fn sec4_task41_4_resolve_in_audited_skips_root_path_rejection() {
+        use crate::audit_log::AuditDelivery;
+        use crate::audit_log::mount::tests::VecSink;
+
+        let dest = MountDestination::parse("/etc").expect("parse");
+        let sink = VecSink::new(false);
+        let r = dest
+            .resolve_in_audited(Path::new("relative-rootfs"), &sink)
+            .expect_err("relative rootfs rejected");
+        assert_eq!(r.delivery, AuditDelivery::NotApplicable);
+        assert_eq!(sink.snapshot().len(), 0);
     }
 }

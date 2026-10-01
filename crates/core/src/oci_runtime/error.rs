@@ -126,6 +126,19 @@ pub struct OciRuntimeError {
     message: String,
 }
 
+/// 表示を乱しうる非制御の書式文字（行・段落区切り、双方向制御、ゼロ幅文字、BOM）か判定する。
+fn is_unsafe_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}' | '\u{2029}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
 impl OciRuntimeError {
     /// エラーを構築する。`message` はサニタイズ（制御文字の置換・長さ上限での切り詰め）して保持する。
     pub fn new(op: LifecycleOp, code: ErrorCode, message: impl AsRef<str>) -> Self {
@@ -136,8 +149,9 @@ impl OciRuntimeError {
         // （untrusted な巨大メッセージによるメモリ・CPU の浪費を防ぐ）。
         let mut message = String::with_capacity(raw.len().min(OCI_ERROR_MESSAGE_MAX_BYTES));
         for c in raw.chars() {
-            // `is_control()` は U+2028 / U+2029（行・段落区切り）を含まないため明示的に置換する。
-            let c = if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            // `is_control()` は U+2028 / U+2029（行・段落区切り）や双方向テキスト制御文字
+            // （U+202E 等。表示順を操作してエラー内容を偽装できる）を含まないため明示的に置換する。
+            let c = if c.is_control() || is_unsafe_format_char(c) {
                 ' '
             } else {
                 c
@@ -279,6 +293,17 @@ mod tests {
             "a\u{2028}b\u{2029}c",
         );
         assert_eq!(e.message(), "a b c");
+    }
+
+    /// ERR-2: 双方向テキスト制御文字（U+202E 等）やゼロ幅文字も空白へ置換される。
+    #[test]
+    fn err2_message_bidi_controls_are_replaced() {
+        let e = OciRuntimeError::new(
+            LifecycleOp::Create,
+            ErrorCode::Internal,
+            "a\u{202E}b\u{2066}c\u{2069}d\u{200F}e\u{061C}f\u{FEFF}g",
+        );
+        assert_eq!(e.message(), "a b c d e f g");
     }
 
     /// ERR-2: 上限超過は文字境界で切り詰められる。

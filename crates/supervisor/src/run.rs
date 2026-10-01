@@ -203,6 +203,14 @@ pub enum MonitorOutcome {
         /// `supervisor_pid` 解除の失敗理由。
         release_error: TraitError,
     },
+    /// 監視開始後の準備（ログ捕捉の開始）に失敗し、記録済みの `supervisor_pid` の解除にも失敗した
+    /// （状態に自 pid が残り得る）。解除に成功した場合は `Err(start_error)` で返る。
+    StartFailedUnreleased {
+        /// 準備（捕捉開始）の失敗理由。
+        start_error: TraitError,
+        /// `supervisor_pid` 解除の失敗理由。
+        release_error: TraitError,
+    },
     /// 停止要求で監視をやめた（プロセスは kill せず、状態は `Running` のまま）。
     ///
     /// 起動ハンドルの回収責任は呼び出し側に残る（`monitor` は参照でしか受け取らない）。呼び出し側は
@@ -368,11 +376,16 @@ fn monitor_after_claim(
     })?;
 
     if let Err(e) = after_claim() {
-        // 監視を始められないので、記録済みの自 pid を残さない。解放失敗は元のエラーを優先する。
-        let _ = observed(obs, MonitorOperation::ReleaseAfterWaitError, || {
+        // 監視を始められないので、記録済みの自 pid を残さない。解放にも失敗したら両方を返す。
+        return match observed(obs, MonitorOperation::ReleaseAfterWaitError, || {
             release_supervisor_pid(state, pid, self_pid)
-        });
-        return Err(e);
+        }) {
+            Ok(_) => Err(e),
+            Err(release_error) => Ok(MonitorOutcome::StartFailedUnreleased {
+                start_error: e,
+                release_error,
+            }),
+        };
     }
 
     loop {
@@ -454,14 +467,15 @@ impl MonitoredWithCapture {
 /// [`monitor_with_observer`] に stdout / stderr の行単位捕捉（[`crate::logs`]。#241・TASK-157.7）を加える。
 ///
 /// 事前条件（`Running` かつ pid 一致）を満たさない、または他の supervisor が既に監視権を持つ場合は、スレッドを起こさず
-/// （ストリームを読まず）`FailedPrecondition`。捕捉は監視権の取得後に開始し、開始に失敗したら監視権を解放して `Err`。プロセスの終了（`Exited` / `ExitedUnrecorded`）を検知したときだけ、`drain_timeout` を上限に
+/// （ストリームを読まず）`FailedPrecondition`。この場合 `streams` は呼び出し側に残る（取り出すのは監視権の取得後のみ）。
+/// 捕捉開始の失敗で監視権の解放にも失敗したら [`MonitorOutcome::StartFailedUnreleased`] を返す。捕捉は監視権の取得後に開始し、開始に失敗したら監視権を解放して `Err`。プロセスの終了（`Exited` / `ExitedUnrecorded`）を検知したときだけ、`drain_timeout` を上限に
 /// 全ストリームの EOF を待って集計を返す。`StopRequested` などプロセスが生存し得る結果では待たない
 /// （EOF が来ないため）。その場合リーダーは EOF まで走り sink への追記を続け、ストリームの所有権は捕捉側へ移っているため
 /// 監視の引き継ぎ時に再注入できない（#239・TASK-164 で扱う）。永続化・ローテーションは未実装（SUP-7・TASK-164）。
 pub fn monitor_with_capture(
     state: &mut SupervisedState,
     process: &dyn LaunchedProcess,
-    streams: OutputStreams,
+    streams: &mut OutputStreams,
     sink: Arc<dyn LogSink>,
     config: &MonitorConfig,
     stop: &StopToken,
@@ -473,12 +487,10 @@ pub fn monitor_with_capture(
         ));
     }
     // 監視権の取得後に捕捉を開始する。権限を得られない場合・開始失敗の場合に出力ストリームを消費しない。
-    let mut streams = Some(streams);
+    // `streams` は可変参照で受け、監視権の取得に成功した場合のみ中身を取り出す。取得失敗時は呼び出し側の手元に残る。
     let mut capture: Option<LogCapture> = None;
     let outcome = monitor_after_claim(state, process, config, stop, obs, &mut || {
-        let Some(streams) = streams.take() else {
-            return Ok(());
-        };
+        let streams = std::mem::take(streams);
         capture = Some(observed(obs, MonitorOperation::CaptureStart, || {
             LogCapture::start(streams, Arc::clone(&sink))
         })?);
@@ -1055,6 +1067,35 @@ mod tests {
         assert_eq!(release_error.code(), ErrorCode::FailedPrecondition);
     }
 
+    /// TASK-157.7: 捕捉開始（after_claim）の失敗と解除失敗の両方を StartFailedUnreleased で返す。
+    #[test]
+    fn sup1_task157_7_start_failure_release_failure_is_identifiable() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = FakeProc::alive();
+        let out = monitor_after_claim(
+            &mut s,
+            &p,
+            &MonitorConfig::default(),
+            &StopToken::new(),
+            &StderrLogObserver,
+            &mut || {
+                *store.conflicts.lock().unwrap() = 100;
+                Err(TraitError::new(ErrorCode::Internal, "fake start failure"))
+            },
+        )
+        .unwrap();
+        let MonitorOutcome::StartFailedUnreleased {
+            start_error,
+            release_error,
+        } = out
+        else {
+            panic!("unexpected outcome")
+        };
+        assert_eq!(start_error.code(), ErrorCode::Internal);
+        assert_eq!(release_error.code(), ErrorCode::FailedPrecondition);
+    }
+
     struct Rec(Mutex<Vec<(MonitorOperation, Option<ErrorCode>)>>);
     impl MonitorObserver for Rec {
         fn observe(&self, e: &MonitorEvent) {
@@ -1165,11 +1206,11 @@ mod tests {
         let store = running_store(0);
         let mut s = attach(&store);
         let p = FakeProc::exiting(1, ProcessExit::Exited(0));
-        let (streams, sink) = capture_streams(b"a\nb\n", b"e\n");
+        let (mut streams, sink) = capture_streams(b"a\nb\n", b"e\n");
         let r = monitor_with_capture(
             &mut s,
             &p,
-            streams,
+            &mut streams,
             sink.clone(),
             &MonitorConfig::default(),
             &StopToken::new(),
@@ -1191,13 +1232,13 @@ mod tests {
         let mut s = attach(&store);
         let p = FakeProc::alive();
         let (reader, writer) = std::io::pipe().unwrap();
-        let streams = OutputStreams::new(Some(Box::new(reader)), None);
+        let mut streams = OutputStreams::new(Some(Box::new(reader)), None);
         let stop = StopToken::new();
         stop.request_stop();
         let r = monitor_with_capture(
             &mut s,
             &p,
-            streams,
+            &mut streams,
             Arc::new(crate::logs::MemoryLogSink::default()),
             &MonitorConfig::default(),
             &stop,
@@ -1219,11 +1260,11 @@ mod tests {
         );
         let mut s = attach(&store);
         let p = FakeProc::alive();
-        let (streams, sink) = capture_streams(b"x\n", b"y\n");
+        let (mut streams, sink) = capture_streams(b"x\n", b"y\n");
         let e = monitor_with_capture(
             &mut s,
             &p,
-            streams,
+            &mut streams,
             sink.clone(),
             &MonitorConfig::default(),
             &StopToken::new(),
@@ -1252,10 +1293,11 @@ mod tests {
         let mut s = attach(&store);
         let read = Arc::new(AtomicBool::new(false));
         let sink = Arc::new(crate::logs::MemoryLogSink::default());
+        let mut streams = OutputStreams::new(Some(Box::new(Spy(read.clone()))), None);
         let e = monitor_with_capture(
             &mut s,
             &FakeProc::alive(),
-            OutputStreams::new(Some(Box::new(Spy(read.clone()))), None),
+            &mut streams,
             sink.clone(),
             &MonitorConfig::default(),
             &StopToken::new(),
@@ -1263,6 +1305,8 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        // 監視権を得られなかった場合、ストリームは呼び出し側に残る。
+        assert!(!streams.is_empty());
         std::thread::sleep(Duration::from_millis(50));
         assert!(!read.load(Ordering::SeqCst));
         assert!(sink.snapshot().unwrap().is_empty());
@@ -1275,14 +1319,14 @@ mod tests {
         let mut s = attach(&store);
         let p = FakeProc::exiting(1, ProcessExit::Exited(3));
         let (reader, writer) = std::io::pipe().unwrap();
-        let streams = OutputStreams::new(Some(Box::new(reader)), None);
+        let mut streams = OutputStreams::new(Some(Box::new(reader)), None);
         let cfg = MonitorConfig::default()
             .with_drain_timeout(Duration::from_millis(50))
             .unwrap();
         let r = monitor_with_capture(
             &mut s,
             &p,
-            streams,
+            &mut streams,
             Arc::new(crate::logs::MemoryLogSink::default()),
             &cfg,
             &StopToken::new(),
@@ -1309,12 +1353,12 @@ mod tests {
         let store = running_store(0);
         let mut s = attach(&store);
         let p = FakeProc::exiting(1, ProcessExit::Exited(0));
-        let (streams, sink) = capture_streams(b"", b"");
+        let (mut streams, sink) = capture_streams(b"", b"");
         let rec = Rec(Mutex::new(Vec::new()));
         monitor_with_capture(
             &mut s,
             &p,
-            streams,
+            &mut streams,
             sink,
             &MonitorConfig::default(),
             &StopToken::new(),

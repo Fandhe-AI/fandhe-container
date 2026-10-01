@@ -76,6 +76,11 @@ impl OutputStreams {
         Self { stdout, stderr }
     }
 
+    /// 捕捉対象のストリームを 1 つも持たないか。
+    pub fn is_empty(&self) -> bool {
+        self.stdout.is_none() && self.stderr.is_none()
+    }
+
     /// どちらも捕捉しない。
     pub fn none() -> Self {
         Self::default()
@@ -233,11 +238,14 @@ pub struct LogCapture {
 }
 
 impl LogCapture {
-    /// ストリームごとにリーダースレッドを起動する。スレッド起動失敗は `Internal`
-    /// （先に起動したスレッドは EOF まで走り続ける）。
+    /// ストリームごとにリーダースレッドを起動する。
+    ///
+    /// 全スレッドの起動に成功してから一斉に読み取りを開始させる（起動ゲート）。途中のスレッド起動失敗は `Internal` で、
+    /// 既に起動したスレッドはゲートの解放前に終了し、一行も読まず sink へも書かない（部分起動のまま走り続けない）。
+    /// この失敗経路では注入されたストリームは全て破棄される（再注入は不可。module doc 参照）。
     pub fn start(streams: OutputStreams, sink: Arc<dyn LogSink>) -> Result<Self, TraitError> {
         let (tx, rx) = mpsc::channel();
-        let mut expected = 0usize;
+        let mut gates: Vec<mpsc::Sender<()>> = Vec::new();
         for (kind, stream) in [
             (StreamKind::Stdout, streams.stdout),
             (StreamKind::Stderr, streams.stderr),
@@ -245,9 +253,15 @@ impl LogCapture {
             let Some(stream) = stream else { continue };
             let tx = tx.clone();
             let sink = Arc::clone(&sink);
+            let (gate_tx, gate_rx) = mpsc::channel::<()>();
+            // 失敗時は gates（と未起動分の stream）が drop され、起動済みスレッドの recv が Err になって終了する。
             std::thread::Builder::new()
                 .name(format!("supervisor-log-{}", kind.as_str()))
                 .spawn(move || {
+                    // ゲートが解放されずに閉じた（部分起動の中止）なら、何も読まず stream を破棄して終わる。
+                    if gate_rx.recv().is_err() {
+                        return;
+                    }
                     let summary = pump(stream, kind, sink.as_ref());
                     // 受信側が drain を諦めて破棄済みなら送信失敗は無視してよい。
                     let _ = tx.send((kind, summary));
@@ -255,7 +269,12 @@ impl LogCapture {
                 .map_err(|_| {
                     TraitError::new(ErrorCode::Internal, "failed to spawn log reader thread")
                 })?;
-            expected += 1;
+            gates.push(gate_tx);
+        }
+        let expected = gates.len();
+        for gate in gates {
+            // スレッドは gate_rx を保持して待機中のため送信は失敗しない。失敗しても当該スレッドが既に終了しているだけ。
+            let _ = gate.send(());
         }
         Ok(Self { rx, expected })
     }

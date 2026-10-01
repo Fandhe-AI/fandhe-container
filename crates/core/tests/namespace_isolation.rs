@@ -52,7 +52,7 @@ fn main() {
 mod linux {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, ExitStatus, Stdio};
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
@@ -204,9 +204,30 @@ mod linux {
                 Err(e) => return Err(format!("wait kill failed: {e}")),
             }
         }
+        // SIGKILL 後の回収にも期限を設け、回収できなければ後始末失敗として返す（REPAIR-5）。
         let _ = killer.kill();
-        let _ = killer.wait();
-        Err("kill did not exit within 5s".to_string())
+        match wait_bounded(&mut killer, REAP_LIMIT) {
+            Ok(_) => Err("kill did not exit within 5s".to_string()),
+            Err(e) => Err(format!("kill did not exit within 5s and {e}")),
+        }
+    }
+
+    /// SIGKILL 後の回収待ちの上限（REPAIR-5）。
+    const REAP_LIMIT: Duration = Duration::from_secs(5);
+
+    /// 子プロセスの終了を最大 `limit` だけ待つ。期限内に回収できなければ `Err`（無期限 `wait` を避ける。REPAIR-5）。
+    fn wait_bounded(child: &mut Child, limit: Duration) -> Result<ExitStatus, String> {
+        let deadline = Instant::now() + limit;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) if Instant::now() >= deadline => {
+                    return Err(format!("child {} not reaped within {limit:?}", child.id()));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => return Err(format!("try_wait failed: {e}")),
+            }
+        }
     }
 
     /// プロセスグループ `pgid` に属する生存プロセス（ゾンビを除く）の PID を `/proc` から列挙する。
@@ -334,7 +355,8 @@ mod linux {
                         Ok(())
                     };
                     // 直接の子の kill / 回収に失敗した場合も停止未確認として rootfs を保持する。
-                    let direct_stopped = child.kill().is_ok() && child.wait().is_ok();
+                    let direct_stopped =
+                        child.kill().is_ok() && wait_bounded(&mut child, REAP_LIMIT).is_ok();
                     if group_result.is_err() || !direct_stopped {
                         STOP_UNCONFIRMED.store(true, std::sync::atomic::Ordering::SeqCst);
                     }

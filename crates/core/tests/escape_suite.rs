@@ -200,12 +200,14 @@ const RECORD_MAX_LINES: usize = 64;
 /// 子から回収した記録の解析結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedRecord {
-    outcome: AttackOutcome,
+    /// outcome 行が無ければ `None`。シグナル終了では outcome 行の前に停止し得るため、欠落の可否は
+    /// 終了状態を見る `judge` が決める（`Exited` なら `MissingOutcome`。`Signaled` なら許容）。
+    outcome: Option<AttackOutcome>,
     audit_layers: Vec<String>,
 }
 
 /// 記録（行指向テキスト）を厳格に解析する。子の出力は untrusted として扱い、欠落・重複・未知キー・
-/// 不正値・上限超過を拒否する。形式: `outcome=<ok|errno=N|absent|failed>` を 1 行、
+/// 不正値・上限超過を拒否する。形式: `outcome=<ok|errno=N|absent|failed>` を高々 1 行（省略可）、
 /// `audit=<encode_json_line の 1 行>` を 0 行以上。
 fn parse_record(text: &str) -> Result<ParsedRecord, String> {
     if text.len() > RECORD_MAX_BYTES {
@@ -239,7 +241,6 @@ fn parse_record(text: &str) -> Result<ParsedRecord, String> {
             other => return Err(format!("unknown key {other:?}")),
         }
     }
-    let outcome = outcome.ok_or_else(|| "missing key \"outcome\"".to_string())?;
     Ok(ParsedRecord {
         outcome,
         audit_layers,
@@ -269,6 +270,24 @@ fn sec2_task42_1_judge_selftest() {
         audit_layers: layers.iter().map(|s| s.to_string()).collect(),
     };
     let ok_exit = ObservedExit::Exited(0);
+
+    // シグナル終了 + 監査必須: outcome 行なし・audit 行のみの記録でも判定できる。
+    let sig_audit = Expectation {
+        allowed: &[],
+        signal: Some(31),
+        audit: AuditExpectation::Required("seccomp"),
+    };
+    assert_eq!(
+        judge(
+            &sig_audit,
+            &obs(ObservedExit::Signaled(31), None, &["seccomp"])
+        ),
+        CaseVerdict::Pass
+    );
+    assert_eq!(
+        judge(&sig_audit, &obs(ObservedExit::Signaled(31), None, &[])),
+        CaseVerdict::Fail(vec![Mismatch::MissingAudit { layer: "seccomp" }])
+    );
 
     assert_eq!(
         judge(
@@ -340,21 +359,24 @@ fn sec2_task42_1_record_parser_selftest() {
     assert_eq!(
         parse_record(&ok),
         Ok(ParsedRecord {
-            outcome: AttackOutcome::Errno(13),
+            outcome: Some(AttackOutcome::Errno(13)),
             audit_layers: vec!["landlock".to_string()],
         })
     );
     assert_eq!(
         parse_record("outcome=ok\n"),
         Ok(ParsedRecord {
-            outcome: AttackOutcome::Succeeded,
+            outcome: Some(AttackOutcome::Succeeded),
             audit_layers: vec![],
         })
     );
     assert_eq!(AttackOutcome::Errno(13).render(), "errno=13");
     assert_eq!(
         parse_record(&format!("{audit}\n")),
-        Err("missing key \"outcome\"".to_string())
+        Ok(ParsedRecord {
+            outcome: None,
+            audit_layers: vec!["landlock".to_string()],
+        })
     );
     assert_eq!(
         parse_record("outcome=ok\noutcome=absent\n"),
@@ -788,16 +810,11 @@ mod linux {
             .unwrap_or_else(|e| panic!("record read did not finish in time: {e}"))
             .expect("read record");
         let observation = match parse_record(&text) {
+            // outcome 欠落は `judge` が終了状態と突き合わせて判定する（シグナル終了では audit 行のみが残り得る）。
             Ok(rec) => Observation {
                 exit,
-                outcome: Some(rec.outcome),
+                outcome: rec.outcome,
                 audit_layers: rec.audit_layers,
-            },
-            // 記録なし（シグナル終了等）は outcome 無しの観測にする。不正な記録は失敗。
-            Err(_) if text.is_empty() => Observation {
-                exit,
-                outcome: None,
-                audit_layers: Vec::new(),
             },
             Err(e) => panic!("invalid record from the container: {e}"),
         };

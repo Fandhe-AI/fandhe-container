@@ -737,6 +737,10 @@ pub fn spawn_container_seccomp_probe(
 ///
 /// exec が許可されたら（証跡配線後。後続作業）、エントリポイント内の攻撃プローブへ移して本関数は
 /// 廃止する（REPAIR-3）。
+///
+/// 任意クロージャを分離後の子で実行できるため、cargo feature `escape-probe`（結合試験用に dev-dependency の
+/// 自己参照で有効化。通常ビルドには含まれない）でのみ公開する。
+#[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub fn spawn_container_probe<F>(
     rootfs: &Path,

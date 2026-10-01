@@ -119,8 +119,11 @@ impl AuditNetlinkFrame {
         if payload.len() > AUDIT_MESSAGE_TEXT_MAX {
             return Err(too_long());
         }
+        // AUDIT_TRUSTED_APP ではカーネルが本文の最終バイトを NUL で上書きするため、libaudit と同じく
+        // 末尾 NUL を含めた strlen+1 を `nlmsg_len` に入れる（含めないと最後のフィールドが欠ける）。
         let total = NLMSG_HDRLEN
             .checked_add(payload.len())
+            .and_then(|t| t.checked_add(1))
             .ok_or_else(too_long)?;
         let hdr = NlMsgHdr {
             len: u32::try_from(total).map_err(|_| too_long())?,
@@ -133,6 +136,7 @@ impl AuditNetlinkFrame {
         let mut bytes = Vec::with_capacity(padded);
         bytes.extend_from_slice(&hdr.to_bytes());
         bytes.extend_from_slice(payload);
+        // 末尾 NUL と 4 バイト境界までのパディング（ゼロ埋め）。
         bytes.resize(padded, 0);
         Ok(Self { bytes, seq })
     }
@@ -484,7 +488,7 @@ mod tests {
     fn sec4_task41_5_2_frame_bytes_are_exact() {
         let f = AuditNetlinkFrame::new(7, b"abcde").unwrap();
         let mut want = Vec::new();
-        want.extend_from_slice(&21u32.to_ne_bytes()); // 16 + 5（パディングは長さに含めない）
+        want.extend_from_slice(&22u32.to_ne_bytes()); // 16 + 5 + 末尾 NUL（パディングは長さに含めない）
         want.extend_from_slice(&1121u16.to_ne_bytes());
         want.extend_from_slice(&5u16.to_ne_bytes()); // REQUEST | ACK
         want.extend_from_slice(&7u32.to_ne_bytes());

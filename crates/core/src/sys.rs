@@ -219,6 +219,8 @@ mod consts {
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
     pub const NETLINK_AUDIT: i32 = 9;
     pub const POLLIN: i16 = 1;
+    /// `MSG_DONTWAIT`（送信側を非ブロッキングにする。x86_64・aarch64 とも 0x40）。
+    pub const MSG_DONTWAIT: i32 = 0x40;
     pub const EPROTONOSUPPORT: i32 = 93;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ECONNREFUSED: i32 = 111;
@@ -357,6 +359,8 @@ mod consts {
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
     pub const NETLINK_AUDIT: i32 = 9;
     pub const POLLIN: i16 = 1;
+    /// `MSG_DONTWAIT`（送信側を非ブロッキングにする。x86_64・aarch64 とも 0x40）。
+    pub const MSG_DONTWAIT: i32 = 0x40;
     pub const EPROTONOSUPPORT: i32 = 93;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ECONNREFUSED: i32 = 111;
@@ -460,6 +464,7 @@ mod consts {
     pub const SOCK_CLOEXEC: i32 = 0;
     pub const NETLINK_AUDIT: i32 = 0;
     pub const POLLIN: i16 = 0;
+    pub const MSG_DONTWAIT: i32 = 0;
     pub const EPROTONOSUPPORT: i32 = -22;
     pub const EAFNOSUPPORT: i32 = -23;
     pub const ECONNREFUSED: i32 = -24;
@@ -651,6 +656,9 @@ pub(crate) fn netlink_audit_socket() -> Result<OwnedFd, SysError> {
 }
 
 /// `buf` 全体を 1 データグラムとしてカーネル（`nl_pid = 0`）へ送る。送れたバイト数を返す。
+///
+/// 送信は `MSG_DONTWAIT` で行い、送信キューが詰まっていても待たずに `EAGAIN` で失敗する
+/// （監査ファイル失敗時の呼び出し元を無期限にブロックさせない。SEC-4・TASK-41.5.2）。
 pub(crate) fn netlink_send_to_kernel(fd: BorrowedFd<'_>, buf: &[u8]) -> Result<usize, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
@@ -669,7 +677,7 @@ pub(crate) fn netlink_send_to_kernel(fd: BorrowedFd<'_>, buf: &[u8]) -> Result<u
             fd.as_raw_fd(),
             buf.as_ptr().cast(),
             buf.len(),
-            0,
+            consts::MSG_DONTWAIT,
             &raw const addr,
             core::mem::size_of::<SockaddrNl>() as u32,
         )
@@ -1945,6 +1953,7 @@ mod tests {
         assert_eq!((consts::AF_NETLINK, consts::SOCK_RAW), (16, 3));
         assert_eq!(consts::SOCK_CLOEXEC, 0o2_000_000);
         assert_eq!((consts::NETLINK_AUDIT, consts::POLLIN), (9, 1));
+        assert_eq!(consts::MSG_DONTWAIT, 0x40);
         assert_eq!((EAFNOSUPPORT, EPROTONOSUPPORT, ECONNREFUSED), (97, 93, 111));
         assert_eq!(std::mem::size_of::<SockaddrNl>(), 12);
         assert_eq!(std::mem::size_of::<PollFd>(), 8);

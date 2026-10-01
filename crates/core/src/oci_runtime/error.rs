@@ -362,6 +362,81 @@ mod tests {
         assert_eq!(e.message(), "a b c d");
     }
 
+    /// ERR-2: Cf の範囲表は昇順・重複なしで、Unicode 16.0.0 の Cf 全 170 符号位置と一致する。
+    #[test]
+    fn err2_format_char_table_is_sorted_disjoint_and_complete() {
+        let mut total = 0u32;
+        let mut prev_hi: Option<char> = None;
+        for (lo, hi) in FORMAT_CHAR_RANGES {
+            assert!(lo <= hi, "{lo:?}..={hi:?}");
+            if let Some(p) = prev_hi {
+                assert!(p < lo, "{p:?} overlaps {lo:?}");
+            }
+            prev_hi = Some(hi);
+            total += u32::from(hi) - u32::from(lo) + 1;
+        }
+        assert_eq!(total, 170);
+    }
+
+    /// ERR-2: 規則（Cc・Cf・Zl・Zp）の各カテゴリの代表と Cf 範囲の両端が空白へ置換され、
+    /// 範囲の直外（U+00AC・U+2065〔未割り当て〕・U+2070・U+E0080）や通常の文字は保持される。
+    #[test]
+    fn err2_message_general_category_rule() {
+        // Cc（U+007F・U+0085）・Zl・Zp・各 Cf 範囲の両端。
+        let mut unsafe_chars = vec!['\u{007F}', '\u{0085}', '\u{2028}', '\u{2029}'];
+        for (lo, hi) in FORMAT_CHAR_RANGES {
+            unsafe_chars.push(lo);
+            unsafe_chars.push(hi);
+        }
+        for c in unsafe_chars {
+            let input = format!("a{c}b");
+            let e = OciRuntimeError::new(LifecycleOp::Create, ErrorCode::Internal, &input);
+            assert_eq!(e.message(), "a b", "U+{:04X}", u32::from(c));
+        }
+        let kept = "\u{00AC}\u{2065}\u{2070}\u{E0080}e\u{0301}é漢字 x";
+        let e = OciRuntimeError::new(LifecycleOp::Create, ErrorCode::Internal, kept);
+        assert_eq!(
+            e.message(),
+            "\u{00AC}\u{2065}\u{2070}\u{E0080}e\u{0301}é漢字 x"
+        );
+    }
+
+    /// ERR-2: 走査は上限で止まる。無限の入力でも終了し、読み取るのは上限 + 1 文字まで。
+    #[test]
+    fn err2_sanitize_scan_stops_at_limit() {
+        let mut consumed = 0usize;
+        let chars = std::iter::repeat('a').inspect(|_| consumed += 1);
+        let mut out = String::new();
+        push_sanitized_bounded(&mut out, chars, OCI_ERROR_MESSAGE_MAX_BYTES);
+        assert_eq!(out.len(), 4096);
+        assert_eq!(consumed, 4097);
+    }
+
+    /// ERR-2: 巨大な入力（1 MiB）でも保持する `message` の確保量は上限（4096 バイト）で、
+    /// 短い入力では入力長と同じ（置換で伸びないため再確保しない）。
+    #[test]
+    fn err2_message_allocation_is_capped_at_limit() {
+        let huge = "x".repeat(1024 * 1024);
+        let e = OciRuntimeError::new(LifecycleOp::Create, ErrorCode::Internal, huge.as_str());
+        assert_eq!(e.message.len(), 4096);
+        assert_eq!(e.message.capacity(), 4096);
+
+        let huge_err = TraitError::new(ErrorCode::Unavailable, "\u{202E}".repeat(1024 * 1024));
+        let e = OciRuntimeError::from_trait_error(LifecycleOp::Kill, huge_err);
+        assert_eq!(e.message.len(), 4096);
+        assert_eq!(e.message.capacity(), 4096);
+        assert_eq!(e.message, " ".repeat(4096));
+
+        // U+202E・U+2028（各 3 バイト）を 1 バイトの空白へ置換しても入力長 8 の確保を超えない。
+        let e = OciRuntimeError::new(
+            LifecycleOp::Create,
+            ErrorCode::Internal,
+            "a\u{202E}b\u{2028}",
+        );
+        assert_eq!(e.message.as_str(), "a b ");
+        assert_eq!(e.message.capacity(), 8);
+    }
+
     /// ERR-2: 上限超過は文字境界で切り詰められる。
     #[test]
     fn err2_message_is_truncated_at_char_boundary() {

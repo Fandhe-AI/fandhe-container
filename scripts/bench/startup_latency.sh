@@ -51,7 +51,7 @@
 #   1: ランタイムの create / start / state の失敗・タイムアウト、実行開始を観測できない、
 #      ID が既に使用中
 #   2: 入力エラー（引数・bundle・output の検証失敗）
-#   3: 前提ツール欠如（bash 5 以上・jq・GNU timeout・GNU dd〔conv=excl〕・mktemp・sleep 等）
+#   3: 前提ツール欠如（bash 5 以上・jq・GNU timeout・GNU dd〔conv=excl〕・GNU ln〔-T〕・mktemp・sleep 等）
 #   4: 後始末失敗（作成済みコンテナを delete できない、create 失敗後に未作成を確定できない等。
 #      残存の可能性がある ID を stderr に出す。最優先）
 #
@@ -215,7 +215,7 @@ if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
   err "missing-prerequisite" "bash 5 or later is required (EPOCHREALTIME)"
   exit "$EXIT_PREREQ"
 fi
-for tool in jq timeout mktemp tail rm sleep dd; do
+for tool in jq timeout mktemp tail rm sleep dd ln; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     err "missing-prerequisite" "required tool not found: $tool"
     exit "$EXIT_PREREQ"
@@ -589,16 +589,33 @@ result="$(jq -n \
 # --output 指定時はファイル作成に成功してから stdout へ出す（作成失敗時に成功結果を
 # stdout へ残さず、呼び出し元が失敗した計測を取り込まないようにする）。
 if [ -n "$output" ]; then
-  # 結果は非公開の tmpdir に書いてから、dd の conv=excl（open の O_CREAT|O_EXCL）で出力先を
-  # 排他的に新規作成し、その記述子へ書き込む。O_EXCL は既存のパス（通常ファイル・symlink・
-  # FIFO 等の種別を問わない）で EEXIST となるため、検証後に出力先が FIFO や symlink へ
-  # 差し替えられても開かずに失敗する（noclobber は通常ファイル以外を開いてしまい、読み手の
-  # いない FIFO で無期限に待機し得る）。念のため timeout でも上限を掛ける（REPAIR-5）。
+  # 完成した結果だけを出力先に公開する（書き込みが途中で失敗しても不完全な JSON を
+  # 出力先に残さない）。手順:
+  #   1. 結果を非公開の tmpdir に書く。
+  #   2. 出力先と同じディレクトリに今回の実行固有の名前（run_tag・PID・乱数）で一時ファイルを
+  #      dd の conv=excl（O_CREAT|O_EXCL）で新規作成し、その記述子へ書き込んで fsync する。
+  #      O_EXCL は既存のパス（通常ファイル・symlink・FIFO 等）で EEXIST となるため、差し替え
+  #      られたパスを開かない（noclobber は FIFO を開いて無期限に待機し得る）。
+  #   3. ln -T（link(2)）で一時ファイルを出力先へ公開する。link は出力先が種別を問わず既に
+  #      存在すれば EEXIST で失敗し、symlink を辿らず、-T によりディレクトリ内へも作らない。
+  #   4. 一時ファイルを消す（成功時は出力先が同じ実体を指して残る）。
+  # 失敗時は一時ファイルを消して exit 2 にする。一時ファイル名は今回の実行に固有なので、
+  # 消す対象は今回作ったものに限られる。dd・ln には timeout で上限を掛ける（REPAIR-5）。
   printf '%s\n' "$result" >"$tmpdir/result.json"
+  staging="$output_dir/.startup_latency.$run_tag.$$.$RANDOM.tmp"
   if ! timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" \
-    dd if="$tmpdir/result.json" of="$output" conv=excl status=none 2>/dev/null; then
-    err "output-write-failed" "could not create --output file"
+    dd if="$tmpdir/result.json" of="$staging" conv=excl,fsync status=none 2>/dev/null; then
+    rm -f -- "$staging" || true
+    err "output-write-failed" "could not write the --output file"
     exit "$EXIT_INPUT"
+  fi
+  if ! timeout --kill-after="$KILL_AFTER_SECS" "$timeout_secs" ln -T -- "$staging" "$output" 2>/dev/null; then
+    rm -f -- "$staging" || true
+    err "output-write-failed" "could not create --output file (it may already exist, or hard links are unsupported)"
+    exit "$EXIT_INPUT"
+  fi
+  if ! rm -f -- "$staging"; then
+    echo "warning: could not remove the temporary file next to --output" >&2
   fi
 fi
 printf '%s\n' "$result"

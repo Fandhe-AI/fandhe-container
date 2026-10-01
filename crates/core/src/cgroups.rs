@@ -22,8 +22,14 @@
 //! ```text
 //! <委譲された親 P>/            ← 自プロセスの元の所属。controller を有効化する対象
 //! ├── fc-runtime/             ← 退避リーフ（自プロセス〔runtime / supervisor〕の移動先）
-//! └── fc-<container-id>/      ← コンテナ用子 cgroup（この時点では空）
+//! └── fc-<container-id>@<n>/  ← コンテナ用子 cgroup（この時点では空。名前は [`CgroupName::for_instance`]）
 //! ```
+//! コンテナ用子 cgroup の名前は、状態記録の create で割り当てた revision（instance `n`。ストア全体で再利用
+//! されない）を含む `fc-<id>@<n>` とする（TASK-30.3・OCI-6）。同じ ID の削除・再作成をまたいでも名前が
+//! 重ならないため、古いレコードを読んだ delete が再作成後のコンテナの cgroup を名前で消すことはない。
+//! `@` は `ContainerId` の許容文字に無いため、`fc-runtime` や ID だけの名前とも衝突しない。
+//! [`CgroupName::new`]（`fc-<id>`）は instance を持たない名前で、TASK-32 の結合試験が使う。delete はこの名前の
+//! cgroup を削除しないので、本番 launcher は `for_instance` で作る。
 //! 退避リーフは 1 supervisor = 1 委譲スコープを前提とする（CORE-1・D-19）。複数コンテナが同一
 //! スコープを共有する運用の扱いは本番 launcher（TASK-29 / TASK-157 系）で整合させる。退避リーフは自プロセスが入るため削除せず、
 //! スコープ終了時に systemd が回収する。
@@ -40,7 +46,8 @@
 //!   検証つきで開き、`oci_runtime::ContainerCgroupRemover` の実装として [`DelegatedCgroup::remove_child`] へ渡す
 //!   （`oci_runtime::delete` が状態記録の削除の前に呼ぶ。本番の呼び出し元による結線は未実装）。
 //!   `ContainerCgroupRemover::scope` は検出した委譲パス（[`DelegatedCgroup::path`] と同じ文字列）を返し、
-//!   delete は状態に記録されたスコープ（`StateRecord::cgroup_scope`）と一致するときだけ削除・不存在確認を行う
+//!   delete は状態に記録された配置（`StateRecord::cgroup`）のスコープと一致するときだけ、記録された instance の
+//!   名前（`fc-<id>@<n>`）で削除・不存在確認を行う
 //!
 //! # 未実装（REPAIR-3）
 //! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映、本番 launcher での
@@ -59,7 +66,7 @@ use std::os::unix::fs::MetadataExt as _;
 
 use crate::oci_runtime::{CgroupRemoval, ContainerCgroupRemover};
 use crate::sys::{self, SysError};
-use crate::traits::{CgroupScope, ContainerId, ErrorCode, TraitError};
+use crate::traits::{CgroupScope, ContainerId, ErrorCode, StateRevision, TraitError};
 
 mod cpu;
 pub use cpu::{CpuMax, CpuQuota};
@@ -68,6 +75,8 @@ pub use cpu::{CpuMax, CpuQuota};
 const EVACUATION_LEAF: &str = "fc-runtime";
 /// コンテナ用子 cgroup の接頭辞。`cgroup.procs` 等のインターフェースファイル名との衝突を避ける。
 const CONTAINER_PREFIX: &str = "fc-";
+/// コンテナ ID と instance の区切り（`ContainerId` の許容文字に含まれない。TASK-30.3）。
+const INSTANCE_SEPARATOR: char = '@';
 /// cgroup 名（ディレクトリ要素）の最大バイト数（`NAME_MAX`）。
 const NAME_MAX: usize = 255;
 /// `/proc/self/cgroup` の読み取り上限。
@@ -466,7 +475,7 @@ fn validate_controller_request(
     Ok(())
 }
 
-/// コンテナ用子 cgroup の名前（`fc-<container-id>`）。検証済みの 1 要素。
+/// コンテナ用子 cgroup の名前（`fc-<container-id>@<instance>` または `fc-<container-id>`）。検証済みの 1 要素。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CgroupName(String);
 
@@ -492,7 +501,29 @@ impl CgroupName {
         Ok(Self(name))
     }
 
-    /// 名前の文字列表現（`fc-<id>`）。
+    /// 状態記録の cgroup 配置の instance（create 時の revision）を含む名前 `fc-<id>@<n>` を作る
+    /// （TASK-30.3・OCI-6。本番のコンテナ用 cgroup の名前。モジュール doc「レイアウト」）。
+    ///
+    /// instance はストア全体で再利用されないため、同じ ID でも別のレコードとは名前が重ならない。
+    /// 255 バイトを超えると `InvalidArgument`（`prepare` でも delete でも同じ規則なので、作れない名前の
+    /// cgroup は存在しない）。
+    pub fn for_instance(id: &ContainerId, instance: StateRevision) -> Result<Self, CgroupError> {
+        let name = format!(
+            "{CONTAINER_PREFIX}{}{INSTANCE_SEPARATOR}{}",
+            id.as_str(),
+            instance.value()
+        );
+        if name.len() > NAME_MAX {
+            return Err(CgroupError::new(
+                ErrorCode::InvalidArgument,
+                CgroupStep::CreateChild,
+                "cgroup name exceeds 255 bytes",
+            ));
+        }
+        Ok(Self(name))
+    }
+
+    /// 名前の文字列表現（`fc-<id>@<n>` または `fc-<id>`）。
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -843,8 +874,10 @@ impl DelegatedCgroup {
     /// 削除する（[`Self::remove_verified`]。巻き戻しの失敗・fd が無く名前指定で消した事実はエラー文に併記）。
     ///
     /// 呼び出し元は、本関数で子 cgroup を作る前にこの委譲スコープ（`ContainerCgroupRemover::scope`）を
-    /// 状態記録へ記録しておく（`CreateStateRequest::with_cgroup_scope`。TASK-30.3・OCI-6）。記録の無い
-    /// レコードの `oci_runtime::delete` は cgroup に触れないため、記録せずに作った子 cgroup は回収されない。
+    /// 状態記録へ記録し（`CreateStateRequest::with_cgroup_scope`。TASK-30.3・OCI-6）、返された配置の instance
+    /// から [`CgroupName::for_instance`] で作った名前を渡す。記録の無いレコードの `oci_runtime::delete` は
+    /// cgroup に触れず、`fc-<id>@<n>` 以外の名前の cgroup も削除しないため、それ以外の手順で作った子 cgroup は
+    /// 回収されない。
     pub fn prepare(&self, name: &CgroupName) -> Result<(ContainerCgroup, Evacuated), CgroupError> {
         let me = std::process::id();
         let parent_procs = parse_procs(
@@ -1183,7 +1216,7 @@ impl DelegatedCgroup {
     }
 }
 
-/// `oci_runtime::delete` が使う cgroup 削除（TASK-30.3・OCI-6）。対象は `fc-<id>`（CORE-3 で作った子）だけ。
+/// `oci_runtime::delete` が使う cgroup 削除（TASK-30.3・OCI-6）。対象は `fc-<id>@<instance>`（CORE-3 で作った子）だけ。
 ///
 /// 待機を伴わないファイル I/O のみのためタイムアウトは持たない（REPAIR-5 の対象外）。
 impl ContainerCgroupRemover for DelegatedCgroup {
@@ -1196,10 +1229,14 @@ impl ContainerCgroupRemover for DelegatedCgroup {
         CgroupScope::new(&self.path.display())
     }
 
-    fn remove(&self, id: &ContainerId) -> Result<CgroupRemoval, TraitError> {
-        // 名前を作れない ID（予約名・長さ超過）の cgroup は `prepare` で作れないため存在し得ない。
+    fn remove(
+        &self,
+        id: &ContainerId,
+        instance: StateRevision,
+    ) -> Result<CgroupRemoval, TraitError> {
+        // 名前を作れない（長さ超過）cgroup は `prepare` に渡す名前も同じ規則で作れないため存在し得ない。
         // 失敗にすると該当レコードが永久に削除不能になるので NotPresent とする。
-        let Ok(name) = CgroupName::new(id) else {
+        let Ok(name) = CgroupName::for_instance(id, instance) else {
             return Ok(CgroupRemoval::NotPresent);
         };
         match self.open_child(&name).map_err(removal_error)? {

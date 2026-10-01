@@ -30,10 +30,12 @@
 //!    [`TraitError::message`] の長さが上限内かを検証してからアロケーションする
 //! 7. 状態レコードとエラーメッセージに秘密情報（レジストリ資格情報等）を含めない
 //!    （security.md）
-//! 8. [`StateRecord::cgroup_scope`]（コンテナ用 cgroup を作った委譲スコープ。TASK-30.3・OCI-6・CORE-3）は
-//!    `create` で [`CreateStateRequest::cgroup_scope`] の値をそのまま記録し、`update` では変更せずに
-//!    引き継ぎ、`get` / `list` で返す。plugin 実装も同じく往復させる（落とすと delete が cgroup の
-//!    削除を飛ばし、cgroup がリークする）
+//! 8. [`StateRecord::cgroup`]（コンテナ用 cgroup の配置 [`CgroupPlacement`]。TASK-30.3・OCI-6・CORE-3）は、
+//!    `create` で [`CreateStateRequest::cgroup_scope`] が指定されたときだけ、そのスコープと **この create で
+//!    割り当てた revision**（instance）の組として記録する。`update` では変更せずに引き継ぎ、`get` / `list` で
+//!    返す。plugin 実装も同じく往復させる（落とすと delete が cgroup の削除を飛ばし、cgroup がリークする）。
+//!    revision の再利用禁止（[`StateStore::create`]）により instance も再利用されず、instance を含む
+//!    cgroup 名（`fc-<id>@<instance>`）は同じ ID の削除・再作成をまたいでも重ならない
 //!
 //! メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 //! `ContainerRuntime`（TASK-4.1）と同じく dyn 互換（object safety）を保つ。
@@ -174,7 +176,7 @@ const MAX_CGROUP_SCOPE_COMPONENT_BYTES: usize = 255;
 
 /// コンテナ用 cgroup を作った委譲スコープ（cgroup v2 の `/sys/fs/cgroup` 起点の絶対パス。TASK-30.3・OCI-6・CORE-3）。
 ///
-/// コンテナ用子 cgroup（`<scope>/fc-<id>`）の親を指す。正規形は Linux の
+/// コンテナ用子 cgroup（`<scope>/fc-<id>@<instance>`）の親を指す。正規形は Linux の
 /// `cgroups::DelegatedCgroup::path()` と同じ文字列（ルートは `"/"`、それ以外は `"/a/b"`）で、
 /// `oci_runtime::delete` は記録された値と削除側の委譲スコープを文字列の完全一致で照合し、
 /// 一致しなければ cgroup にも状態記録にも触れない（別スコープで「cgroup 無し」を誤って確認して
@@ -219,6 +221,35 @@ impl CgroupScope {
     }
 }
 
+/// コンテナ用 cgroup の配置（委譲スコープと instance の組。TASK-30.3・OCI-6・CORE-3）。
+///
+/// cgroup の実体は `<scope>/fc-<id>@<instance>`（Linux の `cgroups::CgroupName::for_instance`）。instance は
+/// ストアがレコードの create で割り当てた revision で、ストア全体で再利用されない（[`StateStore::create`]）。
+/// そのため同じ ID のコンテナが削除・再作成されても cgroup 名は重ならず、古いレコードを読んだ delete が
+/// 再作成後のコンテナの cgroup を名前で消すことは構成上起きない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CgroupPlacement {
+    scope: CgroupScope,
+    instance: StateRevision,
+}
+
+impl CgroupPlacement {
+    /// スコープと instance（create で割り当てた revision）から作る。ストア実装が create で使う。
+    pub fn new(scope: CgroupScope, instance: StateRevision) -> Self {
+        Self { scope, instance }
+    }
+
+    /// コンテナ用 cgroup の親（委譲スコープ）。
+    pub fn scope(&self) -> &CgroupScope {
+        &self.scope
+    }
+
+    /// cgroup 名に埋め込む instance（create 時の revision）。
+    pub fn instance(&self) -> StateRevision {
+        self.instance
+    }
+}
+
 /// コンテナ状態のレコード（[`StateStore`] が保持・返却する単位）。
 ///
 /// 真偽値やフラットな文字列ではなく、将来の拡張に備えて構造化された型にする
@@ -231,7 +262,7 @@ pub struct StateRecord {
     status: ContainerStatus,
     bundle: PathBuf,
     revision: StateRevision,
-    cgroup_scope: Option<CgroupScope>,
+    cgroup: Option<CgroupPlacement>,
 }
 
 impl StateRecord {
@@ -255,14 +286,14 @@ impl StateRecord {
             status,
             bundle,
             revision,
-            cgroup_scope: None,
+            cgroup: None,
         })
     }
 
-    /// コンテナ用 cgroup を作った委譲スコープを設定する（[`Self::cgroup_scope`]）。
+    /// コンテナ用 cgroup の配置を設定する（[`Self::cgroup`]）。ストア実装が create・読み込みで使う。
     #[must_use]
-    pub fn with_cgroup_scope(mut self, scope: CgroupScope) -> Self {
-        self.cgroup_scope = Some(scope);
+    pub fn with_cgroup(mut self, cgroup: CgroupPlacement) -> Self {
+        self.cgroup = Some(cgroup);
         self
     }
 
@@ -286,14 +317,15 @@ impl StateRecord {
         self.revision
     }
 
-    /// コンテナ用 cgroup を作った委譲スコープを返す（TASK-30.3・OCI-6）。
+    /// コンテナ用 cgroup の配置を返す（TASK-30.3・OCI-6）。
     ///
-    /// `Some` なら、このコンテナの cgroup は `<scope>/fc-<id>` にある（または削除済み）。`None` は
+    /// `Some` なら、このコンテナの cgroup は `<scope>/fc-<id>@<instance>` にある（または削除済み）。`None` は
     /// 「このレコードのために cgroup を作っていない」ことを表し、`oci_runtime::delete` は cgroup に
-    /// 触れない。cgroup を作る側（本番 launcher。TASK-29 / TASK-157 系で結線予定）は、作る前に
-    /// スコープを記録しておく契約である（`cgroups::DelegatedCgroup::prepare` の doc）。
-    pub fn cgroup_scope(&self) -> Option<&CgroupScope> {
-        self.cgroup_scope.as_ref()
+    /// 触れない。cgroup を作る側（本番 launcher。TASK-29 / TASK-157 系で結線予定）は、create 時にスコープを
+    /// 記録し（[`CreateStateRequest::with_cgroup_scope`]）、返された配置の名前で cgroup を作る契約である
+    /// （`cgroups::DelegatedCgroup::prepare` の doc）。
+    pub fn cgroup(&self) -> Option<&CgroupPlacement> {
+        self.cgroup.as_ref()
     }
 }
 
@@ -327,9 +359,10 @@ impl CreateStateRequest {
         })
     }
 
-    /// コンテナ用 cgroup を作る委譲スコープを記録する（[`StateRecord::cgroup_scope`]）。
+    /// コンテナ用 cgroup を作る委譲スコープを記録する（[`StateRecord::cgroup`]）。
     ///
-    /// cgroup を作る呼び出し元は、作る前（`cgroups::DelegatedCgroup::prepare` の前）にこれで記録する。
+    /// ストアは create で割り当てた revision を instance として組にして記録する（契約 8）。cgroup を作る
+    /// 呼び出し元は、作る前（`cgroups::DelegatedCgroup::prepare` の前）にこれで記録する。
     #[must_use]
     pub fn with_cgroup_scope(mut self, scope: CgroupScope) -> Self {
         self.cgroup_scope = Some(scope);
@@ -650,8 +683,9 @@ mod tests {
             let revision = self.allocate_revision()?;
             let mut record =
                 StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
+            // 契約 8: instance はこの create で割り当てた revision。
             if let Some(scope) = req.cgroup_scope() {
-                record = record.with_cgroup_scope(scope.clone());
+                record = record.with_cgroup(CgroupPlacement::new(scope.clone(), revision));
             }
             records.insert(req.id().clone(), record.clone());
             Ok(record)
@@ -671,9 +705,9 @@ mod tests {
             let bundle = current.bundle().to_path_buf();
             let next_revision = self.allocate_revision()?;
             let mut updated = StateRecord::new(req.status().clone(), bundle, next_revision)?;
-            // 契約 8: cgroup_scope は update で変えずに引き継ぐ。
-            if let Some(scope) = current.cgroup_scope() {
-                updated = updated.with_cgroup_scope(scope.clone());
+            // 契約 8: cgroup の配置は update で変えずに引き継ぐ。
+            if let Some(cgroup) = current.cgroup() {
+                updated = updated.with_cgroup(cgroup.clone());
             }
             records.insert(req.id().clone(), updated.clone());
             Ok(updated)
@@ -1047,36 +1081,46 @@ mod tests {
         assert!(CgroupScope::new(&max_depth).is_ok());
     }
 
-    /// TASK-30.3・OCI-6（契約 8）: create で記録した cgroup_scope は get で返り、update でも引き継がれる。
-    /// 未設定のレコードは `None`。
+    /// TASK-30.3・OCI-6（契約 8）: create でスコープを指定すると、instance = create で割り当てた revision の
+    /// 配置として記録され、get で返り、update でも変わらない。削除・再作成すると instance は変わる。
+    /// 未指定のレコードは `None`。
     #[test]
-    fn oci6_task30_3_cgroup_scope_round_trips_through_store() {
+    fn oci6_task30_3_cgroup_placement_round_trips_through_store() {
         let store = StubStateStore::new();
         let scope = CgroupScope::new("/user.slice/x.scope").expect("scope");
         let id = sample_id("scoped");
-        let created = store
-            .create(
-                &CreateStateRequest::new(
-                    ContainerStatus::created(id.clone(), None),
-                    sample_bundle(),
-                )
+        let scoped_req = || {
+            CreateStateRequest::new(ContainerStatus::created(id.clone(), None), sample_bundle())
                 .expect("req")
-                .with_cgroup_scope(scope.clone()),
-            )
-            .expect("create");
-        assert_eq!(created.cgroup_scope(), Some(&scope));
+                .with_cgroup_scope(scope.clone())
+        };
+        let created = store.create(&scoped_req()).expect("create");
+        let placement = created.cgroup().expect("placement").clone();
+        assert_eq!(placement.scope(), &scope);
+        assert_eq!(placement.instance(), created.revision());
+        assert_eq!(placement.instance(), StateRevision::INITIAL);
         let updated = store
             .update(&UpdateStateRequest::new(
                 ContainerStatus::stopped(id.clone(), Some(0)),
                 created.revision(),
             ))
             .expect("update");
-        assert_eq!(updated.cgroup_scope(), Some(&scope));
-        let got = store.get(&GetStateRequest::new(id)).expect("get");
+        assert_ne!(updated.revision(), created.revision());
+        assert_eq!(updated.cgroup(), Some(&placement));
+        let got = store.get(&GetStateRequest::new(id.clone())).expect("get");
         assert_eq!(
-            got.cgroup_scope().map(CgroupScope::as_str),
-            Some("/user.slice/x.scope")
+            got.cgroup()
+                .map(|c| (c.scope().as_str(), c.instance().value())),
+            Some(("/user.slice/x.scope", 0))
         );
+
+        store
+            .delete(&DeleteStateRequest::new(id.clone(), updated.revision()))
+            .expect("delete");
+        let recreated = store.create(&scoped_req()).expect("recreate");
+        let instance = recreated.cgroup().expect("placement").instance();
+        assert_eq!(instance, recreated.revision());
+        assert_ne!(instance, placement.instance());
 
         let plain = store
             .create(
@@ -1087,7 +1131,7 @@ mod tests {
                 .expect("req"),
             )
             .expect("create");
-        assert_eq!(plain.cgroup_scope(), None);
+        assert_eq!(plain.cgroup(), None);
     }
 
     /// `StateRevision::next` は `INITIAL` の次を +1 にし、`u64::MAX` からの

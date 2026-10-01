@@ -32,8 +32,8 @@ mod linux {
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
         CgroupScope, ContainerId, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse,
-        ErrorCode, GetStateRequest, ListStateRequest, StartRequest, StateStore, TraitError,
-        UpdateStateRequest,
+        ErrorCode, GetStateRequest, ListStateRequest, StartRequest, StateRevision, StateStore,
+        TraitError, UpdateStateRequest,
     };
     use serde_json::{Value, json};
 
@@ -52,7 +52,11 @@ mod linux {
                 "no delegated cgroup in this test",
             ))
         }
-        fn remove(&self, _id: &ContainerId) -> Result<CgroupRemoval, TraitError> {
+        fn remove(
+            &self,
+            _id: &ContainerId,
+            _instance: StateRevision,
+        ) -> Result<CgroupRemoval, TraitError> {
             Ok(CgroupRemoval::NotPresent)
         }
     }

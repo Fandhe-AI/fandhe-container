@@ -80,9 +80,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::{
-    CgroupScope, ContainerId, ContainerStatus, CreateStateRequest, DeleteStateRequest,
-    DeleteStateResponse, ErrorCode, GetStateRequest, ListStateRequest, StateList, StateListCursor,
-    StateRecord, StateRevision, StateStore, TraitError, UpdateStateRequest,
+    CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, CreateStateRequest,
+    DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, ListStateRequest,
+    StateList, StateListCursor, StateRecord, StateRevision, StateStore, TraitError,
+    UpdateStateRequest,
 };
 
 /// 各コンテナの状態ファイル名（OCI-5）。
@@ -731,8 +732,10 @@ impl StateStore for FileStateStore {
         let revision = self.allocate_revision(&mut guard, None)?;
         let mut record =
             StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
+        // instance はこの create で割り当てた revision（トレイト契約 8。再利用されないため cgroup 名も
+        // 削除・再作成をまたいで重ならない。TASK-30.3・OCI-6）。
         if let Some(scope) = req.cgroup_scope() {
-            record = record.with_cgroup_scope(scope.clone());
+            record = record.with_cgroup(CgroupPlacement::new(scope.clone(), revision));
         }
         self.write_record(&record)?;
         Ok(record)
@@ -755,10 +758,10 @@ impl StateStore for FileStateStore {
             existing.bundle().to_path_buf(),
             revision,
         )?;
-        // cgroup_scope は作成時の値を変えずに引き継ぐ（トレイト契約 8。落とすと delete が cgroup を
+        // cgroup の配置は作成時の値を変えずに引き継ぐ（トレイト契約 8。落とすと delete が cgroup を
         // 削除しなくなる。TASK-30.3・OCI-6）。
-        if let Some(scope) = existing.cgroup_scope() {
-            record = record.with_cgroup_scope(scope.clone());
+        if let Some(cgroup) = existing.cgroup() {
+            record = record.with_cgroup(cgroup.clone());
         }
         self.write_record(&record)?;
         Ok(record)
@@ -1216,14 +1219,16 @@ fn open_nowait(path: &Path, opts: &mut OpenOptions) -> std::io::Result<File> {
 }
 
 /// `state.json` の JSON 表現（OCI Runtime Spec の state 形式。`ociVersion`・`id`・`status`・
-/// `pid`・`bundle`）に、ストア独自の `revision`・`exitCode`・`cgroupScope` を加えたもの。
+/// `pid`・`bundle`）に、ストア独自の `revision`・`exitCode`・`cgroupScope`・`cgroupInstance` を加えたもの。
 ///
-/// `cgroupScope`（TASK-30.3・OCI-6）は cgroup を作った委譲スコープで、記録が無ければ書かない。
-/// このフィールドを持たない既存の `state.json`（導入前の版が書いたもの）は `None` として読む。
-/// 導入前の版は本番経路で cgroup を作らない（`cgroups::DelegatedCgroup::prepare` は起動フローに
-/// 未結線）ため、フィールドの無いレコードに対応する cgroup は存在せず、「cgroup を作っていない」
-/// （delete は cgroup に触れない）と読むのが正しい。値が [`CgroupScope`] の形式を満たさなければ
-/// 他の項目と同じく破損（`Internal`。回復は `purge_corrupted`）とする。
+/// `cgroupScope` / `cgroupInstance`（TASK-30.3・OCI-6）は cgroup の配置（[`CgroupPlacement`]）で、記録が
+/// 無ければどちらも書かない。両方あるか両方ないかのどちらかで、片方だけ・`cgroupScope` が
+/// [`CgroupScope`] の形式を満たさない・`cgroupInstance` が `revision` より大きい（create 時の revision は
+/// 現在の revision を超えない）場合は他の項目と同じく破損（`Internal`。回復は `purge_corrupted`）とする。
+/// どちらも持たない既存の `state.json`（導入前の版が書いたもの）は `None` として読む。導入前の版は
+/// 本番経路で cgroup を作らない（`cgroups::DelegatedCgroup::prepare` は起動フローに未結線）ため、
+/// フィールドの無いレコードに対応する cgroup は存在せず、「cgroup を作っていない」（delete は cgroup に
+/// 触れない）と読むのが正しい。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StateDto {
@@ -1238,6 +1243,8 @@ struct StateDto {
     exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cgroup_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cgroup_instance: Option<u64>,
 }
 
 impl StateDto {
@@ -1252,7 +1259,8 @@ impl StateDto {
             bundle,
             revision: record.revision().value(),
             exit_code: status.exit_code(),
-            cgroup_scope: record.cgroup_scope().map(|c| c.as_str().to_owned()),
+            cgroup_scope: record.cgroup().map(|c| c.scope().as_str().to_owned()),
+            cgroup_instance: record.cgroup().map(|c| c.instance().value()),
         })
     }
 
@@ -1283,9 +1291,15 @@ impl StateDto {
             ("stopped", None, code) => ContainerStatus::stopped(id, code),
             _ => return Err(corrupted()),
         };
-        let cgroup_scope = match self.cgroup_scope.as_deref() {
-            Some(c) => Some(CgroupScope::new(c).map_err(|_| corrupted())?),
-            None => None,
+        let cgroup = match (self.cgroup_scope.as_deref(), self.cgroup_instance) {
+            (None, None) => None,
+            (Some(scope), Some(instance)) if instance <= self.revision => {
+                Some(CgroupPlacement::new(
+                    CgroupScope::new(scope).map_err(|_| corrupted())?,
+                    StateRevision::from_raw(instance),
+                ))
+            }
+            _ => return Err(corrupted()),
         };
         let record = StateRecord::new(
             status,
@@ -1293,8 +1307,8 @@ impl StateDto {
             StateRevision::from_raw(self.revision),
         )
         .map_err(|_| corrupted())?;
-        Ok(match cgroup_scope {
-            Some(c) => record.with_cgroup_scope(c),
+        Ok(match cgroup {
+            Some(c) => record.with_cgroup(c),
             None => record,
         })
     }
@@ -1501,47 +1515,72 @@ mod tests {
         assert_eq!(v["revision"], 0);
         assert_eq!(v["bundle"], bundle().to_str().unwrap());
         assert!(v.get("pid").is_none());
-        // TASK-30.3・OCI-6: cgroup スコープの記録が無ければ `cgroupScope` は書かない。
+        // TASK-30.3・OCI-6: cgroup の配置の記録が無ければ `cgroupScope` / `cgroupInstance` は書かない。
         assert!(v.get("cgroupScope").is_none());
-        assert_eq!(rec.cgroup_scope(), None);
+        assert!(v.get("cgroupInstance").is_none());
+        assert_eq!(rec.cgroup(), None);
     }
 
-    /// TASK-30.3・OCI-6: create で記録した cgroup スコープは `state.json` の `cgroupScope` に書かれ、
-    /// get で返り、update（start の Created → Running 相当）の後も引き継がれる。
+    /// TASK-30.3・OCI-6: create でスコープを指定すると、`state.json` に `cgroupScope` と
+    /// `cgroupInstance`（= create で割り当てた revision）が書かれ、get・別インスタンスで読み戻せ、
+    /// update（start の Created → Running 相当）の後も変わらない。削除・再作成すると instance は変わる。
     #[test]
-    fn oci6_task30_3_cgroup_scope_is_persisted_and_kept_on_update() {
+    fn oci6_task30_3_cgroup_placement_is_persisted_and_kept_on_update() {
         let t = TmpDir::new("cgscope");
         let store = t.open();
+        create(&store, "other");
         let scope = CgroupScope::new("/user.slice/user-1000.slice/x.scope").unwrap();
-        let req = CreateStateRequest::new(ContainerStatus::created(cid("web"), None), bundle())
-            .unwrap()
-            .with_cgroup_scope(scope.clone());
-        let rec = store.create(&req).unwrap();
-        assert_eq!(rec.cgroup_scope(), Some(&scope));
-        let read_scope = || {
+        let req = || {
+            CreateStateRequest::new(ContainerStatus::created(cid("web"), None), bundle())
+                .unwrap()
+                .with_cgroup_scope(scope.clone())
+        };
+        let rec = store.create(&req()).unwrap();
+        assert_eq!(rec.revision(), StateRevision::from_raw(1));
+        let expected = CgroupPlacement::new(scope.clone(), StateRevision::from_raw(1));
+        assert_eq!(rec.cgroup(), Some(&expected));
+        let read_json = || {
             let text = fs::read_to_string(t.path().join("web").join("state.json")).unwrap();
             let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-            v["cgroupScope"].clone()
+            (v["cgroupScope"].clone(), v["cgroupInstance"].clone())
         };
-        assert_eq!(read_scope(), "/user.slice/user-1000.slice/x.scope");
-        let updated = update_to_running(&store, &rec);
-        assert_eq!(updated.cgroup_scope(), Some(&scope));
-        assert_eq!(read_scope(), "/user.slice/user-1000.slice/x.scope");
-        let got = store.get(&GetStateRequest::new(cid("web"))).unwrap();
         assert_eq!(
-            got.cgroup_scope().map(CgroupScope::as_str),
-            Some("/user.slice/user-1000.slice/x.scope")
+            read_json(),
+            (
+                serde_json::json!("/user.slice/user-1000.slice/x.scope"),
+                serde_json::json!(1)
+            )
+        );
+        let updated = update_to_running(&store, &rec);
+        assert_eq!(updated.revision(), StateRevision::from_raw(2));
+        assert_eq!(updated.cgroup(), Some(&expected));
+        assert_eq!(
+            read_json(),
+            (
+                serde_json::json!("/user.slice/user-1000.slice/x.scope"),
+                serde_json::json!(1)
+            )
         );
         // 別インスタンス（別プロセスの delete 相当）から読んでも同じ値になる。
         let reopened = t.open();
         let got = reopened.get(&GetStateRequest::new(cid("web"))).unwrap();
-        assert_eq!(got.cgroup_scope(), Some(&scope));
+        assert_eq!(got.cgroup(), Some(&expected));
+
+        // 削除・再作成すると instance は新しい revision になり、旧 instance と重ならない。
+        store
+            .delete(&DeleteStateRequest::new(cid("web"), updated.revision()))
+            .unwrap();
+        let recreated = store.create(&req()).unwrap();
+        assert_eq!(
+            recreated.cgroup().map(|c| c.instance()),
+            Some(StateRevision::from_raw(3))
+        );
     }
 
-    /// TASK-30.3・OCI-6: `cgroupScope` を持たない既存の `state.json`（導入前の版が書いたもの）は
-    /// 破損扱いにせず、cgroup スコープの記録なし（`None`）として読み、通常の delete で消せる。
+    /// TASK-30.3・OCI-6: `cgroupScope` / `cgroupInstance` を持たない既存の `state.json`（導入前の版が
+    /// 書いたもの）は破損扱いにせず、cgroup の配置なし（`None`）として読み、通常の delete で消せる。
     #[test]
-    fn oci6_task30_3_legacy_state_without_cgroup_scope_reads_as_none() {
+    fn oci6_task30_3_legacy_state_without_cgroup_reads_as_none() {
         let t = TmpDir::new("cglegacy");
         let store = t.open();
         let rec = create(&store, "old");
@@ -1552,7 +1591,7 @@ mod tests {
         );
         fs::write(t.path().join("old").join("state.json"), legacy).unwrap();
         let got = store.get(&GetStateRequest::new(cid("old"))).unwrap();
-        assert_eq!(got.cgroup_scope(), None);
+        assert_eq!(got.cgroup(), None);
         assert_eq!(got.status(), &ContainerStatus::stopped(cid("old"), None));
         assert!(store.find_corrupted().unwrap().is_empty());
         assert_eq!(store.list(&list_req(10)).unwrap().records().len(), 1);
@@ -1562,32 +1601,36 @@ mod tests {
         assert!(!t.path().join("old").exists());
     }
 
-    /// TASK-30.3・OCI-6: 形式を満たさない `cgroupScope`（相対・`..`・空要素・非文字列）は破損として
-    /// `Internal` になり、`find_corrupted` / `purge_corrupted` で回復できる。
+    /// TASK-30.3・OCI-6: 不正な cgroup の配置（スコープの形式違反・非文字列、片方だけ、instance が revision
+    /// より大きい、負の instance）は破損として `Internal` になり、`find_corrupted` / `purge_corrupted` で回復できる。
     #[test]
-    fn oci6_task30_3_invalid_cgroup_scope_is_corrupted_and_purgeable() {
+    fn oci6_task30_3_invalid_cgroup_placement_is_corrupted_and_purgeable() {
         let t = TmpDir::new("cgbad");
         let store = t.open();
         let bad = [
-            ("a", r#""relative""#),
-            ("b", r#""/a/../b""#),
-            ("c", r#""/a//b""#),
-            ("d", "5"),
+            ("a", r#""cgroupScope":"relative","cgroupInstance":0"#),
+            ("b", r#""cgroupScope":"/a/../b","cgroupInstance":0"#),
+            ("c", r#""cgroupScope":"/a//b","cgroupInstance":0"#),
+            ("d", r#""cgroupScope":5,"cgroupInstance":0"#),
+            ("e", r#""cgroupScope":"/a""#),
+            ("f", r#""cgroupInstance":0"#),
+            ("g", r#""cgroupScope":"/a","cgroupInstance":99"#),
+            ("h", r#""cgroupScope":"/a","cgroupInstance":-1"#),
         ];
-        for (id, value) in bad {
-            let rec = create(&store, id);
+        let ids: Vec<&str> = bad.iter().map(|(id, _)| *id).collect();
+        for (id, fields) in bad {
+            create(&store, id);
             let body = format!(
-                r#"{{"ociVersion":"1.2.0","id":"{id}","status":"stopped","bundle":"/b","revision":{},"cgroupScope":{value}}}"#,
-                rec.revision().value()
+                r#"{{"ociVersion":"1.2.0","id":"{id}","status":"stopped","bundle":"/b","revision":10,{fields}}}"#
             );
             fs::write(t.path().join(id).join("state.json"), body).unwrap();
             let e = store.get(&GetStateRequest::new(cid(id))).unwrap_err();
-            assert_eq!(e.code().as_str(), "INTERNAL");
+            assert_eq!(e.code().as_str(), "INTERNAL", "{id}");
         }
         assert_eq!(code(store.list(&list_req(10))), "INTERNAL");
         let found = store.find_corrupted().unwrap();
-        assert_eq!(found, vec![cid("a"), cid("b"), cid("c"), cid("d")]);
-        for (id, _) in bad {
+        assert_eq!(found, ids.iter().map(|id| cid(id)).collect::<Vec<_>>());
+        for id in ids {
             store.purge_corrupted(&cid(id)).unwrap();
         }
         assert!(store.list(&list_req(10)).unwrap().records().is_empty());

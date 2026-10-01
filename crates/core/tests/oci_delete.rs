@@ -19,21 +19,21 @@ use std::sync::Mutex;
 use fandhe_container_core::observability::{OpName, OpRecorder};
 use fandhe_container_core::oci_runtime::{CgroupRemoval, ContainerCgroupRemover, create, delete};
 use fandhe_container_core::traits::{
-    CgroupScope, ContainerId, ContainerState, ContainerStatus, CreateRequest, CreateStateRequest,
-    DeleteRequest, DeleteResponse, DeleteStateRequest, DeleteStateResponse, ErrorCode,
-    GetStateRequest, ListStateRequest, StateList, StateRecord, StateRevision, StateStore,
-    TraitError, UpdateStateRequest,
+    CgroupPlacement, CgroupScope, ContainerId, ContainerState, ContainerStatus, CreateRequest,
+    CreateStateRequest, DeleteRequest, DeleteResponse, DeleteStateRequest, DeleteStateResponse,
+    ErrorCode, GetStateRequest, ListStateRequest, StateList, StateRecord, StateRevision,
+    StateStore, TraitError, UpdateStateRequest,
 };
 use serde_json::{Value, json};
 
 /// テストで記録する委譲スコープ。
 const SCOPE: &str = "/user.slice/user-1000.slice/a.scope";
 
-/// テスト専用の記録用 `ContainerCgroupRemover`。委譲スコープ `scope` を持ち、`remove` で呼ばれた ID を順に
-/// 記録して常に `Removed` を返す。
+/// テスト専用の記録用 `ContainerCgroupRemover`。委譲スコープ `scope` を持ち、`remove` で呼ばれた ID と
+/// instance の組を順に記録して常に `Removed` を返す。
 struct RecordingCgroup {
     scope: CgroupScope,
-    calls: Mutex<Vec<ContainerId>>,
+    calls: Mutex<Vec<(ContainerId, StateRevision)>>,
 }
 
 impl RecordingCgroup {
@@ -44,7 +44,7 @@ impl RecordingCgroup {
         }
     }
 
-    fn calls(&self) -> Vec<ContainerId> {
+    fn calls(&self) -> Vec<(ContainerId, StateRevision)> {
         self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
@@ -54,11 +54,15 @@ impl ContainerCgroupRemover for RecordingCgroup {
         Ok(self.scope.clone())
     }
 
-    fn remove(&self, id: &ContainerId) -> Result<CgroupRemoval, TraitError> {
+    fn remove(
+        &self,
+        id: &ContainerId,
+        instance: StateRevision,
+    ) -> Result<CgroupRemoval, TraitError> {
         self.calls
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(id.clone());
+            .push((id.clone(), instance));
         Ok(CgroupRemoval::Removed)
     }
 }
@@ -98,13 +102,12 @@ impl StateStore for MemStateStore {
         if records.contains_key(req.id()) {
             return Err(TraitError::new(ErrorCode::AlreadyExists, "exists"));
         }
-        let mut record = StateRecord::new(
-            req.status().clone(),
-            req.bundle().to_path_buf(),
-            self.allocate_revision(),
-        )?;
+        let revision = self.allocate_revision();
+        let mut record =
+            StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
+        // `StateStore` の契約どおり instance はこの create で割り当てた revision（TASK-30.3）。
         if let Some(scope) = req.cgroup_scope() {
-            record = record.with_cgroup_scope(scope.clone());
+            record = record.with_cgroup(CgroupPlacement::new(scope.clone(), revision));
         }
         records.insert(req.id().clone(), record.clone());
         Ok(record)
@@ -124,8 +127,8 @@ impl StateStore for MemStateStore {
             self.allocate_revision(),
         )?;
         // `StateStore` の契約どおり cgroup スコープは update で変えずに引き継ぐ（TASK-30.3）。
-        if let Some(scope) = cur.cgroup_scope() {
-            next = next.with_cgroup_scope(scope.clone());
+        if let Some(cgroup) = cur.cgroup() {
+            next = next.with_cgroup(cgroup.clone());
         }
         records.insert(req.status().id().clone(), next.clone());
         Ok(next)
@@ -225,11 +228,11 @@ fn oci6_core2_create_then_delete() {
     let rec = OpRecorder::new();
     let id = "del-create";
     let created = create(&store, &rec, &b.create_request(id)).expect("create");
-    assert_eq!(created.cgroup_scope(), None);
+    assert_eq!(created.cgroup(), None);
 
     let cg = RecordingCgroup::in_scope(SCOPE);
     let res = delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect("delete");
-    assert_eq!(cg.calls(), Vec::<ContainerId>::new());
+    assert_eq!(cg.calls(), Vec::<(ContainerId, StateRevision)>::new());
     assert_eq!(res, DeleteResponse::new());
     assert_eq!(
         store.record_of(id).expect_err("gone").code(),
@@ -238,7 +241,7 @@ fn oci6_core2_create_then_delete() {
 
     let err = delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect_err("second delete");
     assert_eq!(err.code(), ErrorCode::NotFound);
-    assert_eq!(cg.calls(), Vec::<ContainerId>::new());
+    assert_eq!(cg.calls(), Vec::<(ContainerId, StateRevision)>::new());
     assert_eq!(op_stats(&rec, "delete"), (1, 1));
 }
 
@@ -262,18 +265,21 @@ fn oci6_task30_3_scoped_delete_removes_cgroup_once() {
     let store = MemStateStore::new();
     let rec = OpRecorder::new();
     let id = "del-scoped";
-    create_scoped(&store, &b, id, SCOPE);
+    let created = create_scoped(&store, &b, id, SCOPE);
+    // instance は create で割り当てた revision（このストアの最初の払い出しなので 1）。
+    let instance = StateRevision::from_raw(1);
+    assert_eq!(created.cgroup().map(|c| c.instance()), Some(instance));
 
     let cg = RecordingCgroup::in_scope(SCOPE);
     delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect("delete");
-    assert_eq!(cg.calls(), vec![cid(id)]);
+    assert_eq!(cg.calls(), vec![(cid(id), instance)]);
     assert_eq!(
         store.record_of(id).expect_err("gone").code(),
         ErrorCode::NotFound
     );
     let err = delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect_err("second delete");
     assert_eq!(err.code(), ErrorCode::NotFound);
-    assert_eq!(cg.calls(), vec![cid(id)]);
+    assert_eq!(cg.calls(), vec![(cid(id), instance)]);
     assert_eq!(op_stats(&rec, "delete"), (1, 1));
 }
 
@@ -294,12 +300,12 @@ fn oci6_task30_3_delete_from_other_scope_keeps_state() {
         err.message(),
         "delegated cgroup scope does not match the recorded scope"
     );
-    assert_eq!(other.calls(), Vec::<ContainerId>::new());
+    assert_eq!(other.calls(), Vec::<(ContainerId, StateRevision)>::new());
     assert_eq!(store.record_of(id).expect("kept"), created);
 
     let right = RecordingCgroup::in_scope(SCOPE);
     delete(&store, &rec, &right, &DeleteRequest::new(cid(id))).expect("delete");
-    assert_eq!(right.calls(), vec![cid(id)]);
+    assert_eq!(right.calls(), vec![(cid(id), StateRevision::from_raw(1))]);
     assert_eq!(op_stats(&rec, "delete"), (1, 1));
 }
 
@@ -340,7 +346,7 @@ fn oci6_core2_delete_rejected_until_stopped() {
         }
         assert_eq!(store.record_of(id).expect("kept"), running);
         // 拒否された状態では cgroup に触れない。
-        assert_eq!(cg.calls(), Vec::<ContainerId>::new());
+        assert_eq!(cg.calls(), Vec::<(ContainerId, StateRevision)>::new());
     }
 
     // supervisor（TASK-157）の代わりに Stopped へ遷移させる。
@@ -353,9 +359,10 @@ fn oci6_core2_delete_rejected_until_stopped() {
     assert_eq!(stopped.status().state(), ContainerState::Stopped);
 
     delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect("delete");
-    assert_eq!(cg.calls(), vec![cid(id)]);
+    // update を経ても instance は create 時の revision（1）のまま。
+    assert_eq!(cg.calls(), vec![(cid(id), StateRevision::from_raw(1))]);
     let err = delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect_err("second delete");
     assert_eq!(err.code(), ErrorCode::NotFound);
-    assert_eq!(cg.calls(), vec![cid(id)]);
+    assert_eq!(cg.calls(), vec![(cid(id), StateRevision::from_raw(1))]);
     assert_eq!(op_stats(&rec, "delete"), (1, 3));
 }

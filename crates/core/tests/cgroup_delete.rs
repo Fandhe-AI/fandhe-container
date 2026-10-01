@@ -1,10 +1,11 @@
 //! `delete` による cgroup・状態ファイルの削除の結合試験（CORE-3・OCI-6・TASK-30.3）。
 //!
 //! 実 `DelegatedCgroup`（`ContainerCgroupRemover` の本番実装）と実 `FileStateStore` を `oci_runtime::delete`
-//! へ渡し、delete の後にコンテナ用子 cgroup（`<委譲パス>/fc-<id>`）と `state.json` が実ファイルシステム上から
+//! へ渡し、delete の後にコンテナ用子 cgroup（`<委譲パス>/fc-<id>@<instance>`）と `state.json` が実ファイルシステム上から
 //! 消えていることを具体値で照合する（受入基準 1・2）。レコードには create 時の委譲スコープを記録し
 //! （`CreateStateRequest::with_cgroup_scope`）、`state.json` の `cgroupScope` が検出した委譲パスと一致することも
 //! 確かめる（delete はこの記録と削除側のスコープが一致するときだけ cgroup を削除・不存在確認する）。
+//! cgroup は記録された instance を含む名前（`fc-<id>@<instance>`）で作る。
 //!
 //! # 実機前提テストとしての分離
 //! 非特権ユーザーに委譲された cgroup v2 サブツリーが必要で、GitHub ホステッド runner では保証できない
@@ -30,7 +31,7 @@ mod linux {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
 
-    /// CORE-3・OCI-6（受入基準 1・2）: delete の後、`fc-<id>` と `state.json` が消え、2 回目は `NotFound`。
+    /// CORE-3・OCI-6（受入基準 1・2）: delete の後、`fc-<id>@<instance>` と `state.json` が消え、2 回目は `NotFound`。
     #[test]
     #[ignore = "requires a delegated cgroup v2 subtree (systemd-run --user --scope -p Delegate=yes)"]
     fn oci6_task30_3_delete_removes_cgroup_and_state_file() {
@@ -38,10 +39,6 @@ mod linux {
         let parent = PathBuf::from("/sys/fs/cgroup").join(delegated.path().trim_start_matches('/'));
 
         let id = ContainerId::new(format!("d{}", std::process::id())).expect("id");
-        let name = CgroupName::new(&id).expect("name");
-        let (_child, _proof) = delegated.prepare(&name).expect("prepare");
-        let cgroup_dir = parent.join(name.as_str());
-        assert!(cgroup_dir.is_dir());
 
         let root_dir = std::env::temp_dir().join(format!("fandhe-cgroup-delete-{}", id.as_str()));
         let _ = fs::remove_dir_all(&root_dir);
@@ -49,7 +46,8 @@ mod linux {
         fs::set_permissions(&root_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
         let store = FileStateStore::open(StateRoot::from_override(root_dir.clone()).expect("root"))
             .expect("open store");
-        store
+        // 本番 launcher の契約どおり、cgroup を作る前にスコープを記録し、返された instance の名前で作る。
+        let record = store
             .create(
                 &CreateStateRequest::new(
                     ContainerStatus::stopped(id.clone(), Some(0)),
@@ -59,12 +57,23 @@ mod linux {
                 .with_cgroup_scope(delegated.scope().expect("scope")),
             )
             .expect("create record");
+        let instance = record.cgroup().expect("placement").instance();
+        let name = CgroupName::for_instance(&id, instance).expect("name");
+        assert_eq!(
+            name.as_str(),
+            format!("fc-{}@{}", id.as_str(), instance.value())
+        );
+        let (_child, _proof) = delegated.prepare(&name).expect("prepare");
+        let cgroup_dir = parent.join(name.as_str());
+        assert!(cgroup_dir.is_dir());
+
         let state_json = root_dir.join(id.as_str()).join("state.json");
         assert!(state_json.is_file());
         let state: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_json).expect("read state.json"))
                 .expect("parse state.json");
         assert_eq!(state["cgroupScope"], delegated.path());
+        assert_eq!(state["cgroupInstance"], instance.value());
 
         let rec = OpRecorder::new();
         delete(&store, &rec, &delegated, &DeleteRequest::new(id.clone())).expect("delete");

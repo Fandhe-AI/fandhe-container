@@ -566,7 +566,11 @@ mod linux {
                 "no delegated cgroup in this test",
             ))
         }
-        fn remove(&self, _id: &ContainerId) -> Result<CgroupRemoval, TraitError> {
+        fn remove(
+            &self,
+            _id: &ContainerId,
+            _instance: StateRevision,
+        ) -> Result<CgroupRemoval, TraitError> {
             Ok(CgroupRemoval::NotPresent)
         }
     }

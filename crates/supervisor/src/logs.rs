@@ -167,6 +167,8 @@ impl Default for MemoryLogSink {
 
 impl LogSink for MemoryLogSink {
     fn append(&self, stream: StreamKind, line: &[u8]) -> Result<(), TraitError> {
+        // 直接呼び出しでも行サイズ上限を超えて確保しないよう、確保前に MAX_LINE_BYTES へ切り詰める。
+        let line = line.get(..MAX_LINE_BYTES).unwrap_or(line);
         let mut g = self.lock()?;
         // 空行でも 1 行ごとに固定費（LINE_OVERHEAD_BYTES）を計上し、行数が無制限に増えないようにする。
         g.total_bytes = g.total_bytes.saturating_add(line_cost(line.len()));
@@ -282,7 +284,13 @@ impl LogCapture {
     /// 全ストリームが EOF になるまで `timeout` を上限に待つ。期限切れは `Timeout`
     /// （リーダースレッドは切り離されて走り続ける。module doc 参照）。
     pub fn drain(self, timeout: Duration) -> Result<CaptureSummary, TraitError> {
-        let deadline = Instant::now() + timeout;
+        // Duration::MAX 等で加算が溢れても panic しない（公開 API のため直接呼ばれうる）。
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "drain timeout is too large",
+            ));
+        };
         let mut out = CaptureSummary::default();
         for _ in 0..self.expected {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -404,6 +412,27 @@ mod tests {
             stream,
             bytes: s.to_vec(),
         }
+    }
+
+    /// REPAIR-5・TASK-157.7: 溢れる timeout は panic せず InvalidArgument を返す。
+    #[test]
+    fn sup1_task157_7_drain_rejects_overflowing_timeout() {
+        let cap = LogCapture::start(
+            OutputStreams::new(None, None),
+            Arc::new(MemoryLogSink::default()),
+        )
+        .unwrap();
+        let err = cap.drain(Duration::MAX).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    }
+
+    /// TASK-157.7: 直接 append された巨大行も MAX_LINE_BYTES へ切り詰める。
+    #[test]
+    fn sup1_task157_7_memory_sink_truncates_oversized_direct_append() {
+        let sink = MemoryLogSink::default();
+        let big = vec![b'a'; MAX_LINE_BYTES + 100];
+        sink.append(StreamKind::Stdout, &big).unwrap();
+        assert_eq!(sink.snapshot().unwrap()[0].bytes.len(), MAX_LINE_BYTES);
     }
 
     /// SUP-1・TASK-157.7: stdout / stderr の両方を種別付きで捕捉する。

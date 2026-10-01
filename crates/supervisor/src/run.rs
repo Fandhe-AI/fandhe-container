@@ -220,7 +220,7 @@ impl MonitorObserver for StderrLogObserver {
         };
         let code = event
             .error_code
-            .map(|c| format!("{c:?}"))
+            .map(|c| c.as_str().to_owned())
             .unwrap_or_default();
         eprintln!(
             "{{\"component\":\"supervisor.monitor\",\"operation\":\"{}\",\"result\":\"{}\",\"code\":\"{}\",\"elapsed_us\":{}}}",
@@ -279,17 +279,23 @@ pub fn monitor_with_observer(
         .ok_or_else(|| TraitError::new(ErrorCode::Internal, "own pid is zero"))?;
     observed(obs, MonitorOperation::Start, || {
         write_with_retry(state, pid, |rec| {
-            (
+            // 他の supervisor が監視中なら奪わない（SUP-1: コンテナごとの監視所有権）。
+            match rec.supervision().supervisor_pid() {
+                None => {}
+                Some(p) if p == self_pid => {}
+                Some(_) => return Err(precondition("another supervisor already owns monitoring")),
+            }
+            Ok((
                 rec.status().clone(),
                 SupervisionState::new(Some(self_pid), rec.health(), rec.restart_count()),
-            )
+            ))
         })
     })?;
 
     loop {
         if stop.is_stop_requested() {
             let record = observed(obs, MonitorOperation::Stop, || {
-                release_supervisor_pid(state, pid)
+                release_supervisor_pid(state, pid, self_pid)
             })?;
             return Ok(MonitorOutcome::StopRequested { record });
         }
@@ -303,10 +309,11 @@ pub fn monitor_with_observer(
                 // 回収後は再 wait できないため、書き込み失敗でも終了状態を返す。
                 let written = observed(obs, MonitorOperation::RecordExit, || {
                     write_with_retry(state, pid, |rec| {
-                        (
+                        ensure_owner(rec, self_pid)?;
+                        Ok((
                             ContainerStatus::stopped(id.clone(), code),
                             SupervisionState::new(None, rec.health(), rec.restart_count()),
-                        )
+                        ))
                     })
                 });
                 return Ok(match written {
@@ -317,7 +324,7 @@ pub fn monitor_with_observer(
             Err(wait_error) => {
                 // 監視をやめるので、記録済みの自 pid を残さない。
                 return match observed(obs, MonitorOperation::ReleaseAfterWaitError, || {
-                    release_supervisor_pid(state, pid)
+                    release_supervisor_pid(state, pid, self_pid)
                 }) {
                     Ok(_) => Err(wait_error),
                     Err(release_error) => Ok(MonitorOutcome::WaitFailedUnreleased {
@@ -334,13 +341,26 @@ pub fn monitor_with_observer(
 fn release_supervisor_pid(
     state: &mut SupervisedState,
     pid: NonZeroU32,
+    self_pid: NonZeroU32,
 ) -> Result<StateRecord, TraitError> {
     write_with_retry(state, pid, |rec| {
-        (
+        ensure_owner(rec, self_pid)?;
+        Ok((
             rec.status().clone(),
             SupervisionState::new(None, rec.health(), rec.restart_count()),
-        )
+        ))
     })
+}
+
+/// 記録上の `supervisor_pid` が自 pid であること（他 supervisor の記録を消さないため。SUP-1）。
+fn ensure_owner(rec: &StateRecord, self_pid: NonZeroU32) -> Result<(), TraitError> {
+    if rec.supervision().supervisor_pid() == Some(self_pid) {
+        Ok(())
+    } else {
+        Err(precondition(
+            "supervisor ownership lost to another supervisor",
+        ))
+    }
 }
 
 fn precondition(msg: &'static str) -> TraitError {
@@ -367,7 +387,7 @@ fn write_with_retry<F>(
     build: F,
 ) -> Result<StateRecord, TraitError>
 where
-    F: Fn(&StateRecord) -> (ContainerStatus, SupervisionState),
+    F: Fn(&StateRecord) -> Result<(ContainerStatus, SupervisionState), TraitError>,
 {
     let mut last_err = precondition("state write attempts exhausted");
     for attempt in 0..MAX_WRITE_ATTEMPTS {
@@ -379,7 +399,7 @@ where
                 ));
             }
         }
-        let (status, supervision) = build(state.record());
+        let (status, supervision) = build(state.record())?;
         match state.write(status, supervision) {
             Ok(rec) => return Ok(rec.clone()),
             Err(e) if e.code() == ErrorCode::FailedPrecondition => last_err = e,
@@ -669,6 +689,54 @@ mod tests {
         };
         assert_eq!(record.health(), Some(HealthStatus::Healthy));
         assert_eq!(record.restart_count(), 2);
+    }
+
+    /// SUP-1・TASK-157.4: 別 supervisor が監視中なら開始を拒否し、記録を奪わない。
+    #[test]
+    fn sup1_task157_4_rejects_foreign_owner_at_start() {
+        let store = store_with(
+            ContainerStatus::running(cid(), Some(pid(42))),
+            SupervisionState::new(Some(pid(999_999)), SupervisionState::default().health(), 0),
+            0,
+        );
+        let mut s = attach(&store);
+        let p = FakeProc::alive();
+        let e = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(p.waits(), 0);
+        let g = store.rec.lock().unwrap();
+        assert_eq!(g.supervision().supervisor_pid(), Some(pid(999_999)));
+    }
+
+    /// SUP-1・TASK-157.4: 監視中に所有権が他 supervisor へ移ったら、終了記録でその pid を消さない。
+    #[test]
+    fn sup1_task157_4_does_not_clear_foreign_owner_on_exit() {
+        struct Steal(Arc<FakeStore>);
+        impl LaunchedProcess for Steal {
+            fn pid(&self) -> NonZeroU32 {
+                pid(42)
+            }
+            fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+                let mut g = self.0.rec.lock().unwrap();
+                let s = SupervisionState::new(
+                    Some(pid(999_999)),
+                    SupervisionState::default().health(),
+                    0,
+                );
+                *g = next_record(&g, g.status().clone(), s);
+                Ok(Some(ProcessExit::Exited(0)))
+            }
+            fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+                Ok(())
+            }
+        }
+        let store = running_store(0);
+        let mut s = attach(&store);
+        let p = Steal(store.clone());
+        let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
+        assert!(matches!(out, MonitorOutcome::ExitedUnrecorded { .. }));
+        let g = store.rec.lock().unwrap();
+        assert_eq!(g.supervision().supervisor_pid(), Some(pid(999_999)));
     }
 
     /// TASK-157.4: 停止要求で戻り、Running のまま supervisor_pid を外す（プロセスは kill しない）。

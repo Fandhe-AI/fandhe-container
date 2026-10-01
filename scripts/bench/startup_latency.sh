@@ -240,8 +240,8 @@ leftover_ids=()
 rc=0
 # create の終了コード（create 未成功時の未作成判定に使う）。
 create_rc=0
-# 後始末全体の期限（マイクロ秒）。空でなければ run_rt は各呼び出しへ残り時間だけを渡す
-# （finish_container が設定・解除する。REPAIR-5）。
+# 複数回の呼び出しをまとめて縛る期限（マイクロ秒）。空でなければ run_rt は各呼び出しへ
+# 残り時間だけを渡す（実行開始の観測ループと finish_container が設定・解除する。REPAIR-5）。
 rt_deadline_us=""
 # query_state の結果（終了コード・status）。
 state_rc=0
@@ -251,7 +251,7 @@ state_status=""
 # 保持して create が戻らないランタイムへの対策）。stdin は /dev/null。
 # 引数: <stdout ファイル> <stderr ファイル（stdout と同じパスなら併合）> <ランタイム引数...>
 # 時間上限: 通常は 1 呼び出しにつき --timeout 秒（TERM 後の KILL 猶予 KILL_AFTER_SECS 秒）。
-# rt_deadline_us が設定されている間（後始末中）は、TERM までの時間と KILL 猶予の合計が
+# rt_deadline_us が設定されている間（実行開始の観測中・後始末中）は、TERM までの時間と KILL 猶予の合計が
 # 期限までの残り時間に収まるよう配分し、残りが MIN_CALL_BUDGET_US 未満なら呼ばずに
 # 124（timeout と同じ値）を返す。
 run_rt() {
@@ -264,8 +264,9 @@ run_rt() {
     if [ "$rem" -lt "$MIN_CALL_BUDGET_US" ]; then
       return 124
     fi
-    # KILL 猶予は残り時間の半分（最大 1 秒）とし、残りを TERM までの時間にする。
-    g=$((rem / 2))
+    # KILL 猶予は残り時間の 1/10（最大 1 秒）とし、残りを TERM までの時間にする
+    # （1 回目の呼び出しが期限のほぼ全体を使えるようにする）。
+    g=$((rem / 10))
     [ "$g" -gt 1000000 ] && g=1000000
     limit="$(us_to_secs $((rem - g)))"
     grace="$(us_to_secs "$g")"
@@ -486,11 +487,15 @@ measure_once() {
   deadline=$((ts + timeout_secs * 1000000))
   while :; do
     state_polls=$((state_polls + 1))
+    # 各照会には観測期限までの残り時間だけを渡す。残りがなければ呼ばずに 124 になる。
+    rt_deadline_us="$deadline"
     query_state "$id"
+    rt_deadline_us=""
     t2="$(now_us)"
     # 期限は照会完了時刻で判定する。running / stopped を観測した照会でも、完了が期限を
     # 過ぎていれば --timeout 内に観測できなかった計測として失敗にする（成功結果に混ぜない）。
-    if [ "$t2" -gt "$deadline" ]; then
+    # 照会が時間切れ（124）になった場合も同じ扱いにする。
+    if [ "$t2" -gt "$deadline" ] || [ "$state_rc" -eq 124 ]; then
       err "runtime-exec-not-observed" "container $id did not reach running/stopped within ${timeout_secs}s"
       return 1
     fi

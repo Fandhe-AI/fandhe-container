@@ -611,6 +611,20 @@ impl ContainerCgroup {
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
+
+    /// テスト専用: 通常のディレクトリ fd から組み立てる（CORE-3・TASK-32.5）。
+    ///
+    /// 実 cgroup を要さず `set_memory_limits` / `set_cpu_max` の書き込み経路を既定のテスト集合で
+    /// 検証するために使う（`CgroupJoin::from_dir_for_test` と同じ位置づけ）。`parent_id` はダミーのため
+    /// `DelegatedCgroup::remove_child` には渡さない。
+    #[cfg(test)]
+    pub(crate) fn from_dir_for_test(name: CgroupName, fd: OwnedFd) -> Self {
+        Self {
+            name,
+            fd,
+            parent_id: (0, 0),
+        }
+    }
 }
 
 /// fork 後の子プロセスが自分自身をコンテナ用子 cgroup へ参加させるためのフック（CORE-3・TASK-32.4）。
@@ -1772,5 +1786,156 @@ mod tests {
         );
         assert!(verify_effective(Max, Bytes(1)).is_err());
         assert!(verify_effective(Bytes(1), Max).is_err());
+    }
+
+    fn limits_for(dir: &std::path::Path) -> ContainerCgroup {
+        let fd = OwnedFd::from(File::open(dir).unwrap());
+        let name = CgroupName::new(&ContainerId::new("t").unwrap()).unwrap();
+        ContainerCgroup::from_dir_for_test(name, fd)
+    }
+
+    /// 通常ファイル上の書き込みは `O_TRUNC` なしのため、対象は事前に空で作る（cpu.rs のテストと同じ前提）。
+    fn touch(tmp: &TmpDir, names: &[&str]) {
+        for n in names {
+            std::fs::write(tmp.0.join(n), "").unwrap();
+        }
+    }
+
+    fn read(tmp: &TmpDir, name: &str) -> String {
+        std::fs::read_to_string(tmp.0.join(name)).unwrap()
+    }
+
+    fn mem_limits(max: &str, swap: Option<MemoryLimit>) -> MemoryLimits {
+        MemoryLimits {
+            memory_max: MemoryLimit::parse(max).unwrap(),
+            swap_max: swap,
+        }
+    }
+
+    /// CORE-3・TASK-32.5: memory.max / memory.swap.max / cpu.max に書かれる値を具体値で照合する。
+    #[test]
+    fn core3_task32_5_memory_and_cpu_values_written() {
+        let tmp = TmpDir::new("t325-ok");
+        touch(&tmp, &["memory.max", "memory.swap.max", "cpu.max"]);
+        let cg = limits_for(&tmp.0);
+        let enabled = ControllerSet::of(&[Controller::Memory, Controller::Cpu]);
+        let applied = cg
+            .set_memory_limits(&enabled, &mem_limits("64M", Some(MemoryLimit::Bytes(0))))
+            .unwrap();
+        assert_eq!(
+            applied,
+            AppliedMemoryLimits {
+                memory_max: MemoryLimit::Bytes(67_108_864),
+                swap_max: Some(MemoryLimit::Bytes(0)),
+            }
+        );
+        assert_eq!(read(&tmp, "memory.max"), "67108864");
+        assert_eq!(read(&tmp, "memory.swap.max"), "0");
+        let cpu = CpuMax::new(CpuQuota::Micros(50_000), 100_000).unwrap();
+        assert_eq!(cg.set_cpu_max(&cpu), Ok(cpu));
+        assert_eq!(read(&tmp, "cpu.max").trim_end(), "50000 100000");
+    }
+
+    /// CORE-3・TASK-32.5: `max` は `max` と書かれ、swap 未指定なら memory.swap.max に触れない。
+    #[test]
+    fn core3_task32_5_max_and_no_swap_leaves_swap_untouched() {
+        let tmp = TmpDir::new("t325-max");
+        touch(&tmp, &["memory.max"]);
+        std::fs::write(tmp.0.join("memory.swap.max"), "sentinel").unwrap();
+        let cg = limits_for(&tmp.0);
+        let enabled = ControllerSet::of(&[Controller::Memory]);
+        let applied = cg
+            .set_memory_limits(&enabled, &mem_limits("max", None))
+            .unwrap();
+        assert_eq!(applied.memory_max, MemoryLimit::Max);
+        assert_eq!(applied.swap_max, None);
+        assert_eq!(read(&tmp, "memory.max"), "max");
+        assert_eq!(read(&tmp, "memory.swap.max"), "sentinel");
+    }
+
+    /// CORE-3・TASK-32.5: memory controller 未有効なら何も書かず `FailedPrecondition`。
+    #[test]
+    fn core3_task32_5_memory_controller_not_enabled_writes_nothing() {
+        let tmp = TmpDir::new("t325-noctl");
+        touch(&tmp, &["memory.max", "memory.swap.max"]);
+        let cg = limits_for(&tmp.0);
+        let e = cg
+            .set_memory_limits(
+                &ControllerSet::of(&[Controller::Cpu]),
+                &mem_limits("64M", Some(MemoryLimit::Bytes(0))),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.step, CgroupStep::SetMemoryLimit);
+        assert_eq!(read(&tmp, "memory.max"), "");
+        assert_eq!(read(&tmp, "memory.swap.max"), "");
+    }
+
+    /// CORE-3・TASK-32.5: 範囲外の swap 値は書き込み前に拒否され memory.max も書かれない（部分書き込みなし）。
+    #[test]
+    fn core3_task32_5_out_of_range_swap_rejected_before_any_write() {
+        let tmp = TmpDir::new("t325-range");
+        touch(&tmp, &["memory.max", "memory.swap.max"]);
+        let cg = limits_for(&tmp.0);
+        let e = cg
+            .set_memory_limits(
+                &ControllerSet::of(&[Controller::Memory]),
+                &mem_limits("64M", Some(MemoryLimit::Bytes(i64::MAX as u64 + 1))),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+        assert_eq!(e.step, CgroupStep::SetMemoryLimit);
+        assert_eq!(read(&tmp, "memory.max"), "");
+        assert_eq!(read(&tmp, "memory.swap.max"), "");
+    }
+
+    /// CORE-3・TASK-32.5: memory.max 不在は `FailedPrecondition`（swap は未変更）。
+    #[test]
+    fn core3_task32_5_missing_memory_max_is_failed_precondition() {
+        let tmp = TmpDir::new("t325-nomax");
+        touch(&tmp, &["memory.swap.max"]);
+        let cg = limits_for(&tmp.0);
+        let e = cg
+            .set_memory_limits(
+                &ControllerSet::of(&[Controller::Memory]),
+                &mem_limits("64M", Some(MemoryLimit::Bytes(0))),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.step, CgroupStep::SetMemoryLimit);
+        assert_eq!(read(&tmp, "memory.swap.max"), "");
+    }
+
+    /// CORE-3・TASK-32.5: memory.swap.max 不在（swap accounting 無効相当）は `FailedPrecondition`。
+    /// 書き込み順は memory.max が先で、失敗しても巻き戻さない契約どおり memory.max は書かれたまま。
+    #[test]
+    fn core3_task32_5_missing_swap_file_is_failed_precondition() {
+        let tmp = TmpDir::new("t325-noswap");
+        touch(&tmp, &["memory.max"]);
+        let cg = limits_for(&tmp.0);
+        let e = cg
+            .set_memory_limits(
+                &ControllerSet::of(&[Controller::Memory]),
+                &mem_limits("64M", Some(MemoryLimit::Bytes(0))),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.step, CgroupStep::SetMemoryLimit);
+        assert_eq!(read(&tmp, "memory.max"), "67108864");
+    }
+
+    /// CORE-3・TASK-32.5: memory.max が symlink なら `O_NOFOLLOW` で拒否し、リンク先は変更しない。
+    #[test]
+    fn core3_task32_5_symlink_memory_max_is_rejected() {
+        let tmp = TmpDir::new("t325-symlink");
+        std::fs::write(tmp.0.join("target"), "untouched").unwrap();
+        std::os::unix::fs::symlink(tmp.0.join("target"), tmp.0.join("memory.max")).unwrap();
+        let cg = limits_for(&tmp.0);
+        let r = cg.set_memory_limits(
+            &ControllerSet::of(&[Controller::Memory]),
+            &mem_limits("64M", None),
+        );
+        assert!(r.is_err());
+        assert_eq!(read(&tmp, "target"), "untouched");
     }
 }

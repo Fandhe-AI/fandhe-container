@@ -411,12 +411,12 @@ startup-latency-selftest: ## 起動時間計測スクリプトの自己テスト
 	bash scripts/bench/startup_latency_selftest.sh
 
 .PHONY: startup-latency
-startup-latency: ## 起動時間を計測する（実機前提。RUNTIME=<絶対パス> BUNDLE=<dir> 必須）
-	@if [ -z $(call fio_bench_sq,$(RUNTIME)) ] || [ -z $(call fio_bench_sq,$(BUNDLE)) ]; then \
-		echo "usage: make startup-latency RUNTIME=<abs-path> BUNDLE=<dir> [ITERATIONS=<n>] [LABEL=<label>]" >&2; \
+startup-latency: ## 起動時間を計測する（実機前提。RUNTIME=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須）
+	@if [ -z $(call fio_bench_sq,$(RUNTIME)) ] || [ -z $(call fio_bench_sq,$(BUNDLE)) ] || [ -z $(call fio_bench_sq,$(TARGET)) ]; then \
+		echo "usage: make startup-latency RUNTIME=<abs-path> BUNDLE=<dir> TARGET=<name, e.g. own> [ITERATIONS=<n>] [LABEL=<label>]" >&2; \
 		exit 2; \
 	fi
-	bash scripts/bench/startup_latency.sh --runtime $(call fio_bench_sq,$(RUNTIME)) --bundle $(call fio_bench_sq,$(BUNDLE)) --iterations $(call fio_bench_sq,$(or $(ITERATIONS),10)) --label $(call fio_bench_sq,$(or $(LABEL),own))
+	bash scripts/bench/startup_latency.sh --runtime $(call fio_bench_sq,$(RUNTIME)) --bundle $(call fio_bench_sq,$(BUNDLE)) --target $(call fio_bench_sq,$(TARGET)) --iterations $(call fio_bench_sq,$(or $(ITERATIONS),10)) --label $(call fio_bench_sq,$(or $(LABEL),own))
 
 # --------------------------------------------------
 # アイドル時常駐メモリ計測（TASK-45.1・CORE-7。Linux 限定。bash のみで完結）

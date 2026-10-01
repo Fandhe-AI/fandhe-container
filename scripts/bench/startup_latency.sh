@@ -9,7 +9,7 @@
 # TASK-46（担当: 人間）のうち Claude Code 担当分である計測ハーネスの準備までを担い、
 # 実機での実測・Docker 比較・Conditional Go 条件 1 の判定は #213（TASK-46.h1）で人間が行う。
 # Docker 側の同一手法計測は #842（TASK-46.2）が本スクリプトを拡張して追加する
-# （1 回分の計測を measure_once に分け、出力に計測対象ラベル `target` を持たせてある）。
+# （1 回分の計測を measure_once に分け、出力に計測対象 `target`〔--target で明示〕を持たせてある）。
 #
 # 現状の制約（REPAIR-3: 実装済みを装わない）:
 #   - crates/cli は雛形で fandhe-container バイナリは未提供（TASK-79 で追加予定）。
@@ -43,8 +43,10 @@
 #   create・start・観測待ち observe と state 照会回数を記録する）。
 #
 # 使い方:
-#   startup_latency.sh --runtime <絶対パス> --bundle <dir> [--iterations N] [--warmup N]
-#                      [--timeout SECS] [--label NAME] [--output FILE]
+#   startup_latency.sh --runtime <絶対パス> --bundle <dir> --target <名前> [--iterations N]
+#                      [--warmup N] [--timeout SECS] [--label NAME] [--output FILE]
+#   --target は計測対象のランタイムの名前（own・runc 等）で、出力の target に記録する。
+#   任意の実行ファイルを --runtime に渡せるため、取り違えを防ぐよう既定値を持たせず必須にする。
 #   bundle は人間が用意する（rootfs と config.json。基準ワークロードは alpine:3.20 相当の
 #   軽量プロセス。rootfs・config.json の生成は本スクリプトでは行わない）。
 #
@@ -106,6 +108,7 @@ usage() {
 usage: startup_latency.sh --runtime <abs-path> --bundle <dir> [options]
   --runtime <path>     OCI runtime executable (absolute path, required)
   --bundle <dir>       OCI bundle directory containing config.json (required)
+  --target <name>      name of the measured runtime recorded as "target" (required, e.g. own, runc)
   --iterations <1-1000> measured iterations (default: 10)
   --warmup <0-100>     warmup iterations excluded from statistics (default: 1)
   --timeout <1-60>     per runtime command timeout in seconds (default: 10)
@@ -144,6 +147,7 @@ iterations=10
 warmup=1
 timeout_secs=10
 label="own"
+target=""
 output=""
 seen_opts=" "
 
@@ -163,7 +167,7 @@ while [ "$#" -gt 0 ]; do
       usage
       exit 0
       ;;
-    --runtime | --bundle | --iterations | --warmup | --timeout | --label | --output)
+    --runtime | --bundle | --target | --iterations | --warmup | --timeout | --label | --output)
       opt="$1"
       if [ "$#" -lt 2 ]; then
         err "missing-value" "$opt requires a value"
@@ -177,6 +181,7 @@ while [ "$#" -gt 0 ]; do
         --warmup) warmup="$2" ;;
         --timeout) timeout_secs="$2" ;;
         --label) label="$2" ;;
+        --target) target="$2" ;;
         --output) output="$2" ;;
       esac
       shift 2
@@ -208,6 +213,14 @@ if [[ "$runtime" != /* ]] || [ ! -f "$runtime" ] || [ ! -x "$runtime" ]; then
 fi
 if [ -z "$bundle" ]; then
   err "missing-bundle" "--bundle is required"
+  exit "$EXIT_INPUT"
+fi
+if [ -z "$target" ]; then
+  err "missing-target" "--target is required (name of the measured runtime, e.g. own)"
+  exit "$EXIT_INPUT"
+fi
+if ! [[ "$target" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; then
+  err "invalid-target" "target must match ^[A-Za-z0-9._-]{1,32}$"
   exit "$EXIT_INPUT"
 fi
 if [ -L "$bundle" ] || [ ! -d "$bundle" ]; then
@@ -610,7 +623,7 @@ measure_once() {
 
 samples="[]"
 total_runs=$((warmup + iterations))
-echo "startup_latency: target=own label=$label warmup=$warmup iterations=$iterations timeout=${timeout_secs}s" >&2
+echo "startup_latency: target=$target label=$label warmup=$warmup iterations=$iterations timeout=${timeout_secs}s" >&2
 run_no=0
 while [ "$run_no" -lt "$total_runs" ]; do
   run_no=$((run_no + 1))
@@ -648,6 +661,7 @@ fi
 # total_us の中央値（偶数件は中央 2 件の平均）・最小・最大を ms で集計して JSON を組み立てる。
 result="$(jq -n \
   --arg label "$label" \
+  --arg target "$target" \
   --argjson iterations "$iterations" \
   --argjson warmup "$warmup" \
   --argjson timeout "$timeout_secs" \
@@ -658,7 +672,7 @@ result="$(jq -n \
   | {
       schema_version: 1,
       benchmark: "startup_latency",
-      target: "own",
+      target: $target,
       label: $label,
       params: {iterations: $iterations, warmup: $warmup, timeout_secs: $timeout},
       samples_us: $samples,

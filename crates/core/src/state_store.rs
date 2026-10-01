@@ -80,9 +80,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::{
-    ContainerId, ContainerStatus, CreateStateRequest, DeleteStateRequest, DeleteStateResponse,
-    ErrorCode, GetStateRequest, ListStateRequest, StateList, StateListCursor, StateRecord,
-    StateRevision, StateStore, TraitError, UpdateStateRequest,
+    CgroupScope, ContainerId, ContainerStatus, CreateStateRequest, DeleteStateRequest,
+    DeleteStateResponse, ErrorCode, GetStateRequest, ListStateRequest, StateList, StateListCursor,
+    StateRecord, StateRevision, StateStore, TraitError, UpdateStateRequest,
 };
 
 /// 各コンテナの状態ファイル名（OCI-5）。
@@ -729,7 +729,11 @@ impl StateStore for FileStateStore {
             Err(_) => return Err(internal("failed to create the state directory")),
         }
         let revision = self.allocate_revision(&mut guard, None)?;
-        let record = StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
+        let mut record =
+            StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
+        if let Some(scope) = req.cgroup_scope() {
+            record = record.with_cgroup_scope(scope.clone());
+        }
         self.write_record(&record)?;
         Ok(record)
     }
@@ -746,11 +750,16 @@ impl StateStore for FileStateStore {
             ));
         }
         let revision = self.allocate_revision(&mut guard, Some(&existing))?;
-        let record = StateRecord::new(
+        let mut record = StateRecord::new(
             req.status().clone(),
             existing.bundle().to_path_buf(),
             revision,
         )?;
+        // cgroup_scope は作成時の値を変えずに引き継ぐ（トレイト契約 8。落とすと delete が cgroup を
+        // 削除しなくなる。TASK-30.3・OCI-6）。
+        if let Some(scope) = existing.cgroup_scope() {
+            record = record.with_cgroup_scope(scope.clone());
+        }
         self.write_record(&record)?;
         Ok(record)
     }
@@ -1207,7 +1216,14 @@ fn open_nowait(path: &Path, opts: &mut OpenOptions) -> std::io::Result<File> {
 }
 
 /// `state.json` の JSON 表現（OCI Runtime Spec の state 形式。`ociVersion`・`id`・`status`・
-/// `pid`・`bundle`）に、ストア独自の `revision`・`exitCode` を加えたもの。
+/// `pid`・`bundle`）に、ストア独自の `revision`・`exitCode`・`cgroupScope` を加えたもの。
+///
+/// `cgroupScope`（TASK-30.3・OCI-6）は cgroup を作った委譲スコープで、記録が無ければ書かない。
+/// このフィールドを持たない既存の `state.json`（導入前の版が書いたもの）は `None` として読む。
+/// 導入前の版は本番経路で cgroup を作らない（`cgroups::DelegatedCgroup::prepare` は起動フローに
+/// 未結線）ため、フィールドの無いレコードに対応する cgroup は存在せず、「cgroup を作っていない」
+/// （delete は cgroup に触れない）と読むのが正しい。値が [`CgroupScope`] の形式を満たさなければ
+/// 他の項目と同じく破損（`Internal`。回復は `purge_corrupted`）とする。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StateDto {
@@ -1220,6 +1236,8 @@ struct StateDto {
     revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cgroup_scope: Option<String>,
 }
 
 impl StateDto {
@@ -1234,6 +1252,7 @@ impl StateDto {
             bundle,
             revision: record.revision().value(),
             exit_code: status.exit_code(),
+            cgroup_scope: record.cgroup_scope().map(|c| c.as_str().to_owned()),
         })
     }
 
@@ -1264,12 +1283,20 @@ impl StateDto {
             ("stopped", None, code) => ContainerStatus::stopped(id, code),
             _ => return Err(corrupted()),
         };
-        StateRecord::new(
+        let cgroup_scope = match self.cgroup_scope.as_deref() {
+            Some(c) => Some(CgroupScope::new(c).map_err(|_| corrupted())?),
+            None => None,
+        };
+        let record = StateRecord::new(
             status,
             PathBuf::from(self.bundle),
             StateRevision::from_raw(self.revision),
         )
-        .map_err(|_| corrupted())
+        .map_err(|_| corrupted())?;
+        Ok(match cgroup_scope {
+            Some(c) => record.with_cgroup_scope(c),
+            None => record,
+        })
     }
 }
 
@@ -1474,6 +1501,9 @@ mod tests {
         assert_eq!(v["revision"], 0);
         assert_eq!(v["bundle"], bundle().to_str().unwrap());
         assert!(v.get("pid").is_none());
+        // TASK-30.3・OCI-6: cgroup スコープの記録が無ければ `cgroupScope` は書かない。
+        assert!(v.get("cgroupScope").is_none());
+        assert_eq!(rec.cgroup_scope(), None);
     }
 
     #[test]

@@ -30,6 +30,10 @@
 //!    [`TraitError::message`] の長さが上限内かを検証してからアロケーションする
 //! 7. 状態レコードとエラーメッセージに秘密情報（レジストリ資格情報等）を含めない
 //!    （security.md）
+//! 8. [`StateRecord::cgroup_scope`]（コンテナ用 cgroup を作った委譲スコープ。TASK-30.3・OCI-6・CORE-3）は
+//!    `create` で [`CreateStateRequest::cgroup_scope`] の値をそのまま記録し、`update` では変更せずに
+//!    引き継ぎ、`get` / `list` で返す。plugin 実装も同じく往復させる（落とすと delete が cgroup の
+//!    削除を飛ばし、cgroup がリークする）
 //!
 //! メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 //! `ContainerRuntime`（TASK-4.1）と同じく dyn 互換（object safety）を保つ。
@@ -159,6 +163,62 @@ impl StateRevision {
     }
 }
 
+/// [`CgroupScope`] 全体の最大バイト数（Linux の `PATH_MAX`）。
+pub const MAX_CGROUP_SCOPE_BYTES: usize = 4096;
+
+/// [`CgroupScope`] の要素数の上限（`cgroups` モジュールの cgroup パス深さ上限と同じ）。
+const MAX_CGROUP_SCOPE_DEPTH: usize = 64;
+
+/// [`CgroupScope`] の 1 要素の最大バイト数（`NAME_MAX`）。
+const MAX_CGROUP_SCOPE_COMPONENT_BYTES: usize = 255;
+
+/// コンテナ用 cgroup を作った委譲スコープ（cgroup v2 の `/sys/fs/cgroup` 起点の絶対パス。TASK-30.3・OCI-6・CORE-3）。
+///
+/// コンテナ用子 cgroup（`<scope>/fc-<id>`）の親を指す。正規形は Linux の
+/// `cgroups::DelegatedCgroup::path()` と同じ文字列（ルートは `"/"`、それ以外は `"/a/b"`）で、
+/// `oci_runtime::delete` は記録された値と削除側の委譲スコープを文字列の完全一致で照合し、
+/// 一致しなければ cgroup にも状態記録にも触れない（別スコープで「cgroup 無し」を誤って確認して
+/// 状態記録だけを消すことを防ぐ。fail-closed）。
+///
+/// 照合は文字列で行うため、記録した側と同じ cgroup 名前空間から見たパスであることが前提である
+/// （名前空間が異なり文字列が食い違えば不一致として拒否される）。本型は形式（絶対パス・
+/// 各要素が空 / `.` / `..` / NUL でない・要素長・深さ・全体長の上限）だけを検証し、実在は確かめない。
+/// 3 OS でビルドする（状態記録は OS に依存しない。CLI-1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CgroupScope(String);
+
+impl CgroupScope {
+    /// 文字列から作る。形式が不正なら [`ErrorCode::InvalidArgument`]（値はメッセージに含めない）。
+    pub fn new(path: &str) -> Result<Self, TraitError> {
+        let invalid = || TraitError::new(ErrorCode::InvalidArgument, "invalid cgroup scope path");
+        if path.len() > MAX_CGROUP_SCOPE_BYTES {
+            return Err(invalid());
+        }
+        let rest = path.strip_prefix('/').ok_or_else(invalid)?;
+        if !rest.is_empty() {
+            let mut depth = 0usize;
+            for comp in rest.split('/') {
+                depth = depth.checked_add(1).ok_or_else(invalid)?;
+                if depth > MAX_CGROUP_SCOPE_DEPTH
+                    || comp.is_empty()
+                    || comp == "."
+                    || comp == ".."
+                    || comp.len() > MAX_CGROUP_SCOPE_COMPONENT_BYTES
+                    || comp.contains('\0')
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        Ok(Self(path.to_owned()))
+    }
+
+    /// 正規形の文字列（`"/"` または `"/a/b"`）。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// コンテナ状態のレコード（[`StateStore`] が保持・返却する単位）。
 ///
 /// 真偽値やフラットな文字列ではなく、将来の拡張に備えて構造化された型にする
@@ -171,6 +231,7 @@ pub struct StateRecord {
     status: ContainerStatus,
     bundle: PathBuf,
     revision: StateRevision,
+    cgroup_scope: Option<CgroupScope>,
 }
 
 impl StateRecord {
@@ -194,7 +255,15 @@ impl StateRecord {
             status,
             bundle,
             revision,
+            cgroup_scope: None,
         })
+    }
+
+    /// コンテナ用 cgroup を作った委譲スコープを設定する（[`Self::cgroup_scope`]）。
+    #[must_use]
+    pub fn with_cgroup_scope(mut self, scope: CgroupScope) -> Self {
+        self.cgroup_scope = Some(scope);
+        self
     }
 
     /// 対象コンテナの ID を返す（`status().id()` への委譲）。
@@ -216,6 +285,16 @@ impl StateRecord {
     pub fn revision(&self) -> StateRevision {
         self.revision
     }
+
+    /// コンテナ用 cgroup を作った委譲スコープを返す（TASK-30.3・OCI-6）。
+    ///
+    /// `Some` なら、このコンテナの cgroup は `<scope>/fc-<id>` にある（または削除済み）。`None` は
+    /// 「このレコードのために cgroup を作っていない」ことを表し、`oci_runtime::delete` は cgroup に
+    /// 触れない。cgroup を作る側（本番 launcher。TASK-29 / TASK-157 系で結線予定）は、作る前に
+    /// スコープを記録しておく契約である（`cgroups::DelegatedCgroup::prepare` の doc）。
+    pub fn cgroup_scope(&self) -> Option<&CgroupScope> {
+        self.cgroup_scope.as_ref()
+    }
 }
 
 /// [`StateStore::create`] の要求。
@@ -227,6 +306,7 @@ impl StateRecord {
 pub struct CreateStateRequest {
     status: ContainerStatus,
     bundle: PathBuf,
+    cgroup_scope: Option<CgroupScope>,
 }
 
 impl CreateStateRequest {
@@ -240,7 +320,25 @@ impl CreateStateRequest {
                 "bundle path must be absolute",
             ));
         }
-        Ok(Self { status, bundle })
+        Ok(Self {
+            status,
+            bundle,
+            cgroup_scope: None,
+        })
+    }
+
+    /// コンテナ用 cgroup を作る委譲スコープを記録する（[`StateRecord::cgroup_scope`]）。
+    ///
+    /// cgroup を作る呼び出し元は、作る前（`cgroups::DelegatedCgroup::prepare` の前）にこれで記録する。
+    #[must_use]
+    pub fn with_cgroup_scope(mut self, scope: CgroupScope) -> Self {
+        self.cgroup_scope = Some(scope);
+        self
+    }
+
+    /// 記録する委譲スコープを返す（未設定なら `None`）。
+    pub fn cgroup_scope(&self) -> Option<&CgroupScope> {
+        self.cgroup_scope.as_ref()
     }
 
     /// 対象コンテナの ID を返す（`status().id()` への委譲）。
@@ -550,8 +648,11 @@ mod tests {
                 ));
             }
             let revision = self.allocate_revision()?;
-            let record =
+            let mut record =
                 StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
+            if let Some(scope) = req.cgroup_scope() {
+                record = record.with_cgroup_scope(scope.clone());
+            }
             records.insert(req.id().clone(), record.clone());
             Ok(record)
         }
@@ -569,7 +670,11 @@ mod tests {
             }
             let bundle = current.bundle().to_path_buf();
             let next_revision = self.allocate_revision()?;
-            let updated = StateRecord::new(req.status().clone(), bundle, next_revision)?;
+            let mut updated = StateRecord::new(req.status().clone(), bundle, next_revision)?;
+            // 契約 8: cgroup_scope は update で変えずに引き継ぐ。
+            if let Some(scope) = current.cgroup_scope() {
+                updated = updated.with_cgroup_scope(scope.clone());
+            }
             records.insert(req.id().clone(), updated.clone());
             Ok(updated)
         }

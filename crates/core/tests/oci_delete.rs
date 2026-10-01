@@ -6,8 +6,10 @@
 //! `StateStore` へ直接作る（3 OS で同じ経路。root 不要・skip なし）。
 //!
 //! cgroup の削除は OS 非依存の記録用 fake（`RecordingCgroup`）で「いつ・どの ID で呼ばれるか」を照合する
-//! （TASK-30.3 の受入基準 2 の機械照合）。実 cgroup での削除は実機前提の `cgroup_delete.rs`、状態ファイルの
-//! 削除（受入基準 1）は実 `FileStateStore` を使う `state_store.rs` が照合する。
+//! （TASK-30.3 の受入基準 2 の機械照合）。cgroup を削除するのは状態に cgroup スコープが記録されたレコード
+//! だけで（`oci_runtime::create` は記録しないため、記録つきのレコードは `StateStore::create` で直接作る）、
+//! 記録と異なる委譲スコープからの delete は状態記録を残して拒否される。実 cgroup での削除は実機前提の
+//! `cgroup_delete.rs`、状態ファイルの削除（受入基準 1）は実 `FileStateStore` を使う `state_store.rs` が照合する。
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -17,26 +19,41 @@ use std::sync::Mutex;
 use fandhe_container_core::observability::{OpName, OpRecorder};
 use fandhe_container_core::oci_runtime::{CgroupRemoval, ContainerCgroupRemover, create, delete};
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ContainerStatus, CreateRequest, CreateStateRequest, DeleteRequest,
-    DeleteResponse, DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest,
-    ListStateRequest, StateList, StateRecord, StateRevision, StateStore, TraitError,
-    UpdateStateRequest,
+    CgroupScope, ContainerId, ContainerState, ContainerStatus, CreateRequest, CreateStateRequest,
+    DeleteRequest, DeleteResponse, DeleteStateRequest, DeleteStateResponse, ErrorCode,
+    GetStateRequest, ListStateRequest, StateList, StateRecord, StateRevision, StateStore,
+    TraitError, UpdateStateRequest,
 };
 use serde_json::{Value, json};
 
-/// テスト専用の記録用 `ContainerCgroupRemover`。呼ばれた ID を順に記録し、常に `Removed` を返す。
-#[derive(Default)]
+/// テストで記録する委譲スコープ。
+const SCOPE: &str = "/user.slice/user-1000.slice/a.scope";
+
+/// テスト専用の記録用 `ContainerCgroupRemover`。委譲スコープ `scope` を持ち、`remove` で呼ばれた ID を順に
+/// 記録して常に `Removed` を返す。
 struct RecordingCgroup {
+    scope: CgroupScope,
     calls: Mutex<Vec<ContainerId>>,
 }
 
 impl RecordingCgroup {
+    fn in_scope(scope: &str) -> Self {
+        Self {
+            scope: CgroupScope::new(scope).expect("scope"),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
     fn calls(&self) -> Vec<ContainerId> {
         self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
 impl ContainerCgroupRemover for RecordingCgroup {
+    fn scope(&self) -> Result<CgroupScope, TraitError> {
+        Ok(self.scope.clone())
+    }
+
     fn remove(&self, id: &ContainerId) -> Result<CgroupRemoval, TraitError> {
         self.calls
             .lock()
@@ -81,11 +98,14 @@ impl StateStore for MemStateStore {
         if records.contains_key(req.id()) {
             return Err(TraitError::new(ErrorCode::AlreadyExists, "exists"));
         }
-        let record = StateRecord::new(
+        let mut record = StateRecord::new(
             req.status().clone(),
             req.bundle().to_path_buf(),
             self.allocate_revision(),
         )?;
+        if let Some(scope) = req.cgroup_scope() {
+            record = record.with_cgroup_scope(scope.clone());
+        }
         records.insert(req.id().clone(), record.clone());
         Ok(record)
     }
@@ -98,11 +118,15 @@ impl StateStore for MemStateStore {
         if cur.revision() != req.expected_revision() {
             return Err(TraitError::new(ErrorCode::FailedPrecondition, "stale"));
         }
-        let next = StateRecord::new(
+        let mut next = StateRecord::new(
             req.status().clone(),
             cur.bundle().to_path_buf(),
             self.allocate_revision(),
         )?;
+        // `StateStore` の契約どおり cgroup スコープは update で変えずに引き継ぐ（TASK-30.3）。
+        if let Some(scope) = cur.cgroup_scope() {
+            next = next.with_cgroup_scope(scope.clone());
+        }
         records.insert(req.status().id().clone(), next.clone());
         Ok(next)
     }
@@ -193,18 +217,19 @@ fn op_stats(rec: &OpRecorder, name: &str) -> (u64, u64) {
 }
 
 /// OCI-6・CORE-2: create した直後（未起動）のコンテナは delete でき、再 delete は `NotFound`。
+/// `oci_runtime::create` は cgroup スコープを記録しない（cgroup を作らない）ので、cgroup には触れない（TASK-30.3）。
 #[test]
 fn oci6_core2_create_then_delete() {
     let b = Bundle::ready("create", &config());
     let store = MemStateStore::new();
     let rec = OpRecorder::new();
     let id = "del-create";
-    create(&store, &rec, &b.create_request(id)).expect("create");
+    let created = create(&store, &rec, &b.create_request(id)).expect("create");
+    assert_eq!(created.cgroup_scope(), None);
 
-    let cg = RecordingCgroup::default();
+    let cg = RecordingCgroup::in_scope(SCOPE);
     let res = delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect("delete");
-    // 受入基準 2: delete が当該 ID の cgroup 削除をちょうど 1 回呼ぶ（2 回目の delete は NotFound で呼ばない）。
-    assert_eq!(cg.calls(), vec![cid(id)]);
+    assert_eq!(cg.calls(), Vec::<ContainerId>::new());
     assert_eq!(res, DeleteResponse::new());
     assert_eq!(
         store.record_of(id).expect_err("gone").code(),
@@ -213,8 +238,20 @@ fn oci6_core2_create_then_delete() {
 
     let err = delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect_err("second delete");
     assert_eq!(err.code(), ErrorCode::NotFound);
-    assert_eq!(cg.calls(), vec![cid(id)]);
+    assert_eq!(cg.calls(), Vec::<ContainerId>::new());
     assert_eq!(op_stats(&rec, "delete"), (1, 1));
+}
+
+/// cgroup スコープ `scope` を記録した Created（pid なし）のレコードを `StateStore::create` で直接作る
+/// （cgroup を作る将来の launcher が create 時に記録する経路の代わり。TASK-30.3）。
+fn create_scoped(store: &MemStateStore, b: &Bundle, id: &str, scope: &str) -> StateRecord {
+    store
+        .create(
+            &CreateStateRequest::new(ContainerStatus::created(cid(id), None), b.dir.clone())
+                .expect("absolute bundle")
+                .with_cgroup_scope(CgroupScope::new(scope).expect("scope")),
+        )
+        .expect("create scoped record")
 }
 
 /// OCI-6・CORE-2: 実行中は拒否され、停止（supervisor の代わりにテストが遷移）後に削除できる。
@@ -224,8 +261,9 @@ fn oci6_core2_delete_rejected_until_stopped() {
     let store = MemStateStore::new();
     let rec = OpRecorder::new();
     let id = "del-running";
-    let cg = RecordingCgroup::default();
-    let created = create(&store, &rec, &b.create_request(id)).expect("create");
+    let cg = RecordingCgroup::in_scope(SCOPE);
+    // cgroup の削除まで照合するため、スコープを記録したレコードで始める（TASK-30.3）。
+    let created = create_scoped(&store, &b, id, SCOPE);
 
     // start 済み相当（Running・pid あり）を revision 照合つきの update で作る。
     let pid = NonZeroU32::new(4242).expect("pid");

@@ -27,10 +27,10 @@ use fandhe_container_core::oci_runtime::{
     StartTimeouts, create, delete, kill, start,
 };
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ContainerStatus, CreateRequest, CreateStateRequest, DeleteRequest,
-    DeleteResponse, DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest,
-    KillRequest, ListStateRequest, Signal, StartRequest, StateList, StateRecord, StateRevision,
-    StateStore, TraitError, UpdateStateRequest,
+    CgroupScope, ContainerId, ContainerState, ContainerStatus, CreateRequest, CreateStateRequest,
+    DeleteRequest, DeleteResponse, DeleteStateRequest, DeleteStateResponse, ErrorCode,
+    GetStateRequest, KillRequest, ListStateRequest, Signal, StartRequest, StateList, StateRecord,
+    StateRevision, StateStore, TraitError, UpdateStateRequest,
 };
 use serde_json::{Value, json};
 
@@ -44,9 +44,17 @@ use fandhe_container_core::oci_runtime::{LaunchSpec, LaunchedProcess, NamespaceK
 
 /// テスト専用の `ContainerCgroupRemover`。cgroup は常に存在しない（`NotPresent`）として扱い、実 cgroup には
 /// 触れない（OS 非依存。cgroup 削除の結線は `oci_delete.rs`・`cgroup_delete.rs` が照合する。TASK-30.3）。
+/// `oci_runtime::create` は cgroup スコープを記録しないため、delete は本 fake を呼ばない。呼ばれた場合に
+/// 気付けるよう `scope` はエラーを返す（delete は照合できず失敗する）。
 struct NoCgroup;
 
 impl ContainerCgroupRemover for NoCgroup {
+    fn scope(&self) -> Result<CgroupScope, TraitError> {
+        Err(TraitError::new(
+            ErrorCode::Internal,
+            "no delegated cgroup in this test",
+        ))
+    }
     fn remove(&self, _id: &ContainerId) -> Result<CgroupRemoval, TraitError> {
         Ok(CgroupRemoval::NotPresent)
     }

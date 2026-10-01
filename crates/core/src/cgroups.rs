@@ -38,13 +38,15 @@
 //!
 //! - delete 時の cgroup 削除（TASK-30.3・OCI-6）: [`DelegatedCgroup::open_child`] で名前から既存の子 cgroup を
 //!   検証つきで開き、`oci_runtime::ContainerCgroupRemover` の実装として [`DelegatedCgroup::remove_child`] へ渡す
-//!   （`oci_runtime::delete` が状態記録の削除の前に呼ぶ。本番の呼び出し元による結線は未実装）
+//!   （`oci_runtime::delete` が状態記録の削除の前に呼ぶ。本番の呼び出し元による結線は未実装）。
+//!   `ContainerCgroupRemover::scope` は検出した委譲パス（[`DelegatedCgroup::path`] と同じ文字列）を返し、
+//!   delete は状態に記録されたスコープ（`StateRecord::cgroup_scope`）と一致するときだけ削除・不存在確認を行う
 //!
 //! # 未実装（REPAIR-3）
 //! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映、本番 launcher での
 //!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
-//! - OCI `linux.cgroupsPath` の反映（状態に cgroup パスが記録されないため、delete は create と同じ委譲スコープ
-//!   から呼ばれることを前提とする）・delete への本番の呼び出し元（CLI / plugin / supervisor）からの結線
+//! - OCI `linux.cgroupsPath` の反映・create での委譲スコープの記録（`CreateStateRequest::with_cgroup_scope`）と
+//!   delete への本番の呼び出し元（CLI / plugin / supervisor）からの結線
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
 
 use std::collections::BTreeSet;
@@ -57,7 +59,7 @@ use std::os::unix::fs::MetadataExt as _;
 
 use crate::oci_runtime::{CgroupRemoval, ContainerCgroupRemover};
 use crate::sys::{self, SysError};
-use crate::traits::{ContainerId, ErrorCode, TraitError};
+use crate::traits::{CgroupScope, ContainerId, ErrorCode, TraitError};
 
 mod cpu;
 pub use cpu::{CpuMax, CpuQuota};
@@ -839,6 +841,10 @@ impl DelegatedCgroup {
     /// `AlreadyExists`。途中失敗時は、自プロセスを移していれば元の親へ戻して所属を読み戻しで検証し、
     /// 本処理が作った子 cgroup・退避リーフを作成直後に固定した fd との同一性を確認してから best-effort で
     /// 削除する（[`Self::remove_verified`]。巻き戻しの失敗・fd が無く名前指定で消した事実はエラー文に併記）。
+    ///
+    /// 呼び出し元は、本関数で子 cgroup を作る前にこの委譲スコープ（`ContainerCgroupRemover::scope`）を
+    /// 状態記録へ記録しておく（`CreateStateRequest::with_cgroup_scope`。TASK-30.3・OCI-6）。記録の無い
+    /// レコードの `oci_runtime::delete` は cgroup に触れないため、記録せずに作った子 cgroup は回収されない。
     pub fn prepare(&self, name: &CgroupName) -> Result<(ContainerCgroup, Evacuated), CgroupError> {
         let me = std::process::id();
         let parent_procs = parse_procs(
@@ -1181,6 +1187,15 @@ impl DelegatedCgroup {
 ///
 /// 待機を伴わないファイル I/O のみのためタイムアウトは持たない（REPAIR-5 の対象外）。
 impl ContainerCgroupRemover for DelegatedCgroup {
+    /// 検出した委譲パス（[`DelegatedCgroup::path`]。ルートは `"/"`）を [`CgroupScope`] にして返す。
+    ///
+    /// 要素は `detect` で検証済み（`validate_component` と [`CgroupScope`] は同じ要素規則）のため、
+    /// 失敗するのは全体長が `MAX_CGROUP_SCOPE_BYTES` を超える場合だけである。その場合は記録と照合
+    /// できないので `InvalidArgument` を返す（delete は状態記録を削除しない）。
+    fn scope(&self) -> Result<CgroupScope, TraitError> {
+        CgroupScope::new(&self.path.display())
+    }
+
     fn remove(&self, id: &ContainerId) -> Result<CgroupRemoval, TraitError> {
         // 名前を作れない ID（予約名・長さ超過）の cgroup は `prepare` で作れないため存在し得ない。
         // 失敗にすると該当レコードが永久に削除不能になるので NotPresent とする。

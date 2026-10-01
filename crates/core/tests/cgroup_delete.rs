@@ -2,7 +2,9 @@
 //!
 //! 実 `DelegatedCgroup`（`ContainerCgroupRemover` の本番実装）と実 `FileStateStore` を `oci_runtime::delete`
 //! へ渡し、delete の後にコンテナ用子 cgroup（`<委譲パス>/fc-<id>`）と `state.json` が実ファイルシステム上から
-//! 消えていることを具体値で照合する（受入基準 1・2）。
+//! 消えていることを具体値で照合する（受入基準 1・2）。レコードには create 時の委譲スコープを記録し
+//! （`CreateStateRequest::with_cgroup_scope`）、`state.json` の `cgroupScope` が検出した委譲パスと一致することも
+//! 確かめる（delete はこの記録と削除側のスコープが一致するときだけ cgroup を削除・不存在確認する）。
 //!
 //! # 実機前提テストとしての分離
 //! 非特権ユーザーに委譲された cgroup v2 サブツリーが必要で、GitHub ホステッド runner では保証できない
@@ -19,7 +21,7 @@
 mod linux {
     use fandhe_container_core::cgroups::{CgroupName, DelegatedCgroup};
     use fandhe_container_core::observability::OpRecorder;
-    use fandhe_container_core::oci_runtime::delete;
+    use fandhe_container_core::oci_runtime::{ContainerCgroupRemover, delete};
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
         ContainerId, ContainerStatus, CreateStateRequest, DeleteRequest, ErrorCode, StateStore,
@@ -53,11 +55,16 @@ mod linux {
                     ContainerStatus::stopped(id.clone(), Some(0)),
                     root_dir.join("bundle"),
                 )
-                .expect("req"),
+                .expect("req")
+                .with_cgroup_scope(delegated.scope().expect("scope")),
             )
             .expect("create record");
         let state_json = root_dir.join(id.as_str()).join("state.json");
         assert!(state_json.is_file());
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_json).expect("read state.json"))
+                .expect("parse state.json");
+        assert_eq!(state["cgroupScope"], delegated.path());
 
         let rec = OpRecorder::new();
         delete(&store, &rec, &delegated, &DeleteRequest::new(id.clone())).expect("delete");

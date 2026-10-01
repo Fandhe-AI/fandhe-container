@@ -15,6 +15,15 @@
 #     noready（子は作るが READY 行を出さない）
 #   STUB_PIDFILE: スタブが起動した sleep の「pid 起動時刻」を追記するファイル（孤児確認をこの
 #     selftest が起動した sleep に限定するため。無関係な sleep 300 を数えない）
+#   STUB_NO_READY=1: READY 行を出さない（STUB_MODE と併用できる）
+#   STUB_BIGWRITE=<パス接頭辞>: READY の前に、子プロセス（head）で 3 MiB（3145728 バイト）のファイルを
+#     <接頭辞>.<i> へ書く。書けなければ READY を出さずに終了する（launcher の子孫へのファイルサイズ
+#     制限の有無を照合する）
+#   STUB_NOISE_KIB=<N>: READY の前に N KiB を標準出力へ書く（ログ上限超過の模擬）
+#   STUB_MID=launcher|child（疑似 /proc 使用時のみ）: 1 番目のコンテナが「自分の集計が始まった瞬間」に
+#     launcher ごと（launcher）または子だけ（child）終了する。子の smaps_rollup を FIFO にして計測
+#     スクリプトの読み取りと同期し、2 番目以降は 1 番目の終了を待ってから値を返す（集計中の終了を
+#     時間待ちに頼らず決定的に再現する）。STUB_MID_DIR に同期用のファイルを置く
 #   STUB_DEEP=1: 疑似 /proc に MAX_DEPTH（16）を超える深さの子孫チェーンを書く
 #   STUB_DIE_I: i 番目（1 始まり）のコンテナは即終了する
 #   STUB_PSS_BY_TRIAL: 試行ごとの子の Pss（kB。カンマ区切り。疑似 /proc 使用時のみ）
@@ -120,6 +129,13 @@ if [ "$mode" != "nochild" ] && [ "$mode" != "hang" ]; then
   child=$!
   record_child "$child"
 fi
+if [ -n "${STUB_BIGWRITE:-}" ]; then
+  head -c 3145728 /dev/zero >"${STUB_BIGWRITE}.${idx}" || { echo "stub: bigwrite failed" >&2; exit 9; }
+fi
+if [ -n "${STUB_NOISE_KIB:-}" ]; then
+  head -c "$((STUB_NOISE_KIB * 1024))" /dev/zero | tr '\0' 'x'
+  echo
+fi
 if [ -n "${FAKE_PROC:-}" ] && [ "$mode" != "hang" ]; then
   IFS=, read -ra vals <<<"${STUB_PSS_BY_TRIAL:-1000}"
   v="${vals[$((trial - 1))]:-${vals[0]}}"
@@ -134,6 +150,42 @@ if [ -n "${FAKE_PROC:-}" ] && [ "$mode" != "hang" ]; then
   [ -z "$child" ] || mk "$child" "$v"
   mk "$$" "$lp"
   [ -z "$child" ] || printf '%s \n' "$child" >"$FAKE_PROC/$$/task/$$/children"
+  if [ -n "${STUB_MID:-}" ] && [ -n "$child" ]; then
+    fifo="$FAKE_PROC/$child/smaps_rollup"
+    rm -f "$fifo"
+    mkfifo "$fifo"
+    if [ "$idx" = "1" ]; then
+      echo "$$" >"$STUB_MID_DIR/l1.pid"
+      (
+        # 計測スクリプトがこの FIFO を開く（= 1 番目の集計が始まる）まで書き込みの open で待つ。
+        printf 'Rss: 1 kB\nPss: %s kB\n' "$v" >"$fifo"
+        if [ "$STUB_MID" = "launcher" ]; then
+          kill -KILL "$child" "$$" 2>/dev/null || true
+        else
+          kill -KILL "$child" 2>/dev/null || true
+          : >"$FAKE_PROC/$$/task/$$/children"
+        fi
+        : >"$STUB_MID_DIR/done"
+      ) &
+    else
+      (
+        exec 3>"$fifo"
+        # 1 番目の終了が完了する（launcher モードでは launcher が消滅・ゾンビになる）まで値を返さない。
+        for _ in $(seq 1 100); do
+          if [ -e "$STUB_MID_DIR/done" ]; then
+            if [ "$STUB_MID" != "launcher" ]; then break; fi
+            l1="$(cat "$STUB_MID_DIR/l1.pid" 2>/dev/null || true)"
+            s=""
+            { IFS= read -r s <"/proc/$l1/stat"; } 2>/dev/null || break
+            s="${s##*) }"
+            case "${s:0:1}" in Z | X | x) break ;; esac
+          fi
+          sleep 0.1
+        done
+        printf 'Rss: 1 kB\nPss: %s kB\n' "$v" >&3
+      ) &
+    fi
+  fi
   if [ -n "${STUB_DEEP:-}" ]; then
     # launcher -> 900000+idx*100 -> 次 ... と 20 段のチェーン（実在しない pid。疑似 /proc 上のみ）。
     base=$((900000 + idx * 100))
@@ -146,7 +198,7 @@ if [ -n "${FAKE_PROC:-}" ] && [ "$mode" != "hang" ]; then
   fi
 fi
 # 起動完了の明示的な通知（ready 状態）。hang・noready は出さない。
-if [ "$mode" != "hang" ] && [ "$mode" != "noready" ]; then echo READY; fi
+if [ "$mode" != "hang" ] && [ "$mode" != "noready" ] && [ -z "${STUB_NO_READY:-}" ]; then echo READY; fi
 # SIGTERM を即座に処理するため、sleep を待つ形で待機する。
 while :; do sleep 1 & wait $! || true; done
 STUB
@@ -156,12 +208,14 @@ chmod +x "$stub"
 out="$work/out.json"
 errf="$work/err.txt"
 rc=0
+# 計測スクリプトの前に付けるコマンド（FIFO で同期するケースだけ timeout で包み、同期の失敗でハングさせない）。
+run_wrap=()
 
 # 計測スクリプトを実行し rc・$out・$errf を更新する。
 run_target() {
   rc=0
   : >"$out"; : >"$errf"
-  "$bash_bin" "$target" --launcher "$stub" --bundle "$work/bundle" --target own --settle 0 "$@" >"$out" 2>"$errf" || rc=$?
+  "${run_wrap[@]}" "$bash_bin" "$target" --launcher "$stub" --bundle "$work/bundle" --target own --settle 0 "$@" >"$out" 2>"$errf" || rc=$?
 }
 run_fake() { # 疑似 /proc を使う（メモリ値の具体照合）
   rm -rf "$work/fake"; mkdir -p "$work/fake"
@@ -321,6 +375,84 @@ expect_eq "noready-exit1" 1 "$rc"
 expect_has "noready-stderr" "$errf" "started=0/2"
 expect_eq "noready-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "noready-no-residual" 0 "$(alive_stub_count)"
+
+# --- 12f. launcher の子孫へファイルサイズ制限を掛けない（CORE-9。ulimit -f を継承させると、コンテナ内の
+#          書き込みが SIGXFSZ で失敗して計測条件が変わる）。子が 3 MiB を書けて N/N 起動になる ---
+STUB_BIGWRITE="$work/big" run_fake --count 2 --trials 1
+expect_eq "bigwrite-exit0" 0 "$rc"
+expect_eq "bigwrite-started" 2 "$(jq -r '.n_started_min' "$out")"
+expect_eq "bigwrite-size-1" 3145728 "$(wc -c <"$work/big.1" 2>/dev/null || echo missing)"
+expect_eq "bigwrite-size-2" 3145728 "$(wc -c <"$work/big.2" 2>/dev/null || echo missing)"
+expect_eq "bigwrite-no-residual" 0 "$(alive_stub_count)"
+
+# --- 12g. ログの上限は収集側で設ける: 上限（2048 KiB）を超えるログを出す launcher は計測失敗にして
+#          停止する（結果は公開しない。REPAIR-5 のリソース上限） ---
+start=$SECONDS
+STUB_NOISE_KIB=3072 run_fake --count 1 --trials 1 --timeout 20
+expect_eq "log-limit-exit1" 1 "$rc"
+expect_has "log-limit-stderr" "$errf" "log-limit-exceeded: trial=1 id=fc-bench50-1-1 limit_kib=2048"
+expect_eq "log-limit-stdout-empty" 0 "$(wc -c <"$out")"
+if [ $((SECONDS - start)) -le 15 ]; then pass "log-limit-detected-before-timeout"; else fail "log-limit-detected-before-timeout"; fi
+expect_eq "log-limit-no-residual" 0 "$(alive_stub_count)"
+
+# --- 12h. 集計中に終了したコンテナを検出する（CORE-9・SUP-1。先に集計したコンテナの launcher が、後続の
+#          集計中に終了しても N/N として公開しない） ---
+mkdir -p "$work/mid"
+run_wrap=(timeout --kill-after=5 60)
+rm -f "$work/mid/"*
+STUB_MID=launcher STUB_MID_DIR="$work/mid" run_fake --count 2 --trials 1 --output "$work/mid-never.json"
+expect_eq "mid-launcher-exit1" 1 "$rc"
+expect_has "mid-launcher-stderr" "$errf" "measurement-failed: trial=1 running_after_measurement=1/2 reason=container-exited-during-measurement"
+expect_has "mid-launcher-id" "$errf" "unstarted: id=fc-bench50-1-1"
+expect_eq "mid-launcher-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "mid-launcher-no-output-file" 0 "$(find "$work" -maxdepth 1 -name 'mid-never.json*' | wc -l)"
+expect_eq "mid-launcher-no-residual" 0 "$(alive_stub_count)"
+
+# --- 12i. 集計中に launcher は残り子プロセスだけが終了した場合も検出する（必要な子プロセスの生存） ---
+rm -f "$work/mid/"*
+STUB_MID=child STUB_MID_DIR="$work/mid" run_fake --count 2 --trials 1
+expect_eq "mid-child-exit1" 1 "$rc"
+expect_has "mid-child-stderr" "$errf" "measurement-failed: trial=1 running_after_measurement=1/2 reason=container-exited-during-measurement"
+expect_eq "mid-child-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "mid-child-no-residual" 0 "$(alive_stub_count)"
+run_wrap=()
+
+# --- 12j. 記録した起動時刻と一致しない pid（再利用された pid の模擬。selftest 専用フック）へはシグナルを
+#          送らない。launcher は生存扱いにもならず起動数不足になり、プロセスは終了させられずに残る
+#          （環境変数トークンを持たないので所有プロセスとしても回収されない）。直接の子として生存して
+#          いるものは黙って残さず、後始末失敗（exit 4）として pid を報告する ---
+: >"$STUB_PIDFILE"
+STUB_NO_ENVIRON=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_STALE_START=1 run_fake --count 2 --trials 1 --timeout 2
+expect_eq "stale-start-exit4" 4 "$rc"
+expect_has "stale-start-stderr" "$errf" "startup-incomplete: trial=1 started=0/2"
+expect_has "stale-start-reported" "$errf" "cleanup-failed: processes still running: pid="
+expect_eq "stale-start-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "stale-start-not-signalled" 2 "$(alive_stub_count)"
+pkill -TERM -f -- "${work}/stub-launcher" 2>/dev/null || true
+kill_recorded
+for _ in $(seq 1 15); do [ "$(alive_stub_count)" != "0" ] || break; sleep 0.2; done
+expect_eq "stale-start-test-cleanup" 0 "$(alive_stub_count)"
+
+# --- 12k. 後始末中に 2 回目以降のシグナル（TERM・HUP）を受けても後始末を最後まで行う（REPAIR-5。
+#          SIGTERM を無視する launcher の終了待ち中に再送しても、launcher・子を残さない） ---
+: >"$STUB_PIDFILE"
+: >"$out"; : >"$errf"
+STUB_MODE=ignoreterm STUB_NO_READY=1 "$bash_bin" "$target" --launcher "$stub" --bundle "$work/bundle" --target own \
+  --count 2 --trials 1 --timeout 20 >"$out" 2>"$errf" &
+sig_pid=$!
+for _ in $(seq 1 50); do [ "$(wc -l <"$STUB_PIDFILE")" -lt 2 ] || break; sleep 0.2; done
+expect_eq "resignal-stubs-started" 2 "$(wc -l <"$STUB_PIDFILE")"
+kill -TERM "$sig_pid"
+for _ in $(seq 1 50); do ! grep -qF "interrupted" "$errf" || break; sleep 0.1; done
+expect_has "resignal-first-signal-handled" "$errf" "interrupted: received signal (exit 143); running cleanup"
+kill -TERM "$sig_pid" 2>/dev/null || true
+sleep 0.3
+kill -HUP "$sig_pid" 2>/dev/null || true
+r=0
+wait "$sig_pid" || r=$?
+expect_eq "resignal-exit143" 143 "$r"
+expect_eq "resignal-no-residual" 0 "$(alive_stub_count)"
+expect_eq "resignal-no-orphan-child" 0 "$(orphan_sleep_count)"
 
 # --- 13. 引数エラーは exit 2 ---
 expect_rc2() { # <名前> <引数...>

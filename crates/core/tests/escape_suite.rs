@@ -49,7 +49,8 @@
 //!   期待の弱体化や監査レコードの偽造はしない）。監査記録の回収経路は、子が持つ `Recorder` の pipe を本番の
 //!   SIGSYS 経路（`SECCOMP_RET_TRAP` のハンドラが `record_seccomp_denial` へ渡す `AuditSink`）の書き込み先に
 //!   する想定で、親が読む。`SECCOMP_RET_KILL` 系では死ぬ前に書けないため、TRAP＋ハンドラ内記録が前提
-//!   （`audit_log/seccomp_hook.rs`・REPAIR-3。本番配線は後続作業）
+//!   （`audit_log/seccomp_hook.rs`・REPAIR-3。本番配線は後続作業）。親側で取得できる本番監査経路が接続されるまで
+//!   ESC-06 は成立しない（監査記録の偽造・親側での推測生成はしない。期待を弱めず、実機実行では失敗として残す）
 //!
 //! ESC-07 は Landlock ABI 6+（Linux 6.12+）を要する。
 //!
@@ -677,8 +678,9 @@ fn sec2_task42_4_expectation_selftest() {
 }
 
 /// `/proc/self/mountinfo` の内容から、`path` に `maskedPaths` / `readonlyPaths` が適用された証拠があるかを返す
-/// （REPAIR-12・SEC-2・TASK-42.3・MS-2）。証拠は「`path` 自身へのマウント（マスク）」または「`path` の祖先
-/// （`/` と `/proc` と `/sys` は除く）への読み取り専用（`ro`）マウント」。ホスト側の権限拒否（EPERM / EACCES）
+/// （REPAIR-12・SEC-2・TASK-42.3・MS-2）。証拠は「`path` 自身への読み取り専用（`ro`）マウント（マスク）」または「`path` の祖先
+/// （`/` と `/proc` と `/sys` は除く）への読み取り専用（`ro`）マウント」。どちらも `ro` を必須とし、rw マウントは
+/// 対象自身へのものでも証拠にしない。ホスト側の権限拒否（EPERM / EACCES）
 /// だけで防御ありと誤判定しないために、攻撃結果とは独立にこの証拠を確認する。
 fn has_mask_evidence(mountinfo: &str, path: &str) -> bool {
     mountinfo.lines().any(|line| {
@@ -686,15 +688,18 @@ fn has_mask_evidence(mountinfo: &str, path: &str) -> bool {
         let (Some(mount_point), Some(opts)) = (f.nth(4), f.next()) else {
             return false;
         };
+        // 書き込みを実際に遮断する設定（`ro`）でなければ証拠にしない。無関係な rw マウントが対象パスにあっても、
+        // ホスト側の権限拒否（EPERM / EACCES）を防御の効果と誤認しないため（REPAIR-12）。
+        if !opts.split(',').any(|o| o == "ro") {
+            return false;
+        }
         if mount_point == path {
             return true;
         }
         let ancestor = path
             .strip_prefix(mount_point)
             .is_some_and(|rest| rest.starts_with('/'));
-        ancestor
-            && !["/", "/proc", "/sys"].contains(&mount_point)
-            && opts.split(',').any(|o| o == "ro")
+        ancestor && !["/", "/proc", "/sys"].contains(&mount_point)
     })
 }
 
@@ -702,9 +707,11 @@ fn has_mask_evidence(mountinfo: &str, path: &str) -> bool {
 fn sec2_task42_3_mask_evidence_selftest() {
     let ro = "40 30 0:30 /sys /proc/sys ro,nosuid - proc proc rw";
     let rw = "40 30 0:30 / /proc rw,nosuid - proc proc rw";
-    let mask = "41 30 0:6 /null /proc/sysrq-trigger rw - devtmpfs dev rw";
+    let mask = "41 30 0:6 /null /proc/sysrq-trigger ro - devtmpfs dev rw";
+    let mask_rw = "41 30 0:6 /null /proc/sysrq-trigger rw - devtmpfs dev rw";
     assert!(has_mask_evidence(ro, "/proc/sys/kernel/core_pattern"));
     assert!(has_mask_evidence(mask, "/proc/sysrq-trigger"));
+    assert!(!has_mask_evidence(mask_rw, "/proc/sysrq-trigger"));
     assert!(!has_mask_evidence(rw, "/proc/sys/kernel/core_pattern"));
     assert!(!has_mask_evidence(ro, "/proc/sysrq-trigger"));
     assert!(!has_mask_evidence("", "/proc/sysrq-trigger"));

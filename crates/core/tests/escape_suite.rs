@@ -34,6 +34,17 @@
 //! 事前条件の不成立を含めあらゆる失敗を失敗として扱い、検証せずに成功する分岐は持たない。AGENTS.md への
 //! 記載と CI での分離方式の確定は #204（TASK-42.6）で行う。
 //!
+//! # ESC-09・ESC-10（TASK-42.5・#203）
+//! - `esc-09-userns-owner`（SEC-5）: コンテナ内 root が作成したファイルの所有者を、ディスパッチャ（分離なし・
+//!   ホスト視点）が `EscapeCase::host_check` で検査し、起動ユーザーの非特権 UID/GID（≠ 0）であることを具体値で
+//!   照合する。**非 root 起動が必須**（root 起動は user namespace なしでコンテナ内 root = ホスト root になるため、
+//!   事前条件不成立として失敗させる）。subuid 範囲の写像は `rootless_uid_mapping.rs`（TASK-44）の担当で、
+//!   本ケースは既定経路（単一 ID 写像）を対象にする
+//! - `esc-10-landlock-outside`（CORE-5・SEC-4）: readonly root（READ のみ許可）の下で許可外の作成が `EACCES` で
+//!   拒否され、監査ログに landlock レイヤーが記録されること。Landlock ABI 6+（Linux 6.12+）が必須
+//! - `control-esc-10-no-landlock`: 同じ操作が Landlock なしでは成功する否定対照（拒否が DAC 等ではなく Landlock
+//!   に帰属することの裏付け）
+//!
 //! ケースの攻撃操作は、制限が欠けていてもホストへ副作用が出ない引数・対象に限る（`seccomp.rs` と同方針）。
 //! 攻撃クロージャ・ハーネスは `unsafe` を書かない。raw syscall が要る攻撃は core 側の `#[doc(hidden)]`
 //! プローブ（syscall 本体は `sys` モジュール）を経由する。
@@ -142,6 +153,14 @@ enum Mismatch {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     ScenarioFailed {
+        detail: String,
+    },
+    /// ホスト視点の検査（`EscapeCase::host_check`）の失敗。実プロセス部（Linux）でのみ構築される。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    HostCheckFailed {
         detail: String,
     },
 }
@@ -473,11 +492,15 @@ mod linux {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::audit_log::{AuditRecord, AuditSink, encode_json_line};
+    use fandhe_container_core::audit_log::{
+        AuditRecord, AuditSink, encode_json_line, landlock_denial_record_now,
+    };
     use fandhe_container_core::exec::{
         ChildExit, IsolationConfig, Namespace, NamespaceSet, StagePipeline, isolate,
         isolate_rootful_host_root, plan, plan_rootful_host_root, spawn_container_probe,
     };
+    use fandhe_container_core::landlock::{detect_landlock_abi, path_rules_from_config};
+    use fandhe_container_core::oci_runtime::parse_config_bytes;
     use fandhe_container_core::traits::{ErrorCode, TraitError};
 
     use super::{
@@ -496,19 +519,158 @@ mod linux {
         /// 子の制限ステージ列（Landlock を伴うケースは `with_landlock` を載せて返す）。
         stages: fn() -> StagePipeline,
         attack: Attack,
+        /// ディスパッチャ（分離なし・ホスト視点）がシナリオ成功後・rootfs 削除前に行う検査。
+        /// 別テーブルにせずフィールドにすることで、追記漏れを rebase 後のコンパイルエラーで表面化させる。
+        host_check: Option<HostCheck>,
     }
 
-    /// 登録済みケース。本 PR は、ハーネスが end-to-end で動くことを示す対照ケースのみ。
-    const CASES: &[EscapeCase] = &[EscapeCase {
-        id: "control-read-proc",
-        expectation: Expectation {
-            allowed: &[AttackOutcome::Succeeded],
-            signal: None,
-            audit: AuditExpectation::None,
+    /// ホスト視点の検査関数の型。
+    type HostCheck = fn(&HostView) -> Result<(), String>;
+
+    /// ホスト視点の検査入力（ESC-09。SEC-5）。
+    struct HostView<'a> {
+        rootfs: &'a Path,
+        euid: u32,
+        egid: u32,
+        is_root: bool,
+    }
+
+    /// 登録済みケース。兄弟 issue（#200〜#202）のケースはこの末尾へ追記される。
+    const CASES: &[EscapeCase] = &[
+        EscapeCase {
+            id: "control-read-proc",
+            expectation: Expectation {
+                allowed: &[AttackOutcome::Succeeded],
+                signal: None,
+                audit: AuditExpectation::None,
+            },
+            stages: StagePipeline::new,
+            attack: attack_control_read_proc,
+            host_check: None,
         },
-        stages: StagePipeline::new,
-        attack: attack_control_read_proc,
-    }];
+        // 否定対照: Landlock なしなら ESC-10 と同じ作成が成功する（拒否の Landlock への帰属の裏付け）。
+        EscapeCase {
+            id: "control-esc-10-no-landlock",
+            expectation: Expectation {
+                allowed: &[AttackOutcome::Succeeded],
+                signal: None,
+                audit: AuditExpectation::None,
+            },
+            stages: StagePipeline::new,
+            attack: attack_esc10_create_outside,
+            host_check: None,
+        },
+        // ESC-10（CORE-5・SEC-4・SEC-2）。
+        EscapeCase {
+            id: "esc-10-landlock-outside",
+            expectation: Expectation {
+                allowed: &[AttackOutcome::Errno(13)],
+                signal: None,
+                audit: AuditExpectation::Required("landlock"),
+            },
+            stages: esc10_stages,
+            attack: attack_esc10_create_outside,
+            host_check: None,
+        },
+        // ESC-09（SEC-5・SEC-2）。
+        EscapeCase {
+            id: "esc-09-userns-owner",
+            expectation: Expectation {
+                allowed: &[AttackOutcome::Succeeded],
+                signal: None,
+                audit: AuditExpectation::None,
+            },
+            stages: StagePipeline::new,
+            attack: attack_esc09_create_file,
+            host_check: Some(host_check_esc09_owner),
+        },
+    ];
+
+    /// ESC-10 が作成を試みるコンテナ内パス。
+    const ESC10_PROBE: &str = "/esc-10-landlock-probe";
+    /// ESC-09 が作成するコンテナ内ファイル名（ホスト側は rootfs 直下の同名ファイルとして観測する）。
+    const ESC09_PROBE: &str = "esc-09-owner-probe";
+
+    /// ESC-10 用の制限ステージ列。readonly root（READ のみ許可）の Landlock ruleset を載せる。
+    ///
+    /// config は固定リテラルでホスト側パスを含まない。ABI 6 未満など検出・構築に失敗したら panic し、
+    /// シナリオ失敗（`ScenarioFailed`）として fail-closed にする（シナリオプロセス・fork 前で呼ばれる）。
+    fn esc10_stages() -> StagePipeline {
+        let config = parse_config_bytes(
+            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"mounts":[]}"#,
+        )
+        .expect("valid config");
+        let support = detect_landlock_abi()
+            .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for ESC-10: {e}"));
+        let ruleset =
+            path_rules_from_config(&support, &config).unwrap_or_else(|e| panic!("rules: {e}"));
+        StagePipeline::new()
+            .with_landlock(ruleset)
+            .unwrap_or_else(|e| panic!("with_landlock: {e}"))
+    }
+
+    /// 排他作成を試みて結果を `AttackOutcome` へ写す。
+    fn try_create(path: &str) -> AttackOutcome {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(_) => AttackOutcome::Succeeded,
+            Err(e) => e
+                .raw_os_error()
+                .map_or(AttackOutcome::Failed, AttackOutcome::Errno),
+        }
+    }
+
+    /// ESC-10 / 否定対照の攻撃: readonly root の下で許可外の作成（MAKE_REG）を試みる。
+    /// `EACCES` なら landlock 拒否レコードを `AuditSink` 経由で記録する（本番配線は REPAIR-3 まで未実装）。
+    /// レコード構築・記録の失敗は panic で子の異常終了にし、黙殺しない。
+    fn attack_esc10_create_outside(rec: &Recorder) {
+        let outcome = try_create(ESC10_PROBE);
+        if let AttackOutcome::Errno(13) = outcome {
+            let record = landlock_denial_record_now(Path::new(ESC10_PROBE), Some(13))
+                .unwrap_or_else(|e| panic!("build landlock record: {e:?}"))
+                .expect("EACCES must yield a landlock record");
+            rec.record(&record)
+                .unwrap_or_else(|e| panic!("record landlock denial: {e:?}"));
+        }
+        rec.outcome(outcome);
+    }
+
+    /// ESC-09 の攻撃: コンテナ内（pivot 後）の root としてファイルを作る。所有者の検査はホスト側で行う。
+    fn attack_esc09_create_file(rec: &Recorder) {
+        rec.outcome(try_create(&format!("/{ESC09_PROBE}")));
+    }
+
+    /// ESC-09 のホスト視点検査（SEC-5）: コンテナ内 root 作成のファイルが起動ユーザーの非特権 UID/GID 所有であること。
+    /// root 起動では写像が存在しないため、所有者を照合せずに成功させる分岐を持たず事前条件不成立で失敗させる。
+    fn host_check_esc09_owner(view: &HostView) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+        if view.is_root {
+            return Err("precondition: ESC-09 requires a non-root launcher (SEC-5: the rootful path maps container root to host root)".to_string());
+        }
+        let path = view.rootfs.join(ESC09_PROBE);
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("stat {} failed: {e}", path.display()))?;
+        if !meta.file_type().is_file() {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        let (uid, gid) = (meta.uid(), meta.gid());
+        if uid != view.euid || uid == 0 {
+            return Err(format!(
+                "owner uid is {uid}, expected the launcher's unprivileged uid {} (and != 0)",
+                view.euid
+            ));
+        }
+        if gid != view.egid || gid == 0 {
+            return Err(format!(
+                "owner gid is {gid}, expected the launcher's unprivileged gid {} (and != 0)",
+                view.egid
+            ));
+        }
+        Ok(())
+    }
 
     /// 対照: 禁止対象外の操作（`/proc/self/status` の読み出し）が制限下でも動くこと。
     fn attack_control_read_proc(rec: &Recorder) {
@@ -651,14 +813,22 @@ mod linux {
         }
     }
 
+    /// `/proc/self/status` の `Uid:`・`Gid:` 行の effective（2 列目）を返す。
+    fn effective_ids() -> (u32, u32) {
+        let status = std::fs::read_to_string("/proc/self/status").expect("read status");
+        let field = |key: &str| -> u32 {
+            status
+                .lines()
+                .find(|l| l.starts_with(key))
+                .and_then(|l| l.split_whitespace().nth(2))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("{key} line in /proc/self/status"))
+        };
+        (field("Uid:"), field("Gid:"))
+    }
+
     fn is_root() -> bool {
-        std::fs::read_to_string("/proc/self/status")
-            .expect("read status")
-            .lines()
-            .find(|l| l.starts_with("Uid:"))
-            .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
-            .as_deref()
-            == Some("0")
+        effective_ids().0 == 0
     }
 
     /// 自プロセスの `Seccomp:` 行の値（`/proc/self/status`）。
@@ -715,7 +885,24 @@ mod linux {
         }
         print!("{stdout}");
         match status {
-            Some(st) if st.code() == Some(0) => CaseVerdict::Pass,
+            Some(st) if st.code() == Some(0) => match case.host_check {
+                None => CaseVerdict::Pass,
+                Some(check) => {
+                    let (euid, egid) = effective_ids();
+                    let view = HostView {
+                        rootfs: &rootfs.0,
+                        euid,
+                        egid,
+                        is_root: euid == 0,
+                    };
+                    match check(&view) {
+                        Ok(()) => CaseVerdict::Pass,
+                        Err(detail) => {
+                            CaseVerdict::Fail(vec![Mismatch::HostCheckFailed { detail }])
+                        }
+                    }
+                }
+            },
             Some(st) => CaseVerdict::Fail(vec![Mismatch::ScenarioFailed {
                 detail: format!("scenario exited with {st}; stderr:\n{stderr}"),
             }]),

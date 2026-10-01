@@ -26,8 +26,8 @@ mod linux {
 
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
-        LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, StartTimeouts, create, delete,
-        start,
+        CgroupRemoval, ContainerCgroupRemover, LaunchSpec, LaunchedProcess, ProcessExit,
+        ProcessLauncher, StartTimeouts, create, delete, start,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
@@ -38,6 +38,16 @@ mod linux {
     use serde_json::{Value, json};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// テスト専用の `ContainerCgroupRemover`。cgroup は常に存在しない（`NotPresent`）として扱い、実 cgroup には
+    /// 触れない（OS 非依存。cgroup 削除の結線は `oci_delete.rs`・`cgroup_delete.rs` が照合する。TASK-30.3）。
+    struct NoCgroup;
+
+    impl ContainerCgroupRemover for NoCgroup {
+        fn remove(&self, _id: &ContainerId) -> Result<CgroupRemoval, TraitError> {
+            Ok(CgroupRemoval::NotPresent)
+        }
+    }
 
     /// テストごとに一意な作業ディレクトリ（0700。drop で削除）。
     struct TmpDir(PathBuf);
@@ -260,7 +270,7 @@ mod linux {
 
         // 2a. Running 中の delete は拒否され、state.json のバイト列は変わらない。
         let before = fs::read(state_json_path(root, id)).expect("read");
-        let err = delete(dyn_store, &rec, &DeleteRequest::new(cid(id)))
+        let err = delete(dyn_store, &rec, &NoCgroup, &DeleteRequest::new(cid(id)))
             .expect_err("delete while running");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(err.message(), "container is still running");
@@ -296,7 +306,7 @@ mod linux {
 
         // 4. delete 後: state.json も <id>/ も消え、状態ルート直下はストア管理ファイルだけ。
         assert_eq!(
-            delete(dyn_store, &rec, &DeleteRequest::new(cid(id))).expect("delete"),
+            delete(dyn_store, &rec, &NoCgroup, &DeleteRequest::new(cid(id))).expect("delete"),
             DeleteResponse::new()
         );
         assert_gone(root, id);
@@ -312,7 +322,7 @@ mod linux {
             ListStateRequest::new(NonZeroU32::new(10).expect("nonzero")).expect("list request");
         assert_eq!(store.list(&page).expect("list").records().len(), 0);
         assert_eq!(
-            delete(dyn_store, &rec, &DeleteRequest::new(cid(id)))
+            delete(dyn_store, &rec, &NoCgroup, &DeleteRequest::new(cid(id)))
                 .expect_err("second delete")
                 .code(),
             ErrorCode::NotFound

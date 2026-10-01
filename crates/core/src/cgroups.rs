@@ -36,10 +36,15 @@
 //! - fork 後の子の `cgroup.procs` 参加（TASK-32.4・#161）: [`ContainerCgroup::join_hook`] が返す
 //!   [`CgroupJoin`] を `exec::StagePipeline` の `CgroupJoin` 段へ登録する（`exec::StageHook` 実装済み）
 //!
+//! - delete 時の cgroup 削除（TASK-30.3・OCI-6）: [`DelegatedCgroup::open_child`] で名前から既存の子 cgroup を
+//!   検証つきで開き、`oci_runtime::ContainerCgroupRemover` の実装として [`DelegatedCgroup::remove_child`] へ渡す
+//!   （`oci_runtime::delete` が状態記録の削除の前に呼ぶ。本番の呼び出し元による結線は未実装）
+//!
 //! # 未実装（REPAIR-3）
 //! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映、本番 launcher での
 //!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
-//! - OCI `linux.cgroupsPath` の反映、delete 時の cgroup 削除の結線（TASK-30 系）
+//! - OCI `linux.cgroupsPath` の反映（状態に cgroup パスが記録されないため、delete は create と同じ委譲スコープ
+//!   から呼ばれることを前提とする）・delete への本番の呼び出し元（CLI / plugin / supervisor）からの結線
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
 
 use std::collections::BTreeSet;
@@ -50,8 +55,9 @@ use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 
+use crate::oci_runtime::{CgroupRemoval, ContainerCgroupRemover};
 use crate::sys::{self, SysError};
-use crate::traits::{ContainerId, ErrorCode};
+use crate::traits::{ContainerId, ErrorCode, TraitError};
 
 mod cpu;
 pub use cpu::{CpuMax, CpuQuota};
@@ -1099,6 +1105,41 @@ impl DelegatedCgroup {
         self.remove_verified(child.name.as_str(), child.fd.as_fd())
     }
 
+    /// 名前で既存のコンテナ用子 cgroup を検証つきで開く（TASK-30.3・別プロセスの delete 用）。
+    ///
+    /// `prepare` と同じ `ContainerCgroup` ハンドルを、作成した同一プロセス内に限らず再取得するために使う。
+    /// 存在しなければ `Ok(None)`。`O_NOFOLLOW`・O_PATH で開いて cgroup2 を確認し、euid が 0 でなければ
+    /// 所有者が euid であることも確かめる（他主体が作った同名ディレクトリを採用しない。不一致は
+    /// `PermissionDenied`）。返すハンドルの `parent_id` は本スコープの親で、[`Self::remove_child`] の
+    /// 親照合を通る。開いた後の差し替えは `remove_verified` の同一性確認が検出する。
+    pub fn open_child(&self, name: &CgroupName) -> Result<Option<ContainerCgroup>, CgroupError> {
+        let step = CgroupStep::Cleanup;
+        let fd = match open_cgroup_dir(step, self.fd.as_fd(), name.as_str()) {
+            Ok(fd) => fd,
+            Err(e) if e.code == ErrorCode::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let euid = sys::effective_uid();
+        if euid != 0 {
+            let dup = fd
+                .try_clone()
+                .map_err(|e| io_error(step, "dup container cgroup", &e))?;
+            if owner_uid(step, dup, "stat container cgroup")? != euid {
+                return Err(CgroupError::new(
+                    ErrorCode::PermissionDenied,
+                    step,
+                    "container cgroup is not owned by the effective user",
+                ));
+            }
+        }
+        let parent_id = dir_identity(step, self.fd.as_fd(), "stat parent cgroup")?;
+        Ok(Some(ContainerCgroup {
+            name: name.clone(),
+            fd,
+            parent_id,
+        }))
+    }
+
     /// 親直下の `name` を、保持 fd `held` と同一の cgroup であることを確かめてから削除し、削除済みを確認する。
     /// `remove_child` と `prepare` の巻き戻し（コンテナ用子 cgroup・新規作成した退避リーフ）が共用する。
     ///
@@ -1134,6 +1175,37 @@ impl DelegatedCgroup {
             Err(e) => Err(sys_error(step, "confirm removal via held cgroup.events", e)),
         }
     }
+}
+
+/// `oci_runtime::delete` が使う cgroup 削除（TASK-30.3・OCI-6）。対象は `fc-<id>`（CORE-3 で作った子）だけ。
+///
+/// 待機を伴わないファイル I/O のみのためタイムアウトは持たない（REPAIR-5 の対象外）。
+impl ContainerCgroupRemover for DelegatedCgroup {
+    fn remove(&self, id: &ContainerId) -> Result<CgroupRemoval, TraitError> {
+        // 名前を作れない ID（予約名・長さ超過）の cgroup は `prepare` で作れないため存在し得ない。
+        // 失敗にすると該当レコードが永久に削除不能になるので NotPresent とする。
+        let Ok(name) = CgroupName::new(id) else {
+            return Ok(CgroupRemoval::NotPresent);
+        };
+        match self.open_child(&name).map_err(removal_error)? {
+            None => Ok(CgroupRemoval::NotPresent),
+            Some(child) => {
+                self.remove_child(&child).map_err(removal_error)?;
+                Ok(CgroupRemoval::Removed)
+            }
+        }
+    }
+}
+
+/// `CgroupError` を `TraitError` へ写す。`code` だけを保ち、メッセージは固定文言にする
+/// （errno・パスを `oci_runtime::delete` の呼び出し元へ漏らさない）。
+fn removal_error(e: CgroupError) -> TraitError {
+    let message = match e.code {
+        ErrorCode::FailedPrecondition => "container cgroup is not empty or changed; retry",
+        ErrorCode::PermissionDenied => "container cgroup is not owned by the effective user",
+        _ => "failed to remove container cgroup",
+    };
+    TraitError::new(e.code, message)
 }
 
 /// ディレクトリ・`cgroup.procs`・`cgroup.subtree_control` の所有者がすべて `euid` であること
@@ -1937,5 +2009,29 @@ mod tests {
         );
         assert!(r.is_err());
         assert_eq!(read(&tmp, "target"), "untouched");
+    }
+
+    /// OCI-6・TASK-30.3: cgroup 削除の失敗は `code` を保ち、errno・パスを含まない固定文言へ写す。
+    #[test]
+    fn oci6_removal_error_keeps_code_and_hides_errno() {
+        let busy = CgroupError::new(
+            ErrorCode::FailedPrecondition,
+            CgroupStep::Cleanup,
+            "fc-c1: errno 16",
+        );
+        let mapped = removal_error(busy);
+        assert_eq!(mapped.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            mapped.message(),
+            "container cgroup is not empty or changed; retry"
+        );
+        let other = removal_error(CgroupError::new(
+            ErrorCode::Internal,
+            CgroupStep::Cleanup,
+            "/sys/fs/cgroup/x: errno 5",
+        ));
+        assert_eq!(other.code(), ErrorCode::Internal);
+        assert_eq!(other.message(), "failed to remove container cgroup");
+        assert!(!other.message().contains("errno"));
     }
 }

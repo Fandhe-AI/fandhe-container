@@ -1,11 +1,13 @@
-//! OCI Runtime `delete` の結合試験（CORE-2・OCI-6・REPAIR-4・TASK-30.2）。
+//! OCI Runtime `delete` の結合試験（CORE-2・OCI-6・REPAIR-4・TASK-30.2・TASK-30.3）。
 //!
 //! 公開 API（`create`・`delete`・`StateStore`・`OpRecorder`）だけを crate の外から呼び、
 //! create → delete の流れと、実行中コンテナの delete 拒否・停止後の delete・二重 delete の契約を
 //! 具体値で確かめる。start 経路は `oci_lifecycle.rs` が担うため、Running の状態は supervisor の代わりに
 //! `StateStore` へ直接作る（3 OS で同じ経路。root 不要・skip なし）。
 //!
-//! 本 Issue の範囲は `StateStore` のレコード削除まで。状態ファイル・cgroup の削除は TASK-30.3 の範囲。
+//! cgroup の削除は OS 非依存の記録用 fake（`RecordingCgroup`）で「いつ・どの ID で呼ばれるか」を照合する
+//! （TASK-30.3 の受入基準 2 の機械照合）。実 cgroup での削除は実機前提の `cgroup_delete.rs`、状態ファイルの
+//! 削除（受入基準 1）は実 `FileStateStore` を使う `state_store.rs` が照合する。
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -13,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use fandhe_container_core::observability::{OpName, OpRecorder};
-use fandhe_container_core::oci_runtime::{create, delete};
+use fandhe_container_core::oci_runtime::{CgroupRemoval, ContainerCgroupRemover, create, delete};
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ContainerStatus, CreateRequest, CreateStateRequest, DeleteRequest,
     DeleteResponse, DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest,
@@ -21,6 +23,28 @@ use fandhe_container_core::traits::{
     UpdateStateRequest,
 };
 use serde_json::{Value, json};
+
+/// テスト専用の記録用 `ContainerCgroupRemover`。呼ばれた ID を順に記録し、常に `Removed` を返す。
+#[derive(Default)]
+struct RecordingCgroup {
+    calls: Mutex<Vec<ContainerId>>,
+}
+
+impl RecordingCgroup {
+    fn calls(&self) -> Vec<ContainerId> {
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl ContainerCgroupRemover for RecordingCgroup {
+    fn remove(&self, id: &ContainerId) -> Result<CgroupRemoval, TraitError> {
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(id.clone());
+        Ok(CgroupRemoval::Removed)
+    }
+}
 
 /// テスト専用のインメモリ `StateStore`。`update` / `delete` は revision を照合する。
 ///
@@ -177,15 +201,19 @@ fn oci6_core2_create_then_delete() {
     let id = "del-create";
     create(&store, &rec, &b.create_request(id)).expect("create");
 
-    let res = delete(&store, &rec, &DeleteRequest::new(cid(id))).expect("delete");
+    let cg = RecordingCgroup::default();
+    let res = delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect("delete");
+    // 受入基準 2: delete が当該 ID の cgroup 削除をちょうど 1 回呼ぶ（2 回目の delete は NotFound で呼ばない）。
+    assert_eq!(cg.calls(), vec![cid(id)]);
     assert_eq!(res, DeleteResponse::new());
     assert_eq!(
         store.record_of(id).expect_err("gone").code(),
         ErrorCode::NotFound
     );
 
-    let err = delete(&store, &rec, &DeleteRequest::new(cid(id))).expect_err("second delete");
+    let err = delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect_err("second delete");
     assert_eq!(err.code(), ErrorCode::NotFound);
+    assert_eq!(cg.calls(), vec![cid(id)]);
     assert_eq!(op_stats(&rec, "delete"), (1, 1));
 }
 
@@ -196,6 +224,7 @@ fn oci6_core2_delete_rejected_until_stopped() {
     let store = MemStateStore::new();
     let rec = OpRecorder::new();
     let id = "del-running";
+    let cg = RecordingCgroup::default();
     let created = create(&store, &rec, &b.create_request(id)).expect("create");
 
     // start 済み相当（Running・pid あり）を revision 照合つきの update で作る。
@@ -209,8 +238,13 @@ fn oci6_core2_delete_rejected_until_stopped() {
     assert_eq!(running.revision().value(), 2);
 
     for force in [false, true] {
-        let err = delete(&store, &rec, &DeleteRequest::new(cid(id)).with_force(force))
-            .expect_err("rejected while running");
+        let err = delete(
+            &store,
+            &rec,
+            &cg,
+            &DeleteRequest::new(cid(id)).with_force(force),
+        )
+        .expect_err("rejected while running");
         if force {
             assert_eq!(err.code(), ErrorCode::Unimplemented);
         } else {
@@ -218,6 +252,8 @@ fn oci6_core2_delete_rejected_until_stopped() {
             assert_eq!(err.message(), "container is still running");
         }
         assert_eq!(store.record_of(id).expect("kept"), running);
+        // 拒否された状態では cgroup に触れない。
+        assert_eq!(cg.calls(), Vec::<ContainerId>::new());
     }
 
     // supervisor（TASK-157）の代わりに Stopped へ遷移させる。
@@ -229,8 +265,10 @@ fn oci6_core2_delete_rejected_until_stopped() {
         .expect("stopped");
     assert_eq!(stopped.status().state(), ContainerState::Stopped);
 
-    delete(&store, &rec, &DeleteRequest::new(cid(id))).expect("delete");
-    let err = delete(&store, &rec, &DeleteRequest::new(cid(id))).expect_err("second delete");
+    delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect("delete");
+    assert_eq!(cg.calls(), vec![cid(id)]);
+    let err = delete(&store, &rec, &cg, &DeleteRequest::new(cid(id))).expect_err("second delete");
     assert_eq!(err.code(), ErrorCode::NotFound);
+    assert_eq!(cg.calls(), vec![cid(id)]);
     assert_eq!(op_stats(&rec, "delete"), (1, 3));
 }

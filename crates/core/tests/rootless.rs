@@ -98,8 +98,8 @@ mod linux {
     };
     use fandhe_container_core::observability::{OpName, OpRecorder};
     use fandhe_container_core::oci_runtime::{
-        KillTimeout, LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, ProcessSignaler,
-        StartTimeouts, create, delete, kill, start,
+        CgroupRemoval, ContainerCgroupRemover, KillTimeout, LaunchSpec, LaunchedProcess,
+        ProcessExit, ProcessLauncher, ProcessSignaler, StartTimeouts, create, delete, kill, start,
     };
     use fandhe_container_core::rootless::{
         DEFAULT_HELPER_TIMEOUT, HelperPaths, IdMapSet, IdMapWriter, SubIdOwner, WriterKind,
@@ -553,6 +553,16 @@ mod linux {
         }
     }
 
+    /// テスト専用の `ContainerCgroupRemover`。cgroup は常に存在しない（`NotPresent`）として扱い、実 cgroup には
+    /// 触れない（OS 非依存。cgroup 削除の結線は `oci_delete.rs`・`cgroup_delete.rs` が照合する。TASK-30.3）。
+    struct NoCgroup;
+
+    impl ContainerCgroupRemover for NoCgroup {
+        fn remove(&self, _id: &ContainerId) -> Result<CgroupRemoval, TraitError> {
+            Ok(CgroupRemoval::NotPresent)
+        }
+    }
+
     // ---- 最小のインメモリ StateStore（`StateStore::delete` は本テストの経路で呼ばれないため未実装のまま。
     // delete〔TASK-30.2〕は Running のレコードを状態判定で拒否し、ここへ到達しない） ----
 
@@ -872,8 +882,8 @@ mod linux {
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
 
         // kill 直後の delete は Running・pid ありとして拒否され、状態・revision は残る（CORE-2・TASK-30.2）。
-        let err =
-            delete(&store, &rec, &DeleteRequest::new(id.clone())).expect_err("delete running");
+        let err = delete(&store, &rec, &NoCgroup, &DeleteRequest::new(id.clone()))
+            .expect_err("delete running");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(err.message(), "container is still running");
         assert_eq!(

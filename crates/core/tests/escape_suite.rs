@@ -37,11 +37,14 @@
 //! # ESC-04〜ESC-06（TASK-42.3・#201）
 //! - ESC-04（cgroup の `release_agent` 書き込み）・ESC-05（`/proc/sys`・`/proc/sysrq-trigger` 書き込み）は、
 //!   書き込み用に「開くだけ」で判定し 1 バイトも書かない（制限が欠けてもホストへ作用させないため）。
-//!   ESC-05 は `linux.maskedPaths` / `readonlyPaths` が未適用のため、rootful の実機実行では本物の欠陥として
-//!   失敗し得る（期待は変えない）
+//!   ESC-04 は対象（`sys/fs/cgroup/release_agent`）を rootfs に実在させ `Absent` を受理しない。ESC-04・05 とも
+//!   `linux.maskedPaths` / `readonlyPaths` が未適用のため、実機実行では本物の欠陥として失敗し得る（期待は変えない）
 //! - ESC-06（禁止 syscall の SIGSYS 強制終了＋監査記録）は spec の期待で書く。現行の CORE-5 フィルタは
 //!   `ERRNO(EPERM)` を返し、SIGSYS 化と監査記録の配送は未実装のため、実機実行では失敗する（fail-closed。
-//!   期待の弱体化や監査レコードの偽造はしない）
+//!   期待の弱体化や監査レコードの偽造はしない）。監査記録の回収経路は、子が持つ `Recorder` の pipe を本番の
+//!   SIGSYS 経路（`SECCOMP_RET_TRAP` のハンドラが `record_seccomp_denial` へ渡す `AuditSink`）の書き込み先に
+//!   する想定で、親が読む。`SECCOMP_RET_KILL` 系では死ぬ前に書けないため、TRAP＋ハンドラ内記録が前提
+//!   （`audit_log/seccomp_hook.rs`・REPAIR-3。本番配線は後続作業）
 //!
 //! ケースの攻撃操作は、制限が欠けていてもホストへ副作用が出ない引数・対象に限る（`seccomp.rs` と同方針）。
 //! 攻撃クロージャ・ハーネスは `unsafe` を書かない。raw syscall が要る攻撃は core 側の `#[doc(hidden)]`
@@ -56,20 +59,38 @@ const EACCES: i32 = 13;
 const EROFS: i32 = 30;
 const SIGSYS: i32 = 31;
 
-/// ESC-04・05 が受理する結果（対象の不在・権限・読み取り専用による拒否）。
-const ESC04_05_ALLOWED: &[AttackOutcome] = &[
+/// ESC-04 が受理する結果（権限・読み取り専用による拒否のみ）。対象を rootfs に実在させて観測するため、
+/// 対象の不在（`Absent`）は「防御を検証できていない」ことを意味し、受理しない（SEC-2）。
+const ESC04_ALLOWED: &[AttackOutcome] = &[
+    AttackOutcome::Errno(EPERM),
+    AttackOutcome::Errno(EACCES),
+    AttackOutcome::Errno(EROFS),
+];
+
+/// ESC-05 が受理する結果（対象の不在・権限・読み取り専用による拒否）。
+const ESC05_ALLOWED: &[AttackOutcome] = &[
     AttackOutcome::Absent,
     AttackOutcome::Errno(EPERM),
     AttackOutcome::Errno(EACCES),
     AttackOutcome::Errno(EROFS),
 ];
 
-/// ESC-04・05 の期待（SEC-2。spec は監査記録を要求しない）。
-const ESC04_05_EXPECT: Expectation = Expectation {
-    allowed: ESC04_05_ALLOWED,
+/// ESC-04 の期待（SEC-2。spec は監査記録を要求しない）。
+const ESC04_EXPECT: Expectation = Expectation {
+    allowed: ESC04_ALLOWED,
     signal: None,
     audit: AuditExpectation::None,
 };
+
+/// ESC-05 の期待（SEC-2。spec は監査記録を要求しない）。
+const ESC05_EXPECT: Expectation = Expectation {
+    allowed: ESC05_ALLOWED,
+    signal: None,
+    audit: AuditExpectation::None,
+};
+
+/// ESC-04 の攻撃対象（rootfs 内の相対パス）。rootfs 作成時に実在させる（`linux::make_rootfs`）。
+const ESC04_TARGET_REL: [&str; 4] = ["sys", "fs", "cgroup", "release_agent"];
 
 /// ESC-06 の期待（SEC-2・SEC-4）。SIGSYS での強制終了と seccomp 監査記録を要求する。
 const ESC06_EXPECT: Expectation = Expectation {
@@ -483,13 +504,27 @@ fn sec2_task42_3_case_expectation_selftest() {
     let ok_exit = ObservedExit::Exited(0);
     for pass in [AttackOutcome::Absent, AttackOutcome::Errno(EACCES)] {
         assert_eq!(
-            judge(&ESC04_05_EXPECT, &obs(ok_exit, Some(pass), &[])),
+            judge(&ESC05_EXPECT, &obs(ok_exit, Some(pass), &[])),
             CaseVerdict::Pass
         );
     }
     assert_eq!(
         judge(
-            &ESC04_05_EXPECT,
+            &ESC04_EXPECT,
+            &obs(ok_exit, Some(AttackOutcome::Errno(EROFS)), &[])
+        ),
+        CaseVerdict::Pass
+    );
+    // ESC-04 は対象が実在する前提のため、不在（防御を検証できていない）と書き込み成功は失敗になる。
+    for bad in [AttackOutcome::Absent, AttackOutcome::Succeeded] {
+        assert_eq!(
+            judge(&ESC04_EXPECT, &obs(ok_exit, Some(bad), &[])),
+            CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome { got: bad }])
+        );
+    }
+    assert_eq!(
+        judge(
+            &ESC05_EXPECT,
             &obs(ok_exit, Some(AttackOutcome::Succeeded), &[])
         ),
         CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
@@ -587,8 +622,9 @@ mod linux {
     use fandhe_container_core::traits::{ErrorCode, TraitError};
 
     use super::{
-        AttackOutcome, AuditExpectation, CaseVerdict, ENOENT, ESC04_05_EXPECT, ESC06_EXPECT,
-        Expectation, Mismatch, Observation, ObservedExit, RECORD_MAX_BYTES, judge, parse_record,
+        AttackOutcome, AuditExpectation, CaseVerdict, ENOENT, ESC04_EXPECT, ESC04_TARGET_REL,
+        ESC05_EXPECT, ESC06_EXPECT, Expectation, Mismatch, Observation, ObservedExit,
+        RECORD_MAX_BYTES, judge, parse_record,
     };
 
     /// 子（コンテナ内）で攻撃を実行するクロージャの型。結果は `Recorder` へ書く。
@@ -618,19 +654,19 @@ mod linux {
         },
         EscapeCase {
             id: "esc-04-release-agent",
-            expectation: ESC04_05_EXPECT,
+            expectation: ESC04_EXPECT,
             stages: StagePipeline::new,
             attack: attack_esc04_release_agent,
         },
         EscapeCase {
             id: "esc-05-proc-sys-core-pattern",
-            expectation: ESC04_05_EXPECT,
+            expectation: ESC05_EXPECT,
             stages: StagePipeline::new,
             attack: attack_esc05_proc_sys_core_pattern,
         },
         EscapeCase {
             id: "esc-05-sysrq-trigger",
-            expectation: ESC04_05_EXPECT,
+            expectation: ESC05_EXPECT,
             stages: StagePipeline::new,
             attack: attack_esc05_sysrq_trigger,
         },
@@ -683,8 +719,11 @@ mod linux {
     }
 
     /// ESC-04（SEC-2・TASK-42.3・#201）: cgroup v1 の `release_agent` への書き込み。
-    /// 子の rootfs は `proc/` のみで `/sys/fs/cgroup` が存在しないため `Absent` が構造上の期待。v1 階層の
-    /// 新規 mount は seccomp の `mount` 拒否（`tests/seccomp.rs`）で塞がれ、ホスト側の根拠は
+    /// 対象は rootfs 作成時に実在させる（`make_rootfs` が `sys/fs/cgroup/release_agent` を空ファイルで置く。
+    /// ホストの cgroup は触らない）。そのため `ENOENT`（`Absent`）は受理せず、`EPERM` / `EACCES` / `EROFS` の
+    /// 拒否だけを期待する。拒否の本番実装（`linux.readonlyPaths` / `maskedPaths` 適用）は未実装（REPAIR-3）のため、
+    /// 現行の実機実行では書き込み用に開けて失敗する（ESC-05 と同様に本物の欠陥として検出。期待は変えない）。
+    /// v1 階層の新規 mount の拒否は seccomp の `mount` 拒否（`tests/seccomp.rs`）、ホスト側の根拠は
     /// `tests/cgroups_release_agent.rs`（TASK-35）にある。
     fn attack_esc04_release_agent(rec: &Recorder) {
         rec.outcome(open_write_only("/sys/fs/cgroup/release_agent"));
@@ -821,7 +860,7 @@ mod linux {
         }
     }
 
-    /// `proc/` だけを持つ rootfs を排他的に作る（推測されにくい名前・`mkdir` は既存なら失敗）。
+    /// `proc/` と ESC-04 の攻撃対象（`sys/fs/cgroup/release_agent`）を持つ rootfs を排他的に作る（推測されにくい名前・`mkdir` は既存なら失敗）。
     fn make_rootfs() -> Rootfs {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -835,6 +874,13 @@ mod linux {
         std::fs::set_permissions(&rootfs.0, std::fs::Permissions::from_mode(0o755))
             .expect("chmod rootfs dir");
         std::fs::create_dir(rootfs.0.join("proc")).expect("create rootfs/proc");
+        // ESC-04 の攻撃対象を rootfs 内に実在させる（ENOENT で防御を検証できないことを避ける）。
+        let target = ESC04_TARGET_REL
+            .iter()
+            .fold(rootfs.0.clone(), |p, c| p.join(c));
+        let dir = target.parent().expect("release_agent has a parent dir");
+        std::fs::create_dir_all(dir).expect("create rootfs/sys/fs/cgroup");
+        std::fs::write(&target, b"").expect("create rootfs release_agent stand-in");
         rootfs
     }
 

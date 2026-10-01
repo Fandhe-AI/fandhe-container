@@ -54,7 +54,6 @@ use std::fmt;
 
 /// errno / シグナル番号（asm-generic の値で x86_64・aarch64 とも共通）。
 const EPERM: i32 = 1;
-const ENOENT: i32 = 2;
 const EACCES: i32 = 13;
 const EROFS: i32 = 30;
 const SIGSYS: i32 = 31;
@@ -88,9 +87,6 @@ const ESC05_EXPECT: Expectation = Expectation {
     signal: None,
     audit: AuditExpectation::None,
 };
-
-/// ESC-04 の攻撃対象（rootfs 内の相対パス）。rootfs 作成時に実在させる（`linux::make_rootfs`）。
-const ESC04_TARGET_REL: [&str; 4] = ["sys", "fs", "cgroup", "release_agent"];
 
 /// ESC-06 の期待（SEC-2・SEC-4）。SIGSYS での強制終了と seccomp 監査記録を要求する。
 const ESC06_EXPECT: Expectation = Expectation {
@@ -622,10 +618,15 @@ mod linux {
     use fandhe_container_core::traits::{ErrorCode, TraitError};
 
     use super::{
-        AttackOutcome, AuditExpectation, CaseVerdict, ENOENT, ESC04_EXPECT, ESC04_TARGET_REL,
-        ESC05_EXPECT, ESC06_EXPECT, Expectation, Mismatch, Observation, ObservedExit,
-        RECORD_MAX_BYTES, judge, parse_record,
+        AttackOutcome, AuditExpectation, CaseVerdict, ESC04_EXPECT, ESC05_EXPECT, ESC06_EXPECT,
+        Expectation, Mismatch, Observation, ObservedExit, RECORD_MAX_BYTES, judge, parse_record,
     };
+
+    /// ENOENT の errno（Linux 専用ケースでのみ使うため非 Linux の dead_code を避けここに置く）。
+    const ENOENT: i32 = 2;
+
+    /// ESC-04 の攻撃対象（rootfs 内の相対パス）。rootfs 作成時に実在させる（`make_rootfs`）。
+    const ESC04_TARGET_REL: [&str; 4] = ["sys", "fs", "cgroup", "release_agent"];
 
     /// 子（コンテナ内）で攻撃を実行するクロージャの型。結果は `Recorder` へ書く。
     type Attack = fn(&Recorder);

@@ -1273,6 +1273,130 @@ mod tests {
         }
     }
 
+    /// 最初の `fail_after` 行までは成功し、以後は失敗する sink。呼ばれた回数を数える。
+    struct FailAfterSink {
+        fail_after: usize,
+        calls: AtomicUsize,
+    }
+    impl LogSink for FailAfterSink {
+        fn append(&self, _: StreamKind, _: &[u8]) -> Result<(), TraitError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.fail_after {
+                Ok(())
+            } else {
+                Err(TraitError::new(ErrorCode::Unavailable, "fake sink failure"))
+            }
+        }
+    }
+
+    /// TASK-157.7: sink の追記が失敗したら、そのストリームでは以後 sink を呼ばず、EOF まで読み捨てる。
+    /// 5 行のうち 2 行目で失敗する場合、append は 2 回だけ呼ばれ、届かなかった行は 4 行（失敗した行を含む）。
+    #[test]
+    fn sup1_task157_7_sink_is_not_called_again_after_failure() {
+        let sink = Arc::new(FailAfterSink {
+            fail_after: 1,
+            calls: AtomicUsize::new(0),
+        });
+        let cap = LogCapture::start(
+            OutputStreams::new(
+                &ReaderBudget::with_max_limit(),
+                boxed(b"a\nb\nc\nd\ne"),
+                None,
+            ),
+            sink.clone(),
+        )
+        .unwrap();
+        let sum = cap.drain(Duration::from_secs(10)).unwrap();
+        let s = sum.stdout().unwrap();
+        assert_eq!(sink.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(s.error_code(), Some(ErrorCode::Unavailable));
+        assert_eq!(s.lines(), 5);
+        assert_eq!(s.discarded_lines(), 4);
+        assert_eq!(s.bytes(), 9);
+    }
+
+    /// TASK-157.7: sink の失敗はストリームごとに扱う（stdout で失敗しても stderr の 2 行は届く）。
+    #[test]
+    fn sup1_task157_7_sink_failure_is_per_stream() {
+        struct StdoutFails(MemoryLogSink);
+        impl LogSink for StdoutFails {
+            fn append(&self, stream: StreamKind, line: &[u8]) -> Result<(), TraitError> {
+                if stream == StreamKind::Stdout {
+                    return Err(TraitError::new(ErrorCode::Internal, "fake sink failure"));
+                }
+                self.0.append(stream, line)
+            }
+        }
+        let sink = Arc::new(StdoutFails(MemoryLogSink::default()));
+        let cap = LogCapture::start(
+            OutputStreams::new(
+                &ReaderBudget::with_max_limit(),
+                boxed(b"o1\no2\n"),
+                boxed(b"e1\ne2\n"),
+            ),
+            sink.clone(),
+        )
+        .unwrap();
+        let sum = cap.drain(Duration::from_secs(10)).unwrap();
+        assert_eq!(sum.stdout().unwrap().discarded_lines(), 2);
+        assert_eq!(sum.stderr().unwrap().discarded_lines(), 0);
+        assert_eq!(sum.stderr().unwrap().error_code(), None);
+        assert_eq!(
+            sink.0.snapshot().unwrap(),
+            vec![
+                line(StreamKind::Stderr, b"e1"),
+                line(StreamKind::Stderr, b"e2")
+            ]
+        );
+    }
+
+    /// REPAIR-5・TASK-157.7: drain の timeout は MAX_DRAIN_TIMEOUT（60 秒）以下に限る。超過は待たずに
+    /// InvalidArgument で返り、捕捉は取り消される（リーダーは終了して枠を返す）。
+    #[test]
+    fn sup1_task157_7_drain_rejects_timeout_above_max() {
+        assert_eq!(MAX_DRAIN_TIMEOUT, Duration::from_secs(60));
+        let budget = ReaderBudget::new(1).unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let sink = Arc::new(MemoryLogSink::default());
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        let start = Instant::now();
+        let err = cap
+            .drain(MAX_DRAIN_TIMEOUT + Duration::from_nanos(1))
+            .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), "drain timeout is too large");
+        writer.write_all(b"late\n").unwrap();
+        assert_eq!(wait_live(&budget, 0), 0);
+        assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
+        drop(writer);
+    }
+
+    /// TASK-157.7: メモリ sink の容量は MAX_MEMORY_SINK_BYTES（64MiB）以下に限る（境界は受理、超過は拒否）。
+    #[test]
+    fn sup1_task157_7_memory_sink_capacity_has_maximum() {
+        assert_eq!(MAX_MEMORY_SINK_BYTES, 67_108_864);
+        assert!(MemoryLogSink::new(MAX_MEMORY_SINK_BYTES).is_ok());
+        for bad in [MAX_MEMORY_SINK_BYTES + 1, usize::MAX] {
+            let err = MemoryLogSink::new(bad).err().unwrap();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            assert_eq!(
+                err.message(),
+                "memory sink capacity is larger than the maximum"
+            );
+        }
+        let err = MemoryLogSink::new(line_cost(MAX_LINE_BYTES) - 1)
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.message(),
+            "memory sink capacity is smaller than the maximum line size"
+        );
+    }
+
     /// TASK-157.7: sink が失敗しても EOF まで読み切り、最初のエラーコードを返す。
     #[test]
     fn sup1_task157_7_sink_error_is_reported_and_reading_continues() {

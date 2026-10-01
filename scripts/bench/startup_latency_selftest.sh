@@ -132,6 +132,8 @@ cat >>"$stub" <<'STUB'
 #   cleanup-hang: start 後は running のままで、delete・kill がいずれも応答しない（ハング）
 #   exec-hang-poll: start 後の state が 1.5 秒かけて created を返し、2 回目以降はハングする
 #   exec-after-1s: start 後 1 秒間は state が即座に created を返し、その後 running を返す
+#   log-holder: create・start・delete がそれぞれ、ログ（stdout / stderr）を開いたまま 3 秒残る
+#               子プロセスを起こしてから正常終了する（子の PID を $STUB_STATE/holders に記録）
 #   id-in-use: create 前から同じ ID のコンテナが存在する
 mode="${STUB_MODE:-ok}"
 cmd="$1"
@@ -141,6 +143,11 @@ case "$cmd" in
   *) id="$1" ;;
 esac
 echo "$cmd $id" >>"$STUB_LOG"
+if [ "$mode" = log-holder ] && { [ "$cmd" = create ] || [ "$cmd" = start ] || [ "$cmd" = delete ]; }; then
+  # stdout / stderr（run_rt が向けたログファイル）を継承したまま残る子プロセス。
+  sleep 3 &
+  echo "$!" >>"$STUB_STATE/holders"
+fi
 m="$STUB_STATE/$id"
 # bundle は create が受け取った --bundle を返す（OCI state の bundle は絶対パス）。
 state_json() {
@@ -649,6 +656,17 @@ STUB_MODE=exec-hang-poll expect_rc "exec-hang-poll" 1 --runtime "$stub" --bundle
 observe_ms=$(((${EPOCHREALTIME/./} - observe_t0) / 1000))
 if [ "$observe_ms" -lt 4000 ]; then pass "exec-hang-poll-bounded (${observe_ms}ms < 4000ms)"; else fail "exec-hang-poll-bounded (${observe_ms}ms)"; fi
 expect_contains "exec-hang-poll-error" "runtime-exec-not-observed"
+
+# ランタイムの子プロセスがログファイルを開いたまま残っても、スクリプトはそれを待たない
+# （Codex P0 の確認）。ランタイムの stdout / stderr はパイプでなくファイルへ向け、stdin は
+# /dev/null のため、子の終了や EOF を待つ箇所がない。子が残る 3 秒より十分短く終わること。
+reset_log
+holder_t0="${EPOCHREALTIME/./}"
+STUB_MODE=log-holder expect_rc "log-holder" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+holder_ms=$(((${EPOCHREALTIME/./} - holder_t0) / 1000))
+if [ "$holder_ms" -lt 2500 ]; then pass "log-holder-not-waited (${holder_ms}ms < 2500ms)"; else fail "log-holder-not-waited (${holder_ms}ms)"; fi
+expect_eq "log-holder-children-spawned" "3" "$(wc -l <"$stub_state/holders" | tr -d ' ')"
+while read -r holder_pid; do kill "$holder_pid" 2>/dev/null || true; done <"$stub_state/holders"
 
 # --- 8d. 計測中の時計の変更（Codex P1）: 壁時計の区間を単調時計（/proc/uptime）と照合し、
 #         食い違えばその回を結果に使わず exit 1、stdout は空。単調時計が進まない読み元に

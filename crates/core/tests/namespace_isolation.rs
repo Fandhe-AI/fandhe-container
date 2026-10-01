@@ -161,29 +161,95 @@ mod linux {
         rootfs
     }
 
-    /// プロセスグループ `pgid` の全員へ SIGKILL を送る（`kill -KILL -- -<pgid>`）。
-    /// 新しい PID namespace の PID 1 も親 namespace からの SIGKILL は受け付けるため container 段も止まる。
-    /// 外部コマンドの待機にも上限を設ける（REPAIR-5）。
-    fn kill_group(pgid: u32) {
-        let Ok(mut killer) = Command::new("kill")
+    /// 外部コマンド `kill` を `-KILL` 付きで実行し、終了コード 0 を確認する。起動失敗・非ゼロ終了・
+    /// 待機超過はすべて `Err`（成功扱いにしない）。待機にも上限を設ける（REPAIR-5）。
+    fn run_kill(targets: &[String]) -> Result<(), String> {
+        let mut killer = Command::new("kill")
             .args(["-KILL", "--"])
-            .arg(format!("-{pgid}"))
+            .args(targets)
             .stdin(Stdio::null())
             .spawn()
-        else {
-            return;
-        };
+            .map_err(|e| format!("spawn kill failed: {e}"))?;
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if matches!(killer.try_wait(), Ok(Some(_))) {
-                return;
+            match killer.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(status)) => return Err(format!("kill exited with {status}")),
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => return Err(format!("wait kill failed: {e}")),
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
         let _ = killer.kill();
         let _ = killer.wait();
+        Err("kill did not exit within 5s".to_string())
     }
 
+    /// プロセスグループ `pgid` に属する生存プロセス（ゾンビを除く）の PID を `/proc` から列挙する。
+    /// 新しい PID namespace 内のプロセスもホストの `/proc` からはホスト側 PID で見える。
+    fn group_members(pgid: u32) -> Vec<u32> {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let mut pids = Vec::new();
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // 形式: `pid (comm) state ppid pgrp ...`。comm は括弧を含み得るため最後の `)` 以降を分解する。
+            let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+                continue;
+            };
+            let mut fields = rest.split_whitespace();
+            let state = fields.next();
+            let _ppid = fields.next();
+            let pgrp = fields.next().and_then(|f| f.parse::<u32>().ok());
+            if pgrp == Some(pgid) && state != Some("Z") && state != Some("X") {
+                pids.push(pid);
+            }
+        }
+        pids
+    }
+
+    /// `pgid` のグループが空になるまで最大 `limit` 待つ。残存 PID を返す（空なら全員停止）。
+    fn wait_group_gone(pgid: u32, limit: Duration) -> Vec<u32> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let members = group_members(pgid);
+            if members.is_empty() || Instant::now() >= deadline {
+                return members;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// プロセスグループ `pgid` の全員へ SIGKILL を送り、全員が止まったことまで確認する（特権操作の後始末）。
+    /// 新しい PID namespace の PID 1 も親 namespace からの SIGKILL は受け付けるため container 段も止まる。
+    /// グループ送信に失敗した場合は残存プロセスへ個別に送るフォールバックを試み、それでも残れば `Err` を返す。
+    fn kill_group(pgid: u32) -> Result<(), String> {
+        let group_result = run_kill(&[format!("-{pgid}")]);
+        let mut survivors = wait_group_gone(pgid, Duration::from_secs(2));
+        if survivors.is_empty() {
+            return Ok(());
+        }
+        // フォールバック: 残存 PID へ個別に SIGKILL を送る。
+        let targets: Vec<String> = survivors.iter().map(u32::to_string).collect();
+        let individual_result = run_kill(&targets);
+        survivors = wait_group_gone(pgid, Duration::from_secs(5));
+        if survivors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "processes remain in group {pgid}: {survivors:?} (group kill: {group_result:?}, individual kill: {individual_result:?})"
+            ))
+        }
+    }
     /// 子を起動して終了コード 0 を待つ。超過時は kill して panic する（REPAIR-5）。
     fn run_stage(flag: &str, rootfs: &Path, host_pid: u32, ns: &[String]) {
         use std::os::unix::process::CommandExt;
@@ -210,12 +276,18 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    if own_group {
-                        kill_group(child.id());
-                    }
+                    // グループ kill の失敗は握りつぶさず、直接の子の回収後に panic 文言へ含める。
+                    let group_result = if own_group {
+                        kill_group(child.id())
+                    } else {
+                        Ok(())
+                    };
                     let _ = child.kill();
                     let _ = child.wait();
-                    panic!("{flag} stage did not exit within {:?}", timeout());
+                    panic!(
+                        "{flag} stage did not exit within {:?} (cleanup: {group_result:?})",
+                        timeout()
+                    );
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
             }

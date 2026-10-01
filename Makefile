@@ -504,8 +504,9 @@ idle-memory-supervised-selftest: ## 監視プロセス込みアイドル常駐�
 # make ci には含めない。ci.md「実機前提テスト」）。全体に timeout を掛け（REPAIR-5）、終了コードの変換規則は
 # idle-memory と同じ。IDLE_MEMORY_SUPERVISED_TIMEOUT は全体の秒数（1〜999999・既定 900）、
 # IDLE_MEMORY_SUPERVISED_CALL_TIMEOUT は driver・各計測 1 回あたりの秒数（未指定ならスクリプト既定）。
-# 外側 timeout の TERM 後、スクリプトの TERM trap → EXIT trap の driver down（最大 call timeout + 10 秒）が完走できるよう、
-# --kill-after は call timeout + 20 秒（未指定・不正値は既定 120 秒 + 20）を確保する（後始末の時間予算。AGENTS.md「特権操作の後始末」）。
+# 外側 timeout の TERM 後、スクリプトは TERM trap で実行中の driver を待ち（最大 call timeout + 10 秒）、続く EXIT trap で
+# driver down を実行する（最大 call timeout + 10 秒）。両段階が完走できるよう、--kill-after は余裕 10 秒を含む
+# 2 * call timeout + 30 秒（未指定・不正値は既定 120 秒 → 270 秒）を確保する（後始末の時間予算。AGENTS.md「特権操作の後始末」）。
 # IDLE_MEMORY_SUPERVISED_SCRIPT は selftest が配線を stub で照合するための差し替え口。
 IDLE_MEMORY_SUPERVISED_TIMEOUT ?= 900
 IDLE_MEMORY_SUPERVISED_SCRIPT ?= scripts/bench/idle_memory_supervised.sh
@@ -532,7 +533,7 @@ idle-memory-supervised: ## 監視プロセス込みのアイドル常駐メモ�
 	if [ -n $(call fio_bench_sq,$(IDLE_MEMORY_SUPERVISED_CALL_TIMEOUT)) ]; then set -- "$$@" --timeout $(call fio_bench_sq,$(IDLE_MEMORY_SUPERVISED_CALL_TIMEOUT)); fi; \
 	c=$(call fio_bench_sq,$(IDLE_MEMORY_SUPERVISED_CALL_TIMEOUT)); \
 	case "$$c" in ''|*[!0-9]*|???????*|0) c=120 ;; esac; \
-	k=$$((c + 20)); \
+	k=$$((2 * c + 30)); \
 	rc=0; \
 	timeout --kill-after="$$k" "$$t" bash $(call fio_bench_sq,$(IDLE_MEMORY_SUPERVISED_SCRIPT)) "$$@" || rc=$$?; \
 	case "$$rc" in \

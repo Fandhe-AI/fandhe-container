@@ -391,6 +391,26 @@ PATH="$work/faildd:$PATH" "$bash_bin" "$target_script" --runtime "$stub" --bundl
 expect_eq "output-partial-write-exit" "2" "$rc"
 expect_eq "output-partial-write-no-file" "" "$(find "$work/partial" -mindepth 1 -print)"
 expect_eq "output-partial-write-stdout-empty" "" "$(cat "$work/partial.stdout")"
+# 一時ファイルの作成が名前の衝突等で失敗した場合（Codex P1）: 既存のファイルを消さずに exit 2。
+# mktemp が既存の名前を返す（作成していない）状況を、既存ファイルのパスを返して失敗する
+# mktemp で再現し、そのファイルが残ることを確かめる。
+mkdir -p "$work/failmktemp" "$work/collide"
+echo other >"$work/collide/.startup_latency.taken"
+cat >"$work/failmktemp/mktemp" <<FAILMKTEMP
+#!/usr/bin/env bash
+case "\$*" in *startup_latency*) echo "$work/collide/.startup_latency.taken"; exit 1 ;; esac
+exec "$(command -v mktemp)" "\$@"
+FAILMKTEMP
+chmod 755 "$work/failmktemp/mktemp"
+reset_log
+rc=0
+PATH="$work/failmktemp:$PATH" "$bash_bin" "$target_script" --runtime "$stub" --bundle "$work/bundle" \
+  --iterations 1 --warmup 0 --output "$work/collide/out.json" >/dev/null 2>&1 || rc=$?
+expect_eq "output-staging-collision-exit" "2" "$rc"
+expect_eq "output-staging-collision-kept" "other" "$(cat "$work/collide/.startup_latency.taken")"
+expect_eq "output-staging-collision-no-output" "" "$(find "$work/collide" -name out.json -print)"
+# 出力ファイルのパーミッションは umask に従う（umask 022 で 644）。
+expect_eq "output-mode-follows-umask" "644" "$(stat -c '%a' "$out_file" 2>/dev/null || stat -f '%Lp' "$out_file")"
 
 # --- 5. 入力エラー（exit 2） ---
 expect_rc "input-runtime-missing" 2 --bundle "$work/bundle"

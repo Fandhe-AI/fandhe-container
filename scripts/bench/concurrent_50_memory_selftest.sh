@@ -557,6 +557,21 @@ expect_rc2 "arg-output-parent-symlink" "${base[@]}" --output "$work/olink/o.json
 mkdir -p "$work/oreal/sub"
 chmod 700 "$work/oreal/sub"
 expect_rc2 "arg-output-ancestor-symlink" "${base[@]}" --output "$work/olink/sub/o.json"
+# 親が安全でも、他のユーザーが書き込める祖先（sticky なし）があれば拒否する（検査後の差し替え防止）
+mkdir -p "$work/oanc/sub"
+chmod 700 "$work/oanc/sub"
+chmod 777 "$work/oanc"
+expect_rc2 "arg-output-ancestor-world-writable" "${base[@]}" --output "$work/oanc/sub/o.json"
+# sticky 付きの共有ディレクトリ（/tmp と同じ形）は祖先として受け入れる。出力先の検証を通過したことを、
+# その後段の前提確認（uname を差し替えて非 Linux を模擬）で止まる終了コード 3 で照合する
+chmod 1777 "$work/oanc"
+mkdir -p "$work/fakebin-anc"
+printf '#!%s\necho Darwin\n' "$bash_bin" >"$work/fakebin-anc/uname"
+chmod +x "$work/fakebin-anc/uname"
+r=0
+PATH="$work/fakebin-anc:$PATH" "$bash_bin" "$target" "${base[@]}" --output "$work/oanc/sub/o.json" >/dev/null 2>"$errf" || r=$?
+expect_eq "arg-output-ancestor-sticky-accepted" 3 "$r"
+expect_has "arg-output-ancestor-sticky-reaches-prereq" "$errf" "unsupported-os: only Linux is supported"
 expect_rc2 "arg-output-dotdot" "${base[@]}" --output "$work/oreal/../oreal/o.json"
 expect_rc2 "arg-min-procs-one" "${base[@]}" --min-procs 1
 expect_rc2 "arg-bad-id-prefix" "${base[@]}" --id-prefix 'A;b'

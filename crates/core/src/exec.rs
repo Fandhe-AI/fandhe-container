@@ -124,6 +124,10 @@ pub use process::{
 };
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 pub use seccomp::SeccompReport;
+/// 結合試験 `tests/escape_suite.rs` の ESC-03 専用の再公開（SEC-2・TASK-42.2・#200。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub use seccomp::escape_probe_mount;
 #[doc(hidden)]
 pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 /// 結合試験 `tests/seccomp_enforcement.rs` 専用の再公開（通常の利用者は呼ばない。詳細は定義側）。`unsafe` を `sys` の外へ出さないための観測専用の入口。

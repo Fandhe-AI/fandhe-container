@@ -2,7 +2,20 @@
 //!
 //! PoC-9（`03-poc/security-isolation`）で定めた最小攻撃セット ESC-01〜ESC-10 を CI 自動テストスイート
 //! として実装する TASK-42 の土台。各 ESC ケースは `linux::CASES` へ `EscapeCase` を 1 行追加するだけで
-//! 実装できる（ESC-01〜03 は #200、04〜06 は #201、07〜08 は #202、09〜10 は #203 で追加する）。
+//! 実装できる（ESC-01〜03 は #200〔実装済み〕、04〜06 は #201、07〜08 は #202、09〜10 は #203 で追加する）。
+//!
+//! # ESC-01〜03（SEC-2・TASK-42.2・#200）の検証範囲と監査（SEC-4）の扱い（REPAIR-3）
+//! - ESC-01（ホスト FS 書き込み）: ホスト側に用意した canary ファイルへ、ホスト絶対パス・`/proc/1/root`・
+//!   `/proc/self/root` 経由で書き込みを試み、いずれも成功しないこと、およびホスト側で canary が無変更
+//!   （内容一致・余計なファイルなし）であることをディスパッチ側で観測する。加えて readonly root への書き込みが
+//!   EACCES（Landlock 適用下）で拒否されることを確認する。EACCES は DAC でも返り得るため層の厳密な証跡ではない
+//! - ESC-02（ホスト PID namespace）: 監査記録は要求しない（拒否ではなく不可視であることの観測）
+//! - ESC-03（`mount(2)`）: 拒否主体は組み込み seccomp の `ERRNO(EPERM)`（と capability 削減）
+//! - 監査（SEC-4）: 本番の監査配送経路（`AuditSink` を fork 後の子へ渡す経路・seccomp ERRNO の報告経路）は
+//!   未配線のため、攻撃コード自身が記録ヘルパを呼んで記録を作る方式は監査成功の証拠にならない。
+//!   ESC-01・03 は `AuditExpectation::Deferred` とし、監査レコードの有無を合否に使わない（攻撃の拒否検証と
+//!   監査配送経路の検証を分離）。ヘルパ自体の契約は core 側ユニットテストが担う。配送経路の配線後に
+//!   本番経路の実出力を回収して照合する `Required` へ切り替える
 //!
 //! # 共通関数の流れ（コンテナ起動 → 攻撃 → 判定 → 後始末）
 //! `linux::run_case`（ディスパッチャ）が排他作成した一時 rootfs を用意し、自身を
@@ -60,7 +73,7 @@ enum AttackOutcome {
     Succeeded,
     /// errno 付きで失敗した。
     Errno(i32),
-    /// 操作の対象が存在しない（ESC-04・05 向け）。
+    /// 操作の対象が存在しない・見えない（ESC-02・04・05 向け）。
     Absent,
     /// errno なしの失敗。
     Failed,
@@ -98,7 +111,11 @@ enum AuditExpectation {
     /// 監査レコードを要求しない。
     None,
     /// 指定レイヤー（`AuditLayer::as_str()` の値: `seccomp` / `landlock` / `mount`）の記録を 1 件以上要求する。
+    /// 記録は本番の配送経路が出力したものに限る（テスト側が生成した記録を証拠にしてはならない）。
     Required(&'static str),
+    /// 指定レイヤーの監査を spec 上は要求するが、本番の配送経路が未配線のため合否に使わない（REPAIR-3・SEC-4）。
+    /// 配線完了後に `Required` へ置き換える。判定は攻撃結果のみで行う。
+    Deferred(&'static str),
 }
 
 /// ケースの期待。
@@ -163,6 +180,14 @@ enum Mismatch {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     HostCheckFailed {
+        detail: String,
+    },
+    /// ホスト側の canary が攻撃後に変化した（ホスト FS へ到達・書き込めた = エスケープ。ESC-01）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    HostTargetModified {
         detail: String,
     },
 }
@@ -439,6 +464,110 @@ fn sec2_task42_1_record_parser_selftest() {
     );
 }
 
+/// ESC-01: ホスト FS への書き込みは成功せず（ホスト側 canary 無変更）、readonly root への書き込みは EACCES（Landlock）。
+///
+/// `landlock` 層の監査は配送経路未配線のため `Deferred`（SEC-4・REPAIR-3）。
+const ESC01_EXPECTATION: Expectation = Expectation {
+    allowed: &[AttackOutcome::Errno(13)],
+    signal: None,
+    audit: AuditExpectation::Deferred("landlock"),
+};
+
+/// ESC-02: ホストの PID namespace が参照できない（`/proc/1` はコンテナ内の自分自身）。監査記録は要求しない。
+const ESC02_EXPECTATION: Expectation = Expectation {
+    allowed: &[AttackOutcome::Absent],
+    signal: None,
+    audit: AuditExpectation::None,
+};
+
+/// ESC-03: 既定 capability セット下の `mount(2)` は EPERM（1）で拒否される。拒否主体は組み込み seccomp の
+/// `ERRNO(EPERM)`（と capability 削減）で `AuditLayer::Mount` ではないため、`seccomp` 層の監査を
+/// 配送経路未配線のため `Deferred` とする（SEC-4・REPAIR-3）。
+const ESC03_EXPECTATION: Expectation = Expectation {
+    allowed: &[AttackOutcome::Errno(1)],
+    signal: None,
+    audit: AuditExpectation::Deferred("seccomp"),
+};
+
+/// ESC-02 の判定: コンテナ内から見える PID 空間を分類する（OS 非依存の純粋関数）。
+///
+/// `self_pid` は `process::id()`、`proc_self_link` は `readlink("/proc/self")`、`visible` は `/proc` の数値エントリ。
+/// 自分が PID 1 で、`/proc/self` が `1` を指し、可視 PID が `[1]` のみなら「ホストのプロセスは不可視」
+/// （`Absent`）。それ以外はホストのプロセスを参照できた（PID namespace 未分離・別 namespace の `/proc`）ため
+/// `Succeeded`（= エスケープ）。
+fn classify_pid_view(self_pid: u32, proc_self_link: &str, visible: &[u32]) -> AttackOutcome {
+    if self_pid == 1 && proc_self_link == "1" && visible == [1] {
+        AttackOutcome::Absent
+    } else {
+        AttackOutcome::Succeeded
+    }
+}
+
+/// SEC-2・TASK-42.2: ESC-02 の PID 可視性分類と ESC-01〜03 の期待の自己テスト（具体値で照合。REPAIR-12）。
+fn sec2_task42_2_selftest() {
+    assert_eq!(classify_pid_view(1, "1", &[1]), AttackOutcome::Absent);
+    assert_eq!(
+        classify_pid_view(1, "1", &[1, 734]),
+        AttackOutcome::Succeeded
+    );
+    assert_eq!(
+        classify_pid_view(4321, "4321", &[1, 4321]),
+        AttackOutcome::Succeeded
+    );
+    assert_eq!(classify_pid_view(1, "57", &[1]), AttackOutcome::Succeeded);
+    assert_eq!(classify_pid_view(1, "1", &[]), AttackOutcome::Succeeded);
+
+    let obs = |outcome, layers: &[&str]| Observation {
+        exit: ObservedExit::Exited(0),
+        outcome: Some(outcome),
+        audit_layers: layers.iter().map(|s| s.to_string()).collect(),
+    };
+    // Deferred: 監査記録の有無は合否に影響しない（テスト側生成の記録を証拠にしない。SEC-4）。
+    assert_eq!(
+        judge(&ESC03_EXPECTATION, &obs(AttackOutcome::Errno(1), &[])),
+        CaseVerdict::Pass
+    );
+    assert_eq!(
+        judge(
+            &ESC03_EXPECTATION,
+            &obs(AttackOutcome::Errno(1), &["mount"])
+        ),
+        CaseVerdict::Pass
+    );
+    assert_eq!(
+        judge(
+            &ESC03_EXPECTATION,
+            &obs(AttackOutcome::Succeeded, &["mount"])
+        ),
+        CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
+            got: AttackOutcome::Succeeded
+        }])
+    );
+    assert_eq!(
+        judge(&ESC01_EXPECTATION, &obs(AttackOutcome::Errno(13), &[])),
+        CaseVerdict::Pass
+    );
+    assert_eq!(
+        judge(
+            &ESC01_EXPECTATION,
+            &obs(AttackOutcome::Errno(1), &["landlock"])
+        ),
+        CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
+            got: AttackOutcome::Errno(1)
+        }])
+    );
+    assert_eq!(
+        judge(&ESC02_EXPECTATION, &obs(AttackOutcome::Absent, &[])),
+        CaseVerdict::Pass
+    );
+    assert_eq!(
+        judge(&ESC02_EXPECTATION, &obs(AttackOutcome::Succeeded, &[])),
+        CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
+            got: AttackOutcome::Succeeded
+        }])
+    );
+}
+
 /// Linux asm-generic の errno 値（x86_64・aarch64 共通。syscall 番号ではないため arch 分岐は不要）。
 const EPERM: i32 = 1;
 #[cfg(all(
@@ -561,6 +690,7 @@ fn sec2_task42_4_expectation_selftest() {
 fn always() {
     sec2_task42_1_judge_selftest();
     sec2_task42_1_record_parser_selftest();
+    sec2_task42_2_selftest();
     sec2_task42_4_expectation_selftest();
     println!("escape_suite: SEC-2 judge and record parser verified");
 }
@@ -618,21 +748,25 @@ mod linux {
         AuditDelivery, AuditRecord, AuditSink, encode_json_line, landlock_denial_record_now,
     };
     use fandhe_container_core::exec::{
-        ChildExit, IsolationConfig, Namespace, NamespaceSet, StagePipeline, isolate,
-        isolate_rootful_host_root, plan, plan_rootful_host_root, spawn_container_probe,
+        ChildExit, IsolationConfig, Namespace, NamespaceSet, ProbeOutcome, StagePipeline,
+        escape_probe_mount, isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
+        spawn_container_probe,
     };
     use fandhe_container_core::landlock::{detect_landlock_abi, path_rules_from_config};
     use fandhe_container_core::oci_runtime::{audit_mount_config_error, parse_config_bytes};
     use fandhe_container_core::traits::{ErrorCode, TraitError};
 
     use super::{
-        AttackOutcome, AuditExpectation, CaseVerdict, ENOENT, ESC07_LANDLOCK_EXPECT,
-        ESC07_WRITE_EXPECT, ESC08_EXPECT, Expectation, Mismatch, Observation, ObservedExit,
-        RECORD_MAX_BYTES, judge, parse_record,
+        AttackOutcome, AuditExpectation, CaseVerdict, ENOENT, ESC01_EXPECTATION, ESC02_EXPECTATION,
+        ESC03_EXPECTATION, ESC07_LANDLOCK_EXPECT, ESC07_WRITE_EXPECT, ESC08_EXPECT, Expectation,
+        Mismatch, Observation, ObservedExit, RECORD_MAX_BYTES, classify_pid_view, judge,
+        parse_record,
     };
 
     /// 子（コンテナ内）で攻撃を実行するクロージャの型。結果は `Recorder` へ書く。
-    type Attack = fn(&Recorder);
+    ///
+    /// 第 2 引数はホスト側に用意した canary ファイルの絶対パス（ホスト FS 到達の観測対象。ESC-01）。
+    type Attack = fn(&Recorder, &Path);
 
     /// 1 件の攻撃ケース。ESC-01〜10 は `CASES` へ追加する（#200〜#203）。
     struct EscapeCase {
@@ -660,7 +794,7 @@ mod linux {
         is_root: bool,
     }
 
-    /// 登録済みケース。ハーネスが end-to-end で動くことを示す対照ケースと、ESC 各ケース（#200〜#203）。
+    /// 登録済みケース。対照ケースと ESC-01〜03（#200）。ESC-04 以降は #201〜#203 で追加する。
     const CASES: &[EscapeCase] = &[
         EscapeCase {
             id: "control-read-proc",
@@ -713,6 +847,30 @@ mod linux {
             host_check: Some(host_check_esc09_owner),
             precondition: no_precondition,
         },
+        EscapeCase {
+            id: "esc-01-host-fs-write",
+            expectation: ESC01_EXPECTATION,
+            stages: esc01_stages,
+            attack: attack_esc01_host_fs_write,
+            precondition: no_precondition,
+            host_check: None,
+        },
+        EscapeCase {
+            id: "esc-02-host-pid-ns",
+            expectation: ESC02_EXPECTATION,
+            stages: StagePipeline::new,
+            attack: attack_esc02_host_pid_ns,
+            precondition: no_precondition,
+            host_check: None,
+        },
+        EscapeCase {
+            id: "esc-03-cap-sys-admin-mount",
+            expectation: ESC03_EXPECTATION,
+            stages: StagePipeline::new,
+            attack: attack_esc03_cap_sys_admin_mount,
+            precondition: no_precondition,
+            host_check: None,
+        },
         // ESC-07〜08（TASK-42.4・#202）
         EscapeCase {
             id: "esc-07-runtime-binary-write",
@@ -739,6 +897,150 @@ mod linux {
             host_check: None,
         },
     ];
+
+    /// ESC-01 の制限ステージ列: readonly root・mounts なしの Landlock ruleset を載せる（親・fork 前に構築）。
+    ///
+    /// ABI 6 未満など Landlock が使えない環境は実機前提の不成立として panic（失敗）にする。skip しない。
+    fn esc01_stages() -> StagePipeline {
+        let json =
+            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"mounts":[]}"#;
+        let config = parse_config_bytes(json).expect("valid config");
+        let support = detect_landlock_abi()
+            .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for ESC-01: {e}"));
+        let ruleset =
+            path_rules_from_config(&support, &config).unwrap_or_else(|e| panic!("rules: {e}"));
+        StagePipeline::new()
+            .with_landlock(ruleset)
+            .unwrap_or_else(|e| panic!("with_landlock: {e}"))
+    }
+
+    /// ESC-01 の対照ファイル（rootfs 直下。シナリオが fork 前に作成し、rootfs と共に削除される）。
+    const CONTROL_NAME: &str = "esc-01-control";
+    /// pivot 後の名前空間から見た対照ファイルのパス。
+    const CONTROL_PATH: &str = "/esc-01-control";
+
+    /// `prefix` 配下にホスト絶対パス `host` を連結した経路（`/proc/1/root` 等経由）を作る。
+    fn via(prefix: &str, host: &Path) -> PathBuf {
+        let mut p = PathBuf::from(prefix);
+        p.extend(host.components().skip(1));
+        p
+    }
+
+    /// 既存ファイルへの書き込みオープンを試みる（作成・切り詰めはしない。成功しても内容は変わらない）。
+    fn try_open_for_write(target: &Path) -> AttackOutcome {
+        match std::fs::OpenOptions::new().write(true).open(target) {
+            Ok(_) => AttackOutcome::Succeeded,
+            Err(e) => e
+                .raw_os_error()
+                .map_or(AttackOutcome::Failed, AttackOutcome::Errno),
+        }
+    }
+
+    /// ESC-01: pivot_root 後にホスト FS へ書き込めないこと（SEC-2・TASK-42.2）。
+    ///
+    /// 0. 対照: rootfs 内の既存ファイルへの書き込みが EACCES（Landlock）で拒否されること。経路自体が機能して
+    ///    いることを先に確かめ、以降のホスト経路の ENOENT を「到達不能」（正常な隔離）と読めるようにする。
+    /// 1. ホスト側に用意した canary（`host_canary`。rootfs の外）へ、ホスト絶対パス・`/proc/1/root`・
+    ///    `/proc/self/root` 経由で書き込みオープンを試みる。いずれかが成功したら `Succeeded`（エスケープ）。
+    ///    ENOENT / EACCES / EPERM 以外の errno はその errno を結果にして期待と不一致にする。
+    ///    canary の無変更はシナリオ側（コンテナ外）が別途観測する。
+    /// 2. readonly root への書き込み（`/proc/1/root` は PID 1 = 自分の rootfs）が Landlock（EACCES）で
+    ///    拒否されることを確認する。ここは Landlock の拒否の観測であり、ホスト FS への到達検査は 1 が担う。
+    ///
+    /// 制限が欠けて 2 が成功してもマーカーは一時 rootfs 内に作られ `Rootfs::drop` で削除される。
+    /// 監査記録は作らない（攻撃側生成の記録は SEC-4 の証拠にならない。期待は `Deferred`）。
+    fn attack_esc01_host_fs_write(rec: &Recorder, host_canary: &Path) {
+        // 対照経路: pivot 後の rootfs 内の既存ファイル（シナリオが fork 前に作成）への書き込みオープン。
+        // パス解決・オープンの経路自体は機能しており Landlock（readonly root）が EACCES で拒否する、
+        // という前提を先に確認する。ENOENT（経路の不備）や成功（Landlock 欠落）なら以降の
+        // ホスト経路の ENOENT を「到達不能」と読めないため、その結果を記録して失敗にする。
+        match try_open_for_write(Path::new(CONTROL_PATH)) {
+            AttackOutcome::Errno(13) => {}
+            other => {
+                rec.outcome(other);
+                return;
+            }
+        }
+        // ホスト経路: ENOENT = ホスト FS は pivot 後の名前空間から到達不能（正常な隔離）。
+        // EACCES / EPERM = 到達はしたが書き込みは拒否された（ここでも成功ではない）。
+        // 成功・その他の errno は期待（EACCES）と不一致にする。
+        let routes = [
+            host_canary.to_path_buf(),
+            via("/proc/1/root", host_canary),
+            via("/proc/self/root", host_canary),
+        ];
+        for route in &routes {
+            match try_open_for_write(route) {
+                AttackOutcome::Errno(1 | 2 | 13) => {}
+                other => {
+                    rec.outcome(other);
+                    return;
+                }
+            }
+        }
+        let outcome = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open("/proc/1/root/esc-01-marker")
+        {
+            Ok(_) => AttackOutcome::Succeeded,
+            Err(e) => e
+                .raw_os_error()
+                .map_or(AttackOutcome::Failed, AttackOutcome::Errno),
+        };
+        rec.outcome(outcome);
+    }
+
+    /// `/proc` の列挙件数の上限（超過は PID 空間が想定外に広い = `Succeeded` 扱い。無制限な蓄積の防止）。
+    const PROC_ENTRY_LIMIT: usize = 4096;
+
+    /// ESC-02: ホストの PID namespace が参照できず `/proc/1` が自分自身であること（SEC-2・TASK-42.2）。
+    ///
+    /// `/proc` の数値エントリ・`/proc/self` のリンク先・`process::id()` から可視 PID 空間を観測し、
+    /// `classify_pid_view` で分類する。読み出しの失敗は errno / `Failed` として記録する（成功扱いにしない）。
+    fn attack_esc02_host_pid_ns(rec: &Recorder, _host_canary: &Path) {
+        let observe = || -> Result<AttackOutcome, std::io::Error> {
+            let link = std::fs::read_link("/proc/self")?;
+            let link = link.to_string_lossy().into_owned();
+            let mut visible: Vec<u32> = Vec::new();
+            for entry in std::fs::read_dir("/proc")? {
+                let name = entry?.file_name();
+                if let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) {
+                    if visible.len() >= PROC_ENTRY_LIMIT {
+                        return Ok(AttackOutcome::Succeeded);
+                    }
+                    visible.push(pid);
+                }
+            }
+            visible.sort_unstable();
+            Ok(classify_pid_view(std::process::id(), &link, &visible))
+        };
+        let outcome = match observe() {
+            Ok(o) => o,
+            Err(e) => e
+                .raw_os_error()
+                .map_or(AttackOutcome::Failed, AttackOutcome::Errno),
+        };
+        rec.outcome(outcome);
+    }
+
+    /// ESC-03: 既定 capability セット下の `mount(2)` が EPERM で拒否されること（SEC-2・TASK-42.2）。
+    ///
+    /// core の `escape_probe_mount`（PID 1 限定・propagation 変更のみで新規マウントを作らない）を呼ぶ。
+    ///
+    /// 監査（SEC-4・REPAIR-3）: 実際の拒否主体は組み込み seccomp の `ERRNO(EPERM)`（と capability 削減）で、
+    /// seccomp ERRNO にはユーザー空間への報告経路がまだない。攻撃側で記録を作ると監査の証拠にならないため
+    /// 記録せず、期待は `Deferred`。配送経路の配線後に本番経路の出力照合（`Required`）へ置き換える。
+    /// `SeccompDenialReport` は偽造しない。
+    fn attack_esc03_cap_sys_admin_mount(rec: &Recorder, _host_canary: &Path) {
+        let probe = escape_probe_mount().unwrap_or_else(|e| panic!("escape_probe_mount: {e}"));
+        let outcome = match probe {
+            ProbeOutcome::Ok => AttackOutcome::Succeeded,
+            ProbeOutcome::Errno(errno) => AttackOutcome::Errno(errno),
+            ProbeOutcome::Unsupported | ProbeOutcome::Failed => AttackOutcome::Failed,
+        };
+        rec.outcome(outcome);
+    }
 
     // ---- ESC-07〜08（SEC-2・TASK-42.4・#202） ----
 
@@ -808,7 +1110,7 @@ mod linux {
     }
 
     /// 否定対照の攻撃: Landlock なしで ESC-10 と同じ作成を試みる（結果の報告のみ）。
-    fn attack_control_create_outside(rec: &Recorder) {
+    fn attack_control_create_outside(rec: &Recorder, _host_canary: &Path) {
         rec.outcome(try_create(ESC10_PROBE));
     }
 
@@ -818,7 +1120,7 @@ mod linux {
     /// （ステージ自体の回帰検出。CORE-5）。拒否（`EACCES`）は本番の監査ヘルパ `landlock_denial_record_now`
     /// で SEC-4 の監査レコードにし、同じ試行の結果から判定と記録を結び付ける。レコードが出なければ
     /// `AuditExpectation::Required("landlock")` は満たされない。子プロセスへの本番監査配線は REPAIR-3 まで未実装。
-    fn attack_esc10_create_outside(rec: &Recorder) {
+    fn attack_esc10_create_outside(rec: &Recorder, _host_canary: &Path) {
         let outcome = try_create(ESC10_PROBE);
         let errno = match outcome {
             AttackOutcome::Errno(e) => Some(e),
@@ -834,7 +1136,7 @@ mod linux {
     }
 
     /// ESC-09 の攻撃: コンテナ内（pivot 後）の root としてファイルを作る。所有者の検査はホスト側で行う。
-    fn attack_esc09_create_file(rec: &Recorder) {
+    fn attack_esc09_create_file(rec: &Recorder, _host_canary: &Path) {
         rec.outcome(try_create(&format!("/{ESC09_PROBE}")));
     }
 
@@ -892,7 +1194,7 @@ mod linux {
     /// 書き込みモードで開こうとする。truncate・create・append は付けず、開けても即 drop して 1 バイトも
     /// 書かないため、制限が全て欠けてもホストは変わらない（`Succeeded` を記録して失敗するだけ）。
     /// ETXTBSY は LSM の file_open より先に判定されるため許可する（Landlock 帰属は別ケースで確認）。
-    fn attack_esc07_runtime_binary_write(rec: &Recorder) {
+    fn attack_esc07_runtime_binary_write(rec: &Recorder, _host_canary: &Path) {
         let outcome = match std::fs::OpenOptions::new()
             .write(true)
             .open("/proc/self/exe")
@@ -906,7 +1208,7 @@ mod linux {
 
     /// ESC-07 の補助（SEC-2・TASK-42.4・#202）: ETXTBSY に覆われない読み取り open で、Landlock が
     /// ホスト側バイナリ（rootfs の許可ツリー外）の経路を塞いでいることを独立に示す。読み込みはしない。
-    fn attack_esc07_runtime_binary_landlock(rec: &Recorder) {
+    fn attack_esc07_runtime_binary_landlock(rec: &Recorder, _host_canary: &Path) {
         let outcome = match std::fs::File::open("/proc/self/exe") {
             Ok(_) => AttackOutcome::Succeeded,
             Err(e) => outcome_of_error(&e),
@@ -921,7 +1223,7 @@ mod linux {
     /// 注意（実装済みを装わない）: マウント元（source）側のホワイトリストは未実装で、start は空でない mounts
     /// を一律 `Unimplemented` で拒否するが監査されない。コンテナ内から生の `mount(2)` を試すケースは
     /// raw syscall プローブが必要なため範囲外。本ケースは監査経路が実装済みの destination 側を検証する。
-    fn attack_esc08_mount_outside_whitelist(rec: &Recorder) {
+    fn attack_esc08_mount_outside_whitelist(rec: &Recorder, _host_canary: &Path) {
         for dest in ["/../../run/fandhe-container", "/", "run/../../../etc"] {
             let before = rec.audit_count();
             let json = format!(
@@ -956,7 +1258,7 @@ mod linux {
     }
 
     /// 対照: 禁止対象外の操作（`/proc/self/status` の読み出し）が制限下でも動くこと。
-    fn attack_control_read_proc(rec: &Recorder) {
+    fn attack_control_read_proc(rec: &Recorder, _host_canary: &Path) {
         let outcome = match std::fs::read_to_string("/proc/self/status") {
             Ok(s) if s.contains("Seccomp:") => AttackOutcome::Succeeded,
             Ok(_) => AttackOutcome::Failed,
@@ -1150,6 +1452,9 @@ mod linux {
     fn run_case(case: &EscapeCase) -> CaseVerdict {
         let exe = std::env::current_exe().expect("current_exe");
         let rootfs = make_rootfs();
+        // シナリオの異常終了・panic でも canary ディレクトリが残らないよう、ディスパッチャ側でも
+        // 全終了経路（drop）で削除する（未作成なら no-op）。
+        let _canary_cleanup = Rootfs(canary_dir_for(&rootfs.0));
         let mut child = Command::new(&exe)
             .args(["--scenario", case.id])
             .arg(&rootfs.0)
@@ -1221,6 +1526,32 @@ mod linux {
         );
     }
 
+    /// ホスト側 canary の初期内容。
+    const CANARY_CONTENT: &[u8] = b"fandhe-escape-host-canary\n";
+
+    /// rootfs と同じ親ディレクトリに作る canary ディレクトリのパス（rootfs の外）。
+    fn canary_dir_for(rootfs: &Path) -> PathBuf {
+        let mut name = rootfs.as_os_str().to_os_string();
+        name.push("-canary");
+        PathBuf::from(name)
+    }
+
+    /// canary が攻撃後も無変更か（内容一致・ディレクトリに余計なエントリなし）。違反なら詳細を返す。
+    fn canary_violation(dir: &Path, canary: &Path) -> Option<String> {
+        match std::fs::read(canary) {
+            Ok(c) if c == CANARY_CONTENT => {}
+            Ok(c) => return Some(format!("canary content changed ({} bytes)", c.len())),
+            Err(e) => return Some(format!("canary unreadable: {e}")),
+        }
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                let count = entries.count();
+                (count != 1).then(|| format!("canary dir has {count} entries (expected 1)"))
+            }
+            Err(e) => Some(format!("canary dir unreadable: {e}")),
+        }
+    }
+
     /// シナリオ: 分離 → 子で攻撃 → 記録回収 → 判定。結果は 1 行出力し、不合格は終了コード 1 にする。
     fn scenario(case_id: &str, rootfs: &Path) {
         let case = CASES
@@ -1253,13 +1584,25 @@ mod linux {
         };
         result.unwrap_or_else(|err| panic!("isolate failed: {err}"));
 
+        // ホスト側 canary（rootfs の外。ESC-01 の到達観測対象）。分離後もホスト FS は親から見える。
+        let canary_dir = Rootfs(canary_dir_for(rootfs));
+        std::fs::create_dir(&canary_dir.0).expect("exclusively create canary dir");
+        let canary = canary_dir.0.join("canary");
+        std::fs::write(&canary, CANARY_CONTENT).expect("write canary");
+        std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o666))
+            .expect("chmod canary");
+
+        // ESC-01 の対照ファイル（rootfs 内。rootfs と共にディスパッチャが削除する）。
+        std::fs::write(rootfs.join(CONTROL_NAME), b"control\n").expect("write control file");
+
         let (reader, writer) = std::io::pipe().expect("create record pipe");
         (case.precondition)();
         let attack = case.attack;
+        let attack_canary = canary.clone();
         // 親側の writer 端は fork 時に閉じられる（クロージャは子にだけ残る）ため、子の終了で EOF になる。
         let child = spawn_container_probe(rootfs, (case.stages)(), move || {
             let recorder = Recorder::new(writer);
-            attack(&recorder);
+            attack(&recorder, &attack_canary);
         })
         .unwrap_or_else(|e| panic!("spawn: {e}"));
         // パイプ容量を超える記録でも子が write で詰まらないよう、子の待機と並行して別スレッドで読む（REPAIR-5）。
@@ -1298,13 +1641,25 @@ mod linux {
             },
             Err(e) => panic!("invalid record from the container: {e}"),
         };
-        let verdict = judge(&case.expectation, &observation);
+        let mut verdict = judge(&case.expectation, &observation);
+        // ホスト側 canary の無変更を、コンテナ外から観測する（到達・書き込みの副作用の有無）。
+        if let Some(detail) = canary_violation(&canary_dir.0, &canary) {
+            let mismatch = Mismatch::HostTargetModified { detail };
+            verdict = match verdict {
+                CaseVerdict::Pass => CaseVerdict::Fail(vec![mismatch]),
+                CaseVerdict::Fail(mut m) => {
+                    m.push(mismatch);
+                    CaseVerdict::Fail(m)
+                }
+            };
+        }
         match verdict {
             CaseVerdict::Pass => {
                 println!("escape_suite: {} verdict=pass exit={}", case.id, exit);
             }
             CaseVerdict::Fail(ref m) => {
                 println!("escape_suite: {} verdict=fail {m:?}", case.id);
+                drop(canary_dir);
                 std::process::exit(1);
             }
         }

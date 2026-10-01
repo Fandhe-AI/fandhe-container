@@ -102,3 +102,10 @@ harness = false
 name = "seccomp"
 path = "tests/seccomp.rs"
 harness = false
+
+# Landlock 適用後の遮断の結合試験（CORE-5・TASK-39.3・#183）。適用は不可逆・単一スレッド前提のため
+# harness = false（使い捨ての子プロセス内で適用する）。実機前提はなく既定のテスト集合で動く。
+[[test]]
+name = "landlock_enforcement"
+path = "tests/landlock_enforcement.rs"
+harness = false

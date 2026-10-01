@@ -570,7 +570,7 @@ fn nspid_innermost(status: &str) -> Option<u32> {
 }
 
 /// `/proc/self/status` の `Threads:` 行（スレッドグループのスレッド数）。
-fn status_threads(status: &str) -> Option<u64> {
+pub(crate) fn status_threads(status: &str) -> Option<u64> {
     status
         .lines()
         .find_map(|l| l.strip_prefix("Threads:"))

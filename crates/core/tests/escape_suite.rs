@@ -2,7 +2,7 @@
 //!
 //! PoC-9（`03-poc/security-isolation`）で定めた最小攻撃セット ESC-01〜ESC-10 を CI 自動テストスイート
 //! として実装する TASK-42 の土台。各 ESC ケースは `linux::CASES` へ `EscapeCase` を 1 行追加するだけで
-//! 実装できる（ESC-01〜03 は #200、04〜06 は #201、07〜08 は #202〔いずれも実装済み〕、09〜10 は #203 で追加する）。
+//! 実装できる（ESC-01〜03 は #200、04〜06 は #201、07〜08 は #202、09〜10 は #203 で実装済み）。
 //!
 //! # ESC-01〜03（SEC-2・TASK-42.2・#200）の検証範囲と監査（SEC-4）の扱い（REPAIR-3）
 //! - ESC-01（ホスト FS 書き込み）: ホスト側に用意した canary ファイルへ、ホスト絶対パス・`/proc/1/root`・
@@ -31,9 +31,9 @@
 //! - 監査ログ: `AuditExpectation::Required(layer)` のケースは、そのレイヤーの記録が 0 件なら必ず失敗する。
 //!   `AuditExpectation::Deferred(layer)` は spec 上は要求するが本番の配送経路が未配線のため合否に使わない。
 //!   監査ログの本番配線（`AuditSink` を fork 後の子へ渡す経路）は未実装（REPAIR-3）のため、現状は攻撃
-//!   クロージャが既存の記録ヘルパ（`landlock_denial_record_now`・`audit_mount_config_error` 等）経由で
-//!   `Recorder`（`AuditSink`）へ記録したレコードを pipe で回収して判定する。配線完了後は本番経路の
-//!   出力を照合する形へ置き換える
+//!   クロージャが記録ヘルパで作った記録は ESC-07 など一部ケースの暫定方式であり、ESC-10 は
+//!   `Deferred`（起動ステージ適用済みの子で追加の Landlock 適用をせず、ステージ自体の回帰を攻撃結果で検出）。
+//!   配線完了後は本番経路の出力を照合する形へ置き換える
 //!
 //! # 構成
 //! - 常に走る部分（3 OS 共通・既定のテスト集合）: 判定ロジック `judge` と記録パーサの自己テスト
@@ -45,7 +45,9 @@
 //! Docker 既定 seccomp 下の開発コンテナでは分離に失敗する。GitHub ホステッド runner で保証できないため
 //! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」）。実行コマンド:
 //! `cargo test -p fandhe-container-core --test escape_suite -- --ignored`。実行された場合は分離の拒否・
-//! 事前条件の不成立を含めあらゆる失敗を失敗として扱い、検証せずに成功する分岐は持たない。AGENTS.md への
+//! 事前条件の不成立を含めあらゆる失敗を失敗として扱い、検証せずに成功する分岐は持たない。ただし起動ユーザー
+//! （root / 非 root）で前提が成立しないケース（`LauncherRequirement`）は、そのケースだけを合格ではなく
+//! 「対象外」（`verdict=not-applicable`）として理由とビヘイビア ID を出力し、他のケースは実行する。AGENTS.md への
 //! 記載と CI での分離方式の確定は #204（TASK-42.6）で行う。
 //!
 //! # ESC-04〜ESC-06（TASK-42.3・#201・MS-2）
@@ -73,6 +75,20 @@
 //!   （`audit_log/seccomp_hook.rs`）の後に、その本番経路が出力した記録を親側で回収して照合する
 //!   `Required("seccomp")` へ切り替える。`SECCOMP_RET_KILL` 系では子が記録を書く前に終了するため、親側の
 //!   listener か TRAP ハンドラ内の記録が前提になる
+//!
+//! # ESC-09・ESC-10（TASK-42.5・#203）
+//! - `esc-09-userns-owner`（SEC-5）: コンテナ内 root が作成したファイルの所有者を、ディスパッチャ（分離なし・
+//!   ホスト視点）が `EscapeCase::host_check` で検査し、起動ユーザーの非特権 UID/GID（≠ 0）であることを具体値で
+//!   照合する。**非 root 起動でのみ検証できる**（root 起動は user namespace なしでコンテナ内 root = ホスト root に
+//!   なるため）。root 起動時はディスパッチャが ESC-09 のシナリオを起動せず、ESC-09 だけを対象外として理由と
+//!   SEC-5 を出力し（`ESC09_LAUNCHER`）、他のケースは実行する。非 root 起動では必ず実行する。
+//!   subuid 範囲の写像は `rootless_uid_mapping.rs`（TASK-44）の担当で、
+//!   本ケースは既定経路（単一 ID 写像）を対象にする
+//! - `esc-10-landlock-outside`（CORE-5・SEC-4）: readonly root（READ のみ許可）の下で許可外の作成が `EACCES` で
+//!   拒否されること。Landlock ABI 6+（Linux 6.12+）が必須。spec が求める landlock レイヤーの監査記録は、本番の
+//!   配送経路が未配線のため `AuditExpectation::Deferred` とし合否に使わない（SEC-4・REPAIR-3）
+//! - `control-esc-10-no-landlock`: 同じ操作が Landlock なしでは成功する否定対照（拒否が DAC 等ではなく Landlock
+//!   に帰属することの裏付け）
 //!
 //! ESC-07 は Landlock ABI 6+（Linux 6.12+）を要する。
 //!
@@ -238,6 +254,14 @@ enum Mismatch {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     ScenarioFailed {
+        detail: String,
+    },
+    /// ホスト視点の検査（`EscapeCase::host_check`）の失敗。実プロセス部（Linux）でのみ構築される。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    HostCheckFailed {
         detail: String,
     },
     /// ホスト側の canary が攻撃後に変化した（ホスト FS へ到達・書き込めた = エスケープ。ESC-01）。
@@ -995,6 +1019,70 @@ fn sec2_task42_3_mask_evidence_selftest() {
     assert_eq!(effective_mount(two_roots, core), None);
 }
 
+/// ケースが前提とする起動ユーザー（ディスパッチャ＝分離前のホスト側プロセスの実効 UID）。
+///
+/// 起動ユーザーで前提が成立しないケースは、スイート全体を失敗させずにそのケースだけを「対象外」として
+/// 理由とビヘイビア ID を出力する（他のケースは実行する。ci.md「実機前提テスト」）。対象外は合格ではなく、
+/// 検証していないことを明示する別の結果として扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LauncherRequirement {
+    /// root・非 root のどちらで起動しても検証できる。
+    Any,
+    /// 非 root 起動でのみ検証できる（root 起動では前提が成立しない）。
+    NonRoot {
+        /// 対象外とする理由（出力文字列。英語）。
+        reason: &'static str,
+        /// 前提が対応するビヘイビア ID。
+        behavior: &'static str,
+    },
+}
+
+/// 起動ユーザーの前提が成立しないことの記録（対象外の理由）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NotApplicable {
+    reason: &'static str,
+    behavior: &'static str,
+}
+
+/// 起動ユーザーの前提を判定する（OS 非依存の純粋関数）。`is_root` はディスパッチャ自身の実効 UID が 0 か。
+/// user namespace 内の写像後 UID（コンテナ内では 0 に見える）を渡してはならない。
+fn launcher_applicability(req: LauncherRequirement, is_root: bool) -> Result<(), NotApplicable> {
+    match req {
+        LauncherRequirement::NonRoot { reason, behavior } if is_root => {
+            Err(NotApplicable { reason, behavior })
+        }
+        LauncherRequirement::Any | LauncherRequirement::NonRoot { .. } => Ok(()),
+    }
+}
+
+/// ESC-09（SEC-5）の起動ユーザー前提: root 起動の rootful 経路はコンテナ内 root をホスト root に写す
+/// （user namespace なし）ため、非特権 UID への写像を検証できない。
+const ESC09_LAUNCHER: LauncherRequirement = LauncherRequirement::NonRoot {
+    reason: "requires a non-root launcher: the rootful path has no user namespace and maps container root to host root",
+    behavior: "SEC-5",
+};
+
+/// SEC-2・SEC-5・TASK-42.5: 起動ユーザー前提の判定の自己テスト（具体値で照合。REPAIR-12）。
+fn sec2_task42_5_launcher_selftest() {
+    assert_eq!(
+        launcher_applicability(ESC09_LAUNCHER, true),
+        Err(NotApplicable {
+            reason: "requires a non-root launcher: the rootful path has no user namespace and maps container root to host root",
+            behavior: "SEC-5",
+        })
+    );
+    // 非 root 起動では ESC-09 を必ず実行する（対象外にする経路を持たない）。
+    assert_eq!(launcher_applicability(ESC09_LAUNCHER, false), Ok(()));
+    assert_eq!(
+        launcher_applicability(LauncherRequirement::Any, true),
+        Ok(())
+    );
+    assert_eq!(
+        launcher_applicability(LauncherRequirement::Any, false),
+        Ok(())
+    );
+}
+
 fn always() {
     sec2_task42_1_judge_selftest();
     sec2_task42_1_record_parser_selftest();
@@ -1003,6 +1091,7 @@ fn always() {
     sec2_task42_3_case_expectation_selftest();
     sec2_task42_3_mask_evidence_selftest();
     sec2_task42_4_expectation_selftest();
+    sec2_task42_5_launcher_selftest();
     println!("escape_suite: SEC-2 judge and record parser verified");
 }
 
@@ -1070,8 +1159,9 @@ mod linux {
     use super::{
         AttackOutcome, AuditExpectation, CaseVerdict, ENOENT, ESC01_EXPECTATION, ESC02_EXPECTATION,
         ESC03_EXPECTATION, ESC04_EXPECT, ESC05_EXPECT, ESC06_EXPECT, ESC07_LANDLOCK_EXPECT,
-        ESC07_WRITE_EXPECT, ESC08_EXPECT, Expectation, Mismatch, Observation, ObservedExit,
-        RECORD_MAX_BYTES, classify_pid_view, judge, parse_record,
+        ESC07_WRITE_EXPECT, ESC08_EXPECT, ESC09_LAUNCHER, Expectation, LauncherRequirement,
+        Mismatch, NotApplicable, Observation, ObservedExit, RECORD_MAX_BYTES, classify_pid_view,
+        judge, launcher_applicability, parse_record,
     };
 
     /// ESC-04 の攻撃対象（rootfs 内の相対パス）。rootfs 作成時に実在させる（`make_rootfs`）。
@@ -1092,9 +1182,26 @@ mod linux {
         attack: Attack,
         /// Landlock 適用前（親側）に走らせる対照。制限が拒否の原因であることを示すために使う（既定は何もしない）。
         precondition: fn(),
+        /// ディスパッチャ（分離なし・ホスト視点）がシナリオ成功後・rootfs 削除前に行う検査。
+        /// 別テーブルにせずフィールドにすることで、追記漏れを rebase 後のコンパイルエラーで表面化させる。
+        host_check: Option<HostCheck>,
+        /// 起動ユーザーの前提。成立しなければディスパッチャがシナリオを起動せず、このケースだけを理由と
+        /// ビヘイビア ID 付きの対象外として出力する（他のケースは実行する）。`host_check` と同じ理由でフィールドにする。
+        launcher: LauncherRequirement,
     }
 
-    /// 登録済みケース。対照ケースと ESC 各ケース（ESC-01〜03 は #200、ESC-04〜06 は #201、ESC-07〜08 は #202。ESC-09〜10 は #203 で追加する）。
+    /// ホスト視点の検査関数の型。
+    type HostCheck = fn(&HostView) -> Result<(), String>;
+
+    /// ホスト視点の検査入力（ESC-09。SEC-5）。
+    struct HostView<'a> {
+        rootfs: &'a Path,
+        euid: u32,
+        egid: u32,
+        is_root: bool,
+    }
+
+    /// 登録済みケース。対照ケースと ESC-01〜03（#200）・ESC-04〜06（#201）・ESC-07〜08（#202）・ESC-09〜10（#203）。
     const CASES: &[EscapeCase] = &[
         EscapeCase {
             id: "control-read-proc",
@@ -1106,6 +1213,51 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_control_read_proc,
             precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
+        },
+        // 否定対照: Landlock なしなら ESC-10 と同じ作成が成功する（拒否の Landlock への帰属の裏付け）。
+        EscapeCase {
+            id: "control-esc-10-no-landlock",
+            expectation: Expectation {
+                allowed: &[AttackOutcome::Succeeded],
+                signal: None,
+                audit: AuditExpectation::None,
+            },
+            stages: StagePipeline::new,
+            attack: attack_control_create_outside,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
+            precondition: no_precondition,
+        },
+        // ESC-10（CORE-5・SEC-4・SEC-2）。
+        EscapeCase {
+            id: "esc-10-landlock-outside",
+            expectation: Expectation {
+                allowed: &[AttackOutcome::Errno(13)],
+                signal: None,
+                // 配送経路未配線のため Deferred（テスト側生成の記録を合格証拠にしない。SEC-4・REPAIR-3）。
+                audit: AuditExpectation::Deferred("landlock"),
+            },
+            stages: esc10_stages,
+            attack: attack_esc10_create_outside,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
+            precondition: no_precondition,
+        },
+        // ESC-09（SEC-5・SEC-2）。
+        EscapeCase {
+            id: "esc-09-userns-owner",
+            expectation: Expectation {
+                allowed: &[AttackOutcome::Succeeded],
+                signal: None,
+                audit: AuditExpectation::None,
+            },
+            stages: StagePipeline::new,
+            attack: attack_esc09_create_file,
+            host_check: Some(host_check_esc09_owner),
+            launcher: ESC09_LAUNCHER,
+            precondition: no_precondition,
         },
         EscapeCase {
             id: "esc-01-host-fs-write",
@@ -1113,6 +1265,8 @@ mod linux {
             stages: esc01_stages,
             attack: attack_esc01_host_fs_write,
             precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
         },
         EscapeCase {
             id: "esc-02-host-pid-ns",
@@ -1120,6 +1274,8 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_esc02_host_pid_ns,
             precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
         },
         EscapeCase {
             id: "esc-03-cap-sys-admin-mount",
@@ -1127,6 +1283,8 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_esc03_cap_sys_admin_mount,
             precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
         },
         EscapeCase {
             id: "esc-04-release-agent",
@@ -1134,6 +1292,8 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_esc04_release_agent,
             precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
         },
         EscapeCase {
             id: "esc-05-proc-sys-core-pattern",
@@ -1141,6 +1301,8 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_esc05_proc_sys_core_pattern,
             precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
         },
         EscapeCase {
             id: "esc-05-sysrq-trigger",
@@ -1148,6 +1310,8 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_esc05_sysrq_trigger,
             precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
         },
         EscapeCase {
             id: "esc-06-unshare",
@@ -1155,6 +1319,8 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_esc06_unshare,
             precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
         },
         EscapeCase {
             id: "esc-06-ptrace",
@@ -1162,6 +1328,8 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_esc06_ptrace,
             precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
         },
         EscapeCase {
             id: "esc-06-kexec-load",
@@ -1169,6 +1337,8 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_esc06_kexec_load,
             precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
         },
         // ESC-07〜08（TASK-42.4・#202）
         EscapeCase {
@@ -1177,6 +1347,8 @@ mod linux {
             stages: landlock_rootfs_only_stages,
             attack: attack_esc07_runtime_binary_write,
             precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
         },
         EscapeCase {
             id: "esc-07-runtime-binary-landlock",
@@ -1184,6 +1356,8 @@ mod linux {
             stages: landlock_rootfs_only_stages,
             attack: attack_esc07_runtime_binary_landlock,
             precondition: precondition_esc07_exe_readable,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
         },
         EscapeCase {
             id: "esc-08-mount-outside-whitelist",
@@ -1191,6 +1365,8 @@ mod linux {
             stages: StagePipeline::new,
             attack: attack_esc08_mount_outside_whitelist,
             precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
         },
     ];
 
@@ -1366,6 +1542,92 @@ mod linux {
         StagePipeline::new()
             .with_landlock(ruleset)
             .unwrap_or_else(|e| panic!("with_landlock: {e}"))
+    }
+
+    /// ESC-10 の OCI config（readonly root・mount なし。固定リテラルでホスト側パスを含まない）。
+    const ESC10_CONFIG: &[u8] =
+        br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"mounts":[]}"#;
+    /// ESC-10 が作成を試みるコンテナ内パス。
+    const ESC10_PROBE: &str = "/esc-10-landlock-probe";
+    /// ESC-09 が作成するコンテナ内ファイル名（ホスト側は rootfs 直下の同名ファイルとして観測する）。
+    const ESC09_PROBE: &str = "esc-09-owner-probe";
+
+    /// ESC-10 用の制限ステージ列。readonly root（READ のみ許可）の Landlock ruleset を載せる。
+    ///
+    /// config は固定リテラルでホスト側パスを含まない。ABI 6 未満など検出・構築に失敗したら panic し、
+    /// シナリオ失敗（`ScenarioFailed`）として fail-closed にする（シナリオプロセス・fork 前で呼ばれる）。
+    fn esc10_stages() -> StagePipeline {
+        let config = parse_config_bytes(ESC10_CONFIG).expect("valid config");
+        let support = detect_landlock_abi()
+            .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for ESC-10: {e}"));
+        let ruleset =
+            path_rules_from_config(&support, &config).unwrap_or_else(|e| panic!("rules: {e}"));
+        StagePipeline::new()
+            .with_landlock(ruleset)
+            .unwrap_or_else(|e| panic!("with_landlock: {e}"))
+    }
+
+    /// 排他作成を試みて結果を `AttackOutcome` へ写す。
+    fn try_create(path: &str) -> AttackOutcome {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(_) => AttackOutcome::Succeeded,
+            Err(e) => e
+                .raw_os_error()
+                .map_or(AttackOutcome::Failed, AttackOutcome::Errno),
+        }
+    }
+
+    /// 否定対照の攻撃: Landlock なしで ESC-10 と同じ作成を試みる（結果の報告のみ）。
+    fn attack_control_create_outside(rec: &Recorder, _host_canary: &Path) {
+        rec.outcome(try_create(ESC10_PROBE));
+    }
+
+    /// ESC-10 の攻撃: 起動ステージ（`esc10_stages` の readonly root Landlock）が適用済みの子で、
+    /// 追加の Landlock 適用をせずに許可外の作成（MAKE_REG）をそのまま試みる。
+    /// 起動ステージの Landlock が欠落・回帰すれば作成が成功し、`Errno(13)` 期待に反してケースが失敗する
+    /// （ステージ自体の回帰検出。CORE-5）。監査レコードは作らない（テスト側生成の記録は SEC-4 の証拠にならない）。
+    /// 期待は `Deferred`。本番の監査配送経路の配線後（REPAIR-3）に実出力を回収して `Required` へ切り替える。
+    fn attack_esc10_create_outside(rec: &Recorder, _host_canary: &Path) {
+        rec.outcome(try_create(ESC10_PROBE));
+    }
+
+    /// ESC-09 の攻撃: コンテナ内（pivot 後）の root としてファイルを作る。所有者の検査はホスト側で行う。
+    fn attack_esc09_create_file(rec: &Recorder, _host_canary: &Path) {
+        rec.outcome(try_create(&format!("/{ESC09_PROBE}")));
+    }
+
+    /// ESC-09 のホスト視点検査（SEC-5）: コンテナ内 root 作成のファイルが起動ユーザーの非特権 UID/GID 所有であること。
+    /// root 起動はディスパッチャが `ESC09_LAUNCHER` で対象外にしてシナリオ自体を起動しないため、ここへは到達しない。
+    /// 到達した場合はハーネスの不変条件違反として失敗させる（所有者を照合せずに成功させる分岐は持たない）。
+    fn host_check_esc09_owner(view: &HostView) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+        if view.is_root {
+            return Err("harness invariant violated: ESC-09 ran under a root launcher; it must be reported as not applicable (SEC-5)".to_string());
+        }
+        let path = view.rootfs.join(ESC09_PROBE);
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("stat {} failed: {e}", path.display()))?;
+        if !meta.file_type().is_file() {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        let (uid, gid) = (meta.uid(), meta.gid());
+        if uid != view.euid || uid == 0 {
+            return Err(format!(
+                "owner uid is {uid}, expected the launcher's unprivileged uid {} (and != 0)",
+                view.euid
+            ));
+        }
+        if gid != view.egid || gid == 0 {
+            return Err(format!(
+                "owner gid is {gid}, expected the launcher's unprivileged gid {} (and != 0)",
+                view.egid
+            ));
+        }
+        Ok(())
     }
 
     /// `std::io::Error` を攻撃結果へ写す（ENOENT は `Absent`）。
@@ -1716,14 +1978,22 @@ mod linux {
         }
     }
 
+    /// `/proc/self/status` の `Uid:`・`Gid:` 行の effective（2 列目）を返す。
+    fn effective_ids() -> (u32, u32) {
+        let status = std::fs::read_to_string("/proc/self/status").expect("read status");
+        let field = |key: &str| -> u32 {
+            status
+                .lines()
+                .find(|l| l.starts_with(key))
+                .and_then(|l| l.split_whitespace().nth(2))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("{key} line in /proc/self/status"))
+        };
+        (field("Uid:"), field("Gid:"))
+    }
+
     fn is_root() -> bool {
-        std::fs::read_to_string("/proc/self/status")
-            .expect("read status")
-            .lines()
-            .find(|l| l.starts_with("Uid:"))
-            .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
-            .as_deref()
-            == Some("0")
+        effective_ids().0 == 0
     }
 
     /// 自プロセスの `Seccomp:` 行の値（`/proc/self/status`）。
@@ -1750,7 +2020,24 @@ mod linux {
     ///
     /// rootfs の作成・自身のシナリオ再起動・期限付き待機・出力回収を行い、rootfs は drop で削除する。
     /// 判定そのものはシナリオ内（`scenario`）で `judge` により行い、終了コード 0 を `Pass` とする。
-    fn run_case(case: &EscapeCase) -> CaseVerdict {
+    /// 起動ユーザーの前提（`EscapeCase::launcher`）が成立しなければ、シナリオを起動せず `NotApplicable` を返す。
+    fn run_case(case: &EscapeCase) -> CaseRun {
+        // 前提の判定はディスパッチャ自身（分離前・ホスト側）の実効 UID で行う。user namespace 内では
+        // 写像後の UID が 0 に見えるため、シナリオ・子の側では判定しない。
+        if let Err(na) = launcher_applicability(case.launcher, is_root()) {
+            return CaseRun::NotApplicable(na);
+        }
+        CaseRun::Ran(run_scenario(case))
+    }
+
+    /// 1 ケースの実行結果。対象外（`NotApplicable`）は合格ではなく、検証していないことを表す。
+    enum CaseRun {
+        Ran(CaseVerdict),
+        NotApplicable(NotApplicable),
+    }
+
+    /// `run_case` の本体: 起動前提の成立済みのケースを起動・判定・後始末する。
+    fn run_scenario(case: &EscapeCase) -> CaseVerdict {
         let exe = std::env::current_exe().expect("current_exe");
         let rootfs = make_rootfs();
         // シナリオの異常終了・panic でも canary ディレクトリが残らないよう、ディスパッチャ側でも
@@ -1783,7 +2070,24 @@ mod linux {
         }
         print!("{stdout}");
         match status {
-            Some(st) if st.code() == Some(0) => CaseVerdict::Pass,
+            Some(st) if st.code() == Some(0) => match case.host_check {
+                None => CaseVerdict::Pass,
+                Some(check) => {
+                    let (euid, egid) = effective_ids();
+                    let view = HostView {
+                        rootfs: &rootfs.0,
+                        euid,
+                        egid,
+                        is_root: euid == 0,
+                    };
+                    match check(&view) {
+                        Ok(()) => CaseVerdict::Pass,
+                        Err(detail) => {
+                            CaseVerdict::Fail(vec![Mismatch::HostCheckFailed { detail }])
+                        }
+                    }
+                }
+            },
             Some(st) => CaseVerdict::Fail(vec![Mismatch::ScenarioFailed {
                 detail: format!("scenario exited with {st}; stderr:\n{stderr}"),
             }]),
@@ -1795,17 +2099,35 @@ mod linux {
 
     fn dispatcher() {
         let mut failed = 0usize;
+        let mut verified = 0usize;
+        let mut not_applicable = Vec::new();
         for case in CASES {
-            let verdict = run_case(case);
-            if verdict != CaseVerdict::Pass {
-                failed += 1;
-                eprintln!("escape_suite: {} verdict=fail {verdict:?}", case.id);
+            match run_case(case) {
+                CaseRun::Ran(CaseVerdict::Pass) => verified += 1,
+                CaseRun::Ran(verdict) => {
+                    failed += 1;
+                    eprintln!("escape_suite: {} verdict=fail {verdict:?}", case.id);
+                }
+                CaseRun::NotApplicable(na) => {
+                    // 検証していないことを理由とビヘイビア ID 付きで出力する（合格として数えない）。
+                    println!(
+                        "escape_suite: {} verdict=not-applicable behavior={} reason={:?}",
+                        case.id, na.behavior, na.reason
+                    );
+                    not_applicable.push(case.id);
+                }
             }
         }
         assert_eq!(failed, 0, "{failed} escape case(s) failed");
+        // 非 root 起動で対象外になるケースは存在しない（`launcher_applicability` の契約）。
+        assert!(
+            is_root() || not_applicable.is_empty(),
+            "non-root launcher must run every case: {not_applicable:?}"
+        );
         println!(
-            "escape_suite: SEC-2 harness verified {} case(s) (root={})",
+            "escape_suite: SEC-2 harness verified {verified} of {} case(s), not applicable {:?} (root={})",
             CASES.len(),
+            not_applicable,
             is_root()
         );
     }

@@ -24,7 +24,7 @@ mod linux {
 
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
-        ContainerId, ContainerStatus, CreateStateRequest, GetStateRequest, StateStore,
+        ContainerId, ContainerStatus, CreateStateRequest, ErrorCode, GetStateRequest, StateStore,
         UpdateStateRequest,
     };
 
@@ -153,9 +153,14 @@ mod linux {
             let observer = open(&root);
             let started = Instant::now();
             loop {
-                let rec = observer.get(&GetStateRequest::new(cid(ID))).unwrap();
-                if rec.revision().value() > last_seen {
-                    break;
+                // 子が `@lock` を連続取得している間は観測側の取得が期限切れ（Timeout）になり得る
+                // （flock は公平でない）。これは子が稼働中という前提の通常動作なので、全体の
+                // 上限時間内で再試行する。それ以外のエラーは失敗させる。
+                match observer.get(&GetStateRequest::new(cid(ID))) {
+                    Ok(rec) if rec.revision().value() > last_seen => break,
+                    Ok(_) => {}
+                    Err(e) if e.code() == ErrorCode::Timeout => {}
+                    Err(e) => panic!("observer get failed: {e:?}"),
                 }
                 assert!(started.elapsed() < WAIT_DEADLINE, "child made no progress");
                 std::thread::sleep(Duration::from_millis(2));

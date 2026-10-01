@@ -409,6 +409,24 @@ PATH="$work/failmktemp:$PATH" "$bash_bin" "$target_script" --runtime "$stub" --b
 expect_eq "output-staging-collision-exit" "2" "$rc"
 expect_eq "output-staging-collision-kept" "other" "$(cat "$work/collide/.startup_latency.taken")"
 expect_eq "output-staging-collision-no-output" "" "$(find "$work/collide" -name out.json -print)"
+# 出力先の祖先ディレクトリを他のユーザーが差し替えられる場合は拒否する（Codex P0 / Bugbot:
+# 一時ファイルのパス差し替えで別ファイルの権限・内容を変更させない）。計測前に exit 2。
+mkdir -p "$work/gw" "$work/ow" "$work/sticky" "$work/ow2/target"
+chmod 0775 "$work/gw"
+chmod 0777 "$work/ow"
+chmod 1777 "$work/sticky"
+chmod 0777 "$work/ow2"
+ln -s "$work/ow2/target" "$work/linkdir"
+for case_dir in gw ow linkdir; do
+  reset_log
+  expect_rc "output-unsafe-dir-$case_dir" 2 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --output "$work/$case_dir/out.json"
+  expect_contains "output-unsafe-dir-$case_dir-error" "invalid-output"
+  expect_eq "output-unsafe-dir-$case_dir-no-runtime-call" "0" "$(wc -l <"$stub_log" | tr -d ' ')"
+done
+# sticky ビット付きの共有ディレクトリ（/tmp 相当）は他人が自分のエントリを差し替えられないため許可する。
+reset_log
+expect_rc "output-sticky-dir" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --output "$work/sticky/out.json"
+expect_eq "output-sticky-dir-written" "$last_stdout" "$(cat "$work/sticky/out.json")"
 # 出力ファイルのパーミッションは umask に従う（umask 022 で 644）。
 expect_eq "output-mode-follows-umask" "644" "$(stat -c '%a' "$out_file" 2>/dev/null || stat -f '%Lp' "$out_file")"
 

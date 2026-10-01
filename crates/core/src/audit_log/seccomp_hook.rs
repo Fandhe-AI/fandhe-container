@@ -14,7 +14,7 @@
 //!   end-to-end 試験は後続作業（フィルタのアクション変更を伴う設計判断）で行う
 //! - カーネル報告値は untrusted。構築子で検証し、panic しない。syscall 番号・arch は拒否された試行を
 //!   落とさないよう値を保存する（SEC-4 の 100% 記録）
-//! - シンクの失敗は握りつぶさず `Err` で伝播する。リトライ・フォールバックは #840 の担当
+//! - シンクの失敗は握りつぶさず `Err` で伝播する。リトライ・フォールバックは呼び出し側（`write_with_fallback`・#840 の `KernelAuditFallback`）の担当
 
 use crate::traits::TraitError;
 

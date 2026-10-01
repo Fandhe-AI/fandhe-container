@@ -4,7 +4,7 @@
 //!
 //! [`AuditRecord`] を JSON Lines（1 行 1 オブジェクト・LF 終端）にエンコードし、追記専用ファイルへ
 //! 書き込む「主経路」を提供する。書き込み失敗は panic させず [`AuditWriteError`] で返し、
-//! [`AuditFallback`] を介して代替経路（#840・TASK-41.5.2 のカーネル監査連携）へ引き渡せる。
+//! [`AuditFallback`] を介して代替経路（TASK-41.5.2・#840 のカーネル監査フォールバック）へ引き渡せる。
 //!
 //! # 呼び出し元・契約
 //!
@@ -28,8 +28,8 @@
 //!
 //! # 将来仕様
 //!
-//! seccomp の `arch` フィールドは未出力（TASK-41.2 のマージ後にスキーマへ追加）。フォールバックの実体は
-//! #840 で実装し、本モジュールの [`NoAuditFallback`] はそれまでのスタブ（REPAIR-3）。
+//! 代替経路の実体は `kernel_audit` の `KernelAuditFallback`（主経路の失敗時にだけカーネル監査へ送る）。
+//! 常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持は未実装（REPAIR-3）。
 
 use std::fmt;
 use std::fs::File;
@@ -78,6 +78,41 @@ pub enum AuditWriteErrorKind {
     Sync,
     /// フォールバック経路が未実装・利用不可。
     FallbackUnavailable,
+    /// カーネル監査へ到達できない（audit 非搭載・初期 user namespace 外・socket 作成不可。TASK-41.5.2）。
+    KernelAuditUnavailable,
+    /// カーネル監査が `CAP_AUDIT_WRITE` 不足で書き込みを拒否した（ACK が `EPERM`）。
+    KernelAuditPermissionDenied,
+    /// カーネル監査の ACK が上限時間内に届かなかった（REPAIR-5）。
+    KernelAuditTimeout,
+    /// カーネル監査が `EPERM` / `ECONNREFUSED` 以外の errno で書き込みを拒否した。
+    KernelAuditRejected,
+    /// カーネル監査との送受信が I/O エラーで失敗した、または ACK の形式が不正だった。
+    KernelAuditIo,
+}
+
+impl AuditWriteErrorKind {
+    /// ログ・構造化行用の固定トークン（snake_case。レコード内容・errno を含まない）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RelativePath => "relative_path",
+            Self::Unsupported => "unsupported",
+            Self::NotRegularFile => "not_regular_file",
+            Self::InsecureFile => "insecure_file",
+            Self::Open => "open",
+            Self::Encode => "encode",
+            Self::LineTooLong => "line_too_long",
+            Self::Write => "write",
+            Self::Lock => "lock",
+            Self::LockFailed => "lock_failed",
+            Self::Sync => "sync",
+            Self::FallbackUnavailable => "fallback_unavailable",
+            Self::KernelAuditUnavailable => "kernel_audit_unavailable",
+            Self::KernelAuditPermissionDenied => "kernel_audit_permission_denied",
+            Self::KernelAuditTimeout => "kernel_audit_timeout",
+            Self::KernelAuditRejected => "kernel_audit_rejected",
+            Self::KernelAuditIo => "kernel_audit_io",
+        }
+    }
 }
 
 /// 監査書き込みエラー（ERR 系の構造化形式。errno・パスは含めない）。
@@ -88,11 +123,11 @@ pub struct AuditWriteError {
 }
 
 impl AuditWriteError {
-    fn new(kind: AuditWriteErrorKind) -> Self {
+    pub(super) fn new(kind: AuditWriteErrorKind) -> Self {
         Self { kind }
     }
 
-    /// フォールバック実装（#840）が自身の利用不可を表すための構築子。
+    /// フォールバック実装が自身の利用不可を表すための構築子。
     pub fn fallback_unavailable() -> Self {
         Self::new(AuditWriteErrorKind::FallbackUnavailable)
     }
@@ -112,7 +147,12 @@ impl AuditWriteError {
             AuditWriteErrorKind::NotRegularFile | AuditWriteErrorKind::InsecureFile => {
                 ErrorCode::PermissionDenied
             }
-            AuditWriteErrorKind::Lock => ErrorCode::Timeout,
+            AuditWriteErrorKind::Lock | AuditWriteErrorKind::KernelAuditTimeout => {
+                ErrorCode::Timeout
+            }
+            // 環境上カーネル監査へ到達できない状態（未実装ではない）。`Unimplemented` と区別する。
+            AuditWriteErrorKind::KernelAuditUnavailable => ErrorCode::Unavailable,
+            AuditWriteErrorKind::KernelAuditPermissionDenied => ErrorCode::PermissionDenied,
             _ => ErrorCode::Internal,
         }
     }
@@ -134,6 +174,17 @@ impl AuditWriteError {
             AuditWriteErrorKind::LockFailed => "failed to acquire the audit log lock",
             AuditWriteErrorKind::Sync => "failed to sync audit log file",
             AuditWriteErrorKind::FallbackUnavailable => "audit fallback path is not available",
+            AuditWriteErrorKind::KernelAuditUnavailable => {
+                "kernel audit subsystem is not reachable from this environment"
+            }
+            AuditWriteErrorKind::KernelAuditPermissionDenied => {
+                "kernel audit rejected the message: CAP_AUDIT_WRITE is required"
+            }
+            AuditWriteErrorKind::KernelAuditTimeout => {
+                "timed out waiting for the kernel audit acknowledgement"
+            }
+            AuditWriteErrorKind::KernelAuditRejected => "kernel audit rejected the message",
+            AuditWriteErrorKind::KernelAuditIo => "kernel audit exchange failed",
         }
     }
 }
@@ -402,7 +453,7 @@ fn open_checked(_path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
     Err(AuditWriteError::new(AuditWriteErrorKind::Unsupported))
 }
 
-/// 主経路が失敗したときの代替経路のフック点（#840・TASK-41.5.2 がカーネル監査連携で実装する）。
+/// 主経路が失敗したときの代替経路のフック点（TASK-41.5.2・#840。実装は `KernelAuditFallback`）。
 pub trait AuditFallback {
     /// 主経路の失敗 `primary` を受けて `record` を代替経路へ記録する。
     fn record_fallback(
@@ -412,9 +463,10 @@ pub trait AuditFallback {
     ) -> Result<(), AuditWriteError>;
 }
 
-/// 既定のスタブ。常に `FallbackUnavailable`（`Unimplemented`）を返す。
+/// カーネル監査を使わない構成・テスト用の代替経路。常に `FallbackUnavailable`（`Unimplemented`）を返す。
 ///
-/// #840 でカーネル監査連携が実装されるまでの暫定（REPAIR-3: 実装済みを装わない）。
+/// 本番のカーネル監査フォールバックは `KernelAuditFallback`（TASK-41.5.2・#840）。本型は「代替経路なし」を
+/// 明示する構成のために残す（記録は欠落するため、両経路失敗として [`AuditWriteFailure`] が返る）。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoAuditFallback;
 
@@ -441,7 +493,16 @@ pub enum AuditWriteOutcome {
     },
 }
 
-/// 主経路・代替経路の両方が失敗した（記録が欠落した）ことを表す。
+/// 主経路・代替経路の両方が失敗した（記録が欠落した）ことを表す（SEC-4・TASK-41.5.2）。
+///
+/// # 両経路失敗時の扱い
+///
+/// - 構造化エラーコードは常に `INTERNAL`。両経路のエラー（kind とコード）は [`Self::primary`]・
+///   [`Self::fallback`] で保持する
+/// - 記録の成否で分離違反の拒否判定を覆さない（fail-closed。`AuditSink` の契約と同じ）。拒否は維持したまま、
+///   記録が欠落した事実だけを呼び出し側へ返す
+/// - 黙って捨てない。呼び出し側（supervisor / CLI の配線。後続）は [`Self::write_json_line`] の固定スキーマ
+///   1 行を stderr へ出力する責務を持つ（レコード内容・パス・errno は含まない）
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AuditWriteFailure {
@@ -468,6 +529,22 @@ impl AuditWriteFailure {
     /// 人間向け説明（英語）。
     pub fn message(&self) -> &'static str {
         "audit record could not be persisted by primary or fallback path"
+    }
+
+    /// 両経路失敗を固定スキーマの 1 行（LF 終端）で `out` へ書く（stderr 出力用。REPAIR-4）。
+    ///
+    /// キーは `event`・`code`・`primary`・`primary_code`・`fallback`・`fallback_code` の固定順。
+    /// 値はすべて固定トークンで、レコード内容・パス・errno を含めない（ログ注入・秘密情報の回避）。
+    pub fn write_json_line(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(
+            out,
+            "{{\"event\":\"audit_write_failure\",\"code\":\"{}\",\"primary\":\"{}\",\"primary_code\":\"{}\",\"fallback\":\"{}\",\"fallback_code\":\"{}\"}}",
+            self.error_code().as_str(),
+            self.primary.kind().as_str(),
+            self.primary.error_code().as_str(),
+            self.fallback.kind().as_str(),
+            self.fallback.error_code().as_str(),
+        )
     }
 }
 

@@ -13,6 +13,8 @@
 //! create / start / kill / delete は依存注入された `OpRecorder` へ固定の操作名（`create`・`start`・`kill`・
 //! `delete`）で成功 / 失敗と所要時間を記録する（REPAIR-4・TASK-84.4。delete は TASK-30.2 で同じ
 //! `record_op` パターンにより計装）。
+//! 失敗を表すエラー型 `OciRuntimeError` と終了コード対応表 `exit_code_for`（ERR-2・TASK-96.1）は定義済みだが、
+//! 各操作の失敗経路への結線と標準エラー出力は TASK-96.2 / TASK-96.3 で未実装である（REPAIR-3）。
 //! 例外は start の rootfs 固定（`RootfsDir::pin`。`exec::open_dir_beneath` を使う）と
 //! `ContainerChildProcess` で、`launch.rs` 内に `cfg(target_os = "linux")` で局所化している。Linux 以外の
 //! start は rootfs を固定できないため、起動前に `Unimplemented` で拒否する（fail-closed）。
@@ -20,6 +22,7 @@
 mod config;
 mod create;
 mod delete;
+mod error;
 mod kill;
 mod launch;
 mod mount_destination;
@@ -35,6 +38,12 @@ pub use config::{
 };
 pub use create::create;
 pub use delete::{CgroupRemoval, ContainerCgroupRemover, delete};
+pub use error::{
+    LifecycleOp, OCI_ERROR_MESSAGE_MAX_BYTES, OCI_EXIT_ALREADY_EXISTS,
+    OCI_EXIT_FAILED_PRECONDITION, OCI_EXIT_INTERNAL, OCI_EXIT_INVALID_ARGUMENT, OCI_EXIT_NOT_FOUND,
+    OCI_EXIT_PERMISSION_DENIED, OCI_EXIT_TIMEOUT, OCI_EXIT_UNAVAILABLE, OCI_EXIT_UNIMPLEMENTED,
+    OciRuntimeError, exit_code_for,
+};
 pub use kill::{KillTimeout, ProcessSignaler, kill};
 #[cfg(target_os = "linux")]
 pub use launch::ContainerChildProcess;

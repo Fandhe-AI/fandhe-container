@@ -90,7 +90,22 @@ fn main() {
             "unexpected code {:?}",
             e.code
         );
-        assert!(e.message.starts_with("landlock_"), "{}", e.message);
+        // `LandlockUnavailable::as_str` の理由コード（接頭辞は統一されていないため個別に照合する）。
+        const REASONS: [&str; 6] = [
+            "kernel_lacks_landlock",
+            "landlock_disabled_at_boot",
+            "landlock_abi_too_old",
+            "invalid_kernel_response",
+            "unsupported_architecture",
+            "landlock_probe_failed",
+        ];
+        assert!(
+            REASONS
+                .iter()
+                .any(|r| e.message.starts_with(&format!("{r}:"))),
+            "{}",
+            e.message
+        );
         assert!(!o.applied);
         assert!(o.apply_error.is_none());
         assert!(o.results.is_empty(), "probes must not run");

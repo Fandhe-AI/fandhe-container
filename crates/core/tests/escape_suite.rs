@@ -753,7 +753,15 @@ mod linux {
         result.unwrap_or_else(|err| panic!("isolate failed: {err}"));
 
         let (reader, writer) = std::io::pipe().expect("create record pipe");
+        let attack = case.attack;
+        // 親側の writer 端は fork 時に閉じられる（クロージャは子にだけ残る）ため、子の終了で EOF になる。
+        let child = spawn_container_probe(rootfs, (case.stages)(), move || {
+            let recorder = Recorder::new(writer);
+            attack(&recorder);
+        })
+        .unwrap_or_else(|e| panic!("spawn: {e}"));
         // パイプ容量を超える記録でも子が write で詰まらないよう、子の待機と並行して別スレッドで読む（REPAIR-5）。
+        // fork は単一スレッド必須（`fork_single_threaded` が Threads: 1 を要求）のため、読み取りスレッドは fork の後に起動する。
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut text = String::new();
@@ -763,13 +771,6 @@ mod linux {
                 .map(|_| text);
             let _ = tx.send(res);
         });
-        let attack = case.attack;
-        // 親側の writer 端は fork 時に閉じられる（クロージャは子にだけ残る）ため、子の終了で EOF になる。
-        let child = spawn_container_probe(rootfs, (case.stages)(), move || {
-            let recorder = Recorder::new(writer);
-            attack(&recorder);
-        })
-        .unwrap_or_else(|e| panic!("spawn: {e}"));
         let exit = child.wait_timeout(timeout()).unwrap_or_else(|e| {
             let _ = child.kill_and_reap(Duration::from_secs(5));
             panic!("wait: {e}")

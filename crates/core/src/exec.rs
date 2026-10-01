@@ -7,7 +7,7 @@
 //! （[`StagePipeline`]。#832・TASK-27.4.2。`exec/stages.rs`）まで実装済み。各段の実体
 //! のうち `PR_SET_NO_NEW_PRIVS` は組み込みの固定ステージとして実装済み（#833・TASK-27.4.3。
 //! `exec/no_new_privs.rs`）、capability 削減（#173）と seccomp（#178・TASK-38.3）も同様に組み込み済み。
-//! cgroup 参加・Landlock と制限適用の証跡は未実装で、後続の sub-issue（#137、TASK-32・37〜40）が追記する（REPAIR-3: 実装済みを装わない）。
+//! cgroup 参加と制限適用の証跡は未実装（Landlock は `StagePipeline::with_landlock` で差し込み可能。#184）で、後続の sub-issue（#137、TASK-32・37〜40）が追記する（REPAIR-3: 実装済みを装わない）。
 //!
 //! # 目指すフロー（Linux 専用）
 //!
@@ -23,8 +23,8 @@
 //!    常に適用する。capability の絞り込み処理 `apply_default_capabilities`（crate 内限定。SEC-1・TASK-37.1・#172）
 //!    も #173（TASK-37.2）で同じく差し替え不可の組み込み段になった。seccomp の適用処理 `apply_default_seccomp`
 //!    （crate 内限定。CORE-5・TASK-38.2・#177）も #178（TASK-38.3）で同じく差し替え不可の組み込み段になり、
-//!    exec 直前に必ず適用される。Landlock・cgroup 参加と
-//!    最終的な制限の証跡は未実装のため exec は
+//!    exec 直前に必ず適用される。cgroup 参加と
+//!    最終的な制限の証跡は未実装（Landlock は `StagePipeline::with_landlock` で差し込み可能。組み込み段ではない）のため exec は
 //!    引き続き拒否される。他の段の実体は未実装で、後続の TASK-32・39・40 が [`StageHook`] として
 //!    差し込む）。
 //!    `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
@@ -32,7 +32,7 @@
 //! 5. `fork` / `exec`（#831・TASK-27.4.1。**最小構成のみ実装済み**。[`spawn_container`] が分離済みの
 //!    親から子を fork し、子が `establish` → [`prepare_rootfs`] → [`pivot_root`] →
 //!    [`exec_entrypoint`] を行う。上の第 3・4 段〔デバイスノード・ステージ列・`NO_NEW_PRIVS`〕のうち
-//!    Landlock・cgroup 参加が未実装のため**この最小構成は Landlock を適用できず、[`exec_entrypoint`] は
+//!    制限適用の証跡配線が未実装のため**この最小構成は exec を許可せず、[`exec_entrypoint`] は
 //!    制限の適用証跡が無い限り rootful・rootless を問わず `PermissionDenied` で exec を拒否する**
 //!    （SEC-1・CORE-5。fail-closed）。親子間の同期・構造化エラーパイプも未実装で、子の失敗は
 //!    終了コードと stderr で伝える〔TASK-29/30 で扱う〕）
@@ -92,6 +92,7 @@ use crate::traits::types::ErrorCode;
 
 mod capabilities;
 mod devices;
+mod landlock;
 mod no_new_privs;
 mod process;
 mod rootfs;

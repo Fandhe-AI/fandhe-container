@@ -9,24 +9,27 @@
 //!
 //! # 呼び出し文脈・契約
 //!
-//! - 将来、ステージ列の Landlock 段（#184・TASK-39.4。適用は #183 の `apply` が担う）や CLI / supervisor の事前チェックから呼ぶ。
-//!   `ExecError` / `IsolationStage` への写像は #184 で行い、本モジュールは `ErrorCode` までを決める
+//! - ステージ列の Landlock 段（`exec/landlock.rs`・#184・TASK-39.4。適用は #183 の `apply` が担う）や
+//!   CLI / supervisor の事前チェックから呼ぶ。`ExecError` / `IsolationStage` への写像は `exec/landlock.rs`
+//!   が行い、本モジュールは `ErrorCode` までを決める
 //! - 検出した ABI は #182（TASK-39.2。`rules` 子モジュール）が handled access のマスク選択に使う
 //! - syscall は `crate::sys::landlock_abi_version` のみ（読み取り専用の問い合わせ。権限を変えない）
 //! - ABI 不足は環境の前提条件違反であり、分離違反の試行ではないため SEC-4 の監査ログ対象にしない
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! ステージ列への組み込み（#184）は未実装。本モジュールは検出と拒否判定、純粋関数によるルール生成
+//! ステージ列への組み込み口（`StagePipeline::with_landlock`・#184）は実装済みだが、本番 launcher からの呼び出しと
+//! 制限適用の証跡配線は後続作業（スコープ外）。本モジュールは検出と拒否判定、純粋関数によるルール生成
 //! （`rules` 子モジュール・#182）、ruleset の適用（`apply` 子モジュール・#183。`landlock_create_ruleset` →
 //! `landlock_add_rule` → `landlock_restrict_self`）を提供する。適用関数 `apply_landlock_ruleset` は #184 の
-//! 組み込み段が呼ぶ前提で crate 内公開に留める。
+//! `exec/landlock.rs` が呼ぶ前提で crate 内公開に留める。
 
 use std::fmt;
 use std::num::NonZeroU32;
 
 mod apply;
 mod rules;
+pub(crate) use apply::apply_landlock_ruleset;
 pub use apply::{
     LandlockApplyError, LandlockApplyErrorKind, LandlockApplyReport,
     LandlockEnforcementObservation, observe_landlock_enforcement,

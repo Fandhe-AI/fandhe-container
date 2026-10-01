@@ -10,7 +10,7 @@
 //! ```
 //!
 //! 残りの段の実体は後続の TASK が [`StageHook`] として差し込む（cgroup 参加: TASK-32、
-//! Landlock: TASK-39、rootless: TASK-40）。`CapabilityDrop`（`exec/capabilities.rs`。
+//! rootless: TASK-40。Landlock は [`StagePipeline::with_landlock`]（TASK-39.4・#184）で core の適用処理を差し込む）。`CapabilityDrop`（`exec/capabilities.rs`。
 //! #173・TASK-37.2・SEC-1）・`NoNewPrivs`（`exec/no_new_privs.rs`。#833・TASK-27.4.3）・
 //! `Seccomp`（`exec/seccomp.rs`。#178・TASK-38.3・CORE-5。exec 直前の最終段）は
 //! 組み込みの固定ステージで、フックを登録しなくても必ず実行され、[`StagePipeline::with_hook`] による
@@ -49,13 +49,18 @@ use std::fmt;
 #[cfg(not(test))]
 use super::capabilities::apply_default_capabilities;
 #[cfg(not(test))]
+use super::landlock::apply_landlock_stage;
+#[cfg(not(test))]
 use super::seccomp::apply_default_seccomp;
 use super::{CapabilityReport, ExecError, IsolationStage, no_new_privs};
 // テストでは本物（`Threads: 1` を要求）の代わりに偽カーネルで走る関数へ差し替える。
 #[cfg(test)]
 use super::capabilities::testing::apply_default_capabilities;
 #[cfg(test)]
+use super::landlock::testing::apply_landlock_stage;
+#[cfg(test)]
 use super::seccomp::testing::apply_default_seccomp;
+use crate::landlock::LandlockRuleset;
 use crate::traits::types::ErrorCode;
 
 /// ステージの種別。`ORDER` の順が実行順（固定）。
@@ -209,6 +214,21 @@ impl StagePipeline {
         }
     }
 
+    /// core の Landlock 適用処理（TASK-39.4・#184・CORE-5）を Landlock 段へ登録する。
+    ///
+    /// `ruleset` は fork 前に親で `landlock_ruleset_from_config` 等で作り、クロージャへ move する
+    /// （fork で子へコピーされる）。実行位置は [`StageKind::ORDER`] により capability 削減・
+    /// `NO_NEW_PRIVS` の後、seccomp の前で固定される。適用失敗は `stage = Landlock` のエラーで
+    /// 以降の段と exec に進まない（fail-closed）。Landlock スロットを占有するため、独自の Landlock
+    /// フックとは排他で、どちらが先でも 2 回目は `InvalidArgument`（`Validate` 段）になる。
+    ///
+    /// 適用結果は制限適用の証跡ではなく捨てる（証跡型の確定は後続作業。REPAIR-3）。
+    pub fn with_landlock(self, ruleset: LandlockRuleset) -> Result<Self, ExecError> {
+        self.with_hook(StageKind::Landlock, move || {
+            apply_landlock_stage(&ruleset).map(|_report| ())
+        })
+    }
+
     /// 段にフックを登録する。同じ段への二重登録と、組み込みの固定ステージ
     /// （[`StageKind::is_builtin`]）への登録は `InvalidArgument`（`Validate` 段）で拒否する。
     pub fn with_hook(
@@ -272,7 +292,7 @@ impl StagePipeline {
     ///   `InvalidArgument`（`Validate` 段）で拒否される。
     /// - 理由: 登録漏れ・no-op フックで seccomp が外れる経路をなくす（CORE-5・fail-closed）。
     /// - 移行方法: seccomp は core が常に適用するため登録は不要。exec 直前の観測点・独自処理は、
-    ///   組み込みでない最後の段 `Landlock` を使う（TASK-39.4 で Landlock も組み込みになる可能性がある）。
+    ///   組み込みでない最後の段 `Landlock` を使う（#184 では Landlock を組み込みにせず `with_landlock` を提供した。組み込み化は後続作業）。
     ///
     /// # 破壊的変更と移行方法（#833・TASK-27.4.3）
     ///
@@ -303,7 +323,7 @@ impl StagePipeline {
                         .map_err(|e| e.at_stage(kind.isolation_stage()))?;
                 }
                 StageKind::Seccomp => {
-                    // 証跡型は #184・TASK-39 で確定するため、終端へは渡さない（REPAIR-3）。
+                    // 証跡型の確定と配線は後続作業（スコープ外）のため、終端へは渡さない（REPAIR-3）。
                     let _report =
                         apply_default_seccomp().map_err(|e| e.at_stage(kind.isolation_stage()))?;
                 }
@@ -616,6 +636,118 @@ mod tests {
                 "exec"
             ]
         );
+    }
+
+    fn landlock_fixture() -> LandlockRuleset {
+        use crate::landlock::{AccessFs, PathRule, RuleOrigin, RulePath};
+        LandlockRuleset::for_observation(
+            6,
+            vec![PathRule {
+                path: RulePath::Root,
+                allowed: AccessFs::READ,
+                origin: RuleOrigin::Root,
+            }],
+        )
+    }
+
+    /// CORE-5・TASK-39.4・MS-2（受け入れ条件）: Landlock は capability 削減の後・seccomp の前に走る。
+    #[test]
+    fn core5_landlock_runs_after_capability_drop_and_before_seccomp() {
+        take();
+        let p = StagePipeline::new()
+            .with_landlock(landlock_fixture())
+            .unwrap();
+        p.run_then(exec_ok).unwrap();
+        assert_eq!(
+            take(),
+            [
+                "capability_drop",
+                "no_new_privs",
+                "landlock",
+                "seccomp",
+                "exec"
+            ]
+        );
+    }
+
+    /// CORE-5・TASK-39.4: 他段のフックを後から登録しても固定順。
+    #[test]
+    fn core5_landlock_with_cgroup_hook_keeps_fixed_order() {
+        take();
+        let p = StagePipeline::new()
+            .with_landlock(landlock_fixture())
+            .unwrap()
+            .with_hook(StageKind::CgroupJoin, ok_hook(StageKind::CgroupJoin))
+            .unwrap();
+        p.run_then(exec_ok).unwrap();
+        assert_eq!(
+            take(),
+            [
+                "cgroup_join",
+                "capability_drop",
+                "no_new_privs",
+                "landlock",
+                "seccomp",
+                "exec"
+            ]
+        );
+    }
+
+    /// CORE-5・TASK-39.4: Landlock 適用が失敗したら seccomp・exec に進まない（fail-closed）。
+    #[test]
+    fn core5_landlock_failure_blocks_seccomp_and_exec() {
+        take();
+        super::super::landlock::testing::fake_landlock_err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Validate,
+            "boom",
+        ));
+        let err = StagePipeline::new()
+            .with_landlock(landlock_fixture())
+            .unwrap()
+            .run_then(exec_ok)
+            .unwrap_err();
+        assert_eq!(err.stage, IsolationStage::Landlock);
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(take(), ["capability_drop", "no_new_privs", "landlock"]);
+    }
+
+    /// CORE-5・TASK-39.4: capability 削減が失敗したら Landlock は走らない。
+    #[test]
+    fn core5_capability_drop_failure_skips_landlock() {
+        take();
+        fake_capability_drop_err(SysError::Os(sys::EPERM));
+        let err = StagePipeline::new()
+            .with_landlock(landlock_fixture())
+            .unwrap()
+            .run_then(exec_ok)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(take(), ["capability_drop"]);
+    }
+
+    /// CORE-5・TASK-39.4: `with_landlock` と独自 Landlock フックは排他（どちらの順でも拒否）。
+    #[test]
+    fn core5_with_landlock_conflicts_with_custom_landlock_hook() {
+        let a = StagePipeline::new()
+            .with_hook(StageKind::Landlock, || Ok(()))
+            .unwrap()
+            .with_landlock(landlock_fixture())
+            .unwrap_err();
+        let b = StagePipeline::new()
+            .with_landlock(landlock_fixture())
+            .unwrap()
+            .with_hook(StageKind::Landlock, || Ok(()))
+            .unwrap_err();
+        for err in [a, b] {
+            assert_eq!(err.code, ErrorCode::InvalidArgument);
+            assert_eq!(err.stage, IsolationStage::Validate);
+            assert!(
+                err.message.contains("already registered"),
+                "{}",
+                err.message
+            );
+        }
     }
 
     /// CORE-5・TASK-38.3: seccomp は組み込みで、フックでは差し替えられない。

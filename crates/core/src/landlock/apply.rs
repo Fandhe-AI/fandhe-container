@@ -9,9 +9,9 @@
 //!
 //! # 呼び出し文脈・契約
 //!
-//! - 将来、ステージ列の Landlock 段（#184・TASK-39.4）が pivot_root 後・exec 直前の単一スレッドの子
-//!   プロセスから [`apply_landlock_ruleset`] を呼ぶ。`ExecError` / `IsolationStage` への写像は #184 で
-//!   行い、本モジュールは `ErrorCode` までを決める
+//! - ステージ列の Landlock 段（`exec/landlock.rs`・#184・TASK-39.4）が pivot_root 後・exec 直前の
+//!   単一スレッドの子プロセスから [`apply_landlock_ruleset`] を呼ぶ。`ExecError` / `IsolationStage` への
+//!   写像は `exec/landlock.rs` が行い、本モジュールは `ErrorCode` までを決める
 //! - `PR_SET_NO_NEW_PRIVS` は固定ステージ `no_new_privs`（TASK-27.4.3・#833）が先に立てる。本関数は
 //!   それを再度設定せず、立っていることを自前で検証する。カーネルは呼び出し元が user namespace 内で
 //!   `CAP_SYS_ADMIN` を持つと NNP 無しでも `landlock_restrict_self` を許すため、この検証が実際の防御になる
@@ -25,8 +25,8 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! ステージ列への組み込み（#184・TASK-39.4）は未実装。[`LandlockApplyReport`] は制限適用の証跡では
-//! なく、`require_restriction_evidence` の判定には使えない（証跡型は TASK-38・TASK-39 の後続）。
+//! ステージ列への組み込み口（`with_landlock`・#184）は実装済み。[`LandlockApplyReport`] は制限適用の証跡では
+//! なく、`require_restriction_evidence` の判定には使えない（証跡型の確定は後続作業）。
 
 use std::ffi::CString;
 use std::fmt;
@@ -289,8 +289,8 @@ impl LandlockKernel for RealKernel {
 /// 生成済みの ruleset を呼び出しスレッドへ適用する（CORE-5・TASK-39.3・#183。不可逆）。
 ///
 /// 前提検査（NNP・単一スレッド）は ruleset を作る前に行い、違反なら何も変えず、fd も作らない。
-/// 呼び出しは #184 のステージから単一スレッドの子プロセスで行う。
-// 組み込み（#184）までは結合試験用の観測関数だけが呼ぶため、テストビルドでは dead_code を許可する。
+/// 呼び出しは #184 のステージ（`exec/landlock.rs`）から単一スレッドの子プロセスで行う。
+// テストビルドでは `stages.rs` が偽物へ差し替えるため、本物は結合試験用の観測関数だけが呼ぶ。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn apply_landlock_ruleset(
     ruleset: &LandlockRuleset,

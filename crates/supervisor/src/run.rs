@@ -484,7 +484,8 @@ impl MonitoredWithCapture {
 /// 過去の捕捉で終端待ちが期限切れになり残ったリーダーも同じ予算に数えられ、上限に達していれば捕捉開始は
 /// `Unavailable`（`too many log reader threads are still alive`）で失敗して上記の開始失敗の扱いになる（REPAIR-5）。
 /// 呼び出し側は supervisor プロセスにつき 1 つの予算を、再起動・再捕捉をまたいで使い回すこと。
-/// 終端待ちが失敗（`Timeout` 等）した場合、捕捉は取り消され、以後 sink への追記は起きない。
+/// 終端待ちが失敗（`Timeout` 等）した場合、捕捉は取り消され、以後 sink への新しい追記は始まらない。
+/// sink の追記が止まっていても終端待ちは `drain_timeout` 以内に返る（[`LogCapture::drain`]）。
 pub fn monitor_with_capture(
     state: &mut SupervisedState,
     process: &dyn LaunchedProcess,

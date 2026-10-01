@@ -13,7 +13,10 @@
 //! - [`LogCapture::drain`] は期限付き（REPAIR-5）。期限切れ（孫プロセスがパイプを保持し続ける場合等）では
 //!   ブロック中の `Read` を外から中断する汎用手段がないため、リーダースレッドは切り離される。
 //!   `drain` は `Err` を返す全経路（期限切れ・溢れる timeout・リーダーの異常終了）で、返る前に捕捉を取り消す。
-//!   取消しは sink への追記と排他で、`drain` が `Err` を返した後は sink へ 1 行も追記されない。
+//!   取消しの要求後に新しい追記は始まらない。実行中だった追記（ストリームあたり高々 1 件）は期限の内側に取った
+//!   猶予（[`CANCEL_SETTLE_TIMEOUT`] 以下）だけ完了を待ち、待ち切れなければ待たずに返る（`drain` は sink が
+//!   止まっても `timeout` 以内に返る）。したがって `drain` が `Err` を返した後に sink へ届き得るのは、
+//!   返る時点で実行中だったその追記だけである。
 //!   リーダーは現在の `read` が戻った時点でスレッドとストリームを解放して終了する。
 //! - `read` が戻らない間に残るスレッド数は [`ReaderBudget`]（上限 [`MAX_LIVE_READERS`] 以下）で制限し、超える開始は
 //!   `Unavailable` で拒否する（孫プロセスがパイプを保持する場合の無制限なスレッド・ストリーム蓄積の防止。REPAIR-5）。
@@ -36,9 +39,9 @@
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
@@ -126,6 +129,12 @@ impl Drop for ReaderSlot {
     }
 }
 
+/// 取消し時に、実行中の sink 追記の完了を待つ猶予の上限。
+///
+/// [`LogCapture::drain`] は `timeout` の末尾からこの猶予（`timeout` の 1/4 が上限）を取り分け、EOF 待ちを
+/// その手前で打ち切る。猶予は `timeout` の内側にあるため、`drain` 全体は `timeout` を超えない。
+pub const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// [`MemoryLogSink`] の既定の保持上限（総バイト数）。
 pub const DEFAULT_MEMORY_SINK_BYTES: usize = 1024 * 1024;
 
@@ -189,8 +198,8 @@ impl OutputStreams {
 pub trait LogSink: Send + Sync {
     /// 1 行（LF 抜き・[`MAX_LINE_BYTES`] 以下）を追記する。失敗は構造化エラーで返す（panic しない）。
     ///
-    /// 有限時間で戻ること。[`LogCapture::drain`] の取消しは実行中の `append` の完了を待つため
-    /// （取消し後に追記が起きないことを保証するための排他）、戻らない `append` は `drain` を期限より長く止める。
+    /// 有限時間で戻ること。戻らない `append` はリーダースレッドとその枠（[`ReaderBudget`]）を占有し続け、
+    /// パイプが詰まってコンテナ側の write を止める。[`LogCapture::drain`] は `append` の完了を期限を超えて待たない。
     fn append(&self, stream: StreamKind, line: &[u8]) -> Result<(), TraitError>;
 }
 
@@ -334,44 +343,84 @@ impl CaptureSummary {
     }
 }
 
-/// 捕捉の取消し状態。リーダーは sink への追記のあいだ共有ロックを保持し、取消しは要求フラグを立ててから
-/// 排他ロックを取る。これにより「取消しが返った後は追記が 1 件も起きない」ことを保証する
-/// （確認と追記の間に取消しが返らない）。要求フラグを先に立てるので、取消しの要求後に新しい追記は始まらず、
-/// 取消しが待つのは実行中の追記（ストリームあたり高々 1 件）だけである（ロックの公平性に依存しない）。
+#[derive(Default)]
+struct GateState {
+    /// 取消しが要求済みか（以後、新しい追記を始めない）。
+    requested: bool,
+    /// 実行中の追記の数（ストリームあたり高々 1）。
+    in_flight: usize,
+}
+
+/// 捕捉の取消し状態。リーダーは追記の前後で実行中の件数を増減し、取消しは要求を立ててから
+/// 実行中の追記が 0 件になるのを期限付きで待つ。
+///
+/// 保証: 取消しの要求後に新しい追記は始まらない（要求の確認と件数の加算を同じロック内で行う）。
+/// 待機が期限内に終われば、返った後に sink へ届く追記は無い。期限切れなら実行中の追記
+/// （ストリームあたり高々 1 件）だけが後から完了し得る。ロックは追記の間は保持しないため、
+/// sink が止まっても取消しは期限で返る（REPAIR-5）。
 #[derive(Default)]
 struct CancelGate {
-    requested: AtomicBool,
-    appending: RwLock<()>,
+    state: Mutex<GateState>,
+    idle: Condvar,
+}
+
+/// 実行中の追記 1 件ぶん。drop（追記が panic した場合を含む）で件数を戻し、待機中の取消しを起こす。
+struct InFlight<'a>(&'a CancelGate);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let mut g = self.0.lock();
+        g.in_flight = g.in_flight.saturating_sub(1);
+        if g.in_flight == 0 {
+            self.0.idle.notify_all();
+        }
+    }
 }
 
 impl CancelGate {
-    /// 取消し済みにする。実行中の追記があれば、その完了を待ってから返る。
-    fn cancel(&self) {
-        self.requested.store(true, Ordering::SeqCst);
-        // 共有ロックを保持中（追記中）のリーダーが抜けるのを待つ。値は持たないので毒化は無視してよい。
-        drop(
-            self.appending
-                .write()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
+    /// 状態は整数と真偽値だけで、途中状態で壊れないため毒化は無視してよい。
+    fn lock(&self) -> MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 取消しを要求し、実行中の追記が無くなるのを `until` まで待つ。
+    /// 戻り値は、実行中の追記が無い状態で返ったか（`false` は期限切れで、実行中の追記が残っている）。
+    fn cancel(&self, until: Instant) -> bool {
+        let mut g = self.lock();
+        g.requested = true;
+        while g.in_flight > 0 {
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            g = self
+                .idle
+                .wait_timeout(g, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
     }
 
     /// 取消しが要求済みか。
     fn is_cancelled(&self) -> bool {
-        self.requested.load(Ordering::SeqCst)
+        self.lock().requested
     }
 
-    /// 取消し前なら `f` を実行して `Some`、取消し済みなら実行せず `None`。`f` の間は取消しを待たせる。
+    /// 取消しの要求前なら `f` を実行して `Some`、要求済みなら実行せず `None`。
+    /// `f` の間はロックを保持せず、実行中の件数として数える。
     fn run_unless_cancelled<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
-        let _appending = self
-            .appending
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
-        // 共有ロックの保持中に確認する（未要求なら、cancel はこのロックの解放まで返れない）。
-        if self.is_cancelled() {
-            return None;
-        }
-        Some(f())
+        let in_flight = {
+            let mut g = self.lock();
+            if g.requested {
+                return None;
+            }
+            g.in_flight = g.in_flight.saturating_add(1);
+            InFlight(self)
+        };
+        let out = f();
+        drop(in_flight);
+        Some(out)
     }
 }
 
@@ -492,24 +541,37 @@ impl LogCapture {
     /// 期限を表現できない `timeout`（`Duration::MAX` 等）は `InvalidArgument`。
     ///
     /// `Err` を返す全経路で、返る前に捕捉を取り消す（`self` を消費するため、呼び出し側は後から止められない）。
-    /// `Err` が返った後は sink へ 1 行も追記されず、リーダーは次に `read` が戻った時点で終了する（module doc 参照）。
+    /// 取消しの要求後に新しい追記は始まらず、リーダーは次に `read` が戻った時点で終了する。
+    ///
+    /// sink の追記が止まっていても `timeout` 以内に返る（REPAIR-5）。そのため `timeout` の末尾から猶予
+    /// （`timeout` の 1/4 と [`CANCEL_SETTLE_TIMEOUT`] の小さい方）を取り分け、EOF 待ちはその手前で打ち切り、
+    /// 猶予の間だけ実行中の追記の完了を待つ。猶予内に終わらなかった追記（ストリームあたり高々 1 件）だけは、
+    /// `Err` が返った後に完了し得る（module doc 参照）。
     pub fn drain(self, timeout: Duration) -> Result<CaptureSummary, TraitError> {
-        let result = self.wait_all(timeout);
-        if result.is_err() {
-            self.cancel.cancel();
-        }
-        result
-    }
-
-    /// [`LogCapture::drain`] の待機本体（取消しは呼び出し元が行う）。
-    fn wait_all(&self, timeout: Duration) -> Result<CaptureSummary, TraitError> {
+        let started = Instant::now();
         // Duration::MAX 等で加算が溢れても panic しない（公開 API のため直接呼ばれうる）。
-        let Some(deadline) = Instant::now().checked_add(timeout) else {
+        let Some(deadline) = started.checked_add(timeout) else {
+            // 期限を表現できない場合も取り消してから返す。待つのは固定の猶予まで。
+            let until = started
+                .checked_add(CANCEL_SETTLE_TIMEOUT)
+                .unwrap_or(started);
+            self.cancel.cancel(until);
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 "drain timeout is too large",
             ));
         };
+        let settle = (timeout / 4).min(CANCEL_SETTLE_TIMEOUT);
+        let eof_deadline = deadline.checked_sub(settle).unwrap_or(deadline);
+        let result = self.wait_all(eof_deadline);
+        if result.is_err() {
+            self.cancel.cancel(deadline);
+        }
+        result
+    }
+
+    /// [`LogCapture::drain`] の EOF 待ち本体（取消しは呼び出し元が行う）。
+    fn wait_all(&self, deadline: Instant) -> Result<CaptureSummary, TraitError> {
         let mut out = CaptureSummary::default();
         for _ in 0..self.expected {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -568,7 +630,7 @@ impl LineSplitter<'_> {
     }
 
     fn emit(&mut self) {
-        // 取消しの確認と追記を排他にする（確認後・追記前に取消しが返ることを防ぐ）。
+        // 取消しの確認と「実行中」の計上を不可分にする（要求後に新しい追記を始めない）。
         let Some(appended) = self
             .cancel
             .run_unless_cancelled(|| self.sink.append(self.kind, &self.buf))
@@ -756,40 +818,45 @@ mod tests {
         drop(writer);
     }
 
-    /// REPAIR-5・TASK-157.7: 取消しは実行中の追記の完了を待ち、取消しが返った後は追記が始まらない
-    /// （確認と追記の間に取消しが割り込まない）。
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(10)
+    }
+
+    /// REPAIR-5・TASK-157.7: 取消しの要求後は追記を実行しない。
     #[test]
-    fn sup1_task157_7_cancel_gate_excludes_append() {
+    fn sup1_task157_7_cancel_gate_rejects_append_after_cancel() {
         let gate = CancelGate::default();
         assert_eq!(gate.run_unless_cancelled(|| 7), Some(7));
         assert!(!gate.is_cancelled());
-        gate.cancel();
+        assert!(gate.cancel(far()));
         assert!(gate.is_cancelled());
         assert_eq!(gate.run_unless_cancelled(|| 7), None);
     }
 
-    /// 追記に 300ms かかる sink。追記に入ったことを `entered` で知らせ、完了した行だけを `done` に残す。
+    /// 追記に 20ms かかる sink。追記に入ったことを `entered` で知らせ、完了した行だけを `done` に残す。
     struct SlowSink {
-        entered: AtomicBool,
+        entered: Mutex<mpsc::Sender<()>>,
         done: Mutex<Vec<Vec<u8>>>,
     }
     impl LogSink for SlowSink {
         fn append(&self, _: StreamKind, line: &[u8]) -> Result<(), TraitError> {
-            self.entered.store(true, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(300));
+            let _ = self.entered.lock().unwrap().send(());
+            std::thread::sleep(Duration::from_millis(20));
             self.done.lock().unwrap().push(line.to_vec());
             Ok(())
         }
     }
 
-    /// REPAIR-5・TASK-157.7: 追記の実行中に drain が期限切れになった場合、drain は実行中の 1 行（"a"）の完了を待ってから
-    /// 返り、同じチャンクで読めていた次の行（"b"）は追記されない。返った時点の内容は以後も変わらない。
+    /// REPAIR-5・TASK-157.7: 溢れる timeout で取り消した時点で追記が実行中（20ms）なら、猶予（100ms）内の完了を待って
+    /// から返る。返った時点で実行中だった 1 行（"a"）は完了済みで、次の行（"b"）は追記されず、以後も変わらない。
     #[test]
     fn sup1_task157_7_drain_error_waits_for_in_flight_append_and_stops_the_rest() {
+        assert_eq!(CANCEL_SETTLE_TIMEOUT, Duration::from_millis(100));
         let budget = ReaderBudget::new(1).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let sink = Arc::new(SlowSink {
-            entered: AtomicBool::new(false),
+            entered: Mutex::new(entered_tx),
             done: Mutex::new(Vec::new()),
         });
         let cap = LogCapture::start(
@@ -798,12 +865,9 @@ mod tests {
         )
         .unwrap();
         writer.write_all(b"a\nb\n").unwrap();
-        let start = Instant::now();
-        while !sink.entered.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let err = cap.drain(Duration::from_millis(1)).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::Timeout);
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let err = cap.drain(Duration::MAX).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(*sink.done.lock().unwrap(), vec![b"a".to_vec()]);
         // 同じチャンクの残りを処理せずに終了するため、パイプを閉じなくても枠が戻る。
         assert_eq!(wait_live(&budget, 0), 0);

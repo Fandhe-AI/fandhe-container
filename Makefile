@@ -395,6 +395,31 @@ fio-baseline-ratio: ## fio ベースライン比を算出する（BASELINE/CANDI
 	bash scripts/fio-baseline-ratio.sh --baseline $(call fio_bench_sq,$(BASELINE)) --candidate $(call fio_bench_sq,$(CANDIDATE))
 
 # --------------------------------------------------
+# 起動時間計測（TASK-46.1・CORE-10・MS-2 Phase 3）
+# --------------------------------------------------
+# `scripts/bench/startup_latency.sh` は OCI Runtime CLI 契約のランタイムに対し
+# create からプロセス実行開始（state が running / stopped を返した時点）までの時間の
+# 中央値を計測する。own 実装の実測は CLI（TASK-79）
+# 提供後に人間が #213（TASK-46.h1）で行う実機前提（ランタイム・bundle・場合により root）
+# のため `make ci` には含めない。自己テストはスタブランタイムで完結し CI に組み込み済み
+# （計測スクリプトが単調時計として /proc/uptime を使うため Linux 限定）。
+.PHONY: startup-latency-selftest
+startup-latency-selftest: ## 起動時間計測スクリプトの自己テスト（REPAIR-12。実ランタイム不要）
+	@if ! command -v jq >/dev/null 2>&1; then \
+		echo "jq is required but not found: install it (e.g. brew install jq / apt-get install jq)" >&2; \
+		exit 1; \
+	fi
+	bash scripts/bench/startup_latency_selftest.sh
+
+.PHONY: startup-latency
+startup-latency: ## 起動時間を計測する（実機前提。RUNTIME=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須）
+	@if [ -z $(call fio_bench_sq,$(RUNTIME)) ] || [ -z $(call fio_bench_sq,$(BUNDLE)) ] || [ -z $(call fio_bench_sq,$(TARGET)) ]; then \
+		echo "usage: make startup-latency RUNTIME=<abs-path> BUNDLE=<dir> TARGET=<name, e.g. own> [ITERATIONS=<n>] [LABEL=<label>]" >&2; \
+		exit 2; \
+	fi
+	bash scripts/bench/startup_latency.sh --runtime $(call fio_bench_sq,$(RUNTIME)) --bundle $(call fio_bench_sq,$(BUNDLE)) --target $(call fio_bench_sq,$(TARGET)) --iterations $(call fio_bench_sq,$(or $(ITERATIONS),10)) --label $(call fio_bench_sq,$(or $(LABEL),$(TARGET)))
+
+# --------------------------------------------------
 # アイドル時常駐メモリ計測（TASK-45.1・CORE-7。Linux 限定。bash のみで完結）
 # --------------------------------------------------
 

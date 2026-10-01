@@ -512,6 +512,8 @@ jobs:
         run: make bench-check-selftest
       - name: baseline.json 生成スクリプトの自己テスト（TASK-88.1・REPAIR-8・REPAIR-12）
         run: make bench-baseline-selftest
+      - name: 起動時間計測スクリプトの自己テスト（TASK-46.1・CORE-10。スタブランタイムで実ランタイムは使わない）
+        run: make startup-latency-selftest
       # 疑似 /proc（mktemp -d 配下）だけで照合し、ランナーの実プロセスは計測しない。
       # 非 root で実行されるため chmod 000 を使う読み取り失敗ケースも実行される
       - name: アイドル時常駐メモリ計測スクリプトの自己テスト（TASK-45.1・CORE-7・SUP-1・REPAIR-12）

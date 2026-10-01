@@ -2010,8 +2010,17 @@ mod tests {
     #[test]
     fn err2_start_non_created_is_failed_precondition() {
         let (_b, store) = created("err2-twice");
+        let id = ContainerId::new("err2-twice").expect("id");
+        let rec = store.get(&GetStateRequest::new(id.clone())).expect("get");
+        // 1 回目の start は Linux 以外では rootfs 固定が未実装（Unimplemented）で成功しないため、
+        // 状態検査（rootfs 固定より前）だけを 3 OS で検証できるよう Running を直接設定する。
+        store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(id, std::num::NonZeroU32::new(4242)),
+                rec.revision(),
+            ))
+            .expect("mark running");
         let launcher = RecordingLauncher::new(false);
-        run(&store, &launcher, "err2-twice").expect("first start");
         let err = run(&store, &launcher, "err2-twice").expect_err("second start");
         assert_eq!(err.op(), LifecycleOp::Start);
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);

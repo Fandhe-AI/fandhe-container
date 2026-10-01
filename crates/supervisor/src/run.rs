@@ -17,7 +17,8 @@
 //! 2. 監視開始の記録: `supervisor_pid` に自プロセスの pid を書く（`health`・`restart_count` は既存値を保つ）。
 //! 3. ループ: 周回の先頭で停止要求を確認し、`wait(poll_interval)` で生存確認する。`Ok(None)` は生存、
 //!    `Ok(Some(_))` は終了（回収済み）、`Err` は握りつぶさずそのまま返す。
-//! 4. 終了の記録: `Stopped` と終了コードを書き、`supervisor_pid` を `None` に戻す。本 issue ではループ終了 =
+//! 4. 終了の記録: `Stopped` と終了コードを書き、`supervisor_pid` を `None` に戻す。回収後の書き込み失敗は
+//!    `Err` にせず [`MonitorOutcome::ExitedUnrecorded`] で終了状態ごと返す（プロセスは回収済みで再 wait 不可。回復は #239）。本 issue ではループ終了 =
 //!    監視なしのため。再起動で監視を続ける挙動は #239 が変更する。
 //! 5. 停止要求（[`StopToken`]）: 監視をやめるだけで、プロセスは終了させない。状態は `Running` のまま
 //!    `supervisor_pid` だけ `None` に戻す。
@@ -123,6 +124,15 @@ pub enum MonitorOutcome {
         /// 書き込み後のレコード。
         record: StateRecord,
     },
+    /// 終了を検知しプロセスは回収済みだが、`Stopped` の書き込みに失敗した（状態は `Running` のまま、
+    /// `supervisor_pid` も自 pid のまま残り得る）。再 `wait` はできないため、終了状態を失わないよう
+    /// `exit` と書き込み失敗の `error` を呼び出し側へ返す。回復（再書き込み・再起動判断）は #239（SUP-3）が扱う。
+    ExitedUnrecorded {
+        /// 起動ハンドルが回収した終了状態。
+        exit: ProcessExit,
+        /// 状態書き込みの失敗理由。
+        error: TraitError,
+    },
     /// 停止要求で監視をやめた（プロセスは kill せず、状態は `Running` のまま）。
     StopRequested {
         /// 書き込み後のレコード（`supervisor_pid` は `None`）。
@@ -170,13 +180,17 @@ pub fn monitor(
             Some(exit) => {
                 let code = exit_code_of(exit);
                 let id = state.id().clone();
-                let record = write_with_retry(state, pid, |rec| {
+                // 回収後は再 wait できないため、書き込み失敗でも終了状態を返す。
+                let written = write_with_retry(state, pid, |rec| {
                     (
                         ContainerStatus::stopped(id.clone(), code),
                         SupervisionState::new(None, rec.health(), rec.restart_count()),
                     )
-                })?;
-                return Ok(MonitorOutcome::Exited { exit, record });
+                });
+                return Ok(match written {
+                    Ok(record) => MonitorOutcome::Exited { exit, record },
+                    Err(error) => MonitorOutcome::ExitedUnrecorded { exit, error },
+                });
             }
         }
     }
@@ -416,22 +430,80 @@ mod tests {
         assert_eq!(exit_code_of(ProcessExit::Signaled(i32::MAX)), None);
     }
 
-    /// TASK-157.4: 監視開始時に supervisor_pid が自プロセスの pid で記録される（停止要求の直前に確認）。
+    /// TASK-157.4: 監視中（wait 内）に supervisor_pid が自プロセスの pid で記録されている。
     #[test]
     fn sup1_task157_4_records_supervisor_pid_while_alive() {
         let store = running_store(0);
         let mut s = attach(&store);
-        let p = FakeProc::alive();
-        let stop = StopToken::new();
-        // 周回中の状態を観測するため、別スレッドは使わず wait 内で観測する代わりに、
-        // 監視開始後のレコードを StopRequested の前段（revision 2）で確認する。
-        let before = store.rec.lock().unwrap().revision().value();
-        assert_eq!(before, 1);
-        stop.request_stop();
-        monitor(&mut s, &p, &MonitorConfig::default(), &stop).unwrap();
-        // 監視開始（rev 2）→ 停止要求による解除（rev 3）。
-        assert_eq!(store.rec.lock().unwrap().revision().value(), 3);
-        assert_eq!(store.updates.load(Ordering::SeqCst), 2);
+        let observed: Mutex<Vec<Option<NonZeroU32>>> = Mutex::new(Vec::new());
+        struct Obs<'a> {
+            store: &'a FakeStore,
+            observed: &'a Mutex<Vec<Option<NonZeroU32>>>,
+        }
+        impl LaunchedProcess for Obs<'_> {
+            fn pid(&self) -> NonZeroU32 {
+                pid(42)
+            }
+            fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+                let sp = self
+                    .store
+                    .rec
+                    .lock()
+                    .unwrap()
+                    .supervision()
+                    .supervisor_pid();
+                self.observed.lock().unwrap().push(sp);
+                Ok(Some(ProcessExit::Exited(0)))
+            }
+            fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+                Ok(())
+            }
+        }
+        let p = Obs {
+            store: &store,
+            observed: &observed,
+        };
+        let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![NonZeroU32::new(std::process::id())]
+        );
+        let MonitorOutcome::Exited { record, .. } = out else {
+            panic!("unexpected outcome")
+        };
+        assert_eq!(record.supervisor_pid(), None);
+    }
+
+    /// TASK-157.4: 回収後の書き込み失敗でも終了状態を失わず ExitedUnrecorded で返す。
+    #[test]
+    fn sup1_task157_4_exit_survives_write_failure() {
+        let store = running_store(0);
+        let mut s = attach(&store);
+        // 監視開始の書き込み後、終了の書き込みだけが競合し続けるよう wait 内で競合を仕込む。
+        struct Racy<'a>(&'a FakeStore);
+        impl LaunchedProcess for Racy<'_> {
+            fn pid(&self) -> NonZeroU32 {
+                pid(42)
+            }
+            fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+                *self.0.conflicts.lock().unwrap() = 100;
+                Ok(Some(ProcessExit::Exited(5)))
+            }
+            fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+                Ok(())
+            }
+        }
+        let p = Racy(&store);
+        let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
+        let MonitorOutcome::ExitedUnrecorded { exit, error } = out else {
+            panic!("unexpected outcome")
+        };
+        assert_eq!(exit, ProcessExit::Exited(5));
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            store.rec.lock().unwrap().status().state(),
+            ContainerState::Running
+        );
     }
 
     /// TASK-157.4: health・restart_count は終了後も保持される。

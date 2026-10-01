@@ -459,6 +459,9 @@ children=()
 ok_flags=()
 # docker モードの状態（TASK-50.2）。dk_active は最初のコンテナ起動を試みる直前から 1（on_exit が dk_stop を通す）。
 dk_active=0
+# on_exit（EXIT trap）に入ったら 1。dk_stop が後始末後にシグナル処理を戻してよいかの判定に使う。
+in_exit=0
+dk_sig=""
 dk_cpids=()
 dk_ids=()
 dk_pid=()
@@ -862,6 +865,7 @@ ln_stop() {
 # ln_stop は最大 20 秒ほど待つため、Ctrl+C の連打や外側 timeout の再送で launcher を残さない）。
 on_exit() {
   local rc=$?
+  in_exit=1
   # 先にシグナルを無処理にしてから EXIT trap を外す（逆順だと、その間に届いたシグナルの exit で
   # 後始末を通らずに終了する）。
   trap ':' TERM INT HUP
@@ -1424,7 +1428,13 @@ dk_measure_container() { # <i>
 dk_stop() {
   local f v p waited=0 alive owned=() rc=0 id o unowned=0 found
   [ "$dk_active" -eq 1 ] || return 0
-  dk_active=0
+  # 後始末の途中で TERM / INT / HUP を受けると on_signal 経由の exit で on_exit が走り、dk_active=0 の
+  # 状態では dk_stop が no-op になって cidfile・一時ディレクトリが消え、所有コンテナが残る。そのため
+  # 後始末の間はシグナルを記録だけして保留し（dk_sig）、dk_active は削除と残存確認が済むまで 1 のまま保つ。
+  dk_sig=""
+  trap 'dk_sig=143' TERM
+  trap 'dk_sig=130' INT
+  trap 'dk_sig=129' HUP
   # 起動中の docker run クライアントを先に終える（終了前の中断でコンテナが作られた後に ID を読むため）。
   while [ "$waited" -lt 50 ]; do
     alive=0
@@ -1462,6 +1472,16 @@ dk_stop() {
     rc=4
   fi
   rm -f -- "$tmpdir"/cid/*.cid "$tmpdir"/cid/*.err 2>/dev/null || true
+  dk_active=0
+  # 通常経路（試行間の後始末）ではシグナル処理を元に戻し、保留したシグナルがあれば今処理する
+  # （後始末は完了済みなので on_exit の dk_stop が no-op でも残存しない）。on_exit 内からの呼び出しでは
+  # 呼び出し元が設定した無処理（':'）のまま残す。
+  if [ "$in_exit" -eq 0 ]; then
+    trap 'on_signal 143' TERM
+    trap 'on_signal 130' INT
+    trap 'on_signal 129' HUP
+    if [ -n "$dk_sig" ]; then on_signal "$dk_sig"; fi
+  fi
   return "$rc"
 }
 

@@ -97,6 +97,14 @@ pub struct CapturedLine {
     pub bytes: Vec<u8>,
 }
 
+/// 1 行あたりの管理コスト（`CapturedLine`・`VecDeque` 要素の概算）。長さ 0 の行でも保持量へ計上し、
+/// 空行の連続出力による無制限なメモリ増加を防ぐ（非信頼出力への上限。REPAIR-5 の資源上限方針）。
+const LINE_OVERHEAD_BYTES: usize = 64;
+
+fn line_cost(len: usize) -> usize {
+    len.saturating_add(LINE_OVERHEAD_BYTES)
+}
+
 #[derive(Default)]
 struct MemoryInner {
     lines: VecDeque<CapturedLine>,
@@ -112,9 +120,9 @@ pub struct MemoryLogSink {
 }
 
 impl MemoryLogSink {
-    /// `capacity_bytes` が [`MAX_LINE_BYTES`] 未満なら `InvalidArgument`（1 行が保持できなくなるため）。
+    /// `capacity_bytes` が最大 1 行ぶん（[`MAX_LINE_BYTES`] + 行ごとの固定費）未満なら `InvalidArgument`（1 行が保持できなくなるため）。
     pub fn new(capacity_bytes: usize) -> Result<Self, TraitError> {
-        if capacity_bytes < MAX_LINE_BYTES {
+        if capacity_bytes < line_cost(MAX_LINE_BYTES) {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 "memory sink capacity is smaller than the maximum line size",
@@ -155,7 +163,8 @@ impl Default for MemoryLogSink {
 impl LogSink for MemoryLogSink {
     fn append(&self, stream: StreamKind, line: &[u8]) -> Result<(), TraitError> {
         let mut g = self.lock()?;
-        g.total_bytes = g.total_bytes.saturating_add(line.len());
+        // 空行でも 1 行ごとに固定費（LINE_OVERHEAD_BYTES）を計上し、行数が無制限に増えないようにする。
+        g.total_bytes = g.total_bytes.saturating_add(line_cost(line.len()));
         g.lines.push_back(CapturedLine {
             stream,
             bytes: line.to_vec(),
@@ -164,7 +173,7 @@ impl LogSink for MemoryLogSink {
             let Some(old) = g.lines.pop_front() else {
                 break;
             };
-            g.total_bytes = g.total_bytes.saturating_sub(old.bytes.len());
+            g.total_bytes = g.total_bytes.saturating_sub(line_cost(old.bytes.len()));
             g.dropped_lines = g.dropped_lines.saturating_add(1);
         }
         Ok(())
@@ -491,18 +500,29 @@ mod tests {
     /// TASK-157.7: メモリ sink は上限で古い行から捨てる。
     #[test]
     fn sup1_task157_7_memory_sink_is_bounded() {
-        let sink = MemoryLogSink::new(MAX_LINE_BYTES).unwrap();
+        let sink = MemoryLogSink::new(line_cost(MAX_LINE_BYTES)).unwrap();
         for _ in 0..3 {
             sink.append(StreamKind::Stdout, &[b'x'; 30_000]).unwrap();
         }
         assert_eq!(sink.snapshot().unwrap().len(), 2);
         assert_eq!(sink.dropped_lines().unwrap(), 1);
         assert_eq!(
-            MemoryLogSink::new(MAX_LINE_BYTES - 1)
+            MemoryLogSink::new(line_cost(MAX_LINE_BYTES) - 1)
                 .err()
                 .map(|e| e.code()),
             Some(ErrorCode::InvalidArgument)
         );
+    }
+
+    /// TASK-157.7: 空行の連続でも保持行数が上限に収まる（容量 65600 バイト・1 行 64 バイト計上で 1025 行）。
+    #[test]
+    fn sup1_task157_7_memory_sink_bounds_empty_lines() {
+        let sink = MemoryLogSink::new(line_cost(MAX_LINE_BYTES)).unwrap();
+        for _ in 0..5000 {
+            sink.append(StreamKind::Stdout, b"").unwrap();
+        }
+        assert_eq!(sink.snapshot().unwrap().len(), 1025);
+        assert_eq!(sink.dropped_lines().unwrap(), 5000 - 1025);
     }
 
     /// TASK-157.7: ストリーム未注入なら空の結果。

@@ -327,6 +327,21 @@ pub fn monitor_with_observer(
     stop: &StopToken,
     obs: &dyn MonitorObserver,
 ) -> Result<MonitorOutcome, TraitError> {
+    monitor_after_claim(state, process, config, stop, obs, &mut || Ok(()))
+}
+
+/// [`monitor_with_observer`] の本体。監視権の取得（`supervisor_pid` 記録）に成功した直後、待機ループへ入る前に
+/// `after_claim` を一度だけ呼ぶ。`after_claim` が `Err` なら記録済みの自 pid を戻して `Err` を返す。
+/// ログ捕捉（#241）を「監視権を得られた場合のみ」開始するための拡張点で、権限を得られなかった supervisor が
+/// 出力ストリームを消費しない（ログの欠落・重複を防ぐ）ことを保証する。
+fn monitor_after_claim(
+    state: &mut SupervisedState,
+    process: &dyn LaunchedProcess,
+    config: &MonitorConfig,
+    stop: &StopToken,
+    obs: &dyn MonitorObserver,
+    after_claim: &mut dyn FnMut() -> Result<(), TraitError>,
+) -> Result<MonitorOutcome, TraitError> {
     let pid = process.pid();
     if !is_running_with_pid(state.record(), pid) {
         return Err(precondition(
@@ -351,6 +366,14 @@ pub fn monitor_with_observer(
             ))
         })
     })?;
+
+    if let Err(e) = after_claim() {
+        // 監視を始められないので、記録済みの自 pid を残さない。解放失敗は元のエラーを優先する。
+        let _ = observed(obs, MonitorOperation::ReleaseAfterWaitError, || {
+            release_supervisor_pid(state, pid, self_pid)
+        });
+        return Err(e);
+    }
 
     loop {
         if stop.is_stop_requested() {
@@ -430,8 +453,8 @@ impl MonitoredWithCapture {
 
 /// [`monitor_with_observer`] に stdout / stderr の行単位捕捉（[`crate::logs`]。#241・TASK-157.7）を加える。
 ///
-/// 事前条件（`Running` かつ pid 一致）を満たさなければスレッドを起こさず `FailedPrecondition`。捕捉の開始に失敗しても
-/// 監視は始めず `Err`。プロセスの終了（`Exited` / `ExitedUnrecorded`）を検知したときだけ、`drain_timeout` を上限に
+/// 事前条件（`Running` かつ pid 一致）を満たさない、または他の supervisor が既に監視権を持つ場合は、スレッドを起こさず
+/// （ストリームを読まず）`FailedPrecondition`。捕捉は監視権の取得後に開始し、開始に失敗したら監視権を解放して `Err`。プロセスの終了（`Exited` / `ExitedUnrecorded`）を検知したときだけ、`drain_timeout` を上限に
 /// 全ストリームの EOF を待って集計を返す。`StopRequested` などプロセスが生存し得る結果では待たない
 /// （EOF が来ないため）。その場合リーダーは EOF まで走り sink への追記を続け、ストリームの所有権は捕捉側へ移っているため
 /// 監視の引き継ぎ時に再注入できない（#239・TASK-164 で扱う）。永続化・ローテーションは未実装（SUP-7・TASK-164）。
@@ -449,10 +472,18 @@ pub fn monitor_with_capture(
             "container is not running with the launched pid",
         ));
     }
-    let capture = observed(obs, MonitorOperation::CaptureStart, || {
-        LogCapture::start(streams, sink)
+    // 監視権の取得後に捕捉を開始する。権限を得られない場合・開始失敗の場合に出力ストリームを消費しない。
+    let mut streams = Some(streams);
+    let mut capture: Option<LogCapture> = None;
+    let outcome = monitor_after_claim(state, process, config, stop, obs, &mut || {
+        let Some(streams) = streams.take() else {
+            return Ok(());
+        };
+        capture = Some(observed(obs, MonitorOperation::CaptureStart, || {
+            LogCapture::start(streams, Arc::clone(&sink))
+        })?);
+        Ok(())
     })?;
-    let outcome = monitor_with_observer(state, process, config, stop, obs)?;
     let exited = matches!(
         outcome,
         MonitorOutcome::Exited { .. } | MonitorOutcome::ExitedUnrecorded { .. }
@@ -464,6 +495,13 @@ pub fn monitor_with_capture(
             capture_error: None,
         });
     }
+    let Some(capture) = capture else {
+        return Ok(MonitoredWithCapture {
+            outcome,
+            capture: None,
+            capture_error: None,
+        });
+    };
     let drained = observed(obs, MonitorOperation::CaptureDrain, || {
         capture.drain(config.drain_timeout())
     });
@@ -1196,6 +1234,40 @@ mod tests {
         assert!(sink.snapshot().unwrap().is_empty());
     }
 
+    /// TASK-157.7: 他の supervisor が監視中なら FailedPrecondition で、出力ストリームは 1 バイトも読まれない。
+    #[test]
+    fn sup1_task157_7_owned_by_other_supervisor_does_not_consume_streams() {
+        struct Spy(Arc<AtomicBool>);
+        impl std::io::Read for Spy {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(0)
+            }
+        }
+        let store = store_with(
+            ContainerStatus::running(cid(), Some(pid(42))),
+            SupervisionState::new(Some(pid(7)), None, 0),
+            0,
+        );
+        let mut s = attach(&store);
+        let read = Arc::new(AtomicBool::new(false));
+        let sink = Arc::new(crate::logs::MemoryLogSink::default());
+        let e = monitor_with_capture(
+            &mut s,
+            &FakeProc::alive(),
+            OutputStreams::new(Some(Box::new(Spy(read.clone()))), None),
+            sink.clone(),
+            &MonitorConfig::default(),
+            &StopToken::new(),
+            &StderrLogObserver,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!read.load(Ordering::SeqCst));
+        assert!(sink.snapshot().unwrap().is_empty());
+    }
+
     /// TASK-157.7: drain が Timeout でも監視結果は失われない。
     #[test]
     fn sup1_task157_7_drain_timeout_keeps_outcome() {
@@ -1252,8 +1324,8 @@ mod tests {
         assert_eq!(
             *rec.0.lock().unwrap(),
             vec![
-                (MonitorOperation::CaptureStart, None),
                 (MonitorOperation::Start, None),
+                (MonitorOperation::CaptureStart, None),
                 (MonitorOperation::Wait, None),
                 (MonitorOperation::RecordExit, None),
                 (MonitorOperation::CaptureDrain, None),

@@ -12,9 +12,9 @@
 //!   `EACCES` の写像まで。ワークロードの拒否の捕捉は #840）
 //! - TASK-41.2（#193 seccomp フック）・41.4（#195 マウント検証/API。
 //!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
-//! - 永続化・エンコード（JSON Lines 等）は TASK-41.5 系（#839）、カーネル監査連携・クラッシュ時の記録保持は
-//!   #840 の担当で、本モジュールは**未実装**（REPAIR-3: 実装済みを装わない）。`serde` の derive も未提供
-//!   （フィールド名がワイヤースキーマになるため #839 / #652 で決める）
+//! - ローカルファイルへの JSON Lines 書き込み（主経路）は `file_writer` で実装済み（TASK-41.5.1・#839）。
+//!   型自体に `serde` の derive は付けず、非公開 DTO でワイヤースキーマへ写す（#652 で共通ログ型へ統一予定）。
+//!   カーネル監査連携・クラッシュ時の記録保持は #840 の担当で**未実装**（REPAIR-3: 実装済みを装わない）
 //! - レイヤーごとのペイロードを [`AuditEvent`] の enum で持ち、「syscall の無い seccomp 違反」のような
 //!   不正な組み合わせを構築できない（REPAIR-2）。値は各 newtype の構築子が検証する
 //! - 秘密情報（資格情報・環境変数・namespace 識別子）は含めない。ホスト側の実パスを載せるかは各フックで判断する
@@ -25,7 +25,13 @@
 //! コンテナ ID を持たせるかは #193 以降で決める。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
 
+mod file_writer;
 mod landlock;
+
+pub use file_writer::{
+    AUDIT_LINE_MAX_BYTES, AuditFallback, AuditFileWriter, AuditWriteError, AuditWriteErrorKind,
+    AuditWriteFailure, AuditWriteOutcome, NoAuditFallback, encode_json_line, write_with_fallback,
+};
 
 pub use landlock::{LANDLOCK_DENIED_ERRNO, landlock_denial_record, landlock_denial_record_now};
 

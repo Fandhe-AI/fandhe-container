@@ -538,7 +538,7 @@ idle-memory-supervised: ## 監視プロセス込みのアイドル常駐メモ�
 	timeout --kill-after="$$k" "$$t" bash $(call fio_bench_sq,$(IDLE_MEMORY_SUPERVISED_SCRIPT)) "$$@" || rc=$$?; \
 	case "$$rc" in \
 		0|1|2|3) exit "$$rc" ;; \
-		124|137) echo "error: measurement-failed: timed out after $${t}s (measurement or cleanup stalled)" >&2; exit 3 ;; \
+		124|137) echo "error: measurement-failed: timed out after $${t}s" >&2; exit 3 ;; \
 		125|126|127) echo "error: invalid-input: cannot run the measurement under timeout (exit $$rc)" >&2; exit 2 ;; \
 		*) echo "error: measurement-failed: unexpected exit status $$rc" >&2; exit 3 ;; \
 	esac

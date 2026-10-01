@@ -134,7 +134,7 @@ fn is_unsafe_format_char(c: char) -> bool {
             | '\u{061C}'
             | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2060}'..='\u{206F}'
             | '\u{FEFF}'
     )
 }
@@ -304,6 +304,17 @@ mod tests {
             "a\u{202E}b\u{2066}c\u{2069}d\u{200F}e\u{061C}f\u{FEFF}g",
         );
         assert_eq!(e.message(), "a b c d e f g");
+    }
+
+    /// ERR-2: U+2060（WORD JOINER）・U+206A-U+206F（非推奨の書式制御）も空白へ置換される。
+    #[test]
+    fn err2_message_word_joiner_and_deprecated_format_chars_are_replaced() {
+        let e = OciRuntimeError::new(
+            LifecycleOp::Create,
+            ErrorCode::Internal,
+            "a\u{2060}b\u{206A}c\u{206F}d",
+        );
+        assert_eq!(e.message(), "a b c d");
     }
 
     /// ERR-2: 上限超過は文字境界で切り詰められる。

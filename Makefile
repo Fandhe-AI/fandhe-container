@@ -496,6 +496,47 @@ idle-memory: ## アイドル時常駐メモリ（プロセス数・PSS・RSS）�
 		*) echo "error: measurement-failed: unexpected exit status $$rc" >&2; exit 3 ;; \
 	esac
 
+.PHONY: idle-memory-supervised-selftest
+idle-memory-supervised-selftest: ## 監視プロセス込みアイドル常駐メモリ回帰テストの自己テスト（TASK-47・CORE-7・REPAIR-12）
+	bash scripts/bench/idle_memory_supervised_selftest.sh
+
+# 実機前提（root 権限の操作者が driver を渡して明示実行する。実 driver は製品バイナリ未提供のため現状なし。
+# make ci には含めない。ci.md「実機前提テスト」）。全体に timeout を掛け（REPAIR-5）、終了コードの変換規則は
+# idle-memory と同じ。IDLE_MEMORY_SUPERVISED_TIMEOUT は全体の秒数（1〜999999・既定 900）、
+# IDLE_MEMORY_SUPERVISED_CALL_TIMEOUT は driver・各計測 1 回あたりの秒数（未指定ならスクリプト既定）。
+# IDLE_MEMORY_SUPERVISED_SCRIPT は selftest が配線を stub で照合するための差し替え口。
+IDLE_MEMORY_SUPERVISED_TIMEOUT ?= 900
+IDLE_MEMORY_SUPERVISED_SCRIPT ?= scripts/bench/idle_memory_supervised.sh
+
+.PHONY: idle-memory-supervised
+idle-memory-supervised: ## 監視プロセス込みのアイドル常駐メモリ回帰テスト（DRIVER=<絶対パス> [EXPECTED_DIR=] [OUTPUT=]。CORE-7・Linux・実機前提）
+	@t=$(call fio_bench_sq,$(IDLE_MEMORY_SUPERVISED_TIMEOUT)); \
+	case "$$t" in ''|*[!0-9]*|???????*) t=invalid ;; esac; \
+	if [ "$$t" = invalid ] || [ "$$t" -eq 0 ]; then \
+		echo "error: invalid-argument: IDLE_MEMORY_SUPERVISED_TIMEOUT must be an integer from 1 to 999999 (seconds)" >&2; \
+		exit 2; \
+	fi; \
+	if [ -z $(call fio_bench_sq,$(DRIVER)) ]; then \
+		echo "error: invalid-argument: DRIVER=<absolute-path> is required (an executable taking 'up' / 'down'; see scripts/bench/idle_memory_supervised.sh)" >&2; \
+		exit 2; \
+	fi; \
+	if ! command -v timeout >/dev/null 2>&1; then \
+		echo "error: unsupported-os: timeout (coreutils) is required" >&2; \
+		exit 2; \
+	fi; \
+	set -- --driver $(call fio_bench_sq,$(DRIVER)); \
+	if [ -n $(call fio_bench_sq,$(EXPECTED_DIR)) ]; then set -- "$$@" --expected-dir $(call fio_bench_sq,$(EXPECTED_DIR)); fi; \
+	if [ -n $(call fio_bench_sq,$(OUTPUT)) ]; then set -- "$$@" --output $(call fio_bench_sq,$(OUTPUT)); fi; \
+	if [ -n $(call fio_bench_sq,$(IDLE_MEMORY_SUPERVISED_CALL_TIMEOUT)) ]; then set -- "$$@" --timeout $(call fio_bench_sq,$(IDLE_MEMORY_SUPERVISED_CALL_TIMEOUT)); fi; \
+	rc=0; \
+	timeout --kill-after=10 "$$t" bash $(call fio_bench_sq,$(IDLE_MEMORY_SUPERVISED_SCRIPT)) "$$@" || rc=$$?; \
+	case "$$rc" in \
+		0|1|2|3) exit "$$rc" ;; \
+		124|137) echo "error: measurement-failed: timed out after $${t}s" >&2; exit 3 ;; \
+		125|126|127) echo "error: invalid-input: cannot run the measurement under timeout (exit $$rc)" >&2; exit 2 ;; \
+		*) echo "error: measurement-failed: unexpected exit status $$rc" >&2; exit 3 ;; \
+	esac
+
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------

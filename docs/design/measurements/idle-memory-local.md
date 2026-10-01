@@ -104,3 +104,5 @@ timeout --kill-after=10 120 bash scripts/bench/idle_memory.sh --format json --ex
 - `--expected-dir` の指定方針をどうするか
 - CLI / supervisor 実装後に create → delete を経てゼロへ戻るか
 - ローカルの Docker の n=0 との比較（CORE-7）
+
+計測ハーネス（Agent 担当分・#214）: [`scripts/bench/idle_memory_supervised.sh`](../../../scripts/bench/idle_memory_supervised.sh)（`make idle-memory-supervised DRIVER=<絶対パス>`）が「0 個 → 監視プロセス込み 1 個 → 0 個」の 3 フェーズを計測し、0 へ戻ることを機械判定する。操作者が渡す driver（`up` / `down`）が必要だが、製品バイナリ（supervisor の入口・CLI。TASK-79）が未提供のため実 driver は現時点で存在せず、実機での確定値取得は本タスクの担当。実機では `EXPECTED_DIR` に配置ディレクトリを渡す。

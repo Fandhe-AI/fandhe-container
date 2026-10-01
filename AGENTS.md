@@ -62,6 +62,8 @@ make startup-latency RUNTIME=<abs-path> BUNDLE=<dir> TARGET=<name> [ITERATIONS=<
 make startup-latency-docker DOCKER=<abs-path> [TARGET=<name>] [IMAGE=<ref>] [ITERATIONS=<n>] [LABEL=<label>] [OUTPUT=<file>]  # `docker run --rm --pull never ... --entrypoint true <image>` 全体の起動時間の中央値を計測する（TASK-46.2・CORE-10。実機前提。イメージは事前に手動 pull）
 make startup-latency-report OWN_RESULT=<file> DOCKER_RESULT=<file> [OUTPUT=<file>]  # own（oci モード）と Docker の結果を 1 つのレポートに統合する（TASK-46.2。合否判定は出さない）
 make idle-memory-selftest   # アイドル時常駐メモリ計測スクリプトの自己テスト（TASK-45.1・CORE-7・SUP-1。疑似 /proc のみで実計測はしない。終了コード 0 かつ FAIL 行なし。Linux・非 root 限定で、root 実行は chmod 000 系のケースが成立しないため失敗する）
+make idle-memory-supervised-selftest   # 監視プロセス込みアイドル常駐メモリ回帰テストの自己テスト（TASK-47・CORE-7・SUP-1。スタブ計測・スタブ driver のみで実計測はしない。終了コード 0 かつ FAIL 行なし。Linux・非 root 限定）
+make idle-memory-supervised DRIVER=<abs-path> [EXPECTED_DIR=<dir>] [OUTPUT=<file>] [IDLE_MEMORY_SUPERVISED_TIMEOUT=<秒>]  # 0 個 → 監視プロセス込み 1 個 → 0 個の常駐メモリを計測し 0 へ戻ることを判定（実機前提・make ci 対象外。Linux・root の操作者が明示実行し、スクリプト内で sudo は呼ばない。DRIVER は `up` / `down` を受ける実行可能ファイルの絶対パスで、製品バイナリ〔TASK-79〕未提供のため現状は実 driver なし。実機では EXPECTED_DIR に配置ディレクトリを渡す）。終了コードは idle-memory と同じ契約（0 = 成功、1 = 期待違反、2 = 引数・入力エラー、3 = 計測失敗・driver 失敗）。make は失敗時に自身は 2 で終わるため、レシピの値は `Error <n>` 行で確認する
 make idle-memory [IDLE_MEMORY_TIMEOUT=<秒>]  # プロセス数・PSS・RSS を JSON 出力（ローカル実測は [idle-memory-local](docs/design/measurements/idle-memory-local.md)。Linux 限定・実機計測。timeout 付き〔既定 120 秒〕）。スクリプトの終了コード: 0 = 成功、1 = --expect-zero 違反（結果は公開しない）、2 = 引数・入力エラー・非 Linux・出力先エラー・timeout 配下で起動できない、3 = 計測失敗（読めない値・識別不能・timeout 超過・想定外の終了）。make は失敗時に自身は 2 で終わるため、レシピの値は `Error <n>` 行で確認する
 ```
 

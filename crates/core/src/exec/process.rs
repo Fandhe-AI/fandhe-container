@@ -265,7 +265,7 @@ fn require_restriction_evidence(
     Err(ExecError::new(
         ErrorCode::PermissionDenied,
         IsolationStage::Exec,
-        "refusing to exec: no evidence that the isolation restrictions were applied (the Landlock stage is not implemented yet)",
+        "refusing to exec: no evidence that the isolation restrictions were applied (wiring of restriction-applied evidence into exec is not implemented yet)",
     ))
 }
 

@@ -180,6 +180,25 @@ ifneq ($(HAS_CARGO),)
 		echo "NG: cargo verify-project が success を返しませんでした" >&2; \
 		exit 1; \
 	fi
+	@# crates/supervisor が workspace members から外れると `cargo test --workspace` が
+	@# crate 内の機械照合テストごと実行しなくなるため、workspace 外のここで登録を検証する
+	@# （TASK-157.1・#235・SUP-1・REPAIR-12）。
+	@# ディレクトリ存在と members 登録はそれぞれ必須とする。`cargo pkgid` は Cargo.lock の
+	@# resolve グラフを参照し members を見ないため使わず、`cargo metadata --no-deps`
+	@# （packages に workspace members のみを列挙する）の `manifest_path` が
+	@# crates/supervisor/Cargo.toml であるパッケージの有無で照合する。パッケージ名や
+	@# 他 member の dependencies に同名が残っていても通らないよう、依存エントリには
+	@# 現れない `manifest_path` キーのみを見る。Windows の cargo metadata はバックスラッシュ
+	@# 区切り（JSON 上は `\\`）を返すため、区切りは `/` と `\` の両方を受け付ける。
+	@[ -d crates/supervisor ] || { \
+		echo "NG: crates/supervisor が存在しません" >&2; \
+		exit 1; \
+	}
+	@cargo metadata --no-deps --format-version 1 2>/dev/null \
+		| grep -Eq '"manifest_path"[[:space:]]*:[[:space:]]*"[^"]*[/\\]+crates[/\\]+supervisor[/\\]+Cargo\.toml"' || { \
+		echo "NG: crates/supervisor が workspace members に登録されていません" >&2; \
+		exit 1; \
+	}
 else
 	@echo "skip: Cargo.toml 未追加のため check-workspace-manifest をスキップ"
 endif

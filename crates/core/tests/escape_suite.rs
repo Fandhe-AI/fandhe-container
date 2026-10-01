@@ -47,8 +47,11 @@
 //! `cargo test -p fandhe-container-core --test escape_suite -- --ignored`。実行された場合は分離の拒否・
 //! 事前条件の不成立を含めあらゆる失敗を失敗として扱い、検証せずに成功する分岐は持たない。ただし起動ユーザー
 //! （root / 非 root）で前提が成立しないケース（`LauncherRequirement`）は、そのケースだけを合格ではなく
-//! 「対象外」（`verdict=not-applicable`）として理由とビヘイビア ID を出力し、他のケースは実行する。AGENTS.md への
-//! 記載と CI での分離方式の確定は #204（TASK-42.6）で行う。
+//! 「対象外」（`verdict=not-applicable`）として理由とビヘイビア ID を出力し、他のケースは実行する。分離方式（TASK-42.6・#204）は
+//! `harness = false` ＋ `--ignored` 引数ゲートで確定（CLONE_NEWUSER は単一スレッド前提で libtest と相容れないため
+//! `#[ignore]` や feature flag は使わない）。既定の集合では自己テストのみ走る。CI の `integration-test` への
+//! 組み込みは ESC-04〜06 の既知失敗の解消と Landlock ABI 6+ runner の確保後に別 PR で行う。実行条件は AGENTS.md
+//! 「実機前提テスト」節を参照。
 //!
 //! # ESC-04〜ESC-06（TASK-42.3・#201・MS-2）
 //! - ESC-04（cgroup の `release_agent` 書き込み）・ESC-05（`/proc/sys`・`/proc/sysrq-trigger` 書き込み）は、

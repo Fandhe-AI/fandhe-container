@@ -6,7 +6,7 @@
 //! （TASK-38.1）が作る [`SeccompProgram`] を `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)` で呼び出し
 //! スレッドへ適用する。ステージ列（`StagePipeline`）へは TASK-38.3（#178）で組み込み済みで、
 //! `stages.rs` の組み込み段が [`apply_default_seccomp`] を exec 直前に必ず呼ぶ（差し替え不可）。
-//! 最終的な制限適用の証跡型の確定は後続作業ため、[`SeccompReport`] は証跡ではなく、
+//! 最終的な制限適用の証跡型の確定は後続作業のため、[`SeccompReport`] は証跡ではなく、
 //! `process.rs::require_restriction_evidence` は本関数の成否によらず exec を拒否し続ける（REPAIR-3）。
 //!
 //! # 契約

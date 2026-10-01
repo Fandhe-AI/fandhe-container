@@ -128,8 +128,10 @@ pub struct OciRuntimeError {
 
 impl OciRuntimeError {
     /// エラーを構築する。`message` はサニタイズ（制御文字の置換・長さ上限での切り詰め）して保持する。
-    pub fn new(op: LifecycleOp, code: ErrorCode, message: impl Into<String>) -> Self {
-        let raw: String = message.into();
+    pub fn new(op: LifecycleOp, code: ErrorCode, message: impl AsRef<str>) -> Self {
+        // `AsRef<str>` で借用のまま受け取り、入力全体を `String` へ複製しない
+        // （`&str` を `Into<String>` で受けると全量確保になるため）。
+        let raw: &str = message.as_ref();
         // 全量を複製せず、出力が上限に達するまでだけサニタイズして収集する
         // （untrusted な巨大メッセージによるメモリ・CPU の浪費を防ぐ）。
         let mut message = String::with_capacity(raw.len().min(OCI_ERROR_MESSAGE_MAX_BYTES));

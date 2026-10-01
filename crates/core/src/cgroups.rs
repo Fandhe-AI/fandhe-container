@@ -31,9 +31,10 @@
 //! # 実装済みの資源制限
 //! - `cpu.max`（TASK-32.3・#160）: [`ContainerCgroup::set_cpu_max`]（`cpu` サブモジュール。起動フローからは
 //!   未呼び出しで、結線は TASK-32.4・#161）
+//! - `memory.max` / `memory.swap.max`（TASK-32.2・#159）: [`ContainerCgroup::set_memory_limits`]
+//!   （起動フローからは未呼び出しで、結線は TASK-32.4）
 //!
 //! # 未実装（REPAIR-3）
-//! - `memory.max` / `memory.swap.max`（TASK-32.2・#159）の書き込み
 //! - `StageHook` 化・fork 後の子の `cgroup.procs` 参加・`ExecError` への変換（TASK-32.4・#161）
 //! - OCI `linux.cgroupsPath` の反映、delete 時の cgroup 削除の結線（TASK-30 系）
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
@@ -93,6 +94,8 @@ pub enum CgroupStep {
     EnableControllers,
     /// 失敗後の後始末。
     Cleanup,
+    /// `memory.max` / `memory.swap.max` の設定（TASK-32.2）。
+    SetMemoryLimit,
     /// `cpu.max` の検証・書き込み・読み戻し。
     SetCpuMax,
 }
@@ -1062,6 +1065,232 @@ fn check_owned_by(dir: &OwnedFd, euid: u32) -> Result<(), CgroupError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// メモリ上限（CORE-3・TASK-32.2・#159）
+// ---------------------------------------------------------------------------------------------
+
+/// 上限文字列の最大バイト数（パース前に検証し、巨大入力の処理を避ける）。
+const MEMORY_LIMIT_INPUT_MAX: usize = 32;
+
+/// cgroup v2 のメモリ上限値（`memory.max` / `memory.swap.max` に書く値。CORE-3）。
+///
+/// `Bytes` は `0..=i64::MAX` に制限する（カーネルの page counter 上限に張り付く値を避ける）。
+/// OCI `linux.resources.memory` の `-1`（無制限）・未指定の写像は呼び出し側（TASK-32.4・#161 以降）の
+/// 責務で、本型は受け取った値を検証して正規形で書くだけを担う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryLimit {
+    /// 無制限（`max`）。
+    Max,
+    /// バイト数（`0..=i64::MAX`）。
+    Bytes(u64),
+}
+
+fn memory_invalid(message: impl Into<String>) -> CgroupError {
+    CgroupError::new(
+        ErrorCode::InvalidArgument,
+        CgroupStep::SetMemoryLimit,
+        message,
+    )
+}
+
+impl MemoryLimit {
+    /// バイト数から作る。`i64::MAX` 超は `InvalidArgument`。
+    pub fn bytes(n: u64) -> Result<Self, CgroupError> {
+        if i64::try_from(n).is_err() {
+            return Err(memory_invalid("memory limit exceeds i64::MAX"));
+        }
+        Ok(Self::Bytes(n))
+    }
+
+    /// 文字列から作る。受理するのは `max`・10 進数字列・10 進数字列＋単一サフィックス
+    /// （`k`/`m`/`g`/`t`、大文字小文字可、1024 進）のみ。負数・符号・空白・小数・未知のサフィックス・
+    /// オーバーフローは `InvalidArgument`（CORE-3）。
+    pub fn parse(s: &str) -> Result<Self, CgroupError> {
+        if s.len() > MEMORY_LIMIT_INPUT_MAX {
+            return Err(memory_invalid("memory limit string is too long"));
+        }
+        if s == "max" {
+            return Ok(Self::Max);
+        }
+        if s.starts_with('-') {
+            return Err(memory_invalid("memory limit must not be negative"));
+        }
+        let (digits, shift) = match s.char_indices().last() {
+            Some((i, c)) if !c.is_ascii_digit() => {
+                let shift = match c {
+                    'k' | 'K' => 10u32,
+                    'm' | 'M' => 20,
+                    'g' | 'G' => 30,
+                    't' | 'T' => 40,
+                    _ => return Err(memory_invalid("unknown memory limit suffix")),
+                };
+                (s.get(..i).unwrap_or(""), shift)
+            }
+            _ => (s, 0),
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(memory_invalid("memory limit must be decimal digits"));
+        }
+        let n: u64 = digits
+            .parse()
+            .map_err(|_| memory_invalid("memory limit is out of range"))?;
+        let bytes = n
+            .checked_mul(1u64 << shift)
+            .ok_or_else(|| memory_invalid("memory limit is out of range"))?;
+        Self::bytes(bytes)
+    }
+
+    /// 値が `0..=i64::MAX`（または `Max`）であることを再確認して返す。
+    fn validated(self) -> Result<Self, CgroupError> {
+        match self {
+            Self::Max => Ok(self),
+            Self::Bytes(n) => Self::bytes(n),
+        }
+    }
+
+    /// カーネルへ書く正規形（呼び出し元の文字列はカーネルへ渡さない）。
+    fn render(self) -> String {
+        match self {
+            Self::Max => "max".to_string(),
+            Self::Bytes(n) => n.to_string(),
+        }
+    }
+}
+
+impl TryFrom<i64> for MemoryLimit {
+    type Error = CgroupError;
+
+    /// 負数は `InvalidArgument`。OCI の `-1`（無制限）の意味付けは呼び出し側で行う。
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        let n = u64::try_from(value)
+            .map_err(|_| memory_invalid("memory limit must not be negative"))?;
+        Self::bytes(n)
+    }
+}
+
+/// メモリ上限の設定要求。`swap_max` が `None` なら `memory.swap.max` には触れない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryLimits {
+    /// `memory.max` に書く値。
+    pub memory_max: MemoryLimit,
+    /// `memory.swap.max` に書く値（CORE-3 の例では `Bytes(0)`）。
+    pub swap_max: Option<MemoryLimit>,
+}
+
+/// 書き込み後に読み戻した実効値（カーネルは値をページ境界へ切り下げる）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AppliedMemoryLimits {
+    /// 読み戻した `memory.max`。
+    pub memory_max: MemoryLimit,
+    /// 読み戻した `memory.swap.max`（要求しなかった場合は `None`）。
+    pub swap_max: Option<MemoryLimit>,
+}
+
+/// カーネルが返す `memory.max` 系の値（`max` または 10 進）を解析する。
+fn parse_kernel_limit(text: &str) -> Result<MemoryLimit, CgroupError> {
+    let step = CgroupStep::SetMemoryLimit;
+    let t = text.trim_end_matches('\n');
+    if t == "max" {
+        return Ok(MemoryLimit::Max);
+    }
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(CgroupError::precondition(
+            step,
+            "unexpected memory limit value read back from the kernel",
+        ));
+    }
+    let n: u64 = t.parse().map_err(|_| {
+        CgroupError::precondition(
+            step,
+            "memory limit read back from the kernel is out of range",
+        )
+    })?;
+    Ok(MemoryLimit::Bytes(n))
+}
+
+/// 要求値と読み戻した実効値を照合し、実効値を返す。カーネルはページ境界へ切り下げるため
+/// `Bytes` は実効値が要求以下であれば成功とし、要求を上回る・`max` への化けは `FailedPrecondition`。
+fn verify_effective(
+    requested: MemoryLimit,
+    effective: MemoryLimit,
+) -> Result<MemoryLimit, CgroupError> {
+    let ok = match (requested, effective) {
+        (MemoryLimit::Max, MemoryLimit::Max) => true,
+        (MemoryLimit::Bytes(req), MemoryLimit::Bytes(eff)) => eff <= req,
+        _ => false,
+    };
+    if ok {
+        Ok(effective)
+    } else {
+        Err(CgroupError::precondition(
+            CgroupStep::SetMemoryLimit,
+            "effective memory limit does not satisfy the request",
+        ))
+    }
+}
+
+impl ContainerCgroup {
+    /// 子 cgroup の `memory.max`（および要求があれば `memory.swap.max`）を設定し、読み戻した実効値を返す。
+    ///
+    /// 呼び出し文脈: 起動フロー（TASK-32.4・#161）が `enable_controllers` の後・子プロセス参加の前に
+    /// 呼ぶ予定。`enabled` はその戻り値で、`memory` が含まれなければ書き込まず `FailedPrecondition`。
+    /// 書き込み順は `memory.max` → `memory.swap.max`。途中で失敗しても巻き戻さない（子 cgroup は空で、
+    /// 呼び出し側が `DelegatedCgroup::remove_child` で削除する前提）。値は検証済みの正規形のみ書く。
+    pub fn set_memory_limits(
+        &self,
+        enabled: &ControllerSet,
+        limits: &MemoryLimits,
+    ) -> Result<AppliedMemoryLimits, CgroupError> {
+        if !enabled.contains(Controller::Memory) {
+            return Err(CgroupError::precondition(
+                CgroupStep::SetMemoryLimit,
+                "memory controller is not enabled for the container cgroup",
+            ));
+        }
+        // 公開バリアント `Bytes(u64)` は直接構築できるため、書き込み前に両値を再検証する
+        // （`i64::MAX` 超を memory.max / memory.swap.max へ渡さない。部分書き込みも避ける）。
+        let memory_max_req = limits.memory_max.validated()?;
+        let swap_max_req = limits.swap_max.map(MemoryLimit::validated).transpose()?;
+        let memory_max = self.write_memory_file("memory.max", memory_max_req)?;
+        let swap_max = match swap_max_req {
+            Some(req) => Some(self.write_memory_file("memory.swap.max", req)?),
+            None => None,
+        };
+        Ok(AppliedMemoryLimits {
+            memory_max,
+            swap_max,
+        })
+    }
+
+    /// `file` へ正規形を書き、読み戻して要求を満たすことを確認する。ファイル不在は controller 未有効
+    /// （または swap accounting 無効）として `FailedPrecondition`（fail-closed）。
+    fn write_memory_file(
+        &self,
+        file: &str,
+        requested: MemoryLimit,
+    ) -> Result<MemoryLimit, CgroupError> {
+        let step = CgroupStep::SetMemoryLimit;
+        let name = cstring(step, file)?;
+        let wfd = match sys::open_write_at(self.fd.as_fd(), &name) {
+            Ok(fd) => fd,
+            Err(SysError::Os(errno)) if errno == sys::ENOENT => {
+                return Err(CgroupError::precondition(
+                    step,
+                    format!("{file} does not exist (controller or swap accounting is unavailable)"),
+                ));
+            }
+            Err(e) => return Err(sys_error(step, file, e)),
+        };
+        File::from(wfd)
+            .write_all(requested.render().as_bytes())
+            .map_err(|e| io_error(step, file, &e))?;
+        let effective =
+            parse_kernel_limit(&read_iface(step, self.fd.as_fd(), file, SMALL_FILE_LIMIT)?)?;
+        verify_effective(requested, effective)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1268,5 +1497,124 @@ mod tests {
             &Evacuated,
             &ControllerSet,
         ) -> Result<ControllerSet, CgroupError> = DelegatedCgroup::enable_controllers;
+    }
+
+    fn mem_err(r: Result<MemoryLimit, CgroupError>) -> (ErrorCode, CgroupStep) {
+        let e = r.expect_err("must be rejected");
+        (e.code, e.step)
+    }
+
+    #[test]
+    fn core3_task32_2_parse_accepts() {
+        let cases: [(&str, MemoryLimit); 6] = [
+            ("max", MemoryLimit::Max),
+            ("67108864", MemoryLimit::Bytes(67_108_864)),
+            ("64M", MemoryLimit::Bytes(67_108_864)),
+            ("64m", MemoryLimit::Bytes(67_108_864)),
+            ("1G", MemoryLimit::Bytes(1_073_741_824)),
+            ("0", MemoryLimit::Bytes(0)),
+        ];
+        for (s, want) in cases {
+            assert_eq!(MemoryLimit::parse(s).expect(s), want, "{s}");
+        }
+        assert_eq!(
+            MemoryLimit::parse("9223372036854775807").expect("max i64"),
+            MemoryLimit::Bytes(i64::MAX as u64)
+        );
+    }
+
+    #[test]
+    fn core3_task32_2_parse_rejects() {
+        let long = "1".repeat(MEMORY_LIMIT_INPUT_MAX + 1);
+        let cases = [
+            "-1",
+            "-64M",
+            "+5",
+            "",
+            " 64",
+            "64 ",
+            "64MB",
+            "64X",
+            "64KiB",
+            "1.5G",
+            "M",
+            "9223372036854775808",
+            "9999999999T",
+            long.as_str(),
+        ];
+        for s in cases {
+            assert_eq!(
+                mem_err(MemoryLimit::parse(s)),
+                (ErrorCode::InvalidArgument, CgroupStep::SetMemoryLimit),
+                "{s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn core3_task32_2_try_from_i64() {
+        assert!(MemoryLimit::try_from(-1i64).is_err());
+        assert!(MemoryLimit::try_from(i64::MIN).is_err());
+        assert_eq!(
+            MemoryLimit::try_from(0i64).expect("0"),
+            MemoryLimit::Bytes(0)
+        );
+        assert_eq!(
+            MemoryLimit::try_from(67_108_864i64).expect("64MiB"),
+            MemoryLimit::Bytes(67_108_864)
+        );
+        assert!(MemoryLimit::bytes(u64::MAX).is_err());
+    }
+
+    /// CORE-3・TASK-32.2: 公開バリアントを直接構築した範囲外の値も書き込み前の再検証で拒否する。
+    #[test]
+    fn core3_task32_2_validated_rejects_directly_built_out_of_range() {
+        assert_eq!(
+            MemoryLimit::Bytes(i64::MAX as u64)
+                .validated()
+                .expect("i64::MAX"),
+            MemoryLimit::Bytes(i64::MAX as u64)
+        );
+        assert_eq!(MemoryLimit::Max.validated().expect("max"), MemoryLimit::Max);
+        for n in [i64::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(
+                mem_err(MemoryLimit::Bytes(n).validated()),
+                (ErrorCode::InvalidArgument, CgroupStep::SetMemoryLimit),
+                "{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn core3_task32_2_render_is_canonical() {
+        assert_eq!(MemoryLimit::Max.render(), "max");
+        assert_eq!(MemoryLimit::Bytes(67_108_864).render(), "67108864");
+        assert_eq!(MemoryLimit::parse("64M").expect("64M").render(), "67108864");
+    }
+
+    #[test]
+    fn core3_task32_2_parse_kernel_limit() {
+        assert_eq!(parse_kernel_limit("max\n").expect("max"), MemoryLimit::Max);
+        assert_eq!(
+            parse_kernel_limit("67108864\n").expect("num"),
+            MemoryLimit::Bytes(67_108_864)
+        );
+        for s in ["abc\n", "", "-1\n", "\n"] {
+            let e = parse_kernel_limit(s).expect_err(s);
+            assert_eq!(e.code, ErrorCode::FailedPrecondition, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn core3_task32_2_verify_effective() {
+        use MemoryLimit::{Bytes, Max};
+        assert_eq!(
+            verify_effective(Bytes(10_000), Bytes(8192)).expect("floor"),
+            Bytes(8192)
+        );
+        assert_eq!(verify_effective(Max, Max).expect("max"), Max);
+        assert!(verify_effective(Bytes(4096), Bytes(8192)).is_err());
+        assert!(verify_effective(Max, Bytes(1)).is_err());
+        assert!(verify_effective(Bytes(1), Max).is_err());
     }
 }

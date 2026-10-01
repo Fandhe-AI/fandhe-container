@@ -666,12 +666,29 @@ mod tests {
         }
     }
 
-    struct SlowProbe;
+    /// `cancel` が呼ばれるまで戻らず、戻るときは Healthy を返す probe。
+    ///
+    /// 壁時計の sleep に依存すると、負荷の高い runner で呼び出し側の待ち開始が遅れ、期限内に結果が
+    /// 届いてしまう。cancel（= 期限超過の確定）を待つことで判定を決定的にする（REPAIR-5）。
+    struct SlowProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    impl SlowProbe {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        }
+    }
 
     impl HealthProbe for SlowProbe {
-        fn probe(&self, t: Duration) -> Result<HealthStatus, TraitError> {
-            std::thread::sleep(t + Duration::from_millis(20));
+        fn probe(&self, _: Duration) -> Result<HealthStatus, TraitError> {
+            // 安全弁: cancel が来なくてもテストがハングしないよう上限を設ける。
+            let limit = std::time::Instant::now() + Duration::from_secs(10);
+            while !self.0.load(Ordering::SeqCst) && std::time::Instant::now() < limit {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             Ok(HealthStatus::Healthy)
+        }
+        fn cancel(&self) {
+            self.0.store(true, Ordering::SeqCst);
         }
     }
 
@@ -712,7 +729,7 @@ mod tests {
         let e = probe_and_record(
             &mut s,
             &FakeProc,
-            &ProbeRunner::new(Arc::new(SlowProbe)),
+            &ProbeRunner::new(Arc::new(SlowProbe::new())),
             Duration::from_millis(10),
             &obs,
         )

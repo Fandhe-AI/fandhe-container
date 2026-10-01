@@ -34,7 +34,7 @@ fn sec4_task41_1_three_layers_are_representable() {
         ts(),
         pid,
         AuditEvent::Landlock {
-            path: AuditPath::new("/etc/passwd").unwrap(),
+            path: AuditPath::new("/etc/passwd"),
             syscall: None,
         },
     );
@@ -60,8 +60,8 @@ fn sec4_task41_1_invalid_values_cannot_be_constructed() {
         AuditSyscallNr::new(-5).unwrap_err().kind(),
         AuditRecordErrorKind::SyscallNegative
     );
-    assert_eq!(
-        AuditPath::new("").unwrap_err().kind(),
-        AuditRecordErrorKind::PathEmpty
-    );
+    // 拒否される不正パスも記録可能（SEC-4）。
+    let empty = AuditPath::new("");
+    assert_eq!(empty.as_path(), Path::new(""));
+    assert!(!empty.is_truncated());
 }

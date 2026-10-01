@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::seccomp::SyscallNr;
 use crate::traits::ErrorCode;
 
-/// [`AuditPath`] のバイト長上限（Linux の `PATH_MAX` に合わせる。無制限確保の防止）。
+/// [`AuditPath`] が保持するバイト長の上限（Linux の `PATH_MAX` に合わせる。超過分は切り詰める）。
 pub const AUDIT_PATH_MAX_BYTES: usize = 4096;
 
 /// 監査レコード構築エラーの分類。
@@ -42,12 +42,6 @@ pub enum AuditRecordErrorKind {
     PidNotPositive,
     /// syscall 番号が負。
     SyscallNegative,
-    /// パスが空。
-    PathEmpty,
-    /// パスに NUL バイトが含まれる。
-    PathContainsNul,
-    /// パスが [`AUDIT_PATH_MAX_BYTES`] を超える。
-    PathTooLong,
     /// 時計が UNIX エポックより前を指している。
     ClockBeforeEpoch,
 }
@@ -82,9 +76,6 @@ impl AuditRecordError {
         match self.kind {
             AuditRecordErrorKind::PidNotPositive => "audit pid must be positive",
             AuditRecordErrorKind::SyscallNegative => "audit syscall number must not be negative",
-            AuditRecordErrorKind::PathEmpty => "audit path must not be empty",
-            AuditRecordErrorKind::PathContainsNul => "audit path must not contain NUL",
-            AuditRecordErrorKind::PathTooLong => "audit path exceeds the length limit",
             AuditRecordErrorKind::ClockBeforeEpoch => "system clock is before the UNIX epoch",
         }
     }
@@ -178,41 +169,60 @@ impl AuditTimestamp {
     }
 }
 
-/// 違反対象のパス。生のパスを保持する。
+/// 違反対象のパス。拒否された入力そのものを記録するため、不正なパスも受け入れる（SEC-4）。
 ///
-/// 改行・制御文字を含みうるため、出力時は書き込み側（#839）が必ずエスケープすること
-/// （ログ注入対策。`ViolationSubject` と同じ方針）。相対パスの指定自体が拒否される違反の試行であり
-/// SEC-4 の 100% 記録の対象なので、絶対パスは要求しない。
+/// 空・NUL 含有・[`AUDIT_PATH_MAX_BYTES`] 超のパスはまさにマウント検証等で拒否される入力であり、
+/// 構築を拒否すると拒否試行の記録（100%）が失われる。そのため構築は失敗せず、上限超過分は
+/// UTF-8 文字境界で切り詰めて保持し（`ViolationSubject::from_path` と同じ方針）、
+/// 元のバイト長を [`AuditPath::original_len`] で残す。
+///
+/// 改行・制御文字・NUL を含みうるため、出力時は書き込み側（#839）が必ずエスケープすること
+/// （ログ注入対策）。相対パスも要求しない。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuditPath(PathBuf);
+pub struct AuditPath {
+    path: PathBuf,
+    original_len: usize,
+}
 
 impl AuditPath {
-    /// 空でなく・NUL を含まず・[`AUDIT_PATH_MAX_BYTES`] 以下のパスから構築する。
+    /// 任意のパスから構築する（失敗しない）。
     ///
-    /// 借用のまま検証し、合格した場合のみ `PathBuf` を確保する（上限超過の未信頼入力で
-    /// 確保が先行する DoS を防ぐ）。
-    pub fn new<P: AsRef<Path> + ?Sized>(path: &P) -> Result<Self, AuditRecordError> {
+    /// 上限以下ならそのまま保持する。超過時のみ lossy UTF-8 に変換した上で文字境界まで切り詰める
+    /// （非 UTF-8 バイトは U+FFFD に置換される）。保持バイト長は常に [`AUDIT_PATH_MAX_BYTES`] 以下。
+    pub fn new<P: AsRef<Path> + ?Sized>(path: &P) -> Self {
         let path = path.as_ref();
-        // OS 非依存にバイト列で検査する（Windows でもコンパイルできるようにする）。
-        let bytes = path.as_os_str().as_encoded_bytes();
-        let kind = if bytes.is_empty() {
-            Some(AuditRecordErrorKind::PathEmpty)
-        } else if bytes.contains(&0) {
-            Some(AuditRecordErrorKind::PathContainsNul)
-        } else if bytes.len() > AUDIT_PATH_MAX_BYTES {
-            Some(AuditRecordErrorKind::PathTooLong)
-        } else {
-            None
-        };
-        match kind {
-            Some(k) => Err(AuditRecordError::new(k)),
-            None => Ok(Self(path.to_path_buf())),
+        let original_len = path.as_os_str().as_encoded_bytes().len();
+        if original_len <= AUDIT_PATH_MAX_BYTES {
+            return Self {
+                path: path.to_path_buf(),
+                original_len,
+            };
+        }
+        let lossy = path.to_string_lossy();
+        let mut end = AUDIT_PATH_MAX_BYTES.min(lossy.len());
+        while end > 0 && !lossy.is_char_boundary(end) {
+            end -= 1;
+        }
+        let kept = lossy.get(..end).unwrap_or("");
+        Self {
+            path: PathBuf::from(kept),
+            original_len,
         }
     }
 
-    /// パスを返す。
+    /// 保持しているパス（切り詰め後の場合あり）を返す。
     pub fn as_path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+
+    /// 元のパスのバイト長を返す。
+    pub fn original_len(&self) -> usize {
+        self.original_len
+    }
+
+    /// 上限超過で切り詰められたか。
+    pub fn is_truncated(&self) -> bool {
+        self.original_len > AUDIT_PATH_MAX_BYTES
     }
 }
 
@@ -365,7 +375,7 @@ mod tests {
 
     #[test]
     fn sec4_task41_1_landlock_record_with_and_without_syscall() {
-        let p = AuditPath::new("/etc/shadow").unwrap();
+        let p = AuditPath::new("/etc/shadow");
         let with = AuditRecord::new(
             ts(),
             pid(7),
@@ -395,7 +405,7 @@ mod tests {
             ts(),
             pid(9),
             AuditEvent::Mount {
-                path: Some(AuditPath::new("/proc/sys").unwrap()),
+                path: Some(AuditPath::new("/proc/sys")),
             },
         );
         assert_eq!(with.layer(), AuditLayer::Mount);
@@ -435,27 +445,38 @@ mod tests {
     }
 
     #[test]
-    fn sec4_task41_1_path_validation() {
-        assert_eq!(
-            AuditPath::new("").unwrap_err().kind(),
-            AuditRecordErrorKind::PathEmpty
+    fn sec4_task41_1_path_accepts_rejected_inputs() {
+        // 拒否される入力そのものも記録できる（SEC-4 の 100% 記録）。
+        let empty = AuditPath::new("");
+        assert_eq!(empty.as_path(), Path::new(""));
+        assert!(!empty.is_truncated());
+        let nul = AuditPath::new("/a\0b");
+        assert_eq!(nul.as_path(), Path::new("/a\0b"));
+        assert_eq!(nul.original_len(), 4);
+        assert_eq!(AuditPath::new("rel/path").as_path(), Path::new("rel/path"));
+        let exact = AuditPath::new(&"a".repeat(AUDIT_PATH_MAX_BYTES));
+        assert!(!exact.is_truncated());
+        assert_eq!(exact.as_path().as_os_str().len(), AUDIT_PATH_MAX_BYTES);
+    }
+
+    #[test]
+    fn sec4_task41_1_path_truncates_over_limit() {
+        let long = AuditPath::new(&"a".repeat(AUDIT_PATH_MAX_BYTES + 10));
+        assert!(long.is_truncated());
+        assert_eq!(long.original_len(), AUDIT_PATH_MAX_BYTES + 10);
+        assert_eq!(long.as_path().as_os_str().len(), AUDIT_PATH_MAX_BYTES);
+        // マルチバイト文字の境界で切り詰める（3 バイト文字が上限をまたぐ）。
+        let multi = AuditPath::new(&"あ".repeat(AUDIT_PATH_MAX_BYTES / 3 + 1));
+        assert!(multi.is_truncated());
+        assert_eq!(multi.as_path().as_os_str().len(), 4095);
+        let mount = AuditRecord::new(
+            ts(),
+            pid(3),
+            AuditEvent::Mount {
+                path: Some(AuditPath::new(&"b".repeat(5000))),
+            },
         );
-        assert_eq!(
-            AuditPath::new("/a\0b").unwrap_err().kind(),
-            AuditRecordErrorKind::PathContainsNul
-        );
-        assert_eq!(
-            AuditPath::new(&"a".repeat(AUDIT_PATH_MAX_BYTES + 1))
-                .unwrap_err()
-                .kind(),
-            AuditRecordErrorKind::PathTooLong
-        );
-        assert!(AuditPath::new(&"a".repeat(AUDIT_PATH_MAX_BYTES)).is_ok());
-        // 相対パスの試行も記録できる（SEC-4 の 100% 記録）。
-        assert_eq!(
-            AuditPath::new("rel/path").unwrap().as_path(),
-            Path::new("rel/path")
-        );
+        assert_eq!(mount.path().map(|p| p.as_os_str().len()), Some(4096));
     }
 
     #[test]

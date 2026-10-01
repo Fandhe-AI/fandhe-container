@@ -113,6 +113,7 @@ use std::time::{Duration, Instant};
 
 use super::config::{NamespaceKind, OciConfig};
 use super::create::validate_bundle;
+use super::error::{LifecycleOp, OciRuntimeError};
 use super::launch::{
     BundleLock, LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts,
 };
@@ -176,15 +177,23 @@ impl std::fmt::Debug for StartedContainer {
 /// [`ErrorCode::Timeout`]（予約は残り [`recover_interrupted_start`] で回復する）。launcher は上限超過後も
 /// 後始末スレッドから使うため `Arc` で受ける。成功・失敗の件数と所要時間は `recorder` へ操作名 `start` で
 /// 記録する（全終了経路。REPAIR-4）。
+///
+/// 失敗は [`OciRuntimeError`]（`op` = start・内部エラーと同一の `code`・非ゼロの
+/// [`OciRuntimeError::exit_code`]）で返す。標準エラーへの書き出しと終了は呼び出し元の責務
+/// （ERR-2・TASK-96.2）。[`recover_interrupted_start`] は ERR-2 の 4 操作外のため `TraitError` のまま。
 pub fn start(
     store: &dyn StateStore,
     recorder: &OpRecorder,
     launcher: &Arc<dyn ProcessLauncher>,
     req: &StartRequest,
     timeouts: &StartTimeouts,
-) -> Result<StartedContainer, TraitError> {
-    let name = OpName::new(START_OP_NAME)?;
-    recorder.record_op(&name, || start_inner(store, launcher, req, timeouts))
+) -> Result<StartedContainer, OciRuntimeError> {
+    // 変換は最上位 1 か所のみ。内部関数は `TraitError` のまま（波及最小）。
+    let to_err = |e: TraitError| OciRuntimeError::from_trait_error(LifecycleOp::Start, e);
+    let name = OpName::new(START_OP_NAME).map_err(to_err)?;
+    recorder.record_op(&name, || {
+        start_inner(store, launcher, req, timeouts).map_err(to_err)
+    })
 }
 
 /// [`call_bounded`] の結果を保持する枠（呼び出し側と実行スレッドの受け渡し）。
@@ -1001,7 +1010,7 @@ mod tests {
         store: &MemStateStore,
         launcher: &Arc<RecordingLauncher>,
         id: &str,
-    ) -> Result<StateRecord, TraitError> {
+    ) -> Result<StateRecord, OciRuntimeError> {
         start(
             store,
             &OpRecorder::new(),
@@ -1115,7 +1124,7 @@ mod tests {
     }
 
     /// create 後に config を差し替えて start し、エラーを返す（状態は Created のまま・launcher 0 回を確認）。
-    fn start_rejected_after_rewrite(name: &str, cfg: &Value) -> TraitError {
+    fn start_rejected_after_rewrite(name: &str, cfg: &Value) -> OciRuntimeError {
         let (b, store) = created(name);
         b.write_config(cfg);
         let launcher = RecordingLauncher::new(false);
@@ -1964,5 +1973,48 @@ mod tests {
             launcher.received_timeouts(),
             [Duration::from_millis(200), Duration::from_secs(10)]
         );
+    }
+
+    /// ERR-2・TASK-96.2: 未 create の start が op = start・NOT_FOUND・終了コード 3・構造化 1 行で得られ、失敗が計数される。
+    #[test]
+    fn err2_start_unknown_container_is_not_found() {
+        let store = MemStateStore::new(None);
+        let launcher = RecordingLauncher::new(false);
+        let rec = OpRecorder::new();
+        let err = start(
+            &store,
+            &rec,
+            &dynl(&launcher),
+            &sid("ghost"),
+            &StartTimeouts::default(),
+        )
+        .expect_err("must fail");
+        assert_eq!(err.op(), LifecycleOp::Start);
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(err.exit_code().get(), 3);
+        let mut out = Vec::new();
+        err.write_json_line(&mut out).expect("write");
+        let line = String::from_utf8(out).expect("utf8");
+        assert!(
+            line.starts_with("{\"op\":\"start\",\"code\":\"NOT_FOUND\",\"message\":"),
+            "{line}"
+        );
+        assert!(line.ends_with("}\n"));
+        let stats = rec
+            .snapshot_op(&OpName::new("start").expect("name"))
+            .expect("recorded");
+        assert_eq!(stats.failure(), 1);
+    }
+
+    /// ERR-2・TASK-96.2: Created 以外の start が FAILED_PRECONDITION・終了コード 5 になる。
+    #[test]
+    fn err2_start_non_created_is_failed_precondition() {
+        let (_b, store) = created("err2-twice");
+        let launcher = RecordingLauncher::new(false);
+        run(&store, &launcher, "err2-twice").expect("first start");
+        let err = run(&store, &launcher, "err2-twice").expect_err("second start");
+        assert_eq!(err.op(), LifecycleOp::Start);
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(err.exit_code().get(), 5);
     }
 }

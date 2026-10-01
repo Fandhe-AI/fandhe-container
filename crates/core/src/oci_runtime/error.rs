@@ -6,10 +6,16 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! 本モジュールは型と対応表の定義のみ。各操作の失敗経路への結線と標準エラー出力への書き出しは
-//! TASK-96.2（create / start）・TASK-96.3（kill / delete）で実装する。標準エラー出力の構造化形式の
-//! フィールド名は `op` / `code` / `message` に固定する（`code` は [`ErrorCode::as_str`] の文字列で
-//! ERR-1 と同一体系）。CLI 層（TASK-95）の終了コードも二重の表を持たず [`exit_code_for`] を再利用する。
+//! create / start の失敗経路への結線は TASK-96.2 で済み（公開関数の戻り値が [`OciRuntimeError`]）、
+//! kill / delete は TASK-96.3 で結線する。標準エラー向けの構造化 1 行は
+//! [`OciRuntimeError::write_json_line`] が任意の `Write` へ書く。キーは `op` / `code` / `message` の
+//! 3 つ固定（`code` は [`ErrorCode::as_str`] の文字列で ERR-1 と同一体系）。共通ヘッダ（`event`・
+//! タイムスタンプ等）は付けない（形式統一は TASK-98・ERR-4）。
+//!
+//! 実際に `stderr` へ書きプロセスを [`OciRuntimeError::exit_code`] で終了させるのは呼び出し元
+//! （CLI〔TASK-79・TASK-95〕・plugin 側 `ContainerRuntime` 実装）の責務で、CLI は現状雛形のため未結線
+//! である（REPAIR-3）。本モジュールは `stderr` へ直接書かず `std::process::exit` も呼ばない。
+//! CLI 層の終了コードも二重の表を持たず [`exit_code_for`] を再利用する。
 //!
 //! # 終了コード対応表（ERR-2）
 //!
@@ -31,7 +37,10 @@
 
 use std::error::Error;
 use std::fmt;
+use std::io::Write;
 use std::num::NonZeroU8;
+
+use serde::Serialize;
 
 use crate::traits::{ErrorCode, TraitError};
 
@@ -238,6 +247,34 @@ impl OciRuntimeError {
     /// プロセス終了コードを返す（非ゼロ。対応表はモジュール doc を参照）。
     pub fn exit_code(&self) -> NonZeroU8 {
         exit_code_for(self.code)
+    }
+}
+
+/// 標準エラー向け 1 行 JSON の固定スキーマ（キー順は宣言順。ERR-2・TASK-96.2）。
+#[derive(Serialize)]
+struct StderrLine<'a> {
+    op: &'static str,
+    code: &'static str,
+    message: &'a str,
+}
+
+impl OciRuntimeError {
+    /// 標準エラー向けの構造化 1 行（`{"op":..,"code":..,"message":..}` + LF）を `out` へ書く（ERR-2）。
+    ///
+    /// CLI・plugin 側 `ContainerRuntime` 実装が `stderr` を渡す想定。JSON は `serde_json` で組み、
+    /// `message` 内の `"` と `\` をエスケープする。`message` は構築時にサニタイズ・長さ上限済みのため
+    /// 行は有界で LF は行末の 1 個のみ。他の出力との行混在を避けるため 1 回の `write_all` で書く。
+    /// 書き込みに失敗しても呼び出し元は [`Self::exit_code`] で終了すること（終了コードを書き込みの
+    /// 成否に依存させない）。
+    pub fn write_json_line(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        let line = StderrLine {
+            op: self.op.as_str(),
+            code: self.code.as_str(),
+            message: &self.message,
+        };
+        let mut buf = serde_json::to_vec(&line).map_err(std::io::Error::other)?;
+        buf.push(b'\n');
+        out.write_all(&buf)
     }
 }
 
@@ -468,5 +505,71 @@ mod tests {
         let boxed: Box<dyn Error> = Box::new(e);
         assert_eq!(boxed.to_string(), expected);
         assert_eq!(expected, "delete: NOT_FOUND: gone");
+    }
+
+    /// ERR-2: 標準エラー向け 1 行がバイト単位で固定の形式になる。
+    #[test]
+    fn err2_write_json_line_exact_bytes() {
+        let e = OciRuntimeError::new(LifecycleOp::Start, ErrorCode::FailedPrecondition, "x");
+        let mut out = Vec::new();
+        e.write_json_line(&mut out).unwrap();
+        assert_eq!(
+            out,
+            b"{\"op\":\"start\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"x\"}\n"
+        );
+    }
+
+    /// ERR-2: 引用符とバックスラッシュは JSON エスケープされ、読み戻すと元の 3 値に一致する。
+    #[test]
+    fn err2_write_json_line_escapes_and_roundtrips() {
+        let e = OciRuntimeError::new(LifecycleOp::Create, ErrorCode::NotFound, "a\"b\\c");
+        let mut out = Vec::new();
+        e.write_json_line(&mut out).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["op"], "create");
+        assert_eq!(v["code"], "NOT_FOUND");
+        assert_eq!(v["message"], "a\"b\\c");
+    }
+
+    /// ERR-2: 改行を含む入力でも LF は行末の 1 個だけ（行注入されない）。
+    #[test]
+    fn err2_write_json_line_single_line() {
+        let e = OciRuntimeError::new(LifecycleOp::Create, ErrorCode::Internal, "a\nb\r\nc");
+        let mut out = Vec::new();
+        e.write_json_line(&mut out).unwrap();
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert_eq!(out.last(), Some(&b'\n'));
+    }
+
+    /// ERR-2: 上限長の `message` でも 1 行で出る。
+    #[test]
+    fn err2_write_json_line_max_length_message() {
+        let e = OciRuntimeError::new(
+            LifecycleOp::Delete,
+            ErrorCode::Internal,
+            "m".repeat(OCI_ERROR_MESSAGE_MAX_BYTES * 2),
+        );
+        let mut out = Vec::new();
+        e.write_json_line(&mut out).unwrap();
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["message"].as_str().unwrap().len(), 4096);
+    }
+
+    /// ERR-2: 書き込み先が失敗しても `Err` を返し panic しない（終了コードは書き込みに依存しない）。
+    #[test]
+    fn err2_write_json_line_write_failure_is_err() {
+        struct Failing;
+        impl Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("broken"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let e = OciRuntimeError::new(LifecycleOp::Kill, ErrorCode::Internal, "x");
+        assert!(e.write_json_line(&mut Failing).is_err());
+        assert_eq!(e.exit_code().get(), 1);
     }
 }

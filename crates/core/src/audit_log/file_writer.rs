@@ -194,8 +194,6 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
 #[derive(Debug)]
 pub struct AuditFileWriter {
     file: File,
-    /// 直前の書き込みが失敗し、末尾に部分行が残っている可能性がある。
-    needs_line_break: bool,
 }
 
 impl AuditFileWriter {
@@ -213,10 +211,7 @@ impl AuditFileWriter {
     /// テスト用: 検査なしで `File` を包む（読み取り専用ファイルで書き込み失敗を再現する）。
     #[cfg(test)]
     pub(crate) fn from_file_unchecked(file: File) -> Self {
-        Self {
-            file,
-            needs_line_break: false,
-        }
+        Self { file }
     }
 
     /// 1 レコードを排他ロック下で `write_all` し、`sync_data` まで行う。
@@ -251,20 +246,18 @@ impl AuditFileWriter {
 
     fn write_locked(&mut self, line: &[u8]) -> Result<(), AuditWriteError> {
         let mut buf = Vec::with_capacity(line.len() + 1);
-        // 自身の直前の失敗、またはロック下で観測した他 writer の部分行が末尾に残っていれば隔離する。
-        if self.needs_line_break || tail_is_unterminated(&self.file) {
+        // 行頭 LF の要否は、ロック下で確認した実際の末尾バイトだけで決める（自身の直前の失敗・他 writer・
+        // 前回プロセスの部分行を区別せず扱う。sync 失敗後など末尾が既に LF なら空行を作らない）。
+        if tail_is_unterminated(&self.file) {
             buf.push(b'\n');
         }
         buf.extend_from_slice(line);
         if self.file.write_all(&buf).is_err() {
-            self.needs_line_break = true;
             return Err(AuditWriteError::new(AuditWriteErrorKind::Write));
         }
         if self.file.sync_data().is_err() {
-            self.needs_line_break = true;
             return Err(AuditWriteError::new(AuditWriteErrorKind::Sync));
         }
-        self.needs_line_break = false;
         Ok(())
     }
 }
@@ -380,13 +373,8 @@ fn open_checked(path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
     if meta.nlink() != 1 || meta.uid() != crate::sys::effective_uid() || meta.mode() & 0o077 != 0 {
         return Err(AuditWriteError::new(AuditWriteErrorKind::InsecureFile));
     }
-    // 再オープン時に末尾が LF でない（前回プロセスの torn line）場合、最初の追記前に LF を挿入して
-    // 新レコードを既存の部分行から隔離する（書き込み時にもロック下で再判定する）。
-    let needs_line_break = tail_is_unterminated(&file);
-    Ok(AuditFileWriter {
-        file,
-        needs_line_break,
-    })
+    // 末尾が LF でない（torn line）場合の隔離は、書き込みごとにロック下で判定する。
+    Ok(AuditFileWriter { file })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -659,12 +647,25 @@ mod tests {
         assert_eq!(e.error_code(), ErrorCode::Unimplemented);
     }
 
-    /// SEC-4・TASK-41.5.1: 失敗後は次回書き込みで行頭 LF を付ける状態になる。
+    /// SEC-4・TASK-41.5.1: 失敗後も行頭 LF の要否は実際の末尾で決まる（末尾が LF なら空行を作らない）。
+    #[cfg(target_os = "linux")]
     #[test]
-    fn sec4_task41_5_1_line_break_after_failure() {
-        let mut w = failing_writer();
-        assert!(w.write_record(&sample()).is_err());
-        assert!(w.needs_line_break);
+    fn sec4_task41_5_1_no_blank_line_when_tail_is_lf() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fresh_dir("nolf");
+        let path = dir.join("audit.log");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut w = AuditFileWriter::open(&path).unwrap();
+        // 書き込み失敗（読み取り専用 fd）を経ても、別 fd 側の追記結果に空行が混ざらない。
+        assert!(failing_writer().write_record(&sample()).is_err());
+        w.write_record(&sample()).unwrap();
+        w.write_record(&sample()).unwrap();
+        let line = text(&sample());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{line}{line}")
+        );
     }
 
     /// SEC-4・TASK-41.5.1: 末尾が LF でない既存ファイルを再オープンしても、新レコードは独立した行になる。

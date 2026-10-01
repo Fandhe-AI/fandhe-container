@@ -111,7 +111,7 @@ impl MountDestination {
 
     /// [`Self::resolve_in`] の拒否を監査記録する版（SEC-4・TASK-41.4・#195）。
     ///
-    /// 成功時は `resolve_in` と同じ値。拒否時は正規化済みのコンテナ内パス（ホスト側 rootfs の実パスは
+    /// 成功時は `resolve_in` と同じ値。`mounts[].destination` 起因の拒否時は正規化済みのコンテナ内パス（ホスト側 rootfs の実パスは
     /// 載せない）を `Mount` レコードとして `sink` へ 1 件渡し、エラーはそのまま返す（fail-closed）。
     /// 本番経路への配線は未実装（TASK-29.2）。
     pub fn resolve_in_audited(
@@ -119,8 +119,18 @@ impl MountDestination {
         rootfs: &Path,
         sink: &dyn AuditSink,
     ) -> Result<PathBuf, Box<AuditedRejection<OciConfigError>>> {
-        self.resolve_in(rootfs)
-            .map_err(|e| Box::new(record_mount_rejection(e, Some(self.as_path()), sink)))
+        self.resolve_in(rootfs).map_err(|e| {
+            // `root.path`（rootfs 引数）起因の拒否はマウント先の違反ではないため記録しない。
+            let is_dest = matches!(
+                e.kind(),
+                OciConfigErrorKind::Invalid { field } if *field == DEST_FIELD
+            );
+            Box::new(if is_dest {
+                record_mount_rejection(e, Some(self.as_path()), sink)
+            } else {
+                AuditedRejection::not_applicable(e)
+            })
+        })
     }
 }
 
@@ -278,27 +288,32 @@ mod tests {
             .unwrap();
         assert_eq!(got, r.join("C:").join("x"));
     }
-    /// SEC-4・TASK-41.4: resolve_in の拒否が Mount レコード 1 件になり、成功時は記録しない。
+    /// SEC-4・TASK-41.4: resolve_in の成功時は記録しない（destination 起因の拒否は
+    /// 字句正規化後は Linux では到達しないため、記録経路は `audit_mount_config_error` 側で検証する）。
     #[test]
-    fn sec4_task41_4_resolve_in_audited_records_rejection() {
+    fn sec4_task41_4_resolve_in_audited_success_records_nothing() {
         use crate::audit_log::mount::tests::VecSink;
-        use crate::audit_log::{AuditDelivery, AuditLayer};
+
+        let dest = MountDestination::parse("/etc").expect("parse");
+        let ok_sink = VecSink::new(false);
+        let root = std::env::temp_dir();
+        let out = dest.resolve_in_audited(&root, &ok_sink).expect("ok");
+        assert_eq!(out, root.join("etc"));
+        assert_eq!(ok_sink.snapshot().len(), 0);
+    }
+
+    /// SEC-4・TASK-41.4: root.path 起因の拒否は Mount レコードにしない。
+    #[test]
+    fn sec4_task41_4_resolve_in_audited_skips_root_path_rejection() {
+        use crate::audit_log::AuditDelivery;
+        use crate::audit_log::mount::tests::VecSink;
 
         let dest = MountDestination::parse("/etc").expect("parse");
         let sink = VecSink::new(false);
         let r = dest
             .resolve_in_audited(Path::new("relative-rootfs"), &sink)
             .expect_err("relative rootfs rejected");
-        assert_eq!(r.delivery, AuditDelivery::Recorded);
-        let recs = sink.snapshot();
-        assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].layer(), AuditLayer::Mount);
-        assert_eq!(recs[0].path(), Some(Path::new("/etc")));
-
-        let ok_sink = VecSink::new(false);
-        let root = std::env::temp_dir();
-        let out = dest.resolve_in_audited(&root, &ok_sink).expect("ok");
-        assert_eq!(out, root.join("etc"));
-        assert_eq!(ok_sink.snapshot().len(), 0);
+        assert_eq!(r.delivery, AuditDelivery::NotApplicable);
+        assert_eq!(sink.snapshot().len(), 0);
     }
 }

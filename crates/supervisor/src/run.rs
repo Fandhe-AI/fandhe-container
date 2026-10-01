@@ -9,7 +9,9 @@
 //! - 本番の `ProcessLauncher` は core に未提供のため、起動ハンドル（`LaunchedProcess`）は呼び出し側から注入する。
 //!   supervisor のバイナリ入口（`main.rs`）は本 issue では追加しない（実プロセスを起動できないため実装済みを装わない）。
 //!   「コンテナ 0 個で supervisor プロセスが残存しない」ことの検証は結合テスト（#242・TASK-157.8）の担当。
-//! - restart 判定・`restart_count` 更新（#239・SUP-3）、health 更新（#240・SUP-4）、stdout / stderr 捕捉（#241）は未実装。
+//! - restart 判定・`restart_count` 更新（#239・SUP-3）、stdout / stderr 捕捉（#241）は未実装。
+//!   `health` を書くフックは [`crate::health`] で提供済み（#240・SUP-4）。healthcheck コマンドの実行と周期実行は未実装（TASK-161）で、
+//!   ループ内の統合点は手順 3 の生存確認の周回（本 issue ではループ本体へ組み込まない）。
 //!   終了検知後の分岐（再起動するか Stopped に落とすか）は、[`monitor`] の手順 4 が拡張点になる。
 //!
 //! # 処理順（[`monitor`]）
@@ -176,6 +178,8 @@ pub enum MonitorOperation {
     Stop,
     /// `wait` 失敗後の `supervisor_pid` 解除。
     ReleaseAfterWaitError,
+    /// healthcheck の判定結果（`health`）の記録（#240・SUP-4。[`crate::health`]）。
+    RecordHealth,
 }
 
 impl MonitorOperation {
@@ -187,6 +191,7 @@ impl MonitorOperation {
             Self::RecordExit => "record_exit",
             Self::Stop => "stop",
             Self::ReleaseAfterWaitError => "release_after_wait_error",
+            Self::RecordHealth => "record_health",
         }
     }
 }
@@ -234,7 +239,7 @@ impl MonitorObserver for StderrLogObserver {
 }
 
 /// 操作を実行して所要時間と成否を通知する。
-fn observed<T>(
+pub(crate) fn observed<T>(
     obs: &dyn MonitorObserver,
     operation: MonitorOperation,
     f: impl FnOnce() -> Result<T, TraitError>,
@@ -355,7 +360,7 @@ fn release_supervisor_pid(
 }
 
 /// 記録上の `supervisor_pid` が自 pid であること（他 supervisor の記録を消さないため。SUP-1）。
-fn ensure_owner(rec: &StateRecord, self_pid: NonZeroU32) -> Result<(), TraitError> {
+pub(crate) fn ensure_owner(rec: &StateRecord, self_pid: NonZeroU32) -> Result<(), TraitError> {
     if rec.supervision().supervisor_pid() == Some(self_pid) {
         Ok(())
     } else {
@@ -365,11 +370,11 @@ fn ensure_owner(rec: &StateRecord, self_pid: NonZeroU32) -> Result<(), TraitErro
     }
 }
 
-fn precondition(msg: &'static str) -> TraitError {
+pub(crate) fn precondition(msg: &'static str) -> TraitError {
     TraitError::new(ErrorCode::FailedPrecondition, msg)
 }
 
-fn is_running_with_pid(rec: &StateRecord, pid: NonZeroU32) -> bool {
+pub(crate) fn is_running_with_pid(rec: &StateRecord, pid: NonZeroU32) -> bool {
     rec.status().state() == ContainerState::Running && rec.status().pid() == Some(pid)
 }
 
@@ -383,7 +388,7 @@ fn exit_code_of(exit: ProcessExit) -> Option<i32> {
 }
 
 /// revision 不一致のときだけ `refresh` して再構築・再書き込みする（上限 [`MAX_WRITE_ATTEMPTS`]）。
-fn write_with_retry<F>(
+pub(crate) fn write_with_retry<F>(
     state: &mut SupervisedState,
     pid: NonZeroU32,
     build: F,

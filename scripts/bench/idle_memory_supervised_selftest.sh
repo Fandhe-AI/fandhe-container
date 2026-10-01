@@ -66,7 +66,7 @@ case "$1" in
   *) exit 64 ;;
 esac
 STUB
-chmod +x "${root}/measure.sh" "${root}/driver.sh"
+chmod 755 "${root}/measure.sh" "${root}/driver.sh"
 
 case_no=0
 # ケースごとの作業ディレクトリを作り STUB_DIR を設定する。引数は 3 回分の "<rc> <pc> <pss> <rss>"。
@@ -247,6 +247,51 @@ ln -s "${STUB_DIR}/real" "${STUB_DIR}/link"
 chmod 777 "${STUB_DIR}/open"
 check_arg "arg-output-parent-symlink" "invalid-output" --driver "$driver" --output "${STUB_DIR}/link/x.json"
 check_arg "arg-output-parent-world-writable" "invalid-output" --driver "$driver" --output "${STUB_DIR}/open/x.json"
+
+# 11d. driver が symlink・他ユーザー書き込み可・書き込み可ディレクトリ配下なら拒否 → 2。何も起動されない。
+new_case "0 0 0 0" "0 2 1 1" "0 0 0 0"
+ln -s "$driver" "${STUB_DIR}/driver-link.sh"
+cp "$driver" "${STUB_DIR}/driver-gw.sh"
+chmod 775 "${STUB_DIR}/driver-gw.sh"
+cp "$driver" "${STUB_DIR}/driver-ow.sh"
+chmod 757 "${STUB_DIR}/driver-ow.sh"
+mkdir -p "${STUB_DIR}/wdir"
+cp "$driver" "${STUB_DIR}/wdir/driver.sh"
+chmod 777 "${STUB_DIR}/wdir"
+mkdir -p "${STUB_DIR}/real2"
+cp "$driver" "${STUB_DIR}/real2/driver.sh"
+ln -s "${STUB_DIR}/real2" "${STUB_DIR}/link2"
+check_arg "arg-driver-symlink" "invalid-driver" --driver "${STUB_DIR}/driver-link.sh"
+check_arg "arg-driver-group-writable" "invalid-driver" --driver "${STUB_DIR}/driver-gw.sh"
+check_arg "arg-driver-other-writable" "invalid-driver" --driver "${STUB_DIR}/driver-ow.sh"
+check_arg "arg-driver-parent-writable" "invalid-driver" --driver "${STUB_DIR}/wdir/driver.sh"
+check_arg "arg-driver-parent-symlink" "invalid-driver" --driver "${STUB_DIR}/link2/driver.sh"
+
+# 11e. 全体 timeout 相当の SIGTERM（up 実行中）でも driver down が呼ばれる → 143。
+# down も失敗する場合は cleanup-failed を報告し 3 で返す。
+new_case "0 0 0 0" "0 2 1 1" "0 0 0 0"
+echo 30 >"$STUB_DIR/up_sleep"
+FANDHE_IDLE_MEMORY_SUPERVISED_MEASURE="${root}/measure.sh" bash "$target" --driver "$driver" 2>"${root}/stderr" >/dev/null &
+tpid=$!
+for _ in $(seq 1 50); do [ "$(driver_log)" = "up," ] && break; sleep 0.1; done
+kill -TERM "$tpid" 2>/dev/null || true
+actual=0
+wait "$tpid" || actual=$?
+errout="$(cat "${root}/stderr")"
+expect_exit "sigterm-runs-down" 143 && [ "$(driver_log)" = "up,down," ] && pass "sigterm-runs-down" || fail "sigterm-runs-down (driver: $(driver_log))"
+
+new_case "0 0 0 0" "0 2 1 1" "0 0 0 0"
+echo 30 >"$STUB_DIR/up_sleep"
+echo 1 >"$STUB_DIR/down_rc"
+FANDHE_IDLE_MEMORY_SUPERVISED_MEASURE="${root}/measure.sh" bash "$target" --driver "$driver" 2>"${root}/stderr" >/dev/null &
+tpid=$!
+for _ in $(seq 1 50); do [ "$(driver_log)" = "up," ] && break; sleep 0.1; done
+kill -TERM "$tpid" 2>/dev/null || true
+actual=0
+wait "$tpid" || actual=$?
+errout="$(cat "${root}/stderr")"
+expect_exit "sigterm-down-fail" 3 && expect_err "sigterm-down-fail" "cleanup-failed" &&
+  [ "$(driver_log)" = "up,down," ] && pass "sigterm-down-fail" || fail "sigterm-down-fail (driver: $(driver_log))"
 
 # 12. 差し替え環境変数は selftest フラグなしでは拒否 → 2。
 new_case "0 0 0 0" "0 2 1 1" "0 0 0 0"

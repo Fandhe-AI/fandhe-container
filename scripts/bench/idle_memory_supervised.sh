@@ -23,6 +23,10 @@
 #
 # driver 契約: 絶対パスの実行可能な通常ファイル。引数は固定の `up` / `down` のみを配列で直接 exec
 #   する（シェル経由・文字列連結なし）。`up` は 1 コンテナを監視プロセス込みで起動して復帰し、
+#   driver は symlink でなく所有者が実行ユーザーか root・group/other 書き込み不可で、親ディレクトリから / までが
+#   symlink なし・所有者が実行ユーザーか root・他者書き込み不可（sticky 除く）であること（root 実行時の差し替え防止。
+#   違反は `error: invalid-driver:` で終了コード 2）。
+#   TERM / INT / HUP を受けても EXIT trap の `down` を必ず実行し、失敗は `cleanup-failed` で報告する。
 #   `down` は停止・削除して復帰する。いずれも終了コード 0 で成功を示す。driver の標準出力は破棄し、
 #   標準エラーはそのまま流す。driver の絶対パス・引数は結果 JSON に出さない。
 #
@@ -209,6 +213,31 @@ output_path_is_safe() {
   return 0
 }
 
+# root で実行される driver が、他ユーザーに差し替えられない場所・実体であることを確かめる。
+# driver 自体が symlink でなく、所有者が実行ユーザーか root で、group / other の書き込み権がなく、
+# 親ディレクトリから / までが output_path_is_safe の規則（symlink なし・所有者 / 権限の検査）を満たすこと。
+# 検査後の差し替え競合は、経路上の全ディレクトリと driver 本体が信頼できる所有者（実行ユーザー・root）
+# だけに書き込み可能であることで塞ぐ（それ以外のユーザーは差し替えられない）。
+driver_is_safe() {
+  local f="$1" uid dir
+  uid="$(id -u)" || return 1
+  [ ! -L "$f" ] || return 1
+  [ -n "$(find -P "$f" -maxdepth 0 -type f \( -user "$uid" -o -user 0 \) -print 2>/dev/null)" ] || return 1
+  [ -z "$(find -P "$f" -maxdepth 0 \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ] || return 1
+  dir="${f%/*}"
+  [ -n "$dir" ] || dir="/"
+  output_path_is_safe "$dir"
+}
+
+if ! command -v find >/dev/null 2>&1 || ! command -v id >/dev/null 2>&1; then
+  err "unsupported-os" "find and id are required to validate the driver"
+  exit 2
+fi
+if ! driver_is_safe "$driver"; then
+  err "invalid-driver" "--driver must not be a symlink, must be owned by you or root and not writable by group/others, and every directory above it must be owned by you or root, not a symlink, and not writable by others (unless sticky)"
+  exit 2
+fi
+
 if [ -n "$output" ]; then
   if [ -d "$output" ]; then
     err "invalid-argument" "output path is a directory: ${output}"
@@ -243,6 +272,7 @@ tmp=""
 # （AGENTS.md「特権操作の後始末」）。Makefile の外側 timeout はこの down が完走できる猶予を取る。
 cleanup() {
   local orig=$? rc=0
+  trap ':' TERM INT HUP
   if [ "$up_attempted" -eq 1 ] && [ "$down_done" -eq 0 ]; then
     down_done=1
     timeout --kill-after=10 "$timeout_s" "$driver" down >/dev/null || rc=$?
@@ -256,10 +286,33 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# 外側 timeout（Makefile）の TERM や操作者の INT / HUP でも、EXIT trap の後始末（driver down）を
+# 必ず通す。実行中の driver 子プロセスを止めてから 128+signal で exit し、cleanup が down を試みる
+# （down の失敗は cleanup が `error: cleanup-failed:` として報告し終了コード 3 で返す）。
+child_pid=""
+on_signal() {
+  local code="$1"
+  trap ':' TERM INT HUP
+  if [ -n "$child_pid" ]; then
+    kill -TERM "$child_pid" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
+    child_pid=""
+  fi
+  err "interrupted" "received signal (exit ${code}); running cleanup"
+  exit "$code"
+}
+trap 'on_signal 143' TERM
+trap 'on_signal 130' INT
+trap 'on_signal 129' HUP
+
 # driver を固定サブコマンドで直接 exec する。戻り値は終了コード（timeout 超過は 124 / 137）。
+# 背景起動して wait することで、実行中でも TERM 等の trap が即座に動く。
 run_driver() {
   local rc=0
-  timeout --kill-after=10 "$timeout_s" "$driver" "$1" >/dev/null || rc=$?
+  timeout --kill-after=10 "$timeout_s" "$driver" "$1" >/dev/null &
+  child_pid=$!
+  wait "$child_pid" || rc=$?
+  child_pid=""
   return "$rc"
 }
 

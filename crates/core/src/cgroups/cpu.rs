@@ -7,7 +7,7 @@
 //!
 //! # 呼び出し文脈・契約
 //! - 呼び出し元: 起動フロー（`oci_runtime` の start 経路。OCI `linux.resources.cpu` の反映と結線は
-//!   TASK-32.4・#161）。本モジュールは単体の API で、起動フローからはまだ呼ばれない
+//!   本番 launcher〔TASK-29 / TASK-157 系〕の担当）。本モジュールは単体の API で、起動フローからはまだ呼ばれない
 //! - 前提: 親 cgroup の `cgroup.subtree_control` で `cpu` controller が有効化済み
 //!   （[`super::DelegatedCgroup::enable_controllers`]）。未有効なら `cpu.max` が存在せず
 //!   `FailedPrecondition`

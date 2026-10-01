@@ -9,14 +9,14 @@
 //! 要求する（退避前に有効化するコードはコンパイルできない）。
 //!
 //! # 呼び出し文脈・契約
-//! - 呼び出し元: 起動フロー（`oci_runtime` の start 経路。結線は TASK-32.4・#161）。本 PR では
-//!   単体の API として提供し、起動フローからはまだ呼ばれない
+//! - 呼び出し元: 起動フロー。本番 launcher（TASK-29 / TASK-157 系）はまだ無く、`detect` / `prepare` の
+//!   呼び出しと [`ContainerCgroup::join_hook`] の登録は未結線（REPAIR-3）
 //! - `unsafe` は持たない。syscall は `crate::sys` の薄いラッパー（`mkdirat`・`unlinkat`・`fstatfs`・
 //!   `O_NOFOLLOW` 付き `openat`）経由で、検証した実体を fd で固定する（TOCTOU・symlink 対策）
 //! - `/proc/self/cgroup`・`cgroup.procs` 等はカーネル応答（外部入力）として上限付きで読み、
 //!   `unwrap` / 添字アクセスを使わずに検証する
 //! - 待機を伴う処理はない（ファイル I/O のみ）ためタイムアウトは設けない
-//! - エラーは [`CgroupError`]（`ErrorCode`＋失敗した段）。`ExecError` への変換は TASK-32.4 の担当
+//! - エラーは [`CgroupError`]（`ErrorCode`＋失敗した段）。`ExecError` への変換は `exec` 側（`ExecError::from_cgroup`）
 //!
 //! # レイアウト
 //! ```text
@@ -25,17 +25,20 @@
 //! └── fc-<container-id>/      ← コンテナ用子 cgroup（この時点では空）
 //! ```
 //! 退避リーフは 1 supervisor = 1 委譲スコープを前提とする（CORE-1・D-19）。複数コンテナが同一
-//! スコープを共有する運用の扱いは TASK-32.4 と整合させる。退避リーフは自プロセスが入るため削除せず、
+//! スコープを共有する運用の扱いは本番 launcher（TASK-29 / TASK-157 系）で整合させる。退避リーフは自プロセスが入るため削除せず、
 //! スコープ終了時に systemd が回収する。
 //!
 //! # 実装済みの資源制限
 //! - `cpu.max`（TASK-32.3・#160）: [`ContainerCgroup::set_cpu_max`]（`cpu` サブモジュール。起動フローからは
-//!   未呼び出しで、結線は TASK-32.4・#161）
+//!   未呼び出しで、本番 launcher〔TASK-29 / TASK-157 系〕で結線する）
 //! - `memory.max` / `memory.swap.max`（TASK-32.2・#159）: [`ContainerCgroup::set_memory_limits`]
-//!   （起動フローからは未呼び出しで、結線は TASK-32.4）
+//!   （同上。未結線）
+//! - fork 後の子の `cgroup.procs` 参加（TASK-32.4・#161）: [`ContainerCgroup::join_hook`] が返す
+//!   [`CgroupJoin`] を `exec::StagePipeline` の `CgroupJoin` 段へ登録する（`exec::StageHook` 実装済み）
 //!
 //! # 未実装（REPAIR-3）
-//! - `StageHook` 化・fork 後の子の `cgroup.procs` 参加・`ExecError` への変換（TASK-32.4・#161）
+//! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映、本番 launcher での
+//!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
 //! - OCI `linux.cgroupsPath` の反映、delete 時の cgroup 削除の結線（TASK-30 系）
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
 
@@ -98,6 +101,8 @@ pub enum CgroupStep {
     SetMemoryLimit,
     /// `cpu.max` の検証・書き込み・読み戻し。
     SetCpuMax,
+    /// fork 後の子プロセスの `cgroup.procs` への参加（TASK-32.4）。
+    JoinContainer,
 }
 
 /// cgroup 操作のエラー。`code` は ERR 系の機械可読コード、`message` は英語の説明。
@@ -605,6 +610,85 @@ impl ContainerCgroup {
     /// cgroup ディレクトリの fd（O_PATH。`openat` の dirfd 専用）。
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+}
+
+/// fork 後の子プロセスが自分自身をコンテナ用子 cgroup へ参加させるためのフック（CORE-3・TASK-32.4）。
+///
+/// [`ContainerCgroup::join_hook`] が親で作り、`exec::StagePipeline` の `CgroupJoin` 段へ登録する。
+/// 検証済みの O_PATH ディレクトリ fd（`O_CLOEXEC`）だけを保持し、パス文字列では再解決しない
+/// （pivot 後はホストの `/sys/fs/cgroup` が見えないため。symlink・TOCTOU 対策）。
+/// 契約: fork 後の子でのみ [`CgroupJoin::join_current_process`] が呼ばれる。親で呼ぶと runtime 自身が
+/// コンテナ cgroup へ移るため `pub(crate)` に留める。cgroup namespace（`CLONE_NEWCGROUP`）導入時は
+/// 親で `cgroup.procs` を書き込み用に事前 open する方式へ切り替える（未導入のため現状は不要）。
+pub struct CgroupJoin {
+    name: CgroupName,
+    fd: OwnedFd,
+}
+
+impl fmt::Debug for CgroupJoin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CgroupJoin")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `cgroup.procs` を読み戻した `text` に `pid` が含まれることを検証する（fail-closed）。
+fn verify_joined(pid: u32, text: &str) -> Result<(), CgroupError> {
+    let step = CgroupStep::JoinContainer;
+    if parse_procs(step, text)?.contains(&pid) {
+        Ok(())
+    } else {
+        Err(CgroupError::precondition(
+            step,
+            "own pid is not listed in cgroup.procs after the join",
+        ))
+    }
+}
+
+impl CgroupJoin {
+    /// 自プロセスの TGID を `cgroup.procs` へ書き、読み戻して参加を確認する。
+    ///
+    /// 呼び出し元: `exec::stages` の `CgroupJoin` 段（fork 後・pivot 後・capability 削減前の子）。
+    /// カーネルは書き手の PID namespace で解決するため、新 PID ns の PID 1 でも自分自身を指す。
+    pub(crate) fn join_current_process(&mut self) -> Result<(), CgroupError> {
+        let step = CgroupStep::JoinContainer;
+        let pid = std::process::id();
+        let procs = cstring(step, "cgroup.procs")?;
+        let wfd = sys::open_write_at(self.fd.as_fd(), &procs)
+            .map_err(|e| sys_error(step, "cgroup.procs", e))?;
+        File::from(wfd)
+            .write_all(pid.to_string().as_bytes())
+            .map_err(|e| io_error(step, "cgroup.procs", &e))?;
+        verify_joined(
+            pid,
+            &read_iface(step, self.fd.as_fd(), "cgroup.procs", PROCS_LIMIT)?,
+        )
+    }
+
+    /// テスト用: 任意のディレクトリ fd から組み立てる。
+    #[cfg(test)]
+    pub(crate) fn from_dir_for_test(name: CgroupName, fd: OwnedFd) -> Self {
+        Self { name, fd }
+    }
+}
+
+impl ContainerCgroup {
+    /// 子プロセスの参加フックを作る（fd を `F_DUPFD_CLOEXEC` で複製）。
+    ///
+    /// 呼び出し順: `detect` / `prepare`（および任意の資源制限設定）→ 本メソッド → `isolate`（user ns 等へ
+    /// 入る）→ `StagePipeline::with_hook(StageKind::CgroupJoin, hook)`。`detect` / `prepare` は
+    /// `isolate` より前に呼ぶこと（pivot 後はホストの cgroupfs が見えず、所有者検証の前提も変わる）。
+    pub fn join_hook(&self) -> Result<CgroupJoin, CgroupError> {
+        let fd = self
+            .fd
+            .try_clone()
+            .map_err(|e| io_error(CgroupStep::JoinContainer, "duplicate cgroup fd", &e))?;
+        Ok(CgroupJoin {
+            name: self.name.clone(),
+            fd,
+        })
     }
 }
 
@@ -1369,6 +1453,67 @@ mod tests {
         assert_eq!(
             ControllerSet::of(&[Controller::Memory, Controller::Cpu]).to_enable_request(),
             "+cpu +memory"
+        );
+    }
+
+    /// 一時ディレクトリ（std のみ）。drop で削除する。
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn new(label: &str) -> Self {
+            let p =
+                std::env::temp_dir().join(format!("fandhe-cgjoin-{label}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn join_for(dir: &std::path::Path) -> CgroupJoin {
+        let fd = OwnedFd::from(File::open(dir).unwrap());
+        let name = CgroupName::new(&ContainerId::new("t").unwrap()).unwrap();
+        CgroupJoin::from_dir_for_test(name, fd)
+    }
+
+    /// CORE-3・TASK-32.4: 自 PID を `cgroup.procs` へ書き、読み戻して検証する。
+    #[test]
+    fn core3_task32_4_join_current_process_writes_own_pid() {
+        let tmp = TmpDir::new("ok");
+        std::fs::write(tmp.0.join("cgroup.procs"), "").unwrap();
+        let mut join = join_for(&tmp.0);
+        join.join_current_process().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.0.join("cgroup.procs")).unwrap(),
+            std::process::id().to_string()
+        );
+    }
+
+    /// CORE-3・TASK-32.4: `cgroup.procs` 不在は `NotFound`（段は `JoinContainer`）。
+    #[test]
+    fn core3_task32_4_join_missing_procs_is_not_found() {
+        let tmp = TmpDir::new("missing");
+        let mut join = join_for(&tmp.0);
+        let err = join.join_current_process().unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.step, CgroupStep::JoinContainer);
+    }
+
+    /// CORE-3・TASK-32.4: 読み戻しに自 PID が無ければ成功扱いしない（fail-closed）。
+    #[test]
+    fn core3_task32_4_verify_joined_requires_own_pid() {
+        verify_joined(123, "5\n123\n").unwrap();
+        let err = verify_joined(123, "5\n124\n").unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.step, CgroupStep::JoinContainer);
+        assert_eq!(
+            verify_joined(123, "").unwrap_err().code,
+            ErrorCode::FailedPrecondition
         );
     }
 

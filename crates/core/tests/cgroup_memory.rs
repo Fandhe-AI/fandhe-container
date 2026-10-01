@@ -16,7 +16,7 @@ mod linux {
     use fandhe_container_core::cgroups::{
         CgroupName, Controller, ControllerSet, DelegatedCgroup, MemoryLimit, MemoryLimits,
     };
-    use fandhe_container_core::traits::ContainerId;
+    use fandhe_container_core::traits::{ContainerId, ErrorCode};
     use std::fs;
     use std::path::PathBuf;
 
@@ -50,10 +50,28 @@ mod linux {
         assert_eq!(applied.memory_max, MemoryLimit::Bytes(67_108_864));
         assert_eq!(applied.swap_max, Some(MemoryLimit::Bytes(0)));
 
-        // 不正値は書き込み前に拒否され、ファイル内容は変わらない。
-        assert!(MemoryLimit::parse("-1").is_err());
-        assert!(MemoryLimit::parse("64MB").is_err());
-        assert_eq!(read(&dir.join("memory.max")).trim(), "67108864");
+        // 不正値は書き込み前に拒否され、ファイル内容は変わらない。`Bytes(u64)` は直接構築できるため、
+        // 範囲外（i64::MAX 超）を設定 API へ渡して検証する。memory.max / memory.swap.max の
+        // どちらに不正値があっても、両ファイルとも元の値のまま（部分書き込みなし）であること。
+        let too_big = MemoryLimit::Bytes(i64::MAX as u64 + 1);
+        let invalid_requests = [
+            MemoryLimits {
+                memory_max: too_big,
+                swap_max: Some(MemoryLimit::Bytes(0)),
+            },
+            MemoryLimits {
+                memory_max: MemoryLimit::Bytes(33_554_432),
+                swap_max: Some(too_big),
+            },
+        ];
+        for bad in &invalid_requests {
+            let err = child
+                .set_memory_limits(&enabled, bad)
+                .expect_err("out-of-range limit must be rejected");
+            assert_eq!(err.code, ErrorCode::InvalidArgument);
+            assert_eq!(read(&dir.join("memory.max")).trim(), "67108864");
+            assert_eq!(read(&dir.join("memory.swap.max")).trim(), "0");
+        }
 
         delegated.remove_child(&child).expect("remove child cgroup");
         assert!(!dir.exists());

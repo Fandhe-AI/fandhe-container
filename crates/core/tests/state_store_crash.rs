@@ -78,21 +78,17 @@ mod linux {
         let deadline = Instant::now() + CHILD_LIFETIME;
         let mut n: u32 = 1;
         while Instant::now() < deadline {
-            let cur = match store.get(&GetStateRequest::new(cid(ID))) {
-                Ok(cur) => cur,
-                // ロック競合のタイムアウトは親の観測側との競合であり致命ではないため再試行する。
-                Err(e) if e.code() == ErrorCode::Timeout => continue,
-                Err(_) => return,
+            let Ok(cur) = store.get(&GetStateRequest::new(cid(ID))) else {
+                return;
             };
             let status = ContainerStatus::running(cid(ID), NonZeroU32::new(n));
-            match store.update(&UpdateStateRequest::new(status, cur.revision())) {
-                Ok(_) => {}
-                Err(e) if e.code() == ErrorCode::Timeout => continue,
-                Err(_) => return,
+            if store
+                .update(&UpdateStateRequest::new(status, cur.revision()))
+                .is_err()
+            {
+                return;
             }
             n = n.wrapping_add(1).max(1);
-            // ロックの再取得までに隙間を空け、観測側の `try_lock` ポーリングが飢えないようにする。
-            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -157,7 +153,9 @@ mod linux {
             let observer = open(&root);
             let started = Instant::now();
             loop {
-                // 子が高頻度でロックを保持するため、ロック待ちのタイムアウトは上限時間内で再試行する。
+                // 子が `@lock` を連続取得している間は観測側の取得が期限切れ（Timeout）になり得る
+                // （flock は公平でない）。これは子が稼働中という前提の通常動作なので、全体の
+                // 上限時間内で再試行する。それ以外のエラーは失敗させる。
                 match observer.get(&GetStateRequest::new(cid(ID))) {
                     Ok(rec) if rec.revision().value() > last_seen => break,
                     Ok(_) => {}

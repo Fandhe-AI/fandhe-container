@@ -395,7 +395,7 @@ fio-baseline-ratio: ## fio ベースライン比を算出する（BASELINE/CANDI
 	bash scripts/fio-baseline-ratio.sh --baseline $(call fio_bench_sq,$(BASELINE)) --candidate $(call fio_bench_sq,$(CANDIDATE))
 
 # --------------------------------------------------
-# 起動時間計測（TASK-46.1・CORE-10・MS-2 Phase 3）
+# 起動時間計測（TASK-46.1・TASK-46.2・CORE-10・MS-2 Phase 3）
 # --------------------------------------------------
 # `scripts/bench/startup_latency.sh` は OCI Runtime CLI 契約のランタイムに対し
 # create からプロセス実行開始（state が running / stopped を返した時点）までの時間の
@@ -403,6 +403,10 @@ fio-baseline-ratio: ## fio ベースライン比を算出する（BASELINE/CANDI
 # 提供後に人間が #213（TASK-46.h1）で行う実機前提（ランタイム・bundle・場合により root）
 # のため `make ci` には含めない。自己テストはスタブランタイムで完結し CI に組み込み済み
 # （計測スクリプトが単調時計として /proc/uptime を使うため Linux 限定）。
+# `startup-latency-docker` は同じスクリプトの `--mode docker` で `docker run --rm ... --entrypoint true <image>` の
+# 全体時間を計測し（TASK-46.2。Docker は実機前提・イメージは事前に手動 pull）、
+# `startup-latency-report` は own と Docker の結果を 1 つのレポートに統合する。両者の計測区間は
+# 異なり（method / methods_differ に明示）、合否判定は #213（TASK-46.h1）で人間が行う。
 .PHONY: startup-latency-selftest
 startup-latency-selftest: ## 起動時間計測スクリプトの自己テスト（REPAIR-12。実ランタイム不要）
 	@if ! command -v jq >/dev/null 2>&1; then \
@@ -418,6 +422,22 @@ startup-latency: ## 起動時間を計測する（実機前提。RUNTIME=<絶対
 		exit 2; \
 	fi
 	bash scripts/bench/startup_latency.sh --runtime $(call fio_bench_sq,$(RUNTIME)) --bundle $(call fio_bench_sq,$(BUNDLE)) --target $(call fio_bench_sq,$(TARGET)) --iterations $(call fio_bench_sq,$(or $(ITERATIONS),10)) --label $(call fio_bench_sq,$(or $(LABEL),$(TARGET)))
+
+.PHONY: startup-latency-docker
+startup-latency-docker: ## Docker の起動時間を計測する（実機前提。DOCKER=<docker の絶対パス> 必須。TASK-46.2）
+	@if [ -z $(call fio_bench_sq,$(DOCKER)) ]; then \
+		echo "usage: make startup-latency-docker DOCKER=<abs-path of docker CLI> [TARGET=<name, default docker>] [IMAGE=<ref, default alpine:3.20 (pull it first)>] [ITERATIONS=<n>] [LABEL=<label>] [OUTPUT=<new file>]" >&2; \
+		exit 2; \
+	fi
+	bash scripts/bench/startup_latency.sh --mode docker --runtime $(call fio_bench_sq,$(DOCKER)) --target $(call fio_bench_sq,$(or $(TARGET),docker)) --iterations $(call fio_bench_sq,$(or $(ITERATIONS),10)) --label $(call fio_bench_sq,$(or $(LABEL),$(or $(TARGET),docker)))$(if $(IMAGE), --image $(call fio_bench_sq,$(IMAGE)))$(if $(OUTPUT), --output $(call fio_bench_sq,$(OUTPUT)))
+
+.PHONY: startup-latency-report
+startup-latency-report: ## own と Docker の起動時間の結果を 1 つのレポートに統合する（OWN_RESULT=<file> DOCKER_RESULT=<file> 必須。TASK-46.2）
+	@if [ -z $(call fio_bench_sq,$(OWN_RESULT)) ] || [ -z $(call fio_bench_sq,$(DOCKER_RESULT)) ]; then \
+		echo "usage: make startup-latency-report OWN_RESULT=<oci-mode result.json> DOCKER_RESULT=<docker-mode result.json> [OUTPUT=<new file>]" >&2; \
+		exit 2; \
+	fi
+	bash scripts/bench/startup_latency.sh --mode report --own-result $(call fio_bench_sq,$(OWN_RESULT)) --docker-result $(call fio_bench_sq,$(DOCKER_RESULT))$(if $(OUTPUT), --output $(call fio_bench_sq,$(OUTPUT)))
 
 # --------------------------------------------------
 # アイドル時常駐メモリ計測（TASK-45.1・CORE-7。Linux 限定。bash のみで完結）

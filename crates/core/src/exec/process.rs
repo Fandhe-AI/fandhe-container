@@ -726,6 +726,15 @@ pub fn spawn_container_seccomp_probe(
 /// 通した**後**にだけ `probe` を呼ぶ。exec は呼ばず `require_restriction_evidence` も迂回しないため、
 /// 権限・昇格経路は増えない。前段が失敗した場合は `probe` に到達しない（fail-closed）。通常の利用者は呼ばない。
 ///
+/// # 制限適用証跡の例外（SEC-1・REPAIR-3）
+///
+/// 本番の `run_child` は終端で `verify_caller` と `require_restriction_evidence` を行うが、後者は証跡型が
+/// 未確定の間は常に拒否するため、本関数では `verify_caller` のみ行い `require_restriction_evidence` は
+/// 呼ばない（呼ぶとプローブが永久に実行できない）。これは exec を伴わない検証専用経路に限った明示的な例外で、
+/// 本関数の成功（終了コード 0）は「制限が適用された証跡」ではなく、本番経路の成功判定・exec 許可の根拠に
+/// 使ってはならない。攻撃が拒否されたことの判定は probe 側の観測（fd 経由の結果）だけで行う。
+/// 証跡配線後は `require_restriction_evidence` を呼ぶ形へ置き換える。
+///
 /// # 契約
 ///
 /// - 終了コード: `probe` が正常に戻れば 0、前段失敗は既存規約（`exit_code_for`）、`probe` の panic は
@@ -752,7 +761,10 @@ where
 {
     let pid = sys::fork_single_threaded(
         move || {
-            let result = run_child_then(rootfs, stages, |_isolation, _report, _caps| {
+            let result = run_child_then(rootfs, stages, |isolation, _report, _caps| {
+                // 本番 `run_child` と同じ呼び出し元検証（PID 1・入れ子 PID namespace・シングルスレッド）を
+                // プローブ実行前に行う。`require_restriction_evidence` は意図的に呼ばない（下記の例外）。
+                isolation.verify_caller(IsolationStage::Exec)?;
                 probe();
                 Ok(())
             });

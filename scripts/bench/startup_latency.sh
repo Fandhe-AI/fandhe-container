@@ -260,6 +260,10 @@ output_path_is_safe() {
   local logical physical d parent depth
   logical="$(cd -- "$1" && pwd -L)" || return 1
   physical="$(cd -- "$1" && pwd -P)" || return 1
+  # 先頭の連続した "/"（"//" は処理系定義で、Linux では "/" と同じ）を 1 つにそろえてから
+  # 比べる（pwd -L / -P で "//" の扱いが異なる環境でも symlink と誤認しない）。
+  while [[ "$logical" == //* ]]; do logical="${logical#/}"; done
+  while [[ "$physical" == //* ]]; do physical="${physical#/}"; done
   [ "$logical" = "$physical" ] || return 1
   d="$physical"
   depth=0

@@ -41,7 +41,7 @@ pub use launch::{
     LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, RootfsDir, START_TIMEOUT_MAX,
     StartTimeouts,
 };
-pub use mount_destination::MountDestination;
+pub use mount_destination::{MountDestination, audit_mount_config_error};
 pub use start::{
     LAUNCHER_REPLY_GRACE, StartedContainer, recover_interrupted_start, start,
     take_unreaped_processes,

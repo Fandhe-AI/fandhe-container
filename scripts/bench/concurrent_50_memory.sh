@@ -105,7 +105,8 @@
 #   3 = 前提欠如（非 Linux・smaps_rollup 非対応・bash 5 未満・docker モードの timeout 欠如・report の jq 欠如等。
 #       0 を返して合格に見せない）
 #   4 = 後始末失敗（起動したプロセス・コンテナが残存。他の失敗より優先して返す。docker モードでは
-#       docker rm -f の後にラベル一致のコンテナが残る場合を含む）
+#       docker rm -f の後にラベル一致のコンテナが残る場合と、docker run クライアント（timeout・docker CLI）の
+#       終了を確認できない場合を含む）
 #   129 / 130 / 143 = HUP / INT / TERM による中断（後始末は必ず実行し、残存があれば 4 を優先する。
 #       後始末中に再度シグナルを受けても後始末を最後まで続ける）
 #   上記以外の値（set -e の暗黙終了等）を返さないよう、失敗しうる操作は明示的に分岐する。
@@ -463,6 +464,9 @@ dk_active=0
 in_exit=0
 dk_sig=""
 dk_cpids=()
+# docker run クライアント（timeout）の起動時刻。dk_cpids と同じ添字（読めなければ空で、シグナルを送らない）。
+dk_cstart=()
+KILLED_KIDS=""
 DK_CLIENT_FAILED=0
 dk_ids=()
 dk_pid=()
@@ -529,6 +533,32 @@ own_child_alive() { # <pid>
   [ "${f[1]:-}" = "$$" ]
 }
 
+# 本スクリプトの直接の子 <pid> と、その時点の子プロセス（1 階層）へ SIGKILL を送る。子は親の終了後に
+# 再親化されて親子関係をたどれなくなるため、先に「pid:起動時刻」で控えてから親を終了させ、控えた子へは
+# 起動時刻が一致するもの（pid 再利用でないもの）にだけ送る。控えた子は KILLED_KIDS へ残す（呼び出し側が
+# 残存確認に使う）。ログ収集プロセス（collectors_stop）と docker クライアント（dk_stop）が共用する。
+# 子は実 /proc から読む（--proc-root の疑似 /proc は集計専用で、本スクリプトの子は常に実プロセス）。
+# children ファイルが無いカーネルでは全プロセスの stat を走査して親が一致するものを控える。
+kill_child_with_kids() { # <pid> <起動時刻>
+  local c=() desc d
+  KILLED_KIDS=""
+  if [ -e "/proc/$1/task/$1/children" ]; then
+    { read -ra c <"/proc/$1/task/$1/children"; } 2>/dev/null || true
+  else
+    for d in /proc/[0-9]*; do c+=("${d#/proc/}"); done
+  fi
+  for desc in "${c[@]}"; do
+    [[ "$desc" =~ $num_re ]] || continue
+    # 起動時刻を読んだ後に、その起動時刻のプロセスの親が <pid> であることを確かめる（列挙から読み取り
+    # までの間に終了して pid が再利用された無関係なプロセスを控えない）。
+    if read_starttime "$desc" && same_proc_alive "$desc" "$ST" "$1"; then KILLED_KIDS+="${desc}:${ST} "; fi
+  done
+  sig_same_proc KILL "$1" "$2" "$$"
+  for desc in $KILLED_KIDS; do
+    sig_same_proc KILL "${desc%%:*}" "${desc#*:}"
+  done
+}
+
 # --- launcher 契約の差し替え点（実 CLI 提供後はここだけ合わせる。REPAIR-3） ---
 
 # コンテナ 1 つ分のログ収集プロセスを起動し、pid を LAST_CPID、起動時刻を LAST_CSTART へ入れる。
@@ -565,7 +595,7 @@ log_collector_start() { # <logfile>
 # まず最大 2 秒待つ。残ったもの（書き手が残存している・FIFO の open 待ちのまま）は、起動時刻と親 pid を
 # 照合してから SIGKILL する。収集プロセスが dd を実行中なら、その子（dd）も起動時刻を照合して終了させる。
 collectors_stop() {
-  local i waited=0 alive c desc kids
+  local i waited=0 alive
   [ "${#cpids[@]}" -gt 0 ] || return 0
   while [ "$waited" -lt 10 ]; do
     alive=0
@@ -578,17 +608,7 @@ collectors_stop() {
   done
   for i in "${!cpids[@]}"; do
     if same_proc_alive "${cpids[i]}" "${cstart[i]:-}" "$$"; then
-      kids=""
-      c=()
-      { read -ra c <"/proc/${cpids[i]}/task/${cpids[i]}/children"; } 2>/dev/null || true
-      for desc in "${c[@]}"; do
-        [[ "$desc" =~ $num_re ]] || continue
-        if read_starttime "$desc"; then kids+="${desc}:${ST} "; fi
-      done
-      sig_same_proc KILL "${cpids[i]}" "${cstart[i]}" "$$"
-      for desc in $kids; do
-        sig_same_proc KILL "${desc%%:*}" "${desc#*:}"
-      done
+      kill_child_with_kids "${cpids[i]}" "${cstart[i]}"
     fi
     # 終了済み・SIGKILL 済みの収集プロセスを回収する（照合できない生存プロセスは待たない）。
     if ! own_child_alive "${cpids[i]}" || [ -n "${cstart[i]:-}" ]; then
@@ -1293,6 +1313,7 @@ read_ppid() {
 dk_spawn() { # <trial>
   local i=0 id
   dk_cpids=()
+  dk_cstart=()
   dk_active=1
   while [ "$i" -lt "$count" ]; do
     id="${id_prefix}-$1-$((i + 1))"
@@ -1300,13 +1321,19 @@ dk_spawn() { # <trial>
     timeout --kill-after=5 "$timeout_s" "$docker" run -d --pull never --cidfile "$tmpdir/cid/$id.cid" \
       --label "${DK_LABEL_KEY}=${owner_tok}" "$image" sleep "$dk_sleep" </dev/null >/dev/null 2>"$tmpdir/cid/$id.err" &
     dk_cpids+=("$!")
+    # 起動時刻は起動直後に控える（ln_spawn と同じ。以後のシグナルは起動時刻と親 pid の一致を条件にする）。
+    ST=""
+    read_starttime "$!" || true
+    dk_cstart+=("$ST")
     spawn_section_end
     i=$((i + 1))
   done
 }
 
-# docker run クライアントの終了を期限つきで待って回収する。期限を過ぎたものは TERM を送る（本スクリプトの
-# 未回収の直接の子なので pid は再利用されない）。失敗は件数と先頭数件の stderr 末尾（無害化）を報告する。
+# docker run クライアントの終了を期限つきで待って回収する。期限を過ぎたものは TERM を送る（送信は
+# sig_same_proc 経由で、起動時刻と親 pid が一致する場合だけ。timeout は TERM を docker CLI へ中継し、
+# --kill-after 後に SIGKILL する）。失敗は件数と先頭数件の stderr 末尾（無害化）を報告する。
+# ここで回収するのは timeout プロセスまでで、docker CLI を含む残りの終了確認は dk_stop が行う。
 dk_wait_clients() { # <trial>
   local p i alive rc failed=0 shown=0 id line deadline
   deadline=$((SECONDS + timeout_s))
@@ -1321,7 +1348,9 @@ dk_wait_clients() { # <trial>
   done
   for i in "${!dk_cpids[@]}"; do
     p="${dk_cpids[i]}"
-    if proc_alive "$p"; then kill -TERM "$p" 2>/dev/null || true; fi
+    sig_same_proc TERM "$p" "${dk_cstart[i]:-}" "$$"
+    # 起動時刻を照合できず TERM を送れなかった場合でも、この wait は止まらない。クライアントは
+    # timeout --kill-after=5 で包んであり、起動から timeout_s + 5 秒以内に自身と docker CLI を終了させる。
     rc=0
     wait "$p" 2>/dev/null || rc=$?
     if [ "$rc" -ne 0 ]; then
@@ -1337,6 +1366,7 @@ dk_wait_clients() { # <trial>
     fi
   done
   dk_cpids=()
+  dk_cstart=()
   # 呼び出し元（dk_trials）が失敗試行を公開しないよう、失敗件数を DK_CLIENT_FAILED へ返す。
   DK_CLIENT_FAILED="$failed"
   if [ "$failed" -gt 0 ]; then err "docker-run-failed" "trial=$1 failed=${failed}/${count}"; fi
@@ -1467,11 +1497,21 @@ dk_measure_container() { # <i>
   return 1
 }
 
-# 今回の試行のコンテナを止めて残存を確認する。cidfile で所有を証明した ID だけを docker rm -f し、ラベルでの
-# 一覧が空になることを確認する。残存・確認不能は 4（ラベルが一致しても所有を証明できないコンテナには触れず、
+# docker run クライアント（本スクリプトの直接の子の timeout）に、起動時刻が一致して生存しているものがあるか。
+dk_any_client_alive() {
+  local j
+  for j in "${!dk_cpids[@]}"; do
+    if same_proc_alive "${dk_cpids[j]}" "${dk_cstart[j]:-}" "$$"; then return 0; fi
+  done
+  return 1
+}
+
+# 今回の試行のコンテナを止めて残存を確認する。docker run クライアント（timeout と docker CLI）の終了・回収を
+# 確認してから cidfile を読み、所有を証明した ID だけを docker rm -f し、ラベルでの一覧が空になることを
+# 確認する。クライアントの残存・コンテナの残存・確認不能は 4（ラベルが一致しても所有を証明できないコンテナには触れず、
 # 件数だけ報告する）。何度呼んでも安全（EXIT trap からも呼ばれる）。
 dk_stop() {
-  local f v p waited=0 alive owned=() rc=0 id o unowned=0 found
+  local f v p i waited=0 alive owned=() rc=0 id o unowned=0 found desc kids="" residual=() nokill=0 noterm=0
   [ "$dk_active" -eq 1 ] || return 0
   # 後始末の途中で TERM / INT / HUP を受けると on_signal 経由の exit で on_exit が走り、dk_active=0 の
   # 状態では dk_stop が no-op になって cidfile・一時ディレクトリが消え、所有コンテナが残る。そのため
@@ -1481,20 +1521,77 @@ dk_stop() {
   trap 'dk_sig=130' INT
   trap 'dk_sig=129' HUP
   # 起動中の docker run クライアントを先に終える（終了前の中断でコンテナが作られた後に ID を読むため）。
+  # 手順は 1) 自然終了を待つ（作成途中の docker run に cidfile を書かせる）、2) 残ったものへ TERM
+  # （timeout が docker CLI へ中継し、--kill-after=5 で SIGKILL する）、3) なお残るものは timeout と
+  # その子（docker CLI）を起動時刻の照合つきで SIGKILL、4) timeout・docker CLI のどちらも残っていない
+  # ことを確認してから cidfile を読む。timeout だけを終了させると docker CLI が孤児として動き続け、
+  # cidfile の削除後にコンテナを作り得る。終了を確認できないクライアントは残存として 4 を返す。
+  # 自然終了待ちは起動時刻を問わず「直接の子として生存しているか」で見る（シグナルを送らない段階なので、
+  # 起動時刻を控えられなかったクライアントの終了も待つ）。
   while [ "$waited" -lt 50 ]; do
     alive=0
     for p in "${dk_cpids[@]}"; do
-      if proc_alive "$p"; then alive=1; break; fi
+      if own_child_alive "$p"; then alive=1; break; fi
     done
     [ "$alive" -eq 1 ] || break
     sleep "$POLL_INTERVAL"
     waited=$((waited + 1))
   done
-  for p in "${dk_cpids[@]}"; do
-    if proc_alive "$p"; then kill -KILL "$p" 2>/dev/null || true; fi
-    wait "$p" 2>/dev/null || true
+  # FANDHE_CONCURRENT_MEMORY_SELFTEST_NOKILL は selftest が「回収不能」を模すための専用フック（ln_stop と
+  # 共通）。FANDHE_CONCURRENT_MEMORY_SELFTEST_DK_NO_TERM は TERM の段階だけを省き、SIGKILL の経路を照合する。
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ] && [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST_NOKILL:-}" = "1" ]; then nokill=1; fi
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ] && [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST_DK_NO_TERM:-}" = "1" ]; then noterm=1; fi
+  if [ "$nokill" -eq 0 ]; then
+    if [ "$noterm" -eq 0 ] && dk_any_client_alive; then
+      for i in "${!dk_cpids[@]}"; do
+        sig_same_proc TERM "${dk_cpids[i]}" "${dk_cstart[i]:-}" "$$"
+      done
+      # timeout の --kill-after（5 秒）が効くまで待つ（余裕を含めて 7 秒）。
+      waited=0
+      while [ "$waited" -lt 35 ] && dk_any_client_alive; do
+        sleep "$POLL_INTERVAL"
+        waited=$((waited + 1))
+      done
+    fi
+    for i in "${!dk_cpids[@]}"; do
+      if same_proc_alive "${dk_cpids[i]}" "${dk_cstart[i]:-}" "$$"; then
+        kill_child_with_kids "${dk_cpids[i]}" "${dk_cstart[i]}"
+        kids+="$KILLED_KIDS"
+      fi
+    done
+    waited=0
+    while [ "$waited" -lt 25 ]; do
+      alive=0
+      if dk_any_client_alive; then alive=1; fi
+      for desc in $kids; do
+        if same_proc_alive "${desc%%:*}" "${desc#*:}"; then alive=1; break; fi
+      done
+      [ "$alive" -eq 1 ] || break
+      sleep "$POLL_INTERVAL"
+      waited=$((waited + 1))
+    done
+  fi
+  for i in "${!dk_cpids[@]}"; do
+    p="${dk_cpids[i]}"
+    # 起動時刻が一致して生存しているもの・起動時刻を照合できないが直接の子として生存しているもの
+    # （シグナルを送っていない）は残存として報告し、wait しない（終了を待つと後始末が止まる）。
+    if same_proc_alive "$p" "${dk_cstart[i]:-}" "$$" || own_child_alive "$p"; then
+      residual+=("pid=${p}")
+    else
+      wait "$p" 2>/dev/null || true
+    fi
+  done
+  for desc in $kids; do
+    if same_proc_alive "${desc%%:*}" "${desc#*:}"; then residual+=("pid=${desc%%:*}"); fi
   done
   dk_cpids=()
+  dk_cstart=()
+  if [ "${#residual[@]}" -gt 0 ]; then
+    # クライアントが残っていると、この後にコンテナを作られても検出できない。残存として 4 を返す
+    # （以降の削除と残存確認は、その時点で証明できる分について続ける）。
+    err "cleanup-failed" "docker clients still running: ${residual[*]}"
+    rc=4
+  fi
   for f in "$tmpdir"/cid/*.cid; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     v=""

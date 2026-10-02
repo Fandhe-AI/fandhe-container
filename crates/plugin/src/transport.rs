@@ -250,10 +250,7 @@ impl UdsStream {
             return Err(poisoned_error());
         }
         let (result, restored) = self.inner.read_frame(timeout);
-        if result.is_err() || !restored {
-            self.poisoned = true;
-        }
-        result
+        self.finish_frame_op(result, restored)
     }
 
     /// フレーム 1 つを合計 `timeout` 以内に全量送る（PLUG-2・PLUG-5・REPAIR-5）。相手が読まず
@@ -263,25 +260,55 @@ impl UdsStream {
             return Err(poisoned_error());
         }
         let (result, restored) = self.inner.write_frame(frame, timeout);
+        self.finish_frame_op(result, restored)
+    }
+
+    /// フレーム操作の後始末。失敗、または socket 期限を復元できなかった場合は接続を使用不可にし、
+    /// 復元失敗は Ok の結果を握りつぶさずその操作のエラーとして返す（REPAIR-5）。
+    fn finish_frame_op<T>(
+        &mut self,
+        result: Result<T, PluginError>,
+        restored: bool,
+    ) -> Result<T, PluginError> {
         if result.is_err() || !restored {
             self.poisoned = true;
         }
-        result
+        match result {
+            Ok(_) if !restored => Err(PluginError::new(
+                PluginErrorCode::Internal,
+                "failed to restore io timeout",
+            )),
+            other => other,
+        }
+    }
+
+    /// 失敗後の接続への生 I/O を拒否する（フレーム I/O と同じ「失敗後は使用不可」契約）。
+    fn check_raw_io(&self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection is unusable after a previous frame error",
+            ));
+        }
+        Ok(())
     }
 }
 
 impl Read for UdsStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.check_raw_io()?;
         self.inner.read(buf)
     }
 }
 
 impl Write for UdsStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.check_raw_io()?;
         self.inner.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.check_raw_io()?;
         self.inner.flush()
     }
 }
@@ -716,7 +743,10 @@ mod imp {
             let Some((r, w)) = saved else {
                 return false;
             };
-            self.stream.set_read_timeout(r).is_ok() && self.stream.set_write_timeout(w).is_ok()
+            // 片方が失敗しても必ず両方を試す（短絡させない）。
+            let read_ok = self.stream.set_read_timeout(r).is_ok();
+            let write_ok = self.stream.set_write_timeout(w).is_ok();
+            read_ok && write_ok
         }
 
         fn read_frame_inner(&mut self, deadline: Instant) -> Result<Frame, PluginError> {
@@ -745,10 +775,15 @@ mod imp {
             let mut filled = 0usize;
             while filled < buf.len() {
                 let remaining = remaining_until(deadline, FrameOp::Read)?;
-                // macOS は peer close 後の UDS で set_read_timeout が EINVAL を返す。設定失敗は
-                // 致命扱いにせず読み取りを続ける（切断済みなら read は即座に残りバイトか EOF を返し、
-                // EOF は Unavailable に写像される。PLUG-2・REPAIR-5）。
-                let _ = self.stream.set_read_timeout(Some(remaining));
+                // macOS は peer close 後の UDS で set_read_timeout が EINVAL を返す。その場合のみ
+                // 続行する（切断済みなら read は即座に残りバイトか EOF を返し、EOF は Unavailable
+                // に写像される）。それ以外の失敗は旧期限で待ち続けうるため読まずに失敗させる
+                // （PLUG-2・REPAIR-5）。
+                if let Err(e) = self.stream.set_read_timeout(Some(remaining))
+                    && e.kind() != io::ErrorKind::InvalidInput
+                {
+                    return Err(internal_read());
+                }
                 let slice = buf.get_mut(filled..).ok_or_else(internal_read)?;
                 match self.stream.read(slice) {
                     Ok(0) => {
@@ -773,9 +808,13 @@ mod imp {
             let mut sent = 0usize;
             while sent < bytes.len() {
                 let remaining = remaining_until(deadline, FrameOp::Write)?;
-                // 読み取り側と同様、macOS の peer close 後 EINVAL は無視して write に進む
-                // （切断済みなら EPIPE 等が Unavailable に写像される）。
-                let _ = self.stream.set_write_timeout(Some(remaining));
+                // 読み取り側と同様、macOS の peer close 後 EINVAL のみ許容して write に進む
+                // （切断済みなら EPIPE 等が Unavailable に写像される）。他の失敗は書かずに失敗させる。
+                if let Err(e) = self.stream.set_write_timeout(Some(remaining))
+                    && e.kind() != io::ErrorKind::InvalidInput
+                {
+                    return Err(internal_write());
+                }
                 let slice = bytes.get(sent..).ok_or_else(internal_write)?;
                 match self.stream.write(slice) {
                     Ok(0) => {

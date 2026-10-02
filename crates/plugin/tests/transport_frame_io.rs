@@ -146,6 +146,25 @@ mod unix {
         assert_eq!(e.code(), PluginErrorCode::Unavailable);
     }
 
+    #[test]
+    fn repair5_raw_io_is_rejected_after_frame_failure() {
+        use std::io::{ErrorKind, Read};
+        let dir = TempDir::new();
+        let (_l, _client, mut server) = pair(&dir);
+        let e = server.read_frame(rpc(100)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Timeout);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            server.read(&mut buf).unwrap_err().kind(),
+            ErrorKind::NotConnected
+        );
+        assert_eq!(
+            server.write(b"x").unwrap_err().kind(),
+            ErrorKind::NotConnected
+        );
+        assert_eq!(server.flush().unwrap_err().kind(), ErrorKind::NotConnected);
+    }
+
     /// 送信バッファの挙動は OS 差が大きい（macOS は詰まりの閾値が異なる）ため、確実に詰まる
     /// Linux に限定する。期待値は弱めない。
     #[cfg(target_os = "linux")]

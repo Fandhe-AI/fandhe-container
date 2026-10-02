@@ -24,7 +24,7 @@
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`connect_unix`]（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 
@@ -113,7 +113,6 @@ pub(crate) fn fchmodat_nofollow(dir: &File, name: &CStr, mode: u32) -> io::Resul
 fn fchmodat_via_opath(dir: &File, name: &CStr, mode: ModeT) -> io::Result<()> {
     // O_PATH は x86_64 / aarch64 とも 0o10000000。
     const O_PATH: i32 = 0o10000000;
-    const AT_EMPTY_PATH: i32 = 0x1000;
     // SAFETY: `name` は NUL 終端の有効な C 文字列。`dir` は `&File` の借用中のため有効。
     let fd = unsafe {
         c_openat(
@@ -274,6 +273,42 @@ fn statx_ident(dirfd: i32, name: &CStr, flags: i32) -> io::Result<FileIdent> {
         mtime_sec: mtime.sec,
         mtime_nsec: mtime.nsec,
     })
+}
+
+/// `statx` の `AT_EMPTY_PATH`（fd 自体を対象にする。Linux の全アーキテクチャで共通値）。
+#[cfg(target_os = "linux")]
+const AT_EMPTY_PATH: i32 = 0x1000;
+
+/// `dir` 基準の `name`（symlink を辿らない）が、開いている `file` と同じ inode（dev / ino）を指すか。
+/// `name` が存在しなければ `false`。
+///
+/// bind ロックの取得後・解放時に、ロックファイル名が「いま flock を持っている inode」をまだ指して
+/// いるかを確かめるために使う（保持者が解放時に unlink した古い inode を掴んだ取得者を弾く。
+/// PLUG-12・TASK-123.2）。Linux は両方を `statx` で取得しパスを再解決しない。Linux 以外は
+/// [`lstat_at`] と同じく `fallback_path` の `symlink_metadata` へ縮退する。
+pub(crate) fn names_open_file(
+    dir: &File,
+    name: &CStr,
+    fallback_path: &std::path::Path,
+    file: &File,
+) -> io::Result<bool> {
+    let named = match lstat_at(dir, name, fallback_path) {
+        Ok(i) => i,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    #[cfg(target_os = "linux")]
+    let (dev, ino) = {
+        let i = statx_ident(file.as_raw_fd(), c"", AT_EMPTY_PATH)?;
+        (i.dev, i.ino)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (dev, ino) = {
+        use std::os::unix::fs::MetadataExt;
+        let m = file.metadata()?;
+        (m.dev(), m.ino())
+    };
+    Ok(!named.is_symlink && named.dev == dev && named.ino == ino)
 }
 
 /// `dir` 基準で `name`（symlink を辿らない）の識別情報を返す。
@@ -454,7 +489,7 @@ pub(crate) struct LockHandle {
 /// `dir` 基準で `name` のロックファイルを `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`・0600 で開き
 /// （無ければ作成）、非ブロッキングで排他ロックを取る。`O_NONBLOCK` は、既存の名前が FIFO・デバイス
 /// 等だった場合に open が相手を待って止まらないようにするため（通常ファイルの読み書きには影響しない。
-/// 種別は呼び出し側が開いた fd の metadata で検証して拒否する。REPAIR-5）。他者が保持中なら `WouldBlock`。listener の生存判定に接続 probe を
+/// REPAIR-5）。開いた fd が通常ファイルでなければロックせず `PermissionDenied`。他者が保持中なら `WouldBlock`。listener の生存判定に接続 probe を
 /// 使わず、「ロックを取れる＝以前の保持者は消えた」で stale を判定するための基盤（既存 listener の
 /// accept queue に副作用を与えない。PLUG-12）。未対応の OS・アーキテクチャは `Unsupported`。
 ///
@@ -495,6 +530,11 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (open(O_RDWR | O_CREAT)?, false),
             Err(e) => return Err(e),
         };
+        // 通常ファイル以外（FIFO・デバイス等）はロックを試みる前に拒否する（flock 自体が失敗して
+        // 理由が分からなくなる OS があるため。内容にも触れない）。
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
         match file.try_lock() {
             Ok(()) => Ok(LockHandle { file, created }),
             Err(std::fs::TryLockError::WouldBlock) => {

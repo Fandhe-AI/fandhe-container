@@ -635,9 +635,9 @@ mod imp {
             check_sun_path_len(&target)?;
             // 既存エントリの lstat 検証と、自 UID 所有の stale socket の削除（PLUG-12・TASK-123.2）。
             // 生存判定は接続 probe でなく sibling lock の flock（既存 listener に副作用を与えない）。
-            // 以降で失敗してもロックファイルは削除しない（flock 保持中の unlink は排他を崩す。残った
-            // ロックファイルは記録が無い限り管理下の証拠にならない。`BindLock` の doc 参照）。
-            let lock = crate::uds_security::acquire_bind_lock(&dir, &name, euid)?;
+            // 以降で失敗した場合、記録の無いロックファイルは `BindLock` の drop が解放の直前に削除する
+            // （削除と取得の競合は取得側の同一性確認で排除する。`BindLock` の doc 参照）。
+            let lock = crate::uds_security::acquire_bind_lock(&dir, &name, &bound, euid)?;
             crate::uds_security::clear_stale_socket(&dir, &name, &bound, euid, &lock)?;
             let listener = UnixListener::bind(&target).map_err(|e| map_bind_error(e.kind()))?;
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。

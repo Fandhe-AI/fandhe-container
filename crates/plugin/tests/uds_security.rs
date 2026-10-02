@@ -162,8 +162,8 @@ mod unix {
         assert!(record.starts_with(b"fcus2 "));
         let keep = d.path().join("s.keep");
         std::fs::hard_link(&p, &keep).unwrap(); // 正常終了の unlink から inode を守る
-        drop(first); // 記録を消し socket 名を unlink する
-        assert!(std::fs::read(&lock).unwrap().is_empty());
+        drop(first); // socket 名を unlink し、記録の無くなったロックファイルも削除する
+        assert!(std::fs::symlink_metadata(&lock).is_err());
         std::fs::rename(&keep, &p).unwrap();
         std::fs::write(&lock, &record).unwrap(); // クラッシュ時は記録が残る
         let l = UdsListener::bind(&p).unwrap();
@@ -231,9 +231,8 @@ mod unix {
         live.accept(Duration::from_secs(2)).unwrap();
     }
 
-    /// 記録の無い socket（他実装・旧版）は生存中か判別できないため削除しない。失敗した bind が
-    /// 作ったロックファイルは残るが（flock 保持中に unlink しない）、記録が空なので管理下の証拠に
-    /// ならず、再試行しても削除されない（PLUG-12・TASK-123.2）。
+    /// 記録の無い socket（他実装・旧版）は生存中か判別できないため削除しない。失敗した bind は
+    /// 作ったロックファイルを残さず、再試行しても socket は削除されない（PLUG-12・TASK-123.2）。
     #[test]
     fn plug12_unmanaged_socket_is_never_removed() {
         let t = TempDir::new();
@@ -244,16 +243,16 @@ mod unix {
             let e = UdsListener::bind(&p).unwrap_err();
             assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
             assert!(std::fs::symlink_metadata(&p).is_ok());
-            assert_eq!(std::fs::read(d.path().join("s.sock.lock")).unwrap(), b"");
+            assert!(std::fs::symlink_metadata(d.path().join("s.sock.lock")).is_err());
         }
         // 生存中の別 listener へ接続できる（socket が削除・置換されていない）。
         std::os::unix::net::UnixStream::connect(&p).unwrap();
     }
 
-    /// bind 失敗で残ったロックファイルは同じ inode のまま再利用される（unlink して作り直さない）。
-    /// 別 inode のロックを取得できると排他が崩れるため（PLUG-12・TASK-123.2）。
+    /// ロックファイルは listener の生存中だけ記録つきで存在し、記録が無くなれば（bind 失敗・正常終了）
+    /// 削除される。socket 名ごとのロックファイルを溜めない（PLUG-12・TASK-123.2）。
     #[test]
-    fn plug12_lock_file_is_never_unlinked_or_recreated() {
+    fn plug12_lock_file_exists_only_while_recorded() {
         let t = TempDir::new();
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         let p = d.path().join("s.sock");
@@ -261,15 +260,65 @@ mod unix {
         let other = std::os::unix::net::UnixListener::bind(&p).unwrap();
         let e = UdsListener::bind(&p).unwrap_err(); // ロックを新規作成して失敗する
         assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
-        let ino = std::fs::metadata(&lock).unwrap().ino();
+        assert!(std::fs::symlink_metadata(&lock).is_err());
         drop(other);
         std::fs::remove_file(&p).unwrap();
         let l = UdsListener::bind(&p).unwrap();
-        assert_eq!(std::fs::metadata(&lock).unwrap().ino(), ino);
-        drop(l); // 正常終了でもロックファイルは残り、記録だけが消える
-        assert_eq!(std::fs::metadata(&lock).unwrap().ino(), ino);
-        assert_eq!(std::fs::read(&lock).unwrap(), b"");
+        let ino = std::fs::symlink_metadata(&p).unwrap().ino();
+        assert_eq!(
+            recorded_ino(&std::fs::read_to_string(&lock).unwrap()),
+            Some(ino)
+        );
+        drop(l);
+        assert!(std::fs::symlink_metadata(&lock).is_err());
         assert!(std::fs::symlink_metadata(&p).is_err());
+        let names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, Vec::<std::ffi::OsString>::new());
+    }
+
+    /// 同じパスへの bind / 解放を複数スレッドで繰り返しても、同時に成功する listener は 1 つだけで、
+    /// 失敗は `AlreadyExists` のみ。ロックファイルの削除と取得が競合しても排他が保たれる
+    /// （PLUG-12・TASK-123.2）。
+    #[test]
+    fn plug12_concurrent_bind_and_release_keeps_exclusion() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        let t = TempDir::new();
+        let d = RuntimeDir::ensure_under(&t.0).unwrap();
+        let p = d.path().join("s.sock");
+        let active = Arc::new(AtomicUsize::new(0));
+        let bound = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let (p, active, bound) = (p.clone(), active.clone(), bound.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        match UdsListener::bind(&p) {
+                            Ok(l) => {
+                                assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                                // 保持中は自分の listener へ接続できる（パスを奪われていない）。
+                                let _c = std::os::unix::net::UnixStream::connect(l.path()).unwrap();
+                                l.accept(std::time::Duration::from_secs(5)).unwrap();
+                                bound.fetch_add(1, Ordering::SeqCst);
+                                assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                                drop(l);
+                            }
+                            Err(e) => assert_eq!(e.code(), PluginErrorCode::AlreadyExists),
+                        }
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert!(bound.load(Ordering::SeqCst) >= 1);
+        // 全員が解放した後は何も残らず、再 bind できる。
+        assert!(std::fs::symlink_metadata(d.path().join("s.sock.lock")).is_err());
+        UdsListener::bind(&p).unwrap();
     }
 
     /// stale socket を削除した後の再 bind が失敗しても、削除済み socket の記録を残さない。残すと
@@ -292,7 +341,8 @@ mod unix {
         let other = std::os::unix::net::UnixListener::bind(&p).unwrap();
         let e = UdsListener::bind(&p).unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
-        assert_eq!(std::fs::read(&lock).unwrap(), b"");
+        // 一致しない記録は消去され、記録の無くなったロックファイルも残らない。
+        assert!(std::fs::symlink_metadata(&lock).is_err());
         std::os::unix::net::UnixStream::connect(&p).unwrap();
         drop(other);
         std::fs::remove_file(&p).unwrap();
@@ -375,17 +425,17 @@ mod unix {
         l.accept(std::time::Duration::from_secs(2)).unwrap();
     }
 
-    /// 正常終了後に残ったロックファイルだけでは管理下の証拠にならず、後から別経路が bind した
-    /// socket は削除しない（TASK-123.2・Codex P0 / Bugbot 指摘）。
+    /// 記録の無いロックファイルが残っていても（旧版・外部で作られた空ファイル）管理下の証拠に
+    /// ならず、別経路が bind した socket は削除しない（PLUG-12・TASK-123.2）。
     #[test]
     fn plug12_leftover_lock_does_not_authorize_removing_foreign_socket() {
         let t = TempDir::new();
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         let p = d.path().join("s.sock");
-        drop(UdsListener::bind(&p).unwrap()); // ロックファイルは残る
-        assert!(d.path().join("s.sock.lock").exists());
+        drop(UdsListener::bind(&p).unwrap());
         let _other = std::os::unix::net::UnixListener::bind(&p).unwrap();
         for _ in 0..2 {
+            std::fs::write(d.path().join("s.sock.lock"), b"").unwrap();
             let e = UdsListener::bind(&p).unwrap_err();
             assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
             assert!(std::fs::symlink_metadata(&p).is_ok());

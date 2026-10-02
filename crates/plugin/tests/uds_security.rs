@@ -45,7 +45,8 @@ mod unix {
     fn plug12_creates_runtime_dir_with_0700() {
         let t = TempDir::new();
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
-        assert_eq!(d.path(), t.rt().as_path());
+        let expected = std::fs::canonicalize(&t.0).unwrap().join(RUNTIME_DIR_NAME);
+        assert_eq!(d.path(), expected.as_path());
         assert_eq!(mode_of(d.path()), 0o700);
         assert_eq!(
             std::fs::metadata(d.path()).unwrap().uid(),

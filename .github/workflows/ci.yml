@@ -537,6 +537,15 @@ jobs:
         run: make idle-memory-supervised-selftest
       - name: ベンチ比較の配線確認（プレースホルダ・性能回帰は未検出）
         run: make bench-check
+      # core の既定 / plugin 除外（--no-default-features）release ビルドと成果物サイズの記録
+      # （PLUG-3・TASK-111.2・#263）。新ジョブは check-run 名が増え ruleset 変更が要るため
+      # 既存ジョブのステップとする（check-run 29 件は不変）。計測対象は rlib（最終バイナリ未実装。
+      # TASK-79 後に実行ファイルへ切り替える）で、差は僅少のため軽量化効果の実測ではない
+      - name: plugin feature 除外ビルドとサイズ記録（PLUG-3・TASK-111.2）
+        shell: bash
+        run: |
+          set -euo pipefail
+          make plugin-feature-size | tee -a "${GITHUB_STEP_SUMMARY}"
 
   # --------------------------------------------------
   # aarch64-linux-check（Linux aarch64 向けクロス型検査: #1120・REPAIR-7 第 1 段階を補うアーキ網羅）

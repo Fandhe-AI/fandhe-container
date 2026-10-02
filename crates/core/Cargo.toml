@@ -22,7 +22,7 @@ fandhe-container-plugin = { workspace = true, optional = true }
 #
 # `plugin` feature（PLUG-3・TASK-111.1・#262）: 未使用の plugin 相当機能をコンパイル時に除外して
 # 軽量バイナリを作れるようにする。`default` を新設し既定では有効（従来の利用側は挙動が変わらない）。
-# 無効化は `--no-default-features`。CI 組み込みとバイナリサイズ記録は TASK-111.2（#263）。
+# 無効化は `--no-default-features`。CI 組み込みとサイズ記録は TASK-111.2（#263）で導入済み（`make plugin-feature-size`・docs/design/plugin-feature-size-record.md）。
 [features]
 default = ["plugin"]
 plugin = ["dep:fandhe-container-plugin"]

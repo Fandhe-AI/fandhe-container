@@ -498,3 +498,18 @@ fn plug11_task122_2_held_fd_survives_symlink_retarget() {
     v.into_file().read_to_string(&mut s).unwrap();
     assert_eq!(s, "payload");
 }
+
+/// 実ファイル名が ` (deleted)` で終わっていても、実体が存在し信頼できれば受理する
+/// （リンク先文字列だけで削除済み判定しない。PLUG-11・TASK-122.2）。
+#[test]
+fn plug11_task122_2_accepts_real_name_ending_with_deleted_suffix() {
+    let tmp = setup("s2del", 0o755, 0o755);
+    let odd = "plugin (deleted)";
+    fs::rename(tmp.0.join(NAME), tmp.0.join(odd)).unwrap();
+    symlink(odd, tmp.0.join(LINK)).unwrap();
+    let v = verified_link(&tmp.0).expect("accepted");
+    assert_eq!(
+        v.resolved_path(),
+        fs::canonicalize(tmp.0.join(odd)).unwrap()
+    );
+}

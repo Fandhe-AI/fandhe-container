@@ -1253,7 +1253,7 @@ pub(crate) fn open_read_nonblock_at(
     open_file_at(parent, name, consts::O_RDONLY | consts::O_NONBLOCK)
 }
 
-/// [`open_path_follow_at`] / [`open_read_nonblock_follow_at`] 共通の `openat(2)` 呼び出し。
+/// [`open_path_follow_at`] / [`reopen_pinned_read_nonblock`] 共通の `openat(2)` 呼び出し。
 /// `O_NOFOLLOW` を付けず最終要素の symlink チェーンをカーネルに辿らせる（ホップ上限を超えると
 /// `ELOOP`）。`O_CREAT` を含まない。辿った先の実体は呼び出し側が fstat と祖先検証で確かめる前提
 /// （PLUG-11・TASK-122.2）。
@@ -1283,14 +1283,16 @@ pub(crate) fn open_path_follow_at(
     open_follow_at(parent, name, consts::O_PATH)
 }
 
-/// `parent` 配下の `name` を `O_RDONLY|O_NONBLOCK|O_CLOEXEC` で開く（最終要素の symlink を辿る）。
-/// FIFO 等でも `openat(2)` が相手待ちで止まらない（REPAIR-5）。symlink ループは `ELOOP`。
-/// 辿った実体の所有者・モード・祖先は呼び出し側が検証する（PLUG-11・TASK-122.2）。
-pub(crate) fn open_read_nonblock_follow_at(
-    parent: BorrowedFd<'_>,
-    name: &CStr,
-) -> Result<OwnedFd, SysError> {
-    open_follow_at(parent, name, consts::O_RDONLY | consts::O_NONBLOCK)
+/// 保持中の `O_PATH` fd `pinned` が指す inode を `/proc/thread-self/fd/N` 経由で
+/// `O_RDONLY|O_NONBLOCK|O_CLOEXEC` に開き直す。パスの再解決（symlink チェーンの再走査）を
+/// 行わず、`pinned` が固定した inode そのものを開く（magic link はリンク先を再 walk しない）。
+/// 呼び出し側は `pinned` への fstat で通常ファイルと確認済みであること（デバイス・FIFO 等への
+/// open の副作用を避ける。REPAIR-5・PLUG-11・TASK-122.2）。
+pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
+    let path = std::ffi::CString::new(format!("/proc/thread-self/fd/{}", pinned.as_raw_fd()))
+        .map_err(|_| SysError::Unsupported)?;
+    // 絶対パスのため dirfd は無視される（`pinned` を渡しても解決に影響しない）。
+    open_follow_at(pinned, &path, consts::O_RDONLY | consts::O_NONBLOCK)
 }
 
 /// `parent` 配下の既存ファイル `name` を書き込み専用（`O_NOFOLLOW`）で開く。
@@ -2519,18 +2521,16 @@ mod tests {
 
         let probe = open_path_follow_at(parent.as_fd(), c"l2").unwrap();
         assert!(std::fs::File::from(probe).metadata().unwrap().is_file());
-        let fd = open_read_nonblock_follow_at(parent.as_fd(), c"l2").unwrap();
+        let pinned = open_path_follow_at(parent.as_fd(), c"l2").unwrap();
+        let fd = reopen_pinned_read_nonblock(pinned.as_fd()).unwrap();
         assert_eq!(std::fs::File::from(fd).metadata().unwrap().len(), 1);
 
         assert!(matches!(
             open_path_follow_at(parent.as_fd(), c"loop"),
             Err(SysError::Os(n)) if n == ELOOP
         ));
-        assert!(matches!(
-            open_read_nonblock_follow_at(parent.as_fd(), c"loop"),
-            Err(SysError::Os(n)) if n == ELOOP
-        ));
-        let fd = open_read_nonblock_follow_at(parent.as_fd(), c"lp").unwrap();
+        let pinned = open_path_follow_at(parent.as_fd(), c"lp").unwrap();
+        let fd = reopen_pinned_read_nonblock(pinned.as_fd()).unwrap();
         assert!(
             std::fs::File::from(fd)
                 .metadata()

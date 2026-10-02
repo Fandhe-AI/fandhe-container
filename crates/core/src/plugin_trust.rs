@@ -434,7 +434,7 @@ mod imp {
             path: PathBuf,
         ) -> Result<VerifiedPluginFile, PluginTrustError> {
             let err = |k| PluginTrustError::new(k, TrustTarget::File, &path);
-            // (1) 追従 O_PATH プローブで実体の種別を確認する（FIFO・デバイスの open による
+            // (1) 追従 O_PATH で実体を一度だけ解決して固定する（FIFO・デバイスの open による
             // ハング・副作用を避ける。REPAIR-5）。ループ・ホップ超過はここで ELOOP。
             let probe = sys::open_path_follow_at(self.fd.as_fd(), name)
                 .map_err(|e| err(map_sys_follow(e)))?;
@@ -442,9 +442,10 @@ mod imp {
             if !probe_md.is_file() {
                 return Err(err(PluginTrustErrorKind::NotRegularFile));
             }
-            // (2) 保持 fd（唯一の引き渡し fd）。差し替えに備え dev/ino をプローブと照合する。
-            let rfd = sys::open_read_nonblock_follow_at(self.fd.as_fd(), name)
-                .map_err(|e| err(map_sys_follow(e)))?;
+            // (2) 保持 fd は固定済みの O_PATH fd から開き直す。symlink チェーンを再走査しない
+            // ため、probe 後に張り替えられても別の実体は開かれない（通常ファイルと確認済み）。
+            let rfd = sys::reopen_pinned_read_nonblock(probe.as_fd())
+                .map_err(|e| err(map_sys(e, false)))?;
             let md = fstat(&rfd).map_err(|_| err(PluginTrustErrorKind::Io))?;
             if !md.is_file() {
                 return Err(err(PluginTrustErrorKind::NotRegularFile));
@@ -464,8 +465,10 @@ mod imp {
             else {
                 return Err(err(PluginTrustErrorKind::Io));
             };
-            // 削除済みの実体は `... (deleted)` 付きで返るため、パスと一致しない名前を拒否する。
-            if !is_single_component(real_name) || real_name.as_bytes().ends_with(b" (deleted)") {
+            // 削除済みの実体は `... (deleted)` 付きで返るが、正当な実名が同じ接尾辞を持ちうるため
+            // 文字列では判定しない。(6) の検証済み親からの open と保持 fd の dev/ino 照合で
+            // 実体の存在を確かめる（削除済みなら ENOENT か inode 不一致で拒否される）。
+            if !is_single_component(real_name) {
                 return Err(err(PluginTrustErrorKind::Io));
             }
             // (5) 実体の親と全祖先を探索先と同一基準で検証する。

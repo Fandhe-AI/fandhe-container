@@ -12,7 +12,8 @@ use std::fmt;
 /// `NetError` の機械可読な分類（ERR-1）。
 ///
 /// `#[non_exhaustive]` のため、呼び出し側の `match` は `_` 分岐を持つこと。
-/// 他のコード（`Timeout`・`PermissionDenied` 等）は、使う Issue（#843・#844 等）で追加する。
+/// ソケット層（#843）で `Timeout`・`PermissionDenied`・`Unimplemented`・`ResourceExhausted`・`Internal`
+/// を追加した。文字列は `PluginErrorCode::as_str` と揃える。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum NetErrorCode {
@@ -20,6 +21,16 @@ pub enum NetErrorCode {
     InvalidArgument,
     /// デコード側で検出した不正な長さ・切り詰め（受信データの破損）。
     DataLoss,
+    /// 期限内に応答が得られなかった（REPAIR-5）。
+    Timeout,
+    /// 権限不足（`EPERM`・`EACCES`）。
+    PermissionDenied,
+    /// 対応外の OS・アーキテクチャ・プロトコル（fail-closed）。
+    Unimplemented,
+    /// fd・メモリ・カーネルバッファ等の資源枯渇。
+    ResourceExhausted,
+    /// 上記以外の内部エラー（分類できない errno 等）。
+    Internal,
 }
 
 impl NetErrorCode {
@@ -28,6 +39,11 @@ impl NetErrorCode {
         match self {
             Self::InvalidArgument => "INVALID_ARGUMENT",
             Self::DataLoss => "DATA_LOSS",
+            Self::Timeout => "TIMEOUT",
+            Self::PermissionDenied => "PERMISSION_DENIED",
+            Self::Unimplemented => "UNIMPLEMENTED",
+            Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
+            Self::Internal => "INTERNAL",
         }
     }
 }
@@ -78,6 +94,14 @@ mod tests {
     fn code_strings_and_display() {
         assert_eq!(NetErrorCode::InvalidArgument.as_str(), "INVALID_ARGUMENT");
         assert_eq!(NetErrorCode::DataLoss.as_str(), "DATA_LOSS");
+        assert_eq!(NetErrorCode::Timeout.as_str(), "TIMEOUT");
+        assert_eq!(NetErrorCode::PermissionDenied.as_str(), "PERMISSION_DENIED");
+        assert_eq!(NetErrorCode::Unimplemented.as_str(), "UNIMPLEMENTED");
+        assert_eq!(
+            NetErrorCode::ResourceExhausted.as_str(),
+            "RESOURCE_EXHAUSTED"
+        );
+        assert_eq!(NetErrorCode::Internal.as_str(), "INTERNAL");
         let e = NetError::new(NetErrorCode::DataLoss, "truncated");
         assert_eq!(e.to_string(), "DATA_LOSS: truncated");
         assert_eq!(e.code(), NetErrorCode::DataLoss);

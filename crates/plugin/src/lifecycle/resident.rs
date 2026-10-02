@@ -173,20 +173,46 @@ pub struct ResidentCallRecord {
 }
 
 impl ResidentCallRecord {
-    /// JSON Lines の 1 行（改行なし）へ符号化する。固定文字列・数値・真偽値のみで外部入力を埋め込まない。
+    /// JSON Lines の 1 行（改行なし）へ符号化する。
+    ///
+    /// `operation` と `error_code` は公開フィールドで呼び出し側が任意の値を入れ得るため、
+    /// 引用符・バックスラッシュ・制御文字（改行を含む）を JSON 文字列としてエスケープし、
+    /// 常に単一行の妥当な JSON になることを保証する（REPAIR-4）。
     pub fn to_json_line(&self) -> String {
         let code = match self.error_code {
-            Some(c) => format!("\"{c}\""),
+            Some(c) => format!("\"{}\"", json_escape(c)),
             None => "null".to_string(),
         };
         format!(
             "{{\"op\":\"{}\",\"success\":{},\"error_code\":{},\"elapsed_us\":{}}}",
-            self.operation,
+            json_escape(self.operation),
             self.success,
             code,
             self.elapsed.as_micros()
         )
     }
+}
+
+/// JSON 文字列リテラルの内側へ埋め込める形にエスケープする（RFC 8259 §7）。
+///
+/// `"`・`\`・U+0000〜U+001F をエスケープし、それ以外（非 ASCII を含む）はそのまま出す。
+fn json_escape(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// 常駐 plugin プロセスとの接続を保持するセッション（PLUG-7）。
@@ -557,6 +583,24 @@ mod tests {
             ok.to_json_line(),
             "{\"op\":\"plugin.resident_call\",\"success\":true,\
              \"error_code\":null,\"elapsed_us\":2500}"
+        );
+    }
+
+    /// REPAIR-4: 引用符・バックスラッシュ・改行・制御文字を含む値でも単一行の妥当な JSON になる。
+    #[test]
+    fn repair4_resident_record_json_line_escapes_fields() {
+        let rec = ResidentCallRecord {
+            operation: "a\"b\\c\nd\te\u{1}",
+            success: false,
+            error_code: Some("X\"\r\ny"),
+            elapsed: Duration::from_micros(1),
+        };
+        let line = rec.to_json_line();
+        assert!(!line.contains('\n') && !line.contains('\r'));
+        assert_eq!(
+            line,
+            "{\"op\":\"a\\\"b\\\\c\\nd\\te\\u0001\",\"success\":false,\
+             \"error_code\":\"X\\\"\\r\\ny\",\"elapsed_us\":1}"
         );
     }
 

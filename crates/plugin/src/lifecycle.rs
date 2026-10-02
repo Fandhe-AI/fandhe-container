@@ -191,10 +191,10 @@ impl ChildGuard {
     }
 
     /// kill して回収を `ONE_SHOT_REAP_TIMEOUT` まで待つ。回収を確認できたら true。
-    /// kill の失敗は無視せず、回収確認ができなければ false を返す（呼び出し側が `Unreaped` で報告する）。
-    /// 回収できなかった子は `Child` を手放す（以後 wait しない。孤児化の可能性は報告で伝える）。
+    /// kill の失敗は無視せず、回収確認ができなければ false を返す（呼び出し側が報告する）。
+    /// 回収できなかった場合は `Child` を保持し続ける（再試行・`Drop` での最終試行のため手放さない）。
     fn kill_and_reap(&mut self) -> bool {
-        let Some(mut c) = self.0.take() else {
+        let Some(c) = self.0.as_mut() else {
             return true;
         };
         let _ = c.kill();
@@ -202,7 +202,10 @@ impl ChildGuard {
         let mut interval = Duration::from_millis(1);
         loop {
             match c.try_wait() {
-                Ok(Some(_)) => return true,
+                Ok(Some(_)) => {
+                    self.0 = None;
+                    return true;
+                }
                 Ok(None) => {}
                 Err(_) => return false,
             }
@@ -386,7 +389,7 @@ fn call_once_inner(
 
     // 受付・往復はブロック内で完結させ、抜けた時点で接続を閉じて子に EOF を見せる
     // （続けて listener を drop して socket を unlink してから終了を待つ）。
-    let response = {
+    let exchange = (|| -> Result<Frame, PluginError> {
         let child_pid = guard.pid().ok_or_else(|| {
             PluginError::new(
                 PluginErrorCode::Internal,
@@ -407,9 +410,22 @@ fn call_once_inner(
             listener.accept_peer_pid(left, child_pid, &mut check_child)?
         };
         stream.write_frame(request, rpc_timeout(remaining(deadline)?)?)?;
-        stream.read_frame(rpc_timeout(remaining(deadline)?)?)?
-    };
+        stream.read_frame(rpc_timeout(remaining(deadline)?)?)
+    })();
     drop(listener);
+    // 応答前のエラー経路でも、ここで子を明示的に kill・回収し、回収失敗を呼び出し側へ返す（REPAIR-5・PLUG-7）。
+    let response = match exchange {
+        Ok(r) => r,
+        Err(e) => {
+            if !guard.kill_and_reap() {
+                return Err(PluginError::new(
+                    PluginErrorCode::Internal,
+                    "plugin process could not be reaped after a failed exchange",
+                ));
+            }
+            return Err(e);
+        }
+    };
     let termination = guard.wait_or_kill(ONE_SHOT_EXIT_TIMEOUT);
     // 回収を確認できない子（孤児の可能性）と異常終了（非ゼロ・シグナル）は成功扱いにしない（REPAIR-5・PLUG-7）。
     match termination {

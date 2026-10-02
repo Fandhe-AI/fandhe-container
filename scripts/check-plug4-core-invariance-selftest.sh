@@ -12,6 +12,8 @@
 #   - plugin crate を追加する PR が core の src/ または tests/ を変更すると失敗し、変更ファイルを出力する
 #   - plugin crate を追加しない PR の core 変更は対象外（成功）
 #   - 基準は merge-base（分岐後に base だけで進んだ core 変更を PR の変更と誤検出しない）
+#   - PLUG4_BASE_REF 指定時（PR 判定）は HEAD のコミット tree を見る（作業ツリーの未コミット変更を混ぜない）。
+#     未指定時（ローカル実行）は作業ツリーの未コミット変更を含めて複製する
 #   - PLUG4_BASE_REF が解決できなければ失敗する（fail-closed）
 #   - 空白を含むパス・symlink を含む作業ツリーを複製できる
 #
@@ -109,7 +111,8 @@ branch_from_base() {
 run_case() {
   local name="$1" expected="$2" base_ref="$3"
   shift 3
-  local actual=0 want
+  local actual=0 want status_before
+  status_before="$(g status --porcelain)"
   if [ -n "$base_ref" ]; then
     PLUG4_BASE_REF="$base_ref" bash "$fx/scripts/check-plug4-core-invariance.sh" >"$work/out.txt" 2>&1 || actual=$?
   else
@@ -128,7 +131,7 @@ run_case() {
     fi
   done
   # 判定スクリプトはリポ内のファイルを変更しない
-  if [ -n "$(g status --porcelain)" ]; then
+  if [ "$(g status --porcelain)" != "$status_before" ]; then
     fail "${name} (repository was modified)"
     return
   fi
@@ -181,6 +184,17 @@ echo 'pub fn later() -> u32 { 1 }' >>"$fx/crates/core/src/lib.rs"
 g commit -q -am "base moves core"
 g checkout -q pr-plugin-only
 run_case "base-moved-after-fork" 0 base-moved "$ok_msg"
+
+# 8. PR 判定は HEAD のコミット tree を見る: 作業ツリーに未コミットの core 変更が残っていても、
+#    plugin だけを追加する PR は成功する（merge-base と PR head の比較に固定）
+echo 'pub fn dirty() -> u32 { 9 }' >>"$fx/crates/core/src/lib.rs"
+run_case "pr-mode-ignores-dirty-worktree" 0 base "$ok_msg"
+
+# 9. ローカル実行（PLUG4_BASE_REF 未指定）は作業ツリーを複製する: 未コミットの変更で core がビルド
+#    できなくなっていれば失敗する（コミット tree を見ていれば成功してしまう）
+echo 'compile_error!("dirty worktree is copied");' >>"$fx/crates/core/src/lib.rs"
+run_case "local-mode-uses-worktree" 101 "" "dirty worktree is copied"
+g checkout -q -- crates/core/src/lib.rs
 
 if [ "$failures" -ne 0 ]; then
   echo "plug4-core-invariance selftest: ${failures} failure(s)" >&2

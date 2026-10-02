@@ -239,13 +239,28 @@ pub fn default_search_dirs() -> Vec<PluginSearchDir> {
 ///
 /// 結果は (origin: System → User, name 昇順) に整列する。存在しないディレクトリは候補なし。
 /// それ以外の I/O エラー・走査上限・候補総数上限（[`MAX_TOTAL_CANDIDATES`]）超過は `Err`（fail-closed）。
+///
+/// `PluginDirKind::Path` の探索先は受け付けず `Err(InvalidArgument)`（PLUG-11。`PATH` 探索は
+/// opt-in 経路の [`discover_with_options`] が内部で生成した探索先だけを走査する）。
 pub fn discover_candidates(dirs: &[PluginSearchDir]) -> Result<Vec<PluginCandidate>, TraitError> {
+    reject_path_kind(dirs)?;
     let mut found = Vec::new();
     for dir in dirs {
         scan_dir(dir, MAX_SCANNED_ENTRIES_PER_DIR, &mut found)?;
     }
     found.sort_by(|a, b| (a.origin, &a.name, &a.path).cmp(&(b.origin, &b.name, &b.path)));
     Ok(found)
+}
+
+/// 管理ディレクトリ引数に `PATH` 区分が混入していたら拒否する（PLUG-11。opt-in と警告の迂回防止）。
+fn reject_path_kind(dirs: &[PluginSearchDir]) -> Result<(), TraitError> {
+    if dirs.iter().any(|d| d.kind == PluginDirKind::Path) {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "PATH-kind search directory is not accepted as a managed directory",
+        ));
+    }
+    Ok(())
 }
 
 /// 既定の管理ディレクトリを走査する（`discover_candidates(&default_search_dirs())`）。
@@ -432,6 +447,7 @@ pub fn discover_with_options(
     path_value: Option<&OsStr>,
     options: &DiscoveryOptions,
 ) -> Result<DiscoveryReport, TraitError> {
+    reject_path_kind(managed_dirs)?;
     let mut found = Vec::new();
     for dir in managed_dirs {
         scan_dir(dir, MAX_SCANNED_ENTRIES_PER_DIR, &mut found)?;
@@ -697,6 +713,18 @@ mod tests {
         assert_eq!(ok.len(), 256);
         let err = resolve_path_search_dirs(Some(&mk(257))).unwrap_err();
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    }
+
+    #[test]
+    fn plug11_path_kind_dir_is_rejected_as_managed_dir() {
+        let dirs = vec![PluginSearchDir::new(
+            PluginDirKind::Path,
+            std::env::temp_dir(),
+        )];
+        let err = discover_candidates(&dirs).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        let err = discover_with_options(&dirs, None, &DiscoveryOptions::new()).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
     }
 
     #[test]

@@ -51,14 +51,31 @@ mod rejection {
     impl Fixture {
         fn new(tag: &str) -> Self {
             let home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set"));
-            let dir = home.join(format!(
-                "fandhe-plugin-trust-it-{}-{tag}",
-                std::process::id()
-            ));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir(&dir).expect("create fixture dir");
-            chmod(&dir, 0o755);
-            Self(dir)
+            // 既存ディレクトリを削除しない: 名前に時刻 ns・カウンタを混ぜ、`create_dir`
+            // （既存なら AlreadyExists で失敗するアトミックな新規作成）に成功したものだけを
+            // 自分の所有物として Drop で削除する。衝突時は別名で再試行する。
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            for _ in 0..100 {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let dir = home.join(format!(
+                    "fandhe-plugin-trust-it-{}-{nanos:x}-{seq}-{tag}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&dir) {
+                    Ok(()) => {
+                        let fixture = Self(dir);
+                        chmod(&fixture.0, 0o755);
+                        return fixture;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("create fixture dir: {e}"),
+                }
+            }
+            panic!("could not create a unique fixture dir under HOME");
         }
 
         /// 0o755 のサブディレクトリを作る。

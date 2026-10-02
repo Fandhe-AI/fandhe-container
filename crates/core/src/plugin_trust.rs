@@ -161,6 +161,7 @@ pub fn check_owner_and_mode(
 
 /// ファイル名が 1 要素（`/`・`.`・`..`・空・NUL を含まない）であることを確認する。
 /// バイト列で判定し OS 非依存にする（非 UTF-8 も扱う）。
+#[cfg(any(target_os = "linux", test))]
 fn is_single_component(name: &OsStr) -> bool {
     let s = name.to_string_lossy();
     !(s.is_empty() || s == "." || s == ".." || s.contains('/') || s.contains('\0'))
@@ -282,8 +283,10 @@ mod imp {
             if !probe_md.is_file() {
                 return Err(err(PluginTrustErrorKind::NotRegularFile));
             }
-            // (b) 読み取り用 fd を開き、正とする判定はこの fd への fstat で行う。
-            let rfd = sys::open_read_at(self.fd.as_fd(), &c).map_err(|e| err(map_sys(e, false)))?;
+            // (b) 読み取り用 fd を O_NONBLOCK で開き（O_PATH 確認後に FIFO へ差し替えられても
+            // open 自体が止まらない。REPAIR-5）、正とする判定はこの fd への fstat で行う。
+            let rfd = sys::open_read_nonblock_at(self.fd.as_fd(), &c)
+                .map_err(|e| err(map_sys(e, false)))?;
             let md = fstat(&rfd).map_err(|_| err(PluginTrustErrorKind::Io))?;
             if !md.is_file() {
                 return Err(err(PluginTrustErrorKind::NotRegularFile));

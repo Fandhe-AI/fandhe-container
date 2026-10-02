@@ -1243,6 +1243,16 @@ pub(crate) fn open_read_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<OwnedF
     open_file_at(parent, name, consts::O_RDONLY)
 }
 
+/// `parent` 配下の既存ファイル `name` を `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` で開く。
+/// FIFO 等へ差し替えられても `openat(2)` が相手待ちで止まらない（REPAIR-5）。種別は呼び出し側が
+/// 開いた fd への `fstat` で確かめる（PLUG-11・TASK-122.1）。通常ファイルの読み取りには影響しない。
+pub(crate) fn open_read_nonblock_at(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+) -> Result<OwnedFd, SysError> {
+    open_file_at(parent, name, consts::O_RDONLY | consts::O_NONBLOCK)
+}
+
 /// `parent` 配下の既存ファイル `name` を書き込み専用（`O_NOFOLLOW`）で開く。
 /// `cgroup.procs`・`cgroup.subtree_control` への書き込みに使う（CORE-3）。
 pub(crate) fn open_write_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, SysError> {
@@ -2424,6 +2434,28 @@ mod tests {
         assert_eq!(
             open_path_nofollow(parent.as_fd(), c"missing").unwrap_err(),
             SysError::Os(ENOENT)
+        );
+    }
+
+    /// PLUG-11・REPAIR-5（TASK-122.1）: `open_read_nonblock_at` は書き手のいない FIFO でも
+    /// 待たずに返り、開いた fd は FIFO として判別できる。
+    #[test]
+    fn plug11_open_read_nonblock_at_does_not_block_on_fifo() {
+        use std::os::unix::fs::FileTypeExt as _;
+        let t = TempTree::new("rdnb");
+        let status = std::process::Command::new("mkfifo")
+            .arg(t.base.join("pipe"))
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success());
+        let parent = open_dir_path_nofollow(None, &c(&t.base)).unwrap();
+        let fd = open_read_nonblock_at(parent.as_fd(), c"pipe").unwrap();
+        assert!(
+            std::fs::File::from(fd)
+                .metadata()
+                .unwrap()
+                .file_type()
+                .is_fifo()
         );
     }
 

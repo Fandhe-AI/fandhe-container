@@ -159,21 +159,27 @@ pub struct Results {
 impl Results {
     /// results スキーマの JSON（LF 改行）を返す。全値が有限かつ 0 超でなければ `Err`。
     pub fn to_json(&self) -> Result<String, BenchError> {
-        let mut entries = vec![(METRIC_INPROC, self.inproc)];
-        if let Some(f) = self.framed {
-            entries.push((METRIC_FRAMED, f));
-        }
+        // 未計測（`None`）は metric ごと省略せず `null` で明示する（スモーク出力の契約）。
+        let entries = [
+            (METRIC_INPROC, Some(self.inproc)),
+            (METRIC_FRAMED, self.framed),
+        ];
         let mut body = Vec::new();
         for (name, value) in entries {
-            if !value.is_finite() || value <= 0.0 {
-                return Err(BenchError::new(
-                    "invalid-result",
-                    format!("metric {name} must be finite and positive"),
-                ));
+            match value {
+                Some(value) => {
+                    if !value.is_finite() || value <= 0.0 {
+                        return Err(BenchError::new(
+                            "invalid-result",
+                            format!("metric {name} must be finite and positive"),
+                        ));
+                    }
+                    body.push(format!(
+                        "    \"{name}\": {{ \"value\": {value}, \"unit\": \"ns\" }}"
+                    ));
+                }
+                None => body.push(format!("    \"{name}\": null")),
             }
-            body.push(format!(
-                "    \"{name}\": {{ \"value\": {value}, \"unit\": \"ns\" }}"
-            ));
         }
         Ok(format!(
             "{{\n  \"schema_version\": 1,\n  \"metrics\": {{\n{}\n  }}\n}}\n",
@@ -269,21 +275,37 @@ mod boundary {
     #[derive(Debug)]
     pub struct TempDir(PathBuf);
 
+    /// 名前衝突時の再試行上限。
+    const MAX_ATTEMPTS: usize = 64;
+
     impl TempDir {
         /// 一時ディレクトリを作る。
         pub fn new() -> Result<Self, BenchError> {
             static SEQ: AtomicU64 = AtomicU64::new(0);
-            let name = format!(
-                "fcb-{}-{}",
-                std::process::id(),
-                SEQ.fetch_add(1, Ordering::Relaxed)
-            );
-            let path = std::env::temp_dir().join(name);
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&path)
-                .map_err(|e| BenchError::new("io", format!("create temp dir failed: {e}")))?;
-            Ok(Self(path))
+            // 強制終了後の PID 再利用で名前が衝突しても、連番を進めて別名で再試行する。
+            // 既存名は先取り対策のため引き続き失敗扱い（`create` は既存を流用しない）。
+            for _ in 0..MAX_ATTEMPTS {
+                let name = format!(
+                    "fcb-{}-{}",
+                    std::process::id(),
+                    SEQ.fetch_add(1, Ordering::Relaxed)
+                );
+                let path = std::env::temp_dir().join(name);
+                match fs::DirBuilder::new().mode(0o700).create(&path) {
+                    Ok(()) => return Ok(Self(path)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => {
+                        return Err(BenchError::new(
+                            "io",
+                            format!("create temp dir failed: {e}"),
+                        ));
+                    }
+                }
+            }
+            Err(BenchError::new(
+                "io",
+                "create temp dir failed: all candidate names already exist",
+            ))
         }
 
         /// ディレクトリのパス。
@@ -501,6 +523,21 @@ mod tests {
             "{\n  \"schema_version\": 1,\n  \"metrics\": {\n    \
              \"plugin_boundary_list_images_inproc_p50\": { \"value\": 120.5, \"unit\": \"ns\" },\n    \
              \"plugin_boundary_list_images_framed_p50\": { \"value\": 9000, \"unit\": \"ns\" }\n  }\n}\n"
+        );
+    }
+
+    /// PLUG-5: 未計測の framed は metric を省略せず null で出力する。
+    #[test]
+    fn plug5_results_json_null_when_framed_unmeasured() {
+        let r = Results {
+            inproc: 120.5,
+            framed: None,
+        };
+        assert_eq!(
+            r.to_json().unwrap(),
+            "{\n  \"schema_version\": 1,\n  \"metrics\": {\n    \
+             \"plugin_boundary_list_images_inproc_p50\": { \"value\": 120.5, \"unit\": \"ns\" },\n    \
+             \"plugin_boundary_list_images_framed_p50\": null\n  }\n}\n"
         );
     }
 

@@ -16,13 +16,15 @@
 //!   基準で呼ぶ（パス再解決による TOCTOU を避ける。PLUG-12）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_NOFOLLOW | O_DIRECTORY)` で配置ディレクトリを
 //!   ルートから 1 要素ずつ辿る（祖先要素の symlink を拒否。PLUG-12）
+//! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_CREAT | O_NOFOLLOW)` で bind ロックファイルを開く
+//!   （排他ロック自体は std の `File::try_lock`。fork 用のコールバック登録は行わない。PLUG-12・TASK-123.2）
 //! - client connect（#249）: `socket(2)` / `connect(2)`（macOS は `fcntl(F_SETFD)` も）で非ブロッキング接続を期限までリトライする（REPAIR-5）。
 //!   対応外の OS・アーキテクチャは `Unsupported`
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`connect_unix`]（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 
@@ -111,7 +113,6 @@ pub(crate) fn fchmodat_nofollow(dir: &File, name: &CStr, mode: u32) -> io::Resul
 fn fchmodat_via_opath(dir: &File, name: &CStr, mode: ModeT) -> io::Result<()> {
     // O_PATH は x86_64 / aarch64 とも 0o10000000。
     const O_PATH: i32 = 0o10000000;
-    const AT_EMPTY_PATH: i32 = 0x1000;
     // SAFETY: `name` は NUL 終端の有効な C 文字列。`dir` は `&File` の借用中のため有効。
     let fd = unsafe {
         c_openat(
@@ -148,6 +149,13 @@ pub(crate) struct FileIdent {
     pub ino: u64,
     pub uid: u32,
     pub is_socket: bool,
+    /// symlink 本体か（`lstat` 相当で取得するため、リンク先ではなくリンク自体の種別。PLUG-12）。
+    pub is_symlink: bool,
+    /// 最終更新時刻（秒・ナノ秒）。socket では作成（bind）時に決まり、chmod・rename・hard link では
+    /// 変わらない。inode 番号が再利用された別の socket を dev / ino の一致だけで同一と見なさないための
+    /// 同一性の一部（PLUG-12・TASK-123.2）。
+    pub mtime_sec: i64,
+    pub mtime_nsec: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -167,7 +175,8 @@ mod statx_abi {
         pub size: u64,
         pub blocks: u64,
         pub attributes_mask: u64,
-        pub timestamps: [u64; 8],
+        /// `stx_atime`・`stx_btime`・`stx_ctime`・`stx_mtime` の順（各 16 バイト）。
+        pub timestamps: [StatxTimestamp; 4],
         pub rdev_major: u32,
         pub rdev_minor: u32,
         pub dev_major: u32,
@@ -176,8 +185,22 @@ mod statx_abi {
     }
     const _: () = assert!(core::mem::size_of::<Statx>() == 256);
 
-    /// `STATX_TYPE | STATX_MODE | STATX_UID | STATX_INO`。
-    pub(super) const REQUIRED_MASK: u32 = 0x1 | 0x2 | 0x8 | 0x100;
+    /// `struct statx_timestamp` と同じレイアウト（16 バイト）。
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct StatxTimestamp {
+        pub sec: i64,
+        pub nsec: u32,
+        pub reserved: i32,
+    }
+    const _: () = assert!(core::mem::size_of::<StatxTimestamp>() == 16);
+    const _: () = assert!(core::mem::offset_of!(Statx, timestamps) == 64);
+
+    /// `timestamps` 内の `stx_mtime` の位置。
+    pub(super) const MTIME_INDEX: usize = 3;
+
+    /// `STATX_TYPE | STATX_MODE | STATX_UID | STATX_MTIME | STATX_INO`。
+    pub(super) const REQUIRED_MASK: u32 = 0x1 | 0x2 | 0x8 | 0x40 | 0x100;
 
     unsafe extern "C" {
         // SAFETY（宣言そのものの妥当性）: glibc（2.28 以降）/ musl の
@@ -209,7 +232,11 @@ fn statx_ident(dirfd: i32, name: &CStr, flags: i32) -> io::Result<FileIdent> {
         size: 0,
         blocks: 0,
         attributes_mask: 0,
-        timestamps: [0; 8],
+        timestamps: [statx_abi::StatxTimestamp {
+            sec: 0,
+            nsec: 0,
+            reserved: 0,
+        }; 4],
         rdev_major: 0,
         rdev_minor: 0,
         dev_major: 0,
@@ -233,12 +260,55 @@ fn statx_ident(dirfd: i32, name: &CStr, flags: i32) -> io::Result<FileIdent> {
     if st.mask & statx_abi::REQUIRED_MASK != statx_abi::REQUIRED_MASK {
         return Err(io::Error::from(io::ErrorKind::Unsupported));
     }
+    let mtime = st
+        .timestamps
+        .get(statx_abi::MTIME_INDEX)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?;
     Ok(FileIdent {
         dev: (u64::from(st.dev_major) << 32) | u64::from(st.dev_minor),
         ino: st.ino,
         uid: st.uid,
         is_socket: u32::from(st.mode) & 0o170000 == 0o140000,
+        is_symlink: u32::from(st.mode) & 0o170000 == 0o120000,
+        mtime_sec: mtime.sec,
+        mtime_nsec: mtime.nsec,
     })
+}
+
+/// `statx` の `AT_EMPTY_PATH`（fd 自体を対象にする。Linux の全アーキテクチャで共通値）。
+#[cfg(target_os = "linux")]
+const AT_EMPTY_PATH: i32 = 0x1000;
+
+/// `dir` 基準の `name`（symlink を辿らない）が、開いている `file` と同じ inode（dev / ino）を指すか。
+/// `name` が存在しなければ `false`。
+///
+/// bind ロックの取得後・解放時に、ロックファイル名が「いま flock を持っている inode」をまだ指して
+/// いるかを確かめるために使う（保持者が解放時に unlink した古い inode を掴んだ取得者を弾く。
+/// PLUG-12・TASK-123.2）。Linux は両方を `statx` で取得しパスを再解決しない。Linux 以外は
+/// [`lstat_at`] と同じく `fallback_path` の `symlink_metadata` へ縮退する。
+pub(crate) fn names_open_file(
+    dir: &File,
+    name: &CStr,
+    fallback_path: &std::path::Path,
+    file: &File,
+) -> io::Result<bool> {
+    let named = match lstat_at(dir, name, fallback_path) {
+        Ok(i) => i,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    #[cfg(target_os = "linux")]
+    let (dev, ino) = {
+        let i = statx_ident(file.as_raw_fd(), c"", AT_EMPTY_PATH)?;
+        (i.dev, i.ino)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (dev, ino) = {
+        use std::os::unix::fs::MetadataExt;
+        let m = file.metadata()?;
+        (m.dev(), m.ino())
+    };
+    Ok(!named.is_symlink && named.dev == dev && named.ino == ino)
 }
 
 /// `dir` 基準で `name`（symlink を辿らない）の識別情報を返す。
@@ -267,6 +337,10 @@ pub(crate) fn lstat_at(
             ino: m.ino(),
             uid: m.uid(),
             is_socket: m.file_type().is_socket(),
+            is_symlink: m.file_type().is_symlink(),
+            mtime_sec: m.mtime(),
+            mtime_nsec: u32::try_from(m.mtime_nsec())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?,
         })
     }
 }
@@ -308,7 +382,7 @@ const AT_FDCWD: i32 = -2;
 ))]
 unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: POSIX の `int openat(int, const char *, int, ...)` と同じ型・幅。
-    // O_CREAT を使わないため可変長引数（mode）は渡さない。
+    // 可変長引数（mode）は O_CREAT を使う `lock_file_at` だけが渡す（他は渡さない）。
     #[link_name = "openat"]
     fn c_openat(dirfd: i32, path: *const core::ffi::c_char, flags: i32, ...) -> i32;
 }
@@ -372,6 +446,132 @@ pub(crate) fn open_dir_nofollow(abs: &std::path::Path) -> io::Result<File> {
     )))]
     {
         let _ = abs;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+// ロックファイル作成用の open(2) フラグ。値は OS ごとに異なる。Linux の 4 値は asm-generic の既定値で、
+// x86_64・aarch64 とも上書きしないため同値だが、流用せず対応アーキテクチャごとに定義する。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_RDWR: i32 = 0o2;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_CREAT: i32 = 0o100;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_EXCL: i32 = 0o200;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_RDWR: i32 = 0o2;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_CREAT: i32 = 0o100;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_EXCL: i32 = 0o200;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(target_os = "macos")]
+const O_RDWR: i32 = 0x2;
+#[cfg(target_os = "macos")]
+const O_CREAT: i32 = 0x200;
+#[cfg(target_os = "macos")]
+const O_EXCL: i32 = 0x800;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x4;
+
+/// ロックファイルの取得結果（PLUG-12・TASK-123.2）。
+#[derive(Debug)]
+pub(crate) struct LockHandle {
+    /// 排他ロック（`flock`）を保持する fd。close（プロセス終了・クラッシュ含む）で kernel が解放する。
+    pub file: File,
+    /// 今回の呼び出しで新規作成したか（false なら以前の保持者が作ったロックファイルが残っていた）。
+    pub created: bool,
+}
+
+/// `dir` 基準で `name` のロックファイルを `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`・0600 で開き
+/// （無ければ作成）、非ブロッキングで排他ロックを取る。`O_NONBLOCK` は、既存の名前が FIFO・デバイス
+/// 等だった場合に open が相手を待って止まらないようにするため（通常ファイルの読み書きには影響しない。
+/// REPAIR-5）。開いた fd が通常ファイルでなければロックせず `PermissionDenied`。他者が保持中なら `WouldBlock`。listener の生存判定に接続 probe を
+/// 使わず、「ロックを取れる＝以前の保持者は消えた」で stale を判定するための基盤（既存 listener の
+/// accept queue に副作用を与えない。PLUG-12）。未対応の OS・アーキテクチャは `Unsupported`。
+///
+/// ロックは std の [`File::try_lock`]（Linux・macOS は `flock(2)`）で取り、FFI は `openat` だけに
+/// 留める。`flock` は open file description に紐付くため、fork した子は listener の socket fd と
+/// 同じくロック fd も継承する（どちらも `O_CLOEXEC` で exec 時に閉じる）。子が両方を持ち続ける間は
+/// socket も実際に接続可能なので、ロック保持＝listener 生存という対応は fork をまたいでも崩れない。
+/// そのため fork 時に子側のロックだけを外す仕組み（`pthread_atfork` 等）は持たない。
+pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    {
+        let open = |flags: i32| -> io::Result<File> {
+            // SAFETY: `dir` は `&File` の借用中のため fd は有効。`name` は NUL 終端の有効な C 文字列。
+            // O_CREAT を含むため、可変長引数として mode（C の既定引数昇格後の `unsigned int` 幅）を
+            // 1 つ渡す。openat は渡したポインタを呼び出し中しか参照しない。
+            let fd = unsafe {
+                c_openat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    flags | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
+                    0o600u32,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` は直前の openat が返した、他に所有者のいない有効な fd（非負を確認済み）。
+            Ok(unsafe { File::from_raw_fd(fd) })
+        };
+        // 新規作成（O_EXCL）を試し、既にあれば O_CREAT なしで既存を開く。その間に保持者が解放時の
+        // unlink をした場合は ENOENT になるため、上限つきで最初からやり直す（`created` を正確に保つ。
+        // 上限まで競合し続けた場合は使用中＝`WouldBlock` として返し、待ち続けない。REPAIR-5）。
+        const OPEN_ATTEMPTS: usize = 8;
+        let mut opened = None;
+        for _ in 0..OPEN_ATTEMPTS {
+            match open(O_RDWR | O_CREAT | O_EXCL) {
+                Ok(f) => {
+                    opened = Some((f, true));
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match open(O_RDWR) {
+                    Ok(f) => {
+                        opened = Some((f, false));
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                },
+                Err(e) => return Err(e),
+            }
+        }
+        let Some((file, created)) = opened else {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        };
+        // 通常ファイル以外（FIFO・デバイス等）はロックを試みる前に拒否する（flock 自体が失敗して
+        // 理由が分からなくなる OS があるため。内容にも触れない）。
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(LockHandle { file, created }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    {
+        let _ = (dir, name);
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }

@@ -26,6 +26,31 @@
 //!   返した後の保護は `UdsListener::bind` が bind 時に配置ディレクトリを fd で再検証して担う。
 //! - 作成は非再帰で、基底ディレクトリ（`XDG_RUNTIME_DIR` 自体）は作らない。
 //! - エラーメッセージは固定の英語文字列で、パス・環境変数値を含めない。
+//! - 既存 socket パス（TASK-123.2・#287）: `UdsListener::bind` が bind 前に検証済みディレクトリ fd 基準で
+//!   lstat（symlink 非追従）する。symlink と他 UID 所有のエントリは削除せず `PermissionDenied`。
+//!   生存判定は接続 probe ではなく sibling の `<socket 名>.lock` への排他 flock で行う
+//!   （listener が生存中保持し、クラッシュ時は kernel が解放する）。接続拒否の回数では削除しない
+//!   （macOS は accept queue 満杯の生存 listener にも ECONNREFUSED を返すため区別できず、probe 接続が
+//!   既存 listener の accept queue に残る副作用もある）。ロックを取れない（生存中）、socket 以外、
+//!   またはロックに記録した同一性（dev / ino / mtime）と一致しない socket（管理下か判別不能。残存ロック
+//!   ファイルの存在は根拠にしない）は削除せず `AlreadyExists`。ロックを取れて
+//!   管理下の自 UID 所有 socket だけを、再 lstat で同一性（dev / ino / mtime / uid / 種別）を確認したうえで
+//!   `unlinkat` し、再 bind を可能にする。
+//!   ロックファイルは、記録が空の場合に限り保持者が解放の直前に unlink する（記録が残る場合は残す）。
+//!   取得側は flock 取得後に名前が同じ inode を指すことを確認し、外れていれば開き直すため、unlink と
+//!   取得が競合しても同名に有効なロックを持つのは 1 者だけ（`BindLock` の doc 参照）。記録は、記録した socket がパス上から無くなったと
+//!   確認できた後にだけ消す（listener の後始末と、bind 前の検証で不在・別エントリ・削除済みを確認した時。
+//!   unlink に失敗して socket が残る場合は記録も残し、次回 bind で削除できる）。
+//!   fork した子は socket fd と一緒にロック fd も継承するため、子が持つ間は生存中として扱う
+//!   （`BindLock` の doc 参照）。
+//!   残余: bind 成功から記録書き込みまでの間に異常終了すると記録の無い socket が残り、以後は
+//!   `AlreadyExists`（手動削除が必要。fail-closed）。記録した socket が外部で削除され、別経路の socket が
+//!   同じ inode 番号を再利用しても、記録には mtime（秒・ナノ秒）を含めるため一致しない（後から作られた
+//!   socket の mtime は記録時点より新しい）。誤認が残るのは、時計が巻き戻るかタイムスタンプ粒度の
+//!   範囲内で、同一 UID が削除と再作成を行い inode 番号まで一致した場合のみ（0700 ディレクトリ内の
+//!   同一 UID の操作。脅威モデル外）。
+//!   残余: 再確認から unlink までの窓で差し替えられるのは 0700 ディレクトリ内の同一 UID のみ
+//!   （脅威モデル外）。macOS は lstat がパス縮退のため窓がやや広い。
 //! - socket の 0600 化は [`crate::UdsListener::bind`] が検証済みディレクトリ fd 基準の
 //!   `fchmodat(AT_SYMLINK_NOFOLLOW)` で行う（TASK-123.3・#288）。パス指定の chmod は、bind 後の
 //!   パス・祖先の差し替えで別ファイルの mode を変えうるため使わない（`docs/design/io-protocol.md`）。
@@ -49,8 +74,7 @@
 //! - OCI-5 の state store は別仕様で、未設定時にフォールバックしない（`crates/core`）。
 //!
 //! # 未実装（REPAIR-3）
-//! - 既存 socket パスの lstat 検証・stale socket 削除（TASK-123.2・#287）、
-//!   peer credential（TASK-124）は別 sub。
+//! - peer credential（TASK-124）は別 sub。
 //! - 非 unix は `Unimplemented`（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る）。
 
 use std::path::{Component, Path, PathBuf};
@@ -138,6 +162,9 @@ fn runtime_dir_base(xdg: Option<std::ffi::OsString>) -> Result<PathBuf, PluginEr
     validate_base(&base)?;
     Ok(base)
 }
+
+#[cfg(unix)]
+pub(crate) use imp::{BindLock, acquire_bind_lock, clear_stale_socket};
 
 #[cfg(unix)]
 mod imp {
@@ -413,10 +440,508 @@ mod imp {
         Ok(RuntimeDir { path: dir })
     }
 
+    /// 既存エントリの分類結果（PLUG-12・TASK-123.2）。
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum ExistingEntry {
+        Absent,
+        Symlink,
+        ForeignOwner,
+        NotSocket,
+        OwnSocket(crate::sys::FileIdent),
+    }
+
+    /// lstat 結果と自 UID から分類する純粋関数（判定順: symlink → 所有者 → 種別）。
+    pub(super) fn classify_existing(
+        ident: Option<&crate::sys::FileIdent>,
+        euid: u32,
+    ) -> ExistingEntry {
+        match ident {
+            None => ExistingEntry::Absent,
+            Some(i) if i.is_symlink => ExistingEntry::Symlink,
+            Some(i) if i.uid != euid => ExistingEntry::ForeignOwner,
+            Some(i) if !i.is_socket => ExistingEntry::NotSocket,
+            Some(i) => ExistingEntry::OwnSocket(*i),
+        }
+    }
+
+    fn err(code: PluginErrorCode, msg: &'static str) -> PluginError {
+        PluginError::new(code, msg)
+    }
+
+    fn lstat_opt(
+        dir: &File,
+        name: &std::ffi::CStr,
+        public: &Path,
+    ) -> Result<Option<crate::sys::FileIdent>, PluginError> {
+        match crate::sys::lstat_at(dir, name, public) {
+            Ok(i) => Ok(Some(i)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(err(
+                PluginErrorCode::PermissionDenied,
+                "permission denied while inspecting existing socket path",
+            )),
+            Err(_) => Err(err(
+                PluginErrorCode::Internal,
+                "failed to inspect existing socket path",
+            )),
+        }
+    }
+
+    /// bind 用ロック（sibling の `<socket 名>.lock` への排他 flock。PLUG-12・TASK-123.2）。
+    ///
+    /// 保持者は listener の生存期間中ロックを持ち続ける（[`crate::transport::UdsListener`] の内部が
+    /// 保持）。kernel はプロセス終了・クラッシュ時に自動解放するため、「ロックを取れる」ことが
+    /// 「以前の保持者はもういない」の証拠になる。接続 probe は使わない（macOS では accept queue 満杯の
+    /// 生存 listener にも ECONNREFUSED が返り stale と区別できず、probe 接続が相手の accept queue に
+    /// 残る副作用もあるため）。
+    ///
+    /// # ロックファイルの削除
+    /// ロックファイルは、記録が空（管理下の socket が残っていない）の場合に限り、保持者が解放の
+    /// 直前に flock を持ったまま unlink する（bind 失敗時・正常終了時。記録が残る場合＝異常終了や
+    /// socket の unlink 失敗時は残す）。socket 名ごとのロックファイルを溜めないため（都度起動モードは
+    /// 起動ごとに別名の socket を使う）。排他は次の手順で保つ:
+    /// - 取得側は flock の取得後に、ロックファイル名がいま持っている inode を指すことを確認し、
+    ///   指していなければ（保持者が unlink した古い inode を掴んだ）捨てて開き直す。
+    /// - 保持者が unlink するのは、自分の socket 操作をすべて終えた後（解放の直前）だけ。
+    ///
+    /// これにより、同じ名前に対して有効なロックを持てるのは常に 1 者になる。残ったロックファイルは
+    /// 「管理下の証拠」にはならない（証拠は下記の記録と socket の同一性の一致だけ）。
+    ///
+    /// # fork
+    /// flock は open file description に紐付くため、fork した子は listener の socket fd と一緒に
+    /// ロック fd も継承する（どちらも `O_CLOEXEC` で exec 時に閉じる）。子が両方を持つ間は socket も
+    /// 実際に接続可能なので stale ではなく、再 bind は `AlreadyExists` になる（fail-closed）。
+    /// 子側のロックだけを外すと、生存中の socket を stale と誤認して削除し得るため行わない。
+    /// 正常な解放では明示的に unlock する（unlock は open file description 単位で効くため、別スレッドの
+    /// プロセス起動で fork から exec までの間だけ子が fd の複製を持っていても、解放が遅れない）。
+    #[derive(Debug)]
+    pub(crate) struct BindLock {
+        /// flock を保持する fd（drop で解放）。
+        file: File,
+        /// 配置ディレクトリ fd の複製（解放時にロックファイルを fd 基準で unlink する）。
+        dir: File,
+        /// ロックファイル名（`<socket 名>.lock`）。
+        lock_name: std::ffi::CString,
+        /// ロックファイルの公開パス（Linux 以外で同一性確認がパス縮退になるため保持する）。
+        lock_path: std::path::PathBuf,
+    }
+
+    impl Drop for BindLock {
+        fn drop(&mut self) {
+            // 記録が空なら、このロックファイルを根拠に削除できる socket は無い。flock を持ったまま、
+            // 名前がまだ自分の inode を指す場合だけ unlink する（別の inode には触れない）。
+            let unrecorded = self.file.metadata().is_ok_and(|m| m.len() == 0);
+            if unrecorded
+                && matches!(
+                    crate::sys::names_open_file(
+                        &self.dir,
+                        &self.lock_name,
+                        &self.lock_path,
+                        &self.file
+                    ),
+                    Ok(true)
+                )
+            {
+                let _ = crate::sys::unlinkat(&self.dir, &self.lock_name);
+            }
+            let _ = self.file.unlock();
+        }
+    }
+
+    /// ロックファイルへ書く「この socket は自分が bind した」記録の接頭辞（版付き）。
+    /// 記録は `fcus2 <dev> <ino> <mtime 秒> <mtime ナノ秒>\n`（すべて 10 進）。
+    const RECORD_PREFIX: &str = "fcus2";
+    /// 記録の項目数（dev・ino・mtime 秒・mtime ナノ秒）。
+    const RECORD_FIELDS: usize = 4;
+    /// 旧形式（`fcus1 <dev> <ino>\n`）の接頭辞と項目数。専用ロックファイルとしては認めるが、mtime を
+    /// 持たないため管理下の証拠にはしない。
+    const LEGACY_RECORD: (&str, usize) = ("fcus1", 2);
+    /// 記録の最大長（接頭辞＋u64 の 10 進 20 桁×4＋区切り＝90 を超えない範囲の上限）。
+    const RECORD_MAX_LEN: usize = 96;
+
+    /// socket の同一性を記録の項目へ変換する。dev / ino に加えて mtime を含めるのは、記録した socket が
+    /// 外部で削除され、同じ inode 番号を再利用した別の socket がパスに置かれても一致させないため
+    /// （後から作られた socket の mtime は記録時点より新しい）。負の mtime は表現せず None。
+    fn record_key(ident: &crate::sys::FileIdent) -> Option<[u64; RECORD_FIELDS]> {
+        Some([
+            ident.dev,
+            ident.ino,
+            u64::try_from(ident.mtime_sec).ok()?,
+            u64::from(ident.mtime_nsec),
+        ])
+    }
+
+    impl BindLock {
+        /// bind 済み socket の同一性（dev / ino / mtime）をロックファイルへ記録する。stale 判定は、残存
+        /// ロックファイルの存在ではなく、この記録と socket の同一性の一致だけを管理下の証拠にする
+        /// （他実装・別経路が同じパスに bind した socket を誤って削除しない。PLUG-12）。
+        pub(crate) fn record_socket(&self, ident: &crate::sys::FileIdent) -> io::Result<()> {
+            use std::os::unix::fs::FileExt;
+            let [dev, ino, sec, nsec] =
+                record_key(ident).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            self.file.set_len(0)?;
+            let text = format!("{RECORD_PREFIX} {dev} {ino} {sec} {nsec}\n");
+            self.file.write_all_at(text.as_bytes(), 0)
+        }
+
+        /// 記録を消す。記録した socket がパス上から無くなったと確認できた後にだけ呼ぶ
+        /// （[`crate::transport::UdsListener`] の後始末と [`clear_stale_socket`] が、unlink 成功・不在・
+        /// 別エントリへの差し替えを確認した後）。socket が残る場合は記録も残し、次回の bind が stale
+        /// として削除できるようにする。
+        pub(crate) fn clear_record(&self) -> io::Result<()> {
+            self.file.set_len(0)
+        }
+
+        /// 記録された同一性（[`record_key`] と同じ並び）。無い・壊れている・旧形式の場合は None
+        /// （管理下と見なさない）。
+        fn recorded(&self) -> Option<[u64; RECORD_FIELDS]> {
+            parse_record(&read_record(&self.file)?)
+        }
+    }
+
+    /// ロックファイルの先頭（記録の最大長まで）を読む。
+    fn read_record(file: &File) -> Option<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = [0u8; RECORD_MAX_LEN];
+        let n = file.read_at(&mut buf, 0).ok()?;
+        Some(buf.get(..n)?.to_vec())
+    }
+
+    /// 10 進数字だけからなる空でないバイト列を u64 として読む（符号・空白は受け付けない）。
+    fn parse_decimal(b: &[u8]) -> Option<u64> {
+        if b.is_empty() || !b.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(b).ok()?.parse().ok()
+    }
+
+    /// 完全な記録（現行形式・末尾改行つき）だけを受け付ける。末尾の改行を必須にして、書き込みが
+    /// 途中で止まった記録（数字が途中で切れた項目）を別の socket の同一性として読まない。
+    pub(super) fn parse_record(b: &[u8]) -> Option<[u64; RECORD_FIELDS]> {
+        let body = b.strip_suffix(b"\n")?;
+        let rest = body
+            .strip_prefix(RECORD_PREFIX.as_bytes())?
+            .strip_prefix(b" ")?;
+        let mut out = [0u64; RECORD_FIELDS];
+        let mut tokens = rest.split(|c| *c == b' ');
+        for slot in &mut out {
+            *slot = parse_decimal(tokens.next()?)?;
+        }
+        tokens.next().is_none().then_some(out)
+    }
+
+    /// 完全な記録、または記録の書き込みが途中で止まったもの（完全な記録の接頭辞）か。現行形式と
+    /// 旧形式の両方を認める。既存ロックファイルを「本実装の専用ファイル」と認める判定に使う。
+    /// 書きかけ・旧形式を拒否するとその socket 名を以後 bind できなくなるため、管理下の証拠には
+    /// しないが専用ファイルとしては認める。
+    pub(super) fn is_record_fragment(b: &[u8]) -> bool {
+        is_fragment_of(b, RECORD_PREFIX, RECORD_FIELDS)
+            || is_fragment_of(b, LEGACY_RECORD.0, LEGACY_RECORD.1)
+    }
+
+    /// `b` が `<prefix> <10 進>×fields\n` の接頭辞（完全一致を含む）か。
+    fn is_fragment_of(b: &[u8], prefix: &str, fields: usize) -> bool {
+        let head = [prefix.as_bytes(), b" "].concat();
+        let Some(rest) = b.strip_prefix(head.as_slice()) else {
+            return head.starts_with(b);
+        };
+        let (body, complete) = match rest.strip_suffix(b"\n") {
+            Some(x) => (x, true),
+            None => (rest, false),
+        };
+        let tokens: Vec<&[u8]> = body.split(|c| *c == b' ').collect();
+        let Some((last, init)) = tokens.split_last() else {
+            return false;
+        };
+        let digits = |x: &[u8]| x.iter().all(u8::is_ascii_digit);
+        // 途中の項目は空でない 10 進、最後の項目は書きかけ（空を含む）を許す。改行まで書かれて
+        // いれば全項目が揃っていること。
+        tokens.len() <= fields
+            && init.iter().all(|t| !t.is_empty() && digits(t))
+            && digits(last)
+            && (!complete || (tokens.len() == fields && !last.is_empty()))
+    }
+
+    /// 取得した inode がロックファイル名から外れていた場合（保持者が解放時に unlink した）の再試行回数。
+    const LOCK_ATTEMPTS: usize = 8;
+
+    /// `name` に対応するロックを取得する。他者が保持中（生存中の listener）は `AlreadyExists`、
+    /// symlink・他 UID 所有・通常ファイル以外は `PermissionDenied`（fail-closed）。
+    /// `public` は socket の公開パス（ロックファイルの公開パスの導出に使う）。
+    pub(crate) fn acquire_bind_lock(
+        dir: &File,
+        name: &std::ffi::CStr,
+        public: &Path,
+        euid: u32,
+    ) -> Result<BindLock, PluginError> {
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = || err(PluginErrorCode::InvalidArgument, "invalid socket path");
+        let mut bytes = name.to_bytes().to_vec();
+        bytes.extend_from_slice(b".lock");
+        let lock_path = public
+            .parent()
+            .ok_or_else(invalid)?
+            .join(std::ffi::OsStr::from_bytes(&bytes));
+        let lock_name = std::ffi::CString::new(bytes).map_err(|_| invalid())?;
+        for _ in 0..LOCK_ATTEMPTS {
+            let handle = match crate::sys::lock_file_at(dir, &lock_name) {
+                Ok(h) => h,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(busy()),
+                Err(e)
+                    if e.kind() == io::ErrorKind::PermissionDenied
+                        || e.raw_os_error().is_some_and(is_symlink_errno) =>
+                {
+                    return Err(err(
+                        PluginErrorCode::PermissionDenied,
+                        "permission denied while locking socket path",
+                    ));
+                }
+                Err(_) => {
+                    return Err(err(PluginErrorCode::Internal, "failed to lock socket path"));
+                }
+            };
+            // flock を取れても、名前が別の inode を指す（または消えた）なら、以前の保持者が解放時に
+            // unlink した古い inode を掴んでいる。これを有効なロックと見なすと、同名の新しい inode を
+            // ロックした別の bind と並走するため、捨てて開き直す。
+            match crate::sys::names_open_file(dir, &lock_name, &lock_path, &handle.file) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => {
+                    return Err(err(
+                        PluginErrorCode::Internal,
+                        "failed to inspect socket lock file",
+                    ));
+                }
+            }
+            return validate_lock(handle, dir, lock_name, lock_path, euid);
+        }
+        // 取得と解放が繰り返し競合した。使用中として扱う（待ち続けない。REPAIR-5）。
+        Err(busy())
+    }
+
+    /// 取得したロックファイルが自 UID 所有の専用ファイルかを確認し、[`BindLock`] にする。
+    /// 拒否する場合はファイルに触れず（切り詰め・unlink をしない）fd を閉じるだけ。
+    fn validate_lock(
+        handle: crate::sys::LockHandle,
+        dir: &File,
+        lock_name: std::ffi::CString,
+        lock_path: std::path::PathBuf,
+        euid: u32,
+    ) -> Result<BindLock, PluginError> {
+        let inspect = || {
+            err(
+                PluginErrorCode::Internal,
+                "failed to inspect socket lock file",
+            )
+        };
+        let meta = handle.file.metadata().map_err(|_| inspect())?;
+        if !meta.is_file() || meta.uid() != euid {
+            return Err(err(
+                PluginErrorCode::PermissionDenied,
+                "socket lock file is not owned by the current user",
+            ));
+        }
+        // 既存ファイルは「専用ロックファイル」と確認できたものだけ受け入れる。ハードリンクされた
+        // 他ファイル・無関係な既存ファイルを `record_socket` の `set_len(0)` や解放時の unlink で
+        // 壊さないため、単一リンク（nlink == 1）かつ、空または本実装の記録形式（書きかけ・旧形式を
+        // 含む・小サイズ）のみ許可する。
+        if !handle.created {
+            let valid = meta.nlink() == 1
+                && meta.len() <= RECORD_MAX_LEN as u64
+                && read_record(&handle.file)
+                    .is_some_and(|b| b.len() as u64 == meta.len() && is_record_fragment(&b));
+            if !valid {
+                return Err(err(
+                    PluginErrorCode::PermissionDenied,
+                    "socket lock path is not a dedicated lock file",
+                ));
+            }
+        }
+        let dir = dir.try_clone().map_err(|_| inspect())?;
+        Ok(BindLock {
+            file: handle.file,
+            dir,
+            lock_name,
+            lock_path,
+        })
+    }
+
+    /// `O_NOFOLLOW` が symlink に対して返す errno（Linux: ELOOP=40、macOS: ELOOP=62）。
+    fn is_symlink_errno(code: i32) -> bool {
+        if cfg!(target_os = "macos") {
+            code == 62
+        } else {
+            code == 40
+        }
+    }
+
+    /// bind 前に既存エントリを検証し、自 UID 所有の stale socket のみ削除する（PLUG-12・TASK-123.2）。
+    ///
+    /// `UdsListener::bind` から、配置ディレクトリ検証後・`UnixListener::bind` の前に、`lock`
+    /// 取得後に呼ばれる。ロックを保持している＝同ロックを使う生存中の listener は存在しないため、
+    /// 自 UID 所有の socket のうち「ロックに記録した同一性（dev / ino / mtime）と一致する（管理下の）」
+    /// ものだけを削除する。記録が無い・不一致の socket（他実装・旧版・残存ロックだけが根拠の
+    /// もの）は生存中か判別できないため削除せず `AlreadyExists`（fail-closed）。削除は検証済み
+    /// `dir` fd 基準の `unlinkat` のみ。
+    ///
+    /// 記録した socket がパス上に無いと確認できた場合（不在・別エントリ・今回削除した）は、戻る前に
+    /// 記録を消す。削除済み socket の dev / ino を残すと、この後の bind が失敗した場合などに inode
+    /// 番号の再利用で別経路の socket を管理下と誤認し得るため。検証が成功していて消去だけ失敗した場合は
+    /// `Internal`（検証が既にエラーならそのエラーを優先して返す。記録は次回の bind で再度消去を試みる）。
+    pub(crate) fn clear_stale_socket(
+        dir: &File,
+        name: &std::ffi::CStr,
+        public: &Path,
+        euid: u32,
+        lock: &BindLock,
+    ) -> Result<(), PluginError> {
+        let (recorded_socket_remains, result) =
+            remove_recorded_socket(dir, name, public, euid, lock);
+        if !recorded_socket_remains && lock.clear_record().is_err() && result.is_ok() {
+            return Err(err(
+                PluginErrorCode::Internal,
+                "failed to update socket lock record",
+            ));
+        }
+        result
+    }
+
+    /// [`clear_stale_socket`] の本体。戻り値の bool は「記録した socket がパス上に残っている
+    /// （または確認できなかった）」か。false のときだけ呼び出し側が記録を消す。
+    fn remove_recorded_socket(
+        dir: &File,
+        name: &std::ffi::CStr,
+        public: &Path,
+        euid: u32,
+        lock: &BindLock,
+    ) -> (bool, Result<(), PluginError>) {
+        let existing = match lstat_opt(dir, name, public) {
+            Ok(i) => i,
+            Err(e) => return (true, Err(e)),
+        };
+        let first = match classify_existing(existing.as_ref(), euid) {
+            ExistingEntry::Absent => return (false, Ok(())),
+            ExistingEntry::Symlink => {
+                return (
+                    false,
+                    Err(err(
+                        PluginErrorCode::PermissionDenied,
+                        "socket path is a symlink",
+                    )),
+                );
+            }
+            ExistingEntry::ForeignOwner => {
+                return (
+                    false,
+                    Err(err(
+                        PluginErrorCode::PermissionDenied,
+                        "socket path is owned by another user",
+                    )),
+                );
+            }
+            ExistingEntry::NotSocket => return (false, Err(busy())),
+            ExistingEntry::OwnSocket(i) => i,
+        };
+        // 管理下の証拠は「ロックファイルの存在」ではなく、ロックに記録した socket の同一性
+        // （dev / ino / mtime）と現在の socket の一致のみ。dev / ino だけでは、記録した socket が
+        // 外部で削除された後に同じ inode 番号を再利用した別の socket と区別できない。記録が無い・不一致なら他実装や別経路が bind した
+        // 可能性があるため削除しない（fail-closed）。
+        let key = record_key(&first);
+        if key.is_none() || lock.recorded() != key {
+            return (false, Err(busy()));
+        }
+        // 削除直前に同一性を再確認する。
+        match lstat_opt(dir, name, public) {
+            Ok(None) => return (false, Ok(())),
+            Ok(Some(now)) if now == first => {}
+            Ok(Some(_)) => return (false, Err(busy())),
+            Err(e) => return (true, Err(e)),
+        }
+        match crate::sys::unlinkat(dir, name) {
+            Ok(()) => (false, Ok(())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (false, Ok(())),
+            Err(_) => (
+                true,
+                Err(err(
+                    PluginErrorCode::Internal,
+                    "failed to remove stale socket",
+                )),
+            ),
+        }
+    }
+
+    fn busy() -> PluginError {
+        err(PluginErrorCode::AlreadyExists, "socket path already exists")
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use std::os::unix::fs::PermissionsExt;
+
+        fn ident(uid: u32, is_socket: bool, is_symlink: bool) -> crate::sys::FileIdent {
+            crate::sys::FileIdent {
+                dev: 1,
+                ino: 2,
+                uid,
+                is_socket,
+                is_symlink,
+                mtime_sec: 3,
+                mtime_nsec: 4,
+            }
+        }
+
+        #[test]
+        fn plug12_classify_existing_symlink_wins_over_owner() {
+            let i = ident(7, false, true);
+            assert_eq!(classify_existing(Some(&i), 7), ExistingEntry::Symlink);
+            assert_eq!(classify_existing(Some(&i), 8), ExistingEntry::Symlink);
+        }
+
+        #[test]
+        fn plug12_classify_existing_foreign_owner_for_file_and_socket() {
+            for sock in [false, true] {
+                let i = ident(7, sock, false);
+                assert_eq!(
+                    classify_existing(Some(&i), 7u32.wrapping_add(1)),
+                    ExistingEntry::ForeignOwner
+                );
+            }
+        }
+
+        #[test]
+        fn plug12_classify_existing_own_entries() {
+            assert_eq!(classify_existing(None, 7), ExistingEntry::Absent);
+            let f = ident(7, false, false);
+            assert_eq!(classify_existing(Some(&f), 7), ExistingEntry::NotSocket);
+            let s = ident(7, true, false);
+            assert_eq!(classify_existing(Some(&s), 7), ExistingEntry::OwnSocket(s));
+        }
+
+        #[test]
+        fn plug12_clear_stale_socket_rejects_foreign_uid_and_keeps_file() {
+            let d = std::env::temp_dir().join(format!("fcst-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            let sock = d.join("s");
+            let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let dir = File::open(&d).unwrap();
+            let name = std::ffi::CString::new("s").unwrap();
+            let euid = crate::sys::effective_uid();
+            let lock = acquire_bind_lock(&dir, &name, &sock, euid).unwrap();
+            let e =
+                clear_stale_socket(&dir, &name, &sock, euid.wrapping_add(1), &lock).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert!(sock.exists());
+            // 存在しない名前は Ok。
+            let none = std::ffi::CString::new("nope").unwrap();
+            let lock2 = acquire_bind_lock(&dir, &none, &d.join("nope"), euid).unwrap();
+            assert_eq!(
+                clear_stale_socket(&dir, &none, &d.join("nope"), euid, &lock2),
+                Ok(())
+            );
+            drop(_l);
+            std::fs::remove_dir_all(&d).ok();
+        }
 
         struct Tmp(std::path::PathBuf);
         impl Tmp {
@@ -436,6 +961,152 @@ mod imp {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
+        }
+
+        /// PLUG-12: 記録は完全な形式（末尾改行つき）だけを同一性として読む。書きかけは専用ファイルとは
+        /// 認めるが、管理下の証拠にはしない（TASK-123.2）。
+        #[test]
+        fn plug12_record_parsing_rejects_torn_and_foreign_content() {
+            assert_eq!(
+                parse_record(b"fcus2 2049 8912910 1790000000 123456789\n"),
+                Some([2049, 8912910, 1790000000, 123456789])
+            );
+            assert_eq!(parse_record(b"fcus2 2049 8912910 1790000000 1234"), None); // 改行なし
+            assert_eq!(parse_record(b"fcus2 2049 8912910 1790000000\n"), None); // 項目不足
+            assert_eq!(parse_record(b"fcus2 1 2 3 4 5\n"), None);
+            assert_eq!(parse_record(b"fcus2 1 2 3 4\nx"), None);
+            assert_eq!(parse_record(b"fcus2 +1 2 3 4\n"), None);
+            assert_eq!(parse_record(b"fcus2  1 2 3 4\n"), None);
+            assert_eq!(parse_record(b"fcus2 1 2 3 \n"), None);
+            assert_eq!(parse_record(b"fcus1 2049 8912910\n"), None); // 旧形式は証拠にしない
+            assert_eq!(parse_record(b""), None);
+            for ok in [
+                &b""[..],
+                b"fc",
+                b"fcus2 ",
+                b"fcus2 20",
+                b"fcus2 2049 ",
+                b"fcus2 2049 891 17",
+                b"fcus2 2049 8912910 1790000000 ",
+                b"fcus2 2049 8912910 1790000000 123456789\n",
+                b"fcus1 2049 891",
+                b"fcus1 2049 8912910\n",
+            ] {
+                assert!(is_record_fragment(ok), "{ok:?}");
+            }
+            for ng in [
+                &b"hello"[..],
+                b"fcus2 x",
+                b"fcus2 2049\n",
+                b"fcus2 2049 1 2 \n",
+                b"fcus2  1 2 3 4\n",
+                b"fcus2 1 2 3 4 5\n",
+                b"fcus2 1 2 3 4\nx",
+                b"fcus1 1 2 3\n",
+                b"fcus3 1 2 3 4\n",
+            ] {
+                assert!(!is_record_fragment(ng), "{ng:?}");
+            }
+        }
+
+        /// PLUG-12: 書きかけの記録が残ったロックファイルは受け入れ（以後も bind できる）、その記録では
+        /// socket を削除しない（TASK-123.2）。
+        #[test]
+        fn plug12_torn_record_is_accepted_as_lock_but_not_as_evidence() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = open_dir_for_test(&t.0);
+            let sock = t.0.join("a.sock");
+            let _other = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let m = std::fs::symlink_metadata(&sock).unwrap();
+            let name = std::ffi::CString::new("a.sock").unwrap();
+            let ident = crate::sys::lstat_at(&dir, &name, &sock).unwrap();
+            // 改行だけが欠けた（数値は現在の socket と一致する）記録。
+            let [dev, ino, sec, nsec] = record_key(&ident).unwrap();
+            let torn = format!("fcus2 {dev} {ino} {sec} {nsec}");
+            std::fs::write(t.0.join("a.sock.lock"), &torn).unwrap();
+            let lock = acquire_bind_lock(&dir, &name, &sock, euid).unwrap();
+            let e = clear_stale_socket(&dir, &name, &sock, euid, &lock).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+            assert_eq!(std::fs::symlink_metadata(&sock).unwrap().ino(), m.ino());
+        }
+
+        /// PLUG-12: 記録と一致する stale socket を削除したら、再 bind の成否を待たずに記録を消す
+        /// （削除済み socket の dev / ino を残さない。TASK-123.2）。
+        #[test]
+        fn plug12_clear_stale_socket_clears_record_after_removal() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = open_dir_for_test(&t.0);
+            let sock = t.0.join("a.sock");
+            drop(std::os::unix::net::UnixListener::bind(&sock).unwrap()); // stale socket
+            let name = std::ffi::CString::new("a.sock").unwrap();
+            let ident = crate::sys::lstat_at(&dir, &name, &sock).unwrap();
+            let lock_path = t.0.join("a.sock.lock");
+            let [dev, ino, sec, nsec] = record_key(&ident).unwrap();
+            std::fs::write(&lock_path, format!("fcus2 {dev} {ino} {sec} {nsec}\n")).unwrap();
+            let lock = acquire_bind_lock(&dir, &name, &sock, euid).unwrap();
+            assert_eq!(clear_stale_socket(&dir, &name, &sock, euid, &lock), Ok(()));
+            assert!(std::fs::symlink_metadata(&sock).is_err());
+            assert_eq!(std::fs::read(&lock_path).unwrap(), b"");
+        }
+
+        /// PLUG-12: dev / ino が一致しても mtime が違う socket（inode 番号を再利用した別の socket に
+        /// 相当）と、旧形式（mtime なし）の記録は管理下と見なさず、削除しない（TASK-123.2）。
+        #[test]
+        fn plug12_same_inode_number_with_different_mtime_is_not_removed() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = open_dir_for_test(&t.0);
+            let sock = t.0.join("a.sock");
+            let _other = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let name = std::ffi::CString::new("a.sock").unwrap();
+            let ident = crate::sys::lstat_at(&dir, &name, &sock).unwrap();
+            let [dev, ino, sec, nsec] = record_key(&ident).unwrap();
+            let lock_path = t.0.join("a.sock.lock");
+            for stale in [
+                format!("fcus2 {dev} {ino} {} {nsec}\n", sec - 1),
+                format!("fcus2 {dev} {ino} {sec} {}\n", (nsec + 1) % 1_000_000_000),
+                format!("fcus1 {dev} {ino}\n"),
+            ] {
+                std::fs::write(&lock_path, &stale).unwrap();
+                let lock = acquire_bind_lock(&dir, &name, &sock, euid).unwrap();
+                let e = clear_stale_socket(&dir, &name, &sock, euid, &lock).unwrap_err();
+                assert_eq!(e.code(), PluginErrorCode::AlreadyExists, "{stale:?}");
+                // 一致しない記録は消え、生存中の別 listener は残って接続できる。
+                assert_eq!(std::fs::read(&lock_path).unwrap(), b"");
+                std::os::unix::net::UnixStream::connect(&sock).unwrap();
+            }
+        }
+
+        /// PLUG-12: 既存の `.lock` 名が無関係ファイル・ハードリンクなら拒否し、内容を壊さない。
+        #[test]
+        fn plug12_rejects_non_dedicated_lock_file_without_truncating() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = open_dir_for_test(&t.0);
+            let victim = t.0.join("victim");
+            std::fs::write(&victim, b"precious").unwrap();
+            // 1) 無関係な内容の既存ファイル
+            let foreign = t.0.join("a.sock.lock");
+            std::fs::write(&foreign, b"hello").unwrap();
+            let name = std::ffi::CString::new("a.sock").unwrap();
+            let e = acquire_bind_lock(&dir, &name, &t.0.join("a.sock"), euid).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert_eq!(std::fs::read(&foreign).unwrap(), b"hello");
+            // 2) 他ファイルへのハードリンク（内容が空でも nlink > 1 は拒否）
+            std::fs::remove_file(&foreign).unwrap();
+            std::fs::hard_link(&victim, t.0.join("b.sock.lock")).unwrap();
+            let name = std::ffi::CString::new("b.sock").unwrap();
+            let e = acquire_bind_lock(&dir, &name, &t.0.join("b.sock"), euid).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+            // 拒否したロック名は unlink もしない（ハードリンクの名前を消さない）。
+            assert_eq!(std::fs::read(t.0.join("b.sock.lock")).unwrap(), b"precious");
+        }
+
+        fn open_dir_for_test(p: &Path) -> File {
+            File::open(p).unwrap()
         }
 
         /// PLUG-12: 所有者不一致は 0700 でも拒否する（別 UID を用意せず分岐を照合する）。

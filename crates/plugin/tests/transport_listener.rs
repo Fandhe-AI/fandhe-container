@@ -135,6 +135,8 @@ mod unix {
         let l = UdsListener::bind(&dir2.sock()).unwrap();
         let e = UdsListener::bind(&dir2.sock()).unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+        // 生存判定は flock のため、拒否された bind は既存 listener の accept queue に何も残さない
+        // （TASK-123.2）。最初の accept が実クライアントの接続になる。
         let h = connect_and_ping(l.path());
         let mut s = l.accept(WAIT).unwrap();
         let mut buf = [0u8; 4];

@@ -32,11 +32,23 @@
 //!   credential を自 UID と照合する（不一致は 1 バイトも送らず切断。listener 側 accept と対称。
 //!   同一 UID の偽 listener は脅威モデル外。socket 配置ディレクトリの検証は client では行わない）
 //!
+//! # フレーム単位の待機（REPAIR-5・TASK-107.6・#250）
+//!
+//! [`UdsStream::read_frame`] / [`UdsStream::write_frame`] は [`RpcTimeout`]（必須引数。0 と上限超過は
+//! 構築不能）を取り、syscall 1 回ごとではなく **フレーム全体の合計期限** で打ち切る（少量ずつ送り
+//! 続ける相手による引き延ばしを防ぐ）。期限切れは `Timeout`、相手切断は `Unavailable`、
+//! チェックサム不一致は `DataLoss`。受信は固定長ヘッダを検証（長さ上限）してから本体を小さな塊ずつ
+//! 確保する。途中でエラーになった接続はフレーム境界がずれうるため以後使用不可（`Unavailable`）に
+//! なる。呼び出し側は再接続する（fail-closed）。
+//!
 //! # 未実装の範囲（REPAIR-3）
 //!
 //! - 自 UID 所有 stale socket の再 bind は TASK-123・TASK-124（PLUG-12）。本実装は既存パスを
 //!   一切 unlink せず `AlreadyExists` で拒否する
-//! - ACK/RPC タイムアウト（#250）・gRPC（TASK-108）
+//! - gRPC（TASK-108）
+//! - 要求 ID と応答 ID の対応づけ・要求→応答の 1 往復ヘルパー（core 側 proxy。TASK-114）
+//! - ACK 専用のワイヤー種別（`ControlMessage` のワイヤー形変更を伴うため行わない。本 crate での
+//!   「ACK / RPC 応答待ち」は [`UdsStream::read_frame`] を指す）
 //!
 //! # cfg 方針
 //!
@@ -48,15 +60,73 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{PluginError, PluginErrorCode};
+use crate::frame::Frame;
 
 /// `accept` の期限の上限。これを超える指定は `InvalidArgument`（REPAIR-5）。
-///
-/// #250（TASK-107.6）でタイムアウト型を導入する際、`accept` の引数型を揃える可能性がある。
+/// 接続待ち（`connect`）は [`UDS_CONNECT_TIMEOUT_MAX`]、フレーム待ちは [`RpcTimeout`] が別に持つ。
 pub const UDS_ACCEPT_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 
-/// 受け付けた接続の既定の read / write 期限（REPAIR-5）。
-/// [`UdsStream::set_io_timeout`] で変更できる（#250 で RPC タイムアウト型へ統合予定）。
+/// `UdsStream::connect` の期限の上限（600 秒）。これを超える指定は `InvalidArgument`（REPAIR-5）。
+/// 接続待ちと RPC 応答待ちは目的が違うため、[`UDS_RPC_TIMEOUT_MAX`] とは別の定数にしている。
+pub const UDS_CONNECT_TIMEOUT_MAX: Duration = Duration::from_secs(600);
+
+/// 生の `Read` / `Write` の既定の 1 回あたり read / write 期限（REPAIR-5。安全網）。
+/// フレーム単位の待機は [`UdsStream::read_frame`] / [`UdsStream::write_frame`] の [`RpcTimeout`] が
+/// 合計期限を持つ。[`UdsStream::set_io_timeout`] で変更できる。
 pub const UDS_DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// ACK / RPC 応答待ち 1 回分の既定のタイムアウト（10 秒。`RpcTimeout::default()`）。
+///
+/// AGENTS.md「推奨タイムアウト値」の 5〜10 秒のレンジ上限。PLUG-2・PLUG-5・REPAIR-5・
+/// TASK-107.6（#250）。
+pub const UDS_RPC_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
+
+/// [`RpcTimeout`] の上限（10 秒）。これを超える指定は `InvalidArgument`（REPAIR-5）。
+///
+/// 長時間待ちが必要な RPC（イメージ取得等）が出てきても本定数は緩めず、根拠つきで別の型・定数に
+/// 分離する（検出が弱まる方向の変更を避ける。TASK-114 設計時に再検討）。
+pub const UDS_RPC_TIMEOUT_MAX: Duration = Duration::from_secs(10);
+
+/// ACK / RPC 応答待ちのタイムアウト（PLUG-2・PLUG-5・REPAIR-5・TASK-107.6・#250）。
+///
+/// 呼び出し側が [`UdsStream::read_frame`] / [`UdsStream::write_frame`] へ必ず明示する値で、0 と
+/// [`UDS_RPC_TIMEOUT_MAX`] 超は構築できない（無期限待ちを型として表現できない。REPAIR-2 の考え方）。
+/// 既定値は [`UDS_RPC_TIMEOUT_DEFAULT`]（10 秒。`Default`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RpcTimeout(Duration);
+
+impl RpcTimeout {
+    /// 0 または [`UDS_RPC_TIMEOUT_MAX`] 超は `InvalidArgument`。
+    pub fn new(timeout: Duration) -> Result<Self, PluginError> {
+        if timeout.is_zero() || timeout > UDS_RPC_TIMEOUT_MAX {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                "rpc timeout must be non-zero and within the maximum",
+            ));
+        }
+        Ok(Self(timeout))
+    }
+
+    /// 保持している期間を返す。
+    pub fn as_duration(&self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for RpcTimeout {
+    /// [`UDS_RPC_TIMEOUT_DEFAULT`]（10 秒）。
+    fn default() -> Self {
+        Self(UDS_RPC_TIMEOUT_DEFAULT)
+    }
+}
+
+impl TryFrom<Duration> for RpcTimeout {
+    type Error = PluginError;
+
+    fn try_from(timeout: Duration) -> Result<Self, Self::Error> {
+        Self::new(timeout)
+    }
+}
 
 /// plugin からの接続を待ち受ける UDS listener（PLUG-2・PLUG-12）。
 ///
@@ -108,7 +178,10 @@ impl UdsListener {
                 "accept timeout must be non-zero and within the maximum",
             ));
         }
-        self.inner.accept(timeout).map(|inner| UdsStream { inner })
+        self.inner.accept(timeout).map(|inner| UdsStream {
+            inner,
+            poisoned: false,
+        })
     }
 
     /// client が接続に使う socket のパスを返す（PLUG-12）。
@@ -129,54 +202,155 @@ impl Drop for UdsListener {
     }
 }
 
-/// accept / connect で得た検証済み 1 接続（peer credential 検証済み。PLUG-12）。read / write には
-/// [`UDS_DEFAULT_IO_TIMEOUT`] の期限が付く（REPAIR-5）。
-///
-/// #247 のフレーム符号化が載せられるよう `Read` / `Write` のみを提供する。
+/// accept / connect で得た検証済み 1 接続（peer credential 検証済み。PLUG-12）。生の read / write には
+/// [`UDS_DEFAULT_IO_TIMEOUT`] の期限が付く（REPAIR-5）。フレーム単位の送受信は
+/// [`Self::read_frame`] / [`Self::write_frame`]（合計期限つき）を使う。
 #[derive(Debug)]
 pub struct UdsStream {
     inner: imp::StreamInner,
+    /// フレーム I/O が失敗した接続はフレーム境界がずれうるため以後使用不可にする（fail-closed）。
+    poisoned: bool,
 }
 
 impl UdsStream {
     /// plugin プロセス側から core の UDS（[`UdsListener::path`] が想定入力）へ期限付きで接続する
     /// （PLUG-2・PLUG-12・REPAIR-5）。#250 の RPC 待機がこの接続の上に載る。
     ///
-    /// `timeout` が 0 または [`UDS_ACCEPT_TIMEOUT_MAX`] 超なら `InvalidArgument`（#250 でタイムアウト型へ
-    /// 統合する可能性がある）。パスが空・内部 NUL・`sun_path` 超過の場合も `InvalidArgument`。
+    /// `timeout` が 0 または [`UDS_CONNECT_TIMEOUT_MAX`] 超なら `InvalidArgument`。パスが空・内部 NUL・`sun_path` 超過の場合も `InvalidArgument`。
     /// 存在しなければ `NotFound`、listener 不在の stale socket は `Unavailable`、権限不足は
     /// `PermissionDenied`、期限切れ（backlog 満杯を含む）は `Timeout`。接続後に server の peer UID が
     /// 自 UID でなければ切断して `PermissionDenied`、取得できない環境は `Unimplemented`（fail-closed）。
     pub fn connect(path: &Path, timeout: Duration) -> Result<Self, PluginError> {
-        if timeout.is_zero() || timeout > UDS_ACCEPT_TIMEOUT_MAX {
+        if timeout.is_zero() || timeout > UDS_CONNECT_TIMEOUT_MAX {
             return Err(PluginError::new(
                 PluginErrorCode::InvalidArgument,
                 "connect timeout must be non-zero and within the maximum",
             ));
         }
-        imp::StreamInner::connect(path, timeout).map(|inner| Self { inner })
+        imp::StreamInner::connect(path, timeout).map(|inner| Self {
+            inner,
+            poisoned: false,
+        })
     }
 
     /// read / write の期限を変更する。0 は `InvalidArgument`（無期限にしない。REPAIR-5）。
     pub fn set_io_timeout(&self, timeout: Duration) -> Result<(), PluginError> {
         self.inner.set_io_timeout(timeout)
     }
+
+    /// 相手からのフレーム 1 つ（ACK・RPC 応答・要求のいずれも）を合計 `timeout` 以内に受ける
+    /// （PLUG-2・PLUG-5・REPAIR-5）。
+    ///
+    /// 期限切れは `Timeout`、相手切断は `Unavailable`、長さ超過・チェックサム不一致は検証エラー
+    /// （`InvalidArgument`・`DataLoss`）。失敗した接続は以後使用不可（`Unavailable`）になるため、
+    /// 呼び出し側は再接続する（`crates/io` の `FrameSender` と同じ契約）。
+    /// 呼び出し前の read / write 期限（[`UDS_DEFAULT_IO_TIMEOUT`] 等）は呼び出し後に復元する。
+    pub fn read_frame(&mut self, timeout: RpcTimeout) -> Result<Frame, PluginError> {
+        if self.poisoned {
+            return Err(poisoned_error());
+        }
+        let (result, restored) = self.inner.read_frame(timeout);
+        self.finish_frame_op(result, restored)
+    }
+
+    /// フレーム 1 つを合計 `timeout` 以内に全量送る（PLUG-2・PLUG-5・REPAIR-5）。相手が読まず
+    /// 送信バッファが詰まった場合も `Timeout` で打ち切る。失敗後の扱いは [`Self::read_frame`] と同じ。
+    pub fn write_frame(&mut self, frame: &Frame, timeout: RpcTimeout) -> Result<(), PluginError> {
+        if self.poisoned {
+            return Err(poisoned_error());
+        }
+        let (result, restored) = self.inner.write_frame(frame, timeout);
+        self.finish_frame_op(result, restored)
+    }
+
+    /// フレーム操作の後始末。失敗、または socket 期限を復元できなかった場合は接続を使用不可にし、
+    /// 復元失敗は Ok の結果を握りつぶさずその操作のエラーとして返す（REPAIR-5）。
+    fn finish_frame_op<T>(
+        &mut self,
+        result: Result<T, PluginError>,
+        restored: bool,
+    ) -> Result<T, PluginError> {
+        if result.is_err() || !restored {
+            self.poisoned = true;
+        }
+        match result {
+            Ok(_) if !restored => Err(PluginError::new(
+                PluginErrorCode::Internal,
+                "failed to restore io timeout",
+            )),
+            other => other,
+        }
+    }
+
+    /// 失敗後の接続への生 I/O を拒否する（フレーム I/O と同じ「失敗後は使用不可」契約）。
+    fn check_raw_io(&self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection is unusable after a previous frame error",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Read for UdsStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.check_raw_io()?;
         self.inner.read(buf)
     }
 }
 
 impl Write for UdsStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.check_raw_io()?;
         self.inner.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.check_raw_io()?;
         self.inner.flush()
     }
+}
+
+fn poisoned_error() -> PluginError {
+    PluginError::new(
+        PluginErrorCode::Unavailable,
+        "connection is unusable after a previous frame error",
+    )
+}
+
+/// フレーム I/O の方向（エラー message の出し分け用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum FrameOp {
+    Read,
+    Write,
+}
+
+/// フレーム I/O の `io::Error` を `PluginError` へ写像する（REPAIR-5）。期限切れ（`Timeout`）と
+/// 相手切断（`Unavailable`）を区別する。パス・相手由来データはメッセージへ載せない。
+#[cfg_attr(not(unix), allow(dead_code))]
+fn map_frame_io_error(kind: io::ErrorKind, op: FrameOp) -> PluginError {
+    let (code, message) = match (kind, op) {
+        (io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut, FrameOp::Read) => {
+            (PluginErrorCode::Timeout, "timed out waiting for a frame")
+        }
+        (io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut, FrameOp::Write) => {
+            (PluginErrorCode::Timeout, "timed out sending a frame")
+        }
+        (
+            io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected,
+            _,
+        ) => (PluginErrorCode::Unavailable, "peer closed the connection"),
+        (_, FrameOp::Read) => (PluginErrorCode::Internal, "failed to read a frame"),
+        (_, FrameOp::Write) => (PluginErrorCode::Internal, "failed to send a frame"),
+    };
+    PluginError::new(code, message)
 }
 
 /// `bind` の `io::Error` を `PluginError` へ写像する。相手由来データはメッセージへ載せない。
@@ -229,8 +403,12 @@ fn map_connect_error(kind: io::ErrorKind) -> PluginError {
 
 #[cfg(unix)]
 mod imp {
-    use super::{UDS_DEFAULT_IO_TIMEOUT, map_bind_error, map_connect_error};
+    use super::{
+        FrameOp, RpcTimeout, UDS_DEFAULT_IO_TIMEOUT, map_bind_error, map_connect_error,
+        map_frame_io_error,
+    };
     use crate::error::{PluginError, PluginErrorCode};
+    use crate::frame::{FRAME_HEADER_LEN, Frame, FrameHeader};
     use crate::sys;
     use std::ffi::CString;
     use std::fs::File;
@@ -241,6 +419,9 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// 受信本体バッファを伸ばす 1 回あたりの塊（ヘッダだけ送って巨大確保させない。REPAIR-5）。
+    const BODY_CHUNK: usize = 64 * 1024;
 
     /// accept のポーリング間隔（busy loop 回避。crates/io の ACCEPT_POLL_INTERVAL に合わせる）。
     const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -525,12 +706,189 @@ mod imp {
         pub(super) fn flush(&mut self) -> io::Result<()> {
             self.stream.flush()
         }
+
+        /// 期限つきでフレームを 1 つ受ける。戻り値の bool は socket 期限を復元できたか。
+        pub(super) fn read_frame(
+            &mut self,
+            timeout: RpcTimeout,
+        ) -> (Result<Frame, PluginError>, bool) {
+            let saved = self.save_timeouts();
+            let deadline = Instant::now() + timeout.as_duration();
+            let result = self.read_frame_inner(deadline);
+            let restored = self.restore_timeouts(saved);
+            (result, restored)
+        }
+
+        /// 期限つきでフレームを 1 つ全量送る。戻り値の bool は socket 期限を復元できたか。
+        pub(super) fn write_frame(
+            &mut self,
+            frame: &Frame,
+            timeout: RpcTimeout,
+        ) -> (Result<(), PluginError>, bool) {
+            let saved = self.save_timeouts();
+            let deadline = Instant::now() + timeout.as_duration();
+            // encode（最大 16 MiB のコピーとチェックサム計算）も合計期限に含める。encode 後に期限を
+            // 超えていれば 1 バイトも送らず Timeout にする（REPAIR-5）。
+            let encoded = frame.encode();
+            let result = remaining_until(deadline, FrameOp::Write)
+                .and_then(|_| self.write_all_deadline(&encoded, deadline));
+            let restored = self.restore_timeouts(saved);
+            (result, restored)
+        }
+
+        fn save_timeouts(&self) -> Option<(Option<Duration>, Option<Duration>)> {
+            Some((
+                self.stream.read_timeout().ok()?,
+                self.stream.write_timeout().ok()?,
+            ))
+        }
+
+        fn restore_timeouts(&self, saved: Option<(Option<Duration>, Option<Duration>)>) -> bool {
+            let Some((r, w)) = saved else {
+                return false;
+            };
+            // 片方が失敗しても必ず両方を試す（短絡させない）。
+            let read_ok = self.stream.set_read_timeout(r).is_ok();
+            let write_ok = self.stream.set_write_timeout(w).is_ok();
+            read_ok && write_ok
+        }
+
+        fn read_frame_inner(&mut self, deadline: Instant) -> Result<Frame, PluginError> {
+            let mut head = [0u8; FRAME_HEADER_LEN];
+            self.read_exact_deadline(&mut head, deadline)?;
+            // 長さ上限の検証を通ってから本体を確保する。
+            let header = FrameHeader::from_bytes(head)?;
+            let body_len = header.body_len();
+            let mut body: Vec<u8> = Vec::new();
+            while body.len() < body_len {
+                let start = body.len();
+                let chunk = BODY_CHUNK.min(body_len - start);
+                body.resize(start + chunk, 0);
+                let slice = body.get_mut(start..).ok_or_else(internal_read)?;
+                self.read_exact_deadline(slice, deadline)?;
+            }
+            let frame = Frame::decode_body(header, &body)?;
+            // チェックサム検証・ペイロードコピーの後に期限を超えていれば成功扱いにしない（REPAIR-5）。
+            remaining_until(deadline, FrameOp::Read)?;
+            Ok(frame)
+        }
+
+        /// 合計期限 `deadline` までに `buf` をちょうど埋める。残り時間で read 期限を掛け直す。
+        fn read_exact_deadline(
+            &mut self,
+            buf: &mut [u8],
+            deadline: Instant,
+        ) -> Result<(), PluginError> {
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                let remaining = remaining_until(deadline, FrameOp::Read)?;
+                let slice = buf.get_mut(filled..).ok_or_else(internal_read)?;
+                // macOS は peer close 後の UDS で set_read_timeout が EINVAL を返す。期限を掛けられない
+                // まま blocking read に進むと上限を超えて待ちうるため、EINVAL のときは non-blocking
+                // read で 1 回だけ試す（切断済みなら残りバイトか EOF を即返す。何も来なければ
+                // 期限を保証できないので失敗させる）。それ以外の失敗も読まずに失敗させる
+                // （PLUG-2・REPAIR-5）。
+                let res = match self.stream.set_read_timeout(Some(remaining)) {
+                    Ok(()) => self.stream.read(slice),
+                    Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                        self.nonblocking_once(FrameOp::Read, |mut s| s.read(slice))?
+                    }
+                    Err(_) => return Err(internal_read()),
+                };
+                match res {
+                    Ok(0) => {
+                        return Err(map_frame_io_error(
+                            io::ErrorKind::UnexpectedEof,
+                            FrameOp::Read,
+                        ));
+                    }
+                    Ok(n) => filled = filled.checked_add(n).ok_or_else(internal_read)?,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(map_frame_io_error(e.kind(), FrameOp::Read)),
+                }
+            }
+            // 最後の read が期限後に成功した場合も合計期限超過として扱う（REPAIR-5）。
+            remaining_until(deadline, FrameOp::Read)?;
+            Ok(())
+        }
+
+        /// socket を一時的に non-blocking にして `op` を 1 回だけ実行する。期限を設定できない
+        /// socket で blocking I/O に進まないための経路。WouldBlock（進捗なし）は期限を保証できない
+        /// ため `Internal` で失敗させ、blocking への復元に失敗した場合も失敗させる（REPAIR-5）。
+        fn nonblocking_once(
+            &self,
+            frame_op: FrameOp,
+            op: impl FnOnce(&UnixStream) -> io::Result<usize>,
+        ) -> Result<io::Result<usize>, PluginError> {
+            // 失敗は呼び出し元の方向（read / write）で報告する。
+            let internal = || map_frame_io_error(io::ErrorKind::Other, frame_op);
+            self.stream.set_nonblocking(true).map_err(|_| internal())?;
+            let res = op(&self.stream);
+            self.stream.set_nonblocking(false).map_err(|_| internal())?;
+            match res {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(internal()),
+                other => Ok(other),
+            }
+        }
+
+        fn write_all_deadline(
+            &mut self,
+            bytes: &[u8],
+            deadline: Instant,
+        ) -> Result<(), PluginError> {
+            let mut sent = 0usize;
+            while sent < bytes.len() {
+                let remaining = remaining_until(deadline, FrameOp::Write)?;
+                let slice = bytes.get(sent..).ok_or_else(internal_write)?;
+                // 読み取り側と同様、EINVAL のときは non-blocking write で 1 回だけ試す
+                // （切断済みなら EPIPE 等が Unavailable に写像される）。他の失敗は書かずに失敗させる。
+                let res = match self.stream.set_write_timeout(Some(remaining)) {
+                    Ok(()) => self.stream.write(slice),
+                    Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                        self.nonblocking_once(FrameOp::Write, |mut s| s.write(slice))?
+                    }
+                    Err(_) => return Err(internal_write()),
+                };
+                match res {
+                    Ok(0) => {
+                        return Err(map_frame_io_error(
+                            io::ErrorKind::BrokenPipe,
+                            FrameOp::Write,
+                        ));
+                    }
+                    Ok(n) => sent = sent.checked_add(n).ok_or_else(internal_write)?,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(map_frame_io_error(e.kind(), FrameOp::Write)),
+                }
+            }
+            // 最後の write が期限後に成功した場合も合計期限超過として扱う（REPAIR-5）。
+            remaining_until(deadline, FrameOp::Write)?;
+            Ok(())
+        }
+    }
+
+    fn internal_read() -> PluginError {
+        map_frame_io_error(io::ErrorKind::Other, FrameOp::Read)
+    }
+
+    fn internal_write() -> PluginError {
+        map_frame_io_error(io::ErrorKind::Other, FrameOp::Write)
+    }
+
+    /// 期限までの残り時間（0 なら `Timeout`）。
+    fn remaining_until(deadline: Instant, op: FrameOp) -> Result<Duration, PluginError> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| map_frame_io_error(io::ErrorKind::TimedOut, op))
     }
 }
 
 #[cfg(not(unix))]
 mod imp {
+    use super::RpcTimeout;
     use crate::error::{PluginError, PluginErrorCode};
+    use crate::frame::Frame;
     use std::io;
     use std::path::Path;
     use std::time::Duration;
@@ -577,6 +935,19 @@ mod imp {
             match *self {}
         }
         pub(super) fn flush(&mut self) -> io::Result<()> {
+            match *self {}
+        }
+        pub(super) fn read_frame(
+            &mut self,
+            _timeout: RpcTimeout,
+        ) -> (Result<Frame, PluginError>, bool) {
+            match *self {}
+        }
+        pub(super) fn write_frame(
+            &mut self,
+            _frame: &Frame,
+            _timeout: RpcTimeout,
+        ) -> (Result<(), PluginError>, bool) {
             match *self {}
         }
     }
@@ -632,6 +1003,99 @@ mod tests {
         for (kind, code) in cases {
             assert_eq!(map_connect_error(kind).code(), code);
         }
+    }
+
+    /// REPAIR-5: 0 と上限超過は構築できず、上限ちょうどは許可する。
+    #[test]
+    fn repair5_rpc_timeout_rejects_zero_and_over_max() {
+        let e = RpcTimeout::new(Duration::ZERO).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        let ok = RpcTimeout::new(UDS_RPC_TIMEOUT_MAX).unwrap();
+        assert_eq!(ok.as_duration(), Duration::from_secs(10));
+        let e = RpcTimeout::try_from(UDS_RPC_TIMEOUT_MAX + Duration::from_nanos(1)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+    }
+
+    /// REPAIR-5: 既定値・上限の具体値。
+    #[test]
+    fn repair5_rpc_timeout_default_is_ten_seconds() {
+        assert_eq!(RpcTimeout::default().as_duration(), Duration::from_secs(10));
+        assert_eq!(UDS_RPC_TIMEOUT_DEFAULT, Duration::from_secs(10));
+        assert_eq!(UDS_RPC_TIMEOUT_MAX, Duration::from_secs(10));
+        assert_eq!(UDS_CONNECT_TIMEOUT_MAX, Duration::from_secs(600));
+    }
+
+    /// PLUG-2・REPAIR-5: フレーム I/O の ErrorKind 写像（Timeout と Unavailable を区別する）。
+    #[test]
+    fn plug2_map_frame_io_error_maps_io_error_kinds() {
+        use io::ErrorKind as K;
+        let t = PluginErrorCode::Timeout;
+        let u = PluginErrorCode::Unavailable;
+        let i = PluginErrorCode::Internal;
+        let cases = [
+            (
+                K::TimedOut,
+                FrameOp::Read,
+                t,
+                "timed out waiting for a frame",
+            ),
+            (
+                K::WouldBlock,
+                FrameOp::Read,
+                t,
+                "timed out waiting for a frame",
+            ),
+            (K::TimedOut, FrameOp::Write, t, "timed out sending a frame"),
+            (
+                K::WouldBlock,
+                FrameOp::Write,
+                t,
+                "timed out sending a frame",
+            ),
+            (
+                K::UnexpectedEof,
+                FrameOp::Read,
+                u,
+                "peer closed the connection",
+            ),
+            (
+                K::ConnectionReset,
+                FrameOp::Read,
+                u,
+                "peer closed the connection",
+            ),
+            (
+                K::ConnectionAborted,
+                FrameOp::Write,
+                u,
+                "peer closed the connection",
+            ),
+            (
+                K::BrokenPipe,
+                FrameOp::Write,
+                u,
+                "peer closed the connection",
+            ),
+            (
+                K::NotConnected,
+                FrameOp::Write,
+                u,
+                "peer closed the connection",
+            ),
+            (K::Other, FrameOp::Read, i, "failed to read a frame"),
+            (K::Other, FrameOp::Write, i, "failed to send a frame"),
+        ];
+        for (kind, op, code, msg) in cases {
+            let e = map_frame_io_error(kind, op);
+            assert_eq!(e.code(), code);
+            assert_eq!(e.message(), msg);
+        }
+        assert_eq!(
+            map_frame_io_error(io::ErrorKind::TimedOut, FrameOp::Read)
+                .code()
+                .as_str(),
+            "TIMEOUT"
+        );
     }
 
     /// PLUG-2: `sun_path` に収まる最大長（容量 - 1 バイト。終端 NUL 分）は許可し、容量ちょうどは

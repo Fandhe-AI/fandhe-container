@@ -20,7 +20,7 @@ fn plug2_connect_is_unimplemented_on_non_unix() {
 mod unix {
     use fandhe_container_plugin::{
         ControlMessage, FRAME_HEADER_LEN, Frame, FrameHeader, MessageId, PluginErrorCode,
-        UDS_ACCEPT_TIMEOUT_MAX, UdsListener, UdsStream, decode_message, encode_message,
+        UDS_CONNECT_TIMEOUT_MAX, UdsListener, UdsStream, decode_message, encode_message,
     };
     use std::io::{Read, Write};
     use std::os::unix::fs::DirBuilderExt;
@@ -153,8 +153,11 @@ mod unix {
         let dir = TempDir::new();
         let e = UdsStream::connect(&dir.sock(), Duration::ZERO).unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
-        let e = UdsStream::connect(&dir.sock(), UDS_ACCEPT_TIMEOUT_MAX + Duration::from_secs(1))
-            .unwrap_err();
+        let e = UdsStream::connect(
+            &dir.sock(),
+            UDS_CONNECT_TIMEOUT_MAX + Duration::from_secs(1),
+        )
+        .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
     }
 

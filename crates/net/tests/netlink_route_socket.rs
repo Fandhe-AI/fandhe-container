@@ -87,3 +87,48 @@ fn multiple_sockets_bind_independently() {
     assert_eq!(dump_links(&a).last().map(|m| m.0), Some(NLMSG_DONE));
     assert_eq!(dump_links(&b).last().map(|m| m.0), Some(NLMSG_DONE));
 }
+
+/// lo（ifindex 1）1 件だけを問い合わせる非 dump の RTM_GETLINK（応答は RTM_NEWLINK 1 データグラム）。
+fn getlink_lo(seq: u32) -> Vec<u8> {
+    let mut b = NlMsgBuilder::new(RTM_GETLINK, NLM_F_REQUEST, seq, 0);
+    let mut ifi = [0u8; 16];
+    ifi[4..8].copy_from_slice(&1i32.to_ne_bytes());
+    b.put_fixed(&ifi).expect("ifinfomsg");
+    b.finish().expect("finish")
+}
+
+/// NET-11・REPAIR-5: 1 つのソケットを 2 スレッドが共有して同時に `recv` しても、応答が期限内に
+/// 2 件届けば両方が 1 件ずつ受信する（先を越された側が即座に `Timeout` にならず待ち直す）。
+#[test]
+fn shared_socket_readers_each_receive_one_response() {
+    const SEQ_A: u32 = 0x0000_a001;
+    const SEQ_B: u32 = 0x0000_b002;
+    let sock = NetlinkRouteSocket::open().expect("open");
+    let started = Instant::now();
+    let mut seqs = std::thread::scope(|scope| {
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    let data = sock.recv(Duration::from_secs(10)).expect("recv");
+                    let first = NlMsgIter::new(&data)
+                        .next()
+                        .expect("one message")
+                        .expect("valid message");
+                    (first.header().msg_type(), first.header().seq())
+                })
+            })
+            .collect();
+        // 両方の読み手が poll で待っている状態で 1 件目を届け、少し空けて 2 件目を届ける。
+        std::thread::sleep(Duration::from_millis(100));
+        sock.send(&getlink_lo(SEQ_A)).expect("send a");
+        std::thread::sleep(Duration::from_millis(100));
+        sock.send(&getlink_lo(SEQ_B)).expect("send b");
+        readers
+            .into_iter()
+            .map(|r| r.join().expect("reader thread"))
+            .collect::<Vec<_>>()
+    });
+    seqs.sort_unstable();
+    assert_eq!(seqs, vec![(RTM_NEWLINK, SEQ_A), (RTM_NEWLINK, SEQ_B)]);
+    assert!(started.elapsed() < Duration::from_secs(10));
+}

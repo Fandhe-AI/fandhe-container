@@ -73,10 +73,17 @@
 //! - 設定済みだが不正な値（相対パス・`..`）はフォールバックせずエラーにする。
 //! - OCI-5 の state store は別仕様で、未設定時にフォールバックしない（`crates/core`）。
 //!
+//! # peer credential 検証（TASK-124.1・#292。Linux は SO_PEERCRED。PLUG-12）
+//! `transport` の accept / connect が接続直後に [`verify_peer`] を呼ぶ。契約:
+//! - 順序: accept（connect）の直後、フレームの read・write より前に検証する。
+//! - fail-closed: 取得失敗も UID 不一致も `Err` を返し、呼び出し側は stream を drop して切断する。
+//! - 比較する UID は接続時点の peer の実効 uid と、listener bind 時（client は connect 時）の自 euid。
+//!   user namespace 外の uid は overflowuid として見え、不一致で拒否される（安全側）。
+//! - 同一 UID の別プロセスは脅威モデル外（第 1 層は 0700 の配置ディレクトリ）。
+//! - `unsafe` を含む取得処理は `crate::sys::peer_uid`（`sys` モジュール）に閉じる。
+//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。未実装は Windows の文書化（#294）・別 UID 実接続の拒否試験（#295）・拒否の監査ログ（SEC-4）。
+//!
 //! # 未実装（REPAIR-3）
-//! - peer credential の取得・照合自体は `crate::sys::peer_uid`・`UdsListener::accept`・
-//!   `UdsStream::connect` で実装済み（macOS は TASK-124.2・#293 で確認。Linux は #292、Windows の文書化は #294、
-//!   別 UID 拒否の結合テストは #295 で扱い、本節では完了扱いにしない）。
 //! - 非 unix は `Unimplemented`（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る）。
 
 use std::path::{Component, Path, PathBuf};
@@ -163,6 +170,42 @@ fn runtime_dir_base(xdg: Option<std::ffi::OsString>) -> Result<PathBuf, PluginEr
     let base = PathBuf::from(value);
     validate_base(&base)?;
     Ok(base)
+}
+
+/// peer の uid が期待 uid と一致するか（PLUG-12・TASK-124.1）。
+#[cfg(unix)]
+fn peer_uid_matches(peer: u32, expected: u32) -> bool {
+    peer == expected
+}
+
+/// 取得関数を差し替えられる検証本体（取得失敗の fail-closed をテストで再現するため。PLUG-12）。
+#[cfg(unix)]
+fn verify_peer_with(
+    get: impl FnOnce() -> Result<u32, PluginError>,
+    expected_uid: u32,
+) -> Result<(), PluginError> {
+    // 取得失敗はそのまま伝播する（Ok にしない）。
+    let peer = get()?;
+    if !peer_uid_matches(peer, expected_uid) {
+        // メッセージは固定文字列で UID 値を含めない。
+        return Err(PluginError::new(
+            PluginErrorCode::PermissionDenied,
+            "peer credential does not match the current user",
+        ));
+    }
+    Ok(())
+}
+
+/// 接続済み stream の peer uid を `expected_uid` と照合する（PLUG-12・TASK-124.1・#292）。
+///
+/// `transport` の accept 直後・connect 直後（最初の read より前）から呼ばれる。Err なら呼び出し側が
+/// stream を drop して切断する。取得は `crate::sys::peer_uid`（Linux は SO_PEERCRED）。
+#[cfg(unix)]
+pub(crate) fn verify_peer(
+    stream: &std::os::unix::net::UnixStream,
+    expected_uid: u32,
+) -> Result<(), PluginError> {
+    verify_peer_with(|| crate::sys::peer_uid(stream), expected_uid)
 }
 
 #[cfg(unix)]
@@ -1414,6 +1457,55 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PLUG-12: uid は完全一致のみ許可する。
+    #[cfg(unix)]
+    #[test]
+    fn plug12_peer_uid_matches_only_identical_uid() {
+        assert!(peer_uid_matches(1000, 1000));
+        for (p, e) in [(1000, 1001), (0, 1000), (1000, 0), (65534, 1000)] {
+            assert!(!peer_uid_matches(p, e), "{p} vs {e}");
+        }
+    }
+
+    /// PLUG-12: 不一致は PermissionDenied・固定メッセージで UID 値を含まない。
+    #[cfg(unix)]
+    #[test]
+    fn plug12_verify_peer_rejects_mismatched_uid_with_permission_denied() {
+        let err = verify_peer_with(|| Ok(1001), 1000).unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+        let msg = err.to_string();
+        assert!(msg.contains("peer credential does not match the current user"));
+        assert!(!msg.contains("1000") && !msg.contains("1001"), "{msg}");
+    }
+
+    /// PLUG-12: 取得失敗は Ok にならず同じコードで Err（fail-closed）。
+    #[cfg(unix)]
+    #[test]
+    fn plug12_verify_peer_fails_closed_when_credential_unavailable() {
+        for code in [PluginErrorCode::Internal, PluginErrorCode::Unimplemented] {
+            let err = verify_peer_with(|| Err(PluginError::new(code, "x")), 1000).unwrap_err();
+            assert_eq!(err.code(), code);
+        }
+    }
+
+    /// PLUG-12: 実際の peer credential 経路（自己接続）で一致は Ok、ずらした期待値は拒否。
+    /// `sys::peer_uid` が実装済みの OS・アーキテクチャに限定する（他は Unimplemented を返すため）。
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn plug12_verify_peer_accepts_same_uid_socketpair() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let me = crate::sys::effective_uid();
+        assert!(verify_peer(&a, me).is_ok());
+        let err = verify_peer(&a, me.wrapping_add(1)).unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+    }
 
     /// PLUG-12: 未設定・空・相対は FailedPrecondition（`/tmp` 等へ落とさない）。
     #[test]

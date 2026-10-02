@@ -28,16 +28,33 @@
 //! - エラーメッセージは固定の英語文字列で、パス・環境変数値を含めない。
 //! - 既存 socket パス（TASK-123.2・#287）: `UdsListener::bind` が bind 前に検証済みディレクトリ fd 基準で
 //!   lstat（symlink 非追従）する。symlink と他 UID 所有のエントリは削除せず `PermissionDenied`。
-//!   自 UID 所有でも socket 以外、または接続が成功／判定不能（期限超過等）の socket は削除せず
-//!   `AlreadyExists`。自 UID 所有で接続が拒否される stale socket だけを、再 lstat で同一性
-//!   （dev / ino / uid / 種別）を確認したうえで `unlinkat` し、再 bind を可能にする。
-//!   生存確認の probe は接続して即切断するだけでデータを送らない（相手の accept には一瞬届く。同一 UID）。
+//!   生存判定は接続 probe ではなく sibling の `<socket 名>.lock` への排他 flock で行う
+//!   （listener が生存中保持し、クラッシュ時は kernel が解放する）。接続拒否の回数では削除しない
+//!   （macOS は accept queue 満杯の生存 listener にも ECONNREFUSED を返すため区別できず、probe 接続が
+//!   既存 listener の accept queue に残る副作用もある）。ロックを取れない（生存中）、socket 以外、
+//!   またはロックファイルの無い socket（管理下か判別不能）は削除せず `AlreadyExists`。ロックを取れて
+//!   管理下の自 UID 所有 socket だけを、再 lstat で同一性（dev / ino / uid / 種別）を確認したうえで
+//!   `unlinkat` し、再 bind を可能にする。
 //!   残余: 再確認から unlink までの窓で差し替えられるのは 0700 ディレクトリ内の同一 UID のみ
 //!   （脅威モデル外）。macOS は lstat がパス縮退のため窓がやや広い。
 //!
+//! # `XDG_RUNTIME_DIR` 未設定時のフォールバック（TASK-123.4・#289）
+//! 未設定または空のときだけ、OS・euid ごとに単一の基底を選び、通常経路と同じ検証
+//! （[`RuntimeDir::ensure_under`] 相当）を省略なく適用する。
+//!
+//! | 条件 | 基底 |
+//! | ---- | ---- |
+//! | Linux・euid 0 | `/run`（OCI-5 の root 配置と同じツリー） |
+//! | Linux・euid != 0 | `/run/user/<euid>` |
+//! | macOS | 環境変数 `TMPDIR`（ユーザー固有の 0700 ディレクトリ） |
+//! | 上記以外の unix | なし（`FailedPrecondition`） |
+//!
+//! - 共有書き込み可能な `/tmp` へは落とさない。基底は作らず、無ければ `FailedPrecondition`。
+//! - 候補は単一で、検証失敗（`PermissionDenied` 等）時に別候補へ連鎖しない（改ざんを隠さない）。
+//! - 設定済みだが不正な値（相対パス・`..`）はフォールバックせずエラーにする。
+//! - OCI-5 の state store は別仕様で、未設定時にフォールバックしない（`crates/core`）。
+//!
 //! # 未実装（REPAIR-3）
-//! - `XDG_RUNTIME_DIR` 未設定時のフォールバック・root 時の既定配置先は未実装で、未設定は
-//!   `FailedPrecondition`（TASK-123.4・#289）。
 //! - socket 0600 化と `sun_path` 長検証（TASK-123.3・#288）、peer credential（TASK-124）は別 sub。
 //! - 非 unix は `Unimplemented`（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る）。
 
@@ -58,14 +75,15 @@ pub struct RuntimeDir {
 impl RuntimeDir {
     /// 環境変数 `XDG_RUNTIME_DIR` と自プロセスの実効 uid から解決・作成する。
     ///
-    /// 未設定・空・相対パスは `FailedPrecondition`（フォールバックは TASK-123.4・#289）。
+    /// 未設定・空のときは OS・euid ごとのフォールバック基底を使う（モジュール doc 参照。TASK-123.4・#289）。
+    /// 設定済みの相対パスは `FailedPrecondition`、`..` 含みは `InvalidArgument`。
     pub fn from_env() -> Result<Self, PluginError> {
         imp::from_env()
     }
 
     /// 指定の基底ディレクトリ直下の `fandhe-container` を解決・作成する。
     ///
-    /// テストおよび #289 のフォールバックが基底を注入する入口。基底は絶対パス・`..` なしで自 UID 所有・
+    /// テストおよびフォールバック（#289）が基底を注入する入口。基底は絶対パス・`..` なしで自 UID 所有・
     /// group/other 書き込み不可の非 symlink ディレクトリ（違反は `PermissionDenied`）で、
     /// 既に存在していなければならない（`NotFound`。基底は作成しない）。
     pub fn ensure_under(base: &Path) -> Result<Self, PluginError> {
@@ -114,7 +132,7 @@ fn runtime_dir_base(xdg: Option<std::ffi::OsString>) -> Result<PathBuf, PluginEr
 }
 
 #[cfg(unix)]
-pub(crate) use imp::clear_stale_socket;
+pub(crate) use imp::{BindLock, acquire_bind_lock, clear_stale_socket};
 
 #[cfg(unix)]
 mod imp {
@@ -125,9 +143,80 @@ mod imp {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     use std::path::{Path, PathBuf};
 
+    /// Linux のフォールバック基底の根（root は直下、非 root は `user/<euid>`）。
+    const RUN_ROOT: &str = "/run";
+
+    const NO_FALLBACK: &str =
+        "XDG_RUNTIME_DIR is not set and no fallback runtime directory is available";
+
     pub(super) fn from_env() -> Result<RuntimeDir, PluginError> {
-        let base = runtime_dir_base(std::env::var_os("XDG_RUNTIME_DIR"))?;
-        ensure_dir(&base, crate::sys::effective_uid())
+        resolve(
+            std::env::var_os("XDG_RUNTIME_DIR"),
+            std::env::var_os("TMPDIR"),
+            crate::sys::effective_uid(),
+            Path::new(RUN_ROOT),
+        )
+    }
+
+    /// `XDG_RUNTIME_DIR` 未設定・空のときの単一フォールバック基底（PLUG-12・TASK-123.4）。
+    /// 基底の存在・所有者・権限の検証は呼び出し元の `ensure_dir` が行う。
+    #[allow(unused_variables)] // OS ごとに使う引数が異なる
+    fn fallback_base(
+        euid: u32,
+        run_root: &Path,
+        tmpdir: Option<std::ffi::OsString>,
+    ) -> Result<PathBuf, PluginError> {
+        #[cfg(target_os = "linux")]
+        {
+            if euid == 0 {
+                Ok(run_root.to_path_buf())
+            } else {
+                Ok(run_root.join("user").join(euid.to_string()))
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            match tmpdir {
+                Some(v) if !v.is_empty() => {
+                    let base = PathBuf::from(v);
+                    validate_base(&base)?;
+                    Ok(base)
+                }
+                _ => Err(PluginError::new(
+                    PluginErrorCode::FailedPrecondition,
+                    NO_FALLBACK,
+                )),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(PluginError::new(
+                PluginErrorCode::FailedPrecondition,
+                NO_FALLBACK,
+            ))
+        }
+    }
+
+    /// 環境値を注入できる解決本体。`from_env` とテストが呼ぶ。
+    pub(super) fn resolve(
+        xdg: Option<std::ffi::OsString>,
+        tmpdir: Option<std::ffi::OsString>,
+        euid: u32,
+        run_root: &Path,
+    ) -> Result<RuntimeDir, PluginError> {
+        if matches!(&xdg, Some(v) if !v.is_empty()) {
+            let base = runtime_dir_base(xdg)?;
+            return ensure_dir(&base, euid);
+        }
+        let base = fallback_base(euid, run_root, tmpdir)?;
+        // フォールバック基底が無い場合のみ前提条件違反へ写像する。検証失敗は格下げしない。
+        ensure_dir(&base, euid).map_err(|e| {
+            if e.code() == PluginErrorCode::NotFound {
+                PluginError::new(PluginErrorCode::FailedPrecondition, NO_FALLBACK)
+            } else {
+                e
+            }
+        })
     }
 
     pub(super) fn ensure_under(base: &Path) -> Result<RuntimeDir, PluginError> {
@@ -293,13 +382,6 @@ mod imp {
         Ok(RuntimeDir { path: dir })
     }
 
-    /// stale 判定の probe（接続試行）の期限（REPAIR-5）。
-    const STALE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-    /// stale 判定に必要な連続拒否回数（macOS の backlog 満杯 ECONNREFUSED 対策）。
-    const STALE_PROBE_ATTEMPTS: u32 = 2;
-    /// 連続 probe の間隔。
-    const STALE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
-
     /// 既存エントリの分類結果（PLUG-12・TASK-123.2）。
     #[derive(Debug, PartialEq, Eq)]
     pub(super) enum ExistingEntry {
@@ -347,17 +429,99 @@ mod imp {
         }
     }
 
+    /// bind 用ロック（sibling の `<socket 名>.lock` への排他 flock。PLUG-12・TASK-123.2）。
+    ///
+    /// 保持者は listener の生存期間中ロックを持ち続ける（[`crate::transport::UdsListener`] の内部が
+    /// 保持）。kernel はプロセス終了・クラッシュ時に自動解放するため、「ロックを取れる」ことが
+    /// 「以前の保持者はもういない」の証拠になる。接続 probe は使わない（macOS では accept queue 満杯の
+    /// 生存 listener にも ECONNREFUSED が返り stale と区別できず、probe 接続が相手の accept queue に
+    /// 残る副作用もあるため）。
+    #[derive(Debug)]
+    pub(crate) struct BindLock {
+        /// flock を保持する fd（drop で解放）。
+        _file: File,
+        /// ロックファイル名（unmanaged 判定時の後始末用）。
+        lock_name: std::ffi::CString,
+        /// 以前の保持者が作ったロックファイルが残っていたか（false なら今回新規作成）。
+        preexisting: bool,
+    }
+
+    /// `name` に対応するロックを取得する。他者が保持中（生存中の listener）は `AlreadyExists`、
+    /// symlink・他 UID 所有・通常ファイル以外は `PermissionDenied`（fail-closed）。
+    pub(crate) fn acquire_bind_lock(
+        dir: &File,
+        name: &std::ffi::CStr,
+        euid: u32,
+    ) -> Result<BindLock, PluginError> {
+        let mut bytes = name.to_bytes().to_vec();
+        bytes.extend_from_slice(b".lock");
+        let lock_name = std::ffi::CString::new(bytes)
+            .map_err(|_| err(PluginErrorCode::InvalidArgument, "invalid socket path"))?;
+        let handle = match crate::sys::lock_file_at(dir, &lock_name) {
+            Ok(h) => h,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Err(err(
+                    PluginErrorCode::AlreadyExists,
+                    "socket path already exists",
+                ));
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::PermissionDenied
+                    || e.raw_os_error().is_some_and(is_symlink_errno) =>
+            {
+                return Err(err(
+                    PluginErrorCode::PermissionDenied,
+                    "permission denied while locking socket path",
+                ));
+            }
+            Err(_) => {
+                return Err(err(PluginErrorCode::Internal, "failed to lock socket path"));
+            }
+        };
+        let meta = handle.file.metadata().map_err(|_| {
+            err(
+                PluginErrorCode::Internal,
+                "failed to inspect socket lock file",
+            )
+        })?;
+        if !meta.is_file() || meta.uid() != euid {
+            if handle.created {
+                let _ = crate::sys::unlinkat(dir, &lock_name);
+            }
+            return Err(err(
+                PluginErrorCode::PermissionDenied,
+                "socket lock file is not owned by the current user",
+            ));
+        }
+        Ok(BindLock {
+            _file: handle.file,
+            lock_name,
+            preexisting: !handle.created,
+        })
+    }
+
+    /// `O_NOFOLLOW` が symlink に対して返す errno（Linux: ELOOP=40、macOS: ELOOP=62）。
+    fn is_symlink_errno(code: i32) -> bool {
+        if cfg!(target_os = "macos") {
+            code == 62
+        } else {
+            code == 40
+        }
+    }
+
     /// bind 前に既存エントリを検証し、自 UID 所有の stale socket のみ削除する（PLUG-12・TASK-123.2）。
     ///
-    /// `UdsListener::bind` から、配置ディレクトリ検証後・`UnixListener::bind` の前に呼ばれる。
-    /// `public` は公開パス（macOS の lstat 縮退用）、`probe` は生存確認の接続先。削除は
-    /// 検証済み `dir` fd 基準の `unlinkat` のみ。判定不能は削除しない（fail-closed）。
+    /// `UdsListener::bind` から、配置ディレクトリ検証後・`UnixListener::bind` の前に、`lock`
+    /// 取得後に呼ばれる。ロックを保持している＝同ロックを使う生存中の listener は存在しないため、
+    /// 自 UID 所有の socket のうち「以前ロックファイルを作った（管理下の）」ものだけを削除する。
+    /// ロックファイルが無かった socket は生存中か判別できない（他実装・旧版）ため削除せず
+    /// `AlreadyExists`（fail-closed）。削除は検証済み `dir` fd 基準の `unlinkat` のみ。
     pub(crate) fn clear_stale_socket(
         dir: &File,
         name: &std::ffi::CStr,
         public: &Path,
-        probe: &Path,
         euid: u32,
+        lock: &BindLock,
     ) -> Result<(), PluginError> {
         let first = match classify_existing(lstat_opt(dir, name, public)?.as_ref(), euid) {
             ExistingEntry::Absent => return Ok(()),
@@ -382,19 +546,12 @@ mod imp {
             ExistingEntry::OwnSocket(i) => i,
         };
         let busy = || err(PluginErrorCode::AlreadyExists, "socket path already exists");
-        // macOS は accept queue 満杯の生存 listener にも ECONNREFUSED を返すため、一過性の
-        // 満杯を stale と誤認しないよう、間隔を置いた連続 2 回の拒否を stale の条件とする。
-        // 接続成功（生存中。即 drop）・期限超過・未対応・その他は削除しない（fail-closed）。
-        for attempt in 0..STALE_PROBE_ATTEMPTS {
-            if attempt > 0 {
-                std::thread::sleep(STALE_PROBE_INTERVAL);
-            }
-            match crate::sys::connect_unix(probe, std::time::Instant::now() + STALE_PROBE_TIMEOUT) {
-                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
-                _ => return Err(busy()),
-            }
+        if !lock.preexisting {
+            // 今回作ったロックファイルを残すと、次回以降この socket を管理下と誤認するため消す。
+            let _ = crate::sys::unlinkat(dir, &lock.lock_name);
+            return Err(busy());
         }
-        // 削除直前に同一性を再確認する（probe 中の差し替えを検出）。
+        // 削除直前に同一性を再確認する。
         match lstat_opt(dir, name, public)? {
             None => return Ok(()),
             Some(now) if now == first => {}
@@ -461,14 +618,16 @@ mod imp {
             let dir = File::open(&d).unwrap();
             let name = std::ffi::CString::new("s").unwrap();
             let euid = crate::sys::effective_uid();
+            let lock = acquire_bind_lock(&dir, &name, euid).unwrap();
             let e =
-                clear_stale_socket(&dir, &name, &sock, &sock, euid.wrapping_add(1)).unwrap_err();
+                clear_stale_socket(&dir, &name, &sock, euid.wrapping_add(1), &lock).unwrap_err();
             assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
             assert!(sock.exists());
             // 存在しない名前は Ok。
             let none = std::ffi::CString::new("nope").unwrap();
+            let lock2 = acquire_bind_lock(&dir, &none, euid).unwrap();
             assert_eq!(
-                clear_stale_socket(&dir, &none, &d.join("nope"), &d.join("nope"), euid),
+                clear_stale_socket(&dir, &none, &d.join("nope"), euid, &lock2),
                 Ok(())
             );
             drop(_l);
@@ -625,6 +784,137 @@ mod imp {
             let sticky = std::fs::symlink_metadata(&t.0).unwrap();
             assert!(verify_ancestor(&sticky, euid).is_ok());
             std::fs::set_permissions(&t.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        fn osv(s: &str) -> Option<std::ffi::OsString> {
+            Some(s.into())
+        }
+
+        /// 試験用の「フォールバック基底」を Tmp 内に用意する。Linux は euid に応じ
+        /// `run_root`（root）または `run_root/user/<euid>` を返し、macOS は TMPDIR 値として Tmp を使う。
+        fn fallback_fixture(t: &Tmp, euid: u32) -> (PathBuf, Option<std::ffi::OsString>) {
+            if cfg!(target_os = "linux") {
+                if euid == 0 {
+                    (t.0.clone(), None)
+                } else {
+                    let b = t.0.join("user").join(euid.to_string());
+                    DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(&b)
+                        .unwrap();
+                    (b, None)
+                }
+            } else {
+                (t.0.clone(), Some(t.0.clone().into_os_string()))
+            }
+        }
+
+        /// PLUG-12・TASK-123.4: Linux のフォールバック基底は euid で決まる（具体値）。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn plug12_fallback_base_linux() {
+            let root = Path::new("/run");
+            assert_eq!(fallback_base(0, root, None).unwrap(), PathBuf::from("/run"));
+            assert_eq!(
+                fallback_base(1000, root, None).unwrap(),
+                PathBuf::from("/run/user/1000")
+            );
+        }
+
+        /// PLUG-12・TASK-123.4: macOS は TMPDIR のみ。未設定・空・相対は FailedPrecondition。
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn plug12_fallback_base_macos() {
+            let root = Path::new("/run");
+            assert_eq!(
+                fallback_base(501, root, osv("/var/folders/x/T")).unwrap(),
+                PathBuf::from("/var/folders/x/T")
+            );
+            for v in [None, osv(""), osv("relative")] {
+                let err = fallback_base(501, root, v).unwrap_err();
+                assert_eq!(err.code(), PluginErrorCode::FailedPrecondition);
+            }
+            let err = fallback_base(501, root, osv("/a/../b")).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
+        }
+
+        /// PLUG-12・TASK-123.4: XDG 未設定・空でフォールバック基底直下に 0700・自 UID で作成する。
+        #[test]
+        fn plug12_resolve_falls_back_when_xdg_unset_or_empty() {
+            let euid = crate::sys::effective_uid();
+            for xdg in [None, osv("")] {
+                let t = Tmp::new();
+                let (base, tmpdir) = fallback_fixture(&t, euid);
+                let got = resolve(xdg, tmpdir, euid, &t.0).unwrap();
+                let expected = std::fs::canonicalize(&base).unwrap().join(RUNTIME_DIR_NAME);
+                assert_eq!(got.path(), expected.as_path());
+                let meta = std::fs::symlink_metadata(&expected).unwrap();
+                assert_eq!(meta.mode() & 0o7777, 0o700);
+                assert_eq!(meta.uid(), euid);
+            }
+        }
+
+        /// PLUG-12・TASK-123.4: フォールバック基底が無ければ FailedPrecondition で、基底は作らない。
+        #[test]
+        fn plug12_resolve_fallback_missing_base_is_failed_precondition() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let missing = t.0.join("missing");
+            let tmpdir = Some(missing.clone().into_os_string());
+            // root の Linux は run_root 自体、非 root は run_root/user/<euid>、macOS は TMPDIR が無い状況。
+            let err = resolve(None, tmpdir, euid, &missing).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::FailedPrecondition);
+            assert!(!missing.exists());
+        }
+
+        /// PLUG-12・TASK-123.4: フォールバック先にも通常経路と同じ検証が適用され、修復されない。
+        #[test]
+        fn plug12_resolve_fallback_applies_verification() {
+            let euid = crate::sys::effective_uid();
+            let t = Tmp::new();
+            let (base, tmpdir) = fallback_fixture(&t, euid);
+            // 基底が group/other 書き込み可。
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let err = resolve(None, tmpdir.clone(), euid, &t.0).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+            assert!(!base.join(RUNTIME_DIR_NAME).exists());
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+            // 既存 runtime directory が 0755。
+            let dir = base.join(RUNTIME_DIR_NAME);
+            DirBuilder::new().mode(0o755).create(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let err = resolve(None, tmpdir, euid, &t.0).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+
+        /// PLUG-12・TASK-123.4: 設定済みで不正な XDG はフォールバックで隠さない。
+        #[test]
+        fn plug12_resolve_does_not_fall_back_for_invalid_xdg() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let (base, tmpdir) = fallback_fixture(&t, euid);
+            let err = resolve(osv("relative"), tmpdir, euid, &t.0).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::FailedPrecondition);
+            assert!(!base.join(RUNTIME_DIR_NAME).exists());
+        }
+
+        /// PLUG-12・TASK-123.4: XDG が有効ならフォールバック候補を使わない。
+        #[test]
+        fn plug12_resolve_prefers_xdg_when_set() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let (fb, tmpdir) = fallback_fixture(&t, euid);
+            let xdg = t.0.join("xdg");
+            DirBuilder::new().mode(0o700).create(&xdg).unwrap();
+            let got = resolve(Some(xdg.clone().into_os_string()), tmpdir, euid, &t.0).unwrap();
+            let expected = std::fs::canonicalize(&xdg).unwrap().join(RUNTIME_DIR_NAME);
+            assert_eq!(got.path(), expected.as_path());
+            assert!(!fb.join(RUNTIME_DIR_NAME).exists());
         }
 
         #[test]

@@ -380,6 +380,103 @@ pub(crate) fn open_dir_nofollow(abs: &std::path::Path) -> io::Result<File> {
     }
 }
 
+// ロックファイル作成用の open(2) フラグ（値は OS ごとに異なる。Linux は x86_64 / aarch64 共通）。
+#[cfg(target_os = "linux")]
+const O_RDWR: i32 = 0o2;
+#[cfg(target_os = "linux")]
+const O_CREAT: i32 = 0o100;
+#[cfg(target_os = "linux")]
+const O_EXCL: i32 = 0o200;
+#[cfg(target_os = "macos")]
+const O_RDWR: i32 = 0x2;
+#[cfg(target_os = "macos")]
+const O_CREAT: i32 = 0x200;
+#[cfg(target_os = "macos")]
+const O_EXCL: i32 = 0x800;
+
+// flock(2) の operation（Linux・macOS 共通値）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const LOCK_EX: i32 = 2;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const LOCK_NB: i32 = 4;
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: BSD / glibc / musl の `int flock(int, int)` と同じ型・幅。
+    fn flock(fd: i32, operation: i32) -> i32;
+}
+
+/// ロックファイルの取得結果（PLUG-12・TASK-123.2）。
+#[derive(Debug)]
+pub(crate) struct LockHandle {
+    /// 排他 flock を保持する fd。drop（プロセス終了・クラッシュ含む）で kernel が解放する。
+    pub file: File,
+    /// 今回の呼び出しで新規作成したか（false なら以前の保持者が作ったロックファイルが残っていた）。
+    pub created: bool,
+}
+
+/// `dir` 基準で `name` のロックファイルを `O_NOFOLLOW`・0600 で開き（無ければ作成）、非ブロッキングで
+/// 排他 `flock` を取る。他者が保持中なら `WouldBlock`。listener の生存判定に接続 probe を使わず、
+/// 「ロックを取れる＝以前の保持者は消えた」で stale を判定するための基盤（既存 listener の
+/// accept queue に副作用を与えない。PLUG-12）。未対応の OS・アーキテクチャは `Unsupported`。
+pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    {
+        let open = |flags: i32| -> io::Result<i32> {
+            // SAFETY: fd は `&File` の借用中のため有効。`name` は NUL 終端の有効な C 文字列。
+            let fd = unsafe {
+                c_openat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    flags | O_NOFOLLOW | O_CLOEXEC,
+                    0o600u32, // O_CREAT 時の mode（C の unsigned int 幅）
+                )
+            };
+            if fd < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(fd)
+            }
+        };
+        let (fd, created) = match open(O_RDWR | O_CREAT | O_EXCL) {
+            Ok(fd) => (fd, true),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (open(O_RDWR | O_CREAT)?, false),
+            Err(e) => return Err(e),
+        };
+        // SAFETY: `fd` は直前の openat が返した、他に所有者のいない有効な fd（非負を確認済み）。
+        let file = unsafe { File::from_raw_fd(fd) };
+        // SAFETY: `file` が fd を所有し続ける間は有効。flock は fd 以外のメモリを触らない。
+        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(LockHandle { file, created })
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    {
+        let _ = (dir, name);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
 /// `dir`（開いたディレクトリ fd）基準で `name` を unlink する（ディレクトリは対象外: flags=0）。
 pub(crate) fn unlinkat(dir: &File, name: &CStr) -> io::Result<()> {
     // SAFETY: fd は `&File` の借用中のため有効。`name` は NUL 終端の有効な C 文字列。

@@ -44,8 +44,8 @@
 //! # 未実装の範囲（REPAIR-3）
 //!
 //! - 既存パスは bind 前に lstat 検証する（PLUG-12・TASK-123.2）。symlink・他 UID 所有は削除せず
-//!   `PermissionDenied`、生存中の listener や socket 以外は `AlreadyExists`、自 UID 所有で接続が
-//!   拒否される stale socket のみ削除して再 bind する（詳細は `uds_security` モジュール doc）
+//!   `PermissionDenied`、生存中の listener や socket 以外は `AlreadyExists`、bind ロックを取得でき管理下の
+//!   自 UID 所有 stale socket のみ削除して再 bind する（詳細は `uds_security` モジュール doc）
 //! - gRPC（TASK-108）
 //! - 要求 ID と応答 ID の対応づけ・要求→応答の 1 往復ヘルパー（core 側 proxy。TASK-114）
 //! - ACK 専用のワイヤー種別（`ControlMessage` のワイヤー形変更を伴うため行わない。本 crate での
@@ -150,7 +150,7 @@ impl UdsListener {
     ///
     /// 既存エントリがある場合は lstat で検証する（PLUG-12・TASK-123.2）。symlink・他 UID 所有は削除せず
     /// `PermissionDenied`、生存中の listener・socket 以外は `AlreadyExists`、自 UID 所有の stale socket
-    /// （接続拒否）のみ削除して再 bind する。
+    /// （bind ロックを取得でき管理下のもの）のみ削除して再 bind する。
     pub fn bind(path: &Path) -> Result<Self, PluginError> {
         // `..` は bind 時点とそれ以降で解決先が変わりうるため拒否する（`std::path::absolute` は
         // `..` を残す。PLUG-12）。
@@ -529,6 +529,8 @@ mod imp {
         dir: File,
         /// 配置ディレクトリ内の socket 名（NUL を含まない）。
         name: CString,
+        /// bind 排他ロック（listener の生存期間中保持し、stale 判定の根拠になる。TASK-123.2）。
+        _lock: crate::uds_security::BindLock,
         /// socket の公開パス（検証済み配置ディレクトリの `canonicalize` 結果＋socket 名。
         /// `UdsListener::path` が返す。PLUG-12）。Linux 以外では identity 取得の縮退にも使う。
         path: PathBuf,
@@ -557,7 +559,9 @@ mod imp {
             let target = bind_target(&dir, &bound, Path::new(file_name));
             check_sun_path_len(&target)?;
             // 既存エントリの lstat 検証と、自 UID 所有の stale socket の削除（PLUG-12・TASK-123.2）。
-            crate::uds_security::clear_stale_socket(&dir, &name, &bound, &target, euid)?;
+            // 生存判定は接続 probe でなく sibling lock の flock（既存 listener に副作用を与えない）。
+            let lock = crate::uds_security::acquire_bind_lock(&dir, &name, euid)?;
+            crate::uds_security::clear_stale_socket(&dir, &name, &bound, euid, &lock)?;
             let listener = UnixListener::bind(&target).map_err(|e| map_bind_error(e.kind()))?;
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
             let identity = sys::lstat_at(&dir, &name, &bound).ok();
@@ -565,6 +569,7 @@ mod imp {
                 listener,
                 dir,
                 name,
+                _lock: lock,
                 path: bound,
                 identity,
                 euid,

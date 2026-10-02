@@ -1,10 +1,12 @@
-//! runtime directory 解決・作成の結合試験（PLUG-12・TASK-123.1・#286）。root・特権不要。
+//! runtime directory 解決・作成の結合試験（PLUG-12・TASK-123.1・#286、フォールバックは TASK-123.4・#289）。root・特権不要。
 
 #[cfg(not(unix))]
 #[test]
 fn plug12_runtime_dir_is_unimplemented_on_non_unix() {
     use fandhe_container_plugin::{PluginErrorCode, RuntimeDir};
     let err = RuntimeDir::ensure_under(std::path::Path::new("C:\\x")).unwrap_err();
+    assert_eq!(err.code(), PluginErrorCode::Unimplemented);
+    let err = RuntimeDir::from_env().unwrap_err();
     assert_eq!(err.code(), PluginErrorCode::Unimplemented);
 }
 
@@ -129,6 +131,7 @@ mod unix {
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         UdsListener::bind(&d.path().join("s.sock")).unwrap();
     }
+
     /// 自 UID 所有の stale socket は削除され再 bind できる（TASK-123.2・AC3）。
     #[test]
     fn plug12_rebind_over_own_stale_socket() {
@@ -136,6 +139,8 @@ mod unix {
         let t = TempDir::new();
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         let p = d.path().join("s.sock");
+        // クラッシュ後の残骸を再現する: ロックファイルが残り、socket が残り、保持者は居ない。
+        drop(UdsListener::bind(&p).unwrap()); // ロックファイルを残して socket を片付ける
         drop(std::os::unix::net::UnixListener::bind(&p).unwrap()); // std は unlink しない
         let l = UdsListener::bind(&p).unwrap();
         let m = std::fs::symlink_metadata(&p).unwrap();
@@ -180,17 +185,85 @@ mod unix {
         assert!(std::fs::symlink_metadata(&stale).is_ok());
     }
 
-    /// 生存中の listener のパスは奪わない（TASK-123.2）。
+    /// 生存中の listener のパスは奪わず、既存 listener に副作用（accept queue への probe 接続）も
+    /// 与えない（TASK-123.2）。
     #[test]
-    fn plug12_live_listener_path_is_not_stolen() {
+    fn plug12_live_listener_path_is_not_stolen_and_has_no_side_effect() {
+        use std::time::Duration;
         let t = TempDir::new();
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         let p = d.path().join("s.sock");
-        let live = std::os::unix::net::UnixListener::bind(&p).unwrap();
-        let e = UdsListener::bind(&p).unwrap_err();
-        assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+        let live = UdsListener::bind(&p).unwrap();
+        for _ in 0..3 {
+            let e = UdsListener::bind(&p).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+        }
         assert!(std::fs::symlink_metadata(&p).is_ok());
-        std::os::unix::net::UnixStream::connect(&p).unwrap();
-        drop(live);
+        // 拒否された bind が probe 接続を残していないため、accept は接続なしで Timeout になる。
+        let e = live.accept(Duration::from_millis(200)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Timeout);
+        // 実クライアントは通常どおり接続できる。
+        let _c = std::os::unix::net::UnixStream::connect(&p).unwrap();
+        live.accept(Duration::from_secs(2)).unwrap();
+    }
+
+    /// ロックファイルの無い socket（他実装・旧版）は生存中か判別できないため削除しない。
+    /// 失敗後に再試行しても削除されない（作成したロックファイルを残さない）（TASK-123.2）。
+    #[test]
+    fn plug12_unmanaged_socket_is_never_removed() {
+        let t = TempDir::new();
+        let d = RuntimeDir::ensure_under(&t.0).unwrap();
+        let p = d.path().join("s.sock");
+        let _other = std::os::unix::net::UnixListener::bind(&p).unwrap();
+        for _ in 0..2 {
+            let e = UdsListener::bind(&p).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+            assert!(std::fs::symlink_metadata(&p).is_ok());
+            assert!(!d.path().join("s.sock.lock").exists());
+        }
+    }
+
+    /// PLUG-12・TASK-123.4: `from_env` は環境から基底を決め、Ok なら 0700 で bind でき、
+    /// 基底が無ければ FailedPrecondition で止まる。環境変数は読むだけで書き換えない。
+    /// macOS の CI は XDG 未設定・TMPDIR 設定済みのため、フォールバックの Ok 側が実際に通る。
+    #[test]
+    fn plug12_from_env_resolves_or_fails_closed() {
+        let probe = TempDir::new();
+        let uid = std::fs::metadata(&probe.0).unwrap().uid();
+        let xdg = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty());
+        let base: Option<PathBuf> = match &xdg {
+            Some(v) => Some(PathBuf::from(v)),
+            None if cfg!(target_os = "macos") => std::env::var_os("TMPDIR").map(PathBuf::from),
+            None if cfg!(target_os = "linux") && uid == 0 => Some(PathBuf::from("/run")),
+            None if cfg!(target_os = "linux") => Some(PathBuf::from(format!("/run/user/{uid}"))),
+            None => None,
+        };
+        let result = RuntimeDir::from_env();
+        match (&base, result) {
+            (Some(b), Ok(d)) => {
+                assert!(d.path().starts_with(std::fs::canonicalize(b).unwrap()));
+                assert_eq!(d.path().file_name().unwrap(), RUNTIME_DIR_NAME);
+                assert_eq!(mode_of(d.path()), 0o700);
+                UdsListener::bind(&d.path().join("fromenv.sock")).unwrap();
+                let _ = std::fs::remove_file(d.path().join("fromenv.sock"));
+            }
+            (Some(b), Err(e)) => {
+                if xdg.is_none() && !b.exists() {
+                    assert_eq!(e.code(), PluginErrorCode::FailedPrecondition);
+                } else {
+                    // 基底が存在するのに拒否される環境は、Linux の非標準構成のみ許容する。
+                    assert!(
+                        !cfg!(target_os = "macos") || xdg.is_some(),
+                        "macOS fallback must resolve: {e:?}"
+                    );
+                    assert!(matches!(
+                        e.code(),
+                        PluginErrorCode::PermissionDenied | PluginErrorCode::NotFound
+                    ));
+                }
+            }
+            (None, Err(e)) => assert_eq!(e.code(), PluginErrorCode::FailedPrecondition),
+            (None, Ok(_)) => panic!("no base expected but from_env succeeded"),
+        }
     }
 }

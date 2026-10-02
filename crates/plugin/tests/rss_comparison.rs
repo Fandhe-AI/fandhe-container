@@ -113,11 +113,15 @@ mod supported {
         const SAMPLES: usize = 5;
         /// 壊れた値の検出用の上限。PLUG-9 の値との比較は #268 の人間判断でここでは合否にしない。
         const SANITY_MAX_BYTES: u64 = 256 * 1024 * 1024;
-        /// ウォッチドッグの上限（REPAIR-5）。
-        const WAIT: Duration = Duration::from_secs(25);
+        /// 各操作の個別期限（起動待ち 5 秒・RPC 1 回 5 秒・終了待ち 5 秒）。
+        const OP_TIMEOUT: Duration = Duration::from_secs(5);
+        /// ウォッチドッグの上限（REPAIR-5）。個別期限の最悪合計（起動 + RPC_COUNT 回 + 終了待ち）に
+        /// 余裕 2 倍を掛け、各操作が期限内に成功した場合に全体期限で誤失敗しないようにする。
+        const WAIT: Duration =
+            Duration::from_secs(OP_TIMEOUT.as_secs() * (RPC_COUNT as u64 + 2) * 2);
 
         fn rpc() -> RpcTimeout {
-            RpcTimeout::new(Duration::from_secs(5)).unwrap()
+            RpcTimeout::new(OP_TIMEOUT).unwrap()
         }
 
         /// 0700 の一時ディレクトリ（socket の配置先）。Drop で削除する。
@@ -142,7 +146,7 @@ mod supported {
             let Some(sock) = std::env::var_os(PLUGIN_SOCKET_ENV) else {
                 return;
             };
-            let mut s = UdsStream::connect(&PathBuf::from(sock), Duration::from_secs(5)).unwrap();
+            let mut s = UdsStream::connect(&PathBuf::from(sock), OP_TIMEOUT).unwrap();
             while s.read_frame(rpc()).is_ok() {
                 s.write_frame(&Frame::new(b"pong".to_vec()).unwrap(), rpc())
                     .unwrap();
@@ -170,11 +174,9 @@ mod supported {
             .collect();
             let plugin =
                 OneShotPlugin::new(std::env::current_exe().unwrap(), args, dir.0.clone()).unwrap();
-            let mut session = ResidentPlugin::start(
-                &plugin,
-                ResidentStartTimeout::new(Duration::from_secs(5)).unwrap(),
-            )
-            .unwrap();
+            let mut session =
+                ResidentPlugin::start(&plugin, ResidentStartTimeout::new(OP_TIMEOUT).unwrap())
+                    .unwrap();
             assert_eq!(session.state(), ResidentState::Running);
             let pid = session.pid().unwrap();
             assert_ne!(pid, std::process::id());

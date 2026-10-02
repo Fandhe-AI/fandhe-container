@@ -299,6 +299,7 @@ pub(crate) fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) -> Result<boo
         };
         // SAFETY: `pfd` はスタック上の初期化済み 1 要素で、`nfds` = 1 と一致する。カーネルは呼び出しの間だけ
         // `revents` を書く。
+        let poll_started = Instant::now();
         let r = unsafe { poll(&raw mut pfd, 1, ms) };
         if r > 0 {
             return Ok(true);
@@ -314,7 +315,9 @@ pub(crate) fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) -> Result<boo
         if let Some(d) = deadline {
             remaining = d.saturating_duration_since(Instant::now());
         } else {
-            remaining = remaining.saturating_sub(Duration::from_millis(i32::MAX as u64));
+            // 期限を表せない巨大 timeout では、EINTR で即戻りしても i32::MAX ms を差し引かず、
+            // 実際に経過した時間だけを残り時間から引く。
+            remaining = remaining.saturating_sub(poll_started.elapsed());
         }
         if remaining.is_zero() {
             return Ok(false);

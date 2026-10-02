@@ -319,6 +319,17 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため plugin-feature-size をスキップ"
 endif
 
+# PLUG-4（TASK-109.4・REPAIR-12）: plugin crate 追加の前後を別ビルドで比較し、core のソース一覧・
+# 依存木・rlib の sha256 が不変であることを判定する（docs/design/crate-naming.md 決定 3）。
+# 一時 workspace 上で実行し、リポ内のファイルは変更しない。CI の bench-regression ジョブが実行する。
+.PHONY: plug4-core-invariance
+plug4-core-invariance: ## plugin 追加前後で core の指紋が不変か別ビルドで比較する（PLUG-4・TASK-109.4）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@bash scripts/check-plug4-core-invariance.sh
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため plug4-core-invariance をスキップ"
+endif
+
 # REPAIR-7 ステージ 3（タイムアウト保護された結合試験。TASK-86.2・#36）。
 # CI（ci.yml の integration-test ジョブ）と同じ判定を行う: integration test
 # target（`tests/*.rs`。cargo metadata 上で kind が "test" のもの）が 0 件の

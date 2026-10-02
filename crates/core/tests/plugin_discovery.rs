@@ -1,7 +1,8 @@
 //! plugin 候補探索の結合試験（TASK-109.1・PLUG-4・PLUG-11・REPAIR-12）。
 //!
 //! 加えて TASK-109.4（PLUG-4・`docs/design/crate-naming.md` 決定 3）として、plugin 追加の前後で
-//! core のソース sha256 一覧とバイナリ sha256 が不変であることを検証する（`plug4_*`）。
+//! core のソース sha256 一覧が実行時操作で不変であることを検証する（`plug4_*`）。ビルド成果物・依存木の
+//! 前後比較は `scripts/check-plug4-core-invariance.sh` が担う。
 //!
 //! 公開 API のみを使い、一時ディレクトリを system / user の管理ディレクトリに見立てて走査結果を
 //! 具体値で照合する。実ホストの `/usr/libexec` には触れず、3 OS で同じ試験が動く。
@@ -509,19 +510,14 @@ fn core_source_sha256_list() -> Vec<(String, String)> {
     out
 }
 
-/// core バイナリの代理指紋。
+/// PLUG-4（TASK-109.4）: plugin を管理ディレクトリへ追加して発見・登録する実行時操作が、core の
+/// ソース（同一 checkout）を書き換えないことの確認。
 ///
-/// core は lib のみで bin target が無いため、core を静的リンクしたこのテスト実行ファイルを
-/// 代理対象にする（PoC-13 の `core-harness` 比較と同形）。TASK-79 で CLI bin が入ったら、
-/// `cargo build --locked` の成果物へ切り替える（REPAIR-3）。
-fn core_binary_sha256() -> String {
-    sha256::sha256_file(&std::env::current_exe().expect("current_exe"))
-}
-
-/// PLUG-4（TASK-109.4）: plugin を管理ディレクトリへ追加して発見・登録しても、core のソース
-/// sha256 一覧とバイナリ（代理）sha256 は変わらない。決定 3 の (2) 依存木比較は本テストの対象外。
-/// 現状は代理指紋（test 実行ファイル）の比較で保証が弱い。TASK-79 の CLI bin 導入時に
-/// `cargo build --locked` 成果物の比較へ置き換える（REPAIR-3）。
+/// 保証範囲に注意: 本テストは同一 checkout・同一テスト実行ファイルを見るため「plugin crate の
+/// 追加でビルド結果が変わる」回帰は検出できない。その判定（core ソース一覧・依存木・rlib の
+/// sha256 を plugin 追加前後の別ビルドで比較。決定 3 の 3 点）は
+/// `scripts/check-plug4-core-invariance.sh`（`make plug4-core-invariance`・CI の
+/// bench-regression ジョブ）が担う。
 #[test]
 fn plug4_core_sha256_unchanged_after_plugin_add() {
     let tmp = Tmp::new("plug4");
@@ -530,7 +526,6 @@ fn plug4_core_sha256_unchanged_after_plugin_add() {
     let dirs = [PluginSearchDir::new(PluginDirKind::System, sys.clone())];
 
     let src_before = core_source_sha256_list();
-    let bin_before = core_binary_sha256();
     assert!(discover_candidates(&dirs).unwrap().is_empty());
 
     // plugin 追加（ファイルは置くだけで実行しない）と発見・登録
@@ -546,7 +541,6 @@ fn plug4_core_sha256_unchanged_after_plugin_add() {
     assert!(registry.get("sha256probe").is_some());
 
     let src_after = core_source_sha256_list();
-    let bin_after = core_binary_sha256();
 
     // 空振り防止
     for required in [
@@ -565,8 +559,6 @@ fn plug4_core_sha256_unchanged_after_plugin_add() {
             .iter()
             .all(|(_, h)| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
     );
-    assert_eq!(bin_before.len(), 64);
 
     assert_eq!(src_before, src_after, "core source sha256 list changed");
-    assert_eq!(bin_before, bin_after, "core binary sha256 changed");
 }

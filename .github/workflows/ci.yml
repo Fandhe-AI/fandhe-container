@@ -547,6 +547,14 @@ jobs:
           set -euo pipefail
           make plugin-feature-size | tee -a "${GITHUB_STEP_SUMMARY}"
 
+      # PLUG-4（TASK-109.4）: plugin 追加前後の別ビルドで core の指紋（ソース一覧・依存木・rlib sha256）を比較する。
+      # 既存ジョブのステップとして追加（check-run 件数は不変）
+      - name: plugin 追加前後の core 不変性（PLUG-4・TASK-109.4）
+        shell: bash
+        run: |
+          set -euo pipefail
+          make plug4-core-invariance
+
   # --------------------------------------------------
   # aarch64-linux-check（Linux aarch64 向けクロス型検査: #1120・REPAIR-7 第 1 段階を補うアーキ網羅）
   # --------------------------------------------------

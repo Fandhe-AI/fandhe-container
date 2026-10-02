@@ -544,9 +544,12 @@ idle-memory-supervised: ## 監視プロセス込みのアイドル常駐メモ�
 	esac
 
 # --------------------------------------------------
-# 50 コンテナ同時起動の集約メモリ計測（TASK-50.1・CORE-9・SUP-1。Linux 限定。own 側。bash のみで完結）
+# 50 コンテナ同時起動の集約メモリ計測（TASK-50.1 own 側・TASK-50.2 Docker 側と統合レポート・CORE-9・SUP-1。Linux 限定。bash のみで完結）
 # --------------------------------------------------
 # 実測は own の CLI・本番 launcher 提供後に人間が #219（TASK-50.h1）で行う。`make ci` には含めない（実機前提）。
+# `concurrent-memory-docker` は同じスクリプトの `--mode docker` で Docker 側を同一手法（PSS 合計の中央値。集計対象は
+# デーモン＋各コンテナの shim ツリー）で測り（実 Docker・ローカルデーモン・イメージの事前 pull・他コンテナなし・
+# 権限付きシェルが前提）、`concurrent-memory-report` は own・Docker の結果を 1 つのレポートへまとめる（合否は出さない）。
 # 計測全体を timeout で包む（REPAIR-5）。秒数は CONCURRENT_MEMORY_TIMEOUT（1〜999999 の整数。既定 1800）。
 # スクリプトの終了コード 0〜4 はそのまま返し、timeout 超過（124・137）と想定外の値は 1、起動不能（125〜127）は 2。
 CONCURRENT_MEMORY_TIMEOUT ?= 1800
@@ -557,6 +560,43 @@ CONCURRENT_MEMORY_SCRIPT ?= scripts/bench/concurrent_50_memory.sh
 .PHONY: concurrent-memory-selftest
 concurrent-memory-selftest: ## 50 コンテナ同時起動メモリ計測スクリプトの自己テスト（CORE-9・REPAIR-12。スタブ launcher・疑似 /proc）
 	bash scripts/bench/concurrent_50_memory_selftest.sh
+
+.PHONY: concurrent-memory-docker
+concurrent-memory-docker: ## Docker 側の 50 コンテナ同時起動時の集約 PSS を計測する（実機前提・timeout 付き。DOCKER=<docker の絶対パス> 必須。TASK-50.2）
+	@if [ -z $(call fio_bench_sq,$(DOCKER)) ]; then \
+		echo "usage: make concurrent-memory-docker DOCKER=<abs-path of docker CLI> [TARGET=<name, default docker>] [IMAGE=<ref, default alpine:3.20 (pull it first)>] [COUNT=<n, default 50>] [TRIALS=<n, default 3>] [OUTPUT=<new file>] [CONCURRENT_MEMORY_TIMEOUT=<secs, default 1800>]" >&2; \
+		exit 2; \
+	fi; \
+	t=$(call fio_bench_sq,$(CONCURRENT_MEMORY_TIMEOUT)); \
+	case "$$t" in ''|*[!0-9]*|???????*) t=invalid ;; esac; \
+	if [ "$$t" = invalid ] || [ "$$t" -eq 0 ]; then \
+		echo "error: invalid-argument: CONCURRENT_MEMORY_TIMEOUT must be an integer from 1 to 999999 (seconds)" >&2; \
+		exit 2; \
+	fi; \
+	if ! command -v timeout >/dev/null 2>&1; then \
+		echo "error: unsupported-os: timeout (coreutils) is required" >&2; \
+		exit 2; \
+	fi; \
+	rc=0; \
+	timeout --kill-after=60 "$$t" bash $(call fio_bench_sq,$(CONCURRENT_MEMORY_SCRIPT)) --mode docker --docker $(call fio_bench_sq,$(DOCKER)) --target $(call fio_bench_sq,$(or $(TARGET),docker))$(if $(IMAGE), --image $(call fio_bench_sq,$(IMAGE)))$(if $(COUNT), --count $(call fio_bench_sq,$(COUNT)))$(if $(TRIALS), --trials $(call fio_bench_sq,$(TRIALS)))$(if $(OUTPUT), --output $(call fio_bench_sq,$(OUTPUT))) || rc=$$?; \
+	case "$$rc" in \
+		0|1|2|3|4) exit "$$rc" ;; \
+		124|137) echo "error: measurement-failed: timed out after $${t}s (measurement or cleanup stalled)" >&2; exit 1 ;; \
+		125|126|127) echo "error: invalid-input: cannot run the measurement under timeout (exit $$rc)" >&2; exit 2 ;; \
+		*) echo "error: measurement-failed: unexpected exit status $$rc" >&2; exit 1 ;; \
+	esac
+
+.PHONY: concurrent-memory-report
+concurrent-memory-report: ## own と Docker の 50 コンテナ集約メモリの結果を 1 つのレポートに統合する（OWN_RESULT=<file> DOCKER_RESULT=<file> 必須。TASK-50.2）
+	@if [ -z $(call fio_bench_sq,$(OWN_RESULT)) ] || [ -z $(call fio_bench_sq,$(DOCKER_RESULT)) ]; then \
+		echo "usage: make concurrent-memory-report OWN_RESULT=<own-mode result.json> DOCKER_RESULT=<docker-mode result.json> [OUTPUT=<new file>]" >&2; \
+		exit 2; \
+	fi
+	@if ! command -v jq >/dev/null 2>&1; then \
+		echo "jq is required but not found: install it (e.g. brew install jq / apt-get install jq)" >&2; \
+		exit 1; \
+	fi
+	bash $(call fio_bench_sq,$(CONCURRENT_MEMORY_SCRIPT)) --mode report --own-result $(call fio_bench_sq,$(OWN_RESULT)) --docker-result $(call fio_bench_sq,$(DOCKER_RESULT))$(if $(OUTPUT), --output $(call fio_bench_sq,$(OUTPUT)))
 
 .PHONY: concurrent-memory
 concurrent-memory: ## 50 コンテナ同時起動時の集約 PSS を計測する（実機前提・timeout 付き。LAUNCHER=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須）

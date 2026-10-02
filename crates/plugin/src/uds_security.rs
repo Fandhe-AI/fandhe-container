@@ -81,7 +81,7 @@
 //!   user namespace 外の uid は overflowuid として見え、不一致で拒否される（安全側）。
 //! - 同一 UID の別プロセスは脅威モデル外（第 1 層は 0700 の配置ディレクトリ）。
 //! - `unsafe` を含む取得処理は `crate::sys::peer_uid`（`sys` モジュール）に閉じる。
-//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。未実装は別 UID 実接続の拒否試験（#295）・拒否の監査ログ（SEC-4）。
+//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。別 UID 接続拒否の結合試験は `tests/peer_auth.rs`（TASK-124.4・#295。実機前提の 2 件は人間が実行）。未実装は拒否の監査ログ（SEC-4）。
 //!
 //! # Windows に固有の peer 認証を持たない理由（WIN-1・PLUG-12。TASK-124.3・#294）
 //! 「未実装の残件」ではなく、設計上この crate に Win32 向け実装を置かない判断である。
@@ -1497,6 +1497,35 @@ mod tests {
         for code in [PluginErrorCode::Internal, PluginErrorCode::Unimplemented] {
             let err = verify_peer_with(|| Err(PluginError::new(code, "x")), 1000).unwrap_err();
             assert_eq!(err.code(), code);
+        }
+    }
+
+    /// PLUG-12・TASK-124.4・#295: peer UID の取得失敗は期待 UID によらず Ok にならない（fail-closed）。
+    ///
+    /// transport の accept / connect は `verify_peer` の Err を `?` で返し stream を drop して切断する。
+    /// 公開 API からは取得失敗を注入できないため、`tests/peer_auth.rs` ではなく本テストで取得関数を
+    /// 差し替えて照合する。再試行・既定値へのフォールバックをしないことも固定する。
+    #[cfg(unix)]
+    #[test]
+    fn plug12_fail_closed_on_peercred_error() {
+        use std::cell::Cell;
+        for code in [PluginErrorCode::Internal, PluginErrorCode::Unimplemented] {
+            for expected in [crate::sys::effective_uid(), 0, u32::MAX] {
+                let calls = Cell::new(0u32);
+                let err = verify_peer_with(
+                    || {
+                        calls.set(calls.get() + 1);
+                        Err(PluginError::new(code, "failed to obtain peer credential"))
+                    },
+                    expected,
+                )
+                .unwrap_err();
+                assert_eq!(err.code(), code);
+                assert_ne!(err.code(), PluginErrorCode::PermissionDenied);
+                assert_eq!(err.message(), "failed to obtain peer credential");
+                assert_eq!(calls.get(), 1);
+                assert!(!err.message().contains(&expected.to_string()));
+            }
         }
     }
 

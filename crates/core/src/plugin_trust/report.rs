@@ -17,8 +17,8 @@
 //! # 未実装（REPAIR-3）
 //!
 //! レジストリ登録経路・本番の `AuditSink`・CLI の終了コード処理への配線は後続。現時点で本番経路からは
-//! 呼ばれない。TASK-122.4（#282）が検証方式の切替点を入れた後は、[`verify_candidate_audited`] の入口を
-//! その切替点へ差し替える。
+//! 呼ばれない。[`verify_candidate_audited`] は検証方式の切替点
+//! （[`PluginVerificationMethod::verify`]）を通す。
 
 use std::io::Write;
 
@@ -30,7 +30,7 @@ use crate::plugin_discovery::PluginCandidate;
 use crate::traits::ErrorCode;
 
 use super::{
-    AllowedPluginHashes, HashVerifiedPluginFile, PluginTrustError, PluginTrustErrorKind,
+    HashVerifiedPluginFile, PluginTrustError, PluginTrustErrorKind, PluginVerificationMethod,
     TrustTarget, verify_candidate,
 };
 
@@ -168,16 +168,28 @@ pub fn record_plugin_trust_rejection(
 
 /// 候補 1 件を所有者・モード・ハッシュの順に検証し、どの段の拒否も監査へ記録して返す（PLUG-11・SEC-4）。
 ///
-/// 検証自体は [`verify_candidate`] → `verify_hash` をそのまま通す（保持 fd 経由。緩めない）。
+/// 検証自体は [`verify_candidate`] → [`PluginVerificationMethod::verify`]（方式の唯一の切替点。保持 fd 経由。
+/// 緩めない）を通す。未実装方式（署名）の `VerificationMethodNotImplemented` 拒否も他の拒否と同様に監査へ記録する。
 pub fn verify_candidate_audited(
     candidate: &PluginCandidate,
-    allowed: &AllowedPluginHashes,
+    method: &PluginVerificationMethod,
     sink: &dyn AuditSink,
 ) -> Result<HashVerifiedPluginFile, AuditedRejection<PluginTrustError>> {
-    let verified = verify_candidate(candidate)
-        .and_then(|file| file.verify_hash(allowed))
-        .map_err(|e| record_plugin_trust_rejection(e, sink))?;
-    Ok(verified)
+    let file = verify_candidate(candidate).map_err(|e| record_plugin_trust_rejection(e, sink))?;
+    verify_method_audited(file, method, sink)
+}
+
+/// 所有者・モード検証済みの `file` を `method` で検証し、拒否を監査へ記録する（[`verify_candidate_audited`] の後段）。
+///
+/// 未実装方式の拒否（`VerificationMethodNotImplemented`）もここで 1 件記録される。
+pub(crate) fn verify_method_audited(
+    file: super::VerifiedPluginFile,
+    method: &PluginVerificationMethod,
+    sink: &dyn AuditSink,
+) -> Result<HashVerifiedPluginFile, AuditedRejection<PluginTrustError>> {
+    method
+        .verify(file)
+        .map_err(|e| record_plugin_trust_rejection(e, sink))
 }
 
 #[cfg(test)]

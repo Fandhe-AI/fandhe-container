@@ -633,7 +633,7 @@ fn plug11_task122_3_symlink_candidate_hashes_target_content() {
 fn plug11_task122_5_audited_verify_records_mode_rejection() {
     use crate::audit_log::mount::tests::VecSink;
     use crate::audit_log::{AuditDelivery, AuditLayer};
-    use crate::plugin_trust::{AllowedPluginHashes, verify_candidate_audited};
+    use crate::plugin_trust::{PluginVerificationMethod, verify_candidate_audited};
 
     // /tmp（other 書き込み可）配下は祖先検証で拒否される（既存テストと同じ前提）。
     let tmp = Path::new("/tmp").join(format!(
@@ -649,7 +649,7 @@ fn plug11_task122_5_audited_verify_records_mode_rejection() {
     let dirs = [PluginSearchDir::new(PluginDirKind::User, tmp.clone())];
     let got = discover_candidates(&dirs).expect("discover");
     let sink = VecSink::new(false);
-    let res = verify_candidate_audited(&got[0], &AllowedPluginHashes::from_digests([]), &sink);
+    let res = verify_candidate_audited(&got[0], &PluginVerificationMethod::default(), &sink);
     let _ = fs::remove_dir_all(&tmp);
     let rej = res.expect_err("reject");
     assert_eq!(rej.error.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
@@ -709,4 +709,46 @@ fn plug11_task122_4_default_method_rejects_everything() {
         .verify(v)
         .expect_err("reject");
     assert_eq!(e.kind(), PluginTrustErrorKind::HashMismatch);
+}
+
+/// PLUG-11・SEC-4・TASK-122.5: 署名方式（未実装）の拒否も、理由つき監査レコードを 1 件残す。
+#[test]
+fn plug11_task122_5_audited_signature_method_records_not_implemented() {
+    use crate::audit_log::mount::tests::VecSink;
+    use crate::audit_log::{AuditDelivery, AuditLayer};
+    use crate::plugin_trust::PluginVerificationMethod;
+    use crate::plugin_trust::report::verify_method_audited;
+
+    let (_t, v) = verified("a-sig");
+    let sink = VecSink::new(false);
+    let rej =
+        verify_method_audited(v, &PluginVerificationMethod::Signature, &sink).expect_err("reject");
+    assert_eq!(
+        rej.error.kind(),
+        PluginTrustErrorKind::VerificationMethodNotImplemented
+    );
+    assert_eq!(rej.delivery, AuditDelivery::Recorded);
+    let recs = sink.snapshot();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].layer(), AuditLayer::PluginTrust);
+    assert_eq!(
+        recs[0].reason().map(|r| r.as_str()),
+        Some("verification_method_not_implemented")
+    );
+    assert_eq!(recs[0].path(), Some(rej.error.path()));
+}
+
+/// 許可一覧方式の不一致拒否も同じ経路で 1 件記録される。
+#[test]
+fn plug11_task122_5_audited_allowlist_method_records_hash_mismatch() {
+    use crate::audit_log::mount::tests::VecSink;
+    use crate::plugin_trust::PluginVerificationMethod;
+    use crate::plugin_trust::report::verify_method_audited;
+
+    let (_t, v) = verified("a-hash");
+    let sink = VecSink::new(false);
+    let method = PluginVerificationMethod::Sha256Allowlist(allow(&[OTHER_SHA]));
+    let rej = verify_method_audited(v, &method, &sink).expect_err("reject");
+    assert_eq!(rej.error.kind(), PluginTrustErrorKind::HashMismatch);
+    assert_eq!(sink.snapshot().len(), 1);
 }

@@ -580,6 +580,28 @@ fn plug11_task122_3_sha256_is_repeatable_and_leaves_offset_zero() {
     assert_eq!(f.stream_position().unwrap(), 0);
 }
 
+/// 共有参照からの並行 `sha256()` が seek/read で干渉せず、常に同じダイジェストになる（PLUG-11・TASK-122.3）。
+#[test]
+fn plug11_task122_3_concurrent_sha256_is_consistent() {
+    let (_t, v) = verified("h-concurrent");
+    std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                s.spawn(|| {
+                    (0..200)
+                        .map(|_| v.sha256().unwrap().to_string())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in hs {
+            for d in h.join().unwrap() {
+                assert_eq!(d, PAYLOAD_SHA);
+            }
+        }
+    });
+}
+
 /// 検証後にパスを別内容へ差し替えても、保持 fd のハッシュは検証時の内容のまま（TOCTOU 回避）。
 #[test]
 fn plug11_task122_3_hash_follows_held_fd_not_path() {

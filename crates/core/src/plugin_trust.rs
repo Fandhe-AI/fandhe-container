@@ -85,6 +85,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use sha2::{Digest as _, Sha256};
 
@@ -234,6 +235,8 @@ fn is_single_component(name: &OsStr) -> bool {
 #[derive(Debug)]
 pub struct VerifiedPluginFile {
     file: File,
+    /// `sha256` の seek→read→巻き戻しを直列化する排他（共有 fd のオフセット競合による誤ダイジェスト防止）。
+    hash_lock: Mutex<()>,
     owner_uid: u32,
     mode: u32,
     path: PathBuf,
@@ -488,7 +491,8 @@ impl VerifiedPluginFile {
     /// 保持 fd の内容の sha256 を計算する（TASK-122.3）。
     ///
     /// **パスを取らない**ため再オープンはできず、所有者・モード検証と同じ fd を読む（TOCTOU 回避）。
-    /// fd を先頭へ seek して計算し、成功時は先頭へ戻す。失敗時のオフセットは不定のため呼び出し側は
+    /// fd を先頭へ seek して計算し、成功時は先頭へ戻す。seek〜読み取り〜巻き戻しは内部 Mutex で直列化するため、
+    /// 共有参照からの並行呼び出しでも結果は干渉しない（[`Self::file`] 経由の外部読み取りは対象外）。失敗時のオフセットは不定のため呼び出し側は
     /// fd を破棄する。サイズが [`MAX_PLUGIN_BINARY_BYTES`] を超えれば `TooLarge`。
     pub fn sha256(&self) -> Result<Sha256Digest, PluginTrustError> {
         let err = |k| PluginTrustError::new(k, TrustTarget::File, &self.path);
@@ -499,6 +503,12 @@ impl VerifiedPluginFile {
         if md.len() > MAX_PLUGIN_BINARY_BYTES {
             return Err(err(PluginTrustErrorKind::TooLarge));
         }
+        // 共有 fd のオフセットを動かすため、ハッシュ計算全体（seek〜巻き戻し）を排他する。
+        // 毒化しても fd 自体は無傷で、毎回先頭へ seek するため回復して続行してよい。
+        let _guard = self
+            .hash_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut f = &self.file;
         f.seek(SeekFrom::Start(0))
             .map_err(|_| err(PluginTrustErrorKind::Io))?;
@@ -755,6 +765,7 @@ mod imp {
             check_owner_and_mode(md.uid(), md.mode(), sys::effective_uid()).map_err(err)?;
             Ok(VerifiedPluginFile {
                 file: File::from(rfd),
+                hash_lock: Mutex::new(()),
                 owner_uid: md.uid(),
                 mode: md.mode(),
                 resolved_path: path.clone(),
@@ -825,6 +836,7 @@ mod imp {
             }
             Ok(VerifiedPluginFile {
                 file: File::from(rfd),
+                hash_lock: Mutex::new(()),
                 owner_uid: md.uid(),
                 mode: md.mode(),
                 path,

@@ -5,7 +5,7 @@
 //! core が plugin バイナリを発見・登録する機構（TASK-109）の最初の 1 片。既定の管理ディレクトリ
 //! （system / user）を走査し、`fandhe-container-plugin-*` の命名規約に合うファイルを **候補**
 //! として列挙するだけを担う。後続の `PATH` 探索の opt-in（#254・TASK-109.2）、レジストリと
-//! 同名候補の優先順位・登録（#255・TASK-109.3）、信頼性検証（TASK-122・PLUG-11）が本モジュールの
+//! 同名候補の優先順位・登録（#255・TASK-109.3。[`registry`] 子モジュールで実装済み）、信頼性検証（TASK-122・PLUG-11）が本モジュールの
 //! 戻り値を入力に使う。`fandhe-container-plugin`（境界機構）には依存しない。
 //!
 //! # 契約
@@ -18,7 +18,7 @@
 //! - ファイルの中身は読まず、実行ビットも見ない。`PATH` は探索しない（opt-in は #254）
 //! - 探索先ディレクトリが存在しない場合はエラーにせず候補なしとする。それ以外の I/O エラーは
 //!   握りつぶさず返す（fail-closed）
-//! - system と user に同名があれば両方返す。優先順位・重複解決は #255 の責務
+//! - system と user に同名があれば両方返す。優先順位・重複解決は [`registry`] の責務
 //!
 //! # 対応 OS
 //!
@@ -33,6 +33,13 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::traits::{ErrorCode, TraitError};
+
+pub mod registry;
+
+pub use registry::{
+    MAX_REGISTRY_ENTRIES, PluginRegistry, RegistrationOutcome, RegistrationStatus,
+    ShadowedCandidate,
+};
 
 /// plugin 実行ファイル名の接頭辞（PLUG-11 の命名規約）。
 pub const PLUGIN_NAME_PREFIX: &str = "fandhe-container-plugin-";

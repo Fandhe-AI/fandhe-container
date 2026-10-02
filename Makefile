@@ -413,6 +413,14 @@ bench-check: ## ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8�
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
 	mkdir "$$tmp/in" "$$tmp/out" && \
+	if [ "$(OS)" != "Windows_NT" ]; then \
+		reg=$$(jq -c '[.metrics | keys[] | select(startswith("plugin_boundary"))]' benches/baseline.json) || exit 1; \
+		exp=$$(jq -c '[.metrics | keys[] | select(startswith("plugin_boundary"))]' benches/metrics.json) || exit 1; \
+		if [ "$$reg" != "[]" ] && [ "$$reg" != "$$exp" ]; then \
+			echo "error: invalid-input: baseline.json plugin_boundary metrics $$reg do not match metrics.json $$exp (a registered metric was removed or is missing; recalibrate per TASK-88)" >&2; \
+			exit 2; \
+		fi; \
+	fi && \
 	for n in $(BENCH_CHECK_NAMES); do \
 		cargo bench -p fandhe-container-benches --bench "$$n" -- --output "$$tmp/in/$$n.json" >/dev/null || exit 1; \
 	done && \
@@ -473,6 +481,8 @@ bench-baseline-selftest: ## baseline.json 生成スクリプトの自己テス�
 # Windows（OS=Windows_NT）は plugin 境界ベンチ（Unix ドメインソケット前提）を実行できないため
 # bench-check と同様に regression_placeholder のみ実行し、metrics.json からも plugin_boundary*
 # を除いた一時ファイルを生成スクリプトへ渡す（要求 metric 集合を実行ベンチに合わせる。AGENTS.md「3 OS 対応」）。
+# このため Windows で既定の出力先 benches/baseline.json へ書くと共有 baseline から plugin metric が
+# 消えるので、Windows では BENCH_BASELINE_OUT を別ファイルに指定しない限りエラーにする。
 BENCH_NAMES := regression_placeholder plugin_boundary plugin_boundary_list_images
 BENCH_BASELINE_NAMES = $(if $(filter Windows_NT,$(OS)),regression_placeholder,$(BENCH_NAMES))
 BENCH_METRICS ?= benches/metrics.json
@@ -490,6 +500,10 @@ ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	done && \
 	metrics="$$BENCH_METRICS" && \
 	if [ "$(OS)" = "Windows_NT" ]; then \
+		if [ "$$BENCH_BASELINE_OUT" = "benches/baseline.json" ]; then \
+			echo "error: invalid-input: on Windows plugin_boundary metrics are not measured; set BENCH_BASELINE_OUT to a separate file so the shared benches/baseline.json keeps its plugin baselines" >&2; \
+			exit 2; \
+		fi; \
 		jq '.metrics |= with_entries(select(.key | startswith("plugin_boundary") | not))' \
 			"$$BENCH_METRICS" > "$$tmp/metrics.json" && metrics="$$tmp/metrics.json" || exit 1; \
 	fi && \

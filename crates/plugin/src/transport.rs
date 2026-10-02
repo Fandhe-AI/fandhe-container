@@ -264,6 +264,15 @@ mod imp {
             loop {
                 match self.listener.accept() {
                     Ok((stream, _)) => {
+                        // 期限後に到着した接続は受理せず閉じて Timeout を返す（REPAIR-5。
+                        // 期限直前のポーリング後のスリープ中に到着した接続が成功する経路を塞ぐ）。
+                        // drop で fd を閉じるため相手は切断される。
+                        if Instant::now() >= deadline {
+                            return Err(PluginError::new(
+                                PluginErrorCode::Timeout,
+                                "timed out waiting for a connection",
+                            ));
+                        }
                         // 別 UID（取得不能を含む）は切断して拒否する（PLUG-12・fail-closed）。
                         // drop で fd を閉じるため相手は切断される。
                         if sys::peer_uid(&stream)? != self.euid {

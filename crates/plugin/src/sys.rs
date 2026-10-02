@@ -575,12 +575,31 @@ mod connect_abi {
 ))]
 const SUN_PATH_OFFSET: usize = 2;
 
+/// connect 成功時にも期限を確認する（REPAIR-5）。期限超過なら成功扱いにせず `TimedOut` を返し、
+/// `stream` は Drop で close される。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn connected_within_deadline(
+    stream: UnixStream,
+    deadline: std::time::Instant,
+) -> io::Result<UnixStream> {
+    if std::time::Instant::now() > deadline {
+        return Err(io::Error::from(io::ErrorKind::TimedOut));
+    }
+    Ok(stream)
+}
+
 /// `path` の UDS へ `deadline` までに非ブロッキング connect し、接続済みの `UnixStream` を返す
 /// （非ブロッキングのまま。呼び出し側が blocking へ戻す）。
 ///
 /// `transport` の client 接続（`UdsStream::connect`）から呼ばれる。空・内部 NUL・`sun_path` 超過は
 /// `InvalidInput`、期限超過は `TimedOut`、listener の backlog 満杯（Linux の `EAGAIN`）・`EINTR`・
-/// `EINPROGRESS` は期限までリトライする。未対応の OS・アーキテクチャは `Unsupported`（fail-closed）。
+/// `EINPROGRESS` は期限までリトライする。connect 成功時も期限超過なら `TimedOut`。未対応の OS・アーキテクチャは `Unsupported`（fail-closed）。
 /// fd は socket 作成直後に `UnixStream` へ所有させ、どの失敗経路でも close される。
 pub(crate) fn connect_unix(
     path: &std::path::Path,
@@ -652,11 +671,11 @@ pub(crate) fn connect_unix(
             // （構造体サイズ以下であることは上の長さ検査で保証）。
             let rc = unsafe { abi::connect(fd, &raw const addr, addr_len) };
             if rc == 0 {
-                return Ok(stream);
+                return connected_within_deadline(stream, deadline);
             }
             let err = io::Error::last_os_error();
             match err.raw_os_error() {
-                Some(abi::EISCONN) => return Ok(stream),
+                Some(abi::EISCONN) => return connected_within_deadline(stream, deadline),
                 Some(abi::EAGAIN | abi::EINTR | abi::EINPROGRESS | abi::EALREADY) => {
                     let now = Instant::now();
                     if now >= deadline {
@@ -739,6 +758,18 @@ mod tests {
         assert!(fchmodat_via_opath(&dir, c"lnk", 0o600).is_err());
         let mode = std::fs::metadata(d.join("target")).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o644);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// REPAIR-5: 接続自体は成功する状況でも、期限が過ぎていれば成功扱いにせず `TimedOut` を返す。
+    #[test]
+    fn repair5_connect_unix_expired_deadline_times_out_even_if_connectable() {
+        let d = tmpdir("expired");
+        let sock = d.join("s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let past = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let e = connect_unix(&sock, past).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
         let _ = std::fs::remove_dir_all(&d);
     }
 

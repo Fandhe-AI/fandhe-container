@@ -50,6 +50,9 @@ impl PluginTrustErrorKind {
             PluginTrustErrorKind::Unsupported => "unsupported",
             PluginTrustErrorKind::HashMismatch => "hash_mismatch",
             PluginTrustErrorKind::TooLarge => "too_large",
+            PluginTrustErrorKind::VerificationMethodNotImplemented => {
+                "verification_method_not_implemented"
+            }
         }
     }
 
@@ -74,6 +77,9 @@ impl PluginTrustErrorKind {
                 "plugin sha256 digest is not in the allowed hash list"
             }
             PluginTrustErrorKind::TooLarge => "plugin file exceeds the maximum allowed size",
+            PluginTrustErrorKind::VerificationMethodNotImplemented => {
+                "requested plugin verification method is not implemented"
+            }
         }
     }
 
@@ -89,7 +95,8 @@ impl PluginTrustErrorKind {
             | PluginTrustErrorKind::TooLarge
             | PluginTrustErrorKind::InvalidPath => ErrorCode::InvalidArgument,
             PluginTrustErrorKind::Io => ErrorCode::Internal,
-            PluginTrustErrorKind::Unsupported => ErrorCode::Unimplemented,
+            PluginTrustErrorKind::Unsupported
+            | PluginTrustErrorKind::VerificationMethodNotImplemented => ErrorCode::Unimplemented,
         }
     }
 }
@@ -181,7 +188,7 @@ mod tests {
     use crate::traits::TraitError;
     use std::path::Path;
 
-    const ALL: [PluginTrustErrorKind; 10] = [
+    const ALL: [PluginTrustErrorKind; 11] = [
         PluginTrustErrorKind::UntrustedOwner,
         PluginTrustErrorKind::GroupOrOtherWritable,
         PluginTrustErrorKind::NotRegularFile,
@@ -192,6 +199,7 @@ mod tests {
         PluginTrustErrorKind::Unsupported,
         PluginTrustErrorKind::HashMismatch,
         PluginTrustErrorKind::TooLarge,
+        PluginTrustErrorKind::VerificationMethodNotImplemented,
     ];
 
     fn err(kind: PluginTrustErrorKind, path: &str) -> PluginTrustError {
@@ -211,7 +219,7 @@ mod tests {
             );
             assert!(seen.insert(r), "duplicate reason {r}");
         }
-        assert_eq!(seen.len(), 10);
+        assert_eq!(seen.len(), 11);
     }
 
     /// 受入基準 B: message は英語 ASCII で、パスを含まない。代表 3 種は具体値で照合する。

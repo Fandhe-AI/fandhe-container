@@ -199,6 +199,35 @@ mod unix {
         assert!(!real.join("s.sock").exists());
     }
 
+    /// PLUG-12: 祖先要素が symlink でも、検証した配置ディレクトリ（解決後の実体）の直下に
+    /// socket が作られ、接続でき、Drop で削除される（検証 fd と bind 先が一致する）。
+    #[test]
+    fn plug12_bind_with_symlinked_ancestor_creates_socket_in_verified_dir() {
+        let dir = TempDir::new();
+        let real = dir.0.join("real");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&real)
+            .unwrap();
+        let inner = real.join("inner");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&inner)
+            .unwrap();
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let l = UdsListener::bind(&link.join("inner").join("s.sock")).unwrap();
+        assert!(inner.join("s.sock").exists());
+        let h = connect_and_ping(&inner.join("s.sock"));
+        let mut s = l.accept(WAIT).unwrap();
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).unwrap();
+        s.write_all(&buf).unwrap();
+        assert_eq!(h.join().unwrap(), b"ping");
+        drop(l);
+        assert!(!inner.join("s.sock").exists());
+    }
+
     /// PLUG-2: path() は絶対パスで保持される（相対指定でも Drop 時の cwd に依存しない）。
     #[test]
     fn plug2_path_is_absolute() {

@@ -10,6 +10,9 @@
 //! - bind 前に socket 配置ディレクトリを検証する: symlink でない・自 UID 所有・group/other の
 //!   権限が一切ない（0700 相当）。他 UID はこのディレクトリを辿れないため、socket の mode が
 //!   bind 直後の umask 次第でも他 UID が接続できる窓は生じない（0600 化は多層防御）
+//! - 配置ディレクトリへの経路は `canonicalize` 後にルートから 1 要素ずつ `openat(O_NOFOLLOW)` で
+//!   辿り（検証後に祖先が symlink へ差し替わると失敗）、bind 自体も検証済み fd 基準で行う
+//!   （Linux は `/proc/self/fd/<fd>/<name>`。祖先パスを再解決しない。macOS は残余あり: `bind_in_dir` 参照）
 //! - 配置ディレクトリは 1 度だけ開いた fd（検証対象そのもの）を保持し、bind 後の 0600 化
 //!   （`fchmodat(dirfd, name, AT_SYMLINK_NOFOLLOW)`）と Drop 時の削除（`unlinkat(dirfd, name)`）は
 //!   その fd 基準で行う。パスを再解決しないため、検証後に中間要素・`..`・symlink が差し替わっても
@@ -190,7 +193,7 @@ mod imp {
     /// 親ディレクトリを開き、symlink でなく、自 UID 所有で、group/other の権限が一切ないことを
     /// 開いた fd 自体に対して検証する（PLUG-12）。以降の chmod・unlink はこの fd 基準で行う。
     /// 他 UID は辿れないため、socket の mode が umask 次第でも他 UID が接続できる窓は生じない。
-    fn open_parent_dir(path: &Path, euid: u32) -> Result<File, PluginError> {
+    fn open_parent_dir(path: &Path, euid: u32) -> Result<(File, PathBuf), PluginError> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -199,7 +202,14 @@ mod imp {
         if !link_meta.file_type().is_dir() {
             return Err(denied("socket parent is not a directory"));
         }
-        let dir = File::open(parent).map_err(|e| map_bind_error(e.kind()))?;
+        // 祖先要素の symlink は canonicalize で解決した上で、解決後の絶対パスをルートから
+        // 1 要素ずつ O_NOFOLLOW で辿って fd を得る。canonicalize 後に祖先が symlink へ差し替わると
+        // openat が失敗する（fail-closed。PLUG-12）。
+        let canonical = std::fs::canonicalize(parent).map_err(|e| map_bind_error(e.kind()))?;
+        let dir = sys::open_dir_nofollow(&canonical).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => map_bind_error(e.kind()),
+            _ => denied("socket directory path could not be opened without following symlinks"),
+        })?;
         let meta = dir.metadata().map_err(|e| map_bind_error(e.kind()))?;
         // 開いた fd が symlink 判定した実体と同一であること（検査と open の間の差し替え検出）。
         if !meta.file_type().is_dir()
@@ -216,7 +226,31 @@ mod imp {
                 "socket directory must not be accessible by group or others",
             ));
         }
-        Ok(dir)
+        Ok((dir, canonical))
+    }
+
+    /// 検証済みディレクトリ fd 基準で `name` に bind する（PLUG-12）。
+    ///
+    /// Linux: `/proc/self/fd/<fd>/<name>` 経由で bind するため、kernel が検証済み fd の指す
+    /// ディレクトリ直下に socket を作る（祖先パスの再解決なし。`/proc` 不在なら失敗＝fail-closed）。
+    /// 他の unix（macOS）: `bindat` 相当が無いため `canonical/name` へ bind し、直後の
+    /// `configure`（fd 基準の所有者・種別確認と 0600 化）で検証する。残余: 祖先ディレクトリの
+    /// 書き込み権限を持つ他主体が bind の瞬間に差し替える窓が残る（TASK-123・TASK-124 で再検討）。
+    fn bind_in_dir(dir: &File, canonical: &Path, name: &Path) -> io::Result<UnixListener> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let _ = canonical;
+            let via_fd = Path::new("/proc/self/fd")
+                .join(dir.as_raw_fd().to_string())
+                .join(name);
+            UnixListener::bind(via_fd)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = dir;
+            UnixListener::bind(canonical.join(name))
+        }
     }
 
     #[derive(Debug)]
@@ -238,21 +272,23 @@ mod imp {
         /// `path` は `..` を含まない絶対パス（`UdsListener::bind` が検証・変換済み）。
         pub(super) fn bind(path: &Path) -> Result<Self, PluginError> {
             let euid = sys::effective_uid();
-            let dir = open_parent_dir(path, euid)?;
-            let name = path
-                .file_name()
-                .and_then(|n| CString::new(n.as_bytes()).ok())
-                .ok_or_else(|| {
-                    PluginError::new(PluginErrorCode::InvalidArgument, "invalid socket path")
-                })?;
-            let listener = UnixListener::bind(path).map_err(|e| map_bind_error(e.kind()))?;
+            let (dir, canonical) = open_parent_dir(path, euid)?;
+            let file_name = path.file_name().ok_or_else(|| {
+                PluginError::new(PluginErrorCode::InvalidArgument, "invalid socket path")
+            })?;
+            let name = CString::new(file_name.as_bytes()).map_err(|_| {
+                PluginError::new(PluginErrorCode::InvalidArgument, "invalid socket path")
+            })?;
+            let listener = bind_in_dir(&dir, &canonical, Path::new(file_name))
+                .map_err(|e| map_bind_error(e.kind()))?;
+            let bound = canonical.join(file_name);
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
-            let identity = sys::lstat_at(&dir, &name, path).ok();
+            let identity = sys::lstat_at(&dir, &name, &bound).ok();
             let inner = Self {
                 listener,
                 dir,
                 name,
-                path: path.to_path_buf(),
+                path: bound,
                 identity,
                 euid,
             };

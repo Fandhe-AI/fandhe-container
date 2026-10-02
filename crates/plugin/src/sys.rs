@@ -14,6 +14,8 @@
 //! - macOS: `getpeereid(2)`
 //! - いずれの unix: `fchmodat(2)`（`AT_SYMLINK_NOFOLLOW`）・`unlinkat(2)` を検証済みディレクトリ fd
 //!   基準で呼ぶ（パス再解決による TOCTOU を避ける。PLUG-12）
+//! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_NOFOLLOW | O_DIRECTORY)` で配置ディレクトリを
+//!   ルートから 1 要素ずつ辿る（祖先要素の symlink を拒否。PLUG-12）
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 契約
@@ -26,7 +28,7 @@
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 
 use crate::error::{PluginError, PluginErrorCode};
@@ -200,6 +202,105 @@ pub(crate) fn lstat_at(
             uid: m.uid(),
             is_socket: m.file_type().is_socket(),
         })
+    }
+}
+
+// openat 用の open(2) フラグ・AT_FDCWD。値は OS・アーキテクチャごとに異なるため個別定義し流用しない。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_DIRECTORY: i32 = 0o200000;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_DIRECTORY: i32 = 0o40000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_NOFOLLOW: i32 = 0o100000;
+#[cfg(target_os = "linux")]
+const O_CLOEXEC: i32 = 0o2000000;
+#[cfg(target_os = "linux")]
+const AT_FDCWD: i32 = -100;
+#[cfg(target_os = "macos")]
+const O_DIRECTORY: i32 = 0x0010_0000;
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(target_os = "macos")]
+const O_CLOEXEC: i32 = 0x0100_0000;
+#[cfg(target_os = "macos")]
+const AT_FDCWD: i32 = -2;
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: POSIX の `int openat(int, const char *, int, ...)` と同じ型・幅。
+    // O_CREAT を使わないため可変長引数（mode）は渡さない。
+    #[link_name = "openat"]
+    fn c_openat(dirfd: i32, path: *const core::ffi::c_char, flags: i32, ...) -> i32;
+}
+
+/// `dirfd` 基準で `name` を `O_DIRECTORY | O_NOFOLLOW` で開く（1 要素）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn openat_dir_nofollow(dirfd: i32, name: &CStr) -> io::Result<File> {
+    // SAFETY: `name` は NUL 終端の有効な C 文字列。`dirfd` は呼び出し側が保持する開いた fd
+    // （または AT_FDCWD + 絶対パス）。
+    let fd = unsafe { c_openat(dirfd, name.as_ptr(), O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` は直前の openat が返した、他に所有者のいない有効な fd（非負を確認済み）。
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// 絶対パス `abs`（`canonicalize` 済み）をルートから 1 要素ずつ `openat(O_NOFOLLOW | O_DIRECTORY)`
+/// で辿り、ディレクトリ fd を返す（PLUG-12）。いずれかの要素が symlink（検証後の差し替えを含む）なら
+/// `ELOOP` 等で失敗する（fail-closed）。以降はこの fd を基準に bind・chmod・unlink を行い、
+/// パスを再解決しない。未対応の OS・アーキテクチャは `Unsupported`（fail-closed）。
+pub(crate) fn open_dir_nofollow(abs: &std::path::Path) -> io::Result<File> {
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Component;
+        let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
+        let mut comps = abs.components();
+        if comps.next() != Some(Component::RootDir) {
+            return Err(invalid());
+        }
+        let mut cur = openat_dir_nofollow(AT_FDCWD, c"/")?;
+        for c in comps {
+            let Component::Normal(n) = c else {
+                return Err(invalid());
+            };
+            let name = CString::new(n.as_bytes()).map_err(|_| invalid())?;
+            cur = openat_dir_nofollow(cur.as_raw_fd(), &name)?;
+        }
+        Ok(cur)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    {
+        let _ = abs;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
 

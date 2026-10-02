@@ -15,10 +15,15 @@
 //!   基底は末尾 `/` を除いた正規化パスで lstat し（末尾 `/` による symlink 追従を防ぐ）、
 //!   symlink なら拒否する。さらに基底を `canonicalize` した実パスの全祖先を検証する。祖先は
 //!   実ディレクトリで、所有者が root または自 UID、group / other 書き込み不可（または sticky）で
-//!   なければならず、満たさなければ `PermissionDenied`。以降の操作は検証済みの実パスで行う
-//!   （祖先の symlink 差し替えによる配置先のすり替えを防ぐ。fd 基準の `openat` 化は未実装で、
-//!   検証後に信頼済み祖先が root / 自 UID により改変される競合のみ残る）。
-//! - 判定は `symlink_metadata`（symlink を辿らない）の結果で行う。
+//!   なければならず、満たさなければ `PermissionDenied`。
+//! - 祖先・基底・runtime directory の判定は、実パスをルートから 1 要素ずつ
+//!   `openat(O_NOFOLLOW | O_DIRECTORY)` で辿って開いた fd（`crate::sys::open_dir_nofollow`。
+//!   `UdsListener::bind` の配置ディレクトリ検証と同じ仕組み）の `fstat` 結果で行う。経路上の要素が
+//!   symlink（`canonicalize` 後の差し替えを含む）なら open が失敗し、パスの再解決で検証対象と
+//!   別の場所を見ることはない（fail-closed）。基底は lstat した実体と fd の dev / ino の一致も確認する。
+//! - 残余: 作成（`mkdir`）だけはパス指定で行う。検証済みの祖先を書き換えられるのは root と自 UID
+//!   のみで、その場合も作成後に fd で開き直して検証するため、未検証の場所を返すことはない。
+//!   返した後の保護は `UdsListener::bind` が bind 時に配置ディレクトリを fd で再検証して担う。
 //! - 作成は非再帰で、基底ディレクトリ（`XDG_RUNTIME_DIR` 自体）は作らない。
 //! - エラーメッセージは固定の英語文字列で、パス・環境変数値を含めない。
 //!
@@ -105,7 +110,7 @@ fn runtime_dir_base(xdg: Option<std::ffi::OsString>) -> Result<PathBuf, PluginEr
 mod imp {
     use super::{RUNTIME_DIR_NAME, RuntimeDir, runtime_dir_base, validate_base};
     use crate::error::{PluginError, PluginErrorCode};
-    use std::fs::{DirBuilder, Metadata};
+    use std::fs::{DirBuilder, File, Metadata};
     use std::io;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     use std::path::{Path, PathBuf};
@@ -136,7 +141,7 @@ mod imp {
         }
     }
 
-    /// `symlink_metadata` 由来の Metadata を検証する（symlink 非追従。PLUG-12）。
+    /// runtime directory を `O_NOFOLLOW` で開いた fd の Metadata を検証する（PLUG-12）。
     fn verify(meta: &Metadata, euid: u32) -> Result<(), PluginError> {
         let deny = |m: &str| PluginError::new(PluginErrorCode::PermissionDenied, m);
         if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -158,7 +163,7 @@ mod imp {
         Ok(())
     }
 
-    /// 基底ディレクトリの検証（symlink 非追従）。自 UID 所有の実ディレクトリで、group / other に
+    /// 基底ディレクトリの検証（lstat または `O_NOFOLLOW` で開いた fd の Metadata）。自 UID 所有の実ディレクトリで、group / other に
     /// 書き込み権が無いこと（`mode & 0o022 == 0`）を要求する。`/run/user/<uid>`（0700）は通り、
     /// 共有書き込み可能な `/tmp` 等（sticky でも）は拒否する。祖先は [`verify_ancestor`] で別途検証する。
     fn verify_base(meta: &Metadata, euid: u32) -> Result<(), PluginError> {
@@ -179,7 +184,8 @@ mod imp {
         Ok(())
     }
 
-    /// 基底の祖先ディレクトリの検証（実パス上の各要素。PLUG-12）。実ディレクトリで、所有者が
+    /// 基底の祖先ディレクトリの検証（実パス上の各要素を `O_NOFOLLOW` で開いた fd の Metadata。
+    /// PLUG-12）。実ディレクトリで、所有者が
     /// root または自 UID、かつ group / other に書き込み権が無い（sticky bit 付きは許容。`/tmp` 等）こと。
     fn verify_ancestor(meta: &Metadata, euid: u32) -> Result<(), PluginError> {
         let deny = |m: &str| PluginError::new(PluginErrorCode::PermissionDenied, m);
@@ -197,26 +203,51 @@ mod imp {
         Ok(())
     }
 
-    /// 基底を symlink 非追従で検証し、全祖先を検証済みの実パス（canonical）を返す。
+    /// 実パス `abs` をルートから 1 要素ずつ symlink 非追従で開く（[`crate::sys::open_dir_nofollow`]）。
+    /// 経路上の要素が symlink・非ディレクトリ・読み取り不可なら `PermissionDenied`、
+    /// 未対応の OS・アーキテクチャは `Unimplemented`（いずれも fail-closed）。
+    fn open_nofollow(abs: &Path) -> Result<File, PluginError> {
+        crate::sys::open_dir_nofollow(abs).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => map_io(&e),
+            io::ErrorKind::Unsupported => PluginError::new(
+                PluginErrorCode::Unimplemented,
+                "runtime directory is not implemented on this platform",
+            ),
+            _ => PluginError::new(
+                PluginErrorCode::PermissionDenied,
+                "runtime directory path could not be opened without following symlinks",
+            ),
+        })
+    }
+
+    fn fstat(dir: &File) -> Result<Metadata, PluginError> {
+        dir.metadata().map_err(|e| map_io(&e))
+    }
+
+    /// 基底と全祖先を検証し、基底の実パス（canonical）を返す（PLUG-12）。
+    ///
+    /// 検証は実パスの各要素を symlink 非追従で開いた fd に対して行う。`canonicalize` 後に経路上の
+    /// 要素が symlink へ差し替えられた場合は open が失敗する。
     fn resolve_base(base: &Path, euid: u32) -> Result<PathBuf, PluginError> {
         // 末尾 `/` は lstat が最終要素の symlink を辿る原因になるため、components で正規化して除く。
         let normalized: PathBuf = base.components().collect();
-        let base_meta = std::fs::symlink_metadata(&normalized).map_err(|e| map_io(&e))?;
-        verify_base(&base_meta, euid)?;
+        let link_meta = std::fs::symlink_metadata(&normalized).map_err(|e| map_io(&e))?;
+        verify_base(&link_meta, euid)?;
         // 基底が実ディレクトリと確定した後の canonicalize は祖先 symlink のみを解決する。
         let real = std::fs::canonicalize(&normalized).map_err(|e| map_io(&e))?;
-        let mut cur = PathBuf::new();
-        let mut comps = real.components().peekable();
-        while let Some(c) = comps.next() {
-            cur.push(c);
-            if comps.peek().is_none() {
-                break; // 最終要素（基底自身）は verify_base で検証済みなので、実パス側で再検証のみ行う
-            }
-            let m = std::fs::symlink_metadata(&cur).map_err(|e| map_io(&e))?;
-            verify_ancestor(&m, euid)?;
+        // ancestors() は自身を最初に、ルートを最後に返す。自身を除いた各祖先を fd で検証する。
+        for ancestor in real.ancestors().skip(1) {
+            verify_ancestor(&fstat(&open_nofollow(ancestor)?)?, euid)?;
         }
-        let real_meta = std::fs::symlink_metadata(&real).map_err(|e| map_io(&e))?;
-        verify_base(&real_meta, euid)?;
+        let meta = fstat(&open_nofollow(&real)?)?;
+        // 開いた fd が lstat した実体と同一であること（検査と open の間の差し替え検出）。
+        if meta.dev() != link_meta.dev() || meta.ino() != link_meta.ino() {
+            return Err(PluginError::new(
+                PluginErrorCode::PermissionDenied,
+                "runtime directory base changed during verification",
+            ));
+        }
+        verify_base(&meta, euid)?;
         Ok(real)
     }
 
@@ -228,20 +259,27 @@ mod imp {
         let real_base = resolve_base(base, euid)?;
         let dir = real_base.join(RUNTIME_DIR_NAME);
         match std::fs::symlink_metadata(&dir) {
-            Ok(meta) => verify(&meta, euid)?,
+            // 既存の symlink・非ディレクトリは open を試みる前に拒否する（修復・削除はしない）。
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(PluginError::new(
+                    PluginErrorCode::PermissionDenied,
+                    "runtime directory is not a plain directory",
+                ));
+            }
+            Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // 非再帰。基底が無ければ NotFound。競合作成（AlreadyExists）は再 lstat で検証する。
+                // 非再帰。競合作成（AlreadyExists）は下の fd 検証で判定する。
                 match DirBuilder::new().mode(0o700).create(&dir) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(e) => return Err(map_io(&e)),
                 }
-                // 作成直後に再取得して検証する（差し替え・競合作成を検出）。
-                let meta = std::fs::symlink_metadata(&dir).map_err(|e| map_io(&e))?;
-                verify(&meta, euid)?;
             }
             Err(e) => return Err(map_io(&e)),
         }
+        // ルートから symlink 非追従で開き直し、開いた fd 自体を検証する。lstat・作成との間に
+        // 経路上の要素や runtime directory が symlink へ差し替えられていれば open が失敗する。
+        verify(&fstat(&open_nofollow(&dir)?)?, euid)?;
         Ok(RuntimeDir { path: dir })
     }
 

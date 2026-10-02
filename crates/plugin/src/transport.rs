@@ -718,9 +718,8 @@ mod imp {
                         }
                         // 別 UID（取得不能を含む）は切断して拒否する（PLUG-12・fail-closed）。
                         // drop で fd を閉じるため相手は切断される。
-                        if sys::peer_uid(&stream)? != self.euid {
-                            return Err(denied("peer credential does not match the current user"));
-                        }
+                        // accept 直後・最初の read より前に検証する（TASK-124.1・#292）。
+                        crate::uds_security::verify_peer(&stream, self.euid)?;
                         // 応答者の限定指定がある場合、spawn した子以外（同一 UID の別プロセス）は
                         // 切断して受付を継続する（PLUG-7。取得不能は fail-closed でエラー）。
                         if let Some(pid) = expected_pid
@@ -825,9 +824,7 @@ mod imp {
             let stream =
                 sys::connect_unix(path, deadline).map_err(|e| map_connect_error(e.kind()))?;
             // 偽 listener への誘導対策（PLUG-12）。不一致・取得不能は何も送らず drop で切断する。
-            if sys::peer_uid(&stream)? != sys::effective_uid() {
-                return Err(denied("peer credential does not match the current user"));
-            }
+            crate::uds_security::verify_peer(&stream, sys::effective_uid())?;
             stream.set_nonblocking(false).map_err(|_| {
                 PluginError::new(
                     PluginErrorCode::Internal,

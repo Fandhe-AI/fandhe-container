@@ -10,8 +10,9 @@
 //! 都度起動モード（`lifecycle`。TASK-110.1・#258）と
 //! XDG 未設定時のフォールバック（TASK-123.4・#289）と常駐モード（`lifecycle`。TASK-110.2・#259）のみ実装済み。
 //! モード選択 API（`lifecycle`。TASK-110.3・#260）は実装済み。gRPC と
-//! PLUG-12 の peer 認証（TASK-124。macOS の `getpeereid` 経路は TASK-124.2・#293 で実装・検証済み）のうち
-//! 残り（Linux・Windows 文書化・別 UID 拒否テスト）は未完了（TASK-108 ほか。REPAIR-3）。
+//! PLUG-12 の peer 認証（TASK-124）は Linux の SO_PEERCRED（`uds_security::verify_peer`。TASK-124.1・#292）と
+//! macOS の `getpeereid` 経路（TASK-124.2・#293）が実装・検証済みで、
+//! 残り（Windows 文書化・別 UID 拒否テスト・拒否の監査ログ）は未完了（TASK-108 ほか。REPAIR-3）。
 //! 本体は G8（TASK-107 が crate 本体、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124）で
 //! 実装する。plugin 発見・登録（TASK-109）の成果物は `fandhe-container-core` 側に置かれ、本 crate ではない。
 //! PLUG-1 区分は core・plugin 双方が依存する境界基盤ライブラリ（crate-naming.md 決定 4）。

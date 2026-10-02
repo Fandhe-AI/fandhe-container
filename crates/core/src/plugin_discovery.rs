@@ -50,6 +50,10 @@ pub const MAX_SCANNED_ENTRIES_PER_DIR: usize = 4096;
 /// 上限を超え得るため別に設ける）。超過は fail-closed で拒否する。
 pub const MAX_SCANNED_ENTRIES_PER_PATH_DIR: usize = 65536;
 
+/// 探索全体（管理ディレクトリ + `PATH`）で保持する候補数の上限。超過は切り捨てず fail-closed で
+/// 拒否する（多数のディレクトリに名前一致ファイルを置かれた場合の無制限なメモリ確保・警告複製を防ぐ）。
+pub const MAX_TOTAL_CANDIDATES: usize = 4096;
+
 /// `PATH` から採用するディレクトリ数の上限。超過は切り捨てず fail-closed で拒否する。
 pub const MAX_PATH_SEARCH_DIRS: usize = 256;
 
@@ -234,7 +238,7 @@ pub fn default_search_dirs() -> Vec<PluginSearchDir> {
 /// 指定ディレクトリを走査して命名規約に合う候補を列挙する。
 ///
 /// 結果は (origin: System → User, name 昇順) に整列する。存在しないディレクトリは候補なし。
-/// それ以外の I/O エラー・走査上限超過は `Err`（fail-closed）。
+/// それ以外の I/O エラー・走査上限・候補総数上限（[`MAX_TOTAL_CANDIDATES`]）超過は `Err`（fail-closed）。
 pub fn discover_candidates(dirs: &[PluginSearchDir]) -> Result<Vec<PluginCandidate>, TraitError> {
     let mut found = Vec::new();
     for dir in dirs {
@@ -298,6 +302,12 @@ fn scan_dir(
         } else {
             continue;
         };
+        if out.len() >= MAX_TOTAL_CANDIDATES {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "too many plugin candidates",
+            ));
+        }
         out.push(PluginCandidate {
             name: name.to_owned(),
             path: dir.path().join(file_name),
@@ -618,6 +628,24 @@ mod tests {
         assert_eq!(ok.len(), 256);
         let err = resolve_path_search_dirs(Some(&mk(257))).unwrap_err();
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    }
+
+    #[test]
+    fn plug11_total_candidates_are_capped() {
+        let root = std::env::temp_dir().join(format!("fandhe-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut out = Vec::new();
+        let dir = PluginSearchDir::new(PluginDirKind::Path, root.clone());
+        let ext = std::env::consts::EXE_SUFFIX;
+        for i in 0..MAX_TOTAL_CANDIDATES + 1 {
+            fs::write(root.join(format!("{PLUGIN_NAME_PREFIX}p{i}{ext}")), b"").unwrap();
+        }
+        // 総数上限を 1 超える数のファイルがある場合は fail-closed。
+        let err = scan_dir(&dir, MAX_SCANNED_ENTRIES_PER_PATH_DIR, &mut out).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(out.len(), MAX_TOTAL_CANDIDATES);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

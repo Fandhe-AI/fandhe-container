@@ -292,6 +292,74 @@ pub fn call_once(
     request: &Frame,
     timeout: OneShotTimeout,
 ) -> Result<OneShotOutcome, PluginError> {
+    call_once_observed(plugin, request, timeout, &mut |record| {
+        use std::io::Write;
+        // 構造化ログ（JSON Lines）を stderr へ 1 行出す。書き込み失敗は呼び出し結果に影響させない。
+        let _ = writeln!(io::stderr(), "{}", record.to_json_line());
+    })
+}
+
+/// 1 回の [`call_once`] の観測記録（成功 / 失敗とレイテンシ。REPAIR-4）。
+///
+/// 呼び出し側（core の plugin proxy 等）が `observer` で受け取り、成功 / 失敗件数とレイテンシ分布へ
+/// 集計する。`fandhe-container-core` の `OpRecorder` は依存方向（`core -> plugin`）のため本 crate から
+/// 参照できないので、記録の受け渡しは本型で行う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OneShotRecord {
+    /// 操作名（固定値 `plugin.call_once`）。
+    pub operation: &'static str,
+    /// 成功したか。
+    pub success: bool,
+    /// 失敗時の機械可読な `code`（ERR-1）。成功時は `None`。
+    pub error_code: Option<&'static str>,
+    /// 開始から戻るまでの所要時間（子の回収待ちを含む）。
+    pub elapsed: Duration,
+}
+
+impl OneShotRecord {
+    /// JSON Lines の 1 行（改行なし）へ符号化する。値はすべて固定文字列・数値のみで、外部入力を含まない。
+    pub fn to_json_line(&self) -> String {
+        let code = match self.error_code {
+            Some(c) => format!("\"{c}\""),
+            None => "null".to_string(),
+        };
+        format!(
+            "{{\"op\":\"{}\",\"success\":{},\"error_code\":{},\"elapsed_us\":{}}}",
+            self.operation,
+            self.success,
+            code,
+            self.elapsed.as_micros()
+        )
+    }
+}
+
+/// [`call_once`] と同じ処理を行い、終了時に 1 件の [`OneShotRecord`] を `observer` へ渡す（REPAIR-4）。
+///
+/// 成功・失敗のどの終了経路でも必ず 1 回だけ呼ばれる。`observer` は呼び出しスレッド上で同期的に
+/// 実行されるため、長時間ブロックしないこと。
+pub fn call_once_observed(
+    plugin: &OneShotPlugin,
+    request: &Frame,
+    timeout: OneShotTimeout,
+    observer: &mut dyn FnMut(&OneShotRecord),
+) -> Result<OneShotOutcome, PluginError> {
+    let start = Instant::now();
+    let result = call_once_inner(plugin, request, timeout);
+    observer(&OneShotRecord {
+        operation: "plugin.call_once",
+        success: result.is_ok(),
+        error_code: result.as_ref().err().map(|e| e.code().as_str()),
+        elapsed: start.elapsed(),
+    });
+    result
+}
+
+fn call_once_inner(
+    plugin: &OneShotPlugin,
+    request: &Frame,
+    timeout: OneShotTimeout,
+) -> Result<OneShotOutcome, PluginError> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     let deadline = Instant::now()
@@ -383,6 +451,38 @@ mod tests {
             Duration::from_secs(10)
         );
         assert!(OneShotTimeout::new(ONE_SHOT_TIMEOUT_MAX).is_ok());
+    }
+
+    /// REPAIR-4: 失敗経路でも観測記録が 1 件・機械可読 code 付きで渡される。
+    #[test]
+    fn repair4_observer_receives_failure_record() {
+        let abs = if cfg!(windows) { "C:\\p" } else { "/bin/p" };
+        let dir = std::env::temp_dir().join("fcos-nonexistent-observer-dir");
+        let plugin = OneShotPlugin::new(abs.into(), vec![], dir).unwrap();
+        let req = Frame::new(Vec::new()).unwrap();
+        let mut records = Vec::new();
+        let r = call_once_observed(&plugin, &req, OneShotTimeout::default(), &mut |rec| {
+            records.push(rec.clone())
+        });
+        assert!(r.is_err());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, "plugin.call_once");
+        assert!(!records[0].success);
+        assert!(records[0].error_code.is_some());
+    }
+
+    #[test]
+    fn repair4_record_json_line_is_stable() {
+        let rec = OneShotRecord {
+            operation: "plugin.call_once",
+            success: false,
+            error_code: Some("TIMEOUT"),
+            elapsed: Duration::from_micros(1500),
+        };
+        assert_eq!(
+            rec.to_json_line(),
+            "{\"op\":\"plugin.call_once\",\"success\":false,\"error_code\":\"TIMEOUT\",\"elapsed_us\":1500}"
+        );
     }
 
     #[test]

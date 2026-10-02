@@ -349,6 +349,8 @@ enum TimeoutRestore {
     /// 元の期限へ戻せた。
     Restored,
     /// 相手切断で復元できなかった（EINVAL）。接続は使用不可にする。
+    /// 構築は unix 実装（`restore_timeouts`）のみ。他 OS では UDS が未実装のため構築されない。
+    #[cfg_attr(not(unix), allow(dead_code))]
     PeerClosed,
     /// 復元に失敗した、または元の期限を保存できなかった。
     Failed,

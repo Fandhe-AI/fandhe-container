@@ -404,6 +404,20 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-check をスキップ"
 endif
 
+# plugin 境界ベンチ（代表操作 A・B。TASK-113.1〜113.3）を実行し、Δp50 と CORE-10 の Linux 実機値
+# （0.290〜0.298 秒）に対する割合を stderr へログ出力する（PLUG-5・CORE-10）。基準値との比較は
+# しない（plugin 系 metric は baseline.json 未登録。実測基準値は TASK-88.h1・TASK-113.h1 で確定）。
+# 一時ディレクトリは trap で必ず削除する。Make 変数はシェル文字列へ埋め込まない。
+.PHONY: bench-plugin-boundary
+bench-plugin-boundary: ## plugin 境界ベンチを実行し Δp50 と CORE-10 比をログ出力する（TASK-113.3・PLUG-5。基準値比較なし）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	cargo bench -p fandhe-container-benches --bench plugin_boundary -- --output "$$tmp/a.json" && \
+	cargo bench -p fandhe-container-benches --bench plugin_boundary_list_images -- --output "$$tmp/b.json" >/dev/null
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-plugin-boundary をスキップ"
+endif
+
 # baseline.json 生成スクリプト（scripts/bench/generate_baseline.sh）の自己テスト
 # （TASK-88.1・REPAIR-8・REPAIR-12）。bash + jq のみで完結する。
 .PHONY: bench-baseline-selftest
@@ -420,7 +434,11 @@ bench-baseline-selftest: ## baseline.json 生成スクリプトの自己テス�
 # BENCH_METRICS / BENCH_BASELINE_OUT / BENCH_ENVIRONMENT は Make 変数展開でシェル文字列へ
 # 埋め込まず、export した環境変数として二重引用符付きで参照する（値に ' 等が含まれても
 # 引用が壊れず、インジェクションにならない）。
-BENCH_NAMES := regression_placeholder
+# plugin 境界ベンチ（TASK-113.1〜113.3）は metric を metrics.json に登録済みのため、ここにも
+# 同時に載せる（generate_baseline.sh は metrics.json と results の metric 集合が完全一致しないと
+# exit 2）。baseline 再生成時は `bench-check` の対象ベンチも同じ集合に揃えること（baseline と
+# results の集合不一致は check-bench-regression.sh が exit 2 にするため）。
+BENCH_NAMES := regression_placeholder plugin_boundary plugin_boundary_list_images
 BENCH_METRICS ?= benches/metrics.json
 BENCH_BASELINE_OUT ?= benches/baseline.json
 BENCH_ENVIRONMENT ?=

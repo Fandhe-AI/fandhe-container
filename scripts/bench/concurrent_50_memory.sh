@@ -1137,8 +1137,12 @@ run_report() {
     err "invalid-result" "count differs between own ($oc) and docker ($dc); the comparison needs the same container count"
     exit 2
   fi
-  if ! out_buf="$(jq -n --argjson own "$own" --argjson docker "$dk" '
-    $own.count as $c
+  # 検証済みの 2 つの JSON は標準入力で jq へ渡す（printf は bash の組み込み）。--argjson でコマンドライン
+  # 引数にすると、1 引数の長さ上限（Linux では 128 KiB）を超える入力で jq を起動できず、load_result_file が
+  # 許容するサイズ（RESULT_MAX_BYTES）の結果を統合できない。
+  if ! out_buf="$(printf '%s\n%s\n' "$own" "$dk" | jq -s '
+    .[0] as $own | .[1] as $docker
+    | $own.count as $c
     | ("concurrent_\($c)_pss_median_kb") as $k
     | $own.metrics[$k].value as $o
     | $docker.metrics[$k].value as $d

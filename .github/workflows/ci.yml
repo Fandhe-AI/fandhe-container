@@ -551,8 +551,15 @@ jobs:
       # 既存ジョブのステップとして追加（check-run 件数は不変）
       - name: plugin 追加前後の core 不変性（PLUG-4・TASK-109.4）
         shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
+          # pull_request では base を取得し、plugin 追加 PR が core を変更していないかも検査する
+          if [ -n "${BASE_REF}" ]; then
+            git fetch --no-tags --depth=1 origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            export PLUG4_BASE_REF="origin/${BASE_REF}"
+          fi
           make plug4-core-invariance
 
   # --------------------------------------------------

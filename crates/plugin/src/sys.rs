@@ -525,10 +525,30 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
             // SAFETY: `fd` は直前の openat が返した、他に所有者のいない有効な fd（非負を確認済み）。
             Ok(unsafe { File::from_raw_fd(fd) })
         };
-        let (file, created) = match open(O_RDWR | O_CREAT | O_EXCL) {
-            Ok(f) => (f, true),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (open(O_RDWR | O_CREAT)?, false),
-            Err(e) => return Err(e),
+        // 新規作成（O_EXCL）を試し、既にあれば O_CREAT なしで既存を開く。その間に保持者が解放時の
+        // unlink をした場合は ENOENT になるため、上限つきで最初からやり直す（`created` を正確に保つ。
+        // 上限まで競合し続けた場合は使用中＝`WouldBlock` として返し、待ち続けない。REPAIR-5）。
+        const OPEN_ATTEMPTS: usize = 8;
+        let mut opened = None;
+        for _ in 0..OPEN_ATTEMPTS {
+            match open(O_RDWR | O_CREAT | O_EXCL) {
+                Ok(f) => {
+                    opened = Some((f, true));
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match open(O_RDWR) {
+                    Ok(f) => {
+                        opened = Some((f, false));
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                },
+                Err(e) => return Err(e),
+            }
+        }
+        let Some((file, created)) = opened else {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
         };
         // 通常ファイル以外（FIFO・デバイス等）はロックを試みる前に拒否する（flock 自体が失敗して
         // 理由が分からなくなる OS があるため。内容にも触れない）。

@@ -306,7 +306,7 @@ mod unix {
                                 assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
                                 drop(l);
                             }
-                            Err(e) => assert_eq!(e.code(), PluginErrorCode::AlreadyExists),
+                            Err(e) => assert_eq!(e.code(), PluginErrorCode::AlreadyExists, "{e:?}"),
                         }
                     }
                 })

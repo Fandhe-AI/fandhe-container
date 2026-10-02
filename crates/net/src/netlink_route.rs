@@ -18,7 +18,7 @@ mod socket {
     use std::time::Duration;
 
     use crate::error::{NetError, NetErrorCode};
-    use crate::netlink::{MAX_MESSAGE_LEN, NLMSG_HEADER_LEN, NlMsgHeader};
+    use crate::netlink::{ALIGN_TO, MAX_MESSAGE_LEN, NLMSG_HEADER_LEN, NlMsgHeader};
     use crate::sys::{self, SysError};
 
     /// 受信バッファの固定上限（バイト）。カーネルの申告長に応じた再確保はしない（無制限確保の防止）。
@@ -54,7 +54,7 @@ mod socket {
 
         /// `message`（`NlMsgBuilder` で組んだ 1 メッセージ）をそのままカーネルへ送る。
         ///
-        /// 空・`NLMSG_HEADER_LEN` 未満・`MAX_MESSAGE_LEN` 超、および `nlmsg_len` が実長と一致しない（複数メッセージ連結を含む）入力は `InvalidArgument`。部分送信は `DataLoss`。
+        /// 空・`NLMSG_HEADER_LEN` 未満・`MAX_MESSAGE_LEN` 超、および「アラインした `nlmsg_len` が実長と一致しない（複数メッセージ連結を含む）・末尾パディング（0〜3 バイト）が 0 でない」入力は `InvalidArgument`。部分送信は `DataLoss`。
         pub fn send(&self, message: &[u8]) -> Result<(), NetError> {
             if message.len() < NLMSG_HEADER_LEN || message.len() > MAX_MESSAGE_LEN as usize {
                 return Err(NetError::new(
@@ -72,12 +72,19 @@ mod socket {
             let header = NlMsgHeader::decode(message).map_err(|e| {
                 NetError::new(NetErrorCode::InvalidArgument, e.message().to_string())
             })?;
-            if header.len() as usize != message.len() {
+            // NlMsgBuilder::finish は nlmsg_len に末尾パディングを含めず、バイト列は 4 バイト境界まで 0 埋めする。
+            // よって実長は nlmsg_len を 4 バイトへアラインした値と一致し、nlmsg_len 以降（0〜3 バイト）は 0 でなければならない。
+            let msg_len = header.len() as usize;
+            let aligned_len = msg_len.saturating_add(ALIGN_TO - 1) & !(ALIGN_TO - 1);
+            let padding_is_zero = message
+                .get(msg_len..)
+                .is_some_and(|pad| pad.iter().all(|&b| b == 0));
+            if aligned_len != message.len() || !padding_is_zero {
                 return Err(NetError::new(
                     NetErrorCode::InvalidArgument,
                     format!(
-                        "nlmsg_len {} does not match buffer length {} (single message required)",
-                        header.len(),
+                        "nlmsg_len {} does not match buffer length {} (single message with zero padding required)",
+                        msg_len,
                         message.len()
                     ),
                 ));
@@ -215,6 +222,32 @@ mod socket {
             let mut short_hdr = one;
             short_hdr[0..4].copy_from_slice(&8u32.to_ne_bytes());
             let e = s.send(&short_hdr).expect_err("must reject");
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        }
+
+        /// NET-11・REPAIR-2: 末尾パディングを含む NlMsgBuilder の出力は受理し、非 0 パディング・過剰パディングは拒否する。
+        #[test]
+        fn send_accepts_padded_builder_output() {
+            use crate::netlink::NlMsgBuilder;
+            let s = NetlinkRouteSocket::open().expect("open");
+            let mut b = NlMsgBuilder::new(18, crate::netlink::NLM_F_REQUEST, 1, 0);
+            b.put_fixed(&[1]).expect("fixed");
+            let msg = b.finish().expect("finish");
+            assert_eq!(u32::from_ne_bytes(msg[0..4].try_into().expect("len")), 17);
+            assert_eq!(msg.len(), 20);
+            // 受理（カーネル応答の成否は問わず、InvalidArgument でないこと）。
+            if let Err(e) = s.send(&msg) {
+                assert_ne!(e.code(), NetErrorCode::InvalidArgument);
+            }
+            let mut dirty = msg.clone();
+            dirty[19] = 1;
+            let e = s.send(&dirty).expect_err("must reject");
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+            let mut over = msg.clone();
+            over.extend_from_slice(&[0u8; 4]);
+            let e = s.send(&over).expect_err("must reject");
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+            let e = s.send(&msg[..17]).expect_err("must reject");
             assert_eq!(e.code(), NetErrorCode::InvalidArgument);
         }
     }

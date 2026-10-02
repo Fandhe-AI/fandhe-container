@@ -470,6 +470,16 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-plugin-boundary をスキップ"
 endif
 
+# macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）の手動実行。macOS 以外は skip を表示して成功する。
+# BENCH_NAMES・基準値比較には接続しない（macOS 専用 metric のため。CI の macOS では結合試験として実行）。
+.PHONY: bench-macos-cold-start
+bench-macos-cold-start: ## macOS cold start 上乗せを計測する（TASK-113.4・PLUG-6・MAC-2。macOS 以外は skip）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@cargo bench -p fandhe-container-benches --bench plugin_boundary_macos_cold_start
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-macos-cold-start をスキップ"
+endif
+
 # baseline.json 生成スクリプト（scripts/bench/generate_baseline.sh）の自己テスト
 # （TASK-88.1・REPAIR-8・REPAIR-12）。bash + jq のみで完結する。
 .PHONY: bench-baseline-selftest

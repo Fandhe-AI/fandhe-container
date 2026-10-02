@@ -22,6 +22,7 @@ name = "fandhe-container-core"
 version = "0.0.0"
 dependencies = [
  "fandhe-container-core",
+ "fandhe-container-plugin",
  "serde",
  "serde_json",
 ]

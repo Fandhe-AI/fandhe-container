@@ -237,6 +237,27 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
 endif
 
+# core の plugin 無効構成の検証（PLUG-3・TASK-111.1・#262。REPAIR-10 (d)）。
+# `--no-default-features` で core がビルド・テストでき、依存ツリーに plugin 境界基盤
+# （fandhe-container-plugin）が入らないことを確認する。`make ci` には含めない
+# （CI の rust-ci-default-features ジョブが同じターゲットを実行する）。
+.PHONY: test-core-no-plugin
+test-core-no-plugin: ## core を --no-default-features でテストし plugin 依存が入らないことを検証する
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	cargo test -p fandhe-container-core --no-default-features --lib
+	@tree=$$(cargo tree -p fandhe-container-core --no-default-features -e normal) || { \
+		echo "NG: cargo tree の実行に失敗しました" >&2; \
+		exit 1; \
+	}; \
+	if printf '%s\n' "$$tree" | grep -q 'fandhe-container-plugin'; then \
+		echo "NG: plugin 無効構成の依存ツリーに fandhe-container-plugin が含まれています" >&2; \
+		exit 1; \
+	fi; \
+	echo "OK: plugin 無効構成で fandhe-container-plugin は依存ツリーに含まれません"
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test-core-no-plugin をスキップ"
+endif
+
 # REPAIR-7 ステージ 3（タイムアウト保護された結合試験。TASK-86.2・#36）。
 # CI（ci.yml の integration-test ジョブ）と同じ判定を行う: integration test
 # target（`tests/*.rs`。cargo metadata 上で kind が "test" のもの）が 0 件の

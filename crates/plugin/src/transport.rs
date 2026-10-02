@@ -703,7 +703,9 @@ mod imp {
                 Err(e) => e.kind() == io::ErrorKind::NotFound,
             };
             if gone {
-                self.lock.clear_record();
+                // 消去に失敗しても後始末（Drop）からは報告できない。記録が残っても、次回の bind の
+                // `clear_stale_socket` が「記録した socket がパス上に無い」と確認した時点で消す。
+                let _ = self.lock.clear_record();
             }
         }
     }

@@ -106,6 +106,11 @@ pub fn decode_nlmsgerr(payload: &[u8]) -> Result<NlAck, NetError> {
     };
     // 元要求ヘッダは payload[4..20]。nlmsg_seq はその先頭から 8..12 バイト目（payload[12..16]）。
     // ヘッダ 16 バイトが揃っていない（切り詰められた）場合は None。
+    // 5..=19 バイトは「ACK の 4 バイトでも、元要求ヘッダまで揃った形でもない」中途半端な長さで、
+    // 切り詰めと区別できない破損なので DataLoss とする。
+    if payload.len() > 4 && payload.len() < 4 + NLMSG_HEADER_LEN {
+        return Err(bad("nlmsgerr payload has a partial original header"));
+    }
     let request_seq = if payload.len() >= 4 + NLMSG_HEADER_LEN {
         payload
             .get(12..16)
@@ -361,7 +366,7 @@ mod socket {
                 let deadline = Deadline::after(timeout);
                 let _turn = self.gate.acquire(&deadline, timeout)?;
                 let seq = self.seq.next();
-                let dump = flags & (NLM_F_ROOT | NLM_F_MATCH) == (NLM_F_ROOT | NLM_F_MATCH);
+                let dump = is_dump_request(msg_type, flags);
                 let mut builder =
                     NlMsgBuilder::new(msg_type, flags | NLM_F_REQUEST | NLM_F_ACK, seq, 0);
                 build(&mut builder)?;
@@ -584,6 +589,14 @@ mod socket {
                 format!("netlink dump for seq {seq} was interrupted (NLM_F_DUMP_INTR); retry"),
             )
         };
+        // 期限後に届いた ACK / DONE を成功として返さない（全体期限の契約。REPAIR-5）。
+        let finish = |messages: Vec<NetlinkReplyMessage>| {
+            if deadline.remaining().is_zero() {
+                Err(timed_out())
+            } else {
+                Ok(NetlinkReply { seq, messages })
+            }
+        };
         loop {
             let data = match recv(deadline.remaining()) {
                 Err(e) if e.code() == NetErrorCode::Timeout => return Err(timed_out()),
@@ -611,7 +624,7 @@ mod socket {
                             if dump {
                                 continue;
                             }
-                            return Ok(NetlinkReply { seq, messages });
+                            return finish(messages);
                         }
                         let errno = ack.errno();
                         return Err(NetError::new(
@@ -623,11 +636,11 @@ mod socket {
                         // dump が途中で失敗すると、カーネルは DONE のペイロードに負の errno を載せる。
                         // ペイロードが空なら成功、それ以外は先頭の i32 を判定する。
                         if msg.payload().is_empty() {
-                            return Ok(NetlinkReply { seq, messages });
+                            return finish(messages);
                         }
                         let ack = decode_nlmsgerr(msg.payload())?;
                         if ack.is_ack() {
-                            return Ok(NetlinkReply { seq, messages });
+                            return finish(messages);
                         }
                         let errno = ack.errno();
                         return Err(NetError::new(
@@ -664,6 +677,16 @@ mod socket {
                 return Err(timed_out());
             }
         }
+    }
+
+    /// 要求が dump か。`NLM_F_DUMP`（`NLM_F_ROOT | NLM_F_MATCH`）は NEW 系の `NLM_F_REPLACE | NLM_F_EXCL`
+    /// と同じビットなので、rtnetlink の GET 系（`msg_type & 3 == 2`、`RTM_BASE`＝16 以上）の場合だけ
+    /// dump とみなす。NEW 要求を dump と誤判定すると DONE を待ち続けて時間切れになる。
+    fn is_dump_request(msg_type: u16, flags: u16) -> bool {
+        const RTM_BASE: u16 = 16;
+        msg_type >= RTM_BASE
+            && msg_type & 3 == 2
+            && flags & (NLM_F_ROOT | NLM_F_MATCH) == (NLM_F_ROOT | NLM_F_MATCH)
     }
 
     /// errno を `NetErrorCode` へ写す（メッセージは英語で syscall 名と errno 数値のみ）。
@@ -1055,6 +1078,30 @@ mod socket {
             assert!(r.messages().is_empty());
         }
 
+        /// REPAIR-5: 期限後に届いた ACK は成功にせず Timeout。
+        #[test]
+        fn late_ack_after_deadline_is_timeout() {
+            let total = Duration::from_millis(30);
+            let deadline = Deadline::after(total);
+            let mut once = Some(err_dgram(5, 0, 5));
+            let e = await_reply(5, &deadline, total, |_| {
+                std::thread::sleep(Duration::from_millis(80));
+                Ok(once.take().expect("one"))
+            })
+            .expect_err("late");
+            assert_eq!(e.code(), NetErrorCode::Timeout);
+        }
+
+        /// NET-11: NEW 要求の REPLACE|EXCL は dump ではない（ROOT|MATCH と同ビット）。
+        #[test]
+        fn replace_excl_on_new_is_not_dump() {
+            // RTM_NEWADDR = 20（&3 == 0）、RTM_GETADDR = 22（&3 == 2）。
+            let f = NLM_F_ROOT | NLM_F_MATCH;
+            assert!(!is_dump_request(20, f));
+            assert!(is_dump_request(22, f));
+            assert!(!is_dump_request(22, NLM_F_ROOT));
+        }
+
         /// NET-11: seq 不一致の ACK は破棄して待ち続け、一致したものを採用する。
         #[test]
         fn mismatched_seq_is_discarded_then_match_succeeds() {
@@ -1409,10 +1456,13 @@ mod tests {
         );
         let short = decode_nlmsgerr(&payload(-2, None)).expect("no header");
         assert_eq!((short.errno(), short.request_seq()), (2, None));
-        // 元ヘッダが 16 バイト未満なら request_seq は読まない。
+        // 5..=19 バイト（元ヘッダが中途半端）は DataLoss。
         let mut cut = payload(-2, Some(5));
         cut.truncate(4 + 12);
-        assert_eq!(decode_nlmsgerr(&cut).expect("cut").request_seq(), None);
+        assert_eq!(
+            decode_nlmsgerr(&cut).expect_err("partial").code(),
+            NetErrorCode::DataLoss
+        );
     }
 
     /// NET-11: 不正なペイロードは DataLoss（3 バイト・正値・i32::MIN・空）。

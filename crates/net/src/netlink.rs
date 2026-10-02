@@ -189,6 +189,8 @@ impl NlMsgHeader {
 #[derive(Debug)]
 pub struct NlMsgBuilder {
     buf: Vec<u8>,
+    /// 末尾要素のパディングを含まない論理長。`finish` が `nlmsg_len` として書く（ワイヤーレイアウト参照）。
+    logical_len: usize,
 }
 
 impl NlMsgBuilder {
@@ -200,7 +202,10 @@ impl NlMsgBuilder {
         buf.extend_from_slice(&flags.to_ne_bytes());
         buf.extend_from_slice(&seq.to_ne_bytes());
         buf.extend_from_slice(&pid.to_ne_bytes());
-        Self { buf }
+        Self {
+            buf,
+            logical_len: NLMSG_HEADER_LEN,
+        }
     }
 
     /// 追記後の長さが上限内か確認する。
@@ -222,6 +227,7 @@ impl NlMsgBuilder {
         let padded = align(bytes.len()).ok_or_else(|| invalid("fixed header too large"))?;
         self.check_room(padded)?;
         self.buf.extend_from_slice(bytes);
+        self.logical_len = self.buf.len();
         self.pad();
         Ok(())
     }
@@ -246,6 +252,7 @@ impl NlMsgBuilder {
         self.buf.extend_from_slice(&rta_len.to_ne_bytes());
         self.buf.extend_from_slice(&raw_type.to_ne_bytes());
         self.buf.extend_from_slice(payload);
+        self.logical_len = self.buf.len();
         self.pad();
         Ok(())
     }
@@ -261,25 +268,39 @@ impl NlMsgBuilder {
         }
         self.check_room(ATTR_HEADER_LEN)?;
         let start = self.buf.len();
+        let saved_logical = self.logical_len;
         self.buf.extend_from_slice(&0u16.to_ne_bytes());
         self.buf
             .extend_from_slice(&(attr_type | NLA_F_NESTED).to_ne_bytes());
-        f(self)?;
-        let total = self.buf.len() - start;
-        let rta_len =
-            u16::try_from(total).map_err(|_| invalid("nested attribute length exceeds u16"))?;
-        let slot = self
-            .buf
-            .get_mut(start..start + 2)
-            .ok_or_else(|| invalid("nested attribute bookkeeping error"))?;
-        slot.copy_from_slice(&rta_len.to_ne_bytes());
-        Ok(())
+        // 失敗時は追記済みバイトを start まで巻き戻し、不正な rta_len を持つ半端な属性を残さない（REPAIR-2）。
+        let result = f(self).and_then(|()| {
+            let total = self.buf.len() - start;
+            let rta_len =
+                u16::try_from(total).map_err(|_| invalid("nested attribute length exceeds u16"))?;
+            let slot = self
+                .buf
+                .get_mut(start..start + 2)
+                .ok_or_else(|| invalid("nested attribute bookkeeping error"))?;
+            slot.copy_from_slice(&rta_len.to_ne_bytes());
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                self.logical_len = self.buf.len();
+                Ok(())
+            }
+            Err(e) => {
+                self.buf.truncate(start);
+                self.logical_len = saved_logical;
+                Err(e)
+            }
+        }
     }
 
-    /// `nlmsg_len` を確定してメッセージ全体を返す。
+    /// `nlmsg_len`（末尾パディングを除く論理長）を確定し、パディング込みのバイト列を返す。
     pub fn finish(mut self) -> Result<Vec<u8>, NetError> {
         let len =
-            u32::try_from(self.buf.len()).map_err(|_| invalid("message length exceeds u32"))?;
+            u32::try_from(self.logical_len).map_err(|_| invalid("message length exceeds u32"))?;
         if len > MAX_MESSAGE_LEN {
             return Err(invalid("message exceeds maximum length"));
         }
@@ -541,8 +562,10 @@ mod tests {
         b.put_fixed(&[1, 2, 3, 4, 5]).unwrap();
         let bytes = b.finish().unwrap();
         assert_eq!(bytes.len(), 24);
-        assert_eq!(NlMsgHeader::decode(&bytes).unwrap().len(), 24);
+        assert_eq!(NlMsgHeader::decode(&bytes).unwrap().len(), 21);
         assert_eq!(&bytes[16..], &[1, 2, 3, 4, 5, 0, 0, 0]);
+        let msg = NlMsgIter::new(&bytes).next().unwrap().unwrap();
+        assert_eq!(msg.payload(), &[1, 2, 3, 4, 5]);
     }
 
     /// NET-11: rtattr のパディングと rta_len。
@@ -702,6 +725,31 @@ mod tests {
             }
         }
         assert_eq!(code(&err.unwrap()), NetErrorCode::InvalidArgument);
+    }
+
+    /// REPAIR-2: put_nested 失敗時は追記済みバイトを巻き戻し、以後の finish が壊れた属性を含まない。
+    #[test]
+    fn nested_failure_rolls_back() {
+        let mut b = NlMsgBuilder::new(1, 0, 0, 0);
+        b.put_attr(1, &[9]).unwrap();
+        let r = b.put_nested(2, |b| {
+            b.put_attr(1, &[1, 2, 3])?;
+            b.put_attr(0x4000, &[])
+        });
+        assert!(r.is_err());
+        let r = b.put_nested(3, |b| {
+            for _ in 0..2 {
+                b.put_attr(1, &vec![0; 40000])?;
+            }
+            Ok(())
+        });
+        assert!(r.is_err());
+        let bytes = b.finish().unwrap();
+        assert_eq!(bytes.len(), 24);
+        let msg = NlMsgIter::new(&bytes).next().unwrap().unwrap();
+        let attrs: Vec<_> = msg.attrs(0).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].payload(), &[9]);
     }
 
     /// REPAIR-2: 全バイト値・切り詰めでも panic しない。

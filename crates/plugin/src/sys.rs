@@ -565,6 +565,16 @@ mod connect_abi {
     }
 }
 
+/// `sockaddr_un` の `sun_path` 先頭オフセット（Linux: 2、macOS: 2）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+const SUN_PATH_OFFSET: usize = 2;
+
 /// `path` の UDS へ `deadline` までに非ブロッキング connect し、接続済みの `UnixStream` を返す
 /// （非ブロッキングのまま。呼び出し側が blocking へ戻す）。
 ///
@@ -671,16 +681,6 @@ pub(crate) fn connect_unix(
     }
 }
 
-/// `sockaddr_un` の `sun_path` 先頭オフセット（Linux: 2、macOS: 2）。
-#[cfg(any(
-    target_os = "macos",
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )
-))]
-const SUN_PATH_OFFSET: usize = 2;
-
 /// 未対応の OS・アーキテクチャでは peer を検証できないため常に拒否する（fail-closed）。
 #[cfg(not(any(
     target_os = "macos",
@@ -760,6 +760,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[cfg(target_os = "linux")]
     unsafe extern "C" {
         // SAFETY（宣言そのものの妥当性）: POSIX の `int listen(int, int)` と同じ型・幅。
         fn listen(sockfd: i32, backlog: i32) -> i32;
@@ -769,6 +770,7 @@ mod tests {
     /// 期限付き connect は `TimedOut` で戻る（Linux の満杯時 `EAGAIN` 経路。macOS は即
     /// `ECONNREFUSED` のため対象外）。backlog は std の既定が大きく埋めにくいため、テスト内で
     /// `listen(fd, 0)` を再発行して縮める。
+    #[cfg(target_os = "linux")]
     #[test]
     fn repair5_connect_unix_times_out_when_backlog_is_full() {
         use std::time::{Duration, Instant};

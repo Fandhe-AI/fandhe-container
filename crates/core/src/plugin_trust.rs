@@ -11,7 +11,9 @@
 //!
 //! # 検証方式
 //!
-//! - ディレクトリは `O_PATH|O_DIRECTORY|O_NOFOLLOW` で開いた fd への `fstat` で判定する
+//! - ディレクトリは `/` から 1 要素ずつ `O_PATH|O_DIRECTORY|O_NOFOLLOW` の fd 相対 open で辿り、
+//!   ルート・全祖先・探索先のそれぞれを開いた fd への `fstat` で判定する（中間 symlink は拒否、
+//!   祖先の所有者・モードも探索先と同一基準で検証する）
 //! - ファイルは検証済みディレクトリ fd からの相対 open（`openat`）で開き、開いた同一 fd への
 //!   `fstat` で判定する。パスの再 stat / lstat はしない
 //! - 判定基準はディレクトリ・ファイルとも同一で、所有者が root か実効 UID であり、かつ
@@ -19,7 +21,8 @@
 //!
 //! # 限界（REPAIR-3。実装済みを装わない）
 //!
-//! - 祖先ディレクトリの所有者・権限は見ない（探索先のパス解決で中間要素の symlink は辿る）
+//! - sticky bit 付きの祖先（`/tmp` 等）も例外にせず拒否する（fail-closed）。plugin は
+//!   他ユーザーが書き込めない祖先配下にのみ置ける
 //! - symlink は現状すべて拒否する。実体解決は TASK-122.2（#277）の将来仕様
 //! - ハッシュ・署名の照合は未実装（TASK-122.3・#279）。信頼できる所有者が置いた任意の
 //!   バイナリは本モジュールを通る
@@ -35,7 +38,7 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::plugin_discovery::PluginCandidate;
 use crate::traits::{ErrorCode, TraitError};
@@ -241,20 +244,85 @@ mod imp {
         File::from(fd.as_fd().try_clone_to_owned()?).metadata()
     }
 
-    /// 探索先ディレクトリを開いて fstat で検証し、fd を固定して返す。
+    /// 開いた dir fd を fstat で検証する（ディレクトリであること・所有者・モード）。
+    fn check_dir_fd(fd: &OwnedFd, shown: &Path, runner_uid: u32) -> Result<(), PluginTrustError> {
+        let err = |k| PluginTrustError::new(k, TrustTarget::Directory, shown);
+        let md = fstat(fd).map_err(|_| err(PluginTrustErrorKind::Io))?;
+        if !md.is_dir() {
+            return Err(err(PluginTrustErrorKind::NotDirectory));
+        }
+        check_owner_and_mode(md.uid(), md.mode(), runner_uid).map_err(err)
+    }
+
+    /// 探索先ディレクトリを `/` から 1 要素ずつ fd 相対（`O_PATH|O_DIRECTORY|O_NOFOLLOW`）で
+    /// 辿り、ルート・全祖先・探索先のすべてを fstat で検証して最終 fd を固定して返す。
+    ///
+    /// 祖先の symlink は `O_NOFOLLOW|O_DIRECTORY` により `NotDirectory` で拒否され、祖先の
+    /// 所有者・モードが不正（他ユーザー書き込み可能な `/tmp` 等）なら拒否する（PLUG-11）。
+    /// `.`・`..` を含むパスは `InvalidPath`。
     pub fn verify_plugin_dir(dir: &Path) -> Result<VerifiedPluginDir, PluginTrustError> {
+        walk_verify(dir, None)
+    }
+
+    /// [`verify_plugin_dir`] の試験用変種。`anchor`（`dir` の祖先または `dir` 自身）までの
+    /// 要素は symlink 拒否つきで辿るが所有者・モードを検証せず、`anchor` より下だけを検証する。
+    /// 開発機・CI で上位ディレクトリの権限が環境依存になる試験のためのもので、本番経路では
+    /// 使わない（`anchor` 以上の信頼は呼び出し側の責任。PLUG-11）。
+    #[doc(hidden)]
+    pub fn verify_plugin_dir_below(
+        anchor: &Path,
+        dir: &Path,
+    ) -> Result<VerifiedPluginDir, PluginTrustError> {
+        if !dir.starts_with(anchor) {
+            return Err(PluginTrustError::new(
+                PluginTrustErrorKind::InvalidPath,
+                TrustTarget::Directory,
+                dir,
+            ));
+        }
+        walk_verify(dir, Some(anchor))
+    }
+
+    fn walk_verify(
+        dir: &Path,
+        anchor: Option<&Path>,
+    ) -> Result<VerifiedPluginDir, PluginTrustError> {
         let err = |k| PluginTrustError::new(k, TrustTarget::Directory, dir);
         if !dir.is_absolute() {
             return Err(err(PluginTrustErrorKind::InvalidPath));
         }
-        let c = CString::new(dir.as_os_str().as_bytes())
-            .map_err(|_| err(PluginTrustErrorKind::InvalidPath))?;
-        let fd = sys::open_dir_path_nofollow(None, &c).map_err(|e| err(map_sys(e, true)))?;
-        let md = fstat(&fd).map_err(|_| err(PluginTrustErrorKind::Io))?;
-        if !md.is_dir() {
-            return Err(err(PluginTrustErrorKind::NotDirectory));
+        let runner_uid = sys::effective_uid();
+        let mut shown = PathBuf::new();
+        let mut cur: Option<OwnedFd> = None;
+        for comp in dir.components() {
+            let name: &OsStr = match comp {
+                Component::RootDir => OsStr::new("/"),
+                Component::Normal(n) => n,
+                _ => return Err(err(PluginTrustErrorKind::InvalidPath)),
+            };
+            shown.push(name);
+            let c = CString::new(name.as_bytes())
+                .map_err(|_| err(PluginTrustErrorKind::InvalidPath))?;
+            let parent = cur.as_ref().map(|f| f.as_fd());
+            let fd = sys::open_dir_path_nofollow(parent, &c).map_err(|e| {
+                PluginTrustError::new(map_sys(e, true), TrustTarget::Directory, &shown)
+            })?;
+            // anchor 以上（試験用変種のみ）は所有者・モードを検証せず、種別だけ確認する。
+            if anchor.is_some_and(|a| a.starts_with(&shown)) {
+                let md = fstat(&fd).map_err(|_| err(PluginTrustErrorKind::Io))?;
+                if !md.is_dir() {
+                    return Err(PluginTrustError::new(
+                        PluginTrustErrorKind::NotDirectory,
+                        TrustTarget::Directory,
+                        &shown,
+                    ));
+                }
+            } else {
+                check_dir_fd(&fd, &shown, runner_uid)?;
+            }
+            cur = Some(fd);
         }
-        check_owner_and_mode(md.uid(), md.mode(), sys::effective_uid()).map_err(err)?;
+        let fd = cur.ok_or_else(|| err(PluginTrustErrorKind::InvalidPath))?;
         Ok(VerifiedPluginDir {
             fd,
             path: dir.to_path_buf(),
@@ -324,6 +392,15 @@ mod imp {
         ))
     }
 
+    /// 非 Linux は常に拒否する（試験用変種。[`verify_plugin_dir`] と同じ）。
+    #[doc(hidden)]
+    pub fn verify_plugin_dir_below(
+        _anchor: &Path,
+        dir: &Path,
+    ) -> Result<VerifiedPluginDir, PluginTrustError> {
+        verify_plugin_dir(dir)
+    }
+
     impl VerifiedPluginDir {
         /// 非 Linux では到達しない（`verify_plugin_dir` が常に拒否する）。
         pub fn verify_file(
@@ -339,6 +416,8 @@ mod imp {
     }
 }
 
+#[doc(hidden)]
+pub use imp::verify_plugin_dir_below;
 pub use imp::{VerifiedPluginDir, verify_plugin_dir};
 
 /// 候補 1 件の検証（親ディレクトリ → ファイルの順）。

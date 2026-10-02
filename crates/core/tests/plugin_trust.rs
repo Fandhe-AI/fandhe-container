@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use fandhe_container_core::plugin_trust::{
     PluginTrustErrorKind, TrustTarget, check_owner_and_mode, verify_plugin_dir,
+    verify_plugin_dir_below,
 };
 
 /// テスト用の一意な一時ディレクトリ（終了時に削除）。
@@ -16,15 +17,35 @@ struct Tmp(PathBuf);
 
 impl Tmp {
     fn new(tag: &str) -> Self {
-        let p = std::env::temp_dir().join(format!(
+        // /tmp（sticky・other 書き込み可）配下は祖先検証で拒否されるため、cargo が用意する
+        // target 配下の専用ディレクトリを使う。
+        let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
             "fandhe-plugin-trust-{}-{}",
             std::process::id(),
             tag
         ));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).expect("create tmp dir");
+        // umask（002 等）に依存させず、祖先検証を通る 0o755 に固定する。
+        fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod tmp dir");
         Self(p)
     }
+}
+
+/// 試験の信頼起点（これより下だけを検証する。上位の権限が開発機・CI で異なるため）。
+fn anchor() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+}
+
+/// 試験用: anchor より下だけを検証する。
+fn verify_dir(
+    dir: &std::path::Path,
+) -> Result<
+    fandhe_container_core::plugin_trust::VerifiedPluginDir,
+    fandhe_container_core::plugin_trust::PluginTrustError,
+> {
+    verify_plugin_dir_below(&anchor(), dir)
 }
 
 impl Drop for Tmp {
@@ -83,7 +104,7 @@ mod linux {
     #[test]
     fn plug11_task122_1_accepts_and_hands_over_same_fd() {
         let tmp = setup("ok", 0o755, 0o755);
-        let dir = verify_plugin_dir(&tmp.0).expect("dir ok");
+        let dir = verify_dir(&tmp.0).expect("dir ok");
         let v = dir.verify_file(OsStr::new(NAME)).expect("file ok");
         let md = fs::metadata(tmp.0.join(NAME)).unwrap();
         assert_eq!(v.owner_uid(), md.uid());
@@ -97,7 +118,7 @@ mod linux {
     fn plug11_task122_1_rejects_writable_file() {
         for mode in [0o775, 0o757, 0o777] {
             let tmp = setup(&format!("fw{mode:o}"), 0o755, mode);
-            let dir = verify_plugin_dir(&tmp.0).expect("dir ok");
+            let dir = verify_dir(&tmp.0).expect("dir ok");
             let err = dir.verify_file(OsStr::new(NAME)).expect_err("reject");
             assert_eq!(err.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
             assert_eq!(err.target(), TrustTarget::File);
@@ -108,7 +129,7 @@ mod linux {
     fn plug11_task122_1_rejects_writable_dir() {
         for mode in [0o775, 0o777, 0o1777] {
             let tmp = setup(&format!("dw{mode:o}"), mode, 0o755);
-            let err = verify_plugin_dir(&tmp.0).expect_err("reject");
+            let err = verify_dir(&tmp.0).expect_err("reject");
             assert_eq!(err.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
             assert_eq!(err.target(), TrustTarget::Directory);
         }
@@ -119,21 +140,74 @@ mod linux {
         let tmp = setup("sym", 0o755, 0o755);
         let link = tmp.0.join("fandhe-container-plugin-link");
         symlink(tmp.0.join(NAME), &link).unwrap();
-        let dir = verify_plugin_dir(&tmp.0).expect("dir ok");
+        let dir = verify_dir(&tmp.0).expect("dir ok");
         let err = dir
             .verify_file(OsStr::new("fandhe-container-plugin-link"))
             .expect_err("reject");
         assert_eq!(err.kind(), PluginTrustErrorKind::NotRegularFile);
 
-        let dlink = std::env::temp_dir().join(format!(
+        let dlink = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
             "fandhe-plugin-trust-{}-dirlink",
             std::process::id()
         ));
         let _ = fs::remove_file(&dlink);
         symlink(&tmp.0, &dlink).unwrap();
-        let err = verify_plugin_dir(&dlink).expect_err("reject");
+        let err = verify_dir(&dlink).expect_err("reject");
         let _ = fs::remove_file(&dlink);
         assert_eq!(err.kind(), PluginTrustErrorKind::NotDirectory);
+    }
+
+    #[test]
+    fn plug11_task122_1_rejects_writable_ancestor() {
+        // 祖先（中間ディレクトリ）が group 書き込み可なら、探索先自体が 0o755 でも拒否する。
+        let tmp = Tmp::new("anc");
+        let mid = tmp.0.join("mid");
+        let leaf = mid.join("leaf");
+        fs::create_dir_all(&leaf).unwrap();
+        chmod(&leaf, 0o755);
+        chmod(&mid, 0o775);
+        let err = verify_dir(&leaf).expect_err("reject");
+        assert_eq!(err.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
+        assert_eq!(err.path(), mid.as_path());
+        chmod(&mid, 0o755);
+        verify_dir(&leaf).expect("ok once ancestor is tightened");
+    }
+
+    #[test]
+    fn plug11_task122_1_rejects_sticky_world_writable_ancestor() {
+        // /tmp 相当（1777）配下の探索先も拒否する。
+        let tmp = Tmp::new("sticky");
+        let leaf = tmp.0.join("leaf");
+        fs::create_dir(&leaf).unwrap();
+        chmod(&leaf, 0o755);
+        chmod(&tmp.0, 0o1777);
+        let err = verify_dir(&leaf).expect_err("reject");
+        assert_eq!(err.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
+        assert_eq!(err.path(), tmp.0.as_path());
+        chmod(&tmp.0, 0o755);
+    }
+
+    #[test]
+    fn plug11_task122_1_rejects_symlink_ancestor() {
+        let tmp = Tmp::new("ancsym");
+        let real = tmp.0.join("real");
+        fs::create_dir_all(real.join("leaf")).unwrap();
+        chmod(&real, 0o755);
+        chmod(&real.join("leaf"), 0o755);
+        let link = tmp.0.join("link");
+        symlink(&real, &link).unwrap();
+        let err = verify_dir(&link.join("leaf")).expect_err("reject");
+        assert_eq!(err.kind(), PluginTrustErrorKind::NotDirectory);
+        assert_eq!(err.path(), link.as_path());
+    }
+
+    #[test]
+    fn plug11_task122_1_rejects_dotdot_components() {
+        let tmp = Tmp::new("dotdot");
+        fs::create_dir(tmp.0.join("a")).unwrap();
+        chmod(&tmp.0.join("a"), 0o755);
+        let err = verify_dir(&tmp.0.join("a").join("..")).expect_err("reject");
+        assert_eq!(err.kind(), PluginTrustErrorKind::InvalidPath);
     }
 
     #[test]
@@ -142,7 +216,7 @@ mod linux {
         let sub = tmp.0.join("subdir");
         fs::create_dir(&sub).unwrap();
         chmod(&sub, 0o755);
-        let dir = verify_plugin_dir(&tmp.0).expect("dir ok");
+        let dir = verify_dir(&tmp.0).expect("dir ok");
         let err = dir.verify_file(OsStr::new("subdir")).expect_err("reject");
         assert_eq!(err.kind(), PluginTrustErrorKind::NotRegularFile);
     }
@@ -150,7 +224,7 @@ mod linux {
     #[test]
     fn plug11_task122_1_held_fd_survives_path_replacement() {
         let tmp = setup("swap", 0o755, 0o755);
-        let dir = verify_plugin_dir(&tmp.0).expect("dir ok");
+        let dir = verify_dir(&tmp.0).expect("dir ok");
         let v = dir.verify_file(OsStr::new(NAME)).expect("file ok");
         let other = tmp.0.join("other");
         fs::write(&other, b"evil").unwrap();
@@ -168,7 +242,7 @@ mod linux {
         assert_eq!(te.code(), ErrorCode::InvalidArgument);
 
         let tmp = setup("inv", 0o755, 0o755);
-        let dir = verify_plugin_dir(&tmp.0).expect("dir ok");
+        let dir = verify_dir(&tmp.0).expect("dir ok");
         for bad in ["../x", "a/b", "..", "."] {
             let err = dir.verify_file(OsStr::new(bad)).expect_err("reject");
             assert_eq!(err.kind(), PluginTrustErrorKind::InvalidPath, "{bad}");
@@ -180,7 +254,7 @@ mod linux {
         let te: TraitError = err.into();
         assert_eq!(te.code(), ErrorCode::Internal);
 
-        let err = verify_plugin_dir(&tmp.0.join("nope")).expect_err("reject");
+        let err = verify_dir(&tmp.0.join("nope")).expect_err("reject");
         assert_eq!(err.kind(), PluginTrustErrorKind::Io);
     }
 
@@ -190,13 +264,44 @@ mod linux {
         let dirs = [PluginSearchDir::new(PluginDirKind::User, tmp.0.clone())];
         let got = discover_candidates(&dirs).expect("discover");
         assert_eq!(got.len(), 1);
-        let v = verify_candidate(&got[0]).expect("verified");
+        // 祖先の権限は環境依存のため anchor 起点の変種で検証する（verify_candidate と同じ手順）。
+        let v = verify_dir(&tmp.0)
+            .and_then(|d| d.verify_file(OsStr::new(NAME)))
+            .expect("verified");
         assert_eq!(v.path(), tmp.0.join(NAME));
 
         chmod(&tmp.0.join(NAME), 0o777);
-        let err = verify_candidate(&got[0]).expect_err("reject");
+        let err = verify_dir(&tmp.0)
+            .and_then(|d| d.verify_file(OsStr::new(NAME)))
+            .expect_err("reject");
         assert_eq!(err.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
         let te: TraitError = err.into();
         assert_eq!(te.code(), ErrorCode::PermissionDenied);
+    }
+
+    #[test]
+    fn plug11_task122_1_verify_candidate_rejects_world_writable_tmp_ancestor() {
+        // /tmp（sticky・other 書き込み可）は祖先として拒否される。
+        let base = Path::new("/tmp");
+        let md = fs::metadata(base).expect("/tmp");
+        assert_ne!(
+            md.mode() & 0o002,
+            0,
+            "/tmp is expected to be world-writable"
+        );
+        let tmp = base.join(format!("fandhe-plugin-trust-{}-tmpanc", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir(&tmp).unwrap();
+        chmod(&tmp, 0o755);
+        let f = tmp.join(NAME);
+        fs::write(&f, b"x").unwrap();
+        chmod(&f, 0o755);
+        let dirs = [PluginSearchDir::new(PluginDirKind::User, tmp.clone())];
+        let got = discover_candidates(&dirs).expect("discover");
+        let res = verify_candidate(&got[0]);
+        let _ = fs::remove_dir_all(&tmp);
+        let err = res.expect_err("reject");
+        assert_eq!(err.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
+        assert_eq!(err.path(), base);
     }
 }

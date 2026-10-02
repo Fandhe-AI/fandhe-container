@@ -12,7 +12,7 @@
 //!   bind 直後の umask 次第でも他 UID が接続できる窓は生じない（0600 化は多層防御）
 //! - 配置ディレクトリへの経路は `canonicalize` 後にルートから 1 要素ずつ `openat(O_NOFOLLOW)` で
 //!   辿り（検証後に祖先が symlink へ差し替わると失敗）、bind 自体も検証済み fd 基準で行う
-//!   （Linux は `/proc/self/fd/<fd>/<name>`。祖先パスを再解決しない。macOS は残余あり: `bind_in_dir` 参照）
+//!   （Linux は `/proc/self/fd/<fd>/<name>`。祖先パスを再解決しない。macOS は残余あり: `bind_target` 参照）
 //! - 配置ディレクトリは 1 度だけ開いた fd（検証対象そのもの）を保持し、bind 後の 0600 化
 //!   （`fchmodat(dirfd, name, AT_SYMLINK_NOFOLLOW)`）と Drop 時の削除（`unlinkat(dirfd, name)`）は
 //!   その fd 基準で行う。パスを再解決しないため、検証後に中間要素・`..`・symlink が差し替わっても
@@ -20,6 +20,9 @@
 //! - 接続先として公開する [`UdsListener::path`] は、検証済み配置ディレクトリの解決後パス
 //!   （`canonicalize` 結果）＋ socket 名とする。呼び出し側が渡した symlink を含む経路は保持しない
 //!   ため、bind 後にその symlink が差し替わっても、`path()` を使う client が別の接続先へ誘導されない
+//! - 公開パスと bind に使うパスの両方が `sockaddr_un.sun_path`（Linux 108・macOS 104 バイト。終端
+//!   NUL 込み）に収まることを bind 前に確認し、超える場合は socket を作らず `InvalidArgument` で
+//!   拒否する（bind できても公開パスで接続できない構成を作らない。PLUG-2）
 //! - 残余: 0700 の自 UID 所有ディレクトリ内でエントリを差し替えられるのは同一 UID のみで、
 //!   同一 UID は脅威モデル外（socket と同一性の照合は行わず、ディレクトリ fd 基準で名前を操作する）
 //! - accept した接続の peer credential（`SO_PEERCRED` / `getpeereid`。`crate::sys`）を検証し、
@@ -67,7 +70,9 @@ impl UdsListener {
     /// 配置ディレクトリ（symlink 不可・自 UID 所有・0700 相当）を検証してから bind する。
     /// 相対パスは bind 時点の絶対パスへ変換し、配置ディレクトリの symlink を解決した実体のパスを
     /// 保持する（Drop 時の cwd 変更・bind 後の symlink 差し替えの影響を避ける。[`Self::path`] 参照）。
-    /// stale 処理は TASK-123・TASK-124（PLUG-12）。
+    /// 解決後のパス（[`Self::path`]）が `sun_path` の長さ制限を超える場合は `InvalidArgument`
+    /// （Linux は bind に使う `/proc/self/fd/<fd>/<名前>` も同じ制限を受けるため、socket 名が
+    /// 長い場合も拒否する）。stale 処理は TASK-123・TASK-124（PLUG-12）。
     pub fn bind(path: &Path) -> Result<Self, PluginError> {
         // `..` は bind 時点とそれ以降で解決先が変わりうるため拒否する（`std::path::absolute` は
         // `..` を残す。PLUG-12）。
@@ -236,27 +241,45 @@ mod imp {
         Ok((dir, canonical))
     }
 
-    /// 検証済みディレクトリ fd 基準で `name` に bind する（PLUG-12）。
+    /// `sockaddr_un.sun_path` の容量（終端 NUL を含むバイト数）。Linux は 108。
+    #[cfg(target_os = "linux")]
+    pub(super) const SUN_PATH_CAPACITY: usize = 108;
+    /// `sockaddr_un.sun_path` の容量（終端 NUL を含むバイト数）。macOS・BSD 系は 104。
+    #[cfg(not(target_os = "linux"))]
+    pub(super) const SUN_PATH_CAPACITY: usize = 104;
+
+    /// `p` が `sun_path` に収まる（終端 NUL の 1 バイトを残せる）ことを確認する。
+    /// 収まらないパスは bind も connect もできないため `InvalidArgument` で拒否する（PLUG-2）。
+    pub(super) fn check_sun_path_len(p: &Path) -> Result<(), PluginError> {
+        if p.as_os_str().as_bytes().len() >= SUN_PATH_CAPACITY {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                "socket path is too long",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 検証済みディレクトリ fd 基準で bind するために kernel へ渡すパスを組み立てる（PLUG-12）。
     ///
-    /// Linux: `/proc/self/fd/<fd>/<name>` 経由で bind するため、kernel が検証済み fd の指す
-    /// ディレクトリ直下に socket を作る（祖先パスの再解決なし。`/proc` 不在なら失敗＝fail-closed）。
-    /// 他の unix（macOS）: `bindat` 相当が無いため `canonical/name` へ bind し、直後の
+    /// Linux: `/proc/self/fd/<fd>/<name>`。kernel が検証済み fd の指すディレクトリ直下に socket を
+    /// 作る（祖先パスの再解決なし。`/proc` 不在なら bind が失敗＝fail-closed）。
+    /// 他の unix（macOS）: `bindat` 相当が無いため `canonical/name`（＝公開パス）へ bind し、直後の
     /// `configure`（fd 基準の所有者・種別確認と 0600 化）で検証する。残余: 祖先ディレクトリの
     /// 書き込み権限を持つ他主体が bind の瞬間に差し替える窓が残る（TASK-123・TASK-124 で再検討）。
-    fn bind_in_dir(dir: &File, canonical: &Path, name: &Path) -> io::Result<UnixListener> {
+    fn bind_target(dir: &File, public: &Path, name: &Path) -> PathBuf {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
-            let _ = canonical;
-            let via_fd = Path::new("/proc/self/fd")
+            let _ = public;
+            Path::new("/proc/self/fd")
                 .join(dir.as_raw_fd().to_string())
-                .join(name);
-            UnixListener::bind(via_fd)
+                .join(name)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = dir;
-            UnixListener::bind(canonical.join(name))
+            let _ = (dir, name);
+            public.to_path_buf()
         }
     }
 
@@ -287,9 +310,14 @@ mod imp {
             let name = CString::new(file_name.as_bytes()).map_err(|_| {
                 PluginError::new(PluginErrorCode::InvalidArgument, "invalid socket path")
             })?;
-            let listener = bind_in_dir(&dir, &canonical, Path::new(file_name))
-                .map_err(|e| map_bind_error(e.kind()))?;
+            // 公開パス（client が接続に使う）と bind に使うパスの両方が `sun_path` に収まることを
+            // bind 前に確認する。短い symlink 経由で長い実体ディレクトリを指定した場合など、bind は
+            // できても公開パスでは接続できない構成を作らない（socket を作る前に拒否。PLUG-2）。
             let bound = canonical.join(file_name);
+            check_sun_path_len(&bound)?;
+            let target = bind_target(&dir, &bound, Path::new(file_name));
+            check_sun_path_len(&target)?;
+            let listener = UnixListener::bind(&target).map_err(|e| map_bind_error(e.kind()))?;
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
             let identity = sys::lstat_at(&dir, &name, &bound).ok();
             let inner = Self {
@@ -503,5 +531,24 @@ mod tests {
         for (kind, code) in cases {
             assert_eq!(map_bind_error(kind).code(), code);
         }
+    }
+
+    /// PLUG-2: `sun_path` に収まる最大長（容量 - 1 バイト。終端 NUL 分）は許可し、容量ちょうどは
+    /// `InvalidArgument` で拒否する（Linux 108・それ以外の unix 104）。
+    #[cfg(unix)]
+    #[test]
+    fn plug2_sun_path_length_boundary() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(imp::SUN_PATH_CAPACITY, 108);
+        #[cfg(target_os = "macos")]
+        assert_eq!(imp::SUN_PATH_CAPACITY, 104);
+        let fits = format!("/{}", "a".repeat(imp::SUN_PATH_CAPACITY - 2));
+        assert_eq!(fits.len(), imp::SUN_PATH_CAPACITY - 1);
+        assert_eq!(imp::check_sun_path_len(Path::new(&fits)), Ok(()));
+        let over = format!("/{}", "a".repeat(imp::SUN_PATH_CAPACITY - 1));
+        assert_eq!(over.len(), imp::SUN_PATH_CAPACITY);
+        let err = imp::check_sun_path_len(Path::new(&over)).unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(err.message(), "socket path is too long");
     }
 }

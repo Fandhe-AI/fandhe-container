@@ -502,7 +502,8 @@ pub struct RouteSpec {
 }
 
 impl RouteSpec {
-    /// dst のホスト部が 0 でない、またはゲートウェイのファミリが dst と異なれば `InvalidArgument`。
+    /// dst のホスト部が 0 でない、ゲートウェイのファミリが dst と異なる、または IPv6 リンクローカル
+    /// ゲートウェイ（`fe80::/10`）に `oif` がなければ `InvalidArgument`（カーネルは `RTA_OIF` なしを拒否する）。
     pub fn new(dst: IpPrefix, nexthop: RouteNextHop) -> Result<Self, NetError> {
         if !dst.is_network() {
             return Err(invalid("route destination has host bits set"));
@@ -511,6 +512,16 @@ impl RouteSpec {
             && family_of(gateway) != dst.family()
         {
             return Err(invalid("gateway address family differs from destination"));
+        }
+        if let RouteNextHop::Gateway {
+            gateway: IpAddr::V6(gw),
+            oif: None,
+        } = &nexthop
+            && (gw.segments()[0] & 0xffc0) == 0xfe80
+        {
+            return Err(invalid(
+                "IPv6 link-local gateway requires an output interface",
+            ));
         }
         Ok(Self { dst, nexthop })
     }
@@ -782,6 +793,17 @@ mod tests {
         );
         assert_eq!(
             code(mismatch.expect_err("family")),
+            NetErrorCode::InvalidArgument
+        );
+        let ll_no_oif = RouteSpec::new(
+            IpPrefix::default_v6(),
+            RouteNextHop::Gateway {
+                gateway: IpAddr::V6("fe80::1".parse().expect("v6")),
+                oif: None,
+            },
+        );
+        assert_eq!(
+            code(ll_no_oif.expect_err("link-local without oif")),
             NetErrorCode::InvalidArgument
         );
         assert_eq!(

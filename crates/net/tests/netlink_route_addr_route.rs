@@ -1,8 +1,8 @@
 //! address / route 追加（`RTM_NEWADDR` / `RTM_NEWROUTE`）の実機前提結合試験（NET-11・TASK-136.4・#301）。
 //!
 //! `CAP_NET_ADMIN` が必要なため既定のテスト集合から `#[ignore]` で分離する（ci.md「実機前提テスト」）。
-//! host の network namespace を変更しないよう、隔離 netns（例: `unshare -rn`）で lo のみの
-//! 状態でなければ panic で拒否する（fail-closed）。実行方法は AGENTS.md「実機前提テスト」節を参照。
+//! host の network namespace を変更しないよう、自プロセスの netns が親プロセスの netns と
+//! 異なる隔離 netns（例: `unshare -rn`）でなければ panic で拒否する（fail-closed）。実行方法は AGENTS.md「実機前提テスト」節を参照。
 //! Linux のみ。
 
 #![cfg(target_os = "linux")]
@@ -38,13 +38,31 @@ fn attr_payload(payload: &[u8], fixed_len: usize, attr_type: u16) -> Option<Vec<
         .map(|a| a.payload().to_vec())
 }
 
+/// 自プロセスと親プロセスの network namespace が別物であることを検証する（fail-closed）。
+///
+/// `unshare -rn <exe>` は unshare 自身が exec で置き換わるため、親は host netns のシェル等になる。
+/// 同一 kuid のプロセスの `/proc/<pid>/ns/net` は読めるため、読めない場合も拒否する。
+fn assert_isolated_from_parent_netns() {
+    let own = std::fs::read_link("/proc/self/ns/net").expect("read own netns link");
+    let parent_path = format!("/proc/{}/ns/net", std::os::unix::process::parent_id());
+    let parent = std::fs::read_link(&parent_path)
+        .unwrap_or_else(|e| panic!("refusing to run: cannot read parent netns {parent_path}: {e}"));
+    assert_ne!(
+        own, parent,
+        "refusing to run: same network namespace as the parent process; run under `unshare -rn` so the host network namespace is not modified"
+    );
+}
+
 /// NET-11・TASK-136.4: lo に address と route を追加し、dump で内容を確認する。
 #[test]
 #[ignore = "requires CAP_NET_ADMIN inside an isolated network namespace (e.g. unshare -rn); NET-11"]
 fn add_address_and_route_in_isolated_netns() {
     let sock = NetlinkRouteSocket::open().expect("open");
 
-    // 安全ガード: link が lo（ifindex 1）だけでなければ host netns の可能性があるため中止する。
+    // 安全ガード 1: 実行元（親プロセス）と netns が異なることを確認する。判別できなければ中止する。
+    assert_isolated_from_parent_netns();
+
+    // 安全ガード 2: link が lo（ifindex 1）だけでなければ想定外の構成のため中止する。
     let links = dump(&sock, RTM_GETLINK, &[0u8; 16]);
     let idx: Vec<u32> = links
         .messages()

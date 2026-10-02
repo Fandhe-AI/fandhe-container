@@ -81,7 +81,7 @@
 //!   user namespace 外の uid は overflowuid として見え、不一致で拒否される（安全側）。
 //! - 同一 UID の別プロセスは脅威モデル外（第 1 層は 0700 の配置ディレクトリ）。
 //! - `unsafe` を含む取得処理は `crate::sys::peer_uid`（`sys` モジュール）に閉じる。
-//! - 未実装: macOS の LOCAL_PEERCRED（#293）・別 UID 実接続の拒否試験（#295）・拒否の監査ログ（SEC-4）。
+//! - macOS は getpeereid で peer uid を取得済み。未実装は LOCAL_PEERCRED 方式（#293）・別 UID 実接続の拒否試験（#295）・拒否の監査ログ（SEC-4）。
 //!
 //! # 未実装（REPAIR-3）
 //! - 非 unix は `Unimplemented`（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る）。
@@ -1490,7 +1490,14 @@ mod tests {
     }
 
     /// PLUG-12: 実際の peer credential 経路（自己接続）で一致は Ok、ずらした期待値は拒否。
-    #[cfg(unix)]
+    /// `sys::peer_uid` が実装済みの OS・アーキテクチャに限定する（他は Unimplemented を返すため）。
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     #[test]
     fn plug12_verify_peer_accepts_same_uid_socketpair() {
         let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();

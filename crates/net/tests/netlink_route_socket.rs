@@ -34,11 +34,12 @@ fn dump_links(sock: &NetlinkRouteSocket) -> Vec<(u16, u32, Vec<u8>)> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut out = Vec::new();
     for _ in 0..64 {
-        assert!(
-            Instant::now() < deadline,
-            "dump exceeded the total deadline"
-        );
-        let data = sock.recv(Duration::from_secs(5)).expect("recv");
+        // 合計期限の残り時間を 1 回の recv 待機の上限にする（REPAIR-5）。
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "dump exceeded the total deadline");
+        let data = sock
+            .recv(remaining.min(Duration::from_secs(5)))
+            .expect("recv");
         for m in NlMsgIter::new(&data) {
             let m = m.expect("valid message");
             let h = m.header();

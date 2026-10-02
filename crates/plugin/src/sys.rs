@@ -430,12 +430,12 @@ unsafe extern "C" {
     fn getpeereid(socket: i32, euid: *mut u32, egid: *mut u32) -> i32;
 }
 
-/// 接続元の接続時点の実効 uid を返す（Linux）。取得できなければ fail-closed でエラー。
+/// 接続元の接続時点の資格情報（SO_PEERCRED）を取得する（Linux）。取得できなければ fail-closed でエラー。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
+fn peer_ucred(stream: &UnixStream) -> Result<linux::Ucred, PluginError> {
     use std::os::unix::io::AsRawFd;
     let mut ucred = linux::Ucred {
         pid: 0,
@@ -460,7 +460,30 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
             "failed to obtain peer credential",
         ));
     }
-    Ok(ucred.uid)
+    Ok(ucred)
+}
+
+/// 接続元の接続時点の実効 uid を返す（Linux）。取得できなければ fail-closed でエラー。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
+    Ok(peer_ucred(stream)?.uid)
+}
+
+/// 接続元の pid を返す（Linux。都度起動モードで応答者を spawn した子に限定するため。PLUG-7・PLUG-12）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) fn peer_pid(stream: &UnixStream) -> Result<u32, PluginError> {
+    u32::try_from(peer_ucred(stream)?.pid).map_err(|_| {
+        PluginError::new(
+            PluginErrorCode::Internal,
+            "failed to obtain peer credential",
+        )
+    })
 }
 
 /// 接続元の接続時点の実効 uid を返す（macOS）。
@@ -478,6 +501,52 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
         ));
     }
     Ok(euid)
+}
+
+/// 接続元の pid を返す（macOS。`LOCAL_PEERPID`）。
+#[cfg(target_os = "macos")]
+pub(crate) fn peer_pid(stream: &UnixStream) -> Result<u32, PluginError> {
+    use std::os::unix::io::AsRawFd;
+    /// `<sys/un.h>` の `SOL_LOCAL`。
+    const SOL_LOCAL: i32 = 0;
+    /// `<sys/un.h>` の `LOCAL_PEERPID`。
+    const LOCAL_PEERPID: i32 = 0x002;
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: libSystem の
+        // `int getsockopt(int, int, int, void *, socklen_t *)` と同じ型・幅（`socklen_t` は `u32`）。
+        fn getsockopt(
+            sockfd: i32,
+            level: i32,
+            optname: i32,
+            optval: *mut core::ffi::c_void,
+            optlen: *mut u32,
+        ) -> i32;
+    }
+    let mut pid: i32 = 0;
+    let mut len: u32 = core::mem::size_of::<i32>() as u32;
+    // SAFETY: fd は `&UnixStream` の借用中のため有効。`optval` はスタック上の `pid_t`（i32）を指し、
+    // `optlen` はそのサイズを指す有効なポインタ。
+    let rc = unsafe {
+        getsockopt(
+            stream.as_raw_fd(),
+            SOL_LOCAL,
+            LOCAL_PEERPID,
+            (&raw mut pid).cast(),
+            &raw mut len,
+        )
+    };
+    if rc != 0 || len as usize != core::mem::size_of::<i32>() {
+        return Err(PluginError::new(
+            PluginErrorCode::Internal,
+            "failed to obtain peer credential",
+        ));
+    }
+    u32::try_from(pid).map_err(|_| {
+        PluginError::new(
+            PluginErrorCode::Internal,
+            "failed to obtain peer credential",
+        )
+    })
 }
 
 // ---- 期限付き client connect（PLUG-2・REPAIR-5。TASK-107.5・#249） ----
@@ -709,6 +778,21 @@ pub(crate) fn connect_unix(
     )
 )))]
 pub(crate) fn peer_uid(_stream: &UnixStream) -> Result<u32, PluginError> {
+    Err(PluginError::new(
+        PluginErrorCode::Unimplemented,
+        "peer credential verification is not implemented for this platform",
+    ))
+}
+
+/// 未対応の OS・アーキテクチャでは peer pid を検証できないため常に拒否する（fail-closed）。
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+pub(crate) fn peer_pid(_stream: &UnixStream) -> Result<u32, PluginError> {
     Err(PluginError::new(
         PluginErrorCode::Unimplemented,
         "peer credential verification is not implemented for this platform",

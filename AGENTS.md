@@ -111,6 +111,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | 層 | 値 | 設定箇所 | 根拠 |
 | ---- | ---- | ---- | ---- |
 | テスト 1 件の応答待ち（ACK・plugin RPC・子プロセス） | 推奨 5〜10 秒（CI 設定値 10 秒） | `ci.yml` `integration-test` ジョブの env `FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"`（TASK-87.1・#40） | PoC-8 実測・REPAIR-10 (c)・REPAIR-5 |
+| plugin の ACK / RPC 応答待ち（フレーム 1 つ） | 既定 10 秒・上限 10 秒（0 と上限超過は構築不可） | `crates/plugin/src/transport.rs` の `RpcTimeout`（`UDS_RPC_TIMEOUT_DEFAULT`・`UDS_RPC_TIMEOUT_MAX`。TASK-107.6・#250） | REPAIR-5・PLUG-2・PLUG-5 |
 | 結合試験の実行ステップ | 10 分 | `integration-test` ジョブの実行ステップ `timeout-minutes: 10` | TASK-86.2（#36）・TASK-87 |
 | ジョブ全体 | `integration-test` 30 分・`bench-regression` 15 分・`ci-complete` 5 分 | 各ジョブの `timeout-minutes` | 多層防御 |
 
@@ -156,7 +157,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 上記「crate 追加時」の全項目に加えて、次を追加で用意する。
 
 - plugin 境界フレーム（長さ接頭辞フレーム。PLUG-2）の符号化・復号、壊れたフレームや長さ上限超過を拒否することのユニットテスト。フレームは型で組み立てる（REPAIR-2）。plugin からの入力は untrusted として検証する
-- plugin RPC の応答待ちがタイムアウトで打ち切られることの結合試験（REPAIR-5）
+- plugin RPC の応答待ちがタイムアウトで打ち切られることの結合試験（REPAIR-5。フレーム単位の待機は `crates/plugin/tests/transport_frame_io.rs`〔#250〕。要求・応答の往復の試験は TASK-107.7・#251）
 - PLUG-4「core 無変更」の 3 点比較（core 側ソースの sha256 一覧・`cargo tree -p <core> --locked -e normal` で見た core の依存木・core バイナリの sha256。[crate-naming.md](docs/design/crate-naming.md) 決定 3）が変化しないこと。**現状**: 判定の仕組みは TASK-109 で実装予定で未実装。plugin を通すために core 側のソースやテストを書き換えないこと（PLUG-4 違反は既存の P0 観点）
 - plugin の信頼性検証（PLUG-11: 他ユーザー書き込み可能な場所・ハッシュ不一致の plugin の登録拒否）と UDS 境界（PLUG-12: 権限・peer credential 検証）について、新しい plugin を対象にしたケース。**現状**: 検証の仕組みは TASK-109・TASK-122〜124 で実装予定で未実装
 - plugin 境界のベンチ（TASK-113 の `plugin_boundary` 系）。**現状**: 未実装

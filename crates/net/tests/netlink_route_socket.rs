@@ -1,14 +1,15 @@
-//! `NetlinkRouteSocket` の結合試験（NET-11・TASK-136.2.1・#843）。
+//! `NetlinkRouteSocket` の結合試験（NET-11・TASK-136.2.1・#843・TASK-136.2.2・#844）。
 //!
 //! 非特権で成立する RTM_GETLINK dump の往復で、送ったバイト列がカーネルへそのまま届くことを
-//! 機械照合する（seq の一致・lo の RTM_NEWLINK・NLMSG_DONE）。root 不要のため既定の結合試験集合で
+//! 機械照合する（seq の一致・lo の RTM_NEWLINK・NLMSG_DONE）。`request`（seq 採番・ACK / errno /
+//! DONE の終端判定）の実カーネル往復も読み取り要求だけで照合する。root 不要のため既定の結合試験集合で
 //! 実行する（ci.md「実機前提テスト」: 既定集合で動くテストは分離しない）。Linux のみ。
 
 #![cfg(target_os = "linux")]
 
 use std::time::{Duration, Instant};
 
-use fandhe_container_net::error::NetErrorCode;
+use fandhe_container_net::error::{NetError, NetErrorCode};
 use fandhe_container_net::netlink_route::{
     NLM_F_MATCH, NLM_F_REQUEST, NLM_F_ROOT, NLMSG_DONE, NLMSG_ERROR, NetlinkRouteSocket,
     NlMsgBuilder, NlMsgIter,
@@ -131,4 +132,96 @@ fn shared_socket_readers_each_receive_one_response() {
     seqs.sort_unstable();
     assert_eq!(seqs, vec![(RTM_NEWLINK, SEQ_A), (RTM_NEWLINK, SEQ_B)]);
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+/// 非 dump の RTM_GETLINK で `ifindex` を 1 件問い合わせる要求本体（ifinfomsg）を組む。
+fn ifinfo(ifindex: i32) -> impl FnOnce(&mut NlMsgBuilder) -> Result<(), NetError> {
+    move |b| {
+        let mut ifi = [0u8; 16];
+        ifi[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+        b.put_fixed(&ifi)
+    }
+}
+
+/// NET-11・TASK-136.2.2: `request` は seq を採番して往復し、lo の RTM_NEWLINK を 1 件返す。
+#[test]
+fn request_returns_link_for_lo() {
+    let sock = NetlinkRouteSocket::open().expect("open");
+    let r = sock
+        .request(RTM_GETLINK, 0, Duration::from_secs(5), ifinfo(1))
+        .expect("request");
+    assert_eq!(r.seq(), 1);
+    let m = r.messages();
+    assert_eq!(m.len(), 1);
+    assert_eq!(m.first().map(|m| m.msg_type()), Some(RTM_NEWLINK));
+    let r2 = sock
+        .request(RTM_GETLINK, 0, Duration::from_secs(5), ifinfo(1))
+        .expect("request 2");
+    assert_eq!(r2.seq(), 2);
+}
+
+/// NET-11・ERR-1: 存在しない ifindex への読み取り要求は、カーネルの errno 付き NLMSG_ERROR が
+/// 構造化エラー（NOT_FOUND）になる。ホストの状態は変更しない。
+#[test]
+fn request_unknown_ifindex_is_not_found() {
+    let sock = NetlinkRouteSocket::open().expect("open");
+    let e = sock
+        .request(RTM_GETLINK, 0, Duration::from_secs(5), ifinfo(i32::MAX))
+        .expect_err("no such device");
+    assert_eq!(e.code(), NetErrorCode::NotFound);
+    assert_eq!(e.to_string(), "NOT_FOUND: netlink request failed: errno 19");
+    // エラー後も同じソケットで次の要求が成功する。
+    sock.request(RTM_GETLINK, 0, Duration::from_secs(5), ifinfo(1))
+        .expect("next request");
+}
+
+/// REPAIR-5・NET-11: 複数スレッドが同じソケットで同時に `request` しても直列化され、互いの応答を
+/// 取り違えずにすべて成功する。
+#[test]
+fn concurrent_requests_are_serialized() {
+    let sock = NetlinkRouteSocket::open().expect("open");
+    let mut seqs: Vec<u32> = std::thread::scope(|scope| {
+        let hs: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    sock.request(RTM_GETLINK, 0, Duration::from_secs(10), ifinfo(1))
+                        .expect("request")
+                        .seq()
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("thread")).collect()
+    });
+    seqs.sort_unstable();
+    assert_eq!(seqs, vec![1, 2, 3, 4]);
+}
+
+/// NET-11・TASK-136.2.2: dump の `request` は NLMSG_DONE まで集め、lo を含む RTM_NEWLINK を返す。
+/// カーネルは `NLM_F_ROOT` だけの GET も dump として扱い ACK を返さないため、その場合も DONE で
+/// 成功する（ホストの状態は変更しない）。
+#[test]
+fn dump_request_collects_links_until_done() {
+    let sock = NetlinkRouteSocket::open().expect("open");
+    for flags in [NLM_F_ROOT | NLM_F_MATCH, NLM_F_ROOT] {
+        let r = sock
+            .request(RTM_GETLINK, flags, Duration::from_secs(10), ifinfo(0))
+            .expect("dump request");
+        let m = r.messages();
+        assert!(!m.is_empty(), "dump returned no links (flags {flags:#x})");
+        assert!(
+            m.iter().all(|m| m.msg_type() == RTM_NEWLINK),
+            "unexpected message type in dump (flags {flags:#x})"
+        );
+        let has_lo = m.iter().any(|m| {
+            m.payload()
+                .get(4..8)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(i32::from_ne_bytes)
+                == Some(1)
+        });
+        assert!(
+            has_lo,
+            "lo (ifindex 1) missing from dump (flags {flags:#x})"
+        );
+    }
 }

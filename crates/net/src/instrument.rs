@@ -13,7 +13,7 @@
 //! # 未実装範囲（REPAIR-3）
 //!
 //! - core の `OpRecorder` との接続アダプタ（上位 crate の担当。net からは提供しない）
-//! - 後続の操作（#844 の request / ACK、#845・#846 の link 操作等）の種別は、各 Issue で
+//! - 後続の操作（#845・#846 の link 操作等）の種別は、各 Issue で
 //!   [`NetOpKind`] へ追加する
 //!
 //! # 機微情報
@@ -37,6 +37,9 @@ pub enum NetOpKind {
     NetlinkSend,
     /// netlink データグラム 1 件の受信（期限までの待機時間を含む。時間切れは失敗）。
     NetlinkRecv,
+    /// 要求 1 件の往復（送信 → seq 一致の応答 / ACK 待ち。TASK-136.2.2・#844）。内側の send / recv も
+    /// 従来どおり個別に記録される。
+    NetlinkRequest,
 }
 
 impl NetOpKind {
@@ -46,6 +49,7 @@ impl NetOpKind {
             NetOpKind::NetlinkOpen => "netlink.open",
             NetOpKind::NetlinkSend => "netlink.send",
             NetOpKind::NetlinkRecv => "netlink.recv",
+            NetOpKind::NetlinkRequest => "netlink.request",
         }
     }
 }
@@ -220,10 +224,11 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 3] = [
+    const ALL_KINDS: [NetOpKind; 4] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
+        NetOpKind::NetlinkRequest,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
@@ -232,6 +237,7 @@ mod tests {
         assert_eq!(NetOpKind::NetlinkOpen.as_str(), "netlink.open");
         assert_eq!(NetOpKind::NetlinkSend.as_str(), "netlink.send");
         assert_eq!(NetOpKind::NetlinkRecv.as_str(), "netlink.recv");
+        assert_eq!(NetOpKind::NetlinkRequest.as_str(), "netlink.request");
     }
 
     /// REPAIR-4: 操作名は core の `OpName::new` と同じ規則に収まる（net は core に依存できないため

@@ -12,12 +12,12 @@ use std::fmt;
 /// `NetError` の機械可読な分類（ERR-1）。
 ///
 /// `#[non_exhaustive]` のため、呼び出し側の `match` は `_` 分岐を持つこと。
-/// ソケット層（#843）で `Timeout`・`PermissionDenied`・`Unimplemented`・`ResourceExhausted`・`Internal`
-/// を追加した。文字列は `PluginErrorCode::as_str` と揃える。
+/// ソケット層（#843）で `Timeout`・`PermissionDenied`・`Unimplemented`・`ResourceExhausted`・`Internal`、
+/// request / ACK 層（#844）で `NotFound`・`AlreadyExists`・`FailedPrecondition` を追加した。文字列は `PluginErrorCode::as_str` と揃える。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum NetErrorCode {
-    /// エンコード側の不正入力・上限超過。
+    /// エンコード側の不正入力・上限超過、およびカーネルが拒否した要求（`EINVAL`。#844）。
     InvalidArgument,
     /// デコード側で検出した不正な長さ・切り詰め（受信データの破損）。
     DataLoss,
@@ -29,6 +29,12 @@ pub enum NetErrorCode {
     Unimplemented,
     /// fd・メモリ・カーネルバッファ等の資源枯渇。
     ResourceExhausted,
+    /// 対象が存在しない（`ENOENT`・`ENODEV`。#844）。
+    NotFound,
+    /// 対象がすでに存在する（`EEXIST`。#844）。
+    AlreadyExists,
+    /// 現在の状態では実行できない（`EBUSY`。#844）。
+    FailedPrecondition,
     /// 上記以外の内部エラー（分類できない errno 等）。
     Internal,
 }
@@ -43,6 +49,9 @@ impl NetErrorCode {
             Self::PermissionDenied => "PERMISSION_DENIED",
             Self::Unimplemented => "UNIMPLEMENTED",
             Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
+            Self::NotFound => "NOT_FOUND",
+            Self::AlreadyExists => "ALREADY_EXISTS",
+            Self::FailedPrecondition => "FAILED_PRECONDITION",
             Self::Internal => "INTERNAL",
         }
     }
@@ -100,6 +109,12 @@ mod tests {
         assert_eq!(
             NetErrorCode::ResourceExhausted.as_str(),
             "RESOURCE_EXHAUSTED"
+        );
+        assert_eq!(NetErrorCode::NotFound.as_str(), "NOT_FOUND");
+        assert_eq!(NetErrorCode::AlreadyExists.as_str(), "ALREADY_EXISTS");
+        assert_eq!(
+            NetErrorCode::FailedPrecondition.as_str(),
+            "FAILED_PRECONDITION"
         );
         assert_eq!(NetErrorCode::Internal.as_str(), "INTERNAL");
         let e = NetError::new(NetErrorCode::DataLoss, "truncated");

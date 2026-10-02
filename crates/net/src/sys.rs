@@ -300,24 +300,31 @@ pub(crate) fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) -> Result<boo
         // SAFETY: `pfd` はスタック上の初期化済み 1 要素で、`nfds` = 1 と一致する。カーネルは呼び出しの間だけ
         // `revents` を書く。
         let r = unsafe { poll(&raw mut pfd, 1, ms) };
-        if r >= 0 {
-            return Ok(r > 0);
+        if r > 0 {
+            return Ok(true);
         }
-        let e = last_error();
-        if e != SysError::Os(consts::EINTR) {
-            return Err(e);
+        if r < 0 {
+            let e = last_error();
+            if e != SysError::Os(consts::EINTR) {
+                return Err(e);
+            }
         }
+        // 時間切れ（r == 0）でも、1 回の poll に渡せる上限（i32::MAX ms）で飽和していた場合は
+        // 残り時間を消化するため再試行する。EINTR も同様に残り時間を再計算する。
         if let Some(d) = deadline {
             remaining = d.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(false);
-            }
+        } else {
+            remaining = remaining.saturating_sub(Duration::from_millis(i32::MAX as u64));
+        }
+        if remaining.is_zero() {
+            return Ok(false);
         }
     }
 }
 
-/// 1 データグラムを受信する（呼び出し前に [`wait_readable`] で読み取り可能を確認する。確認なしだと
-/// ブロックしうる）。送信元が netlink アドレスでなければ `Os(0)` で拒否する。
+/// 1 データグラムを受信する。`MSG_DONTWAIT` で呼ぶため待たずに返り、読み取り可能でなければ
+/// （他スレッドが先に取った場合を含む）`Os(EAGAIN)` で失敗する。通常は [`wait_readable`] の後に呼ぶ。
+/// 送信元が netlink アドレスでなければ `Os(0)` で拒否する。
 ///
 /// `MSG_TRUNC` を渡すため、`buf` に収まらない場合も戻り値は実長になり `truncated` が立つ。
 pub(crate) fn recv_from(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<RecvMeta, SysError> {
@@ -341,7 +348,7 @@ pub(crate) fn recv_from(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<RecvMeta, 
                 fd.as_raw_fd(),
                 buf.as_mut_ptr().cast(),
                 buf.len(),
-                consts::MSG_TRUNC,
+                consts::MSG_TRUNC | consts::MSG_DONTWAIT,
                 &raw mut addr,
                 &raw mut addrlen,
             )

@@ -78,7 +78,7 @@ mod socket {
             Ok(())
         }
 
-        /// 最大 `timeout` 待って 1 データグラムを受信し、受信長に切り詰めたバイト列を返す。
+        /// 最大 `timeout` 待って（`i32::MAX` ms 超も残り時間を消化する）1 データグラムを受信し、受信長に切り詰めたバイト列を返す。
         ///
         /// 期限内に届かなければ `Timeout`。切り詰め・カーネル以外の送信元は `DataLoss`。
         /// 返したバイト列の解釈は呼び出し側が `NlMsgIter` で行う。
@@ -92,8 +92,17 @@ mod socket {
                 ));
             }
             let mut buf = vec![0u8; RECV_BUFFER_LEN];
-            let meta = sys::recv_from(self.fd.as_fd(), &mut buf)
-                .map_err(|e| map_sys_error("recvfrom", e))?;
+            let meta = match sys::recv_from(self.fd.as_fd(), &mut buf) {
+                Ok(meta) => meta,
+                // poll 通過後に別スレッドが先に読んだ場合。無期限に待たず Timeout として返す（REPAIR-5）。
+                Err(sys::SysError::Os(sys::EAGAIN)) => {
+                    return Err(NetError::new(
+                        NetErrorCode::Timeout,
+                        "netlink message was consumed by another reader",
+                    ));
+                }
+                Err(e) => return Err(map_sys_error("recvfrom", e)),
+            };
             if meta.truncated {
                 return Err(NetError::new(
                     NetErrorCode::DataLoss,

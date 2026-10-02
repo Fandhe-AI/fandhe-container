@@ -255,6 +255,9 @@ mod boundary {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
+    /// 要求本文が表す操作名（代表操作 B）。クライアントとサーバで共有し照合に使う。
+    const LIST_IMAGES_OP: &str = "list_images";
+
     /// accept・connect の期限（REPAIR-5）。
     const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
     /// 往復 1 回の期限（REPAIR-5）。
@@ -393,8 +396,16 @@ mod boundary {
                 Err(e) => return Err(plugin_err(e)),
             };
             let msg = decode_message::<Vec<String>>(&frame).map_err(plugin_err)?;
+            // 要求本文が `list_images` 単独であることを照合し、想定外の操作は拒否する。
+            // 誤った要求を送る変更があってもベンチが成功してしまうのを防ぐ（代表操作 B の往復を担保）。
             let id = match msg {
-                ControlMessage::Request { id, .. } => id,
+                ControlMessage::Request { id, body } if body.as_slice() == [LIST_IMAGES_OP] => id,
+                ControlMessage::Request { .. } => {
+                    return Err(BenchError::new(
+                        "protocol",
+                        "unexpected operation in request body",
+                    ));
+                }
                 _ => return Err(BenchError::new("protocol", "expected a request")),
             };
             let resp = ControlMessage::Response {
@@ -417,7 +428,7 @@ mod boundary {
         let timeout = rpc_timeout()?;
         let req = ControlMessage::Request {
             id: MessageId::new(id),
-            body: vec!["list_images".to_string()],
+            body: vec![LIST_IMAGES_OP.to_string()],
         };
         let start = Instant::now();
         let frame = encode_message(&req).map_err(plugin_err)?;
@@ -639,5 +650,35 @@ mod tests {
             .expect("round trip hung")
             .unwrap();
         assert!(v > 0.0 && v.is_finite());
+    }
+
+    /// PLUG-5: 想定外の要求本文は protocol エラーで拒否する（本文照合の回帰防止）。
+    #[cfg(unix)]
+    #[test]
+    fn plug5_serve_rejects_unexpected_request_body() {
+        use fandhe_container_plugin::{
+            ControlMessage, MessageId, RpcTimeout, UdsListener, UdsStream, encode_message,
+        };
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let listener = UdsListener::bind(&dir.path().join("s")).unwrap();
+        let sock = listener.path().to_path_buf();
+        let client = std::thread::spawn(move || {
+            let mut st = UdsStream::connect(&sock, Duration::from_secs(5)).unwrap();
+            let req = ControlMessage::Request {
+                id: MessageId::new(1),
+                body: vec!["delete_images".to_string()],
+            };
+            let out = encode_message(&req).unwrap();
+            let t = RpcTimeout::new(Duration::from_secs(5)).unwrap();
+            st.write_frame(&out, t).unwrap();
+            // サーバが拒否して閉じるまで保持する。
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut st = listener.accept(Duration::from_secs(5)).unwrap();
+        let err = serve_connection(&mut st, &MockImageStore).unwrap_err();
+        assert_eq!(err.code, "protocol");
+        client.join().unwrap();
     }
 }

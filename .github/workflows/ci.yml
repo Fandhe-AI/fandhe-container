@@ -449,6 +449,17 @@ jobs:
           # crash_test_server bin 内のユニットテスト（--test '*' の対象外）も実行する
           cargo test -p fandhe-container-io --bins --features crash-test-server
 
+      # PLUG-4 判定スクリプト（scripts/check-plug4-core-invariance.sh）の自己テスト（TASK-109.4・REPAIR-12）。
+      # 判定本体は bench-regression（ubuntu 単独）で走るが、`make plug4-core-invariance` は開発者が macOS でも
+      # 実行するため、GNU / BSD 双方のツールで動くことを ubuntu・macos の実行で確かめる。fixture の最小
+      # workspace（依存 0 件）だけを使い、ネットワーク・secrets・`${{ }}` の埋め込みは使わない。
+      # Windows は判定スクリプトの対象外（Git Bash での動作は未検証）のため除く。新ジョブは check-run 名が
+      # 増えるため既存ジョブのステップとする（check-run 件数は不変）
+      - name: PLUG-4 判定スクリプトの自己テスト（TASK-109.4・REPAIR-12。ubuntu・macos）
+        if: runner.os != 'Windows' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make plug4-core-invariance-selftest
+
       - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 2
@@ -554,6 +565,26 @@ jobs:
         run: |
           set -euo pipefail
           make plugin-feature-size | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      # PLUG-4（TASK-109.4）: plugin 追加前後の別ビルドで core の指紋（ソース一覧・依存木・rlib sha256）を比較する。
+      # スクリプトの自己テストは integration-test ジョブ（ubuntu・macos）で実行する。
+      # 既存ジョブのステップとして追加（check-run 件数は不変）
+      - name: plugin 追加前後の core 不変性（PLUG-4・TASK-109.4）
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          # pull_request では base を取得し、plugin 追加 PR が core を変更していないかも検査する
+          if [ -n "${BASE_REF}" ]; then
+            # merge-base を求めるため履歴を深くする（shallow なら unshallow してから base を取得）
+            if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+              git fetch --no-tags --unshallow origin
+            fi
+            git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            export PLUG4_BASE_REF="origin/${BASE_REF}"
+          fi
+          make plug4-core-invariance
 
   # --------------------------------------------------
   # aarch64-linux-check（Linux aarch64 向けクロス型検査: #1120・REPAIR-7 第 1 段階を補うアーキ網羅）

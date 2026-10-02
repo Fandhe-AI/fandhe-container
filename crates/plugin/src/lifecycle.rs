@@ -1,4 +1,5 @@
-//! plugin プロセスの都度起動モード（PLUG-7・TASK-110.1・#258）。
+//! plugin プロセスの都度起動モード（PLUG-7・TASK-110.1・#258）と、子モジュール `resident` の常駐モード
+//! （TASK-110.2・#259。起動仕様 [`OneShotPlugin`]・stderr 収集・子の回収ガードを共用する）。
 //!
 //! 呼び出しごとに plugin プロセスを spawn し、1 往復（要求フレーム送信 -> 応答フレーム受信）の
 //! 完了後に終了させる。呼び出し元は core 側の plugin proxy（TASK-114 ほか。依存方向は
@@ -28,13 +29,21 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - 常駐モード（TASK-110.2）・モード選択 API（TASK-110.3）。
+//! - モード選択 API（TASK-110.3）。常駐モードは実装済み（外部管理の常駐 plugin への再接続は未実装。
+//!   `resident` の冒頭を参照）。
 //! - 起動対象の信頼性検証（所有者・モード・sha256 照合。TASK-122・PLUG-11）。本 API は検証を
 //!   行わず、呼び出し側が検証済みの絶対パスを渡すことを前提とする。
 //! - 孫プロセスの回収（プロセスグループ単位の kill は未対応）。孫が stderr の書き込み端を保持し
 //!   続けた場合、収集は [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`] で打ち切り、[`OneShotStderr::is_complete`]
 //!   が false になる。打ち切り後は読み取り側を閉じるため、孫の以後の書き込みは `EPIPE` になる。
 //! - 要求 ID と応答 ID の対応づけ（TASK-114）。
+
+mod resident;
+
+pub use resident::{
+    RESIDENT_EXIT_DETECT_TIMEOUT, RESIDENT_START_TIMEOUT_DEFAULT, RESIDENT_START_TIMEOUT_MAX,
+    ResidentCallRecord, ResidentPlugin, ResidentShutdown, ResidentStartTimeout, ResidentState,
+};
 
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
@@ -241,7 +250,7 @@ impl OneShotStderr {
 /// 間に読まないため、子がバッファを超えて書いても子は詰まらず、親も読み取りでブロックしない。
 /// 結果の受け取り（[`Self::finish`]）は期限つきで、期限内に終端へ達しなければ読み取りを打ち切って
 /// スレッドを停止させる（スレッドを残さない）。`join` は行わず、停止の確認も期限つきで行う。
-/// 常駐モード（TASK-110.2）でも同じ収集器を使える形にしている。
+/// 常駐モード（`resident`。TASK-110.2）はセッション全期間で 1 本の収集器を保持する。
 struct StderrCapture {
     state: Arc<Mutex<OneShotStderr>>,
     done: mpsc::Receiver<()>,

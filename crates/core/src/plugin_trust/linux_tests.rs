@@ -627,3 +627,50 @@ fn plug11_task122_3_symlink_candidate_hashes_target_content() {
     let hv = v.verify_hash(&allow(&[PAYLOAD_SHA])).expect("allowed");
     assert_eq!(hv.digest().to_string(), PAYLOAD_SHA);
 }
+
+#[test]
+fn plug11_task122_4_signature_method_rejects_fail_closed() {
+    use crate::plugin_trust::PluginVerificationMethod;
+    let (_t, v) = verified("m-sig");
+    let path = v.path().to_path_buf();
+    let e = PluginVerificationMethod::Signature
+        .verify(v)
+        .expect_err("reject");
+    assert_eq!(
+        e.kind(),
+        PluginTrustErrorKind::VerificationMethodNotImplemented
+    );
+    assert_eq!(e.target(), TrustTarget::File);
+    assert_eq!(e.path(), path.as_path());
+    let te: TraitError = e.into();
+    assert_eq!(te.code(), ErrorCode::Unimplemented);
+}
+
+#[test]
+fn plug11_task122_4_allowlist_method_delegates_to_verify_hash() {
+    use crate::plugin_trust::PluginVerificationMethod;
+    let (_t, v) = verified("m-ok");
+    let hv = PluginVerificationMethod::Sha256Allowlist(allow(&[PAYLOAD_SHA]))
+        .verify(v)
+        .expect("allowed");
+    assert_eq!(hv.digest().to_string(), PAYLOAD_SHA);
+    let mut s = String::new();
+    hv.into_file().into_file().read_to_string(&mut s).unwrap();
+    assert_eq!(s, "payload");
+
+    let (_t2, v2) = verified("m-ng");
+    let e = PluginVerificationMethod::Sha256Allowlist(allow(&[OTHER_SHA]))
+        .verify(v2)
+        .expect_err("reject");
+    assert_eq!(e.kind(), PluginTrustErrorKind::HashMismatch);
+}
+
+#[test]
+fn plug11_task122_4_default_method_rejects_everything() {
+    use crate::plugin_trust::PluginVerificationMethod;
+    let (_t, v) = verified("m-def");
+    let e = PluginVerificationMethod::default()
+        .verify(v)
+        .expect_err("reject");
+    assert_eq!(e.kind(), PluginTrustErrorKind::HashMismatch);
+}

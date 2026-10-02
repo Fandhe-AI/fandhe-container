@@ -159,10 +159,13 @@ mod unix {
             .spawn()
             .expect("failed to spawn the connector command");
         let mut stdout = child.stdout.take().unwrap();
-        let reader = std::thread::spawn(move || {
+        // 孫プロセスが stdout を保持すると read_to_end が戻らないため、join ではなく
+        // 期限付き recv で結果を受け取る（REPAIR-5）。
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let _reader = std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = stdout.read_to_end(&mut buf);
-            buf
+            let _ = tx.send(buf);
         });
 
         match l.accept(Duration::from_secs(10)) {
@@ -192,7 +195,12 @@ mod unix {
             let _ = child.wait();
             panic!("connector did not exit after the connection was rejected");
         }
-        let received = reader.join().unwrap();
+        // 読み取り側にも期限を設ける。超過時は reader を待たずに失敗させる（reader は孫が
+        // パイプを閉じるか test プロセス終了で回収される）。
+        let received = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(buf) => buf,
+            Err(e) => panic!("stdout reader did not finish in time: {e}"),
+        };
         assert!(
             received.is_empty(),
             "no bytes must reach the rejected peer: {} bytes",

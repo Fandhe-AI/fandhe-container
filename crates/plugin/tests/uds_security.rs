@@ -1,10 +1,12 @@
-//! runtime directory 解決・作成の結合試験（PLUG-12・TASK-123.1・#286）。root・特権不要。
+//! runtime directory 解決・作成の結合試験（PLUG-12・TASK-123.1・#286、フォールバックは TASK-123.4・#289）。root・特権不要。
 
 #[cfg(not(unix))]
 #[test]
 fn plug12_runtime_dir_is_unimplemented_on_non_unix() {
     use fandhe_container_plugin::{PluginErrorCode, RuntimeDir};
     let err = RuntimeDir::ensure_under(std::path::Path::new("C:\\x")).unwrap_err();
+    assert_eq!(err.code(), PluginErrorCode::Unimplemented);
+    let err = RuntimeDir::from_env().unwrap_err();
     assert_eq!(err.code(), PluginErrorCode::Unimplemented);
 }
 
@@ -128,5 +130,49 @@ mod unix {
         let t = TempDir::new();
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         UdsListener::bind(&d.path().join("s.sock")).unwrap();
+    }
+
+    /// PLUG-12・TASK-123.4: `from_env` は環境から基底を決め、Ok なら 0700 で bind でき、
+    /// 基底が無ければ FailedPrecondition で止まる。環境変数は読むだけで書き換えない。
+    /// macOS の CI は XDG 未設定・TMPDIR 設定済みのため、フォールバックの Ok 側が実際に通る。
+    #[test]
+    fn plug12_from_env_resolves_or_fails_closed() {
+        let probe = TempDir::new();
+        let uid = std::fs::metadata(&probe.0).unwrap().uid();
+        let xdg = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty());
+        let base: Option<PathBuf> = match &xdg {
+            Some(v) => Some(PathBuf::from(v)),
+            None if cfg!(target_os = "macos") => std::env::var_os("TMPDIR").map(PathBuf::from),
+            None if cfg!(target_os = "linux") && uid == 0 => Some(PathBuf::from("/run")),
+            None if cfg!(target_os = "linux") => Some(PathBuf::from(format!("/run/user/{uid}"))),
+            None => None,
+        };
+        let result = RuntimeDir::from_env();
+        match (&base, result) {
+            (Some(b), Ok(d)) => {
+                assert!(d.path().starts_with(std::fs::canonicalize(b).unwrap()));
+                assert_eq!(d.path().file_name().unwrap(), RUNTIME_DIR_NAME);
+                assert_eq!(mode_of(d.path()), 0o700);
+                UdsListener::bind(&d.path().join("fromenv.sock")).unwrap();
+                let _ = std::fs::remove_file(d.path().join("fromenv.sock"));
+            }
+            (Some(b), Err(e)) => {
+                if xdg.is_none() && !b.exists() {
+                    assert_eq!(e.code(), PluginErrorCode::FailedPrecondition);
+                } else {
+                    // 基底が存在するのに拒否される環境は、Linux の非標準構成のみ許容する。
+                    assert!(
+                        !cfg!(target_os = "macos") || xdg.is_some(),
+                        "macOS fallback must resolve: {e:?}"
+                    );
+                    assert!(matches!(
+                        e.code(),
+                        PluginErrorCode::PermissionDenied | PluginErrorCode::NotFound
+                    ));
+                }
+            }
+            (None, Err(e)) => assert_eq!(e.code(), PluginErrorCode::FailedPrecondition),
+            (None, Ok(_)) => panic!("no base expected but from_env succeeded"),
+        }
     }
 }

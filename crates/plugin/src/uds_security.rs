@@ -27,9 +27,23 @@
 //! - 作成は非再帰で、基底ディレクトリ（`XDG_RUNTIME_DIR` 自体）は作らない。
 //! - エラーメッセージは固定の英語文字列で、パス・環境変数値を含めない。
 //!
+//! # `XDG_RUNTIME_DIR` 未設定時のフォールバック（TASK-123.4・#289）
+//! 未設定または空のときだけ、OS・euid ごとに単一の基底を選び、通常経路と同じ検証
+//! （[`RuntimeDir::ensure_under`] 相当）を省略なく適用する。
+//!
+//! | 条件 | 基底 |
+//! | ---- | ---- |
+//! | Linux・euid 0 | `/run`（OCI-5 の root 配置と同じツリー） |
+//! | Linux・euid != 0 | `/run/user/<euid>` |
+//! | macOS | 環境変数 `TMPDIR`（ユーザー固有の 0700 ディレクトリ） |
+//! | 上記以外の unix | なし（`FailedPrecondition`） |
+//!
+//! - 共有書き込み可能な `/tmp` へは落とさない。基底は作らず、無ければ `FailedPrecondition`。
+//! - 候補は単一で、検証失敗（`PermissionDenied` 等）時に別候補へ連鎖しない（改ざんを隠さない）。
+//! - 設定済みだが不正な値（相対パス・`..`）はフォールバックせずエラーにする。
+//! - OCI-5 の state store は別仕様で、未設定時にフォールバックしない（`crates/core`）。
+//!
 //! # 未実装（REPAIR-3）
-//! - `XDG_RUNTIME_DIR` 未設定時のフォールバック・root 時の既定配置先は未実装で、未設定は
-//!   `FailedPrecondition`（TASK-123.4・#289）。
 //! - 既存 socket パスの lstat 検証・stale socket 削除（TASK-123.2・#287）、socket 0600 化と
 //!   `sun_path` 長検証（TASK-123.3・#288）、peer credential（TASK-124）は別 sub。
 //! - 非 unix は `Unimplemented`（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る）。
@@ -51,14 +65,15 @@ pub struct RuntimeDir {
 impl RuntimeDir {
     /// 環境変数 `XDG_RUNTIME_DIR` と自プロセスの実効 uid から解決・作成する。
     ///
-    /// 未設定・空・相対パスは `FailedPrecondition`（フォールバックは TASK-123.4・#289）。
+    /// 未設定・空のときは OS・euid ごとのフォールバック基底を使う（モジュール doc 参照。TASK-123.4・#289）。
+    /// 設定済みの相対パスは `FailedPrecondition`、`..` 含みは `InvalidArgument`。
     pub fn from_env() -> Result<Self, PluginError> {
         imp::from_env()
     }
 
     /// 指定の基底ディレクトリ直下の `fandhe-container` を解決・作成する。
     ///
-    /// テストおよび #289 のフォールバックが基底を注入する入口。基底は絶対パス・`..` なしで自 UID 所有・
+    /// テストおよびフォールバック（#289）が基底を注入する入口。基底は絶対パス・`..` なしで自 UID 所有・
     /// group/other 書き込み不可の非 symlink ディレクトリ（違反は `PermissionDenied`）で、
     /// 既に存在していなければならない（`NotFound`。基底は作成しない）。
     pub fn ensure_under(base: &Path) -> Result<Self, PluginError> {
@@ -115,9 +130,80 @@ mod imp {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     use std::path::{Path, PathBuf};
 
+    /// Linux のフォールバック基底の根（root は直下、非 root は `user/<euid>`）。
+    const RUN_ROOT: &str = "/run";
+
+    const NO_FALLBACK: &str =
+        "XDG_RUNTIME_DIR is not set and no fallback runtime directory is available";
+
     pub(super) fn from_env() -> Result<RuntimeDir, PluginError> {
-        let base = runtime_dir_base(std::env::var_os("XDG_RUNTIME_DIR"))?;
-        ensure_dir(&base, crate::sys::effective_uid())
+        resolve(
+            std::env::var_os("XDG_RUNTIME_DIR"),
+            std::env::var_os("TMPDIR"),
+            crate::sys::effective_uid(),
+            Path::new(RUN_ROOT),
+        )
+    }
+
+    /// `XDG_RUNTIME_DIR` 未設定・空のときの単一フォールバック基底（PLUG-12・TASK-123.4）。
+    /// 基底の存在・所有者・権限の検証は呼び出し元の `ensure_dir` が行う。
+    #[allow(unused_variables)] // OS ごとに使う引数が異なる
+    fn fallback_base(
+        euid: u32,
+        run_root: &Path,
+        tmpdir: Option<std::ffi::OsString>,
+    ) -> Result<PathBuf, PluginError> {
+        #[cfg(target_os = "linux")]
+        {
+            if euid == 0 {
+                Ok(run_root.to_path_buf())
+            } else {
+                Ok(run_root.join("user").join(euid.to_string()))
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            match tmpdir {
+                Some(v) if !v.is_empty() => {
+                    let base = PathBuf::from(v);
+                    validate_base(&base)?;
+                    Ok(base)
+                }
+                _ => Err(PluginError::new(
+                    PluginErrorCode::FailedPrecondition,
+                    NO_FALLBACK,
+                )),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(PluginError::new(
+                PluginErrorCode::FailedPrecondition,
+                NO_FALLBACK,
+            ))
+        }
+    }
+
+    /// 環境値を注入できる解決本体。`from_env` とテストが呼ぶ。
+    pub(super) fn resolve(
+        xdg: Option<std::ffi::OsString>,
+        tmpdir: Option<std::ffi::OsString>,
+        euid: u32,
+        run_root: &Path,
+    ) -> Result<RuntimeDir, PluginError> {
+        if matches!(&xdg, Some(v) if !v.is_empty()) {
+            let base = runtime_dir_base(xdg)?;
+            return ensure_dir(&base, euid);
+        }
+        let base = fallback_base(euid, run_root, tmpdir)?;
+        // フォールバック基底が無い場合のみ前提条件違反へ写像する。検証失敗は格下げしない。
+        ensure_dir(&base, euid).map_err(|e| {
+            if e.code() == PluginErrorCode::NotFound {
+                PluginError::new(PluginErrorCode::FailedPrecondition, NO_FALLBACK)
+            } else {
+                e
+            }
+        })
     }
 
     pub(super) fn ensure_under(base: &Path) -> Result<RuntimeDir, PluginError> {
@@ -438,6 +524,137 @@ mod imp {
             let sticky = std::fs::symlink_metadata(&t.0).unwrap();
             assert!(verify_ancestor(&sticky, euid).is_ok());
             std::fs::set_permissions(&t.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        fn osv(s: &str) -> Option<std::ffi::OsString> {
+            Some(s.into())
+        }
+
+        /// 試験用の「フォールバック基底」を Tmp 内に用意する。Linux は euid に応じ
+        /// `run_root`（root）または `run_root/user/<euid>` を返し、macOS は TMPDIR 値として Tmp を使う。
+        fn fallback_fixture(t: &Tmp, euid: u32) -> (PathBuf, Option<std::ffi::OsString>) {
+            if cfg!(target_os = "linux") {
+                if euid == 0 {
+                    (t.0.clone(), None)
+                } else {
+                    let b = t.0.join("user").join(euid.to_string());
+                    DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(&b)
+                        .unwrap();
+                    (b, None)
+                }
+            } else {
+                (t.0.clone(), Some(t.0.clone().into_os_string()))
+            }
+        }
+
+        /// PLUG-12・TASK-123.4: Linux のフォールバック基底は euid で決まる（具体値）。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn plug12_fallback_base_linux() {
+            let root = Path::new("/run");
+            assert_eq!(fallback_base(0, root, None).unwrap(), PathBuf::from("/run"));
+            assert_eq!(
+                fallback_base(1000, root, None).unwrap(),
+                PathBuf::from("/run/user/1000")
+            );
+        }
+
+        /// PLUG-12・TASK-123.4: macOS は TMPDIR のみ。未設定・空・相対は FailedPrecondition。
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn plug12_fallback_base_macos() {
+            let root = Path::new("/run");
+            assert_eq!(
+                fallback_base(501, root, osv("/var/folders/x/T")).unwrap(),
+                PathBuf::from("/var/folders/x/T")
+            );
+            for v in [None, osv(""), osv("relative")] {
+                let err = fallback_base(501, root, v).unwrap_err();
+                assert_eq!(err.code(), PluginErrorCode::FailedPrecondition);
+            }
+            let err = fallback_base(501, root, osv("/a/../b")).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
+        }
+
+        /// PLUG-12・TASK-123.4: XDG 未設定・空でフォールバック基底直下に 0700・自 UID で作成する。
+        #[test]
+        fn plug12_resolve_falls_back_when_xdg_unset_or_empty() {
+            let euid = crate::sys::effective_uid();
+            for xdg in [None, osv("")] {
+                let t = Tmp::new();
+                let (base, tmpdir) = fallback_fixture(&t, euid);
+                let got = resolve(xdg, tmpdir, euid, &t.0).unwrap();
+                let expected = std::fs::canonicalize(&base).unwrap().join(RUNTIME_DIR_NAME);
+                assert_eq!(got.path(), expected.as_path());
+                let meta = std::fs::symlink_metadata(&expected).unwrap();
+                assert_eq!(meta.mode() & 0o7777, 0o700);
+                assert_eq!(meta.uid(), euid);
+            }
+        }
+
+        /// PLUG-12・TASK-123.4: フォールバック基底が無ければ FailedPrecondition で、基底は作らない。
+        #[test]
+        fn plug12_resolve_fallback_missing_base_is_failed_precondition() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let missing = t.0.join("missing");
+            let tmpdir = Some(missing.clone().into_os_string());
+            // root の Linux は run_root 自体、非 root は run_root/user/<euid>、macOS は TMPDIR が無い状況。
+            let err = resolve(None, tmpdir, euid, &missing).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::FailedPrecondition);
+            assert!(!missing.exists());
+        }
+
+        /// PLUG-12・TASK-123.4: フォールバック先にも通常経路と同じ検証が適用され、修復されない。
+        #[test]
+        fn plug12_resolve_fallback_applies_verification() {
+            let euid = crate::sys::effective_uid();
+            let t = Tmp::new();
+            let (base, tmpdir) = fallback_fixture(&t, euid);
+            // 基底が group/other 書き込み可。
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let err = resolve(None, tmpdir.clone(), euid, &t.0).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+            assert!(!base.join(RUNTIME_DIR_NAME).exists());
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+            // 既存 runtime directory が 0755。
+            let dir = base.join(RUNTIME_DIR_NAME);
+            DirBuilder::new().mode(0o755).create(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let err = resolve(None, tmpdir, euid, &t.0).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+
+        /// PLUG-12・TASK-123.4: 設定済みで不正な XDG はフォールバックで隠さない。
+        #[test]
+        fn plug12_resolve_does_not_fall_back_for_invalid_xdg() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let (base, tmpdir) = fallback_fixture(&t, euid);
+            let err = resolve(osv("relative"), tmpdir, euid, &t.0).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::FailedPrecondition);
+            assert!(!base.join(RUNTIME_DIR_NAME).exists());
+        }
+
+        /// PLUG-12・TASK-123.4: XDG が有効ならフォールバック候補を使わない。
+        #[test]
+        fn plug12_resolve_prefers_xdg_when_set() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let (fb, tmpdir) = fallback_fixture(&t, euid);
+            let xdg = t.0.join("xdg");
+            DirBuilder::new().mode(0o700).create(&xdg).unwrap();
+            let got = resolve(Some(xdg.clone().into_os_string()), tmpdir, euid, &t.0).unwrap();
+            let expected = std::fs::canonicalize(&xdg).unwrap().join(RUNTIME_DIR_NAME);
+            assert_eq!(got.path(), expected.as_path());
+            assert!(!fb.join(RUNTIME_DIR_NAME).exists());
         }
 
         #[test]

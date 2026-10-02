@@ -415,7 +415,7 @@ pub(crate) fn open_dir_nofollow(abs: &std::path::Path) -> io::Result<File> {
     }
 }
 
-// ロックファイル作成用の open(2) フラグ。値は OS ごとに異なる。Linux の 3 値は asm-generic の既定値で、
+// ロックファイル作成用の open(2) フラグ。値は OS ごとに異なる。Linux の 4 値は asm-generic の既定値で、
 // x86_64・aarch64 とも上書きしないため同値だが、流用せず対応アーキテクチャごとに定義する。
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_RDWR: i32 = 0o2;
@@ -429,12 +429,18 @@ const O_RDWR: i32 = 0o2;
 const O_CREAT: i32 = 0o100;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const O_EXCL: i32 = 0o200;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_NONBLOCK: i32 = 0o4000;
 #[cfg(target_os = "macos")]
 const O_RDWR: i32 = 0x2;
 #[cfg(target_os = "macos")]
 const O_CREAT: i32 = 0x200;
 #[cfg(target_os = "macos")]
 const O_EXCL: i32 = 0x800;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x4;
 
 /// ロックファイルの取得結果（PLUG-12・TASK-123.2）。
 #[derive(Debug)]
@@ -445,8 +451,10 @@ pub(crate) struct LockHandle {
     pub created: bool,
 }
 
-/// `dir` 基準で `name` のロックファイルを `O_NOFOLLOW | O_CLOEXEC`・0600 で開き（無ければ作成）、
-/// 非ブロッキングで排他ロックを取る。他者が保持中なら `WouldBlock`。listener の生存判定に接続 probe を
+/// `dir` 基準で `name` のロックファイルを `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`・0600 で開き
+/// （無ければ作成）、非ブロッキングで排他ロックを取る。`O_NONBLOCK` は、既存の名前が FIFO・デバイス
+/// 等だった場合に open が相手を待って止まらないようにするため（通常ファイルの読み書きには影響しない。
+/// 種別は呼び出し側が開いた fd の metadata で検証して拒否する。REPAIR-5）。他者が保持中なら `WouldBlock`。listener の生存判定に接続 probe を
 /// 使わず、「ロックを取れる＝以前の保持者は消えた」で stale を判定するための基盤（既存 listener の
 /// accept queue に副作用を与えない。PLUG-12）。未対応の OS・アーキテクチャは `Unsupported`。
 ///
@@ -472,7 +480,7 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
                 c_openat(
                     dir.as_raw_fd(),
                     name.as_ptr(),
-                    flags | O_NOFOLLOW | O_CLOEXEC,
+                    flags | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
                     0o600u32,
                 )
             };

@@ -509,6 +509,8 @@ mod imp {
 
     /// ロックファイルへ書く「この socket は自分が bind した」記録の接頭辞（版付き）。
     const RECORD_PREFIX: &str = "fcus1";
+    /// 記録の最大長（接頭辞＋空白＋u64 の 10 進 20 桁×2＋空白＋改行＝48 を超える余裕を持たせた上限）。
+    const RECORD_MAX_LEN: usize = 96;
 
     impl BindLock {
         /// bind 済み socket の同一性（dev / ino）をロックファイルへ記録する。stale 判定は、残存
@@ -531,17 +533,60 @@ mod imp {
 
         /// 記録された (dev, ino)。無い・壊れている場合は None（管理下と見なさない）。
         fn recorded(&self) -> Option<(u64, u64)> {
+            parse_record(&self.read_record()?)
+        }
+
+        /// ロックファイルの先頭（記録の最大長まで）を読む。
+        fn read_record(&self) -> Option<Vec<u8>> {
             use std::os::unix::fs::FileExt;
-            let mut buf = [0u8; 96];
+            let mut buf = [0u8; RECORD_MAX_LEN];
             let n = self.file.read_at(&mut buf, 0).ok()?;
-            let text = std::str::from_utf8(buf.get(..n)?).ok()?;
-            let mut it = text.split_whitespace();
-            if it.next()? != RECORD_PREFIX {
-                return None;
+            Some(buf.get(..n)?.to_vec())
+        }
+    }
+
+    /// 10 進数字だけからなる空でないバイト列を u64 として読む（符号・空白は受け付けない）。
+    fn parse_decimal(b: &[u8]) -> Option<u64> {
+        if b.is_empty() || !b.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(b).ok()?.parse().ok()
+    }
+
+    /// 完全な記録 `fcus1 <dev> <ino>\n` だけを受け付ける。末尾の改行を必須にして、書き込みが途中で
+    /// 止まった記録（数字が途中で切れた ino 等）を別の socket の同一性として読まない。
+    pub(super) fn parse_record(b: &[u8]) -> Option<(u64, u64)> {
+        let body = b.strip_suffix(b"\n")?;
+        let rest = body
+            .strip_prefix(RECORD_PREFIX.as_bytes())?
+            .strip_prefix(b" ")?;
+        let sep = rest.iter().position(|c| *c == b' ')?;
+        let (dev, ino) = rest.split_at_checked(sep)?;
+        Some((parse_decimal(dev)?, parse_decimal(ino.get(1..)?)?))
+    }
+
+    /// 完全な記録、または記録の書き込みが途中で止まったもの（完全な記録の接頭辞）か。
+    /// 既存ロックファイルを「本実装の専用ファイル」と認める判定に使う。途中で止まった記録を拒否すると
+    /// その socket 名を以後 bind できなくなるため、管理下の証拠にはしないが専用ファイルとしては認める。
+    pub(super) fn is_record_fragment(b: &[u8]) -> bool {
+        let head = [RECORD_PREFIX.as_bytes(), b" "].concat();
+        let Some(rest) = b.strip_prefix(head.as_slice()) else {
+            return head.starts_with(b);
+        };
+        let (body, complete) = match rest.strip_suffix(b"\n") {
+            Some(x) => (x, true),
+            None => (rest, false),
+        };
+        let digits = |x: &[u8]| x.iter().all(u8::is_ascii_digit);
+        match body.iter().position(|c| *c == b' ') {
+            None => !complete && digits(body),
+            Some(sep) => {
+                let Some((dev, ino)) = body.split_at_checked(sep) else {
+                    return false;
+                };
+                let ino = ino.get(1..).unwrap_or_default();
+                !dev.is_empty() && digits(dev) && digits(ino) && (!complete || !ino.is_empty())
             }
-            let dev = it.next()?.parse().ok()?;
-            let ino = it.next()?.parse().ok()?;
-            Some((dev, ino))
         }
     }
 
@@ -593,11 +638,13 @@ mod imp {
         let lock = BindLock { file: handle.file };
         // 既存ファイルは「専用ロックファイル」と確認できたものだけ受け入れる。ハードリンクされた
         // 他ファイル・無関係な既存ファイルを `record_socket` の `set_len(0)` で破壊しないため、
-        // 単一リンク（nlink == 1）かつ、空または本実装の記録形式（接頭辞付き・小サイズ）のみ許可する。
+        // 単一リンク（nlink == 1）かつ、空または本実装の記録形式（書きかけを含む・小サイズ）のみ許可する。
         if preexisting {
             let valid = meta.nlink() == 1
-                && meta.len() <= 96
-                && (meta.len() == 0 || lock.recorded().is_some());
+                && meta.len() <= RECORD_MAX_LEN as u64
+                && lock
+                    .read_record()
+                    .is_some_and(|b| b.len() as u64 == meta.len() && is_record_fragment(&b));
             if !valid {
                 return Err(err(
                     PluginErrorCode::PermissionDenied,
@@ -761,6 +808,62 @@ mod imp {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
+        }
+
+        /// PLUG-12: 記録は完全な形式（末尾改行つき）だけを同一性として読む。書きかけは専用ファイルとは
+        /// 認めるが、管理下の証拠にはしない（TASK-123.2）。
+        #[test]
+        fn plug12_record_parsing_rejects_torn_and_foreign_content() {
+            assert_eq!(parse_record(b"fcus1 2049 8912910\n"), Some((2049, 8912910)));
+            assert_eq!(parse_record(b"fcus1 2049 891"), None); // 途中で切れた ino
+            assert_eq!(parse_record(b"fcus1 2049 8912910\nx"), None);
+            assert_eq!(parse_record(b"fcus1 +1 2\n"), None);
+            assert_eq!(parse_record(b"fcus1  1 2\n"), None);
+            assert_eq!(parse_record(b"fcus2 1 2\n"), None);
+            assert_eq!(parse_record(b""), None);
+            for ok in [
+                &b""[..],
+                b"fc",
+                b"fcus1 ",
+                b"fcus1 20",
+                b"fcus1 2049 ",
+                b"fcus1 2049 891",
+                b"fcus1 2049 8912910\n",
+            ] {
+                assert!(is_record_fragment(ok), "{ok:?}");
+            }
+            for ng in [
+                &b"hello"[..],
+                b"fcus1 x",
+                b"fcus1 2049\n",
+                b"fcus1 2049 \n",
+                b"fcus1  1 2\n",
+                b"fcus1 1 2 3\n",
+                b"fcus1 1 2\nx",
+            ] {
+                assert!(!is_record_fragment(ng), "{ng:?}");
+            }
+        }
+
+        /// PLUG-12: 書きかけの記録が残ったロックファイルは受け入れ（以後も bind できる）、その記録では
+        /// socket を削除しない（TASK-123.2）。
+        #[test]
+        fn plug12_torn_record_is_accepted_as_lock_but_not_as_evidence() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = open_dir_for_test(&t.0);
+            let sock = t.0.join("a.sock");
+            let _other = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let m = std::fs::symlink_metadata(&sock).unwrap();
+            let name = std::ffi::CString::new("a.sock").unwrap();
+            let ident = crate::sys::lstat_at(&dir, &name, &sock).unwrap();
+            // 改行だけが欠けた（数値は現在の socket と一致する）記録。
+            let torn = format!("fcus1 {} {}", ident.dev, ident.ino);
+            std::fs::write(t.0.join("a.sock.lock"), &torn).unwrap();
+            let lock = acquire_bind_lock(&dir, &name, euid).unwrap();
+            let e = clear_stale_socket(&dir, &name, &sock, euid, &lock).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+            assert_eq!(std::fs::symlink_metadata(&sock).unwrap().ino(), m.ino());
         }
 
         /// PLUG-12: 既存の `.lock` 名が無関係ファイル・ハードリンクなら拒否し、内容を壊さない。

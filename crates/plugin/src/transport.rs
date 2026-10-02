@@ -567,11 +567,6 @@ mod imp {
             let listener = UnixListener::bind(&target).map_err(|e| map_bind_error(e.kind()))?;
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
             let identity = sys::lstat_at(&dir, &name, &bound).ok();
-            // 管理下の証拠として socket の同一性をロックへ記録する（記録できなければ次回は stale
-            // 扱いにならず AlreadyExists になるだけで安全側）。
-            if let Some(ident) = identity.as_ref() {
-                let _ = lock.record_socket(ident);
-            }
             let inner = Self {
                 listener,
                 dir,
@@ -581,6 +576,19 @@ mod imp {
                 identity,
                 euid,
             };
+            // 管理下の証拠として socket の同一性をロックへ記録する。記録できないまま listener を返すと、
+            // 異常終了時に記録の無い socket が残り、以後の bind が stale と判定できず `AlreadyExists` に
+            // なるため、記録失敗は bind 失敗として作成した socket を後始末する（TASK-123.2）。
+            // identity が無い場合は記録せず、直後の `configure` が拒否する。
+            if let Some(ident) = inner.identity.as_ref()
+                && inner.lock.record_socket(ident).is_err()
+            {
+                inner.cleanup();
+                return Err(PluginError::new(
+                    PluginErrorCode::Internal,
+                    "failed to record bound socket",
+                ));
+            }
             if let Err(e) = inner.configure() {
                 inner.cleanup();
                 return Err(e);

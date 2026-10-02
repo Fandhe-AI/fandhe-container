@@ -1253,6 +1253,48 @@ pub(crate) fn open_read_nonblock_at(
     open_file_at(parent, name, consts::O_RDONLY | consts::O_NONBLOCK)
 }
 
+/// [`open_path_follow_at`] / [`reopen_pinned_read_nonblock`] 共通の `openat(2)` 呼び出し。
+/// `O_NOFOLLOW` を付けず最終要素の symlink チェーンをカーネルに辿らせる（ホップ上限を超えると
+/// `ELOOP`）。`O_CREAT` を含まない。辿った先の実体は呼び出し側が fstat と祖先検証で確かめる前提
+/// （PLUG-11・TASK-122.2）。
+fn open_follow_at(parent: BorrowedFd<'_>, name: &CStr, flags: i32) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = flags | consts::O_CLOEXEC;
+    // SAFETY: `name` は借用した NUL 終端文字列で呼び出しの間生存する。`parent` は生存中の
+    // `BorrowedFd`。flags に O_CREAT / O_TMPFILE を含まないため可変長引数（mode）は渡さない。
+    // 成功時の戻り値は新規 fd で、直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let fd = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `parent` 配下の `name` を `O_PATH|O_CLOEXEC` で開く（最終要素の symlink を辿る）。
+/// 辿った先の種別を、ブロックや副作用なしに fstat で確かめるためのプローブ（REPAIR-5）。
+/// 返る fd は fstat 専用。symlink ループは `ELOOP`（PLUG-11・TASK-122.2）。
+pub(crate) fn open_path_follow_at(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+) -> Result<OwnedFd, SysError> {
+    open_follow_at(parent, name, consts::O_PATH)
+}
+
+/// 保持中の `O_PATH` fd `pinned` が指す inode を `/proc/thread-self/fd/N` 経由で
+/// `O_RDONLY|O_NONBLOCK|O_CLOEXEC` に開き直す。パスの再解決（symlink チェーンの再走査）を
+/// 行わず、`pinned` が固定した inode そのものを開く（magic link はリンク先を再 walk しない）。
+/// 呼び出し側は `pinned` への fstat で通常ファイルと確認済みであること（デバイス・FIFO 等への
+/// open の副作用を避ける。REPAIR-5・PLUG-11・TASK-122.2）。
+pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
+    let path = std::ffi::CString::new(format!("/proc/thread-self/fd/{}", pinned.as_raw_fd()))
+        .map_err(|_| SysError::Unsupported)?;
+    // 絶対パスのため dirfd は無視される（`pinned` を渡しても解決に影響しない）。
+    open_follow_at(pinned, &path, consts::O_RDONLY | consts::O_NONBLOCK)
+}
+
 /// `parent` 配下の既存ファイル `name` を書き込み専用（`O_NOFOLLOW`）で開く。
 /// `cgroup.procs`・`cgroup.subtree_control` への書き込みに使う（CORE-3）。
 pub(crate) fn open_write_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, SysError> {
@@ -2450,6 +2492,45 @@ mod tests {
         assert!(status.success());
         let parent = open_dir_path_nofollow(None, &c(&t.base)).unwrap();
         let fd = open_read_nonblock_at(parent.as_fd(), c"pipe").unwrap();
+        assert!(
+            std::fs::File::from(fd)
+                .metadata()
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    /// PLUG-11・TASK-122.2: 追従 open は symlink チェーンの実体を開き、ループは `ELOOP`、
+    /// FIFO への symlink でもブロックしない。
+    #[test]
+    fn plug11_follow_open_resolves_chain_and_detects_loop() {
+        use std::os::unix::fs::{FileTypeExt as _, symlink};
+        let t = TempTree::new("follow");
+        std::fs::write(t.base.join("real"), b"x").unwrap();
+        symlink("real", t.base.join("l1")).unwrap();
+        symlink("l1", t.base.join("l2")).unwrap();
+        symlink("loop", t.base.join("loop")).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(t.base.join("pipe"))
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success());
+        symlink("pipe", t.base.join("lp")).unwrap();
+        let parent = open_dir_path_nofollow(None, &c(&t.base)).unwrap();
+
+        let probe = open_path_follow_at(parent.as_fd(), c"l2").unwrap();
+        assert!(std::fs::File::from(probe).metadata().unwrap().is_file());
+        let pinned = open_path_follow_at(parent.as_fd(), c"l2").unwrap();
+        let fd = reopen_pinned_read_nonblock(pinned.as_fd()).unwrap();
+        assert_eq!(std::fs::File::from(fd).metadata().unwrap().len(), 1);
+
+        assert!(matches!(
+            open_path_follow_at(parent.as_fd(), c"loop"),
+            Err(SysError::Os(n)) if n == ELOOP
+        ));
+        let pinned = open_path_follow_at(parent.as_fd(), c"lp").unwrap();
+        let fd = reopen_pinned_read_nonblock(pinned.as_fd()).unwrap();
         assert!(
             std::fs::File::from(fd)
                 .metadata()

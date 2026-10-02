@@ -1,4 +1,4 @@
-//! plugin 候補の所有者・モード検証（TASK-122.1・PLUG-11・MS-3）。
+//! plugin 候補の所有者・モード・symlink 実体解決検証（TASK-122.1・TASK-122.2・PLUG-11・MS-3）。
 //!
 //! # 役割と呼び出し元
 //!
@@ -16,6 +16,14 @@
 //!   祖先の所有者・モードも探索先と同一基準で検証する）
 //! - ファイルは検証済みディレクトリ fd からの相対 open（`openat`）で開き、開いた同一 fd への
 //!   `fstat` で判定する。パスの再 stat / lstat はしない
+//! - plugin ファイル名が symlink（チェーン含む）のときは、カーネルに追従 open（`O_NOFOLLOW`
+//!   なし）でチェーンを辿らせて **一度だけ** 実体 fd を得て、その fd の所有者・モードを判定する
+//!   （symlink 自体の属性では判定しない）。ホップ上限超過・ループはカーネルの `ELOOP`
+//!   （上限 40）を [`PluginTrustErrorKind::SymlinkLoop`] に写し、自前のループは持たない。
+//!   実体の正規パスは `/proc/thread-self/fd/N` の `readlink` で得て、その親ディレクトリを
+//!   通常の探索先と同じ `/` からの fd 相対ウォークで全祖先まで検証し、検証済み親からの
+//!   `O_PATH|O_NOFOLLOW` open の `dev/ino` が保持 fd と一致することを確かめる（保持 fd が
+//!   検証済みの祖先連鎖の下にあることの証明。パスから fd を開き直さない）
 //! - 判定基準はディレクトリ・ファイルとも同一で、所有者が root か実効 UID であり、かつ
 //!   `mode & 0o022 == 0`。sticky bit 付きでも例外にしない
 //!
@@ -23,7 +31,13 @@
 //!
 //! - sticky bit 付きの祖先（`/tmp` 等）も例外にせず拒否する（fail-closed）。plugin は
 //!   他ユーザーが書き込めない祖先配下にのみ置ける
-//! - symlink は現状すべて拒否する。実体解決は TASK-122.2（#277）の将来仕様
+//! - symlink を辿るのは plugin ファイル名（最終要素）だけ。探索先ディレクトリ自体や祖先の
+//!   symlink は従来どおり `NotDirectory` で拒否する
+//! - チェーン中間ホップの symlink が置かれたディレクトリ自体は検証しない（検証するのは探索先
+//!   連鎖と、最終実体およびその祖先連鎖）。最終実体は信頼できる所有者・書き込み不可の祖先配下に
+//!   限られ、内容の同一性はハッシュ照合（TASK-122.3・#279）で担保する前提
+//! - symlink 経由の検証は実体の正規パスの取得に `/proc` を要する。未マウント環境では `Io` で
+//!   拒否する（fail-closed）
 //! - ハッシュ・署名の照合は未実装（TASK-122.3・#279）。信頼できる所有者が置いた任意の
 //!   バイナリは本モジュールを通る
 //! - レジストリへの配線は未実施で、本モジュール単体では未検証候補の登録を防がない
@@ -33,7 +47,7 @@
 //! - エラーの error-format 準拠の整形は TASK-122.5（#283）。本モジュールは機械可読な
 //!   [`PluginTrustErrorKind`] と [`TraitError`] への変換までを担う
 //!
-//! 本モジュールは新規の `unsafe` を持たない（Linux では `sys` の既存ラッパーと std のみを使う）。
+//! 本モジュールは `unsafe` を持たない（Linux では `sys` のラッパーと std のみを使う）。
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -68,6 +82,8 @@ pub enum PluginTrustErrorKind {
     InvalidPath,
     /// open / fstat の失敗、または検証中の実体不一致。
     Io,
+    /// symlink のループ、またはホップ上限を超えるチェーン（PLUG-11・TASK-122.2）。
+    SymlinkLoop,
     /// 非 Linux・対応外アーキテクチャ（同等検証が未実装）。
     Unsupported,
 }
@@ -118,6 +134,7 @@ impl fmt::Display for PluginTrustError {
             PluginTrustErrorKind::NotDirectory => "not a directory (or a symlink)",
             PluginTrustErrorKind::InvalidPath => "invalid path",
             PluginTrustErrorKind::Io => "failed to open or stat",
+            PluginTrustErrorKind::SymlinkLoop => "symlink loop or chain too long",
             PluginTrustErrorKind::Unsupported => {
                 "ownership verification is not supported on this platform"
             }
@@ -136,6 +153,7 @@ impl From<PluginTrustError> for TraitError {
             }
             PluginTrustErrorKind::NotRegularFile
             | PluginTrustErrorKind::NotDirectory
+            | PluginTrustErrorKind::SymlinkLoop
             | PluginTrustErrorKind::InvalidPath => ErrorCode::InvalidArgument,
             PluginTrustErrorKind::Io => ErrorCode::Internal,
             PluginTrustErrorKind::Unsupported => ErrorCode::Unimplemented,
@@ -178,6 +196,7 @@ pub struct VerifiedPluginFile {
     owner_uid: u32,
     mode: u32,
     path: PathBuf,
+    resolved_path: PathBuf,
 }
 
 impl VerifiedPluginFile {
@@ -201,9 +220,15 @@ impl VerifiedPluginFile {
         self.mode
     }
 
-    /// 検証時のパス（表示用。再 open に使わない）。
+    /// 検証時のパス（symlink の場合は発見時の symlink 側。表示用。再 open に使わない）。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 実体の正規パス（symlink・`..` を含まない。通常ファイルでは [`Self::path`] と同一。
+    /// 表示用で再 open に使わない。TASK-122.2）。
+    pub fn resolved_path(&self) -> &Path {
+        &self.resolved_path
     }
 }
 
@@ -213,7 +238,7 @@ mod imp {
     use crate::sys::{self, SysError};
     use std::ffi::CString;
     use std::fs::Metadata;
-    use std::os::fd::{AsFd as _, OwnedFd};
+    use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
     use std::path::Component;
@@ -223,6 +248,9 @@ mod imp {
     pub struct VerifiedPluginDir {
         fd: OwnedFd,
         path: PathBuf,
+        /// 試験用変種の信頼起点。symlink 実体の祖先検証へ引き継ぐ（本番ビルドには存在しない）。
+        #[cfg(test)]
+        anchor: Option<PathBuf>,
     }
 
     fn map_sys(e: SysError, dir_open: bool) -> PluginTrustErrorKind {
@@ -236,6 +264,16 @@ mod imp {
                 }
             }
             SysError::Os(n) if n == sys::ELOOP => PluginTrustErrorKind::NotRegularFile,
+            _ => PluginTrustErrorKind::Io,
+        }
+    }
+
+    /// 追従 open（symlink を辿る経路）専用の errno 写像。`ELOOP` はループ・ホップ上限超過。
+    fn map_sys_follow(e: SysError) -> PluginTrustErrorKind {
+        match e {
+            SysError::Unsupported => PluginTrustErrorKind::Unsupported,
+            SysError::Os(n) if n == sys::ELOOP => PluginTrustErrorKind::SymlinkLoop,
+            SysError::Os(n) if n == sys::ENOTDIR => PluginTrustErrorKind::NotRegularFile,
             _ => PluginTrustErrorKind::Io,
         }
     }
@@ -337,6 +375,8 @@ mod imp {
         Ok(VerifiedPluginDir {
             fd,
             path: dir.to_path_buf(),
+            #[cfg(test)]
+            anchor: anchor.map(Path::to_path_buf),
         })
     }
 
@@ -359,6 +399,9 @@ mod imp {
             let probe =
                 sys::open_path_nofollow(self.fd.as_fd(), &c).map_err(|e| err(map_sys(e, false)))?;
             let probe_md = fstat(&probe).map_err(|_| err(PluginTrustErrorKind::Io))?;
+            if probe_md.file_type().is_symlink() {
+                return self.verify_symlink(&c, path);
+            }
             if !probe_md.is_file() {
                 return Err(err(PluginTrustErrorKind::NotRegularFile));
             }
@@ -378,7 +421,78 @@ mod imp {
                 file: File::from(rfd),
                 owner_uid: md.uid(),
                 mode: md.mode(),
+                resolved_path: path.clone(),
                 path,
+            })
+        }
+
+        /// `name` が symlink のときの検証（PLUG-11・TASK-122.2）。カーネルに最終要素の
+        /// チェーンを辿らせて保持 fd を一度だけ得て、実体 inode と実体の全祖先を検証する。
+        fn verify_symlink(
+            &self,
+            name: &CString,
+            path: PathBuf,
+        ) -> Result<VerifiedPluginFile, PluginTrustError> {
+            let err = |k| PluginTrustError::new(k, TrustTarget::File, &path);
+            // (1) 追従 O_PATH で実体を一度だけ解決して固定する（FIFO・デバイスの open による
+            // ハング・副作用を避ける。REPAIR-5）。ループ・ホップ超過はここで ELOOP。
+            let probe = sys::open_path_follow_at(self.fd.as_fd(), name)
+                .map_err(|e| err(map_sys_follow(e)))?;
+            let probe_md = fstat(&probe).map_err(|_| err(PluginTrustErrorKind::Io))?;
+            if !probe_md.is_file() {
+                return Err(err(PluginTrustErrorKind::NotRegularFile));
+            }
+            // (2) 保持 fd は固定済みの O_PATH fd から開き直す。symlink チェーンを再走査しない
+            // ため、probe 後に張り替えられても別の実体は開かれない（通常ファイルと確認済み）。
+            let rfd = sys::reopen_pinned_read_nonblock(probe.as_fd())
+                .map_err(|e| err(map_sys(e, false)))?;
+            let md = fstat(&rfd).map_err(|_| err(PluginTrustErrorKind::Io))?;
+            if !md.is_file() {
+                return Err(err(PluginTrustErrorKind::NotRegularFile));
+            }
+            if md.dev() != probe_md.dev() || md.ino() != probe_md.ino() {
+                return Err(err(PluginTrustErrorKind::Io));
+            }
+            // (3) 判定は実体 inode に対して行う（symlink の lrwxrwxrwx は使わない）。
+            check_owner_and_mode(md.uid(), md.mode(), sys::effective_uid()).map_err(err)?;
+            // (4) 実体の正規パスを保持 fd の magic link から得る。
+            let magic = PathBuf::from(format!("/proc/thread-self/fd/{}", rfd.as_raw_fd()));
+            let resolved = std::fs::read_link(&magic).map_err(|_| err(PluginTrustErrorKind::Io))?;
+            if !resolved.is_absolute() {
+                return Err(err(PluginTrustErrorKind::Io));
+            }
+            let (Some(real_parent), Some(real_name)) = (resolved.parent(), resolved.file_name())
+            else {
+                return Err(err(PluginTrustErrorKind::Io));
+            };
+            // 削除済みの実体は `... (deleted)` 付きで返るが、正当な実名が同じ接尾辞を持ちうるため
+            // 文字列では判定しない。(6) の検証済み親からの open と保持 fd の dev/ino 照合で
+            // 実体の存在を確かめる（削除済みなら ENOENT か inode 不一致で拒否される）。
+            if !is_single_component(real_name) {
+                return Err(err(PluginTrustErrorKind::Io));
+            }
+            // (5) 実体の親と全祖先を探索先と同一基準で検証する。
+            #[cfg(test)]
+            let anchor = self.anchor.as_deref();
+            #[cfg(not(test))]
+            let anchor: Option<&Path> = None;
+            let real_dir = walk_verify(real_parent, anchor)?;
+            // (6) 検証済み親の下の実体が保持 fd と同一 inode であることを確かめる（保持 fd が
+            // 検証済みの祖先連鎖の下にある証明。この fd は fstat のみに使い、引き渡さない）。
+            let real_c = CString::new(real_name.as_bytes())
+                .map_err(|_| err(PluginTrustErrorKind::InvalidPath))?;
+            let bound = sys::open_path_nofollow(real_dir.fd.as_fd(), &real_c)
+                .map_err(|e| err(map_sys(e, false)))?;
+            let bound_md = fstat(&bound).map_err(|_| err(PluginTrustErrorKind::Io))?;
+            if bound_md.dev() != md.dev() || bound_md.ino() != md.ino() {
+                return Err(err(PluginTrustErrorKind::Io));
+            }
+            Ok(VerifiedPluginFile {
+                file: File::from(rfd),
+                owner_uid: md.uid(),
+                mode: md.mode(),
+                path,
+                resolved_path: resolved,
             })
         }
     }
@@ -506,6 +620,10 @@ mod tests {
             ),
             (
                 PluginTrustErrorKind::InvalidPath,
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                PluginTrustErrorKind::SymlinkLoop,
                 ErrorCode::InvalidArgument,
             ),
             (PluginTrustErrorKind::Io, ErrorCode::Internal),

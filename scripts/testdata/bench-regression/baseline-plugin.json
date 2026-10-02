@@ -2,7 +2,7 @@
   "schema_version": 1,
   "metrics": {
     "plugin_boundary_op_a_inproc_p50": {
-      "value": 1000,
+      "value": 5000,
       "unit": "ns",
       "direction": "lower_is_better"
     },
@@ -12,7 +12,7 @@
       "direction": "lower_is_better"
     },
     "plugin_boundary_op_a_delta_p50": {
-      "value": 27000,
+      "value": 23000,
       "unit": "ns",
       "direction": "lower_is_better"
     },

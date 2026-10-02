@@ -2,15 +2,15 @@
   "schema_version": 1,
   "metrics": {
     "plugin_boundary_op_a_inproc_p50": {
-      "value": 1000,
+      "value": 5000,
       "unit": "ns"
     },
     "plugin_boundary_op_a_framed_p50": {
-      "value": 28000,
+      "value": 31450,
       "unit": "ns"
     },
     "plugin_boundary_op_a_delta_p50": {
-      "value": 31050,
+      "value": 26450,
       "unit": "ns"
     },
     "plugin_boundary_list_images_inproc_p50": {

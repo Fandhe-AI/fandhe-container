@@ -394,12 +394,23 @@ bench-check-selftest: ## ベンチ回帰比較スクリプトの自己テスト�
 # プレースホルダベンチ（benches/benches/regression_placeholder.rs）を実行し、
 # 結果を基準値（benches/baseline.json）と比較する。一時ディレクトリは trap で
 # 必ず削除する（1 レシピ行で完結させ、定義から削除までの経路を保つ）。
+# 対象ベンチは bench-baseline と同じ BENCH_NAMES を実行し、結果は baseline.json に登録済みの
+# metric だけに絞って比較する（check-bench-regression.sh は metric 集合の完全一致を要求するため）。
+# これにより baseline 再生成（plugin 系 metric の登録。TASK-88.h1・TASK-113.h1）後は、再生成した
+# metric がそのまま 15% 回帰判定の対象になり、Makefile の追従修正が要らない。未登録の間は
+# plugin 系 metric は比較されない（plugin 境界の性能回帰ゲートは未有効）。
 .PHONY: bench-check
 bench-check: ## ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
-	cargo bench -p fandhe-container-benches --bench regression_placeholder -- --output "$$tmp/results.json" && \
-	bash scripts/check-bench-regression.sh benches/baseline.json "$$tmp/results.json"
+	mkdir "$$tmp/in" "$$tmp/out" && \
+	for n in $(BENCH_NAMES); do \
+		cargo bench -p fandhe-container-benches --bench "$$n" -- --output "$$tmp/in/$$n.json" >/dev/null || exit 1; \
+	done && \
+	jq -s --slurpfile b benches/baseline.json \
+		'{schema_version: 1, metrics: (map(.metrics) | add | with_entries(select(.key as $$k | $$b[0].metrics | has($$k))))}' \
+		"$$tmp"/in/*.json > "$$tmp/out/results.json" && \
+	bash scripts/check-bench-regression.sh benches/baseline.json "$$tmp/out/results.json"
 else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-check をスキップ"
 endif
@@ -436,8 +447,7 @@ bench-baseline-selftest: ## baseline.json 生成スクリプトの自己テス�
 # 引用が壊れず、インジェクションにならない）。
 # plugin 境界ベンチ（TASK-113.1〜113.3）は metric を metrics.json に登録済みのため、ここにも
 # 同時に載せる（generate_baseline.sh は metrics.json と results の metric 集合が完全一致しないと
-# exit 2）。baseline 再生成時は `bench-check` の対象ベンチも同じ集合に揃えること（baseline と
-# results の集合不一致は check-bench-regression.sh が exit 2 にするため）。
+# exit 2）。baseline 再生成時は `bench-check` も同じ BENCH_NAMES を実行し baseline 登録済み metric に絞って比較する。
 BENCH_NAMES := regression_placeholder plugin_boundary plugin_boundary_list_images
 BENCH_METRICS ?= benches/metrics.json
 BENCH_BASELINE_OUT ?= benches/baseline.json

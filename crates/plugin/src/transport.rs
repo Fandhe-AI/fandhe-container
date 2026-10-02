@@ -784,7 +784,7 @@ mod imp {
                 let res = match self.stream.set_read_timeout(Some(remaining)) {
                     Ok(()) => self.stream.read(slice),
                     Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-                        self.nonblocking_once(|mut s| s.read(slice))?
+                        self.nonblocking_once(FrameOp::Read, |mut s| s.read(slice))?
                     }
                     Err(_) => return Err(internal_read()),
                 };
@@ -800,6 +800,8 @@ mod imp {
                     Err(e) => return Err(map_frame_io_error(e.kind(), FrameOp::Read)),
                 }
             }
+            // 最後の read が期限後に成功した場合も合計期限超過として扱う（REPAIR-5）。
+            remaining_until(deadline, FrameOp::Read)?;
             Ok(())
         }
 
@@ -808,17 +810,16 @@ mod imp {
         /// ため `Internal` で失敗させ、blocking への復元に失敗した場合も失敗させる（REPAIR-5）。
         fn nonblocking_once(
             &self,
+            frame_op: FrameOp,
             op: impl FnOnce(&UnixStream) -> io::Result<usize>,
         ) -> Result<io::Result<usize>, PluginError> {
-            self.stream
-                .set_nonblocking(true)
-                .map_err(|_| internal_read())?;
+            // 失敗は呼び出し元の方向（read / write）で報告する。
+            let internal = || map_frame_io_error(io::ErrorKind::Other, frame_op);
+            self.stream.set_nonblocking(true).map_err(|_| internal())?;
             let res = op(&self.stream);
-            self.stream
-                .set_nonblocking(false)
-                .map_err(|_| internal_read())?;
+            self.stream.set_nonblocking(false).map_err(|_| internal())?;
             match res {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(internal_read()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(internal()),
                 other => Ok(other),
             }
         }
@@ -837,7 +838,7 @@ mod imp {
                 let res = match self.stream.set_write_timeout(Some(remaining)) {
                     Ok(()) => self.stream.write(slice),
                     Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-                        self.nonblocking_once(|mut s| s.write(slice))?
+                        self.nonblocking_once(FrameOp::Write, |mut s| s.write(slice))?
                     }
                     Err(_) => return Err(internal_write()),
                 };
@@ -853,6 +854,8 @@ mod imp {
                     Err(e) => return Err(map_frame_io_error(e.kind(), FrameOp::Write)),
                 }
             }
+            // 最後の write が期限後に成功した場合も合計期限超過として扱う（REPAIR-5）。
+            remaining_until(deadline, FrameOp::Write)?;
             Ok(())
         }
     }

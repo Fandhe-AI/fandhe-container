@@ -1,18 +1,22 @@
 //! macOS バックエンドを plugin 化した場合の VM cold start への上乗せ回帰確認（TASK-113.4・PLUG-6・MAC-2・MS-3）。
 //!
 //! 役割: plugin 境界（別プロセス＋UDS＋長さ接頭辞フレーム）を挟むことで増える起動コストを
-//! 「都度起動（spawn → 接続受理）」と「常駐（プロセス起動＋UDS 接続＋4 RPC）」の 2 モードで測り、
-//! MAC-2 の cold start 目標（2 秒）に対する比が PLUG-6 の期待（1% 未満＝20 ms 未満）に収まるか判定する。
+//! 「都度起動（spawn → 接続受理）」と「常駐（計測前に起動・接続済みの plugin へ 4 RPC）」の 2 モードで測る。
+//! 各モードは plugin を挟まない同一プロセス経路（同じ操作の直接呼び出し）を同条件で計測し、
+//! その**差（上乗せ）**が MAC-2 の cold start 目標（2 秒）の PLUG-6 の期待（1% 未満＝20 ms 未満）に収まるか判定する。
+//! 計測区間は都度起動が「spawn → accept 完了」、常駐が「接続済み plugin への代表操作 A×3＋B×1 の 4 RPC」のみで、
+//! 常駐 plugin の起動・接続・子プロセス回収は計測区間の外に置く。
 //! 参照値は PoC-13（長さ接頭辞フレーム: 都度 2.043 ms／常駐 4.500 ms、gRPC: 2.537 ms／5.032 ms）。
 //!
 //! 呼び出し元: `benches/plugin_boundary_macos_cold_start.rs`（薄い `main`）と
-//! `tests/macos_cold_start.rs`（macOS 結合試験）、子プロセス側 `bin/plugin_boundary_stub.rs`。
+//! `tests/macos_cold_start.rs`（macOS 結合試験）、子プロセス側 `bin/plugin_boundary_stub.rs`（plugin 役のみ）。
 //! 純粋ロジック（定数・比率・判定・ログ整形）は全 OS で単体テストし、計測部（`cfg(unix)`）の
 //! 実行は macOS のみで有効化する（他 OS では呼び出し側が skip を明示する）。
 //!
 //! 計測対象は 113.1・113.2 と同じ **模擬制御コア**であり、実 macOS バックエンド plugin
 //! （`crates/plugin-macos`。TASK-115）や macOS 独自 VM の cold start 実測（TASK-70・人間担当）ではない
-//! （REPAIR-3）。PoC-13 との差分: 常駐モードでは子プロセスの回収（期限付き wait）を計測区間の外に置く。
+//! （REPAIR-3）。PoC-13 との差分: 常駐モードは plugin の起動を計測区間の外に置き（PoC-13 は起動込みの 4.500 ms）、
+//! 都度起動・常駐とも非 plugin 経路との差を上乗せとして判定する。
 //! gRPC 経路（TASK-108）は未実装のため同条件比較はフレーム行のみで、gRPC 値は参照ログに出すだけ。
 //! 実測基準値の登録と回帰ゲート（`baseline.json`）への接続は TASK-88.h1・TASK-113.h1。
 
@@ -37,8 +41,6 @@ pub const MAX_TRIALS: usize = 100;
 
 /// 子プロセスの引数（plugin 役）。
 pub const ARG_PLUGIN_SERVE: &str = "--plugin-serve";
-/// 子プロセスの引数（core 役ハーネス）。
-pub const ARG_CORE_HARNESS: &str = "--core-harness";
 
 /// 判定の上限値（ms）= MAC-2 目標 × PLUG-6 の 1%（= 20 ms）。
 pub fn limit_ms() -> f64 {
@@ -61,7 +63,7 @@ pub fn ratio_percent(overhead_ms: f64) -> Result<f64, BenchError> {
 pub enum Mode {
     /// 都度起動（spawn → 接続受理）。
     Spawn,
-    /// 常駐（プロセス起動＋UDS 接続＋代表操作 A×3＋B×1 の 4 RPC）。
+    /// 常駐（計測前に起動・接続済みの plugin へ代表操作 A×3＋B×1 の 4 RPC。起動は計測区間の外）。
     Resident,
 }
 
@@ -114,12 +116,28 @@ pub fn judge(mode: Mode, overhead_ms: f64) -> Result<Verdict, BenchError> {
     })
 }
 
+/// plugin 経路の所要（ms）から非 plugin 経路の所要（ms）を引いた上乗せ（ms）。
+///
+/// 非有限・負値の入力は構造化エラー。差が負（計測ノイズで plugin 経路の方が速く見えた）の場合は
+/// 上乗せなしとして 0 へ丸める（入力そのものの不正とは区別する）。
+pub fn overhead_ms(plugin_ms: f64, baseline_ms: f64) -> Result<f64, BenchError> {
+    if !plugin_ms.is_finite() || !baseline_ms.is_finite() || plugin_ms < 0.0 || baseline_ms < 0.0 {
+        return Err(BenchError::new(
+            "invalid-measurement",
+            "timings must be finite non-negative numbers",
+        ));
+    }
+    Ok((plugin_ms - baseline_ms).max(0.0))
+}
+
 /// 構造化ログ 1 行（英語。stderr 用）。参照値は PoC-13。
-pub fn log_line(mode: Mode, overhead_ms: f64) -> Result<String, BenchError> {
+/// `plugin_ms`（plugin 経路）と `baseline_ms`（非 plugin 経路）の差を上乗せとして出す。
+pub fn log_line(mode: Mode, plugin_ms: f64, baseline_ms: f64) -> Result<String, BenchError> {
+    let overhead_ms = overhead_ms(plugin_ms, baseline_ms)?;
     let ratio = ratio_percent(overhead_ms)?;
     let (framed, grpc) = mode.reference();
     Ok(format!(
-        "macos_cold_start mode={} overhead_ms={overhead_ms:.3} ratio_percent={ratio:.4} limit_percent={MAX_OVERHEAD_RATIO_PERCENT:.1} ref_framed_ms={framed:.3} ref_grpc_ms={grpc:.3}",
+        "macos_cold_start mode={} plugin_ms={plugin_ms:.3} baseline_ms={baseline_ms:.3} overhead_ms={overhead_ms:.3} ratio_percent={ratio:.4} limit_percent={MAX_OVERHEAD_RATIO_PERCENT:.1} ref_framed_ms={framed:.3} ref_grpc_ms={grpc:.3}",
         mode.name(),
     ))
 }
@@ -138,18 +156,19 @@ pub fn median_ms(samples: &[f64]) -> Result<f64, BenchError> {
 }
 
 #[cfg(unix)]
-pub use proc::{measure_all, run_core_harness, serve_plugin_socket};
+pub use proc::{measure_all, serve_plugin_socket};
 
 #[cfg(unix)]
 mod proc {
     use super::*;
-    use crate::plugin_boundary::{Model, round_trip, run_op_a_framed};
+    use crate::plugin_boundary::{Model, round_trip, run_op_a_framed, run_op_a_inproc};
     use crate::plugin_boundary_list_images::{ImageLister, MockImageStore};
     use fandhe_container_plugin::{
         ControlMessage, PluginError, PluginErrorCode, RpcTimeout, UdsListener, UdsStream,
         decode_message, encode_message,
     };
     use std::fs;
+    use std::hint::black_box;
     use std::os::unix::fs::DirBuilderExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
@@ -303,18 +322,16 @@ mod proc {
         serve(&mut stream)
     }
 
-    /// 子プロセス（core 役ハーネス。`--core-harness`）の本体。接続して A×3＋B×1 の 4 RPC を行い、
-    /// 応答内容を具体値で検証して終了する（切断で常駐側ループが終わる）。
-    pub fn run_core_harness(socket: &Path) -> Result<(), BenchError> {
-        let mut stream = UdsStream::connect(socket, SETUP_TIMEOUT).map_err(pe)?;
+    /// 接続済みの plugin へ代表操作 A×3＋B×1 の 4 RPC を行い、応答内容を具体値で検証する。
+    fn run_four_rpcs(stream: &mut UdsStream) -> Result<(), BenchError> {
         let mut next_id = 0u64;
-        let a = run_op_a_framed(&mut stream, &mut next_id)
+        let a = run_op_a_framed(stream, &mut next_id)
             .map_err(|e| BenchError::new(e.code, e.message))?;
         if a.state != "running" {
             return Err(BenchError::new("bad-response", "unexpected state"));
         }
         next_id += 1;
-        let images = round_trip(&mut stream, next_id, vec![OP_LIST_IMAGES.to_string()])
+        let images = round_trip(stream, next_id, vec![OP_LIST_IMAGES.to_string()])
             .map_err(|e| BenchError::new(e.code, e.message))?;
         if images != MockImageStore.list_images() {
             return Err(BenchError::new("bad-response", "unexpected image list"));
@@ -322,7 +339,7 @@ mod proc {
         Ok(())
     }
 
-    /// 都度起動: bind 済み listener に対し、spawn から accept 完了（READY の代理）までを測る。
+    /// 都度起動（plugin 経路）: bind 済み listener に対し、spawn から accept 完了（READY の代理）までを測る。
     fn once_spawn(exe: &Path) -> Result<f64, BenchError> {
         let dir = TempDir::new()?;
         let listener = UdsListener::bind(&dir.0.join("s")).map_err(pe)?;
@@ -335,46 +352,83 @@ mod proc {
         Ok(ms)
     }
 
-    /// 常駐: 計測側が plugin 役。spawn から 4 RPC 完了（切断観測）までを測る。
+    /// 都度起動（非 plugin 経路）: 同じ制御コアを同一プロセス内で用意するまでを測る。
+    fn once_spawn_baseline() -> Result<f64, BenchError> {
+        let start = Instant::now();
+        let model = black_box(Model::new());
+        let store = black_box(MockImageStore);
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        drop((model, store));
+        Ok(ms)
+    }
+
+    /// 常駐（plugin 経路）: plugin を計測前に起動・接続済みにし、4 RPC だけを測る。
+    /// plugin の起動・accept・切断後の回収は計測区間の外。
     fn once_resident(exe: &Path) -> Result<f64, BenchError> {
         let dir = TempDir::new()?;
         let listener = UdsListener::bind(&dir.0.join("s")).map_err(pe)?;
-        let start = Instant::now();
-        let child = Guard::spawn(exe, ARG_CORE_HARNESS, listener.path())?;
+        let child = Guard::spawn(exe, ARG_PLUGIN_SERVE, listener.path())?;
         let mut stream = listener.accept(SETUP_TIMEOUT).map_err(pe)?;
-        serve(&mut stream)?;
+        let start = Instant::now();
+        run_four_rpcs(&mut stream)?;
         let ms = start.elapsed().as_secs_f64() * 1000.0;
+        // 切断で plugin 側ループが終わる。回収は計測区間の外。
         drop(stream);
         child.finish()?;
         Ok(ms)
     }
 
-    fn measure_mode(exe: &Path, mode: Mode, trials: usize) -> Result<f64, BenchError> {
+    /// 常駐（非 plugin 経路）: 同じ 4 操作を同一プロセス内の直接呼び出しで測る（制御コアは計測前に用意）。
+    fn once_resident_baseline() -> Result<f64, BenchError> {
+        let mut model = Model::new();
+        let store = MockImageStore;
+        let start = Instant::now();
+        let a = run_op_a_inproc(&mut model).map_err(|e| BenchError::new(e.code, e.message))?;
+        let images = black_box(store.list_images());
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        if a.state != "running" || images != MockImageStore.list_images() {
+            return Err(BenchError::new(
+                "bad-response",
+                "unexpected baseline result",
+            ));
+        }
+        Ok(ms)
+    }
+
+    /// `(plugin 経路の中央値, 非 plugin 経路の中央値)`（ms）。
+    fn measure_mode(exe: &Path, mode: Mode, trials: usize) -> Result<(f64, f64), BenchError> {
         if trials == 0 || trials > MAX_TRIALS {
             return Err(BenchError::new("invalid-args", "trials must be in 1..=100"));
         }
-        let once = |exe: &Path| match mode {
+        let plugin = |exe: &Path| match mode {
             Mode::Spawn => once_spawn(exe),
             Mode::Resident => once_resident(exe),
         };
+        let baseline = || match mode {
+            Mode::Spawn => once_spawn_baseline(),
+            Mode::Resident => once_resident_baseline(),
+        };
         // 初回 exec 検査等の影響を除くため 1 回捨てる。
-        once(exe)?;
-        let mut v = Vec::with_capacity(trials);
+        plugin(exe)?;
+        baseline()?;
+        let mut p = Vec::with_capacity(trials);
+        let mut b = Vec::with_capacity(trials);
         for _ in 0..trials {
-            v.push(once(exe)?);
+            p.push(plugin(exe)?);
+            b.push(baseline()?);
         }
-        median_ms(&v)
+        Ok((median_ms(&p)?, median_ms(&b)?))
     }
 
-    /// 両モードを計測してログ出力し、判定する。`exe` は stub バイナリの絶対パス。
+    /// 両モードを計測してログ出力し、上乗せ（plugin 経路 − 非 plugin 経路）を判定する。`exe` は stub バイナリの絶対パス。
     pub fn measure_all(exe: &Path, trials: usize) -> Result<(Verdict, Verdict), BenchError> {
-        let s = measure_mode(exe, Mode::Spawn, trials)?;
-        let r = measure_mode(exe, Mode::Resident, trials)?;
+        let (sp, sb) = measure_mode(exe, Mode::Spawn, trials)?;
+        let (rp, rb) = measure_mode(exe, Mode::Resident, trials)?;
         // 片方が超過でももう片方の値を残すため、判定前に両方のログを出す。
-        eprintln!("{}", log_line(Mode::Spawn, s)?);
-        eprintln!("{}", log_line(Mode::Resident, r)?);
-        let sv = judge(Mode::Spawn, s);
-        let rv = judge(Mode::Resident, r);
+        eprintln!("{}", log_line(Mode::Spawn, sp, sb)?);
+        eprintln!("{}", log_line(Mode::Resident, rp, rb)?);
+        let sv = judge(Mode::Spawn, overhead_ms(sp, sb)?);
+        let rv = judge(Mode::Resident, overhead_ms(rp, rb)?);
         Ok((sv?, rv?))
     }
 }
@@ -419,8 +473,23 @@ mod tests {
     #[test]
     fn log_line_exact() {
         assert_eq!(
-            log_line(Mode::Resident, 4.5).unwrap(),
-            "macos_cold_start mode=resident overhead_ms=4.500 ratio_percent=0.2250 limit_percent=1.0 ref_framed_ms=4.500 ref_grpc_ms=5.032"
+            log_line(Mode::Resident, 4.6, 0.1).unwrap(),
+            "macos_cold_start mode=resident plugin_ms=4.600 baseline_ms=0.100 overhead_ms=4.500 ratio_percent=0.2250 limit_percent=1.0 ref_framed_ms=4.500 ref_grpc_ms=5.032"
+        );
+    }
+
+    /// 上乗せは plugin 経路と非 plugin 経路の差（PLUG-6）。ノイズによる負の差は 0、不正入力はエラー。
+    #[test]
+    fn overhead_is_difference_of_paths() {
+        assert!((overhead_ms(4.6, 0.1).unwrap() - 4.5).abs() < 1e-9);
+        assert_eq!(overhead_ms(0.1, 0.2).unwrap(), 0.0);
+        assert_eq!(
+            overhead_ms(f64::NAN, 0.1).unwrap_err().code,
+            "invalid-measurement"
+        );
+        assert_eq!(
+            overhead_ms(1.0, -0.1).unwrap_err().code,
+            "invalid-measurement"
         );
     }
 

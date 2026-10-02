@@ -14,14 +14,24 @@ publish = false
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# plugin 境界基盤。`plugin` feature 有効時のみ依存する（PLUG-3・TASK-111.1・#262）。
+fandhe-container-plugin = { workspace = true, optional = true }
 
 # 結合試験 tests/escape_suite.rs 専用の任意クロージャ実行経路 `spawn_container_probe` を公開する feature
 # （SEC-2・TASK-42.1・#199）。通常ビルドでは無効で、下の dev-dependency（自己参照）でテスト時のみ有効化する。
+#
+# `plugin` feature（PLUG-3・TASK-111.1・#262）: 未使用の plugin 相当機能をコンパイル時に除外して
+# 軽量バイナリを作れるようにする。`default` を新設し既定では有効（従来の利用側は挙動が変わらない）。
+# 無効化は `--no-default-features`。CI 組み込みとバイナリサイズ記録は TASK-111.2（#263）。
 [features]
+default = ["plugin"]
+plugin = ["dep:fandhe-container-plugin"]
 escape-probe = []
 
+# default-features = false は、`--no-default-features` のテスト時に自己参照経由で default が
+# 統合されて feature 無効構成を検証できなくなるのを防ぐ（既定の `cargo test` では影響しない）。
 [dev-dependencies]
-fandhe-container-core = { path = ".", features = ["escape-probe"] }
+fandhe-container-core = { path = ".", default-features = false, features = ["escape-probe"] }
 
 # namespace 分離の結合試験（CORE-1・TASK-27.2）。libtest はテストをスレッドで実行し
 # CLONE_NEWUSER が EINVAL になるため、単一スレッドの独自 main（harness = false）で動かす。

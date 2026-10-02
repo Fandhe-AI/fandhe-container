@@ -80,15 +80,17 @@ pub struct PluginError {
 
 impl PluginError {
     /// エラーを生成する。`message` が上限を超える場合は文字境界で切り詰める。
-    pub fn new(code: PluginErrorCode, message: impl Into<String>) -> Self {
-        let mut message = message.into();
-        if message.len() > PLUGIN_ERROR_MESSAGE_MAX_BYTES {
-            let mut end = PLUGIN_ERROR_MESSAGE_MAX_BYTES;
-            while end > 0 && !message.is_char_boundary(end) {
-                end -= 1;
-            }
-            message.truncate(end);
+    ///
+    /// 入力全体を複製せず、上限内の UTF-8 接頭部分だけを確保する（確保量が
+    /// [`PLUGIN_ERROR_MESSAGE_MAX_BYTES`] で頭打ちになる。AGENTS.md「リソース上限」）。
+    pub fn new(code: PluginErrorCode, message: impl AsRef<str>) -> Self {
+        let src = message.as_ref();
+        let mut end = src.len().min(PLUGIN_ERROR_MESSAGE_MAX_BYTES);
+        while end > 0 && !src.is_char_boundary(end) {
+            end -= 1;
         }
+        // `end` は文字境界のため `get` は常に `Some` だが、panic を避けて空文字へ倒す。
+        let message = String::from(src.get(..end).unwrap_or_default());
         Self { code, message }
     }
 
@@ -165,6 +167,16 @@ mod tests {
         let e = PluginError::new(PluginErrorCode::Internal, "あ".repeat(1400));
         assert_eq!(e.message().len(), 4095);
         assert!(e.message().chars().all(|c| c == 'あ'));
+    }
+
+    #[test]
+    fn plug2_message_capacity_is_bounded_for_oversized_input() {
+        let e = PluginError::new(
+            PluginErrorCode::Internal,
+            "a".repeat(PLUGIN_ERROR_MESSAGE_MAX_BYTES * 64),
+        );
+        assert_eq!(e.message().len(), PLUGIN_ERROR_MESSAGE_MAX_BYTES);
+        assert!(e.message.capacity() <= PLUGIN_ERROR_MESSAGE_MAX_BYTES);
     }
 
     #[test]

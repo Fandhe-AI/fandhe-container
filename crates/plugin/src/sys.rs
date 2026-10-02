@@ -12,7 +12,7 @@
 //!
 //! - Linux（x86_64 / aarch64）: `getsockopt(SOL_SOCKET, SO_PEERCRED)` の `struct ucred`
 //! - macOS: `getpeereid(2)`
-//! - いずれの unix: `fchmodat(2)`（`AT_SYMLINK_NOFOLLOW`）・`unlinkat(2)` を検証済みディレクトリ fd
+//! - いずれの unix: `fchmodat(2)`（`AT_SYMLINK_NOFOLLOW`。Linux の `fchmodat2` 非対応環境は `O_PATH` fd 経由へ縮退）・`unlinkat(2)` を検証済みディレクトリ fd
 //!   基準で呼ぶ（パス再解決による TOCTOU を避ける。PLUG-12）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_NOFOLLOW | O_DIRECTORY)` で配置ディレクトリを
 //!   ルートから 1 要素ずつ辿る（祖先要素の symlink を拒否。PLUG-12）
@@ -70,11 +70,67 @@ unsafe extern "C" {
 }
 
 /// `dir`（開いたディレクトリ fd）基準で `name` の mode を設定する。最終要素が symlink なら
-/// 辿らない（`AT_SYMLINK_NOFOLLOW`。辿れない実装では失敗＝fail-closed）。
+/// 辿らない（PLUG-12）。
+///
+/// まず `fchmodat(AT_SYMLINK_NOFOLLOW)` を試す。この flags は Linux 6.6 の `fchmodat2` に依存し、
+/// 古いカーネル・libc（musl 等）では `ENOSYS` / `EOPNOTSUPP` / `EINVAL` で失敗するため、Linux では
+/// その場合に限り [`fchmodat_via_opath`] へ縮退する（symlink 防御は保ったまま古い環境でも bind 可能にする）。
+/// 縮退できない環境・OS はそのままエラー（fail-closed）。
 pub(crate) fn fchmodat_nofollow(dir: &File, name: &CStr, mode: u32) -> io::Result<()> {
     let mode = ModeT::try_from(mode).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: fd は `&File` の借用中のため有効。`name` は NUL 終端の有効な C 文字列。
     let rc = unsafe { c_fchmodat(dir.as_raw_fd(), name.as_ptr(), mode, AT_SYMLINK_NOFOLLOW) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        // ENOSYS=38・EINVAL=22・EOPNOTSUPP=95（Linux の errno は x86_64 / aarch64 で共通）。
+        if matches!(err.raw_os_error(), Some(38 | 22 | 95)) {
+            return fchmodat_via_opath(dir, name, mode);
+        }
+    }
+    Err(err)
+}
+
+/// `fchmodat2` 非対応環境向けの縮退実装（Linux のみ）。`name` を `O_PATH | O_NOFOLLOW` で開き、
+/// fd 自体が socket であること（symlink・通常ファイルでない）を `statx(AT_EMPTY_PATH)` で確認してから、
+/// `/proc/self/fd/<fd>` 経由で chmod する（fd が指す inode に対して作用し、パスは再解決しない）。
+/// `/proc` が使えない場合は失敗する（fail-closed）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn fchmodat_via_opath(dir: &File, name: &CStr, mode: ModeT) -> io::Result<()> {
+    // O_PATH は x86_64 / aarch64 とも 0o10000000。
+    const O_PATH: i32 = 0o10000000;
+    const AT_EMPTY_PATH: i32 = 0x1000;
+    // SAFETY: `name` は NUL 終端の有効な C 文字列。`dir` は `&File` の借用中のため有効。
+    let fd = unsafe {
+        c_openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            O_PATH | O_NOFOLLOW | O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` は直前の openat が返した、他に所有者のいない有効な fd（非負を確認済み）。
+    let opened = unsafe { File::from_raw_fd(fd) };
+    let ident = statx_ident(opened.as_raw_fd(), c"", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)?;
+    if !ident.is_socket {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let proc_path = std::ffi::CString::new(format!("/proc/self/fd/{}", opened.as_raw_fd()))
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `proc_path` は NUL 終端の有効な C 文字列。AT_FDCWD + 絶対パスで、flags=0 は
+    // /proc の magic link を辿って検証済み socket inode に作用する（`opened` が生存中は有効）。
+    let rc = unsafe { c_fchmodat(AT_FDCWD, proc_path.as_ptr(), mode, 0) };
     if rc == 0 {
         Ok(())
     } else {
@@ -133,6 +189,55 @@ mod statx_abi {
     }
 }
 
+/// `statx(dirfd, name, flags)` を呼び、識別情報へ変換する（Linux のみ。symlink を辿るか否かは
+/// `flags` で決まる）。`lstat_at` と、O_PATH fd の同一性確認（`AT_EMPTY_PATH`）から使う。
+#[cfg(target_os = "linux")]
+fn statx_ident(dirfd: i32, name: &CStr, flags: i32) -> io::Result<FileIdent> {
+    let mut st = statx_abi::Statx {
+        mask: 0,
+        blksize: 0,
+        attributes: 0,
+        nlink: 0,
+        uid: 0,
+        gid: 0,
+        mode: 0,
+        pad0: 0,
+        ino: 0,
+        size: 0,
+        blocks: 0,
+        attributes_mask: 0,
+        timestamps: [0; 8],
+        rdev_major: 0,
+        rdev_minor: 0,
+        dev_major: 0,
+        dev_minor: 0,
+        tail: [0; 14],
+    };
+    // SAFETY: `dirfd` は呼び出し側が保持する開いた fd。`name` は NUL 終端の有効な C 文字列。
+    // `st` はスタック上の 256 バイトの `#[repr(C)]` 領域で、カーネルが書き込む最大サイズと一致。
+    let rc = unsafe {
+        statx_abi::statx(
+            dirfd,
+            name.as_ptr(),
+            flags,
+            statx_abi::REQUIRED_MASK,
+            &raw mut st,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if st.mask & statx_abi::REQUIRED_MASK != statx_abi::REQUIRED_MASK {
+        return Err(io::Error::from(io::ErrorKind::Unsupported));
+    }
+    Ok(FileIdent {
+        dev: (u64::from(st.dev_major) << 32) | u64::from(st.dev_minor),
+        ino: st.ino,
+        uid: st.uid,
+        is_socket: u32::from(st.mode) & 0o170000 == 0o140000,
+    })
+}
+
 /// `dir` 基準で `name`（symlink を辿らない）の識別情報を返す。
 ///
 /// Linux は `statx(dirfd, name, AT_SYMLINK_NOFOLLOW)` でパスを再解決しない。Linux 以外の unix は
@@ -147,49 +252,7 @@ pub(crate) fn lstat_at(
     #[cfg(target_os = "linux")]
     {
         let _ = fallback_path;
-        let mut st = statx_abi::Statx {
-            mask: 0,
-            blksize: 0,
-            attributes: 0,
-            nlink: 0,
-            uid: 0,
-            gid: 0,
-            mode: 0,
-            pad0: 0,
-            ino: 0,
-            size: 0,
-            blocks: 0,
-            attributes_mask: 0,
-            timestamps: [0; 8],
-            rdev_major: 0,
-            rdev_minor: 0,
-            dev_major: 0,
-            dev_minor: 0,
-            tail: [0; 14],
-        };
-        // SAFETY: fd は `&File` の借用中のため有効。`name` は NUL 終端の有効な C 文字列。
-        // `st` はスタック上の 256 バイトの `#[repr(C)]` 領域で、カーネルが書き込む最大サイズと一致。
-        let rc = unsafe {
-            statx_abi::statx(
-                dir.as_raw_fd(),
-                name.as_ptr(),
-                AT_SYMLINK_NOFOLLOW,
-                statx_abi::REQUIRED_MASK,
-                &raw mut st,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if st.mask & statx_abi::REQUIRED_MASK != statx_abi::REQUIRED_MASK {
-            return Err(io::Error::from(io::ErrorKind::Unsupported));
-        }
-        Ok(FileIdent {
-            dev: (u64::from(st.dev_major) << 32) | u64::from(st.dev_minor),
-            ino: st.ino,
-            uid: st.uid,
-            is_socket: u32::from(st.mode) & 0o170000 == 0o140000,
-        })
+        statx_ident(dir.as_raw_fd(), name, AT_SYMLINK_NOFOLLOW)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -421,4 +484,51 @@ pub(crate) fn peer_uid(_stream: &UnixStream) -> Result<u32, PluginError> {
         PluginErrorCode::Unimplemented,
         "peer credential verification is not implemented for this platform",
     ))
+}
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, symlink};
+    use std::os::unix::net::UnixListener;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("fc-sys-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// PLUG-12: `fchmodat2` 非対応環境向けの縮退経路が socket の mode を設定できる。
+    #[test]
+    fn opath_fallback_sets_socket_mode_0600() {
+        let d = tmpdir("sock");
+        let _l = UnixListener::bind(d.join("s.sock")).unwrap();
+        let dir = File::open(&d).unwrap();
+        fchmodat_via_opath(&dir, c"s.sock", 0o600).unwrap();
+        let mode = std::fs::symlink_metadata(d.join("s.sock")).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// PLUG-12: 縮退経路でも最終要素が symlink なら辿らず拒否し、リンク先の mode は変えない。
+    #[test]
+    fn opath_fallback_rejects_symlink_and_leaves_target() {
+        let d = tmpdir("link");
+        std::fs::write(d.join("target"), b"x").unwrap();
+        std::fs::set_permissions(
+            d.join("target"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
+        symlink(d.join("target"), d.join("lnk")).unwrap();
+        let dir = File::open(&d).unwrap();
+        assert!(fchmodat_via_opath(&dir, c"lnk", 0o600).is_err());
+        let mode = std::fs::metadata(d.join("target")).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

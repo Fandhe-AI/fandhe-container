@@ -10,6 +10,9 @@
 //!   （`mode & 0o077 != 0`。`UdsListener::bind` の親ディレクトリ検証と同じ閾値）、または所有者の
 //!   rwx が揃っていない（`mode & 0o700 != 0o700`。0500・000 等）場合は、使用せず
 //!   `PermissionDenied` を返す。chmod・chown・削除での自動修復はしない（fail-closed）。
+//! - 基底ディレクトリも同様に検証する。自 UID 所有の非 symlink ディレクトリで group / other に
+//!   書き込み権が無い（`mode & 0o022 == 0`）ことを要求し、満たさなければ `PermissionDenied`。
+//!   基底より上位の祖先は信頼する（全祖先の走査は未実装）。
 //! - 判定は `symlink_metadata`（symlink を辿らない）の結果で行う。
 //! - 作成は非再帰で、基底ディレクトリ（`XDG_RUNTIME_DIR` 自体）は作らない。
 //! - エラーメッセージは固定の英語文字列で、パス・環境変数値を含めない。
@@ -45,7 +48,8 @@ impl RuntimeDir {
 
     /// 指定の基底ディレクトリ直下の `fandhe-container` を解決・作成する。
     ///
-    /// テストおよび #289 のフォールバックが基底を注入する入口。基底は絶対パス・`..` なしで、
+    /// テストおよび #289 のフォールバックが基底を注入する入口。基底は絶対パス・`..` なしで自 UID 所有・
+    /// group/other 書き込み不可の非 symlink ディレクトリ（違反は `PermissionDenied`）で、
     /// 既に存在していなければならない（`NotFound`。基底は作成しない）。
     pub fn ensure_under(base: &Path) -> Result<Self, PluginError> {
         imp::ensure_under(base)
@@ -149,9 +153,35 @@ mod imp {
         Ok(())
     }
 
+    /// 基底ディレクトリの検証（symlink 非追従）。自 UID 所有の実ディレクトリで、group / other に
+    /// 書き込み権が無いこと（`mode & 0o022 == 0`）を要求する。`/run/user/<uid>`（0700）は通り、
+    /// 共有書き込み可能な `/tmp` 等（sticky でも）は拒否する。基底より上位の祖先は
+    /// 信頼する（システム管理下の root 所有パス前提。祖先の全走査は未実装）。
+    fn verify_base(meta: &Metadata, euid: u32) -> Result<(), PluginError> {
+        let deny = |m: &str| PluginError::new(PluginErrorCode::PermissionDenied, m);
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(deny("runtime directory base is not a plain directory"));
+        }
+        if meta.uid() != euid {
+            return Err(deny(
+                "runtime directory base is not owned by the current user",
+            ));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(deny(
+                "runtime directory base must not be writable by group or other",
+            ));
+        }
+        Ok(())
+    }
+
     /// `base/fandhe-container` を解決し、無ければ 0700 で作成して検証する。
     pub(super) fn ensure_dir(base: &Path, euid: u32) -> Result<RuntimeDir, PluginError> {
         validate_base(base)?;
+        // 基底自体を先に検証する。他ユーザーが書ける・symlink の基底では、検証済みの子を
+        // 後から rename・差し替えられ配置パスの安全性が失われるため（PLUG-12）。
+        let base_meta = std::fs::symlink_metadata(base).map_err(|e| map_io(&e))?;
+        verify_base(&base_meta, euid)?;
         let dir = base.join(RUNTIME_DIR_NAME);
         match std::fs::symlink_metadata(&dir) {
             Ok(meta) => verify(&meta, euid)?,
@@ -227,6 +257,30 @@ mod imp {
                 std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
                 std::fs::remove_dir(&dir).unwrap();
             }
+        }
+
+        /// PLUG-12: 基底が他ユーザー書き込み可・他 UID 所有・symlink なら拒否する。
+        #[test]
+        fn plug12_rejects_unsafe_base() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            for mode in [0o770u32, 0o707, 0o777] {
+                std::fs::set_permissions(&t.0, std::fs::Permissions::from_mode(mode)).unwrap();
+                let err = ensure_dir(&t.0, euid).unwrap_err();
+                assert_eq!(
+                    err.code(),
+                    PluginErrorCode::PermissionDenied,
+                    "mode {mode:o}"
+                );
+                assert!(!t.0.join(RUNTIME_DIR_NAME).exists());
+            }
+            std::fs::set_permissions(&t.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let err = ensure_dir(&t.0, euid.wrapping_add(1)).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+            let link = t.0.join("link");
+            std::os::unix::fs::symlink(&t.0, &link).unwrap();
+            let err = ensure_dir(&link, euid).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
         }
 
         #[test]

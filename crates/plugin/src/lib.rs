@@ -9,7 +9,7 @@
 //! 既存 socket パスの lstat 検証・stale socket 再 bind（`uds_security`。TASK-123.2・#287）と
 //! 都度起動モード（`lifecycle`。TASK-110.1・#258）と
 //! XDG 未設定時のフォールバック（TASK-123.4・#289）と常駐モード（`lifecycle`。TASK-110.2・#259）のみ実装済み。
-//! モード選択 API（TASK-110.3）・gRPC と
+//! モード選択 API（`lifecycle`。TASK-110.3・#260）は実装済み。gRPC と
 //! PLUG-12 の peer 認証（TASK-124。macOS の `getpeereid` 経路は TASK-124.2・#293 で実装・検証済み）のうち
 //! 残り（Linux・Windows 文書化・別 UID 拒否テスト）は未完了（TASK-108 ほか。REPAIR-3）。
 //! 本体は G8（TASK-107 が crate 本体、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124）で
@@ -35,10 +35,11 @@ pub use lifecycle::{
     ONE_SHOT_ARGS_MAX_BYTES, ONE_SHOT_ARGS_MAX_COUNT, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_REAP_TIMEOUT,
     ONE_SHOT_STDERR_DRAIN_TIMEOUT, ONE_SHOT_STDERR_MAX_BYTES, ONE_SHOT_STDERR_STOP_TIMEOUT,
     ONE_SHOT_TIMEOUT_DEFAULT, ONE_SHOT_TIMEOUT_MAX, OneShotOutcome, OneShotPlugin, OneShotRecord,
-    OneShotStderr, OneShotTermination, OneShotTimeout, PLUGIN_SOCKET_ENV,
-    RESIDENT_EXIT_DETECT_TIMEOUT, RESIDENT_START_TIMEOUT_DEFAULT, RESIDENT_START_TIMEOUT_MAX,
-    ResidentCallRecord, ResidentPlugin, ResidentShutdown, ResidentShutdownError,
-    ResidentStartTimeout, ResidentState, call_once, call_once_observed,
+    OneShotStderr, OneShotTermination, OneShotTimeout, PLUGIN_SOCKET_ENV, PluginMode,
+    PluginModeKind, PluginSession, PluginSessionShutdown, RESIDENT_EXIT_DETECT_TIMEOUT,
+    RESIDENT_START_TIMEOUT_DEFAULT, RESIDENT_START_TIMEOUT_MAX, ResidentCallRecord, ResidentPlugin,
+    ResidentShutdown, ResidentShutdownError, ResidentStartTimeout, ResidentState, call_once,
+    call_once_observed,
 };
 pub use message::{ControlMessage, MessageId, decode_message, encode_message};
 pub use transport::{

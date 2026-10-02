@@ -17,18 +17,23 @@
 //!   （報告後に回収すると、解放済みの pid を未回収として伝えることになるため）。子は終了済みでも
 //!   ゾンビとして残り、親プロセスの終了時に OS が引き取る。呼び出し側はその pid を未回収として扱う。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
-//!   stdin / stdout は null。stderr は親へ継承させず、専用の pipe で受けて [`OneShotStderr`] として
-//!   返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は読み捨てて件数だけ数える）。
-//!   親の stderr・構造化ログへ内容を転記しない（量の上限なしの出力・ログ行の偽装を防ぐ）。
+//!   stdin / stdout は null。stderr は親へ継承させず、専用の UNIX ソケット対で受けて
+//!   [`OneShotStderr`] として返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は
+//!   読み捨てて件数だけ数える）。親の stderr・構造化ログへ内容を転記しない（量の上限なしの出力・
+//!   ログ行の偽装を防ぐ）。子から見た stderr は端末でも pipe でもなくソケットで、書き込みは pipe と
+//!   同様に扱える（`/dev/stderr` の開き直しは Linux では失敗する）。
+//! - stderr の読み取りスレッドは呼び出しごとに 1 本で、[`call_once`] が戻るまでに停止させる
+//!   （呼び出しを繰り返してもスレッドが増え続けない）。子の回収後 [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`]
+//!   以内に終端へ達しなければ、ソケットを shutdown して読み取りを打ち切る。
 //!
 //! # 未実装（REPAIR-3）
 //!
 //! - 常駐モード（TASK-110.2）・モード選択 API（TASK-110.3）。
 //! - 起動対象の信頼性検証（所有者・モード・sha256 照合。TASK-122・PLUG-11）。本 API は検証を
 //!   行わず、呼び出し側が検証済みの絶対パスを渡すことを前提とする。
-//! - 孫プロセスの回収（プロセスグループ単位の kill は未対応）。孫が stderr の pipe を保持し続けた
-//!   場合、収集は [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`] で打ち切り、[`OneShotStderr::is_complete`] が
-//!   false になる（読み取りスレッドは pipe が閉じるまで読み捨てを続ける）。
+//! - 孫プロセスの回収（プロセスグループ単位の kill は未対応）。孫が stderr の書き込み端を保持し
+//!   続けた場合、収集は [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`] で打ち切り、[`OneShotStderr::is_complete`]
+//!   が false になる。打ち切り後は読み取り側を閉じるため、孫の以後の書き込みは `EPIPE` になる。
 //! - 要求 ID と応答 ID の対応づけ（TASK-114）。
 
 use crate::error::{PluginError, PluginErrorCode};
@@ -38,7 +43,7 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
@@ -69,10 +74,19 @@ pub const ONE_SHOT_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 /// plugin の stderr として保持するバイト数の上限（64 KiB。超過分は読み捨てる。無制限確保の防止）。
 pub const ONE_SHOT_STDERR_MAX_BYTES: usize = 64 * 1024;
 
-/// 子の回収後に stderr の読み取り完了（EOF）を待つ上限（REPAIR-5。合計期限とは別枠）。
-/// 子が終了していれば pipe は閉じており即座に完了する。孫プロセスが pipe を保持している場合のみ
-/// この期限まで待ち、打ち切る。
+/// 子の回収後に stderr の読み取り完了（終端）を待つ上限（REPAIR-5。合計期限とは別枠）。
+/// 子が終了していれば書き込み端は閉じており即座に完了する。孫プロセスが書き込み端を保持している
+/// 場合のみこの期限まで待ち、読み取りを打ち切ってスレッドを停止させる。
 pub const ONE_SHOT_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// 打ち切りを指示した後、読み取りスレッドの停止を確認するまで待つ上限（REPAIR-5）。
+/// shutdown で読み取りは即座に戻るため通常は待たない。スケジューリング遅延への余裕として設ける。
+pub const ONE_SHOT_STDERR_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// stderr の読み取り 1 回の待ち上限。読み取りスレッドはこの間隔で停止指示を確認する
+/// （shutdown による起床が効かない場合でも、この間隔で停止できる）。
+#[cfg(unix)]
+const STDERR_READ_POLL: Duration = Duration::from_millis(100);
 
 /// spawn から応答受信までの合計期限（REPAIR-5）。0 と [`ONE_SHOT_TIMEOUT_MAX`] 超は構築できない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -178,15 +192,17 @@ pub struct OneShotStderr {
     bytes: Vec<u8>,
     total_bytes: u64,
     complete: bool,
+    reader_stopped: bool,
 }
 
 impl OneShotStderr {
-    /// 何も収集していない完了済みの結果（子を spawn しなかった経路用）。
+    /// 何も収集していない完了済みの結果（子を spawn しなかった経路用。読み取りスレッドなし）。
     fn empty() -> Self {
         Self {
             bytes: Vec::new(),
             total_bytes: 0,
             complete: true,
+            reader_stopped: true,
         }
     }
 
@@ -205,51 +221,120 @@ impl OneShotStderr {
         u64::try_from(self.bytes.len()).map_or(true, |kept| self.total_bytes > kept)
     }
 
-    /// pipe の終端（EOF）まで読み切ったか。false は [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`] で打ち切った
-    /// ことを表す（孫プロセスが pipe を保持している等）。
+    /// 終端（全書き込み端の close）まで読み切ったか。false は [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`] で
+    /// 打ち切ったことを表す（孫プロセスが書き込み端を保持している等）。
     pub fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    /// 読み取りスレッドの停止を確認できたか（終端到達、または打ち切り指示への応答）。
+    /// false はスレッドが [`ONE_SHOT_STDERR_STOP_TIMEOUT`] 内に停止を返さなかったことを表し、
+    /// 呼び出し側は資源の残留として扱う（REPAIR-4 の観測記録にも出す）。
+    pub fn reader_stopped(&self) -> bool {
+        self.reader_stopped
     }
 }
 
 /// 子の stderr を専用スレッドで読み、上限つきで保持する収集器（REPAIR-5）。
 ///
-/// 読み取りは子の spawn 直後から別スレッドで行う。親（呼び出しスレッド）は接続待ち・往復・回収の
-/// 間に pipe を読まないため、子が pipe バッファを超えて書いても子は詰まらず、親も読み取りで
-/// ブロックしない。結果の受け取り（[`Self::finish`]）は期限つきで、スレッドの `join` は行わない。
+/// 読み取りは接続待ちの前から別スレッドで行う。親（呼び出しスレッド）は接続待ち・往復・回収の
+/// 間に読まないため、子がバッファを超えて書いても子は詰まらず、親も読み取りでブロックしない。
+/// 結果の受け取り（[`Self::finish`]）は期限つきで、期限内に終端へ達しなければ読み取りを打ち切って
+/// スレッドを停止させる（スレッドを残さない）。`join` は行わず、停止の確認も期限つきで行う。
 /// 常駐モード（TASK-110.2）でも同じ収集器を使える形にしている。
 struct StderrCapture {
     state: Arc<Mutex<OneShotStderr>>,
     done: mpsc::Receiver<()>,
+    stop_requested: Arc<AtomicBool>,
+    /// ブロック中の読み取りを起こす操作（ソケットの shutdown）。1 回だけ実行する。
+    wake: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl StderrCapture {
-    /// `source` を EOF まで読むスレッドを起動する。起動できなければ `Err`（呼び出し側が子を回収する）。
-    fn start<R: Read + Send + 'static>(source: R) -> io::Result<Self> {
+    /// `source` を終端または停止指示まで読むスレッドを起動する。起動できなければ `Err`
+    /// （呼び出し側が子を回収する）。
+    ///
+    /// `source` の `read` は有限時間で戻ること（読み取り期限を設定済みで、期限切れは `WouldBlock` /
+    /// `TimedOut` を返す）。`wake` はブロック中の `read` を即座に戻すための操作で、停止指示の後に
+    /// 1 回だけ呼ぶ。
+    fn start<R: Read + Send + 'static>(
+        source: R,
+        wake: Box<dyn FnOnce() + Send>,
+    ) -> io::Result<Self> {
         let state = Arc::new(Mutex::new(OneShotStderr {
             bytes: Vec::new(),
             total_bytes: 0,
             complete: false,
+            reader_stopped: false,
         }));
+        let stop_requested = Arc::new(AtomicBool::new(false));
         let (tx, done) = mpsc::channel();
         let shared = Arc::clone(&state);
+        let stop = Arc::clone(&stop_requested);
         std::thread::Builder::new()
             .name("plugin-stderr".to_string())
             .spawn(move || {
-                drain_stderr(source, &shared);
-                // 受け手が期限切れで去っていても構わない。
+                drain_stderr(source, &shared, &stop);
+                // 受け手が先に去っていても構わない。
                 let _ = tx.send(());
             })?;
-        Ok(Self { state, done })
+        Ok(Self {
+            state,
+            done,
+            stop_requested,
+            wake: Some(wake),
+        })
     }
 
-    /// 読み取り完了を `limit` まで待ち、その時点までの収集結果を返す。期限内に EOF へ達しなければ
-    /// `is_complete() == false` の途中結果を返す（スレッドは pipe が閉じるまで読み捨てを続け、
-    /// 保持量は上限のまま増えない）。
-    fn finish(self, limit: Duration) -> OneShotStderr {
-        // タイムアウト・送信側の消滅（スレッドの異常終了）はどちらも途中結果として扱う。
-        let _ = self.done.recv_timeout(limit);
-        lock_stderr(&self.state).clone()
+    /// 子の stderr を受けるソケットの読み取り側から収集を始める。停止時はソケットを shutdown して
+    /// ブロック中の読み取りを起こす（以後、書き込み端を保持する孫の書き込みは `EPIPE` になる）。
+    #[cfg(unix)]
+    fn attach(reader: StderrReader) -> io::Result<Self> {
+        let waker = reader.try_clone()?;
+        Self::start(
+            reader,
+            Box::new(move || {
+                let _ = waker.shutdown(std::net::Shutdown::Both);
+            }),
+        )
+    }
+
+    /// 非 unix では子を spawn しないため、空の入力を読むだけになる（即座に終端へ達する）。
+    #[cfg(not(unix))]
+    fn attach(reader: StderrReader) -> io::Result<Self> {
+        Self::start(reader, Box::new(|| {}))
+    }
+
+    /// 読み取りスレッドへ停止を指示し、ブロック中の読み取りを起こす。
+    fn request_stop(&mut self) {
+        self.stop_requested.store(true, Ordering::SeqCst);
+        if let Some(wake) = self.wake.take() {
+            wake();
+        }
+    }
+
+    /// 読み取り完了を `limit` まで待ち、その時点までの収集結果を返す。期限内に終端へ達しなければ
+    /// 読み取りを打ち切り、スレッドの停止を [`ONE_SHOT_STDERR_STOP_TIMEOUT`] まで確認して
+    /// `is_complete() == false` の途中結果を返す。
+    fn finish(mut self, limit: Duration) -> OneShotStderr {
+        // 送信側の消滅（Disconnected）はスレッドが終了したことを意味するため、停止済みとして扱う。
+        let timed_out =
+            |r: Result<(), mpsc::RecvTimeoutError>| r == Err(mpsc::RecvTimeoutError::Timeout);
+        let mut stopped = !timed_out(self.done.recv_timeout(limit));
+        if !stopped {
+            self.request_stop();
+            stopped = !timed_out(self.done.recv_timeout(ONE_SHOT_STDERR_STOP_TIMEOUT));
+        }
+        let mut result = lock_stderr(&self.state).clone();
+        result.reader_stopped = stopped;
+        result
+    }
+}
+
+impl Drop for StderrCapture {
+    /// `finish` を経ずに破棄される経路（panic 等）でもスレッドを残さない。
+    fn drop(&mut self) {
+        self.request_stop();
     }
 }
 
@@ -258,13 +343,23 @@ fn lock_stderr(state: &Mutex<OneShotStderr>) -> MutexGuard<'_, OneShotStderr> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `source` を EOF またはエラーまで読み、先頭 [`ONE_SHOT_STDERR_MAX_BYTES`] バイトだけ保持する。
-/// 上限到達後も読み捨てを続ける（読むのを止めると子が書き込みで詰まり、応答・終了が遅れるため）。
-fn drain_stderr<R: Read>(mut source: R, state: &Mutex<OneShotStderr>) {
+/// `source` を終端・エラー・停止指示のいずれかまで読み、先頭 [`ONE_SHOT_STDERR_MAX_BYTES`] バイト
+/// だけ保持する。上限到達後も読み捨てを続ける（読むのを止めると子が書き込みで詰まり、応答・終了が
+/// 遅れるため）。停止指示は読み取りのたびに確認するので、書き込みが続いていても停止できる。
+fn drain_stderr<R: Read>(mut source: R, state: &Mutex<OneShotStderr>, stop: &AtomicBool) {
     let mut chunk = [0u8; 4096];
     loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
         match source.read(&mut chunk) {
-            Ok(0) => break,
+            // 停止指示による shutdown でも 0 が返るため、指示後の 0 は終端として扱わない。
+            Ok(0) => {
+                if !stop.load(Ordering::SeqCst) {
+                    lock_stderr(state).complete = true;
+                }
+                return;
+            }
             Ok(n) => {
                 let mut s = lock_stderr(state);
                 let room = ONE_SHOT_STDERR_MAX_BYTES.saturating_sub(s.bytes.len());
@@ -275,12 +370,44 @@ fn drain_stderr<R: Read>(mut source: R, state: &Mutex<OneShotStderr>) {
                     .total_bytes
                     .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            // 読み取りエラーは EOF として扱わない（complete を立てない）。
+            // 読み取り期限切れ・割り込みは継続する（ループ先頭で停止指示を確認する）。
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            // その他の読み取りエラーは終端として扱わない（complete を立てない）。
             Err(_) => return,
         }
     }
-    lock_stderr(state).complete = true;
+}
+
+/// 親が読む側の stderr 入力。unix は UNIX ソケット、非 unix は空の入力（子を spawn しないため）。
+#[cfg(unix)]
+type StderrReader = std::os::unix::net::UnixStream;
+#[cfg(not(unix))]
+type StderrReader = io::Empty;
+
+/// 子の stderr に渡す書き込み端と、親が読む側の組を作る（REPAIR-5）。
+///
+/// pipe ではなく UNIX ソケット対を使う。pipe の読み取りは期限を掛けられず、書き込み端を孫が保持
+/// している間は読み取りスレッドを止められない。ソケットなら読み取り期限と shutdown で確実に止め
+/// られる（標準ライブラリの安全な API だけで実現できる）。子から見た書き込みは pipe と同様（端末ではなく、読み手が
+/// 閉じれば `EPIPE`）。どちらの端も close-on-exec で、子へ渡るのは fd 2 に複製した書き込み端のみ。
+#[cfg(unix)]
+fn stderr_channel() -> io::Result<(Stdio, StderrReader)> {
+    let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+    // 相手が健在なうちに期限を設定する（macOS は相手切断後の設定が EINVAL になる）。
+    reader.set_read_timeout(Some(STDERR_READ_POLL))?;
+    Ok((Stdio::from(std::os::fd::OwnedFd::from(writer)), reader))
+}
+
+/// 非 unix では listener を bind できず子を spawn しないため到達しない（stderr は破棄する設定を返す）。
+#[cfg(not(unix))]
+fn stderr_channel() -> io::Result<(Stdio, StderrReader)> {
+    Ok((Stdio::null(), io::empty()))
 }
 
 /// [`call_once`] の成功結果。
@@ -336,11 +463,6 @@ impl ChildGuard {
 
     fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
-    }
-
-    /// 子の stderr（pipe の読み取り側）を取り出す。2 回目以降・回収済みは `None`。
-    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.child.as_mut().and_then(|c| c.stderr.take())
     }
 
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -515,6 +637,9 @@ fn spawn_error(e: &io::Error) -> PluginError {
 /// シグナルで終了した場合は `Unavailable`、回収を確認できない場合は `Internal` を返す（このときだけ
 /// 子が残っている可能性がある。メッセージに子の pid を含み、その子は以後回収しない。モジュール冒頭の
 /// 契約を参照）。
+///
+/// stderr の読み取りスレッドは戻るまでに停止させる。停止を確認できなかった場合は
+/// [`OneShotStderr::reader_stopped`] が false になる。
 /// 非 unix では listener の bind が `Unimplemented` を返し、子は spawn されない。
 ///
 /// plugin の stderr は親へ継承させず [`OneShotOutcome::stderr`] で返す。本関数が親の stderr へ出す
@@ -556,7 +681,7 @@ pub struct OneShotRecord {
 impl OneShotRecord {
     /// JSON Lines の 1 行（改行なし）へ符号化する。値はすべて固定文字列・数値・真偽値のみで、外部入力
     /// （plugin の stderr の内容を含む）を埋め込まない。stderr は出所を明示したキー
-    /// （`plugin_stderr_*`）で件数と打ち切りの有無だけを出す。
+    /// （`plugin_stderr_*`）で件数・打ち切りの有無・読み取りスレッドの停止確認だけを出す。
     pub fn to_json_line(&self) -> String {
         let code = match self.error_code {
             Some(c) => format!("\"{c}\""),
@@ -565,14 +690,15 @@ impl OneShotRecord {
         format!(
             "{{\"op\":\"{}\",\"success\":{},\"error_code\":{},\"elapsed_us\":{},\
              \"plugin_stderr_bytes\":{},\"plugin_stderr_truncated\":{},\
-             \"plugin_stderr_complete\":{}}}",
+             \"plugin_stderr_complete\":{},\"plugin_stderr_reader_stopped\":{}}}",
             self.operation,
             self.success,
             code,
             self.elapsed.as_micros(),
             self.stderr.total_bytes(),
             self.stderr.is_truncated(),
-            self.stderr.is_complete()
+            self.stderr.is_complete(),
+            self.stderr.reader_stopped()
         )
     }
 }
@@ -630,14 +756,26 @@ fn call_once_inner(
     };
 
     // stderr は親へ継承させない（plugin が親の stderr へ任意の量・内容を書けてしまうため）。
-    // `Command` は文の終わりで drop され、親側に pipe の書き込み端は残らない（EOF を妨げない）。
+    let (child_stderr, reader) = match stderr_channel() {
+        Ok(pair) => pair,
+        Err(_) => {
+            return (
+                Err(PluginError::new(
+                    PluginErrorCode::Internal,
+                    "failed to prepare capturing plugin stderr",
+                )),
+                OneShotStderr::empty(),
+            );
+        }
+    };
+    // `Command` は文の終わりで drop され、親側に書き込み端は残らない（終端の検出を妨げない）。
     let spawned = Command::new(&plugin.program)
         .args(&plugin.args)
         .env_clear()
         .env(PLUGIN_SOCKET_ENV, listener.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(child_stderr)
         .spawn();
     let mut guard = match spawned {
         Ok(child) => ChildGuard::new(child),
@@ -645,26 +783,25 @@ fn call_once_inner(
     };
 
     // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。
-    let capture = guard.take_stderr().map(StderrCapture::start);
-    let result = match &capture {
-        Some(Ok(_)) => exchange_and_reap(&mut guard, listener, request, deadline),
-        // 読み取り手がいないまま子を走らせると pipe が埋まって子が詰まるため、往復せず回収する。
-        Some(Err(_)) | None => {
+    let capture = match StderrCapture::attach(reader) {
+        Ok(c) => c,
+        // 読み取り手がいないまま子を走らせるとバッファが埋まって子が詰まるため、往復せず回収する。
+        Err(_) => {
             drop(listener);
-            Err(reap_after_failure(
+            let error = reap_after_failure(
                 &mut guard,
                 PluginError::new(
                     PluginErrorCode::Internal,
                     "failed to start capturing plugin stderr",
                 ),
-            ))
+            );
+            return (Err(error), OneShotStderr::empty());
         }
     };
-    // 子の回収後に収集結果を受け取る。子が終了していれば pipe は閉じており即座に完了する。
-    let stderr = match capture {
-        Some(Ok(c)) => c.finish(ONE_SHOT_STDERR_DRAIN_TIMEOUT),
-        Some(Err(_)) | None => OneShotStderr::empty(),
-    };
+    let result = exchange_and_reap(&mut guard, listener, request, deadline);
+    // 子の回収後に収集結果を受け取る。子が終了していれば書き込み端は閉じており即座に完了する。
+    // 戻る時点で読み取りスレッドは停止している（停止を確認できなければ結果に記録する）。
+    let stderr = capture.finish(ONE_SHOT_STDERR_DRAIN_TIMEOUT);
     (result, stderr)
 }
 
@@ -797,6 +934,7 @@ mod tests {
                 bytes: b"\"}\n{\"op\":\"forged\"}".to_vec(),
                 total_bytes: 70000,
                 complete: false,
+                reader_stopped: true,
             },
         };
         // plugin の stderr の内容は行へ埋め込まず、出所を明示したキーで件数だけを出す。
@@ -804,7 +942,8 @@ mod tests {
             rec.to_json_line(),
             "{\"op\":\"plugin.call_once\",\"success\":false,\"error_code\":\"TIMEOUT\",\
              \"elapsed_us\":1500,\"plugin_stderr_bytes\":70000,\
-             \"plugin_stderr_truncated\":true,\"plugin_stderr_complete\":false}"
+             \"plugin_stderr_truncated\":true,\"plugin_stderr_complete\":false,\
+             \"plugin_stderr_reader_stopped\":true}"
         );
     }
 
@@ -920,7 +1059,7 @@ mod tests {
     fn plug7_stderr_capture_keeps_only_the_cap() {
         let mut data = vec![b'a'; ONE_SHOT_STDERR_MAX_BYTES];
         data.extend_from_slice(&[b'b'; 34_464]);
-        let capture = StderrCapture::start(io::Cursor::new(data)).unwrap();
+        let capture = StderrCapture::start(io::Cursor::new(data), Box::new(|| {})).unwrap();
         let got = capture.finish(Duration::from_secs(5));
         assert_eq!(got.bytes().len(), 65_536);
         assert_eq!(got.bytes().iter().filter(|b| **b == b'a').count(), 65_536);
@@ -932,19 +1071,22 @@ mod tests {
     /// 上限以内の stderr はそのまま保持する。
     #[test]
     fn plug7_stderr_capture_keeps_small_output_verbatim() {
-        let capture = StderrCapture::start(io::Cursor::new(b"warn: x\n".to_vec())).unwrap();
+        let capture =
+            StderrCapture::start(io::Cursor::new(b"warn: x\n".to_vec()), Box::new(|| {})).unwrap();
         let got = capture.finish(Duration::from_secs(5));
         assert_eq!(got.bytes(), b"warn: x\n");
         assert_eq!(got.total_bytes(), 8);
         assert!(!got.is_truncated());
         assert!(got.is_complete());
+        assert!(got.reader_stopped());
     }
 
-    /// REPAIR-5: 書き込み端が閉じない（孫プロセスが保持する等）場合でも、収集待ちは期限で打ち切る。
+    /// REPAIR-5: 書き込み端が閉じない（孫プロセスが保持する等）場合でも、収集待ちは期限で打ち切り、
+    /// 読み取りスレッドは停止指示で止まる（スレッドを残さない）。
     #[test]
-    fn repair5_stderr_capture_finish_is_bounded_when_source_never_closes() {
-        /// 最初に 3 バイト返し、その後は送信側が drop されるまで読み取りをブロックする入力。
-        struct Stalled(Option<&'static [u8]>, mpsc::Receiver<()>);
+    fn repair5_stderr_capture_finish_stops_reader_when_source_never_closes() {
+        /// 最初に 3 バイト返し、その後は終端に達しないまま読み取り期限切れを返し続ける入力。
+        struct Stalled(Option<&'static [u8]>);
         impl Read for Stalled {
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
                 if let Some(first) = self.0.take() {
@@ -952,12 +1094,17 @@ mod tests {
                     buf[..n].copy_from_slice(&first[..n]);
                     return Ok(n);
                 }
-                let _ = self.1.recv();
-                Ok(0)
+                std::thread::sleep(Duration::from_millis(10));
+                Err(io::ErrorKind::WouldBlock.into())
             }
         }
-        let (release, blocked) = mpsc::channel::<()>();
-        let capture = StderrCapture::start(Stalled(Some(b"abc"), blocked)).unwrap();
+        let woken = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&woken);
+        let capture = StderrCapture::start(
+            Stalled(Some(b"abc")),
+            Box::new(move || flag.store(true, Ordering::SeqCst)),
+        )
+        .unwrap();
         // 先頭の 3 バイトが保持されるまで待つ（最大 5 秒）。
         let waited = Instant::now();
         while lock_stderr(&capture.state).total_bytes < 3 {
@@ -972,7 +1119,40 @@ mod tests {
         assert_eq!(got.bytes(), b"abc");
         assert_eq!(got.total_bytes(), 3);
         assert!(!got.is_complete());
-        drop(release);
+        assert!(got.reader_stopped());
+        assert!(woken.load(Ordering::SeqCst));
+    }
+
+    /// REPAIR-5・PLUG-7: 子の終了後も別プロセスが stderr の書き込み端を保持している場合、収集は
+    /// 期限で打ち切り、ソケットの shutdown で読み取りスレッドを停止させる。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_stderr_capture_stops_reader_while_another_process_holds_the_writer() {
+        let (child_stderr, reader) = stderr_channel().unwrap();
+        // 書き込み端を保持したまま何も書かないプロセス（孫プロセスの代役）。
+        let holder = Command::new("/bin/sh")
+            .args(["-c", "echo held >&2; exec sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(child_stderr)
+            .spawn()
+            .unwrap();
+        let mut holder = ChildGuard::new(holder);
+        let capture = StderrCapture::attach(reader).unwrap();
+        let waited = Instant::now();
+        while lock_stderr(&capture.state).total_bytes < 5 {
+            assert!(waited.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let started = Instant::now();
+        let got = capture.finish(Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        assert_eq!(got.bytes(), b"held\n");
+        assert_eq!(got.total_bytes(), 5);
+        assert!(!got.is_complete());
+        assert!(got.reader_stopped());
+        assert!(holder.kill_and_reap().is_reaped());
     }
 
     /// PLUG-7: 未回収として pid を報告した子は、ガードの破棄時に回収しない（報告した pid を

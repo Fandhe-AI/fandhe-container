@@ -67,7 +67,7 @@ mod unix {
         }
     }
 
-    /// stderr 大量出力ケースで子が書くバイト数（1 MiB。Linux・macOS の pipe バッファより大きい）。
+    /// stderr 大量出力ケースで子が書くバイト数（1 MiB。Linux・macOS のソケットバッファより大きい）。
     const FLOOD_BYTES: usize = 1024 * 1024;
 
     /// 子の stderr へ直接書く（`eprint!` は libtest の出力捕捉に入るため使わない）。
@@ -95,12 +95,23 @@ mod unix {
             "stderr_exit_early" => write_stderr(b"boom: cannot start\n"),
             "silent_no_connect" => std::thread::sleep(Duration::from_secs(60)),
             mode => {
-                // 接続前に書く。親が stderr を読み続けていなければ pipe が埋まって子はここで止まる。
+                // 接続前に書く。親が stderr を読み続けていなければバッファが埋まって子はここで止まる。
                 if mode == "stderr_flood" {
                     write_stderr(&vec![b'x'; FLOOD_BYTES]);
                 }
                 if mode == "stderr_small" {
                     write_stderr(b"plugin-diagnostic\n");
+                }
+                // stderr を引き継いだ孫プロセスを残したまま応答して終了する（孫は 5 秒で自然終了）。
+                // この子はすぐ終了するため孫は wait しない（孫は init に引き取られ、終了後に回収される）。
+                #[allow(clippy::zombie_processes)]
+                if mode == "stderr_held_by_grandchild" {
+                    std::process::Command::new("/bin/sleep")
+                        .arg("5")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .spawn()
+                        .unwrap();
                 }
                 let mut s = UdsStream::connect(&sock, Duration::from_secs(5)).unwrap();
                 if mode == "silent_after_connect" {
@@ -247,6 +258,7 @@ mod unix {
         assert_eq!(out.stderr().total_bytes(), 18);
         assert!(!out.stderr().is_truncated());
         assert!(out.stderr().is_complete());
+        assert!(out.stderr().reader_stopped());
     }
 
     /// stderr を出さない plugin では収集結果が空になる。
@@ -258,9 +270,10 @@ mod unix {
         assert_eq!(out.stderr().total_bytes(), 0);
         assert!(!out.stderr().is_truncated());
         assert!(out.stderr().is_complete());
+        assert!(out.stderr().reader_stopped());
     }
 
-    /// pipe バッファを超える stderr を書く plugin でも詰まらず応答でき、保持は上限までに留まる
+    /// ソケットバッファを超える stderr を書く plugin でも詰まらず応答でき、保持は上限までに留まる
     /// （REPAIR-5・PLUG-7。親が読み続けていなければ子は接続前に止まり、合計期限で Timeout になる）。
     #[test]
     fn plug7_one_shot_bounds_flooding_plugin_stderr() {
@@ -280,6 +293,23 @@ mod unix {
         assert!(out.stderr().is_truncated());
         assert!(out.stderr().is_complete());
         assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+    }
+
+    /// 孫プロセスが stderr の書き込み端を保持し続けても、収集は期限で打ち切られ、読み取りスレッドは
+    /// 停止する（REPAIR-5・PLUG-7。呼び出しは孫の終了〔5 秒〕を待たずに戻る）。
+    #[test]
+    fn repair5_one_shot_stops_stderr_reader_when_grandchild_holds_stderr() {
+        let (res, elapsed, _dir) = run("stderr_held_by_grandchild", 5000);
+        let out = res.unwrap();
+        assert_eq!(
+            out.termination(),
+            OneShotTermination::Exited { code: Some(0) }
+        );
+        assert_eq!(out.stderr().bytes(), b"");
+        assert!(!out.stderr().is_complete());
+        assert!(out.stderr().reader_stopped());
+        assert!(elapsed >= Duration::from_millis(500), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
     }
 
     /// 失敗時も stderr は観測記録で受け取れ、構造化ログの行には内容が入らない（REPAIR-4・PLUG-7）。
@@ -309,7 +339,7 @@ mod unix {
         assert!(
             line.ends_with(
                 ",\"plugin_stderr_bytes\":19,\"plugin_stderr_truncated\":false,\
-                 \"plugin_stderr_complete\":true}"
+                 \"plugin_stderr_complete\":true,\"plugin_stderr_reader_stopped\":true}"
             ),
             "{line}"
         );

@@ -30,9 +30,10 @@ pub use frame::{
 };
 pub use lifecycle::{
     ONE_SHOT_ARGS_MAX_BYTES, ONE_SHOT_ARGS_MAX_COUNT, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_REAP_TIMEOUT,
-    ONE_SHOT_STDERR_DRAIN_TIMEOUT, ONE_SHOT_STDERR_MAX_BYTES, ONE_SHOT_TIMEOUT_DEFAULT,
-    ONE_SHOT_TIMEOUT_MAX, OneShotOutcome, OneShotPlugin, OneShotRecord, OneShotStderr,
-    OneShotTermination, OneShotTimeout, PLUGIN_SOCKET_ENV, call_once, call_once_observed,
+    ONE_SHOT_STDERR_DRAIN_TIMEOUT, ONE_SHOT_STDERR_MAX_BYTES, ONE_SHOT_STDERR_STOP_TIMEOUT,
+    ONE_SHOT_TIMEOUT_DEFAULT, ONE_SHOT_TIMEOUT_MAX, OneShotOutcome, OneShotPlugin, OneShotRecord,
+    OneShotStderr, OneShotTermination, OneShotTimeout, PLUGIN_SOCKET_ENV, call_once,
+    call_once_observed,
 };
 pub use message::{ControlMessage, MessageId, decode_message, encode_message};
 pub use transport::{

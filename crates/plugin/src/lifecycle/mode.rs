@@ -263,16 +263,14 @@ impl PluginSession {
         }
     }
 
-    /// 要求を 1 往復させる。観測記録は都度起動のみ構造化ログ（JSON Lines）として stderr へ 1 行出す
-    /// （従来の [`call_once`](super::call_once) と同じ挙動）。記録を自分で受け取るなら
+    /// 要求を 1 往復させる。観測記録は両モードとも構造化ログ（JSON Lines）として stderr へ 1 行出す
+    /// （REPAIR-4。都度起動は従来の [`call_once`](super::call_once) と同じ挙動）。記録を自分で受け取るなら
     /// [`call_observed`](Self::call_observed) を使う。応答は untrusted。
     pub fn call(&mut self, request: &Frame) -> Result<PluginCallOutcome, PluginError> {
         self.call_observed(request, &mut |record| {
-            if record.mode == PluginModeKind::OneShot {
-                use std::io::Write;
-                // 書き込み失敗は呼び出し結果に影響させない。
-                let _ = writeln!(std::io::stderr(), "{}", record.to_json_line());
-            }
+            use std::io::Write;
+            // 書き込み失敗は呼び出し結果に影響させない。
+            let _ = writeln!(std::io::stderr(), "{}", record.to_json_line());
         })
     }
 

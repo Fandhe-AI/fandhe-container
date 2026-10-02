@@ -612,6 +612,7 @@ expect_has "help-mentions-task-50-2" "$out" "TASK-50.2"
 #   STUB_DK_EXIT_AFTER=<n>: 1 番目のコンテナが n 回目の inspect の後に exited を報告する（集計中の終了の模擬）
 #   STUB_DK_ZERO_PSS=1 / STUB_DK_BAD_PSS=<文字列> / STUB_DK_NO_SMAPS=1: 値の異常 / STUB_DK_SHIM_COMM=<名前>: shim の comm
 #   STUB_DK_RM_FAIL=1: docker rm -f が何もせず失敗する / STUB_DK_RUN_SLEEP=<秒>: docker run が作成前に待つ
+#   STUB_DK_RUN_IGNORE_TERM=1: docker run が TERM を無視する（待機中の sleep も無視を継承する）
 #   STUB_DK_FOREIGN_LATE=1 / STUB_DK_FOREIGN_AFTER_RM=1: 集計後 / 1 試行目の後始末後に別コンテナが稼働している
 #   STUB_SEED_EXTRA_DAEMON=<comm>: 疑似 /proc に 2 つ目のデーモン（別 pid）を置く
 #   STUB_SEED_NO_DOCKERD=1: 疑似 /proc に dockerd を置かない
@@ -678,6 +679,7 @@ case "$cmd" in
     idx="${base##*-}"
     rest="${base%-*}"
     trial="${rest##*-}"
+    [ -z "${STUB_DK_RUN_IGNORE_TERM:-}" ] || trap '' TERM
     [ -z "${STUB_DK_RUN_SLEEP:-}" ] || sleep "$STUB_DK_RUN_SLEEP"
     if [ "${STUB_DK_RUN_FAIL_I:-}" = "$idx" ]; then echo "stub: run failed" >&2; exit 125; fi
     id="$(printf '%016x%016x%016x%016x' "$BASHPID" "${EPOCHREALTIME//./}" "$RANDOM" "$RANDOM")"
@@ -770,6 +772,21 @@ run_dk() { # <計測スクリプトへの引数...>
 }
 dk_remaining() { find "$work/dk/c" -mindepth 1 -maxdepth 1 -type d | wc -l; }
 dk_rm_count() { wc -l <"$work/dk/rm.log"; }
+# スタブ docker CLI（とそれを包む timeout）の生存数。cmdline にスタブのパスを含むプロセスを数える。
+alive_dk_client_count() { pgrep -fc -- "${work}/stub-docker" 2>/dev/null || true; }
+# docker モードを起動し、1 秒後（docker run の待機中）に SIGTERM を送って終了コードを r へ入れる。
+run_dk_sigterm() { # <計測スクリプトへの引数...>
+  local sig_pid
+  dk_reset
+  : >"$out"; : >"$errf"
+  STUB_DK_DIR="$work/dk" FAKE_PROC="$work/fake" FANDHE_CONCURRENT_MEMORY_SELFTEST=1 \
+    "$bash_bin" "$target" --mode docker --docker "$dkstub" --target docker --settle 0 --proc-root "$work/fake" "$@" >"$out" 2>"$errf" &
+  sig_pid=$!
+  sleep 1
+  kill -TERM "$sig_pid"
+  r=0
+  wait "$sig_pid" || r=$?
+}
 
 # --- D1. 正常系: 5 個・3 試行。デーモン 2500 + 5 * (shim 100 + init x) ---
 export STUB_DK_INIT_BY_TRIAL="1000,3000,2000"
@@ -920,19 +937,39 @@ expect_eq "dk-unowned-rm-count" 4 "$(dk_rm_count)"
 expect_eq "dk-unowned-remaining" 1 "$(dk_remaining)"
 
 # --- D10. SIGTERM 中断でも所有 ID を後始末して 143（作成途中のクライアントを待ってから rm -f する） ---
-dk_reset
-: >"$out"; : >"$errf"
-STUB_DK_DIR="$work/dk" FAKE_PROC="$work/fake" FANDHE_CONCURRENT_MEMORY_SELFTEST=1 STUB_DK_RUN_SLEEP=2 \
-  "$bash_bin" "$target" --mode docker --docker "$dkstub" --target docker --settle 0 --proc-root "$work/fake" --count 4 --trials 1 --timeout 20 >"$out" 2>"$errf" &
-sig_pid=$!
-sleep 1
-kill -TERM "$sig_pid"
-r=0
-wait "$sig_pid" || r=$?
+STUB_DK_RUN_SLEEP=2 run_dk_sigterm --count 4 --trials 1 --timeout 20
 expect_eq "dk-sigterm-exit143" 143 "$r"
 expect_has "dk-sigterm-stderr" "$errf" "interrupted: received signal (exit 143); running cleanup"
 expect_eq "dk-sigterm-rm-count" 4 "$(dk_rm_count)"
 expect_eq "dk-sigterm-no-residual" 0 "$(dk_remaining)"
+
+# --- D10b. 中断時、終わらない docker run クライアントは timeout と docker CLI の両方を終了・回収してから
+#     後始末を終える（REPAIR-5。timeout だけを SIGKILL すると、docker CLI が孤児として残り、cidfile の削除後に
+#     コンテナを作り得る）。docker run は TERM を無視して 40 秒待つ。計測側の TERM → timeout の --kill-after で
+#     終了し、終了後にクライアントが 1 つも残らず、コンテナも作られない ---
+export STUB_DK_RUN_SLEEP=40 STUB_DK_RUN_IGNORE_TERM=1
+run_dk_sigterm --count 3 --trials 1 --timeout 120
+expect_eq "dk-sigterm-stuck-client-exit143" 143 "$r"
+expect_eq "dk-sigterm-stuck-client-none-alive" 0 "$(alive_dk_client_count)"
+expect_eq "dk-sigterm-stuck-client-rm-count" 0 "$(dk_rm_count)"
+expect_eq "dk-sigterm-stuck-client-no-container" 0 "$(dk_remaining)"
+expect_eq "dk-sigterm-stuck-client-stdout-empty" 0 "$(wc -c <"$out")"
+# TERM の段階を省いても（selftest 専用フック）、timeout とその子の docker CLI を SIGKILL して回収する
+FANDHE_CONCURRENT_MEMORY_SELFTEST_DK_NO_TERM=1 run_dk_sigterm --count 3 --trials 1 --timeout 120
+expect_eq "dk-sigterm-kill-client-exit143" 143 "$r"
+expect_eq "dk-sigterm-kill-client-none-alive" 0 "$(alive_dk_client_count)"
+expect_eq "dk-sigterm-kill-client-no-container" 0 "$(dk_remaining)"
+# クライアントを回収できない場合（selftest 専用フックでシグナルを抑止）は、シグナルの 143 より 4 を優先する
+FANDHE_CONCURRENT_MEMORY_SELFTEST_NOKILL=1 run_dk_sigterm --count 3 --trials 1 --timeout 120
+expect_eq "dk-client-residual-exit4" 4 "$r"
+expect_has "dk-client-residual-stderr" "$errf" "cleanup-failed: docker clients still running: pid="
+expect_eq "dk-client-residual-count" 3 "$(grep -o 'pid=[0-9]*' "$errf" | wc -l)"
+expect_eq "dk-client-residual-stdout-empty" 0 "$(wc -c <"$out")"
+# 残存を片付ける（この selftest が起動したスタブと、それを包む timeout だけ）。
+pkill -KILL -f -- "${work}/stub-docker" 2>/dev/null || true
+sleep 0.5
+expect_eq "dk-client-residual-cleaned" 0 "$(alive_dk_client_count)"
+unset STUB_DK_RUN_SLEEP STUB_DK_RUN_IGNORE_TERM
 
 # --- D11. 引数: モードごとの必須・拒否（exit 2） ---
 dkbase=(--mode docker --docker "$dkstub" --target docker)
@@ -1014,6 +1051,26 @@ jq '.trial_results[0].n_started = 4' "$work/own-ok.json" >"$work/own-partial.jso
 expect_report_rc2 "report-trial-partial-start" "$work/own-partial.json" "$work/dk-ok.json"
 jq '.method = "docker-daemons-and-shim-trees"' "$work/own-ok.json" >"$work/own-method.json"
 expect_report_rc2 "report-method-forged" "$work/own-method.json" "$work/dk-ok.json"
+# docker の内訳（daemon_pss_kb・containers_pss_kb・daemon_process_count）の型・範囲・合計（CORE-9・SUP-1）。
+# 正常な結果の 1 試行目は daemon 2500 + containers 5500 = pss_total 8000
+expect_eq "report-ok-docker-breakdown" "2500+5500=8000" "$(jq -r '.trial_results[0] | "\(.daemon_pss_kb)+\(.containers_pss_kb)=\(.pss_total_kb)"' "$work/dk-ok.json")"
+jq '.trial_results[0].daemon_pss_kb = -1 | .trial_results[0].containers_pss_kb = 8001' "$work/dk-ok.json" >"$work/dk-neg-daemon.json"
+expect_report_rc2 "report-docker-daemon-negative" "$work/own-ok.json" "$work/dk-neg-daemon.json"
+jq '.trial_results[0].containers_pss_kb = -1 | .trial_results[0].daemon_pss_kb = 8001' "$work/dk-ok.json" >"$work/dk-neg-containers.json"
+expect_report_rc2 "report-docker-containers-negative" "$work/own-ok.json" "$work/dk-neg-containers.json"
+jq '.trial_results[1].daemon_pss_kb = 2501' "$work/dk-ok.json" >"$work/dk-sum.json"
+expect_report_rc2 "report-docker-breakdown-sum-mismatch" "$work/own-ok.json" "$work/dk-sum.json"
+jq '.trial_results[0].containers_pss_kb = "5500"' "$work/dk-ok.json" >"$work/dk-str.json"
+expect_report_rc2 "report-docker-containers-string" "$work/own-ok.json" "$work/dk-str.json"
+jq '.trial_results[0].daemon_pss_kb = 2500.5 | .trial_results[0].containers_pss_kb = 5499.5' "$work/dk-ok.json" >"$work/dk-frac.json"
+expect_report_rc2 "report-docker-breakdown-fraction" "$work/own-ok.json" "$work/dk-frac.json"
+jq 'del(.trial_results[2].daemon_pss_kb)' "$work/dk-ok.json" >"$work/dk-nodaemon.json"
+expect_report_rc2 "report-docker-daemon-missing" "$work/own-ok.json" "$work/dk-nodaemon.json"
+jq '.trial_results[0].daemon_process_count = 0' "$work/dk-ok.json" >"$work/dk-dn.json"
+expect_report_rc2 "report-docker-daemon-count-zero" "$work/own-ok.json" "$work/dk-dn.json"
+# 試行の pss_total_kb は整数（kB）に限る。1 試行目（最小値 5500）を 5500.5 にしても中央値 10500 は変わらない
+jq '.trial_results[0].pss_total_kb = 5500.5' "$work/own-ok.json" >"$work/own-frac.json"
+expect_report_rc2 "report-own-total-fraction" "$work/own-frac.json" "$work/dk-ok.json"
 cat "$work/own-ok.json" "$work/own-ok.json" >"$work/own-two.json"
 expect_report_rc2 "report-two-json-values" "$work/own-two.json" "$work/dk-ok.json"
 printf 'not json' >"$work/own-garbage.json"

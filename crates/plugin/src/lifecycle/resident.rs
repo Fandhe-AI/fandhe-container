@@ -372,7 +372,13 @@ impl ResidentPlugin {
                     self.guard.child = None;
                     let code = status.code();
                     self.state = ResidentState::Exited { code };
-                    return exited_error(code);
+                    // 終了コード 0 の後始末（EOF を受けた正常終了）は通信失敗の原因ではないため、
+                    // 元のエラーを保つ。異常終了（非ゼロ・取得不能）のときだけ読み替える。
+                    return if code == Some(0) {
+                        original
+                    } else {
+                        exited_error(code)
+                    };
                 }
                 Ok(None) => {}
                 Err(_) => break,
@@ -383,13 +389,20 @@ impl ResidentPlugin {
             std::thread::sleep(EXIT_POLL);
         }
         match self.guard.kill_and_reap() {
-            Reap::Reaped(status) => {
-                self.state = match classify_reaped(status) {
-                    OneShotTermination::Exited { code } => ResidentState::Exited { code },
-                    _ => ResidentState::Killed,
-                };
-                original
-            }
+            Reap::Reaped(status) => match classify_reaped(status) {
+                OneShotTermination::Exited { code } => {
+                    self.state = ResidentState::Exited { code };
+                    if code == Some(0) {
+                        original
+                    } else {
+                        exited_error(code)
+                    }
+                }
+                _ => {
+                    self.state = ResidentState::Killed;
+                    original
+                }
+            },
             Reap::AlreadyReaped => {
                 self.state = ResidentState::Killed;
                 original
@@ -401,7 +414,7 @@ impl ResidentPlugin {
         }
     }
 
-    /// セッションを終了させる。接続を閉じて EOF を見せ、[`ONE_SHOT_EXIT_TIMEOUT`] まで自発終了を待ち、
+    /// セッションを終了させる。自発終了が非ゼロ・取得不能なら `Unavailable`（PLUG-7）。接続を閉じて EOF を見せ、[`ONE_SHOT_EXIT_TIMEOUT`] まで自発終了を待ち、
     /// 超過で強制終了・回収する。回収を確認できなければ `Internal`（pid つき）。既に終了済みの
     /// セッションでは、その終了状況をそのまま返す。
     pub fn shutdown(mut self) -> Result<ResidentShutdown, PluginError> {
@@ -415,6 +428,13 @@ impl ResidentPlugin {
         if termination == OneShotTermination::Unreaped {
             self.state = ResidentState::Unreaped;
             return Err(unreaped_error(&mut self.guard, "shutdown"));
+        }
+        // 最終応答後の異常終了（非ゼロ・取得不能）を成功として返さない（PLUG-7）。
+        if let OneShotTermination::Exited { code } = termination
+            && code != Some(0)
+        {
+            self.state = ResidentState::Exited { code };
+            return Err(exited_error(code));
         }
         let stderr = match self.capture.take() {
             Some(capture) => capture.finish(ONE_SHOT_STDERR_DRAIN_TIMEOUT),

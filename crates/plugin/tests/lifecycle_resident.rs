@@ -104,11 +104,17 @@ mod unix {
                     if mode == "exit3_on_second" && seq == 2 {
                         std::process::exit(3);
                     }
+                    if mode == "exit0_on_second" && seq == 2 {
+                        std::process::exit(0);
+                    }
                     let body = format!("pid={} seq={seq}", std::process::id());
                     s.write_frame(&Frame::new(body.into_bytes()).unwrap(), rpc(5000))
                         .unwrap();
                     if mode == "exit_after_first" && seq == 1 {
                         return;
+                    }
+                    if mode == "exit3_after_first" && seq == 1 {
+                        std::process::exit(3);
                     }
                 }
                 if mode == "linger" {
@@ -226,10 +232,42 @@ mod unix {
         assert_eq!(first.code(), PluginErrorCode::Unavailable);
         let again = session.call(&ping(), rpc(5000)).unwrap_err();
         assert_eq!(again.code(), PluginErrorCode::FailedPrecondition);
+        let e = session.shutdown().unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Unavailable);
         assert_eq!(
-            session.shutdown().unwrap().termination(),
-            OneShotTermination::Exited { code: Some(3) }
+            e.message(),
+            "resident plugin process exited unexpectedly with exit code 3"
         );
+    }
+
+    /// 最終応答後の異常終了は、shutdown が成功として返さず Unavailable にする（PLUG-7）。
+    #[test]
+    fn plug7_resident_shutdown_reports_abnormal_exit_after_last_response() {
+        let dir = TempDir::new("exit3_after_first");
+        let mut session = start(&dir, 5000).unwrap();
+        session.call(&ping(), rpc(5000)).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let e = session.shutdown().unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Unavailable);
+        assert_eq!(
+            e.message(),
+            "resident plugin process exited unexpectedly with exit code 3"
+        );
+    }
+
+    /// 通信失敗の後に子が終了コード 0 で終わった場合、元の通信エラーを Unavailable へ読み替えない。
+    #[test]
+    fn plug7_resident_keeps_original_error_when_child_exits_cleanly() {
+        let dir = TempDir::new("exit0_on_second");
+        let mut session = start(&dir, 5000).unwrap();
+        session.call(&ping(), rpc(5000)).unwrap();
+        let e = session.call(&ping(), rpc(5000)).unwrap_err();
+        assert!(
+            !e.message().contains("exited unexpectedly"),
+            "{}",
+            e.message()
+        );
+        assert_eq!(session.state(), ResidentState::Exited { code: Some(0) });
     }
 
     /// 呼び出し間で自発終了した子を、次の呼び出しの前に検知して Unavailable にする。

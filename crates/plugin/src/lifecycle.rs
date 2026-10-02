@@ -51,11 +51,11 @@ pub const ONE_SHOT_ARGS_MAX_COUNT: usize = 64;
 /// 起動引数の合計バイト数上限。
 pub const ONE_SHOT_ARGS_MAX_BYTES: usize = 4096;
 
-/// accept を刻む 1 区間の長さ。区間ごとに子の早期終了を確認する。
-const ACCEPT_SLICE: Duration = Duration::from_millis(50);
-
 /// 子の終了待ちポーリング間隔の上限。
 const POLL_MAX: Duration = Duration::from_millis(5);
+
+/// 強制終了後の回収（`try_wait` ポーリング）を待つ上限（REPAIR-5。無期限の `wait` を避ける）。
+pub const ONE_SHOT_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// spawn から応答受信までの合計期限（REPAIR-5）。0 と [`ONE_SHOT_TIMEOUT_MAX`] 超は構築できない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -143,8 +143,11 @@ impl OneShotPlugin {
 pub enum OneShotTermination {
     /// 猶予内に自発終了した。`code` はシグナル終了などで取得できない場合 `None`。
     Exited { code: Option<i32> },
-    /// 猶予内に終了せず強制終了した。
+    /// 猶予内に終了せず強制終了し、回収まで確認した。
     Killed,
+    /// 強制終了を試みたが、[`ONE_SHOT_REAP_TIMEOUT`] 内に回収を確認できなかった（kill 失敗を含む）。
+    /// 呼び出し側は孤児の可能性として扱う（REPAIR-5・PLUG-7）。
+    Unreaped,
 }
 
 /// [`call_once`] の成功結果。
@@ -176,6 +179,10 @@ impl OneShotOutcome {
 struct ChildGuard(Option<Child>);
 
 impl ChildGuard {
+    fn pid(&self) -> Option<u32> {
+        self.0.as_ref().map(Child::id)
+    }
+
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         match self.0.as_mut() {
             Some(c) => c.try_wait(),
@@ -183,10 +190,27 @@ impl ChildGuard {
         }
     }
 
-    fn kill_and_reap(&mut self) {
-        if let Some(mut c) = self.0.take() {
-            let _ = c.kill();
-            let _ = c.wait();
+    /// kill して回収を `ONE_SHOT_REAP_TIMEOUT` まで待つ。回収を確認できたら true。
+    /// kill の失敗は無視せず、回収確認ができなければ false を返す（呼び出し側が `Unreaped` で報告する）。
+    /// 回収できなかった子は `Child` を手放す（以後 wait しない。孤児化の可能性は報告で伝える）。
+    fn kill_and_reap(&mut self) -> bool {
+        let Some(mut c) = self.0.take() else {
+            return true;
+        };
+        let _ = c.kill();
+        let start = Instant::now();
+        let mut interval = Duration::from_millis(1);
+        loop {
+            match c.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {}
+                Err(_) => return false,
+            }
+            if start.elapsed() >= ONE_SHOT_REAP_TIMEOUT {
+                return false;
+            }
+            std::thread::sleep(interval);
+            interval = (interval * 2).min(POLL_MAX);
         }
     }
 
@@ -211,14 +235,17 @@ impl ChildGuard {
             std::thread::sleep(interval);
             interval = (interval * 2).min(POLL_MAX);
         }
-        self.kill_and_reap();
-        OneShotTermination::Killed
+        if self.kill_and_reap() {
+            OneShotTermination::Killed
+        } else {
+            OneShotTermination::Unreaped
+        }
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        self.kill_and_reap();
+        let _ = self.kill_and_reap();
     }
 }
 
@@ -288,29 +315,31 @@ pub fn call_once(
         .map_err(|e| spawn_error(&e))?;
     let mut guard = ChildGuard(Some(child));
 
-    let mut stream = loop {
-        let left = remaining(deadline)?;
-        match listener.accept(left.min(ACCEPT_SLICE)) {
-            Ok(s) => break s,
-            Err(e) if e.code() == PluginErrorCode::Timeout => {}
-            Err(e) => return Err(e),
-        }
-        match guard.try_wait() {
-            Ok(None) => {}
-            Ok(Some(_)) | Err(_) => {
-                return Err(PluginError::new(
+    // 受付・往復はブロック内で完結させ、抜けた時点で接続を閉じて子に EOF を見せる
+    // （続けて listener を drop して socket を unlink してから終了を待つ）。
+    let response = {
+        let child_pid = guard.pid().ok_or_else(|| {
+            PluginError::new(
+                PluginErrorCode::Internal,
+                "plugin process handle is missing",
+            )
+        })?;
+        let mut stream = {
+            let left = remaining(deadline)?;
+            // 接続待ちの間は子の早期終了を確認し、期限を待たず Unavailable にする。
+            // 応答者は spawn した子の pid に限定する（同一 UID の別プロセスの先取りを防ぐ。PLUG-7）。
+            let mut check_child = || match guard.try_wait() {
+                Ok(None) => None,
+                Ok(Some(_)) | Err(_) => Some(PluginError::new(
                     PluginErrorCode::Unavailable,
                     "plugin exited before connecting",
-                ));
-            }
-        }
+                )),
+            };
+            listener.accept_peer_pid(left, child_pid, &mut check_child)?
+        };
+        stream.write_frame(request, rpc_timeout(remaining(deadline)?)?)?;
+        stream.read_frame(rpc_timeout(remaining(deadline)?)?)?
     };
-
-    stream.write_frame(request, rpc_timeout(remaining(deadline)?)?)?;
-    let response = stream.read_frame(rpc_timeout(remaining(deadline)?)?)?;
-
-    // 子に EOF を見せ、socket を unlink してから終了を待つ。
-    drop(stream);
     drop(listener);
     let termination = guard.wait_or_kill(ONE_SHOT_EXIT_TIMEOUT);
     Ok(OneShotOutcome {
@@ -357,5 +386,31 @@ mod tests {
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         let ok = vec![OsString::from("a"); ONE_SHOT_ARGS_MAX_COUNT];
         assert!(OneShotPlugin::new(abs.into(), ok, "/tmp".into()).is_ok());
+    }
+
+    /// 応答者を pid で限定する: 同一 UID でも pid が異なる接続は受理しない（PLUG-7）。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_accept_rejects_other_pid_and_accepts_expected() {
+        use crate::transport::UdsStream;
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = std::env::temp_dir().join(format!("fcos-unit-{}", std::process::id()));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let listener = UdsListener::bind(&dir.join("a.sock")).unwrap();
+        let path = listener.path().to_path_buf();
+        let me = std::process::id();
+        let _c = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
+        let e = listener
+            .accept_peer_pid(Duration::from_millis(300), me.wrapping_add(1), &mut || None)
+            .unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Timeout);
+        let _c2 = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
+        assert!(
+            listener
+                .accept_peer_pid(Duration::from_secs(2), me, &mut || None)
+                .is_ok()
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

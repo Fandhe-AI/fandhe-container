@@ -178,10 +178,39 @@ impl UdsListener {
                 "accept timeout must be non-zero and within the maximum",
             ));
         }
-        self.inner.accept(timeout).map(|inner| UdsStream {
-            inner,
-            poisoned: false,
-        })
+        self.inner
+            .accept(timeout, None, &mut || None)
+            .map(|inner| UdsStream {
+                inner,
+                poisoned: false,
+            })
+    }
+
+    /// [`Self::accept`] に「応答者を特定の子プロセスに限定する」「待機中に中断条件を確認する」を加えた版
+    /// （都度起動モード専用。PLUG-7・PLUG-12・REPAIR-5。`crate::lifecycle::call_once` が使う）。
+    ///
+    /// peer の pid が `expected_pid` と一致しない接続（同一 UID の別プロセス）は切断して受付を継続する
+    /// （期限内に限る。pid を取得できない環境は fail-closed でエラー）。接続待ちの間は `abort` を
+    /// 繰り返し呼び、`Some(err)` を返したらその `err` で受付を中断する。保留中の接続がある場合は
+    /// `abort` より接続の受理を優先する（期限切れ間際に届いた接続を取りこぼさない）。
+    pub(crate) fn accept_peer_pid(
+        &self,
+        timeout: Duration,
+        expected_pid: u32,
+        abort: &mut dyn FnMut() -> Option<PluginError>,
+    ) -> Result<UdsStream, PluginError> {
+        if timeout.is_zero() || timeout > UDS_ACCEPT_TIMEOUT_MAX {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                "accept timeout must be non-zero and within the maximum",
+            ));
+        }
+        self.inner
+            .accept(timeout, Some(expected_pid), abort)
+            .map(|inner| UdsStream {
+                inner,
+                poisoned: false,
+            })
     }
 
     /// client が接続に使う socket のパスを返す（PLUG-12）。
@@ -594,7 +623,12 @@ mod imp {
             })
         }
 
-        pub(super) fn accept(&self, timeout: Duration) -> Result<StreamInner, PluginError> {
+        pub(super) fn accept(
+            &self,
+            timeout: Duration,
+            expected_pid: Option<u32>,
+            abort: &mut dyn FnMut() -> Option<PluginError>,
+        ) -> Result<StreamInner, PluginError> {
             let deadline = Instant::now() + timeout;
             let mut poll_interval = ACCEPT_POLL_INITIAL;
             loop {
@@ -613,6 +647,13 @@ mod imp {
                         // drop で fd を閉じるため相手は切断される。
                         if sys::peer_uid(&stream)? != self.euid {
                             return Err(denied("peer credential does not match the current user"));
+                        }
+                        // 応答者の限定指定がある場合、spawn した子以外（同一 UID の別プロセス）は
+                        // 切断して受付を継続する（PLUG-7。取得不能は fail-closed でエラー）。
+                        if let Some(pid) = expected_pid
+                            && sys::peer_pid(&stream)? != pid
+                        {
+                            continue;
                         }
                         // macOS 等は listener の nonblocking を継承するため明示的に戻す。
                         stream.set_nonblocking(false).map_err(|_| {
@@ -639,6 +680,9 @@ mod imp {
                                 PluginErrorCode::Timeout,
                                 "timed out waiting for a connection",
                             ));
+                        }
+                        if let Some(e) = abort() {
+                            return Err(e);
                         }
                         thread::sleep((deadline - now).min(poll_interval));
                         poll_interval = (poll_interval * 2).min(ACCEPT_POLL_INTERVAL);
@@ -756,8 +800,15 @@ mod imp {
                 return false;
             };
             // 片方が失敗しても必ず両方を試す（短絡させない）。
-            let read_ok = self.stream.set_read_timeout(r).is_ok();
-            let write_ok = self.stream.set_write_timeout(w).is_ok();
+            // macOS は peer close 後の UDS で set_*_timeout が EINVAL を返す。切断済みの接続は以後の
+            // read が EOF・write が EPIPE で即失敗し、期限なしで待つ経路が無いため、EINVAL は
+            // 復元済みとして扱う（それ以外の失敗は復元失敗）。
+            let tolerated = |r: io::Result<()>| match r {
+                Ok(()) => true,
+                Err(e) => e.kind() == io::ErrorKind::InvalidInput,
+            };
+            let read_ok = tolerated(self.stream.set_read_timeout(r));
+            let write_ok = tolerated(self.stream.set_write_timeout(w));
             read_ok && write_ok
         }
 
@@ -918,7 +969,12 @@ mod imp {
         pub(super) fn path(&self) -> &Path {
             match *self {}
         }
-        pub(super) fn accept(&self, _timeout: Duration) -> Result<StreamInner, PluginError> {
+        pub(super) fn accept(
+            &self,
+            _timeout: Duration,
+            _expected_pid: Option<u32>,
+            _abort: &mut dyn FnMut() -> Option<PluginError>,
+        ) -> Result<StreamInner, PluginError> {
             match *self {}
         }
         pub(super) fn cleanup(&self) {

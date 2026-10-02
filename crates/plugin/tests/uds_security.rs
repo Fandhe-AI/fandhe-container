@@ -1,4 +1,4 @@
-//! runtime directory 解決・作成の結合試験（PLUG-12・TASK-123.1・#286、フォールバックは TASK-123.4・#289）。root・特権不要。
+//! runtime directory 解決・作成の結合試験（PLUG-12・TASK-123.1・#286、フォールバックは TASK-123.4・#289）。root・特権不要（別 UID 所有ディレクトリの拒否試験のみ TASK-123.5・#290 の実機前提テストとして `#[ignore]` 分離）。
 
 #[cfg(not(unix))]
 #[test]
@@ -148,7 +148,7 @@ mod unix {
         it.nth(1)?.parse().ok()
     }
 
-    /// 自 UID 所有の stale socket は削除され再 bind できる（TASK-123.2・AC3）。
+    /// 自 UID 所有の stale socket は削除され再 bind できる（TASK-123.2・AC3。TASK-123.5・#290 の「自 UID stale socket の再 bind」受入基準に対応）。
     #[test]
     fn plug12_rebind_over_own_stale_socket() {
         use std::time::Duration;
@@ -174,7 +174,7 @@ mod unix {
         l.accept(Duration::from_secs(2)).unwrap();
     }
 
-    /// symlink は削除せず PermissionDenied。リンクもリンク先も不変（TASK-123.2・AC1）。
+    /// symlink は削除せず PermissionDenied。リンクもリンク先も不変（TASK-123.2・AC1。TASK-123.5・#290 の「symlink 既存パスの bind 拒否」受入基準に対応）。
     #[test]
     fn plug12_symlink_at_socket_path_is_rejected_untouched() {
         let t = TempDir::new();
@@ -535,5 +535,57 @@ mod unix {
             (None, Err(e)) => assert_eq!(e.code(), PluginErrorCode::FailedPrecondition),
             (None, Ok(_)) => panic!("no base expected but from_env succeeded"),
         }
+    }
+
+    /// 別 UID 所有ディレクトリ配下の bind / runtime directory 作成を拒否し、何も作らない
+    /// （PLUG-12・TASK-123.5・#290）。公開 API（`UdsListener::bind`・`RuntimeDir::ensure_under`）を
+    /// 実際に別 UID 所有のディレクトリへ当てる。
+    ///
+    /// 別の非 root UID 所有のディレクトリは root の chown なしに作れないため、既定集合から
+    /// `#[ignore]` で分離する実機前提テスト（準備手順・実行コマンドは AGENTS.md「実機前提テスト」）。
+    /// 同一 UID で完結する分岐照合は `uds_security` の単体テスト `plug12_rejects_owner_mismatch` が
+    /// 既定集合で担う。前提不備は skip せず panic する。fixture は読み取りと対象 API 呼び出しのみで
+    /// chmod・chown・削除をしない。
+    #[test]
+    #[ignore = "requires a directory owned by another non-root UID (prepared with chown as root); PLUG-12"]
+    fn plug12_rejects_other_uid_owned_directory() {
+        const OTHER_UID_DIR_ENV: &str = "FANDHE_CONTAINER_TEST_OTHER_UID_DIR";
+        let dir = PathBuf::from(
+            std::env::var_os(OTHER_UID_DIR_ENV)
+                .unwrap_or_else(|| panic!("{OTHER_UID_DIR_ENV} must be set")),
+        );
+        assert!(dir.is_absolute(), "{OTHER_UID_DIR_ENV} must be absolute");
+        let before = std::fs::symlink_metadata(&dir).unwrap();
+        assert!(
+            before.file_type().is_dir(),
+            "{OTHER_UID_DIR_ENV} must be a real directory, not a symlink"
+        );
+        let me = TempDir::new();
+        let my_uid = std::fs::metadata(&me.0).unwrap().uid();
+        assert_ne!(before.uid(), 0, "fixture must not be owned by root");
+        assert_ne!(before.uid(), my_uid, "fixture must be owned by another UID");
+        // 0700 だと別 UID からは開けず別経路の拒否になるため、所有者検査へ確実に到達する 0755 を要求する。
+        assert_eq!(before.mode() & 0o777, 0o755, "fixture mode must be 0755");
+        let count = || std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(count(), 0, "fixture directory must be empty");
+
+        let err = UdsListener::bind(&dir.join("s.sock")).unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            "socket directory is not owned by the current user"
+        );
+
+        let err = RuntimeDir::ensure_under(&dir).unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            "runtime directory base is not owned by the current user"
+        );
+
+        // fail-closed: socket・ロックファイル・runtime directory を作らず、fixture も変えない。
+        assert_eq!(count(), 0, "rejection must leave no entries behind");
+        let after = std::fs::symlink_metadata(&dir).unwrap();
+        assert_eq!((after.uid(), after.mode()), (before.uid(), before.mode()));
     }
 }

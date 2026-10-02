@@ -235,14 +235,17 @@ mod supported {
         };
         let dir = PathBuf::from(dir);
         let condition = std::fs::read_to_string(dir.join("condition")).unwrap();
-        let expected: Vec<Frame> = (1..=ROUND_TRIPS)
-            .map(|n| reference_handle(&request(n)))
+        // 期待応答は参照処理を呼ばず固定の書式から組み立てる（`reference_handle` の契約
+        // `req:<n>` -> `ok:<n>:<len>` と同じ）。resident 条件の計測対象プロセスが plugin 相当処理を
+        // 実行すると両条件の処理量がずれ RSS 差分へ混入するため（PLUG-8）。
+        let expected: Vec<Vec<u8>> = (1..=ROUND_TRIPS)
+            .map(|n| format!("ok:{n}:{}", format!("req:{n}").len()).into_bytes())
             .collect();
         let bytes = match condition.as_str() {
             "in_process" => {
                 for n in 1..=ROUND_TRIPS {
                     let resp = reference_handle(&request(n));
-                    assert_eq!(resp.payload(), expected[(n - 1) as usize].payload());
+                    assert_eq!(resp.payload(), expected[(n - 1) as usize].as_slice());
                 }
                 sample_rss()
             }
@@ -268,7 +271,7 @@ mod supported {
                 );
                 for n in 1..=ROUND_TRIPS {
                     let resp = session.call(&request(n), rpc5()).unwrap();
-                    assert_eq!(resp.payload(), expected[(n - 1) as usize].payload());
+                    assert_eq!(resp.payload(), expected[(n - 1) as usize].as_slice());
                 }
                 // plugin が常駐したままの状態で採取する（shutdown の前）。
                 let b = sample_rss();

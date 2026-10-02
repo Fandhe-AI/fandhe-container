@@ -52,6 +52,9 @@ pub const METRIC_FRAMED: &str = "plugin_boundary_op_a_framed_p50";
 const OP_RUN_POD_SANDBOX: &str = "run_pod_sandbox";
 const OP_CREATE_CONTAINER: &str = "create_container";
 const OP_START_CONTAINER: &str = "start_container";
+const PREFIX_SANDBOX: &str = "sandbox-";
+const PREFIX_CONTAINER: &str = "container-";
+const STATE_RUNNING: &str = "running";
 
 /// ベンチハーネスの構造化エラー（`code` は機械可読、`message` は英語。ERR-1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +139,7 @@ impl Model {
             OP_START_CONTAINER => match (&mut self.container, args.get(1)) {
                 (Some((id, started)), Some(want)) if id == want && !*started => {
                     *started = true;
-                    Ok(vec!["running".to_string()])
+                    Ok(vec![STATE_RUNNING.to_string()])
                 }
                 _ => Err(PluginError::new(
                     PluginErrorCode::FailedPrecondition,
@@ -162,18 +165,56 @@ pub struct OpAOutcome {
     pub state: String,
 }
 
-fn first(v: Vec<String>) -> Result<String, BenchError> {
-    v.into_iter()
-        .next()
-        .ok_or_else(|| BenchError::new("bad-response", "empty response body"))
+/// 応答本体がちょうど 1 要素であることを検証して取り出す（plugin 応答は untrusted。PLUG-5）。
+fn single(v: Vec<String>) -> Result<String, BenchError> {
+    let mut it = v.into_iter();
+    match (it.next(), it.next()) {
+        (Some(one), None) => Ok(one),
+        _ => Err(BenchError::new(
+            "bad-response",
+            "response body must contain exactly one element",
+        )),
+    }
+}
+
+/// `<prefix><10 進数>` 形式の ID であることを検証する（`Model` が採番する形式）。
+fn expect_id(v: Vec<String>, prefix: &str) -> Result<String, BenchError> {
+    let id = single(v)?;
+    let ok = id
+        .strip_prefix(prefix)
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+    if ok {
+        Ok(id)
+    } else {
+        Err(BenchError::new("bad-response", "unexpected id format"))
+    }
+}
+
+/// StartContainer 相当の応答が `running` であることを検証する。
+fn expect_running(v: Vec<String>) -> Result<String, BenchError> {
+    let state = single(v)?;
+    if state == STATE_RUNNING {
+        Ok(state)
+    } else {
+        Err(BenchError::new(
+            "bad-response",
+            "unexpected container state",
+        ))
+    }
 }
 
 /// 同一プロセスで代表操作 A（3 呼び出し）を実行する。
 pub fn run_op_a_inproc(model: &mut Model) -> Result<OpAOutcome, BenchError> {
-    let sandbox_id = first(model.handle(&[OP_RUN_POD_SANDBOX.to_string()])?)?;
-    let container_id =
-        first(model.handle(&[OP_CREATE_CONTAINER.to_string(), sandbox_id.clone()])?)?;
-    let state = first(model.handle(&[OP_START_CONTAINER.to_string(), container_id.clone()])?)?;
+    let sandbox_id = expect_id(
+        model.handle(&[OP_RUN_POD_SANDBOX.to_string()])?,
+        PREFIX_SANDBOX,
+    )?;
+    let container_id = expect_id(
+        model.handle(&[OP_CREATE_CONTAINER.to_string(), sandbox_id.clone()])?,
+        PREFIX_CONTAINER,
+    )?;
+    let state =
+        expect_running(model.handle(&[OP_START_CONTAINER.to_string(), container_id.clone()])?)?;
     Ok(OpAOutcome {
         sandbox_id,
         container_id,
@@ -217,13 +258,19 @@ pub fn run_op_a_framed(
     stream: &mut UdsStream,
     next_id: &mut u64,
 ) -> Result<OpAOutcome, BenchError> {
-    let mut call = |args: Vec<String>| -> Result<String, BenchError> {
+    let mut call = |args: Vec<String>| -> Result<Vec<String>, BenchError> {
         *next_id += 1;
-        first(round_trip(stream, *next_id, args)?)
+        round_trip(stream, *next_id, args)
     };
-    let sandbox_id = call(vec![OP_RUN_POD_SANDBOX.to_string()])?;
-    let container_id = call(vec![OP_CREATE_CONTAINER.to_string(), sandbox_id.clone()])?;
-    let state = call(vec![OP_START_CONTAINER.to_string(), container_id.clone()])?;
+    let sandbox_id = expect_id(call(vec![OP_RUN_POD_SANDBOX.to_string()])?, PREFIX_SANDBOX)?;
+    let container_id = expect_id(
+        call(vec![OP_CREATE_CONTAINER.to_string(), sandbox_id.clone()])?,
+        PREFIX_CONTAINER,
+    )?;
+    let state = expect_running(call(vec![
+        OP_START_CONTAINER.to_string(),
+        container_id.clone(),
+    ])?)?;
     Ok(OpAOutcome {
         sandbox_id,
         container_id,
@@ -430,6 +477,30 @@ mod tests {
         assert_eq!(out.sandbox_id, "sandbox-1");
         assert_eq!(out.container_id, "container-2");
         assert_eq!(out.state, "running");
+    }
+
+    /// PLUG-5: 不正な応答（件数・ID 形式・状態）は計測失敗になる。
+    #[test]
+    fn plug5_response_validation_rejects_bad_bodies() {
+        assert_eq!(single(s(&["a"])).unwrap(), "a");
+        assert_eq!(single(vec![]).unwrap_err().code, "bad-response");
+        assert_eq!(single(s(&["a", "b"])).unwrap_err().code, "bad-response");
+        assert_eq!(
+            expect_id(s(&["sandbox-12"]), PREFIX_SANDBOX).unwrap(),
+            "sandbox-12"
+        );
+        for bad in ["container-1", "sandbox-", "sandbox-1x", "evil", ""] {
+            assert_eq!(
+                expect_id(s(&[bad]), PREFIX_SANDBOX).unwrap_err().code,
+                "bad-response",
+                "{bad}"
+            );
+        }
+        assert_eq!(expect_running(s(&["running"])).unwrap(), "running");
+        assert_eq!(
+            expect_running(s(&["stopped"])).unwrap_err().code,
+            "bad-response"
+        );
     }
 
     #[test]

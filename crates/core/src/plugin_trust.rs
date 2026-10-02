@@ -38,7 +38,7 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::plugin_discovery::PluginCandidate;
 use crate::traits::{ErrorCode, TraitError};
@@ -216,6 +216,7 @@ mod imp {
     use std::os::fd::{AsFd as _, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
+    use std::path::Component;
 
     /// 検証済みの探索先ディレクトリ fd。ファイルはここからの相対 open で開く。
     #[derive(Debug)]
@@ -266,10 +267,10 @@ mod imp {
 
     /// [`verify_plugin_dir`] の試験用変種。`anchor`（`dir` の祖先または `dir` 自身）までの
     /// 要素は symlink 拒否つきで辿るが所有者・モードを検証せず、`anchor` より下だけを検証する。
-    /// 開発機・CI で上位ディレクトリの権限が環境依存になる試験のためのもので、本番経路では
-    /// 使わない（`anchor` 以上の信頼は呼び出し側の責任。PLUG-11）。
-    #[doc(hidden)]
-    pub fn verify_plugin_dir_below(
+    /// 祖先検証を省略できる迂回経路のため `cfg(test)` 限定の非公開とし、公開 API・本番ビルドに
+    /// 含めない（PLUG-11）。
+    #[cfg(test)]
+    pub(super) fn verify_plugin_dir_below(
         anchor: &Path,
         dir: &Path,
     ) -> Result<VerifiedPluginDir, PluginTrustError> {
@@ -392,15 +393,6 @@ mod imp {
         ))
     }
 
-    /// 非 Linux は常に拒否する（試験用変種。[`verify_plugin_dir`] と同じ）。
-    #[doc(hidden)]
-    pub fn verify_plugin_dir_below(
-        _anchor: &Path,
-        dir: &Path,
-    ) -> Result<VerifiedPluginDir, PluginTrustError> {
-        verify_plugin_dir(dir)
-    }
-
     impl VerifiedPluginDir {
         /// 非 Linux では到達しない（`verify_plugin_dir` が常に拒否する）。
         pub fn verify_file(
@@ -416,8 +408,6 @@ mod imp {
     }
 }
 
-#[doc(hidden)]
-pub use imp::verify_plugin_dir_below;
 pub use imp::{VerifiedPluginDir, verify_plugin_dir};
 
 /// 候補 1 件の検証（親ディレクトリ → ファイルの順）。
@@ -436,6 +426,9 @@ pub fn verify_candidate(
     };
     verify_plugin_dir(parent)?.verify_file(name)
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests;
 
 #[cfg(test)]
 mod tests {

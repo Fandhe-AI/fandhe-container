@@ -62,7 +62,8 @@ fandhe-container/
 │   │   ├── bench-calibration.md   # ベンチ基準値の校正記録・試行ログ（TASK-88.2・REPAIR-8。実測は前提ベンチ未実装のため保留）
 │   │   ├── measurements/
 │   │   │   └── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
-│   │   └── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
+│   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
+│   │   └── rootless-network.md    # rootless ネットワーク外部ヘルパー選択肢の設計ドラフト（TASK-147・NET-9。採否未決）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external・ci（稼働）/ release（発火条件無効化中）
 ├── .agents/skills/                # npx skills add の導入実体

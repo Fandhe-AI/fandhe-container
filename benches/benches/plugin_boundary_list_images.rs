@@ -12,8 +12,8 @@
 //! - `--plugin-serve <path>`: 子プロセス（plugin 役）モード。本ベンチが自分自身を起動する内部用
 //! - `--bench`: cargo が自動付与するため無視
 //!
-//! 結果 JSON を CI のベンチ回帰ゲートへ接続するのは #272（TASK-113.4）。本ベンチ単体では
-//! 合否判定をしない。
+//! Δp50 と CORE-10 比（#272・TASK-113.3）は stderr へ構造化ログとして出す。
+//! 結果 JSON の回帰判定は `scripts/check-bench-regression.sh` が担い、本ベンチ単体では合否判定をしない。
 
 use fandhe_container_benches::plugin_boundary_list_images::{
     BenchError, MockImageStore, Mode, Results, SAMPLES_PER_TRIAL, SMOKE_SAMPLES, SMOKE_TRIALS,
@@ -21,17 +21,27 @@ use fandhe_container_benches::plugin_boundary_list_images::{
 };
 use std::process::ExitCode;
 
+/// Δp50 と CORE-10 比を stderr へ英語の構造化ログとして出す（TASK-113.3・PLUG-5）。
+/// 境界経路が未計測のときは出さない（値を捏造しない）。
+fn log_delta(results: &Results) -> Result<(), BenchError> {
+    if let Some(d) = results.delta()? {
+        eprintln!("{}", fandhe_container_benches::delta_p50::log_line("b", &d));
+    }
+    Ok(())
+}
+
 fn run(mode: Mode) -> Result<(), BenchError> {
     match mode {
         Mode::PluginServe { socket } => serve(&socket),
         Mode::Measure { output } => {
             let framed = run_framed_with_child(TRIALS, SAMPLES_PER_TRIAL)?;
             let inproc = measure_inproc(&MockImageStore, TRIALS, SAMPLES_PER_TRIAL)?;
-            let json = Results {
+            let results = Results {
                 inproc,
                 framed: Some(framed),
-            }
-            .to_json()?;
+            };
+            let json = results.to_json()?;
+            log_delta(&results)?;
             std::fs::write(&output, &json)
                 .map_err(|e| BenchError::new("io", format!("write output failed: {e}")))?;
             print!("{json}");
@@ -51,7 +61,9 @@ fn run(mode: Mode) -> Result<(), BenchError> {
                 }
                 Err(e) => return Err(e),
             };
-            print!("{}", Results { inproc, framed }.to_json()?);
+            let results = Results { inproc, framed };
+            log_delta(&results)?;
+            print!("{}", results.to_json()?);
             Ok(())
         }
     }

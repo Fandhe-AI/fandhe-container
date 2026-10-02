@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "metrics": {
+    "plugin_boundary_op_a_inproc_p50": {
+      "value": 5000,
+      "unit": "ns"
+    },
+    "plugin_boundary_op_a_framed_p50": {
+      "value": 31450,
+      "unit": "ns"
+    },
+    "plugin_boundary_op_a_delta_p50": {
+      "value": 26450,
+      "unit": "ns"
+    },
+    "plugin_boundary_list_images_inproc_p50": {
+      "value": 500,
+      "unit": "ns"
+    },
+    "plugin_boundary_list_images_framed_p50": {
+      "value": 10000,
+      "unit": "ns"
+    },
+    "plugin_boundary_list_images_delta_p50": {
+      "value": 9500,
+      "unit": "ns"
+    }
+  }
+}

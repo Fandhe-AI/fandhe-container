@@ -9,7 +9,8 @@
 //! 結果出力のみ）と、本モジュール内のユニットテスト（`harness = false` のベンチには
 //! `#[test]` を置けないため、ロジックはライブラリ側に置く。REPAIR-12）。
 //! 結果 JSON は `scripts/check-bench-regression.sh` の results スキーマ（`schema_version: 1`）に
-//! 適合する。Δp50 算出・CORE-10 比・回帰ゲートへの接続は #272（TASK-113.4）で行う。
+//! 適合する。Δp50 算出・CORE-10 比（`delta_p50` モジュール）は #272（TASK-113.3）で追加した。
+//! 回帰ゲートへの常時接続（`make bench-check` 対象化）は実測基準値の確定後（TASK-88.h1・TASK-113.h1）。
 //!
 //! 計測対象は **模擬制御コア**（固定の少数件のイメージ参照文字列を返すだけ）であり、実 OCI
 //! イメージストアではない（REPAIR-3）。実処理を混ぜると境界コストが埋もれるため（PoC-13 と
@@ -23,6 +24,7 @@
 //! - 非 unix（Windows）では UDS 転送が `Unimplemented`（WIN-1 により WSL2 内 Linux 側機構に
 //!   乗る）のため境界経路は計測できず、片方だけの結果を成功として出さない（fail-closed）
 
+use crate::delta_p50::{self, Delta};
 use std::fmt;
 use std::hint::black_box;
 use std::time::Instant;
@@ -44,6 +46,10 @@ pub const INPROC_BATCH: usize = 1_000;
 pub const METRIC_INPROC: &str = "plugin_boundary_list_images_inproc_p50";
 /// 境界越し経路の metric 名。
 pub const METRIC_FRAMED: &str = "plugin_boundary_list_images_framed_p50";
+/// Δp50（framed − inproc。N=1。TASK-113.3）の metric 名。
+pub const METRIC_DELTA: &str = "plugin_boundary_list_images_delta_p50";
+/// 代表操作 B の往復回数 N（PLUG-5）。
+pub const OP_B_ROUND_TRIPS: u32 = 1;
 
 /// ハーネスのエラー。`error: <code>: <message>`（英語）で標準エラーへ出す。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +163,17 @@ pub struct Results {
 }
 
 impl Results {
+    /// Δp50 と CORE-10 比を返す。境界経路が未計測（`framed: None`）なら `Ok(None)`（値を捏造しない）。
+    /// `framed <= inproc`・非有限は `Err`（fail-closed）。
+    pub fn delta(&self) -> Result<Option<Delta>, BenchError> {
+        match self.framed {
+            None => Ok(None),
+            Some(framed) => delta_p50::compute(self.inproc, framed, OP_B_ROUND_TRIPS)
+                .map(Some)
+                .map_err(|e| BenchError::new(e.code(), format!("metric {METRIC_DELTA}: {e}"))),
+        }
+    }
+
     /// results スキーマの JSON（LF 改行）を返す。全値が有限かつ 0 超でなければ `Err`。
     pub fn to_json(&self) -> Result<String, BenchError> {
         // 未計測（`None`）は metric ごと省略せず `null` で明示する（スモーク出力の契約）。
@@ -164,8 +181,21 @@ impl Results {
             (METRIC_INPROC, Some(self.inproc)),
             (METRIC_FRAMED, self.framed),
         ];
-        let mut body = Vec::new();
+        // 入力値の検証（invalid-result）を Δp50 の算出より先に行う。
         for (name, value) in entries {
+            if let Some(value) = value
+                && (!value.is_finite() || value <= 0.0)
+            {
+                return Err(BenchError::new(
+                    "invalid-result",
+                    format!("metric {name} must be finite and positive"),
+                ));
+            }
+        }
+        // Δp50 は framed が計測済みのときだけ値を持つ（未計測なら null）。
+        let delta = self.delta()?.map(|d| d.total_ns);
+        let mut body = Vec::new();
+        for (name, value) in entries.into_iter().chain([(METRIC_DELTA, delta)]) {
             match value {
                 Some(value) => {
                     if !value.is_finite() || value <= 0.0 {
@@ -533,7 +563,8 @@ mod tests {
             r.to_json().unwrap(),
             "{\n  \"schema_version\": 1,\n  \"metrics\": {\n    \
              \"plugin_boundary_list_images_inproc_p50\": { \"value\": 120.5, \"unit\": \"ns\" },\n    \
-             \"plugin_boundary_list_images_framed_p50\": { \"value\": 9000, \"unit\": \"ns\" }\n  }\n}\n"
+             \"plugin_boundary_list_images_framed_p50\": { \"value\": 9000, \"unit\": \"ns\" },\n    \
+             \"plugin_boundary_list_images_delta_p50\": { \"value\": 8879.5, \"unit\": \"ns\" }\n  }\n}\n"
         );
     }
 
@@ -548,7 +579,8 @@ mod tests {
             r.to_json().unwrap(),
             "{\n  \"schema_version\": 1,\n  \"metrics\": {\n    \
              \"plugin_boundary_list_images_inproc_p50\": { \"value\": 120.5, \"unit\": \"ns\" },\n    \
-             \"plugin_boundary_list_images_framed_p50\": null\n  }\n}\n"
+             \"plugin_boundary_list_images_framed_p50\": null,\n    \
+             \"plugin_boundary_list_images_delta_p50\": null\n  }\n}\n"
         );
     }
 
@@ -567,6 +599,33 @@ mod tests {
             framed: Some(0.0),
         };
         assert!(r.to_json().is_err());
+    }
+
+    /// PLUG-5・REPAIR-8: Δp50 は framed − inproc。framed <= inproc は Err、未計測は None。
+    #[test]
+    fn plug5_delta_values_and_fail_closed() {
+        let d = Results {
+            inproc: 500.0,
+            framed: Some(9_915.0),
+        }
+        .delta()
+        .unwrap()
+        .unwrap();
+        assert_eq!(d.total_ns, 9_415.0);
+        assert_eq!(d.round_trips, 1);
+        for framed in [500.0, 100.0] {
+            let r = Results {
+                inproc: 500.0,
+                framed: Some(framed),
+            };
+            assert_eq!(r.delta().unwrap_err().code, "non-positive-delta");
+            assert_eq!(r.to_json().unwrap_err().code, "non-positive-delta");
+        }
+        let none = Results {
+            inproc: 500.0,
+            framed: None,
+        };
+        assert_eq!(none.delta().unwrap(), None);
     }
 
     /// PLUG-5: 引数解釈（`--bench` は無視・値欠落・未知引数）。

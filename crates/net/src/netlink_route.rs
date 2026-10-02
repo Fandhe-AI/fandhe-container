@@ -15,7 +15,7 @@
 //! - extended ACK（`NETLINK_EXT_ACK`・`NLMSGERR_ATTR_MSG` 等）の解釈
 //! - 自ソケットの `nl_pid` 取得（`getsockname`）と応答 `nlmsg_pid` の照合。マルチキャスト購読が
 //!   なく送信元がカーネルであることは `recv` が検証済みのため、現状は seq 照合で足りる
-//! - `NLM_F_DUMP_INTR` の扱い、複数スレッドでの seq 別の待機者振り分け（往復は 1 件ずつ直列化する）
+//! - dump 中断（`NLM_F_DUMP_INTR`）の自動再試行（検出して `FailedPrecondition` で返すのみ）、複数スレッドでの seq 別の待機者振り分け（往復は 1 件ずつ直列化する）
 //! - link / address / route の各操作（#845・#846・#301）
 
 use std::sync::atomic::{AtomicU32, Ordering};

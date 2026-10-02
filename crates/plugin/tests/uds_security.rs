@@ -263,6 +263,42 @@ mod unix {
         assert!(std::fs::symlink_metadata(&p).is_err());
     }
 
+    /// stale socket を削除した後の再 bind が失敗しても、削除済み socket の記録を残さない。残すと
+    /// inode 番号の再利用で別経路の socket を管理下と誤認し得る（PLUG-12・TASK-123.2）。
+    #[test]
+    fn plug12_record_is_cleared_when_recorded_socket_is_gone() {
+        let t = TempDir::new();
+        let d = RuntimeDir::ensure_under(&t.0).unwrap();
+        let p = d.path().join("s.sock");
+        let lock = d.path().join("s.sock.lock");
+        // クラッシュ後の残骸（記録つきロックと同一 inode の socket）を再現する。
+        let first = UdsListener::bind(&p).unwrap();
+        let record = std::fs::read(&lock).unwrap();
+        assert!(record.starts_with(b"fcus1 "));
+        let keep = d.path().join("s.keep");
+        std::fs::hard_link(&p, &keep).unwrap();
+        drop(first);
+        std::fs::write(&lock, &record).unwrap();
+        // 1) 記録した socket が既に無く、別経路の socket がある: 削除せず、古い記録は消える。
+        let other = std::os::unix::net::UnixListener::bind(&p).unwrap();
+        let e = UdsListener::bind(&p).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+        assert_eq!(std::fs::read(&lock).unwrap(), b"");
+        std::os::unix::net::UnixStream::connect(&p).unwrap();
+        drop(other);
+        std::fs::remove_file(&p).unwrap();
+        // 2) 記録した socket も何も無い: bind は成功し、記録は新しい socket のものへ置き換わる。
+        std::fs::write(&lock, &record).unwrap();
+        let l = UdsListener::bind(&p).unwrap();
+        let ino = std::fs::symlink_metadata(&p).unwrap().ino();
+        let now = std::fs::read_to_string(&lock).unwrap();
+        assert!(now.ends_with(&format!(" {ino}\n")), "{now:?}");
+        drop(l);
+        // stale socket を削除した直後（再 bind の前）の消去は、公開 API からは観測できないため
+        // `uds_security` の単体テスト `plug12_clear_stale_socket_clears_record_after_removal` で照合する。
+        std::fs::remove_file(&keep).unwrap();
+    }
+
     /// 後始末で socket を unlink できなかった場合は記録を残し、次回の bind が stale として削除して
     /// 再 bind できる（記録を先に消すと以後常に AlreadyExists になる。PLUG-12・TASK-123.2）。
     #[test]

@@ -1073,7 +1073,9 @@ readonly RESULT_MAX_BYTES=1048576
 # report の入力（own・docker の結果ファイル）を非信頼 JSON として検証し、単一行の JSON を標準出力へ返す
 # （違反は 2）。symlink・非通常ファイル・1 MiB 超を拒否し、mode と method は固定値で照合する（入力の自己申告で
 # methods_differ を偽装させない）。N/N 起動・PSS 0 なし・中央値の再計算一致を要求する（CORE-9。無効な計測を
-# 比較に混ぜない）。
+# 比較に混ぜない）。試行ごとの pss_total_kb は正の整数（kB）に限る。docker の結果は内訳（daemon_pss_kb・
+# containers_pss_kb が非負の整数、daemon_process_count が正の整数）と、内訳の合計が pss_total_kb に一致する
+# ことも要求する（内訳は #219 で人間が比較に使う値のため、矛盾した入力からレポートを作らない）。
 load_result_file() { # <オプション名> <ファイル> <own|docker>
   local opt="$1" f="$2" want="$3" want_method size obj
   case "$want" in
@@ -1094,6 +1096,11 @@ load_result_file() { # <オプション名> <ファイル> <own|docker>
   if ! obj="$(jq -cs --arg mode "$want" --arg method "$want_method" '
     def near($a; $b): (($a - $b) | if . < 0 then -. else . end) < 0.000001;
     def posint($x): ($x | type) == "number" and $x == ($x | floor) and $x >= 1;
+    def nonnegint($x): ($x | type) == "number" and $x == ($x | floor) and $x >= 0;
+    def breakdown_ok: if $mode == "docker"
+      then nonnegint(.daemon_pss_kb) and nonnegint(.containers_pss_kb) and posint(.daemon_process_count)
+        and (.daemon_pss_kb + .containers_pss_kb) == .pss_total_kb
+      else true end;
     if length == 1 then .[0] else error("not a single JSON value") end
     | if (type == "object" and .schema_version == 1 and .benchmark == "concurrent_memory"
         and .mode == $mode and .method == $method
@@ -1105,14 +1112,14 @@ load_result_file() { # <オプション名> <ファイル> <own|docker>
     | .trial_results as $tr
     | if ($tr | type) == "array" and ($tr | length) == .trials
         and ($tr | all(type == "object" and .n_expected == $c and .n_started == $c and .zero_pss_count == 0
-          and (.pss_total_kb | type) == "number" and .pss_total_kb > 0))
+          and posint(.pss_total_kb) and breakdown_ok))
         and (.metrics[$k].unit == "kB") and (.metrics[$k].value | type) == "number" and .metrics[$k].value > 0
       then ([$tr[].pss_total_kb] | sort) as $t
         | ($t | length) as $n
         | (if $n % 2 == 1 then $t[($n - 1) / 2] else ($t[$n / 2 - 1] + $t[$n / 2]) / 2 end) as $med
         | if near(.metrics[$k].value; $med) then . else error("median does not match trial_results") end
       else error("trial_results inconsistent with count and trials") end' "$f" 2>/dev/null)"; then
-    err "invalid-result" "$opt is not a valid concurrent_memory result with mode=$want method=$want_method (schema_version 1, n_started_min == count, all trials N/N started with no zero PSS, median recomputed from trial_results)"
+    err "invalid-result" "$opt is not a valid concurrent_memory result with mode=$want method=$want_method (schema_version 1, n_started_min == count, all trials N/N started with no zero PSS, integer pss_total_kb, docker breakdown summing to pss_total_kb, median recomputed from trial_results)"
     exit 2
   fi
   printf '%s' "$obj"

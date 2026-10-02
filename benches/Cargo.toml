@@ -34,3 +34,9 @@ harness = false
 
 [dependencies]
 fandhe-container-plugin = { path = "../crates/plugin" }
+
+# [[bench]] plugin_boundary_list_images は TASK-113.2（#271・PLUG-5）の代表操作 B（イメージ一覧）計測ハーネス。
+# 代表操作 A（plugin_boundary。TASK-113.1）とは別ターゲットで、ゲート（bench-check）へは未接続。
+[[bench]]
+name = "plugin_boundary_list_images"
+harness = false

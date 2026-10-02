@@ -4,6 +4,7 @@
 //! 「都度起動（spawn → 接続受理）」と「常駐（計測前に起動・接続済みの plugin へ 4 RPC）」の 2 モードで測る。
 //! 各モードは plugin を挟まない同一プロセス経路（同じ操作の直接呼び出し）を同条件で計測し、
 //! その**差（上乗せ）**が MAC-2 の cold start 目標（2 秒）の PLUG-6 の期待（1% 未満＝20 ms 未満）に収まるか判定する。
+//! 常駐の子は `Model::new()` 後に準備完了通知（1 フレーム）を送り、親は計測開始前にそれを受け取る（accept は接続成立のみを示すため）。
 //! 計測区間は都度起動が「spawn → accept 完了」、常駐が「接続済み plugin への代表操作 A×3＋B×1 の 4 RPC」のみで、
 //! 常駐 plugin の起動・接続・子プロセス回収は計測区間の外に置く。
 //! 参照値は PoC-13（長さ接頭辞フレーム: 都度 2.043 ms／常駐 4.500 ms、gRPC: 2.537 ms／5.032 ms）。
@@ -164,8 +165,8 @@ mod proc {
     use crate::plugin_boundary::{Model, round_trip, run_op_a_framed, run_op_a_inproc};
     use crate::plugin_boundary_list_images::{ImageLister, MockImageStore};
     use fandhe_container_plugin::{
-        ControlMessage, PluginError, PluginErrorCode, RpcTimeout, UdsListener, UdsStream,
-        decode_message, encode_message,
+        ControlMessage, MessageId, PluginError, PluginErrorCode, RpcTimeout, UdsListener,
+        UdsStream, decode_message, encode_message,
     };
     use std::fs;
     use std::hint::black_box;
@@ -180,6 +181,9 @@ mod proc {
     const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
     const MAX_NAME_ATTEMPTS: usize = 64;
     const OP_LIST_IMAGES: &str = "list_images";
+    /// 準備完了通知の ID と本体（子が `Model::new()` を終えサーバーループに入る直前に 1 回送る）。
+    const READY_ID: u64 = u64::MAX;
+    const READY_BODY: &str = "ready";
 
     /// plugin エラーを構造化エラーへ写す（相手由来の文字列は載せない）。
     fn pe(e: PluginError) -> BenchError {
@@ -291,6 +295,14 @@ mod proc {
         let t = timeout()?;
         let mut model = Model::new();
         let store = MockImageStore;
+        // 準備完了ハンドシェイク: 親は計測開始前（常駐）または計測終了後（都度起動）にこれを受け取る。
+        let ready: ControlMessage<Vec<String>> = ControlMessage::Response {
+            id: MessageId::new(READY_ID),
+            body: vec![READY_BODY.to_string()],
+        };
+        stream
+            .write_frame(&encode_message(&ready).map_err(pe)?, t)
+            .map_err(pe)?;
         loop {
             let frame = match stream.read_frame(t) {
                 Ok(f) => f,
@@ -322,6 +334,20 @@ mod proc {
         serve(&mut stream)
     }
 
+    /// 子の準備完了通知を受け取り検証する（accept は接続成立しか示さず、子の `Model::new()` 完了を保証しない）。
+    fn wait_ready(stream: &mut UdsStream) -> Result<(), BenchError> {
+        let t = timeout()?;
+        let frame = stream.read_frame(t).map_err(pe)?;
+        match decode_message::<Vec<String>>(&frame).map_err(pe)? {
+            ControlMessage::Response { id, body }
+                if id == MessageId::new(READY_ID) && body.as_slice() == [READY_BODY] =>
+            {
+                Ok(())
+            }
+            _ => Err(BenchError::new("protocol", "expected a ready notification")),
+        }
+    }
+
     /// 接続済みの plugin へ代表操作 A×3＋B×1 の 4 RPC を行い、応答内容を具体値で検証する。
     fn run_four_rpcs(stream: &mut UdsStream) -> Result<(), BenchError> {
         let mut next_id = 0u64;
@@ -345,8 +371,10 @@ mod proc {
         let listener = UdsListener::bind(&dir.0.join("s")).map_err(pe)?;
         let start = Instant::now();
         let child = Guard::spawn(exe, ARG_PLUGIN_SERVE, listener.path())?;
-        let stream = listener.accept(SETUP_TIMEOUT).map_err(pe)?;
+        let mut stream = listener.accept(SETUP_TIMEOUT).map_err(pe)?;
         let ms = start.elapsed().as_secs_f64() * 1000.0;
+        // 子が通知を書く前に切断して EPIPE にならないよう、計測後に準備完了通知を読み捨てる。
+        wait_ready(&mut stream)?;
         drop(stream);
         child.finish()?;
         Ok(ms)
@@ -369,6 +397,8 @@ mod proc {
         let listener = UdsListener::bind(&dir.0.join("s")).map_err(pe)?;
         let child = Guard::spawn(exe, ARG_PLUGIN_SERVE, listener.path())?;
         let mut stream = listener.accept(SETUP_TIMEOUT).map_err(pe)?;
+        // 子の準備完了（Model::new() 済み・サーバーループ直前）を待ってから計測を始める。
+        wait_ready(&mut stream)?;
         let start = Instant::now();
         run_four_rpcs(&mut stream)?;
         let ms = start.elapsed().as_secs_f64() * 1000.0;

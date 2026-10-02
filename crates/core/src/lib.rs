@@ -59,8 +59,8 @@
 //!   TASK-32.3・CORE-3 は実装済み。TASK-32.4 は fork 後の子の `cgroup.procs` 参加フック `CgroupJoin` まで実装済み。本番 launcher からの結線は未実装）
 //! - `plugin`: `plugin` feature 配下の境界基盤型の再エクスポート（PLUG-3・TASK-111.1・#262）。
 //!   発見・登録は未実装
-//! - `plugin_discovery`: 管理ディレクトリ（system / user）からの plugin 候補探索（TASK-109.1・PLUG-4・PLUG-11）と `PATH` 探索の opt-in・警告ログ（TASK-109.2）は実装済み・OS 非依存。
-//!   候補は未検証。opt-in の CLI フラグ配線（TASK-79）・レジストリ（TASK-109.3）・信頼性検証（TASK-122）は未実装
+//! - `plugin_discovery`: 管理ディレクトリ（system / user）からの plugin 候補探索（TASK-109.1・PLUG-4・PLUG-11）と `PATH` 探索の opt-in・警告ログ（TASK-109.2）、同名重複を解決する候補レジストリ（TASK-109.3。登録は未検証）は実装済み・OS 非依存。
+//!   候補は未検証。opt-in の CLI フラグ配線（TASK-79）・信頼性検証（TASK-122）は未実装
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
 //!

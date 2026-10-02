@@ -11,7 +11,9 @@
 //! 同じ流儀で必要最小限の `extern "C"` 宣言を自前で持つ。
 //!
 //! - Linux（x86_64 / aarch64）: `getsockopt(SOL_SOCKET, SO_PEERCRED)` の `struct ucred`
-//! - macOS: `getpeereid(2)`
+//! - macOS: `getpeereid(2)`（TASK-124.2・#293。`LOCAL_PEERCRED` の `struct xucred` を自前で写さず libSystem の
+//!   安定 ABI に乗り、arch 依存定数を持たないため `target_arch` 分岐は不要。Linux の `SO_PEERCRED` と同じ
+//!   「接続時点の実効 uid」を返す共通インターフェース）
 //! - いずれの unix: `fchmodat(2)`（`AT_SYMLINK_NOFOLLOW`。Linux の `fchmodat2` 非対応環境は `O_PATH` fd 経由へ縮退）・`unlinkat(2)` を検証済みディレクトリ fd
 //!   基準で呼ぶ（パス再解決による TOCTOU を避ける。PLUG-12）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_NOFOLLOW | O_DIRECTORY)` で配置ディレクトリを
@@ -687,7 +689,10 @@ pub(crate) fn peer_pid(stream: &UnixStream) -> Result<u32, PluginError> {
     })
 }
 
-/// 接続元の接続時点の実効 uid を返す（macOS）。
+/// 接続元の接続時点の実効 uid を返す（macOS。PLUG-12・TASK-124.2）。
+///
+/// Linux 版と同シグネチャ・同じ意味の値を返す。取得失敗は `Internal` で、呼び出し側（`transport` の
+/// accept / connect）は `?` で返して stream を drop し、フレームを読まずに切断する（fail-closed）。
 #[cfg(target_os = "macos")]
 pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
     use std::os::unix::io::AsRawFd;
@@ -1124,5 +1129,46 @@ mod tests {
         let (a, _b) = UnixStream::pair().unwrap();
         assert_eq!(peer_uid(&a).unwrap(), effective_uid());
         assert_eq!(peer_pid(&a).unwrap(), std::process::id());
+    }
+}
+
+/// macOS の peer 認証ラッパーの検証（PLUG-12・TASK-124.2・#293）。実 UDS 接続で行う。
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::net::UnixListener;
+
+    /// 一時ディレクトリ（0700）に listener を bind し、実接続した (client, server) を返す。
+    fn connected_pair(tag: &str) -> (UnixStream, UnixStream) {
+        let dir = std::env::temp_dir().join(format!("fc-peer-{}-{tag}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .expect("create tmp dir");
+        let path = dir.join("s");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let client = UnixStream::connect(&path).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let _ = std::fs::remove_dir_all(&dir);
+        (client, server)
+    }
+
+    /// PLUG-12: 両端とも自プロセスの実効 uid を返す。
+    #[test]
+    fn plug12_macos_peer_uid_matches_effective_uid() {
+        let (client, server) = connected_pair("uid");
+        let euid = effective_uid();
+        assert_eq!(peer_uid(&server).expect("server side"), euid);
+        assert_eq!(peer_uid(&client).expect("client side"), euid);
+    }
+
+    /// PLUG-12: `LOCAL_PEERPID` は同一プロセス内の接続では自 pid を返す。
+    #[test]
+    fn plug12_macos_peer_pid_matches_own_pid() {
+        let (client, server) = connected_pair("pid");
+        assert_eq!(peer_pid(&server).expect("server side"), std::process::id());
+        assert_eq!(peer_pid(&client).expect("client side"), std::process::id());
     }
 }

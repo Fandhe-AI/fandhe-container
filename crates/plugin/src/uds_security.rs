@@ -81,7 +81,7 @@
 //!   user namespace 外の uid は overflowuid として見え、不一致で拒否される（安全側）。
 //! - 同一 UID の別プロセスは脅威モデル外（第 1 層は 0700 の配置ディレクトリ）。
 //! - `unsafe` を含む取得処理は `crate::sys::peer_uid`（`sys` モジュール）に閉じる。
-//! - macOS は getpeereid で peer uid を取得済み。未実装は LOCAL_PEERCRED 方式（#293）・別 UID 実接続の拒否試験（#295）・拒否の監査ログ（SEC-4）。
+//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。未実装は Windows の文書化（#294）・別 UID 実接続の拒否試験（#295）・拒否の監査ログ（SEC-4）。
 //!
 //! # 未実装（REPAIR-3）
 //! - 非 unix は `Unimplemented`（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る）。

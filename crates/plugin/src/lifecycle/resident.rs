@@ -21,8 +21,8 @@
 //!   状態にする。以後の [`ResidentPlugin::call`] は I/O せず `FailedPrecondition`。回収を確認できない
 //!   場合は `Internal`（pid つき）を返し、その子は以後回収しない（都度起動モードと同じ契約）。
 //! - 子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ。stdin / stdout は null、stderr は
-//!   セッション全期間で 1 本の読み取りスレッドが上限つきで収集し、[`ResidentPlugin::shutdown`] の結果で
-//!   のみ返す（untrusted）。[`ResidentPlugin`] の破棄（panic 等を含む）でも子の kill・回収とスレッド停止を行う。
+//!   セッション全期間で 1 本の読み取りスレッドが上限つきで収集し、[`ResidentPlugin::shutdown`] の結果
+//!   （失敗時も [`ResidentShutdownError`] に載せる）でのみ返す（untrusted）。[`ResidentPlugin`] の破棄（panic 等を含む）でも子の kill・回収とスレッド停止を行う。
 //! - 応答は untrusted。フレームの長さ上限・チェックサムは transport 側で検証済みで、内容は解釈しない。
 //!
 //! # 未実装（REPAIR-3）
@@ -128,10 +128,37 @@ impl ResidentShutdown {
     }
 }
 
+/// [`ResidentPlugin::shutdown`] の失敗結果。エラーと、失敗経路でも回収した stderr を併せ持つ。
+///
+/// plugin がクラッシュした場合の診断情報を失わないため、[`ResidentShutdown`] と同じ stderr を載せる。
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ResidentShutdownError {
+    error: PluginError,
+    stderr: OneShotStderr,
+}
+
+impl ResidentShutdownError {
+    /// 失敗の構造化エラー。
+    pub fn error(&self) -> &PluginError {
+        &self.error
+    }
+
+    /// セッション全期間に plugin が stderr へ書いた内容（untrusted・上限つき）。
+    pub fn stderr(&self) -> &OneShotStderr {
+        &self.stderr
+    }
+
+    /// 構造化エラーだけを取り出す（stderr は捨てる）。
+    pub fn into_error(self) -> PluginError {
+        self.error
+    }
+}
+
 /// 1 回の [`ResidentPlugin::call_observed`] の観測記録（成功 / 失敗とレイテンシ。REPAIR-4）。
 ///
 /// 呼び出し側（core の plugin proxy 等）が集計する。stderr は毎回複製しないため載せない
-/// （[`ResidentShutdown::stderr`] で受け取る）。
+/// （[`ResidentShutdown::stderr`]、失敗時は [`ResidentShutdownError::stderr`] で受け取る）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResidentCallRecord {
@@ -196,6 +223,14 @@ fn remaining_or(deadline: Instant, err: fn() -> PluginError) -> Result<Duration,
         Some(d) if !d.is_zero() => Ok(d),
         _ => Err(err()),
     }
+}
+
+/// 子の生存確認（`try_wait`）自体が失敗したことを表す `Unavailable`（OS のエラー文字列は含めない）。
+fn status_check_error() -> PluginError {
+    PluginError::new(
+        PluginErrorCode::Unavailable,
+        "failed to check resident plugin process status",
+    )
 }
 
 /// 子の終了を表す `Unavailable`。値は自プロセスが回収で得た終了コードの数値のみ。
@@ -316,12 +351,18 @@ impl ResidentPlugin {
             return Err(not_running_error());
         }
         // 往復の前に、呼び出し間で自発終了していないかを確認する。
-        if let Ok(Some(status)) = self.guard.try_wait() {
-            self.guard.child = None;
-            self.stream = None;
-            let code = status.code();
-            self.state = ResidentState::Exited { code };
-            return Err(exited_error(code));
+        match self.guard.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                self.guard.child = None;
+                self.stream = None;
+                let code = status.code();
+                self.state = ResidentState::Exited { code };
+                return Err(exited_error(code));
+            }
+            // 生存を確認できないまま通信しない。確認エラーもセッション失敗として接続を閉じ、
+            // 子を kill・回収した結果を含む構造化エラーを返す。
+            Err(_) => return Err(self.fail_session(status_check_error())),
         }
         let Some(deadline) = Instant::now().checked_add(timeout.as_duration()) else {
             return Err(call_timeout_error());
@@ -414,10 +455,14 @@ impl ResidentPlugin {
         }
     }
 
-    /// セッションを終了させる。自発終了が非ゼロ・取得不能なら `Unavailable`（PLUG-7）。接続を閉じて EOF を見せ、[`ONE_SHOT_EXIT_TIMEOUT`] まで自発終了を待ち、
-    /// 超過で強制終了・回収する。回収を確認できなければ `Internal`（pid つき）。既に終了済みの
-    /// セッションでは、その終了状況をそのまま返す。
-    pub fn shutdown(mut self) -> Result<ResidentShutdown, PluginError> {
+    /// セッションを終了させる。接続を閉じて EOF を見せ、[`ONE_SHOT_EXIT_TIMEOUT`] まで自発終了を待ち、
+    /// 超過で強制終了・回収する。既に終了済みのセッションでは、その終了状況をそのまま使う。
+    ///
+    /// 自発終了が非ゼロ・取得不能なら `Unavailable`、回収を確認できなければ `Internal`（pid つき）を
+    /// [`ResidentShutdownError`] で返す。いずれの経路でも、エラーを返す前に stderr の収集結果を
+    /// 期限つき（[`ONE_SHOT_STDERR_DRAIN_TIMEOUT`]）で受け取って読み取りスレッドの停止を確認し、
+    /// 診断情報（クラッシュ時の plugin の stderr 等）を [`ResidentShutdownError::stderr`] で渡す。
+    pub fn shutdown(mut self) -> Result<ResidentShutdown, ResidentShutdownError> {
         self.stream = None;
         let termination = match self.state {
             ResidentState::Running => self.guard.wait_or_kill(ONE_SHOT_EXIT_TIMEOUT),
@@ -425,25 +470,30 @@ impl ResidentPlugin {
             ResidentState::Killed => OneShotTermination::Killed,
             ResidentState::Unreaped => OneShotTermination::Unreaped,
         };
-        if termination == OneShotTermination::Unreaped {
+        // 失敗の判定を先に済ませ（報告済みの印は `unreaped_error` が付ける）、stderr は必ず回収する。
+        let failure = if termination == OneShotTermination::Unreaped {
             self.state = ResidentState::Unreaped;
-            return Err(unreaped_error(&mut self.guard, "shutdown"));
-        }
-        // 最終応答後の異常終了（非ゼロ・取得不能）を成功として返さない（PLUG-7）。
-        if let OneShotTermination::Exited { code } = termination
+            Some(unreaped_error(&mut self.guard, "shutdown"))
+        } else if let OneShotTermination::Exited { code } = termination
             && code != Some(0)
         {
+            // 最終応答後の異常終了（非ゼロ・取得不能）を成功として返さない（PLUG-7）。
             self.state = ResidentState::Exited { code };
-            return Err(exited_error(code));
-        }
+            Some(exited_error(code))
+        } else {
+            None
+        };
         let stderr = match self.capture.take() {
             Some(capture) => capture.finish(ONE_SHOT_STDERR_DRAIN_TIMEOUT),
             None => OneShotStderr::empty(),
         };
-        Ok(ResidentShutdown {
-            termination,
-            stderr,
-        })
+        match failure {
+            Some(error) => Err(ResidentShutdownError { error, stderr }),
+            None => Ok(ResidentShutdown {
+                termination,
+                stderr,
+            }),
+        }
     }
 }
 

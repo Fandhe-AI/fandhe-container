@@ -42,7 +42,8 @@ mod resident;
 
 pub use resident::{
     RESIDENT_EXIT_DETECT_TIMEOUT, RESIDENT_START_TIMEOUT_DEFAULT, RESIDENT_START_TIMEOUT_MAX,
-    ResidentCallRecord, ResidentPlugin, ResidentShutdown, ResidentStartTimeout, ResidentState,
+    ResidentCallRecord, ResidentPlugin, ResidentShutdown, ResidentShutdownError,
+    ResidentStartTimeout, ResidentState,
 };
 
 use crate::error::{PluginError, PluginErrorCode};

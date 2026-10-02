@@ -35,8 +35,8 @@ pub use lifecycle::{
     ONE_SHOT_TIMEOUT_DEFAULT, ONE_SHOT_TIMEOUT_MAX, OneShotOutcome, OneShotPlugin, OneShotRecord,
     OneShotStderr, OneShotTermination, OneShotTimeout, PLUGIN_SOCKET_ENV,
     RESIDENT_EXIT_DETECT_TIMEOUT, RESIDENT_START_TIMEOUT_DEFAULT, RESIDENT_START_TIMEOUT_MAX,
-    ResidentCallRecord, ResidentPlugin, ResidentShutdown, ResidentStartTimeout, ResidentState,
-    call_once, call_once_observed,
+    ResidentCallRecord, ResidentPlugin, ResidentShutdown, ResidentShutdownError,
+    ResidentStartTimeout, ResidentState, call_once, call_once_observed,
 };
 pub use message::{ControlMessage, MessageId, decode_message, encode_message};
 pub use transport::{

@@ -90,7 +90,7 @@ mod unix {
             "exit_early" => {}
             "silent_no_connect" => std::thread::sleep(Duration::from_secs(60)),
             mode => {
-                if mode == "stderr_small" {
+                if mode == "stderr_small" || mode == "stderr_exit3_after_first" {
                     write_stderr(b"plugin-diagnostic\n");
                 }
                 let mut s = UdsStream::connect(&sock, Duration::from_secs(5)).unwrap();
@@ -113,7 +113,9 @@ mod unix {
                     if mode == "exit_after_first" && seq == 1 {
                         return;
                     }
-                    if mode == "exit3_after_first" && seq == 1 {
+                    if (mode == "exit3_after_first" || mode == "stderr_exit3_after_first")
+                        && seq == 1
+                    {
                         std::process::exit(3);
                     }
                 }
@@ -232,7 +234,7 @@ mod unix {
         assert_eq!(first.code(), PluginErrorCode::Unavailable);
         let again = session.call(&ping(), rpc(5000)).unwrap_err();
         assert_eq!(again.code(), PluginErrorCode::FailedPrecondition);
-        let e = session.shutdown().unwrap_err();
+        let e = session.shutdown().unwrap_err().into_error();
         assert_eq!(e.code(), PluginErrorCode::Unavailable);
         assert_eq!(
             e.message(),
@@ -247,12 +249,26 @@ mod unix {
         let mut session = start(&dir, 5000).unwrap();
         session.call(&ping(), rpc(5000)).unwrap();
         std::thread::sleep(Duration::from_millis(500));
-        let e = session.shutdown().unwrap_err();
+        let e = session.shutdown().unwrap_err().into_error();
         assert_eq!(e.code(), PluginErrorCode::Unavailable);
         assert_eq!(
             e.message(),
             "resident plugin process exited unexpectedly with exit code 3"
         );
+    }
+
+    /// 異常終了の shutdown 失敗でも、セッション全期間の stderr が結果に載り、読み取りスレッドが止まる。
+    #[test]
+    fn plug7_resident_shutdown_failure_still_returns_stderr() {
+        let dir = TempDir::new("stderr_exit3_after_first");
+        let mut session = start(&dir, 5000).unwrap();
+        session.call(&ping(), rpc(5000)).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let failure = session.shutdown().unwrap_err();
+        assert_eq!(failure.error().code(), PluginErrorCode::Unavailable);
+        assert_eq!(failure.stderr().bytes(), b"plugin-diagnostic\n");
+        assert_eq!(failure.stderr().total_bytes(), 18);
+        assert!(failure.stderr().reader_stopped());
     }
 
     /// 通信失敗の後に子が終了コード 0 で終わった場合、元の通信エラーを Unavailable へ読み替えない。

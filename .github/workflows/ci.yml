@@ -565,7 +565,11 @@ jobs:
           set -euo pipefail
           # pull_request では base を取得し、plugin 追加 PR が core を変更していないかも検査する
           if [ -n "${BASE_REF}" ]; then
-            git fetch --no-tags --depth=1 origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            # merge-base を求めるため履歴を深くする（shallow なら unshallow してから base を取得）
+            if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+              git fetch --no-tags --unshallow origin
+            fi
+            git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
             export PLUG4_BASE_REF="origin/${BASE_REF}"
           fi
           make plug4-core-invariance

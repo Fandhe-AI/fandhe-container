@@ -54,7 +54,7 @@
 //! # cfg 方針
 //!
 //! 実体は `cfg(unix)` の `std::os::unix::net` のみ。それ以外の OS では `bind` が
-//! `Unimplemented` を返す（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る）。
+//! `Unimplemented` を返す（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る。理由は `uds_security` のモジュール doc 参照）。
 
 use std::io::{self, Read, Write};
 use std::path::Path;

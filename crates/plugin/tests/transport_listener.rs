@@ -135,6 +135,10 @@ mod unix {
         let l = UdsListener::bind(&dir2.sock()).unwrap();
         let e = UdsListener::bind(&dir2.sock()).unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+        // 生存確認の probe 接続（TASK-123.2。データは送らず即切断）が accept に 1 件届くので読み捨てる。
+        let mut probe = l.accept(WAIT).unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(probe.read(&mut b).unwrap(), 0);
         let h = connect_and_ping(l.path());
         let mut s = l.accept(WAIT).unwrap();
         let mut buf = [0u8; 4];

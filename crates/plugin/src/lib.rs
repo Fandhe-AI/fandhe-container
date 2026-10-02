@@ -6,7 +6,8 @@
 //! （`UdsStream::connect`。TASK-107.5・#249）、フレーム単位の ACK/RPC 待機タイムアウト
 //! （`RpcTimeout`・`UdsStream::read_frame` / `write_frame`。TASK-107.6・#250）と runtime directory の解決・作成・検証
 //! （`uds_security`。TASK-123.1・#286）のみ実装済み。gRPC と
-//! PLUG-12 の残り（stale socket 再 bind・XDG 未設定時のフォールバック等。TASK-123・TASK-124）は未実装（TASK-108 ほか。REPAIR-3）。
+//! 既存 socket パスの lstat 検証・stale socket 再 bind（`uds_security`。TASK-123.2・#287）も実装済み。
+//! PLUG-12 の残り（XDG 未設定時のフォールバック等。TASK-123.4・TASK-124）は未実装（TASK-108 ほか。REPAIR-3）。
 //! 本体は G8（TASK-107 が crate 本体、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124）で
 //! 実装する。plugin 発見・登録（TASK-109）の成果物は `fandhe-container-core` 側に置かれ、本 crate ではない。
 //! PLUG-1 区分は core・plugin 双方が依存する境界基盤ライブラリ（crate-naming.md 決定 4）。

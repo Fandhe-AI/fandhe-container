@@ -43,8 +43,9 @@
 //!
 //! # 未実装の範囲（REPAIR-3）
 //!
-//! - 自 UID 所有 stale socket の再 bind は TASK-123・TASK-124（PLUG-12）。本実装は既存パスを
-//!   一切 unlink せず `AlreadyExists` で拒否する
+//! - 既存パスは bind 前に lstat 検証する（PLUG-12・TASK-123.2）。symlink・他 UID 所有は削除せず
+//!   `PermissionDenied`、生存中の listener や socket 以外は `AlreadyExists`、自 UID 所有で接続が
+//!   拒否される stale socket のみ削除して再 bind する（詳細は `uds_security` モジュール doc）
 //! - gRPC（TASK-108）
 //! - 要求 ID と応答 ID の対応づけ・要求→応答の 1 往復ヘルパー（core 側 proxy。TASK-114）
 //! - ACK 専用のワイヤー種別（`ControlMessage` のワイヤー形変更を伴うため行わない。本 crate での
@@ -145,7 +146,11 @@ impl UdsListener {
     /// 保持する（Drop 時の cwd 変更・bind 後の symlink 差し替えの影響を避ける。[`Self::path`] 参照）。
     /// 解決後のパス（[`Self::path`]）が `sun_path` の長さ制限を超える場合は `InvalidArgument`
     /// （Linux は bind に使う `/proc/self/fd/<fd>/<名前>` も同じ制限を受けるため、socket 名が
-    /// 長い場合も拒否する）。stale 処理は TASK-123・TASK-124（PLUG-12）。
+    /// 長い場合も拒否する）。
+    ///
+    /// 既存エントリがある場合は lstat で検証する（PLUG-12・TASK-123.2）。symlink・他 UID 所有は削除せず
+    /// `PermissionDenied`、生存中の listener・socket 以外は `AlreadyExists`、自 UID 所有の stale socket
+    /// （接続拒否）のみ削除して再 bind する。
     pub fn bind(path: &Path) -> Result<Self, PluginError> {
         // `..` は bind 時点とそれ以降で解決先が変わりうるため拒否する（`std::path::absolute` は
         // `..` を残す。PLUG-12）。
@@ -197,7 +202,7 @@ impl UdsListener {
 impl Drop for UdsListener {
     fn drop(&mut self) {
         // 検証済み配置ディレクトリ fd 基準の unlinkat で削除する（パス再解決なし）。
-        // stale socket の所有者検証・再 bind は TASK-123・TASK-124（PLUG-12）で扱う。
+        // 既存 socket の stale 判定・削除は bind 時（`clear_stale_socket`。TASK-123.2）に行う。
         self.inner.cleanup();
     }
 }
@@ -551,6 +556,8 @@ mod imp {
             check_sun_path_len(&bound)?;
             let target = bind_target(&dir, &bound, Path::new(file_name));
             check_sun_path_len(&target)?;
+            // 既存エントリの lstat 検証と、自 UID 所有の stale socket の削除（PLUG-12・TASK-123.2）。
+            crate::uds_security::clear_stale_socket(&dir, &name, &bound, &target, euid)?;
             let listener = UnixListener::bind(&target).map_err(|e| map_bind_error(e.kind()))?;
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
             let identity = sys::lstat_at(&dir, &name, &bound).ok();

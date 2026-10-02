@@ -129,4 +129,69 @@ mod unix {
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         UdsListener::bind(&d.path().join("s.sock")).unwrap();
     }
+    /// 自 UID 所有の stale socket は削除され再 bind できる（TASK-123.2・AC3）。
+    #[test]
+    fn plug12_rebind_over_own_stale_socket() {
+        use std::time::Duration;
+        let t = TempDir::new();
+        let d = RuntimeDir::ensure_under(&t.0).unwrap();
+        let p = d.path().join("s.sock");
+        drop(std::os::unix::net::UnixListener::bind(&p).unwrap()); // std は unlink しない
+        let old_ino = std::fs::symlink_metadata(&p).unwrap().ino();
+        let l = UdsListener::bind(&p).unwrap();
+        let m = std::fs::symlink_metadata(&p).unwrap();
+        assert_ne!(m.ino(), old_ino);
+        assert_eq!(m.mode() & 0o777, 0o600);
+        let _c = std::os::unix::net::UnixStream::connect(l.path()).unwrap();
+        l.accept(Duration::from_secs(2)).unwrap();
+    }
+
+    /// symlink は削除せず PermissionDenied。リンクもリンク先も不変（TASK-123.2・AC1）。
+    #[test]
+    fn plug12_symlink_at_socket_path_is_rejected_untouched() {
+        let t = TempDir::new();
+        let d = RuntimeDir::ensure_under(&t.0).unwrap();
+        let target = d.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = d.path().join("s.sock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let e = UdsListener::bind(&link).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+
+        // リンク先が stale socket の場合も、リンクもリンク先も残る。
+        let link2 = d.path().join("t.sock");
+        let stale = d.path().join("stale");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        std::os::unix::fs::symlink(&stale, &link2).unwrap();
+        let e = UdsListener::bind(&link2).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+        assert!(
+            std::fs::symlink_metadata(&link2)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(std::fs::symlink_metadata(&stale).is_ok());
+    }
+
+    /// 生存中の listener のパスは奪わない（TASK-123.2）。
+    #[test]
+    fn plug12_live_listener_path_is_not_stolen() {
+        let t = TempDir::new();
+        let d = RuntimeDir::ensure_under(&t.0).unwrap();
+        let p = d.path().join("s.sock");
+        let live = std::os::unix::net::UnixListener::bind(&p).unwrap();
+        let e = UdsListener::bind(&p).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+        assert!(std::fs::symlink_metadata(&p).is_ok());
+        std::os::unix::net::UnixStream::connect(&p).unwrap();
+        drop(live);
+    }
 }

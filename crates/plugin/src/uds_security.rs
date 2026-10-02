@@ -26,12 +26,19 @@
 //!   返した後の保護は `UdsListener::bind` が bind 時に配置ディレクトリを fd で再検証して担う。
 //! - 作成は非再帰で、基底ディレクトリ（`XDG_RUNTIME_DIR` 自体）は作らない。
 //! - エラーメッセージは固定の英語文字列で、パス・環境変数値を含めない。
+//! - 既存 socket パス（TASK-123.2・#287）: `UdsListener::bind` が bind 前に検証済みディレクトリ fd 基準で
+//!   lstat（symlink 非追従）する。symlink と他 UID 所有のエントリは削除せず `PermissionDenied`。
+//!   自 UID 所有でも socket 以外、または接続が成功／判定不能（期限超過等）の socket は削除せず
+//!   `AlreadyExists`。自 UID 所有で接続が拒否される stale socket だけを、再 lstat で同一性
+//!   （dev / ino / uid / 種別）を確認したうえで `unlinkat` し、再 bind を可能にする。
+//!   生存確認の probe は接続して即切断するだけでデータを送らない（相手の accept には一瞬届く。同一 UID）。
+//!   残余: 再確認から unlink までの窓で差し替えられるのは 0700 ディレクトリ内の同一 UID のみ
+//!   （脅威モデル外）。macOS は lstat がパス縮退のため窓がやや広い。
 //!
 //! # 未実装（REPAIR-3）
 //! - `XDG_RUNTIME_DIR` 未設定時のフォールバック・root 時の既定配置先は未実装で、未設定は
 //!   `FailedPrecondition`（TASK-123.4・#289）。
-//! - 既存 socket パスの lstat 検証・stale socket 削除（TASK-123.2・#287）、socket 0600 化と
-//!   `sun_path` 長検証（TASK-123.3・#288）、peer credential（TASK-124）は別 sub。
+//! - socket 0600 化と `sun_path` 長検証（TASK-123.3・#288）、peer credential（TASK-124）は別 sub。
 //! - 非 unix は `Unimplemented`（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る）。
 
 use std::path::{Component, Path, PathBuf};
@@ -105,6 +112,9 @@ fn runtime_dir_base(xdg: Option<std::ffi::OsString>) -> Result<PathBuf, PluginEr
     validate_base(&base)?;
     Ok(base)
 }
+
+#[cfg(unix)]
+pub(crate) use imp::clear_stale_socket;
 
 #[cfg(unix)]
 mod imp {
@@ -283,10 +293,176 @@ mod imp {
         Ok(RuntimeDir { path: dir })
     }
 
+    /// stale 判定の probe（接続試行）の期限（REPAIR-5）。
+    const STALE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// 既存エントリの分類結果（PLUG-12・TASK-123.2）。
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum ExistingEntry {
+        Absent,
+        Symlink,
+        ForeignOwner,
+        NotSocket,
+        OwnSocket(crate::sys::FileIdent),
+    }
+
+    /// lstat 結果と自 UID から分類する純粋関数（判定順: symlink → 所有者 → 種別）。
+    pub(super) fn classify_existing(
+        ident: Option<&crate::sys::FileIdent>,
+        euid: u32,
+    ) -> ExistingEntry {
+        match ident {
+            None => ExistingEntry::Absent,
+            Some(i) if i.is_symlink => ExistingEntry::Symlink,
+            Some(i) if i.uid != euid => ExistingEntry::ForeignOwner,
+            Some(i) if !i.is_socket => ExistingEntry::NotSocket,
+            Some(i) => ExistingEntry::OwnSocket(*i),
+        }
+    }
+
+    fn err(code: PluginErrorCode, msg: &'static str) -> PluginError {
+        PluginError::new(code, msg)
+    }
+
+    fn lstat_opt(
+        dir: &File,
+        name: &std::ffi::CStr,
+        public: &Path,
+    ) -> Result<Option<crate::sys::FileIdent>, PluginError> {
+        match crate::sys::lstat_at(dir, name, public) {
+            Ok(i) => Ok(Some(i)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(err(
+                PluginErrorCode::PermissionDenied,
+                "permission denied while inspecting existing socket path",
+            )),
+            Err(_) => Err(err(
+                PluginErrorCode::Internal,
+                "failed to inspect existing socket path",
+            )),
+        }
+    }
+
+    /// bind 前に既存エントリを検証し、自 UID 所有の stale socket のみ削除する（PLUG-12・TASK-123.2）。
+    ///
+    /// `UdsListener::bind` から、配置ディレクトリ検証後・`UnixListener::bind` の前に呼ばれる。
+    /// `public` は公開パス（macOS の lstat 縮退用）、`probe` は生存確認の接続先。削除は
+    /// 検証済み `dir` fd 基準の `unlinkat` のみ。判定不能は削除しない（fail-closed）。
+    pub(crate) fn clear_stale_socket(
+        dir: &File,
+        name: &std::ffi::CStr,
+        public: &Path,
+        probe: &Path,
+        euid: u32,
+    ) -> Result<(), PluginError> {
+        let first = match classify_existing(lstat_opt(dir, name, public)?.as_ref(), euid) {
+            ExistingEntry::Absent => return Ok(()),
+            ExistingEntry::Symlink => {
+                return Err(err(
+                    PluginErrorCode::PermissionDenied,
+                    "socket path is a symlink",
+                ));
+            }
+            ExistingEntry::ForeignOwner => {
+                return Err(err(
+                    PluginErrorCode::PermissionDenied,
+                    "socket path is owned by another user",
+                ));
+            }
+            ExistingEntry::NotSocket => {
+                return Err(err(
+                    PluginErrorCode::AlreadyExists,
+                    "socket path already exists",
+                ));
+            }
+            ExistingEntry::OwnSocket(i) => i,
+        };
+        let busy = || err(PluginErrorCode::AlreadyExists, "socket path already exists");
+        match crate::sys::connect_unix(probe, std::time::Instant::now() + STALE_PROBE_TIMEOUT) {
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
+            // 接続成功（生存中。即 drop）・期限超過・未対応・その他は削除しない。
+            _ => return Err(busy()),
+        }
+        // 削除直前に同一性を再確認する（probe 中の差し替えを検出）。
+        match lstat_opt(dir, name, public)? {
+            None => return Ok(()),
+            Some(now) if now == first => {}
+            Some(_) => return Err(busy()),
+        }
+        match crate::sys::unlinkat(dir, name) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(err(
+                PluginErrorCode::Internal,
+                "failed to remove stale socket",
+            )),
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use std::os::unix::fs::PermissionsExt;
+
+        fn ident(uid: u32, is_socket: bool, is_symlink: bool) -> crate::sys::FileIdent {
+            crate::sys::FileIdent {
+                dev: 1,
+                ino: 2,
+                uid,
+                is_socket,
+                is_symlink,
+            }
+        }
+
+        #[test]
+        fn plug12_classify_existing_symlink_wins_over_owner() {
+            let i = ident(7, false, true);
+            assert_eq!(classify_existing(Some(&i), 7), ExistingEntry::Symlink);
+            assert_eq!(classify_existing(Some(&i), 8), ExistingEntry::Symlink);
+        }
+
+        #[test]
+        fn plug12_classify_existing_foreign_owner_for_file_and_socket() {
+            for sock in [false, true] {
+                let i = ident(7, sock, false);
+                assert_eq!(
+                    classify_existing(Some(&i), 7u32.wrapping_add(1)),
+                    ExistingEntry::ForeignOwner
+                );
+            }
+        }
+
+        #[test]
+        fn plug12_classify_existing_own_entries() {
+            assert_eq!(classify_existing(None, 7), ExistingEntry::Absent);
+            let f = ident(7, false, false);
+            assert_eq!(classify_existing(Some(&f), 7), ExistingEntry::NotSocket);
+            let s = ident(7, true, false);
+            assert_eq!(classify_existing(Some(&s), 7), ExistingEntry::OwnSocket(s));
+        }
+
+        #[test]
+        fn plug12_clear_stale_socket_rejects_foreign_uid_and_keeps_file() {
+            let d = std::env::temp_dir().join(format!("fcst-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            let sock = d.join("s");
+            let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let dir = File::open(&d).unwrap();
+            let name = std::ffi::CString::new("s").unwrap();
+            let euid = crate::sys::effective_uid();
+            let e =
+                clear_stale_socket(&dir, &name, &sock, &sock, euid.wrapping_add(1)).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert!(sock.exists());
+            // 存在しない名前は Ok。
+            let none = std::ffi::CString::new("nope").unwrap();
+            assert_eq!(
+                clear_stale_socket(&dir, &none, &d.join("nope"), &d.join("nope"), euid),
+                Ok(())
+            );
+            drop(_l);
+            std::fs::remove_dir_all(&d).ok();
+        }
 
         struct Tmp(std::path::PathBuf);
         impl Tmp {

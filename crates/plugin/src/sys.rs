@@ -148,6 +148,8 @@ pub(crate) struct FileIdent {
     pub ino: u64,
     pub uid: u32,
     pub is_socket: bool,
+    /// symlink 本体か（`lstat` 相当で取得するため、リンク先ではなくリンク自体の種別。PLUG-12）。
+    pub is_symlink: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -238,6 +240,7 @@ fn statx_ident(dirfd: i32, name: &CStr, flags: i32) -> io::Result<FileIdent> {
         ino: st.ino,
         uid: st.uid,
         is_socket: u32::from(st.mode) & 0o170000 == 0o140000,
+        is_symlink: u32::from(st.mode) & 0o170000 == 0o120000,
     })
 }
 
@@ -267,6 +270,7 @@ pub(crate) fn lstat_at(
             ino: m.ino(),
             uid: m.uid(),
             is_socket: m.file_type().is_socket(),
+            is_symlink: m.file_type().is_symlink(),
         })
     }
 }

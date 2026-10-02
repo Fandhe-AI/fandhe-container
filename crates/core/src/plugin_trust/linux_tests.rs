@@ -513,3 +513,95 @@ fn plug11_task122_2_accepts_real_name_ending_with_deleted_suffix() {
         fs::canonicalize(tmp.0.join(odd)).unwrap()
     );
 }
+// ---- TASK-122.3: sha256 許可済みハッシュ照合（PLUG-11） ----
+
+use crate::plugin_trust::{AllowedPluginHashes, Sha256Digest};
+use std::io::Seek as _;
+
+/// `setup` が書く内容 `payload` の sha256（`printf payload | sha256sum`）。
+const PAYLOAD_SHA: &str = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+/// 何にも一致しない任意の 64 桁 hex。
+const OTHER_SHA: &str = "ed1b8f4f1b1c5f6d0b6e9a3f5a4c7d1f1b8d6e0a1c2e3f4a5b6c7d8e9f0a1b2c";
+
+fn allow(hexes: &[&str]) -> AllowedPluginHashes {
+    AllowedPluginHashes::from_digests(
+        hexes
+            .iter()
+            .map(|h| Sha256Digest::from_hex(h).expect("hex")),
+    )
+}
+
+fn verified(tag: &str) -> (Tmp, super::VerifiedPluginFile) {
+    let tmp = setup(tag, 0o755, 0o755);
+    let v = verify_dir(&tmp.0)
+        .expect("dir ok")
+        .verify_file(OsStr::new(NAME))
+        .expect("file ok");
+    (tmp, v)
+}
+
+#[test]
+fn plug11_task122_3_accepts_listed_hash_and_rewinds_fd() {
+    let (_t, v) = verified("h-ok");
+    let hv = v.verify_hash(&allow(&[PAYLOAD_SHA])).expect("allowed");
+    assert_eq!(hv.digest().to_string(), PAYLOAD_SHA);
+    let mut s = String::new();
+    hv.into_file().into_file().read_to_string(&mut s).unwrap();
+    assert_eq!(s, "payload");
+}
+
+#[test]
+fn plug11_task122_3_rejects_unlisted_hash() {
+    let (_t, v) = verified("h-ng");
+    let e = v.verify_hash(&allow(&[OTHER_SHA])).expect_err("reject");
+    assert_eq!(e.kind(), PluginTrustErrorKind::HashMismatch);
+    assert_eq!(e.target(), TrustTarget::File);
+    let te: TraitError = e.into();
+    assert_eq!(te.code(), ErrorCode::PermissionDenied);
+}
+
+#[test]
+fn plug11_task122_3_empty_list_rejects() {
+    let (_t, v) = verified("h-empty");
+    let e = v
+        .verify_hash(&AllowedPluginHashes::default())
+        .expect_err("reject");
+    assert_eq!(e.kind(), PluginTrustErrorKind::HashMismatch);
+}
+
+#[test]
+fn plug11_task122_3_sha256_is_repeatable_and_leaves_offset_zero() {
+    let (_t, v) = verified("h-rewind");
+    let a = v.sha256().unwrap();
+    let b = v.sha256().unwrap();
+    assert_eq!(a, b);
+    assert_eq!(a.to_string(), PAYLOAD_SHA);
+    let mut f = v.file();
+    assert_eq!(f.stream_position().unwrap(), 0);
+}
+
+/// 検証後にパスを別内容へ差し替えても、保持 fd のハッシュは検証時の内容のまま（TOCTOU 回避）。
+#[test]
+fn plug11_task122_3_hash_follows_held_fd_not_path() {
+    let (t, v) = verified("h-swap");
+    let other = t.0.join("other");
+    fs::write(&other, b"evil").unwrap();
+    fs::rename(&other, t.0.join(NAME)).unwrap();
+    let hv = v.verify_hash(&allow(&[PAYLOAD_SHA])).expect("held fd");
+    assert_eq!(hv.digest().to_string(), PAYLOAD_SHA);
+}
+
+/// symlink 経由の候補は実体 fd の内容で照合される（TASK-122.2）。
+#[test]
+fn plug11_task122_3_symlink_candidate_hashes_target_content() {
+    let tmp = Tmp::new("h-link");
+    fs::write(tmp.0.join("real"), b"payload").unwrap();
+    chmod(&tmp.0.join("real"), 0o755);
+    symlink("real", tmp.0.join(NAME)).unwrap();
+    let v = verify_dir(&tmp.0)
+        .expect("dir ok")
+        .verify_file(OsStr::new(NAME))
+        .expect("file ok");
+    let hv = v.verify_hash(&allow(&[PAYLOAD_SHA])).expect("allowed");
+    assert_eq!(hv.digest().to_string(), PAYLOAD_SHA);
+}

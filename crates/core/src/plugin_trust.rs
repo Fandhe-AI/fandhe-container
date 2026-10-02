@@ -1,12 +1,12 @@
-//! plugin 候補の所有者・モード・symlink 実体解決検証（TASK-122.1・TASK-122.2・PLUG-11・MS-3）。
+//! plugin 候補の所有者・モード・symlink 実体解決・sha256 許可済みハッシュ検証（TASK-122.1〜122.3・PLUG-11・MS-3）。
 //!
 //! # 役割と呼び出し元
 //!
 //! [`crate::plugin_discovery`] が列挙した **未検証** の候補（[`PluginCandidate`]）に対し、
 //! 「探索先ディレクトリと plugin バイナリの所有者が core の実効 UID または root であり、
 //! group / other に書き込み権限がないこと」を確認する（PLUG-11）。検証を通ったファイルは
-//! 検証済みの fd を持つ [`VerifiedPluginFile`] として返し、後続のハッシュ照合（TASK-122.3）・
-//! 登録処理は **パスを開き直さずこの fd だけを使う** 契約とする（検証と使用の間の差し替え
+//! 検証済みの fd を持つ [`VerifiedPluginFile`] として返し、後続のハッシュ照合（TASK-122.3。
+//! [`VerifiedPluginFile::verify_hash`]）・登録処理は **パスを開き直さずこの fd だけを使う** 契約とする（検証と使用の間の差し替え
 //! 〔TOCTOU〕を避ける）。
 //!
 //! # 検証方式
@@ -27,6 +27,31 @@
 //! - 判定基準はディレクトリ・ファイルとも同一で、所有者が root か実効 UID であり、かつ
 //!   `mode & 0o022 == 0`。sticky bit 付きでも例外にしない
 //!
+//! # ハッシュ照合（TASK-122.3・PLUG-11）
+//!
+//! 既定の検証方式は「許可済み sha256 ハッシュ一覧に一致するバイナリのみ登録する」方式
+//! （TASK-122.h1・#280）。[`VerifiedPluginFile::sha256`] / [`VerifiedPluginFile::verify_hash`] は
+//! 所有者・モード検証と **同一の保持 fd** の内容を先頭から固定長バッファでストリーミング計算し、
+//! シグネチャにパスを取らない（パスの再オープンによる TOCTOU を型の上で排除する）。成功後の
+//! fd オフセットは 0 に巻き戻す（後続が先頭から読める）。失敗時のオフセットは不定で、呼び出し側は
+//! fd を破棄する。照合に成功した fd は type-state の [`HashVerifiedPluginFile`] で返し、後続の
+//! 登録処理が「ハッシュ照合済み」を型で要求できる。
+//!
+//! ## 許可一覧の設定形式
+//!
+//! 許可一覧は **設定ファイル方式** で、core バイナリへの埋め込み値は持たない（plugin 追加のたびに
+//! core を変えない。PLUG-4。既定の一覧は空で全件拒否）。形式は LF 区切りの UTF-8 テキストで
+//! `sha256sum` の出力と互換とする（[`AllowedPluginHashes::parse`]）。
+//!
+//! - 1 行 1 件。行頭の 64 桁 hex がダイジェスト。空白以降は表示用ラベルとして解釈せず無視する
+//! - 空行と `#` 始まりの行は無視する。行末の `\r` は許容する
+//! - 不正な行が 1 件でもあれば全体をエラーにする（部分採用しない。fail-closed）
+//! - 上限は全体 [`MAX_ALLOWLIST_BYTES`]・件数 [`MAX_ALLOWLIST_ENTRIES`]
+//!
+//! [`AllowedPluginHashes::parse`] は **バイト列のみ** を受け取り、パスからのロードは提供しない。
+//! 一覧ファイル自体も信頼できる所有者・group/other 書き込み不可であることを呼び出し側が fd 経由で
+//! 検証した内容だけを渡す契約とする（一覧が書き換え可能だと検証が無効になる）。
+//!
 //! # 限界（REPAIR-3。実装済みを装わない）
 //!
 //! - sticky bit 付きの祖先（`/tmp` 等）も例外にせず拒否する（fail-closed）。plugin は
@@ -35,11 +60,16 @@
 //!   symlink は従来どおり `NotDirectory` で拒否する
 //! - チェーン中間ホップの symlink が置かれたディレクトリ自体は検証しない（検証するのは探索先
 //!   連鎖と、最終実体およびその祖先連鎖）。最終実体は信頼できる所有者・書き込み不可の祖先配下に
-//!   限られ、内容の同一性はハッシュ照合（TASK-122.3・#279）で担保する前提
+//!   限られ、内容の同一性はハッシュ照合（TASK-122.3）で担保する前提
 //! - symlink 経由の検証は実体の正規パスの取得に `/proc` を要する。未マウント環境では `Io` で
 //!   拒否する（fail-closed）
-//! - ハッシュ・署名の照合は未実装（TASK-122.3・#279）。信頼できる所有者が置いた任意の
-//!   バイナリは本モジュールを通る
+//! - 署名の照合は未実装。ハッシュ照合は「計算時点」の内容を保証するもので、信頼された所有者
+//!   （root / 実効 UID）自身が計算後に内容を書き換える場合は防げない。起動も照合済み fd 経由
+//!   （fexecve 相当）にしない限り保証は切れる（配線は後続）
+//! - 許可一覧ファイルの置き場所・指定方法（CLI フラグ / 固定パス）と、一覧ファイル自体の
+//!   所有者・モード検証の配線は未実装（呼び出し側の契約。上記）
+//! - 検証方式の切替点（TASK-122.4・#282）は未実装で、本モジュールはハッシュ一覧方式の実体のみ
+//!   を提供する
 //! - レジストリへの配線は未実施で、本モジュール単体では未検証候補の登録を防がない
 //! - setuid / setgid ビット・ACL・拡張属性は判定対象外（PLUG-11 の記述範囲外）
 //! - 非 Linux は同等検証が未実装のため常に拒否する（fail-closed。macOS / Windows の「相当」
@@ -49,10 +79,14 @@
 //!
 //! 本モジュールは `unsafe` を持たない（Linux では `sys` のラッパーと std のみを使う）。
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest as _, Sha256};
 
 use crate::plugin_discovery::PluginCandidate;
 use crate::traits::{ErrorCode, TraitError};
@@ -86,6 +120,10 @@ pub enum PluginTrustErrorKind {
     SymlinkLoop,
     /// 非 Linux・対応外アーキテクチャ（同等検証が未実装）。
     Unsupported,
+    /// sha256 が許可済みハッシュ一覧に含まれない（PLUG-11・TASK-122.3）。
+    HashMismatch,
+    /// バイナリが [`MAX_PLUGIN_BINARY_BYTES`] を超える（ハッシュ計算の無制限読み取りを防ぐ）。
+    TooLarge,
 }
 
 /// 検証の拒否。種別・対象・パスを持つ。
@@ -138,6 +176,8 @@ impl fmt::Display for PluginTrustError {
             PluginTrustErrorKind::Unsupported => {
                 "ownership verification is not supported on this platform"
             }
+            PluginTrustErrorKind::HashMismatch => "sha256 digest is not in the allowed hash list",
+            PluginTrustErrorKind::TooLarge => "file exceeds the maximum allowed size",
         };
         write!(f, "{target} rejected: {reason}: {}", self.path.display())
     }
@@ -148,12 +188,13 @@ impl std::error::Error for PluginTrustError {}
 impl From<PluginTrustError> for TraitError {
     fn from(e: PluginTrustError) -> Self {
         let code = match e.kind {
-            PluginTrustErrorKind::UntrustedOwner | PluginTrustErrorKind::GroupOrOtherWritable => {
-                ErrorCode::PermissionDenied
-            }
+            PluginTrustErrorKind::UntrustedOwner
+            | PluginTrustErrorKind::GroupOrOtherWritable
+            | PluginTrustErrorKind::HashMismatch => ErrorCode::PermissionDenied,
             PluginTrustErrorKind::NotRegularFile
             | PluginTrustErrorKind::NotDirectory
             | PluginTrustErrorKind::SymlinkLoop
+            | PluginTrustErrorKind::TooLarge
             | PluginTrustErrorKind::InvalidPath => ErrorCode::InvalidArgument,
             PluginTrustErrorKind::Io => ErrorCode::Internal,
             PluginTrustErrorKind::Unsupported => ErrorCode::Unimplemented,
@@ -229,6 +270,301 @@ impl VerifiedPluginFile {
     /// 表示用で再 open に使わない。TASK-122.2）。
     pub fn resolved_path(&self) -> &Path {
         &self.resolved_path
+    }
+}
+/// plugin バイナリとして受理するサイズの上限（1 GiB）。ハッシュ計算の読み取り量を縛る（REPAIR-5）。
+pub const MAX_PLUGIN_BINARY_BYTES: u64 = 1 << 30;
+
+/// 許可一覧ファイル（バイト列）の上限（1 MiB）。
+pub const MAX_ALLOWLIST_BYTES: usize = 1 << 20;
+
+/// 許可一覧の件数上限。
+pub const MAX_ALLOWLIST_ENTRIES: usize = 4096;
+
+/// ハッシュ計算の読み取りバッファ長（ファイルサイズに比例する確保をしない）。
+const HASH_BUF_LEN: usize = 64 * 1024;
+
+/// sha256 ダイジェスト（32 バイト固定。REPAIR-2。壊れた長さを表現できない newtype）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Sha256Digest([u8; 32]);
+
+impl Sha256Digest {
+    /// 生のバイト列から作る。
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// 生のバイト列を返す。
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// 厳密に 64 桁の ASCII hex（大文字小文字可）のみ受理する。`sha256:` 接頭辞・空白・
+    /// 桁数違いは拒否する。添字アクセスは使わない。
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let b = s.as_bytes();
+        if b.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        let (pairs, _) = b.as_chunks::<2>();
+        for (slot, [hi, lo]) in out.iter_mut().zip(pairs) {
+            let hi = char::from(*hi).to_digit(16)?;
+            let lo = char::from(*lo).to_digit(16)?;
+            *slot = u8::try_from(hi * 16 + lo).ok()?;
+        }
+        Some(Self(out))
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    /// 小文字 hex 64 桁。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// `r` を EOF まで固定長バッファで読み、sha256 を計算する。累積が `max_bytes` を超えたら
+/// `InvalidData` で失敗する（検証後に伸長されたファイルへの備え）。`Interrupted` は再試行する。
+fn sha256_of_reader<R: Read>(mut r: R, max_bytes: u64) -> std::io::Result<Sha256Digest> {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; HASH_BUF_LEN];
+    let mut total: u64 = 0;
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        total = total.saturating_add(n as u64);
+        if total > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "input exceeds the size limit",
+            ));
+        }
+        let Some(chunk) = buf.get(..n) else {
+            return Err(std::io::Error::other("read length exceeds buffer"));
+        };
+        hasher.update(chunk);
+    }
+    Ok(Sha256Digest(hasher.finalize().into()))
+}
+
+/// 許可一覧の構文エラー種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AllowedHashesParseErrorKind {
+    /// 行頭が 64 桁 hex でない、または hex の直後が空白でない。
+    InvalidDigest,
+    /// 件数が [`MAX_ALLOWLIST_ENTRIES`] を超える。
+    TooManyEntries,
+    /// 入力が [`MAX_ALLOWLIST_BYTES`] を超える。
+    TooLarge,
+    /// UTF-8 でない。
+    NotUtf8,
+}
+
+/// 許可一覧の構文エラー（行番号は 1 始まり。入力全体の問題では 0）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllowedHashesParseError {
+    kind: AllowedHashesParseErrorKind,
+    line: usize,
+}
+
+impl AllowedHashesParseError {
+    /// エラー種別。
+    pub fn kind(&self) -> AllowedHashesParseErrorKind {
+        self.kind
+    }
+
+    /// 1 始まりの行番号（入力全体に関わるエラーは 0）。
+    pub fn line(&self) -> usize {
+        self.line
+    }
+}
+
+impl fmt::Display for AllowedHashesParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = match self.kind {
+            AllowedHashesParseErrorKind::InvalidDigest => "invalid sha256 digest",
+            AllowedHashesParseErrorKind::TooManyEntries => "too many entries",
+            AllowedHashesParseErrorKind::TooLarge => "allowed hash list is too large",
+            AllowedHashesParseErrorKind::NotUtf8 => "allowed hash list is not valid UTF-8",
+        };
+        if self.line == 0 {
+            write!(f, "{reason}")
+        } else {
+            write!(f, "{reason} at line {}", self.line)
+        }
+    }
+}
+
+impl std::error::Error for AllowedHashesParseError {}
+
+impl From<AllowedHashesParseError> for TraitError {
+    fn from(e: AllowedHashesParseError) -> Self {
+        TraitError::new(ErrorCode::InvalidArgument, e.to_string())
+    }
+}
+
+/// 許可済み plugin バイナリの sha256 一覧（PLUG-11・TASK-122.3）。
+///
+/// 設定形式（設定ファイル方式・`sha256sum` 互換テキスト・埋め込みなし）はモジュール doc を参照。
+/// **空の一覧は全件拒否**（fail-closed）。ハッシュは秘密でないため通常の等値比較を使う。
+/// 呼び出し元（plugin 登録経路。配線は後続）は、信頼検証済みの一覧ファイルの内容だけを
+/// [`Self::parse`] へ渡すこと。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllowedPluginHashes {
+    digests: BTreeSet<Sha256Digest>,
+}
+
+impl AllowedPluginHashes {
+    /// ダイジェスト列から作る（件数上限は [`Self::parse`] のみで検査する。試験・呼び出し側の組み立て用）。
+    pub fn from_digests(digests: impl IntoIterator<Item = Sha256Digest>) -> Self {
+        Self {
+            digests: digests.into_iter().collect(),
+        }
+    }
+
+    /// 許可一覧テキストを解析する。形式・上限はモジュール doc を参照。不正行があれば全体を拒否する。
+    pub fn parse(bytes: &[u8]) -> Result<Self, AllowedHashesParseError> {
+        let err = |kind, line| AllowedHashesParseError { kind, line };
+        if bytes.len() > MAX_ALLOWLIST_BYTES {
+            return Err(err(AllowedHashesParseErrorKind::TooLarge, 0));
+        }
+        let text =
+            std::str::from_utf8(bytes).map_err(|_| err(AllowedHashesParseErrorKind::NotUtf8, 0))?;
+        let mut digests = BTreeSet::new();
+        // 重複行も 1 行 1 件として数える（集合長では重複が計上されず上限を迂回できるため）。
+        let mut entry_count = 0usize;
+        for (idx, raw) in text.split('\n').enumerate() {
+            let line_no = idx + 1;
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            // 行頭の 64 文字が hex、その後は空白（ラベル）か行末のみ許容する。
+            let (hex, rest) = match trimmed.char_indices().nth(64) {
+                Some((i, _)) => trimmed.split_at(i),
+                None => (trimmed, ""),
+            };
+            if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+                return Err(err(AllowedHashesParseErrorKind::InvalidDigest, line_no));
+            }
+            let digest = Sha256Digest::from_hex(hex)
+                .ok_or_else(|| err(AllowedHashesParseErrorKind::InvalidDigest, line_no))?;
+            digests.insert(digest);
+            entry_count += 1;
+            if entry_count > MAX_ALLOWLIST_ENTRIES {
+                return Err(err(AllowedHashesParseErrorKind::TooManyEntries, line_no));
+            }
+        }
+        Ok(Self { digests })
+    }
+
+    /// 一覧に含まれるか。
+    pub fn contains(&self, digest: &Sha256Digest) -> bool {
+        self.digests.contains(digest)
+    }
+
+    /// 件数。
+    pub fn len(&self) -> usize {
+        self.digests.len()
+    }
+
+    /// 空か（空は全件拒否）。
+    pub fn is_empty(&self) -> bool {
+        self.digests.is_empty()
+    }
+}
+
+impl VerifiedPluginFile {
+    /// 保持 fd の内容の sha256 を計算する（TASK-122.3）。
+    ///
+    /// **パスを取らない**ため再オープンはできず、所有者・モード検証と同じ fd を読む（TOCTOU 回避）。
+    /// fd を先頭へ seek して計算し、成功時は先頭へ戻す。失敗時のオフセットは不定のため呼び出し側は
+    /// fd を破棄する。サイズが [`MAX_PLUGIN_BINARY_BYTES`] を超えれば `TooLarge`。
+    pub fn sha256(&self) -> Result<Sha256Digest, PluginTrustError> {
+        let err = |k| PluginTrustError::new(k, TrustTarget::File, &self.path);
+        let md = self
+            .file
+            .metadata()
+            .map_err(|_| err(PluginTrustErrorKind::Io))?;
+        if md.len() > MAX_PLUGIN_BINARY_BYTES {
+            return Err(err(PluginTrustErrorKind::TooLarge));
+        }
+        let mut f = &self.file;
+        f.seek(SeekFrom::Start(0))
+            .map_err(|_| err(PluginTrustErrorKind::Io))?;
+        let digest = sha256_of_reader(f, MAX_PLUGIN_BINARY_BYTES).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                err(PluginTrustErrorKind::TooLarge)
+            } else {
+                err(PluginTrustErrorKind::Io)
+            }
+        })?;
+        f.seek(SeekFrom::Start(0))
+            .map_err(|_| err(PluginTrustErrorKind::Io))?;
+        Ok(digest)
+    }
+
+    /// sha256 を計算して許可一覧と照合する。不一致（空一覧を含む）は `HashMismatch`。
+    /// 成功した fd は [`HashVerifiedPluginFile`] として返す（オフセットは 0）。
+    pub fn verify_hash(
+        self,
+        allowed: &AllowedPluginHashes,
+    ) -> Result<HashVerifiedPluginFile, PluginTrustError> {
+        let digest = self.sha256()?;
+        if !allowed.contains(&digest) {
+            return Err(PluginTrustError::new(
+                PluginTrustErrorKind::HashMismatch,
+                TrustTarget::File,
+                &self.path,
+            ));
+        }
+        Ok(HashVerifiedPluginFile { file: self, digest })
+    }
+}
+
+/// 所有者・モード検証に加えて sha256 許可一覧との照合を通った plugin ファイル（type-state）。
+/// 構築は [`VerifiedPluginFile::verify_hash`] のみ。後続のレジストリ配線が型でハッシュ照合済みを
+/// 要求できる（TASK-122.3）。
+#[derive(Debug)]
+pub struct HashVerifiedPluginFile {
+    file: VerifiedPluginFile,
+    digest: Sha256Digest,
+}
+
+impl HashVerifiedPluginFile {
+    /// 検証済みファイルを借用する。
+    pub fn file(&self) -> &VerifiedPluginFile {
+        &self.file
+    }
+
+    /// 検証済みファイルを取り出す。
+    pub fn into_file(self) -> VerifiedPluginFile {
+        self.file
+    }
+
+    /// 照合した sha256。
+    pub fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+
+    /// 検証時のパス（表示用）。
+    pub fn path(&self) -> &Path {
+        self.file.path()
+    }
+
+    /// 実体の正規パス（表示用）。
+    pub fn resolved_path(&self) -> &Path {
+        self.file.resolved_path()
     }
 }
 
@@ -628,10 +964,125 @@ mod tests {
             ),
             (PluginTrustErrorKind::Io, ErrorCode::Internal),
             (PluginTrustErrorKind::Unsupported, ErrorCode::Unimplemented),
+            (
+                PluginTrustErrorKind::HashMismatch,
+                ErrorCode::PermissionDenied,
+            ),
+            (PluginTrustErrorKind::TooLarge, ErrorCode::InvalidArgument),
         ];
         for (k, c) in cases {
             let e: TraitError = PluginTrustError::new(k, TrustTarget::File, p).into();
             assert_eq!(e.code(), c);
         }
+    }
+
+    const EMPTY_SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const ABC_SHA: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn plug11_task122_3_known_digests() {
+        let d = sha256_of_reader(&b""[..], 10).unwrap();
+        assert_eq!(d.to_string(), EMPTY_SHA);
+        let d = sha256_of_reader(&b"abc"[..], 10).unwrap();
+        assert_eq!(d.to_string(), ABC_SHA);
+    }
+
+    #[test]
+    fn plug11_task122_3_streaming_matches_one_shot_across_buffer_boundary() {
+        for len in [
+            HASH_BUF_LEN - 1,
+            HASH_BUF_LEN,
+            HASH_BUF_LEN + 1,
+            3 * HASH_BUF_LEN + 7,
+        ] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let streamed = sha256_of_reader(&data[..], u64::MAX).unwrap();
+            let oneshot = Sha256Digest(Sha256::digest(&data).into());
+            assert_eq!(streamed, oneshot, "len {len}");
+        }
+    }
+
+    #[test]
+    fn plug11_task122_3_reader_rejects_over_limit() {
+        let data = [0u8; 11];
+        let e = sha256_of_reader(&data[..], 10).expect_err("over limit");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert!(sha256_of_reader(&data[..10], 10).is_ok());
+    }
+
+    #[test]
+    fn plug11_task122_3_from_hex_strict() {
+        assert_eq!(
+            Sha256Digest::from_hex(ABC_SHA).unwrap().to_string(),
+            ABC_SHA
+        );
+        let upper = ABC_SHA.to_uppercase();
+        assert_eq!(Sha256Digest::from_hex(&upper).unwrap().to_string(), ABC_SHA);
+        let short = &ABC_SHA[..63];
+        let long = format!("{ABC_SHA}0");
+        let prefixed = format!("sha256:{ABC_SHA}");
+        let spaced = format!(" {}", &ABC_SHA[..63]);
+        let non_hex = format!("g{}", &ABC_SHA[1..]);
+        let multibyte = format!("{}é", &ABC_SHA[..62]);
+        for bad in [short, &long, &prefixed, &spaced, &non_hex, &multibyte, ""] {
+            assert_eq!(Sha256Digest::from_hex(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn plug11_task122_3_parse_accepts_comments_labels_crlf() {
+        let text = format!(
+            "# header\n\n{EMPTY_SHA}  plugin-a\r\n   {ABC_SHA}\t*plugin-b\n{}\n",
+            ABC_SHA.to_uppercase()
+        );
+        let l = AllowedPluginHashes::parse(text.as_bytes()).unwrap();
+        assert_eq!(l.len(), 2);
+        assert!(l.contains(&Sha256Digest::from_hex(EMPTY_SHA).unwrap()));
+        assert!(l.contains(&Sha256Digest::from_hex(ABC_SHA).unwrap()));
+    }
+
+    #[test]
+    fn plug11_task122_3_parse_rejects_bad_lines_with_line_number() {
+        let text = format!("{ABC_SHA}\nnot-a-digest\n");
+        let e = AllowedPluginHashes::parse(text.as_bytes()).expect_err("bad");
+        assert_eq!(e.kind(), AllowedHashesParseErrorKind::InvalidDigest);
+        assert_eq!(e.line(), 2);
+        assert_eq!(e.to_string(), "invalid sha256 digest at line 2");
+        // hex の直後が空白でない（65 桁連続）は拒否する。
+        let text = format!("{ABC_SHA}0 label\n");
+        let e = AllowedPluginHashes::parse(text.as_bytes()).expect_err("bad");
+        assert_eq!(e.line(), 1);
+        let te: TraitError = e.into();
+        assert_eq!(te.code(), ErrorCode::InvalidArgument);
+        let e = AllowedPluginHashes::parse(&[0xff, 0xfe]).expect_err("utf8");
+        assert_eq!(e.kind(), AllowedHashesParseErrorKind::NotUtf8);
+    }
+
+    #[test]
+    fn plug11_task122_3_parse_enforces_limits() {
+        let big = vec![b'#'; MAX_ALLOWLIST_BYTES + 1];
+        let e = AllowedPluginHashes::parse(&big).expect_err("too large");
+        assert_eq!(e.kind(), AllowedHashesParseErrorKind::TooLarge);
+
+        let mut text = String::new();
+        for i in 0..=MAX_ALLOWLIST_ENTRIES {
+            text.push_str(&format!("{i:064x}\n"));
+        }
+        let e = AllowedPluginHashes::parse(text.as_bytes()).expect_err("too many");
+        assert_eq!(e.kind(), AllowedHashesParseErrorKind::TooManyEntries);
+
+        // 重複行も件数に計上される（全行同一でも上限超過で拒否）。
+        let dup = format!("{:064x}\n", 1).repeat(MAX_ALLOWLIST_ENTRIES + 1);
+        let e = AllowedPluginHashes::parse(dup.as_bytes()).expect_err("too many dups");
+        assert_eq!(e.kind(), AllowedHashesParseErrorKind::TooManyEntries);
+        assert_eq!(e.line(), MAX_ALLOWLIST_ENTRIES + 1);
+    }
+
+    #[test]
+    fn plug11_task122_3_empty_list_rejects_everything() {
+        let l = AllowedPluginHashes::parse(b"# only comments\n").unwrap();
+        assert!(l.is_empty());
+        assert!(!l.contains(&Sha256Digest::from_hex(EMPTY_SHA).unwrap()));
+        assert!(!AllowedPluginHashes::default().contains(&Sha256Digest::from_bytes([0; 32])));
     }
 }

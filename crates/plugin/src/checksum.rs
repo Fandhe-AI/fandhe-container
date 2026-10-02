@@ -54,17 +54,15 @@ impl Crc32c {
     /// バイト列を計算に取り込む。複数回に分けて呼んでも、一括で呼んだ場合と
     /// 同じ結果になる（多項式除算の線形性による。テストで確認する）。
     ///
-    /// `byte` は `u8`（値域 0..=255）を `usize::from` で `TABLE`（長さ 256）の
-    /// 添字に変換しており、値域が静的にテーブル長へ収まるため境界外アクセスは
-    /// 起こらない（coding-rust の「外部入力での添字アクセス禁止」は任意長・任意値の
-    /// 入力に対する規約であり、本関数のように添字の値域がコンパイル時に保証されている
-    /// 場合は対象外。テーブルなしのビット単位実装も可能だが約 8 倍遅くなるため
-    /// 採らない）。
+    /// 添字は `& 0xFF` により 0..=255 に収まり `TABLE`（長さ 256）の範囲内だが、
+    /// plugin 入力の経路では添字アクセス（`[]`）を使わない規約（coding-rust）に
+    /// 従い `get()` で引く。`None` は到達不能で、万一の場合も panic させず
+    /// 0 へフォールバックする。
     pub(crate) fn update(&mut self, bytes: &[u8]) {
         let mut crc = self.state;
         for &byte in bytes {
             let index = ((crc ^ u32::from(byte)) & 0xFF) as usize;
-            crc = (crc >> 8) ^ TABLE[index];
+            crc = (crc >> 8) ^ TABLE.get(index).copied().unwrap_or(0);
         }
         self.state = crc;
     }

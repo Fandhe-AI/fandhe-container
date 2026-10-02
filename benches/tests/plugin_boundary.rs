@@ -80,8 +80,9 @@ mod unix {
         let f = measure_framed(plan, &mut stream).unwrap();
         let i = measure_inproc(plan).unwrap();
         assert!(f > 0 && i > 0);
-        let json = results_json(i, f);
+        let json = results_json(i, f).unwrap();
         assert!(json.contains(METRIC_INPROC) && json.contains(METRIC_FRAMED));
+        assert!(json.contains("plugin_boundary_op_a_delta_p50"));
         drop(stream);
         h.join().unwrap();
     }

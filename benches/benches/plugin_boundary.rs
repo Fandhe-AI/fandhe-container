@@ -24,7 +24,8 @@ mod imp {
 
     use fandhe_container_benches::plugin_boundary::{
         BenchError, CONNECT_TIMEOUT, Command, Plan, SMOKE_ITERATIONS, SMOKE_TRIALS,
-        WARMUP_ITERATIONS, measure_framed, measure_inproc, parse_args, results_json, serve,
+        WARMUP_ITERATIONS, delta_log_line, measure_framed, measure_inproc, parse_args,
+        results_json, serve,
     };
     use fandhe_container_plugin::{UdsListener, UdsStream};
 
@@ -80,7 +81,9 @@ mod imp {
         let mut stream = listener.accept(CONNECT_TIMEOUT)?;
         let framed = measure_framed(plan, &mut stream)?;
         drop(stream);
-        Ok(results_json(inproc, framed))
+        // Δp50 と CORE-10 比は stderr へ出す（stdout は結果 JSON のみ。TASK-113.3・PLUG-5）。
+        eprintln!("{}", delta_log_line(inproc, framed)?);
+        results_json(inproc, framed)
     }
 
     fn run_child(socket: &str) -> Result<(), BenchError> {

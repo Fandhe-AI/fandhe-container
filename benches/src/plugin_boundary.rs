@@ -13,13 +13,15 @@
 //! 計測区間: 1 サンプル = 代表操作 A の 3 呼び出しの合計。接続確立・子プロセス起動は含めない
 //! （起動コストは PLUG-6・TASK-113.4 側）。試行ごとの p50 の中央値を結果とする（PoC-13 と同じ集計）。
 //!
-//! 未対応（後続 sub）: 代表操作 B（TASK-113.2）、Δp50 の算出と 15% ゲート接続（TASK-113.3）、
-//! macOS cold start 上乗せ（TASK-113.4）、gRPC 経路（TASK-108。未実装）。本モジュールの出力は
-//! `benches/baseline.json` に未登録のためゲートには接続していない（基準値の確定は TASK-88）。
+//! Δp50（`delta_p50` モジュール。TASK-113.3）は metric `plugin_boundary_op_a_delta_p50` として出力する。
+//! 未対応（後続 sub）: macOS cold start 上乗せ（TASK-113.4）、gRPC 経路（TASK-108。未実装）。
+//! 本モジュールの出力は `benches/baseline.json` に未登録のため `make bench-check` には接続していない
+//! （実測基準値の確定は TASK-88.h1・TASK-113.h1。比較ロジックは fixture で検証済み）。
 
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::delta_p50::{self, DeltaError};
 use fandhe_container_plugin::{
     ControlMessage, MessageId, PluginError, PluginErrorCode, RpcTimeout, UdsStream, decode_message,
     encode_message,
@@ -48,6 +50,10 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const METRIC_INPROC: &str = "plugin_boundary_op_a_inproc_p50";
 /// 結果 JSON の metric 名（境界越し経路）。
 pub const METRIC_FRAMED: &str = "plugin_boundary_op_a_framed_p50";
+/// Δp50（framed − inproc。3 呼び出し合計。TASK-113.3）の metric 名。
+pub const METRIC_DELTA: &str = "plugin_boundary_op_a_delta_p50";
+/// 代表操作 A の往復回数 N（PLUG-5）。
+pub const OP_A_ROUND_TRIPS: u32 = 3;
 
 const OP_RUN_POD_SANDBOX: &str = "run_pod_sandbox";
 const OP_CREATE_CONTAINER: &str = "create_container";
@@ -371,11 +377,34 @@ pub fn measure_framed(plan: Plan, stream: &mut UdsStream) -> Result<u64, BenchEr
     measure(plan, || run_op_a_framed(stream, &mut next_id).map(|_| ()))
 }
 
+/// Δp50（ns）。`framed <= inproc` は計測異常として `Err`（fail-closed。0 へ丸めない）。
+pub fn delta_ns(inproc_p50_ns: u64, framed_p50_ns: u64) -> Result<u64, BenchError> {
+    framed_p50_ns
+        .checked_sub(inproc_p50_ns)
+        .filter(|d| *d > 0)
+        .ok_or_else(|| {
+            BenchError::new(
+                DeltaError::NonPositiveDelta.code(),
+                "framed p50 must exceed in-process p50",
+            )
+        })
+}
+
+/// Δp50 と CORE-10 比の構造化ログ行（stderr 用。`delta_p50::log_line`）を返す。
+pub fn delta_log_line(inproc_p50_ns: u64, framed_p50_ns: u64) -> Result<String, BenchError> {
+    // p50 の ns 値は 2^53 未満で f64 に正確に載る。
+    let d = delta_p50::compute(inproc_p50_ns as f64, framed_p50_ns as f64, OP_A_ROUND_TRIPS)
+        .map_err(|e| BenchError::new(e.code(), e.to_string()))?;
+    Ok(delta_p50::log_line("a", &d))
+}
+
 /// 結果 JSON（比較スクリプトの results スキーマ。単位は ns）を組み立てる。
-pub fn results_json(inproc_p50_ns: u64, framed_p50_ns: u64) -> String {
-    format!(
-        "{{\n  \"schema_version\": 1,\n  \"metrics\": {{\n    \"{METRIC_INPROC}\": {{\n      \"value\": {inproc_p50_ns},\n      \"unit\": \"ns\"\n    }},\n    \"{METRIC_FRAMED}\": {{\n      \"value\": {framed_p50_ns},\n      \"unit\": \"ns\"\n    }}\n  }}\n}}\n"
-    )
+/// Δp50 が正でなければ `Err`。
+pub fn results_json(inproc_p50_ns: u64, framed_p50_ns: u64) -> Result<String, BenchError> {
+    let delta = delta_ns(inproc_p50_ns, framed_p50_ns)?;
+    Ok(format!(
+        "{{\n  \"schema_version\": 1,\n  \"metrics\": {{\n    \"{METRIC_INPROC}\": {{\n      \"value\": {inproc_p50_ns},\n      \"unit\": \"ns\"\n    }},\n    \"{METRIC_FRAMED}\": {{\n      \"value\": {framed_p50_ns},\n      \"unit\": \"ns\"\n    }},\n    \"{METRIC_DELTA}\": {{\n      \"value\": {delta},\n      \"unit\": \"ns\"\n    }}\n  }}\n}}\n"
+    ))
 }
 
 /// 解釈済みのコマンドライン。
@@ -524,11 +553,25 @@ mod tests {
 
     #[test]
     fn plug5_results_json_has_both_metrics() {
-        let j = results_json(120, 45_000);
+        let j = results_json(120, 45_000).unwrap();
         assert!(j.contains("\"plugin_boundary_op_a_inproc_p50\": {\n      \"value\": 120,"));
         assert!(j.contains("\"plugin_boundary_op_a_framed_p50\": {\n      \"value\": 45000,"));
         assert!(j.contains("\"schema_version\": 1"));
-        assert_eq!(j.matches("\"unit\": \"ns\"").count(), 2);
+        assert!(j.contains("\"plugin_boundary_op_a_delta_p50\": {\n      \"value\": 44880,"));
+        assert_eq!(j.matches("\"unit\": \"ns\"").count(), 3);
+    }
+
+    /// REPAIR-8: framed が inproc 以下なら Err（fail-closed）。
+    #[test]
+    fn plug5_results_json_rejects_non_positive_delta() {
+        assert_eq!(
+            results_json(100, 100).unwrap_err().code,
+            "non-positive-delta"
+        );
+        assert_eq!(
+            results_json(200, 100).unwrap_err().code,
+            "non-positive-delta"
+        );
     }
 
     #[test]

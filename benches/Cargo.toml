@@ -40,3 +40,14 @@ fandhe-container-plugin = { path = "../crates/plugin" }
 [[bench]]
 name = "plugin_boundary_list_images"
 harness = false
+
+# [[bench]] plugin_boundary_macos_cold_start は TASK-113.4（PLUG-6・MAC-2）の macOS cold start 上乗せ確認。
+# 子プロセス役は [[bin]] plugin-boundary-stub（外部依存なし。CARGO_BIN_EXE_* の絶対パスで起動）。
+# macOS のみ計測。回帰ゲート（baseline.json）へは未接続（TASK-88.h1・TASK-113.h1）。
+[[bench]]
+name = "plugin_boundary_macos_cold_start"
+harness = false
+
+[[bin]]
+name = "plugin-boundary-stub"
+path = "src/bin/plugin_boundary_stub.rs"

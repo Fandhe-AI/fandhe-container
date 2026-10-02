@@ -55,6 +55,7 @@ make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段�
 cargo bench -p fandhe-container-benches --bench plugin_boundary -- --output <path>  # 代表操作 A の plugin 境界ベンチ（TASK-113.1・PLUG-5。同一プロセスと境界越しの p50 と Δp50（TASK-113.3）を ns で出力し、Δp50 と CORE-10 比は stderr へログ。Unix のみ。baseline 未登録のため bench-check には未接続）
 cargo bench -p fandhe-container-benches --bench plugin_boundary_list_images [-- --output <path>]  # 代表操作 B（イメージ一覧）の plugin 境界ベンチ（TASK-113.2・PLUG-5。引数なしはスモーク。Δp50 も出力。bench-check には未接続）
 make bench-plugin-boundary  # plugin 境界ベンチ A・B を実行し Δp50 と CORE-10 の Linux 実機値（0.290〜0.298 秒）に対する割合をログ出力（TASK-113.3・PLUG-5。基準値比較なし）
+make bench-macos-cold-start  # macOS cold start 上乗せ（都度起動・常駐）を計測し、MAC-2 目標 2 秒の 1% 未満（20 ms 未満）を判定（TASK-113.4・PLUG-6。macOS のみ。他 OS は skip。CI の macos では結合試験 `benches/tests/macos_cold_start.rs` として実行。bench-check には未接続）
 make bench-baseline-selftest  # baseline.json 生成スクリプトの自己テスト（TASK-88.1・REPAIR-12）
 make bench-baseline         # ベンチを実行し baseline.json を再生成する（TASK-88.1。BENCH_ENVIRONMENT・BENCH_BASELINE_OUT で指定。実測の記録は TASK-88.2）
 make fio-bench-selftest     # fio 4K ランダム write ベンチスクリプトの自己テスト（TASK-25.1・IO-8・REPAIR-12。実 fio 不要）
@@ -164,7 +165,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 - plugin 境界フレーム（長さ接頭辞フレーム。PLUG-2）の符号化・復号、壊れたフレームや長さ上限超過を拒否することのユニットテスト。フレームは型で組み立てる（REPAIR-2）。plugin からの入力は untrusted として検証する
 - plugin RPC の応答待ちがタイムアウトで打ち切られることの結合試験（REPAIR-5。フレーム単位の待機は `crates/plugin/tests/transport_frame_io.rs`〔#250〕。要求・応答の往復の試験は TASK-107.7・#251）
 - PLUG-4「core 無変更」の 3 点比較（core 側ソースの sha256 一覧・`cargo tree -p <core> --locked -e normal` で見た core の依存木・core バイナリの sha256。[crate-naming.md](docs/design/crate-naming.md) 決定 3）が変化しないこと。**現状**: 判定の仕組みは TASK-109 で実装予定で未実装。plugin を通すために core 側のソースやテストを書き換えないこと（PLUG-4 違反は既存の P0 観点）
-- plugin 境界のベンチ（TASK-113 の `plugin_boundary` 系）。**現状**: 代表操作 A・B と Δp50・CORE-10 比のログ出力は実装済み（TASK-113.1〜113.3）。実測基準値の `benches/baseline.json` 登録と `make bench-check` への組み込み（常時の 15% 回帰判定）は TASK-88.h1・TASK-113.h1 待ちで未有効。それまで `bench-regression` の成功は plugin 境界の性能回帰がない根拠にならない。`bench-check` は `bench-baseline` と同じ `BENCH_NAMES` を実行し baseline.json 登録済み metric に絞って比較するため、基準値の再生成後は plugin 系 metric も自動で 15% 判定の対象になる
+- plugin 境界のベンチ（TASK-113 の `plugin_boundary` 系）。**現状**: 代表操作 A・B と Δp50・CORE-10 比のログ出力は実装済み（TASK-113.1〜113.3）。macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は macOS のみ結合試験として 3 OS matrix の macos で実行し（`bench-regression` は不変）、2 秒の 1% 未満を判定する。実測基準値の `benches/baseline.json` 登録と `make bench-check` への組み込み（常時の 15% 回帰判定）は TASK-88.h1・TASK-113.h1 待ちで未有効。それまで `bench-regression` の成功は plugin 境界の性能回帰がない根拠にならない。`bench-check` は `bench-baseline` と同じ `BENCH_NAMES` を実行し baseline.json 登録済み metric に絞って比較するため、基準値の再生成後は plugin 系 metric も自動で 15% 判定の対象になる
 - plugin の信頼性検証（PLUG-11: 他ユーザー書き込み可能な場所・ハッシュ不一致の plugin の登録拒否）と UDS 境界（PLUG-12: 権限・peer credential 検証）について、新しい plugin を対象にしたケース。**現状**: 管理ディレクトリからの候補探索（TASK-109.1）と PATH 探索の opt-in・警告ログ（TASK-109.2。候補は未検証・CLI フラグ配線は TASK-79）は実装済み。同名候補を解決するレジストリも TASK-109.3 で実装済み（登録は信頼済みを意味しない）。信頼性検証は TASK-122〜124 で実装予定で未実装
 - `plugin-microvm` 等 microVM 系の依存に触れる場合は `make deny` の禁止クレート検査（MVM-4）。**現状**: 機械判定（`scripts/check-microvm-deps.sh`・`deny.toml` `[bans]`）は TASK-73 で導入予定
 - macOS Virtualization.framework・WSL2・KVM を使うバックエンド plugin（`plugin-macos`・`plugin-windows`・`plugin-microvm`）の実機依存テストは、実機前提テストとして分離する（[ci](.claude/rules/ci.md)「実機前提テスト」）

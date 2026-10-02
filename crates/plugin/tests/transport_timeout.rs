@@ -85,21 +85,29 @@ mod unix {
         }
     }
 
-    /// server 側の振る舞い。要求を受信したら `act` を実行し、その後は
+    /// server 側の振る舞い。要求を受信したら `act` を実行し、完了を `acted` へ通知した後、
     /// 解放通知（release の sender drop）まで接続を開いたまま沈黙する。
+    /// client は `acted` を待ってから読み取り期限を開始する（部分応答の送信完了を保証し、
+    /// server の遅延で「部分応答なしの Timeout」になる偽陽性を防ぐ）。
     fn run_silent_server(
         mut server: UdsStream,
         act: impl FnOnce(&mut UdsStream) + Send + 'static,
-    ) -> (mpsc::Sender<()>, std::thread::JoinHandle<Msg>) {
+    ) -> (
+        mpsc::Sender<()>,
+        mpsc::Receiver<()>,
+        std::thread::JoinHandle<Msg>,
+    ) {
         let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (acted_tx, acted_rx) = mpsc::channel::<()>();
         let h = std::thread::spawn(move || {
             let got = server.read_frame(rpc(2000)).unwrap();
             let msg = decode_message::<String>(&got).unwrap();
             act(&mut server);
+            let _ = acted_tx.send(());
             let _ = release_rx.recv_timeout(WAIT);
             msg
         });
-        (release_tx, h)
+        (release_tx, acted_rx, h)
     }
 
     /// 要求送信成功 -> 応答なし -> client の read_frame が有限時間で Timeout になる。
@@ -108,10 +116,14 @@ mod unix {
         let l = UdsListener::bind(&dir.sock()).unwrap();
         let mut client = UdsStream::connect(l.path(), WAIT).unwrap();
         let server = l.accept(WAIT).unwrap();
-        let (release, h) = run_silent_server(server, act);
+        let (release, acted, h) = run_silent_server(server, act);
 
         let frame = encode_message(&request(42, "ping")).unwrap();
         client.write_frame(&frame, rpc(1000)).unwrap();
+
+        // server の act（部分応答の送信等）完了後に client の期限を開始する。
+        // 失敗時も server を解放して join できるよう、結果は後で検証する。
+        let acted_ok = acted.recv_timeout(WAIT).is_ok();
 
         let (err, elapsed) = with_watchdog("client read_frame", move || {
             let start = Instant::now();
@@ -123,6 +135,7 @@ mod unix {
         drop(release);
         let received = h.join().unwrap();
         assert_eq!(received, request(42, "ping"));
+        assert!(acted_ok, "server did not finish its action within {WAIT:?}");
 
         assert_eq!(err.code(), PluginErrorCode::Timeout);
         assert_eq!(err.code().as_str(), "TIMEOUT");

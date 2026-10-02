@@ -274,8 +274,10 @@ mod unix {
         let lock = d.path().join("s.sock.lock");
         let first = UdsListener::bind(&p).unwrap();
         let m = std::fs::symlink_metadata(&p).unwrap();
-        let record = format!("fcus1 {} {}\n", m.dev(), m.ino());
-        assert_eq!(std::fs::read_to_string(&lock).unwrap(), record);
+        // 記録は `fcus1 <dev> <ino>\n`。dev の符号化は実装依存のため、接頭辞と ino（具体値）で照合する。
+        let record = std::fs::read_to_string(&lock).unwrap();
+        assert!(record.starts_with("fcus1 "), "{record:?}");
+        assert!(record.ends_with(&format!(" {}\n", m.ino())), "{record:?}");
         // ディレクトリを書き込み不可にして unlink を失敗させる（root は権限検査を受けないため対象外）。
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
         let unlink_blocked = std::fs::remove_file(&p).is_err();

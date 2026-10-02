@@ -92,22 +92,20 @@ mod unix {
     fn run_silent_server(
         mut server: UdsStream,
         act: impl FnOnce(&mut UdsStream) + Send + 'static,
-    ) -> (
-        mpsc::Sender<()>,
-        mpsc::Receiver<()>,
-        std::thread::JoinHandle<Msg>,
-    ) {
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<()>, mpsc::Receiver<Msg>) {
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let (acted_tx, acted_rx) = mpsc::channel::<()>();
-        let h = std::thread::spawn(move || {
+        let (done_tx, done_rx) = mpsc::channel::<Msg>();
+        // join は無期限に待つため使わない。完了は done チャネルで期限付きに受け取る。
+        std::thread::spawn(move || {
             let got = server.read_frame(rpc(2000)).unwrap();
             let msg = decode_message::<String>(&got).unwrap();
             act(&mut server);
             let _ = acted_tx.send(());
             let _ = release_rx.recv_timeout(WAIT);
-            msg
+            let _ = done_tx.send(msg);
         });
-        (release_tx, acted_rx, h)
+        (release_tx, acted_rx, done_rx)
     }
 
     /// 要求送信成功 -> 応答なし -> client の read_frame が有限時間で Timeout になる。
@@ -116,13 +114,13 @@ mod unix {
         let l = UdsListener::bind(&dir.sock()).unwrap();
         let mut client = UdsStream::connect(l.path(), WAIT).unwrap();
         let server = l.accept(WAIT).unwrap();
-        let (release, acted, h) = run_silent_server(server, act);
+        let (release, acted, done) = run_silent_server(server, act);
 
         let frame = encode_message(&request(42, "ping")).unwrap();
         client.write_frame(&frame, rpc(1000)).unwrap();
 
         // server の act（部分応答の送信等）完了後に client の期限を開始する。
-        // 失敗時も server を解放して join できるよう、結果は後で検証する。
+        // 失敗時も server を解放できるよう、結果は後で検証する。
         let acted_ok = acted.recv_timeout(WAIT).is_ok();
 
         let (err, elapsed) = with_watchdog("client read_frame", move || {
@@ -131,11 +129,13 @@ mod unix {
             (e, start.elapsed())
         });
 
-        // assert 失敗時もスレッドが残らないよう、先に解放して join する。
+        // 先に server を解放する。server の停止時は join せずに失敗させる（REPAIR-5）。
         drop(release);
-        let received = h.join().unwrap();
-        assert_eq!(received, request(42, "ping"));
         assert!(acted_ok, "server did not finish its action within {WAIT:?}");
+        let received = done
+            .recv_timeout(WAIT)
+            .expect("server thread did not complete within the deadline");
+        assert_eq!(received, request(42, "ping"));
 
         assert_eq!(err.code(), PluginErrorCode::Timeout);
         assert_eq!(err.code().as_str(), "TIMEOUT");

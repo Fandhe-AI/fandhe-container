@@ -63,6 +63,13 @@ run_case "baseline-invalid-zero" "${fixtures_dir}/baseline-invalid-zero.json" "$
 # 修正の受け入れ基準）
 run_case "regress-lower-extreme-overflow" "${fixtures_dir}/baseline-extreme.json" "${fixtures_dir}/results-regress-extreme-10x.json" 1
 
+# TASK-113.3・PLUG-5・REPAIR-8: plugin 境界ベンチの実 metric 名（Δp50）での判定。
+# Δp50 単独の悪化（他 metric は基準値と同値）を検出できることを機械照合する。
+plugin_baseline="${fixtures_dir}/baseline-plugin.json"
+run_case "plugin-delta-boundary-15-percent" "$plugin_baseline" "${fixtures_dir}/results-plugin-boundary-15.json" 0
+run_case "plugin-delta-regress-16-percent" "$plugin_baseline" "${fixtures_dir}/results-plugin-regress-delta-16.json" 1
+run_case "plugin-delta-improved" "$plugin_baseline" "${fixtures_dir}/results-plugin-improved.json" 0
+
 # 存在しないファイル → 入力エラー（2）
 run_case "missing-file" "$baseline" "${fixtures_dir}/does-not-exist.json" 2
 

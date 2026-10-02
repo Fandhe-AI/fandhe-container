@@ -1169,7 +1169,8 @@ mod socket {
         fn late_errno_after_deadline_is_timeout() {
             let total = Duration::from_millis(30);
             let deadline = Deadline::after(total);
-            let mut once = Some(err_dgram(5, -1, 5));
+            // errno 17（EEXIST）の正しいエラー応答。期限内なら AlreadyExists になる値を使う。
+            let mut once = Some(err_dgram(5, 17, 5));
             let e = await_reply(5, &deadline, total, |_| {
                 std::thread::sleep(Duration::from_millis(80));
                 Ok(once.take().expect("one"))
@@ -1327,7 +1328,7 @@ mod socket {
             assert_eq!(r.messages().len(), 2);
         }
 
-        /// NET-11: NLM_F_DUMP_INTR の dump は FailedPrecondition。
+        /// NET-11: ACK と同じデータグラムで ACK の後ろに同じ seq の応答があれば、送出順に反するため DataLoss。
         #[test]
         fn trailing_message_after_ack_is_data_loss() {
             let mut dg = err_dgram(7, 0, 7);
@@ -1336,15 +1337,64 @@ mod socket {
             assert_eq!(r.unwrap_err().code(), NetErrorCode::DataLoss);
         }
 
-        /// NET-11: 終端の後ろの不正フレームも見逃さない。
+        /// NET-11: 終端の後ろの不正フレームも見逃さず DataLoss。
         #[test]
         fn malformed_frame_after_ack_is_error() {
             let mut dg = err_dgram(7, 0, 7);
             dg.extend([0xff, 0, 0, 0, 1]);
-            let r = run(7, Duration::from_secs(1), script(vec![dg]));
-            assert!(r.is_err());
+            let e = run(7, Duration::from_secs(1), script(vec![dg])).expect_err("malformed");
+            assert_eq!(e.code(), NetErrorCode::DataLoss);
         }
 
+        /// NET-11: 非 dump では ACK より前の複数データグラムの応答をすべて到着順に集めてから、ACK で
+        /// 終端する（カーネルは doit の応答を送り終えてから ACK を送る）。ACK の後のデータグラムは
+        /// 読まない（次の往復が seq 不一致として破棄する）。
+        #[test]
+        fn non_dump_collects_replies_before_ack() {
+            let mut queue = vec![
+                plain_dgram(16, 9, b"aaaa"),
+                plain_dgram(20, 9, b"bbbbbbbb"),
+                err_dgram(9, 0, 9),
+                plain_dgram(16, 10, b"next"),
+            ];
+            queue.reverse();
+            let mut recvs = 0usize;
+            let r = run(9, Duration::from_secs(5), |_| {
+                recvs += 1;
+                queue
+                    .pop()
+                    .ok_or_else(|| NetError::new(NetErrorCode::Timeout, "none"))
+            })
+            .expect("ack");
+            let got: Vec<(u16, &[u8])> = r
+                .messages()
+                .iter()
+                .map(|m| (m.msg_type(), m.payload()))
+                .collect();
+            assert_eq!(got, vec![(16, &b"aaaa"[..]), (20, &b"bbbbbbbb"[..])]);
+            assert_eq!(recvs, 3);
+            assert_eq!(queue, vec![plain_dgram(16, 10, b"next")]);
+        }
+
+        /// NET-11: dump の開始に失敗した errno 付き NLMSG_ERROR は、dump でもエラーで終端する。
+        #[test]
+        fn dump_start_failure_is_error() {
+            let e = await_reply_for(
+                4,
+                true,
+                &Deadline::after(Duration::from_secs(5)),
+                Duration::from_secs(5),
+                script(vec![err_dgram(4, 95, 4)]),
+            )
+            .expect_err("eopnotsupp");
+            assert_eq!(e.code(), NetErrorCode::Unimplemented);
+            assert_eq!(
+                e.to_string(),
+                "UNIMPLEMENTED: netlink request failed: errno 95"
+            );
+        }
+
+        /// NET-11: NLM_F_DUMP_INTR の dump は FailedPrecondition（再試行可能）。
         #[test]
         fn dump_intr_is_retryable_error() {
             let mut b = NlMsgBuilder::new(16, NLM_F_DUMP_INTR, 4, 0);
@@ -1359,6 +1409,49 @@ mod socket {
             )
             .expect_err("intr");
             assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        }
+
+        /// NET-11: DUMP_INTR は dump 判定によらず検出する（DONE 側に立っても成功にしない）。
+        #[test]
+        fn dump_intr_on_done_is_detected_without_dump_flag() {
+            let mut b = NlMsgBuilder::new(NLMSG_DONE, NLM_F_DUMP_INTR, 4, 0);
+            b.put_fixed(&[0u8; 4]).expect("payload");
+            let e = run(
+                4,
+                Duration::from_secs(5),
+                script(vec![b.finish().expect("finish")]),
+            )
+            .expect_err("intr");
+            assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+            assert_eq!(
+                e.to_string(),
+                "FAILED_PRECONDITION: netlink dump for seq 4 was interrupted (NLM_F_DUMP_INTR); retry"
+            );
+        }
+
+        /// NET-11: NLMSG_DONE のペイロードは先頭の int だけを読む（extended ACK の属性が続いても
+        /// nlmsgerr の元要求ヘッダ検査で DataLoss にしない）。不正値は DataLoss。
+        #[test]
+        fn done_payload_is_a_leading_int() {
+            assert_eq!(decode_done_errno(&[]).expect("empty"), 0);
+            assert_eq!(decode_done_errno(&0i32.to_ne_bytes()).expect("zero"), 0);
+            assert_eq!(
+                decode_done_errno(&(-2i32).to_ne_bytes()).expect("enoent"),
+                2
+            );
+            let mut with_tlv = (-22i32).to_ne_bytes().to_vec();
+            with_tlv.extend_from_slice(&[8, 0, 1, 0, b'e', b'r', b'r', 0]);
+            assert_eq!(decode_done_errno(&with_tlv).expect("tlv"), 22);
+            for bad in [
+                vec![0u8; 3],
+                1i32.to_ne_bytes().to_vec(),
+                i32::MIN.to_ne_bytes().to_vec(),
+            ] {
+                assert_eq!(
+                    decode_done_errno(&bad).expect_err("bad").code(),
+                    NetErrorCode::DataLoss
+                );
+            }
         }
 
         /// REPAIR-3: 空ペイロードのメッセージでも件数上限で打ち切る。

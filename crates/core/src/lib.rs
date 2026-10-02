@@ -59,7 +59,8 @@
 //!   TASK-32.3・CORE-3 は実装済み。TASK-32.4 は fork 後の子の `cgroup.procs` 参加フック `CgroupJoin` まで実装済み。本番 launcher からの結線は未実装）
 //! - `plugin`: `plugin` feature 配下の境界基盤型の再エクスポート（PLUG-3・TASK-111.1・#262）。
 //!   発見・登録は未実装
-//! - 予定（未作成）: `plugin_discovery`（TASK-109。`plugin` feature のゲート配下に置く予定）
+//! - `plugin_discovery`: 管理ディレクトリ（system / user）からの plugin 候補探索（TASK-109.1・PLUG-4・PLUG-11）は実装済み・OS 非依存。
+//!   候補は未検証で、`PATH` opt-in（TASK-109.2）・レジストリ（TASK-109.3）・信頼性検証（TASK-122）は未実装
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
 //!
@@ -87,6 +88,7 @@ pub mod observability;
 pub mod oci_runtime;
 #[cfg(feature = "plugin")]
 pub mod plugin;
+pub mod plugin_discovery;
 #[cfg(target_os = "linux")]
 pub mod rootless;
 pub mod seccomp;

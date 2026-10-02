@@ -13,10 +13,9 @@
 //! - 子プロセスの回収: [`call_once`] が `Ok` を返した時点で、直接起動した子は wait または kill で
 //!   回収済み。`Err` の場合も、返す前に必ず kill と [`ONE_SHOT_REAP_TIMEOUT`] までの回収を試みる。
 //!   回収を確認できなかった場合に限り、`Internal`（メッセージに `could not be reaped` と子の pid を
-//!   含む）を元のエラーに代えて返す。このとき子は残っている可能性があり（孤児・ゾンビ）、呼び出し側は
-//!   その pid を未回収として扱う。ハンドルは保持したまま戻る直前（ガードの `Drop`）にもう一度だけ
-//!   期限つきで回収を試みるが、それでも回収できなければハンドルを手放す（プロセス終了時に OS が
-//!   引き取る。未回収の経路は最大で `ONE_SHOT_REAP_TIMEOUT` の 2 倍を要する）。
+//!   含む）を元のエラーに代えて返す。報告した pid の子は、この呼び出しではそれ以降回収しない
+//!   （報告後に回収すると、解放済みの pid を未回収として伝えることになるため）。子は終了済みでも
+//!   ゾンビとして残り、親プロセスの終了時に OS が引き取る。呼び出し側はその pid を未回収として扱う。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
 //!   stdin / stdout は null。stderr は親へ継承させず、専用の pipe で受けて [`OneShotStderr`] として
 //!   返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は読み捨てて件数だけ数える）。
@@ -315,25 +314,37 @@ impl OneShotOutcome {
     }
 }
 
-/// 子プロセスを保持し、Drop で kill・回収を試みるガード（早期 return でも kill を必ず試みる）。
+/// 子プロセスを保持し、Drop で kill・回収を試みるガード（panic 等の早期離脱でも子を残さない）。
 ///
 /// 回収の成否を呼び出し側へ返す責務は明示的な [`Self::kill_and_reap`] / [`Self::wait_or_kill`] の
-/// 呼び出しが担う。`Drop` はその後の最終試行で、未回収のままなら `Child` を手放す（モジュール冒頭の
-/// 契約のとおり、その場合は `Internal` を返して子が残り得ることを呼び出し側へ伝えている）。
-struct ChildGuard(Option<Child>);
+/// 呼び出しが担う。未回収として報告した後（[`unreaped_error`]）は `Drop` で回収しない。報告後に回収
+/// すると、呼び出し側へ伝えた pid が解放済みになり、別プロセスを指し得るため（kill は報告前に送信
+/// 済みで、`Drop` での再試行は待ち時間を延ばすだけになる）。
+struct ChildGuard {
+    child: Option<Child>,
+    /// 未回収として pid を報告済みか。true なら `Drop` で回収しない。
+    reported_unreaped: bool,
+}
 
 impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self {
+            child: Some(child),
+            reported_unreaped: false,
+        }
+    }
+
     fn pid(&self) -> Option<u32> {
-        self.0.as_ref().map(Child::id)
+        self.child.as_ref().map(Child::id)
     }
 
     /// 子の stderr（pipe の読み取り側）を取り出す。2 回目以降・回収済みは `None`。
     fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.0.as_mut().and_then(|c| c.stderr.take())
+        self.child.as_mut().and_then(|c| c.stderr.take())
     }
 
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        match self.0.as_mut() {
+        match self.child.as_mut() {
             Some(c) => c.try_wait(),
             None => Ok(None),
         }
@@ -342,17 +353,17 @@ impl ChildGuard {
     /// kill して回収を `ONE_SHOT_REAP_TIMEOUT` まで待つ。
     ///
     /// kill の失敗は無視せず、回収確認ができなければ `Unreaped` を返す（呼び出し側が報告する）。
-    /// 回収できなかった場合は `Child` を保持し続ける（再試行・`Drop` での最終試行のため手放さない）。
+    /// 回収できなかった場合は `Child` を保持し続ける（呼び出し側が pid を報告できるよう手放さない）。
     /// 回収できた場合は終了状態を捨てずに返す。kill の直前・直後に子が自発終了していた場合、
     /// 回収される状態は「こちらの kill」ではなく子自身の終了状態になるため、呼び出し側が
     /// [`classify_reaped`] で区別する（異常終了を強制終了と取り違えて成功扱いしない。PLUG-7）。
     fn kill_and_reap(&mut self) -> Reap {
-        let Some(c) = self.0.as_mut() else {
+        let Some(c) = self.child.as_mut() else {
             return Reap::AlreadyReaped;
         };
         // kill の前に終了済みかを確認し、自発終了の状態をそのまま拾う（kill との競合窓を狭める）。
         if let Ok(Some(status)) = c.try_wait() {
-            self.0 = None;
+            self.child = None;
             return Reap::Reaped(status);
         }
         let _ = c.kill();
@@ -361,7 +372,7 @@ impl ChildGuard {
         loop {
             match c.try_wait() {
                 Ok(Some(status)) => {
-                    self.0 = None;
+                    self.child = None;
                     return Reap::Reaped(status);
                 }
                 Ok(None) => {}
@@ -383,7 +394,7 @@ impl ChildGuard {
         loop {
             match self.try_wait() {
                 Ok(Some(status)) => {
-                    self.0 = None;
+                    self.child = None;
                     return OneShotTermination::Exited {
                         code: status.code(),
                     };
@@ -407,7 +418,9 @@ impl ChildGuard {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.kill_and_reap();
+        if !self.reported_unreaped {
+            let _ = self.kill_and_reap();
+        }
     }
 }
 
@@ -500,7 +513,8 @@ fn spawn_error(e: &io::Error) -> PluginError {
 /// 終了した場合は期限を待たず `Unavailable`。応答は得たが子が [`ONE_SHOT_EXIT_TIMEOUT`] 内に
 /// 終了しなかった場合は強制終了し、`Ok` と [`OneShotTermination::Killed`] を返す。応答後に非ゼロ・
 /// シグナルで終了した場合は `Unavailable`、回収を確認できない場合は `Internal` を返す（このときだけ
-/// 子が残っている可能性がある。メッセージに子の pid を含む。モジュール冒頭の契約を参照）。
+/// 子が残っている可能性がある。メッセージに子の pid を含み、その子は以後回収しない。モジュール冒頭の
+/// 契約を参照）。
 /// 非 unix では listener の bind が `Unimplemented` を返し、子は spawn されない。
 ///
 /// plugin の stderr は親へ継承させず [`OneShotOutcome::stderr`] で返す。本関数が親の stderr へ出す
@@ -626,7 +640,7 @@ fn call_once_inner(
         .stderr(Stdio::piped())
         .spawn();
     let mut guard = match spawned {
-        Ok(child) => ChildGuard(Some(child)),
+        Ok(child) => ChildGuard::new(child),
         Err(e) => return (Err(spawn_error(&e)), OneShotStderr::empty()),
     };
 
@@ -666,16 +680,21 @@ fn reap_after_failure(guard: &mut ChildGuard, error: PluginError) -> PluginError
 
 /// 回収を確認できなかった子についてのエラー（`Internal`）。呼び出し側が未回収の子を特定できるよう
 /// pid を含める（pid は自プロセスが起動した子のもので、外部入力ではない）。
-fn unreaped_error(guard: &ChildGuard, phase: &str) -> PluginError {
+///
+/// 報告した pid を以後も有効に保つため、`guard` に報告済みの印を付けて `Drop` での回収を止める。
+fn unreaped_error(guard: &mut ChildGuard, phase: &str) -> PluginError {
     let message = match guard.pid() {
-        Some(pid) => format!("plugin process (pid {pid}) could not be reaped after {phase}"),
+        Some(pid) => {
+            guard.reported_unreaped = true;
+            format!("plugin process (pid {pid}) could not be reaped after {phase}")
+        }
         None => format!("plugin process could not be reaped after {phase}"),
     };
     PluginError::new(PluginErrorCode::Internal, message)
 }
 
 /// 接続の受付・1 往復・子の回収を行う。`Ok` で戻る時点で子は回収済み。回収を確認できなかった場合は
-/// `Internal`（[`unreaped_error`]）を返し、子のハンドルは `guard` に残る。
+/// `Internal`（[`unreaped_error`]）を返し、以後 `guard` はその子を回収しない。
 fn exchange_and_reap(
     guard: &mut ChildGuard,
     listener: UdsListener,
@@ -830,7 +849,7 @@ mod tests {
         let mut sink = Vec::new();
         io::Read::read_to_end(&mut out, &mut sink).unwrap();
         assert_eq!(sink, b"");
-        let mut guard = ChildGuard(Some(child));
+        let mut guard = ChildGuard::new(child);
         let Reap::Reaped(status) = guard.kill_and_reap() else {
             panic!("child was not reaped");
         };
@@ -855,12 +874,12 @@ mod tests {
                 .spawn()
                 .unwrap()
         };
-        let mut lingering = ChildGuard(Some(spawn("exec sleep 60")));
+        let mut lingering = ChildGuard::new(spawn("exec sleep 60"));
         assert_eq!(
             lingering.wait_or_kill(Duration::from_millis(50)),
             OneShotTermination::Killed
         );
-        let mut failing = ChildGuard(Some(spawn("exit 7")));
+        let mut failing = ChildGuard::new(spawn("exit 7"));
         assert_eq!(
             failing.wait_or_kill(Duration::from_secs(5)),
             OneShotTermination::Exited { code: Some(7) }
@@ -879,8 +898,9 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        let mut guard = ChildGuard(Some(child));
-        let e = unreaped_error(&guard, "the response");
+        let mut guard = ChildGuard::new(child);
+        let e = unreaped_error(&mut guard, "the response");
+        assert!(guard.reported_unreaped);
         assert_eq!(e.code(), PluginErrorCode::Internal);
         assert_eq!(
             e.message(),
@@ -888,7 +908,7 @@ mod tests {
         );
         // 回収済み（ハンドルなし）の場合は pid を含めない。
         assert!(guard.kill_and_reap().is_reaped());
-        let e = unreaped_error(&guard, "a failed exchange");
+        let e = unreaped_error(&mut guard, "a failed exchange");
         assert_eq!(
             e.message(),
             "plugin process could not be reaped after a failed exchange"
@@ -953,6 +973,43 @@ mod tests {
         assert_eq!(got.total_bytes(), 3);
         assert!(!got.is_complete());
         drop(release);
+    }
+
+    /// PLUG-7: 未回収として pid を報告した子は、ガードの破棄時に回収しない（報告した pid を
+    /// 解放済みにしない）。報告していない子は破棄時に kill・回収する。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_reported_unreaped_child_is_not_reaped_on_drop() {
+        let spawn = |script: &str| {
+            Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let exists = |pid: u32| std::path::Path::new(&format!("/proc/{pid}")).exists();
+
+        // すぐ自発終了する子。回収しなければゾンビとして pid が残る。
+        let mut reported = ChildGuard::new(spawn("exit 0"));
+        let reported_pid = reported.pid().unwrap();
+        let e = unreaped_error(&mut reported, "the response");
+        assert_eq!(
+            e.message(),
+            format!("plugin process (pid {reported_pid}) could not be reaped after the response")
+        );
+        drop(reported);
+
+        let unreported = ChildGuard::new(spawn("exec sleep 30"));
+        let unreported_pid = unreported.pid().unwrap();
+        drop(unreported);
+
+        // `/proc` で確認できるのは Linux のみ。他の unix では破棄が戻ることだけを確認する。
+        if cfg!(target_os = "linux") {
+            assert!(exists(reported_pid), "pid {reported_pid}");
+            assert!(!exists(unreported_pid), "pid {unreported_pid}");
+        }
     }
 
     #[test]

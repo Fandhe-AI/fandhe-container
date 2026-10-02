@@ -18,8 +18,15 @@ mod unix {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new() -> Self {
+            Self::new_in(std::env::temp_dir())
+        }
+        /// 環境の `TMPDIR` に依らず短いパスを保証する（sun_path 境界テスト用）。
+        fn new_short() -> Self {
+            Self::new_in(PathBuf::from("/tmp"))
+        }
+        fn new_in(root: PathBuf) -> Self {
             static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
+            let p = root.join(format!(
                 "fcrd-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
@@ -149,12 +156,15 @@ mod unix {
     /// PLUG-12・TASK-123.3: sun_path 境界。容量 - 1 は成功、容量ちょうどは拒否し socket を作らない。
     #[test]
     fn plug12_socket_path_sun_path_boundary() {
-        let t = TempDir::new();
+        // TMPDIR が長い環境でも境界を必ず構成できるよう、短い /tmp 配下を使う。
+        let t = TempDir::new_short();
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         let base = d.path().as_os_str().len() + 1; // 区切り 1 バイト
-        if base + 1 >= SUN_PATH_CAPACITY {
-            return; // 一時ディレクトリ自体が長すぎる環境では境界を作れない
-        }
+        // 構成不能なら黙って成功させず失敗させる（テストの skip で CI を通さない）。
+        assert!(
+            base + 1 < SUN_PATH_CAPACITY,
+            "cannot construct sun_path boundary: runtime dir too long ({base} bytes)"
+        );
         let fits = "a".repeat(SUN_PATH_CAPACITY - 1 - base);
         let p = d.socket_path(&fits).unwrap();
         assert_eq!(p.as_os_str().len(), SUN_PATH_CAPACITY - 1);

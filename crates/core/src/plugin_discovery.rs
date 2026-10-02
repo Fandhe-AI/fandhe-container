@@ -456,16 +456,54 @@ pub fn discover_with_options(
     })
 }
 
-/// 既定の管理ディレクトリと、`Enabled` のときだけ `PATH` 環境変数を使って探索する。
-/// `Disabled` では `PATH` 環境変数を読まない。
+/// 明示オプションと環境変数値から実効の `PATH` 探索方針を決める純粋関数（PLUG-11）。
+///
+/// どちらか一方でも `Enabled` なら `Enabled`（opt-in の和。どちらも未指定なら `Disabled`）。
+/// 環境変数側は [`PathSearchPolicy::from_env_value`] の厳密解釈（`1` のみ）に従う。
+fn effective_path_search(
+    options: &DiscoveryOptions,
+    env_value: Option<&OsStr>,
+) -> PathSearchPolicy {
+    if options.path_search == PathSearchPolicy::Enabled
+        || PathSearchPolicy::from_env_value(env_value) == PathSearchPolicy::Enabled
+    {
+        PathSearchPolicy::Enabled
+    } else {
+        PathSearchPolicy::Disabled
+    }
+}
+
+/// 既定の管理ディレクトリと、実効方針が `Enabled` のときだけ `PATH` 環境変数を使って探索する。
+///
+/// 実効方針は `options` の明示指定と環境変数 [`PATH_SEARCH_ENV`]`=1` の opt-in の和
+/// （[`effective_path_search`]）。`Disabled` では `PATH` 環境変数を読まない。
 pub fn discover_default_with_options(
     options: &DiscoveryOptions,
 ) -> Result<DiscoveryReport, TraitError> {
-    let path_value = match options.path_search {
-        PathSearchPolicy::Enabled => std::env::var_os("PATH"),
+    let env_value = std::env::var_os(PATH_SEARCH_ENV);
+    discover_default_with_env(
+        options,
+        env_value.as_deref(),
+        &default_search_dirs(),
+        |dir_var| std::env::var_os(dir_var),
+    )
+}
+
+/// 環境依存の入力（環境変数値・管理ディレクトリ・`PATH` 取得関数）を注入できる本体。
+/// テストから実環境を変更せずに環境変数 opt-in の経路を検証するために分離している。
+fn discover_default_with_env(
+    options: &DiscoveryOptions,
+    env_value: Option<&OsStr>,
+    managed_dirs: &[PluginSearchDir],
+    get_var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<DiscoveryReport, TraitError> {
+    let effective =
+        DiscoveryOptions::new().with_path_search(effective_path_search(options, env_value));
+    let path_value = match effective.path_search {
+        PathSearchPolicy::Enabled => get_var("PATH"),
         PathSearchPolicy::Disabled => None,
     };
-    discover_with_options(&default_search_dirs(), path_value.as_deref(), options)
+    discover_with_options(managed_dirs, path_value.as_deref(), &effective)
 }
 
 /// `PATH` 警告を 1 件 1 行で書く。呼び出し側（CLI 等）が stderr を渡す（core は直接書かない）。
@@ -571,6 +609,33 @@ mod tests {
     #[test]
     fn plug11_default_dirs_are_empty_outside_linux() {
         assert!(resolve_default_dirs(Some("/xdg".into()), Some("/h".into())).is_empty());
+    }
+
+    #[test]
+    fn plug11_env_opt_in_enables_path_search_in_default_api() {
+        use std::ffi::OsString;
+        let tmp = std::env::temp_dir().join(format!("fc-plug11-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("fandhe-container-plugin-envtest"), b"").unwrap();
+        let path = OsString::from(tmp.as_os_str());
+        let get = |k: &str| (k == "PATH").then(|| path.clone());
+        let opts = DiscoveryOptions::default();
+
+        // 環境変数 `1` なら明示オプションが Disabled でも PATH を探索する
+        let r = discover_default_with_env(&opts, Some(OsStr::new("1")), &[], get).unwrap();
+        assert_eq!(r.candidates().len(), 1);
+        assert_eq!(r.path_warnings().len(), 1);
+        // 未設定・`0` は探索しない（fail-closed）
+        for v in [None, Some(OsStr::new("0")), Some(OsStr::new("true"))] {
+            let r = discover_default_with_env(&opts, v, &[], get).unwrap();
+            assert!(r.candidates().is_empty());
+        }
+        // 明示オプション Enabled は環境変数なしでも探索する
+        let on = DiscoveryOptions::new().with_path_search(PathSearchPolicy::Enabled);
+        let r = discover_default_with_env(&on, None, &[], get).unwrap();
+        assert_eq!(r.candidates().len(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

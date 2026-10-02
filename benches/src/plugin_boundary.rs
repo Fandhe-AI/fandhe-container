@@ -133,8 +133,14 @@ pub fn measure_inproc(
                 black_box(black_box(lister).list_images());
             }
             let ns = start.elapsed().as_nanos() as f64 / INPROC_BATCH as f64;
-            // 時計分解能による 0 を避け、結果スキーマ（0 超）を満たす。
-            values.push(ns.max(f64::MIN_POSITIVE));
+            // 経過 0 は未計測であり正の値へ置き換えない（計測エラーとして失敗させる）。
+            if ns <= 0.0 {
+                return Err(BenchError::new(
+                    "measurement",
+                    "elapsed time was zero (clock resolution too coarse)",
+                ));
+            }
+            values.push(ns);
         }
         trial_p50s.push(p50(&values)?);
     }
@@ -384,8 +390,8 @@ mod boundary {
         serve_connection(&mut stream, &MockImageStore)
     }
 
-    /// 往復 1 回。応答の ID・種別・件数を照合し、経過 ns を返す。
-    fn round_trip(stream: &mut UdsStream, id: u64, expected: usize) -> Result<f64, BenchError> {
+    /// 往復 1 回。応答の ID・種別・本文（模擬コアの期待一覧と完全一致）を照合し、経過 ns を返す。
+    fn round_trip(stream: &mut UdsStream, id: u64, expected: &[String]) -> Result<f64, BenchError> {
         let timeout = rpc_timeout()?;
         let req = ControlMessage::Request {
             id: MessageId::new(id),
@@ -399,9 +405,16 @@ mod boundary {
         let ns = start.elapsed().as_nanos() as f64;
         match msg {
             ControlMessage::Response { id: rid, body }
-                if rid.get() == id && body.len() == expected =>
+                if rid.get() == id && body.as_slice() == expected =>
             {
-                Ok(ns.max(f64::MIN_POSITIVE))
+                if ns <= 0.0 {
+                    // 経過 0 は未計測であり正の値へ置き換えない。
+                    return Err(BenchError::new(
+                        "measurement",
+                        "elapsed time was zero (clock resolution too coarse)",
+                    ));
+                }
+                Ok(ns)
             }
             _ => Err(BenchError::new("protocol", "unexpected response")),
         }
@@ -413,18 +426,18 @@ mod boundary {
         trials: usize,
         samples: usize,
     ) -> Result<f64, BenchError> {
-        let expected = MockImageStore.list_images().len();
+        let expected = MockImageStore.list_images();
         let mut id = 0u64;
         for _ in 0..WARMUP_ROUND_TRIPS {
             id += 1;
-            round_trip(stream, id, expected)?;
+            round_trip(stream, id, &expected)?;
         }
         let mut trial_p50s = Vec::with_capacity(trials);
         for _ in 0..trials {
             let mut values = Vec::with_capacity(samples);
             for _ in 0..samples {
                 id += 1;
-                values.push(round_trip(stream, id, expected)?);
+                values.push(round_trip(stream, id, &expected)?);
             }
             trial_p50s.push(p50(&values)?);
         }

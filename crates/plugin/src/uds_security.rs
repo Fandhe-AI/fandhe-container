@@ -32,9 +32,9 @@
 //!   （listener が生存中保持し、クラッシュ時は kernel が解放する）。接続拒否の回数では削除しない
 //!   （macOS は accept queue 満杯の生存 listener にも ECONNREFUSED を返すため区別できず、probe 接続が
 //!   既存 listener の accept queue に残る副作用もある）。ロックを取れない（生存中）、socket 以外、
-//!   またはロックに記録した同一性（dev / ino）と一致しない socket（管理下か判別不能。残存ロック
+//!   またはロックに記録した同一性（dev / ino / mtime）と一致しない socket（管理下か判別不能。残存ロック
 //!   ファイルの存在は根拠にしない）は削除せず `AlreadyExists`。ロックを取れて
-//!   管理下の自 UID 所有 socket だけを、再 lstat で同一性（dev / ino / uid / 種別）を確認したうえで
+//!   管理下の自 UID 所有 socket だけを、再 lstat で同一性（dev / ino / mtime / uid / 種別）を確認したうえで
 //!   `unlinkat` し、再 bind を可能にする。
 //!   ロックファイルは一度作ったら削除しない（flock 保持中・解放直後の unlink は、別の bind が別 inode の
 //!   ロックを取得できて排他が崩れるため）。記録は、記録した socket がパス上から無くなったと
@@ -43,8 +43,11 @@
 //!   fork した子は socket fd と一緒にロック fd も継承するため、子が持つ間は生存中として扱う
 //!   （`BindLock` の doc 参照）。
 //!   残余: bind 成功から記録書き込みまでの間に異常終了すると記録の無い socket が残り、以後は
-//!   `AlreadyExists`（手動削除が必要。fail-closed）。記録が残った状態で同一 UID の別経路が socket を
-//!   差し替え、inode 番号が再利用された場合は管理下と誤認し得る（同一 UID の操作のみ。脅威モデル外）。
+//!   `AlreadyExists`（手動削除が必要。fail-closed）。記録した socket が外部で削除され、別経路の socket が
+//!   同じ inode 番号を再利用しても、記録には mtime（秒・ナノ秒）を含めるため一致しない（後から作られた
+//!   socket の mtime は記録時点より新しい）。誤認が残るのは、時計が巻き戻るかタイムスタンプ粒度の
+//!   範囲内で、同一 UID が削除と再作成を行い inode 番号まで一致した場合のみ（0700 ディレクトリ内の
+//!   同一 UID の操作。脅威モデル外）。
 //!   残余: 再確認から unlink までの窓で差し替えられるのは 0700 ディレクトリ内の同一 UID のみ
 //!   （脅威モデル外）。macOS は lstat がパス縮退のため窓がやや広い。
 //! - socket の 0600 化は [`crate::UdsListener::bind`] が検証済みディレクトリ fd 基準の
@@ -509,18 +512,38 @@ mod imp {
     }
 
     /// ロックファイルへ書く「この socket は自分が bind した」記録の接頭辞（版付き）。
-    const RECORD_PREFIX: &str = "fcus1";
-    /// 記録の最大長（接頭辞＋空白＋u64 の 10 進 20 桁×2＋空白＋改行＝48 を超える余裕を持たせた上限）。
+    /// 記録は `fcus2 <dev> <ino> <mtime 秒> <mtime ナノ秒>\n`（すべて 10 進）。
+    const RECORD_PREFIX: &str = "fcus2";
+    /// 記録の項目数（dev・ino・mtime 秒・mtime ナノ秒）。
+    const RECORD_FIELDS: usize = 4;
+    /// 旧形式（`fcus1 <dev> <ino>\n`）の接頭辞と項目数。専用ロックファイルとしては認めるが、mtime を
+    /// 持たないため管理下の証拠にはしない。
+    const LEGACY_RECORD: (&str, usize) = ("fcus1", 2);
+    /// 記録の最大長（接頭辞＋u64 の 10 進 20 桁×4＋区切り＝90 を超えない範囲の上限）。
     const RECORD_MAX_LEN: usize = 96;
 
+    /// socket の同一性を記録の項目へ変換する。dev / ino に加えて mtime を含めるのは、記録した socket が
+    /// 外部で削除され、同じ inode 番号を再利用した別の socket がパスに置かれても一致させないため
+    /// （後から作られた socket の mtime は記録時点より新しい）。負の mtime は表現せず None。
+    fn record_key(ident: &crate::sys::FileIdent) -> Option<[u64; RECORD_FIELDS]> {
+        Some([
+            ident.dev,
+            ident.ino,
+            u64::try_from(ident.mtime_sec).ok()?,
+            u64::from(ident.mtime_nsec),
+        ])
+    }
+
     impl BindLock {
-        /// bind 済み socket の同一性（dev / ino）をロックファイルへ記録する。stale 判定は、残存
+        /// bind 済み socket の同一性（dev / ino / mtime）をロックファイルへ記録する。stale 判定は、残存
         /// ロックファイルの存在ではなく、この記録と socket の同一性の一致だけを管理下の証拠にする
         /// （他実装・別経路が同じパスに bind した socket を誤って削除しない。PLUG-12）。
         pub(crate) fn record_socket(&self, ident: &crate::sys::FileIdent) -> io::Result<()> {
             use std::os::unix::fs::FileExt;
+            let [dev, ino, sec, nsec] =
+                record_key(ident).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
             self.file.set_len(0)?;
-            let text = format!("{RECORD_PREFIX} {} {}\n", ident.dev, ident.ino);
+            let text = format!("{RECORD_PREFIX} {dev} {ino} {sec} {nsec}\n");
             self.file.write_all_at(text.as_bytes(), 0)
         }
 
@@ -532,8 +555,9 @@ mod imp {
             self.file.set_len(0)
         }
 
-        /// 記録された (dev, ino)。無い・壊れている場合は None（管理下と見なさない）。
-        fn recorded(&self) -> Option<(u64, u64)> {
+        /// 記録された同一性（[`record_key`] と同じ並び）。無い・壊れている・旧形式の場合は None
+        /// （管理下と見なさない）。
+        fn recorded(&self) -> Option<[u64; RECORD_FIELDS]> {
             parse_record(&self.read_record()?)
         }
 
@@ -554,23 +578,33 @@ mod imp {
         std::str::from_utf8(b).ok()?.parse().ok()
     }
 
-    /// 完全な記録 `fcus1 <dev> <ino>\n` だけを受け付ける。末尾の改行を必須にして、書き込みが途中で
-    /// 止まった記録（数字が途中で切れた ino 等）を別の socket の同一性として読まない。
-    pub(super) fn parse_record(b: &[u8]) -> Option<(u64, u64)> {
+    /// 完全な記録（現行形式・末尾改行つき）だけを受け付ける。末尾の改行を必須にして、書き込みが
+    /// 途中で止まった記録（数字が途中で切れた項目）を別の socket の同一性として読まない。
+    pub(super) fn parse_record(b: &[u8]) -> Option<[u64; RECORD_FIELDS]> {
         let body = b.strip_suffix(b"\n")?;
         let rest = body
             .strip_prefix(RECORD_PREFIX.as_bytes())?
             .strip_prefix(b" ")?;
-        let sep = rest.iter().position(|c| *c == b' ')?;
-        let (dev, ino) = rest.split_at_checked(sep)?;
-        Some((parse_decimal(dev)?, parse_decimal(ino.get(1..)?)?))
+        let mut out = [0u64; RECORD_FIELDS];
+        let mut tokens = rest.split(|c| *c == b' ');
+        for slot in &mut out {
+            *slot = parse_decimal(tokens.next()?)?;
+        }
+        tokens.next().is_none().then_some(out)
     }
 
-    /// 完全な記録、または記録の書き込みが途中で止まったもの（完全な記録の接頭辞）か。
-    /// 既存ロックファイルを「本実装の専用ファイル」と認める判定に使う。途中で止まった記録を拒否すると
-    /// その socket 名を以後 bind できなくなるため、管理下の証拠にはしないが専用ファイルとしては認める。
+    /// 完全な記録、または記録の書き込みが途中で止まったもの（完全な記録の接頭辞）か。現行形式と
+    /// 旧形式の両方を認める。既存ロックファイルを「本実装の専用ファイル」と認める判定に使う。
+    /// 書きかけ・旧形式を拒否するとその socket 名を以後 bind できなくなるため、管理下の証拠には
+    /// しないが専用ファイルとしては認める。
     pub(super) fn is_record_fragment(b: &[u8]) -> bool {
-        let head = [RECORD_PREFIX.as_bytes(), b" "].concat();
+        is_fragment_of(b, RECORD_PREFIX, RECORD_FIELDS)
+            || is_fragment_of(b, LEGACY_RECORD.0, LEGACY_RECORD.1)
+    }
+
+    /// `b` が `<prefix> <10 進>×fields\n` の接頭辞（完全一致を含む）か。
+    fn is_fragment_of(b: &[u8], prefix: &str, fields: usize) -> bool {
+        let head = [prefix.as_bytes(), b" "].concat();
         let Some(rest) = b.strip_prefix(head.as_slice()) else {
             return head.starts_with(b);
         };
@@ -578,17 +612,17 @@ mod imp {
             Some(x) => (x, true),
             None => (rest, false),
         };
+        let tokens: Vec<&[u8]> = body.split(|c| *c == b' ').collect();
+        let Some((last, init)) = tokens.split_last() else {
+            return false;
+        };
         let digits = |x: &[u8]| x.iter().all(u8::is_ascii_digit);
-        match body.iter().position(|c| *c == b' ') {
-            None => !complete && digits(body),
-            Some(sep) => {
-                let Some((dev, ino)) = body.split_at_checked(sep) else {
-                    return false;
-                };
-                let ino = ino.get(1..).unwrap_or_default();
-                !dev.is_empty() && digits(dev) && digits(ino) && (!complete || !ino.is_empty())
-            }
-        }
+        // 途中の項目は空でない 10 進、最後の項目は書きかけ（空を含む）を許す。改行まで書かれて
+        // いれば全項目が揃っていること。
+        tokens.len() <= fields
+            && init.iter().all(|t| !t.is_empty() && digits(t))
+            && digits(last)
+            && (!complete || (tokens.len() == fields && !last.is_empty()))
     }
 
     /// `name` に対応するロックを取得する。他者が保持中（生存中の listener）は `AlreadyExists`、
@@ -669,14 +703,15 @@ mod imp {
     ///
     /// `UdsListener::bind` から、配置ディレクトリ検証後・`UnixListener::bind` の前に、`lock`
     /// 取得後に呼ばれる。ロックを保持している＝同ロックを使う生存中の listener は存在しないため、
-    /// 自 UID 所有の socket のうち「ロックに記録した同一性（dev / ino）と一致する（管理下の）」
+    /// 自 UID 所有の socket のうち「ロックに記録した同一性（dev / ino / mtime）と一致する（管理下の）」
     /// ものだけを削除する。記録が無い・不一致の socket（他実装・旧版・残存ロックだけが根拠の
     /// もの）は生存中か判別できないため削除せず `AlreadyExists`（fail-closed）。削除は検証済み
     /// `dir` fd 基準の `unlinkat` のみ。
     ///
     /// 記録した socket がパス上に無いと確認できた場合（不在・別エントリ・今回削除した）は、戻る前に
     /// 記録を消す。削除済み socket の dev / ino を残すと、この後の bind が失敗した場合などに inode
-    /// 番号の再利用で別経路の socket を管理下と誤認し得るため。消去に失敗した場合は `Internal`。
+    /// 番号の再利用で別経路の socket を管理下と誤認し得るため。検証が成功していて消去だけ失敗した場合は
+    /// `Internal`（検証が既にエラーならそのエラーを優先して返す。記録は次回の bind で再度消去を試みる）。
     pub(crate) fn clear_stale_socket(
         dir: &File,
         name: &std::ffi::CStr,
@@ -732,9 +767,11 @@ mod imp {
             ExistingEntry::OwnSocket(i) => i,
         };
         // 管理下の証拠は「ロックファイルの存在」ではなく、ロックに記録した socket の同一性
-        // （dev / ino）と現在の socket の一致のみ。記録が無い・不一致なら他実装や別経路が bind した
+        // （dev / ino / mtime）と現在の socket の一致のみ。dev / ino だけでは、記録した socket が
+        // 外部で削除された後に同じ inode 番号を再利用した別の socket と区別できない。記録が無い・不一致なら他実装や別経路が bind した
         // 可能性があるため削除しない（fail-closed）。
-        if lock.recorded() != Some((first.dev, first.ino)) {
+        let key = record_key(&first);
+        if key.is_none() || lock.recorded() != key {
             return (false, Err(busy()));
         }
         // 削除直前に同一性を再確認する。
@@ -773,6 +810,8 @@ mod imp {
                 uid,
                 is_socket,
                 is_symlink,
+                mtime_sec: 3,
+                mtime_nsec: 4,
             }
         }
 
@@ -852,19 +891,28 @@ mod imp {
         /// 認めるが、管理下の証拠にはしない（TASK-123.2）。
         #[test]
         fn plug12_record_parsing_rejects_torn_and_foreign_content() {
-            assert_eq!(parse_record(b"fcus1 2049 8912910\n"), Some((2049, 8912910)));
-            assert_eq!(parse_record(b"fcus1 2049 891"), None); // 途中で切れた ino
-            assert_eq!(parse_record(b"fcus1 2049 8912910\nx"), None);
-            assert_eq!(parse_record(b"fcus1 +1 2\n"), None);
-            assert_eq!(parse_record(b"fcus1  1 2\n"), None);
-            assert_eq!(parse_record(b"fcus2 1 2\n"), None);
+            assert_eq!(
+                parse_record(b"fcus2 2049 8912910 1790000000 123456789\n"),
+                Some([2049, 8912910, 1790000000, 123456789])
+            );
+            assert_eq!(parse_record(b"fcus2 2049 8912910 1790000000 1234"), None); // 改行なし
+            assert_eq!(parse_record(b"fcus2 2049 8912910 1790000000\n"), None); // 項目不足
+            assert_eq!(parse_record(b"fcus2 1 2 3 4 5\n"), None);
+            assert_eq!(parse_record(b"fcus2 1 2 3 4\nx"), None);
+            assert_eq!(parse_record(b"fcus2 +1 2 3 4\n"), None);
+            assert_eq!(parse_record(b"fcus2  1 2 3 4\n"), None);
+            assert_eq!(parse_record(b"fcus2 1 2 3 \n"), None);
+            assert_eq!(parse_record(b"fcus1 2049 8912910\n"), None); // 旧形式は証拠にしない
             assert_eq!(parse_record(b""), None);
             for ok in [
                 &b""[..],
                 b"fc",
-                b"fcus1 ",
-                b"fcus1 20",
-                b"fcus1 2049 ",
+                b"fcus2 ",
+                b"fcus2 20",
+                b"fcus2 2049 ",
+                b"fcus2 2049 891 17",
+                b"fcus2 2049 8912910 1790000000 ",
+                b"fcus2 2049 8912910 1790000000 123456789\n",
                 b"fcus1 2049 891",
                 b"fcus1 2049 8912910\n",
             ] {
@@ -872,12 +920,14 @@ mod imp {
             }
             for ng in [
                 &b"hello"[..],
-                b"fcus1 x",
-                b"fcus1 2049\n",
-                b"fcus1 2049 \n",
-                b"fcus1  1 2\n",
+                b"fcus2 x",
+                b"fcus2 2049\n",
+                b"fcus2 2049 1 2 \n",
+                b"fcus2  1 2 3 4\n",
+                b"fcus2 1 2 3 4 5\n",
+                b"fcus2 1 2 3 4\nx",
                 b"fcus1 1 2 3\n",
-                b"fcus1 1 2\nx",
+                b"fcus3 1 2 3 4\n",
             ] {
                 assert!(!is_record_fragment(ng), "{ng:?}");
             }
@@ -896,7 +946,8 @@ mod imp {
             let name = std::ffi::CString::new("a.sock").unwrap();
             let ident = crate::sys::lstat_at(&dir, &name, &sock).unwrap();
             // 改行だけが欠けた（数値は現在の socket と一致する）記録。
-            let torn = format!("fcus1 {} {}", ident.dev, ident.ino);
+            let [dev, ino, sec, nsec] = record_key(&ident).unwrap();
+            let torn = format!("fcus2 {dev} {ino} {sec} {nsec}");
             std::fs::write(t.0.join("a.sock.lock"), &torn).unwrap();
             let lock = acquire_bind_lock(&dir, &name, euid).unwrap();
             let e = clear_stale_socket(&dir, &name, &sock, euid, &lock).unwrap_err();
@@ -916,11 +967,40 @@ mod imp {
             let name = std::ffi::CString::new("a.sock").unwrap();
             let ident = crate::sys::lstat_at(&dir, &name, &sock).unwrap();
             let lock_path = t.0.join("a.sock.lock");
-            std::fs::write(&lock_path, format!("fcus1 {} {}\n", ident.dev, ident.ino)).unwrap();
+            let [dev, ino, sec, nsec] = record_key(&ident).unwrap();
+            std::fs::write(&lock_path, format!("fcus2 {dev} {ino} {sec} {nsec}\n")).unwrap();
             let lock = acquire_bind_lock(&dir, &name, euid).unwrap();
             assert_eq!(clear_stale_socket(&dir, &name, &sock, euid, &lock), Ok(()));
             assert!(std::fs::symlink_metadata(&sock).is_err());
             assert_eq!(std::fs::read(&lock_path).unwrap(), b"");
+        }
+
+        /// PLUG-12: dev / ino が一致しても mtime が違う socket（inode 番号を再利用した別の socket に
+        /// 相当）と、旧形式（mtime なし）の記録は管理下と見なさず、削除しない（TASK-123.2）。
+        #[test]
+        fn plug12_same_inode_number_with_different_mtime_is_not_removed() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = open_dir_for_test(&t.0);
+            let sock = t.0.join("a.sock");
+            let _other = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let name = std::ffi::CString::new("a.sock").unwrap();
+            let ident = crate::sys::lstat_at(&dir, &name, &sock).unwrap();
+            let [dev, ino, sec, nsec] = record_key(&ident).unwrap();
+            let lock_path = t.0.join("a.sock.lock");
+            for stale in [
+                format!("fcus2 {dev} {ino} {} {nsec}\n", sec - 1),
+                format!("fcus2 {dev} {ino} {sec} {}\n", (nsec + 1) % 1_000_000_000),
+                format!("fcus1 {dev} {ino}\n"),
+            ] {
+                std::fs::write(&lock_path, &stale).unwrap();
+                let lock = acquire_bind_lock(&dir, &name, euid).unwrap();
+                let e = clear_stale_socket(&dir, &name, &sock, euid, &lock).unwrap_err();
+                assert_eq!(e.code(), PluginErrorCode::AlreadyExists, "{stale:?}");
+                // 一致しない記録は消え、生存中の別 listener は残って接続できる。
+                assert_eq!(std::fs::read(&lock_path).unwrap(), b"");
+                std::os::unix::net::UnixStream::connect(&sock).unwrap();
+            }
         }
 
         /// PLUG-12: 既存の `.lock` 名が無関係ファイル・ハードリンクなら拒否し、内容を壊さない。

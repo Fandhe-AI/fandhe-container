@@ -139,6 +139,15 @@ mod unix {
         UdsListener::bind(&d.path().join("s.sock")).unwrap();
     }
 
+    /// ロックの記録 `fcus2 <dev> <ino> <mtime 秒> <mtime ナノ秒>\n` から ino を取り出す。
+    fn recorded_ino(record: &str) -> Option<u64> {
+        let mut it = record.strip_suffix('\n')?.split(' ');
+        if it.next()? != "fcus2" {
+            return None;
+        }
+        it.nth(1)?.parse().ok()
+    }
+
     /// 自 UID 所有の stale socket は削除され再 bind できる（TASK-123.2・AC3）。
     #[test]
     fn plug12_rebind_over_own_stale_socket() {
@@ -150,7 +159,7 @@ mod unix {
         let first = UdsListener::bind(&p).unwrap();
         let lock = d.path().join("s.sock.lock");
         let record = std::fs::read(&lock).unwrap();
-        assert!(record.starts_with(b"fcus1 "));
+        assert!(record.starts_with(b"fcus2 "));
         let keep = d.path().join("s.keep");
         std::fs::hard_link(&p, &keep).unwrap(); // 正常終了の unlink から inode を守る
         drop(first); // 記録を消し socket 名を unlink する
@@ -274,7 +283,7 @@ mod unix {
         // クラッシュ後の残骸（記録つきロックと同一 inode の socket）を再現する。
         let first = UdsListener::bind(&p).unwrap();
         let record = std::fs::read(&lock).unwrap();
-        assert!(record.starts_with(b"fcus1 "));
+        assert!(record.starts_with(b"fcus2 "));
         let keep = d.path().join("s.keep");
         std::fs::hard_link(&p, &keep).unwrap();
         drop(first);
@@ -292,7 +301,7 @@ mod unix {
         let l = UdsListener::bind(&p).unwrap();
         let ino = std::fs::symlink_metadata(&p).unwrap().ino();
         let now = std::fs::read_to_string(&lock).unwrap();
-        assert!(now.ends_with(&format!(" {ino}\n")), "{now:?}");
+        assert_eq!(recorded_ino(&now), Some(ino), "{now:?}");
         drop(l);
         // stale socket を削除した直後（再 bind の前）の消去は、公開 API からは観測できないため
         // `uds_security` の単体テスト `plug12_clear_stale_socket_clears_record_after_removal` で照合する。
@@ -310,10 +319,13 @@ mod unix {
         let lock = d.path().join("s.sock.lock");
         let first = UdsListener::bind(&p).unwrap();
         let m = std::fs::symlink_metadata(&p).unwrap();
-        // 記録は `fcus1 <dev> <ino>\n`。dev の符号化は実装依存のため、接頭辞と ino（具体値）で照合する。
+        // dev の符号化は実装依存のため、接頭辞と ino・mtime（具体値）で照合する。
         let record = std::fs::read_to_string(&lock).unwrap();
-        assert!(record.starts_with("fcus1 "), "{record:?}");
-        assert!(record.ends_with(&format!(" {}\n", m.ino())), "{record:?}");
+        assert_eq!(recorded_ino(&record), Some(m.ino()), "{record:?}");
+        assert!(
+            record.ends_with(&format!(" {} {}\n", m.mtime(), m.mtime_nsec())),
+            "{record:?}"
+        );
         // ディレクトリを書き込み不可にして unlink を失敗させる（root は権限検査を受けないため対象外）。
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
         let unlink_blocked = std::fs::remove_file(&p).is_err();

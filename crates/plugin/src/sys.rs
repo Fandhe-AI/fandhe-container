@@ -152,6 +152,11 @@ pub(crate) struct FileIdent {
     pub is_socket: bool,
     /// symlink 本体か（`lstat` 相当で取得するため、リンク先ではなくリンク自体の種別。PLUG-12）。
     pub is_symlink: bool,
+    /// 最終更新時刻（秒・ナノ秒）。socket では作成（bind）時に決まり、chmod・rename・hard link では
+    /// 変わらない。inode 番号が再利用された別の socket を dev / ino の一致だけで同一と見なさないための
+    /// 同一性の一部（PLUG-12・TASK-123.2）。
+    pub mtime_sec: i64,
+    pub mtime_nsec: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -171,7 +176,8 @@ mod statx_abi {
         pub size: u64,
         pub blocks: u64,
         pub attributes_mask: u64,
-        pub timestamps: [u64; 8],
+        /// `stx_atime`・`stx_btime`・`stx_ctime`・`stx_mtime` の順（各 16 バイト）。
+        pub timestamps: [StatxTimestamp; 4],
         pub rdev_major: u32,
         pub rdev_minor: u32,
         pub dev_major: u32,
@@ -180,8 +186,22 @@ mod statx_abi {
     }
     const _: () = assert!(core::mem::size_of::<Statx>() == 256);
 
-    /// `STATX_TYPE | STATX_MODE | STATX_UID | STATX_INO`。
-    pub(super) const REQUIRED_MASK: u32 = 0x1 | 0x2 | 0x8 | 0x100;
+    /// `struct statx_timestamp` と同じレイアウト（16 バイト）。
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct StatxTimestamp {
+        pub sec: i64,
+        pub nsec: u32,
+        pub reserved: i32,
+    }
+    const _: () = assert!(core::mem::size_of::<StatxTimestamp>() == 16);
+    const _: () = assert!(core::mem::offset_of!(Statx, timestamps) == 64);
+
+    /// `timestamps` 内の `stx_mtime` の位置。
+    pub(super) const MTIME_INDEX: usize = 3;
+
+    /// `STATX_TYPE | STATX_MODE | STATX_UID | STATX_MTIME | STATX_INO`。
+    pub(super) const REQUIRED_MASK: u32 = 0x1 | 0x2 | 0x8 | 0x40 | 0x100;
 
     unsafe extern "C" {
         // SAFETY（宣言そのものの妥当性）: glibc（2.28 以降）/ musl の
@@ -213,7 +233,11 @@ fn statx_ident(dirfd: i32, name: &CStr, flags: i32) -> io::Result<FileIdent> {
         size: 0,
         blocks: 0,
         attributes_mask: 0,
-        timestamps: [0; 8],
+        timestamps: [statx_abi::StatxTimestamp {
+            sec: 0,
+            nsec: 0,
+            reserved: 0,
+        }; 4],
         rdev_major: 0,
         rdev_minor: 0,
         dev_major: 0,
@@ -237,12 +261,18 @@ fn statx_ident(dirfd: i32, name: &CStr, flags: i32) -> io::Result<FileIdent> {
     if st.mask & statx_abi::REQUIRED_MASK != statx_abi::REQUIRED_MASK {
         return Err(io::Error::from(io::ErrorKind::Unsupported));
     }
+    let mtime = st
+        .timestamps
+        .get(statx_abi::MTIME_INDEX)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?;
     Ok(FileIdent {
         dev: (u64::from(st.dev_major) << 32) | u64::from(st.dev_minor),
         ino: st.ino,
         uid: st.uid,
         is_socket: u32::from(st.mode) & 0o170000 == 0o140000,
         is_symlink: u32::from(st.mode) & 0o170000 == 0o120000,
+        mtime_sec: mtime.sec,
+        mtime_nsec: mtime.nsec,
     })
 }
 
@@ -273,6 +303,9 @@ pub(crate) fn lstat_at(
             uid: m.uid(),
             is_socket: m.file_type().is_socket(),
             is_symlink: m.file_type().is_symlink(),
+            mtime_sec: m.mtime(),
+            mtime_nsec: u32::try_from(m.mtime_nsec())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?,
         })
     }
 }

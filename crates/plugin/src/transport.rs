@@ -183,6 +183,7 @@ impl UdsListener {
             .map(|inner| UdsStream {
                 inner,
                 poisoned: false,
+                io_timeout_unrestored: false,
             })
     }
 
@@ -210,6 +211,7 @@ impl UdsListener {
             .map(|inner| UdsStream {
                 inner,
                 poisoned: false,
+                io_timeout_unrestored: false,
             })
     }
 
@@ -239,6 +241,10 @@ pub struct UdsStream {
     inner: imp::StreamInner,
     /// フレーム I/O が失敗した接続はフレーム境界がずれうるため以後使用不可にする（fail-closed）。
     poisoned: bool,
+    /// 相手切断により socket の既定期限を復元できなかった接続。生の read / write は想定外の期限で
+    /// 待ちうるため拒否する（REPAIR-5）。フレーム I/O は操作ごとに自前の期限を掛け直すため
+    /// 続行でき、相手が切断前に送り終えたフレームを受信バッファから読める。
+    io_timeout_unrestored: bool,
 }
 
 impl UdsStream {
@@ -259,6 +265,7 @@ impl UdsStream {
         imp::StreamInner::connect(path, timeout).map(|inner| Self {
             inner,
             poisoned: false,
+            io_timeout_unrestored: false,
         })
     }
 
@@ -274,6 +281,8 @@ impl UdsStream {
     /// （`InvalidArgument`・`DataLoss`）。失敗した接続は以後使用不可（`Unavailable`）になるため、
     /// 呼び出し側は再接続する（`crates/io` の `FrameSender` と同じ契約）。
     /// 呼び出し前の read / write 期限（[`UDS_DEFAULT_IO_TIMEOUT`] 等）は呼び出し後に復元する。
+    /// 相手切断で復元できなかった場合、以後の生 read / write は拒否するが、フレーム I/O は続行できる
+    /// （切断前に相手が送り終えたフレームは読める。読み切った後は `Unavailable`）。
     pub fn read_frame(&mut self, timeout: RpcTimeout) -> Result<Frame, PluginError> {
         if self.poisoned {
             return Err(poisoned_error());
@@ -292,29 +301,50 @@ impl UdsStream {
         self.finish_frame_op(result, restored)
     }
 
-    /// フレーム操作の後始末。失敗、または socket 期限を復元できたと確認できなかった場合は接続を
-    /// 使用不可にする（REPAIR-5）。復元失敗（`Failed`）は Ok の結果を握りつぶさずエラーとして返す。
-    /// `PeerClosed`（EINVAL。相手切断済みで復元不能）は操作結果を尊重しつつ接続は使用不可にする。
+    /// フレーム操作の後始末（REPAIR-5）。
+    ///
+    /// - 操作の失敗、または復元失敗（`Failed`）は接続を全面的に使用不可にする。`Failed` は Ok の
+    ///   結果を握りつぶさずエラーとして返す。
+    /// - `PeerClosed`（EINVAL。相手切断済みで復元不能）は操作結果を尊重し、生 I/O だけを拒否する。
+    ///   フレーム I/O は拒否しない。要求の送信直後に相手が応答を書いて切断した場合、応答は受信
+    ///   バッファに残っており、続く `read_frame` で読める必要があるため（都度起動モード。PLUG-7）。
+    ///   フレーム I/O は操作ごとに自前の期限を掛け直し、期限を設定できない socket では
+    ///   non-blocking で 1 回だけ試すので、既定期限が未復元でも無期限には待たない。
+    /// - 既に `PeerClosed` を観測した接続では、以後の復元結果を問わない（切断済み socket では期限の
+    ///   保存・復元がどちらも失敗し得る。生 I/O は拒否済みで、復元すべき期限の利用者がいない）。
     fn finish_frame_op<T>(
         &mut self,
         result: Result<T, PluginError>,
         restored: TimeoutRestore,
     ) -> Result<T, PluginError> {
-        if result.is_err() || restored != TimeoutRestore::Restored {
+        if result.is_err() {
             self.poisoned = true;
         }
-        match result {
-            Ok(_) if restored == TimeoutRestore::Failed => Err(PluginError::new(
-                PluginErrorCode::Internal,
-                "failed to restore io timeout",
-            )),
-            other => other,
+        if self.io_timeout_unrestored {
+            return result;
+        }
+        match restored {
+            TimeoutRestore::Restored => result,
+            TimeoutRestore::PeerClosed => {
+                self.io_timeout_unrestored = true;
+                result
+            }
+            TimeoutRestore::Failed => {
+                self.poisoned = true;
+                result.and_then(|_| {
+                    Err(PluginError::new(
+                        PluginErrorCode::Internal,
+                        "failed to restore io timeout",
+                    ))
+                })
+            }
         }
     }
 
-    /// 失敗後の接続への生 I/O を拒否する（フレーム I/O と同じ「失敗後は使用不可」契約）。
+    /// 失敗後、または既定期限を復元できなかった接続への生 I/O を拒否する（フレーム I/O と同じ
+    /// 「失敗後は使用不可」契約。期限未復元の socket で生 I/O を待たせない。REPAIR-5）。
     fn check_raw_io(&self) -> io::Result<()> {
-        if self.poisoned {
+        if self.poisoned || self.io_timeout_unrestored {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "connection is unusable after a previous frame error",
@@ -344,13 +374,15 @@ impl Write for UdsStream {
 }
 
 /// フレーム操作後の socket 期限の復元結果（REPAIR-5）。
+///
+/// 構築するのは unix 実装（`restore_timeouts`）のみ。他 OS では UDS が未実装で接続を作れず、
+/// どの値も構築されないため、非 unix に限り未使用の警告を抑止する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
 enum TimeoutRestore {
     /// 元の期限へ戻せた。
     Restored,
-    /// 相手切断で復元できなかった（EINVAL）。接続は使用不可にする。
-    /// 構築は unix 実装（`restore_timeouts`）のみ。他 OS では UDS が未実装のため構築されない。
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// 相手切断で復元できなかった（EINVAL）。生 I/O を拒否する（フレーム I/O は続行できる）。
     PeerClosed,
     /// 復元に失敗した、または元の期限を保存できなかった。
     Failed,
@@ -737,6 +769,12 @@ mod imp {
     }
 
     impl StreamInner {
+        /// テスト用: 接続済みの `UnixStream` をそのまま包む（peer credential 検証なし）。
+        #[cfg(test)]
+        pub(super) fn from_std(stream: UnixStream) -> Self {
+            Self { stream }
+        }
+
         /// 期限付き connect → server の peer UID 照合 → blocking 化 → 既定 I/O 期限の付与。
         pub(super) fn connect(path: &Path, timeout: Duration) -> Result<Self, PluginError> {
             check_sun_path_len(path)?;
@@ -1054,6 +1092,81 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 相手側の生 socket と、検証を経ずに包んだ `UdsStream` の対を作る。
+    #[cfg(unix)]
+    fn stream_pair() -> (UdsStream, std::os::unix::net::UnixStream) {
+        let (ours, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let stream = UdsStream {
+            inner: imp::StreamInner::from_std(ours),
+            poisoned: false,
+            io_timeout_unrestored: false,
+        };
+        (stream, peer)
+    }
+
+    /// PLUG-7・PLUG-2・REPAIR-5: 送信直後に相手が応答を書いて切断し、期限を復元できなかった
+    /// （`PeerClosed`）場合でも、受信バッファの応答フレームは読める。生 I/O は拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_peer_closed_after_write_still_reads_buffered_frame() {
+        let (mut stream, mut peer) = stream_pair();
+        let response = Frame::new(b"pong".to_vec()).unwrap();
+        peer.write_all(&response.encode()).unwrap();
+        drop(peer);
+
+        // write_frame が成功し、期限の復元だけが相手切断で失敗した状態。
+        let written = stream.finish_frame_op(Ok(()), TimeoutRestore::PeerClosed);
+        assert_eq!(written, Ok(()));
+        assert!(!stream.poisoned);
+        assert!(stream.io_timeout_unrestored);
+
+        let mut raw = [0u8; 1];
+        let e = stream.read(&mut raw).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotConnected);
+        let e = stream.write(b"x").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotConnected);
+
+        let timeout = RpcTimeout::new(Duration::from_secs(5)).unwrap();
+        let got = stream.read_frame(timeout).unwrap();
+        assert_eq!(got.payload(), b"pong");
+        // 読み切った後は相手切断として失敗し、以後は全面的に使用不可。
+        let e = stream.read_frame(timeout).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Unavailable);
+        assert!(stream.poisoned);
+    }
+
+    /// REPAIR-5: `PeerClosed` を観測済みの接続では、以後の復元失敗で成功した操作を失敗に変えない。
+    /// 未観測の接続での復元失敗（`Failed`）は従来どおり全面的に使用不可にしてエラーを返す。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_restore_failure_handling_depends_on_peer_closed_state() {
+        let (mut stream, _peer) = stream_pair();
+        let e = stream
+            .finish_frame_op(Ok(()), TimeoutRestore::Failed)
+            .unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Internal);
+        assert_eq!(e.message(), "failed to restore io timeout");
+        assert!(stream.poisoned);
+
+        let (mut stream, _peer) = stream_pair();
+        assert_eq!(
+            stream.finish_frame_op(Ok(1u8), TimeoutRestore::PeerClosed),
+            Ok(1u8)
+        );
+        assert_eq!(
+            stream.finish_frame_op(Ok(2u8), TimeoutRestore::Failed),
+            Ok(2u8)
+        );
+        assert!(!stream.poisoned);
+        let failed: Result<u8, PluginError> = Err(poisoned_error());
+        assert!(
+            stream
+                .finish_frame_op(failed, TimeoutRestore::Restored)
+                .is_err()
+        );
+        assert!(stream.poisoned);
+    }
 
     /// PLUG-2: bind の ErrorKind 写像（具体値で照合）。
     #[test]

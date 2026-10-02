@@ -18,7 +18,7 @@ fn repair5_frame_io_requires_unix_transport() {
 #[cfg(unix)]
 mod unix {
     use fandhe_container_plugin::{
-        ControlMessage, Frame, MessageId, PluginErrorCode, RpcTimeout, UdsListener, UdsStream,
+        ControlMessage, MessageId, PluginErrorCode, RpcTimeout, UdsListener, UdsStream,
         decode_message, encode_message,
     };
     use std::io::Write;
@@ -153,7 +153,7 @@ mod unix {
     fn repair5_write_frame_times_out_when_peer_does_not_read() {
         let dir = TempDir::new();
         let (_l, mut client, _server) = pair(&dir);
-        let frame = Frame::new(vec![0xAB; 8 * 1024 * 1024]).unwrap();
+        let frame = fandhe_container_plugin::Frame::new(vec![0xAB; 8 * 1024 * 1024]).unwrap();
         let start = Instant::now();
         let e = client.write_frame(&frame, rpc(300)).unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Timeout);

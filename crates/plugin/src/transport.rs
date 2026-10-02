@@ -745,9 +745,10 @@ mod imp {
             let mut filled = 0usize;
             while filled < buf.len() {
                 let remaining = remaining_until(deadline, FrameOp::Read)?;
-                self.stream
-                    .set_read_timeout(Some(remaining))
-                    .map_err(|_| internal_read())?;
+                // macOS は peer close 後の UDS で set_read_timeout が EINVAL を返す。設定失敗は
+                // 致命扱いにせず読み取りを続ける（切断済みなら read は即座に残りバイトか EOF を返し、
+                // EOF は Unavailable に写像される。PLUG-2・REPAIR-5）。
+                let _ = self.stream.set_read_timeout(Some(remaining));
                 let slice = buf.get_mut(filled..).ok_or_else(internal_read)?;
                 match self.stream.read(slice) {
                     Ok(0) => {
@@ -772,9 +773,9 @@ mod imp {
             let mut sent = 0usize;
             while sent < bytes.len() {
                 let remaining = remaining_until(deadline, FrameOp::Write)?;
-                self.stream
-                    .set_write_timeout(Some(remaining))
-                    .map_err(|_| internal_write())?;
+                // 読み取り側と同様、macOS の peer close 後 EINVAL は無視して write に進む
+                // （切断済みなら EPIPE 等が Unavailable に写像される）。
+                let _ = self.stream.set_write_timeout(Some(remaining));
                 let slice = bytes.get(sent..).ok_or_else(internal_write)?;
                 match self.stream.write(slice) {
                     Ok(0) => {

@@ -12,7 +12,12 @@
 //!   `PermissionDenied` を返す。chmod・chown・削除での自動修復はしない（fail-closed）。
 //! - 基底ディレクトリも同様に検証する。自 UID 所有の非 symlink ディレクトリで group / other に
 //!   書き込み権が無い（`mode & 0o022 == 0`）ことを要求し、満たさなければ `PermissionDenied`。
-//!   基底より上位の祖先は信頼する（全祖先の走査は未実装）。
+//!   基底は末尾 `/` を除いた正規化パスで lstat し（末尾 `/` による symlink 追従を防ぐ）、
+//!   symlink なら拒否する。さらに基底を `canonicalize` した実パスの全祖先を検証する。祖先は
+//!   実ディレクトリで、所有者が root または自 UID、group / other 書き込み不可（または sticky）で
+//!   なければならず、満たさなければ `PermissionDenied`。以降の操作は検証済みの実パスで行う
+//!   （祖先の symlink 差し替えによる配置先のすり替えを防ぐ。fd 基準の `openat` 化は未実装で、
+//!   検証後に信頼済み祖先が root / 自 UID により改変される競合のみ残る）。
 //! - 判定は `symlink_metadata`（symlink を辿らない）の結果で行う。
 //! - 作成は非再帰で、基底ディレクトリ（`XDG_RUNTIME_DIR` 自体）は作らない。
 //! - エラーメッセージは固定の英語文字列で、パス・環境変数値を含めない。
@@ -103,7 +108,7 @@ mod imp {
     use std::fs::{DirBuilder, Metadata};
     use std::io;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     pub(super) fn from_env() -> Result<RuntimeDir, PluginError> {
         let base = runtime_dir_base(std::env::var_os("XDG_RUNTIME_DIR"))?;
@@ -155,8 +160,7 @@ mod imp {
 
     /// 基底ディレクトリの検証（symlink 非追従）。自 UID 所有の実ディレクトリで、group / other に
     /// 書き込み権が無いこと（`mode & 0o022 == 0`）を要求する。`/run/user/<uid>`（0700）は通り、
-    /// 共有書き込み可能な `/tmp` 等（sticky でも）は拒否する。基底より上位の祖先は
-    /// 信頼する（システム管理下の root 所有パス前提。祖先の全走査は未実装）。
+    /// 共有書き込み可能な `/tmp` 等（sticky でも）は拒否する。祖先は [`verify_ancestor`] で別途検証する。
     fn verify_base(meta: &Metadata, euid: u32) -> Result<(), PluginError> {
         let deny = |m: &str| PluginError::new(PluginErrorCode::PermissionDenied, m);
         if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -175,14 +179,54 @@ mod imp {
         Ok(())
     }
 
+    /// 基底の祖先ディレクトリの検証（実パス上の各要素。PLUG-12）。実ディレクトリで、所有者が
+    /// root または自 UID、かつ group / other に書き込み権が無い（sticky bit 付きは許容。`/tmp` 等）こと。
+    fn verify_ancestor(meta: &Metadata, euid: u32) -> Result<(), PluginError> {
+        let deny = |m: &str| PluginError::new(PluginErrorCode::PermissionDenied, m);
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(deny("runtime directory ancestor is not a plain directory"));
+        }
+        if meta.uid() != 0 && meta.uid() != euid {
+            return Err(deny("runtime directory ancestor has an untrusted owner"));
+        }
+        if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
+            return Err(deny(
+                "runtime directory ancestor must not be writable by group or other",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 基底を symlink 非追従で検証し、全祖先を検証済みの実パス（canonical）を返す。
+    fn resolve_base(base: &Path, euid: u32) -> Result<PathBuf, PluginError> {
+        // 末尾 `/` は lstat が最終要素の symlink を辿る原因になるため、components で正規化して除く。
+        let normalized: PathBuf = base.components().collect();
+        let base_meta = std::fs::symlink_metadata(&normalized).map_err(|e| map_io(&e))?;
+        verify_base(&base_meta, euid)?;
+        // 基底が実ディレクトリと確定した後の canonicalize は祖先 symlink のみを解決する。
+        let real = std::fs::canonicalize(&normalized).map_err(|e| map_io(&e))?;
+        let mut cur = PathBuf::new();
+        let mut comps = real.components().peekable();
+        while let Some(c) = comps.next() {
+            cur.push(c);
+            if comps.peek().is_none() {
+                break; // 最終要素（基底自身）は verify_base で検証済みなので、実パス側で再検証のみ行う
+            }
+            let m = std::fs::symlink_metadata(&cur).map_err(|e| map_io(&e))?;
+            verify_ancestor(&m, euid)?;
+        }
+        let real_meta = std::fs::symlink_metadata(&real).map_err(|e| map_io(&e))?;
+        verify_base(&real_meta, euid)?;
+        Ok(real)
+    }
+
     /// `base/fandhe-container` を解決し、無ければ 0700 で作成して検証する。
     pub(super) fn ensure_dir(base: &Path, euid: u32) -> Result<RuntimeDir, PluginError> {
         validate_base(base)?;
-        // 基底自体を先に検証する。他ユーザーが書ける・symlink の基底では、検証済みの子を
-        // 後から rename・差し替えられ配置パスの安全性が失われるため（PLUG-12）。
-        let base_meta = std::fs::symlink_metadata(base).map_err(|e| map_io(&e))?;
-        verify_base(&base_meta, euid)?;
-        let dir = base.join(RUNTIME_DIR_NAME);
+        // 基底自体と全祖先を先に検証する。他ユーザーが書ける・symlink の基底や祖先では、
+        // 検証済みの子を後から rename・差し替えられ配置パスの安全性が失われるため（PLUG-12）。
+        let real_base = resolve_base(base, euid)?;
+        let dir = real_base.join(RUNTIME_DIR_NAME);
         match std::fs::symlink_metadata(&dir) {
             Ok(meta) => verify(&meta, euid)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -281,6 +325,39 @@ mod imp {
             std::os::unix::fs::symlink(&t.0, &link).unwrap();
             let err = ensure_dir(&link, euid).unwrap_err();
             assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+        }
+
+        /// PLUG-12: 末尾 `/` 付きの symlink 基底も拒否する（lstat が symlink を辿らない）。
+        #[test]
+        fn plug12_rejects_symlink_base_with_trailing_slash() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let target = t.0.join("real");
+            DirBuilder::new().mode(0o700).create(&target).unwrap();
+            let link = t.0.join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let mut with_slash = link.into_os_string();
+            with_slash.push("/");
+            let err = ensure_dir(Path::new(&with_slash), euid).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+            assert!(!target.join(RUNTIME_DIR_NAME).exists());
+        }
+
+        /// PLUG-12: 祖先が group / other 書き込み可（非 sticky）なら、基底が安全でも拒否する。
+        #[test]
+        fn plug12_rejects_writable_ancestor() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let mid = t.0.join("mid");
+            let base = mid.join("base");
+            DirBuilder::new().mode(0o700).create(&mid).unwrap();
+            DirBuilder::new().mode(0o700).create(&base).unwrap();
+            std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let err = ensure_dir(&base, euid).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+            assert!(!base.join(RUNTIME_DIR_NAME).exists());
+            std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(ensure_dir(&base, euid).is_ok());
         }
 
         #[test]

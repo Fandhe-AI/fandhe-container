@@ -22,8 +22,9 @@ fn plug7_one_shot_requires_unix_transport() {
 #[cfg(unix)]
 mod unix {
     use fandhe_container_plugin::{
-        Frame, OneShotPlugin, OneShotTermination, OneShotTimeout, PLUGIN_SOCKET_ENV, PluginError,
-        PluginErrorCode, RpcTimeout, UdsStream, call_once,
+        Frame, ONE_SHOT_STDERR_MAX_BYTES, OneShotPlugin, OneShotRecord, OneShotTermination,
+        OneShotTimeout, PLUGIN_SOCKET_ENV, PluginError, PluginErrorCode, RpcTimeout, UdsStream,
+        call_once, call_once_observed,
     };
     use std::ffi::OsString;
     use std::os::unix::fs::DirBuilderExt;
@@ -66,6 +67,17 @@ mod unix {
         }
     }
 
+    /// stderr 大量出力ケースで子が書くバイト数（1 MiB。Linux・macOS の pipe バッファより大きい）。
+    const FLOOD_BYTES: usize = 1024 * 1024;
+
+    /// 子の stderr へ直接書く（`eprint!` は libtest の出力捕捉に入るため使わない）。
+    fn write_stderr(bytes: &[u8]) {
+        use std::io::Write;
+        let mut err = std::io::stderr().lock();
+        err.write_all(bytes).unwrap();
+        err.flush().unwrap();
+    }
+
     fn rpc(ms: u64) -> RpcTimeout {
         RpcTimeout::new(Duration::from_millis(ms)).unwrap()
     }
@@ -80,8 +92,16 @@ mod unix {
         let behavior = std::fs::read_to_string(sock.parent().unwrap().join("behavior")).unwrap();
         match behavior.as_str() {
             "exit_early" => {}
+            "stderr_exit_early" => write_stderr(b"boom: cannot start\n"),
             "silent_no_connect" => std::thread::sleep(Duration::from_secs(60)),
             mode => {
+                // 接続前に書く。親が stderr を読み続けていなければ pipe が埋まって子はここで止まる。
+                if mode == "stderr_flood" {
+                    write_stderr(&vec![b'x'; FLOOD_BYTES]);
+                }
+                if mode == "stderr_small" {
+                    write_stderr(b"plugin-diagnostic\n");
+                }
                 let mut s = UdsStream::connect(&sock, Duration::from_secs(5)).unwrap();
                 if mode == "silent_after_connect" {
                     std::thread::sleep(Duration::from_secs(60));
@@ -216,6 +236,83 @@ mod unix {
         let (res, _, _dir) = run("exit_nonzero", 5000);
         let e = res.unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Unavailable);
+    }
+
+    /// plugin の stderr は親へ流さず、上限以内ならそのまま収集結果として返る（PLUG-7）。
+    #[test]
+    fn plug7_one_shot_captures_plugin_stderr() {
+        let (res, _, _dir) = run("stderr_small", 5000);
+        let out = res.unwrap();
+        assert_eq!(out.stderr().bytes(), b"plugin-diagnostic\n");
+        assert_eq!(out.stderr().total_bytes(), 18);
+        assert!(!out.stderr().is_truncated());
+        assert!(out.stderr().is_complete());
+    }
+
+    /// stderr を出さない plugin では収集結果が空になる。
+    #[test]
+    fn plug7_one_shot_reports_empty_stderr_for_quiet_plugin() {
+        let (res, _, _dir) = run("respond", 5000);
+        let out = res.unwrap();
+        assert_eq!(out.stderr().bytes(), b"");
+        assert_eq!(out.stderr().total_bytes(), 0);
+        assert!(!out.stderr().is_truncated());
+        assert!(out.stderr().is_complete());
+    }
+
+    /// pipe バッファを超える stderr を書く plugin でも詰まらず応答でき、保持は上限までに留まる
+    /// （REPAIR-5・PLUG-7。親が読み続けていなければ子は接続前に止まり、合計期限で Timeout になる）。
+    #[test]
+    fn plug7_one_shot_bounds_flooding_plugin_stderr() {
+        let (res, elapsed, _dir) = run("stderr_flood", 8000);
+        let out = res.unwrap();
+        assert_eq!(
+            out.termination(),
+            OneShotTermination::Exited { code: Some(0) }
+        );
+        assert_eq!(ONE_SHOT_STDERR_MAX_BYTES, 65_536);
+        assert_eq!(out.stderr().bytes().len(), 65_536);
+        assert_eq!(
+            out.stderr().bytes().iter().filter(|b| **b == b'x').count(),
+            65_536
+        );
+        assert_eq!(out.stderr().total_bytes(), 1_048_576);
+        assert!(out.stderr().is_truncated());
+        assert!(out.stderr().is_complete());
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+    }
+
+    /// 失敗時も stderr は観測記録で受け取れ、構造化ログの行には内容が入らない（REPAIR-4・PLUG-7）。
+    #[test]
+    fn repair4_one_shot_failure_record_carries_stderr_without_logging_it() {
+        let dir = TempDir::new("stderr_exit_early");
+        let plugin = plugin_for(&dir);
+        let (res, records) = with_watchdog("call_once_observed", move || {
+            let req = Frame::new(b"ping".to_vec()).unwrap();
+            let mut records: Vec<OneShotRecord> = Vec::new();
+            let r = call_once_observed(
+                &plugin,
+                &req,
+                OneShotTimeout::new(Duration::from_millis(8000)).unwrap(),
+                &mut |rec| records.push(rec.clone()),
+            );
+            (r, records)
+        });
+        assert_eq!(res.unwrap_err().code(), PluginErrorCode::Unavailable);
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+        assert_eq!(rec.error_code, Some("UNAVAILABLE"));
+        assert_eq!(rec.stderr.bytes(), b"boom: cannot start\n");
+        assert!(rec.stderr.is_complete());
+        let line = rec.to_json_line();
+        assert!(!line.contains("boom"), "{line}");
+        assert!(
+            line.ends_with(
+                ",\"plugin_stderr_bytes\":19,\"plugin_stderr_truncated\":false,\
+                 \"plugin_stderr_complete\":true}"
+            ),
+            "{line}"
+        );
     }
 
     /// 存在しない絶対パスは NotFound。

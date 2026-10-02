@@ -13,24 +13,29 @@
 //! - [`call_once`] が戻った（`Ok` / `Err` いずれの）時点で、直接起動した子プロセスは kill または
 //!   wait で回収済み。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
-//!   stdin / stdout は null、stderr は継承する。
+//!   stdin / stdout は null。stderr は親へ継承させず、専用の pipe で受けて [`OneShotStderr`] として
+//!   返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は読み捨てて件数だけ数える）。
+//!   親の stderr・構造化ログへ内容を転記しない（量の上限なしの出力・ログ行の偽装を防ぐ）。
 //!
 //! # 未実装（REPAIR-3）
 //!
 //! - 常駐モード（TASK-110.2）・モード選択 API（TASK-110.3）。
 //! - 起動対象の信頼性検証（所有者・モード・sha256 照合。TASK-122・PLUG-11）。本 API は検証を
 //!   行わず、呼び出し側が検証済みの絶対パスを渡すことを前提とする。
-//! - 孫プロセスの回収（プロセスグループ単位の kill は未対応）。
+//! - 孫プロセスの回収（プロセスグループ単位の kill は未対応）。孫が stderr の pipe を保持し続けた
+//!   場合、収集は [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`] で打ち切り、[`OneShotStderr::is_complete`] が
+//!   false になる（読み取りスレッドは pipe が閉じるまで読み捨てを続ける）。
 //! - 要求 ID と応答 ID の対応づけ（TASK-114）。
 
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
 use crate::transport::{RpcTimeout, UdsListener};
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 /// 子へ接続先 socket の絶対パスを渡す環境変数名。
@@ -56,6 +61,14 @@ const POLL_MAX: Duration = Duration::from_millis(5);
 
 /// 強制終了後の回収（`try_wait` ポーリング）を待つ上限（REPAIR-5。無期限の `wait` を避ける）。
 pub const ONE_SHOT_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// plugin の stderr として保持するバイト数の上限（64 KiB。超過分は読み捨てる。無制限確保の防止）。
+pub const ONE_SHOT_STDERR_MAX_BYTES: usize = 64 * 1024;
+
+/// 子の回収後に stderr の読み取り完了（EOF）を待つ上限（REPAIR-5。合計期限とは別枠）。
+/// 子が終了していれば pipe は閉じており即座に完了する。孫プロセスが pipe を保持している場合のみ
+/// この期限まで待ち、打ち切る。
+pub const ONE_SHOT_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// spawn から応答受信までの合計期限（REPAIR-5）。0 と [`ONE_SHOT_TIMEOUT_MAX`] 超は構築できない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -151,12 +164,128 @@ pub enum OneShotTermination {
     Unreaped,
 }
 
+/// plugin が stderr へ書いた内容の収集結果（untrusted。出所は起動した plugin プロセス）。
+///
+/// 内容は plugin が任意に書けるバイト列であり、解釈・検証はしていない。呼び出し側がログへ出す
+/// 場合は、plugin 由来であることを明示し、エスケープしたうえで扱うこと（構造化ログの行を偽装
+/// され得るため、そのまま自プロセスの stderr・ログへ流さない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneShotStderr {
+    bytes: Vec<u8>,
+    total_bytes: u64,
+    complete: bool,
+}
+
+impl OneShotStderr {
+    /// 何も収集していない完了済みの結果（子を spawn しなかった経路用）。
+    fn empty() -> Self {
+        Self {
+            bytes: Vec::new(),
+            total_bytes: 0,
+            complete: true,
+        }
+    }
+
+    /// 保持している先頭部分（最大 [`ONE_SHOT_STDERR_MAX_BYTES`] バイト）。
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// 収集を打ち切るまでに plugin が書いた総バイト数（読み捨てた分を含む）。
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// 上限超過で読み捨てた部分があるか。
+    pub fn is_truncated(&self) -> bool {
+        u64::try_from(self.bytes.len()).map_or(true, |kept| self.total_bytes > kept)
+    }
+
+    /// pipe の終端（EOF）まで読み切ったか。false は [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`] で打ち切った
+    /// ことを表す（孫プロセスが pipe を保持している等）。
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+}
+
+/// 子の stderr を専用スレッドで読み、上限つきで保持する収集器（REPAIR-5）。
+///
+/// 読み取りは子の spawn 直後から別スレッドで行う。親（呼び出しスレッド）は接続待ち・往復・回収の
+/// 間に pipe を読まないため、子が pipe バッファを超えて書いても子は詰まらず、親も読み取りで
+/// ブロックしない。結果の受け取り（[`Self::finish`]）は期限つきで、スレッドの `join` は行わない。
+/// 常駐モード（TASK-110.2）でも同じ収集器を使える形にしている。
+struct StderrCapture {
+    state: Arc<Mutex<OneShotStderr>>,
+    done: mpsc::Receiver<()>,
+}
+
+impl StderrCapture {
+    /// `source` を EOF まで読むスレッドを起動する。起動できなければ `Err`（呼び出し側が子を回収する）。
+    fn start<R: Read + Send + 'static>(source: R) -> io::Result<Self> {
+        let state = Arc::new(Mutex::new(OneShotStderr {
+            bytes: Vec::new(),
+            total_bytes: 0,
+            complete: false,
+        }));
+        let (tx, done) = mpsc::channel();
+        let shared = Arc::clone(&state);
+        std::thread::Builder::new()
+            .name("plugin-stderr".to_string())
+            .spawn(move || {
+                drain_stderr(source, &shared);
+                // 受け手が期限切れで去っていても構わない。
+                let _ = tx.send(());
+            })?;
+        Ok(Self { state, done })
+    }
+
+    /// 読み取り完了を `limit` まで待ち、その時点までの収集結果を返す。期限内に EOF へ達しなければ
+    /// `is_complete() == false` の途中結果を返す（スレッドは pipe が閉じるまで読み捨てを続け、
+    /// 保持量は上限のまま増えない）。
+    fn finish(self, limit: Duration) -> OneShotStderr {
+        // タイムアウト・送信側の消滅（スレッドの異常終了）はどちらも途中結果として扱う。
+        let _ = self.done.recv_timeout(limit);
+        lock_stderr(&self.state).clone()
+    }
+}
+
+/// 読み取りスレッドが panic しても収集結果を取り出せるよう、poison を無視して lock する。
+fn lock_stderr(state: &Mutex<OneShotStderr>) -> MutexGuard<'_, OneShotStderr> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `source` を EOF またはエラーまで読み、先頭 [`ONE_SHOT_STDERR_MAX_BYTES`] バイトだけ保持する。
+/// 上限到達後も読み捨てを続ける（読むのを止めると子が書き込みで詰まり、応答・終了が遅れるため）。
+fn drain_stderr<R: Read>(mut source: R, state: &Mutex<OneShotStderr>) {
+    let mut chunk = [0u8; 4096];
+    loop {
+        match source.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut s = lock_stderr(state);
+                let room = ONE_SHOT_STDERR_MAX_BYTES.saturating_sub(s.bytes.len());
+                if let Some(kept) = chunk.get(..n.min(room)) {
+                    s.bytes.extend_from_slice(kept);
+                }
+                s.total_bytes = s
+                    .total_bytes
+                    .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // 読み取りエラーは EOF として扱わない（complete を立てない）。
+            Err(_) => return,
+        }
+    }
+    lock_stderr(state).complete = true;
+}
+
 /// [`call_once`] の成功結果。
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct OneShotOutcome {
     response: Frame,
     termination: OneShotTermination,
+    stderr: OneShotStderr,
 }
 
 impl OneShotOutcome {
@@ -174,6 +303,11 @@ impl OneShotOutcome {
     pub fn termination(&self) -> OneShotTermination {
         self.termination
     }
+
+    /// plugin が stderr へ書いた内容（untrusted・上限つき）。
+    pub fn stderr(&self) -> &OneShotStderr {
+        &self.stderr
+    }
 }
 
 /// 子プロセスを保持し、Drop で必ず kill・回収するガード（全エラー経路で孤児を残さない）。
@@ -182,6 +316,11 @@ struct ChildGuard(Option<Child>);
 impl ChildGuard {
     fn pid(&self) -> Option<u32> {
         self.0.as_ref().map(Child::id)
+    }
+
+    /// 子の stderr（pipe の読み取り側）を取り出す。2 回目以降・回収済みは `None`。
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.0.as_mut().and_then(|c| c.stderr.take())
     }
 
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -353,6 +492,10 @@ fn spawn_error(e: &io::Error) -> PluginError {
 /// 終了しなかった場合は強制終了し、`Ok` と [`OneShotTermination::Killed`] を返す。応答後に非ゼロ・
 /// シグナルで終了した場合は `Unavailable`、回収を確認できない場合は `Internal` を返す。
 /// 非 unix では listener の bind が `Unimplemented` を返し、子は spawn されない。
+///
+/// plugin の stderr は親へ継承させず [`OneShotOutcome::stderr`] で返す。本関数が親の stderr へ出す
+/// 構造化ログには、plugin の stderr の内容は含めず件数のみ載せる。失敗時の内容が必要な呼び出し側は
+/// [`call_once_observed`] の [`OneShotRecord::stderr`] を使う。
 pub fn call_once(
     plugin: &OneShotPlugin,
     request: &Frame,
@@ -379,23 +522,33 @@ pub struct OneShotRecord {
     pub success: bool,
     /// 失敗時の機械可読な `code`（ERR-1）。成功時は `None`。
     pub error_code: Option<&'static str>,
-    /// 開始から戻るまでの所要時間（子の回収待ちを含む）。
+    /// 開始から戻るまでの所要時間（子の回収待ち・stderr の収集待ちを含む）。
     pub elapsed: Duration,
+    /// plugin が stderr へ書いた内容（untrusted・上限つき）。成功・失敗のどちらでも渡す。
+    /// [`Self::to_json_line`] には内容を含めず、件数と打ち切りの有無だけを出す。
+    pub stderr: OneShotStderr,
 }
 
 impl OneShotRecord {
-    /// JSON Lines の 1 行（改行なし）へ符号化する。値はすべて固定文字列・数値のみで、外部入力を含まない。
+    /// JSON Lines の 1 行（改行なし）へ符号化する。値はすべて固定文字列・数値・真偽値のみで、外部入力
+    /// （plugin の stderr の内容を含む）を埋め込まない。stderr は出所を明示したキー
+    /// （`plugin_stderr_*`）で件数と打ち切りの有無だけを出す。
     pub fn to_json_line(&self) -> String {
         let code = match self.error_code {
             Some(c) => format!("\"{c}\""),
             None => "null".to_string(),
         };
         format!(
-            "{{\"op\":\"{}\",\"success\":{},\"error_code\":{},\"elapsed_us\":{}}}",
+            "{{\"op\":\"{}\",\"success\":{},\"error_code\":{},\"elapsed_us\":{},\
+             \"plugin_stderr_bytes\":{},\"plugin_stderr_truncated\":{},\
+             \"plugin_stderr_complete\":{}}}",
             self.operation,
             self.success,
             code,
-            self.elapsed.as_micros()
+            self.elapsed.as_micros(),
+            self.stderr.total_bytes(),
+            self.stderr.is_truncated(),
+            self.stderr.is_complete()
         )
     }
 }
@@ -411,45 +564,106 @@ pub fn call_once_observed(
     observer: &mut dyn FnMut(&OneShotRecord),
 ) -> Result<OneShotOutcome, PluginError> {
     let start = Instant::now();
-    let result = call_once_inner(plugin, request, timeout);
+    let (result, stderr) = call_once_inner(plugin, request, timeout);
     observer(&OneShotRecord {
         operation: "plugin.call_once",
         success: result.is_ok(),
         error_code: result.as_ref().err().map(|e| e.code().as_str()),
         elapsed: start.elapsed(),
+        stderr: stderr.clone(),
     });
-    result
+    result.map(|(response, termination)| OneShotOutcome {
+        response,
+        termination,
+        stderr,
+    })
 }
 
+/// listener の bind・子の spawn・stderr の収集・往復・回収までを行う。戻り値の第 2 要素は、
+/// 成功・失敗のどちらでも子の回収後に確定した stderr の収集結果（spawn 前の失敗は空）。
 fn call_once_inner(
     plugin: &OneShotPlugin,
     request: &Frame,
     timeout: OneShotTimeout,
-) -> Result<OneShotOutcome, PluginError> {
+) -> (
+    Result<(Frame, OneShotTermination), PluginError>,
+    OneShotStderr,
+) {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    let deadline = Instant::now()
-        .checked_add(timeout.as_duration())
-        .ok_or_else(timeout_error)?;
+    let Some(deadline) = Instant::now().checked_add(timeout.as_duration()) else {
+        return (Err(timeout_error()), OneShotStderr::empty());
+    };
 
     let name = format!(
         "oneshot-{}-{}.sock",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    let listener = UdsListener::bind(&plugin.socket_dir.join(name))?;
+    let listener = match UdsListener::bind(&plugin.socket_dir.join(name)) {
+        Ok(l) => l,
+        Err(e) => return (Err(e), OneShotStderr::empty()),
+    };
 
-    let child = Command::new(&plugin.program)
+    // stderr は親へ継承させない（plugin が親の stderr へ任意の量・内容を書けてしまうため）。
+    // `Command` は文の終わりで drop され、親側に pipe の書き込み端は残らない（EOF を妨げない）。
+    let spawned = Command::new(&plugin.program)
         .args(&plugin.args)
         .env_clear()
         .env(PLUGIN_SOCKET_ENV, listener.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| spawn_error(&e))?;
-    let mut guard = ChildGuard(Some(child));
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut guard = match spawned {
+        Ok(child) => ChildGuard(Some(child)),
+        Err(e) => return (Err(spawn_error(&e)), OneShotStderr::empty()),
+    };
 
+    // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。
+    let capture = guard.take_stderr().map(StderrCapture::start);
+    let result = match &capture {
+        Some(Ok(_)) => exchange_and_reap(&mut guard, listener, request, deadline),
+        // 読み取り手がいないまま子を走らせると pipe が埋まって子が詰まるため、往復せず回収する。
+        Some(Err(_)) | None => {
+            drop(listener);
+            Err(reap_after_failure(
+                &mut guard,
+                PluginError::new(
+                    PluginErrorCode::Internal,
+                    "failed to start capturing plugin stderr",
+                ),
+            ))
+        }
+    };
+    // 子の回収後に収集結果を受け取る。子が終了していれば pipe は閉じており即座に完了する。
+    let stderr = match capture {
+        Some(Ok(c)) => c.finish(ONE_SHOT_STDERR_DRAIN_TIMEOUT),
+        Some(Err(_)) | None => OneShotStderr::empty(),
+    };
+    (result, stderr)
+}
+
+/// 応答前の失敗経路で子を明示的に kill・回収する。回収を確認できなければ、元のエラーではなく
+/// 回収失敗（`Internal`）を返す（孤児の可能性を呼び出し側へ伝える。REPAIR-5・PLUG-7）。
+fn reap_after_failure(guard: &mut ChildGuard, error: PluginError) -> PluginError {
+    if guard.kill_and_reap().is_reaped() {
+        error
+    } else {
+        PluginError::new(
+            PluginErrorCode::Internal,
+            "plugin process could not be reaped after a failed exchange",
+        )
+    }
+}
+
+/// 接続の受付・1 往復・子の回収を行う。戻る時点で子は回収済み、または回収失敗をエラーで返している。
+fn exchange_and_reap(
+    guard: &mut ChildGuard,
+    listener: UdsListener,
+    request: &Frame,
+    deadline: Instant,
+) -> Result<(Frame, OneShotTermination), PluginError> {
     // 受付・往復はブロック内で完結させ、抜けた時点で接続を閉じて子に EOF を見せる
     // （続けて listener を drop して socket を unlink してから終了を待つ）。
     let exchange = (|| -> Result<Frame, PluginError> {
@@ -479,37 +693,23 @@ fn call_once_inner(
     // 応答前のエラー経路でも、ここで子を明示的に kill・回収し、回収失敗を呼び出し側へ返す（REPAIR-5・PLUG-7）。
     let response = match exchange {
         Ok(r) => r,
-        Err(e) => {
-            if !guard.kill_and_reap().is_reaped() {
-                return Err(PluginError::new(
-                    PluginErrorCode::Internal,
-                    "plugin process could not be reaped after a failed exchange",
-                ));
-            }
-            return Err(e);
-        }
+        Err(e) => return Err(reap_after_failure(guard, e)),
     };
     let termination = guard.wait_or_kill(ONE_SHOT_EXIT_TIMEOUT);
     // 回収を確認できない子（孤児の可能性）と異常終了（非ゼロ・シグナル）は成功扱いにしない（REPAIR-5・PLUG-7）。
     match termination {
-        OneShotTermination::Unreaped => {
-            return Err(PluginError::new(
-                PluginErrorCode::Internal,
-                "plugin process could not be reaped after the response",
-            ));
+        OneShotTermination::Unreaped => Err(PluginError::new(
+            PluginErrorCode::Internal,
+            "plugin process could not be reaped after the response",
+        )),
+        OneShotTermination::Exited { code: Some(0) } | OneShotTermination::Killed => {
+            Ok((response, termination))
         }
-        OneShotTermination::Exited { code: Some(0) } | OneShotTermination::Killed => {}
-        OneShotTermination::Exited { .. } => {
-            return Err(PluginError::new(
-                PluginErrorCode::Unavailable,
-                "plugin process exited abnormally after the response",
-            ));
-        }
+        OneShotTermination::Exited { .. } => Err(PluginError::new(
+            PluginErrorCode::Unavailable,
+            "plugin process exited abnormally after the response",
+        )),
     }
-    Ok(OneShotOutcome {
-        response,
-        termination,
-    })
 }
 
 #[cfg(test)]
@@ -548,6 +748,8 @@ mod tests {
         assert_eq!(records[0].operation, "plugin.call_once");
         assert!(!records[0].success);
         assert!(records[0].error_code.is_some());
+        // 子を spawn していない経路では stderr の収集結果は空で完了済み。
+        assert_eq!(records[0].stderr, OneShotStderr::empty());
     }
 
     #[test]
@@ -557,10 +759,18 @@ mod tests {
             success: false,
             error_code: Some("TIMEOUT"),
             elapsed: Duration::from_micros(1500),
+            stderr: OneShotStderr {
+                bytes: b"\"}\n{\"op\":\"forged\"}".to_vec(),
+                total_bytes: 70000,
+                complete: false,
+            },
         };
+        // plugin の stderr の内容は行へ埋め込まず、出所を明示したキーで件数だけを出す。
         assert_eq!(
             rec.to_json_line(),
-            "{\"op\":\"plugin.call_once\",\"success\":false,\"error_code\":\"TIMEOUT\",\"elapsed_us\":1500}"
+            "{\"op\":\"plugin.call_once\",\"success\":false,\"error_code\":\"TIMEOUT\",\
+             \"elapsed_us\":1500,\"plugin_stderr_bytes\":70000,\
+             \"plugin_stderr_truncated\":true,\"plugin_stderr_complete\":false}"
         );
     }
 
@@ -640,6 +850,66 @@ mod tests {
             failing.wait_or_kill(Duration::from_secs(5)),
             OneShotTermination::Exited { code: Some(7) }
         );
+    }
+
+    /// 上限を超える stderr は先頭 `ONE_SHOT_STDERR_MAX_BYTES` だけ保持し、総量を数える（REPAIR-5）。
+    #[test]
+    fn plug7_stderr_capture_keeps_only_the_cap() {
+        let mut data = vec![b'a'; ONE_SHOT_STDERR_MAX_BYTES];
+        data.extend_from_slice(&[b'b'; 34_464]);
+        let capture = StderrCapture::start(io::Cursor::new(data)).unwrap();
+        let got = capture.finish(Duration::from_secs(5));
+        assert_eq!(got.bytes().len(), 65_536);
+        assert_eq!(got.bytes().iter().filter(|b| **b == b'a').count(), 65_536);
+        assert_eq!(got.total_bytes(), 100_000);
+        assert!(got.is_truncated());
+        assert!(got.is_complete());
+    }
+
+    /// 上限以内の stderr はそのまま保持する。
+    #[test]
+    fn plug7_stderr_capture_keeps_small_output_verbatim() {
+        let capture = StderrCapture::start(io::Cursor::new(b"warn: x\n".to_vec())).unwrap();
+        let got = capture.finish(Duration::from_secs(5));
+        assert_eq!(got.bytes(), b"warn: x\n");
+        assert_eq!(got.total_bytes(), 8);
+        assert!(!got.is_truncated());
+        assert!(got.is_complete());
+    }
+
+    /// REPAIR-5: 書き込み端が閉じない（孫プロセスが保持する等）場合でも、収集待ちは期限で打ち切る。
+    #[test]
+    fn repair5_stderr_capture_finish_is_bounded_when_source_never_closes() {
+        /// 最初に 3 バイト返し、その後は送信側が drop されるまで読み取りをブロックする入力。
+        struct Stalled(Option<&'static [u8]>, mpsc::Receiver<()>);
+        impl Read for Stalled {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if let Some(first) = self.0.take() {
+                    let n = first.len().min(buf.len());
+                    buf[..n].copy_from_slice(&first[..n]);
+                    return Ok(n);
+                }
+                let _ = self.1.recv();
+                Ok(0)
+            }
+        }
+        let (release, blocked) = mpsc::channel::<()>();
+        let capture = StderrCapture::start(Stalled(Some(b"abc"), blocked)).unwrap();
+        // 先頭の 3 バイトが保持されるまで待つ（最大 5 秒）。
+        let waited = Instant::now();
+        while lock_stderr(&capture.state).total_bytes < 3 {
+            assert!(waited.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let started = Instant::now();
+        let got = capture.finish(Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        assert_eq!(got.bytes(), b"abc");
+        assert_eq!(got.total_bytes(), 3);
+        assert!(!got.is_complete());
+        drop(release);
     }
 
     #[test]

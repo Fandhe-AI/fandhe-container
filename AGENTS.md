@@ -117,7 +117,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | ---- | ---- | ---- | ---- |
 | テスト 1 件の応答待ち（ACK・plugin RPC・子プロセス） | 推奨 5〜10 秒（CI 設定値 10 秒） | `ci.yml` `integration-test` ジョブの env `FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"`（TASK-87.1・#40） | PoC-8 実測・REPAIR-10 (c)・REPAIR-5 |
 | plugin の ACK / RPC 応答待ち（フレーム 1 つ） | 既定 10 秒・上限 10 秒（0 と上限超過は構築不可） | `crates/plugin/src/transport.rs` の `RpcTimeout`（`UDS_RPC_TIMEOUT_DEFAULT`・`UDS_RPC_TIMEOUT_MAX`。TASK-107.6・#250） | REPAIR-5・PLUG-2・PLUG-5 |
-| plugin 都度起動の合計期限（spawn から応答受信まで）・応答後の終了猶予 | 合計期限 既定 10 秒・上限 10 秒（0 と上限超過は構築不可）／終了猶予 5 秒（超過で強制終了） | `crates/plugin/src/lifecycle.rs` の `OneShotTimeout`・`ONE_SHOT_EXIT_TIMEOUT`（TASK-110.1・#258） | REPAIR-5・PLUG-7 |
+| plugin 都度起動の合計期限（spawn から応答受信まで）・応答後の終了猶予・強制終了後の回収待ち・stderr の収集待ち | 合計期限 既定 10 秒・上限 10 秒（0 と上限超過は構築不可）／終了猶予 5 秒（超過で強制終了）／回収待ち 2 秒（超過は回収失敗としてエラー）／stderr の収集待ち 500 ミリ秒（超過は途中結果で打ち切り。保持は 64 KiB まで） | `crates/plugin/src/lifecycle.rs` の `OneShotTimeout`・`ONE_SHOT_EXIT_TIMEOUT`・`ONE_SHOT_REAP_TIMEOUT`・`ONE_SHOT_STDERR_DRAIN_TIMEOUT`・`ONE_SHOT_STDERR_MAX_BYTES`（TASK-110.1・#258） | REPAIR-5・PLUG-7 |
 | 結合試験の実行ステップ | 10 分 | `integration-test` ジョブの実行ステップ `timeout-minutes: 10` | TASK-86.2（#36）・TASK-87 |
 | ジョブ全体 | `integration-test` 30 分・`bench-regression` 15 分・`ci-complete` 5 分 | 各ジョブの `timeout-minutes` | 多層防御 |
 

@@ -292,6 +292,16 @@ mod imp {
         if !dir.is_absolute() {
             return Err(err(PluginTrustErrorKind::InvalidPath));
         }
+        // `Path::components()` は途中・末尾の `.` を黙って正規化するため、正規化前の生バイト列で
+        // `.` 要素を検出して拒否する（契約: `.`・`..` は InvalidPath）。
+        if dir
+            .as_os_str()
+            .as_bytes()
+            .split(|b| *b == b'/')
+            .any(|e| e == b".")
+        {
+            return Err(err(PluginTrustErrorKind::InvalidPath));
+        }
         let runner_uid = sys::effective_uid();
         let mut shown = PathBuf::new();
         let mut cur: Option<OwnedFd> = None;

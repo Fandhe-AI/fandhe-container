@@ -276,3 +276,40 @@ fn plug11_task122_1_verify_candidate_rejects_world_writable_tmp_ancestor() {
     assert_eq!(err.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
     assert_eq!(err.path(), base);
 }
+
+#[test]
+fn plug11_task122_1_verify_candidate_accepts_under_trusted_ancestors() {
+    // 公開 API `verify_candidate` の成功経路（祖先の検証を含む）。/tmp は祖先として拒否される
+    // ため、開発機・CI とも group/other 書き込み不可の `$HOME` 配下に plugin を置く。
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let base = home.join(format!("fandhe-plugin-trust-{}-okanc", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir(&base).unwrap();
+    chmod(&base, 0o755);
+    let f = base.join(NAME);
+    fs::write(&f, b"x").unwrap();
+    chmod(&f, 0o755);
+    let dirs = [PluginSearchDir::new(PluginDirKind::User, base.clone())];
+    let got = discover_candidates(&dirs);
+    let res = got
+        .as_ref()
+        .map_err(|_| ())
+        .and_then(|g| verify_candidate(g.first().expect("one candidate")).map_err(|_| ()));
+    let _ = fs::remove_dir_all(&base);
+    let v = res.expect("verified via public API");
+    assert_eq!(v.path(), f);
+    assert_eq!(v.mode() & 0o022, 0);
+}
+
+#[test]
+fn plug11_task122_1_rejects_dot_components() {
+    let tmp = Tmp::new("dot");
+    fs::create_dir(tmp.0.join("a")).unwrap();
+    chmod(&tmp.0.join("a"), 0o755);
+    let mid = PathBuf::from(format!("{}/./a", tmp.0.display()));
+    let err = verify_dir(&mid).expect_err("reject mid dot");
+    assert_eq!(err.kind(), PluginTrustErrorKind::InvalidPath);
+    let tail = PathBuf::from(format!("{}/a/.", tmp.0.display()));
+    let err = verify_dir(&tail).expect_err("reject trailing dot");
+    assert_eq!(err.kind(), PluginTrustErrorKind::InvalidPath);
+}

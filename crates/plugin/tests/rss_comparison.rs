@@ -394,7 +394,16 @@ mod supported {
             c1.iter().chain(c2.iter()).all(|b| *b >= 4096),
             "{c1:?} {c2:?}"
         );
-        println!("{}", report_line(median(c1), median(c2)));
+        // PLUG-8: println!/eprintln! は libtest に捕捉され、成功時の既定実行
+        // （`make test`・CI は --nocapture を付けない）では表示されない。
+        // 捕捉対象外の stderr ハンドル直書きと、成果物ファイルの両方へ出す。
+        let line = report_line(median(c1), median(c2));
+        {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr().lock(), "{line}");
+        }
+        let report = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rss_comparison_report.json");
+        std::fs::write(&report, format!("{line}\n")).expect("write rss comparison report");
     }
 }
 

@@ -16,9 +16,11 @@ pub const PLUGIN_ERROR_MESSAGE_MAX_BYTES: usize = 4096;
 
 /// `PluginError` の機械可読な分類（ERR-1）。
 ///
-/// 文字列表現は core の `ErrorCode::as_str` と同一（変換を無損失にする契約）。
+/// 文字列表現は、core の `ErrorCode::as_str` と共通する 9 コードでは同一（変換を無損失にする契約）。
+/// `DataLoss`（`DATA_LOSS`）はフレーム層固有で core 側には無く、`TraitError` への写像は
+/// core 側 proxy 実装（TASK-114）の責務とする。
 /// `#[non_exhaustive]` のため、呼び出し側の `match` は `_` 分岐を持つこと。
-/// フレーム破損・資源上限系のコードは、使う sub（#245 等）で追加する。
+/// 資源上限系のコードは、使う sub で追加する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PluginErrorCode {
@@ -40,6 +42,8 @@ pub enum PluginErrorCode {
     Timeout,
     /// 接続断・相手不在。
     Unavailable,
+    /// フレームのチェックサム不一致など、偶発的なデータ破損を検出した（TASK-107.2）。
+    DataLoss,
 }
 
 impl PluginErrorCode {
@@ -55,6 +59,7 @@ impl PluginErrorCode {
             Self::PermissionDenied => "PERMISSION_DENIED",
             Self::Timeout => "TIMEOUT",
             Self::Unavailable => "UNAVAILABLE",
+            Self::DataLoss => "DATA_LOSS",
         }
     }
 }
@@ -129,6 +134,7 @@ mod tests {
             (PluginErrorCode::PermissionDenied, "PERMISSION_DENIED"),
             (PluginErrorCode::Timeout, "TIMEOUT"),
             (PluginErrorCode::Unavailable, "UNAVAILABLE"),
+            (PluginErrorCode::DataLoss, "DATA_LOSS"),
         ];
         for (code, s) in cases {
             assert_eq!(code.as_str(), s);

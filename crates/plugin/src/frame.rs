@@ -1,4 +1,4 @@
-//! plugin 境界の長さ接頭辞フレーム（TASK-107.2・PLUG-2・PLUG-5・REPAIR-1・REPAIR-2・#245）。
+//! plugin 境界の長さ接頭辞フレーム（TASK-107.2・PLUG-2・PLUG-5・REPAIR-1・REPAIR-2・MS-3・#245）。
 //!
 //! core と plugin プロセスが UDS 上で交わす制御面メッセージを運ぶフレームの、固定長ヘッダ・
 //! トレーラ・チェックサムを「壊れた値を表現できない」型として定義する。ペイロード（serde_json）の
@@ -43,7 +43,7 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const FRAME_HEADER_LEN: usize = 9;
 /// トレーラ（チェックサム）の固定長。
 pub const CHECKSUM_LEN: usize = 4;
-/// ペイロード長の上限（16 MiB）。PoC-13（plugin-framed）の上限を根拠とする暫定値で、
+/// ペイロード長の上限（16 MiB）。PoC-13（plugin-framed。MS-3 の plugin 境界機構〔TASK-107〕で採用）の上限を根拠とする暫定値で、
 /// TASK-113 の再計測で見直しうる（REPAIR-3）。io 共有層の上限（64 MiB）とは別の境界で、流用しない。
 pub const MAX_PAYLOAD_LEN: u32 = 16 * 1024 * 1024;
 /// フレーム全体の最大長（ヘッダ + 最大ペイロード + トレーラ）。

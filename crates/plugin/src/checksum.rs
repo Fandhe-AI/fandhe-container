@@ -1,4 +1,4 @@
-//! CRC-32C（Castagnoli）チェックサムの自前実装（TASK-107.2・PLUG-2・REPAIR-2・#245）。
+//! CRC-32C（Castagnoli）チェックサムの自前実装（TASK-107.2・PLUG-2・REPAIR-2・MS-3・#245）。
 //!
 //! [`crate::frame::Frame`] がヘッダ・ペイロードの偶発的破損・フレーム境界ずれ
 //! （PoC-8 の BREAK-2 相当）を検出するために使う。依存追加なし（std のみ。

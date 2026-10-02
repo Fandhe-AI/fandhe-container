@@ -308,6 +308,39 @@ mod unix {
         std::fs::remove_file(&keep).unwrap();
     }
 
+    /// ロック名に FIFO がある場合、open で止まらずに `PermissionDenied` で拒否し、FIFO には触れない
+    /// （PLUG-12・REPAIR-5・TASK-123.2）。
+    #[test]
+    fn plug12_fifo_at_lock_name_is_rejected_without_blocking() {
+        use std::os::unix::fs::FileTypeExt;
+        let t = TempDir::new();
+        let d = RuntimeDir::ensure_under(&t.0).unwrap();
+        let p = d.path().join("s.sock");
+        let fifo = d.path().join("s.sock.lock");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = p.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(UdsListener::bind(&path).map(|_| ()));
+        });
+        // 止まった場合は期限で失敗させる（ハングで CI を止めない）。
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("bind must not block on a FIFO lock path");
+        assert_eq!(res.unwrap_err().code(), PluginErrorCode::PermissionDenied);
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert!(std::fs::symlink_metadata(&p).is_err());
+    }
+
     /// 後始末で socket を unlink できなかった場合は記録を残し、次回の bind が stale として削除して
     /// 再 bind できる（記録を先に消すと以後常に AlreadyExists になる。PLUG-12・TASK-123.2）。
     #[test]

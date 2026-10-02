@@ -54,7 +54,8 @@ pub(crate) enum SysError {
 const EINTR_RETRY_MAX: u32 = 16;
 
 pub(crate) use consts::{
-    EACCES, EAFNOSUPPORT, EAGAIN, EINTR, EMFILE, ENFILE, ENOBUFS, ENOMEM, EPERM, EPROTONOSUPPORT,
+    EACCES, EAFNOSUPPORT, EAGAIN, EBUSY, EEXIST, EINTR, EINVAL, EMFILE, ENFILE, ENOBUFS, ENODEV,
+    ENOENT, ENOMEM, EOPNOTSUPP, EPERM, EPROTONOSUPPORT,
 };
 
 /// 受信待ち全体の期限（REPAIR-5）。単調時計（`Instant`）の開始時刻と全体 timeout を持ち、
@@ -125,13 +126,19 @@ mod consts {
     pub const MSG_DONTWAIT: i32 = 0x40;
     pub const POLLIN: i16 = 0x0001;
     pub const EPERM: i32 = 1;
+    pub const ENOENT: i32 = 2;
     pub const EINTR: i32 = 4;
     pub const ENOMEM: i32 = 12;
     pub const EAGAIN: i32 = 11;
     pub const EACCES: i32 = 13;
+    pub const EBUSY: i32 = 16;
+    pub const EEXIST: i32 = 17;
+    pub const ENODEV: i32 = 19;
+    pub const EINVAL: i32 = 22;
     pub const ENFILE: i32 = 23;
     pub const EMFILE: i32 = 24;
     pub const EPROTONOSUPPORT: i32 = 93;
+    pub const EOPNOTSUPP: i32 = 95;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ENOBUFS: i32 = 105;
 }
@@ -148,13 +155,19 @@ mod consts {
     pub const MSG_DONTWAIT: i32 = 0x40;
     pub const POLLIN: i16 = 0x0001;
     pub const EPERM: i32 = 1;
+    pub const ENOENT: i32 = 2;
     pub const EINTR: i32 = 4;
     pub const ENOMEM: i32 = 12;
     pub const EAGAIN: i32 = 11;
     pub const EACCES: i32 = 13;
+    pub const EBUSY: i32 = 16;
+    pub const EEXIST: i32 = 17;
+    pub const ENODEV: i32 = 19;
+    pub const EINVAL: i32 = 22;
     pub const ENFILE: i32 = 23;
     pub const EMFILE: i32 = 24;
     pub const EPROTONOSUPPORT: i32 = 93;
+    pub const EOPNOTSUPP: i32 = 95;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ENOBUFS: i32 = 105;
 }
@@ -176,13 +189,19 @@ mod consts {
     pub const MSG_DONTWAIT: i32 = 0;
     pub const POLLIN: i16 = 0;
     pub const EPERM: i32 = -1;
+    pub const ENOENT: i32 = -11;
     pub const EINTR: i32 = -2;
     pub const ENOMEM: i32 = -3;
     pub const EAGAIN: i32 = -4;
     pub const EACCES: i32 = -5;
+    pub const EBUSY: i32 = -12;
+    pub const EEXIST: i32 = -13;
+    pub const ENODEV: i32 = -14;
+    pub const EINVAL: i32 = -15;
     pub const ENFILE: i32 = -6;
     pub const EMFILE: i32 = -7;
     pub const EPROTONOSUPPORT: i32 = -8;
+    pub const EOPNOTSUPP: i32 = -16;
     pub const EAFNOSUPPORT: i32 = -9;
     pub const ENOBUFS: i32 = -10;
 }
@@ -487,6 +506,12 @@ mod tests {
         assert_eq!(consts::POLLIN, 1);
         assert_eq!(consts::EINTR, 4);
         assert_eq!(consts::EAGAIN, 11);
+        assert_eq!(consts::ENOENT, 2);
+        assert_eq!(consts::EBUSY, 16);
+        assert_eq!(consts::EEXIST, 17);
+        assert_eq!(consts::ENODEV, 19);
+        assert_eq!(consts::EINVAL, 22);
+        assert_eq!(consts::EOPNOTSUPP, 95);
         assert_eq!(core::mem::size_of::<SockaddrNl>(), 12);
         assert_eq!(core::mem::size_of::<PollFd>(), 8);
     }

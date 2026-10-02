@@ -41,7 +41,7 @@ pub const MAX_ATTR_PAYLOAD_LEN: usize = 65531;
 
 /// 何もしないメッセージ。
 pub const NLMSG_NOOP: u16 = 1;
-/// エラー応答（ペイロードの解釈は #844 の責務）。
+/// エラー / ACK 応答（ペイロードは `netlink_route::decode_nlmsgerr` で解釈する。#844）。
 pub const NLMSG_ERROR: u16 = 2;
 /// マルチパート応答の終端。
 pub const NLMSG_DONE: u16 = 3;

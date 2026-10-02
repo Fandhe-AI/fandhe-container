@@ -42,3 +42,6 @@ repository = "https://github.com/Fandhe-AI/fandhe-container"
 fandhe-container-plugin = { path = "crates/plugin" }
 serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = "=1.0.151"
+# plugin バイナリの sha256 許可済みハッシュ照合（PLUG-11・TASK-122.3）。承認: Issue #278・TASK-122.hdep1。
+# 純 Rust・MIT OR Apache-2.0。alloc / oid は不要のため default-features を無効化する。
+sha2 = { version = "=0.11.0", default-features = false }

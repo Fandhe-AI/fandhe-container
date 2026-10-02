@@ -197,8 +197,14 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         AuditEvent::Seccomp { .. } => None,
         AuditEvent::Landlock { path, .. } => Some(path),
         AuditEvent::Mount { path } => path.as_ref(),
+        AuditEvent::PluginTrust { path, .. } => Some(path),
     };
     push_path_fields(&mut out, path);
+    // plugin 信頼検証のみ末尾に理由を追記する（他レイヤーの本文は従来と同一）。
+    if let Some(reason) = record.reason() {
+        out.push_str(" reason=");
+        out.push_str(reason.as_str());
+    }
     if out.len() > AUDIT_MESSAGE_TEXT_MAX {
         return Err(AuditWriteError::new(Kind::LineTooLong));
     }
@@ -528,6 +534,19 @@ mod tests {
             encode_payload(&r).unwrap(),
             "op=fandhe-audit layer=landlock ts=1700000000.000000005 pid=1234 syscall=2 \
              arch=? path=2F612062270A00 path_truncated=0 path_original_len=7"
+        );
+    }
+
+    #[test]
+    fn plug11_task122_5_payload_plugin_trust_appends_reason() {
+        let r = rec(AuditEvent::PluginTrust {
+            path: AuditPath::new("/p"),
+            reason: crate::audit_log::AuditReason::new("untrusted_owner"),
+        });
+        assert_eq!(
+            encode_payload(&r).unwrap(),
+            "op=fandhe-audit layer=plugin_trust ts=1700000000.000000005 pid=1234 syscall=? arch=? \
+             path=2F70 path_truncated=0 path_original_len=2 reason=untrusted_owner"
         );
     }
 

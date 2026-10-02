@@ -2,7 +2,7 @@
 //!
 //! # 役割
 //!
-//! seccomp・Landlock・マウント検証/API の 3 レイヤーで起きた分離違反の試行を、原因特定に必要な情報
+//! seccomp・Landlock・マウント検証/API・plugin 信頼検証（TASK-122.5）の 4 レイヤーで起きた分離違反の試行を、原因特定に必要な情報
 //! （syscall 番号・対象パス・プロセス ID・タイムスタンプ）付きで表す固定スキーマの型を定義する。
 //! 本モジュールは型のみで、syscall も I/O も持たない（OS 非依存。3 OS でコンパイルされる）。
 //!
@@ -304,6 +304,25 @@ impl AuditPath {
     }
 }
 
+/// 監査レコードに載せる拒否理由トークン（PLUG-11・TASK-122.5）。
+///
+/// crate 内の静的 ASCII トークンからのみ構築できる（`pub(crate)` 構築子）。外部入力由来の文字列を
+/// 載せられない型にしてログ注入を防ぐ（REPAIR-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditReason(&'static str);
+
+impl AuditReason {
+    /// 静的トークンから構築する（crate 内専用）。
+    pub(crate) const fn new(token: &'static str) -> Self {
+        Self(token)
+    }
+
+    /// トークンを返す。
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
 /// 違反を検知したレイヤー。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -314,6 +333,8 @@ pub enum AuditLayer {
     Landlock,
     /// マウント検証 / API（SEC-4）。
     Mount,
+    /// plugin 信頼検証（所有者・モード・ハッシュ。PLUG-11・SEC-4・TASK-122.5）。
+    PluginTrust,
 }
 
 impl AuditLayer {
@@ -323,6 +344,7 @@ impl AuditLayer {
             AuditLayer::Seccomp => "seccomp",
             AuditLayer::Landlock => "landlock",
             AuditLayer::Mount => "mount",
+            AuditLayer::PluginTrust => "plugin_trust",
         }
     }
 }
@@ -357,6 +379,13 @@ pub enum AuditEvent {
         /// 拒否されたマウント先パス。
         path: Option<AuditPath>,
     },
+    /// plugin 信頼検証の拒否（PLUG-11・TASK-122.5）。パスと拒否理由は必須。
+    PluginTrust {
+        /// 拒否された plugin ファイルまたは探索先ディレクトリのパス。
+        path: AuditPath,
+        /// 拒否理由トークン（静的トークン。[`AuditReason`] 参照）。
+        reason: AuditReason,
+    },
 }
 
 impl AuditEvent {
@@ -366,6 +395,7 @@ impl AuditEvent {
             AuditEvent::Seccomp { .. } => AuditLayer::Seccomp,
             AuditEvent::Landlock { .. } => AuditLayer::Landlock,
             AuditEvent::Mount { .. } => AuditLayer::Mount,
+            AuditEvent::PluginTrust { .. } => AuditLayer::PluginTrust,
         }
     }
 }
@@ -414,7 +444,7 @@ impl AuditRecord {
         match &self.event {
             AuditEvent::Seccomp { syscall, .. } => Some(*syscall),
             AuditEvent::Landlock { syscall, .. } => *syscall,
-            AuditEvent::Mount { .. } => None,
+            AuditEvent::Mount { .. } | AuditEvent::PluginTrust { .. } => None,
         }
     }
 
@@ -432,6 +462,15 @@ impl AuditRecord {
             AuditEvent::Seccomp { .. } => None,
             AuditEvent::Landlock { path, .. } => Some(path.as_path()),
             AuditEvent::Mount { path } => path.as_ref().map(AuditPath::as_path),
+            AuditEvent::PluginTrust { path, .. } => Some(path.as_path()),
+        }
+    }
+
+    /// 拒否理由トークン（plugin 信頼検証レコードのみ。他レイヤーは `None`）。
+    pub fn reason(&self) -> Option<AuditReason> {
+        match &self.event {
+            AuditEvent::PluginTrust { reason, .. } => Some(*reason),
+            _ => None,
         }
     }
 }

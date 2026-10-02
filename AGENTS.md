@@ -138,6 +138,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | 50 コンテナ同時起動の集約メモリ計測（CORE-9・SUP-1） | `scripts/bench/concurrent_50_memory.sh`・`scripts/bench/concurrent_50_memory_selftest.sh` | `make concurrent-memory-selftest`（自己テスト）・`make concurrent-memory`・`make concurrent-memory-docker`（実機）・`make concurrent-memory-report`（統合） | TASK-50.1: own 側の計測ハーネス（起動数 N 未満・PSS 0 混入を失敗として検出）。TASK-50.2: Docker 側の同一手法計測（`--mode docker`）と own・Docker の統合レポート（`--mode report`）。実測と SUP-1 の判定は CLI（TASK-79）・本番 launcher 提供後に人間が #219（TASK-50.h1）で実施（実測値は未取得） |
 | fio ベースライン比算出 | `scripts/fio-baseline-ratio.sh`・`scripts/testdata/fio-baseline/` | `make fio-baseline-ratio-selftest`（自己テスト）・`make fio-baseline-ratio`（比率算出） | TASK-25.2: 手順・比率算出・目標値案は整備済み。Docker ベースライン比の実測値は人間実施待ち（#114） |
 | 実機前提テスト | 既定のテスト集合から分離する | 分離の仕組みは該当タスクで決める | 下記「実機前提テスト」節・[ci](.claude/rules/ci.md)「実機前提テスト」を参照 |
+| feature 無効構成（PLUG-3・TASK-111.1） | `crates/core` の `plugin` feature（`--no-default-features`） | `make test-core-no-plugin`（CI の `rust-ci-default-features` ジョブが実行） | 無効構成で core がテストでき、依存ツリーに `fandhe-container-plugin` が入らないことを検証する |
 | 依存・ライセンス検査 | `Cargo.toml`・`deny.toml` | `make deny` | 依存を追加・更新するときのみ（ユーザー承認制。[dependency-policy](.claude/rules/dependency-policy.md)） |
 
 コマンドと CI ジョブの対応は上記「回帰確認コマンド一覧」節の表を参照する（重複管理しない。TASK-94）。

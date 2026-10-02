@@ -167,4 +167,54 @@ mod unix {
         drop(l);
         assert_eq!(std::fs::read(dir.sock()).unwrap(), b"other");
     }
+
+    /// PLUG-12: group/other に権限のある親・symlink の親は拒否する（0700 相当のみ許可）。
+    #[test]
+    fn plug12_bind_rejects_group_accessible_and_symlink_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let e = UdsListener::bind(&dir.sock()).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let real = dir.0.join("real");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&real)
+            .unwrap();
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = UdsListener::bind(&link.join("s.sock")).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+        assert!(!real.join("s.sock").exists());
+    }
+
+    /// PLUG-2: path() は絶対パスで保持される（相対指定でも Drop 時の cwd に依存しない）。
+    #[test]
+    fn plug2_path_is_absolute() {
+        let dir = TempDir::new();
+        let l = UdsListener::bind(&dir.sock()).unwrap();
+        assert!(l.path().is_absolute());
+    }
+
+    /// REPAIR-5: 何も送らない peer でも read は期限で戻り、0 の期限は拒否される。
+    #[test]
+    fn repair5_accepted_stream_read_times_out() {
+        let dir = TempDir::new();
+        let l = UdsListener::bind(&dir.sock()).unwrap();
+        let _c = UnixStream::connect(l.path()).unwrap();
+        let mut s = l.accept(WAIT).unwrap();
+        let e = s.set_io_timeout(Duration::ZERO).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        s.set_io_timeout(Duration::from_millis(100)).unwrap();
+        let t = Instant::now();
+        let mut buf = [0u8; 1];
+        let err = s.read(&mut buf).unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        assert!(t.elapsed() < Duration::from_secs(5));
+    }
 }

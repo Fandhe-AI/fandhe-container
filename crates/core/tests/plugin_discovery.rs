@@ -496,16 +496,15 @@ fn collect_files(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
     }
 }
 
-/// core crate のソース（`Cargo.toml` と `src/` 配下の全ファイル）の (相対パス, sha256) 一覧。
+/// core crate 配下の全ファイル（`Cargo.toml`・`src/`・`tests/` 等）の (相対パス, sha256) 一覧。
 ///
-/// `tests/` はテスト自身であり core の成果物に入らないため対象外とする。
+/// `tests/` は core の成果物に入らないが、Issue #256 の受け入れ条件「core crate 配下の全ソース
+/// ファイル」と PLUG-4（plugin を通すために core 側のソースやテストを書き換えない）に合わせて
+/// 対象に含める。`scripts/check-plug4-core-invariance.sh` の対象範囲（`crates/core` 全体）と揃える。
 fn core_source_sha256_list() -> Vec<(String, String)> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut out = vec![(
-        "Cargo.toml".to_owned(),
-        sha256::sha256_file(&root.join("Cargo.toml")),
-    )];
-    collect_files(&root.join("src"), &root, &mut out);
+    let mut out = Vec::new();
+    collect_files(&root, &root, &mut out);
     out.sort();
     out
 }
@@ -548,6 +547,7 @@ fn plug4_core_sha256_unchanged_after_plugin_add() {
         "src/lib.rs",
         "src/plugin_discovery.rs",
         "src/plugin_discovery/registry.rs",
+        "tests/plugin_discovery.rs",
     ] {
         assert!(
             src_before.iter().any(|(p, _)| p == required),

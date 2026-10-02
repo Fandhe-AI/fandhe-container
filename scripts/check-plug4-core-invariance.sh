@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # PLUG-4（TASK-109.4・REPAIR-12）: plugin crate を workspace へ追加する前後で、core が無変更であることを
 # 「別ビルド」で比較する判定スクリプト（docs/design/crate-naming.md 決定 3 の 3 点）。
-#   (1) core crate のソース（Cargo.toml と src/ 配下）の sha256 一覧
+#   (1) core crate 配下の全ファイル（Cargo.toml・src/・tests/ 等。crates/core 全体）の sha256 一覧
+#       ※ Issue #256 の受け入れ条件「core crate 配下の全ソースファイル」と、AGENTS.md の「plugin を通すために
+#         core 側のソースやテストを書き換えない」に合わせ、成果物に入らない tests/ も対象に含める。
 #   (2) `cargo tree -p fandhe-container-core --locked -e normal` の依存木
 #   (3) `cargo build -p fandhe-container-core --locked` の成果物（rlib）の sha256
 #       ※ core は lib のみで bin が無いため rlib を代理にする。CLI bin（TASK-79）導入後に実行ファイルへ切り替える（REPAIR-3）。
@@ -13,7 +15,10 @@
 # PR が追加する plugin の依存による feature 統合の変化も、core の依存木・rlib の差として現れる）。
 # それ以外は作業ツリー（probe 追加前）。base の現在の先端ではなく merge-base を使うため、分岐後に base だけで
 # 進んだ core の変更を PR の変更と誤検出しない。
-# 加えて PLUG4_BASE_REF 指定時は、plugin crate を新規追加する PR が core を変更していないかを git diff でも検査する。
+# 加えて PLUG4_BASE_REF 指定時は、plugin crate を新規追加する PR が core（crates/core 配下全体）を変更して
+# いないかを git diff でも検査する。plugin crate を追加しない PR の core 変更は対象外（通常の開発）。
+# 移植性: Linux（GNU）と macOS（BSD）の両方で動かすため、GNU 専用の機能（tar --null・sed 置換内の \n・
+# grep -z 等）を使わない。自己テストは scripts/check-plug4-core-invariance-selftest.sh（CI は ubuntu・macos で実行）。
 # 失敗（ビルド失敗・指紋不一致・空の指紋）は非ゼロ終了（fail-closed）。リポ内のファイルは変更しない。
 set -euo pipefail
 
@@ -35,15 +40,23 @@ if [ -n "${PLUG4_BASE_REF:-}" ]; then
     { echo "NG: PLUG4_BASE_REF not resolvable: ${PLUG4_BASE_REF}" >&2; exit 1; }
   mb=$(git -C "$repo" merge-base HEAD "$PLUG4_BASE_REF") ||
     { echo "NG: no merge-base between HEAD and ${PLUG4_BASE_REF} (shallow clone?)" >&2; exit 1; }
-  added=$(git -C "$repo" diff --name-only --diff-filter=A "$mb" HEAD -- 'crates/plugin*/Cargo.toml')
+  # --no-renames: 既存 crate の改名・複製として検出され「新規追加」から漏れるのを防ぐ（git の既定は改名検出あり）。
+  added=$(git -C "$repo" diff --no-renames --name-only --diff-filter=A "$mb" HEAD -- 'crates/plugin*/Cargo.toml')
 fi
 
 # 作業ツリーの追跡ファイル（未コミットの変更を含む）を ws へ複製する。docs/spec（submodule）は含めない。
-# 移植性のため grep -z は使わず git の pathspec 除外で NUL 区切り一覧を作る（macOS の BSD grep に -z は無い）。
+# 移植性のため grep -z・tar --null は使わず、git の pathspec 除外で作った NUL 区切り一覧を bash の read で
+# 1 件ずつ複製する（cp -RPp は symlink を辿らずそのまま複製する。GNU・BSD 共通）。
+# 追跡ファイルが作業ツリーから消えている場合は cp が失敗し、非ゼロ終了する（fail-closed）。
 populate_head() {
-  local list="$work/files.lst"
-  (cd "$repo" && git ls-files -z --cached -- . ':(exclude)docs/spec' >"$list")
-  (cd "$repo" && tar --null -T "$list" -cf - 2>/dev/null) | tar -xf - -C "$ws"
+  local f
+  (cd "$repo" && git ls-files -z --cached -- . ':(exclude)docs/spec') |
+    while IFS= read -r -d '' f; do
+      case "$f" in
+        */*) mkdir -p "$ws/${f%/*}" ;;
+      esac
+      cp -RPp "$repo/$f" "$ws/$f"
+    done
 }
 # merge-base 時点のコミット tree を ws へ展開する（submodule は gitlink のため中身は含まれない）。
 populate_base() {
@@ -56,7 +69,8 @@ fingerprint() {
   local out="$work/$1" tgt="$work/target"
   rm -rf "$tgt"
   mkdir -p "$out"
-  (cd "$ws/crates/core" && find Cargo.toml src -type f | LC_ALL=C sort | while IFS= read -r f; do sha "$f"; done) >"$out/src.txt"
+  # crates/core 配下の全ファイル（tests/ 等を含む）。target は CARGO_TARGET_DIR で ws の外へ出すため混ざらない。
+  (cd "$ws/crates/core" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do sha "$f"; done) >"$out/src.txt"
   (cd "$ws" && cargo tree -p fandhe-container-core --locked -e normal) >"$out/tree.txt"
   (cd "$ws" && CARGO_TARGET_DIR="$tgt" cargo build -p fandhe-container-core --locked >&2)
   local rlib="$tgt/debug/libfandhe_container_core.rlib"
@@ -92,9 +106,11 @@ license.workspace = true
 publish = false
 TOML
 echo '//! PLUG-4 判定用の probe plugin（一時 workspace 内のみ）。' >"$ws/crates/plugin-plug4probe/src/lib.rs"
-sed -i.bak 's|^members = \[|members = [\n    "crates/plugin-plug4probe",|' "$ws/Cargo.toml"
-rm -f "$ws/Cargo.toml.bak"
-grep -q 'plugin-plug4probe' "$ws/Cargo.toml" || { echo "NG: failed to add probe member" >&2; exit 1; }
+# sed の置換文字列内の \n は GNU 拡張（BSD sed では文字 n になる）ため、awk で members の直後へ 1 行挿入する。
+awk '{ print } /^members = \[$/ && !done { print "    \"crates/plugin-plug4probe\","; done = 1 }' \
+  "$ws/Cargo.toml" >"$ws/Cargo.toml.new"
+mv "$ws/Cargo.toml.new" "$ws/Cargo.toml"
+grep -q '^    "crates/plugin-plug4probe",$' "$ws/Cargo.toml" || { echo "NG: failed to add probe member" >&2; exit 1; }
 (cd "$ws" && cargo update --workspace --offline >&2)
 (cd "$ws" && CARGO_TARGET_DIR="$work/target-probe" cargo build -p fandhe-container-plugin-plug4probe --locked >&2)
 
@@ -103,10 +119,10 @@ fingerprint after
 status=0
 
 # PR 差分の検査（PLUG4_BASE_REF 指定時のみ）。PR が plugin crate（crates/plugin*/Cargo.toml）を新規追加するとき、
-# merge-base から HEAD までに core のソース（Cargo.toml と src/ 配下）が変わっていれば失敗する
+# merge-base から HEAD までに core（crates/core 配下全体。src/ に加え tests/ 等も含む）が変わっていれば失敗する
 # （指紋比較と同じ基準点。分かりやすい差分一覧を出すための補完。PLUG-4）。
 if [ -n "$added" ]; then
-  changed=$(git -C "$repo" diff --name-only "$mb" HEAD -- crates/core/Cargo.toml crates/core/src)
+  changed=$(git -C "$repo" diff --no-renames --name-only "$mb" HEAD -- crates/core)
   if [ -n "$changed" ]; then
     echo "NG: PR adds a plugin crate ($added) but also changes core (PLUG-4):" >&2
     echo "$changed" >&2

@@ -1020,6 +1020,14 @@ run_report --own-result "$work/own-ok.json" --docker-result "$work/dk-ok.json" -
 expect_eq "report-output-exists-exit2" 2 "$rc"
 expect_eq "report-output-exists-unchanged" 5 "$(jq -r '.comparison.count' "$rep_out")"
 
+# 許容サイズ（1 MiB）以内なら、1 引数の長さ上限（128 KiB）を超える結果も統合できる（CORE-9・SUP-1）
+jq '.padding = ("x" * 300000)' "$work/own-ok.json" >"$work/own-large.json"
+jq '.padding = ("x" * 300000)' "$work/dk-ok.json" >"$work/dk-large.json"
+run_report --own-result "$work/own-large.json" --docker-result "$work/dk-large.json"
+expect_eq "report-large-input-exit0" 0 "$rc"
+expect_eq "report-large-input-medians" "10500,13000" "$(jq -r '.comparison | "\(.own_pss_median_kb),\(.docker_pss_median_kb)"' "$out")"
+expect_eq "report-large-input-padding-kept" 300000 "$(jq -r '.results.docker.padding | length' "$out")"
+
 # --- R2. report: 非信頼入力の検証（いずれも exit 2・標準出力は空） ---
 expect_report_rc2() { # <名前> <own> <docker>
   run_report --own-result "$2" --docker-result "$3"

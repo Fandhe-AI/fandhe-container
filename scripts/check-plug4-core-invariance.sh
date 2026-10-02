@@ -13,8 +13,11 @@
 # 「追加前」の tree: 環境変数 PLUG4_BASE_REF（例: origin/main）指定時で、PR が plugin crate を新規追加しているなら
 # merge-base(HEAD, PLUG4_BASE_REF) の tree（実際の plugin 追加前の基準。PR 自体が core を変えても検出できる。
 # PR が追加する plugin の依存による feature 統合の変化も、core の依存木・rlib の差として現れる）。
-# それ以外は作業ツリー（probe 追加前）。base の現在の先端ではなく merge-base を使うため、分岐後に base だけで
-# 進んだ core の変更を PR の変更と誤検出しない。
+# それ以外は「追加後」と同じ tree（probe 追加前）。base の現在の先端ではなく merge-base を使うため、分岐後に
+# base だけで進んだ core の変更を PR の変更と誤検出しない。
+# 「追加後」の tree: PLUG4_BASE_REF 指定時（PR 判定）は HEAD のコミット tree（作業ツリーに残った未コミットの
+# 変更を判定へ混ぜない。差分検査と同じ merge-base..HEAD を見る）。未指定時（ローカル実行）は作業ツリーの
+# 追跡ファイル（未コミットの変更を含む）。
 # 加えて PLUG4_BASE_REF 指定時は、plugin crate を新規追加する PR が core（crates/core 配下全体）を変更して
 # いないかを git diff でも検査する。plugin crate を追加しない PR の core 変更は対象外（通常の開発）。
 # 移植性: Linux（GNU）と macOS（BSD）の両方で動かすため、GNU 専用の機能（tar --null・sed 置換内の \n・
@@ -45,10 +48,11 @@ if [ -n "${PLUG4_BASE_REF:-}" ]; then
 fi
 
 # 作業ツリーの追跡ファイル（未コミットの変更を含む）を ws へ複製する。docs/spec（submodule）は含めない。
+# PLUG4_BASE_REF 未指定（ローカル実行）のときだけ使う。
 # 移植性のため grep -z・tar --null は使わず、git の pathspec 除外で作った NUL 区切り一覧を bash の read で
 # 1 件ずつ複製する（cp -RPp は symlink を辿らずそのまま複製する。GNU・BSD 共通）。
 # 追跡ファイルが作業ツリーから消えている場合は cp が失敗し、非ゼロ終了する（fail-closed）。
-populate_head() {
+populate_worktree() {
   local f
   (cd "$repo" && git ls-files -z --cached -- . ':(exclude)docs/spec') |
     while IFS= read -r -d '' f; do
@@ -58,9 +62,17 @@ populate_head() {
       cp -RPp "$repo/$f" "$ws/$f"
     done
 }
-# merge-base 時点のコミット tree を ws へ展開する（submodule は gitlink のため中身は含まれない）。
-populate_base() {
-  git -C "$repo" archive "$mb" | tar -xf - -C "$ws"
+# $1: コミット。そのコミットの tree を ws へ展開する（submodule は gitlink のため中身は含まれない）。
+populate_commit() {
+  git -C "$repo" archive "$1" | tar -xf - -C "$ws"
+}
+# 「追加後」の tree を ws へ展開する（PLUG4_BASE_REF 指定時は HEAD のコミット、未指定時は作業ツリー）。
+populate_head() {
+  if [ -n "$mb" ]; then
+    populate_commit HEAD
+  else
+    populate_worktree
+  fi
 }
 
 # $1: 指紋の出力名（before / after）
@@ -83,7 +95,7 @@ fingerprint() {
 }
 
 if [ -n "$added" ]; then
-  populate_base
+  populate_commit "$mb"
 else
   populate_head
 fi

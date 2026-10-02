@@ -14,6 +14,9 @@ publish = false
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# plugin バイナリの sha256 許可済みハッシュ照合（PLUG-11・TASK-122.3。承認: Issue #278・TASK-122.hdep1）。
+# plugin_trust は `plugin` feature の外の無条件モジュールのため optional にしない。
+sha2 = { workspace = true }
 # plugin 境界基盤。`plugin` feature 有効時のみ依存する（PLUG-3・TASK-111.1・#262）。
 fandhe-container-plugin = { workspace = true, optional = true }
 

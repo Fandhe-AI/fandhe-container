@@ -439,9 +439,12 @@ impl DiscoveryReport {
         &self.path_warnings
     }
 
-    /// 候補だけを取り出す。
-    pub fn into_candidates(self) -> Vec<PluginCandidate> {
-        self.candidates
+    /// 候補と `PATH` 警告を組で取り出す（PLUG-11）。
+    ///
+    /// 警告を捨てて候補だけを返す API は、「候補 1 件につき警告 1 件」の契約を呼び出し側が
+    /// 無言で破れるため提供しない。警告は [`write_path_warnings`] 等で必ず出力すること。
+    pub fn into_parts(self) -> (Vec<PluginCandidate>, Vec<PathSearchWarning>) {
+        (self.candidates, self.path_warnings)
     }
 }
 

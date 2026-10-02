@@ -51,6 +51,7 @@ make deny                   # cargo deny --locked check advisories bans licenses
 make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + deny を一括実行
 make bench-check-selftest   # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
 make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
+cargo bench -p fandhe-container-benches --bench plugin_boundary [-- --output <path>]  # 代表操作 B（イメージ一覧）の plugin 境界ベンチ（TASK-113.2・PLUG-5。引数なしはスモーク。ゲート未接続）
 make bench-baseline-selftest  # baseline.json 生成スクリプトの自己テスト（TASK-88.1・REPAIR-12）
 make bench-baseline         # ベンチを実行し baseline.json を再生成する（TASK-88.1。BENCH_ENVIRONMENT・BENCH_BASELINE_OUT で指定。実測の記録は TASK-88.2）
 make fio-bench-selftest     # fio 4K ランダム write ベンチスクリプトの自己テスト（TASK-25.1・IO-8・REPAIR-12。実 fio 不要）

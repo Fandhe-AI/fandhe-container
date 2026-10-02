@@ -119,8 +119,8 @@ pub fn decode_nlmsgerr(payload: &[u8]) -> Result<NlAck, NetError> {
 
 #[cfg(target_os = "linux")]
 pub use socket::{
-    MAX_RECV_DATAGRAM_LEN, MAX_REPLY_BYTES, NetlinkReply, NetlinkReplyMessage, NetlinkRouteSocket,
-    RECV_BUFFER_LEN,
+    MAX_RECV_DATAGRAM_LEN, MAX_REPLY_BYTES, MAX_REPLY_MESSAGES, NetlinkReply, NetlinkReplyMessage,
+    NetlinkRouteSocket, RECV_BUFFER_LEN,
 };
 
 #[cfg(target_os = "linux")]
@@ -134,8 +134,9 @@ mod socket {
     use crate::error::{NetError, NetErrorCode};
     use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
     use crate::netlink::{
-        ALIGN_TO, MAX_MESSAGE_LEN, NLM_F_ACK, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR,
-        NLMSG_HEADER_LEN, NLMSG_NOOP, NLMSG_OVERRUN, NlMsgBuilder, NlMsgHeader, NlMsgIter,
+        ALIGN_TO, MAX_MESSAGE_LEN, NLM_F_ACK, NLM_F_DUMP_INTR, NLM_F_MATCH, NLM_F_REQUEST,
+        NLM_F_ROOT, NLMSG_DONE, NLMSG_ERROR, NLMSG_HEADER_LEN, NLMSG_NOOP, NLMSG_OVERRUN,
+        NlMsgBuilder, NlMsgHeader, NlMsgIter,
     };
     use crate::sys::{self, Deadline, Readiness, RecvMeta, SysError};
 
@@ -153,6 +154,10 @@ mod socket {
     /// 1 回の往復で収集する応答ペイロードの合計上限（バイト）。無制限の確保（DoS）を防ぐ暫定値で、
     /// spec に根拠値はない（REPAIR-3。実運用の dump 規模が分かった時点で見直す）。
     pub const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
+
+    /// 1 回の往復で収集する応答メッセージ件数の上限。ペイロードが空のメッセージが続いても
+    /// `Vec` が増え続けないようにする暫定値（REPAIR-3。根拠値は spec にない）。
+    pub const MAX_REPLY_MESSAGES: usize = 262_144;
 
     /// 往復の応答に含まれる 1 メッセージ（ACK / DONE / NOOP を除く）。
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,16 +219,20 @@ mod socket {
     impl RequestGate {
         fn acquire(&self, deadline: &Deadline, total: Duration) -> Result<GateGuard<'_>, NetError> {
             let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
-            while *busy {
+            loop {
                 let remaining = deadline.remaining();
+                // 門が空いていても期限切れなら取得しない（期限後に要求を送らない）。
                 if remaining.is_zero() {
                     return Err(NetError::new(
                         NetErrorCode::Timeout,
                         format!(
-                            "another netlink request stayed in flight for {} ms",
+                            "netlink request not started within {} ms (gate wait)",
                             total.as_millis()
                         ),
                     ));
+                }
+                if !*busy {
+                    break;
                 }
                 // 巨大な timeout で内部の期限計算があふれないよう 1 回の待機を区切り、残り時間で再計算する。
                 let (g, _) = self
@@ -352,11 +361,23 @@ mod socket {
                 let deadline = Deadline::after(timeout);
                 let _turn = self.gate.acquire(&deadline, timeout)?;
                 let seq = self.seq.next();
+                let dump = flags & (NLM_F_ROOT | NLM_F_MATCH) == (NLM_F_ROOT | NLM_F_MATCH);
                 let mut builder =
                     NlMsgBuilder::new(msg_type, flags | NLM_F_REQUEST | NLM_F_ACK, seq, 0);
                 build(&mut builder)?;
-                self.send(&builder.finish()?)?;
-                await_reply(seq, &deadline, timeout, |t| self.recv(t))
+                let message = builder.finish()?;
+                // build に時間がかかって期限が切れた場合、要求をカーネルへ送らない。
+                if deadline.remaining().is_zero() {
+                    return Err(NetError::new(
+                        NetErrorCode::Timeout,
+                        format!(
+                            "netlink request seq {seq} not sent: deadline of {} ms passed",
+                            timeout.as_millis()
+                        ),
+                    ));
+                }
+                self.send(&message)?;
+                await_reply_for(seq, dump, &deadline, timeout, |t| self.recv(t))
             })
         }
 
@@ -525,8 +546,22 @@ mod socket {
     /// `deadline` は往復全体で 1 つ（`total` は文言用の元の timeout）。各 `recv` には残り時間を渡し、
     /// 受信のたびに期限を張り直さない。`recv` は本番では `NetlinkRouteSocket::recv`、単体試験では
     /// 決定的な偽物。
+    #[cfg(test)]
     fn await_reply(
         seq: u32,
+        deadline: &Deadline,
+        total: Duration,
+        recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
+    ) -> Result<NetlinkReply, NetError> {
+        await_reply_for(seq, false, deadline, total, recv)
+    }
+
+    /// [`await_reply`] の本体。`dump` が真なら `NLMSG_DONE` までを終端とし、途中の ACK は成功状態
+    /// として保持するだけで応答を完了させない（ACK が DONE より先に届きうるため）。`NLM_F_DUMP_INTR`
+    /// が立った dump は不完全なので `FailedPrecondition`（再試行可能）で返す。
+    fn await_reply_for(
+        seq: u32,
+        dump: bool,
         deadline: &Deadline,
         total: Duration,
         mut recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
@@ -543,6 +578,12 @@ mod socket {
         let data_loss = |msg: String| NetError::new(NetErrorCode::DataLoss, msg);
         let mut messages = Vec::new();
         let mut collected = 0usize;
+        let interrupted = || {
+            NetError::new(
+                NetErrorCode::FailedPrecondition,
+                format!("netlink dump for seq {seq} was interrupted (NLM_F_DUMP_INTR); retry"),
+            )
+        };
         loop {
             let data = match recv(deadline.remaining()) {
                 Err(e) if e.code() == NetErrorCode::Timeout => return Err(timed_out()),
@@ -555,6 +596,9 @@ mod socket {
                 if h.seq() != seq {
                     continue;
                 }
+                if dump && h.flags() & NLM_F_DUMP_INTR != 0 {
+                    return Err(interrupted());
+                }
                 match h.msg_type() {
                     NLMSG_ERROR => {
                         let ack = decode_nlmsgerr(msg.payload())?;
@@ -564,6 +608,9 @@ mod socket {
                             )));
                         }
                         if ack.is_ack() {
+                            if dump {
+                                continue;
+                            }
                             return Ok(NetlinkReply { seq, messages });
                         }
                         let errno = ack.errno();
@@ -593,12 +640,15 @@ mod socket {
                         return Err(data_loss(format!("netlink overrun for seq {seq}")));
                     }
                     other => {
-                        collected = collected.saturating_add(msg.payload().len());
-                        if collected > MAX_REPLY_BYTES {
+                        // ヘッダ分も加算し、空ペイロードのメッセージでも総量が増えるようにする。
+                        collected = collected
+                            .saturating_add(msg.payload().len())
+                            .saturating_add(NLMSG_HEADER_LEN);
+                        if collected > MAX_REPLY_BYTES || messages.len() >= MAX_REPLY_MESSAGES {
                             return Err(NetError::new(
                                 NetErrorCode::ResourceExhausted,
                                 format!(
-                                    "netlink reply for seq {seq} exceeds {MAX_REPLY_BYTES} bytes"
+                                    "netlink reply for seq {seq} exceeds {MAX_REPLY_BYTES} bytes or {MAX_REPLY_MESSAGES} messages"
                                 ),
                             ));
                         }
@@ -1117,6 +1167,75 @@ mod socket {
             let e = run(2, Duration::from_secs(5), script(vec![vec![0xff; 20]]))
                 .expect_err("malformed");
             assert_eq!(e.code(), NetErrorCode::DataLoss);
+        }
+
+        /// NET-11: dump では ACK が DONE より先に届いても完了せず、DONE までの応答を集める。
+        #[test]
+        fn dump_ack_before_done_keeps_collecting() {
+            let items = vec![
+                plain_dgram(16, 4, b"aaaa"),
+                err_dgram(4, 0, 4),
+                plain_dgram(16, 4, b"bbbb"),
+                plain_dgram(NLMSG_DONE, 4, &[]),
+            ];
+            let r = await_reply_for(
+                4,
+                true,
+                &Deadline::after(Duration::from_secs(5)),
+                Duration::from_secs(5),
+                script(items),
+            )
+            .expect("ok");
+            assert_eq!(r.messages().len(), 2);
+        }
+
+        /// NET-11: NLM_F_DUMP_INTR の dump は FailedPrecondition。
+        #[test]
+        fn dump_intr_is_retryable_error() {
+            let mut b = NlMsgBuilder::new(16, NLM_F_DUMP_INTR, 4, 0);
+            b.put_fixed(b"aaaa").expect("payload");
+            let items = vec![b.finish().expect("finish")];
+            let e = await_reply_for(
+                4,
+                true,
+                &Deadline::after(Duration::from_secs(5)),
+                Duration::from_secs(5),
+                script(items),
+            )
+            .expect_err("intr");
+            assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        }
+
+        /// REPAIR-3: 空ペイロードのメッセージでも件数上限で打ち切る。
+        #[test]
+        fn empty_payload_messages_are_bounded() {
+            let dgram = plain_dgram(16, 4, &[]);
+            let e = run(4, Duration::from_secs(30), |_| Ok(dgram.clone())).expect_err("exhausted");
+            assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        }
+
+        /// REPAIR-5: 期限切れ後は門が空いていても取得できない。
+        #[test]
+        fn repair5_expired_deadline_does_not_acquire_gate() {
+            let gate = RequestGate::default();
+            let e = gate
+                .acquire(&Deadline::after(Duration::ZERO), Duration::ZERO)
+                .err()
+                .expect("timeout");
+            assert_eq!(e.code(), NetErrorCode::Timeout);
+        }
+
+        /// REPAIR-5: build 中に期限が切れたら送信しない。
+        #[test]
+        fn repair5_expired_during_build_is_not_sent() {
+            let s = NetlinkRouteSocket::open().expect("open");
+            let e = s
+                .request(RTM_GETLINK, 0, Duration::from_millis(50), |b| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    b.put_fixed(&[0u8; 16])
+                })
+                .expect_err("timeout");
+            assert_eq!(e.code(), NetErrorCode::Timeout);
         }
 
         /// NET-11: 収集上限（合計 16 MiB）を超えると ResourceExhausted。

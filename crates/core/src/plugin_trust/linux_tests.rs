@@ -107,17 +107,10 @@ fn plug11_task122_1_rejects_writable_dir() {
     }
 }
 
+/// 探索先ディレクトリ自体が symlink の場合は従来どおり拒否する（TASK-122.2 の対象外）。
 #[test]
-fn plug11_task122_1_rejects_symlinks() {
+fn plug11_task122_1_rejects_directory_symlink() {
     let tmp = setup("sym", 0o755, 0o755);
-    let link = tmp.0.join("fandhe-container-plugin-link");
-    symlink(tmp.0.join(NAME), &link).unwrap();
-    let dir = verify_dir(&tmp.0).expect("dir ok");
-    let err = dir
-        .verify_file(OsStr::new("fandhe-container-plugin-link"))
-        .expect_err("reject");
-    assert_eq!(err.kind(), PluginTrustErrorKind::NotRegularFile);
-
     let dlink = anchor().join(format!(
         "fandhe-plugin-trust-{}-dirlink",
         std::process::id()
@@ -312,4 +305,196 @@ fn plug11_task122_1_rejects_dot_components() {
     let tail = PathBuf::from(format!("{}/a/.", tmp.0.display()));
     let err = verify_dir(&tail).expect_err("reject trailing dot");
     assert_eq!(err.kind(), PluginTrustErrorKind::InvalidPath);
+}
+
+// ---- TASK-122.2: symlink 実体解決検証（PLUG-11） ----
+
+const LINK: &str = "fandhe-container-plugin-link";
+
+fn verified_link(dir: &Path) -> Result<super::VerifiedPluginFile, PluginTrustError> {
+    verify_dir(dir)?.verify_file(OsStr::new(LINK))
+}
+
+/// 仕様反転: TASK-122.1 では symlink を一律拒否したが、実体が信頼できれば受理する。
+/// 判定は実体 inode の値で、保持 fd は実体を指し、path / resolved_path が区別される。
+#[test]
+fn plug11_task122_2_accepts_relative_symlink_to_real_file() {
+    let tmp = setup("s2rel", 0o755, 0o755);
+    symlink(NAME, tmp.0.join(LINK)).unwrap();
+    let v = verified_link(&tmp.0).expect("accepted");
+    let real = fs::metadata(tmp.0.join(NAME)).unwrap();
+    assert_eq!(v.owner_uid(), real.uid());
+    assert_eq!(v.mode() & 0o7777, 0o755);
+    assert_eq!(v.file().metadata().unwrap().ino(), real.ino());
+    assert_eq!(v.path(), tmp.0.join(LINK));
+    assert_eq!(
+        v.resolved_path(),
+        fs::canonicalize(tmp.0.join(NAME)).unwrap()
+    );
+    let mut s = String::new();
+    v.file().read_to_string(&mut s).unwrap();
+    assert_eq!(s, "payload");
+}
+
+#[test]
+fn plug11_task122_2_accepts_absolute_symlink_to_other_directory() {
+    let tmp = setup("s2abs", 0o755, 0o755);
+    let other = tmp.0.join("other");
+    fs::create_dir(&other).unwrap();
+    chmod(&other, 0o755);
+    let real = other.join("real-plugin");
+    fs::write(&real, b"abs").unwrap();
+    chmod(&real, 0o755);
+    symlink(&real, tmp.0.join(LINK)).unwrap();
+    let v = verified_link(&tmp.0).expect("accepted");
+    assert_eq!(v.resolved_path(), fs::canonicalize(&real).unwrap());
+    let mut s = String::new();
+    v.file().read_to_string(&mut s).unwrap();
+    assert_eq!(s, "abs");
+}
+
+#[test]
+fn plug11_task122_2_accepts_multi_hop_chain() {
+    let tmp = setup("s2chain", 0o755, 0o755);
+    symlink(NAME, tmp.0.join("h1")).unwrap();
+    symlink("h1", tmp.0.join("h2")).unwrap();
+    symlink("h2", tmp.0.join(LINK)).unwrap();
+    let v = verified_link(&tmp.0).expect("accepted");
+    assert_eq!(
+        v.resolved_path(),
+        fs::canonicalize(tmp.0.join(NAME)).unwrap()
+    );
+}
+
+/// symlink 自体は 0o777 だが、実体が group/other 書き込み可のときだけ拒否される。
+#[test]
+fn plug11_task122_2_judges_real_file_not_symlink() {
+    for mode in [0o775, 0o777] {
+        let tmp = setup(&format!("s2w{mode:o}"), 0o755, mode);
+        symlink(NAME, tmp.0.join(LINK)).unwrap();
+        let err = verified_link(&tmp.0).expect_err("reject");
+        assert_eq!(err.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
+        assert_eq!(err.target(), TrustTarget::File);
+    }
+}
+
+#[test]
+fn plug11_task122_2_rejects_writable_real_parent_directory() {
+    let tmp = setup("s2par", 0o755, 0o755);
+    let other = tmp.0.join("other");
+    fs::create_dir(&other).unwrap();
+    let real = other.join("real-plugin");
+    fs::write(&real, b"x").unwrap();
+    chmod(&real, 0o755);
+    chmod(&other, 0o777);
+    symlink(&real, tmp.0.join(LINK)).unwrap();
+    let err = verified_link(&tmp.0).expect_err("reject");
+    assert_eq!(err.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
+    assert_eq!(err.target(), TrustTarget::Directory);
+    assert_eq!(err.path(), fs::canonicalize(&other).unwrap().as_path());
+    chmod(&other, 0o755);
+}
+
+/// 公開 API（anchor なし）では、信頼できる `$HOME` 配下の symlink が `/tmp` 配下の実体を
+/// 指していても `/tmp` 祖先で拒否される。
+#[test]
+fn plug11_task122_2_rejects_target_under_world_writable_ancestor() {
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let base = home.join(format!("fandhe-plugin-trust-{}-s2tmp", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir(&base).unwrap();
+    chmod(&base, 0o755);
+    let real_dir =
+        PathBuf::from("/tmp").join(format!("fandhe-plugin-trust-{}-s2real", std::process::id()));
+    let _ = fs::remove_dir_all(&real_dir);
+    fs::create_dir(&real_dir).unwrap();
+    chmod(&real_dir, 0o755);
+    let real = real_dir.join(NAME);
+    fs::write(&real, b"x").unwrap();
+    chmod(&real, 0o755);
+    symlink(&real, base.join(NAME)).unwrap();
+    let dirs = [PluginSearchDir::new(PluginDirKind::User, base.clone())];
+    let res = discover_candidates(&dirs)
+        .map_err(|_| ())
+        .and_then(|g| verify_candidate(g.first().expect("one")).map_err(|_| ()));
+    let res_kind = discover_candidates(&dirs)
+        .ok()
+        .and_then(|g| verify_candidate(g.first()?).err());
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&real_dir);
+    assert!(res.is_err());
+    let err = res_kind.expect("rejected");
+    assert_eq!(err.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
+    assert_eq!(err.path(), Path::new("/tmp"));
+}
+
+#[test]
+fn plug11_task122_2_detects_loops_with_symlink_loop() {
+    let tmp = setup("s2loop", 0o755, 0o755);
+    symlink(LINK, tmp.0.join(LINK)).unwrap();
+    let err = verified_link(&tmp.0).expect_err("reject");
+    assert_eq!(err.kind(), PluginTrustErrorKind::SymlinkLoop);
+    let te: TraitError = err.into();
+    assert_eq!(te.code(), ErrorCode::InvalidArgument);
+
+    let tmp = setup("s2loop2", 0o755, 0o755);
+    symlink("b", tmp.0.join("a")).unwrap();
+    symlink("a", tmp.0.join("b")).unwrap();
+    let err = verify_dir(&tmp.0)
+        .and_then(|d| d.verify_file(OsStr::new("a")))
+        .expect_err("reject");
+    assert_eq!(err.kind(), PluginTrustErrorKind::SymlinkLoop);
+}
+
+#[test]
+fn plug11_task122_2_rejects_chain_longer_than_kernel_limit() {
+    let tmp = setup("s2long", 0o755, 0o755);
+    symlink(NAME, tmp.0.join("n0")).unwrap();
+    for i in 1..=50 {
+        symlink(format!("n{}", i - 1), tmp.0.join(format!("n{i}"))).unwrap();
+    }
+    let err = verify_dir(&tmp.0)
+        .and_then(|d| d.verify_file(OsStr::new("n50")))
+        .expect_err("reject");
+    assert_eq!(err.kind(), PluginTrustErrorKind::SymlinkLoop);
+}
+
+#[test]
+fn plug11_task122_2_rejects_dangling_dir_and_fifo_targets() {
+    let tmp = setup("s2bad", 0o755, 0o755);
+    symlink("missing-target", tmp.0.join("dangling")).unwrap();
+    let dir = verify_dir(&tmp.0).expect("dir ok");
+    let err = dir.verify_file(OsStr::new("dangling")).expect_err("reject");
+    assert_eq!(err.kind(), PluginTrustErrorKind::Io);
+
+    let sub = tmp.0.join("subdir");
+    fs::create_dir(&sub).unwrap();
+    chmod(&sub, 0o755);
+    symlink("subdir", tmp.0.join("tosub")).unwrap();
+    let err = dir.verify_file(OsStr::new("tosub")).expect_err("reject");
+    assert_eq!(err.kind(), PluginTrustErrorKind::NotRegularFile);
+
+    let status = std::process::Command::new("mkfifo")
+        .arg(tmp.0.join("pipe"))
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+    symlink("pipe", tmp.0.join("tofifo")).unwrap();
+    let err = dir.verify_file(OsStr::new("tofifo")).expect_err("reject");
+    assert_eq!(err.kind(), PluginTrustErrorKind::NotRegularFile);
+}
+
+/// 検証後に symlink を張り替えても、保持 fd は検証した実体を読み続ける。
+#[test]
+fn plug11_task122_2_held_fd_survives_symlink_retarget() {
+    let tmp = setup("s2swap", 0o755, 0o755);
+    symlink(NAME, tmp.0.join(LINK)).unwrap();
+    let v = verified_link(&tmp.0).expect("accepted");
+    let evil = tmp.0.join("evil");
+    fs::write(&evil, b"evil").unwrap();
+    fs::remove_file(tmp.0.join(LINK)).unwrap();
+    symlink("evil", tmp.0.join(LINK)).unwrap();
+    let mut s = String::new();
+    v.into_file().read_to_string(&mut s).unwrap();
+    assert_eq!(s, "payload");
 }

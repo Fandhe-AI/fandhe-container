@@ -546,4 +546,34 @@ mod tests {
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// pid 不一致の接続が続いても abort を確認し、子の早期終了を期限前に返す（PLUG-7・REPAIR-5）。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_abort_is_checked_after_pid_mismatch() {
+        use crate::transport::UdsStream;
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = std::env::temp_dir().join(format!("fcos-abort-{}", std::process::id()));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let listener = UdsListener::bind(&dir.join("a.sock")).unwrap();
+        let path = listener.path().to_path_buf();
+        let me = std::process::id();
+        let _c = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
+        let mut calls = 0u32;
+        let started = std::time::Instant::now();
+        let e = listener
+            .accept_peer_pid(Duration::from_secs(10), me.wrapping_add(1), &mut || {
+                calls += 1;
+                Some(PluginError::new(
+                    PluginErrorCode::Unavailable,
+                    "child exited early",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Unavailable);
+        assert_eq!(calls, 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

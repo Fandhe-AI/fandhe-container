@@ -667,6 +667,12 @@ mod imp {
                         if let Some(pid) = expected_pid
                             && sys::peer_pid(&stream)? != pid
                         {
+                            // 別プロセスの接続が続いても子の早期終了を検知できるよう、
+                            // 不一致の接続を閉じた後にも abort を確認する（Unavailable 契約）。
+                            drop(stream);
+                            if let Some(e) = abort() {
+                                return Err(e);
+                            }
                             continue;
                         }
                         // macOS 等は listener の nonblocking を継承するため明示的に戻す。

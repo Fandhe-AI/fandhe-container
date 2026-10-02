@@ -13,6 +13,8 @@
 //! - `supervisor` は core に依存する（`StateStore` 既定実装を core に一本化。決定 6）
 //! - `ContainerRuntime`・`NetworkPlugin` の実装は別プロセス＋UDS の plugin 側に置く（PLUG-1）。
 //!   plugin の追加で core を変更しない（PLUG-4）
+//! - `plugin` feature 有効時のみ `fandhe-container-plugin`（境界基盤）に依存する（既定で有効。PLUG-3・
+//!   TASK-111.1）。無効化は `--no-default-features`
 //! - `cri`・`platform-*`・`microvm`・`plugin-*` には依存しない
 //!
 //! # モジュール構成
@@ -55,6 +57,8 @@
 //! - `cgroups`: 委譲 cgroup v2 の検出・コンテナ用子 cgroup 作成・自プロセス退避の検証・controller
 //!   有効化・`memory.max` / `memory.swap.max` 設定・`cpu.max` 設定（Linux 限定。TASK-32.1・TASK-32.2・
 //!   TASK-32.3・CORE-3 は実装済み。TASK-32.4 は fork 後の子の `cgroup.procs` 参加フック `CgroupJoin` まで実装済み。本番 launcher からの結線は未実装）
+//! - `plugin`: `plugin` feature 配下の境界基盤型の再エクスポート（PLUG-3・TASK-111.1・#262）。
+//!   発見・登録は未実装
 //! - `plugin_discovery`: 管理ディレクトリ（system / user）からの plugin 候補探索（TASK-109.1・PLUG-4・PLUG-11）は実装済み・OS 非依存。
 //!   候補は未検証で、`PATH` opt-in（TASK-109.2）・レジストリ（TASK-109.3）・信頼性検証（TASK-122）は未実装
 //!
@@ -82,6 +86,8 @@ pub mod exec;
 pub mod landlock;
 pub mod observability;
 pub mod oci_runtime;
+#[cfg(feature = "plugin")]
+pub mod plugin;
 pub mod plugin_discovery;
 #[cfg(target_os = "linux")]
 pub mod rootless;

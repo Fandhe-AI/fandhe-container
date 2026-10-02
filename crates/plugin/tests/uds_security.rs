@@ -129,4 +129,50 @@ mod unix {
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         UdsListener::bind(&d.path().join("s.sock")).unwrap();
     }
+
+    #[cfg(target_os = "linux")]
+    const SUN_PATH_CAPACITY: usize = 108;
+    #[cfg(not(target_os = "linux"))]
+    const SUN_PATH_CAPACITY: usize = 104;
+
+    /// PLUG-12・TASK-123.3: socket_path -> bind で socket が 0600 になる。
+    #[test]
+    fn plug12_socket_path_then_bind_yields_0600() {
+        let t = TempDir::new();
+        let d = RuntimeDir::ensure_under(&t.0).unwrap();
+        let sp = d.socket_path("s.sock").unwrap();
+        assert_eq!(sp, d.path().join("s.sock"));
+        let _l = UdsListener::bind(&sp).unwrap();
+        assert_eq!(mode_of(&sp), 0o600);
+    }
+
+    /// PLUG-12・TASK-123.3: sun_path 境界。容量 - 1 は成功、容量ちょうどは拒否し socket を作らない。
+    #[test]
+    fn plug12_socket_path_sun_path_boundary() {
+        let t = TempDir::new();
+        let d = RuntimeDir::ensure_under(&t.0).unwrap();
+        let base = d.path().as_os_str().len() + 1; // 区切り 1 バイト
+        if base + 1 >= SUN_PATH_CAPACITY {
+            return; // 一時ディレクトリ自体が長すぎる環境では境界を作れない
+        }
+        let fits = "a".repeat(SUN_PATH_CAPACITY - 1 - base);
+        let p = d.socket_path(&fits).unwrap();
+        assert_eq!(p.as_os_str().len(), SUN_PATH_CAPACITY - 1);
+        let over = "a".repeat(SUN_PATH_CAPACITY - base);
+        let err = d.socket_path(&over).unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(err.message(), "socket path is too long");
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 0);
+    }
+
+    /// PLUG-12・TASK-123.3: 単一コンポーネント以外の名前は bind 前に拒否する。
+    #[test]
+    fn plug12_socket_path_rejects_invalid_names() {
+        let t = TempDir::new();
+        let d = RuntimeDir::ensure_under(&t.0).unwrap();
+        for n in ["", ".", "..", "a/b", "/abs", "a/", "a/.", "../x", "a\0b"] {
+            let err = d.socket_path(n).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::InvalidArgument, "name {n:?}");
+        }
+    }
 }

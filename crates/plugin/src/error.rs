@@ -5,7 +5,8 @@
 //! と機械可読文字列を揃えるが、依存方向は `core → plugin`（`docs/architecture.md`）で
 //! plugin は core に依存できないため、本 crate 内で独立に定義する。`TraitError` への
 //! 変換は core 側の proxy 実装（TASK-114）の責務である。
-//! ワイヤー上の表現（serde）は TASK-107.3（#247）で扱い、ここでは持たない。
+//! ワイヤー上の表現（serde）は `message` モジュール（TASK-107.3・#247）が非公開 DTO 経由で扱い、
+//! 本型自体には serde を持たせない（フィールド非公開・切り詰めの不変条件を保つため）。
 
 use std::error::Error;
 use std::fmt;
@@ -61,6 +62,27 @@ impl PluginErrorCode {
             Self::Unavailable => "UNAVAILABLE",
             Self::DataLoss => "DATA_LOSS",
         }
+    }
+}
+
+impl PluginErrorCode {
+    /// [`PluginErrorCode::as_str`] の逆変換。未知の文字列は `None`（呼び出し側が fail-closed で扱う）。
+    ///
+    /// `message` モジュールが相手 plugin 由来のエラー code を復号する際に使う（PLUG-2・ERR-1）。
+    pub fn from_code_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "INVALID_ARGUMENT" => Self::InvalidArgument,
+            "NOT_FOUND" => Self::NotFound,
+            "ALREADY_EXISTS" => Self::AlreadyExists,
+            "FAILED_PRECONDITION" => Self::FailedPrecondition,
+            "UNIMPLEMENTED" => Self::Unimplemented,
+            "INTERNAL" => Self::Internal,
+            "PERMISSION_DENIED" => Self::PermissionDenied,
+            "TIMEOUT" => Self::Timeout,
+            "UNAVAILABLE" => Self::Unavailable,
+            "DATA_LOSS" => Self::DataLoss,
+            _ => return None,
+        })
     }
 }
 
@@ -139,6 +161,28 @@ mod tests {
         for (code, s) in cases {
             assert_eq!(code.as_str(), s);
         }
+    }
+
+    #[test]
+    fn plug2_error_code_from_code_str_roundtrips_all_variants() {
+        let all = [
+            PluginErrorCode::InvalidArgument,
+            PluginErrorCode::NotFound,
+            PluginErrorCode::AlreadyExists,
+            PluginErrorCode::FailedPrecondition,
+            PluginErrorCode::Unimplemented,
+            PluginErrorCode::Internal,
+            PluginErrorCode::PermissionDenied,
+            PluginErrorCode::Timeout,
+            PluginErrorCode::Unavailable,
+            PluginErrorCode::DataLoss,
+        ];
+        for code in all {
+            assert_eq!(PluginErrorCode::from_code_str(code.as_str()), Some(code));
+        }
+        assert_eq!(PluginErrorCode::from_code_str("NOPE"), None);
+        assert_eq!(PluginErrorCode::from_code_str("not_found"), None);
+        assert_eq!(PluginErrorCode::from_code_str(""), None);
     }
 
     #[test]

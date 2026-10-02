@@ -5,7 +5,7 @@
 //! ホステッド runner での時間計測はノイズが大きくフレーキーになるため、
 //! `benches/baseline.json` の暫定値と対になる決定的な固定値だけを結果 JSON として
 //! 書き出す。実測を伴う本物のベンチ（`plugin_boundary` 等）への置き換えは
-//! TASK-113 で行う（配置方式 `benches/benches/*.rs` の是非も TASK-113 で決める）。
+//! TASK-113 で行う（配置方式は `benches/benches/*.rs` の自動発見に TASK-113.1 で決定済み）。
 //!
 //! 呼び出し元: `Makefile` の `bench-check` ターゲットと
 //! `.github/workflows/ci.yml` の `bench-regression` ジョブが

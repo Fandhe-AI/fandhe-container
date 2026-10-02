@@ -1,82 +1,141 @@
-//! `fandhe-container-benches` の `plugin_boundary` ベンチ（`harness = false`。TASK-113.2・#271）。
+//! `fandhe-container-benches` の `plugin_boundary` ベンチ（`harness = false`。TASK-113.1・PLUG-5・PLUG-6）。
 //!
-//! 代表操作 B（イメージ一覧）の plugin 境界往復コストと同一プロセス呼び出しコストを計測する
-//! （PLUG-5・PLUG-6）。計測ロジックは `fandhe_container_benches::plugin_boundary` にあり、
-//! ここは引数解釈・子プロセスモード分岐・結果出力だけの薄い層。
+//! 役割: 代表操作 A（作成〜起動相当の 3 往復）を同一プロセスと plugin 境界越し（別プロセス＋UDS＋
+//! 長さ接頭辞フレーム）で測り、p50 を結果 JSON として出力する。計測ロジックは
+//! `fandhe_container_benches::plugin_boundary` にあり、ここは引数の振り分け・子プロセスの起動と
+//! 後始末・ファイル書き出しだけを担う。
 //!
-//! 引数:
-//! - `--output <path>`: 本計測（1,000 回 × 5 試行）。結果 JSON を `<path>` へ書き標準出力にも出す
-//! - 引数なし: スモーク（少回数。`cargo test --all-targets` 等からの実行想定）。境界経路を
-//!   計測できない環境（非 unix）では同一プロセス経路のみ検証し、境界経路は未計測と警告する
-//!   （本計測 `--output` は同環境で非ゼロ終了。fail-closed）
-//! - `--plugin-serve <path>`: 子プロセス（plugin 役）モード。本ベンチが自分自身を起動する内部用
-//! - `--bench`: cargo が自動付与するため無視
+//! 配置方式の決定（TASK-113）: root の `benches/benches/*.rs` を自動発見に任せ、`path` 明示はしない。
 //!
-//! 結果 JSON を CI のベンチ回帰ゲートへ接続するのは #272（TASK-113.4）。本ベンチ単体では
-//! 合否判定をしない。
+//! 呼び出し: `cargo bench -p fandhe-container-benches --bench plugin_boundary -- --output <path>`。
+//! 引数なしはスモーク実行（結果 JSON を標準出力へ）。`--plugin-serve <socket>` は子プロセス専用の内部引数。
+//! ゲート（`scripts/check-bench-regression.sh`）へは未接続（baseline 未登録。TASK-113.3・TASK-88）。
+//!
+//! 境界機構は Unix ドメインソケットに依存するため、Windows では未対応（WIN-1 により境界機構は
+//! WSL2 内の Linux 側で動く）。
 
-use fandhe_container_benches::plugin_boundary::{
-    BenchError, MockImageStore, Mode, Results, SAMPLES_PER_TRIAL, SMOKE_SAMPLES, SMOKE_TRIALS,
-    TRIALS, measure_inproc, parse_args, run_framed_with_child,
-};
-use std::process::ExitCode;
+#[cfg(unix)]
+mod imp {
+    use std::env;
+    use std::fs;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::path::PathBuf;
+    use std::process::{Child, Command as Proc, ExitCode, Stdio};
 
-fn run(mode: Mode) -> Result<(), BenchError> {
-    match mode {
-        Mode::PluginServe { socket } => serve(&socket),
-        Mode::Measure { output } => {
-            let framed = run_framed_with_child(TRIALS, SAMPLES_PER_TRIAL)?;
-            let inproc = measure_inproc(&MockImageStore, TRIALS, SAMPLES_PER_TRIAL)?;
-            let json = Results {
-                inproc,
-                framed: Some(framed),
+    use fandhe_container_benches::plugin_boundary::{
+        BenchError, CONNECT_TIMEOUT, Command, Plan, SMOKE_ITERATIONS, SMOKE_TRIALS,
+        WARMUP_ITERATIONS, measure_framed, measure_inproc, parse_args, results_json, serve,
+    };
+    use fandhe_container_plugin::{UdsListener, UdsStream};
+
+    /// 子プロセスと一時ディレクトリを失敗時も含めて必ず後始末する。
+    struct Guard {
+        child: Option<Child>,
+        dir: PathBuf,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.child.take() {
+                // 接続切断で自発終了するが、残っていれば kill して回収する。
+                let _ = c.kill();
+                let _ = c.wait();
             }
-            .to_json()?;
-            std::fs::write(&output, &json)
-                .map_err(|e| BenchError::new("io", format!("write output failed: {e}")))?;
-            print!("{json}");
-            Ok(())
+            let _ = fs::remove_dir_all(&self.dir);
         }
-        Mode::Smoke => {
-            let inproc = measure_inproc(&MockImageStore, SMOKE_TRIALS, SMOKE_SAMPLES)?;
-            // スモークは配線確認のみで合否ゲートではない。境界越し経路が未実装の環境（Windows 等。
-            // WIN-1）に限り、同一プロセス経路だけ検証して `framed: null` と stderr の警告で
-            // 「境界経路は未計測」を明示する（成功扱いの沈黙にしない）。それ以外の失敗、および
-            // 本計測（`--output`）の未実装は非ゼロ終了のまま（fail-closed。PLUG-5）。
-            let framed = match run_framed_with_child(SMOKE_TRIALS, SMOKE_SAMPLES) {
-                Ok(v) => Some(v),
-                Err(e) if e.code == "unimplemented" => {
-                    eprintln!("warning: boundary path NOT measured in smoke ({e})");
-                    None
-                }
-                Err(e) => return Err(e),
-            };
-            print!("{}", Results { inproc, framed }.to_json()?);
-            Ok(())
+    }
+
+    fn run_parent(plan: Plan) -> Result<String, BenchError> {
+        let inproc = measure_inproc(plan)?;
+
+        // sun_path の長さ制限（macOS 104 バイト）を避けるため名前を短くする。
+        // 作成は mkdir 相当（既存なら失敗）で、0700 にして他ユーザーの先回りを拒否する。
+        // PID 再利用による衝突を避けるため、ナノ秒時刻を接尾辞に加える（短さを保つため 16 進）。
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
+            .unwrap_or(0);
+        let dir = env::temp_dir().join(format!("fcpb-{}-{:x}", std::process::id(), nanos));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|_| BenchError::new("io-error", "failed to create temporary directory"))?;
+        let mut guard = Guard {
+            child: None,
+            dir: dir.clone(),
+        };
+
+        let listener = UdsListener::bind(&dir.join("s.sock"))?;
+        let exe = env::current_exe()
+            .map_err(|_| BenchError::new("io-error", "failed to resolve current executable"))?;
+        // シェルを経由せず引数配列で起動する。
+        let child = Proc::new(exe)
+            .arg("--plugin-serve")
+            .arg(listener.path())
+            .stdin(Stdio::null())
+            .spawn()
+            .map_err(|_| BenchError::new("spawn-failed", "failed to spawn plugin process"))?;
+        guard.child = Some(child);
+
+        let mut stream = listener.accept(CONNECT_TIMEOUT)?;
+        let framed = measure_framed(plan, &mut stream)?;
+        drop(stream);
+        Ok(results_json(inproc, framed))
+    }
+
+    fn run_child(socket: &str) -> Result<(), BenchError> {
+        let mut stream = UdsStream::connect(std::path::Path::new(socket), CONNECT_TIMEOUT)?;
+        serve(&mut stream)
+    }
+
+    pub fn main() -> ExitCode {
+        let args: Vec<String> = env::args().skip(1).collect();
+        let result = parse_args(&args).and_then(|cmd| match cmd {
+            Command::PluginServe { socket } => run_child(&socket),
+            Command::Smoke => run_parent(Plan {
+                iterations: SMOKE_ITERATIONS,
+                trials: SMOKE_TRIALS,
+                warmup: WARMUP_ITERATIONS,
+            })
+            .map(|j| print!("{j}")),
+            Command::Run { plan, output } => run_parent(plan).and_then(|j| {
+                fs::write(&output, j)
+                    .map_err(|_| BenchError::new("write-failed", "failed to write the output file"))
+            }),
+        });
+        match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
         }
     }
 }
 
 #[cfg(unix)]
-fn serve(socket: &str) -> Result<(), BenchError> {
-    fandhe_container_benches::plugin_boundary::serve_socket(std::path::Path::new(socket))
+fn main() -> std::process::ExitCode {
+    imp::main()
 }
 
 #[cfg(not(unix))]
-fn serve(_socket: &str) -> Result<(), BenchError> {
-    Err(BenchError::new(
-        "unimplemented",
-        "plugin role is unavailable on this platform",
-    ))
-}
-
-fn main() -> ExitCode {
+fn main() -> std::process::ExitCode {
+    use fandhe_container_benches::plugin_boundary::{Command, parse_args};
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match parse_args(&args).and_then(run) {
-        Ok(()) => ExitCode::SUCCESS,
+    match parse_args(&args) {
+        Ok(Command::Smoke) => {
+            println!("plugin_boundary: skipped; the plugin boundary requires Unix domain sockets");
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            eprintln!(
+                "error: unsupported-platform: the plugin boundary requires Unix domain sockets"
+            );
+            std::process::ExitCode::FAILURE
+        }
         Err(e) => {
-            eprintln!("{e}");
-            ExitCode::FAILURE
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
         }
     }
 }

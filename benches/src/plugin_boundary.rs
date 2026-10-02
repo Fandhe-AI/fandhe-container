@@ -1,64 +1,75 @@
-//! plugin 境界ベンチの計測ハーネス（TASK-113.2・#271。代表操作 B「イメージ一覧」）。
+//! 代表操作 A（RunPodSandbox → CreateContainer → StartContainer 相当の 3 往復）の
+//! plugin 境界ベンチの計測ロジック（TASK-113.1・PLUG-5・PLUG-6・MS-3）。
 //!
-//! PLUG-5 は「別プロセス＋UDS＋長さ接頭辞フレーム」の制御面往復コストを、代表操作
-//! (A) 作成〜起動相当（N=3）と (B) イメージ一覧（N=1）について 1 試行 1,000 回 × 5 試行で
-//! 計測すると定める。PoC-13 は bincode ペイロードでの計測だったため、serde_json 化（PLUG-2）
-//! 後の再計測が TASK-113 に要る。本モジュールはそのうち代表操作 B の計測部品を持つ。
+//! 役割: 同一プロセス呼び出しと、plugin 境界越し（別プロセス＋UDS＋長さ接頭辞フレーム。
+//! `fandhe-container-plugin`）呼び出しの p50 レイテンシを同じ状態遷移モデルで測り、
+//! 比較スクリプト（`scripts/check-bench-regression.sh`）の results スキーマ
+//! （`schema_version: 1`）の JSON として出力する。
 //!
-//! 呼び出し元: `benches/benches/plugin_boundary.rs`（薄い `main`。引数解釈・子プロセス起動・
-//! 結果出力のみ）と、本モジュール内のユニットテスト（`harness = false` のベンチには
-//! `#[test]` を置けないため、ロジックはライブラリ側に置く。REPAIR-12）。
-//! 結果 JSON は `scripts/check-bench-regression.sh` の results スキーマ（`schema_version: 1`）に
-//! 適合する。Δp50 算出・CORE-10 比・回帰ゲートへの接続は #272（TASK-113.4）で行う。
+//! 呼び出し元: `benches/plugin_boundary.rs`（`harness = false` の薄い `main`。子プロセスの起動・
+//! 後始末・ファイル書き出しを担う）と `benches/tests/plugin_boundary.rs`（スレッドのサーバーでの結合試験）。
+//! `make test` はベンチバイナリを実行しないため、ロジックはこのモジュールに置いてテストする。
 //!
-//! 計測対象は **模擬制御コア**（固定の少数件のイメージ参照文字列を返すだけ）であり、実 OCI
-//! イメージストアではない（REPAIR-3）。実処理を混ぜると境界コストが埋もれるため（PoC-13 と
-//! 同じ整理）。
+//! 計測区間: 1 サンプル = 代表操作 A の 3 呼び出しの合計。接続確立・子プロセス起動は含めない
+//! （起動コストは PLUG-6・TASK-113.4 側）。試行ごとの p50 の中央値を結果とする（PoC-13 と同じ集計）。
 //!
-//! - 同一プロセス経路: [`ImageLister`] 越しに直接呼ぶ。1 呼び出しが時計分解能を下回りうるため、
-//!   1 サンプル = [`INPROC_BATCH`] 回の経過時間 ÷ 回数
-//! - 境界越し経路（`cfg(unix)`）: 自分自身を子プロセス（plugin 役）として起動し、UDS 上で
-//!   `encode_message → write_frame → read_frame → decode_message` の往復を 1 サンプルとして計測
-//! - 集計: 試行ごとの p50 を出し、試行間の中央値を最終値とする（PoC-13 と同じ。[`p50`]）
-//! - 非 unix（Windows）では UDS 転送が `Unimplemented`（WIN-1 により WSL2 内 Linux 側機構に
-//!   乗る）のため境界経路は計測できず、片方だけの結果を成功として出さない（fail-closed）
+//! 未対応（後続 sub）: 代表操作 B（TASK-113.2）、Δp50 の算出と 15% ゲート接続（TASK-113.3）、
+//! macOS cold start 上乗せ（TASK-113.4）、gRPC 経路（TASK-108。未実装）。本モジュールの出力は
+//! `benches/baseline.json` に未登録のためゲートには接続していない（基準値の確定は TASK-88）。
 
 use std::fmt;
-use std::hint::black_box;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// 1 試行あたりのサンプル数（PLUG-5）。
-pub const SAMPLES_PER_TRIAL: usize = 1_000;
-/// 試行数（PLUG-5）。
-pub const TRIALS: usize = 5;
-/// 境界経路の計測前ウォームアップ往復数（結果に含めない）。
-pub const WARMUP_ROUND_TRIPS: usize = 100;
-/// スモークモードのサンプル数。
-pub const SMOKE_SAMPLES: usize = 20;
-/// スモークモードの試行数。
-pub const SMOKE_TRIALS: usize = 1;
-/// 同一プロセス経路で 1 サンプルに含める呼び出し回数。
-pub const INPROC_BATCH: usize = 1_000;
+use fandhe_container_plugin::{
+    ControlMessage, MessageId, PluginError, PluginErrorCode, RpcTimeout, UdsStream, decode_message,
+    encode_message,
+};
 
-/// 同一プロセス経路の metric 名。
-pub const METRIC_INPROC: &str = "plugin_boundary_list_images_inproc_p50";
-/// 境界越し経路の metric 名。
-pub const METRIC_FRAMED: &str = "plugin_boundary_list_images_framed_p50";
+/// 1 試行あたりの反復数の既定値（PLUG-5 の計測条件）。
+pub const DEFAULT_ITERATIONS: usize = 1_000;
+/// 試行数の既定値（PLUG-5 の計測条件）。
+pub const DEFAULT_TRIALS: usize = 5;
+/// 各試行前のウォームアップ回数（記録しない）。
+pub const WARMUP_ITERATIONS: usize = 100;
+/// 引数なし（スモーク）実行の反復数。
+pub const SMOKE_ITERATIONS: usize = 20;
+/// 引数なし（スモーク）実行の試行数。
+pub const SMOKE_TRIALS: usize = 2;
+/// 無制限な長時間占有を避けるための反復数の上限。
+pub const MAX_ITERATIONS: usize = 1_000_000;
+/// 試行数の上限。
+pub const MAX_TRIALS: usize = 100;
+/// フレーム 1 つの送受信に許す期限（REPAIR-5。`RpcTimeout` の上限と同じ 10 秒）。
+pub const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// accept・connect の期限。
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// ハーネスのエラー。`error: <code>: <message>`（英語）で標準エラーへ出す。
+/// 結果 JSON の metric 名（同一プロセス経路）。
+pub const METRIC_INPROC: &str = "plugin_boundary_op_a_inproc_p50";
+/// 結果 JSON の metric 名（境界越し経路）。
+pub const METRIC_FRAMED: &str = "plugin_boundary_op_a_framed_p50";
+
+const OP_RUN_POD_SANDBOX: &str = "run_pod_sandbox";
+const OP_CREATE_CONTAINER: &str = "create_container";
+const OP_START_CONTAINER: &str = "start_container";
+const PREFIX_SANDBOX: &str = "sandbox-";
+const PREFIX_CONTAINER: &str = "container-";
+const STATE_RUNNING: &str = "running";
+
+/// ベンチハーネスの構造化エラー（`code` は機械可読、`message` は英語。ERR-1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BenchError {
-    /// 機械可読な種別。
-    pub code: String,
-    /// 説明。
+    /// 機械可読なコード。
+    pub code: &'static str,
+    /// 英語の説明。受信データの断片は載せない。
     pub message: String,
 }
 
 impl BenchError {
-    /// エラーを作る。
-    pub fn new(code: &str, message: impl Into<String>) -> Self {
+    /// 構造化エラーを作る。
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
-            code: code.to_string(),
+            code,
             message: message.into(),
         }
     }
@@ -66,418 +77,377 @@ impl BenchError {
 
 impl fmt::Display for BenchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "error: {}: {}", self.code, self.message)
+        write!(f, "{}: {}", self.code, self.message)
     }
 }
 
-impl std::error::Error for BenchError {}
-
-/// p50 を返す。昇順に並べ、奇数件は中央要素、偶数件は中央 2 要素の平均（PLUG-5）。
-/// 試行間の中央値も同じ関数で求める。空入力・非有限値は `Err`。
-pub fn p50(samples: &[f64]) -> Result<f64, BenchError> {
-    if samples.is_empty() {
-        return Err(BenchError::new("invalid-input", "no samples"));
-    }
-    if samples.iter().any(|v| !v.is_finite()) {
-        return Err(BenchError::new("invalid-input", "non-finite sample"));
-    }
-    let mut sorted = samples.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let n = sorted.len();
-    let mid = n / 2;
-    if n % 2 == 1 {
-        Ok(sorted[mid])
-    } else {
-        Ok((sorted[mid - 1] + sorted[mid]) / 2.0)
+impl From<PluginError> for BenchError {
+    fn from(e: PluginError) -> Self {
+        // 相手由来の文字列は載せず、code のみを写す。
+        let code = match e.code() {
+            PluginErrorCode::Timeout => "timeout",
+            PluginErrorCode::Unavailable => "unavailable",
+            PluginErrorCode::PermissionDenied => "permission-denied",
+            PluginErrorCode::Unimplemented => "unsupported-platform",
+            _ => "plugin-error",
+        };
+        Self::new(code, format!("plugin boundary error ({})", e.code()))
     }
 }
 
-/// 代表操作 B（イメージ一覧）を提供する制御コアの抽象。同一プロセス経路ではこのトレイト越し、
-/// 境界越し経路では plugin 役プロセスが応答の生成に使う。
-pub trait ImageLister {
-    /// イメージ参照の一覧を返す。
-    fn list_images(&self) -> Vec<String>;
+/// 代表操作 A の状態遷移モデル（ID 採番と状態更新のみ。プロセス起動なし）。
+///
+/// 同一プロセス経路は直接、境界越し経路は子プロセス側のサーバーループから呼ばれ、
+/// 両経路が同じ処理量になるようにする。
+#[derive(Debug, Default)]
+pub struct Model {
+    next_id: u64,
+    sandbox: Option<String>,
+    container: Option<(String, bool)>,
 }
 
-/// 模擬制御コア。固定の少数件を返すだけで、実 OCI イメージストアには触れない（REPAIR-3）。
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MockImageStore;
-
-/// 模擬イメージ参照（ダミー値）。
-const MOCK_IMAGES: [&str; 4] = [
-    "example.invalid/app/alpha:1.0",
-    "example.invalid/app/beta:2.1",
-    "example.invalid/lib/gamma:0.9",
-    "example.invalid/lib/delta:3.4",
-];
-
-impl ImageLister for MockImageStore {
-    fn list_images(&self) -> Vec<String> {
-        MOCK_IMAGES.iter().map(|s| (*s).to_string()).collect()
+impl Model {
+    /// 空のモデルを作る。
+    pub fn new() -> Self {
+        Self::default()
     }
-}
 
-/// 同一プロセス経路の p50（ns）を計測する。`trials` 試行 × `samples` サンプルで、
-/// 1 サンプルは [`INPROC_BATCH`] 回呼び出しの平均。
-pub fn measure_inproc(
-    lister: &dyn ImageLister,
-    trials: usize,
-    samples: usize,
-) -> Result<f64, BenchError> {
-    let mut trial_p50s = Vec::with_capacity(trials);
-    for _ in 0..trials {
-        let mut values = Vec::with_capacity(samples);
-        for _ in 0..samples {
-            let start = Instant::now();
-            for _ in 0..INPROC_BATCH {
-                black_box(black_box(lister).list_images());
+    /// 1 操作を処理する。`args` は `[op, 引数...]`。未知の操作・前提状態違反は構造化エラー。
+    pub fn handle(&mut self, args: &[String]) -> Result<Vec<String>, PluginError> {
+        let op = args.first().map(String::as_str).unwrap_or("");
+        match op {
+            OP_RUN_POD_SANDBOX => {
+                self.next_id += 1;
+                let id = format!("sandbox-{}", self.next_id);
+                self.sandbox = Some(id.clone());
+                self.container = None;
+                Ok(vec![id])
             }
-            let ns = start.elapsed().as_nanos() as f64 / INPROC_BATCH as f64;
-            // 経過 0 は未計測であり正の値へ置き換えない（計測エラーとして失敗させる）。
-            if ns <= 0.0 {
-                return Err(BenchError::new(
-                    "measurement",
-                    "elapsed time was zero (clock resolution too coarse)",
-                ));
-            }
-            values.push(ns);
-        }
-        trial_p50s.push(p50(&values)?);
-    }
-    p50(&trial_p50s)
-}
-
-/// 計測結果。`framed` は境界経路を計測できなかった場合（非 unix のスモーク）に `None`。
-#[derive(Debug, Clone, PartialEq)]
-pub struct Results {
-    /// 同一プロセス経路の p50（ns）。
-    pub inproc: f64,
-    /// 境界越し経路の p50（ns）。
-    pub framed: Option<f64>,
-}
-
-impl Results {
-    /// results スキーマの JSON（LF 改行）を返す。全値が有限かつ 0 超でなければ `Err`。
-    pub fn to_json(&self) -> Result<String, BenchError> {
-        // 未計測（`None`）は metric ごと省略せず `null` で明示する（スモーク出力の契約）。
-        let entries = [
-            (METRIC_INPROC, Some(self.inproc)),
-            (METRIC_FRAMED, self.framed),
-        ];
-        let mut body = Vec::new();
-        for (name, value) in entries {
-            match value {
-                Some(value) => {
-                    if !value.is_finite() || value <= 0.0 {
-                        return Err(BenchError::new(
-                            "invalid-result",
-                            format!("metric {name} must be finite and positive"),
-                        ));
-                    }
-                    body.push(format!(
-                        "    \"{name}\": {{ \"value\": {value}, \"unit\": \"ns\" }}"
+            OP_CREATE_CONTAINER => {
+                let sandbox = args.get(1);
+                if sandbox.is_none() || sandbox != self.sandbox.as_ref() {
+                    return Err(PluginError::new(
+                        PluginErrorCode::FailedPrecondition,
+                        "unknown sandbox",
                     ));
                 }
-                None => body.push(format!("    \"{name}\": null")),
+                self.next_id += 1;
+                let id = format!("container-{}", self.next_id);
+                self.container = Some((id.clone(), false));
+                Ok(vec![id])
             }
+            OP_START_CONTAINER => match (&mut self.container, args.get(1)) {
+                (Some((id, started)), Some(want)) if id == want && !*started => {
+                    *started = true;
+                    Ok(vec![STATE_RUNNING.to_string()])
+                }
+                _ => Err(PluginError::new(
+                    PluginErrorCode::FailedPrecondition,
+                    "unknown or already started container",
+                )),
+            },
+            _ => Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                "unknown operation",
+            )),
         }
-        Ok(format!(
-            "{{\n  \"schema_version\": 1,\n  \"metrics\": {{\n{}\n  }}\n}}\n",
-            body.join(",\n")
+    }
+}
+
+/// 代表操作 A 1 回分の結果（検証用。両経路で一致すること）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpAOutcome {
+    /// RunPodSandbox 相当の結果 ID。
+    pub sandbox_id: String,
+    /// CreateContainer 相当の結果 ID。
+    pub container_id: String,
+    /// StartContainer 相当の結果状態。
+    pub state: String,
+}
+
+/// 応答本体がちょうど 1 要素であることを検証して取り出す（plugin 応答は untrusted。PLUG-5）。
+fn single(v: Vec<String>) -> Result<String, BenchError> {
+    let mut it = v.into_iter();
+    match (it.next(), it.next()) {
+        (Some(one), None) => Ok(one),
+        _ => Err(BenchError::new(
+            "bad-response",
+            "response body must contain exactly one element",
+        )),
+    }
+}
+
+/// `<prefix><10 進数>` 形式の ID であることを検証する（`Model` が採番する形式）。
+fn expect_id(v: Vec<String>, prefix: &str) -> Result<String, BenchError> {
+    let id = single(v)?;
+    let ok = id
+        .strip_prefix(prefix)
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+    if ok {
+        Ok(id)
+    } else {
+        Err(BenchError::new("bad-response", "unexpected id format"))
+    }
+}
+
+/// StartContainer 相当の応答が `running` であることを検証する。
+fn expect_running(v: Vec<String>) -> Result<String, BenchError> {
+    let state = single(v)?;
+    if state == STATE_RUNNING {
+        Ok(state)
+    } else {
+        Err(BenchError::new(
+            "bad-response",
+            "unexpected container state",
         ))
     }
 }
 
-/// 実行モード。
+/// 同一プロセスで代表操作 A（3 呼び出し）を実行する。
+pub fn run_op_a_inproc(model: &mut Model) -> Result<OpAOutcome, BenchError> {
+    let sandbox_id = expect_id(
+        model.handle(&[OP_RUN_POD_SANDBOX.to_string()])?,
+        PREFIX_SANDBOX,
+    )?;
+    let container_id = expect_id(
+        model.handle(&[OP_CREATE_CONTAINER.to_string(), sandbox_id.clone()])?,
+        PREFIX_CONTAINER,
+    )?;
+    let state =
+        expect_running(model.handle(&[OP_START_CONTAINER.to_string(), container_id.clone()])?)?;
+    Ok(OpAOutcome {
+        sandbox_id,
+        container_id,
+        state,
+    })
+}
+
+type Msg = ControlMessage<Vec<String>>;
+
+fn rpc_timeout() -> Result<RpcTimeout, BenchError> {
+    Ok(RpcTimeout::new(FRAME_TIMEOUT)?)
+}
+
+/// 境界越しに 1 往復する（`write_frame` → `read_frame` → 復号）。応答は untrusted として検証する。
+fn round_trip(
+    stream: &mut UdsStream,
+    id: u64,
+    args: Vec<String>,
+) -> Result<Vec<String>, BenchError> {
+    let timeout = rpc_timeout()?;
+    let req: Msg = ControlMessage::Request {
+        id: MessageId::new(id),
+        body: args,
+    };
+    stream.write_frame(&encode_message(&req)?, timeout)?;
+    let frame = stream.read_frame(timeout)?;
+    match decode_message::<Vec<String>>(&frame)? {
+        ControlMessage::Response { id: rid, body } if rid == MessageId::new(id) => Ok(body),
+        ControlMessage::Error { .. } => {
+            Err(BenchError::new("remote-error", "peer returned an error"))
+        }
+        _ => Err(BenchError::new(
+            "bad-response",
+            "unexpected response message",
+        )),
+    }
+}
+
+/// 接続済みの `UdsStream` 越しに代表操作 A（3 往復）を実行する。`next_id` はメッセージ ID の採番元。
+pub fn run_op_a_framed(
+    stream: &mut UdsStream,
+    next_id: &mut u64,
+) -> Result<OpAOutcome, BenchError> {
+    let mut call = |args: Vec<String>| -> Result<Vec<String>, BenchError> {
+        *next_id += 1;
+        round_trip(stream, *next_id, args)
+    };
+    let sandbox_id = expect_id(call(vec![OP_RUN_POD_SANDBOX.to_string()])?, PREFIX_SANDBOX)?;
+    let container_id = expect_id(
+        call(vec![OP_CREATE_CONTAINER.to_string(), sandbox_id.clone()])?,
+        PREFIX_CONTAINER,
+    )?;
+    let state = expect_running(call(vec![
+        OP_START_CONTAINER.to_string(),
+        container_id.clone(),
+    ])?)?;
+    Ok(OpAOutcome {
+        sandbox_id,
+        container_id,
+        state,
+    })
+}
+
+/// plugin 役のサーバーループ。切断（`Unavailable`）で正常終了し、それ以外の受信失敗はエラーで返す。
+///
+/// 未知の操作・前提状態違反は `ControlMessage::Error` を返して継続する。
+pub fn serve(stream: &mut UdsStream) -> Result<(), BenchError> {
+    let timeout = rpc_timeout()?;
+    let mut model = Model::new();
+    loop {
+        let frame = match stream.read_frame(timeout) {
+            Ok(f) => f,
+            Err(e) if e.code() == PluginErrorCode::Unavailable => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let reply: Msg = match decode_message::<Vec<String>>(&frame)? {
+            ControlMessage::Request { id, body } => match model.handle(&body) {
+                Ok(body) => ControlMessage::Response { id, body },
+                Err(error) => ControlMessage::Error { id, error },
+            },
+            _ => {
+                return Err(BenchError::new("bad-request", "expected a request message"));
+            }
+        };
+        stream.write_frame(&encode_message(&reply)?, timeout)?;
+    }
+}
+
+/// 偶数個なら中央 2 値の平均（切り捨て）、奇数個なら中央値。空は `None`。入力は並べ替える。
+pub fn percentile_p50(samples: &mut [u64]) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let n = samples.len();
+    let hi = *samples.get(n / 2)?;
+    if n % 2 == 1 {
+        return Some(hi);
+    }
+    let lo = *samples.get(n / 2 - 1)?;
+    Some(lo / 2 + hi / 2 + (lo % 2 + hi % 2) / 2)
+}
+
+/// 計測条件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Plan {
+    /// 1 試行あたりの反復数。
+    pub iterations: usize,
+    /// 試行数。
+    pub trials: usize,
+    /// 試行前のウォームアップ回数。
+    pub warmup: usize,
+}
+
+fn measure<F>(plan: Plan, mut op: F) -> Result<u64, BenchError>
+where
+    F: FnMut() -> Result<(), BenchError>,
+{
+    let mut trial_p50s = Vec::with_capacity(plan.trials);
+    for _ in 0..plan.trials {
+        for _ in 0..plan.warmup {
+            op()?;
+        }
+        let mut samples = Vec::with_capacity(plan.iterations);
+        for _ in 0..plan.iterations {
+            let t = Instant::now();
+            op()?;
+            samples.push(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
+        let p50 = percentile_p50(&mut samples)
+            .ok_or_else(|| BenchError::new("no-samples", "no samples were collected"))?;
+        trial_p50s.push(p50);
+    }
+    let p50 = percentile_p50(&mut trial_p50s)
+        .ok_or_else(|| BenchError::new("no-samples", "no trials were run"))?;
+    if p50 == 0 {
+        return Err(BenchError::new(
+            "clock-resolution",
+            "measured p50 is 0 ns; the clock resolution is too coarse",
+        ));
+    }
+    Ok(p50)
+}
+
+/// 同一プロセス経路の p50（ns）を測る。
+pub fn measure_inproc(plan: Plan) -> Result<u64, BenchError> {
+    let mut model = Model::new();
+    measure(plan, || run_op_a_inproc(&mut model).map(|_| ()))
+}
+
+/// 境界越し経路の p50（ns）を測る。`stream` は接続確立済みであること。
+pub fn measure_framed(plan: Plan, stream: &mut UdsStream) -> Result<u64, BenchError> {
+    let mut next_id = 0u64;
+    measure(plan, || run_op_a_framed(stream, &mut next_id).map(|_| ()))
+}
+
+/// 結果 JSON（比較スクリプトの results スキーマ。単位は ns）を組み立てる。
+pub fn results_json(inproc_p50_ns: u64, framed_p50_ns: u64) -> String {
+    format!(
+        "{{\n  \"schema_version\": 1,\n  \"metrics\": {{\n    \"{METRIC_INPROC}\": {{\n      \"value\": {inproc_p50_ns},\n      \"unit\": \"ns\"\n    }},\n    \"{METRIC_FRAMED}\": {{\n      \"value\": {framed_p50_ns},\n      \"unit\": \"ns\"\n    }}\n  }}\n}}\n"
+    )
+}
+
+/// 解釈済みのコマンドライン。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Mode {
-    /// 本計測（1,000×5）。結果 JSON を `output` へ書く。
-    Measure {
-        /// 出力先パス。
+pub enum Command {
+    /// 少数回の計測を行い、結果 JSON を標準出力へ出す。
+    Smoke,
+    /// 計測し、結果 JSON を `output` へ書く。
+    Run {
+        /// 計測条件。
+        plan: Plan,
+        /// 結果 JSON の書き出し先。
         output: String,
     },
-    /// スモーク（少回数で両経路を通す）。
-    Smoke,
-    /// 子プロセス（plugin 役）。内部用。
+    /// 子プロセス側（plugin 役）。`socket` へ接続してサーバーループを回す。
     PluginServe {
-        /// 接続先 socket パス。
+        /// 接続先の socket パス。
         socket: String,
     },
 }
 
-/// 引数（プログラム名を除く）を解釈する。`--bench`（cargo が自動付与）は無視する。
-pub fn parse_args(args: &[String]) -> Result<Mode, BenchError> {
-    let rest: Vec<&str> = args
-        .iter()
-        .map(String::as_str)
-        .filter(|a| *a != "--bench")
-        .collect();
-    match rest.as_slice() {
-        [] => Ok(Mode::Smoke),
-        ["--output", path] => Ok(Mode::Measure {
-            output: (*path).to_string(),
-        }),
-        ["--plugin-serve", path] => Ok(Mode::PluginServe {
-            socket: (*path).to_string(),
-        }),
-        ["--output"] | ["--plugin-serve"] => {
-            Err(BenchError::new("invalid-args", "missing value for option"))
+/// 引数（プログラム名を除く）を解釈する。`cargo bench` が付ける `--bench` は無視する。
+pub fn parse_args(args: &[String]) -> Result<Command, BenchError> {
+    let invalid = |m: &str| BenchError::new("invalid-args", m.to_string());
+    let mut output = None;
+    let mut socket = None;
+    let mut iterations = None;
+    let mut trials = None;
+    let mut it = args.iter().filter(|a| a.as_str() != "--bench");
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--output" | "--plugin-serve" | "--iterations" | "--trials" => {}
+            _ => {
+                return Err(invalid(
+                    "usage: plugin_boundary [--output <path>] [--iterations <n>] [--trials <n>]",
+                ));
+            }
         }
-        _ => Err(BenchError::new("invalid-args", "unrecognized arguments")),
+        let value = it
+            .next()
+            .ok_or_else(|| invalid("missing value for option"))?;
+        match a.as_str() {
+            "--output" => output = Some(value.clone()),
+            "--plugin-serve" => socket = Some(value.clone()),
+            "--iterations" => iterations = Some(parse_count(value, MAX_ITERATIONS)?),
+            _ => trials = Some(parse_count(value, MAX_TRIALS)?),
+        }
+    }
+    if let Some(socket) = socket {
+        return Ok(Command::PluginServe { socket });
+    }
+    match output {
+        Some(output) => Ok(Command::Run {
+            plan: Plan {
+                iterations: iterations.unwrap_or(DEFAULT_ITERATIONS),
+                trials: trials.unwrap_or(DEFAULT_TRIALS),
+                warmup: WARMUP_ITERATIONS,
+            },
+            output,
+        }),
+        None if iterations.is_none() && trials.is_none() => Ok(Command::Smoke),
+        None => Err(invalid("--iterations and --trials require --output")),
     }
 }
 
-#[cfg(unix)]
-pub use boundary::{
-    PluginProcess, TempDir, measure_framed, run_framed_with_child, serve_connection, serve_socket,
-};
-
-/// 境界越し経路。非 unix では UDS 転送が `Unimplemented` のため計測不能。
-#[cfg(not(unix))]
-pub fn run_framed_with_child(_trials: usize, _samples: usize) -> Result<f64, BenchError> {
-    Err(BenchError::new(
-        "unimplemented",
-        "UDS transport is unavailable on this platform (WIN-1: Linux side of WSL2)",
-    ))
-}
-
-#[cfg(unix)]
-mod boundary {
-    use super::{BenchError, ImageLister, MockImageStore, WARMUP_ROUND_TRIPS, p50};
-    use fandhe_container_plugin::{
-        ControlMessage, MessageId, PluginError, PluginErrorCode, RpcTimeout, UdsListener,
-        UdsStream, decode_message, encode_message,
-    };
-    use std::fs;
-    use std::os::unix::fs::DirBuilderExt;
-    use std::path::{Path, PathBuf};
-    use std::process::{Child, Command};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, Instant};
-
-    /// accept・connect の期限（REPAIR-5）。
-    const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
-    /// 往復 1 回の期限（REPAIR-5）。
-    const RPC_TIMEOUT: Duration = Duration::from_secs(10);
-    /// 子プロセス終了待ちの期限。
-    const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
-
-    fn rpc_timeout() -> Result<RpcTimeout, BenchError> {
-        RpcTimeout::new(RPC_TIMEOUT).map_err(plugin_err)
-    }
-
-    fn plugin_err(e: PluginError) -> BenchError {
-        BenchError::new(&e.code().as_str().to_ascii_lowercase(), e.message())
-    }
-
-    /// 0700 の専用一時ディレクトリ。既存名は失敗（予測可能名の先取り対策）。Drop で削除する。
-    /// `sun_path` 長制限（macOS 104 バイト）に収まるよう名前は短くする。
-    #[derive(Debug)]
-    pub struct TempDir(PathBuf);
-
-    /// 名前衝突時の再試行上限。
-    const MAX_ATTEMPTS: usize = 64;
-
-    impl TempDir {
-        /// 一時ディレクトリを作る。
-        pub fn new() -> Result<Self, BenchError> {
-            static SEQ: AtomicU64 = AtomicU64::new(0);
-            // 強制終了後の PID 再利用で名前が衝突しても、連番を進めて別名で再試行する。
-            // 既存名は先取り対策のため引き続き失敗扱い（`create` は既存を流用しない）。
-            for _ in 0..MAX_ATTEMPTS {
-                let name = format!(
-                    "fcb-{}-{}",
-                    std::process::id(),
-                    SEQ.fetch_add(1, Ordering::Relaxed)
-                );
-                let path = std::env::temp_dir().join(name);
-                match fs::DirBuilder::new().mode(0o700).create(&path) {
-                    Ok(()) => return Ok(Self(path)),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(e) => {
-                        return Err(BenchError::new(
-                            "io",
-                            format!("create temp dir failed: {e}"),
-                        ));
-                    }
-                }
-            }
-            Err(BenchError::new(
-                "io",
-                "create temp dir failed: all candidate names already exist",
-            ))
-        }
-
-        /// ディレクトリのパス。
-        pub fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// plugin 役の子プロセス。Drop で確実に kill・wait する（ゾンビを残さない）。
-    #[derive(Debug)]
-    pub struct PluginProcess(Option<Child>);
-
-    impl PluginProcess {
-        /// 自分自身（`current_exe()` のみ。`PATH` 探索なし）を `--plugin-serve` で起動する。
-        pub fn spawn(socket: &Path) -> Result<Self, BenchError> {
-            let exe = std::env::current_exe()
-                .map_err(|e| BenchError::new("io", format!("current_exe failed: {e}")))?;
-            let child = Command::new(exe)
-                .arg("--plugin-serve")
-                .arg(socket)
-                .spawn()
-                .map_err(|e| BenchError::new("io", format!("spawn failed: {e}")))?;
-            Ok(Self(Some(child)))
-        }
-
-        /// 子の正常終了を期限付きで待つ。呼び出し前に接続を閉じておくこと。
-        pub fn finish(mut self) -> Result<(), BenchError> {
-            let Some(mut child) = self.0.take() else {
-                return Ok(());
-            };
-            let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) if status.success() => return Ok(()),
-                    Ok(Some(status)) => {
-                        return Err(BenchError::new(
-                            "plugin-failed",
-                            format!("plugin process exited with {status}"),
-                        ));
-                    }
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Ok(None) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(BenchError::new("timeout", "plugin process did not exit"));
-                    }
-                    Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(BenchError::new("io", format!("wait failed: {e}")));
-                    }
-                }
-            }
-        }
-    }
-
-    impl Drop for PluginProcess {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.0.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
-
-    /// plugin 役のループ。要求を受けて模擬コアの結果を同じ ID の応答で返す。
-    /// 相手切断（`Unavailable`）で正常終了、それ以外のエラーは `Err`。
-    pub fn serve_connection(
-        stream: &mut UdsStream,
-        lister: &dyn ImageLister,
-    ) -> Result<(), BenchError> {
-        let timeout = rpc_timeout()?;
-        loop {
-            let frame = match stream.read_frame(timeout) {
-                Ok(f) => f,
-                Err(e) if e.code() == PluginErrorCode::Unavailable => return Ok(()),
-                Err(e) => return Err(plugin_err(e)),
-            };
-            let msg = decode_message::<Vec<String>>(&frame).map_err(plugin_err)?;
-            let id = match msg {
-                ControlMessage::Request { id, .. } => id,
-                _ => return Err(BenchError::new("protocol", "expected a request")),
-            };
-            let resp = ControlMessage::Response {
-                id,
-                body: lister.list_images(),
-            };
-            let out = encode_message(&resp).map_err(plugin_err)?;
-            stream.write_frame(&out, timeout).map_err(plugin_err)?;
-        }
-    }
-
-    /// 子プロセスの本体。`socket` へ接続して [`serve_connection`] を回す。
-    pub fn serve_socket(socket: &Path) -> Result<(), BenchError> {
-        let mut stream = UdsStream::connect(socket, SETUP_TIMEOUT).map_err(plugin_err)?;
-        serve_connection(&mut stream, &MockImageStore)
-    }
-
-    /// 往復 1 回。応答の ID・種別・本文（模擬コアの期待一覧と完全一致）を照合し、経過 ns を返す。
-    fn round_trip(stream: &mut UdsStream, id: u64, expected: &[String]) -> Result<f64, BenchError> {
-        let timeout = rpc_timeout()?;
-        let req = ControlMessage::Request {
-            id: MessageId::new(id),
-            body: vec!["list_images".to_string()],
-        };
-        let start = Instant::now();
-        let frame = encode_message(&req).map_err(plugin_err)?;
-        stream.write_frame(&frame, timeout).map_err(plugin_err)?;
-        let reply = stream.read_frame(timeout).map_err(plugin_err)?;
-        let msg = decode_message::<Vec<String>>(&reply).map_err(plugin_err)?;
-        let ns = start.elapsed().as_nanos() as f64;
-        match msg {
-            ControlMessage::Response { id: rid, body }
-                if rid.get() == id && body.as_slice() == expected =>
-            {
-                if ns <= 0.0 {
-                    // 経過 0 は未計測であり正の値へ置き換えない。
-                    return Err(BenchError::new(
-                        "measurement",
-                        "elapsed time was zero (clock resolution too coarse)",
-                    ));
-                }
-                Ok(ns)
-            }
-            _ => Err(BenchError::new("protocol", "unexpected response")),
-        }
-    }
-
-    /// 接続済みの境界越し経路の p50（ns）を計測する（ウォームアップ → `trials` × `samples`）。
-    pub fn measure_framed(
-        stream: &mut UdsStream,
-        trials: usize,
-        samples: usize,
-    ) -> Result<f64, BenchError> {
-        let expected = MockImageStore.list_images();
-        let mut id = 0u64;
-        for _ in 0..WARMUP_ROUND_TRIPS {
-            id += 1;
-            round_trip(stream, id, &expected)?;
-        }
-        let mut trial_p50s = Vec::with_capacity(trials);
-        for _ in 0..trials {
-            let mut values = Vec::with_capacity(samples);
-            for _ in 0..samples {
-                id += 1;
-                values.push(round_trip(stream, id, &expected)?);
-            }
-            trial_p50s.push(p50(&values)?);
-        }
-        p50(&trial_p50s)
-    }
-
-    /// 子プロセス（plugin 役）を起動して境界越し経路を計測する。
-    pub fn run_framed_with_child(trials: usize, samples: usize) -> Result<f64, BenchError> {
-        let dir = TempDir::new()?;
-        let listener = UdsListener::bind(&dir.path().join("s")).map_err(plugin_err)?;
-        let child = PluginProcess::spawn(listener.path())?;
-        let mut stream = listener.accept(SETUP_TIMEOUT).map_err(plugin_err)?;
-        let result = measure_framed(&mut stream, trials, samples);
-        drop(stream);
-        // 計測失敗時は `child` の Drop で kill・wait される。
-        let value = result?;
-        child.finish()?;
-        Ok(value)
+fn parse_count(s: &str, max: usize) -> Result<usize, BenchError> {
+    match s.parse::<usize>() {
+        Ok(n) if (1..=max).contains(&n) => Ok(n),
+        _ => Err(BenchError::new(
+            "invalid-args",
+            format!("count must be an integer in 1..={max}"),
+        )),
     }
 }
 
@@ -489,155 +459,135 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
-    /// PLUG-5: p50 は奇数件で中央要素、偶数件で中央 2 要素の平均（未ソート入力でも）。
+    /// PLUG-5: p50 の具体値（奇数・偶数・1 個・空）。
     #[test]
-    fn plug5_p50_odd_even_unsorted_single() {
-        assert_eq!(p50(&[5.0, 1.0, 3.0]).unwrap(), 3.0);
-        assert_eq!(p50(&[4.0, 1.0, 3.0, 2.0]).unwrap(), 2.5);
-        assert_eq!(p50(&[7.0]).unwrap(), 7.0);
+    fn plug5_percentile_p50_concrete_values() {
+        assert_eq!(percentile_p50(&mut [5, 1, 3]), Some(3));
+        assert_eq!(percentile_p50(&mut [4, 1, 3, 2]), Some(2));
+        assert_eq!(percentile_p50(&mut [7]), Some(7));
+        assert_eq!(percentile_p50(&mut []), None);
+        assert_eq!(percentile_p50(&mut [u64::MAX, u64::MAX]), Some(u64::MAX));
     }
 
-    /// PLUG-5: 空入力・非有限値は拒否する。
+    /// PLUG-5: 代表操作 A が 3 段階を踏んで期待 ID・状態になる。
     #[test]
-    fn plug5_p50_rejects_empty_and_nan() {
-        assert_eq!(p50(&[]).unwrap_err().code, "invalid-input");
-        assert_eq!(p50(&[1.0, f64::NAN]).unwrap_err().code, "invalid-input");
-        assert_eq!(p50(&[f64::INFINITY]).unwrap_err().code, "invalid-input");
+    fn plug5_op_a_inproc_walks_three_stages() {
+        let mut m = Model::new();
+        let out = run_op_a_inproc(&mut m).unwrap();
+        assert_eq!(out.sandbox_id, "sandbox-1");
+        assert_eq!(out.container_id, "container-2");
+        assert_eq!(out.state, "running");
     }
 
-    /// PLUG-5: 5 試行の p50 の中央値。
+    /// PLUG-5: 不正な応答（件数・ID 形式・状態）は計測失敗になる。
     #[test]
-    fn plug5_median_of_five_trials() {
-        assert_eq!(p50(&[10.0, 50.0, 30.0, 20.0, 40.0]).unwrap(), 30.0);
-    }
-
-    /// PLUG-5: 結果 JSON は既存スキーマ（schema_version 1・unit ns）に完全一致する。
-    #[test]
-    fn plug5_results_json_exact() {
-        let r = Results {
-            inproc: 120.5,
-            framed: Some(9000.0),
-        };
+    fn plug5_response_validation_rejects_bad_bodies() {
+        assert_eq!(single(s(&["a"])).unwrap(), "a");
+        assert_eq!(single(vec![]).unwrap_err().code, "bad-response");
+        assert_eq!(single(s(&["a", "b"])).unwrap_err().code, "bad-response");
         assert_eq!(
-            r.to_json().unwrap(),
-            "{\n  \"schema_version\": 1,\n  \"metrics\": {\n    \
-             \"plugin_boundary_list_images_inproc_p50\": { \"value\": 120.5, \"unit\": \"ns\" },\n    \
-             \"plugin_boundary_list_images_framed_p50\": { \"value\": 9000, \"unit\": \"ns\" }\n  }\n}\n"
+            expect_id(s(&["sandbox-12"]), PREFIX_SANDBOX).unwrap(),
+            "sandbox-12"
         );
-    }
-
-    /// PLUG-5: 未計測の framed は metric を省略せず null で出力する。
-    #[test]
-    fn plug5_results_json_null_when_framed_unmeasured() {
-        let r = Results {
-            inproc: 120.5,
-            framed: None,
-        };
-        assert_eq!(
-            r.to_json().unwrap(),
-            "{\n  \"schema_version\": 1,\n  \"metrics\": {\n    \
-             \"plugin_boundary_list_images_inproc_p50\": { \"value\": 120.5, \"unit\": \"ns\" },\n    \
-             \"plugin_boundary_list_images_framed_p50\": null\n  }\n}\n"
-        );
-    }
-
-    /// PLUG-5: 0 以下・非有限値の結果は出力しない。
-    #[test]
-    fn plug5_results_json_rejects_bad_values() {
-        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let r = Results {
-                inproc: bad,
-                framed: Some(1.0),
-            };
-            assert_eq!(r.to_json().unwrap_err().code, "invalid-result");
+        for bad in ["container-1", "sandbox-", "sandbox-1x", "evil", ""] {
+            assert_eq!(
+                expect_id(s(&[bad]), PREFIX_SANDBOX).unwrap_err().code,
+                "bad-response",
+                "{bad}"
+            );
         }
-        let r = Results {
-            inproc: 1.0,
-            framed: Some(0.0),
-        };
-        assert!(r.to_json().is_err());
+        assert_eq!(expect_running(s(&["running"])).unwrap(), "running");
+        assert_eq!(
+            expect_running(s(&["stopped"])).unwrap_err().code,
+            "bad-response"
+        );
     }
 
-    /// PLUG-5: 引数解釈（`--bench` は無視・値欠落・未知引数）。
     #[test]
-    fn plug5_parse_args() {
-        assert_eq!(parse_args(&s(&["--bench"])).unwrap(), Mode::Smoke);
+    fn model_rejects_unknown_op_and_bad_state() {
+        let mut m = Model::new();
         assert_eq!(
-            parse_args(&s(&["--bench", "--output", "/x/r.json"])).unwrap(),
-            Mode::Measure {
-                output: "/x/r.json".into()
+            m.handle(&s(&["nope"])).unwrap_err().code(),
+            PluginErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            m.handle(&s(&["create_container", "sandbox-9"]))
+                .unwrap_err()
+                .code(),
+            PluginErrorCode::FailedPrecondition
+        );
+        assert_eq!(
+            m.handle(&[]).unwrap_err().code(),
+            PluginErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn plug5_results_json_has_both_metrics() {
+        let j = results_json(120, 45_000);
+        assert!(j.contains("\"plugin_boundary_op_a_inproc_p50\": {\n      \"value\": 120,"));
+        assert!(j.contains("\"plugin_boundary_op_a_framed_p50\": {\n      \"value\": 45000,"));
+        assert!(j.contains("\"schema_version\": 1"));
+        assert_eq!(j.matches("\"unit\": \"ns\"").count(), 2);
+    }
+
+    #[test]
+    fn parse_args_cases() {
+        assert_eq!(parse_args(&s(&[])).unwrap(), Command::Smoke);
+        assert_eq!(parse_args(&s(&["--bench"])).unwrap(), Command::Smoke);
+        assert_eq!(
+            parse_args(&s(&["--bench", "--output", "r.json"])).unwrap(),
+            Command::Run {
+                plan: Plan {
+                    iterations: 1000,
+                    trials: 5,
+                    warmup: 100
+                },
+                output: "r.json".into()
             }
         );
         assert_eq!(
-            parse_args(&s(&["--plugin-serve", "/x/s"])).unwrap(),
-            Mode::PluginServe {
-                socket: "/x/s".into()
+            parse_args(&s(&["--output", "r", "--iterations", "7", "--trials", "2"])).unwrap(),
+            Command::Run {
+                plan: Plan {
+                    iterations: 7,
+                    trials: 2,
+                    warmup: 100
+                },
+                output: "r".into()
             }
         );
         assert_eq!(
-            parse_args(&s(&["--output"])).unwrap_err().code,
-            "invalid-args"
+            parse_args(&s(&["--plugin-serve", "/x/s.sock"])).unwrap(),
+            Command::PluginServe {
+                socket: "/x/s.sock".into()
+            }
         );
-        assert_eq!(
-            parse_args(&s(&["--nope"])).unwrap_err().code,
-            "invalid-args"
-        );
+        for bad in [
+            s(&["--wat"]),
+            s(&["--output"]),
+            s(&["--output", "r", "--iterations", "0"]),
+            s(&["--output", "r", "--iterations", "1000001"]),
+            s(&["--output", "r", "--trials", "101"]),
+            s(&["--output", "r", "--trials", "x"]),
+            s(&["--iterations", "5"]),
+        ] {
+            assert_eq!(
+                parse_args(&bad).unwrap_err().code,
+                "invalid-args",
+                "{bad:?}"
+            );
+        }
     }
 
-    /// PLUG-5: 模擬コアは固定 4 件を返し、同一プロセス計測は 0 超の有限な p50 を返す。
     #[test]
-    fn plug5_inproc_measures_positive() {
-        assert_eq!(MockImageStore.list_images().len(), 4);
-        let v = measure_inproc(&MockImageStore, 2, 3).unwrap();
-        assert!(v > 0.0 && v.is_finite());
-    }
-
-    /// PLUG-5: 非 unix では境界経路は Unimplemented 相当のエラー。
-    #[cfg(not(unix))]
-    #[test]
-    fn plug5_framed_unimplemented_on_non_unix() {
-        assert_eq!(
-            run_framed_with_child(1, 1).unwrap_err().code,
-            "unimplemented"
-        );
-    }
-
-    /// PLUG-5: 境界往復（plugin 役をスレッドで動かす）。ハング時はウォッチドッグで失敗させる。
-    #[cfg(unix)]
-    #[test]
-    fn plug5_framed_round_trip_with_thread_plugin() {
-        use fandhe_container_plugin::{UdsListener, UdsStream};
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let run = || -> Result<f64, BenchError> {
-                let dir = TempDir::new()?;
-                let listener = UdsListener::bind(&dir.path().join("s"))
-                    .map_err(|e| BenchError::new("bind", e.message()))?;
-                let sock = listener.path().to_path_buf();
-                let plugin = std::thread::spawn(move || {
-                    let mut st = UdsStream::connect(&sock, Duration::from_secs(5))
-                        .map_err(|e| BenchError::new("connect", e.message()))?;
-                    serve_connection(&mut st, &MockImageStore)
-                });
-                let mut st = listener
-                    .accept(Duration::from_secs(5))
-                    .map_err(|e| BenchError::new("accept", e.message()))?;
-                let v = measure_framed(&mut st, 2, 5)?;
-                drop(st);
-                plugin
-                    .join()
-                    .map_err(|_| BenchError::new("thread", "plugin thread panicked"))??;
-                Ok(v)
-            };
-            let _ = tx.send(run());
-        });
-        let v = rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("round trip hung")
-            .unwrap();
-        assert!(v > 0.0 && v.is_finite());
+    fn measure_inproc_returns_positive_p50() {
+        let p = measure_inproc(Plan {
+            iterations: 50,
+            trials: 2,
+            warmup: 5,
+        })
+        .unwrap();
+        assert!(p > 0);
     }
 }

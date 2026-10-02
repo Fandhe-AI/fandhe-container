@@ -14,7 +14,7 @@
 //! （起動コストは PLUG-6・TASK-113.4 側）。試行ごとの p50 の中央値を結果とする（PoC-13 と同じ集計）。
 //!
 //! Δp50（`delta_p50` モジュール。TASK-113.3）は metric `plugin_boundary_op_a_delta_p50` として出力する。
-//! 未対応（後続 sub）: macOS cold start 上乗せ（TASK-113.4）、gRPC 経路（TASK-108。未実装）。
+//! macOS cold start 上乗せは `macos_cold_start` モジュール（TASK-113.4）。未対応: gRPC 経路（TASK-108。未実装）。
 //! 本モジュールの出力は `benches/baseline.json` に未登録のため `make bench-check` には接続していない
 //! （実測基準値の確定は TASK-88.h1・TASK-113.h1。比較ロジックは fixture で検証済み）。
 
@@ -235,7 +235,7 @@ fn rpc_timeout() -> Result<RpcTimeout, BenchError> {
 }
 
 /// 境界越しに 1 往復する（`write_frame` → `read_frame` → 復号）。応答は untrusted として検証する。
-fn round_trip(
+pub fn round_trip(
     stream: &mut UdsStream,
     id: u64,
     args: Vec<String>,

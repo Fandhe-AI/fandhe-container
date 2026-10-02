@@ -423,8 +423,14 @@ mod imp {
     /// 受信本体バッファを伸ばす 1 回あたりの塊（ヘッダだけ送って巨大確保させない。REPAIR-5）。
     const BODY_CHUNK: usize = 64 * 1024;
 
-    /// accept のポーリング間隔（busy loop 回避。crates/io の ACCEPT_POLL_INTERVAL に合わせる）。
+    /// accept のポーリング間隔の上限（busy loop 回避。crates/io の ACCEPT_POLL_INTERVAL に合わせる）。
     const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+    /// accept のポーリング間隔の初期値。待ち始めは短く刻み、空振りのたびに倍々で
+    /// [`ACCEPT_POLL_INTERVAL`] まで伸ばす。子プロセス起動直後に接続が届く都度起動の経路
+    /// （PLUG-6・TASK-113.4）で、固定 5 ms の sleep 粒度（macOS では更に延びる）が接続受理の
+    /// レイテンシへそのまま上乗せされるのを避けつつ、長い待ちでは従来どおりの低頻度に落ち着く。
+    const ACCEPT_POLL_INITIAL: Duration = Duration::from_micros(250);
 
     fn denied(m: &'static str) -> PluginError {
         PluginError::new(PluginErrorCode::PermissionDenied, m)
@@ -590,6 +596,7 @@ mod imp {
 
         pub(super) fn accept(&self, timeout: Duration) -> Result<StreamInner, PluginError> {
             let deadline = Instant::now() + timeout;
+            let mut poll_interval = ACCEPT_POLL_INITIAL;
             loop {
                 match self.listener.accept() {
                     Ok((stream, _)) => {
@@ -633,7 +640,8 @@ mod imp {
                                 "timed out waiting for a connection",
                             ));
                         }
-                        thread::sleep((deadline - now).min(ACCEPT_POLL_INTERVAL));
+                        thread::sleep((deadline - now).min(poll_interval));
+                        poll_interval = (poll_interval * 2).min(ACCEPT_POLL_INTERVAL);
                     }
                     Err(_) => {
                         return Err(PluginError::new(

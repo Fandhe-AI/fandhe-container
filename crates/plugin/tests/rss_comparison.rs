@@ -1,7 +1,7 @@
-//! OS 別 RSS サンプラーの結合試験（PLUG-8・PLUG-9。TASK-112.1・#265）。
+//! OS 別 RSS サンプラーの結合試験（PLUG-8・PLUG-9。TASK-112.1・#265・MS-3）。
 //! root・特権不要で、CI の既定テスト集合（3 OS）で実行される。
 //!
-//! 本ファイルは TASK-112 の結合試験。core 側 RSS の 2 条件比較ハーネス（TASK-112.2・#266。代役による
+//! 本ファイルは TASK-112（MS-3）の結合試験。core 側 RSS の 2 条件比較ハーネス（TASK-112.2・#266。代役による
 //! 近似で、閾値は assert せず差分を JSON 1 行で出力する）を含む。0.5MB 閾値の判定は未実装で、
 //! 後続がこのファイルへ追記する。常駐 plugin の RSS 計測（TASK-112.3・#267）は
 //! `supported::resident` にあり、環境依存のため `#[ignore]` の実機前提テストとして既定集合から分離している
@@ -85,11 +85,12 @@ mod supported {
         );
     }
     // ---------------------------------------------------------------------------------------
-    // TASK-112.2（#266）: core 側 RSS の 2 条件比較ハーネス（PLUG-8）
+    // TASK-112.2（#266）: core 側 RSS の 2 条件比較ハーネス（PLUG-8・MS-3）
     //
     // 条件 (1): plugin 相当機能を同一プロセス内でライブラリとして呼ぶ構成。
     // 条件 (2): core 単体。plugin は別プロセスで常駐中。
-    // spec の条件 (3)（動的ライブラリロード）は D-14・PoC-13 で不採用、gRPC も対象外のため比較しない。
+    // PLUG-8 の条件 (3)（動的ライブラリロード）は D-14・PoC-13 で不採用、gRPC も対象外のため比較しない
+    // （TASK-112・MS-3）。
     //
     // 【代役であること（REPAIR-3）】core 実行バイナリ（TASK-79）も参照 plugin 実装（TASK-118）も未実装で、
     // 依存方向（core -> plugin）上、本 crate のテストから core はリンクできない。このためテストバイナリ
@@ -114,12 +115,12 @@ mod supported {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
-    /// PLUG-8 目標: 2 条件の差が 0.5 MiB 未満。PoC-13 の 3.375 は 3456 KiB ちょうどのため
-    /// spec の「MB」は MiB と解釈する（524,288 バイト）。
+    /// PLUG-8 目標（TASK-112・MS-3）: 2 条件の差が 0.5 MiB 未満。PoC-13 の 3.375 は 3456 KiB ちょうどのため
+    /// PLUG-8 の「MB」は MiB と解釈する（524,288 バイト）。
     const PLUG8_TARGET_DIFF_BYTES: u64 = 524_288;
-    /// 代表操作の往復数（PoC-13 / PLUG-5: 操作 A 相当 3 往復 + 操作 B 相当 1 往復）。
+    /// 代表操作の往復数（PoC-13 / PLUG-5・TASK-112・MS-3: 操作 A 相当 3 往復 + 操作 B 相当 1 往復）。
     const ROUND_TRIPS: u32 = 4;
-    /// 条件ごとの試行数（PoC-13 と同じ 5 試行の中央値）。
+    /// 条件ごとの試行数（PoC-13 と同じ 5 試行の中央値。PLUG-8・TASK-112・MS-3）。
     const TRIALS: usize = 5;
     /// 計測対象プロセスの終了待ち上限（REPAIR-5）。
     const SUBJECT_WAIT: Duration = Duration::from_secs(60);
@@ -417,7 +418,7 @@ mod supported {
         assert_eq!(v["stand_in"], true);
     }
 
-    /// PLUG-8・TASK-112.2: 2 条件を各 5 試行（交互）で計測し、差分を JSON 1 行で出力する。
+    /// PLUG-8・TASK-112.2・MS-3: 2 条件を各 5 試行（交互）で計測し、差分を JSON 1 行で出力する。
     /// 閾値は assert しない（TASK-112.3 の担当）。構造的な事実のみ検査する。
     #[test]
     fn plug8_two_condition_rss_comparison_is_recorded() {
@@ -455,7 +456,7 @@ mod supported {
         std::fs::write(&report, format!("{line}\n")).expect("write rss comparison report");
     }
 
-    /// 別プロセス plugin（常駐モード）の RSS 計測（PLUG-9。TASK-112.3・#267）。実機前提テスト集合。
+    /// 別プロセス plugin（常駐モード）の RSS 計測（PLUG-9。TASK-112.3・#267・MS-3）。実機前提テスト集合。
     ///
     /// 常駐 RSS の絶対値は OS・ビルドプロファイル・アロケータ・ページサイズに依存し、妥当性は人間が
     /// 判断する（#268）ため、計測テストは `#[ignore]` で既定集合から分離する（AGENTS.md「実機前提テスト」）。
@@ -478,7 +479,7 @@ mod supported {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        /// 計測時の RPC 往復回数（PLUG-7 / PoC-13 の「4 RPC」に合わせて定常状態にする）。
+        /// 計測時の RPC 往復回数（PLUG-7 / PoC-13 の「4 RPC」に合わせて定常状態にする。TASK-112.3・MS-3）。
         const RPC_COUNT: usize = 4;
         /// RSS のサンプル回数。
         const SAMPLES: usize = 5;
@@ -581,7 +582,7 @@ mod supported {
             bytes
         }
 
-        /// PLUG-9: 常駐 plugin プロセスの RSS を計測し、1 行 JSON を stdout へ出す（REPAIR-4）。
+        /// PLUG-9・TASK-112.3・MS-3: 常駐 plugin プロセスの RSS を計測し、1 行 JSON を stdout へ出す（REPAIR-4）。
         /// 値は健全性（4096 バイト以上・256 MiB 未満）のみ検査し、PLUG-9 との比較は #268 で人間が判断する。
         #[test]
         #[ignore = "real-machine measurement: resident plugin RSS is environment-dependent and judged by a human (PLUG-9, TASK-112.3)"]

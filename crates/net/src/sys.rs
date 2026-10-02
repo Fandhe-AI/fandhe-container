@@ -16,7 +16,8 @@
 //! - 定数は `cfg(target_arch = ...)` ごとに個別に定義し、値が同じでも他アーキテクチャの定義を
 //!   流用しない。対応外アーキテクチャでは各ラッパーが [`SysError::Unsupported`] を返す（fail-closed）
 //! - 戻り値が `-1` のときは直後に `std::io::Error::last_os_error()` で errno を確保する
-//! - 送信は `MSG_DONTWAIT`、受信は `poll(2)` の期限つきで、無期限に待つ経路を持たない（REPAIR-5）
+//! - 送信・受信とも `MSG_DONTWAIT` で、待つのは期限つきの `poll(2)` だけ。残り時間は [`Deadline`]
+//!   （単調時計の開始時刻＋全体 timeout）から毎回計算し直し、無期限に待つ経路を持たない（REPAIR-5）
 //!
 //! # `libc` / `nix` について
 //! `libc` は #86 で採用承認済みだが、自動運転下では「追加時点で新しい版があれば PR で確認する」
@@ -39,16 +40,74 @@ use std::time::{Duration, Instant};
 pub(crate) enum SysError {
     /// 対応外のアーキテクチャ（定数が未定義）。
     Unsupported,
-    /// カーネルが返した errno（0 は「送信元が netlink アドレスでない」等の内部検証失敗）。
+    /// カーネルが返した errno。
     Os(i32),
+    /// 受信した送信元アドレスが `sockaddr_nl` でない（長さ不足・`nl_family` 不一致）。
+    /// カーネル応答の境界検査で検出し、アドレスの中身は読まない。
+    BadSenderAddress,
 }
 
-/// EINTR 再試行の上限回数（シグナル嵐で無限ループにしない）。
+/// 送信（`sendto`）の EINTR 再試行の上限回数（シグナル嵐で無限ループにしない）。
+/// 受信側は回数ではなく [`Deadline`] の残り時間で打ち切る。
 const EINTR_RETRY_MAX: u32 = 16;
 
 pub(crate) use consts::{
-    EACCES, EAFNOSUPPORT, EAGAIN, EMFILE, ENFILE, ENOBUFS, ENOMEM, EPERM, EPROTONOSUPPORT,
+    EACCES, EAFNOSUPPORT, EAGAIN, EINTR, EMFILE, ENFILE, ENOBUFS, ENOMEM, EPERM, EPROTONOSUPPORT,
 };
+
+/// 受信待ち全体の期限（REPAIR-5）。単調時計（`Instant`）の開始時刻と全体 timeout を持ち、
+/// 残り時間を毎回 `timeout - 経過時間` で計算し直す。
+///
+/// `Instant + timeout` を作らないため、`Duration::MAX` のような「期限を `Instant` で表せない」
+/// timeout でも同じ式で扱える（EINTR・受信競合で早く戻っても、実際に経過した時間しか減らない）。
+/// `NetlinkRouteSocket::recv` が 1 回の呼び出しにつき 1 つ作り、[`wait_readable`] と
+/// 受信再試行の両方がこれを基準にする。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Deadline {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl Deadline {
+    /// 現在時刻を起点に、全体で `timeout` 待つ期限を作る。
+    pub(crate) fn after(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    /// 残り時間（期限を過ぎていれば 0）。
+    pub(crate) fn remaining(&self) -> Duration {
+        remaining_after(self.timeout, self.started.elapsed())
+    }
+}
+
+/// 全体 `timeout` から経過時間 `elapsed` を引いた残り時間（負にならず 0 で飽和）。
+fn remaining_after(timeout: Duration, elapsed: Duration) -> Duration {
+    timeout.saturating_sub(elapsed)
+}
+
+/// `poll(2)` に渡す待ち時間（ms）。端数は切り上げ（残り 1 ns を 0 ms 待ち＝ビジーループに
+/// しない）、`i32::MAX` ms を超える分は飽和させる（呼び出し側が残り時間を再計算して再度待つ）。
+fn poll_timeout_ms(remaining: Duration) -> i32 {
+    let round_up = u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
+    let ms = remaining.as_millis().saturating_add(round_up);
+    i32::try_from(ms).unwrap_or(i32::MAX)
+}
+
+/// [`wait_readable`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Readiness {
+    /// `POLLIN` が立った（データグラムが届いている。他スレッドが先に読む可能性は残る）。
+    Readable,
+    /// `POLLIN` なしで `POLLERR` / `POLLHUP` / `POLLNVAL` 等だけが立った。`recvfrom` で保留中の
+    /// errno を取り出せる。取り出せなかった場合に再度待つと即座に戻り続けるため、呼び出し側は
+    /// 待機を続けずエラーにする。
+    Exceptional,
+    /// 期限までに何も起きなかった。
+    TimedOut,
+}
 
 // include/linux/socket.h・uapi/linux/netlink.h・uapi/asm-generic/socket.h・poll.h・errno.h の値。
 // `SOCK_CLOEXEC` は `O_CLOEXEC` と同値。
@@ -61,7 +120,7 @@ mod consts {
     pub const NETLINK_ROUTE: i32 = 0;
     pub const MSG_TRUNC: i32 = 0x20;
     pub const MSG_DONTWAIT: i32 = 0x40;
-    pub const POLLIN: i16 = 1;
+    pub const POLLIN: i16 = 0x0001;
     pub const EPERM: i32 = 1;
     pub const EINTR: i32 = 4;
     pub const ENOMEM: i32 = 12;
@@ -83,7 +142,7 @@ mod consts {
     pub const NETLINK_ROUTE: i32 = 0;
     pub const MSG_TRUNC: i32 = 0x20;
     pub const MSG_DONTWAIT: i32 = 0x40;
-    pub const POLLIN: i16 = 1;
+    pub const POLLIN: i16 = 0x0001;
     pub const EPERM: i32 = 1;
     pub const EINTR: i32 = 4;
     pub const ENOMEM: i32 = 12;
@@ -97,6 +156,9 @@ mod consts {
 }
 
 /// 対応外アーキテクチャ: 値を確認していないためラッパーは `Unsupported` を返し、カーネルへ渡さない。
+///
+/// errno は実在しない負値を 1 つずつ割り当てる（カーネルの errno は正なので何にも一致せず、
+/// 上位の `match` で互いに重複もしない）。それ以外は使われないプレースホルダの 0。
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[allow(dead_code)]
 mod consts {
@@ -109,24 +171,29 @@ mod consts {
     pub const MSG_DONTWAIT: i32 = 0;
     pub const POLLIN: i16 = 0;
     pub const EPERM: i32 = -1;
-    pub const EINTR: i32 = -1;
-    pub const ENOMEM: i32 = -1;
-    pub const EAGAIN: i32 = -1;
-    pub const EACCES: i32 = -1;
-    pub const ENFILE: i32 = -1;
-    pub const EMFILE: i32 = -1;
-    pub const EPROTONOSUPPORT: i32 = -1;
-    pub const EAFNOSUPPORT: i32 = -1;
-    pub const ENOBUFS: i32 = -1;
+    pub const EINTR: i32 = -2;
+    pub const ENOMEM: i32 = -3;
+    pub const EAGAIN: i32 = -4;
+    pub const EACCES: i32 = -5;
+    pub const ENFILE: i32 = -6;
+    pub const EMFILE: i32 = -7;
+    pub const EPROTONOSUPPORT: i32 = -8;
+    pub const EAFNOSUPPORT: i32 = -9;
+    pub const ENOBUFS: i32 = -10;
 }
 
+// SAFETY: 以下は Linux の libc（glibc / musl 共通）が公開する C 関数の宣言で、引数・戻り値の型を
+// C の原型（各項目のコメントに記載）と一致させている。`ssize_t` / `size_t` はポインタ幅なので
+// `isize` / `usize`、`nfds_t` は `unsigned long` なので `c_ulong`、`socklen_t` は u32、
+// ポインタ引数は `#[repr(C)]` でサイズを const assert した `SockaddrNl`（12 バイト）・
+// `PollFd`（8 バイト）を指す。呼び出し側の不変条件は各 `unsafe` ブロックの SAFETY に記す。
 unsafe extern "C" {
-    // SAFETY（宣言そのものの妥当性）: `int socket(int domain, int type, int protocol)`。
+    // 原型: `int socket(int domain, int type, int protocol)`。
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
-    // SAFETY（宣言そのものの妥当性）: `int bind(int fd, const struct sockaddr *addr, socklen_t addrlen)`
+    // 原型: `int bind(int fd, const struct sockaddr *addr, socklen_t addrlen)`
     // （`socklen_t` は u32）。
     fn bind(fd: i32, addr: *const SockaddrNl, addrlen: u32) -> i32;
-    // SAFETY（宣言そのものの妥当性）: `ssize_t sendto(int fd, const void *buf, size_t len, int flags,
+    // 原型: `ssize_t sendto(int fd, const void *buf, size_t len, int flags,
     // const struct sockaddr *addr, socklen_t addrlen)`（LP64 で `ssize_t` は i64）。
     fn sendto(
         fd: i32,
@@ -136,7 +203,7 @@ unsafe extern "C" {
         addr: *const SockaddrNl,
         addrlen: u32,
     ) -> isize;
-    // SAFETY（宣言そのものの妥当性）: `ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
+    // 原型: `ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
     // struct sockaddr *addr, socklen_t *addrlen)`。
     fn recvfrom(
         fd: i32,
@@ -146,9 +213,9 @@ unsafe extern "C" {
         addr: *mut SockaddrNl,
         addrlen: *mut u32,
     ) -> isize;
-    // SAFETY（宣言そのものの妥当性）: `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`
-    // （`nfds_t` は `unsigned long`＝LP64 で u64）。
-    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    // 原型: `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`
+    // （`nfds_t` は `unsigned long`）。
+    fn poll(fds: *mut PollFd, nfds: core::ffi::c_ulong, timeout: i32) -> i32;
 }
 
 /// `struct sockaddr_nl`（include/uapi/linux/netlink.h。全アーキテクチャ共通の 12 バイト）。
@@ -275,34 +342,40 @@ pub(crate) fn send_to_kernel(fd: BorrowedFd<'_>, buf: &[u8]) -> Result<usize, Sy
     }
 }
 
-/// `fd` が読み取り可能になるまで最大 `timeout` 待つ。可能なら `true`、時間切れなら `false`。
+/// `fd` が読み取り可能になるまで、`deadline` の残り時間だけ待つ。
 ///
-/// EINTR は残り時間を再計算して再試行する（全体で `timeout` を超えて待たない）。
-pub(crate) fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) -> Result<bool, SysError> {
+/// 期限を過ぎていても `poll` を 1 回は（0 ms で）呼ぶため、timeout 0 は「届いていれば読む」の
+/// 非ブロック確認になる。EINTR・`i32::MAX` ms で飽和した 1 回分の時間切れは、`deadline` から
+/// 残り時間を計算し直して待ち直す（全体で `deadline` を超えて待たず、早くも切り上げない）。
+// 対応外アーキテクチャでは `POLLIN` がプレースホルダの 0 で、先頭の `SUPPORTED` 判定により
+// マスク演算へ到達しない。その構成でだけ出る lint を、その構成に限って許可する。
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(clippy::bad_bit_mask)
+)]
+pub(crate) fn wait_readable(
+    fd: BorrowedFd<'_>,
+    deadline: &Deadline,
+) -> Result<Readiness, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    let deadline = Instant::now().checked_add(timeout);
-    let mut remaining = timeout;
     loop {
-        // ミリ秒へ切り上げ（端数で 0 ms 待ちにならないため）。i32 に収まらなければ飽和させる。
-        let ms = remaining
-            .as_millis()
-            .saturating_add(u128::from(
-                !remaining.subsec_nanos().is_multiple_of(1_000_000),
-            ))
-            .min(i32::MAX as u128) as i32;
+        let ms = poll_timeout_ms(deadline.remaining());
         let mut pfd = PollFd {
             fd: fd.as_raw_fd(),
             events: consts::POLLIN,
             revents: 0,
         };
         // SAFETY: `pfd` はスタック上の初期化済み 1 要素で、`nfds` = 1 と一致する。カーネルは呼び出しの間だけ
-        // `revents` を書く。
-        let poll_started = Instant::now();
+        // `revents` を書く。`fd` は生存中の `BorrowedFd`。`ms` は 0 以上で、負値（無期限待ち）を渡さない。
         let r = unsafe { poll(&raw mut pfd, 1, ms) };
         if r > 0 {
-            return Ok(true);
+            return Ok(if pfd.revents & consts::POLLIN != 0 {
+                Readiness::Readable
+            } else {
+                Readiness::Exceptional
+            });
         }
         if r < 0 {
             let e = last_error();
@@ -310,71 +383,57 @@ pub(crate) fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) -> Result<boo
                 return Err(e);
             }
         }
-        // 時間切れ（r == 0）でも、1 回の poll に渡せる上限（i32::MAX ms）で飽和していた場合は
-        // 残り時間を消化するため再試行する。EINTR も同様に残り時間を再計算する。
-        if let Some(d) = deadline {
-            remaining = d.saturating_duration_since(Instant::now());
-        } else {
-            // 期限を表せない巨大 timeout では、EINTR で即戻りしても i32::MAX ms を差し引かず、
-            // 実際に経過した時間だけを残り時間から引く。
-            remaining = remaining.saturating_sub(poll_started.elapsed());
-        }
-        if remaining.is_zero() {
-            return Ok(false);
+        if deadline.remaining().is_zero() {
+            return Ok(Readiness::TimedOut);
         }
     }
 }
 
-/// 1 データグラムを受信する。`MSG_DONTWAIT` で呼ぶため待たずに返り、読み取り可能でなければ
-/// （他スレッドが先に取った場合を含む）`Os(EAGAIN)` で失敗する。通常は [`wait_readable`] の後に呼ぶ。
-/// 送信元が netlink アドレスでなければ `Os(0)` で拒否する。
+/// 1 データグラムを待たずに受信する（`MSG_DONTWAIT`）。通常は [`wait_readable`] の後に呼ぶ。
+///
+/// 読み取り可能でなければ（`poll` の後に他スレッドが先に取った場合を含む）`Os(EAGAIN)`、シグナルで
+/// 中断されれば `Os(EINTR)` を返す。ここでは再試行せず、呼び出し側が [`Deadline`] の残り時間で
+/// 待ち直すかを決める。送信元が netlink アドレスでなければ `BadSenderAddress` で拒否する。
 ///
 /// `MSG_TRUNC` を渡すため、`buf` に収まらない場合も戻り値は実長になり `truncated` が立つ。
 pub(crate) fn recv_from(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<RecvMeta, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    let mut attempts = 0;
-    loop {
-        let mut addr = SockaddrNl {
-            nl_family: 0,
-            nl_pad: 0,
-            nl_pid: 0,
-            nl_groups: 0,
-        };
-        let mut addrlen = core::mem::size_of::<SockaddrNl>() as u32;
-        // SAFETY: `buf` は排他借用したスライスで `buf.len()` バイトが書き込み可能（カーネルは `len` を
-        // 超えて書かない。`MSG_TRUNC` でも書き込み量は `len` まで）。`addr`・`addrlen` はスタック上の
-        // 初期化済みローカルで、`addrlen` は `addr` の確保サイズ（12）を入力として渡す。
-        let n = unsafe {
-            recvfrom(
-                fd.as_raw_fd(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                consts::MSG_TRUNC | consts::MSG_DONTWAIT,
-                &raw mut addr,
-                &raw mut addrlen,
-            )
-        };
-        let Ok(n) = usize::try_from(n) else {
-            let e = last_error();
-            attempts += 1;
-            if e == SysError::Os(consts::EINTR) && attempts < EINTR_RETRY_MAX {
-                continue;
-            }
-            return Err(e);
-        };
-        if addrlen < core::mem::size_of::<SockaddrNl>() as u32
-            || addr.nl_family != consts::AF_NETLINK
-        {
-            return Err(SysError::Os(0));
-        }
-        return Ok(RecvMeta {
-            len: n,
-            truncated: n > buf.len(),
-            sender_pid: addr.nl_pid,
-        });
+    let addr_size = core::mem::size_of::<SockaddrNl>() as u32;
+    let mut addr = SockaddrNl {
+        nl_family: 0,
+        nl_pad: 0,
+        nl_pid: 0,
+        nl_groups: 0,
+    };
+    let mut addrlen = addr_size;
+    // SAFETY: `buf` は排他借用したスライスで `buf.len()` バイトが書き込み可能（カーネルは `len` を
+    // 超えて書かない。`MSG_TRUNC` でも書き込み量は `len` まで）。`addr`・`addrlen` はスタック上の
+    // 初期化済みローカルで、`addrlen` は `addr` の確保サイズ（12）を入力として渡すため、カーネルは
+    // `addr` へ 12 バイトを超えて書かない。`fd` は生存中の `BorrowedFd`。
+    let n = unsafe {
+        recvfrom(
+            fd.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            consts::MSG_TRUNC | consts::MSG_DONTWAIT,
+            &raw mut addr,
+            &raw mut addrlen,
+        )
+    };
+    let Ok(n) = usize::try_from(n) else {
+        return Err(last_error());
+    };
+    // カーネルが書いたアドレス長を検証してから `addr` の中身を使う（短ければ `nl_pid` は未設定）。
+    if addrlen < addr_size || addr.nl_family != consts::AF_NETLINK {
+        return Err(SysError::BadSenderAddress);
     }
+    Ok(RecvMeta {
+        len: n,
+        truncated: n > buf.len(),
+        sender_pid: addr.nl_pid,
+    })
 }
 
 #[cfg(test)]
@@ -390,21 +449,82 @@ mod tests {
         assert_eq!(consts::SOCK_CLOEXEC, 0x80000);
         assert_eq!(consts::NETLINK_ROUTE, 0);
         assert_eq!(consts::MSG_TRUNC, 0x20);
+        assert_eq!(consts::MSG_DONTWAIT, 0x40);
+        assert_eq!(consts::POLLIN, 1);
         assert_eq!(consts::EINTR, 4);
+        assert_eq!(consts::EAGAIN, 11);
         assert_eq!(core::mem::size_of::<SockaddrNl>(), 12);
         assert_eq!(core::mem::size_of::<PollFd>(), 8);
     }
 
-    /// NET-11・REPAIR-5: 何も届いていない socket の `wait_readable` は期限で false を返す。
+    /// NET-11・REPAIR-5: 何も届いていない socket の `wait_readable` は期限まで待って `TimedOut` を返す
+    /// （早く切り上げず、無期限にも待たない）。
     #[test]
     fn wait_readable_times_out() {
         let fd = open_route_socket().expect("open");
         bind_kernel_assigned(fd.as_fd()).expect("bind");
         let t = Instant::now();
+        let deadline = Deadline::after(Duration::from_millis(50));
         assert_eq!(
-            wait_readable(fd.as_fd(), Duration::from_millis(50)),
-            Ok(false)
+            wait_readable(fd.as_fd(), &deadline),
+            Ok(Readiness::TimedOut)
+        );
+        assert!(t.elapsed() >= Duration::from_millis(50));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert_eq!(deadline.remaining(), Duration::ZERO);
+    }
+
+    /// NET-11・REPAIR-5: timeout 0 は待たずに `TimedOut`、届いていない socket の `recv_from` は
+    /// 待たずに `EAGAIN`（`MSG_DONTWAIT`）。
+    #[test]
+    fn zero_timeout_and_empty_recv_do_not_block() {
+        let fd = open_route_socket().expect("open");
+        bind_kernel_assigned(fd.as_fd()).expect("bind");
+        let t = Instant::now();
+        let deadline = Deadline::after(Duration::ZERO);
+        assert_eq!(
+            wait_readable(fd.as_fd(), &deadline),
+            Ok(Readiness::TimedOut)
+        );
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            recv_from(fd.as_fd(), &mut buf),
+            Err(SysError::Os(consts::EAGAIN))
         );
         assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    /// REPAIR-5: 残り時間は `timeout - 経過時間` で、0 未満にならない。`Instant` で期限を表せない
+    /// `Duration::MAX` でも、経過した分だけが減る（EINTR・受信競合で早戻りしても短縮されない）。
+    #[test]
+    fn remaining_after_subtracts_only_elapsed_time() {
+        let s = Duration::from_secs;
+        assert_eq!(remaining_after(s(10), s(3)), s(7));
+        assert_eq!(remaining_after(s(10), s(10)), Duration::ZERO);
+        assert_eq!(remaining_after(s(10), s(11)), Duration::ZERO);
+        assert_eq!(
+            remaining_after(Duration::MAX, s(1)),
+            Duration::MAX - Duration::from_secs(1)
+        );
+        assert!(Deadline::after(Duration::MAX).remaining() > s(u64::MAX / 2));
+        assert_eq!(Deadline::after(Duration::ZERO).remaining(), Duration::ZERO);
+    }
+
+    /// REPAIR-5: `poll` へ渡す ms は端数切り上げ・`i32::MAX` 飽和で、負値（無期限待ち）にならない。
+    #[test]
+    fn poll_timeout_ms_rounds_up_and_saturates() {
+        assert_eq!(poll_timeout_ms(Duration::ZERO), 0);
+        assert_eq!(poll_timeout_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(poll_timeout_ms(Duration::from_millis(50)), 50);
+        assert_eq!(poll_timeout_ms(Duration::from_micros(50_001)), 51);
+        assert_eq!(
+            poll_timeout_ms(Duration::from_millis(i32::MAX as u64)),
+            i32::MAX
+        );
+        assert_eq!(
+            poll_timeout_ms(Duration::from_millis(i32::MAX as u64 + 1)),
+            i32::MAX
+        );
+        assert_eq!(poll_timeout_ms(Duration::MAX), i32::MAX);
     }
 }

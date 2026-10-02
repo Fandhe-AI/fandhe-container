@@ -569,6 +569,31 @@ mod socket {
         dump: bool,
         deadline: &Deadline,
         total: Duration,
+        recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
+    ) -> Result<NetlinkReply, NetError> {
+        // 応答の解釈中に期限を過ぎた場合は、errno・DONE エラー・DUMP_INTR 等のどのエラーでも
+        // Timeout に統一する（全体期限の契約。REPAIR-5）。
+        await_reply_inner(seq, dump, deadline, total, recv).map_err(|e| {
+            if e.code() != NetErrorCode::Timeout && deadline.remaining().is_zero() {
+                NetError::new(
+                    NetErrorCode::Timeout,
+                    format!(
+                        "no reply for netlink request seq {seq} within {} ms",
+                        total.as_millis()
+                    ),
+                )
+            } else {
+                e
+            }
+        })
+    }
+
+    /// [`await_reply_for`] の本体（期限後のエラー正規化は呼び出し側で行う）。
+    fn await_reply_inner(
+        seq: u32,
+        dump: bool,
+        deadline: &Deadline,
+        total: Duration,
         mut recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
     ) -> Result<NetlinkReply, NetError> {
         let timed_out = || {
@@ -1098,6 +1123,20 @@ mod socket {
             let total = Duration::from_millis(30);
             let deadline = Deadline::after(total);
             let mut once = Some(err_dgram(5, 0, 5));
+            let e = await_reply(5, &deadline, total, |_| {
+                std::thread::sleep(Duration::from_millis(80));
+                Ok(once.take().expect("one"))
+            })
+            .expect_err("late");
+            assert_eq!(e.code(), NetErrorCode::Timeout);
+        }
+
+        /// REPAIR-5: 期限後に届いた errno エラー応答も別エラーではなく Timeout に統一する。
+        #[test]
+        fn late_errno_after_deadline_is_timeout() {
+            let total = Duration::from_millis(30);
+            let deadline = Deadline::after(total);
+            let mut once = Some(err_dgram(5, -1, 5));
             let e = await_reply(5, &deadline, total, |_| {
                 std::thread::sleep(Duration::from_millis(80));
                 Ok(once.take().expect("one"))

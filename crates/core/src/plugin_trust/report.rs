@@ -25,7 +25,9 @@ use std::io::Write;
 use serde::Serialize;
 
 use crate::audit_log::mount::deliver;
-use crate::audit_log::{AuditEvent, AuditPath, AuditReason, AuditSink, AuditedRejection};
+use crate::audit_log::{
+    AUDIT_PATH_MAX_BYTES, AuditEvent, AuditPath, AuditReason, AuditSink, AuditedRejection,
+};
 use crate::plugin_discovery::PluginCandidate;
 use crate::traits::ErrorCode;
 
@@ -129,12 +131,13 @@ impl PluginTrustError {
 
     /// 構造化 1 行（`{"code":..,"message":..,"reason":..,"target":..,"path":..}` + LF）を `out` へ書く（ERR-1）。
     ///
-    /// `path` は [`AuditPath`] と同じ上限（4096 バイト・文字境界で切り詰め）で有界。JSON は `serde_json` で
+    /// `path` は JSON エスケープ後のバイト長が [`AUDIT_PATH_MAX_BYTES`]（4096）以下になるよう、
+    /// `to_string_lossy` 後に文字境界で切り詰める（制御文字は最大 6 バイトに膨らむため直列化後基準）。JSON は `serde_json` で
     /// 組むため改行・引用符・制御文字はエスケープされ、LF は行末の 1 個のみ。1 回の `write_all` で書く。
     /// stderr への出力と終了コード決定は呼び出し元の責務で、書き込み失敗を終了コードに影響させないこと。
     pub fn write_json_line(&self, out: &mut dyn Write) -> std::io::Result<()> {
-        let audit_path = AuditPath::new(self.path());
-        let path = audit_path.as_path().to_string_lossy();
+        let lossy = self.path().to_string_lossy();
+        let path = truncate_for_json(&lossy, AUDIT_PATH_MAX_BYTES);
         let dto = ErrorLineDto {
             code: self.code().as_str(),
             message: self.message(),
@@ -143,12 +146,33 @@ impl PluginTrustError {
                 TrustTarget::Directory => "directory",
                 TrustTarget::File => "file",
             },
-            path: &path,
+            path,
         };
         let mut buf = serde_json::to_vec(&dto).map_err(std::io::Error::other)?;
         buf.push(b'\n');
         out.write_all(&buf)
     }
+}
+
+/// JSON 文字列リテラルとして直列化したときの 1 文字分のバイト長（`serde_json` のエスケープ規則）。
+fn json_escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// エスケープ後の直列化バイト長が `max` 以下になる最長の文字境界接頭辞を返す。
+fn truncate_for_json(s: &str, max: usize) -> &str {
+    let mut used = 0usize;
+    for (i, c) in s.char_indices() {
+        used += json_escaped_len(c);
+        if used > max {
+            return s.get(..i).unwrap_or("");
+        }
+    }
+    s
 }
 
 /// 拒否 `error` を `PluginTrust` 監査レコードとして 1 件記録し、`error` をそのまま返す（SEC-4）。
@@ -299,6 +323,24 @@ mod tests {
         assert!(s.ends_with("}\n"));
         assert!(s.contains("\"target\":\"directory\""));
         assert!(s.len() < 4096 + 512);
+    }
+
+    /// 制御文字だらけのパスでも直列化後の `path` 値が 4096 バイト以下（Codex P2）。
+    #[test]
+    fn plug11_task122_5_json_path_bound_holds_after_escaping() {
+        let hostile = format!("/{}", "\u{1}".repeat(4000));
+        let e = PluginTrustError::new(
+            PluginTrustErrorKind::UntrustedOwner,
+            TrustTarget::File,
+            Path::new(&hostile),
+        );
+        let mut buf = Vec::new();
+        e.write_json_line(&mut buf).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        let path = v["path"].as_str().unwrap();
+        let ser = serde_json::to_string(path).unwrap();
+        assert!(ser.len() - 2 <= 4096, "len={}", ser.len() - 2);
+        assert_eq!(path.chars().count(), 1 + (4096 - 1) / 6);
     }
 
     /// 受入基準 C: 所有者・モード・ハッシュの 3 種がそれぞれ理由つきで 1 件記録される。

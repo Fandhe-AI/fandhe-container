@@ -50,8 +50,10 @@ make test-integration       # cargo test --workspace --test '*' --features fandh
 make deny                   # cargo deny --locked check advisories bans licenses sources
 make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + deny を一括実行
 make bench-check-selftest   # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
+make plugin-feature-size    # core の既定 / plugin 除外 release ビルドの rlib サイズ記録（PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測）
 make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
 cargo bench -p fandhe-container-benches --bench plugin_boundary -- --output <path>  # 代表操作 A の plugin 境界ベンチ（TASK-113.1・PLUG-5。同一プロセスと境界越しの p50 を ns で出力。Unix のみ。baseline 未登録のため bench-check・CI ゲートには未接続）
+cargo bench -p fandhe-container-benches --bench plugin_boundary_list_images [-- --output <path>]  # 代表操作 B（イメージ一覧）の plugin 境界ベンチ（TASK-113.2・PLUG-5。引数なしはスモーク。ゲート未接続）
 make bench-baseline-selftest  # baseline.json 生成スクリプトの自己テスト（TASK-88.1・REPAIR-12）
 make bench-baseline         # ベンチを実行し baseline.json を再生成する（TASK-88.1。BENCH_ENVIRONMENT・BENCH_BASELINE_OUT で指定。実測の記録は TASK-88.2）
 make fio-bench-selftest     # fio 4K ランダム write ベンチスクリプトの自己テスト（TASK-25.1・IO-8・REPAIR-12。実 fio 不要）
@@ -102,7 +104,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | `fmt-check`・`deny` | `rust-ci` |
 | `lint`・`test`（既定 feature） | `rust-ci-default-features`（`--all-features` 側は `rust-ci`） |
 | `test-integration` | `integration-test` |
-| `bench-check-selftest`・`bench-baseline-selftest`・`bench-check` | `bench-regression` |
+| `bench-check-selftest`・`bench-baseline-selftest`・`bench-check`・`plugin-feature-size` | `bench-regression` |
 | （対応 target なし。`rustup target add aarch64-unknown-linux-gnu` の後に `cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu` と `cargo clippy --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu -- -D warnings`） | `aarch64-linux-check` |
 | `lint-docs` | `lint-docs` |
 | `check-workspace-manifest`（`make ci` の一部） | 専用の CI ジョブはない（ローカルゲート専用）。workspace manifest が不正なら各 cargo ジョブのビルドが失敗するため、CI では間接的に検出される |
@@ -139,7 +141,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | 50 コンテナ同時起動の集約メモリ計測（CORE-9・SUP-1） | `scripts/bench/concurrent_50_memory.sh`・`scripts/bench/concurrent_50_memory_selftest.sh` | `make concurrent-memory-selftest`（自己テスト）・`make concurrent-memory`・`make concurrent-memory-docker`（実機）・`make concurrent-memory-report`（統合） | TASK-50.1: own 側の計測ハーネス（起動数 N 未満・PSS 0 混入を失敗として検出）。TASK-50.2: Docker 側の同一手法計測（`--mode docker`）と own・Docker の統合レポート（`--mode report`）。実測と SUP-1 の判定は CLI（TASK-79）・本番 launcher 提供後に人間が #219（TASK-50.h1）で実施（実測値は未取得） |
 | fio ベースライン比算出 | `scripts/fio-baseline-ratio.sh`・`scripts/testdata/fio-baseline/` | `make fio-baseline-ratio-selftest`（自己テスト）・`make fio-baseline-ratio`（比率算出） | TASK-25.2: 手順・比率算出・目標値案は整備済み。Docker ベースライン比の実測値は人間実施待ち（#114） |
 | 実機前提テスト | 既定のテスト集合から分離する | 分離の仕組みは該当タスクで決める | 下記「実機前提テスト」節・[ci](.claude/rules/ci.md)「実機前提テスト」を参照 |
-| feature 無効構成（PLUG-3・TASK-111.1） | `crates/core` の `plugin` feature（`--no-default-features`） | `make test-core-no-plugin`（CI の `rust-ci-default-features` ジョブが実行） | 無効構成で core がテストでき、依存ツリーに `fandhe-container-plugin` が入らないことを検証する |
+| feature 無効構成（PLUG-3・TASK-111.1・TASK-111.2） | `crates/core` の `plugin` feature（`--no-default-features`） | `make test-core-no-plugin`（CI の `rust-ci-default-features` ジョブが実行）・`make plugin-feature-size`（release ビルドの rlib サイズ記録。CI の `bench-regression` ジョブが実行。記録: [plugin-feature-size-record](docs/design/plugin-feature-size-record.md)） | 無効構成で core がテストでき、依存ツリーに `fandhe-container-plugin` が入らないことを検証する |
 | 依存・ライセンス検査 | `Cargo.toml`・`deny.toml` | `make deny` | 依存を追加・更新するときのみ（ユーザー承認制。[dependency-policy](.claude/rules/dependency-policy.md)） |
 
 コマンドと CI ジョブの対応は上記「回帰確認コマンド一覧」節の表を参照する（重複管理しない。TASK-94）。

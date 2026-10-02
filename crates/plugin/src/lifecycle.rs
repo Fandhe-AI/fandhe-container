@@ -1,0 +1,361 @@
+//! plugin プロセスの都度起動モード（PLUG-7・TASK-110.1・#258）。
+//!
+//! 呼び出しごとに plugin プロセスを spawn し、1 往復（要求フレーム送信 -> 応答フレーム受信）の
+//! 完了後に終了させる。呼び出し元は core 側の plugin proxy（TASK-114 ほか。依存方向は
+//! `core -> plugin` のため、本モジュールは core の登録表を参照せず検証済みの絶対パスを受け取る）。
+//!
+//! # 契約
+//!
+//! - 接続方向は「core 側が [`UdsListener`] を bind し、plugin が接続する」（`transport` 冒頭の契約）。
+//!   socket の絶対パスは環境変数 [`PLUGIN_SOCKET_ENV`] で子へ渡す（暫定契約。spec 未規定）。
+//! - spawn から応答受信までは [`OneShotTimeout`] の合計期限で打ち切る（REPAIR-5）。応答後の自発終了
+//!   待ちは別枠の [`ONE_SHOT_EXIT_TIMEOUT`]。猶予内に終了しなければ強制終了する。
+//! - [`call_once`] が戻った（`Ok` / `Err` いずれの）時点で、直接起動した子プロセスは kill または
+//!   wait で回収済み。
+//! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
+//!   stdin / stdout は null、stderr は継承する。
+//!
+//! # 未実装（REPAIR-3）
+//!
+//! - 常駐モード（TASK-110.2）・モード選択 API（TASK-110.3）。
+//! - 起動対象の信頼性検証（所有者・モード・sha256 照合。TASK-122・PLUG-11）。本 API は検証を
+//!   行わず、呼び出し側が検証済みの絶対パスを渡すことを前提とする。
+//! - 孫プロセスの回収（プロセスグループ単位の kill は未対応）。
+//! - 要求 ID と応答 ID の対応づけ（TASK-114）。
+
+use crate::error::{PluginError, PluginErrorCode};
+use crate::frame::Frame;
+use crate::transport::{RpcTimeout, UdsListener};
+use std::ffi::OsString;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// 子へ接続先 socket の絶対パスを渡す環境変数名。
+pub const PLUGIN_SOCKET_ENV: &str = "FANDHE_CONTAINER_PLUGIN_SOCKET";
+
+/// [`OneShotTimeout`] の既定値（10 秒）。
+pub const ONE_SHOT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
+
+/// [`OneShotTimeout`] の上限（10 秒。残り時間を常に `RpcTimeout` へ変換できる値にする）。
+pub const ONE_SHOT_TIMEOUT_MAX: Duration = Duration::from_secs(10);
+
+/// 応答受信後に子の自発終了を待つ猶予（合計期限とは別枠）。
+pub const ONE_SHOT_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 起動引数の件数上限。
+pub const ONE_SHOT_ARGS_MAX_COUNT: usize = 64;
+
+/// 起動引数の合計バイト数上限。
+pub const ONE_SHOT_ARGS_MAX_BYTES: usize = 4096;
+
+/// accept を刻む 1 区間の長さ。区間ごとに子の早期終了を確認する。
+const ACCEPT_SLICE: Duration = Duration::from_millis(50);
+
+/// 子の終了待ちポーリング間隔の上限。
+const POLL_MAX: Duration = Duration::from_millis(5);
+
+/// spawn から応答受信までの合計期限（REPAIR-5）。0 と [`ONE_SHOT_TIMEOUT_MAX`] 超は構築できない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OneShotTimeout(Duration);
+
+impl OneShotTimeout {
+    /// 0 または [`ONE_SHOT_TIMEOUT_MAX`] 超は `InvalidArgument`。
+    pub fn new(timeout: Duration) -> Result<Self, PluginError> {
+        if timeout.is_zero() || timeout > ONE_SHOT_TIMEOUT_MAX {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                "one-shot timeout must be non-zero and within the maximum",
+            ));
+        }
+        Ok(Self(timeout))
+    }
+
+    /// 保持している期間を返す。
+    pub fn as_duration(&self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for OneShotTimeout {
+    /// [`ONE_SHOT_TIMEOUT_DEFAULT`]（10 秒）。
+    fn default() -> Self {
+        Self(ONE_SHOT_TIMEOUT_DEFAULT)
+    }
+}
+
+impl TryFrom<Duration> for OneShotTimeout {
+    type Error = PluginError;
+
+    fn try_from(timeout: Duration) -> Result<Self, Self::Error> {
+        Self::new(timeout)
+    }
+}
+
+/// 都度起動する plugin の起動仕様。検証済みの値のみ保持する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneShotPlugin {
+    program: PathBuf,
+    args: Vec<OsString>,
+    socket_dir: PathBuf,
+}
+
+impl OneShotPlugin {
+    /// `program` は絶対パス必須（`PATH` 探索をしない。PLUG-11）。引数は件数・合計バイト数を検証する。
+    /// `socket_dir` は listener を置く 0700 ディレクトリ（通常は `RuntimeDir::path()`）。
+    /// 違反は `InvalidArgument`。`program` の信頼性（ハッシュ等）は検証しない（TASK-122）。
+    pub fn new(
+        program: PathBuf,
+        args: Vec<OsString>,
+        socket_dir: PathBuf,
+    ) -> Result<Self, PluginError> {
+        if !program.is_absolute() {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                "plugin program path must be absolute",
+            ));
+        }
+        let total: usize = args.iter().map(|a| a.len()).sum();
+        if args.len() > ONE_SHOT_ARGS_MAX_COUNT || total > ONE_SHOT_ARGS_MAX_BYTES {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                "plugin arguments exceed the allowed count or size",
+            ));
+        }
+        Ok(Self {
+            program,
+            args,
+            socket_dir,
+        })
+    }
+
+    /// 起動する実行ファイルの絶対パス。
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+}
+
+/// 応答受信後の子プロセスの終了状況。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OneShotTermination {
+    /// 猶予内に自発終了した。`code` はシグナル終了などで取得できない場合 `None`。
+    Exited { code: Option<i32> },
+    /// 猶予内に終了せず強制終了した。
+    Killed,
+}
+
+/// [`call_once`] の成功結果。
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct OneShotOutcome {
+    response: Frame,
+    termination: OneShotTermination,
+}
+
+impl OneShotOutcome {
+    /// plugin から受信した応答フレーム（untrusted。内容は解釈していない）。
+    pub fn response(&self) -> &Frame {
+        &self.response
+    }
+
+    /// 応答フレームを取り出す。
+    pub fn into_response(self) -> Frame {
+        self.response
+    }
+
+    /// 子プロセスの終了状況。
+    pub fn termination(&self) -> OneShotTermination {
+        self.termination
+    }
+}
+
+/// 子プロセスを保持し、Drop で必ず kill・回収するガード（全エラー経路で孤児を残さない）。
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        match self.0.as_mut() {
+            Some(c) => c.try_wait(),
+            None => Ok(None),
+        }
+    }
+
+    fn kill_and_reap(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    /// 終了を `limit` まで待つ。終了していれば状態を返し、猶予超過なら強制終了して `Killed`。
+    fn wait_or_kill(&mut self, limit: Duration) -> OneShotTermination {
+        let start = Instant::now();
+        let mut interval = Duration::from_millis(1);
+        loop {
+            match self.try_wait() {
+                Ok(Some(status)) => {
+                    self.0 = None;
+                    return OneShotTermination::Exited {
+                        code: status.code(),
+                    };
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+            if start.elapsed() >= limit {
+                break;
+            }
+            std::thread::sleep(interval);
+            interval = (interval * 2).min(POLL_MAX);
+        }
+        self.kill_and_reap();
+        OneShotTermination::Killed
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, PluginError> {
+    match deadline.checked_duration_since(Instant::now()) {
+        Some(d) if !d.is_zero() => Ok(d),
+        _ => Err(timeout_error()),
+    }
+}
+
+fn timeout_error() -> PluginError {
+    PluginError::new(PluginErrorCode::Timeout, "one-shot plugin call timed out")
+}
+
+fn rpc_timeout(remaining: Duration) -> Result<RpcTimeout, PluginError> {
+    RpcTimeout::new(remaining.min(ONE_SHOT_TIMEOUT_MAX))
+}
+
+fn spawn_error(e: &io::Error) -> PluginError {
+    let (code, msg) = match e.kind() {
+        io::ErrorKind::NotFound => (PluginErrorCode::NotFound, "plugin program not found"),
+        io::ErrorKind::PermissionDenied => (
+            PluginErrorCode::PermissionDenied,
+            "permission denied spawning plugin program",
+        ),
+        _ => (
+            PluginErrorCode::Unavailable,
+            "failed to spawn plugin program",
+        ),
+    };
+    PluginError::new(code, msg)
+}
+
+/// plugin を 1 回起動して 1 往復し、終了を確認して回収する（PLUG-7・REPAIR-5）。
+///
+/// 流れ: 一意名で listener を bind -> 子を spawn -> 接続を受け付け -> `request` 送信 -> 応答受信 ->
+/// 接続を閉じて子の終了を待つ。spawn から応答受信までが `timeout` の合計期限。接続前に子が
+/// 終了した場合は期限を待たず `Unavailable`。応答は得たが子が [`ONE_SHOT_EXIT_TIMEOUT`] 内に
+/// 終了しなかった場合は強制終了し、`Ok` と [`OneShotTermination::Killed`] を返す。
+/// 非 unix では listener の bind が `Unimplemented` を返し、子は spawn されない。
+pub fn call_once(
+    plugin: &OneShotPlugin,
+    request: &Frame,
+    timeout: OneShotTimeout,
+) -> Result<OneShotOutcome, PluginError> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let deadline = Instant::now()
+        .checked_add(timeout.as_duration())
+        .ok_or_else(timeout_error)?;
+
+    let name = format!(
+        "oneshot-{}-{}.sock",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let listener = UdsListener::bind(&plugin.socket_dir.join(name))?;
+
+    let child = Command::new(&plugin.program)
+        .args(&plugin.args)
+        .env_clear()
+        .env(PLUGIN_SOCKET_ENV, listener.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| spawn_error(&e))?;
+    let mut guard = ChildGuard(Some(child));
+
+    let mut stream = loop {
+        let left = remaining(deadline)?;
+        match listener.accept(left.min(ACCEPT_SLICE)) {
+            Ok(s) => break s,
+            Err(e) if e.code() == PluginErrorCode::Timeout => {}
+            Err(e) => return Err(e),
+        }
+        match guard.try_wait() {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => {
+                return Err(PluginError::new(
+                    PluginErrorCode::Unavailable,
+                    "plugin exited before connecting",
+                ));
+            }
+        }
+    };
+
+    stream.write_frame(request, rpc_timeout(remaining(deadline)?)?)?;
+    let response = stream.read_frame(rpc_timeout(remaining(deadline)?)?)?;
+
+    // 子に EOF を見せ、socket を unlink してから終了を待つ。
+    drop(stream);
+    drop(listener);
+    let termination = guard.wait_or_kill(ONE_SHOT_EXIT_TIMEOUT);
+    Ok(OneShotOutcome {
+        response,
+        termination,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plug7_timeout_rejects_zero_and_over_max() {
+        for d in [
+            Duration::ZERO,
+            ONE_SHOT_TIMEOUT_MAX + Duration::from_millis(1),
+        ] {
+            let e = OneShotTimeout::new(d).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        }
+        assert_eq!(
+            OneShotTimeout::default().as_duration(),
+            Duration::from_secs(10)
+        );
+        assert!(OneShotTimeout::new(ONE_SHOT_TIMEOUT_MAX).is_ok());
+    }
+
+    #[test]
+    fn plug7_plugin_rejects_relative_program() {
+        let e = OneShotPlugin::new("plugin".into(), vec![], "/tmp".into()).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "plugin program path must be absolute");
+    }
+
+    #[test]
+    fn plug7_plugin_rejects_too_many_or_too_long_args() {
+        let abs = if cfg!(windows) { "C:\\p" } else { "/bin/p" };
+        let many = vec![OsString::from("a"); ONE_SHOT_ARGS_MAX_COUNT + 1];
+        let e = OneShotPlugin::new(abs.into(), many, "/tmp".into()).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        let long = vec![OsString::from("a".repeat(ONE_SHOT_ARGS_MAX_BYTES + 1))];
+        let e = OneShotPlugin::new(abs.into(), long, "/tmp".into()).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        let ok = vec![OsString::from("a"); ONE_SHOT_ARGS_MAX_COUNT];
+        assert!(OneShotPlugin::new(abs.into(), ok, "/tmp".into()).is_ok());
+    }
+}

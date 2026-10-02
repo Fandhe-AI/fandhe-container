@@ -117,6 +117,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | ---- | ---- | ---- | ---- |
 | テスト 1 件の応答待ち（ACK・plugin RPC・子プロセス） | 推奨 5〜10 秒（CI 設定値 10 秒） | `ci.yml` `integration-test` ジョブの env `FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"`（TASK-87.1・#40） | PoC-8 実測・REPAIR-10 (c)・REPAIR-5 |
 | plugin の ACK / RPC 応答待ち（フレーム 1 つ） | 既定 10 秒・上限 10 秒（0 と上限超過は構築不可） | `crates/plugin/src/transport.rs` の `RpcTimeout`（`UDS_RPC_TIMEOUT_DEFAULT`・`UDS_RPC_TIMEOUT_MAX`。TASK-107.6・#250） | REPAIR-5・PLUG-2・PLUG-5 |
+| plugin 都度起動の合計期限（spawn から応答受信まで）・応答後の終了猶予 | 合計期限 既定 10 秒・上限 10 秒（0 と上限超過は構築不可）／終了猶予 5 秒（超過で強制終了） | `crates/plugin/src/lifecycle.rs` の `OneShotTimeout`・`ONE_SHOT_EXIT_TIMEOUT`（TASK-110.1・#258） | REPAIR-5・PLUG-7 |
 | 結合試験の実行ステップ | 10 分 | `integration-test` ジョブの実行ステップ `timeout-minutes: 10` | TASK-86.2（#36）・TASK-87 |
 | ジョブ全体 | `integration-test` 30 分・`bench-regression` 15 分・`ci-complete` 5 分 | 各ジョブの `timeout-minutes` | 多層防御 |
 
@@ -163,7 +164,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 上記「crate 追加時」の全項目に加えて、次を追加で用意する。
 
 - plugin 境界フレーム（長さ接頭辞フレーム。PLUG-2）の符号化・復号、壊れたフレームや長さ上限超過を拒否することのユニットテスト。フレームは型で組み立てる（REPAIR-2）。plugin からの入力は untrusted として検証する
-- plugin RPC の応答待ちがタイムアウトで打ち切られることの結合試験（REPAIR-5。フレーム単位の待機は `crates/plugin/tests/transport_frame_io.rs`〔#250〕。要求・応答の往復の試験は TASK-107.7・#251）
+- plugin RPC の応答待ちがタイムアウトで打ち切られることの結合試験（REPAIR-5。フレーム単位の待機は `crates/plugin/tests/transport_frame_io.rs`〔#250〕。要求・応答の往復の試験は TASK-107.7・#251）。都度起動モードの合計期限・子プロセス回収の結合試験は `crates/plugin/tests/lifecycle_one_shot.rs`（TASK-110.1・#258・PLUG-7）
 - PLUG-4「core 無変更」の 3 点比較（core 側ソースの sha256 一覧・`cargo tree -p <core> --locked -e normal` で見た core の依存木・core バイナリの sha256。[crate-naming.md](docs/design/crate-naming.md) 決定 3）が変化しないこと。**現状**: `scripts/check-plug4-core-invariance.sh`（`make plug4-core-invariance`。core バイナリは未存在のため rlib で代理。TASK-79 後に実行ファイルへ切替）が plugin 追加前後の別ビルドで 3 点を比較する。ソース一覧と、plugin crate を新規追加する PR の差分検査は `crates/core` 配下全体（`src/` に加え `tests/` 等）を対象とする。スクリプトの自己テストは `make plug4-core-invariance-selftest`（CI の `integration-test` ジョブの ubuntu・macos）。plugin を通すために core 側のソースやテストを書き換えないこと（PLUG-4 違反は既存の P0 観点）
 - plugin 境界のベンチ（TASK-113 の `plugin_boundary` 系）。**現状**: 代表操作 A・B と Δp50・CORE-10 比のログ出力は実装済み（TASK-113.1〜113.3）。macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は macOS のみ結合試験として 3 OS matrix の macos で実行し（`bench-regression` は不変）、2 秒の 1% 未満を判定する。実測基準値の `benches/baseline.json` 登録と `make bench-check` への組み込み（常時の 15% 回帰判定）は TASK-88.h1・TASK-113.h1 待ちで未有効。それまで `bench-regression` の成功は plugin 境界の性能回帰がない根拠にならない。`bench-check` は `bench-baseline` と同じ `BENCH_NAMES` を実行し baseline.json 登録済み metric に絞って比較するため、基準値の再生成後は plugin 系 metric も自動で 15% 判定の対象になる
 - plugin の信頼性検証（PLUG-11: 他ユーザー書き込み可能な場所・ハッシュ不一致の plugin の登録拒否）と UDS 境界（PLUG-12: 権限・peer credential 検証）について、新しい plugin を対象にしたケース。**現状**: 管理ディレクトリからの候補探索（TASK-109.1）と PATH 探索の opt-in・警告ログ（TASK-109.2。候補は未検証・CLI フラグ配線は TASK-79）は実装済み。同名候補を解決するレジストリも TASK-109.3 で実装済み（登録は信頼済みを意味しない）。信頼性検証は TASK-122〜124 で実装予定で未実装

@@ -212,6 +212,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test（既定 feature）
         run: cargo test --workspace
+      # core の plugin 無効構成（--no-default-features）の検証（PLUG-3・TASK-111.1・#262）。
+      # 新ジョブは必須チェック名が増えるため既存ジョブへのステップとして追加する。
+      - name: core plugin 無効構成の検証
+        shell: bash
+        run: make test-core-no-plugin
 
   # --------------------------------------------------
   # integration-test（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）
@@ -493,6 +498,8 @@ jobs:
   # 成功し続ける。本ジョブの成功を「性能回帰がない」根拠にしないこと。実測を
   # 伴う本物のベンチ（TASK-113・#269）と実測に基づく基準値（TASK-88・#227）へ
   # 置き換えて初めて、性能回帰ゲートとして機能する。
+  # plugin 境界ベンチの Δp50（TASK-113.3）は計測ログ出力と fixture での判定検証まで
+  # 接続済みで、基準値との常時比較は実測基準値の登録後（TASK-88.h1・TASK-113.h1）。
   #
   # ubuntu-latest 単独とし 3 OS matrix にしない: ベンチの数値は OS 間の実行環境
   # （CPU・ノイズ）が異なり比較できないこと、check-run が増えると ruleset
@@ -532,6 +539,21 @@ jobs:
         run: make idle-memory-supervised-selftest
       - name: ベンチ比較の配線確認（プレースホルダ・性能回帰は未検出）
         run: make bench-check
+      # 計測とログ出力のみ。baseline.json 未登録のため基準値比較はせず、Δp50 の 15% 回帰判定は
+      # 上の bench-check-selftest（fixture）でのみ検証している（TASK-113.3・PLUG-5・REPAIR-8）。
+      # 実測基準値の登録と bench-check 対象化は TASK-88.h1・TASK-113.h1 待ち。
+      # check-run 名は増やさず既存ジョブのステップとする（29 件は不変）
+      - name: plugin 境界 Δp50 と CORE-10 比の計測ログ（計測とログ出力のみ・性能回帰は未判定。TASK-113.3）
+        run: make bench-plugin-boundary
+      # core の既定 / plugin 除外（--no-default-features）release ビルドと成果物サイズの記録
+      # （PLUG-3・TASK-111.2・#263）。新ジョブは check-run 名が増え ruleset 変更が要るため
+      # 既存ジョブのステップとする（check-run 29 件は不変）。計測対象は rlib（最終バイナリ未実装。
+      # TASK-79 後に実行ファイルへ切り替える）で、差は僅少のため軽量化効果の実測ではない
+      - name: plugin feature 除外ビルドとサイズ記録（PLUG-3・TASK-111.2）
+        shell: bash
+        run: |
+          set -euo pipefail
+          make plugin-feature-size | tee -a "${GITHUB_STEP_SUMMARY}"
 
   # --------------------------------------------------
   # aarch64-linux-check（Linux aarch64 向けクロス型検査: #1120・REPAIR-7 第 1 段階を補うアーキ網羅）

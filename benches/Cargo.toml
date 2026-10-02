@@ -3,9 +3,10 @@
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。
 #
 # Cargo のベンチ自動発見は `<crate>/benches/*.rs` を探すため、本 crate（root `benches/`）配下では
-# 実際の配置が `benches/benches/*.rs` になるか、`[[bench]] path` の明示指定が要る。どちらにするかは
-# TASK-113（`benches/plugin_boundary.rs`）で決める。ベンチの枠組みクレート（criterion 等）は使わず、
-# まずは `harness = false` の自前計測で始める（依存を足すならユーザー承認が要る）。
+# 実際の配置が `benches/benches/*.rs` になる。TASK-113.1 で `path` 明示はせず、この自動発見に
+# 任せる配置方式に決定した。ベンチの枠組みクレート（criterion 等）は使わず、
+# `harness = false` の自前計測とする（依存を足すならユーザー承認が要る）。
+# `fandhe-container-plugin` は workspace 内の path 依存（外部クレートの追加ではない）。
 #
 # version は未指定（Cargo の既定で 0.0.0）。
 # 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
@@ -13,8 +14,8 @@
 # [[bench]] regression_placeholder は TASK-86.3（REPAIR-7 第 4 段階・REPAIR-8）で
 # CI のベンチ回帰ゲートを暫定的に稼働させるための stub ベンチ（本文は
 # benches/regression_placeholder.rs。決定的な固定値を出力するだけで実測はしない）。
-# `benches/benches/regression_placeholder.rs` への自動発見に依存する配置は暫定であり、
-# 正式な配置方式（`benches/benches/*.rs` か `path` 明示か）は TASK-113 で決める。
+# [[bench]] plugin_boundary は TASK-113.1 の代表操作 A ベンチ（PLUG-5・PLUG-6）。
+# Δp50 metric（TASK-113.3）も出力する。baseline.json 未登録のため bench-check にはまだ接続しない（実測基準値は TASK-88.h1・TASK-113.h1）。
 
 [package]
 name = "fandhe-container-benches"
@@ -26,3 +27,27 @@ publish = false
 [[bench]]
 name = "regression_placeholder"
 harness = false
+
+[[bench]]
+name = "plugin_boundary"
+harness = false
+
+[dependencies]
+fandhe-container-plugin = { path = "../crates/plugin" }
+
+# [[bench]] plugin_boundary_list_images は TASK-113.2（#271・PLUG-5）の代表操作 B（イメージ一覧）計測ハーネス。
+# 代表操作 A（plugin_boundary。TASK-113.1）とは別ターゲットで、Δp50（TASK-113.3）も出力する。ゲート（bench-check）へは未接続（同上）。
+[[bench]]
+name = "plugin_boundary_list_images"
+harness = false
+
+# [[bench]] plugin_boundary_macos_cold_start は TASK-113.4（PLUG-6・MAC-2）の macOS cold start 上乗せ確認。
+# 子プロセス役は [[bin]] plugin-boundary-stub（外部依存なし。CARGO_BIN_EXE_* の絶対パスで起動）。
+# macOS のみ計測。回帰ゲート（baseline.json）へは未接続（TASK-88.h1・TASK-113.h1）。
+[[bench]]
+name = "plugin_boundary_macos_cold_start"
+harness = false
+
+[[bin]]
+name = "plugin-boundary-stub"
+path = "src/bin/plugin_boundary_stub.rs"

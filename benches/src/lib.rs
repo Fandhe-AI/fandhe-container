@@ -1,11 +1,20 @@
 //! fandhe-container-benches: crate をまたぐベンチ（TASK-113）と基準値（TASK-88・REPAIR-8）を置く crate。
 //!
-//! ライブラリ本体は雛形のみで、実装はない（TASK-1.3・REPAIR-1。スタブの明示は REPAIR-3）。
-//! `publish = false`（crate-naming.md 決定 7）。ベンチ本体は該当 TASK で追加し、
-//! `[[bench]]` の配置方針（`benches/benches/*.rs` か `path` 明示か）は TASK-113 で決める。
+//! `publish = false`（crate-naming.md 決定 7）。ベンチ本体は該当 TASK で追加する。
+//! `[[bench]]` は `benches/benches/*.rs` の自動発見に任せる配置とする（TASK-113.1 で決定）。
+//! `plugin_boundary` モジュールは代表操作 A の計測ロジック（TASK-113.1・PLUG-5）。
+//! `plugin_boundary_list_images` モジュールは代表操作 B（イメージ一覧）の計測ロジック（TASK-113.2・PLUG-5）。
+//! `delta_p50` モジュールは Δp50 と CORE-10 比の算出（TASK-113.3・PLUG-5・CORE-10）。
+//! `macos_cold_start` モジュールは macOS の cold start 上乗せ回帰確認（TASK-113.4・PLUG-6・MAC-2）。
 //!
 //! `benches/regression_placeholder.rs` に TASK-86.3（REPAIR-7 第 4 段階）で導入した
 //! プレースホルダベンチが 1 本ある。決定的な固定値を出力するだけの stub で、CI の
-//! ベンチ回帰ゲート（REPAIR-8）を暫定的に稼働させるためのもの。実測を伴う本物の
-//! ベンチ（`plugin_boundary` 等）と実測基準値（`benches/baseline.json`）への置き換えは
-//! それぞれ TASK-113・TASK-88 で行う。
+//! ベンチ回帰ゲート（REPAIR-8）を暫定的に稼働させるためのもの。plugin 境界ベンチ
+//! （代表操作 A・B）は Δp50 metric の出力と `scripts/check-bench-regression.sh` の fixture 判定
+//! まで接続済みだが、`make bench-check` の対象外で `benches/baseline.json` にも未登録
+//! （常時比較は実測基準値の確定を待つ。TASK-88.h1・TASK-113.h1）。
+
+pub mod delta_p50;
+pub mod macos_cold_start;
+pub mod plugin_boundary;
+pub mod plugin_boundary_list_images;

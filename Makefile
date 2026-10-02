@@ -237,6 +237,88 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
 endif
 
+# core の plugin 無効構成の検証（PLUG-3・TASK-111.1・#262。REPAIR-10 (d)）。
+# `--no-default-features` で core がビルド・テストでき、依存ツリーに plugin 境界基盤
+# （fandhe-container-plugin）が入らないことを確認する。`make ci` には含めない
+# （CI の rust-ci-default-features ジョブが同じターゲットを実行する）。
+.PHONY: test-core-no-plugin
+test-core-no-plugin: ## core を --no-default-features でテストし plugin 依存が入らないことを検証する
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	cargo test -p fandhe-container-core --no-default-features --lib
+	@tree=$$(cargo tree -p fandhe-container-core --no-default-features -e normal) || { \
+		echo "NG: cargo tree の実行に失敗しました" >&2; \
+		exit 1; \
+	}; \
+	if printf '%s\n' "$$tree" | grep -q 'fandhe-container-plugin'; then \
+		echo "NG: plugin 無効構成の依存ツリーに fandhe-container-plugin が含まれています" >&2; \
+		exit 1; \
+	fi; \
+	echo "OK: plugin 無効構成で fandhe-container-plugin は依存ツリーに含まれません"
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test-core-no-plugin をスキップ"
+endif
+
+# core の既定 / plugin 除外構成の release ビルドと成果物サイズの記録（PLUG-3・TASK-111.2・#263）。
+# CI の bench-regression ジョブ（ubuntu-latest 単独。サイズは OS 間で比較できないため）が
+# 実行し、stdout の markdown 表を $GITHUB_STEP_SUMMARY へ追記する。`make ci` には含めない。
+# 記録文書: docs/design/plugin-feature-size-record.md
+# - 計測対象は rlib: 最終バイナリ（CLI bin）は TASK-79 で追加予定のため未存在。
+#   TASK-79 後に実行ファイルのサイズへ切り替える（REPAIR-3: 実装済みを装わない）。
+# - `-p fandhe-container-core` で計測する: workspace 全体の `--no-default-features` は
+#   supervisor が core を既定 feature つきで依存するため feature 統合で plugin が再有効化され、
+#   除外ビルドにならない。
+# - ゲート配下は現状再エクスポートのみで、core rlib の差は僅少（合計差は plugin rlib 自体が占める）。軽量化効果の実測ではない。
+# - サイズ差に閾値は設けない（ノイズ程度の差で誤検出するため）。ビルド失敗・rlib 不在・
+#   不正値・除外構成での plugin rlib 出現は fail-closed で非ゼロ終了する。
+# - target dir は mktemp -d 配下（リポ内の target/ とキャッシュに影響しない）。
+.PHONY: plugin-feature-size
+plugin-feature-size: ## core の既定 / plugin 除外 release ビルドの rlib サイズを記録する（PLUG-3・TASK-111.2）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@set -euo pipefail; \
+	root=$$(mktemp -d); \
+	trap 'rm -rf "$$root"' EXIT; \
+	CARGO_TARGET_DIR="$$root/default" cargo build --release -p fandhe-container-core >&2; \
+	CARGO_TARGET_DIR="$$root/no-plugin" cargo build --release -p fandhe-container-core --no-default-features >&2; \
+	size_of() { \
+		[ -f "$$1" ] || { echo "NG: rlib not found: $$1" >&2; exit 1; }; \
+		n=$$(wc -c < "$$1" | tr -d '[:space:]'); \
+		[[ "$$n" =~ ^[1-9][0-9]*$$ ]] || { echo "NG: invalid size for $$1: $$n" >&2; exit 1; }; \
+		echo "$$n"; \
+	}; \
+	core_def=$$(size_of "$$root/default/release/libfandhe_container_core.rlib"); \
+	core_np=$$(size_of "$$root/no-plugin/release/libfandhe_container_core.rlib"); \
+	plugin_def=""; \
+	for f in "$$root"/default/release/deps/libfandhe_container_plugin-*.rlib; do \
+		[ -e "$$f" ] || continue; \
+		[ -z "$$plugin_def" ] || { echo "NG: multiple plugin rlibs in default build" >&2; exit 1; }; \
+		plugin_def=$$(size_of "$$f"); \
+	done; \
+	[ -n "$$plugin_def" ] || { echo "NG: plugin rlib not found in default build" >&2; exit 1; }; \
+	for f in "$$root"/no-plugin/release/deps/libfandhe_container_plugin-*.rlib; do \
+		[ ! -e "$$f" ] || { echo "NG: plugin rlib exists in no-default-features build: $$f" >&2; exit 1; }; \
+	done; \
+	core_diff=$$((core_def - core_np)); \
+	total_def=$$((core_def + plugin_def)); \
+	diff=$$((total_def - core_np)); \
+	pct=$$(awk -v d="$$diff" -v t="$$total_def" 'BEGIN { printf "%.2f", d * 100 / t }'); \
+	echo "### plugin feature size record (PLUG-3, TASK-111.2)"; \
+	echo; \
+	echo "- rustc: $$(rustc --version)"; \
+	echo "- platform: $$(uname -sm)"; \
+	echo "- profile: release (rlib size; the final binary does not exist yet, see TASK-79)"; \
+	echo; \
+	echo "| build | core rlib (bytes) | plugin rlib (bytes) | total (bytes) |"; \
+	echo "| ----- | ----------------- | ------------------- | ------------- |"; \
+	echo "| default | $$core_def | $$plugin_def | $$total_def |"; \
+	echo "| --no-default-features | $$core_np | - (not built) | $$core_np |"; \
+	echo; \
+	echo "- difference (default - no-default-features): $$diff bytes ($$pct %)"; \
+	echo "- note: measured on rlibs because no final binary exists yet; switch to the executable after TASK-79."; \
+	echo "- note: the total difference is dominated by the plugin rlib itself (an intermediate artifact, not linked size); the core rlib difference is $$core_diff bytes because the gated code is re-exports only. This is not a measurement of the weight-saving effect."
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため plugin-feature-size をスキップ"
+endif
+
 # REPAIR-7 ステージ 3（タイムアウト保護された結合試験。TASK-86.2・#36）。
 # CI（ci.yml の integration-test ジョブ）と同じ判定を行う: integration test
 # target（`tests/*.rs`。cargo metadata 上で kind が "test" のもの）が 0 件の
@@ -312,14 +394,79 @@ bench-check-selftest: ## ベンチ回帰比較スクリプトの自己テスト�
 # プレースホルダベンチ（benches/benches/regression_placeholder.rs）を実行し、
 # 結果を基準値（benches/baseline.json）と比較する。一時ディレクトリは trap で
 # 必ず削除する（1 レシピ行で完結させ、定義から削除までの経路を保つ）。
+# 対象ベンチは BENCH_CHECK_NAMES（Unix は bench-baseline と同じ BENCH_NAMES）を実行する。
+# 絞り込みは plugin 境界ベンチ（plugin_boundary*）の結果だけに適用し、baseline.json に登録済みの
+# metric に限って比較する（plugin 系 metric の段階登録を許容するため）。それ以外のベンチ
+# （regression_placeholder 等）の未登録 metric は絞り込まず、check-bench-regression.sh が
+# 入力エラーにする（登録漏れを検出する）。Windows（OS=Windows_NT）は Unix ドメインソケット前提の
+# plugin 境界ベンチが unsupported-platform で失敗するため実行せず、baseline 側も実行した
+# ベンチの metric に限って比較する（baseline から plugin_boundary* の metric だけを除外し、
+# それ以外の未実行・欠落 metric は Unix と同様に check-bench-regression.sh が入力エラーにする。
+# plugin 境界は Unix 専用。PLUG-5）。
+# これにより baseline 再生成（plugin 系 metric の登録。TASK-88.h1・TASK-113.h1）後は、再生成した
+# metric がそのまま 15% 回帰判定の対象になり、Makefile の追従修正が要らない。未登録の間は
+# plugin 系 metric は比較されない（plugin 境界の性能回帰ゲートは未有効）。
+BENCH_CHECK_NAMES = $(if $(filter Windows_NT,$(OS)),regression_placeholder,$(BENCH_NAMES))
+
 .PHONY: bench-check
 bench-check: ## ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
-	cargo bench -p fandhe-container-benches --bench regression_placeholder -- --output "$$tmp/results.json" && \
-	bash scripts/check-bench-regression.sh benches/baseline.json "$$tmp/results.json"
+	mkdir "$$tmp/in" "$$tmp/out" && \
+	if [ "$(OS)" != "Windows_NT" ]; then \
+		reg=$$(jq -c '[.metrics | keys[] | select(startswith("plugin_boundary"))]' benches/baseline.json) || exit 1; \
+		exp=$$(jq -c '[.metrics | keys[] | select(startswith("plugin_boundary"))]' benches/metrics.json) || exit 1; \
+		if [ "$$reg" != "[]" ] && [ "$$reg" != "$$exp" ]; then \
+			echo "error: invalid-input: baseline.json plugin_boundary metrics $$reg do not match metrics.json $$exp (a registered metric was removed or is missing; recalibrate per TASK-88)" >&2; \
+			exit 2; \
+		fi; \
+	fi && \
+	for n in $(BENCH_CHECK_NAMES); do \
+		cargo bench -p fandhe-container-benches --bench "$$n" -- --output "$$tmp/in/$$n.json" >/dev/null || exit 1; \
+	done && \
+	for f in "$$tmp"/in/*.json; do \
+		case "$$(basename "$$f")" in \
+		plugin_boundary*) \
+			jq --slurpfile b benches/baseline.json \
+				'{schema_version: 1, metrics: (.metrics | with_entries(select(.key as $$k | $$b[0].metrics | has($$k))))}' \
+				"$$f" > "$$tmp/out/$$(basename "$$f")" || exit 1 ;; \
+		*) cp "$$f" "$$tmp/out/" || exit 1 ;; \
+		esac; \
+	done && \
+	jq -s '{schema_version: 1, metrics: (map(.metrics) | add)}' "$$tmp"/out/*.json > "$$tmp/results.json" && \
+	if [ "$(OS)" = "Windows_NT" ]; then \
+		jq '.metrics |= with_entries(select(.key | startswith("plugin_boundary") | not))' \
+			benches/baseline.json > "$$tmp/baseline.json" || exit 1; \
+	else \
+		cp benches/baseline.json "$$tmp/baseline.json" || exit 1; \
+	fi && \
+	bash scripts/check-bench-regression.sh "$$tmp/baseline.json" "$$tmp/results.json"
 else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-check をスキップ"
+endif
+
+# plugin 境界ベンチ（代表操作 A・B。TASK-113.1〜113.3）を実行し、Δp50 と CORE-10 の Linux 実機値
+# （0.290〜0.298 秒）に対する割合を stderr へログ出力する（PLUG-5・CORE-10）。基準値との比較は
+# しない（plugin 系 metric は baseline.json 未登録。実測基準値は TASK-88.h1・TASK-113.h1 で確定）。
+# 一時ディレクトリは trap で必ず削除する。Make 変数はシェル文字列へ埋め込まない。
+.PHONY: bench-plugin-boundary
+bench-plugin-boundary: ## plugin 境界ベンチを実行し Δp50 と CORE-10 比をログ出力する（TASK-113.3・PLUG-5。基準値比較なし）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	cargo bench -p fandhe-container-benches --bench plugin_boundary -- --output "$$tmp/a.json" && \
+	cargo bench -p fandhe-container-benches --bench plugin_boundary_list_images -- --output "$$tmp/b.json" >/dev/null
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-plugin-boundary をスキップ"
+endif
+
+# macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）の手動実行。macOS 以外は skip を表示して成功する。
+# BENCH_NAMES・基準値比較には接続しない（macOS 専用 metric のため。CI の macOS では結合試験として実行）。
+.PHONY: bench-macos-cold-start
+bench-macos-cold-start: ## macOS cold start 上乗せを計測する（TASK-113.4・PLUG-6・MAC-2。macOS 以外は skip）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@cargo bench -p fandhe-container-benches --bench plugin_boundary_macos_cold_start
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-macos-cold-start をスキップ"
 endif
 
 # baseline.json 生成スクリプト（scripts/bench/generate_baseline.sh）の自己テスト
@@ -338,7 +485,16 @@ bench-baseline-selftest: ## baseline.json 生成スクリプトの自己テス�
 # BENCH_METRICS / BENCH_BASELINE_OUT / BENCH_ENVIRONMENT は Make 変数展開でシェル文字列へ
 # 埋め込まず、export した環境変数として二重引用符付きで参照する（値に ' 等が含まれても
 # 引用が壊れず、インジェクションにならない）。
-BENCH_NAMES := regression_placeholder
+# plugin 境界ベンチ（TASK-113.1〜113.3）は metric を metrics.json に登録済みのため、ここにも
+# 同時に載せる（generate_baseline.sh は metrics.json と results の metric 集合が完全一致しないと
+# exit 2）。baseline 再生成時は `bench-check` も同じ BENCH_NAMES を実行し baseline 登録済み metric に絞って比較する。
+# Windows（OS=Windows_NT）は plugin 境界ベンチ（Unix ドメインソケット前提）を実行できないため
+# bench-check と同様に regression_placeholder のみ実行し、metrics.json からも plugin_boundary*
+# を除いた一時ファイルを生成スクリプトへ渡す（要求 metric 集合を実行ベンチに合わせる。AGENTS.md「3 OS 対応」）。
+# このため Windows で既定の出力先 benches/baseline.json へ書くと共有 baseline から plugin metric が
+# 消えるので、Windows では BENCH_BASELINE_OUT を別ファイルに指定しない限りエラーにする。
+BENCH_NAMES := regression_placeholder plugin_boundary plugin_boundary_list_images
+BENCH_BASELINE_NAMES = $(if $(filter Windows_NT,$(OS)),regression_placeholder,$(BENCH_NAMES))
 BENCH_METRICS ?= benches/metrics.json
 BENCH_BASELINE_OUT ?= benches/baseline.json
 BENCH_ENVIRONMENT ?=
@@ -348,11 +504,21 @@ export BENCH_METRICS BENCH_BASELINE_OUT BENCH_ENVIRONMENT
 bench-baseline: ## ベンチを実行し baseline.json を再生成する（TASK-88.1・REPAIR-8）
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
-	for n in $(BENCH_NAMES); do \
-		cargo bench -p fandhe-container-benches --bench "$$n" -- --output "$$tmp/$$n.json" || exit 1; \
+	mkdir "$$tmp/res" && \
+	for n in $(BENCH_BASELINE_NAMES); do \
+		cargo bench -p fandhe-container-benches --bench "$$n" -- --output "$$tmp/res/$$n.json" || exit 1; \
 	done && \
-	bash scripts/bench/generate_baseline.sh --metrics "$$BENCH_METRICS" --output "$$BENCH_BASELINE_OUT" \
-		$${BENCH_ENVIRONMENT:+--environment "$$BENCH_ENVIRONMENT"} "$$tmp"/*.json
+	metrics="$$BENCH_METRICS" && \
+	if [ "$(OS)" = "Windows_NT" ]; then \
+		if [ "$$BENCH_BASELINE_OUT" = "benches/baseline.json" ]; then \
+			echo "error: invalid-input: on Windows plugin_boundary metrics are not measured; set BENCH_BASELINE_OUT to a separate file so the shared benches/baseline.json keeps its plugin baselines" >&2; \
+			exit 2; \
+		fi; \
+		jq '.metrics |= with_entries(select(.key | startswith("plugin_boundary") | not))' \
+			"$$BENCH_METRICS" > "$$tmp/metrics.json" && metrics="$$tmp/metrics.json" || exit 1; \
+	fi && \
+	bash scripts/bench/generate_baseline.sh --metrics "$$metrics" --output "$$BENCH_BASELINE_OUT" \
+		$${BENCH_ENVIRONMENT:+--environment "$$BENCH_ENVIRONMENT"} "$$tmp"/res/*.json
 else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-baseline をスキップ"
 endif

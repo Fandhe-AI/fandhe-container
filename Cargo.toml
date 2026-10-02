@@ -37,6 +37,8 @@ repository = "https://github.com/Fandhe-AI/fandhe-container"
 
 # 共通依存の集約先。追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 # 採用済みは serde / serde_json の 2 件（承認: Issue #138・TASK-29.hdep1。OCI config.json のパース用）。
+# workspace 内 crate の path 依存は外部クレートの追加ではない（TASK-111.1・#262・PLUG-3。core の optional 依存用）。
 [workspace.dependencies]
+fandhe-container-plugin = { path = "crates/plugin" }
 serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = "=1.0.151"

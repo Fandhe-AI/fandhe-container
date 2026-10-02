@@ -1,11 +1,11 @@
 //! macOS バックエンドを plugin 化した場合の VM cold start への上乗せ回帰確認（TASK-113.4・PLUG-6・MAC-2・MS-3）。
 //!
 //! 役割: plugin 境界（別プロセス＋UDS＋長さ接頭辞フレーム）を挟むことで増える起動コストを
-//! 「都度起動（spawn → 接続受理）」と「常駐（計測前に起動・接続済みの plugin へ 4 RPC）」の 2 モードで測る。
+//! 「都度起動（spawn → 準備完了通知の受信）」と「常駐（計測前に起動・接続済みの plugin へ 4 RPC）」の 2 モードで測る。
 //! 各モードは plugin を挟まない同一プロセス経路（同じ操作の直接呼び出し）を同条件で計測し、
 //! その**差（上乗せ）**が MAC-2 の cold start 目標（2 秒）の PLUG-6 の期待（1% 未満＝20 ms 未満）に収まるか判定する。
 //! 常駐の子は `Model::new()` 後に準備完了通知（1 フレーム）を送り、親は計測開始前にそれを受け取る（accept は接続成立のみを示すため）。
-//! 計測区間は都度起動が「spawn → accept 完了」、常駐が「接続済み plugin への代表操作 A×3＋B×1 の 4 RPC」のみで、
+//! 計測区間は都度起動が「spawn → 準備完了通知の受信」、常駐が「接続済み plugin への代表操作 A×3＋B×1 の 4 RPC」のみで、
 //! 常駐 plugin の起動・接続・子プロセス回収は計測区間の外に置く。
 //! 参照値は PoC-13（長さ接頭辞フレーム: 都度 2.043 ms／常駐 4.500 ms、gRPC: 2.537 ms／5.032 ms）。
 //!
@@ -62,7 +62,7 @@ pub fn ratio_percent(overhead_ms: f64) -> Result<f64, BenchError> {
 /// 計測モード。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// 都度起動（spawn → 接続受理）。
+    /// 都度起動（spawn → 準備完了通知の受信）。
     Spawn,
     /// 常駐（計測前に起動・接続済みの plugin へ代表操作 A×3＋B×1 の 4 RPC。起動は計測区間の外）。
     Resident,
@@ -365,16 +365,16 @@ mod proc {
         Ok(())
     }
 
-    /// 都度起動（plugin 経路）: bind 済み listener に対し、spawn から accept 完了（READY の代理）までを測る。
+    /// 都度起動（plugin 経路）: bind 済み listener に対し、spawn から子の準備完了通知の受信までを測る。
     fn once_spawn(exe: &Path) -> Result<f64, BenchError> {
         let dir = TempDir::new()?;
         let listener = UdsListener::bind(&dir.0.join("s")).map_err(pe)?;
         let start = Instant::now();
         let child = Guard::spawn(exe, ARG_PLUGIN_SERVE, listener.path())?;
         let mut stream = listener.accept(SETUP_TIMEOUT).map_err(pe)?;
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        // 子が通知を書く前に切断して EPIPE にならないよう、計測後に準備完了通知を読み捨てる。
+        // accept は接続成立のみを示すため、子の `Model::new()` 完了を示す準備完了通知まで含めて測る。
         wait_ready(&mut stream)?;
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
         drop(stream);
         child.finish()?;
         Ok(ms)

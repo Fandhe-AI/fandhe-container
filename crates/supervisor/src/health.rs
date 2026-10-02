@@ -1007,11 +1007,11 @@ mod tests {
 
     impl HealthProbe for StuckCancelProbe {
         fn probe(&self, _: Duration) -> Result<HealthStatus, TraitError> {
-            std::thread::sleep(Duration::from_millis(600));
+            std::thread::sleep(Duration::from_millis(2000));
             Ok(HealthStatus::Healthy)
         }
         fn cancel(&self) {
-            std::thread::sleep(Duration::from_millis(600));
+            std::thread::sleep(Duration::from_millis(2000));
         }
     }
 
@@ -1057,7 +1057,9 @@ mod tests {
             &RecObs::default(),
         )
         .unwrap_err();
-        assert!(started.elapsed() < Duration::from_millis(400));
+        // stuck 側（probe 2000ms + cancel 2000ms）より十分短い 1200ms 未満で戻ることを確認する。
+        // 遅い CI ランナー（macOS）での揺らぎを許容しつつ、待ち合わせていれば確実に超える値にする。
+        assert!(started.elapsed() < Duration::from_millis(1200));
         assert_eq!(e.error().code(), ErrorCode::Timeout);
         assert_eq!(e.demotion(), &Demotion::Applied);
         assert_eq!(runner.unfinished(), 2);
@@ -1071,7 +1073,10 @@ mod tests {
         .unwrap_err();
         assert_eq!(e2.error().code(), ErrorCode::Unavailable);
         // スレッドが戻れば再び判定できる。
-        std::thread::sleep(Duration::from_millis(1500));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while runner.unfinished() != 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert_eq!(runner.unfinished(), 0);
     }
 

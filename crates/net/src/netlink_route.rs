@@ -561,9 +561,21 @@ mod socket {
         await_reply_for(seq, false, deadline, total, recv)
     }
 
-    /// [`await_reply`] の本体。`dump` が真なら `NLMSG_DONE` までを終端とし、途中の ACK は成功状態
-    /// として保持するだけで応答を完了させない（ACK が DONE より先に届きうるため）。`NLM_F_DUMP_INTR`
-    /// が立った dump は不完全なので `FailedPrecondition`（再試行可能）で返す。
+    /// [`await_reply`] の本体。応答の終端はカーネルの送出順に合わせて次のとおり判定する。
+    ///
+    /// - 非 dump（doit）: seq 一致の `NLMSG_ERROR`（ACK / errno）で終端する。カーネルは
+    ///   `netlink_rcv_skb`（net/netlink/af_netlink.c）で doit の呼び出しが戻ってから `netlink_ack` を
+    ///   送り、doit の応答（GET の 1 件・`NLM_F_ECHO` の通知等）は doit の中で同期的に
+    ///   `nlmsg_unicast` 済みのため、受信キュー（FIFO）上で ACK は同じ seq の最後のデータグラムになる。
+    ///   ACK より前のデータグラムの応答はすべて `messages` に集め終えている。
+    /// - dump（[`is_dump_request`]）: `NLMSG_DONE` で終端する（DONE は非 dump でも終端として扱う）。
+    ///   開始に成功した dump では `netlink_dump_start` が `-EINTR` を返し、`netlink_rcv_skb` は ACK を
+    ///   送らない。開始に失敗すれば errno 付きの `NLMSG_ERROR` が届く。errno 0 の ACK が届いても完了させない。
+    /// - 終端と同じデータグラムで終端より後ろにある同じ seq のメッセージ（NOOP を除く）は、上記の
+    ///   送出順に反するため `DataLoss`。終端より後のデータグラムは読まず、次の往復が seq 不一致として破棄する。
+    ///
+    /// `NLM_F_DUMP_INTR`（`nl_dump_check_consistent` だけが立てる）のついた応答は不完全なので
+    /// `FailedPrecondition`（再試行可能）で返す。
     fn await_reply_for(
         seq: u32,
         dump: bool,
@@ -643,7 +655,8 @@ mod socket {
                         h.msg_type()
                     )));
                 }
-                if dump && h.flags() & NLM_F_DUMP_INTR != 0 {
+                // DUMP_INTR は dump の応答にしか立たないため、dump 判定によらず検査する。
+                if h.flags() & NLM_F_DUMP_INTR != 0 {
                     return Err(interrupted());
                 }
                 match h.msg_type() {
@@ -667,18 +680,11 @@ mod socket {
                         ));
                     }
                     NLMSG_DONE => {
-                        // dump が途中で失敗すると、カーネルは DONE のペイロードに負の errno を載せる。
-                        // ペイロードが空なら成功、それ以外は先頭の i32 を判定する。
-                        if msg.payload().is_empty() {
+                        let errno = decode_done_errno(msg.payload())?;
+                        if errno == 0 {
                             terminal = true;
                             continue;
                         }
-                        let ack = decode_nlmsgerr(msg.payload())?;
-                        if ack.is_ack() {
-                            terminal = true;
-                            continue;
-                        }
-                        let errno = ack.errno();
                         return Err(NetError::new(
                             classify_errno(errno),
                             format!("netlink dump failed: errno {errno}"),
@@ -718,14 +724,41 @@ mod socket {
         }
     }
 
-    /// 要求が dump か。`NLM_F_DUMP`（`NLM_F_ROOT | NLM_F_MATCH`）は NEW 系の `NLM_F_REPLACE | NLM_F_EXCL`
-    /// と同じビットなので、rtnetlink の GET 系（`msg_type & 3 == 2`、`RTM_BASE`＝16 以上）の場合だけ
-    /// dump とみなす。NEW 要求を dump と誤判定すると DONE を待ち続けて時間切れになる。
+    /// 要求が dump か。カーネルの判定（`rtnetlink_rcv_msg` の
+    /// `kind == RTNL_KIND_GET && (nlmsg_flags & NLM_F_DUMP)`）と一致させる。
+    ///
+    /// - GET 系（`RTM_BASE`＝16 以上で `msg_type & 3 == 2`）だけを対象にする。`NLM_F_ROOT`・
+    ///   `NLM_F_MATCH` は NEW 系の `NLM_F_REPLACE`・`NLM_F_EXCL` と同じビットのため、NEW 要求を dump と
+    ///   誤判定すると来ない DONE を待ち続けて時間切れになる
+    /// - カーネルは `NLM_F_ROOT`・`NLM_F_MATCH` のどちらか一方でも dump として扱う（両方揃いを要求すると、
+    ///   片方だけの GET で ACK が来ないまま DONE で終わる応答を非 dump として扱い、判定がずれる）
     fn is_dump_request(msg_type: u16, flags: u16) -> bool {
         const RTM_BASE: u16 = 16;
-        msg_type >= RTM_BASE
-            && msg_type & 3 == 2
-            && flags & (NLM_F_ROOT | NLM_F_MATCH) == (NLM_F_ROOT | NLM_F_MATCH)
+        msg_type >= RTM_BASE && msg_type & 3 == 2 && flags & (NLM_F_ROOT | NLM_F_MATCH) != 0
+    }
+
+    /// `NLMSG_DONE` のペイロードから dump の errno（正値。0 は成功）を取り出す（カーネル応答は外部入力）。
+    ///
+    /// DONE のペイロードは `struct nlmsgerr` ではなく `int` 1 個（`netlink_dump_done` の
+    /// `dump_done_errno`）で、`NLM_F_ACK_TLVS` 時はその後ろに属性が続く。よって先頭 4 バイトだけを
+    /// 読み、元要求ヘッダの長さ検査（[`decode_nlmsgerr`]）は適用しない。空ペイロードは成功として
+    /// 受理する。1〜3 バイト・正値・`i32::MIN` は `DataLoss`。
+    fn decode_done_errno(payload: &[u8]) -> Result<i32, NetError> {
+        let bad = |msg: &str| NetError::new(NetErrorCode::DataLoss, msg.to_string());
+        if payload.is_empty() {
+            return Ok(0);
+        }
+        let head: [u8; 4] = payload
+            .get(..4)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| bad("NLMSG_DONE payload shorter than 4 bytes"))?;
+        match i32::from_ne_bytes(head) {
+            0 => Ok(0),
+            raw if raw < 0 => raw
+                .checked_neg()
+                .ok_or_else(|| bad("NLMSG_DONE error value out of range")),
+            _ => Err(bad("NLMSG_DONE carries a positive error value")),
+        }
     }
 
     /// errno を `NetErrorCode` へ写す（メッセージは英語で syscall 名と errno 数値のみ）。
@@ -1145,14 +1178,19 @@ mod socket {
             assert_eq!(e.code(), NetErrorCode::Timeout);
         }
 
-        /// NET-11: NEW 要求の REPLACE|EXCL は dump ではない（ROOT|MATCH と同ビット）。
+        /// NET-11: dump 判定はカーネル（`rtnetlink_rcv_msg`）と同じく GET 系に限り、`NLM_F_ROOT`・
+        /// `NLM_F_MATCH` のどちらか一方でも dump。NEW 要求の REPLACE|EXCL（同ビット）は dump ではない。
         #[test]
-        fn replace_excl_on_new_is_not_dump() {
-            // RTM_NEWADDR = 20（&3 == 0）、RTM_GETADDR = 22（&3 == 2）。
+        fn dump_detection_matches_the_kernel() {
+            // RTM_NEWADDR = 20（&3 == 0）、RTM_GETADDR = 22（&3 == 2）、NLMSG_DONE = 3（RTM_BASE 未満）。
             let f = NLM_F_ROOT | NLM_F_MATCH;
             assert!(!is_dump_request(20, f));
+            assert!(!is_dump_request(20, NLM_F_ROOT));
             assert!(is_dump_request(22, f));
-            assert!(!is_dump_request(22, NLM_F_ROOT));
+            assert!(is_dump_request(22, NLM_F_ROOT));
+            assert!(is_dump_request(22, NLM_F_MATCH));
+            assert!(!is_dump_request(22, 0));
+            assert!(!is_dump_request(NLMSG_DONE, f));
         }
 
         /// NET-11: seq 不一致の ACK は破棄して待ち続け、一致したものを採用する。

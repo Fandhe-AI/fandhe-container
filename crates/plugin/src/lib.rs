@@ -8,6 +8,7 @@
 //! （`uds_security`。TASK-123.1・#286。socket 名・`sun_path` 長の bind 前検証は TASK-123.3・#288）、
 //! 既存 socket パスの lstat 検証・stale socket 再 bind（`uds_security`。TASK-123.2・#287）と
 //! 都度起動モード（`lifecycle`。TASK-110.1・#258）と
+//! OS 別 RSS サンプラー（`rss`。TASK-112.1・#265）と
 //! XDG 未設定時のフォールバック（TASK-123.4・#289）と常駐モード（`lifecycle`。TASK-110.2・#259）のみ実装済み。
 //! モード選択 API（`lifecycle`。TASK-110.3・#260）は実装済み。gRPC と
 //! PLUG-12 の peer 認証（TASK-124）は Linux の SO_PEERCRED（`uds_security::verify_peer`。TASK-124.1・#292）と
@@ -22,6 +23,7 @@ pub mod error;
 pub mod frame;
 pub mod lifecycle;
 pub mod message;
+pub mod rss;
 #[cfg(unix)]
 pub(crate) mod sys;
 pub mod transport;
@@ -43,6 +45,7 @@ pub use lifecycle::{
     ResidentShutdownError, ResidentStartTimeout, ResidentState, call_once, call_once_observed,
 };
 pub use message::{ControlMessage, MessageId, decode_message, encode_message};
+pub use rss::{RssSample, RssSource};
 pub use transport::{
     RpcTimeout, UDS_ACCEPT_TIMEOUT_MAX, UDS_CONNECT_TIMEOUT_MAX, UDS_DEFAULT_IO_TIMEOUT,
     UDS_RPC_TIMEOUT_DEFAULT, UDS_RPC_TIMEOUT_MAX, UdsListener, UdsStream,

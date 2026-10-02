@@ -22,11 +22,12 @@
 //!   （排他ロック自体は std の `File::try_lock`。fork 用のコールバック登録は行わない。PLUG-12・TASK-123.2）
 //! - client connect（#249）: `socket(2)` / `connect(2)`（macOS は `fcntl(F_SETFD)` も）で非ブロッキング接続を期限までリトライする（REPAIR-5）。
 //!   対応外の OS・アーキテクチャは `Unsupported`
+//! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 
@@ -1171,4 +1172,75 @@ mod macos_tests {
         assert_eq!(peer_pid(&server).expect("server side"), std::process::id());
         assert_eq!(peer_pid(&client).expect("client side"), std::process::id());
     }
+}
+// ---- macOS の常駐メモリ（RSS）取得（PLUG-8・PLUG-9。TASK-112.1・#265） ----
+
+/// 指定 pid の常駐メモリ量（バイト）を返す（macOS。libproc の `proc_pidinfo(PROC_PIDTASKINFO)`）。
+///
+/// `crate::rss` の macOS 実装から呼ばれる。Linux は `/proc` を std で読むためここには FFI を持たない。
+/// 戻り値が構造体サイズと一致しない場合は失敗として扱い、構造体を初期化済みとして使わない。
+#[cfg(target_os = "macos")]
+pub(crate) fn resident_size_bytes(pid: u32) -> io::Result<u64> {
+    use core::mem::{MaybeUninit, size_of};
+
+    /// `<sys/proc_info.h>` の `PROC_PIDTASKINFO`。
+    const PROC_PIDTASKINFO: i32 = 4;
+
+    /// `<sys/proc_info.h>` の `struct proc_taskinfo`（u64 × 6 ＋ i32 × 12 = 96 バイト。
+    /// x86_64 / aarch64 でレイアウトは同一）。
+    #[repr(C)]
+    struct ProcTaskInfo {
+        pti_virtual_size: u64,
+        pti_resident_size: u64,
+        pti_total_user: u64,
+        pti_total_system: u64,
+        pti_threads_user: u64,
+        pti_threads_system: u64,
+        pti_policy: i32,
+        pti_faults: i32,
+        pti_pageins: i32,
+        pti_cow_faults: i32,
+        pti_messages_sent: i32,
+        pti_messages_received: i32,
+        pti_syscalls_mach: i32,
+        pti_syscalls_unix: i32,
+        pti_csw: i32,
+        pti_threadnum: i32,
+        pti_numrunning: i32,
+        pti_priority: i32,
+    }
+    // レイアウト誤りをコンパイル時に検出する。
+    const _: () = assert!(size_of::<ProcTaskInfo>() == 96);
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: libSystem（libproc）の
+        // `int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize)` と同じ型・幅。
+        fn proc_pidinfo(
+            pid: i32,
+            flavor: i32,
+            arg: u64,
+            buffer: *mut core::ffi::c_void,
+            buffersize: i32,
+        ) -> i32;
+    }
+
+    let pid = i32::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of range"))?;
+    let size = i32::try_from(size_of::<ProcTaskInfo>())
+        .map_err(|_| io::Error::other("proc_taskinfo size out of range"))?;
+    let mut info = MaybeUninit::<ProcTaskInfo>::uninit();
+    // SAFETY: `buffer` は `size` バイト書き込み可能な `MaybeUninit<ProcTaskInfo>` を指し、`buffersize` は
+    // その `size_of` と一致する。`arg` は PROC_PIDTASKINFO では未使用（0）。
+    let rc = unsafe { proc_pidinfo(pid, PROC_PIDTASKINFO, 0, info.as_mut_ptr().cast(), size) };
+    if rc != size {
+        // 0 以下は失敗（errno 参照）。それ以外のサイズ不一致も初期化済みとして扱わない。
+        return Err(if rc > 0 {
+            io::Error::other("proc_pidinfo returned an unexpected size")
+        } else {
+            io::Error::last_os_error()
+        });
+    }
+    // SAFETY: 戻り値が構造体サイズと一致したため、カーネルが全フィールドを書き込み済み。
+    let info = unsafe { info.assume_init() };
+    Ok(info.pti_resident_size)
 }

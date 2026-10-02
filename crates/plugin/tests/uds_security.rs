@@ -137,10 +137,9 @@ mod unix {
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         let p = d.path().join("s.sock");
         drop(std::os::unix::net::UnixListener::bind(&p).unwrap()); // std は unlink しない
-        let old_ino = std::fs::symlink_metadata(&p).unwrap().ino();
         let l = UdsListener::bind(&p).unwrap();
         let m = std::fs::symlink_metadata(&p).unwrap();
-        assert_ne!(m.ino(), old_ino);
+        // inode は tmpfs で再利用され得るため同一性比較に使わない。新 listener への接続成功で置換を確認する。
         assert_eq!(m.mode() & 0o777, 0o600);
         let _c = std::os::unix::net::UnixStream::connect(l.path()).unwrap();
         l.accept(Duration::from_secs(2)).unwrap();

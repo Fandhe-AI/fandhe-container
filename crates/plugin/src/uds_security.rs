@@ -295,6 +295,10 @@ mod imp {
 
     /// stale 判定の probe（接続試行）の期限（REPAIR-5）。
     const STALE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+    /// stale 判定に必要な連続拒否回数（macOS の backlog 満杯 ECONNREFUSED 対策）。
+    const STALE_PROBE_ATTEMPTS: u32 = 2;
+    /// 連続 probe の間隔。
+    const STALE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
     /// 既存エントリの分類結果（PLUG-12・TASK-123.2）。
     #[derive(Debug, PartialEq, Eq)]
@@ -378,10 +382,17 @@ mod imp {
             ExistingEntry::OwnSocket(i) => i,
         };
         let busy = || err(PluginErrorCode::AlreadyExists, "socket path already exists");
-        match crate::sys::connect_unix(probe, std::time::Instant::now() + STALE_PROBE_TIMEOUT) {
-            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
-            // 接続成功（生存中。即 drop）・期限超過・未対応・その他は削除しない。
-            _ => return Err(busy()),
+        // macOS は accept queue 満杯の生存 listener にも ECONNREFUSED を返すため、一過性の
+        // 満杯を stale と誤認しないよう、間隔を置いた連続 2 回の拒否を stale の条件とする。
+        // 接続成功（生存中。即 drop）・期限超過・未対応・その他は削除しない（fail-closed）。
+        for attempt in 0..STALE_PROBE_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(STALE_PROBE_INTERVAL);
+            }
+            match crate::sys::connect_unix(probe, std::time::Instant::now() + STALE_PROBE_TIMEOUT) {
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
+                _ => return Err(busy()),
+            }
         }
         // 削除直前に同一性を再確認する（probe 中の差し替えを検出）。
         match lstat_opt(dir, name, public)? {

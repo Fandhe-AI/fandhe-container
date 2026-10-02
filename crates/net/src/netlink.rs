@@ -334,6 +334,11 @@ impl<'a> NlMsg<'a> {
     /// ファミリ固有の固定ヘッダ `fixed_len` バイト（4 バイト切り上げ）を飛ばして属性を走査する。
     pub fn attrs(&self, fixed_len: usize) -> Result<AttrIter<'a>, NetError> {
         let skip = align(fixed_len).ok_or_else(|| invalid("fixed header too large"))?;
+        // 固定ヘッダのみで属性 0 件のメッセージは nlmsg_len が固定ヘッダ実長（4 の倍数と限らない）で、
+        // 末尾パディングが省略される。実長ちょうどなら空の走査として扱う。
+        if self.payload.len() == fixed_len {
+            return Ok(AttrIter::new(&[]));
+        }
         let rest = self
             .payload
             .get(skip..)
@@ -766,5 +771,19 @@ mod tests {
                 let _ = AttrIter::new(&buf).count();
             }
         }
+    }
+
+    /// NET-11・REPAIR-2: 4 バイト境界でない固定ヘッダのみのメッセージは属性 0 件として往復できる。
+    #[test]
+    fn header_only_unaligned_fixed_roundtrip() {
+        let mut b = NlMsgBuilder::new(16, 0, 1, 2);
+        b.put_fixed(&[1, 2, 3, 4, 5]).unwrap();
+        let bytes = b.finish().unwrap();
+        assert_eq!(bytes.len(), 24);
+        let msg = NlMsgIter::new(&bytes).next().unwrap().unwrap();
+        assert_eq!(msg.header().len(), 21);
+        assert_eq!(msg.payload(), &[1, 2, 3, 4, 5]);
+        assert_eq!(msg.attrs(5).unwrap().count(), 0);
+        assert_eq!(code(&msg.attrs(6).unwrap_err()), NetErrorCode::DataLoss);
     }
 }

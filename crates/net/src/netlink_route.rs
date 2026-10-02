@@ -572,7 +572,22 @@ mod socket {
                             format!("netlink request failed: errno {errno}"),
                         ));
                     }
-                    NLMSG_DONE => return Ok(NetlinkReply { seq, messages }),
+                    NLMSG_DONE => {
+                        // dump が途中で失敗すると、カーネルは DONE のペイロードに負の errno を載せる。
+                        // ペイロードが空なら成功、それ以外は先頭の i32 を判定する。
+                        if msg.payload().is_empty() {
+                            return Ok(NetlinkReply { seq, messages });
+                        }
+                        let ack = decode_nlmsgerr(msg.payload())?;
+                        if ack.is_ack() {
+                            return Ok(NetlinkReply { seq, messages });
+                        }
+                        let errno = ack.errno();
+                        return Err(NetError::new(
+                            classify_errno(errno),
+                            format!("netlink dump failed: errno {errno}"),
+                        ));
+                    }
                     NLMSG_NOOP => {}
                     NLMSG_OVERRUN => {
                         return Err(data_loss(format!("netlink overrun for seq {seq}")));
@@ -1058,6 +1073,30 @@ mod socket {
                 got,
                 vec![(16, &[1u8, 2, 3, 4][..]), (16, &[5u8, 6, 7, 8][..])]
             );
+        }
+
+        /// NET-11: NLMSG_DONE のペイロードが負の errno なら、部分結果を返さずエラーにする。
+        #[test]
+        fn done_with_errno_is_error() {
+            let payload = (-2i32).to_ne_bytes();
+            let e = run(
+                8,
+                Duration::from_secs(5),
+                script(vec![plain_dgram(NLMSG_DONE, 8, &payload)]),
+            )
+            .expect_err("dump failed");
+            assert_eq!(e.code(), NetErrorCode::NotFound);
+        }
+
+        /// NET-11: NLMSG_DONE が空ペイロードなら成功。
+        #[test]
+        fn done_with_empty_payload_is_ok() {
+            run(
+                8,
+                Duration::from_secs(5),
+                script(vec![plain_dgram(NLMSG_DONE, 8, &[])]),
+            )
+            .expect("done");
         }
 
         /// NET-11: NLMSG_OVERRUN は DataLoss。

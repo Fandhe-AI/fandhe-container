@@ -235,13 +235,28 @@ impl NlMsgBuilder {
     /// 属性を追記する。`attr_type` が `NLA_TYPE_MASK` を超える、またはペイロードが
     /// `MAX_ATTR_PAYLOAD_LEN` を超える場合は `Err`。
     pub fn put_attr(&mut self, attr_type: u16, payload: &[u8]) -> Result<(), NetError> {
-        self.put_attr_raw(attr_type, payload)
+        self.put_attr_with_flags(attr_type, 0, payload)
+    }
+
+    /// フラグ付きで属性を追記する。`flags` に指定できるのは `NLA_F_NET_BYTEORDER` のみ
+    /// （`NLA_F_NESTED` は `put_nested` 経由で付与する）。型番号は `NLA_TYPE_MASK` 以下であること。
+    /// デコーダ側（`is_net_byteorder`）と対称に、ネットワークバイトオーダー属性を送出できる。
+    pub fn put_attr_with_flags(
+        &mut self,
+        attr_type: u16,
+        flags: u16,
+        payload: &[u8],
+    ) -> Result<(), NetError> {
+        if attr_type > NLA_TYPE_MASK {
+            return Err(invalid("attribute type out of range"));
+        }
+        if flags & !NLA_F_NET_BYTEORDER != 0 {
+            return Err(invalid("attribute flags not allowed"));
+        }
+        self.put_attr_raw(attr_type | flags, payload)
     }
 
     fn put_attr_raw(&mut self, raw_type: u16, payload: &[u8]) -> Result<(), NetError> {
-        if raw_type > NLA_TYPE_MASK {
-            return Err(invalid("attribute type out of range"));
-        }
         if payload.len() > MAX_ATTR_PAYLOAD_LEN {
             return Err(invalid("attribute payload too large"));
         }
@@ -623,6 +638,26 @@ mod tests {
             (inner[0].attr_type(), inner[0].payload()),
             (1, &[9u8, 8][..])
         );
+    }
+
+    /// NET-11: `NLA_F_NET_BYTEORDER` 付き属性の送出と復元、不許可フラグ・型範囲の拒否。
+    #[test]
+    fn put_attr_with_flags_net_byteorder() {
+        let mut b = NlMsgBuilder::new(1, 0, 0, 0);
+        b.put_attr_with_flags(3, NLA_F_NET_BYTEORDER, &[0, 0, 0, 1])
+            .unwrap();
+        let bytes = b.finish().unwrap();
+        assert_eq!(&bytes[18..20], &(0x4000u16 | 3).to_ne_bytes());
+        let msg = NlMsgIter::new(&bytes).next().unwrap().unwrap();
+        let a = msg.attrs(0).unwrap().next().unwrap().unwrap();
+        assert_eq!(
+            (a.attr_type(), a.is_net_byteorder(), a.payload()),
+            (3, true, &[0u8, 0, 0, 1][..])
+        );
+        let mut b = NlMsgBuilder::new(1, 0, 0, 0);
+        assert!(b.put_attr_with_flags(3, NLA_F_NESTED, &[]).is_err());
+        assert!(b.put_attr_with_flags(0x4000, 0, &[]).is_err());
+        assert!(b.put_attr(0x4003, &[]).is_err());
     }
 
     /// NET-11: rta_type 上位ビットのフラグ。

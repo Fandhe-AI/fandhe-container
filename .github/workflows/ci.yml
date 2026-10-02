@@ -212,6 +212,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test（既定 feature）
         run: cargo test --workspace
+      # core の plugin 無効構成（--no-default-features）の検証（PLUG-3・TASK-111.1・#262）。
+      # 新ジョブは必須チェック名が増えるため既存ジョブへのステップとして追加する。
+      - name: core plugin 無効構成の検証
+        shell: bash
+        run: make test-core-no-plugin
 
   # --------------------------------------------------
   # integration-test（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）

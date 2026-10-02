@@ -36,11 +36,11 @@ pub use lifecycle::{
     ONE_SHOT_ARGS_MAX_BYTES, ONE_SHOT_ARGS_MAX_COUNT, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_REAP_TIMEOUT,
     ONE_SHOT_STDERR_DRAIN_TIMEOUT, ONE_SHOT_STDERR_MAX_BYTES, ONE_SHOT_STDERR_STOP_TIMEOUT,
     ONE_SHOT_TIMEOUT_DEFAULT, ONE_SHOT_TIMEOUT_MAX, OneShotOutcome, OneShotPlugin, OneShotRecord,
-    OneShotStderr, OneShotTermination, OneShotTimeout, PLUGIN_SOCKET_ENV, PluginMode,
-    PluginModeKind, PluginSession, PluginSessionShutdown, RESIDENT_EXIT_DETECT_TIMEOUT,
-    RESIDENT_START_TIMEOUT_DEFAULT, RESIDENT_START_TIMEOUT_MAX, ResidentCallRecord, ResidentPlugin,
-    ResidentShutdown, ResidentShutdownError, ResidentStartTimeout, ResidentState, call_once,
-    call_once_observed,
+    OneShotStderr, OneShotSummary, OneShotTermination, OneShotTimeout, PLUGIN_SOCKET_ENV,
+    PluginCallOutcome, PluginCallRecord, PluginMode, PluginModeKind, PluginSession,
+    PluginSessionShutdown, RESIDENT_EXIT_DETECT_TIMEOUT, RESIDENT_START_TIMEOUT_DEFAULT,
+    RESIDENT_START_TIMEOUT_MAX, ResidentCallRecord, ResidentPlugin, ResidentShutdown,
+    ResidentShutdownError, ResidentStartTimeout, ResidentState, call_once, call_once_observed,
 };
 pub use message::{ControlMessage, MessageId, decode_message, encode_message};
 pub use transport::{

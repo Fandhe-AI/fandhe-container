@@ -41,7 +41,10 @@
 mod mode;
 mod resident;
 
-pub use mode::{PluginMode, PluginModeKind, PluginSession, PluginSessionShutdown};
+pub use mode::{
+    OneShotSummary, PluginCallOutcome, PluginCallRecord, PluginMode, PluginModeKind, PluginSession,
+    PluginSessionShutdown,
+};
 
 pub use resident::{
     RESIDENT_EXIT_DETECT_TIMEOUT, RESIDENT_START_TIMEOUT_DEFAULT, RESIDENT_START_TIMEOUT_MAX,

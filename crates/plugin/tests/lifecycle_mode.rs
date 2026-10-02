@@ -145,27 +145,41 @@ mod unix {
             // 1. 都度起動: 呼び出しごとに新しいプロセスで、seq は毎回 1。
             let mut s = PluginSession::start(&plugin, PluginMode::one_shot()).unwrap();
             assert_eq!(s.mode(), PluginModeKind::OneShot);
-            let (a1, seq) = parse(&s.call(&ping()).unwrap());
+            let (a1, seq) = parse(&s.call(&ping()).unwrap().into_response());
             assert_eq!(seq, 1);
             assert_process_gone(a1);
             no_socket_left(&dir);
-            let (a2, seq) = parse(&s.call(&ping()).unwrap());
+            let out = s.call(&ping()).unwrap();
+            // 都度起動の終了状況と stderr は統一 API でも保持される。
+            assert_eq!(
+                out.termination(),
+                Some(OneShotTermination::Exited { code: Some(0) })
+            );
+            assert!(out.stderr().is_some());
+            let (a2, seq) = parse(&out.into_response());
             assert_eq!(seq, 1);
             assert_ne!(a1, a2);
             assert_process_gone(a2);
             no_socket_left(&dir);
-            assert!(matches!(
-                s.shutdown().unwrap(),
-                PluginSessionShutdown::OneShot
-            ));
+            match s.shutdown().unwrap() {
+                PluginSessionShutdown::OneShot(sum) => {
+                    assert_eq!(sum.calls(), 2);
+                    assert_eq!(
+                        sum.last_termination(),
+                        Some(OneShotTermination::Exited { code: Some(0) })
+                    );
+                    assert!(sum.last_stderr().is_some());
+                }
+                other => panic!("unexpected shutdown: {other:?}"),
+            }
 
             // 2. 常駐へ切替: 同一 pid で seq が 1, 2, 3。
             let mut s = PluginSession::start(&plugin, PluginMode::resident()).unwrap();
             assert_eq!(s.mode(), PluginModeKind::Resident);
-            let (b, seq) = parse(&s.call(&ping()).unwrap());
+            let (b, seq) = parse(&s.call(&ping()).unwrap().into_response());
             assert_eq!(seq, 1);
-            assert_eq!(parse(&s.call(&ping()).unwrap()), (b, 2));
-            assert_eq!(parse(&s.call(&ping()).unwrap()), (b, 3));
+            assert_eq!(parse(&s.call(&ping()).unwrap().into_response()), (b, 2));
+            assert_eq!(parse(&s.call(&ping()).unwrap().into_response()), (b, 3));
             assert!(b != me && b != a1 && b != a2);
             match s.shutdown().unwrap() {
                 PluginSessionShutdown::Resident(done) => assert_eq!(
@@ -179,17 +193,43 @@ mod unix {
 
             // 3. 再び都度起動へ切替。
             let mut s = PluginSession::start(&plugin, PluginMode::one_shot()).unwrap();
-            let (c, seq) = parse(&s.call(&ping()).unwrap());
+            let (c, seq) = parse(&s.call(&ping()).unwrap().into_response());
             assert_eq!(seq, 1);
             assert_ne!(c, b);
             assert_process_gone(c);
             no_socket_left(&dir);
             assert!(matches!(
                 s.shutdown().unwrap(),
-                PluginSessionShutdown::OneShot
+                PluginSessionShutdown::OneShot(_)
             ));
         });
         assert!(started.elapsed() < WAIT);
+    }
+
+    /// REPAIR-4: 観測記録は両モードで同じ形で受け取れる（成功件数・モード・操作名）。
+    #[test]
+    fn plug7_mode_session_call_observed_records_both_modes() {
+        let dir = TempDir::new("respond");
+        let plugin = plugin_for(&dir);
+        with_watchdog("observed", move || {
+            for (mode, op) in [
+                (PluginMode::one_shot(), "plugin.call_once"),
+                (PluginMode::resident(), "plugin.resident_call"),
+            ] {
+                let kind = mode.kind();
+                let mut s = PluginSession::start(&plugin, mode).unwrap();
+                let mut records = Vec::new();
+                s.call_observed(&ping(), &mut |r| records.push(r.clone()))
+                    .unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].mode, kind);
+                assert_eq!(records[0].operation, op);
+                assert!(records[0].success);
+                assert_eq!(records[0].error_code, None);
+                assert_eq!(records[0].stderr.is_some(), kind == PluginModeKind::OneShot);
+                s.shutdown().unwrap();
+            }
+        });
     }
 
     /// 存在しない絶対パスは両モードとも NotFound の構造化エラーで、socket は残らない。

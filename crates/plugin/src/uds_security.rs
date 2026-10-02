@@ -26,6 +26,11 @@
 //!   返した後の保護は `UdsListener::bind` が bind 時に配置ディレクトリを fd で再検証して担う。
 //! - 作成は非再帰で、基底ディレクトリ（`XDG_RUNTIME_DIR` 自体）は作らない。
 //! - エラーメッセージは固定の英語文字列で、パス・環境変数値を含めない。
+//! - socket の 0600 化は [`crate::UdsListener::bind`] が検証済みディレクトリ fd 基準の
+//!   `fchmodat(AT_SYMLINK_NOFOLLOW)` で行う（TASK-123.3・#288）。パス指定の chmod は、bind 後の
+//!   パス・祖先の差し替えで別ファイルの mode を変えうるため使わない（`docs/design/io-protocol.md`）。
+//!   親が 0700 かつ自 UID 所有のため、bind から 0600 化までの mode 差は他 UID から到達できない。
+//! - [`RuntimeDir::socket_path`] が socket 名の検証と `sun_path` 長検証を bind 前に行う（#288）。
 //!
 //! # `XDG_RUNTIME_DIR` 未設定時のフォールバック（TASK-123.4・#289）
 //! 未設定または空のときだけ、OS・euid ごとに単一の基底を選び、通常経路と同じ検証
@@ -44,8 +49,8 @@
 //! - OCI-5 の state store は別仕様で、未設定時にフォールバックしない（`crates/core`）。
 //!
 //! # 未実装（REPAIR-3）
-//! - 既存 socket パスの lstat 検証・stale socket 削除（TASK-123.2・#287）、socket 0600 化と
-//!   `sun_path` 長検証（TASK-123.3・#288）、peer credential（TASK-124）は別 sub。
+//! - 既存 socket パスの lstat 検証・stale socket 削除（TASK-123.2・#287）、
+//!   peer credential（TASK-124）は別 sub。
 //! - 非 unix は `Unimplemented`（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る）。
 
 use std::path::{Component, Path, PathBuf};
@@ -78,6 +83,19 @@ impl RuntimeDir {
     /// 既に存在していなければならない（`NotFound`。基底は作成しない）。
     pub fn ensure_under(base: &Path) -> Result<Self, PluginError> {
         imp::ensure_under(base)
+    }
+
+    /// 検証済み runtime directory 直下の socket パスを、bind 前に検証して返す（PLUG-12・TASK-123.3・#288）。
+    ///
+    /// TASK-109（plugin 発見）・TASK-114（core 側 proxy）が [`crate::UdsListener::bind`] へ渡す前に使い、
+    /// 不正な名前と `sun_path` 超過を socket を作る前に検出する。`name` は単一の通常コンポーネント
+    /// （空・`.`・`..`・区切り・NUL を含まない）でなければ `InvalidArgument`。結合後のパスが
+    /// `sun_path` に収まらなければ `InvalidArgument`（"socket path is too long"）。
+    ///
+    /// 本メソッドは早期検出であり、`UdsListener::bind` は同じ長さ検証（Linux では bind に使う
+    /// `/proc/self/fd/<fd>/<名前>` 側の長さも）を再度行う。0600 化も bind 側が fd 基準で担う。
+    pub fn socket_path(&self, name: &str) -> Result<PathBuf, PluginError> {
+        imp::socket_path(self, name)
     }
 
     /// 検証済みディレクトリのパス。
@@ -208,6 +226,32 @@ mod imp {
 
     pub(super) fn ensure_under(base: &Path) -> Result<RuntimeDir, PluginError> {
         ensure_dir(base, crate::sys::effective_uid())
+    }
+
+    pub(super) fn socket_path(dir: &RuntimeDir, name: &str) -> Result<PathBuf, PluginError> {
+        validate_socket_name(name)?;
+        let path = dir.path().join(name);
+        crate::transport::check_sun_path_len(&path)?;
+        Ok(path)
+    }
+
+    /// socket 名が単一の通常コンポーネントであることを確認する純粋関数（トラバーサル防止）。
+    /// `Path::components()` は末尾 `/` や中間の `.` を正規化するため、元の文字列との一致で拒否する。
+    pub(super) fn validate_socket_name(name: &str) -> Result<(), PluginError> {
+        let mut comps = Path::new(name).components();
+        let ok = !name.contains('\0')
+            && matches!(
+                (comps.next(), comps.next()),
+                (Some(std::path::Component::Normal(c)), None) if c == std::ffi::OsStr::new(name)
+            );
+        if ok {
+            Ok(())
+        } else {
+            Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                "socket name must be a single path component",
+            ))
+        }
     }
 
     fn map_io(e: &io::Error) -> PluginError {
@@ -683,6 +727,13 @@ mod imp {
     }
 
     pub(super) fn ensure_under(_base: &Path) -> Result<RuntimeDir, PluginError> {
+        Err(unimplemented())
+    }
+
+    pub(super) fn socket_path(
+        _dir: &RuntimeDir,
+        _name: &str,
+    ) -> Result<std::path::PathBuf, PluginError> {
         Err(unimplemented())
     }
 }

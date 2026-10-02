@@ -1,5 +1,6 @@
 //! plugin プロセスの都度起動モード（PLUG-7・TASK-110.1・#258）と、子モジュール `resident` の常駐モード
-//! （TASK-110.2・#259。起動仕様 [`OneShotPlugin`]・stderr 収集・子の回収ガードを共用する）。
+//! （TASK-110.2・#259。起動仕様 [`OneShotPlugin`]・stderr 収集・子の回収ガードを共用する）と、
+//! 子モジュール `mode` のモード選択 API（TASK-110.3・#260）。
 //!
 //! 呼び出しごとに plugin プロセスを spawn し、1 往復（要求フレーム送信 -> 応答フレーム受信）の
 //! 完了後に終了させる。呼び出し元は core 側の plugin proxy（TASK-114 ほか。依存方向は
@@ -29,8 +30,7 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - モード選択 API（TASK-110.3）。常駐モードは実装済み（外部管理の常駐 plugin への再接続は未実装。
-//!   `resident` の冒頭を参照）。
+//! - 外部管理の常駐 plugin への再接続（attach）と、観測記録を受け取る統一 API（`mode` の冒頭を参照）。
 //! - 起動対象の信頼性検証（所有者・モード・sha256 照合。TASK-122・PLUG-11）。本 API は検証を
 //!   行わず、呼び出し側が検証済みの絶対パスを渡すことを前提とする。
 //! - 孫プロセスの回収（プロセスグループ単位の kill は未対応）。孫が stderr の書き込み端を保持し
@@ -38,7 +38,13 @@
 //!   が false になる。打ち切り後は読み取り側を閉じるため、孫の以後の書き込みは `EPIPE` になる。
 //! - 要求 ID と応答 ID の対応づけ（TASK-114）。
 
+mod mode;
 mod resident;
+
+pub use mode::{
+    OneShotSummary, PluginCallOutcome, PluginCallRecord, PluginMode, PluginModeKind, PluginSession,
+    PluginSessionShutdown,
+};
 
 pub use resident::{
     RESIDENT_EXIT_DETECT_TIMEOUT, RESIDENT_START_TIMEOUT_DEFAULT, RESIDENT_START_TIMEOUT_MAX,

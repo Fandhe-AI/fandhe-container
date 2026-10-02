@@ -16,11 +16,13 @@
 //!   基準で呼ぶ（パス再解決による TOCTOU を避ける。PLUG-12）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_NOFOLLOW | O_DIRECTORY)` で配置ディレクトリを
 //!   ルートから 1 要素ずつ辿る（祖先要素の symlink を拒否。PLUG-12）
+//! - client connect（#249）: `socket(2)` / `connect(2)`（macOS は `fcntl(F_SETFD)` も）で非ブロッキング接続を期限までリトライする（REPAIR-5）。
+//!   対応外の OS・アーキテクチャは `Unsupported`
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`connect_unix`]（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 
@@ -478,6 +480,207 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
     Ok(euid)
 }
 
+// ---- 期限付き client connect（PLUG-2・REPAIR-5。TASK-107.5・#249） ----
+//
+// `UnixStream::connect` は期限を指定できず、Linux では backlog が埋まった listener への blocking
+// connect が無期限に待つ。そのため socket を自前で作り、非ブロッキング connect を期限までリトライする。
+// 定数・構造体レイアウトは OS ごとに個別定義し流用しない（Linux x86_64 / aarch64 は共通値。
+// 対応外の unix は `Unsupported`）。
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+mod connect_abi {
+    pub(super) const AF_UNIX: i32 = 1;
+
+    #[cfg(target_os = "linux")]
+    pub(super) const SOCK_STREAM: i32 = 1;
+    #[cfg(target_os = "linux")]
+    pub(super) const SOCK_CLOEXEC: i32 = 0o2000000;
+    #[cfg(target_os = "linux")]
+    pub(super) const EISCONN: i32 = 106;
+    #[cfg(target_os = "linux")]
+    pub(super) const EINPROGRESS: i32 = 115;
+    #[cfg(target_os = "linux")]
+    pub(super) const EALREADY: i32 = 114;
+    #[cfg(target_os = "linux")]
+    pub(super) const EAGAIN: i32 = 11;
+
+    #[cfg(target_os = "macos")]
+    pub(super) const SOCK_STREAM: i32 = 1;
+    #[cfg(target_os = "macos")]
+    pub(super) const F_SETFD: i32 = 2;
+    #[cfg(target_os = "macos")]
+    pub(super) const FD_CLOEXEC: i32 = 1;
+    #[cfg(target_os = "macos")]
+    pub(super) const EISCONN: i32 = 56;
+    #[cfg(target_os = "macos")]
+    pub(super) const EINPROGRESS: i32 = 36;
+    #[cfg(target_os = "macos")]
+    pub(super) const EALREADY: i32 = 37;
+    #[cfg(target_os = "macos")]
+    pub(super) const EAGAIN: i32 = 35;
+
+    pub(super) const EINTR: i32 = 4;
+
+    #[cfg(target_os = "linux")]
+    pub(super) const SUN_PATH_LEN: usize = 108;
+    #[cfg(target_os = "macos")]
+    pub(super) const SUN_PATH_LEN: usize = 104;
+
+    /// Linux の `struct sockaddr_un`（110 バイト）。
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    pub(super) struct SockaddrUn {
+        pub sun_family: u16,
+        pub sun_path: [u8; SUN_PATH_LEN],
+    }
+    #[cfg(target_os = "linux")]
+    const _: () = assert!(core::mem::size_of::<SockaddrUn>() == 110);
+
+    /// macOS の `struct sockaddr_un`（106 バイト）。
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    pub(super) struct SockaddrUn {
+        pub sun_len: u8,
+        pub sun_family: u8,
+        pub sun_path: [u8; SUN_PATH_LEN],
+    }
+    #[cfg(target_os = "macos")]
+    const _: () = assert!(core::mem::size_of::<SockaddrUn>() == 106);
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の `int socket(int, int, int)` と同じ型・幅。
+        pub(super) fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
+        // SAFETY（宣言そのものの妥当性）: POSIX の `int connect(int, const struct sockaddr *, socklen_t)`
+        // と同じ型・幅（`socklen_t` は `u32`）。
+        pub(super) fn connect(sockfd: i32, addr: *const SockaddrUn, addrlen: u32) -> i32;
+        // SAFETY（宣言そのものの妥当性）: POSIX の `int fcntl(int, int, ...)` と同じ型・幅。
+        #[cfg(target_os = "macos")]
+        pub(super) fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+}
+
+/// `path` の UDS へ `deadline` までに非ブロッキング connect し、接続済みの `UnixStream` を返す
+/// （非ブロッキングのまま。呼び出し側が blocking へ戻す）。
+///
+/// `transport` の client 接続（`UdsStream::connect`）から呼ばれる。空・内部 NUL・`sun_path` 超過は
+/// `InvalidInput`、期限超過は `TimedOut`、listener の backlog 満杯（Linux の `EAGAIN`）・`EINTR`・
+/// `EINPROGRESS` は期限までリトライする。未対応の OS・アーキテクチャは `Unsupported`（fail-closed）。
+/// fd は socket 作成直後に `UnixStream` へ所有させ、どの失敗経路でも close される。
+pub(crate) fn connect_unix(
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> io::Result<UnixStream> {
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    {
+        use connect_abi as abi;
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::{Duration, Instant};
+
+        let bytes = path.as_os_str().as_bytes();
+        let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
+        // sun_path は終端 NUL を 1 バイト残す（`addr` はゼロ初期化済み）。
+        let mut addr: abi::SockaddrUn = abi::SockaddrUn {
+            #[cfg(target_os = "macos")]
+            sun_len: 0,
+            #[cfg(target_os = "macos")]
+            sun_family: abi::AF_UNIX as u8,
+            #[cfg(target_os = "linux")]
+            sun_family: abi::AF_UNIX as u16,
+            sun_path: [0; abi::SUN_PATH_LEN],
+        };
+        if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= addr.sun_path.len() {
+            return Err(invalid());
+        }
+        addr.sun_path
+            .get_mut(..bytes.len())
+            .ok_or_else(invalid)?
+            .copy_from_slice(bytes);
+        let addr_len = u32::try_from(SUN_PATH_OFFSET + bytes.len() + 1).map_err(|_| invalid())?;
+        #[cfg(target_os = "macos")]
+        {
+            addr.sun_len = u8::try_from(addr_len).map_err(|_| invalid())?;
+        }
+
+        #[cfg(target_os = "linux")]
+        let ty = abi::SOCK_STREAM | abi::SOCK_CLOEXEC;
+        #[cfg(target_os = "macos")]
+        let ty = abi::SOCK_STREAM;
+        // SAFETY: 引数は整数のみ。成否は戻り値で確認する。
+        let fd = unsafe { abi::socket(abi::AF_UNIX, ty, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` は直前の socket が返した、他に所有者のいない有効な fd（非負を確認済み）。
+        // 以降の失敗経路でも `UnixStream` の Drop で close される。
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: `fd` は `stream` が所有する有効な fd。F_SETFD は int 引数 1 つを取る。
+            let rc = unsafe { abi::fcntl(fd, abi::F_SETFD, abi::FD_CLOEXEC) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        stream.set_nonblocking(true)?;
+
+        const RETRY_INTERVAL: Duration = Duration::from_millis(5);
+        loop {
+            // SAFETY: `fd` は `stream` が所有し生存中。`addr` はスタック上の `#[repr(C)]` な
+            // `sockaddr_un` で、`addr_len` はその先頭から有効な（NUL 終端込みの）バイト数
+            // （構造体サイズ以下であることは上の長さ検査で保証）。
+            let rc = unsafe { abi::connect(fd, &raw const addr, addr_len) };
+            if rc == 0 {
+                return Ok(stream);
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(abi::EISCONN) => return Ok(stream),
+                Some(abi::EAGAIN | abi::EINTR | abi::EINPROGRESS | abi::EALREADY) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(io::Error::from(io::ErrorKind::TimedOut));
+                    }
+                    std::thread::sleep((deadline - now).min(RETRY_INTERVAL));
+                }
+                _ => return Err(err),
+            }
+        }
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    {
+        let _ = (path, deadline);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+/// `sockaddr_un` の `sun_path` 先頭オフセット（Linux: 2、macOS: 2）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+const SUN_PATH_OFFSET: usize = 2;
+
 /// 未対応の OS・アーキテクチャでは peer を検証できないため常に拒否する（fail-closed）。
 #[cfg(not(any(
     target_os = "macos",
@@ -536,6 +739,60 @@ mod tests {
         assert!(fchmodat_via_opath(&dir, c"lnk", 0o600).is_err());
         let mode = std::fs::metadata(d.join("target")).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o644);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// PLUG-2: 期限付き connect の入力検証と未存在パス（OS 依存の errno は NotFound）。
+    #[test]
+    fn plug2_connect_unix_rejects_bad_paths_and_missing_socket() {
+        use std::time::{Duration, Instant};
+        let dl = Instant::now() + Duration::from_secs(5);
+        let long = std::path::PathBuf::from(format!("/{}", "a".repeat(200)));
+        let e = connect_unix(&long, dl).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let e = connect_unix(std::path::Path::new(""), dl).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let e = connect_unix(std::path::Path::new("/tmp/a\0b"), dl).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let d = tmpdir("conn");
+        let e = connect_unix(&d.join("none.sock"), dl).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の `int listen(int, int)` と同じ型・幅。
+        fn listen(sockfd: i32, backlog: i32) -> i32;
+    }
+
+    /// REPAIR-5: accept しない listener の backlog が埋まると blocking connect は無期限に待つが、
+    /// 期限付き connect は `TimedOut` で戻る（Linux の満杯時 `EAGAIN` 経路。macOS は即
+    /// `ECONNREFUSED` のため対象外）。backlog は std の既定が大きく埋めにくいため、テスト内で
+    /// `listen(fd, 0)` を再発行して縮める。
+    #[test]
+    fn repair5_connect_unix_times_out_when_backlog_is_full() {
+        use std::time::{Duration, Instant};
+        let d = tmpdir("backlog");
+        let l = UnixListener::bind(d.join("s.sock")).unwrap();
+        // SAFETY: fd は `l` の借用中は有効な listening socket。再 listen は backlog を更新するだけ。
+        assert_eq!(unsafe { listen(l.as_raw_fd(), 0) }, 0);
+        let mut held = Vec::new();
+        let mut timed_out = None;
+        for _ in 0..64 {
+            let t = Instant::now();
+            let dl = t + Duration::from_millis(200);
+            match connect_unix(&d.join("s.sock"), dl) {
+                Ok(s) => held.push(s),
+                Err(e) => {
+                    timed_out = Some((e.kind(), t.elapsed()));
+                    break;
+                }
+            }
+        }
+        let (kind, el) = timed_out.expect("backlog did not fill");
+        assert_eq!(kind, io::ErrorKind::TimedOut);
+        assert!(el >= Duration::from_millis(200), "{el:?}");
+        assert!(el < Duration::from_secs(5), "{el:?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

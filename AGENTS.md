@@ -52,8 +52,9 @@ make ci                     # lint-docs + check-workspace-manifest + fmt-check +
 make bench-check-selftest   # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
 make plugin-feature-size    # core の既定 / plugin 除外 release ビルドの rlib サイズ記録（PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測）
 make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
-cargo bench -p fandhe-container-benches --bench plugin_boundary -- --output <path>  # 代表操作 A の plugin 境界ベンチ（TASK-113.1・PLUG-5。同一プロセスと境界越しの p50 を ns で出力。Unix のみ。baseline 未登録のため bench-check・CI ゲートには未接続）
-cargo bench -p fandhe-container-benches --bench plugin_boundary_list_images [-- --output <path>]  # 代表操作 B（イメージ一覧）の plugin 境界ベンチ（TASK-113.2・PLUG-5。引数なしはスモーク。ゲート未接続）
+cargo bench -p fandhe-container-benches --bench plugin_boundary -- --output <path>  # 代表操作 A の plugin 境界ベンチ（TASK-113.1・PLUG-5。同一プロセスと境界越しの p50 と Δp50（TASK-113.3）を ns で出力し、Δp50 と CORE-10 比は stderr へログ。Unix のみ。baseline 未登録のため bench-check には未接続）
+cargo bench -p fandhe-container-benches --bench plugin_boundary_list_images [-- --output <path>]  # 代表操作 B（イメージ一覧）の plugin 境界ベンチ（TASK-113.2・PLUG-5。引数なしはスモーク。Δp50 も出力。bench-check には未接続）
+make bench-plugin-boundary  # plugin 境界ベンチ A・B を実行し Δp50 と CORE-10 の Linux 実機値（0.290〜0.298 秒）に対する割合をログ出力（TASK-113.3・PLUG-5。基準値比較なし）
 make bench-baseline-selftest  # baseline.json 生成スクリプトの自己テスト（TASK-88.1・REPAIR-12）
 make bench-baseline         # ベンチを実行し baseline.json を再生成する（TASK-88.1。BENCH_ENVIRONMENT・BENCH_BASELINE_OUT で指定。実測の記録は TASK-88.2）
 make fio-bench-selftest     # fio 4K ランダム write ベンチスクリプトの自己テスト（TASK-25.1・IO-8・REPAIR-12。実 fio 不要）
@@ -104,7 +105,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | `fmt-check`・`deny` | `rust-ci` |
 | `lint`・`test`（既定 feature） | `rust-ci-default-features`（`--all-features` 側は `rust-ci`） |
 | `test-integration` | `integration-test` |
-| `bench-check-selftest`・`bench-baseline-selftest`・`bench-check`・`plugin-feature-size` | `bench-regression` |
+| `bench-check-selftest`・`bench-baseline-selftest`・`bench-check`・`bench-plugin-boundary`・`plugin-feature-size` | `bench-regression` |
 | （対応 target なし。`rustup target add aarch64-unknown-linux-gnu` の後に `cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu` と `cargo clippy --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu -- -D warnings`） | `aarch64-linux-check` |
 | `lint-docs` | `lint-docs` |
 | `check-workspace-manifest`（`make ci` の一部） | 専用の CI ジョブはない（ローカルゲート専用）。workspace manifest が不正なら各 cargo ジョブのビルドが失敗するため、CI では間接的に検出される |
@@ -135,7 +136,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | 結合試験 | 各 crate の `tests/*.rs`（integration test target） | `make test-integration` | `crates/io/tests/` に導入済み。他 crate の結合試験は各機能タスクで追加する。件数は `make test-integration` が出力する `integration test targets: N` 行で確認する |
 | SIGKILL 耐性（IO-3・TASK-18.3.1。実測は [io-crash-safety](docs/design/io-crash-safety.md)） | `crates/io/tests/crash_safety.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-io --features crash-test-server --test crash_safety` | 既定 CI 集合（`integration-test` 3 OS・`rust-ci`）で実行し、実機前提ではない。`integration-test` は「crash_safety の存在確認」ステップで glob による無言除外を検出する。電源断後の媒体永続化（IO-2）と実測レポート・妥当性判断（TASK-18 の人間担当）は保証しない |
 | デーモンレス確認（CORE-1・D-19・SUP-1・TASK-28.2） | `crates/core/tests/daemonless.rs`・`crates/supervisor/tests/daemonless.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-core --test daemonless`・`cargo test -p fandhe-container-supervisor --test daemonless` | root・namespace を要さず自身が起動した子プロセスのみを対象とするため、分離せず既定 CI 集合に含める。検証本体は Linux のみ（`/proc` 走査）。役割プロセスは代役で、本番バイナリでの n=0 確認と SUP-1 の実機計測は TASK-45・47・49 の担当 |
-| ベンチ回帰 | `benches/benches/*.rs`・`benches/baseline.json`・`benches/metrics.json`・`scripts/bench/` | `make bench-check`・`make bench-baseline-selftest` | プレースホルダ段階。実ベンチは TASK-113、基準値の校正は TASK-88（校正記録: [bench-calibration](docs/design/bench-calibration.md)） |
+| ベンチ回帰 | `benches/benches/*.rs`・`benches/baseline.json`・`benches/metrics.json`・`scripts/bench/` | `make bench-check`・`make bench-baseline-selftest` | `bench-check` の対象はプレースホルダ段階。plugin 境界ベンチの Δp50 は metric 出力と fixture 判定（`make bench-check-selftest`。16% 悪化は exit 1・ちょうど 15% は exit 0）まで実装済みで、baseline 未登録のため常時比較は未有効（TASK-113.3）。基準値の校正は TASK-88（校正記録: [bench-calibration](docs/design/bench-calibration.md)） |
 | fio 4K ランダム write ベンチ | `scripts/fio-randwrite-4k.sh`・`scripts/testdata/fio-bench/` | `make fio-bench-selftest`（自己テスト）・`make fio-bench`（実機） | TASK-25.1 で実装済み |
 | 起動時間計測（CORE-10） | `scripts/bench/startup_latency.sh`・`scripts/bench/startup_latency_selftest.sh` | `make startup-latency-selftest`（自己テスト）・`make startup-latency`（実機）・`make startup-latency-docker`（実機）・`make startup-latency-report` | TASK-46.1: 計測ハーネスのみ実装済み。own 実測は CLI（TASK-79）・本番 launcher 提供後に人間が #213（TASK-46.h1）で実施。Docker 側の計測と own・Docker の統合レポートは TASK-46.2（#842）で追加済み（docker / report モード。計測区間が異なる点は `methods_differ` に明示。実測と判定は #213） |
 | 50 コンテナ同時起動の集約メモリ計測（CORE-9・SUP-1） | `scripts/bench/concurrent_50_memory.sh`・`scripts/bench/concurrent_50_memory_selftest.sh` | `make concurrent-memory-selftest`（自己テスト）・`make concurrent-memory`・`make concurrent-memory-docker`（実機）・`make concurrent-memory-report`（統合） | TASK-50.1: own 側の計測ハーネス（起動数 N 未満・PSS 0 混入を失敗として検出）。TASK-50.2: Docker 側の同一手法計測（`--mode docker`）と own・Docker の統合レポート（`--mode report`）。実測と SUP-1 の判定は CLI（TASK-79）・本番 launcher 提供後に人間が #219（TASK-50.h1）で実施（実測値は未取得） |
@@ -163,8 +164,8 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 - plugin 境界フレーム（長さ接頭辞フレーム。PLUG-2）の符号化・復号、壊れたフレームや長さ上限超過を拒否することのユニットテスト。フレームは型で組み立てる（REPAIR-2）。plugin からの入力は untrusted として検証する
 - plugin RPC の応答待ちがタイムアウトで打ち切られることの結合試験（REPAIR-5。フレーム単位の待機は `crates/plugin/tests/transport_frame_io.rs`〔#250〕。要求・応答の往復の試験は TASK-107.7・#251）
 - PLUG-4「core 無変更」の 3 点比較（core 側ソースの sha256 一覧・`cargo tree -p <core> --locked -e normal` で見た core の依存木・core バイナリの sha256。[crate-naming.md](docs/design/crate-naming.md) 決定 3）が変化しないこと。**現状**: `scripts/check-plug4-core-invariance.sh`（`make plug4-core-invariance`。core バイナリは未存在のため rlib で代理。TASK-79 後に実行ファイルへ切替）が plugin 追加前後の別ビルドで 3 点を比較する。plugin を通すために core 側のソースやテストを書き換えないこと（PLUG-4 違反は既存の P0 観点）
+- plugin 境界のベンチ（TASK-113 の `plugin_boundary` 系）。**現状**: 代表操作 A・B と Δp50・CORE-10 比のログ出力は実装済み（TASK-113.1〜113.3）。実測基準値の `benches/baseline.json` 登録と `make bench-check` への組み込み（常時の 15% 回帰判定）は TASK-88.h1・TASK-113.h1 待ちで未有効。それまで `bench-regression` の成功は plugin 境界の性能回帰がない根拠にならない。`bench-check` は `bench-baseline` と同じ `BENCH_NAMES` を実行し baseline.json 登録済み metric に絞って比較するため、基準値の再生成後は plugin 系 metric も自動で 15% 判定の対象になる
 - plugin の信頼性検証（PLUG-11: 他ユーザー書き込み可能な場所・ハッシュ不一致の plugin の登録拒否）と UDS 境界（PLUG-12: 権限・peer credential 検証）について、新しい plugin を対象にしたケース。**現状**: 管理ディレクトリからの候補探索（TASK-109.1）と PATH 探索の opt-in・警告ログ（TASK-109.2。候補は未検証・CLI フラグ配線は TASK-79）は実装済み。同名候補を解決するレジストリも TASK-109.3 で実装済み（登録は信頼済みを意味しない）。信頼性検証は TASK-122〜124 で実装予定で未実装
-- plugin 境界のベンチ（TASK-113 の `plugin_boundary` 系）。**現状**: 未実装
 - `plugin-microvm` 等 microVM 系の依存に触れる場合は `make deny` の禁止クレート検査（MVM-4）。**現状**: 機械判定（`scripts/check-microvm-deps.sh`・`deny.toml` `[bans]`）は TASK-73 で導入予定
 - macOS Virtualization.framework・WSL2・KVM を使うバックエンド plugin（`plugin-macos`・`plugin-windows`・`plugin-microvm`）の実機依存テストは、実機前提テストとして分離する（[ci](.claude/rules/ci.md)「実機前提テスト」）
 

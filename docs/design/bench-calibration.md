@@ -13,6 +13,8 @@
 | ---- | ---- | ---- | ---- |
 | 小ファイル多数ワークロードの files/s | `higher_is_better` | 未確定（ベンチ実装時に `benches/metrics.json` で確定） | 対応するベンチが未実装 |
 | コンテナ起動レイテンシ p95 | `lower_is_better` | 未確定（同上） | 対応するベンチが未実装。計測には TASK-29（create/start）の完了も必要 |
+| plugin 境界 代表操作 A の inproc / framed / Δp50（`plugin_boundary_op_a_{inproc,framed,delta}_p50`） | `lower_is_better`（ns） | 未確定（実測は未実施） | TASK-113.1・113.3 で実装済み。metrics.json・`BENCH_NAMES` に登録済み。baseline 未登録 |
+| plugin 境界 代表操作 B の inproc / framed / Δp50（`plugin_boundary_list_images_{inproc,framed,delta}_p50`） | `lower_is_better`（ns） | 未確定（実測は未実施） | TASK-113.2・113.3 で実装済み。登録状況は上と同じ |
 
 ## 校正記録（試行ログ）
 
@@ -28,7 +30,7 @@
 2. 起動 p95 は TASK-29（コンテナ create/start）が完了している
 3. 計測環境の扱いが TASK-88.h1 で決まっている（下記）
 
-現状は `BENCH_NAMES := regression_placeholder`・metric は `placeholder_throughput` / `placeholder_latency_p95` のみ。metric を先に追加すると `generate_baseline.sh` は `results are missing metrics` で exit 2 になる（fail-closed。設計どおり）。
+現状は `BENCH_NAMES := regression_placeholder plugin_boundary plugin_boundary_list_images`・metric は placeholder 2 件と plugin 境界 6 件（TASK-113.3 で登録）。`make bench-check` の対象は placeholder のみで、baseline 再生成時は `bench-check` の対象ベンチも同じ集合に揃えること（baseline と results の集合不一致は比較スクリプトが exit 2 にする）。metric だけを先に追加すると `generate_baseline.sh` は `results are missing metrics` で exit 2 になる（fail-closed。設計どおり）。
 
 ## 再実行手順
 

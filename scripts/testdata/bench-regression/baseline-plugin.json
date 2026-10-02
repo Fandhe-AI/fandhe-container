@@ -1,37 +1,33 @@
 {
   "schema_version": 1,
-  "placeholder": true,
-  "note": "TASK-88（人間担当）が実測から確定させて置き換える暫定基準値。placeholder_* は TASK-113 の実ベンチと対応付けが確定していないプレースホルダ。plugin_boundary_* は TASK-113.1〜113.3 の実 metric（実測基準値は TASK-88.h1・TASK-113.h1 で確定する）。",
   "metrics": {
-    "placeholder_throughput": {
-      "unit": "ops/s",
-      "direction": "higher_is_better"
-    },
-    "placeholder_latency_p95": {
-      "unit": "ms",
-      "direction": "lower_is_better"
-    },
     "plugin_boundary_op_a_inproc_p50": {
+      "value": 5000,
       "unit": "ns",
       "direction": "lower_is_better"
     },
     "plugin_boundary_op_a_framed_p50": {
+      "value": 28000,
       "unit": "ns",
       "direction": "lower_is_better"
     },
     "plugin_boundary_op_a_delta_p50": {
+      "value": 23000,
       "unit": "ns",
       "direction": "lower_is_better"
     },
     "plugin_boundary_list_images_inproc_p50": {
+      "value": 500,
       "unit": "ns",
       "direction": "lower_is_better"
     },
     "plugin_boundary_list_images_framed_p50": {
+      "value": 10000,
       "unit": "ns",
       "direction": "lower_is_better"
     },
     "plugin_boundary_list_images_delta_p50": {
+      "value": 9500,
       "unit": "ns",
       "direction": "lower_is_better"
     }

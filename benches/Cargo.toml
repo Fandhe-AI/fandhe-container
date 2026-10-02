@@ -15,7 +15,7 @@
 # CI のベンチ回帰ゲートを暫定的に稼働させるための stub ベンチ（本文は
 # benches/regression_placeholder.rs。決定的な固定値を出力するだけで実測はしない）。
 # [[bench]] plugin_boundary は TASK-113.1 の代表操作 A ベンチ（PLUG-5・PLUG-6）。
-# 結果は baseline.json 未登録のため bench-check にはまだ接続しない（TASK-113.3・TASK-88）。
+# Δp50 metric（TASK-113.3）も出力する。baseline.json 未登録のため bench-check にはまだ接続しない（実測基準値は TASK-88.h1・TASK-113.h1）。
 
 [package]
 name = "fandhe-container-benches"
@@ -36,7 +36,7 @@ harness = false
 fandhe-container-plugin = { path = "../crates/plugin" }
 
 # [[bench]] plugin_boundary_list_images は TASK-113.2（#271・PLUG-5）の代表操作 B（イメージ一覧）計測ハーネス。
-# 代表操作 A（plugin_boundary。TASK-113.1）とは別ターゲットで、ゲート（bench-check）へは未接続。
+# 代表操作 A（plugin_boundary。TASK-113.1）とは別ターゲットで、Δp50（TASK-113.3）も出力する。ゲート（bench-check）へは未接続（同上）。
 [[bench]]
 name = "plugin_boundary_list_images"
 harness = false

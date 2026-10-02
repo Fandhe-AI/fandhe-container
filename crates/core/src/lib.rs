@@ -61,6 +61,7 @@
 //!   発見・登録は未実装
 //! - `plugin_discovery`: 管理ディレクトリ（system / user）からの plugin 候補探索（TASK-109.1・PLUG-4・PLUG-11）と `PATH` 探索の opt-in・警告ログ（TASK-109.2）、同名重複を解決する候補レジストリ（TASK-109.3。登録は未検証）は実装済み・OS 非依存。
 //!   候補は未検証。opt-in の CLI フラグ配線（TASK-79）・信頼性検証（TASK-122）は未実装
+//! - `plugin_trust`: plugin 候補の所有者・モード検証（TASK-122.1・PLUG-11）。fd 経由の fstat で判定し検証済み fd を返す。非 Linux は常に拒否。symlink 解決・ハッシュ照合・レジストリ配線は未実装
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
 //!
@@ -89,6 +90,7 @@ pub mod oci_runtime;
 #[cfg(feature = "plugin")]
 pub mod plugin;
 pub mod plugin_discovery;
+pub mod plugin_trust;
 #[cfg(target_os = "linux")]
 pub mod rootless;
 pub mod seccomp;

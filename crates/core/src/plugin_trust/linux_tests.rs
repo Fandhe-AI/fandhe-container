@@ -627,3 +627,39 @@ fn plug11_task122_3_symlink_candidate_hashes_target_content() {
     let hv = v.verify_hash(&allow(&[PAYLOAD_SHA])).expect("allowed");
     assert_eq!(hv.digest().to_string(), PAYLOAD_SHA);
 }
+
+/// PLUG-11・SEC-4・TASK-122.5: 監査つき検証は、モード拒否と同時に理由つきレコードを 1 件残す。
+#[test]
+fn plug11_task122_5_audited_verify_records_mode_rejection() {
+    use crate::audit_log::mount::tests::VecSink;
+    use crate::audit_log::{AuditDelivery, AuditLayer};
+    use crate::plugin_trust::{AllowedPluginHashes, verify_candidate_audited};
+
+    // /tmp（other 書き込み可）配下は祖先検証で拒否される（既存テストと同じ前提）。
+    let tmp = Path::new("/tmp").join(format!(
+        "fandhe-plugin-trust-{}-audited",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir(&tmp).unwrap();
+    chmod(&tmp, 0o755);
+    let f = tmp.join(NAME);
+    fs::write(&f, b"x").unwrap();
+    chmod(&f, 0o755);
+    let dirs = [PluginSearchDir::new(PluginDirKind::User, tmp.clone())];
+    let got = discover_candidates(&dirs).expect("discover");
+    let sink = VecSink::new(false);
+    let res = verify_candidate_audited(&got[0], &AllowedPluginHashes::from_digests([]), &sink);
+    let _ = fs::remove_dir_all(&tmp);
+    let rej = res.expect_err("reject");
+    assert_eq!(rej.error.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
+    assert_eq!(rej.delivery, AuditDelivery::Recorded);
+    let recs = sink.snapshot();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].layer(), AuditLayer::PluginTrust);
+    assert_eq!(
+        recs[0].reason().map(|r| r.as_str()),
+        Some("group_or_other_writable")
+    );
+    assert_eq!(recs[0].path(), Some(rej.error.path()));
+}

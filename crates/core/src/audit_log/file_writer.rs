@@ -211,6 +211,9 @@ struct AuditLineDto {
     path: Option<String>,
     path_truncated: Option<bool>,
     path_original_len: Option<usize>,
+    /// plugin 信頼検証のみ: 拒否理由トークン（他レイヤーでは出力しない＝既存行は不変）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
 }
 
 /// レコードを JSON 1 行（LF 終端）へエンコードする。
@@ -221,6 +224,7 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         AuditEvent::Seccomp { syscall, .. } => (Some(syscall.get()), None),
         AuditEvent::Landlock { path, syscall, .. } => (syscall.map(|s| s.get()), Some(path)),
         AuditEvent::Mount { path, .. } => (None, path.as_ref()),
+        AuditEvent::PluginTrust { path, .. } => (None, Some(path)),
     };
     let ts = record.timestamp().as_unix_duration();
     let dto = AuditLineDto {
@@ -234,6 +238,7 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         path: path.map(|p| p.as_path().to_string_lossy().into_owned()),
         path_truncated: path.map(|p| p.is_truncated()),
         path_original_len: path.map(|p| p.original_len()),
+        reason: record.reason().map(|r| r.as_str()),
     };
     let mut line =
         serde_json::to_vec(&dto).map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Encode))?;
@@ -626,6 +631,22 @@ mod tests {
         assert_eq!(
             text(&m),
             "{\"event\":\"audit\",\"layer\":\"mount\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null}\n"
+        );
+    }
+
+    /// PLUG-11・TASK-122.5: plugin 信頼検証レコードは reason を末尾に持つ（既存レイヤーの行は不変）。
+    #[test]
+    fn plug11_task122_5_encode_plugin_trust_has_reason() {
+        let r = rec(
+            9,
+            AuditEvent::PluginTrust {
+                path: AuditPath::new("/p/plugin"),
+                reason: crate::audit_log::AuditReason::new("hash_mismatch"),
+            },
+        );
+        assert_eq!(
+            text(&r),
+            "{\"event\":\"audit\",\"layer\":\"plugin_trust\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":9,\"syscall\":null,\"arch\":null,\"path\":\"/p/plugin\",\"path_truncated\":false,\"path_original_len\":9,\"reason\":\"hash_mismatch\"}\n"
         );
     }
 

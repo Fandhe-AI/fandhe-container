@@ -602,12 +602,21 @@ mod socket {
                 Err(e) if e.code() == NetErrorCode::Timeout => return Err(timed_out()),
                 other => other?,
             };
+            // 終端（ACK・DONE）を見つけても即returnせず、データグラム全体を検証してから確定する。
+            // 同じデータグラムの後続に不正フレームや予期しないメッセージがあれば見逃さない（NET-11）。
+            let mut terminal = false;
             for item in NlMsgIter::new(&data) {
                 let msg = item?;
                 let h = msg.header();
                 // 以前に時間切れした要求の遅延応答が残りうるため、不一致はエラーにせず破棄する。
                 if h.seq() != seq {
                     continue;
+                }
+                if terminal && h.msg_type() != NLMSG_NOOP {
+                    return Err(data_loss(format!(
+                        "unexpected netlink message (type {}) after the terminal reply for seq {seq}",
+                        h.msg_type()
+                    )));
                 }
                 if dump && h.flags() & NLM_F_DUMP_INTR != 0 {
                     return Err(interrupted());
@@ -621,10 +630,10 @@ mod socket {
                             )));
                         }
                         if ack.is_ack() {
-                            if dump {
-                                continue;
+                            if !dump {
+                                terminal = true;
                             }
-                            return finish(messages);
+                            continue;
                         }
                         let errno = ack.errno();
                         return Err(NetError::new(
@@ -636,11 +645,13 @@ mod socket {
                         // dump が途中で失敗すると、カーネルは DONE のペイロードに負の errno を載せる。
                         // ペイロードが空なら成功、それ以外は先頭の i32 を判定する。
                         if msg.payload().is_empty() {
-                            return finish(messages);
+                            terminal = true;
+                            continue;
                         }
                         let ack = decode_nlmsgerr(msg.payload())?;
                         if ack.is_ack() {
-                            return finish(messages);
+                            terminal = true;
+                            continue;
                         }
                         let errno = ack.errno();
                         return Err(NetError::new(
@@ -672,6 +683,9 @@ mod socket {
                         });
                     }
                 }
+            }
+            if terminal {
+                return finish(messages);
             }
             if deadline.remaining().is_zero() {
                 return Err(timed_out());
@@ -1237,6 +1251,23 @@ mod socket {
         }
 
         /// NET-11: NLM_F_DUMP_INTR の dump は FailedPrecondition。
+        #[test]
+        fn trailing_message_after_ack_is_data_loss() {
+            let mut dg = err_dgram(7, 0, 7);
+            dg.extend(plain_dgram(16, 7, &[1, 2, 3, 4]));
+            let r = run(7, Duration::from_secs(1), script(vec![dg]));
+            assert_eq!(r.unwrap_err().code(), NetErrorCode::DataLoss);
+        }
+
+        /// NET-11: 終端の後ろの不正フレームも見逃さない。
+        #[test]
+        fn malformed_frame_after_ack_is_error() {
+            let mut dg = err_dgram(7, 0, 7);
+            dg.extend([0xff, 0, 0, 0, 1]);
+            let r = run(7, Duration::from_secs(1), script(vec![dg]));
+            assert!(r.is_err());
+        }
+
         #[test]
         fn dump_intr_is_retryable_error() {
             let mut b = NlMsgBuilder::new(16, NLM_F_DUMP_INTR, 4, 0);

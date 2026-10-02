@@ -4,8 +4,9 @@
 //! （`frame`。TASK-107.2・#245）、制御メッセージの serde_json 符号化・復号（`message`。
 //! TASK-107.3・#247）と UDS listener（`transport`。TASK-107.4・#248。配置検証・peer 認証・I/O 期限を含む）と UDS client 接続
 //! （`UdsStream::connect`。TASK-107.5・#249）、フレーム単位の ACK/RPC 待機タイムアウト
-//! （`RpcTimeout`・`UdsStream::read_frame` / `write_frame`。TASK-107.6・#250）のみ実装済み。gRPC と
-//! PLUG-12 の完全な保護（stale socket 再 bind 等。TASK-123・TASK-124）は未実装（TASK-108 ほか。REPAIR-3）。
+//! （`RpcTimeout`・`UdsStream::read_frame` / `write_frame`。TASK-107.6・#250）と runtime directory の解決・作成・検証
+//! （`uds_security`。TASK-123.1・#286）のみ実装済み。gRPC と
+//! PLUG-12 の残り（stale socket 再 bind・XDG 未設定時のフォールバック等。TASK-123・TASK-124）は未実装（TASK-108 ほか。REPAIR-3）。
 //! 本体は G8（TASK-107 が crate 本体、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124）で
 //! 実装する。plugin 発見・登録（TASK-109）の成果物は `fandhe-container-core` 側に置かれ、本 crate ではない。
 //! PLUG-1 区分は core・plugin 双方が依存する境界基盤ライブラリ（crate-naming.md 決定 4）。
@@ -17,6 +18,7 @@ pub mod message;
 #[cfg(unix)]
 pub(crate) mod sys;
 pub mod transport;
+pub mod uds_security;
 
 pub use error::{PLUGIN_ERROR_MESSAGE_MAX_BYTES, PluginError, PluginErrorCode};
 pub use frame::{
@@ -28,3 +30,4 @@ pub use transport::{
     RpcTimeout, UDS_ACCEPT_TIMEOUT_MAX, UDS_CONNECT_TIMEOUT_MAX, UDS_DEFAULT_IO_TIMEOUT,
     UDS_RPC_TIMEOUT_DEFAULT, UDS_RPC_TIMEOUT_MAX, UdsListener, UdsStream,
 };
+pub use uds_security::{RUNTIME_DIR_NAME, RuntimeDir};

@@ -7,7 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fandhe_container_core::plugin_discovery::{
-    PluginCandidate, PluginDirKind, PluginFileKind, PluginSearchDir, discover_candidates,
+    DiscoveryOptions, PathSearchPolicy, PluginCandidate, PluginDirKind, PluginFileKind,
+    PluginSearchDir, discover_candidates, discover_with_options, write_path_warnings,
 };
 
 /// テスト用の一意な一時ディレクトリ（終了時に削除）。
@@ -190,4 +191,110 @@ fn plug11_search_path_that_is_a_file_is_an_error() {
     assert_eq!(err.code().as_str(), "INTERNAL");
     #[cfg(not(target_os = "linux"))]
     let _ = err;
+}
+
+/// PATH 探索の試験用に、管理ディレクトリ（mcp）と PATH 用ディレクトリ（cri・macos・命名規約外）を作る。
+fn path_fixture(tag: &str) -> (Tmp, Vec<PluginSearchDir>, PathBuf) {
+    let tmp = Tmp::new(tag);
+    let sys = tmp.0.join("system");
+    let pdir = tmp.0.join("pathdir");
+    fs::create_dir_all(&sys).unwrap();
+    fs::create_dir_all(&pdir).unwrap();
+    touch(&sys, &exe("mcp"));
+    touch(&pdir, &exe("cri"));
+    touch(&pdir, &exe("macos"));
+    touch(&pdir, "README");
+    touch(&pdir, "other-tool");
+    let managed = vec![PluginSearchDir::new(PluginDirKind::System, sys)];
+    (tmp, managed, pdir)
+}
+
+#[test]
+fn plug11_path_search_disabled_by_default_finds_nothing_on_path() {
+    let (_tmp, managed, pdir) = path_fixture("path-off");
+    let value = std::env::join_paths([&pdir]).unwrap();
+    let report =
+        discover_with_options(&managed, Some(&value), &DiscoveryOptions::default()).unwrap();
+    assert_eq!(
+        summary(report.candidates()),
+        vec![(
+            "mcp".to_owned(),
+            PluginDirKind::System,
+            PluginFileKind::File
+        )]
+    );
+    assert!(report.path_warnings().is_empty());
+    let mut out = Vec::new();
+    write_path_warnings(&report, &mut out).unwrap();
+    assert_eq!(out.len(), 0);
+}
+
+#[test]
+fn plug11_path_search_opt_in_warns_once_per_candidate() {
+    let (_tmp, managed, pdir) = path_fixture("path-on");
+    let value = std::env::join_paths([&pdir]).unwrap();
+    let opts = DiscoveryOptions::new().with_path_search(PathSearchPolicy::Enabled);
+    let report = discover_with_options(&managed, Some(&value), &opts).unwrap();
+    assert_eq!(
+        summary(report.candidates()),
+        vec![
+            (
+                "mcp".to_owned(),
+                PluginDirKind::System,
+                PluginFileKind::File
+            ),
+            ("cri".to_owned(), PluginDirKind::Path, PluginFileKind::File),
+            (
+                "macos".to_owned(),
+                PluginDirKind::Path,
+                PluginFileKind::File
+            ),
+        ]
+    );
+    assert_eq!(report.path_warnings().len(), 2);
+    let mut out = Vec::new();
+    write_path_warnings(&report, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2);
+    let names: Vec<String> = lines
+        .iter()
+        .map(|l| {
+            assert!(l.contains("not registered"));
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            assert_eq!(v["level"], "warn");
+            v["name"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(names, vec!["cri", "macos"]);
+}
+
+#[test]
+fn plug11_path_search_skips_missing_and_duplicate_entries() {
+    let (tmp, managed, pdir) = path_fixture("path-skip");
+    let plain = tmp.0.join("plain-file");
+    fs::write(&plain, b"").unwrap();
+    let missing = tmp.0.join("missing");
+    let value = std::env::join_paths([&missing, &pdir, &plain, &pdir]).unwrap();
+    // cri のみを残して 1 件にする
+    fs::remove_file(pdir.join(exe("macos"))).unwrap();
+    let opts = DiscoveryOptions::new().with_path_search(PathSearchPolicy::Enabled);
+    let report = discover_with_options(&managed, Some(&value), &opts).unwrap();
+    let on_path: Vec<_> = report
+        .candidates()
+        .iter()
+        .filter(|c| c.origin() == PluginDirKind::Path)
+        .collect();
+    assert_eq!(on_path.len(), 1);
+    let mut out = Vec::new();
+    write_path_warnings(&report, &mut out).unwrap();
+    assert_eq!(String::from_utf8(out).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn plug11_existing_discover_candidates_never_touches_path() {
+    let (_tmp, managed, _pdir) = path_fixture("path-legacy");
+    let found = discover_candidates(&managed).unwrap();
+    assert!(found.iter().all(|c| c.origin() != PluginDirKind::Path));
+    assert_eq!(found.len(), 1);
 }

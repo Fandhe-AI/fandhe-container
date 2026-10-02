@@ -484,7 +484,7 @@ mod imp {
 
     /// `p` が `sun_path` に収まる（終端 NUL の 1 バイトを残せる）ことを確認する。
     /// 収まらないパスは bind も connect もできないため `InvalidArgument` で拒否する（PLUG-2）。
-    pub(super) fn check_sun_path_len(p: &Path) -> Result<(), PluginError> {
+    pub(crate) fn check_sun_path_len(p: &Path) -> Result<(), PluginError> {
         if p.as_os_str().as_bytes().len() >= SUN_PATH_CAPACITY {
             return Err(PluginError::new(
                 PluginErrorCode::InvalidArgument,
@@ -891,6 +891,11 @@ mod imp {
             .ok_or_else(|| map_frame_io_error(io::ErrorKind::TimedOut, op))
     }
 }
+
+/// `uds_security::RuntimeDir::socket_path` が bind 前の早期検出に使う `sun_path` 長検証の再公開
+/// （PLUG-12・TASK-123.3・#288）。ロジックは `imp` 側の 1 箇所に置き、重複させない。
+#[cfg(unix)]
+pub(crate) use imp::check_sun_path_len;
 
 #[cfg(not(unix))]
 mod imp {

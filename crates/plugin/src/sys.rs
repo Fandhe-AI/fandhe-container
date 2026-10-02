@@ -663,7 +663,8 @@ fn peer_ucred(stream: &UnixStream) -> Result<linux::Ucred, PluginError> {
     Ok(ucred)
 }
 
-/// 接続元の接続時点の実効 uid を返す（Linux）。取得できなければ fail-closed でエラー。
+/// 接続元の接続時点の実効 uid を返す（Linux。SO_PEERCRED。TASK-124.1・#292）。取得できなければ fail-closed でエラー。
+/// user namespace 外の uid は overflowuid として観測されうる（照合側で不一致となり拒否される）。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -1111,5 +1112,17 @@ mod tests {
         assert!(el >= Duration::from_millis(200), "{el:?}");
         assert!(el < Duration::from_secs(5), "{el:?}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// PLUG-12・TASK-124.1: 自己接続の peer uid / pid は自プロセスの値と一致する。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn plug12_linux_peer_uid_of_socketpair_equals_effective_uid() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        assert_eq!(peer_uid(&a).unwrap(), effective_uid());
+        assert_eq!(peer_pid(&a).unwrap(), std::process::id());
     }
 }

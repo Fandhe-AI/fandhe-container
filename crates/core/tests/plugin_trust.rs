@@ -26,3 +26,15 @@ fn plug11_task122_1_non_linux_is_rejected_fail_closed() {
     assert_eq!(err.kind(), PluginTrustErrorKind::Unsupported);
     assert_eq!(err.target(), TrustTarget::Directory);
 }
+/// 許可一覧と sha256 型が公開 API から到達でき、3 OS で同じ結果になること（TASK-122.3・PLUG-11）。
+#[test]
+fn plug11_task122_3_allowlist_is_reachable_from_public_api() {
+    use fandhe_container_core::plugin_trust::{AllowedPluginHashes, Sha256Digest};
+
+    let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let list = AllowedPluginHashes::parse(format!("{abc}  plugin-a\n").as_bytes()).expect("parse");
+    let digest = Sha256Digest::from_hex(abc).expect("hex");
+    assert!(list.contains(&digest));
+    assert_eq!(list.len(), 1);
+    assert!(AllowedPluginHashes::default().is_empty());
+}

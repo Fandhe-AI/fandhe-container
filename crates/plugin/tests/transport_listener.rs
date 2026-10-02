@@ -216,8 +216,15 @@ mod unix {
             .unwrap();
         let link = dir.0.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let l = UdsListener::bind(&link.join("inner").join("s.sock")).unwrap();
+        let requested = link.join("inner").join("s.sock");
+        let l = UdsListener::bind(&requested).unwrap();
         assert!(inner.join("s.sock").exists());
+        // PLUG-12: 公開パスは symlink を解決した検証済みディレクトリ基準（渡した経路ではない）。
+        // TempDir 自体が symlink 配下にある OS（macOS の /var → /private/var）があるため、
+        // 期待値は実体ディレクトリの canonicalize 結果から組み立てる。
+        let expected = std::fs::canonicalize(&inner).unwrap().join("s.sock");
+        assert_eq!(l.path(), expected.as_path());
+        assert_ne!(l.path(), requested.as_path());
         let h = connect_and_ping(&inner.join("s.sock"));
         let mut s = l.accept(WAIT).unwrap();
         let mut buf = [0u8; 4];
@@ -228,12 +235,59 @@ mod unix {
         assert!(!inner.join("s.sock").exists());
     }
 
-    /// PLUG-2: path() は絶対パスで保持される（相対指定でも Drop 時の cwd に依存しない）。
+    /// PLUG-12: bind 後に祖先の symlink を別ディレクトリへ差し替えても、`path()` は検証済みの
+    /// socket を指し続け、`path()` を使う client は差し替え先（偽の listener）へ誘導されない。
+    #[test]
+    fn plug12_path_stays_on_verified_socket_after_ancestor_symlink_swap() {
+        let dir = TempDir::new();
+        let real = dir.0.join("real");
+        let decoy = dir.0.join("decoy");
+        // 配置ディレクトリ自体の symlink は拒否されるため、symlink は祖先（1 つ上）に置く。
+        for d in [&real, &decoy] {
+            std::fs::DirBuilder::new().mode(0o700).create(d).unwrap();
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(d.join("inner"))
+                .unwrap();
+        }
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let l = UdsListener::bind(&link.join("inner").join("s.sock")).unwrap();
+
+        // 祖先 symlink を差し替え、差し替え先に同名の別 listener を置く。
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&decoy, &link).unwrap();
+        let decoy_listener =
+            std::os::unix::net::UnixListener::bind(decoy.join("inner").join("s.sock")).unwrap();
+        decoy_listener.set_nonblocking(true).unwrap();
+
+        let expected = std::fs::canonicalize(real.join("inner"))
+            .unwrap()
+            .join("s.sock");
+        assert_eq!(l.path(), expected.as_path());
+        let h = connect_and_ping(l.path());
+        let mut s = l.accept(WAIT).unwrap();
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+        s.write_all(b"pong").unwrap();
+        assert_eq!(h.join().unwrap(), b"pong".to_vec());
+        // 差し替え先の listener には接続が届いていない。
+        assert_eq!(
+            decoy_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    /// PLUG-2・PLUG-12: path() は配置ディレクトリを解決した絶対パス＋socket 名で保持される
+    /// （相対指定でも Drop 時の cwd に依存しない）。
     #[test]
     fn plug2_path_is_absolute() {
         let dir = TempDir::new();
         let l = UdsListener::bind(&dir.sock()).unwrap();
         assert!(l.path().is_absolute());
+        let expected = std::fs::canonicalize(&dir.0).unwrap().join("s.sock");
+        assert_eq!(l.path(), expected.as_path());
     }
 
     /// REPAIR-5: 何も送らない peer でも read は期限で戻り、0 の期限は拒否される。

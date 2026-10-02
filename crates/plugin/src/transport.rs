@@ -17,6 +17,9 @@
 //!   （`fchmodat(dirfd, name, AT_SYMLINK_NOFOLLOW)`）と Drop 時の削除（`unlinkat(dirfd, name)`）は
 //!   その fd 基準で行う。パスを再解決しないため、検証後に中間要素・`..`・symlink が差し替わっても
 //!   別ファイルの chmod・削除には到達しない。bind パスの `..` は拒否する
+//! - 接続先として公開する [`UdsListener::path`] は、検証済み配置ディレクトリの解決後パス
+//!   （`canonicalize` 結果）＋ socket 名とする。呼び出し側が渡した symlink を含む経路は保持しない
+//!   ため、bind 後にその symlink が差し替わっても、`path()` を使う client が別の接続先へ誘導されない
 //! - 残余: 0700 の自 UID 所有ディレクトリ内でエントリを差し替えられるのは同一 UID のみで、
 //!   同一 UID は脅威モデル外（socket と同一性の照合は行わず、ディレクトリ fd 基準で名前を操作する）
 //! - accept した接続の peer credential（`SO_PEERCRED` / `getpeereid`。`crate::sys`）を検証し、
@@ -35,7 +38,7 @@
 //! `Unimplemented` を返す（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る）。
 
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{PluginError, PluginErrorCode};
@@ -55,7 +58,6 @@ pub const UDS_DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub struct UdsListener {
     inner: imp::ListenerInner,
-    path: PathBuf,
 }
 
 impl UdsListener {
@@ -63,7 +65,8 @@ impl UdsListener {
     ///
     /// 既存パスは unlink せず `AlreadyExists` で拒否する（fail-closed）。
     /// 配置ディレクトリ（symlink 不可・自 UID 所有・0700 相当）を検証してから bind する。
-    /// 相対パスは bind 時点の絶対パスへ変換して保持する（Drop 時の cwd 変更の影響を避ける）。
+    /// 相対パスは bind 時点の絶対パスへ変換し、配置ディレクトリの symlink を解決した実体のパスを
+    /// 保持する（Drop 時の cwd 変更・bind 後の symlink 差し替えの影響を避ける。[`Self::path`] 参照）。
     /// stale 処理は TASK-123・TASK-124（PLUG-12）。
     pub fn bind(path: &Path) -> Result<Self, PluginError> {
         // `..` は bind 時点とそれ以降で解決先が変わりうるため拒否する（`std::path::absolute` は
@@ -81,7 +84,7 @@ impl UdsListener {
             PluginError::new(PluginErrorCode::InvalidArgument, "invalid socket path")
         })?;
         let inner = imp::ListenerInner::bind(&abs)?;
-        Ok(Self { inner, path: abs })
+        Ok(Self { inner })
     }
 
     /// 1 接続を期限付きで受け付ける（REPAIR-5）。
@@ -100,9 +103,13 @@ impl UdsListener {
         self.inner.accept(timeout).map(|inner| UdsStream { inner })
     }
 
-    /// bind したパスを返す。
+    /// client が接続に使う socket のパスを返す（PLUG-12）。
+    ///
+    /// `bind` に渡したパスそのものではなく、検証済み配置ディレクトリの解決後パス（symlink を
+    /// 含まない絶対パス）＋ socket 名を返す。渡したパスの祖先に symlink があっても、bind 後の
+    /// 差し替えで本パスの指す先は変わらない（実際に socket を作成したディレクトリを指し続ける）。
     pub fn path(&self) -> &Path {
-        &self.path
+        self.inner.path()
     }
 }
 
@@ -260,7 +267,8 @@ mod imp {
         dir: File,
         /// 配置ディレクトリ内の socket 名（NUL を含まない）。
         name: CString,
-        /// bind したパス（Linux 以外の identity 取得の縮退用。Linux では使わない）。
+        /// socket の公開パス（検証済み配置ディレクトリの `canonicalize` 結果＋socket 名。
+        /// `UdsListener::path` が返す。PLUG-12）。Linux 以外では identity 取得の縮退にも使う。
         path: PathBuf,
         /// bind 直後の socket の識別情報。取得失敗時は None（Drop で削除しない）。
         identity: Option<sys::FileIdent>,
@@ -297,6 +305,11 @@ mod imp {
                 return Err(e);
             }
             Ok(inner)
+        }
+
+        /// 公開パス（検証済み配置ディレクトリの解決後パス＋socket 名。PLUG-12）。
+        pub(super) fn path(&self) -> &Path {
+            &self.path
         }
 
         /// bind 直後の設定（nonblocking 化・0600 化。PLUG-12）。
@@ -439,6 +452,9 @@ mod imp {
                 PluginErrorCode::Unimplemented,
                 "unix domain socket listener is not supported on this platform",
             ))
+        }
+        pub(super) fn path(&self) -> &Path {
+            match *self {}
         }
         pub(super) fn accept(&self, _timeout: Duration) -> Result<StreamInner, PluginError> {
             match *self {}

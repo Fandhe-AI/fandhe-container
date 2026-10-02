@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "fandhe-container-benches"
 version = "0.0.0"
+dependencies = [
+ "fandhe-container-plugin",
+]
 
 [[package]]
 name = "fandhe-container-cli"

@@ -2,7 +2,8 @@
 //!
 //! ファミリ非依存の nlmsghdr / rtattr コーデック（`crate::netlink`。TASK-136.1・#298）を再公開し、
 //! Linux では `NETLINK_ROUTE` ソケットの open / bind / send / recv（[`NetlinkRouteSocket`]。
-//! TASK-136.2.1・#843）を提供する。seq 採番・ACK / `NLMSG_ERROR` 判定（#844）・link 操作
+//! TASK-136.2.1・#843）を提供する。各操作の成功 / 失敗と所要時間は `crate::instrument` の
+//! `NetOpRecorder` へ渡す（REPAIR-4）。seq 採番・ACK / `NLMSG_ERROR` 判定（#844）・link 操作
 //! （#845・#846）・address / route 操作（#301）は未実装で、各 Issue でここへ追加する
 //! （REPAIR-3。実装済みを装わない）。
 
@@ -15,10 +16,11 @@ pub use socket::{MAX_RECV_DATAGRAM_LEN, NetlinkRouteSocket, RECV_BUFFER_LEN};
 mod socket {
     use std::fmt;
     use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
     use crate::error::{NetError, NetErrorCode};
+    use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
     use crate::netlink::{ALIGN_TO, MAX_MESSAGE_LEN, NLMSG_HEADER_LEN, NlMsgHeader};
     use crate::sys::{self, Deadline, Readiness, RecvMeta, SysError};
 
@@ -43,11 +45,14 @@ mod socket {
     /// `Send + Sync` で、`&self` のまま複数スレッドから `send` / `recv` できる。ただし応答と要求の
     /// 対応づけ（seq 照合）は行わないため、複数スレッドで `recv` すると、どの応答をどのスレッドが
     /// 受け取るかは定まらない（対応づけは #844 の層が担う）。
+    ///
+    /// open / send / recv は 1 回ごとに結果と所要時間を [`NetOpRecorder`] へ渡す（REPAIR-4）。
     pub struct NetlinkRouteSocket {
         fd: OwnedFd,
         /// 「先頭データグラムの長さ確認 → 取り出し」を 1 つの読み手にまとめるためのロック。
         /// 保持するのは待たない syscall（`MSG_DONTWAIT`）の間だけで、`poll` の待機中は保持しない。
         recv_lock: Mutex<()>,
+        recorder: Arc<dyn NetOpRecorder>,
     }
 
     impl fmt::Debug for NetlinkRouteSocket {
@@ -89,13 +94,24 @@ mod socket {
     }
 
     impl NetlinkRouteSocket {
-        /// ソケットを開いて bind する。
+        /// ソケットを開いて bind する（計測結果は記録しない。記録するなら
+        /// [`open_with_recorder`](Self::open_with_recorder)）。
         pub fn open() -> Result<Self, NetError> {
-            let fd = sys::open_route_socket().map_err(|e| map_sys_error("socket", e))?;
-            sys::bind_kernel_assigned(fd.as_fd()).map_err(|e| map_sys_error("bind", e))?;
+            Self::open_with_recorder(Arc::new(NoopNetOpRecorder))
+        }
+
+        /// ソケットを開いて bind し、以後の open / send / recv の結果と所要時間を `recorder` へ渡す
+        /// （REPAIR-4）。open 自体の成否もここで 1 件記録する。
+        pub fn open_with_recorder(recorder: Arc<dyn NetOpRecorder>) -> Result<Self, NetError> {
+            let fd = record_net_op(recorder.as_ref(), NetOpKind::NetlinkOpen, || {
+                let fd = sys::open_route_socket().map_err(|e| map_sys_error("socket", e))?;
+                sys::bind_kernel_assigned(fd.as_fd()).map_err(|e| map_sys_error("bind", e))?;
+                Ok::<_, NetError>(fd)
+            })?;
             Ok(Self {
                 fd,
                 recv_lock: Mutex::new(()),
+                recorder,
             })
         }
 
@@ -103,6 +119,13 @@ mod socket {
         ///
         /// 空・`NLMSG_HEADER_LEN` 未満・`MAX_MESSAGE_LEN` 超、および「アラインした `nlmsg_len` が実長と一致しない（複数メッセージ連結を含む）・末尾パディング（0〜3 バイト）が 0 でない」入力は `InvalidArgument`。部分送信は `DataLoss`。
         pub fn send(&self, message: &[u8]) -> Result<(), NetError> {
+            record_net_op(self.recorder.as_ref(), NetOpKind::NetlinkSend, || {
+                self.send_unrecorded(message)
+            })
+        }
+
+        /// [`send`](Self::send) の本体（検証と送信）。
+        fn send_unrecorded(&self, message: &[u8]) -> Result<(), NetError> {
             if message.len() < NLMSG_HEADER_LEN || message.len() > MAX_MESSAGE_LEN as usize {
                 return Err(NetError::new(
                     NetErrorCode::InvalidArgument,
@@ -164,8 +187,10 @@ mod socket {
         /// `DataLoss` を返す。カーネル以外の送信元も `DataLoss`（そのデータグラムは破棄済み）。
         /// 返したバイト列の解釈は呼び出し側が `NlMsgIter` で行う。
         pub fn recv(&self, timeout: Duration) -> Result<Vec<u8>, NetError> {
-            self.recv_with(timeout, |fd| {
-                try_recv_datagram(fd, RECV_BUFFER_LEN, MAX_RECV_DATAGRAM_LEN)
+            record_net_op(self.recorder.as_ref(), NetOpKind::NetlinkRecv, || {
+                self.recv_with(timeout, |fd| {
+                    try_recv_datagram(fd, RECV_BUFFER_LEN, MAX_RECV_DATAGRAM_LEN)
+                })
             })
         }
 
@@ -544,6 +569,40 @@ mod socket {
             s.send(&getlink_lo(8)).expect("send 8");
             let next = s.recv(Duration::from_secs(5)).expect("recv");
             assert_eq!(first_type_and_seq(&next), (RTM_NEWLINK, 8));
+        }
+
+        /// REPAIR-4・NET-11: open / send / recv は成功・失敗のどちらでも 1 回につき 1 件、種別と
+        /// 結果と所要時間を記録先へ渡す。
+        #[test]
+        fn repair4_socket_operations_are_recorded() {
+            use crate::instrument::testing::Collect;
+            use crate::instrument::{NetOpOutcome, NetOpSample};
+            let collect = Arc::new(Collect::default());
+            let s = NetlinkRouteSocket::open_with_recorder(collect.clone()).expect("open");
+            s.send(&getlink_lo(9)).expect("send");
+            let data = s.recv(Duration::from_secs(5)).expect("recv");
+            assert_eq!(first_type_and_seq(&data), (RTM_NEWLINK, 9));
+            let e = s.send(&[0u8; 3]).expect_err("invalid");
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+            let e = s.recv(Duration::from_millis(100)).expect_err("timeout");
+            assert_eq!(e.code(), NetErrorCode::Timeout);
+            assert_eq!(
+                collect.kinds(),
+                vec![
+                    (NetOpKind::NetlinkOpen, NetOpOutcome::Success),
+                    (NetOpKind::NetlinkSend, NetOpOutcome::Success),
+                    (NetOpKind::NetlinkRecv, NetOpOutcome::Success),
+                    (NetOpKind::NetlinkSend, NetOpOutcome::Failure),
+                    (NetOpKind::NetlinkRecv, NetOpOutcome::Failure),
+                ]
+            );
+            // 時間切れの recv のレイテンシは、待った時間（100 ms 以上）を含む。
+            let timed_out = collect.items().last().map(NetOpSample::latency);
+            assert!(
+                timed_out >= Some(Duration::from_millis(100)),
+                "{timed_out:?}"
+            );
+            assert!(timed_out < Some(Duration::from_secs(5)), "{timed_out:?}");
         }
 
         /// NET-11: 複数スレッドから `&self` で共有できる（`Send + Sync`）。

@@ -400,7 +400,9 @@ bench-check-selftest: ## ベンチ回帰比較スクリプトの自己テスト�
 # （regression_placeholder 等）の未登録 metric は絞り込まず、check-bench-regression.sh が
 # 入力エラーにする（登録漏れを検出する）。Windows（OS=Windows_NT）は Unix ドメインソケット前提の
 # plugin 境界ベンチが unsupported-platform で失敗するため実行せず、baseline 側も実行した
-# ベンチの metric に限って比較する（plugin 境界は Unix 専用。PLUG-5）。
+# ベンチの metric に限って比較する（baseline から plugin_boundary* の metric だけを除外し、
+# それ以外の未実行・欠落 metric は Unix と同様に check-bench-regression.sh が入力エラーにする。
+# plugin 境界は Unix 専用。PLUG-5）。
 # これにより baseline 再生成（plugin 系 metric の登録。TASK-88.h1・TASK-113.h1）後は、再生成した
 # metric がそのまま 15% 回帰判定の対象になり、Makefile の追従修正が要らない。未登録の間は
 # plugin 系 metric は比較されない（plugin 境界の性能回帰ゲートは未有効）。
@@ -425,8 +427,7 @@ ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	done && \
 	jq -s '{schema_version: 1, metrics: (map(.metrics) | add)}' "$$tmp"/out/*.json > "$$tmp/results.json" && \
 	if [ "$(OS)" = "Windows_NT" ]; then \
-		jq --slurpfile r "$$tmp/results.json" \
-			'.metrics |= with_entries(select(.key as $$k | $$r[0].metrics | has($$k)))' \
+		jq '.metrics |= with_entries(select(.key | startswith("plugin_boundary") | not))' \
 			benches/baseline.json > "$$tmp/baseline.json" || exit 1; \
 	else \
 		cp benches/baseline.json "$$tmp/baseline.json" || exit 1; \
@@ -469,7 +470,11 @@ bench-baseline-selftest: ## baseline.json 生成スクリプトの自己テス�
 # plugin 境界ベンチ（TASK-113.1〜113.3）は metric を metrics.json に登録済みのため、ここにも
 # 同時に載せる（generate_baseline.sh は metrics.json と results の metric 集合が完全一致しないと
 # exit 2）。baseline 再生成時は `bench-check` も同じ BENCH_NAMES を実行し baseline 登録済み metric に絞って比較する。
+# Windows（OS=Windows_NT）は plugin 境界ベンチ（Unix ドメインソケット前提）を実行できないため
+# bench-check と同様に regression_placeholder のみ実行し、metrics.json からも plugin_boundary*
+# を除いた一時ファイルを生成スクリプトへ渡す（要求 metric 集合を実行ベンチに合わせる。AGENTS.md「3 OS 対応」）。
 BENCH_NAMES := regression_placeholder plugin_boundary plugin_boundary_list_images
+BENCH_BASELINE_NAMES = $(if $(filter Windows_NT,$(OS)),regression_placeholder,$(BENCH_NAMES))
 BENCH_METRICS ?= benches/metrics.json
 BENCH_BASELINE_OUT ?= benches/baseline.json
 BENCH_ENVIRONMENT ?=
@@ -479,11 +484,17 @@ export BENCH_METRICS BENCH_BASELINE_OUT BENCH_ENVIRONMENT
 bench-baseline: ## ベンチを実行し baseline.json を再生成する（TASK-88.1・REPAIR-8）
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
-	for n in $(BENCH_NAMES); do \
-		cargo bench -p fandhe-container-benches --bench "$$n" -- --output "$$tmp/$$n.json" || exit 1; \
+	mkdir "$$tmp/res" && \
+	for n in $(BENCH_BASELINE_NAMES); do \
+		cargo bench -p fandhe-container-benches --bench "$$n" -- --output "$$tmp/res/$$n.json" || exit 1; \
 	done && \
-	bash scripts/bench/generate_baseline.sh --metrics "$$BENCH_METRICS" --output "$$BENCH_BASELINE_OUT" \
-		$${BENCH_ENVIRONMENT:+--environment "$$BENCH_ENVIRONMENT"} "$$tmp"/*.json
+	metrics="$$BENCH_METRICS" && \
+	if [ "$(OS)" = "Windows_NT" ]; then \
+		jq '.metrics |= with_entries(select(.key | startswith("plugin_boundary") | not))' \
+			"$$BENCH_METRICS" > "$$tmp/metrics.json" && metrics="$$tmp/metrics.json" || exit 1; \
+	fi && \
+	bash scripts/bench/generate_baseline.sh --metrics "$$metrics" --output "$$BENCH_BASELINE_OUT" \
+		$${BENCH_ENVIRONMENT:+--environment "$$BENCH_ENVIRONMENT"} "$$tmp"/res/*.json
 else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため bench-baseline をスキップ"
 endif

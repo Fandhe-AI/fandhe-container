@@ -92,8 +92,16 @@ mod unix {
         let dir = TempDir::new();
         let listener = UdsListener::bind(&dir.0.join("s.sock")).unwrap();
         let path = listener.path().to_path_buf();
-        let client = thread::spawn(move || drop(UdsStream::connect(&path, WAIT).unwrap()));
+        // macOS では相手が切断済みの socket に set_{read,write}_timeout すると EINVAL になるため、
+        // accept が完了するまで client を生かし、その後に切断して「相手が消えた」状態を作る。
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let client = thread::spawn(move || {
+            let s = UdsStream::connect(&path, WAIT).unwrap();
+            let _ = go_rx.recv_timeout(Duration::from_secs(15));
+            drop(s);
+        });
         let mut stream = listener.accept(WAIT).unwrap();
+        go_tx.send(()).unwrap();
         client.join().unwrap();
 
         let (tx, rx) = mpsc::channel();

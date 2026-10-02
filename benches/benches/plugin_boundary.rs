@@ -50,7 +50,12 @@ mod imp {
 
         // sun_path の長さ制限（macOS 104 バイト）を避けるため名前を短くする。
         // 作成は mkdir 相当（既存なら失敗）で、0700 にして他ユーザーの先回りを拒否する。
-        let dir = env::temp_dir().join(format!("fcpb-{}", std::process::id()));
+        // PID 再利用による衝突を避けるため、ナノ秒時刻を接尾辞に加える（短さを保つため 16 進）。
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
+            .unwrap_or(0);
+        let dir = env::temp_dir().join(format!("fcpb-{}-{:x}", std::process::id(), nanos));
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)

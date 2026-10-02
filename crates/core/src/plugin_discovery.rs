@@ -617,7 +617,11 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("fc-plug11-env-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("fandhe-container-plugin-envtest"), b"").unwrap();
+        let fixture = format!(
+            "fandhe-container-plugin-envtest{}",
+            std::env::consts::EXE_SUFFIX
+        );
+        std::fs::write(tmp.join(fixture), b"").unwrap();
         let path = OsString::from(tmp.as_os_str());
         let get = |k: &str| (k == "PATH").then(|| path.clone());
         let opts = DiscoveryOptions::default();

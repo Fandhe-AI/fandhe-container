@@ -141,9 +141,10 @@ impl OneShotPlugin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OneShotTermination {
-    /// 猶予内に自発終了した。`code` はシグナル終了などで取得できない場合 `None`。
+    /// 自発終了した（強制終了を試みる直前・直後に自発終了していた場合を含む）。`code` はシグナル
+    /// 終了などで取得できない場合 `None`。
     Exited { code: Option<i32> },
-    /// 猶予内に終了せず強制終了し、回収まで確認した。
+    /// 猶予内に終了せず強制終了し、回収まで確認した（回収した終了状態が強制終了によるもの）。
     Killed,
     /// 強制終了を試みたが、[`ONE_SHOT_REAP_TIMEOUT`] 内に回収を確認できなかった（kill 失敗を含む）。
     /// 呼び出し側は孤児の可能性として扱う（REPAIR-5・PLUG-7）。
@@ -190,34 +191,44 @@ impl ChildGuard {
         }
     }
 
-    /// kill して回収を `ONE_SHOT_REAP_TIMEOUT` まで待つ。回収を確認できたら true。
-    /// kill の失敗は無視せず、回収確認ができなければ false を返す（呼び出し側が報告する）。
+    /// kill して回収を `ONE_SHOT_REAP_TIMEOUT` まで待つ。
+    ///
+    /// kill の失敗は無視せず、回収確認ができなければ `Unreaped` を返す（呼び出し側が報告する）。
     /// 回収できなかった場合は `Child` を保持し続ける（再試行・`Drop` での最終試行のため手放さない）。
-    fn kill_and_reap(&mut self) -> bool {
+    /// 回収できた場合は終了状態を捨てずに返す。kill の直前・直後に子が自発終了していた場合、
+    /// 回収される状態は「こちらの kill」ではなく子自身の終了状態になるため、呼び出し側が
+    /// [`classify_reaped`] で区別する（異常終了を強制終了と取り違えて成功扱いしない。PLUG-7）。
+    fn kill_and_reap(&mut self) -> Reap {
         let Some(c) = self.0.as_mut() else {
-            return true;
+            return Reap::AlreadyReaped;
         };
+        // kill の前に終了済みかを確認し、自発終了の状態をそのまま拾う（kill との競合窓を狭める）。
+        if let Ok(Some(status)) = c.try_wait() {
+            self.0 = None;
+            return Reap::Reaped(status);
+        }
         let _ = c.kill();
         let start = Instant::now();
         let mut interval = Duration::from_millis(1);
         loop {
             match c.try_wait() {
-                Ok(Some(_)) => {
+                Ok(Some(status)) => {
                     self.0 = None;
-                    return true;
+                    return Reap::Reaped(status);
                 }
                 Ok(None) => {}
-                Err(_) => return false,
+                Err(_) => return Reap::Unreaped,
             }
             if start.elapsed() >= ONE_SHOT_REAP_TIMEOUT {
-                return false;
+                return Reap::Unreaped;
             }
             std::thread::sleep(interval);
             interval = (interval * 2).min(POLL_MAX);
         }
     }
 
-    /// 終了を `limit` まで待つ。終了していれば状態を返し、猶予超過なら強制終了して `Killed`。
+    /// 終了を `limit` まで待つ。終了していれば状態を返し、猶予超過なら強制終了する。
+    /// 強制終了後に回収した終了状態は [`classify_reaped`] で分類する（`Killed` と決め打ちしない）。
     fn wait_or_kill(&mut self, limit: Duration) -> OneShotTermination {
         let start = Instant::now();
         let mut interval = Duration::from_millis(1);
@@ -238,10 +249,10 @@ impl ChildGuard {
             std::thread::sleep(interval);
             interval = (interval * 2).min(POLL_MAX);
         }
-        if self.kill_and_reap() {
-            OneShotTermination::Killed
-        } else {
-            OneShotTermination::Unreaped
+        match self.kill_and_reap() {
+            Reap::Reaped(status) => classify_reaped(status),
+            // 既に回収済みのガードに対して呼ばれることはないが、終了状態が不明なため成功扱いしない。
+            Reap::AlreadyReaped | Reap::Unreaped => OneShotTermination::Unreaped,
         }
     }
 }
@@ -249,6 +260,58 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.kill_and_reap();
+    }
+}
+
+/// [`ChildGuard::kill_and_reap`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reap {
+    /// 今回の呼び出しで回収した。終了状態は子の自発終了・こちらの kill のどちらの場合もある。
+    Reaped(ExitStatus),
+    /// 既に回収済みで保持している子がない。
+    AlreadyReaped,
+    /// kill 失敗または期限超過で回収を確認できなかった（孤児の可能性）。
+    Unreaped,
+}
+
+impl Reap {
+    /// 子が残っていない（回収を確認できた）か。
+    fn is_reaped(self) -> bool {
+        !matches!(self, Self::Unreaped)
+    }
+}
+
+/// `Child::kill` が unix で送るシグナル番号（`SIGKILL`。Linux・macOS とも 9）。
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+
+/// 強制終了を試みた後に回収した終了状態を分類する（PLUG-7・REPAIR-5）。
+///
+/// 終了猶予の境界では、最後の `try_wait` と `kill` の間に子が自発終了し得る。その場合に回収される
+/// のは子自身の終了状態であり、`Killed`（成功扱い）にすると非ゼロ終了を見逃す。そのため終了コードを
+/// 持つ状態と `SIGKILL` 以外のシグナルによる終了は `Exited` として返し、成功 / 失敗の判定を
+/// `call_once` 側の終了コード検査へ委ねる。`SIGKILL` による終了のみ `Killed` とする
+/// （外部からの `SIGKILL` とこちらの kill は区別できないが、どちらも kill を試みた後の強制終了である）。
+fn classify_reaped(status: ExitStatus) -> OneShotTermination {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(SIGKILL) {
+            return OneShotTermination::Killed;
+        }
+        OneShotTermination::Exited {
+            code: status.code(),
+        }
+    }
+    // 非 unix では listener を bind できず子を spawn しないため到達しない。終了コード 0 の自発終了
+    // だけを `Exited` とし、それ以外は強制終了（`TerminateProcess` 相当）と区別できないため
+    // `Killed` として扱う。
+    #[cfg(not(unix))]
+    {
+        match status.code() {
+            Some(0) => OneShotTermination::Exited { code: Some(0) },
+            _ => OneShotTermination::Killed,
+        }
     }
 }
 
@@ -417,7 +480,7 @@ fn call_once_inner(
     let response = match exchange {
         Ok(r) => r,
         Err(e) => {
-            if !guard.kill_and_reap() {
+            if !guard.kill_and_reap().is_reaped() {
                 return Err(PluginError::new(
                     PluginErrorCode::Internal,
                     "plugin process could not be reaped after a failed exchange",
@@ -498,6 +561,84 @@ mod tests {
         assert_eq!(
             rec.to_json_line(),
             "{\"op\":\"plugin.call_once\",\"success\":false,\"error_code\":\"TIMEOUT\",\"elapsed_us\":1500}"
+        );
+    }
+
+    /// PLUG-7・REPAIR-5: 強制終了を試みた後に回収した終了状態を、子自身の終了と取り違えない。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_classify_reaped_keeps_own_exit_status() {
+        use std::os::unix::process::ExitStatusExt;
+        // wait status の生値: 終了コードは上位 8 bit、シグナル番号は下位 7 bit。
+        assert_eq!(
+            classify_reaped(ExitStatus::from_raw(0)),
+            OneShotTermination::Exited { code: Some(0) }
+        );
+        assert_eq!(
+            classify_reaped(ExitStatus::from_raw(3 << 8)),
+            OneShotTermination::Exited { code: Some(3) }
+        );
+        assert_eq!(
+            classify_reaped(ExitStatus::from_raw(9)),
+            OneShotTermination::Killed
+        );
+        // SIGKILL 以外のシグナル（SIGSEGV = 11）は強制終了扱いにせず、異常終了として返す。
+        assert_eq!(
+            classify_reaped(ExitStatus::from_raw(11)),
+            OneShotTermination::Exited { code: None }
+        );
+    }
+
+    /// PLUG-7: kill の前に自発終了していた子は、その終了状態のまま回収される（`Killed` にしない）。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_kill_and_reap_returns_status_of_already_exited_child() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // stdout の EOF は子の終了処理の開始後にしか来ない。回収（wait）はせずに終了だけを待つ。
+        let mut out = child.stdout.take().unwrap();
+        let mut sink = Vec::new();
+        io::Read::read_to_end(&mut out, &mut sink).unwrap();
+        assert_eq!(sink, b"");
+        let mut guard = ChildGuard(Some(child));
+        let Reap::Reaped(status) = guard.kill_and_reap() else {
+            panic!("child was not reaped");
+        };
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(
+            classify_reaped(status),
+            OneShotTermination::Exited { code: Some(3) }
+        );
+        assert_eq!(guard.kill_and_reap(), Reap::AlreadyReaped);
+    }
+
+    /// PLUG-7: 終了猶予を使い切った後の回収でも、自発的な非ゼロ終了は `Exited` として返る。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_wait_or_kill_reports_killed_only_for_forced_kill() {
+        let spawn = |script: &str| {
+            Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut lingering = ChildGuard(Some(spawn("exec sleep 60")));
+        assert_eq!(
+            lingering.wait_or_kill(Duration::from_millis(50)),
+            OneShotTermination::Killed
+        );
+        let mut failing = ChildGuard(Some(spawn("exit 7")));
+        assert_eq!(
+            failing.wait_or_kill(Duration::from_secs(5)),
+            OneShotTermination::Exited { code: Some(7) }
         );
     }
 

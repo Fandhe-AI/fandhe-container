@@ -775,17 +775,20 @@ mod imp {
             let mut filled = 0usize;
             while filled < buf.len() {
                 let remaining = remaining_until(deadline, FrameOp::Read)?;
-                // macOS は peer close 後の UDS で set_read_timeout が EINVAL を返す。その場合のみ
-                // 続行する（切断済みなら read は即座に残りバイトか EOF を返し、EOF は Unavailable
-                // に写像される）。それ以外の失敗は旧期限で待ち続けうるため読まずに失敗させる
-                // （PLUG-2・REPAIR-5）。
-                if let Err(e) = self.stream.set_read_timeout(Some(remaining))
-                    && e.kind() != io::ErrorKind::InvalidInput
-                {
-                    return Err(internal_read());
-                }
                 let slice = buf.get_mut(filled..).ok_or_else(internal_read)?;
-                match self.stream.read(slice) {
+                // macOS は peer close 後の UDS で set_read_timeout が EINVAL を返す。期限を掛けられない
+                // まま blocking read に進むと上限を超えて待ちうるため、EINVAL のときは non-blocking
+                // read で 1 回だけ試す（切断済みなら残りバイトか EOF を即返す。何も来なければ
+                // 期限を保証できないので失敗させる）。それ以外の失敗も読まずに失敗させる
+                // （PLUG-2・REPAIR-5）。
+                let res = match self.stream.set_read_timeout(Some(remaining)) {
+                    Ok(()) => self.stream.read(slice),
+                    Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                        self.nonblocking_once(|mut s| s.read(slice))?
+                    }
+                    Err(_) => return Err(internal_read()),
+                };
+                match res {
                     Ok(0) => {
                         return Err(map_frame_io_error(
                             io::ErrorKind::UnexpectedEof,
@@ -800,6 +803,26 @@ mod imp {
             Ok(())
         }
 
+        /// socket を一時的に non-blocking にして `op` を 1 回だけ実行する。期限を設定できない
+        /// socket で blocking I/O に進まないための経路。WouldBlock（進捗なし）は期限を保証できない
+        /// ため `Internal` で失敗させ、blocking への復元に失敗した場合も失敗させる（REPAIR-5）。
+        fn nonblocking_once(
+            &self,
+            op: impl FnOnce(&UnixStream) -> io::Result<usize>,
+        ) -> Result<io::Result<usize>, PluginError> {
+            self.stream
+                .set_nonblocking(true)
+                .map_err(|_| internal_read())?;
+            let res = op(&self.stream);
+            self.stream
+                .set_nonblocking(false)
+                .map_err(|_| internal_read())?;
+            match res {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(internal_read()),
+                other => Ok(other),
+            }
+        }
+
         fn write_all_deadline(
             &mut self,
             bytes: &[u8],
@@ -808,15 +831,17 @@ mod imp {
             let mut sent = 0usize;
             while sent < bytes.len() {
                 let remaining = remaining_until(deadline, FrameOp::Write)?;
-                // 読み取り側と同様、macOS の peer close 後 EINVAL のみ許容して write に進む
-                // （切断済みなら EPIPE 等が Unavailable に写像される）。他の失敗は書かずに失敗させる。
-                if let Err(e) = self.stream.set_write_timeout(Some(remaining))
-                    && e.kind() != io::ErrorKind::InvalidInput
-                {
-                    return Err(internal_write());
-                }
                 let slice = bytes.get(sent..).ok_or_else(internal_write)?;
-                match self.stream.write(slice) {
+                // 読み取り側と同様、EINVAL のときは non-blocking write で 1 回だけ試す
+                // （切断済みなら EPIPE 等が Unavailable に写像される）。他の失敗は書かずに失敗させる。
+                let res = match self.stream.set_write_timeout(Some(remaining)) {
+                    Ok(()) => self.stream.write(slice),
+                    Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                        self.nonblocking_once(|mut s| s.write(slice))?
+                    }
+                    Err(_) => return Err(internal_write()),
+                };
+                match res {
                     Ok(0) => {
                         return Err(map_frame_io_error(
                             io::ErrorKind::BrokenPipe,

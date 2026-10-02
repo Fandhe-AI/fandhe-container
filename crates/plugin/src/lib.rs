@@ -12,7 +12,8 @@
 //! モード選択 API（`lifecycle`。TASK-110.3・#260）は実装済み。gRPC と
 //! PLUG-12 の peer 認証（TASK-124）は Linux の SO_PEERCRED（`uds_security::verify_peer`。TASK-124.1・#292）と
 //! macOS の `getpeereid` 経路（TASK-124.2・#293）が実装・検証済みで、
-//! 残り（別 UID 拒否テスト・拒否の監査ログ。Windows は WIN-1 により固有実装を持たない旨を `uds_security` に文書化済み。TASK-124.3・#294）は未完了（TASK-108 ほか。REPAIR-3）。
+//! 別 UID 接続拒否の結合試験（TASK-124.4・#295。実機前提の 2 件は人間が実行）も追加済みで、
+//! 残り（拒否の監査ログ）は未完了（Windows は WIN-1 により固有実装を持たない旨を `uds_security` に文書化済み。TASK-124.3・#294。TASK-108 ほか。REPAIR-3）。
 //! 本体は G8（TASK-107 が crate 本体、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124）で
 //! 実装する。plugin 発見・登録（TASK-109）の成果物は `fandhe-container-core` 側に置かれ、本 crate ではない。
 //! PLUG-1 区分は core・plugin 双方が依存する境界基盤ライブラリ（crate-naming.md 決定 4）。

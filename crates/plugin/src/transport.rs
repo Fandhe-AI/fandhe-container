@@ -561,10 +561,28 @@ mod imp {
             // 既存エントリの lstat 検証と、自 UID 所有の stale socket の削除（PLUG-12・TASK-123.2）。
             // 生存判定は接続 probe でなく sibling lock の flock（既存 listener に副作用を与えない）。
             let lock = crate::uds_security::acquire_bind_lock(&dir, &name, euid)?;
-            crate::uds_security::clear_stale_socket(&dir, &name, &bound, euid, &lock)?;
-            let listener = UnixListener::bind(&target).map_err(|e| map_bind_error(e.kind()))?;
+            // 以降の失敗では、今回新規作成したロックファイルを残さない（後から別経路が作った
+            // socket を管理下と誤認させない）。
+            if let Err(e) =
+                crate::uds_security::clear_stale_socket(&dir, &name, &bound, euid, &lock)
+            {
+                lock.discard_if_created(&dir);
+                return Err(e);
+            }
+            let listener = match UnixListener::bind(&target) {
+                Ok(l) => l,
+                Err(e) => {
+                    lock.discard_if_created(&dir);
+                    return Err(map_bind_error(e.kind()));
+                }
+            };
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
             let identity = sys::lstat_at(&dir, &name, &bound).ok();
+            // 管理下の証拠として socket の同一性をロックへ記録する（記録できなければ次回は stale
+            // 扱いにならず AlreadyExists になるだけで安全側）。
+            if let Some(ident) = identity.as_ref() {
+                let _ = lock.record_socket(ident);
+            }
             let inner = Self {
                 listener,
                 dir,
@@ -668,6 +686,8 @@ mod imp {
         /// 検証済みディレクトリ fd 基準で、bind 時と同一性（dev/ino）が一致する socket のみ
         /// unlink する（best-effort）。Linux では照合も削除もパスを再解決しない。
         pub(super) fn cleanup(&self) {
+            // 正常終了では記録を消し、残ったロックファイルが後続の socket を管理下と誤認させない。
+            self._lock.clear_record();
             let Some(expected) = self.identity else {
                 return;
             };

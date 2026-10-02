@@ -32,7 +32,8 @@
 //!   （listener が生存中保持し、クラッシュ時は kernel が解放する）。接続拒否の回数では削除しない
 //!   （macOS は accept queue 満杯の生存 listener にも ECONNREFUSED を返すため区別できず、probe 接続が
 //!   既存 listener の accept queue に残る副作用もある）。ロックを取れない（生存中）、socket 以外、
-//!   またはロックファイルの無い socket（管理下か判別不能）は削除せず `AlreadyExists`。ロックを取れて
+//!   またはロックに記録した同一性（dev / ino）と一致しない socket（管理下か判別不能。残存ロック
+//!   ファイルの存在は根拠にしない）は削除せず `AlreadyExists`。ロックを取れて
 //!   管理下の自 UID 所有 socket だけを、再 lstat で同一性（dev / ino / uid / 種別）を確認したうえで
 //!   `unlinkat` し、再 bind を可能にする。
 //!   残余: 再確認から unlink までの窓で差し替えられるのは 0700 ディレクトリ内の同一 UID のみ
@@ -446,6 +447,49 @@ mod imp {
         preexisting: bool,
     }
 
+    /// ロックファイルへ書く「この socket は自分が bind した」記録の接頭辞（版付き）。
+    const RECORD_PREFIX: &str = "fcus1";
+
+    impl BindLock {
+        /// bind 済み socket の同一性（dev / ino）をロックファイルへ記録する。stale 判定は、残存
+        /// ロックファイルの存在ではなく、この記録と socket の同一性の一致だけを管理下の証拠にする
+        /// （他実装・別経路が同じパスに bind した socket を誤って削除しない。PLUG-12）。
+        pub(crate) fn record_socket(&self, ident: &crate::sys::FileIdent) -> io::Result<()> {
+            use std::os::unix::fs::FileExt;
+            self._file.set_len(0)?;
+            let text = format!("{RECORD_PREFIX} {} {}\n", ident.dev, ident.ino);
+            self._file.write_all_at(text.as_bytes(), 0)
+        }
+
+        /// 記録を消す（正常終了時。以後この socket 名の再利用で残骸が管理下と誤認されない）。
+        pub(crate) fn clear_record(&self) {
+            let _ = self._file.set_len(0);
+        }
+
+        /// 記録された (dev, ino)。無い・壊れている場合は None（管理下と見なさない）。
+        fn recorded(&self) -> Option<(u64, u64)> {
+            use std::os::unix::fs::FileExt;
+            let mut buf = [0u8; 96];
+            let n = self._file.read_at(&mut buf, 0).ok()?;
+            let text = std::str::from_utf8(buf.get(..n)?).ok()?;
+            let mut it = text.split_whitespace();
+            if it.next()? != RECORD_PREFIX {
+                return None;
+            }
+            let dev = it.next()?.parse().ok()?;
+            let ino = it.next()?.parse().ok()?;
+            Some((dev, ino))
+        }
+
+        /// 今回新規作成したロックファイルだけを削除する（bind 失敗時の後始末。以前の保持者が
+        /// 作った残骸は他の判定に使われ得るため触らない）。
+        pub(crate) fn discard_if_created(&self, dir: &File) {
+            if !self.preexisting {
+                let _ = crate::sys::unlinkat(dir, &self.lock_name);
+            }
+        }
+    }
+
     /// `name` に対応するロックを取得する。他者が保持中（生存中の listener）は `AlreadyExists`、
     /// symlink・他 UID 所有・通常ファイル以外は `PermissionDenied`（fail-closed）。
     pub(crate) fn acquire_bind_lock(
@@ -513,9 +557,9 @@ mod imp {
     ///
     /// `UdsListener::bind` から、配置ディレクトリ検証後・`UnixListener::bind` の前に、`lock`
     /// 取得後に呼ばれる。ロックを保持している＝同ロックを使う生存中の listener は存在しないため、
-    /// 自 UID 所有の socket のうち「以前ロックファイルを作った（管理下の）」ものだけを削除する。
-    /// ロックファイルが無かった socket は生存中か判別できない（他実装・旧版）ため削除せず
-    /// `AlreadyExists`（fail-closed）。削除は検証済み `dir` fd 基準の `unlinkat` のみ。
+    /// 自 UID 所有の socket のうち「ロックに記録した同一性（dev / ino）と一致する（管理下の）」
+    /// ものだけを削除する。記録が無い・不一致の socket（他実装・旧版・残存ロックだけが根拠の
+    /// もの）は生存中か判別できないため削除せず `AlreadyExists`（fail-closed）。削除は検証済み `dir` fd 基準の `unlinkat` のみ。
     pub(crate) fn clear_stale_socket(
         dir: &File,
         name: &std::ffi::CStr,
@@ -546,9 +590,10 @@ mod imp {
             ExistingEntry::OwnSocket(i) => i,
         };
         let busy = || err(PluginErrorCode::AlreadyExists, "socket path already exists");
-        if !lock.preexisting {
-            // 今回作ったロックファイルを残すと、次回以降この socket を管理下と誤認するため消す。
-            let _ = crate::sys::unlinkat(dir, &lock.lock_name);
+        // 管理下の証拠は「ロックファイルの存在」ではなく、ロックに記録した socket の同一性
+        // （dev / ino）と現在の socket の一致のみ。記録が無い・不一致なら他実装や別経路が bind した
+        // 可能性があるため削除しない（fail-closed）。
+        if lock.recorded() != Some((first.dev, first.ino)) {
             return Err(busy());
         }
         // 削除直前に同一性を再確認する。

@@ -139,9 +139,17 @@ mod unix {
         let t = TempDir::new();
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         let p = d.path().join("s.sock");
-        // クラッシュ後の残骸を再現する: ロックファイルが残り、socket が残り、保持者は居ない。
-        drop(UdsListener::bind(&p).unwrap()); // ロックファイルを残して socket を片付ける
-        drop(std::os::unix::net::UnixListener::bind(&p).unwrap()); // std は unlink しない
+        // クラッシュ後の残骸を再現する: 記録つきロックファイルと同一 inode の socket が残り、保持者は居ない。
+        let first = UdsListener::bind(&p).unwrap();
+        let lock = d.path().join("s.sock.lock");
+        let record = std::fs::read(&lock).unwrap();
+        assert!(record.starts_with(b"fcus1 "));
+        let keep = d.path().join("s.keep");
+        std::fs::hard_link(&p, &keep).unwrap(); // 正常終了の unlink から inode を守る
+        drop(first); // 記録を消し socket 名を unlink する
+        assert!(std::fs::read(&lock).unwrap().is_empty());
+        std::fs::rename(&keep, &p).unwrap();
+        std::fs::write(&lock, &record).unwrap(); // クラッシュ時は記録が残る
         let l = UdsListener::bind(&p).unwrap();
         let m = std::fs::symlink_metadata(&p).unwrap();
         // inode は tmpfs で再利用され得るため同一性比較に使わない。新 listener への接続成功で置換を確認する。
@@ -221,6 +229,25 @@ mod unix {
             assert!(std::fs::symlink_metadata(&p).is_ok());
             assert!(!d.path().join("s.sock.lock").exists());
         }
+    }
+
+    /// 正常終了後に残ったロックファイルだけでは管理下の証拠にならず、後から別経路が bind した
+    /// socket は削除しない（TASK-123.2・Codex P0 / Bugbot 指摘）。
+    #[test]
+    fn plug12_leftover_lock_does_not_authorize_removing_foreign_socket() {
+        let t = TempDir::new();
+        let d = RuntimeDir::ensure_under(&t.0).unwrap();
+        let p = d.path().join("s.sock");
+        drop(UdsListener::bind(&p).unwrap()); // ロックファイルは残る
+        assert!(d.path().join("s.sock.lock").exists());
+        let _other = std::os::unix::net::UnixListener::bind(&p).unwrap();
+        for _ in 0..2 {
+            let e = UdsListener::bind(&p).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+            assert!(std::fs::symlink_metadata(&p).is_ok());
+        }
+        // 生存中の別 listener へ接続できる（socket が削除・置換されていない）。
+        std::os::unix::net::UnixStream::connect(&p).unwrap();
     }
 
     /// PLUG-12・TASK-123.4: `from_env` は環境から基底を決め、Ok なら 0700 で bind でき、

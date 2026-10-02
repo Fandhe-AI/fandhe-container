@@ -74,7 +74,9 @@
 //! - OCI-5 の state store は別仕様で、未設定時にフォールバックしない（`crates/core`）。
 //!
 //! # 未実装（REPAIR-3）
-//! - peer credential（TASK-124）は別 sub。
+//! - peer credential の取得・照合自体は `crate::sys::peer_uid`・`UdsListener::accept`・
+//!   `UdsStream::connect` で実装済み（macOS は TASK-124.2・#293 で確認。Linux は #292、Windows の文書化は #294、
+//!   別 UID 拒否の結合テストは #295 で扱い、本節では完了扱いにしない）。
 //! - 非 unix は `Unimplemented`（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る）。
 
 use std::path::{Component, Path, PathBuf};

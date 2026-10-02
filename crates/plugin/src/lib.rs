@@ -8,8 +8,10 @@
 //! （`uds_security`。TASK-123.1・#286。socket 名・`sun_path` 長の bind 前検証は TASK-123.3・#288）、
 //! 既存 socket パスの lstat 検証・stale socket 再 bind（`uds_security`。TASK-123.2・#287）と
 //! 都度起動モード（`lifecycle`。TASK-110.1・#258）と
-//! XDG 未設定時のフォールバック（TASK-123.4・#289）のみ実装済み。常駐モード（`lifecycle`。TASK-110.2・#259）も実装済み。モード選択 API（TASK-110.3）・gRPC と
-//! PLUG-12 の残り（TASK-124）は未実装（TASK-108 ほか。REPAIR-3）。
+//! XDG 未設定時のフォールバック（TASK-123.4・#289）と常駐モード（`lifecycle`。TASK-110.2・#259）のみ実装済み。
+//! モード選択 API（TASK-110.3）・gRPC と
+//! PLUG-12 の peer 認証（TASK-124。macOS の `getpeereid` 経路は TASK-124.2・#293 で実装・検証済み）のうち
+//! 残り（Linux・Windows 文書化・別 UID 拒否テスト）は未完了（TASK-108 ほか。REPAIR-3）。
 //! 本体は G8（TASK-107 が crate 本体、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124）で
 //! 実装する。plugin 発見・登録（TASK-109）の成果物は `fandhe-container-core` 側に置かれ、本 crate ではない。
 //! PLUG-1 区分は core・plugin 双方が依存する境界基盤ライブラリ（crate-naming.md 決定 4）。

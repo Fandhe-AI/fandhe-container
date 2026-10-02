@@ -87,6 +87,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 
 - spec 01-brainstorm.md D-18・未解決疑問点 14
 - netlink / nftables は自前実装で決定済み（NET-11）
+- 選択肢・判断材料のドラフト: [rootless-network.md](rootless-network.md)（TASK-147.1・NET-9。採否は #340 で判断）
 
 ## 非 Cargo 資産（ライセンス手動確認）
 

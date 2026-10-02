@@ -1123,12 +1123,17 @@ mod tests {
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
     use super::*;
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixListener;
 
     /// 一時ディレクトリ（0700）に listener を bind し、実接続した (client, server) を返す。
     fn connected_pair(tag: &str) -> (UnixStream, UnixStream) {
         let dir = std::env::temp_dir().join(format!("fc-peer-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create tmp dir");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .expect("create tmp dir");
         let path = dir.join("s");
         let listener = UnixListener::bind(&path).expect("bind");
         let client = UnixStream::connect(&path).expect("connect");

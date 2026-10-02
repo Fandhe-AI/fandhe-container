@@ -143,6 +143,15 @@ mod unix {
         h.join().unwrap();
     }
 
+    /// PLUG-12: `..` を含む bind パスは再解決で別ディレクトリを指しうるため拒否する。
+    #[test]
+    fn plug12_bind_rejects_parent_dir_component() {
+        let dir = TempDir::new();
+        let p = dir.0.join("sub").join("..").join("s.sock");
+        let e = UdsListener::bind(&p).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+    }
+
     #[test]
     fn plug2_bind_missing_parent_dir_returns_not_found() {
         let dir = TempDir::new();

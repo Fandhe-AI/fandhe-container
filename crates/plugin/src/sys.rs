@@ -12,15 +12,21 @@
 //!
 //! - Linux（x86_64 / aarch64）: `getsockopt(SOL_SOCKET, SO_PEERCRED)` の `struct ucred`
 //! - macOS: `getpeereid(2)`
+//! - いずれの unix: `fchmodat(2)`（`AT_SYMLINK_NOFOLLOW`）・`unlinkat(2)` を検証済みディレクトリ fd
+//!   基準で呼ぶ（パス再解決による TOCTOU を避ける。PLUG-12）
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 契約
-//! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`] のみ
+//! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・[`unlinkat`] のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 
 #![cfg(unix)]
 
+use std::ffi::CStr;
+use std::fs::File;
+use std::io;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 
 use crate::error::{PluginError, PluginErrorCode};
@@ -35,6 +41,177 @@ unsafe extern "C" {
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: 引数を取らず、POSIX の規定上エラー条件を持たない。
     unsafe { geteuid() }
+}
+
+#[cfg(target_os = "linux")]
+type ModeT = u32;
+#[cfg(target_os = "macos")]
+type ModeT = u16;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+type ModeT = u32;
+
+#[cfg(target_os = "linux")]
+const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+#[cfg(target_os = "macos")]
+const AT_SYMLINK_NOFOLLOW: i32 = 0x20;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: POSIX の `int fchmodat(int, const char *, mode_t, int)` と
+    // 同じ型・幅（`mode_t` は Linux で `u32`、macOS で `u16`。上の `ModeT`）。
+    #[link_name = "fchmodat"]
+    fn c_fchmodat(dirfd: i32, path: *const core::ffi::c_char, mode: ModeT, flags: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: POSIX の `int unlinkat(int, const char *, int)` と同じ型・幅。
+    #[link_name = "unlinkat"]
+    fn c_unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
+}
+
+/// `dir`（開いたディレクトリ fd）基準で `name` の mode を設定する。最終要素が symlink なら
+/// 辿らない（`AT_SYMLINK_NOFOLLOW`。辿れない実装では失敗＝fail-closed）。
+pub(crate) fn fchmodat_nofollow(dir: &File, name: &CStr, mode: u32) -> io::Result<()> {
+    let mode = ModeT::try_from(mode).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: fd は `&File` の借用中のため有効。`name` は NUL 終端の有効な C 文字列。
+    let rc = unsafe { c_fchmodat(dir.as_raw_fd(), name.as_ptr(), mode, AT_SYMLINK_NOFOLLOW) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// `lstat` 相当の識別情報（同一性照合・所有者・種別の確認用。PLUG-12）。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct FileIdent {
+    pub dev: u64,
+    pub ino: u64,
+    pub uid: u32,
+    pub is_socket: bool,
+}
+
+#[cfg(target_os = "linux")]
+mod statx_abi {
+    /// `struct statx` と同じレイアウト（アーキテクチャ非依存の安定 ABI。256 バイト）。
+    #[repr(C)]
+    pub(super) struct Statx {
+        pub mask: u32,
+        pub blksize: u32,
+        pub attributes: u64,
+        pub nlink: u32,
+        pub uid: u32,
+        pub gid: u32,
+        pub mode: u16,
+        pub pad0: u16,
+        pub ino: u64,
+        pub size: u64,
+        pub blocks: u64,
+        pub attributes_mask: u64,
+        pub timestamps: [u64; 8],
+        pub rdev_major: u32,
+        pub rdev_minor: u32,
+        pub dev_major: u32,
+        pub dev_minor: u32,
+        pub tail: [u64; 14],
+    }
+    const _: () = assert!(core::mem::size_of::<Statx>() == 256);
+
+    /// `STATX_TYPE | STATX_MODE | STATX_UID | STATX_INO`。
+    pub(super) const REQUIRED_MASK: u32 = 0x1 | 0x2 | 0x8 | 0x100;
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: glibc（2.28 以降）/ musl の
+        // `int statx(int, const char *, int, unsigned int, struct statx *)` と同じ型・幅。
+        pub(super) fn statx(
+            dirfd: i32,
+            path: *const core::ffi::c_char,
+            flags: i32,
+            mask: u32,
+            buf: *mut Statx,
+        ) -> i32;
+    }
+}
+
+/// `dir` 基準で `name`（symlink を辿らない）の識別情報を返す。
+///
+/// Linux は `statx(dirfd, name, AT_SYMLINK_NOFOLLOW)` でパスを再解決しない。Linux 以外の unix は
+/// アーキテクチャ別の `struct stat` を自前で持たないため `fallback_path` の `symlink_metadata` に
+/// 縮退する（残余: macOS ではパス再解決の競合窓が残る。ディレクトリ自体は 0700 の自 UID 所有で
+/// 同一 UID のみが差し替えられる。TASK-123・TASK-124 で fstatat 化を検討）。
+pub(crate) fn lstat_at(
+    dir: &File,
+    name: &CStr,
+    fallback_path: &std::path::Path,
+) -> io::Result<FileIdent> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = fallback_path;
+        let mut st = statx_abi::Statx {
+            mask: 0,
+            blksize: 0,
+            attributes: 0,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            mode: 0,
+            pad0: 0,
+            ino: 0,
+            size: 0,
+            blocks: 0,
+            attributes_mask: 0,
+            timestamps: [0; 8],
+            rdev_major: 0,
+            rdev_minor: 0,
+            dev_major: 0,
+            dev_minor: 0,
+            tail: [0; 14],
+        };
+        // SAFETY: fd は `&File` の借用中のため有効。`name` は NUL 終端の有効な C 文字列。
+        // `st` はスタック上の 256 バイトの `#[repr(C)]` 領域で、カーネルが書き込む最大サイズと一致。
+        let rc = unsafe {
+            statx_abi::statx(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                AT_SYMLINK_NOFOLLOW,
+                statx_abi::REQUIRED_MASK,
+                &raw mut st,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if st.mask & statx_abi::REQUIRED_MASK != statx_abi::REQUIRED_MASK {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
+        Ok(FileIdent {
+            dev: (u64::from(st.dev_major) << 32) | u64::from(st.dev_minor),
+            ino: st.ino,
+            uid: st.uid,
+            is_socket: u32::from(st.mode) & 0o170000 == 0o140000,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let _ = (dir, name);
+        let m = std::fs::symlink_metadata(fallback_path)?;
+        Ok(FileIdent {
+            dev: m.dev(),
+            ino: m.ino(),
+            uid: m.uid(),
+            is_socket: m.file_type().is_socket(),
+        })
+    }
+}
+
+/// `dir`（開いたディレクトリ fd）基準で `name` を unlink する（ディレクトリは対象外: flags=0）。
+pub(crate) fn unlinkat(dir: &File, name: &CStr) -> io::Result<()> {
+    // SAFETY: fd は `&File` の借用中のため有効。`name` は NUL 終端の有効な C 文字列。
+    let rc = unsafe { c_unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -10,8 +10,12 @@
 //! - bind 前に socket 配置ディレクトリを検証する: symlink でない・自 UID 所有・group/other の
 //!   権限が一切ない（0700 相当）。他 UID はこのディレクトリを辿れないため、socket の mode が
 //!   bind 直後の umask 次第でも他 UID が接続できる窓は生じない（0600 化は多層防御）
-//! - bind 後に socket が自 UID 所有の socket であり配置ディレクトリが入れ替わっていないことを
-//!   確認してから 0600 化する（symlink 経由で別ファイルを chmod しない）
+//! - 配置ディレクトリは 1 度だけ開いた fd（検証対象そのもの）を保持し、bind 後の 0600 化
+//!   （`fchmodat(dirfd, name, AT_SYMLINK_NOFOLLOW)`）と Drop 時の削除（`unlinkat(dirfd, name)`）は
+//!   その fd 基準で行う。パスを再解決しないため、検証後に中間要素・`..`・symlink が差し替わっても
+//!   別ファイルの chmod・削除には到達しない。bind パスの `..` は拒否する
+//! - 残余: 0700 の自 UID 所有ディレクトリ内でエントリを差し替えられるのは同一 UID のみで、
+//!   同一 UID は脅威モデル外（socket と同一性の照合は行わず、ディレクトリ fd 基準で名前を操作する）
 //! - accept した接続の peer credential（`SO_PEERCRED` / `getpeereid`。`crate::sys`）を検証し、
 //!   自 UID 以外は切断して `PermissionDenied` を返す
 //! - 受け付けた接続には既定の read / write 期限を付ける（REPAIR-5）
@@ -59,6 +63,17 @@ impl UdsListener {
     /// 相対パスは bind 時点の絶対パスへ変換して保持する（Drop 時の cwd 変更の影響を避ける）。
     /// stale 処理は TASK-123・TASK-124（PLUG-12）。
     pub fn bind(path: &Path) -> Result<Self, PluginError> {
+        // `..` は bind 時点とそれ以降で解決先が変わりうるため拒否する（`std::path::absolute` は
+        // `..` を残す。PLUG-12）。
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                "socket path must not contain parent directory components",
+            ));
+        }
         let abs = std::path::absolute(path).map_err(|_| {
             PluginError::new(PluginErrorCode::InvalidArgument, "invalid socket path")
         })?;
@@ -90,9 +105,9 @@ impl UdsListener {
 
 impl Drop for UdsListener {
     fn drop(&mut self) {
-        // 自分が bind した socket と同一性が確認できる場合のみ削除する。
-        // 検査と削除の間の競合窓・所有者検証は TASK-123（PLUG-12）で扱う。
-        self.inner.cleanup(&self.path);
+        // 検証済み配置ディレクトリ fd 基準の unlinkat で削除する（パス再解決なし）。
+        // stale socket の所有者検証・再 bind は TASK-123・TASK-124（PLUG-12）で扱う。
+        self.inner.cleanup();
     }
 }
 
@@ -155,10 +170,13 @@ mod imp {
     use super::{UDS_DEFAULT_IO_TIMEOUT, map_bind_error};
     use crate::error::{PluginError, PluginErrorCode};
     use crate::sys;
+    use std::ffi::CString;
+    use std::fs::File;
     use std::io::{self, Read, Write};
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -169,23 +187,26 @@ mod imp {
         PluginError::new(PluginErrorCode::PermissionDenied, m)
     }
 
-    /// 配置ディレクトリの検証結果（bind 後に入れ替わっていないことの再確認に使う）。
-    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-    struct DirIdentity {
-        dev: u64,
-        ino: u64,
-    }
-
-    /// 親ディレクトリが symlink でなく、自 UID 所有で、group/other の権限が一切ないことを検証する（PLUG-12）。
+    /// 親ディレクトリを開き、symlink でなく、自 UID 所有で、group/other の権限が一切ないことを
+    /// 開いた fd 自体に対して検証する（PLUG-12）。以降の chmod・unlink はこの fd 基準で行う。
     /// 他 UID は辿れないため、socket の mode が umask 次第でも他 UID が接続できる窓は生じない。
-    fn check_parent_dir(path: &Path, euid: u32) -> Result<DirIdentity, PluginError> {
+    fn open_parent_dir(path: &Path, euid: u32) -> Result<File, PluginError> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or_else(|| denied("socket path has no parent directory"))?;
-        let meta = std::fs::symlink_metadata(parent).map_err(|e| map_bind_error(e.kind()))?;
-        if !meta.file_type().is_dir() {
+        let link_meta = std::fs::symlink_metadata(parent).map_err(|e| map_bind_error(e.kind()))?;
+        if !link_meta.file_type().is_dir() {
             return Err(denied("socket parent is not a directory"));
+        }
+        let dir = File::open(parent).map_err(|e| map_bind_error(e.kind()))?;
+        let meta = dir.metadata().map_err(|e| map_bind_error(e.kind()))?;
+        // 開いた fd が symlink 判定した実体と同一であること（検査と open の間の差し替え検出）。
+        if !meta.file_type().is_dir()
+            || meta.dev() != link_meta.dev()
+            || meta.ino() != link_meta.ino()
+        {
+            return Err(denied("socket directory changed during bind"));
         }
         if meta.uid() != euid {
             return Err(denied("socket directory is not owned by the current user"));
@@ -195,68 +216,71 @@ mod imp {
                 "socket directory must not be accessible by group or others",
             ));
         }
-        Ok(DirIdentity {
-            dev: meta.dev(),
-            ino: meta.ino(),
-        })
+        Ok(dir)
     }
 
     #[derive(Debug)]
     pub(super) struct ListenerInner {
         listener: UnixListener,
-        /// bind 直後の socket の (dev, ino)。取得失敗時は None（Drop で削除しない）。
-        identity: Option<(u64, u64)>,
+        /// 検証済みの配置ディレクトリ fd（chmod・unlink の基準。パスを再解決しない）。
+        dir: File,
+        /// 配置ディレクトリ内の socket 名（NUL を含まない）。
+        name: CString,
+        /// bind したパス（Linux 以外の identity 取得の縮退用。Linux では使わない）。
+        path: PathBuf,
+        /// bind 直後の socket の識別情報。取得失敗時は None（Drop で削除しない）。
+        identity: Option<sys::FileIdent>,
         /// bind 時点の自プロセスの実効 uid（accept ごとの peer 照合の基準）。
         euid: u32,
     }
 
     impl ListenerInner {
-        /// `path` は絶対パス（`UdsListener::bind` が変換済み）。
+        /// `path` は `..` を含まない絶対パス（`UdsListener::bind` が検証・変換済み）。
         pub(super) fn bind(path: &Path) -> Result<Self, PluginError> {
             let euid = sys::effective_uid();
-            let dir = check_parent_dir(path, euid)?;
+            let dir = open_parent_dir(path, euid)?;
+            let name = path
+                .file_name()
+                .and_then(|n| CString::new(n.as_bytes()).ok())
+                .ok_or_else(|| {
+                    PluginError::new(PluginErrorCode::InvalidArgument, "invalid socket path")
+                })?;
             let listener = UnixListener::bind(path).map_err(|e| map_bind_error(e.kind()))?;
-            let meta = std::fs::symlink_metadata(path).ok();
-            let identity = meta.as_ref().map(|m| (m.dev(), m.ino()));
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
+            let identity = sys::lstat_at(&dir, &name, path).ok();
             let inner = Self {
                 listener,
+                dir,
+                name,
+                path: path.to_path_buf(),
                 identity,
                 euid,
             };
-            if let Err(e) = inner.configure(path, dir) {
-                inner.cleanup(path);
+            if let Err(e) = inner.configure() {
+                inner.cleanup();
                 return Err(e);
             }
             Ok(inner)
         }
 
-        /// bind 直後の設定（nonblocking 化・所有者/配置の再確認・0600 化。PLUG-12）。
+        /// bind 直後の設定（nonblocking 化・0600 化。PLUG-12）。
+        /// 0600 化は検証済みディレクトリ fd 基準の `fchmodat(AT_SYMLINK_NOFOLLOW)`。差し替えで
+        /// 名前が別ディレクトリへ解決された場合は ENOENT・symlink なら拒否となり失敗する（fail-closed）。
         /// 失敗時の socket 削除は呼び出し側（`bind`）が行う。
-        fn configure(&self, path: &Path, dir: DirIdentity) -> Result<(), PluginError> {
+        fn configure(&self) -> Result<(), PluginError> {
             self.listener.set_nonblocking(true).map_err(|_| {
                 PluginError::new(PluginErrorCode::Internal, "failed to configure listener")
             })?;
-            // chmod は symlink を辿るため、その前に「自分が作った自 UID 所有の socket」であり、
-            // 配置ディレクトリが検証時から入れ替わっていないことを確認する。
-            let (dev, ino) = self
+            // 作成した自 UID 所有の socket であることを確認してから 0600 化する。
+            let ident = self
                 .identity
                 .ok_or_else(|| denied("failed to inspect bound socket"))?;
-            let meta = std::fs::symlink_metadata(path).map_err(|_| denied("socket vanished"))?;
-            if !meta.file_type().is_socket()
-                || meta.dev() != dev
-                || meta.ino() != ino
-                || meta.uid() != self.euid
-            {
+            if !ident.is_socket || ident.uid != self.euid {
                 return Err(denied("bound socket is not the expected socket"));
             }
-            if check_parent_dir(path, self.euid)? != dir {
-                return Err(denied("socket directory changed during bind"));
-            }
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |_| PluginError::new(PluginErrorCode::Internal, "failed to restrict socket mode"),
-            )?;
-            Ok(())
+            sys::fchmodat_nofollow(&self.dir, &self.name, 0o600).map_err(|_| {
+                PluginError::new(PluginErrorCode::Internal, "failed to restrict socket mode")
+            })
         }
 
         pub(super) fn accept(&self, timeout: Duration) -> Result<StreamInner, PluginError> {
@@ -316,16 +340,16 @@ mod imp {
             }
         }
 
-        pub(super) fn cleanup(&self, path: &Path) {
-            let Some((dev, ino)) = self.identity else {
+        /// 検証済みディレクトリ fd 基準で、bind 時と同一性（dev/ino）が一致する socket のみ
+        /// unlink する（best-effort）。Linux では照合も削除もパスを再解決しない。
+        pub(super) fn cleanup(&self) {
+            let Some(expected) = self.identity else {
                 return;
             };
-            if let Ok(m) = std::fs::symlink_metadata(path)
-                && m.file_type().is_socket()
-                && m.dev() == dev
-                && m.ino() == ino
+            if let Ok(now) = sys::lstat_at(&self.dir, &self.name, &self.path)
+                && now == expected
             {
-                let _ = std::fs::remove_file(path);
+                let _ = sys::unlinkat(&self.dir, &self.name);
             }
         }
     }
@@ -383,7 +407,7 @@ mod imp {
         pub(super) fn accept(&self, _timeout: Duration) -> Result<StreamInner, PluginError> {
             match *self {}
         }
-        pub(super) fn cleanup(&self, _path: &Path) {
+        pub(super) fn cleanup(&self) {
             match *self {}
         }
     }

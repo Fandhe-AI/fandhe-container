@@ -94,6 +94,9 @@ mod unix {
                 if mode == "linger" {
                     std::thread::sleep(Duration::from_secs(60));
                 }
+                if mode == "exit_nonzero" {
+                    std::process::exit(3);
+                }
             }
         }
     }
@@ -205,6 +208,14 @@ mod unix {
         let out = res.unwrap();
         assert_eq!(out.termination(), OneShotTermination::Killed);
         assert_process_gone(pid_of(out.response().payload()));
+    }
+
+    /// 応答後に非ゼロ終了した子は成功扱いにせず Unavailable（REPAIR-5・PLUG-7）。
+    #[test]
+    fn plug7_one_shot_rejects_nonzero_exit_after_response() {
+        let (res, _, _dir) = run("exit_nonzero", 5000);
+        let e = res.unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Unavailable);
     }
 
     /// 存在しない絶対パスは NotFound。

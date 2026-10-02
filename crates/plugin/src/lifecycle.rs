@@ -284,7 +284,8 @@ fn spawn_error(e: &io::Error) -> PluginError {
 /// 流れ: 一意名で listener を bind -> 子を spawn -> 接続を受け付け -> `request` 送信 -> 応答受信 ->
 /// 接続を閉じて子の終了を待つ。spawn から応答受信までが `timeout` の合計期限。接続前に子が
 /// 終了した場合は期限を待たず `Unavailable`。応答は得たが子が [`ONE_SHOT_EXIT_TIMEOUT`] 内に
-/// 終了しなかった場合は強制終了し、`Ok` と [`OneShotTermination::Killed`] を返す。
+/// 終了しなかった場合は強制終了し、`Ok` と [`OneShotTermination::Killed`] を返す。応答後に非ゼロ・
+/// シグナルで終了した場合は `Unavailable`、回収を確認できない場合は `Internal` を返す。
 /// 非 unix では listener の bind が `Unimplemented` を返し、子は spawn されない。
 pub fn call_once(
     plugin: &OneShotPlugin,
@@ -342,6 +343,22 @@ pub fn call_once(
     };
     drop(listener);
     let termination = guard.wait_or_kill(ONE_SHOT_EXIT_TIMEOUT);
+    // 回収を確認できない子（孤児の可能性）と異常終了（非ゼロ・シグナル）は成功扱いにしない（REPAIR-5・PLUG-7）。
+    match termination {
+        OneShotTermination::Unreaped => {
+            return Err(PluginError::new(
+                PluginErrorCode::Internal,
+                "plugin process could not be reaped after the response",
+            ));
+        }
+        OneShotTermination::Exited { code: Some(0) } | OneShotTermination::Killed => {}
+        OneShotTermination::Exited { .. } => {
+            return Err(PluginError::new(
+                PluginErrorCode::Unavailable,
+                "plugin process exited abnormally after the response",
+            ));
+        }
+    }
     Ok(OneShotOutcome {
         response,
         termination,

@@ -292,18 +292,19 @@ impl UdsStream {
         self.finish_frame_op(result, restored)
     }
 
-    /// フレーム操作の後始末。失敗、または socket 期限を復元できなかった場合は接続を使用不可にし、
-    /// 復元失敗は Ok の結果を握りつぶさずその操作のエラーとして返す（REPAIR-5）。
+    /// フレーム操作の後始末。失敗、または socket 期限を復元できたと確認できなかった場合は接続を
+    /// 使用不可にする（REPAIR-5）。復元失敗（`Failed`）は Ok の結果を握りつぶさずエラーとして返す。
+    /// `PeerClosed`（EINVAL。相手切断済みで復元不能）は操作結果を尊重しつつ接続は使用不可にする。
     fn finish_frame_op<T>(
         &mut self,
         result: Result<T, PluginError>,
-        restored: bool,
+        restored: TimeoutRestore,
     ) -> Result<T, PluginError> {
-        if result.is_err() || !restored {
+        if result.is_err() || restored != TimeoutRestore::Restored {
             self.poisoned = true;
         }
         match result {
-            Ok(_) if !restored => Err(PluginError::new(
+            Ok(_) if restored == TimeoutRestore::Failed => Err(PluginError::new(
                 PluginErrorCode::Internal,
                 "failed to restore io timeout",
             )),
@@ -340,6 +341,17 @@ impl Write for UdsStream {
         self.check_raw_io()?;
         self.inner.flush()
     }
+}
+
+/// フレーム操作後の socket 期限の復元結果（REPAIR-5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutRestore {
+    /// 元の期限へ戻せた。
+    Restored,
+    /// 相手切断で復元できなかった（EINVAL）。接続は使用不可にする。
+    PeerClosed,
+    /// 復元に失敗した、または元の期限を保存できなかった。
+    Failed,
 }
 
 fn poisoned_error() -> PluginError {
@@ -433,8 +445,8 @@ fn map_connect_error(kind: io::ErrorKind) -> PluginError {
 #[cfg(unix)]
 mod imp {
     use super::{
-        FrameOp, RpcTimeout, UDS_DEFAULT_IO_TIMEOUT, map_bind_error, map_connect_error,
-        map_frame_io_error,
+        FrameOp, RpcTimeout, TimeoutRestore, UDS_DEFAULT_IO_TIMEOUT, map_bind_error,
+        map_connect_error, map_frame_io_error,
     };
     use crate::error::{PluginError, PluginErrorCode};
     use crate::frame::{FRAME_HEADER_LEN, Frame, FrameHeader};
@@ -759,11 +771,11 @@ mod imp {
             self.stream.flush()
         }
 
-        /// 期限つきでフレームを 1 つ受ける。戻り値の bool は socket 期限を復元できたか。
+        /// 期限つきでフレームを 1 つ受ける。戻り値は socket 期限の復元結果。
         pub(super) fn read_frame(
             &mut self,
             timeout: RpcTimeout,
-        ) -> (Result<Frame, PluginError>, bool) {
+        ) -> (Result<Frame, PluginError>, TimeoutRestore) {
             let saved = self.save_timeouts();
             let deadline = Instant::now() + timeout.as_duration();
             let result = self.read_frame_inner(deadline);
@@ -771,12 +783,12 @@ mod imp {
             (result, restored)
         }
 
-        /// 期限つきでフレームを 1 つ全量送る。戻り値の bool は socket 期限を復元できたか。
+        /// 期限つきでフレームを 1 つ全量送る。戻り値は socket 期限の復元結果。
         pub(super) fn write_frame(
             &mut self,
             frame: &Frame,
             timeout: RpcTimeout,
-        ) -> (Result<(), PluginError>, bool) {
+        ) -> (Result<(), PluginError>, TimeoutRestore) {
             let saved = self.save_timeouts();
             let deadline = Instant::now() + timeout.as_duration();
             // encode（最大 16 MiB のコピーとチェックサム計算）も合計期限に含める。encode 後に期限を
@@ -795,21 +807,30 @@ mod imp {
             ))
         }
 
-        fn restore_timeouts(&self, saved: Option<(Option<Duration>, Option<Duration>)>) -> bool {
+        fn restore_timeouts(
+            &self,
+            saved: Option<(Option<Duration>, Option<Duration>)>,
+        ) -> TimeoutRestore {
             let Some((r, w)) = saved else {
-                return false;
+                return TimeoutRestore::Failed;
             };
             // 片方が失敗しても必ず両方を試す（短絡させない）。
-            // macOS は peer close 後の UDS で set_*_timeout が EINVAL を返す。切断済みの接続は以後の
-            // read が EOF・write が EPIPE で即失敗し、期限なしで待つ経路が無いため、EINVAL は
-            // 復元済みとして扱う（それ以外の失敗は復元失敗）。
-            let tolerated = |r: io::Result<()>| match r {
-                Ok(()) => true,
-                Err(e) => e.kind() == io::ErrorKind::InvalidInput,
+            // macOS は peer close 後の UDS で set_*_timeout が EINVAL を返す。復元できたとは見なさず
+            // `PeerClosed` として区別し、呼び出し側が接続を使用不可にする（期限未復元のまま再利用させない。
+            // 操作自体の成功は保つ）。それ以外の失敗は `Failed`。
+            let classify = |r: io::Result<()>| match r {
+                Ok(()) => TimeoutRestore::Restored,
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => TimeoutRestore::PeerClosed,
+                Err(_) => TimeoutRestore::Failed,
             };
-            let read_ok = tolerated(self.stream.set_read_timeout(r));
-            let write_ok = tolerated(self.stream.set_write_timeout(w));
-            read_ok && write_ok
+            match (
+                classify(self.stream.set_read_timeout(r)),
+                classify(self.stream.set_write_timeout(w)),
+            ) {
+                (TimeoutRestore::Restored, TimeoutRestore::Restored) => TimeoutRestore::Restored,
+                (TimeoutRestore::Failed, _) | (_, TimeoutRestore::Failed) => TimeoutRestore::Failed,
+                _ => TimeoutRestore::PeerClosed,
+            }
         }
 
         fn read_frame_inner(&mut self, deadline: Instant) -> Result<Frame, PluginError> {
@@ -945,7 +966,7 @@ mod imp {
 
 #[cfg(not(unix))]
 mod imp {
-    use super::RpcTimeout;
+    use super::{RpcTimeout, TimeoutRestore};
     use crate::error::{PluginError, PluginErrorCode};
     use crate::frame::Frame;
     use std::io;
@@ -1004,14 +1025,14 @@ mod imp {
         pub(super) fn read_frame(
             &mut self,
             _timeout: RpcTimeout,
-        ) -> (Result<Frame, PluginError>, bool) {
+        ) -> (Result<Frame, PluginError>, TimeoutRestore) {
             match *self {}
         }
         pub(super) fn write_frame(
             &mut self,
             _frame: &Frame,
             _timeout: RpcTimeout,
-        ) -> (Result<(), PluginError>, bool) {
+        ) -> (Result<(), PluginError>, TimeoutRestore) {
             match *self {}
         }
     }

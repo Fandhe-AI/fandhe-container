@@ -38,3 +38,29 @@ fn plug11_task122_3_allowlist_is_reachable_from_public_api() {
     assert_eq!(list.len(), 1);
     assert!(AllowedPluginHashes::default().is_empty());
 }
+
+/// 検証方式の切替点が公開 API から到達でき、既定はハッシュ方式、署名は fail-closed で拒否されること
+/// （TASK-122.4・PLUG-11）。
+#[test]
+fn plug11_task122_4_verification_method_is_reachable_from_public_api() {
+    use fandhe_container_core::plugin_trust::{
+        PluginVerificationMethod, PluginVerificationMethodKind,
+    };
+
+    assert_eq!(
+        PluginVerificationMethod::default().kind(),
+        PluginVerificationMethodKind::Sha256Allowlist
+    );
+    assert_eq!(
+        PluginVerificationMethod::Signature.kind(),
+        PluginVerificationMethodKind::Signature
+    );
+    let kind = PluginVerificationMethod::Signature
+        .ensure_implemented()
+        .expect_err("must reject");
+    assert_eq!(kind, PluginTrustErrorKind::VerificationMethodNotImplemented);
+    assert_eq!(
+        PluginVerificationMethod::default().ensure_implemented(),
+        Ok(())
+    );
+}

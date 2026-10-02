@@ -1,4 +1,4 @@
-//! plugin 候補の所有者・モード・symlink 実体解決・sha256 許可済みハッシュ検証（TASK-122.1〜122.3・PLUG-11・MS-3）。
+//! plugin 候補の所有者・モード・symlink 実体解決・sha256 許可済みハッシュ検証・検証方式の切替点（TASK-122.1〜122.4・PLUG-11・MS-3）。
 //!
 //! # 役割と呼び出し元
 //!
@@ -52,6 +52,23 @@
 //! 一覧ファイル自体も信頼できる所有者・group/other 書き込み不可であることを呼び出し側が fd 経由で
 //! 検証した内容だけを渡す契約とする（一覧が書き換え可能だと検証が無効になる）。
 //!
+//! # 検証方式の切替点（TASK-122.4・PLUG-11）
+//!
+//! TASK-122.h1（#280）の決定により、既定はハッシュ一覧方式、署名検証は opt-in の将来拡張で
+//! MVP では実装しない（鍵管理が不要でローカル導入の plugin と整合し、依存が `sha2` のみで済むため）。
+//! [`PluginVerificationMethod`] が方式の切替点で、[`PluginVerificationMethod::verify`] が唯一の
+//! 検証入口になる。core 内で閉じた列挙型のため、外部から未知の方式を注入できない。
+//!
+//! - 既定は [`PluginVerificationMethod::Sha256Allowlist`]（空一覧＝全件拒否。fail-closed）
+//! - 未実装の方式（[`PluginVerificationMethod::Signature`]）の指定は黙って通さず、ハッシュ方式への
+//!   フォールバックもせず、[`PluginTrustErrorKind::VerificationMethodNotImplemented`] で登録を拒否する
+//!   （REPAIR-3）。「差し替え・併用」のうち併用（ハッシュ AND 署名）の variant は未実装
+//! - **契約**: 署名検証を追加するときも、検証対象は [`VerifiedPluginFile`] が保持する **オープン済み
+//!   fd の内容** に限る。`path()` / `resolved_path()` は表示用で再 open に使わない。署名・鍵などの
+//!   付随入力も、呼び出し側が fd 経由で信頼検証した内容をバイト列で渡す（[`AllowedPluginHashes::parse`]
+//!   と同じ流儀）。署名検証の実装時に [`HashVerifiedPluginFile`] の一般化を検討する
+//! - 設定から方式を選ぶ配線（TASK-79 ほか）は未知の方式名を拒否すること
+//!
 //! # 限界（REPAIR-3。実装済みを装わない）
 //!
 //! - sticky bit 付きの祖先（`/tmp` 等）も例外にせず拒否する（fail-closed）。plugin は
@@ -63,13 +80,12 @@
 //!   限られ、内容の同一性はハッシュ照合（TASK-122.3）で担保する前提
 //! - symlink 経由の検証は実体の正規パスの取得に `/proc` を要する。未マウント環境では `Io` で
 //!   拒否する（fail-closed）
-//! - 署名の照合は未実装。ハッシュ照合は「計算時点」の内容を保証するもので、信頼された所有者
+//! - 署名の照合は未実装（切替点はあるが [`PluginVerificationMethod::Signature`] は常に拒否する）。ハッシュ照合は「計算時点」の内容を保証するもので、信頼された所有者
 //!   （root / 実効 UID）自身が計算後に内容を書き換える場合は防げない。起動も照合済み fd 経由
 //!   （fexecve 相当）にしない限り保証は切れる（配線は後続）
 //! - 許可一覧ファイルの置き場所・指定方法（CLI フラグ / 固定パス）と、一覧ファイル自体の
 //!   所有者・モード検証の配線は未実装（呼び出し側の契約。上記）
-//! - 検証方式の切替点（TASK-122.4・#282）は未実装で、本モジュールはハッシュ一覧方式の実体のみ
-//!   を提供する
+//! - 併用方式（ハッシュ AND 署名）は未実装（切替点は TASK-122.4 で実装済み）
 //! - レジストリへの配線は未実施で、本モジュール単体では未検証候補の登録を防がない
 //! - setuid / setgid ビット・ACL・拡張属性は判定対象外（PLUG-11 の記述範囲外）
 //! - 非 Linux は同等検証が未実装のため常に拒否する（fail-closed。macOS / Windows の「相当」
@@ -125,6 +141,8 @@ pub enum PluginTrustErrorKind {
     HashMismatch,
     /// バイナリが [`MAX_PLUGIN_BINARY_BYTES`] を超える（ハッシュ計算の無制限読み取りを防ぐ）。
     TooLarge,
+    /// 指定された検証方式が未実装（署名検証。TASK-122.4・PLUG-11。fail-closed）。
+    VerificationMethodNotImplemented,
 }
 
 /// 検証の拒否。種別・対象・パスを持つ。
@@ -179,6 +197,9 @@ impl fmt::Display for PluginTrustError {
             }
             PluginTrustErrorKind::HashMismatch => "sha256 digest is not in the allowed hash list",
             PluginTrustErrorKind::TooLarge => "file exceeds the maximum allowed size",
+            PluginTrustErrorKind::VerificationMethodNotImplemented => {
+                "requested verification method is not implemented"
+            }
         };
         write!(f, "{target} rejected: {reason}: {}", self.path.display())
     }
@@ -198,7 +219,8 @@ impl From<PluginTrustError> for TraitError {
             | PluginTrustErrorKind::TooLarge
             | PluginTrustErrorKind::InvalidPath => ErrorCode::InvalidArgument,
             PluginTrustErrorKind::Io => ErrorCode::Internal,
-            PluginTrustErrorKind::Unsupported => ErrorCode::Unimplemented,
+            PluginTrustErrorKind::Unsupported
+            | PluginTrustErrorKind::VerificationMethodNotImplemented => ErrorCode::Unimplemented,
         };
         TraitError::new(code, e.to_string())
     }
@@ -575,6 +597,75 @@ impl HashVerifiedPluginFile {
     /// 実体の正規パス（表示用）。
     pub fn resolved_path(&self) -> &Path {
         self.file.resolved_path()
+    }
+}
+
+/// 検証方式の種別のみ（ログ・試験・将来の設定配線用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PluginVerificationMethodKind {
+    /// 許可済み sha256 ハッシュ一覧（既定）。
+    Sha256Allowlist,
+    /// 署名検証（opt-in の将来拡張・未実装）。
+    Signature,
+}
+
+/// plugin 登録時の検証方式の切替点（TASK-122.4・PLUG-11。#280 の決定）。
+///
+/// 後続のレジストリ配線が [`Self::verify`] を呼ぶ。既定はハッシュ一覧方式で、既定値の一覧は空のため
+/// 全件拒否（fail-closed）。入力は常に [`VerifiedPluginFile`] の保持 fd の内容であり、将来の署名検証も
+/// パスを開き直さずこの fd だけを対象にする契約とする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PluginVerificationMethod {
+    /// 既定。許可済み sha256 ハッシュ一覧（TASK-122.3）。
+    Sha256Allowlist(AllowedPluginHashes),
+    /// 署名検証（opt-in の将来拡張。未実装で、指定すると必ず登録を拒否する）。
+    /// 実装時も検証対象は保持 fd の内容に限り、パスの再 open はしない。
+    Signature,
+}
+
+impl Default for PluginVerificationMethod {
+    fn default() -> Self {
+        Self::Sha256Allowlist(AllowedPluginHashes::default())
+    }
+}
+
+impl PluginVerificationMethod {
+    /// 方式の種別を返す。
+    pub fn kind(&self) -> PluginVerificationMethodKind {
+        match self {
+            Self::Sha256Allowlist(_) => PluginVerificationMethodKind::Sha256Allowlist,
+            Self::Signature => PluginVerificationMethodKind::Signature,
+        }
+    }
+
+    /// 方式が実装済みかを fd なしで判定するゲート（純関数）。未実装は
+    /// [`PluginTrustErrorKind::VerificationMethodNotImplemented`]（fail-closed。REPAIR-3）。
+    pub fn ensure_implemented(&self) -> Result<(), PluginTrustErrorKind> {
+        match self {
+            Self::Sha256Allowlist(_) => Ok(()),
+            Self::Signature => Err(PluginTrustErrorKind::VerificationMethodNotImplemented),
+        }
+    }
+
+    /// 選択された方式で検証する唯一の入口。**パスを取らず**、保持 fd の内容だけを対象にする。
+    /// 未実装方式はハッシュ方式へフォールバックせず拒否する。
+    pub fn verify(
+        &self,
+        file: VerifiedPluginFile,
+    ) -> Result<HashVerifiedPluginFile, PluginTrustError> {
+        if let Err(kind) = self.ensure_implemented() {
+            return Err(PluginTrustError::new(kind, TrustTarget::File, file.path()));
+        }
+        match self {
+            Self::Sha256Allowlist(allowed) => file.verify_hash(allowed),
+            Self::Signature => Err(PluginTrustError::new(
+                PluginTrustErrorKind::VerificationMethodNotImplemented,
+                TrustTarget::File,
+                file.path(),
+            )),
+        }
     }
 }
 
@@ -981,11 +1072,50 @@ mod tests {
                 ErrorCode::PermissionDenied,
             ),
             (PluginTrustErrorKind::TooLarge, ErrorCode::InvalidArgument),
+            (
+                PluginTrustErrorKind::VerificationMethodNotImplemented,
+                ErrorCode::Unimplemented,
+            ),
         ];
         for (k, c) in cases {
             let e: TraitError = PluginTrustError::new(k, TrustTarget::File, p).into();
             assert_eq!(e.code(), c);
         }
+    }
+
+    #[test]
+    fn plug11_task122_4_default_is_empty_sha256_allowlist() {
+        let m = PluginVerificationMethod::default();
+        assert_eq!(m.kind(), PluginVerificationMethodKind::Sha256Allowlist);
+        assert_eq!(
+            m,
+            PluginVerificationMethod::Sha256Allowlist(AllowedPluginHashes::default())
+        );
+    }
+
+    #[test]
+    fn plug11_task122_4_signature_is_not_implemented() {
+        assert_eq!(
+            PluginVerificationMethod::Signature.ensure_implemented(),
+            Err(PluginTrustErrorKind::VerificationMethodNotImplemented)
+        );
+        assert_eq!(
+            PluginVerificationMethod::default().ensure_implemented(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn plug11_task122_4_not_implemented_display() {
+        let e = PluginTrustError::new(
+            PluginTrustErrorKind::VerificationMethodNotImplemented,
+            TrustTarget::File,
+            Path::new("/x"),
+        );
+        assert_eq!(
+            e.to_string(),
+            "plugin file rejected: requested verification method is not implemented: /x"
+        );
     }
 
     const EMPTY_SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";

@@ -2,9 +2,9 @@
 //!
 //! 現状はエラー型（`error`。TASK-107.1・#244）、長さ接頭辞フレームのヘッダ・チェックサム型
 //! （`frame`。TASK-107.2・#245）、制御メッセージの serde_json 符号化・復号（`message`。
-//! TASK-107.3・#247）と UDS listener（`transport`。TASK-107.4・#248。配置検証・peer 認証・I/O 期限を含む）のみ
-//! 実装済み。client 接続・タイムアウト・gRPC・PLUG-12 の完全な保護（stale socket 再 bind 等。
-//! TASK-123・TASK-124）は未実装（#249〜#251・TASK-108 ほか。REPAIR-3）。
+//! TASK-107.3・#247）と UDS listener（`transport`。TASK-107.4・#248。配置検証・peer 認証・I/O 期限を含む）と UDS client 接続
+//! （`UdsStream::connect`。TASK-107.5・#249）のみ実装済み。RPC タイムアウト・gRPC・PLUG-12 の完全な保護
+//! （stale socket 再 bind 等。TASK-123・TASK-124）は未実装（#250・#251・TASK-108 ほか。REPAIR-3）。
 //! 本体は G8（TASK-107 が crate 本体、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124）で
 //! 実装する。plugin 発見・登録（TASK-109）の成果物は `fandhe-container-core` 側に置かれ、本 crate ではない。
 //! PLUG-1 区分は core・plugin 双方が依存する境界基盤ライブラリ（crate-naming.md 決定 4）。

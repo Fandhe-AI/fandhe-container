@@ -1,8 +1,8 @@
-//! plugin 境界の UDS 転送層（PLUG-2・TASK-107.4・#248・MS-3）。
+//! plugin 境界の UDS 転送層（PLUG-2・TASK-107.4・#248・TASK-107.5・#249・MS-3）。
 //!
 //! core 側が plugin プロセスからの接続を待ち受ける `UdsListener`（bind / listen / accept）と、
-//! 受け付けた 1 接続を表す `UdsStream` を提供する。待ち受けは core 側（TASK-109・TASK-114）、
-//! 接続は plugin プロセス側（#249）が使う。フレーム符号化（#245・#247）は本型の `Read` / `Write`
+//! accept / connect で得た検証済み 1 接続を表す `UdsStream` を提供する。待ち受けは core 側
+//! （TASK-109・TASK-114）、接続（`UdsStream::connect`）は plugin プロセス側が使う。フレーム符号化（#245・#247）は本型の `Read` / `Write`
 //! の上に載る。
 //!
 //! # PLUG-12 の保護（本モジュールで実施する範囲）
@@ -28,12 +28,15 @@
 //! - accept した接続の peer credential（`SO_PEERCRED` / `getpeereid`。`crate::sys`）を検証し、
 //!   自 UID 以外は切断して `PermissionDenied` を返す
 //! - 受け付けた接続には既定の read / write 期限を付ける（REPAIR-5）
+//! - client 接続（`UdsStream::connect`）は connect 自体に期限を付け、接続直後に server の peer
+//!   credential を自 UID と照合する（不一致は 1 バイトも送らず切断。listener 側 accept と対称。
+//!   同一 UID の偽 listener は脅威モデル外。socket 配置ディレクトリの検証は client では行わない）
 //!
 //! # 未実装の範囲（REPAIR-3）
 //!
 //! - 自 UID 所有 stale socket の再 bind は TASK-123・TASK-124（PLUG-12）。本実装は既存パスを
 //!   一切 unlink せず `AlreadyExists` で拒否する
-//! - client 接続（#249）・ACK/RPC タイムアウト（#250）・gRPC（TASK-108）
+//! - ACK/RPC タイムアウト（#250）・gRPC（TASK-108）
 //!
 //! # cfg 方針
 //!
@@ -126,16 +129,34 @@ impl Drop for UdsListener {
     }
 }
 
-/// 受け付けた 1 接続（peer credential 検証済み。PLUG-12）。read / write には
+/// accept / connect で得た検証済み 1 接続（peer credential 検証済み。PLUG-12）。read / write には
 /// [`UDS_DEFAULT_IO_TIMEOUT`] の期限が付く（REPAIR-5）。
 ///
-/// #247 のフレーム符号化・#249 の client が載せられるよう `Read` / `Write` のみを提供する。
+/// #247 のフレーム符号化が載せられるよう `Read` / `Write` のみを提供する。
 #[derive(Debug)]
 pub struct UdsStream {
     inner: imp::StreamInner,
 }
 
 impl UdsStream {
+    /// plugin プロセス側から core の UDS（[`UdsListener::path`] が想定入力）へ期限付きで接続する
+    /// （PLUG-2・PLUG-12・REPAIR-5）。#250 の RPC 待機がこの接続の上に載る。
+    ///
+    /// `timeout` が 0 または [`UDS_ACCEPT_TIMEOUT_MAX`] 超なら `InvalidArgument`（#250 でタイムアウト型へ
+    /// 統合する可能性がある）。パスが空・内部 NUL・`sun_path` 超過の場合も `InvalidArgument`。
+    /// 存在しなければ `NotFound`、listener 不在の stale socket は `Unavailable`、権限不足は
+    /// `PermissionDenied`、期限切れ（backlog 満杯を含む）は `Timeout`。接続後に server の peer UID が
+    /// 自 UID でなければ切断して `PermissionDenied`、取得できない環境は `Unimplemented`（fail-closed）。
+    pub fn connect(path: &Path, timeout: Duration) -> Result<Self, PluginError> {
+        if timeout.is_zero() || timeout > UDS_ACCEPT_TIMEOUT_MAX {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                "connect timeout must be non-zero and within the maximum",
+            ));
+        }
+        imp::StreamInner::connect(path, timeout).map(|inner| Self { inner })
+    }
+
     /// read / write の期限を変更する。0 は `InvalidArgument`（無期限にしない。REPAIR-5）。
     pub fn set_io_timeout(&self, timeout: Duration) -> Result<(), PluginError> {
         self.inner.set_io_timeout(timeout)
@@ -180,9 +201,35 @@ fn map_bind_error(kind: io::ErrorKind) -> PluginError {
     PluginError::new(code, message)
 }
 
+/// `connect` の `io::Error` を `PluginError` へ写像する。パス・相手由来データはメッセージへ載せない。
+#[cfg_attr(not(unix), allow(dead_code))]
+fn map_connect_error(kind: io::ErrorKind) -> PluginError {
+    let (code, message) = match kind {
+        io::ErrorKind::NotFound => (PluginErrorCode::NotFound, "socket does not exist"),
+        io::ErrorKind::ConnectionRefused => (
+            PluginErrorCode::Unavailable,
+            "no listener is accepting on the socket",
+        ),
+        io::ErrorKind::PermissionDenied => (
+            PluginErrorCode::PermissionDenied,
+            "permission denied while connecting to socket",
+        ),
+        io::ErrorKind::InvalidInput => (PluginErrorCode::InvalidArgument, "invalid socket path"),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+            (PluginErrorCode::Timeout, "timed out connecting to socket")
+        }
+        io::ErrorKind::Unsupported => (
+            PluginErrorCode::Unimplemented,
+            "unix domain socket client is not supported on this platform",
+        ),
+        _ => (PluginErrorCode::Internal, "failed to connect to socket"),
+    };
+    PluginError::new(code, message)
+}
+
 #[cfg(unix)]
 mod imp {
-    use super::{UDS_DEFAULT_IO_TIMEOUT, map_bind_error};
+    use super::{UDS_DEFAULT_IO_TIMEOUT, map_bind_error, map_connect_error};
     use crate::error::{PluginError, PluginErrorCode};
     use crate::sys;
     use std::ffi::CString;
@@ -437,6 +484,27 @@ mod imp {
     }
 
     impl StreamInner {
+        /// 期限付き connect → server の peer UID 照合 → blocking 化 → 既定 I/O 期限の付与。
+        pub(super) fn connect(path: &Path, timeout: Duration) -> Result<Self, PluginError> {
+            check_sun_path_len(path)?;
+            let deadline = Instant::now() + timeout;
+            let stream =
+                sys::connect_unix(path, deadline).map_err(|e| map_connect_error(e.kind()))?;
+            // 偽 listener への誘導対策（PLUG-12）。不一致・取得不能は何も送らず drop で切断する。
+            if sys::peer_uid(&stream)? != sys::effective_uid() {
+                return Err(denied("peer credential does not match the current user"));
+            }
+            stream.set_nonblocking(false).map_err(|_| {
+                PluginError::new(
+                    PluginErrorCode::Internal,
+                    "failed to configure connected stream",
+                )
+            })?;
+            let inner = Self { stream };
+            inner.set_io_timeout(UDS_DEFAULT_IO_TIMEOUT)?;
+            Ok(inner)
+        }
+
         pub(super) fn set_io_timeout(&self, timeout: Duration) -> Result<(), PluginError> {
             if timeout.is_zero() {
                 return Err(PluginError::new(
@@ -493,6 +561,12 @@ mod imp {
     }
 
     impl StreamInner {
+        pub(super) fn connect(_path: &Path, _timeout: Duration) -> Result<Self, PluginError> {
+            Err(PluginError::new(
+                PluginErrorCode::Unimplemented,
+                "unix domain socket client is not supported on this platform",
+            ))
+        }
         pub(super) fn set_io_timeout(&self, _timeout: Duration) -> Result<(), PluginError> {
             match *self {}
         }
@@ -530,6 +604,33 @@ mod tests {
         ];
         for (kind, code) in cases {
             assert_eq!(map_bind_error(kind).code(), code);
+        }
+    }
+
+    /// PLUG-2: connect の ErrorKind 写像（具体値で照合）。
+    #[test]
+    fn plug2_map_connect_error_maps_io_error_kinds() {
+        let cases = [
+            (io::ErrorKind::NotFound, PluginErrorCode::NotFound),
+            (
+                io::ErrorKind::ConnectionRefused,
+                PluginErrorCode::Unavailable,
+            ),
+            (
+                io::ErrorKind::PermissionDenied,
+                PluginErrorCode::PermissionDenied,
+            ),
+            (
+                io::ErrorKind::InvalidInput,
+                PluginErrorCode::InvalidArgument,
+            ),
+            (io::ErrorKind::WouldBlock, PluginErrorCode::Timeout),
+            (io::ErrorKind::TimedOut, PluginErrorCode::Timeout),
+            (io::ErrorKind::Unsupported, PluginErrorCode::Unimplemented),
+            (io::ErrorKind::Other, PluginErrorCode::Internal),
+        ];
+        for (kind, code) in cases {
+            assert_eq!(map_connect_error(kind).code(), code);
         }
     }
 

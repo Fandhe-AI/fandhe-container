@@ -18,7 +18,7 @@ mod socket {
     use std::time::Duration;
 
     use crate::error::{NetError, NetErrorCode};
-    use crate::netlink::{MAX_MESSAGE_LEN, NLMSG_HEADER_LEN};
+    use crate::netlink::{MAX_MESSAGE_LEN, NLMSG_HEADER_LEN, NlMsgHeader};
     use crate::sys::{self, SysError};
 
     /// 受信バッファの固定上限（バイト）。カーネルの申告長に応じた再確保はしない（無制限確保の防止）。
@@ -54,7 +54,7 @@ mod socket {
 
         /// `message`（`NlMsgBuilder` で組んだ 1 メッセージ）をそのままカーネルへ送る。
         ///
-        /// 空・`NLMSG_HEADER_LEN` 未満・`MAX_MESSAGE_LEN` 超は `InvalidArgument`。部分送信は `DataLoss`。
+        /// 空・`NLMSG_HEADER_LEN` 未満・`MAX_MESSAGE_LEN` 超、および `nlmsg_len` が実長と一致しない（複数メッセージ連結を含む）入力は `InvalidArgument`。部分送信は `DataLoss`。
         pub fn send(&self, message: &[u8]) -> Result<(), NetError> {
             if message.len() < NLMSG_HEADER_LEN || message.len() > MAX_MESSAGE_LEN as usize {
                 return Err(NetError::new(
@@ -64,6 +64,21 @@ mod socket {
                         message.len(),
                         NLMSG_HEADER_LEN,
                         MAX_MESSAGE_LEN
+                    ),
+                ));
+            }
+            // 単一メッセージの契約を型ではなく送信前検証で保証する（REPAIR-2）。
+            // 復号できない・nlmsg_len が実長と不一致（短い=複数メッセージ連結、長い=切り詰め）は渡さない。
+            let header = NlMsgHeader::decode(message).map_err(|e| {
+                NetError::new(NetErrorCode::InvalidArgument, e.message().to_string())
+            })?;
+            if header.len() as usize != message.len() {
+                return Err(NetError::new(
+                    NetErrorCode::InvalidArgument,
+                    format!(
+                        "nlmsg_len {} does not match buffer length {} (single message required)",
+                        header.len(),
+                        message.len()
                     ),
                 ));
             }
@@ -175,6 +190,32 @@ mod socket {
                 let e = s.send(&vec![0u8; len]).expect_err("must reject");
                 assert_eq!(e.code(), NetErrorCode::InvalidArgument, "len {len}");
             }
+        }
+
+        /// NET-11・REPAIR-2: nlmsg_len と実長の不一致・複数メッセージ連結は送信前に拒否する。
+        #[test]
+        fn send_rejects_mismatched_header_len() {
+            use crate::netlink::NlMsgBuilder;
+            let s = NetlinkRouteSocket::open().expect("open");
+            let one = NlMsgBuilder::new(18, crate::netlink::NLM_F_REQUEST, 1, 0)
+                .finish()
+                .expect("finish");
+            assert_eq!(one.len(), NLMSG_HEADER_LEN);
+            // 2 メッセージ連結（先頭の nlmsg_len は 16 のまま実長 32）。
+            let mut two = one.clone();
+            two.extend_from_slice(&one);
+            let e = s.send(&two).expect_err("must reject");
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+            // ヘッダ長が実長より大きい。
+            let mut long_hdr = one.clone();
+            long_hdr[0..4].copy_from_slice(&32u32.to_ne_bytes());
+            let e = s.send(&long_hdr).expect_err("must reject");
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+            // ヘッダ長が 16 未満。
+            let mut short_hdr = one;
+            short_hdr[0..4].copy_from_slice(&8u32.to_ne_bytes());
+            let e = s.send(&short_hdr).expect_err("must reject");
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
         }
     }
 }

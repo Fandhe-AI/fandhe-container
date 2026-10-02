@@ -530,7 +530,7 @@ mod imp {
         /// 配置ディレクトリ内の socket 名（NUL を含まない）。
         name: CString,
         /// bind 排他ロック（listener の生存期間中保持し、stale 判定の根拠になる。TASK-123.2）。
-        _lock: crate::uds_security::BindLock,
+        lock: crate::uds_security::BindLock,
         /// socket の公開パス（検証済み配置ディレクトリの `canonicalize` 結果＋socket 名。
         /// `UdsListener::path` が返す。PLUG-12）。Linux 以外では identity 取得の縮退にも使う。
         path: PathBuf,
@@ -560,22 +560,11 @@ mod imp {
             check_sun_path_len(&target)?;
             // 既存エントリの lstat 検証と、自 UID 所有の stale socket の削除（PLUG-12・TASK-123.2）。
             // 生存判定は接続 probe でなく sibling lock の flock（既存 listener に副作用を与えない）。
+            // 以降で失敗してもロックファイルは削除しない（flock 保持中の unlink は排他を崩す。残った
+            // ロックファイルは記録が無い限り管理下の証拠にならない。`BindLock` の doc 参照）。
             let lock = crate::uds_security::acquire_bind_lock(&dir, &name, euid)?;
-            // 以降の失敗では、今回新規作成したロックファイルを残さない（後から別経路が作った
-            // socket を管理下と誤認させない）。
-            if let Err(e) =
-                crate::uds_security::clear_stale_socket(&dir, &name, &bound, euid, &lock)
-            {
-                lock.discard_if_created(&dir);
-                return Err(e);
-            }
-            let listener = match UnixListener::bind(&target) {
-                Ok(l) => l,
-                Err(e) => {
-                    lock.discard_if_created(&dir);
-                    return Err(map_bind_error(e.kind()));
-                }
-            };
+            crate::uds_security::clear_stale_socket(&dir, &name, &bound, euid, &lock)?;
+            let listener = UnixListener::bind(&target).map_err(|e| map_bind_error(e.kind()))?;
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
             let identity = sys::lstat_at(&dir, &name, &bound).ok();
             // 管理下の証拠として socket の同一性をロックへ記録する（記録できなければ次回は stale
@@ -587,7 +576,7 @@ mod imp {
                 listener,
                 dir,
                 name,
-                _lock: lock,
+                lock,
                 path: bound,
                 identity,
                 euid,
@@ -685,16 +674,28 @@ mod imp {
 
         /// 検証済みディレクトリ fd 基準で、bind 時と同一性（dev/ino）が一致する socket のみ
         /// unlink する（best-effort）。Linux では照合も削除もパスを再解決しない。
+        ///
+        /// ロックの記録（管理下の証拠。TASK-123.2）は、記録した socket がパス上から無くなったと
+        /// 確認できた後にだけ消す。先に消すと、unlink の失敗や途中の異常終了で socket だけが残り、
+        /// 以後の bind が stale と判定できず常に `AlreadyExists` になるため。socket が残る場合
+        /// （unlink 失敗・確認不能）は記録も残し、次回の bind が削除できるようにする。
         pub(super) fn cleanup(&self) {
-            // 正常終了では記録を消し、残ったロックファイルが後続の socket を管理下と誤認させない。
-            self._lock.clear_record();
+            // identity が無い場合は記録も書いていない（`bind` 参照）ため何もしない。
             let Some(expected) = self.identity else {
                 return;
             };
-            if let Ok(now) = sys::lstat_at(&self.dir, &self.name, &self.path)
-                && now == expected
-            {
-                let _ = sys::unlinkat(&self.dir, &self.name);
+            let gone = match sys::lstat_at(&self.dir, &self.name, &self.path) {
+                Ok(now) if now == expected => match sys::unlinkat(&self.dir, &self.name) {
+                    Ok(()) => true,
+                    Err(e) => e.kind() == io::ErrorKind::NotFound,
+                },
+                // 別のエントリへ差し替え済み: 自分の socket はパス上に無い。記録を残すと inode 番号の
+                // 再利用で別の socket を管理下と誤認し得るため消す（差し替え後のエントリには触れない）。
+                Ok(_) => true,
+                Err(e) => e.kind() == io::ErrorKind::NotFound,
+            };
+            if gone {
+                self.lock.clear_record();
             }
         }
     }

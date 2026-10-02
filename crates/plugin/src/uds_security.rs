@@ -36,6 +36,14 @@
 //!   ファイルの存在は根拠にしない）は削除せず `AlreadyExists`。ロックを取れて
 //!   管理下の自 UID 所有 socket だけを、再 lstat で同一性（dev / ino / uid / 種別）を確認したうえで
 //!   `unlinkat` し、再 bind を可能にする。
+//!   ロックファイルは一度作ったら削除しない（flock 保持中・解放直後の unlink は、別の bind が別 inode の
+//!   ロックを取得できて排他が崩れるため）。記録は listener の後始末で socket がパス上から無くなったと
+//!   確認できた後にだけ消す（unlink に失敗して socket が残る場合は記録も残し、次回 bind で削除できる）。
+//!   fork した子は socket fd と一緒にロック fd も継承するため、子が持つ間は生存中として扱う
+//!   （`BindLock` の doc 参照）。
+//!   残余: bind 成功から記録書き込みまでの間に異常終了すると記録の無い socket が残り、以後は
+//!   `AlreadyExists`（手動削除が必要。fail-closed）。記録が残った状態で同一 UID の別経路が socket を
+//!   差し替え、inode 番号が再利用された場合は管理下と誤認し得る（同一 UID の操作のみ。脅威モデル外）。
 //!   残余: 再確認から unlink までの窓で差し替えられるのは 0700 ディレクトリ内の同一 UID のみ
 //!   （脅威モデル外）。macOS は lstat がパス縮退のため窓がやや広い。
 //! - socket の 0600 化は [`crate::UdsListener::bind`] が検証済みディレクトリ fd 基準の
@@ -481,16 +489,22 @@ mod imp {
     /// 「以前の保持者はもういない」の証拠になる。接続 probe は使わない（macOS では accept queue 満杯の
     /// 生存 listener にも ECONNREFUSED が返り stale と区別できず、probe 接続が相手の accept queue に
     /// 残る副作用もあるため）。
+    ///
+    /// # ロックファイルは削除しない
+    /// 一度作った `<socket 名>.lock` は bind 失敗時・正常終了時とも unlink しない。flock 保持中や
+    /// 解放直後に unlink すると、別の bind が同名の新しい inode を作って別々のロックを取得でき、
+    /// 排他が崩れるため。残ったロックファイルは「管理下の証拠」にはならない（証拠は下記の記録と
+    /// socket の同一性の一致だけ）ので、残しても別経路の socket を誤って削除しない。
+    ///
+    /// # fork
+    /// flock は open file description に紐付くため、fork した子は listener の socket fd と一緒に
+    /// ロック fd も継承する（どちらも `O_CLOEXEC` で exec 時に閉じる）。子が両方を持つ間は socket も
+    /// 実際に接続可能なので stale ではなく、再 bind は `AlreadyExists` になる（fail-closed）。
+    /// 子側のロックだけを外すと、生存中の socket を stale と誤認して削除し得るため行わない。
     #[derive(Debug)]
     pub(crate) struct BindLock {
-        /// fork の子へのロック継承を防ぐ登録（`_file` より先に drop される順序で置く）。
-        _fork_guard: crate::sys::ForkGuard,
         /// flock を保持する fd（drop で解放）。
-        _file: File,
-        /// ロックファイル名（unmanaged 判定時の後始末用）。
-        lock_name: std::ffi::CString,
-        /// 以前の保持者が作ったロックファイルが残っていたか（false なら今回新規作成）。
-        preexisting: bool,
+        file: File,
     }
 
     /// ロックファイルへ書く「この socket は自分が bind した」記録の接頭辞（版付き）。
@@ -502,21 +516,24 @@ mod imp {
         /// （他実装・別経路が同じパスに bind した socket を誤って削除しない。PLUG-12）。
         pub(crate) fn record_socket(&self, ident: &crate::sys::FileIdent) -> io::Result<()> {
             use std::os::unix::fs::FileExt;
-            self._file.set_len(0)?;
+            self.file.set_len(0)?;
             let text = format!("{RECORD_PREFIX} {} {}\n", ident.dev, ident.ino);
-            self._file.write_all_at(text.as_bytes(), 0)
+            self.file.write_all_at(text.as_bytes(), 0)
         }
 
-        /// 記録を消す（正常終了時。以後この socket 名の再利用で残骸が管理下と誤認されない）。
+        /// 記録を消す。記録した socket がパス上から無くなったと確認できた後にだけ呼ぶ
+        /// （[`crate::transport::UdsListener`] の後始末で unlink 成功・不在・別 inode への差し替えを
+        /// 確認した後）。socket が残る場合は記録も残し、次回の bind が stale として削除できるようにする。
+        /// 消去に失敗しても記録が残るだけで、対象 inode が既に無いため削除対象は生じない。
         pub(crate) fn clear_record(&self) {
-            let _ = self._file.set_len(0);
+            let _ = self.file.set_len(0);
         }
 
         /// 記録された (dev, ino)。無い・壊れている場合は None（管理下と見なさない）。
         fn recorded(&self) -> Option<(u64, u64)> {
             use std::os::unix::fs::FileExt;
             let mut buf = [0u8; 96];
-            let n = self._file.read_at(&mut buf, 0).ok()?;
+            let n = self.file.read_at(&mut buf, 0).ok()?;
             let text = std::str::from_utf8(buf.get(..n)?).ok()?;
             let mut it = text.split_whitespace();
             if it.next()? != RECORD_PREFIX {
@@ -525,14 +542,6 @@ mod imp {
             let dev = it.next()?.parse().ok()?;
             let ino = it.next()?.parse().ok()?;
             Some((dev, ino))
-        }
-
-        /// 今回新規作成したロックファイルだけを削除する（bind 失敗時の後始末。以前の保持者が
-        /// 作った残骸は他の判定に使われ得るため触らない）。
-        pub(crate) fn discard_if_created(&self, dir: &File) {
-            if !self.preexisting {
-                let _ = crate::sys::unlinkat(dir, &self.lock_name);
-            }
         }
     }
 
@@ -575,24 +584,17 @@ mod imp {
             )
         })?;
         if !meta.is_file() || meta.uid() != euid {
-            if handle.created {
-                let _ = crate::sys::unlinkat(dir, &lock_name);
-            }
             return Err(err(
                 PluginErrorCode::PermissionDenied,
                 "socket lock file is not owned by the current user",
             ));
         }
-        let lock = BindLock {
-            _fork_guard: handle.fork_guard,
-            _file: handle.file,
-            lock_name,
-            preexisting: !handle.created,
-        };
+        let preexisting = !handle.created;
+        let lock = BindLock { file: handle.file };
         // 既存ファイルは「専用ロックファイル」と確認できたものだけ受け入れる。ハードリンクされた
         // 他ファイル・無関係な既存ファイルを `record_socket` の `set_len(0)` で破壊しないため、
         // 単一リンク（nlink == 1）かつ、空または本実装の記録形式（接頭辞付き・小サイズ）のみ許可する。
-        if lock.preexisting {
+        if preexisting {
             let valid = meta.nlink() == 1
                 && meta.len() <= 96
                 && (meta.len() == 0 || lock.recorded().is_some());

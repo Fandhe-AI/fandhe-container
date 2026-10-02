@@ -16,13 +16,15 @@
 //!   基準で呼ぶ（パス再解決による TOCTOU を避ける。PLUG-12）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_NOFOLLOW | O_DIRECTORY)` で配置ディレクトリを
 //!   ルートから 1 要素ずつ辿る（祖先要素の symlink を拒否。PLUG-12）
+//! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_CREAT | O_NOFOLLOW)` で bind ロックファイルを開く
+//!   （排他ロック自体は std の `File::try_lock`。fork 用のコールバック登録は行わない。PLUG-12・TASK-123.2）
 //! - client connect（#249）: `socket(2)` / `connect(2)`（macOS は `fcntl(F_SETFD)` も）で非ブロッキング接続を期限までリトライする（REPAIR-5）。
 //!   対応外の OS・アーキテクチャは `Unsupported`
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`connect_unix`]（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`connect_unix`]（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 
@@ -312,7 +314,7 @@ const AT_FDCWD: i32 = -2;
 ))]
 unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: POSIX の `int openat(int, const char *, int, ...)` と同じ型・幅。
-    // O_CREAT を使わないため可変長引数（mode）は渡さない。
+    // 可変長引数（mode）は O_CREAT を使う `lock_file_at` だけが渡す（他は渡さない）。
     #[link_name = "openat"]
     fn c_openat(dirfd: i32, path: *const core::ffi::c_char, flags: i32, ...) -> i32;
 }
@@ -380,12 +382,19 @@ pub(crate) fn open_dir_nofollow(abs: &std::path::Path) -> io::Result<File> {
     }
 }
 
-// ロックファイル作成用の open(2) フラグ（値は OS ごとに異なる。Linux は x86_64 / aarch64 共通）。
-#[cfg(target_os = "linux")]
+// ロックファイル作成用の open(2) フラグ。値は OS ごとに異なる。Linux の 3 値は asm-generic の既定値で、
+// x86_64・aarch64 とも上書きしないため同値だが、流用せず対応アーキテクチャごとに定義する。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_RDWR: i32 = 0o2;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_CREAT: i32 = 0o100;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_EXCL: i32 = 0o200;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_RDWR: i32 = 0o2;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_CREAT: i32 = 0o100;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const O_EXCL: i32 = 0o200;
 #[cfg(target_os = "macos")]
 const O_RDWR: i32 = 0x2;
@@ -394,138 +403,25 @@ const O_CREAT: i32 = 0x200;
 #[cfg(target_os = "macos")]
 const O_EXCL: i32 = 0x800;
 
-// flock(2) の operation（Linux・macOS 共通値）。
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-const LOCK_EX: i32 = 2;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-const LOCK_NB: i32 = 4;
-
-#[cfg(any(
-    target_os = "macos",
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )
-))]
-unsafe extern "C" {
-    // SAFETY（宣言そのものの妥当性）: BSD / glibc / musl の `int flock(int, int)` と同じ型・幅。
-    fn flock(fd: i32, operation: i32) -> i32;
-}
-
-#[cfg(any(
-    target_os = "macos",
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )
-))]
-mod forkguard {
-    //! fork した子プロセスにロック fd を継承させない仕組み（PLUG-12・TASK-123.2）。
-    //!
-    //! `flock` は open file description に紐付くため、`O_CLOEXEC`（exec 時のみ有効）では fork だけの
-    //! 子がロックを保持し続け、親の終了後も再 bind が `AlreadyExists` になる。登録した fd を
-    //! `pthread_atfork` の child ハンドラで `/dev/null` に差し替え、子側のコピーを閉じる
-    //! （親の fd は影響を受けない）。ハンドラ内は async-signal-safe な呼び出しとアトミックのみ。
-    use super::{AT_FDCWD, O_CLOEXEC, O_RDWR, c_openat};
-    use std::sync::Once;
-    use std::sync::atomic::{AtomicI32, Ordering};
-
-    const SLOTS: usize = 64;
-    static REGISTRY: [AtomicI32; SLOTS] = [const { AtomicI32::new(-1) }; SLOTS];
-    static INSTALL: Once = Once::new();
-
-    unsafe extern "C" {
-        // SAFETY（宣言そのものの妥当性）: POSIX の `int pthread_atfork(void (*)(void), void (*)(void), void (*)(void))`。
-        fn pthread_atfork(
-            prepare: Option<extern "C" fn()>,
-            parent: Option<extern "C" fn()>,
-            child: Option<extern "C" fn()>,
-        ) -> i32;
-        // SAFETY（宣言そのものの妥当性）: POSIX の `int dup2(int, int)` / `int close(int)`。
-        fn dup2(oldfd: i32, newfd: i32) -> i32;
-        fn close(fd: i32) -> i32;
-    }
-
-    extern "C" fn on_fork_child() {
-        for slot in REGISTRY.iter() {
-            let fd = slot.load(Ordering::Relaxed);
-            if fd < 0 {
-                continue;
-            }
-            // SAFETY: fork 直後の子で、登録済み fd（親が有効な間のみ登録）を自プロセス内で差し替える
-            // だけ。open / dup2 / close は async-signal-safe。`/dev/null` の NUL 終端リテラルを渡す。
-            unsafe {
-                let n = c_openat(AT_FDCWD, c"/dev/null".as_ptr(), O_RDWR | O_CLOEXEC);
-                if n >= 0 {
-                    dup2(n, fd);
-                    close(n);
-                } else {
-                    close(fd);
-                }
-            }
-            slot.store(-1, Ordering::Relaxed);
-        }
-    }
-
-    /// 登録中の fd が fork の子へ継承されないよう保護する。drop で登録を外す。
-    #[derive(Debug)]
-    pub(crate) struct ForkGuard(usize);
-
-    impl ForkGuard {
-        pub(crate) fn register(fd: i32) -> Option<Self> {
-            INSTALL.call_once(|| {
-                // SAFETY: 引数は `extern "C"` の有効な関数ポインタ（prepare / parent は None）。
-                let _ = unsafe { pthread_atfork(None, None, Some(on_fork_child)) };
-            });
-            REGISTRY
-                .iter()
-                .enumerate()
-                .find(|(_, s)| {
-                    s.compare_exchange(-1, fd, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()
-                })
-                .map(|(i, _)| Self(i))
-        }
-    }
-
-    impl Drop for ForkGuard {
-        fn drop(&mut self) {
-            if let Some(s) = REGISTRY.get(self.0) {
-                s.store(-1, Ordering::Release);
-            }
-        }
-    }
-}
-
-#[cfg(not(any(
-    target_os = "macos",
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )
-)))]
-mod forkguard {
-    #[derive(Debug)]
-    pub(crate) struct ForkGuard;
-}
-
-pub(crate) use forkguard::ForkGuard;
-
 /// ロックファイルの取得結果（PLUG-12・TASK-123.2）。
 #[derive(Debug)]
 pub(crate) struct LockHandle {
-    /// fork の子へのロック継承を防ぐ登録（`file` より先に drop されるよう前に置く）。
-    pub fork_guard: ForkGuard,
-    /// 排他 flock を保持する fd。drop（プロセス終了・クラッシュ含む）で kernel が解放する。
+    /// 排他ロック（`flock`）を保持する fd。close（プロセス終了・クラッシュ含む）で kernel が解放する。
     pub file: File,
     /// 今回の呼び出しで新規作成したか（false なら以前の保持者が作ったロックファイルが残っていた）。
     pub created: bool,
 }
 
-/// `dir` 基準で `name` のロックファイルを `O_NOFOLLOW`・0600 で開き（無ければ作成）、非ブロッキングで
-/// 排他 `flock` を取る。他者が保持中なら `WouldBlock`。listener の生存判定に接続 probe を使わず、
-/// 「ロックを取れる＝以前の保持者は消えた」で stale を判定するための基盤（既存 listener の
+/// `dir` 基準で `name` のロックファイルを `O_NOFOLLOW | O_CLOEXEC`・0600 で開き（無ければ作成）、
+/// 非ブロッキングで排他ロックを取る。他者が保持中なら `WouldBlock`。listener の生存判定に接続 probe を
+/// 使わず、「ロックを取れる＝以前の保持者は消えた」で stale を判定するための基盤（既存 listener の
 /// accept queue に副作用を与えない。PLUG-12）。未対応の OS・アーキテクチャは `Unsupported`。
+///
+/// ロックは std の [`File::try_lock`]（Linux・macOS は `flock(2)`）で取り、FFI は `openat` だけに
+/// 留める。`flock` は open file description に紐付くため、fork した子は listener の socket fd と
+/// 同じくロック fd も継承する（どちらも `O_CLOEXEC` で exec 時に閉じる）。子が両方を持ち続ける間は
+/// socket も実際に接続可能なので、ロック保持＝listener 生存という対応は fork をまたいでも崩れない。
+/// そのため fork 時に子側のロックだけを外す仕組み（`pthread_atfork` 等）は持たない。
 pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
     #[cfg(any(
         target_os = "macos",
@@ -535,41 +431,36 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
         )
     ))]
     {
-        let open = |flags: i32| -> io::Result<i32> {
-            // SAFETY: fd は `&File` の借用中のため有効。`name` は NUL 終端の有効な C 文字列。
+        let open = |flags: i32| -> io::Result<File> {
+            // SAFETY: `dir` は `&File` の借用中のため fd は有効。`name` は NUL 終端の有効な C 文字列。
+            // O_CREAT を含むため、可変長引数として mode（C の既定引数昇格後の `unsigned int` 幅）を
+            // 1 つ渡す。openat は渡したポインタを呼び出し中しか参照しない。
             let fd = unsafe {
                 c_openat(
                     dir.as_raw_fd(),
                     name.as_ptr(),
                     flags | O_NOFOLLOW | O_CLOEXEC,
-                    0o600u32, // O_CREAT 時の mode（C の unsigned int 幅）
+                    0o600u32,
                 )
             };
             if fd < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(fd)
+                return Err(io::Error::last_os_error());
             }
+            // SAFETY: `fd` は直前の openat が返した、他に所有者のいない有効な fd（非負を確認済み）。
+            Ok(unsafe { File::from_raw_fd(fd) })
         };
-        let (fd, created) = match open(O_RDWR | O_CREAT | O_EXCL) {
-            Ok(fd) => (fd, true),
+        let (file, created) = match open(O_RDWR | O_CREAT | O_EXCL) {
+            Ok(f) => (f, true),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (open(O_RDWR | O_CREAT)?, false),
             Err(e) => return Err(e),
         };
-        // SAFETY: `fd` は直前の openat が返した、他に所有者のいない有効な fd（非負を確認済み）。
-        let file = unsafe { File::from_raw_fd(fd) };
-        // SAFETY: `file` が fd を所有し続ける間は有効。flock は fd 以外のメモリを触らない。
-        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
+        match file.try_lock() {
+            Ok(()) => Ok(LockHandle { file, created }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
         }
-        let fork_guard = ForkGuard::register(file.as_raw_fd())
-            .ok_or_else(|| io::Error::other("fork guard registry is full"))?;
-        Ok(LockHandle {
-            fork_guard,
-            file,
-            created,
-        })
     }
     #[cfg(not(any(
         target_os = "macos",

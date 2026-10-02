@@ -81,10 +81,21 @@
 //!   user namespace 外の uid は overflowuid として見え、不一致で拒否される（安全側）。
 //! - 同一 UID の別プロセスは脅威モデル外（第 1 層は 0700 の配置ディレクトリ）。
 //! - `unsafe` を含む取得処理は `crate::sys::peer_uid`（`sys` モジュール）に閉じる。
-//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。未実装は Windows の文書化（#294）・別 UID 実接続の拒否試験（#295）・拒否の監査ログ（SEC-4）。
+//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。未実装は別 UID 実接続の拒否試験（#295）・拒否の監査ログ（SEC-4）。
 //!
-//! # 未実装（REPAIR-3）
-//! - 非 unix は `Unimplemented`（Windows は WIN-1 により WSL2 内の Linux 側機構に乗る）。
+//! # Windows に固有の peer 認証を持たない理由（WIN-1・PLUG-12。TASK-124.3・#294）
+//! 「未実装の残件」ではなく、設計上この crate に Win32 向け実装を置かない判断である。
+//! - 対応関係: PLUG-12 は Windows バックエンドを WIN-1（WSL2 経由を MVP 主経路とする）により
+//!   Linux 側の機構に乗せると定める。plugin プロセスと UDS は WSL2 内の Linux 環境で動くため、
+//!   実際に実行される peer 検証は上記の Linux 経路（`verify_peer` → `crate::sys::peer_uid`）である。
+//! - 非 unix ビルドの挙動: `sys` は `cfg(unix)` 限定でコンパイルされず、配置ディレクトリ検証（`RuntimeDir` 系）と
+//!   `UdsListener::bind` は `Unimplemented` を返す（fail-closed。接続を一切作らない）。
+//!   これはデプロイ経路ではないビルドが安全側に倒れることを示すもので、エラー文言の
+//!   "not implemented for this platform" と本節の「実装不要」は矛盾しない。
+//! - 保証の範囲: Windows ホスト側の保護を主張するものではない。保護の根拠は WSL2 内で Linux の検証が動くことだけである。
+//! - 将来仕様（REPAIR-3）: WSL2 を経由しない Windows 経路（Hyper-V 直接方式など。MVP 外。`docs/architecture.md` 参照）を
+//!   採る場合は、Windows 固有の peer 認証を新規に設計する必要があり、本節の前提は成り立たない。
+//! - 関連: Windows 側の plugin 化（TASK-116 `fandhe-container-plugin-windows`）は、PLUG-12 を満たしたこの UDS を使う側である。
 
 use std::path::{Component, Path, PathBuf};
 

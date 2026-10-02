@@ -279,6 +279,31 @@ mod unix {
         );
     }
 
+    /// PLUG-2: 短い symlink 経由で長い実体ディレクトリを指定し、公開パス（解決後）が `sun_path`
+    /// の長さ制限を超える場合は、socket を作らず `InvalidArgument` で拒否する（bind できても
+    /// `path()` で接続できない構成を作らない）。
+    #[test]
+    fn plug2_bind_rejects_public_path_exceeding_sun_path_limit() {
+        let dir = TempDir::new();
+        // 実体側の 1 要素だけで Linux（108）・macOS（104）の制限を超える長さにする。
+        let long = dir.0.join("a".repeat(120));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&long)
+            .unwrap();
+        let inner = long.join("i");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&inner)
+            .unwrap();
+        let link = dir.0.join("l");
+        std::os::unix::fs::symlink(&long, &link).unwrap();
+        let e = UdsListener::bind(&link.join("i").join("s.sock")).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "socket path is too long");
+        assert!(!inner.join("s.sock").exists());
+    }
+
     /// PLUG-2・PLUG-12: path() は配置ディレクトリを解決した絶対パス＋socket 名で保持される
     /// （相対指定でも Drop 時の cwd に依存しない）。
     #[test]

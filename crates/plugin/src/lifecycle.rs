@@ -10,8 +10,13 @@
 //!   socket の絶対パスは環境変数 [`PLUGIN_SOCKET_ENV`] で子へ渡す（暫定契約。spec 未規定）。
 //! - spawn から応答受信までは [`OneShotTimeout`] の合計期限で打ち切る（REPAIR-5）。応答後の自発終了
 //!   待ちは別枠の [`ONE_SHOT_EXIT_TIMEOUT`]。猶予内に終了しなければ強制終了する。
-//! - [`call_once`] が戻った（`Ok` / `Err` いずれの）時点で、直接起動した子プロセスは kill または
-//!   wait で回収済み。
+//! - 子プロセスの回収: [`call_once`] が `Ok` を返した時点で、直接起動した子は wait または kill で
+//!   回収済み。`Err` の場合も、返す前に必ず kill と [`ONE_SHOT_REAP_TIMEOUT`] までの回収を試みる。
+//!   回収を確認できなかった場合に限り、`Internal`（メッセージに `could not be reaped` と子の pid を
+//!   含む）を元のエラーに代えて返す。このとき子は残っている可能性があり（孤児・ゾンビ）、呼び出し側は
+//!   その pid を未回収として扱う。ハンドルは保持したまま戻る直前（ガードの `Drop`）にもう一度だけ
+//!   期限つきで回収を試みるが、それでも回収できなければハンドルを手放す（プロセス終了時に OS が
+//!   引き取る。未回収の経路は最大で `ONE_SHOT_REAP_TIMEOUT` の 2 倍を要する）。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
 //!   stdin / stdout は null。stderr は親へ継承させず、専用の pipe で受けて [`OneShotStderr`] として
 //!   返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は読み捨てて件数だけ数える）。
@@ -310,7 +315,11 @@ impl OneShotOutcome {
     }
 }
 
-/// 子プロセスを保持し、Drop で必ず kill・回収するガード（全エラー経路で孤児を残さない）。
+/// 子プロセスを保持し、Drop で kill・回収を試みるガード（早期 return でも kill を必ず試みる）。
+///
+/// 回収の成否を呼び出し側へ返す責務は明示的な [`Self::kill_and_reap`] / [`Self::wait_or_kill`] の
+/// 呼び出しが担う。`Drop` はその後の最終試行で、未回収のままなら `Child` を手放す（モジュール冒頭の
+/// 契約のとおり、その場合は `Internal` を返して子が残り得ることを呼び出し側へ伝えている）。
 struct ChildGuard(Option<Child>);
 
 impl ChildGuard {
@@ -490,7 +499,8 @@ fn spawn_error(e: &io::Error) -> PluginError {
 /// 接続を閉じて子の終了を待つ。spawn から応答受信までが `timeout` の合計期限。接続前に子が
 /// 終了した場合は期限を待たず `Unavailable`。応答は得たが子が [`ONE_SHOT_EXIT_TIMEOUT`] 内に
 /// 終了しなかった場合は強制終了し、`Ok` と [`OneShotTermination::Killed`] を返す。応答後に非ゼロ・
-/// シグナルで終了した場合は `Unavailable`、回収を確認できない場合は `Internal` を返す。
+/// シグナルで終了した場合は `Unavailable`、回収を確認できない場合は `Internal` を返す（このときだけ
+/// 子が残っている可能性がある。メッセージに子の pid を含む。モジュール冒頭の契約を参照）。
 /// 非 unix では listener の bind が `Unimplemented` を返し、子は spawn されない。
 ///
 /// plugin の stderr は親へ継承させず [`OneShotOutcome::stderr`] で返す。本関数が親の stderr へ出す
@@ -650,14 +660,22 @@ fn reap_after_failure(guard: &mut ChildGuard, error: PluginError) -> PluginError
     if guard.kill_and_reap().is_reaped() {
         error
     } else {
-        PluginError::new(
-            PluginErrorCode::Internal,
-            "plugin process could not be reaped after a failed exchange",
-        )
+        unreaped_error(guard, "a failed exchange")
     }
 }
 
-/// 接続の受付・1 往復・子の回収を行う。戻る時点で子は回収済み、または回収失敗をエラーで返している。
+/// 回収を確認できなかった子についてのエラー（`Internal`）。呼び出し側が未回収の子を特定できるよう
+/// pid を含める（pid は自プロセスが起動した子のもので、外部入力ではない）。
+fn unreaped_error(guard: &ChildGuard, phase: &str) -> PluginError {
+    let message = match guard.pid() {
+        Some(pid) => format!("plugin process (pid {pid}) could not be reaped after {phase}"),
+        None => format!("plugin process could not be reaped after {phase}"),
+    };
+    PluginError::new(PluginErrorCode::Internal, message)
+}
+
+/// 接続の受付・1 往復・子の回収を行う。`Ok` で戻る時点で子は回収済み。回収を確認できなかった場合は
+/// `Internal`（[`unreaped_error`]）を返し、子のハンドルは `guard` に残る。
 fn exchange_and_reap(
     guard: &mut ChildGuard,
     listener: UdsListener,
@@ -698,10 +716,7 @@ fn exchange_and_reap(
     let termination = guard.wait_or_kill(ONE_SHOT_EXIT_TIMEOUT);
     // 回収を確認できない子（孤児の可能性）と異常終了（非ゼロ・シグナル）は成功扱いにしない（REPAIR-5・PLUG-7）。
     match termination {
-        OneShotTermination::Unreaped => Err(PluginError::new(
-            PluginErrorCode::Internal,
-            "plugin process could not be reaped after the response",
-        )),
+        OneShotTermination::Unreaped => Err(unreaped_error(guard, "the response")),
         OneShotTermination::Exited { code: Some(0) } | OneShotTermination::Killed => {
             Ok((response, termination))
         }
@@ -849,6 +864,34 @@ mod tests {
         assert_eq!(
             failing.wait_or_kill(Duration::from_secs(5)),
             OneShotTermination::Exited { code: Some(7) }
+        );
+    }
+
+    /// REPAIR-5・PLUG-7: 回収できなかった子のエラーは `Internal` で、未回収の pid を特定できる。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_unreaped_error_names_the_child_pid() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut guard = ChildGuard(Some(child));
+        let e = unreaped_error(&guard, "the response");
+        assert_eq!(e.code(), PluginErrorCode::Internal);
+        assert_eq!(
+            e.message(),
+            format!("plugin process (pid {pid}) could not be reaped after the response")
+        );
+        // 回収済み（ハンドルなし）の場合は pid を含めない。
+        assert!(guard.kill_and_reap().is_reaped());
+        let e = unreaped_error(&guard, "a failed exchange");
+        assert_eq!(
+            e.message(),
+            "plugin process could not be reaped after a failed exchange"
         );
     }
 

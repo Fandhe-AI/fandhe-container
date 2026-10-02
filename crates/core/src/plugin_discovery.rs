@@ -1,12 +1,12 @@
-//! 管理ディレクトリからの plugin 候補探索（TASK-109.1・PLUG-4・PLUG-11・MS-3）。
+//! 管理ディレクトリ・`PATH`（opt-in）からの plugin 候補探索（TASK-109.1・TASK-109.2・PLUG-4・PLUG-11・MS-3）。
 //!
 //! # 役割と呼び出し元
 //!
 //! core が plugin バイナリを発見・登録する機構（TASK-109）の最初の 1 片。既定の管理ディレクトリ
 //! （system / user）を走査し、`fandhe-container-plugin-*` の命名規約に合うファイルを **候補**
-//! として列挙するだけを担う。後続の `PATH` 探索の opt-in（#254・TASK-109.2）、レジストリと
-//! 同名候補の優先順位・登録（#255・TASK-109.3）、信頼性検証（TASK-122・PLUG-11）が本モジュールの
-//! 戻り値を入力に使う。`fandhe-container-plugin`（境界機構）には依存しない。
+//! として列挙するだけを担う。TASK-109.2（#254）で `PATH` 探索の opt-in と警告ログを加えた。
+//! 後続のレジストリと同名候補の優先順位・登録（#255・TASK-109.3）、信頼性検証（TASK-122・PLUG-11）が
+//! 本モジュールの戻り値を入力に使う。`fandhe-container-plugin`（境界機構）には依存しない。
 //!
 //! # 契約
 //!
@@ -15,7 +15,13 @@
 //! - 走査から検証・登録までの間にファイルは差し替わり得る（TOCTOU）。登録側は検証時に
 //!   再 stat・ハッシュ照合する前提で、本モジュールの結果を信頼の根拠にしない
 //! - symlink は辿らず [`PluginFileKind::Symlink`] として記録する。実体への検証は TASK-122 の責務
-//! - ファイルの中身は読まず、実行ビットも見ない。`PATH` は探索しない（opt-in は #254）
+//! - ファイルの中身は読まず、実行ビットも見ない
+//! - `PATH` は既定で探索しない。環境変数 [`PATH_SEARCH_ENV`]`=1` または呼び出し側が渡す
+//!   [`PathSearchPolicy::Enabled`] の opt-in があるときだけ探索し、`PATH` 上で見つけた候補 1 件
+//!   ごとに警告ログ 1 行を出す（[`PathSearchWarning`]）。**`PATH` 上の名前一致のみでは登録しない**
+//!   （`PluginDirKind::Path` の候補は未検証で、登録可否は TASK-122・#255 が決める）
+//! - CLI フラグ（opt-in の CLI 側入口）の配線は CLI 実装（TASK-79）で行う。未実装（REPAIR-3）。
+//!   CLI は `PathSearchPolicy::Enabled` を [`DiscoveryOptions`] 経由で渡す想定
 //! - 探索先ディレクトリが存在しない場合はエラーにせず候補なしとする。それ以外の I/O エラーは
 //!   握りつぶさず返す（fail-closed）
 //! - system と user に同名があれば両方返す。優先順位・重複解決は #255 の責務
@@ -27,9 +33,9 @@
 //! `<HOME>/.local/share/fandhe-container/plugins`）。macOS / Windows の「相当」パスは spec で
 //! 未確定のため空の探索先一覧を返す（エラーにしない。PLUG-11）。走査関数自体は 3 OS で動く。
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use crate::traits::{ErrorCode, TraitError};
@@ -39,6 +45,22 @@ pub const PLUGIN_NAME_PREFIX: &str = "fandhe-container-plugin-";
 
 /// 1 ディレクトリあたりの走査エントリ数の上限。超過は fail-closed で拒否する（無制限走査の防止）。
 pub const MAX_SCANNED_ENTRIES_PER_DIR: usize = 4096;
+
+/// `PATH` 探索時の 1 ディレクトリあたりの走査エントリ数の上限（`/usr/bin` 等は管理ディレクトリ用の
+/// 上限を超え得るため別に設ける）。超過は fail-closed で拒否する。
+pub const MAX_SCANNED_ENTRIES_PER_PATH_DIR: usize = 65536;
+
+/// `PATH` から採用するディレクトリ数の上限。超過は切り捨てず fail-closed で拒否する。
+pub const MAX_PATH_SEARCH_DIRS: usize = 256;
+
+/// `PATH` 探索を opt-in する環境変数名。値が厳密に `1` のときだけ有効（PLUG-11）。
+pub const PATH_SEARCH_ENV: &str = "FANDHE_CONTAINER_PLUGIN_PATH_SEARCH";
+
+/// `PATH` 候補の警告行 `code` フィールド値（機械可読。ERR 系の流儀）。
+pub const PATH_WARNING_CODE: &str = "PLUGIN_PATH_CANDIDATE";
+
+/// `PATH` 候補の警告行 `message` フィールド値（英語固定。名前一致のみでは登録しない旨を明記）。
+pub const PATH_WARNING_MESSAGE: &str = "plugin candidate found via PATH search; a name match on PATH alone is not registered (trust verification required)";
 
 /// plugin 名（接頭辞を除いた部分）の最大バイト数。
 const MAX_PLUGIN_NAME_LEN: usize = 64;
@@ -50,6 +72,35 @@ pub enum PluginDirKind {
     System,
     /// ユーザー単位の管理ディレクトリ。
     User,
+    /// `PATH` 由来（opt-in 時のみ）。未検証で、名前一致のみでは登録しない（PLUG-11・TASK-122）。
+    Path,
+}
+
+/// `PATH` 探索の可否（bool を避け将来の拡張に備える）。既定は [`PathSearchPolicy::Disabled`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PathSearchPolicy {
+    /// `PATH` を探索しない（既定）。
+    #[default]
+    Disabled,
+    /// `PATH` を探索し、発見ごとに警告を出す。
+    Enabled,
+}
+
+impl PathSearchPolicy {
+    /// 環境変数値から方針を決める純粋関数。厳密に `1` のときだけ `Enabled`。
+    /// 未設定・空・`0`・`true`・前後空白付き・非 UTF-8 などはすべて `Disabled`（fail-closed）。
+    pub fn from_env_value(value: Option<&OsStr>) -> Self {
+        if value == Some(OsStr::new("1")) {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    /// [`PATH_SEARCH_ENV`] を読んで方針を決める。
+    pub fn from_env() -> Self {
+        Self::from_env_value(std::env::var_os(PATH_SEARCH_ENV).as_deref())
+    }
 }
 
 /// 探索対象ディレクトリ 1 件。
@@ -187,7 +238,7 @@ pub fn default_search_dirs() -> Vec<PluginSearchDir> {
 pub fn discover_candidates(dirs: &[PluginSearchDir]) -> Result<Vec<PluginCandidate>, TraitError> {
     let mut found = Vec::new();
     for dir in dirs {
-        scan_dir(dir, &mut found)?;
+        scan_dir(dir, MAX_SCANNED_ENTRIES_PER_DIR, &mut found)?;
     }
     found.sort_by(|a, b| (a.origin, &a.name, &a.path).cmp(&(b.origin, &b.name, &b.path)));
     Ok(found)
@@ -207,14 +258,23 @@ fn io_error(e: &std::io::Error, message: &'static str) -> TraitError {
     TraitError::new(code, message)
 }
 
-fn scan_dir(dir: &PluginSearchDir, out: &mut Vec<PluginCandidate>) -> Result<(), TraitError> {
+/// `max_entries` は走査上限。`Path` 区分のときだけ「ディレクトリでない」要素も候補なしとして skip する
+/// （`PATH` には通常ファイルが混ざり得る。管理ディレクトリの既存挙動は変えない）。
+fn scan_dir(
+    dir: &PluginSearchDir,
+    max_entries: usize,
+    out: &mut Vec<PluginCandidate>,
+) -> Result<(), TraitError> {
     let entries = match fs::read_dir(dir.path()) {
         Ok(entries) => entries,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotADirectory && dir.kind() == PluginDirKind::Path => {
+            return Ok(());
+        }
         Err(e) => return Err(io_error(&e, "failed to read plugin directory")),
     };
     for (scanned, entry) in entries.enumerate() {
-        if scanned >= MAX_SCANNED_ENTRIES_PER_DIR {
+        if scanned >= max_entries {
             return Err(TraitError::new(
                 ErrorCode::FailedPrecondition,
                 "too many entries in plugin directory",
@@ -246,6 +306,164 @@ fn scan_dir(dir: &PluginSearchDir, out: &mut Vec<PluginCandidate>) -> Result<(),
         });
     }
     Ok(())
+}
+
+/// `PATH` 値を探索先へ分割する純粋関数。空要素・相対パス（カレントディレクトリ依存）は採用せず、
+/// 重複は初出のみ残す。採用数が [`MAX_PATH_SEARCH_DIRS`] を超えたら `Err`。`None` は空。
+fn resolve_path_search_dirs(
+    path_value: Option<&OsStr>,
+) -> Result<Vec<PluginSearchDir>, TraitError> {
+    let mut dirs: Vec<PluginSearchDir> = Vec::new();
+    let Some(value) = path_value else {
+        return Ok(dirs);
+    };
+    for p in std::env::split_paths(value) {
+        if !p.is_absolute() || dirs.iter().any(|d| d.path == p) {
+            continue;
+        }
+        if dirs.len() >= MAX_PATH_SEARCH_DIRS {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "too many directories in PATH",
+            ));
+        }
+        dirs.push(PluginSearchDir::new(PluginDirKind::Path, p));
+    }
+    Ok(dirs)
+}
+
+/// 探索オプション（将来拡張できるよう構造体にする）。既定は `PATH` 探索なし。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiscoveryOptions {
+    path_search: PathSearchPolicy,
+}
+
+impl DiscoveryOptions {
+    /// 既定（`PATH` 探索なし）のオプションを作る。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `PATH` 探索の方針を設定する（CLI フラグ・環境変数の解決結果を渡す。配線は TASK-79）。
+    pub fn with_path_search(mut self, policy: PathSearchPolicy) -> Self {
+        self.path_search = policy;
+        self
+    }
+
+    /// `PATH` 探索の方針を返す。
+    pub fn path_search(&self) -> PathSearchPolicy {
+        self.path_search
+    }
+}
+
+/// `PATH` 上で見つかった候補 1 件に対する警告（名前一致のみでは登録しない旨を伝える）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathSearchWarning {
+    name: String,
+    path: PathBuf,
+}
+
+impl PathSearchWarning {
+    /// 候補の plugin 名を返す。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 候補のパスを返す。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// JSON Lines 1 行（末尾 `\n`）で書き出す。`serde_json` でエスケープするため、パスに改行や
+    /// 制御文字があっても 1 行に収まる（ログ行の偽造防止）。
+    pub fn write_line(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        let line = serde_json::json!({
+            "level": "warn",
+            "code": PATH_WARNING_CODE,
+            "message": PATH_WARNING_MESSAGE,
+            "name": self.name,
+            "path": self.path.to_string_lossy(),
+        });
+        serde_json::to_writer(&mut *out, &line).map_err(std::io::Error::from)?;
+        out.write_all(b"\n")
+    }
+}
+
+/// 探索結果（候補と `PATH` 警告）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryReport {
+    candidates: Vec<PluginCandidate>,
+    path_warnings: Vec<PathSearchWarning>,
+}
+
+impl DiscoveryReport {
+    /// 整列済みの候補（未検証）を返す。
+    pub fn candidates(&self) -> &[PluginCandidate] {
+        &self.candidates
+    }
+
+    /// `PATH` 由来の候補ごとの警告を返す（`Disabled` では常に空）。
+    pub fn path_warnings(&self) -> &[PathSearchWarning] {
+        &self.path_warnings
+    }
+
+    /// 候補だけを取り出す。
+    pub fn into_candidates(self) -> Vec<PluginCandidate> {
+        self.candidates
+    }
+}
+
+/// 管理ディレクトリに加え、opt-in 時のみ `path_value`（`PATH` 環境変数値）も走査する。
+///
+/// `Disabled` では `path_value` を解釈も走査もしない。`Enabled` では `PATH` 由来の候補
+/// （`origin == Path`）1 件につき警告を 1 件作る。名前一致のみでは登録しない（TASK-122・#255）。
+pub fn discover_with_options(
+    managed_dirs: &[PluginSearchDir],
+    path_value: Option<&OsStr>,
+    options: &DiscoveryOptions,
+) -> Result<DiscoveryReport, TraitError> {
+    let mut found = Vec::new();
+    for dir in managed_dirs {
+        scan_dir(dir, MAX_SCANNED_ENTRIES_PER_DIR, &mut found)?;
+    }
+    if options.path_search == PathSearchPolicy::Enabled {
+        for dir in resolve_path_search_dirs(path_value)? {
+            scan_dir(&dir, MAX_SCANNED_ENTRIES_PER_PATH_DIR, &mut found)?;
+        }
+    }
+    found.sort_by(|a, b| (a.origin, &a.name, &a.path).cmp(&(b.origin, &b.name, &b.path)));
+    let path_warnings = found
+        .iter()
+        .filter(|c| c.origin == PluginDirKind::Path)
+        .map(|c| PathSearchWarning {
+            name: c.name.clone(),
+            path: c.path.clone(),
+        })
+        .collect();
+    Ok(DiscoveryReport {
+        candidates: found,
+        path_warnings,
+    })
+}
+
+/// 既定の管理ディレクトリと、`Enabled` のときだけ `PATH` 環境変数を使って探索する。
+/// `Disabled` では `PATH` 環境変数を読まない。
+pub fn discover_default_with_options(
+    options: &DiscoveryOptions,
+) -> Result<DiscoveryReport, TraitError> {
+    let path_value = match options.path_search {
+        PathSearchPolicy::Enabled => std::env::var_os("PATH"),
+        PathSearchPolicy::Disabled => None,
+    };
+    discover_with_options(&default_search_dirs(), path_value.as_deref(), options)
+}
+
+/// `PATH` 警告を 1 件 1 行で書く。呼び出し側（CLI 等）が stderr を渡す（core は直接書かない）。
+pub fn write_path_warnings(report: &DiscoveryReport, out: &mut dyn Write) -> std::io::Result<()> {
+    report
+        .path_warnings
+        .iter()
+        .try_for_each(|w| w.write_line(out))
 }
 
 #[cfg(test)]
@@ -343,5 +561,79 @@ mod tests {
     #[test]
     fn plug11_default_dirs_are_empty_outside_linux() {
         assert!(resolve_default_dirs(Some("/xdg".into()), Some("/h".into())).is_empty());
+    }
+
+    #[test]
+    fn plug11_path_search_policy_parses_only_exact_one() {
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some(" 1"),
+            Some("1 "),
+            Some("11"),
+        ] {
+            assert_eq!(
+                PathSearchPolicy::from_env_value(v.map(OsStr::new)),
+                PathSearchPolicy::Disabled,
+                "{v:?}"
+            );
+        }
+        assert_eq!(
+            PathSearchPolicy::from_env_value(Some(OsStr::new("1"))),
+            PathSearchPolicy::Enabled
+        );
+        assert_eq!(PathSearchPolicy::default(), PathSearchPolicy::Disabled);
+    }
+
+    #[test]
+    fn plug11_path_dirs_skip_empty_and_relative_and_dedupe() {
+        let a = std::env::temp_dir().join("fandhe-a");
+        let b = std::env::temp_dir().join("fandhe-b");
+        let joined = std::env::join_paths([
+            a.clone(),
+            PathBuf::new(),
+            PathBuf::from("rel"),
+            b.clone(),
+            a.clone(),
+        ])
+        .unwrap();
+        let got = resolve_path_search_dirs(Some(&joined)).unwrap();
+        let got: Vec<_> = got.into_iter().map(|d| (d.kind, d.path)).collect();
+        assert_eq!(
+            got,
+            vec![(PluginDirKind::Path, a), (PluginDirKind::Path, b)]
+        );
+        assert!(resolve_path_search_dirs(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn plug11_path_dirs_reject_too_many_entries() {
+        let base = std::env::temp_dir();
+        let mk =
+            |n: usize| std::env::join_paths((0..n).map(|i| base.join(format!("d{i}")))).unwrap();
+        let ok = resolve_path_search_dirs(Some(&mk(256))).unwrap();
+        assert_eq!(ok.len(), 256);
+        let err = resolve_path_search_dirs(Some(&mk(257))).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    }
+
+    #[test]
+    fn plug11_path_warning_is_single_line_and_states_no_registration() {
+        let w = PathSearchWarning {
+            name: "cri".to_owned(),
+            path: PathBuf::from("/x\ny/fandhe-container-plugin-cri"),
+        };
+        let mut buf = Vec::new();
+        w.write_line(&mut buf).unwrap();
+        assert_eq!(buf.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert_eq!(buf.last(), Some(&b'\n'));
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["level"], "warn");
+        assert_eq!(v["code"], "PLUGIN_PATH_CANDIDATE");
+        assert_eq!(v["name"], "cri");
+        assert!(v["message"].as_str().unwrap().contains("not registered"));
     }
 }

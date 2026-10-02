@@ -342,16 +342,21 @@ mod supported {
     /// 絶対パスで起動する。失敗は無視し、呼び出し側が続けて計測対象本体を kill する。
     fn kill_process_group(child: &std::process::Child) {
         let target = format!("-{}", child.id());
+        // GNU（Linux）は `--` つき、BSD（macOS）の kill は `--` を pid として拒否するため
+        // `--` なしの形式も順に試す。どちらかが成功した時点で戻る。
+        let arg_forms: [&[&str]; 2] = [&["-s", "KILL", "--", &target], &["-s", "KILL", &target]];
         for bin in ["/bin/kill", "/usr/bin/kill"] {
-            let status = Command::new(bin)
-                .args(["-s", "KILL", "--", &target])
-                .env_clear()
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            if status.is_ok_and(|s| s.success()) {
-                return;
+            for args in arg_forms {
+                let status = Command::new(bin)
+                    .args(args)
+                    .env_clear()
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                if status.is_ok_and(|s| s.success()) {
+                    return;
+                }
             }
         }
     }

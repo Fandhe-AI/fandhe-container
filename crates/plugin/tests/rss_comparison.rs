@@ -92,7 +92,10 @@ mod supported {
     // 依存方向（core -> plugin）上、本 crate のテストから core はリンクできない。このためテストバイナリ
     // 自身を再実行し、「core 役」の計測対象プロセスと「plugin 役」の常駐プロセスを用意して近似する。
     // 実ビルド変種での再計測は別途必要。値は debug ビルド・libtest 込みで、PoC-13 の絶対値とは比較できない。
-    // 既定集合では閾値を assert せず記録に留める（閾値判定と実機集合への分離は TASK-112.3・#267）。
+    // 条件 (2) の計測対象も plugin をリンクした同じバイナリであり、リンク構成の差（PLUG-8 が求める
+    // plugin 分離による core 側 RSS の差）は表現できない。このため代役の差分を PLUG-8 の目標判定
+    // としては報告せず（`target_judged: false`）、差分の記録に留める。閾値判定は実ビルド変種を
+    // 用意できる TASK-112.3・#267 以降の担当。
     // ---------------------------------------------------------------------------------------
 
     use fandhe_container_plugin::{
@@ -102,10 +105,10 @@ mod supported {
     use std::ffi::OsString;
     use std::io::Read;
     use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     /// PLUG-8 目標: 2 条件の差が 0.5 MiB 未満。PoC-13 の 3.375 は 3456 KiB ちょうどのため
@@ -151,7 +154,9 @@ mod supported {
             "diff_bytes": i64::try_from(c.diff_bytes).unwrap_or(i64::MAX),
             "abs_diff_bytes": c.abs_diff_bytes,
             "target_diff_bytes": PLUG8_TARGET_DIFF_BYTES,
-            "within_target": c.within_target,
+            // 代役はリンク構成が条件間で同一のため、PLUG-8 目標の判定結果としては出さない。
+            "target_judged": false,
+            "stand_in_within_reference_diff": c.within_target,
             "conditions_compared": 2,
             "trials": TRIALS,
             "source": format!("{:?}", EXPECTED_SOURCE),
@@ -286,8 +291,14 @@ mod supported {
     }
 
     /// 自テストバイナリを計測対象として起動し、`result` の RSS（バイト）を返す。
-    /// 環境は空にし、期限超過時は kill して回収する（REPAIR-5）。
-    fn run_subject(condition: &str) -> u64 {
+    /// 環境は空にし、期限超過時は計測対象と子孫の常駐 plugin をプロセスグループ単位で kill し
+    /// 計測対象を回収する（REPAIR-5）。
+    /// `overall_deadline` は全体期限で、これを超える待機・新規起動は行わない（REPAIR-5）。
+    fn run_subject(condition: &str, overall_deadline: Instant) -> u64 {
+        assert!(
+            Instant::now() < overall_deadline,
+            "overall deadline reached before starting subject ({condition})"
+        );
         let dir = WorkDir::new(condition);
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -297,25 +308,49 @@ mod supported {
             ])
             .env_clear()
             .env(SUBJECT_DIR_ENV, &dir.0)
+            // 計測対象を新しいプロセスグループの先頭にする。常駐 plugin はその子孫として同じ
+            // グループに属し、期限超過時にグループ単位で終了・回収できる（REPAIR-5）。
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + SUBJECT_WAIT;
+        let deadline = (Instant::now() + SUBJECT_WAIT).min(overall_deadline);
         let status = loop {
             if let Some(st) = child.try_wait().unwrap() {
                 break st;
             }
             if Instant::now() >= deadline {
+                kill_process_group(&child);
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("subject ({condition}) did not finish within {SUBJECT_WAIT:?}");
+                panic!("subject ({condition}) did not finish before its deadline");
             }
             std::thread::sleep(Duration::from_millis(20));
         };
         assert!(status.success(), "subject ({condition}) failed: {status}");
         parse_result(&dir.0.join("result"))
+    }
+
+    /// 計測対象のプロセスグループ（計測対象と、その子孫である常駐 plugin）へ SIGKILL を送る。
+    /// 計測対象は未回収（pid 保持中）の状態で呼ぶこと。pgid の再利用による誤殺を避けるため。
+    /// 本 crate は libc に依存せず unsafe も使えないため、OS 同梱の `kill` コマンドを環境空・
+    /// 絶対パスで起動する。失敗は無視し、呼び出し側が続けて計測対象本体を kill する。
+    fn kill_process_group(child: &std::process::Child) {
+        let target = format!("-{}", child.id());
+        for bin in ["/bin/kill", "/usr/bin/kill"] {
+            let status = Command::new(bin)
+                .args(["-s", "KILL", "--", &target])
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if status.is_ok_and(|s| s.success()) {
+                return;
+            }
+        }
     }
 
     /// `result` を読み取り上限つきで厳密にパースする（10 進数 + 改行のみ）。
@@ -364,7 +399,8 @@ mod supported {
         assert_eq!(v["diff_bytes"], 459_264);
         assert_eq!(v["abs_diff_bytes"], 459_264);
         assert_eq!(v["target_diff_bytes"], 524_288);
-        assert_eq!(v["within_target"], true);
+        assert_eq!(v["target_judged"], false);
+        assert!(v.get("within_target").is_none());
         assert_eq!(v["conditions_compared"], 2);
         assert_eq!(v["trials"], 5);
         assert_eq!(v["stand_in"], true);
@@ -375,19 +411,21 @@ mod supported {
     #[test]
     fn plug8_two_condition_rss_comparison_is_recorded() {
         let _guard = rss_guard();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        // 全体期限を各試行へ伝える。期限到達時は稼働中の子を kill・回収して計測スレッドが
+        // 自ら終了するため、join は期限後ほぼ即座に返り、スレッド・子プロセスは残らない。
+        let overall_deadline = Instant::now() + OVERALL_WAIT;
+        let worker = std::thread::spawn(move || {
             let mut c1 = Vec::new();
             let mut c2 = Vec::new();
             for _ in 0..TRIALS {
-                c1.push(run_subject("in_process"));
-                c2.push(run_subject("resident"));
+                c1.push(run_subject("in_process", overall_deadline));
+                c2.push(run_subject("resident", overall_deadline));
             }
-            let _ = tx.send((c1, c2));
+            (c1, c2)
         });
-        let (c1, c2) = rx
-            .recv_timeout(OVERALL_WAIT)
-            .expect("two-condition measurement hung");
+        let (c1, c2) = worker
+            .join()
+            .expect("two-condition measurement failed or hit the overall deadline");
         assert_eq!(c1.len(), TRIALS);
         assert_eq!(c2.len(), TRIALS);
         assert!(

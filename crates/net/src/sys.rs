@@ -28,6 +28,8 @@
 //! 受信切り詰め検出は `recvfrom(2)` に `MSG_TRUNC` を渡し、戻り値（データグラムの実長）が
 //! バッファ長を超えたことで判定する。これにより `msghdr` のレイアウト（glibc / musl 差）に
 //! 依存しない（`sendmsg` / `recvmsg` と同じ netlink データグラム意味論）。
+//! 受信前の長さ確認（[`peek_datagram_len`]）も同じ仕組みで、`MSG_PEEK | MSG_TRUNC` と長さ 0 の
+//! バッファにより、キューから取り除かずに先頭データグラムの実長だけを得る。
 
 #![cfg(target_os = "linux")]
 
@@ -118,6 +120,7 @@ mod consts {
     pub const SOCK_RAW: i32 = 3;
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
     pub const NETLINK_ROUTE: i32 = 0;
+    pub const MSG_PEEK: i32 = 0x02;
     pub const MSG_TRUNC: i32 = 0x20;
     pub const MSG_DONTWAIT: i32 = 0x40;
     pub const POLLIN: i16 = 0x0001;
@@ -140,6 +143,7 @@ mod consts {
     pub const SOCK_RAW: i32 = 3;
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
     pub const NETLINK_ROUTE: i32 = 0;
+    pub const MSG_PEEK: i32 = 0x02;
     pub const MSG_TRUNC: i32 = 0x20;
     pub const MSG_DONTWAIT: i32 = 0x40;
     pub const POLLIN: i16 = 0x0001;
@@ -167,6 +171,7 @@ mod consts {
     pub const SOCK_RAW: i32 = 0;
     pub const SOCK_CLOEXEC: i32 = 0;
     pub const NETLINK_ROUTE: i32 = 0;
+    pub const MSG_PEEK: i32 = 0;
     pub const MSG_TRUNC: i32 = 0;
     pub const MSG_DONTWAIT: i32 = 0;
     pub const POLLIN: i16 = 0;
@@ -389,6 +394,34 @@ pub(crate) fn wait_readable(
     }
 }
 
+/// 受信キュー先頭のデータグラムの実長を、キューから取り除かずに待たずに返す
+/// （`MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT`）。
+///
+/// 呼び出し側（`NetlinkRouteSocket::recv`）が、上限検証のうえ必要な長さのバッファを確保してから
+/// [`recv_from`] で取り出すために使う。届いていなければ `Os(EAGAIN)`、中断は `Os(EINTR)`。
+/// 送信元アドレスは取得しない（検証は取り出す [`recv_from`] 側で行う）。
+pub(crate) fn peek_datagram_len(fd: BorrowedFd<'_>) -> Result<usize, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut empty = [0u8; 0];
+    // SAFETY: `len` に 0 を渡すため、カーネルは `buf` へ 1 バイトも書かない（`empty` の非 null・
+    // 整列済みポインタを渡すが参照されない）。`addr`・`addrlen` は両方 null で、`recvfrom(2)` は
+    // この組を「送信元アドレスを返さない」指定として扱い、どちらにも書かない。`fd` は生存中の
+    // `BorrowedFd`。`MSG_PEEK` のためキューの状態を変えない。
+    let n = unsafe {
+        recvfrom(
+            fd.as_raw_fd(),
+            empty.as_mut_ptr().cast(),
+            0,
+            consts::MSG_PEEK | consts::MSG_TRUNC | consts::MSG_DONTWAIT,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    usize::try_from(n).map_err(|_| last_error())
+}
+
 /// 1 データグラムを待たずに受信する（`MSG_DONTWAIT`）。通常は [`wait_readable`] の後に呼ぶ。
 ///
 /// 読み取り可能でなければ（`poll` の後に他スレッドが先に取った場合を含む）`Os(EAGAIN)`、シグナルで
@@ -448,6 +481,7 @@ mod tests {
         assert_eq!(consts::SOCK_RAW, 3);
         assert_eq!(consts::SOCK_CLOEXEC, 0x80000);
         assert_eq!(consts::NETLINK_ROUTE, 0);
+        assert_eq!(consts::MSG_PEEK, 0x02);
         assert_eq!(consts::MSG_TRUNC, 0x20);
         assert_eq!(consts::MSG_DONTWAIT, 0x40);
         assert_eq!(consts::POLLIN, 1);
@@ -492,6 +526,55 @@ mod tests {
             Err(SysError::Os(consts::EAGAIN))
         );
         assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    /// NET-11: 何も届いていない socket の `peek_datagram_len` は待たずに `EAGAIN`。
+    #[test]
+    fn peek_on_empty_socket_does_not_block() {
+        let fd = open_route_socket().expect("open");
+        bind_kernel_assigned(fd.as_fd()).expect("bind");
+        let t = Instant::now();
+        assert_eq!(
+            peek_datagram_len(fd.as_fd()),
+            Err(SysError::Os(consts::EAGAIN))
+        );
+        assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    /// NET-11: `peek_datagram_len` はデータグラムを取り除かずに実長を返し、続く `recv_from` が
+    /// 同じ長さのデータグラムを取り出す。小さいバッファでは `truncated` が立ち実長が返る。
+    #[test]
+    fn peek_reports_full_length_without_consuming() {
+        // NLM_F_REQUEST|NLM_F_ACK だけの RTM_GETLINK（ifinfomsg なし）。カーネルは NLMSG_ERROR
+        // 1 件（ヘッダ 16 + errno 4 + 元ヘッダ 16 = 36 バイト）を返す。
+        let mut req = Vec::new();
+        req.extend_from_slice(&16u32.to_ne_bytes());
+        req.extend_from_slice(&18u16.to_ne_bytes());
+        req.extend_from_slice(&(0x01u16 | 0x04u16).to_ne_bytes());
+        req.extend_from_slice(&9u32.to_ne_bytes());
+        req.extend_from_slice(&0u32.to_ne_bytes());
+        let fd = open_route_socket().expect("open");
+        bind_kernel_assigned(fd.as_fd()).expect("bind");
+        assert_eq!(send_to_kernel(fd.as_fd(), &req), Ok(16));
+        let deadline = Deadline::after(Duration::from_secs(5));
+        assert_eq!(
+            wait_readable(fd.as_fd(), &deadline),
+            Ok(Readiness::Readable)
+        );
+        assert_eq!(peek_datagram_len(fd.as_fd()), Ok(36));
+        let mut small = [0u8; 8];
+        assert_eq!(
+            recv_from(fd.as_fd(), &mut small),
+            Ok(RecvMeta {
+                len: 36,
+                truncated: true,
+                sender_pid: 0
+            })
+        );
+        assert_eq!(
+            peek_datagram_len(fd.as_fd()),
+            Err(SysError::Os(consts::EAGAIN))
+        );
     }
 
     /// REPAIR-5: 残り時間は `timeout - 経過時間` で、0 未満にならない。`Instant` で期限を表せない

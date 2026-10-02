@@ -9,22 +9,29 @@
 pub use crate::netlink::*;
 
 #[cfg(target_os = "linux")]
-pub use socket::{NetlinkRouteSocket, RECV_BUFFER_LEN};
+pub use socket::{MAX_RECV_DATAGRAM_LEN, NetlinkRouteSocket, RECV_BUFFER_LEN};
 
 #[cfg(target_os = "linux")]
 mod socket {
     use std::fmt;
     use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
+    use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
 
     use crate::error::{NetError, NetErrorCode};
     use crate::netlink::{ALIGN_TO, MAX_MESSAGE_LEN, NLMSG_HEADER_LEN, NlMsgHeader};
     use crate::sys::{self, Deadline, Readiness, RecvMeta, SysError};
 
-    /// 受信バッファの固定上限（バイト）。カーネルの申告長に応じた再確保はしない（無制限確保の防止）。
+    /// 受信バッファの通常の長さ（バイト）。これ以下のデータグラムはこの長さのバッファで受ける
+    /// （カーネルは dump 応答の 1 データグラムを受信側のバッファ長に合わせて詰めるため、小さく
+    /// しすぎない）。これを超えるデータグラムは実長に合わせて [`MAX_RECV_DATAGRAM_LEN`] まで広げる。
     pub const RECV_BUFFER_LEN: usize = 32 * 1024;
 
-    const _: () = assert!(RECV_BUFFER_LEN <= MAX_MESSAGE_LEN as usize);
+    /// 受信する 1 データグラムの上限長（バイト）。コーデックの `MAX_MESSAGE_LEN` と同じ 1 MiB。
+    /// カーネルが申告した実長をこの値で検証してから確保するため、無制限には確保しない。
+    pub const MAX_RECV_DATAGRAM_LEN: usize = MAX_MESSAGE_LEN as usize;
+
+    const _: () = assert!(RECV_BUFFER_LEN <= MAX_RECV_DATAGRAM_LEN);
 
     /// bind 済みの `NETLINK_ROUTE` ソケット（NET-11）。
     ///
@@ -32,16 +39,53 @@ mod socket {
     /// `nl_pid` はカーネル採番・マルチキャスト購読なし。fd は `SOCK_CLOEXEC` で、Drop で閉じる。
     /// 呼び出し元（#844 以降の request / ACK 層）が `NlMsgBuilder` で組んだバイト列を `send` し、
     /// `recv` の戻りを `NlMsgIter` で解釈する。seq 採番・ACK 判定・採番 pid の取得は未実装（#844）。
+    ///
+    /// `Send + Sync` で、`&self` のまま複数スレッドから `send` / `recv` できる。ただし応答と要求の
+    /// 対応づけ（seq 照合）は行わないため、複数スレッドで `recv` すると、どの応答をどのスレッドが
+    /// 受け取るかは定まらない（対応づけは #844 の層が担う）。
     pub struct NetlinkRouteSocket {
         fd: OwnedFd,
+        /// 「先頭データグラムの長さ確認 → 取り出し」を 1 つの読み手にまとめるためのロック。
+        /// 保持するのは待たない syscall（`MSG_DONTWAIT`）の間だけで、`poll` の待機中は保持しない。
+        recv_lock: Mutex<()>,
     }
 
     impl fmt::Debug for NetlinkRouteSocket {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("NetlinkRouteSocket")
                 .field("fd", &self.fd.as_raw_fd())
-                .finish()
+                .finish_non_exhaustive()
         }
+    }
+
+    /// 待たない 1 回の受信の結果。
+    #[derive(Debug)]
+    enum TryRecv {
+        /// 1 データグラムを取り出した（`buf` は確保したバッファ全体。有効長は `meta.len`）。
+        Datagram { buf: Vec<u8>, meta: RecvMeta },
+        /// 先頭データグラムが上限長を超えていたため、確保せずに破棄した。
+        Oversized { len: usize },
+    }
+
+    /// 先頭データグラムの実長を確認し、`max_len` 以下なら `max(実長, min_buf)` のバッファを確保して
+    /// 取り出す。超えていれば確保せずにキューから破棄する（残すと以後の受信が進まないため）。
+    ///
+    /// カーネルの申告長（外部入力）を上限検証してから確保に使う。呼び出し側が `recv_lock` を保持して
+    /// いる前提で、長さ確認と取り出しの間に同じソケットの別の読み手は割り込まない。
+    fn try_recv_datagram(
+        fd: BorrowedFd<'_>,
+        min_buf: usize,
+        max_len: usize,
+    ) -> Result<TryRecv, SysError> {
+        let len = sys::peek_datagram_len(fd)?;
+        if len > max_len {
+            let mut discard = [0u8; 1];
+            sys::recv_from(fd, &mut discard)?;
+            return Ok(TryRecv::Oversized { len });
+        }
+        let mut buf = vec![0u8; len.max(min_buf)];
+        let meta = sys::recv_from(fd, &mut buf)?;
+        Ok(TryRecv::Datagram { buf, meta })
     }
 
     impl NetlinkRouteSocket {
@@ -49,7 +93,10 @@ mod socket {
         pub fn open() -> Result<Self, NetError> {
             let fd = sys::open_route_socket().map_err(|e| map_sys_error("socket", e))?;
             sys::bind_kernel_assigned(fd.as_fd()).map_err(|e| map_sys_error("bind", e))?;
-            Ok(Self { fd })
+            Ok(Self {
+                fd,
+                recv_lock: Mutex::new(()),
+            })
         }
 
         /// `message`（`NlMsgBuilder` で組んだ 1 メッセージ）をそのままカーネルへ送る。
@@ -110,18 +157,25 @@ mod socket {
         /// - `timeout` が 1 回の `poll` に渡せる上限（`i32::MAX` ms）を超える
         ///
         /// `timeout` が 0 なら待たず、すでに届いているデータグラムだけを返す。期限内に届かなければ
-        /// `Timeout`。切り詰め・カーネル以外の送信元は `DataLoss`（そのデータグラムは破棄済み）。
+        /// `Timeout`。
+        ///
+        /// 受信長はカーネルが申告した実長に合わせる。[`RECV_BUFFER_LEN`] を超えるデータグラムも
+        /// [`MAX_RECV_DATAGRAM_LEN`] までは欠落なく受信し、それを超えるものは確保せずに破棄して
+        /// `DataLoss` を返す。カーネル以外の送信元も `DataLoss`（そのデータグラムは破棄済み）。
         /// 返したバイト列の解釈は呼び出し側が `NlMsgIter` で行う。
         pub fn recv(&self, timeout: Duration) -> Result<Vec<u8>, NetError> {
-            self.recv_with(timeout, sys::recv_from)
+            self.recv_with(timeout, |fd| {
+                try_recv_datagram(fd, RECV_BUFFER_LEN, MAX_RECV_DATAGRAM_LEN)
+            })
         }
 
-        /// [`recv`](Self::recv) の本体。`try_recv` は待たない 1 回の受信（本番は `sys::recv_from`）で、
-        /// 単体試験が「`poll` の後に別の読み手が先に取った」競合を決定的に再現するための差し替え点。
+        /// [`recv`](Self::recv) の本体。`try_recv` は待たない 1 回の受信（本番は
+        /// [`try_recv_datagram`]）で、`recv_lock` を保持した状態で呼ばれる。単体試験が「`poll` の後に
+        /// 別の読み手が先に取った」競合や小さい上限長を決定的に再現するための差し替え点。
         fn recv_with(
             &self,
             timeout: Duration,
-            mut try_recv: impl FnMut(BorrowedFd<'_>, &mut [u8]) -> Result<RecvMeta, SysError>,
+            mut try_recv: impl FnMut(BorrowedFd<'_>) -> Result<TryRecv, SysError>,
         ) -> Result<Vec<u8>, NetError> {
             let deadline = Deadline::after(timeout);
             let timed_out = || {
@@ -130,15 +184,31 @@ mod socket {
                     format!("no netlink message within {} ms", timeout.as_millis()),
                 )
             };
-            let mut buf = vec![0u8; RECV_BUFFER_LEN];
-            let meta = loop {
+            let (mut buf, meta) = loop {
                 let readiness = sys::wait_readable(self.fd.as_fd(), &deadline)
                     .map_err(|e| map_sys_error("poll", e))?;
                 if readiness == Readiness::TimedOut {
                     return Err(timed_out());
                 }
-                match try_recv(self.fd.as_fd(), &mut buf) {
-                    Ok(meta) => break meta,
+                let attempt = {
+                    // 待たない syscall の間だけ保持する。保護対象のデータを持たないため、他スレッドの
+                    // panic による poison は無視して続行する。
+                    let _guard = self
+                        .recv_lock
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    try_recv(self.fd.as_fd())
+                };
+                match attempt {
+                    Ok(TryRecv::Datagram { buf, meta }) => break (buf, meta),
+                    Ok(TryRecv::Oversized { len }) => {
+                        return Err(NetError::new(
+                            NetErrorCode::DataLoss,
+                            format!(
+                                "dropped netlink datagram of {len} bytes exceeding the limit of {MAX_RECV_DATAGRAM_LEN} bytes"
+                            ),
+                        ));
+                    }
                     // 別スレッドが先に読んだ（EAGAIN）・シグナルで中断された（EINTR）。失敗にせず、
                     // 残り時間があれば待ち直す。回数ではなく全体期限で打ち切る（REPAIR-5）。
                     Err(SysError::Os(errno @ (sys::EAGAIN | sys::EINTR))) => {
@@ -164,7 +234,8 @@ mod socket {
                     NetErrorCode::DataLoss,
                     format!(
                         "netlink datagram of {} bytes exceeds receive buffer of {} bytes",
-                        meta.len, RECV_BUFFER_LEN
+                        meta.len,
+                        buf.len()
                     ),
                 ));
             }
@@ -252,6 +323,11 @@ mod socket {
             b.finish().expect("finish")
         }
 
+        /// 本番と同じ上限での待たない 1 回の受信。
+        fn real_try_recv(fd: BorrowedFd<'_>) -> Result<TryRecv, SysError> {
+            try_recv_datagram(fd, RECV_BUFFER_LEN, MAX_RECV_DATAGRAM_LEN)
+        }
+
         /// 受信 1 データグラムの先頭メッセージの (type, seq)。
         fn first_type_and_seq(data: &[u8]) -> (u16, u32) {
             let h = NlMsgHeader::decode(data).expect("header");
@@ -271,15 +347,19 @@ mod socket {
             let mut stolen = None;
             let started = std::time::Instant::now();
             let data = s
-                .recv_with(Duration::from_secs(5), |fd, buf| {
+                .recv_with(Duration::from_secs(5), |fd| {
                     calls += 1;
                     if calls == 1 {
-                        let meta = sys::recv_from(fd, buf).expect("other reader takes it");
+                        let TryRecv::Datagram { buf, meta } =
+                            real_try_recv(fd).expect("other reader takes it")
+                        else {
+                            panic!("unexpected oversized datagram");
+                        };
                         stolen = Some(first_type_and_seq(buf.get(..meta.len).expect("len")));
                         s.send(&getlink_lo(2)).expect("send 2");
                         return Err(SysError::Os(sys::EAGAIN));
                     }
-                    sys::recv_from(fd, buf)
+                    real_try_recv(fd)
                 })
                 .expect("recv must continue until the next datagram");
             assert_eq!(stolen, Some((RTM_NEWLINK, 1)));
@@ -296,12 +376,12 @@ mod socket {
             s.send(&getlink_lo(7)).expect("send");
             let mut calls = 0u32;
             let data = s
-                .recv_with(Duration::from_secs(5), |fd, buf| {
+                .recv_with(Duration::from_secs(5), |fd| {
                     calls += 1;
                     if calls <= 20 {
                         return Err(SysError::Os(sys::EINTR));
                     }
-                    sys::recv_from(fd, buf)
+                    real_try_recv(fd)
                 })
                 .expect("recv");
             assert_eq!(first_type_and_seq(&data), (RTM_NEWLINK, 7));
@@ -317,9 +397,9 @@ mod socket {
             let mut calls = 0u32;
             let started = std::time::Instant::now();
             let e = s
-                .recv_with(Duration::from_millis(300), |fd, buf| {
+                .recv_with(Duration::from_millis(300), |fd| {
                     calls += 1;
-                    sys::recv_from(fd, buf).expect("other reader takes it");
+                    real_try_recv(fd).expect("other reader takes it");
                     Err(SysError::Os(sys::EAGAIN))
                 })
                 .expect_err("timeout");
@@ -339,7 +419,7 @@ mod socket {
             let started = std::time::Instant::now();
             // データグラムを読まずに EAGAIN を返し続ける（poll は毎回 Readable で即座に戻る）。
             let e = s
-                .recv_with(Duration::from_millis(200), |_, _| {
+                .recv_with(Duration::from_millis(200), |_| {
                     Err(SysError::Os(sys::EAGAIN))
                 })
                 .expect_err("timeout");
@@ -418,6 +498,59 @@ mod socket {
             assert_eq!(e.code(), NetErrorCode::InvalidArgument);
             let e = s.send(&msg[..17]).expect_err("must reject");
             assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        }
+
+        /// NET-11: 通常のバッファ長を超えるデータグラムも、実長に合わせたバッファで欠落なく受信する
+        /// （上限長までは `DataLoss` にしない）。通常のバッファ長を 16 バイトへ縮めて再現し、
+        /// 既定のバッファ長での受信結果と全バイトが一致することを照合する。
+        #[test]
+        fn recv_grows_buffer_to_the_datagram_length() {
+            let s = NetlinkRouteSocket::open().expect("open");
+            s.send(&getlink_lo(5)).expect("send");
+            let expected = s.recv(Duration::from_secs(5)).expect("recv");
+            assert!(expected.len() > 16, "reply is {} bytes", expected.len());
+            assert_eq!(first_type_and_seq(&expected), (RTM_NEWLINK, 5));
+
+            s.send(&getlink_lo(5)).expect("send");
+            let grown = s
+                .recv_with(Duration::from_secs(5), |fd| {
+                    try_recv_datagram(fd, 16, MAX_RECV_DATAGRAM_LEN)
+                })
+                .expect("recv with a 16-byte normal buffer");
+            assert_eq!(grown.len(), expected.len());
+            assert_eq!(first_type_and_seq(&grown), (RTM_NEWLINK, 5));
+            let h = NlMsgHeader::decode(&grown).expect("header");
+            assert_eq!(h.len() as usize, grown.len());
+        }
+
+        /// NET-11: 上限長を超えるデータグラムは確保せずに破棄して `DataLoss` を返し、キューに残さない
+        /// （次の受信は次のデータグラムへ進む）。上限長を 64 バイトへ縮めて再現する。
+        #[test]
+        fn recv_drops_datagram_above_the_limit() {
+            let s = NetlinkRouteSocket::open().expect("open");
+            s.send(&getlink_lo(6)).expect("send 6");
+            let e = s
+                .recv_with(Duration::from_secs(5), |fd| try_recv_datagram(fd, 16, 64))
+                .expect_err("oversized");
+            assert_eq!(e.code(), NetErrorCode::DataLoss);
+            assert!(
+                e.to_string()
+                    .starts_with("DATA_LOSS: dropped netlink datagram of "),
+                "{e}"
+            );
+            // 破棄済みなので、待たない受信では何も残っていない。
+            let e = s.recv(Duration::ZERO).expect_err("queue is empty");
+            assert_eq!(e.code(), NetErrorCode::Timeout);
+            s.send(&getlink_lo(8)).expect("send 8");
+            let next = s.recv(Duration::from_secs(5)).expect("recv");
+            assert_eq!(first_type_and_seq(&next), (RTM_NEWLINK, 8));
+        }
+
+        /// NET-11: 複数スレッドから `&self` で共有できる（`Send + Sync`）。
+        #[test]
+        fn socket_is_send_and_sync() {
+            fn assert_send_sync<T: Send + Sync>() {}
+            assert_send_sync::<NetlinkRouteSocket>();
         }
     }
 }

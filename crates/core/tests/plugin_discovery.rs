@@ -302,6 +302,7 @@ fn plug11_existing_discover_candidates_never_touches_path() {
     assert!(found.iter().all(|c| c.origin() != PluginDirKind::Path));
     assert_eq!(found.len(), 1);
 }
+
 // ---------------------------------------------------------------------------
 // TASK-109.4: plugin 追加前後の core 不変性（PLUG-4・決定 3 の (1)(3)）
 // ---------------------------------------------------------------------------
@@ -519,6 +520,8 @@ fn core_binary_sha256() -> String {
 
 /// PLUG-4（TASK-109.4）: plugin を管理ディレクトリへ追加して発見・登録しても、core のソース
 /// sha256 一覧とバイナリ（代理）sha256 は変わらない。決定 3 の (2) 依存木比較は本テストの対象外。
+/// 現状は代理指紋（test 実行ファイル）の比較で保証が弱い。TASK-79 の CLI bin 導入時に
+/// `cargo build --locked` 成果物の比較へ置き換える（REPAIR-3）。
 #[test]
 fn plug4_core_sha256_unchanged_after_plugin_add() {
     let tmp = Tmp::new("plug4");

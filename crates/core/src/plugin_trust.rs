@@ -1,4 +1,4 @@
-//! plugin 候補の所有者・モード・symlink 実体解決・sha256 許可済みハッシュ検証・検証方式の切替点（TASK-122.1〜122.4・PLUG-11・MS-3）。
+//! plugin 候補の所有者・モード・symlink 実体解決・sha256 許可済みハッシュ検証・検証方式の切替点（TASK-122.1〜122.5・PLUG-11・MS-3）。
 //!
 //! # 役割と呼び出し元
 //!
@@ -90,8 +90,9 @@
 //! - setuid / setgid ビット・ACL・拡張属性は判定対象外（PLUG-11 の記述範囲外）
 //! - 非 Linux は同等検証が未実装のため常に拒否する（fail-closed。macOS / Windows の「相当」
 //!   検証は spec で未確定）
-//! - エラーの error-format 準拠の整形は TASK-122.5（#283）。本モジュールは機械可読な
-//!   [`PluginTrustErrorKind`] と [`TraitError`] への変換までを担う
+//! - error-format 準拠の構造化エラー（`code` / `reason` / `message` の 1 行 JSON）と監査レコード化
+//!   （`PluginTrust` レイヤー）、監査つき検証ラッパーは `report` に実装済み（TASK-122.5・#283）。
+//!   レジストリ・本番 `AuditSink`・CLI の終了コード処理への配線は未実装
 //!
 //! 本モジュールは `unsafe` を持たない（Linux では `sys` のラッパーと std のみを使う）。
 
@@ -108,6 +109,9 @@ use sha2::{Digest as _, Sha256};
 use crate::plugin_discovery::PluginCandidate;
 use crate::traits::{ErrorCode, TraitError};
 
+mod report;
+pub use report::{record_plugin_trust_rejection, verify_candidate_audited};
+
 /// 検証対象の種別（拒否メッセージと種別チェックの切替に使う）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustTarget {
@@ -117,7 +121,7 @@ pub enum TrustTarget {
     File,
 }
 
-/// 拒否理由（機械可読。TASK-122.5 が error-format へ整形する入力）。
+/// 拒否理由（機械可読。error-format への整形と理由トークンは `report`〔TASK-122.5〕）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PluginTrustErrorKind {

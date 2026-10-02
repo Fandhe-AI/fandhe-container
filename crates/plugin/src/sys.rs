@@ -412,9 +412,110 @@ unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
 }
 
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+mod forkguard {
+    //! fork した子プロセスにロック fd を継承させない仕組み（PLUG-12・TASK-123.2）。
+    //!
+    //! `flock` は open file description に紐付くため、`O_CLOEXEC`（exec 時のみ有効）では fork だけの
+    //! 子がロックを保持し続け、親の終了後も再 bind が `AlreadyExists` になる。登録した fd を
+    //! `pthread_atfork` の child ハンドラで `/dev/null` に差し替え、子側のコピーを閉じる
+    //! （親の fd は影響を受けない）。ハンドラ内は async-signal-safe な呼び出しとアトミックのみ。
+    use super::{AT_FDCWD, O_CLOEXEC, O_RDWR, c_openat};
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    const SLOTS: usize = 64;
+    static REGISTRY: [AtomicI32; SLOTS] = [const { AtomicI32::new(-1) }; SLOTS];
+    static INSTALL: Once = Once::new();
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の `int pthread_atfork(void (*)(void), void (*)(void), void (*)(void))`。
+        fn pthread_atfork(
+            prepare: Option<extern "C" fn()>,
+            parent: Option<extern "C" fn()>,
+            child: Option<extern "C" fn()>,
+        ) -> i32;
+        // SAFETY（宣言そのものの妥当性）: POSIX の `int dup2(int, int)` / `int close(int)`。
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+
+    extern "C" fn on_fork_child() {
+        for slot in REGISTRY.iter() {
+            let fd = slot.load(Ordering::Relaxed);
+            if fd < 0 {
+                continue;
+            }
+            // SAFETY: fork 直後の子で、登録済み fd（親が有効な間のみ登録）を自プロセス内で差し替える
+            // だけ。open / dup2 / close は async-signal-safe。`/dev/null` の NUL 終端リテラルを渡す。
+            unsafe {
+                let n = c_openat(AT_FDCWD, c"/dev/null".as_ptr(), O_RDWR | O_CLOEXEC);
+                if n >= 0 {
+                    dup2(n, fd);
+                    close(n);
+                } else {
+                    close(fd);
+                }
+            }
+            slot.store(-1, Ordering::Relaxed);
+        }
+    }
+
+    /// 登録中の fd が fork の子へ継承されないよう保護する。drop で登録を外す。
+    #[derive(Debug)]
+    pub(crate) struct ForkGuard(usize);
+
+    impl ForkGuard {
+        pub(crate) fn register(fd: i32) -> Option<Self> {
+            INSTALL.call_once(|| {
+                // SAFETY: 引数は `extern "C"` の有効な関数ポインタ（prepare / parent は None）。
+                let _ = unsafe { pthread_atfork(None, None, Some(on_fork_child)) };
+            });
+            REGISTRY
+                .iter()
+                .enumerate()
+                .find(|(_, s)| {
+                    s.compare_exchange(-1, fd, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                })
+                .map(|(i, _)| Self(i))
+        }
+    }
+
+    impl Drop for ForkGuard {
+        fn drop(&mut self) {
+            if let Some(s) = REGISTRY.get(self.0) {
+                s.store(-1, Ordering::Release);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+mod forkguard {
+    #[derive(Debug)]
+    pub(crate) struct ForkGuard;
+}
+
+pub(crate) use forkguard::ForkGuard;
+
 /// ロックファイルの取得結果（PLUG-12・TASK-123.2）。
 #[derive(Debug)]
 pub(crate) struct LockHandle {
+    /// fork の子へのロック継承を防ぐ登録（`file` より先に drop されるよう前に置く）。
+    pub fork_guard: ForkGuard,
     /// 排他 flock を保持する fd。drop（プロセス終了・クラッシュ含む）で kernel が解放する。
     pub file: File,
     /// 今回の呼び出しで新規作成したか（false なら以前の保持者が作ったロックファイルが残っていた）。
@@ -462,7 +563,13 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(LockHandle { file, created })
+        let fork_guard = ForkGuard::register(file.as_raw_fd())
+            .ok_or_else(|| io::Error::other("fork guard registry is full"))?;
+        Ok(LockHandle {
+            fork_guard,
+            file,
+            created,
+        })
     }
     #[cfg(not(any(
         target_os = "macos",

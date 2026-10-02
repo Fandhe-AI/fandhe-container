@@ -483,6 +483,8 @@ mod imp {
     /// 残る副作用もあるため）。
     #[derive(Debug)]
     pub(crate) struct BindLock {
+        /// fork の子へのロック継承を防ぐ登録（`_file` より先に drop される順序で置く）。
+        _fork_guard: crate::sys::ForkGuard,
         /// flock を保持する fd（drop で解放）。
         _file: File,
         /// ロックファイル名（unmanaged 判定時の後始末用）。
@@ -581,11 +583,27 @@ mod imp {
                 "socket lock file is not owned by the current user",
             ));
         }
-        Ok(BindLock {
+        let lock = BindLock {
+            _fork_guard: handle.fork_guard,
             _file: handle.file,
             lock_name,
             preexisting: !handle.created,
-        })
+        };
+        // 既存ファイルは「専用ロックファイル」と確認できたものだけ受け入れる。ハードリンクされた
+        // 他ファイル・無関係な既存ファイルを `record_socket` の `set_len(0)` で破壊しないため、
+        // 単一リンク（nlink == 1）かつ、空または本実装の記録形式（接頭辞付き・小サイズ）のみ許可する。
+        if lock.preexisting {
+            let valid = meta.nlink() == 1
+                && meta.len() <= 96
+                && (meta.len() == 0 || lock.recorded().is_some());
+            if !valid {
+                return Err(err(
+                    PluginErrorCode::PermissionDenied,
+                    "socket lock path is not a dedicated lock file",
+                ));
+            }
+        }
+        Ok(lock)
     }
 
     /// `O_NOFOLLOW` が symlink に対して返す errno（Linux: ELOOP=40、macOS: ELOOP=62）。
@@ -741,6 +759,34 @@ mod imp {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
+        }
+
+        /// PLUG-12: 既存の `.lock` 名が無関係ファイル・ハードリンクなら拒否し、内容を壊さない。
+        #[test]
+        fn plug12_rejects_non_dedicated_lock_file_without_truncating() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = open_dir_for_test(&t.0);
+            let victim = t.0.join("victim");
+            std::fs::write(&victim, b"precious").unwrap();
+            // 1) 無関係な内容の既存ファイル
+            let foreign = t.0.join("a.sock.lock");
+            std::fs::write(&foreign, b"hello").unwrap();
+            let name = std::ffi::CString::new("a.sock").unwrap();
+            let e = acquire_bind_lock(&dir, &name, euid).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert_eq!(std::fs::read(&foreign).unwrap(), b"hello");
+            // 2) 他ファイルへのハードリンク（内容が空でも nlink > 1 は拒否）
+            std::fs::remove_file(&foreign).unwrap();
+            std::fs::hard_link(&victim, t.0.join("b.sock.lock")).unwrap();
+            let name = std::ffi::CString::new("b.sock").unwrap();
+            let e = acquire_bind_lock(&dir, &name, euid).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        }
+
+        fn open_dir_for_test(p: &Path) -> File {
+            File::open(p).unwrap()
         }
 
         /// PLUG-12: 所有者不一致は 0700 でも拒否する（別 UID を用意せず分岐を照合する）。

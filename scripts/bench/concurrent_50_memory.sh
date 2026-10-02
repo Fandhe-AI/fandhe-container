@@ -1180,6 +1180,46 @@ dk_no_foreign() {
   [ -z "$out" ]
 }
 
+# 稼働中のコンテナのうち、今回の所有 ID（dk_ids。cidfile で検証済み）以外が 1 つもないこと。0 = なし、
+# 1 = ある、2 = docker の失敗・不正な出力。dk_no_foreign は計測前の 1 回だけだったため、後続試行の開始時と
+# 集計後にも呼び、計測中に別コンテナが起動した場合（その shim は集計対象外だがデーモン負荷には効く）に
+# 結果を公開しないようにする（CORE-9・SUP-1）。
+dk_check_foreign() {
+  local out line own o found
+  out="$(dk ps -q --no-trunc 2>/dev/null)" || return 2
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [[ "$line" =~ $hex64_re ]] || return 2
+    found=0
+    for o in "${dk_ids[@]}"; do
+      if [ "$o" = "$line" ]; then found=1; break; fi
+    done
+    [ "$found" -eq 1 ] || return 1
+  done <<<"$out"
+  return 0
+}
+
+# dk_check_foreign の結果を失敗終了へ変換する。<phase> は診断用（trial-start・after-measurement）。
+dk_require_no_foreign() { # <trial> <phase>
+  local rc=0
+  dk_check_foreign || rc=$?
+  case "$rc" in
+    0) ;;
+    1) err "foreign-containers-running" "trial=$1 phase=$2 containers other than this run's are running; refusing to publish a distorted aggregate"; exit 1 ;;
+    *) err "docker-list-failed" "trial=$1 phase=$2 could not list running containers"; exit 1 ;;
+  esac
+}
+
+# dockerd・containerd がそれぞれ 1 つだけであること。CLI の接続先デーモンの PID を CLI から特定する手段は
+# ないため、複数あると無関係なデーモンの PSS が Docker 基準値へ混入する。一意に特定できない環境は拒否する
+# （dind・複数デーモン・システム側と Docker 管理側の containerd 併存を含む。CORE-9・SUP-1）。
+dk_require_single_daemons() {
+  if [ "$DK_DOCKERD_N" -gt 1 ] || [ "$DK_CONTAINERD_N" -gt 1 ]; then
+    err "docker-daemon-ambiguous" "found dockerd=${DK_DOCKERD_N} containerd=${DK_CONTAINERD_N} processes; cannot tell which daemon the docker CLI uses, so refusing to sum unrelated daemons"
+    exit 1
+  fi
+}
+
 # 今回の実行トークンのラベルを持つコンテナの ID（停止中を含む）を DK_LISTED へ入れる。失敗・不正な出力は 1。
 dk_list_labeled() {
   local out line
@@ -1517,12 +1557,15 @@ dk_trials() {
   dk_scan_daemons
   if [ "$DK_DOCKERD_N" -lt 1 ]; then err "docker-daemon-not-local" "no dockerd process found locally (remote or rootless daemons are not supported)"; exit 1; fi
   if [ "$DK_CONTAINERD_N" -lt 1 ]; then err "docker-daemon-not-local" "no containerd process found locally (its PSS would be missing from the aggregate)"; exit 1; fi
+  dk_require_single_daemons
 
   while [ "$t" -le "$trials" ]; do
     mem_before="$(mem_available)"
     dk_ids=()
     dk_pid=()
     dk_ok=()
+    # 2 試行目以降は前試行の後始末後に別コンテナが起動していないことを確認してから起動する。
+    if [ "$t" -gt 1 ]; then dk_require_no_foreign "$t" "trial-start"; fi
     dk_spawn "$t"
     dk_wait_clients "$t"
     if [ "$DK_CLIENT_FAILED" -gt 0 ]; then exit 1; fi
@@ -1553,6 +1596,7 @@ dk_trials() {
     dk_scan_daemons
     if [ "$DK_DOCKERD_N" -lt 1 ]; then err "docker-daemon-not-local" "no dockerd process found locally"; exit 1; fi
     if [ "$DK_CONTAINERD_N" -lt 1 ]; then err "docker-daemon-not-local" "no containerd process found locally"; exit 1; fi
+    dk_require_single_daemons
     dk_seen=()
     acc_pss=0
     acc_rss=0
@@ -1592,6 +1636,7 @@ dk_trials() {
       dk_report_unstarted "$t"
       exit 1
     fi
+    dk_require_no_foreign "$t" "after-measurement"
     mem_after="$(mem_available)"
     trial_pss+=("$pss_total")
     trial_rss+=("$rss_total")

@@ -612,6 +612,8 @@ expect_has "help-mentions-task-50-2" "$out" "TASK-50.2"
 #   STUB_DK_EXIT_AFTER=<n>: 1 番目のコンテナが n 回目の inspect の後に exited を報告する（集計中の終了の模擬）
 #   STUB_DK_ZERO_PSS=1 / STUB_DK_BAD_PSS=<文字列> / STUB_DK_NO_SMAPS=1: 値の異常 / STUB_DK_SHIM_COMM=<名前>: shim の comm
 #   STUB_DK_RM_FAIL=1: docker rm -f が何もせず失敗する / STUB_DK_RUN_SLEEP=<秒>: docker run が作成前に待つ
+#   STUB_DK_FOREIGN_LATE=1 / STUB_DK_FOREIGN_AFTER_RM=1: 集計後 / 1 試行目の後始末後に別コンテナが稼働している
+#   STUB_SEED_EXTRA_DAEMON=<comm>: 疑似 /proc に 2 つ目のデーモン（別 pid）を置く
 #   STUB_SEED_NO_DOCKERD=1: 疑似 /proc に dockerd を置かない
 #   STUB_SEED_NO_CONTAINERD=1: 疑似 /proc に containerd を置かない
 dkstub="$work/stub-docker"
@@ -642,6 +644,16 @@ case "$cmd" in
     done
     if [ -z "$filter" ]; then
       if [ -n "${STUB_DK_FOREIGN:-}" ]; then printf '%064d\n' 7; fi
+      # 実 docker は所有コンテナも列挙する（running のものだけ）。
+      for d in "$st"/c/*/; do
+        [ -d "$d" ] || continue
+        read -r cs _ <"$d/state" || true
+        if [ "$cs" = "running" ]; then basename "$d"; fi
+      done
+      # 計測中に別コンテナが起動した模擬: 所有コンテナが存在する間（集計後の確認）に現れる。
+      if [ -n "${STUB_DK_FOREIGN_LATE:-}" ] && [ -n "$(ls -A "$st/c" 2>/dev/null)" ]; then printf '%064d\n' 8; fi
+      # 後続試行の開始時の模擬: 1 試行目の後始末（rm -f）の後に現れる。
+      if [ -n "${STUB_DK_FOREIGN_AFTER_RM:-}" ] && [ -s "$st/rm.log" ]; then printf '%064d\n' 9; fi
       exit 0
     fi
     for d in "$st"/c/*/; do
@@ -736,7 +748,9 @@ dk_reset() {
   mkdir -p "$work/fake" "$work/dk/c"
   : >"$work/dk/rm.log"
   local pid comm pss
-  for spec in "500001 dockerd 2000" "500002 containerd 500"; do
+  local specs=("500001 dockerd 2000" "500002 containerd 500")
+  if [ -n "${STUB_SEED_EXTRA_DAEMON:-}" ]; then specs+=("500003 ${STUB_SEED_EXTRA_DAEMON} 700"); fi
+  for spec in "${specs[@]}"; do
     read -r pid comm pss <<<"$spec"
     if [ "$comm" = "dockerd" ] && [ -n "${STUB_SEED_NO_DOCKERD:-}" ]; then continue; fi
     if [ "$comm" = "containerd" ] && [ -n "${STUB_SEED_NO_CONTAINERD:-}" ]; then continue; fi
@@ -868,6 +882,24 @@ expect_eq "dk-no-containerd-exit1" 1 "$rc"
 expect_has "dk-no-containerd-stderr" "$errf" "no containerd process found locally"
 expect_eq "dk-no-containerd-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "dk-no-containerd-rm-count" 0 "$(dk_rm_count)"
+
+STUB_SEED_EXTRA_DAEMON=dockerd run_dk --count 3 --trials 1
+expect_eq "dk-two-dockerd-exit1" 1 "$rc"
+expect_has "dk-two-dockerd-stderr" "$errf" "docker-daemon-ambiguous"
+expect_eq "dk-two-dockerd-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "dk-two-dockerd-no-run" 0 "$(dk_remaining)"
+STUB_SEED_EXTRA_DAEMON=containerd run_dk --count 3 --trials 1
+expect_eq "dk-two-containerd-exit1" 1 "$rc"
+expect_has "dk-two-containerd-stderr" "$errf" "docker-daemon-ambiguous"
+STUB_DK_FOREIGN_LATE=1 run_dk --count 3 --trials 1
+expect_eq "dk-foreign-late-exit1" 1 "$rc"
+expect_has "dk-foreign-late-stderr" "$errf" "phase=after-measurement"
+expect_eq "dk-foreign-late-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "dk-foreign-late-no-residual" 0 "$(dk_remaining)"
+STUB_DK_FOREIGN_AFTER_RM=1 run_dk --count 3 --trials 2
+expect_eq "dk-foreign-trial2-exit1" 1 "$rc"
+expect_has "dk-foreign-trial2-stderr" "$errf" "trial=2 phase=trial-start"
+expect_eq "dk-foreign-trial2-stdout-empty" 0 "$(wc -c <"$out")"
 
 # --- D8. 集計中にコンテナが終了したら exit 1（CORE-9。N 個同時稼働時の値ではない） ---
 STUB_DK_EXIT_AFTER=2 run_dk --count 3 --trials 1

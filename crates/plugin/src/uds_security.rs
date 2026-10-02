@@ -343,7 +343,7 @@ mod imp {
 
         /// PLUG-12: 基底が他ユーザー書き込み可・他 UID 所有・symlink なら拒否する。
         #[test]
-        fn plug12_rejects_unsafe_base() {
+        fn plug12_rejects_untrusted_base() {
             let t = Tmp::new();
             let euid = crate::sys::effective_uid();
             for mode in [0o770u32, 0o707, 0o777] {
@@ -396,6 +396,48 @@ mod imp {
             assert!(!base.join(RUNTIME_DIR_NAME).exists());
             std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o700)).unwrap();
             assert!(ensure_dir(&base, euid).is_ok());
+        }
+
+        /// PLUG-12: 基底の祖先（最終要素以外）の symlink は実パスへ解決し、返すパスは実パス側になる
+        /// （以降の検証・open は実パスを symlink 非追従で辿る）。
+        #[test]
+        fn plug12_resolves_ancestor_symlink_to_real_path() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let real_mid = t.0.join("mid");
+            let real_base = real_mid.join("base");
+            DirBuilder::new().mode(0o700).create(&real_mid).unwrap();
+            DirBuilder::new().mode(0o700).create(&real_base).unwrap();
+            let link = t.0.join("link");
+            std::os::unix::fs::symlink(&real_mid, &link).unwrap();
+            let got = ensure_dir(&link.join("base"), euid).unwrap();
+            let expected = std::fs::canonicalize(&real_base)
+                .unwrap()
+                .join(RUNTIME_DIR_NAME);
+            assert_eq!(got.path(), expected.as_path());
+            let mode = std::fs::symlink_metadata(&expected).unwrap().mode();
+            assert_eq!(mode & 0o7777, 0o700);
+        }
+
+        /// PLUG-12: 祖先の所有者が root・自 UID 以外なら拒否する（別 UID を用意せず分岐を照合する）。
+        #[test]
+        fn plug12_verify_ancestor_rejects_untrusted_owner_and_accepts_sticky() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let meta = std::fs::symlink_metadata(&t.0).unwrap();
+            assert!(verify_ancestor(&meta, euid).is_ok());
+            if euid != 0 {
+                let err = verify_ancestor(&meta, euid.wrapping_add(1)).unwrap_err();
+                assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+                assert_eq!(
+                    err.message(),
+                    "runtime directory ancestor has an untrusted owner"
+                );
+            }
+            std::fs::set_permissions(&t.0, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            let sticky = std::fs::symlink_metadata(&t.0).unwrap();
+            assert!(verify_ancestor(&sticky, euid).is_ok());
+            std::fs::set_permissions(&t.0, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
 
         #[test]

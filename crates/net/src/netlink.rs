@@ -33,7 +33,8 @@ pub const NLMSG_HEADER_LEN: usize = 16;
 pub const ATTR_HEADER_LEN: usize = 4;
 /// メッセージ・属性の境界（`NLMSG_ALIGNTO` = `RTA_ALIGNTO`）。
 pub const ALIGN_TO: usize = 4;
-/// 1 メッセージの上限長。暫定値 1 MiB（spec に根拠値なし）。#843 の受信バッファ長決定時に見直す（REPAIR-3）。
+/// 1 メッセージの上限長。暫定値 1 MiB（spec に根拠値なし。REPAIR-3）。#843 のソケット層は受信する
+/// 1 データグラムの上限長にも同じ値を使う（`netlink_route::MAX_RECV_DATAGRAM_LEN`）。
 pub const MAX_MESSAGE_LEN: u32 = 1024 * 1024;
 /// `rta_len` が u16 のため、属性ペイロードの上限は 65535 - 4。
 pub const MAX_ATTR_PAYLOAD_LEN: usize = 65531;

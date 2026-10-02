@@ -727,7 +727,11 @@ mod imp {
         ) -> (Result<(), PluginError>, bool) {
             let saved = self.save_timeouts();
             let deadline = Instant::now() + timeout.as_duration();
-            let result = self.write_all_deadline(&frame.encode(), deadline);
+            // encode（最大 16 MiB のコピーとチェックサム計算）も合計期限に含める。encode 後に期限を
+            // 超えていれば 1 バイトも送らず Timeout にする（REPAIR-5）。
+            let encoded = frame.encode();
+            let result = remaining_until(deadline, FrameOp::Write)
+                .and_then(|_| self.write_all_deadline(&encoded, deadline));
             let restored = self.restore_timeouts(saved);
             (result, restored)
         }
@@ -763,7 +767,10 @@ mod imp {
                 let slice = body.get_mut(start..).ok_or_else(internal_read)?;
                 self.read_exact_deadline(slice, deadline)?;
             }
-            Frame::decode_body(header, &body)
+            let frame = Frame::decode_body(header, &body)?;
+            // チェックサム検証・ペイロードコピーの後に期限を超えていれば成功扱いにしない（REPAIR-5）。
+            remaining_until(deadline, FrameOp::Read)?;
+            Ok(frame)
         }
 
         /// 合計期限 `deadline` までに `buf` をちょうど埋める。残り時間で read 期限を掛け直す。

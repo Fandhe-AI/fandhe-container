@@ -160,7 +160,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 - plugin 境界フレーム（長さ接頭辞フレーム。PLUG-2）の符号化・復号、壊れたフレームや長さ上限超過を拒否することのユニットテスト。フレームは型で組み立てる（REPAIR-2）。plugin からの入力は untrusted として検証する
 - plugin RPC の応答待ちがタイムアウトで打ち切られることの結合試験（REPAIR-5。フレーム単位の待機は `crates/plugin/tests/transport_frame_io.rs`〔#250〕。要求・応答の往復の試験は TASK-107.7・#251）
 - PLUG-4「core 無変更」の 3 点比較（core 側ソースの sha256 一覧・`cargo tree -p <core> --locked -e normal` で見た core の依存木・core バイナリの sha256。[crate-naming.md](docs/design/crate-naming.md) 決定 3）が変化しないこと。**現状**: 判定の仕組みは TASK-109 で実装予定で未実装。plugin を通すために core 側のソースやテストを書き換えないこと（PLUG-4 違反は既存の P0 観点）
-- plugin の信頼性検証（PLUG-11: 他ユーザー書き込み可能な場所・ハッシュ不一致の plugin の登録拒否）と UDS 境界（PLUG-12: 権限・peer credential 検証）について、新しい plugin を対象にしたケース。**現状**: 検証の仕組みは TASK-109・TASK-122〜124 で実装予定で未実装
+- plugin の信頼性検証（PLUG-11: 他ユーザー書き込み可能な場所・ハッシュ不一致の plugin の登録拒否）と UDS 境界（PLUG-12: 権限・peer credential 検証）について、新しい plugin を対象にしたケース。**現状**: 管理ディレクトリからの候補探索のみ TASK-109.1 で実装済み（候補は未検証）。PATH opt-in・レジストリ・信頼性検証は TASK-109.2〜・TASK-122〜124 で実装予定で未実装
 - plugin 境界のベンチ（TASK-113 の `plugin_boundary` 系）。**現状**: 未実装
 - `plugin-microvm` 等 microVM 系の依存に触れる場合は `make deny` の禁止クレート検査（MVM-4）。**現状**: 機械判定（`scripts/check-microvm-deps.sh`・`deny.toml` `[bans]`）は TASK-73 で導入予定
 - macOS Virtualization.framework・WSL2・KVM を使うバックエンド plugin（`plugin-macos`・`plugin-windows`・`plugin-microvm`）の実機依存テストは、実機前提テストとして分離する（[ci](.claude/rules/ci.md)「実機前提テスト」）

@@ -151,6 +151,10 @@ mod linux {
                 ));
             }
         };
+        // `--child` は親の `unshare --net` 経路を通らず直接起動できてしまう。root が host の netns で
+        // 直接起動すると host に bridge 作成と link up が及ぶため、操作前に隔離を確認し、
+        // 確認できなければ拒否する（P0・fail-closed）。
+        ensure_isolated_netns()?;
         println!("ready");
         // パイプ越しでも確実に親へ届けるため明示的に flush する（go 待ちでブロックする前）。
         std::io::stdout().flush().map_err(|e| {
@@ -170,6 +174,47 @@ mod linux {
                     format!("IFF_UP not set on {n}: flags={flags:#x}"),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// 自分が新規 netns にいることを確認する。次の 2 条件をどちらも満たさなければ拒否する。
+    /// - 親プロセスの netns と inode が異なる（`unshare --net` 経由なら親は host の netns）
+    /// - `/proc/self/net/dev` が loopback `lo` のみ（新規 netns は `lo` だけを持つ）
+    fn ensure_isolated_netns() -> Result<(), NetError> {
+        let deny = |m: String| NetError::new(NetErrorCode::FailedPrecondition, m);
+        let io = |what: &str, e: std::io::Error| {
+            NetError::new(NetErrorCode::Internal, format!("{what} failed: {e}"))
+        };
+        let status = std::fs::read_to_string("/proc/self/status")
+            .map_err(|e| io("read /proc/self/status", e))?;
+        let ppid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .ok_or_else(|| deny("cannot determine parent pid; refusing to run".to_owned()))?;
+        let own = std::fs::read_link("/proc/self/ns/net")
+            .map_err(|e| io("readlink /proc/self/ns/net", e))?;
+        let parent = std::fs::read_link(format!("/proc/{ppid}/ns/net"))
+            .map_err(|e| deny(format!("cannot read parent netns ({e}); refusing to run")))?;
+        if own == parent {
+            return Err(deny(format!(
+                "child shares the parent's netns ({}); run via the parent test (`-- --ignored`)",
+                own.display()
+            )));
+        }
+        let dev = std::fs::read_to_string("/proc/self/net/dev")
+            .map_err(|e| io("read /proc/self/net/dev", e))?;
+        let foreign: Vec<&str> = dev
+            .lines()
+            .skip(2)
+            .filter_map(|l| l.split(':').next().map(str::trim))
+            .filter(|n| !n.is_empty() && *n != "lo")
+            .collect();
+        if !foreign.is_empty() {
+            return Err(deny(format!(
+                "netns is not fresh (interfaces present: {foreign:?}); refusing to run"
+            )));
         }
         Ok(())
     }

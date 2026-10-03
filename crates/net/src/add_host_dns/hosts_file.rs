@@ -584,6 +584,8 @@ mod tests {
             up.as_path(),
             outside.path.as_path(), // 絶対パス（管理ルート外）
             Path::new("./hosts"),
+            Path::new("sub/./hosts"),
+            Path::new("hosts/."),
             Path::new(""),
         ] {
             let e = apply_add_hosts(&f.root, rel, ["web:192.0.2.1"]).unwrap_err();
@@ -627,6 +629,17 @@ mod tests {
         assert_eq!(parse_fdinfo_mnt_id("mnt_id:\tabc\n"), None);
         assert_eq!(parse_fdinfo_mnt_id("mnt_id:\t-1\n"), None);
         assert_eq!(parse_fdinfo_mnt_id(""), None);
+    }
+
+    /// NET-12・P2: 生のパスの `.` 要素（先頭・途中・末尾）を検出し、通常の名前は誤検出しない。
+    #[test]
+    fn cur_dir_segments_are_detected_anywhere() {
+        for p in ["./h", "a/./h", "a/.", "/a/./b", "."] {
+            assert!(has_cur_dir_segment(Path::new(p)), "{p}");
+        }
+        for p in ["a/h", ".hidden/h", "a/..b", "/a/b", "a/.../h"] {
+            assert!(!has_cur_dir_segment(Path::new(p)), "{p}");
+        }
     }
 
     /// NET-12・TASK-185.2（P0）: 管理ルートと同じマウント上のファイルは通す。
@@ -699,7 +712,12 @@ mod tests {
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
         assert_eq!(std::fs::read_to_string(&real.path).unwrap(), "orig\n");
 
-        for bad in [Path::new("relative/root"), &alias_root.join("..").join("x")] {
+        let dotted = std::path::PathBuf::from(format!("{}/./x", alias_root.display()));
+        for bad in [
+            Path::new("relative/root"),
+            &alias_root.join("..").join("x"),
+            dotted.as_path(),
+        ] {
             let e = open_abs_dir_nofollow(bad).unwrap_err();
             assert_eq!(e.code(), NetErrorCode::InvalidArgument, "{bad:?}");
             assert_eq!(

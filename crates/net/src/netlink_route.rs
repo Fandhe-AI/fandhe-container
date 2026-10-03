@@ -12,6 +12,8 @@
 //! link 作成・設定の送信ラッパー（`NetlinkRouteSocket::create_link` / `set_link`。`RTM_SETLINK` の
 //! netns 移動・up は [`LinkSet`]。TASK-136.3.2・#846）も提供する。address / route 操作（`addr_route` モジュール。
 //! `AddressSpec`・`RouteSpec`・`add_address`・`add_route`。TASK-136.4・#301）も本層の上に載る。
+//! 実機前提の結合テスト（`tests/link_netns_privileged.rs`・`tests/netlink_route_addr_route.rs`。
+//! TASK-136.5・#302）と既定集合からの分離方式は `AGENTS.md`「実機前提テスト」節を参照。
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!

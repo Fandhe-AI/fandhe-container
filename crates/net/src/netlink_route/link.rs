@@ -1,10 +1,11 @@
 //! `RTM_NEWLINK` による bridge / veth ペアの作成メッセージ組み立て（TASK-136.3.1・#845・NET-11・MS-8）。
 //!
 //! `struct ifinfomsg` と `IFLA_*` 属性を `crate::netlink::NlMsgBuilder` で組み立てるだけの OS 非依存
-//! モジュールで、ソケットも `unsafe` も持たない。呼び出し元（#846 TASK-136.3.2 の送信ラッパー）は
+//! モジュールで、ソケットも `unsafe` も持たない。呼び出し元（`NetlinkRouteSocket::create_link` /
+//! `set_link`。Linux のみ。#846 TASK-136.3.2）は
 //! `NetlinkRouteSocket::request(req.msg_type(), req.flags(), timeout, |b| req.encode(b))` の
-//! `build` クロージャから [`LinkCreate::encode`] を呼ぶ。`NLM_F_REQUEST | NLM_F_ACK` は
-//! `request` が付与するため [`LinkCreate::flags`] には含めない。
+//! `build` クロージャから [`LinkCreate::encode`] / [`LinkSet::encode`] を呼ぶ。
+//! `NLM_F_REQUEST | NLM_F_ACK` は `request` が付与するため `flags()` には含めない。
 //!
 //! # ワイヤーレイアウト
 //!
@@ -26,7 +27,22 @@
 //!       VETH_INFO_PEER (nested)
 //!         ifinfomsg(16B, すべて 0)   <- peer 側は 2 つ目の ifinfomsg で始まる
 //!         IFLA_IFNAME = "veth1\0"
+//!
+//! RTM_SETLINK（netns 移動）:
+//!   nlmsghdr(RTM_SETLINK, flags = 0)
+//!   ifinfomsg(index = ifindex か 0, flags = 0, change = 0)   <- 値入りフィールドはネイティブ順
+//!   [IFLA_IFNAME = "veth0\0"]                                 <- 名前で指定するときだけ
+//!   IFLA_NET_NS_PID = u32  または  IFLA_NET_NS_FD = u32
+//!
+//! RTM_SETLINK（up）:
+//!   ifinfomsg(index, flags = IFF_UP, change = IFF_UP) + [IFLA_IFNAME]
 //! ```
+//!
+//! # netns 移動と up の順序（カーネル挙動）
+//!
+//! 移動したデバイスは元の netns から消え、移動先では down になる。up は移動先 netns の中に
+//! netlink ソケットを持つプロセスが別の `RTM_SETLINK` として送る（移動元のソケットからは届かない）。
+//! bridge は `NETIF_F_NETNS_LOCAL` のため netns 間を移動できない（移動先 netns の中で作る）。
 //!
 //! # 信頼境界
 //!
@@ -35,9 +51,13 @@
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
-//! - ソケットへの送信ラッパーと `NetOpKind` の拡張（#846・TASK-136.3.2）
-//! - `RTM_SETLINK`（netns 移動 `IFLA_NET_NS_PID/FD`・up の `IFF_UP`）（#846）
-//! - MTU・MAC 等の追加属性、bridge のオプション（`IFLA_BR_*`）、`RTM_DELLINK` の組み立て
+//! - down 操作、MTU・MAC 等の追加属性、bridge のオプション（`IFLA_BR_*`）、bridge への接続
+//!   （`IFLA_MASTER`）、`RTM_DELLINK` の組み立て（公開 API なし）
+//! - netns を作る・開く API（実機テストは外部コマンド `unshare(1)` と `/proc/<pid>/ns/net` を使う）
+
+use std::marker::PhantomData;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd as _, BorrowedFd};
 
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{NLM_F_CREATE, NLM_F_EXCL, NlMsgBuilder};
@@ -56,6 +76,12 @@ pub const AF_UNSPEC: u8 = 0;
 pub const IFINFOMSG_LEN: usize = 16;
 /// インターフェース名属性（`linux/if_link.h`）。
 pub const IFLA_IFNAME: u16 = 3;
+/// 移動先 netns を PID で指定する属性（`linux/if_link.h`）。
+pub const IFLA_NET_NS_PID: u16 = 19;
+/// 移動先 netns を ns ファイルの fd で指定する属性（`linux/if_link.h`）。
+pub const IFLA_NET_NS_FD: u16 = 28;
+/// リンクを up にするフラグ（`linux/if.h` の `IFF_UP`）。
+pub const IFF_UP: u32 = 0x1;
 /// リンク種別情報のネスト属性（`linux/if_link.h`）。
 pub const IFLA_LINKINFO: u16 = 18;
 /// リンク種別名（`bridge`・`veth` 等。`linux/if_link.h`）。
@@ -173,6 +199,174 @@ impl LinkCreate {
             }
             Ok(())
         })
+    }
+}
+
+/// 値を指定した `ifinfomsg`。値入りフィールドはネイティブバイトオーダー（`to_ne_bytes`）。
+fn ifinfomsg(index: i32, flags: u32, change: u32) -> [u8; IFINFOMSG_LEN] {
+    let mut m = [AF_UNSPEC; IFINFOMSG_LEN];
+    if let Some(d) = m.get_mut(4..8) {
+        d.copy_from_slice(&index.to_ne_bytes());
+    }
+    if let Some(d) = m.get_mut(8..12) {
+        d.copy_from_slice(&flags.to_ne_bytes());
+    }
+    if let Some(d) = m.get_mut(12..16) {
+        d.copy_from_slice(&change.to_ne_bytes());
+    }
+    m
+}
+
+/// 検証済みの ifindex（正の値のみ。REPAIR-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkIndex(i32);
+
+impl LinkIndex {
+    /// 1 以上を受け付ける。0 以下は `InvalidArgument`。
+    pub fn new(index: i32) -> Result<Self, NetError> {
+        if index <= 0 {
+            return Err(invalid("link index must be positive"));
+        }
+        Ok(Self(index))
+    }
+
+    /// ifindex の値。
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// リンクの指定方法。`Name` は `ifi_index = 0` + `IFLA_IFNAME` でカーネルが引く。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkRef {
+    /// ifindex で指定する（`IFLA_IFNAME` は付けない）。
+    Index(LinkIndex),
+    /// 名前で指定する。
+    Name(IfName),
+}
+
+/// 検証済みの PID（`1..=i32::MAX`）。呼び出し側の pid namespace で解釈される。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetnsPid(u32);
+
+impl NetnsPid {
+    /// 範囲外（0・`i32::MAX` 超）は `InvalidArgument`。
+    pub fn new(pid: u32) -> Result<Self, NetError> {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return Err(invalid("netns pid must be in 1..=i32::MAX"));
+        }
+        Ok(Self(pid))
+    }
+
+    /// PID の値。
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// netns を指す ns ファイル（`/proc/<pid>/ns/net` 等）の fd。借用の寿命の間だけ開いていればよい
+/// （`request` は ACK まで同期で待つため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetnsFd<'a> {
+    raw: u32,
+    _borrow: PhantomData<&'a ()>,
+}
+
+impl<'a> NetnsFd<'a> {
+    /// 借用した fd から作る。負の fd は `InvalidArgument`。
+    #[cfg(unix)]
+    pub fn new(fd: BorrowedFd<'a>) -> Result<Self, NetError> {
+        let raw =
+            u32::try_from(fd.as_raw_fd()).map_err(|_| invalid("netns fd must not be negative"))?;
+        Ok(Self {
+            raw,
+            _borrow: PhantomData,
+        })
+    }
+
+    /// fd 番号。
+    pub fn raw(&self) -> u32 {
+        self.raw
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(raw: u32) -> Self {
+        Self {
+            raw,
+            _borrow: PhantomData,
+        }
+    }
+}
+
+/// 移動先 netns の指定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetnsTarget<'a> {
+    /// PID 指定（`IFLA_NET_NS_PID`）。
+    Pid(NetnsPid),
+    /// ns fd 指定（`IFLA_NET_NS_FD`）。
+    Fd(NetnsFd<'a>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetKind<'a> {
+    MoveToNetns {
+        link: LinkRef,
+        target: NetnsTarget<'a>,
+    },
+    Up {
+        link: LinkRef,
+    },
+}
+
+/// `RTM_SETLINK` によるリンク設定要求（netns 移動・up）。
+///
+/// 送信は `NetlinkRouteSocket::set_link`（Linux のみ）。netns 移動後の up は移動先 netns の
+/// ソケットから送ること（モジュール doc 参照）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSet<'a>(SetKind<'a>);
+
+impl<'a> LinkSet<'a> {
+    /// リンクを `target` の netns へ移動する要求。
+    pub fn move_to_netns(link: LinkRef, target: NetnsTarget<'a>) -> Self {
+        Self(SetKind::MoveToNetns { link, target })
+    }
+
+    /// リンクを up にする要求（`IFF_UP` のみ変更する）。
+    pub fn up(link: LinkRef) -> Self {
+        Self(SetKind::Up { link })
+    }
+
+    /// `nlmsg_type`（常に `RTM_SETLINK`）。
+    pub fn msg_type(&self) -> u16 {
+        RTM_SETLINK
+    }
+
+    /// `nlmsg_flags`（0。REQUEST / ACK は `request` が付与する）。
+    pub fn flags(&self) -> u16 {
+        0
+    }
+
+    /// nlmsghdr の後ろに続く `ifinfomsg` と属性を `b` へ書き込む。
+    pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
+        let (link, flags, change) = match &self.0 {
+            SetKind::MoveToNetns { link, .. } => (link, 0, 0),
+            SetKind::Up { link } => (link, IFF_UP, IFF_UP),
+        };
+        let (index, name) = match link {
+            LinkRef::Index(i) => (i.get(), None),
+            LinkRef::Name(n) => (0, Some(n)),
+        };
+        b.put_fixed(&ifinfomsg(index, flags, change))?;
+        if let Some(n) = name {
+            b.put_attr(IFLA_IFNAME, &n.to_nul_terminated())?;
+        }
+        if let SetKind::MoveToNetns { target, .. } = &self.0 {
+            match target {
+                NetnsTarget::Pid(p) => b.put_attr(IFLA_NET_NS_PID, &p.get().to_ne_bytes())?,
+                NetnsTarget::Fd(f) => b.put_attr(IFLA_NET_NS_FD, &f.raw().to_ne_bytes())?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -317,5 +511,144 @@ mod tests {
         let f = LinkCreate::bridge(name("br0")).flags();
         assert_eq!(f, 0x0600);
         assert_eq!(f & (NLM_F_REQUEST | NLM_F_ACK), 0);
+    }
+
+    fn build_set(req: &LinkSet<'_>) -> Vec<u8> {
+        let mut b = NlMsgBuilder::new(req.msg_type(), req.flags(), 0x1234, 0);
+        req.encode(&mut b).unwrap();
+        b.finish().unwrap()
+    }
+
+    fn set_attrs(data: &[u8]) -> (Vec<u8>, Vec<(u16, Vec<u8>)>) {
+        let mut it = NlMsgIter::new(data);
+        let msg = it.next().unwrap().unwrap();
+        let ifi = msg.payload().get(..IFINFOMSG_LEN).unwrap().to_vec();
+        let attrs = msg
+            .attrs(IFINFOMSG_LEN)
+            .unwrap()
+            .map(|a| {
+                let a = a.unwrap();
+                (a.attr_type(), a.payload().to_vec())
+            })
+            .collect();
+        (ifi, attrs)
+    }
+
+    /// NET-11: netns 移動(PID 指定)のメッセージ全体を期待バイト列と完全一致で比べる。
+    #[test]
+    fn net11_setlink_move_by_pid_golden_bytes() {
+        let req = LinkSet::move_to_netns(
+            LinkRef::Name(name("veth1")),
+            NetnsTarget::Pid(NetnsPid::new(4242).unwrap()),
+        );
+        let data = build_set(&req);
+        let mut e = Vec::new();
+        // len = 16 + 16 + 12 (IFNAME: 4 + 6 + 2 pad) + 8 (NET_NS_PID) = 52
+        e.extend_from_slice(&52u32.to_ne_bytes());
+        e.extend_from_slice(&19u16.to_ne_bytes());
+        e.extend_from_slice(&0u16.to_ne_bytes());
+        e.extend_from_slice(&0x1234u32.to_ne_bytes());
+        e.extend_from_slice(&0u32.to_ne_bytes());
+        e.extend_from_slice(&[0u8; 16]);
+        e.extend_from_slice(&10u16.to_ne_bytes());
+        e.extend_from_slice(&3u16.to_ne_bytes());
+        e.extend_from_slice(b"veth1\0");
+        e.extend_from_slice(&[0, 0]);
+        e.extend_from_slice(&8u16.to_ne_bytes());
+        e.extend_from_slice(&19u16.to_ne_bytes());
+        e.extend_from_slice(&4242u32.to_ne_bytes());
+        assert_eq!(data, e);
+    }
+
+    /// NET-11: FD 指定は IFLA_NET_NS_FD(28) を持ち、IFLA_NET_NS_PID を持たない。
+    #[test]
+    fn net11_setlink_move_by_fd_has_net_ns_fd_attr() {
+        let req = LinkSet::move_to_netns(
+            LinkRef::Name(name("veth1")),
+            NetnsTarget::Fd(NetnsFd::from_raw_for_test(7)),
+        );
+        let (_, attrs) = set_attrs(&build_set(&req));
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0], (IFLA_IFNAME, b"veth1\0".to_vec()));
+        assert_eq!(attrs[1], (28, 7u32.to_ne_bytes().to_vec()));
+        assert!(attrs.iter().all(|(t, _)| *t != IFLA_NET_NS_PID));
+    }
+
+    /// NET-11: ifindex 指定は ifi_index に入り IFLA_IFNAME を付けない。
+    #[test]
+    fn net11_setlink_move_by_index_sets_ifi_index_without_ifname() {
+        let req = LinkSet::move_to_netns(
+            LinkRef::Index(LinkIndex::new(5).unwrap()),
+            NetnsTarget::Pid(NetnsPid::new(1).unwrap()),
+        );
+        let (ifi, attrs) = set_attrs(&build_set(&req));
+        assert_eq!(ifi.get(4..8).unwrap(), &5i32.to_ne_bytes());
+        assert_eq!(ifi.get(8..16).unwrap(), &[0u8; 8]);
+        assert_eq!(attrs, vec![(19, 1u32.to_ne_bytes().to_vec())]);
+    }
+
+    /// NET-11: up は flags と change の両方に IFF_UP だけを立てる。
+    #[test]
+    fn net11_setlink_up_sets_iff_up_flag_and_change_mask() {
+        let (ifi, attrs) = set_attrs(&build_set(&LinkSet::up(LinkRef::Name(name("br0")))));
+        assert_eq!(ifi.get(4..8).unwrap(), &0i32.to_ne_bytes());
+        assert_eq!(ifi.get(8..12).unwrap(), &1u32.to_ne_bytes());
+        assert_eq!(ifi.get(12..16).unwrap(), &1u32.to_ne_bytes());
+        assert_eq!(attrs, vec![(IFLA_IFNAME, b"br0\0".to_vec())]);
+    }
+
+    /// NET-11: up のメッセージ全体を期待バイト列と完全一致で比べる。
+    #[test]
+    fn net11_setlink_up_golden_bytes() {
+        let data = build_set(&LinkSet::up(LinkRef::Index(LinkIndex::new(3).unwrap())));
+        let mut e = Vec::new();
+        e.extend_from_slice(&32u32.to_ne_bytes());
+        e.extend_from_slice(&19u16.to_ne_bytes());
+        e.extend_from_slice(&0u16.to_ne_bytes());
+        e.extend_from_slice(&0x1234u32.to_ne_bytes());
+        e.extend_from_slice(&0u32.to_ne_bytes());
+        e.extend_from_slice(&[0, 0, 0, 0]);
+        e.extend_from_slice(&3i32.to_ne_bytes());
+        e.extend_from_slice(&1u32.to_ne_bytes());
+        e.extend_from_slice(&1u32.to_ne_bytes());
+        assert_eq!(data, e);
+    }
+
+    /// NET-11: RTM_SETLINK の flags は 0（CREATE / EXCL / REQUEST / ACK を含まない）。
+    #[test]
+    fn net11_setlink_flags_exclude_create_excl_request_ack() {
+        let req = LinkSet::up(LinkRef::Name(name("br0")));
+        assert_eq!(req.msg_type(), 19);
+        assert_eq!(req.flags(), 0);
+    }
+
+    /// NET-11・REPAIR-2: PID と ifindex の範囲外を拒否し境界値は受理する。
+    #[test]
+    fn net11_netns_pid_and_link_index_validation() {
+        for bad in [0u32, i32::MAX as u32 + 1, u32::MAX] {
+            let e = NetnsPid::new(bad).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument, "{bad}");
+        }
+        assert_eq!(NetnsPid::new(1).unwrap().get(), 1);
+        assert_eq!(
+            NetnsPid::new(i32::MAX as u32).unwrap().get(),
+            i32::MAX as u32
+        );
+        for bad in [0i32, -1, i32::MIN] {
+            let e = LinkIndex::new(bad).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument, "{bad}");
+        }
+        assert_eq!(LinkIndex::new(1).unwrap().get(), 1);
+        assert_eq!(LinkIndex::new(i32::MAX).unwrap().get(), i32::MAX);
+    }
+
+    /// NET-11: 借用した fd から作った NetnsFd の fd 番号は元の fd と一致する。
+    #[cfg(unix)]
+    #[test]
+    fn net11_netns_fd_from_borrowed_fd() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let f = std::fs::File::open(env!("CARGO_MANIFEST_DIR").to_owned() + "/Cargo.toml").unwrap();
+        let nfd = NetnsFd::new(f.as_fd()).unwrap();
+        assert_eq!(nfd.raw(), f.as_raw_fd() as u32);
     }
 }

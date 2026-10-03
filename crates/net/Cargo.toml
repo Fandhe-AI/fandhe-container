@@ -9,3 +9,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+# bridge・veth の作成 → netns 移動 → up の実機結合試験（NET-11・TASK-136.3.2・#846）。libtest のスレッド実行と
+# 子の再入（--child）を分けるため harness = false。root と unshare --net が要る実機前提テストなので
+# -- --ignored 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "link_netns_privileged"
+path = "tests/link_netns_privileged.rs"
+harness = false

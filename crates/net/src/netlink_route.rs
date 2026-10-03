@@ -9,7 +9,8 @@
 //! （[`decode_nlmsgerr`]）・seq 一致の ACK / エラー判定・全体期限つきの応答待ち
 //! （`NetlinkRouteSocket::request`。Linux のみ。TASK-136.2.2・#844・REPAIR-5）を提供する。
 //! bridge・veth の作成メッセージ（`RTM_NEWLINK`。[`LinkCreate`]。TASK-136.3.1・#845）も組み立てる。
-//! link の送信ラッパー（#846）・address / route 操作（#301）が本層を呼ぶ。
+//! link 作成・設定の送信ラッパー（`NetlinkRouteSocket::create_link` / `set_link`。`RTM_SETLINK` の
+//! netns 移動・up は [`LinkSet`]。TASK-136.3.2・#846）も提供する。address / route 操作（#301）が本層を呼ぶ。
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
@@ -17,7 +18,7 @@
 //! - 自ソケットの `nl_pid` 取得（`getsockname`）と応答 `nlmsg_pid` の照合。マルチキャスト購読が
 //!   なく送信元がカーネルであることは `recv` が検証済みのため、現状は seq 照合で足りる
 //! - dump 中断（`NLM_F_DUMP_INTR`）の自動再試行（検出して `FailedPrecondition` で返すのみ）、複数スレッドでの seq 別の待機者振り分け（往復は 1 件ずつ直列化する）
-//! - link 作成メッセージの送信ラッパー・netns 移動・up（`RTM_SETLINK`。#846）、address / route の各操作（#301）
+//! - address / route の各操作（#301）、link の down・削除・属性変更の送信ラッパー
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -147,6 +148,7 @@ mod socket {
         NLM_F_ROOT, NLMSG_DONE, NLMSG_ERROR, NLMSG_HEADER_LEN, NLMSG_NOOP, NLMSG_OVERRUN,
         NlMsgBuilder, NlMsgHeader, NlMsgIter,
     };
+    use crate::netlink_route::{LinkCreate, LinkSet};
     use crate::sys::{self, Deadline, Readiness, RecvMeta, SysError};
 
     /// 受信バッファの通常の長さ（バイト）。これ以下のデータグラムはこの長さのバッファで受ける
@@ -387,6 +389,33 @@ mod socket {
                 }
                 self.send(&message)?;
                 await_reply_for(seq, dump, &deadline, timeout, |t| self.recv(t))
+            })
+        }
+
+        /// link 作成要求（`RTM_NEWLINK`）を送り ACK を待つ（NET-11・TASK-136.3.2）。`NetOpKind::LinkCreate`
+        /// として記録する（内側の request / send / recv も個別に記録）。`timeout` は全体の期限
+        /// （推奨 5〜10 秒）。`Timeout` / `DataLoss` ではカーネル側で作成済みか不明なため、状態を再照会すること。
+        /// 同名が既にあれば `AlreadyExists`、権限不足は `PermissionDenied`。
+        pub fn create_link(
+            &self,
+            req: &LinkCreate,
+            timeout: Duration,
+        ) -> Result<NetlinkReply, NetError> {
+            record_net_op(self.recorder.as_ref(), NetOpKind::LinkCreate, || {
+                self.request(req.msg_type(), req.flags(), timeout, |b| req.encode(b))
+            })
+        }
+
+        /// link 設定要求（`RTM_SETLINK`: netns 移動・up）を送り ACK を待つ（NET-11・TASK-136.3.2）。
+        /// `NetOpKind::LinkSet` として記録する。対象が自 netns に無ければ `NotFound`（netns 移動後の
+        /// デバイスは移動先 netns のソケットから操作する）。`Timeout` / `DataLoss` では適用済みか不明。
+        pub fn set_link(
+            &self,
+            req: &LinkSet<'_>,
+            timeout: Duration,
+        ) -> Result<NetlinkReply, NetError> {
+            record_net_op(self.recorder.as_ref(), NetOpKind::LinkSet, || {
+                self.request(req.msg_type(), req.flags(), timeout, |b| req.encode(b))
             })
         }
 
@@ -803,7 +832,7 @@ mod socket {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::netlink_route::{RTM_GETLINK, RTM_NEWLINK};
+        use crate::netlink_route::{IfName, LinkRef, RTM_GETLINK, RTM_NEWLINK};
 
         /// NET-11: errno 写像の具体値。
         #[test]
@@ -1069,6 +1098,48 @@ mod socket {
             s.send(&getlink_lo(8)).expect("send 8");
             let next = s.recv(Duration::from_secs(5)).expect("recv");
             assert_eq!(first_type_and_seq(&next), (RTM_NEWLINK, 8));
+        }
+
+        /// 実効 capability に `CAP_NET_ADMIN`（bit 12）があるか（`/proc/self/status` の `CapEff`）。
+        fn has_cap_net_admin() -> bool {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find_map(|l| l.strip_prefix("CapEff:").map(|v| v.trim().to_owned()))
+                })
+                .and_then(|v| u64::from_str_radix(&v, 16).ok())
+                .is_some_and(|caps| caps & (1 << 12) != 0)
+        }
+
+        /// NET-11・TASK-136.3.2: 存在しない名前への up は失敗し、LinkSet と request が 1 件ずつ失敗として
+        /// 記録される。カーネルは権限検査が先に来るため、`CAP_NET_ADMIN` が無ければ `PermissionDenied`
+        /// （fail-closed）、あれば `NotFound`（ENODEV）になる。
+        #[test]
+        fn net11_set_link_on_missing_device_fails_and_is_recorded() {
+            use crate::instrument::NetOpOutcome;
+            use crate::instrument::testing::Collect;
+            let collect = Arc::new(Collect::default());
+            let s = NetlinkRouteSocket::open_with_recorder(collect.clone()).expect("open");
+            let req = LinkSet::up(LinkRef::Name(IfName::new("fcn-absent0").expect("name")));
+            let e = s
+                .set_link(&req, Duration::from_secs(5))
+                .expect_err("absent device");
+            let want = if has_cap_net_admin() {
+                NetErrorCode::NotFound
+            } else {
+                NetErrorCode::PermissionDenied
+            };
+            assert_eq!(e.code(), want);
+            let kinds = collect.kinds();
+            let n = |k| {
+                kinds
+                    .iter()
+                    .filter(|x| **x == (k, NetOpOutcome::Failure))
+                    .count()
+            };
+            assert_eq!(n(NetOpKind::LinkSet), 1);
+            assert_eq!(n(NetOpKind::NetlinkRequest), 1);
         }
 
         /// REPAIR-4・NET-11: open / send / recv は成功・失敗のどちらでも 1 回につき 1 件、種別と

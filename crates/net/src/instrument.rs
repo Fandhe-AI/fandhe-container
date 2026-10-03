@@ -13,8 +13,8 @@
 //! # 未実装範囲（REPAIR-3）
 //!
 //! - core の `OpRecorder` との接続アダプタ（上位 crate の担当。net からは提供しない）
-//! - 後続の操作（#846 の link 送信ラッパー等）の種別は、送信ラッパーと一緒に
-//!   [`NetOpKind`] へ追加する（#845 は組み立てのみで記録対象の操作を持たない）
+//! - 後続の操作（address / route 送信ラッパー等。#301）の種別は、送信ラッパーと一緒に
+//!   [`NetOpKind`] へ追加する
 //!
 //! # 機微情報
 //!
@@ -40,6 +40,11 @@ pub enum NetOpKind {
     /// 要求 1 件の往復（送信 → seq 一致の応答 / ACK 待ち。TASK-136.2.2・#844）。内側の send / recv も
     /// 従来どおり個別に記録される。
     NetlinkRequest,
+    /// link 作成要求 1 件（`RTM_NEWLINK`。`NetlinkRouteSocket::create_link`。TASK-136.3.2・#846）。
+    /// 内側の request / send / recv も個別に記録される。
+    LinkCreate,
+    /// link 設定要求 1 件（`RTM_SETLINK`。`NetlinkRouteSocket::set_link`。TASK-136.3.2・#846）。
+    LinkSet,
 }
 
 impl NetOpKind {
@@ -50,6 +55,8 @@ impl NetOpKind {
             NetOpKind::NetlinkSend => "netlink.send",
             NetOpKind::NetlinkRecv => "netlink.recv",
             NetOpKind::NetlinkRequest => "netlink.request",
+            NetOpKind::LinkCreate => "netlink.link.create",
+            NetOpKind::LinkSet => "netlink.link.set",
         }
     }
 }
@@ -224,11 +231,13 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 4] = [
+    const ALL_KINDS: [NetOpKind; 6] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
         NetOpKind::NetlinkRequest,
+        NetOpKind::LinkCreate,
+        NetOpKind::LinkSet,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
@@ -238,6 +247,8 @@ mod tests {
         assert_eq!(NetOpKind::NetlinkSend.as_str(), "netlink.send");
         assert_eq!(NetOpKind::NetlinkRecv.as_str(), "netlink.recv");
         assert_eq!(NetOpKind::NetlinkRequest.as_str(), "netlink.request");
+        assert_eq!(NetOpKind::LinkCreate.as_str(), "netlink.link.create");
+        assert_eq!(NetOpKind::LinkSet.as_str(), "netlink.link.set");
     }
 
     /// REPAIR-4: 操作名は core の `OpName::new` と同じ規則に収まる（net は core に依存できないため

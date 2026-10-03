@@ -91,3 +91,10 @@ harness = false
 name = "none_mode_privileged"
 path = "tests/none_mode_privileged.rs"
 harness = false
+
+# --add-host の /etc/hosts 追記が none モードで反映されることの実機前提テスト（NET-12・TASK-185.2）。
+# 子の再入（--inner / --probe）と root 前提の分離のため harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "add_host_privileged"
+path = "tests/add_host_privileged.rs"
+harness = false

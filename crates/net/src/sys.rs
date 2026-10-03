@@ -11,6 +11,11 @@
 //! メッセージの組み立て・解釈は `crate::netlink` のコーデックが担い、ここはバイト列を
 //! 運ぶだけで中身を解釈しない。
 //!
+//! `crate::add_host_dns` の hosts ファイル追記（NET-12・TASK-185.2・#345）は、管理ルートから
+//! 1 要素ずつ `openat(2)`（`O_NOFOLLOW`）で辿って開くために [`open_root_dir`]・
+//! [`open_dir_nofollow_at`]・[`open_path_nofollow_at`]・[`reopen_append`] を使う（パス再解決による
+//! TOCTOU を避ける。最終要素は `O_PATH` で開いて種別を確かめてから読み書き用に開き直す）。
+//!
 //! # 契約（事前承認の条件を満たす設計）
 //! - `unsafe fn` はこのモジュールの外へ公開しない。公開するのは安全な関数のみ
 //! - すべての `unsafe` ブロック・`unsafe extern "C"` 宣言に `// SAFETY:` で理由と
@@ -60,8 +65,8 @@ pub(crate) enum SysError {
 const EINTR_RETRY_MAX: u32 = 16;
 
 pub(crate) use consts::{
-    EACCES, EAFNOSUPPORT, EAGAIN, EBUSY, EEXIST, EINTR, EINVAL, EMFILE, EMSGSIZE, ENFILE, ENOBUFS,
-    ENODEV, ENOENT, ENOMEM, EOPNOTSUPP, EPERM, EPROTONOSUPPORT,
+    EACCES, EAFNOSUPPORT, EAGAIN, EBUSY, EEXIST, EINTR, EINVAL, EISDIR, ELOOP, EMFILE, EMSGSIZE,
+    ENFILE, ENOBUFS, ENODEV, ENOENT, ENOMEM, ENOTDIR, EOPNOTSUPP, EPERM, EPROTONOSUPPORT,
 };
 
 /// 受信待ち全体の期限（REPAIR-5）。単調時計（`Instant`）の開始時刻と全体 timeout を持ち、
@@ -158,6 +163,22 @@ mod consts {
     pub const MS_BIND: core::ffi::c_ulong = 4096;
     /// `umount2(2)` の遅延アンマウント（`linux/fs.h` の `MNT_DETACH`）。
     pub const MNT_DETACH: i32 = 2;
+    pub const ENOTDIR: i32 = 20;
+    pub const EISDIR: i32 = 21;
+    pub const ELOOP: i32 = 40;
+    // open(2) フラグ（x86_64 は uapi/asm-generic/fcntl.h の既定値をそのまま使う）。
+    pub const O_RDONLY: i32 = 0;
+    pub const O_RDWR: i32 = 0o2;
+    pub const O_NOCTTY: i32 = 0o400;
+    pub const O_APPEND: i32 = 0o2000;
+    pub const O_NONBLOCK: i32 = 0o4000;
+    pub const O_DIRECTORY: i32 = 0o200_000;
+    pub const O_NOFOLLOW: i32 = 0o400_000;
+    pub const O_CLOEXEC: i32 = 0o2_000_000;
+    /// `O_PATH`（asm-generic の 0o10000000。arm64 も上書きしない）。
+    pub const O_PATH: i32 = 0o10_000_000;
+    /// `openat(2)` のカレントディレクトリ基準（`linux/fcntl.h` の `AT_FDCWD`）。
+    pub const AT_FDCWD: i32 = -100;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -198,6 +219,24 @@ mod consts {
     pub const MS_BIND: core::ffi::c_ulong = 4096;
     /// `umount2(2)` の遅延アンマウント（`linux/fs.h` の `MNT_DETACH`）。
     pub const MNT_DETACH: i32 = 2;
+    pub const ENOTDIR: i32 = 20;
+    pub const EISDIR: i32 = 21;
+    pub const ELOOP: i32 = 40;
+    // open(2) フラグ。arm64 は uapi/asm/fcntl.h で O_DIRECTORY / O_NOFOLLOW / O_DIRECT / O_LARGEFILE を
+    // 上書きする（0o40000 / 0o100000）。x86_64 の値（0o200000 / 0o400000）は aarch64 では O_DIRECT /
+    // O_LARGEFILE になり symlink を辿ってしまうため流用しない。その他は asm-generic の既定値。
+    pub const O_RDONLY: i32 = 0;
+    pub const O_RDWR: i32 = 0o2;
+    pub const O_NOCTTY: i32 = 0o400;
+    pub const O_APPEND: i32 = 0o2000;
+    pub const O_NONBLOCK: i32 = 0o4000;
+    pub const O_DIRECTORY: i32 = 0o40_000;
+    pub const O_NOFOLLOW: i32 = 0o100_000;
+    pub const O_CLOEXEC: i32 = 0o2_000_000;
+    /// `O_PATH`（asm-generic の 0o10000000。arm64 も上書きしない）。
+    pub const O_PATH: i32 = 0o10_000_000;
+    /// `openat(2)` のカレントディレクトリ基準（`linux/fcntl.h` の `AT_FDCWD`）。
+    pub const AT_FDCWD: i32 = -100;
 }
 
 /// 対応外アーキテクチャ: 値を確認していないためラッパーは `Unsupported` を返し、カーネルへ渡さない。
@@ -240,6 +279,19 @@ mod consts {
     pub const CLONE_NEWNET: i32 = 0;
     pub const MS_BIND: core::ffi::c_ulong = 0;
     pub const MNT_DETACH: i32 = 0;
+    pub const ENOTDIR: i32 = -18;
+    pub const EISDIR: i32 = -19;
+    pub const ELOOP: i32 = -20;
+    pub const O_RDONLY: i32 = 0;
+    pub const O_RDWR: i32 = 0;
+    pub const O_NOCTTY: i32 = 0;
+    pub const O_APPEND: i32 = 0;
+    pub const O_NONBLOCK: i32 = 0;
+    pub const O_DIRECTORY: i32 = 0;
+    pub const O_NOFOLLOW: i32 = 0;
+    pub const O_CLOEXEC: i32 = 0;
+    pub const O_PATH: i32 = 0;
+    pub const AT_FDCWD: i32 = 0;
 }
 
 // SAFETY: 以下は Linux の libc（glibc / musl 共通）が公開する C 関数の宣言で、引数・戻り値の型を
@@ -303,6 +355,9 @@ unsafe extern "C" {
     fn umount2(target: *const core::ffi::c_char, flags: i32) -> i32;
     // 原型: `uid_t geteuid(void)`（`uid_t` は u32。失敗しない）。
     fn geteuid() -> u32;
+    // 原型: `int openat(int dirfd, const char *pathname, int flags, ...)`。可変長引数（mode）は
+    // `O_CREAT` / `O_TMPFILE` のときだけ読まれる。本モジュールはどちらも渡さないため mode を渡さない。
+    fn openat(dirfd: i32, path: *const core::ffi::c_char, flags: i32, ...) -> i32;
 }
 
 /// `struct sockaddr_nl`（include/uapi/linux/netlink.h。全アーキテクチャ共通の 12 バイト）。
@@ -685,6 +740,95 @@ pub(crate) fn effective_uid() -> u32 {
     unsafe { geteuid() }
 }
 
+/// ルートディレクトリ `/` を `O_RDONLY | O_DIRECTORY | O_CLOEXEC` で開く（引数を取らない）。
+///
+/// `crate::add_host_dns` が管理ルートを `/` から [`open_dir_nofollow_at`] で 1 要素ずつ辿る起点に使う。
+/// 任意のパスを `AT_FDCWD` 基準で開く経路（途中要素の symlink を辿りうる）を公開しないため、
+/// 開くのは `/` に固定する。
+pub(crate) fn open_root_dir() -> Result<OwnedFd, SysError> {
+    open_at_raw(
+        consts::AT_FDCWD,
+        c"/",
+        consts::O_RDONLY | consts::O_DIRECTORY | consts::O_CLOEXEC,
+    )
+}
+
+/// `dir` 直下の 1 要素 `name` のディレクトリを `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` で開く。
+///
+/// `name` は `/` を含まない通常の名前（`.`・`..`・空は `EINVAL`）。symlink なら `ELOOP`
+/// または `ENOTDIR`（ディレクトリへの symlink）、ディレクトリでなければ `ENOTDIR`。
+pub(crate) fn open_dir_nofollow_at(dir: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, SysError> {
+    check_single_component(name)?;
+    open_at_raw(
+        dir.as_raw_fd(),
+        name,
+        consts::O_RDONLY | consts::O_DIRECTORY | consts::O_NOFOLLOW | consts::O_CLOEXEC,
+    )
+}
+
+/// `dir` 直下の 1 要素 `name` を `O_PATH | O_NOFOLLOW | O_CLOEXEC` で開く（中身は開かない・作成しない）。
+///
+/// `O_PATH` は対象のドライバの `open()` を呼ばずに位置だけを得るため、キャラクタ / ブロックデバイス・FIFO
+/// でも副作用が無い。symlink は辿らずリンク自体の fd になる（種別判定は呼び出し側が `fstat` で行う）。
+/// 無ければ `ENOENT`。読み書きには種別を確かめた後で [`reopen_append`] で開き直す。
+pub(crate) fn open_path_nofollow_at(dir: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, SysError> {
+    check_single_component(name)?;
+    open_at_raw(
+        dir.as_raw_fd(),
+        name,
+        consts::O_PATH | consts::O_NOFOLLOW | consts::O_CLOEXEC,
+    )
+}
+
+/// `O_PATH` の fd `path_fd` が指すファイルを `/proc/self/fd/<fd>` 経由で
+/// `O_RDWR | O_APPEND | O_NOCTTY | O_NONBLOCK | O_CLOEXEC` で開き直す（作成しない）。
+///
+/// `/proc/self/fd/<fd>` は fd が保持する実体（dentry とマウント）を直接指す magic link で、パスを
+/// 再解決しない。呼び出し側は事前に `path_fd` が通常ファイルであることを確かめ、開き直した fd の
+/// (dev, ino) が `path_fd` と一致することも確かめる。procfs が無ければ失敗する（fail-closed）。
+pub(crate) fn reopen_append(path_fd: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
+    let path = std::ffi::CString::new(format!("/proc/self/fd/{}", path_fd.as_raw_fd()))
+        .map_err(|_| SysError::Os(consts::EINVAL))?;
+    open_at_raw(
+        consts::AT_FDCWD,
+        &path,
+        consts::O_RDWR
+            | consts::O_APPEND
+            | consts::O_NOCTTY
+            | consts::O_NONBLOCK
+            | consts::O_CLOEXEC,
+    )
+}
+
+/// `openat` に渡す名前が 1 要素（`/` を含まない・空 / `.` / `..` でない）であることを確認する。
+/// 複数要素を渡すと途中要素の symlink を辿ってしまうため、ラッパーの入口で拒否する。
+fn check_single_component(name: &CStr) -> Result<(), SysError> {
+    let b = name.to_bytes();
+    if b.is_empty() || b == b"." || b == b".." || b.contains(&b'/') {
+        return Err(SysError::Os(consts::EINVAL));
+    }
+    Ok(())
+}
+
+/// `openat(dirfd, path, flags)` を呼び、成功時の fd を `OwnedFd` にする。`flags` はこのモジュールの
+/// 定数の組み合わせだけが渡される（`O_CREAT` / `O_TMPFILE` を含まないので mode は渡さない）。
+fn open_at_raw(dirfd: i32, path: &CStr, flags: i32) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `path` は NUL 終端済みの `CStr` で、呼び出しの間は借用により有効（カーネルは読むだけで
+    // 保持しない）。`dirfd` は呼び出し側が借用している生存中の fd（`BorrowedFd`）か `AT_FDCWD`
+    // （このとき `path` はモジュール内で組み立てた絶対パス `/` または `/proc/self/fd/<n>` に限る）。`flags` に `O_CREAT` / `O_TMPFILE` を含まないため
+    // 可変長引数 mode は読まれない。
+    let fd = unsafe { openat(dirfd, path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は直前の openat が返した非負の新規 fd で他に所有者がおらず、ここで `OwnedFd` が
+    // 唯一の所有者になる（二重 close なし）。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,6 +859,24 @@ mod tests {
         assert_eq!(consts::CLONE_NEWNET, 0x4000_0000);
         assert_eq!(consts::MS_BIND, 4096);
         assert_eq!(consts::MNT_DETACH, 2);
+        assert_eq!(consts::ENOTDIR, 20);
+        assert_eq!(consts::EISDIR, 21);
+        assert_eq!(consts::ELOOP, 40);
+        assert_eq!(consts::O_RDWR, 2);
+        assert_eq!(consts::O_APPEND, 0o2000);
+        assert_eq!(consts::O_CLOEXEC, 0o2_000_000);
+        assert_eq!(consts::AT_FDCWD, -100);
+        assert_eq!(consts::O_PATH, 0o10_000_000);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            (consts::O_DIRECTORY, consts::O_NOFOLLOW),
+            (0o200_000, 0o400_000)
+        );
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            (consts::O_DIRECTORY, consts::O_NOFOLLOW),
+            (0o40_000, 0o100_000)
+        );
         assert_eq!(core::mem::size_of::<SockaddrNl>(), 12);
         assert_eq!(core::mem::size_of::<PollFd>(), 8);
     }
@@ -859,5 +1021,69 @@ mod tests {
             i32::MAX
         );
         assert_eq!(poll_timeout_ms(Duration::MAX), i32::MAX);
+    }
+
+    /// NET-12・TASK-185.2: openat ラッパーは 1 要素の名前だけを受け付け、ディレクトリは symlink・不在・
+    /// 種別違いを errno で返す。最終要素は `O_PATH` で（symlink・ディレクトリでも中身を開かずに）得て、
+    /// 開き直しは通常ファイルなら追記用、ディレクトリなら `EISDIR`。何も作成しない。
+    #[test]
+    fn openat_wrappers_follow_no_symlink_and_create_nothing() {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = std::env::temp_dir().join(format!("fc-net-sys-openat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("f"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.join("f"), dir.join("lnk")).unwrap();
+        std::os::unix::fs::symlink(dir.join("sub"), dir.join("dlnk")).unwrap();
+        let mut cur = open_root_dir().unwrap();
+        for c in std::fs::canonicalize(&dir).unwrap().components().skip(1) {
+            let name = std::ffi::CString::new(c.as_os_str().as_encoded_bytes()).unwrap();
+            cur = open_dir_nofollow_at(cur.as_fd(), &name).unwrap();
+        }
+        let r = cur.as_fd();
+
+        assert!(open_dir_nofollow_at(r, c"sub").is_ok());
+        // O_DIRECTORY と O_NOFOLLOW の併用では、ディレクトリへの symlink は ENOTDIR になる（Linux）。
+        assert_eq!(
+            open_dir_nofollow_at(r, c"dlnk").err(),
+            Some(SysError::Os(ENOTDIR))
+        );
+        assert_eq!(
+            open_dir_nofollow_at(r, c"f").err(),
+            Some(SysError::Os(ENOTDIR))
+        );
+        // O_PATH | O_NOFOLLOW は symlink 自体の fd を返す（辿らない）。
+        let l = std::fs::File::from(open_path_nofollow_at(r, c"lnk").unwrap());
+        assert!(l.metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            open_path_nofollow_at(r, c"none").err(),
+            Some(SysError::Os(ENOENT))
+        );
+        assert!(!dir.join("none").exists());
+        let d = open_path_nofollow_at(r, c"sub").unwrap();
+        assert_eq!(reopen_append(d.as_fd()).err(), Some(SysError::Os(EISDIR)));
+
+        let p = open_path_nofollow_at(r, c"f").unwrap();
+        let pm = std::fs::File::from(p.try_clone().unwrap())
+            .metadata()
+            .unwrap();
+        let mut w = std::fs::File::from(reopen_append(p.as_fd()).unwrap());
+        let wm = w.metadata().unwrap();
+        assert_eq!((wm.dev(), wm.ino()), (pm.dev(), pm.ino()));
+        w.write_all(b"y").unwrap();
+        assert_eq!(std::fs::read(dir.join("f")).unwrap(), b"xy");
+
+        for bad in [c"", c".", c"..", c"sub/x", c"dlnk/x"] {
+            assert_eq!(
+                open_dir_nofollow_at(r, bad).err(),
+                Some(SysError::Os(EINVAL))
+            );
+            assert_eq!(
+                open_path_nofollow_at(r, bad).err(),
+                Some(SysError::Os(EINVAL))
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

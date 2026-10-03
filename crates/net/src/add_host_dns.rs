@@ -6,23 +6,48 @@
 //! （TASK-185.2・#345）・上流転送（`dns_helper::upstream`。TASK-185.3・#346）・host/none の `--dns` 反映（TASK-185.4・#347）・
 //! 軽量運用の `--dns` 直接書き込み（TASK-146.2・#336）から再利用される。
 //!
-//! 本モジュール本体は検証のみ。host/none の `--dns` 反映と none の loopback 制限は子モジュール
-//! `resolv_conf`（TASK-185.4・#347）、ユーザー定義ネットワーク上の上流転送は `dns_helper::upstream`
-//! （TASK-185.3・#346）。`<hostname>:<ip>` の分割パース・`/etc/hosts` 追記は未実装（TASK-185.2。
-//! REPAIR-3）。エラーの `message` は固定の英語文字列で、
+//! `--add-host <hostname>:<ip>` は最初の `:` で 2 分割する（[`AddHostEntry::parse`]。残り全体を IP とするため
+//! `::1` 等の IPv6 表記をそのまま渡せる）。検証済みエントリはコンテナの hosts ファイルへ追記できる
+//! （[`apply_add_hosts`]。TASK-185.2・#345）。追記先は「管理ルート（コンテナ状態ディレクトリ）」と
+//! そこからの相対パスで指定し、ルート配下の既存の通常ファイルに限る（`/etc/hosts` のような管理外の
+//! ファイルは絶対パス・`..`・symlink・管理ルート内の bind mount 経由のいずれでも指せない）。
+//! ネットワークモード（bridge / host / none）を引数に取らないため全モードで同じ処理になる。hosts ファイルの
+//! 生成・コンテナへの bind mount は runtime / core 側の責務で、本モジュールは既存の通常ファイルへ追記するだけ
+//! （無ければ作らず `NOT_FOUND`）。
+//! 追記は Linux 限定（子モジュール `hosts_file`。他 OS は `UNIMPLEMENTED`）。管理ルートから
+//! `openat(O_NOFOLLOW)` で 1 要素ずつ辿り、最終要素は `O_PATH` で種別を確かめてから開き直した fd だけを
+//! 検証・追記に使い（パスを再解決しない）、symlink（途中ディレクトリを含む）・非通常ファイル・
+//! ハードリンク（nlink != 1）・他ユーザー所有・管理ルートと別のマウント上のファイル（fd の `mnt_id` で照合）を
+//! 拒否する。書き込み失敗時は、サイズが「書き込み前の長さ + 書けた量」と一致する場合に限り同じロック下で
+//! 書き込み前の長さへ戻す。一致しない・巻き戻しにも失敗した場合は不完全な行が残りうるため `DATA_LOSS` で
+//! 通常の失敗と区別して返す。
+//!
+//! host/none の `--dns` 反映と none の loopback 制限は子モジュール `resolv_conf`（TASK-185.4・#347）、
+//! ユーザー定義ネットワーク上の上流転送は `dns_helper::upstream`（TASK-185.3・#346）。
+//! エラーの `message` は固定の英語文字列で、
 //! 入力値を載せない（ログ・ファイルへの行注入を防ぐ）。`dns_helper::DnsName`（小文字化・末尾ドット除去）
 //! とは意味論が異なり、ここでは入力をそのまま保持し、末尾ドット（空ラベル）は拒否する。
 
+#[cfg(target_os = "linux")]
+mod hosts_file;
 pub mod resolv_conf;
 
 use std::net::IpAddr;
+use std::path::Path;
 
 use crate::error::{NetError, NetErrorCode};
+use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
 
 /// hostname 全体の最大バイト長（RFC 1123）。
 const MAX_HOSTNAME_LEN: usize = 253;
 /// ラベルの最大バイト長（RFC 1123）。
 const MAX_LABEL_LEN: usize = 63;
+/// IPv6 の最長テキスト表記（IPv4 射影を含む）のバイト長。
+const MAX_IP_TEXT_LEN: usize = 45;
+/// `--add-host` 1 件の最大バイト長（hostname + `:` + IP）。分割前に検査する。
+const MAX_ADD_HOST_LEN: usize = MAX_HOSTNAME_LEN + 1 + MAX_IP_TEXT_LEN;
+/// `--add-host` の最大件数。spec（NET-12）に件数規定は無く、無制限確保を避けるための実装上限。
+pub const MAX_ADD_HOST_ENTRIES: usize = 256;
 
 /// 入力検証の違反理由（機械可読）。`NetError`（`INVALID_ARGUMENT`）へ変換できる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,6 +67,12 @@ pub enum InputViolation {
     InvalidHostnameChar,
     /// IPv4 / IPv6 のいずれとしても解釈できない。
     NotIpAddress,
+    /// `--add-host` の値に `<hostname>:<ip>` の区切り `:` が無い。
+    MissingHostIpSeparator,
+    /// `--add-host` の 1 件が長すぎる（hostname + `:` + IP の上限超過）。
+    AddHostTooLong,
+    /// `--add-host` の件数が上限（[`MAX_ADD_HOST_ENTRIES`]）を超える。
+    TooManyAddHosts,
     /// none モードで loopback 以外の `--dns` を指定した。
     NotLoopbackForNoneMode,
 }
@@ -57,6 +88,9 @@ impl InputViolation {
             Self::LabelHyphenEdge => "LABEL_HYPHEN_EDGE",
             Self::InvalidHostnameChar => "INVALID_HOSTNAME_CHAR",
             Self::NotIpAddress => "NOT_IP_ADDRESS",
+            Self::MissingHostIpSeparator => "MISSING_SEPARATOR",
+            Self::AddHostTooLong => "ADD_HOST_TOO_LONG",
+            Self::TooManyAddHosts => "TOO_MANY_ADD_HOSTS",
             Self::NotLoopbackForNoneMode => "NOT_LOOPBACK_FOR_NONE_MODE",
         }
     }
@@ -73,6 +107,9 @@ impl InputViolation {
                 "invalid hostname: only ASCII letters, digits, hyphens and dots are allowed"
             }
             Self::NotIpAddress => "invalid IP address: not a valid IPv4 or IPv6 address",
+            Self::MissingHostIpSeparator => "invalid add-host: expected <hostname>:<ip>",
+            Self::AddHostTooLong => "invalid add-host: entry is too long",
+            Self::TooManyAddHosts => "invalid add-host: too many entries",
             Self::NotLoopbackForNoneMode => {
                 "invalid --dns for none network mode: only loopback addresses (127.0.0.0/8, ::1) are allowed"
             }
@@ -150,6 +187,137 @@ pub fn parse_ip_addr(s: &str) -> Result<IpAddr, NetError> {
     }
     s.parse::<IpAddr>()
         .map_err(|_| InputViolation::NotIpAddress.into())
+}
+
+/// 検証済みの `--add-host` 1 件（hostname と IP）。不正値を表現できない型で、hosts ファイルへ書く行は
+/// この型からのみ描画する（行注入を型で防ぐ。NET-12）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AddHostEntry {
+    host: HostName,
+    ip: IpAddr,
+}
+
+impl AddHostEntry {
+    /// `<hostname>:<ip>` を最初の `:` で 2 分割して検証する。左が hostname、残り全体が IP
+    /// （hostname は `:` を含まないため `host:::1` は (`host`, `::1`)）。違反は `INVALID_ARGUMENT`（NET-12）。
+    pub fn parse(s: &str) -> Result<Self, NetError> {
+        if s.len() > MAX_ADD_HOST_LEN {
+            return Err(InputViolation::AddHostTooLong.into());
+        }
+        let (host, ip) = s
+            .split_once(':')
+            .ok_or(InputViolation::MissingHostIpSeparator)?;
+        Ok(Self {
+            host: HostName::parse(host)?,
+            ip: parse_ip_addr(ip)?,
+        })
+    }
+
+    /// 検証済み hostname。
+    pub fn host(&self) -> &HostName {
+        &self.host
+    }
+
+    /// 検証済み IP。
+    pub fn ip(&self) -> IpAddr {
+        self.ip
+    }
+}
+
+/// 複数の `--add-host` 値を全件検証して返す。1 件でも不正、または件数が上限超過なら `Err`（副作用なし）。
+pub fn parse_add_hosts<'a, I>(raw: I) -> Result<Vec<AddHostEntry>, NetError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut out = Vec::new();
+    for s in raw {
+        if out.len() >= MAX_ADD_HOST_ENTRIES {
+            return Err(InputViolation::TooManyAddHosts.into());
+        }
+        out.push(AddHostEntry::parse(s)?);
+    }
+    Ok(out)
+}
+
+/// hosts ファイル形式の行（`<ip>\t<hostname>\n`）へ描画する。IP は `IpAddr` の正規化表記になる。
+pub fn render_hosts_lines(entries: &[AddHostEntry]) -> String {
+    let mut out = String::new();
+    for e in entries {
+        out.push_str(&format!("{}\t{}\n", e.ip, e.host.as_str()));
+    }
+    out
+}
+
+/// 検証済みエントリをコンテナの hosts ファイルへ追記する（NET-12・TASK-185.2）。
+///
+/// `managed_root` は管理ルート（コンテナ状態ディレクトリ）で、symlink を含まない絶対パスで渡す（正規化せず、
+/// 管理ルート自身・祖先が symlink なら `FAILED_PRECONDITION`）。`hosts_rel` はその配下の hosts ファイルへの
+/// 相対パスで、ネットワークモードに依存しない。ルート外（絶対パス・`..`・symlink・管理ルート内の
+/// bind mount 経由）は指せない。既存の通常ファイルにのみ追記し（無ければ `NOT_FOUND` で作成しない）、
+/// tmp + rename は使わない（bind mount 済みファイルの inode を保つため）。境界の守り方・ロック・巻き戻しは
+/// Linux 限定の `hosts_file` モジュールに置く。`entries` が空なら何も開かない。
+///
+/// 呼び出し側の前提:
+/// - `hosts_rel` の途中ディレクトリと hosts ファイルは、コンテナ・他ユーザーが書き込めないディレクトリ
+///   配下に置くこと（書き込めると symlink 以外の手段で中身を入れ替えられ、本関数の検査の前提が崩れる）。
+/// - 管理ルート（状態ディレクトリ）はローカルファイルシステム上にあること（`flock` による直列化・`O_APPEND`・
+///   `mnt_id` 照合はローカル FS の意味論に依存し、NFS 等のネットワーク FS では保証しない）。
+///
+/// Linux 以外では `UNIMPLEMENTED` を返す（fail-closed）。symlink を辿らない `openat` と fd の `mnt_id`
+/// 照合を持たない OS でパス検査だけの追記をすると、検査と open の間の差し替えで管理外のファイルへ
+/// 書けてしまうため。macOS / Windows のコンテナは Linux VM 側で hosts を扱う。
+pub fn append_add_hosts(
+    managed_root: &Path,
+    hosts_rel: &Path,
+    entries: &[AddHostEntry],
+) -> Result<(), NetError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    // 公開 API 単体でも件数を上限検証する（parse_add_hosts を経由しない呼び出しでの無制限確保を防ぐ）。
+    if entries.len() > MAX_ADD_HOST_ENTRIES {
+        return Err(InputViolation::TooManyAddHosts.into());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        hosts_file::append_lines(managed_root, hosts_rel, &render_hosts_lines(entries))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (managed_root, hosts_rel);
+        Err(NetError::new(
+            NetErrorCode::Unimplemented,
+            "appending to hosts file is only supported on Linux",
+        ))
+    }
+}
+
+/// `--add-host` の生値を全件検証してから hosts ファイルへ追記する入口（NET-12・TASK-185.2）。
+///
+/// 検証が全件通るまでファイルを開かないため、検証失敗時に hosts ファイルは変更されない。
+/// 計測しない呼び出し口で、成否・所要時間を記録するには [`apply_add_hosts_with_recorder`] を使う。
+pub fn apply_add_hosts<'a, I>(managed_root: &Path, hosts_rel: &Path, raw: I) -> Result<(), NetError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    apply_add_hosts_with_recorder(managed_root, hosts_rel, raw, &NoopNetOpRecorder)
+}
+
+/// [`apply_add_hosts`] に計装を付けた入口（REPAIR-4）。検証から追記・fsync までの成否と所要時間を
+/// `NetOpKind::AddHostsApply` として `recorder` へ渡す（入力値・パスは記録しない）。
+pub fn apply_add_hosts_with_recorder<'a, I>(
+    managed_root: &Path,
+    hosts_rel: &Path,
+    raw: I,
+    recorder: &dyn NetOpRecorder,
+) -> Result<(), NetError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    record_net_op(recorder, NetOpKind::AddHostsApply, || {
+        let entries = parse_add_hosts(raw)?;
+        append_add_hosts(managed_root, hosts_rel, &entries)
+    })
 }
 
 #[cfg(test)]
@@ -291,6 +459,9 @@ mod tests {
             (InputViolation::LabelHyphenEdge, "LABEL_HYPHEN_EDGE"),
             (InputViolation::InvalidHostnameChar, "INVALID_HOSTNAME_CHAR"),
             (InputViolation::NotIpAddress, "NOT_IP_ADDRESS"),
+            (InputViolation::MissingHostIpSeparator, "MISSING_SEPARATOR"),
+            (InputViolation::AddHostTooLong, "ADD_HOST_TOO_LONG"),
+            (InputViolation::TooManyAddHosts, "TOO_MANY_ADD_HOSTS"),
             (
                 InputViolation::NotLoopbackForNoneMode,
                 "NOT_LOOPBACK_FOR_NONE_MODE",
@@ -311,5 +482,115 @@ mod tests {
         assert!(!e.message().contains("evil"));
         let e = parse_ip_addr("evil\ninjected").unwrap_err();
         assert!(!e.message().contains("evil"));
+    }
+
+    fn entry_err(s: &str) -> NetError {
+        AddHostEntry::parse(s).expect_err(s)
+    }
+
+    /// NET-12: 最初の `:` で分割し、残り全体を IP とする（IPv6 を含む）。
+    #[test]
+    fn add_host_splits_on_first_colon() {
+        for (raw, host, ip) in [
+            ("host:192.0.2.1", "host", "192.0.2.1"),
+            ("host:::1", "host", "::1"),
+            ("host:2001:db8::1", "host", "2001:db8::1"),
+            (
+                "a.example:::ffff:192.0.2.1",
+                "a.example",
+                "::ffff:192.0.2.1",
+            ),
+        ] {
+            let e = AddHostEntry::parse(raw).unwrap();
+            assert_eq!(e.host().as_str(), host);
+            assert_eq!(e.ip().to_string(), ip);
+        }
+    }
+
+    /// NET-12・ERR-1: 分割・検証の拒否（INVALID_ARGUMENT と理由を具体値で照合）。
+    #[test]
+    fn add_host_rejects_bad_entries() {
+        for (raw, v) in [
+            ("host:", InputViolation::NotIpAddress),
+            (":1.2.3.4", InputViolation::EmptyHostname),
+            ("host", InputViolation::MissingHostIpSeparator),
+            ("", InputViolation::MissingHostIpSeparator),
+            ("host:fe80::1%eth0", InputViolation::NotIpAddress),
+            ("host:[::1]", InputViolation::NotIpAddress),
+            ("host:host-gateway", InputViolation::NotIpAddress),
+            ("bad host:1.2.3.4", InputViolation::ControlOrWhitespace),
+            (
+                "a\n1.2.3.4 evil:1.2.3.4",
+                InputViolation::ControlOrWhitespace,
+            ),
+            ("host:1.2.3.4\n", InputViolation::ControlOrWhitespace),
+        ] {
+            assert_violation(&entry_err(raw), v);
+        }
+        let long = format!("{}:1.2.3.4", "a".repeat(MAX_ADD_HOST_LEN));
+        assert_violation(&entry_err(&long), InputViolation::AddHostTooLong);
+    }
+
+    /// NET-12: 複数件は順序どおり、1 件でも不正なら全体が Err、件数は上限ちょうどまで。
+    #[test]
+    fn parse_add_hosts_all_or_nothing_and_limit() {
+        let v = parse_add_hosts(["web:192.0.2.1", "db:2001:db8::1"]).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].host().as_str(), "web");
+        assert_eq!(v[1].ip().to_string(), "2001:db8::1");
+        assert_violation(
+            &parse_add_hosts(["web:192.0.2.1", "bad host:192.0.2.2"]).unwrap_err(),
+            InputViolation::ControlOrWhitespace,
+        );
+        let ok = vec!["h:192.0.2.1"; MAX_ADD_HOST_ENTRIES];
+        assert_eq!(parse_add_hosts(ok.iter().copied()).unwrap().len(), 256);
+        let over = vec!["h:192.0.2.1"; MAX_ADD_HOST_ENTRIES + 1];
+        assert_violation(
+            &parse_add_hosts(over.iter().copied()).unwrap_err(),
+            InputViolation::TooManyAddHosts,
+        );
+    }
+
+    /// NET-12: hosts 行の描画（タブ区切り・IPv6 正規化表記）。
+    #[test]
+    fn render_lines_exact_bytes() {
+        let v = parse_add_hosts(["web:192.0.2.1", "db:2001:DB8:0:0:0:0:0:1"]).unwrap();
+        assert_eq!(render_hosts_lines(&v), "192.0.2.1\tweb\n2001:db8::1\tdb\n");
+        assert_eq!(render_hosts_lines(&[]), "");
+    }
+
+    /// NET-12: append_add_hosts 単体でも件数上限を検証する（ファイルに触れる前に拒否するため、
+    /// 管理ルートが存在しなくても `INVALID_ARGUMENT`）。
+    #[test]
+    fn append_rejects_too_many_entries() {
+        let one = AddHostEntry::parse("h:192.0.2.1").unwrap();
+        let entries = vec![one; MAX_ADD_HOST_ENTRIES + 1];
+        let root = std::env::temp_dir().join("fc-addhost-nonexistent-root");
+        let e = append_add_hosts(&root, Path::new("hosts"), &entries).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "invalid add-host: too many entries");
+    }
+
+    /// NET-12・TASK-185.2: Linux 以外では追記せず `UNIMPLEMENTED`（fail-closed）。空エントリは何もせず成功。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn append_is_unimplemented_outside_linux() {
+        let root = std::env::temp_dir().join(format!("fc-addhost-nl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let hosts = root.join("hosts");
+        std::fs::write(&hosts, "orig\n").unwrap();
+        let e = apply_add_hosts(&root, Path::new("hosts"), ["web:192.0.2.1"]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::Unimplemented);
+        assert_eq!(
+            e.message(),
+            "appending to hosts file is only supported on Linux"
+        );
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), "orig\n");
+        assert_eq!(
+            apply_add_hosts(&root, Path::new("hosts"), std::iter::empty()),
+            Ok(())
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

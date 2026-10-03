@@ -359,31 +359,53 @@ fn reclaim_abandoned(pin_c: &CStr, pin: &Path, mounted: bool) {
 /// 失敗時は `ns`（fd と pin パス）を [`UnpinFailure`] に入れて返し、呼び出し側が再試行できる。
 /// 再試行しても、アンマウント済み（`EINVAL`）やファイル削除済みの途中状態から続行できる。
 pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetns>> {
-    let c_path = match CString::new(ns.pin.as_os_str().as_bytes()) {
-        Ok(c) => c,
-        Err(_) => {
-            return Err(UnpinFailure {
-                error: NetError::new(NetErrorCode::InvalidArgument, "netns path contains NUL"),
-                netns: ns,
-            });
+    match unpin_path_inner(&ns.pin) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(UnpinFailure { error, netns: ns }),
+    }
+}
+
+/// pin パスだけから netns の pin を解除する（`ContainerNetns` を手放した後の再試行用）。
+///
+/// ロールバックで `unpin` が失敗するとハンドルは破棄され、マウントとファイルだけが残る。接続失敗の
+/// 報告（`AttachRollbackReport::leftover`）に載った pin パスをここへ渡すと、アンマウントとファイル削除を
+/// やり直せる。すでに消えている（`ENOENT`）・マウントされていない（`EINVAL`）は成功扱い（冪等）。
+/// 誤って他のパスを触らないよう、絶対パスで、かつ symlink・ディレクトリでない通常ファイルだけを対象にする。
+pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
+    if !pin.is_absolute() {
+        return Err(NetError::new(
+            NetErrorCode::InvalidArgument,
+            "netns pin path must be absolute",
+        ));
+    }
+    match fs::symlink_metadata(pin) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "netns pin path is not a regular file",
+            ));
         }
-    };
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_error("stat netns pin", &e)),
+    }
+    unpin_path_inner(pin)
+}
+
+/// アンマウント → ファイル削除。ENOENT（すでに消えている）・EINVAL（未マウント）は成功扱いで、
+/// 途中状態からの再試行に耐える。
+fn unpin_path_inner(pin: &Path) -> Result<(), NetError> {
+    let c_path = CString::new(pin.as_os_str().as_bytes())
+        .map_err(|_| NetError::new(NetErrorCode::InvalidArgument, "netns path contains NUL"))?;
     match sys::unmount_detach(&c_path) {
         Ok(()) => {}
-        Err(SysError::Os(e)) if e == sys::EINVAL => {}
-        Err(e) => {
-            return Err(UnpinFailure {
-                error: sys_error("umount", e),
-                netns: ns,
-            });
-        }
+        Err(SysError::Os(e)) if e == sys::EINVAL || e == sys::ENOENT => {}
+        Err(e) => return Err(sys_error("umount", e)),
     }
-    match fs::remove_file(&ns.pin) {
+    match fs::remove_file(pin) {
         Ok(()) => Ok(()),
-        Err(e) => Err(UnpinFailure {
-            error: io_error("remove netns pin file", &e),
-            netns: ns,
-        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_error("remove netns pin file", &e)),
     }
 }
 
@@ -405,6 +427,17 @@ mod tests {
             let e = check_base_dir_attrs(is_dir, mode, owner, 1000).unwrap_err();
             assert_eq!(e.code(), NetErrorCode::FailedPrecondition, "{what}");
         }
+    }
+
+    /// NET-1: `unpin_path` は相対パスを拒否し、存在しない pin は成功（冪等）、ディレクトリは拒否する。
+    #[test]
+    fn net1_unpin_path_guards_and_idempotence() {
+        let e = unpin_path(Path::new("relative/pin")).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        let missing = std::env::temp_dir().join("fandhe-net-unpin-missing-pin-xyz");
+        assert!(unpin_path(&missing).is_ok());
+        let e = unpin_path(&std::env::temp_dir()).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
     }
 
     /// NET-1: 相対パスは受け付けない。

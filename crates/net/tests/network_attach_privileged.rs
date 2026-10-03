@@ -188,18 +188,60 @@ mod linux {
         Ok(())
     }
 
+    /// 外部コマンドを期限つきで実行する（REPAIR-5）。期限切れなら子を kill して回収する。
     fn run_cmd(program: &str, args: &[&str]) -> Result<String, NetError> {
-        let out = Command::new(program)
+        use std::io::Read as _;
+        let mut child = Command::new(program)
             .args(args)
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| fail(format!("spawn {program}: {e}")))?;
-        if !out.status.success() {
+        // パイプが詰まって子が止まらないよう、別スレッドで読み切る。
+        let mut out_pipe = child.stdout.take();
+        let mut err_pipe = child.stderr.take();
+        let out_t = std::thread::spawn(move || {
+            let mut b = Vec::new();
+            if let Some(p) = out_pipe.as_mut() {
+                let _ = p.read_to_end(&mut b);
+            }
+            b
+        });
+        let err_t = std::thread::spawn(move || {
+            let mut b = Vec::new();
+            if let Some(p) = err_pipe.as_mut() {
+                let _ = p.read_to_end(&mut b);
+            }
+            b
+        });
+        let deadline = Instant::now() + timeout();
+        let status = loop {
+            match child
+                .try_wait()
+                .map_err(|e| fail(format!("wait {program}: {e}")))?
+            {
+                Some(st) => break st,
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(NetError::new(
+                        NetErrorCode::Timeout,
+                        format!("{program} did not finish before the deadline"),
+                    ));
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        let stdout = out_t.join().unwrap_or_default();
+        let stderr = err_t.join().unwrap_or_default();
+        if !status.success() {
             return Err(fail(format!(
                 "{program} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                String::from_utf8_lossy(&stderr)
             )));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 
     /// 名前指定の `RTM_GETLINK` で応答の `RTM_NEWLINK` ペイロード（ifinfomsg + 属性）を返す。

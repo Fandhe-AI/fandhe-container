@@ -257,6 +257,8 @@ pub struct CreatedNetwork {
     pub bridge: IfName,
     /// bridge の ifindex。
     pub bridge_index: IfIndex,
+    /// bridge の `IFLA_IFALIAS` に付けた所有トークン（接続時に同名の別 link でないことを確認する）。
+    pub bridge_token: String,
     /// 専用 nft テーブル名。
     pub table: NftName,
     /// bridge に付与した gateway。
@@ -540,6 +542,7 @@ pub(crate) fn create_network_with(
         name: spec.name().clone(),
         bridge,
         bridge_index: index,
+        bridge_token: token,
         table,
         gateway: spec.gateway(),
     })
@@ -736,6 +739,7 @@ pub struct ContainerAttachSpec {
     endpoint: EndpointId,
     bridge: IfName,
     bridge_index: IfIndex,
+    bridge_token: String,
     netns_dir: PathBuf,
 }
 
@@ -755,6 +759,7 @@ impl ContainerAttachSpec {
             endpoint,
             bridge: network.bridge.clone(),
             bridge_index: network.bridge_index,
+            bridge_token: network.bridge_token.clone(),
             netns_dir,
         })
     }
@@ -899,6 +904,9 @@ pub(crate) trait AttachOps {
     fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<(), NetError>;
     /// 名前から ifindex を引く。
     fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError>;
+    /// bridge の名前から ifindex を引く。`IFLA_IFALIAS` が `token` と一致しない（同名の別 link）
+    /// 場合は `FailedPrecondition` で失敗する。
+    fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError>;
     /// `link` を `master`（bridge）へ接続する。
     fn set_master(&self, link: IfIndex, master: IfIndex) -> Result<(), NetError>;
     /// ifindex 指定で up にする。
@@ -919,7 +927,7 @@ fn rollback_netns<O: AttachOps>(
     match ops.unpin_netns(ns) {
         Ok(()) => report.removed.push(AttachResource::Netns(pin.to_owned())),
         // ハンドルはここで手放すが、pin のマウントは fd と独立に残るため、報告した pin パスから
-        // 解除をやり直せる（`unpin` は未マウント〔EINVAL〕でもファイル削除へ進む）。
+        // `netns::unpin_path`（公開・冪等）で解除をやり直せる。
         Err(UnpinFailure { error, netns }) => {
             drop(netns);
             let state = if is_indeterminate(error.code()) {
@@ -981,7 +989,7 @@ pub(crate) fn attach_container_with<O: AttachOps>(
         .map_err(|e| fail(e, AttachStep::DeriveNames, AttachRollbackReport::default()))?;
 
     // 何かを作る前に、接続先が作成時の bridge のままであることを確認する。
-    match ops.link_index(&spec.bridge) {
+    match ops.owned_bridge_index(&spec.bridge, &spec.bridge_token) {
         Ok(i) if i == spec.bridge_index => {}
         Ok(_) => {
             return Err(fail(
@@ -1121,6 +1129,10 @@ impl AttachOps for LinuxAttachOps<'_> {
 
     fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
         self.route.link_index(name, self.timeout)
+    }
+
+    fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError> {
+        self.route.link_index_owned(name, token, self.timeout)
     }
 
     fn set_master(&self, link: IfIndex, master: IfIndex) -> Result<(), NetError> {
@@ -1715,6 +1727,7 @@ mod attach_tests {
             name: NetworkName::new("web").unwrap(),
             bridge: names.bridge().clone(),
             bridge_index: IfIndex::new(7).unwrap(),
+            bridge_token: "fandhe-net:web:1:0:0".to_owned(),
             table: names.table().clone(),
             gateway: IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 1)), 24).unwrap(),
         }
@@ -1806,6 +1819,12 @@ mod attach_tests {
                 return Err(err(NetErrorCode::NotFound));
             }
             IfIndex::new(22)
+        }
+        fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError> {
+            if token != "fandhe-net:web:1:0:0" {
+                return Err(err(NetErrorCode::FailedPrecondition));
+            }
+            self.link_index(name)
         }
         fn set_master(&self, link: IfIndex, master: IfIndex) -> Result<(), NetError> {
             self.rec(format!("set_master {} {}", link.get(), master.get()));
@@ -1934,6 +1953,18 @@ mod attach_tests {
         assert_eq!(f.calls().len(), 1);
         assert_eq!(e.step, AttachStep::VerifyBridge);
         assert_eq!(e.code(), NetErrorCode::NotFound);
+    }
+
+    /// NET-1: bridge の所有トークンが一致しない（ifindex が同じでも別所有者の同名 bridge）なら拒否する。
+    #[test]
+    fn net1_attach_bridge_token_mismatch_creates_nothing() {
+        let mut sp = spec("c1");
+        sp.bridge_token = "other-owner".to_owned();
+        let f = Fake::default();
+        let e = attach_container_with(&f, &sp).unwrap_err();
+        assert_eq!(e.step, AttachStep::VerifyBridge);
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(f.calls().len(), 0);
     }
 
     /// NET-1: netns 作成の失敗。取り残しが無ければ空報告、結果不明なら Unknown で pin パスを報告する。

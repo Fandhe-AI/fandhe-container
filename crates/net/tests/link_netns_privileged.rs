@@ -49,6 +49,24 @@ mod linux {
         RTM_NEWLINK,
     };
 
+    /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス名。
+    /// モジュールのロード状況で有無が変わるため「新規 netns 判定」では無視する。
+    const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
+        "tunl0",
+        "gre0",
+        "gretap0",
+        "erspan0",
+        "ip_vti0",
+        "ip6_vti0",
+        "sit0",
+        "ip6tnl0",
+        "ip6gre0",
+        "ip6erspan0",
+    ];
+
+    /// `IFLA_LINK`（linux/if_link.h）。veth ではペア相手の ifindex。
+    const IFLA_LINK_ATTR: u16 = 5;
+
     const OK_LINE: &str = "link_netns_privileged: ok bridge=up veth_a=up veth_b=up";
 
     fn timeout() -> Duration {
@@ -125,6 +143,57 @@ mod linux {
         Ok(u32::from_ne_bytes(raw))
     }
 
+    /// 名前指定の `RTM_GETLINK` で (ifindex, `IFLA_LINK`) を返す。veth では `IFLA_LINK` が
+    /// ペアの相手端の ifindex になる（作成直後の所有確認に使う）。
+    fn get_link_index_and_peer(
+        sock: &NetlinkRouteSocket,
+        ifname: &str,
+    ) -> Result<(u32, Option<u32>), NetError> {
+        let n = name(ifname);
+        let reply = sock.request(RTM_GETLINK, 0, timeout(), |b: &mut NlMsgBuilder| {
+            b.put_fixed(&[0u8; IFINFOMSG_LEN])?;
+            let mut v = n.as_str().as_bytes().to_vec();
+            v.push(0);
+            b.put_attr(IFLA_IFNAME, &v)
+        })?;
+        let msg = reply
+            .messages()
+            .iter()
+            .find(|m| m.msg_type() == RTM_NEWLINK)
+            .ok_or_else(|| NetError::new(NetErrorCode::Internal, "no RTM_NEWLINK in reply"))?;
+        let payload = msg.payload();
+        let short = || NetError::new(NetErrorCode::Internal, "short ifinfomsg in reply");
+        let index = payload
+            .get(4..8)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .map(u32::from_ne_bytes)
+            .ok_or_else(short)?;
+        // rtattr 列（len(2) type(2) 値、4 バイト境界）を checked で走査して IFLA_LINK を探す。
+        let mut peer = None;
+        let mut off = IFINFOMSG_LEN;
+        let rd16 = |at: usize| {
+            payload
+                .get(at..at + 2)
+                .and_then(|s| <[u8; 2]>::try_from(s).ok())
+                .map(u16::from_ne_bytes)
+        };
+        while let (Some(len), Some(ty)) = (rd16(off), rd16(off + 2)) {
+            let len = usize::from(len);
+            let ty = ty & 0x3fff;
+            if len < 4 {
+                break;
+            }
+            if ty == IFLA_LINK_ATTR {
+                peer = payload
+                    .get(off + 4..off + len)
+                    .and_then(|v| <[u8; 4]>::try_from(v).ok())
+                    .map(u32::from_ne_bytes);
+            }
+            off += (len + 3) & !3;
+        }
+        Ok((index, peer))
+    }
+
     /// ifindex 指定の `RTM_DELLINK`（テスト内の後始末専用。公開 API にはしない）。
     /// 名前ではなく自分が作成直後に控えた ifindex で消すため、同名の他者のリンクを巻き込まない。
     fn del_link_by_index(sock: &NetlinkRouteSocket, index: u32) -> Result<(), NetError> {
@@ -180,7 +249,8 @@ mod linux {
 
     /// 自分が新規 netns にいることを確認する。次の 2 条件をどちらも満たさなければ拒否する。
     /// - 親プロセスの netns と inode が異なる（`unshare --net` 経由なら親は host の netns）
-    /// - `/proc/self/net/dev` が loopback `lo` のみ（新規 netns は `lo` だけを持つ）
+    /// - `/proc/self/net/dev` が `lo` とカーネルのフォールバックトンネルデバイスのみ
+    ///   （新規 netns は `lo` に加え、tunnel 系モジュールのロード状況により `sit0`・`gre0` 等を自動で持つ）
     fn ensure_isolated_netns() -> Result<(), NetError> {
         let deny = |m: String| NetError::new(NetErrorCode::FailedPrecondition, m);
         let io = |what: &str, e: std::io::Error| {
@@ -209,7 +279,7 @@ mod linux {
             .lines()
             .skip(2)
             .filter_map(|l| l.split(':').next().map(str::trim))
-            .filter(|n| !n.is_empty() && *n != "lo")
+            .filter(|n| !n.is_empty() && *n != "lo" && !FALLBACK_TUNNEL_DEVICES.contains(n))
             .collect();
         if !foreign.is_empty() {
             return Err(deny(format!(
@@ -237,6 +307,38 @@ mod linux {
     }
 
     // ---- 親（host netns）----
+
+    /// host 上に残りうる veth の後始末用状態（親の失敗経路で参照する）。
+    struct HostState {
+        /// create_link の成功応答後に控えた、host 上の未移動の端の ifindex。
+        owned: [Cell<Option<u32>>; 2],
+        /// create_link の成功応答を得たか（ifindex 記録前の失敗経路の判定用）。
+        created: Cell<bool>,
+        /// 各端の移動要求が成功応答を得て host から外れたか。
+        moved: [Cell<bool>; 2],
+    }
+
+    /// create_link 成功後〜ifindex 記録前に失敗した経路の所有確認。ifindex が未記録のため、今の host 上の
+    /// 両端が互いを `IFLA_LINK` で指し合う veth ペアだと確認できた場合だけ ifindex を控える
+    /// （他者の同名リンクを巻き込まない。確認できなければ控えず、消さずに残存を許容する）。
+    fn confirm_unrecorded_pair(sock: &NetlinkRouteSocket, a: &str, b: &str, st: &HostState) {
+        let unrecorded = st.created.get()
+            && st.owned.iter().all(|c| c.get().is_none())
+            && st.moved.iter().all(|m| !m.get());
+        if !unrecorded {
+            return;
+        }
+        let (Ok((ia, pa)), Ok((ib, pb))) = (
+            get_link_index_and_peer(sock, a),
+            get_link_index_and_peer(sock, b),
+        ) else {
+            return;
+        };
+        if pa == Some(ib) && pb == Some(ia) {
+            st.owned[0].set(Some(ia));
+            st.owned[1].set(Some(ib));
+        }
+    }
 
     /// drop で子を kill して wait するガード（失敗経路でも netns と子を残さない）。
     struct ChildGuard {
@@ -326,19 +428,27 @@ mod linux {
 
         // 本試験が create_link の成功応答を得て、作成直後に ifindex を控えた host 上の未移動の端だけを保持する。
         // 後始末は名前ではなく ifindex で消すため、同名の他者のリンクは消さない（P0）。
-        let host_veth_owned: [Cell<Option<u32>>; 2] = [Cell::new(None), Cell::new(None)];
+        let st = HostState {
+            owned: [Cell::new(None), Cell::new(None)],
+            created: Cell::new(false),
+            moved: [Cell::new(false), Cell::new(false)],
+        };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            scenario(&sock, &mut guard, pid, &a, &b, deadline, &host_veth_owned)
+            scenario(&sock, &mut guard, pid, (&a, &b), deadline, &st)
         }));
         // 移動前に失敗した場合に host へ残る veth を片付ける（本試験が作成したものに限る）。
         {
+            // create_link 成功後〜ifindex 記録前に失敗した経路: ifindex が未記録のため、今の host 上の
+            // 両端が「互いを IFLA_LINK で指し合う veth ペア」だと確認できた場合だけ ifindex を控える
+            // （他者の同名リンクを巻き込まない。確認できなければ消さず残存を許容する）。
+            confirm_unrecorded_pair(&sock, &a, &b, &st);
             // a だけ移動済みで b が host に残る経路もあるため、未移動の端ごとに試す（NotFound は想定内）。
             // 移動要求が Timeout / DataLoss 等で応答不明でもカーネル側では移動済みの可能性がある。
             // 控えた ifindex が今も host 上の同名リンクのものだと再確認できた場合だけ消す（P0。
             // ifindex を他者が再利用したリンクを巻き込まない。確認できなければ消さず残存を許容する）。
             for (ifname, idx) in [&a, &b]
                 .into_iter()
-                .zip(host_veth_owned.iter())
+                .zip(st.owned.iter())
                 .filter_map(|(n, c)| c.get().map(|i| (n, i)))
             {
                 if get_link_index(&sock, ifname).ok() != Some(idx) {
@@ -365,10 +475,9 @@ mod linux {
         sock: &NetlinkRouteSocket,
         guard: &mut ChildGuard,
         pid: u32,
-        a: &str,
-        b: &str,
+        (a, b): (&str, &str),
         deadline: Instant,
-        host_veth_owned: &[Cell<Option<u32>>; 2],
+        st: &HostState,
     ) {
         guard.expect_line(deadline, "ready");
 
@@ -386,9 +495,10 @@ mod linux {
             timeout(),
         )
         .expect("create veth pair");
+        st.created.set(true);
         // 作成直後に ifindex を控え、後始末はこの ifindex だけを対象にする。
-        host_veth_owned[0].set(Some(get_link_index(sock, a).expect("ifindex of a")));
-        host_veth_owned[1].set(Some(get_link_index(sock, b).expect("ifindex of b")));
+        st.owned[0].set(Some(get_link_index(sock, a).expect("ifindex of a")));
+        st.owned[1].set(Some(get_link_index(sock, b).expect("ifindex of b")));
 
         // a は PID 指定、b は ns fd 指定で子の netns へ移動する。
         let by_pid = NetnsTarget::Pid(NetnsPid::new(pid).expect("child pid"));
@@ -399,7 +509,8 @@ mod linux {
         .expect("move a by pid");
         // 移動の成功応答を得た端は host の ifindex と無関係になるため後始末対象から外す。
         // 失敗・応答不明の場合は外さず、後始末側が名前と ifindex の一致を再確認してから消す。
-        host_veth_owned[0].set(None);
+        st.owned[0].set(None);
+        st.moved[0].set(true);
         let ns_file = File::open(format!("/proc/{pid}/ns/net")).expect("open child netns");
         let by_fd = NetnsTarget::Fd(NetnsFd::new(ns_file.as_fd()).expect("netns fd"));
         sock.set_link(
@@ -407,7 +518,8 @@ mod linux {
             timeout(),
         )
         .expect("move b by fd");
-        host_veth_owned[1].set(None);
+        st.owned[1].set(None);
+        st.moved[1].set(true);
 
         // host からは両端が消え、子の netns に現れる。
         for n in [a, b] {

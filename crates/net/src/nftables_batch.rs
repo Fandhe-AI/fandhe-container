@@ -9,7 +9,8 @@
 //!
 //! - NEWTABLE / NEWCHAIN / DELTABLE の本体メッセージ組み立て（`table_chain`。#305・TASK-137.2）が
 //!   `NfGenMsg::put_into` と `nfnl_msg_type` を使い、`NftBatch::push_with` へ積む
-//! - `NETLINK_NETFILTER` ソケットでの送信と ACK 判定（#306・TASK-137.3）が `NftBatchBytes` を送る
+//! - `NETLINK_NETFILTER` ソケットでの送信と ACK 判定（`NetlinkNetfilterSocket::send_batch`。`ack`・`socket`。
+//!   Linux のみ。#306・TASK-137.3）が `NftBatchBytes` を送り、本体メッセージごとの ACK / エラーを判定する
 //!
 //! # ワイヤーレイアウト
 //!
@@ -29,10 +30,20 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! ルール（NEWRULE / expr。TASK-138）、ソケット送信と ACK 判定（#306）、実機結合テスト（#307）は未実装。
+//! ルール（NEWRULE / expr。TASK-138）と、root を要する実機結合テスト（#307）は未実装。ソケット送信と ACK 判定
+//! （#306）は実装済みだが、`SO_SNDBUF` / `SO_RCVBUF` の調整・extended ACK・`NFTA_GEN_ID` は未実装（`socket` の doc）。
 //! 定数値は Linux UAPI（`nfnetlink.h`・`netfilter.h`）に基づく。
 
+#[cfg(target_os = "linux")]
+mod ack;
+#[cfg(target_os = "linux")]
+mod socket;
 mod table_chain;
+
+#[cfg(target_os = "linux")]
+pub use ack::{NftBatchAck, NftBatchError, NftBatchOutcome, NftBatchPosition, NftMessageFailure};
+#[cfg(target_os = "linux")]
+pub use socket::NetlinkNetfilterSocket;
 pub use table_chain::*;
 
 use crate::error::{NetError, NetErrorCode};
@@ -51,7 +62,7 @@ pub const NFNETLINK_V0: u8 = 0;
 /// `nfgenmsg` の固定長（バイト）。
 pub const NFGENMSG_LEN: usize = 4;
 /// BATCH_BEGIN / END 1 件の長さ（nlmsghdr 16 + nfgenmsg 4。パディングなし）。
-const BATCH_MARKER_LEN: usize = 20;
+pub(crate) const BATCH_MARKER_LEN: usize = 20;
 
 /// プロトコルファミリ `NFPROTO_UNSPEC`。
 pub const NFPROTO_UNSPEC: u8 = 0;
@@ -69,8 +80,8 @@ pub const NFPROTO_BRIDGE: u8 = 7;
 pub const NFPROTO_IPV6: u8 = 10;
 
 /// バッチ全体の上限長。暫定値で `MAX_MESSAGE_LEN`（1 MiB）を流用する（REPAIR-3）。
-/// kernel 由来の値ではなく、実際の上限はソケットの `SO_SNDBUF`（超過で `EMSGSIZE`）に依存する。
-/// 実効値の決定は #306 の担当。
+/// kernel 由来の値ではなく、実際に送れる長さはソケットの `SO_SNDBUF`（既定で約 212 KB。超過で
+/// `EMSGSIZE` → `ResourceExhausted` / `NotSent`）に依存する。`SO_SNDBUF` の調整は未実装（#306・REPAIR-3）。
 pub const MAX_BATCH_LEN: usize = MAX_MESSAGE_LEN as usize;
 
 fn invalid(msg: impl Into<String>) -> NetError {

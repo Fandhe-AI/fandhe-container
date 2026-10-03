@@ -45,6 +45,9 @@ pub enum NetOpKind {
     LinkCreate,
     /// link 設定要求 1 件（`RTM_SETLINK`。`NetlinkRouteSocket::set_link`。TASK-136.3.2・#846）。
     LinkSet,
+    /// nf_tables バッチ 1 件の送信と ACK / エラー判定（`NetlinkNetfilterSocket::send_batch`。
+    /// TASK-137.3・#306）。内側の send / recv も従来どおり個別に記録される。
+    NftBatch,
 }
 
 impl NetOpKind {
@@ -57,6 +60,7 @@ impl NetOpKind {
             NetOpKind::NetlinkRequest => "netlink.request",
             NetOpKind::LinkCreate => "netlink.link.create",
             NetOpKind::LinkSet => "netlink.link.set",
+            NetOpKind::NftBatch => "nftables.batch",
         }
     }
 }
@@ -231,13 +235,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 6] = [
+    const ALL_KINDS: [NetOpKind; 7] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
         NetOpKind::NetlinkRequest,
         NetOpKind::LinkCreate,
         NetOpKind::LinkSet,
+        NetOpKind::NftBatch,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
@@ -249,6 +254,7 @@ mod tests {
         assert_eq!(NetOpKind::NetlinkRequest.as_str(), "netlink.request");
         assert_eq!(NetOpKind::LinkCreate.as_str(), "netlink.link.create");
         assert_eq!(NetOpKind::LinkSet.as_str(), "netlink.link.set");
+        assert_eq!(NetOpKind::NftBatch.as_str(), "nftables.batch");
     }
 
     /// REPAIR-4: 操作名は core の `OpName::new` と同じ規則に収まる（net は core に依存できないため

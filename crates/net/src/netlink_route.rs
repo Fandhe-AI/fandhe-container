@@ -139,6 +139,9 @@ pub use socket::{
 };
 
 #[cfg(target_os = "linux")]
+pub(crate) use socket::{RequestGate, classify_errno};
+
+#[cfg(target_os = "linux")]
 mod socket {
     use std::fmt;
     use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
@@ -154,6 +157,7 @@ mod socket {
         NlMsgBuilder, NlMsgHeader, NlMsgIter,
     };
     use crate::netlink_route::{LinkCreate, LinkSet};
+    use crate::nftables_batch::{MAX_BATCH_LEN, NftBatchBytes};
     use crate::sys::{self, Deadline, Readiness, RecvMeta, SysError};
 
     /// 受信バッファの通常の長さ（バイト）。これ以下のデータグラムはこの長さのバッファで受ける
@@ -224,16 +228,20 @@ mod socket {
     /// 往復が並行すると互いの応答を seq 不一致として破棄し合うため必要。順番待ちも往復全体の
     /// [`Deadline`] に含め、無期限には待たない。
     #[derive(Debug, Default)]
-    struct RequestGate {
+    pub(crate) struct RequestGate {
         busy: Mutex<bool>,
         released: Condvar,
     }
 
     /// [`RequestGate`] の保持中を表す。Drop で解放して次の待機者を起こす。
-    struct GateGuard<'a>(&'a RequestGate);
+    pub(crate) struct GateGuard<'a>(&'a RequestGate);
 
     impl RequestGate {
-        fn acquire(&self, deadline: &Deadline, total: Duration) -> Result<GateGuard<'_>, NetError> {
+        pub(crate) fn acquire(
+            &self,
+            deadline: &Deadline,
+            total: Duration,
+        ) -> Result<GateGuard<'_>, NetError> {
             let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
             loop {
                 let remaining = deadline.remaining();
@@ -342,8 +350,33 @@ mod socket {
         /// ソケットを開いて bind し、以後の open / send / recv の結果と所要時間を `recorder` へ渡す
         /// （REPAIR-4）。open 自体の成否もここで 1 件記録する。
         pub fn open_with_recorder(recorder: Arc<dyn NetOpRecorder>) -> Result<Self, NetError> {
+            Self::open_protocol(recorder, sys::open_route_socket)
+        }
+
+        /// `NETLINK_NETFILTER` ソケットとして開いて bind する（nf_tables のバッチ送信用。
+        /// `crate::nftables_batch::NetlinkNetfilterSocket` だけが使う。TASK-137.3・#306）。
+        ///
+        /// 型名は route だが、送受信・期限・計装の機構はプロトコルに依存しないため再利用している。
+        /// `request` などの rtnetlink 固有の往復（dump / DONE の終端規則）は netfilter 側へ公開しない。
+        /// 共通コアの切り出しは後続の整理課題（REPAIR-3）。
+        pub(crate) fn open_netfilter_with_recorder(
+            recorder: Arc<dyn NetOpRecorder>,
+        ) -> Result<Self, NetError> {
+            Self::open_protocol(recorder, sys::open_netfilter_socket)
+        }
+
+        /// 計装の記録先（`NetlinkNetfilterSocket` が往復全体を記録するために共有する）。
+        pub(crate) fn recorder(&self) -> &Arc<dyn NetOpRecorder> {
+            &self.recorder
+        }
+
+        /// open（`socket` + `bind`）の共通部。`open_fd` が protocol ごとのソケット作成を担う。
+        fn open_protocol(
+            recorder: Arc<dyn NetOpRecorder>,
+            open_fd: fn() -> Result<OwnedFd, SysError>,
+        ) -> Result<Self, NetError> {
             let fd = record_net_op(recorder.as_ref(), NetOpKind::NetlinkOpen, || {
-                let fd = sys::open_route_socket().map_err(|e| map_sys_error("socket", e))?;
+                let fd = open_fd().map_err(|e| map_sys_error("socket", e))?;
                 sys::bind_kernel_assigned(fd.as_fd()).map_err(|e| map_sys_error("bind", e))?;
                 Ok::<_, NetError>(fd)
             })?;
@@ -430,6 +463,38 @@ mod socket {
         pub fn send(&self, message: &[u8]) -> Result<(), NetError> {
             record_net_op(self.recorder.as_ref(), NetOpKind::NetlinkSend, || {
                 self.send_unrecorded(message)
+            })
+        }
+
+        /// 閉じた nf_tables バッチ（連結された複数メッセージ）を 1 データグラムとして送る
+        /// （TASK-137.3・#306。`NetOpKind::NetlinkSend` として記録）。
+        ///
+        /// [`send`](Self::send) の単一メッセージ検証は通さない。`NftBatchBytes` は非公開フィールドで
+        /// `NftBatch::finish` だけが作れ、BEGIN・本体・END の framing は型で保証されるため（REPAIR-2）、
+        /// ここでは長さの上限だけ確認する。部分送信は `DataLoss`。送信が `EMSGSIZE`（ソケットの
+        /// `SO_SNDBUF` 超過）なら `ResourceExhausted`。
+        pub(crate) fn send_batch_bytes(&self, batch: &NftBatchBytes) -> Result<(), NetError> {
+            record_net_op(self.recorder.as_ref(), NetOpKind::NetlinkSend, || {
+                let bytes = batch.bytes();
+                if bytes.len() > MAX_BATCH_LEN {
+                    return Err(NetError::new(
+                        NetErrorCode::InvalidArgument,
+                        format!(
+                            "nf_tables batch length {} exceeds {}",
+                            bytes.len(),
+                            MAX_BATCH_LEN
+                        ),
+                    ));
+                }
+                let sent = sys::send_to_kernel(self.fd.as_fd(), bytes)
+                    .map_err(|e| map_sys_error("sendto", e))?;
+                if sent != bytes.len() {
+                    return Err(NetError::new(
+                        NetErrorCode::DataLoss,
+                        format!("partial netlink send: {} of {} bytes", sent, bytes.len()),
+                    ));
+                }
+                Ok(())
             })
         }
 
@@ -817,7 +882,7 @@ mod socket {
         }
     }
 
-    fn classify_errno(errno: i32) -> NetErrorCode {
+    pub(crate) fn classify_errno(errno: i32) -> NetErrorCode {
         match errno {
             sys::EPERM | sys::EACCES => NetErrorCode::PermissionDenied,
             sys::EAFNOSUPPORT | sys::EPROTONOSUPPORT | sys::EOPNOTSUPP => {
@@ -827,9 +892,12 @@ mod socket {
             sys::EEXIST => NetErrorCode::AlreadyExists,
             sys::EBUSY => NetErrorCode::FailedPrecondition,
             sys::EINVAL => NetErrorCode::InvalidArgument,
-            sys::ENOBUFS | sys::ENOMEM | sys::EMFILE | sys::ENFILE | sys::EAGAIN => {
-                NetErrorCode::ResourceExhausted
-            }
+            sys::ENOBUFS
+            | sys::ENOMEM
+            | sys::EMFILE
+            | sys::ENFILE
+            | sys::EAGAIN
+            | sys::EMSGSIZE => NetErrorCode::ResourceExhausted,
             _ => NetErrorCode::Internal,
         }
     }
@@ -855,6 +923,7 @@ mod socket {
             assert_eq!(classify_errno(16), NetErrorCode::FailedPrecondition);
             assert_eq!(classify_errno(22), NetErrorCode::InvalidArgument);
             assert_eq!(classify_errno(95), NetErrorCode::Unimplemented);
+            assert_eq!(classify_errno(90), NetErrorCode::ResourceExhausted);
             assert_eq!(classify_errno(5), NetErrorCode::Internal);
             let e = map_sys_error("socket", SysError::Os(1));
             assert_eq!(e.to_string(), "PERMISSION_DENIED: socket failed: errno 1");

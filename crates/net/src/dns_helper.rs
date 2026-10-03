@@ -5,7 +5,8 @@
 //! - ネットワーク（`network::create_network` が作る bridge）の gateway の IPv4:53 に UDP で待ち受ける
 //!   ヘルパープロセスを 1 つ起動する基盤。質問セクションのパース（[`parse_question`]）、コンテナ名 → IPv4 の
 //!   レジストリ（[`DnsRegistry`]）、A 応答・REFUSED / NODATA の組み立て（[`RegistryHandler`]）を持つ
-//!   （TASK-141.2・#322）。上流 DNS への転送は TASK-185、参照カウントによるオンデマンド起動・終了は
+//!   （TASK-141.2・#322）。上流 DNS への転送（コンテナ別の `--dns` マッピング）は [`upstream`]
+//!   （NET-12・TASK-185.3・#346）、参照カウントによるオンデマンド起動・終了は
 //!   [`refcount`]（NET-7・TASK-144.1・#329）が持つ。SIGTERM による正常終了は未実装（REPAIR-3）
 //! - 呼び出し側（将来の統一 CLI / 製品バイナリ。TASK-79）は [`spawn_dns_helper`] で自身または専用バイナリを
 //!   `--listen <ipv4:port>` つきで起動し、ヘルパー側の `main` は [`run_dns_helper_main`] を呼ぶ
@@ -24,8 +25,13 @@
 //! 起きるため、経路の設計は後続タスクで決める）。経路ができるまで [`run_dns_helper_main`] は
 //! [`RegistryHandler`] に切り替えず、全クエリに NOTIMP を返す [`NotImplementedHandler`] を使い続ける
 //! （登録できない空レジストリで実際の名前解決を妨げない）。[`RegistryHandler`] は同一プロセス内の
-//! 登録側（テスト・将来の組み込み）から使える。上流転送・TCP・AAAA・EDNS0 も未対応。
-//! レジストリに無い名前は存在・不存在を断定せず REFUSED（AA=0）を返す（上流転送 TASK-185 まで）。
+//! 登録側（テスト・将来の組み込み）から使える。TCP・AAAA・EDNS0 も未対応（上流転送は次に記す）。
+//! レジストリに無い名前は存在・不存在を断定せず REFUSED（AA=0）を返す。ただし [`upstream::ForwardingHandler`]
+//! （NET-12・TASK-185.3・#346）を組み立てた場合に限り、上流マッピング登録済みのコンテナからの管理外名は
+//! そのコンテナの `--dns` 上流へ転送する。この転送機構も同じ理由で製品の入口には未接続で、同一プロセス内の
+//! 登録側（テスト・将来の組み込み）からのみ到達できる。転送は `serve` の受信ループではなく最大
+//! [`MAX_INFLIGHT_DEFERRED`] 件のワーカー（[`HandlerOutcome::Defer`]）で行い、上流の応答待ちで他のクエリを
+//! 待たせない。TCP 再試行（TC=1 応答）は未対応。
 //! PLUG-1 における DNS ヘルパーの core / plugin 区分は検討中で、確定扱いにはしない。
 //!
 //! # 実機計測（TASK-141.3・#323）
@@ -36,24 +42,28 @@
 //!
 //! # 安全性
 //! 受信バッファは固定長（513 バイト）で、512 バイト超は破棄する。外部入力の解析は `get` / `try_into` のみで
-//! 添字アクセス・`unwrap` を使わない。ヘッダー不正のパケットには応答しない。応答は要求長 + [`MAX_RESPONSE_GROWTH`]
-//! バイト以下に限り（増幅反射の防止）、ログ・統計にはパケットの内容を載せない。待受・準備完了待ち・回収はすべて期限つき（REPAIR-5）。
+//! 添字アクセス・`unwrap` を使わない。ヘッダー不正のパケットには応答しない。自前応答は要求長 + [`MAX_RESPONSE_GROWTH`]
+//! バイト以下に限る（増幅反射の防止）。上流転送の応答は 512 バイト以下に限る（[`upstream::SourceVerified`] で bridge の
+//! 送信元詐称防止を保証した場合だけ転送を有効にできるため、増幅の上限を緩める。TCP 再試行は未対応）。ログ・統計にはパケットの内容を載せない。待受・準備完了待ち・回収はすべて期限つき（REPAIR-5）。
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::num::NonZeroU8;
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{NetError, NetErrorCode};
 use crate::network::CreatedNetwork;
 
 pub mod refcount;
+pub mod upstream;
 
 /// DNS の既定ポート。
 pub const DNS_PORT: u16 = 53;
@@ -78,13 +88,14 @@ const FLAG_QR: u8 = 0x80;
 const FLAG_RD: u8 = 0x01;
 const FLAG_AA: u8 = 0x04;
 const RCODE_NOERROR: u8 = 0;
+const RCODE_SERVFAIL: u8 = 2;
 const RCODE_NOTIMP: u8 = 4;
 const RCODE_REFUSED: u8 = 5;
 const QTYPE_A: u16 = 1;
 const QCLASS_IN: u16 = 1;
 /// A レコード応答の TTL（秒）。コンテナの増減を反映しやすいよう短くする（PoC-15 と同値）。spec は TTL を規定しない。
 pub const ANSWER_TTL_SECS: u32 = 5;
-/// 応答が要求長を超えてよい上限（A RR 1 件: 圧縮ポインタ 2 + TYPE 2 + CLASS 2 + TTL 4 + RDLENGTH 2 + RDATA 4）。
+/// 自前応答（`HandlerOutcome::Respond`）が要求長を超えてよい上限（A RR 1 件: 圧縮ポインタ 2 + TYPE 2 + CLASS 2 + TTL 4 + RDLENGTH 2 + RDATA 4）。
 /// 応答は「要求 + A RR 1 件」に限られ、最小クエリ（17 バイト）でも増幅率は 2 倍未満。待受は bridge gateway の
 /// ユニキャストのみ（[`DnsListenAddr`]）で、外部インターフェースへは公開しない（NET-5）。
 pub const MAX_RESPONSE_GROWTH: usize = 16;
@@ -340,11 +351,31 @@ impl ResponseBuf {
     }
 }
 
+/// 上流転送の応答であることの証印。フィールドが非公開のため `dns_helper` 配下（[`upstream::ForwardingHandler`]）
+/// でしか作れず、外部の [`QueryHandler`] 実装が `serve` の増幅ガードを緩められない（NET-12・TASK-185.3）。
+/// 防御的に、フィールドを `NonZeroU8` にして全ゼロのビットパターン（`std::mem::zeroed` 等。いずれも `unsafe`）を
+/// 有効値にしない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardedProof(NonZeroU8);
+
+impl ForwardedProof {
+    /// 証印を発行する。非公開で、`dns_helper` 配下（[`upstream::ForwardingHandler`]）からのみ呼べる。
+    fn issue() -> Self {
+        Self(NonZeroU8::MIN)
+    }
+}
+
 /// ハンドラの結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandlerOutcome {
     /// `out` の内容を返信する。
     Respond,
+    /// 上流から受けた応答を返信する（統計の `forwarded` に計上するための区別）。増幅ガードの上限は
+    /// UDP の最大長（512 バイト）。呼び出し元の送信元詐称防止の保証が前提（NET-12・TASK-185.3）。
+    RespondForwarded(ForwardedProof),
+    /// 応答に時間がかかる（上流転送）ため、`serve` のワーカーで [`QueryHandler::respond_deferred`] を呼んで
+    /// 応答させる。`out` の内容は使わない（NET-12・TASK-185.3）。
+    Defer,
     /// 返信しない。
     NoResponse,
 }
@@ -354,6 +385,31 @@ pub trait QueryHandler {
     /// `header` は検証済み、`datagram` は受信全体（512 バイト以下）。
     fn respond(&self, header: &DnsHeader, datagram: &[u8], out: &mut ResponseBuf)
     -> HandlerOutcome;
+
+    /// 送信元つきの応答処理。`serve` が呼ぶ。既定は `respond` へ委譲する（送信元を使わないハンドラは実装不要）。
+    /// 上流転送のようにクエリ元のコンテナ（IP）で挙動を変えるハンドラが上書きする（NET-12・TASK-185.3）。
+    fn respond_from(
+        &self,
+        _peer: SocketAddr,
+        header: &DnsHeader,
+        datagram: &[u8],
+        out: &mut ResponseBuf,
+    ) -> HandlerOutcome {
+        self.respond(header, datagram, out)
+    }
+
+    /// `respond_from` が [`HandlerOutcome::Defer`] を返したクエリの応答処理。`serve` が受信ループとは別の
+    /// ワーカースレッドから呼ぶ（受信ループを塞がない）。必ず期限つきで終えること（REPAIR-5）。ここで
+    /// 再び `Defer` を返しても返信しない。既定は返信しない（Defer を返さないハンドラは実装不要）。
+    fn respond_deferred(
+        &self,
+        _peer: SocketAddr,
+        _header: &DnsHeader,
+        _datagram: &[u8],
+        _out: &mut ResponseBuf,
+    ) -> HandlerOutcome {
+        HandlerOutcome::NoResponse
+    }
 }
 
 /// 疎通確認用の最小ハンドラ: ID と RD をコピーし QR=1・RCODE=NOTIMP(4)・各カウント 0 の 12 バイトを返す。
@@ -679,6 +735,11 @@ pub struct DnsHelperStats {
     pub recv_errors: u64,
     /// ハンドラの応答が要求長を超える等で抑止した数。
     pub suppressed: u64,
+    /// 上流から受けた応答を返した数（`answered` にも含む。NET-12・TASK-185.3）。
+    pub forwarded: u64,
+    /// [`HandlerOutcome::Defer`] のうち、同時処理の上限（[`MAX_INFLIGHT_DEFERRED`]）超過・ワーカーのスレッド生成失敗で
+    /// 応答せず破棄した数（NET-12・TASK-185.3）。
+    pub deferred_dropped: u64,
 }
 
 impl DnsHelperStats {
@@ -692,6 +753,21 @@ impl DnsHelperStats {
             DropReason::BadQuestionCount => self.dropped_bad_question_count,
             DropReason::BadQuestion => self.dropped_bad_question,
         }
+    }
+
+    fn record(&mut self, r: SendResult) {
+        let slot = match r {
+            SendResult::Sent { forwarded } => {
+                if forwarded {
+                    self.forwarded = self.forwarded.saturating_add(1);
+                }
+                &mut self.answered
+            }
+            SendResult::Suppressed => &mut self.suppressed,
+            SendResult::SendError => &mut self.send_errors,
+            SendResult::NoResponse => return,
+        };
+        *slot = slot.saturating_add(1);
     }
 
     fn count_drop(&mut self, reason: DropReason) {
@@ -719,6 +795,152 @@ fn is_msgsize(e: &io::Error) -> bool {
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     const MSGSIZE: i32 = -1;
     e.raw_os_error() == Some(MSGSIZE)
+}
+
+/// [`HandlerOutcome::Defer`] を同時に処理するワーカーの上限（暫定値。spec に規定なし）。上限に達している間の Defer は
+/// 応答せず破棄し、スレッドを無制限に作らない（DoS 対策）。各ワーカーは高々 `upstream::FORWARD_TOTAL_DEADLINE`（2.5 秒）
+/// で終わるため、上流がすべて無応答でも毎秒およそ 6 件の転送を受け付け、自前応答（レジストリ）は待たされない。
+pub const MAX_INFLIGHT_DEFERRED: usize = 16;
+/// Defer ワーカーのスタックサイズ。固定長バッファ（数 KiB）しか使わないため既定より小さくする（CORE-7）。
+const DEFERRED_WORKER_STACK: usize = 128 * 1024;
+
+/// 1 件の応答を送った結果（統計の更新に使う）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendResult {
+    /// 送信した。`forwarded` は上流転送の応答か。
+    Sent { forwarded: bool },
+    /// 増幅ガードで抑止した。
+    Suppressed,
+    /// 送信に失敗した。
+    SendError,
+    /// 返信しない結果だった。
+    NoResponse,
+}
+
+/// 増幅反射の防止を課して返信する（NET-5・NET-12）。自前応答（`Respond`）は要求長 + [`MAX_RESPONSE_GROWTH`]、
+/// 上流転送の応答（`RespondForwarded`）は UDP の上限（512 バイト）まで。受信ループと Defer ワーカーの共通経路。
+fn guarded_send(
+    socket: &UdpSocket,
+    outcome: HandlerOutcome,
+    out: &ResponseBuf,
+    request_len: usize,
+    peer: SocketAddr,
+) -> SendResult {
+    let (limit, forwarded) = match outcome {
+        HandlerOutcome::Respond => (request_len.saturating_add(MAX_RESPONSE_GROWTH), false),
+        // 転送応答は UDP の上限まで許す（`ForwardingHandler` は `SourceVerified` なしに作れず、
+        // 証印 `ForwardedProof` も外部から作れない）。
+        HandlerOutcome::RespondForwarded(_) => (MAX_DATAGRAM_LEN, true),
+        // ワーカーが再度 Defer を返しても再投入しない（無限の委譲を作らない）。
+        HandlerOutcome::Defer | HandlerOutcome::NoResponse => return SendResult::NoResponse,
+    };
+    if out.as_bytes().len() > limit {
+        return SendResult::Suppressed;
+    }
+    match socket.send_to(out.as_bytes(), peer) {
+        Ok(_) => SendResult::Sent { forwarded },
+        Err(_) => SendResult::SendError,
+    }
+}
+
+/// Defer ワーカーが更新する統計。`serve` の終了時（全ワーカーの join 後）に [`DnsHelperStats`] へ合算する。
+#[derive(Debug, Default)]
+struct DeferredCounters {
+    answered: AtomicU64,
+    forwarded: AtomicU64,
+    suppressed: AtomicU64,
+    send_errors: AtomicU64,
+}
+
+impl DeferredCounters {
+    fn record(&self, r: SendResult) {
+        let slot = match r {
+            SendResult::Sent { forwarded } => {
+                if forwarded {
+                    self.forwarded.fetch_add(1, Ordering::Relaxed);
+                }
+                &self.answered
+            }
+            SendResult::Suppressed => &self.suppressed,
+            SendResult::SendError => &self.send_errors,
+            SendResult::NoResponse => return,
+        };
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn merge_into(&self, stats: &mut DnsHelperStats) {
+        let add =
+            |dst: &mut u64, src: &AtomicU64| *dst = dst.saturating_add(src.load(Ordering::Relaxed));
+        add(&mut stats.answered, &self.answered);
+        add(&mut stats.forwarded, &self.forwarded);
+        add(&mut stats.suppressed, &self.suppressed);
+        add(&mut stats.send_errors, &self.send_errors);
+    }
+}
+
+/// Defer ワーカーの同時実行枠。drop で枠を返す（ワーカーの終了・スレッド生成失敗のどちらでも漏らさない）。
+struct InflightSlot<'a>(&'a AtomicUsize);
+
+impl<'a> InflightSlot<'a> {
+    fn try_acquire(inflight: &'a AtomicUsize) -> Option<Self> {
+        // `fetch_update` は新しい toolchain で非推奨（`try_update` へ改名）のため、CAS ループで書く。
+        let mut cur = inflight.load(Ordering::Acquire);
+        loop {
+            if cur >= MAX_INFLIGHT_DEFERRED {
+                return None;
+            }
+            match inflight.compare_exchange_weak(
+                cur,
+                cur.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(inflight)),
+                Err(now) => cur = now,
+            }
+        }
+    }
+}
+
+impl Drop for InflightSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Defer されたクエリを scoped ワーカーで処理する。受信データグラムは固定長バッファへ複製して渡す。
+/// 枠の上限超過・スレッド生成失敗なら `false`（呼び出し側が `deferred_dropped` に計上する）。
+#[allow(clippy::too_many_arguments)]
+fn spawn_deferred<'scope, 'env>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    handler: &'env (dyn QueryHandler + Sync),
+    socket: &'env UdpSocket,
+    inflight: &'env AtomicUsize,
+    counters: &'env DeferredCounters,
+    peer: SocketAddr,
+    header: DnsHeader,
+    datagram: &[u8],
+) -> bool {
+    let Some(slot) = InflightSlot::try_acquire(inflight) else {
+        return false;
+    };
+    let n = datagram.len();
+    let mut req = [0u8; MAX_DATAGRAM_LEN];
+    let Some(dst) = req.get_mut(..n) else {
+        return false;
+    };
+    dst.copy_from_slice(datagram);
+    thread::Builder::new()
+        .name("dns-helper-deferred".to_owned())
+        .stack_size(DEFERRED_WORKER_STACK)
+        .spawn_scoped(scope, move || {
+            let _slot = slot;
+            let mut out = ResponseBuf::new();
+            let datagram = req.get(..n).unwrap_or(&[]);
+            let outcome = handler.respond_deferred(peer, &header, datagram, &mut out);
+            counters.record(guarded_send(socket, outcome, &out, n, peer));
+        })
+        .is_ok()
 }
 
 /// UDP 待受サーバー。ヘルパープロセスの本体で、テストからはスレッドでも動かせる。
@@ -758,76 +980,94 @@ impl DnsHelperServer {
     }
 
     /// `stop` が立つまで受信する。1 パケットごとの失敗では止まらない（NET-5）。停止確認は
-    /// [`RECV_POLL_INTERVAL`] ごと（REPAIR-5）。パケットごとのヒープ確保はしない。
+    /// [`RECV_POLL_INTERVAL`] ごと（REPAIR-5）。自前応答の経路ではパケットごとのヒープ確保はしない。
     ///
     /// 受信エラーは一時的なもの（割り込み・ICMP 由来の ConnectionReset 等）のみ再試行し、連続
     /// [`MAX_CONSECUTIVE_RECV_ERRORS`] 回を超えるか永続的なエラーなら受信ループを終了して `Err` を返す（REPAIR-5）。
     /// 各クエリのハンドラ呼び出し前に応答バッファを空にする。
-    pub fn serve(&mut self, handler: &dyn QueryHandler, stop: &AtomicBool) -> Result<(), NetError> {
-        let mut buf = [0u8; MAX_DATAGRAM_LEN + 1];
-        let mut out = ResponseBuf::new();
-        let mut consecutive_errors: u32 = 0;
-        while !stop.load(Ordering::Relaxed) {
-            let (n, peer) = match self.socket.recv_from(&mut buf) {
-                Ok(v) => {
-                    consecutive_errors = 0;
-                    v
-                }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    continue;
-                }
-                // バッファより大きいデータグラムを切り詰めず EMSGSIZE 系で返す OS では、
-                // 致命扱いにせず Oversized として破棄して継続する（NET-5）。
-                Err(e) if is_msgsize(&e) => {
-                    self.stats.received = self.stats.received.saturating_add(1);
-                    self.stats.count_drop(DropReason::Oversized);
-                    continue;
-                }
-                Err(e) => {
-                    self.stats.recv_errors = self.stats.recv_errors.saturating_add(1);
-                    consecutive_errors = consecutive_errors.saturating_add(1);
-                    let transient = matches!(
-                        e.kind(),
-                        io::ErrorKind::Interrupted
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::ConnectionRefused
-                            | io::ErrorKind::ConnectionAborted
-                    );
-                    if !transient || consecutive_errors > MAX_CONSECUTIVE_RECV_ERRORS {
-                        return Err(map_io("recv udp", &e));
+    ///
+    /// ハンドラが [`HandlerOutcome::Defer`] を返したクエリ（上流転送。NET-12・TASK-185.3）は、受信ループを塞がない
+    /// よう scoped スレッドのワーカーで [`QueryHandler::respond_deferred`] を呼び、同じ増幅ガードを課して返信する。
+    /// 同時に処理するワーカーは [`MAX_INFLIGHT_DEFERRED`] 件までで、超過分とスレッド生成失敗は応答せず破棄する
+    /// （`deferred_dropped`。クライアントは再送する）。停止・エラー終了時は処理中のワーカーの終了を待ってから返る
+    /// （ワーカーはハンドラ側の期限〔`upstream::FORWARD_TOTAL_DEADLINE`〕で終わるため有界）。ワーカーの統計は
+    /// その後に [`DnsHelperStats`] へ合算する。
+    pub fn serve(
+        &mut self,
+        handler: &(dyn QueryHandler + Sync),
+        stop: &AtomicBool,
+    ) -> Result<(), NetError> {
+        let socket = &self.socket;
+        let stats = &mut self.stats;
+        let inflight = AtomicUsize::new(0);
+        let deferred = DeferredCounters::default();
+        let result = thread::scope(|scope| {
+            let mut buf = [0u8; MAX_DATAGRAM_LEN + 1];
+            let mut out = ResponseBuf::new();
+            let mut consecutive_errors: u32 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let (n, peer) = match socket.recv_from(&mut buf) {
+                    Ok(v) => {
+                        consecutive_errors = 0;
+                        v
                     }
-                    continue;
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    // バッファより大きいデータグラムを切り詰めず EMSGSIZE 系で返す OS では、
+                    // 致命扱いにせず Oversized として破棄して継続する（NET-5）。
+                    Err(e) if is_msgsize(&e) => {
+                        stats.received = stats.received.saturating_add(1);
+                        stats.count_drop(DropReason::Oversized);
+                        continue;
+                    }
+                    Err(e) => {
+                        stats.recv_errors = stats.recv_errors.saturating_add(1);
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        let transient = matches!(
+                            e.kind(),
+                            io::ErrorKind::Interrupted
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::ConnectionRefused
+                                | io::ErrorKind::ConnectionAborted
+                        );
+                        if !transient || consecutive_errors > MAX_CONSECUTIVE_RECV_ERRORS {
+                            return Err(map_io("recv udp", &e));
+                        }
+                        continue;
+                    }
+                };
+                stats.received = stats.received.saturating_add(1);
+                let datagram = buf.get(..n).unwrap_or(&[]);
+                let header = match classify_datagram(datagram) {
+                    DatagramVerdict::Accept(h) => h,
+                    DatagramVerdict::Drop(r) => {
+                        stats.count_drop(r);
+                        continue;
+                    }
+                };
+                out.clear();
+                match handler.respond_from(peer, &header, datagram, &mut out) {
+                    HandlerOutcome::Defer => {
+                        let dropped = !spawn_deferred(
+                            scope, handler, socket, &inflight, &deferred, peer, header, datagram,
+                        );
+                        if dropped {
+                            stats.deferred_dropped = stats.deferred_dropped.saturating_add(1);
+                        }
+                    }
+                    outcome => stats.record(guarded_send(socket, outcome, &out, n, peer)),
                 }
-            };
-            self.stats.received = self.stats.received.saturating_add(1);
-            let datagram = buf.get(..n).unwrap_or(&[]);
-            let header = match classify_datagram(datagram) {
-                DatagramVerdict::Accept(h) => h,
-                DatagramVerdict::Drop(r) => {
-                    self.stats.count_drop(r);
-                    continue;
-                }
-            };
-            out.clear();
-            if handler.respond(&header, datagram, &mut out) != HandlerOutcome::Respond {
-                continue;
             }
-            // 増幅反射の防止: 応答は要求長 + A RR 1 件分以下に限る。
-            if out.as_bytes().len() > n.saturating_add(MAX_RESPONSE_GROWTH) {
-                self.stats.suppressed = self.stats.suppressed.saturating_add(1);
-                continue;
-            }
-            match self.socket.send_to(out.as_bytes(), peer) {
-                Ok(_) => self.stats.answered = self.stats.answered.saturating_add(1),
-                Err(_) => self.stats.send_errors = self.stats.send_errors.saturating_add(1),
-            }
-        }
-        Ok(())
+            Ok(())
+        });
+        deferred.merge_into(stats);
+        result
     }
 }
 

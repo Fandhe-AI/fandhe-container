@@ -3,7 +3,7 @@
 //!
 //! CLI / stack が `--add-host` / `--dns` を受け取った直後に呼ばれ、`/etc/hosts` 追記・`resolv.conf`
 //! 書き換え・DNS ヘルパー設定変更の前に不正値をコンテナ作成前に拒否する。後続の `/etc/hosts` 追記
-//! （TASK-185.2・#345）・上流転送（TASK-185.3・#346）・host/none の `--dns` 反映（TASK-185.4・#347）・
+//! （TASK-185.2・#345）・上流転送（`dns_helper::upstream`。TASK-185.3・#346）・host/none の `--dns` 反映（TASK-185.4・#347）・
 //! 軽量運用の `--dns` 直接書き込み（TASK-146.2・#336）から再利用される。
 //!
 //! `--add-host <hostname>:<ip>` は最初の `:` で 2 分割する（[`AddHostEntry::parse`]。残り全体を IP とするため
@@ -20,8 +20,9 @@
 //! ファイル（fd の `mnt_id` で照合）を拒否する。書き込み失敗時は同じロック下で書き込み前の長さへ戻し、
 //! 巻き戻しにも失敗した場合は不完全な行が残りうるため `DATA_LOSS` で通常の失敗と区別して返す。
 //!
-//! host/none の `--dns` 反映と none の loopback 制限は子モジュール `resolv_conf`（TASK-185.4・#347）。
-//! 上流転送（TASK-185.3）は未実装（REPAIR-3）。エラーの `message` は固定の英語文字列で、
+//! host/none の `--dns` 反映と none の loopback 制限は子モジュール `resolv_conf`（TASK-185.4・#347）、
+//! ユーザー定義ネットワーク上の上流転送は `dns_helper::upstream`（TASK-185.3・#346）。
+//! エラーの `message` は固定の英語文字列で、
 //! 入力値を載せない（ログ・ファイルへの行注入を防ぐ）。`dns_helper::DnsName`（小文字化・末尾ドット除去）
 //! とは意味論が異なり、ここでは入力をそのまま保持し、末尾ドット（空ラベル）は拒否する。
 

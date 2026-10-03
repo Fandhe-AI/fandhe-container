@@ -286,7 +286,27 @@ mod linux {
         let spec = NoneModeSpec::new(EndpointId::new("addhostctr")?, base.clone())?;
         let none = create_none_netns(&spec, t, &recorder)
             .map_err(|e| fail(format!("create_none_netns failed at {:?}: {e}", e.step)))?;
+        // 以降はどこで失敗しても umount と netns 解放を必ず実行し、本体と後始末の両方のエラーを保つ。
+        let pin_path = none.netns_path.clone();
+        let mut mounted = false;
+        let body = run_body(&base, &pin_path, exe_str, &mut mounted);
+        let umount_res = if mounted {
+            run_cmd("umount", &["/etc/hosts"]).map(|_| ())
+        } else {
+            Ok(())
+        };
+        let release_res =
+            release_none_netns(none).map_err(|e| fail(format!("release_none_netns failed: {e}")));
+        combine_results(body, umount_res, release_res)
+    }
 
+    /// hosts 追記・bind mount・none netns 内での照合。`mounted` は `/etc/hosts` へ bind した後に立てる。
+    fn run_body(
+        base: &std::path::Path,
+        pin_path: &std::path::Path,
+        exe_str: &str,
+        mounted: &mut bool,
+    ) -> Result<(), NetError> {
         // コンテナの hosts ファイル相当へ追記し、private な mount ns 内だけで /etc/hosts に重ねる。
         let hosts = base.join("hosts");
         fs::write(&hosts, INITIAL_HOSTS).map_err(|e| fail(format!("write hosts: {e}")))?;
@@ -298,10 +318,11 @@ mod linux {
             .to_str()
             .ok_or_else(|| fail("hosts path is not UTF-8"))?;
         run_cmd("mount", &["--bind", hosts_str, "/etc/hosts"])?;
+        *mounted = true;
 
         let pin_arg = format!(
             "--net={}",
-            none.netns_path
+            pin_path
                 .to_str()
                 .ok_or_else(|| fail("pin path is not UTF-8"))?
         );
@@ -320,9 +341,23 @@ mod linux {
         if out.trim() != "probe: ok" {
             return Err(fail(format!("unexpected probe output: {out}")));
         }
-
-        run_cmd("umount", &["/etc/hosts"])?;
-        release_none_netns(none).map_err(|e| fail(format!("release_none_netns failed: {e}")))?;
         Ok(())
+    }
+
+    /// 本体・umount・解放の結果を 1 つにまとめる。失敗が複数なら全メッセージを連結して保持する。
+    fn combine_results(
+        body: Result<(), NetError>,
+        umount: Result<(), NetError>,
+        release: Result<(), NetError>,
+    ) -> Result<(), NetError> {
+        let msgs: Vec<String> = [("body", body), ("umount", umount), ("release", release)]
+            .into_iter()
+            .filter_map(|(label, r)| r.err().map(|e| format!("{label}: {e}")))
+            .collect();
+        if msgs.is_empty() {
+            Ok(())
+        } else {
+            Err(fail(msgs.join("; ")))
+        }
     }
 }

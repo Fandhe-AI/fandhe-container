@@ -22,8 +22,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::error::{NetError, NetErrorCode};
+use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
 
 /// hostname 全体の最大バイト長（RFC 1123）。
 const MAX_HOSTNAME_LEN: usize = 253;
@@ -37,6 +40,13 @@ const MAX_ADD_HOST_LEN: usize = MAX_HOSTNAME_LEN + 1 + MAX_IP_TEXT_LEN;
 pub const MAX_ADD_HOST_ENTRIES: usize = 256;
 /// 追記先 hosts ファイルの最大バイト数（実装上限。これを超える既存ファイルへは追記しない）。
 const MAX_HOSTS_FILE_BYTES: u64 = 1024 * 1024;
+/// hosts ファイルの排他ロック取得の待ち上限（REPAIR-5。超過は `TIMEOUT`）。
+const HOSTS_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// 排他ロックの再試行間隔。
+const HOSTS_LOCK_POLL: Duration = Duration::from_millis(10);
+/// 同一プロセス内の追記を直列化する（flock はプロセス間用で、同一プロセスの別 fd 同士も
+/// 直列化するが、ロック待ちを持たずに済ませるため先にこのミューテックスで順序付ける）。
+static HOSTS_APPEND_GUARD: Mutex<()> = Mutex::new(());
 
 /// 入力検証の違反理由（機械可読）。`NetError`（`INVALID_ARGUMENT`）へ変換できる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -274,6 +284,28 @@ fn verify_hosts_file(file: &File, path: &Path) -> Result<(), NetError> {
     Ok(())
 }
 
+/// hosts ファイルの排他ロックを期限つきで取得する（プロセス間の直列化。REPAIR-5）。
+fn lock_exclusive_bounded(file: &File) -> Result<(), NetError> {
+    let deadline = Instant::now() + HOSTS_LOCK_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(NetError::new(
+                        NetErrorCode::Timeout,
+                        "timed out waiting for hosts file lock",
+                    ));
+                }
+                std::thread::sleep(HOSTS_LOCK_POLL);
+            }
+            Err(std::fs::TryLockError::Error(_)) => {
+                return Err(io_err("failed to lock hosts file"));
+            }
+        }
+    }
+}
+
 /// 検証済みエントリをコンテナの hosts ファイルへ追記する（NET-12・TASK-185.2）。
 ///
 /// `hosts_path` はホスト側から見たコンテナの hosts ファイルで、ネットワークモードに依存しない。
@@ -309,6 +341,12 @@ pub fn append_add_hosts(hosts_path: &Path, entries: &[AddHostEntry]) -> Result<(
         .append(true)
         .open(hosts_path)
         .map_err(|_| io_err("failed to open hosts file"))?;
+    // 長さ取得・末尾改行判定・上限判定・追記を 1 つの排他区間にする（並行追記による上限超過・
+    // 古い末尾内容に基づく改行判定を防ぐ）。ロックは file の Drop で解放される。
+    let _guard = HOSTS_APPEND_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    lock_exclusive_bounded(&file)?;
     verify_hosts_file(&file, hosts_path)?;
 
     let len = file
@@ -344,12 +382,28 @@ pub fn append_add_hosts(hosts_path: &Path, entries: &[AddHostEntry]) -> Result<(
 /// `--add-host` の生値を全件検証してから hosts ファイルへ追記する入口（NET-12・TASK-185.2）。
 ///
 /// 検証が全件通るまでファイルを開かないため、検証失敗時に hosts ファイルは変更されない。
+/// 計測しない呼び出し口で、成否・所要時間を記録するには [`apply_add_hosts_with_recorder`] を使う。
 pub fn apply_add_hosts<'a, I>(hosts_path: &Path, raw: I) -> Result<(), NetError>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    let entries = parse_add_hosts(raw)?;
-    append_add_hosts(hosts_path, &entries)
+    apply_add_hosts_with_recorder(hosts_path, raw, &NoopNetOpRecorder)
+}
+
+/// [`apply_add_hosts`] に計装を付けた入口（REPAIR-4）。検証から追記・fsync までの成否と所要時間を
+/// `NetOpKind::AddHostsApply` として `recorder` へ渡す（入力値・パスは記録しない）。
+pub fn apply_add_hosts_with_recorder<'a, I>(
+    hosts_path: &Path,
+    raw: I,
+    recorder: &dyn NetOpRecorder,
+) -> Result<(), NetError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    record_net_op(recorder, NetOpKind::AddHostsApply, || {
+        let entries = parse_add_hosts(raw)?;
+        append_add_hosts(hosts_path, &entries)
+    })
 }
 
 #[cfg(test)]
@@ -720,5 +774,47 @@ mod tests {
             assert_eq!(e.code(), NetErrorCode::InvalidArgument, "{c:?}");
             assert_eq!(std::fs::read(&f.0).unwrap(), init.as_bytes(), "{c:?}");
         }
+    }
+
+    /// REPAIR-4: 成功・失敗（検証失敗）が `AddHostsApply` として 1 件ずつ記録される。
+    #[test]
+    fn apply_records_success_and_failure() {
+        use crate::instrument::NetOpOutcome;
+        use crate::instrument::testing::Collect;
+        let f = TmpFile::new("record", Some("127.0.0.1\tlocalhost\n"));
+        let c = Collect::default();
+        apply_add_hosts_with_recorder(&f.0, ["web:192.0.2.1"], &c).unwrap();
+        apply_add_hosts_with_recorder(&f.0, ["bad host:192.0.2.1"], &c).unwrap_err();
+        assert_eq!(
+            c.kinds(),
+            vec![
+                (NetOpKind::AddHostsApply, NetOpOutcome::Success),
+                (NetOpKind::AddHostsApply, NetOpOutcome::Failure),
+            ]
+        );
+    }
+
+    /// NET-12: 並行追記でも上限を超えず、各行が欠落・混在せずちょうど 1 回ずつ入る。
+    #[test]
+    fn concurrent_appends_are_serialized() {
+        let f = TmpFile::new("concurrent", Some(""));
+        let path = f.0.clone();
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    let v = format!("h{i}:192.0.2.{i}");
+                    apply_add_hosts(&p, [v.as_str()]).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let got = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<_> = got.lines().collect();
+        lines.sort_unstable();
+        let want: Vec<String> = (0..8).map(|i| format!("192.0.2.{i}\th{i}")).collect();
+        assert_eq!(lines, want.iter().map(String::as_str).collect::<Vec<_>>());
     }
 }

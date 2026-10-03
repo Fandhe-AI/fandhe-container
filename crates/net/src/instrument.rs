@@ -54,6 +54,9 @@ pub enum NetOpKind {
     DnsHelperStart,
     /// DNS ヘルパーの停止と回収（`DnsHelperRefCounts::leave` / 再参加時の停止再試行。TASK-144.1・#329・NET-7）。
     DnsHelperStop,
+    /// `--add-host` の hosts ファイル追記 1 件（`add_host_dns::apply_add_hosts_with_recorder`。
+    /// 検証から追記・fsync までを含む。TASK-185.2・#345・NET-12）。
+    AddHostsApply,
 }
 
 impl NetOpKind {
@@ -70,6 +73,7 @@ impl NetOpKind {
             NetOpKind::NftBatch => "nftables.batch",
             NetOpKind::DnsHelperStart => "dns.helper.start",
             NetOpKind::DnsHelperStop => "dns.helper.stop",
+            NetOpKind::AddHostsApply => "hosts.add_host.apply",
         }
     }
 }
@@ -244,7 +248,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 10] = [
+    const ALL_KINDS: [NetOpKind; 11] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
@@ -255,6 +259,7 @@ mod tests {
         NetOpKind::NftBatch,
         NetOpKind::DnsHelperStart,
         NetOpKind::DnsHelperStop,
+        NetOpKind::AddHostsApply,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
@@ -270,6 +275,7 @@ mod tests {
         assert_eq!(NetOpKind::NftBatch.as_str(), "nftables.batch");
         assert_eq!(NetOpKind::DnsHelperStart.as_str(), "dns.helper.start");
         assert_eq!(NetOpKind::DnsHelperStop.as_str(), "dns.helper.stop");
+        assert_eq!(NetOpKind::AddHostsApply.as_str(), "hosts.add_host.apply");
     }
 
     /// REPAIR-4: 操作名は core の `OpName::new` と同じ規則に収まる（net は core に依存できないため

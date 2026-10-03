@@ -56,6 +56,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher as _;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -64,7 +65,7 @@ use std::time::{Duration, Instant};
 use super::{
     DNS_PORT, DnsHeader, DnsRegistry, FLAG_QR, FLAG_RD, ForwardedProof, HEADER_LEN, HandlerOutcome,
     MAX_DATAGRAM_LEN, MAX_NAME_LEN, MAX_REGISTRY_ENTRIES, MsgWriter, QCLASS_IN, QueryHandler,
-    RCODE_SERVFAIL, RegistryHandler, ResponseBuf, normalize_qname, parse_question,
+    RCODE_SERVFAIL, RegistryHandler, ResponseBuf, is_msgsize, normalize_qname, parse_question,
 };
 use crate::error::{NetError, NetErrorCode};
 
@@ -463,8 +464,16 @@ fn try_upstream(
     let Ok(sock) = UdpSocket::bind(bind) else {
         return false;
     };
-    if sock.connect(server).is_err() || sock.send(query).is_err() {
+    if sock.connect(server).is_err() {
         return false;
+    }
+    // シグナル割り込み（EINTR）は一時的なので期限内なら送り直す。
+    loop {
+        match sock.send(query) {
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted && Instant::now() < deadline => {}
+            Err(_) => return false,
+        }
     }
     let mut buf = [0u8; MAX_DATAGRAM_LEN + 1];
     loop {
@@ -489,9 +498,19 @@ fn try_upstream(
                 }
                 // 条件を満たさない応答は捨てて期限まで待ち続ける。
             }
+            // 割り込み・バッファ超過のデータグラム（Windows の WSAEMSGSIZE 等）は待ち直す。期限は次の周回で判定する。
+            Err(e) if recv_error_is_retryable(&e) => {}
+            // 期限切れ（WouldBlock / TimedOut）・ICMP 由来の ConnectionRefused 等はこの上流の失敗とする。
             Err(_) => return false,
         }
     }
+}
+
+/// 上流からの受信エラーのうち、同じ上流の応答を期限まで待ち直してよいもの（NET-12・REPAIR-5）。
+/// シグナル割り込みと、受信バッファを超えるデータグラム（`serve` と同じ [`is_msgsize`] で判定。超過した応答は
+/// 512 バイト上限を超えるため破棄する）。
+fn recv_error_is_retryable(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Interrupted || is_msgsize(e)
 }
 
 /// 上流を登録順に試し、最初に受理できた応答を `out` に格納する。各試行は [`FORWARD_ATTEMPT_TIMEOUT`]、全体は

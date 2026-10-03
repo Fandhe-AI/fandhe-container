@@ -36,7 +36,8 @@
 #             複製し、複製を実行する〔検証対象と実行対象の同一性を保つ。TOCTOU 対策〕）
 #   --queries 系列（コンテナ x 名前）ごとの本計測クエリ数（1〜10000・既定 1000。PoC-15 は 6 系列合計 6,000）
 #   --warmup  系列ごとのウォームアップ数（0〜1000・既定 100。集計から除外）
-#   --timeout exe 全体の上限秒数（1〜3600・既定 600）
+#   --timeout exe 全体の上限秒数（1〜3600・既定 600）。exe へも `--timeout` で渡り、Rust 側の各待機期限
+#             （network 作成・PSS 同期・クライアント待ち）はこの値から算出される（REPAIR-5）
 #   --label   出力に記録するラベル（[A-Za-z0-9._-]・64 文字以下）
 #   --output  出力先（新規ファイルのみ。既存ファイルは上書きせず失敗）。省略時は stdout
 #
@@ -282,7 +283,7 @@ readonly OUT_LIMIT_BYTES=$((OUT_LIMIT_KIB * 1024))
   # --foreground: GNU timeout は既定で子を新しいプロセスグループへ移し、INT/TERM 時の kill_group（-pgid 宛て）
   # が timeout 自身にしか届かず unshare 以下の子孫が残る。--foreground で子を setsid のグループに留める。
   exec setsid timeout --foreground --kill-after=10 "$limit" "$run_exe" --measure \
-    --queries "$queries" --warmup "$warmup" --cgroup "$cgdir" --sync-dir "$sync_dir" >"$raw"
+    --queries "$queries" --warmup "$warmup" --cgroup "$cgdir" --sync-dir "$sync_dir" --timeout "$limit" >"$raw"
 ) &
 pgid=$!
 

@@ -14,7 +14,7 @@
 //!   `nsenter --net=<pin> <exe> --dns-client <gateway:53>` でコンテナ netns からクエリを送る
 //!   （不正パケットは無応答・続く正常クエリには応答 = ヘルパー生存の証明）。最後に回収と `delete_network`
 //!
-//! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提を満たさない
+//! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒。計測モードは `--timeout` から算出）で期限を切る（REPAIR-5）。前提を満たさない
 //! 場合は skip せず失敗する。
 //!
 //! # 実機計測モード（`--measure`。TASK-141.3・#323・NET-5・MS-8）
@@ -410,8 +410,6 @@ mod linux {
         const QUERIES_MAX: u32 = 10_000;
         const WARMUP_MAX: u32 = 1_000;
         const RECORDS_MAX: usize = 16;
-        /// 計測で登録する名前数（svc-a / svc-b / svc-c）。待機上限の算出に使う。
-        const RECORDS_PER_RUN: usize = 3;
         /// クエリごとの受信期限。無応答は ok:false で記録する。
         const RECV_TIMEOUT: Duration = Duration::from_millis(500);
         /// 連続無応答がこの回数に達したらヘルパーが死んでいるとみなして打ち切る（REPAIR-5）。
@@ -439,6 +437,23 @@ mod linux {
                 }
             }
             out
+        }
+
+        /// 計測全体の上限秒数（`--timeout`。スクリプトの `--timeout` と同じ値が渡る。REPAIR-5）。
+        /// 省略時はスクリプトの既定（600 秒）に合わせる。範囲外・不正値は `None`。
+        fn measure_limit(args: &[OsString]) -> Option<Duration> {
+            match opt(args, "--timeout") {
+                None => Some(Duration::from_secs(600)),
+                Some(_) => {
+                    bounded(args, "--timeout", 3600, 1).map(|s| Duration::from_secs(u64::from(s)))
+                }
+            }
+        }
+
+        /// 1 回の待機（network 作成・attach・削除・PSS 同期）に使う期限。全体上限 `limit` から導出し、
+        /// 短い `--timeout` では短く、長い `--timeout` では既定 10 秒を超えて伸ばす（上限 600 秒）。
+        fn wait_unit(limit: Duration) -> Duration {
+            Duration::from_secs((limit.as_secs() / 10).clamp(1, 600))
         }
 
         fn bounded(args: &[OsString], flag: &str, max: u32, min: u32) -> Option<u32> {
@@ -522,6 +537,10 @@ mod linux {
                 err_line("INVALID_ARGUMENT", "invalid --cgroup or --sync-dir");
                 return ExitCode::from(2);
             }
+            let Some(limit) = measure_limit(args) else {
+                err_line("INVALID_ARGUMENT", "invalid --timeout");
+                return ExitCode::from(2);
+            };
             require_root_and_tools();
             let dir =
                 std::env::temp_dir().join(format!("fandhe-dns-measure-{}", std::process::id()));
@@ -547,16 +566,16 @@ mod linux {
                 .arg(cg)
                 .arg("--sync-dir")
                 .arg(sync)
+                .arg("--timeout")
+                .arg(limit.as_secs().to_string())
                 .env(LAUNCHER_PID_ENV, std::process::id().to_string())
                 .env(DIR_ENV, &dir)
                 .spawn();
             let code = match child {
                 Ok(mut c) => {
-                    // クライアント 2 本分 + 作成・削除・PSS 待ちの余裕。--queries / --timeout に連動させる。
-                    let limit = bench_budget(q, w, RECORDS_PER_RUN) * 2
-                        + timeout() * 6
-                        + Duration::from_secs(60);
-                    wait_deadline(&mut c, limit).unwrap_or(1)
+                    // 全体上限は --timeout（スクリプトの上限と同一）。スクリプト側の kill-after 分だけ猶予を足す。
+                    let hard = limit + Duration::from_secs(15);
+                    wait_deadline(&mut c, hard).unwrap_or(1)
                 }
                 Err(_) => {
                     err_line("INTERNAL", "cannot spawn unshare");
@@ -597,7 +616,11 @@ mod linux {
                 err_line("INVALID_ARGUMENT", "invalid measurement arguments");
                 return ExitCode::from(2);
             };
-            match inner_checked(q, w, cg, sync) {
+            let Some(limit) = measure_limit(args) else {
+                err_line("INVALID_ARGUMENT", "invalid --timeout");
+                return ExitCode::from(2);
+            };
+            match inner_checked(q, w, cg, sync, limit) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     err_line(e.code().as_str(), e.message());
@@ -606,7 +629,13 @@ mod linux {
             }
         }
 
-        fn inner_checked(q: u32, w: u32, cg: &str, sync: &str) -> Result<(), NetError> {
+        fn inner_checked(
+            q: u32,
+            w: u32,
+            cg: &str,
+            sync: &str,
+            limit: Duration,
+        ) -> Result<(), NetError> {
             validate_cgroup(cg)?;
             let sync = validate_sync_dir(sync)?;
             let expected = std::env::var(LAUNCHER_PID_ENV)
@@ -643,7 +672,7 @@ mod linux {
 
             let route = NetlinkRouteSocket::open()?;
             let nft = NetlinkNetfilterSocket::open()?;
-            let t = timeout();
+            let t = wait_unit(limit);
             // IPAM は特権資源（network）を作る前に構築する。構築失敗で `delete_network` に到達できず
             // root で作った資源が残る経路を作らない（AGENTS.md「特権操作の後始末」）。
             let gateway = IpPrefix::new("10.215.0.1".parse().map_err(|_| fail("addr"))?, 24)?;
@@ -725,7 +754,7 @@ mod linux {
                         .spawn()
                         .map_err(|e| fail(format!("spawn nsenter: {e}")))?;
                     // 失敗時はクライアントが連続無応答で打ち切るため、期限は十分な余裕を持たせる。
-                    match wait_deadline(&mut child, bench_budget(q, w, records.len())) {
+                    match wait_deadline(&mut child, bench_budget(q, w, records.len(), limit)) {
                         Some(0) => {}
                         Some(_) => return Err(fail("container-side dns bench failed")),
                         None => {
@@ -740,7 +769,7 @@ mod linux {
                 // 全クエリ後のアイドル時に PSS を読ませる。スクリプトが読み終えるまでヘルパーを生かす。
                 fs::write(sync.join("pss-ready"), b"1")
                     .map_err(|e| fail(format!("write pss-ready: {e}")))?;
-                let deadline = Instant::now() + timeout() * 3;
+                let deadline = Instant::now() + (t * 3).min(limit);
                 while !sync.join("pss-done").exists() {
                     if Instant::now() >= deadline {
                         return Err(NetError::new(
@@ -774,14 +803,16 @@ mod linux {
         }
 
         /// クライアント 1 プロセスの所要上限。名前数 × (warmup + queries) の全クエリが
-        /// 受信期限まで待たされる最悪ケースに、固定の余裕を足して `--queries` / `--timeout` に連動させる。
-        fn bench_budget(q: u32, w: u32, names: usize) -> Duration {
+        /// 受信期限まで待たされる最悪ケースに、固定の余裕を足し、全体上限 `limit`（`--timeout`）で頭打ちにする。
+        fn bench_budget(q: u32, w: u32, names: usize, limit: Duration) -> Duration {
             let total = u64::from(q).saturating_add(u64::from(w));
             let queries = total.saturating_mul(u64::try_from(names).unwrap_or(u64::MAX));
             let per_query_ms = u64::try_from(RECV_TIMEOUT.as_millis()).unwrap_or(500);
-            timeout() * 3
+            let computed = wait_unit(limit) * 3
                 + Duration::from_secs(30)
-                + Duration::from_millis(queries.saturating_mul(per_query_ms))
+                + Duration::from_millis(queries.saturating_mul(per_query_ms));
+            // 全体上限（--timeout）を超えて待たない。
+            computed.min(limit)
         }
 
         /// 計測専用ヘルパーを起動し、READY 行を期限内に受理するまで待つ。
@@ -915,18 +946,35 @@ mod linux {
             if resp.get(12..off)? != query.get(12..)? {
                 return Some(false);
             }
-            // 回答の NAME（圧縮ポインタまたはラベル列）を読み飛ばす。
-            loop {
-                let b = *resp.get(off)?;
-                if b & 0xC0 == 0xC0 {
-                    off = off.checked_add(2)?;
-                    break;
+            // 回答の NAME が送信した質問名を指すこと（別名を指す回答を正答にしない。NET-5）。
+            // 質問名は resp[12..qname_end]（終端 0 を含む）。圧縮ポインタは offset 12 を指す場合のみ許可し、
+            // ラベル列で書かれている場合は質問名とバイト一致を要求する。
+            let qname_end = off.checked_sub(4)?;
+            let qname = resp.get(12..qname_end)?;
+            let name_start = off;
+            let b = *resp.get(off)?;
+            if b & 0xC0 == 0xC0 {
+                let target =
+                    (usize::from(b & 0x3F) << 8) | usize::from(*resp.get(off.checked_add(1)?)?);
+                if target != 12 {
+                    return Some(false);
                 }
-                off = off.checked_add(1)?;
-                if b == 0 {
-                    break;
+                off = off.checked_add(2)?;
+            } else {
+                loop {
+                    let l = *resp.get(off)?;
+                    if l & 0xC0 != 0 {
+                        return Some(false);
+                    }
+                    off = off.checked_add(1)?;
+                    if l == 0 {
+                        break;
+                    }
+                    off = off.checked_add(usize::from(l))?;
                 }
-                off = off.checked_add(usize::from(b))?;
+                if resp.get(name_start..off)? != qname {
+                    return Some(false);
+                }
             }
             let rtype = be16(resp, off)?;
             let rclass = be16(resp, off.checked_add(2)?)?;

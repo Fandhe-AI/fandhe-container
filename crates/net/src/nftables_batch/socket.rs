@@ -365,6 +365,19 @@ mod tests {
         b.finish().expect("finish")
     }
 
+    /// 同期点の期待バイト列（具体値）: nlmsghdr(len 20・type 0x0A10・flags REQUEST|ACK = 0x0005・seq・pid 0)
+    /// + nfgenmsg(family 0・version 0・res_id 0)。数値フィールドはネイティブバイトオーダー。
+    fn barrier_bytes(seq: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&20u32.to_ne_bytes());
+        v.extend_from_slice(&0x0A10u16.to_ne_bytes());
+        v.extend_from_slice(&0x0005u16.to_ne_bytes());
+        v.extend_from_slice(&seq.to_ne_bytes());
+        v.extend_from_slice(&0u32.to_ne_bytes());
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        v
+    }
+
     /// 偽 recv: 順に返し、尽きたら Timeout。
     fn script(
         mut items: Vec<Result<Vec<u8>, NetError>>,
@@ -565,7 +578,100 @@ mod tests {
         .expect_err("no barrier ack");
         assert_eq!(e.code(), NetErrorCode::Timeout);
         assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
-        assert_eq!(sent, encode_barrier(13).expect("barrier"));
+        assert_eq!(sent, barrier_bytes(13));
+    }
+
+    /// NET-11: 同期点は nf_tables の GETGEN 要求（type 0x0A10・REQUEST|ACK）で 20 バイト。NOOP（type 1）ではない。
+    #[test]
+    fn net11_barrier_is_getgen_request_bytes() {
+        let bytes = encode_barrier(0x0102_0304).expect("barrier");
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(bytes, barrier_bytes(0x0102_0304));
+        let msg = crate::netlink::NlMsgIter::new(&bytes)
+            .next()
+            .expect("one message")
+            .expect("valid");
+        assert_eq!(msg.header().msg_type(), 0x0A10);
+        assert_eq!(nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_GETGEN), 0x0A10);
+        assert_eq!(msg.header().seq(), 0x0102_0304);
+        assert_eq!(
+            NfGenMsg::decode(msg.payload()).expect("nfgenmsg"),
+            NfGenMsg::new(NFPROTO_UNSPEC, 0)
+        );
+    }
+
+    /// NET-11: NEWGEN と ACK が 1 データグラムにまとまって届いても成功にする。
+    #[test]
+    fn net11_barrier_reply_in_one_datagram_succeeds() {
+        let b = batch(1);
+        let ack = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![
+                Ok(err_dgram(11, 0)),
+                Ok([gen_dgram(13), err_dgram(13, 0)].concat()),
+            ]),
+        )
+        .expect("ok");
+        assert_eq!(ack.body_seqs(), &[11][..]);
+        assert_eq!(ack.end_seq(), 12);
+    }
+
+    /// NET-11: NEWGEN を受けずに届いた同期点の errno 0 の ACK は成功にせず DataLoss / Unknown。
+    #[test]
+    fn net11_barrier_ack_without_newgen_is_data_loss() {
+        let b = batch(1);
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![Ok(err_dgram(11, 0)), Ok(err_dgram(13, 0))]),
+        )
+        .expect_err("no newgen");
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+    }
+
+    /// NET-11: 同期点が EPERM で拒否されたら成功にせず PermissionDenied / Unknown。
+    #[test]
+    fn net11_barrier_rejected_is_unknown() {
+        let b = batch(1);
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![Ok(err_dgram(11, 0)), Ok(err_dgram(13, 1))]),
+        )
+        .expect_err("eperm");
+        assert_eq!(e.code(), NetErrorCode::PermissionDenied);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+    }
+
+    /// NET-11: END の失敗が同期点の NEWGEN より前に届けば Aborted（END の位置で記録する）。
+    #[test]
+    fn net11_end_error_before_newgen_is_aborted() {
+        let b = batch(1);
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![
+                Ok(err_dgram(11, 0)),
+                Ok(err_dgram(12, 12)),
+                Ok(gen_dgram(13)),
+                Ok(err_dgram(13, 0)),
+            ]),
+        )
+        .expect_err("end failure");
+        assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
+        assert_eq!(
+            e.failures()
+                .iter()
+                .map(|f| (f.position(), f.seq(), f.errno()))
+                .collect::<Vec<_>>(),
+            vec![(crate::nftables_batch::NftBatchPosition::End, 12, 12)]
+        );
     }
 
     /// NET-11: 同期点を送れなければ Unknown。

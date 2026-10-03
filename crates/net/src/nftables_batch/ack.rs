@@ -735,6 +735,74 @@ mod tests {
         assert_eq!(c.locate(3), None);
     }
 
+    /// 同期点への応答 `NFT_MSG_NEWGEN`（type 0x0A0F。属性は省略）。
+    fn newgen(seq: u32) -> Vec<u8> {
+        let mut b = NlMsgBuilder::new(0x0A0F, 0, seq, 0);
+        b.put_fixed(&[0, 0, 0, 0]).expect("nfgenmsg");
+        b.finish().expect("finish")
+    }
+
+    /// NET-11: 同期点の応答は NEWGEN（0x0A0F）→ errno 0 の ACK の順で完了する。NEWGEN だけでは未完了。
+    #[test]
+    fn net11_barrier_completes_after_newgen_then_ack() {
+        assert_eq!(NEWGEN_TYPE, 0x0A0F);
+        let mut c = NftBatchAckCollector::new(&batch(1));
+        assert!(matches!(c.feed(&ok(101)), Ok(Progress::Done(_))));
+        c.set_barrier(103);
+        assert!(matches!(c.feed(&newgen(103)), Ok(Progress::Done(_))));
+        assert!(!c.barrier_acked());
+        assert!(matches!(c.feed(&ok(103)), Ok(Progress::Done(_))));
+        assert!(c.barrier_acked());
+    }
+
+    /// NET-11: NEWGEN を受けずに届いた同期点の errno 0 の ACK は DataLoss / Unknown（完了にしない）。
+    #[test]
+    fn net11_barrier_ack_without_newgen_is_data_loss() {
+        let mut c = NftBatchAckCollector::new(&batch(1));
+        c.set_barrier(103);
+        let e = c.feed(&ok(103)).expect_err("no newgen");
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+        assert_eq!(
+            e.message(),
+            "sync ack for seq 103 arrived without a generation reply"
+        );
+        assert!(!c.barrier_acked());
+    }
+
+    /// NET-11: 同期点の seq を持つ NEWGEN・NOOP・NLMSG_ERROR 以外の type は DataLoss / Unknown。
+    #[test]
+    fn net11_unexpected_type_for_barrier_seq_is_data_loss() {
+        let mut c = NftBatchAckCollector::new(&batch(1));
+        c.set_barrier(103);
+        let noop = NlMsgBuilder::new(NLMSG_NOOP, 0, 103, 0)
+            .finish()
+            .expect("finish");
+        assert_eq!(c.feed(&noop).expect("noop"), Progress::Pending);
+        let mut b = NlMsgBuilder::new(NEWTABLE, 0, 103, 0);
+        b.put_fixed(&[0u8; 4]).expect("payload");
+        let e = c.feed(&b.finish().expect("finish")).expect_err("type");
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(
+            e.message(),
+            "unexpected netlink message type 2560 for sync seq 103"
+        );
+        assert!(!c.barrier_acked());
+    }
+
+    /// NET-11: 同期点が EPERM で拒否されたら PermissionDenied / Unknown（NEWGEN 済みでも完了にしない）。
+    #[test]
+    fn net11_barrier_errno_is_unknown() {
+        let mut c = NftBatchAckCollector::new(&batch(1));
+        c.set_barrier(103);
+        c.feed(&newgen(103)).expect("newgen");
+        let e = c.feed(&err_dgram(103, 1, 103)).expect_err("eperm");
+        assert_eq!(e.code(), NetErrorCode::PermissionDenied);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+        assert_eq!(e.message(), "sync request failed with errno 1");
+        assert!(!c.barrier_acked());
+    }
+
     /// NET-11: 同期点 ACK が別の要求 seq を埋め込んでいれば成功にせず DataLoss（Unknown）にする。
     #[test]
     fn net11_barrier_ack_with_mismatched_inner_seq_is_data_loss() {

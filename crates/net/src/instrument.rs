@@ -50,6 +50,10 @@ pub enum NetOpKind {
     /// nf_tables バッチ 1 件の送信と ACK / エラー判定（`NetlinkNetfilterSocket::send_batch`。
     /// TASK-137.3・#306）。内側の send / recv も従来どおり個別に記録される。
     NftBatch,
+    /// DNS ヘルパーの起動と準備完了待ち（`DnsHelperRefCounts::join`。TASK-144.1・#329・NET-7）。
+    DnsHelperStart,
+    /// DNS ヘルパーの停止と回収（`DnsHelperRefCounts::leave` / 再参加時の停止再試行。TASK-144.1・#329・NET-7）。
+    DnsHelperStop,
 }
 
 impl NetOpKind {
@@ -64,6 +68,8 @@ impl NetOpKind {
             NetOpKind::LinkSet => "netlink.link.set",
             NetOpKind::LinkDelete => "netlink.link.delete",
             NetOpKind::NftBatch => "nftables.batch",
+            NetOpKind::DnsHelperStart => "dns.helper.start",
+            NetOpKind::DnsHelperStop => "dns.helper.stop",
         }
     }
 }
@@ -238,7 +244,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 8] = [
+    const ALL_KINDS: [NetOpKind; 10] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
@@ -247,6 +253,8 @@ mod tests {
         NetOpKind::LinkSet,
         NetOpKind::LinkDelete,
         NetOpKind::NftBatch,
+        NetOpKind::DnsHelperStart,
+        NetOpKind::DnsHelperStop,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
@@ -260,6 +268,8 @@ mod tests {
         assert_eq!(NetOpKind::LinkSet.as_str(), "netlink.link.set");
         assert_eq!(NetOpKind::LinkDelete.as_str(), "netlink.link.delete");
         assert_eq!(NetOpKind::NftBatch.as_str(), "nftables.batch");
+        assert_eq!(NetOpKind::DnsHelperStart.as_str(), "dns.helper.start");
+        assert_eq!(NetOpKind::DnsHelperStop.as_str(), "dns.helper.stop");
     }
 
     /// REPAIR-4: 操作名は core の `OpName::new` と同じ規則に収まる（net は core に依存できないため

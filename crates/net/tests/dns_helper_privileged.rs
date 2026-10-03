@@ -14,8 +14,23 @@
 //!   `nsenter --net=<pin> <exe> --dns-client <gateway:53>` でコンテナ netns からクエリを送る
 //!   （不正パケットは無応答・続く正常クエリには応答 = ヘルパー生存の証明）。最後に回収と `delete_network`
 //!
-//! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提を満たさない
+//! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒。計測モードは `--timeout` から算出）で期限を切る（REPAIR-5）。前提を満たさない
 //! 場合は skip せず失敗する。
+//!
+//! # 実機計測モード（`--measure`。TASK-141.3・#323・NET-5・MS-8）
+//!
+//! `scripts/bench/dns_helper_measure.sh` が専用 cgroup と同期ディレクトリを用意して本実行ファイルを
+//! `--measure --queries N --warmup W --cgroup <path> --sync-dir <dir>` で呼ぶ。
+//! - 計測対象は「本テストバイナリが組み立てた `DnsHelperServer` + `RegistryHandler`」であり、製品の入口
+//!   `run_dns_helper_main`（プロセス外から名前を登録する経路が無く NOTIMP 固定。REPAIR-3）ではない。
+//!   製品の入口の数値として読んではならない。入口へ登録フラグを足す設計は後続タスクの責務で、本モードは行わない
+//! - 系列構成は PoC-15 と同じ: コンテナ netns 2 個（c1・c2）x 登録名 3 個（svc-a・svc-b・svc-c）x N クエリ
+//! - 計測専用ヘルパー（`--dns-measure-helper`）は bind・READY より前に自身を専用 cgroup へ参加させる。
+//!   スクリプトは `cgroup.procs` から PID を 1 個だけ取って PSS を読む（PoC-15 の sudo の PID 誤計測の再発防止）
+//! - 全系列の後に `<sync-dir>/pss-ready` を作り、スクリプトが PSS を読み終えて `pss-done` を作るまで待つ
+//! - stdout は 1 クエリ 1 行の JSONL 専用（診断は stderr）。集計はスクリプト側
+//!
+//! 実機（root）での実行結果は TASK-142（人間）が記録する。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -32,6 +47,20 @@ fn main() -> std::process::ExitCode {
     let has = |f: &str| args.iter().any(|a| a == f);
     if has("--dns-client") {
         return linux::client(&args);
+    }
+    // 計測モード（TASK-141.3・#323）の再入口。ランチャ（--measure）→ inner（--inner-measure）→
+    // 計測専用ヘルパー（--dns-measure-helper）／コンテナ側クライアント（--dns-bench）。
+    if has("--dns-measure-helper") {
+        return linux::measure::helper(&args);
+    }
+    if has("--dns-bench") {
+        return linux::measure::bench(&args);
+    }
+    if has("--inner-measure") {
+        return linux::measure::inner(&args);
+    }
+    if has("--measure") {
+        return linux::measure::launcher(&args);
     }
     if has("--inner") {
         linux::inner();
@@ -203,7 +232,7 @@ mod linux {
     }
 
     /// コンテナ netns 側のクライアント（`nsenter --net=<pin> <exe> --dns-client <addr>`）。
-    /// 不正パケットが無応答であることと、続く正常クエリへの応答（ID 一致・QR=1・RCODE=4）を確認する。
+    /// 不正パケットが無応答であることと、続く正常クエリへの応答（ID 一致・QR=1・RCODE=4 の NOTIMP。登録経路が無い間）を確認する。
     pub fn client(args: &[OsString]) -> ExitCode {
         let target: Option<SocketAddrV4> = args
             .iter()
@@ -239,8 +268,8 @@ mod linux {
                 return ExitCode::from(1);
             }
             if let Ok((n, _)) = sock.recv_from(&mut buf) {
-                let ok =
-                    buf.get(..n) == Some(&[0x42, 0x42, 0x81, 0x04, 0, 0, 0, 0, 0, 0, 0, 0][..]);
+                let want = vec![0x42, 0x42, 0x81, 0x04, 0, 0, 0, 0, 0, 0, 0, 0];
+                let ok = buf.get(..n) == Some(&want[..]);
                 println!("dns client: reply ok={ok}");
                 return if ok {
                     ExitCode::SUCCESS
@@ -297,20 +326,14 @@ mod linux {
         let route = NetlinkRouteSocket::open()?;
         let nft = NetlinkNetfilterSocket::open()?;
         let t = timeout();
-        let net = create_network(
-            &route,
-            &nft,
-            &NetworkCreateSpec::new(
-                NetworkName::new("dns")?,
-                IpPrefix::new("10.215.0.1".parse().map_err(|_| fail("addr"))?, 24)?,
-            )?,
-            t,
-        )
-        .map_err(|e| fail(format!("create_network failed at {:?}: {e}", e.step)))?;
+        // IPAM は特権資源（network）を作る前に構築する。構築失敗で `delete_network` に到達できず
+        // root で作った資源が残る経路を作らない（AGENTS.md「特権操作の後始末」）。
+        let gateway = IpPrefix::new("10.215.0.1".parse().map_err(|_| fail("addr"))?, 24)?;
+        let mut ipam = StaticIpam::new(&NetworkName::new("dns")?, gateway)?;
+        let spec = NetworkCreateSpec::new(NetworkName::new("dns")?, gateway)?;
+        let net = create_network(&route, &nft, &spec, t)
+            .map_err(|e| fail(format!("create_network failed at {:?}: {e}", e.step)))?;
         // create_network 成功後は、どの失敗経路でも逆順（helper 停止 → delete_network）で回収する。
-        // ipam を作れない場合は delete_network を呼べないが、子は専用 netns・mount namespace のため
-        // 終了時にカーネルが bridge・nft・pin を解放する。
-        let mut ipam = StaticIpam::for_network(&net)?;
         let mut ports = PortRegistry::new();
         let mut attached = Vec::new();
         let mut helper = None;
@@ -357,8 +380,706 @@ mod linux {
         let deleted = delete_network(&route, &nft, &net, attached, &mut ipam, &mut ports, t)
             .map(|_| ())
             .map_err(|e| fail(format!("delete_network failed: {e}")));
-        result?;
-        stop?;
-        deleted
+        // 後始末の失敗も必ず報告する（先に `?` で返さず、全結果を評価してから最初の失敗を返す）。
+        match (result, stop, deleted) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (Err(e), _, Ok(())) | (Ok(()), Err(e), Ok(())) | (Ok(()), Ok(()), Err(e)) => Err(e),
+            (Err(e), _, Err(d)) | (Ok(()), Err(e), Err(d)) => {
+                Err(fail(format!("{e}; additionally: {d}")))
+            }
+        }
+    }
+
+    /// 実機計測モード（`--measure`。TASK-141.3・#323・NET-5）。呼び出し元は `scripts/bench/dns_helper_measure.sh`
+    /// （実行ファイルを `--measure` で起動し、stdout の JSONL を集計する）。`dns_helper_privileged` の
+    /// 既定経路（`--ignored`）とは独立で、製品コードは変更しない。
+    pub mod measure {
+        use std::io::{BufRead as _, BufReader, Read as _};
+        use std::net::IpAddr;
+        use std::path::Path;
+        use std::process::Child;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, mpsc};
+
+        use fandhe_container_net::dns_helper::{
+            DnsHelperServer, DnsName, DnsRegistry, RegistryHandler, parse_question,
+        };
+
+        use super::*;
+
+        const QUERIES_MAX: u32 = 10_000;
+        const WARMUP_MAX: u32 = 1_000;
+        const RECORDS_MAX: usize = 16;
+        /// クエリごとの受信期限。無応答は ok:false で記録する。
+        const RECV_TIMEOUT: Duration = Duration::from_millis(500);
+        /// 連続無応答がこの回数に達したらヘルパーが死んでいるとみなして打ち切る（REPAIR-5）。
+        const MAX_CONSECUTIVE_MISSES: u32 = 50;
+        /// svc-c の固定アドレス（レジストリはサブネット内かを検証しない。応答の中身を照合するだけ）。
+        const SVC_C_ADDR: &str = "10.215.0.200";
+        const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+        const CGROUP_PREFIX: &str = "fandhe-dns-measure-";
+
+        /// `--flag <value>` の値を返す。
+        fn opt<'a>(args: &'a [OsString], flag: &str) -> Option<&'a str> {
+            let i = args.iter().position(|a| a == flag)?;
+            args.get(i + 1)?.to_str()
+        }
+
+        /// 繰り返し指定された `--flag <value>` の値を全て返す。
+        fn opts<'a>(args: &'a [OsString], flag: &str) -> Vec<&'a str> {
+            let mut out = Vec::new();
+            let mut it = args.iter();
+            while let Some(a) = it.next() {
+                if a == flag
+                    && let Some(v) = it.next().and_then(|v| v.to_str())
+                {
+                    out.push(v);
+                }
+            }
+            out
+        }
+
+        /// 計測全体の上限秒数（`--timeout`。スクリプトの `--timeout` と同じ値が渡る。REPAIR-5）。
+        /// 省略時はスクリプトの既定（600 秒）に合わせる。範囲外・不正値は `None`。
+        fn measure_limit(args: &[OsString]) -> Option<Duration> {
+            match opt(args, "--timeout") {
+                None => Some(Duration::from_secs(600)),
+                Some(_) => {
+                    bounded(args, "--timeout", 3600, 1).map(|s| Duration::from_secs(u64::from(s)))
+                }
+            }
+        }
+
+        /// 1 回の待機（network 作成・attach・削除・PSS 同期）に使う期限。全体上限 `limit` から導出し、
+        /// 短い `--timeout` では短く、長い `--timeout` では既定 10 秒を超えて伸ばす（上限 600 秒）。
+        fn wait_unit(limit: Duration) -> Duration {
+            Duration::from_secs((limit.as_secs() / 10).clamp(1, 600))
+        }
+
+        fn bounded(args: &[OsString], flag: &str, max: u32, min: u32) -> Option<u32> {
+            opt(args, flag)
+                .filter(|v| v.len() <= 5)
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| (min..=max).contains(v))
+        }
+
+        /// stderr に英語 1 行（code / message）を出す。外部由来の文字列は載せない。
+        fn err_line(code: &str, message: &str) {
+            eprintln!("error code={code} message={message}");
+        }
+
+        /// 専用 cgroup のパスを検証する（絶対・親が `/sys/fs/cgroup`・接頭辞つき名前・既存ディレクトリ）。
+        fn validate_cgroup(path: &str) -> Result<PathBuf, NetError> {
+            let p = Path::new(path);
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| fail("invalid cgroup path"))?;
+            let suffix = name
+                .strip_prefix(CGROUP_PREFIX)
+                .ok_or_else(|| fail("cgroup name must start with the measurement prefix"))?;
+            let name_ok = (1..=64).contains(&suffix.len())
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+            if !p.is_absolute() || p.parent() != Some(Path::new(CGROUP_ROOT)) || !name_ok {
+                return Err(fail("cgroup must be a direct child of /sys/fs/cgroup"));
+            }
+            let meta = fs::symlink_metadata(p).map_err(|_| fail("cgroup does not exist"))?;
+            if !meta.is_dir() || !p.join("cgroup.procs").exists() {
+                return Err(fail("cgroup is not a cgroup v2 directory"));
+            }
+            Ok(p.to_path_buf())
+        }
+
+        /// 同期ディレクトリを検証する（絶対パス・実ディレクトリ・0700）。
+        fn validate_sync_dir(path: &str) -> Result<PathBuf, NetError> {
+            let p = Path::new(path);
+            let meta = fs::symlink_metadata(p).map_err(|_| fail("sync dir does not exist"))?;
+            if !p.is_absolute() || !meta.is_dir() || meta.permissions().mode() & 0o077 != 0 {
+                return Err(fail("sync dir must be an absolute 0700 directory"));
+            }
+            Ok(p.to_path_buf())
+        }
+
+        /// 子の終了を期限つきで待つ。期限切れは kill して `None`。
+        fn wait_deadline(child: &mut Child, limit: Duration) -> Option<i32> {
+            let deadline = Instant::now() + limit;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(st)) => return Some(st.code().unwrap_or(1)),
+                    Ok(None) if Instant::now() >= deadline => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                    Err(_) => return None,
+                }
+            }
+        }
+
+        /// ランチャ（host netns の root プロセス）。`unshare --net --mount` で inner を起動して終了コードを引き継ぐ。
+        pub fn launcher(args: &[OsString]) -> ExitCode {
+            let (Some(q), Some(w), Some(cg), Some(sync)) = (
+                bounded(args, "--queries", QUERIES_MAX, 1),
+                bounded(args, "--warmup", WARMUP_MAX, 0),
+                opt(args, "--cgroup"),
+                opt(args, "--sync-dir"),
+            ) else {
+                err_line(
+                    "INVALID_ARGUMENT",
+                    "need --queries 1..=10000 --warmup 0..=1000 --cgroup --sync-dir",
+                );
+                return ExitCode::from(2);
+            };
+            if validate_cgroup(cg).is_err() || validate_sync_dir(sync).is_err() {
+                err_line("INVALID_ARGUMENT", "invalid --cgroup or --sync-dir");
+                return ExitCode::from(2);
+            }
+            let Some(limit) = measure_limit(args) else {
+                err_line("INVALID_ARGUMENT", "invalid --timeout");
+                return ExitCode::from(2);
+            };
+            require_root_and_tools();
+            let dir =
+                std::env::temp_dir().join(format!("fandhe-dns-measure-{}", std::process::id()));
+            if fs::create_dir(&dir)
+                .and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)))
+                .is_err()
+            {
+                err_line("INTERNAL", "cannot create temp dir");
+                return ExitCode::from(1);
+            }
+            let Ok(exe) = std::env::current_exe() else {
+                err_line("INTERNAL", "current_exe failed");
+                return ExitCode::from(1);
+            };
+            let child = Command::new("unshare")
+                .args(["--net", "--mount", "--"])
+                .arg(exe)
+                .args(["--inner-measure", "--queries"])
+                .arg(q.to_string())
+                .arg("--warmup")
+                .arg(w.to_string())
+                .arg("--cgroup")
+                .arg(cg)
+                .arg("--sync-dir")
+                .arg(sync)
+                .arg("--timeout")
+                .arg(limit.as_secs().to_string())
+                .env(LAUNCHER_PID_ENV, std::process::id().to_string())
+                .env(DIR_ENV, &dir)
+                .spawn();
+            let code = match child {
+                Ok(mut c) => {
+                    // 全体上限は --timeout（スクリプトの上限と同一）。スクリプト側の kill-after 分だけ猶予を足す。
+                    let hard = limit + Duration::from_secs(15);
+                    wait_deadline(&mut c, hard).unwrap_or(1)
+                }
+                Err(_) => {
+                    err_line("INTERNAL", "cannot spawn unshare");
+                    1
+                }
+            };
+            let _ = fs::remove_dir(&dir);
+            ExitCode::from(u8::try_from(code).unwrap_or(1))
+        }
+
+        /// 計測専用ヘルパーのハンドル。`Drop` でも kill と回収を行う（ゾンビを残さない）。
+        struct HelperGuard(Option<Child>);
+
+        impl HelperGuard {
+            fn stop(&mut self) {
+                if let Some(mut c) = self.0.take() {
+                    let _ = c.kill();
+                    let _ = wait_deadline(&mut c, REAP_TIMEOUT_DEFAULT);
+                }
+            }
+        }
+
+        impl Drop for HelperGuard {
+            fn drop(&mut self) {
+                self.stop();
+            }
+        }
+
+        /// inner（新 netns・新 mount namespace）。ネットワークと 2 コンテナを用意し、計測専用ヘルパーと
+        /// コンテナ側クライアントを動かして JSONL を stdout へ中継し、PSS 取得の同期後に後始末する。
+        pub fn inner(args: &[OsString]) -> ExitCode {
+            let (Some(q), Some(w), Some(cg), Some(sync)) = (
+                bounded(args, "--queries", QUERIES_MAX, 1),
+                bounded(args, "--warmup", WARMUP_MAX, 0),
+                opt(args, "--cgroup"),
+                opt(args, "--sync-dir"),
+            ) else {
+                err_line("INVALID_ARGUMENT", "invalid measurement arguments");
+                return ExitCode::from(2);
+            };
+            let Some(limit) = measure_limit(args) else {
+                err_line("INVALID_ARGUMENT", "invalid --timeout");
+                return ExitCode::from(2);
+            };
+            match inner_checked(q, w, cg, sync, limit) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    err_line(e.code().as_str(), e.message());
+                    ExitCode::from(1)
+                }
+            }
+        }
+
+        fn inner_checked(
+            q: u32,
+            w: u32,
+            cg: &str,
+            sync: &str,
+            limit: Duration,
+        ) -> Result<(), NetError> {
+            validate_cgroup(cg)?;
+            let sync = validate_sync_dir(sync)?;
+            let expected = std::env::var(LAUNCHER_PID_ENV)
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok());
+            if expected != Some(std::os::unix::process::parent_id()) {
+                return Err(fail(
+                    "`--inner-measure` must be started by the `--measure` launcher; refusing to run",
+                ));
+            }
+            let own =
+                fs::read_link("/proc/self/ns/net").map_err(|e| fail(format!("readlink: {e}")))?;
+            let parent = fs::read_link(format!(
+                "/proc/{}/ns/net",
+                std::os::unix::process::parent_id()
+            ))
+            .map_err(|e| fail(format!("cannot read parent netns ({e}); refusing to run")))?;
+            if own == parent {
+                return Err(fail(
+                    "same network namespace as the launcher; refusing to run (see AGENTS.md)",
+                ));
+            }
+            let base = PathBuf::from(
+                std::env::var(DIR_ENV).map_err(|_| fail("missing test directory env"))?,
+            );
+            let base_str = base
+                .to_str()
+                .ok_or_else(|| fail("test directory is not UTF-8"))?;
+            run_checked("mount", &["--make-rprivate", "/"])?;
+            run_checked(
+                "mount",
+                &["-t", "tmpfs", "-o", "mode=0700", "tmpfs", base_str],
+            )?;
+
+            let route = NetlinkRouteSocket::open()?;
+            let nft = NetlinkNetfilterSocket::open()?;
+            let t = wait_unit(limit);
+            // IPAM は特権資源（network）を作る前に構築する。構築失敗で `delete_network` に到達できず
+            // root で作った資源が残る経路を作らない（AGENTS.md「特権操作の後始末」）。
+            let gateway = IpPrefix::new("10.215.0.1".parse().map_err(|_| fail("addr"))?, 24)?;
+            let mut ipam = StaticIpam::new(&NetworkName::new("dnsm")?, gateway)?;
+            let spec = NetworkCreateSpec::new(NetworkName::new("dnsm")?, gateway)?;
+            let net = create_network(&route, &nft, &spec, t)
+                .map_err(|e| fail(format!("create_network failed at {:?}: {e}", e.step)))?;
+            // create_network 成功後は、どの失敗経路でも逆順（helper 停止 → delete_network）で回収する。
+            let mut ports = PortRegistry::new();
+            let mut attached = Vec::new();
+            let mut helper = HelperGuard(None);
+            let result = (|| -> Result<(), NetError> {
+                let mut addrs = Vec::new();
+                let mut pins = Vec::new();
+                for id in ["c1", "c2"] {
+                    let spec = ContainerAttachSpec::new(EndpointId::new(id)?, &net, base.clone())?;
+                    let a = attach_container(&route, &nft, &spec, &mut ipam, &mut ports, t)
+                        .map_err(|e| {
+                            fail(format!("attach_container failed at {:?}: {e}", e.step))
+                        })?;
+                    let ip = match a.address.addr() {
+                        IpAddr::V4(v4) => Some(v4),
+                        IpAddr::V6(_) => None,
+                    };
+                    let pin = a.netns_path.to_str().map(str::to_owned);
+                    attached.push(a);
+                    addrs.push(ip.ok_or_else(|| fail("container address is not IPv4"))?);
+                    pins.push(pin.ok_or_else(|| fail("pin path is not UTF-8"))?);
+                }
+                let a1 = addrs
+                    .first()
+                    .copied()
+                    .ok_or_else(|| fail("no c1 address"))?;
+                let a2 = addrs.get(1).copied().ok_or_else(|| fail("no c2 address"))?;
+                let c_addr: Ipv4Addr = SVC_C_ADDR.parse().map_err(|_| fail("svc-c addr"))?;
+                let records = [("svc-a", a1), ("svc-b", a2), ("svc-c", c_addr)];
+
+                let exe = std::env::current_exe().map_err(|e| fail(format!("current_exe: {e}")))?;
+                let listen = DnsListenAddr::for_network(&net)?;
+                helper.0 = Some(spawn_measure_helper(&exe, listen, cg, &records)?);
+                let pid = helper
+                    .0
+                    .as_ref()
+                    .map(Child::id)
+                    .ok_or_else(|| fail("no helper"))?;
+                let helper_ns = fs::read_link(format!("/proc/{pid}/ns/net"))
+                    .map_err(|e| fail(format!("readlink helper netns: {e}")))?;
+                if helper_ns != own || helper_ns == parent {
+                    return Err(fail(
+                        "helper is not in the network's own netns (or shares the launcher's)",
+                    ));
+                }
+
+                let exe_str = exe.to_str().ok_or_else(|| fail("exe path is not UTF-8"))?;
+                let target = listen.socket_addr().to_string();
+                for (label, pin) in ["c1", "c2"].iter().zip(pins.iter()) {
+                    let mut cmd_args: Vec<String> = vec![
+                        format!("--net={pin}"),
+                        exe_str.to_owned(),
+                        "--dns-bench".into(),
+                        target.clone(),
+                        "--label".into(),
+                        (*label).to_owned(),
+                        "--queries".into(),
+                        q.to_string(),
+                        "--warmup".into(),
+                        w.to_string(),
+                    ];
+                    for (name, ip) in &records {
+                        cmd_args.push("--expect".into());
+                        cmd_args.push(format!("{name}={ip}"));
+                    }
+                    // クライアントの stdout（JSONL）はそのまま親へ中継する。
+                    let mut child = Command::new("nsenter")
+                        .args(&cmd_args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .spawn()
+                        .map_err(|e| fail(format!("spawn nsenter: {e}")))?;
+                    // 失敗時はクライアントが連続無応答で打ち切るため、期限は十分な余裕を持たせる。
+                    match wait_deadline(&mut child, bench_budget(q, w, records.len(), limit)) {
+                        Some(0) => {}
+                        Some(_) => return Err(fail("container-side dns bench failed")),
+                        None => {
+                            return Err(NetError::new(
+                                NetErrorCode::Timeout,
+                                "container-side dns bench did not finish before the deadline",
+                            ));
+                        }
+                    }
+                }
+
+                // 全クエリ後のアイドル時に PSS を読ませる。スクリプトが読み終えるまでヘルパーを生かす。
+                fs::write(sync.join("pss-ready"), b"1")
+                    .map_err(|e| fail(format!("write pss-ready: {e}")))?;
+                let deadline = Instant::now() + (t * 3).min(limit);
+                while !sync.join("pss-done").exists() {
+                    if Instant::now() >= deadline {
+                        return Err(NetError::new(
+                            NetErrorCode::Timeout,
+                            "pss-done was not signalled before the deadline",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(())
+            })();
+            helper.stop();
+            let deleted = delete_network(&route, &nft, &net, attached, &mut ipam, &mut ports, t)
+                .map(|_| ())
+                .map_err(|e| fail(format!("delete_network failed: {e}")));
+            combine_results(result, deleted)
+        }
+
+        /// 計測結果と後始末（`delete_network`）結果を合成する。どちらかが失敗なら失敗を返し、
+        /// 両方失敗なら両方の内容を載せる（root で作った network の残存を見落とさない）。
+        fn combine_results(
+            result: Result<(), NetError>,
+            deleted: Result<(), NetError>,
+        ) -> Result<(), NetError> {
+            match (result, deleted) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(e), Ok(())) => Err(e),
+                (Ok(()), Err(d)) => Err(d),
+                (Err(e), Err(d)) => Err(fail(format!("{e}; additionally: {d}"))),
+            }
+        }
+
+        /// クライアント 1 プロセスの所要上限。名前数 × (warmup + queries) の全クエリが
+        /// 受信期限まで待たされる最悪ケースに、固定の余裕を足し、全体上限 `limit`（`--timeout`）で頭打ちにする。
+        fn bench_budget(q: u32, w: u32, names: usize, limit: Duration) -> Duration {
+            let total = u64::from(q).saturating_add(u64::from(w));
+            let queries = total.saturating_mul(u64::try_from(names).unwrap_or(u64::MAX));
+            let per_query_ms = u64::try_from(RECV_TIMEOUT.as_millis()).unwrap_or(500);
+            let computed = wait_unit(limit) * 3
+                + Duration::from_secs(30)
+                + Duration::from_millis(queries.saturating_mul(per_query_ms));
+            // 全体上限（--timeout）を超えて待たない。
+            computed.min(limit)
+        }
+
+        /// 計測専用ヘルパーを起動し、READY 行を期限内に受理するまで待つ。
+        fn spawn_measure_helper(
+            exe: &Path,
+            listen: DnsListenAddr,
+            cgroup: &str,
+            records: &[(&str, Ipv4Addr)],
+        ) -> Result<Child, NetError> {
+            let mut cmd = Command::new(exe);
+            cmd.args(["--dns-measure-helper", "--listen"])
+                .arg(listen.socket_addr().to_string())
+                .arg("--cgroup")
+                .arg(cgroup);
+            for (name, ip) in records {
+                cmd.arg("--record").arg(format!("{name}={ip}"));
+            }
+            let mut child = cmd
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map_err(|e| fail(format!("spawn measure helper: {e}")))?;
+            let Some(stdout) = child.stdout.take() else {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(fail("helper stdout unavailable"));
+            };
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                // READY 行は短い。上限つきで 1 行だけ読む。
+                let _ = BufReader::new(stdout.take(256)).read_line(&mut line);
+                let _ = tx.send(line);
+            });
+            let want = format!("READY {}", listen.socket_addr());
+            match rx.recv_timeout(READY_TIMEOUT_DEFAULT) {
+                Ok(line) if line.trim_end() == want => Ok(child),
+                other => {
+                    let _ = child.kill();
+                    let _ = wait_deadline(&mut child, REAP_TIMEOUT_DEFAULT);
+                    Err(NetError::new(
+                        NetErrorCode::FailedPrecondition,
+                        if other.is_err() {
+                            "measure helper was not ready before the deadline"
+                        } else {
+                            "measure helper reported an unexpected ready line"
+                        },
+                    ))
+                }
+            }
+        }
+
+        /// 計測専用ヘルパー本体（`--dns-measure-helper --listen <ipv4:port> --cgroup <path> --record <name>=<ipv4>...`）。
+        /// 製品の `run_dns_helper_main` ではなく、`DnsHelperServer` + `RegistryHandler`（製品コード）を本バイナリが
+        /// 直接組み立てる。bind と READY より前に専用 cgroup へ参加し、READY 時点で参加済みを保証する。
+        pub fn helper(args: &[OsString]) -> ExitCode {
+            match helper_checked(args) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    err_line(e.code().as_str(), e.message());
+                    ExitCode::from(1)
+                }
+            }
+        }
+
+        fn helper_checked(args: &[OsString]) -> Result<(), NetError> {
+            let listen: SocketAddrV4 = opt(args, "--listen")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| fail("invalid --listen"))?;
+            let listen = DnsListenAddr::new(*listen.ip(), listen.port())?;
+            let cgroup =
+                validate_cgroup(opt(args, "--cgroup").ok_or_else(|| fail("missing --cgroup"))?)?;
+            let recs = opts(args, "--record");
+            if recs.is_empty() || recs.len() > RECORDS_MAX {
+                return Err(fail("--record count out of range"));
+            }
+            let registry = Arc::new(DnsRegistry::new());
+            for r in recs {
+                let (name, ip) = r.split_once('=').ok_or_else(|| fail("invalid --record"))?;
+                let ip: Ipv4Addr = ip.parse().map_err(|_| fail("invalid --record address"))?;
+                registry.register(&DnsName::new(name)?, ip)?;
+            }
+            // "0" は書き込んだプロセス自身を指す。READY より前に参加することで PID 取得の競合を避ける。
+            fs::write(cgroup.join("cgroup.procs"), b"0")
+                .map_err(|e| fail(format!("join cgroup: {e}")))?;
+            let mut server = DnsHelperServer::bind(listen)?;
+            println!("READY {}", server.local_addr());
+            std::io::Write::flush(&mut std::io::stdout())
+                .map_err(|e| fail(format!("flush ready line: {e}")))?;
+            // 親が kill するまで動き続ける。
+            let stop = AtomicBool::new(false);
+            server.serve(&RegistryHandler::new(registry), &stop)
+        }
+
+        /// A クエリ（RD=1・IN）を組む。
+        fn a_query(id: u16, name: &str) -> Option<Vec<u8>> {
+            let mut v = query(id, 0x0100, 1);
+            for label in name.split('.') {
+                let len = u8::try_from(label.len())
+                    .ok()
+                    .filter(|l| (1..=63).contains(l))?;
+                v.push(len);
+                v.extend_from_slice(label.as_bytes());
+            }
+            v.push(0);
+            v.extend_from_slice(&[0, 1, 0, 1]);
+            Some(v)
+        }
+
+        fn be16(b: &[u8], off: usize) -> Option<u16> {
+            Some(u16::from_be_bytes([
+                *b.get(off)?,
+                *b.get(off.checked_add(1)?)?,
+            ]))
+        }
+
+        /// 応答が期待どおり（ID 一致・QR=1・RCODE=0・質問が送信クエリと完全一致・ANCOUNT=1・
+        /// 回答 TYPE=A / CLASS=IN・RDATA=期待アドレス）かを照合する。`query` は送信したパケット全体。
+        fn answer_matches(resp: &[u8], query: &[u8], id: u16, want: Ipv4Addr) -> Option<bool> {
+            let flags = be16(resp, 2)?;
+            if be16(resp, 0)? != id || flags & 0x8000 == 0 || flags & 0x000f != 0 {
+                return Some(false);
+            }
+            if be16(resp, 6)? != 1 {
+                return Some(false);
+            }
+            let mut off = parse_question(resp)?.end;
+            // 質問（QNAME・QTYPE・QCLASS）が送ったクエリのものと一致すること。
+            if resp.get(12..off)? != query.get(12..)? {
+                return Some(false);
+            }
+            // 回答の NAME が送信した質問名を指すこと（別名を指す回答を正答にしない。NET-5）。
+            // 質問名は resp[12..qname_end]（終端 0 を含む）。圧縮ポインタは offset 12 を指す場合のみ許可し、
+            // ラベル列で書かれている場合は質問名とバイト一致を要求する。
+            let qname_end = off.checked_sub(4)?;
+            let qname = resp.get(12..qname_end)?;
+            let name_start = off;
+            let b = *resp.get(off)?;
+            if b & 0xC0 == 0xC0 {
+                let target =
+                    (usize::from(b & 0x3F) << 8) | usize::from(*resp.get(off.checked_add(1)?)?);
+                if target != 12 {
+                    return Some(false);
+                }
+                off = off.checked_add(2)?;
+            } else {
+                loop {
+                    let l = *resp.get(off)?;
+                    if l & 0xC0 != 0 {
+                        return Some(false);
+                    }
+                    off = off.checked_add(1)?;
+                    if l == 0 {
+                        break;
+                    }
+                    off = off.checked_add(usize::from(l))?;
+                }
+                if resp.get(name_start..off)? != qname {
+                    return Some(false);
+                }
+            }
+            let rtype = be16(resp, off)?;
+            let rclass = be16(resp, off.checked_add(2)?)?;
+            let rdlen = be16(resp, off.checked_add(8)?)?;
+            let rdata = resp.get(off.checked_add(10)?..off.checked_add(14)?)?;
+            Some(rtype == 1 && rclass == 1 && rdlen == 4 && rdata == want.octets())
+        }
+
+        /// コンテナ netns 側のクライアント（`--dns-bench <ipv4:port> --label <c1|c2> --expect <name>=<ipv4>... --queries N --warmup W`）。
+        /// 名前ごとに warmup W 回と本計測 N 回を順に送り、1 クエリ 1 行の JSONL を stdout へ出す。
+        /// 連続無応答が [`MAX_CONSECUTIVE_MISSES`] 回に達したら打ち切って非ゼロで終える（REPAIR-5）。
+        pub fn bench(args: &[OsString]) -> ExitCode {
+            let target: Option<SocketAddrV4> = args
+                .iter()
+                .skip_while(|a| *a != "--dns-bench")
+                .nth(1)
+                .and_then(|a| a.to_str())
+                .and_then(|s| s.parse().ok());
+            let label = opt(args, "--label").filter(|l| matches!(*l, "c1" | "c2"));
+            let (Some(target), Some(label), Some(q), Some(w)) = (
+                target,
+                label,
+                bounded(args, "--queries", QUERIES_MAX, 1),
+                bounded(args, "--warmup", WARMUP_MAX, 0),
+            ) else {
+                err_line("INVALID_ARGUMENT", "invalid bench arguments");
+                return ExitCode::from(2);
+            };
+            let mut expects: Vec<(String, Ipv4Addr)> = Vec::new();
+            for e in opts(args, "--expect").into_iter().take(RECORDS_MAX) {
+                let parsed = e.split_once('=').and_then(|(n, ip)| {
+                    let n = DnsName::new(n).ok()?;
+                    Some((n.as_str().to_owned(), ip.parse::<Ipv4Addr>().ok()?))
+                });
+                match parsed {
+                    Some(p) => expects.push(p),
+                    None => {
+                        err_line("INVALID_ARGUMENT", "invalid --expect");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            if expects.is_empty() {
+                err_line("INVALID_ARGUMENT", "missing --expect");
+                return ExitCode::from(2);
+            }
+            let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+                err_line("INTERNAL", "bind failed");
+                return ExitCode::from(1);
+            };
+            let _ = sock.set_read_timeout(Some(RECV_TIMEOUT));
+            let mut next_id: u16 = 1;
+            let mut misses: u32 = 0;
+            let mut buf = [0u8; 600];
+            for (name, want) in &expects {
+                for i in 0..(w + q) {
+                    let is_warmup = i < w;
+                    let trial = if is_warmup { i } else { i - w };
+                    let id = next_id;
+                    next_id = next_id.wrapping_add(1);
+                    let Some(pkt) = a_query(id, name) else {
+                        err_line("INVALID_ARGUMENT", "cannot build query");
+                        return ExitCode::from(2);
+                    };
+                    let start = Instant::now();
+                    let mut result: Option<(bool, Duration)> = None;
+                    if sock.send_to(&pkt, target).is_ok() {
+                        let deadline = start + RECV_TIMEOUT;
+                        while Instant::now() < deadline {
+                            let Ok((n, src)) = sock.recv_from(&mut buf) else {
+                                break;
+                            };
+                            let at = start.elapsed();
+                            // 計測対象のヘルパー以外から届いたデータグラムは読み捨てる。
+                            if src != std::net::SocketAddr::V4(target) {
+                                continue;
+                            }
+                            let resp = buf.get(..n).unwrap_or(&[]);
+                            // ID が違う遅延応答は読み捨てる。
+                            if be16(resp, 0) == Some(id) {
+                                let ok = answer_matches(resp, &pkt, id, *want).unwrap_or(false);
+                                result = Some((ok, at));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some((ok, at)) = result {
+                        misses = 0;
+                        let us = at.as_secs_f64() * 1e6;
+                        println!(
+                            "{{\"series\":\"{label}/{name}\",\"trial\":{trial},\"warmup\":{is_warmup},\"ok\":{ok},\"latency_us\":{us:.3}}}"
+                        );
+                    } else {
+                        misses += 1;
+                        println!(
+                            "{{\"series\":\"{label}/{name}\",\"trial\":{trial},\"warmup\":{is_warmup},\"ok\":false,\"latency_us\":null}}"
+                        );
+                        if misses >= MAX_CONSECUTIVE_MISSES {
+                            err_line("TIMEOUT", "too many consecutive missing replies");
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
     }
 }

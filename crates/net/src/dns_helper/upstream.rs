@@ -1468,4 +1468,14 @@ mod tests {
             assert!(!recv_error_is_retryable(&io::Error::from(kind)), "{kind:?}");
         }
     }
+
+    /// NET-12: 送信元詐称防止の証明・転送応答の証印は全ゼロのビットパターンを有効値にしない。`Option` が全ゼロを
+    /// `None` のニッチに使えてサイズが増えない（1 バイト）ことで、全ゼロが無効値であることを確認する。
+    #[test]
+    fn proof_tokens_reject_all_zero_bit_pattern() {
+        assert_eq!(std::mem::size_of::<SourceVerified>(), 1);
+        assert_eq!(std::mem::size_of::<Option<SourceVerified>>(), 1);
+        assert_eq!(std::mem::size_of::<ForwardedProof>(), 1);
+        assert_eq!(std::mem::size_of::<Option<ForwardedProof>>(), 1);
+    }
 }

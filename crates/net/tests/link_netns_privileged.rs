@@ -243,8 +243,8 @@ mod linux {
             lines: rx,
         };
 
-        // 本試験が host 側に作成して未移動の veth がある間だけ true。作成成功を確認できた場合に限り
-        // 後始末で削除する（同名の既存 host インターフェースを誤って消さないため。P0）。
+        // 本試験が host 側に作成した（応答不明の作成要求を含む）未移動の veth がありうる間だけ true。
+        // 作成前に同名の不在を確認した後にのみ true にするため、同名の既存 host インターフェースは消さない（P0）。
         let host_veth_owned = Cell::new(false);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             scenario(&sock, &mut guard, pid, &a, &b, deadline, &host_veth_owned)
@@ -284,12 +284,15 @@ mod linux {
                 .expect_err("interface name already exists on host; refusing to proceed");
             assert_eq!(e.code(), NetErrorCode::NotFound, "{n}");
         }
+        // 直前の存在確認で両名が無いことを確認済みのため、以降に現れる同名リンクは本試験が作成したもの。
+        // create_link が Timeout / DataLoss を返してもカーネル側では作成済みの可能性があるので、
+        // 送信前に所有を宣言し、後始末側が実在するものだけを削除する（NotFound は想定内）。
+        host_veth_owned.set(true);
         sock.create_link(
             &LinkCreate::veth(name(a), name(b)).expect("veth request"),
             timeout(),
         )
         .expect("create veth pair");
-        host_veth_owned.set(true);
 
         // a は PID 指定、b は ns fd 指定で子の netns へ移動する。
         let by_pid = NetnsTarget::Pid(NetnsPid::new(pid).expect("child pid"));

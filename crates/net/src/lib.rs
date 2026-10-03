@@ -3,8 +3,9 @@
 //! 実装済みは netlink の nlmsghdr / rtattr バイト列コーデック・共通エラー型
 //! （`netlink`・`error`。TASK-136.1・NET-11）と `NETLINK_ROUTE` ソケットの open / bind / send / recv
 //! （`netlink_route`。Linux のみ。TASK-136.2.1・#843）と、seq 採番・ACK / `NLMSG_ERROR` 判定・
-//! 期限つき往復（`NetlinkRouteSocket::request`。TASK-136.2.2・#844）。操作ごとの成功 / 失敗・所要時間の記録先を
-//! 受け取る計装連携点（`instrument`。REPAIR-4）も持つ。link / address / route 操作・
+//! 期限つき往復（`NetlinkRouteSocket::request`。TASK-136.2.2・#844）と、bridge・veth の
+//! `RTM_NEWLINK` 作成メッセージの組み立て（`netlink_route::LinkCreate`。OS 非依存。TASK-136.3.1・#845）。操作ごとの成功 / 失敗・所要時間の記録先を
+//! 受け取る計装連携点（`instrument`。REPAIR-4）も持つ。link の送信・netns 移動・up（#846）、address / route 操作・
 //! nftables・DNS ヘルパー等は未実装で、G10（TASK-136〜148・TASK-185〜186）で実装する（REPAIR-3）。
 //! PLUG-1 区分は検討中
 //! （制御面の `NetworkPlugin` は plugin 側に区分される一方、DNS ヘルパー・rootless 転送のデータパス

@@ -142,7 +142,7 @@ impl NftName {
     }
 
     /// NUL 終端付きでワイヤーに載せる。
-    fn put_into(&self, b: &mut NlMsgBuilder, attr_type: u16) -> Result<(), NetError> {
+    pub(crate) fn put_into(&self, b: &mut NlMsgBuilder, attr_type: u16) -> Result<(), NetError> {
         let mut bytes = Vec::with_capacity(self.0.len() + 1);
         bytes.extend_from_slice(self.0.as_bytes());
         bytes.push(0);
@@ -212,7 +212,12 @@ pub struct BaseChain {
 }
 
 /// 共通の組み立て手順。`op_flags` は操作フラグのみで、REQUEST / ACK はここで付ける。
-fn start(msg: u8, op_flags: u16, family: NftFamily, seq: u32) -> Result<NlMsgBuilder, NetError> {
+pub(crate) fn start(
+    msg: u8,
+    op_flags: u16,
+    family: NftFamily,
+    seq: u32,
+) -> Result<NlMsgBuilder, NetError> {
     let mut b = NlMsgBuilder::new(
         nfnl_msg_type(NFNL_SUBSYS_NFTABLES, msg),
         op_flags | NLM_F_REQUEST | NLM_F_ACK,

@@ -30,7 +30,7 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! ルール本体（NEWRULE。TASK-138.2 以降）は未実装（expr の共通コーデックは `nftables_rules`。TASK-138.1）。実機前提テストは `tests/nftables_batch_privileged.rs`（TASK-137.4・#307。AGENTS.md「実機前提テスト」）。ソケット送信と ACK 判定
+//! ルール本体（NEWRULE）は `nftables_rules` が担当する（TASK-138.1・TASK-138.2）。実機前提テストは `tests/nftables_batch_privileged.rs`（TASK-137.4・#307。AGENTS.md「実機前提テスト」）。ソケット送信と ACK 判定
 //! （#306）は実装済みだが、`SO_SNDBUF` / `SO_RCVBUF` の調整・extended ACK・`NFTA_GEN_ID` は未実装（`socket` の doc）。
 //! 定数値は Linux UAPI（`nfnetlink.h`・`netfilter.h`）に基づく。
 
@@ -44,6 +44,8 @@ mod table_chain;
 pub use ack::{NftBatchAck, NftBatchError, NftBatchOutcome, NftBatchPosition, NftMessageFailure};
 #[cfg(target_os = "linux")]
 pub use socket::NetlinkNetfilterSocket;
+/// NEWRULE 等、他モジュールの nf_tables メッセージが REQUEST / ACK 付きヘッダーを組み立てる共通入口。
+pub(crate) use table_chain::start as start_nft_request;
 pub use table_chain::*;
 
 use crate::error::{NetError, NetErrorCode};

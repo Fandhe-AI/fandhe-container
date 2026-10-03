@@ -17,3 +17,10 @@ publish = false
 name = "link_netns_privileged"
 path = "tests/link_netns_privileged.rs"
 harness = false
+
+# 3 netns（container / router / external）での masquerade 実機結合試験（NET-11・TASK-138.2・#310）。
+# 子の再入（--child）と root 前提の分離のため harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "nftables_masq_privileged"
+path = "tests/nftables_masq_privileged.rs"
+harness = false

@@ -3,14 +3,15 @@
 //!
 //! `nft` コマンドや汎用 crate に頼らず、`NFT_MSG_NEWRULE` の `NFTA_RULE_EXPRESSIONS` 以下を
 //! `NlMsgBuilder` で組み立て、`AttrIter` で復号する OS 非依存のコーデック。ソケット・`unsafe` は持たない。
-//! 任意の expr 名・データを運べる汎用層であり、型付き expr（payload / cmp / masq / nat 等）は
-//! この層の上に `NftExpr` へ変換する形で載せる。
+//! 任意の expr 名・データを運べる汎用層であり、型付き expr はこの層の上に `NftExpr` へ変換する形で載せる。
+//! 型付き expr は `payload`（load 形式。[`NftPayload`]・TASK-138.2）と `masq`（[`NftMasq`]・TASK-138.2）、
+//! NEWRULE 本体は [`RuleCreate`]（TASK-138.2）。
 //!
 //! # 呼び出し元
 //!
-//! NEWRULE 本体（`NFTA_RULE_TABLE` / `NFTA_RULE_CHAIN` の組み立てと送信。TASK-138.2・#310）と
-//! nat / ルール削除（TASK-138.3・#311）が、メッセージ組み立て中に [`NftRuleExprs::put_into`] を呼ぶ。
-//! 実機結合は TASK-138.4（#312）が担当する。
+//! [`RuleCreate`]（NEWRULE 本体。TASK-138.2・#310）が、メッセージ組み立て中に [`NftRuleExprs::put_into`] を呼ぶ。
+//! nat / ルール削除（TASK-138.3・#311）も同じ層に載る。masq の実機結合は
+//! `tests/nftables_masq_privileged.rs`（TASK-138.2）、それ以外の実機結合は TASK-138.4（#312）が担当する。
 //!
 //! # ワイヤーレイアウト
 //!
@@ -43,9 +44,18 @@
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
-//! - NEWRULE メッセージ本体と型付き expr（TASK-138.2 以降）
+//! - 型付き expr は payload（load 形式）と masq のみ。cmp / bitwise / meta / nat（#311 と TASK-139）は未実装
+//! - `NFT_MSG_DELRULE` とルールのハンドル指定（#311）。詳細は各サブモジュールの doc
 //! - `NLA_F_NET_BYTEORDER` 付き属性のデコード（本エンコーダが出さないため現状は拒否。
 //!   GETRULE dump 等で必要になった時点で受理を検討する）
+
+mod masq;
+mod payload;
+mod rule;
+
+pub use masq::*;
+pub use payload::*;
+pub use rule::*;
 
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{Attr, MAX_ATTR_PAYLOAD_LEN, NLA_TYPE_MASK, NlMsgBuilder};
@@ -75,6 +85,26 @@ fn invalid(msg: impl Into<String>) -> NetError {
 
 fn data_loss(msg: impl Into<String>) -> NetError {
     NetError::new(NetErrorCode::DataLoss, msg)
+}
+
+/// 型付き expr の `from_expr` 共通の前処理。名前が `expected` と一致し、データ属性がすべて
+/// 非ネストの 4 バイト値（`__be32`）で、種別が重複していないことを検証して `(種別, 値)` を返す。
+/// 違反は `DataLoss`（kernel 応答など外部由来の expr も untrusted として扱う。fail-closed）。
+fn collect_u32_attrs(expr: &NftExpr, expected: &str) -> Result<Vec<(u16, u32)>, NetError> {
+    if expr.name().as_str() != expected {
+        return Err(data_loss("unexpected expr name"));
+    }
+    let mut out: Vec<(u16, u32)> = Vec::new();
+    for a in expr.data() {
+        let v = a
+            .as_u32_be()
+            .ok_or_else(|| data_loss("expr attribute is not a be32 value"))?;
+        if out.iter().any(|(t, _)| *t == a.attr_type()) {
+            return Err(data_loss("duplicate attribute in expr"));
+        }
+        out.push((a.attr_type(), v));
+    }
+    Ok(out)
 }
 
 /// 検証済みの expr 名（`payload`・`masq` 等）。

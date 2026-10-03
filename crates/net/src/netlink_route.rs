@@ -668,17 +668,17 @@ mod socket {
         }
     }
 
-    /// seq `seq` の応答が確定する（ACK・エラー・DONE）まで `recv` で受信して判定する（NET-11・REPAIR-5）。
-    ///
-    /// `deadline` は往復全体で 1 つ（`total` は文言用の元の timeout）。各 `recv` には残り時間を渡し、
-    /// 受信のたびに期限を張り直さない。`recv` は本番では `NetlinkRouteSocket::recv`、単体試験では
-    /// 決定的な偽物。
     #[cfg(test)]
     const TEST_LOCAL_PID: NonZeroU32 = match NonZeroU32::new(0x4242) {
         Some(p) => p,
         None => panic!("nonzero"),
     };
 
+    /// seq `seq` の応答が確定する（ACK・エラー・DONE）まで `recv` で受信して判定する（NET-11・REPAIR-5）。
+    ///
+    /// `deadline` は往復全体で 1 つ（`total` は文言用の元の timeout）。各 `recv` には残り時間を渡し、
+    /// 受信のたびに期限を張り直さない。`recv` は本番では `NetlinkRouteSocket::recv`、単体試験では
+    /// 決定的な偽物。
     #[cfg(test)]
     fn await_reply(
         seq: u32,

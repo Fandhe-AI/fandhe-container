@@ -14,7 +14,7 @@
 //! - `br_netfilter`: `/proc/sys/net/bridge/bridge-nf-call-iptables` の存在で判定する。このディレクトリは
 //!   `br_netfilter` の初期化時に作られるため、モジュール版と組み込み版の両方で使える。
 //!   `/sys/module/br_netfilter` は組み込み版では当てにならないため判定には使わない。ファイルの値
-//!   （`0` / `1`）は bridge 通過パケットを iptables に渡すかどうかとして併せて返す。
+//!   （`0` / `1`）は bridge 通過パケットを iptables に渡すかどうかとして返し、`1` のときだけリスク条件を成立とする（`0` は不成立）。
 //! - `FORWARD` チェインの policy: nf_tables に対する `NFT_MSG_GETCHAIN` の読み取り照会
 //!   （`ip filter FORWARD`）。外部コマンド（`iptables` / `nft`）は起動しない（NET-11・フルスクラッチ方針）。
 //!   nfnetlink は `CAP_NET_ADMIN` を要するため、非特権では [`ForwardPolicyState::PermissionDenied`] になる。
@@ -451,8 +451,18 @@ pub struct DoctorReport {
 
 fn br_netfilter_condition(s: &BrNetfilterState) -> ConditionState {
     match s {
-        // call_iptables が 0 でも sysctl は後から 1 に変わりうるため、ロード済みなら成立とする。
-        BrNetfilterState::Loaded { .. } => ConditionState::Met,
+        // bridge-nf-call-iptables=1 のときだけ bridge 通過パケットが iptables に渡り、リスクが成立する。
+        // 0 は現時点では渡されないため不成立（将来 sysctl が変わりうることは現在の診断結果と分ける）。
+        // 0 / 1 以外で読めない値は判定不能にする。
+        BrNetfilterState::Loaded {
+            call_iptables: Some(true),
+        } => ConditionState::Met,
+        BrNetfilterState::Loaded {
+            call_iptables: Some(false),
+        } => ConditionState::NotMet,
+        BrNetfilterState::Loaded {
+            call_iptables: None,
+        } => ConditionState::Unknown,
         BrNetfilterState::NotLoaded => ConditionState::NotMet,
         BrNetfilterState::Unknown { .. } => ConditionState::Unknown,
         BrNetfilterState::Unsupported => ConditionState::NotApplicable,
@@ -505,9 +515,14 @@ pub fn evaluate(findings: &DoctorFindings) -> DoctorReport {
                       networks may be dropped and external reachability may be lost"
                 .to_string(),
             remediation: vec![
-                "Allow fandhe-container bridge traffic in Docker's DOCKER-USER chain, e.g. \
-                 \"iptables -I DOCKER-USER -i <bridge> -j ACCEPT\" and \
-                 \"iptables -I DOCKER-USER -o <bridge> -j ACCEPT\""
+                "First check which iptables backend is in use (\"iptables --version\" shows nf_tables or \
+                 legacy) and whether the DOCKER-USER chain exists (\"iptables -S DOCKER-USER\"); \
+                 DOCKER-USER exists only while Docker is running with iptables management enabled"
+                    .to_string(),
+                "If it exists, consider adding narrowly scoped rules to the DOCKER-USER chain for the \
+                 fandhe-container bridge (<bridge>), restricted by source, destination and protocol, \
+                 instead of accepting all forwarded traffic of the bridge, which would bypass \
+                 existing traffic restrictions"
                     .to_string(),
                 "fandhe-container doctor does not modify firewall rules; apply the rules above yourself"
                     .to_string(),
@@ -694,10 +709,10 @@ mod eval_tests {
     #[test]
     fn net10_condition_table_br_netfilter() {
         use ConditionState::*;
-        for c in [Some(true), Some(false), None] {
+        for (c, want) in [(Some(true), Met), (Some(false), NotMet), (None, Unknown)] {
             assert_eq!(
                 br_netfilter_condition(&BrNetfilterState::Loaded { call_iptables: c }),
-                Met
+                want
             );
         }
         assert_eq!(br_netfilter_condition(&BrNetfilterState::NotLoaded), NotMet);
@@ -800,6 +815,28 @@ mod eval_tests {
 
     fn risk() -> DoctorReport {
         evaluate(&f(loaded(), ForwardPolicyState::Policy(ChainPolicy::Drop)))
+    }
+
+    #[test]
+    fn net10_call_iptables_zero_is_no_risk() {
+        let r = evaluate(&f(
+            BrNetfilterState::Loaded {
+                call_iptables: Some(false),
+            },
+            ForwardPolicyState::Policy(ChainPolicy::Drop),
+        ));
+        assert_eq!(r.outcome, DoctorOutcome::NoRisk);
+        assert!(r.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn net10_remediation_checks_first_and_has_no_blanket_accept() {
+        let r = risk();
+        let rem = &r.diagnostics[0].remediation;
+        assert!(
+            rem[0].contains("iptables --version") && rem[0].contains("iptables -S DOCKER-USER")
+        );
+        assert!(rem.iter().all(|x| !x.contains("-j ACCEPT")));
     }
 
     #[test]

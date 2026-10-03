@@ -1248,13 +1248,24 @@ pub(crate) fn attach_container_with<O: AttachOps>(
             report
                 .leftover
                 .push((AttachResource::Address(address), ResourceState::Unknown));
-        } else {
-            // 払い出しと予約を戻す。直前に確保したので失敗しない（失敗しても元のエラーを優先する）。
-            let _ = ipam.release(&spec.endpoint);
-            ports.release(&spec.network, &spec.endpoint);
         }
         rollback_veth(ops, names.host(), host_index, &mut report);
-        return Err(abort(netns, report, f.error, f.step));
+        rollback_netns(ops, netns, &pin, &mut report);
+        if !f.ports_unknown {
+            // veth・netns の後始末が完了したことを確認できた場合に限り、払い出しと予約を戻す。
+            // 資源が残った・結果不明の場合は、設定済みアドレスを持つ資源が生きている可能性があるため、
+            // アドレスと受け口の予約を残して `leftover` で報告する（別コンテナへの再払い出しで衝突させない。
+            // 特権操作の後始末の fail-closed）。解放は呼び出し側が資源の除去を確認してから行う。
+            if report.leftover.is_empty() {
+                let _ = ipam.release(&spec.endpoint);
+                ports.release(&spec.network, &spec.endpoint);
+            } else {
+                report
+                    .leftover
+                    .push((AttachResource::Address(address), ResourceState::Unknown));
+            }
+        }
+        return Err(fail(f.error, f.step, report));
     }
     ops.release_netns_socket(&mut netns);
 
@@ -2762,25 +2773,45 @@ mod attach_tests {
         }
     }
 
-    /// NET-1・TASK-139.3: netns 内の失敗時のロールバック自体が失敗しても元のエラーを保ち、IPAM は解放する。
+    /// NET-1・TASK-139.3: netns 内の失敗時にロールバック自体が失敗しても元のエラーを保ち、資源が残った・
+    /// 結果不明の間は IPAM のアドレスと受け口の予約を保持する（再払い出しで同じ IP を衝突させない）。
     #[test]
-    fn net1_attach_config_failure_with_rollback_failure_keeps_error() {
-        let f = Fake {
-            fail_ns: Some("ns_route"),
-            delete_err: Some(NetErrorCode::Timeout),
-            ..Default::default()
-        };
-        let mut pool = ipam();
-        let e = attach_container_with(&f, &spec("c1"), &mut pool, &mut PortRegistry::new())
-            .unwrap_err();
-        assert_eq!(e.step, AttachStep::DefaultRoute);
-        assert_eq!(e.code(), NetErrorCode::Internal);
-        assert_eq!(
-            e.rollback.leftover,
-            [(AttachResource::Veth(host_of("c1")), ResourceState::Unknown)]
-        );
-        assert_eq!(e.rollback.removed, [AttachResource::Netns(pin_of("c1"))]);
-        assert_eq!(pool.allocated_count(), 0);
+    fn net1_attach_config_failure_with_rollback_failure_keeps_address() {
+        for (delete_err, unpin_fails) in [(Some(NetErrorCode::Timeout), false), (None, true)] {
+            let f = Fake {
+                fail_ns: Some("ns_route"),
+                delete_err,
+                unpin_fails,
+                ..Default::default()
+            };
+            let mut pool = ipam();
+            let mut reg = PortRegistry::new();
+            let s = spec_with_ports("c1", vec![port(8080)]);
+            let e = attach_container_with(&f, &s, &mut pool, &mut reg).unwrap_err();
+            assert_eq!(e.step, AttachStep::DefaultRoute);
+            assert_eq!(e.code(), NetErrorCode::Internal);
+            let addr = pool.address_of(&eid("c1")).unwrap();
+            assert_eq!(pool.allocated_count(), 1);
+            assert_eq!(reg.len(), 1);
+            assert_eq!(
+                e.rollback.leftover.last(),
+                Some(&(AttachResource::Address(addr), ResourceState::Unknown))
+            );
+            if unpin_fails {
+                assert!(
+                    e.rollback
+                        .leftover
+                        .iter()
+                        .any(|(r, _)| matches!(r, AttachResource::Netns(_)))
+                );
+            } else {
+                assert_eq!(e.rollback.removed, [AttachResource::Netns(pin_of("c1"))]);
+                assert_eq!(
+                    e.rollback.leftover[0],
+                    (AttachResource::Veth(host_of("c1")), ResourceState::Unknown)
+                );
+            }
+        }
     }
 
     /// NET-1・TASK-139.3: DNAT バッチが確定的に失敗（`Aborted` / `NotSent`）なら nft 側の残置は報告せず、

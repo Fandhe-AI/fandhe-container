@@ -866,6 +866,9 @@ pub struct AttachedContainer<N> {
     pub host_veth: IfName,
     /// host 側 veth の ifindex（bridge に接続済みで up）。
     pub host_index: IfIndex,
+    /// host 側 veth の `IFLA_IFALIAS` に付けた所有トークン。ifindex は再利用されうるため、削除直前に
+    /// このトークンの一致で元の veth であることを確認する（`delete_network`。TASK-139.4・NET-1）。
+    pub host_token: String,
     /// コンテナ netns に入った peer 側 veth の名前（netns 内での名前。リネーム前）。
     pub peer_veth: IfName,
     /// netns の pin 先パス。
@@ -890,6 +893,8 @@ pub enum AttachStep {
     CreateVeth,
     /// 作成直後の veth の ifindex 解決。
     ResolveIndex,
+    /// host 側 veth への所有トークン（`IFLA_IFALIAS`）の付与。
+    SetOwnerToken,
     /// host 側の bridge への接続（`IFLA_MASTER`）。
     SetMaster,
     /// host 側の up。
@@ -1011,6 +1016,8 @@ pub(crate) trait AttachOps {
     /// bridge の名前から ifindex を引く。`IFLA_IFALIAS` が `token` と一致しない（同名の別 link）
     /// 場合は `FailedPrecondition` で失敗する。
     fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError>;
+    /// `link` の `IFLA_IFALIAS` に所有トークン `token` を設定する。
+    fn set_owner_token(&self, link: IfIndex, token: &str) -> Result<(), NetError>;
     /// `link` を `master`（bridge）へ接続する。
     fn set_master(&self, link: IfIndex, master: IfIndex) -> Result<(), NetError>;
     /// ifindex 指定で up にする。
@@ -1104,9 +1111,10 @@ fn rollback_veth<O: AttachOps>(
 /// default route。TASK-139.3）→ ポート公開（指定があれば DNAT を一括投入）。失敗時は自分が作った
 /// 部分資源（veth・netns・IPAM の払い出し）だけを戻し、元のエラーはロールバックの失敗で上書きしない。
 ///
-/// veth は所有トークン（`IFLA_IFALIAS`）を使えない（`LinkCreate::with_alias` は veth を拒否する）ため、
-/// 「`NLM_F_EXCL` 作成 + 直後の ifindex 確保 + 以降は ifindex 指定」で運用する。作成から解決までの
-/// 極小の窓に同名 link へ差し替えられる残余リスクは残る（`CAP_NET_ADMIN` を持つ者に限られる）。
+/// veth は作成時に `IFLA_IFALIAS` を付けられない（`LinkCreate::with_alias` は veth を拒否する）ため、
+/// 「`NLM_F_EXCL` 作成 + 直後の ifindex 確保 + `RTM_SETLINK` で所有トークンを刻む + 以降は ifindex 指定」で
+/// 運用する。作成から解決・刻印までの極小の窓に同名 link へ差し替えられる残余リスクは残る
+/// （`CAP_NET_ADMIN` を持つ者に限られる）。削除側はトークンの一致を確認してから消す（ifindex は再利用されうる）。
 /// ifindex を解決できなかった場合は名前では削除せず `Unknown` で報告する（fail-closed）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn attach_container_with<O: AttachOps>(
@@ -1220,7 +1228,11 @@ pub(crate) fn attach_container_with<O: AttachOps>(
         }
     };
 
+    // ifindex は再利用されうるため、削除時に元の veth と照合できるよう所有トークンを刻む。
+    let host_token = format!("{}/ep/{}", spec.bridge_token, spec.endpoint.as_str());
     let attach = || {
+        ops.set_owner_token(host_index, &host_token)
+            .map_err(|e| (e, AttachStep::SetOwnerToken))?;
         ops.set_master(host_index, spec.bridge_index)
             .map_err(|e| (e, AttachStep::SetMaster))?;
         ops.set_up(host_index).map_err(|e| (e, AttachStep::SetUp))?;
@@ -1299,6 +1311,7 @@ pub(crate) fn attach_container_with<O: AttachOps>(
         endpoint: spec.endpoint.clone(),
         host_veth: names.host().clone(),
         host_index,
+        host_token,
         peer_veth: names.peer().clone(),
         netns_path: pin,
         address,
@@ -1432,6 +1445,12 @@ impl AttachOps for LinuxAttachOps<'_> {
 
     fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError> {
         self.route.link_index_owned(name, token, self.timeout)
+    }
+
+    fn set_owner_token(&self, link: IfIndex, token: &str) -> Result<(), NetError> {
+        self.route
+            .set_link(&LinkSet::set_alias(link_ref(link)?, token)?, self.timeout)
+            .map(|_| ())
     }
 
     fn set_master(&self, link: IfIndex, master: IfIndex) -> Result<(), NetError> {
@@ -2228,6 +2247,10 @@ mod attach_tests {
             }
             self.link_index(name)
         }
+        fn set_owner_token(&self, link: IfIndex, token: &str) -> Result<(), NetError> {
+            self.rec(format!("set_owner_token {} {}", link.get(), token));
+            Ok(())
+        }
         fn set_master(&self, link: IfIndex, master: IfIndex) -> Result<(), NetError> {
             self.rec(format!("set_master {} {}", link.get(), master.get()));
             if self.fail_master {
@@ -2398,6 +2421,7 @@ mod attach_tests {
                 format!("create_veth {} {}", n.host().as_str(), n.peer().as_str()),
                 format!("link_index {}", n.host().as_str()),
                 format!("link_index {}", n.peer().as_str()),
+                "set_owner_token 21 fandhe-net:web:1:0:0/ep/web-1".to_owned(),
                 "set_master 21 7".to_owned(),
                 "set_up 21".to_owned(),
                 "move_to_netns 22".to_owned(),

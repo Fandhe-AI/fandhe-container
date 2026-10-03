@@ -353,6 +353,10 @@ enum SetKind<'a> {
         link: LinkRef,
         master: IfIndex,
     },
+    SetAlias {
+        link: LinkRef,
+        alias: &'a str,
+    },
 }
 
 /// `RTM_SETLINK` によるリンク設定要求（netns 移動・up）。
@@ -379,6 +383,19 @@ impl<'a> LinkSet<'a> {
         Self(SetKind::SetMaster { link, master })
     }
 
+    /// リンクに `IFLA_IFALIAS`（所有トークン）を設定する要求（TASK-139.4・#317・NET-1）。veth は作成時に
+    /// 別名を付けられないため、作成直後に ifindex 指定でこの要求を送って所有を刻む。トークンは
+    /// [`LinkCreate::with_alias`] と同じ制約（1〜255 バイトの可視 ASCII）で、違反は `InvalidArgument`。
+    pub fn set_alias(link: LinkRef, alias: &'a str) -> Result<Self, NetError> {
+        if alias.is_empty() || alias.len() > IFALIAS_MAX_LEN {
+            return Err(invalid("link alias length must be 1 to 255 bytes"));
+        }
+        if !alias.bytes().all(|c| c.is_ascii_graphic()) {
+            return Err(invalid("link alias must be visible ASCII"));
+        }
+        Ok(Self(SetKind::SetAlias { link, alias }))
+    }
+
     /// `nlmsg_type`（常に `RTM_SETLINK`）。
     pub fn msg_type(&self) -> u16 {
         RTM_SETLINK
@@ -392,7 +409,9 @@ impl<'a> LinkSet<'a> {
     /// nlmsghdr の後ろに続く `ifinfomsg` と属性を `b` へ書き込む。
     pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
         let (link, flags, change) = match &self.0 {
-            SetKind::MoveToNetns { link, .. } | SetKind::SetMaster { link, .. } => (link, 0, 0),
+            SetKind::MoveToNetns { link, .. }
+            | SetKind::SetMaster { link, .. }
+            | SetKind::SetAlias { link, .. } => (link, 0, 0),
             SetKind::Up { link } => (link, IFF_UP, IFF_UP),
         };
         let (index, name) = match link {
@@ -411,6 +430,9 @@ impl<'a> LinkSet<'a> {
         }
         if let SetKind::SetMaster { master, .. } = &self.0 {
             b.put_attr(IFLA_MASTER, &master.get().to_ne_bytes())?;
+        }
+        if let SetKind::SetAlias { alias, .. } = &self.0 {
+            b.put_attr(IFLA_IFALIAS, &nul_terminated(alias.as_bytes()))?;
         }
         Ok(())
     }
@@ -932,6 +954,33 @@ mod tests {
                 (IFLA_MASTER, 3u32.to_ne_bytes().to_vec())
             ]
         );
+    }
+
+    /// NET-1・TASK-139.4: veth の所有トークンは ifindex 指定の SETLINK で IFLA_IFALIAS に NUL 終端で載る。
+    #[test]
+    fn net1_setlink_set_alias_encodes_nul_terminated_alias() {
+        let req = LinkSet::set_alias(
+            LinkRef::Index(LinkIndex::new(5).unwrap()),
+            "fandhe-net:web/ep/c1",
+        )
+        .unwrap();
+        let (ifi, attrs) = set_attrs(&build_set(&req));
+        assert_eq!(ifi.get(4..8).unwrap(), &5i32.to_ne_bytes());
+        assert_eq!(
+            attrs,
+            vec![(IFLA_IFALIAS, b"fandhe-net:web/ep/c1\0".to_vec())]
+        );
+    }
+
+    /// NET-1・TASK-139.4: 空・長すぎる・可視 ASCII 以外の別名は InvalidArgument。
+    #[test]
+    fn net1_setlink_set_alias_rejects_invalid_alias() {
+        let link = || LinkRef::Name(name("veth0"));
+        let long = "a".repeat(IFALIAS_MAX_LEN + 1);
+        for bad in ["", "a b", "a\0b", long.as_str()] {
+            let e = LinkSet::set_alias(link(), bad).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument, "{bad:?}");
+        }
     }
 
     /// NET-11: up は flags と change の両方に IFF_UP だけを立てる。

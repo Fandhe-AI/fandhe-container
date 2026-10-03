@@ -756,18 +756,20 @@ mod socket {
             }
         }
 
-        /// 名前から ifindex と所属先 master（`IFLA_MASTER`）の ifindex を引く（TASK-139.4・#317）。
-        /// master が無い link は `None`。veth を削除する直前に bridge への所属を照合して、同名の別 link を
-        /// 巻き込まないために使う。
-        pub fn link_index_and_master(
+        /// 名前から ifindex・所属先 master（`IFLA_MASTER`）の ifindex・別名（`IFLA_IFALIAS`）を引く
+        /// （TASK-139.4・#317）。master / 別名が無い link は `None`。veth を削除する直前に所有トークンと
+        /// bridge への所属を照合して、同名の別 link を巻き込まないために使う。
+        #[allow(clippy::type_complexity)]
+        pub fn link_index_master_alias(
             &self,
             name: &IfName,
             timeout: Duration,
-        ) -> Result<(IfIndex, Option<IfIndex>), NetError> {
+        ) -> Result<(IfIndex, Option<IfIndex>, Option<String>), NetError> {
             let msg = self.get_link_message(name, timeout)?;
             let index = decode_ifinfomsg_index(&msg)?;
             let master = decode_ifinfomsg_master(&msg)?;
-            Ok((index, master))
+            let alias = decode_ifinfomsg_alias(&msg)?;
+            Ok((index, master, alias))
         }
 
         fn get_link_message(&self, name: &IfName, timeout: Duration) -> Result<Vec<u8>, NetError> {

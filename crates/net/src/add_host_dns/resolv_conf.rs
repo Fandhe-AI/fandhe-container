@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{InputViolation, parse_ip_addr};
 use crate::error::{NetError, NetErrorCode};
+use crate::instrument::{NetOpKind, NetOpRecorder, record_net_op};
 use crate::network_mode::NetworkMode;
 
 /// `--dns` の上限件数（無制限確保の防止）。glibc は先頭 3 件（MAXNS）しか使わない。
@@ -41,12 +42,28 @@ pub struct ResolvConfPlan {
     nameservers: Vec<IpAddr>,
 }
 
+/// 書き込み完了時に保証できる永続化の範囲（OS ごとに異なる。3 OS 対応）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PersistGuarantee {
+    /// ファイル本体の fsync に加え、rename の反映先である親ディレクトリも fsync 済み（unix）。
+    Durable,
+    /// ファイル本体は fsync 済みで rename による置換は原子的だが、rename（ディレクトリエントリ）の
+    /// 永続化は保証しない（unix 以外。Windows では std が親ディレクトリの flush / `MOVEFILE_WRITE_THROUGH`
+    /// を提供せず、`windows-sys` は依存承認前のため未使用。電源断直後は旧内容に戻りうる）。
+    ContentOnly,
+}
+
 /// [`apply_dns`] の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DnsApplyOutcome {
     /// `count` 件の nameserver を書き込んだ。
-    Written { count: usize },
+    Written {
+        count: usize,
+        /// 永続化の保証範囲（OS 依存）。
+        persistence: PersistGuarantee,
+    },
     /// 書き込む対象がなかった（`--dns` 未指定）。ファイルには触れていない。
     NotRequested,
 }
@@ -103,11 +120,26 @@ impl ResolvConfPlan {
 
     /// 原子的に書き込む（呼び出しごとに固有の tmp + `create_new` + 0644 明示 + fsync + rename + 親ディレクトリ fsync）。
     ///
+    /// 成功時の戻り値が永続化の保証範囲を表す: unix は [`PersistGuarantee::Durable`]、それ以外は
+    /// [`PersistGuarantee::ContentOnly`]（親ディレクトリ fsync を行わない）。
+    ///
+    /// 成功・失敗と所要時間を `recorder` へ [`NetOpKind::DnsResolvConfWrite`] として 1 件記録する（REPAIR-4）。
+    ///
     /// 親ディレクトリの open / fsync に失敗した場合も `INTERNAL` を返す（rename 済みのため内容は置換済みだが、
     /// 永続化は保証されない）。
     ///
     /// 本文は高々 `MAX_DNS_SERVERS` 行なので追加の長さ検査は不要。失敗は固定メッセージの `INTERNAL`。
-    pub fn write_to(&self, path: &Path) -> Result<(), NetError> {
+    pub fn write_to(
+        &self,
+        path: &Path,
+        recorder: &dyn NetOpRecorder,
+    ) -> Result<PersistGuarantee, NetError> {
+        record_net_op(recorder, NetOpKind::DnsResolvConfWrite, || {
+            self.write_unrecorded(path)
+        })
+    }
+
+    fn write_unrecorded(&self, path: &Path) -> Result<PersistGuarantee, NetError> {
         let werr = || NetError::new(NetErrorCode::Internal, "failed to write resolv.conf");
         // 呼び出しごとに固有の一時ファイル名（pid + プロセス内カウンタ + 時刻）を同一ディレクトリに作る。
         // 固定名だと同一 path への同時書き込みが互いの tmp を削除・上書きして壊れるため。
@@ -148,7 +180,7 @@ impl ResolvConfPlan {
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(tmp);
-            return result;
+            return result.map(|()| PersistGuarantee::ContentOnly);
         }
         // 永続化保証（親ディレクトリ fsync）に失敗した場合は成功を装わずエラーにする。
         #[cfg(unix)]
@@ -161,8 +193,12 @@ impl ResolvConfPlan {
             std::fs::File::open(dir)
                 .and_then(|d| d.sync_all())
                 .map_err(|_| werr())?;
+            Ok(PersistGuarantee::Durable)
         }
-        Ok(())
+        #[cfg(not(unix))]
+        {
+            Ok(PersistGuarantee::ContentOnly)
+        }
     }
 }
 
@@ -172,26 +208,42 @@ impl ResolvConfPlan {
 /// 宛先は無変更だが、rename 後の親ディレクトリ open / fsync の失敗では宛先が置換済みのまま `Err`
 /// になり得る（置換は済んでいるが永続化は保証されない）。呼び出し側は `Err` でも内容が更新済みの可能性を
 /// 前提にすること（NET-12・NET-6）。
+///
+/// 検証 + 書き込み全体を 1 件として `recorder` へ [`NetOpKind::DnsResolvConfWrite`] で記録する（成功・失敗件数と
+/// レイテンシ。REPAIR-4）。`--dns` 未指定（no-op）は成功として記録する。
 pub fn apply_dns(
     mode: NetworkMode,
     dns: &[&str],
     path: &Path,
+    recorder: &dyn NetOpRecorder,
 ) -> Result<DnsApplyOutcome, NetError> {
-    match ResolvConfPlan::for_mode(mode, dns)? {
-        None => Ok(DnsApplyOutcome::NotRequested),
-        Some(plan) => {
-            plan.write_to(path)?;
-            Ok(DnsApplyOutcome::Written {
-                count: plan.nameservers().len(),
-            })
-        }
-    }
+    record_net_op(
+        recorder,
+        NetOpKind::DnsResolvConfWrite,
+        || match ResolvConfPlan::for_mode(mode, dns)? {
+            None => Ok(DnsApplyOutcome::NotRequested),
+            Some(plan) => {
+                let persistence = plan.write_unrecorded(path)?;
+                Ok(DnsApplyOutcome::Written {
+                    count: plan.nameservers().len(),
+                    persistence,
+                })
+            }
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instrument::testing::Collect;
+    use crate::instrument::{NetOpOutcome, NoopNetOpRecorder};
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    const EXPECTED_PERSIST: PersistGuarantee = PersistGuarantee::Durable;
+    #[cfg(not(unix))]
+    const EXPECTED_PERSIST: PersistGuarantee = PersistGuarantee::ContentOnly;
 
     struct Dir(PathBuf);
     impl Dir {
@@ -236,9 +288,16 @@ mod tests {
             NetworkMode::Host,
             &["192.0.2.53", "2001:db8::53"],
             &d.file(),
+            &NoopNetOpRecorder,
         )
         .unwrap();
-        assert_eq!(out, DnsApplyOutcome::Written { count: 2 });
+        assert_eq!(
+            out,
+            DnsApplyOutcome::Written {
+                count: 2,
+                persistence: EXPECTED_PERSIST
+            }
+        );
         assert_eq!(
             std::fs::read_to_string(d.file()).unwrap(),
             body(&["192.0.2.53", "2001:db8::53"])
@@ -259,8 +318,14 @@ mod tests {
     fn none_accepts_loopback() {
         for ip in ["127.0.0.1", "127.255.255.254", "::1"] {
             let d = Dir::new("noneok");
-            let out = apply_dns(NetworkMode::None, &[ip], &d.file()).unwrap();
-            assert_eq!(out, DnsApplyOutcome::Written { count: 1 });
+            let out = apply_dns(NetworkMode::None, &[ip], &d.file(), &NoopNetOpRecorder).unwrap();
+            assert_eq!(
+                out,
+                DnsApplyOutcome::Written {
+                    count: 1,
+                    persistence: EXPECTED_PERSIST
+                }
+            );
             assert_eq!(std::fs::read_to_string(d.file()).unwrap(), body(&[ip]));
         }
     }
@@ -270,7 +335,13 @@ mod tests {
     fn none_rejects_non_loopback_without_side_effect() {
         let d = Dir::new("nonerej");
         std::fs::write(d.file(), b"keep\n").unwrap();
-        let e = apply_dns(NetworkMode::None, &["8.8.8.8"], &d.file()).unwrap_err();
+        let e = apply_dns(
+            NetworkMode::None,
+            &["8.8.8.8"],
+            &d.file(),
+            &NoopNetOpRecorder,
+        )
+        .unwrap_err();
         assert_not_loopback(&e);
         assert_eq!(std::fs::read(d.file()).unwrap(), b"keep\n");
         assert_eq!(std::fs::read_dir(&d.0).unwrap().count(), 1);
@@ -297,9 +368,21 @@ mod tests {
     fn all_or_nothing() {
         let d = Dir::new("aon");
         std::fs::write(d.file(), b"keep\n").unwrap();
-        let e = apply_dns(NetworkMode::None, &["127.0.0.1", "8.8.8.8"], &d.file()).unwrap_err();
+        let e = apply_dns(
+            NetworkMode::None,
+            &["127.0.0.1", "8.8.8.8"],
+            &d.file(),
+            &NoopNetOpRecorder,
+        )
+        .unwrap_err();
         assert_not_loopback(&e);
-        let e = apply_dns(NetworkMode::Host, &["192.0.2.1", "bad\nvalue"], &d.file()).unwrap_err();
+        let e = apply_dns(
+            NetworkMode::Host,
+            &["192.0.2.1", "bad\nvalue"],
+            &d.file(),
+            &NoopNetOpRecorder,
+        )
+        .unwrap_err();
         assert_eq!(e.message(), InputViolation::ControlOrWhitespace.message());
         assert!(!e.message().contains("bad"));
         assert_eq!(std::fs::read(d.file()).unwrap(), b"keep\n");
@@ -326,13 +409,13 @@ mod tests {
         let d = Dir::new("empty");
         for m in [NetworkMode::Host, NetworkMode::None] {
             assert_eq!(
-                apply_dns(m, &[], &d.file()).unwrap(),
+                apply_dns(m, &[], &d.file(), &NoopNetOpRecorder).unwrap(),
                 DnsApplyOutcome::NotRequested
             );
             assert!(!d.file().exists());
         }
         std::fs::write(d.file(), b"keep\n").unwrap();
-        apply_dns(NetworkMode::Host, &[], &d.file()).unwrap();
+        apply_dns(NetworkMode::Host, &[], &d.file(), &NoopNetOpRecorder).unwrap();
         assert_eq!(std::fs::read(d.file()).unwrap(), b"keep\n");
     }
 
@@ -341,7 +424,13 @@ mod tests {
     fn bridge_is_unimplemented() {
         let d = Dir::new("bridge");
         std::fs::write(d.file(), b"keep\n").unwrap();
-        let e = apply_dns(NetworkMode::Bridge, &["192.0.2.1"], &d.file()).unwrap_err();
+        let e = apply_dns(
+            NetworkMode::Bridge,
+            &["192.0.2.1"],
+            &d.file(),
+            &NoopNetOpRecorder,
+        )
+        .unwrap_err();
         assert_eq!(e.code().as_str(), "UNIMPLEMENTED");
         assert_eq!(std::fs::read(d.file()).unwrap(), b"keep\n");
     }
@@ -355,7 +444,13 @@ mod tests {
         let target = d.0.join("target");
         std::fs::write(&target, b"victim\n").unwrap();
         std::os::unix::fs::symlink(&target, d.file()).unwrap();
-        apply_dns(NetworkMode::Host, &["192.0.2.1"], &d.file()).unwrap();
+        apply_dns(
+            NetworkMode::Host,
+            &["192.0.2.1"],
+            &d.file(),
+            &NoopNetOpRecorder,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"victim\n");
         let md = std::fs::symlink_metadata(d.file()).unwrap();
         assert!(md.file_type().is_file());
@@ -376,7 +471,13 @@ mod tests {
         let d = Dir::new("mode");
         std::fs::write(d.file(), b"old\n").unwrap();
         std::fs::set_permissions(d.file(), std::fs::Permissions::from_mode(0o600)).unwrap();
-        apply_dns(NetworkMode::Host, &["192.0.2.1"], &d.file()).unwrap();
+        apply_dns(
+            NetworkMode::Host,
+            &["192.0.2.1"],
+            &d.file(),
+            &NoopNetOpRecorder,
+        )
+        .unwrap();
         let md = std::fs::metadata(d.file()).unwrap();
         assert_eq!(md.permissions().mode() & 0o777, 0o644);
         assert_eq!(std::fs::read_dir(&d.0).unwrap().count(), 1);
@@ -393,7 +494,8 @@ mod tests {
                 std::thread::spawn(move || {
                     let ip = format!("192.0.2.{}", i + 1);
                     for _ in 0..20 {
-                        apply_dns(NetworkMode::Host, &[ip.as_str()], &p).unwrap();
+                        apply_dns(NetworkMode::Host, &[ip.as_str()], &p, &NoopNetOpRecorder)
+                            .unwrap();
                     }
                 })
             })
@@ -415,6 +517,46 @@ mod tests {
         assert_eq!(
             plan.render(),
             "# Generated by fandhe-container (NET-12)\nnameserver 192.0.2.1\nnameserver 192.0.2.1\n"
+        );
+    }
+
+    /// REPAIR-4・NET-12: 成功・検証失敗・no-op が操作種別 `dns.resolv_conf.write` で 1 件ずつ記録される。
+    #[test]
+    fn repair4_apply_dns_records_each_call_once() {
+        let d = Dir::new("rec");
+        let c = Collect::default();
+        apply_dns(NetworkMode::Host, &["192.0.2.1"], &d.file(), &c).unwrap();
+        apply_dns(NetworkMode::None, &["8.8.8.8"], &d.file(), &c).unwrap_err();
+        apply_dns(NetworkMode::Host, &[], &d.file(), &c).unwrap();
+        let k = NetOpKind::DnsResolvConfWrite;
+        assert_eq!(
+            c.kinds(),
+            vec![
+                (k, NetOpOutcome::Success),
+                (k, NetOpOutcome::Failure),
+                (k, NetOpOutcome::Success),
+            ]
+        );
+    }
+
+    /// REPAIR-4・NET-12: write_to は 1 件記録し、書き込み失敗（親ディレクトリ不在）は Failure。
+    #[test]
+    fn repair4_write_to_records_and_returns_guarantee() {
+        let d = Dir::new("recw");
+        let c = Collect::default();
+        let plan = ResolvConfPlan::for_mode(NetworkMode::Host, &["192.0.2.1"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.write_to(&d.file(), &c).unwrap(), EXPECTED_PERSIST);
+        let missing = d.0.join("nodir").join("resolv.conf");
+        assert_eq!(
+            plan.write_to(&missing, &c).unwrap_err().code().as_str(),
+            "INTERNAL"
+        );
+        let k = NetOpKind::DnsResolvConfWrite;
+        assert_eq!(
+            c.kinds(),
+            vec![(k, NetOpOutcome::Success), (k, NetOpOutcome::Failure)]
         );
     }
 }

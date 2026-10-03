@@ -8,7 +8,8 @@
 //! さらに要求 1 件の往復として、seq 採番（`SeqAllocator`）・`NLMSG_ERROR` の復号
 //! （[`decode_nlmsgerr`]）・seq 一致の ACK / エラー判定・全体期限つきの応答待ち
 //! （`NetlinkRouteSocket::request`。Linux のみ。TASK-136.2.2・#844・REPAIR-5）を提供する。
-//! link 操作（#845・#846）が本層を呼ぶ。address / route 操作（`addr_route` モジュール。
+//! bridge・veth の作成メッセージ（`RTM_NEWLINK`。[`LinkCreate`]。TASK-136.3.1・#845）も組み立てる。
+//! link の送信ラッパー（#846）が本層を呼ぶ。address / route 操作（`addr_route` モジュール。
 //! `AddressSpec`・`RouteSpec`・`add_address`・`add_route`。TASK-136.4・#301）も本層の上に載る。
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
@@ -17,7 +18,7 @@
 //! - 自ソケットの `nl_pid` 取得（`getsockname`）と応答 `nlmsg_pid` の照合。マルチキャスト購読が
 //!   なく送信元がカーネルであることは `recv` が検証済みのため、現状は seq 照合で足りる
 //! - dump 中断（`NLM_F_DUMP_INTR`）の自動再試行（検出して `FailedPrecondition` で返すのみ）、複数スレッドでの seq 別の待機者振り分け（往復は 1 件ずつ直列化する）
-//! - link の各操作（#845・#846）。address / route の未実装範囲は `addr_route` の doc を参照
+//! - link 作成メッセージの送信ラッパー・netns 移動・up（`RTM_SETLINK`。#846）。address / route の未実装範囲は `addr_route` の doc を参照
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -27,6 +28,8 @@ pub use crate::netlink::*;
 
 mod addr_route;
 pub use addr_route::*;
+mod link;
+pub use link::*;
 
 /// 要求の `nlmsg_seq` を採番する（NET-11・TASK-136.2.2）。
 ///
@@ -803,6 +806,7 @@ mod socket {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::netlink_route::{RTM_GETLINK, RTM_NEWLINK};
 
         /// NET-11: errno 写像の具体値。
         #[test]
@@ -834,9 +838,6 @@ mod socket {
                 "UNIMPLEMENTED: poll: unsupported architecture"
             );
         }
-
-        const RTM_NEWLINK: u16 = 16;
-        const RTM_GETLINK: u16 = 18;
 
         /// lo（ifindex 1）1 件だけを問い合わせる非 dump の RTM_GETLINK。非特権で成立し、カーネルは
         /// RTM_NEWLINK 1 件を 1 データグラムで返す（NLM_F_ACK なしのため ACK は返らない）。

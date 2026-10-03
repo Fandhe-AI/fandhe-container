@@ -34,6 +34,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::cell::Cell;
     use std::fs::File;
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::fd::AsFd as _;
@@ -242,14 +243,22 @@ mod linux {
             lines: rx,
         };
 
+        // 本試験が host 側に作成して未移動の veth がある間だけ true。作成成功を確認できた場合に限り
+        // 後始末で削除する（同名の既存 host インターフェースを誤って消さないため。P0）。
+        let host_veth_owned = Cell::new(false);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            scenario(&sock, &mut guard, pid, &a, &b, deadline)
+            scenario(&sock, &mut guard, pid, &a, &b, deadline, &host_veth_owned)
         }));
-        // 移動前に失敗した場合に host へ残る veth を片付ける（NotFound は想定内）。
-        match del_link(&sock, &a) {
-            Ok(()) => eprintln!("link_netns_privileged: cleaned up leftover veth on host"),
-            Err(e) if e.code() == NetErrorCode::NotFound => {}
-            Err(e) => eprintln!("link_netns_privileged: cleanup failed: {e}"),
+        // 移動前に失敗した場合に host へ残る veth を片付ける（本試験が作成したものに限る）。
+        if host_veth_owned.get() {
+            // a だけ移動済みで b が host に残る経路もあるため、両名を試す（NotFound は想定内）。
+            for n in [&a, &b] {
+                match del_link(&sock, n) {
+                    Ok(()) => eprintln!("link_netns_privileged: cleaned up leftover veth on host"),
+                    Err(e) if e.code() == NetErrorCode::NotFound => {}
+                    Err(e) => eprintln!("link_netns_privileged: cleanup failed: {e}"),
+                }
+            }
         }
         drop(guard);
         if let Err(p) = result {
@@ -265,14 +274,22 @@ mod linux {
         a: &str,
         b: &str,
         deadline: Instant,
+        host_veth_owned: &Cell<bool>,
     ) {
         assert_eq!(guard.next_line(deadline), "ready");
 
+        // 既存の host インターフェースと名前が衝突していないことを作成前に確認する。
+        for n in [a, b] {
+            let e = get_link_flags(sock, n)
+                .expect_err("interface name already exists on host; refusing to proceed");
+            assert_eq!(e.code(), NetErrorCode::NotFound, "{n}");
+        }
         sock.create_link(
             &LinkCreate::veth(name(a), name(b)).expect("veth request"),
             timeout(),
         )
         .expect("create veth pair");
+        host_veth_owned.set(true);
 
         // a は PID 指定、b は ns fd 指定で子の netns へ移動する。
         let by_pid = NetnsTarget::Pid(NetnsPid::new(pid).expect("child pid"));
@@ -288,6 +305,8 @@ mod linux {
             timeout(),
         )
         .expect("move b by fd");
+        // 両端が host から消えたため、以降の後始末対象ではない。
+        host_veth_owned.set(false);
 
         // host からは両端が消え、子の netns に現れる。
         for n in [a, b] {

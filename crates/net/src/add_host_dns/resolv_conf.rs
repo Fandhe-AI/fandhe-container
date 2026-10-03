@@ -152,7 +152,12 @@ impl ResolvConfPlan {
         }
         // 永続化保証（親ディレクトリ fsync）に失敗した場合は成功を装わずエラーにする。
         #[cfg(unix)]
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        {
+            // 相対パス（`resolv.conf` 等）は `parent()` が空パスになるため、カレントディレクトリ（`.`）を fsync する。
+            let dir = match path.parent() {
+                Some(d) if !d.as_os_str().is_empty() => d,
+                _ => Path::new("."),
+            };
             std::fs::File::open(dir)
                 .and_then(|d| d.sync_all())
                 .map_err(|_| werr())?;

@@ -541,16 +541,40 @@ fn inconclusive_diagnostic(
         remediation.push("Re-run as a user that can read /proc/sys/net (e.g. root)".to_string());
     }
     if b == ConditionState::Unknown {
-        let code = match &findings.forward_policy {
-            ForwardPolicyState::PermissionDenied => "PERMISSION_DENIED",
-            ForwardPolicyState::Unknown { reason } => reason.code.as_str(),
-            ForwardPolicyState::Policy(_) => "UNRECOGNIZED_POLICY",
-            _ => "LEGACY_IPTABLES_POLICY_UNAVAILABLE",
+        // 原因別に診断コードと案内を分ける。権限不足以外は root で再実行しても解消しないため、
+        // CAP_NET_ADMIN の案内を出さない（誤誘導の防止）。
+        let (code, advice) = match &findings.forward_policy {
+            ForwardPolicyState::PermissionDenied => (
+                "PERMISSION_DENIED",
+                "Re-run with CAP_NET_ADMIN (e.g. as root) to read the FORWARD chain policy",
+            ),
+            ForwardPolicyState::Unknown { reason } => (
+                reason.code.as_str(),
+                "Check the probe error code above; the FORWARD chain policy could not be read",
+            ),
+            ForwardPolicyState::Policy(_) => (
+                "UNRECOGNIZED_POLICY",
+                "The kernel reported an unrecognized FORWARD policy value; check it with \"nft list chain ip filter FORWARD\"",
+            ),
+            ForwardPolicyState::NotFoundInNftables {
+                legacy_iptables_filter: Some(true),
+            } => (
+                "LEGACY_IPTABLES_POLICY_UNREAD",
+                "Legacy iptables filter table exists but its FORWARD policy is not read by this version; check it with \"iptables -S FORWARD\" (running as root does not help)",
+            ),
+            ForwardPolicyState::NotFoundInNftables {
+                legacy_iptables_filter: None,
+            } => (
+                "LEGACY_IPTABLES_STATE_UNKNOWN",
+                "Whether a legacy iptables filter table exists could not be determined; check it with \"iptables -S FORWARD\" (running as root does not help)",
+            ),
+            _ => (
+                "FORWARD_POLICY_UNAVAILABLE",
+                "Check the FORWARD chain policy manually with \"iptables -S FORWARD\"",
+            ),
         };
         reasons.push(format!("forward policy could not be determined ({code})"));
-        remediation.push(
-            "Re-run with CAP_NET_ADMIN (e.g. as root) to read the FORWARD chain policy".to_string(),
-        );
+        remediation.push(advice.to_string());
     }
     DoctorDiagnostic {
         severity: DoctorSeverity::Notice,
@@ -643,6 +667,8 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// 評価層（`evaluate`）のテスト。実機に依存しない純粋関数のため全 OS で実行される
+/// （Linux 限定の実機プローブテストは後続の `tests` モジュール）。
 #[cfg(test)]
 mod eval_tests {
     use super::*;
@@ -852,10 +878,30 @@ mod eval_tests {
     }
 
     #[test]
+    fn net10_inconclusive_legacy_codes_are_distinct() {
+        for (legacy, code) in [
+            (Some(true), "LEGACY_IPTABLES_POLICY_UNREAD"),
+            (None, "LEGACY_IPTABLES_STATE_UNKNOWN"),
+        ] {
+            let r = evaluate(&f(
+                loaded(),
+                ForwardPolicyState::NotFoundInNftables {
+                    legacy_iptables_filter: legacy,
+                },
+            ));
+            let d = &r.diagnostics[0];
+            assert_eq!(d.code, "DIAGNOSIS_INCONCLUSIVE");
+            assert!(d.message.contains(code), "{}", d.message);
+            assert!(!d.remediation[0].contains("CAP_NET_ADMIN"));
+        }
+    }
+
+    #[test]
     fn net10_json_escape() {
         assert_eq!(json_escape("a\"b\\c\nd\u{1}"), "a\\\"b\\\\c\\nd\\u0001");
     }
 }
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

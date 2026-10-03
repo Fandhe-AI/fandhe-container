@@ -926,8 +926,8 @@ fn rollback_netns<O: AttachOps>(
 ) {
     match ops.unpin_netns(ns) {
         Ok(()) => report.removed.push(AttachResource::Netns(pin.to_owned())),
-        // ハンドルはここで手放すが、pin のマウントは fd と独立に残るため、報告した pin パスから
-        // `netns::unpin_path`（公開・冪等）で解除をやり直せる。
+        // ハンドルはここで手放すが、pin のマウントは fd と独立に残るため、同じプロセス内なら報告した
+        // pin パスから `netns::unpin_path`（公開・冪等。所有記録のある pin だけを扱う）で解除をやり直せる。
         Err(UnpinFailure { error, netns }) => {
             drop(netns);
             let state = if is_indeterminate(error.code()) {

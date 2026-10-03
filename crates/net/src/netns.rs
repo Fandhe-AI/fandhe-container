@@ -33,6 +33,10 @@
 //!   `MS_SHARED` の自己 bind にする処理は行わない。判定は `/proc/self/mountinfo` から行い、
 //!   判定できなければ拒否する
 //! - 解除（`unpin`）が失敗したら `ContainerNetns` を呼び出し側へ返す（再試行可能）
+//! - 解除（`unpin_path`）は、本プロセスが作成して未解除の pin（プロセス内の所有記録 `PINS` と照合できる
+//!   もの）だけを対象にする。記録の無いファイル・マウントは形が pin と同じでも削除・アンマウントしない
+//!   （fail-closed）。作成プロセスの終了後・再起動後の残置 pin の清掃は、永続的な所有記録と照合する設計
+//!   （TASK-139.4）で扱い、それまでは本 API からは解除できない
 //!
 //! # 権限
 //!
@@ -239,7 +243,19 @@ fn check_base_dir_propagation(base: &Path) -> Result<(), NetError> {
 }
 
 /// 作った pin ファイルを消す（消せたら `PINS` の記録も外す）。失敗は `Present`（残っていると分かる）で報告する。
+///
+/// 削除の直前にパスの実体が作成時の `fid` であることを照合し、別の実体へ差し替わっていれば消さない
+/// （`Unknown`。作成した pin の所在が分からないため）。記録の無いものを消さない点は `unpin_path` と同じ。
 fn remove_pin_file(pin: &Path, fid: FileId) -> Option<ResourceState> {
+    match fs::symlink_metadata(pin) {
+        Ok(m) if file_id(&m) == fid => {}
+        Ok(_) => return Some(ResourceState::Unknown),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            forget_pin(fid);
+            return None;
+        }
+        Err(_) => return Some(ResourceState::Present),
+    }
     match fs::remove_file(pin) {
         Ok(()) => {
             forget_pin(fid);
@@ -272,21 +288,27 @@ pub(crate) fn create_pinned(
         .mode(0o400)
         .open(&pin)
         .map_err(|e| fail(io_error("create netns pin file", &e), None))?;
-    // 作成時の mode は umask で削られうる（例: umask 0777 → 0000）。`check_pin_file_attrs` が要求する
-    // 厳密な 0o400 にするため、保持した fd（fchmod）で明示設定する。パスは再解決しない。
-    if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o400)) {
-        let leftover = fs::remove_file(&pin).err().map(|_| ResourceState::Present);
-        return Err(fail(io_error("chmod netns pin file", &e), leftover));
-    }
-    // 作成した実体の識別子を記録する。`unpin_path` が「本モジュールが作った pin」だけを対象にする根拠。
+    // 作成した実体の識別子を記録する。`unpin_path` が「本モジュールが作った pin」だけを対象にする根拠で、
+    // 以降の失敗時の削除（`remove_pin_file`）も、この識別子と一致する実体だけを消す。
     let fid = match file.metadata() {
         Ok(m) => file_id(&m),
         Err(e) => {
-            let leftover = fs::remove_file(&pin).err().map(|_| ResourceState::Present);
-            return Err(fail(io_error("stat netns pin file", &e), leftover));
+            // 識別子を取れないので照合つきの削除ができない。消さずに残置として報告する（fail-closed）。
+            return Err(fail(
+                io_error("stat netns pin file", &e),
+                Some(ResourceState::Present),
+            ));
         }
     };
     register_pin(fid);
+    // 作成時の mode は umask で削られうる（例: umask 0777 → 0000）。`check_pin_file_attrs` が要求する
+    // 厳密な 0o400 にするため、保持した fd（fchmod）で明示設定する。パスは再解決しない。
+    if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o400)) {
+        return Err(fail(
+            io_error("chmod netns pin file", &e),
+            remove_pin_file(&pin, fid),
+        ));
+    }
     let target = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|_| {
         fail(
             NetError::new(NetErrorCode::Internal, "invalid pin target"),
@@ -403,19 +425,21 @@ pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetn
 /// pin パスだけから netns の pin を解除する（`ContainerNetns` を手放した後の再試行用）。
 ///
 /// ロールバックで `unpin` が失敗するとハンドルは破棄され、マウントとファイルだけが残る。接続失敗の
-/// 報告（`AttachRollbackReport::leftover`）に載った pin パスをここへ渡すと、アンマウントとファイル削除を
-/// やり直せる。すでに消えている（`ENOENT`）場合は成功扱い（冪等）。
+/// 報告（`AttachRollbackReport::leftover`）に載った pin パスを、同じプロセス内でここへ渡すと、アンマウントと
+/// ファイル削除をやり直せる（所有記録は解除に成功するまで残る）。すでに消えている（`ENOENT`）場合は
+/// 成功扱い（冪等）。
 ///
 /// 任意ファイルの削除・他者の pin の解除を防ぐため（P0）、次のすべてを満たす pin だけを対象にする（fail-closed）。
 /// - 絶対パスで、親ディレクトリが置き場の検証（symlink でない・group / other 書き込み不可・実効 UID 所有）に通る。
 ///   親ディレクトリは開いた fd で固定し、以降の操作は `/proc/self/fd/<dirfd>/<名前>` 経由で行う
 ///   （検査後に親のパスが差し替えられても、検査した同じディレクトリに対してだけ作用する）
-/// - 本プロセスの `create_pinned` が作った pin なら、作成時に控えた「pin ファイルの (dev, ino)」と
-///   「固定した netns の (dev, ino)」のどちらかに現在の実体が一致すること（操作の直前に stat し直して照合）。
-///   記録が無い pin（作成プロセスの終了後・再起動後の清掃）は、nsfs がマウント中なら umount 前に
-///   `FailedPrecondition` で拒否する（所有を証明できず、同一 UID の別プロセスの netns を破棄しうるため）。
-///   マウントの無い残置ファイルは、置き場の検証と下記の形の検査（mode `0o400`・サイズ 0・実効 UID 所有の
-///   通常ファイル）を通れば削除する。永続状態による厳密な所有照合は TASK-139.4 の責務
+/// - 本プロセスの `create_pinned` が作って未解除の pin であること。作成時に控えた「pin ファイルの (dev, ino)」
+///   （未マウント時）または「固定した netns の (dev, ino)」（nsfs マウント中）に現在の実体が一致すること
+///   （操作の直前に stat し直して照合）。記録が無い pin（作成プロセスの終了後・再起動後の残置）は、
+///   マウントの有無に関わらず umount・削除の前に `FailedPrecondition` で拒否する。形（mode `0o400`・
+///   サイズ 0・実効 UID 所有の通常ファイル）だけでは本モジュールが作った pin と証明できず、任意の空ファイルの
+///   削除や同一 UID の別プロセスの netns の破棄につながるため。プロセスをまたぐ清掃は、永続的な所有記録と
+///   照合する設計（TASK-139.4）で扱う
 /// - `/proc/self/mountinfo` 上で、pin がマウントされていないか、`nsfs` としてマウントされている
 /// - アンマウント後の実体が、作成時の pin ファイル（上記 inode）かつ本モジュールが作った形
 ///   （実効 UID 所有・mode `0o400`・サイズ 0 の通常ファイル）
@@ -472,7 +496,14 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
     let expected_file: Option<FileId> = match pin_mount_state(&String::from_utf8_lossy(&raw), &real)
     {
         PinMount::None => {
-            if record.is_some_and(|r| r.file != current) {
+            // 記録の無いファイルは、形（実効 UID 所有・0o400・空）が pin と同じでも削除しない（fail-closed）。
+            // 形だけでは本モジュールが作った pin と証明できず、呼び出し側が指定した任意の空ファイルを
+            // 消しうるため。記録が netns 側（`r.ns`）とだけ一致する場合（マウントが無いのに nsfs の inode が
+            // 見える）も、作成した状態ではないので拒否する。
+            let Some(r) = record else {
+                return Err(not_our_pin());
+            };
+            if r.file != current {
                 return Err(not_our_pin());
             }
             Some(current)
@@ -820,21 +851,79 @@ mod tests {
         fs::remove_dir(&dir).unwrap();
     }
 
-    /// NET-1: 作成プロセスが終了した後（記録なし）でも、置き場検証と形の検査を通る pin は解除できる。
+    /// NET-1・P0: 所有記録の無いファイルは、置き場検証と形の検査（実効 UID 所有・0o400・空の通常ファイル）を
+    /// 通っても削除しない（作成プロセスの終了後の残置を含む。プロセスをまたぐ清掃は TASK-139.4）。
     #[test]
-    fn net1_unpin_path_cleans_pin_without_record() {
+    fn net1_unpin_path_rejects_pin_shaped_file_without_record() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = scratch_dir("norecord");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         let pin = dir.join("web-1");
         fs::write(&pin, b"").unwrap();
         fs::set_permissions(&pin, fs::Permissions::from_mode(0o400)).unwrap();
+        let e = unpin_path(&pin).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "path is not a netns pin created by this process"
+        );
+        assert!(pin.exists());
+        // 同じ実体を記録した後なら解除できる（拒否の理由が記録の有無だけであることの確認）。
+        register_pin(file_id(&fs::symlink_metadata(&pin).unwrap()));
         unpin_path(&pin).unwrap();
         assert!(!pin.exists());
         fs::remove_dir(&dir).unwrap();
     }
 
-    /// NET-1: 別 inode に差し替わった pin は、現在の実体の記録（無ければ形の検査）で判定する。
+    /// NET-1・P0: 記録済みの pin の名前へ、記録の無い同じ形のファイルが差し替わったら削除しない。
+    #[test]
+    fn net1_unpin_path_rejects_unrecorded_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("replaced");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let pin = dir.join("web-1");
+        make_registered_pin(&pin);
+        let recorded = file_id(&fs::symlink_metadata(&pin).unwrap());
+        // 旧ファイルを別名で残し（inode 番号の再利用を防ぐ）、記録の無い同形ファイルを被せる。
+        let kept = dir.join("kept");
+        fs::rename(&pin, &kept).unwrap();
+        fs::write(&pin, b"").unwrap();
+        fs::set_permissions(&pin, fs::Permissions::from_mode(0o400)).unwrap();
+        let e = unpin_path(&pin).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(pin.exists());
+        forget_pin(recorded);
+        fs::remove_file(&pin).unwrap();
+        fs::remove_file(&kept).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    /// NET-1: 作成時の識別子と異なる実体へ差し替わった pin ファイルは、失敗時の後始末でも削除しない。
+    #[test]
+    fn net1_remove_pin_file_checks_identity() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("rmid");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let pin = dir.join("web-1");
+        make_registered_pin(&pin);
+        let fid = file_id(&fs::symlink_metadata(&pin).unwrap());
+        let kept = dir.join("kept");
+        fs::rename(&pin, &kept).unwrap();
+        fs::write(&pin, b"other").unwrap();
+        assert_eq!(remove_pin_file(&pin, fid), Some(ResourceState::Unknown));
+        assert_eq!(fs::read(&pin).unwrap(), b"other");
+        // 元の実体に戻せば消せ、記録も外れる。
+        fs::remove_file(&pin).unwrap();
+        fs::rename(&kept, &pin).unwrap();
+        assert_eq!(remove_pin_file(&pin, fid), None);
+        assert!(!pin.exists());
+        assert!(lookup_pin(fid).is_none());
+        // 既に無ければ成功扱い（冪等）。
+        assert_eq!(remove_pin_file(&pin, fid), None);
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    /// NET-1: 別 inode に差し替わった pin は、現在の実体の記録で判定する（記録が無ければ拒否）。
     #[test]
     fn net1_unpin_path_judges_swapped_file_by_current_inode() {
         let dir = scratch_dir("swapped");

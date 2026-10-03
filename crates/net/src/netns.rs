@@ -20,7 +20,9 @@
 //! - pin 先は「呼び出し側が渡す絶対パスのディレクトリ」直下の、検証済み `EndpointId`（`/` を含まず
 //!   `.` 始まりでない）をファイル名にした通常ファイル。`Path::join` のみで組み立てる
 //! - ディレクトリは symlink でない・group / other に書き込み不可・実効 UID の所有、のすべてを満たさない
-//!   場合は拒否する（fail-closed）。ディレクトリより上位の経路の検証は呼び出し側の責務
+//!   場合は拒否する（fail-closed）。検査したディレクトリは開いた fd で固定し、pin ファイルの作成・伝播検査・
+//!   後始末は `/proc/self/fd/<dirfd>/<名前>` 経由で同じ実体に対して行う（検査後に祖先のパスが差し替えられても、
+//!   検査していない場所には作用しない）。ディレクトリより上位の経路の検証は呼び出し側の責務
 //! - pin 先ファイルは `create_new`（`O_EXCL`）で作る。既存物（他者のファイル・symlink）は上書きも
 //!   削除もしない。bind マウントの対象は、作成直後に保持した fd の `/proc/self/fd/<n>` で指定し、
 //!   作成から mount までの間のパス差し替えを塞ぐ
@@ -236,10 +238,10 @@ fn check_propagation(mountinfo: &str, dir: &Path) -> Result<(), NetError> {
     }
 }
 
-fn check_base_dir_propagation(base: &Path) -> Result<(), NetError> {
-    let real = fs::canonicalize(base).map_err(|e| io_error("resolve netns directory", &e))?;
+/// 固定済みの置き場ディレクトリ（`PinDir::real`。開いた fd から得た実際の位置）の伝播を検査する。
+fn check_dir_propagation(dir: &PinDir) -> Result<(), NetError> {
     let raw = fs::read("/proc/self/mountinfo").map_err(|e| io_error("read mountinfo", &e))?;
-    check_propagation(&String::from_utf8_lossy(&raw), &real)
+    check_propagation(&String::from_utf8_lossy(&raw), &dir.real)
 }
 
 /// 作った pin ファイルを消す（消せたら `PINS` の記録も外す）。失敗は `Present`（残っていると分かる）で報告する。
@@ -274,19 +276,27 @@ fn remove_pin_file(pin: &Path, fid: FileId) -> Option<ResourceState> {
 /// 成功時は `ContainerNetns`（fd と pin パス）を返す。失敗時は自分が作ったファイルだけを片付け、
 /// 時間切れ等で mount の有無が不明なら削除せず `leftover = Some(Unknown)` で報告する。`timeout` は
 /// 使い捨てスレッドの完了待ちの期限（REPAIR-5）。時間切れ後もスレッドは裏で完走しうる。
+///
+/// 置き場ディレクトリは検査時に開いた fd で固定し（[`open_pin_dir`]）、pin ファイルの作成・伝播検査・
+/// 失敗時や時間切れ後の後始末はすべて `/proc/self/fd/<dirfd>/<名前>` 経由で同じ実体に対して行う。
+/// 検査後に `base` やその祖先が差し替えられても、検査していない場所に pin を作ったり消したりしない。
 pub(crate) fn create_pinned(
     base: &Path,
     id: &EndpointId,
     timeout: Duration,
 ) -> Result<ContainerNetns, NetnsFailure> {
     let fail = |error: NetError, leftover: Option<ResourceState>| NetnsFailure { error, leftover };
-    check_base_dir(base).map_err(|e| fail(e, None))?;
-    let pin = base.join(id.as_str());
+    let dir = Arc::new(open_pin_dir(base).map_err(|e| fail(e, None))?);
+    let name = std::ffi::OsStr::new(id.as_str());
+    // 呼び出し側へ返す pin パス（runtime の join・`unpin_path` に使う名前）。
+    let pin = base.join(name);
+    // 本関数内の操作に使う、固定したディレクトリ経由のパス。
+    let via = dir.entry(name);
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o400)
-        .open(&pin)
+        .open(&via)
         .map_err(|e| fail(io_error("create netns pin file", &e), None))?;
     // 作成した実体の識別子を記録する。`unpin_path` が「本モジュールが作った pin」だけを対象にする根拠で、
     // 以降の失敗時の削除（`remove_pin_file`）も、この識別子と一致する実体だけを消す。
@@ -306,38 +316,41 @@ pub(crate) fn create_pinned(
     if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o400)) {
         return Err(fail(
             io_error("chmod netns pin file", &e),
-            remove_pin_file(&pin, fid),
+            remove_pin_file(&via, fid),
         ));
     }
     let target = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|_| {
         fail(
             NetError::new(NetErrorCode::Internal, "invalid pin target"),
-            remove_pin_file(&pin, fid),
+            remove_pin_file(&via, fid),
         )
     })?;
 
     // 伝播検査は pin ファイルの作成後に行う（既存物への `AlreadyExists` を先に返すため）。
     // 拒否したら自分が作ったファイルだけ消す。
-    if let Err(e) = check_base_dir_propagation(base) {
-        return Err(fail(e, remove_pin_file(&pin, fid)));
+    if let Err(e) = check_dir_propagation(&dir) {
+        return Err(fail(e, remove_pin_file(&via, fid)));
     }
-    let pin_c = CString::new(pin.as_os_str().as_bytes()).map_err(|_| {
+    let via_c = CString::new(via.as_os_str().as_bytes()).map_err(|_| {
         fail(
             NetError::new(NetErrorCode::InvalidArgument, "netns path contains NUL"),
-            remove_pin_file(&pin, fid),
+            remove_pin_file(&via, fid),
         )
     })?;
 
     let handoff: Arc<Handoff> = Arc::new((Mutex::new(Slot::Pending), Condvar::new()));
     let worker_handoff = Arc::clone(&handoff);
-    let worker_pin = pin.clone();
+    let worker_via = via.clone();
+    // ワーカーが後始末を担う間も `/proc/self/fd/<dirfd>` を有効に保つ。
+    let worker_dir = Arc::clone(&dir);
     // 時間切れ後もワーカーが完走するまで `unpin_path` を拒否させる（unlink との競合防止）。
-    let inflight = InflightGuard::new(&pin);
+    let inflight = InflightGuard::new(fid);
     let spawned = thread::Builder::new()
         .name("fandhe-netns".to_owned())
         .spawn(move || {
             // `file` を握ったまま mount することで、`/proc/self/fd/<n>` が差し替え不能な対象を指す。
             let _hold = file;
+            let _dir = worker_dir;
             let inflight = inflight;
             let result = unshare_and_pin(&target).map(|(fd, ns_id)| {
                 set_pin_ns(fid, ns_id);
@@ -348,7 +361,7 @@ pub(crate) fn create_pinned(
             if matches!(*slot, Slot::Abandoned) {
                 // 呼び出し側は期限切れで見切り済み。完了した副作用はこのスレッドが回収する。
                 drop(slot);
-                reclaim_abandoned(&pin_c, &worker_pin, fid, result.is_ok());
+                reclaim_abandoned(&via_c, &worker_via, fid, result.is_ok());
                 drop(inflight);
             } else {
                 drop(inflight);
@@ -362,7 +375,7 @@ pub(crate) fn create_pinned(
                 NetErrorCode::ResourceExhausted,
                 "failed to spawn netns thread",
             ),
-            remove_pin_file(&pin, fid),
+            remove_pin_file(&via, fid),
         ));
     }
 
@@ -374,7 +387,7 @@ pub(crate) fn create_pinned(
     // 未完了なら、ロックを握ったまま `Abandoned` にして回収をスレッドへ引き継ぐ（完了との競合を防ぐ）。
     match std::mem::replace(&mut *guard, Slot::Abandoned) {
         Slot::Done(Ok(fd)) => Ok(ContainerNetns { fd, pin }),
-        Slot::Done(Err(error)) => Err(fail(error, remove_pin_file(&pin, fid))),
+        Slot::Done(Err(error)) => Err(fail(error, remove_pin_file(&via, fid))),
         Slot::Pending => Err(fail(
             NetError::new(NetErrorCode::Timeout, "timed out creating netns"),
             Some(ResourceState::Unknown),
@@ -403,11 +416,14 @@ type Handoff = (Mutex<Slot>, Condvar);
 /// 削除する。アンマウントに失敗したら pin ファイルを残す（呼び出し側へ報告済みの pin パスから
 /// `unpin_path` で再試行できるようにするため。ファイルを消すとマウントが名前を失ってリークする）。
 /// 失敗しても報告先は無い（時間切れ時点で `Unknown` を返済み）。
-fn reclaim_abandoned(pin_c: &CStr, pin: &Path, fid: FileId, mounted: bool) {
-    if mounted && sys::unmount_detach(pin_c).is_err() {
+///
+/// `via_c` / `via` は固定した置き場ディレクトリ経由のパス（`/proc/self/fd/<dirfd>/<名前>`）。呼び出し側の
+/// ワーカーがディレクトリの fd を保持している間だけ有効。
+fn reclaim_abandoned(via_c: &CStr, via: &Path, fid: FileId, mounted: bool) {
+    if mounted && sys::unmount_detach(via_c).is_err() {
         return;
     }
-    let _ = remove_pin_file(pin, fid);
+    let _ = remove_pin_file(via, fid);
 }
 
 /// pin を外す（`umount2(MNT_DETACH)` → ファイル削除）。fd を drop し参照が尽きれば、カーネルが
@@ -462,12 +478,6 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
             "netns pin path must name a file",
         ));
     };
-    if inflight_contains(pin) {
-        return Err(NetError::new(
-            NetErrorCode::FailedPrecondition,
-            "netns pin creation is still in progress; retry later",
-        ));
-    }
     match fs::symlink_metadata(pin) {
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -491,6 +501,13 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
     };
     // 本プロセスの記録（所有の証明）を引く。nsfs マウントの解除は記録がある場合に限る（下記）。
     let record = lookup_pin(current);
+    // 動作中ワーカーの pin は、どの経路のパスで指定されても実体（作成時の識別子）で判定して拒否する。
+    if inflight_contains(current) || record.is_some_and(|r| inflight_contains(r.file)) {
+        return Err(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "netns pin creation is still in progress; retry later",
+        ));
+    }
     let raw = fs::read("/proc/self/mountinfo").map_err(|e| io_error("read mountinfo", &e))?;
     // アンマウント後に現れるべき pin ファイルの識別子。
     let expected_file: Option<FileId> = match pin_mount_state(&String::from_utf8_lossy(&raw), &real)
@@ -724,28 +741,28 @@ fn pin_mount_state(mountinfo: &str, pin: &Path) -> PinMount {
     state
 }
 
-/// `create_pinned` の使い捨てスレッドが動作中の pin パス（時間切れ後も含む）。`unpin_path` が
-/// 動作中のワーカーと競合して unlink しないよう参照する。
-static INFLIGHT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// `create_pinned` の使い捨てスレッドが動作中の pin ファイルの識別子 (dev, ino)（時間切れ後も含む）。
+/// `unpin_path` が動作中のワーカーと競合して unlink しないよう参照する。パスではなく実体で持つのは、
+/// 同じ pin を別の経路のパス（祖先の symlink 等）で指定されても取りこぼさないため。
+static INFLIGHT: Mutex<Vec<FileId>> = Mutex::new(Vec::new());
 
-fn inflight_contains(pin: &Path) -> bool {
+fn inflight_contains(file: FileId) -> bool {
     INFLIGHT
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .any(|p| p == pin)
+        .contains(&file)
 }
 
 /// 動作中ワーカーの登録。drop で登録を外す（スレッド起動失敗でクロージャが破棄された場合も外れる）。
-struct InflightGuard(PathBuf);
+struct InflightGuard(FileId);
 
 impl InflightGuard {
-    fn new(pin: &Path) -> Self {
+    fn new(file: FileId) -> Self {
         INFLIGHT
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(pin.to_owned());
-        Self(pin.to_owned())
+            .push(file);
+        Self(file)
     }
 }
 
@@ -956,7 +973,7 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         let pin = dir.join("web-1");
         make_registered_pin(&pin);
-        let guard = InflightGuard::new(&pin);
+        let guard = InflightGuard::new(file_id(&fs::symlink_metadata(&pin).unwrap()));
         let e = unpin_path(&pin).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
         assert!(pin.exists());
@@ -1066,6 +1083,24 @@ mod tests {
         let e = check_base_dir(&link).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
         assert!(check_base_dir(&real).is_ok());
+        fs::remove_file(&link).unwrap();
+        fs::remove_dir(&real).unwrap();
+    }
+
+    /// NET-1: `create_pinned` は置き場を fd で固定する前の検査（`open_pin_dir`）で、symlink の置き場を
+    /// 拒否し、リンク先の実ディレクトリには何も作らない（mount へ進まない権限不要の経路）。
+    #[test]
+    fn net1_create_pinned_rejects_symlinked_base_without_side_effects() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let real = scratch_dir("cp-real");
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = real.with_extension("link");
+        symlink(&real, &link).unwrap();
+        let id = EndpointId::new("web-1").unwrap();
+        let f = create_pinned(&link, &id, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(f.error.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(f.leftover, None);
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 0);
         fs::remove_file(&link).unwrap();
         fs::remove_dir(&real).unwrap();
     }

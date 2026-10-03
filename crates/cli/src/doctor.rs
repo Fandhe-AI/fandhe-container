@@ -21,8 +21,9 @@
 //! # 判定不能の扱い（fail-closed）
 //!
 //! 「accept」と「答えが出なかった」を取り違えないよう、取得できなかった場合は独立した値で返す。
-//! `bridge-nf-call-iptables` の `NotFound` も、`/proc/sys/net` を参照できると確認できた場合に限り
-//! 未ロードとし、procfs 未マウント等で確認できなければ `Unknown` とする。
+//! `bridge-nf-call-iptables` の `NotFound` も、`/proc/self/mountinfo` 上で `/proc/sys/net` を含むマウントが
+//! procfs（fstype `proc`）であり、かつ `/proc/sys/net` がディレクトリと確認できた場合に限り未ロードとし、
+//! procfs 未マウント・通常ディレクトリ・mountinfo を読めない等で確認できなければ `Unknown` とする。
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
@@ -40,18 +41,26 @@ use fandhe_container_net::nftables_batch::{ChainInfo, ChainPolicy, NfInetHook};
 /// sysctl・`/proc` の読み取り上限（バイト）。想定値は 1 文字なので小さく抑える。
 const MAX_PROC_READ: u64 = 4096;
 
+/// `/proc/self/mountinfo` の読み取り上限（バイト）。1 行は概ね数百バイトなので、コンテナを多数抱える
+/// ホストのマウント数（数万）でも収まる値にする。超過時は読み切れないため判定不能とする（fail-closed）。
+const MAX_MOUNTINFO_READ: u64 = 4 * 1024 * 1024;
+
 /// `/proc` 配下で br_netfilter の有無を示すパス（root からの相対）。
 const BR_NF_CALL_IPTABLES: &str = "proc/sys/net/bridge/bridge-nf-call-iptables";
 
 /// procfs 自体が参照できることの確認に使うパス（root からの相対）。
 ///
 /// procfs が未マウントだと `BR_NF_CALL_IPTABLES` も `NotFound` になり、未ロードと区別できないため、
-/// 常に存在する `/proc/sys/net` を先に確認する。
+/// procfs 上で常に存在する `/proc/sys/net` を先に確認する。
 const PROC_SYS_NET: &str = "proc/sys/net";
 
-/// procfs にだけ存在する `/proc/self`（シンボリックリンク）。通常のディレクトリが `/proc/sys/net` を
-/// 偽装していても、これが無ければ procfs 上とは確認できない。
-const PROC_SELF: &str = "proc/self";
+/// 自プロセスから見たマウント一覧（root からの相対）。パスの存在だけでは procfs 上か分からないため、
+/// `/proc/sys/net` を含むマウントの fstype をここから確認する（NET-10）。
+const PROC_SELF_MOUNTINFO: &str = "proc/self/mountinfo";
+
+/// `/proc/net`（root からの相対。procfs 上では `self/net` への symlink）。`IP_TABLES_NAMES` 不在を
+/// 「filter なし」と断定する前に procfs 上であることを確認する対象（NET-10）。
+const PROC_NET: &str = "proc/net";
 
 /// iptables-legacy が使うテーブル名の一覧（root からの相対）。
 const IP_TABLES_NAMES: &str = "proc/net/ip_tables_names";
@@ -136,7 +145,7 @@ impl BrNetfilterProbe {
         if !cfg!(target_os = "linux") {
             return BrNetfilterState::Unsupported;
         }
-        match read_limited(&self.root.join(BR_NF_CALL_IPTABLES)) {
+        match read_limited(&self.root.join(BR_NF_CALL_IPTABLES), MAX_PROC_READ) {
             Ok(text) => BrNetfilterState::Loaded {
                 call_iptables: match text.trim() {
                     "1" => Some(true),
@@ -147,20 +156,9 @@ impl BrNetfilterProbe {
             // NotFound は procfs が参照可能と確認できた場合に限り未ロードとする
             // （未マウントの procfs を未ロードと誤判定しない fail-closed。NET-10）。
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                let is_procfs = std::fs::symlink_metadata(self.root.join(PROC_SELF))
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false);
-                match std::fs::metadata(self.root.join(PROC_SYS_NET)) {
-                    Ok(m) if m.is_dir() && is_procfs => BrNetfilterState::NotLoaded,
-                    Ok(_) => BrNetfilterState::Unknown {
-                        reason: DoctorProbeError {
-                            code: NetErrorCode::Internal.as_str().to_string(),
-                            message: "procfs mount could not be confirmed".to_string(),
-                        },
-                    },
-                    Err(e2) => BrNetfilterState::Unknown {
-                        reason: DoctorProbeError::from_io(&e2),
-                    },
+                match confirm_procfs(&self.root, PROC_SYS_NET) {
+                    Ok(()) => BrNetfilterState::NotLoaded,
+                    Err(reason) => BrNetfilterState::Unknown { reason },
                 }
             }
             Err(e) => BrNetfilterState::Unknown {
@@ -170,17 +168,54 @@ impl BrNetfilterProbe {
     }
 }
 
-/// [`MAX_PROC_READ`] バイト以内のファイルを文字列として読む（無制限読み取りを避ける）。
+/// `root` からの相対パス `dir`（`proc/` 配下のディレクトリ）が procfs 上にあることを確認する。
+/// procfs 配下のファイルの `NotFound` を「存在しない」と断定してよいかの前提（NET-10）。
+///
+/// パスの存在だけでは procfs 上と保証できない（通常のディレクトリが残っている環境がありうる）ため、
+/// `/proc/self/mountinfo` で `dir` を含むマウントの fstype が `proc` であり、かつ `dir` がディレクトリで
+/// あることを確かめる。mountinfo を読めない・上限超過・該当マウントが無い・fstype が `proc` でない・
+/// `dir` が無い場合は確認できないとして理由を返す（呼び出し側は判定不能として扱う。fail-closed）。
+fn confirm_procfs(root: &Path, dir: &str) -> Result<(), DoctorProbeError> {
+    let not_confirmed = || DoctorProbeError {
+        code: NetErrorCode::Internal.as_str().to_string(),
+        message: "procfs mount could not be confirmed".to_string(),
+    };
+    let mountinfo = read_limited(&root.join(PROC_SELF_MOUNTINFO), MAX_MOUNTINFO_READ)
+        .map_err(|e| DoctorProbeError::from_io(&e))?;
+    // mountinfo のマウントポイントは自プロセスの root からの絶対パスで書かれている。
+    if mount_fstype(&mountinfo, &Path::new("/").join(dir)).as_deref() != Some("proc") {
+        return Err(not_confirmed());
+    }
+    match std::fs::metadata(root.join(dir)) {
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(not_confirmed()),
+        Err(e) => Err(DoctorProbeError::from_io(&e)),
+    }
+}
+
+/// `mountinfo` 上で `path` を含むマウントの fstype（net の mountinfo 解析を再利用する）。
+#[cfg(target_os = "linux")]
+fn mount_fstype(mountinfo: &str, path: &Path) -> Option<String> {
+    fandhe_container_net::netns::covering_mount_fstype(mountinfo, path)
+}
+
+/// Linux 以外では mountinfo が無いため常に確認できない（`probe` は先に `Unsupported` を返すので到達しない）。
+#[cfg(not(target_os = "linux"))]
+fn mount_fstype(_mountinfo: &str, _path: &Path) -> Option<String> {
+    None
+}
+
+/// `limit` バイト以内のファイルを文字列として読む（無制限読み取りを避ける）。
 ///
 /// 上限を超えるファイルは途中で切れた内容を返さず `InvalidData` で失敗させる（切れた内容から
 /// 「行が無い」と誤断定しない fail-closed。呼び出し側は判定不能として扱う）。
-fn read_limited(path: &Path) -> std::io::Result<String> {
+fn read_limited(path: &Path, limit: u64) -> std::io::Result<String> {
     let mut buf = Vec::new();
     // 上限 + 1 バイトまで読み、超過分が読めたら EOF に達していない（読み切れていない）と判定する。
     File::open(path)?
-        .take(MAX_PROC_READ + 1)
+        .take(limit.saturating_add(1))
         .read_to_end(&mut buf)?;
-    if buf.len() as u64 > MAX_PROC_READ {
+    if buf.len() as u64 > limit {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
             "file exceeds read limit",
@@ -203,7 +238,8 @@ pub enum ForwardPolicyState {
     /// `/proc/net/ip_tables_names` に `filter` があるか（policy 自体は未取得。モジュール doc の未実装範囲）。
     NotFoundInNftables {
         /// legacy iptables の filter テーブルが存在するか。`None` は権限不足等で読み取れず判定不能
-        /// （不存在の `Some(false)` と区別する。fail-closed）。ファイル自体が無い場合は `Some(false)`。
+        /// （不存在の `Some(false)` と区別する。fail-closed）。ファイル自体が無い場合は、`/proc/net` が
+        /// procfs 上と確認できれば `Some(false)`・確認できなければ `None`。
         legacy_iptables_filter: Option<bool>,
     },
     /// 権限不足。nfnetlink の照会には `CAP_NET_ADMIN` が必要。
@@ -281,12 +317,15 @@ pub fn probe_forward_policy(source: &dyn ForwardPolicySource, root: &Path) -> Fo
     }
 }
 
-/// `/proc/net/ip_tables_names` に `filter` 行があるか。ファイル不在（ip_tables 未ロード）は `Some(false)`、
-/// 権限不足などその他の読み取り失敗は不存在と断定できないため `None`（判定不能）。
+/// `/proc/net/ip_tables_names` に `filter` 行があるか。ファイル不在（ip_tables 未ロード）は `/proc/net` が
+/// procfs 上と確認できた場合に限り `Some(false)`。procfs と確認できない場合・権限不足などその他の
+/// 読み取り失敗は不存在と断定できないため `None`（判定不能。fail-closed）。
 fn has_legacy_filter(root: &Path) -> Option<bool> {
-    match read_limited(&root.join(IP_TABLES_NAMES)) {
+    match read_limited(&root.join(IP_TABLES_NAMES), MAX_PROC_READ) {
         Ok(t) => Some(t.lines().any(|l| l.trim() == "filter")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            confirm_procfs(root, PROC_NET).is_ok().then_some(false)
+        }
         Err(_) => None,
     }
 }
@@ -372,11 +411,24 @@ mod tests {
         p
     }
 
-    fn br(value: Option<&str>) -> BrNetfilterState {
+    /// `/proc` に procfs がマウントされた mountinfo（`/` は ext4）。
+    const MOUNTINFO_PROCFS: &str = "\
+22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+24 22 0:22 / /proc rw,nosuid,nodev,noexec - proc proc rw
+";
+
+    /// procfs が参照できる環境を模した root（`/proc/sys/net`・`/proc/net` が存在し、mountinfo 上で
+    /// `/proc` が procfs）。
+    fn procfs_root() -> TempRoot {
         let t = TempRoot::new();
-        // procfs が参照できる環境を模す（`/proc/sys/net` が存在する）。
         std::fs::create_dir_all(t.0.join(PROC_SYS_NET)).expect("mkdir");
-        std::os::unix::fs::symlink("1", t.0.join(PROC_SELF)).expect("symlink");
+        std::fs::create_dir_all(t.0.join(PROC_NET)).expect("mkdir");
+        t.write(PROC_SELF_MOUNTINFO, MOUNTINFO_PROCFS);
+        t
+    }
+
+    fn br(value: Option<&str>) -> BrNetfilterState {
+        let t = procfs_root();
         if let Some(v) = value {
             t.write(BR_NF_CALL_IPTABLES, v);
         }
@@ -412,7 +464,78 @@ mod tests {
         let t = TempRoot::new();
         std::fs::create_dir_all(t.0.join(PROC_SYS_NET)).expect("mkdir");
         let st = BrNetfilterProbe::with_root(t.0.clone()).probe();
-        assert!(matches!(st, BrNetfilterState::Unknown { .. }), "{st:?}");
+        // mountinfo が無い（procfs 上でない）ので NotFound の読み取り失敗として判定不能。
+        assert_eq!(
+            st,
+            BrNetfilterState::Unknown {
+                reason: DoctorProbeError {
+                    code: "NOT_FOUND".to_string(),
+                    message: "failed to read a procfs entry".to_string(),
+                }
+            }
+        );
+    }
+
+    /// NET-10: mountinfo 上で `/proc/sys/net` を含むマウントが procfs でなければ、ディレクトリと mountinfo が
+    /// 揃っていても NotLoaded と断定せず Unknown。
+    #[test]
+    fn net10_br_netfilter_non_procfs_mount_is_unknown() {
+        let not_confirmed = BrNetfilterState::Unknown {
+            reason: DoctorProbeError {
+                code: "INTERNAL".to_string(),
+                message: "procfs mount could not be confirmed".to_string(),
+            },
+        };
+        let probe = |mountinfo: &str| {
+            let t = TempRoot::new();
+            std::fs::create_dir_all(t.0.join(PROC_SYS_NET)).expect("mkdir");
+            t.write(PROC_SELF_MOUNTINFO, mountinfo);
+            BrNetfilterProbe::with_root(t.0.clone()).probe()
+        };
+        // `/proc` が通常のディレクトリ（`/` の ext4 上）。
+        assert_eq!(
+            probe("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"),
+            not_confirmed
+        );
+        // `/proc` は procfs だが `/proc/sys` に tmpfs が重ねられている。
+        assert_eq!(
+            probe(&format!(
+                "{MOUNTINFO_PROCFS}30 24 0:30 / /proc/sys rw - tmpfs tmpfs rw\n"
+            )),
+            not_confirmed
+        );
+        // 該当マウントが無い（空の mountinfo）。
+        assert_eq!(probe(""), not_confirmed);
+        // 上限を超えて読み切れない mountinfo（procfs の行が上限より後ろにある）。
+        let mut big =
+            "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n".repeat(MAX_MOUNTINFO_READ as usize / 30 + 1);
+        big.push_str(MOUNTINFO_PROCFS);
+        assert_eq!(
+            probe(&big),
+            BrNetfilterState::Unknown {
+                reason: DoctorProbeError {
+                    code: "INTERNAL".to_string(),
+                    message: "failed to read a procfs entry".to_string(),
+                }
+            }
+        );
+    }
+
+    /// NET-10: mountinfo 上は procfs でも `/proc/sys/net` が無ければ（net sysctl 不在）Unknown。
+    #[test]
+    fn net10_br_netfilter_missing_proc_sys_net_is_unknown() {
+        let t = TempRoot::new();
+        t.write(PROC_SELF_MOUNTINFO, MOUNTINFO_PROCFS);
+        let st = BrNetfilterProbe::with_root(t.0.clone()).probe();
+        assert_eq!(
+            st,
+            BrNetfilterState::Unknown {
+                reason: DoctorProbeError {
+                    code: "NOT_FOUND".to_string(),
+                    message: "failed to read a procfs entry".to_string(),
+                }
+            }
+        );
     }
 
     /// NET-10: policy の取得結果が各状態に対応する。
@@ -443,8 +566,17 @@ mod tests {
             st(Mock(Err(NetErrorCode::PermissionDenied))),
             ForwardPolicyState::PermissionDenied
         );
+        // nftables に無く、procfs と確認できない root の ip_tables_names 不在は判定不能（None）。
         assert_eq!(
             st(Mock(Err(NetErrorCode::NotFound))),
+            ForwardPolicyState::NotFoundInNftables {
+                legacy_iptables_filter: None
+            }
+        );
+        // procfs 上と確認できれば ip_tables_names 不在は「filter なし」（Some(false)）。
+        let procfs = procfs_root();
+        assert_eq!(
+            probe_forward_policy(&Mock(Err(NetErrorCode::NotFound)), &procfs.0),
             ForwardPolicyState::NotFoundInNftables {
                 legacy_iptables_filter: Some(false)
             }
@@ -469,7 +601,7 @@ mod tests {
         text.push_str("filter\n");
         root.write(IP_TABLES_NAMES, &text);
         assert_eq!(has_legacy_filter(&root.0), None);
-        let r = read_limited(&root.0.join(IP_TABLES_NAMES)).unwrap_err();
+        let r = read_limited(&root.0.join(IP_TABLES_NAMES), MAX_PROC_READ).unwrap_err();
         assert_eq!(r.kind(), ErrorKind::InvalidData);
         // ちょうど上限の内容は読み切れるので判定できる（filter 行なし）。
         let exact = TempRoot::new();
@@ -495,6 +627,16 @@ mod tests {
             probe_forward_policy(&nf, &without.0),
             ForwardPolicyState::NotFoundInNftables {
                 legacy_iptables_filter: Some(false)
+            }
+        );
+        // ファイル不在でも、`/proc/net` を含むマウントが procfs でなければ不存在と断定せず None。
+        let plain = TempRoot::new();
+        std::fs::create_dir_all(plain.0.join(PROC_NET)).expect("mkdir");
+        plain.write(PROC_SELF_MOUNTINFO, "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n");
+        assert_eq!(
+            probe_forward_policy(&nf, &plain.0),
+            ForwardPolicyState::NotFoundInNftables {
+                legacy_iptables_filter: None
             }
         );
         // 読み取り失敗（ここでは filter がディレクトリ）は不存在と区別して None。

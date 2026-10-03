@@ -261,10 +261,11 @@ impl NetlinkNetfilterSocket {
     /// （バッチ内に seq 0 を含めない）。
     ///
     /// 戻り値の判定:
-    /// - 成功: 本体のすべてが errno 0 で ACK された
+    /// - 成功: 本体のすべてが errno 0 で ACK され、同期点（`NFT_MSG_GETGEN`）も NEWGEN → errno 0 で応答した
     /// - カーネルの失敗: [`NftBatchError::failures`] に失敗したメッセージの位置・seq・errno を全件並べ、
     ///   outcome は `Aborted`。nf_tables のバッチは all-or-nothing で何も適用されておらず、他メッセージの
-    ///   errno 0 の ACK は「適用済み」を意味しない
+    ///   errno 0 の ACK は「適用済み」を意味しない。同期点への応答まで読んでから確定する
+    /// - 失敗なしで同期点が拒否された（非 0 errno）: errno を分類した code で outcome は `Unknown`
     /// - `Timeout` / `DataLoss` / `ResourceExhausted`（受信欠落）: outcome は `Unknown`。適用されたか不明
     ///   なので、呼び出し側が状態を再照会すること
     /// - 空バッチ・組み立て失敗・送信前の期限切れ・送信拒否（`EMSGSIZE` を含む）: outcome は `NotSent`

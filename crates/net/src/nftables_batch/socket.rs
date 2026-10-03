@@ -29,7 +29,7 @@ use std::time::Duration;
 use super::ack::{NFT_MSG_GETGEN, NftBatchAck, NftBatchAckCollector, NftBatchError, Progress};
 use super::{
     BATCH_MARKER_LEN, MAX_BATCH_LEN, NFNL_SUBSYS_NFTABLES, NFPROTO_UNSPEC, NfGenMsg, NftBatch,
-    NftBatchBytes, nfnl_msg_type,
+    NftBatchBytes, TableGet, nfnl_msg_type,
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
@@ -247,6 +247,25 @@ impl NetlinkNetfilterSocket {
             gate: RequestGate::default(),
             next_seq: AtomicU32::new(1),
         })
+    }
+
+    /// 専用テーブルが存在するかを `NFT_MSG_GETTABLE` で照会する（読み取り専用。TASK-139.4・#317）。
+    ///
+    /// 存在すれば `Ok(true)`、カーネルが `ENOENT` を返せば `Ok(false)`。それ以外の失敗（権限不足・
+    /// 期限切れ・欠落）は存在不明として `Err` のまま返す（fail-closed）。`timeout` は順番待ちと往復を通した
+    /// 全体の期限（REPAIR-5）。
+    pub fn table_exists(&self, req: &TableGet, timeout: Duration) -> Result<bool, NetError> {
+        let deadline = Deadline::after(timeout);
+        let _turn = self.gate.acquire(&deadline, timeout)?;
+        match self
+            .inner
+            .request(req.msg_type(), req.flags(), deadline.remaining(), |b| {
+                req.encode(b)
+            }) {
+            Ok(_) => Ok(true),
+            Err(e) if e.code() == NetErrorCode::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// バッチを組み立てて送り、本体メッセージごとの ACK / エラーが揃うまで待つ（NET-11・TASK-137.3）。

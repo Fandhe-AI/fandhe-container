@@ -48,6 +48,8 @@ use crate::netlink::{NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST, NlMsgBu
 
 /// テーブル作成（`linux/netfilter/nf_tables.h` の `NFT_MSG_NEWTABLE`）。
 pub const NFT_MSG_NEWTABLE: u8 = 0;
+/// テーブル照会（`NFT_MSG_GETTABLE`）。
+pub const NFT_MSG_GETTABLE: u8 = 1;
 /// テーブル削除（`NFT_MSG_DELTABLE`）。
 pub const NFT_MSG_DELTABLE: u8 = 2;
 /// チェイン作成（`NFT_MSG_NEWCHAIN`）。
@@ -321,6 +323,40 @@ impl TableDelete {
     }
 }
 
+/// `NFT_MSG_GETTABLE`。テーブルの存在を読み取り専用で照会する（TASK-139.4・#317・NET-11）。
+///
+/// バッチ（BEGIN / END）を使わない単発の要求で、ルールセットを変更しない。存在すれば `NFT_MSG_NEWTABLE`
+/// の応答と errno 0 の ACK、無ければ `-ENOENT`（`NotFound`）が返る。bridge の消失後に、専用テーブルが
+/// 削除済みかを（所有の証明なしに破壊的操作をせず）確認するために使う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableGet {
+    family: NftFamily,
+    name: NftName,
+}
+
+impl TableGet {
+    /// 照会対象を指定して作る。
+    pub fn new(family: NftFamily, name: NftName) -> Self {
+        Self { family, name }
+    }
+
+    /// `nlmsg_type`。
+    pub fn msg_type(&self) -> u16 {
+        nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_GETTABLE)
+    }
+
+    /// 操作フラグ（なし。REQUEST / ACK は送信側が付ける）。
+    pub fn flags(&self) -> u16 {
+        0
+    }
+
+    /// nfgenmsg と属性を `b` へ追記する。
+    pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
+        NfGenMsg::new(self.family.nfproto(), 0).put_into(b)?;
+        self.name.put_into(b, NFTA_TABLE_NAME)
+    }
+}
+
 /// `NFT_MSG_NEWCHAIN`。base chain（hook あり）と通常の chain（hook なし）を表す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainCreate {
@@ -546,6 +582,18 @@ mod tests {
         assert_eq!(ty, 0x0A02);
         assert_eq!(fl, RA);
         assert_eq!(fl & (NLM_F_CREATE | NLM_F_EXCL | NLM_F_REPLACE), 0);
+        assert_eq!(attrs, vec![(1, false, false, b"fandhe\0".to_vec())]);
+    }
+
+    /// NET-11・TASK-139.4: GETTABLE は名前だけを持つ読み取り専用の照会（type 0x0A01・CREATE 等なし）。
+    #[test]
+    fn net11_gettable_queries_named_table() {
+        let g = TableGet::new(NftFamily::Ipv4, name("fandhe"));
+        let mut b = NlMsgBuilder::new(g.msg_type(), g.flags() | NLM_F_REQUEST | NLM_F_ACK, 3, 0);
+        g.encode(&mut b).expect("encode");
+        let (ty, fl, _, attrs) = decode(b);
+        assert_eq!(ty, 0x0A01);
+        assert_eq!(fl, RA);
         assert_eq!(attrs, vec![(1, false, false, b"fandhe\0".to_vec())]);
     }
 

@@ -373,6 +373,88 @@ fn verify_within_root(root: &Path, path: &Path) -> Result<(), NetError> {
     Ok(())
 }
 
+/// `/proc/self/mountinfo` の 1 フィールド内の 8 進エスケープ（`\040` 等）を元に戻す。
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(field: &str) -> Vec<u8> {
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let oct = b
+            .get(i + 1..i + 4)
+            .filter(|d| b[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)));
+        if let Some(d) = oct {
+            let v = d.iter().fold(0u32, |a, c| a * 8 + u32::from(c - b'0'));
+            out.push((v & 0xff) as u8);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// mountinfo の本文に、`root` 配下（`root` 自身は除く）かつ `path` の祖先または `path` 自身である
+/// マウントポイントが含まれるかを返す（管理ルート内の bind mount 検出。パス要素ごとに判定する）。
+#[cfg(target_os = "linux")]
+fn mountinfo_has_inner_mount(text: &str, root: &Path, path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    text.lines().any(|line| {
+        let Some(mp) = line.split(' ').nth(4) else {
+            return false;
+        };
+        let mp = Path::new(std::ffi::OsStr::from_bytes(&unescape_mountinfo(mp))).to_path_buf();
+        mp != root && mp.starts_with(root) && path.starts_with(&mp)
+    })
+}
+
+/// 管理ルート内に外部ファイルを指す mount（bind mount 等）が無いことを確認する（P0・rootfs / マウント境界）。
+///
+/// `canonicalize` は mount を辿れないため、(1) 開いた fd のデバイスがルートと同一であること、
+/// (2) Linux では `/proc/self/mountinfo` に hosts パスまたはその祖先（ルートより下）のマウントポイントが
+/// 無いこと、を検査する。読めない・巨大な場合は fail-closed で拒否する。
+fn verify_no_foreign_mount(root: &Path, path: &Path, file: &File) -> Result<(), NetError> {
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    let foreign = || {
+        NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "hosts file lives on a mount outside the managed root",
+        )
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let fm = file
+            .metadata()
+            .map_err(|_| io_err("failed to stat hosts file"))?;
+        let rm = std::fs::metadata(root).map_err(|_| io_err("failed to stat managed root"))?;
+        if fm.dev() != rm.dev() {
+            return Err(foreign());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut text = String::new();
+        File::open("/proc/self/mountinfo")
+            .and_then(|f| f.take(MAX_MOUNTINFO_BYTES + 1).read_to_string(&mut text))
+            .map_err(|_| io_err("failed to read mountinfo"))?;
+        if u64::try_from(text.len()).is_ok_and(|n| n > MAX_MOUNTINFO_BYTES) {
+            return Err(io_err("mountinfo is too large"));
+        }
+        if mountinfo_has_inner_mount(&text, root, path) {
+            return Err(foreign());
+        }
+    }
+    #[cfg(not(any(unix, target_os = "linux")))]
+    let _ = (root, path, file);
+    Ok(())
+}
+
+/// `/proc/self/mountinfo` の読み込み上限（無制限確保の防止）。
+#[cfg(target_os = "linux")]
+const MAX_MOUNTINFO_BYTES: u64 = 4 * 1024 * 1024;
+
 /// 書き込み失敗後に書き込み前の長さへ戻し、結果に応じたエラーを返す。
 ///
 /// 巻き戻し（切り詰め + fsync）まで成功した場合のみ通常の `INTERNAL`（ファイルは元の内容）。
@@ -483,6 +565,7 @@ pub fn append_add_hosts(
     let _guard = lock_guard_bounded(deadline)?;
     lock_exclusive_bounded(&file, deadline)?;
     verify_hosts_file(&file, hosts_path)?;
+    verify_no_foreign_mount(&root, hosts_path, &file)?;
 
     let len = file
         .metadata()
@@ -973,6 +1056,32 @@ mod tests {
     }
 
     /// NET-12・P1: 巻き戻しに失敗したら `DATA_LOSS`（復旧不能）で区別して返す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_detects_inner_bind_mount() {
+        let root = Path::new("/run/c/1");
+        let hosts = Path::new("/run/c/1/etc/hosts");
+        let mi = |mp: &str| format!("100 90 8:1 /x {mp} rw - ext4 /dev/sda1 rw\n");
+        // ファイル自体・祖先ディレクトリへの mount は検出する
+        assert!(mountinfo_has_inner_mount(
+            &mi("/run/c/1/etc/hosts"),
+            root,
+            hosts
+        ));
+        assert!(mountinfo_has_inner_mount(&mi("/run/c/1/etc"), root, hosts));
+        // ルート自身・ルート外・無関係な兄弟は検出しない
+        assert!(!mountinfo_has_inner_mount(&mi("/run/c/1"), root, hosts));
+        assert!(!mountinfo_has_inner_mount(&mi("/run"), root, hosts));
+        assert!(!mountinfo_has_inner_mount(&mi("/run/c/1/var"), root, hosts));
+        // 8 進エスケープ（空白）を復元して比較する
+        let sp = Path::new("/run/c/1/e tc/hosts");
+        assert!(mountinfo_has_inner_mount(
+            &mi("/run/c/1/e\\040tc"),
+            root,
+            sp
+        ));
+    }
+
     #[test]
     fn rollback_failure_is_reported_as_data_loss() {
         let f = TmpFile::new("rollback-fail", Some("abc\n"));

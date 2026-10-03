@@ -413,7 +413,9 @@ pub(crate) trait NetworkOps {
     fn set_up(&self, index: IfIndex) -> Result<(), NetError>;
     /// 取得済みの ifindex で削除する。外部で bridge が消され同名の別 link ができても巻き込まない。
     fn delete_bridge(&self, index: IfIndex) -> Result<(), NetError>;
-    fn apply_nft(&self, table: &NftName) -> Result<(), NftApplyFailure>;
+    /// 専用テーブルと NAT base chain を作る。テーブルには所有トークン（`token`）を `NFTA_TABLE_USERDATA` で
+    /// 載せ、削除時に照合できるようにする（TASK-139.4・#317）。
+    fn apply_nft(&self, table: &NftName, token: &str) -> Result<(), NftApplyFailure>;
 }
 
 const COLLISION_MSG: &str =
@@ -564,7 +566,7 @@ pub(crate) fn create_network_with(
         .map_err(|e| step_fail(e, CreateStep::SetUp))?;
 
     // 5. nft テーブル。バッチは all-or-nothing のため、Unknown 以外は nft 側に何も残らない。
-    if let Err(f) = ops.apply_nft(&table) {
+    if let Err(f) = ops.apply_nft(&table, &token) {
         let mut report = RollbackReport::default();
         rollback_bridge(ops, &bridge, &token, index, &mut report);
         if !matches!(
@@ -654,12 +656,13 @@ impl NetworkOps for LinuxNetworkOps<'_> {
             .map(|_| ())
     }
 
-    fn apply_nft(&self, table: &NftName) -> Result<(), NftApplyFailure> {
+    fn apply_nft(&self, table: &NftName, token: &str) -> Result<(), NftApplyFailure> {
         self.nft
             .send_batch(self.timeout, |batch| {
                 batch.push_with(|seq| {
                     TableCreate::new(NftFamily::Ipv4, table.clone())
                         .exclusive()
+                        .with_userdata(token.as_bytes())?
                         .build(seq)
                 })?;
                 for (name, hook, priority) in [
@@ -1753,7 +1756,7 @@ mod tests {
             }
             Ok(())
         }
-        fn apply_nft(&self, _: &NftName) -> Result<(), NftApplyFailure> {
+        fn apply_nft(&self, _: &NftName, _: &str) -> Result<(), NftApplyFailure> {
             self.rec("apply_nft");
             match self.fail_nft {
                 Some((c, o)) => Err(NftApplyFailure {

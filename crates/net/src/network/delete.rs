@@ -16,8 +16,9 @@
 //!
 //! # 順序
 //!
-//! 入力検証 → 渡されていない endpoint の preflight → コンテナごとの veth 削除と netns の unpin → bridge の
-//! 所有確認 → 専用 nft テーブルの削除（配下の chain と DNAT ルールも消える）→ bridge の削除 → 予約の解放。
+//! 入力検証 → 渡されていない endpoint の preflight → コンテナごとの veth の所有確認と削除・netns の unpin →
+//! bridge の所有確認 → 専用 nft テーブルの所有確認と削除（配下の chain と DNAT ルールも消える）→ bridge の削除 →
+//! 予約の解放。
 //! 各段を可能な限り試し（best-effort）、取り残しを [`NetworkDeleteReport::leftover`] にまとめて `Err` で
 //! 返す。最初のエラーは後続の失敗で上書きしない（ERR-1）。各段は「すでに無い」（`NotFound`）を完了扱いにする。
 //! veth の削除に失敗したコンテナは unpin せず、unpin に失敗したコンテナと同様に netns ハンドルごと [`NetworkDeleteError::retry`] で返すので、取り残しを
@@ -29,21 +30,29 @@
 //!
 //! # nft テーブルの所有
 //!
-//! テーブル名はネットワーク名からの導出で、名前だけでは所有を証明できない。そのため bridge の所有確認
-//! （作成時に付けた `IFLA_IFALIAS` のトークンと ifindex の一致）が通った場合にだけテーブルを削除する。
-//! 確認できない（別 link への差し替え・判定不能）ならテーブルには触れず `Unknown` で報告する。bridge は
-//! テーブルの削除を確認してから消す（テーブルの削除に失敗したら bridge を残し、再実行で証明を再利用する）。
-//! bridge が無い場合は所有を証明できないため、テーブルを削除しない。ただし読み取り専用の照会
-//! （`NFT_MSG_GETTABLE`）でテーブルも無いと確認できれば、前回の削除で解放済みとして成功扱いにする（冪等）。
-//! テーブルが残る・有無を確認できない場合は `Unknown` で報告して予約を保持し、手動での確認・解放に委ねる。
+//! テーブル名はネットワーク名からの導出で、名前だけでは所有を証明できない。そのため作成時にテーブルへ
+//! 所有トークン（bridge と共通。`NFTA_TABLE_USERDATA`）を載せ、削除前に `NFT_MSG_GETTABLE` で照会して
+//! トークンの一致を確認する。削除は照会で得たハンドル（`NFTA_TABLE_HANDLE`。カーネルが採番し再利用しない）
+//! 指定で行い、確認後に同名の別テーブルへ差し替えられても巻き込まない。トークンやハンドルが無い（旧版で
+//! 作ったテーブル等）・不一致・照会できない場合はテーブルに触れず `Unknown` で報告して予約を保持し、
+//! 手動での確認・解放に委ねる（fail-closed）。照会でテーブルが無いと確認できれば、前回の削除で解放済みとして
+//! 成功扱いにする（冪等）。bridge の所有確認（`IFLA_IFALIAS`）はテーブルとは独立で、bridge の削除にだけ使う。
+//! bridge はテーブルの削除を確認してから消す（テーブルの削除に失敗したら bridge を残す）。
 //!
-//! コンテナ側の資源（veth・netns pin）が残るあいだは bridge を削除しない。bridge が消えると所有の証明を
-//! 失い、再実行で残りを片付けられなくなるため（テーブルは先に削除してよい。再実行は `NotFound` を完了扱いにする）。
+//! # veth の所有
+//!
+//! veth の削除前に名前から ifindex と所属先 master を引き直し、ifindex が記録と一致し、かつ master が
+//! このネットワークの bridge であることを確認する。master が違う・無い link は元の veth と証明できないため
+//! 削除せず `Unknown` で報告する（ifindex が記録と異なる場合は元の veth は消失済みとして扱う）。
+//!
+//! コンテナ側の資源（veth・netns pin）が残るあいだは bridge を削除しない。bridge が消えると veth の所有の
+//! 証明（bridge への所属）を失い、再実行で残りを片付けられなくなるため（テーブルは先に削除してよい。
+//! 再実行は `NotFound` を完了扱いにする）。
 //!
 //! # 残余リスクと未実装（REPAIR-3）
 //!
-//! - nft テーブル自体の所有（ハンドル・userdata での照合）は未実装で、bridge の所有確認による間接的な証明に
-//!   とどまる。担当 Issue 未確定
+//! - テーブルの所有トークンは `NFTA_TABLE_USERDATA` を保持するカーネルを前提とする。保持しない
+//!   カーネルではトークンが読み戻せず、削除は拒否される（手動解放）
 //! - link の dump API が無いため、IPAM に記録されていない孤児 veth は回収しない。担当 Issue 未確定
 //! - コンテナ単体の切り離しと、プロセスをまたぐ残置 pin の清掃は未実装。担当 Issue 未確定
 
@@ -60,7 +69,7 @@ use crate::netlink_route::{LinkDelete, NetlinkRouteSocket};
 use crate::netns::{self, ContainerNetns};
 #[cfg(target_os = "linux")]
 use crate::nftables_batch::{NetlinkNetfilterSocket, NftFamily, TableDelete, TableGet};
-use crate::nftables_batch::{NftBatchOutcome, NftName};
+use crate::nftables_batch::{NftBatchOutcome, NftName, TableInfo};
 
 #[cfg(target_os = "linux")]
 use super::link_ref;
@@ -160,6 +169,8 @@ pub(crate) trait DeleteOps {
     type Netns;
     /// 名前から ifindex を引く。
     fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError>;
+    /// 名前から ifindex と所属先 master（bridge）の ifindex を引く。veth の所有確認に使う。
+    fn link_attachment(&self, name: &IfName) -> Result<(IfIndex, Option<IfIndex>), NetError>;
     /// bridge の名前から ifindex を引く。`IFLA_IFALIAS` が `token` と一致しなければ `FailedPrecondition`。
     fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError>;
     /// ifindex 指定で link を削除する（veth は peer も消える）。
@@ -168,10 +179,10 @@ pub(crate) trait DeleteOps {
     fn unpin_netns(&self, ns: Self::Netns) -> Result<(), UnpinFailure<Self::Netns>>;
     /// pin 先に何か残っているか（`symlink_metadata` 相当。`NotFound` だけが `Ok(false)`）。
     fn pin_exists(&self, path: &Path) -> Result<bool, NetError>;
-    /// 専用テーブルが存在するか（読み取り専用の照会。`NotFound` 相当だけが `Ok(false)`）。
-    fn table_exists(&self, table: &NftName) -> Result<bool, NetError>;
-    /// 専用テーブルを削除する（配下の chain・ルールも消える）。
-    fn delete_table(&self, table: &NftName) -> Result<(), NftApplyFailure>;
+    /// 専用テーブルのハンドルとユーザーデータ（所有トークン）を引く（読み取り専用の照会）。無ければ `NotFound`。
+    fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError>;
+    /// 専用テーブルをハンドル指定で削除する（配下の chain・ルールも消える）。名前では消さない。
+    fn delete_table(&self, table: &NftName, handle: u64) -> Result<(), NftApplyFailure>;
 }
 
 fn precondition(msg: &'static str) -> NetError {
@@ -233,6 +244,31 @@ fn prove_bridge<O: DeleteOps>(ops: &O, network: &CreatedNetwork) -> BridgeProof 
         Ok(_) => BridgeProof::Unproven(precondition("bridge ifindex changed (link was replaced)")),
         Err(e) if e.code() == NetErrorCode::NotFound => BridgeProof::Gone,
         Err(e) => BridgeProof::Unproven(e),
+    }
+}
+
+/// 専用 nft テーブルの所有確認の結果。作成時に `NFTA_TABLE_USERDATA` へ載せたトークンの一致で証明する。
+enum TableProof {
+    /// トークンが一致した。削除に使うハンドル。
+    Owned(u64),
+    /// テーブルが無い（前回の削除で解放済み）。
+    Absent,
+    /// 別者のテーブルへの差し替え・判定不能。
+    Unproven(NetError),
+}
+
+fn prove_table<O: DeleteOps>(ops: &O, network: &CreatedNetwork) -> TableProof {
+    match ops.table_info(&network.table) {
+        Err(e) if e.code() == NetErrorCode::NotFound => TableProof::Absent,
+        Err(e) => TableProof::Unproven(e),
+        Ok(info) => match (info.handle(), info.userdata()) {
+            (Some(handle), Some(data)) if data == network.bridge_token.as_bytes() => {
+                TableProof::Owned(handle)
+            }
+            _ => TableProof::Unproven(precondition(
+                "nft table ownership token mismatch (table was replaced or has no token)",
+            )),
+        },
     }
 }
 
@@ -352,7 +388,14 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
             address,
             netns,
         } = c;
-        let veth_gone = delete_veth(ops, &host_veth, host_index, &mut report, &mut failures);
+        let veth_gone = delete_veth(
+            ops,
+            &host_veth,
+            host_index,
+            network.bridge_index,
+            &mut report,
+            &mut failures,
+        );
         // veth が残っているなら unpin しない。ハンドルを消費すると再試行で veth を消す経路を失い、
         // 残った veth が IPAM 上の生存 endpoint として次回の preflight に拒否され続ける。
         let unpinned = if !veth_gone {
@@ -403,43 +446,20 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
 
     containers_clear &= retry.is_empty();
 
-    // 3. 専用 nft テーブル。bridge の所有確認（作成時の IFLA_IFALIAS トークン）をテーブルの所有の証明にする。
-    //    bridge が無い場合は所有を証明できないため、テーブルには触れず予約を保持して報告する。
+    // 3. 専用 nft テーブル。作成時に載せた所有トークン（NFTA_TABLE_USERDATA）の一致を確認し、確認した個体を
+    //    ハンドル指定で削除する（確認後に同名の別テーブルへ差し替えられても巻き込まない）。証明できなければ触れない。
     let proof = prove_bridge(ops, network);
-    let table_gone = match &proof {
-        BridgeProof::Unproven(_) => {
+    let table_gone = match prove_table(ops, network) {
+        TableProof::Absent => true,
+        TableProof::Unproven(e) => {
             report.leftover.push((
                 DeleteResource::NftTable(network.table.clone()),
                 ResourceState::Unknown,
             ));
+            failures.note(e, DeleteStep::DeleteNftTable);
             false
         }
-        BridgeProof::Gone => match ops.table_exists(&network.table) {
-            // bridge が無く、テーブルも無い: 前回の削除で解放済み（冪等。成功扱い）。
-            Ok(false) => true,
-            // テーブルが残っているが、所有トークンを確認できないので触れない（他者の同名テーブルを
-            // 壊さない。fail-closed）。予約は保持して取り残しとして報告する。
-            Ok(true) => {
-                report.leftover.push((
-                    DeleteResource::NftTable(network.table.clone()),
-                    ResourceState::Unknown,
-                ));
-                failures.note(
-                    precondition("nft table ownership cannot be proven because the bridge is gone"),
-                    DeleteStep::DeleteNftTable,
-                );
-                false
-            }
-            Err(e) => {
-                report.leftover.push((
-                    DeleteResource::NftTable(network.table.clone()),
-                    ResourceState::Unknown,
-                ));
-                failures.note(e, DeleteStep::DeleteNftTable);
-                false
-            }
-        },
-        BridgeProof::Owned => match ops.delete_table(&network.table) {
+        TableProof::Owned(handle) => match ops.delete_table(&network.table, handle) {
             Ok(()) => true,
             // `Aborted` + `NotFound` は「すでに無い」（冪等）。
             Err(f)
@@ -515,11 +535,12 @@ fn delete_veth<O: DeleteOps>(
     ops: &O,
     host: &IfName,
     expected: IfIndex,
+    bridge_index: IfIndex,
     report: &mut NetworkDeleteReport,
     failures: &mut Failures,
 ) -> bool {
     let res = DeleteResource::Veth(host.clone());
-    match ops.link_index(host) {
+    match ops.link_attachment(host) {
         Err(e) if e.code() == NetErrorCode::NotFound => {
             report.removed.push(res);
             true
@@ -530,11 +551,21 @@ fn delete_veth<O: DeleteOps>(
             failures.note(e, DeleteStep::DeleteVeth);
             false
         }
-        Ok(now) if now != expected => {
+        Ok((now, _)) if now != expected => {
             // ifindex は再利用されないので、元の veth はすでに消えている（同名の別 link に差し替わった）。
             // 別 link は巻き込まず、消失済みとして扱い、pin の解除とアドレス解放に進めるようにする。
             report.removed.push(res);
             true
+        }
+        Ok((_, master)) if master != Some(bridge_index) => {
+            // 名前と ifindex は一致するが、このネットワークの bridge に属していない。元の veth だと
+            // 証明できないので削除しない（fail-closed）。
+            report.leftover.push((res, ResourceState::Unknown));
+            failures.note(
+                precondition("veth is not attached to the network bridge (ownership not proven)"),
+                DeleteStep::DeleteVeth,
+            );
+            false
         }
         Ok(_) => match ops.delete_link(expected) {
             Ok(()) => {
@@ -602,6 +633,10 @@ impl DeleteOps for LinuxDeleteOps<'_> {
         self.route.link_index(name, self.timeout)
     }
 
+    fn link_attachment(&self, name: &IfName) -> Result<(IfIndex, Option<IfIndex>), NetError> {
+        self.route.link_index_and_master(name, self.timeout)
+    }
+
     fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError> {
         self.route.link_index_owned(name, token, self.timeout)
     }
@@ -630,16 +665,17 @@ impl DeleteOps for LinuxDeleteOps<'_> {
         }
     }
 
-    fn table_exists(&self, table: &NftName) -> Result<bool, NetError> {
+    fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError> {
         self.nft
-            .table_exists(&TableGet::new(NftFamily::Ipv4, table.clone()), self.timeout)
+            .table_info(&TableGet::new(NftFamily::Ipv4, table.clone()), self.timeout)
     }
 
-    fn delete_table(&self, table: &NftName) -> Result<(), NftApplyFailure> {
+    fn delete_table(&self, table: &NftName, handle: u64) -> Result<(), NftApplyFailure> {
         self.nft
             .send_batch(self.timeout, |batch| {
-                batch
-                    .push_with(|seq| TableDelete::new(NftFamily::Ipv4, table.clone()).build(seq))?;
+                batch.push_with(|seq| {
+                    TableDelete::by_handle(NftFamily::Ipv4, table.clone(), handle).build(seq)
+                })?;
                 Ok(())
             })
             .map(|_| ())
@@ -730,9 +766,16 @@ mod tests {
         pins_present: Vec<PathBuf>,
         pin_check_err: bool,
         table_err: Option<(NetErrorCode, NftBatchOutcome)>,
-        /// 照会（`table_exists`）で専用テーブルが存在するとみなすか。
-        table_present: bool,
-        table_exists_err: Option<NetErrorCode>,
+        /// 照会（`table_info`）で専用テーブルが存在しない（`NotFound`）とみなすか。
+        table_absent: bool,
+        /// 照会（`table_info`）の失敗。
+        table_query_err: Option<NetErrorCode>,
+        /// テーブルのユーザーデータ。`None` は所有トークン（`TOKEN`）。
+        table_userdata: Option<Vec<u8>>,
+        /// ハンドルを持たない応答にするか。
+        table_no_handle: bool,
+        /// veth の所属先 master。`None` は bridge（ifindex 7）、`Some(None)` は master なし。
+        veth_master: Option<Option<u32>>,
         bridge_lookup_err: Option<NetErrorCode>,
         bridge_index: Option<u32>,
         bridge_delete_err: Option<NetErrorCode>,
@@ -745,13 +788,7 @@ mod tests {
         fn calls(&self) -> Vec<String> {
             self.calls.borrow().clone()
         }
-    }
-
-    impl DeleteOps for Fake {
-        type Netns = ();
-
-        fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
-            self.rec(format!("link_index {}", name.as_str()));
+        fn link_index_inner(&self, name: &IfName) -> Result<IfIndex, NetError> {
             if self.absent_veths.iter().any(|n| n == name.as_str()) {
                 return Err(err(NetErrorCode::NotFound));
             }
@@ -759,6 +796,21 @@ mod tests {
                 return Err(err(c));
             }
             IfIndex::new(self.veth_index.unwrap_or(21))
+        }
+    }
+
+    impl DeleteOps for Fake {
+        type Netns = ();
+
+        fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
+            self.rec(format!("link_index {}", name.as_str()));
+            self.link_index_inner(name)
+        }
+        fn link_attachment(&self, name: &IfName) -> Result<(IfIndex, Option<IfIndex>), NetError> {
+            self.rec(format!("link_attachment {}", name.as_str()));
+            let index = self.link_index_inner(name)?;
+            let master = self.veth_master.unwrap_or(Some(7));
+            Ok((index, master.and_then(|m| IfIndex::new(m).ok())))
         }
         fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError> {
             self.rec(format!("owned_bridge_index {}", name.as_str()));
@@ -797,15 +849,35 @@ mod tests {
             }
             Ok(self.pins_present.iter().any(|p| p == path))
         }
-        fn table_exists(&self, table: &NftName) -> Result<bool, NetError> {
-            self.rec(format!("table_exists {}", table.as_str()));
-            match self.table_exists_err {
-                Some(c) => Err(err(c)),
-                None => Ok(self.table_present),
+        fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError> {
+            self.rec(format!("table_info {}", table.as_str()));
+            if let Some(c) = self.table_query_err {
+                return Err(err(c));
             }
+            if self.table_absent {
+                return Err(err(NetErrorCode::NotFound));
+            }
+            // nfgenmsg + NFTA_TABLE_HANDLE(4) + NFTA_TABLE_USERDATA(6) の応答を組み、実際の復号を通す。
+            let mut p = vec![2u8, 0, 0, 0];
+            let mut put = |ty: u16, data: &[u8]| {
+                p.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
+                p.extend_from_slice(&ty.to_ne_bytes());
+                p.extend_from_slice(data);
+                while p.len() % 4 != 0 {
+                    p.push(0);
+                }
+            };
+            if !self.table_no_handle {
+                put(4, &99u64.to_be_bytes());
+            }
+            put(
+                6,
+                self.table_userdata.as_deref().unwrap_or(TOKEN.as_bytes()),
+            );
+            TableInfo::decode(&p)
         }
-        fn delete_table(&self, table: &NftName) -> Result<(), NftApplyFailure> {
-            self.rec(format!("delete_table {}", table.as_str()));
+        fn delete_table(&self, table: &NftName, handle: u64) -> Result<(), NftApplyFailure> {
+            self.rec(format!("delete_table {} handle={handle}", table.as_str()));
             match self.table_err {
                 Some((c, outcome)) => Err(NftApplyFailure {
                     error: err(c),
@@ -879,11 +951,12 @@ mod tests {
         assert_eq!(
             fake.calls(),
             vec![
-                format!("link_index {}", host.as_str()),
+                format!("link_attachment {}", host.as_str()),
                 "delete_link 21".to_owned(),
                 "unpin_netns".to_owned(),
                 format!("owned_bridge_index {}", net.bridge.as_str()),
-                format!("delete_table {}", net.table.as_str()),
+                format!("table_info {}", net.table.as_str()),
+                format!("delete_table {} handle=99", net.table.as_str()),
                 "delete_link 7".to_owned(),
             ]
         );
@@ -1214,7 +1287,11 @@ mod tests {
     fn net1_delete_bridge_token_mismatch_not_deleted() {
         let (mut net, mut ipam, mut ports) = setup();
         net.bridge_token = "other".to_owned();
-        let fake = Fake::default();
+        // テーブルのトークンは一致する（テーブルの所有は bridge と独立に証明される）。
+        let fake = Fake {
+            table_userdata: Some(b"other".to_vec()),
+            ..Fake::default()
+        };
         let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
             .unwrap_err();
         assert_eq!(
@@ -1223,19 +1300,13 @@ mod tests {
         );
         assert_eq!(
             e.report.leftover,
-            vec![
-                (
-                    DeleteResource::NftTable(net.table.clone()),
-                    ResourceState::Unknown
-                ),
-                (
-                    DeleteResource::Bridge(net.bridge.clone()),
-                    ResourceState::Unknown
-                ),
-            ]
+            vec![(
+                DeleteResource::Bridge(net.bridge.clone()),
+                ResourceState::Unknown
+            )]
         );
-        // 所有を証明できないので、テーブルにも bridge にも触れない（P0）。
-        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_")));
+        // 所有を証明できない bridge には触れない（P0）。
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
     }
 
     /// NET-1・TASK-139.4: bridge がすでに無ければ完了扱い。ifindex 不一致は削除しない。
@@ -1244,19 +1315,17 @@ mod tests {
         let (net, mut ipam, mut ports) = setup();
         let fake = Fake {
             bridge_lookup_err: Some(NetErrorCode::NotFound),
-            table_present: true,
             ..Fake::default()
         };
-        // bridge が無いときは所有を証明できないので、テーブルには触れず Unknown で報告する。
-        let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
-        assert_eq!(e.step, DeleteStep::DeleteNftTable);
+        // bridge が無くても、テーブルは自分のトークンで所有を証明できれば削除して完了する。
+        let report =
+            delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports).unwrap();
         assert!(
-            e.report
+            report
                 .removed
                 .contains(&DeleteResource::Bridge(net.bridge.clone()))
         );
-        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_")));
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
 
         let fake = Fake {
             bridge_index: Some(8),
@@ -1383,31 +1452,80 @@ mod tests {
         }
     }
 
-    /// NET-1・TASK-139.4: bridge が無い（所有を証明できない）ときは同名テーブルを削除せず、予約・アドレスを保持する。
+    /// NET-1・TASK-139.4・P0: テーブルの所有トークンが一致しない（別者の同名テーブル）・ハンドルが無い場合は
+    /// 削除せず、予約・アドレスを保持する。bridge の所有確認が通っていても同じ。
     #[test]
-    fn net1_delete_bridge_gone_refuses_to_delete_unproven_table() {
+    fn net1_delete_refuses_table_without_ownership_token() {
+        for fake in [
+            Fake {
+                table_userdata: Some(b"someone-else".to_vec()),
+                ..Fake::default()
+            },
+            Fake {
+                table_no_handle: true,
+                ..Fake::default()
+            },
+            Fake {
+                bridge_lookup_err: Some(NetErrorCode::NotFound),
+                table_userdata: Some(b"someone-else".to_vec()),
+                ..Fake::default()
+            },
+        ] {
+            let (net, mut ipam, mut ports) = setup();
+            reserve_port(&mut ports, "c1", 8080);
+            let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
+                .unwrap_err();
+            assert_eq!(
+                (e.code(), e.step),
+                (NetErrorCode::FailedPrecondition, DeleteStep::DeleteNftTable)
+            );
+            assert_eq!(
+                e.report.leftover.first(),
+                Some(&(
+                    DeleteResource::NftTable(net.table.clone()),
+                    ResourceState::Unknown
+                ))
+            );
+            assert!(!fake.calls().iter().any(|c| c.starts_with("delete_")));
+            assert_eq!(ports.len(), 1);
+        }
+    }
+
+    /// NET-1・TASK-139.4: 所有を確認したテーブルは、照会で得たハンドル指定で削除する（名前では消さない）。
+    #[test]
+    fn net1_delete_table_by_proven_handle() {
         let (net, mut ipam, mut ports) = setup();
-        reserve_port(&mut ports, "c1", 8080);
-        let fake = Fake {
-            bridge_lookup_err: Some(NetErrorCode::NotFound),
-            table_present: true,
-            ..Fake::default()
-        };
-        let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
-        assert_eq!(
-            (e.code(), e.step),
-            (NetErrorCode::FailedPrecondition, DeleteStep::DeleteNftTable)
-        );
-        assert_eq!(
-            e.report.leftover,
-            vec![(
-                DeleteResource::NftTable(net.table.clone()),
-                ResourceState::Unknown
-            )]
-        );
-        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_")));
-        assert_eq!(ports.len(), 1);
+        let fake = Fake::default();
+        delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports).unwrap();
+        let calls = fake.calls();
+        let q = calls.iter().position(|c| c.starts_with("table_info"));
+        let d = calls
+            .iter()
+            .position(|c| c == &format!("delete_table {} handle=99", net.table.as_str()));
+        assert!(q.is_some() && d.is_some() && q < d, "{calls:?}");
+    }
+
+    /// NET-1・TASK-139.4・P0: 名前と ifindex が一致しても bridge に属していない link は元の veth と証明できず、
+    /// 削除しない（unpin もしない）。
+    #[test]
+    fn net1_delete_refuses_veth_not_attached_to_bridge() {
+        for master in [None, Some(8)] {
+            let (net, mut ipam, mut ports) = setup();
+            let c1 = attached(&mut ipam, "c1");
+            let fake = Fake {
+                veth_master: Some(master),
+                ..Fake::default()
+            };
+            let e = delete_network_with(&fake, &net, vec![c1], &netns_dir(), &mut ipam, &mut ports)
+                .unwrap_err();
+            assert_eq!(
+                (e.code(), e.step),
+                (NetErrorCode::FailedPrecondition, DeleteStep::DeleteVeth)
+            );
+            assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+            assert!(!fake.calls().iter().any(|c| c == "unpin_netns"));
+            assert_eq!(e.retry.len(), 1);
+        }
     }
 
     /// NET-1・TASK-139.4: 削除成功後の再実行（bridge もテーブルも無い）は成功に収束する（冪等）。
@@ -1418,7 +1536,7 @@ mod tests {
         delete_network_with(&first, &net, vec![], &netns_dir(), &mut ipam, &mut ports).unwrap();
         let rerun = Fake {
             bridge_lookup_err: Some(NetErrorCode::NotFound),
-            table_present: false,
+            table_absent: true,
             ..Fake::default()
         };
         let report =
@@ -1438,7 +1556,7 @@ mod tests {
         let (net, mut ipam, mut ports) = setup();
         let fake = Fake {
             bridge_lookup_err: Some(NetErrorCode::NotFound),
-            table_exists_err: Some(NetErrorCode::Timeout),
+            table_query_err: Some(NetErrorCode::Timeout),
             ..Fake::default()
         };
         let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)

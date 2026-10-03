@@ -289,7 +289,7 @@ mod socket {
     };
     use crate::netlink_route::{
         IFINFOMSG_LEN, IFLA_IFNAME, IfIndex, IfName, LinkCreate, LinkDelete, LinkSet, RTM_GETLINK,
-        RTM_NEWLINK, decode_ifinfomsg_alias, decode_ifinfomsg_index,
+        RTM_NEWLINK, decode_ifinfomsg_alias, decode_ifinfomsg_index, decode_ifinfomsg_master,
     };
     use crate::nftables_batch::{MAX_BATCH_LEN, NftBatchBytes};
     use crate::sys::{self, Deadline, Readiness, RecvMeta, SysError};
@@ -639,10 +639,35 @@ mod socket {
             timeout: Duration,
             build: impl FnOnce(&mut NlMsgBuilder) -> Result<(), NetError>,
         ) -> Result<NetlinkReply, NetError> {
+            self.request_with_seq(None, msg_type, flags, timeout, build)
+        }
+
+        /// [`request`](Self::request) の seq を呼び出し側が指定できる版（`Some(seq)`。`None` は自前採番）。
+        ///
+        /// 同じ fd を別の seq 空間（`NetlinkNetfilterSocket` のバッチ用 `next_seq`）と共有する場合に、
+        /// 時間切れしたバッチの遅延 ACK と seq が衝突しないよう、呼び出し側が確保した重ならない seq を渡す
+        /// ために使う（NET-11・REPAIR-5）。`Some(0)` は要求に使えないため `InvalidArgument`。
+        pub(crate) fn request_with_seq(
+            &self,
+            fixed_seq: Option<u32>,
+            msg_type: u16,
+            flags: u16,
+            timeout: Duration,
+            build: impl FnOnce(&mut NlMsgBuilder) -> Result<(), NetError>,
+        ) -> Result<NetlinkReply, NetError> {
             record_net_op(self.recorder.as_ref(), NetOpKind::NetlinkRequest, || {
                 let deadline = Deadline::after(timeout);
                 let _turn = self.gate.acquire(&deadline, timeout)?;
-                let seq = self.seq.next();
+                let seq = match fixed_seq {
+                    Some(0) => {
+                        return Err(NetError::new(
+                            NetErrorCode::InvalidArgument,
+                            "netlink request seq must not be zero",
+                        ));
+                    }
+                    Some(s) => s,
+                    None => self.seq.next(),
+                };
                 let dump = is_dump_request(msg_type, flags);
                 let mut builder =
                     NlMsgBuilder::new(msg_type, flags | NLM_F_REQUEST | NLM_F_ACK, seq, 0);
@@ -731,26 +756,45 @@ mod socket {
             }
         }
 
-        fn link_index_and_alias(
+        /// 名前から ifindex と所属先 master（`IFLA_MASTER`）の ifindex を引く（TASK-139.4・#317）。
+        /// master が無い link は `None`。veth を削除する直前に bridge への所属を照合して、同名の別 link を
+        /// 巻き込まないために使う。
+        pub fn link_index_and_master(
             &self,
             name: &IfName,
             timeout: Duration,
-        ) -> Result<(IfIndex, Option<String>), NetError> {
+        ) -> Result<(IfIndex, Option<IfIndex>), NetError> {
+            let msg = self.get_link_message(name, timeout)?;
+            let index = decode_ifinfomsg_index(&msg)?;
+            let master = decode_ifinfomsg_master(&msg)?;
+            Ok((index, master))
+        }
+
+        fn get_link_message(&self, name: &IfName, timeout: Duration) -> Result<Vec<u8>, NetError> {
             let reply = self.request(RTM_GETLINK, 0, timeout, |b| {
                 b.put_fixed(&[0u8; IFINFOMSG_LEN])?;
                 let mut v = name.as_str().as_bytes().to_vec();
                 v.push(0);
                 b.put_attr(IFLA_IFNAME, &v)
             })?;
-            let msg = reply
+            reply
                 .messages()
                 .iter()
                 .find(|m| m.msg_type() == RTM_NEWLINK)
+                .map(|m| m.payload().to_vec())
                 .ok_or_else(|| {
                     NetError::new(NetErrorCode::Internal, "no RTM_NEWLINK in link reply")
-                })?;
-            let index = decode_ifinfomsg_index(msg.payload())?;
-            let alias = decode_ifinfomsg_alias(msg.payload())?;
+                })
+        }
+
+        fn link_index_and_alias(
+            &self,
+            name: &IfName,
+            timeout: Duration,
+        ) -> Result<(IfIndex, Option<String>), NetError> {
+            let msg = self.get_link_message(name, timeout)?;
+            let index = decode_ifinfomsg_index(&msg)?;
+            let alias = decode_ifinfomsg_alias(&msg)?;
             Ok((index, alias))
         }
 

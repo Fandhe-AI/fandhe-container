@@ -477,6 +477,32 @@ pub fn decode_ifinfomsg_alias(payload: &[u8]) -> Result<Option<String>, NetError
     Ok(None)
 }
 
+/// `RTM_NEWLINK` 応答のペイロードから `IFLA_MASTER`（所属先 bridge の ifindex）を取り出す（無ければ `None`）。
+///
+/// 応答はカーネル由来の外部入力として属性走査で検証する。長さが 4 バイトでない属性・0 以下の値は
+/// `DataLoss`（TASK-139.4・#317）。
+pub fn decode_ifinfomsg_master(payload: &[u8]) -> Result<Option<IfIndex>, NetError> {
+    let attrs = payload.get(IFINFOMSG_LEN..).ok_or_else(|| {
+        NetError::new(
+            NetErrorCode::DataLoss,
+            "link reply is shorter than ifinfomsg",
+        )
+    })?;
+    for attr in crate::netlink::AttrIter::new(attrs) {
+        let attr = attr?;
+        if attr.attr_type() == IFLA_MASTER {
+            let raw = <[u8; 4]>::try_from(attr.payload()).map_err(|_| {
+                NetError::new(NetErrorCode::DataLoss, "IFLA_MASTER has an invalid length")
+            })?;
+            let index = IfIndex::new(u32::from_ne_bytes(raw)).map_err(|_| {
+                NetError::new(NetErrorCode::DataLoss, "IFLA_MASTER is not a valid ifindex")
+            })?;
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
 /// `RTM_NEWLINK` 応答（`RTM_GETLINK` の返答）のペイロードから ifindex を取り出す。
 ///
 /// 応答はカーネル由来の外部入力として扱い、添字アクセスを使わず長さ・値を検証する。
@@ -839,6 +865,32 @@ mod tests {
         assert_eq!(ifi.get(4..8).unwrap(), &5i32.to_ne_bytes());
         assert_eq!(ifi.get(8..16).unwrap(), &[0u8; 8]);
         assert_eq!(attrs, vec![(19, 1u32.to_ne_bytes().to_vec())]);
+    }
+
+    /// NET-1・TASK-139.4: RTM_NEWLINK 応答の IFLA_MASTER を復号する。無ければ None、壊れた長さ・0 は DataLoss。
+    #[test]
+    fn net1_decode_master() {
+        let mut p = vec![0u8; IFINFOMSG_LEN];
+        assert_eq!(decode_ifinfomsg_master(&p).unwrap(), None);
+        p.extend_from_slice(&8u16.to_ne_bytes());
+        p.extend_from_slice(&10u16.to_ne_bytes());
+        p.extend_from_slice(&7u32.to_ne_bytes());
+        assert_eq!(
+            decode_ifinfomsg_master(&p).unwrap(),
+            Some(IfIndex::new(7).unwrap())
+        );
+        let mut zero = vec![0u8; IFINFOMSG_LEN];
+        zero.extend_from_slice(&8u16.to_ne_bytes());
+        zero.extend_from_slice(&10u16.to_ne_bytes());
+        zero.extend_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(
+            decode_ifinfomsg_master(&zero).unwrap_err().code(),
+            NetErrorCode::DataLoss
+        );
+        assert_eq!(
+            decode_ifinfomsg_master(&[0u8; 3]).unwrap_err().code(),
+            NetErrorCode::DataLoss
+        );
     }
 
     /// NET-1・TASK-139.2.1: bridge 接続は ifi_index にポートの ifindex、IFLA_MASTER(10) に bridge の

@@ -6,10 +6,14 @@
 //! （TASK-185.2・#345）・上流転送（`dns_helper::upstream`。TASK-185.3・#346）・host/none の `--dns` 反映（TASK-185.4・#347）・
 //! 軽量運用の `--dns` 直接書き込み（TASK-146.2・#336）から再利用される。
 //!
-//! 本モジュールは検証のみで、`<hostname>:<ip>` の分割パース、ファイル反映、none モードでの
-//! loopback 制限は未実装（TASK-185.2〜185.4。REPAIR-3）。エラーの `message` は固定の英語文字列で、
+//! 本モジュール本体は検証のみ。host/none の `--dns` 反映と none の loopback 制限は子モジュール
+//! `resolv_conf`（TASK-185.4・#347）、ユーザー定義ネットワーク上の上流転送は `dns_helper::upstream`
+//! （TASK-185.3・#346）。`<hostname>:<ip>` の分割パース・`/etc/hosts` 追記は未実装（TASK-185.2。
+//! REPAIR-3）。エラーの `message` は固定の英語文字列で、
 //! 入力値を載せない（ログ・ファイルへの行注入を防ぐ）。`dns_helper::DnsName`（小文字化・末尾ドット除去）
 //! とは意味論が異なり、ここでは入力をそのまま保持し、末尾ドット（空ラベル）は拒否する。
+
+pub mod resolv_conf;
 
 use std::net::IpAddr;
 
@@ -38,6 +42,8 @@ pub enum InputViolation {
     InvalidHostnameChar,
     /// IPv4 / IPv6 のいずれとしても解釈できない。
     NotIpAddress,
+    /// none モードで loopback 以外の `--dns` を指定した。
+    NotLoopbackForNoneMode,
 }
 
 impl InputViolation {
@@ -51,6 +57,7 @@ impl InputViolation {
             Self::LabelHyphenEdge => "LABEL_HYPHEN_EDGE",
             Self::InvalidHostnameChar => "INVALID_HOSTNAME_CHAR",
             Self::NotIpAddress => "NOT_IP_ADDRESS",
+            Self::NotLoopbackForNoneMode => "NOT_LOOPBACK_FOR_NONE_MODE",
         }
     }
 
@@ -66,6 +73,9 @@ impl InputViolation {
                 "invalid hostname: only ASCII letters, digits, hyphens and dots are allowed"
             }
             Self::NotIpAddress => "invalid IP address: not a valid IPv4 or IPv6 address",
+            Self::NotLoopbackForNoneMode => {
+                "invalid --dns for none network mode: only loopback addresses (127.0.0.0/8, ::1) are allowed"
+            }
         }
     }
 }
@@ -133,7 +143,7 @@ impl HostName {
 ///
 /// std のパーサに従い fail-closed: 先頭ゼロのオクテット（`010.0.0.1`）・ゾーン ID（`fe80::1%eth0`）・
 /// 角括弧（`[::1]`）・CIDR（`1.2.3.4/24`）は拒否し、IPv4 射影（`::ffff:192.0.2.1`）は受理する。
-/// アドレス種別（loopback 等）の制限は行わない（none モードの制限は TASK-185.4）。
+/// アドレス種別（loopback 等）の制限は行わない（none モードの loopback 制限は `resolv_conf` が行う。TASK-185.4）。
 pub fn parse_ip_addr(s: &str) -> Result<IpAddr, NetError> {
     if has_control_or_whitespace(s) {
         return Err(InputViolation::ControlOrWhitespace.into());
@@ -281,6 +291,10 @@ mod tests {
             (InputViolation::LabelHyphenEdge, "LABEL_HYPHEN_EDGE"),
             (InputViolation::InvalidHostnameChar, "INVALID_HOSTNAME_CHAR"),
             (InputViolation::NotIpAddress, "NOT_IP_ADDRESS"),
+            (
+                InputViolation::NotLoopbackForNoneMode,
+                "NOT_LOOPBACK_FOR_NONE_MODE",
+            ),
         ];
         for (v, s) in table {
             assert_eq!(v.as_str(), s);

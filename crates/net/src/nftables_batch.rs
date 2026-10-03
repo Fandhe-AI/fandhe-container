@@ -33,7 +33,9 @@
 //! 定数値は Linux UAPI（`nfnetlink.h`・`netfilter.h`）に基づく。
 
 use crate::error::{NetError, NetErrorCode};
-use crate::netlink::{MAX_MESSAGE_LEN, NLM_F_REQUEST, NLMSG_HEADER_LEN, NlMsgBuilder, NlMsgHeader};
+use crate::netlink::{
+    MAX_MESSAGE_LEN, NLM_F_ACK, NLM_F_REQUEST, NLMSG_HEADER_LEN, NlMsgBuilder, NlMsgHeader,
+};
 
 /// nf_tables のサブシステム ID（`NFNL_SUBSYS_NFTABLES`）。
 pub const NFNL_SUBSYS_NFTABLES: u8 = 10;
@@ -256,6 +258,11 @@ impl NftBatch {
         if header.flags() & NLM_F_REQUEST == 0 {
             return Err(invalid("message lacks NLM_F_REQUEST flag"));
         }
+        // body_seqs は「成功時にも ACK が返る seq」の一覧として #306 が ACK 待ちに使う。
+        // NLM_F_ACK のない本体を登録すると成功時に ACK が来ず期限切れになるため、必須にする。
+        if header.flags() & NLM_F_ACK == 0 {
+            return Err(invalid("message lacks NLM_F_ACK flag"));
+        }
         let payload = msg.get(NLMSG_HEADER_LEN..).unwrap_or(&[]);
         let nfg = NfGenMsg::decode(payload)
             .map_err(|_| invalid("message payload is shorter than nfgenmsg"))?;
@@ -309,7 +316,7 @@ mod tests {
     const NEWTABLE: u16 = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, 0);
 
     fn body(seq: u32) -> Result<NlMsgBuilder, NetError> {
-        let mut b = NlMsgBuilder::new(NEWTABLE, NLM_F_REQUEST, seq, 0);
+        let mut b = NlMsgBuilder::new(NEWTABLE, NLM_F_REQUEST | NLM_F_ACK, seq, 0);
         NfGenMsg::new(NFPROTO_INET, 0).put_into(&mut b)?;
         Ok(b)
     }
@@ -438,7 +445,7 @@ mod tests {
         for ty in [NFNL_MSG_BATCH_BEGIN, 16u16, nfnl_msg_type(11, 0)] {
             let e = b
                 .push_with(|s| {
-                    let mut m = NlMsgBuilder::new(ty, NLM_F_REQUEST, s, 0);
+                    let mut m = NlMsgBuilder::new(ty, NLM_F_REQUEST | NLM_F_ACK, s, 0);
                     NfGenMsg::new(0, 0).put_into(&mut m)?;
                     Ok(m)
                 })
@@ -448,14 +455,23 @@ mod tests {
         assert_eq!(b.finish().unwrap().bytes().len(), 40);
     }
 
-    /// REPAIR-2: NLM_F_REQUEST 欠落・nfgenmsg 欠落・version/family 不正は拒否し状態を変えない。
+    /// REPAIR-2: NLM_F_REQUEST / NLM_F_ACK 欠落・nfgenmsg 欠落・version/family 不正は拒否し状態を変えない。
     #[test]
     fn batch_rejects_malformed_body() {
         let mut b = NftBatch::new(1).unwrap();
-        // 要求フラグなし
+        // ACK フラグなし（REQUEST のみ）
         let e = b
             .push_with(|s| {
-                let mut m = NlMsgBuilder::new(NEWTABLE, 0, s, 0);
+                let mut m = NlMsgBuilder::new(NEWTABLE, NLM_F_REQUEST, s, 0);
+                NfGenMsg::new(NFPROTO_INET, 0).put_into(&mut m)?;
+                Ok(m)
+            })
+            .unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        // 要求フラグなし（ACK のみ）
+        let e = b
+            .push_with(|s| {
+                let mut m = NlMsgBuilder::new(NEWTABLE, NLM_F_ACK, s, 0);
                 NfGenMsg::new(NFPROTO_INET, 0).put_into(&mut m)?;
                 Ok(m)
             })
@@ -463,14 +479,14 @@ mod tests {
         assert_eq!(e.code(), NetErrorCode::InvalidArgument);
         // nfgenmsg なし（ペイロード空）
         let e = b
-            .push_with(|s| Ok(NlMsgBuilder::new(NEWTABLE, NLM_F_REQUEST, s, 0)))
+            .push_with(|s| Ok(NlMsgBuilder::new(NEWTABLE, NLM_F_REQUEST | NLM_F_ACK, s, 0)))
             .unwrap_err();
         assert_eq!(e.code(), NetErrorCode::InvalidArgument);
         // version 不正・family 不正
         for raw in [[NFPROTO_INET, 1, 0, 0], [99, NFNETLINK_V0, 0, 0]] {
             let e = b
                 .push_with(|s| {
-                    let mut m = NlMsgBuilder::new(NEWTABLE, NLM_F_REQUEST, s, 0);
+                    let mut m = NlMsgBuilder::new(NEWTABLE, NLM_F_REQUEST | NLM_F_ACK, s, 0);
                     m.put_fixed(&raw)?;
                     Ok(m)
                 })
@@ -488,7 +504,7 @@ mod tests {
         let e = b.push_with(|_| Err(invalid("boom"))).unwrap_err();
         assert_eq!(e.message(), "boom");
         let big = |s: u32| {
-            let mut m = NlMsgBuilder::new(NEWTABLE, NLM_F_REQUEST, s, 0);
+            let mut m = NlMsgBuilder::new(NEWTABLE, NLM_F_REQUEST | NLM_F_ACK, s, 0);
             NfGenMsg::new(0, 0).put_into(&mut m)?;
             m.put_fixed(&vec![0u8; MAX_BATCH_LEN / 2])?;
             Ok(m)

@@ -5,7 +5,7 @@
 //! CI 通過のための弱体化ではない。`AGENTS.md`「実機前提テスト」節）。非 Linux では対象外。
 //!
 //! # 流れ
-//! - ランチャ（host netns・root）: (1) `HostNetns::detect()` が成功し id が `/proc/1/ns/net` と一致、
+//! - ランチャ（host netns・root）: (1) `HostNetns::detect(信頼済み基準)` が成功し id が基準（テストではホスト実機の `/proc/1/ns/net`）と一致、
 //!   (2) 子 `sleep` が `verify_process` で `Member`、(3) その子の `/proc/<pid>/net/dev` の interface 名集合が
 //!   ホストの `/proc/net/dev` と一致、(4) `unshare --net` で起こした子は `Other` になり、
 //!   (5) `unshare --net -- <exe> --child` の子では `detect()` が `FAILED_PRECONDITION`（fail-closed）になる
@@ -41,7 +41,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_net::error::NetErrorCode;
-    use fandhe_container_net::network_mode::host::{HostNetns, HostNetnsMembership};
+    use fandhe_container_net::network_mode::host::{HostNetns, HostNetnsMembership, NsId};
 
     fn timeout() -> Duration {
         let secs = std::env::var("FANDHE_CONTAINER_TEST_TIMEOUT_SECS")
@@ -144,8 +144,10 @@ mod linux {
         require_root();
 
         // (1) 呼び出しスレッドがホスト netns にいる。
-        let host = HostNetns::detect().expect("detect host netns");
+        // 実機テストはホスト上の root で動くため、ここに限り /proc/1 を信頼済み基準として使う。
         let init = fs::metadata("/proc/1/ns/net").expect("stat /proc/1/ns/net");
+        let trusted = NsId::new(init.dev(), init.ino());
+        let host = HostNetns::detect(trusted).expect("detect host netns");
         assert_eq!(
             (host.id().dev(), host.id().ino()),
             (init.dev(), init.ino()),
@@ -181,6 +183,8 @@ mod linux {
                 .args(["--net", "--"])
                 .arg(exe)
                 .arg("--child")
+                .arg(init.dev().to_string())
+                .arg(init.ino().to_string())
                 .stdin(Stdio::null())
                 .spawn()
                 .expect("spawn unshare child"),
@@ -194,7 +198,16 @@ mod linux {
     }
 
     pub fn child() {
-        match HostNetns::detect() {
+        // 引数は `--child <dev> <ino>`（ランチャが渡すホスト netns の信頼済み基準）。
+        let args: Vec<String> = std::env::args().collect();
+        let pos = args.iter().position(|a| a == "--child").unwrap_or(0);
+        let num = |i: usize| -> u64 {
+            args.get(pos + i)
+                .and_then(|v| v.parse().ok())
+                .expect("child requires <dev> <ino> arguments")
+        };
+        let trusted = NsId::new(num(1), num(2));
+        match HostNetns::detect(trusted) {
             Err(e) if e.code() == NetErrorCode::FailedPrecondition => {}
             other => {
                 eprintln!("expected FAILED_PRECONDITION in unshared netns, got {other:?}");

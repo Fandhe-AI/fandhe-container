@@ -7,9 +7,11 @@
 //! unsafe も追加しない。
 //!
 //! # 契約
-//! - ホスト netns の基準は `/proc/1/ns/net`。読めない場合は fail-closed（非 root では
-//!   `PermissionDenied`。rootless の host モードは NET-9・TASK-147 の領域で未対応）
-//! - 呼び出しスレッドがホスト netns 以外にいる場合は `FailedPrecondition`。setns による加入
+//! - ホスト netns の基準は runtime が渡す信頼済み識別子（[`NsId`]）のみ。`/proc/1/ns/net` は基準に使わない
+//!   （PID namespace 内では PID 1 がホストと別 netns になり得て、誤った基準で判定してしまうため）。
+//!   runtime はホスト側で取得した参照（起動時に保持した netns の (dev, ino) 等）を渡す責務を持つ。
+//!   rootless の host モードは NET-9・TASK-147 の領域で未対応
+//! - 呼び出しスレッドが基準の netns 以外にいる場合は `FailedPrecondition`。setns による加入
 //!   （runtime 自体がホスト以外の netns で動く構成）は未実装の将来仕様（REPAIR-3）
 //! - [`HostNetns::verify_process`] は pid 再利用による TOCTOU が残る。呼び出し側は自分の子 pid に限って使う
 //! - エラーメッセージは固定の英語文で、パスや inode の中身を含めない
@@ -74,12 +76,12 @@ fn stat_ns(path: &Path) -> Result<NsId, NetError> {
     Ok(NsId::new(md.dev(), md.ino()))
 }
 
-/// 呼び出しスレッドの netns が init の netns と一致することを確認する純粋関数。
+/// 呼び出しスレッドの netns が信頼済みホスト netns と一致することを確認する純粋関数。
 ///
 /// 一致しなければ `FailedPrecondition`（fail-closed）。
-pub fn classify_host_netns(thread: NsId, init: NsId) -> Result<NsId, NetError> {
-    if thread == init {
-        Ok(init)
+pub fn classify_host_netns(thread: NsId, trusted_host: NsId) -> Result<NsId, NetError> {
+    if thread == trusted_host {
+        Ok(trusted_host)
     } else {
         Err(NetError::new(
             NetErrorCode::FailedPrecondition,
@@ -89,14 +91,14 @@ pub fn classify_host_netns(thread: NsId, init: NsId) -> Result<NsId, NetError> {
 }
 
 impl HostNetns {
-    /// 呼び出しスレッドがホスト netns（`/proc/1/ns/net`）にいることを確認する。
+    /// 呼び出しスレッドが、runtime の渡した信頼済みホスト netns `trusted_host` にいることを確認する。
     ///
-    /// netns はスレッド単位のため `/proc/thread-self` を参照する。
-    pub fn detect() -> Result<Self, NetError> {
+    /// `trusted_host` は runtime がホスト側で取得した識別子で、`/proc/1/ns/net` からは導出しない
+    /// （PID namespace 内で誤判定するため。NET-6）。netns はスレッド単位のため `/proc/thread-self` を参照する。
+    pub fn detect(trusted_host: NsId) -> Result<Self, NetError> {
         let thread = stat_ns(Path::new("/proc/thread-self/ns/net"))?;
-        let init = stat_ns(Path::new("/proc/1/ns/net"))?;
         Ok(Self {
-            id: classify_host_netns(thread, init)?,
+            id: classify_host_netns(thread, trusted_host)?,
         })
     }
 
@@ -185,20 +187,13 @@ mod tests {
         assert_eq!(e.code(), NetErrorCode::NotFound);
     }
 
-    /// NET-6: detect は環境依存（root なら Ok、非 root は /proc/1 が読めず PERMISSION_DENIED。
-    /// コンテナ内など別 netns なら FAILED_PRECONDITION）。それ以外の code にはならない。
+    /// NET-6: detect は渡された信頼済み基準とのみ照合する。自スレッドの id なら Ok、別 id なら
+    /// FAILED_PRECONDITION（/proc/1 は参照しない）。
     #[test]
-    fn net6_detect_known_outcomes() {
-        match HostNetns::detect() {
-            Ok(h) => assert_eq!(h.id(), stat_ns(Path::new("/proc/1/ns/net")).unwrap()),
-            Err(e) => assert!(
-                matches!(
-                    e.code(),
-                    NetErrorCode::PermissionDenied | NetErrorCode::FailedPrecondition
-                ),
-                "unexpected code {:?}",
-                e.code()
-            ),
-        }
+    fn net6_detect_uses_trusted_reference() {
+        let own = stat_ns(Path::new("/proc/thread-self/ns/net")).unwrap();
+        assert_eq!(HostNetns::detect(own).unwrap().id(), own);
+        let e = HostNetns::detect(NsId::new(own.dev(), own.ino() + 1)).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
     }
 }

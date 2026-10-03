@@ -71,3 +71,53 @@ fn net11_body_without_ack_is_rejected() {
     assert!(out.body_seqs().is_empty());
     assert_eq!(out.bytes().len(), 40);
 }
+
+/// NET-11・TASK-137.2: 公開 API だけで「テーブル作成 → nat base chain 作成 → テーブル削除」を組む。
+#[test]
+fn net11_table_chain_batch_via_public_api() {
+    use fandhe_container_net::netlink::NLM_F_CREATE;
+    use fandhe_container_net::nftables_batch::{
+        BaseChain, ChainCreate, ChainType, NF_IP_PRI_NAT_SRC, NfInetHook, NftFamily, NftName,
+        TableCreate, TableDelete,
+    };
+
+    let t = NftName::new("fandhe").expect("name");
+    let create = TableCreate::new(NftFamily::Inet, t.clone());
+    let chain = ChainCreate::base(
+        NftFamily::Inet,
+        t.clone(),
+        NftName::new("postrouting").expect("name"),
+        BaseChain {
+            chain_type: ChainType::Nat,
+            hook: NfInetHook::PostRouting,
+            priority: NF_IP_PRI_NAT_SRC,
+        },
+    )
+    .expect("base");
+    let del = TableDelete::new(NftFamily::Inet, t);
+
+    let mut batch = NftBatch::new(1).expect("new");
+    batch.push_with(|s| create.build(s)).expect("create");
+    batch.push_with(|s| chain.build(s)).expect("chain");
+    batch.push_with(|s| del.build(s)).expect("del");
+    let out = batch.finish().expect("finish");
+
+    assert_eq!(out.body_seqs(), &[2, 3, 4][..]);
+    let got: Vec<(u16, u16, u32)> = NlMsgIter::new(out.bytes())
+        .map(|m| {
+            let h = m.expect("decode").header();
+            (h.msg_type(), h.flags(), h.seq())
+        })
+        .collect();
+    let ra = NLM_F_REQUEST | NLM_F_ACK;
+    assert_eq!(
+        got,
+        vec![
+            (NFNL_MSG_BATCH_BEGIN, NLM_F_REQUEST, 1),
+            (0x0A00, ra | NLM_F_CREATE, 2),
+            (0x0A03, ra | NLM_F_CREATE, 3),
+            (0x0A02, ra, 4),
+            (NFNL_MSG_BATCH_END, NLM_F_REQUEST, 5),
+        ]
+    );
+}

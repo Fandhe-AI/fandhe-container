@@ -7,7 +7,7 @@
 //!
 //! # 呼び出し元
 //!
-//! - NEWTABLE / NEWCHAIN / DELTABLE 等の本体メッセージ組み立て（#305・TASK-137.2）が
+//! - NEWTABLE / NEWCHAIN / DELTABLE の本体メッセージ組み立て（`table_chain`。#305・TASK-137.2）が
 //!   `NfGenMsg::put_into` と `nfnl_msg_type` を使い、`NftBatch::push_with` へ積む
 //! - `NETLINK_NETFILTER` ソケットでの送信と ACK 判定（#306・TASK-137.3）が `NftBatchBytes` を送る
 //!
@@ -29,8 +29,11 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! 本体メッセージ（#305）、ソケット送信と ACK 判定（#306）、実機結合テスト（#307）は未実装。
+//! ルール（NEWRULE / expr。TASK-138）、ソケット送信と ACK 判定（#306）、実機結合テスト（#307）は未実装。
 //! 定数値は Linux UAPI（`nfnetlink.h`・`netfilter.h`）に基づく。
+
+mod table_chain;
+pub use table_chain::*;
 
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{

@@ -254,6 +254,10 @@ pub fn render_hosts_lines(entries: &[AddHostEntry]) -> String {
 /// tmp + rename は使わない（bind mount 済みファイルの inode を保つため）。境界の守り方・ロック・巻き戻しは
 /// Linux 限定の `hosts_file` モジュールに置く。`entries` が空なら何も開かない。
 ///
+/// 呼び出し側の前提:
+/// - `hosts_rel` の途中ディレクトリと hosts ファイルは、コンテナ・他ユーザーが書き込めないディレクトリ
+///   配下に置くこと（書き込めると symlink 以外の手段で中身を入れ替えられ、本関数の検査の前提が崩れる）。
+///
 /// Linux 以外では `UNIMPLEMENTED` を返す（fail-closed）。symlink を辿らない `openat` と fd の `mnt_id`
 /// 照合を持たない OS でパス検査だけの追記をすると、検査と open の間の差し替えで管理外のファイルへ
 /// 書けてしまうため。macOS / Windows のコンテナは Linux VM 側で hosts を扱う。

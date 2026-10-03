@@ -6,12 +6,14 @@
 //! # 境界の守り方（rootfs・マウント境界の P0）
 //! - 管理ルートは symlink を含まない絶対パスで受け取り、正規化（`canonicalize`）せずに `/` から 1 要素ずつ
 //!   `O_DIRECTORY | O_NOFOLLOW` で辿って開く（管理ルート自身・祖先のどれかが symlink なら辿らず拒否する）。
-//!   そのディレクトリ fd を起点に相対パスの各要素を
-//!   `openat(O_NOFOLLOW)`（`crate::sys` の薄いラッパー）で 1 要素ずつ辿って開く。途中・最終要素が
-//!   symlink（検証後の差し替えを含む）なら `ELOOP` / `ENOTDIR` で失敗するため、パスを再解決する検査と
-//!   open の間の競合（TOCTOU）で管理外のファイルを開くことはない。`..`・絶対パス・`.` は辿る前に拒否する。
-//! - 以降の検証（通常ファイル・`nlink == 1`・所有者・サイズ・マウント）・ロック・追記・巻き戻しは
-//!   すべて開いた同じ fd に対して行い、パスは二度と引かない。
+//!   そのディレクトリ fd を起点に相対パスの途中要素を `openat(O_DIRECTORY | O_NOFOLLOW)`
+//!   （`crate::sys` の薄いラッパー）で 1 要素ずつ辿る。途中要素が symlink（検証後の差し替えを含む）なら
+//!   `ELOOP` / `ENOTDIR` で失敗するため、パスを再解決する検査と open の間の競合（TOCTOU）で管理外の
+//!   ファイルを開くことはない。`..`・絶対パス・`.` は辿る前に拒否する。
+//! - 最終要素は `O_PATH | O_NOFOLLOW` で開き（デバイス・FIFO でもドライバの `open()` を呼ばない）、その fd で
+//!   通常ファイル・`nlink == 1`・所有者・サイズ・マウントを確かめてから `/proc/self/fd/<fd>` 経由で
+//!   読み書き用に開き直す。開き直した fd の (dev, ino) が `O_PATH` の fd と一致することも確かめ、以降の
+//!   検証・ロック・追記・巻き戻しはすべて開き直した fd に対して行い、パスは二度と引かない。
 //! - 管理ルート内の hosts パス・途中ディレクトリへの bind mount（同一ファイルシステム内でも新しい
 //!   マウントになる）は、ルートのディレクトリ fd と hosts ファイル fd の `mnt_id`
 //!   （`/proc/self/fdinfo/<fd>`）の不一致で拒否する。
@@ -68,7 +70,7 @@ fn dir_open_error(e: SysError) -> NetError {
     }
 }
 
-/// 最終要素（hosts ファイル）を開く `openat` の失敗を分類する（symlink・ディレクトリは
+/// 最終要素（hosts ファイル）の `O_PATH` での open・開き直しの失敗を分類する（symlink・ディレクトリは
 /// `INVALID_ARGUMENT`）。
 fn file_open_error(e: SysError) -> NetError {
     match e {
@@ -120,7 +122,7 @@ fn open_abs_dir_nofollow(abs: &Path) -> Result<OwnedFd, NetError> {
     if comps.next() != Some(Component::RootDir) {
         return Err(not_normalized());
     }
-    let mut cur = sys::open_dir_nofollow(c"/").map_err(map)?;
+    let mut cur = sys::open_root_dir().map_err(map)?;
     for c in comps {
         let Component::Normal(n) = c else {
             return Err(not_normalized());
@@ -168,11 +170,36 @@ fn open_in_root(managed_root: &Path, rel: &Path) -> Result<(File, File), NetErro
         cur = Some(sys::open_dir_nofollow_at(base, d).map_err(dir_open_error)?);
     }
     let base = cur.as_ref().unwrap_or(&root_fd).as_fd();
-    let file = sys::open_append_nofollow_at(base, last).map_err(file_open_error)?;
-    Ok((File::from(root_fd), File::from(file)))
+    let target = sys::open_path_nofollow_at(base, last).map_err(file_open_error)?;
+    Ok((File::from(root_fd), File::from(target)))
 }
 
-/// 開いた fd が追記してよい hosts ファイルであることを確認する（fd のみを見る。パスは引かない）。
+/// `O_PATH` の fd `target` を検証してから読み書き用（`O_RDWR | O_APPEND`）に開き直す。
+///
+/// 種別・リンク数・所有者・サイズ・マウントは `O_PATH` の fd で先に確かめる（通常ファイル以外の
+/// ドライバ `open()` を走らせない）。開き直しは fd が保持する実体を指す `/proc/self/fd/<fd>` 経由で、
+/// 開き直した fd の (dev, ino) が `target` と一致しなければ拒否する（fail-closed）。
+fn reopen_verified(root: &File, target: &File) -> Result<File, NetError> {
+    verify_hosts_file(target)?;
+    verify_same_mount(root, target)?;
+    let before = target
+        .metadata()
+        .map_err(|_| io_err("failed to stat hosts file"))?;
+    let file = File::from(sys::reopen_append(target.as_fd()).map_err(file_open_error)?);
+    let after = file
+        .metadata()
+        .map_err(|_| io_err("failed to stat hosts file"))?;
+    if (after.dev(), after.ino()) != (before.dev(), before.ino()) {
+        return Err(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "hosts file changed while reopening",
+        ));
+    }
+    Ok(file)
+}
+
+/// 開いた fd（`O_PATH` の fd を含む。`fstat` は `O_PATH` でも使える）が追記してよい hosts ファイルで
+/// あることを確認する（fd のみを見る。パスは引かない）。
 ///
 /// 通常ファイル・上限サイズ以下・ハードリンクなし（`nlink == 1`。ハードリンク経由でコンテナ外の
 /// ファイルへ追記させない）・実効 UID 所有（他ユーザー所有のファイルへ追記しない）。
@@ -317,10 +344,13 @@ pub(super) fn append_lines(
     hosts_rel: &Path,
     lines: &str,
 ) -> Result<(), NetError> {
-    let (root, mut file) = open_in_root(managed_root, hosts_rel)?;
+    let (root, target) = open_in_root(managed_root, hosts_rel)?;
+    let mut file = reopen_verified(&root, &target)?;
+    drop(target);
     let deadline = Instant::now() + HOSTS_LOCK_TIMEOUT;
     let _guard = lock_guard_bounded(deadline)?;
     lock_exclusive_bounded(&file, deadline)?;
+    // サイズ・リンク数はロック取得までに変わりうるため、排他区間内で開き直した fd に対して再確認する。
     verify_hosts_file(&file)?;
     verify_same_mount(&root, &file)?;
 

@@ -82,6 +82,7 @@ mod linux {
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
     use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::CommandExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, Command, Stdio};
     use std::sync::mpsc::{self, Receiver};
@@ -211,6 +212,37 @@ mod linux {
         }
     }
 
+    /// プロセスグループ `pgid` の全員に SIGKILL を送り、グループが空になる（`kill -0` が失敗する）まで
+    /// 期限つきで待つ。空になったことを確認できたら true（外部 `kill` コマンド経由で `sys` 外の unsafe を避ける）。
+    fn kill_group(pgid: u32) -> bool {
+        let target = format!("-{pgid}");
+        let signal = |sig: &str| {
+            Command::new("kill")
+                .args([sig, "--", &target])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let _ = signal("-KILL");
+        let deadline = Instant::now() + timeout();
+        loop {
+            if !signal("-0") {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "network_paths_privileged: process group {pgid} still alive after SIGKILL"
+                );
+                return false;
+            }
+            let _ = signal("-KILL");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// ランチャ（host netns の root プロセス）。自身では何も変更せず、一時ディレクトリを作って inner を起動する。
     pub fn launcher(extra: Vec<String>) {
         require_root_and_tools();
@@ -218,7 +250,9 @@ mod linux {
         fs::create_dir(&dir).expect("create temp dir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
         let exe = std::env::current_exe().expect("current_exe");
+        // 専用プロセスグループで起動し、期限切れ時に inner・nsenter・その配下の子孫をまとめて停止できるようにする。
         let mut child = Command::new("unshare")
+            .process_group(0)
             .args(["--net", "--mount", "--"])
             .arg(exe)
             .arg("--inner")
@@ -228,12 +262,13 @@ mod linux {
             .spawn()
             .expect("spawn unshare --net --mount");
         // 計測は最大 (200 + 20) 試行になり得るため、期限は試行数に依らず固定倍率にせず十分長く取る。
+        let pgid = child.id();
         let deadline = Instant::now() + timeout() * 60;
         let code = loop {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
+                    kill_group(pgid);
                     let _ = child.wait();
                     eprintln!("network_paths_privileged: inner did not finish before deadline");
                     break 1;
@@ -241,6 +276,9 @@ mod linux {
                 None => std::thread::sleep(Duration::from_millis(50)),
             }
         };
+        // 正常終了でも取り残された子孫があればグループごと停止し、消えたことを確認する（特権操作の後始末）。
+        // mount namespace・tmpfs・netns の pin は全プロセスの終了で解放される。
+        let code = if kill_group(pgid) { code } else { 1 };
         // mount namespace は inner の終了で消えるので、host 側には空のディレクトリだけが残る。
         let _ = fs::remove_dir(&dir);
         std::process::exit(code);

@@ -27,7 +27,7 @@
 # 使い方:
 #   net_setup_timing.sh --exe <絶対パス> [--trials N] [--warmup W] [--timeout SECS] [--label NAME] [--output FILE]
 #   --exe     network_paths_privileged のテスト実行ファイル（正規化済みの絶対パス・通常ファイル・
-#             symlink 不可・所有者は root か実行ユーザー・group/other 書き込み不可。祖先ディレクトリも
+#             symlink 不可・所有者は root・実行ユーザー・sudo の呼び出しユーザー〔SUDO_UID〕・group/other 書き込み不可。祖先ディレクトリも
 #             同様に検証する〔sticky 付きは root 所有に限り許容〕。root で実行するため、他者が差し替え得る
 #             バイナリを拒否する。検証に使った fd から 0700 の私有ディレクトリへ複製し、複製を実行する
 #             〔検証対象と実行対象の同一性を保つ〕）
@@ -123,14 +123,25 @@ canon="$(realpath -e -- "$exe" 2>/dev/null)" || usage_error "cannot resolve --ex
 [ "$canon" = "$exe" ] || usage_error "--exe must be a canonical path (no symlink components)"
 
 self_uid="$(id -u)"
-# 所有者が root か実行ユーザーで、group/other 書き込み不可であることを検査する。
+# sudo 経由の実行では実効 UID が 0 になり、呼び出しユーザー所有の cargo test バイナリ（と祖先ディレクトリ）が
+# 拒否されてしまう。sudo が設定する SUDO_UID（数値のみ・0 以外）を追加の許容所有者として受け付ける。
+# SUDO_UID を設定できるのは root の環境を制御できる者だけで、その者は任意の exe を直接実行できるため
+# 権限境界は広がらない。
+sudo_uid=""
+if [[ "${SUDO_UID:-}" =~ ^[1-9][0-9]{0,9}$ ]]; then
+  sudo_uid="$SUDO_UID"
+fi
+owner_allowed() { # uid
+  [ "$1" = "0" ] || [ "$1" = "$self_uid" ] || { [ -n "$sudo_uid" ] && [ "$1" = "$sudo_uid" ]; }
+}
+# 所有者が root・実行ユーザー・sudo の呼び出しユーザーのいずれかで、group/other 書き込み不可であることを検査する。
 # 祖先ディレクトリでは sticky（01000）付きかつ root 所有の場合のみ group/other 書き込みを許す（/tmp 等）。
 check_owner_perm() { # path allow_sticky_root
   local p="$1" owner mode
   owner="$(stat -c '%u' -- "$p")" || usage_error "cannot stat $p"
   mode="$(stat -c '%a' -- "$p")" || usage_error "cannot stat $p"
-  if [ "$owner" != "0" ] && [ "$owner" != "$self_uid" ]; then
-    usage_error "$p must be owned by root or the current user"
+  if ! owner_allowed "$owner"; then
+    usage_error "$p must be owned by root, the current user or the sudo invoking user"
   fi
   if [ $((8#$mode & 8#022)) -ne 0 ]; then
     if [ "$2" = "yes" ] && [ "$owner" = "0" ] && [ $((8#$mode & 8#1000)) -ne 0 ]; then
@@ -180,7 +191,7 @@ trap 'cleanup; exit 143' TERM
 exec 3<"$exe" || usage_error "cannot open --exe"
 fd_owner="$(stat -L -c '%u' -- /proc/self/fd/3 2>/dev/null || stat -L -c '%u' -- "$exe")"
 fd_mode="$(stat -L -c '%a' -- /proc/self/fd/3 2>/dev/null || stat -L -c '%a' -- "$exe")"
-if { [ "$fd_owner" != "0" ] && [ "$fd_owner" != "$self_uid" ]; } || [ $((8#$fd_mode & 8#022)) -ne 0 ]; then
+if ! owner_allowed "$fd_owner" || [ $((8#$fd_mode & 8#022)) -ne 0 ]; then
   usage_error "--exe changed or has unsafe owner/permissions"
 fi
 cat <&3 >"$run_exe" || usage_error "cannot copy --exe"
@@ -195,7 +206,9 @@ readonly OUT_LIMIT_BYTES=$((OUT_LIMIT_KIB * 1024))
 # exe 全体に上限を設ける（REPAIR-5）。新セッション（setsid）で起動し、グループ全体を制御する。
 (
   ulimit -f "$OUT_LIMIT_KIB"
-  exec setsid timeout --kill-after=10 "$limit" "$run_exe" --measure --trials "$trials" --warmup "$warmup" >"$raw"
+  # --foreground: GNU timeout は既定で子を新しいプロセスグループへ移し、INT/TERM 時の kill_group（-pgid 宛て）
+  # が timeout 自身にしか届かず unshare 以下の子孫が残る。--foreground で子を setsid のグループに留める。
+  exec setsid timeout --foreground --kill-after=10 "$limit" "$run_exe" --measure --trials "$trials" --warmup "$warmup" >"$raw"
 ) &
 pgid=$!
 rc=0

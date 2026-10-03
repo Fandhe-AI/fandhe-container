@@ -32,7 +32,8 @@
 //!   パケットの送信元 MAC を見られないため、これを自力では防げない。そこで [`ForwardingHandler::new`] は
 //!   [`SourceVerified`]（bridge 側の送信元詐称防止〔ether saddr と IPv4 saddr の対応固定。`nftables_rules` に必要な
 //!   expr が未実装〕を呼び出し側が保証する証明）を要求し、証明なしに転送を有効化できない形にする（fail-closed）。
-//!   この保証の実装は未着手で、現状は組み込み側の責務（追跡 Issue 未起票。ユーザー承認後に起票し番号を追記する）
+//!   この保証の実装は未着手のため、製品ビルドに [`SourceVerified`] を作る公開 API は無く、転送は有効化できない
+//!   （追跡 Issue 未起票。ユーザー承認後に起票し番号を追記する）
 //! - 上の保証があるため詐称による増幅反射は成立しない。転送応答には自前応答の `MAX_RESPONSE_GROWTH` ではなく UDP の上限
 //!   （[`MAX_DATAGRAM_LEN`] = 512 バイト。EDNS OPT を転送しないため上流も 512 以下で返す）を課し、複数 RR・CNAME 連鎖を含む
 //!   通常の応答を TCP 再試行なしで解決できるようにする。上流自身が TC=1 で返した応答は素通しで、クライアントの TCP 再試行は
@@ -58,12 +59,14 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use super::{
-    DNS_PORT, DnsHeader, DnsRegistry, FLAG_QR, FLAG_RD, HEADER_LEN, HandlerOutcome,
+    DNS_PORT, DnsHeader, DnsRegistry, FLAG_QR, FLAG_RD, ForwardedProof, HEADER_LEN, HandlerOutcome,
     MAX_DATAGRAM_LEN, MAX_NAME_LEN, MAX_REGISTRY_ENTRIES, MsgWriter, QCLASS_IN, QueryHandler,
     RCODE_SERVFAIL, RegistryHandler, ResponseBuf, normalize_qname, parse_question,
 };
 use crate::error::{NetError, NetErrorCode};
 
+/// ワイヤー形式の名前の最大長（終端のゼロを含む。RFC 1035 3.1）。
+const MAX_WIRE_NAME_LEN: usize = 255;
 /// コンテナ 1 つあたりの上流の最大件数（resolv.conf の MAXNS に合わせた暫定値。spec に規定なし）。
 pub const MAX_UPSTREAMS_PER_CONTAINER: usize = 3;
 /// 上流 1 件あたりの応答待ち期限（暫定値。spec に規定なし）。
@@ -308,7 +311,10 @@ fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
                 }
                 let step = usize::from(len).checked_add(1)?;
                 total = total.checked_add(step)?;
-                if total > MAX_NAME_LEN {
+                // 非圧縮名のワイヤー長は終端のゼロ 1 バイトを含めて 255 オクテット以下（RFC 1035 3.1）。
+                // ここまでの合計（長さバイト + ラベル）は終端を除くので 254 まで許す。
+                // `MAX_NAME_LEN`（253）はドット区切りテキスト表現の上限で、ワイヤー長の上限とは異なる。
+                if total >= MAX_WIRE_NAME_LEN {
                     return None;
                 }
                 pos = pos.checked_add(step)?;
@@ -503,15 +509,17 @@ fn build_servfail(
 
 /// bridge 側で送信元詐称（他コンテナの IP・MAC の騙り）が防がれていることの証明（NET-12・NET-5）。
 /// 転送はクエリの送信元 IP だけでコンテナを識別するため、これが成り立たない環境では別コンテナの上流を利用できてしまう。
-/// 値は [`SourceVerified::attest_bridge_enforces_source_binding`] でのみ作れ、呼び出し側が保証の責任を明示的に負う。
+/// 製品ビルドでは値を作る公開 API が無く（検証済みを装えない）、bridge ルールの実検査が入るまで転送は有効化できない。
 #[derive(Debug, Clone, Copy)]
 pub struct SourceVerified(());
 
 impl SourceVerified {
-    /// 呼び出し側が「このヘルパーが待ち受ける bridge で、各 port の送信元 MAC と IPv4 アドレスの対応が強制され
-    /// （詐称パケットは bridge で破棄される）、ARP 詐称も防がれている」ことを保証して証明を作る。
-    /// 保証の実装〔nftables の bridge 家族ルール〕は未実装（REPAIR-3。担当 Issue 未確定）。
-    pub fn attest_bridge_enforces_source_binding() -> Self {
+    /// テスト専用の証明生成。製品ビルドには公開コンストラクタを置かない（fail-closed）。
+    /// 「各 port の送信元 MAC と IPv4 アドレスの対応が bridge で強制され、ARP 詐称も防がれている」ことを
+    /// 実際のルールから確認して証明を返す実装〔nftables の bridge 家族ルール。`nftables_rules` に必要な expr が未実装〕
+    /// が入るまで、製品コードから [`ForwardingHandler`] を作る経路は存在しない（REPAIR-3。NET-12・NET-5）。
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
         Self(())
     }
 }
@@ -590,7 +598,7 @@ impl QueryHandler for ForwardingHandler {
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
         match forward_query(&list, datagram, q.end, header.id(), counter, out) {
             // 受理済みの上流応答は 512 バイト以下（validate_upstream_reply）。サイズ上限は serve が課す。
-            ForwardResult::Forwarded => HandlerOutcome::RespondForwarded,
+            ForwardResult::Forwarded => HandlerOutcome::RespondForwarded(ForwardedProof(())),
             ForwardResult::AllFailed => {
                 self.forward_failed.fetch_add(1, Ordering::Relaxed);
                 if build_servfail(header, datagram, q.end, out) {
@@ -721,11 +729,7 @@ mod tests {
             map.set_unchecked_for_test(*peer, &[*addr]).unwrap();
         }
         (
-            ForwardingHandler::new(
-                Arc::clone(&reg),
-                map,
-                SourceVerified::attest_bridge_enforces_source_binding(),
-            ),
+            ForwardingHandler::new(Arc::clone(&reg), map, SourceVerified::for_test()),
             reg,
         )
     }
@@ -967,11 +971,11 @@ mod tests {
         let u2 = MockUpstream::start(Ipv4Addr::new(198, 51, 100, 2), 1, true);
         let (h, _) = handler_with(&[(PEER1, u1.addr), (PEER2, u2.addr)]);
         let (o, r) = respond_from(&h, sa(PEER1), &query(0x1111, EXTERNAL, 1, 0));
-        assert_eq!(o, HandlerOutcome::RespondForwarded);
+        assert_eq!(o, HandlerOutcome::RespondForwarded(ForwardedProof(())));
         assert_eq!(&r[..2], &[0x11, 0x11], "client id restored");
         assert_eq!(answer_ip(&r), Ipv4Addr::new(198, 51, 100, 1));
         let (o, r) = respond_from(&h, sa(PEER2), &query(0x2222, EXTERNAL, 1, 1));
-        assert_eq!(o, HandlerOutcome::RespondForwarded);
+        assert_eq!(o, HandlerOutcome::RespondForwarded(ForwardedProof(())));
         assert_eq!(answer_ip(&r), Ipv4Addr::new(198, 51, 100, 2));
         let (o, r) = respond_from(&h, sa(PEER3), &query(0x3333, EXTERNAL, 1, 0));
         assert_eq!(o, HandlerOutcome::Respond);
@@ -1027,5 +1031,29 @@ mod tests {
         bad.extend_from_slice(q);
         bad.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 2, 1, 2]);
         assert!(!validate_upstream_reply(&bad, 0x1234, q));
+    }
+
+    /// 非圧縮名のワイヤー長は終端を含め 255 まで許す（254 は受理、255 は拒否）。
+    #[test]
+    fn skip_name_accepts_254_octets_before_root() {
+        let mut msg = vec![0u8; HEADER_LEN];
+        // 63+1 を 3 回 = 192、残り 62 → 61 バイトのラベル(+1) = 254。
+        for _ in 0..3 {
+            msg.push(63);
+            msg.extend_from_slice(&[b'a'; 63]);
+        }
+        msg.push(61);
+        msg.extend_from_slice(&[b'a'; 61]);
+        msg.push(0);
+        assert_eq!(skip_name(&msg, HEADER_LEN), Some(msg.len()));
+        let mut over = vec![0u8; HEADER_LEN];
+        for _ in 0..3 {
+            over.push(63);
+            over.extend_from_slice(&[b'a'; 63]);
+        }
+        over.push(62);
+        over.extend_from_slice(&[b'a'; 62]);
+        over.push(0);
+        assert_eq!(skip_name(&over, HEADER_LEN), None);
     }
 }

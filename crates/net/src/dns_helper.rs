@@ -348,6 +348,11 @@ impl ResponseBuf {
     }
 }
 
+/// 上流転送の応答であることの証印。フィールドが非公開のため `dns_helper` 配下（[`upstream::ForwardingHandler`]）
+/// でしか作れず、外部の [`QueryHandler`] 実装が `serve` の増幅ガードを緩められない（NET-12・TASK-185.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardedProof(());
+
 /// ハンドラの結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandlerOutcome {
@@ -355,7 +360,7 @@ pub enum HandlerOutcome {
     Respond,
     /// 上流から受けた応答を返信する（統計の `forwarded` に計上するための区別）。増幅ガードの上限は
     /// UDP の最大長（512 バイト）。呼び出し元の送信元詐称防止の保証が前提（NET-12・TASK-185.3）。
-    RespondForwarded,
+    RespondForwarded(ForwardedProof),
     /// 返信しない。
     NoResponse,
 }
@@ -843,8 +848,8 @@ impl DnsHelperServer {
             // 増幅反射の防止: 自前応答・上流転送の応答とも要求長 + A RR 1 件分以下に限る。
             let limit = match outcome {
                 HandlerOutcome::Respond => n.saturating_add(MAX_RESPONSE_GROWTH),
-                // 転送応答は UDP の上限まで許す（`ForwardingHandler` は `SourceVerified` なしに作れない）。
-                HandlerOutcome::RespondForwarded => MAX_DATAGRAM_LEN,
+                // 転送応答は UDP の上限まで許す（`ForwardingHandler` は `SourceVerified` なしに作れず、証印 `ForwardedProof` も外部から作れない）。
+                HandlerOutcome::RespondForwarded(_) => MAX_DATAGRAM_LEN,
                 HandlerOutcome::NoResponse => continue,
             };
             if out.as_bytes().len() > limit {
@@ -854,7 +859,7 @@ impl DnsHelperServer {
             match self.socket.send_to(out.as_bytes(), peer) {
                 Ok(_) => {
                     self.stats.answered = self.stats.answered.saturating_add(1);
-                    if outcome == HandlerOutcome::RespondForwarded {
+                    if matches!(outcome, HandlerOutcome::RespondForwarded(_)) {
                         self.stats.forwarded = self.stats.forwarded.saturating_add(1);
                     }
                 }

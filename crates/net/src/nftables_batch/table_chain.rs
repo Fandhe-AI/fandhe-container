@@ -533,12 +533,21 @@ impl ChainPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainInfo {
     policy: Option<ChainPolicy>,
+    hook: Option<u32>,
 }
 
 impl ChainInfo {
     /// base chain の policy。base chain でない（属性が無い）場合は `None`。
     pub fn policy(&self) -> Option<ChainPolicy> {
         self.policy
+    }
+
+    /// base chain の hook 番号（`NFTA_HOOK_HOOKNUM`。`NF_INET_*` の値）。hook 属性が無い場合は `None`。
+    ///
+    /// 同名のチェインでも別 hook の base chain でありうるため、policy を転送経路のものとして
+    /// 扱う側（cli の `doctor`。NET-10）はこの値が `NfInetHook::Forward` と一致することを確認する。
+    pub fn hook(&self) -> Option<u32> {
+        self.hook
     }
 
     /// 応答ペイロード（nfgenmsg + 属性）を復号する。カーネル由来の外部入力として属性走査で検証し、
@@ -550,10 +559,26 @@ impl ChainInfo {
                 "chain reply is shorter than nfgenmsg",
             )
         })?;
-        let mut info = Self { policy: None };
+        let mut info = Self {
+            policy: None,
+            hook: None,
+        };
         for attr in crate::netlink::AttrIter::new(attrs) {
             let attr = attr?;
-            if attr.attr_type() == NFTA_CHAIN_POLICY {
+            if attr.attr_type() == NFTA_CHAIN_HOOK {
+                for child in attr.nested() {
+                    let child = child?;
+                    if child.attr_type() == NFTA_HOOK_HOOKNUM {
+                        let raw = <[u8; 4]>::try_from(child.payload()).map_err(|_| {
+                            NetError::new(
+                                NetErrorCode::DataLoss,
+                                "NFTA_HOOK_HOOKNUM has an invalid length",
+                            )
+                        })?;
+                        info.hook = Some(u32::from_be_bytes(raw));
+                    }
+                }
+            } else if attr.attr_type() == NFTA_CHAIN_POLICY {
                 let raw = <[u8; 4]>::try_from(attr.payload()).map_err(|_| {
                     NetError::new(
                         NetErrorCode::DataLoss,
@@ -929,6 +954,43 @@ mod tests {
         );
         assert_eq!(
             ChainInfo::decode(&[2, 0]).expect_err("short").code(),
+            NetErrorCode::DataLoss
+        );
+    }
+
+    /// NET-10・TASK-148.1: GETCHAIN 応答の NFTA_CHAIN_HOOK（ネスト）から hook 番号を復号する。
+    #[test]
+    fn net10_chain_info_decodes_hook() {
+        let reply = |hook: Option<&[u8]>| {
+            let mut p = vec![2u8, 0, 0, 0];
+            // NFTA_CHAIN_HOOK (nested) { NFTA_HOOK_HOOKNUM = data }
+            if let Some(d) = hook {
+                let inner_len = (4 + d.len()) as u16;
+                p.extend_from_slice(&(4 + inner_len).to_ne_bytes());
+                p.extend_from_slice(&(NFTA_CHAIN_HOOK | 0x8000).to_ne_bytes());
+                p.extend_from_slice(&inner_len.to_ne_bytes());
+                p.extend_from_slice(&NFTA_HOOK_HOOKNUM.to_ne_bytes());
+                p.extend_from_slice(d);
+            }
+            p
+        };
+        assert_eq!(
+            ChainInfo::decode(&reply(Some(&2u32.to_be_bytes())))
+                .expect("forward")
+                .hook(),
+            Some(NfInetHook::Forward.value())
+        );
+        assert_eq!(
+            ChainInfo::decode(&reply(Some(&0u32.to_be_bytes())))
+                .expect("prerouting")
+                .hook(),
+            Some(NfInetHook::PreRouting.value())
+        );
+        assert_eq!(ChainInfo::decode(&reply(None)).expect("none").hook(), None);
+        assert_eq!(
+            ChainInfo::decode(&reply(Some(&[0, 0, 2])))
+                .expect_err("len")
+                .code(),
             NetErrorCode::DataLoss
         );
     }

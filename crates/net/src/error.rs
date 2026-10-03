@@ -4,7 +4,9 @@
 //! 操作（#843〜#846・#301）・nftables（#304）が返すエラーをここに集約する。
 //! 機械可読な `code` と英語の `message` を持つ（ERR-1）。`fandhe-container-plugin` へは依存せず、
 //! 文字列表現のみ `PluginErrorCode::as_str` と揃えて独立に定義する。
-//! `message` には受信バイト列の内容を載せず、長さ・オフセット等の数値のみを載せる。
+//! `message` には受信バイト列の内容を載せず、長さ・オフセット等の数値のみを載せる。唯一の例外は拡張 ACK の
+//! `NLMSGERR_ATTR_MSG`（NET-11）で、NUL で切り・128 バイト上限・ASCII 印字可能文字以外は `?` に置換した
+//! 文字列に限って載せる。
 
 use std::error::Error;
 use std::fmt;
@@ -67,7 +69,7 @@ pub struct NetError {
 }
 
 impl NetError {
-    /// 分類とメッセージ（英語。バイト列の内容を含めない）からエラーを作る。
+    /// 分類とメッセージ（英語。バイト列の内容を含めない。拡張 ACK の文字列は上記のサニタイズ済みのものに限る）からエラーを作る。
     pub fn new(code: NetErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,

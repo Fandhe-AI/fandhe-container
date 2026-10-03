@@ -36,6 +36,9 @@
 //!
 //! RTM_SETLINK（up）:
 //!   ifinfomsg(index, flags = IFF_UP, change = IFF_UP) + [IFLA_IFNAME]
+//!
+//! RTM_SETLINK（bridge へ接続。TASK-139.2.1）:
+//!   ifinfomsg(index, flags = 0, change = 0) + [IFLA_IFNAME] + IFLA_MASTER = u32（bridge の ifindex）
 //! ```
 //!
 //! # netns 移動と up の順序（カーネル挙動）
@@ -51,8 +54,9 @@
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
-//! - down 操作、MTU・MAC 等の追加属性、bridge のオプション（`IFLA_BR_*`）、bridge への接続
-//!   （`IFLA_MASTER`）、`RTM_DELLINK` は `LinkDelete` で実装済み（TASK-139.1）
+//! - down 操作、MTU・MAC 等の追加属性、bridge のオプション（`IFLA_BR_*`）。
+//!   bridge への接続（`IFLA_MASTER`）は `LinkSet::set_master`（TASK-139.2.1）、`RTM_DELLINK` は
+//!   `LinkDelete` で実装済み（TASK-139.1）
 //! - netns を作る・開く API（実機テストは外部コマンド `unshare(1)` と `/proc/<pid>/ns/net` を使う）
 
 use std::marker::PhantomData;
@@ -88,6 +92,8 @@ pub const IFLA_NET_NS_PID: u16 = 19;
 pub const IFLA_NET_NS_FD: u16 = 28;
 /// リンクを up にするフラグ（`linux/if.h` の `IFF_UP`）。
 pub const IFF_UP: u32 = 0x1;
+/// 所属先の master（bridge）の ifindex を指す属性（`linux/if_link.h` の `IFLA_MASTER`。u32）。
+pub const IFLA_MASTER: u16 = 10;
 /// リンク種別情報のネスト属性（`linux/if_link.h`）。
 pub const IFLA_LINKINFO: u16 = 18;
 /// リンク種別名（`bridge`・`veth` 等。`linux/if_link.h`）。
@@ -343,6 +349,10 @@ enum SetKind<'a> {
     Up {
         link: LinkRef,
     },
+    SetMaster {
+        link: LinkRef,
+        master: IfIndex,
+    },
 }
 
 /// `RTM_SETLINK` によるリンク設定要求（netns 移動・up）。
@@ -363,6 +373,12 @@ impl<'a> LinkSet<'a> {
         Self(SetKind::Up { link })
     }
 
+    /// リンクを `master`（bridge の ifindex）へ接続する要求（`IFLA_MASTER`。TASK-139.2.1・NET-1）。
+    /// `ifinfomsg` の flags / change は 0 で、up / down は変えない。
+    pub fn set_master(link: LinkRef, master: IfIndex) -> Self {
+        Self(SetKind::SetMaster { link, master })
+    }
+
     /// `nlmsg_type`（常に `RTM_SETLINK`）。
     pub fn msg_type(&self) -> u16 {
         RTM_SETLINK
@@ -376,7 +392,7 @@ impl<'a> LinkSet<'a> {
     /// nlmsghdr の後ろに続く `ifinfomsg` と属性を `b` へ書き込む。
     pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
         let (link, flags, change) = match &self.0 {
-            SetKind::MoveToNetns { link, .. } => (link, 0, 0),
+            SetKind::MoveToNetns { link, .. } | SetKind::SetMaster { link, .. } => (link, 0, 0),
             SetKind::Up { link } => (link, IFF_UP, IFF_UP),
         };
         let (index, name) = match link {
@@ -392,6 +408,9 @@ impl<'a> LinkSet<'a> {
                 NetnsTarget::Pid(p) => b.put_attr(IFLA_NET_NS_PID, &p.get().to_ne_bytes())?,
                 NetnsTarget::Fd(f) => b.put_attr(IFLA_NET_NS_FD, &f.raw().to_ne_bytes())?,
             }
+        }
+        if let SetKind::SetMaster { master, .. } = &self.0 {
+            b.put_attr(IFLA_MASTER, &master.get().to_ne_bytes())?;
         }
         Ok(())
     }
@@ -820,6 +839,47 @@ mod tests {
         assert_eq!(ifi.get(4..8).unwrap(), &5i32.to_ne_bytes());
         assert_eq!(ifi.get(8..16).unwrap(), &[0u8; 8]);
         assert_eq!(attrs, vec![(19, 1u32.to_ne_bytes().to_vec())]);
+    }
+
+    /// NET-1・TASK-139.2.1: bridge 接続は ifi_index にポートの ifindex、IFLA_MASTER(10) に bridge の
+    /// ifindex（u32 ネイティブ順）を載せ、flags / change は 0 のまま。メッセージ全体を完全一致で照合する。
+    #[test]
+    fn net1_setlink_set_master_golden_bytes() {
+        let req = LinkSet::set_master(
+            LinkRef::Index(LinkIndex::new(5).unwrap()),
+            IfIndex::new(9).unwrap(),
+        );
+        let data = build_set(&req);
+        let mut e = Vec::new();
+        e.extend_from_slice(&40u32.to_ne_bytes()); // nlmsg_len = 16 + 16 + 8
+        e.extend_from_slice(&RTM_SETLINK.to_ne_bytes());
+        e.extend_from_slice(&0u16.to_ne_bytes()); // flags
+        e.extend_from_slice(&0x1234u32.to_ne_bytes()); // seq
+        e.extend_from_slice(&0u32.to_ne_bytes()); // pid
+        e.extend_from_slice(&[0, 0]); // family + pad
+        e.extend_from_slice(&0u16.to_ne_bytes()); // type
+        e.extend_from_slice(&5i32.to_ne_bytes()); // ifi_index
+        e.extend_from_slice(&0u32.to_ne_bytes()); // flags
+        e.extend_from_slice(&0u32.to_ne_bytes()); // change
+        e.extend_from_slice(&8u16.to_ne_bytes()); // rta_len
+        e.extend_from_slice(&10u16.to_ne_bytes()); // IFLA_MASTER
+        e.extend_from_slice(&9u32.to_ne_bytes());
+        assert_eq!(data, e);
+    }
+
+    /// NET-1・TASK-139.2.1: 名前指定の bridge 接続は IFLA_IFNAME の後ろに IFLA_MASTER が続く。
+    #[test]
+    fn net1_setlink_set_master_by_name_orders_attrs() {
+        let req = LinkSet::set_master(LinkRef::Name(name("veth0")), IfIndex::new(3).unwrap());
+        let (ifi, attrs) = set_attrs(&build_set(&req));
+        assert_eq!(ifi.get(4..16).unwrap(), &[0u8; 12]);
+        assert_eq!(
+            attrs,
+            vec![
+                (IFLA_IFNAME, b"veth0\0".to_vec()),
+                (IFLA_MASTER, 3u32.to_ne_bytes().to_vec())
+            ]
+        );
     }
 
     /// NET-11: up は flags と change の両方に IFF_UP だけを立てる。

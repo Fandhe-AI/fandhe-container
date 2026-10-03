@@ -33,23 +33,36 @@
 //! に `ResourceState::Unknown` として報告する。nft バッチは all-or-nothing なので `Aborted` /
 //! `NotSent` では nft 側に何も残らない。
 //!
+//! # コンテナ接続（TASK-139.2.1・#847）
+//!
+//! [`attach_container`] はコンテナ単位の接続処理で、netns の作成と pin（`crate::netns`）→ veth ペア作成 →
+//! host 側の bridge 接続（`IFLA_MASTER`）と up → peer 側の netns 移動までを行い、途中で失敗したら
+//! 自分が作った veth と netns だけを戻す。veth は host 側 `fcvh` / peer 側 `fcvp` + [`EndpointId`] の
+//! FNV-1a 下位 44bit hex 11 桁（[`VethNames`]。互換性に関わる契約）。veth には所有トークンを付けられない
+//! ため `NLM_F_EXCL` 作成 + 直後の ifindex 確保 + ifindex 指定の削除で運用する（`attach_container_with` の doc）。
+//!
 //! # 未実装範囲（REPAIR-3）
 //!
 //! - masquerade ルール本体（`bitwise` / `meta` expr が `nftables_rules` に未実装のため `postrouting`
 //!   チェインは空。条件なし masq は host の全外向き通信を SNAT するため入れない）。TASK-139.3
-//! - netns・veth・IPAM・default route（TASK-139.2 以降）、ネットワーク削除（TASK-139.4）
+//! - netns 内の作業（peer 側の up・`lo` の up・アドレス付与・`eth0` へのリネーム）と IPAM（TASK-139.2.2・#848）、
+//!   default route・DNAT（TASK-139.3・#316）、ネットワークとコンテナ側資源の削除（TASK-139.4・#317）
 //! - IPv6 と `NftFamily::Inet`（IPv4 のみ。静的 IPAM が IPv4 のみのため）
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use crate::error::{NetError, NetErrorCode};
 #[cfg(target_os = "linux")]
 use crate::netlink_route::{
-    AddrScope, AddressSpec, LinkCreate, LinkDelete, LinkIndex, LinkRef, LinkSet, NetlinkRouteSocket,
+    AddrScope, AddressSpec, LinkCreate, LinkDelete, LinkIndex, LinkRef, LinkSet,
+    NetlinkRouteSocket, NetnsFd, NetnsTarget,
 };
 use crate::netlink_route::{IfIndex, IfName, IpPrefix};
+#[cfg(target_os = "linux")]
+use crate::netns::{self, ContainerNetns};
 #[cfg(target_os = "linux")]
 use crate::nftables_batch::{
     BaseChain, ChainCreate, ChainType, NF_IP_PRI_NAT_DST, NF_IP_PRI_NAT_SRC,
@@ -72,6 +85,31 @@ fn invalid(msg: &'static str) -> NetError {
     NetError::new(NetErrorCode::InvalidArgument, msg)
 }
 
+/// 名前の検証違反の種類（`NetworkName` と `EndpointId` が共有する文字種規則）。
+enum NameFault {
+    Length,
+    Chars,
+}
+
+/// 1〜64 バイト、先頭 `[a-z0-9]`、以降 `[a-z0-9_.-]` の規則に反する点を返す。`/`・NUL・空白・
+/// 先頭の `.` を含み得ないので、パス要素としても安全（パストラバーサル不能）。
+fn name_fault(name: &str) -> Option<NameFault> {
+    if name.is_empty() || name.len() > NAME_MAX_LEN {
+        return Some(NameFault::Length);
+    }
+    let mut bytes = name.bytes();
+    let first_ok = bytes
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    let rest_ok = bytes
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'.' | b'-'));
+    if first_ok && rest_ok {
+        None
+    } else {
+        Some(NameFault::Chars)
+    }
+}
+
 /// 検証済みのネットワーク名（REPAIR-2）。1〜64 バイト、先頭 `[a-z0-9]`、以降 `[a-z0-9_.-]`。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NetworkName(String);
@@ -79,20 +117,11 @@ pub struct NetworkName(String);
 impl NetworkName {
     /// 検証して作る。違反は `InvalidArgument`（入力値はメッセージに載せない）。
     pub fn new(name: &str) -> Result<Self, NetError> {
-        if name.is_empty() || name.len() > NAME_MAX_LEN {
-            return Err(invalid("network name length must be 1 to 64 bytes"));
+        match name_fault(name) {
+            Some(NameFault::Length) => Err(invalid("network name length must be 1 to 64 bytes")),
+            Some(NameFault::Chars) => Err(invalid("network name contains invalid characters")),
+            None => Ok(Self(name.to_owned())),
         }
-        let mut bytes = name.bytes();
-        let first_ok = bytes
-            .next()
-            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-        let rest_ok = bytes.all(|c| {
-            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'.' | b'-')
-        });
-        if !first_ok || !rest_ok {
-            return Err(invalid("network name contains invalid characters"));
-        }
-        Ok(Self(name.to_owned()))
     }
 
     /// 名前を返す。
@@ -637,6 +666,492 @@ pub fn create_network(
     )
 }
 
+// ---------------------------------------------------------------------------
+// コンテナ接続（netns 作成・veth 作成 / attach。TASK-139.2.1・#847）
+// ---------------------------------------------------------------------------
+
+/// veth の host 側名のプレフィックス。
+const VETH_HOST_PREFIX: &str = "fcvh";
+/// veth の peer（コンテナ）側名のプレフィックス。
+const VETH_PEER_PREFIX: &str = "fcvp";
+
+/// 検証済みのエンドポイント ID（コンテナ 1 つの接続口の識別子。REPAIR-2）。`NetworkName` と同じ文字種規則
+/// （1〜64 バイト、先頭 `[a-z0-9]`、以降 `[a-z0-9_.-]`）で、netns の pin ファイル名にそのまま使う。
+/// ホスト全体で一意であること（veth 名は ID だけから導出する）は呼び出し側（状態レジストリ）の責務。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EndpointId(String);
+
+impl EndpointId {
+    /// 検証して作る。違反は `InvalidArgument`（入力値はメッセージに載せない）。
+    pub fn new(id: &str) -> Result<Self, NetError> {
+        match name_fault(id) {
+            Some(NameFault::Length) => Err(invalid("endpoint id length must be 1 to 64 bytes")),
+            Some(NameFault::Chars) => Err(invalid("endpoint id contains invalid characters")),
+            None => Ok(Self(id.to_owned())),
+        }
+    }
+
+    /// ID を返す。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// エンドポイント ID から導出した veth の名前。
+///
+/// host 側 `fcvh` + FNV-1a 64bit の下位 44bit を小文字 hex 11 桁、peer 側 `fcvp` + 同じ 11 桁
+/// （いずれも 15 バイトで `IFNAMSIZ` 未満）。bridge 名と同じく、プレフィックス・ハッシュ関数・桁数は
+/// 互換性に関わる契約で、変更すると既存コンテナの veth を名前で辿れなくなる（TASK-139.4 の削除が
+/// 同じ名前を再導出する）。異なる ID のハッシュ衝突は `NLM_F_EXCL` の `AlreadyExists` として検出される。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VethNames {
+    host: IfName,
+    peer: IfName,
+}
+
+impl VethNames {
+    /// 決定的に導出する。
+    pub fn derive(endpoint: &EndpointId) -> Result<Self, NetError> {
+        let hash = fnv1a64(endpoint.as_str().as_bytes()) & ((1u64 << 44) - 1);
+        Ok(Self {
+            host: IfName::new(&format!("{VETH_HOST_PREFIX}{hash:011x}"))?,
+            peer: IfName::new(&format!("{VETH_PEER_PREFIX}{hash:011x}"))?,
+        })
+    }
+
+    /// host 側（bridge に接続する側）の名前。
+    pub fn host(&self) -> &IfName {
+        &self.host
+    }
+
+    /// peer 側（コンテナの netns へ移す側）の名前。
+    pub fn peer(&self) -> &IfName {
+        &self.peer
+    }
+}
+
+/// コンテナ接続の入力（検証済み）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerAttachSpec {
+    endpoint: EndpointId,
+    bridge: IfName,
+    bridge_index: IfIndex,
+    netns_dir: PathBuf,
+}
+
+impl ContainerAttachSpec {
+    /// `network` は [`create_network`] が返したネットワーク。`netns_dir` は netns の pin を置く
+    /// ディレクトリの絶対パス（所有者・権限の検査は作成時に行う。`crate::netns`）。
+    /// 相対パスは `InvalidArgument`。
+    pub fn new(
+        endpoint: EndpointId,
+        network: &CreatedNetwork,
+        netns_dir: PathBuf,
+    ) -> Result<Self, NetError> {
+        if !netns_dir.is_absolute() {
+            return Err(invalid("netns directory must be an absolute path"));
+        }
+        Ok(Self {
+            endpoint,
+            bridge: network.bridge.clone(),
+            bridge_index: network.bridge_index,
+            netns_dir,
+        })
+    }
+
+    /// エンドポイント ID。
+    pub fn endpoint(&self) -> &EndpointId {
+        &self.endpoint
+    }
+
+    /// netns の pin 先パス（`netns_dir` 直下に ID 名のファイル）。
+    pub fn netns_path(&self) -> PathBuf {
+        self.netns_dir.join(self.endpoint.as_str())
+    }
+}
+
+/// 接続に成功したコンテナ。`N` は netns ハンドル（Linux では `crate::netns::ContainerNetns`）。
+///
+/// peer 側は netns へ移動済みだが、netns 内での up・アドレス付与・リネームは未実施（REPAIR-3。
+/// 「対象 netns の中で開いた netlink ソケット」を要するため TASK-139.2.2・TASK-139.3 側）。
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct AttachedContainer<N> {
+    /// エンドポイント ID。
+    pub endpoint: EndpointId,
+    /// host 側 veth の名前。
+    pub host_veth: IfName,
+    /// host 側 veth の ifindex（bridge に接続済みで up）。
+    pub host_index: IfIndex,
+    /// コンテナ netns に入った peer 側 veth の名前（netns 内での名前。リネーム前）。
+    pub peer_veth: IfName,
+    /// netns の pin 先パス。
+    pub netns_path: PathBuf,
+    /// netns ハンドル（fd を保持する。解放は pin の unpin）。
+    pub netns: N,
+}
+
+/// 失敗した手順。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AttachStep {
+    /// veth 名の導出。
+    DeriveNames,
+    /// 接続先 bridge の名前と ifindex の一致確認。
+    VerifyBridge,
+    /// netns の作成と pin。
+    CreateNetns,
+    /// veth ペアの作成。
+    CreateVeth,
+    /// 作成直後の veth の ifindex 解決。
+    ResolveIndex,
+    /// host 側の bridge への接続（`IFLA_MASTER`）。
+    SetMaster,
+    /// host 側の up。
+    SetUp,
+    /// peer 側の netns への移動。
+    MoveToNetns,
+}
+
+/// ロールバック対象のリソース。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AttachResource {
+    /// veth ペア（host 側の名前。peer 側は同時に消える）。
+    Veth(IfName),
+    /// pin 済みの netns（pin 先パス）。
+    Netns(PathBuf),
+}
+
+/// コンテナ接続のロールバック結果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AttachRollbackReport {
+    /// 削除に成功したリソース。
+    pub removed: Vec<AttachResource>,
+    /// 取り残したリソースとその状態（結果不明は fail-closed で削除せず `Unknown`）。
+    pub leftover: Vec<(AttachResource, ResourceState)>,
+}
+
+/// コンテナ接続の失敗（元のエラー・失敗手順・ロールバック結果。ERR-1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ContainerAttachError {
+    /// 失敗の原因（ロールバック失敗では上書きしない）。
+    pub error: NetError,
+    /// 失敗した手順。
+    pub step: AttachStep,
+    /// ロールバックの結果。
+    pub rollback: AttachRollbackReport,
+}
+
+impl ContainerAttachError {
+    /// 機械可読な分類。
+    pub fn code(&self) -> NetErrorCode {
+        self.error.code()
+    }
+
+    /// 英語のメッセージ。
+    pub fn message(&self) -> &str {
+        self.error.message()
+    }
+}
+
+impl fmt::Display for ContainerAttachError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for ContainerAttachError {}
+
+/// netns 作成の失敗。作成途中の残骸が残りうるかを `leftover` で伝える。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetnsFailure {
+    /// 失敗の原因。
+    pub(crate) error: NetError,
+    /// 取り残した pin の状態。何も残していなければ `None`。
+    /// `Present`: 後始末（ファイル削除）に失敗した。`Unknown`: 時間切れ等で mount の有無が不明
+    /// （fail-closed のため削除しない）。
+    pub(crate) leftover: Option<ResourceState>,
+}
+
+/// 接続手順が使うカーネル操作の境界。Linux 実装とテストの fake を差し替えるための crate 内部トレイトで、
+/// 公開の拡張点（PLUG-1）ではない。[`NetworkOps`] とは独立（ネットワーク作成のテストに影響させない）。
+pub(crate) trait AttachOps {
+    /// netns ハンドル（Linux では fd と pin パス）。
+    type Netns;
+    /// `dir` 直下に `id` 名で pin した新しい netns を作る。失敗時は自分が作った部分資源を片付けてある。
+    fn create_netns(&self, dir: &Path, id: &EndpointId) -> Result<Self::Netns, NetnsFailure>;
+    /// pin を外す（umount → ファイル削除）。
+    fn unpin_netns(&self, ns: Self::Netns) -> Result<(), NetError>;
+    /// veth ペアを `NLM_F_EXCL` で作る。
+    fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<(), NetError>;
+    /// 名前から ifindex を引く。
+    fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError>;
+    /// `link` を `master`（bridge）へ接続する。
+    fn set_master(&self, link: IfIndex, master: IfIndex) -> Result<(), NetError>;
+    /// ifindex 指定で up にする。
+    fn set_up(&self, link: IfIndex) -> Result<(), NetError>;
+    /// ifindex 指定で `ns` へ移動する。
+    fn move_to_netns(&self, link: IfIndex, ns: &Self::Netns) -> Result<(), NetError>;
+    /// ifindex 指定で link を削除する（veth は peer も一緒に消える）。
+    fn delete_link(&self, link: IfIndex) -> Result<(), NetError>;
+}
+
+/// pin を外し、結果をロールバック報告へ載せる。
+fn rollback_netns<O: AttachOps>(
+    ops: &O,
+    ns: O::Netns,
+    pin: &Path,
+    report: &mut AttachRollbackReport,
+) {
+    match ops.unpin_netns(ns) {
+        Ok(()) => report.removed.push(AttachResource::Netns(pin.to_owned())),
+        Err(_) => report.leftover.push((
+            AttachResource::Netns(pin.to_owned()),
+            ResourceState::Present,
+        )),
+    }
+}
+
+/// 作成直後に確保した ifindex 指定で veth を削除する。`Timeout` / `DataLoss` は適用済みか不明なので
+/// `Unknown`、それ以外の失敗は存在が分かっているので `Present` で報告する。
+fn rollback_veth<O: AttachOps>(
+    ops: &O,
+    host: &IfName,
+    index: IfIndex,
+    report: &mut AttachRollbackReport,
+) {
+    match ops.delete_link(index) {
+        Ok(()) => report.removed.push(AttachResource::Veth(host.clone())),
+        Err(e) => {
+            let state = if is_indeterminate(e.code()) {
+                ResourceState::Unknown
+            } else {
+                ResourceState::Present
+            };
+            report
+                .leftover
+                .push((AttachResource::Veth(host.clone()), state));
+        }
+    }
+}
+
+/// 接続手順本体（OS 非依存。`ops` を差し替えて 3 OS で単体テストできる）。
+///
+/// 手順: 名前導出 → bridge の名前 ↔ ifindex 確認 → netns 作成 → veth 作成 → 作成直後に両端の ifindex を
+/// 名前から解決 → host 側を bridge へ接続 → host 側 up → peer 側を netns へ移動。失敗時は自分が作った
+/// 部分資源（veth・netns）だけを戻し、元のエラーはロールバックの失敗で上書きしない。
+///
+/// veth は所有トークン（`IFLA_IFALIAS`）を使えない（`LinkCreate::with_alias` は veth を拒否する）ため、
+/// 「`NLM_F_EXCL` 作成 + 直後の ifindex 確保 + 以降は ifindex 指定」で運用する。作成から解決までの
+/// 極小の窓に同名 link へ差し替えられる残余リスクは残る（`CAP_NET_ADMIN` を持つ者に限られる）。
+/// ifindex を解決できなかった場合は名前では削除せず `Unknown` で報告する（fail-closed）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn attach_container_with<O: AttachOps>(
+    ops: &O,
+    spec: &ContainerAttachSpec,
+) -> Result<AttachedContainer<O::Netns>, ContainerAttachError> {
+    let fail = |error, step, rollback| ContainerAttachError {
+        error,
+        step,
+        rollback,
+    };
+    let names = VethNames::derive(&spec.endpoint)
+        .map_err(|e| fail(e, AttachStep::DeriveNames, AttachRollbackReport::default()))?;
+
+    // 何かを作る前に、接続先が作成時の bridge のままであることを確認する。
+    match ops.link_index(&spec.bridge) {
+        Ok(i) if i == spec.bridge_index => {}
+        Ok(_) => {
+            return Err(fail(
+                NetError::new(
+                    NetErrorCode::FailedPrecondition,
+                    "bridge ifindex changed (network was replaced)",
+                ),
+                AttachStep::VerifyBridge,
+                AttachRollbackReport::default(),
+            ));
+        }
+        Err(e) => {
+            return Err(fail(
+                e,
+                AttachStep::VerifyBridge,
+                AttachRollbackReport::default(),
+            ));
+        }
+    }
+
+    let pin = spec.netns_path();
+    let netns = match ops.create_netns(&spec.netns_dir, &spec.endpoint) {
+        Ok(ns) => ns,
+        Err(f) => {
+            let mut report = AttachRollbackReport::default();
+            if let Some(state) = f.leftover {
+                report.leftover.push((AttachResource::Netns(pin), state));
+            }
+            return Err(fail(f.error, AttachStep::CreateNetns, report));
+        }
+    };
+
+    // 以降の失敗は、veth の後始末（あれば）→ netns の unpin の順で戻す。
+    let abort =
+        |netns: O::Netns, mut report: AttachRollbackReport, error: NetError, step: AttachStep| {
+            rollback_netns(ops, netns, &pin, &mut report);
+            fail(error, step, report)
+        };
+
+    if let Err(e) = ops.create_veth(names.host(), names.peer()) {
+        let mut report = AttachRollbackReport::default();
+        // 確定的な拒否（`AlreadyExists` 含む）以外は作成済みの可能性があるため Unknown で報告する。
+        if !is_definitely_rejected(e.code()) {
+            report.leftover.push((
+                AttachResource::Veth(names.host().clone()),
+                ResourceState::Unknown,
+            ));
+        }
+        return Err(abort(
+            netns,
+            report,
+            veth_collision_or(e),
+            AttachStep::CreateVeth,
+        ));
+    }
+
+    let resolved = ops
+        .link_index(names.host())
+        .and_then(|host| ops.link_index(names.peer()).map(|peer| (host, peer)));
+    let (host_index, peer_index) = match resolved {
+        Ok(pair) => pair,
+        Err(e) => {
+            let mut report = AttachRollbackReport::default();
+            report.leftover.push((
+                AttachResource::Veth(names.host().clone()),
+                ResourceState::Unknown,
+            ));
+            return Err(abort(netns, report, e, AttachStep::ResolveIndex));
+        }
+    };
+
+    let attach = || {
+        ops.set_master(host_index, spec.bridge_index)
+            .map_err(|e| (e, AttachStep::SetMaster))?;
+        ops.set_up(host_index).map_err(|e| (e, AttachStep::SetUp))?;
+        ops.move_to_netns(peer_index, &netns)
+            .map_err(|e| (e, AttachStep::MoveToNetns))
+    };
+    if let Err((error, step)) = attach() {
+        let mut report = AttachRollbackReport::default();
+        rollback_veth(ops, names.host(), host_index, &mut report);
+        return Err(abort(netns, report, error, step));
+    }
+
+    Ok(AttachedContainer {
+        endpoint: spec.endpoint.clone(),
+        host_veth: names.host().clone(),
+        host_index,
+        peer_veth: names.peer().clone(),
+        netns_path: pin,
+        netns,
+    })
+}
+
+const VETH_COLLISION_MSG: &str =
+    "container veth already exists (endpoint id collision or stale endpoint; delete it first)";
+
+fn veth_collision_or(e: NetError) -> NetError {
+    if e.code() == NetErrorCode::AlreadyExists {
+        NetError::new(NetErrorCode::AlreadyExists, VETH_COLLISION_MSG)
+    } else {
+        e
+    }
+}
+
+/// Linux のカーネル実装。各要求に `timeout` を期限として渡す（REPAIR-5）。
+#[cfg(target_os = "linux")]
+struct LinuxAttachOps<'a> {
+    route: &'a NetlinkRouteSocket,
+    timeout: Duration,
+}
+
+#[cfg(target_os = "linux")]
+fn link_ref(index: IfIndex) -> Result<LinkRef, NetError> {
+    let raw = i32::try_from(index.get())
+        .map_err(|_| NetError::new(NetErrorCode::InvalidArgument, "ifindex exceeds i32::MAX"))?;
+    Ok(LinkRef::Index(LinkIndex::new(raw)?))
+}
+
+#[cfg(target_os = "linux")]
+impl AttachOps for LinuxAttachOps<'_> {
+    type Netns = ContainerNetns;
+
+    fn create_netns(&self, dir: &Path, id: &EndpointId) -> Result<ContainerNetns, NetnsFailure> {
+        netns::create_pinned(dir, id, self.timeout)
+    }
+
+    fn unpin_netns(&self, ns: ContainerNetns) -> Result<(), NetError> {
+        netns::unpin(ns)
+    }
+
+    fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<(), NetError> {
+        self.route
+            .create_link(&LinkCreate::veth(host.clone(), peer.clone())?, self.timeout)
+            .map(|_| ())
+    }
+
+    fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
+        self.route.link_index(name, self.timeout)
+    }
+
+    fn set_master(&self, link: IfIndex, master: IfIndex) -> Result<(), NetError> {
+        self.route
+            .set_link(&LinkSet::set_master(link_ref(link)?, master), self.timeout)
+            .map(|_| ())
+    }
+
+    fn set_up(&self, link: IfIndex) -> Result<(), NetError> {
+        self.route
+            .set_link(&LinkSet::up(link_ref(link)?), self.timeout)
+            .map(|_| ())
+    }
+
+    fn move_to_netns(&self, link: IfIndex, ns: &ContainerNetns) -> Result<(), NetError> {
+        let fd = NetnsFd::new(ns.fd())?;
+        self.route
+            .set_link(
+                &LinkSet::move_to_netns(link_ref(link)?, NetnsTarget::Fd(fd)),
+                self.timeout,
+            )
+            .map(|_| ())
+    }
+
+    fn delete_link(&self, link: IfIndex) -> Result<(), NetError> {
+        self.route
+            .delete_link(&LinkDelete::new(link_ref(link)?), self.timeout)
+            .map(|_| ())
+    }
+}
+
+/// コンテナをネットワークへ接続する（netns の作成と pin・veth ペアの作成・host 側の bridge 接続と up・
+/// peer 側の netns 移動。PoC-15 `netsetup` の `netns-create` / `veth-attach` に相当。NET-1・TASK-139.2.1）。
+///
+/// 失敗時は自分が作った veth と netns だけを戻し、結果を [`ContainerAttachError::rollback`] で返す。
+/// `CAP_NET_ADMIN`（netlink）と `CAP_SYS_ADMIN`（`unshare` / `mount`）が必要で、本 crate は権限を上げない。
+/// `timeout` は各カーネル要求と netns 作成スレッドの待ちの期限（REPAIR-5）。
+///
+/// # 未実装範囲（REPAIR-3）
+/// netns 内の作業（peer 側の up・`lo` の up・アドレス付与・default route・`eth0` へのリネーム）は
+/// 「対象 netns の中で開いた netlink ソケット」を要するため含まない。IPAM は TASK-139.2.2（#848）、
+/// default route・DNAT は TASK-139.3（#316）、ネットワーク・コンテナ側資源の削除は TASK-139.4（#317）。
+#[cfg(target_os = "linux")]
+pub fn attach_container(
+    route: &NetlinkRouteSocket,
+    spec: &ContainerAttachSpec,
+    timeout: Duration,
+) -> Result<AttachedContainer<ContainerNetns>, ContainerAttachError> {
+    attach_container_with(&LinuxAttachOps { route, timeout }, spec)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1163,5 +1678,398 @@ mod tests {
                 ResourceState::Unknown
             )]
         );
+    }
+}
+#[cfg(test)]
+mod attach_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn eid(s: &str) -> EndpointId {
+        EndpointId::new(s).unwrap()
+    }
+
+    fn created() -> CreatedNetwork {
+        let names = NetworkResourceNames::derive(&NetworkName::new("web").unwrap()).unwrap();
+        CreatedNetwork {
+            name: NetworkName::new("web").unwrap(),
+            bridge: names.bridge().clone(),
+            bridge_index: IfIndex::new(7).unwrap(),
+            table: names.table().clone(),
+            gateway: IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 1)), 24).unwrap(),
+        }
+    }
+
+    fn spec(id: &str) -> ContainerAttachSpec {
+        ContainerAttachSpec::new(eid(id), &created(), PathBuf::from("/run/fc-netns")).unwrap()
+    }
+
+    /// 呼び出しを記録し、指定手順で失敗を注入する fake。link の ifindex は名前の接頭辞で決める。
+    #[derive(Default)]
+    struct Fake {
+        calls: RefCell<Vec<String>>,
+        bridge_index: Option<u32>,
+        fail_bridge_lookup: bool,
+        fail_netns: Option<(NetErrorCode, Option<ResourceState>)>,
+        fail_veth: Option<NetErrorCode>,
+        fail_host_lookup: bool,
+        fail_peer_lookup: bool,
+        fail_master: bool,
+        fail_up: bool,
+        fail_move: Option<NetErrorCode>,
+        delete_err: Option<NetErrorCode>,
+        unpin_fails: bool,
+    }
+
+    impl Fake {
+        fn rec(&self, s: impl Into<String>) {
+            self.calls.borrow_mut().push(s.into());
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    fn err(code: NetErrorCode) -> NetError {
+        NetError::new(code, "injected")
+    }
+
+    impl AttachOps for Fake {
+        type Netns = ();
+
+        fn create_netns(&self, dir: &Path, id: &EndpointId) -> Result<(), NetnsFailure> {
+            self.rec(format!("create_netns {}", dir.join(id.as_str()).display()));
+            match self.fail_netns {
+                Some((c, leftover)) => Err(NetnsFailure {
+                    error: err(c),
+                    leftover,
+                }),
+                None => Ok(()),
+            }
+        }
+        fn unpin_netns(&self, (): ()) -> Result<(), NetError> {
+            self.rec("unpin_netns");
+            if self.unpin_fails {
+                Err(err(NetErrorCode::Internal))
+            } else {
+                Ok(())
+            }
+        }
+        fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<(), NetError> {
+            self.rec(format!("create_veth {} {}", host.as_str(), peer.as_str()));
+            self.fail_veth.map_or(Ok(()), |c| Err(err(c)))
+        }
+        fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
+            self.rec(format!("link_index {}", name.as_str()));
+            if name.as_str().starts_with("fcbr") {
+                if self.fail_bridge_lookup {
+                    return Err(err(NetErrorCode::NotFound));
+                }
+                return IfIndex::new(self.bridge_index.unwrap_or(7));
+            }
+            if name.as_str().starts_with("fcvh") {
+                if self.fail_host_lookup {
+                    return Err(err(NetErrorCode::Timeout));
+                }
+                return IfIndex::new(21);
+            }
+            if self.fail_peer_lookup {
+                return Err(err(NetErrorCode::NotFound));
+            }
+            IfIndex::new(22)
+        }
+        fn set_master(&self, link: IfIndex, master: IfIndex) -> Result<(), NetError> {
+            self.rec(format!("set_master {} {}", link.get(), master.get()));
+            if self.fail_master {
+                Err(err(NetErrorCode::Internal))
+            } else {
+                Ok(())
+            }
+        }
+        fn set_up(&self, link: IfIndex) -> Result<(), NetError> {
+            self.rec(format!("set_up {}", link.get()));
+            if self.fail_up {
+                Err(err(NetErrorCode::Internal))
+            } else {
+                Ok(())
+            }
+        }
+        fn move_to_netns(&self, link: IfIndex, (): &()) -> Result<(), NetError> {
+            self.rec(format!("move_to_netns {}", link.get()));
+            self.fail_move.map_or(Ok(()), |c| Err(err(c)))
+        }
+        fn delete_link(&self, link: IfIndex) -> Result<(), NetError> {
+            self.rec(format!("delete_link {}", link.get()));
+            self.delete_err.map_or(Ok(()), |c| Err(err(c)))
+        }
+    }
+
+    fn host_of(id: &str) -> IfName {
+        VethNames::derive(&eid(id)).unwrap().host().clone()
+    }
+
+    fn pin_of(id: &str) -> PathBuf {
+        PathBuf::from("/run/fc-netns").join(id)
+    }
+
+    /// NET-1・TASK-139.2.1: 導出名は決まった形式で、長さは 15 バイト（`IFNAMSIZ` 未満）。
+    #[test]
+    fn net1_veth_names_are_fixed() {
+        let n = VethNames::derive(&eid("web-1")).unwrap();
+        let h = fnv1a64(b"web-1") & ((1u64 << 44) - 1);
+        assert_eq!(n.host().as_str(), format!("fcvh{h:011x}"));
+        assert_eq!(n.peer().as_str(), format!("fcvp{h:011x}"));
+        assert_eq!(n.host().as_str().len(), 15);
+        assert_eq!(n.peer().as_str().len(), 15);
+        assert_ne!(n.host(), n.peer());
+        let long = VethNames::derive(&eid(&"a".repeat(64))).unwrap();
+        assert_eq!(long.host().as_str().len(), 15);
+    }
+
+    /// NET-1: エンドポイント ID はパス要素として安全な文字だけを受け付ける。
+    #[test]
+    fn net1_endpoint_id_validation() {
+        assert!(EndpointId::new(&"a".repeat(64)).is_ok());
+        for bad in [
+            "".to_owned(),
+            "a".repeat(65),
+            "A".to_owned(),
+            ".".to_owned(),
+            "..".to_owned(),
+            ".hidden".to_owned(),
+            "a/b".to_owned(),
+            "../x".to_owned(),
+            "a b".to_owned(),
+            "a\0b".to_owned(),
+        ] {
+            assert_eq!(
+                EndpointId::new(&bad).unwrap_err().code(),
+                NetErrorCode::InvalidArgument,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// NET-1: netns 置き場は絶対パスのみ。pin 先は置き場直下の ID 名。
+    #[test]
+    fn net1_spec_requires_absolute_netns_dir() {
+        let e =
+            ContainerAttachSpec::new(eid("c1"), &created(), PathBuf::from("rel/dir")).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        assert_eq!(spec("c1").netns_path(), pin_of("c1"));
+    }
+
+    /// NET-1・TASK-139.2.1: 全手順成功。呼び出し列と戻り値を具体値で照合する。
+    #[test]
+    fn net1_attach_success() {
+        let f = Fake::default();
+        let a = attach_container_with(&f, &spec("web-1")).unwrap();
+        let n = VethNames::derive(&eid("web-1")).unwrap();
+        assert_eq!(
+            f.calls(),
+            [
+                format!("link_index {}", created().bridge.as_str()),
+                "create_netns /run/fc-netns/web-1".to_owned(),
+                format!("create_veth {} {}", n.host().as_str(), n.peer().as_str()),
+                format!("link_index {}", n.host().as_str()),
+                format!("link_index {}", n.peer().as_str()),
+                "set_master 21 7".to_owned(),
+                "set_up 21".to_owned(),
+                "move_to_netns 22".to_owned(),
+            ]
+        );
+        assert_eq!(a.host_index.get(), 21);
+        assert_eq!(a.host_veth, *n.host());
+        assert_eq!(a.peer_veth, *n.peer());
+        assert_eq!(a.netns_path, pin_of("web-1"));
+    }
+
+    /// NET-1: bridge の ifindex が作成時と違う（差し替え）なら、何も作らず拒否する。
+    #[test]
+    fn net1_attach_bridge_mismatch_creates_nothing() {
+        let f = Fake {
+            bridge_index: Some(9),
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        assert_eq!(f.calls().len(), 1);
+        assert_eq!(e.step, AttachStep::VerifyBridge);
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.rollback, AttachRollbackReport::default());
+
+        let f = Fake {
+            fail_bridge_lookup: true,
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        assert_eq!(f.calls().len(), 1);
+        assert_eq!(e.step, AttachStep::VerifyBridge);
+        assert_eq!(e.code(), NetErrorCode::NotFound);
+    }
+
+    /// NET-1: netns 作成の失敗。取り残しが無ければ空報告、結果不明なら Unknown で pin パスを報告する。
+    #[test]
+    fn net1_attach_netns_failure_reports_leftover() {
+        let f = Fake {
+            fail_netns: Some((NetErrorCode::PermissionDenied, None)),
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        assert_eq!(e.step, AttachStep::CreateNetns);
+        assert_eq!(e.code(), NetErrorCode::PermissionDenied);
+        assert_eq!(e.rollback, AttachRollbackReport::default());
+        assert_eq!(f.calls().len(), 2);
+
+        let f = Fake {
+            fail_netns: Some((NetErrorCode::Timeout, Some(ResourceState::Unknown))),
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        assert_eq!(
+            e.rollback.leftover,
+            [(AttachResource::Netns(pin_of("c1")), ResourceState::Unknown)]
+        );
+        assert!(e.rollback.removed.is_empty());
+    }
+
+    /// NET-1: veth の AlreadyExists は他者のリソースなので削除せず、netns だけ戻す。
+    #[test]
+    fn net1_attach_veth_exists_is_not_deleted() {
+        let f = Fake {
+            fail_veth: Some(NetErrorCode::AlreadyExists),
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        assert_eq!(e.step, AttachStep::CreateVeth);
+        assert_eq!(e.code(), NetErrorCode::AlreadyExists);
+        assert_eq!(e.message(), VETH_COLLISION_MSG);
+        assert_eq!(e.rollback.removed, [AttachResource::Netns(pin_of("c1"))]);
+        assert!(e.rollback.leftover.is_empty());
+        assert!(!f.calls().iter().any(|c| c.starts_with("delete_link")));
+        assert_eq!(f.calls().last().unwrap(), "unpin_netns");
+    }
+
+    /// NET-1: 送信後の応答エラーは作成済みの可能性があるので veth を Unknown で報告し、名前では削除しない。
+    #[test]
+    fn net1_attach_veth_post_send_error_is_unknown() {
+        for code in [
+            NetErrorCode::Timeout,
+            NetErrorCode::DataLoss,
+            NetErrorCode::Internal,
+        ] {
+            let f = Fake {
+                fail_veth: Some(code),
+                ..Default::default()
+            };
+            let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+            assert_eq!(
+                e.rollback.leftover,
+                [(AttachResource::Veth(host_of("c1")), ResourceState::Unknown)],
+                "{code:?}"
+            );
+            assert_eq!(e.rollback.removed, [AttachResource::Netns(pin_of("c1"))]);
+            assert!(!f.calls().iter().any(|c| c.starts_with("delete_link")));
+        }
+    }
+
+    /// NET-1: ifindex を解決できなければ名前では削除せず Unknown（fail-closed）。netns は戻す。
+    #[test]
+    fn net1_attach_resolve_failure_is_unknown() {
+        for (host, peer) in [(true, false), (false, true)] {
+            let f = Fake {
+                fail_host_lookup: host,
+                fail_peer_lookup: peer,
+                ..Default::default()
+            };
+            let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+            assert_eq!(e.step, AttachStep::ResolveIndex);
+            assert_eq!(
+                e.rollback.leftover,
+                [(AttachResource::Veth(host_of("c1")), ResourceState::Unknown)]
+            );
+            assert_eq!(e.rollback.removed, [AttachResource::Netns(pin_of("c1"))]);
+            assert!(!f.calls().iter().any(|c| c.starts_with("delete_link")));
+        }
+    }
+
+    /// NET-1: 接続以降の失敗は ifindex 指定で veth を削除してから netns を戻す。
+    #[test]
+    fn net1_attach_late_failures_roll_back_veth_then_netns() {
+        let cases = [
+            (
+                Fake {
+                    fail_master: true,
+                    ..Default::default()
+                },
+                AttachStep::SetMaster,
+            ),
+            (
+                Fake {
+                    fail_up: true,
+                    ..Default::default()
+                },
+                AttachStep::SetUp,
+            ),
+            (
+                Fake {
+                    fail_move: Some(NetErrorCode::Internal),
+                    ..Default::default()
+                },
+                AttachStep::MoveToNetns,
+            ),
+        ];
+        for (f, step) in cases {
+            let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+            assert_eq!(e.step, step);
+            assert_eq!(e.code(), NetErrorCode::Internal);
+            assert_eq!(
+                e.rollback.removed,
+                [
+                    AttachResource::Veth(host_of("c1")),
+                    AttachResource::Netns(pin_of("c1"))
+                ],
+                "{step:?}"
+            );
+            assert!(e.rollback.leftover.is_empty());
+            let calls = f.calls();
+            let n = calls.len();
+            assert_eq!(calls[n - 2], "delete_link 21");
+            assert_eq!(calls[n - 1], "unpin_netns");
+        }
+    }
+
+    /// NET-1: ロールバックが失敗しても元のエラーを保ち、状態を Present / Unknown で分けて報告する。
+    #[test]
+    fn net1_attach_rollback_failure_keeps_original_error() {
+        let f = Fake {
+            fail_move: Some(NetErrorCode::PermissionDenied),
+            delete_err: Some(NetErrorCode::Internal),
+            unpin_fails: true,
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        assert_eq!(e.step, AttachStep::MoveToNetns);
+        assert_eq!(e.code(), NetErrorCode::PermissionDenied);
+        assert!(e.rollback.removed.is_empty());
+        assert_eq!(
+            e.rollback.leftover,
+            [
+                (AttachResource::Veth(host_of("c1")), ResourceState::Present),
+                (AttachResource::Netns(pin_of("c1")), ResourceState::Present)
+            ]
+        );
+
+        let f = Fake {
+            fail_up: true,
+            delete_err: Some(NetErrorCode::Timeout),
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        assert_eq!(
+            e.rollback.leftover,
+            [(AttachResource::Veth(host_of("c1")), ResourceState::Unknown)]
+        );
+        assert_eq!(e.rollback.removed, [AttachResource::Netns(pin_of("c1"))]);
     }
 }

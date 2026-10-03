@@ -38,3 +38,10 @@ harness = false
 name = "nftables_paths_privileged"
 path = "tests/nftables_paths_privileged.rs"
 harness = false
+
+# コンテナ接続（netns 作成・pin、veth 作成、bridge 接続、peer の netns 移動）の実機結合試験（NET-1・TASK-139.2.1・#847）。
+# 子の再入（--inner）と root 前提の分離のため harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "network_attach_privileged"
+path = "tests/network_attach_privileged.rs"
+harness = false

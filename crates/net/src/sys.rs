@@ -6,7 +6,7 @@
 //! # 呼び出し文脈
 //! `crate::netlink_route::NetlinkRouteSocket`（NET-11・TASK-136.2.1・#843。nf_tables のバッチ送信 TASK-137.3・#306
 //! では protocol だけ `NETLINK_NETFILTER` に差し替えて再利用する）の `open` / `send` / `recv` が、
-//! `socket(2)`・`bind(2)`・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶために使う。
+//! `socket(2)`・`bind(2)`・`setsockopt(2)`・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶために使う。
 //! メッセージの組み立て・解釈は `crate::netlink` のコーデックが担い、ここはバイト列を
 //! 運ぶだけで中身を解釈しない。
 //!
@@ -123,6 +123,9 @@ mod consts {
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
     pub const NETLINK_ROUTE: i32 = 0;
     pub const NETLINK_NETFILTER: i32 = 12;
+    pub const SOL_NETLINK: i32 = 270;
+    pub const NETLINK_CAP_ACK: i32 = 10;
+    pub const NETLINK_EXT_ACK: i32 = 11;
     pub const MSG_PEEK: i32 = 0x02;
     pub const MSG_TRUNC: i32 = 0x20;
     pub const MSG_DONTWAIT: i32 = 0x40;
@@ -154,6 +157,9 @@ mod consts {
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
     pub const NETLINK_ROUTE: i32 = 0;
     pub const NETLINK_NETFILTER: i32 = 12;
+    pub const SOL_NETLINK: i32 = 270;
+    pub const NETLINK_CAP_ACK: i32 = 10;
+    pub const NETLINK_EXT_ACK: i32 = 11;
     pub const MSG_PEEK: i32 = 0x02;
     pub const MSG_TRUNC: i32 = 0x20;
     pub const MSG_DONTWAIT: i32 = 0x40;
@@ -190,6 +196,9 @@ mod consts {
     pub const SOCK_CLOEXEC: i32 = 0;
     pub const NETLINK_ROUTE: i32 = 0;
     pub const NETLINK_NETFILTER: i32 = 0;
+    pub const SOL_NETLINK: i32 = 0;
+    pub const NETLINK_CAP_ACK: i32 = 0;
+    pub const NETLINK_EXT_ACK: i32 = 0;
     pub const MSG_PEEK: i32 = 0;
     pub const MSG_TRUNC: i32 = 0;
     pub const MSG_DONTWAIT: i32 = 0;
@@ -247,6 +256,15 @@ unsafe extern "C" {
     // 原型: `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`
     // （`nfds_t` は `unsigned long`）。
     fn poll(fds: *mut PollFd, nfds: core::ffi::c_ulong, timeout: i32) -> i32;
+    // 原型: `int setsockopt(int fd, int level, int optname, const void *optval,
+    // socklen_t optlen)`（`socklen_t` は u32）。
+    fn setsockopt(
+        fd: i32,
+        level: i32,
+        optname: i32,
+        optval: *const core::ffi::c_void,
+        optlen: u32,
+    ) -> i32;
 }
 
 /// `struct sockaddr_nl`（include/uapi/linux/netlink.h。全アーキテクチャ共通の 12 バイト）。
@@ -329,6 +347,39 @@ fn open_socket(protocol: i32) -> Result<OwnedFd, SysError> {
     }
     // SAFETY: `fd` は上で成功した socket が返した、他に所有者のいない有効な fd。
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `NETLINK_EXT_ACK` を有効にする（拡張 ACK の `NLMSGERR_ATTR_MSG` / `OFFS` を受け取る。Linux 4.12 以降）。
+/// 失敗（古いカーネルの `ENOPROTOOPT` 等）は呼び出し側が無視して拡張 ACK なしで続ける（NET-11）。
+pub(crate) fn enable_ext_ack(fd: BorrowedFd<'_>) -> Result<(), SysError> {
+    set_netlink_flag(fd, consts::NETLINK_EXT_ACK)
+}
+
+/// `NETLINK_CAP_ACK` を有効にする（エラー応答が元要求の本体を写さずヘッダのみになる。Linux 4.3 以降）。
+pub(crate) fn enable_cap_ack(fd: BorrowedFd<'_>) -> Result<(), SysError> {
+    set_netlink_flag(fd, consts::NETLINK_CAP_ACK)
+}
+
+/// `SOL_NETLINK` の真偽値オプション `optname` を 1 にする。`optname` はこのモジュールの定数だけが
+/// 渡される（任意の optname・optval を渡す経路を公開しない）。
+fn set_netlink_flag(fd: BorrowedFd<'_>, optname: i32) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let on: i32 = 1;
+    // SAFETY: `on` はスタック上の初期化済み `i32` で、`optlen` はその `size_of`（4）と一致する。
+    // カーネルは呼び出しの間だけ `optval` を読む。`fd` は生存中の `BorrowedFd`。`level` / `optname` は
+    // 値渡しの整数で、このモジュールの定義済み定数のみ。
+    let rc = unsafe {
+        setsockopt(
+            fd.as_raw_fd(),
+            consts::SOL_NETLINK,
+            optname,
+            (&raw const on).cast(),
+            core::mem::size_of::<i32>() as u32,
+        )
+    };
+    if rc < 0 { Err(last_error()) } else { Ok(()) }
 }
 
 /// `nl_pid = 0`（カーネルが採番）・`nl_groups = 0`（マルチキャスト購読なし）で bind する。
@@ -520,6 +571,9 @@ mod tests {
         assert_eq!(consts::SOCK_RAW, 3);
         assert_eq!(consts::SOCK_CLOEXEC, 0x80000);
         assert_eq!(consts::NETLINK_ROUTE, 0);
+        assert_eq!(consts::SOL_NETLINK, 270);
+        assert_eq!(consts::NETLINK_CAP_ACK, 10);
+        assert_eq!(consts::NETLINK_EXT_ACK, 11);
         assert_eq!(consts::MSG_PEEK, 0x02);
         assert_eq!(consts::MSG_TRUNC, 0x20);
         assert_eq!(consts::MSG_DONTWAIT, 0x40);
@@ -534,6 +588,14 @@ mod tests {
         assert_eq!(consts::EOPNOTSUPP, 95);
         assert_eq!(core::mem::size_of::<SockaddrNl>(), 12);
         assert_eq!(core::mem::size_of::<PollFd>(), 8);
+    }
+
+    /// NET-11: 実カーネルで route ソケットに EXT_ACK / CAP_ACK を設定できる（4.12 以降のカーネル前提）。
+    #[test]
+    fn enable_ack_options_on_route_socket() {
+        let fd = open_route_socket().expect("open");
+        enable_ext_ack(fd.as_fd()).expect("ext ack");
+        enable_cap_ack(fd.as_fd()).expect("cap ack");
     }
 
     /// NET-11・REPAIR-5: 何も届いていない socket の `wait_readable` は期限まで待って `TimedOut` を返す

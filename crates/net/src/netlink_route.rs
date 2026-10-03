@@ -15,9 +15,21 @@
 //! 実機前提の結合テスト（`tests/link_netns_privileged.rs`・`tests/netlink_route_addr_route.rs`。
 //! TASK-136.5・#302）と既定集合からの分離方式は `AGENTS.md`「実機前提テスト」節を参照。
 //!
+//! # 拡張 ACK（NET-11・REPAIR-4）
+//!
+//! route ソケットは open 時に `NETLINK_EXT_ACK` と `NETLINK_CAP_ACK` を有効にする（どちらも失敗したら
+//! 無視して従来どおり errno だけで動く）。`CAP_ACK` を使う理由は、既定ではエラー応答が要求全体を写して
+//! 返すため、上限（1 MiB）近い要求が失敗すると応答が受信上限を超えて破棄され、本当の errno が
+//! `Timeout` に化けるのを避けるため。`NLMSGERR_ATTR_OFFS` は要求先頭からのオフセットで、要求は
+//! 呼び出し側が持っているので写しがなくても失う情報はない。
+//! 拡張 ACK の文字列はカーネル由来の外部入力として長さを制限し、印字可能な ASCII 以外を除いて
+//! エラーの `message` に載せる（[`decode_nlmsgerr_with_flags`]）。
+//!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
-//! - extended ACK（`NETLINK_EXT_ACK`・`NLMSGERR_ATTR_MSG` 等）の解釈
+//! - netfilter ソケット（`NETLINK_NETFILTER`）での拡張 ACK の有効化・解釈。拡張 ACK は route ソケットだけで
+//!   有効にする（`nftables_batch` が受け取るバイト列を変えないため）
+//! - 拡張 ACK のうち `NLMSGERR_ATTR_COOKIE`・`POLICY`・`MISS_TYPE` / `MISS_NEST` の解釈（読み飛ばす）
 //! - 自ソケットの `nl_pid` 取得（`getsockname`）と応答 `nlmsg_pid` の照合。マルチキャスト購読が
 //!   なく送信元がカーネルであることは `recv` が検証済みのため、現状は seq 照合で足りる
 //! - dump 中断（`NLM_F_DUMP_INTR`）の自動再試行（検出して `FailedPrecondition` で返すのみ）、複数スレッドでの seq 別の待機者振り分け（往復は 1 件ずつ直列化する）
@@ -66,14 +78,21 @@ impl SeqAllocator {
     }
 }
 
+/// 拡張 ACK の文字列（`NLMSGERR_ATTR_MSG`）の最大バイト数。カーネルの書式つきメッセージは
+/// `NETLINK_MAX_FMTMSG_LEN`（80）で静的メッセージも短いため、それより余裕のある値で打ち切る。
+const MAX_EXT_ACK_MESSAGE_LEN: usize = 128;
+
 /// `NLMSG_ERROR` ペイロード（`struct nlmsgerr`）の復号結果（NET-11・ERR-1）。
 ///
-/// `errno == 0` は ACK、それ以外はカーネルが返した失敗（正の errno）。将来 extended ACK の属性を
-/// 足せるよう、フィールドは非公開でアクセサ経由にする。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `errno == 0` は ACK、それ以外はカーネルが返した失敗（正の errno）。拡張 ACK
+/// （`NETLINK_EXT_ACK`。[`decode_nlmsgerr_with_flags`]）が付いていれば、失敗理由の文字列と
+/// 問題の属性のオフセットも持つ。フィールドは非公開でアクセサ経由にする。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NlAck {
     errno: i32,
     request_seq: Option<u32>,
+    ext_message: Option<String>,
+    ext_offset: Option<u32>,
 }
 
 impl NlAck {
@@ -92,6 +111,37 @@ impl NlAck {
     pub fn request_seq(&self) -> Option<u32> {
         self.request_seq
     }
+
+    /// 拡張 ACK の失敗理由（サニタイズ済み。ASCII の印字可能文字のみ・最大 128 バイト + `...`）。
+    pub fn ext_message(&self) -> Option<&str> {
+        self.ext_message.as_deref()
+    }
+
+    /// 拡張 ACK の、問題のある属性の元要求先頭からのオフセット。
+    pub fn ext_offset(&self) -> Option<u32> {
+        self.ext_offset
+    }
+
+    /// 失敗時の `NetError` の `message`（英語）。拡張 ACK がなければ従来と同一の
+    /// `netlink request failed: errno N`。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn failure_message(&self) -> String {
+        let mut m = format!("netlink request failed: errno {}", self.errno);
+        if let Some(text) = &self.ext_message {
+            m.push_str(": ");
+            m.push_str(text);
+        }
+        if let Some(off) = self.ext_offset {
+            m.push_str(&format!(" (at offset {off})"));
+        }
+        m
+    }
+}
+
+/// `NLMSG_ERROR` メッセージのペイロードを復号する（拡張 ACK は解釈しない。
+/// [`decode_nlmsgerr_with_flags`] に `flags = 0` を渡すのと同じ）。
+pub fn decode_nlmsgerr(payload: &[u8]) -> Result<NlAck, NetError> {
+    decode_nlmsgerr_with_flags(0, payload)
 }
 
 /// `NLMSG_ERROR` メッセージのペイロードを復号する（カーネル応答は外部入力として検証する）。
@@ -99,7 +149,15 @@ impl NlAck {
 /// 先頭 4 バイトの `error`（ホストバイトオーダーの `i32`）が 0 なら ACK、負なら `-errno` の失敗。
 /// 4 バイト未満・正値・`i32::MIN` はプロトコル違反として `DataLoss`。後続の元要求ヘッダ
 /// （16 バイト）が揃っていれば、その `nlmsg_seq` を `request_seq` に返す。
-pub fn decode_nlmsgerr(payload: &[u8]) -> Result<NlAck, NetError> {
+///
+/// `flags` は受信した nlmsghdr の `nlmsg_flags`。`NLM_F_ACK_TLVS` が立っていれば、ペイロード末尾の
+/// 拡張 ACK 属性から `NLMSGERR_ATTR_MSG`（文字列）と `NLMSGERR_ATTR_OFFS`（オフセット）を取り出す。
+/// `NLM_F_CAPPED` ならペイロードは 20 バイト（error + 元ヘッダ）で終わり、そうでなければ元要求の
+/// 全体（4 バイト境界に切り上げ）の後ろから属性が始まる。拡張部分は診断情報なので best effort で、
+/// 壊れていれば全体を捨てて errno だけを返す（エラー判定は変えない。REPAIR-2）。
+/// `NLM_F_CAPPED` / `NLM_F_ACK_TLVS` は他のフラグと同じビットなので、呼び出し側は
+/// `NLMSG_ERROR` のメッセージにだけ渡すこと。COOKIE・POLICY・MISS_* は未解釈（REPAIR-3）。
+pub fn decode_nlmsgerr_with_flags(flags: u16, payload: &[u8]) -> Result<NlAck, NetError> {
     let bad = |msg: &str| NetError::new(NetErrorCode::DataLoss, msg.to_string());
     let head: [u8; 4] = payload
         .get(..4)
@@ -129,7 +187,79 @@ pub fn decode_nlmsgerr(payload: &[u8]) -> Result<NlAck, NetError> {
     } else {
         None
     };
-    Ok(NlAck { errno, request_seq })
+    let (ext_message, ext_offset) = if flags & NLM_F_ACK_TLVS != 0 {
+        decode_ext_ack(flags, payload).unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+    Ok(NlAck {
+        errno,
+        request_seq,
+        ext_message,
+        ext_offset,
+    })
+}
+
+/// 拡張 ACK の属性領域を解釈する。領域の位置が決まらない・属性が壊れている場合は `None`
+/// （呼び出し側が拡張部分全体を捨てる）。
+fn decode_ext_ack(flags: u16, payload: &[u8]) -> Option<(Option<String>, Option<u32>)> {
+    let start = if flags & NLM_F_CAPPED != 0 {
+        4 + NLMSG_HEADER_LEN
+    } else {
+        // 元要求の nlmsg_len（payload[4..8]）は外部入力。範囲と桁あふれを検証してから使う。
+        let orig_len =
+            usize::try_from(u32::from_ne_bytes(payload.get(4..8)?.try_into().ok()?)).ok()?;
+        if orig_len < NLMSG_HEADER_LEN {
+            return None;
+        }
+        let aligned = orig_len.checked_add(ALIGN_TO - 1)? & !(ALIGN_TO - 1);
+        4usize.checked_add(aligned)?
+    };
+    let tlvs = payload.get(start..)?;
+    let mut message = None;
+    let mut offset = None;
+    for attr in AttrIter::new(tlvs) {
+        let attr = attr.ok()?;
+        match attr.attr_type() {
+            NLMSGERR_ATTR_MSG if message.is_none() => {
+                message = sanitize_ext_ack_message(attr.payload());
+            }
+            NLMSGERR_ATTR_OFFS if offset.is_none() => {
+                offset = <[u8; 4]>::try_from(attr.payload())
+                    .ok()
+                    .map(u32::from_ne_bytes);
+            }
+            _ => {}
+        }
+    }
+    Some((message, offset))
+}
+
+/// カーネル由来の文字列を `message` に載せられる形にする（ログ注入・表示の乱れ・巨大化の防止）。
+///
+/// 最初の NUL で切り、128 バイトを超える分は捨てて末尾に `...` を付ける。ASCII の印字可能文字
+/// （0x20..=0x7E）以外は 1 バイトにつき `?` に置き換える。空白だけ・空なら `None`。
+fn sanitize_ext_ack_message(raw: &[u8]) -> Option<String> {
+    let text = raw.split(|&b| b == 0).next().unwrap_or_default();
+    let truncated = text.len() > MAX_EXT_ACK_MESSAGE_LEN;
+    let mut out: String = text
+        .iter()
+        .take(MAX_EXT_ACK_MESSAGE_LEN)
+        .map(|&b| {
+            if (0x20..=0x7e).contains(&b) {
+                b as char
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    if out.trim().is_empty() {
+        return None;
+    }
+    if truncated {
+        out.push_str("...");
+    }
+    Some(out)
 }
 
 #[cfg(target_os = "linux")]
@@ -148,7 +278,7 @@ mod socket {
     use std::sync::{Arc, Condvar, Mutex, PoisonError};
     use std::time::Duration;
 
-    use super::{SeqAllocator, decode_nlmsgerr};
+    use super::{SeqAllocator, decode_nlmsgerr_with_flags};
     use crate::error::{NetError, NetErrorCode};
     use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
     use crate::netlink::{
@@ -300,12 +430,51 @@ mod socket {
         seq: SeqAllocator,
         /// `request` の直列化。
         gate: RequestGate,
+        /// open 時に有効にできた ACK オプション（拡張 ACK。NET-11）。
+        ack_options: AckOptions,
+    }
+
+    /// open 時に有効にできた ACK オプション。失敗しても open は成功し、その項目が `false` になる。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct AckOptions {
+        /// `NETLINK_EXT_ACK`（失敗理由・オフセットの TLV を受け取る）。
+        pub ext_ack: bool,
+        /// `NETLINK_CAP_ACK`（エラー応答が元要求の本体を写さない）。
+        pub cap_ack: bool,
+    }
+
+    /// [`enable_ack_options`] が設定するオプションの種別。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum AckOpt {
+        ExtAck,
+        CapAck,
+    }
+
+    /// 拡張 ACK 関連のソケットオプションを有効にする。診断情報のためのオプションなので、
+    /// 失敗（古いカーネル等）は無視して `false` を記録するだけで、エラーにしない。
+    /// `set` を差し替えられるのは失敗経路を実カーネルなしで試すため。
+    pub(crate) fn enable_ack_options(
+        fd: BorrowedFd<'_>,
+        set: impl Fn(BorrowedFd<'_>, AckOpt) -> Result<(), SysError>,
+    ) -> AckOptions {
+        AckOptions {
+            ext_ack: set(fd, AckOpt::ExtAck).is_ok(),
+            cap_ack: set(fd, AckOpt::CapAck).is_ok(),
+        }
+    }
+
+    fn set_ack_opt(fd: BorrowedFd<'_>, opt: AckOpt) -> Result<(), SysError> {
+        match opt {
+            AckOpt::ExtAck => sys::enable_ext_ack(fd),
+            AckOpt::CapAck => sys::enable_cap_ack(fd),
+        }
     }
 
     impl fmt::Debug for NetlinkRouteSocket {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("NetlinkRouteSocket")
                 .field("fd", &self.fd.as_raw_fd())
+                .field("ack_options", &self.ack_options)
                 .finish_non_exhaustive()
         }
     }
@@ -350,7 +519,7 @@ mod socket {
         /// ソケットを開いて bind し、以後の open / send / recv の結果と所要時間を `recorder` へ渡す
         /// （REPAIR-4）。open 自体の成否もここで 1 件記録する。
         pub fn open_with_recorder(recorder: Arc<dyn NetOpRecorder>) -> Result<Self, NetError> {
-            Self::open_protocol(recorder, sys::open_route_socket)
+            Self::open_protocol(recorder, sys::open_route_socket, true)
         }
 
         /// `NETLINK_NETFILTER` ソケットとして開いて bind する（nf_tables のバッチ送信用。
@@ -362,7 +531,7 @@ mod socket {
         pub(crate) fn open_netfilter_with_recorder(
             recorder: Arc<dyn NetOpRecorder>,
         ) -> Result<Self, NetError> {
-            Self::open_protocol(recorder, sys::open_netfilter_socket)
+            Self::open_protocol(recorder, sys::open_netfilter_socket, false)
         }
 
         /// 計装の記録先（`NetlinkNetfilterSocket` が往復全体を記録するために共有する）。
@@ -370,22 +539,40 @@ mod socket {
             &self.recorder
         }
 
+        /// 有効にできた ACK オプション（netfilter ソケットは常に両方 `false`）。
+        #[cfg(test)]
+        pub(crate) fn ack_options(&self) -> AckOptions {
+            self.ack_options
+        }
+
         /// open（`socket` + `bind`）の共通部。`open_fd` が protocol ごとのソケット作成を担う。
+        /// `ack_opts` が真なら拡張 ACK を有効にする（route 用。netfilter は `nftables_batch` の
+        /// 応答バイト列を変えないため無効のまま）。
         fn open_protocol(
             recorder: Arc<dyn NetOpRecorder>,
             open_fd: fn() -> Result<OwnedFd, SysError>,
+            ack_opts: bool,
         ) -> Result<Self, NetError> {
             let fd = record_net_op(recorder.as_ref(), NetOpKind::NetlinkOpen, || {
                 let fd = open_fd().map_err(|e| map_sys_error("socket", e))?;
                 sys::bind_kernel_assigned(fd.as_fd()).map_err(|e| map_sys_error("bind", e))?;
                 Ok::<_, NetError>(fd)
             })?;
+            let ack_options = if ack_opts {
+                enable_ack_options(fd.as_fd(), set_ack_opt)
+            } else {
+                AckOptions {
+                    ext_ack: false,
+                    cap_ack: false,
+                }
+            };
             Ok(Self {
                 fd,
                 recv_lock: Mutex::new(()),
                 recorder,
                 seq: SeqAllocator::new(),
                 gate: RequestGate::default(),
+                ack_options,
             })
         }
 
@@ -764,7 +951,7 @@ mod socket {
                 }
                 match h.msg_type() {
                     NLMSG_ERROR => {
-                        let ack = decode_nlmsgerr(msg.payload())?;
+                        let ack = decode_nlmsgerr_with_flags(h.flags(), msg.payload())?;
                         if ack.request_seq().is_some_and(|s| s != seq) {
                             return Err(data_loss(format!(
                                 "nlmsgerr for seq {seq} embeds a different request seq"
@@ -776,10 +963,9 @@ mod socket {
                             }
                             continue;
                         }
-                        let errno = ack.errno();
                         return Err(NetError::new(
-                            classify_errno(errno),
-                            format!("netlink request failed: errno {errno}"),
+                            classify_errno(ack.errno()),
+                            ack.failure_message(),
                         ));
                     }
                     NLMSG_DONE => {
@@ -1380,6 +1566,94 @@ mod socket {
             assert_eq!(e.code(), NetErrorCode::PermissionDenied);
         }
 
+        /// 拡張 ACK 付きの `NLMSG_ERROR`（capped。MSG と OFFS を持つ）。
+        fn ext_err_dgram(seq: u32, errno: i32, msg: &[u8], offs: u32) -> Vec<u8> {
+            let mut b = NlMsgBuilder::new(
+                NLMSG_ERROR,
+                crate::netlink::NLM_F_CAPPED | crate::netlink::NLM_F_ACK_TLVS,
+                seq,
+                0,
+            );
+            let mut p = Vec::new();
+            p.extend_from_slice(&(-errno).to_ne_bytes());
+            p.extend_from_slice(&[0u8; 8]);
+            p.extend_from_slice(&seq.to_ne_bytes());
+            p.extend_from_slice(&[0u8; 4]);
+            let mut text = msg.to_vec();
+            text.push(0);
+            p.extend_from_slice(&((4 + text.len()) as u16).to_ne_bytes());
+            p.extend_from_slice(&crate::netlink::NLMSGERR_ATTR_MSG.to_ne_bytes());
+            p.extend_from_slice(&text);
+            while !p.len().is_multiple_of(4) {
+                p.push(0);
+            }
+            p.extend_from_slice(&8u16.to_ne_bytes());
+            p.extend_from_slice(&crate::netlink::NLMSGERR_ATTR_OFFS.to_ne_bytes());
+            p.extend_from_slice(&offs.to_ne_bytes());
+            b.put_fixed(&p).expect("payload");
+            b.finish().expect("finish")
+        }
+
+        /// NET-11・REPAIR-4: 拡張 ACK の文字列とオフセットがエラーの message に入る。
+        #[test]
+        fn ext_ack_message_is_in_error() {
+            let dg = ext_err_dgram(3, 22, b"Unknown device type", 36);
+            let e = run(3, Duration::from_secs(5), script(vec![dg])).expect_err("einval");
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+            assert_eq!(
+                e.to_string(),
+                "INVALID_ARGUMENT: netlink request failed: errno 22: Unknown device type (at offset 36)"
+            );
+        }
+
+        /// NET-11: ACK オプションの設定に失敗しても open 相当は成功扱い（両方 false）。片方だけの失敗も反映。
+        #[test]
+        fn enable_ack_options_ignores_failures() {
+            use std::os::fd::AsFd as _;
+            let fd = sys::open_route_socket().expect("open");
+            let all_fail = enable_ack_options(fd.as_fd(), |_, _| Err(SysError::Os(92)));
+            assert_eq!(
+                all_fail,
+                AckOptions {
+                    ext_ack: false,
+                    cap_ack: false
+                }
+            );
+            let only_cap = enable_ack_options(fd.as_fd(), |_, o| match o {
+                AckOpt::ExtAck => Err(SysError::Os(92)),
+                AckOpt::CapAck => Ok(()),
+            });
+            assert_eq!(
+                only_cap,
+                AckOptions {
+                    ext_ack: false,
+                    cap_ack: true
+                }
+            );
+        }
+
+        /// NET-11: 実カーネルでは route ソケットだけ拡張 ACK が有効（Linux 4.12 以降前提）。
+        #[test]
+        fn route_socket_enables_ack_options_netfilter_does_not() {
+            let route = NetlinkRouteSocket::open().expect("route");
+            assert_eq!(
+                route.ack_options(),
+                AckOptions {
+                    ext_ack: true,
+                    cap_ack: true
+                }
+            );
+            let nf = NetlinkRouteSocket::open_netfilter_with_recorder(Arc::new(NoopNetOpRecorder))
+                .expect("netfilter");
+            assert_eq!(
+                nf.ack_options(),
+                AckOptions {
+                    ext_ack: false,
+                    cap_ack: false
+                }
+            );
+        }
+
         /// NET-11: 埋め込まれた元要求 seq が外側と食い違えば DataLoss。
         #[test]
         fn embedded_seq_mismatch_is_data_loss() {
@@ -1824,6 +2098,166 @@ mod tests {
         ] {
             let e = decode_nlmsgerr(&bad).expect_err("malformed");
             assert_eq!(e.code(), NetErrorCode::DataLoss);
+        }
+    }
+
+    // --- 拡張 ACK（NET-11・REPAIR-2・REPAIR-4） ---
+
+    fn tlv(ty: u16, data: &[u8]) -> Vec<u8> {
+        let mut v = ((4 + data.len()) as u16).to_ne_bytes().to_vec();
+        v.extend_from_slice(&ty.to_ne_bytes());
+        v.extend_from_slice(data);
+        while !v.len().is_multiple_of(4) {
+            v.push(0);
+        }
+        v
+    }
+
+    /// capped: error + 元ヘッダ 16 バイト + TLV。
+    fn capped(error: i32, seq: u32, tlvs: &[u8]) -> Vec<u8> {
+        let mut v = payload(error, Some(seq));
+        v.extend_from_slice(tlvs);
+        v
+    }
+
+    const CAPPED_TLVS: u16 = NLM_F_CAPPED | NLM_F_ACK_TLVS;
+
+    #[test]
+    fn ext_ack_capped_message() {
+        let p = capped(-22, 7, &tlv(NLMSGERR_ATTR_MSG, b"Unknown device type\0"));
+        let a = decode_nlmsgerr_with_flags(CAPPED_TLVS, &p).expect("ok");
+        assert_eq!(a.errno(), 22);
+        assert_eq!(a.request_seq(), Some(7));
+        assert_eq!(a.ext_message(), Some("Unknown device type"));
+        assert_eq!(a.ext_offset(), None);
+        assert_eq!(
+            a.failure_message(),
+            "netlink request failed: errno 22: Unknown device type"
+        );
+    }
+
+    #[test]
+    fn ext_ack_capped_message_and_offset() {
+        let mut t = tlv(NLMSGERR_ATTR_MSG, b"Unknown device type\0");
+        t.extend(tlv(NLMSGERR_ATTR_OFFS, &36u32.to_ne_bytes()));
+        let a = decode_nlmsgerr_with_flags(CAPPED_TLVS, &capped(-22, 7, &t)).expect("ok");
+        assert_eq!(a.ext_offset(), Some(36));
+        assert_eq!(
+            a.failure_message(),
+            "netlink request failed: errno 22: Unknown device type (at offset 36)"
+        );
+        let only_off = tlv(NLMSGERR_ATTR_OFFS, &8u32.to_ne_bytes());
+        let a = decode_nlmsgerr_with_flags(CAPPED_TLVS, &capped(-22, 7, &only_off)).expect("ok");
+        assert_eq!(
+            a.failure_message(),
+            "netlink request failed: errno 22 (at offset 8)"
+        );
+    }
+
+    #[test]
+    fn ext_ack_uncapped_message() {
+        // 元ヘッダの nlmsg_len = 21（本体 5 バイト）。本体はパディング込み 8 バイト写される。
+        let mut p = payload(-22, Some(7));
+        p.get_mut(4..8)
+            .expect("len field")
+            .copy_from_slice(&21u32.to_ne_bytes());
+        p.extend_from_slice(&[0xAA; 8]);
+        p.extend(tlv(NLMSGERR_ATTR_MSG, b"bad attr\0"));
+        let a = decode_nlmsgerr_with_flags(NLM_F_ACK_TLVS, &p).expect("ok");
+        assert_eq!(a.ext_message(), Some("bad attr"));
+    }
+
+    #[test]
+    fn ext_ack_on_success_ack() {
+        let p = capped(0, 5, &tlv(NLMSGERR_ATTR_MSG, b"warning\0"));
+        let a = decode_nlmsgerr_with_flags(CAPPED_TLVS, &p).expect("ok");
+        assert!(a.is_ack());
+        assert_eq!(a.ext_message(), Some("warning"));
+    }
+
+    /// REPAIR-2: 壊れた TLV・範囲外の長さは拡張部分だけ捨てて errno は返す。
+    #[test]
+    fn ext_ack_broken_tlvs_are_ignored() {
+        let mut long_rta = 200u16.to_ne_bytes().to_vec();
+        long_rta.extend_from_slice(&NLMSGERR_ATTR_MSG.to_ne_bytes());
+        long_rta.extend_from_slice(b"abc\0");
+        let mut small_rta = 2u16.to_ne_bytes().to_vec();
+        small_rta.extend_from_slice(&NLMSGERR_ATTR_MSG.to_ne_bytes());
+        let cases: Vec<(u16, Vec<u8>)> = vec![
+            (CAPPED_TLVS, capped(-22, 7, &long_rta)),
+            (CAPPED_TLVS, capped(-22, 7, &small_rta)),
+            (CAPPED_TLVS, capped(-22, 7, &[1, 2, 3])),
+            // uncapped: 元の nlmsg_len が 16 未満・payload 超え・桁あふれ寸前
+            (NLM_F_ACK_TLVS, payload(-22, Some(7))),
+            (NLM_F_ACK_TLVS, {
+                let mut p = payload(-22, Some(7));
+                p.get_mut(4..8)
+                    .expect("len")
+                    .copy_from_slice(&1000u32.to_ne_bytes());
+                p
+            }),
+            (NLM_F_ACK_TLVS, {
+                let mut p = payload(-22, Some(7));
+                p.get_mut(4..8)
+                    .expect("len")
+                    .copy_from_slice(&u32::MAX.to_ne_bytes());
+                p
+            }),
+        ];
+        for (flags, p) in cases {
+            let a = decode_nlmsgerr_with_flags(flags, &p).expect("errno survives");
+            assert_eq!((a.errno(), a.request_seq()), (22, Some(7)));
+            assert_eq!((a.ext_message(), a.ext_offset()), (None, None));
+        }
+    }
+
+    #[test]
+    fn ext_ack_bad_offset_length_is_ignored() {
+        for len in [2usize, 8] {
+            let mut t = tlv(NLMSGERR_ATTR_MSG, b"hi\0");
+            t.extend(tlv(NLMSGERR_ATTR_OFFS, &vec![0u8; len]));
+            let a = decode_nlmsgerr_with_flags(CAPPED_TLVS, &capped(-22, 7, &t)).expect("ok");
+            assert_eq!((a.ext_message(), a.ext_offset()), (Some("hi"), None));
+        }
+    }
+
+    #[test]
+    fn sanitize_rules() {
+        let long = vec![b'a'; 200];
+        assert_eq!(
+            sanitize_ext_ack_message(&long),
+            Some(format!("{}...", "a".repeat(128)))
+        );
+        assert_eq!(sanitize_ext_ack_message(b"tail"), Some("tail".to_string()));
+        assert_eq!(
+            sanitize_ext_ack_message(b"bad\nline\x1b[31m\xff"),
+            Some("bad?line?[31m?".to_string())
+        );
+        assert_eq!(sanitize_ext_ack_message(b"ab\0cd"), Some("ab".to_string()));
+        assert_eq!(sanitize_ext_ack_message(b""), None);
+        assert_eq!(sanitize_ext_ack_message(b"   \0x"), None);
+    }
+
+    /// AC3: flags なしなら TLV が続いても解釈せず、従来の結果と同じ。
+    #[test]
+    fn ext_ack_ignored_without_flag() {
+        let p = capped(-22, 7, &tlv(NLMSGERR_ATTR_MSG, b"x\0"));
+        let a = decode_nlmsgerr_with_flags(0, &p).expect("ok");
+        assert_eq!((a.ext_message(), a.ext_offset()), (None, None));
+        assert_eq!(decode_nlmsgerr(&p).expect("ok"), a);
+        assert_eq!(a.failure_message(), "netlink request failed: errno 22");
+    }
+
+    /// REPAIR-2: 任意バイト列とフラグの組でも panic しない。
+    #[test]
+    fn ext_ack_no_panic_on_arbitrary_bytes() {
+        for flags in [0, NLM_F_CAPPED, NLM_F_ACK_TLVS, CAPPED_TLVS] {
+            for n in 0..64usize {
+                let buf: Vec<u8> = (0..n).map(|i| (i * 7 % 256) as u8).collect();
+                let _ = decode_nlmsgerr_with_flags(flags, &buf);
+                let ff = vec![0xFFu8; n];
+                let _ = decode_nlmsgerr_with_flags(flags, &ff);
+            }
         }
     }
 }

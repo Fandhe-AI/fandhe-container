@@ -1,4 +1,4 @@
-//! `NetlinkRouteSocket` の結合試験（NET-11・TASK-136.2.1・#843・TASK-136.2.2・#844）。
+//! `NetlinkRouteSocket` の結合試験（NET-11・TASK-136.2.1・#843・TASK-136.2.2・#844・自ソケット nl_pid の取得と応答照合 #1313）。
 //!
 //! 非特権で成立する RTM_GETLINK dump の往復で、送ったバイト列がカーネルへそのまま届くことを
 //! 機械照合する（seq の一致・lo の RTM_NEWLINK・NLMSG_DONE）。`request`（seq 採番・ACK / errno /
@@ -224,4 +224,24 @@ fn dump_request_collects_links_until_done() {
             "lo (ifindex 1) missing from dump (flags {flags:#x})"
         );
     }
+}
+
+/// NET-11・#1313: `local_pid` は非 0 で、ソケットごとに異なり、dump 応答の `nlmsg_pid` と一致する。
+#[test]
+fn local_pid_is_nonzero_and_matches_replies() {
+    let a = NetlinkRouteSocket::open().expect("open a");
+    let b = NetlinkRouteSocket::open().expect("open b");
+    assert_ne!(a.local_pid().get(), 0);
+    assert_ne!(a.local_pid(), b.local_pid());
+
+    let mut req = NlMsgBuilder::new(RTM_GETLINK, NLM_F_REQUEST, SEQ, 0);
+    let mut ifi = [0u8; 16];
+    ifi[4..8].copy_from_slice(&1i32.to_ne_bytes());
+    req.put_fixed(&ifi).expect("ifinfomsg");
+    a.send(&req.finish().expect("finish")).expect("send");
+    let data = a.recv(Duration::from_secs(5)).expect("recv");
+    let pids: Vec<u32> = NlMsgIter::new(&data)
+        .map(|m| m.expect("valid").header().pid())
+        .collect();
+    assert_eq!(pids, vec![a.local_pid().get()]);
 }

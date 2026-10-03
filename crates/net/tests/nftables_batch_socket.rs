@@ -77,3 +77,29 @@ fn net11_second_batch_on_same_socket_is_judged_independently() {
         assert_eq!(err.failures().len(), 1, "{err}");
     }
 }
+
+/// NET-10・TASK-148.1: 存在しないチェインの GETCHAIN が構造化エラーで返る（ルールセットは変更しない）。
+///
+/// `CAP_NET_ADMIN` なしは `PermissionDenied`、ありは `NotFound`。
+#[test]
+fn net10_getchain_of_missing_chain_reports_structured_error() {
+    use fandhe_container_net::nftables_batch::ChainGet;
+    let socket = NetlinkNetfilterSocket::open().expect("open NETLINK_NETFILTER");
+    let req = ChainGet::new(
+        NftFamily::Ipv4,
+        NftName::new(&unique_name()).expect("name"),
+        NftName::new("FORWARD").expect("name"),
+    );
+    let started = Instant::now();
+    let err = socket
+        .chain_info(&req, Duration::from_secs(5))
+        .expect_err("a missing chain cannot be read");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        matches!(
+            err.code(),
+            NetErrorCode::PermissionDenied | NetErrorCode::NotFound
+        ),
+        "{err}"
+    );
+}

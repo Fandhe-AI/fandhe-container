@@ -2,6 +2,7 @@
 //!
 //! `NetlinkNetfilterSocket::send_batch` で、隔離 netns の中にテーブル・regular chain・nat base chain を
 //! 作って消す往復と、失敗バッチが all-or-nothing（何も適用されない）であることを実カーネルで照合する。
+//! `chain_info`（GETCHAIN の成功経路。NET-10・TASK-148.1）で base chain の policy を読み取れることも照合する。
 //! 成功時の同期点（`NFT_MSG_GETGEN` → `NEWGEN` → errno 0 の ACK。#306 で実機未確認だった経路）の確認も兼ねる。
 //!
 //! `CAP_NET_ADMIN` が必要なため既定のテスト集合から `#[ignore]` で分離する（ci.md「実機前提テスト」。
@@ -181,4 +182,65 @@ fn net11_failed_batch_is_all_or_nothing_in_isolated_netns() {
     let err = send(&socket, |b| b.push_with(|seq| del.build(seq)).map(|_| ()))
         .expect_err("table must not exist");
     assert_single_failure(&err, 0, 2, NetErrorCode::NotFound);
+}
+
+/// NET-10・TASK-148.1: 実在する base chain の GETCHAIN が NEWCHAIN を返し、policy を読み取れる。
+///
+/// `ChainCreate` は policy 属性を載せないため、カーネルの既定（`NF_ACCEPT`）が返ることを具体値で照合する。
+/// 存在しないチェインの照会は `NotFound` になる（`nftables_batch_socket` の非特権試験は権限なしでも通るため、
+/// 成功経路の実カーネル往復はここで担う）。
+#[test]
+#[ignore = "requires CAP_NET_ADMIN inside an isolated network namespace (e.g. unshare -n as root); NET-10, TASK-148.1"]
+fn net10_chain_info_reads_policy_of_base_chain_in_isolated_netns() {
+    use fandhe_container_net::nftables_batch::{
+        ChainGet, ChainPolicy, ChainType, NF_IP_PRI_FILTER,
+    };
+
+    assert_isolated_from_parent_netns();
+    let socket = NetlinkNetfilterSocket::open().expect("open NETLINK_NETFILTER");
+    let t = unique_name("ci");
+    let _cleanup = Cleanup {
+        socket: &socket,
+        table: t.clone(),
+    };
+
+    let create_table = TableCreate::new(NftFamily::Inet, t.clone()).exclusive();
+    let forward = ChainCreate::base(
+        NftFamily::Inet,
+        t.clone(),
+        name("forward"),
+        BaseChain {
+            chain_type: ChainType::Filter,
+            hook: NfInetHook::Forward,
+            priority: NF_IP_PRI_FILTER,
+        },
+    )
+    .expect("base chain");
+    send(&socket, |b| {
+        b.push_with(|seq| create_table.build(seq))?;
+        b.push_with(|seq| forward.build(seq))?;
+        Ok(())
+    })
+    .expect("create table and base chain");
+
+    let started = Instant::now();
+    let limit = timeout();
+    let info = socket
+        .chain_info(
+            &ChainGet::new(NftFamily::Inet, t.clone(), name("forward")),
+            limit,
+        )
+        .expect("GETCHAIN of an existing base chain");
+    assert!(started.elapsed() < limit);
+    assert_eq!(info.policy(), Some(ChainPolicy::Accept));
+    assert_eq!(info.hook(), Some(NfInetHook::Forward.value()));
+
+    // 存在しないチェインは NotFound（テーブルはあるがチェインが無い）。
+    let err = socket
+        .chain_info(
+            &ChainGet::new(NftFamily::Inet, t.clone(), name("missing")),
+            limit,
+        )
+        .expect_err("missing chain");
+    assert_eq!(err.code(), NetErrorCode::NotFound, "{err}");
 }

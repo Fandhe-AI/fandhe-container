@@ -589,6 +589,31 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "orig\n");
     }
 
+    /// NET-12・TASK-185.2（P0）: 管理ルートは `/` から 1 要素ずつ辿り、祖先に symlink があれば
+    /// （`canonicalize` 後の差し替え相当）`FAILED_PRECONDITION` で開かない。実ディレクトリは開ける。
+    #[test]
+    fn managed_root_with_symlink_ancestor_is_not_opened() {
+        let real = TmpFile::new("root-real", Some("orig\n"));
+        let alias = TmpFile::new("root-alias", None);
+        // 一時ディレクトリ自体の祖先に symlink があっても影響しないよう正規化してから組み立てる。
+        let alias_root = std::fs::canonicalize(&alias.root).unwrap();
+        let link = alias_root.join("lnk");
+        std::os::unix::fs::symlink(&real.root, &link).unwrap();
+        let canon = std::fs::canonicalize(&real.root).unwrap();
+        assert!(open_abs_dir_nofollow(&canon).is_ok());
+        let e = open_abs_dir_nofollow(&link).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "managed root has a symlink or non-directory component"
+        );
+        let e = open_abs_dir_nofollow(&link.join("x")).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        let e = open_abs_dir_nofollow(&alias_root.join("none")).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::NotFound);
+        assert_eq!(std::fs::read_to_string(&real.path).unwrap(), "orig\n");
+    }
+
     /// NET-12・TASK-185.2（P0）: 途中要素が通常ファイルなら辿らず `INVALID_ARGUMENT`、途中が不在なら
     /// `NOT_FOUND`（いずれも何も作らない）。
     #[test]

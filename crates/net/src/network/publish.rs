@@ -20,16 +20,18 @@
 //!   拒否する（nft は同一ルールの重複を拒否しないため、後から入れたルールが機能しない）。レジストリは
 //!   呼び出し側が所有し、複数ネットワークで 1 つを共有する。デーモンレス構成で別プロセスが公開した受け口とも
 //!   競合を検出するには [`PortRegistry::with_shared_file`] を使う（排他ロック付きの共有ファイル。既定の
-//!   [`PortRegistry::new`] はプロセス内のみ）。再起動後の復元と孤児エントリの回収は TASK-139.4 以降（REPAIR-3）
+//!   [`PortRegistry::new`] はプロセス内のみ）。共有ファイルは開いた fd を検証し（通常ファイル・実効 UID 所有・
+//!   `0o077` なし・symlink 非追従）、一時ファイル＋fsync＋rename で原子的に更新する。空・不完全な内容は
+//!   予約ゼロ件ではなく破損として拒否する。ロックは置き換えない `<path>.lock` に掛ける。再起動後の復元と孤児エントリの回収は TASK-139.4 以降（REPAIR-3）
 //! - IPv4 のみ（静的 IPAM が IPv4 のみのため）。公開の個別解除はルールハンドルの取得経路が無く未対応
 //!   （ネットワーク削除時にテーブルごと解放する。TASK-139.4）
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::{EndpointId, NetworkName};
@@ -195,28 +197,94 @@ type ListenerKey = (PortProtocol, Ipv4Addr, u16);
 const MAX_SHARED_FILE_BYTES: u64 = 1024 * 1024;
 /// 共有ファイルのロック待ちの期限。
 const SHARED_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// 共有ファイルの先頭行（形式の版）。
+const SHARED_HEADER: &str = "fandhe-portreg v1\n";
+/// 共有ファイルの終端マーカー。無ければ書き込み途中として拒否する。
+const SHARED_FOOTER: &str = "end\n";
 
 fn shared_err(msg: &'static str) -> NetError {
     NetError::new(NetErrorCode::Internal, msg)
 }
 
-/// 共有ファイルを開いて排他ロックする（期限付き）。symlink・通常ファイル以外は拒否する。
-fn open_locked(path: &std::path::Path) -> Result<File, NetError> {
-    if let Ok(m) = std::fs::symlink_metadata(path)
-        && !m.file_type().is_file()
-    {
+/// `path` の末尾へ `suffix` を足したパス（ロックファイル・一時ファイル用）。
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// 開いた fd の属性を検証する（TOCTOU を避けるため、パスではなく開いた後の fd を検査する）。
+///
+/// 通常ファイルで、実効 UID 所有、グループ・その他に権限が無い（`0o077` が 0）ことを要求する。
+/// さらに `path` を symlink を追わずに引き直した dev / ino が fd と一致することを要求し、
+/// 最後の要素が symlink（や差し替えられたファイル）なら拒否する。検査後は fd だけを使うので、
+/// 以降のパス差し替えは影響しない。
+fn verify_opened(file: &File, path: &Path) -> Result<(), NetError> {
+    let meta = file
+        .metadata()
+        .map_err(|_| shared_err("failed to stat shared port registry"))?;
+    if !meta.file_type().is_file() {
         return Err(shared_err("shared port registry is not a regular file"));
     }
-    let mut opts = OpenOptions::new();
-    opts.read(true).write(true).create(true).truncate(false);
+    let via_path = std::fs::symlink_metadata(path)
+        .map_err(|_| shared_err("failed to stat shared port registry"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o077 != 0 {
+            return Err(shared_err("shared port registry permissions are too open"));
+        }
+        #[cfg(target_os = "linux")]
+        if meta.uid() != crate::sys::effective_uid() {
+            return Err(shared_err("shared port registry has an unexpected owner"));
+        }
+        if via_path.dev() != meta.dev() || via_path.ino() != meta.ino() {
+            return Err(shared_err("shared port registry path was replaced"));
+        }
     }
-    let file = opts
-        .open(path)
-        .map_err(|_| shared_err("failed to open shared port registry"))?;
+    #[cfg(not(unix))]
+    if !via_path.file_type().is_file() {
+        return Err(shared_err("shared port registry is not a regular file"));
+    }
+    Ok(())
+}
+
+/// ファイルを開く。`create` なら無いときだけ排他作成する（`create_new` = O_EXCL。symlink を追わない）。
+/// 既存なら通常 open のうえ [`verify_opened`] で fd を検証する。`create` でなく無ければ `None`。
+fn open_verified(path: &Path, create: bool) -> Result<Option<File>, NetError> {
+    let open_err = || shared_err("failed to open shared port registry");
+    if create {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(path) {
+            Ok(f) => return Ok(Some(f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(open_err()),
+        }
+    }
+    match OpenOptions::new().read(true).write(create).open(path) {
+        Ok(f) => {
+            verify_opened(&f, path)?;
+            Ok(Some(f))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => Ok(None),
+        Err(_) => Err(open_err()),
+    }
+}
+
+/// 共有ファイルのロックファイル（`<path>.lock`）を開いて排他ロックする（期限付き）。
+///
+/// データファイルは原子的な rename で置き換えるため inode が変わる。ロックはデータファイルではなく
+/// 置き換えない専用ロックファイルに掛ける。返す `File` を保持している間がロック区間。
+fn open_locked(path: &Path) -> Result<File, NetError> {
+    let lock_path = with_suffix(path, ".lock");
+    let file = open_verified(&lock_path, true)?
+        .ok_or_else(|| shared_err("failed to open shared port registry"))?;
     let deadline = Instant::now() + SHARED_LOCK_TIMEOUT;
     loop {
         match file.try_lock() {
@@ -237,7 +305,13 @@ fn open_locked(path: &std::path::Path) -> Result<File, NetError> {
     }
 }
 
-fn parse_shared(file: &mut File) -> Result<HashMap<ListenerKey, ListenerOwner>, NetError> {
+/// 共有ファイルを読む。ファイルが無ければ予約ゼロ件（初回）。空ファイルや不完全な内容は
+/// 予約ゼロ件として扱わず破損として拒否する（fail-closed。書き込みは原子的 rename のため、
+/// 正常系では空ファイルは現れない）。呼び出しは [`open_locked`] のロック区間内で行うこと。
+fn parse_shared(path: &Path) -> Result<HashMap<ListenerKey, ListenerOwner>, NetError> {
+    let Some(mut file) = open_verified(path, false)? else {
+        return Ok(HashMap::new());
+    };
     let meta = file
         .metadata()
         .map_err(|_| shared_err("failed to stat shared port registry"))?;
@@ -245,11 +319,18 @@ fn parse_shared(file: &mut File) -> Result<HashMap<ListenerKey, ListenerOwner>, 
         return Err(shared_err("shared port registry is too large"));
     }
     let mut text = String::new();
-    file.read_to_string(&mut text)
+    (&mut file)
+        .take(MAX_SHARED_FILE_BYTES)
+        .read_to_string(&mut text)
         .map_err(|_| shared_err("failed to read shared port registry"))?;
     let corrupt = || shared_err("shared port registry is corrupt");
+    // 先頭行がヘッダ、末尾行が終端マーカー。切り詰められた内容・空ファイルはここで弾く。
+    let body = text
+        .strip_prefix(SHARED_HEADER)
+        .and_then(|t| t.strip_suffix(SHARED_FOOTER))
+        .ok_or_else(corrupt)?;
     let mut map = HashMap::new();
-    for line in text.lines() {
+    for line in body.lines() {
         let mut f = line.split(' ');
         let (Some(proto), Some(addr), Some(port), Some(net), Some(ep), None) =
             (f.next(), f.next(), f.next(), f.next(), f.next(), f.next())
@@ -272,10 +353,9 @@ fn parse_shared(file: &mut File) -> Result<HashMap<ListenerKey, ListenerOwner>, 
     Ok(map)
 }
 
-fn write_shared(
-    file: &mut File,
-    map: &HashMap<ListenerKey, ListenerOwner>,
-) -> Result<(), NetError> {
+/// 共有ファイルを原子的に置き換える（一時ファイルへ書いて fsync → rename → 親ディレクトリ fsync）。
+/// 途中で失敗・クラッシュしても元のファイルは無傷で残る。[`open_locked`] のロック区間内で呼ぶこと。
+fn write_shared(path: &Path, map: &HashMap<ListenerKey, ListenerOwner>) -> Result<(), NetError> {
     let mut lines: Vec<String> = map
         .iter()
         .map(|((proto, addr, port), (n, e))| {
@@ -287,12 +367,41 @@ fn write_shared(
         })
         .collect();
     lines.sort();
-    let body = lines.concat();
+    let body = format!("{SHARED_HEADER}{}{SHARED_FOOTER}", lines.concat());
     let werr = || shared_err("failed to write shared port registry");
-    file.seek(SeekFrom::Start(0)).map_err(|_| werr())?;
-    file.set_len(0).map_err(|_| werr())?;
-    file.write_all(body.as_bytes()).map_err(|_| werr())?;
-    file.sync_all().map_err(|_| werr())
+    let tmp = with_suffix(path, ".tmp");
+    // 前回の残骸があれば消す（symlink なら link 自体が消えるだけ）。ロック区間内なので競合しない。
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(werr()),
+    }
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let result = (|| {
+        let mut f = opts.open(&tmp).map_err(|_| werr())?;
+        f.write_all(body.as_bytes()).map_err(|_| werr())?;
+        f.sync_all().map_err(|_| werr())?;
+        drop(f);
+        std::fs::rename(&tmp, path).map_err(|_| werr())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    // rename の永続化（ベストエフォート。rename 済みなので失敗しても内容は新旧どちらかで完全）。
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
+        && let Ok(d) = File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 impl PortRegistry {
@@ -339,11 +448,11 @@ impl PortRegistry {
             )
         };
         // 共有ファイルは排他ロックの中で最新を読み直し、検査と書き戻しを同じロックで行う。
-        let mut locked = match &self.shared {
+        let _lock = match &self.shared {
             Some(path) => {
-                let mut file = open_locked(path)?;
-                self.owners = parse_shared(&mut file)?;
-                Some(file)
+                let lock = open_locked(path)?;
+                self.owners = parse_shared(path)?;
+                Some(lock)
             }
             None => None,
         };
@@ -354,12 +463,16 @@ impl PortRegistry {
                 return Err(conflict());
             }
         }
+        if ports.is_empty() {
+            // 公開なしの attach では共有ファイルを書き直さない（不要な書き込みで失敗要因を増やさない）。
+            return Ok(());
+        }
         let mut next = self.owners.clone();
         for p in ports {
             next.insert(Self::key(p), (network.clone(), endpoint.clone()));
         }
-        if let Some(file) = locked.as_mut() {
-            write_shared(file, &next)?;
+        if let Some(path) = &self.shared {
+            write_shared(path, &next)?;
         }
         self.owners = next;
         Ok(())
@@ -373,15 +486,15 @@ impl PortRegistry {
         let keep = |_: &ListenerKey, (n, e): &mut ListenerOwner| !(n == network && e == endpoint);
         if let Some(path) = &self.shared {
             // 共有ファイルから先に外す。失敗時は予約を残す（fail-closed。0 件を返す）。
-            let Ok(mut file) = open_locked(path) else {
+            let Ok(_lock) = open_locked(path) else {
                 return 0;
             };
-            let Ok(mut map) = parse_shared(&mut file) else {
+            let Ok(mut map) = parse_shared(path) else {
                 return 0;
             };
             let before = map.len();
             map.retain(keep);
-            if write_shared(&mut file, &map).is_err() {
+            if write_shared(path, &map).is_err() {
                 return 0;
             }
             let released = before - map.len();
@@ -537,6 +650,55 @@ mod tests {
         std::fs::write(&path, "garbage\n").unwrap();
         let e = r1.reserve(&web, &c1, &[p80]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::Internal);
+        // 空ファイル（切り詰め）・終端マーカー欠落は予約ゼロ件として受理せず拒否する。
+        std::fs::write(&path, "").unwrap();
+        let e = r1.reserve(&web, &c1, &[p80]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::Internal);
+        std::fs::write(&path, "fandhe-portreg v1\ntcp 192.0.2.10 80 web c2\n").unwrap();
+        let e = r1.reserve(&web, &c1, &[p80]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::Internal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NET-1・TASK-139.3: 共有ファイルが symlink・緩い権限なら拒否し、公開なしの attach は書き直さない。
+    #[cfg(unix)]
+    #[test]
+    fn net1_shared_registry_rejects_unsafe_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fc-portreg-unsafe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let web = NetworkName::new("web").unwrap();
+        let c1 = EndpointId::new("c1").unwrap();
+        let p80 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 80, 80).unwrap();
+
+        // データファイルが symlink。
+        let target = dir.join("target");
+        std::fs::write(&target, "fandhe-portreg v1\nend\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link.reg");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut r = PortRegistry::with_shared_file(link);
+        assert_eq!(
+            r.reserve(&web, &c1, &[p80]).unwrap_err().code(),
+            NetErrorCode::Internal
+        );
+
+        // 権限が緩い。
+        let loose = dir.join("loose.reg");
+        std::fs::write(&loose, "fandhe-portreg v1\nend\n").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let mut r = PortRegistry::with_shared_file(loose);
+        assert_eq!(
+            r.reserve(&web, &c1, &[p80]).unwrap_err().code(),
+            NetErrorCode::Internal
+        );
+
+        // 公開なしの attach は共有ファイルを作らない・書き換えない。
+        let none = dir.join("none.reg");
+        let mut r = PortRegistry::with_shared_file(none.clone());
+        r.reserve(&web, &c1, &[]).unwrap();
+        assert!(!none.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

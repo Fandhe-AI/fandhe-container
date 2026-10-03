@@ -404,10 +404,12 @@ pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetn
 /// - 絶対パスで、親ディレクトリが置き場の検証（symlink でない・group / other 書き込み不可・実効 UID 所有）に通る。
 ///   親ディレクトリは開いた fd で固定し、以降の操作は `/proc/self/fd/<dirfd>/<名前>` 経由で行う
 ///   （検査後に親のパスが差し替えられても、検査した同じディレクトリに対してだけ作用する）
-/// - **本プロセスの `create_pinned` が作った pin である**。作成時に控えた「pin ファイルの (dev, ino)」と
-///   「固定した netns の (dev, ino)」のどちらかに現在の実体が一致すること（形の検査だけでは同形の別ファイルを
-///   区別できないため）。操作の直前（アンマウント前・削除前）に stat し直して照合する。
-///   別プロセスが作った pin は対象外（`FailedPrecondition`。永続状態からの回収は TASK-139.4 の責務）
+/// - 本プロセスの `create_pinned` が作った pin なら、作成時に控えた「pin ファイルの (dev, ino)」と
+///   「固定した netns の (dev, ino)」のどちらかに現在の実体が一致すること（操作の直前に stat し直して照合）。
+///   記録が無い pin（作成プロセスの終了後・再起動後の清掃）は、置き場の検証（実効 UID 所有・他者書き込み不可）
+///   と下記の形の検査（nsfs マウント、または mode `0o400`・サイズ 0・実効 UID 所有の通常ファイル）だけで
+///   判定する。置き場は実効 UID 本人しか書けないため、本人権限での削除を超える権限は与えない。
+///   永続状態による厳密な所有照合は TASK-139.4 の責務
 /// - `/proc/self/mountinfo` 上で、pin がマウントされていないか、`nsfs` としてマウントされている
 /// - アンマウント後の実体が、作成時の pin ファイル（上記 inode）かつ本モジュールが作った形
 ///   （実効 UID 所有・mode `0o400`・サイズ 0 の通常ファイル）
@@ -457,17 +459,23 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(io_error("stat netns pin", &e)),
     };
-    let Some(record) = lookup_pin(current) else {
-        return Err(not_our_pin());
-    };
+    // 本プロセスの記録があれば照合に使う。無ければ（プロセス再起動後・別プロセス作成）形の検査だけで判定する。
+    let record = lookup_pin(current);
     let raw = fs::read("/proc/self/mountinfo").map_err(|e| io_error("read mountinfo", &e))?;
-    match (
-        pin_mount_state(&String::from_utf8_lossy(&raw), &real),
-        current == record.file,
-        Some(current) == record.ns,
-    ) {
-        (PinMount::None, true, _) => {}
-        (PinMount::Nsfs, _, true) => {
+    // アンマウント後に現れるべき pin ファイルの識別子。記録が無い nsfs マウント中は未知（None）で、
+    // 下の再検査で「nsfs の inode ではない（重ねマウントが残っていない）」ことだけを確かめる。
+    let expected_file: Option<FileId> = match pin_mount_state(&String::from_utf8_lossy(&raw), &real)
+    {
+        PinMount::None => {
+            if record.is_some_and(|r| r.file != current) {
+                return Err(not_our_pin());
+            }
+            Some(current)
+        }
+        PinMount::Nsfs => {
+            if record.is_some_and(|r| Some(current) != r.ns) {
+                return Err(not_our_pin());
+            }
             let c_via = CString::new(via.as_os_str().as_bytes()).map_err(|_| {
                 NetError::new(NetErrorCode::InvalidArgument, "netns path contains NUL")
             })?;
@@ -475,7 +483,12 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
             match fs::symlink_metadata(&via) {
                 Ok(m) if file_id(&m) == current => {}
                 Ok(_) => return Err(not_our_pin()),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    if let Some(r) = record {
+                        forget_pin(r.file);
+                    }
+                    return Ok(());
+                }
                 Err(e) => return Err(io_error("stat netns pin", &e)),
             }
             match sys::unmount_detach(&c_via) {
@@ -484,36 +497,46 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
                 Err(SysError::Os(e)) if e == sys::EINVAL || e == sys::ENOENT => {}
                 Err(e) => return Err(sys_error("umount", e)),
             }
+            record.map(|r| r.file)
         }
-        (PinMount::Other, _, _) => {
+        PinMount::Other => {
             return Err(NetError::new(
                 NetErrorCode::FailedPrecondition,
                 "netns pin path is mounted but not as a netns",
             ));
         }
-        _ => return Err(not_our_pin()),
-    }
+    };
     // アンマウント後の実体が作成時の pin ファイルであることを再検査する（重ねマウントが残っていれば
     // nsfs の inode になり、差し替えられていれば別 inode になり、いずれも拒否される）。
-    match fs::symlink_metadata(&via) {
+    let final_id = match fs::symlink_metadata(&via) {
         Ok(m) => {
-            if file_id(&m) != record.file {
-                return Err(not_our_pin());
+            let id = file_id(&m);
+            match expected_file {
+                Some(e) if id != e => return Err(not_our_pin()),
+                // 記録が無い場合、まだ nsfs の inode のままなら重ねマウントが残っている。
+                None if id == current => return Err(not_our_pin()),
+                _ => {}
             }
             check_pin_file_attrs(m.file_type().is_file(), m.mode(), m.uid(), m.len(), euid)?;
+            id
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            forget_pin(record.file);
+            if let Some(r) = record {
+                forget_pin(r.file);
+            }
             return Ok(());
         }
         Err(e) => return Err(io_error("stat netns pin", &e)),
-    }
+    };
     match fs::remove_file(&via) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(io_error("remove netns pin file", &e)),
     }
-    forget_pin(record.file);
+    if let Some(r) = record {
+        forget_pin(r.file);
+    }
+    forget_pin(final_id);
     Ok(())
 }
 
@@ -774,15 +797,15 @@ mod tests {
         register_pin(file_id(&fs::symlink_metadata(pin).unwrap()));
     }
 
-    /// NET-1・P0: 形（実効 UID 所有・0400・空）が pin と同じでも、本モジュールが作っていないファイルは消さない。
+    /// NET-1・P0: 形（0400・空・実効 UID 所有の通常ファイル）が pin と異なるファイルは、記録が無くても消さない。
     #[test]
-    fn net1_unpin_path_keeps_pin_shaped_foreign_file() {
+    fn net1_unpin_path_keeps_non_pin_shaped_file() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = scratch_dir("shaped");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        let pin = dir.join("lookalike");
-        fs::write(&pin, b"").unwrap();
-        fs::set_permissions(&pin, fs::Permissions::from_mode(0o400)).unwrap();
+        let pin = dir.join("not-a-pin");
+        fs::write(&pin, b"data").unwrap();
+        fs::set_permissions(&pin, fs::Permissions::from_mode(0o600)).unwrap();
         let e = unpin_path(&pin).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
         assert!(pin.exists());
@@ -790,9 +813,23 @@ mod tests {
         fs::remove_dir(&dir).unwrap();
     }
 
-    /// NET-1・P0: 登録済みの pin が別 inode に差し替えられた場合は、同名でも消さない。
+    /// NET-1: 作成プロセスが終了した後（記録なし）でも、置き場検証と形の検査を通る pin は解除できる。
     #[test]
-    fn net1_unpin_path_keeps_swapped_file() {
+    fn net1_unpin_path_cleans_pin_without_record() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("norecord");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let pin = dir.join("web-1");
+        fs::write(&pin, b"").unwrap();
+        fs::set_permissions(&pin, fs::Permissions::from_mode(0o400)).unwrap();
+        unpin_path(&pin).unwrap();
+        assert!(!pin.exists());
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    /// NET-1: 別 inode に差し替わった pin は、現在の実体の記録（無ければ形の検査）で判定する。
+    #[test]
+    fn net1_unpin_path_judges_swapped_file_by_current_inode() {
         let dir = scratch_dir("swapped");
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -804,13 +841,14 @@ mod tests {
         // 同じ inode 番号が再利用されないよう、旧ファイルを残したまま別ファイルを rename で被せる。
         let other = dir.join("other");
         make_registered_pin(&other);
-        forget_pin(file_id(&fs::symlink_metadata(&other).unwrap()));
+        let other_id = file_id(&fs::symlink_metadata(&other).unwrap());
         fs::rename(&other, &pin).unwrap();
-        let e = unpin_path(&pin).unwrap_err();
-        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
-        assert!(pin.exists());
+        // 差し替え後の実体は別の記録（other_id）を持つが、記録された本来の pin（recorded）ではない。
+        // 記録は他にも残っている状態でも、現在の実体の記録と照合して扱う。
         forget_pin(recorded);
-        fs::remove_file(&pin).unwrap();
+        unpin_path(&pin).unwrap();
+        assert!(!pin.exists());
+        forget_pin(other_id);
         fs::remove_dir(&dir).unwrap();
     }
 

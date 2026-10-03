@@ -30,6 +30,7 @@ use super::ack::{NftBatchAck, NftBatchAckCollector, NftBatchError, Progress};
 use super::{BATCH_MARKER_LEN, MAX_BATCH_LEN, NftBatch, NftBatchBytes};
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
+use crate::netlink::{NLM_F_ACK, NLM_F_REQUEST, NLMSG_NOOP, NlMsgBuilder};
 use crate::netlink_route::{NetlinkRouteSocket, RequestGate};
 use crate::sys::Deadline;
 
@@ -53,11 +54,11 @@ fn seq_after(end_seq: u32) -> u32 {
     }
 }
 
-/// 1 バッチが消費し得る seq 数の上限（BEGIN + 本体 + END）。
+/// 1 バッチが消費し得る seq 数の上限（BEGIN + 本体 + END + 同期点）。
 ///
 /// 本体メッセージは最小でも `BATCH_MARKER_LEN`（nlmsghdr + nfgenmsg = 20 バイト）あり、バッチ全体は
 /// `MAX_BATCH_LEN` で打ち切られるため、これを超える seq は使わない。
-const MAX_SEQ_PER_BATCH: u32 = (MAX_BATCH_LEN / BATCH_MARKER_LEN) as u32 + 2;
+const MAX_SEQ_PER_BATCH: u32 = (MAX_BATCH_LEN / BATCH_MARKER_LEN) as u32 + 3;
 
 /// 組み立て前に、残りの seq 空間が最大バッチを収容できなければ 1 から採番し直す（NET-11）。
 ///
@@ -85,6 +86,7 @@ fn exchange(
     deadline: &Deadline,
     total: Duration,
     send: impl FnOnce(&NftBatchBytes) -> Result<(), NetError>,
+    send_barrier: impl FnOnce(&[u8]) -> Result<(), NetError>,
     mut recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
 ) -> Result<NftBatchAck, NftBatchError> {
     // 本体が無いと成功 ACK が 1 件も返らず、成功を確認できない（fail-closed）。
@@ -128,62 +130,71 @@ fn exchange(
         }
         match result? {
             Progress::Done(ack) => {
-                return drain_trailing(&mut collector, deadline, total, recv).map(|()| ack);
+                // 同期点の seq は END の次（呼び出し側が範囲を予約済み）。
+                let barrier_seq = seq_after(batch.end_seq());
+                collector.set_barrier(barrier_seq);
+                let barrier = encode_barrier(barrier_seq).map_err(|e| collector.unknown(e))?;
+                // 送れなければ END の判定を確認できない（適用済みかも不明）。
+                send_barrier(&barrier).map_err(|e| collector.unknown(e))?;
+                return drain_until_barrier(&mut collector, deadline, total, recv).map(|()| ack);
             }
             Progress::Pending => {}
         }
     }
 }
 
-/// 本体の判定が揃った後、受信キューに残る応答を読み切って END の判定を確認する。
+/// 本体の判定が揃った後、同期点の ACK が届くまで読み、END の判定を確実に確認する。
 ///
-/// END は `NLM_F_ACK` を持たないため成功時の応答は来ないが、失敗（非 0 errno）は本体の ACK と別の
-/// データグラムで届き得る。カーネルは送信の中で全応答を積み終えるので、短い静止窓
-/// （[`TRAILING_QUIET_WINDOW`]）で読めば取りこぼさない。窓を 0 にしないのは、timeout 0 の受信だと
-/// `poll` 後の EINTR / EAGAIN が即 `Timeout` に写り「キューが空」と区別できず、キュー内の END
-/// エラーを見逃すため（正の窓なら受信側が EINTR を窓の残り時間で再試行する）。
+/// END は `NLM_F_ACK` を持たず成功時は無応答で、失敗（非 0 errno）は本体の ACK と別のデータグラムで
+/// 届き得る。静止窓のような時間による推定では取りこぼし得るため、判定後に別要求の同期点
+/// （`NLMSG_NOOP` + `NLM_F_ACK`。カーネルの `netlink_rcv_skb` が errno 0 の ACK を返す）を送り、
+/// その ACK を完了条件にする。応答は FIFO なので、同期点の ACK より前に積まれた END の失敗は必ず
+/// 先に `feed` される（NET-11）。
 ///
-/// 全体期限（REPAIR-5）を `deadline` で共有し、期限切れは `Timeout`（`Unknown`）にする。上限
-/// （[`MAX_TRAILING_DATAGRAMS`]）まで読んでも応答が止まらなければ、END の判定を確認できないため
-/// 成功にせず `ResourceExhausted`（`Unknown`）にする（fail-closed。NET-11）。
-fn drain_trailing(
+/// 全体期限（REPAIR-5）を `deadline` で共有し、期限切れ・確認不能は `Unknown` にする。上限
+/// （[`MAX_TRAILING_DATAGRAMS`]）まで読んでも同期点の ACK が来なければ `ResourceExhausted`（`Unknown`）。
+fn drain_until_barrier(
     collector: &mut NftBatchAckCollector,
     deadline: &Deadline,
     total: Duration,
     mut recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
 ) -> Result<(), NftBatchError> {
     for _ in 0..MAX_TRAILING_DATAGRAMS {
+        if collector.barrier_acked() {
+            return Ok(());
+        }
         let remaining = deadline.remaining();
         if remaining.is_zero() {
             return Err(collector.timeout_error(total));
         }
-        match recv(remaining.min(TRAILING_QUIET_WINDOW)) {
+        match recv(remaining) {
             Ok(data) => {
                 collector.feed(&data)?;
             }
             Err(e) if e.code() == NetErrorCode::Timeout => {
-                // 期限切れによる Timeout は「空」と見なさない。
-                if deadline.remaining().is_zero() {
-                    return Err(collector.timeout_error(total));
-                }
-                return Ok(());
+                return Err(collector.timeout_error(total));
             }
             Err(e) => return Err(collector.unknown(e)),
         }
     }
+    if collector.barrier_acked() {
+        return Ok(());
+    }
     Err(collector.unknown(NetError::new(
         NetErrorCode::ResourceExhausted,
         format!(
-            "more than {MAX_TRAILING_DATAGRAMS} trailing netlink datagrams after nf_tables batch verdicts"
+            "no sync ack within {MAX_TRAILING_DATAGRAMS} trailing netlink datagrams after nf_tables batch verdicts"
         ),
     )))
 }
 
-/// 本体の判定後に読み切るデータグラム数の上限。
-const MAX_TRAILING_DATAGRAMS: usize = 64;
+/// 同期点（`NLMSG_NOOP` + `NLM_F_REQUEST | NLM_F_ACK`）のバイト列を組み立てる。
+fn encode_barrier(seq: u32) -> Result<Vec<u8>, NetError> {
+    NlMsgBuilder::new(NLMSG_NOOP, NLM_F_REQUEST | NLM_F_ACK, seq, 0).finish()
+}
 
-/// 本体の判定後に「キューが空」と判断するまでの静止窓。成功したバッチごとに最大この時間だけ待つ。
-const TRAILING_QUIET_WINDOW: Duration = Duration::from_millis(1);
+/// 判定後に読むデータグラム数の上限。
+const MAX_TRAILING_DATAGRAMS: usize = 64;
 
 impl NetlinkNetfilterSocket {
     /// ソケットを開いて bind する（計測結果は記録しない）。
@@ -244,12 +255,13 @@ impl NetlinkNetfilterSocket {
             }
             // 送る・送らないによらず今回の範囲は再利用しない（遅延応答との衝突を避ける）。
             self.next_seq
-                .store(seq_after(bytes.end_seq()), Ordering::Relaxed);
+                .store(seq_after(seq_after(bytes.end_seq())), Ordering::Relaxed);
             exchange(
                 &bytes,
                 &deadline,
                 timeout,
                 |b| self.inner.send_batch_bytes(b),
+                |m| self.inner.send(m),
                 |t| self.inner.recv(t),
             )
         })
@@ -314,7 +326,7 @@ mod tests {
         send: impl FnOnce(&NftBatchBytes) -> Result<(), NetError>,
         recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
     ) -> Result<NftBatchAck, NftBatchError> {
-        exchange(b, &Deadline::after(total), total, send, recv)
+        exchange(b, &Deadline::after(total), total, send, |_| Ok(()), recv)
     }
 
     /// NET-11: 全 ACK で成功する。
@@ -325,7 +337,10 @@ mod tests {
             &b,
             Duration::from_secs(5),
             |_| Ok(()),
-            script(vec![Ok([err_dgram(11, 0), err_dgram(12, 0)].concat())]),
+            script(vec![
+                Ok([err_dgram(11, 0), err_dgram(12, 0)].concat()),
+                Ok(err_dgram(14, 0)),
+            ]),
         )
         .expect("ok");
         assert_eq!(ack.body_seqs(), &[11, 12][..]);
@@ -405,28 +420,78 @@ mod tests {
         assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
     }
 
-    /// NET-11: 末尾の読み切りは timeout 0 でなく正の静止窓で受信する（EINTR を Timeout と誤認しない）。
+    /// NET-11: 同期点の ACK より前に届いた END の失敗は成功にしない（時間窓に依存しない）。
     #[test]
-    fn net11_trailing_recv_uses_positive_window() {
+    fn net11_end_error_before_barrier_ack_is_aborted() {
         let b = batch(1);
-        let mut seen = Vec::new();
-        let mut first = true;
-        run(
+        // 本体 seq 11 / END seq 12 / 同期点 seq 13。
+        let e = run(
             &b,
             Duration::from_secs(5),
             |_| Ok(()),
-            |t| {
-                seen.push(t);
-                if std::mem::take(&mut first) {
-                    Ok(err_dgram(11, 0))
-                } else {
-                    Err(NetError::new(NetErrorCode::Timeout, "none"))
-                }
-            },
+            script(vec![
+                Ok(err_dgram(11, 0)),
+                Ok(err_dgram(12, 12)),
+                Ok(err_dgram(13, 0)),
+            ]),
         )
-        .expect("ok");
-        assert_eq!(seen.len(), 2);
-        assert!(seen[1] > Duration::ZERO && seen[1] <= TRAILING_QUIET_WINDOW);
+        .expect_err("end failure");
+        assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
+    }
+
+    /// NET-11: 同期点を END の次の seq・NOOP + REQUEST|ACK で送り、ACK が来るまで成功にしない。
+    #[test]
+    fn net11_success_requires_barrier_ack() {
+        let b = batch(1);
+        let mut sent = Vec::new();
+        let e = exchange(
+            &b,
+            &Deadline::after(Duration::from_millis(50)),
+            Duration::from_millis(50),
+            |_| Ok(()),
+            |m| {
+                sent = m.to_vec();
+                Ok(())
+            },
+            script(vec![Ok(err_dgram(11, 0))]),
+        )
+        .expect_err("no barrier ack");
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+        assert_eq!(sent, encode_barrier(13).expect("barrier"));
+    }
+
+    /// NET-11: 同期点を送れなければ Unknown。
+    #[test]
+    fn net11_barrier_send_failure_is_unknown() {
+        let b = batch(1);
+        let e = exchange(
+            &b,
+            &Deadline::after(Duration::from_secs(5)),
+            Duration::from_secs(5),
+            |_| Ok(()),
+            |_| Err(NetError::new(NetErrorCode::Internal, "boom")),
+            script(vec![Ok(err_dgram(11, 0))]),
+        )
+        .expect_err("barrier send");
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+    }
+
+    /// NET-11: 実カーネルは同期点（NOOP + NLM_F_ACK）に必ず応答する。CAP_NET_ADMIN があれば errno 0 の
+    /// ACK、なければ nfnetlink の入口で EPERM（権限不足のバッチは BEGIN でも EPERM になるため矛盾しない）。
+    #[test]
+    fn net11_kernel_answers_barrier() {
+        let s = NetlinkNetfilterSocket::open().expect("open");
+        s.inner
+            .send(&encode_barrier(7).expect("barrier"))
+            .expect("send");
+        let data = s.inner.recv(Duration::from_secs(5)).expect("recv");
+        let mut c = NftBatchAckCollector::new(&batch(1));
+        c.set_barrier(7);
+        match c.feed(&data) {
+            Ok(_) => assert!(c.barrier_acked()),
+            Err(e) => assert_eq!(e.code(), NetErrorCode::PermissionDenied),
+        }
     }
 
     /// REPAIR-5: 期限後に届いた ACK は成功にせず Timeout に揃える。
@@ -603,7 +668,7 @@ mod tests {
             .send_batch(Duration::from_secs(5), |_| Ok(()))
             .expect_err("empty");
         assert_eq!(e.code(), NetErrorCode::InvalidArgument);
-        assert_eq!(s.next_seq.load(Ordering::Relaxed), 3);
+        assert_eq!(s.next_seq.load(Ordering::Relaxed), 4);
         let nft: Vec<_> = collect
             .kinds()
             .into_iter()

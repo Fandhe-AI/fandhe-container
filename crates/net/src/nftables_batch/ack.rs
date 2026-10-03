@@ -15,9 +15,10 @@
 //!   これは [`NftBatchPosition::Begin`] として即座に確定し、キューに残る後続の応答は読まない
 //!   （ソケットが seq を一意に採番するため、次のバッチは seq 不一致として破棄する）
 //! - BEGIN / END への errno 0 の ACK は許容して無視する（カーネル版数で返る場合がある）
-//! - 完了条件は本体の全 seq に判定が揃うこと。END は `NLM_F_ACK` を持たず成功時は無応答のため待たないが、
-//!   失敗（非 0 errno）が別データグラムで届き得るので、`exchange` が判定後に受信キューを読み切って
-//!   `feed` へ渡し続ける（`socket::drain_trailing`）
+//! - 完了条件は本体の全 seq に判定が揃うこと。END は `NLM_F_ACK` を持たず成功時は無応答のため待てないが、
+//!   失敗（非 0 errno）が別データグラムで届き得る。そこで判定後に同期点（`NLMSG_NOOP` + `NLM_F_ACK` の
+//!   別要求）を送り、その ACK が届くまで読む（`socket::drain_until_barrier`）。応答は FIFO のため、
+//!   同期点の ACK より前の応答はすべて判定済みになる。時間の経過で「終わり」と推定しない
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
@@ -212,6 +213,9 @@ pub(crate) struct NftBatchAckCollector {
     seen: Vec<bool>,
     pending: usize,
     failures: Vec<NftMessageFailure>,
+    /// 判定後に送る同期点（`NLMSG_NOOP` + `NLM_F_ACK`）の seq と、その ACK を受けたか。
+    barrier_seq: Option<u32>,
+    barrier_acked: bool,
 }
 
 fn data_loss(msg: impl Into<String>) -> NetError {
@@ -229,7 +233,21 @@ impl NftBatchAckCollector {
             pending: body_seqs.len(),
             body_seqs,
             failures: Vec::new(),
+            barrier_seq: None,
+            barrier_acked: false,
         }
+    }
+
+    /// 同期点の seq を登録する。カーネルは送信ごとに全応答を積み終えてから戻り、応答は FIFO で届くため、
+    /// 後続の同期点の ACK が届けば、それより前（END の失敗を含む）の応答はすべて `feed` 済みになる。
+    pub(crate) fn set_barrier(&mut self, seq: u32) {
+        self.barrier_seq = Some(seq);
+        self.barrier_acked = false;
+    }
+
+    /// 同期点の ACK を受けたか。
+    pub(crate) fn barrier_acked(&self) -> bool {
+        self.barrier_acked
     }
 
     /// `seq` が指すバッチ内の位置。範囲外（遅延応答）は `None`。
@@ -260,6 +278,19 @@ impl NftBatchAckCollector {
         for item in NlMsgIter::new(datagram) {
             let msg = item.map_err(|e| self.unknown(data_loss(e.message().to_string())))?;
             let h = msg.header();
+            if self.barrier_seq == Some(h.seq()) {
+                if h.msg_type() == NLMSG_ERROR {
+                    let ack = decode_nlmsgerr(msg.payload()).map_err(|e| self.unknown(e))?;
+                    if ack.errno() != 0 {
+                        return Err(self.unknown(NetError::new(
+                            classify_errno(ack.errno()),
+                            format!("sync request failed with errno {}", ack.errno()),
+                        )));
+                    }
+                    self.barrier_acked = true;
+                }
+                continue;
+            }
             let Some(position) = self.locate(h.seq()) else {
                 // 以前に時間切れしたバッチの遅延応答。
                 continue;

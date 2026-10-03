@@ -245,3 +245,20 @@ fn local_pid_is_nonzero_and_matches_replies() {
         .collect();
     assert_eq!(pids, vec![a.local_pid().get()]);
 }
+
+/// NET-1・TASK-139.1: 名前から ifindex を引く（lo は 1。root 不要）。存在しない名前は NotFound。
+#[test]
+fn link_index_resolves_lo_and_reports_missing() {
+    use fandhe_container_net::netlink_route::IfName;
+    let sock = NetlinkRouteSocket::open().expect("open");
+    let lo = IfName::new("lo").expect("name");
+    let idx = sock
+        .link_index(&lo, Duration::from_secs(5))
+        .expect("link_index");
+    assert_eq!(idx.get(), 1);
+    let missing = IfName::new("fcnone0").expect("name");
+    let err = sock
+        .link_index(&missing, Duration::from_secs(5))
+        .expect_err("missing link");
+    assert_eq!(err.code(), NetErrorCode::NotFound);
+}

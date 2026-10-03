@@ -52,7 +52,7 @@
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
 //! - down 操作、MTU・MAC 等の追加属性、bridge のオプション（`IFLA_BR_*`）、bridge への接続
-//!   （`IFLA_MASTER`）、`RTM_DELLINK` の組み立て（公開 API なし）
+//!   （`IFLA_MASTER`）、`RTM_DELLINK` は `LinkDelete` で実装済み（TASK-139.1）
 //! - netns を作る・開く API（実機テストは外部コマンド `unshare(1)` と `/proc/<pid>/ns/net` を使う）
 
 use std::marker::PhantomData;
@@ -61,6 +61,7 @@ use std::os::fd::{AsRawFd as _, BorrowedFd};
 
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{NLM_F_CREATE, NLM_F_EXCL, NlMsgBuilder};
+use crate::netlink_route::IfIndex;
 
 /// リンクの新規作成（`linux/rtnetlink.h`）。
 pub const RTM_NEWLINK: u16 = 16;
@@ -370,6 +371,72 @@ impl<'a> LinkSet<'a> {
     }
 }
 
+/// `RTM_DELLINK` によるリンク削除要求（TASK-139.1・#314。ネットワーク作成の失敗時ロールバックと、
+/// 後続のネットワーク削除 TASK-139.4 が使う）。
+///
+/// `LinkRef::Name` は `ifi_index = 0` + `IFLA_IFNAME` でカーネルが引く。bridge を削除すると
+/// 付与済みの address も一緒に消える。送信は `NetlinkRouteSocket::delete_link`（Linux のみ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkDelete(LinkRef);
+
+impl LinkDelete {
+    /// `link` を削除する要求。
+    pub fn new(link: LinkRef) -> Self {
+        Self(link)
+    }
+
+    /// `nlmsg_type`（常に `RTM_DELLINK`）。
+    pub fn msg_type(&self) -> u16 {
+        RTM_DELLINK
+    }
+
+    /// `nlmsg_flags`（0。REQUEST / ACK は `request` が付与する）。
+    pub fn flags(&self) -> u16 {
+        0
+    }
+
+    /// nlmsghdr の後ろに続く `ifinfomsg` と（名前指定のときだけ）`IFLA_IFNAME` を `b` へ書き込む。
+    pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
+        let (index, name) = match &self.0 {
+            LinkRef::Index(i) => (i.get(), None),
+            LinkRef::Name(n) => (0, Some(n)),
+        };
+        b.put_fixed(&ifinfomsg(index, 0, 0))?;
+        if let Some(n) = name {
+            b.put_attr(IFLA_IFNAME, &n.to_nul_terminated())?;
+        }
+        Ok(())
+    }
+}
+
+/// `RTM_NEWLINK` 応答（`RTM_GETLINK` の返答）のペイロードから ifindex を取り出す。
+///
+/// 応答はカーネル由来の外部入力として扱い、添字アクセスを使わず長さ・値を検証する。
+/// 短い payload は `DataLoss`、ifindex が 0 以下は `Internal`。
+pub fn decode_ifinfomsg_index(payload: &[u8]) -> Result<IfIndex, NetError> {
+    // ifinfomsg 全体（IFINFOMSG_LEN バイト）に満たない応答は、index が読めても破損とみなす。
+    let raw = payload
+        .get(..IFINFOMSG_LEN)
+        .and_then(|full| full.get(4..8))
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .ok_or_else(|| {
+            NetError::new(
+                NetErrorCode::DataLoss,
+                "link reply is shorter than ifinfomsg",
+            )
+        })?;
+    let index = i32::from_ne_bytes(raw);
+    u32::try_from(index)
+        .ok()
+        .and_then(|i| IfIndex::new(i).ok())
+        .ok_or_else(|| {
+            NetError::new(
+                NetErrorCode::Internal,
+                "link reply has a non-positive index",
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +450,70 @@ mod tests {
 
     fn name(s: &str) -> IfName {
         IfName::new(s).unwrap()
+    }
+
+    /// TASK-139.1: 名前指定の RTM_DELLINK は ifindex 0 + IFLA_IFNAME（NUL 終端）。
+    #[test]
+    fn task139_1_link_delete_by_name_bytes() {
+        let req = LinkDelete::new(LinkRef::Name(name("br0")));
+        assert_eq!(req.msg_type(), 17);
+        assert_eq!(req.flags(), 0);
+        let mut b = NlMsgBuilder::new(req.msg_type(), req.flags(), 7, 0);
+        req.encode(&mut b).unwrap();
+        let data = b.finish().unwrap();
+        let mut it = NlMsgIter::new(&data);
+        let msg = it.next().unwrap().unwrap();
+        assert_eq!(msg.header().msg_type(), 17);
+        assert_eq!(msg.payload().get(..IFINFOMSG_LEN).unwrap(), &[0u8; 16]);
+        let attrs: Vec<_> = msg
+            .attrs(IFINFOMSG_LEN)
+            .unwrap()
+            .map(|a| a.unwrap())
+            .collect();
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].attr_type(), IFLA_IFNAME);
+        assert_eq!(attrs[0].payload(), b"br0\0");
+    }
+
+    /// TASK-139.1: index 指定の RTM_DELLINK は ifindex を持ち属性を付けない。
+    #[test]
+    fn task139_1_link_delete_by_index_bytes() {
+        let req = LinkDelete::new(LinkRef::Index(LinkIndex::new(5).unwrap()));
+        let mut b = NlMsgBuilder::new(req.msg_type(), req.flags(), 7, 0);
+        req.encode(&mut b).unwrap();
+        let data = b.finish().unwrap();
+        let mut it = NlMsgIter::new(&data);
+        let msg = it.next().unwrap().unwrap();
+        assert_eq!(msg.payload().len(), IFINFOMSG_LEN);
+        assert_eq!(msg.payload().get(4..8).unwrap(), &5i32.to_ne_bytes());
+    }
+
+    /// TASK-139.1: 応答の ifindex 解釈（正常・短い・0・負）。
+    #[test]
+    fn task139_1_decode_ifinfomsg_index() {
+        let mut p = [0u8; 16];
+        p[4..8].copy_from_slice(&3i32.to_ne_bytes());
+        assert_eq!(decode_ifinfomsg_index(&p).unwrap().get(), 3);
+        assert_eq!(
+            decode_ifinfomsg_index(&p[..7]).unwrap_err().code(),
+            NetErrorCode::DataLoss
+        );
+        assert_eq!(
+            decode_ifinfomsg_index(&p[..IFINFOMSG_LEN - 1])
+                .unwrap_err()
+                .code(),
+            NetErrorCode::DataLoss
+        );
+        p[4..8].copy_from_slice(&0i32.to_ne_bytes());
+        assert_eq!(
+            decode_ifinfomsg_index(&p).unwrap_err().code(),
+            NetErrorCode::Internal
+        );
+        p[4..8].copy_from_slice(&(-1i32).to_ne_bytes());
+        assert_eq!(
+            decode_ifinfomsg_index(&p).unwrap_err().code(),
+            NetErrorCode::Internal
+        );
     }
 
     /// NET-11: bridge 作成は IFLA_IFNAME と IFLA_LINKINFO(KIND=bridge) だけを持つ。

@@ -214,7 +214,7 @@ mod linux {
 
     /// プロセスグループ `pgid` の全員に SIGKILL を送り、グループが空になる（`kill -0` が失敗する）まで
     /// 期限つきで待つ。空になったことを確認できたら true（外部 `kill` コマンド経由で `sys` 外の unsafe を避ける）。
-    fn kill_group(pgid: u32) -> bool {
+    fn kill_group(pgid: u32, leader: &mut std::process::Child) -> bool {
         let target = format!("-{pgid}");
         let signal = |sig: &str| {
             Command::new("kill")
@@ -229,6 +229,8 @@ mod linux {
         let _ = signal("-KILL");
         let deadline = Instant::now() + timeout();
         loop {
+            // グループリーダー（unshare）が未回収のゾンビのままだと `kill -0` が成功し続けるため、先に回収する。
+            let _ = leader.try_wait();
             if !signal("-0") {
                 return true;
             }
@@ -268,8 +270,7 @@ mod linux {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
                 None if Instant::now() >= deadline => {
-                    kill_group(pgid);
-                    let _ = child.wait();
+                    kill_group(pgid, &mut child);
                     eprintln!("network_paths_privileged: inner did not finish before deadline");
                     break 1;
                 }
@@ -278,7 +279,11 @@ mod linux {
         };
         // 正常終了でも取り残された子孫があればグループごと停止し、消えたことを確認する（特権操作の後始末）。
         // mount namespace・tmpfs・netns の pin は全プロセスの終了で解放される。
-        let code = if kill_group(pgid) { code } else { 1 };
+        let code = if kill_group(pgid, &mut child) {
+            code
+        } else {
+            1
+        };
         // mount namespace は inner の終了で消えるので、host 側には空のディレクトリだけが残る。
         let _ = fs::remove_dir(&dir);
         std::process::exit(code);
@@ -402,7 +407,31 @@ mod linux {
         NetworkCreateSpec::new(NetworkName::new(name)?, IpPrefix::new(v4(GATEWAY), 24)?)
     }
 
+    /// ランチャ死亡の監視。ランチャは専用プロセスグループへ inner を分離しているため、スクリプトのタイムアウトや
+    /// Ctrl-C でランチャだけが死ぬと信号が inner に届かない。親 PID が変わったら（ランチャ消失）自グループ全体を
+    /// SIGKILL して特権プロセスの取り残しを防ぐ（`sys` 外の unsafe を避け、外部 `kill` を用いる）。
+    fn spawn_launcher_watchdog() {
+        let expected = std::env::var(LAUNCHER_PID_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if expected != Some(std::os::unix::process::parent_id()) {
+                    let _ = Command::new("kill")
+                        .args(["-KILL", "--", &format!("-{}", std::process::id())])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+
     pub fn inner(args: &[String]) {
+        spawn_launcher_watchdog();
         let measuring = args.iter().any(|a| a == "--measure");
         let result = if measuring {
             let trials = flag_value(args, "--trials", TRIALS_DEFAULT, TRIALS_MAX, 1);

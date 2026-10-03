@@ -5,7 +5,8 @@
 //! - ネットワーク（`network::create_network` が作る bridge）の gateway の IPv4:53 に UDP で待ち受ける
 //!   ヘルパープロセスを 1 つ起動する基盤。質問セクションのパース（[`parse_question`]）、コンテナ名 → IPv4 の
 //!   レジストリ（[`DnsRegistry`]）、A 応答・REFUSED / NODATA の組み立て（[`RegistryHandler`]）を持つ
-//!   （TASK-141.2・#322）。上流 DNS への転送は TASK-185、参照カウントによるオンデマンド起動・終了は
+//!   （TASK-141.2・#322）。上流 DNS への転送（コンテナ別の `--dns` マッピング）は [`upstream`]
+//!   （NET-12・TASK-185.3・#346）、参照カウントによるオンデマンド起動・終了は
 //!   [`refcount`]（NET-7・TASK-144.1・#329）が持つ。SIGTERM による正常終了は未実装（REPAIR-3）
 //! - 呼び出し側（将来の統一 CLI / 製品バイナリ。TASK-79）は [`spawn_dns_helper`] で自身または専用バイナリを
 //!   `--listen <ipv4:port>` つきで起動し、ヘルパー側の `main` は [`run_dns_helper_main`] を呼ぶ
@@ -25,7 +26,11 @@
 //! [`RegistryHandler`] に切り替えず、全クエリに NOTIMP を返す [`NotImplementedHandler`] を使い続ける
 //! （登録できない空レジストリで実際の名前解決を妨げない）。[`RegistryHandler`] は同一プロセス内の
 //! 登録側（テスト・将来の組み込み）から使える。上流転送・TCP・AAAA・EDNS0 も未対応。
-//! レジストリに無い名前は存在・不存在を断定せず REFUSED（AA=0）を返す（上流転送 TASK-185 まで）。
+//! レジストリに無い名前は存在・不存在を断定せず REFUSED（AA=0）を返す。ただし [`upstream::ForwardingHandler`]
+//! （NET-12・TASK-185.3・#346）を組み立てた場合に限り、上流マッピング登録済みのコンテナからの管理外名は
+//! そのコンテナの `--dns` 上流へ転送する。この転送機構も同じ理由で製品の入口には未接続で、同一プロセス内の
+//! 登録側（テスト・将来の組み込み）からのみ到達できる。転送中は単一スレッドの `serve` が最大
+//! [`upstream::FORWARD_TOTAL_DEADLINE`] 塞がる（head-of-line blocking）。TCP 再試行（TC=1 応答）も未対応。
 //! PLUG-1 における DNS ヘルパーの core / plugin 区分は検討中で、確定扱いにはしない。
 //!
 //! # 実機計測（TASK-141.3・#323）
@@ -36,8 +41,10 @@
 //!
 //! # 安全性
 //! 受信バッファは固定長（513 バイト）で、512 バイト超は破棄する。外部入力の解析は `get` / `try_into` のみで
-//! 添字アクセス・`unwrap` を使わない。ヘッダー不正のパケットには応答しない。応答は要求長 + [`MAX_RESPONSE_GROWTH`]
-//! バイト以下に限り（増幅反射の防止）、ログ・統計にはパケットの内容を載せない。待受・準備完了待ち・回収はすべて期限つき（REPAIR-5）。
+//! 添字アクセス・`unwrap` を使わない。ヘッダー不正のパケットには応答しない。自前応答は要求長 + [`MAX_RESPONSE_GROWTH`]
+//! バイト以下に限り（増幅反射の防止）、上流転送の応答は上流マッピング登録済みのコンテナ宛てに限って
+//! [`MAX_DATAGRAM_LEN`] まで許す（`HandlerOutcome::RespondForwarded`。bridge 内の送信元偽装による
+//! 別コンテナへの反射は残存リスク）。ログ・統計にはパケットの内容を載せない。待受・準備完了待ち・回収はすべて期限つき（REPAIR-5）。
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -54,6 +61,7 @@ use crate::error::{NetError, NetErrorCode};
 use crate::network::CreatedNetwork;
 
 pub mod refcount;
+pub mod upstream;
 
 /// DNS の既定ポート。
 pub const DNS_PORT: u16 = 53;
@@ -78,13 +86,14 @@ const FLAG_QR: u8 = 0x80;
 const FLAG_RD: u8 = 0x01;
 const FLAG_AA: u8 = 0x04;
 const RCODE_NOERROR: u8 = 0;
+const RCODE_SERVFAIL: u8 = 2;
 const RCODE_NOTIMP: u8 = 4;
 const RCODE_REFUSED: u8 = 5;
 const QTYPE_A: u16 = 1;
 const QCLASS_IN: u16 = 1;
 /// A レコード応答の TTL（秒）。コンテナの増減を反映しやすいよう短くする（PoC-15 と同値）。spec は TTL を規定しない。
 pub const ANSWER_TTL_SECS: u32 = 5;
-/// 応答が要求長を超えてよい上限（A RR 1 件: 圧縮ポインタ 2 + TYPE 2 + CLASS 2 + TTL 4 + RDLENGTH 2 + RDATA 4）。
+/// 自前応答（`HandlerOutcome::Respond`）が要求長を超えてよい上限（A RR 1 件: 圧縮ポインタ 2 + TYPE 2 + CLASS 2 + TTL 4 + RDLENGTH 2 + RDATA 4）。
 /// 応答は「要求 + A RR 1 件」に限られ、最小クエリ（17 バイト）でも増幅率は 2 倍未満。待受は bridge gateway の
 /// ユニキャストのみ（[`DnsListenAddr`]）で、外部インターフェースへは公開しない（NET-5）。
 pub const MAX_RESPONSE_GROWTH: usize = 16;
@@ -345,6 +354,9 @@ impl ResponseBuf {
 pub enum HandlerOutcome {
     /// `out` の内容を返信する。
     Respond,
+    /// 上流から受けた応答を返信する。`serve` は増幅ガードの上限を [`MAX_DATAGRAM_LEN`] にする。
+    /// ハンドラは送信元が上流マッピング登録済みの場合に限って返す（NET-12・TASK-185.3）。
+    RespondForwarded,
     /// 返信しない。
     NoResponse,
 }
@@ -354,6 +366,18 @@ pub trait QueryHandler {
     /// `header` は検証済み、`datagram` は受信全体（512 バイト以下）。
     fn respond(&self, header: &DnsHeader, datagram: &[u8], out: &mut ResponseBuf)
     -> HandlerOutcome;
+
+    /// 送信元つきの応答処理。`serve` が呼ぶ。既定は `respond` へ委譲する（送信元を使わないハンドラは実装不要）。
+    /// 上流転送のようにクエリ元のコンテナ（IP）で挙動を変えるハンドラが上書きする（NET-12・TASK-185.3）。
+    fn respond_from(
+        &self,
+        _peer: SocketAddr,
+        header: &DnsHeader,
+        datagram: &[u8],
+        out: &mut ResponseBuf,
+    ) -> HandlerOutcome {
+        self.respond(header, datagram, out)
+    }
 }
 
 /// 疎通確認用の最小ハンドラ: ID と RD をコピーし QR=1・RCODE=NOTIMP(4)・各カウント 0 の 12 バイトを返す。
@@ -679,6 +703,8 @@ pub struct DnsHelperStats {
     pub recv_errors: u64,
     /// ハンドラの応答が要求長を超える等で抑止した数。
     pub suppressed: u64,
+    /// 上流から受けた応答を返した数（`answered` にも含む。NET-12・TASK-185.3）。
+    pub forwarded: u64,
 }
 
 impl DnsHelperStats {
@@ -814,16 +840,25 @@ impl DnsHelperServer {
                 }
             };
             out.clear();
-            if handler.respond(&header, datagram, &mut out) != HandlerOutcome::Respond {
-                continue;
-            }
-            // 増幅反射の防止: 応答は要求長 + A RR 1 件分以下に限る。
-            if out.as_bytes().len() > n.saturating_add(MAX_RESPONSE_GROWTH) {
+            let outcome = handler.respond_from(peer, &header, datagram, &mut out);
+            // 増幅反射の防止: 自前応答は要求長 + A RR 1 件分以下に限る。上流転送の応答は
+            // ハンドラが登録済みコンテナ宛てと確認したときのみ RespondForwarded で返り、512 バイトまで許す。
+            let limit = match outcome {
+                HandlerOutcome::Respond => n.saturating_add(MAX_RESPONSE_GROWTH),
+                HandlerOutcome::RespondForwarded => MAX_DATAGRAM_LEN,
+                HandlerOutcome::NoResponse => continue,
+            };
+            if out.as_bytes().len() > limit {
                 self.stats.suppressed = self.stats.suppressed.saturating_add(1);
                 continue;
             }
             match self.socket.send_to(out.as_bytes(), peer) {
-                Ok(_) => self.stats.answered = self.stats.answered.saturating_add(1),
+                Ok(_) => {
+                    self.stats.answered = self.stats.answered.saturating_add(1);
+                    if outcome == HandlerOutcome::RespondForwarded {
+                        self.stats.forwarded = self.stats.forwarded.saturating_add(1);
+                    }
+                }
                 Err(_) => self.stats.send_errors = self.stats.send_errors.saturating_add(1),
             }
         }

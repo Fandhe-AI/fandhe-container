@@ -43,7 +43,7 @@ use std::time::Duration;
 use crate::error::{NetError, NetErrorCode};
 #[cfg(target_os = "linux")]
 use crate::netlink_route::{
-    AddrScope, AddressSpec, LinkCreate, LinkDelete, LinkRef, LinkSet, NetlinkRouteSocket,
+    AddrScope, AddressSpec, LinkCreate, LinkDelete, LinkIndex, LinkRef, LinkSet, NetlinkRouteSocket,
 };
 use crate::netlink_route::{IfIndex, IfName, IpPrefix};
 #[cfg(target_os = "linux")]
@@ -323,8 +323,10 @@ pub(crate) trait NetworkOps {
     fn create_bridge(&self, name: &IfName) -> Result<(), NetError>;
     fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError>;
     fn add_address(&self, index: IfIndex, gateway: &IpPrefix) -> Result<(), NetError>;
-    fn set_up(&self, name: &IfName) -> Result<(), NetError>;
-    fn delete_bridge(&self, name: &IfName) -> Result<(), NetError>;
+    /// 取得済みの ifindex で up にする（名前再解決で別 link を操作しない）。
+    fn set_up(&self, index: IfIndex) -> Result<(), NetError>;
+    /// 取得済みの ifindex で削除する。外部で bridge が消され同名の別 link ができても巻き込まない。
+    fn delete_bridge(&self, index: IfIndex) -> Result<(), NetError>;
     fn apply_nft(&self, table: &NftName) -> Result<(), NftApplyFailure>;
 }
 
@@ -344,8 +346,13 @@ fn is_indeterminate(code: NetErrorCode) -> bool {
     matches!(code, NetErrorCode::Timeout | NetErrorCode::DataLoss)
 }
 
-fn rollback_bridge(ops: &impl NetworkOps, bridge: &IfName, report: &mut RollbackReport) {
-    match ops.delete_bridge(bridge) {
+fn rollback_bridge(
+    ops: &impl NetworkOps,
+    bridge: &IfName,
+    index: IfIndex,
+    report: &mut RollbackReport,
+) {
+    match ops.delete_bridge(index) {
         Ok(()) => report.removed.push(NetworkResource::Bridge(bridge.clone())),
         // Timeout / DataLoss は削除が適用されたか不明なので、Present と断定せず Unknown で報告する。
         Err(e) => {
@@ -388,24 +395,33 @@ pub(crate) fn create_network_with(
         return Err(fail(collision_or(e), CreateStep::CreateBridge, report));
     }
 
-    // 2〜4. 失敗したら bridge を削除する（address も一緒に消える）。
+    // 2〜4. ifindex 取得後の失敗は、その ifindex で bridge を削除する（address も一緒に消える）。
+    // ifindex 取得前は自分の bridge と確定できないため、名前では削除せず Unknown で報告する（fail-closed）。
+    let index = match ops.link_index(&bridge) {
+        Ok(i) => i,
+        Err(e) => {
+            let mut report = RollbackReport::default();
+            report.leftover.push((
+                NetworkResource::Bridge(bridge.clone()),
+                ResourceState::Unknown,
+            ));
+            return Err(fail(e, CreateStep::ResolveIndex, report));
+        }
+    };
     let step_fail = |e: NetError, step: CreateStep| {
         let mut report = RollbackReport::default();
-        rollback_bridge(ops, &bridge, &mut report);
+        rollback_bridge(ops, &bridge, index, &mut report);
         fail(e, step, report)
     };
-    let index = ops
-        .link_index(&bridge)
-        .map_err(|e| step_fail(e, CreateStep::ResolveIndex))?;
     ops.add_address(index, &spec.gateway())
         .map_err(|e| step_fail(e, CreateStep::AddAddress))?;
-    ops.set_up(&bridge)
+    ops.set_up(index)
         .map_err(|e| step_fail(e, CreateStep::SetUp))?;
 
     // 5. nft テーブル。バッチは all-or-nothing のため、Unknown 以外は nft 側に何も残らない。
     if let Err(f) = ops.apply_nft(&table) {
         let mut report = RollbackReport::default();
-        rollback_bridge(ops, &bridge, &mut report);
+        rollback_bridge(ops, &bridge, index, &mut report);
         if !matches!(
             f.outcome,
             NftBatchOutcome::Aborted | NftBatchOutcome::NotSent
@@ -459,15 +475,21 @@ impl NetworkOps for LinuxNetworkOps<'_> {
             .map(|_| ())
     }
 
-    fn set_up(&self, name: &IfName) -> Result<(), NetError> {
+    fn set_up(&self, index: IfIndex) -> Result<(), NetError> {
+        let idx = LinkIndex::new(i32::try_from(index.get()).map_err(|_| {
+            NetError::new(NetErrorCode::InvalidArgument, "ifindex exceeds i32::MAX")
+        })?)?;
         self.route
-            .set_link(&LinkSet::up(LinkRef::Name(name.clone())), self.timeout)
+            .set_link(&LinkSet::up(LinkRef::Index(idx)), self.timeout)
             .map(|_| ())
     }
 
-    fn delete_bridge(&self, name: &IfName) -> Result<(), NetError> {
+    fn delete_bridge(&self, index: IfIndex) -> Result<(), NetError> {
+        let idx = LinkIndex::new(i32::try_from(index.get()).map_err(|_| {
+            NetError::new(NetErrorCode::InvalidArgument, "ifindex exceeds i32::MAX")
+        })?)?;
         self.route
-            .delete_link(&LinkDelete::new(LinkRef::Name(name.clone())), self.timeout)
+            .delete_link(&LinkDelete::new(LinkRef::Index(idx)), self.timeout)
             .map(|_| ())
     }
 
@@ -681,14 +703,14 @@ mod tests {
             }
             Ok(())
         }
-        fn set_up(&self, _: &IfName) -> Result<(), NetError> {
+        fn set_up(&self, _: IfIndex) -> Result<(), NetError> {
             self.rec("set_up");
             if self.fail_up {
                 return Err(err(NetErrorCode::Internal));
             }
             Ok(())
         }
-        fn delete_bridge(&self, _: &IfName) -> Result<(), NetError> {
+        fn delete_bridge(&self, _: IfIndex) -> Result<(), NetError> {
             self.rec("delete_bridge");
             if self.fail_delete {
                 return Err(err(self.delete_code.unwrap_or(NetErrorCode::Internal)));
@@ -770,18 +792,10 @@ mod tests {
         assert!(e.rollback.removed.is_empty());
     }
 
-    /// NET-1: 手順 2〜4 の失敗は bridge を削除する。
+    /// NET-1: 手順 3〜4 の失敗は bridge を削除する。
     #[test]
     fn net1_steps_2_to_4_roll_back_bridge() {
         let cases = [
-            (
-                Fake {
-                    fail_index: true,
-                    ..Default::default()
-                },
-                CreateStep::ResolveIndex,
-                vec!["create_bridge", "link_index", "delete_bridge"],
-            ),
             (
                 Fake {
                     fail_addr: true,
@@ -820,6 +834,26 @@ mod tests {
             );
             assert!(e.rollback.leftover.is_empty());
         }
+    }
+
+    /// NET-1: ifindex 取得前の失敗は所有を確認できないため名前で削除せず Unknown で報告する。
+    #[test]
+    fn net1_resolve_index_failure_does_not_delete_by_name() {
+        let f = Fake {
+            fail_index: true,
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(f.calls(), ["create_bridge", "link_index"]);
+        assert_eq!(e.step, CreateStep::ResolveIndex);
+        assert!(e.rollback.removed.is_empty());
+        assert_eq!(
+            e.rollback.leftover,
+            [(
+                NetworkResource::Bridge(bridge_of("web")),
+                ResourceState::Unknown
+            )]
+        );
     }
 
     /// NET-1: nft の Aborted / NotSent は bridge だけ削除する。AlreadyExists は衝突として返す。

@@ -3,12 +3,13 @@
 //!
 //! CLI / stack が `--add-host` / `--dns` を受け取った直後に呼ばれ、`/etc/hosts` 追記・`resolv.conf`
 //! 書き換え・DNS ヘルパー設定変更の前に不正値をコンテナ作成前に拒否する。後続の `/etc/hosts` 追記
-//! （TASK-185.2・#345）・上流転送（TASK-185.3・#346）・host/none の `--dns` 反映（TASK-185.4・#347）・
+//! （TASK-185.2・#345）・上流転送（`dns_helper::upstream`。TASK-185.3・#346）・host/none の `--dns` 反映（TASK-185.4・#347）・
 //! 軽量運用の `--dns` 直接書き込み（TASK-146.2・#336）から再利用される。
 //!
 //! 本モジュール本体は検証のみ。host/none の `--dns` 反映と none の loopback 制限は子モジュール
-//! `resolv_conf`（TASK-185.4・#347）。`<hostname>:<ip>` の分割パース・`/etc/hosts` 追記・上流転送は
-//! 未実装（TASK-185.2・185.3。REPAIR-3）。エラーの `message` は固定の英語文字列で、
+//! `resolv_conf`（TASK-185.4・#347）、ユーザー定義ネットワーク上の上流転送は `dns_helper::upstream`
+//! （TASK-185.3・#346）。`<hostname>:<ip>` の分割パース・`/etc/hosts` 追記は未実装（TASK-185.2。
+//! REPAIR-3）。エラーの `message` は固定の英語文字列で、
 //! 入力値を載せない（ログ・ファイルへの行注入を防ぐ）。`dns_helper::DnsName`（小文字化・末尾ドット除去）
 //! とは意味論が異なり、ここでは入力をそのまま保持し、末尾ドット（空ラベル）は拒否する。
 

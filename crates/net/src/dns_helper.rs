@@ -396,6 +396,20 @@ impl DnsHelperStats {
     }
 }
 
+/// `recv_from` のエラーが「データグラムがバッファに収まらない」（Linux / macOS の EMSGSIZE、Windows の
+/// WSAEMSGSIZE）かを判定する。std は専用の `ErrorKind` を持たないため raw OS エラー番号で比較する。
+fn is_msgsize(e: &io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    const MSGSIZE: i32 = 90;
+    #[cfg(target_os = "macos")]
+    const MSGSIZE: i32 = 40;
+    #[cfg(windows)]
+    const MSGSIZE: i32 = 10040;
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    const MSGSIZE: i32 = -1;
+    e.raw_os_error() == Some(MSGSIZE)
+}
+
 /// UDP 待受サーバー。ヘルパープロセスの本体で、テストからはスレッドでも動かせる。
 #[derive(Debug)]
 pub struct DnsHelperServer {
@@ -454,6 +468,13 @@ impl DnsHelperServer {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
+                    continue;
+                }
+                // バッファより大きいデータグラムを切り詰めず EMSGSIZE 系で返す OS では、
+                // 致命扱いにせず Oversized として破棄して継続する（NET-5）。
+                Err(e) if is_msgsize(&e) => {
+                    self.stats.received = self.stats.received.saturating_add(1);
+                    self.stats.count_drop(DropReason::Oversized);
                     continue;
                 }
                 Err(e) => {
@@ -585,6 +606,19 @@ fn kill_and_reap(child: &mut Child, timeout: Duration) -> bool {
     }
 }
 
+/// kill して期限内に回収し、できなければ回収権をバックグラウンドの回収スレッドへ移す（ゾンビを残さない）。
+/// 期限内に回収できたら true。kill 済みのため、回収スレッドの `wait` は子の終了後に必ず戻る。
+fn kill_reap_or_detach(mut child: Child, timeout: Duration) -> bool {
+    if kill_and_reap(&mut child, timeout) {
+        return true;
+    }
+    // 回収権を捨てない: Child を破棄すると後から終了した子がゾンビになる。
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    false
+}
+
 impl DnsHelperProcess {
     /// プロセス ID。
     pub fn pid(&self) -> Option<u32> {
@@ -596,13 +630,14 @@ impl DnsHelperProcess {
         self.listen
     }
 
-    /// kill して期限内に回収する。期限内に回収できなければ `Timeout`。
+    /// kill して期限内に回収する。期限内に回収できなければ `Timeout` を返すが、回収権は
+    /// バックグラウンドの回収スレッドが引き継ぐため、子が後から終了してもゾンビは残らない。
     pub fn stop(mut self, reap_timeout: Duration) -> Result<(), NetError> {
         check_timeout(reap_timeout)?;
-        let Some(mut child) = self.child.take() else {
+        let Some(child) = self.child.take() else {
             return Ok(());
         };
-        if kill_and_reap(&mut child, reap_timeout) {
+        if kill_reap_or_detach(child, reap_timeout) {
             Ok(())
         } else {
             Err(NetError::new(
@@ -615,8 +650,8 @@ impl DnsHelperProcess {
 
 impl Drop for DnsHelperProcess {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = kill_and_reap(&mut child, REAP_TIMEOUT_DEFAULT);
+        if let Some(child) = self.child.take() {
+            let _ = kill_reap_or_detach(child, REAP_TIMEOUT_DEFAULT);
         }
     }
 }
@@ -686,15 +721,15 @@ pub fn spawn_dns_helper(
     }
     let mut child = cmd.spawn().map_err(|e| map_io("spawn dns helper", &e))?;
     let Some(stdout) = child.stdout.take() else {
-        kill_and_reap(&mut child, REAP_TIMEOUT_DEFAULT);
+        let _ = kill_reap_or_detach(child, REAP_TIMEOUT_DEFAULT);
         return Err(NetError::new(
             NetErrorCode::Internal,
             "helper stdout unavailable",
         ));
     };
     let (tx, rx) = mpsc::channel();
-    // kill で pipe が閉じれば read が戻るため、スレッドは残らない。
-    std::thread::spawn(move || {
+    // kill で pipe の書き込み端が閉じれば read が戻る。失敗経路では kill 後にこのスレッドの終了も期限つきで確認する。
+    let reader = std::thread::spawn(move || {
         let _ = tx.send(read_ready_line(stdout));
     });
     let result = match rx.recv_timeout(ready_timeout) {
@@ -711,8 +746,22 @@ pub fn spawn_dns_helper(
             listen: addr,
         }),
         Err(e) => {
-            kill_and_reap(&mut child, REAP_TIMEOUT_DEFAULT);
-            Err(e)
+            let reaped = kill_reap_or_detach(child, REAP_TIMEOUT_DEFAULT);
+            // 読み取りスレッドの終了を期限つきで確認する。子孫プロセスが stdout を継承していると pipe が
+            // 閉じず read が戻らない（std は pipe 読み取りを中断できない）ため、その場合は join せず
+            // 切り離して Timeout で報告する（REPAIR-5。無期限にブロックしない）。
+            let waited = rx.recv_timeout(REAP_TIMEOUT_DEFAULT);
+            if !matches!(waited, Err(mpsc::RecvTimeoutError::Timeout)) || reader.is_finished() {
+                let _ = reader.join();
+                Err(e)
+            } else {
+                let tail = if reaped {
+                    "readiness reader thread did not terminate before the deadline"
+                } else {
+                    "readiness reader thread and helper reaping did not finish before the deadline"
+                };
+                Err(NetError::new(NetErrorCode::Timeout, format!("{e}; {tail}")))
+            }
         }
     }
 }
@@ -826,6 +875,24 @@ mod tests {
         }
         let ok = DnsListenAddr::new(Ipv4Addr::new(10, 213, 0, 1), 53).expect("ok");
         assert_eq!(ok.to_string(), "10.213.0.1:53");
+    }
+
+    /// NET-5: EMSGSIZE 系のエラーは Oversized 扱い（致命ではない）と判定される。
+    #[test]
+    fn msgsize_error_is_recognized() {
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        {
+            #[cfg(target_os = "linux")]
+            let code = 90;
+            #[cfg(target_os = "macos")]
+            let code = 40;
+            #[cfg(windows)]
+            let code = 10040;
+            assert!(is_msgsize(&io::Error::from_raw_os_error(code)));
+        }
+        assert!(!is_msgsize(&io::Error::from(
+            io::ErrorKind::ConnectionReset
+        )));
     }
 
     #[test]

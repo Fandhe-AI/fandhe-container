@@ -10,3 +10,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+# NET-10 の診断（doctor）が net の読み取り照会を使う workspace 内 path 依存（TASK-148.1。外部クレートの追加ではない）。
+[dependencies]
+fandhe-container-net = { path = "../net" }

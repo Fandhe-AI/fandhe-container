@@ -89,8 +89,25 @@ mod linux {
         }
     }
 
+    /// 子プロセスの所有ガード。成功・エラー・panic のいずれの経路でも Drop で kill と wait を実行し、
+    /// root で起動した `sleep 60` や隔離 netns をテスト終了後に残さない（特権操作の後始末）。
+    struct ChildGuard(Child);
+
+    impl ChildGuard {
+        fn id(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// `sleep` を起動する（`unshare_net` 時は `unshare --net` 経由）。起動完了の待機は `wait_comm_sleep` が担う。
-    fn spawn_sleep(unshare_net: bool) -> Child {
+    fn spawn_sleep(unshare_net: bool) -> ChildGuard {
         let mut cmd = if unshare_net {
             let mut c = Command::new("unshare");
             c.args(["--net", "--", "sleep", "60"]);
@@ -100,9 +117,11 @@ mod linux {
             c.arg("60");
             c
         };
-        cmd.stdin(Stdio::null())
-            .spawn()
-            .expect("spawn sleep (is util-linux unshare installed?)")
+        ChildGuard(
+            cmd.stdin(Stdio::null())
+                .spawn()
+                .expect("spawn sleep (is util-linux unshare installed?)"),
+        )
     }
 
     /// 子の exec と netns 切替の完了を、comm が `sleep` になるまで期限つきで待つ。
@@ -134,24 +153,22 @@ mod linux {
         );
 
         // (2)(3) host の子は Member で、interface 名集合がホストと一致する。
-        let mut child = spawn_sleep(false);
+        let child = spawn_sleep(false);
         let pid = child.id();
         wait_comm_sleep(pid);
         let m = host.verify_process(pid).expect("verify host child");
         let host_ifaces = ifaces("/proc/net/dev");
         let child_ifaces = ifaces(&format!("/proc/{pid}/net/dev"));
-        let _ = child.kill();
-        let _ = wait_exit(&mut child);
+        drop(child);
         assert_eq!(m, HostNetnsMembership::Member);
         assert_eq!(child_ifaces, host_ifaces);
 
         // (4) unshare --net の子は Other。
-        let mut other = spawn_sleep(true);
+        let other = spawn_sleep(true);
         let opid = other.id();
         wait_comm_sleep(opid);
         let om = host.verify_process(opid);
-        let _ = other.kill();
-        let _ = wait_exit(&mut other);
+        drop(other);
         match om.expect("verify unshared child") {
             HostNetnsMembership::Other { observed } => assert_ne!(observed, host.id()),
             m => panic!("unshared child must not be a member: {m:?}"),
@@ -159,14 +176,16 @@ mod linux {
 
         // (5) 新しい netns の中では detect が FAILED_PRECONDITION。
         let exe = std::env::current_exe().expect("current_exe");
-        let mut c = Command::new("unshare")
-            .args(["--net", "--"])
-            .arg(exe)
-            .arg("--child")
-            .stdin(Stdio::null())
-            .spawn()
-            .expect("spawn unshare child");
-        let st = wait_exit(&mut c);
+        let mut c = ChildGuard(
+            Command::new("unshare")
+                .args(["--net", "--"])
+                .arg(exe)
+                .arg("--child")
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn unshare child"),
+        );
+        let st = wait_exit(&mut c.0);
         assert!(st.success(), "child detect check failed: {st:?}");
 
         println!(

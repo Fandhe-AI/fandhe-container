@@ -124,6 +124,8 @@ pub enum DropReason {
     UnsupportedOpcode,
     /// QDCOUNT が 1 以外。
     BadQuestionCount,
+    /// 質問セクション（QNAME・QTYPE・QCLASS）が欠落・不正・データグラム境界を超えている。
+    BadQuestion,
 }
 
 impl DropReason {
@@ -135,6 +137,7 @@ impl DropReason {
             Self::NotQuery => "not_query",
             Self::UnsupportedOpcode => "unsupported_opcode",
             Self::BadQuestionCount => "bad_question_count",
+            Self::BadQuestion => "bad_question",
         }
     }
 }
@@ -190,7 +193,7 @@ pub enum DatagramVerdict {
     Drop(DropReason),
 }
 
-/// データグラムを分類する純粋関数（NET-5）。長さ → ヘッダー → QR → Opcode → QDCOUNT の順に検査する。
+/// データグラムを分類する純粋関数（NET-5）。長さ → ヘッダー → QR → Opcode → QDCOUNT → 質問セクション境界の順に検査する。
 pub fn classify_datagram(datagram: &[u8]) -> DatagramVerdict {
     if datagram.len() > MAX_DATAGRAM_LEN {
         return DatagramVerdict::Drop(DropReason::Oversized);
@@ -205,9 +208,42 @@ pub fn classify_datagram(datagram: &[u8]) -> DatagramVerdict {
         DatagramVerdict::Drop(DropReason::UnsupportedOpcode)
     } else if header.qdcount() != 1 {
         DatagramVerdict::Drop(DropReason::BadQuestionCount)
+    } else if !question_fits(datagram) {
+        DatagramVerdict::Drop(DropReason::BadQuestion)
     } else {
         DatagramVerdict::Accept(header)
     }
+}
+
+/// ヘッダー直後の質問 1 件（QNAME・QTYPE 2 バイト・QCLASS 2 バイト）がデータグラム境界内に収まるか検証する。
+/// QNAME はラベル列（長さ 1〜63 + 本体）を長さ 0 で終端するもののみ受理し、圧縮ポインタ・拡張ラベル
+/// （上位 2 ビットが非 0）・全長 255 超は不正とする。添字アクセスは使わず `get` で境界を確認する。
+fn question_fits(datagram: &[u8]) -> bool {
+    let Some(mut rest) = datagram.get(HEADER_LEN..) else {
+        return false;
+    };
+    let mut name_len = 0usize;
+    loop {
+        let Some((&len, tail)) = rest.split_first() else {
+            return false;
+        };
+        if len == 0 {
+            rest = tail;
+            break;
+        }
+        if len > 63 {
+            return false;
+        }
+        let Some(after) = tail.get(usize::from(len)..) else {
+            return false;
+        };
+        name_len = name_len.saturating_add(usize::from(len) + 1);
+        if name_len > 254 {
+            return false;
+        }
+        rest = after;
+    }
+    rest.len() >= 4
 }
 
 /// 応答バッファ（上限 512 バイトの固定長）。
@@ -317,6 +353,8 @@ pub struct DnsHelperStats {
     pub dropped_unsupported_opcode: u64,
     /// `BadQuestionCount` の破棄数。
     pub dropped_bad_question_count: u64,
+    /// `BadQuestion` の破棄数。
+    pub dropped_bad_question: u64,
     /// 送信失敗数。
     pub send_errors: u64,
     /// 受信失敗数（一時的なエラーとして継続）。
@@ -334,6 +372,7 @@ impl DnsHelperStats {
             DropReason::NotQuery => self.dropped_not_query,
             DropReason::UnsupportedOpcode => self.dropped_unsupported_opcode,
             DropReason::BadQuestionCount => self.dropped_bad_question_count,
+            DropReason::BadQuestion => self.dropped_bad_question,
         }
     }
 
@@ -344,6 +383,7 @@ impl DnsHelperStats {
             DropReason::NotQuery => &mut self.dropped_not_query,
             DropReason::UnsupportedOpcode => &mut self.dropped_unsupported_opcode,
             DropReason::BadQuestionCount => &mut self.dropped_bad_question_count,
+            DropReason::BadQuestion => &mut self.dropped_bad_question,
         };
         *slot = slot.saturating_add(1);
     }
@@ -658,6 +698,13 @@ mod tests {
         v
     }
 
+    /// ヘッダー + 質問 1 件（`example.com` A IN）のデータグラムを組む。
+    fn query_pkt(id: u16, flags: u16) -> Vec<u8> {
+        let mut v = hdr(id, flags, 1);
+        v.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        v
+    }
+
     /// NET-5: 破棄理由の表駆動。
     #[test]
     fn classify_drops_malformed() {
@@ -668,6 +715,26 @@ mod tests {
             (hdr(1, 0x1000, 1), DropReason::UnsupportedOpcode),
             (hdr(1, 0x0100, 0), DropReason::BadQuestionCount),
             (hdr(1, 0x0100, 2), DropReason::BadQuestionCount),
+            // 質問セクション無し・途中切れ・圧縮ポインタ・63 超ラベルは BadQuestion。
+            (hdr(1, 0x0100, 1), DropReason::BadQuestion),
+            (
+                query_pkt(1, 0x0100)[..query_pkt(1, 0x0100).len() - 1].to_vec(),
+                DropReason::BadQuestion,
+            ),
+            (
+                [hdr(1, 0x0100, 1), vec![0xC0, 0x0C, 0, 1, 0, 1]].concat(),
+                DropReason::BadQuestion,
+            ),
+            (
+                [
+                    hdr(1, 0x0100, 1),
+                    vec![64],
+                    vec![b'a'; 64],
+                    vec![0, 0, 1, 0, 1],
+                ]
+                .concat(),
+                DropReason::BadQuestion,
+            ),
             (vec![0; 513], DropReason::Oversized),
         ];
         for (pkt, want) in cases {
@@ -679,14 +746,14 @@ mod tests {
     /// NET-5: 正常ヘッダーは Accept で ID・QDCOUNT を読める。512 バイトちょうども受理する。
     #[test]
     fn classify_accepts_query() {
-        let DatagramVerdict::Accept(h) = classify_datagram(&hdr(0x1234, 0x0100, 1)) else {
+        let DatagramVerdict::Accept(h) = classify_datagram(&query_pkt(0x1234, 0x0100)) else {
             panic!("expected accept");
         };
         assert_eq!(h.id(), 0x1234);
         assert_eq!(h.qdcount(), 1);
         assert!(h.recursion_desired());
         assert_eq!(h.opcode(), 0);
-        let mut big = hdr(7, 0, 1);
+        let mut big = query_pkt(7, 0);
         big.resize(512, 0);
         assert!(matches!(
             classify_datagram(&big),
@@ -799,13 +866,14 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(300)))
             .expect("timeout");
         let mut buf = [0u8; 600];
-        let mut big = hdr(1, 0x0100, 1);
+        let mut big = query_pkt(1, 0x0100);
         big.resize(513, 0);
         for pkt in [
             vec![0u8; 11],
             hdr(1, 0x8100, 1),
             hdr(1, 0x1000, 1),
             hdr(1, 0x0100, 0),
+            hdr(1, 0x0100, 1),
             big,
         ] {
             client.send_to(&pkt, target).expect("send");
@@ -813,7 +881,7 @@ mod tests {
             assert!(r.is_err(), "malformed packet must not be answered");
         }
         client
-            .send_to(&hdr(0xBEEF, 0x0100, 1), target)
+            .send_to(&query_pkt(0xBEEF, 0x0100), target)
             .expect("send");
         let (n, _) = client.recv_from(&mut buf).expect("reply");
         assert_eq!(
@@ -823,12 +891,13 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let server = th.join().expect("join");
         let s = server.stats();
-        assert_eq!(s.received, 6);
+        assert_eq!(s.received, 7);
         assert_eq!(s.answered, 1);
         assert_eq!(s.dropped(DropReason::TooShort), 1);
         assert_eq!(s.dropped(DropReason::NotQuery), 1);
         assert_eq!(s.dropped(DropReason::UnsupportedOpcode), 1);
         assert_eq!(s.dropped(DropReason::BadQuestionCount), 1);
+        assert_eq!(s.dropped(DropReason::BadQuestion), 1);
         assert_eq!(s.dropped(DropReason::Oversized), 1);
     }
 }

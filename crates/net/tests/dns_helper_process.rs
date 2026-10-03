@@ -22,6 +22,13 @@ fn query(id: u16, flags: u16, qd: u16) -> Vec<u8> {
     v
 }
 
+/// ヘッダー + 質問 1 件（`example.com` A IN）の正常クエリ。
+fn full_query(id: u16) -> Vec<u8> {
+    let mut v = query(id, 0x0100, 1);
+    v.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+    v
+}
+
 fn main() -> std::process::ExitCode {
     let args: Vec<_> = std::env::args_os().collect();
     if args.get(1).is_some_and(|a| a == "--listen") {
@@ -39,15 +46,18 @@ fn main() -> std::process::ExitCode {
         .set_read_timeout(Some(Duration::from_millis(300)))
         .expect("timeout");
     let mut buf = [0u8; 600];
-    for bad in [vec![0u8; 5], query(1, 0x8100, 1), query(1, 0x0100, 0)] {
+    for bad in [
+        vec![0u8; 5],
+        query(1, 0x8100, 1),
+        query(1, 0x0100, 0),
+        query(1, 0x0100, 1), // 質問セクション無し
+    ] {
         client.send_to(&bad, target).expect("send");
         assert!(client.recv_from(&mut buf).is_err(), "must not be answered");
     }
     let mut ok = false;
     for _ in 0..20 {
-        client
-            .send_to(&query(0xABCD, 0x0100, 1), target)
-            .expect("send");
+        client.send_to(&full_query(0xABCD), target).expect("send");
         if let Ok((n, _)) = client.recv_from(&mut buf) {
             assert_eq!(
                 buf.get(..n),

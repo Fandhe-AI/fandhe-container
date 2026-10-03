@@ -92,6 +92,23 @@ mod linux {
         v
     }
 
+    /// ヘッダー + 質問 1 件（`example.com` A IN）の正常クエリ。
+    fn full_query(id: u16) -> Vec<u8> {
+        let mut v = query(id, 0x0100, 1);
+        v.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        v
+    }
+
+    /// 外部コマンドを実行し、非ゼロ終了・失敗をエラーにする（後続の特権操作を中止するため）。
+    fn run_checked(program: &str, args: &[&str]) -> Result<(), NetError> {
+        let (ok, _) = run_cmd(program, args)?;
+        if ok {
+            Ok(())
+        } else {
+            Err(fail(format!("{program} {args:?} exited non-zero")))
+        }
+    }
+
     fn require_root_and_tools() {
         let uid_root = fs::read_to_string("/proc/self/status")
             .expect("read /proc/self/status")
@@ -204,7 +221,12 @@ mod linux {
         };
         let _ = sock.set_read_timeout(Some(Duration::from_millis(300)));
         let mut buf = [0u8; 600];
-        for bad in [vec![0u8; 5], query(1, 0x8100, 1), query(1, 0x0100, 0)] {
+        for bad in [
+            vec![0u8; 5],
+            query(1, 0x8100, 1),
+            query(1, 0x0100, 0),
+            query(1, 0x0100, 1), // 質問セクション無し
+        ] {
             if sock.send_to(&bad, target).is_err() || sock.recv_from(&mut buf).is_ok() {
                 println!("dns client: malformed packet was answered or send failed");
                 return ExitCode::from(1);
@@ -213,7 +235,7 @@ mod linux {
         // 起動直後の取りこぼしに備え、期限内で再送する。
         let deadline = Instant::now() + timeout();
         while Instant::now() < deadline {
-            if sock.send_to(&query(0x4242, 0x0100, 1), target).is_err() {
+            if sock.send_to(&full_query(0x4242), target).is_err() {
                 return ExitCode::from(1);
             }
             if let Ok((n, _)) = sock.recv_from(&mut buf) {
@@ -266,8 +288,8 @@ mod linux {
         let base_str = base
             .to_str()
             .ok_or_else(|| fail("test directory is not UTF-8"))?;
-        run_cmd("mount", &["--make-rprivate", "/"])?;
-        run_cmd(
+        run_checked("mount", &["--make-rprivate", "/"])?;
+        run_checked(
             "mount",
             &["-t", "tmpfs", "-o", "mode=0700", "tmpfs", base_str],
         )?;
@@ -285,17 +307,31 @@ mod linux {
             t,
         )
         .map_err(|e| fail(format!("create_network failed at {:?}: {e}", e.step)))?;
-        let spec = ContainerAttachSpec::new(EndpointId::new("c1")?, &net, base.clone())?;
+        // create_network 成功後は、どの失敗経路でも逆順（helper 停止 → delete_network）で回収する。
+        // ipam を作れない場合は delete_network を呼べないが、子は専用 netns・mount namespace のため
+        // 終了時にカーネルが bridge・nft・pin を解放する。
         let mut ipam = StaticIpam::for_network(&net)?;
         let mut ports = PortRegistry::new();
-        let attached = attach_container(&route, &nft, &spec, &mut ipam, &mut ports, t)
-            .map_err(|e| fail(format!("attach_container failed at {:?}: {e}", e.step)))?;
-
-        let exe = std::env::current_exe().map_err(|e| fail(format!("current_exe: {e}")))?;
-        let listen = DnsListenAddr::for_network(&net)?;
-        let helper = spawn_dns_helper(&exe, listen, READY_TIMEOUT_DEFAULT)?;
+        let mut attached = Vec::new();
+        let mut helper = None;
         let result = (|| -> Result<(), NetError> {
-            let pid = helper.pid().ok_or_else(|| fail("helper has no pid"))?;
+            let spec = ContainerAttachSpec::new(EndpointId::new("c1")?, &net, base.clone())?;
+            let a = attach_container(&route, &nft, &spec, &mut ipam, &mut ports, t)
+                .map_err(|e| fail(format!("attach_container failed at {:?}: {e}", e.step)))?;
+            let pin = a
+                .netns_path
+                .to_str()
+                .ok_or_else(|| fail("pin path is not UTF-8"))
+                .map(str::to_owned);
+            attached.push(a);
+            let pin = pin?;
+
+            let exe = std::env::current_exe().map_err(|e| fail(format!("current_exe: {e}")))?;
+            let listen = DnsListenAddr::for_network(&net)?;
+            let h = spawn_dns_helper(&exe, listen, READY_TIMEOUT_DEFAULT)?;
+            let pid = h.pid();
+            helper = Some(h);
+            let pid = pid.ok_or_else(|| fail("helper has no pid"))?;
             let helper_ns = fs::read_link(format!("/proc/{pid}/ns/net"))
                 .map_err(|e| fail(format!("readlink helper netns: {e}")))?;
             if helper_ns != own || helper_ns == parent {
@@ -303,10 +339,6 @@ mod linux {
                     "helper is not in the network's own netns (or shares the launcher's)",
                 ));
             }
-            let pin = attached
-                .netns_path
-                .to_str()
-                .ok_or_else(|| fail("pin path is not UTF-8"))?;
             let exe_str = exe.to_str().ok_or_else(|| fail("exe path is not UTF-8"))?;
             let target = listen.to_string();
             let (ok, out) = run_cmd(
@@ -318,10 +350,15 @@ mod linux {
             }
             Ok(())
         })();
-        let stop = helper.stop(REAP_TIMEOUT_DEFAULT);
-        delete_network(&route, &nft, &net, vec![attached], &mut ipam, &mut ports, t)
-            .map_err(|e| fail(format!("delete_network failed: {e}")))?;
+        let stop = match helper {
+            Some(h) => h.stop(REAP_TIMEOUT_DEFAULT),
+            None => Ok(()),
+        };
+        let deleted = delete_network(&route, &nft, &net, attached, &mut ipam, &mut ports, t)
+            .map(|_| ())
+            .map_err(|e| fail(format!("delete_network failed: {e}")));
         result?;
-        stop
+        stop?;
+        deleted
     }
 }

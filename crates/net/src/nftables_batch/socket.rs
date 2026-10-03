@@ -108,11 +108,39 @@ fn exchange(
             };
         }
         match result? {
-            Progress::Done(ack) => return Ok(ack),
+            Progress::Done(ack) => {
+                return drain_trailing(&mut collector, recv).map(|()| ack);
+            }
             Progress::Pending => {}
         }
     }
 }
+
+/// 本体の判定が揃った後、受信キューに残る応答を待たずに読み切って END の判定を確認する。
+///
+/// END は `NLM_F_ACK` を持たないため成功時の応答は来ないが、失敗（非 0 errno）は本体の ACK と別の
+/// データグラムで届き得る。カーネルは送信の中で全応答を積み終えるので、待たない受信（timeout 0）で
+/// 取りこぼしなく読める。END の失敗を見逃して成功を返さない（NET-11）。
+fn drain_trailing(
+    collector: &mut NftBatchAckCollector,
+    mut recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
+) -> Result<(), NftBatchError> {
+    // 有界（応答が止まらない相手に回り続けない。REPAIR-5）。
+    for _ in 0..MAX_TRAILING_DATAGRAMS {
+        match recv(Duration::ZERO) {
+            Ok(data) => {
+                collector.feed(&data)?;
+            }
+            // 残りの応答なし。
+            Err(e) if e.code() == NetErrorCode::Timeout => return Ok(()),
+            Err(e) => return Err(collector.unknown(e)),
+        }
+    }
+    Ok(())
+}
+
+/// 本体の判定後に読み切るデータグラム数の上限。
+const MAX_TRAILING_DATAGRAMS: usize = 64;
 
 impl NetlinkNetfilterSocket {
     /// ソケットを開いて bind する（計測結果は記録しない）。
@@ -245,6 +273,26 @@ mod tests {
         )
         .expect("ok");
         assert_eq!(ack.body_seqs(), &[11, 12][..]);
+    }
+
+    /// NET-11: 本体の ACK が揃った後に別データグラムで届く END の非 0 errno を見逃さない。
+    #[test]
+    fn net11_end_error_in_later_datagram_is_not_success() {
+        let b = batch(2);
+        // 本体 seq 11,12 / END seq 13。
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![
+                Ok([err_dgram(11, 0), err_dgram(12, 0)].concat()),
+                Ok(err_dgram(13, 12)),
+            ]),
+        )
+        .expect_err("end failure");
+        assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(e.failures().len(), 1);
     }
 
     /// REPAIR-5: 無応答なら Timeout / Unknown（ハングしない）。

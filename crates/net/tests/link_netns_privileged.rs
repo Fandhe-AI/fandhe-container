@@ -12,7 +12,7 @@
 //!
 //! 移動したデバイスは移動先で down になり host のソケットからは見えなくなるため、up は子の netns 内の
 //! ソケットから送る（`netlink_route/link.rs` のモジュール doc）。作ったものはすべて子の netns に入り、
-//! 子の終了とともに消える。親の失敗経路では host に残りうる veth を、作成直後に控えた ifindex 指定の
+//! 子の終了とともに消える。親の失敗経路では host に残りうる veth を、作成直後に控えた ifindex 指定（名前と ifindex の一致を再確認した場合のみ）の
 //! `RTM_DELLINK` で後始末する（ベストエフォート。他者の同名リンクは消さない）。待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で
 //! 期限を切る（REPAIR-5）。前提（root・`unshare`）を満たさない場合は skip せず失敗する。
 
@@ -208,11 +208,19 @@ mod linux {
     }
 
     impl ChildGuard {
-        fn next_line(&self, deadline: Instant) -> String {
-            let left = deadline.saturating_duration_since(Instant::now());
-            self.lines
-                .recv_timeout(left)
-                .unwrap_or_else(|e| panic!("child produced no line before deadline: {e}"))
+        /// 期限内に `expected` と一致する行が来るまで読む。`unshare` の診断など想定外の行は読み捨てる。
+        fn expect_line(&self, deadline: Instant, expected: &str) {
+            let mut skipped = Vec::new();
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match self.lines.recv_timeout(left) {
+                    Ok(l) if l == expected => return,
+                    Ok(l) => skipped.push(l),
+                    Err(e) => panic!(
+                        "child did not print {expected:?} before deadline: {e}; other lines: {skipped:?}"
+                    ),
+                }
+            }
         }
     }
 
@@ -280,7 +288,20 @@ mod linux {
         // 移動前に失敗した場合に host へ残る veth を片付ける（本試験が作成したものに限る）。
         {
             // a だけ移動済みで b が host に残る経路もあるため、未移動の端ごとに試す（NotFound は想定内）。
-            for idx in host_veth_owned.iter().filter_map(Cell::get) {
+            // 移動要求が Timeout / DataLoss 等で応答不明でもカーネル側では移動済みの可能性がある。
+            // 控えた ifindex が今も host 上の同名リンクのものだと再確認できた場合だけ消す（P0。
+            // ifindex を他者が再利用したリンクを巻き込まない。確認できなければ消さず残存を許容する）。
+            for (ifname, idx) in [&a, &b]
+                .into_iter()
+                .zip(host_veth_owned.iter())
+                .filter_map(|(n, c)| c.get().map(|i| (n, i)))
+            {
+                if get_link_index(&sock, ifname).ok() != Some(idx) {
+                    eprintln!(
+                        "link_netns_privileged: {ifname} is not the link we created on host; skip cleanup"
+                    );
+                    continue;
+                }
                 match del_link_by_index(&sock, idx) {
                     Ok(()) => eprintln!("link_netns_privileged: cleaned up leftover veth on host"),
                     Err(e) if e.code() == NetErrorCode::NotFound => {}
@@ -304,7 +325,7 @@ mod linux {
         deadline: Instant,
         host_veth_owned: &[Cell<Option<u32>>; 2],
     ) {
-        assert_eq!(guard.next_line(deadline), "ready");
+        guard.expect_line(deadline, "ready");
 
         // 既存の host インターフェースと名前が衝突していないことを作成前に確認する。
         for n in [a, b] {
@@ -331,7 +352,8 @@ mod linux {
             timeout(),
         )
         .expect("move a by pid");
-        // 移動済みの端は host の ifindex と無関係になるため後始末対象から外す。
+        // 移動の成功応答を得た端は host の ifindex と無関係になるため後始末対象から外す。
+        // 失敗・応答不明の場合は外さず、後始末側が名前と ifindex の一致を再確認してから消す。
         host_veth_owned[0].set(None);
         let ns_file = File::open(format!("/proc/{pid}/ns/net")).expect("open child netns");
         let by_fd = NetnsTarget::Fd(NetnsFd::new(ns_file.as_fd()).expect("netns fd"));
@@ -359,7 +381,7 @@ mod linux {
         let stdin = guard.stdin.as_mut().expect("child stdin");
         stdin.write_all(b"go\n").expect("write go");
         stdin.flush().expect("flush go");
-        assert_eq!(guard.next_line(deadline), OK_LINE);
+        guard.expect_line(deadline, OK_LINE);
 
         loop {
             match guard.child.try_wait().expect("try_wait") {

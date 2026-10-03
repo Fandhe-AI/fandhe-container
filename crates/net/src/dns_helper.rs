@@ -49,6 +49,8 @@ pub const READY_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
 pub const REAP_TIMEOUT_DEFAULT: Duration = Duration::from_secs(2);
 /// 受信ループが停止フラグを確認する間隔。
 pub const RECV_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// 一時的な受信エラーが連続して許容される上限（超えたら受信ループを終了する。REPAIR-5）。
+pub const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 100;
 /// 期限引数の上限。
 const TIMEOUT_MAX: Duration = Duration::from_secs(10);
 /// 準備完了行の最大長。
@@ -261,6 +263,11 @@ impl ResponseBuf {
         }
     }
 
+    /// 内容を空にする。`serve` が各クエリのハンドラ呼び出し前に必ず呼ぶ（前回の応答が次の送信元へ漏れない）。
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
     /// バイト列で置き換える。上限超過なら false（バッファは空になる）。
     pub fn set(&mut self, bytes: &[u8]) -> bool {
         self.len = 0;
@@ -427,12 +434,20 @@ impl DnsHelperServer {
 
     /// `stop` が立つまで受信する。1 パケットごとの失敗では止まらない（NET-5）。停止確認は
     /// [`RECV_POLL_INTERVAL`] ごと（REPAIR-5）。パケットごとのヒープ確保はしない。
-    pub fn serve(&mut self, handler: &dyn QueryHandler, stop: &AtomicBool) {
+    ///
+    /// 受信エラーは一時的なもの（割り込み・ICMP 由来の ConnectionReset 等）のみ再試行し、連続
+    /// [`MAX_CONSECUTIVE_RECV_ERRORS`] 回を超えるか永続的なエラーなら受信ループを終了して `Err` を返す（REPAIR-5）。
+    /// 各クエリのハンドラ呼び出し前に応答バッファを空にする。
+    pub fn serve(&mut self, handler: &dyn QueryHandler, stop: &AtomicBool) -> Result<(), NetError> {
         let mut buf = [0u8; MAX_DATAGRAM_LEN + 1];
         let mut out = ResponseBuf::new();
+        let mut consecutive_errors: u32 = 0;
         while !stop.load(Ordering::Relaxed) {
             let (n, peer) = match self.socket.recv_from(&mut buf) {
-                Ok(v) => v,
+                Ok(v) => {
+                    consecutive_errors = 0;
+                    v
+                }
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -441,8 +456,19 @@ impl DnsHelperServer {
                 {
                     continue;
                 }
-                Err(_) => {
+                Err(e) => {
                     self.stats.recv_errors = self.stats.recv_errors.saturating_add(1);
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    let transient = matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionRefused
+                            | io::ErrorKind::ConnectionAborted
+                    );
+                    if !transient || consecutive_errors > MAX_CONSECUTIVE_RECV_ERRORS {
+                        return Err(map_io("recv udp", &e));
+                    }
                     continue;
                 }
             };
@@ -455,6 +481,7 @@ impl DnsHelperServer {
                     continue;
                 }
             };
+            out.clear();
             if handler.respond(&header, datagram, &mut out) != HandlerOutcome::Respond {
                 continue;
             }
@@ -468,6 +495,7 @@ impl DnsHelperServer {
                 Err(_) => self.stats.send_errors = self.stats.send_errors.saturating_add(1),
             }
         }
+        Ok(())
     }
 }
 
@@ -519,8 +547,13 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
     }
     // 親が kill するまで動き続ける。正常終了（SIGTERM）は TASK-144 の責務。
     let stop = AtomicBool::new(false);
-    server.serve(&NotImplementedHandler, &stop);
-    ExitCode::SUCCESS
+    match server.serve(&NotImplementedHandler, &stop) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            fail_line(e.code().as_str(), e.message());
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// 起動したヘルパープロセスのハンドル。`Drop` でも kill と回収を行う（ゾンビを残さない）。
@@ -848,6 +881,56 @@ mod tests {
         assert!(read_ready_line(&b"no newline"[..]).is_err());
     }
 
+    /// 前回 `set` した内容を残したまま `Respond` だけ返すハンドラ（`serve` がバッファを空にすることの検証用）。
+    struct ForgetfulHandler {
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl QueryHandler for ForgetfulHandler {
+        fn respond(&self, _h: &DnsHeader, _d: &[u8], out: &mut ResponseBuf) -> HandlerOutcome {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                assert!(out.set(&[1, 2, 3]));
+                HandlerOutcome::NoResponse
+            } else {
+                assert!(
+                    out.as_bytes().is_empty(),
+                    "buffer must be cleared per query"
+                );
+                HandlerOutcome::Respond
+            }
+        }
+    }
+
+    /// NET-5: NoResponse 後の Respond でも前回の応答バイト列が漏れない。
+    #[test]
+    fn serve_clears_response_buffer_per_query() {
+        let mut server =
+            DnsHelperServer::bind(DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("addr"))
+                .expect("bind");
+        let target = server.local_addr();
+        let stop = AtomicBool::new(false);
+        let handler = ForgetfulHandler {
+            calls: std::sync::atomic::AtomicU32::new(0),
+        };
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client");
+        client
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout");
+        for _ in 0..2 {
+            client.send_to(&query_pkt(7, 0x0100), target).expect("send");
+        }
+        std::thread::scope(|sc| {
+            let th = sc.spawn(|| server.serve(&handler, &stop));
+            let mut buf = [0u8; 600];
+            let r = client.recv_from(&mut buf);
+            stop.store(true, Ordering::Relaxed);
+            assert!(th.join().expect("join").is_ok());
+            // 2 件目は空応答（0 バイト）で返る。前回の [1,2,3] は出ない。
+            assert_eq!(r.map(|(n, _)| n).ok(), Some(0));
+        });
+    }
+
     /// NET-5: ループバックの実ソケットで、不正パケットは無応答・正常クエリは応答、統計が具体値になる。
     #[test]
     fn serve_drops_malformed_and_answers_query() {
@@ -858,7 +941,8 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = Arc::clone(&stop);
         let th = std::thread::spawn(move || {
-            server.serve(&NotImplementedHandler, &stop2);
+            let r = server.serve(&NotImplementedHandler, &stop2);
+            assert!(r.is_ok());
             server
         });
         let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client");

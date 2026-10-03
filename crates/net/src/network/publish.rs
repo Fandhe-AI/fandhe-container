@@ -31,7 +31,10 @@ use crate::nftables_rules::{
 /// 1 コンテナあたりの公開指定の上限（バッチ長の上限 1 MiB に対して十分小さい値）。
 pub const MAX_PORT_PUBLISHES: usize = 64;
 
+// 呼び出し元（`network.rs` の Linux 限定 `publish_ports`）以外の OS では未使用になる。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const IPPROTO_TCP: u8 = 6;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const IPPROTO_UDP: u8 = 17;
 
 fn invalid(msg: &'static str) -> NetError {
@@ -50,6 +53,8 @@ pub enum PortProtocol {
 
 impl PortProtocol {
     /// IP ヘッダーのプロトコル番号。
+    // Linux 限定の呼び出し元のみが使う。他 OS の非 test ビルドでは未使用（単体テストは全 OS で使う）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn number(self) -> u8 {
         match self {
             Self::Tcp => IPPROTO_TCP,
@@ -124,6 +129,8 @@ impl PortPublish {
     }
 
     /// `container` 宛ての DNAT ルールの expr 列を組み立てる（モジュール doc「ルールの形」）。
+    // Linux 限定の `publish_ports` のみが使う。他 OS の非 test ビルドでは未使用。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn dnat_rule_exprs(&self, container: Ipv4Addr) -> Result<NftRuleExprs, NetError> {
         let r1 = NftRegister::REG_1;
         let r2 = NftRegister::REG_2;

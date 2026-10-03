@@ -60,3 +60,10 @@ harness = false
 name = "host_mode_privileged"
 path = "tests/host_mode_privileged.rs"
 harness = false
+
+# none モード（lo のみの netns 作成・解放）の実機結合試験（NET-6・TASK-143.2・#327）。
+# 子の再入（--inner / --probe）と root 前提の分離のため harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "none_mode_privileged"
+path = "tests/none_mode_privileged.rs"
+harness = false

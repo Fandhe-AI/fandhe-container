@@ -1,7 +1,7 @@
 //! コンテナのネットワークモード選択（NET-6・TASK-143.1・#326・MS-8）。
 //!
 //! bridge（既定の隔離接続。`network` モジュール）・host（ホストの network namespace 共有。
-//! `host` サブモジュール）・none（`lo` のみ。#327・TASK-143.2 で実装）を互いに排他な
+//! `host` サブモジュール）・none（`lo` のみ。`none` サブモジュール。TASK-143.2・#327）を互いに排他な
 //! [`NetworkMode`] として表す。runtime / CLI / stack（TASK-146・#347）が「どのセットアップ経路へ
 //! 進むか」を判定する入口で、OS 非依存（3 OS でコンパイルされる）。host の検証本体は Linux のみ。
 //!
@@ -12,6 +12,8 @@ use crate::error::{NetError, NetErrorCode};
 
 #[cfg(target_os = "linux")]
 pub mod host;
+
+pub mod none;
 
 /// モード文字列の最大バイト長（外部入力の上限検証。coding-rust）。
 const MODE_MAX_LEN: usize = 16;
@@ -26,7 +28,7 @@ pub enum NetworkMode {
     Bridge,
     /// ホストの network namespace をそのまま共有する（分離を意図的に緩める。NET-6）。
     Host,
-    /// `lo` のみを持つ専用 netns。選択子だけを置き、セットアップ本体は #327（TASK-143.2）で実装する（未実装）。
+    /// `lo` のみを持つ専用 netns。セットアップ本体は `none` サブモジュール（TASK-143.2・#327）。
     None,
 }
 

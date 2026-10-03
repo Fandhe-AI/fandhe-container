@@ -59,10 +59,9 @@ fn main() -> std::process::ExitCode {
     for _ in 0..20 {
         client.send_to(&full_query(0xABCD), target).expect("send");
         if let Ok((n, _)) = client.recv_from(&mut buf) {
-            assert_eq!(
-                buf.get(..n),
-                Some(&[0xAB, 0xCD, 0x81, 0x04, 0, 0, 0, 0, 0, 0, 0, 0][..])
-            );
+            // 登録経路が無い間は NOTIMP（QR|RD・RCODE=4・各カウント 0）の 12 バイト（NET-5・TASK-141.2）。
+            let want = vec![0xAB, 0xCD, 0x81, 0x04, 0, 0, 0, 0, 0, 0, 0, 0];
+            assert_eq!(buf.get(..n), Some(&want[..]));
             ok = true;
             break;
         }

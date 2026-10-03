@@ -1,11 +1,12 @@
-//! ネットワークごとの DNS ヘルパー: プロセス起動・UDP 待受基盤・不正パケットの破棄
-//! （NET-5・TASK-141.1・#321・MS-8）。
+//! ネットワークごとの DNS ヘルパー: プロセス起動・UDP 待受基盤・不正パケットの破棄・A レコード応答
+//! （NET-5・TASK-141.1・#321・TASK-141.2・#322・MS-8）。
 //!
 //! # 役割と関係
 //! - ネットワーク（`network::create_network` が作る bridge）の gateway の IPv4:53 に UDP で待ち受ける
-//!   ヘルパープロセスを 1 つ起動する基盤。クエリの意味解釈（QNAME / QTYPE のパース・レジストリ・A 応答・
-//!   NXDOMAIN）は TASK-141.2（#322）が [`QueryHandler`] の実装を差し替えて担う。上流 DNS への転送は
-//!   TASK-185、参照カウントによるオンデマンド起動・終了と SIGTERM による正常終了は TASK-144 の責務
+//!   ヘルパープロセスを 1 つ起動する基盤。質問セクションのパース（[`parse_question`]）、コンテナ名 → IPv4 の
+//!   レジストリ（[`DnsRegistry`]）、A 応答・REFUSED / NODATA の組み立て（[`RegistryHandler`]）を持つ
+//!   （TASK-141.2・#322）。上流 DNS への転送は TASK-185、参照カウントによるオンデマンド起動・終了と
+//!   SIGTERM による正常終了は TASK-144 の責務
 //! - 呼び出し側（将来の統一 CLI / 製品バイナリ。TASK-79）は [`spawn_dns_helper`] で自身または専用バイナリを
 //!   `--listen <ipv4:port>` つきで起動し、ヘルパー側の `main` は [`run_dns_helper_main`] を呼ぶ
 //!
@@ -14,16 +15,25 @@
 //! その bridge の gateway アドレスに bind する（PoC-15 も同じ配置）。ルーター専用 netns を新設して
 //! ヘルパーを入れる読み方は crate 境界の設計変更になるため採らない。
 //!
+//! # レジストリの連携点
+//! コンテナ接続（`network::attach_container` の `AttachedContainer.address` が IPv4 のとき）で
+//! [`DnsRegistry::register`]、切断・停止で [`DnsRegistry::unregister`] を呼ぶ。
+//!
 //! # 未実装（REPAIR-3）
-//! 既定の [`NotImplementedHandler`] は疎通確認用の仮実装で、ヘッダー検証を通ったクエリに RCODE=NOTIMP(4) の
-//! 12 バイト応答を返すだけである。A レコード応答（NET-5 の本来の挙動）ではない。PLUG-1 における
-//! DNS ヘルパーの core / plugin 区分は検討中で、確定扱いにはしない。
+//! プロセス外（ヘルパープロセス）へ名前の登録・削除を伝える経路はまだ無い（CORE-1 により起動・停止は別プロセスで
+//! 起きるため、経路の設計は後続タスクで決める）。経路ができるまで [`run_dns_helper_main`] は
+//! [`RegistryHandler`] に切り替えず、全クエリに NOTIMP を返す [`NotImplementedHandler`] を使い続ける
+//! （登録できない空レジストリで実際の名前解決を妨げない）。[`RegistryHandler`] は同一プロセス内の
+//! 登録側（テスト・将来の組み込み）から使える。上流転送・TCP・AAAA・EDNS0 も未対応。
+//! レジストリに無い名前は存在・不存在を断定せず REFUSED（AA=0）を返す（上流転送 TASK-185 まで）。
+//! PLUG-1 における DNS ヘルパーの core / plugin 区分は検討中で、確定扱いにはしない。
 //!
 //! # 安全性
 //! 受信バッファは固定長（513 バイト）で、512 バイト超は破棄する。外部入力の解析は `get` / `try_into` のみで
-//! 添字アクセス・`unwrap` を使わない。ヘッダー不正のパケットには応答しない。応答は要求長以下に限り
-//! （増幅反射の防止）、ログ・統計にはパケットの内容を載せない。待受・準備完了待ち・回収はすべて期限つき（REPAIR-5）。
+//! 添字アクセス・`unwrap` を使わない。ヘッダー不正のパケットには応答しない。応答は要求長 + [`MAX_RESPONSE_GROWTH`]
+//! バイト以下に限り（増幅反射の防止）、ログ・統計にはパケットの内容を載せない。待受・準備完了待ち・回収はすべて期限つき（REPAIR-5）。
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write as _};
@@ -31,7 +41,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::error::{NetError, NetErrorCode};
@@ -58,7 +68,22 @@ const READY_LINE_MAX: usize = 64;
 const READY_PREFIX: &str = "READY ";
 const FLAG_QR: u8 = 0x80;
 const FLAG_RD: u8 = 0x01;
+const FLAG_AA: u8 = 0x04;
+const RCODE_NOERROR: u8 = 0;
 const RCODE_NOTIMP: u8 = 4;
+const RCODE_REFUSED: u8 = 5;
+const QTYPE_A: u16 = 1;
+const QCLASS_IN: u16 = 1;
+/// A レコード応答の TTL（秒）。コンテナの増減を反映しやすいよう短くする（PoC-15 と同値）。spec は TTL を規定しない。
+pub const ANSWER_TTL_SECS: u32 = 5;
+/// 応答が要求長を超えてよい上限（A RR 1 件: 圧縮ポインタ 2 + TYPE 2 + CLASS 2 + TTL 4 + RDLENGTH 2 + RDATA 4）。
+/// 応答は「要求 + A RR 1 件」に限られ、最小クエリ（17 バイト）でも増幅率は 2 倍未満。待受は bridge gateway の
+/// ユニキャストのみ（[`DnsListenAddr`]）で、外部インターフェースへは公開しない（NET-5）。
+pub const MAX_RESPONSE_GROWTH: usize = 16;
+/// レジストリの登録上限（1 ネットワークのコンテナ数として十分な値。無制限確保の防止）。
+pub const MAX_REGISTRY_ENTRIES: usize = 4096;
+/// 正規化済みドット連結名の最大長。
+const MAX_NAME_LEN: usize = 253;
 
 fn invalid(msg: &str) -> NetError {
     NetError::new(NetErrorCode::InvalidArgument, msg)
@@ -210,44 +235,64 @@ pub fn classify_datagram(datagram: &[u8]) -> DatagramVerdict {
         DatagramVerdict::Drop(DropReason::UnsupportedOpcode)
     } else if header.qdcount() != 1 {
         DatagramVerdict::Drop(DropReason::BadQuestionCount)
-    } else if !question_fits(datagram) {
+    } else if parse_question(datagram).is_none() {
         DatagramVerdict::Drop(DropReason::BadQuestion)
     } else {
         DatagramVerdict::Accept(header)
     }
 }
 
-/// ヘッダー直後の質問 1 件（QNAME・QTYPE 2 バイト・QCLASS 2 バイト）がデータグラム境界内に収まるか検証する。
-/// QNAME はラベル列（長さ 1〜63 + 本体）を長さ 0 で終端するもののみ受理し、圧縮ポインタ・拡張ラベル
-/// （上位 2 ビットが非 0）・全長 255 超は不正とする。添字アクセスは使わず `get` で境界を確認する。
-fn question_fits(datagram: &[u8]) -> bool {
-    let Some(mut rest) = datagram.get(HEADER_LEN..) else {
-        return false;
-    };
+/// パース済みの質問セクション（QNAME・QTYPE・QCLASS）。`serve` が検証した受信データグラムを借用する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsQuestion<'a> {
+    /// ラベル列（終端の長さ 0 を含む）。
+    pub qname: &'a [u8],
+    /// QTYPE（A=1 等）。
+    pub qtype: u16,
+    /// QCLASS（IN=1 等）。
+    pub qclass: u16,
+    /// QCLASS 直後のデータグラム内オフセット（質問セクションのエコー範囲 `HEADER_LEN..end`）。
+    pub end: usize,
+}
+
+/// ヘッダー直後の質問 1 件を解析する。QNAME はラベル列（長さ 1〜63 + 本体）を長さ 0 で終端するもののみ受理し、
+/// 圧縮ポインタ・拡張ラベル（上位 2 ビットが非 0）・全長 255 超・QTYPE / QCLASS の欠落は `None`。
+/// `classify_datagram` の検証と同一経路（ドリフト防止）。添字アクセスは使わず `get` で境界を確認する（NET-5）。
+pub fn parse_question(datagram: &[u8]) -> Option<DnsQuestion<'_>> {
+    let body = datagram.get(HEADER_LEN..)?;
+    let mut off = 0usize;
     let mut name_len = 0usize;
     loop {
-        let Some((&len, tail)) = rest.split_first() else {
-            return false;
-        };
+        let len = usize::from(*body.get(off)?);
         if len == 0 {
-            rest = tail;
+            off = off.checked_add(1)?;
             break;
         }
         if len > 63 {
-            return false;
+            return None;
         }
-        let Some(after) = tail.get(usize::from(len)..) else {
-            return false;
-        };
-        name_len = name_len.saturating_add(usize::from(len) + 1);
+        let next = off.checked_add(1)?.checked_add(len)?;
+        if next > body.len() {
+            return None;
+        }
+        name_len = name_len.saturating_add(len + 1);
         if name_len > 254 {
-            return false;
+            return None;
         }
-        rest = after;
+        off = next;
     }
-    rest.len() >= 4
+    let qname = body.get(..off)?;
+    let tail = body.get(off..)?.get(..4)?;
+    let qtype = u16::from_be_bytes([*tail.first()?, *tail.get(1)?]);
+    let qclass = u16::from_be_bytes([*tail.get(2)?, *tail.get(3)?]);
+    let end = HEADER_LEN.checked_add(off)?.checked_add(4)?;
+    Some(DnsQuestion {
+        qname,
+        qtype,
+        qclass,
+        end,
+    })
 }
-
 /// 応答バッファ（上限 512 バイトの固定長）。
 #[derive(Debug)]
 pub struct ResponseBuf {
@@ -296,15 +341,14 @@ pub enum HandlerOutcome {
     NoResponse,
 }
 
-/// 検証済みクエリの応答処理（TASK-141.2 が A 応答・NXDOMAIN の実装で差し替える差し替え点）。
+/// 検証済みクエリの応答処理（本実装は [`RegistryHandler`]。TASK-141.2）。
 pub trait QueryHandler {
     /// `header` は検証済み、`datagram` は受信全体（512 バイト以下）。
     fn respond(&self, header: &DnsHeader, datagram: &[u8], out: &mut ResponseBuf)
     -> HandlerOutcome;
 }
 
-/// 仮実装（REPAIR-3）: ID と RD をコピーし QR=1・RCODE=NOTIMP(4)・各カウント 0 の 12 バイトを返す。
-/// NET-5 の A 応答ではなく、疎通確認用。
+/// 疎通確認用の最小ハンドラ: ID と RD をコピーし QR=1・RCODE=NOTIMP(4)・各カウント 0 の 12 バイトを返す。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NotImplementedHandler;
 
@@ -339,6 +383,265 @@ impl QueryHandler for NotImplementedHandler {
             HandlerOutcome::Respond
         } else {
             HandlerOutcome::NoResponse
+        }
+    }
+}
+
+/// コンテナ名として DNS に登録できる名前（RFC 1123 ホスト名規則: 英数字とハイフン、各ラベル 1〜63、
+/// 先頭・末尾ハイフン不可、総長 253 以下）。小文字に正規化して保持する（NET-5・NET-12）。
+///
+/// 注意: Docker はコンテナ名に `_` を許すが、NET-12 の hostname 契約は許さないため拒否する。
+/// `_` を含むコンテナ名の扱いは要判断（未決）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DnsName(String);
+
+impl DnsName {
+    /// 検証・正規化して作る。末尾ドット 1 個は除去する。違反は `InvalidArgument`（入力値はメッセージに載せない）。
+    pub fn new(name: &str) -> Result<Self, NetError> {
+        let trimmed = name.strip_suffix('.').unwrap_or(name);
+        let bad = || invalid("invalid DNS name (RFC 1123 hostname rules)");
+        if trimmed.is_empty() || trimmed.len() > MAX_NAME_LEN {
+            return Err(bad());
+        }
+        for label in trimmed.split('.') {
+            let ok_len = (1..=63).contains(&label.len());
+            let ok_chars = label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+            if !ok_len || !ok_chars || label.starts_with('-') || label.ends_with('-') {
+                return Err(bad());
+            }
+        }
+        Ok(Self(trimmed.to_ascii_lowercase()))
+    }
+
+    /// 正規化済み（小文字・末尾ドットなし）の名前。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// [`DnsRegistry::register`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RegisterOutcome {
+    /// 新規に登録した。
+    Inserted,
+    /// 同名・同アドレスで登録済み（コンテナ再起動時の冪等性）。
+    Unchanged,
+}
+
+/// [`DnsRegistry::unregister`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnregisterOutcome {
+    /// 削除した（削除前のアドレス）。
+    Removed(Ipv4Addr),
+    /// 未登録（停止処理の冪等性のためエラーにしない）。
+    NotFound,
+}
+
+/// コンテナ名 → IPv4 アドレスのレジストリ（NET-5）。`Arc` で `serve` スレッドと登録側が共有する。
+///
+/// 登録側はコンテナ接続（`network::attach_container` が返すアドレスが IPv4 のとき）で [`register`](Self::register)、
+/// 切断・停止で [`unregister`](Self::unregister) を呼ぶ。参照カウントと自動起動 / 終了は TASK-144（NET-7）、
+/// 上流転送は TASK-185（NET-12）の責務。アドレスがサブネット内かの検証は行わない。
+#[derive(Debug, Default)]
+pub struct DnsRegistry {
+    entries: RwLock<HashMap<String, Ipv4Addr>>,
+}
+
+impl DnsRegistry {
+    /// 空のレジストリ。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 同名別アドレスは上書きせず `AlreadyExists`（名前の乗っ取りを隠さない）。上限超過は `ResourceExhausted`。
+    pub fn register(&self, name: &DnsName, addr: Ipv4Addr) -> Result<RegisterOutcome, NetError> {
+        // ポイズンしても中身は単純な map で整合性は壊れないため、回復して続行する。
+        let mut map = self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match map.get(name.as_str()) {
+            Some(cur) if *cur == addr => return Ok(RegisterOutcome::Unchanged),
+            Some(_) => {
+                return Err(NetError::new(
+                    NetErrorCode::AlreadyExists,
+                    "DNS name is already registered with a different address",
+                ));
+            }
+            None => {}
+        }
+        if map.len() >= MAX_REGISTRY_ENTRIES {
+            return Err(NetError::new(
+                NetErrorCode::ResourceExhausted,
+                "DNS registry is full",
+            ));
+        }
+        map.insert(name.as_str().to_owned(), addr);
+        Ok(RegisterOutcome::Inserted)
+    }
+
+    /// 登録を削除する。未登録でもエラーにしない。
+    pub fn unregister(&self, name: &DnsName) -> UnregisterOutcome {
+        let mut map = self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match map.remove(name.as_str()) {
+            Some(a) => UnregisterOutcome::Removed(a),
+            None => UnregisterOutcome::NotFound,
+        }
+    }
+
+    /// 正規化済みの名前で引く。
+    pub fn lookup(&self, normalized: &str) -> Option<Ipv4Addr> {
+        let map = self
+            .entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(normalized).copied()
+    }
+
+    /// 登録件数。
+    pub fn len(&self) -> usize {
+        self.entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// 空か。
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// QNAME を小文字のドット連結名へ正規化する（スタックバッファのみ）。許可文字（英数字・ハイフン）以外を含む
+/// ラベル、ルート名、バッファ超過は `None`（どの登録名にも一致しない扱い。ラベル内の `.` による誤一致を防ぐ）。
+fn normalize_qname<'b>(qname: &[u8], buf: &'b mut [u8; MAX_NAME_LEN]) -> Option<&'b str> {
+    let mut rest = qname;
+    let mut n = 0usize;
+    loop {
+        let (&len, tail) = rest.split_first()?;
+        if len == 0 {
+            break;
+        }
+        let label = tail.get(..usize::from(len))?;
+        rest = tail.get(usize::from(len)..)?;
+        if n > 0 {
+            *buf.get_mut(n)? = b'.';
+            n += 1;
+        }
+        for &b in label {
+            if !(b.is_ascii_alphanumeric() || b == b'-') {
+                return None;
+            }
+            *buf.get_mut(n)? = b.to_ascii_lowercase();
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    std::str::from_utf8(buf.get(..n)?).ok()
+}
+
+/// 固定長バッファへの追記ヘルパー（境界超過は `None`。添字アクセスを避ける）。
+struct MsgWriter {
+    buf: [u8; MAX_DATAGRAM_LEN],
+    len: usize,
+}
+
+impl MsgWriter {
+    fn put(&mut self, bytes: &[u8]) -> Option<()> {
+        let end = self.len.checked_add(bytes.len())?;
+        self.buf.get_mut(self.len..end)?.copy_from_slice(bytes);
+        self.len = end;
+        Some(())
+    }
+}
+
+/// レジストリを引いて A 応答・NXDOMAIN 等を返すハンドラ（NET-5・TASK-141.2）。
+///
+/// 判定: QCLASS≠IN は REFUSED / 未登録は REFUSED（AA=0。上流転送 TASK-185 が無い間は管理外名の存在・不存在を
+/// 断定せず、外部ドメインの解決を妨げない）/ 登録済みの A は answer 1 件（AA=1）/ 登録済みの A 以外は
+/// NODATA（NOERROR・answer 0。glibc が A と AAAA を並列に引くため NXDOMAIN にしない）。再帰は提供しない（RA=0）。
+/// 要求の EDNS OPT はエコーしない（ARCOUNT=0）。
+#[derive(Debug, Clone)]
+pub struct RegistryHandler {
+    registry: Arc<DnsRegistry>,
+}
+
+impl RegistryHandler {
+    /// 共有レジストリを引くハンドラを作る。
+    pub fn new(registry: Arc<DnsRegistry>) -> Self {
+        Self { registry }
+    }
+
+    fn build(&self, header: &DnsHeader, datagram: &[u8], out: &mut ResponseBuf) -> Option<()> {
+        let q = parse_question(datagram)?;
+        let mut norm = [0u8; MAX_NAME_LEN];
+        let (rcode, answer) = if q.qclass != QCLASS_IN {
+            (RCODE_REFUSED, None)
+        } else {
+            let found = normalize_qname(q.qname, &mut norm).and_then(|n| self.registry.lookup(n));
+            match found {
+                None => (RCODE_REFUSED, None),
+                Some(ip) if q.qtype == QTYPE_A => (RCODE_NOERROR, Some(ip)),
+                Some(_) => (RCODE_NOERROR, None),
+            }
+        };
+        // REFUSED（管理外名・非 IN）は権威を主張しないため AA を立てない。
+        let aa = if rcode == RCODE_REFUSED { 0 } else { FLAG_AA };
+        let rd = if header.recursion_desired() {
+            FLAG_RD
+        } else {
+            0
+        };
+        let id = header.id().to_be_bytes();
+        let mut w = MsgWriter {
+            buf: [0; MAX_DATAGRAM_LEN],
+            len: 0,
+        };
+        let ancount = u8::from(answer.is_some());
+        w.put(&[
+            id[0],
+            id[1],
+            FLAG_QR | aa | rd,
+            rcode,
+            0,
+            1,
+            0,
+            ancount,
+            0,
+            0,
+            0,
+            0,
+        ])?;
+        w.put(datagram.get(HEADER_LEN..q.end)?)?;
+        if let Some(ip) = answer {
+            w.put(&[0xC0, 0x0C, 0, 1, 0, 1])?;
+            w.put(&ANSWER_TTL_SECS.to_be_bytes())?;
+            w.put(&[0, 4])?;
+            w.put(&ip.octets())?;
+        }
+        out.set(w.buf.get(..w.len)?).then_some(())
+    }
+}
+
+impl QueryHandler for RegistryHandler {
+    fn respond(
+        &self,
+        header: &DnsHeader,
+        datagram: &[u8],
+        out: &mut ResponseBuf,
+    ) -> HandlerOutcome {
+        match self.build(header, datagram, out) {
+            Some(()) => HandlerOutcome::Respond,
+            None => HandlerOutcome::NoResponse,
         }
     }
 }
@@ -506,8 +809,8 @@ impl DnsHelperServer {
             if handler.respond(&header, datagram, &mut out) != HandlerOutcome::Respond {
                 continue;
             }
-            // 増幅反射の防止: 応答は要求長以下に限る。
-            if out.as_bytes().len() > n {
+            // 増幅反射の防止: 応答は要求長 + A RR 1 件分以下に限る。
+            if out.as_bytes().len() > n.saturating_add(MAX_RESPONSE_GROWTH) {
                 self.stats.suppressed = self.stats.suppressed.saturating_add(1);
                 continue;
             }
@@ -567,6 +870,8 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
         return ExitCode::from(1);
     }
     // 親が kill するまで動き続ける。正常終了（SIGTERM）は TASK-144 の責務。
+    // プロセス外からの登録経路が未実装（REPAIR-3）の間は RegistryHandler に切り替えず NOTIMP を返す
+    // （空レジストリで名前解決を妨げない）。経路の接続は後続タスク（NET-5）。
     let stop = AtomicBool::new(false);
     match server.serve(&NotImplementedHandler, &stop) {
         Ok(()) => ExitCode::SUCCESS,
@@ -769,7 +1074,6 @@ pub fn spawn_dns_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     /// ヘッダー 12 バイト（ID・flags・QDCOUNT）を組む。
     fn hdr(id: u16, flags: u16, qd: u16) -> Vec<u8> {
@@ -1050,5 +1354,257 @@ mod tests {
         assert_eq!(s.dropped(DropReason::BadQuestionCount), 1);
         assert_eq!(s.dropped(DropReason::BadQuestion), 1);
         assert_eq!(s.dropped(DropReason::Oversized), 1);
+    }
+
+    // ---- TASK-141.2（#322）: 質問パース・レジストリ・A 応答 ----
+
+    /// 任意の QNAME 文字列（ドット区切り）・QTYPE・QCLASS のクエリを組む。
+    fn named_query(id: u16, flags: u16, name: &str, qtype: u16, qclass: u16) -> Vec<u8> {
+        let mut v = hdr(id, flags, 1);
+        for label in name.split('.').filter(|l| !l.is_empty()) {
+            v.push(u8::try_from(label.len()).expect("label len"));
+            v.extend_from_slice(label.as_bytes());
+        }
+        v.push(0);
+        v.extend_from_slice(&qtype.to_be_bytes());
+        v.extend_from_slice(&qclass.to_be_bytes());
+        v
+    }
+
+    fn handler_with(entries: &[(&str, Ipv4Addr)]) -> (RegistryHandler, Arc<DnsRegistry>) {
+        let reg = Arc::new(DnsRegistry::new());
+        for (n, a) in entries {
+            reg.register(&DnsName::new(n).expect("name"), *a)
+                .expect("register");
+        }
+        (RegistryHandler::new(Arc::clone(&reg)), reg)
+    }
+
+    fn answer(h: &RegistryHandler, pkt: &[u8]) -> Vec<u8> {
+        let DatagramVerdict::Accept(hd) = classify_datagram(pkt) else {
+            panic!("expected accept");
+        };
+        let mut out = ResponseBuf::new();
+        assert_eq!(h.respond(&hd, pkt, &mut out), HandlerOutcome::Respond);
+        out.as_bytes().to_vec()
+    }
+
+    /// NET-5: 質問セクションの具体値（QNAME 範囲・QTYPE・QCLASS・end）。
+    #[test]
+    fn parse_question_values() {
+        let pkt = query_pkt(1, 0x0100);
+        let q = parse_question(&pkt).expect("question");
+        assert_eq!(q.qname, b"\x07example\x03com\x00");
+        assert_eq!((q.qtype, q.qclass, q.end), (1, 1, pkt.len()));
+        // 質問の後ろの余剰（EDNS OPT 等）は end が質問末尾を指す。
+        let mut with_opt = pkt.clone();
+        with_opt.extend_from_slice(&[0, 0, 41, 16, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(parse_question(&with_opt).expect("q").end, pkt.len());
+        assert!(parse_question(&hdr(1, 0, 1)).is_none());
+        assert!(parse_question(&[]).is_none());
+    }
+
+    /// NET-5: DnsName の正規化と拒否。
+    #[test]
+    fn dns_name_validation() {
+        assert_eq!(DnsName::new("web").expect("ok").as_str(), "web");
+        assert_eq!(DnsName::new("Web.").expect("ok").as_str(), "web");
+        assert_eq!(DnsName::new("db-1.svc").expect("ok").as_str(), "db-1.svc");
+        let long_label = "a".repeat(64);
+        let long_name = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63),
+        ]
+        .join(".");
+        for bad in [
+            "",
+            ".",
+            "-a",
+            "a-",
+            &long_label,
+            &long_name,
+            "a_b",
+            "a b",
+            "a\u{1}b",
+            "a..b",
+            "é",
+        ] {
+            assert_eq!(
+                DnsName::new(bad).expect_err("reject").code(),
+                NetErrorCode::InvalidArgument,
+                "{bad:?}"
+            );
+        }
+        assert!(DnsName::new(&"a".repeat(63)).is_ok());
+    }
+
+    /// NET-5: 登録・冪等・衝突・削除・上限。
+    #[test]
+    fn registry_lifecycle() {
+        let reg = DnsRegistry::new();
+        let web = DnsName::new("web").expect("name");
+        let a1 = Ipv4Addr::new(10, 215, 0, 2);
+        assert_eq!(reg.register(&web, a1), Ok(RegisterOutcome::Inserted));
+        assert_eq!(reg.register(&web, a1), Ok(RegisterOutcome::Unchanged));
+        let e = reg
+            .register(&web, Ipv4Addr::new(10, 215, 0, 3))
+            .expect_err("conflict");
+        assert_eq!(e.code(), NetErrorCode::AlreadyExists);
+        assert_eq!(reg.lookup("web"), Some(a1));
+        assert_eq!(reg.unregister(&web), UnregisterOutcome::Removed(a1));
+        assert_eq!(reg.unregister(&web), UnregisterOutcome::NotFound);
+        assert!(reg.is_empty());
+        for i in 0..MAX_REGISTRY_ENTRIES {
+            let n = DnsName::new(&format!("c{i}")).expect("name");
+            reg.register(&n, a1).expect("fill");
+        }
+        assert_eq!(reg.len(), MAX_REGISTRY_ENTRIES);
+        let over = DnsName::new("over").expect("name");
+        let e = reg.register(&over, a1).expect_err("full");
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+    }
+
+    /// NET-5: 登録済み名の A 質問に正しいアドレスで応答する（全バイト列照合）。大文字小文字は無視。
+    #[test]
+    fn handler_answers_a_record() {
+        let (h, _) = handler_with(&[("web", Ipv4Addr::new(10, 215, 0, 2))]);
+        let pkt = named_query(0x1234, 0x0100, "WEB", 1, 1);
+        let mut want = vec![0x12, 0x34, 0x85, 0x00, 0, 1, 0, 1, 0, 0, 0, 0];
+        want.extend_from_slice(&pkt[HEADER_LEN..]);
+        want.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 5, 0, 4, 10, 215, 0, 2]);
+        assert_eq!(answer(&h, &pkt), want);
+        // RD=0 は RD を立てない。
+        let pkt = named_query(1, 0, "web", 1, 1);
+        assert_eq!(answer(&h, &pkt).get(2..4), Some(&[0x84, 0x00][..]));
+    }
+
+    /// NET-5: 未登録名は REFUSED（AA=0・ANCOUNT=0・長さは要求と同じ。存在・不存在を断定しない）。
+    #[test]
+    fn handler_refused_for_unknown() {
+        let (h, _) = handler_with(&[("web", Ipv4Addr::new(10, 215, 0, 2))]);
+        let pkt = named_query(7, 0x0100, "nope", 1, 1);
+        let r = answer(&h, &pkt);
+        assert_eq!(
+            r.get(..12),
+            Some(&[0, 7, 0x81, 5, 0, 1, 0, 0, 0, 0, 0, 0][..])
+        );
+        assert_eq!(r.len(), pkt.len());
+    }
+
+    /// NET-5: AAAA は NODATA、CH は REFUSED、ラベル内 `.` は誤一致しない、EDNS OPT はエコーしない。
+    #[test]
+    fn handler_edge_cases() {
+        let (h, _) = handler_with(&[
+            ("web", Ipv4Addr::new(10, 215, 0, 2)),
+            ("web.x", Ipv4Addr::new(10, 215, 0, 3)),
+        ]);
+        let r = answer(&h, &named_query(1, 0x0100, "web", 28, 1));
+        assert_eq!(
+            r.get(..12),
+            Some(&[0, 1, 0x85, 0, 0, 1, 0, 0, 0, 0, 0, 0][..])
+        );
+        let r = answer(&h, &named_query(1, 0x0100, "web", 1, 3));
+        assert_eq!(r.get(2..4), Some(&[0x81, 5][..]));
+        // 1 ラベル "web.x"（ラベル内に '.'）は 2 ラベル登録名 web.x に一致しない。
+        let mut pkt = hdr(1, 0x0100, 1);
+        pkt.extend_from_slice(b"\x05web.x\x00\x00\x01\x00\x01");
+        assert_eq!(answer(&h, &pkt).get(3), Some(&5));
+        let ok = named_query(1, 0x0100, "web.x", 1, 1);
+        assert_eq!(answer(&h, &ok).get(3), Some(&0));
+        // EDNS OPT 付き要求（ARCOUNT=1）でも応答は ARCOUNT=0 で OPT をエコーしない。
+        let plain = named_query(1, 0x0100, "web", 1, 1);
+        let mut edns = plain.clone();
+        edns.extend_from_slice(&[0, 0, 41, 16, 0, 0, 0, 0, 0, 0, 0]);
+        if let Some(b) = edns.get_mut(11) {
+            *b = 1;
+        }
+        let r = answer(&h, &edns);
+        assert_eq!(r.get(10..12), Some(&[0, 0][..]));
+        assert_eq!(r.len(), plain.len() + 16);
+    }
+
+    /// NET-5: unregister（コンテナ停止）後は REFUSED に変わる。
+    #[test]
+    fn handler_follows_unregister() {
+        let (h, reg) = handler_with(&[("web", Ipv4Addr::new(10, 215, 0, 2))]);
+        let pkt = named_query(1, 0x0100, "web", 1, 1);
+        assert_eq!(answer(&h, &pkt).get(3), Some(&0));
+        reg.unregister(&DnsName::new("web").expect("name"));
+        assert_eq!(answer(&h, &pkt).get(3), Some(&5));
+    }
+
+    /// 固定長の応答を返すハンドラ（`serve` の増幅ガード境界の検証用）。
+    struct FixedLenHandler(usize);
+
+    impl QueryHandler for FixedLenHandler {
+        fn respond(&self, _h: &DnsHeader, _d: &[u8], out: &mut ResponseBuf) -> HandlerOutcome {
+            assert!(out.set(&vec![0u8; self.0]));
+            HandlerOutcome::Respond
+        }
+    }
+
+    /// NET-5: 応答が要求長 + 16 までは送信し、+17 は抑止（suppressed）する。
+    #[test]
+    fn serve_amplification_guard_boundary() {
+        let pkt = query_pkt(1, 0x0100);
+        for (extra, sent) in [
+            (MAX_RESPONSE_GROWTH, true),
+            (MAX_RESPONSE_GROWTH + 1, false),
+        ] {
+            let mut server =
+                DnsHelperServer::bind(DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("addr"))
+                    .expect("bind");
+            let target = server.local_addr();
+            let stop = AtomicBool::new(false);
+            let handler = FixedLenHandler(pkt.len() + extra);
+            let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client");
+            client
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("timeout");
+            client.send_to(&pkt, target).expect("send");
+            std::thread::scope(|sc| {
+                let th = sc.spawn(|| server.serve(&handler, &stop));
+                let mut buf = [0u8; 600];
+                let r = client.recv_from(&mut buf);
+                stop.store(true, Ordering::Relaxed);
+                assert!(th.join().expect("join").is_ok());
+                assert_eq!(r.is_ok(), sent);
+            });
+            assert_eq!(server.stats().suppressed, u64::from(!sent));
+        }
+    }
+
+    /// NET-5: 実ソケットで登録名の A 応答と未登録名の REFUSED を受信バイト列で照合する。
+    #[test]
+    fn serve_registry_over_loopback() {
+        let (h, _) = handler_with(&[("web", Ipv4Addr::new(10, 215, 0, 2))]);
+        let mut server =
+            DnsHelperServer::bind(DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("addr"))
+                .expect("bind");
+        let target = server.local_addr();
+        let stop = AtomicBool::new(false);
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client");
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        std::thread::scope(|sc| {
+            let th = sc.spawn(|| server.serve(&h, &stop));
+            let mut buf = [0u8; 600];
+            let mut got = Vec::new();
+            for name in ["web", "nope"] {
+                let pkt = named_query(9, 0x0100, name, 1, 1);
+                client.send_to(&pkt, target).expect("send");
+                let (n, _) = client.recv_from(&mut buf).expect("reply");
+                got.push(buf.get(..n).expect("len").to_vec());
+            }
+            stop.store(true, Ordering::Relaxed);
+            assert!(th.join().expect("join").is_ok());
+            assert_eq!(got[0].get(7), Some(&1));
+            assert_eq!(got[0].get(got[0].len() - 4..), Some(&[10, 215, 0, 2][..]));
+            assert_eq!(got[1].get(3), Some(&5));
+        });
+        assert_eq!(server.stats().answered, 2);
     }
 }

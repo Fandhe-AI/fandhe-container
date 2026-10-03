@@ -70,6 +70,19 @@ pub const NLM_F_EXCL: u16 = 0x200;
 pub const NLM_F_CREATE: u16 = 0x400;
 /// NEW: 末尾に追加。
 pub const NLM_F_APPEND: u16 = 0x800;
+/// `NLMSG_ERROR` 応答で、ペイロードに元要求の本体を写さず（ヘッダのみ）返したことを示す
+/// （uapi `NLM_F_CAPPED`。`NETLINK_CAP_ACK` 設定時、または成功 ACK で常に立つ）。
+/// `NLM_F_ROOT` / `NLM_F_REPLACE` と同じビット値のため、`nlmsg_type == NLMSG_ERROR` のメッセージに
+/// 対してだけ意味を持つ（NET-11）。
+pub const NLM_F_CAPPED: u16 = 0x100;
+/// `NLMSG_ERROR` 応答の末尾に拡張 ACK の属性（TLV）が続くことを示す（uapi `NLM_F_ACK_TLVS`）。
+/// `NLM_F_MATCH` / `NLM_F_EXCL` と同じビット値のため、`NLMSG_ERROR` に対してだけ意味を持つ（NET-11）。
+pub const NLM_F_ACK_TLVS: u16 = 0x200;
+/// 拡張 ACK 属性: 失敗理由の NUL 終端文字列（uapi `NLMSGERR_ATTR_MSG`）。
+pub const NLMSGERR_ATTR_MSG: u16 = 1;
+/// 拡張 ACK 属性: 問題のある属性の、元要求先頭からのバイトオフセット（`u32`。uapi
+/// `NLMSGERR_ATTR_OFFS`）。
+pub const NLMSGERR_ATTR_OFFS: u16 = 2;
 
 /// `rta_type` のフラグ: ネスト属性。
 pub const NLA_F_NESTED: u16 = 0x8000;

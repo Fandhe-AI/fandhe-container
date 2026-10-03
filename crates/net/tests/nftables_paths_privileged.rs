@@ -386,10 +386,20 @@ mod linux {
     fn child_inner(role: &str) -> Result<(), NetError> {
         // `--child` は直接起動できてしまうため、操作前に隔離を確認する（P0・fail-closed）。
         ensure_isolated_netns()?;
-        let (dev, addr, default_gw) = match role {
-            "c1" => (CC1, C1_ADDR, Some(HOST_INNER)),
-            "c2" => (CC2, C2_ADDR, Some(HOST_INNER)),
-            "external" => (EX, EXTERNAL_ADDR, None),
+        // external には c1 / c2 側 /24 への戻り経路（router の外側アドレス経由）を持たせる。
+        // 無いと masquerade 適用前の datagram（送信元 10.212.1.x）が rp_filter で martian として
+        // 破棄され、投入前の到達確認がタイムアウトする。
+        let (dev, addr, route) = match role {
+            "c1" => (CC1, C1_ADDR, Some((IpPrefix::default_v4(), HOST_INNER))),
+            "c2" => (CC2, C2_ADDR, Some((IpPrefix::default_v4(), HOST_INNER))),
+            "external" => (
+                EX,
+                EXTERNAL_ADDR,
+                Some((
+                    IpPrefix::new(v4(Ipv4Addr::new(10, 212, 1, 0)), 24)?,
+                    HOST_OUTER,
+                )),
+            ),
             _ => {
                 return Err(NetError::new(
                     NetErrorCode::InvalidArgument,
@@ -408,10 +418,10 @@ mod linux {
             &AddressSpec::new(idx, IpPrefix::new(v4(addr), 24)?, AddrScope::Universe),
             timeout(),
         )?;
-        if let Some(gw) = default_gw {
+        if let Some((dst, gw)) = route {
             sock.add_route(
                 &RouteSpec::new(
-                    IpPrefix::default_v4(),
+                    dst,
                     RouteNextHop::Gateway {
                         gateway: v4(gw),
                         oif: Some(idx),

@@ -292,6 +292,12 @@ impl NftBatchAckCollector {
                             format!("sync request failed with errno {}", ack.errno()),
                         )));
                     }
+                    if ack.request_seq().is_some_and(|s| s != h.seq()) {
+                        return Err(self.unknown(data_loss(format!(
+                            "sync ack for seq {} embeds a different request seq",
+                            h.seq()
+                        ))));
+                    }
                     self.barrier_acked = true;
                 }
                 continue;
@@ -684,5 +690,16 @@ mod tests {
         assert_eq!(c.locate(0), Some(NftBatchPosition::Body { index: 1 }));
         assert_eq!(c.locate(2), Some(NftBatchPosition::End));
         assert_eq!(c.locate(3), None);
+    }
+
+    /// NET-11: 同期点 ACK が別の要求 seq を埋め込んでいれば成功にせず DataLoss（Unknown）にする。
+    #[test]
+    fn net11_barrier_ack_with_mismatched_inner_seq_is_data_loss() {
+        let mut c = NftBatchAckCollector::new(&batch(1));
+        c.set_barrier(103);
+        let e = c.feed(&err_dgram(103, 0, 999)).expect_err("mismatch");
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+        assert!(!c.barrier_acked());
     }
 }

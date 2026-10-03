@@ -138,6 +138,10 @@ fn exchange(
         let barrier_seq = seq_after(batch.end_seq());
         collector.set_barrier(barrier_seq);
         let barrier = encode_barrier(barrier_seq).map_err(|e| collector.unknown(e))?;
+        // 本体判定後の期限切れでは同期点を送らず、全体期限（REPAIR-5）を超えて送信しない。
+        if deadline.remaining().is_zero() {
+            return Err(collector.timeout_error(total));
+        }
         // 送れなければ END の判定を確認できない（適用済みかも不明）。
         send_barrier(&barrier).map_err(|e| collector.unknown(e))?;
         drain_until_barrier(&mut collector, deadline, total, recv)?;

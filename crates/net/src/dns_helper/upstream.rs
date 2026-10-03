@@ -18,7 +18,7 @@
 //! 3. レジストリに無く、送信元が未登録: REFUSED（オープンリゾルバにしない）
 //!
 //! # 安全性
-//! - 転送は登録済みコンテナ宛てに限る。上流は loopback・unspecified・multicast・broadcast・IPv6 link-local を拒否する。
+//! - 転送は登録済みコンテナ宛てに限る。上流は loopback・unspecified・multicast・broadcast・link-local（IPv4 169.254.0.0/16〔メタデータ系アドレスを含む〕・IPv6 fe80::/10）を拒否する。
 //!   これは NET-12 に規定の無い安全側の制限である（ヘルパーはホスト側 netns で動くため、`--dns 127.0.0.53` を許すと
 //!   コンテナがホストローカルの UDP:53 サービスへ到達できてしまう）。ユーザー確認事項（未承認）
 //! - 上流とのやりとりは試行ごとに新しいエフェメラルポートの UDP ソケットを `connect` し（送信元ポートの乱択と
@@ -29,12 +29,16 @@
 //!   glibc の resolver 既定タイムアウト（5 秒）より短く、コンテナが先に SERVFAIL を受け取れる
 //! - 転送応答の上限は 512 バイトで、登録済みコンテナ宛てに限る。bridge 内の送信元偽装による別コンテナへの
 //!   反射（最大約 30 倍）は残存リスクである
+//! - `UpstreamServer::new` はヘルパー自身の gateway アドレスを知らないため、`--dns` に gateway を指定する場合の拒否は
+//!   呼び出し側（ネットワーク構成を知る登録経路）の責務である。拒否しないと自分自身へ転送し、単一スレッドの serve が
+//!   最大 [`FORWARD_TOTAL_DEADLINE`] 塞がる（残存リスク。登録経路の実装は TASK-185.4〔#347〕以降）
 //!
 //! # 未実装（REPAIR-3）
 //! - プロセス外のヘルパープロセスへ上流マッピングを登録する経路は無い（`run_dns_helper_main` は NOTIMP のまま）。
 //!   [`ForwardingHandler`] は同一プロセス内の登録側（テスト・将来の組み込み）からのみ到達できる
 //! - `serve` は単一スレッドのため、転送中は同じネットワークの他クエリが最大 [`FORWARD_TOTAL_DEADLINE`] 待たされる
 //!   （head-of-line blocking）。並列化は後続課題
+//!   （追跡 Issue は未起票。out-of-scope-tracking 規約に従いユーザー承認後に起票し、番号をここへ追記する）
 //! - TCP 再試行・EDNS0・上流応答の加工（TC=1 は素通し）は未対応
 
 use std::collections::HashMap;
@@ -79,7 +83,11 @@ impl UpstreamServer {
         let ip = ip.to_canonical();
         let bad = match ip {
             IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast()
+                v4.is_loopback()
+                    || v4.is_unspecified()
+                    || v4.is_multicast()
+                    || v4.is_broadcast()
+                    || v4.is_link_local()
             }
             IpAddr::V6(v6) => {
                 v6.is_loopback()
@@ -629,6 +637,7 @@ mod tests {
             "224.0.0.1",
             "255.255.255.255",
             "fe80::1",
+            "169.254.169.254",
             "::ffff:127.0.0.1",
         ] {
             let e = UpstreamServer::new(ip(bad)).expect_err(bad);

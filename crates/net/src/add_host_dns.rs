@@ -8,12 +8,15 @@
 //!
 //! `--add-host <hostname>:<ip>` は最初の `:` で 2 分割する（[`AddHostEntry::parse`]。残り全体を IP とするため
 //! `::1` 等の IPv6 表記をそのまま渡せる）。検証済みエントリはコンテナの hosts ファイルへ追記できる
-//! （[`apply_add_hosts`]。TASK-185.2・#345）。追記先はホスト側のパスで、ネットワークモード
+//! （[`apply_add_hosts`]。TASK-185.2・#345）。追記先は「管理ルート（コンテナ状態ディレクトリ）」と
+//! そこからの相対パスで指定し、ルート配下の既存の通常ファイルに限る（`/etc/hosts` のような管理外の
+//! ファイルは絶対パス・`..`・symlink 経由のいずれでも指せない）。ネットワークモード
 //! （bridge / host / none）を引数に取らないため全モードで同じ処理になる。hosts ファイルの生成・
 //! コンテナへの bind mount は runtime / core 側の責務で、本モジュールは既存の通常ファイルへ追記するだけ
 //! （無ければ作らず `NOT_FOUND`）。
-//! 追記先は symlink・ハードリンク（nlink != 1）・他ユーザー所有・`..` を含むパスを拒否し、書き込み失敗時は
-//! 同じロック下で書き込み前の長さへ戻す。
+//! 追記先は symlink（途中ディレクトリを含む）・ハードリンク（nlink != 1）・他ユーザー所有を拒否し、
+//! 書き込み失敗時は同じロック下で書き込み前の長さへ戻す。巻き戻しにも失敗した場合は
+//! 不完全な行が残りうるため `DATA_LOSS` で通常の失敗と区別して返す。
 //!
 //! 上流転送（TASK-185.3）・host/none の `--dns` 反映と none モードでの loopback 制限（TASK-185.4）は
 //! 未実装（REPAIR-3）。エラーの `message` は固定の英語文字列で、
@@ -23,7 +26,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -302,6 +305,91 @@ fn verify_hosts_file(file: &File, path: &Path) -> Result<(), NetError> {
     Ok(())
 }
 
+/// 管理ルート配下の相対パスを安全に解決する（NET-12・TASK-185.2。コンテナ分離の境界）。
+///
+/// `rel` は空でない相対パスで、全要素が通常の名前（絶対パス・`..`・`.`・Windows のプレフィックスは拒否）。
+/// 途中ディレクトリは symlink でない実ディレクトリであること、最終要素は symlink でない通常ファイルで
+/// あることを確認する。返すのは正規化済みルートに `rel` を連結したパスで、呼び出し側は開いた後に
+/// [`verify_within_root`] で実体がルート配下にあることを再確認する。
+fn resolve_in_root(managed_root: &Path, rel: &Path) -> Result<(PathBuf, PathBuf), NetError> {
+    let root = std::fs::canonicalize(managed_root).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            NetError::new(NetErrorCode::NotFound, "managed root does not exist")
+        } else {
+            io_err("failed to resolve managed root")
+        }
+    })?;
+    let mut comps = Vec::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(n) => comps.push(n),
+            _ => {
+                return Err(NetError::new(
+                    NetErrorCode::InvalidArgument,
+                    "hosts path must be a plain relative path inside the managed root",
+                ));
+            }
+        }
+    }
+    let Some((last, dirs)) = comps.split_last() else {
+        return Err(NetError::new(
+            NetErrorCode::InvalidArgument,
+            "hosts path must not be empty",
+        ));
+    };
+    let mut cur = root.clone();
+    for d in dirs {
+        cur.push(d);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(NetError::new(
+                    NetErrorCode::InvalidArgument,
+                    "hosts path has a non-directory or symlink component",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(NetError::new(
+                    NetErrorCode::NotFound,
+                    "hosts file does not exist",
+                ));
+            }
+            Err(_) => return Err(io_err("failed to stat hosts file")),
+        }
+    }
+    cur.push(last);
+    Ok((root, cur))
+}
+
+/// 開いた hosts ファイルの実体（シンボリックリンク解決後）が正規化済みルート配下にあることを確認する。
+fn verify_within_root(root: &Path, path: &Path) -> Result<(), NetError> {
+    let real = std::fs::canonicalize(path).map_err(|_| io_err("failed to resolve hosts file"))?;
+    if !real.starts_with(root) {
+        return Err(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "hosts file resolves outside the managed root",
+        ));
+    }
+    Ok(())
+}
+
+/// 書き込み失敗後に書き込み前の長さへ戻し、結果に応じたエラーを返す。
+///
+/// 巻き戻し（切り詰め + fsync）まで成功した場合のみ通常の `INTERNAL`（ファイルは元の内容）。
+/// 失敗した場合は不完全な行が残りうるため `DATA_LOSS` で区別する（再試行はその後ろへ追記してしまうため
+/// 呼び出し側は hosts ファイルを再生成するなど復旧が必要）。`sync_all` 失敗後の切り詰めも
+/// 永続化を確認するため再度 fsync する。
+fn rollback_after_failure(file: &File, len: u64) -> NetError {
+    if file.set_len(len).and_then(|_| file.sync_all()).is_ok() {
+        io_err("failed to write hosts file")
+    } else {
+        NetError::new(
+            NetErrorCode::DataLoss,
+            "failed to write hosts file and failed to roll back; file may be corrupted",
+        )
+    }
+}
+
 /// hosts ファイルの排他ロックを期限つきで取得する（プロセス間の直列化。REPAIR-5）。
 ///
 /// `deadline` は呼び出し側が決めた全体の期限で、同一プロセス内ミューテックス待ちと共有する。
@@ -348,11 +436,16 @@ fn lock_guard_bounded(deadline: Instant) -> Result<std::sync::MutexGuard<'static
 
 /// 検証済みエントリをコンテナの hosts ファイルへ追記する（NET-12・TASK-185.2）。
 ///
-/// `hosts_path` はホスト側から見たコンテナの hosts ファイルで、ネットワークモードに依存しない。
+/// `managed_root` は管理ルート（コンテナ状態ディレクトリ）、`hosts_rel` はその配下の hosts ファイルへの
+/// 相対パスで、ネットワークモードに依存しない。ルート外（絶対パス・`..`・symlink 経由）は指せない。
 /// 既存の通常ファイルにのみ追記し（symlink・非通常ファイルは拒否、無ければ `NOT_FOUND` で作成しない）、
 /// tmp + rename は使わない（bind mount 済みファイルの inode を保つため）。`O_APPEND` で 1 回の
 /// `write_all` にまとめ、既存内容の末尾が改行でなければ先頭に改行を補う。`entries` が空なら何も開かない。
-pub fn append_add_hosts(hosts_path: &Path, entries: &[AddHostEntry]) -> Result<(), NetError> {
+pub fn append_add_hosts(
+    managed_root: &Path,
+    hosts_rel: &Path,
+    entries: &[AddHostEntry],
+) -> Result<(), NetError> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -360,16 +453,8 @@ pub fn append_add_hosts(hosts_path: &Path, entries: &[AddHostEntry]) -> Result<(
     if entries.len() > MAX_ADD_HOST_ENTRIES {
         return Err(InputViolation::TooManyAddHosts.into());
     }
-    // パス要素の検証: `..` による管理下ディレクトリからの脱出を拒否する。
-    if hosts_path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(NetError::new(
-            NetErrorCode::InvalidArgument,
-            "hosts path must not contain parent directory components",
-        ));
-    }
+    let (root, hosts_path) = resolve_in_root(managed_root, hosts_rel)?;
+    let hosts_path = hosts_path.as_path();
     let meta = match std::fs::symlink_metadata(hosts_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -391,6 +476,7 @@ pub fn append_add_hosts(hosts_path: &Path, entries: &[AddHostEntry]) -> Result<(
         .append(true)
         .open(hosts_path)
         .map_err(|_| io_err("failed to open hosts file"))?;
+    verify_within_root(&root, hosts_path)?;
     // 長さ取得・末尾改行判定・上限判定・追記を 1 つの排他区間にする（並行追記による上限超過・
     // 古い末尾内容に基づく改行判定を防ぐ）。ロックは file の Drop で解放される。
     let deadline = Instant::now() + HOSTS_LOCK_TIMEOUT;
@@ -429,9 +515,7 @@ pub fn append_add_hosts(hosts_path: &Path, entries: &[AddHostEntry]) -> Result<(
         .write_all(payload.as_bytes())
         .and_then(|_| file.sync_all());
     if written.is_err() {
-        // 巻き戻し失敗も元の書き込み失敗と同じ内部エラーで返す（best effort）。
-        let _ = file.set_len(len);
-        return Err(io_err("failed to write hosts file"));
+        return Err(rollback_after_failure(&file, len));
     }
     Ok(())
 }
@@ -440,17 +524,18 @@ pub fn append_add_hosts(hosts_path: &Path, entries: &[AddHostEntry]) -> Result<(
 ///
 /// 検証が全件通るまでファイルを開かないため、検証失敗時に hosts ファイルは変更されない。
 /// 計測しない呼び出し口で、成否・所要時間を記録するには [`apply_add_hosts_with_recorder`] を使う。
-pub fn apply_add_hosts<'a, I>(hosts_path: &Path, raw: I) -> Result<(), NetError>
+pub fn apply_add_hosts<'a, I>(managed_root: &Path, hosts_rel: &Path, raw: I) -> Result<(), NetError>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    apply_add_hosts_with_recorder(hosts_path, raw, &NoopNetOpRecorder)
+    apply_add_hosts_with_recorder(managed_root, hosts_rel, raw, &NoopNetOpRecorder)
 }
 
 /// [`apply_add_hosts`] に計装を付けた入口（REPAIR-4）。検証から追記・fsync までの成否と所要時間を
 /// `NetOpKind::AddHostsApply` として `recorder` へ渡す（入力値・パスは記録しない）。
 pub fn apply_add_hosts_with_recorder<'a, I>(
-    hosts_path: &Path,
+    managed_root: &Path,
+    hosts_rel: &Path,
     raw: I,
     recorder: &dyn NetOpRecorder,
 ) -> Result<(), NetError>
@@ -459,7 +544,7 @@ where
 {
     record_net_op(recorder, NetOpKind::AddHostsApply, || {
         let entries = parse_add_hosts(raw)?;
-        append_add_hosts(hosts_path, &entries)
+        append_add_hosts(managed_root, hosts_rel, &entries)
     })
 }
 
@@ -698,30 +783,41 @@ mod tests {
         assert_eq!(render_hosts_lines(&[]), "");
     }
 
-    struct TmpFile(std::path::PathBuf);
+    /// ケースごとの一時管理ルート。`.0` は管理ルート配下の hosts ファイルの絶対パス（相対名は `hosts`）。
+    struct TmpFile {
+        root: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
     impl TmpFile {
         fn new(case: &str, content: Option<&str>) -> Self {
-            let p = std::env::temp_dir().join(format!("fc-addhost-{}-{case}", std::process::id()));
-            let _ = std::fs::remove_file(&p);
+            let root =
+                std::env::temp_dir().join(format!("fc-addhost-{}-{case}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("hosts");
             if let Some(c) = content {
-                std::fs::write(&p, c).unwrap();
+                std::fs::write(&path, c).unwrap();
             }
-            Self(p)
+            Self { root, path }
         }
     }
     impl Drop for TmpFile {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn run<'a>(f: &TmpFile, raw: impl IntoIterator<Item = &'a str>) -> Result<(), NetError> {
+        apply_add_hosts(&f.root, Path::new("hosts"), raw)
     }
 
     /// NET-12・TASK-185.2: 既存内容の後ろへ追記される。
     #[test]
     fn append_to_existing_file() {
         let f = TmpFile::new("append", Some("127.0.0.1\tlocalhost\n"));
-        apply_add_hosts(&f.0, ["web:192.0.2.1", "db:::1"]).unwrap();
+        run(&f, ["web:192.0.2.1", "db:::1"]).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&f.0).unwrap(),
+            std::fs::read_to_string(&f.path).unwrap(),
             "127.0.0.1\tlocalhost\n192.0.2.1\tweb\n::1\tdb\n"
         );
     }
@@ -730,9 +826,9 @@ mod tests {
     #[test]
     fn append_adds_missing_newline() {
         let f = TmpFile::new("nonl", Some("127.0.0.1\tlocalhost"));
-        apply_add_hosts(&f.0, ["web:192.0.2.1"]).unwrap();
+        run(&f, ["web:192.0.2.1"]).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&f.0).unwrap(),
+            std::fs::read_to_string(&f.path).unwrap(),
             "127.0.0.1\tlocalhost\n192.0.2.1\tweb\n"
         );
     }
@@ -741,11 +837,14 @@ mod tests {
     #[test]
     fn append_empty_file_and_empty_entries() {
         let f = TmpFile::new("empty", Some(""));
-        apply_add_hosts(&f.0, ["web:192.0.2.1"]).unwrap();
-        assert_eq!(std::fs::read_to_string(&f.0).unwrap(), "192.0.2.1\tweb\n");
+        run(&f, ["web:192.0.2.1"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f.path).unwrap(),
+            "192.0.2.1\tweb\n"
+        );
         let g = TmpFile::new("noentries", Some("x"));
-        apply_add_hosts(&g.0, std::iter::empty()).unwrap();
-        assert_eq!(std::fs::read_to_string(&g.0).unwrap(), "x");
+        run(&g, std::iter::empty()).unwrap();
+        assert_eq!(std::fs::read_to_string(&g.path).unwrap(), "x");
     }
 
     /// NET-12: append_add_hosts 単体でも件数上限を検証し、ファイルを変更しない。
@@ -754,9 +853,9 @@ mod tests {
         let f = TmpFile::new("toomany", Some("x\n"));
         let one = AddHostEntry::parse("h:192.0.2.1").unwrap();
         let entries = vec![one; MAX_ADD_HOST_ENTRIES + 1];
-        let e = append_add_hosts(&f.0, &entries).unwrap_err();
+        let e = append_add_hosts(&f.root, Path::new("hosts"), &entries).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::InvalidArgument);
-        assert_eq!(std::fs::read(&f.0).unwrap(), b"x\n");
+        assert_eq!(std::fs::read(&f.path).unwrap(), b"x\n");
     }
 
     /// NET-12: 追記後に上限を超えるファイルは拒否し、ちょうど上限に収まる場合は許可する。
@@ -766,22 +865,22 @@ mod tests {
         let max = MAX_HOSTS_FILE_BYTES as usize;
         let ok = TmpFile::new("fits", Some(&"a".repeat(max - line.len() - 1)));
         // 末尾改行なし: 改行 1 + 行 12 でちょうど上限。
-        apply_add_hosts(&ok.0, ["h:192.0.2.1"]).unwrap();
+        run(&ok, ["h:192.0.2.1"]).unwrap();
         assert_eq!(
-            std::fs::metadata(&ok.0).unwrap().len(),
+            std::fs::metadata(&ok.path).unwrap().len(),
             MAX_HOSTS_FILE_BYTES
         );
 
         let full = TmpFile::new("full", Some(&"a".repeat(max)));
-        let e = apply_add_hosts(&full.0, ["h:192.0.2.1"]).unwrap_err();
+        let e = run(&full, ["h:192.0.2.1"]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
         assert_eq!(
-            std::fs::metadata(&full.0).unwrap().len(),
+            std::fs::metadata(&full.path).unwrap().len(),
             MAX_HOSTS_FILE_BYTES
         );
 
         let near = TmpFile::new("near", Some(&"a".repeat(max - line.len())));
-        let e = apply_add_hosts(&near.0, ["h:192.0.2.1"]).unwrap_err();
+        let e = run(&near, ["h:192.0.2.1"]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
     }
 
@@ -789,15 +888,17 @@ mod tests {
     #[test]
     fn missing_file_is_not_created() {
         let f = TmpFile::new("missing", None);
-        let e = apply_add_hosts(&f.0, ["web:192.0.2.1"]).unwrap_err();
+        let e = run(&f, ["web:192.0.2.1"]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::NotFound);
-        assert!(!f.0.exists());
+        assert!(!f.path.exists());
     }
 
     /// NET-12: ディレクトリ（非通常ファイル）は INVALID_ARGUMENT。
     #[test]
     fn directory_is_rejected() {
-        let e = apply_add_hosts(&std::env::temp_dir(), ["web:192.0.2.1"]).unwrap_err();
+        let f = TmpFile::new("dir", None);
+        std::fs::create_dir(f.root.join("sub")).unwrap();
+        let e = apply_add_hosts(&f.root, Path::new("sub"), ["web:192.0.2.1"]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::InvalidArgument);
     }
 
@@ -807,10 +908,10 @@ mod tests {
     fn symlink_is_rejected() {
         let target = TmpFile::new("symtarget", Some("orig\n"));
         let link = TmpFile::new("symlink", None);
-        std::os::unix::fs::symlink(&target.0, &link.0).unwrap();
-        let e = apply_add_hosts(&link.0, ["web:192.0.2.1"]).unwrap_err();
+        std::os::unix::fs::symlink(&target.path, &link.path).unwrap();
+        let e = run(&link, ["web:192.0.2.1"]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::InvalidArgument);
-        assert_eq!(std::fs::read_to_string(&target.0).unwrap(), "orig\n");
+        assert_eq!(std::fs::read_to_string(&target.path).unwrap(), "orig\n");
     }
 
     /// NET-12: ハードリンクされたファイルへは追記せず、リンク先も変更しない。
@@ -819,24 +920,77 @@ mod tests {
     fn hard_link_is_rejected() {
         let target = TmpFile::new("hltarget", Some("orig\n"));
         let link = TmpFile::new("hllink", None);
-        std::fs::hard_link(&target.0, &link.0).unwrap();
-        let e = apply_add_hosts(&link.0, ["web:192.0.2.1"]).unwrap_err();
+        std::fs::hard_link(&target.path, &link.path).unwrap();
+        let e = run(&link, ["web:192.0.2.1"]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
-        assert_eq!(std::fs::read_to_string(&target.0).unwrap(), "orig\n");
+        assert_eq!(std::fs::read_to_string(&target.path).unwrap(), "orig\n");
     }
 
-    /// NET-12: `..` を含むパスは拒否し、ファイルを変更しない。
+    /// NET-12・P0: 管理ルート外を指す相対パス（`..`・絶対パス・`.`・空）は拒否し、ファイルを変更しない。
     #[test]
-    fn parent_dir_component_is_rejected() {
-        let f = TmpFile::new("dotdot", Some("orig\n"));
-        let dir = std::env::temp_dir();
-        let p = dir
-            .join("..")
-            .join(dir.file_name().unwrap())
-            .join(f.0.file_name().unwrap());
-        let e = apply_add_hosts(&p, ["web:192.0.2.1"]).unwrap_err();
+    fn paths_escaping_managed_root_are_rejected() {
+        let outside = TmpFile::new("outside", Some("orig\n"));
+        let f = TmpFile::new("inside", Some("in\n"));
+        let up = Path::new("..")
+            .join(outside.root.file_name().unwrap())
+            .join("hosts");
+        for rel in [
+            up.as_path(),
+            outside.path.as_path(), // 絶対パス（管理ルート外）
+            Path::new("./hosts"),
+            Path::new(""),
+        ] {
+            let e = apply_add_hosts(&f.root, rel, ["web:192.0.2.1"]).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument, "{rel:?}");
+        }
+        assert_eq!(std::fs::read_to_string(&outside.path).unwrap(), "orig\n");
+        assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "in\n");
+    }
+
+    /// NET-12・P0: 管理ルート配下でも途中ディレクトリが管理外への symlink なら拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_component_is_rejected() {
+        let outside = TmpFile::new("symdir-out", Some("orig\n"));
+        let f = TmpFile::new("symdir-in", None);
+        std::os::unix::fs::symlink(&outside.root, f.root.join("link")).unwrap();
+        let e = apply_add_hosts(&f.root, Path::new("link/hosts"), ["web:192.0.2.1"]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::InvalidArgument);
-        assert_eq!(std::fs::read_to_string(&f.0).unwrap(), "orig\n");
+        assert_eq!(std::fs::read_to_string(&outside.path).unwrap(), "orig\n");
+    }
+
+    /// NET-12: 管理ルート配下のサブディレクトリの hosts ファイルには追記できる。
+    #[test]
+    fn nested_relative_path_inside_root_is_accepted() {
+        let f = TmpFile::new("nested", None);
+        std::fs::create_dir(f.root.join("c1")).unwrap();
+        std::fs::write(f.root.join("c1").join("hosts"), "a\n").unwrap();
+        apply_add_hosts(&f.root, Path::new("c1/hosts"), ["web:192.0.2.1"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("c1").join("hosts")).unwrap(),
+            "a\n192.0.2.1\tweb\n"
+        );
+    }
+
+    /// NET-12・P1: 巻き戻しに失敗したら `DATA_LOSS`（復旧不能）で区別して返す。
+    #[test]
+    fn rollback_failure_is_reported_as_data_loss() {
+        let f = TmpFile::new("rollback-fail", Some("abc\n"));
+        // 読み取り専用 fd では set_len が失敗する。
+        let ro = File::open(&f.path).unwrap();
+        let e = rollback_after_failure(&ro, 0);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(std::fs::read(&f.path).unwrap(), b"abc\n");
+    }
+
+    /// NET-12・P1: 巻き戻しに成功したら元の長さに戻り、通常の `INTERNAL` を返す。
+    #[test]
+    fn rollback_success_restores_length_and_is_internal() {
+        let f = TmpFile::new("rollback-ok", Some("abc\npartial"));
+        let rw = OpenOptions::new().write(true).open(&f.path).unwrap();
+        let e = rollback_after_failure(&rw, 4);
+        assert_eq!(e.code(), NetErrorCode::Internal);
+        assert_eq!(std::fs::read(&f.path).unwrap(), b"abc\n");
     }
 
     /// NET-12・TASK-185.2 受け入れ基準: 検証失敗時に hosts ファイルは 1 バイトも変わらない。
@@ -853,9 +1007,9 @@ mod tests {
             &["ok:192.0.2.1", "h:"],
         ];
         for c in cases {
-            let e = apply_add_hosts(&f.0, c.iter().copied()).unwrap_err();
+            let e = run(&f, c.iter().copied()).unwrap_err();
             assert_eq!(e.code(), NetErrorCode::InvalidArgument, "{c:?}");
-            assert_eq!(std::fs::read(&f.0).unwrap(), init.as_bytes(), "{c:?}");
+            assert_eq!(std::fs::read(&f.path).unwrap(), init.as_bytes(), "{c:?}");
         }
     }
 
@@ -866,8 +1020,9 @@ mod tests {
         use crate::instrument::testing::Collect;
         let f = TmpFile::new("record", Some("127.0.0.1\tlocalhost\n"));
         let c = Collect::default();
-        apply_add_hosts_with_recorder(&f.0, ["web:192.0.2.1"], &c).unwrap();
-        apply_add_hosts_with_recorder(&f.0, ["bad host:192.0.2.1"], &c).unwrap_err();
+        apply_add_hosts_with_recorder(&f.root, Path::new("hosts"), ["web:192.0.2.1"], &c).unwrap();
+        apply_add_hosts_with_recorder(&f.root, Path::new("hosts"), ["bad host:192.0.2.1"], &c)
+            .unwrap_err();
         assert_eq!(
             c.kinds(),
             vec![
@@ -881,13 +1036,14 @@ mod tests {
     #[test]
     fn concurrent_appends_are_serialized() {
         let f = TmpFile::new("concurrent", Some(""));
-        let path = f.0.clone();
+        let path = f.path.clone();
+        let root = f.root.clone();
         let handles: Vec<_> = (0..8)
             .map(|i| {
-                let p = path.clone();
+                let p = root.clone();
                 std::thread::spawn(move || {
                     let v = format!("h{i}:192.0.2.{i}");
-                    apply_add_hosts(&p, [v.as_str()]).unwrap();
+                    apply_add_hosts(&p, Path::new("hosts"), [v.as_str()]).unwrap();
                 })
             })
             .collect();

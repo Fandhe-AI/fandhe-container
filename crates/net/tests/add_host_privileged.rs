@@ -338,7 +338,8 @@ mod linux {
         let hosts = base.join("hosts");
         fs::write(&hosts, INITIAL_HOSTS).map_err(|e| fail(format!("write hosts: {e}")))?;
         apply_add_hosts(
-            &hosts,
+            base,
+            std::path::Path::new("hosts"),
             ["fc-addhost-v4:192.0.2.10", "fc-addhost-v6:2001:db8::10"],
         )?;
         let hosts_str = hosts

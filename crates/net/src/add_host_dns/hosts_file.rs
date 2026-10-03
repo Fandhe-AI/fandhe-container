@@ -542,6 +542,35 @@ mod tests {
         );
     }
 
+    /// NET-12・TASK-185.2（P0）: 最終要素が管理ルート内の別ファイルへの symlink でも追従せず拒否し、
+    /// どちらのファイルも変更しない（symlink を辿る経路が無いこと）。
+    #[test]
+    fn symlink_to_file_inside_root_is_rejected() {
+        let f = TmpFile::new("inner-symlink", Some("orig\n"));
+        std::os::unix::fs::symlink(&f.path, f.root.join("alias")).unwrap();
+        let e = apply_add_hosts(&f.root, Path::new("alias"), ["web:192.0.2.1"]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "hosts path is not a regular file");
+        assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "orig\n");
+    }
+
+    /// NET-12・TASK-185.2（P0）: 途中要素が通常ファイルなら辿らず `INVALID_ARGUMENT`、途中が不在なら
+    /// `NOT_FOUND`（いずれも何も作らない）。
+    #[test]
+    fn non_directory_or_missing_component_is_rejected() {
+        let f = TmpFile::new("nondir", Some("orig\n"));
+        let e = apply_add_hosts(&f.root, Path::new("hosts/x"), ["web:192.0.2.1"]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        assert_eq!(
+            e.message(),
+            "hosts path has a non-directory or symlink component"
+        );
+        let e = apply_add_hosts(&f.root, Path::new("nodir/hosts"), ["web:192.0.2.1"]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::NotFound);
+        assert!(!f.root.join("nodir").exists());
+        assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "orig\n");
+    }
+
     /// NET-12・P1: 巻き戻しに失敗したら `DATA_LOSS`（復旧不能）で区別して返す。
     #[test]
     fn rollback_failure_is_reported_as_data_loss() {

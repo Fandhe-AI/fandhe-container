@@ -560,4 +560,27 @@ mod tests {
         assert_eq!(e.code(), NetErrorCode::InvalidArgument);
         assert_eq!(e.message(), "invalid add-host: too many entries");
     }
+
+    /// NET-12・TASK-185.2: Linux 以外では追記せず `UNIMPLEMENTED`（fail-closed）。空エントリは何もせず成功。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn append_is_unimplemented_outside_linux() {
+        let root = std::env::temp_dir().join(format!("fc-addhost-nl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let hosts = root.join("hosts");
+        std::fs::write(&hosts, "orig\n").unwrap();
+        let e = apply_add_hosts(&root, Path::new("hosts"), ["web:192.0.2.1"]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::Unimplemented);
+        assert_eq!(
+            e.message(),
+            "appending to hosts file is only supported on Linux"
+        );
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), "orig\n");
+        assert_eq!(
+            apply_add_hosts(&root, Path::new("hosts"), std::iter::empty()),
+            Ok(())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

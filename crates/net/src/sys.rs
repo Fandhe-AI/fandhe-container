@@ -1007,4 +1007,59 @@ mod tests {
         );
         assert_eq!(poll_timeout_ms(Duration::MAX), i32::MAX);
     }
+
+    /// NET-12・TASK-185.2: openat ラッパーは 1 要素の名前だけを受け付け、symlink・不在・種別違いを
+    /// errno で返す（作成しない）。相対パスの起点は拒否する。
+    #[test]
+    fn openat_wrappers_follow_no_symlink_and_create_nothing() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = std::env::temp_dir().join(format!("fc-net-sys-openat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("f"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.join("f"), dir.join("lnk")).unwrap();
+        std::os::unix::fs::symlink(dir.join("sub"), dir.join("dlnk")).unwrap();
+        let abs = CString::new(dir.as_os_str().as_bytes()).unwrap();
+        let root = open_dir_nofollow(&abs).unwrap();
+        let r = root.as_fd();
+
+        assert!(open_dir_nofollow_at(r, c"sub").is_ok());
+        assert!(open_append_nofollow_at(r, c"f").is_ok());
+        assert_eq!(
+            open_append_nofollow_at(r, c"lnk").err(),
+            Some(SysError::Os(ELOOP))
+        );
+        // O_DIRECTORY と O_NOFOLLOW の併用では、ディレクトリへの symlink は ENOTDIR になる（Linux）。
+        assert_eq!(
+            open_dir_nofollow_at(r, c"dlnk").err(),
+            Some(SysError::Os(ENOTDIR))
+        );
+        assert_eq!(
+            open_dir_nofollow_at(r, c"f").err(),
+            Some(SysError::Os(ENOTDIR))
+        );
+        assert_eq!(
+            open_append_nofollow_at(r, c"sub").err(),
+            Some(SysError::Os(EISDIR))
+        );
+        assert_eq!(
+            open_append_nofollow_at(r, c"none").err(),
+            Some(SysError::Os(ENOENT))
+        );
+        assert!(!dir.join("none").exists());
+        for bad in [c"", c".", c"..", c"sub/x", c"dlnk/x"] {
+            assert_eq!(
+                open_dir_nofollow_at(r, bad).err(),
+                Some(SysError::Os(EINVAL))
+            );
+            assert_eq!(
+                open_append_nofollow_at(r, bad).err(),
+                Some(SysError::Os(EINVAL))
+            );
+        }
+        assert_eq!(open_dir_nofollow(c"tmp").err(), Some(SysError::Os(EINVAL)));
+        assert_eq!(std::fs::read(dir.join("f")).unwrap(), b"x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

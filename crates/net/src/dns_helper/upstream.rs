@@ -691,7 +691,10 @@ impl QueryHandler for ForwardingHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns_helper::{DnsHelperServer, DnsListenAddr, DnsName, MAX_RESPONSE_GROWTH};
+    use crate::dns_helper::{
+        DnsHelperServer, DnsListenAddr, DnsName, MAX_INFLIGHT_DEFERRED, MAX_RESPONSE_GROWTH,
+    };
+    use std::net::SocketAddrV4;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::thread;
@@ -1282,5 +1285,135 @@ mod tests {
         // 未知の型（TXT=16）は RDLENGTH の境界検査のみ。
         let (ok, q) = reply_with(&[0xC0, 12], 16, &[3, b'a', b'b', b'c']);
         assert!(validate_upstream_reply(&ok, 7, &q));
+    }
+
+    /// NET-12: 転送するクエリは respond_from が上流を待たずに Defer を返し、上流へは respond_deferred で初めて送る。
+    #[test]
+    fn respond_from_defers_forwarding_to_worker() {
+        let up = MockUpstream::start(Ipv4Addr::new(198, 51, 100, 1), 1, true);
+        let (h, _) = handler_with(&[(PEER1, up.addr)]);
+        let pkt = query(0x6161, EXTERNAL, 1, 0);
+        let header = DnsHeader::parse(&pkt).unwrap();
+        let mut out = ResponseBuf::new();
+        assert_eq!(
+            h.respond_from(sa(PEER1), &header, &pkt, &mut out),
+            HandlerOutcome::Defer
+        );
+        assert_eq!(out.as_bytes(), &[] as &[u8]);
+        assert_eq!(up.count(), 0);
+        let o = h.respond_deferred(sa(PEER1), &header, &pkt, &mut out);
+        assert_eq!(o, HandlerOutcome::RespondForwarded(ForwardedProof(())));
+        assert_eq!(&out.as_bytes()[..2], &[0x61, 0x61]);
+        assert_eq!(answer_ip(out.as_bytes()), Ipv4Addr::new(198, 51, 100, 1));
+        assert_eq!(up.count(), 1);
+        // 未登録の送信元は Defer にせず、その場で REFUSED。
+        let mut out = ResponseBuf::new();
+        assert_eq!(
+            h.respond_from(sa(PEER3), &header, &pkt, &mut out),
+            HandlerOutcome::Respond
+        );
+        assert_eq!(out.as_bytes()[3] & 0x0F, 5);
+    }
+
+    /// serve をスレッドで動かし、(停止フラグ, join ハンドル, 待受アドレス) を返す。
+    fn spawn_serve(
+        h: ForwardingHandler,
+    ) -> (
+        Arc<AtomicBool>,
+        thread::JoinHandle<DnsHelperServer>,
+        SocketAddrV4,
+    ) {
+        let mut server =
+            DnsHelperServer::bind(DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).unwrap()).unwrap();
+        let addr = server.local_addr();
+        let stop = Arc::new(AtomicBool::new(false));
+        let st = Arc::clone(&stop);
+        let join = thread::spawn(move || {
+            server.serve(&h, &st).unwrap();
+            server
+        });
+        (stop, join, addr)
+    }
+
+    fn client() -> UdpSocket {
+        let c = UdpSocket::bind("127.0.0.1:0").unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    }
+
+    /// NET-5・NET-12: 応答しない上流への転送中も、受信ループは塞がらずレジストリの名前へ即答する（head-of-line
+    /// blocking なし）。停止は処理中のワーカーの終了（SERVFAIL の送信）を待ってから全体期限内に返る（REPAIR-5）。
+    #[test]
+    fn serve_answers_registry_while_forward_in_flight() {
+        let silent = MockUpstream::start(Ipv4Addr::new(198, 51, 100, 1), 1, false);
+        let (h, reg) = handler_with(&[(Ipv4Addr::LOCALHOST, silent.addr)]);
+        reg.register(
+            &DnsName::new("svc-a").unwrap(),
+            Ipv4Addr::new(10, 215, 0, 9),
+        )
+        .unwrap();
+        let (stop, join, addr) = spawn_serve(h);
+        let (slow, fast) = (client(), client());
+        slow.send_to(&query(0x0A0A, EXTERNAL, 1, 0), addr).unwrap();
+        // ワーカーが上流へ送るまで待ってから、レジストリの名前を問い合わせる。
+        let t = Instant::now();
+        while silent.count() == 0 {
+            assert!(t.elapsed() < Duration::from_secs(5), "forward not started");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let t = Instant::now();
+        fast.send_to(&query(0x0B0B, SVC_A, 1, 0), addr).unwrap();
+        let mut buf = [0u8; 600];
+        let (n, _) = fast.recv_from(&mut buf).unwrap();
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "registry reply took {:?}",
+            t.elapsed()
+        );
+        assert_eq!(&buf[..2], &[0x0B, 0x0B]);
+        assert_eq!(answer_ip(&buf[..n]), Ipv4Addr::new(10, 215, 0, 9));
+        // 停止は処理中のワーカーを待つが、全体期限内に返る。
+        let t = Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        let server = join.join().unwrap();
+        assert!(t.elapsed() <= FORWARD_TOTAL_DEADLINE + Duration::from_millis(500));
+        let (n, _) = slow.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..2], &[0x0A, 0x0A]);
+        assert_eq!(
+            (buf[3] & 0x0F, n),
+            (2, HEADER_LEN + EXTERNAL.len() + 4),
+            "SERVFAIL"
+        );
+        let st = server.stats();
+        assert_eq!((st.answered, st.forwarded, st.deferred_dropped), (2, 0, 0));
+    }
+
+    /// NET-12: 同時に処理する転送は MAX_INFLIGHT_DEFERRED（16）件までで、超過分は応答せず破棄して数える。
+    #[test]
+    fn serve_bounds_inflight_forwards() {
+        assert_eq!(MAX_INFLIGHT_DEFERRED, 16);
+        let silent = MockUpstream::start(Ipv4Addr::new(198, 51, 100, 1), 1, false);
+        let (h, _) = handler_with(&[(Ipv4Addr::LOCALHOST, silent.addr)]);
+        let (stop, join, addr) = spawn_serve(h);
+        let c = client();
+        for i in 0..=MAX_INFLIGHT_DEFERRED {
+            let id = u16::try_from(i).unwrap();
+            c.send_to(&query(id, EXTERNAL, 1, 0), addr).unwrap();
+        }
+        let mut buf = [0u8; 600];
+        let mut ids = Vec::new();
+        for _ in 0..MAX_INFLIGHT_DEFERRED {
+            let (_, _) = c.recv_from(&mut buf).unwrap();
+            assert_eq!(buf[3] & 0x0F, 2, "SERVFAIL");
+            ids.push(u16::from_be_bytes([buf[0], buf[1]]));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let server = join.join().unwrap();
+        ids.sort_unstable();
+        let expected: Vec<u16> = (0..u16::try_from(MAX_INFLIGHT_DEFERRED).unwrap()).collect();
+        assert_eq!(ids, expected, "the 17th query is the one dropped");
+        let st = server.stats();
+        assert_eq!((st.received, st.answered, st.deferred_dropped), (17, 16, 1));
+        assert_eq!(silent.count(), MAX_INFLIGHT_DEFERRED);
     }
 }

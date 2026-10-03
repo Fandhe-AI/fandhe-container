@@ -541,6 +541,9 @@ jobs:
       # スタブ exe の固定 JSONL だけで集計値と異常系を照合し、実 netns・root は使わない（実測は TASK-140）
       - name: ネットワーク作成/接続/削除の所要時間計測スクリプトの自己テスト（TASK-139.5・NET-4・REPAIR-12）
         run: make net-setup-timing-selftest
+      # スタブ exe・疑似 cgroup・疑似 /proc だけで集計値と PID 取得の異常系を照合し、実 netns・実 cgroup・root は使わない（実測は TASK-142）
+      - name: DNS ヘルパー計測スクリプトの自己テスト（TASK-141.3・NET-5・REPAIR-12）
+        run: make dns-helper-measure-selftest
       # 疑似 /proc（mktemp -d 配下）だけで照合し、ランナーの実プロセスは計測しない。
       # 非 root で実行されるため chmod 000 を使う読み取り失敗ケースも実行される
       - name: アイドル時常駐メモリ計測スクリプトの自己テスト（TASK-45.1・CORE-7・SUP-1・REPAIR-12）

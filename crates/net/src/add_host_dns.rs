@@ -284,6 +284,10 @@ pub fn append_add_hosts(hosts_path: &Path, entries: &[AddHostEntry]) -> Result<(
     if entries.is_empty() {
         return Ok(());
     }
+    // 公開 API 単体でも件数を上限検証する（parse_add_hosts を経由しない呼び出しでの無制限確保を防ぐ）。
+    if entries.len() > MAX_ADD_HOST_ENTRIES {
+        return Err(InputViolation::TooManyAddHosts.into());
+    }
     let meta = match std::fs::symlink_metadata(hosts_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -322,6 +326,16 @@ pub fn append_add_hosts(hosts_path: &Path, entries: &[AddHostEntry]) -> Result<(
         }
     }
     payload.push_str(&render_hosts_lines(entries));
+    // 追記後のファイルサイズが上限を超える場合は書き込まない（既存 1 MiB ちょうどへの追記も拒否）。
+    let new_len = u64::try_from(payload.len())
+        .ok()
+        .and_then(|p| len.checked_add(p));
+    if new_len.is_none_or(|n| n > MAX_HOSTS_FILE_BYTES) {
+        return Err(NetError::new(
+            NetErrorCode::ResourceExhausted,
+            "hosts file would exceed size limit",
+        ));
+    }
     file.write_all(payload.as_bytes())
         .and_then(|_| file.sync_all())
         .map_err(|_| io_err("failed to write hosts file"))
@@ -621,6 +635,43 @@ mod tests {
         let g = TmpFile::new("noentries", Some("x"));
         apply_add_hosts(&g.0, std::iter::empty()).unwrap();
         assert_eq!(std::fs::read_to_string(&g.0).unwrap(), "x");
+    }
+
+    /// NET-12: append_add_hosts 単体でも件数上限を検証し、ファイルを変更しない。
+    #[test]
+    fn append_rejects_too_many_entries() {
+        let f = TmpFile::new("toomany", Some("x\n"));
+        let one = AddHostEntry::parse("h:192.0.2.1").unwrap();
+        let entries = vec![one; MAX_ADD_HOST_ENTRIES + 1];
+        let e = append_add_hosts(&f.0, &entries).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        assert_eq!(std::fs::read(&f.0).unwrap(), b"x\n");
+    }
+
+    /// NET-12: 追記後に上限を超えるファイルは拒否し、ちょうど上限に収まる場合は許可する。
+    #[test]
+    fn append_rejects_growth_beyond_size_limit() {
+        let line = "192.0.2.1\th\n"; // 12 バイト
+        let max = MAX_HOSTS_FILE_BYTES as usize;
+        let ok = TmpFile::new("fits", Some(&"a".repeat(max - line.len() - 1)));
+        // 末尾改行なし: 改行 1 + 行 12 でちょうど上限。
+        apply_add_hosts(&ok.0, ["h:192.0.2.1"]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&ok.0).unwrap().len(),
+            MAX_HOSTS_FILE_BYTES
+        );
+
+        let full = TmpFile::new("full", Some(&"a".repeat(max)));
+        let e = apply_add_hosts(&full.0, ["h:192.0.2.1"]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(
+            std::fs::metadata(&full.0).unwrap().len(),
+            MAX_HOSTS_FILE_BYTES
+        );
+
+        let near = TmpFile::new("near", Some(&"a".repeat(max - line.len())));
+        let e = apply_add_hosts(&near.0, ["h:192.0.2.1"]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
     }
 
     /// NET-12: 存在しないパスは NOT_FOUND で、ファイルを作らない。

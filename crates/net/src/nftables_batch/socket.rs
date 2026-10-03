@@ -28,8 +28,9 @@ use std::time::Duration;
 
 use super::ack::{NFT_MSG_GETGEN, NftBatchAck, NftBatchAckCollector, NftBatchError, Progress};
 use super::{
-    BATCH_MARKER_LEN, MAX_BATCH_LEN, NFNL_SUBSYS_NFTABLES, NFPROTO_UNSPEC, NFT_MSG_NEWTABLE,
-    NfGenMsg, NftBatch, NftBatchBytes, TableGet, TableInfo, nfnl_msg_type,
+    BATCH_MARKER_LEN, ChainGet, ChainInfo, MAX_BATCH_LEN, NFNL_SUBSYS_NFTABLES, NFPROTO_UNSPEC,
+    NFT_MSG_NEWCHAIN, NFT_MSG_NEWTABLE, NfGenMsg, NftBatch, NftBatchBytes, TableGet, TableInfo,
+    nfnl_msg_type,
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
@@ -279,6 +280,31 @@ impl NetlinkNetfilterSocket {
             .find(|m| m.msg_type() == want)
             .ok_or_else(|| NetError::new(NetErrorCode::DataLoss, "no NEWTABLE in table reply"))?;
         TableInfo::decode(msg.payload())
+    }
+
+    /// チェインの policy を `NFT_MSG_GETCHAIN` で照会する（読み取り専用。TASK-148.1・NET-10）。
+    ///
+    /// seq の確保・期限・順番待ちは [`Self::table_info`] と同じ（REPAIR-5）。無ければ `NotFound`、
+    /// 権限不足（`CAP_NET_ADMIN` が必要）は `PermissionDenied` のまま返す。
+    pub fn chain_info(&self, req: &ChainGet, timeout: Duration) -> Result<ChainInfo, NetError> {
+        let deadline = Deadline::after(timeout);
+        let _turn = self.gate.acquire(&deadline, timeout)?;
+        let seq = reserve_first_seq(self.next_seq.load(Ordering::Relaxed));
+        self.next_seq.store(seq_after(seq), Ordering::Relaxed);
+        let reply = self.inner.request_with_seq(
+            Some(seq),
+            req.msg_type(),
+            req.flags(),
+            deadline.remaining(),
+            |b| req.encode(b),
+        )?;
+        let want = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWCHAIN);
+        let msg = reply
+            .messages()
+            .iter()
+            .find(|m| m.msg_type() == want)
+            .ok_or_else(|| NetError::new(NetErrorCode::DataLoss, "no NEWCHAIN in chain reply"))?;
+        ChainInfo::decode(msg.payload())
     }
 
     /// バッチを組み立てて送り、本体メッセージごとの ACK / エラーが揃うまで待つ（NET-11・TASK-137.3）。

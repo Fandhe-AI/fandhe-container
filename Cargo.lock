@@ -55,6 +55,9 @@ dependencies = [
 [[package]]
 name = "fandhe-container-cli"
 version = "0.0.0"
+dependencies = [
+ "fandhe-container-net",
+]
 
 [[package]]
 name = "fandhe-container-compose-convert"

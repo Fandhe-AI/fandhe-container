@@ -140,6 +140,7 @@ flowchart LR
     cli -.->|想定| core
     cli -.->|想定| oci
     cli -.->|想定| stack
+    cli -->|確定| net
     plugin_star["plugin-*（バイナリ群）"] -.->|想定| core
     core -.->|optional・plugin feature| plugin["plugin（境界基盤）"]
     stack -.->|想定| core
@@ -157,6 +158,7 @@ flowchart LR
 | `core` → `io` | `VolumeProvider`（core 実装）がデータパスで I/O 共有層を使う想定（D-14。G2/G3 で確定） | 想定 |
 | `cli` → `core` | 統一 CLI が実行層を呼ぶ想定（G6・TASK-79） | 想定 |
 | `cli` → `oci` | 統一 CLI がイメージ管理を呼ぶ想定（G6・TASK-79） | 想定 |
+| `cli` → `net` | `doctor` が br_netfilter・ホストの `ip filter FORWARD` policy の判定材料を net の読み取り照会（GETCHAIN）で取得する（NET-10・TASK-148.1。workspace 内 path 依存で実装済み。組み合わせ判定・警告は TASK-148.2） | 確定 |
 | `cli` → `stack` | 統一 CLI が TOML スキーマを呼ぶ想定（G6・TASK-155） | 想定 |
 | `plugin-*`（バイナリ群） → `core` | トレイト型（`ContainerRuntime` 等の共通型）を参照する想定（TASK-114〜118） | 想定 |
 | `core` → `plugin`（境界基盤） | core の `plugin` feature（既定で有効）で optional 依存。`--no-default-features` で除外できる（PLUG-3・TASK-111.1・#262）。plugin 候補の探索は core 側の `crates/core/src/plugin_discovery.rs` に実装済み。登録の成果物も core 側に置く想定（TASK-109） | 確定（optional 辺。探索は実装済み・登録は未実装） |

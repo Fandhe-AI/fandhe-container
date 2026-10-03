@@ -219,12 +219,12 @@ fn unescape_mountinfo(field: &str) -> Vec<u8> {
     out
 }
 
-/// `mountinfo` の内容から `dir`（正規化済みの絶対パス）を含むマウントを探し、その伝播が `shared` なら
-/// 拒否する（OS 呼び出しを含まない純粋関数。単体テスト用に分離）。最長一致のマウントポイントを採り、
-/// 同長なら後の行（重ねマウントの最上位）を採る。見つからなければ拒否する（fail-closed）。
-fn check_propagation(mountinfo: &str, dir: &Path) -> Result<(), NetError> {
-    let target = dir.as_os_str().as_bytes();
-    let mut best: Option<(usize, bool)> = None;
+/// `mountinfo` の内容から `path`（正規化済みの絶対パス）を含むマウントの行を空白区切りの欄で返す
+/// （OS 呼び出しを含まない純粋関数）。最長一致のマウントポイントを採り、同長なら後の行（重ねマウントの
+/// 最上位）を採る。見つからなければ `None`。
+fn covering_mount<'a>(mountinfo: &'a str, path: &Path) -> Option<Vec<&'a str>> {
+    let target = path.as_os_str().as_bytes();
+    let mut best: Option<(usize, Vec<&str>)> = None;
     for line in mountinfo.lines() {
         let fields: Vec<&str> = line.split_ascii_whitespace().collect();
         let Some(mp_field) = fields.get(4) else {
@@ -237,25 +237,47 @@ fn check_propagation(mountinfo: &str, dir: &Path) -> Result<(), NetError> {
         if !contains {
             continue;
         }
-        let shared = fields
-            .iter()
-            .skip(6)
-            .take_while(|f| **f != "-")
-            .any(|f| f.starts_with("shared:"));
-        if best.is_none_or(|(len, _)| mp.len() >= len) {
-            best = Some((mp.len(), shared));
+        if best.as_ref().is_none_or(|(len, _)| mp.len() >= *len) {
+            best = Some((mp.len(), fields));
         }
     }
-    match best {
-        Some((_, false)) => Ok(()),
-        Some((_, true)) => Err(NetError::new(
-            NetErrorCode::FailedPrecondition,
-            "netns directory must not be on a shared mount (make it private first)",
-        )),
-        None => Err(NetError::new(
+    best.map(|(_, fields)| fields)
+}
+
+/// `mountinfo`（`/proc/self/mountinfo` の内容）上で `path`（正規化済みの絶対パス）を含むマウントの
+/// ファイルシステム種別（`-` の次の欄。例: `proc`）を返す。該当マウントが無い・欄が欠けている場合は `None`。
+///
+/// パスの存在だけでは分からない「そのパスがどのファイルシステム上にあるか」の確認に使う
+/// （cli の `doctor` が `/proc/sys/net` が procfs 上にあることを確認する。NET-10・TASK-148.1）。
+/// 選び方は netns 置き場の伝播検査と同じ（最長一致・同長は最上位）。OS 呼び出しを含まない純粋関数。
+pub fn covering_mount_fstype(mountinfo: &str, path: &Path) -> Option<String> {
+    let fields = covering_mount(mountinfo, path)?;
+    let sep = fields.iter().position(|f| *f == "-")?;
+    fields.get(sep + 1).map(|f| (*f).to_string())
+}
+
+/// `mountinfo` の内容から `dir`（正規化済みの絶対パス）を含むマウントを探し、その伝播が `shared` なら
+/// 拒否する（OS 呼び出しを含まない純粋関数。単体テスト用に分離）。最長一致のマウントポイントを採り、
+/// 同長なら後の行（重ねマウントの最上位）を採る。見つからなければ拒否する（fail-closed）。
+fn check_propagation(mountinfo: &str, dir: &Path) -> Result<(), NetError> {
+    let Some(fields) = covering_mount(mountinfo, dir) else {
+        return Err(NetError::new(
             NetErrorCode::Internal,
             "mount of netns directory not found in mountinfo",
-        )),
+        ));
+    };
+    let shared = fields
+        .iter()
+        .skip(6)
+        .take_while(|f| **f != "-")
+        .any(|f| f.starts_with("shared:"));
+    if shared {
+        Err(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "netns directory must not be on a shared mount (make it private first)",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1143,6 +1165,31 @@ mod tests {
     fn net1_propagation_check_rejects_unknown_mount() {
         let e = check_propagation("", Path::new("/run/x")).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::Internal);
+    }
+
+    /// NET-10・TASK-148.1: パスを含むマウントの fstype（最長一致・同長は最上位・欄欠けは None）。
+    #[test]
+    fn net10_covering_mount_fstype() {
+        let info = "\
+22 1 8:1 / / rw - ext4 /dev/sda1 rw
+24 22 0:22 / /proc rw,nosuid - proc proc rw
+25 24 0:22 /sys /proc/sys ro,nosuid - proc proc rw
+26 22 0:23 / /procx rw - tmpfs tmpfs rw
+27 22 0:24 / /over rw - proc proc rw
+28 22 0:25 / /over rw - tmpfs tmpfs rw
+29 22 0:26 / /broken rw
+";
+        let fs = |p: &str| covering_mount_fstype(info, Path::new(p));
+        assert_eq!(fs("/proc/sys/net").as_deref(), Some("proc"));
+        assert_eq!(fs("/proc").as_deref(), Some("proc"));
+        // 前方一致だけでは別マウントとみなさない（`/procx` 配下は tmpfs、`/procy` は `/` の ext4）。
+        assert_eq!(fs("/procx/sys/net").as_deref(), Some("tmpfs"));
+        assert_eq!(fs("/procy/sys/net").as_deref(), Some("ext4"));
+        // 同じマウントポイントに重ねた場合は後の行（最上位）。
+        assert_eq!(fs("/over/a").as_deref(), Some("tmpfs"));
+        // `-` 区切りの無い壊れた行は種別を返さない。
+        assert_eq!(fs("/broken/a"), None);
+        assert_eq!(covering_mount_fstype("", Path::new("/proc/sys/net")), None);
     }
 
     /// 8 進エスケープの復号。

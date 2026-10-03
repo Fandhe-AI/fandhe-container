@@ -34,8 +34,11 @@
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
-//! - `NFTA_TABLE_FLAGS`（dormant / owner）、`NFTA_CHAIN_POLICY` / `FLAGS` / `HANDLE`、チェインの handle 指定の削除
-//! - `DELCHAIN`・GET 系・`NFT_MSG_DESTROYTABLE`
+//! - `NFTA_TABLE_FLAGS`（dormant / owner）、`NFTA_CHAIN_POLICY`（書き込み）/ `FLAGS` / `HANDLE`、チェインの handle 指定の削除
+//! - `DELCHAIN`・GETTABLE / GETCHAIN 以外の GET 系（ダンプ要求を含む）・`NFT_MSG_DESTROYTABLE`
+//!
+//! 読み取りは `NFT_MSG_GETCHAIN` と応答の `NFTA_CHAIN_POLICY` の復号のみ実装済み（[`ChainGet`]・[`ChainInfo`]。
+//! TASK-148.1・NET-10。cli の `doctor` がホストの `ip filter FORWARD` チェイン policy を調べるために使う）。
 //! - ARP / Bridge / Netdev の base chain と ingress hook（netdev は `NFTA_HOOK_DEV` が必須）
 //! - ルール（TASK-138）
 
@@ -54,6 +57,8 @@ pub const NFT_MSG_GETTABLE: u8 = 1;
 pub const NFT_MSG_DELTABLE: u8 = 2;
 /// チェイン作成（`NFT_MSG_NEWCHAIN`）。
 pub const NFT_MSG_NEWCHAIN: u8 = 3;
+/// チェイン照会（`NFT_MSG_GETCHAIN`）。
+pub const NFT_MSG_GETCHAIN: u8 = 4;
 /// テーブル名属性（`NFTA_TABLE_NAME`）。
 pub const NFTA_TABLE_NAME: u16 = 1;
 /// テーブルのハンドル属性（`NFTA_TABLE_HANDLE`。`__be64`。カーネルが採番し再利用されない）。
@@ -66,6 +71,12 @@ pub const NFT_USERDATA_MAXLEN: usize = 256;
 pub const NFTA_CHAIN_TABLE: u16 = 1;
 /// チェイン名属性（`NFTA_CHAIN_NAME`）。
 pub const NFTA_CHAIN_NAME: u16 = 3;
+/// base chain の policy 属性（`NFTA_CHAIN_POLICY`。`__be32` の `NF_DROP` / `NF_ACCEPT`）。
+pub const NFTA_CHAIN_POLICY: u16 = 5;
+/// policy 値 drop（`linux/netfilter.h` の `NF_DROP`）。
+pub const NF_DROP: u32 = 0;
+/// policy 値 accept（`NF_ACCEPT`）。
+pub const NF_ACCEPT: u32 = 1;
 /// base chain の hook 指定（ネスト。`NFTA_CHAIN_HOOK`）。
 pub const NFTA_CHAIN_HOOK: u16 = 4;
 /// チェイン種別属性（`NFTA_CHAIN_TYPE`）。
@@ -457,6 +468,130 @@ impl TableInfo {
     }
 }
 
+/// `NFT_MSG_GETCHAIN`。チェインの policy を読み取り専用で照会する（TASK-148.1・NET-10・NET-11）。
+///
+/// [`TableGet`] と同じ単発要求で、ルールセットを変更しない。ホストの `ip filter FORWARD` が
+/// `policy drop` かを調べる cli の `doctor` から呼ばれる。無ければ `-ENOENT`（`NotFound`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainGet {
+    family: NftFamily,
+    table: NftName,
+    chain: NftName,
+}
+
+impl ChainGet {
+    /// 照会対象を指定して作る。
+    pub fn new(family: NftFamily, table: NftName, chain: NftName) -> Self {
+        Self {
+            family,
+            table,
+            chain,
+        }
+    }
+
+    /// `nlmsg_type`。
+    pub fn msg_type(&self) -> u16 {
+        nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_GETCHAIN)
+    }
+
+    /// 操作フラグ（なし。REQUEST / ACK は送信側が付ける）。
+    pub fn flags(&self) -> u16 {
+        0
+    }
+
+    /// nfgenmsg と属性を `b` へ追記する。
+    pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
+        NfGenMsg::new(self.family.nfproto(), 0).put_into(b)?;
+        self.table.put_into(b, NFTA_CHAIN_TABLE)?;
+        self.chain.put_into(b, NFTA_CHAIN_NAME)
+    }
+}
+
+/// base chain の policy（`NFTA_CHAIN_POLICY`）。未知の値を accept / drop に丸めない（fail-closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainPolicy {
+    /// `NF_ACCEPT`。
+    Accept,
+    /// `NF_DROP`。
+    Drop,
+    /// 上記以外のカーネル値。
+    Other(u32),
+}
+
+impl ChainPolicy {
+    /// カーネルの policy 値から変換する。
+    pub fn from_raw(v: u32) -> Self {
+        match v {
+            NF_ACCEPT => Self::Accept,
+            NF_DROP => Self::Drop,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// `NFT_MSG_GETCHAIN` 応答（`NFT_MSG_NEWCHAIN`）から読み取ったチェインの情報（TASK-148.1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainInfo {
+    policy: Option<ChainPolicy>,
+    hook: Option<u32>,
+}
+
+impl ChainInfo {
+    /// base chain の policy。base chain でない（属性が無い）場合は `None`。
+    pub fn policy(&self) -> Option<ChainPolicy> {
+        self.policy
+    }
+
+    /// base chain の hook 番号（`NFTA_HOOK_HOOKNUM`。`NF_INET_*` の値）。hook 属性が無い場合は `None`。
+    ///
+    /// 同名のチェインでも別 hook の base chain でありうるため、policy を転送経路のものとして
+    /// 扱う側（cli の `doctor`。NET-10）はこの値が `NfInetHook::Forward` と一致することを確認する。
+    pub fn hook(&self) -> Option<u32> {
+        self.hook
+    }
+
+    /// 応答ペイロード（nfgenmsg + 属性）を復号する。カーネル由来の外部入力として属性走査で検証し、
+    /// 短い・不正な属性列は `DataLoss`。
+    pub fn decode(payload: &[u8]) -> Result<Self, NetError> {
+        let attrs = payload.get(NFGENMSG_LEN..).ok_or_else(|| {
+            NetError::new(
+                NetErrorCode::DataLoss,
+                "chain reply is shorter than nfgenmsg",
+            )
+        })?;
+        let mut info = Self {
+            policy: None,
+            hook: None,
+        };
+        for attr in crate::netlink::AttrIter::new(attrs) {
+            let attr = attr?;
+            if attr.attr_type() == NFTA_CHAIN_HOOK {
+                for child in attr.nested() {
+                    let child = child?;
+                    if child.attr_type() == NFTA_HOOK_HOOKNUM {
+                        let raw = <[u8; 4]>::try_from(child.payload()).map_err(|_| {
+                            NetError::new(
+                                NetErrorCode::DataLoss,
+                                "NFTA_HOOK_HOOKNUM has an invalid length",
+                            )
+                        })?;
+                        info.hook = Some(u32::from_be_bytes(raw));
+                    }
+                }
+            } else if attr.attr_type() == NFTA_CHAIN_POLICY {
+                let raw = <[u8; 4]>::try_from(attr.payload()).map_err(|_| {
+                    NetError::new(
+                        NetErrorCode::DataLoss,
+                        "NFTA_CHAIN_POLICY has an invalid length",
+                    )
+                })?;
+                info.policy = Some(ChainPolicy::from_raw(u32::from_be_bytes(raw)));
+            }
+        }
+        Ok(info)
+    }
+}
+
 /// nfgenmsg の長さ（family・version・res_id）。
 const NFGENMSG_LEN: usize = 4;
 
@@ -762,6 +897,100 @@ mod tests {
         bad.truncate(2);
         assert_eq!(
             TableInfo::decode(&bad).expect_err("short").code(),
+            NetErrorCode::DataLoss
+        );
+    }
+
+    /// NET-10・TASK-148.1: GETCHAIN はテーブル名とチェイン名だけを持つ読み取り専用の照会（type 0x0A04）。
+    #[test]
+    fn net10_getchain_queries_named_chain() {
+        let g = ChainGet::new(NftFamily::Ipv4, name("filter"), name("FORWARD"));
+        let mut b = NlMsgBuilder::new(g.msg_type(), g.flags() | NLM_F_REQUEST | NLM_F_ACK, 3, 0);
+        g.encode(&mut b).expect("encode");
+        let (ty, fl, _, attrs) = decode(b);
+        assert_eq!(ty, 0x0A04);
+        assert_eq!(fl, RA);
+        assert_eq!(
+            attrs,
+            vec![
+                (1, false, false, b"filter\0".to_vec()),
+                (3, false, false, b"FORWARD\0".to_vec())
+            ]
+        );
+    }
+
+    /// NET-10・TASK-148.1: GETCHAIN 応答から policy を復号し、未知値は Other、壊れた属性は DataLoss。
+    #[test]
+    fn net10_chain_info_decodes_policy() {
+        let reply = |policy: Option<&[u8]>| {
+            let mut p = vec![2u8, 0, 0, 0];
+            let mut put = |ty: u16, data: &[u8]| {
+                p.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
+                p.extend_from_slice(&ty.to_ne_bytes());
+                p.extend_from_slice(data);
+                while p.len() % 4 != 0 {
+                    p.push(0);
+                }
+            };
+            put(3, b"FORWARD\0");
+            if let Some(d) = policy {
+                put(5, d);
+            }
+            p
+        };
+        let pol = |v: u32| ChainInfo::decode(&reply(Some(&v.to_be_bytes()))).expect("decode");
+        assert_eq!(pol(0).policy(), Some(ChainPolicy::Drop));
+        assert_eq!(pol(1).policy(), Some(ChainPolicy::Accept));
+        assert_eq!(pol(7).policy(), Some(ChainPolicy::Other(7)));
+        assert_eq!(
+            ChainInfo::decode(&reply(None)).expect("none").policy(),
+            None
+        );
+        assert_eq!(
+            ChainInfo::decode(&reply(Some(&[0, 0, 0])))
+                .expect_err("len")
+                .code(),
+            NetErrorCode::DataLoss
+        );
+        assert_eq!(
+            ChainInfo::decode(&[2, 0]).expect_err("short").code(),
+            NetErrorCode::DataLoss
+        );
+    }
+
+    /// NET-10・TASK-148.1: GETCHAIN 応答の NFTA_CHAIN_HOOK（ネスト）から hook 番号を復号する。
+    #[test]
+    fn net10_chain_info_decodes_hook() {
+        let reply = |hook: Option<&[u8]>| {
+            let mut p = vec![2u8, 0, 0, 0];
+            // NFTA_CHAIN_HOOK (nested) { NFTA_HOOK_HOOKNUM = data }
+            if let Some(d) = hook {
+                let inner_len = (4 + d.len()) as u16;
+                p.extend_from_slice(&(4 + inner_len).to_ne_bytes());
+                p.extend_from_slice(&(NFTA_CHAIN_HOOK | 0x8000).to_ne_bytes());
+                p.extend_from_slice(&inner_len.to_ne_bytes());
+                p.extend_from_slice(&NFTA_HOOK_HOOKNUM.to_ne_bytes());
+                p.extend_from_slice(d);
+            }
+            p
+        };
+        assert_eq!(
+            ChainInfo::decode(&reply(Some(&2u32.to_be_bytes())))
+                .expect("forward")
+                .hook(),
+            Some(NfInetHook::Forward.value())
+        );
+        assert_eq!(
+            ChainInfo::decode(&reply(Some(&0u32.to_be_bytes())))
+                .expect("prerouting")
+                .hook(),
+            Some(NfInetHook::PreRouting.value())
+        );
+        assert_eq!(ChainInfo::decode(&reply(None)).expect("none").hook(), None);
+        assert_eq!(
+            ChainInfo::decode(&reply(Some(&[0, 0, 2])))
+                .expect_err("len")
+                .code(),
             NetErrorCode::DataLoss
         );
     }

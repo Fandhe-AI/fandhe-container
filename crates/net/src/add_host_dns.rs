@@ -1059,6 +1059,48 @@ mod tests {
         );
     }
 
+    /// NET-12・TASK-185.2（P0）: fdinfo の `mnt_id:` 行だけを数値で取り出し、無い・壊れた値は `None`。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fdinfo_mnt_id_is_parsed_strictly() {
+        let text = "pos:\t0\nflags:\t02102002\nmnt_id:\t39\nino:\t5\n\
+                    lock:\t1: FLOCK  ADVISORY  WRITE 1234 00:2a:5 0 EOF\n";
+        assert_eq!(parse_fdinfo_mnt_id(text), Some(39));
+        assert_eq!(parse_fdinfo_mnt_id("pos:\t0\nflags:\t0100000\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id("mnt_id:\tabc\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id("mnt_id:\t-1\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(""), None);
+    }
+
+    /// NET-12・TASK-185.2（P0）: 管理ルートと同じマウント上のファイルは通す。
+    #[cfg(unix)]
+    #[test]
+    fn same_mount_file_is_accepted() {
+        let f = TmpFile::new("same-mount", Some("a\n"));
+        let file = File::open(&f.path).unwrap();
+        assert_eq!(verify_same_mount(&f.root, &file), Ok(()));
+    }
+
+    /// NET-12・TASK-185.2（P0）: 管理ルートと別マウント上の fd（bind mount で差し込まれた外部ファイル相当）
+    /// は `FAILED_PRECONDITION` で拒否する。Linux は procfs、その他の Unix は devfs 上のファイルを使う
+    /// （root 権限なしで「別マウントの fd」を用意するため）。
+    #[cfg(unix)]
+    #[test]
+    fn foreign_mount_file_is_rejected() {
+        let f = TmpFile::new("foreign-mount", Some("a\n"));
+        let foreign = if cfg!(target_os = "linux") {
+            File::open("/proc/self/status").unwrap()
+        } else {
+            File::open("/dev/null").unwrap()
+        };
+        let e = verify_same_mount(&f.root, &foreign).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "hosts file lives on a mount outside the managed root"
+        );
+    }
+
     /// NET-12・P1: 巻き戻しに失敗したら `DATA_LOSS`（復旧不能）で区別して返す。
     #[test]
     fn rollback_failure_is_reported_as_data_loss() {

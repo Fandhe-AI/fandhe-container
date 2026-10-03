@@ -21,6 +21,8 @@
 //! # 判定不能の扱い（fail-closed）
 //!
 //! 「accept」と「答えが出なかった」を取り違えないよう、取得できなかった場合は独立した値で返す。
+//! `bridge-nf-call-iptables` の `NotFound` も、`/proc/sys/net` を参照できると確認できた場合に限り
+//! 未ロードとし、procfs 未マウント等で確認できなければ `Unknown` とする。
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
@@ -40,6 +42,12 @@ const MAX_PROC_READ: u64 = 4096;
 
 /// `/proc` 配下で br_netfilter の有無を示すパス（root からの相対）。
 const BR_NF_CALL_IPTABLES: &str = "proc/sys/net/bridge/bridge-nf-call-iptables";
+
+/// procfs 自体が参照できることの確認に使うパス（root からの相対）。
+///
+/// procfs が未マウントだと `BR_NF_CALL_IPTABLES` も `NotFound` になり、未ロードと区別できないため、
+/// 常に存在する `/proc/sys/net` を先に確認する。
+const PROC_SYS_NET: &str = "proc/sys/net";
 
 /// iptables-legacy が使うテーブル名の一覧（root からの相対）。
 const IP_TABLES_NAMES: &str = "proc/net/ip_tables_names";
@@ -132,7 +140,22 @@ impl BrNetfilterProbe {
                     _ => None,
                 },
             },
-            Err(e) if e.kind() == ErrorKind::NotFound => BrNetfilterState::NotLoaded,
+            // NotFound は procfs が参照可能と確認できた場合に限り未ロードとする
+            // （未マウントの procfs を未ロードと誤判定しない fail-closed。NET-10）。
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                match std::fs::metadata(self.root.join(PROC_SYS_NET)) {
+                    Ok(m) if m.is_dir() => BrNetfilterState::NotLoaded,
+                    Ok(_) => BrNetfilterState::Unknown {
+                        reason: DoctorProbeError {
+                            code: NetErrorCode::Internal.as_str().to_string(),
+                            message: "procfs net sysctl directory is not a directory".to_string(),
+                        },
+                    },
+                    Err(e2) => BrNetfilterState::Unknown {
+                        reason: DoctorProbeError::from_io(&e2),
+                    },
+                }
+            }
             Err(e) => BrNetfilterState::Unknown {
                 reason: DoctorProbeError::from_io(&e),
             },
@@ -322,6 +345,8 @@ mod tests {
 
     fn br(value: Option<&str>) -> BrNetfilterState {
         let t = TempRoot::new();
+        // procfs が参照できる環境を模す（`/proc/sys/net` が存在する）。
+        std::fs::create_dir_all(t.0.join(PROC_SYS_NET)).expect("mkdir");
         if let Some(v) = value {
             t.write(BR_NF_CALL_IPTABLES, v);
         }
@@ -341,6 +366,14 @@ mod tests {
     #[test]
     fn net10_br_netfilter_not_loaded() {
         assert_eq!(br(None), BrNetfilterState::NotLoaded);
+    }
+
+    /// NET-10: procfs を参照できない（`/proc/sys/net` が無い）場合は NotLoaded でなく Unknown。
+    #[test]
+    fn net10_br_netfilter_procfs_unavailable_is_unknown() {
+        let t = TempRoot::new();
+        let st = BrNetfilterProbe::with_root(t.0.clone()).probe();
+        assert!(matches!(st, BrNetfilterState::Unknown { .. }), "{st:?}");
     }
 
     /// NET-10: policy の取得結果が各状態に対応する。

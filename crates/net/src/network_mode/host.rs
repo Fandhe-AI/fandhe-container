@@ -17,6 +17,10 @@
 //!   [`HostNetns::verify_process`] は `/proc/<pid>/task/` の全スレッドを照合し、1 つでも別 netns なら
 //!   `Other` を返す。判定は呼び出し時点のスナップショットで、列挙後に作られたスレッドや列挙後の
 //!   `setns(2)` は対象外。想定する呼び出し元は、exec 直後の自分の子を検証する runtime
+//! - procfs の `/proc/<pid>/task/` の列挙は、列挙中に対象の別スレッドが終了すると生存スレッドを
+//!   1 つ取りこぼし得る（カーネルの readdir は終了したスレッドの位置で打ち切り、次の呼び出しを先頭からの
+//!   件数で再開するため、詰まった分だけ飛ぶ）。スレッドの終了と並行して照合すると「全スレッド」の保証は
+//!   弱まる。想定する呼び出し元（exec 直後の単一スレッドの子）では並行終了が起きないため影響しない
 //! - [`HostNetns::verify_process`] は pid 再利用による TOCTOU が残る。呼び出し側は自分の子 pid に限って使う。
 //!   `pid` は本プロセスから見える `/proc` の PID namespace での番号として解釈する
 //! - エラーメッセージは固定の英語文で、パスや inode の中身を含めない
@@ -70,10 +74,17 @@ pub struct HostNetns {
     id: NsId,
 }
 
+/// ns の magic link を stat した失敗時のメッセージ（固定文。パスを含めない）。
+const STAT_NS_FAILED: &str = "failed to stat network namespace entry in /proc";
+
 fn stat_ns(path: &Path) -> Result<NsId, NetError> {
+    stat_ns_io(path).map_err(|e| proc_error(&e, STAT_NS_FAILED))
+}
+
+/// `stat_ns` の `io::Error` を保ったままの版。失敗理由で終了中スレッドを見分ける呼び出し元が使う。
+fn stat_ns_io(path: &Path) -> io::Result<NsId> {
     // stat は ns の magic link を辿り nsfs inode の (dev, ino) を返す。
-    let md = fs::metadata(path)
-        .map_err(|e| proc_error(&e, "failed to stat network namespace entry in /proc"))?;
+    let md = fs::metadata(path)?;
     Ok(NsId::new(md.dev(), md.ino()))
 }
 
@@ -87,8 +98,9 @@ fn proc_error(e: &io::Error, message: &'static str) -> NetError {
 
 /// `/proc/<pid>/task/` を列挙し、生存中の各スレッドの (tid, netns 識別子) を返すイテレータを作る。
 ///
-/// プロセス自体が無ければ `NotFound`。列挙中に終了したスレッドは飛ばす。数値でないエントリは
-/// procfs の想定外の形として `Internal`（fail-closed）。全件を `Vec` に集めないため件数上限は設けない。
+/// プロセス自体が無ければ `NotFound`。列挙中に終了したスレッド・終了処理中のスレッドは飛ばす
+/// （`skip_exited_thread`）。数値でないエントリは procfs の想定外の形として `Internal`（fail-closed）。
+/// 全件を `Vec` に集めないため件数上限は設けない。
 fn task_netns_ids(
     pid: u32,
 ) -> Result<impl Iterator<Item = Result<(u32, NsId), NetError>>, NetError> {
@@ -98,7 +110,7 @@ fn task_netns_ids(
     Ok(entries.filter_map(move |entry| task_netns_id(&task_dir, entry).transpose()))
 }
 
-/// `task_netns_ids` の 1 エントリ分。終了済みスレッドは `Ok(None)`。
+/// `task_netns_ids` の 1 エントリ分。終了中・終了済みスレッドは `Ok(None)`。
 fn task_netns_id(
     task_dir: &Path,
     entry: io::Result<fs::DirEntry>,
@@ -116,17 +128,45 @@ fn task_netns_id(
             )
         })?;
     let thread_dir: PathBuf = task_dir.join(tid.to_string());
-    match stat_ns(&thread_dir.join("ns").join("net")) {
+    match stat_ns_io(&thread_dir.join("ns").join("net")) {
         Ok(id) => Ok(Some((tid, id))),
         Err(e) => {
-            // 終了済みスレッドの ns link はカーネルが ENOENT だけでなく EACCES も返し得る
-            // （task 構造体の取得に失敗した時点で EACCES）。スレッドのディレクトリ自体が消えていれば
-            // 終了と判断して飛ばし、残っていれば元のエラーを返す（権限不足を黙って見逃さない）。
-            match fs::symlink_metadata(&thread_dir) {
-                Err(gone) if gone.kind() == io::ErrorKind::NotFound => Ok(None),
-                _ => Err(e),
-            }
+            skip_exited_thread(&e, || fs::symlink_metadata(&thread_dir).map(|_| ())).map(|()| None)
         }
+    }
+}
+
+/// スレッドの ns link の stat 失敗を「終了中・終了済みとして飛ばす（`Ok(())`）」か「エラー」かに分ける。
+///
+/// NET-6・TASK-143.1 の全スレッド照合（[`HostNetns::verify_process`]）から呼ばれる。`dir_probe` は
+/// スレッドのディレクトリ（`/proc/<pid>/task/<tid>`）を stat する関数で、`PermissionDenied` のときだけ呼ぶ。
+/// - ENOENT: 飛ばす。tid のディレクトリが既に消えた場合に加え、終了処理中のスレッドでも返る。
+///   カーネルは `do_exit` で `exit_task_namespaces` により nsproxy を外してから、後の `release_task` で
+///   pid を外して `/proc` のエントリを消すため、その間（ゾンビの間はずっと）はディレクトリが残ったまま
+///   ns link が ENOENT になる。nsproxy を失ったスレッドはもうネットワーク操作ができないため、飛ばしても
+///   照合は弱まらない
+/// - EACCES・EPERM（`PermissionDenied`）: task 構造体を取れなくなった時点（pid が外れた後）でも返るが、権限不足と区別できないため
+///   `dir_probe` でディレクトリの消失（NotFound）を確かめたときだけ飛ばし、残っていれば元のエラーを返す
+///   （権限不足を黙って見逃さない）
+/// - その他: 元のエラーを返す
+///
+/// 全スレッドが飛ばされた場合（全スレッドが終了中のプロセス・`CONFIG_NET_NS` の無いカーネル）は
+/// `classify_membership` が 0 件として `NotFound` を返す（fail-closed）。
+fn skip_exited_thread(
+    e: &io::Error,
+    dir_probe: impl FnOnce() -> io::Result<()>,
+) -> Result<(), NetError> {
+    let skip = match e.kind() {
+        io::ErrorKind::NotFound => true,
+        io::ErrorKind::PermissionDenied => {
+            dir_probe().is_err_and(|gone| gone.kind() == io::ErrorKind::NotFound)
+        }
+        _ => false,
+    };
+    if skip {
+        Ok(())
+    } else {
+        Err(proc_error(e, STAT_NS_FAILED))
     }
 }
 

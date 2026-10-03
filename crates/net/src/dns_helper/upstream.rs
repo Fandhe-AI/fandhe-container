@@ -4,7 +4,7 @@
 //! - DNS ヘルパーのあるユーザー定義ネットワーク（NET-1・NET-5）では、コンテナの `resolv.conf` の nameserver は
 //!   常に DNS ヘルパー（gateway:53）のままにし、`--dns` で指定された上流サーバーはヘルパーが肩代わりして
 //!   コンテナ別に転送する（NET-12）。本モジュールはその「コンテナ別の転送先マッピング」（[`DnsUpstreamMap`]）、
-//!   「期限つきの転送」（[`forward_query`]）、両者を [`RegistryHandler`] と合成する [`ForwardingHandler`] を持つ
+//!   「期限つきの転送」（`forward_query`）、両者を [`RegistryHandler`] と合成する [`ForwardingHandler`] を持つ
 //! - 上流アドレスの入力検証は `add_host_dns::parse_ip_addr`（TASK-185.1）が済ませた `IpAddr` を受け、
 //!   [`UpstreamServer::new`] が種別ポリシーを足す。`resolv.conf` への反映は TASK-185.4（#347）の責務
 //! - 登録側は `network::attach_container` が返す `AttachedContainer.address`（IPv4）をキーに
@@ -42,14 +42,15 @@
 //! - 上流応答は質問の一致に加え、後続レコード（名前・RDLENGTH・既知の型の RDATA 内の名前）が末尾ちょうどまで境界内で
 //!   完結することを検証し、不正な応答は破棄する。圧縮ポインタは参照先を終端まで追跡して検証し、参照先は追跡のたびに
 //!   厳密に前方へ戻ること（ループ不可）・追跡回数・展開後の名前長 255 で有界にする
-//! - `DnsUpstreamMap::set` は gateway（ヘルパー自身）を上流に指定した登録を拒否する（自己転送で serve が塞がるため）
+//! - `DnsUpstreamMap::set` は gateway（ヘルパー自身）を上流に指定した登録を拒否する（自己転送は解決にならず、
+//!   転送ワーカーの枠を無駄に占有するため）
+//! - 転送は `serve` の受信ループではなくワーカー（[`HandlerOutcome::Defer`] →
+//!   [`QueryHandler::respond_deferred`]）で行い、上流の応答待ちの間も他のクエリ（レジストリの自前応答を含む）を
+//!   処理する。同時に処理する転送は `dns_helper::MAX_INFLIGHT_DEFERRED` 件まで（暫定値）で、超過分は応答せず破棄する
 //!
 //! # 未実装（REPAIR-3）
 //! - プロセス外のヘルパープロセスへ上流マッピングを登録する経路は無い（`run_dns_helper_main` は NOTIMP のまま）。
 //!   [`ForwardingHandler`] は同一プロセス内の登録側（テスト・将来の組み込み）からのみ到達できる
-//! - `serve` は単一スレッドのため、転送中は同じネットワークの他クエリが最大 [`FORWARD_TOTAL_DEADLINE`] 待たされる
-//!   （head-of-line blocking）。並列化は後続課題
-//!   （追跡 Issue は未起票。out-of-scope-tracking 規約に従いユーザー承認後に起票し、番号をここへ追記する）
 //! - TCP 再試行・EDNS0・上流応答の加工（TC=1 は素通し）は未対応
 
 use std::collections::HashMap;
@@ -199,7 +200,7 @@ impl DnsUpstreamMap {
             [SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0); MAX_UPSTREAMS_PER_CONTAINER];
         for (slot, ip) in addrs.iter_mut().zip(servers) {
             let addr = UpstreamServer::new(*ip)?.socket_addr();
-            // ヘルパー自身（gateway）への転送は自己ループで serve を塞ぐため拒否する。
+            // ヘルパー自身（gateway）への転送は解決にならず転送ワーカーの枠を占有するだけのため拒否する。
             if addr.ip() == IpAddr::V4(gateway) {
                 return Err(invalid(
                     "upstream DNS server must not be the DNS helper's own gateway address",
@@ -612,12 +613,25 @@ impl ForwardingHandler {
         self.forward_failed.load(Ordering::Relaxed)
     }
 
-    /// 質問の QNAME がレジストリにあるか（QCLASS の判定は呼び出し側の [`QueryHandler::respond_from`] が先に行う）。
+    /// 質問の QNAME がレジストリにあるか（QCLASS の判定は呼び出し側の [`ForwardingHandler::route`] が先に行う）。
     fn is_local_name(&self, qname: &[u8]) -> bool {
         let mut norm = [0u8; MAX_NAME_LEN];
         normalize_qname(qname, &mut norm)
             .and_then(|n| self.registry.lookup(n))
             .is_some()
+    }
+
+    /// 転送するクエリなら転送先と質問の終端を返す。判定順は module doc のとおりで、非 IN・レジストリの名前・
+    /// 未登録の送信元（IPv6 を含む）・質問の解析失敗は `None`（[`RegistryHandler`] の自前応答に委ねる）。
+    fn route(&self, peer: SocketAddr, datagram: &[u8]) -> Option<(UpstreamList, usize)> {
+        let q = parse_question(datagram)?;
+        let IpAddr::V4(ip) = peer.ip().to_canonical() else {
+            return None;
+        };
+        if q.qclass != QCLASS_IN || self.is_local_name(q.qname) {
+            return None;
+        }
+        self.upstreams.lookup(ip).map(|list| (list, q.end))
     }
 }
 
@@ -631,6 +645,8 @@ impl QueryHandler for ForwardingHandler {
         self.local.respond(header, datagram, out)
     }
 
+    /// 転送するクエリは上流の応答を待たずに [`HandlerOutcome::Defer`] を返し、`serve` のワーカーへ委ねる
+    /// （受信ループを塞がず、他コンテナの自前応答を待たせない）。それ以外は自前応答。
     fn respond_from(
         &self,
         peer: SocketAddr,
@@ -638,27 +654,31 @@ impl QueryHandler for ForwardingHandler {
         datagram: &[u8],
         out: &mut ResponseBuf,
     ) -> HandlerOutcome {
-        // 判定順は module doc のとおり: 非 IN・レジストリの名前・未登録の送信元は転送せず、RegistryHandler の
-        // 自前応答（非 IN と管理外名は REFUSED）に委ねる。
-        let Some(q) = parse_question(datagram) else {
-            return self.local.respond(header, datagram, out);
-        };
-        let list = match peer.ip().to_canonical() {
-            IpAddr::V4(ip) if q.qclass == QCLASS_IN && !self.is_local_name(q.qname) => {
-                self.upstreams.lookup(ip)
-            }
-            _ => None,
-        };
-        let Some(list) = list else {
+        if self.route(peer, datagram).is_some() {
+            HandlerOutcome::Defer
+        } else {
+            self.local.respond(header, datagram, out)
+        }
+    }
+
+    /// ワーカーで上流へ転送する（高々 [`FORWARD_TOTAL_DEADLINE`]）。Defer 後にマッピングが外れていれば自前応答に戻す。
+    fn respond_deferred(
+        &self,
+        peer: SocketAddr,
+        header: &DnsHeader,
+        datagram: &[u8],
+        out: &mut ResponseBuf,
+    ) -> HandlerOutcome {
+        let Some((list, q_end)) = self.route(peer, datagram) else {
             return self.local.respond(header, datagram, out);
         };
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
-        match forward_query(&list, datagram, q.end, header.id(), counter, out) {
+        match forward_query(&list, datagram, q_end, header.id(), counter, out) {
             // 受理済みの上流応答は 512 バイト以下（validate_upstream_reply）。サイズ上限は serve が課す。
             ForwardResult::Forwarded => HandlerOutcome::RespondForwarded(ForwardedProof(())),
             ForwardResult::AllFailed => {
                 self.forward_failed.fetch_add(1, Ordering::Relaxed);
-                if build_servfail(header, datagram, q.end, out) {
+                if build_servfail(header, datagram, q_end, out) {
                     HandlerOutcome::Respond
                 } else {
                     HandlerOutcome::NoResponse
@@ -712,9 +732,14 @@ mod tests {
         peer: SocketAddr,
         pkt: &[u8],
     ) -> (HandlerOutcome, Vec<u8>) {
+        // serve と同じく Defer ならワーカー相当の respond_deferred で応答させる。
         let header = DnsHeader::parse(pkt).unwrap();
         let mut out = ResponseBuf::new();
-        let o = h.respond_from(peer, &header, pkt, &mut out);
+        let mut o = h.respond_from(peer, &header, pkt, &mut out);
+        if o == HandlerOutcome::Defer {
+            out.clear();
+            o = h.respond_deferred(peer, &header, pkt, &mut out);
+        }
         (o, out.as_bytes().to_vec())
     }
 

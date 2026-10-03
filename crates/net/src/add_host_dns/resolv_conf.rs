@@ -22,6 +22,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{InputViolation, parse_ip_addr};
 use crate::error::{NetError, NetErrorCode};
@@ -99,30 +101,46 @@ impl ResolvConfPlan {
         out
     }
 
-    /// 原子的に書き込む（tmp + `create_new` + fsync + rename + 親ディレクトリ fsync）。
+    /// 原子的に書き込む（呼び出しごとに固有の tmp + `create_new` + 0644 明示 + fsync + rename + 親ディレクトリ fsync）。
+    ///
+    /// 親ディレクトリの open / fsync に失敗した場合も `INTERNAL` を返す（rename 済みのため内容は置換済みだが、
+    /// 永続化は保証されない）。
     ///
     /// 本文は高々 `MAX_DNS_SERVERS` 行なので追加の長さ検査は不要。失敗は固定メッセージの `INTERNAL`。
     pub fn write_to(&self, path: &Path) -> Result<(), NetError> {
         let werr = || NetError::new(NetErrorCode::Internal, "failed to write resolv.conf");
+        // 呼び出しごとに固有の一時ファイル名（pid + プロセス内カウンタ + 時刻）を同一ディレクトリに作る。
+        // 固定名だと同一 path への同時書き込みが互いの tmp を削除・上書きして壊れるため。
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
         let mut tmp_name: OsString = path.as_os_str().to_owned();
-        tmp_name.push(".tmp");
+        tmp_name.push(format!(
+            ".tmp.{}.{}.{nanos}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         let tmp = Path::new(&tmp_name);
-        match std::fs::remove_file(tmp) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(werr()),
-        }
         let mut opts = OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            // コンテナ内プロセスが読めるよう 0644。
+            // 作成時の初期値。umask で狭まりうるため、下で明示的に 0644 へ設定し直す。
             opts.mode(0o644);
         }
         let body = self.render();
         let result = (|| {
             let mut f = opts.open(tmp).map_err(|_| werr())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // コンテナ内の非 root プロセスが読めるよう、umask に関わらず 0644 を明示する。
+                f.set_permissions(std::fs::Permissions::from_mode(0o644))
+                    .map_err(|_| werr())?;
+            }
             f.write_all(body.as_bytes()).map_err(|_| werr())?;
             f.sync_all().map_err(|_| werr())?;
             drop(f);
@@ -132,11 +150,12 @@ impl ResolvConfPlan {
             let _ = std::fs::remove_file(tmp);
             return result;
         }
+        // 永続化保証（親ディレクトリ fsync）に失敗した場合は成功を装わずエラーにする。
         #[cfg(unix)]
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
-            && let Ok(d) = std::fs::File::open(dir)
-        {
-            let _ = d.sync_all();
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|_| werr())?;
         }
         Ok(())
     }
@@ -335,6 +354,46 @@ mod tests {
             std::fs::read_to_string(d.file()).unwrap(),
             body(&["192.0.2.1"])
         );
+    }
+
+    /// NET-12: 既存が 0600 でも置換後は 0644 になり、tmp の残骸を残さない（set_permissions の明示）。
+    #[cfg(unix)]
+    #[test]
+    fn mode_is_0644_over_restrictive_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        // umask はプロセス全体に効くため、他テストへ影響しない代替として
+        // 事前に 0600 の同名既存ファイルがあっても結果が 0644 になることを確認する。
+        let d = Dir::new("mode");
+        std::fs::write(d.file(), b"old\n").unwrap();
+        std::fs::set_permissions(d.file(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        apply_dns(NetworkMode::Host, &["192.0.2.1"], &d.file()).unwrap();
+        let md = std::fs::metadata(d.file()).unwrap();
+        assert_eq!(md.permissions().mode() & 0o777, 0o644);
+        assert_eq!(std::fs::read_dir(&d.0).unwrap().count(), 1);
+    }
+
+    /// NET-12: 同一 path への同時書き込みでも各呼び出しが成功し、最終内容はどちらかの完全な本文になる。
+    #[test]
+    fn concurrent_writes_do_not_corrupt() {
+        let d = Dir::new("conc");
+        let path = d.file();
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    let ip = format!("192.0.2.{}", i + 1);
+                    for _ in 0..20 {
+                        apply_dns(NetworkMode::Host, &[ip.as_str()], &p).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert!((1..=8).any(|i| got == body(&[&format!("192.0.2.{i}")])));
+        assert_eq!(std::fs::read_dir(&d.0).unwrap().count(), 1);
     }
 
     /// NET-12: render は具体値。

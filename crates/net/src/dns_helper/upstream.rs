@@ -1435,4 +1435,27 @@ mod tests {
         assert_eq!((st.received, st.answered, st.deferred_dropped), (17, 16, 1));
         assert_eq!(silent.count(), MAX_INFLIGHT_DEFERRED);
     }
+
+    /// NET-12・REPAIR-5: 上流の受信エラーのうち割り込みとバッファ超過は待ち直し、期限切れ・ICMP 由来の拒否は失敗とする。
+    #[test]
+    fn recv_error_retry_classification() {
+        assert!(recv_error_is_retryable(&io::Error::from(
+            io::ErrorKind::Interrupted
+        )));
+        #[cfg(target_os = "linux")]
+        assert!(recv_error_is_retryable(&io::Error::from_raw_os_error(90)));
+        #[cfg(target_os = "macos")]
+        assert!(recv_error_is_retryable(&io::Error::from_raw_os_error(40)));
+        #[cfg(windows)]
+        assert!(recv_error_is_retryable(&io::Error::from_raw_os_error(
+            10040
+        )));
+        for kind in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(!recv_error_is_retryable(&io::Error::from(kind)), "{kind:?}");
+        }
+    }
 }

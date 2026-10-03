@@ -257,6 +257,8 @@ pub fn render_hosts_lines(entries: &[AddHostEntry]) -> String {
 /// 呼び出し側の前提:
 /// - `hosts_rel` の途中ディレクトリと hosts ファイルは、コンテナ・他ユーザーが書き込めないディレクトリ
 ///   配下に置くこと（書き込めると symlink 以外の手段で中身を入れ替えられ、本関数の検査の前提が崩れる）。
+/// - 管理ルート（状態ディレクトリ）はローカルファイルシステム上にあること（`flock` による直列化・`O_APPEND`・
+///   `mnt_id` 照合はローカル FS の意味論に依存し、NFS 等のネットワーク FS では保証しない）。
 ///
 /// Linux 以外では `UNIMPLEMENTED` を返す（fail-closed）。symlink を辿らない `openat` と fd の `mnt_id`
 /// 照合を持たない OS でパス検査だけの追記をすると、検査と open の間の差し替えで管理外のファイルへ

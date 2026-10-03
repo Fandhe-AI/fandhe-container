@@ -364,6 +364,10 @@ fn lock_guard_bounded(deadline: Instant) -> Result<std::sync::MutexGuard<'static
 /// 既存内容の末尾が改行でなければ先頭に改行を補って `O_APPEND` の 1 回の `write_all` にまとめる。
 /// 追記後に [`MAX_HOSTS_FILE_BYTES`] を超えるなら書かない。書き込み・fsync の失敗時は同じロック下で
 /// 書き込み前の長さへ戻す（[`rollback_after_failure`]）。ロックは `file` の Drop で解放される。
+///
+/// 前提: 管理ルートはローカルファイルシステム上にあること。`flock` による直列化・`O_APPEND` の追記位置・
+/// `/proc/self/fdinfo` の `mnt_id` 照合はローカル FS の意味論に依存し、NFS 等のネットワーク FS では
+/// 保証しない（他ホストからの同時更新は直列化されない）。
 pub(super) fn append_lines(
     managed_root: &Path,
     hosts_rel: &Path,

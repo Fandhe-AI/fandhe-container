@@ -943,6 +943,34 @@ impl DnsHelperProcess {
         self.listen
     }
 
+    /// 子プロセスがまだ動いているか（`try_wait` で終了を検知する。異常終了後は false。TASK-144.1・NET-7）。
+    /// 状態が取得できない場合も安全側で false（再起動側に倒す）。
+    pub fn is_alive(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
+
+    /// kill して期限内に回収する。回収できなければ `Timeout` を返し、ハンドルは保持したまま（子の回収権を
+    /// 手放さない）なので、呼び出し側は旧プロセスの終了を確認するまで再起動を控え、再度呼べる。
+    /// 破棄された場合は `Drop` がバックグラウンド回収へ引き継ぐ（TASK-144.1・NET-7）。
+    pub fn stop_checked(&mut self, reap_timeout: Duration) -> Result<(), NetError> {
+        check_timeout(reap_timeout)?;
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        if kill_and_reap(child, reap_timeout) {
+            self.child = None;
+            Ok(())
+        } else {
+            Err(NetError::new(
+                NetErrorCode::Timeout,
+                "dns helper was not reaped before the deadline",
+            ))
+        }
+    }
+
     /// kill して期限内に回収する。期限内に回収できなければ `Timeout` を返すが、回収権は
     /// バックグラウンドの回収スレッドが引き継ぐため、子が後から終了してもゾンビは残らない。
     pub fn stop(mut self, reap_timeout: Duration) -> Result<(), NetError> {

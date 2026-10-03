@@ -5,7 +5,7 @@
 //! 常駐コストを 0 にする。将来の統一 CLI / supervisor（TASK-79・TASK-157）が、コンテナ接続
 //! （`network::attach_container`）の後に [`DnsHelperRefCounts::join`]、切断・停止・supervisor からの終了通知で
 //! [`DnsHelperRefCounts::leave`] を呼ぶ。起動・停止の実体は [`DnsHelperLauncher`] に分離し、本番は
-//! [`ProcessLauncher`]（`spawn_dns_helper` / `DnsHelperProcess::stop` の薄いラッパー）、ユニットテストは偽実装を使う。
+//! [`ProcessLauncher`]（`spawn_dns_helper` / `DnsHelperProcess::stop_checked` の薄いラッパー）、ユニットテストは偽実装を使う。
 //!
 //! # 設計
 //! - カウントは裸の整数でなく [`EndpointId`] の集合で持つ。参加・離脱の再送や重複通知が冪等になり、
@@ -14,26 +14,33 @@
 //!   旧ヘルパーの回収前に新ヘルパーが同じアドレスへ bind する競合が起きない。保持時間は ready / reap の期限
 //!   （最大 10 秒。REPAIR-5）で上限が決まる。トレードオフとして、あるネットワークの起動中は他ネットワークの
 //!   join / leave も待たされる（ネットワークごとのロックへの細分化は将来課題）
-//! - 起動失敗は何も記録しない（fail-closed。次の join で再試行）。停止失敗でもメンバーシップは解除済みで、
-//!   回収はバックグラウンドへ引き継がれる（ゾンビを残さない）
+//! - 起動失敗は何も記録しない（fail-closed。次の join で再試行）
+//! - 停止失敗（回収期限切れ）では、メンバーが空の「停止中」エントリとハンドルを保持する。旧プロセスの終了を
+//!   確認できるまで次の join は停止を再試行し、成功してから新ヘルパーを起動する（同一アドレスへの二重 bind を
+//!   防ぐ）。再試行も失敗すればエラーを返し、起動しない。エントリが破棄されればハンドルの `Drop` が回収する
+//! - join のたびに稼働中ヘルパーの生死を確認し、異常終了していれば同じアドレスで再起動する
+//!   （[`JoinOutcome::Restarted`]）。再起動に失敗すればエラーを返し、死んだエントリは残して次の join で再試行する。
+//!   `is_running` / `bound_addr` は死んだヘルパーを稼働中として報告しない
+//! - 起動・停止の成否と所要時間は [`NetOpRecorder`] へ記録する（REPAIR-4。`NetOpKind::DnsHelperStart` / `DnsHelperStop`）
 //! - ネットワーク数・参加数は上限つき（DoS 対策）。エラー文言にネットワーク名・endpoint・アドレス・pid を含めない
 //!
 //! # 未実装（REPAIR-3）
 //! - プロセスをまたぐ参照カウントの永続化（CORE-1 により CLI 起動ごとに別プロセスのため、最終的にはファイルと
 //!   ロック等での共有が要る。本モジュールはプロセス内の排他制御まで）
-//! - supervisor（TASK-157）からの終了通知の配線（`leave` を冪等にして重複通知に備えるところまで）
+//! - supervisor（TASK-157）からの終了通知・異常終了の push 通知の配線（現状は join 時の生死確認のみ）
 //! - `DnsRegistry` の登録・削除との連動、SIGTERM による正常終了
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use super::{
     DnsHelperProcess, DnsListenAddr, MAX_REGISTRY_ENTRIES, check_timeout, spawn_dns_helper,
 };
 use crate::error::{NetError, NetErrorCode};
+use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
 use crate::network::{EndpointId, NetworkName};
 
 /// 同時に管理するネットワーク数の上限（無制限確保の防止）。
@@ -45,13 +52,15 @@ pub trait DnsHelperLauncher: Send + Sync {
     type Handle: Send;
     /// ヘルパーを起動し、準備完了までを待つ（期限つき）。
     fn start(&self, listen: DnsListenAddr) -> Result<Self::Handle, NetError>;
-    /// ヘルパーを停止して回収する（期限つき）。
-    fn stop(&self, handle: Self::Handle) -> Result<(), NetError>;
+    /// ヘルパーを停止して回収する（期限つき）。失敗時はハンドルを保持したまま返し、再試行できる。
+    fn stop(&self, handle: &mut Self::Handle) -> Result<(), NetError>;
+    /// ヘルパーがまだ動いているか（異常終了の検知用。取得できない場合は false）。
+    fn is_alive(&self, handle: &mut Self::Handle) -> bool;
     /// ハンドルが報告する実際の待受アドレス（port 0 指定時の確定ポートの取得用）。
     fn bound_addr(&self, handle: &Self::Handle) -> SocketAddrV4;
 }
 
-/// 実プロセスを起動する本番ランチャー（`spawn_dns_helper` / `DnsHelperProcess::stop`）。
+/// 実プロセスを起動する本番ランチャー（`spawn_dns_helper` / `DnsHelperProcess::stop_checked`）。
 #[derive(Debug, Clone)]
 pub struct ProcessLauncher {
     program: PathBuf,
@@ -89,8 +98,12 @@ impl DnsHelperLauncher for ProcessLauncher {
         spawn_dns_helper(&self.program, listen, self.ready_timeout)
     }
 
-    fn stop(&self, handle: Self::Handle) -> Result<(), NetError> {
-        handle.stop(self.reap_timeout)
+    fn stop(&self, handle: &mut Self::Handle) -> Result<(), NetError> {
+        handle.stop_checked(self.reap_timeout)
+    }
+
+    fn is_alive(&self, handle: &mut Self::Handle) -> bool {
+        handle.is_alive()
     }
 
     fn bound_addr(&self, handle: &Self::Handle) -> SocketAddrV4 {
@@ -104,6 +117,11 @@ impl DnsHelperLauncher for ProcessLauncher {
 pub enum JoinOutcome {
     /// 0→1 でヘルパーを起動した。
     Started,
+    /// 異常終了していたヘルパーを同じアドレスで再起動して参加した。
+    Restarted {
+        /// 参加後の人数。
+        members: usize,
+    },
     /// 既存のヘルパーに参加した（起動なし）。
     Joined {
         /// 参加後の人数。
@@ -135,26 +153,55 @@ struct NetworkEntry<H> {
     listen: DnsListenAddr,
     members: HashSet<EndpointId>,
     helper: H,
+    /// 最後の leave で停止に失敗し、旧プロセスの回収待ちである（members は空）。
+    stopping: bool,
 }
 
 /// ネットワークごとの参照カウント（参加 endpoint の集合）とヘルパーの自動起動・終了。
 pub struct DnsHelperRefCounts<L: DnsHelperLauncher> {
     launcher: L,
     state: Mutex<HashMap<NetworkName, NetworkEntry<L::Handle>>>,
+    recorder: Arc<dyn NetOpRecorder>,
     max_members: usize,
     max_networks: usize,
 }
 
 impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
-    /// 既定の上限（[`MAX_REGISTRY_ENTRIES`]・[`MAX_TRACKED_NETWORKS`]）で作る。
+    /// 既定の上限（[`MAX_REGISTRY_ENTRIES`]・[`MAX_TRACKED_NETWORKS`]）・計測なしで作る。
     pub fn new(launcher: L) -> Self {
-        Self::with_limits(launcher, MAX_REGISTRY_ENTRIES, MAX_TRACKED_NETWORKS)
+        Self::with_recorder(launcher, Arc::new(NoopNetOpRecorder))
     }
 
+    /// 既定の上限で、起動・停止の計測先を指定して作る（REPAIR-4）。
+    pub fn with_recorder(launcher: L, recorder: Arc<dyn NetOpRecorder>) -> Self {
+        Self::with_limits_and_recorder(
+            launcher,
+            MAX_REGISTRY_ENTRIES,
+            MAX_TRACKED_NETWORKS,
+            recorder,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_limits(launcher: L, max_members: usize, max_networks: usize) -> Self {
+        Self::with_limits_and_recorder(
+            launcher,
+            max_members,
+            max_networks,
+            Arc::new(NoopNetOpRecorder),
+        )
+    }
+
+    pub(crate) fn with_limits_and_recorder(
+        launcher: L,
+        max_members: usize,
+        max_networks: usize,
+        recorder: Arc<dyn NetOpRecorder>,
+    ) -> Self {
         Self {
             launcher,
             state: Mutex::new(HashMap::new()),
+            recorder,
             max_members,
             max_networks,
         }
@@ -165,7 +212,22 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn start_helper(&self, listen: DnsListenAddr) -> Result<L::Handle, NetError> {
+        record_net_op(self.recorder.as_ref(), NetOpKind::DnsHelperStart, || {
+            self.launcher.start(listen)
+        })
+    }
+
+    fn stop_helper(&self, handle: &mut L::Handle) -> Result<(), NetError> {
+        record_net_op(self.recorder.as_ref(), NetOpKind::DnsHelperStop, || {
+            self.launcher.stop(handle)
+        })
+    }
+
     /// ネットワークへ参加する。0→1 のときだけヘルパーを起動する（失敗時は何も記録しない）。
+    ///
+    /// 稼働中ヘルパーが異常終了していれば同じアドレスで再起動する。直前の停止が回収待ちなら、旧プロセスの
+    /// 終了を確認できるまで起動しない。
     pub fn join(
         &self,
         network: &NetworkName,
@@ -173,6 +235,7 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
         endpoint: &EndpointId,
     ) -> Result<JoinOutcome, NetError> {
         let mut map = self.lock();
+        let mut reaped = false;
         if let Some(entry) = map.get_mut(network) {
             if entry.listen != listen {
                 return Err(NetError::new(
@@ -180,21 +243,39 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
                     "listen address differs from the running helper",
                 ));
             }
-            if entry.members.contains(endpoint) {
-                return Ok(JoinOutcome::AlreadyMember {
-                    members: entry.members.len(),
+            if entry.stopping {
+                // 旧プロセスの終了を確認してから新規起動する（失敗ならエントリを残して返す）。
+                self.stop_helper(&mut entry.helper)?;
+                reaped = true;
+            } else {
+                let alive = self.launcher.is_alive(&mut entry.helper);
+                let is_member = entry.members.contains(endpoint);
+                if alive && is_member {
+                    return Ok(JoinOutcome::AlreadyMember {
+                        members: entry.members.len(),
+                    });
+                }
+                if !is_member && entry.members.len() >= self.max_members {
+                    return Err(NetError::new(
+                        NetErrorCode::ResourceExhausted,
+                        "too many members in the network",
+                    ));
+                }
+                if !alive {
+                    // 異常終了を検知: 同じアドレスで再起動する。失敗時は死んだエントリを残す（次の join で再試行）。
+                    entry.helper = self.start_helper(listen)?;
+                }
+                entry.members.insert(endpoint.clone());
+                let members = entry.members.len();
+                return Ok(if alive {
+                    JoinOutcome::Joined { members }
+                } else {
+                    JoinOutcome::Restarted { members }
                 });
             }
-            if entry.members.len() >= self.max_members {
-                return Err(NetError::new(
-                    NetErrorCode::ResourceExhausted,
-                    "too many members in the network",
-                ));
-            }
-            entry.members.insert(endpoint.clone());
-            return Ok(JoinOutcome::Joined {
-                members: entry.members.len(),
-            });
+        }
+        if reaped {
+            map.remove(network);
         }
         if map.len() >= self.max_networks {
             return Err(NetError::new(
@@ -203,7 +284,7 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
             ));
         }
         // ロック保持のまま起動する: 同時 join でも起動は 1 回だけ。
-        let helper = self.launcher.start(listen)?;
+        let helper = self.start_helper(listen)?;
         let mut members = HashSet::new();
         members.insert(endpoint.clone());
         map.insert(
@@ -212,6 +293,7 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
                 listen,
                 members,
                 helper,
+                stopping: false,
             },
         );
         Ok(JoinOutcome::Started)
@@ -219,7 +301,8 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
 
     /// ネットワークから離脱する。1→0 のときヘルパーを停止する。未参加は [`LeaveOutcome::NotMember`]。
     ///
-    /// 停止に失敗してもメンバーシップは解除済みのままエラーを返す（回収はバックグラウンドへ引き継がれる）。
+    /// 停止に失敗した場合はメンバーシップは解除済みのままエラーを返し、ハンドルは「停止中」として保持される
+    /// （次の join が旧プロセスの終了を確認してから起動する）。
     pub fn leave(
         &self,
         network: &NetworkName,
@@ -229,7 +312,7 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
         let Some(entry) = map.get_mut(network) else {
             return Ok(LeaveOutcome::NotMember);
         };
-        if !entry.members.remove(endpoint) {
+        if entry.stopping || !entry.members.remove(endpoint) {
             return Ok(LeaveOutcome::NotMember);
         }
         if !entry.members.is_empty() {
@@ -237,12 +320,17 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
                 members: entry.members.len(),
             });
         }
-        let Some(entry) = map.remove(network) else {
-            return Ok(LeaveOutcome::NotMember);
-        };
         // ロック保持のまま停止する: 回収完了前に再 join が同じアドレスへ bind する競合を防ぐ。
-        self.launcher.stop(entry.helper)?;
-        Ok(LeaveOutcome::Stopped)
+        match self.stop_helper(&mut entry.helper) {
+            Ok(()) => {
+                map.remove(network);
+                Ok(LeaveOutcome::Stopped)
+            }
+            Err(e) => {
+                entry.stopping = true;
+                Err(e)
+            }
+        }
     }
 
     /// 現在の参加人数（未起動は 0）。
@@ -250,22 +338,26 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
         self.lock().get(network).map_or(0, |e| e.members.len())
     }
 
-    /// ヘルパーが起動中か。
+    /// ヘルパーが起動中か（停止中・異常終了済みは false）。
     pub fn is_running(&self, network: &NetworkName) -> bool {
-        self.lock().contains_key(network)
+        self.lock()
+            .get_mut(network)
+            .is_some_and(|e| !e.stopping && self.launcher.is_alive(&mut e.helper))
     }
 
-    /// 起動中ヘルパーの実際の待受アドレス。
+    /// 起動中ヘルパーの実際の待受アドレス（停止中・異常終了済みは `None`）。
     pub fn bound_addr(&self, network: &NetworkName) -> Option<SocketAddrV4> {
-        self.lock()
-            .get(network)
-            .map(|e| self.launcher.bound_addr(&e.helper))
+        self.lock().get_mut(network).and_then(|e| {
+            (!e.stopping && self.launcher.is_alive(&mut e.helper))
+                .then(|| self.launcher.bound_addr(&e.helper))
+        })
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instrument::NetOpOutcome;
+    use crate::instrument::testing::Collect;
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -278,6 +370,7 @@ mod tests {
         fail_start: AtomicBool,
         fail_stop: AtomicBool,
         slow: AtomicBool,
+        dead: Mutex<HashSet<usize>>,
     }
 
     impl Fake {
@@ -294,19 +387,22 @@ mod tests {
     }
 
     impl DnsHelperLauncher for Fake {
-        type Handle = SocketAddrV4;
-        fn start(&self, listen: DnsListenAddr) -> Result<SocketAddrV4, NetError> {
+        type Handle = (SocketAddrV4, usize);
+        fn start(&self, listen: DnsListenAddr) -> Result<(SocketAddrV4, usize), NetError> {
             self.enter();
             self.starts.fetch_add(1, Ordering::SeqCst);
             let r = if self.fail_start.load(Ordering::SeqCst) {
                 Err(NetError::new(NetErrorCode::Internal, "fake start failure"))
             } else {
-                Ok(listen.socket_addr())
+                Ok((listen.socket_addr(), self.starts.load(Ordering::SeqCst)))
             };
             self.exit();
             r
         }
-        fn stop(&self, _h: SocketAddrV4) -> Result<(), NetError> {
+        fn is_alive(&self, h: &mut (SocketAddrV4, usize)) -> bool {
+            !self.dead.lock().expect("lock").contains(&h.1)
+        }
+        fn stop(&self, _h: &mut (SocketAddrV4, usize)) -> Result<(), NetError> {
             self.enter();
             self.stops.fetch_add(1, Ordering::SeqCst);
             let r = if self.fail_stop.load(Ordering::SeqCst) {
@@ -317,8 +413,8 @@ mod tests {
             self.exit();
             r
         }
-        fn bound_addr(&self, h: &SocketAddrV4) -> SocketAddrV4 {
-            *h
+        fn bound_addr(&self, h: &(SocketAddrV4, usize)) -> SocketAddrV4 {
+            h.0
         }
     }
 
@@ -413,9 +509,9 @@ mod tests {
         assert_eq!(n(&rc.launcher.starts), 2);
     }
 
-    /// NET-7: 停止失敗でもメンバーシップは解除済みで、エラーを返す。
+    /// NET-7: 停止失敗ではメンバーシップは解除済みでエラーを返し、旧プロセスの終了確認まで再起動しない。
     #[test]
-    fn net7_stop_failure_clears_membership_and_surfaces_error() {
+    fn net7_stop_failure_blocks_restart_until_reaped() {
         let rc = DnsHelperRefCounts::new(Fake::default());
         rc.join(&net("a"), addr(53), &ep("c1")).expect("join");
         rc.launcher.fail_stop.store(true, Ordering::SeqCst);
@@ -423,11 +519,89 @@ mod tests {
         assert_eq!(e.code(), NetErrorCode::Timeout);
         assert_eq!(rc.members(&net("a")), 0);
         assert!(!rc.is_running(&net("a")));
+        // 回収できないうちは再参加しても新ヘルパーを起動しない。
+        let e = rc
+            .join(&net("a"), addr(53), &ep("c1"))
+            .expect_err("blocked");
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert_eq!(n(&rc.launcher.starts), 1);
+        assert_eq!(
+            rc.leave(&net("a"), &ep("c1")).expect("leave"),
+            LeaveOutcome::NotMember
+        );
+        // 回収できたら起動する。
+        rc.launcher.fail_stop.store(false, Ordering::SeqCst);
         assert_eq!(
             rc.join(&net("a"), addr(53), &ep("c1")).expect("join"),
             JoinOutcome::Started
         );
         assert_eq!(n(&rc.launcher.starts), 2);
+        assert_eq!(n(&rc.launcher.stops), 3);
+        assert!(rc.is_running(&net("a")));
+    }
+
+    /// NET-7: 異常終了したヘルパーは稼働中扱いされず、join で再起動される。
+    #[test]
+    fn net7_crashed_helper_is_restarted_on_join() {
+        let rc = DnsHelperRefCounts::new(Fake::default());
+        rc.join(&net("a"), addr(53), &ep("c1")).expect("join");
+        rc.launcher.dead.lock().expect("lock").insert(1);
+        assert!(!rc.is_running(&net("a")));
+        assert_eq!(rc.bound_addr(&net("a")), None);
+        assert_eq!(
+            rc.join(&net("a"), addr(53), &ep("c2")).expect("join"),
+            JoinOutcome::Restarted { members: 2 }
+        );
+        assert_eq!(n(&rc.launcher.starts), 2);
+        assert!(rc.is_running(&net("a")));
+        assert_eq!(
+            rc.join(&net("a"), addr(53), &ep("c1")).expect("join"),
+            JoinOutcome::AlreadyMember { members: 2 }
+        );
+    }
+
+    /// NET-7: 異常終了後の再起動に失敗したらエラーを返し、次の join で再試行する。
+    #[test]
+    fn net7_crashed_helper_restart_failure_retries() {
+        let rc = DnsHelperRefCounts::new(Fake::default());
+        rc.join(&net("a"), addr(53), &ep("c1")).expect("join");
+        rc.launcher.dead.lock().expect("lock").insert(1);
+        rc.launcher.fail_start.store(true, Ordering::SeqCst);
+        let e = rc.join(&net("a"), addr(53), &ep("c1")).expect_err("fail");
+        assert_eq!(e.code(), NetErrorCode::Internal);
+        assert!(!rc.is_running(&net("a")));
+        rc.launcher.fail_start.store(false, Ordering::SeqCst);
+        assert_eq!(
+            rc.join(&net("a"), addr(53), &ep("c1")).expect("join"),
+            JoinOutcome::Restarted { members: 1 }
+        );
+    }
+
+    /// REPAIR-4: 起動・停止の成功 / 失敗が記録される。
+    #[test]
+    fn repair4_start_and_stop_are_recorded() {
+        let c = Arc::new(Collect::default());
+        let rc = DnsHelperRefCounts::with_recorder(Fake::default(), c.clone());
+        rc.launcher.fail_start.store(true, Ordering::SeqCst);
+        rc.join(&net("a"), addr(53), &ep("c1")).expect_err("fail");
+        rc.launcher.fail_start.store(false, Ordering::SeqCst);
+        rc.join(&net("a"), addr(53), &ep("c1")).expect("join");
+        rc.launcher.fail_stop.store(true, Ordering::SeqCst);
+        rc.leave(&net("a"), &ep("c1")).expect_err("fail");
+        rc.launcher.fail_stop.store(false, Ordering::SeqCst);
+        rc.join(&net("a"), addr(53), &ep("c1")).expect("join");
+        rc.leave(&net("a"), &ep("c1")).expect("leave");
+        assert_eq!(
+            c.kinds(),
+            vec![
+                (NetOpKind::DnsHelperStart, NetOpOutcome::Failure),
+                (NetOpKind::DnsHelperStart, NetOpOutcome::Success),
+                (NetOpKind::DnsHelperStop, NetOpOutcome::Failure),
+                (NetOpKind::DnsHelperStop, NetOpOutcome::Success),
+                (NetOpKind::DnsHelperStart, NetOpOutcome::Success),
+                (NetOpKind::DnsHelperStop, NetOpOutcome::Success),
+            ]
+        );
     }
 
     /// NET-7: 0→1→0→1 で起動 2 回・停止 1 回。

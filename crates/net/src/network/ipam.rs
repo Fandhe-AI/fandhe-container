@@ -117,19 +117,20 @@ impl StaticIpam {
             ));
         }
         let exhausted = || NetError::new(NetErrorCode::ResourceExhausted, "address pool exhausted");
-        // 昇順の使用済み集合（gateway を含む）を歩いて最初の隙間を探す。
-        let mut used: Vec<u32> = self.by_addr.keys().copied().collect();
-        used.push(self.gateway_u32());
-        used.sort_unstable();
+        // BTreeMap の昇順キーを複製せず直接歩いて最初の隙間を探す。gateway は by_addr に
+        // 入らないため、候補との比較で読み飛ばす（追加メモリなし）。
+        let gateway = self.gateway_u32();
         let mut candidate = self.base.checked_add(1).ok_or_else(exhausted)?;
-        for u in used {
-            if u < candidate {
-                continue;
-            }
-            if u == candidate {
-                candidate = candidate.checked_add(1).ok_or_else(exhausted)?;
-            } else {
+        if candidate == gateway {
+            candidate = candidate.checked_add(1).ok_or_else(exhausted)?;
+        }
+        for (&u, _) in self.by_addr.range(candidate..) {
+            if u != candidate {
                 break;
+            }
+            candidate = candidate.checked_add(1).ok_or_else(exhausted)?;
+            if candidate == gateway {
+                candidate = candidate.checked_add(1).ok_or_else(exhausted)?;
             }
         }
         if candidate >= self.broadcast {

@@ -740,6 +740,44 @@ mod tests {
         assert_eq!(std::fs::read(&f.path).unwrap(), b"abc\n");
     }
 
+    /// NET-12・P2: 現在のサイズが「書き込み前の長さ + 書けた量」と一致しなければ（他者が書き足した等）
+    /// 切り詰めずに `DATA_LOSS` を返し、ファイルの内容を変えない。
+    #[test]
+    fn rollback_with_unexpected_size_does_not_truncate() {
+        let f = TmpFile::new("rollback-mismatch", Some("abc\npartial+other"));
+        let rw = OpenOptions::new().write(true).open(&f.path).unwrap();
+        let e = rollback_after_failure(&rw, 4, 7);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(std::fs::read(&f.path).unwrap(), b"abc\npartial+other");
+    }
+
+    /// NET-12・P2: 書けた量を数えながら書き切る（全量・空バッファの具体値）。
+    #[test]
+    fn write_all_counted_reports_written_bytes() {
+        let f = TmpFile::new("counted", Some("a\n"));
+        let mut w = OpenOptions::new().append(true).open(&f.path).unwrap();
+        let (n, r) = write_all_counted(&mut w, b"bc\n");
+        assert_eq!((n, r.is_ok()), (3, true));
+        let (n, r) = write_all_counted(&mut w, b"");
+        assert_eq!((n, r.is_ok()), (0, true));
+        assert_eq!(std::fs::read(&f.path).unwrap(), b"a\nbc\n");
+        // 読み取り専用 fd では 1 バイトも書けずに失敗し、書けた量は 0。
+        let mut ro = File::open(&f.path).unwrap();
+        let (n, r) = write_all_counted(&mut ro, b"x");
+        assert_eq!((n, r.is_err()), (0, true));
+    }
+
+    /// NET-12・P2: 通常ファイル以外（UNIX ソケット）は `O_PATH` の fd で種別を判定して拒否し、
+    /// 読み書き用には開かない。
+    #[test]
+    fn non_regular_file_is_rejected_before_reopen() {
+        let f = TmpFile::new("socket", None);
+        let _l = std::os::unix::net::UnixListener::bind(&f.path).unwrap();
+        let e = run(&f, ["web:192.0.2.1"]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "hosts path is not a regular file");
+    }
+
     /// NET-12・TASK-185.2 受け入れ基準: 検証失敗時に hosts ファイルは 1 バイトも変わらない。
     #[test]
     fn validation_failure_leaves_file_untouched() {

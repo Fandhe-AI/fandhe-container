@@ -18,9 +18,13 @@
 //! - 本体に失敗があっても判定が揃った時点では確定せず（`Progress::Failed`）、同期点の ACK まで読んで
 //!   別データグラムの失敗も `failures()` に集めてから `aborted` で確定する
 //! - 完了条件は本体の全 seq に判定が揃うこと。END は `NLM_F_ACK` を持たず成功時は無応答のため待てないが、
-//!   失敗（非 0 errno）が別データグラムで届き得る。そこで判定後に同期点（`NLMSG_NOOP` + `NLM_F_ACK` の
-//!   別要求）を送り、その ACK が届くまで読む（`socket::drain_until_barrier`）。応答は FIFO のため、
-//!   同期点の ACK より前の応答はすべて判定済みになる。時間の経過で「終わり」と推定しない
+//!   失敗（非 0 errno）が別データグラムで届き得る。そこで判定後に同期点（nf_tables の `NFT_MSG_GETGEN` +
+//!   `NLM_F_ACK` の別要求）を送り、その ACK が届くまで読む（`socket::drain_until_barrier`）。応答は FIFO の
+//!   ため、同期点の ACK より前の応答はすべて判定済みになる。時間の経過で「終わり」と推定しない
+//! - 同期点への応答は `NFT_MSG_NEWGEN`（同じ seq）→ errno 0 の `NLMSG_ERROR` の順に届く
+//!   （`nf_tables_getgen` が NEWGEN を unicast してから 0 を返し、`netlink_rcv_skb` が ACK を積む）。
+//!   NEWGEN を受けずに届いた errno 0 の ACK は GETGEN が実行された証拠にならないので `DataLoss`、
+//!   同期点の seq を持つそれ以外の type も `DataLoss` にする（カーネル応答の境界検査）
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
@@ -32,7 +36,14 @@ use std::time::Duration;
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{NLMSG_ERROR, NLMSG_NOOP, NlMsgIter};
 use crate::netlink_route::{classify_errno, decode_nlmsgerr};
-use crate::nftables_batch::NftBatchBytes;
+use crate::nftables_batch::{NFNL_SUBSYS_NFTABLES, NftBatchBytes, nfnl_msg_type};
+
+/// nf_tables の世代番号の照会（`linux/netfilter/nf_tables.h` の `NFT_MSG_GETGEN`）。同期点に使う。
+pub(crate) const NFT_MSG_GETGEN: u8 = 16;
+/// `NFT_MSG_GETGEN` への応答（`NFT_MSG_NEWGEN`）。
+pub(crate) const NFT_MSG_NEWGEN: u8 = 15;
+/// 同期点への応答 `NFT_MSG_NEWGEN` の `nlmsg_type`（0x0A0F）。
+const NEWGEN_TYPE: u16 = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWGEN);
 
 /// 失敗したメッセージのバッチ内位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -218,8 +229,9 @@ pub(crate) struct NftBatchAckCollector {
     seen: Vec<bool>,
     pending: usize,
     failures: Vec<NftMessageFailure>,
-    /// 判定後に送る同期点（`NLMSG_NOOP` + `NLM_F_ACK`）の seq と、その ACK を受けたか。
+    /// 判定後に送る同期点（`NFT_MSG_GETGEN` + `NLM_F_ACK`）の seq、その応答 NEWGEN と ACK を受けたか。
     barrier_seq: Option<u32>,
+    barrier_gen_seen: bool,
     barrier_acked: bool,
 }
 
@@ -239,6 +251,7 @@ impl NftBatchAckCollector {
             body_seqs,
             failures: Vec::new(),
             barrier_seq: None,
+            barrier_gen_seen: false,
             barrier_acked: false,
         }
     }
@@ -247,6 +260,7 @@ impl NftBatchAckCollector {
     /// 後続の同期点の ACK が届けば、それより前（END の失敗を含む）の応答はすべて `feed` 済みになる。
     pub(crate) fn set_barrier(&mut self, seq: u32) {
         self.barrier_seq = Some(seq);
+        self.barrier_gen_seen = false;
         self.barrier_acked = false;
     }
 
@@ -284,22 +298,7 @@ impl NftBatchAckCollector {
             let msg = item.map_err(|e| self.unknown(data_loss(e.message().to_string())))?;
             let h = msg.header();
             if self.barrier_seq == Some(h.seq()) {
-                if h.msg_type() == NLMSG_ERROR {
-                    let ack = decode_nlmsgerr(msg.payload()).map_err(|e| self.unknown(e))?;
-                    if ack.errno() != 0 {
-                        return Err(self.unknown(NetError::new(
-                            classify_errno(ack.errno()),
-                            format!("sync request failed with errno {}", ack.errno()),
-                        )));
-                    }
-                    if ack.request_seq().is_some_and(|s| s != h.seq()) {
-                        return Err(self.unknown(data_loss(format!(
-                            "sync ack for seq {} embeds a different request seq",
-                            h.seq()
-                        ))));
-                    }
-                    self.barrier_acked = true;
-                }
+                self.feed_barrier(h.msg_type(), h.seq(), msg.payload())?;
                 continue;
             }
             let Some(position) = self.locate(h.seq()) else {
@@ -361,6 +360,50 @@ impl NftBatchAckCollector {
             }))
         } else {
             Ok(Progress::Failed)
+        }
+    }
+
+    /// 同期点の seq を持つ 1 メッセージを判定する（応答は NEWGEN → errno 0 の ACK の順）。
+    ///
+    /// errno 0 の ACK は、先に NEWGEN を受けていた場合だけ同期点の完了とする。GETGEN の応答を積めなかった
+    /// 場合は `nf_tables_getgen` がエラーを返し ACK が非 0 errno になるため、NEWGEN なしの errno 0 は
+    /// 想定外の応答として扱う。
+    fn feed_barrier(
+        &mut self,
+        msg_type: u16,
+        seq: u32,
+        payload: &[u8],
+    ) -> Result<(), NftBatchError> {
+        match msg_type {
+            NEWGEN_TYPE => {
+                self.barrier_gen_seen = true;
+                Ok(())
+            }
+            NLMSG_NOOP => Ok(()),
+            NLMSG_ERROR => {
+                let ack = decode_nlmsgerr(payload).map_err(|e| self.unknown(e))?;
+                if ack.errno() != 0 {
+                    return Err(self.unknown(NetError::new(
+                        classify_errno(ack.errno()),
+                        format!("sync request failed with errno {}", ack.errno()),
+                    )));
+                }
+                if ack.request_seq().is_some_and(|s| s != seq) {
+                    return Err(self.unknown(data_loss(format!(
+                        "sync ack for seq {seq} embeds a different request seq"
+                    ))));
+                }
+                if !self.barrier_gen_seen {
+                    return Err(self.unknown(data_loss(format!(
+                        "sync ack for seq {seq} arrived without a generation reply"
+                    ))));
+                }
+                self.barrier_acked = true;
+                Ok(())
+            }
+            other => Err(self.unknown(data_loss(format!(
+                "unexpected netlink message type {other} for sync seq {seq}"
+            )))),
         }
     }
 

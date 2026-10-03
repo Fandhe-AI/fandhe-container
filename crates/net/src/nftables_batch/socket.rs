@@ -26,11 +26,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use super::ack::{NftBatchAck, NftBatchAckCollector, NftBatchError, Progress};
-use super::{BATCH_MARKER_LEN, MAX_BATCH_LEN, NftBatch, NftBatchBytes};
+use super::ack::{NFT_MSG_GETGEN, NftBatchAck, NftBatchAckCollector, NftBatchError, Progress};
+use super::{
+    BATCH_MARKER_LEN, MAX_BATCH_LEN, NFNL_SUBSYS_NFTABLES, NFPROTO_UNSPEC, NfGenMsg, NftBatch,
+    NftBatchBytes, nfnl_msg_type,
+};
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
-use crate::netlink::{NLM_F_ACK, NLM_F_REQUEST, NLMSG_NOOP, NlMsgBuilder};
+use crate::netlink::{NLM_F_ACK, NLM_F_REQUEST, NlMsgBuilder};
 use crate::netlink_route::{NetlinkRouteSocket, RequestGate};
 use crate::sys::Deadline;
 
@@ -156,9 +159,9 @@ fn exchange(
 ///
 /// END は `NLM_F_ACK` を持たず成功時は無応答で、失敗（非 0 errno）は本体の ACK と別のデータグラムで
 /// 届き得る。静止窓のような時間による推定では取りこぼし得るため、判定後に別要求の同期点
-/// （`NLMSG_NOOP` + `NLM_F_ACK`。カーネルの `netlink_rcv_skb` が errno 0 の ACK を返す）を送り、
-/// その ACK を完了条件にする。応答は FIFO なので、同期点の ACK より前に積まれた END の失敗は必ず
-/// 先に `feed` される（NET-11）。
+/// （[`encode_barrier`] の `NFT_MSG_GETGEN` + `NLM_F_ACK`）を送り、その ACK を完了条件にする。
+/// 応答は FIFO なので、同期点の ACK より前に積まれた END の失敗は必ず先に `feed` される（NET-11）。
+/// 同期点の応答は NEWGEN と ACK の 2 データグラムになるため、1 データグラムで終わると仮定しない。
 ///
 /// 全体期限（REPAIR-5）を `deadline` で共有し、期限切れ・確認不能は `Unknown` にする。上限
 /// （[`MAX_TRAILING_DATAGRAMS`]）まで読んでも同期点の ACK が来なければ `ResourceExhausted`（`Unknown`）。
@@ -202,9 +205,32 @@ fn drain_until_barrier(
     )))
 }
 
-/// 同期点（`NLMSG_NOOP` + `NLM_F_REQUEST | NLM_F_ACK`）のバイト列を組み立てる。
+/// 同期点（`NFT_MSG_GETGEN` + `NLM_F_REQUEST | NLM_F_ACK`、nfgenmsg は `NFPROTO_UNSPEC`・res_id 0。
+/// 計 20 バイト）のバイト列を組み立てる（NET-11）。
+///
+/// nfnetlink が通常の要求として受理し、必ず ACK を返す要求を選ぶ。カーネル（`net/netfilter/nfnetlink.c`・
+/// `nf_tables_api.c`）での経路と選定理由:
+///
+/// - `nfnetlink_rcv` は `CAP_NET_ADMIN` を検査し（なければ `-EPERM` の ACK。バッチの BEGIN と同じ扱い）、
+///   `NFNL_MSG_BATCH_BEGIN` 以外を `netlink_rcv_skb(nfnetlink_rcv_msg)` へ渡す
+/// - `nfnetlink_rcv_msg` は nf_tables サブシステムの `NFT_MSG_GETGEN` コールバック（`nf_tables_getgen`）を
+///   呼び、これは同じ seq の `NFT_MSG_NEWGEN` を unicast して 0 を返す。続いて `netlink_rcv_skb` が
+///   `NLM_F_ACK` に応じて errno 0 の `NLMSG_ERROR` を積む。NEWGEN を積めなければエラーが返り、ACK は
+///   非 0 errno になる。nf_tables が未ロードでも非バッチ経路は `request_module` で読み込む
+/// - nfnetlink への送信はカーネル内で同期的に処理され、送信が戻った時点で直前のバッチの応答は受信
+///   キューに積まれている。よって後から送った同期点の ACK は、バッチのすべての応答より後に届く
+/// - `NLMSG_NOOP` は `NLMSG_MIN_TYPE` 未満の制御メッセージで nfnetlink の要求ではないため使わない。
+///   BEGIN / END への `NLM_F_ACK` はカーネル版数によっては ACK されないため完了条件にできない
+/// - GETGEN は読み取りのみの照会で、ルールセットを変更しない
 fn encode_barrier(seq: u32) -> Result<Vec<u8>, NetError> {
-    NlMsgBuilder::new(NLMSG_NOOP, NLM_F_REQUEST | NLM_F_ACK, seq, 0).finish()
+    let mut b = NlMsgBuilder::new(
+        nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_GETGEN),
+        NLM_F_REQUEST | NLM_F_ACK,
+        seq,
+        0,
+    );
+    NfGenMsg::new(NFPROTO_UNSPEC, 0).put_into(&mut b)?;
+    b.finish()
 }
 
 /// 判定後に読むデータグラム数の上限。
@@ -322,6 +348,23 @@ mod tests {
         b.finish().expect("finish")
     }
 
+    /// 同期点への応答 `NFT_MSG_NEWGEN`（カーネルの `nf_tables_fill_gen_info` と同じ形。属性は省略）。
+    fn gen_dgram(seq: u32) -> Vec<u8> {
+        let mut b = NlMsgBuilder::new(
+            nfnl_msg_type(
+                NFNL_SUBSYS_NFTABLES,
+                crate::nftables_batch::ack::NFT_MSG_NEWGEN,
+            ),
+            0,
+            seq,
+            0,
+        );
+        NfGenMsg::new(NFPROTO_UNSPEC, 0)
+            .put_into(&mut b)
+            .expect("nfgenmsg");
+        b.finish().expect("finish")
+    }
+
     /// 偽 recv: 順に返し、尽きたら Timeout。
     fn script(
         mut items: Vec<Result<Vec<u8>, NetError>>,
@@ -353,6 +396,7 @@ mod tests {
             |_| Ok(()),
             script(vec![
                 Ok([err_dgram(11, 0), err_dgram(12, 0)].concat()),
+                Ok(gen_dgram(14)),
                 Ok(err_dgram(14, 0)),
             ]),
         )
@@ -424,6 +468,7 @@ mod tests {
                 Ok(err_dgram(11, 17)),
                 Ok(err_dgram(12, 0)),
                 Ok(err_dgram(13, 12)),
+                Ok(gen_dgram(14)),
                 Ok(err_dgram(14, 0)),
             ]),
         )
@@ -443,11 +488,13 @@ mod tests {
             |_| Ok(()),
             move |_| {
                 n += 1;
-                if n == 1 {
-                    Ok(err_dgram(11, 0))
-                } else {
-                    std::thread::sleep(Duration::from_millis(60));
-                    Ok(err_dgram(13, 0))
+                match n {
+                    1 => Ok(err_dgram(11, 0)),
+                    2 => Ok(gen_dgram(13)),
+                    _ => {
+                        std::thread::sleep(Duration::from_millis(60));
+                        Ok(err_dgram(13, 0))
+                    }
                 }
             },
         )
@@ -491,6 +538,7 @@ mod tests {
             script(vec![
                 Ok(err_dgram(11, 0)),
                 Ok(err_dgram(12, 12)),
+                Ok(gen_dgram(13)),
                 Ok(err_dgram(13, 0)),
             ]),
         )
@@ -498,7 +546,7 @@ mod tests {
         assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
     }
 
-    /// NET-11: 同期点を END の次の seq・NOOP + REQUEST|ACK で送り、ACK が来るまで成功にしない。
+    /// NET-11: 同期点を END の次の seq（13）で送り、ACK が来るまで成功にしない。
     #[test]
     fn net11_success_requires_barrier_ack() {
         let b = batch(1);
@@ -536,20 +584,36 @@ mod tests {
         assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
     }
 
-    /// NET-11: 実カーネルは同期点（NOOP + NLM_F_ACK）に必ず応答する。CAP_NET_ADMIN があれば errno 0 の
-    /// ACK、なければ nfnetlink の入口で EPERM（権限不足のバッチは BEGIN でも EPERM になるため矛盾しない）。
+    /// NET-11: 実カーネルは同期点（GETGEN + NLM_F_ACK）に必ず応答する。CAP_NET_ADMIN があれば NEWGEN と
+    /// errno 0 の ACK の 2 データグラム、なければ nfnetlink の入口で EPERM の 1 データグラム（権限不足の
+    /// バッチは BEGIN でも EPERM になるため矛盾しない）。完了まで上限つきで読む。
     #[test]
     fn net11_kernel_answers_barrier() {
         let s = NetlinkNetfilterSocket::open().expect("open");
         s.inner
             .send(&encode_barrier(7).expect("barrier"))
             .expect("send");
-        let data = s.inner.recv(Duration::from_secs(5)).expect("recv");
         let mut c = NftBatchAckCollector::new(&batch(1));
         c.set_barrier(7);
-        match c.feed(&data) {
-            Ok(_) => assert!(c.barrier_acked()),
-            Err(e) => assert_eq!(e.code(), NetErrorCode::PermissionDenied),
+        let deadline = Deadline::after(Duration::from_secs(5));
+        let mut outcome = None;
+        for _ in 0..MAX_TRAILING_DATAGRAMS {
+            let data = s.inner.recv(deadline.remaining()).expect("recv");
+            match c.feed(&data) {
+                Ok(_) if c.barrier_acked() => {
+                    outcome = Some(Ok(()));
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    outcome = Some(Err(e.code()));
+                    break;
+                }
+            }
+        }
+        match outcome.expect("sync request answered") {
+            Ok(()) => assert!(c.barrier_acked()),
+            Err(code) => assert_eq!(code, NetErrorCode::PermissionDenied),
         }
     }
 
@@ -681,6 +745,7 @@ mod tests {
             |_| Ok(()),
             script(vec![
                 Ok([err_dgram(11, 0), err_dgram(12, 17)].concat()),
+                Ok(gen_dgram(14)),
                 Ok(err_dgram(14, 0)),
             ]),
         )

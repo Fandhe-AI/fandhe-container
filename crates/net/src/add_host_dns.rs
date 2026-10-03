@@ -14,9 +14,10 @@
 //! ネットワークモード（bridge / host / none）を引数に取らないため全モードで同じ処理になる。hosts ファイルの
 //! 生成・コンテナへの bind mount は runtime / core 側の責務で、本モジュールは既存の通常ファイルへ追記するだけ
 //! （無ければ作らず `NOT_FOUND`）。
-//! 追記先は symlink（途中ディレクトリを含む）・ハードリンク（nlink != 1）・他ユーザー所有を拒否し、
-//! 書き込み失敗時は同じロック下で書き込み前の長さへ戻す。巻き戻しにも失敗した場合は
-//! 不完全な行が残りうるため `DATA_LOSS` で通常の失敗と区別して返す。
+//! 追記先は symlink（途中ディレクトリを含む）・ハードリンク（nlink != 1）・他ユーザー所有・管理ルートと
+//! 別のマウント上のファイル（Linux は開いた fd の `mnt_id` で照合）を拒否し、書き込み失敗時は同じロック下で
+//! 書き込み前の長さへ戻す。巻き戻しにも失敗した場合は不完全な行が残りうるため `DATA_LOSS` で通常の失敗と
+//! 区別して返す。
 //!
 //! host/none の `--dns` 反映と none の loopback 制限は子モジュール `resolv_conf`（TASK-185.4・#347）。
 //! 上流転送（TASK-185.3）は未実装（REPAIR-3）。エラーの `message` は固定の英語文字列で、
@@ -381,87 +382,78 @@ fn verify_within_root(root: &Path, path: &Path) -> Result<(), NetError> {
     Ok(())
 }
 
-/// `/proc/self/mountinfo` の 1 フィールド内の 8 進エスケープ（`\040` 等）を元に戻す。
+/// `/proc/self/fdinfo/<fd>` の読み込み上限（無制限確保の防止。通常は数百バイト）。
 #[cfg(target_os = "linux")]
-fn unescape_mountinfo(field: &str) -> Vec<u8> {
-    let b = field.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        let oct = b
-            .get(i + 1..i + 4)
-            .filter(|d| b[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)));
-        if let Some(d) = oct {
-            let v = d.iter().fold(0u32, |a, c| a * 8 + u32::from(c - b'0'));
-            out.push((v & 0xff) as u8);
-            i += 4;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    out
-}
+const MAX_FDINFO_BYTES: u64 = 64 * 1024;
 
-/// mountinfo の本文に、`root` 配下（`root` 自身は除く）かつ `path` の祖先または `path` 自身である
-/// マウントポイントが含まれるかを返す（管理ルート内の bind mount 検出。パス要素ごとに判定する）。
-#[cfg(target_os = "linux")]
-fn mountinfo_has_inner_mount(text: &str, root: &Path, path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt as _;
-    text.lines().any(|line| {
-        let Some(mp) = line.split(' ').nth(4) else {
-            return false;
-        };
-        let mp = Path::new(std::ffi::OsStr::from_bytes(&unescape_mountinfo(mp))).to_path_buf();
-        mp != root && mp.starts_with(root) && path.starts_with(&mp)
-    })
-}
-
-/// 管理ルート内に外部ファイルを指す mount（bind mount 等）が無いことを確認する（P0・rootfs / マウント境界）。
+/// `/proc/self/fdinfo/<fd>` の本文から `mnt_id:` 行の値を取り出す（OS 呼び出しを含まない純粋関数）。
 ///
-/// `canonicalize` は mount を辿れないため、(1) 開いた fd のデバイスがルートと同一であること、
-/// (2) Linux では `/proc/self/mountinfo` に hosts パスまたはその祖先（ルートより下）のマウントポイントが
-/// 無いこと、を検査する。読めない・巨大な場合は fail-closed で拒否する。
-fn verify_no_foreign_mount(root: &Path, path: &Path, file: &File) -> Result<(), NetError> {
-    #[cfg_attr(not(unix), allow(unused_variables))]
-    let foreign = || {
-        NetError::new(
-            NetErrorCode::FailedPrecondition,
-            "hosts file lives on a mount outside the managed root",
-        )
-    };
+/// 行が無い・数値でない場合は `None`（呼び出し側は fail-closed で拒否する）。`lock:` 等の他の行は無視する。
+#[cfg(target_os = "linux")]
+fn parse_fdinfo_mnt_id(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("mnt_id:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// 開いた fd が属するマウントの ID を `/proc/self/fdinfo/<fd>` から読む（Linux 3.15 以降。unsafe 不要）。
+///
+/// パスを引き直さず fd 自身の情報を見るため、検査後にパス側の mount を差し替えられても影響を受けない。
+#[cfg(target_os = "linux")]
+fn fd_mount_id(file: &File) -> Result<u64, NetError> {
+    use std::os::fd::AsRawFd as _;
+    let mut text = String::new();
+    File::open(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
+        .and_then(|f| f.take(MAX_FDINFO_BYTES + 1).read_to_string(&mut text))
+        .map_err(|_| io_err("failed to read fdinfo"))?;
+    if u64::try_from(text.len()).map_or(true, |n| n > MAX_FDINFO_BYTES) {
+        return Err(io_err("fdinfo is too large"));
+    }
+    parse_fdinfo_mnt_id(&text).ok_or_else(|| io_err("mount id is missing in fdinfo"))
+}
+
+/// 開いた hosts ファイルが管理ルートと同じマウント上にあることを確認する
+/// （NET-12・TASK-185.2。rootfs / マウント境界の P0）。
+///
+/// [`verify_within_root`] の `canonicalize` はパス上の位置しか見ないため、管理ルート内の hosts パスや
+/// 途中ディレクトリへ外部ファイルを bind mount されると、パスはルート配下のまま外部ファイルを開いてしまう。
+/// bind mount は元と同じファイルシステムでも新しいマウントになるため、Linux では開いた fd 同士の
+/// `mnt_id`（管理ルートのディレクトリ fd と hosts ファイルの fd）が一致することを要求する。その他の Unix は
+/// デバイス番号の一致で代替する（同一ファイルシステム内の bind は検出できない。netns 系は Linux 限定）。
+/// `verify_within_root`（symlink を辿った実体がルート配下）と合わせ、ルートと同一マウント内のファイルに
+/// 限られる。`mnt_id` が読めない場合は拒否する（fail-closed）。
+fn verify_same_mount(root: &Path, file: &File) -> Result<(), NetError> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
-        let fm = file
-            .metadata()
-            .map_err(|_| io_err("failed to stat hosts file"))?;
-        let rm = std::fs::metadata(root).map_err(|_| io_err("failed to stat managed root"))?;
-        if fm.dev() != rm.dev() {
+        let foreign = || {
+            NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "hosts file lives on a mount outside the managed root",
+            )
+        };
+        let root_dir = File::open(root).map_err(|_| io_err("failed to open managed root"))?;
+        #[cfg(target_os = "linux")]
+        if fd_mount_id(&root_dir)? != fd_mount_id(file)? {
             return Err(foreign());
         }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let mut text = String::new();
-        File::open("/proc/self/mountinfo")
-            .and_then(|f| f.take(MAX_MOUNTINFO_BYTES + 1).read_to_string(&mut text))
-            .map_err(|_| io_err("failed to read mountinfo"))?;
-        if u64::try_from(text.len()).is_ok_and(|n| n > MAX_MOUNTINFO_BYTES) {
-            return Err(io_err("mountinfo is too large"));
+        #[cfg(not(target_os = "linux"))]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let rm = root_dir
+                .metadata()
+                .map_err(|_| io_err("failed to stat managed root"))?;
+            let fm = file
+                .metadata()
+                .map_err(|_| io_err("failed to stat hosts file"))?;
+            if rm.dev() != fm.dev() {
+                return Err(foreign());
+            }
         }
-        if mountinfo_has_inner_mount(&text, root, path) {
-            return Err(foreign());
-        }
     }
-    #[cfg(not(any(unix, target_os = "linux")))]
-    let _ = (root, path, file);
+    #[cfg(not(unix))]
+    let _ = (root, file);
     Ok(())
 }
-
-/// `/proc/self/mountinfo` の読み込み上限（無制限確保の防止）。
-#[cfg(target_os = "linux")]
-const MAX_MOUNTINFO_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 書き込み失敗後に書き込み前の長さへ戻し、結果に応じたエラーを返す。
 ///
@@ -573,7 +565,7 @@ pub fn append_add_hosts(
     let _guard = lock_guard_bounded(deadline)?;
     lock_exclusive_bounded(&file, deadline)?;
     verify_hosts_file(&file, hosts_path)?;
-    verify_no_foreign_mount(&root, hosts_path, &file)?;
+    verify_same_mount(&root, &file)?;
 
     let len = file
         .metadata()
@@ -1068,32 +1060,6 @@ mod tests {
     }
 
     /// NET-12・P1: 巻き戻しに失敗したら `DATA_LOSS`（復旧不能）で区別して返す。
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn mountinfo_detects_inner_bind_mount() {
-        let root = Path::new("/run/c/1");
-        let hosts = Path::new("/run/c/1/etc/hosts");
-        let mi = |mp: &str| format!("100 90 8:1 /x {mp} rw - ext4 /dev/sda1 rw\n");
-        // ファイル自体・祖先ディレクトリへの mount は検出する
-        assert!(mountinfo_has_inner_mount(
-            &mi("/run/c/1/etc/hosts"),
-            root,
-            hosts
-        ));
-        assert!(mountinfo_has_inner_mount(&mi("/run/c/1/etc"), root, hosts));
-        // ルート自身・ルート外・無関係な兄弟は検出しない
-        assert!(!mountinfo_has_inner_mount(&mi("/run/c/1"), root, hosts));
-        assert!(!mountinfo_has_inner_mount(&mi("/run"), root, hosts));
-        assert!(!mountinfo_has_inner_mount(&mi("/run/c/1/var"), root, hosts));
-        // 8 進エスケープ（空白）を復元して比較する
-        let sp = Path::new("/run/c/1/e tc/hosts");
-        assert!(mountinfo_has_inner_mount(
-            &mi("/run/c/1/e\\040tc"),
-            root,
-            sp
-        ));
-    }
-
     #[test]
     fn rollback_failure_is_reported_as_data_loss() {
         let f = TmpFile::new("rollback-fail", Some("abc\n"));

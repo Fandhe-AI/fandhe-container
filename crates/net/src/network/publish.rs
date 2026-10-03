@@ -710,6 +710,176 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 共有ファイルのテスト用の一時ディレクトリ（テストごとに別名。並列実行で衝突させない）。
+    fn shared_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fc-portreg-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 所有者のみ読み書き可（0600）で `text` を書く（[`verify_opened`] の権限検査を通し、内容の検査に
+    /// 届かせるため）。
+    fn write_private(path: &Path, text: &str) {
+        std::fs::write(path, text).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    /// 共有ファイルの行 1 つ分（`tcp 192.0.2.10 <5 桁のポート> <net> <ep>\n`）の固定部分の長さ。
+    const LINE_FIXED: usize = "tcp 192.0.2.10 10000  \n".len();
+
+    /// 符号化後の長さがちょうど `total` バイトになる予約表を作る。各行は 25〜151 バイトで、
+    /// ポート（10000 から連番）で受け口を一意にする。
+    fn map_with_encoded_len(total: usize) -> HashMap<ListenerKey, ListenerOwner> {
+        let line = |len: usize| {
+            let s = len - LINE_FIXED;
+            let net = s.saturating_sub(1).min(64);
+            (net, s - net)
+        };
+        let max_line = LINE_FIXED + 128;
+        let mut remaining = total - SHARED_HEADER.len() - SHARED_FOOTER.len();
+        let mut lens = Vec::new();
+        while remaining > max_line * 2 {
+            lens.push(max_line);
+            remaining -= max_line;
+        }
+        lens.push(remaining / 2);
+        lens.push(remaining - remaining / 2);
+        let mut map = HashMap::new();
+        for (i, len) in lens.into_iter().enumerate() {
+            let (n, e) = line(len);
+            let port = 10000 + u16::try_from(i).unwrap();
+            map.insert(
+                (PortProtocol::Tcp, a([192, 0, 2, 10]), port),
+                (
+                    NetworkName::new(&"n".repeat(n)).unwrap(),
+                    EndpointId::new(&"e".repeat(e)).unwrap(),
+                ),
+            );
+        }
+        map
+    }
+
+    /// NET-1・TASK-139.3: サイズ上限の検査は上限ちょうど（1 MiB = 1,048,576 バイト）を受理し、
+    /// 1 バイト超過を `ResourceExhausted` で拒否する（読み込み・書き込みで共有する関数）。
+    #[test]
+    fn net1_shared_len_limit_is_exact() {
+        assert_eq!(MAX_SHARED_FILE_BYTES, 1_048_576);
+        check_shared_len(1_048_576).unwrap();
+        assert_eq!(
+            check_shared_len(1_048_577).unwrap_err().code(),
+            NetErrorCode::ResourceExhausted
+        );
+    }
+
+    /// NET-1・TASK-139.3: 上限ちょうどの予約表は書けて同じ内容で読み直せる。1 バイト超過は書き込む前に
+    /// `ResourceExhausted` で拒否し、既存のファイルは変わらず一時ファイルも残らない。読み込み側も
+    /// 上限超過のファイルを同じ `ResourceExhausted` で拒否する。
+    #[test]
+    fn net1_shared_registry_enforces_size_limit_on_write_and_read() {
+        let dir = shared_dir("size");
+        let path = dir.join("ports.reg");
+        let exact = map_with_encoded_len(1_048_576);
+        assert_eq!(encode_shared(&exact).unwrap().len(), 1_048_576);
+        write_shared(&path, &exact).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1_048_576);
+        assert_eq!(parse_shared(&path).unwrap(), exact);
+
+        let over = map_with_encoded_len(1_048_577);
+        assert_eq!(
+            encode_shared(&over).unwrap_err().code(),
+            NetErrorCode::ResourceExhausted
+        );
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            write_shared(&path, &over).unwrap_err().code(),
+            NetErrorCode::ResourceExhausted
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!with_suffix(&path, ".tmp").exists());
+
+        // 上限ちょうどの内容に 1 行（25 バイト）足したファイルは、内容が正しくても読み込みで拒否する。
+        let mut text = String::from_utf8(before).unwrap();
+        let tail = text.len() - SHARED_FOOTER.len();
+        text.insert_str(tail, "udp 192.0.2.10 10000 n e\n");
+        assert_eq!(text.len(), 1_048_601);
+        write_private(&path, &text);
+        assert_eq!(
+            parse_shared(&path).unwrap_err().code(),
+            NetErrorCode::ResourceExhausted
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NET-1・TASK-139.3: 上限ちょうどの共有ファイルに予約を足すと `ResourceExhausted` で失敗し、
+    /// ファイル・件数とも変わらない（公開 API の `reserve` 経由）。
+    #[test]
+    fn net1_shared_registry_reserve_rejects_over_limit() {
+        let dir = shared_dir("reserve-limit");
+        let path = dir.join("ports.reg");
+        let exact = map_with_encoded_len(1_048_576);
+        write_shared(&path, &exact).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let web = NetworkName::new("web").unwrap();
+        let c1 = EndpointId::new("c1").unwrap();
+        let p80 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 80, 80).unwrap();
+        let mut r = PortRegistry::with_shared_file(path.clone());
+        assert_eq!(
+            r.reserve(&web, &c1, &[p80]).unwrap_err().code(),
+            NetErrorCode::ResourceExhausted
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(r.len(), exact.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NET-1・TASK-139.3: 同じ受け口の重複行（持ち主違い・同じ持ち主・`080` と `80` の表記違い）、
+    /// 書き込み側が出さない値（ポート 0・loopback・行末の CR）は破損として `Internal` で拒否し、
+    /// `release` もファイルを書き換えない。
+    #[test]
+    fn net1_shared_registry_rejects_duplicate_and_foreign_lines() {
+        let dir = shared_dir("dup");
+        let path = dir.join("ports.reg");
+        let web = NetworkName::new("web").unwrap();
+        let c1 = EndpointId::new("c1").unwrap();
+        let p81 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 81, 80).unwrap();
+        for body in [
+            "tcp 192.0.2.10 80 web c1\ntcp 192.0.2.10 80 web c2\n",
+            "tcp 192.0.2.10 80 web c1\ntcp 192.0.2.10 80 web c1\n",
+            "tcp 192.0.2.10 80 web c1\ntcp 192.0.2.10 080 db c2\n",
+            "tcp 192.0.2.10 0 web c1\n",
+            "tcp 127.0.0.1 80 web c1\n",
+            "tcp 192.0.2.10 80 web c1\r\n",
+        ] {
+            let text = format!("fandhe-portreg v1\n{body}end\n");
+            write_private(&path, &text);
+            let e = parse_shared(&path).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::Internal, "{body:?}");
+            assert_eq!(e.message(), "shared port registry is corrupt", "{body:?}");
+            let mut r = PortRegistry::with_shared_file(path.clone());
+            assert_eq!(
+                r.reserve(&web, &c1, &[p81]).unwrap_err().code(),
+                NetErrorCode::Internal
+            );
+            assert_eq!(
+                r.release(&web, &c1).unwrap_err().code(),
+                NetErrorCode::Internal
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        // 重複の無い 2 行は受理する（対照）。
+        write_private(
+            &path,
+            "fandhe-portreg v1\ntcp 192.0.2.10 80 web c1\nudp 192.0.2.10 80 web c2\nend\n",
+        );
+        assert_eq!(parse_shared(&path).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// NET-1・TASK-139.3: 共有ファイルが symlink・緩い権限なら拒否し、公開なしの attach は書き直さない。
     #[cfg(unix)]
     #[test]

@@ -24,8 +24,11 @@
 //! `sudo <exe> --ignored` で起動したランチャ（host netns の root プロセス）は、ネットワーク操作を一切
 //! せず、自身で `unshare --net -- <exe> --router` を起動して新規 netns を作る。router はその新規 netns
 //! の中のプロセスで、container と external は router から `unshare --net -- <exe> --child <role>` で起動する子（stdin/stdout の行
-//! プロトコルで操作）。external は毎回新しいソケット（新しい送信元ポート）で送り、conntrack の既存
-//! エントリの再利用による偽陽性・偽陰性を避ける。照合の順序は次のとおり。
+//! プロトコルで操作）。external は送信ごとに新しいソケットを bind して子の終了まで保持し、送信元ポートが
+//! 既存の保持ソケットと異なることを確かめてから送る。router も 3 回の送信元ポートが互いに異なることと、
+//! 受信側が見た送信元ポートが送信したポートと一致することを照合する。同じ送信元ポートが再利用されると
+//! 既存の conntrack エントリ（例: 3 で DNAT 済みのエントリ）が適用され、5 の判定が偽陽性・偽陰性になるため。
+//! 照合の順序は次のとおり。
 //!
 //! 1. 投入前: router 自身の待受ソケットに届く（送信元 10.211.2.2）
 //! 2. 1 バッチで table / chain / rule を投入する
@@ -321,7 +324,9 @@ mod linux {
         };
         // 送信に使ったソケットは子プロセス終了まで保持する。close すると次の bind(0) が同じ
         // 送信元ポートを再利用し得て、既存 conntrack エントリが適用され配送先判定を誤らせるため。
-        let mut held_senders: Vec<UdpSocket> = Vec::new();
+        // std の `UdpSocket::bind` は SO_REUSEADDR を立てないので保持中のポートは再割り当てされないが、
+        // その不変条件を送信前に明示的に検査する（偽の照合を fail-closed で弾く）。
+        let mut held_senders: Vec<(u16, UdpSocket)> = Vec::new();
         say("configured");
         while let Some(cmd) = read_line() {
             let mut parts = cmd.split_whitespace();
@@ -330,14 +335,23 @@ mod linux {
                 parts.next().and_then(|p| p.parse::<u16>().ok()),
             ) {
                 (Some("send"), Some(port)) => {
-                    // 毎回新しいソケット（新しい送信元ポート）で router の外側アドレスへ送る。
-                    // ソケットは held_senders に保持し続け、送信ごとに異なる送信元ポートを保証する。
+                    // 毎回新しいソケットを bind し、送信元ポートが保持中のどのソケットとも異なることを
+                    // 確かめてから router の外側アドレスへ送る。ソケットは held_senders に保持し続ける。
                     let s = UdpSocket::bind(SocketAddr::new(v4(addr), 0))
                         .map_err(|e| fail(format!("bind udp failed: {e}")))?;
+                    let src_port = s
+                        .local_addr()
+                        .map_err(|e| fail(format!("local_addr failed: {e}")))?
+                        .port();
+                    if held_senders.iter().any(|(p, _)| *p == src_port) {
+                        return Err(fail(format!(
+                            "source port {src_port} is already used by a held sender socket"
+                        )));
+                    }
                     s.send_to(b"fandhe", SocketAddr::new(v4(ROUTER_OUTER_ADDR), port))
                         .map_err(|e| fail(format!("send_to failed: {e}")))?;
-                    held_senders.push(s);
-                    say("sent");
+                    held_senders.push((src_port, s));
+                    say(&format!("sent {src_port}"));
                 }
                 (Some("recv"), None) => {
                     let s = listener
@@ -468,11 +482,10 @@ mod linux {
         assert!(ok, "util-linux `unshare` is required; see AGENTS.md");
     }
 
-    /// 受信側が見た `peer 10.x.y.z:port` から送信元 IP を取り出す。
-    fn peer_ip(line: &str) -> String {
+    /// 受信側が見た `peer 10.x.y.z:port` から送信元アドレスを取り出す。
+    fn peer_addr(line: &str) -> SocketAddr {
         line.strip_prefix("peer ")
-            .and_then(|r| r.rsplit_once(':'))
-            .map(|(ip, _)| ip.to_owned())
+            .and_then(|r| r.parse::<SocketAddr>().ok())
             .unwrap_or_else(|| panic!("unparsable peer line: {line:?}"))
     }
 
@@ -491,20 +504,33 @@ mod linux {
         .expect("router address");
     }
 
-    /// external から router の外側アドレス `HOST_PORT` 宛てに 1 個送る。
-    fn external_sends(external: &mut ChildGuard) {
+    /// external から router の外側アドレス `HOST_PORT` 宛てに 1 個送り、使った送信元ポートを返す。
+    ///
+    /// `used` はこれまでの送信元ポート。子側の検査に加えて router 側でも互いに異なることを照合し、
+    /// conntrack の既存エントリが再利用されない前提を独立に確かめる。
+    fn external_sends(external: &mut ChildGuard, used: &mut Vec<u16>) -> u16 {
         external.send(&format!("send {HOST_PORT}"));
-        external.expect_prefix("sent");
+        let line = external.expect_prefix("sent ");
+        let port = line
+            .strip_prefix("sent ")
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or_else(|| panic!("unparsable sent line: {line:?}"));
+        assert!(
+            !used.contains(&port),
+            "source port {port} reused (previous ports: {used:?}); conntrack entry would be reused"
+        );
+        used.push(port);
+        port
     }
 
-    /// router 自身の待受ソケットが受けた送信元 IP を返す（期限付き）。
-    fn router_receives(sock: &UdpSocket) -> String {
+    /// router 自身の待受ソケットが受けた送信元アドレスを返す（期限付き）。
+    fn router_receives(sock: &UdpSocket) -> SocketAddr {
         let mut buf = [0u8; 64];
         let (n, peer) = sock
             .recv_from(&mut buf)
             .expect("router did not receive the datagram before deadline");
         assert_eq!(buf.get(..n), Some(&b"fandhe"[..]), "router payload");
-        peer.ip().to_string()
+        peer
     }
 
     /// DNAT ルールの expr 列。`ip daddr == router 外側 && ip protocol == udp && udp dport == HOST_PORT`
@@ -603,10 +629,15 @@ mod linux {
             .set_read_timeout(Some(timeout()))
             .expect("router read timeout");
 
-        // 1. 投入前: router 自身に届く。
-        external_sends(&mut external);
+        // 1. 投入前: router 自身に届く。送信元ポートの一致で、この送信の datagram であることも照合する。
+        let mut used_ports = Vec::new();
+        let port_before = external_sends(&mut external, &mut used_ports);
         let before = router_receives(&router_sock);
-        assert_eq!(before, EXTERNAL_ADDR.to_string(), "before dnat (router)");
+        assert_eq!(
+            before,
+            SocketAddr::new(v4(EXTERNAL_ADDR), port_before),
+            "before dnat (router)"
+        );
 
         // 2. table / nat prerouting chain / DNAT rule を 1 バッチで投入する。
         let nft = NetlinkNetfilterSocket::open().expect("open NETLINK_NETFILTER");
@@ -643,10 +674,14 @@ mod linux {
         assert!(started.elapsed() < limit, "batch exceeded {limit:?}");
 
         // 3. 投入後: container の CONT_PORT に届く（送信元は変換されない）。AC1。
-        external_sends(&mut external);
+        let port_after = external_sends(&mut external, &mut used_ports);
         container.send("recv");
-        let after = peer_ip(&container.expect_prefix("peer "));
-        assert_eq!(after, EXTERNAL_ADDR.to_string(), "after dnat (container)");
+        let after = peer_addr(&container.expect_prefix("peer "));
+        assert_eq!(
+            after,
+            SocketAddr::new(v4(EXTERNAL_ADDR), port_after),
+            "after dnat (container)"
+        );
 
         // 4. ハンドル指定で削除する。AC2。
         let handle = NftRuleHandle::new(EXPECTED_RULE_HANDLE).expect("handle");
@@ -664,9 +699,14 @@ mod linux {
             });
 
         // 5. 削除後: 再び router 自身に届く（DNAT が外れた直接の証拠）。
-        external_sends(&mut external);
+        // 3 と異なる送信元ポートで送るため、3 で DNAT 済みの conntrack エントリは適用されない。
+        let port_removed = external_sends(&mut external, &mut used_ports);
         let removed = router_receives(&router_sock);
-        assert_eq!(removed, EXTERNAL_ADDR.to_string(), "after delete (router)");
+        assert_eq!(
+            removed,
+            SocketAddr::new(v4(EXTERNAL_ADDR), port_removed),
+            "after delete (router)"
+        );
 
         // 6. 同じハンドルの再削除は ENOENT（ハンドルで個別のルールを指している証拠）。
         let err = guard

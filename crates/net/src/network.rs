@@ -466,6 +466,16 @@ fn ownership_token(network: &NetworkName) -> String {
     )
 }
 
+/// `token` が `network` の作成時に [`ownership_token`] で発行した形式（`fandhe-net:<名前>:...`）か。
+/// 削除（`delete_network`。TASK-139.4）が、呼び出し側の渡す `CreatedNetwork` の各フィールドがネットワーク名と
+/// 食い違っていない（別ネットワークのトークンを組み合わせていない）ことの確認に使う。
+pub(crate) fn token_names_network(token: &str, network: &NetworkName) -> bool {
+    token
+        .strip_prefix("fandhe-net:")
+        .and_then(|rest| rest.strip_prefix(network.as_str()))
+        .is_some_and(|rest| rest.starts_with(':'))
+}
+
 /// 操作直前に ifindex の所有を再確認する。
 fn ensure_owned(
     ops: &impl NetworkOps,
@@ -1000,6 +1010,15 @@ pub(crate) struct UnpinFailure<N> {
     pub(crate) netns: N,
 }
 
+/// host 側 veth の所有トークン（`IFLA_IFALIAS`）を、ネットワークの所有トークンと endpoint から導出する。
+///
+/// 接続（`attach_container`）が刻み、削除（`delete_network`。TASK-139.4・NET-1）が再導出して照合する
+/// （呼び出し側が渡す `AttachedContainer::host_token` をそのまま所有の証明に使わないため）。形式
+/// （`<bridge_token>/ep/<endpoint>`）は既存 veth の照合に関わる契約で、変更すると削除で所有を証明できなくなる。
+pub(crate) fn host_owner_token(bridge_token: &str, endpoint: &EndpointId) -> String {
+    format!("{bridge_token}/ep/{}", endpoint.as_str())
+}
+
 /// 接続手順が使うカーネル操作の境界。Linux 実装とテストの fake を差し替えるための crate 内部トレイトで、
 /// 公開の拡張点（PLUG-1）ではない。[`NetworkOps`] とは独立（ネットワーク作成のテストに影響させない）。
 pub(crate) trait AttachOps {
@@ -1236,7 +1255,7 @@ pub(crate) fn attach_container_with<O: AttachOps>(
     };
 
     // ifindex は再利用されうるため、削除時に元の veth と照合できるよう所有トークンを刻む。
-    let host_token = format!("{}/ep/{}", spec.bridge_token, spec.endpoint.as_str());
+    let host_token = host_owner_token(&spec.bridge_token, &spec.endpoint);
     let attach = || {
         ops.set_owner_token(host_index, &host_token)
             .map_err(|e| (e, AttachStep::SetOwnerToken))?;

@@ -55,7 +55,13 @@
 //! veth の `IFLA_IFALIAS` へ所有トークンを刻み（`AttachedContainer::host_token`）、削除の直前に名前から
 //! ifindex・別名・所属先 master を引き直して、ifindex が記録と一致し、別名がトークンと一致し、かつ master が
 //! このネットワークの bridge であることを確認する。いずれかを満たさない link は元の veth と証明できないため
-//! 削除せず `Unknown` で報告する（ifindex が記録と異なる場合は元の veth は消失済みとして扱う）。
+//! 削除せず `Unknown` で報告する。ifindex が記録と異なり別名もトークンと異なる場合は、同名の別 link への
+//! 差し替えとみなし、元の veth は消失済みとして扱う。ifindex だけが異なりトークンが一致する場合は記録と実体の
+//! 食い違いとして `Unknown` で報告する（生存 veth を消失済みとみなして unpin・アドレス解放に進まない）。
+//!
+//! `AttachedContainer` のフィールドは公開されていて呼び出し側が書き換えうるため、照合に使うトークンは
+//! 入力検証でネットワークのトークンと endpoint から再導出した値（`host_owner_token`）と一致することを確かめる。
+//! peer 名・pin のパスも同様に再導出・記録した値と照合し、食い違えば何も変更せずに拒否する。
 //!
 //! コンテナ側の資源（veth・netns pin）が残るあいだは bridge を削除しない。bridge が消えると veth の所有の
 //! 証明（bridge への所属）を失い、再実行で残りを片付けられなくなるため（テーブルは先に削除してよい。
@@ -88,8 +94,9 @@ use crate::nftables_batch::{NftBatchOutcome, NftName, TableInfo};
 #[cfg(target_os = "linux")]
 use super::link_ref;
 use super::{
-    AttachedContainer, CreatedNetwork, EndpointId, NetnsDirRecord, NetworkName, NftApplyFailure,
-    PortRegistry, ResourceState, StaticIpam, UnpinFailure, VethNames, is_indeterminate,
+    AttachedContainer, CreatedNetwork, EndpointId, NetnsDirRecord, NetworkName,
+    NetworkResourceNames, NftApplyFailure, PortRegistry, ResourceState, StaticIpam, UnpinFailure,
+    VethNames, host_owner_token, is_indeterminate, token_names_network,
 };
 
 /// 失敗した手順。
@@ -322,7 +329,21 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
 ) -> Result<NetworkDeleteReport, NetworkDeleteError<O::Netns>> {
     let mut report = NetworkDeleteReport::default();
 
-    // 0. 入力検証（何も変更しない）。
+    // 0. 入力検証（何も変更しない）。`CreatedNetwork` も公開フィールドのため、bridge・テーブル名と
+    //    所有トークンがネットワーク名から導出したものと食い違っていないことを確かめる。
+    let consistent = NetworkResourceNames::derive(&network.name).is_ok_and(|n| {
+        n.bridge() == &network.bridge
+            && n.table() == &network.table
+            && token_names_network(&network.bridge_token, &network.name)
+    });
+    if !consistent {
+        return Err(fail(
+            precondition("network handle is inconsistent with its name"),
+            DeleteStep::Validate,
+            report,
+            containers,
+        ));
+    }
     if ipam.network() != &network.name || ipam.gateway() != network.gateway {
         return Err(fail(
             precondition("ipam does not belong to the network"),
@@ -347,13 +368,16 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
                 break;
             }
             Ok(names) => {
-                // pin 置き場の記録があれば、`netns_path` がその直下であることも確かめる（報告に使うパスを
-                // 接続時の置き場に揃える）。
+                // 公開フィールドは呼び出し側が書き換えうるため、所有の判断に使う値はすべてネットワークと
+                // IPAM から再導出した値と照合する。veth の所有トークンは bridge のトークンと endpoint から、
+                // pin のパスは接続時に記録した置き場（記録があれば）から導く。
                 let pin_mismatch = ipam
                     .netns_dir_of(&c.endpoint)
                     .is_some_and(|d| d.path().join(c.endpoint.as_str()) != c.netns_path);
                 if ipam.address_of(&c.endpoint) != Some(c.address)
                     || names.host() != &c.host_veth
+                    || names.peer() != &c.peer_veth
+                    || host_owner_token(&network.bridge_token, &c.endpoint) != c.host_token
                     || pin_mismatch
                 {
                     invalid = Some(precondition("container does not belong to the network"));
@@ -624,7 +648,20 @@ fn delete_veth<O: DeleteOps>(
             failures.note(e, DeleteStep::DeleteVeth);
             false
         }
-        Ok(LinkAttachment { index: now, .. }) if now != expected => {
+        Ok(LinkAttachment {
+            index: now, alias, ..
+        }) if now != expected => {
+            if alias.as_deref() == Some(token) {
+                // 所有トークンは一致するのに ifindex が記録と異なる。host 側 veth の ifindex は生存中に
+                // 変わらないため、渡された記録（`host_index`）が実体と食い違っている。この link を消失済みと
+                // 扱うと生存 veth を残したまま unpin とアドレス解放に進むので、削除も unpin もしない（fail-closed）。
+                report.leftover.push((res, ResourceState::Unknown));
+                failures.note(
+                    precondition("veth carries the ownership token but its ifindex differs"),
+                    DeleteStep::DeleteVeth,
+                );
+                return false;
+            }
             // 記録した ifindex の link は消えている（同名の別 link に差し替わった）。別 link は巻き込まず、
             // 消失済みとして扱い、pin の解除とアドレス解放に進めるようにする。
             report.removed.push(res);
@@ -810,7 +847,6 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     const TOKEN: &str = "fandhe-net:web:1:0:0";
-    const HOST_TOKEN: &str = "fandhe-net:web:1:0:0/ep/host";
     /// 接続時に記録した pin 置き場の識別子 (st_dev, st_ino)。
     const DIR_ID: (u64, u64) = (8, 9);
 
@@ -862,7 +898,8 @@ mod tests {
         table_no_handle: bool,
         /// veth の所属先 master。`None` は bridge（ifindex 7）、`Some(None)` は master なし。
         veth_master: Option<Option<u32>>,
-        /// veth の別名（所有トークン）。`None` は `HOST_TOKEN`、`Some(None)` は別名なし。
+        /// veth の別名（所有トークン）。`None` は名前に対応する endpoint の正しいトークン（`token_of`）、
+        /// `Some(None)` は別名なし。
         veth_alias: Option<Option<String>>,
         bridge_lookup_err: Option<NetErrorCode>,
         bridge_index: Option<u32>,
@@ -904,7 +941,7 @@ mod tests {
                 alias: self
                     .veth_alias
                     .clone()
-                    .unwrap_or_else(|| Some(HOST_TOKEN.to_owned())),
+                    .unwrap_or_else(|| token_for_host(name)),
             })
         }
         fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError> {
@@ -999,6 +1036,19 @@ mod tests {
         VethNames::derive(&eid(id)).unwrap().host().clone()
     }
 
+    /// 接続処理と同じ導出の、endpoint `id` の veth 所有トークン。
+    fn token_of(id: &str) -> String {
+        host_owner_token(TOKEN, &eid(id))
+    }
+
+    /// fake が名前から引く veth の別名（テストで使う endpoint のうち host 名が一致するもののトークン）。
+    fn token_for_host(name: &IfName) -> Option<String> {
+        ["c1", "c2", "c3", "q1"]
+            .into_iter()
+            .find(|id| host_of(id) == *name)
+            .map(token_of)
+    }
+
     fn netns_dir() -> PathBuf {
         std::env::temp_dir().join("fc-netns")
     }
@@ -1018,7 +1068,7 @@ mod tests {
             endpoint,
             host_veth: names.host().clone(),
             host_index: IfIndex::new(21).unwrap(),
-            host_token: HOST_TOKEN.to_owned(),
+            host_token: token_of(id),
             peer_veth: names.peer().clone(),
             netns_path: pin(id),
             address,
@@ -1194,8 +1244,10 @@ mod tests {
     fn net1_delete_veth_index_mismatch_is_treated_as_gone() {
         let (net, mut ipam, mut ports) = setup();
         let c1 = attached(&mut ipam, "c1");
+        // 同名で作り直された別 link（ifindex も別名も異なる）。
         let fake = Fake {
             veth_index: Some(99),
+            veth_alias: Some(Some("someone-else".to_owned())),
             ..Fake::default()
         };
         let report = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap();
@@ -1394,10 +1446,11 @@ mod tests {
     #[test]
     fn net1_delete_bridge_token_mismatch_not_deleted() {
         let (mut net, mut ipam, mut ports) = setup();
-        net.bridge_token = "other".to_owned();
+        // 形式は正しい（同じネットワーク名）が、カーネル上の bridge の別名（`TOKEN`）とは異なるトークン。
+        net.bridge_token = "fandhe-net:web:2:0:0".to_owned();
         // テーブルのトークンは一致する（テーブルの所有は bridge と独立に証明される）。
         let fake = Fake {
-            table_userdata: Some(b"other".to_vec()),
+            table_userdata: Some(b"fandhe-net:web:2:0:0".to_vec()),
             ..Fake::default()
         };
         let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();

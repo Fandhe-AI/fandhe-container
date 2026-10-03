@@ -1113,4 +1113,149 @@ mod tests {
         over.push(0);
         assert_eq!(skip_name(&over, HEADER_LEN), None);
     }
+
+    /// NET-12: 上流マッピング登録済みの送信元でも QCLASS≠IN（CH の version.bind 等）は転送せず REFUSED（AA=0）。
+    #[test]
+    fn non_in_class_is_refused_without_forwarding() {
+        let up = MockUpstream::start(Ipv4Addr::new(198, 51, 100, 1), 1, true);
+        let (h, _) = handler_with(&[(PEER1, up.addr)]);
+        let mut pkt = query(0x5150, EXTERNAL, 16, 0);
+        let last = pkt.len() - 1;
+        pkt[last] = 3; // QCLASS=CH
+        let (o, r) = respond_from(&h, sa(PEER1), &pkt);
+        assert_eq!(o, HandlerOutcome::Respond);
+        assert_eq!(&r[..2], &[0x51, 0x50]);
+        assert_eq!(r[2] & 0x04, 0, "AA");
+        assert_eq!(r[3] & 0x0F, 5, "REFUSED");
+        assert_eq!(&r[6..8], &[0, 0], "ANCOUNT");
+        assert_eq!(&r[HEADER_LEN..], &pkt[HEADER_LEN..], "question echoed");
+        assert_eq!(up.count(), 0);
+        assert_eq!(h.forward_failed(), 0);
+    }
+
+    /// 応答メッセージ: ID 7・QR=1・RD=1・RA=1・QDCOUNT=1・ANCOUNT=1 で、質問 `EXTERNAL` A/IN の後に
+    /// 名前 `answer_name`・型 `rtype` の RR を 1 件（RDLENGTH は `rdata` の長さ）置く。
+    fn reply_with(answer_name: &[u8], rtype: u16, rdata: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let question: Vec<u8> = [EXTERNAL, &[0, 1, 0, 1]].concat();
+        let mut v = vec![0, 7, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        v.extend_from_slice(&question);
+        v.extend_from_slice(answer_name);
+        v.extend_from_slice(&rtype.to_be_bytes());
+        v.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+        v.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+        v.extend_from_slice(rdata);
+        (v, question)
+    }
+
+    /// NET-12: 圧縮ポインタは参照先を終端まで検証する。質問の先頭（12）は受理、ラベルの途中（13。`e`=0x65 は
+    /// 予約ビット 0x40 を持つ）を指すポインタは拒否する。
+    #[test]
+    fn pointer_target_must_be_a_valid_name() {
+        let (ok, q) = reply_with(&[0xC0, 12], 1, &[1, 2, 3, 4]);
+        assert!(validate_upstream_reply(&ok, 7, &q));
+        let (bad, q) = reply_with(&[0xC0, 13], 1, &[1, 2, 3, 4]);
+        assert!(!validate_upstream_reply(&bad, 7, &q));
+    }
+
+    /// NET-12: 後方参照どうしの相互参照（20 のラベル `x` の後のポインタが再び 20 を指す）はループとして拒否する。
+    /// 旧実装の「ポインタ自身より前」だけの条件では通ってしまう形。
+    #[test]
+    fn skip_name_rejects_pointer_loop() {
+        let mut msg = vec![0u8; 32];
+        msg[20..24].copy_from_slice(&[1, b'x', 0xC0, 20]);
+        msg[30..32].copy_from_slice(&[0xC0, 20]);
+        assert_eq!(skip_name(&msg, 30), None);
+        // 同じ位置でも終端があれば受理する（参照先 20 の `x` + 終端）。
+        msg[22..24].copy_from_slice(&[0, 0]);
+        assert_eq!(skip_name(&msg, 30), Some(32));
+    }
+
+    /// 12 の終端（長さ 0）へ向かって 1 つ前のポインタを指すポインタを `hops` 個並べ、最後のポインタの位置を返す。
+    fn pointer_chain(hops: usize) -> (Vec<u8>, usize) {
+        let mut msg = vec![0u8; HEADER_LEN + 2];
+        for k in 1..=hops {
+            let target = HEADER_LEN + 2 * (k - 1);
+            msg.push(0xC0 | u8::try_from(target >> 8).unwrap());
+            msg.push(u8::try_from(target & 0xFF).unwrap());
+        }
+        let start = HEADER_LEN + 2 * hops;
+        (msg, start)
+    }
+
+    /// NET-12: ポインタの追跡回数は MAX_POINTER_HOPS（127）まで（127 回は受理、128 回は拒否）。
+    #[test]
+    fn skip_name_bounds_pointer_hops() {
+        assert_eq!(MAX_POINTER_HOPS, 127);
+        let (msg, start) = pointer_chain(127);
+        assert_eq!(skip_name(&msg, start), Some(start + 2));
+        let (msg, start) = pointer_chain(128);
+        assert_eq!(skip_name(&msg, start), None);
+    }
+
+    /// NET-12: 展開後の名前長はポインタ経由のラベルも合算して 255 以下（参照先 200 + 手前 51 = 251 は受理、
+    /// 200 + 61 = 261 は拒否）。
+    #[test]
+    fn skip_name_counts_labels_reached_via_pointer() {
+        let mut base = vec![0u8; HEADER_LEN];
+        for _ in 0..3 {
+            base.push(63);
+            base.extend_from_slice(&[b'a'; 63]);
+        }
+        base.push(7);
+        base.extend_from_slice(&[b'b'; 7]);
+        base.push(0);
+        assert_eq!(base.len(), HEADER_LEN + 201);
+        let with_prefix = |label: u8| {
+            let mut m = base.clone();
+            let start = m.len();
+            m.push(label);
+            m.extend(std::iter::repeat_n(b'c', usize::from(label)));
+            m.extend_from_slice(&[0xC0, 12]);
+            (m, start)
+        };
+        let (m, start) = with_prefix(50);
+        assert_eq!(skip_name(&m, start), Some(m.len()));
+        let (m, start) = with_prefix(60);
+        assert_eq!(skip_name(&m, start), None);
+    }
+
+    /// NET-12: 名前を含む RDATA（CNAME・MX・SOA）も、圧縮ポインタの参照先と RDATA 末尾との一致を検証する。
+    #[test]
+    fn rdata_names_are_validated() {
+        // CNAME: `www` + 質問名へのポインタは受理、ラベル途中を指すポインタ・自己参照・RDATA 超過は拒否。
+        let (ok, q) = reply_with(&[0xC0, 12], 5, b"\x03www\xC0\x0C");
+        assert!(validate_upstream_reply(&ok, 7, &q));
+        let (bad, q) = reply_with(&[0xC0, 12], 5, b"\x03www\xC0\x0D");
+        assert!(!validate_upstream_reply(&bad, 7, &q), "cname bad pointer");
+        let rdata_start = u8::try_from(HEADER_LEN + q.len() + 2 + 10).unwrap();
+        let (bad, q) = reply_with(&[0xC0, 12], 5, &[1, b'x', 0xC0, rdata_start]);
+        assert!(!validate_upstream_reply(&bad, 7, &q), "cname self loop");
+        // RDLENGTH 3 の `\x02ab` は終端を持たず、続く 2 件目の RR（ルート名・A）の先頭 0 を巻き込んで終わる。
+        // RR 境界だけなら末尾ちょうどで完結するが、名前が RDATA を越えるため拒否する。
+        let (mut bad, q) = reply_with(&[0xC0, 12], 5, b"\x02ab");
+        bad[7] = 2;
+        bad.extend_from_slice(&[0, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
+        assert!(
+            !validate_upstream_reply(&bad, 7, &q),
+            "cname overruns rdata"
+        );
+        let (mut ok, q) = reply_with(&[0xC0, 12], 5, b"\x02ab\x00");
+        ok[7] = 2;
+        ok.extend_from_slice(&[0, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
+        assert!(validate_upstream_reply(&ok, 7, &q), "cname within rdata");
+        // MX: PREFERENCE 2 バイト + 名前。
+        let (ok, q) = reply_with(&[0xC0, 12], 15, &[0, 10, 0xC0, 12]);
+        assert!(validate_upstream_reply(&ok, 7, &q));
+        let (bad, q) = reply_with(&[0xC0, 12], 15, &[0, 10, 0xC0, 13]);
+        assert!(!validate_upstream_reply(&bad, 7, &q), "mx bad pointer");
+        // SOA: 名前 2 つ + 固定 20 バイト。1 バイト不足は拒否。
+        let soa: Vec<u8> = [&[0xC0, 12, 0xC0, 12][..], &[0u8; 20]].concat();
+        let (ok, q) = reply_with(&[0xC0, 12], 6, &soa);
+        assert!(validate_upstream_reply(&ok, 7, &q));
+        let (bad, q) = reply_with(&[0xC0, 12], 6, &soa[..soa.len() - 1]);
+        assert!(!validate_upstream_reply(&bad, 7, &q), "soa short");
+        // 未知の型（TXT=16）は RDLENGTH の境界検査のみ。
+        let (ok, q) = reply_with(&[0xC0, 12], 16, &[3, b'a', b'b', b'c']);
+        assert!(validate_upstream_reply(&ok, 7, &q));
+    }
 }

@@ -1908,6 +1908,19 @@ mod tests {
         assert!(a.bytes().all(|c| c.is_ascii_graphic()) && a.len() <= 255);
     }
 
+    /// NET-1・TASK-139.4: `token_names_network` は発行形式（`fandhe-net:<名前>:`）の名前部分だけを照合する
+    /// （接頭辞が一致する別名 `web2` や形式外の値を受け入れない）。
+    #[test]
+    fn net1_token_names_network_matches_exact_name() {
+        let web = NetworkName::new("web").unwrap();
+        assert!(token_names_network(&ownership_token(&web), &web));
+        assert!(token_names_network("fandhe-net:web:1:0:0", &web));
+        assert!(!token_names_network("fandhe-net:web2:1:0:0", &web));
+        assert!(!token_names_network("fandhe-net:db:1:0:0", &web));
+        assert!(!token_names_network("fandhe-net:web", &web));
+        assert!(!token_names_network("other:web:1:0:0", &web));
+    }
+
     /// NET-1: bridge 作成の Timeout は fail-closed（削除せず Unknown で報告）。
     #[test]
     fn net1_bridge_timeout_is_unknown_leftover() {

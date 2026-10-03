@@ -1263,6 +1263,91 @@ mod tests {
         assert_eq!(ipam.allocated_count(), 0);
     }
 
+    /// NET-1・TASK-139.4・P0: 所有トークンが一致するのに ifindex だけが記録と異なる（渡された `host_index` が
+    /// 実体と食い違う）場合は、生存 veth を消失済みとみなさず、削除も unpin もせずにアドレスを保持する。
+    #[test]
+    fn net1_delete_refuses_token_match_with_index_mismatch() {
+        let (net, mut ipam, mut ports) = setup();
+        let c1 = attached(&mut ipam, "c1");
+        let fake = Fake {
+            veth_index: Some(99),
+            ..Fake::default()
+        };
+        let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
+        assert_eq!(
+            (e.code(), e.step),
+            (NetErrorCode::FailedPrecondition, DeleteStep::DeleteVeth)
+        );
+        assert_eq!(
+            e.message(),
+            "veth carries the ownership token but its ifindex differs"
+        );
+        assert!(
+            e.report
+                .leftover
+                .contains(&(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown))
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+        assert!(!fake.calls().iter().any(|c| c == "unpin_netns"));
+        assert_eq!(e.retry.len(), 1);
+        assert_eq!(ipam.allocated_count(), 1);
+    }
+
+    /// NET-1・TASK-139.4・P0: `CreatedNetwork` の bridge 名・テーブル名・所有トークンがネットワーク名と
+    /// 食い違えば（別ネットワークの値の組み合わせ）、何も呼ばずに入力検証で拒否する。
+    #[test]
+    fn net1_delete_rejects_inconsistent_network_handle() {
+        let other = NetworkResourceNames::derive(&NetworkName::new("db").unwrap()).unwrap();
+        for forge in ["bridge", "table", "token"] {
+            let (mut net, mut ipam, mut ports) = setup();
+            let c1 = attached(&mut ipam, "c1");
+            match forge {
+                "bridge" => net.bridge = other.bridge().clone(),
+                "table" => net.table = other.table().clone(),
+                _ => net.bridge_token = "fandhe-net:db:1:0:0".to_owned(),
+            }
+            let fake = Fake::default();
+            let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
+            assert_eq!(
+                (e.code(), e.step),
+                (NetErrorCode::FailedPrecondition, DeleteStep::Validate),
+                "{forge}"
+            );
+            assert_eq!(e.message(), "network handle is inconsistent with its name");
+            assert!(fake.calls().is_empty(), "{forge}");
+            assert_eq!(e.retry.len(), 1);
+            assert_eq!(ipam.allocated_count(), 1);
+        }
+    }
+
+    /// NET-1・TASK-139.4・P0: 渡したコンテナの所有トークン・peer 名がネットワークと endpoint から再導出した
+    /// 値と異なれば、何も呼ばずに入力検証で拒否する（書き換えたトークンを所有の証明に使わせない）。
+    #[test]
+    fn net1_delete_rejects_forged_host_token_or_peer() {
+        for forge in ["token", "peer"] {
+            let (net, mut ipam, mut ports) = setup();
+            let mut c1 = attached(&mut ipam, "c1");
+            match forge {
+                "token" => c1.host_token = "fandhe-net:other:9:9:9/ep/c1".to_owned(),
+                _ => c1.peer_veth = VethNames::derive(&eid("zzz")).unwrap().peer().clone(),
+            }
+            let fake = Fake {
+                veth_alias: Some(Some("fandhe-net:other:9:9:9/ep/c1".to_owned())),
+                ..Fake::default()
+            };
+            let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
+            assert_eq!(
+                (e.code(), e.step),
+                (NetErrorCode::FailedPrecondition, DeleteStep::Validate),
+                "{forge}"
+            );
+            assert_eq!(e.message(), "container does not belong to the network");
+            assert!(fake.calls().is_empty(), "{forge}");
+            assert_eq!(e.retry.len(), 1);
+            assert_eq!(ipam.allocated_count(), 1);
+        }
+    }
+
     /// NET-1・TASK-139.4・P1: ifindex が一致しても、所有トークンが無い・異なる link（ifindex の再利用）は
     /// 元の veth と証明できず、削除しない（unpin もしない）。
     #[test]

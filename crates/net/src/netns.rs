@@ -11,7 +11,10 @@
 //! `unshare(CLONE_NEWNET)` → `/proc/thread-self/ns/net` を open → pin 先ファイルへ bind マウント、を行って
 //! 終了する。`CLONE_NEWNET` は `CLONE_NEWUSER` と違いマルチスレッドのプロセスでも合法で、影響は
 //! 呼び出したスレッドだけに閉じる。元の netns へ戻る必要が生じないので `setns` は使わない。
-//! 結果（ns ファイルの fd）は `Mutex` + `Condvar` の受け渡し口で返し、待ちは期限つき（REPAIR-5）。
+//! 同じスレッドで、その netns に束縛された `NETLINK_ROUTE` ソケットの fd も開いて返す（netlink ソケットは
+//! 作成時の netns に束縛されるため、コンテナ netns の中の address / route を操作する手段はこれだけ。
+//! `setns` を使わないので `unsafe` も増えない。TASK-139.3・#316）。bind 以降は呼び出し側スレッドが行う。
+//! 結果（ns ファイルの fd とソケット fd）は `Mutex` + `Condvar` の受け渡し口で返し、待ちは期限つき（REPAIR-5）。
 //! 期限切れ後に完了したスレッドは、自分で pin のアンマウントとファイル削除を行って回収する
 //! （受け渡し口が `Abandoned` に切り替わっていることを完了時にロック下で確認する）。
 //!
@@ -58,7 +61,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::error::{NetError, NetErrorCode};
-use crate::netlink_route::classify_errno;
+use crate::instrument::NetOpRecorder;
+use crate::netlink_route::{NetlinkRouteSocket, classify_errno};
 use crate::network::{EndpointId, NetnsFailure, ResourceState, UnpinFailure};
 use crate::sys::{self, SysError};
 
@@ -74,6 +78,9 @@ const THREAD_NS_PATH: &CStr = c"/proc/thread-self/ns/net";
 pub struct ContainerNetns {
     fd: OwnedFd,
     pin: PathBuf,
+    /// この netns に束縛された route ソケット。接続処理の終わりに [`release_route_socket`]
+    /// で閉じる（コンテナごとに fd を常駐させない。CORE-9）。
+    route: Option<NetlinkRouteSocket>,
 }
 
 impl ContainerNetns {
@@ -86,6 +93,16 @@ impl ContainerNetns {
     /// pin 先のパス（runtime が join に使う）。
     pub fn pin_path(&self) -> &Path {
         &self.pin
+    }
+
+    /// netns の中で動く route ソケット（接続処理の途中だけ存在する）。解放済みなら `None`。
+    pub(crate) fn route_socket(&self) -> Option<&NetlinkRouteSocket> {
+        self.route.as_ref()
+    }
+
+    /// route ソケットを閉じる（接続処理の成功時に呼ぶ。pin と ns の fd は保持したまま）。
+    pub(crate) fn release_route_socket(&mut self) {
+        self.route = None;
     }
 }
 
@@ -160,9 +177,12 @@ fn check_base_dir(base: &Path) -> Result<(), NetError> {
 
 /// 使い捨てスレッドの本体。`unshare` → ns を open → 保持中の fd 経由で pin 先へ bind マウント。
 /// bind マウントが最後の副作用なので、`Err` のときは pin のマウントは作られていない。
-fn unshare_and_pin(target: &CStr) -> Result<(OwnedFd, FileId), NetError> {
+fn unshare_and_pin(target: &CStr) -> Result<(OwnedFd, FileId, OwnedFd), NetError> {
     // 影響は当スレッドの netns だけ。このスレッドは戻り値を返したら終了する。
     sys::unshare_net().map_err(|e| sys_error("unshare", e))?;
+    // 新 netns に束縛された route ソケットを、bind マウント（最後の副作用）より前に開く。
+    // 失敗しても pin のマウントは作られていない。
+    let sock = sys::open_route_socket().map_err(|e| sys_error("socket", e))?;
     let ns = File::open("/proc/thread-self/ns/net").map_err(|e| io_error("open thread ns", &e))?;
     // pin のマウント越しに見える inode は netns 自身のものになる。所有証明用に控える（`PINS`）。
     let ns_id = ns
@@ -170,7 +190,7 @@ fn unshare_and_pin(target: &CStr) -> Result<(OwnedFd, FileId), NetError> {
         .map(|m| file_id(&m))
         .map_err(|e| io_error("stat thread ns", &e))?;
     sys::bind_mount(THREAD_NS_PATH, target).map_err(|e| sys_error("mount", e))?;
-    Ok((OwnedFd::from(ns), ns_id))
+    Ok((OwnedFd::from(ns), ns_id, sock))
 }
 
 /// `/proc/self/mountinfo` の `mountpoint` 欄（8 進エスケープ `\040` 等）を元のバイト列へ戻す。
@@ -284,6 +304,7 @@ pub(crate) fn create_pinned(
     base: &Path,
     id: &EndpointId,
     timeout: Duration,
+    recorder: &Arc<dyn NetOpRecorder>,
 ) -> Result<ContainerNetns, NetnsFailure> {
     let fail = |error: NetError, leftover: Option<ResourceState>| NetnsFailure { error, leftover };
     let dir = Arc::new(open_pin_dir(base).map_err(|e| fail(e, None))?);
@@ -352,9 +373,9 @@ pub(crate) fn create_pinned(
             let _hold = file;
             let _dir = worker_dir;
             let inflight = inflight;
-            let result = unshare_and_pin(&target).map(|(fd, ns_id)| {
+            let result = unshare_and_pin(&target).map(|(fd, ns_id, sock)| {
                 set_pin_ns(fid, ns_id);
-                fd
+                (fd, sock)
             });
             let (lock, cv) = &*worker_handoff;
             let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -386,7 +407,26 @@ pub(crate) fn create_pinned(
         .unwrap_or_else(PoisonError::into_inner);
     // 未完了なら、ロックを握ったまま `Abandoned` にして回収をスレッドへ引き継ぐ（完了との競合を防ぐ）。
     match std::mem::replace(&mut *guard, Slot::Abandoned) {
-        Slot::Done(Ok(fd)) => Ok(ContainerNetns { fd, pin }),
+        Slot::Done(Ok((fd, sock))) => {
+            // bind 以降は呼び出し側スレッドで行う（bind は socket 作成時の netns を引き継ぐ）。
+            match NetlinkRouteSocket::from_unbound_route_fd(sock, Arc::clone(recorder)) {
+                Ok(route) => Ok(ContainerNetns {
+                    fd,
+                    pin,
+                    route: Some(route),
+                }),
+                Err(error) => {
+                    // pin は mount 済み。ハンドルを作れないので、ここで pin を解除して片付ける。
+                    drop(fd);
+                    drop(guard);
+                    let leftover = match unpin_path(&pin) {
+                        Ok(()) => None,
+                        Err(_) => Some(ResourceState::Present),
+                    };
+                    Err(fail(error, leftover))
+                }
+            }
+        }
         Slot::Done(Err(error)) => Err(fail(error, remove_pin_file(&via, fid))),
         Slot::Pending => Err(fail(
             NetError::new(NetErrorCode::Timeout, "timed out creating netns"),
@@ -404,7 +444,7 @@ enum Slot {
     /// スレッドが未完了。
     Pending,
     /// スレッドが完了し、結果を置いた。
-    Done(Result<OwnedFd, NetError>),
+    Done(Result<(OwnedFd, OwnedFd), NetError>),
     /// 呼び出し側が期限切れで見切った。以後の後始末は完了時のスレッドが担う。
     Abandoned,
 }
@@ -779,6 +819,10 @@ impl Drop for InflightGuard {
 mod tests {
     use super::*;
 
+    fn noop_recorder() -> Arc<dyn NetOpRecorder> {
+        Arc::new(crate::instrument::NoopNetOpRecorder)
+    }
+
     /// NET-1・TASK-139.2.1: 置き場ディレクトリ検査の具体的な合否。
     #[test]
     fn net1_base_dir_attr_checks() {
@@ -1097,7 +1141,7 @@ mod tests {
         let link = real.with_extension("link");
         symlink(&real, &link).unwrap();
         let id = EndpointId::new("web-1").unwrap();
-        let f = create_pinned(&link, &id, Duration::from_secs(1)).unwrap_err();
+        let f = create_pinned(&link, &id, Duration::from_secs(1), &noop_recorder()).unwrap_err();
         assert_eq!(f.error.code(), NetErrorCode::FailedPrecondition);
         assert_eq!(f.leftover, None);
         assert_eq!(fs::read_dir(&real).unwrap().count(), 0);
@@ -1126,7 +1170,7 @@ mod tests {
         let id = EndpointId::new("web-1").unwrap();
         let pin = dir.join("web-1");
         fs::write(&pin, b"keep").unwrap();
-        let f = create_pinned(&dir, &id, Duration::from_secs(1)).unwrap_err();
+        let f = create_pinned(&dir, &id, Duration::from_secs(1), &noop_recorder()).unwrap_err();
         assert_eq!(f.error.code(), NetErrorCode::AlreadyExists);
         assert_eq!(f.leftover, None);
         assert_eq!(fs::read(&pin).unwrap(), b"keep");

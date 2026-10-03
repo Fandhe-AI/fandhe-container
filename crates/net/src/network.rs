@@ -436,7 +436,7 @@ fn collision_or(e: NetError) -> NetError {
 }
 
 /// 作成が不明な結果（時間切れ・応答破損）か。
-fn is_indeterminate(code: NetErrorCode) -> bool {
+pub(crate) fn is_indeterminate(code: NetErrorCode) -> bool {
     matches!(code, NetErrorCode::Timeout | NetErrorCode::DataLoss)
 }
 
@@ -1449,7 +1449,7 @@ impl LinuxAttachOps<'_> {
 }
 
 #[cfg(target_os = "linux")]
-fn link_ref(index: IfIndex) -> Result<LinkRef, NetError> {
+pub(crate) fn link_ref(index: IfIndex) -> Result<LinkRef, NetError> {
     let raw = i32::try_from(index.get())
         .map_err(|_| NetError::new(NetErrorCode::InvalidArgument, "ifindex exceeds i32::MAX"))?;
     Ok(LinkRef::Index(LinkIndex::new(raw)?))

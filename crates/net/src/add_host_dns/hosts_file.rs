@@ -4,7 +4,8 @@
 //! 「管理ルート（コンテナ状態ディレクトリ）」とそこからの相対パスで指定する。
 //!
 //! # 境界の守り方（rootfs・マウント境界の P0）
-//! - 管理ルートを `O_DIRECTORY | O_NOFOLLOW` で開いたディレクトリ fd を起点に、相対パスの各要素を
+//! - 管理ルートは `canonicalize` 後に `/` から 1 要素ずつ `O_DIRECTORY | O_NOFOLLOW` で辿り直して開き
+//!   （祖先の symlink 差し替えによるすり替えを辿らない）、そのディレクトリ fd を起点に相対パスの各要素を
 //!   `openat(O_NOFOLLOW)`（`crate::sys` の薄いラッパー）で 1 要素ずつ辿って開く。途中・最終要素が
 //!   symlink（検証後の差し替えを含む）なら `ELOOP` / `ENOTDIR` で失敗するため、パスを再解決する検査と
 //!   open の間の競合（TOCTOU）で管理外のファイルを開くことはない。`..`・絶対パス・`.` は辿る前に拒否する。
@@ -85,7 +86,46 @@ fn unsupported() -> NetError {
     )
 }
 
+/// 管理ルートの絶対パス `abs`（`canonicalize` 済み）を `/` から 1 要素ずつ `openat(O_NOFOLLOW |
+/// O_DIRECTORY)` で辿ってディレクトリ fd を得る（`canonicalize` 後に祖先が symlink へ差し替えられても
+/// 辿らず失敗する。祖先の再解決による管理ルートのすり替えを防ぐ）。
+///
+/// 祖先が symlink・非ディレクトリなら `FAILED_PRECONDITION`、不在なら `NOT_FOUND`。
+fn open_abs_dir_nofollow(abs: &Path) -> Result<OwnedFd, NetError> {
+    let map = |e: SysError| match e {
+        SysError::Os(sys::ENOENT) => {
+            NetError::new(NetErrorCode::NotFound, "managed root does not exist")
+        }
+        SysError::Os(sys::ELOOP | sys::ENOTDIR) => NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "managed root has a symlink or non-directory component",
+        ),
+        SysError::Os(sys::EACCES | sys::EPERM) => NetError::new(
+            NetErrorCode::PermissionDenied,
+            "permission denied while opening managed root",
+        ),
+        SysError::Unsupported => unsupported(),
+        _ => io_err("failed to open managed root"),
+    };
+    let mut comps = abs.components();
+    if comps.next() != Some(Component::RootDir) {
+        return Err(io_err("managed root is not an absolute path"));
+    }
+    let mut cur = sys::open_dir_nofollow(c"/").map_err(map)?;
+    for c in comps {
+        let Component::Normal(n) = c else {
+            return Err(io_err("managed root is not a normalized path"));
+        };
+        let name =
+            CString::new(n.as_bytes()).map_err(|_| io_err("failed to resolve managed root"))?;
+        cur = sys::open_dir_nofollow_at(cur.as_fd(), &name).map_err(map)?;
+    }
+    Ok(cur)
+}
+
 /// 管理ルートとその配下の hosts ファイルを、symlink を辿らずに 1 要素ずつ開く。
+///
+/// 管理ルートは `canonicalize` した後、`/` から要素ごとに辿り直す（[`open_abs_dir_nofollow`]）。
 ///
 /// `rel` は空でない相対パスで、全要素が通常の名前であること（絶対パス・`..`・`.` は `INVALID_ARGUMENT`）。
 /// 戻り値は（管理ルートのディレクトリ fd, hosts ファイルの fd）。
@@ -119,12 +159,7 @@ fn open_in_root(managed_root: &Path, rel: &Path) -> Result<(File, File), NetErro
             io_err("failed to resolve managed root")
         }
     })?;
-    let root_c = CString::new(root.as_os_str().as_bytes())
-        .map_err(|_| io_err("failed to resolve managed root"))?;
-    let root_fd = sys::open_dir_nofollow(&root_c).map_err(|e| match e {
-        SysError::Unsupported => unsupported(),
-        _ => io_err("failed to open managed root"),
-    })?;
+    let root_fd = open_abs_dir_nofollow(&root)?;
     let mut cur: Option<OwnedFd> = None;
     for d in dirs {
         let base = cur.as_ref().unwrap_or(&root_fd).as_fd();

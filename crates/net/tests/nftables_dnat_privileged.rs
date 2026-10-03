@@ -319,6 +319,9 @@ mod linux {
         } else {
             None
         };
+        // 送信に使ったソケットは子プロセス終了まで保持する。close すると次の bind(0) が同じ
+        // 送信元ポートを再利用し得て、既存 conntrack エントリが適用され配送先判定を誤らせるため。
+        let mut held_senders: Vec<UdpSocket> = Vec::new();
         say("configured");
         while let Some(cmd) = read_line() {
             let mut parts = cmd.split_whitespace();
@@ -328,10 +331,12 @@ mod linux {
             ) {
                 (Some("send"), Some(port)) => {
                     // 毎回新しいソケット（新しい送信元ポート）で router の外側アドレスへ送る。
+                    // ソケットは held_senders に保持し続け、送信ごとに異なる送信元ポートを保証する。
                     let s = UdpSocket::bind(SocketAddr::new(v4(addr), 0))
                         .map_err(|e| fail(format!("bind udp failed: {e}")))?;
                     s.send_to(b"fandhe", SocketAddr::new(v4(ROUTER_OUTER_ADDR), port))
                         .map_err(|e| fail(format!("send_to failed: {e}")))?;
+                    held_senders.push(s);
                     say("sent");
                 }
                 (Some("recv"), None) => {

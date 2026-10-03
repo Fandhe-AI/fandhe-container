@@ -69,6 +69,11 @@
 //! 設計で、渡されていない生存コンテナがあれば何も変更せず拒否する。方針・順序・残余リスクは
 //! `delete` モジュールの doc を参照。
 //!
+//! # 実機検証（TASK-139.5・#318）
+//!
+//! 作成・接続・削除の統合 API を通しで使う 3 経路疎通と所要時間計測は、実機前提テスト
+//! `tests/network_paths_privileged.rs`（`--ignored` / `--measure`。`AGENTS.md`「実機前提テスト」節）が担う。
+//!
 //! # 未実装範囲（REPAIR-3）
 //!
 //! - masquerade ルール本体（`bitwise` / `meta` expr が `nftables_rules` に未実装のため `postrouting`

@@ -651,6 +651,30 @@ startup-latency-report: ## own と Docker の起動時間の結果を 1 つの�
 	bash scripts/bench/startup_latency.sh --mode report --own-result $(call fio_bench_sq,$(OWN_RESULT)) --docker-result $(call fio_bench_sq,$(DOCKER_RESULT))$(if $(OUTPUT), --output $(call fio_bench_sq,$(OUTPUT)))
 
 # --------------------------------------------------
+# ネットワーク作成・接続・削除の所要時間計測（TASK-139.5・NET-1・NET-4。Linux・root・実機前提）
+# --------------------------------------------------
+# `scripts/bench/net_setup_timing.sh` は network_paths_privileged の `--measure` を実行し、操作ごとの
+# 中央値等を単位 ms の JSON で出す。sudo も cargo も呼ばないため、実行は
+# `cargo test -p fandhe-container-net --test network_paths_privileged --no-run` で得た実行ファイルを
+# `sudo make net-setup-timing EXE=<絶対パス>` で渡す（root 実行は人間の明示操作。実測・比較・判定は TASK-140）。
+# 実機前提のため `make ci` には含めない。自己テストはスタブ exe で完結し CI の bench-regression ジョブで実行する。
+.PHONY: net-setup-timing-selftest
+net-setup-timing-selftest: ## ネットワーク作成/接続/削除の所要時間計測スクリプトの自己テスト（NET-4・REPAIR-12。実機不要）
+	@if ! command -v jq >/dev/null 2>&1; then \
+		echo "jq is required but not found: install it (e.g. brew install jq / apt-get install jq)" >&2; \
+		exit 1; \
+	fi
+	bash scripts/bench/net_setup_timing_selftest.sh
+
+.PHONY: net-setup-timing
+net-setup-timing: ## ネットワーク作成/接続/削除の所要時間を JSON で出力する（実機前提。EXE=<絶対パス> 必須。NET-4・TASK-139.5）
+	@if [ -z $(call fio_bench_sq,$(EXE)) ]; then \
+		echo "usage: sudo make net-setup-timing EXE=<abs-path of network_paths_privileged built by cargo test --no-run> [TRIALS=<n>] [WARMUP=<n>] [LABEL=<label>] [OUTPUT=<new file>]" >&2; \
+		exit 2; \
+	fi
+	bash scripts/bench/net_setup_timing.sh --exe $(call fio_bench_sq,$(EXE))$(if $(TRIALS), --trials $(call fio_bench_sq,$(TRIALS)))$(if $(WARMUP), --warmup $(call fio_bench_sq,$(WARMUP)))$(if $(LABEL), --label $(call fio_bench_sq,$(LABEL)))$(if $(OUTPUT), --output $(call fio_bench_sq,$(OUTPUT)))
+
+# --------------------------------------------------
 # アイドル時常駐メモリ計測（TASK-45.1・CORE-7。Linux 限定。bash のみで完結）
 # --------------------------------------------------
 

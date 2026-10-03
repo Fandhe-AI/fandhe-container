@@ -45,3 +45,11 @@ harness = false
 name = "network_attach_privileged"
 path = "tests/network_attach_privileged.rs"
 harness = false
+
+# 統合 API（create_network / attach_container / delete_network）を通しで使う 3 経路疎通の実機結合試験と、
+# 作成・接続・削除の所要時間計測（NET-1・TASK-139.5・#318）。子の再入（--inner / --child）と root 前提の分離のため
+# harness = false。`--ignored`（疎通）または `--measure`（計測）指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "network_paths_privileged"
+path = "tests/network_paths_privileged.rs"
+harness = false

@@ -53,3 +53,18 @@ harness = false
 name = "network_paths_privileged"
 path = "tests/network_paths_privileged.rs"
 harness = false
+
+# DNS ヘルパーのプロセス起動・準備完了待ち・ループバック UDP 往復・回収の非特権結合試験（NET-5・TASK-141.1・#321）。
+# 自身をヘルパーとして再実行するため harness = false。root 不要で 3 OS の既定集合で実行する。
+[[test]]
+name = "dns_helper_process"
+path = "tests/dns_helper_process.rs"
+harness = false
+
+# DNS ヘルパーを bridge 上のネットワーク用 netns で起動しコンテナ netns から UDP 疎通する実機結合試験
+# （NET-5・TASK-141.1・#321）。子の再入（--inner / --listen / --dns-client）と root 前提の分離のため
+# harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "dns_helper_privileged"
+path = "tests/dns_helper_privileged.rs"
+harness = false

@@ -128,18 +128,23 @@ fn exchange(
                 _ => Err(collector.timeout_error(total)),
             };
         }
-        match result? {
-            Progress::Done(ack) => {
-                // 同期点の seq は END の次（呼び出し側が範囲を予約済み）。
-                let barrier_seq = seq_after(batch.end_seq());
-                collector.set_barrier(barrier_seq);
-                let barrier = encode_barrier(barrier_seq).map_err(|e| collector.unknown(e))?;
-                // 送れなければ END の判定を確認できない（適用済みかも不明）。
-                send_barrier(&barrier).map_err(|e| collector.unknown(e))?;
-                return drain_until_barrier(&mut collector, deadline, total, recv).map(|()| ack);
-            }
-            Progress::Pending => {}
-        }
+        let decided = match result? {
+            Progress::Pending => continue,
+            Progress::Done(ack) => Ok(ack),
+            // 失敗を含む。同期点まで読み切って全応答を集めてから確定する。
+            Progress::Failed => Err(()),
+        };
+        // 同期点の seq は END の次（呼び出し側が範囲を予約済み）。
+        let barrier_seq = seq_after(batch.end_seq());
+        collector.set_barrier(barrier_seq);
+        let barrier = encode_barrier(barrier_seq).map_err(|e| collector.unknown(e))?;
+        // 送れなければ END の判定を確認できない（適用済みかも不明）。
+        send_barrier(&barrier).map_err(|e| collector.unknown(e))?;
+        drain_until_barrier(&mut collector, deadline, total, recv)?;
+        return match decided {
+            Ok(ack) => Ok(ack),
+            Err(()) => Err(collector.aborted()),
+        };
     }
 }
 
@@ -169,7 +174,12 @@ fn drain_until_barrier(
         }
         match recv(remaining) {
             Ok(data) => {
-                collector.feed(&data)?;
+                let result = collector.feed(&data);
+                // 受信・解析中に期限を過ぎた場合は、同期点の ACK 済みでも成功にしない（REPAIR-5）。
+                if deadline.remaining().is_zero() {
+                    return Err(collector.timeout_error(total));
+                }
+                result?;
             }
             Err(e) if e.code() == NetErrorCode::Timeout => {
                 return Err(collector.timeout_error(total));
@@ -397,6 +407,51 @@ mod tests {
         assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
     }
 
+    /// NET-11: 本体の失敗が判定済みでも、同期点まで読み切り、別データグラムの END の失敗も失敗一覧に含む。
+    #[test]
+    fn net11_failures_across_datagrams_are_all_collected() {
+        let b = batch(2);
+        // 本体 seq 11,12 / END seq 13 / 同期点 seq 14。
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![
+                Ok(err_dgram(11, 17)),
+                Ok(err_dgram(12, 0)),
+                Ok(err_dgram(13, 12)),
+                Ok(err_dgram(14, 0)),
+            ]),
+        )
+        .expect_err("failures");
+        assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
+        assert_eq!(e.failures().len(), 2);
+    }
+
+    /// REPAIR-5: 同期点の ACK を解析中に期限を過ぎたら成功にせず Timeout / Unknown。
+    #[test]
+    fn repair5_deadline_expiry_while_receiving_sync_ack_is_timeout() {
+        let b = batch(1);
+        let mut n = 0;
+        let e = run(
+            &b,
+            Duration::from_millis(40),
+            |_| Ok(()),
+            move |_| {
+                n += 1;
+                if n == 1 {
+                    Ok(err_dgram(11, 0))
+                } else {
+                    std::thread::sleep(Duration::from_millis(60));
+                    Ok(err_dgram(13, 0))
+                }
+            },
+        )
+        .expect_err("expired");
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+    }
+
     /// REPAIR-5: 末尾の読み切り中に期限が切れたら Timeout / Unknown。
     #[test]
     fn repair5_deadline_expiry_during_trailing_is_timeout() {
@@ -620,7 +675,10 @@ mod tests {
             &b,
             Duration::from_secs(5),
             |_| Ok(()),
-            script(vec![Ok([err_dgram(11, 0), err_dgram(12, 17)].concat())]),
+            script(vec![
+                Ok([err_dgram(11, 0), err_dgram(12, 17)].concat()),
+                Ok(err_dgram(14, 0)),
+            ]),
         )
         .expect_err("fail");
         assert_eq!(e.outcome(), NftBatchOutcome::Aborted);

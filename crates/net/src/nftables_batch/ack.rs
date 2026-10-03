@@ -15,6 +15,8 @@
 //!   これは [`NftBatchPosition::Begin`] として即座に確定し、キューに残る後続の応答は読まない
 //!   （ソケットが seq を一意に採番するため、次のバッチは seq 不一致として破棄する）
 //! - BEGIN / END への errno 0 の ACK は許容して無視する（カーネル版数で返る場合がある）
+//! - 本体に失敗があっても判定が揃った時点では確定せず（`Progress::Failed`）、同期点の ACK まで読んで
+//!   別データグラムの失敗も `failures()` に集めてから `aborted` で確定する
 //! - 完了条件は本体の全 seq に判定が揃うこと。END は `NLM_F_ACK` を持たず成功時は無応答のため待てないが、
 //!   失敗（非 0 errno）が別データグラムで届き得る。そこで判定後に同期点（`NLMSG_NOOP` + `NLM_F_ACK` の
 //!   別要求）を送り、その ACK が届くまで読む（`socket::drain_until_barrier`）。応答は FIFO のため、
@@ -197,6 +199,9 @@ pub(crate) enum Progress {
     Pending,
     /// 全本体が成功した。
     Done(NftBatchAck),
+    /// 全本体の判定が揃ったが、失敗を含む。後続のデータグラム（同期点より前に積まれた END の失敗や
+    /// 別データグラムの応答）をすべて確認してから [`NftBatchAckCollector::aborted`] で確定する。
+    Failed,
 }
 
 /// 1 バッチ分の応答を集めて判定する状態機械。
@@ -349,7 +354,7 @@ impl NftBatchAckCollector {
                 body_seqs: self.body_seqs.clone(),
             }))
         } else {
-            Err(self.aborted())
+            Ok(Progress::Failed)
         }
     }
 
@@ -360,7 +365,7 @@ impl NftBatchAckCollector {
     }
 
     /// カーネルが失敗を返した場合のエラー（outcome は `Aborted`）。
-    fn aborted(&self) -> NftBatchError {
+    pub(crate) fn aborted(&self) -> NftBatchError {
         let failures = self.sorted_failures();
         let (code, message) = match failures.first() {
             Some(first) => (
@@ -495,9 +500,11 @@ mod tests {
     #[test]
     fn net11_partial_failure_identifies_message() {
         let mut c = NftBatchAckCollector::new(&batch(3));
-        let e = c
+        let p = c
             .feed(&cat(&[ok(101), err_dgram(102, 17, 102), ok(103)]))
-            .expect_err("failure");
+            .expect("decided");
+        assert_eq!(p, Progress::Failed);
+        let e = c.aborted();
         assert_eq!(e.failures(), &[fail(1, 102, 17)][..]);
         assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
         assert_eq!(e.code(), NetErrorCode::AlreadyExists);
@@ -511,15 +518,32 @@ mod tests {
     #[test]
     fn net11_multiple_failures_are_all_listed() {
         let mut c = NftBatchAckCollector::new(&batch(3));
-        let e = c
+        let p = c
             .feed(&cat(&[
                 err_dgram(103, 22, 103),
                 err_dgram(101, 2, 101),
                 ok(102),
             ]))
-            .expect_err("failure");
+            .expect("decided");
+        assert_eq!(p, Progress::Failed);
+        let e = c.aborted();
         assert_eq!(e.failures(), &[fail(0, 101, 2), fail(2, 103, 22)][..]);
         assert_eq!(e.code(), NetErrorCode::NotFound);
+        assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
+    }
+
+    /// NET-11: 失敗を含んで判定が揃っても即確定せず、後続データグラムの失敗も `aborted` に含まれる。
+    #[test]
+    fn net11_failure_in_later_datagram_is_collected_after_failed() {
+        let mut c = NftBatchAckCollector::new(&batch(2));
+        assert_eq!(
+            c.feed(&err_dgram(101, 17, 101)).expect("pending"),
+            Progress::Pending
+        );
+        assert_eq!(c.feed(&ok(102)).expect("decided"), Progress::Failed);
+        // 判定済みの後に届く END の失敗は即座に確定する（先の失敗も保持する）。
+        let e = c.feed(&err_dgram(103, 12, 103)).expect_err("end failure");
+        assert_eq!(e.failures().len(), 2);
         assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
     }
 

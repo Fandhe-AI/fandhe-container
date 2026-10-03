@@ -89,7 +89,7 @@ mod linux {
         }
     }
 
-    /// `/proc/<pid>/ns/net` が読めるようになるまで待つ（`unshare` の exec 完了待ち）。
+    /// `sleep` を起動する（`unshare_net` 時は `unshare --net` 経由）。起動完了の待機は `wait_comm_sleep` が担う。
     fn spawn_sleep(unshare_net: bool) -> Child {
         let mut cmd = if unshare_net {
             let mut c = Command::new("unshare");

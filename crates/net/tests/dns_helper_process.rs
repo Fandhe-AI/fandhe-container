@@ -8,11 +8,15 @@
 use std::net::{Ipv4Addr, UdpSocket};
 use std::time::Duration;
 
+use fandhe_container_net::dns_helper::refcount::{
+    DnsHelperRefCounts, JoinOutcome, LeaveOutcome, ProcessLauncher,
+};
 use fandhe_container_net::dns_helper::{
     DnsListenAddr, READY_TIMEOUT_DEFAULT, REAP_TIMEOUT_DEFAULT, run_dns_helper_main,
     spawn_dns_helper,
 };
 use fandhe_container_net::error::NetErrorCode;
+use fandhe_container_net::network::{EndpointId, NetworkName};
 
 fn query(id: u16, flags: u16, qd: u16) -> Vec<u8> {
     let mut v = id.to_be_bytes().to_vec();
@@ -27,6 +31,54 @@ fn full_query(id: u16) -> Vec<u8> {
     let mut v = query(id, 0x0100, 1);
     v.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
     v
+}
+
+/// 参照カウント経由の 0→1→0 往復（NET-7・TASK-144.1・#329）。起動中は応答し、最後の離脱後は応答しない。
+fn refcount_roundtrip(exe: &std::path::Path) {
+    let launcher = ProcessLauncher::new(
+        exe.to_path_buf(),
+        READY_TIMEOUT_DEFAULT,
+        REAP_TIMEOUT_DEFAULT,
+    )
+    .expect("launcher");
+    let rc = DnsHelperRefCounts::new(launcher);
+    let net = NetworkName::new("refcnt").expect("net");
+    let (e1, e2) = (
+        EndpointId::new("c1").expect("e1"),
+        EndpointId::new("c2").expect("e2"),
+    );
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    assert_eq!(
+        rc.join(&net, listen, &e1).expect("join"),
+        JoinOutcome::Started
+    );
+    assert_eq!(
+        rc.join(&net, listen, &e2).expect("join"),
+        JoinOutcome::Joined { members: 2 }
+    );
+    let target = rc.bound_addr(&net).expect("bound");
+    let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client");
+    client
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut buf = [0u8; 600];
+    let mut answered = false;
+    for _ in 0..20 {
+        client.send_to(&full_query(0x1234), target).expect("send");
+        if client.recv_from(&mut buf).is_ok() {
+            answered = true;
+            break;
+        }
+    }
+    assert!(answered, "helper did not answer while members remain");
+    assert_eq!(
+        rc.leave(&net, &e1).expect("leave"),
+        LeaveOutcome::Remaining { members: 1 }
+    );
+    assert_eq!(rc.leave(&net, &e2).expect("leave"), LeaveOutcome::Stopped);
+    assert!(!rc.is_running(&net));
+    client.send_to(&full_query(0x1234), target).expect("send");
+    assert!(client.recv_from(&mut buf).is_err(), "helper must be gone");
 }
 
 fn main() -> std::process::ExitCode {
@@ -80,6 +132,8 @@ fn main() -> std::process::ExitCode {
     let busy_listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, port).expect("busy addr");
     let e = spawn_dns_helper(&exe, busy_listen, READY_TIMEOUT_DEFAULT).expect_err("busy");
     assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+
+    refcount_roundtrip(&exe);
     println!("dns_helper_process: ok");
     std::process::ExitCode::SUCCESS
 }

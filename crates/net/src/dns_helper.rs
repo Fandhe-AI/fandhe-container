@@ -5,8 +5,8 @@
 //! - ネットワーク（`network::create_network` が作る bridge）の gateway の IPv4:53 に UDP で待ち受ける
 //!   ヘルパープロセスを 1 つ起動する基盤。質問セクションのパース（[`parse_question`]）、コンテナ名 → IPv4 の
 //!   レジストリ（[`DnsRegistry`]）、A 応答・REFUSED / NODATA の組み立て（[`RegistryHandler`]）を持つ
-//!   （TASK-141.2・#322）。上流 DNS への転送は TASK-185、参照カウントによるオンデマンド起動・終了と
-//!   SIGTERM による正常終了は TASK-144 の責務
+//!   （TASK-141.2・#322）。上流 DNS への転送は TASK-185、参照カウントによるオンデマンド起動・終了は
+//!   [`refcount`]（NET-7・TASK-144.1・#329）が持つ。SIGTERM による正常終了は未実装（REPAIR-3）
 //! - 呼び出し側（将来の統一 CLI / 製品バイナリ。TASK-79）は [`spawn_dns_helper`] で自身または専用バイナリを
 //!   `--listen <ipv4:port>` つきで起動し、ヘルパー側の `main` は [`run_dns_helper_main`] を呼ぶ
 //!
@@ -52,6 +52,8 @@ use std::time::{Duration, Instant};
 
 use crate::error::{NetError, NetErrorCode};
 use crate::network::CreatedNetwork;
+
+pub mod refcount;
 
 /// DNS の既定ポート。
 pub const DNS_PORT: u16 = 53;
@@ -450,7 +452,7 @@ pub enum UnregisterOutcome {
 /// コンテナ名 → IPv4 アドレスのレジストリ（NET-5）。`Arc` で `serve` スレッドと登録側が共有する。
 ///
 /// 登録側はコンテナ接続（`network::attach_container` が返すアドレスが IPv4 のとき）で [`register`](Self::register)、
-/// 切断・停止で [`unregister`](Self::unregister) を呼ぶ。参照カウントと自動起動 / 終了は TASK-144（NET-7）、
+/// 切断・停止で [`unregister`](Self::unregister) を呼ぶ。参照カウントと自動起動 / 終了は [`refcount`]（NET-7・TASK-144.1）、
 /// 上流転送は TASK-185（NET-12）の責務。アドレスがサブネット内かの検証は行わない。
 #[derive(Debug, Default)]
 pub struct DnsRegistry {
@@ -875,7 +877,7 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
         fail_line("INTERNAL", "cannot write readiness line");
         return ExitCode::from(1);
     }
-    // 親が kill するまで動き続ける。正常終了（SIGTERM）は TASK-144 の責務。
+    // 親が kill するまで動き続ける。正常終了（SIGTERM）は未実装（REPAIR-3）。
     // プロセス外からの登録経路が未実装（REPAIR-3）の間は RegistryHandler に切り替えず NOTIMP を返す
     // （空レジストリで名前解決を妨げない）。経路の接続は後続タスク（NET-5）。
     let stop = AtomicBool::new(false);

@@ -28,6 +28,12 @@
 //! レジストリに無い名前は存在・不存在を断定せず REFUSED（AA=0）を返す（上流転送 TASK-185 まで）。
 //! PLUG-1 における DNS ヘルパーの core / plugin 区分は検討中で、確定扱いにはしない。
 //!
+//! # 実機計測（TASK-141.3・#323）
+//! 正答率・レイテンシ・常駐 PSS の実機計測は `crates/net/tests/dns_helper_privileged.rs` の `--measure` モードと
+//! `scripts/bench/dns_helper_measure.sh` が行う。計測対象は上記の未実装（REPAIR-3）のため製品の入口
+//! [`run_dns_helper_main`] ではなく、テストバイナリが [`DnsHelperServer`] + [`RegistryHandler`] を直接組み立てた
+//! 計測専用ヘルパーである。製品の入口の数値ではないことに注意（実測・判定は TASK-142）。
+//!
 //! # 安全性
 //! 受信バッファは固定長（513 バイト）で、512 バイト超は破棄する。外部入力の解析は `get` / `try_into` のみで
 //! 添字アクセス・`unwrap` を使わない。ヘッダー不正のパケットには応答しない。応答は要求長 + [`MAX_RESPONSE_GROWTH`]

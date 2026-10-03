@@ -675,6 +675,31 @@ net-setup-timing: ## ネットワーク作成/接続/削除の所要時間を JS
 	bash scripts/bench/net_setup_timing.sh --exe $(call fio_bench_sq,$(EXE))$(if $(TRIALS), --trials $(call fio_bench_sq,$(TRIALS)))$(if $(WARMUP), --warmup $(call fio_bench_sq,$(WARMUP)))$(if $(LABEL), --label $(call fio_bench_sq,$(LABEL)))$(if $(OUTPUT), --output $(call fio_bench_sq,$(OUTPUT)))
 
 # --------------------------------------------------
+# DNS ヘルパーの正答率・レイテンシ・常駐 PSS 計測（TASK-141.3・NET-5。Linux・root・cgroup v2・実機前提）
+# --------------------------------------------------
+# `scripts/bench/dns_helper_measure.sh` は dns_helper_privileged の `--measure` を実行し、正答率・p50/p99（単位 us）・
+# 専用 cgroup の cgroup.procs から取った PID の PSS/RSS（単位 kB）を JSON で出す。計測対象はテストバイナリが組み立てた
+# DnsHelperServer + RegistryHandler で、製品の入口 run_dns_helper_main ではない（REPAIR-3）。sudo も cargo も呼ばないため、
+# `cargo test -p fandhe-container-net --test dns_helper_privileged --no-run` で得た実行ファイルを
+# `sudo make dns-helper-measure EXE=<絶対パス>` で渡す（root 実行は人間の明示操作。実測・比較・判定は TASK-142）。
+# 実機前提のため `make ci` には含めない。自己テストはスタブ exe・疑似 cgroup / proc で完結し CI の bench-regression ジョブで実行する。
+.PHONY: dns-helper-measure-selftest
+dns-helper-measure-selftest: ## DNS ヘルパー計測スクリプトの自己テスト（NET-5・REPAIR-12。実機不要）
+	@if ! command -v jq >/dev/null 2>&1; then \
+		echo "jq is required but not found: install it (e.g. brew install jq / apt-get install jq)" >&2; \
+		exit 1; \
+	fi
+	bash scripts/bench/dns_helper_measure_selftest.sh
+
+.PHONY: dns-helper-measure
+dns-helper-measure: ## DNS ヘルパーの正答率・レイテンシ・常駐 PSS を JSON で出力する（実機前提。EXE=<絶対パス> 必須。NET-5・TASK-141.3）
+	@if [ -z $(call fio_bench_sq,$(EXE)) ]; then \
+		echo "usage: sudo make dns-helper-measure EXE=<abs-path of dns_helper_privileged built by cargo test --no-run> [QUERIES=<n>] [WARMUP=<n>] [TIMEOUT=<secs>] [LABEL=<label>] [OUTPUT=<new file>]" >&2; \
+		exit 2; \
+	fi
+	bash scripts/bench/dns_helper_measure.sh --exe $(call fio_bench_sq,$(EXE))$(if $(QUERIES), --queries $(call fio_bench_sq,$(QUERIES)))$(if $(WARMUP), --warmup $(call fio_bench_sq,$(WARMUP)))$(if $(TIMEOUT), --timeout $(call fio_bench_sq,$(TIMEOUT)))$(if $(LABEL), --label $(call fio_bench_sq,$(LABEL)))$(if $(OUTPUT), --output $(call fio_bench_sq,$(OUTPUT)))
+
+# --------------------------------------------------
 # アイドル時常駐メモリ計測（TASK-45.1・CORE-7。Linux 限定。bash のみで完結）
 # --------------------------------------------------
 

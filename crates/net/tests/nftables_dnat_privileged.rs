@@ -21,8 +21,9 @@
 //! external  (10.211.2.2/24)
 //! ```
 //!
-//! router は `sudo unshare -n <exe> --ignored` で隔離 netns に入ったテストプロセス自身で、container と
-//! external は router から `unshare --net -- <exe> --child <role>` で起動する子（stdin/stdout の行
+//! `sudo <exe> --ignored` で起動したランチャ（host netns の root プロセス）は、ネットワーク操作を一切
+//! せず、自身で `unshare --net -- <exe> --router` を起動して新規 netns を作る。router はその新規 netns
+//! の中のプロセスで、container と external は router から `unshare --net -- <exe> --child <role>` で起動する子（stdin/stdout の行
 //! プロトコルで操作）。external は毎回新しいソケット（新しい送信元ポート）で送り、conntrack の既存
 //! エントリの再利用による偽陽性・偽陰性を避ける。照合の順序は次のとおり。
 //!
@@ -56,10 +57,12 @@ fn main() {
         let role = args.get(pos + 1).map(String::as_str).unwrap_or("");
         linux::child(role);
     } else if args.iter().any(|a| a == "--ignored") {
+        linux::launcher();
+    } else if args.iter().any(|a| a == "--router") {
         linux::router();
     } else {
         println!(
-            "nftables_dnat_privileged: ignored (requires root and `unshare -n`; run the built executable with `--ignored` under `sudo unshare -n`, see AGENTS.md)"
+            "nftables_dnat_privileged: ignored (requires root and `unshare`; run the built executable with `--ignored` under `sudo`, see AGENTS.md)"
         );
     }
 }
@@ -130,8 +133,14 @@ mod linux {
         IpAddr::V4(a)
     }
 
-    /// 自プロセスと親プロセスの network namespace が別物であることを検証する（fail-closed）。
-    /// 親と同じ netns のまま実行すると host の ip_forward・ruleset・veth を変更してしまうため拒否する。
+    /// ランチャが router へ自身の pid を渡す環境変数（router が自分の親＝ランチャであることの確認に使う）。
+    const LAUNCHER_PID_ENV: &str = "FANDHE_DNAT_TEST_LAUNCHER_PID";
+
+    /// 自プロセスが「作成直後の新規 network namespace」にいることを検証する（fail-closed）。
+    ///
+    /// 親との netns 比較だけでは、親が別の共有 netns にいる場合に素通りするため、(1) 親と別 netns
+    /// であること、(2) `/proc/net/dev`（読み手の netns を映す）に `lo` 以外のインターフェースが無い
+    /// こと（新規 netns は `lo` のみ。host・共有 netns は通常それ以外を持つ）を併せて確認する。
     fn ensure_isolated_netns() -> Result<(), NetError> {
         let io = |what: &str, e: std::io::Error| {
             NetError::new(NetErrorCode::Internal, format!("{what} failed: {e}"))
@@ -143,7 +152,62 @@ mod linux {
             .map_err(|e| fail(format!("cannot read parent netns ({e}); refusing to run")))?;
         if own == parent {
             return Err(fail(
-                "same network namespace as the parent process; run under `unshare -n` (see AGENTS.md)",
+                "same network namespace as the parent process; refusing to run (see AGENTS.md)",
+            ));
+        }
+        let dev =
+            std::fs::read_to_string("/proc/net/dev").map_err(|e| io("read /proc/net/dev", e))?;
+        let extra: Vec<&str> = dev
+            .lines()
+            .skip(2)
+            .filter_map(|l| l.split(':').next().map(str::trim))
+            .filter(|n| !n.is_empty() && *n != "lo")
+            .collect();
+        if !extra.is_empty() {
+            return Err(fail(format!(
+                "network namespace is not freshly created (found interfaces: {}); refusing to run",
+                extra.join(",")
+            )));
+        }
+        Ok(())
+    }
+
+    /// ランチャ（host netns の root プロセス）。自身では何も変更せず、新規 netns の router を起動して
+    /// 終了コードを引き継ぐ。待ちは期限付き（REPAIR-5）。
+    pub fn launcher() {
+        require_root_and_unshare();
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = Command::new("unshare")
+            .args(["--net", "--"])
+            .arg(exe)
+            .arg("--router")
+            .env(LAUNCHER_PID_ENV, std::process::id().to_string())
+            .spawn()
+            .expect("spawn unshare --net router");
+        let deadline = Instant::now() + timeout() * 6;
+        loop {
+            match child.try_wait().expect("wait router") {
+                Some(st) => std::process::exit(st.code().unwrap_or(1)),
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    println!("nftables_dnat_privileged: router did not finish before deadline");
+                    std::process::exit(1);
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    }
+
+    /// router が、環境変数で渡されたランチャの直接の子であることを確認する（手動で `--router` を
+    /// 直接起動して隔離を迂回する誤用を弾く）。
+    fn ensure_launched_by_launcher() -> Result<(), NetError> {
+        let expected = std::env::var(LAUNCHER_PID_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
+        if expected != Some(std::os::unix::process::parent_id()) {
+            return Err(fail(
+                "`--router` must be started by the `--ignored` launcher; refusing to run",
             ));
         }
         Ok(())
@@ -474,7 +538,7 @@ mod linux {
     }
 
     pub fn router() {
-        require_root_and_unshare();
+        ensure_launched_by_launcher().expect("refusing to run outside the launcher");
         ensure_isolated_netns().expect("refusing to run outside an isolated netns");
         // ip_forward は netns ごとの値のため、隔離 netns の中に限り host には影響しない。
         std::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n").expect("enable ip_forward");

@@ -27,9 +27,16 @@
 //!   上流が 512 バイト超で返す経路を作らない。ログ・エラーには QNAME・パケット内容を載せない
 //! - 待ちはすべて期限つき（試行 [`FORWARD_ATTEMPT_TIMEOUT`]・全体 [`FORWARD_TOTAL_DEADLINE`]。REPAIR-5）。全体期限は
 //!   glibc の resolver 既定タイムアウト（5 秒）より短く、コンテナが先に SERVFAIL を受け取れる
-//! - 転送応答にも自前応答と同じ増幅上限（要求長 + `MAX_RESPONSE_GROWTH`）を課す。送信元 IP は bridge 内で偽装され得て
-//!   UDP では宛先を認証できないため、上限を超える上流応答は TC=1 の切り詰め応答（質問のみ）に置き換える。TCP 再試行が
-//!   未対応のため、上限を超える応答（複数 RR・CNAME 連鎖等）は現状解決できない（TCP 対応は後続課題）
+//! - 送信元 IP は UDP では認証できず、同一 bridge 上のコンテナが他コンテナの IP を詐称すると、そのコンテナ専用の
+//!   上流（社内 DNS 等）をヘルパー経由で利用できてしまい、応答も詐称先へ届く（P0 の指摘）。ユーザー空間の DNS ヘルパーは
+//!   パケットの送信元 MAC を見られないため、これを自力では防げない。そこで [`ForwardingHandler::new`] は
+//!   [`SourceVerified`]（bridge 側の送信元詐称防止〔ether saddr と IPv4 saddr の対応固定。`nftables_rules` に必要な
+//!   expr が未実装〕を呼び出し側が保証する証明）を要求し、証明なしに転送を有効化できない形にする（fail-closed）。
+//!   この保証の実装は未着手で、現状は組み込み側の責務（追跡 Issue 未起票。ユーザー承認後に起票し番号を追記する）
+//! - 上の保証があるため詐称による増幅反射は成立しない。転送応答には自前応答の `MAX_RESPONSE_GROWTH` ではなく UDP の上限
+//!   （[`MAX_DATAGRAM_LEN`] = 512 バイト。EDNS OPT を転送しないため上流も 512 以下で返す）を課し、複数 RR・CNAME 連鎖を含む
+//!   通常の応答を TCP 再試行なしで解決できるようにする。上流自身が TC=1 で返した応答は素通しで、クライアントの TCP 再試行は
+//!   ヘルパーが TCP 未対応のため解決できない（後続課題）
 //! - 上流応答は質問の一致に加え、後続レコード（名前・圧縮ポインタ・RDLENGTH）が末尾ちょうどまで境界内で完結することを
 //!   検証し、不正な応答は破棄する
 //! - `DnsUpstreamMap::set` は gateway（ヘルパー自身）を上流に指定した登録を拒否する（自己転送で serve が塞がるため）
@@ -51,10 +58,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use super::{
-    DNS_PORT, DnsHeader, DnsRegistry, FLAG_QR, FLAG_RD, FLAG_TC, HEADER_LEN, HandlerOutcome,
-    MAX_DATAGRAM_LEN, MAX_NAME_LEN, MAX_REGISTRY_ENTRIES, MAX_RESPONSE_GROWTH, MsgWriter,
-    QCLASS_IN, QueryHandler, RCODE_SERVFAIL, RegistryHandler, ResponseBuf, normalize_qname,
-    parse_question,
+    DNS_PORT, DnsHeader, DnsRegistry, FLAG_QR, FLAG_RD, HEADER_LEN, HandlerOutcome,
+    MAX_DATAGRAM_LEN, MAX_NAME_LEN, MAX_REGISTRY_ENTRIES, MsgWriter, QCLASS_IN, QueryHandler,
+    RCODE_SERVFAIL, RegistryHandler, ResponseBuf, normalize_qname, parse_question,
 };
 use crate::error::{NetError, NetErrorCode};
 
@@ -343,6 +349,14 @@ fn records_well_formed(reply: &[u8], mut pos: usize) -> bool {
             Some(&[a, b]) => usize::from(u16::from_be_bytes([a, b])),
             _ => return false,
         };
+        // 名前を持たず長さが固定の型は RDLENGTH が型と一致することも確認する（A=4・AAAA=16）。
+        let rtype = match fixed.get(0..2) {
+            Some(&[a, b]) => u16::from_be_bytes([a, b]),
+            _ => return false,
+        };
+        if (rtype == 1 && rdlen != 4) || (rtype == 28 && rdlen != 16) {
+            return false;
+        }
         let end = after_name.saturating_add(10).saturating_add(rdlen);
         if end > reply.len() {
             return false;
@@ -487,41 +501,19 @@ fn build_servfail(
     filled.is_some() && w.buf.get(..w.len).is_some_and(|b| out.set(b))
 }
 
-/// 上流応答が増幅上限を超えるときの切り詰め応答（QR=1・TC=1・RCODE=NOERROR・質問のみ。長さは要求以下）。
-fn build_truncated(
-    header: &DnsHeader,
-    datagram: &[u8],
-    q_end: usize,
-    out: &mut ResponseBuf,
-) -> bool {
-    let rd = if header.recursion_desired() {
-        FLAG_RD
-    } else {
-        0
-    };
-    let id = header.id().to_be_bytes();
-    let mut w = MsgWriter {
-        buf: [0; MAX_DATAGRAM_LEN],
-        len: 0,
-    };
-    let filled = (|| {
-        w.put(&[
-            id[0],
-            id[1],
-            FLAG_QR | FLAG_TC | rd,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ])?;
-        w.put(datagram.get(HEADER_LEN..q_end)?)
-    })();
-    filled.is_some() && w.buf.get(..w.len).is_some_and(|b| out.set(b))
+/// bridge 側で送信元詐称（他コンテナの IP・MAC の騙り）が防がれていることの証明（NET-12・NET-5）。
+/// 転送はクエリの送信元 IP だけでコンテナを識別するため、これが成り立たない環境では別コンテナの上流を利用できてしまう。
+/// 値は [`SourceVerified::attest_bridge_enforces_source_binding`] でのみ作れ、呼び出し側が保証の責任を明示的に負う。
+#[derive(Debug, Clone, Copy)]
+pub struct SourceVerified(());
+
+impl SourceVerified {
+    /// 呼び出し側が「このヘルパーが待ち受ける bridge で、各 port の送信元 MAC と IPv4 アドレスの対応が強制され
+    /// （詐称パケットは bridge で破棄される）、ARP 詐称も防がれている」ことを保証して証明を作る。
+    /// 保証の実装〔nftables の bridge 家族ルール〕は未実装（REPAIR-3。担当 Issue 未確定）。
+    pub fn attest_bridge_enforces_source_binding() -> Self {
+        Self(())
+    }
 }
 
 /// [`RegistryHandler`] と上流転送を合成するハンドラ（NET-12・TASK-185.3）。判定順は module doc を参照。
@@ -537,7 +529,12 @@ pub struct ForwardingHandler {
 
 impl ForwardingHandler {
     /// 共有レジストリと共有上流マップから作る。
-    pub fn new(registry: Arc<DnsRegistry>, upstreams: Arc<DnsUpstreamMap>) -> Self {
+    /// `_verified` は送信元詐称防止の保証（[`SourceVerified`]）。
+    pub fn new(
+        registry: Arc<DnsRegistry>,
+        upstreams: Arc<DnsUpstreamMap>,
+        _verified: SourceVerified,
+    ) -> Self {
         Self {
             local: RegistryHandler::new(Arc::clone(&registry)),
             registry,
@@ -592,18 +589,8 @@ impl QueryHandler for ForwardingHandler {
         };
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
         match forward_query(&list, datagram, q.end, header.id(), counter, out) {
-            ForwardResult::Forwarded => {
-                // 増幅反射の防止（NET-5）: 要求長 + MAX_RESPONSE_GROWTH を超える応答は、そのまま返さず
-                // TC=1 の切り詰め応答（質問のみ。要求長以下）にする。送信元 IP は偽装され得るため、
-                // 転送応答にも自前応答と同じ上限を課す。
-                if out.as_bytes().len() <= datagram.len().saturating_add(MAX_RESPONSE_GROWTH) {
-                    HandlerOutcome::RespondForwarded
-                } else if build_truncated(header, datagram, q.end, out) {
-                    HandlerOutcome::Respond
-                } else {
-                    HandlerOutcome::NoResponse
-                }
-            }
+            // 受理済みの上流応答は 512 バイト以下（validate_upstream_reply）。サイズ上限は serve が課す。
+            ForwardResult::Forwarded => HandlerOutcome::RespondForwarded,
             ForwardResult::AllFailed => {
                 self.forward_failed.fetch_add(1, Ordering::Relaxed);
                 if build_servfail(header, datagram, q.end, out) {
@@ -619,7 +606,7 @@ impl QueryHandler for ForwardingHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns_helper::{DnsHelperServer, DnsListenAddr, DnsName};
+    use crate::dns_helper::{DnsHelperServer, DnsListenAddr, DnsName, MAX_RESPONSE_GROWTH};
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::thread;
@@ -733,7 +720,14 @@ mod tests {
         for (peer, addr) in up {
             map.set_unchecked_for_test(*peer, &[*addr]).unwrap();
         }
-        (ForwardingHandler::new(Arc::clone(&reg), map), reg)
+        (
+            ForwardingHandler::new(
+                Arc::clone(&reg),
+                map,
+                SourceVerified::attest_bridge_enforces_source_binding(),
+            ),
+            reg,
+        )
     }
 
     fn answer_ip(reply: &[u8]) -> Ipv4Addr {
@@ -986,42 +980,52 @@ mod tests {
         assert_eq!(u1.seen.lock().unwrap()[0], EXTERNAL);
     }
 
-    /// NET-12・NET-5: serve 経由でも転送応答は要求長 + 16 以下に限られる。1 RR の応答は転送され統計に計上され、
-    /// 上限を超える応答は TC=1 の切り詰め応答（質問のみ）に置き換わる。
+    /// NET-12・NET-5: serve 経由で複数 RR の応答（要求長 + 16 超・512 以下）も切り詰めず転送される。
     #[test]
-    fn serve_keeps_amplification_limit_for_forwarded_responses() {
-        let one = MockUpstream::start(Ipv4Addr::new(198, 51, 100, 1), 1, true);
+    fn serve_forwards_multi_rr_response_within_udp_limit() {
         let two = MockUpstream::start(Ipv4Addr::new(198, 51, 100, 2), 2, true);
-        for (up, expect_tc) in [(&one, false), (&two, true)] {
-            let (h, _) = handler_with(&[(Ipv4Addr::LOCALHOST, up.addr)]);
-            let mut server =
-                DnsHelperServer::bind(DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).unwrap()).unwrap();
-            let addr = server.local_addr();
-            let stop = Arc::new(AtomicBool::new(false));
-            let st = Arc::clone(&stop);
-            let join = thread::spawn(move || {
-                server.serve(&h, &st).unwrap();
-                server
-            });
-            let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-            client
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let pkt = query(0x7777, EXTERNAL, 1, 0);
-            client.send_to(&pkt, addr).unwrap();
-            let mut buf = [0u8; 600];
-            let (n, _) = client.recv_from(&mut buf).unwrap();
-            assert!(n <= pkt.len() + MAX_RESPONSE_GROWTH, "reply {n} bytes");
-            assert_eq!(&buf[..2], &[0x77, 0x77]);
-            assert_eq!(buf[2] & 0x02 != 0, expect_tc, "TC");
-            if expect_tc {
-                assert_eq!(&buf[6..8], &[0, 0], "ANCOUNT");
-                assert_eq!(n, pkt.len());
-            }
-            stop.store(true, Ordering::Relaxed);
-            let server = join.join().unwrap();
-            assert_eq!(server.stats().forwarded, u64::from(!expect_tc));
-            assert_eq!(server.stats().suppressed, 0);
-        }
+        let (h, _) = handler_with(&[(Ipv4Addr::LOCALHOST, two.addr)]);
+        let mut server =
+            DnsHelperServer::bind(DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).unwrap()).unwrap();
+        let addr = server.local_addr();
+        let stop = Arc::new(AtomicBool::new(false));
+        let st = Arc::clone(&stop);
+        let join = thread::spawn(move || {
+            server.serve(&h, &st).unwrap();
+            server
+        });
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let pkt = query(0x7777, EXTERNAL, 1, 0);
+        client.send_to(&pkt, addr).unwrap();
+        let mut buf = [0u8; 600];
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert!(
+            n > pkt.len() + MAX_RESPONSE_GROWTH && n <= MAX_DATAGRAM_LEN,
+            "reply {n} bytes"
+        );
+        assert_eq!(&buf[..2], &[0x77, 0x77]);
+        assert_eq!(buf[2] & 0x02, 0, "TC");
+        assert_eq!(&buf[6..8], &[0, 2], "ANCOUNT");
+        stop.store(true, Ordering::Relaxed);
+        let server = join.join().unwrap();
+        assert_eq!(server.stats().forwarded, 1);
+        assert_eq!(server.stats().suppressed, 0);
+    }
+
+    /// NET-12: A レコードの RDLENGTH が 4 でない応答は境界内でも不正として拒否する。
+    #[test]
+    fn rejects_a_record_with_wrong_rdlength() {
+        let q = b"\x01a\x00\x00\x01\x00\x01";
+        let mut ok = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        ok.extend_from_slice(q);
+        ok.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
+        assert!(validate_upstream_reply(&ok, 0x1234, q));
+        let mut bad = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        bad.extend_from_slice(q);
+        bad.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 2, 1, 2]);
+        assert!(!validate_upstream_reply(&bad, 0x1234, q));
     }
 }

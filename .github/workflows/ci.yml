@@ -538,6 +538,9 @@ jobs:
         run: make bench-baseline-selftest
       - name: 起動時間計測スクリプトの自己テスト（TASK-46.1・CORE-10。スタブランタイムで実ランタイムは使わない）
         run: make startup-latency-selftest
+      # スタブ exe の固定 JSONL だけで集計値と異常系を照合し、実 netns・root は使わない（実測は TASK-140）
+      - name: ネットワーク作成/接続/削除の所要時間計測スクリプトの自己テスト（TASK-139.5・NET-4・REPAIR-12）
+        run: make net-setup-timing-selftest
       # 疑似 /proc（mktemp -d 配下）だけで照合し、ランナーの実プロセスは計測しない。
       # 非 root で実行されるため chmod 000 を使う読み取り失敗ケースも実行される
       - name: アイドル時常駐メモリ計測スクリプトの自己テスト（TASK-45.1・CORE-7・SUP-1・REPAIR-12）

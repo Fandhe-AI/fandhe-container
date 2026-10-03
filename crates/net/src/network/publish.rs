@@ -24,9 +24,9 @@
 //!   `0o077` なし・symlink 非追従）、一時ファイル＋fsync＋rename で原子的に更新する。空・不完全な内容・
 //!   同じ受け口の重複行・書き込み側が出さない値（ポート 0・公開先範囲外のアドレス・CR）は予約ゼロ件ではなく
 //!   破損として拒否する。サイズ上限（1 MiB）は読み込み・書き込みの両方で同じ検査を通し、上限を超える
-//!   予約は書き込む前に `ResourceExhausted` で拒否する（書いたファイルを次回読めなくならないため）。ロックは置き換えない `<path>.lock` に掛ける。再起動後の復元と孤児エントリの回収は TASK-139.4 以降（REPAIR-3）
+//!   予約は書き込む前に `ResourceExhausted` で拒否する（書いたファイルを次回読めなくならないため）。ロックは置き換えない `<path>.lock` に掛ける。再起動後の復元と孤児エントリの回収は未実装で担当 Issue 未確定（REPAIR-3）
 //! - IPv4 のみ（静的 IPAM が IPv4 のみのため）。公開の個別解除はルールハンドルの取得経路が無く未対応
-//!   （ネットワーク削除時にテーブルごと解放する。TASK-139.4）
+//!   （ネットワーク削除時にテーブルごと解放する。`PortRegistry::release_network`。TASK-139.4）
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -178,7 +178,7 @@ type ListenerOwner = (NetworkName, EndpointId);
 /// 接続を失敗させる。nft は同一ルールの重複を拒否せず、先に入ったルールが優先されて後のコンテナの公開が
 /// 機能しないため。コンテナ間・ネットワーク間の競合を検出できるよう、呼び出し側が全ネットワークで 1 つを
 /// 共有する。状態は呼び出し側が所有するメモリ上の値（常駐デーモンを持たない。CORE-1）で、永続化は
-/// TASK-139.4 以降（REPAIR-3）。
+/// 未実装で担当 Issue 未確定（REPAIR-3）。
 ///
 /// # プロセス間の共有
 ///
@@ -526,7 +526,7 @@ impl PortRegistry {
     /// 呼び出し側は残った予約を報告して再試行できる）。
     ///
     /// DNAT ルールが残っている可能性がある間（結果不明のバッチ）は呼ばないこと。ネットワークの
-    /// テーブルを削除して消えたことを確認した後（TASK-139.4）に呼ぶ。
+    /// テーブルを削除して消えたことを確認した後に呼ぶ（ネットワーク削除では `release_network` を使う）。
     pub fn release(
         &mut self,
         network: &NetworkName,
@@ -535,6 +535,27 @@ impl PortRegistry {
         let keep = |_: &ListenerKey, (n, e): &mut ListenerOwner| !(n == network && e == endpoint);
         if let Some(path) = &self.shared {
             // 共有ファイルから先に外す。失敗時は予約を残してエラーを返す。
+            let _lock = open_locked(path)?;
+            let mut map = parse_shared(path)?;
+            let before = map.len();
+            map.retain(keep);
+            write_shared(path, &map)?;
+            let released = before - map.len();
+            self.owners = map;
+            return Ok(released);
+        }
+        let before = self.owners.len();
+        self.owners.retain(keep);
+        Ok(before - self.owners.len())
+    }
+
+    /// `network` の予約をすべて解放し、解放した件数を返す（ネットワーク削除用。TASK-139.4・NET-1）。
+    ///
+    /// 結果が不明なバッチで quarantine 中の endpoint の予約も含む。手順・失敗時の扱い（予約を残して `Err`）は
+    /// [`PortRegistry::release`] と同じで、専用 nft テーブルの削除を確認した後にだけ呼ぶこと。
+    pub fn release_network(&mut self, network: &NetworkName) -> Result<usize, NetError> {
+        let keep = |_: &ListenerKey, (n, _): &mut ListenerOwner| n != network;
+        if let Some(path) = &self.shared {
             let _lock = open_locked(path)?;
             let mut map = parse_shared(path)?;
             let before = map.len();
@@ -666,6 +687,43 @@ mod tests {
         assert_eq!(r.release(&web, &c1).unwrap(), 1);
         r.reserve(&db, &c2, &[p80]).unwrap();
         assert_eq!(r.len(), 2);
+    }
+
+    /// NET-1・TASK-139.4: `release_network` は指定ネットワークの予約だけをまとめて外す（プロセス内・共有ファイル）。
+    #[test]
+    fn net1_release_network_releases_only_that_network() {
+        let web = NetworkName::new("web").unwrap();
+        let db = NetworkName::new("db").unwrap();
+        let (c1, c2) = (
+            EndpointId::new("c1").unwrap(),
+            EndpointId::new("c2").unwrap(),
+        );
+        let p80 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 80, 80).unwrap();
+        let p81 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 81, 80).unwrap();
+        let p82 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 82, 80).unwrap();
+
+        let mut r = PortRegistry::new();
+        r.reserve(&web, &c1, &[p80]).unwrap();
+        r.reserve(&web, &c2, &[p81]).unwrap();
+        r.reserve(&db, &c1, &[p82]).unwrap();
+        assert_eq!(r.release_network(&web).unwrap(), 2);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.release_network(&web).unwrap(), 0);
+
+        let dir = shared_dir("release-network");
+        let path = dir.join("ports.reg");
+        let mut s1 = PortRegistry::with_shared_file(path.clone());
+        let mut s2 = PortRegistry::with_shared_file(path.clone());
+        s1.reserve(&web, &c1, &[p80]).unwrap();
+        s1.reserve(&db, &c1, &[p82]).unwrap();
+        assert_eq!(s1.release_network(&web).unwrap(), 1);
+        // 他方のインスタンスから、解放済みの受け口を予約でき、他ネットワークの予約は残る。
+        s2.reserve(&db, &c2, &[p80]).unwrap();
+        assert_eq!(
+            s2.reserve(&web, &c2, &[p82]).unwrap_err().code(),
+            NetErrorCode::AlreadyExists
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// NET-1・TASK-139.3: 共有ファイルの予約は別インスタンス（別プロセス相当）との競合を検出し、

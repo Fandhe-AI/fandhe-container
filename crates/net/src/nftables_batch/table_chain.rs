@@ -34,7 +34,7 @@
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
-//! - `NFTA_TABLE_FLAGS`（dormant / owner）、`NFTA_CHAIN_POLICY` / `FLAGS` / `HANDLE`、handle 指定の削除
+//! - `NFTA_TABLE_FLAGS`（dormant / owner）、`NFTA_CHAIN_POLICY` / `FLAGS` / `HANDLE`、チェインの handle 指定の削除
 //! - `DELCHAIN`・GET 系・`NFT_MSG_DESTROYTABLE`
 //! - ARP / Bridge / Netdev の base chain と ingress hook（netdev は `NFTA_HOOK_DEV` が必須）
 //! - ルール（TASK-138）
@@ -48,12 +48,20 @@ use crate::netlink::{NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST, NlMsgBu
 
 /// テーブル作成（`linux/netfilter/nf_tables.h` の `NFT_MSG_NEWTABLE`）。
 pub const NFT_MSG_NEWTABLE: u8 = 0;
+/// テーブル照会（`NFT_MSG_GETTABLE`）。
+pub const NFT_MSG_GETTABLE: u8 = 1;
 /// テーブル削除（`NFT_MSG_DELTABLE`）。
 pub const NFT_MSG_DELTABLE: u8 = 2;
 /// チェイン作成（`NFT_MSG_NEWCHAIN`）。
 pub const NFT_MSG_NEWCHAIN: u8 = 3;
 /// テーブル名属性（`NFTA_TABLE_NAME`）。
 pub const NFTA_TABLE_NAME: u16 = 1;
+/// テーブルのハンドル属性（`NFTA_TABLE_HANDLE`。`__be64`。カーネルが採番し再利用されない）。
+pub const NFTA_TABLE_HANDLE: u16 = 4;
+/// テーブルのユーザーデータ属性（`NFTA_TABLE_USERDATA`。最大 `NFT_USERDATA_MAXLEN` バイト）。
+pub const NFTA_TABLE_USERDATA: u16 = 6;
+/// ユーザーデータの最大長（`NFT_USERDATA_MAXLEN`）。
+pub const NFT_USERDATA_MAXLEN: usize = 256;
 /// チェインの所属テーブル名属性（`NFTA_CHAIN_TABLE`）。
 pub const NFTA_CHAIN_TABLE: u16 = 1;
 /// チェイン名属性（`NFTA_CHAIN_NAME`）。
@@ -242,6 +250,7 @@ pub struct TableCreate {
     family: NftFamily,
     name: NftName,
     exclusive: bool,
+    userdata: Option<Vec<u8>>,
 }
 
 impl TableCreate {
@@ -251,7 +260,26 @@ impl TableCreate {
             family,
             name,
             exclusive: false,
+            userdata: None,
         }
+    }
+
+    /// 所有トークンを `NFTA_TABLE_USERDATA` として載せる（TASK-139.4・#317）。削除時に `TableGet` の応答と
+    /// 照合し、同名の別者のテーブルを巻き込まないために使う。空・`NFT_USERDATA_MAXLEN` 超は `InvalidArgument`。
+    pub fn with_userdata(mut self, data: &[u8]) -> Result<Self, NetError> {
+        if data.is_empty() || data.len() > NFT_USERDATA_MAXLEN {
+            return Err(invalid("table userdata length is out of range"));
+        }
+        self.userdata = Some(data.to_vec());
+        Ok(self)
+    }
+
+    fn put_attrs(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
+        self.name.put_into(b, NFTA_TABLE_NAME)?;
+        if let Some(data) = &self.userdata {
+            b.put_attr(NFTA_TABLE_USERDATA, data)?;
+        }
+        Ok(())
     }
 
     /// `NLM_F_EXCL` を加える（`nft create table` 相当。既存なら `EEXIST`）。
@@ -273,13 +301,13 @@ impl TableCreate {
     /// nfgenmsg と属性を `b` へ追記する。
     pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
         NfGenMsg::new(self.family.nfproto(), 0).put_into(b)?;
-        self.name.put_into(b, NFTA_TABLE_NAME)
+        self.put_attrs(b)
     }
 
     /// REQUEST / ACK 付きで組み立てる。`NftBatch::push_with` へそのまま渡せる。
     pub fn build(&self, seq: u32) -> Result<NlMsgBuilder, NetError> {
         let mut b = start(NFT_MSG_NEWTABLE, self.flags(), self.family, seq)?;
-        self.name.put_into(&mut b, NFTA_TABLE_NAME)?;
+        self.put_attrs(&mut b)?;
         Ok(b)
     }
 }
@@ -289,12 +317,35 @@ impl TableCreate {
 pub struct TableDelete {
     family: NftFamily,
     name: NftName,
+    handle: Option<u64>,
 }
 
 impl TableDelete {
-    /// 削除対象を指定して作る。
+    /// 名前で削除対象を指定して作る。
     pub fn new(family: NftFamily, name: NftName) -> Self {
-        Self { family, name }
+        Self {
+            family,
+            name,
+            handle: None,
+        }
+    }
+
+    /// ハンドルで削除対象を指定して作る（TASK-139.4・#317）。ハンドルはカーネルが採番して再利用しないため、
+    /// `TableGet` で所有を確認した個体だけを（確認後に同名の別テーブルへ差し替えられても）削除できる。
+    /// ハンドル指定のとき名前属性は載せない（カーネルはハンドルを優先する）。
+    pub fn by_handle(family: NftFamily, name: NftName, handle: u64) -> Self {
+        Self {
+            family,
+            name,
+            handle: Some(handle),
+        }
+    }
+
+    fn put_attrs(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
+        match self.handle {
+            Some(h) => b.put_attr(NFTA_TABLE_HANDLE, &h.to_be_bytes()),
+            None => self.name.put_into(b, NFTA_TABLE_NAME),
+        }
     }
 
     /// `nlmsg_type`。
@@ -310,16 +361,104 @@ impl TableDelete {
     /// nfgenmsg と属性を `b` へ追記する。
     pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
         NfGenMsg::new(self.family.nfproto(), 0).put_into(b)?;
-        self.name.put_into(b, NFTA_TABLE_NAME)
+        self.put_attrs(b)
     }
 
     /// REQUEST / ACK 付きで組み立てる。
     pub fn build(&self, seq: u32) -> Result<NlMsgBuilder, NetError> {
         let mut b = start(NFT_MSG_DELTABLE, self.flags(), self.family, seq)?;
-        self.name.put_into(&mut b, NFTA_TABLE_NAME)?;
+        self.put_attrs(&mut b)?;
         Ok(b)
     }
 }
+
+/// `NFT_MSG_GETTABLE`。テーブルの存在を読み取り専用で照会する（TASK-139.4・#317・NET-11）。
+///
+/// バッチ（BEGIN / END）を使わない単発の要求で、ルールセットを変更しない。存在すれば `NFT_MSG_NEWTABLE`
+/// の応答と errno 0 の ACK、無ければ `-ENOENT`（`NotFound`）が返る。bridge の消失後に、専用テーブルが
+/// 削除済みかを（所有の証明なしに破壊的操作をせず）確認するために使う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableGet {
+    family: NftFamily,
+    name: NftName,
+}
+
+impl TableGet {
+    /// 照会対象を指定して作る。
+    pub fn new(family: NftFamily, name: NftName) -> Self {
+        Self { family, name }
+    }
+
+    /// `nlmsg_type`。
+    pub fn msg_type(&self) -> u16 {
+        nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_GETTABLE)
+    }
+
+    /// 操作フラグ（なし。REQUEST / ACK は送信側が付ける）。
+    pub fn flags(&self) -> u16 {
+        0
+    }
+
+    /// nfgenmsg と属性を `b` へ追記する。
+    pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
+        NfGenMsg::new(self.family.nfproto(), 0).put_into(b)?;
+        self.name.put_into(b, NFTA_TABLE_NAME)
+    }
+}
+
+/// `NFT_MSG_GETTABLE` 応答（`NFT_MSG_NEWTABLE`）から読み取ったテーブルの識別情報（TASK-139.4・#317）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableInfo {
+    handle: Option<u64>,
+    userdata: Option<Vec<u8>>,
+}
+
+impl TableInfo {
+    /// カーネルが採番したハンドル（応答に無ければ `None`）。
+    pub fn handle(&self) -> Option<u64> {
+        self.handle
+    }
+
+    /// 作成時に載せたユーザーデータ（無ければ `None`）。
+    pub fn userdata(&self) -> Option<&[u8]> {
+        self.userdata.as_deref()
+    }
+
+    /// 応答ペイロード（nfgenmsg + 属性）を復号する。カーネル由来の外部入力として属性走査で検証し、
+    /// 短い・不正な属性列は `DataLoss`。
+    pub fn decode(payload: &[u8]) -> Result<Self, NetError> {
+        let attrs = payload.get(NFGENMSG_LEN..).ok_or_else(|| {
+            NetError::new(
+                NetErrorCode::DataLoss,
+                "table reply is shorter than nfgenmsg",
+            )
+        })?;
+        let mut info = Self {
+            handle: None,
+            userdata: None,
+        };
+        for attr in crate::netlink::AttrIter::new(attrs) {
+            let attr = attr?;
+            match attr.attr_type() {
+                NFTA_TABLE_HANDLE => {
+                    let raw = <[u8; 8]>::try_from(attr.payload()).map_err(|_| {
+                        NetError::new(
+                            NetErrorCode::DataLoss,
+                            "NFTA_TABLE_HANDLE has an invalid length",
+                        )
+                    })?;
+                    info.handle = Some(u64::from_be_bytes(raw));
+                }
+                NFTA_TABLE_USERDATA => info.userdata = Some(attr.payload().to_vec()),
+                _ => {}
+            }
+        }
+        Ok(info)
+    }
+}
+
+/// nfgenmsg の長さ（family・version・res_id）。
+const NFGENMSG_LEN: usize = 4;
 
 /// `NFT_MSG_NEWCHAIN`。base chain（hook あり）と通常の chain（hook なし）を表す。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,6 +686,84 @@ mod tests {
         assert_eq!(fl, RA);
         assert_eq!(fl & (NLM_F_CREATE | NLM_F_EXCL | NLM_F_REPLACE), 0);
         assert_eq!(attrs, vec![(1, false, false, b"fandhe\0".to_vec())]);
+    }
+
+    /// NET-11・TASK-139.4: GETTABLE は名前だけを持つ読み取り専用の照会（type 0x0A01・CREATE 等なし）。
+    #[test]
+    fn net11_gettable_queries_named_table() {
+        let g = TableGet::new(NftFamily::Ipv4, name("fandhe"));
+        let mut b = NlMsgBuilder::new(g.msg_type(), g.flags() | NLM_F_REQUEST | NLM_F_ACK, 3, 0);
+        g.encode(&mut b).expect("encode");
+        let (ty, fl, _, attrs) = decode(b);
+        assert_eq!(ty, 0x0A01);
+        assert_eq!(fl, RA);
+        assert_eq!(attrs, vec![(1, false, false, b"fandhe\0".to_vec())]);
+    }
+
+    /// NET-11・TASK-139.4: 所有トークンは NFTA_TABLE_USERDATA(6) に載り、範囲外は拒否される。
+    #[test]
+    fn net11_newtable_carries_userdata() {
+        let m = TableCreate::new(NftFamily::Ipv4, name("fandhe"))
+            .exclusive()
+            .with_userdata(b"tok")
+            .expect("userdata");
+        let (_, _, _, attrs) = decode(m.build(3).expect("build"));
+        assert_eq!(
+            attrs,
+            vec![
+                (1, false, false, b"fandhe\0".to_vec()),
+                (6, false, false, b"tok".to_vec())
+            ]
+        );
+        for bad in [Vec::new(), vec![b'a'; 257]] {
+            let e = TableCreate::new(NftFamily::Ipv4, name("t"))
+                .with_userdata(&bad)
+                .expect_err("reject");
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        }
+    }
+
+    /// NET-11・TASK-139.4: ハンドル指定の DELTABLE は NFTA_TABLE_HANDLE(4) の __be64 だけを載せる。
+    #[test]
+    fn net11_deltable_by_handle_has_only_handle() {
+        let m = TableDelete::by_handle(NftFamily::Ipv4, name("fandhe"), 0x0102);
+        let (ty, _, _, attrs) = decode(m.build(3).expect("build"));
+        assert_eq!(ty, 0x0A02);
+        assert_eq!(attrs, vec![(4, false, false, vec![0, 0, 0, 0, 0, 0, 1, 2])]);
+    }
+
+    /// NET-11・TASK-139.4: GETTABLE 応答からハンドルとユーザーデータを復号し、壊れた属性は DataLoss。
+    #[test]
+    fn net11_table_info_decodes_reply() {
+        let mut p = vec![2u8, 0, 0, 0];
+        let mut put = |ty: u16, data: &[u8]| {
+            p.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
+            p.extend_from_slice(&ty.to_ne_bytes());
+            p.extend_from_slice(data);
+            while p.len() % 4 != 0 {
+                p.push(0);
+            }
+        };
+        put(1, b"fandhe\0");
+        put(4, &7u64.to_be_bytes());
+        put(6, b"tok");
+        let info = TableInfo::decode(&p).expect("decode");
+        assert_eq!(info.handle(), Some(7));
+        assert_eq!(info.userdata(), Some(&b"tok"[..]));
+
+        let bare = TableInfo::decode(&[2, 0, 0, 0]).expect("bare");
+        assert_eq!((bare.handle(), bare.userdata()), (None, None));
+
+        let mut bad = vec![2u8, 0, 0, 0, 8, 0, 4, 0, 1, 2, 3, 4];
+        assert_eq!(
+            TableInfo::decode(&bad).expect_err("len").code(),
+            NetErrorCode::DataLoss
+        );
+        bad.truncate(2);
+        assert_eq!(
+            TableInfo::decode(&bad).expect_err("short").code(),
+            NetErrorCode::DataLoss
+        );
     }
 
     /// REPAIR-2: 名前の長さ・文字集合の検証。

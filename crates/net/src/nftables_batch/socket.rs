@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use super::ack::{NFT_MSG_GETGEN, NftBatchAck, NftBatchAckCollector, NftBatchError, Progress};
 use super::{
-    BATCH_MARKER_LEN, MAX_BATCH_LEN, NFNL_SUBSYS_NFTABLES, NFPROTO_UNSPEC, NfGenMsg, NftBatch,
-    NftBatchBytes, nfnl_msg_type,
+    BATCH_MARKER_LEN, MAX_BATCH_LEN, NFNL_SUBSYS_NFTABLES, NFPROTO_UNSPEC, NFT_MSG_NEWTABLE,
+    NfGenMsg, NftBatch, NftBatchBytes, TableGet, TableInfo, nfnl_msg_type,
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
@@ -247,6 +247,38 @@ impl NetlinkNetfilterSocket {
             gate: RequestGate::default(),
             next_seq: AtomicU32::new(1),
         })
+    }
+
+    /// 専用テーブルの識別情報（ハンドル・ユーザーデータ）を `NFT_MSG_GETTABLE` で照会する
+    /// （読み取り専用。TASK-139.4・#317）。
+    ///
+    /// 無ければカーネルの `ENOENT` を `NotFound` のまま返す。それ以外の失敗（権限不足・期限切れ・欠落・
+    /// 応答の不整合）は存在不明として `Err` のまま返す（fail-closed）。`timeout` は順番待ちと往復を通した
+    /// 全体の期限（REPAIR-5）。
+    ///
+    /// seq はバッチと同じ空間（`next_seq`）から確保し、使った範囲を再利用しない。route 用の採番器（1 起点）
+    /// を使うと、時間切れしたバッチの遅延 ACK（同じ fd に届く seq 1…）と衝突して、古い `ENOENT` を
+    /// 照会結果と取り違えるため（NET-11・REPAIR-5）。
+    pub fn table_info(&self, req: &TableGet, timeout: Duration) -> Result<TableInfo, NetError> {
+        let deadline = Deadline::after(timeout);
+        let _turn = self.gate.acquire(&deadline, timeout)?;
+        let seq = reserve_first_seq(self.next_seq.load(Ordering::Relaxed));
+        // 送る・送らないによらず確保した seq は再利用しない。
+        self.next_seq.store(seq_after(seq), Ordering::Relaxed);
+        let reply = self.inner.request_with_seq(
+            Some(seq),
+            req.msg_type(),
+            req.flags(),
+            deadline.remaining(),
+            |b| req.encode(b),
+        )?;
+        let want = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWTABLE);
+        let msg = reply
+            .messages()
+            .iter()
+            .find(|m| m.msg_type() == want)
+            .ok_or_else(|| NetError::new(NetErrorCode::DataLoss, "no NEWTABLE in table reply"))?;
+        TableInfo::decode(msg.payload())
     }
 
     /// バッチを組み立てて送り、本体メッセージごとの ACK / エラーが揃うまで待つ（NET-11・TASK-137.3）。

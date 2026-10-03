@@ -4,7 +4,7 @@
 //! up → 専用 nft テーブルと NAT base chain の作成までを 1 つの操作として行い、途中で失敗したら
 //! 自分が作ったリソースだけをロールバックする。`netlink_route`（bridge・address・link 削除）と
 //! `nftables_batch`（table・chain）の上に載る統合層で、PoC-15 `netsetup` の `net-create` に相当する。
-//! 後続のネットワーク削除（TASK-139.4）は [`NetworkResourceNames::derive`] で同じ名前を再導出して使う。
+//! ネットワーク削除（`delete_network`。TASK-139.4）は [`NetworkResourceNames::derive`] で同じ名前を再導出して使う。
 //!
 //! # 命名（ワイヤー契約と同じ扱い）
 //!
@@ -59,8 +59,15 @@
 //! veth と netns の破棄で消え、nft バッチは失敗時に何も適用されない（`Aborted` / `NotSent`）ことに
 //! 依存する。結果が不明なバッチは `AttachResource::PortRules` と `AttachResource::Address` を `Unknown` で報告し、
 //! IPAM のアドレスと [`PortRegistry`] の予約を保持する（残ったルールが別コンテナへ転送しないための quarantine。
-//! 解放はテーブル削除後に呼び出し側が行う。TASK-139.4）。受け口の競合（コンテナ間・ネットワーク間）は
+//! 解放はテーブルの削除を確認できた場合に `delete_network` が行う。TASK-139.4）。受け口の競合（コンテナ間・ネットワーク間）は
 //! 投入前に [`PortRegistry`] で検出して `AlreadyExists` とする。
+//!
+//! # ネットワーク削除（TASK-139.4・#317）
+//!
+//! `delete_network`（`delete` モジュール）は、渡されたコンテナの veth 削除と netns の unpin → 専用 nft
+//! テーブルの削除（bridge の所有確認が通った場合のみ）→ bridge の削除 → IPAM・ポート予約の解放を行う。接続中のコンテナを呼び出し側が渡す
+//! 設計で、渡されていない生存コンテナがあれば何も変更せず拒否する。方針・順序・残余リスクは
+//! `delete` モジュールの doc を参照。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
@@ -70,9 +77,10 @@
 //!   `ip_forward` が別途必要（本 crate は host のグローバル設定を変更しない）。担当 Issue 未確定
 //! - peer の `eth0` へのリネーム（`LinkSet` に `IFLA_IFNAME` 変更が無い）、コンテナ単位のポート公開解除
 //!   （ルールハンドルの取得経路が無い）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
-//! - IPAM 状態の永続化（TASK-139.4 以降）、ネットワークとコンテナ側資源の削除（TASK-139.4・#317）
+//! - IPAM 状態の永続化とプロセスをまたぐ残置 pin の清掃、コンテナ単体の切り離し。担当 Issue 未確定
 //! - IPv6 と `NftFamily::Inet`（IPv4 のみ。静的 IPAM が IPv4 のみのため）
 
+pub mod delete;
 pub mod ipam;
 pub mod publish;
 
@@ -82,6 +90,10 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+pub use delete::delete_network;
+pub use delete::{DeleteResource, DeleteStep, NetworkDeleteError, NetworkDeleteReport};
+pub(crate) use ipam::NetnsDirRecord;
 pub use ipam::StaticIpam;
 pub use publish::{MAX_PORT_PUBLISHES, PortProtocol, PortPublish, PortRegistry};
 
@@ -402,7 +414,9 @@ pub(crate) trait NetworkOps {
     fn set_up(&self, index: IfIndex) -> Result<(), NetError>;
     /// 取得済みの ifindex で削除する。外部で bridge が消され同名の別 link ができても巻き込まない。
     fn delete_bridge(&self, index: IfIndex) -> Result<(), NetError>;
-    fn apply_nft(&self, table: &NftName) -> Result<(), NftApplyFailure>;
+    /// 専用テーブルと NAT base chain を作る。テーブルには所有トークン（`token`）を `NFTA_TABLE_USERDATA` で
+    /// 載せ、削除時に照合できるようにする（TASK-139.4・#317）。
+    fn apply_nft(&self, table: &NftName, token: &str) -> Result<(), NftApplyFailure>;
 }
 
 const COLLISION_MSG: &str =
@@ -450,6 +464,16 @@ fn ownership_token(network: &NetworkName) -> String {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+/// `token` が `network` の作成時に [`ownership_token`] で発行した形式（`fandhe-net:<名前>:...`）か。
+/// 削除（`delete_network`。TASK-139.4）が、呼び出し側の渡す `CreatedNetwork` の各フィールドがネットワーク名と
+/// 食い違っていない（別ネットワークのトークンを組み合わせていない）ことの確認に使う。
+pub(crate) fn token_names_network(token: &str, network: &NetworkName) -> bool {
+    token
+        .strip_prefix("fandhe-net:")
+        .and_then(|rest| rest.strip_prefix(network.as_str()))
+        .is_some_and(|rest| rest.starts_with(':'))
 }
 
 /// 操作直前に ifindex の所有を再確認する。
@@ -553,7 +577,7 @@ pub(crate) fn create_network_with(
         .map_err(|e| step_fail(e, CreateStep::SetUp))?;
 
     // 5. nft テーブル。バッチは all-or-nothing のため、Unknown 以外は nft 側に何も残らない。
-    if let Err(f) = ops.apply_nft(&table) {
+    if let Err(f) = ops.apply_nft(&table, &token) {
         let mut report = RollbackReport::default();
         rollback_bridge(ops, &bridge, &token, index, &mut report);
         if !matches!(
@@ -643,12 +667,13 @@ impl NetworkOps for LinuxNetworkOps<'_> {
             .map(|_| ())
     }
 
-    fn apply_nft(&self, table: &NftName) -> Result<(), NftApplyFailure> {
+    fn apply_nft(&self, table: &NftName, token: &str) -> Result<(), NftApplyFailure> {
         self.nft
             .send_batch(self.timeout, |batch| {
                 batch.push_with(|seq| {
                     TableCreate::new(NftFamily::Ipv4, table.clone())
                         .exclusive()
+                        .with_userdata(token.as_bytes())?
                         .build(seq)
                 })?;
                 for (name, hook, priority) in [
@@ -737,7 +762,7 @@ impl EndpointId {
 ///
 /// host 側 `fcvh` + FNV-1a 64bit の下位 44bit を小文字 hex 11 桁、peer 側 `fcvp` + 同じ 11 桁
 /// （いずれも 15 バイトで `IFNAMSIZ` 未満）。bridge 名と同じく、プレフィックス・ハッシュ関数・桁数は
-/// 互換性に関わる契約で、変更すると既存コンテナの veth を名前で辿れなくなる（TASK-139.4 の削除が
+/// 互換性に関わる契約で、変更すると既存コンテナの veth を名前で辿れなくなる（`delete_network`（TASK-139.4）が
 /// 同じ名前を再導出する）。異なる ID のハッシュ衝突は `NLM_F_EXCL` の `AlreadyExists` として検出される。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VethNames {
@@ -852,6 +877,9 @@ pub struct AttachedContainer<N> {
     pub host_veth: IfName,
     /// host 側 veth の ifindex（bridge に接続済みで up）。
     pub host_index: IfIndex,
+    /// host 側 veth の `IFLA_IFALIAS` に付けた所有トークン。ifindex は再利用されうるため、削除直前に
+    /// このトークンの一致で元の veth であることを確認する（`delete_network`。TASK-139.4・NET-1）。
+    pub host_token: String,
     /// コンテナ netns に入った peer 側 veth の名前（netns 内での名前。リネーム前）。
     pub peer_veth: IfName,
     /// netns の pin 先パス。
@@ -876,6 +904,8 @@ pub enum AttachStep {
     CreateVeth,
     /// 作成直後の veth の ifindex 解決。
     ResolveIndex,
+    /// host 側 veth への所有トークン（`IFLA_IFALIAS`）の付与。
+    SetOwnerToken,
     /// host 側の bridge への接続（`IFLA_MASTER`）。
     SetMaster,
     /// host 側の up。
@@ -907,11 +937,11 @@ pub enum AttachResource {
     /// pin 済みの netns（pin 先パス）。
     Netns(PathBuf),
     /// ポート公開の DNAT ルールを投入した nft テーブル（結果不明のバッチ。個別削除の手段が無く、
-    /// ネットワーク削除でテーブルごと解放する。TASK-139.4）。
+    /// `delete_network` がテーブルごと解放する。TASK-139.4）。
     PortRules(NftName),
     /// 払い出し済みのまま保持している IPAM アドレス（`PortRules` が不明な間は、残った DNAT ルールが
-    /// 別コンテナへ転送しないよう再利用させない〔quarantine〕。解放は呼び出し側が、テーブルの削除後に
-    /// `StaticIpam::release` と `PortRegistry::release` で行う）。
+    /// 別コンテナへ転送しないよう再利用させない〔quarantine〕。解放は `delete_network` が、テーブルの削除を確認
+    /// できた場合に行う）。
     Address(IpPrefix),
     /// 解放に失敗したポート予約（共有予約表のロック・読み書きの失敗。残ったままだと後続コンテナが
     /// 同じポートを公開できない。呼び出し側が `PortRegistry::release` を再試行する）。
@@ -980,13 +1010,28 @@ pub(crate) struct UnpinFailure<N> {
     pub(crate) netns: N,
 }
 
+/// host 側 veth の所有トークン（`IFLA_IFALIAS`）を、ネットワークの所有トークンと endpoint から導出する。
+///
+/// 接続（`attach_container`）が刻み、削除（`delete_network`。TASK-139.4・NET-1）が再導出して照合する
+/// （呼び出し側が渡す `AttachedContainer::host_token` をそのまま所有の証明に使わないため）。形式
+/// （`<bridge_token>/ep/<endpoint>`）は既存 veth の照合に関わる契約で、変更すると削除で所有を証明できなくなる。
+pub(crate) fn host_owner_token(bridge_token: &str, endpoint: &EndpointId) -> String {
+    format!("{bridge_token}/ep/{}", endpoint.as_str())
+}
+
 /// 接続手順が使うカーネル操作の境界。Linux 実装とテストの fake を差し替えるための crate 内部トレイトで、
 /// 公開の拡張点（PLUG-1）ではない。[`NetworkOps`] とは独立（ネットワーク作成のテストに影響させない）。
 pub(crate) trait AttachOps {
     /// netns ハンドル（Linux では fd と pin パス）。
     type Netns;
     /// `dir` 直下に `id` 名で pin した新しい netns を作る。失敗時は自分が作った部分資源を片付けてある。
-    fn create_netns(&self, dir: &Path, id: &EndpointId) -> Result<Self::Netns, NetnsFailure>;
+    /// 成功時は netns ハンドルと、検査して開いた置き場ディレクトリの識別子 (st_dev, st_ino) を返す。
+    /// 識別子は IPAM へ記録し、`delete_network` が置き場の差し替えを検出するのに使う（TASK-139.4）。
+    fn create_netns(
+        &self,
+        dir: &Path,
+        id: &EndpointId,
+    ) -> Result<(Self::Netns, (u64, u64)), NetnsFailure>;
     /// pin を外す（umount → ファイル削除）。失敗時は `ns` を [`UnpinFailure`] で返し、呼び出し側が
     /// 再試行できるようにする。
     fn unpin_netns(&self, ns: Self::Netns) -> Result<(), UnpinFailure<Self::Netns>>;
@@ -997,6 +1042,8 @@ pub(crate) trait AttachOps {
     /// bridge の名前から ifindex を引く。`IFLA_IFALIAS` が `token` と一致しない（同名の別 link）
     /// 場合は `FailedPrecondition` で失敗する。
     fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError>;
+    /// `link` の `IFLA_IFALIAS` に所有トークン `token` を設定する。
+    fn set_owner_token(&self, link: IfIndex, token: &str) -> Result<(), NetError>;
     /// `link` を `master`（bridge）へ接続する。
     fn set_master(&self, link: IfIndex, master: IfIndex) -> Result<(), NetError>;
     /// ifindex 指定で up にする。
@@ -1090,9 +1137,10 @@ fn rollback_veth<O: AttachOps>(
 /// default route。TASK-139.3）→ ポート公開（指定があれば DNAT を一括投入）。失敗時は自分が作った
 /// 部分資源（veth・netns・IPAM の払い出し）だけを戻し、元のエラーはロールバックの失敗で上書きしない。
 ///
-/// veth は所有トークン（`IFLA_IFALIAS`）を使えない（`LinkCreate::with_alias` は veth を拒否する）ため、
-/// 「`NLM_F_EXCL` 作成 + 直後の ifindex 確保 + 以降は ifindex 指定」で運用する。作成から解決までの
-/// 極小の窓に同名 link へ差し替えられる残余リスクは残る（`CAP_NET_ADMIN` を持つ者に限られる）。
+/// veth は作成時に `IFLA_IFALIAS` を付けられない（`LinkCreate::with_alias` は veth を拒否する）ため、
+/// 「`NLM_F_EXCL` 作成 + 直後の ifindex 確保 + `RTM_SETLINK` で所有トークンを刻む + 以降は ifindex 指定」で
+/// 運用する。作成から解決・刻印までの極小の窓に同名 link へ差し替えられる残余リスクは残る
+/// （`CAP_NET_ADMIN` を持つ者に限られる）。削除側はトークンの一致を確認してから消す（ifindex は再利用されうる）。
 /// ifindex を解決できなかった場合は名前では削除せず `Unknown` で報告する（fail-closed）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn attach_container_with<O: AttachOps>(
@@ -1156,8 +1204,8 @@ pub(crate) fn attach_container_with<O: AttachOps>(
     }
 
     let pin = spec.netns_path();
-    let mut netns = match ops.create_netns(&spec.netns_dir, &spec.endpoint) {
-        Ok(ns) => ns,
+    let (mut netns, pin_dir_id) = match ops.create_netns(&spec.netns_dir, &spec.endpoint) {
+        Ok(created) => created,
         Err(f) => {
             let mut report = AttachRollbackReport::default();
             if let Some(state) = f.leftover {
@@ -1206,7 +1254,11 @@ pub(crate) fn attach_container_with<O: AttachOps>(
         }
     };
 
+    // ifindex は再利用されうるため、削除時に元の veth と照合できるよう所有トークンを刻む。
+    let host_token = host_owner_token(&spec.bridge_token, &spec.endpoint);
     let attach = || {
+        ops.set_owner_token(host_index, &host_token)
+            .map_err(|e| (e, AttachStep::SetOwnerToken))?;
         ops.set_master(host_index, spec.bridge_index)
             .map_err(|e| (e, AttachStep::SetMaster))?;
         ops.set_up(host_index).map_err(|e| (e, AttachStep::SetUp))?;
@@ -1220,7 +1272,10 @@ pub(crate) fn attach_container_with<O: AttachOps>(
     }
 
     // netns 内でのアドレス設定の直前に払い出す。失敗時は作った資源をすべて戻す。
-    let address = match ipam.allocate(&spec.endpoint) {
+    // 払い出しと同時に pin 置き場（パスと識別子）を記録し、削除時に残存 pin を同じ置き場で確認できるようにする
+    // （TASK-139.4）。記録は払い出しの解放（ロールバックを含む）で一緒に消える。
+    let pin_dir = NetnsDirRecord::new(spec.netns_dir.clone(), pin_dir_id);
+    let address = match ipam.allocate_pinned(&spec.endpoint, pin_dir) {
         Ok(a) => a,
         Err(e) => {
             let mut report = AttachRollbackReport::default();
@@ -1285,6 +1340,7 @@ pub(crate) fn attach_container_with<O: AttachOps>(
         endpoint: spec.endpoint.clone(),
         host_veth: names.host().clone(),
         host_index,
+        host_token,
         peer_veth: names.peer().clone(),
         netns_path: pin,
         address,
@@ -1398,7 +1454,11 @@ fn link_ref(index: IfIndex) -> Result<LinkRef, NetError> {
 impl AttachOps for LinuxAttachOps<'_> {
     type Netns = ContainerNetns;
 
-    fn create_netns(&self, dir: &Path, id: &EndpointId) -> Result<ContainerNetns, NetnsFailure> {
+    fn create_netns(
+        &self,
+        dir: &Path,
+        id: &EndpointId,
+    ) -> Result<(ContainerNetns, (u64, u64)), NetnsFailure> {
         netns::create_pinned(dir, id, self.timeout, self.route.recorder())
     }
 
@@ -1418,6 +1478,12 @@ impl AttachOps for LinuxAttachOps<'_> {
 
     fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError> {
         self.route.link_index_owned(name, token, self.timeout)
+    }
+
+    fn set_owner_token(&self, link: IfIndex, token: &str) -> Result<(), NetError> {
+        self.route
+            .set_link(&LinkSet::set_alias(link_ref(link)?, token)?, self.timeout)
+            .map(|_| ())
     }
 
     fn set_master(&self, link: IfIndex, master: IfIndex) -> Result<(), NetError> {
@@ -1542,7 +1608,7 @@ impl AttachOps for LinuxAttachOps<'_> {
 /// # 未実装範囲（REPAIR-3）
 /// `eth0` へのリネーム・masquerade・コンテナ単位のポート公開解除は含まない（モジュール doc「未実装範囲」）。
 /// ホストの外へ届けるには masquerade と host の `ip_forward` が別途必要。IPAM 状態の永続化は呼び出し側・
-/// 後続 Issue の責務。ネットワーク・コンテナ側資源の削除は TASK-139.4（#317）。
+/// 後続 Issue の責務。ネットワーク・コンテナ側資源の削除は `delete_network`（TASK-139.4・#317）。
 #[cfg(target_os = "linux")]
 pub fn attach_container(
     route: &NetlinkRouteSocket,
@@ -1742,7 +1808,7 @@ mod tests {
             }
             Ok(())
         }
-        fn apply_nft(&self, _: &NftName) -> Result<(), NftApplyFailure> {
+        fn apply_nft(&self, _: &NftName, _: &str) -> Result<(), NftApplyFailure> {
             self.rec("apply_nft");
             match self.fail_nft {
                 Some((c, o)) => Err(NftApplyFailure {
@@ -1840,6 +1906,19 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.starts_with("fandhe-net:web:"));
         assert!(a.bytes().all(|c| c.is_ascii_graphic()) && a.len() <= 255);
+    }
+
+    /// NET-1・TASK-139.4: `token_names_network` は発行形式（`fandhe-net:<名前>:`）の名前部分だけを照合する
+    /// （接頭辞が一致する別名 `web2` や形式外の値を受け入れない）。
+    #[test]
+    fn net1_token_names_network_matches_exact_name() {
+        let web = NetworkName::new("web").unwrap();
+        assert!(token_names_network(&ownership_token(&web), &web));
+        assert!(token_names_network("fandhe-net:web:1:0:0", &web));
+        assert!(!token_names_network("fandhe-net:web2:1:0:0", &web));
+        assert!(!token_names_network("fandhe-net:db:1:0:0", &web));
+        assert!(!token_names_network("fandhe-net:web", &web));
+        assert!(!token_names_network("other:web:1:0:0", &web));
     }
 
     /// NET-1: bridge 作成の Timeout は fail-closed（削除せず Unknown で報告）。
@@ -2164,14 +2243,18 @@ mod attach_tests {
     impl AttachOps for Fake {
         type Netns = ();
 
-        fn create_netns(&self, dir: &Path, id: &EndpointId) -> Result<(), NetnsFailure> {
+        fn create_netns(
+            &self,
+            dir: &Path,
+            id: &EndpointId,
+        ) -> Result<((), (u64, u64)), NetnsFailure> {
             self.rec(format!("create_netns {}", dir.join(id.as_str()).display()));
             match self.fail_netns {
                 Some((c, leftover)) => Err(NetnsFailure {
                     error: err(c),
                     leftover,
                 }),
-                None => Ok(()),
+                None => Ok(((), (8, 9))),
             }
         }
         fn unpin_netns(&self, (): ()) -> Result<(), UnpinFailure<()>> {
@@ -2213,6 +2296,10 @@ mod attach_tests {
                 return Err(err(NetErrorCode::FailedPrecondition));
             }
             self.link_index(name)
+        }
+        fn set_owner_token(&self, link: IfIndex, token: &str) -> Result<(), NetError> {
+            self.rec(format!("set_owner_token {} {}", link.get(), token));
+            Ok(())
         }
         fn set_master(&self, link: IfIndex, master: IfIndex) -> Result<(), NetError> {
             self.rec(format!("set_master {} {}", link.get(), master.get()));
@@ -2373,8 +2460,9 @@ mod attach_tests {
     #[test]
     fn net1_attach_success() {
         let f = Fake::default();
-        let a = attach_container_with(&f, &spec("web-1"), &mut ipam(), &mut PortRegistry::new())
-            .unwrap();
+        let mut pool = ipam();
+        let a =
+            attach_container_with(&f, &spec("web-1"), &mut pool, &mut PortRegistry::new()).unwrap();
         let n = VethNames::derive(&eid("web-1")).unwrap();
         assert_eq!(
             f.calls(),
@@ -2384,6 +2472,7 @@ mod attach_tests {
                 format!("create_veth {} {}", n.host().as_str(), n.peer().as_str()),
                 format!("link_index {}", n.host().as_str()),
                 format!("link_index {}", n.peer().as_str()),
+                "set_owner_token 21 fandhe-net:web:1:0:0/ep/web-1".to_owned(),
                 "set_master 21 7".to_owned(),
                 "set_up 21".to_owned(),
                 "move_to_netns 22".to_owned(),
@@ -2401,6 +2490,11 @@ mod attach_tests {
         assert_eq!(a.peer_veth, *n.peer());
         assert_eq!(a.netns_path, pin_of("web-1"));
         assert_eq!(a.address, ip(2));
+        // 削除時の残存 pin の照合用に、置き場のパスと識別子を払い出しと同時に記録する（TASK-139.4）。
+        assert_eq!(
+            pool.netns_dir_of(&eid("web-1")),
+            Some(&NetnsDirRecord::new(netns_dir(), (8, 9)))
+        );
     }
 
     fn ip(last: u8) -> IpPrefix {
@@ -2782,6 +2876,7 @@ mod attach_tests {
             assert!(e.rollback.leftover.is_empty(), "{tag}");
             assert_eq!(pool.allocated_count(), 0, "{tag}");
             assert_eq!(pool.address_of(&eid("c1")), None, "{tag}");
+            assert_eq!(pool.netns_dir_of(&eid("c1")), None, "{tag}");
             assert!(!f.calls().contains(&"release_socket".to_owned()), "{tag}");
         }
     }
@@ -2805,6 +2900,11 @@ mod attach_tests {
             assert_eq!(e.code(), NetErrorCode::Internal);
             let addr = pool.address_of(&eid("c1")).unwrap();
             assert_eq!(pool.allocated_count(), 1);
+            // 保持したアドレスには置き場の記録も残る（削除時に残存 pin を同じ置き場で確認する。TASK-139.4）。
+            assert_eq!(
+                pool.netns_dir_of(&eid("c1")),
+                Some(&NetnsDirRecord::new(netns_dir(), (8, 9)))
+            );
             assert_eq!(reg.len(), 1);
             assert_eq!(
                 e.rollback.leftover.last(),

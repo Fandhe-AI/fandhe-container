@@ -353,6 +353,10 @@ enum SetKind<'a> {
         link: LinkRef,
         master: IfIndex,
     },
+    SetAlias {
+        link: LinkRef,
+        alias: &'a str,
+    },
 }
 
 /// `RTM_SETLINK` によるリンク設定要求（netns 移動・up）。
@@ -379,6 +383,19 @@ impl<'a> LinkSet<'a> {
         Self(SetKind::SetMaster { link, master })
     }
 
+    /// リンクに `IFLA_IFALIAS`（所有トークン）を設定する要求（TASK-139.4・#317・NET-1）。veth は作成時に
+    /// 別名を付けられないため、作成直後に ifindex 指定でこの要求を送って所有を刻む。トークンは
+    /// [`LinkCreate::with_alias`] と同じ制約（1〜255 バイトの可視 ASCII）で、違反は `InvalidArgument`。
+    pub fn set_alias(link: LinkRef, alias: &'a str) -> Result<Self, NetError> {
+        if alias.is_empty() || alias.len() > IFALIAS_MAX_LEN {
+            return Err(invalid("link alias length must be 1 to 255 bytes"));
+        }
+        if !alias.bytes().all(|c| c.is_ascii_graphic()) {
+            return Err(invalid("link alias must be visible ASCII"));
+        }
+        Ok(Self(SetKind::SetAlias { link, alias }))
+    }
+
     /// `nlmsg_type`（常に `RTM_SETLINK`）。
     pub fn msg_type(&self) -> u16 {
         RTM_SETLINK
@@ -392,7 +409,9 @@ impl<'a> LinkSet<'a> {
     /// nlmsghdr の後ろに続く `ifinfomsg` と属性を `b` へ書き込む。
     pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
         let (link, flags, change) = match &self.0 {
-            SetKind::MoveToNetns { link, .. } | SetKind::SetMaster { link, .. } => (link, 0, 0),
+            SetKind::MoveToNetns { link, .. }
+            | SetKind::SetMaster { link, .. }
+            | SetKind::SetAlias { link, .. } => (link, 0, 0),
             SetKind::Up { link } => (link, IFF_UP, IFF_UP),
         };
         let (index, name) = match link {
@@ -412,12 +431,15 @@ impl<'a> LinkSet<'a> {
         if let SetKind::SetMaster { master, .. } = &self.0 {
             b.put_attr(IFLA_MASTER, &master.get().to_ne_bytes())?;
         }
+        if let SetKind::SetAlias { alias, .. } = &self.0 {
+            b.put_attr(IFLA_IFALIAS, &nul_terminated(alias.as_bytes()))?;
+        }
         Ok(())
     }
 }
 
 /// `RTM_DELLINK` によるリンク削除要求（TASK-139.1・#314。ネットワーク作成の失敗時ロールバックと、
-/// 後続のネットワーク削除 TASK-139.4 が使う）。
+/// ネットワーク削除 `network::delete_network`（TASK-139.4）が使う）。
 ///
 /// `LinkRef::Name` は `ifi_index = 0` + `IFLA_IFNAME` でカーネルが引く。bridge を削除すると
 /// 付与済みの address も一緒に消える。送信は `NetlinkRouteSocket::delete_link`（Linux のみ）。
@@ -472,6 +494,32 @@ pub fn decode_ifinfomsg_alias(payload: &[u8]) -> Result<Option<String>, NetError
             let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
             let text = raw.get(..end).and_then(|b| std::str::from_utf8(b).ok());
             return Ok(text.map(str::to_owned));
+        }
+    }
+    Ok(None)
+}
+
+/// `RTM_NEWLINK` 応答のペイロードから `IFLA_MASTER`（所属先 bridge の ifindex）を取り出す（無ければ `None`）。
+///
+/// 応答はカーネル由来の外部入力として属性走査で検証する。長さが 4 バイトでない属性・0 以下の値は
+/// `DataLoss`（TASK-139.4・#317）。
+pub fn decode_ifinfomsg_master(payload: &[u8]) -> Result<Option<IfIndex>, NetError> {
+    let attrs = payload.get(IFINFOMSG_LEN..).ok_or_else(|| {
+        NetError::new(
+            NetErrorCode::DataLoss,
+            "link reply is shorter than ifinfomsg",
+        )
+    })?;
+    for attr in crate::netlink::AttrIter::new(attrs) {
+        let attr = attr?;
+        if attr.attr_type() == IFLA_MASTER {
+            let raw = <[u8; 4]>::try_from(attr.payload()).map_err(|_| {
+                NetError::new(NetErrorCode::DataLoss, "IFLA_MASTER has an invalid length")
+            })?;
+            let index = IfIndex::new(u32::from_ne_bytes(raw)).map_err(|_| {
+                NetError::new(NetErrorCode::DataLoss, "IFLA_MASTER is not a valid ifindex")
+            })?;
+            return Ok(Some(index));
         }
     }
     Ok(None)
@@ -841,6 +889,32 @@ mod tests {
         assert_eq!(attrs, vec![(19, 1u32.to_ne_bytes().to_vec())]);
     }
 
+    /// NET-1・TASK-139.4: RTM_NEWLINK 応答の IFLA_MASTER を復号する。無ければ None、壊れた長さ・0 は DataLoss。
+    #[test]
+    fn net1_decode_master() {
+        let mut p = vec![0u8; IFINFOMSG_LEN];
+        assert_eq!(decode_ifinfomsg_master(&p).unwrap(), None);
+        p.extend_from_slice(&8u16.to_ne_bytes());
+        p.extend_from_slice(&10u16.to_ne_bytes());
+        p.extend_from_slice(&7u32.to_ne_bytes());
+        assert_eq!(
+            decode_ifinfomsg_master(&p).unwrap(),
+            Some(IfIndex::new(7).unwrap())
+        );
+        let mut zero = vec![0u8; IFINFOMSG_LEN];
+        zero.extend_from_slice(&8u16.to_ne_bytes());
+        zero.extend_from_slice(&10u16.to_ne_bytes());
+        zero.extend_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(
+            decode_ifinfomsg_master(&zero).unwrap_err().code(),
+            NetErrorCode::DataLoss
+        );
+        assert_eq!(
+            decode_ifinfomsg_master(&[0u8; 3]).unwrap_err().code(),
+            NetErrorCode::DataLoss
+        );
+    }
+
     /// NET-1・TASK-139.2.1: bridge 接続は ifi_index にポートの ifindex、IFLA_MASTER(10) に bridge の
     /// ifindex（u32 ネイティブ順）を載せ、flags / change は 0 のまま。メッセージ全体を完全一致で照合する。
     #[test]
@@ -880,6 +954,33 @@ mod tests {
                 (IFLA_MASTER, 3u32.to_ne_bytes().to_vec())
             ]
         );
+    }
+
+    /// NET-1・TASK-139.4: veth の所有トークンは ifindex 指定の SETLINK で IFLA_IFALIAS に NUL 終端で載る。
+    #[test]
+    fn net1_setlink_set_alias_encodes_nul_terminated_alias() {
+        let req = LinkSet::set_alias(
+            LinkRef::Index(LinkIndex::new(5).unwrap()),
+            "fandhe-net:web/ep/c1",
+        )
+        .unwrap();
+        let (ifi, attrs) = set_attrs(&build_set(&req));
+        assert_eq!(ifi.get(4..8).unwrap(), &5i32.to_ne_bytes());
+        assert_eq!(
+            attrs,
+            vec![(IFLA_IFALIAS, b"fandhe-net:web/ep/c1\0".to_vec())]
+        );
+    }
+
+    /// NET-1・TASK-139.4: 空・長すぎる・可視 ASCII 以外の別名は InvalidArgument。
+    #[test]
+    fn net1_setlink_set_alias_rejects_invalid_alias() {
+        let link = || LinkRef::Name(name("veth0"));
+        let long = "a".repeat(IFALIAS_MAX_LEN + 1);
+        for bad in ["", "a b", "a\0b", long.as_str()] {
+            let e = LinkSet::set_alias(link(), bad).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument, "{bad:?}");
+        }
     }
 
     /// NET-11: up は flags と change の両方に IFF_UP だけを立てる。

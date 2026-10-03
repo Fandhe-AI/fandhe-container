@@ -4,7 +4,14 @@
 //! [`StaticIpam::allocate`] を呼んでコンテナ 1 つ分のアドレスを決める。常駐デーモンを持たない
 //! 方針（CORE-1）のため、状態は呼び出し側が所有するメモリ上の値で、永続化と再起動後の復元
 //! （[`StaticIpam::reserve`] で払い出し済みを戻す）は呼び出し側の責務。状態レジストリによる
-//! 永続化は TASK-139.4 以降（REPAIR-3）。IPv6 は未対応（IPv4 のみ）。
+//! 永続化は未実装で担当 Issue 未確定（REPAIR-3）。IPv6 は未対応（IPv4 のみ）。
+//!
+//! 接続処理は払い出しと同時に、その endpoint の netns pin 置き場（パスとディレクトリの識別子）を
+//! `NetnsDirRecord` として記録する。ネットワーク削除（`network::delete_network`。TASK-139.4・NET-1）は、
+//! 渡されていない endpoint の pin の残存を、呼び出し側が渡すパスではなくこの記録の置き場で確認する
+//! （別の空ディレクトリを渡されて残存 pin を見落とし、生存 netns のアドレスを再払い出ししないため）。
+//! [`StaticIpam::reserve`] で復元した払い出しには記録が無く、削除はその pin を判定不能として
+//! アドレスを保持する（fail-closed。記録の永続化は IPAM 状態の永続化とともに未実装）。
 //!
 //! # 払い出し方針
 //!
@@ -14,6 +21,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::{Path, PathBuf};
 
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink_route::IpPrefix;
@@ -22,6 +30,34 @@ use super::{CreatedNetwork, EndpointId, NetworkName};
 
 fn invalid(msg: &'static str) -> NetError {
     NetError::new(NetErrorCode::InvalidArgument, msg)
+}
+
+/// 接続時の netns pin 置き場の記録（TASK-139.4・NET-1）。
+///
+/// `path` は接続時に渡した置き場の絶対パス、`dir_id` は接続処理が検査して開いたディレクトリの
+/// 識別子 (st_dev, st_ino)。削除時は同じパスを開き直して識別子を照合し、一致しなければ
+/// （差し替え・移動・消失）何も変更せずに拒否する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetnsDirRecord {
+    path: PathBuf,
+    dir_id: (u64, u64),
+}
+
+impl NetnsDirRecord {
+    pub(crate) fn new(path: PathBuf, dir_id: (u64, u64)) -> Self {
+        Self { path, dir_id }
+    }
+
+    /// 置き場のパス（接続時に渡したもの）。
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 接続時に開いた置き場の識別子 (st_dev, st_ino)。読むのは Linux の削除実装とテストだけ。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn dir_id(&self) -> (u64, u64) {
+        self.dir_id
+    }
 }
 
 /// 1 ネットワーク分の静的 IPAM（OS 非依存）。
@@ -35,6 +71,8 @@ pub struct StaticIpam {
     broadcast: u32,
     by_addr: BTreeMap<u32, EndpointId>,
     by_endpoint: HashMap<EndpointId, u32>,
+    /// 接続処理が払い出しと同時に記録した netns pin 置き場（`reserve` で復元した払い出しには無い）。
+    netns_dirs: HashMap<EndpointId, NetnsDirRecord>,
 }
 
 impl StaticIpam {
@@ -66,6 +104,7 @@ impl StaticIpam {
             broadcast,
             by_addr: BTreeMap::new(),
             by_endpoint: HashMap::new(),
+            netns_dirs: HashMap::new(),
         })
     }
 
@@ -94,6 +133,21 @@ impl StaticIpam {
         self.by_endpoint
             .get(endpoint)
             .and_then(|a| self.prefixed(*a))
+    }
+
+    /// 払い出し済みのエンドポイントとアドレスを、アドレスの昇順で返す。
+    ///
+    /// ネットワーク削除（`network::delete_network`。TASK-139.4・NET-1）が、呼び出し側から渡されていない
+    /// 生存コンテナの有無を検査するために使う。
+    pub fn endpoints(&self) -> impl Iterator<Item = (&EndpointId, IpPrefix)> {
+        self.by_addr
+            .iter()
+            .filter_map(|(&a, e)| self.prefixed(a).map(|p| (e, p)))
+    }
+
+    /// 接続時に記録した netns pin 置き場（`delete_network` が残存 pin の確認に使う）。記録が無ければ `None`。
+    pub(crate) fn netns_dir_of(&self, endpoint: &EndpointId) -> Option<&NetnsDirRecord> {
+        self.netns_dirs.get(endpoint)
     }
 
     fn gateway_u32(&self) -> u32 {
@@ -142,8 +196,23 @@ impl StaticIpam {
         Ok(prefixed)
     }
 
+    /// [`StaticIpam::allocate`] と同じく払い出し、その endpoint の netns pin 置き場 `dir` を記録する
+    /// （接続処理 `attach_container` 専用）。払い出しに失敗したら何も記録しない。
+    pub(crate) fn allocate_pinned(
+        &mut self,
+        endpoint: &EndpointId,
+        dir: NetnsDirRecord,
+    ) -> Result<IpPrefix, NetError> {
+        let addr = self.allocate(endpoint)?;
+        self.netns_dirs.insert(endpoint.clone(), dir);
+        Ok(addr)
+    }
+
     /// 永続化済みの払い出しを復元する。サブネット外・prefix 長の不一致・network / broadcast /
     /// gateway は `InvalidArgument`、使用中のアドレスや払い出し済みの ID は `AlreadyExists`。
+    ///
+    /// 復元した払い出しには netns pin 置き場の記録（`NetnsDirRecord`）が付かない。`delete_network` は
+    /// その endpoint の pin の残存を判定できないため、アドレスを解放せず `Unknown` で報告する（TASK-139.4）。
     pub fn reserve(&mut self, endpoint: &EndpointId, addr: IpPrefix) -> Result<(), NetError> {
         let IpAddr::V4(a) = addr.addr() else {
             return Err(invalid("ipam supports ipv4 only"));
@@ -169,13 +238,14 @@ impl StaticIpam {
         Ok(())
     }
 
-    /// 払い出しを解放して、解放したアドレスを返す。未払い出しの ID は `NotFound`。
+    /// 払い出しを解放して、解放したアドレスを返す（netns pin 置き場の記録も消す）。未払い出しの ID は `NotFound`。
     pub fn release(&mut self, endpoint: &EndpointId) -> Result<IpPrefix, NetError> {
         let a = self
             .by_endpoint
             .remove(endpoint)
             .ok_or_else(|| NetError::new(NetErrorCode::NotFound, "endpoint has no address"))?;
         self.by_addr.remove(&a);
+        self.netns_dirs.remove(endpoint);
         self.prefixed(a)
             .ok_or_else(|| NetError::new(NetErrorCode::Internal, "invalid stored address"))
     }
@@ -195,6 +265,53 @@ mod tests {
 
     fn ipam(gw: [u8; 4], len: u8) -> StaticIpam {
         StaticIpam::new(&NetworkName::new("web").unwrap(), p(gw, len)).unwrap()
+    }
+
+    /// NET-1・TASK-139.4: `endpoints` は払い出し済みを、アドレスの昇順で返す。
+    #[test]
+    fn net1_endpoints_lists_allocations_in_address_order() {
+        let mut ip = ipam([10, 0, 0, 1], 24);
+        ip.reserve(&eid("b"), p([10, 0, 0, 9], 24)).unwrap();
+        ip.allocate(&eid("a")).unwrap();
+        let got: Vec<(String, IpPrefix)> = ip
+            .endpoints()
+            .map(|(e, a)| (e.as_str().to_owned(), a))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_owned(), p([10, 0, 0, 2], 24)),
+                ("b".to_owned(), p([10, 0, 0, 9], 24)),
+            ]
+        );
+    }
+
+    /// NET-1・TASK-139.4: `allocate_pinned` は払い出しと同時に pin 置き場を記録し、`release` で消す。
+    /// `reserve` で復元した払い出しと、失敗した払い出しには記録が無い。
+    #[test]
+    fn net1_allocate_pinned_records_netns_dir_until_release() {
+        let mut ip = ipam([10, 0, 0, 1], 24);
+        let rec = NetnsDirRecord::new(PathBuf::from("/run/fc-netns"), (8, 9));
+        assert_eq!(
+            ip.allocate_pinned(&eid("a"), rec.clone()).unwrap(),
+            p([10, 0, 0, 2], 24)
+        );
+        assert_eq!(ip.netns_dir_of(&eid("a")), Some(&rec));
+        assert_eq!(
+            ip.netns_dir_of(&eid("a")).map(|r| (r.path(), r.dir_id())),
+            Some((Path::new("/run/fc-netns"), (8, 9)))
+        );
+        // 払い出し済みの ID への再払い出しは失敗し、既存の記録を書き換えない。
+        let other = NetnsDirRecord::new(PathBuf::from("/tmp/other"), (1, 2));
+        assert_eq!(
+            ip.allocate_pinned(&eid("a"), other).unwrap_err().code(),
+            NetErrorCode::AlreadyExists
+        );
+        assert_eq!(ip.netns_dir_of(&eid("a")), Some(&rec));
+        ip.reserve(&eid("b"), p([10, 0, 0, 9], 24)).unwrap();
+        assert_eq!(ip.netns_dir_of(&eid("b")), None);
+        assert_eq!(ip.release(&eid("a")).unwrap(), p([10, 0, 0, 2], 24));
+        assert_eq!(ip.netns_dir_of(&eid("a")), None);
     }
 
     /// NET-1: 連続して払い出すと重複せず最小の空きから順になる。

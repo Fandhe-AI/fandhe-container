@@ -2,7 +2,7 @@
 //!
 //! `crate::network::attach_container` が「veth の peer 側を入れる netns」を用意するための下請けで、
 //! PoC-15 `netsetup` の `netns-create` に相当する。後続の runtime が名前（pin パス）でこの netns へ
-//! join でき、ネットワーク削除（TASK-139.4）が同じパスから解放できるよう、netns をファイルへ
+//! join でき、ネットワーク削除（`network::delete_network`。TASK-139.4）が同じパスから解放できるよう、netns をファイルへ
 //! bind マウントして固定（pin）する。`ip netns add` と同じ方式。
 //!
 //! # 方式
@@ -41,7 +41,7 @@
 //! - 解除（`unpin_path`）は、本プロセスが作成して未解除の pin（プロセス内の所有記録 `PINS` と照合できる
 //!   もの）だけを対象にする。記録の無いファイル・マウントは形が pin と同じでも削除・アンマウントしない
 //!   （fail-closed）。作成プロセスの終了後・再起動後の残置 pin の清掃は、永続的な所有記録と照合する設計
-//!   （TASK-139.4）で扱い、それまでは本 API からは解除できない
+//!   で扱う（未実装。担当 Issue 未確定。REPAIR-3）ため、それまでは本 API からは解除できない
 //!
 //! # 権限
 //!
@@ -63,6 +63,7 @@ use std::time::Duration;
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::NetOpRecorder;
 use crate::netlink_route::{NetlinkRouteSocket, classify_errno};
+use crate::network::delete::PinCheckError;
 use crate::network::{EndpointId, NetnsFailure, ResourceState, UnpinFailure};
 use crate::sys::{self, SysError};
 
@@ -73,7 +74,7 @@ const THREAD_NS_PATH: &CStr = c"/proc/thread-self/ns/net";
 ///
 /// `fd` を保持している間と pin のマウントが残っている間、netns は生き続ける。`fd` は
 /// `LinkSet::move_to_netns`（`IFLA_NET_NS_FD`）の移動先指定に使う。解放は
-/// `crate::network` のロールバック、または将来のネットワーク削除（TASK-139.4）が `unpin` で行う。
+/// `crate::network` のロールバック、または `network::delete_network`（TASK-139.4）が `unpin` で行う。
 #[derive(Debug)]
 pub struct ContainerNetns {
     fd: OwnedFd,
@@ -293,7 +294,9 @@ fn remove_pin_file(pin: &Path, fid: FileId) -> Option<ResourceState> {
 
 /// `base` 直下に `id` 名の pin を作り、新しい netns をそこへ固定する。
 ///
-/// 成功時は `ContainerNetns`（fd と pin パス）を返す。失敗時は自分が作ったファイルだけを片付け、
+/// 成功時は `ContainerNetns`（fd と pin パス）と、検査して開いた置き場ディレクトリの識別子
+/// (st_dev, st_ino) を返す。識別子は接続処理が IPAM へ記録し、ネットワーク削除
+/// （`network::delete_network`。TASK-139.4）が置き場の差し替えの検出に使う（[`pin_exists_in`]）。失敗時は自分が作ったファイルだけを片付け、
 /// 時間切れ等で mount の有無が不明なら削除せず `leftover = Some(Unknown)` で報告する。`timeout` は
 /// 使い捨てスレッドの完了待ちの期限（REPAIR-5）。時間切れ後もスレッドは裏で完走しうる。
 ///
@@ -305,7 +308,7 @@ pub(crate) fn create_pinned(
     id: &EndpointId,
     timeout: Duration,
     recorder: &Arc<dyn NetOpRecorder>,
-) -> Result<ContainerNetns, NetnsFailure> {
+) -> Result<(ContainerNetns, FileId), NetnsFailure> {
     let fail = |error: NetError, leftover: Option<ResourceState>| NetnsFailure { error, leftover };
     let dir = Arc::new(open_pin_dir(base).map_err(|e| fail(e, None))?);
     let name = std::ffi::OsStr::new(id.as_str());
@@ -410,11 +413,14 @@ pub(crate) fn create_pinned(
         Slot::Done(Ok((fd, sock))) => {
             // bind 以降は呼び出し側スレッドで行う（bind は socket 作成時の netns を引き継ぐ）。
             match NetlinkRouteSocket::from_unbound_route_fd(sock, Arc::clone(recorder)) {
-                Ok(route) => Ok(ContainerNetns {
-                    fd,
-                    pin,
-                    route: Some(route),
-                }),
+                Ok(route) => Ok((
+                    ContainerNetns {
+                        fd,
+                        pin,
+                        route: Some(route),
+                    },
+                    dir.id,
+                )),
                 Err(error) => {
                     // pin は mount 済み。ハンドルを作れないので、ここで pin を解除して片付ける。
                     drop(fd);
@@ -468,7 +474,7 @@ fn reclaim_abandoned(via_c: &CStr, via: &Path, fid: FileId, mounted: bool) {
 }
 
 /// pin を外す（`umount2(MNT_DETACH)` → ファイル削除）。fd を drop し参照が尽きれば、カーネルが
-/// netns と中に残った peer veth を破棄する。ロールバックと、将来のネットワーク削除（TASK-139.4）が共用する。
+/// netns と中に残った peer veth を破棄する。ロールバックと、`network::delete_network`（TASK-139.4）が共用する。
 ///
 /// 失敗時は `ns`（fd と pin パス）を [`UnpinFailure`] に入れて返し、呼び出し側が再試行できる。
 /// 再試行しても、アンマウント済みやファイル削除済みの途中状態から続行できる。検証は [`unpin_path`] と同じ。
@@ -496,7 +502,7 @@ pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetn
 ///   マウントの有無に関わらず umount・削除の前に `FailedPrecondition` で拒否する。形（mode `0o400`・
 ///   サイズ 0・実効 UID 所有の通常ファイル）だけでは本モジュールが作った pin と証明できず、任意の空ファイルの
 ///   削除や同一 UID の別プロセスの netns の破棄につながるため。プロセスをまたぐ清掃は、永続的な所有記録と
-///   照合する設計（TASK-139.4）で扱う
+///   照合する設計で扱う（未実装。担当 Issue 未確定。REPAIR-3）
 /// - `/proc/self/mountinfo` 上で、pin がマウントされていないか、`nsfs` としてマウントされている
 /// - アンマウント後の実体が、作成時の pin ファイル（上記 inode）かつ本モジュールが作った形
 ///   （実効 UID 所有・mode `0o400`・サイズ 0 の通常ファイル）
@@ -578,7 +584,7 @@ fn unpin_in_dir(dir: &PinDir, name: &std::ffi::OsStr) -> Result<(), NetError> {
         PinMount::Nsfs => {
             // 所有を証明できない nsfs マウントは umount 前に拒否する（fail-closed）。umount すると
             // 後続の検査で拒否しても名前空間は既に切り離されており、同一 UID の別プロセスの pin を
-            // 破棄しうる。作成プロセス終了後の清掃は永続状態による所有照合（TASK-139.4）で行う。
+            // 破棄しうる。作成プロセス終了後の清掃は永続状態による所有照合（未実装。担当 Issue 未確定。REPAIR-3）で行う。
             let Some(r) = record else {
                 return Err(not_our_pin());
             };
@@ -702,6 +708,8 @@ struct PinDir {
     file: File,
     /// 開いた時点の正規パス（mountinfo 照合用）。
     real: PathBuf,
+    /// 開いた実体の識別子 (st_dev, st_ino)。
+    id: FileId,
 }
 
 impl PinDir {
@@ -734,7 +742,38 @@ fn open_pin_dir(parent: &Path) -> Result<PinDir, NetError> {
     )?;
     let real = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
         .map_err(|e| io_error("resolve netns directory", &e))?;
-    Ok(PinDir { file, real })
+    Ok(PinDir {
+        file,
+        real,
+        id: file_id(&opened),
+    })
+}
+
+/// 接続時に記録した置き場 `dir`（識別子 `dir_id`）の直下に `id` 名の pin が残っているかを返す
+/// （`network::delete_network` の preflight。TASK-139.4・NET-1）。何も変更しない。
+///
+/// 置き場は作成時と同じ検査（[`open_pin_dir`]。symlink でない・group / other 書き込み不可・実効 UID 所有）を
+/// 通して fd で固定し、その識別子が `dir_id` と一致することを確かめてから、固定した fd 経由で pin を
+/// `lstat` する。置き場が消えた・移動した・別のディレクトリに差し替わった・権限が緩められた場合は、
+/// 接続時の置き場と証明できないので [`PinCheckError::Dir`]（残存 pin を見落とさないため、呼び出し側は
+/// 何も変更せずに拒否する）。pin の有無そのものを判定できない場合は [`PinCheckError::Pin`]。
+pub(crate) fn pin_exists_in(
+    dir: &Path,
+    dir_id: (u64, u64),
+    id: &EndpointId,
+) -> Result<bool, PinCheckError> {
+    let pinned = open_pin_dir(dir).map_err(PinCheckError::Dir)?;
+    if pinned.id != dir_id {
+        return Err(PinCheckError::Dir(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "netns directory differs from the one used at attach",
+        )));
+    }
+    match fs::symlink_metadata(pinned.entry(std::ffi::OsStr::new(id.as_str()))) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(PinCheckError::Pin(io_error("stat netns pin", &e))),
+    }
 }
 /// pin ファイルの実体検査（OS 呼び出しを含まない純粋関数）。`create_pinned` が作る形
 /// （通常ファイル・実効 UID 所有・mode `0o400`・空）だけを許す。
@@ -923,7 +962,7 @@ mod tests {
     }
 
     /// NET-1・P0: 所有記録の無いファイルは、置き場検証と形の検査（実効 UID 所有・0o400・空の通常ファイル）を
-    /// 通っても削除しない（作成プロセスの終了後の残置を含む。プロセスをまたぐ清掃は TASK-139.4）。
+    /// 通っても削除しない（作成プロセスの終了後の残置を含む。プロセスをまたぐ清掃は未実装で担当 Issue 未確定）。
     #[test]
     fn net1_unpin_path_rejects_pin_shaped_file_without_record() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1185,6 +1224,79 @@ mod tests {
         assert_eq!(f.leftover, None);
         assert_eq!(fs::read(&pin).unwrap(), b"keep");
         fs::remove_file(&pin).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    fn pin_dir_id_of(dir: &Path) -> FileId {
+        file_id(&fs::symlink_metadata(dir).unwrap())
+    }
+
+    /// NET-1・TASK-139.4: 記録どおりの置き場では、pin の有無を固定した fd 経由で返す（何も変更しない）。
+    #[test]
+    fn net1_pin_exists_in_reports_presence_in_recorded_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("pe-ok");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let id = EndpointId::new("web-1").unwrap();
+        let rec = pin_dir_id_of(&dir);
+        assert!(matches!(pin_exists_in(&dir, rec, &id), Ok(false)));
+        fs::write(dir.join("web-1"), b"").unwrap();
+        assert!(matches!(pin_exists_in(&dir, rec, &id), Ok(true)));
+        assert_eq!(fs::read(dir.join("web-1")).unwrap(), b"");
+        fs::remove_file(dir.join("web-1")).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    /// NET-1・TASK-139.4・P1: 同じパスでも接続時と別のディレクトリ（差し替え・移動後の空ディレクトリ）なら、
+    /// pin の有無を答えず `Dir`（`FailedPrecondition`）で拒否する。元の置き場の pin は残る。
+    #[test]
+    fn net1_pin_exists_in_rejects_replaced_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("pe-swap");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let id = EndpointId::new("web-1").unwrap();
+        let rec = pin_dir_id_of(&dir);
+        fs::write(dir.join("web-1"), b"").unwrap();
+        // pin を含む置き場を移動し、同じパスに空のディレクトリを作る。
+        let moved = dir.with_extension("moved");
+        fs::rename(&dir, &moved).unwrap();
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        match pin_exists_in(&dir, rec, &id) {
+            Err(PinCheckError::Dir(e)) => {
+                assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+                assert_eq!(
+                    e.message(),
+                    "netns directory differs from the one used at attach"
+                );
+            }
+            other => panic!("expected Dir error, got {other:?}"),
+        }
+        // 置き場が消えている場合も `Dir`（`NotFound`）。
+        fs::remove_dir(&dir).unwrap();
+        match pin_exists_in(&dir, rec, &id) {
+            Err(PinCheckError::Dir(e)) => assert_eq!(e.code(), NetErrorCode::NotFound),
+            other => panic!("expected Dir error, got {other:?}"),
+        }
+        assert!(moved.join("web-1").exists());
+        fs::remove_file(moved.join("web-1")).unwrap();
+        fs::remove_dir(&moved).unwrap();
+    }
+
+    /// NET-1・TASK-139.4: 置き場の権限が緩められた（group / other 書き込み可）場合も、作成時の検査を
+    /// 満たさないので `Dir`（`FailedPrecondition`）で拒否する。
+    #[test]
+    fn net1_pin_exists_in_rejects_relaxed_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("pe-ww");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let id = EndpointId::new("web-1").unwrap();
+        let rec = pin_dir_id_of(&dir);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        match pin_exists_in(&dir, rec, &id) {
+            Err(PinCheckError::Dir(e)) => assert_eq!(e.code(), NetErrorCode::FailedPrecondition),
+            other => panic!("expected Dir error, got {other:?}"),
+        }
         fs::remove_dir(&dir).unwrap();
     }
 }

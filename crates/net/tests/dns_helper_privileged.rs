@@ -326,20 +326,14 @@ mod linux {
         let route = NetlinkRouteSocket::open()?;
         let nft = NetlinkNetfilterSocket::open()?;
         let t = timeout();
-        let net = create_network(
-            &route,
-            &nft,
-            &NetworkCreateSpec::new(
-                NetworkName::new("dns")?,
-                IpPrefix::new("10.215.0.1".parse().map_err(|_| fail("addr"))?, 24)?,
-            )?,
-            t,
-        )
-        .map_err(|e| fail(format!("create_network failed at {:?}: {e}", e.step)))?;
+        // IPAM は特権資源（network）を作る前に構築する。構築失敗で `delete_network` に到達できず
+        // root で作った資源が残る経路を作らない（AGENTS.md「特権操作の後始末」）。
+        let gateway = IpPrefix::new("10.215.0.1".parse().map_err(|_| fail("addr"))?, 24)?;
+        let mut ipam = StaticIpam::new(&NetworkName::new("dns")?, gateway)?;
+        let spec = NetworkCreateSpec::new(NetworkName::new("dns")?, gateway)?;
+        let net = create_network(&route, &nft, &spec, t)
+            .map_err(|e| fail(format!("create_network failed at {:?}: {e}", e.step)))?;
         // create_network 成功後は、どの失敗経路でも逆順（helper 停止 → delete_network）で回収する。
-        // ipam を作れない場合は delete_network を呼べないが、子は専用 netns・mount namespace のため
-        // 終了時にカーネルが bridge・nft・pin を解放する。
-        let mut ipam = StaticIpam::for_network(&net)?;
         let mut ports = PortRegistry::new();
         let mut attached = Vec::new();
         let mut helper = None;
@@ -650,18 +644,14 @@ mod linux {
             let route = NetlinkRouteSocket::open()?;
             let nft = NetlinkNetfilterSocket::open()?;
             let t = timeout();
-            let net = create_network(
-                &route,
-                &nft,
-                &NetworkCreateSpec::new(
-                    NetworkName::new("dnsm")?,
-                    IpPrefix::new("10.215.0.1".parse().map_err(|_| fail("addr"))?, 24)?,
-                )?,
-                t,
-            )
-            .map_err(|e| fail(format!("create_network failed at {:?}: {e}", e.step)))?;
+            // IPAM は特権資源（network）を作る前に構築する。構築失敗で `delete_network` に到達できず
+            // root で作った資源が残る経路を作らない（AGENTS.md「特権操作の後始末」）。
+            let gateway = IpPrefix::new("10.215.0.1".parse().map_err(|_| fail("addr"))?, 24)?;
+            let mut ipam = StaticIpam::new(&NetworkName::new("dnsm")?, gateway)?;
+            let spec = NetworkCreateSpec::new(NetworkName::new("dnsm")?, gateway)?;
+            let net = create_network(&route, &nft, &spec, t)
+                .map_err(|e| fail(format!("create_network failed at {:?}: {e}", e.step)))?;
             // create_network 成功後は、どの失敗経路でも逆順（helper 停止 → delete_network）で回収する。
-            let mut ipam = StaticIpam::for_network(&net)?;
             let mut ports = PortRegistry::new();
             let mut attached = Vec::new();
             let mut helper = HelperGuard(None);

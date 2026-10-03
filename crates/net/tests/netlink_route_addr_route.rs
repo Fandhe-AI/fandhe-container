@@ -68,12 +68,14 @@ fn add_address_and_route_in_isolated_netns() {
         .messages()
         .iter()
         .filter(|m| m.msg_type() == RTM_NEWLINK)
-        .filter_map(|m| {
-            m.payload()
-                .get(4..8)?
-                .try_into()
-                .ok()
-                .map(u32::from_ne_bytes)
+        .map(|m| {
+            // 不正な payload は黙って除外せず即失敗させる（fail-closed。ガードの迂回防止）
+            let raw: [u8; 4] = m
+                .payload()
+                .get(4..8)
+                .and_then(|b| b.try_into().ok())
+                .expect("malformed RTM_NEWLINK payload: refusing to run");
+            u32::from_ne_bytes(raw)
         })
         .collect();
     assert_eq!(

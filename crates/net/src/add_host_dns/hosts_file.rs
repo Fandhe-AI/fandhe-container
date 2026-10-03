@@ -594,29 +594,55 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "orig\n");
     }
 
-    /// NET-12・TASK-185.2（P0）: 管理ルートは `/` から 1 要素ずつ辿り、祖先に symlink があれば
-    /// （`canonicalize` 後の差し替え相当）`FAILED_PRECONDITION` で開かない。実ディレクトリは開ける。
+    /// NET-12・TASK-185.2（P0）: 管理ルートは正規化せず `/` から 1 要素ずつ辿る。管理ルート自身・祖先が
+    /// 管理外ディレクトリへの symlink なら `FAILED_PRECONDITION` で拒否し、リンク先の hosts を変更しない。
+    /// 相対パス・`..` を含むパスは `INVALID_ARGUMENT`、不在は `NOT_FOUND`。
     #[test]
-    fn managed_root_with_symlink_ancestor_is_not_opened() {
+    fn managed_root_symlink_is_rejected_without_following() {
         let real = TmpFile::new("root-real", Some("orig\n"));
         let alias = TmpFile::new("root-alias", None);
-        // 一時ディレクトリ自体の祖先に symlink があっても影響しないよう正規化してから組み立てる。
-        let alias_root = std::fs::canonicalize(&alias.root).unwrap();
+        let real_root = real.root.clone();
+        let alias_root = alias.root.clone();
         let link = alias_root.join("lnk");
-        std::os::unix::fs::symlink(&real.root, &link).unwrap();
-        let canon = std::fs::canonicalize(&real.root).unwrap();
-        assert!(open_abs_dir_nofollow(&canon).is_ok());
-        let e = open_abs_dir_nofollow(&link).unwrap_err();
+        std::os::unix::fs::symlink(&real_root, &link).unwrap();
+        std::fs::create_dir(alias_root.join("d")).unwrap();
+        std::os::unix::fs::symlink(&real_root, alias_root.join("d").join("lnk")).unwrap();
+
+        // 管理ルート自身が symlink（正規化すればリンク先の hosts へ追記できてしまう経路）。
+        let e = apply_add_hosts(&link, Path::new("hosts"), ["web:192.0.2.1"]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
         assert_eq!(
             e.message(),
             "managed root has a symlink or non-directory component"
         );
+        // 祖先が symlink（`lnk/..` 経由で実ディレクトリへ戻る形も含めて辿らない）。
         let e = open_abs_dir_nofollow(&link.join("x")).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        let e = apply_add_hosts(
+            &alias_root.join("d").join("lnk"),
+            Path::new("hosts"),
+            ["web:192.0.2.1"],
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(std::fs::read_to_string(&real.path).unwrap(), "orig\n");
+
+        for bad in [Path::new("relative/root"), &alias_root.join("..").join("x")] {
+            let e = open_abs_dir_nofollow(bad).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument, "{bad:?}");
+            assert_eq!(
+                e.message(),
+                "managed root must be a normalized absolute path"
+            );
+        }
         let e = open_abs_dir_nofollow(&alias_root.join("none")).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::NotFound);
-        assert_eq!(std::fs::read_to_string(&real.path).unwrap(), "orig\n");
+        // 正規化済みの実ディレクトリなら追記できる。
+        apply_add_hosts(&real_root, Path::new("hosts"), ["web:192.0.2.1"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&real.path).unwrap(),
+            "orig\n192.0.2.1\tweb\n"
+        );
     }
 
     /// NET-12・TASK-185.2（P0）: 途中要素が通常ファイルなら辿らず `INVALID_ARGUMENT`、途中が不在なら

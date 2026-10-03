@@ -21,8 +21,10 @@
 //!   呼び出し側が所有し、複数ネットワークで 1 つを共有する。デーモンレス構成で別プロセスが公開した受け口とも
 //!   競合を検出するには [`PortRegistry::with_shared_file`] を使う（排他ロック付きの共有ファイル。既定の
 //!   [`PortRegistry::new`] はプロセス内のみ）。共有ファイルは開いた fd を検証し（通常ファイル・実効 UID 所有・
-//!   `0o077` なし・symlink 非追従）、一時ファイル＋fsync＋rename で原子的に更新する。空・不完全な内容は
-//!   予約ゼロ件ではなく破損として拒否する。ロックは置き換えない `<path>.lock` に掛ける。再起動後の復元と孤児エントリの回収は TASK-139.4 以降（REPAIR-3）
+//!   `0o077` なし・symlink 非追従）、一時ファイル＋fsync＋rename で原子的に更新する。空・不完全な内容・
+//!   同じ受け口の重複行・書き込み側が出さない値（ポート 0・公開先範囲外のアドレス・CR）は予約ゼロ件ではなく
+//!   破損として拒否する。サイズ上限（1 MiB）は読み込み・書き込みの両方で同じ検査を通し、上限を超える
+//!   予約は書き込む前に `ResourceExhausted` で拒否する（書いたファイルを次回読めなくならないため）。ロックは置き換えない `<path>.lock` に掛ける。再起動後の復元と孤児エントリの回収は TASK-139.4 以降（REPAIR-3）
 //! - IPv4 のみ（静的 IPAM が IPv4 のみのため）。公開の個別解除はルールハンドルの取得経路が無く未対応
 //!   （ネットワーク削除時にテーブルごと解放する。TASK-139.4）
 
@@ -193,7 +195,9 @@ pub struct PortRegistry {
 
 type ListenerKey = (PortProtocol, Ipv4Addr, u16);
 
-/// 共有ファイルの最大サイズ（無制限の読み込みを防ぐ）。
+/// 共有ファイルの最大サイズ（無制限の読み込みを防ぐ）。読み込み・書き込みの両方が
+/// [`check_shared_len`] で同じ上限を検査する。名前が最大長（64 バイト）の行は 151 バイトなので、
+/// 最悪でも約 6,900 件の受け口を保持できる。
 const MAX_SHARED_FILE_BYTES: u64 = 1024 * 1024;
 /// 共有ファイルのロック待ちの期限。
 const SHARED_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -204,6 +208,18 @@ const SHARED_FOOTER: &str = "end\n";
 
 fn shared_err(msg: &'static str) -> NetError {
     NetError::new(NetErrorCode::Internal, msg)
+}
+
+/// 共有ファイルの内容長 `len` がサイズ上限内か検査する。[`parse_shared`]（読み込み前後）と
+/// [`encode_shared`]（書き込み前）が共有し、上限超過はどちらも `ResourceExhausted` を返す。
+fn check_shared_len(len: u64) -> Result<(), NetError> {
+    if len > MAX_SHARED_FILE_BYTES {
+        return Err(NetError::new(
+            NetErrorCode::ResourceExhausted,
+            "shared port registry exceeds the size limit",
+        ));
+    }
+    Ok(())
 }
 
 /// `path` の末尾へ `suffix` を足したパス（ロックファイル・一時ファイル用）。
@@ -307,7 +323,10 @@ fn open_locked(path: &Path) -> Result<File, NetError> {
 
 /// 共有ファイルを読む。ファイルが無ければ予約ゼロ件（初回）。空ファイルや不完全な内容は
 /// 予約ゼロ件として扱わず破損として拒否する（fail-closed。書き込みは原子的 rename のため、
-/// 正常系では空ファイルは現れない）。呼び出しは [`open_locked`] のロック区間内で行うこと。
+/// 正常系では空ファイルは現れない）。[`encode_shared`] が出さない内容（同じ受け口の重複行・
+/// ポート 0・公開先範囲外のアドレス・行末の CR）も破損とする。重複を上書きで受理すると先の所有者が
+/// 失われ、`release` が残すべき予約を外し得るため。サイズ上限超過は `ResourceExhausted`。
+/// 呼び出しは [`open_locked`] のロック区間内で行うこと。
 fn parse_shared(path: &Path) -> Result<HashMap<ListenerKey, ListenerOwner>, NetError> {
     let Some(mut file) = open_verified(path, false)? else {
         return Ok(HashMap::new());
@@ -315,14 +334,14 @@ fn parse_shared(path: &Path) -> Result<HashMap<ListenerKey, ListenerOwner>, NetE
     let meta = file
         .metadata()
         .map_err(|_| shared_err("failed to stat shared port registry"))?;
-    if meta.len() > MAX_SHARED_FILE_BYTES {
-        return Err(shared_err("shared port registry is too large"));
-    }
+    check_shared_len(meta.len())?;
     let mut text = String::new();
+    // stat 後に伸びた場合も上限超過として検出できるよう、上限 + 1 バイトまで読んで同じ検査を通す。
     (&mut file)
-        .take(MAX_SHARED_FILE_BYTES)
+        .take(MAX_SHARED_FILE_BYTES.saturating_add(1))
         .read_to_string(&mut text)
         .map_err(|_| shared_err("failed to read shared port registry"))?;
+    check_shared_len(text.len() as u64)?;
     let corrupt = || shared_err("shared port registry is corrupt");
     // 先頭行がヘッダ、末尾行が終端マーカー。切り詰められた内容・空ファイルはここで弾く。
     let body = text
@@ -330,7 +349,8 @@ fn parse_shared(path: &Path) -> Result<HashMap<ListenerKey, ListenerOwner>, NetE
         .and_then(|t| t.strip_suffix(SHARED_FOOTER))
         .ok_or_else(corrupt)?;
     let mut map = HashMap::new();
-    for line in body.lines() {
+    // `lines()` は行末の CR を黙って除くため使わない（CR は最後の欄に残り、ID の検証で弾かれる）。
+    for line in body.split_terminator('\n') {
         let mut f = line.split(' ');
         let (Some(proto), Some(addr), Some(port), Some(net), Some(ep), None) =
             (f.next(), f.next(), f.next(), f.next(), f.next(), f.next())
@@ -342,20 +362,31 @@ fn parse_shared(path: &Path) -> Result<HashMap<ListenerKey, ListenerOwner>, NetE
             "udp" => PortProtocol::Udp,
             _ => return Err(corrupt()),
         };
+        // 受け口は `PortPublish::new` と同じ規則（公開先範囲・ポート非 0）を満たすこと。
         let addr: Ipv4Addr = addr.parse().map_err(|_| corrupt())?;
-        let port: u16 = port.parse().map_err(|_| corrupt())?;
+        if !is_publishable_unicast(addr) {
+            return Err(corrupt());
+        }
+        let port = port
+            .parse::<u16>()
+            .ok()
+            .and_then(NonZeroU16::new)
+            .ok_or_else(corrupt)?;
         let owner = (
             NetworkName::new(net).map_err(|_| corrupt())?,
             EndpointId::new(ep).map_err(|_| corrupt())?,
         );
-        map.insert((proto, addr, port), owner);
+        // 解析後のキーで照合するので、`080` と `80` のような表記違いの重複も検出する。
+        if map.insert((proto, addr, port.get()), owner).is_some() {
+            return Err(corrupt());
+        }
     }
     Ok(map)
 }
 
-/// 共有ファイルを原子的に置き換える（一時ファイルへ書いて fsync → rename → 親ディレクトリ fsync）。
-/// 途中で失敗・クラッシュしても元のファイルは無傷で残る。[`open_locked`] のロック区間内で呼ぶこと。
-fn write_shared(path: &Path, map: &HashMap<ListenerKey, ListenerOwner>) -> Result<(), NetError> {
+/// 予約表を共有ファイルの内容へ符号化する（行はソート済み）。長さが上限を超えれば
+/// [`check_shared_len`] の `ResourceExhausted`（[`parse_shared`] と同じ検査）。
+fn encode_shared(map: &HashMap<ListenerKey, ListenerOwner>) -> Result<String, NetError> {
     let mut lines: Vec<String> = map
         .iter()
         .map(|((proto, addr, port), (n, e))| {
@@ -368,6 +399,15 @@ fn write_shared(path: &Path, map: &HashMap<ListenerKey, ListenerOwner>) -> Resul
         .collect();
     lines.sort();
     let body = format!("{SHARED_HEADER}{}{SHARED_FOOTER}", lines.concat());
+    check_shared_len(body.len() as u64)?;
+    Ok(body)
+}
+
+/// 共有ファイルを原子的に置き換える（一時ファイルへ書いて fsync → rename → 親ディレクトリ fsync）。
+/// 途中で失敗・クラッシュしても元のファイルは無傷で残る。[`open_locked`] のロック区間内で呼ぶこと。
+/// サイズ上限は一時ファイルに触れる前に [`encode_shared`] で検査する（超過時はファイル操作をしない）。
+fn write_shared(path: &Path, map: &HashMap<ListenerKey, ListenerOwner>) -> Result<(), NetError> {
+    let body = encode_shared(map)?;
     let werr = || shared_err("failed to write shared port registry");
     let tmp = with_suffix(path, ".tmp");
     // 前回の残骸があれば消す（symlink なら link 自体が消えるだけ）。ロック区間内なので競合しない。
@@ -435,6 +475,8 @@ impl PortRegistry {
 
     /// `owner` として `ports` の受け口をすべて予約する。1 件でも既に予約済み（同じ持ち主を含む）なら
     /// 何も予約せず `AlreadyExists`（all-or-nothing）。`ports` 内の重複も `AlreadyExists`。
+    /// 共有ファイル使用時は、予約後の内容がサイズ上限を超えるなら書き込まず `ResourceExhausted`、
+    /// 破損は `Internal`、ロック待ちの期限切れは `Timeout`（いずれも予約は増えない）。
     pub(crate) fn reserve(
         &mut self,
         network: &NetworkName,

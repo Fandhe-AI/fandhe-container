@@ -1531,7 +1531,8 @@ impl AttachOps for LinuxAttachOps<'_> {
 /// アドレスと default route（gateway = bridge アドレス）を設定し、`spec` にポート公開の指定があれば
 /// `nft` で DNAT ルールを投入する（TASK-139.3・#316）。
 /// ポート公開の受け口は投入前に `ports`（全ネットワークで共有する [`PortRegistry`]）へ予約し、他のコンテナ・
-/// ネットワークが公開済みなら `AlreadyExists` で失敗させる。
+/// ネットワークが公開済みなら `AlreadyExists` で失敗させる（共有予約ファイル使用時は、そのサイズ上限超過の
+/// `ResourceExhausted`・破損の `Internal`・ロック待ち期限切れの `Timeout` でも失敗させる。[`PortRegistry`]）。
 /// 失敗時は自分が作った veth と netns と IPAM の払い出し・受け口の予約を戻し、結果を [`ContainerAttachError::rollback`] で返す。
 /// ただし DNAT バッチの結果が不明な場合は、残ったルールが再利用先へ転送しないよう IPAM のアドレスと受け口の予約を
 /// 保持する（quarantine。`AttachResource::Address`・`PortRules` を `Unknown` で報告）。

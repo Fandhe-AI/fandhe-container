@@ -11,8 +11,9 @@
 //! nfnetlink の nfgenmsg ヘッダーとバッチフレーミング（BATCH_BEGIN / END。`nftables_batch`。OS 非依存。TASK-137.1・#304）と、
 //! nf_tables の NEWTABLE / NEWCHAIN / DELTABLE の組み立て（`nftables_batch::table_chain`。TASK-137.2・#305）と、
 //! nf_tables バッチの送信と ACK / エラー判定（`nftables_batch::NetlinkNetfilterSocket`。Linux のみ。TASK-137.3・#306）と、
+//! nf_tables ルールの expr 列（`NFTA_RULE_EXPRESSIONS` / `NFTA_LIST_ELEM` / `NFTA_EXPR_*`）のネスト属性コーデック（`nftables_rules`。OS 非依存。TASK-138.1・#309）と、
 //! 操作ごとの成功 / 失敗・所要時間の記録先を受け取る計装連携点（`instrument`。REPAIR-4）も持つ。link の down・削除・bridge への接続、
-//! nftables のルール、DNS ヘルパー等は未実装で、G10（TASK-136〜148・TASK-185〜186）で実装する（REPAIR-3）。
+//! nftables のルール本体（NEWRULE。TASK-138.2 以降）、DNS ヘルパー等は未実装で、G10（TASK-136〜148・TASK-185〜186）で実装する（REPAIR-3）。
 //! PLUG-1 区分は検討中
 //! （制御面の `NetworkPlugin` は plugin 側に区分される一方、DNS ヘルパー・rootless 転送のデータパス
 //! 判定は未確定。crate-naming.md）。確定扱いにはしない（spec-reference）。
@@ -22,5 +23,6 @@ pub mod instrument;
 pub mod netlink;
 pub mod netlink_route;
 pub mod nftables_batch;
+pub mod nftables_rules;
 #[cfg(target_os = "linux")]
 mod sys;

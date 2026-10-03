@@ -392,15 +392,21 @@ mod tests {
     }
 
     fn spec() -> NoneModeSpec {
-        NoneModeSpec::new(
-            EndpointId::new("ctr1").unwrap(),
-            PathBuf::from("/run/fandhe/netns"),
-        )
-        .unwrap()
+        NoneModeSpec::new(EndpointId::new("ctr1").unwrap(), netns_dir()).unwrap()
+    }
+
+    /// テスト用の netns 置き場。`/run/...` は Windows で絶対パスと見なされないため、
+    /// 3 OS で絶対パスになる一時ディレクトリ配下を使う（実際には作成しない）。
+    fn netns_dir() -> PathBuf {
+        std::env::temp_dir().join("fandhe-netns")
+    }
+
+    fn create_log() -> String {
+        format!("create {} ctr1", netns_dir().display())
     }
 
     fn pin() -> PathBuf {
-        PathBuf::from("/run/fandhe/netns").join("ctr1")
+        netns_dir().join("ctr1")
     }
 
     /// NET-6・TASK-143.2: 正常系は netns 作成 → lo の up → ソケット解放の順で、veth 等を作らない。
@@ -410,12 +416,7 @@ mod tests {
         let c = create_none_netns_with(&f, &spec()).unwrap();
         assert_eq!(
             *f.log.borrow(),
-            vec![
-                "create /run/fandhe/netns ctr1",
-                "index lo",
-                "up 1",
-                "release_socket"
-            ]
+            vec![create_log().as_str(), "index lo", "up 1", "release_socket"]
         );
         assert_eq!(c.netns_path, pin());
         assert_eq!(c.endpoint.as_str(), "ctr1");
@@ -442,7 +443,7 @@ mod tests {
         assert_eq!(e.step, NoneModeStep::CreateNetns);
         assert_eq!(e.code(), NetErrorCode::PermissionDenied);
         assert_eq!(e.rollback, AttachRollbackReport::default());
-        assert_eq!(*f.log.borrow(), vec!["create /run/fandhe/netns ctr1"]);
+        assert_eq!(*f.log.borrow(), vec![create_log()]);
     }
 
     /// NET-6: netns 作成の結果不明は pin を `Unknown` で報告する。

@@ -13,7 +13,7 @@
 //!   - (a) pin の inode が保持 fd の netns と一致し、子の netns とは別
 //!   - (b) `nsenter --net=<pin>` 越しの `/proc/net/dev` に veth が現れない（lo とフォールバックトンネルのみ）
 //!   - (c) `nsenter --net=<pin> <exe> --probe <addr>...`: loopback の TCP 疎通が成立し、TEST-NET-1・他コンテナ・
-//!     bridge gateway への connect が `ENETUNREACH` で失敗し、`/proc/net/route` が空であること
+//!     bridge gateway への connect が `ENETUNREACH` で失敗し、`/proc/net/route` に loopback の 127.0.0.0/8 以外の経路が無いこと
 //!   - (d) `release_none_netns` 後に pin ファイルが消え、`unpin_path` の再実行が `Ok` になること（冪等）
 //!
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・
@@ -278,10 +278,21 @@ mod linux {
                 other => return Err(format!("connect {a} expected ENETUNREACH, got {other:?}")),
             }
         }
-        // 3. ルートテーブルはヘッダ行のみ。
+        // 3. ルートテーブルにはヘッダ行以外に loopback の 127.0.0.0/8 だけが許される。
+        //    lo を up にするとカーネルが設置し得るため許容し、それ以外（default route 等）は拒否する。
+        //    /proc/net/route は Destination・Mask を little-endian の 16 進で出す
+        //    （127.0.0.0 = 0000007F、255.0.0.0 = 000000FF）。
         let route = fs::read_to_string("/proc/net/route").map_err(|e| format!("route: {e}"))?;
-        if route.lines().count() > 1 {
-            return Err(format!("unexpected routes: {route}"));
+        let unexpected: Vec<&str> = route
+            .lines()
+            .skip(1)
+            .filter(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                !(f.get(1) == Some(&"0000007F") && f.get(7) == Some(&"000000FF"))
+            })
+            .collect();
+        if !unexpected.is_empty() {
+            return Err(format!("unexpected routes: {unexpected:?}"));
         }
         Ok(())
     }

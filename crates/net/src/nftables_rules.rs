@@ -4,14 +4,16 @@
 //! `nft` コマンドや汎用 crate に頼らず、`NFT_MSG_NEWRULE` の `NFTA_RULE_EXPRESSIONS` 以下を
 //! `NlMsgBuilder` で組み立て、`AttrIter` で復号する OS 非依存のコーデック。ソケット・`unsafe` は持たない。
 //! 任意の expr 名・データを運べる汎用層であり、型付き expr はこの層の上に `NftExpr` へ変換する形で載せる。
-//! 型付き expr は `payload`（load 形式。[`NftPayload`]・TASK-138.2）と `masq`（[`NftMasq`]・TASK-138.2）、
-//! NEWRULE 本体は [`RuleCreate`]（TASK-138.2）。
+//! 型付き expr は `payload`（load 形式。[`NftPayload`]・TASK-138.2）・`masq`（[`NftMasq`]・TASK-138.2）・
+//! `cmp`（[`NftCmp`]）・`immediate`（[`NftImmediate`]）・`nat`（[`NftNat`]。TASK-138.3）、
+//! NEWRULE 本体は [`RuleCreate`]（TASK-138.2）、ハンドル指定の削除は [`RuleDelete`]（TASK-138.3）。
 //!
 //! # 呼び出し元
 //!
 //! [`RuleCreate`]（NEWRULE 本体。TASK-138.2・#310）が、メッセージ組み立て中に [`NftRuleExprs::put_into`] を呼ぶ。
-//! nat / ルール削除（TASK-138.3・#311）も同じ層に載る。masq の実機結合は
-//! `tests/nftables_masq_privileged.rs`（TASK-138.2）、それ以外の実機結合は TASK-138.4（#312）が担当する。
+//! cmp / immediate / nat / [`RuleDelete`]（TASK-138.3・#311）も同じ層に載る。masq の実機結合は
+//! `tests/nftables_masq_privileged.rs`（TASK-138.2）、DNAT と削除の実機結合は
+//! `tests/nftables_dnat_privileged.rs`（TASK-138.3）、3 経路の統合は TASK-138.4（#312）が担当する。
 //!
 //! # ワイヤーレイアウト
 //!
@@ -44,16 +46,25 @@
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
-//! - 型付き expr は payload（load 形式）と masq のみ。cmp / bitwise / meta / nat（#311 と TASK-139）は未実装
-//! - `NFT_MSG_DELRULE` とルールのハンドル指定（#311）。詳細は各サブモジュールの doc
+//! - 型付き expr は payload（load 形式）・masq・cmp・immediate・nat のみ。bitwise / meta は未実装（TASK-139）
+//! - ルールハンドルの取得経路（`NLM_F_ECHO` 応答の回収・GETRULE dump）。バッチ層が NEWRULE 応答を
+//!   受理しないため未対応で、[`NftRuleHandle::from_rule_attrs`] の純デコーダまで。詳細は各サブモジュールの doc
 //! - `NLA_F_NET_BYTEORDER` 付き属性のデコード（本エンコーダが出さないため現状は拒否。
 //!   GETRULE dump 等で必要になった時点で受理を検討する）
 
+mod cmp;
+mod data;
+mod immediate;
 mod masq;
+mod nat;
 mod payload;
 mod rule;
 
+pub use cmp::*;
+pub use data::*;
+pub use immediate::*;
 pub use masq::*;
+pub use nat::*;
 pub use payload::*;
 pub use rule::*;
 

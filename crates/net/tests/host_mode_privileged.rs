@@ -5,8 +5,12 @@
 //! CI 通過のための弱体化ではない。`AGENTS.md`「実機前提テスト」節）。非 Linux では対象外。
 //!
 //! # 流れ
-//! - ランチャ（host netns・root）: (1) `HostNetns::detect(信頼済み基準)` が成功し id が基準（テストではホスト実機の `/proc/1/ns/net`）と一致、
-//!   (2) 子 `sleep` が `verify_process` で `Member`、(3) その子の `/proc/<pid>/net/dev` の interface 名集合が
+//! - 前提検証: ランチャ自身と `/proc/1` がともに初期 PID namespace（nsfs inode `0xEFFF_FFFC`。Linux 3.8 以降
+//!   固定）にいることを確かめる。これにより `/proc/1` が物理ホストの init で、その netns をホスト netns の
+//!   基準にできる。コンテナ内の root 等で満たさない場合は skip せず失敗する（ライブラリは `/proc/1` を
+//!   基準にしない。基準に使うのはこの前提を検証した本テストに限る）
+//! - ランチャ（host netns・root）: (1) `HostNetns::detect(信頼済み基準)` が成功し id が基準（`/proc/1/ns/net`）と一致、
+//!   (2) 子 `sleep` が `verify_process`（全スレッド照合）で `Member`、(3) その子の `/proc/<pid>/net/dev` の interface 名集合が
 //!   ホストの `/proc/net/dev` と一致、(4) `unshare --net` で起こした子は `Other` になり、
 //!   (5) `unshare --net -- <exe> --child` の子では `detect()` が `FAILED_PRECONDITION`（fail-closed）になる
 //!
@@ -27,7 +31,7 @@ fn main() {
         linux::launcher();
     } else {
         println!(
-            "host_mode_privileged: ignored (requires root and `unshare`; run the built executable with `--ignored` under `sudo`, see AGENTS.md)"
+            "host_mode_privileged: ignored (requires root in the initial PID namespace and `unshare`; run the built executable with `--ignored` under `sudo`, see AGENTS.md)"
         );
     }
 }
@@ -61,6 +65,33 @@ mod linux {
             .as_deref()
             == Some("0");
         assert!(uid_root, "this test requires root (euid 0); see AGENTS.md");
+    }
+
+    /// 初期 PID namespace の nsfs inode 番号（カーネルの `PROC_PID_INIT_INO`。Linux 3.8 以降固定）。
+    const PROC_PID_INIT_INO: u64 = 0xEFFF_FFFC;
+
+    /// ランチャと `/proc/1` がともに初期 PID namespace にいることを確かめ、`/proc/1/ns/net` の
+    /// (dev, ino) をホスト netns の基準として返す（NET-6）。
+    ///
+    /// euid 0 だけでは root のコンテナ内でも通り、その `/proc/1` はコンテナの PID 1 で物理ホストの
+    /// netns とは限らない。初期 PID namespace の PID 1 は物理ホストの init だけなので、両者の
+    /// `ns/pid` が `PROC_PID_INIT_INO` かつ nsfs の同じ dev であることを要求する。magic link を
+    /// 辿れない場合は procfs 側の別 dev・別 inode が見えるため、dev も照合する。満たさなければ失敗する。
+    fn host_netns_reference() -> NsId {
+        let own_pid = fs::metadata("/proc/self/ns/pid").expect("stat /proc/self/ns/pid");
+        let init_pid = fs::metadata("/proc/1/ns/pid").expect("stat /proc/1/ns/pid");
+        let init_net = fs::metadata("/proc/1/ns/net").expect("stat /proc/1/ns/net");
+        assert_eq!(
+            (own_pid.dev(), own_pid.ino()),
+            (init_net.dev(), PROC_PID_INIT_INO),
+            "launcher must run in the initial PID namespace (not inside a container); see AGENTS.md"
+        );
+        assert_eq!(
+            (init_pid.dev(), init_pid.ino()),
+            (own_pid.dev(), PROC_PID_INIT_INO),
+            "/proc/1 must be the init of the initial PID namespace; see AGENTS.md"
+        );
+        NsId::new(init_net.dev(), init_net.ino())
     }
 
     /// `/proc/.../net/dev` の interface 名集合（先頭 2 行はヘッダ）。
@@ -144,15 +175,10 @@ mod linux {
         require_root();
 
         // (1) 呼び出しスレッドがホスト netns にいる。
-        // 実機テストはホスト上の root で動くため、ここに限り /proc/1 を信頼済み基準として使う。
-        let init = fs::metadata("/proc/1/ns/net").expect("stat /proc/1/ns/net");
-        let trusted = NsId::new(init.dev(), init.ino());
+        // 初期 PID namespace にいることを検証した上でだけ、/proc/1 を信頼済み基準として使う。
+        let trusted = host_netns_reference();
         let host = HostNetns::detect(trusted).expect("detect host netns");
-        assert_eq!(
-            (host.id().dev(), host.id().ino()),
-            (init.dev(), init.ino()),
-            "detect id must equal /proc/1/ns/net"
-        );
+        assert_eq!(host.id(), trusted, "detect id must equal /proc/1/ns/net");
 
         // (2)(3) host の子は Member で、interface 名集合がホストと一致する。
         let child = spawn_sleep(false);
@@ -183,8 +209,8 @@ mod linux {
                 .args(["--net", "--"])
                 .arg(exe)
                 .arg("--child")
-                .arg(init.dev().to_string())
-                .arg(init.ino().to_string())
+                .arg(trusted.dev().to_string())
+                .arg(trusted.ino().to_string())
                 .stdin(Stdio::null())
                 .spawn()
                 .expect("spawn unshare child"),

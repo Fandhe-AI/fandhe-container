@@ -8,7 +8,7 @@
 //!
 //! 呼び出し側は `NftBatch::push_with(|seq| msg.build(seq))` で各メッセージを BEGIN / END の間へ積む。
 //! `build` は `NLM_F_REQUEST | NLM_F_ACK` を付与するため、バッチ側の検証（REQUEST・ACK 必須）を通る。
-//! 送信と ACK 判定は #306（TASK-137.3）、実機結合は #307（TASK-137.4）の担当。
+//! 送信と ACK 判定は #306（TASK-137.3）、実機結合は `tests/nftables_batch_privileged.rs`（TASK-137.4・#307）が担当する。
 //!
 //! # ワイヤーレイアウト
 //!
@@ -37,7 +37,7 @@
 //! - `NFTA_TABLE_FLAGS`（dormant / owner）、`NFTA_CHAIN_POLICY` / `FLAGS` / `HANDLE`、handle 指定の削除
 //! - `DELCHAIN`・GET 系・`NFT_MSG_DESTROYTABLE`
 //! - ARP / Bridge / Netdev の base chain と ingress hook（netdev は `NFTA_HOOK_DEV` が必須）
-//! - 送信と ACK 判定（#306）、実機テスト（#307）、ルール（TASK-138）
+//! - ルール（TASK-138）
 
 use super::{
     NFNL_SUBSYS_NFTABLES, NFPROTO_ARP, NFPROTO_BRIDGE, NFPROTO_INET, NFPROTO_IPV4, NFPROTO_IPV6,

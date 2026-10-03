@@ -136,11 +136,27 @@ mod linux {
     /// ランチャが router へ自身の pid を渡す環境変数（router が自分の親＝ランチャであることの確認に使う）。
     const LAUNCHER_PID_ENV: &str = "FANDHE_DNAT_TEST_LAUNCHER_PID";
 
+    /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス名。
+    /// モジュールのロード状況で有無が変わるため「新規 netns 判定」では無視する
+    /// （`link_netns_privileged` の同名定数と同じ一覧）。
+    const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
+        "tunl0",
+        "gre0",
+        "gretap0",
+        "erspan0",
+        "ip_vti0",
+        "ip6_vti0",
+        "sit0",
+        "ip6tnl0",
+        "ip6gre0",
+        "ip6erspan0",
+    ];
+
     /// 自プロセスが「作成直後の新規 network namespace」にいることを検証する（fail-closed）。
     ///
     /// 親との netns 比較だけでは、親が別の共有 netns にいる場合に素通りするため、(1) 親と別 netns
-    /// であること、(2) `/proc/net/dev`（読み手の netns を映す）に `lo` 以外のインターフェースが無い
-    /// こと（新規 netns は `lo` のみ。host・共有 netns は通常それ以外を持つ）を併せて確認する。
+    /// であること、(2) `/proc/net/dev`（読み手の netns を映す）に `lo` とフォールバックトンネル
+    /// デバイス以外のインターフェースが無いこと（host・共有 netns は通常それ以外を持つ）を併せて確認する。
     fn ensure_isolated_netns() -> Result<(), NetError> {
         let io = |what: &str, e: std::io::Error| {
             NetError::new(NetErrorCode::Internal, format!("{what} failed: {e}"))
@@ -161,7 +177,7 @@ mod linux {
             .lines()
             .skip(2)
             .filter_map(|l| l.split(':').next().map(str::trim))
-            .filter(|n| !n.is_empty() && *n != "lo")
+            .filter(|n| !n.is_empty() && *n != "lo" && !FALLBACK_TUNNEL_DEVICES.contains(n))
             .collect();
         if !extra.is_empty() {
             return Err(fail(format!(

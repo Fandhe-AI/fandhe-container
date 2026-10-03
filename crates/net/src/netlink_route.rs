@@ -12,6 +12,8 @@
 //! link 作成・設定の送信ラッパー（`NetlinkRouteSocket::create_link` / `set_link`。`RTM_SETLINK` の
 //! netns 移動・up は [`LinkSet`]。TASK-136.3.2・#846）も提供する。address / route 操作（`addr_route` モジュール。
 //! `AddressSpec`・`RouteSpec`・`add_address`・`add_route`。TASK-136.4・#301）も本層の上に載る。
+//! 自ソケットの `nl_pid` を bind 直後に `getsockname` で取得し（[`NetlinkRouteSocket::local_pid`]）、
+//! `request` は応答の `nlmsg_pid` が自ソケットと一致しないメッセージを破棄する（#1313。多層防御）。
 //! 実機前提の結合テスト（`tests/link_netns_privileged.rs`・`tests/netlink_route_addr_route.rs`。
 //! TASK-136.5・#302）と既定集合からの分離方式は `AGENTS.md`「実機前提テスト」節を参照。
 //!
@@ -30,8 +32,6 @@
 //! - netfilter ソケット（`NETLINK_NETFILTER`）での拡張 ACK の有効化・解釈。拡張 ACK は route ソケットだけで
 //!   有効にする（`nftables_batch` が受け取るバイト列を変えないため）
 //! - 拡張 ACK のうち `NLMSGERR_ATTR_COOKIE`・`POLICY`・`MISS_TYPE` / `MISS_NEST` の解釈（読み飛ばす）
-//! - 自ソケットの `nl_pid` 取得（`getsockname`）と応答 `nlmsg_pid` の照合。マルチキャスト購読が
-//!   なく送信元がカーネルであることは `recv` が検証済みのため、現状は seq 照合で足りる
 //! - dump 中断（`NLM_F_DUMP_INTR`）の自動再試行（検出して `FailedPrecondition` で返すのみ）、複数スレッドでの seq 別の待機者振り分け（往復は 1 件ずつ直列化する）
 //! - link の down・削除・属性変更の送信ラッパー。address / route の未実装範囲は `addr_route` の doc を参照
 
@@ -274,6 +274,7 @@ pub(crate) use socket::{RequestGate, classify_errno};
 #[cfg(target_os = "linux")]
 mod socket {
     use std::fmt;
+    use std::num::NonZeroU32;
     use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
     use std::sync::{Arc, Condvar, Mutex, PoisonError};
     use std::time::Duration;
@@ -413,7 +414,7 @@ mod socket {
     /// `nl_pid` はカーネル採番・マルチキャスト購読なし。fd は `SOCK_CLOEXEC` で、Drop で閉じる。
     /// 通常は [`request`](Self::request)（seq 採番・ACK / エラー判定・全体期限つきの往復。#844）を
     /// 使う。生の `send` / `recv` は `NlMsgBuilder` で組んだバイト列の送受信だけを行い、seq 照合は
-    /// しない。採番 pid の取得は未実装（モジュール doc の未実装範囲）。
+    /// しない。採番された自ソケットの `nl_pid` は [`local_pid`](Self::local_pid) で取得できる（#1313）。
     ///
     /// `Send + Sync` で、`&self` のまま複数スレッドから呼べる。`request` は内部で 1 件ずつに直列化
     /// する。`request` の最中に別スレッドが生の `recv` を呼ぶと応答を横取りしうるため、同じ
@@ -428,6 +429,8 @@ mod socket {
         recorder: Arc<dyn NetOpRecorder>,
         /// `request` の seq 採番器（ソケット単位）。
         seq: SeqAllocator,
+        /// bind 後に `getsockname` で得たカーネル採番の `nl_pid`（0 は open 失敗にするため非 0 型）。
+        local_pid: NonZeroU32,
         /// `request` の直列化。
         gate: RequestGate,
         /// open 時に有効にできた ACK オプション（拡張 ACK。NET-11）。
@@ -534,6 +537,12 @@ mod socket {
             Self::open_protocol(recorder, sys::open_netfilter_socket, false)
         }
 
+        /// カーネルが採番した自ソケットの port ID（`nl_pid`）。このソケット宛ての応答の
+        /// `nlmsg_pid` はこれと一致する。生の `recv` では照合しないため、必要な呼び出し側が使う。
+        pub fn local_pid(&self) -> NonZeroU32 {
+            self.local_pid
+        }
+
         /// 計装の記録先（`NetlinkNetfilterSocket` が往復全体を記録するために共有する）。
         pub(crate) fn recorder(&self) -> &Arc<dyn NetOpRecorder> {
             &self.recorder
@@ -553,10 +562,13 @@ mod socket {
             open_fd: fn() -> Result<OwnedFd, SysError>,
             ack_opts: bool,
         ) -> Result<Self, NetError> {
-            let fd = record_net_op(recorder.as_ref(), NetOpKind::NetlinkOpen, || {
+            let (fd, local_pid) = record_net_op(recorder.as_ref(), NetOpKind::NetlinkOpen, || {
                 let fd = open_fd().map_err(|e| map_sys_error("socket", e))?;
                 sys::bind_kernel_assigned(fd.as_fd()).map_err(|e| map_sys_error("bind", e))?;
-                Ok::<_, NetError>(fd)
+                let raw =
+                    sys::local_nl_pid(fd.as_fd()).map_err(|e| map_sys_error("getsockname", e))?;
+                let local_pid = nonzero_local_pid(raw)?;
+                Ok::<_, NetError>((fd, local_pid))
             })?;
             let ack_options = if ack_opts {
                 enable_ack_options(fd.as_fd(), set_ack_opt)
@@ -568,6 +580,7 @@ mod socket {
             };
             Ok(Self {
                 fd,
+                local_pid,
                 recv_lock: Mutex::new(()),
                 recorder,
                 seq: SeqAllocator::new(),
@@ -584,7 +597,11 @@ mod socket {
         ///
         /// 判定: seq 一致の `NLMSG_ERROR` が errno 0 なら成功、非 0 なら errno を分類した構造化エラー
         /// （ERR-1）。`NLMSG_DONE`（dump の終端）でも成功。seq 不一致のメッセージ（以前に時間切れした
-        /// 要求の遅延応答等）は破棄する。`Timeout` / `DataLoss` で戻った場合、カーネル側で操作が適用
+        /// 要求の遅延応答等）は破棄する。`nlmsg_pid` が自ソケットの `nl_pid` と異なるメッセージも
+        /// 破棄する（#1313）: 自分宛てでない `NLMSG_ERROR`（seq がたまたま一致するもの・なりすまし・
+        /// 将来のマルチキャスト通知）で要求の成否を決めさせず、また構造化エラーにして往復を
+        /// 中断すると他宛てトラフィックの混入で可用性を損なうため、seq 不一致と同じく読み飛ばす。
+        /// 破棄し続けても全体期限で `Timeout` になる（REPAIR-5）。`Timeout` / `DataLoss` で戻った場合、カーネル側で操作が適用
         /// 済みかは不明なので、呼び出し側が状態を再照会すること。
         pub fn request(
             &self,
@@ -613,7 +630,9 @@ mod socket {
                     ));
                 }
                 self.send(&message)?;
-                await_reply_for(seq, dump, &deadline, timeout, |t| self.recv(t))
+                await_reply_for(seq, dump, self.local_pid, &deadline, timeout, |t| {
+                    self.recv(t)
+                })
             })
         }
 
@@ -836,6 +855,12 @@ mod socket {
         }
     }
 
+    #[cfg(test)]
+    const TEST_LOCAL_PID: NonZeroU32 = match NonZeroU32::new(0x4242) {
+        Some(p) => p,
+        None => panic!("nonzero"),
+    };
+
     /// seq `seq` の応答が確定する（ACK・エラー・DONE）まで `recv` で受信して判定する（NET-11・REPAIR-5）。
     ///
     /// `deadline` は往復全体で 1 つ（`total` は文言用の元の timeout）。各 `recv` には残り時間を渡し、
@@ -848,7 +873,7 @@ mod socket {
         total: Duration,
         recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
     ) -> Result<NetlinkReply, NetError> {
-        await_reply_for(seq, false, deadline, total, recv)
+        await_reply_for(seq, false, TEST_LOCAL_PID, deadline, total, recv)
     }
 
     /// [`await_reply`] の本体。応答の終端はカーネルの送出順に合わせて次のとおり判定する。
@@ -869,13 +894,14 @@ mod socket {
     fn await_reply_for(
         seq: u32,
         dump: bool,
+        local_pid: NonZeroU32,
         deadline: &Deadline,
         total: Duration,
         recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
     ) -> Result<NetlinkReply, NetError> {
         // 応答の解釈中に期限を過ぎた場合は、errno・DONE エラー・DUMP_INTR 等のどのエラーでも
         // Timeout に統一する（全体期限の契約。REPAIR-5）。
-        await_reply_inner(seq, dump, deadline, total, recv).map_err(|e| {
+        await_reply_inner(seq, dump, local_pid, deadline, total, recv).map_err(|e| {
             if e.code() != NetErrorCode::Timeout && deadline.remaining().is_zero() {
                 NetError::new(
                     NetErrorCode::Timeout,
@@ -894,6 +920,7 @@ mod socket {
     fn await_reply_inner(
         seq: u32,
         dump: bool,
+        local_pid: NonZeroU32,
         deadline: &Deadline,
         total: Duration,
         mut recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
@@ -936,7 +963,10 @@ mod socket {
                 let msg = item?;
                 let h = msg.header();
                 // 以前に時間切れした要求の遅延応答が残りうるため、不一致はエラーにせず破棄する。
-                if h.seq() != seq {
+                // 宛先 `nlmsg_pid` が自ソケットでないメッセージ（他宛て・なりすまし）も同様に破棄する
+                // （#1313）。この判定が終端後の検査より前にあるため、終端後に届いた他宛てメッセージは
+                // `DataLoss` にならず黙って破棄される。
+                if h.seq() != seq || h.pid() != local_pid.get() {
                     continue;
                 }
                 if terminal && h.msg_type() != NLMSG_NOOP {
@@ -1050,6 +1080,17 @@ mod socket {
         }
     }
 
+    /// `getsockname` が返した `nl_pid` を非 0 型にする。カーネルは bind 後に 0 を割り当てないため、
+    /// 0 は異常として open の失敗にする（fail-closed。#1313）。
+    fn nonzero_local_pid(raw: u32) -> Result<NonZeroU32, NetError> {
+        NonZeroU32::new(raw).ok_or_else(|| {
+            NetError::new(
+                NetErrorCode::Internal,
+                "getsockname: kernel assigned netlink port id 0",
+            )
+        })
+    }
+
     /// errno を `NetErrorCode` へ写す（メッセージは英語で syscall 名と errno 数値のみ）。
     fn map_sys_error(call: &str, e: SysError) -> NetError {
         match e {
@@ -1064,6 +1105,10 @@ mod socket {
             SysError::BadSenderAddress => NetError::new(
                 NetErrorCode::DataLoss,
                 format!("{call}: dropped datagram whose sender is not a netlink address"),
+            ),
+            SysError::BadLocalAddress => NetError::new(
+                NetErrorCode::Internal,
+                format!("{call}: local address is not a netlink address"),
             ),
         }
     }
@@ -1135,6 +1180,21 @@ mod socket {
             ifi[4..8].copy_from_slice(&1i32.to_ne_bytes());
             b.put_fixed(&ifi).expect("ifinfomsg");
             b.finish().expect("finish")
+        }
+
+        /// NET-11・#1313: 実カーネルの応答ヘッダの `nlmsg_pid` は `local_pid()` と一致し、非 0 である。
+        #[test]
+        fn reply_pid_matches_local_pid() {
+            let s = NetlinkRouteSocket::open().expect("open");
+            assert_ne!(s.local_pid().get(), 0);
+            s.send(&getlink_lo(7)).expect("send");
+            let data = s.recv(Duration::from_secs(5)).expect("recv");
+            let h = NlMsgIter::new(&data)
+                .next()
+                .expect("one message")
+                .expect("valid")
+                .header();
+            assert_eq!(h.pid(), s.local_pid().get());
         }
 
         /// 本番と同じ上限での待たない 1 回の受信。
@@ -1441,7 +1501,7 @@ mod socket {
         /// 偽の応答データグラム: `NLMSG_ERROR`（errno は正値で渡し、負にして格納。`inner_seq` は
         /// 埋め込む元要求ヘッダの seq）。
         fn err_dgram(seq: u32, errno: i32, inner_seq: u32) -> Vec<u8> {
-            let mut b = NlMsgBuilder::new(NLMSG_ERROR, 0, seq, 0);
+            let mut b = NlMsgBuilder::new(NLMSG_ERROR, 0, seq, TEST_LOCAL_PID.get());
             let mut p = Vec::new();
             p.extend_from_slice(&(-errno).to_ne_bytes());
             p.extend_from_slice(&[0u8; 8]);
@@ -1452,7 +1512,7 @@ mod socket {
         }
 
         fn plain_dgram(msg_type: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
-            let mut b = NlMsgBuilder::new(msg_type, 0, seq, 0);
+            let mut b = NlMsgBuilder::new(msg_type, 0, seq, TEST_LOCAL_PID.get());
             b.put_fixed(payload).expect("payload");
             b.finish().expect("finish")
         }
@@ -1572,7 +1632,7 @@ mod socket {
                 NLMSG_ERROR,
                 crate::netlink::NLM_F_CAPPED | crate::netlink::NLM_F_ACK_TLVS,
                 seq,
-                0,
+                TEST_LOCAL_PID.get(),
             );
             let mut p = Vec::new();
             p.extend_from_slice(&(-errno).to_ne_bytes());
@@ -1729,6 +1789,97 @@ mod socket {
             assert_eq!(e.code(), NetErrorCode::DataLoss);
         }
 
+        /// 他宛て（`nlmsg_pid` 不一致）の固定バイト列。seq=5・pid=0x9999・errno 引数つきの `NLMSG_ERROR`。
+        fn foreign_err_bytes(errno: i32) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(&36u32.to_ne_bytes()); // nlmsg_len
+            b.extend_from_slice(&NLMSG_ERROR.to_ne_bytes()); // nlmsg_type
+            b.extend_from_slice(&0u16.to_ne_bytes()); // nlmsg_flags
+            b.extend_from_slice(&5u32.to_ne_bytes()); // nlmsg_seq
+            b.extend_from_slice(&0x9999u32.to_ne_bytes()); // nlmsg_pid（他宛て）
+            b.extend_from_slice(&(-errno).to_ne_bytes());
+            b.extend_from_slice(&[0u8; 16]); // 元要求ヘッダ（seq 5 を後で埋める）
+            b.get_mut(28..32)
+                .expect("seq slot")
+                .copy_from_slice(&5u32.to_ne_bytes());
+            b
+        }
+
+        /// NET-11・#1313: pid 不一致の ACK は破棄され、続く自分宛て ACK で成功する。
+        #[test]
+        fn foreign_pid_ack_is_discarded_then_own_ack_succeeds() {
+            let items = vec![foreign_err_bytes(0), err_dgram(5, 0, 5)];
+            let r = run(5, Duration::from_secs(5), script(items)).expect("own ack");
+            assert_eq!(r.seq(), 5);
+        }
+
+        /// NET-11・#1313: pid 不一致の errno はエラーとして伝播しない。
+        #[test]
+        fn foreign_pid_error_is_not_propagated() {
+            let items = vec![foreign_err_bytes(17), err_dgram(5, 0, 5)];
+            let r = run(5, Duration::from_secs(5), script(items)).expect("own ack");
+            assert_eq!(r.seq(), 5);
+        }
+
+        /// NET-11・REPAIR-5・#1313: 他宛ての応答しか来なければ Timeout になる。
+        #[test]
+        fn only_foreign_pid_replies_time_out() {
+            let items = vec![foreign_err_bytes(0), foreign_err_bytes(0)];
+            let e = run(5, Duration::from_secs(5), script(items)).expect_err("timeout");
+            assert_eq!(e.code(), NetErrorCode::Timeout);
+        }
+
+        /// NET-11・#1313: 終端と同じデータグラムの後ろにある他宛てメッセージは DataLoss にならない。
+        #[test]
+        fn foreign_pid_message_after_terminal_is_ignored() {
+            let mut d = err_dgram(5, 0, 5);
+            d.extend_from_slice(&foreign_err_bytes(0));
+            let r = run(5, Duration::from_secs(5), script(vec![d])).expect("ok");
+            assert_eq!(r.seq(), 5);
+        }
+
+        /// NET-11・#1313: dump は他宛ての DONE では終端せず、自分宛ての DONE で終端する。
+        #[test]
+        fn dump_ignores_foreign_pid_done() {
+            let mut foreign = NlMsgBuilder::new(NLMSG_DONE, 0, 4, 0x9999);
+            foreign.put_fixed(&[0u8; 4]).expect("payload");
+            let items = vec![
+                foreign.finish().expect("finish"),
+                plain_dgram(16, 4, b"aaaa"),
+                plain_dgram(NLMSG_DONE, 4, &[0u8; 4]),
+            ];
+            let r = await_reply_for(
+                4,
+                true,
+                TEST_LOCAL_PID,
+                &Deadline::after(Duration::from_secs(5)),
+                Duration::from_secs(5),
+                script(items),
+            )
+            .expect("ok");
+            assert_eq!(r.messages().len(), 1);
+        }
+
+        /// NET-11・#1313: pid 0 は open 失敗（Internal）、非 0 はそのまま通る。
+        #[test]
+        fn nonzero_local_pid_rejects_zero() {
+            let e = nonzero_local_pid(0).expect_err("zero");
+            assert_eq!(e.code(), NetErrorCode::Internal);
+            assert!(e.message().contains("port id 0"), "{}", e.message());
+            assert_eq!(nonzero_local_pid(7).expect("ok").get(), 7);
+        }
+
+        /// NET-11・#1313: `BadLocalAddress` の写像。
+        #[test]
+        fn bad_local_address_maps_to_internal() {
+            let e = map_sys_error("getsockname", SysError::BadLocalAddress);
+            assert_eq!(e.code(), NetErrorCode::Internal);
+            assert_eq!(
+                e.message(),
+                "getsockname: local address is not a netlink address"
+            );
+        }
+
         /// NET-11: dump では ACK が DONE より先に届いても完了せず、DONE までの応答を集める。
         #[test]
         fn dump_ack_before_done_keeps_collecting() {
@@ -1741,6 +1892,7 @@ mod socket {
             let r = await_reply_for(
                 4,
                 true,
+                TEST_LOCAL_PID,
                 &Deadline::after(Duration::from_secs(5)),
                 Duration::from_secs(5),
                 script(items),
@@ -1803,6 +1955,7 @@ mod socket {
             let e = await_reply_for(
                 4,
                 true,
+                TEST_LOCAL_PID,
                 &Deadline::after(Duration::from_secs(5)),
                 Duration::from_secs(5),
                 script(vec![err_dgram(4, 95, 4)]),
@@ -1818,12 +1971,13 @@ mod socket {
         /// NET-11: NLM_F_DUMP_INTR の dump は FailedPrecondition（再試行可能）。
         #[test]
         fn dump_intr_is_retryable_error() {
-            let mut b = NlMsgBuilder::new(16, NLM_F_DUMP_INTR, 4, 0);
+            let mut b = NlMsgBuilder::new(16, NLM_F_DUMP_INTR, 4, TEST_LOCAL_PID.get());
             b.put_fixed(b"aaaa").expect("payload");
             let items = vec![b.finish().expect("finish")];
             let e = await_reply_for(
                 4,
                 true,
+                TEST_LOCAL_PID,
                 &Deadline::after(Duration::from_secs(5)),
                 Duration::from_secs(5),
                 script(items),
@@ -1835,7 +1989,7 @@ mod socket {
         /// NET-11: DUMP_INTR は dump 判定によらず検出する（DONE 側に立っても成功にしない）。
         #[test]
         fn dump_intr_on_done_is_detected_without_dump_flag() {
-            let mut b = NlMsgBuilder::new(NLMSG_DONE, NLM_F_DUMP_INTR, 4, 0);
+            let mut b = NlMsgBuilder::new(NLMSG_DONE, NLM_F_DUMP_INTR, 4, TEST_LOCAL_PID.get());
             b.put_fixed(&[0u8; 4]).expect("payload");
             let e = run(
                 4,

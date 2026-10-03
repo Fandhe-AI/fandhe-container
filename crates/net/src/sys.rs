@@ -6,7 +6,7 @@
 //! # 呼び出し文脈
 //! `crate::netlink_route::NetlinkRouteSocket`（NET-11・TASK-136.2.1・#843。nf_tables のバッチ送信 TASK-137.3・#306
 //! では protocol だけ `NETLINK_NETFILTER` に差し替えて再利用する）の `open` / `send` / `recv` が、
-//! `socket(2)`・`bind(2)`・`setsockopt(2)`・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶために使う。
+//! `socket(2)`・`bind(2)`・`getsockname(2)`・`setsockopt(2)`・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶために使う。
 //! メッセージの組み立て・解釈は `crate::netlink` のコーデックが担い、ここはバイト列を
 //! 運ぶだけで中身を解釈しない。
 //!
@@ -48,6 +48,9 @@ pub(crate) enum SysError {
     /// 受信した送信元アドレスが `sockaddr_nl` でない（長さ不足・`nl_family` 不一致）。
     /// カーネル応答の境界検査で検出し、アドレスの中身は読まない。
     BadSenderAddress,
+    /// `getsockname(2)` が返した自ソケットのアドレスが `sockaddr_nl` でない（長さ不足・`nl_family` 不一致）。
+    /// アドレスの中身は読まない。
+    BadLocalAddress,
 }
 
 /// 送信（`sendto`）の EINTR 再試行の上限回数（シグナル嵐で無限ループにしない）。
@@ -233,6 +236,9 @@ unsafe extern "C" {
     // 原型: `int bind(int fd, const struct sockaddr *addr, socklen_t addrlen)`
     // （`socklen_t` は u32）。
     fn bind(fd: i32, addr: *const SockaddrNl, addrlen: u32) -> i32;
+    // 原型: `int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen)`。
+    // `addrlen` は入力で `addr` の確保サイズ、出力でカーネルが返したアドレスの実長。
+    fn getsockname(fd: i32, addr: *mut SockaddrNl, addrlen: *mut u32) -> i32;
     // 原型: `ssize_t sendto(int fd, const void *buf, size_t len, int flags,
     // const struct sockaddr *addr, socklen_t addrlen)`（LP64 で `ssize_t` は i64）。
     fn sendto(
@@ -306,6 +312,37 @@ fn kernel_addr() -> SockaddrNl {
         nl_pid: 0,
         nl_groups: 0,
     }
+}
+
+/// bind 済みソケットのカーネル採番 `nl_pid`（port ID）を `getsockname(2)` で取得する
+/// （NET-11・#1313）。
+///
+/// `NetlinkRouteSocket::open_protocol` が bind 直後に呼び、応答の `nlmsg_pid` 照合に使う。
+/// 返った値が 0 かの判定は呼び出し側（socket 層）で行い、ここは値を運ぶだけ。アドレス長が
+/// `sockaddr_nl` に満たない、または `nl_family` が `AF_NETLINK` でなければ `BadLocalAddress`。
+pub(crate) fn local_nl_pid(fd: BorrowedFd<'_>) -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let addr_size = core::mem::size_of::<SockaddrNl>() as u32;
+    let mut addr = SockaddrNl {
+        nl_family: 0,
+        nl_pad: 0,
+        nl_pid: 0,
+        nl_groups: 0,
+    };
+    let mut addrlen = addr_size;
+    // SAFETY: `addr`・`addrlen` はスタック上の初期化済みローカルで、入力の `addrlen` は `addr` の
+    // 確保サイズ（12）なので、カーネルは `addr` へ 12 バイトを超えて書かない。`fd` は生存中の
+    // `BorrowedFd`。出力の `addrlen` と `nl_family` を検証してから `nl_pid` を使う。
+    let rc = unsafe { getsockname(fd.as_raw_fd(), &raw mut addr, &raw mut addrlen) };
+    if rc < 0 {
+        return Err(last_error());
+    }
+    if addrlen < addr_size || addr.nl_family != consts::AF_NETLINK {
+        return Err(SysError::BadLocalAddress);
+    }
+    Ok(addr.nl_pid)
 }
 
 /// 直前の失敗した syscall の errno を `SysError` にする（失敗直後に呼ぶこと）。
@@ -596,6 +633,20 @@ mod tests {
         let fd = open_route_socket().expect("open");
         enable_ext_ack(fd.as_fd()).expect("ext ack");
         enable_cap_ack(fd.as_fd()).expect("cap ack");
+    }
+
+    /// NET-11・#1313: bind 後に `getsockname` で得た `nl_pid` は 0 でなく、ソケットごとに異なる。
+    #[test]
+    fn local_nl_pid_after_bind_is_nonzero_and_distinct() {
+        let a = open_route_socket().expect("open a");
+        bind_kernel_assigned(a.as_fd()).expect("bind a");
+        let b = open_route_socket().expect("open b");
+        bind_kernel_assigned(b.as_fd()).expect("bind b");
+        let pa = local_nl_pid(a.as_fd()).expect("pid a");
+        let pb = local_nl_pid(b.as_fd()).expect("pid b");
+        assert_ne!(pa, 0);
+        assert_ne!(pb, 0);
+        assert_ne!(pa, pb);
     }
 
     /// NET-11・REPAIR-5: 何も届いていない socket の `wait_readable` は期限まで待って `TimedOut` を返す

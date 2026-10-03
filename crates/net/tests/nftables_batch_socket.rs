@@ -7,7 +7,7 @@
 //! - `CAP_NET_ADMIN` なし: カーネルは先頭（BEGIN）に `EPERM` を返す → `Begin`・`PermissionDenied`
 //! - `CAP_NET_ADMIN` あり: 本体に `ENOENT` を返す → `Body { index: 0 }`・`NotFound`
 //!
-//! root を要する作成 / 削除の往復と既定集合からの分離は TASK-137.4（#307）の担当。
+//! root を要する作成 / 削除の往復と既定集合からの分離は `nftables_batch_privileged.rs`（TASK-137.4・#307）が担う。
 
 #![cfg(target_os = "linux")]
 

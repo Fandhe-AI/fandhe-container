@@ -30,7 +30,7 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! ルール（NEWRULE / expr。TASK-138）と、root を要する実機結合テスト（#307）は未実装。ソケット送信と ACK 判定
+//! ルール（NEWRULE / expr。TASK-138）は未実装。実機前提テストは `tests/nftables_batch_privileged.rs`（TASK-137.4・#307。AGENTS.md「実機前提テスト」）。ソケット送信と ACK 判定
 //! （#306）は実装済みだが、`SO_SNDBUF` / `SO_RCVBUF` の調整・extended ACK・`NFTA_GEN_ID` は未実装（`socket` の doc）。
 //! 定数値は Linux UAPI（`nfnetlink.h`・`netfilter.h`）に基づく。
 

@@ -2,8 +2,8 @@
 //! （TASK-136.1・NET-11・REPAIR-2・MS-8・#298）。
 //!
 //! 汎用 netlink crate や `ip` / `nft` コマンドに頼らず自前でメッセージを組み立てる（NET-11）ための
-//! 最下層。呼び出し元は `netlink_route`（`NETLINK_ROUTE`。#843〜#846・#301）と、将来の
-//! nftables バッチ組み立て（#304・TASK-137.1。nfgenmsg が本エンコーダを再利用する）。
+//! 最下層。呼び出し元は `netlink_route`（`NETLINK_ROUTE`。#843〜#846・#301）と、`nftables_batch`
+//! （nfgenmsg・バッチフレーミング。#304・TASK-137.1。本エンコーダを再利用する）。
 //! ソケット I/O・`unsafe`・OS 依存は持たない。
 //!
 //! # ワイヤーレイアウト

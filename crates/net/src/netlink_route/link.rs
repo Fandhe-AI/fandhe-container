@@ -417,7 +417,7 @@ impl<'a> LinkSet<'a> {
 }
 
 /// `RTM_DELLINK` によるリンク削除要求（TASK-139.1・#314。ネットワーク作成の失敗時ロールバックと、
-/// 後続のネットワーク削除 TASK-139.4 が使う）。
+/// ネットワーク削除 `network::delete_network`（TASK-139.4）が使う）。
 ///
 /// `LinkRef::Name` は `ifi_index = 0` + `IFLA_IFNAME` でカーネルが引く。bridge を削除すると
 /// 付与済みの address も一緒に消える。送信は `NetlinkRouteSocket::delete_link`（Linux のみ）。

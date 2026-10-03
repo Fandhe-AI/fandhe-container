@@ -2,7 +2,7 @@
 //!
 //! `crate::network::attach_container` が「veth の peer 側を入れる netns」を用意するための下請けで、
 //! PoC-15 `netsetup` の `netns-create` に相当する。後続の runtime が名前（pin パス）でこの netns へ
-//! join でき、ネットワーク削除（TASK-139.4）が同じパスから解放できるよう、netns をファイルへ
+//! join でき、ネットワーク削除（`network::delete_network`。TASK-139.4）が同じパスから解放できるよう、netns をファイルへ
 //! bind マウントして固定（pin）する。`ip netns add` と同じ方式。
 //!
 //! # 方式
@@ -41,7 +41,7 @@
 //! - 解除（`unpin_path`）は、本プロセスが作成して未解除の pin（プロセス内の所有記録 `PINS` と照合できる
 //!   もの）だけを対象にする。記録の無いファイル・マウントは形が pin と同じでも削除・アンマウントしない
 //!   （fail-closed）。作成プロセスの終了後・再起動後の残置 pin の清掃は、永続的な所有記録と照合する設計
-//!   （TASK-139.4）で扱い、それまでは本 API からは解除できない
+//!   で扱う（未実装。担当 Issue 未確定。REPAIR-3）ため、それまでは本 API からは解除できない
 //!
 //! # 権限
 //!
@@ -73,7 +73,7 @@ const THREAD_NS_PATH: &CStr = c"/proc/thread-self/ns/net";
 ///
 /// `fd` を保持している間と pin のマウントが残っている間、netns は生き続ける。`fd` は
 /// `LinkSet::move_to_netns`（`IFLA_NET_NS_FD`）の移動先指定に使う。解放は
-/// `crate::network` のロールバック、または将来のネットワーク削除（TASK-139.4）が `unpin` で行う。
+/// `crate::network` のロールバック、または `network::delete_network`（TASK-139.4）が `unpin` で行う。
 #[derive(Debug)]
 pub struct ContainerNetns {
     fd: OwnedFd,
@@ -468,7 +468,7 @@ fn reclaim_abandoned(via_c: &CStr, via: &Path, fid: FileId, mounted: bool) {
 }
 
 /// pin を外す（`umount2(MNT_DETACH)` → ファイル削除）。fd を drop し参照が尽きれば、カーネルが
-/// netns と中に残った peer veth を破棄する。ロールバックと、将来のネットワーク削除（TASK-139.4）が共用する。
+/// netns と中に残った peer veth を破棄する。ロールバックと、`network::delete_network`（TASK-139.4）が共用する。
 ///
 /// 失敗時は `ns`（fd と pin パス）を [`UnpinFailure`] に入れて返し、呼び出し側が再試行できる。
 /// 再試行しても、アンマウント済みやファイル削除済みの途中状態から続行できる。検証は [`unpin_path`] と同じ。
@@ -496,7 +496,7 @@ pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetn
 ///   マウントの有無に関わらず umount・削除の前に `FailedPrecondition` で拒否する。形（mode `0o400`・
 ///   サイズ 0・実効 UID 所有の通常ファイル）だけでは本モジュールが作った pin と証明できず、任意の空ファイルの
 ///   削除や同一 UID の別プロセスの netns の破棄につながるため。プロセスをまたぐ清掃は、永続的な所有記録と
-///   照合する設計（TASK-139.4）で扱う
+///   照合する設計で扱う（未実装。担当 Issue 未確定。REPAIR-3）
 /// - `/proc/self/mountinfo` 上で、pin がマウントされていないか、`nsfs` としてマウントされている
 /// - アンマウント後の実体が、作成時の pin ファイル（上記 inode）かつ本モジュールが作った形
 ///   （実効 UID 所有・mode `0o400`・サイズ 0 の通常ファイル）
@@ -578,7 +578,7 @@ fn unpin_in_dir(dir: &PinDir, name: &std::ffi::OsStr) -> Result<(), NetError> {
         PinMount::Nsfs => {
             // 所有を証明できない nsfs マウントは umount 前に拒否する（fail-closed）。umount すると
             // 後続の検査で拒否しても名前空間は既に切り離されており、同一 UID の別プロセスの pin を
-            // 破棄しうる。作成プロセス終了後の清掃は永続状態による所有照合（TASK-139.4）で行う。
+            // 破棄しうる。作成プロセス終了後の清掃は永続状態による所有照合（未実装。担当 Issue 未確定。REPAIR-3）で行う。
             let Some(r) = record else {
                 return Err(not_our_pin());
             };
@@ -923,7 +923,7 @@ mod tests {
     }
 
     /// NET-1・P0: 所有記録の無いファイルは、置き場検証と形の検査（実効 UID 所有・0o400・空の通常ファイル）を
-    /// 通っても削除しない（作成プロセスの終了後の残置を含む。プロセスをまたぐ清掃は TASK-139.4）。
+    /// 通っても削除しない（作成プロセスの終了後の残置を含む。プロセスをまたぐ清掃は未実装で担当 Issue 未確定）。
     #[test]
     fn net1_unpin_path_rejects_pin_shaped_file_without_record() {
         use std::os::unix::fs::PermissionsExt as _;

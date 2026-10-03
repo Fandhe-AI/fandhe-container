@@ -4,7 +4,7 @@
 //! [`StaticIpam::allocate`] を呼んでコンテナ 1 つ分のアドレスを決める。常駐デーモンを持たない
 //! 方針（CORE-1）のため、状態は呼び出し側が所有するメモリ上の値で、永続化と再起動後の復元
 //! （[`StaticIpam::reserve`] で払い出し済みを戻す）は呼び出し側の責務。状態レジストリによる
-//! 永続化は TASK-139.4 以降（REPAIR-3）。IPv6 は未対応（IPv4 のみ）。
+//! 永続化は未実装で担当 Issue 未確定（REPAIR-3）。IPv6 は未対応（IPv4 のみ）。
 //!
 //! # 払い出し方針
 //!
@@ -94,6 +94,16 @@ impl StaticIpam {
         self.by_endpoint
             .get(endpoint)
             .and_then(|a| self.prefixed(*a))
+    }
+
+    /// 払い出し済みのエンドポイントとアドレスを、アドレスの昇順で返す。
+    ///
+    /// ネットワーク削除（`network::delete_network`。TASK-139.4・NET-1）が、呼び出し側から渡されていない
+    /// 生存コンテナの有無を検査するために使う。
+    pub fn endpoints(&self) -> impl Iterator<Item = (&EndpointId, IpPrefix)> {
+        self.by_addr
+            .iter()
+            .filter_map(|(&a, e)| self.prefixed(a).map(|p| (e, p)))
     }
 
     fn gateway_u32(&self) -> u32 {
@@ -195,6 +205,25 @@ mod tests {
 
     fn ipam(gw: [u8; 4], len: u8) -> StaticIpam {
         StaticIpam::new(&NetworkName::new("web").unwrap(), p(gw, len)).unwrap()
+    }
+
+    /// NET-1・TASK-139.4: `endpoints` は払い出し済みを、アドレスの昇順で返す。
+    #[test]
+    fn net1_endpoints_lists_allocations_in_address_order() {
+        let mut ip = ipam([10, 0, 0, 1], 24);
+        ip.reserve(&eid("b"), p([10, 0, 0, 9], 24)).unwrap();
+        ip.allocate(&eid("a")).unwrap();
+        let got: Vec<(String, IpPrefix)> = ip
+            .endpoints()
+            .map(|(e, a)| (e.as_str().to_owned(), a))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_owned(), p([10, 0, 0, 2], 24)),
+                ("b".to_owned(), p([10, 0, 0, 9], 24)),
+            ]
+        );
     }
 
     /// NET-1: 連続して払い出すと重複せず最小の空きから順になる。

@@ -4,7 +4,7 @@
 //! up → 専用 nft テーブルと NAT base chain の作成までを 1 つの操作として行い、途中で失敗したら
 //! 自分が作ったリソースだけをロールバックする。`netlink_route`（bridge・address・link 削除）と
 //! `nftables_batch`（table・chain）の上に載る統合層で、PoC-15 `netsetup` の `net-create` に相当する。
-//! 後続のネットワーク削除（TASK-139.4）は [`NetworkResourceNames::derive`] で同じ名前を再導出して使う。
+//! ネットワーク削除（`delete_network`。TASK-139.4）は [`NetworkResourceNames::derive`] で同じ名前を再導出して使う。
 //!
 //! # 命名（ワイヤー契約と同じ扱い）
 //!
@@ -59,8 +59,15 @@
 //! veth と netns の破棄で消え、nft バッチは失敗時に何も適用されない（`Aborted` / `NotSent`）ことに
 //! 依存する。結果が不明なバッチは `AttachResource::PortRules` と `AttachResource::Address` を `Unknown` で報告し、
 //! IPAM のアドレスと [`PortRegistry`] の予約を保持する（残ったルールが別コンテナへ転送しないための quarantine。
-//! 解放はテーブル削除後に呼び出し側が行う。TASK-139.4）。受け口の競合（コンテナ間・ネットワーク間）は
+//! 解放はテーブルの削除を確認できた場合に `delete_network` が行う。TASK-139.4）。受け口の競合（コンテナ間・ネットワーク間）は
 //! 投入前に [`PortRegistry`] で検出して `AlreadyExists` とする。
+//!
+//! # ネットワーク削除（TASK-139.4・#317）
+//!
+//! `delete_network`（`delete` モジュール）は、渡されたコンテナの veth 削除と netns の unpin → 専用 nft
+//! テーブルの削除（bridge の所有確認が通った場合のみ）→ bridge の削除 → IPAM・ポート予約の解放を行う。接続中のコンテナを呼び出し側が渡す
+//! 設計で、渡されていない生存コンテナがあれば何も変更せず拒否する。方針・順序・残余リスクは
+//! `delete` モジュールの doc を参照。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
@@ -70,9 +77,10 @@
 //!   `ip_forward` が別途必要（本 crate は host のグローバル設定を変更しない）。担当 Issue 未確定
 //! - peer の `eth0` へのリネーム（`LinkSet` に `IFLA_IFNAME` 変更が無い）、コンテナ単位のポート公開解除
 //!   （ルールハンドルの取得経路が無い）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
-//! - IPAM 状態の永続化（TASK-139.4 以降）、ネットワークとコンテナ側資源の削除（TASK-139.4・#317）
+//! - IPAM 状態の永続化とプロセスをまたぐ残置 pin の清掃、コンテナ単体の切り離し。担当 Issue 未確定
 //! - IPv6 と `NftFamily::Inet`（IPv4 のみ。静的 IPAM が IPv4 のみのため）
 
+pub mod delete;
 pub mod ipam;
 pub mod publish;
 
@@ -82,6 +90,9 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+pub use delete::delete_network;
+pub use delete::{DeleteResource, DeleteStep, NetworkDeleteError, NetworkDeleteReport};
 pub use ipam::StaticIpam;
 pub use publish::{MAX_PORT_PUBLISHES, PortProtocol, PortPublish, PortRegistry};
 
@@ -737,7 +748,7 @@ impl EndpointId {
 ///
 /// host 側 `fcvh` + FNV-1a 64bit の下位 44bit を小文字 hex 11 桁、peer 側 `fcvp` + 同じ 11 桁
 /// （いずれも 15 バイトで `IFNAMSIZ` 未満）。bridge 名と同じく、プレフィックス・ハッシュ関数・桁数は
-/// 互換性に関わる契約で、変更すると既存コンテナの veth を名前で辿れなくなる（TASK-139.4 の削除が
+/// 互換性に関わる契約で、変更すると既存コンテナの veth を名前で辿れなくなる（`delete_network`（TASK-139.4）が
 /// 同じ名前を再導出する）。異なる ID のハッシュ衝突は `NLM_F_EXCL` の `AlreadyExists` として検出される。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VethNames {
@@ -907,11 +918,11 @@ pub enum AttachResource {
     /// pin 済みの netns（pin 先パス）。
     Netns(PathBuf),
     /// ポート公開の DNAT ルールを投入した nft テーブル（結果不明のバッチ。個別削除の手段が無く、
-    /// ネットワーク削除でテーブルごと解放する。TASK-139.4）。
+    /// `delete_network` がテーブルごと解放する。TASK-139.4）。
     PortRules(NftName),
     /// 払い出し済みのまま保持している IPAM アドレス（`PortRules` が不明な間は、残った DNAT ルールが
-    /// 別コンテナへ転送しないよう再利用させない〔quarantine〕。解放は呼び出し側が、テーブルの削除後に
-    /// `StaticIpam::release` と `PortRegistry::release` で行う）。
+    /// 別コンテナへ転送しないよう再利用させない〔quarantine〕。解放は `delete_network` が、テーブルの削除を確認
+    /// できた場合に行う）。
     Address(IpPrefix),
     /// 解放に失敗したポート予約（共有予約表のロック・読み書きの失敗。残ったままだと後続コンテナが
     /// 同じポートを公開できない。呼び出し側が `PortRegistry::release` を再試行する）。
@@ -1542,7 +1553,7 @@ impl AttachOps for LinuxAttachOps<'_> {
 /// # 未実装範囲（REPAIR-3）
 /// `eth0` へのリネーム・masquerade・コンテナ単位のポート公開解除は含まない（モジュール doc「未実装範囲」）。
 /// ホストの外へ届けるには masquerade と host の `ip_forward` が別途必要。IPAM 状態の永続化は呼び出し側・
-/// 後続 Issue の責務。ネットワーク・コンテナ側資源の削除は TASK-139.4（#317）。
+/// 後続 Issue の責務。ネットワーク・コンテナ側資源の削除は `delete_network`（TASK-139.4・#317）。
 #[cfg(target_os = "linux")]
 pub fn attach_container(
     route: &NetlinkRouteSocket,

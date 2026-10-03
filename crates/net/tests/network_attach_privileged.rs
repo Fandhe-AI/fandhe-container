@@ -17,6 +17,10 @@
 //!   続けて host 側 veth 名を事前に作っておき `AlreadyExists` で失敗させ、pin ファイルが消え、事前作成の
 //!   veth が残ることでロールバック（他者のリソースを消さない）を確認する
 //!
+//! 最後に `delete_network`（TASK-139.4・#317）で c1 と c3 を渡してネットワークを削除し、bridge・host 側 veth が
+//! `NotFound`、`nft list table` の失敗、pin ファイルの消滅、IPAM・ポート予約が空であることを具体値で照合する
+//! （渡していない c2 の事前作成 veth は IPAM に無く、削除の対象外）。続けて空の `containers` での再実行が成功する（冪等）。
+//!
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・
 //! 外部コマンド）を満たさない場合は skip せず失敗する。
 //!
@@ -60,7 +64,7 @@ mod linux {
     use fandhe_container_net::network::{
         AttachResource, AttachStep, ContainerAttachSpec, CreateStep, EndpointId, NetworkCreateSpec,
         NetworkName, PortProtocol, PortPublish, PortRegistry, StaticIpam, VethNames,
-        attach_container, create_network,
+        attach_container, create_network, delete_network,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -491,6 +495,71 @@ mod linux {
                 "expected 2 DNAT rules (prerouting and output), found {dnat_lines} in:\n{ruleset}"
             )));
         }
+
+        // --- ネットワーク削除（TASK-139.4・#317）: bridge・veth・netns pin・nft テーブル・予約が解放される ---
+        let hosts = [attached.host_veth.clone(), attached3.host_veth.clone()];
+        let pins = [attached.netns_path.clone(), attached3.netns_path.clone()];
+        let deleted = delete_network(
+            &route,
+            &nft,
+            &net,
+            vec![attached, attached3],
+            &base,
+            &mut ipam,
+            &mut ports,
+            t,
+        )
+        .map_err(|e| {
+            fail(format!(
+                "delete_network failed at {:?}: {e}; report: {:?}",
+                e.step, e.report
+            ))
+        })?;
+        if !deleted.leftover.is_empty() {
+            return Err(fail(format!("unexpected leftover: {:?}", deleted.leftover)));
+        }
+        let gone = |name: &IfName| {
+            matches!(
+                route.link_index(name, t),
+                Err(ref e) if e.code() == NetErrorCode::NotFound
+            )
+        };
+        if !gone(&net.bridge) {
+            return Err(fail("bridge still exists after delete_network"));
+        }
+        for host in &hosts {
+            if !gone(host) {
+                return Err(fail(format!("veth {} still exists", host.as_str())));
+            }
+        }
+        if run_cmd("nft", &["list", "table", "ip", net.table.as_str()]).is_ok() {
+            return Err(fail("nft table still exists after delete_network"));
+        }
+        for pin in &pins {
+            if pin.exists() {
+                return Err(fail(format!("pin {} still exists", pin.display())));
+            }
+        }
+        if ipam.allocated_count() != 0 || !ports.is_empty() {
+            return Err(fail("ipam or port reservations were not released"));
+        }
+        // 冪等: 何も残っていない状態での再実行も成功する。
+        delete_network(
+            &route,
+            &nft,
+            &net,
+            Vec::new(),
+            &base,
+            &mut ipam,
+            &mut ports,
+            t,
+        )
+        .map_err(|e| {
+            fail(format!(
+                "repeated delete_network failed at {:?}: {e}",
+                e.step
+            ))
+        })?;
         Ok(())
     }
 }

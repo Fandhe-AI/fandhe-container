@@ -12,8 +12,8 @@
 //!
 //! 移動したデバイスは移動先で down になり host のソケットからは見えなくなるため、up は子の netns 内の
 //! ソケットから送る（`netlink_route/link.rs` のモジュール doc）。作ったものはすべて子の netns に入り、
-//! 子の終了とともに消える。親の失敗経路では host に残りうる veth を名前指定の `RTM_DELLINK` で
-//! 後始末する（ベストエフォート）。待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で
+//! 子の終了とともに消える。親の失敗経路では host に残りうる veth を、作成直後に控えた ifindex 指定の
+//! `RTM_DELLINK` で後始末する（ベストエフォート。他者の同名リンクは消さない）。待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で
 //! 期限を切る（REPAIR-5）。前提（root・`unshare`）を満たさない場合は skip せず失敗する。
 
 #[cfg(not(target_os = "linux"))]
@@ -103,14 +103,38 @@ mod linux {
         Ok(u32::from_ne_bytes(raw))
     }
 
-    /// 名前指定の `RTM_DELLINK`（テスト内の後始末専用。公開 API にはしない）。
-    fn del_link(sock: &NetlinkRouteSocket, ifname: &str) -> Result<(), NetError> {
+    /// 名前指定の `RTM_GETLINK` で ifindex（`ifinfomsg.ifi_index`）を返す。
+    fn get_link_index(sock: &NetlinkRouteSocket, ifname: &str) -> Result<u32, NetError> {
         let n = name(ifname);
-        sock.request(RTM_DELLINK, 0, timeout(), |b: &mut NlMsgBuilder| {
+        let reply = sock.request(RTM_GETLINK, 0, timeout(), |b: &mut NlMsgBuilder| {
             b.put_fixed(&[0u8; IFINFOMSG_LEN])?;
             let mut v = n.as_str().as_bytes().to_vec();
             v.push(0);
             b.put_attr(IFLA_IFNAME, &v)
+        })?;
+        let msg = reply
+            .messages()
+            .iter()
+            .find(|m| m.msg_type() == RTM_NEWLINK)
+            .ok_or_else(|| NetError::new(NetErrorCode::Internal, "no RTM_NEWLINK in reply"))?;
+        let raw = msg
+            .payload()
+            .get(4..8)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .ok_or_else(|| NetError::new(NetErrorCode::Internal, "short ifinfomsg in reply"))?;
+        Ok(u32::from_ne_bytes(raw))
+    }
+
+    /// ifindex 指定の `RTM_DELLINK`（テスト内の後始末専用。公開 API にはしない）。
+    /// 名前ではなく自分が作成直後に控えた ifindex で消すため、同名の他者のリンクを巻き込まない。
+    fn del_link_by_index(sock: &NetlinkRouteSocket, index: u32) -> Result<(), NetError> {
+        sock.request(RTM_DELLINK, 0, timeout(), |b: &mut NlMsgBuilder| {
+            let mut m = [0u8; IFINFOMSG_LEN];
+            // ifinfomsg: family(1) pad(1) type(2) index(4) flags(4) change(4)
+            if let Some(slot) = m.get_mut(4..8) {
+                slot.copy_from_slice(&index.to_ne_bytes());
+            }
+            b.put_fixed(&m)
         })
         .map(|_| ())
     }
@@ -128,6 +152,10 @@ mod linux {
             }
         };
         println!("ready");
+        // パイプ越しでも確実に親へ届けるため明示的に flush する（go 待ちでブロックする前）。
+        std::io::stdout().flush().map_err(|e| {
+            NetError::new(NetErrorCode::Internal, format!("flush stdout failed: {e}"))
+        })?;
         wait_for_go();
         let sock = NetlinkRouteSocket::open()?;
         sock.create_link(&LinkCreate::bridge(name(br)), timeout())?;
@@ -243,17 +271,17 @@ mod linux {
             lines: rx,
         };
 
-        // 本試験が host 側に作成した（応答不明の作成要求を含む）未移動の veth がありうる間だけ true。
-        // 作成前に同名の不在を確認した後にのみ true にするため、同名の既存 host インターフェースは消さない（P0）。
-        let host_veth_owned = Cell::new(false);
+        // 本試験が create_link の成功応答を得て、作成直後に ifindex を控えた host 上の未移動の端だけを保持する。
+        // 後始末は名前ではなく ifindex で消すため、同名の他者のリンクは消さない（P0）。
+        let host_veth_owned: [Cell<Option<u32>>; 2] = [Cell::new(None), Cell::new(None)];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             scenario(&sock, &mut guard, pid, &a, &b, deadline, &host_veth_owned)
         }));
         // 移動前に失敗した場合に host へ残る veth を片付ける（本試験が作成したものに限る）。
-        if host_veth_owned.get() {
-            // a だけ移動済みで b が host に残る経路もあるため、両名を試す（NotFound は想定内）。
-            for n in [&a, &b] {
-                match del_link(&sock, n) {
+        {
+            // a だけ移動済みで b が host に残る経路もあるため、未移動の端ごとに試す（NotFound は想定内）。
+            for idx in host_veth_owned.iter().filter_map(Cell::get) {
+                match del_link_by_index(&sock, idx) {
                     Ok(()) => eprintln!("link_netns_privileged: cleaned up leftover veth on host"),
                     Err(e) if e.code() == NetErrorCode::NotFound => {}
                     Err(e) => eprintln!("link_netns_privileged: cleanup failed: {e}"),
@@ -274,7 +302,7 @@ mod linux {
         a: &str,
         b: &str,
         deadline: Instant,
-        host_veth_owned: &Cell<bool>,
+        host_veth_owned: &[Cell<Option<u32>>; 2],
     ) {
         assert_eq!(guard.next_line(deadline), "ready");
 
@@ -284,15 +312,17 @@ mod linux {
                 .expect_err("interface name already exists on host; refusing to proceed");
             assert_eq!(e.code(), NetErrorCode::NotFound, "{n}");
         }
-        // 直前の存在確認で両名が無いことを確認済みのため、以降に現れる同名リンクは本試験が作成したもの。
-        // create_link が Timeout / DataLoss を返してもカーネル側では作成済みの可能性があるので、
-        // 送信前に所有を宣言し、後始末側が実在するものだけを削除する（NotFound は想定内）。
-        host_veth_owned.set(true);
+        // 所有は create_link の成功応答を得た後にだけ宣言する。事前の不在確認だけでは、確認と作成の間に
+        // 別プロセスが同名を作った場合に AlreadyExists 後の後始末で他者のリンクを消してしまう（P0）。
+        // 応答不明（Timeout / DataLoss）の場合は所有を主張せず失敗する（残存の可能性は許容し、消さない側に倒す）。
         sock.create_link(
             &LinkCreate::veth(name(a), name(b)).expect("veth request"),
             timeout(),
         )
         .expect("create veth pair");
+        // 作成直後に ifindex を控え、後始末はこの ifindex だけを対象にする。
+        host_veth_owned[0].set(Some(get_link_index(sock, a).expect("ifindex of a")));
+        host_veth_owned[1].set(Some(get_link_index(sock, b).expect("ifindex of b")));
 
         // a は PID 指定、b は ns fd 指定で子の netns へ移動する。
         let by_pid = NetnsTarget::Pid(NetnsPid::new(pid).expect("child pid"));
@@ -301,6 +331,8 @@ mod linux {
             timeout(),
         )
         .expect("move a by pid");
+        // 移動済みの端は host の ifindex と無関係になるため後始末対象から外す。
+        host_veth_owned[0].set(None);
         let ns_file = File::open(format!("/proc/{pid}/ns/net")).expect("open child netns");
         let by_fd = NetnsTarget::Fd(NetnsFd::new(ns_file.as_fd()).expect("netns fd"));
         sock.set_link(
@@ -308,8 +340,7 @@ mod linux {
             timeout(),
         )
         .expect("move b by fd");
-        // 両端が host から消えたため、以降の後始末対象ではない。
-        host_veth_owned.set(false);
+        host_veth_owned[1].set(None);
 
         // host からは両端が消え、子の netns に現れる。
         for n in [a, b] {

@@ -34,6 +34,8 @@
 //!   モジュールを自動ロードするため、任意文字列を通さない。エラーに入力値は載せない
 //! - 属性ツリーは構築時とデコード時の両方でネスト段数（[`MAX_EXPR_NEST_DEPTH`]）と
 //!   expr 件数（[`NFT_RULE_MAXEXPRS`]）を上限検証し、再帰と確保を有界にする
+//! - 子属性列はエンコード後の合計サイズ（[`MAX_EXPR_ATTRS_ENCODED_LEN`]）を構築時に検証し、
+//!   超過は `InvalidArgument`（[`NftExprAttr::nested`]・[`NftExpr::new`]）
 //! - デコードは kernel 応答も untrusted として扱い、重複・欠落・未知属性・想定外フラグを
 //!   `DataLoss` で拒否する（fail-closed）
 //! - 1 ルールの `NFTA_RULE_EXPRESSIONS` 全体は rtattr の u16 長（65535 バイト）に収まる必要があり、
@@ -62,6 +64,10 @@ pub const NFT_RULE_MAXEXPRS: usize = 128;
 pub const NFT_EXPR_NAME_MAXLEN: usize = 255;
 /// `NFTA_EXPR_DATA` 内に許すネスト段数。kernel の最深例（immediate の verdict）は 2 段。
 pub const MAX_EXPR_NEST_DEPTH: usize = 4;
+/// 子属性列（`NFTA_EXPR_DATA` および各ネスト属性）のエンコード後合計サイズの上限。
+/// rtattr の u16 長に収まる最大ペイロード（[`MAX_ATTR_PAYLOAD_LEN`]）と同じで、
+/// 小さな属性を大量に含む入力による無制限確保を構築時に弾く。
+pub const MAX_EXPR_ATTRS_ENCODED_LEN: usize = MAX_ATTR_PAYLOAD_LEN;
 
 fn invalid(msg: impl Into<String>) -> NetError {
     NetError::new(NetErrorCode::InvalidArgument, msg)
@@ -119,6 +125,20 @@ fn check_type(attr_type: u16) -> Result<(), NetError> {
     Ok(())
 }
 
+fn attrs_encoded_len(attrs: &[NftExprAttr]) -> usize {
+    attrs
+        .iter()
+        .fold(0usize, |acc, a| acc.saturating_add(a.encoded_len()))
+}
+
+/// 子属性列のエンコード後合計サイズが上限以内かを検証する。
+fn check_attrs_len(attrs: &[NftExprAttr]) -> Result<(), NetError> {
+    if attrs_encoded_len(attrs) > MAX_EXPR_ATTRS_ENCODED_LEN {
+        return Err(invalid("attributes too large"));
+    }
+    Ok(())
+}
+
 impl NftExprAttr {
     /// 生ペイロード属性。長さは `MAX_ATTR_PAYLOAD_LEN` 以下であること。
     pub fn bytes(attr_type: u16, payload: Vec<u8>) -> Result<Self, NetError> {
@@ -144,10 +164,21 @@ impl NftExprAttr {
         if deepest >= MAX_EXPR_NEST_DEPTH {
             return Err(invalid("attribute nesting too deep"));
         }
+        check_attrs_len(&children)?;
         Ok(Self {
             attr_type,
             value: NftExprValue::Nested(children),
         })
+    }
+
+    /// ヘッダ（4 バイト）とアラインメントを含むエンコード後サイズ。
+    /// 子は構築時に検証済みのため飽和演算で十分。
+    fn encoded_len(&self) -> usize {
+        let payload = match &self.value {
+            NftExprValue::Bytes(p) => p.len().saturating_add(3) & !3,
+            NftExprValue::Nested(c) => attrs_encoded_len(c),
+        };
+        payload.saturating_add(4)
     }
 
     /// 属性種別（フラグを除く）。
@@ -222,9 +253,11 @@ pub struct NftExpr {
 }
 
 impl NftExpr {
-    /// 名前と固有データ属性列から作る。
-    pub fn new(name: NftExprName, data: Vec<NftExprAttr>) -> Self {
-        Self { name, data }
+    /// 名前と固有データ属性列から作る。データのエンコード後合計サイズが
+    /// `MAX_EXPR_ATTRS_ENCODED_LEN` を超える場合は `InvalidArgument`。
+    pub fn new(name: NftExprName, data: Vec<NftExprAttr>) -> Result<Self, NetError> {
+        check_attrs_len(&data)?;
+        Ok(Self { name, data })
     }
 
     /// expr 名。
@@ -268,7 +301,10 @@ impl NftExpr {
                         return Err(data_loss("duplicate or nested NFTA_EXPR_NAME"));
                     }
                     let raw = child.payload();
-                    let s = raw.strip_suffix(&[0]).unwrap_or(raw);
+                    // ワイヤー契約は NUL 終端必須。欠落は fail-closed で拒否する。
+                    let s = raw
+                        .strip_suffix(&[0])
+                        .ok_or_else(|| data_loss("expr name is not NUL-terminated"))?;
                     let s = std::str::from_utf8(s)
                         .map_err(|_| data_loss("expr name is not valid text"))?;
                     name = Some(NftExprName::new(s).map_err(|_| data_loss("invalid expr name"))?);
@@ -365,7 +401,7 @@ mod tests {
     }
 
     fn expr(n: &str, data: Vec<NftExprAttr>) -> NftExpr {
-        NftExpr::new(name(n), data)
+        NftExpr::new(name(n), data).expect("valid expr")
     }
 
     fn new_builder() -> NlMsgBuilder {
@@ -566,6 +602,22 @@ mod tests {
     }
 
     #[test]
+    fn attrs_total_size_limit_on_construction() {
+        // 4 バイト属性 1 件 = 8 バイト。上限ちょうどは受理、超過は拒否。
+        let max_n = MAX_EXPR_ATTRS_ENCODED_LEN / 8;
+        let mk = |n: usize| -> Vec<NftExprAttr> {
+            (0..n)
+                .map(|_| NftExprAttr::u32_be(1, 0).expect("attr"))
+                .collect()
+        };
+        assert!(NftExpr::new(name("x"), mk(max_n)).is_ok());
+        let e = NftExpr::new(name("x"), mk(max_n + 1)).expect_err("too large");
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        let e = NftExprAttr::nested(1, mk(max_n + 1)).expect_err("too large");
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+    }
+
+    #[test]
     fn u16_overflow_rolls_back_builder() {
         let big = || expr("x", vec![NftExprAttr::bytes(1, vec![0; 30000]).expect("a")]);
         let r = rule(vec![big(), big(), big()]);
@@ -629,6 +681,8 @@ mod tests {
         // 不正な名前
         assert_data_loss(elem_of(|b| b.put_attr(NFTA_EXPR_NAME, b"A-b\0")));
         assert_data_loss(elem_of(|b| b.put_attr(NFTA_EXPR_NAME, b"a\0\0")));
+        // NUL 終端なし
+        assert_data_loss(elem_of(|b| b.put_attr(NFTA_EXPR_NAME, b"a")));
         assert_data_loss(elem_of(|b| b.put_attr(NFTA_EXPR_NAME, &[0xff, 0])));
         // LIST_ELEM が非ネスト
         assert_data_loss(decode_built(|b| {

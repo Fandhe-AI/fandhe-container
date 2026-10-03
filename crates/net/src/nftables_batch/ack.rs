@@ -885,6 +885,77 @@ mod tests {
         assert_eq!(e.message(), "sync request failed with errno 1");
     }
 
+    /// NET-11: END の失敗の後に同じデータグラムで届く本体の失敗も集める（END で打ち切らない）。
+    #[test]
+    fn net11_end_failure_does_not_stop_collecting_same_datagram() {
+        let mut c = NftBatchAckCollector::new(&batch(2));
+        assert_eq!(
+            c.feed(&cat(&[
+                err_dgram(103, 12, 103),
+                err_dgram(102, 17, 102),
+                ok(101)
+            ]))
+            .expect("decided"),
+            Progress::Decided
+        );
+        reach_barrier(&mut c, 104, 0);
+        let e = c.conclude().expect_err("aborted");
+        assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
+        assert_eq!(
+            e.failures()
+                .iter()
+                .map(|f| (f.position(), f.seq(), f.errno()))
+                .collect::<Vec<_>>(),
+            vec![
+                (NftBatchPosition::Body { index: 1 }, 102, 17),
+                (NftBatchPosition::End, 103, 12)
+            ]
+        );
+        assert_eq!(
+            e.message(),
+            "nf_tables batch rejected: 2 message failure(s), first at body[1] (seq 102, errno 17)"
+        );
+    }
+
+    /// NET-11: 同じ BEGIN / END への 2 回目の失敗は DataLoss / Unknown（集めた失敗は添える）。
+    #[test]
+    fn net11_duplicate_marker_failure_is_data_loss() {
+        let mut c = NftBatchAckCollector::new(&batch(1));
+        let e = c
+            .feed(&cat(&[err_dgram(100, 1, 100), err_dgram(100, 1, 100)]))
+            .expect_err("dup");
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+        assert_eq!(e.message(), "duplicate verdict for batch seq 100");
+        assert_eq!(e.failures().len(), 1);
+    }
+
+    /// NET-11: 同期点への応答が未着のまま conclude しても成功にせず Internal / Unknown。
+    #[test]
+    fn net11_conclude_before_sync_reply_is_unknown() {
+        let mut c = NftBatchAckCollector::new(&batch(1));
+        c.feed(&ok(101)).expect("body");
+        let e = c.conclude().expect_err("not reached");
+        assert_eq!(e.code(), NetErrorCode::Internal);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+        c.set_barrier(103);
+        c.feed(&newgen(103)).expect("newgen");
+        let e = c.conclude().expect_err("newgen only");
+        assert_eq!(e.code(), NetErrorCode::Internal);
+    }
+
+    /// NET-11: 失敗を集めた後の同期点の拒否は読み切りの印として扱い、Aborted で確定する。
+    #[test]
+    fn net11_barrier_errno_after_failure_is_aborted() {
+        let mut c = NftBatchAckCollector::new(&batch(1));
+        c.feed(&err_dgram(101, 17, 101)).expect("body failure");
+        reach_barrier(&mut c, 103, 12);
+        let e = c.conclude().expect_err("aborted");
+        assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
+        assert_eq!(e.code(), NetErrorCode::AlreadyExists);
+        assert_eq!(e.failures(), &[fail(0, 101, 17)][..]);
+    }
+
     /// NET-11: 同期点 ACK が別の要求 seq を埋め込んでいれば成功にせず DataLoss（Unknown）にする。
     #[test]
     fn net11_barrier_ack_with_mismatched_inner_seq_is_data_loss() {

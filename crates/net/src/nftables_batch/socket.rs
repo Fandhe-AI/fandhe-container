@@ -673,6 +673,69 @@ mod tests {
         );
     }
 
+    /// NET-11: END の失敗が先に届いても打ち切らず、後続データグラムの本体の失敗まで全件集める。
+    #[test]
+    fn net11_end_failure_then_body_failure_are_all_collected() {
+        let b = batch(2);
+        // 本体 seq 11,12 / END seq 13 / 同期点 seq 14。
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![
+                Ok([err_dgram(11, 0), err_dgram(13, 12)].concat()),
+                Ok(err_dgram(12, 17)),
+                Ok(gen_dgram(14)),
+                Ok(err_dgram(14, 0)),
+            ]),
+        )
+        .expect_err("failures");
+        assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
+        assert_eq!(
+            e.failures()
+                .iter()
+                .map(|f| (f.position(), f.seq(), f.errno()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    crate::nftables_batch::NftBatchPosition::Body { index: 1 },
+                    12,
+                    17
+                ),
+                (crate::nftables_batch::NftBatchPosition::End, 13, 12)
+            ]
+        );
+    }
+
+    /// NET-11: 権限不足では BEGIN と同期点がともに EPERM。同期点の拒否を読み切りの印として Aborted にする。
+    #[test]
+    fn net11_begin_eperm_with_rejected_barrier_is_aborted() {
+        let b = batch(1);
+        let mut sent = Vec::new();
+        let e = exchange(
+            &b,
+            &Deadline::after(Duration::from_secs(5)),
+            Duration::from_secs(5),
+            |_| Ok(()),
+            |m| {
+                sent = m.to_vec();
+                Ok(())
+            },
+            script(vec![Ok(err_dgram(10, 1)), Ok(err_dgram(13, 1))]),
+        )
+        .expect_err("eperm");
+        assert_eq!(sent, barrier_bytes(13));
+        assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
+        assert_eq!(e.code(), NetErrorCode::PermissionDenied);
+        assert_eq!(
+            e.failures()
+                .iter()
+                .map(|f| (f.position(), f.seq(), f.errno()))
+                .collect::<Vec<_>>(),
+            vec![(crate::nftables_batch::NftBatchPosition::Begin, 10, 1)]
+        );
+    }
+
     /// NET-11: 同期点を送れなければ Unknown。
     #[test]
     fn net11_barrier_send_failure_is_unknown() {

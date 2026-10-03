@@ -58,6 +58,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher as _;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -585,8 +586,17 @@ fn build_servfail(
 /// bridge 側で送信元詐称（他コンテナの IP・MAC の騙り）が防がれていることの証明（NET-12・NET-5）。
 /// 転送はクエリの送信元 IP だけでコンテナを識別するため、これが成り立たない環境では別コンテナの上流を利用できてしまう。
 /// 製品ビルドでは値を作る公開 API が無く（検証済みを装えない）、bridge ルールの実検査が入るまで転送は有効化できない。
-#[derive(Debug, Clone, Copy)]
-pub struct SourceVerified(());
+/// `Clone` / `Copy` / `Default` を実装せず、証明の複製・既定値での生成もできない。`std::mem::zeroed` / `transmute` は
+/// `unsafe` で安全なコードからは偽造できないが、防御的にフィールドを `NonZeroU8` にして全ゼロのビットパターンを
+/// 有効値にしない。
+#[derive(Debug)]
+pub struct SourceVerified(
+    #[expect(
+        dead_code,
+        reason = "値は読まず、全ゼロを無効値にするニッチとしてのみ持つ"
+    )]
+    NonZeroU8,
+);
 
 impl SourceVerified {
     /// テスト専用の証明生成。製品ビルドには公開コンストラクタを置かない（fail-closed）。
@@ -595,7 +605,7 @@ impl SourceVerified {
     /// が入るまで、製品コードから [`ForwardingHandler`] を作る経路は存在しない（REPAIR-3。NET-12・NET-5）。
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(())
+        Self(NonZeroU8::MIN)
     }
 }
 
@@ -694,7 +704,7 @@ impl QueryHandler for ForwardingHandler {
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
         match forward_query(&list, datagram, q_end, header.id(), counter, out) {
             // 受理済みの上流応答は 512 バイト以下（validate_upstream_reply）。サイズ上限は serve が課す。
-            ForwardResult::Forwarded => HandlerOutcome::RespondForwarded(ForwardedProof(())),
+            ForwardResult::Forwarded => HandlerOutcome::RespondForwarded(ForwardedProof::issue()),
             ForwardResult::AllFailed => {
                 self.forward_failed.fetch_add(1, Ordering::Relaxed);
                 if build_servfail(header, datagram, q_end, out) {
@@ -1075,11 +1085,11 @@ mod tests {
         let u2 = MockUpstream::start(Ipv4Addr::new(198, 51, 100, 2), 1, true);
         let (h, _) = handler_with(&[(PEER1, u1.addr), (PEER2, u2.addr)]);
         let (o, r) = respond_from(&h, sa(PEER1), &query(0x1111, EXTERNAL, 1, 0));
-        assert_eq!(o, HandlerOutcome::RespondForwarded(ForwardedProof(())));
+        assert_eq!(o, HandlerOutcome::RespondForwarded(ForwardedProof::issue()));
         assert_eq!(&r[..2], &[0x11, 0x11], "client id restored");
         assert_eq!(answer_ip(&r), Ipv4Addr::new(198, 51, 100, 1));
         let (o, r) = respond_from(&h, sa(PEER2), &query(0x2222, EXTERNAL, 1, 1));
-        assert_eq!(o, HandlerOutcome::RespondForwarded(ForwardedProof(())));
+        assert_eq!(o, HandlerOutcome::RespondForwarded(ForwardedProof::issue()));
         assert_eq!(answer_ip(&r), Ipv4Addr::new(198, 51, 100, 2));
         let (o, r) = respond_from(&h, sa(PEER3), &query(0x3333, EXTERNAL, 1, 0));
         assert_eq!(o, HandlerOutcome::Respond);
@@ -1321,7 +1331,7 @@ mod tests {
         assert_eq!(out.as_bytes(), &[] as &[u8]);
         assert_eq!(up.count(), 0);
         let o = h.respond_deferred(sa(PEER1), &header, &pkt, &mut out);
-        assert_eq!(o, HandlerOutcome::RespondForwarded(ForwardedProof(())));
+        assert_eq!(o, HandlerOutcome::RespondForwarded(ForwardedProof::issue()));
         assert_eq!(&out.as_bytes()[..2], &[0x61, 0x61]);
         assert_eq!(answer_ip(out.as_bytes()), Ipv4Addr::new(198, 51, 100, 1));
         assert_eq!(up.count(), 1);

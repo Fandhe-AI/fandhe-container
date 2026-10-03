@@ -51,6 +51,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::num::NonZeroU8;
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -352,8 +353,17 @@ impl ResponseBuf {
 
 /// 上流転送の応答であることの証印。フィールドが非公開のため `dns_helper` 配下（[`upstream::ForwardingHandler`]）
 /// でしか作れず、外部の [`QueryHandler`] 実装が `serve` の増幅ガードを緩められない（NET-12・TASK-185.3）。
+/// 防御的に、フィールドを `NonZeroU8` にして全ゼロのビットパターン（`std::mem::zeroed` 等。いずれも `unsafe`）を
+/// 有効値にしない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ForwardedProof(());
+pub struct ForwardedProof(NonZeroU8);
+
+impl ForwardedProof {
+    /// 証印を発行する。非公開で、`dns_helper` 配下（[`upstream::ForwardingHandler`]）からのみ呼べる。
+    fn issue() -> Self {
+        Self(NonZeroU8::MIN)
+    }
+}
 
 /// ハンドラの結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use super::ack::{NftBatchAck, NftBatchAckCollector, NftBatchError, Progress};
-use super::{NftBatch, NftBatchBytes};
+use super::{BATCH_MARKER_LEN, MAX_BATCH_LEN, NftBatch, NftBatchBytes};
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
 use crate::netlink_route::{NetlinkRouteSocket, RequestGate};
@@ -50,6 +50,25 @@ fn seq_after(end_seq: u32) -> u32 {
     match end_seq.wrapping_add(1) {
         0 => 1,
         n => n,
+    }
+}
+
+/// 1 バッチが消費し得る seq 数の上限（BEGIN + 本体 + END）。
+///
+/// 本体メッセージは最小でも `BATCH_MARKER_LEN`（nlmsghdr + nfgenmsg = 20 バイト）あり、バッチ全体は
+/// `MAX_BATCH_LEN` で打ち切られるため、これを超える seq は使わない。
+const MAX_SEQ_PER_BATCH: u32 = (MAX_BATCH_LEN / BATCH_MARKER_LEN) as u32 + 2;
+
+/// 組み立て前に、残りの seq 空間が最大バッチを収容できなければ 1 から採番し直す（NET-11）。
+///
+/// `NftBatch` は seq を `wrapping_add` で進めるため、バッチ内で `u32::MAX` を越えると本体または END の
+/// `nlmsg_seq` が 0 になる。0 は非要求メッセージにも使われ応答の対応付けが曖昧になるので、
+/// 周回しうる位置では先に 1 へ戻して、バッチ内に 0 を含めない。
+fn reserve_first_seq(next_seq: u32) -> u32 {
+    if next_seq == 0 || next_seq > u32::MAX - MAX_SEQ_PER_BATCH {
+        1
+    } else {
+        next_seq
     }
 }
 
@@ -184,8 +203,14 @@ impl NetlinkNetfilterSocket {
 
     /// バッチを組み立てて送り、本体メッセージごとの ACK / エラーが揃うまで待つ（NET-11・TASK-137.3）。
     ///
-    /// `fill` が `NftBatch::push_with` で本体メッセージを積む。`timeout` は順番待ち・組み立て・送信・
-    /// 応答待ちを通した全体の期限で、超えれば `Timeout`（REPAIR-5）。`NetOpKind::NftBatch` として記録する。
+    /// `fill` が `NftBatch::push_with` で本体メッセージを積む。`timeout` は順番待ち・送信・応答待ちを
+    /// 通した全体の期限で、超えれば `Timeout`（REPAIR-5）。`NetOpKind::NftBatch` として記録する。
+    ///
+    /// `fill` は呼び出し元のスレッドで同期的に実行され、本関数はその実行を中断できない。したがって
+    /// `fill` は待機・I/O・ロック取得などで止まらない短い CPU 処理に限ること。`fill` から戻った時点で
+    /// 期限が過ぎていれば何も送らず `Timeout`（`NotSent`）を返す（期限切れの組み立て結果は送信しない）。
+    /// seq は組み立て前に確保し、残りの seq 空間が最大バッチに足りなければ 1 から採番し直す
+    /// （バッチ内に seq 0 を含めない）。
     ///
     /// 戻り値の判定:
     /// - 成功: 本体のすべてが errno 0 で ACK された
@@ -206,10 +231,17 @@ impl NetlinkNetfilterSocket {
                 .gate
                 .acquire(&deadline, timeout)
                 .map_err(NftBatchError::not_sent)?;
-            let mut batch = NftBatch::new(self.next_seq.load(Ordering::Relaxed))
-                .map_err(NftBatchError::not_sent)?;
+            let first_seq = reserve_first_seq(self.next_seq.load(Ordering::Relaxed));
+            let mut batch = NftBatch::new(first_seq).map_err(NftBatchError::not_sent)?;
             fill(&mut batch).map_err(NftBatchError::not_sent)?;
             let bytes = batch.finish().map_err(NftBatchError::not_sent)?;
+            // 防御: 予約により起こらないはずだが、0 の seq を含むバッチは送らない。
+            if bytes.begin_seq() == 0 || bytes.end_seq() == 0 || bytes.body_seqs().contains(&0) {
+                return Err(NftBatchError::not_sent(NetError::new(
+                    NetErrorCode::Internal,
+                    "nf_tables batch contains a zero seq",
+                )));
+            }
             // 送る・送らないによらず今回の範囲は再利用しない（遅延応答との衝突を避ける）。
             self.next_seq
                 .store(seq_after(bytes.end_seq()), Ordering::Relaxed);
@@ -587,6 +619,34 @@ mod tests {
     }
 
     /// NET-11: 複数スレッドから共有できる。
+    /// NET-11: seq 空間が最大バッチに足りない位置では 1 へ戻し、バッチ内に 0 を含めない。
+    #[test]
+    fn net11_reserve_first_seq_avoids_zero_inside_batch() {
+        assert_eq!(reserve_first_seq(1), 1);
+        assert_eq!(reserve_first_seq(0), 1);
+        assert_eq!(reserve_first_seq(u32::MAX), 1);
+        assert_eq!(reserve_first_seq(u32::MAX - 1), 1);
+        assert_eq!(reserve_first_seq(u32::MAX - MAX_SEQ_PER_BATCH + 1), 1);
+        let ok = u32::MAX - MAX_SEQ_PER_BATCH;
+        assert_eq!(reserve_first_seq(ok), ok);
+        // 最大バッチ（最小サイズの本体で埋めた場合）でも周回しない。
+        assert!(u64::from(ok) + u64::from(MAX_SEQ_PER_BATCH) <= u64::from(u32::MAX));
+    }
+
+    /// REPAIR-5: fill が期限を超えて戻った場合は何も送らず Timeout / NotSent。
+    #[test]
+    fn repair5_expired_after_fill_is_not_sent() {
+        let sock = NetlinkNetfilterSocket::open().expect("open");
+        let e = sock
+            .send_batch(Duration::from_millis(20), |b| {
+                std::thread::sleep(Duration::from_millis(60));
+                push_body(b)
+            })
+            .expect_err("expired");
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert_eq!(e.outcome(), NftBatchOutcome::NotSent);
+    }
+
     #[test]
     fn socket_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}

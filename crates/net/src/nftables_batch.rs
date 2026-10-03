@@ -62,7 +62,7 @@ pub const NFNETLINK_V0: u8 = 0;
 /// `nfgenmsg` の固定長（バイト）。
 pub const NFGENMSG_LEN: usize = 4;
 /// BATCH_BEGIN / END 1 件の長さ（nlmsghdr 16 + nfgenmsg 4。パディングなし）。
-const BATCH_MARKER_LEN: usize = 20;
+pub(crate) const BATCH_MARKER_LEN: usize = 20;
 
 /// プロトコルファミリ `NFPROTO_UNSPEC`。
 pub const NFPROTO_UNSPEC: u8 = 0;

@@ -14,8 +14,9 @@
 //! nf_tables ルールの expr 列（`NFTA_RULE_EXPRESSIONS` / `NFTA_LIST_ELEM` / `NFTA_EXPR_*`）のネスト属性コーデック（`nftables_rules`。OS 非依存。TASK-138.1・#309）と、
 //! payload（load 形式）・masq の型付き expr と NEWRULE の組み立て（`nftables_rules`。TASK-138.2・#310）と、
 //! cmp・immediate・nat（DNAT）の型付き expr とハンドル指定のルール削除 DELRULE の組み立て（`nftables_rules`。TASK-138.3・#311）と、
-//! 操作ごとの成功 / 失敗・所要時間の記録先を受け取る計装連携点（`instrument`。REPAIR-4）も持つ。link の down・削除・bridge への接続、
-//! nftables の bitwise / meta expr・ルールハンドルの取得経路（TASK-139 以降）、DNS ヘルパー等は未実装で、G10（TASK-136〜148・TASK-185〜186）で実装する（REPAIR-3）。
+//! 操作ごとの成功 / 失敗・所要時間の記録先を受け取る計装連携点（`instrument`。REPAIR-4）、ネットワーク作成処理（bridge・gateway・専用 nft テーブルと NAT base chain の作成と失敗時ロールバック。
+//! `RTM_DELLINK`・ifindex 取得を含む。`network`。TASK-139.1・#314）も持つ。link の down・bridge への接続、
+//! masquerade ルール本体（nftables の bitwise / meta expr が前提）・ルールハンドルの取得経路（TASK-139.3 以降）、DNS ヘルパー等は未実装で、G10（TASK-136〜148・TASK-185〜186）で実装する（REPAIR-3）。
 //! PLUG-1 区分は検討中
 //! （制御面の `NetworkPlugin` は plugin 側に区分される一方、DNS ヘルパー・rootless 転送のデータパス
 //! 判定は未確定。crate-naming.md）。確定扱いにはしない（spec-reference）。
@@ -24,6 +25,7 @@ pub mod error;
 pub mod instrument;
 pub mod netlink;
 pub mod netlink_route;
+pub mod network;
 pub mod nftables_batch;
 pub mod nftables_rules;
 #[cfg(target_os = "linux")]

@@ -33,7 +33,7 @@
 //!   有効にする（`nftables_batch` が受け取るバイト列を変えないため）
 //! - 拡張 ACK のうち `NLMSGERR_ATTR_COOKIE`・`POLICY`・`MISS_TYPE` / `MISS_NEST` の解釈（読み飛ばす）
 //! - dump 中断（`NLM_F_DUMP_INTR`）の自動再試行（検出して `FailedPrecondition` で返すのみ）、複数スレッドでの seq 別の待機者振り分け（往復は 1 件ずつ直列化する）
-//! - link の down・削除・属性変更の送信ラッパー。address / route の未実装範囲は `addr_route` の doc を参照
+//! - link の down・属性変更（削除は `delete_link` で実装済み。TASK-139.1）の送信ラッパー。address / route の未実装範囲は `addr_route` の doc を参照
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -287,7 +287,10 @@ mod socket {
         NLM_F_ROOT, NLMSG_DONE, NLMSG_ERROR, NLMSG_HEADER_LEN, NLMSG_NOOP, NLMSG_OVERRUN,
         NlMsgBuilder, NlMsgHeader, NlMsgIter,
     };
-    use crate::netlink_route::{LinkCreate, LinkSet};
+    use crate::netlink_route::{
+        IFINFOMSG_LEN, IFLA_IFNAME, IfIndex, IfName, LinkCreate, LinkDelete, LinkSet, RTM_GETLINK,
+        RTM_NEWLINK, decode_ifinfomsg_alias, decode_ifinfomsg_index,
+    };
     use crate::nftables_batch::{MAX_BATCH_LEN, NftBatchBytes};
     use crate::sys::{self, Deadline, Readiness, RecvMeta, SysError};
 
@@ -661,6 +664,68 @@ mod socket {
             record_net_op(self.recorder.as_ref(), NetOpKind::LinkSet, || {
                 self.request(req.msg_type(), req.flags(), timeout, |b| req.encode(b))
             })
+        }
+
+        /// link 削除要求（`RTM_DELLINK`）を送り ACK を待つ（TASK-139.1・#314）。
+        /// `NetOpKind::LinkDelete` として記録する。対象が無ければ `NotFound`、権限不足は
+        /// `PermissionDenied`。`Timeout` / `DataLoss` では削除済みか不明なので状態を再照会すること。
+        pub fn delete_link(
+            &self,
+            req: &LinkDelete,
+            timeout: Duration,
+        ) -> Result<NetlinkReply, NetError> {
+            record_net_op(self.recorder.as_ref(), NetOpKind::LinkDelete, || {
+                self.request(req.msg_type(), req.flags(), timeout, |b| req.encode(b))
+            })
+        }
+
+        /// 名前から ifindex を引く（`RTM_GETLINK`。TASK-139.1・#314）。無ければ `NotFound`。
+        /// 応答はカーネル由来の外部入力として検証する（`decode_ifinfomsg_index`）。
+        pub fn link_index(&self, name: &IfName, timeout: Duration) -> Result<IfIndex, NetError> {
+            self.link_index_and_alias(name, timeout).map(|(i, _)| i)
+        }
+
+        /// 名前から ifindex を引き、`IFLA_IFALIAS` が `token`（作成時に付けた所有トークン）と
+        /// 一致する場合のみ返す（TASK-139.1・#314）。不一致（別者が同名 link に差し替えた等）は
+        /// `FailedPrecondition` で、呼び出し側はその link を操作・削除してはならない。
+        pub fn link_index_owned(
+            &self,
+            name: &IfName,
+            token: &str,
+            timeout: Duration,
+        ) -> Result<IfIndex, NetError> {
+            let (index, alias) = self.link_index_and_alias(name, timeout)?;
+            if alias.as_deref() == Some(token) {
+                Ok(index)
+            } else {
+                Err(NetError::new(
+                    NetErrorCode::FailedPrecondition,
+                    "link ownership token mismatch (link was replaced)",
+                ))
+            }
+        }
+
+        fn link_index_and_alias(
+            &self,
+            name: &IfName,
+            timeout: Duration,
+        ) -> Result<(IfIndex, Option<String>), NetError> {
+            let reply = self.request(RTM_GETLINK, 0, timeout, |b| {
+                b.put_fixed(&[0u8; IFINFOMSG_LEN])?;
+                let mut v = name.as_str().as_bytes().to_vec();
+                v.push(0);
+                b.put_attr(IFLA_IFNAME, &v)
+            })?;
+            let msg = reply
+                .messages()
+                .iter()
+                .find(|m| m.msg_type() == RTM_NEWLINK)
+                .ok_or_else(|| {
+                    NetError::new(NetErrorCode::Internal, "no RTM_NEWLINK in link reply")
+                })?;
+            let index = decode_ifinfomsg_index(msg.payload())?;
+            let alias = decode_ifinfomsg_alias(msg.payload())?;
+            Ok((index, alias))
         }
 
         /// `message`（`NlMsgBuilder` で組んだ 1 メッセージ）をそのままカーネルへ送る。

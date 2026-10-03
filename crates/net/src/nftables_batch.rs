@@ -41,7 +41,7 @@ mod socket;
 mod table_chain;
 
 #[cfg(target_os = "linux")]
-pub use ack::{NftBatchAck, NftBatchError, NftBatchOutcome, NftBatchPosition, NftMessageFailure};
+pub use ack::{NftBatchAck, NftBatchError, NftBatchPosition, NftMessageFailure};
 #[cfg(target_os = "linux")]
 pub use socket::NetlinkNetfilterSocket;
 /// NEWRULE 等、他モジュールの nf_tables メッセージが REQUEST / ACK 付きヘッダーを組み立てる共通入口。
@@ -52,6 +52,18 @@ use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{
     MAX_MESSAGE_LEN, NLM_F_ACK, NLM_F_REQUEST, NLMSG_HEADER_LEN, NlMsgBuilder, NlMsgHeader,
 };
+
+/// バッチがカーネルに適用されたかどうか（OS 非依存。`network` の判定でも使うため ack から切り出した。呼び出し側が再照会の要否を判断する材料）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NftBatchOutcome {
+    /// カーネルが失敗を返した。nf_tables のバッチは all-or-nothing で、何も適用されていない。
+    Aborted,
+    /// 時間切れ・受信欠落・応答の破損などで、適用されたかどうか不明。状態を再照会すること。
+    Unknown,
+    /// 送信前に拒否または期限切れになり、カーネルへは何も送っていない。
+    NotSent,
+}
 
 /// nf_tables のサブシステム ID（`NFNL_SUBSYS_NFTABLES`）。
 pub const NFNL_SUBSYS_NFTABLES: u8 = 10;

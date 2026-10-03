@@ -37,6 +37,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use super::NftBatchOutcome;
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{NLMSG_ERROR, NLMSG_NOOP, NlMsgIter};
 use crate::netlink_route::{classify_errno, decode_nlmsgerr};
@@ -103,18 +104,6 @@ impl NftMessageFailure {
     pub fn code(&self) -> NetErrorCode {
         self.code
     }
-}
-
-/// バッチがカーネルに適用されたかどうか（呼び出し側が再照会の要否を判断する材料）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum NftBatchOutcome {
-    /// カーネルが失敗を返した。nf_tables のバッチは all-or-nothing で、何も適用されていない。
-    Aborted,
-    /// 時間切れ・受信欠落・応答の破損などで、適用されたかどうか不明。状態を再照会すること。
-    Unknown,
-    /// 送信前に拒否または期限切れになり、カーネルへは何も送っていない。
-    NotSent,
 }
 
 /// バッチ送信の構造化エラー（`code` / `message` に加え、失敗メッセージの一覧と適用状態を持つ）。

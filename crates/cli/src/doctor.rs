@@ -158,8 +158,9 @@ pub enum ForwardPolicyState {
     /// nftables に `ip filter FORWARD` が無い。iptables-legacy 環境では正常で、`legacy_iptables_filter` は
     /// `/proc/net/ip_tables_names` に `filter` があるか（policy 自体は未取得。モジュール doc の未実装範囲）。
     NotFoundInNftables {
-        /// legacy iptables の filter テーブルが存在するか。
-        legacy_iptables_filter: bool,
+        /// legacy iptables の filter テーブルが存在するか。`None` は権限不足等で読み取れず判定不能
+        /// （不存在の `Some(false)` と区別する。fail-closed）。ファイル自体が無い場合は `Some(false)`。
+        legacy_iptables_filter: Option<bool>,
     },
     /// 権限不足。nfnetlink の照会には `CAP_NET_ADMIN` が必要。
     PermissionDenied,
@@ -226,11 +227,14 @@ pub fn probe_forward_policy(source: &dyn ForwardPolicySource, root: &Path) -> Fo
     }
 }
 
-/// `/proc/net/ip_tables_names` に `filter` 行があるか（読めなければ `false`）。
-fn has_legacy_filter(root: &Path) -> bool {
-    read_limited(&root.join(IP_TABLES_NAMES))
-        .map(|t| t.lines().any(|l| l.trim() == "filter"))
-        .unwrap_or(false)
+/// `/proc/net/ip_tables_names` に `filter` 行があるか。ファイル不在（ip_tables 未ロード）は `Some(false)`、
+/// 権限不足などその他の読み取り失敗は不存在と断定できないため `None`（判定不能）。
+fn has_legacy_filter(root: &Path) -> Option<bool> {
+    match read_limited(&root.join(IP_TABLES_NAMES)) {
+        Ok(t) => Some(t.lines().any(|l| l.trim() == "filter")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// 2 つの probe の結果。組み合わせ判定・表示は TASK-148.2（#344）が担う。
@@ -346,7 +350,7 @@ mod tests {
         assert_eq!(
             st(Mock(Err(NetErrorCode::NotFound))),
             ForwardPolicyState::NotFoundInNftables {
-                legacy_iptables_filter: false
+                legacy_iptables_filter: Some(false)
             }
         );
         assert_eq!(
@@ -371,13 +375,22 @@ mod tests {
         assert_eq!(
             probe_forward_policy(&nf, &with.0),
             ForwardPolicyState::NotFoundInNftables {
-                legacy_iptables_filter: true
+                legacy_iptables_filter: Some(true)
             }
         );
         assert_eq!(
             probe_forward_policy(&nf, &without.0),
             ForwardPolicyState::NotFoundInNftables {
-                legacy_iptables_filter: false
+                legacy_iptables_filter: Some(false)
+            }
+        );
+        // 読み取り失敗（ここでは filter がディレクトリ）は不存在と区別して None。
+        let unreadable = TempRoot::new();
+        unreadable.write(&format!("{IP_TABLES_NAMES}/x"), "");
+        assert_eq!(
+            probe_forward_policy(&nf, &unreadable.0),
+            ForwardPolicyState::NotFoundInNftables {
+                legacy_iptables_filter: None
             }
         );
     }

@@ -45,6 +45,7 @@ mod linux {
     use std::io::Read as _;
     use std::net::ToSocketAddrs as _;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -162,28 +163,45 @@ mod linux {
 
     /// 外部コマンドを期限つきで実行する（REPAIR-5）。期限切れなら子を kill して回収する。
     fn run_cmd(program: &str, args: &[&str]) -> Result<String, NetError> {
+        // 子孫がパイプを保持しても止まらないよう、子を新しいプロセスグループに入れ、期限切れ時は
+        // グループごと SIGKILL する。パイプ回収も期限で打ち切る（REPAIR-5）。
         let mut child = Command::new(program)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .spawn()
             .map_err(|e| fail(format!("spawn {program}: {e}")))?;
+        let pgid = child.id();
+        let kill_group = |child: &mut std::process::Child| {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pgid}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = child.kill();
+            let _ = child.wait();
+        };
         let mut out_pipe = child.stdout.take();
         let mut err_pipe = child.stderr.take();
-        let out_t = std::thread::spawn(move || {
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (err_tx, err_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // 読み取りスレッドは join せず切り離す（グループ kill 後は EOF で自然に終了する）。
+        std::thread::spawn(move || {
             let mut b = Vec::new();
             if let Some(p) = out_pipe.as_mut() {
                 let _ = p.read_to_end(&mut b);
             }
-            b
+            let _ = out_tx.send(b);
         });
-        let err_t = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             let mut b = Vec::new();
             if let Some(p) = err_pipe.as_mut() {
                 let _ = p.read_to_end(&mut b);
             }
-            b
+            let _ = err_tx.send(b);
         });
         let deadline = Instant::now() + timeout();
         let status = loop {
@@ -193,8 +211,7 @@ mod linux {
             {
                 Some(st) => break st,
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_group(&mut child);
                     return Err(NetError::new(
                         NetErrorCode::Timeout,
                         format!("{program} did not finish before the deadline"),
@@ -203,8 +220,18 @@ mod linux {
                 None => std::thread::sleep(Duration::from_millis(20)),
             }
         };
-        let stdout = out_t.join().unwrap_or_default();
-        let stderr = err_t.join().unwrap_or_default();
+        // 直接の子が終了しても子孫がパイプを保持し続け得るため、回収は期限内に限る。
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let stdout = out_rx.recv_timeout(remaining).ok();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let stderr = err_rx.recv_timeout(remaining).ok();
+        let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+            kill_group(&mut child);
+            return Err(NetError::new(
+                NetErrorCode::Timeout,
+                format!("{program} output pipes did not close before the deadline"),
+            ));
+        };
         if !status.success() {
             return Err(fail(format!(
                 "{program} failed: {}{}",

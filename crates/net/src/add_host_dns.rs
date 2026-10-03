@@ -285,8 +285,9 @@ fn verify_hosts_file(file: &File, path: &Path) -> Result<(), NetError> {
 }
 
 /// hosts ファイルの排他ロックを期限つきで取得する（プロセス間の直列化。REPAIR-5）。
-fn lock_exclusive_bounded(file: &File) -> Result<(), NetError> {
-    let deadline = Instant::now() + HOSTS_LOCK_TIMEOUT;
+///
+/// `deadline` は呼び出し側が決めた全体の期限で、同一プロセス内ミューテックス待ちと共有する。
+fn lock_exclusive_bounded(file: &File, deadline: Instant) -> Result<(), NetError> {
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(()),
@@ -301,6 +302,27 @@ fn lock_exclusive_bounded(file: &File) -> Result<(), NetError> {
             }
             Err(std::fs::TryLockError::Error(_)) => {
                 return Err(io_err("failed to lock hosts file"));
+            }
+        }
+    }
+}
+
+/// 同一プロセス内の追記ミューテックスを期限つきで取得する（`try_lock` のポーリング。REPAIR-5）。
+///
+/// 先行追記が `sync_all` 等で停止しても、後続は `deadline` で `TIMEOUT` を返し無期限には待たない。
+fn lock_guard_bounded(deadline: Instant) -> Result<std::sync::MutexGuard<'static, ()>, NetError> {
+    loop {
+        match HOSTS_APPEND_GUARD.try_lock() {
+            Ok(g) => return Ok(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Ok(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(NetError::new(
+                        NetErrorCode::Timeout,
+                        "timed out waiting for hosts append lock",
+                    ));
+                }
+                std::thread::sleep(HOSTS_LOCK_POLL);
             }
         }
     }
@@ -343,10 +365,9 @@ pub fn append_add_hosts(hosts_path: &Path, entries: &[AddHostEntry]) -> Result<(
         .map_err(|_| io_err("failed to open hosts file"))?;
     // 長さ取得・末尾改行判定・上限判定・追記を 1 つの排他区間にする（並行追記による上限超過・
     // 古い末尾内容に基づく改行判定を防ぐ）。ロックは file の Drop で解放される。
-    let _guard = HOSTS_APPEND_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    lock_exclusive_bounded(&file)?;
+    let deadline = Instant::now() + HOSTS_LOCK_TIMEOUT;
+    let _guard = lock_guard_bounded(deadline)?;
+    lock_exclusive_bounded(&file, deadline)?;
     verify_hosts_file(&file, hosts_path)?;
 
     let len = file

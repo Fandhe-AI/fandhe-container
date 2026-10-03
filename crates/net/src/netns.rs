@@ -45,7 +45,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
@@ -272,6 +272,12 @@ pub(crate) fn create_pinned(
         .mode(0o400)
         .open(&pin)
         .map_err(|e| fail(io_error("create netns pin file", &e), None))?;
+    // 作成時の mode は umask で削られうる（例: umask 0777 → 0000）。`check_pin_file_attrs` が要求する
+    // 厳密な 0o400 にするため、保持した fd（fchmod）で明示設定する。パスは再解決しない。
+    if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o400)) {
+        let leftover = fs::remove_file(&pin).err().map(|_| ResourceState::Present);
+        return Err(fail(io_error("chmod netns pin file", &e), leftover));
+    }
     // 作成した実体の識別子を記録する。`unpin_path` が「本モジュールが作った pin」だけを対象にする根拠。
     let fid = match file.metadata() {
         Ok(m) => file_id(&m),
@@ -406,10 +412,10 @@ pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetn
 ///   （検査後に親のパスが差し替えられても、検査した同じディレクトリに対してだけ作用する）
 /// - 本プロセスの `create_pinned` が作った pin なら、作成時に控えた「pin ファイルの (dev, ino)」と
 ///   「固定した netns の (dev, ino)」のどちらかに現在の実体が一致すること（操作の直前に stat し直して照合）。
-///   記録が無い pin（作成プロセスの終了後・再起動後の清掃）は、置き場の検証（実効 UID 所有・他者書き込み不可）
-///   と下記の形の検査（nsfs マウント、または mode `0o400`・サイズ 0・実効 UID 所有の通常ファイル）だけで
-///   判定する。置き場は実効 UID 本人しか書けないため、本人権限での削除を超える権限は与えない。
-///   永続状態による厳密な所有照合は TASK-139.4 の責務
+///   記録が無い pin（作成プロセスの終了後・再起動後の清掃）は、nsfs がマウント中なら umount 前に
+///   `FailedPrecondition` で拒否する（所有を証明できず、同一 UID の別プロセスの netns を破棄しうるため）。
+///   マウントの無い残置ファイルは、置き場の検証と下記の形の検査（mode `0o400`・サイズ 0・実効 UID 所有の
+///   通常ファイル）を通れば削除する。永続状態による厳密な所有照合は TASK-139.4 の責務
 /// - `/proc/self/mountinfo` 上で、pin がマウントされていないか、`nsfs` としてマウントされている
 /// - アンマウント後の実体が、作成時の pin ファイル（上記 inode）かつ本モジュールが作った形
 ///   （実効 UID 所有・mode `0o400`・サイズ 0 の通常ファイル）
@@ -459,11 +465,10 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(io_error("stat netns pin", &e)),
     };
-    // 本プロセスの記録があれば照合に使う。無ければ（プロセス再起動後・別プロセス作成）形の検査だけで判定する。
+    // 本プロセスの記録（所有の証明）を引く。nsfs マウントの解除は記録がある場合に限る（下記）。
     let record = lookup_pin(current);
     let raw = fs::read("/proc/self/mountinfo").map_err(|e| io_error("read mountinfo", &e))?;
-    // アンマウント後に現れるべき pin ファイルの識別子。記録が無い nsfs マウント中は未知（None）で、
-    // 下の再検査で「nsfs の inode ではない（重ねマウントが残っていない）」ことだけを確かめる。
+    // アンマウント後に現れるべき pin ファイルの識別子。
     let expected_file: Option<FileId> = match pin_mount_state(&String::from_utf8_lossy(&raw), &real)
     {
         PinMount::None => {
@@ -473,7 +478,13 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
             Some(current)
         }
         PinMount::Nsfs => {
-            if record.is_some_and(|r| Some(current) != r.ns) {
+            // 所有を証明できない nsfs マウントは umount 前に拒否する（fail-closed）。umount すると
+            // 後続の検査で拒否しても名前空間は既に切り離されており、同一 UID の別プロセスの pin を
+            // 破棄しうる。作成プロセス終了後の清掃は永続状態による所有照合（TASK-139.4）で行う。
+            let Some(r) = record else {
+                return Err(not_our_pin());
+            };
+            if Some(current) != r.ns {
                 return Err(not_our_pin());
             }
             let c_via = CString::new(via.as_os_str().as_bytes()).map_err(|_| {
@@ -484,9 +495,7 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
                 Ok(m) if file_id(&m) == current => {}
                 Ok(_) => return Err(not_our_pin()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    if let Some(r) = record {
-                        forget_pin(r.file);
-                    }
+                    forget_pin(r.file);
                     return Ok(());
                 }
                 Err(e) => return Err(io_error("stat netns pin", &e)),
@@ -497,7 +506,7 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
                 Err(SysError::Os(e)) if e == sys::EINVAL || e == sys::ENOENT => {}
                 Err(e) => return Err(sys_error("umount", e)),
             }
-            record.map(|r| r.file)
+            Some(r.file)
         }
         PinMount::Other => {
             return Err(NetError::new(
@@ -513,8 +522,6 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
             let id = file_id(&m);
             match expected_file {
                 Some(e) if id != e => return Err(not_our_pin()),
-                // 記録が無い場合、まだ nsfs の inode のままなら重ねマウントが残っている。
-                None if id == current => return Err(not_our_pin()),
                 _ => {}
             }
             check_pin_file_attrs(m.file_type().is_file(), m.mode(), m.uid(), m.len(), euid)?;

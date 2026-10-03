@@ -475,7 +475,10 @@ fn forward_drop_condition(s: &ForwardPolicyState) -> ConditionState {
         ForwardPolicyState::Policy(ChainPolicy::Accept) => ConditionState::NotMet,
         // 未知のカーネル値は fail-closed で判定不能にする。
         ForwardPolicyState::Policy(ChainPolicy::Other(_)) => ConditionState::Unknown,
-        ForwardPolicyState::NotBaseChain => ConditionState::NotMet,
+        // nftables 側の FORWARD は policy を持たないだけで、legacy iptables の filter テーブルが
+        // 併存して policy が DROP の場合がありうる。legacy 側を確認できないため判定不能にする
+        // （fail-closed。NET-10）。
+        ForwardPolicyState::NotBaseChain => ConditionState::Unknown,
         ForwardPolicyState::NotFoundInNftables {
             legacy_iptables_filter: Some(false),
         } => ConditionState::NotMet,
@@ -546,14 +549,30 @@ fn inconclusive_diagnostic(
     let mut reasons: Vec<String> = Vec::new();
     let mut remediation: Vec<String> = Vec::new();
     if a == ConditionState::Unknown {
-        let code = match &findings.br_netfilter {
-            BrNetfilterState::Unknown { reason } => reason.code.as_str(),
-            _ => "UNKNOWN",
+        // 原因別に診断コードと案内を分ける。値が読めている場合や権限以外の失敗では
+        // 権限での再実行を案内しない（誤誘導の防止）。
+        let (code, advice) = match &findings.br_netfilter {
+            BrNetfilterState::Unknown { reason } if reason.code == "PERMISSION_DENIED" => (
+                "PERMISSION_DENIED",
+                "Re-run as a user that can read /proc/sys/net (e.g. root)",
+            ),
+            BrNetfilterState::Unknown { reason } => (
+                reason.code.as_str(),
+                "Check the probe error code above; the br_netfilter state could not be read",
+            ),
+            BrNetfilterState::Loaded { .. } => (
+                "UNRECOGNIZED_BRIDGE_NF_VALUE",
+                "bridge-nf-call-iptables has a value other than 0 or 1; check it with \"sysctl net.bridge.bridge-nf-call-iptables\" (running as root does not help)",
+            ),
+            _ => (
+                "BR_NETFILTER_UNAVAILABLE",
+                "Check the br_netfilter state manually with \"lsmod | grep br_netfilter\"",
+            ),
         };
         reasons.push(format!(
             "br_netfilter state could not be determined ({code})"
         ));
-        remediation.push("Re-run as a user that can read /proc/sys/net (e.g. root)".to_string());
+        remediation.push(advice.to_string());
     }
     if b == ConditionState::Unknown {
         // 原因別に診断コードと案内を分ける。権限不足以外は root で再実行しても解消しないため、
@@ -566,6 +585,10 @@ fn inconclusive_diagnostic(
             ForwardPolicyState::Unknown { reason } => (
                 reason.code.as_str(),
                 "Check the probe error code above; the FORWARD chain policy could not be read",
+            ),
+            ForwardPolicyState::NotBaseChain => (
+                "FORWARD_CHAIN_NOT_BASE",
+                "The nftables FORWARD chain has no policy, so a legacy iptables FORWARD policy cannot be ruled out; check it with \"iptables -S FORWARD\" (running as root does not help)",
             ),
             ForwardPolicyState::Policy(_) => (
                 "UNRECOGNIZED_POLICY",
@@ -736,7 +759,7 @@ mod eval_tests {
             (ForwardPolicyState::Policy(ChainPolicy::Drop), Met),
             (ForwardPolicyState::Policy(ChainPolicy::Accept), NotMet),
             (ForwardPolicyState::Policy(ChainPolicy::Other(7)), Unknown),
-            (ForwardPolicyState::NotBaseChain, NotMet),
+            (ForwardPolicyState::NotBaseChain, Unknown),
             (nf(Some(false)), NotMet),
             (nf(Some(true)), Unknown),
             (nf(None), Unknown),
@@ -930,6 +953,54 @@ mod eval_tests {
             assert_eq!(d.code, "DIAGNOSIS_INCONCLUSIVE");
             assert!(d.message.contains(code), "{}", d.message);
             assert!(!d.remediation[0].contains("CAP_NET_ADMIN"));
+        }
+    }
+
+    #[test]
+    fn net10_not_base_chain_is_inconclusive_not_no_risk() {
+        let r = evaluate(&f(loaded(), ForwardPolicyState::NotBaseChain));
+        assert_eq!(r.outcome, DoctorOutcome::Inconclusive);
+        assert_eq!(r.exit_status(), DoctorExitStatus::Inconclusive);
+        let d = &r.diagnostics[0];
+        assert!(
+            d.message.contains("FORWARD_CHAIN_NOT_BASE"),
+            "{}",
+            d.message
+        );
+        assert!(!d.remediation[0].contains("CAP_NET_ADMIN"));
+    }
+
+    #[test]
+    fn net10_inconclusive_br_netfilter_codes_by_cause() {
+        let fw = ForwardPolicyState::Policy(ChainPolicy::Drop);
+        let perm = DoctorProbeError {
+            code: "PERMISSION_DENIED".to_string(),
+            message: "x".to_string(),
+        };
+        let cases = [
+            (
+                BrNetfilterState::Unknown { reason: perm },
+                "PERMISSION_DENIED",
+                true,
+            ),
+            (
+                BrNetfilterState::Unknown { reason: err() },
+                "INTERNAL",
+                false,
+            ),
+            (
+                BrNetfilterState::Loaded {
+                    call_iptables: None,
+                },
+                "UNRECOGNIZED_BRIDGE_NF_VALUE",
+                false,
+            ),
+        ];
+        for (b, code, root_hint) in cases {
+            let r = evaluate(&f(b, fw.clone()));
+            let d = &r.diagnostics[0];
+            assert!(d.message.contains(code), "{}", d.message);
+            assert_eq!(d.remediation[0].contains("Re-run as a user"), root_hint);
         }
     }
 

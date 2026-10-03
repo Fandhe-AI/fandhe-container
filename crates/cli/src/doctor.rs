@@ -233,6 +233,13 @@ fn read_limited(path: &Path, limit: u64) -> std::io::Result<String> {
 pub enum ForwardPolicyState {
     /// base chain の policy を取得できた。
     Policy(ChainPolicy),
+    /// nftables 側の policy は accept だが、legacy iptables の filter テーブルが併存しうる（存在する、または
+    /// 読み取れず不明）ため、legacy 側の FORWARD policy が DROP の可能性を否定できない状態。legacy の
+    /// filter テーブルが無いと確認できた場合は [`ForwardPolicyState::Policy`] になる（NET-10・fail-closed）。
+    AcceptLegacyUnruledOut {
+        /// legacy iptables の filter テーブルが存在するか。`None` は判定不能（`NotFoundInNftables` と同義）。
+        legacy_iptables_filter: Option<bool>,
+    },
     /// チェインはあるが policy 属性を持たない（base chain でない）。
     NotBaseChain,
     /// nftables に `ip filter FORWARD` が無い。iptables-legacy 環境では正常で、`legacy_iptables_filter` は
@@ -302,6 +309,15 @@ pub fn probe_forward_policy(source: &dyn ForwardPolicySource, root: &Path) -> Fo
                     },
                 }
             }
+            // nftables 側が accept でも、併存する legacy iptables の FORWARD policy が DROP の
+            // ホストを無リスクと誤判定しない。legacy の filter テーブルが無いと確認できた場合のみ
+            // accept を確定させる（fail-closed。NET-10）。
+            Some(ChainPolicy::Accept) => match has_legacy_filter(root) {
+                Some(false) => ForwardPolicyState::Policy(ChainPolicy::Accept),
+                legacy_iptables_filter => ForwardPolicyState::AcceptLegacyUnruledOut {
+                    legacy_iptables_filter,
+                },
+            },
             Some(p) => ForwardPolicyState::Policy(p),
             None => ForwardPolicyState::NotBaseChain,
         },
@@ -310,7 +326,8 @@ pub fn probe_forward_policy(source: &dyn ForwardPolicySource, root: &Path) -> Fo
                 legacy_iptables_filter: has_legacy_filter(root),
             },
             NetErrorCode::PermissionDenied => ForwardPolicyState::PermissionDenied,
-            NetErrorCode::Unimplemented => ForwardPolicyState::Unsupported,
+            // Linux 上の照会未実装は OS 対象外ではなく判定不能（成功終了に見せない。fail-closed）。
+            // 対象外 OS は関数冒頭で `Unsupported` を返している。
             _ => ForwardPolicyState::Unknown {
                 reason: DoctorProbeError::from_net(&e),
             },
@@ -473,6 +490,8 @@ fn forward_drop_condition(s: &ForwardPolicyState) -> ConditionState {
     match s {
         ForwardPolicyState::Policy(ChainPolicy::Drop) => ConditionState::Met,
         ForwardPolicyState::Policy(ChainPolicy::Accept) => ConditionState::NotMet,
+        // legacy iptables の併存を否定できない accept は無リスクと断定しない。
+        ForwardPolicyState::AcceptLegacyUnruledOut { .. } => ConditionState::Unknown,
         // 未知のカーネル値は fail-closed で判定不能にする。
         ForwardPolicyState::Policy(ChainPolicy::Other(_)) => ConditionState::Unknown,
         // nftables 側の FORWARD は policy を持たないだけで、legacy iptables の filter テーブルが
@@ -586,6 +605,10 @@ fn inconclusive_diagnostic(
                 reason.code.as_str(),
                 "Check the probe error code above; the FORWARD chain policy could not be read",
             ),
+            ForwardPolicyState::AcceptLegacyUnruledOut { .. } => (
+                "LEGACY_IPTABLES_POLICY_UNREAD",
+                "The nftables FORWARD policy is accept, but a legacy iptables FORWARD policy cannot be ruled out; check it with \"iptables -S FORWARD\" (running as root does not help)",
+            ),
             ForwardPolicyState::NotBaseChain => (
                 "FORWARD_CHAIN_NOT_BASE",
                 "The nftables FORWARD chain has no policy, so a legacy iptables FORWARD policy cannot be ruled out; check it with \"iptables -S FORWARD\" (running as root does not help)",
@@ -679,6 +702,9 @@ fn forward_policy_token(s: &ForwardPolicyState) -> String {
         ForwardPolicyState::Policy(ChainPolicy::Drop) => "policy(drop)".to_string(),
         ForwardPolicyState::Policy(ChainPolicy::Accept) => "policy(accept)".to_string(),
         ForwardPolicyState::Policy(ChainPolicy::Other(n)) => format!("policy(other={n})"),
+        ForwardPolicyState::AcceptLegacyUnruledOut { .. } => {
+            "policy(accept,legacy_unruled_out)".to_string()
+        }
         ForwardPolicyState::NotBaseChain => "not_base_chain".to_string(),
         ForwardPolicyState::NotFoundInNftables { .. } => "not_found_in_nftables".to_string(),
         ForwardPolicyState::PermissionDenied => "permission_denied".to_string(),
@@ -755,7 +781,12 @@ mod eval_tests {
         let nf = |l| ForwardPolicyState::NotFoundInNftables {
             legacy_iptables_filter: l,
         };
+        let acc = |l| ForwardPolicyState::AcceptLegacyUnruledOut {
+            legacy_iptables_filter: l,
+        };
         let cases = [
+            (acc(Some(true)), Unknown),
+            (acc(None), Unknown),
             (ForwardPolicyState::Policy(ChainPolicy::Drop), Met),
             (ForwardPolicyState::Policy(ChainPolicy::Accept), NotMet),
             (ForwardPolicyState::Policy(ChainPolicy::Other(7)), Unknown),
@@ -809,6 +840,16 @@ mod eval_tests {
     #[test]
     fn net10_outcome_mapping() {
         let o = |b, p| evaluate(&f(b, p)).outcome;
+        // nftables が accept でも legacy 併存を否定できなければ無リスクにしない。
+        assert_eq!(
+            o(
+                loaded(),
+                ForwardPolicyState::AcceptLegacyUnruledOut {
+                    legacy_iptables_filter: Some(true)
+                }
+            ),
+            DoctorOutcome::Inconclusive
+        );
         assert_eq!(
             o(
                 BrNetfilterState::NotLoaded,
@@ -1210,10 +1251,22 @@ mod tests {
             st(Mock(Ok(reply(Some(0))))),
             ForwardPolicyState::Policy(ChainPolicy::Drop)
         );
+        // accept は legacy の filter テーブル不在を確認できた場合のみ確定する。
         assert_eq!(
             st(Mock(Ok(reply(Some(1))))),
+            ForwardPolicyState::AcceptLegacyUnruledOut {
+                legacy_iptables_filter: None
+            }
+        );
+        assert_eq!(
+            probe_forward_policy(&Mock(Ok(reply(Some(1)))), &procfs_root().0),
             ForwardPolicyState::Policy(ChainPolicy::Accept)
         );
+        // Linux 上の Unimplemented は対象外ではなく判定不能。
+        assert!(matches!(
+            st(Mock(Err(NetErrorCode::Unimplemented))),
+            ForwardPolicyState::Unknown { .. }
+        ));
         assert_eq!(st(Mock(Ok(reply(None)))), ForwardPolicyState::NotBaseChain);
         // 別 hook（prerouting）・hook 属性なしの base chain は転送経路の policy として返さない。
         for hook in [Some(0), None] {

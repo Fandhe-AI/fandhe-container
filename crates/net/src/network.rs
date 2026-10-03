@@ -41,18 +41,26 @@
 //! FNV-1a 下位 44bit hex 11 桁（[`VethNames`]。互換性に関わる契約）。veth には所有トークンを付けられない
 //! ため `NLM_F_EXCL` 作成 + 直後の ifindex 確保 + ifindex 指定の削除で運用する（`attach_container_with` の doc）。
 //!
+//! 接続の最後に [`StaticIpam`]（`ipam`。TASK-139.2.2・#848）で重複しない IPv4 アドレスを払い出す。
+//! 払い出しに失敗（枯渇 `ResourceExhausted` 等）したら veth と netns を戻す。IPAM の状態は呼び出し側が
+//! 所有し、接続失敗時は変更されない。後続手順の失敗時に `release` を呼ぶ責務は後続の Issue で扱う。
+//!
 //! # 未実装範囲（REPAIR-3）
 //!
 //! - masquerade ルール本体（`bitwise` / `meta` expr が `nftables_rules` に未実装のため `postrouting`
 //!   チェインは空。条件なし masq は host の全外向き通信を SNAT するため入れない）。TASK-139.3
-//! - netns 内の作業（peer 側の up・`lo` の up・アドレス付与・`eth0` へのリネーム）と IPAM（TASK-139.2.2・#848）、
-//!   default route・DNAT（TASK-139.3・#316）、ネットワークとコンテナ側資源の削除（TASK-139.4・#317）
+//! - netns 内の作業（peer 側の up・`lo` の up・払い出し済みアドレスの付与・`eth0` へのリネーム。担当 Issue 未確定）、
+//!   IPAM 状態の永続化（TASK-139.4 以降）、default route・DNAT（TASK-139.3・#316）、ネットワークとコンテナ側資源の削除（TASK-139.4・#317）
 //! - IPv6 と `NftFamily::Inet`（IPv4 のみ。静的 IPAM が IPv4 のみのため）
+
+pub mod ipam;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
+
+pub use ipam::StaticIpam;
 
 use crate::error::{NetError, NetErrorCode};
 #[cfg(target_os = "linux")]
@@ -741,6 +749,8 @@ pub struct ContainerAttachSpec {
     bridge_index: IfIndex,
     bridge_token: String,
     netns_dir: PathBuf,
+    network: NetworkName,
+    gateway: IpPrefix,
 }
 
 impl ContainerAttachSpec {
@@ -761,6 +771,8 @@ impl ContainerAttachSpec {
             bridge_index: network.bridge_index,
             bridge_token: network.bridge_token.clone(),
             netns_dir,
+            network: network.name.clone(),
+            gateway: network.gateway,
         })
     }
 
@@ -792,6 +804,8 @@ pub struct AttachedContainer<N> {
     pub peer_veth: IfName,
     /// netns の pin 先パス。
     pub netns_path: PathBuf,
+    /// 静的 IPAM で払い出したアドレス（netns 内への設定は未実施。REPAIR-3）。
+    pub address: IpPrefix,
     /// netns ハンドル（fd を保持する。解放は pin の unpin）。
     pub netns: N,
 }
@@ -816,6 +830,8 @@ pub enum AttachStep {
     SetUp,
     /// peer 側の netns への移動。
     MoveToNetns,
+    /// 静的 IPAM によるアドレス払い出し（対応しない IPAM なら資源を作る前に失敗する）。
+    AllocateAddress,
 }
 
 /// ロールバック対象のリソース。
@@ -968,7 +984,7 @@ fn rollback_veth<O: AttachOps>(
 /// 接続手順本体（OS 非依存。`ops` を差し替えて 3 OS で単体テストできる）。
 ///
 /// 手順: 名前導出 → bridge の名前 ↔ ifindex 確認 → netns 作成 → veth 作成 → 作成直後に両端の ifindex を
-/// 名前から解決 → host 側を bridge へ接続 → host 側 up → peer 側を netns へ移動。失敗時は自分が作った
+/// 名前から解決 → host 側を bridge へ接続 → host 側 up → peer 側を netns へ移動 → アドレス払い出し（IPAM。失敗時も veth・netns を戻し、IPAM の状態は変えない）。失敗時は自分が作った
 /// 部分資源（veth・netns）だけを戻し、元のエラーはロールバックの失敗で上書きしない。
 ///
 /// veth は所有トークン（`IFLA_IFALIAS`）を使えない（`LinkCreate::with_alias` は veth を拒否する）ため、
@@ -979,6 +995,7 @@ fn rollback_veth<O: AttachOps>(
 pub(crate) fn attach_container_with<O: AttachOps>(
     ops: &O,
     spec: &ContainerAttachSpec,
+    ipam: &mut StaticIpam,
 ) -> Result<AttachedContainer<O::Netns>, ContainerAttachError> {
     let fail = |error, step, rollback| ContainerAttachError {
         error,
@@ -987,6 +1004,18 @@ pub(crate) fn attach_container_with<O: AttachOps>(
     };
     let names = VethNames::derive(&spec.endpoint)
         .map_err(|e| fail(e, AttachStep::DeriveNames, AttachRollbackReport::default()))?;
+
+    // 別ネットワークの IPAM を渡す誤用は、何かを作る前に止める。
+    if ipam.network() != &spec.network || ipam.gateway() != spec.gateway {
+        return Err(fail(
+            NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "ipam pool does not belong to this network",
+            ),
+            AttachStep::AllocateAddress,
+            AttachRollbackReport::default(),
+        ));
+    }
 
     // 何かを作る前に、接続先が作成時の bridge のままであることを確認する。
     match ops.owned_bridge_index(&spec.bridge, &spec.bridge_token) {
@@ -1074,12 +1103,23 @@ pub(crate) fn attach_container_with<O: AttachOps>(
         return Err(abort(netns, report, error, step));
     }
 
+    // netns 内でのアドレス設定（後続）の直前に払い出す。失敗時は作った資源をすべて戻す。
+    let address = match ipam.allocate(&spec.endpoint) {
+        Ok(a) => a,
+        Err(e) => {
+            let mut report = AttachRollbackReport::default();
+            rollback_veth(ops, names.host(), host_index, &mut report);
+            return Err(abort(netns, report, e, AttachStep::AllocateAddress));
+        }
+    };
+
     Ok(AttachedContainer {
         endpoint: spec.endpoint.clone(),
         host_veth: names.host().clone(),
         host_index,
         peer_veth: names.peer().clone(),
         netns_path: pin,
+        address,
         netns,
     })
 }
@@ -1167,21 +1207,24 @@ impl AttachOps for LinuxAttachOps<'_> {
 /// コンテナをネットワークへ接続する（netns の作成と pin・veth ペアの作成・host 側の bridge 接続と up・
 /// peer 側の netns 移動。PoC-15 `netsetup` の `netns-create` / `veth-attach` に相当。NET-1・TASK-139.2.1）。
 ///
+/// 続けて `ipam` から重複しないアドレスを払い出す（TASK-139.2.2・#848）。
 /// 失敗時は自分が作った veth と netns だけを戻し、結果を [`ContainerAttachError::rollback`] で返す。
 /// `CAP_NET_ADMIN`（netlink）と `CAP_SYS_ADMIN`（`unshare` / `mount`）が必要で、本 crate は権限を上げない。
 /// `timeout` は各カーネル要求と netns 作成スレッドの待ちの期限（REPAIR-5）。
 ///
 /// # 未実装範囲（REPAIR-3）
-/// netns 内の作業（peer 側の up・`lo` の up・アドレス付与・default route・`eth0` へのリネーム）は
-/// 「対象 netns の中で開いた netlink ソケット」を要するため含まない。IPAM は TASK-139.2.2（#848）、
+/// 払い出したアドレスの netns 内への設定・peer 側と `lo` の up・`eth0` へのリネームは
+/// 「対象 netns の中で開いた netlink ソケット」を要するため含まない（担当 Issue 未確定）。IPAM 状態の
+/// 永続化と後続失敗時の `release` は呼び出し側・後続 Issue の責務。
 /// default route・DNAT は TASK-139.3（#316）、ネットワーク・コンテナ側資源の削除は TASK-139.4（#317）。
 #[cfg(target_os = "linux")]
 pub fn attach_container(
     route: &NetlinkRouteSocket,
     spec: &ContainerAttachSpec,
+    ipam: &mut StaticIpam,
     timeout: Duration,
 ) -> Result<AttachedContainer<ContainerNetns>, ContainerAttachError> {
-    attach_container_with(&LinuxAttachOps { route, timeout }, spec)
+    attach_container_with(&LinuxAttachOps { route, timeout }, spec, ipam)
 }
 #[cfg(test)]
 mod tests {
@@ -1739,6 +1782,10 @@ mod attach_tests {
         std::env::temp_dir().join("fc-netns")
     }
 
+    fn ipam() -> StaticIpam {
+        StaticIpam::for_network(&created()).unwrap()
+    }
+
     fn spec(id: &str) -> ContainerAttachSpec {
         ContainerAttachSpec::new(eid(id), &created(), netns_dir()).unwrap()
     }
@@ -1911,7 +1958,7 @@ mod attach_tests {
     #[test]
     fn net1_attach_success() {
         let f = Fake::default();
-        let a = attach_container_with(&f, &spec("web-1")).unwrap();
+        let a = attach_container_with(&f, &spec("web-1"), &mut ipam()).unwrap();
         let n = VethNames::derive(&eid("web-1")).unwrap();
         assert_eq!(
             f.calls(),
@@ -1930,6 +1977,90 @@ mod attach_tests {
         assert_eq!(a.host_veth, *n.host());
         assert_eq!(a.peer_veth, *n.peer());
         assert_eq!(a.netns_path, pin_of("web-1"));
+        assert_eq!(a.address, ip(2));
+    }
+
+    fn ip(last: u8) -> IpPrefix {
+        IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, last)), 24).unwrap()
+    }
+
+    /// NET-1・TASK-139.2.2: 同じ IPAM で続けて接続すると重複しないアドレスになる。
+    #[test]
+    fn net1_attach_allocates_distinct_addresses() {
+        let f = Fake::default();
+        let mut m = ipam();
+        let a = attach_container_with(&f, &spec("c1"), &mut m).unwrap();
+        let b = attach_container_with(&f, &spec("c2"), &mut m).unwrap();
+        assert_eq!(a.address, ip(2));
+        assert_eq!(b.address, ip(3));
+        assert_eq!(m.allocated_count(), 2);
+    }
+
+    /// 払い出し済みで枯渇した /30 の IPAM を作る。
+    fn exhausted_ipam() -> StaticIpam {
+        let mut net = created();
+        net.gateway = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 1)), 30).unwrap();
+        let mut m = StaticIpam::for_network(&net).unwrap();
+        m.allocate(&eid("other")).unwrap();
+        m
+    }
+
+    fn spec_for(id: &str, gateway_len: u8) -> ContainerAttachSpec {
+        let mut net = created();
+        net.gateway = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 1)), gateway_len).unwrap();
+        ContainerAttachSpec::new(eid(id), &net, netns_dir()).unwrap()
+    }
+
+    /// NET-1・ERR-1・TASK-139.2.2: プール枯渇で veth と netns をこの順に戻し、元のエラーを返す。
+    #[test]
+    fn net1_attach_pool_exhausted_rolls_back() {
+        let f = Fake::default();
+        let mut m = exhausted_ipam();
+        let e = attach_container_with(&f, &spec_for("c1", 30), &mut m).unwrap_err();
+        assert_eq!(e.step, AttachStep::AllocateAddress);
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "address pool exhausted");
+        let calls = f.calls();
+        assert_eq!(&calls[calls.len() - 2..], ["delete_link 21", "unpin_netns"]);
+        assert_eq!(
+            e.rollback.removed,
+            [
+                AttachResource::Veth(host_of("c1")),
+                AttachResource::Netns(pin_of("c1"))
+            ]
+        );
+        assert!(e.rollback.leftover.is_empty());
+        assert_eq!(m.allocated_count(), 1);
+    }
+
+    /// NET-1: 枯渇に veth 削除失敗が重なっても元のエラーは上書きしない。
+    #[test]
+    fn net1_attach_pool_exhausted_with_delete_failure() {
+        let f = Fake {
+            delete_err: Some(NetErrorCode::Internal),
+            ..Default::default()
+        };
+        let mut m = exhausted_ipam();
+        let e = attach_container_with(&f, &spec_for("c1", 30), &mut m).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(
+            e.rollback.leftover,
+            [(AttachResource::Veth(host_of("c1")), ResourceState::Present)]
+        );
+        assert_eq!(e.rollback.removed, [AttachResource::Netns(pin_of("c1"))]);
+    }
+
+    /// NET-1: 別ネットワークの IPAM は資源を作る前に FailedPrecondition で拒否する。
+    #[test]
+    fn net1_attach_ipam_mismatch_creates_nothing() {
+        let f = Fake::default();
+        let mut m =
+            StaticIpam::new(&NetworkName::new("other").unwrap(), created().gateway).unwrap();
+        let e = attach_container_with(&f, &spec("c1"), &mut m).unwrap_err();
+        assert_eq!(e.step, AttachStep::AllocateAddress);
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(f.calls().is_empty());
+        assert!(e.rollback.removed.is_empty() && e.rollback.leftover.is_empty());
     }
 
     /// NET-1: bridge の ifindex が作成時と違う（差し替え）なら、何も作らず拒否する。
@@ -1939,7 +2070,7 @@ mod attach_tests {
             bridge_index: Some(9),
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
         assert_eq!(f.calls().len(), 1);
         assert_eq!(e.step, AttachStep::VerifyBridge);
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
@@ -1949,7 +2080,7 @@ mod attach_tests {
             fail_bridge_lookup: true,
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
         assert_eq!(f.calls().len(), 1);
         assert_eq!(e.step, AttachStep::VerifyBridge);
         assert_eq!(e.code(), NetErrorCode::NotFound);
@@ -1961,7 +2092,7 @@ mod attach_tests {
         let mut sp = spec("c1");
         sp.bridge_token = "other-owner".to_owned();
         let f = Fake::default();
-        let e = attach_container_with(&f, &sp).unwrap_err();
+        let e = attach_container_with(&f, &sp, &mut ipam()).unwrap_err();
         assert_eq!(e.step, AttachStep::VerifyBridge);
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
         assert_eq!(f.calls().len(), 0);
@@ -1974,7 +2105,7 @@ mod attach_tests {
             fail_netns: Some((NetErrorCode::PermissionDenied, None)),
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
         assert_eq!(e.step, AttachStep::CreateNetns);
         assert_eq!(e.code(), NetErrorCode::PermissionDenied);
         assert_eq!(e.rollback, AttachRollbackReport::default());
@@ -1984,7 +2115,7 @@ mod attach_tests {
             fail_netns: Some((NetErrorCode::Timeout, Some(ResourceState::Unknown))),
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
         assert_eq!(
             e.rollback.leftover,
             [(AttachResource::Netns(pin_of("c1")), ResourceState::Unknown)]
@@ -1999,7 +2130,7 @@ mod attach_tests {
             fail_veth: Some(NetErrorCode::AlreadyExists),
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
         assert_eq!(e.step, AttachStep::CreateVeth);
         assert_eq!(e.code(), NetErrorCode::AlreadyExists);
         assert_eq!(e.message(), VETH_COLLISION_MSG);
@@ -2021,7 +2152,7 @@ mod attach_tests {
                 fail_veth: Some(code),
                 ..Default::default()
             };
-            let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+            let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
             assert_eq!(
                 e.rollback.leftover,
                 [(AttachResource::Veth(host_of("c1")), ResourceState::Unknown)],
@@ -2041,7 +2172,7 @@ mod attach_tests {
                 fail_peer_lookup: peer,
                 ..Default::default()
             };
-            let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+            let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
             assert_eq!(e.step, AttachStep::ResolveIndex);
             assert_eq!(
                 e.rollback.leftover,
@@ -2079,7 +2210,7 @@ mod attach_tests {
             ),
         ];
         for (f, step) in cases {
-            let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+            let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
             assert_eq!(e.step, step);
             assert_eq!(e.code(), NetErrorCode::Internal);
             assert_eq!(
@@ -2107,7 +2238,7 @@ mod attach_tests {
             unpin_fails: true,
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
         assert_eq!(e.step, AttachStep::MoveToNetns);
         assert_eq!(e.code(), NetErrorCode::PermissionDenied);
         assert!(e.rollback.removed.is_empty());
@@ -2124,7 +2255,7 @@ mod attach_tests {
             delete_err: Some(NetErrorCode::Timeout),
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1")).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
         assert_eq!(
             e.rollback.leftover,
             [(AttachResource::Veth(host_of("c1")), ResourceState::Unknown)]

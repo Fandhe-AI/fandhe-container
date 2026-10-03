@@ -59,7 +59,7 @@ mod linux {
     };
     use fandhe_container_net::network::{
         AttachResource, AttachStep, ContainerAttachSpec, CreateStep, EndpointId, NetworkCreateSpec,
-        NetworkName, VethNames, attach_container, create_network,
+        NetworkName, StaticIpam, VethNames, attach_container, create_network,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -339,8 +339,12 @@ mod linux {
 
         // --- 成功経路 ---
         let spec = ContainerAttachSpec::new(EndpointId::new("c1")?, &net, base.clone())?;
-        let attached = attach_container(&route, &spec, t)
+        let mut ipam = StaticIpam::for_network(&net)?;
+        let attached = attach_container(&route, &spec, &mut ipam, t)
             .map_err(|e| fail(format!("attach_container failed at {:?}: {e}", e.step)))?;
+        if attached.address != IpPrefix::new("10.213.0.2".parse().map_err(|_| fail("addr"))?, 24)? {
+            return Err(fail(format!("unexpected address {:?}", attached.address)));
+        }
         let host = attached.host_veth.as_str();
         let peer = attached.peer_veth.as_str();
 
@@ -409,7 +413,7 @@ mod linux {
             t,
         )?;
         let spec2 = ContainerAttachSpec::new(c2, &net, base.clone())?;
-        let e = match attach_container(&route, &spec2, t) {
+        let e = match attach_container(&route, &spec2, &mut ipam, t) {
             Err(e) => e,
             Ok(_) => return Err(fail("attach on a taken veth name unexpectedly succeeded")),
         };

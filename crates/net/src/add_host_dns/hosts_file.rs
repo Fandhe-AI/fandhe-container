@@ -274,19 +274,44 @@ fn verify_same_mount(root: &File, file: &File) -> Result<(), NetError> {
 
 /// 書き込み失敗後に書き込み前の長さへ戻し、結果に応じたエラーを返す。
 ///
-/// 巻き戻し（切り詰め + fsync）まで成功した場合のみ通常の `INTERNAL`（ファイルは元の内容）。
-/// 失敗した場合は不完全な行が残りうるため `DATA_LOSS` で区別する（再試行はその後ろへ追記してしまうため
-/// 呼び出し側は hosts ファイルを再生成するなど復旧が必要）。`sync_all` 失敗後の切り詰めも
-/// 永続化を確認するため再度 fsync する。
-fn rollback_after_failure(file: &File, len: u64) -> NetError {
-    if file.set_len(len).and_then(|_| file.sync_all()).is_ok() {
-        io_err("failed to write hosts file")
-    } else {
+/// `written` は今回の呼び出しが実際に書けたバイト数。切り詰める前に現在のサイズが `len + written` と
+/// 一致することを確かめ、一致しなければ（ロックを守らない他者が書き足した等）他者の内容を消さないよう
+/// 切り詰めずに `DATA_LOSS` を返す。巻き戻し（切り詰め + fsync）まで成功した場合のみ通常の `INTERNAL`
+/// （ファイルは元の内容）。失敗した場合は不完全な行が残りうるため `DATA_LOSS` で区別する（再試行は
+/// その後ろへ追記してしまうため、呼び出し側は hosts ファイルを再生成するなど復旧が必要）。`sync_all`
+/// 失敗後の切り詰めも永続化を確認するため再度 fsync する。
+fn rollback_after_failure(file: &File, len: u64, written: usize) -> NetError {
+    let data_loss = || {
         NetError::new(
             NetErrorCode::DataLoss,
             "failed to write hosts file and failed to roll back; file may be corrupted",
         )
+    };
+    let expected = u64::try_from(written).ok().and_then(|w| len.checked_add(w));
+    match file.metadata() {
+        Ok(m) if Some(m.len()) == expected => {}
+        _ => return data_loss(),
     }
+    if file.set_len(len).and_then(|_| file.sync_all()).is_ok() {
+        io_err("failed to write hosts file")
+    } else {
+        data_loss()
+    }
+}
+
+/// `buf` を書き切るまで `write` を繰り返し、実際に書けたバイト数と結果を返す（`write_all` と同じ挙動で、
+/// 失敗時にも書けた量が分かる。巻き戻しのサイズ照合に使う）。
+fn write_all_counted(file: &mut File, buf: &[u8]) -> (usize, std::io::Result<()>) {
+    let mut done = 0usize;
+    while let Some(rest) = buf.get(done..).filter(|r| !r.is_empty()) {
+        match file.write(rest) {
+            Ok(0) => return (done, Err(std::io::ErrorKind::WriteZero.into())),
+            Ok(n) => done = done.saturating_add(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return (done, Err(e)),
+        }
+    }
+    (done, Ok(()))
 }
 
 /// hosts ファイルの排他ロックを期限つきで取得する（プロセス間の直列化。REPAIR-5）。
@@ -381,11 +406,9 @@ pub(super) fn append_lines(
     }
     // 容量不足等で途中まで書いて失敗すると不完全な行が残り、再試行でその後ろへ追記されてしまう。
     // 排他ロックを保持したまま書き込み前の長さへ戻し、失敗後のファイルを元の状態に保つ。
-    let written = file
-        .write_all(payload.as_bytes())
-        .and_then(|_| file.sync_all());
-    if written.is_err() {
-        return Err(rollback_after_failure(&file, len));
+    let (written, res) = write_all_counted(&mut file, payload.as_bytes());
+    if res.and_then(|_| file.sync_all()).is_err() {
+        return Err(rollback_after_failure(&file, len, written));
     }
     Ok(())
 }
@@ -698,7 +721,7 @@ mod tests {
         let f = TmpFile::new("rollback-fail", Some("abc\n"));
         // 読み取り専用 fd では set_len が失敗する。
         let ro = File::open(&f.path).unwrap();
-        let e = rollback_after_failure(&ro, 0);
+        let e = rollback_after_failure(&ro, 0, 4);
         assert_eq!(e.code(), NetErrorCode::DataLoss);
         assert_eq!(std::fs::read(&f.path).unwrap(), b"abc\n");
     }
@@ -708,7 +731,7 @@ mod tests {
     fn rollback_success_restores_length_and_is_internal() {
         let f = TmpFile::new("rollback-ok", Some("abc\npartial"));
         let rw = OpenOptions::new().write(true).open(&f.path).unwrap();
-        let e = rollback_after_failure(&rw, 4);
+        let e = rollback_after_failure(&rw, 4, 7);
         assert_eq!(e.code(), NetErrorCode::Internal);
         assert_eq!(std::fs::read(&f.path).unwrap(), b"abc\n");
     }

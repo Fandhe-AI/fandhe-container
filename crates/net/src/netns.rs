@@ -283,11 +283,14 @@ pub(crate) fn create_pinned(
     let handoff: Arc<Handoff> = Arc::new((Mutex::new(Slot::Pending), Condvar::new()));
     let worker_handoff = Arc::clone(&handoff);
     let worker_pin = pin.clone();
+    // 時間切れ後もワーカーが完走するまで `unpin_path` を拒否させる（unlink との競合防止）。
+    let inflight = InflightGuard::new(&pin);
     let spawned = thread::Builder::new()
         .name("fandhe-netns".to_owned())
         .spawn(move || {
             // `file` を握ったまま mount することで、`/proc/self/fd/<n>` が差し替え不能な対象を指す。
             let _hold = file;
+            let inflight = inflight;
             let result = unshare_and_pin(&target);
             let (lock, cv) = &*worker_handoff;
             let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -295,7 +298,9 @@ pub(crate) fn create_pinned(
                 // 呼び出し側は期限切れで見切り済み。完了した副作用はこのスレッドが回収する。
                 drop(slot);
                 reclaim_abandoned(&pin_c, &worker_pin, result.is_ok());
+                drop(inflight);
             } else {
+                drop(inflight);
                 *slot = Slot::Done(result);
                 cv.notify_one();
             }
@@ -343,11 +348,13 @@ enum Slot {
 type Handoff = (Mutex<Slot>, Condvar);
 
 /// 見切られた後に完了したスレッドが、自分の副作用を戻す。`mounted` なら pin をアンマウントし、
-/// いずれの場合も自分が `create_new` で作った pin ファイルを削除する。失敗しても報告先は無い
-/// （呼び出し側へは時間切れ時点で `Unknown` を返済み）ため、ベストエフォート。
+/// アンマウントできた（またはマウントが無かった）場合だけ自分が `create_new` で作った pin ファイルを
+/// 削除する。アンマウントに失敗したら pin ファイルを残す（呼び出し側へ報告済みの pin パスから
+/// `unpin_path` で再試行できるようにするため。ファイルを消すとマウントが名前を失ってリークする）。
+/// 失敗しても報告先は無い（時間切れ時点で `Unknown` を返済み）。
 fn reclaim_abandoned(pin_c: &CStr, pin: &Path, mounted: bool) {
-    if mounted {
-        let _ = sys::unmount_detach(pin_c);
+    if mounted && sys::unmount_detach(pin_c).is_err() {
+        return;
     }
     let _ = fs::remove_file(pin);
 }
@@ -369,8 +376,16 @@ pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetn
 ///
 /// ロールバックで `unpin` が失敗するとハンドルは破棄され、マウントとファイルだけが残る。接続失敗の
 /// 報告（`AttachRollbackReport::leftover`）に載った pin パスをここへ渡すと、アンマウントとファイル削除を
-/// やり直せる。すでに消えている（`ENOENT`）・マウントされていない（`EINVAL`）は成功扱い（冪等）。
-/// 誤って他のパスを触らないよう、絶対パスで、かつ symlink・ディレクトリでない通常ファイルだけを対象にする。
+/// やり直せる。すでに消えている（`ENOENT`）場合は成功扱い（冪等）。
+///
+/// 任意ファイルの削除を防ぐため（P0）、次のすべてを満たす pin だけを対象にする（fail-closed）。
+/// - 絶対パスで、親ディレクトリが置き場の検証（symlink でない・group / other 書き込み不可・実効 UID 所有）に通る
+/// - `/proc/self/mountinfo` 上で、pin がマウントされていないか、`nsfs` としてマウントされている
+///   （他の種類のマウントは拒否）
+/// - アンマウント後の実体が、本モジュールが作った形（実効 UID 所有・mode `0o400`・サイズ 0 の通常ファイル）
+/// - `create_pinned` の時間切れ後も裏で動作中のワーカーが居る pin ではない（ワーカーが完了するまで
+///   `FailedPrecondition` で拒否する。unlink が先行すると、ワーカーが unlink 済み inode へ bind マウントして
+///   名前の無い netns マウントがリークするため。完了後に再試行すれば、回収済みか解除できる）
 pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
     if !pin.is_absolute() {
         return Err(NetError::new(
@@ -378,6 +393,19 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
             "netns pin path must be absolute",
         ));
     }
+    let (Some(parent), Some(name)) = (pin.parent(), pin.file_name()) else {
+        return Err(NetError::new(
+            NetErrorCode::InvalidArgument,
+            "netns pin path must name a file",
+        ));
+    };
+    if inflight_contains(pin) {
+        return Err(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "netns pin creation is still in progress; retry later",
+        ));
+    }
+    let euid = sys::effective_uid();
     match fs::symlink_metadata(pin) {
         Ok(m) if m.file_type().is_file() => {}
         Ok(_) => {
@@ -386,10 +414,134 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
                 "netns pin path is not a regular file",
             ));
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(io_error("stat netns pin", &e)),
     }
-    unpin_path_inner(pin)
+    check_base_dir(parent)?;
+    let real = fs::canonicalize(parent)
+        .map_err(|e| io_error("resolve netns directory", &e))?
+        .join(name);
+    let raw = fs::read("/proc/self/mountinfo").map_err(|e| io_error("read mountinfo", &e))?;
+    match pin_mount_state(&String::from_utf8_lossy(&raw), &real) {
+        PinMount::None => {}
+        PinMount::Nsfs => {
+            let c_path = CString::new(pin.as_os_str().as_bytes()).map_err(|_| {
+                NetError::new(NetErrorCode::InvalidArgument, "netns path contains NUL")
+            })?;
+            match sys::unmount_detach(&c_path) {
+                Ok(()) => {}
+                // 並行して外れた場合。実体の検査は下で行う。
+                Err(SysError::Os(e)) if e == sys::EINVAL || e == sys::ENOENT => {}
+                Err(e) => return Err(sys_error("umount", e)),
+            }
+        }
+        PinMount::Other => {
+            return Err(NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "netns pin path is mounted but not as a netns",
+            ));
+        }
+    }
+    // アンマウント後の実体を再検査する（重ねマウントが残っていれば nsfs の属性になり拒否される）。
+    match fs::symlink_metadata(pin) {
+        Ok(m) => check_pin_file_attrs(m.file_type().is_file(), m.mode(), m.uid(), m.len(), euid)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_error("stat netns pin", &e)),
+    }
+    match fs::remove_file(pin) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_error("remove netns pin file", &e)),
+    }
+}
+
+/// pin ファイルの実体検査（OS 呼び出しを含まない純粋関数）。`create_pinned` が作る形
+/// （通常ファイル・実効 UID 所有・mode `0o400`・空）だけを許す。
+fn check_pin_file_attrs(
+    is_file: bool,
+    mode: u32,
+    owner: u32,
+    len: u64,
+    euid: u32,
+) -> Result<(), NetError> {
+    if is_file && mode & 0o7777 == 0o400 && owner == euid && len == 0 {
+        Ok(())
+    } else {
+        Err(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "path is not a netns pin created by this crate",
+        ))
+    }
+}
+
+/// `mountinfo` 上での pin パスのマウント状態。
+#[derive(Debug, PartialEq, Eq)]
+enum PinMount {
+    /// マウントされていない。
+    None,
+    /// 最上位のマウントが `nsfs`（netns の bind マウント）。
+    Nsfs,
+    /// 最上位のマウントが `nsfs` 以外。
+    Other,
+}
+
+/// `mountinfo` から `pin`（正規化済みの絶対パス）をマウントポイントとする最上位（最後の行）のマウントを探す。
+fn pin_mount_state(mountinfo: &str, pin: &Path) -> PinMount {
+    let target = pin.as_os_str().as_bytes();
+    let mut state = PinMount::None;
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+        let Some(mp_field) = fields.get(4) else {
+            continue;
+        };
+        if unescape_mountinfo(mp_field) != target {
+            continue;
+        }
+        let fstype = fields
+            .iter()
+            .position(|f| *f == "-")
+            .and_then(|i| fields.get(i + 1));
+        state = if fstype == Some(&"nsfs") {
+            PinMount::Nsfs
+        } else {
+            PinMount::Other
+        };
+    }
+    state
+}
+
+/// `create_pinned` の使い捨てスレッドが動作中の pin パス（時間切れ後も含む）。`unpin_path` が
+/// 動作中のワーカーと競合して unlink しないよう参照する。
+static INFLIGHT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn inflight_contains(pin: &Path) -> bool {
+    INFLIGHT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|p| p == pin)
+}
+
+/// 動作中ワーカーの登録。drop で登録を外す（スレッド起動失敗でクロージャが破棄された場合も外れる）。
+struct InflightGuard(PathBuf);
+
+impl InflightGuard {
+    fn new(pin: &Path) -> Self {
+        INFLIGHT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(pin.to_owned());
+        Self(pin.to_owned())
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let mut v = INFLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(i) = v.iter().position(|p| *p == self.0) {
+            v.swap_remove(i);
+        }
+    }
 }
 
 /// アンマウント → ファイル削除。ENOENT（すでに消えている）・EINVAL（未マウント）は成功扱いで、
@@ -440,6 +592,94 @@ mod tests {
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
     }
 
+    /// NET-1: 通常ファイル（pin でないもの）は未マウントでも削除しない（P0: 任意ファイル削除の防止）。
+    #[test]
+    fn net1_unpin_path_keeps_foreign_regular_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("foreign");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let f = dir.join("precious");
+        fs::write(&f, b"data").unwrap();
+        let e = unpin_path(&f).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(fs::read(&f).unwrap(), b"data");
+        // 置き場として不適切（group / other 書き込み可）なディレクトリ配下は、形が pin でも拒否する。
+        let pin = dir.join("pinlike");
+        fs::write(&pin, b"").unwrap();
+        fs::set_permissions(&pin, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let e = unpin_path(&pin).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(pin.exists());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_file(&f).unwrap();
+        fs::remove_file(&pin).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    /// NET-1: 本 crate が作る形の空の pin ファイル（未マウントの残骸）は解除できる。
+    #[test]
+    fn net1_unpin_path_removes_leftover_pin_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("leftover");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let pin = dir.join("web-1");
+        fs::write(&pin, b"").unwrap();
+        fs::set_permissions(&pin, fs::Permissions::from_mode(0o400)).unwrap();
+        unpin_path(&pin).unwrap();
+        assert!(!pin.exists());
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    /// NET-1: 動作中ワーカーの pin は unlink せず拒否する（ワーカー完了後は通常どおり扱える）。
+    #[test]
+    fn net1_unpin_path_rejects_inflight_pin() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("inflight");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let pin = dir.join("web-1");
+        fs::write(&pin, b"").unwrap();
+        fs::set_permissions(&pin, fs::Permissions::from_mode(0o400)).unwrap();
+        let guard = InflightGuard::new(&pin);
+        let e = unpin_path(&pin).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(pin.exists());
+        drop(guard);
+        unpin_path(&pin).unwrap();
+        assert!(!pin.exists());
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    /// NET-1: pin ファイル実体検査の具体的な合否。
+    #[test]
+    fn net1_pin_file_attr_checks() {
+        assert!(check_pin_file_attrs(true, 0o100_400, 1000, 0, 1000).is_ok());
+        for (is_file, mode, owner, len, what) in [
+            (false, 0o040_400, 1000, 0, "not a file"),
+            (true, 0o100_444, 1000, 0, "nsfs-like mode"),
+            (true, 0o100_400, 0, 0, "other owner"),
+            (true, 0o100_400, 1000, 4, "non-empty"),
+        ] {
+            let e = check_pin_file_attrs(is_file, mode, owner, len, 1000).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::FailedPrecondition, "{what}");
+        }
+    }
+
+    /// NET-1: mountinfo 上の pin のマウント状態（最上位の fstype で判定）。
+    #[test]
+    fn net1_pin_mount_state_from_mountinfo() {
+        let info = "\
+50 30 0:4 net:[4026531992] /run/ns/a rw shared:9 - nsfs nsfs rw
+51 30 0:30 / /run/ns/b rw - tmpfs tmpfs rw
+52 30 0:4 net:[4026531993] /run/ns/c rw - nsfs nsfs rw
+53 30 0:30 / /run/ns/c rw - tmpfs tmpfs rw
+";
+        let st = |p: &str| pin_mount_state(info, Path::new(p));
+        assert_eq!(st("/run/ns/a"), PinMount::Nsfs);
+        assert_eq!(st("/run/ns/b"), PinMount::Other);
+        assert_eq!(st("/run/ns/c"), PinMount::Other);
+        assert_eq!(st("/run/ns/d"), PinMount::None);
+    }
     /// NET-1: 相対パスは受け付けない。
     #[test]
     fn net1_relative_base_dir_is_rejected() {

@@ -873,12 +873,22 @@ struct InflightSlot<'a>(&'a AtomicUsize);
 
 impl<'a> InflightSlot<'a> {
     fn try_acquire(inflight: &'a AtomicUsize) -> Option<Self> {
-        inflight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                (v < MAX_INFLIGHT_DEFERRED).then_some(v.saturating_add(1))
-            })
-            .ok()
-            .map(|_| Self(inflight))
+        // `fetch_update` は新しい toolchain で非推奨（`try_update` へ改名）のため、CAS ループで書く。
+        let mut cur = inflight.load(Ordering::Acquire);
+        loop {
+            if cur >= MAX_INFLIGHT_DEFERRED {
+                return None;
+            }
+            match inflight.compare_exchange_weak(
+                cur,
+                cur.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(inflight)),
+                Err(now) => cur = now,
+            }
+        }
     }
 }
 

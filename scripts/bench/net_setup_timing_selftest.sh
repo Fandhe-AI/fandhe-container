@@ -120,9 +120,25 @@ bad_case "不正 JSON は失敗" "cat '$good'; echo 'not json'"
 bad_case "件数不足は失敗" "head -n 10 '$good'"
 bad_case "未知の op は失敗" "sed 's/\"op\":\"net_delete\"/\"op\":\"net_other\"/' '$good'"
 bad_case "余分なキーは失敗" "sed 's/\"ok\":true/\"ok\":true,\"x\":1/' '$good'"
+bad_case "試行番号の重複は失敗" "sed 's/\"trial\":4,/\"trial\":3,/' '$good'"
+bad_case "試行番号の欠落（飛び番）は失敗" "sed 's/\"trial\":4,/\"trial\":7,/' '$good'"
+bad_case "ウォームアップ番号の不正は失敗" "sed 's/\"trial\":0,\"warmup\":true/\"trial\":1,\"warmup\":true/' '$good'"
+bad_case "出力サイズ超過は失敗" "cat '$good'; head -c 2000000 /dev/zero | tr '\\0' 'a'"
 bad_case "exe の非ゼロ終了は失敗" "cat '$good'; exit 7"
 make_stub "$bad_exe" "sleep 30"
 expect_rc "タイムアウトは失敗" 1 --exe "$bad_exe" --trials 5 --warmup 1 --timeout 1
+
+# --- タイムアウトで子孫プロセスが残らない ---
+pidfile="$tmp_root/child.pid"
+make_stub "$bad_exe" "sleep 300 & echo \$! >'$pidfile'; wait"
+expect_rc "タイムアウト（子孫あり）は失敗" 1 --exe "$bad_exe" --trials 5 --warmup 1 --timeout 1
+child_pid="$(cat "$pidfile" 2>/dev/null || true)"
+if [ -n "$child_pid" ] && ! kill -0 "$child_pid" 2>/dev/null; then
+  pass "タイムアウト後に子孫プロセスが残らない"
+else
+  fail "タイムアウト後に子孫プロセスが残っている (pid=$child_pid)"
+  [ -z "$child_pid" ] || kill -KILL "$child_pid" 2>/dev/null || true
+fi
 
 # --- 異常系: 入力エラー（rc=2）---
 expect_rc "--exe 必須" 2 --trials 5
@@ -136,6 +152,13 @@ chmod 775 "$writable_exe"
 expect_rc "group 書き込み可の exe" 2 --exe "$writable_exe" --trials 5 --warmup 1
 chmod 757 "$writable_exe"
 expect_rc "other 書き込み可の exe" 2 --exe "$writable_exe" --trials 5 --warmup 1
+chmod 755 "$writable_exe"
+loose_dir="$tmp_root/loose"
+mkdir -p "$loose_dir"
+make_stub "$loose_dir/exe" "cat '$good'"
+chmod 777 "$loose_dir"
+expect_rc "親ディレクトリが other 書き込み可の exe" 2 --exe "$loose_dir/exe" --trials 5 --warmup 1
+expect_rc "非正規パス（..）の exe" 2 --exe "$tmp_root/loose/../good_exe" --trials 5 --warmup 1
 expect_rc "trials 範囲外 (0)" 2 --exe "$good_exe" --trials 0
 expect_rc "trials 範囲外 (201)" 2 --exe "$good_exe" --trials 201
 expect_rc "warmup 範囲外 (21)" 2 --exe "$good_exe" --warmup 21
@@ -148,7 +171,7 @@ expect_rc "値の欠落" 2 --exe "$good_exe" --trials
 # --- 前提ツール欠如（rc=3）: PATH から jq を外す ---
 no_jq_dir="$tmp_root/nojq"
 mkdir -p "$no_jq_dir"
-for tool in timeout mktemp stat rm cat sleep grep; do
+for tool in timeout mktemp stat rm cat sleep grep setsid realpath chmod; do
   tool_path="$(command -v "$tool")"
   ln -s "$tool_path" "$no_jq_dir/$tool"
 done

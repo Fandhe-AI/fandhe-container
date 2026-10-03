@@ -26,8 +26,11 @@
 #
 # 使い方:
 #   net_setup_timing.sh --exe <絶対パス> [--trials N] [--warmup W] [--timeout SECS] [--label NAME] [--output FILE]
-#   --exe     network_paths_privileged のテスト実行ファイル（絶対パス・通常ファイル・symlink 不可・
-#             group/other 書き込み不可。root で実行するため、他者が差し替え得るバイナリを拒否する）
+#   --exe     network_paths_privileged のテスト実行ファイル（正規化済みの絶対パス・通常ファイル・
+#             symlink 不可・所有者は root か実行ユーザー・group/other 書き込み不可。祖先ディレクトリも
+#             同様に検証する〔sticky 付きは root 所有に限り許容〕。root で実行するため、他者が差し替え得る
+#             バイナリを拒否する。検証に使った fd から 0700 の私有ディレクトリへ複製し、複製を実行する
+#             〔検証対象と実行対象の同一性を保つ〕）
 #   --trials  計測試行数（1〜200・既定 20。PoC-15 と同じ）
 #   --warmup  ウォームアップ試行数（0〜20・既定 1。集計から除外）
 #   --timeout exe 全体の上限秒数（1〜3600・既定 600）
@@ -39,9 +42,10 @@
 #
 # 終了コード（startup_latency.sh と同じ形式。呼び出し元はこの具体値で分岐する）:
 #   0: 成功
-#   1: 計測失敗（exe の非ゼロ終了・タイムアウト・出力の検証失敗〔不正 JSON・ok:false・件数不足・未知の op〕）
+#   1: 計測失敗（exe の非ゼロ終了・タイムアウト・出力のサイズ超過・出力の検証失敗〔不正 JSON・ok:false・
+#      試行番号の欠落/重複・件数不足・未知の op〕）
 #   2: 入力エラー（引数・exe・output の検証失敗）
-#   3: 前提ツール欠如（bash・jq・timeout・mktemp・GNU 互換の stat -c）
+#   3: 前提ツール欠如（bash・jq・timeout・mktemp・setsid・realpath・GNU 互換の stat -c）
 
 set -euo pipefail
 umask 077
@@ -54,7 +58,7 @@ usage_error() {
   exit 2
 }
 
-for tool in jq timeout mktemp stat; do
+for tool in jq timeout mktemp stat setsid realpath cat chmod; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "net_setup_timing: required tool not found: $tool" >&2
     exit 3
@@ -114,11 +118,35 @@ case "$exe" in /*) ;; *) usage_error "--exe must be an absolute path" ;; esac
 if [ ! -f "$exe" ] || [ ! -x "$exe" ]; then
   usage_error "--exe must be an executable regular file"
 fi
-perm="$(stat -c '%a' -- "$exe")" || usage_error "cannot stat --exe"
-# group/other の書き込みビット（020・002）を検査する。
-if [ $((8#$perm & 8#022)) -ne 0 ]; then
-  usage_error "--exe must not be group/other writable"
-fi
+# 全パス要素が symlink・`..`・重複スラッシュを含まない正規形であることを要求する。
+canon="$(realpath -e -- "$exe" 2>/dev/null)" || usage_error "cannot resolve --exe"
+[ "$canon" = "$exe" ] || usage_error "--exe must be a canonical path (no symlink components)"
+
+self_uid="$(id -u)"
+# 所有者が root か実行ユーザーで、group/other 書き込み不可であることを検査する。
+# 祖先ディレクトリでは sticky（01000）付きかつ root 所有の場合のみ group/other 書き込みを許す（/tmp 等）。
+check_owner_perm() { # path allow_sticky_root
+  local p="$1" owner mode
+  owner="$(stat -c '%u' -- "$p")" || usage_error "cannot stat $p"
+  mode="$(stat -c '%a' -- "$p")" || usage_error "cannot stat $p"
+  if [ "$owner" != "0" ] && [ "$owner" != "$self_uid" ]; then
+    usage_error "$p must be owned by root or the current user"
+  fi
+  if [ $((8#$mode & 8#022)) -ne 0 ]; then
+    if [ "$2" = "yes" ] && [ "$owner" = "0" ] && [ $((8#$mode & 8#1000)) -ne 0 ]; then
+      return 0
+    fi
+    usage_error "$p must not be group/other writable"
+  fi
+}
+check_owner_perm "$exe" no
+dir="$(dirname -- "$exe")"
+while :; do
+  [ -d "$dir" ] && [ ! -L "$dir" ] || usage_error "--exe ancestor is not a plain directory: $dir"
+  check_owner_perm "$dir" yes
+  [ "$dir" != "/" ] || break
+  dir="$(dirname -- "$dir")"
+done
 
 if [ -n "$output" ]; then
   if [ -e "$output" ] || [ -L "$output" ]; then
@@ -126,14 +154,64 @@ if [ -n "$output" ]; then
   fi
 fi
 
-raw="$(mktemp)"
-trap 'rm -f "$raw"' EXIT
+work="$(mktemp -d)"
+raw="${work}/raw.jsonl"
+run_exe="${work}/exe"
+pgid=""
 
-# exe 全体に上限を設ける（REPAIR-5）。stdout は JSONL 専用、診断は stderr へ出る。
+# exe が起動した子孫（unshare・inner プロセス）を新セッションのプロセスグループごと終了して回収する。
+# namespace は所属プロセスの終了で解放される。timeout・中断（INT/TERM）・通常終了のいずれでも呼ぶ。
+kill_group() {
+  if [ -n "$pgid" ]; then
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+    wait "$pgid" 2>/dev/null || true
+    pgid=""
+  fi
+}
+cleanup() {
+  kill_group
+  rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+# 検証した fd から複製して複製を実行する（検証後の差し替え対策。TOCTOU 回避）。
+exec 3<"$exe" || usage_error "cannot open --exe"
+fd_owner="$(stat -L -c '%u' -- /proc/self/fd/3 2>/dev/null || stat -L -c '%u' -- "$exe")"
+fd_mode="$(stat -L -c '%a' -- /proc/self/fd/3 2>/dev/null || stat -L -c '%a' -- "$exe")"
+if { [ "$fd_owner" != "0" ] && [ "$fd_owner" != "$self_uid" ]; } || [ $((8#$fd_mode & 8#022)) -ne 0 ]; then
+  usage_error "--exe changed or has unsafe owner/permissions"
+fi
+cat <&3 >"$run_exe" || usage_error "cannot copy --exe"
+exec 3<&-
+chmod 700 "$run_exe"
+
+# stdout（JSONL 専用）の上限。(200+20)*3 行 × 約 100B ≒ 66KB に対し十分大きい 1MiB。超過書き込みは
+# ulimit -f（1024B 単位）で拒否し、集計（jq）の前に失敗させる。診断は stderr へ出る。
+readonly OUT_LIMIT_KIB=1024
+readonly OUT_LIMIT_BYTES=$((OUT_LIMIT_KIB * 1024))
+
+# exe 全体に上限を設ける（REPAIR-5）。新セッション（setsid）で起動し、グループ全体を制御する。
+(
+  ulimit -f "$OUT_LIMIT_KIB"
+  exec setsid timeout --kill-after=10 "$limit" "$run_exe" --measure --trials "$trials" --warmup "$warmup" >"$raw"
+) &
+pgid=$!
 rc=0
-timeout --kill-after=10 "$limit" "$exe" --measure --trials "$trials" --warmup "$warmup" >"$raw" || rc=$?
+wait "$pgid" || rc=$?
+# 正常終了後も残った子孫があれば回収する。
+kill_group
 if [ "$rc" -ne 0 ]; then
   echo "net_setup_timing: measurement failed (exit $rc)" >&2
+  exit 1
+fi
+raw_size="$(stat -c '%s' -- "$raw")" || {
+  echo "net_setup_timing: cannot stat measurement output" >&2
+  exit 1
+}
+if [ "$raw_size" -ge "$OUT_LIMIT_BYTES" ]; then
+  echo "net_setup_timing: measurement output too large (limit ${OUT_LIMIT_BYTES} bytes)" >&2
   exit 1
 fi
 
@@ -151,8 +229,11 @@ validate='
     and .ok == true)
   and ([.[] | select(.warmup | not)] | length == $trials * 3)
   and ([.[] | select(.warmup)] | length == $warmup * 3)
-  and ([.[] | select(.warmup | not)] | group_by(.trial)
-       | length == $trials and all(.[]; (map(.op) | sort) == ["container_attach","net_create","net_delete"]))
+  and (. as $rows
+       | all(["net_create","container_attach","net_delete"][];
+             . as $op
+             | ([$rows[] | select(.op == $op and .warmup == true) | .trial] | sort) == [range(0; $warmup)]
+               and ([$rows[] | select(.op == $op and .warmup == false) | .trial] | sort) == [range(0; $trials)]))
 '
 if ! jq -s -e --argjson expected "$expected" --argjson trials "$trials" --argjson warmup "$warmup" \
   "$validate" "$raw" >/dev/null 2>&1; then

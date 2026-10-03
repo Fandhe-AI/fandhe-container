@@ -17,8 +17,9 @@
 //! 操作ごとの成功 / 失敗・所要時間の記録先を受け取る計装連携点（`instrument`。REPAIR-4）、ネットワーク作成処理（bridge・gateway・専用 nft テーブルと NAT base chain の作成と失敗時ロールバック。
 //! `RTM_DELLINK`・ifindex 取得を含む。`network`。TASK-139.1・#314）と、コンテナ接続（netns の作成と pin〔`netns`。Linux のみ〕・
 //! veth ペア作成・host 側の bridge 接続と up・peer 側の netns 移動と失敗時ロールバック。`network::attach_container`。静的 IPAM（`network::ipam::StaticIpam`。TASK-139.2.2・#848）によるアドレス払い出しと、枯渇時の veth・netns ロールバック。
-//! `unshare` / `mount` は `sys` の薄いラッパー。TASK-139.2.1・#847）も持つ。link の down、
-//! masquerade ルール本体（nftables の bitwise / meta expr が前提）・ルールハンドルの取得経路（TASK-139.3 以降）、DNS ヘルパー等は未実装で、G10（TASK-136〜148・TASK-185〜186）で実装する（REPAIR-3）。
+//! `unshare` / `mount` は `sys` の薄いラッパー。TASK-139.2.1・#847）に加え、netns 内の `lo` / peer の up・アドレス付与・default route の設定と、
+//! ポート公開指定の DNAT ルール一括投入（`network::PortPublish`。TASK-139.3・#316）も持つ。link の down、
+//! masquerade ルール本体（nftables の bitwise / meta expr が前提）・ルールハンドルの取得経路・`eth0` へのリネーム、DNS ヘルパー等は未実装で、G10（TASK-136〜148・TASK-185〜186）で実装する（REPAIR-3）。
 //! PLUG-1 区分は検討中
 //! （制御面の `NetworkPlugin` は plugin 側に区分される一方、DNS ヘルパー・rootless 転送のデータパス
 //! 判定は未確定。crate-naming.md）。確定扱いにはしない（spec-reference）。

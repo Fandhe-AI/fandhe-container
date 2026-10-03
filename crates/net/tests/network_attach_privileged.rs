@@ -59,7 +59,8 @@ mod linux {
     };
     use fandhe_container_net::network::{
         AttachResource, AttachStep, ContainerAttachSpec, CreateStep, EndpointId, NetworkCreateSpec,
-        NetworkName, StaticIpam, VethNames, attach_container, create_network,
+        NetworkName, PortProtocol, PortPublish, PortRegistry, StaticIpam, VethNames,
+        attach_container, create_network,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -340,7 +341,8 @@ mod linux {
         // --- 成功経路 ---
         let spec = ContainerAttachSpec::new(EndpointId::new("c1")?, &net, base.clone())?;
         let mut ipam = StaticIpam::for_network(&net)?;
-        let attached = attach_container(&route, &spec, &mut ipam, t)
+        let mut ports = PortRegistry::new();
+        let attached = attach_container(&route, &nft, &spec, &mut ipam, &mut ports, t)
             .map_err(|e| fail(format!("attach_container failed at {:?}: {e}", e.step)))?;
         if attached.address != IpPrefix::new("10.213.0.2".parse().map_err(|_| fail("addr"))?, 24)? {
             return Err(fail(format!("unexpected address {:?}", attached.address)));
@@ -405,6 +407,29 @@ mod linux {
             )));
         }
 
+        // netns 内の設定（TASK-139.3・#316）: default route が gateway 経由で peer から出る。
+        // /proc/net/route の Destination・Gateway・Mask は 16 進のリトルエンディアン（10.213.0.1 = 0100D50A）。
+        let route_table = run_cmd(
+            "nsenter",
+            &[&format!("--net={pin_str}"), "cat", "/proc/net/route"],
+        )?;
+        let default_routes: Vec<&str> = route_table
+            .lines()
+            .filter(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.first() == Some(&peer)
+                    && f.get(1) == Some(&"00000000")
+                    && f.get(7) == Some(&"00000000")
+            })
+            .collect();
+        if default_routes.len() != 1
+            || default_routes[0].split_whitespace().nth(2) != Some("0100D50A")
+        {
+            return Err(fail(format!(
+                "expected exactly one default route via 10.213.0.1 on {peer}, got {default_routes:?}"
+            )));
+        }
+
         // --- ロールバック経路: host 側 veth 名を先に塞ぎ、AlreadyExists で失敗させる ---
         let c2 = EndpointId::new("c2")?;
         let names = VethNames::derive(&c2)?;
@@ -413,7 +438,7 @@ mod linux {
             t,
         )?;
         let spec2 = ContainerAttachSpec::new(c2, &net, base.clone())?;
-        let e = match attach_container(&route, &spec2, &mut ipam, t) {
+        let e = match attach_container(&route, &nft, &spec2, &mut ipam, &mut ports, t) {
             Err(e) => e,
             Ok(_) => return Err(fail("attach on a taken veth name unexpectedly succeeded")),
         };
@@ -438,6 +463,34 @@ mod linux {
         }
         link_state(&route, names.host().as_str())
             .map_err(|_| fail("the pre-existing veth must not be deleted by the rollback"))?;
+
+        // --- ポート公開（TASK-139.3・#316）: DNAT ルールが専用テーブルの両チェインに入る ---
+        let publish = PortPublish::new(
+            PortProtocol::Tcp,
+            "192.0.2.10".parse().map_err(|_| fail("addr"))?,
+            8080,
+            80,
+        )?;
+        let spec3 = ContainerAttachSpec::new(EndpointId::new("c3")?, &net, base.clone())?
+            .with_port_publishes(vec![publish])?;
+        let attached3 =
+            attach_container(&route, &nft, &spec3, &mut ipam, &mut ports, t).map_err(|e| {
+                fail(format!(
+                    "attach with port publish failed at {:?}: {e}",
+                    e.step
+                ))
+            })?;
+        let ruleset = run_cmd("nft", &["list", "table", "ip", net.table.as_str()])?;
+        let dnat_lines = ruleset
+            .lines()
+            .filter(|l| l.contains("dnat to") && l.contains("192.0.2.10") && l.contains("8080"))
+            .filter(|l| l.contains(&attached3.address.addr().to_string()) && l.contains(":80"))
+            .count();
+        if dnat_lines != 2 {
+            return Err(fail(format!(
+                "expected 2 DNAT rules (prerouting and output), found {dnat_lines} in:\n{ruleset}"
+            )));
+        }
         Ok(())
     }
 }

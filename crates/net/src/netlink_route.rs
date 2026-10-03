@@ -565,8 +565,34 @@ mod socket {
             open_fd: fn() -> Result<OwnedFd, SysError>,
             ack_opts: bool,
         ) -> Result<Self, NetError> {
+            Self::from_fd_with(
+                recorder,
+                || open_fd().map_err(|e| map_sys_error("socket", e)),
+                ack_opts,
+            )
+        }
+
+        /// 別スレッドで（別 netns の中で）開いた未 bind の `NETLINK_ROUTE` ソケットから組み立てる
+        /// （TASK-139.3・#316）。netlink ソケットは作成時の netns に束縛されるため、コンテナ netns の
+        /// 中の address / route を操作するには、その netns に入った使い捨てスレッドで fd を開き、
+        /// bind 以降を本関数で呼び出し側スレッドが行う（`crate::netns::create_pinned` が使う）。
+        /// 挙動は [`open_with_recorder`](Self::open_with_recorder) と同じ（bind・拡張 ACK 有効化）。
+        #[cfg(target_os = "linux")]
+        pub(crate) fn from_unbound_route_fd(
+            fd: OwnedFd,
+            recorder: Arc<dyn NetOpRecorder>,
+        ) -> Result<Self, NetError> {
+            Self::from_fd_with(recorder, || Ok(fd), true)
+        }
+
+        /// `make_fd` が返す未 bind の fd を bind して組み立てる共通部。
+        fn from_fd_with(
+            recorder: Arc<dyn NetOpRecorder>,
+            make_fd: impl FnOnce() -> Result<OwnedFd, NetError>,
+            ack_opts: bool,
+        ) -> Result<Self, NetError> {
             let (fd, local_pid) = record_net_op(recorder.as_ref(), NetOpKind::NetlinkOpen, || {
-                let fd = open_fd().map_err(|e| map_sys_error("socket", e))?;
+                let fd = make_fd()?;
                 sys::bind_kernel_assigned(fd.as_fd()).map_err(|e| map_sys_error("bind", e))?;
                 let raw =
                     sys::local_nl_pid(fd.as_fd()).map_err(|e| map_sys_error("getsockname", e))?;
@@ -1729,6 +1755,16 @@ mod socket {
                 e.to_string(),
                 "INVALID_ARGUMENT: netlink request failed: errno 22: Unknown device type (at offset 36)"
             );
+        }
+
+        /// NET-1・TASK-139.3: 別スレッドで開いた未 bind の fd から組み立てても bind 済み（`local_pid` が非 0）になり、
+        /// 拡張 ACK が有効になる。
+        #[test]
+        fn from_unbound_route_fd_binds_the_socket() {
+            let fd = sys::open_route_socket().expect("open");
+            let s = NetlinkRouteSocket::from_unbound_route_fd(fd, Arc::new(NoopNetOpRecorder))
+                .expect("build");
+            assert_ne!(s.local_pid().get(), 0);
         }
 
         /// NET-11: ACK オプションの設定に失敗しても open 相当は成功扱い（両方 false）。片方だけの失敗も反映。

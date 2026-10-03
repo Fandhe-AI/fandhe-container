@@ -24,3 +24,10 @@ harness = false
 name = "nftables_masq_privileged"
 path = "tests/nftables_masq_privileged.rs"
 harness = false
+
+# 3 netns（container / router / external）での DNAT・ハンドル指定削除の実機結合試験（NET-11・TASK-138.3・#311）。
+# 子の再入（--child）と root 前提の分離のため harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "nftables_dnat_privileged"
+path = "tests/nftables_dnat_privileged.rs"
+harness = false

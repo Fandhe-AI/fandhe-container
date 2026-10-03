@@ -35,7 +35,7 @@ use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use fandhe_container_net::error::{NetError, NetErrorCode};
-use fandhe_container_net::nftables_batch::{ChainInfo, ChainPolicy};
+use fandhe_container_net::nftables_batch::{ChainInfo, ChainPolicy, NfInetHook};
 
 /// sysctl・`/proc` の読み取り上限（バイト）。想定値は 1 文字なので小さく抑える。
 const MAX_PROC_READ: u64 = 4096;
@@ -48,6 +48,10 @@ const BR_NF_CALL_IPTABLES: &str = "proc/sys/net/bridge/bridge-nf-call-iptables";
 /// procfs が未マウントだと `BR_NF_CALL_IPTABLES` も `NotFound` になり、未ロードと区別できないため、
 /// 常に存在する `/proc/sys/net` を先に確認する。
 const PROC_SYS_NET: &str = "proc/sys/net";
+
+/// procfs にだけ存在する `/proc/self`（シンボリックリンク）。通常のディレクトリが `/proc/sys/net` を
+/// 偽装していても、これが無ければ procfs 上とは確認できない。
+const PROC_SELF: &str = "proc/self";
 
 /// iptables-legacy が使うテーブル名の一覧（root からの相対）。
 const IP_TABLES_NAMES: &str = "proc/net/ip_tables_names";
@@ -143,12 +147,15 @@ impl BrNetfilterProbe {
             // NotFound は procfs が参照可能と確認できた場合に限り未ロードとする
             // （未マウントの procfs を未ロードと誤判定しない fail-closed。NET-10）。
             Err(e) if e.kind() == ErrorKind::NotFound => {
+                let is_procfs = std::fs::symlink_metadata(self.root.join(PROC_SELF))
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
                 match std::fs::metadata(self.root.join(PROC_SYS_NET)) {
-                    Ok(m) if m.is_dir() => BrNetfilterState::NotLoaded,
+                    Ok(m) if m.is_dir() && is_procfs => BrNetfilterState::NotLoaded,
                     Ok(_) => BrNetfilterState::Unknown {
                         reason: DoctorProbeError {
                             code: NetErrorCode::Internal.as_str().to_string(),
-                            message: "procfs net sysctl directory is not a directory".to_string(),
+                            message: "procfs mount could not be confirmed".to_string(),
                         },
                     },
                     Err(e2) => BrNetfilterState::Unknown {
@@ -248,6 +255,16 @@ pub fn probe_forward_policy(source: &dyn ForwardPolicySource, root: &Path) -> Fo
     }
     match source.forward_policy() {
         Ok(info) => match info.policy() {
+            // 同名でも別 hook の base chain の policy を転送経路のものとして返さない
+            // （hook が forward と確認できなければ判定不能。fail-closed。NET-10）。
+            Some(_) if info.hook() != Some(NfInetHook::Forward.value()) => {
+                ForwardPolicyState::Unknown {
+                    reason: DoctorProbeError {
+                        code: NetErrorCode::DataLoss.as_str().to_string(),
+                        message: "FORWARD chain is not hooked to the forward hook".to_string(),
+                    },
+                }
+            }
             Some(p) => ForwardPolicyState::Policy(p),
             None => ForwardPolicyState::NotBaseChain,
         },
@@ -334,7 +351,19 @@ mod tests {
     }
 
     fn reply(policy: Option<u32>) -> Vec<u8> {
+        reply_with_hook(policy, Some(2))
+    }
+
+    /// `hook` は `NFTA_HOOK_HOOKNUM`（`None` は hook 属性なし）。
+    fn reply_with_hook(policy: Option<u32>, hook: Option<u32>) -> Vec<u8> {
         let mut p = vec![2u8, 0, 0, 0];
+        if let Some(h) = hook {
+            p.extend_from_slice(&12u16.to_ne_bytes());
+            p.extend_from_slice(&(4u16 | 0x8000).to_ne_bytes());
+            p.extend_from_slice(&8u16.to_ne_bytes());
+            p.extend_from_slice(&1u16.to_ne_bytes());
+            p.extend_from_slice(&h.to_be_bytes());
+        }
         if let Some(v) = policy {
             p.extend_from_slice(&8u16.to_ne_bytes());
             p.extend_from_slice(&5u16.to_ne_bytes());
@@ -347,6 +376,7 @@ mod tests {
         let t = TempRoot::new();
         // procfs が参照できる環境を模す（`/proc/sys/net` が存在する）。
         std::fs::create_dir_all(t.0.join(PROC_SYS_NET)).expect("mkdir");
+        std::os::unix::fs::symlink("1", t.0.join(PROC_SELF)).expect("symlink");
         if let Some(v) = value {
             t.write(BR_NF_CALL_IPTABLES, v);
         }
@@ -376,6 +406,15 @@ mod tests {
         assert!(matches!(st, BrNetfilterState::Unknown { .. }), "{st:?}");
     }
 
+    /// NET-10: `/proc/sys/net` が通常ディレクトリで procfs と確認できない場合は NotLoaded でなく Unknown。
+    #[test]
+    fn net10_br_netfilter_plain_directory_is_unknown() {
+        let t = TempRoot::new();
+        std::fs::create_dir_all(t.0.join(PROC_SYS_NET)).expect("mkdir");
+        let st = BrNetfilterProbe::with_root(t.0.clone()).probe();
+        assert!(matches!(st, BrNetfilterState::Unknown { .. }), "{st:?}");
+    }
+
     /// NET-10: policy の取得結果が各状態に対応する。
     #[test]
     fn net10_forward_policy_states() {
@@ -390,6 +429,16 @@ mod tests {
             ForwardPolicyState::Policy(ChainPolicy::Accept)
         );
         assert_eq!(st(Mock(Ok(reply(None)))), ForwardPolicyState::NotBaseChain);
+        // 別 hook（prerouting）・hook 属性なしの base chain は転送経路の policy として返さない。
+        for hook in [Some(0), None] {
+            assert!(
+                matches!(
+                    st(Mock(Ok(reply_with_hook(Some(0), hook)))),
+                    ForwardPolicyState::Unknown { .. }
+                ),
+                "hook={hook:?}"
+            );
+        }
         assert_eq!(
             st(Mock(Err(NetErrorCode::PermissionDenied))),
             ForwardPolicyState::PermissionDenied

@@ -233,6 +233,7 @@ fn net10_chain_info_reads_policy_of_base_chain_in_isolated_netns() {
         .expect("GETCHAIN of an existing base chain");
     assert!(started.elapsed() < limit);
     assert_eq!(info.policy(), Some(ChainPolicy::Accept));
+    assert_eq!(info.hook(), Some(NfInetHook::Forward.value()));
 
     // 存在しないチェインは NotFound（テーブルはあるがチェインが無い）。
     let err = socket

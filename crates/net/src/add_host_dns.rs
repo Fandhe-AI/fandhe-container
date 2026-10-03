@@ -10,18 +10,20 @@
 //! `::1` 等の IPv6 表記をそのまま渡せる）。検証済みエントリはコンテナの hosts ファイルへ追記できる
 //! （[`apply_add_hosts`]。TASK-185.2・#345）。追記先は「管理ルート（コンテナ状態ディレクトリ）」と
 //! そこからの相対パスで指定し、ルート配下の既存の通常ファイルに限る（`/etc/hosts` のような管理外の
-//! ファイルは絶対パス・`..`・symlink 経由のいずれでも指せない）。ネットワークモード
-//! （bridge / host / none）を引数に取らないため全モードで同じ処理になる。hosts ファイルの生成・
-//! コンテナへの bind mount は runtime / core 側の責務で、本モジュールは既存の通常ファイルへ追記するだけ
+//! ファイルは絶対パス・`..`・symlink・管理ルート内の bind mount 経由のいずれでも指せない）。
+//! ネットワークモード（bridge / host / none）を引数に取らないため全モードで同じ処理になる。hosts ファイルの
+//! 生成・コンテナへの bind mount は runtime / core 側の責務で、本モジュールは既存の通常ファイルへ追記するだけ
 //! （無ければ作らず `NOT_FOUND`）。
 //! 追記先は symlink（途中ディレクトリを含む）・ハードリンク（nlink != 1）・他ユーザー所有を拒否し、
 //! 書き込み失敗時は同じロック下で書き込み前の長さへ戻す。巻き戻しにも失敗した場合は
 //! 不完全な行が残りうるため `DATA_LOSS` で通常の失敗と区別して返す。
 //!
-//! 上流転送（TASK-185.3）・host/none の `--dns` 反映と none モードでの loopback 制限（TASK-185.4）は
-//! 未実装（REPAIR-3）。エラーの `message` は固定の英語文字列で、
+//! host/none の `--dns` 反映と none の loopback 制限は子モジュール `resolv_conf`（TASK-185.4・#347）。
+//! 上流転送（TASK-185.3）は未実装（REPAIR-3）。エラーの `message` は固定の英語文字列で、
 //! 入力値を載せない（ログ・ファイルへの行注入を防ぐ）。`dns_helper::DnsName`（小文字化・末尾ドット除去）
 //! とは意味論が異なり、ここでは入力をそのまま保持し、末尾ドット（空ラベル）は拒否する。
+
+pub mod resolv_conf;
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -77,6 +79,8 @@ pub enum InputViolation {
     AddHostTooLong,
     /// `--add-host` の件数が上限（[`MAX_ADD_HOST_ENTRIES`]）を超える。
     TooManyAddHosts,
+    /// none モードで loopback 以外の `--dns` を指定した。
+    NotLoopbackForNoneMode,
 }
 
 impl InputViolation {
@@ -93,6 +97,7 @@ impl InputViolation {
             Self::MissingHostIpSeparator => "MISSING_SEPARATOR",
             Self::AddHostTooLong => "ADD_HOST_TOO_LONG",
             Self::TooManyAddHosts => "TOO_MANY_ADD_HOSTS",
+            Self::NotLoopbackForNoneMode => "NOT_LOOPBACK_FOR_NONE_MODE",
         }
     }
 
@@ -111,6 +116,9 @@ impl InputViolation {
             Self::MissingHostIpSeparator => "invalid add-host: expected <hostname>:<ip>",
             Self::AddHostTooLong => "invalid add-host: entry is too long",
             Self::TooManyAddHosts => "invalid add-host: too many entries",
+            Self::NotLoopbackForNoneMode => {
+                "invalid --dns for none network mode: only loopback addresses (127.0.0.0/8, ::1) are allowed"
+            }
         }
     }
 }
@@ -178,7 +186,7 @@ impl HostName {
 ///
 /// std のパーサに従い fail-closed: 先頭ゼロのオクテット（`010.0.0.1`）・ゾーン ID（`fe80::1%eth0`）・
 /// 角括弧（`[::1]`）・CIDR（`1.2.3.4/24`）は拒否し、IPv4 射影（`::ffff:192.0.2.1`）は受理する。
-/// アドレス種別（loopback 等）の制限は行わない（none モードの制限は TASK-185.4）。
+/// アドレス種別（loopback 等）の制限は行わない（none モードの loopback 制限は `resolv_conf` が行う。TASK-185.4）。
 pub fn parse_ip_addr(s: &str) -> Result<IpAddr, NetError> {
     if has_control_or_whitespace(s) {
         return Err(InputViolation::ControlOrWhitespace.into());
@@ -773,6 +781,10 @@ mod tests {
             (InputViolation::MissingHostIpSeparator, "MISSING_SEPARATOR"),
             (InputViolation::AddHostTooLong, "ADD_HOST_TOO_LONG"),
             (InputViolation::TooManyAddHosts, "TOO_MANY_ADD_HOSTS"),
+            (
+                InputViolation::NotLoopbackForNoneMode,
+                "NOT_LOOPBACK_FOR_NONE_MODE",
+            ),
         ];
         for (v, s) in table {
             assert_eq!(v.as_str(), s);

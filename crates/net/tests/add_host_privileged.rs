@@ -104,6 +104,8 @@ mod linux {
         require_root_and_tools();
         let dir = std::env::temp_dir().join(format!("fandhe-addhost-test-{}", std::process::id()));
         fs::create_dir(&dir).expect("create temp dir");
+        // 管理ルートは symlink を含まない絶対パスで渡す契約（`apply_add_hosts` は正規化しない）。
+        let dir = fs::canonicalize(&dir).expect("canonicalize temp dir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
         let exe = std::env::current_exe().expect("current_exe");
         let mut child = Command::new("unshare")

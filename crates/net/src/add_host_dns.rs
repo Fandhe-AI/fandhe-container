@@ -247,7 +247,8 @@ pub fn render_hosts_lines(entries: &[AddHostEntry]) -> String {
 
 /// 検証済みエントリをコンテナの hosts ファイルへ追記する（NET-12・TASK-185.2）。
 ///
-/// `managed_root` は管理ルート（コンテナ状態ディレクトリ）、`hosts_rel` はその配下の hosts ファイルへの
+/// `managed_root` は管理ルート（コンテナ状態ディレクトリ）で、symlink を含まない絶対パスで渡す（正規化せず、
+/// 管理ルート自身・祖先が symlink なら `FAILED_PRECONDITION`）。`hosts_rel` はその配下の hosts ファイルへの
 /// 相対パスで、ネットワークモードに依存しない。ルート外（絶対パス・`..`・symlink・管理ルート内の
 /// bind mount 経由）は指せない。既存の通常ファイルにのみ追記し（無ければ `NOT_FOUND` で作成しない）、
 /// tmp + rename は使わない（bind mount 済みファイルの inode を保つため）。境界の守り方・ロック・巻き戻しは

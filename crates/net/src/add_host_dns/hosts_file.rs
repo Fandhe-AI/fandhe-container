@@ -4,8 +4,9 @@
 //! 「管理ルート（コンテナ状態ディレクトリ）」とそこからの相対パスで指定する。
 //!
 //! # 境界の守り方（rootfs・マウント境界の P0）
-//! - 管理ルートは `canonicalize` 後に `/` から 1 要素ずつ `O_DIRECTORY | O_NOFOLLOW` で辿り直して開き
-//!   （祖先の symlink 差し替えによるすり替えを辿らない）、そのディレクトリ fd を起点に相対パスの各要素を
+//! - 管理ルートは symlink を含まない絶対パスで受け取り、正規化（`canonicalize`）せずに `/` から 1 要素ずつ
+//!   `O_DIRECTORY | O_NOFOLLOW` で辿って開く（管理ルート自身・祖先のどれかが symlink なら辿らず拒否する）。
+//!   そのディレクトリ fd を起点に相対パスの各要素を
 //!   `openat(O_NOFOLLOW)`（`crate::sys` の薄いラッパー）で 1 要素ずつ辿って開く。途中・最終要素が
 //!   symlink（検証後の差し替えを含む）なら `ELOOP` / `ENOTDIR` で失敗するため、パスを再解決する検査と
 //!   open の間の競合（TOCTOU）で管理外のファイルを開くことはない。`..`・絶対パス・`.` は辿る前に拒否する。
@@ -86,11 +87,13 @@ fn unsupported() -> NetError {
     )
 }
 
-/// 管理ルートの絶対パス `abs`（`canonicalize` 済み）を `/` から 1 要素ずつ `openat(O_NOFOLLOW |
-/// O_DIRECTORY)` で辿ってディレクトリ fd を得る（`canonicalize` 後に祖先が symlink へ差し替えられても
-/// 辿らず失敗する。祖先の再解決による管理ルートのすり替えを防ぐ）。
+/// 管理ルートの絶対パス `abs` を、symlink を辿らずに `/` から 1 要素ずつ `openat(O_NOFOLLOW |
+/// O_DIRECTORY)` で開いてディレクトリ fd を得る。
 ///
-/// 祖先が symlink・非ディレクトリなら `FAILED_PRECONDITION`、不在なら `NOT_FOUND`。
+/// 正規化（`canonicalize`）はしない。正規化すると渡されたパス上の symlink を先に辿ってしまい、リンク先
+/// （管理外のディレクトリ）を管理ルートとして扱うことになるため。相対パス・`..` / `.` を含むパスは
+/// `INVALID_ARGUMENT`、管理ルート自身・祖先が symlink または非ディレクトリなら `FAILED_PRECONDITION`、
+/// 不在なら `NOT_FOUND`。
 fn open_abs_dir_nofollow(abs: &Path) -> Result<OwnedFd, NetError> {
     let map = |e: SysError| match e {
         SysError::Os(sys::ENOENT) => {
@@ -107,14 +110,20 @@ fn open_abs_dir_nofollow(abs: &Path) -> Result<OwnedFd, NetError> {
         SysError::Unsupported => unsupported(),
         _ => io_err("failed to open managed root"),
     };
+    let not_normalized = || {
+        NetError::new(
+            NetErrorCode::InvalidArgument,
+            "managed root must be a normalized absolute path",
+        )
+    };
     let mut comps = abs.components();
     if comps.next() != Some(Component::RootDir) {
-        return Err(io_err("managed root is not an absolute path"));
+        return Err(not_normalized());
     }
     let mut cur = sys::open_dir_nofollow(c"/").map_err(map)?;
     for c in comps {
         let Component::Normal(n) = c else {
-            return Err(io_err("managed root is not a normalized path"));
+            return Err(not_normalized());
         };
         let name =
             CString::new(n.as_bytes()).map_err(|_| io_err("failed to resolve managed root"))?;
@@ -125,7 +134,7 @@ fn open_abs_dir_nofollow(abs: &Path) -> Result<OwnedFd, NetError> {
 
 /// 管理ルートとその配下の hosts ファイルを、symlink を辿らずに 1 要素ずつ開く。
 ///
-/// 管理ルートは `canonicalize` した後、`/` から要素ごとに辿り直す（[`open_abs_dir_nofollow`]）。
+/// 管理ルートは正規化せず、`/` から要素ごとに symlink を辿らずに開く（[`open_abs_dir_nofollow`]）。
 ///
 /// `rel` は空でない相対パスで、全要素が通常の名前であること（絶対パス・`..`・`.` は `INVALID_ARGUMENT`）。
 /// 戻り値は（管理ルートのディレクトリ fd, hosts ファイルの fd）。
@@ -152,14 +161,7 @@ fn open_in_root(managed_root: &Path, rel: &Path) -> Result<(File, File), NetErro
             "hosts path must not be empty",
         ));
     };
-    let root = std::fs::canonicalize(managed_root).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            NetError::new(NetErrorCode::NotFound, "managed root does not exist")
-        } else {
-            io_err("failed to resolve managed root")
-        }
-    })?;
-    let root_fd = open_abs_dir_nofollow(&root)?;
+    let root_fd = open_abs_dir_nofollow(managed_root)?;
     let mut cur: Option<OwnedFd> = None;
     for d in dirs {
         let base = cur.as_ref().unwrap_or(&root_fd).as_fd();
@@ -376,6 +378,9 @@ mod tests {
                 std::env::temp_dir().join(format!("fc-addhost-{}-{case}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
+            // 管理ルートは symlink を含まない絶対パスで渡す契約のため、一時ディレクトリの祖先の
+            // symlink（環境依存）を正規化で除いておく。
+            let root = std::fs::canonicalize(&root).unwrap();
             let path = root.join("hosts");
             if let Some(c) = content {
                 std::fs::write(&path, c).unwrap();

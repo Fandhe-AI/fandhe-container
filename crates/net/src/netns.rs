@@ -1226,4 +1226,77 @@ mod tests {
         fs::remove_file(&pin).unwrap();
         fs::remove_dir(&dir).unwrap();
     }
+
+    fn pin_dir_id_of(dir: &Path) -> FileId {
+        file_id(&fs::symlink_metadata(dir).unwrap())
+    }
+
+    /// NET-1・TASK-139.4: 記録どおりの置き場では、pin の有無を固定した fd 経由で返す（何も変更しない）。
+    #[test]
+    fn net1_pin_exists_in_reports_presence_in_recorded_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("pe-ok");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let id = EndpointId::new("web-1").unwrap();
+        let rec = pin_dir_id_of(&dir);
+        assert!(matches!(pin_exists_in(&dir, rec, &id), Ok(false)));
+        fs::write(dir.join("web-1"), b"").unwrap();
+        assert!(matches!(pin_exists_in(&dir, rec, &id), Ok(true)));
+        assert_eq!(fs::read(dir.join("web-1")).unwrap(), b"");
+        fs::remove_file(dir.join("web-1")).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    /// NET-1・TASK-139.4・P1: 同じパスでも接続時と別のディレクトリ（差し替え・移動後の空ディレクトリ）なら、
+    /// pin の有無を答えず `Dir`（`FailedPrecondition`）で拒否する。元の置き場の pin は残る。
+    #[test]
+    fn net1_pin_exists_in_rejects_replaced_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("pe-swap");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let id = EndpointId::new("web-1").unwrap();
+        let rec = pin_dir_id_of(&dir);
+        fs::write(dir.join("web-1"), b"").unwrap();
+        // pin を含む置き場を移動し、同じパスに空のディレクトリを作る。
+        let moved = dir.with_extension("moved");
+        fs::rename(&dir, &moved).unwrap();
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        match pin_exists_in(&dir, rec, &id) {
+            Err(PinCheckError::Dir(e)) => {
+                assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+                assert_eq!(
+                    e.message(),
+                    "netns directory differs from the one used at attach"
+                );
+            }
+            other => panic!("expected Dir error, got {other:?}"),
+        }
+        // 置き場が消えている場合も `Dir`（`NotFound`）。
+        fs::remove_dir(&dir).unwrap();
+        match pin_exists_in(&dir, rec, &id) {
+            Err(PinCheckError::Dir(e)) => assert_eq!(e.code(), NetErrorCode::NotFound),
+            other => panic!("expected Dir error, got {other:?}"),
+        }
+        assert!(moved.join("web-1").exists());
+        fs::remove_file(moved.join("web-1")).unwrap();
+        fs::remove_dir(&moved).unwrap();
+    }
+
+    /// NET-1・TASK-139.4: 置き場の権限が緩められた（group / other 書き込み可）場合も、作成時の検査を
+    /// 満たさないので `Dir`（`FailedPrecondition`）で拒否する。
+    #[test]
+    fn net1_pin_exists_in_rejects_relaxed_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("pe-ww");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let id = EndpointId::new("web-1").unwrap();
+        let rec = pin_dir_id_of(&dir);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        match pin_exists_in(&dir, rec, &id) {
+            Err(PinCheckError::Dir(e)) => assert_eq!(e.code(), NetErrorCode::FailedPrecondition),
+            other => panic!("expected Dir error, got {other:?}"),
+        }
+        fs::remove_dir(&dir).unwrap();
+    }
 }

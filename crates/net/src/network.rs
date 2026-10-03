@@ -2428,8 +2428,9 @@ mod attach_tests {
     #[test]
     fn net1_attach_success() {
         let f = Fake::default();
-        let a = attach_container_with(&f, &spec("web-1"), &mut ipam(), &mut PortRegistry::new())
-            .unwrap();
+        let mut pool = ipam();
+        let a =
+            attach_container_with(&f, &spec("web-1"), &mut pool, &mut PortRegistry::new()).unwrap();
         let n = VethNames::derive(&eid("web-1")).unwrap();
         assert_eq!(
             f.calls(),
@@ -2457,6 +2458,11 @@ mod attach_tests {
         assert_eq!(a.peer_veth, *n.peer());
         assert_eq!(a.netns_path, pin_of("web-1"));
         assert_eq!(a.address, ip(2));
+        // 削除時の残存 pin の照合用に、置き場のパスと識別子を払い出しと同時に記録する（TASK-139.4）。
+        assert_eq!(
+            pool.netns_dir_of(&eid("web-1")),
+            Some(&NetnsDirRecord::new(netns_dir(), (8, 9)))
+        );
     }
 
     fn ip(last: u8) -> IpPrefix {
@@ -2838,6 +2844,7 @@ mod attach_tests {
             assert!(e.rollback.leftover.is_empty(), "{tag}");
             assert_eq!(pool.allocated_count(), 0, "{tag}");
             assert_eq!(pool.address_of(&eid("c1")), None, "{tag}");
+            assert_eq!(pool.netns_dir_of(&eid("c1")), None, "{tag}");
             assert!(!f.calls().contains(&"release_socket".to_owned()), "{tag}");
         }
     }
@@ -2861,6 +2868,11 @@ mod attach_tests {
             assert_eq!(e.code(), NetErrorCode::Internal);
             let addr = pool.address_of(&eid("c1")).unwrap();
             assert_eq!(pool.allocated_count(), 1);
+            // 保持したアドレスには置き場の記録も残る（削除時に残存 pin を同じ置き場で確認する。TASK-139.4）。
+            assert_eq!(
+                pool.netns_dir_of(&eid("c1")),
+                Some(&NetnsDirRecord::new(netns_dir(), (8, 9)))
+            );
             assert_eq!(reg.len(), 1);
             assert_eq!(
                 e.rollback.leftover.last(),

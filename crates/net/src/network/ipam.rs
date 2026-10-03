@@ -283,6 +283,34 @@ mod tests {
         );
     }
 
+    /// NET-1・TASK-139.4: `allocate_pinned` は払い出しと同時に pin 置き場を記録し、`release` で消す。
+    /// `reserve` で復元した払い出しと、失敗した払い出しには記録が無い。
+    #[test]
+    fn net1_allocate_pinned_records_netns_dir_until_release() {
+        let mut ip = ipam([10, 0, 0, 1], 24);
+        let rec = NetnsDirRecord::new(PathBuf::from("/run/fc-netns"), (8, 9));
+        assert_eq!(
+            ip.allocate_pinned(&eid("a"), rec.clone()).unwrap(),
+            p([10, 0, 0, 2], 24)
+        );
+        assert_eq!(ip.netns_dir_of(&eid("a")), Some(&rec));
+        assert_eq!(
+            ip.netns_dir_of(&eid("a")).map(|r| (r.path(), r.dir_id())),
+            Some((Path::new("/run/fc-netns"), (8, 9)))
+        );
+        // 払い出し済みの ID への再払い出しは失敗し、既存の記録を書き換えない。
+        let other = NetnsDirRecord::new(PathBuf::from("/tmp/other"), (1, 2));
+        assert_eq!(
+            ip.allocate_pinned(&eid("a"), other).unwrap_err().code(),
+            NetErrorCode::AlreadyExists
+        );
+        assert_eq!(ip.netns_dir_of(&eid("a")), Some(&rec));
+        ip.reserve(&eid("b"), p([10, 0, 0, 9], 24)).unwrap();
+        assert_eq!(ip.netns_dir_of(&eid("b")), None);
+        assert_eq!(ip.release(&eid("a")).unwrap(), p([10, 0, 0, 2], 24));
+        assert_eq!(ip.netns_dir_of(&eid("a")), None);
+    }
+
     /// NET-1: 連続して払い出すと重複せず最小の空きから順になる。
     #[test]
     fn net1_allocates_distinct_addresses() {

@@ -1537,6 +1537,100 @@ mod tests {
         }
     }
 
+    /// NET-1・TASK-139.4・P1: 未指定 endpoint の pin 置き場が接続時に記録したものと同じ実体と確認できない
+    /// （差し替え・移動・消失）場合は、pin の残存を見落としうるので何も変更せずに `Preflight` で拒否する。
+    /// 渡したコンテナの veth も消さず、netns ハンドルは `retry` で返る。
+    #[test]
+    fn net1_delete_rejects_when_pin_dir_differs_from_attach() {
+        for (dir_id_now, dir_open_err, code) in [
+            (Some((8, 10)), None, NetErrorCode::FailedPrecondition),
+            (None, Some(NetErrorCode::NotFound), NetErrorCode::NotFound),
+        ] {
+            let (net, mut ipam, mut ports) = setup();
+            let _q = attached(&mut ipam, "q1");
+            let c2 = attached(&mut ipam, "c2");
+            reserve_port(&mut ports, "q1", 8080);
+            let fake = Fake {
+                absent_veths: vec![host_of("q1").as_str().to_owned()],
+                pins_present: vec![pin("q1")],
+                dir_id_now,
+                dir_open_err,
+                ..Fake::default()
+            };
+            let e = delete_network_with(&fake, &net, vec![c2], &mut ipam, &mut ports).unwrap_err();
+            assert_eq!((e.code(), e.step), (code, DeleteStep::Preflight));
+            assert_eq!(
+                fake.calls(),
+                vec![
+                    format!("link_index {}", host_of("q1").as_str()),
+                    format!("pin_exists {}", pin("q1").display()),
+                ]
+            );
+            assert_eq!(e.report, NetworkDeleteReport::default());
+            assert_eq!(e.retry.len(), 1);
+            assert_eq!(e.retry[0].endpoint, eid("c2"));
+            assert_eq!(ipam.allocated_count(), 2);
+            assert_eq!(ports.len(), 1);
+        }
+    }
+
+    /// NET-1・TASK-139.4: pin 置き場の記録が無い払い出し（`reserve` で復元）は pin の有無を判定できないため、
+    /// アドレスを保持して `Unknown` で報告し、bridge も残す（fail-closed）。
+    #[test]
+    fn net1_delete_keeps_address_without_pin_dir_record() {
+        let (net, mut ipam, mut ports) = setup();
+        let addr = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 5)), 24).unwrap();
+        ipam.reserve(&eid("r1"), addr).unwrap();
+        let fake = Fake {
+            absent_veths: vec![host_of("r1").as_str().to_owned()],
+            ..Fake::default()
+        };
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
+        assert_eq!(
+            (e.code(), e.step),
+            (NetErrorCode::FailedPrecondition, DeleteStep::Preflight)
+        );
+        assert_eq!(
+            e.message(),
+            "netns directory of an unpassed endpoint is not recorded"
+        );
+        assert_eq!(
+            e.report.leftover,
+            vec![
+                (
+                    DeleteResource::Address(eid("r1"), addr),
+                    ResourceState::Unknown
+                ),
+                (
+                    DeleteResource::Bridge(net.bridge.clone()),
+                    ResourceState::Present
+                ),
+            ]
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("pin_exists")));
+        assert!(!fake.calls().iter().any(|c| c == "delete_link 7"));
+        assert_eq!(ipam.address_of(&eid("r1")), Some(addr));
+    }
+
+    /// NET-1・TASK-139.4: 渡したコンテナの `netns_path` が接続時に記録した置き場の直下でなければ、
+    /// 何も呼ばずに入力検証で拒否する。
+    #[test]
+    fn net1_delete_rejects_container_with_foreign_netns_path() {
+        let (net, mut ipam, mut ports) = setup();
+        let mut c1 = attached(&mut ipam, "c1");
+        c1.netns_path = std::env::temp_dir().join("elsewhere").join("c1");
+        let fake = Fake::default();
+        let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
+        assert_eq!(
+            (e.code(), e.step),
+            (NetErrorCode::FailedPrecondition, DeleteStep::Validate)
+        );
+        assert_eq!(e.message(), "container does not belong to the network");
+        assert!(fake.calls().is_empty());
+        assert_eq!(e.retry.len(), 1);
+        assert_eq!(ipam.allocated_count(), 1);
+    }
+
     /// NET-1・TASK-139.4・P0: テーブルの所有トークンが一致しない（別者の同名テーブル）・ハンドルが無い場合は
     /// 削除せず、予約・アドレスを保持する。bridge の所有確認が通っていても同じ。
     #[test]

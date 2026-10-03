@@ -12,6 +12,8 @@
 //! （bridge / host / none）を引数に取らないため全モードで同じ処理になる。hosts ファイルの生成・
 //! コンテナへの bind mount は runtime / core 側の責務で、本モジュールは既存の通常ファイルへ追記するだけ
 //! （無ければ作らず `NOT_FOUND`）。
+//! 追記先は symlink・ハードリンク（nlink != 1）・他ユーザー所有・`..` を含むパスを拒否し、書き込み失敗時は
+//! 同じロック下で書き込み前の長さへ戻す。
 //!
 //! 上流転送（TASK-185.3）・host/none の `--dns` 反映と none モードでの loopback 制限（TASK-185.4）は
 //! 未実装（REPAIR-3）。エラーの `message` は固定の英語文字列で、
@@ -267,6 +269,22 @@ fn verify_hosts_file(file: &File, path: &Path) -> Result<(), NetError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
+        // ハードリンク経由でコンテナ外のファイルへ追記させない（rootfs・マウント境界）。
+        // 管理下の hosts ファイルは他のどこからもリンクされない（nlink == 1）。
+        if meta.nlink() != 1 {
+            return Err(NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "hosts file has multiple hard links",
+            ));
+        }
+        // 所有者は実効 UID と一致すること（他ユーザー所有のファイルへ追記しない）。
+        #[cfg(target_os = "linux")]
+        if meta.uid() != crate::sys::effective_uid() {
+            return Err(NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "hosts file is not owned by the current user",
+            ));
+        }
         if via_path.dev() != meta.dev() || via_path.ino() != meta.ino() {
             return Err(NetError::new(
                 NetErrorCode::FailedPrecondition,
@@ -342,6 +360,16 @@ pub fn append_add_hosts(hosts_path: &Path, entries: &[AddHostEntry]) -> Result<(
     if entries.len() > MAX_ADD_HOST_ENTRIES {
         return Err(InputViolation::TooManyAddHosts.into());
     }
+    // パス要素の検証: `..` による管理下ディレクトリからの脱出を拒否する。
+    if hosts_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(NetError::new(
+            NetErrorCode::InvalidArgument,
+            "hosts path must not contain parent directory components",
+        ));
+    }
     let meta = match std::fs::symlink_metadata(hosts_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -395,9 +423,17 @@ pub fn append_add_hosts(hosts_path: &Path, entries: &[AddHostEntry]) -> Result<(
             "hosts file would exceed size limit",
         ));
     }
-    file.write_all(payload.as_bytes())
-        .and_then(|_| file.sync_all())
-        .map_err(|_| io_err("failed to write hosts file"))
+    // 容量不足等で途中まで書いて失敗すると不完全な行が残り、再試行でその後ろへ追記されてしまう。
+    // 排他ロックを保持したまま書き込み前の長さへ戻し、失敗後のファイルを元の状態に保つ。
+    let written = file
+        .write_all(payload.as_bytes())
+        .and_then(|_| file.sync_all());
+    if written.is_err() {
+        // 巻き戻し失敗も元の書き込み失敗と同じ内部エラーで返す（best effort）。
+        let _ = file.set_len(len);
+        return Err(io_err("failed to write hosts file"));
+    }
+    Ok(())
 }
 
 /// `--add-host` の生値を全件検証してから hosts ファイルへ追記する入口（NET-12・TASK-185.2）。
@@ -775,6 +811,32 @@ mod tests {
         let e = apply_add_hosts(&link.0, ["web:192.0.2.1"]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::InvalidArgument);
         assert_eq!(std::fs::read_to_string(&target.0).unwrap(), "orig\n");
+    }
+
+    /// NET-12: ハードリンクされたファイルへは追記せず、リンク先も変更しない。
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_is_rejected() {
+        let target = TmpFile::new("hltarget", Some("orig\n"));
+        let link = TmpFile::new("hllink", None);
+        std::fs::hard_link(&target.0, &link.0).unwrap();
+        let e = apply_add_hosts(&link.0, ["web:192.0.2.1"]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(std::fs::read_to_string(&target.0).unwrap(), "orig\n");
+    }
+
+    /// NET-12: `..` を含むパスは拒否し、ファイルを変更しない。
+    #[test]
+    fn parent_dir_component_is_rejected() {
+        let f = TmpFile::new("dotdot", Some("orig\n"));
+        let dir = std::env::temp_dir();
+        let p = dir
+            .join("..")
+            .join(dir.file_name().unwrap())
+            .join(f.0.file_name().unwrap());
+        let e = apply_add_hosts(&p, ["web:192.0.2.1"]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        assert_eq!(std::fs::read_to_string(&f.0).unwrap(), "orig\n");
     }
 
     /// NET-12・TASK-185.2 受け入れ基準: 検証失敗時に hosts ファイルは 1 バイトも変わらない。

@@ -33,7 +33,7 @@
 //! 定数値は Linux UAPI（`nfnetlink.h`・`netfilter.h`）に基づく。
 
 use crate::error::{NetError, NetErrorCode};
-use crate::netlink::{MAX_MESSAGE_LEN, NLM_F_REQUEST, NlMsgBuilder, NlMsgHeader};
+use crate::netlink::{MAX_MESSAGE_LEN, NLM_F_REQUEST, NLMSG_HEADER_LEN, NlMsgBuilder, NlMsgHeader};
 
 /// nf_tables のサブシステム ID（`NFNL_SUBSYS_NFTABLES`）。
 pub const NFNL_SUBSYS_NFTABLES: u8 = 10;
@@ -74,6 +74,20 @@ fn invalid(msg: impl Into<String>) -> NetError {
 
 fn data_loss(msg: impl Into<String>) -> NetError {
     NetError::new(NetErrorCode::DataLoss, msg)
+}
+
+/// 本モジュールが定義する `NFPROTO_*` のいずれかか。
+fn is_known_nfproto(family: u8) -> bool {
+    matches!(
+        family,
+        NFPROTO_UNSPEC
+            | NFPROTO_INET
+            | NFPROTO_IPV4
+            | NFPROTO_ARP
+            | NFPROTO_NETDEV
+            | NFPROTO_BRIDGE
+            | NFPROTO_IPV6
+    )
 }
 
 /// サブシステム ID とサブシステム内メッセージ番号から nfnetlink の `nlmsg_type` を合成する。
@@ -237,6 +251,22 @@ impl NftBatch {
                 "message type {:#x} is not an nf_tables message",
                 header.msg_type()
             )));
+        }
+        // カーネルに拒否されるフレームを積まないため、要求フラグと nfgenmsg を検証する（REPAIR-2）。
+        if header.flags() & NLM_F_REQUEST == 0 {
+            return Err(invalid("message lacks NLM_F_REQUEST flag"));
+        }
+        let payload = msg.get(NLMSG_HEADER_LEN..).unwrap_or(&[]);
+        let nfg = NfGenMsg::decode(payload)
+            .map_err(|_| invalid("message payload is shorter than nfgenmsg"))?;
+        if nfg.version() != NFNETLINK_V0 {
+            return Err(invalid(format!(
+                "unsupported nfnetlink version {}",
+                nfg.version()
+            )));
+        }
+        if !is_known_nfproto(nfg.family()) {
+            return Err(invalid(format!("unknown nfproto family {}", nfg.family())));
         }
         // 末尾に積む END の分を常に残して上限判定する。
         let total = self
@@ -416,6 +446,39 @@ mod tests {
             assert_eq!(e.code(), NetErrorCode::InvalidArgument);
         }
         assert_eq!(b.finish().unwrap().bytes().len(), 40);
+    }
+
+    /// REPAIR-2: NLM_F_REQUEST 欠落・nfgenmsg 欠落・version/family 不正は拒否し状態を変えない。
+    #[test]
+    fn batch_rejects_malformed_body() {
+        let mut b = NftBatch::new(1).unwrap();
+        // 要求フラグなし
+        let e = b
+            .push_with(|s| {
+                let mut m = NlMsgBuilder::new(NEWTABLE, 0, s, 0);
+                NfGenMsg::new(NFPROTO_INET, 0).put_into(&mut m)?;
+                Ok(m)
+            })
+            .unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        // nfgenmsg なし（ペイロード空）
+        let e = b
+            .push_with(|s| Ok(NlMsgBuilder::new(NEWTABLE, NLM_F_REQUEST, s, 0)))
+            .unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        // version 不正・family 不正
+        for raw in [[NFPROTO_INET, 1, 0, 0], [99, NFNETLINK_V0, 0, 0]] {
+            let e = b
+                .push_with(|s| {
+                    let mut m = NlMsgBuilder::new(NEWTABLE, NLM_F_REQUEST, s, 0);
+                    m.put_fixed(&raw)?;
+                    Ok(m)
+                })
+                .unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        }
+        assert_eq!(b.push_with(body).unwrap(), 2);
+        assert_eq!(b.finish().unwrap().bytes().len(), 60);
     }
 
     /// REPAIR-2: closure のエラー伝播と総長上限。

@@ -57,7 +57,10 @@
 //! これらのいずれかが失敗したら接続全体（IPAM の払い出し・veth・netns）を戻す。`RTM_DELROUTE` /
 //! `RTM_DELADDR` / ルールハンドル取得が未実装のため個別の巻き戻しができず、netns 内の address・route は
 //! veth と netns の破棄で消え、nft バッチは失敗時に何も適用されない（`Aborted` / `NotSent`）ことに
-//! 依存する。結果が不明なバッチは `AttachResource::PortRules` を `Unknown` で報告する。
+//! 依存する。結果が不明なバッチは `AttachResource::PortRules` と `AttachResource::Address` を `Unknown` で報告し、
+//! IPAM のアドレスと [`PortRegistry`] の予約を保持する（残ったルールが別コンテナへ転送しないための quarantine。
+//! 解放はテーブル削除後に呼び出し側が行う。TASK-139.4）。受け口の競合（コンテナ間・ネットワーク間）は
+//! 投入前に [`PortRegistry`] で検出して `AlreadyExists` とする。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
@@ -80,7 +83,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use ipam::StaticIpam;
-pub use publish::{MAX_PORT_PUBLISHES, PortProtocol, PortPublish};
+pub use publish::{MAX_PORT_PUBLISHES, PortProtocol, PortPublish, PortRegistry};
 
 use crate::error::{NetError, NetErrorCode};
 #[cfg(target_os = "linux")]
@@ -804,8 +807,8 @@ impl ContainerAttachSpec {
 
     /// ポート公開の指定を加える（既定は公開なし）。件数が [`MAX_PORT_PUBLISHES`] を超える、または
     /// 同じ受け口（プロトコル・host アドレス・host ポート）が重複していれば `InvalidArgument`
-    /// （上限を検証してから保持する）。他コンテナとの受け口の競合検出は呼び出し側の責務
-    /// （`publish` モジュール doc）。
+    /// （上限を検証してから保持する）。他コンテナ・他ネットワークとの受け口の競合は
+    /// [`attach_container`] が [`PortRegistry`] で投入前に検出して接続を失敗させる。
     pub fn with_port_publishes(mut self, ports: Vec<PortPublish>) -> Result<Self, NetError> {
         if ports.len() > MAX_PORT_PUBLISHES {
             return Err(invalid("too many port publishes"));
@@ -906,6 +909,10 @@ pub enum AttachResource {
     /// ポート公開の DNAT ルールを投入した nft テーブル（結果不明のバッチ。個別削除の手段が無く、
     /// ネットワーク削除でテーブルごと解放する。TASK-139.4）。
     PortRules(NftName),
+    /// 払い出し済みのまま保持している IPAM アドレス（`PortRules` が不明な間は、残った DNAT ルールが
+    /// 別コンテナへ転送しないよう再利用させない〔quarantine〕。解放は呼び出し側が、テーブルの削除後に
+    /// `StaticIpam::release` と `PortRegistry::release` で行う）。
+    Address(IpPrefix),
 }
 
 /// コンテナ接続のロールバック結果。
@@ -1089,6 +1096,7 @@ pub(crate) fn attach_container_with<O: AttachOps>(
     ops: &O,
     spec: &ContainerAttachSpec,
     ipam: &mut StaticIpam,
+    ports: &mut PortRegistry,
 ) -> Result<AttachedContainer<O::Netns>, ContainerAttachError> {
     let fail = |error, step, rollback| ContainerAttachError {
         error,
@@ -1218,16 +1226,32 @@ pub(crate) fn attach_container_with<O: AttachOps>(
         }
     };
 
-    // netns 内の設定 → ポート公開。ここからの失敗は IPAM・veth・netns をすべて戻す（モジュール doc）。
-    if let Err(f) = configure_in_netns(ops, spec, &netns, names.peer(), address, gateway) {
-        // 払い出しを戻す。`allocate` 直後なので失敗しない（失敗しても元のエラーを優先する）。
+    // 公開する受け口を、ルールを入れる前に予約する。他のコンテナ・ネットワークが公開済みなら
+    // 接続を失敗させる（nft は重複ルールを拒否せず、後から入れた公開が機能しないため）。
+    if let Err(e) = ports.reserve(&spec.network, &spec.endpoint, &spec.ports) {
         let _ = ipam.release(&spec.endpoint);
         let mut report = AttachRollbackReport::default();
+        rollback_veth(ops, names.host(), host_index, &mut report);
+        return Err(abort(netns, report, e, AttachStep::PublishPorts));
+    }
+
+    // netns 内の設定 → ポート公開。ここからの失敗は veth・netns を戻す（モジュール doc）。
+    if let Err(f) = configure_in_netns(ops, spec, &netns, names.peer(), address, gateway) {
+        let mut report = AttachRollbackReport::default();
         if f.ports_unknown {
+            // DNAT ルールが入っている可能性がある。ルールの不存在を確認・削除できるまで、アドレスと
+            // 受け口の予約を解放しない（別コンテナへ再払い出しすると、残ったルールがそちらへ転送しうる）。
             report.leftover.push((
                 AttachResource::PortRules(spec.table.clone()),
                 ResourceState::Unknown,
             ));
+            report
+                .leftover
+                .push((AttachResource::Address(address), ResourceState::Unknown));
+        } else {
+            // 払い出しと予約を戻す。直前に確保したので失敗しない（失敗しても元のエラーを優先する）。
+            let _ = ipam.release(&spec.endpoint);
+            ports.release(&spec.network, &spec.endpoint);
         }
         rollback_veth(ops, names.host(), host_index, &mut report);
         return Err(abort(netns, report, f.error, f.step));
@@ -1270,6 +1294,8 @@ fn configure_in_netns<O: AttachOps>(
             ports_unknown: false,
         }
     };
+    // `lo` は up にするだけでよい。カーネルが新規 netns の loopback を up にする際に 127.0.0.1/8 を自動で
+    // 付与する（`inetdev_event` の NETDEV_UP）ため、明示的な付与は `AlreadyExists` になる。
     let lo = IfName::new("lo").map_err(step(AttachStep::ConfigureLoopback))?;
     let lo_index = ops
         .netns_link_index(netns, &lo)
@@ -1481,7 +1507,11 @@ impl AttachOps for LinuxAttachOps<'_> {
 /// 続けて `ipam` から重複しないアドレスを払い出し（TASK-139.2.2・#848）、netns 内の `lo` / peer を up にして
 /// アドレスと default route（gateway = bridge アドレス）を設定し、`spec` にポート公開の指定があれば
 /// `nft` で DNAT ルールを投入する（TASK-139.3・#316）。
-/// 失敗時は自分が作った veth と netns と IPAM の払い出しだけを戻し、結果を [`ContainerAttachError::rollback`] で返す。
+/// ポート公開の受け口は投入前に `ports`（全ネットワークで共有する [`PortRegistry`]）へ予約し、他のコンテナ・
+/// ネットワークが公開済みなら `AlreadyExists` で失敗させる。
+/// 失敗時は自分が作った veth と netns と IPAM の払い出し・受け口の予約を戻し、結果を [`ContainerAttachError::rollback`] で返す。
+/// ただし DNAT バッチの結果が不明な場合は、残ったルールが再利用先へ転送しないよう IPAM のアドレスと受け口の予約を
+/// 保持する（quarantine。`AttachResource::Address`・`PortRules` を `Unknown` で報告）。
 /// `CAP_NET_ADMIN`（netlink）と `CAP_SYS_ADMIN`（`unshare` / `mount`）が必要で、本 crate は権限を上げない。
 /// `timeout` は各カーネル要求と netns 作成スレッドの待ちの期限（REPAIR-5）。
 ///
@@ -1495,6 +1525,7 @@ pub fn attach_container(
     nft: &NetlinkNetfilterSocket,
     spec: &ContainerAttachSpec,
     ipam: &mut StaticIpam,
+    ports: &mut PortRegistry,
     timeout: Duration,
 ) -> Result<AttachedContainer<ContainerNetns>, ContainerAttachError> {
     attach_container_with(
@@ -1505,6 +1536,7 @@ pub fn attach_container(
         },
         spec,
         ipam,
+        ports,
     )
 }
 #[cfg(test)]
@@ -2317,7 +2349,8 @@ mod attach_tests {
     #[test]
     fn net1_attach_success() {
         let f = Fake::default();
-        let a = attach_container_with(&f, &spec("web-1"), &mut ipam()).unwrap();
+        let a = attach_container_with(&f, &spec("web-1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap();
         let n = VethNames::derive(&eid("web-1")).unwrap();
         assert_eq!(
             f.calls(),
@@ -2355,8 +2388,8 @@ mod attach_tests {
     fn net1_attach_allocates_distinct_addresses() {
         let f = Fake::default();
         let mut m = ipam();
-        let a = attach_container_with(&f, &spec("c1"), &mut m).unwrap();
-        let b = attach_container_with(&f, &spec("c2"), &mut m).unwrap();
+        let a = attach_container_with(&f, &spec("c1"), &mut m, &mut PortRegistry::new()).unwrap();
+        let b = attach_container_with(&f, &spec("c2"), &mut m, &mut PortRegistry::new()).unwrap();
         assert_eq!(a.address, ip(2));
         assert_eq!(b.address, ip(3));
         assert_eq!(m.allocated_count(), 2);
@@ -2382,7 +2415,8 @@ mod attach_tests {
     fn net1_attach_pool_exhausted_rolls_back() {
         let f = Fake::default();
         let mut m = exhausted_ipam();
-        let e = attach_container_with(&f, &spec_for("c1", 30), &mut m).unwrap_err();
+        let e = attach_container_with(&f, &spec_for("c1", 30), &mut m, &mut PortRegistry::new())
+            .unwrap_err();
         assert_eq!(e.step, AttachStep::AllocateAddress);
         assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
         assert_eq!(e.message(), "address pool exhausted");
@@ -2407,7 +2441,8 @@ mod attach_tests {
             ..Default::default()
         };
         let mut m = exhausted_ipam();
-        let e = attach_container_with(&f, &spec_for("c1", 30), &mut m).unwrap_err();
+        let e = attach_container_with(&f, &spec_for("c1", 30), &mut m, &mut PortRegistry::new())
+            .unwrap_err();
         assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
         assert_eq!(
             e.rollback.leftover,
@@ -2422,7 +2457,8 @@ mod attach_tests {
         let f = Fake::default();
         let mut m =
             StaticIpam::new(&NetworkName::new("other").unwrap(), created().gateway).unwrap();
-        let e = attach_container_with(&f, &spec("c1"), &mut m).unwrap_err();
+        let e =
+            attach_container_with(&f, &spec("c1"), &mut m, &mut PortRegistry::new()).unwrap_err();
         assert_eq!(e.step, AttachStep::AllocateAddress);
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
         assert!(f.calls().is_empty());
@@ -2436,7 +2472,8 @@ mod attach_tests {
             bridge_index: Some(9),
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
         assert_eq!(f.calls().len(), 1);
         assert_eq!(e.step, AttachStep::VerifyBridge);
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
@@ -2446,7 +2483,8 @@ mod attach_tests {
             fail_bridge_lookup: true,
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
         assert_eq!(f.calls().len(), 1);
         assert_eq!(e.step, AttachStep::VerifyBridge);
         assert_eq!(e.code(), NetErrorCode::NotFound);
@@ -2458,7 +2496,7 @@ mod attach_tests {
         let mut sp = spec("c1");
         sp.bridge_token = "other-owner".to_owned();
         let f = Fake::default();
-        let e = attach_container_with(&f, &sp, &mut ipam()).unwrap_err();
+        let e = attach_container_with(&f, &sp, &mut ipam(), &mut PortRegistry::new()).unwrap_err();
         assert_eq!(e.step, AttachStep::VerifyBridge);
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
         assert_eq!(f.calls().len(), 0);
@@ -2471,7 +2509,8 @@ mod attach_tests {
             fail_netns: Some((NetErrorCode::PermissionDenied, None)),
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
         assert_eq!(e.step, AttachStep::CreateNetns);
         assert_eq!(e.code(), NetErrorCode::PermissionDenied);
         assert_eq!(e.rollback, AttachRollbackReport::default());
@@ -2481,7 +2520,8 @@ mod attach_tests {
             fail_netns: Some((NetErrorCode::Timeout, Some(ResourceState::Unknown))),
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
         assert_eq!(
             e.rollback.leftover,
             [(AttachResource::Netns(pin_of("c1")), ResourceState::Unknown)]
@@ -2496,7 +2536,8 @@ mod attach_tests {
             fail_veth: Some(NetErrorCode::AlreadyExists),
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
         assert_eq!(e.step, AttachStep::CreateVeth);
         assert_eq!(e.code(), NetErrorCode::AlreadyExists);
         assert_eq!(e.message(), VETH_COLLISION_MSG);
@@ -2518,7 +2559,8 @@ mod attach_tests {
                 fail_veth: Some(code),
                 ..Default::default()
             };
-            let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
+            let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+                .unwrap_err();
             assert_eq!(
                 e.rollback.leftover,
                 [(AttachResource::Veth(host_of("c1")), ResourceState::Unknown)],
@@ -2538,7 +2580,8 @@ mod attach_tests {
                 fail_peer_lookup: peer,
                 ..Default::default()
             };
-            let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
+            let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+                .unwrap_err();
             assert_eq!(e.step, AttachStep::ResolveIndex);
             assert_eq!(
                 e.rollback.leftover,
@@ -2576,7 +2619,8 @@ mod attach_tests {
             ),
         ];
         for (f, step) in cases {
-            let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
+            let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+                .unwrap_err();
             assert_eq!(e.step, step);
             assert_eq!(e.code(), NetErrorCode::Internal);
             assert_eq!(
@@ -2604,7 +2648,8 @@ mod attach_tests {
             unpin_fails: true,
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
         assert_eq!(e.step, AttachStep::MoveToNetns);
         assert_eq!(e.code(), NetErrorCode::PermissionDenied);
         assert!(e.rollback.removed.is_empty());
@@ -2621,7 +2666,8 @@ mod attach_tests {
             delete_err: Some(NetErrorCode::Timeout),
             ..Default::default()
         };
-        let e = attach_container_with(&f, &spec("c1"), &mut ipam()).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
         assert_eq!(
             e.rollback.leftover,
             [(AttachResource::Veth(host_of("c1")), ResourceState::Unknown)]
@@ -2647,13 +2693,13 @@ mod attach_tests {
     #[test]
     fn net1_attach_publishes_ports_after_route() {
         let f = Fake::default();
-        attach_container_with(&f, &spec("p0"), &mut ipam()).unwrap();
+        attach_container_with(&f, &spec("p0"), &mut ipam(), &mut PortRegistry::new()).unwrap();
         assert!(!f.calls().iter().any(|c| c.starts_with("publish")));
 
         let f = Fake::default();
         let s = spec_with_ports("p1", vec![port(8080), port(8081)]);
         assert_eq!(s.port_publishes().len(), 2);
-        attach_container_with(&f, &s, &mut ipam()).unwrap();
+        attach_container_with(&f, &s, &mut ipam(), &mut PortRegistry::new()).unwrap();
         let calls = f.calls();
         let n = calls.len();
         assert_eq!(calls[n - 3], "ns_route 10.89.0.1 5");
@@ -2697,7 +2743,8 @@ mod attach_tests {
                 ..Default::default()
             };
             let mut pool = ipam();
-            let e = attach_container_with(&f, &spec("c1"), &mut pool).unwrap_err();
+            let e = attach_container_with(&f, &spec("c1"), &mut pool, &mut PortRegistry::new())
+                .unwrap_err();
             assert_eq!(e.step, step, "{tag}");
             assert_eq!(e.code(), code, "{tag}");
             assert_eq!(
@@ -2724,7 +2771,8 @@ mod attach_tests {
             ..Default::default()
         };
         let mut pool = ipam();
-        let e = attach_container_with(&f, &spec("c1"), &mut pool).unwrap_err();
+        let e = attach_container_with(&f, &spec("c1"), &mut pool, &mut PortRegistry::new())
+            .unwrap_err();
         assert_eq!(e.step, AttachStep::DefaultRoute);
         assert_eq!(e.code(), NetErrorCode::Internal);
         assert_eq!(
@@ -2735,8 +2783,10 @@ mod attach_tests {
         assert_eq!(pool.allocated_count(), 0);
     }
 
-    /// NET-1・TASK-139.3: DNAT バッチが確定的に失敗（`Aborted` / `NotSent`）なら nft 側の残置は報告しない。
-    /// 結果不明（`Unknown`）なら `PortRules` を `Unknown` で報告する。いずれも接続全体を戻す。
+    /// NET-1・TASK-139.3: DNAT バッチが確定的に失敗（`Aborted` / `NotSent`）なら nft 側の残置は報告せず、
+    /// IPAM と受け口の予約も戻す。結果不明（`Unknown`）なら `PortRules` と `Address` を `Unknown` で報告し、
+    /// 残ったルールが別コンテナへ転送しないよう IPAM のアドレスと受け口の予約を保持する（quarantine）。
+    /// いずれも veth・netns は戻す。
     #[test]
     fn net1_attach_publish_failure_reports_unknown_rules() {
         for (outcome, unknown) in [
@@ -2749,8 +2799,9 @@ mod attach_tests {
                 ..Default::default()
             };
             let mut pool = ipam();
+            let mut reg = PortRegistry::new();
             let s = spec_with_ports("c1", vec![port(8080)]);
-            let e = attach_container_with(&f, &s, &mut pool).unwrap_err();
+            let e = attach_container_with(&f, &s, &mut pool, &mut reg).unwrap_err();
             assert_eq!(e.step, AttachStep::PublishPorts);
             assert_eq!(e.code(), NetErrorCode::Timeout);
             assert_eq!(
@@ -2761,16 +2812,63 @@ mod attach_tests {
                 ]
             );
             let want: Vec<(AttachResource, ResourceState)> = if unknown {
-                vec![(
-                    AttachResource::PortRules(created().table.clone()),
-                    ResourceState::Unknown,
-                )]
+                vec![
+                    (
+                        AttachResource::PortRules(created().table.clone()),
+                        ResourceState::Unknown,
+                    ),
+                    (AttachResource::Address(ip(2)), ResourceState::Unknown),
+                ]
             } else {
                 Vec::new()
             };
             assert_eq!(e.rollback.leftover, want, "{outcome:?}");
-            assert_eq!(pool.allocated_count(), 0);
+            assert_eq!(pool.allocated_count(), usize::from(unknown), "{outcome:?}");
+            assert_eq!(reg.len(), usize::from(unknown), "{outcome:?}");
+            if unknown {
+                // 保持中のアドレスは別コンテナへ払い出されない。
+                assert_eq!(pool.address_of(&eid("c1")), Some(ip(2)));
+                assert_eq!(pool.allocate(&eid("c2")).unwrap(), ip(3));
+            }
         }
+    }
+
+    /// NET-1・TASK-139.3: 既に公開済みの受け口（別コンテナ・別ネットワーク）を指定した接続は、veth・netns・IPAM を戻して `AlreadyExists`（`PublishPorts`）で失敗し、DNAT は投入しない。
+    /// 公開済みの予約は壊れない。
+    #[test]
+    fn net1_attach_rejects_conflicting_listener() {
+        let f = Fake::default();
+        let mut pool = ipam();
+        let mut reg = PortRegistry::new();
+        attach_container_with(
+            &f,
+            &spec_with_ports("c1", vec![port(8080)]),
+            &mut pool,
+            &mut reg,
+        )
+        .unwrap();
+        assert_eq!(reg.len(), 1);
+        let f2 = Fake::default();
+        let e = attach_container_with(
+            &f2,
+            &spec_with_ports("c2", vec![port(9090), port(8080)]),
+            &mut pool,
+            &mut reg,
+        )
+        .unwrap_err();
+        assert_eq!(e.step, AttachStep::PublishPorts);
+        assert_eq!(e.code(), NetErrorCode::AlreadyExists);
+        assert_eq!(
+            e.rollback.removed,
+            [
+                AttachResource::Veth(host_of("c2")),
+                AttachResource::Netns(pin_of("c2"))
+            ]
+        );
+        assert!(e.rollback.leftover.is_empty());
+        assert!(!f2.calls().iter().any(|c| c.starts_with("publish")));
+        assert_eq!(pool.allocated_count(), 1);
+        assert_eq!(reg.len(), 1);
     }
 
     /// NET-1・TASK-139.3: 公開指定の件数上限と受け口の重複は `InvalidArgument`。

@@ -419,7 +419,8 @@ pub(crate) fn create_pinned(
                     // pin は mount 済み。ハンドルを作れないので、ここで pin を解除して片付ける。
                     drop(fd);
                     drop(guard);
-                    let leftover = match unpin_path(&pin) {
+                    // `base` を再解決せず、固定済みの `dir` 経由で所有照合・解除する。
+                    let leftover = match unpin_in_dir(&dir, name) {
                         Ok(()) => None,
                         Err(_) => Some(ResourceState::Present),
                     };
@@ -524,6 +525,15 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
         Err(e) => return Err(io_error("stat netns pin", &e)),
     }
     let dir = open_pin_dir(parent)?;
+    unpin_in_dir(&dir, name)
+}
+
+/// 固定済みの置き場ディレクトリ `dir` 配下の `name` の pin を解除する（[`unpin_path`] の本体）。
+///
+/// `create_pinned` の失敗時後始末は、パスを再解決せず自分が固定した `dir` を渡してここへ来る
+/// （検査後に `base` やその祖先が差し替えられても、検査していない場所の pin を扱わない）。
+/// 所有照合・解除の条件は [`unpin_path`] と同じ。
+fn unpin_in_dir(dir: &PinDir, name: &std::ffi::OsStr) -> Result<(), NetError> {
     let via = dir.entry(name);
     let real = dir.real.join(name);
     let euid = sys::effective_uid();

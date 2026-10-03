@@ -59,8 +59,8 @@ mod linux {
     };
     use fandhe_container_net::network::{
         AttachResource, AttachStep, ContainerAttachSpec, CreateStep, EndpointId, NetworkCreateSpec,
-        NetworkName, PortProtocol, PortPublish, StaticIpam, VethNames, attach_container,
-        create_network,
+        NetworkName, PortProtocol, PortPublish, PortRegistry, StaticIpam, VethNames,
+        attach_container, create_network,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -341,7 +341,8 @@ mod linux {
         // --- 成功経路 ---
         let spec = ContainerAttachSpec::new(EndpointId::new("c1")?, &net, base.clone())?;
         let mut ipam = StaticIpam::for_network(&net)?;
-        let attached = attach_container(&route, &nft, &spec, &mut ipam, t)
+        let mut ports = PortRegistry::new();
+        let attached = attach_container(&route, &nft, &spec, &mut ipam, &mut ports, t)
             .map_err(|e| fail(format!("attach_container failed at {:?}: {e}", e.step)))?;
         if attached.address != IpPrefix::new("10.213.0.2".parse().map_err(|_| fail("addr"))?, 24)? {
             return Err(fail(format!("unexpected address {:?}", attached.address)));
@@ -437,7 +438,7 @@ mod linux {
             t,
         )?;
         let spec2 = ContainerAttachSpec::new(c2, &net, base.clone())?;
-        let e = match attach_container(&route, &nft, &spec2, &mut ipam, t) {
+        let e = match attach_container(&route, &nft, &spec2, &mut ipam, &mut ports, t) {
             Err(e) => e,
             Ok(_) => return Err(fail("attach on a taken veth name unexpectedly succeeded")),
         };
@@ -472,12 +473,13 @@ mod linux {
         )?;
         let spec3 = ContainerAttachSpec::new(EndpointId::new("c3")?, &net, base.clone())?
             .with_port_publishes(vec![publish])?;
-        let attached3 = attach_container(&route, &nft, &spec3, &mut ipam, t).map_err(|e| {
-            fail(format!(
-                "attach with port publish failed at {:?}: {e}",
-                e.step
-            ))
-        })?;
+        let attached3 =
+            attach_container(&route, &nft, &spec3, &mut ipam, &mut ports, t).map_err(|e| {
+                fail(format!(
+                    "attach with port publish failed at {:?}: {e}",
+                    e.step
+                ))
+            })?;
         let ruleset = run_cmd("nft", &["list", "table", "ip", net.table.as_str()])?;
         let dnat_lines = ruleset
             .lines()

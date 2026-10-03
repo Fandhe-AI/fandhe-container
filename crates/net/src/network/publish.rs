@@ -15,14 +15,18 @@
 //!
 //! - `host_addr` は明示された非 loopback の unicast アドレスに限る。`0.0.0.0`（全アドレス公開）は
 //!   意図しない外部公開につながり、loopback 宛ては `route_localnet` が必要になるため拒否する
-//! - 同一 host アドレス・ポートの競合（コンテナ間・ネットワーク間）の検出は呼び出し側（状態レジストリ）
-//!   の責務。nft は同一ルールの重複を拒否しない
+//! - 同一 host アドレス・ポートの競合（コンテナ間・ネットワーク間）は [`PortRegistry`] で投入前に検出して
+//!   拒否する（nft は同一ルールの重複を拒否しないため、後から入れたルールが機能しない）。レジストリは
+//!   呼び出し側が所有し、複数ネットワークで 1 つを共有する。永続化と再起動後の復元は TASK-139.4 以降
+//!   （REPAIR-3）
 //! - IPv4 のみ（静的 IPAM が IPv4 のみのため）。公開の個別解除はルールハンドルの取得経路が無く未対応
 //!   （ネットワーク削除時にテーブルごと解放する。TASK-139.4）
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
 
+use super::{EndpointId, NetworkName};
 use crate::error::{NetError, NetErrorCode};
 use crate::nftables_rules::{
     NftCmp, NftDataValue, NftImmediate, NftNat, NftPayload, NftRegister, NftRuleExprs,
@@ -150,6 +154,81 @@ impl PortPublish {
     }
 }
 
+/// 受け口の持ち主（ネットワークとエンドポイント）。
+type ListenerOwner = (NetworkName, EndpointId);
+
+/// 公開済みの受け口（プロトコル・host アドレス・host ポート）の予約表（NET-1・TASK-139.3・#316）。
+///
+/// `attach_container` が DNAT ルールを投入する前に受け口を予約し、既に誰かが公開している受け口なら
+/// 接続を失敗させる。nft は同一ルールの重複を拒否せず、先に入ったルールが優先されて後のコンテナの公開が
+/// 機能しないため。コンテナ間・ネットワーク間の競合を検出できるよう、呼び出し側が全ネットワークで 1 つを
+/// 共有する。状態は呼び出し側が所有するメモリ上の値（常駐デーモンを持たない。CORE-1）で、永続化は
+/// TASK-139.4 以降（REPAIR-3）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PortRegistry {
+    owners: HashMap<(PortProtocol, Ipv4Addr, u16), ListenerOwner>,
+}
+
+impl PortRegistry {
+    /// 空の予約表。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 予約済みの受け口の件数。
+    pub fn len(&self) -> usize {
+        self.owners.len()
+    }
+
+    /// 予約が 1 件も無いか。
+    pub fn is_empty(&self) -> bool {
+        self.owners.is_empty()
+    }
+
+    fn key(p: &PortPublish) -> (PortProtocol, Ipv4Addr, u16) {
+        (p.protocol, p.host_addr, p.host_port.get())
+    }
+
+    /// `owner` として `ports` の受け口をすべて予約する。1 件でも既に予約済み（同じ持ち主を含む）なら
+    /// 何も予約せず `AlreadyExists`（all-or-nothing）。`ports` 内の重複も `AlreadyExists`。
+    pub(crate) fn reserve(
+        &mut self,
+        network: &NetworkName,
+        endpoint: &EndpointId,
+        ports: &[PortPublish],
+    ) -> Result<(), NetError> {
+        let conflict = || {
+            NetError::new(
+                NetErrorCode::AlreadyExists,
+                "port listener is already published",
+            )
+        };
+        for (i, p) in ports.iter().enumerate() {
+            if self.owners.contains_key(&Self::key(p))
+                || ports.iter().skip(i + 1).any(|q| p.same_listener(q))
+            {
+                return Err(conflict());
+            }
+        }
+        for p in ports {
+            self.owners
+                .insert(Self::key(p), (network.clone(), endpoint.clone()));
+        }
+        Ok(())
+    }
+
+    /// `endpoint`（`network` 内）が持つ予約をすべて解放し、解放した件数を返す。
+    ///
+    /// DNAT ルールが残っている可能性がある間（結果不明のバッチ）は呼ばないこと。ネットワークの
+    /// テーブルを削除して消えたことを確認した後（TASK-139.4）に呼ぶ。
+    pub fn release(&mut self, network: &NetworkName, endpoint: &EndpointId) -> usize {
+        let before = self.owners.len();
+        self.owners
+            .retain(|_, (n, e)| !(n == network && e == endpoint));
+        before - self.owners.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +307,39 @@ mod tests {
         let t2 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 80, 8080).unwrap();
         assert!(t.same_listener(&t2));
         assert!(!t.same_listener(&u));
+    }
+
+    /// NET-1・TASK-139.3: 受け口の予約は all-or-nothing で、別コンテナ・別ネットワークとの競合を拒否し、
+    /// 解放後は再予約できる。
+    #[test]
+    fn net1_port_registry_detects_conflicts() {
+        let web = NetworkName::new("web").unwrap();
+        let db = NetworkName::new("db").unwrap();
+        let (c1, c2) = (
+            EndpointId::new("c1").unwrap(),
+            EndpointId::new("c2").unwrap(),
+        );
+        let p80 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 80, 80).unwrap();
+        let p81 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 81, 80).unwrap();
+        let udp80 = PortPublish::new(PortProtocol::Udp, a([192, 0, 2, 10]), 80, 80).unwrap();
+        let mut r = PortRegistry::new();
+        r.reserve(&web, &c1, &[p80]).unwrap();
+        // 同じネットワークの別コンテナ。p81 も予約されない（all-or-nothing）。
+        let e = r.reserve(&web, &c2, &[p81, p80]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::AlreadyExists);
+        assert_eq!(r.len(), 1);
+        // 別ネットワークでも競合する。プロトコルが違えば別の受け口。
+        assert_eq!(
+            r.reserve(&db, &c2, &[p80]).unwrap_err().code(),
+            NetErrorCode::AlreadyExists
+        );
+        r.reserve(&db, &c2, &[udp80]).unwrap();
+        assert_eq!(r.len(), 2);
+        // 指定内の重複。
+        let e = r.reserve(&db, &c1, &[p81, p81]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::AlreadyExists);
+        assert_eq!(r.release(&web, &c1), 1);
+        r.reserve(&db, &c2, &[p80]).unwrap();
+        assert_eq!(r.len(), 2);
     }
 }

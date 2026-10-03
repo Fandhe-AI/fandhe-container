@@ -125,7 +125,8 @@ fn add_address_and_route_in_isolated_netns() {
         IpPrefix::new(IpAddr::V6("fd00::1".parse::<Ipv6Addr>().expect("v6")), 64).expect("prefix"),
         AddrScope::Universe,
     )
-    .with_nodad();
+    .with_nodad()
+    .expect("IPv6 nodad");
     sock.add_address(&v6, T)
         .expect("add IPv6 address (is net.ipv6.conf.lo.disable_ipv6 set to 1?)");
     let v6_octets = "fd00::1".parse::<Ipv6Addr>().expect("v6").octets();

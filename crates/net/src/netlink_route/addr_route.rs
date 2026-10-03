@@ -451,9 +451,15 @@ impl AddressSpec {
     }
 
     /// IPv6 の DAD（重複アドレス検出）を省く（`IFA_F_NODAD`）。
-    pub fn with_nodad(mut self) -> Self {
+    ///
+    /// `0x02` は IPv4 では `IFA_F_SECONDARY` に当たり意図せず secondary 指定になるため、
+    /// IPv4 アドレスに対しては `InvalidArgument` を返す。
+    pub fn with_nodad(mut self) -> Result<Self, NetError> {
+        if self.local.family() != AF_INET6 {
+            return Err(invalid("NODAD is only valid for IPv6 addresses"));
+        }
         self.nodad = true;
-        self
+        Ok(self)
     }
 
     /// `ifaddrmsg` と `IFA_LOCAL` / `IFA_ADDRESS` を `b` へ書く。
@@ -672,7 +678,8 @@ mod tests {
             IpPrefix::new(IpAddr::V6(a6), 64).expect("prefix"),
             AddrScope::Universe,
         )
-        .with_nodad();
+        .with_nodad()
+        .expect("v6 nodad");
         let (payload, attrs) = build(RTM_NEWADDR, IFADDRMSG_LEN, |b| spec.encode_into(b));
         let h = IfAddrMsg::decode(&payload).expect("decode");
         assert_eq!(
@@ -689,6 +696,18 @@ mod tests {
         );
         let (payload, _) = build(RTM_NEWADDR, IFADDRMSG_LEN, |b| lo.encode_into(b));
         assert_eq!(IfAddrMsg::decode(&payload).expect("decode").scope(), 254);
+    }
+
+    /// NET-11: IPv4 に NODAD（= IFA_F_SECONDARY と同値）を指定すると拒否される。
+    #[test]
+    fn nodad_rejected_for_ipv4() {
+        let spec = AddressSpec::new(
+            ifx(1),
+            IpPrefix::new(v4(10, 0, 0, 2), 24).expect("prefix"),
+            AddrScope::Universe,
+        );
+        let err = spec.with_nodad().expect_err("v4 nodad must fail");
+        assert_eq!(err.code(), NetErrorCode::InvalidArgument);
     }
 
     /// NET-11・TASK-136.4 AC2: default route（0.0.0.0/0 via gateway）は RTA_DST を持たない。

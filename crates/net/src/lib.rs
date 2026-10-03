@@ -15,7 +15,9 @@
 //! payload（load 形式）・masq の型付き expr と NEWRULE の組み立て（`nftables_rules`。TASK-138.2・#310）と、
 //! cmp・immediate・nat（DNAT）の型付き expr とハンドル指定のルール削除 DELRULE の組み立て（`nftables_rules`。TASK-138.3・#311）と、
 //! 操作ごとの成功 / 失敗・所要時間の記録先を受け取る計装連携点（`instrument`。REPAIR-4）、ネットワーク作成処理（bridge・gateway・専用 nft テーブルと NAT base chain の作成と失敗時ロールバック。
-//! `RTM_DELLINK`・ifindex 取得を含む。`network`。TASK-139.1・#314）も持つ。link の down・bridge への接続、
+//! `RTM_DELLINK`・ifindex 取得を含む。`network`。TASK-139.1・#314）と、コンテナ接続（netns の作成と pin〔`netns`。Linux のみ〕・
+//! veth ペア作成・host 側の bridge 接続と up・peer 側の netns 移動と失敗時ロールバック。`network::attach_container`。
+//! `unshare` / `mount` は `sys` の薄いラッパー。TASK-139.2.1・#847）も持つ。link の down、
 //! masquerade ルール本体（nftables の bitwise / meta expr が前提）・ルールハンドルの取得経路（TASK-139.3 以降）、DNS ヘルパー等は未実装で、G10（TASK-136〜148・TASK-185〜186）で実装する（REPAIR-3）。
 //! PLUG-1 区分は検討中
 //! （制御面の `NetworkPlugin` は plugin 側に区分される一方、DNS ヘルパー・rootless 転送のデータパス
@@ -25,6 +27,8 @@ pub mod error;
 pub mod instrument;
 pub mod netlink;
 pub mod netlink_route;
+#[cfg(target_os = "linux")]
+pub mod netns;
 pub mod network;
 pub mod nftables_batch;
 pub mod nftables_rules;

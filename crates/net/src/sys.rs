@@ -1,4 +1,5 @@
-//! `NETLINK_ROUTE` / `NETLINK_NETFILTER` ソケットに使う syscall・FFI の薄いラッパー（`crates/net` の `sys` モジュール。
+//! `NETLINK_ROUTE` / `NETLINK_NETFILTER` ソケットと、netns の作成・pin（`unshare` / bind `mount` / `umount2`。
+//! `crate::netns`。TASK-139.2.1・NET-1）に使う syscall・FFI の薄いラッパー（`crates/net` の `sys` モジュール。
 //! `unsafe` 事前承認の範囲。coding-rust.md「unsafe・FFI・syscall」節・オーナー決定
 //! 2026-09-27〔[#4](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856057084)・
 //! [範囲限定](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856167174)〕）。
@@ -34,6 +35,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::ffi::CStr;
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::time::{Duration, Instant};
@@ -150,6 +152,12 @@ mod consts {
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ENOBUFS: i32 = 105;
     pub const EMSGSIZE: i32 = 90;
+    /// `unshare(2)` の network namespace フラグ（`linux/sched.h` の `CLONE_NEWNET`）。
+    pub const CLONE_NEWNET: i32 = 0x4000_0000;
+    /// `mount(2)` の bind マウント（`linux/mount.h` の `MS_BIND`）。
+    pub const MS_BIND: core::ffi::c_ulong = 4096;
+    /// `umount2(2)` の遅延アンマウント（`linux/fs.h` の `MNT_DETACH`）。
+    pub const MNT_DETACH: i32 = 2;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -184,6 +192,12 @@ mod consts {
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ENOBUFS: i32 = 105;
     pub const EMSGSIZE: i32 = 90;
+    /// `unshare(2)` の network namespace フラグ（`linux/sched.h` の `CLONE_NEWNET`）。
+    pub const CLONE_NEWNET: i32 = 0x4000_0000;
+    /// `mount(2)` の bind マウント（`linux/mount.h` の `MS_BIND`）。
+    pub const MS_BIND: core::ffi::c_ulong = 4096;
+    /// `umount2(2)` の遅延アンマウント（`linux/fs.h` の `MNT_DETACH`）。
+    pub const MNT_DETACH: i32 = 2;
 }
 
 /// 対応外アーキテクチャ: 値を確認していないためラッパーは `Unsupported` を返し、カーネルへ渡さない。
@@ -223,6 +237,9 @@ mod consts {
     pub const EAFNOSUPPORT: i32 = -9;
     pub const ENOBUFS: i32 = -10;
     pub const EMSGSIZE: i32 = -17;
+    pub const CLONE_NEWNET: i32 = 0;
+    pub const MS_BIND: core::ffi::c_ulong = 0;
+    pub const MNT_DETACH: i32 = 0;
 }
 
 // SAFETY: 以下は Linux の libc（glibc / musl 共通）が公開する C 関数の宣言で、引数・戻り値の型を
@@ -271,6 +288,21 @@ unsafe extern "C" {
         optval: *const core::ffi::c_void,
         optlen: u32,
     ) -> i32;
+    // 原型: `int unshare(int flags)`。
+    fn unshare(flags: i32) -> i32;
+    // 原型: `int mount(const char *source, const char *target, const char *filesystemtype,
+    // unsigned long mountflags, const void *data)`（`unsigned long` は `c_ulong`）。
+    fn mount(
+        source: *const core::ffi::c_char,
+        target: *const core::ffi::c_char,
+        fstype: *const core::ffi::c_char,
+        flags: core::ffi::c_ulong,
+        data: *const core::ffi::c_void,
+    ) -> i32;
+    // 原型: `int umount2(const char *target, int flags)`。
+    fn umount2(target: *const core::ffi::c_char, flags: i32) -> i32;
+    // 原型: `uid_t geteuid(void)`（`uid_t` は u32。失敗しない）。
+    fn geteuid() -> u32;
 }
 
 /// `struct sockaddr_nl`（include/uapi/linux/netlink.h。全アーキテクチャ共通の 12 バイト）。
@@ -596,6 +628,63 @@ pub(crate) fn recv_from(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<RecvMeta, 
     })
 }
 
+/// 呼び出しスレッドだけを新しい network namespace へ移す（`unshare(CLONE_NEWNET)`。TASK-139.2.1・NET-1）。
+///
+/// `crate::netns` の使い捨てスレッド内でのみ呼ぶ。`CLONE_NEWUSER` と違いマルチスレッドの
+/// プロセスでも合法で、影響は呼び出しスレッド（Linux ではタスク）だけに閉じる。元の namespace へ
+/// 戻る手段は持たないので、呼び出したスレッドは用が済んだら終了させること。`CAP_SYS_ADMIN` が必要。
+pub(crate) fn unshare_net() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は値渡しの整数 1 つでポインタを取らない。`CLONE_NEWNET` は定義済み定数。
+    // カーネル側の副作用は呼び出しスレッドの netns の差し替えのみで、メモリには触れない。
+    let rc = unsafe { unshare(consts::CLONE_NEWNET) };
+    if rc < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `source` を `target` へ bind マウントする（`mount(source, target, NULL, MS_BIND, NULL)`）。
+///
+/// netns の pin（`/proc/thread-self/ns/net` を通常ファイルへ重ねる）にだけ使う。fstype・data は
+/// 常に NULL で、他のマウント種別・フラグは公開しない。`CAP_SYS_ADMIN` が必要。
+pub(crate) fn bind_mount(source: &CStr, target: &CStr) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `source` / `target` は `CStr` なので NUL 終端済みで、この呼び出しの間は借用により
+    // 有効。カーネルは文字列を読むだけで保持しない。fstype と data は NULL（`MS_BIND` では無視される
+    // 組み合わせ）。フラグは定義済み定数 `MS_BIND` のみ。
+    let rc = unsafe {
+        mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            core::ptr::null(),
+            consts::MS_BIND,
+            core::ptr::null(),
+        )
+    };
+    if rc < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `target` のマウントを遅延アンマウントする（`umount2(target, MNT_DETACH)`）。
+/// 使用中でも名前空間から切り離すだけで、参照が尽きたときにカーネルが片付ける。
+/// マウントポイントでない場合は `EINVAL`。`CAP_SYS_ADMIN` が必要。
+pub(crate) fn unmount_detach(target: &CStr) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `target` は NUL 終端済みの `CStr` で、呼び出しの間は借用により有効。カーネルは文字列を
+    // 読むだけで保持しない。フラグは定義済み定数 `MNT_DETACH` のみ。
+    let rc = unsafe { umount2(target.as_ptr(), consts::MNT_DETACH) };
+    if rc < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 実効 UID を返す（`geteuid(2)`。失敗しない）。netns 置き場ディレクトリの所有者確認に使う。
+pub(crate) fn effective_uid() -> u32 {
+    // SAFETY: 引数なしで失敗せず、メモリにも触れない（POSIX の geteuid は常に成功する）。
+    unsafe { geteuid() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +712,9 @@ mod tests {
         assert_eq!(consts::ENODEV, 19);
         assert_eq!(consts::EINVAL, 22);
         assert_eq!(consts::EOPNOTSUPP, 95);
+        assert_eq!(consts::CLONE_NEWNET, 0x4000_0000);
+        assert_eq!(consts::MS_BIND, 4096);
+        assert_eq!(consts::MNT_DETACH, 2);
         assert_eq!(core::mem::size_of::<SockaddrNl>(), 12);
         assert_eq!(core::mem::size_of::<PollFd>(), 8);
     }

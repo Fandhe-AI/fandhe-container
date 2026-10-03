@@ -7,7 +7,7 @@
 //! 永続化は未実装で担当 Issue 未確定（REPAIR-3）。IPv6 は未対応（IPv4 のみ）。
 //!
 //! 接続処理は払い出しと同時に、その endpoint の netns pin 置き場（パスとディレクトリの識別子）を
-//! [`NetnsDirRecord`] として記録する。ネットワーク削除（`network::delete_network`。TASK-139.4・NET-1）は、
+//! `NetnsDirRecord` として記録する。ネットワーク削除（`network::delete_network`。TASK-139.4・NET-1）は、
 //! 渡されていない endpoint の pin の残存を、呼び出し側が渡すパスではなくこの記録の置き場で確認する
 //! （別の空ディレクトリを渡されて残存 pin を見落とし、生存 netns のアドレスを再払い出ししないため）。
 //! [`StaticIpam::reserve`] で復元した払い出しには記録が無く、削除はその pin を判定不能として
@@ -210,6 +210,9 @@ impl StaticIpam {
 
     /// 永続化済みの払い出しを復元する。サブネット外・prefix 長の不一致・network / broadcast /
     /// gateway は `InvalidArgument`、使用中のアドレスや払い出し済みの ID は `AlreadyExists`。
+    ///
+    /// 復元した払い出しには netns pin 置き場の記録（`NetnsDirRecord`）が付かない。`delete_network` は
+    /// その endpoint の pin の残存を判定できないため、アドレスを解放せず `Unknown` で報告する（TASK-139.4）。
     pub fn reserve(&mut self, endpoint: &EndpointId, addr: IpPrefix) -> Result<(), NetError> {
         let IpAddr::V4(a) = addr.addr() else {
             return Err(invalid("ipam supports ipv4 only"));

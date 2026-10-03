@@ -1,10 +1,11 @@
-//! `NETLINK_ROUTE` ソケットに使う syscall・FFI の薄いラッパー（`crates/net` の `sys` モジュール。
+//! `NETLINK_ROUTE` / `NETLINK_NETFILTER` ソケットに使う syscall・FFI の薄いラッパー（`crates/net` の `sys` モジュール。
 //! `unsafe` 事前承認の範囲。coding-rust.md「unsafe・FFI・syscall」節・オーナー決定
 //! 2026-09-27〔[#4](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856057084)・
 //! [範囲限定](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856167174)〕）。
 //!
 //! # 呼び出し文脈
-//! `crate::netlink_route::NetlinkRouteSocket`（NET-11・TASK-136.2.1・#843）の `open` / `send` / `recv` が、
+//! `crate::netlink_route::NetlinkRouteSocket`（NET-11・TASK-136.2.1・#843。nf_tables のバッチ送信 TASK-137.3・#306
+//! では protocol だけ `NETLINK_NETFILTER` に差し替えて再利用する）の `open` / `send` / `recv` が、
 //! `socket(2)`・`bind(2)`・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶために使う。
 //! メッセージの組み立て・解釈は `crate::netlink` のコーデックが担い、ここはバイト列を
 //! 運ぶだけで中身を解釈しない。
@@ -54,8 +55,8 @@ pub(crate) enum SysError {
 const EINTR_RETRY_MAX: u32 = 16;
 
 pub(crate) use consts::{
-    EACCES, EAFNOSUPPORT, EAGAIN, EBUSY, EEXIST, EINTR, EINVAL, EMFILE, ENFILE, ENOBUFS, ENODEV,
-    ENOENT, ENOMEM, EOPNOTSUPP, EPERM, EPROTONOSUPPORT,
+    EACCES, EAFNOSUPPORT, EAGAIN, EBUSY, EEXIST, EINTR, EINVAL, EMFILE, EMSGSIZE, ENFILE, ENOBUFS,
+    ENODEV, ENOENT, ENOMEM, EOPNOTSUPP, EPERM, EPROTONOSUPPORT,
 };
 
 /// 受信待ち全体の期限（REPAIR-5）。単調時計（`Instant`）の開始時刻と全体 timeout を持ち、
@@ -121,6 +122,7 @@ mod consts {
     pub const SOCK_RAW: i32 = 3;
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
     pub const NETLINK_ROUTE: i32 = 0;
+    pub const NETLINK_NETFILTER: i32 = 12;
     pub const MSG_PEEK: i32 = 0x02;
     pub const MSG_TRUNC: i32 = 0x20;
     pub const MSG_DONTWAIT: i32 = 0x40;
@@ -141,6 +143,7 @@ mod consts {
     pub const EOPNOTSUPP: i32 = 95;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ENOBUFS: i32 = 105;
+    pub const EMSGSIZE: i32 = 90;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -150,6 +153,7 @@ mod consts {
     pub const SOCK_RAW: i32 = 3;
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
     pub const NETLINK_ROUTE: i32 = 0;
+    pub const NETLINK_NETFILTER: i32 = 12;
     pub const MSG_PEEK: i32 = 0x02;
     pub const MSG_TRUNC: i32 = 0x20;
     pub const MSG_DONTWAIT: i32 = 0x40;
@@ -170,6 +174,7 @@ mod consts {
     pub const EOPNOTSUPP: i32 = 95;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ENOBUFS: i32 = 105;
+    pub const EMSGSIZE: i32 = 90;
 }
 
 /// 対応外アーキテクチャ: 値を確認していないためラッパーは `Unsupported` を返し、カーネルへ渡さない。
@@ -184,6 +189,7 @@ mod consts {
     pub const SOCK_RAW: i32 = 0;
     pub const SOCK_CLOEXEC: i32 = 0;
     pub const NETLINK_ROUTE: i32 = 0;
+    pub const NETLINK_NETFILTER: i32 = 0;
     pub const MSG_PEEK: i32 = 0;
     pub const MSG_TRUNC: i32 = 0;
     pub const MSG_DONTWAIT: i32 = 0;
@@ -204,6 +210,7 @@ mod consts {
     pub const EOPNOTSUPP: i32 = -16;
     pub const EAFNOSUPPORT: i32 = -9;
     pub const ENOBUFS: i32 = -10;
+    pub const EMSGSIZE: i32 = -17;
 }
 
 // SAFETY: 以下は Linux の libc（glibc / musl 共通）が公開する C 関数の宣言で、引数・戻り値の型を
@@ -292,16 +299,29 @@ fn last_error() -> SysError {
 ///
 /// `SOCK_CLOEXEC` により exec 先（コンテナプロセス）へ fd を漏らさない。
 pub(crate) fn open_route_socket() -> Result<OwnedFd, SysError> {
+    open_socket(consts::NETLINK_ROUTE)
+}
+
+/// `NETLINK_NETFILTER`（nf_tables のバッチ送信用。TASK-137.3・#306）の `SOCK_RAW|SOCK_CLOEXEC`
+/// ソケットを開く（未 bind）。`SOCK_CLOEXEC` の理由は [`open_route_socket`] と同じ。
+pub(crate) fn open_netfilter_socket() -> Result<OwnedFd, SysError> {
+    open_socket(consts::NETLINK_NETFILTER)
+}
+
+/// netlink の `SOCK_RAW|SOCK_CLOEXEC` ソケットを `protocol`（`NETLINK_*`）で開く。`protocol` は
+/// このモジュールの定数だけが渡される（外部入力を渡す経路を公開しない）。
+fn open_socket(protocol: i32) -> Result<OwnedFd, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    // SAFETY: 引数はすべて値渡しの整数でポインタを取らない。成功時の戻り値は新規 fd で、直後に
-    // `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    // SAFETY: 引数はすべて値渡しの整数でポインタを取らない。`protocol` は上の 2 つの公開関数が渡す
+    // 定義済み定数のみ。成功時の戻り値は新規 fd で、直後に `OwnedFd` が唯一の所有者となる
+    // （二重 close なし）。
     let fd = unsafe {
         socket(
             i32::from(consts::AF_NETLINK),
             consts::SOCK_RAW | consts::SOCK_CLOEXEC,
-            consts::NETLINK_ROUTE,
+            protocol,
         )
     };
     if fd < 0 {

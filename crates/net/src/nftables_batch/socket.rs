@@ -1,0 +1,454 @@
+//! `NETLINK_NETFILTER` ソケットでの nf_tables バッチ送信と ACK / エラー判定（TASK-137.3・NET-11・
+//! REPAIR-5・MS-8・#306。Linux のみ）。
+//!
+//! `NftBatch`（#304・#305）が組み立てた閉じたバッチを 1 データグラムで送り、本体メッセージごとの
+//! ACK / `NLMSG_ERROR` を [`NftBatchAckCollector`] で判定する。往復全体を 1 つの期限で覆い、無応答で
+//! ハングしない（REPAIR-5）。
+//!
+//! # 構成と責務境界
+//!
+//! - ソケットの open / bind / send / recv は `NetlinkRouteSocket`（TASK-136.2。protocol だけ
+//!   `NETLINK_NETFILTER` に差し替えて再利用）が担い、本型は seq の採番・往復の直列化・期限の管理だけを持つ。
+//!   rtnetlink 固有の往復（dump / DONE の終端規則）は公開しない
+//! - 判定ロジックは `ack` の状態機械。ここは「`recv(残り時間)` → `feed`」を繰り返す薄いループ
+//! - seq はソケットが所有する（呼び出し側は指定できない）。以前に時間切れしたバッチの遅延応答は
+//!   `[begin_seq..=end_seq]` の外になり、衝突しない。マルチキャストは購読しない
+//!
+//! # 未実装範囲（REPAIR-3）
+//!
+//! - `SO_SNDBUF` / `SO_RCVBUF` の調整。送信できる長さはソケットの既定 `SO_SNDBUF`（sysctl 依存で約 212 KB）
+//!   で決まり、超えると `EMSGSIZE` を `ResourceExhausted`（`NotSent`）で返す。ACK が大量で受信バッファが
+//!   あふれた場合（`ENOBUFS`）も待ち続けず `ResourceExhausted`（`Unknown`）で返す（fail-closed）
+//! - extended ACK と `NFTA_GEN_ID` による楽観的並行制御
+//! - route ソケットとの共通コア（`NetlinkSocketCore` 等）の切り出し
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
+use super::ack::{NftBatchAck, NftBatchAckCollector, NftBatchError, Progress};
+use super::{NftBatch, NftBatchBytes};
+use crate::error::{NetError, NetErrorCode};
+use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
+use crate::netlink_route::{NetlinkRouteSocket, RequestGate};
+use crate::sys::Deadline;
+
+/// bind 済みの `NETLINK_NETFILTER` ソケット（NET-11）。
+///
+/// `Send + Sync` で、バッチの往復は内部で 1 件ずつに直列化する。fd は `SOCK_CLOEXEC` で、Drop で閉じる。
+/// 内部実装は `NetlinkRouteSocket` の再利用（型名と実体のずれは本モジュール doc の未実装範囲を参照）。
+#[derive(Debug)]
+pub struct NetlinkNetfilterSocket {
+    inner: NetlinkRouteSocket,
+    gate: RequestGate,
+    /// 次のバッチの BEGIN の seq（0 は使わない）。`gate` 保持中だけ読み書きする。
+    next_seq: AtomicU32,
+}
+
+/// `end_seq` の次に使う seq（0 は飛ばす）。
+fn seq_after(end_seq: u32) -> u32 {
+    match end_seq.wrapping_add(1) {
+        0 => 1,
+        n => n,
+    }
+}
+
+fn timeout_not_sent(msg: String) -> NftBatchError {
+    NftBatchError::not_sent(NetError::new(NetErrorCode::Timeout, msg))
+}
+
+/// 閉じたバッチを `send` で送り、`recv` で ACK / エラーを期限内に集める（判定の本体）。
+///
+/// `send` / `recv` は本番では `NetlinkNetfilterSocket` のもの、単体試験では決定的な偽物。
+/// 期限後に届いた応答は成功・エラーを問わず `Timeout`（`Unknown`）に揃える（REPAIR-5）。
+fn exchange(
+    batch: &NftBatchBytes,
+    deadline: &Deadline,
+    total: Duration,
+    send: impl FnOnce(&NftBatchBytes) -> Result<(), NetError>,
+    mut recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
+) -> Result<NftBatchAck, NftBatchError> {
+    // 本体が無いと成功 ACK が 1 件も返らず、成功を確認できない（fail-closed）。
+    if batch.body_seqs().is_empty() {
+        return Err(NftBatchError::not_sent(NetError::new(
+            NetErrorCode::InvalidArgument,
+            "nf_tables batch has no body message",
+        )));
+    }
+    if deadline.remaining().is_zero() {
+        return Err(timeout_not_sent(format!(
+            "nf_tables batch not sent: deadline of {} ms passed",
+            total.as_millis()
+        )));
+    }
+    let mut collector = NftBatchAckCollector::new(batch);
+    if let Err(e) = send(batch) {
+        // 部分送信（DataLoss）は一部がカーネルへ渡った可能性があるので適用状態は不明。
+        return Err(if e.code() == NetErrorCode::DataLoss {
+            NftBatchError::unknown_outcome(e)
+        } else {
+            NftBatchError::not_sent(e)
+        });
+    }
+    loop {
+        let data = match recv(deadline.remaining()) {
+            Ok(d) => d,
+            Err(e) if e.code() == NetErrorCode::Timeout => {
+                return Err(collector.timeout_error(total));
+            }
+            // ENOBUFS（ACK の取りこぼし）など。待ち続けない。
+            Err(e) => return Err(collector.unknown(e)),
+        };
+        let result = collector.feed(&data);
+        // 判定中に期限を過ぎた場合は、成功も失敗も Timeout に統一する。
+        if deadline.remaining().is_zero() {
+            return match result {
+                Err(e) if e.code() == NetErrorCode::Timeout => Err(e),
+                _ => Err(collector.timeout_error(total)),
+            };
+        }
+        match result? {
+            Progress::Done(ack) => return Ok(ack),
+            Progress::Pending => {}
+        }
+    }
+}
+
+impl NetlinkNetfilterSocket {
+    /// ソケットを開いて bind する（計測結果は記録しない）。
+    pub fn open() -> Result<Self, NetError> {
+        Self::open_with_recorder(Arc::new(NoopNetOpRecorder))
+    }
+
+    /// ソケットを開いて bind し、以後の open / send / recv / バッチ往復の結果と所要時間を
+    /// `recorder` へ渡す（REPAIR-4）。
+    pub fn open_with_recorder(recorder: Arc<dyn NetOpRecorder>) -> Result<Self, NetError> {
+        Ok(Self {
+            inner: NetlinkRouteSocket::open_netfilter_with_recorder(recorder)?,
+            gate: RequestGate::default(),
+            next_seq: AtomicU32::new(1),
+        })
+    }
+
+    /// バッチを組み立てて送り、本体メッセージごとの ACK / エラーが揃うまで待つ（NET-11・TASK-137.3）。
+    ///
+    /// `fill` が `NftBatch::push_with` で本体メッセージを積む。`timeout` は順番待ち・組み立て・送信・
+    /// 応答待ちを通した全体の期限で、超えれば `Timeout`（REPAIR-5）。`NetOpKind::NftBatch` として記録する。
+    ///
+    /// 戻り値の判定:
+    /// - 成功: 本体のすべてが errno 0 で ACK された
+    /// - カーネルの失敗: [`NftBatchError::failures`] に失敗したメッセージの位置・seq・errno を全件並べ、
+    ///   outcome は `Aborted`。nf_tables のバッチは all-or-nothing で何も適用されておらず、他メッセージの
+    ///   errno 0 の ACK は「適用済み」を意味しない
+    /// - `Timeout` / `DataLoss` / `ResourceExhausted`（受信欠落）: outcome は `Unknown`。適用されたか不明
+    ///   なので、呼び出し側が状態を再照会すること
+    /// - 空バッチ・組み立て失敗・送信前の期限切れ・送信拒否（`EMSGSIZE` を含む）: outcome は `NotSent`
+    pub fn send_batch(
+        &self,
+        timeout: Duration,
+        fill: impl FnOnce(&mut NftBatch) -> Result<(), NetError>,
+    ) -> Result<NftBatchAck, NftBatchError> {
+        record_net_op(self.inner.recorder().as_ref(), NetOpKind::NftBatch, || {
+            let deadline = Deadline::after(timeout);
+            let _turn = self
+                .gate
+                .acquire(&deadline, timeout)
+                .map_err(NftBatchError::not_sent)?;
+            let mut batch = NftBatch::new(self.next_seq.load(Ordering::Relaxed))
+                .map_err(NftBatchError::not_sent)?;
+            fill(&mut batch).map_err(NftBatchError::not_sent)?;
+            let bytes = batch.finish().map_err(NftBatchError::not_sent)?;
+            // 送る・送らないによらず今回の範囲は再利用しない（遅延応答との衝突を避ける）。
+            self.next_seq
+                .store(seq_after(bytes.end_seq()), Ordering::Relaxed);
+            exchange(
+                &bytes,
+                &deadline,
+                timeout,
+                |b| self.inner.send_batch_bytes(b),
+                |t| self.inner.recv(t),
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instrument::NetOpOutcome;
+    use crate::instrument::testing::Collect;
+    use crate::netlink::{NLM_F_ACK, NLM_F_REQUEST, NLMSG_ERROR, NlMsgBuilder};
+    use crate::nftables_batch::{
+        NFNL_SUBSYS_NFTABLES, NFPROTO_INET, NfGenMsg, NftBatchOutcome, nfnl_msg_type,
+    };
+
+    const NEWTABLE: u16 = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, 0);
+
+    fn push_body(b: &mut NftBatch) -> Result<(), NetError> {
+        b.push_with(|seq| {
+            let mut m = NlMsgBuilder::new(NEWTABLE, NLM_F_REQUEST | NLM_F_ACK, seq, 0);
+            NfGenMsg::new(NFPROTO_INET, 0).put_into(&mut m)?;
+            Ok(m)
+        })
+        .map(|_| ())
+    }
+
+    fn batch(n: usize) -> NftBatchBytes {
+        let mut b = NftBatch::new(10).expect("new");
+        for _ in 0..n {
+            push_body(&mut b).expect("push");
+        }
+        b.finish().expect("finish")
+    }
+
+    fn err_dgram(seq: u32, errno: i32) -> Vec<u8> {
+        let mut b = NlMsgBuilder::new(NLMSG_ERROR, 0, seq, 0);
+        let mut p = Vec::new();
+        p.extend_from_slice(&(-errno).to_ne_bytes());
+        p.extend_from_slice(&[0u8; 8]);
+        p.extend_from_slice(&seq.to_ne_bytes());
+        p.extend_from_slice(&[0u8; 4]);
+        b.put_fixed(&p).expect("payload");
+        b.finish().expect("finish")
+    }
+
+    /// 偽 recv: 順に返し、尽きたら Timeout。
+    fn script(
+        mut items: Vec<Result<Vec<u8>, NetError>>,
+    ) -> impl FnMut(Duration) -> Result<Vec<u8>, NetError> {
+        items.reverse();
+        move |_| {
+            items
+                .pop()
+                .unwrap_or_else(|| Err(NetError::new(NetErrorCode::Timeout, "none")))
+        }
+    }
+
+    fn run(
+        b: &NftBatchBytes,
+        total: Duration,
+        send: impl FnOnce(&NftBatchBytes) -> Result<(), NetError>,
+        recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
+    ) -> Result<NftBatchAck, NftBatchError> {
+        exchange(b, &Deadline::after(total), total, send, recv)
+    }
+
+    /// NET-11: 全 ACK で成功する。
+    #[test]
+    fn net11_exchange_succeeds_with_all_acks() {
+        let b = batch(2);
+        let ack = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![Ok([err_dgram(11, 0), err_dgram(12, 0)].concat())]),
+        )
+        .expect("ok");
+        assert_eq!(ack.body_seqs(), &[11, 12][..]);
+    }
+
+    /// REPAIR-5: 無応答なら Timeout / Unknown（ハングしない）。
+    #[test]
+    fn repair5_silent_socket_times_out() {
+        let b = batch(1);
+        let e = run(&b, Duration::from_millis(50), |_| Ok(()), script(vec![])).expect_err("t");
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+    }
+
+    /// REPAIR-5: 期限後に届いた ACK は成功にせず Timeout に揃える。
+    #[test]
+    fn repair5_late_ack_after_deadline_is_timeout() {
+        let b = batch(1);
+        let total = Duration::from_millis(30);
+        let mut items = vec![Ok(err_dgram(11, 0))];
+        let e = run(
+            &b,
+            total,
+            |_| Ok(()),
+            move |_| {
+                std::thread::sleep(Duration::from_millis(60));
+                items
+                    .pop()
+                    .unwrap_or_else(|| Err(NetError::new(NetErrorCode::Timeout, "n")))
+            },
+        )
+        .expect_err("late");
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+    }
+
+    /// REPAIR-5: 送信前に期限が切れていれば送らない（NotSent）。
+    #[test]
+    fn repair5_expired_before_send_is_not_sent() {
+        let b = batch(1);
+        let mut sent = false;
+        let e = run(
+            &b,
+            Duration::ZERO,
+            |_| {
+                sent = true;
+                Ok(())
+            },
+            script(vec![]),
+        )
+        .expect_err("expired");
+        assert!(!sent);
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert_eq!(e.outcome(), NftBatchOutcome::NotSent);
+    }
+
+    /// NET-11: 空バッチは送らずに InvalidArgument / NotSent。
+    #[test]
+    fn empty_batch_is_rejected_before_send() {
+        let b = batch(0);
+        let mut sent = false;
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| {
+                sent = true;
+                Ok(())
+            },
+            script(vec![]),
+        )
+        .expect_err("empty");
+        assert!(!sent);
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        assert_eq!(e.outcome(), NftBatchOutcome::NotSent);
+    }
+
+    /// NET-11: 受信の ENOBUFS は待ち続けず ResourceExhausted / Unknown（後続の recv を呼ばない）。
+    #[test]
+    fn enobufs_on_recv_is_resource_exhausted_unknown() {
+        let b = batch(1);
+        let mut calls = 0;
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            |_| {
+                calls += 1;
+                Err(NetError::new(
+                    NetErrorCode::ResourceExhausted,
+                    "recvfrom failed: errno 105",
+                ))
+            },
+        )
+        .expect_err("enobufs");
+        assert_eq!(calls, 1);
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+    }
+
+    /// NET-11: 送信の EMSGSIZE は ResourceExhausted / NotSent。部分送信は Unknown。
+    #[test]
+    fn send_errors_map_to_outcome() {
+        let b = batch(1);
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| {
+                Err(NetError::new(
+                    NetErrorCode::ResourceExhausted,
+                    "sendto failed: errno 90",
+                ))
+            },
+            script(vec![]),
+        )
+        .expect_err("emsgsize");
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(e.outcome(), NftBatchOutcome::NotSent);
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| {
+                Err(NetError::new(
+                    NetErrorCode::DataLoss,
+                    "partial netlink send: 1 of 2 bytes",
+                ))
+            },
+            script(vec![]),
+        )
+        .expect_err("partial");
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+    }
+
+    /// NET-11: 失敗を返した応答は Aborted で位置を特定する。
+    #[test]
+    fn net11_exchange_reports_failed_message() {
+        let b = batch(2);
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![Ok([err_dgram(11, 0), err_dgram(12, 17)].concat())]),
+        )
+        .expect_err("fail");
+        assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
+        assert_eq!(e.code(), NetErrorCode::AlreadyExists);
+        assert_eq!(e.failures().len(), 1);
+    }
+
+    /// NET-11: 次の seq は END の次で、0 を飛ばす。
+    #[test]
+    fn seq_allocation_advances_past_end_and_skips_zero() {
+        assert_eq!(seq_after(5), 6);
+        assert_eq!(seq_after(u32::MAX), 1);
+    }
+
+    /// REPAIR-5: 門の順番待ちも期限で打ち切る（NotSent / Timeout）。
+    #[test]
+    fn repair5_gate_wait_is_bounded() {
+        let s = NetlinkNetfilterSocket::open().expect("open");
+        let _held = s
+            .gate
+            .acquire(
+                &Deadline::after(Duration::from_secs(5)),
+                Duration::from_secs(5),
+            )
+            .expect("gate");
+        let e = s
+            .send_batch(Duration::from_millis(50), push_body)
+            .expect_err("gate wait");
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert_eq!(e.outcome(), NftBatchOutcome::NotSent);
+    }
+
+    /// REPAIR-4: 送信前に失敗するバッチも NftBatch として 1 件記録される。fill の失敗は NotSent。
+    #[test]
+    fn repair4_send_batch_is_recorded_and_seq_advances() {
+        let collect = Arc::new(Collect::default());
+        let s = NetlinkNetfilterSocket::open_with_recorder(collect.clone()).expect("open");
+        let e = s
+            .send_batch(Duration::from_secs(5), |_| {
+                Err(NetError::new(NetErrorCode::InvalidArgument, "bad"))
+            })
+            .expect_err("fill");
+        assert_eq!(e.outcome(), NftBatchOutcome::NotSent);
+        let e = s
+            .send_batch(Duration::from_secs(5), |_| Ok(()))
+            .expect_err("empty");
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        assert_eq!(s.next_seq.load(Ordering::Relaxed), 3);
+        let nft: Vec<_> = collect
+            .kinds()
+            .into_iter()
+            .filter(|k| k.0 == NetOpKind::NftBatch)
+            .collect();
+        assert_eq!(
+            nft,
+            vec![
+                (NetOpKind::NftBatch, NetOpOutcome::Failure),
+                (NetOpKind::NftBatch, NetOpOutcome::Failure)
+            ]
+        );
+    }
+
+    /// NET-11: 複数スレッドから共有できる。
+    #[test]
+    fn socket_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NetlinkNetfilterSocket>();
+    }
+}

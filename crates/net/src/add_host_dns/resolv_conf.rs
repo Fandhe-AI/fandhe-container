@@ -164,8 +164,10 @@ impl ResolvConfPlan {
             opts.mode(0o644);
         }
         let body = self.render();
+        // 作成に失敗した（既存名との衝突を含む）場合は、他の書き込み処理の tmp を消さないよう後始末せず返す。
+        let mut f = opts.open(tmp).map_err(|_| werr())?;
+        // ここから先は自分が作成した tmp のみを所有しているので、失敗時に削除してよい。
         let result = (|| {
-            let mut f = opts.open(tmp).map_err(|_| werr())?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

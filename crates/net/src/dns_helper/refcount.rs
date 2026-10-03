@@ -25,6 +25,10 @@
 //! - 起動・停止の成否と所要時間は [`NetOpRecorder`] へ記録する（REPAIR-4。`NetOpKind::DnsHelperStart` / `DnsHelperStop`）
 //! - ネットワーク数・参加数は上限つき（DoS 対策）。エラー文言にネットワーク名・endpoint・アドレス・pid を含めない
 //!
+//! # 実機結合テスト
+//! 実ネットワーク上のオンデマンド起動・終了は `crates/net/tests/dns_helper_ondemand_privileged.rs`
+//! （TASK-144.2・#330。root 前提で `-- --ignored` 指定時のみ実行）で確かめる。実機での実証は TASK-145。
+//!
 //! # 未実装（REPAIR-3）
 //! - プロセスをまたぐ参照カウントの永続化（CORE-1 により CLI 起動ごとに別プロセスのため、最終的にはファイルと
 //!   ロック等での共有が要る。本モジュールはプロセス内の排他制御まで）

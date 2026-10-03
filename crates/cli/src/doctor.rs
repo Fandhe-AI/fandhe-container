@@ -4,7 +4,8 @@
 //! Docker と同一ホストで自前ネットワーク（NET-1）を併存させると、`br_netfilter` がロードされ、
 //! かつ Docker が iptables の `FORWARD` チェインを `policy drop` にしている環境では、bridge 経由の
 //! 転送が Docker のチェインで落とされ外部到達性が損なわれる可能性がある。本モジュールは次の 2 つの
-//! 事実を取得するだけで、2 条件の組み合わせ判定・警告文・DOCKER-USER 案内・終了コード・サブコマンド配線は
+//! 事実を取得するだけで（`FORWARD` policy はホストの `ip filter FORWARD` チェインの値であり、Docker が設定した
+//! 値かどうかは照会だけでは判別できない。Docker 起因かの判定は別の根拠で行う。NET-10）、2 条件の組み合わせ判定・警告文・DOCKER-USER 案内・終了コード・サブコマンド配線は
 //! 後続の TASK-148.2（#344）と TASK-79 の範囲である（[`DoctorFindings`] を渡す）。
 //!
 //! # 確認方法
@@ -148,7 +149,10 @@ fn read_limited(path: &Path) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Docker の `FORWARD` チェイン policy の取得結果。
+/// ホストの `ip filter FORWARD` チェイン policy の取得結果。
+///
+/// 値はホスト上のチェインの状態で、Docker が設定したものかどうかは照会だけでは判別できない
+/// （Docker 起因かの判定は別の根拠で行う。NET-10 の診断材料）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardPolicyState {
     /// base chain の policy を取得できた。
@@ -242,7 +246,7 @@ fn has_legacy_filter(root: &Path) -> Option<bool> {
 pub struct DoctorFindings {
     /// `br_netfilter` のロード状態。
     pub br_netfilter: BrNetfilterState,
-    /// Docker の `FORWARD` チェイン policy。
+    /// ホストの `ip filter FORWARD` チェイン policy（Docker 設定かは別途判定。NET-10）。
     pub forward_policy: ForwardPolicyState,
 }
 

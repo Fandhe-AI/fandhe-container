@@ -38,7 +38,7 @@
 //! - `DELCHAIN`・GETTABLE / GETCHAIN 以外の GET 系（ダンプ要求を含む）・`NFT_MSG_DESTROYTABLE`
 //!
 //! 読み取りは `NFT_MSG_GETCHAIN` と応答の `NFTA_CHAIN_POLICY` の復号のみ実装済み（[`ChainGet`]・[`ChainInfo`]。
-//! TASK-148.1・NET-10。cli の `doctor` が Docker の `FORWARD` チェイン policy を調べるために使う）。
+//! TASK-148.1・NET-10。cli の `doctor` がホストの `ip filter FORWARD` チェイン policy を調べるために使う）。
 //! - ARP / Bridge / Netdev の base chain と ingress hook（netdev は `NFTA_HOOK_DEV` が必須）
 //! - ルール（TASK-138）
 
@@ -470,7 +470,7 @@ impl TableInfo {
 
 /// `NFT_MSG_GETCHAIN`。チェインの policy を読み取り専用で照会する（TASK-148.1・NET-10・NET-11）。
 ///
-/// [`TableGet`] と同じ単発要求で、ルールセットを変更しない。Docker の `filter` / `FORWARD` が
+/// [`TableGet`] と同じ単発要求で、ルールセットを変更しない。ホストの `ip filter FORWARD` が
 /// `policy drop` かを調べる cli の `doctor` から呼ばれる。無ければ `-ENOENT`（`NotFound`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainGet {

@@ -329,6 +329,10 @@ pub(crate) trait NetworkOps {
     /// 名前から ifindex を引く。`IFLA_IFALIAS` が `token` と一致しない（同名の別 link に差し替わった）
     /// 場合は `FailedPrecondition` で失敗し、その link を操作させない。
     fn link_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError>;
+    /// 操作直前の所有再確認。`name` が今も `index` を指し、かつ所有トークンが `token` と一致する
+    /// 場合のみ `Ok`。確認後に bridge が削除され ifindex が別 link に再利用された場合を、各操作の
+    /// 直前で検出するために使う。不一致は `FailedPrecondition`。
+    fn verify_owned(&self, name: &IfName, token: &str, index: IfIndex) -> Result<(), NetError>;
     fn add_address(&self, index: IfIndex, gateway: &IpPrefix) -> Result<(), NetError>;
     /// 取得済みの ifindex で up にする（名前再解決で別 link を操作しない）。
     fn set_up(&self, index: IfIndex) -> Result<(), NetError>;
@@ -384,12 +388,34 @@ fn ownership_token(network: &NetworkName) -> String {
     )
 }
 
+/// 操作直前に ifindex の所有を再確認する。
+fn ensure_owned(
+    ops: &impl NetworkOps,
+    bridge: &IfName,
+    token: &str,
+    index: IfIndex,
+) -> Result<(), NetError> {
+    ops.verify_owned(bridge, token, index)
+}
+
+/// 所有を再確認してから削除する。再確認できない（不一致・消失・時間切れ等）場合は別 link を
+/// 巻き込まないよう削除せず Unknown で報告する。カーネルには所有トークン条件付きの削除が無く、
+/// 再確認から削除までの極小の窓は残る（ifindex は単調増加で割り当てられ、短時間での再利用は
+/// 通常起きない）。
 fn rollback_bridge(
     ops: &impl NetworkOps,
     bridge: &IfName,
+    token: &str,
     index: IfIndex,
     report: &mut RollbackReport,
 ) {
+    if ensure_owned(ops, bridge, token, index).is_err() {
+        report.leftover.push((
+            NetworkResource::Bridge(bridge.clone()),
+            ResourceState::Unknown,
+        ));
+        return;
+    }
     match ops.delete_bridge(index) {
         Ok(()) => report.removed.push(NetworkResource::Bridge(bridge.clone())),
         // Timeout / DataLoss は削除が適用されたか不明なので、Present と断定せず Unknown で報告する。
@@ -452,18 +478,20 @@ pub(crate) fn create_network_with(
     };
     let step_fail = |e: NetError, step: CreateStep| {
         let mut report = RollbackReport::default();
-        rollback_bridge(ops, &bridge, index, &mut report);
+        rollback_bridge(ops, &bridge, &token, index, &mut report);
         fail(e, step, report)
     };
+    ensure_owned(ops, &bridge, &token, index).map_err(|e| step_fail(e, CreateStep::AddAddress))?;
     ops.add_address(index, &spec.gateway())
         .map_err(|e| step_fail(e, CreateStep::AddAddress))?;
+    ensure_owned(ops, &bridge, &token, index).map_err(|e| step_fail(e, CreateStep::SetUp))?;
     ops.set_up(index)
         .map_err(|e| step_fail(e, CreateStep::SetUp))?;
 
     // 5. nft テーブル。バッチは all-or-nothing のため、Unknown 以外は nft 側に何も残らない。
     if let Err(f) = ops.apply_nft(&table) {
         let mut report = RollbackReport::default();
-        rollback_bridge(ops, &bridge, index, &mut report);
+        rollback_bridge(ops, &bridge, &token, index, &mut report);
         if !matches!(
             f.outcome,
             NftBatchOutcome::Aborted | NftBatchOutcome::NotSent
@@ -509,6 +537,18 @@ impl NetworkOps for LinuxNetworkOps<'_> {
 
     fn link_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError> {
         self.route.link_index_owned(name, token, self.timeout)
+    }
+
+    fn verify_owned(&self, name: &IfName, token: &str, index: IfIndex) -> Result<(), NetError> {
+        let now = self.route.link_index_owned(name, token, self.timeout)?;
+        if now == index {
+            Ok(())
+        } else {
+            Err(NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "link ifindex changed (link was replaced)",
+            ))
+        }
     }
 
     fn add_address(&self, index: IfIndex, gateway: &IpPrefix) -> Result<(), NetError> {
@@ -714,6 +754,9 @@ mod tests {
         fail_nft: Option<(NetErrorCode, NftBatchOutcome)>,
         fail_delete: bool,
         delete_code: Option<NetErrorCode>,
+        /// 指定回数の verify_owned 成功後に FailedPrecondition を返す（差し替えの注入）。
+        fail_verify_after: Option<u32>,
+        verify_count: std::cell::Cell<u32>,
     }
 
     impl Fake {
@@ -740,6 +783,17 @@ mod tests {
                 return Err(err(NetErrorCode::NotFound));
             }
             IfIndex::new(7)
+        }
+        fn verify_owned(&self, _: &IfName, _: &str, _: IfIndex) -> Result<(), NetError> {
+            self.rec("verify_owned");
+            if self.fail_verify_after.is_some_and(|n| {
+                let c = self.verify_count.get() + 1;
+                self.verify_count.set(c);
+                c > n
+            }) {
+                return Err(err(NetErrorCode::FailedPrecondition));
+            }
+            Ok(())
         }
         fn add_address(&self, _: IfIndex, _: &IpPrefix) -> Result<(), NetError> {
             self.rec("add_address");
@@ -792,7 +846,9 @@ mod tests {
             [
                 "create_bridge",
                 "link_index",
+                "verify_owned",
                 "add_address",
+                "verify_owned",
                 "set_up",
                 "apply_nft"
             ]
@@ -892,7 +948,9 @@ mod tests {
                 vec![
                     "create_bridge",
                     "link_index",
+                    "verify_owned",
                     "add_address",
+                    "verify_owned",
                     "delete_bridge",
                 ],
             ),
@@ -905,8 +963,11 @@ mod tests {
                 vec![
                     "create_bridge",
                     "link_index",
+                    "verify_owned",
                     "add_address",
+                    "verify_owned",
                     "set_up",
+                    "verify_owned",
                     "delete_bridge",
                 ],
             ),
@@ -1032,5 +1093,75 @@ mod tests {
                 )]
             );
         }
+    }
+
+    /// NET-1: add_address 直前の所有再確認で差し替えを検出したら、操作も削除もせず Unknown で報告する。
+    #[test]
+    fn net1_replaced_before_add_address_touches_nothing() {
+        let f = Fake {
+            fail_verify_after: Some(0),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(
+            f.calls(),
+            [
+                "create_bridge",
+                "link_index",
+                "verify_owned",
+                "verify_owned"
+            ]
+        );
+        assert_eq!(e.step, CreateStep::AddAddress);
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(e.rollback.removed.is_empty());
+        assert_eq!(
+            e.rollback.leftover,
+            [(
+                NetworkResource::Bridge(bridge_of("web")),
+                ResourceState::Unknown
+            )]
+        );
+    }
+
+    /// NET-1: set_up 直前の差し替えも検出し、up も削除もしない。
+    #[test]
+    fn net1_replaced_before_set_up_touches_nothing() {
+        let f = Fake {
+            fail_verify_after: Some(1),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(e.step, CreateStep::SetUp);
+        assert!(!f.calls().contains(&"set_up"));
+        assert!(!f.calls().contains(&"delete_bridge"));
+        assert_eq!(
+            e.rollback.leftover,
+            [(
+                NetworkResource::Bridge(bridge_of("web")),
+                ResourceState::Unknown
+            )]
+        );
+    }
+
+    /// NET-1: ロールバック削除の直前に差し替わっていたら削除せず Unknown で報告する。
+    #[test]
+    fn net1_replaced_before_rollback_delete_is_not_deleted() {
+        let f = Fake {
+            fail_up: true,
+            fail_verify_after: Some(2),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(e.step, CreateStep::SetUp);
+        assert!(!f.calls().contains(&"delete_bridge"));
+        assert!(e.rollback.removed.is_empty());
+        assert_eq!(
+            e.rollback.leftover,
+            [(
+                NetworkResource::Bridge(bridge_of("web")),
+                ResourceState::Unknown
+            )]
+        );
     }
 }

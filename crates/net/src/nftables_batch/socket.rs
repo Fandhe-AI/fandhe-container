@@ -131,12 +131,10 @@ fn exchange(
                 _ => Err(collector.timeout_error(total)),
             };
         }
-        let decided = match result? {
-            Progress::Pending => continue,
-            Progress::Done(ack) => Ok(ack),
-            // 失敗を含む。同期点まで読み切って全応答を集めてから確定する。
-            Progress::Failed => Err(()),
-        };
+        // 判定済みでも成功・失敗はまだ確定しない。同期点まで読み切って全応答を集めてから確定する。
+        if result? == Progress::Pending {
+            continue;
+        }
         // 同期点の seq は END の次（呼び出し側が範囲を予約済み）。
         let barrier_seq = seq_after(batch.end_seq());
         collector.set_barrier(barrier_seq);
@@ -148,23 +146,22 @@ fn exchange(
         // 送れなければ END の判定を確認できない（適用済みかも不明）。
         send_barrier(&barrier).map_err(|e| collector.unknown(e))?;
         drain_until_barrier(&mut collector, deadline, total, recv)?;
-        return match decided {
-            Ok(ack) => Ok(ack),
-            Err(()) => Err(collector.aborted()),
-        };
+        return collector.conclude();
     }
 }
 
-/// 本体の判定が揃った後、同期点の ACK が届くまで読み、END の判定を確実に確認する。
+/// 判定済み（本体の判定が揃った、または BEGIN / END の失敗）の後、同期点への応答が届くまで読み、
+/// END の判定と後続の失敗を確実に集める。
 ///
 /// END は `NLM_F_ACK` を持たず成功時は無応答で、失敗（非 0 errno）は本体の ACK と別のデータグラムで
 /// 届き得る。静止窓のような時間による推定では取りこぼし得るため、判定後に別要求の同期点
-/// （[`encode_barrier`] の `NFT_MSG_GETGEN` + `NLM_F_ACK`）を送り、その ACK を完了条件にする。
-/// 応答は FIFO なので、同期点の ACK より前に積まれた END の失敗は必ず先に `feed` される（NET-11）。
+/// （[`encode_barrier`] の `NFT_MSG_GETGEN` + `NLM_F_ACK`）を送り、その応答（`NLMSG_ERROR`。errno 0 の
+/// ACK でも拒否でもよい）を完了条件にする。最終判定は呼び出し側が `conclude` で行う。
+/// 応答は FIFO なので、同期点への応答より前に積まれた END の失敗は必ず先に `feed` される（NET-11）。
 /// 同期点の応答は NEWGEN と ACK の 2 データグラムになるため、1 データグラムで終わると仮定しない。
 ///
 /// 全体期限（REPAIR-5）を `deadline` で共有し、期限切れ・確認不能は `Unknown` にする。上限
-/// （[`MAX_TRAILING_DATAGRAMS`]）まで読んでも同期点の ACK が来なければ `ResourceExhausted`（`Unknown`）。
+/// （[`MAX_TRAILING_DATAGRAMS`]）まで読んでも同期点への応答が来なければ `ResourceExhausted`（`Unknown`）。
 fn drain_until_barrier(
     collector: &mut NftBatchAckCollector,
     deadline: &Deadline,
@@ -172,7 +169,7 @@ fn drain_until_barrier(
     mut recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
 ) -> Result<(), NftBatchError> {
     for _ in 0..MAX_TRAILING_DATAGRAMS {
-        if collector.barrier_acked() {
+        if collector.barrier_reached() {
             return Ok(());
         }
         let remaining = deadline.remaining();
@@ -194,7 +191,7 @@ fn drain_until_barrier(
             Err(e) => return Err(collector.unknown(e)),
         }
     }
-    if collector.barrier_acked() {
+    if collector.barrier_reached() {
         return Ok(());
     }
     Err(collector.unknown(NetError::new(
@@ -218,7 +215,7 @@ fn drain_until_barrier(
 ///   `NLM_F_ACK` に応じて errno 0 の `NLMSG_ERROR` を積む。NEWGEN を積めなければエラーが返り、ACK は
 ///   非 0 errno になる。nf_tables が未ロードでも非バッチ経路は `request_module` で読み込む
 /// - nfnetlink への送信はカーネル内で同期的に処理され、送信が戻った時点で直前のバッチの応答は受信
-///   キューに積まれている。よって後から送った同期点の ACK は、バッチのすべての応答より後に届く
+///   キューに積まれている。よって後から送った同期点への応答は、バッチのすべての応答より後に届く
 /// - `NLMSG_NOOP` は `NLMSG_MIN_TYPE` 未満の制御メッセージで nfnetlink の要求ではないため使わない。
 ///   BEGIN / END への `NLM_F_ACK` はカーネル版数によっては ACK されないため完了条件にできない
 /// - GETGEN は読み取りのみの照会で、ルールセットを変更しない
@@ -429,6 +426,8 @@ mod tests {
             script(vec![
                 Ok([err_dgram(11, 0), err_dgram(12, 0)].concat()),
                 Ok(err_dgram(13, 12)),
+                Ok(gen_dgram(14)),
+                Ok(err_dgram(14, 0)),
             ]),
         )
         .expect_err("end failure");
@@ -702,25 +701,16 @@ mod tests {
         let mut c = NftBatchAckCollector::new(&batch(1));
         c.set_barrier(7);
         let deadline = Deadline::after(Duration::from_secs(5));
-        let mut outcome = None;
         for _ in 0..MAX_TRAILING_DATAGRAMS {
-            let data = s.inner.recv(deadline.remaining()).expect("recv");
-            match c.feed(&data) {
-                Ok(_) if c.barrier_acked() => {
-                    outcome = Some(Ok(()));
-                    break;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    outcome = Some(Err(e.code()));
-                    break;
-                }
+            if c.barrier_reached() {
+                break;
             }
+            let data = s.inner.recv(deadline.remaining()).expect("recv");
+            c.feed(&data).expect("valid sync reply");
         }
-        match outcome.expect("sync request answered") {
-            Ok(()) => assert!(c.barrier_acked()),
-            Err(code) => assert_eq!(code, NetErrorCode::PermissionDenied),
-        }
+        // 0: CAP_NET_ADMIN あり（NEWGEN の後の成功 ACK）。1: EPERM。
+        let errno = c.barrier_reply().expect("sync request answered");
+        assert!(errno == 0 || errno == 1, "unexpected sync errno {errno}");
     }
 
     /// REPAIR-5: 期限後に届いた ACK は成功にせず Timeout に揃える。

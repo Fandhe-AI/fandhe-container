@@ -11,20 +11,24 @@
 //! - バッチは all-or-nothing。本体にエラーがあっても処理は止まらず、全エラーを積んだうえでバッチ全体を
 //!   abort し、ACK / エラー列を送信順に配送する。よって他の本体の errno 0 の ACK は「適用済み」を意味せず、
 //!   1 件でも失敗があれば [`NftBatchOutcome::Aborted`]（何も適用されていない）になる
-//! - 権限不足（`CAP_NET_ADMIN` なし）の `-EPERM` や `-ENOMEM` はバッチ先頭（BEGIN）の seq に対して返る。
-//!   これは [`NftBatchPosition::Begin`] として即座に確定し、キューに残る後続の応答は読まない
-//!   （ソケットが seq を一意に採番するため、次のバッチは seq 不一致として破棄する）
+//! - 権限不足（`CAP_NET_ADMIN` なし）の `-EPERM` や `-ENOMEM`・commit の失敗はバッチ先頭（BEGIN）の seq に
+//!   対して返る。BEGIN / END の非 0 errno は [`NftBatchPosition::Begin`] / [`NftBatchPosition::End`] として
+//!   記録し、バッチ全体の失敗なので本体の判定が揃っていなくても「判定済み」（[`Progress::Decided`]）にする。
+//!   ただし即座には確定せず、本体の失敗と同じく同期点まで読み、同じデータグラムの後続や別データグラムの
+//!   失敗も `failures()` に集める（失敗の全件返却。NET-11）
 //! - BEGIN / END への errno 0 の ACK は許容して無視する（カーネル版数で返る場合がある）
-//! - 本体に失敗があっても判定が揃った時点では確定せず（`Progress::Failed`）、同期点の ACK まで読んで
-//!   別データグラムの失敗も `failures()` に集めてから `aborted` で確定する
-//! - 完了条件は本体の全 seq に判定が揃うこと。END は `NLM_F_ACK` を持たず成功時は無応答のため待てないが、
-//!   失敗（非 0 errno）が別データグラムで届き得る。そこで判定後に同期点（nf_tables の `NFT_MSG_GETGEN` +
-//!   `NLM_F_ACK` の別要求）を送り、その ACK が届くまで読む（`socket::drain_until_barrier`）。応答は FIFO の
-//!   ため、同期点の ACK より前の応答はすべて判定済みになる。時間の経過で「終わり」と推定しない
+//! - 判定済みの条件は「本体の全 seq に判定が揃う」または「BEGIN / END が失敗した」。END は `NLM_F_ACK` を
+//!   持たず成功時は無応答のため待てないが、失敗（非 0 errno）が別データグラムで届き得る。そこで判定後に
+//!   同期点（nf_tables の `NFT_MSG_GETGEN` + `NLM_F_ACK` の別要求）を送り、その応答が届くまで読む
+//!   （`socket::drain_until_barrier`）。応答は FIFO のため、同期点への応答より前の応答はすべて `feed` 済みに
+//!   なり、[`NftBatchAckCollector::conclude`] で最終判定する。時間の経過で「終わり」と推定しない
 //! - 同期点への応答は `NFT_MSG_NEWGEN`（同じ seq）→ errno 0 の `NLMSG_ERROR` の順に届く
 //!   （`nf_tables_getgen` が NEWGEN を unicast してから 0 を返し、`netlink_rcv_skb` が ACK を積む）。
 //!   NEWGEN を受けずに届いた errno 0 の ACK は GETGEN が実行された証拠にならないので `DataLoss`、
 //!   同期点の seq を持つそれ以外の type も `DataLoss` にする（カーネル応答の境界検査）
+//! - 同期点が非 0 errno で拒否された場合（権限不足のバッチでは同期点も `EPERM`）も、その応答はバッチより後に
+//!   処理された要求への応答なので読み切りの印になる。失敗を集めていれば `Aborted`、なければ適用状態を
+//!   確認できないので `Unknown` にする
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
@@ -204,15 +208,13 @@ impl NftBatchAck {
 }
 
 /// [`NftBatchAckCollector::feed`] の経過。
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Progress {
     /// 判定が揃っていない。次のデータグラムを待つ。
     Pending,
-    /// 全本体が成功した。
-    Done(NftBatchAck),
-    /// 全本体の判定が揃ったが、失敗を含む。後続のデータグラム（同期点より前に積まれた END の失敗や
-    /// 別データグラムの応答）をすべて確認してから [`NftBatchAckCollector::aborted`] で確定する。
-    Failed,
+    /// 本体の全 seq の判定が揃った、または BEGIN / END が失敗した。成功・失敗はまだ確定せず、
+    /// 同期点への応答まで読んでから [`NftBatchAckCollector::conclude`] で確定する。
+    Decided,
 }
 
 /// 1 バッチ分の応答を集めて判定する状態機械。
@@ -229,10 +231,13 @@ pub(crate) struct NftBatchAckCollector {
     seen: Vec<bool>,
     pending: usize,
     failures: Vec<NftMessageFailure>,
-    /// 判定後に送る同期点（`NFT_MSG_GETGEN` + `NLM_F_ACK`）の seq、その応答 NEWGEN と ACK を受けたか。
+    /// BEGIN / END の非 0 errno を受けたか（本体の判定を待たずに判定済みにする）。
+    marker_failed: bool,
+    /// 判定後に送る同期点（`NFT_MSG_GETGEN` + `NLM_F_ACK`）の seq と、その応答 NEWGEN を受けたか。
     barrier_seq: Option<u32>,
     barrier_gen_seen: bool,
-    barrier_acked: bool,
+    /// 同期点への `NLMSG_ERROR` の errno（`Some(0)` は成功の ACK）。`Some` になれば読み切りの印。
+    barrier_reply: Option<i32>,
 }
 
 fn data_loss(msg: impl Into<String>) -> NetError {
@@ -250,23 +255,30 @@ impl NftBatchAckCollector {
             pending: body_seqs.len(),
             body_seqs,
             failures: Vec::new(),
+            marker_failed: false,
             barrier_seq: None,
             barrier_gen_seen: false,
-            barrier_acked: false,
+            barrier_reply: None,
         }
     }
 
     /// 同期点の seq を登録する。カーネルは送信ごとに全応答を積み終えてから戻り、応答は FIFO で届くため、
-    /// 後続の同期点の ACK が届けば、それより前（END の失敗を含む）の応答はすべて `feed` 済みになる。
+    /// 後続の同期点への応答が届けば、それより前（END の失敗を含む）の応答はすべて `feed` 済みになる。
     pub(crate) fn set_barrier(&mut self, seq: u32) {
         self.barrier_seq = Some(seq);
         self.barrier_gen_seen = false;
-        self.barrier_acked = false;
+        self.barrier_reply = None;
     }
 
-    /// 同期点の ACK を受けたか。
-    pub(crate) fn barrier_acked(&self) -> bool {
-        self.barrier_acked
+    /// 同期点への応答（`NLMSG_ERROR`。成功・失敗を問わない）を受け、読み切りが完了したか。
+    pub(crate) fn barrier_reached(&self) -> bool {
+        self.barrier_reply.is_some()
+    }
+
+    /// 同期点への応答の errno（未着は `None`、成功の ACK は `Some(0)`）。判定は `conclude` が行うため試験用。
+    #[cfg(test)]
+    pub(crate) fn barrier_reply(&self) -> Option<i32> {
+        self.barrier_reply
     }
 
     /// `seq` が指すバッチ内の位置。範囲外（遅延応答）は `None`。
@@ -326,9 +338,16 @@ impl NftBatchAckCollector {
             match position {
                 NftBatchPosition::Begin | NftBatchPosition::End => {
                     if errno != 0 {
-                        // バッチ全体の失敗。後続の応答は読まず即座に確定する。
+                        if self.failures.iter().any(|f| f.position == position) {
+                            return Err(self.unknown(data_loss(format!(
+                                "duplicate verdict for batch seq {}",
+                                h.seq()
+                            ))));
+                        }
+                        // バッチ全体の失敗。本体の判定を待たずに判定済みにするが、後続の失敗も集めるため
+                        // ここでは確定しない（同期点まで読む）。
                         self.record(position, h.seq(), errno);
-                        return Err(self.aborted());
+                        self.marker_failed = true;
                     }
                 }
                 NftBatchPosition::Body { index } => {
@@ -349,25 +368,57 @@ impl NftBatchAckCollector {
                 }
             }
         }
-        if self.pending > 0 {
+        if self.pending > 0 && !self.marker_failed {
             return Ok(Progress::Pending);
         }
-        if self.failures.is_empty() {
-            Ok(Progress::Done(NftBatchAck {
-                begin_seq: self.begin_seq,
-                end_seq: self.end_seq,
-                body_seqs: self.body_seqs.clone(),
-            }))
-        } else {
-            Ok(Progress::Failed)
+        Ok(Progress::Decided)
+    }
+
+    /// 同期点への応答まで読んだ後の最終判定（NET-11）。
+    ///
+    /// - 同期点への応答が未着: 読み切れていないので `Internal`（`Unknown`。呼び出し側の誤用の防御）
+    /// - 失敗を 1 件以上集めた: 全件を並べて `Aborted`（同期点への応答の errno によらない）
+    /// - 同期点が非 0 errno: 適用状態を確認できないので `Unknown`
+    /// - 本体の判定が欠けている: `Internal`（`Unknown`。判定済みの条件から起こらない防御）
+    /// - それ以外: 全本体が errno 0 で成功
+    pub(crate) fn conclude(&self) -> Result<NftBatchAck, NftBatchError> {
+        let Some(errno) = self.barrier_reply else {
+            return Err(self.unknown(NetError::new(
+                NetErrorCode::Internal,
+                "nf_tables batch verdict concluded before the sync reply",
+            )));
+        };
+        if !self.failures.is_empty() {
+            return Err(self.aborted());
         }
+        if errno != 0 {
+            return Err(self.unknown(NetError::new(
+                classify_errno(errno),
+                format!("sync request failed with errno {errno}"),
+            )));
+        }
+        if self.pending > 0 {
+            return Err(self.unknown(NetError::new(
+                NetErrorCode::Internal,
+                format!(
+                    "nf_tables batch concluded with {} of {} body verdicts missing",
+                    self.pending,
+                    self.body_seqs.len()
+                ),
+            )));
+        }
+        Ok(NftBatchAck {
+            begin_seq: self.begin_seq,
+            end_seq: self.end_seq,
+            body_seqs: self.body_seqs.clone(),
+        })
     }
 
     /// 同期点の seq を持つ 1 メッセージを判定する（応答は NEWGEN → errno 0 の ACK の順）。
     ///
     /// errno 0 の ACK は、先に NEWGEN を受けていた場合だけ同期点の完了とする。GETGEN の応答を積めなかった
     /// 場合は `nf_tables_getgen` がエラーを返し ACK が非 0 errno になるため、NEWGEN なしの errno 0 は
-    /// 想定外の応答として扱う。
+    /// 想定外の応答として扱う。非 0 errno は読み切りの印として記録し、判定は [`Self::conclude`] に委ねる。
     fn feed_barrier(
         &mut self,
         msg_type: u16,
@@ -382,23 +433,17 @@ impl NftBatchAckCollector {
             NLMSG_NOOP => Ok(()),
             NLMSG_ERROR => {
                 let ack = decode_nlmsgerr(payload).map_err(|e| self.unknown(e))?;
-                if ack.errno() != 0 {
-                    return Err(self.unknown(NetError::new(
-                        classify_errno(ack.errno()),
-                        format!("sync request failed with errno {}", ack.errno()),
-                    )));
-                }
                 if ack.request_seq().is_some_and(|s| s != seq) {
                     return Err(self.unknown(data_loss(format!(
                         "sync ack for seq {seq} embeds a different request seq"
                     ))));
                 }
-                if !self.barrier_gen_seen {
+                if ack.errno() == 0 && !self.barrier_gen_seen {
                     return Err(self.unknown(data_loss(format!(
                         "sync ack for seq {seq} arrived without a generation reply"
                     ))));
                 }
-                self.barrier_acked = true;
+                self.barrier_reply = Some(ack.errno());
                 Ok(())
             }
             other => Err(self.unknown(data_loss(format!(
@@ -509,6 +554,14 @@ mod tests {
         err_dgram(seq, 0, seq)
     }
 
+    /// 同期点 `seq` を登録し、NEWGEN → errno `errno` の応答を与えて読み切りを完了させる。
+    fn reach_barrier(c: &mut NftBatchAckCollector, seq: u32, errno: i32) {
+        c.set_barrier(seq);
+        c.feed(&cat(&[newgen(seq), err_dgram(seq, errno, seq)]))
+            .expect("barrier reply");
+        assert_eq!(c.barrier_reply(), Some(errno));
+    }
+
     fn cat(parts: &[Vec<u8>]) -> Vec<u8> {
         parts.concat()
     }
@@ -527,9 +580,11 @@ mod tests {
     fn net11_all_acks_succeed() {
         let mut c = NftBatchAckCollector::new(&batch(3));
         let p = c.feed(&cat(&[ok(101), ok(102), ok(103)])).expect("feed");
+        assert_eq!(p, Progress::Decided);
+        reach_barrier(&mut c, 105, 0);
         assert_eq!(
-            p,
-            Progress::Done(NftBatchAck {
+            c.conclude(),
+            Ok(NftBatchAck {
                 begin_seq: 100,
                 end_seq: 104,
                 body_seqs: vec![101, 102, 103],
@@ -542,7 +597,7 @@ mod tests {
     fn net11_verdicts_across_datagrams() {
         let mut c = NftBatchAckCollector::new(&batch(2));
         assert_eq!(c.feed(&ok(101)).expect("feed"), Progress::Pending);
-        assert!(matches!(c.feed(&ok(102)), Ok(Progress::Done(_))));
+        assert_eq!(c.feed(&ok(102)).expect("feed"), Progress::Decided);
     }
 
     /// NET-11: 3 件中 index 1 が EEXIST。失敗メッセージを特定し outcome は Aborted。
@@ -552,8 +607,9 @@ mod tests {
         let p = c
             .feed(&cat(&[ok(101), err_dgram(102, 17, 102), ok(103)]))
             .expect("decided");
-        assert_eq!(p, Progress::Failed);
-        let e = c.aborted();
+        assert_eq!(p, Progress::Decided);
+        reach_barrier(&mut c, 105, 0);
+        let e = c.conclude().expect_err("aborted");
         assert_eq!(e.failures(), &[fail(1, 102, 17)][..]);
         assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
         assert_eq!(e.code(), NetErrorCode::AlreadyExists);
@@ -574,7 +630,7 @@ mod tests {
                 ok(102),
             ]))
             .expect("decided");
-        assert_eq!(p, Progress::Failed);
+        assert_eq!(p, Progress::Decided);
         let e = c.aborted();
         assert_eq!(e.failures(), &[fail(0, 101, 2), fail(2, 103, 22)][..]);
         assert_eq!(e.code(), NetErrorCode::NotFound);
@@ -589,20 +645,40 @@ mod tests {
             c.feed(&err_dgram(101, 17, 101)).expect("pending"),
             Progress::Pending
         );
-        assert_eq!(c.feed(&ok(102)).expect("decided"), Progress::Failed);
-        // 判定済みの後に届く END の失敗は即座に確定する（先の失敗も保持する）。
-        let e = c.feed(&err_dgram(103, 12, 103)).expect_err("end failure");
-        assert_eq!(e.failures().len(), 2);
+        assert_eq!(c.feed(&ok(102)).expect("decided"), Progress::Decided);
+        // 判定済みの後に届く END の失敗も記録し、同期点まで読んでから確定する（先の失敗も保持する）。
+        assert_eq!(
+            c.feed(&err_dgram(103, 12, 103)).expect("end failure"),
+            Progress::Decided
+        );
+        reach_barrier(&mut c, 104, 0);
+        let e = c.conclude().expect_err("aborted");
+        assert_eq!(
+            e.failures()
+                .iter()
+                .map(|f| (f.position(), f.seq(), f.errno()))
+                .collect::<Vec<_>>(),
+            vec![
+                (NftBatchPosition::Body { index: 0 }, 101, 17),
+                (NftBatchPosition::End, 103, 12)
+            ]
+        );
         assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
     }
 
-    /// NET-11: BEGIN への EPERM はバッチ全体の失敗として即座に確定する（後続を読まない）。
+    /// NET-11: BEGIN への EPERM はバッチ全体の失敗で、本体の判定を待たずに判定済みになる。権限不足では
+    /// 同期点も EPERM で拒否されるが、読み切りの印として扱い Aborted で確定する。
     #[test]
     fn net11_begin_eperm_is_batch_level() {
         let mut c = NftBatchAckCollector::new(&batch(2));
-        let e = c
-            .feed(&cat(&[err_dgram(100, 1, 100), ok(101)]))
-            .expect_err("eperm");
+        assert_eq!(
+            c.feed(&err_dgram(100, 1, 100)).expect("eperm"),
+            Progress::Decided
+        );
+        c.set_barrier(104);
+        c.feed(&err_dgram(104, 1, 104)).expect("sync eperm");
+        assert!(c.barrier_reached());
+        let e = c.conclude().expect_err("aborted");
         assert_eq!(
             e.failures(),
             &[NftMessageFailure {
@@ -616,11 +692,15 @@ mod tests {
         assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
     }
 
-    /// NET-11: END への非 0 errno も位置 End として確定する。
+    /// NET-11: END への非 0 errno も位置 End として記録し、本体の判定を待たずに判定済みになる。
     #[test]
     fn net11_end_error_is_batch_level() {
         let mut c = NftBatchAckCollector::new(&batch(1));
-        let e = c.feed(&err_dgram(102, 12, 102)).expect_err("end failure");
+        assert_eq!(
+            c.feed(&err_dgram(102, 12, 102)).expect("end failure"),
+            Progress::Decided
+        );
+        let e = c.aborted();
         assert_eq!(
             e.failures()
                 .iter()
@@ -635,7 +715,9 @@ mod tests {
     fn marker_ack_is_tolerated() {
         let mut c = NftBatchAckCollector::new(&batch(1));
         let p = c.feed(&cat(&[ok(100), ok(101), ok(102)])).expect("feed");
-        assert!(matches!(p, Progress::Done(_)));
+        assert_eq!(p, Progress::Decided);
+        reach_barrier(&mut c, 103, 0);
+        assert!(c.conclude().is_ok());
     }
 
     /// NET-11: 範囲外の seq（以前のバッチの遅延応答）は破棄して続行する。
@@ -647,7 +729,7 @@ mod tests {
                 .expect("feed"),
             Progress::Pending
         );
-        assert!(matches!(c.feed(&ok(101)), Ok(Progress::Done(_))));
+        assert_eq!(c.feed(&ok(101)).expect("feed"), Progress::Decided);
     }
 
     /// NET-11: 同じ本体 seq への 2 回目の判定は DataLoss / Unknown。
@@ -747,12 +829,13 @@ mod tests {
     fn net11_barrier_completes_after_newgen_then_ack() {
         assert_eq!(NEWGEN_TYPE, 0x0A0F);
         let mut c = NftBatchAckCollector::new(&batch(1));
-        assert!(matches!(c.feed(&ok(101)), Ok(Progress::Done(_))));
+        assert_eq!(c.feed(&ok(101)).expect("feed"), Progress::Decided);
         c.set_barrier(103);
-        assert!(matches!(c.feed(&newgen(103)), Ok(Progress::Done(_))));
-        assert!(!c.barrier_acked());
-        assert!(matches!(c.feed(&ok(103)), Ok(Progress::Done(_))));
-        assert!(c.barrier_acked());
+        assert_eq!(c.feed(&newgen(103)).expect("newgen"), Progress::Decided);
+        assert!(!c.barrier_reached());
+        assert_eq!(c.feed(&ok(103)).expect("ack"), Progress::Decided);
+        assert_eq!(c.barrier_reply(), Some(0));
+        assert_eq!(c.conclude().expect("ok").body_seqs(), &[101][..]);
     }
 
     /// NET-11: NEWGEN を受けずに届いた同期点の errno 0 の ACK は DataLoss / Unknown（完了にしない）。
@@ -767,7 +850,7 @@ mod tests {
             e.message(),
             "sync ack for seq 103 arrived without a generation reply"
         );
-        assert!(!c.barrier_acked());
+        assert!(!c.barrier_reached());
     }
 
     /// NET-11: 同期点の seq を持つ NEWGEN・NOOP・NLMSG_ERROR 以外の type は DataLoss / Unknown。
@@ -787,20 +870,19 @@ mod tests {
             e.message(),
             "unexpected netlink message type 2560 for sync seq 103"
         );
-        assert!(!c.barrier_acked());
+        assert!(!c.barrier_reached());
     }
 
-    /// NET-11: 同期点が EPERM で拒否されたら PermissionDenied / Unknown（NEWGEN 済みでも完了にしない）。
+    /// NET-11: 失敗のないバッチで同期点が EPERM で拒否されたら成功にせず PermissionDenied / Unknown。
     #[test]
     fn net11_barrier_errno_is_unknown() {
         let mut c = NftBatchAckCollector::new(&batch(1));
-        c.set_barrier(103);
-        c.feed(&newgen(103)).expect("newgen");
-        let e = c.feed(&err_dgram(103, 1, 103)).expect_err("eperm");
+        c.feed(&ok(101)).expect("body");
+        reach_barrier(&mut c, 103, 1);
+        let e = c.conclude().expect_err("eperm");
         assert_eq!(e.code(), NetErrorCode::PermissionDenied);
         assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
         assert_eq!(e.message(), "sync request failed with errno 1");
-        assert!(!c.barrier_acked());
     }
 
     /// NET-11: 同期点 ACK が別の要求 seq を埋め込んでいれば成功にせず DataLoss（Unknown）にする。
@@ -811,6 +893,6 @@ mod tests {
         let e = c.feed(&err_dgram(103, 0, 999)).expect_err("mismatch");
         assert_eq!(e.code(), NetErrorCode::DataLoss);
         assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
-        assert!(!c.barrier_acked());
+        assert!(!c.barrier_reached());
     }
 }

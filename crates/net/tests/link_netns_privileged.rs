@@ -1,4 +1,5 @@
-//! bridge・veth の作成 → netns 移動 → up の実機結合試験（NET-11・TASK-136.3.2・#846・MS-8）。
+//! bridge・veth の作成 → netns 移動 → up → address / route 設定の実機結合試験
+//! （NET-11・TASK-136.3.2・TASK-136.5・#846・#302・MS-8）。
 //!
 //! root が必要な実機前提テストのため `harness = false` の独自 `main` で動かし、`-- --ignored` を
 //! 付けたときだけ実行する（未指定時は「ignored」を出力して成功終了する分離であり、CI 通過のための
@@ -9,6 +10,9 @@
 //!   `NetlinkRouteSocket` で veth ペアを作成 → 片端を PID 指定、もう片端を ns fd 指定で子の netns へ移動
 //!   → host から 2 端が消え、子の `/proc/<pid>/net/dev` に現れることを確認 → 子へ `go` を送る
 //! - 子（新 netns の中）: bridge を作成 → bridge と veth 両端を up → `RTM_GETLINK` で `IFF_UP` を確認
+//!   → veth a に IPv4 address・gateway route・default route を設定 → `RTM_GETADDR` / `RTM_GETROUTE`
+//!   の dump で具体値を照合（順序は up → address → route。down のリンクへの device route は `ENETDOWN` になり、
+//!   gateway route は address が作る接続 route を前提とするため。IPv6 は lo 上の `netlink_route_addr_route` が担当）
 //!
 //! 移動したデバイスは移動先で down になり host のソケットからは見えなくなるため、up は子の netns 内の
 //! ソケットから送る（`netlink_route/link.rs` のモジュール doc）。作ったものはすべて子の netns に入り、
@@ -44,10 +48,13 @@ mod linux {
 
     use fandhe_container_net::error::{NetError, NetErrorCode};
     use fandhe_container_net::netlink_route::{
-        IFF_UP, IFINFOMSG_LEN, IFLA_IFNAME, IfName, LinkCreate, LinkRef, LinkSet,
-        NetlinkRouteSocket, NetnsFd, NetnsPid, NetnsTarget, NlMsgBuilder, RTM_DELLINK, RTM_GETLINK,
-        RTM_NEWLINK,
+        AddrScope, AddressSpec, AttrIter, IFA_LOCAL, IFF_UP, IFINFOMSG_LEN, IFLA_IFNAME, IfAddrMsg,
+        IfIndex, IfName, IpPrefix, LinkCreate, LinkRef, LinkSet, NLM_F_MATCH, NLM_F_ROOT,
+        NetlinkRouteSocket, NetnsFd, NetnsPid, NetnsTarget, NlMsgBuilder, RT_TABLE_MAIN, RTA_DST,
+        RTA_GATEWAY, RTA_OIF, RTM_DELLINK, RTM_GETADDR, RTM_GETLINK, RTM_GETROUTE, RTM_NEWLINK,
+        RTPROT_STATIC, RouteNextHop, RouteSpec, RtMsg,
     };
+    use std::net::{IpAddr, Ipv4Addr};
 
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス名。
     /// モジュールのロード状況で有無が変わるため「新規 netns 判定」では無視する。
@@ -67,7 +74,8 @@ mod linux {
     /// `IFLA_LINK`（linux/if_link.h）。veth ではペア相手の ifindex。
     const IFLA_LINK_ATTR: u16 = 5;
 
-    const OK_LINE: &str = "link_netns_privileged: ok bridge=up veth_a=up veth_b=up";
+    const OK_LINE: &str =
+        "link_netns_privileged: ok bridge=up veth_a=up veth_b=up addr=ok route=ok";
 
     fn timeout() -> Duration {
         let secs = std::env::var("FANDHE_CONTAINER_TEST_TIMEOUT_SECS")
@@ -243,6 +251,102 @@ mod linux {
                     format!("IFF_UP not set on {n}: flags={flags:#x}"),
                 ));
             }
+        }
+        configure_addr_route(&sock, a)
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    fn fail(msg: impl Into<String>) -> NetError {
+        NetError::new(NetErrorCode::FailedPrecondition, msg)
+    }
+
+    /// 固定ヘッダ `fixed_len` の後ろから `attr_type` の属性ペイロードを探す（checked アクセス）。
+    fn attr_payload(payload: &[u8], fixed_len: usize, attr_type: u16) -> Option<Vec<u8>> {
+        let rest = payload.get(fixed_len..)?;
+        AttrIter::new(rest)
+            .filter_map(Result::ok)
+            .find(|x| x.attr_type() == attr_type)
+            .map(|x| x.payload().to_vec())
+    }
+
+    /// 子の netns 内で veth `a` に IPv4 address と route（gateway・default）を設定し、dump で具体値を照合する
+    /// （NET-11・TASK-136.5）。`ensure_isolated_netns` 通過後にだけ呼ばれ、host の netns には触れない。
+    fn configure_addr_route(sock: &NetlinkRouteSocket, a: &str) -> Result<(), NetError> {
+        let idx = get_link_index(sock, a)?;
+        let a_idx = IfIndex::new(idx)?;
+        let addr = AddressSpec::new(
+            a_idx,
+            IpPrefix::new(v4(10, 200, 0, 1), 24)?,
+            AddrScope::Universe,
+        );
+        sock.add_address(&addr, timeout())?;
+        match sock.add_address(&addr, timeout()) {
+            Err(e) if e.code() == NetErrorCode::AlreadyExists => {}
+            other => {
+                return Err(fail(format!(
+                    "duplicate address must be AlreadyExists: {other:?}"
+                )));
+            }
+        }
+        let gw = RouteSpec::new(
+            IpPrefix::new(v4(10, 201, 0, 0), 24)?,
+            RouteNextHop::Gateway {
+                gateway: v4(10, 200, 0, 2),
+                oif: Some(a_idx),
+            },
+        )?;
+        sock.add_route(&gw, timeout())?;
+        let default = RouteSpec::new(IpPrefix::default_v4(), RouteNextHop::Device { oif: a_idx })?;
+        sock.add_route(&default, timeout())?;
+
+        let dump = |ty: u16, fixed: &[u8]| {
+            sock.request(
+                ty,
+                NLM_F_ROOT | NLM_F_MATCH,
+                timeout(),
+                |b: &mut NlMsgBuilder| b.put_fixed(fixed),
+            )
+        };
+        let addrs = dump(RTM_GETADDR, &[0u8; 8])?;
+        let addr_ok = addrs.messages().iter().any(|m| {
+            IfAddrMsg::decode(m.payload())
+                .is_ok_and(|h| h.index() == idx && h.family() == 2 && h.prefix_len() == 24)
+                && attr_payload(m.payload(), 8, IFA_LOCAL).as_deref() == Some(&[10, 200, 0, 1][..])
+        });
+        if !addr_ok {
+            return Err(fail("10.200.0.1/24 not found in RTM_GETADDR dump"));
+        }
+        let oif = idx.to_ne_bytes();
+        let routes = dump(RTM_GETROUTE, &[0u8; 12])?;
+        let main_static = |h: &RtMsg, dst_len: u8| {
+            h.family() == 2
+                && h.table() == RT_TABLE_MAIN
+                && h.protocol() == RTPROT_STATIC
+                && h.dst_len() == dst_len
+        };
+        let gw_ok = routes.messages().iter().any(|m| {
+            RtMsg::decode(m.payload()).is_ok_and(|h| main_static(&h, 24))
+                && attr_payload(m.payload(), 12, RTA_DST).as_deref() == Some(&[10, 201, 0, 0][..])
+                && attr_payload(m.payload(), 12, RTA_GATEWAY).as_deref()
+                    == Some(&[10, 200, 0, 2][..])
+                && attr_payload(m.payload(), 12, RTA_OIF).as_deref() == Some(&oif[..])
+        });
+        if !gw_ok {
+            return Err(fail(
+                "10.201.0.0/24 via 10.200.0.2 not found in RTM_GETROUTE dump",
+            ));
+        }
+        let default_ok = routes.messages().iter().any(|m| {
+            RtMsg::decode(m.payload()).is_ok_and(|h| main_static(&h, 0))
+                && attr_payload(m.payload(), 12, RTA_OIF).as_deref() == Some(&oif[..])
+        });
+        if !default_ok {
+            return Err(fail(
+                "default route (oif=veth a) not found in RTM_GETROUTE dump",
+            ));
         }
         Ok(())
     }
@@ -468,7 +572,9 @@ mod linux {
         if let Err(p) = result {
             std::panic::resume_unwind(p);
         }
-        println!("link_netns_privileged: bridge/veth create, netns move (pid+fd), up verified");
+        println!(
+            "link_netns_privileged: bridge/veth create, netns move (pid+fd), up, address/route verified (NET-11)"
+        );
     }
 
     fn scenario(

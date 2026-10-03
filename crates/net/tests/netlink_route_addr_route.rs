@@ -4,6 +4,9 @@
 //! host の network namespace を変更しないよう、自プロセスの netns が親プロセスの netns と
 //! 異なる隔離 netns（例: `unshare -rn`）でなければ panic で拒否する（fail-closed）。実行方法は AGENTS.md「実機前提テスト」節を参照。
 //! Linux のみ。
+//!
+//! root なしで `unshare -rn` だけで動かせる lo 上の版（IPv6 も検証）。root を要する一連（作成〜address / route）は
+//! `link_netns_privileged`（TASK-136.5・#302）が担当する。
 
 #![cfg(target_os = "linux")]
 
@@ -13,13 +16,11 @@ use std::time::Duration;
 use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_net::netlink_route::{
     AddrScope, AddressSpec, AttrIter, IFA_ADDRESS, IFA_LOCAL, IfAddrMsg, IfIndex, IpPrefix,
-    NLM_F_MATCH, NLM_F_ROOT, NetlinkReply, NetlinkRouteSocket, NlMsgBuilder, RTA_DST, RTA_OIF,
-    RTM_GETADDR, RTM_GETROUTE, RouteNextHop, RouteSpec, RtMsg,
+    LinkIndex, LinkRef, LinkSet, NLM_F_MATCH, NLM_F_ROOT, NetlinkReply, NetlinkRouteSocket,
+    RTA_DST, RTA_OIF, RTM_GETADDR, RTM_GETLINK, RTM_GETROUTE, RTM_NEWLINK, RouteNextHop, RouteSpec,
+    RtMsg,
 };
 
-const RTM_NEWLINK: u16 = 16;
-const RTM_GETLINK: u16 = 18;
-const IFF_UP: u32 = 1;
 const T: Duration = Duration::from_secs(5);
 
 fn dump(sock: &NetlinkRouteSocket, msg_type: u16, fixed: &[u8]) -> NetlinkReply {
@@ -56,7 +57,7 @@ fn assert_isolated_from_parent_netns() {
 /// NET-11・TASK-136.4: lo に address と route を追加し、dump で内容を確認する。
 #[test]
 #[ignore = "requires CAP_NET_ADMIN inside an isolated network namespace (e.g. unshare -rn); NET-11"]
-fn add_address_and_route_in_isolated_netns() {
+fn net11_add_address_and_route_in_isolated_netns() {
     let sock = NetlinkRouteSocket::open().expect("open");
 
     // 安全ガード 1: 実行元（親プロセス）と netns が異なることを確認する。判別できなければ中止する。
@@ -85,14 +86,10 @@ fn add_address_and_route_in_isolated_netns() {
     );
 
     // lo を up にする（down だと dev 経由の route が ENETDOWN で拒否される）。
-    // #846 の API が main に入ったらそちらへ置き換える。
-    sock.request(RTM_NEWLINK, 0, T, |b: &mut NlMsgBuilder| {
-        let mut ifi = [0u8; 16];
-        ifi[4..8].copy_from_slice(&1i32.to_ne_bytes());
-        ifi[8..12].copy_from_slice(&IFF_UP.to_ne_bytes());
-        ifi[12..16].copy_from_slice(&IFF_UP.to_ne_bytes());
-        b.put_fixed(&ifi)
-    })
+    sock.set_link(
+        &LinkSet::up(LinkRef::Index(LinkIndex::new(1).expect("lo index"))),
+        T,
+    )
     .expect("lo up");
 
     let lo = IfIndex::new(1).expect("ifindex");

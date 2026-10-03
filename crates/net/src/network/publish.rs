@@ -447,6 +447,10 @@ impl PortRegistry {
                 "port listener is already published",
             )
         };
+        if ports.is_empty() {
+            // 公開なしの attach では共有予約表に触れない（ロック・解析の失敗で接続を落とさない）。
+            return Ok(());
+        }
         // 共有ファイルは排他ロックの中で最新を読み直し、検査と書き戻しを同じロックで行う。
         let _lock = match &self.shared {
             Some(path) => {
@@ -463,10 +467,6 @@ impl PortRegistry {
                 return Err(conflict());
             }
         }
-        if ports.is_empty() {
-            // 公開なしの attach では共有ファイルを書き直さない（不要な書き込みで失敗要因を増やさない）。
-            return Ok(());
-        }
         let mut next = self.owners.clone();
         for p in ports {
             next.insert(Self::key(p), (network.clone(), endpoint.clone()));
@@ -480,30 +480,31 @@ impl PortRegistry {
 
     /// `endpoint`（`network` 内）が持つ予約をすべて解放し、解放した件数を返す。
     ///
+    /// 共有ファイルのロック・読み込み・書き込みに失敗した場合は `Err` を返し、予約は残る（fail-closed。
+    /// 呼び出し側は残った予約を報告して再試行できる）。
+    ///
     /// DNAT ルールが残っている可能性がある間（結果不明のバッチ）は呼ばないこと。ネットワークの
     /// テーブルを削除して消えたことを確認した後（TASK-139.4）に呼ぶ。
-    pub fn release(&mut self, network: &NetworkName, endpoint: &EndpointId) -> usize {
+    pub fn release(
+        &mut self,
+        network: &NetworkName,
+        endpoint: &EndpointId,
+    ) -> Result<usize, NetError> {
         let keep = |_: &ListenerKey, (n, e): &mut ListenerOwner| !(n == network && e == endpoint);
         if let Some(path) = &self.shared {
-            // 共有ファイルから先に外す。失敗時は予約を残す（fail-closed。0 件を返す）。
-            let Ok(_lock) = open_locked(path) else {
-                return 0;
-            };
-            let Ok(mut map) = parse_shared(path) else {
-                return 0;
-            };
+            // 共有ファイルから先に外す。失敗時は予約を残してエラーを返す。
+            let _lock = open_locked(path)?;
+            let mut map = parse_shared(path)?;
             let before = map.len();
             map.retain(keep);
-            if write_shared(path, &map).is_err() {
-                return 0;
-            }
+            write_shared(path, &map)?;
             let released = before - map.len();
             self.owners = map;
-            return released;
+            return Ok(released);
         }
         let before = self.owners.len();
         self.owners.retain(keep);
-        before - self.owners.len()
+        Ok(before - self.owners.len())
     }
 }
 
@@ -620,7 +621,7 @@ mod tests {
         // 指定内の重複。
         let e = r.reserve(&db, &c1, &[p81, p81]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::AlreadyExists);
-        assert_eq!(r.release(&web, &c1), 1);
+        assert_eq!(r.release(&web, &c1).unwrap(), 1);
         r.reserve(&db, &c2, &[p80]).unwrap();
         assert_eq!(r.len(), 2);
     }
@@ -644,7 +645,7 @@ mod tests {
         r1.reserve(&web, &c1, &[p80]).unwrap();
         let e = r2.reserve(&web, &c2, &[p80]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::AlreadyExists);
-        assert_eq!(r1.release(&web, &c1), 1);
+        assert_eq!(r1.release(&web, &c1).unwrap(), 1);
         r2.reserve(&web, &c2, &[p80]).unwrap();
         assert_eq!(r2.len(), 1);
         std::fs::write(&path, "garbage\n").unwrap();
@@ -657,6 +658,13 @@ mod tests {
         std::fs::write(&path, "fandhe-portreg v1\ntcp 192.0.2.10 80 web c2\n").unwrap();
         let e = r1.reserve(&web, &c1, &[p80]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::Internal);
+        // 壊れた共有ファイルでも、公開なしの予約は共有表に触れず成功する。
+        r1.reserve(&web, &c1, &[]).unwrap();
+        // 解放は失敗を Err で返し、呼び出し側が検知できる（予約は残る）。
+        assert_eq!(
+            r1.release(&web, &c1).unwrap_err().code(),
+            NetErrorCode::Internal
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

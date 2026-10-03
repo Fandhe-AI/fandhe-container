@@ -913,6 +913,9 @@ pub enum AttachResource {
     /// 別コンテナへ転送しないよう再利用させない〔quarantine〕。解放は呼び出し側が、テーブルの削除後に
     /// `StaticIpam::release` と `PortRegistry::release` で行う）。
     Address(IpPrefix),
+    /// 解放に失敗したポート予約（共有予約表のロック・読み書きの失敗。残ったままだと後続コンテナが
+    /// 同じポートを公開できない。呼び出し側が `PortRegistry::release` を再試行する）。
+    PortReservation(NetworkName, EndpointId),
 }
 
 /// コンテナ接続のロールバック結果。
@@ -1258,7 +1261,16 @@ pub(crate) fn attach_container_with<O: AttachOps>(
             // 特権操作の後始末の fail-closed）。解放は呼び出し側が資源の除去を確認してから行う。
             if report.leftover.is_empty() {
                 let _ = ipam.release(&spec.endpoint);
-                ports.release(&spec.network, &spec.endpoint);
+                // 公開指定が無ければ共有予約表に予約は無い。解放の失敗は予約が残るため leftover で報告する。
+                if !spec.ports.is_empty() && ports.release(&spec.network, &spec.endpoint).is_err() {
+                    report.leftover.push((
+                        AttachResource::PortReservation(
+                            spec.network.clone(),
+                            spec.endpoint.clone(),
+                        ),
+                        ResourceState::Present,
+                    ));
+                }
             } else {
                 report
                     .leftover

@@ -77,6 +77,11 @@ pub const AF_UNSPEC: u8 = 0;
 pub const IFINFOMSG_LEN: usize = 16;
 /// インターフェース名属性（`linux/if_link.h`）。
 pub const IFLA_IFNAME: u16 = 3;
+/// インターフェースの別名属性（`linux/if_link.h` の `IFLA_IFALIAS`）。作成時に付けた所有トークンを
+/// 後から読み戻して、同名の別 link に差し替わっていないかを確認するために使う（TASK-139.1）。
+pub const IFLA_IFALIAS: u16 = 20;
+/// 別名の最大長（NUL を含まない。`linux/if.h` の `IFALIASZ` = 256 から NUL 分を引いた値）。
+pub const IFALIAS_MAX_LEN: usize = 255;
 /// 移動先 netns を PID で指定する属性（`linux/if_link.h`）。
 pub const IFLA_NET_NS_PID: u16 = 19;
 /// 移動先 netns を ns ファイルの fd で指定する属性（`linux/if_link.h`）。
@@ -148,7 +153,7 @@ fn ifinfomsg_for_create() -> [u8; IFINFOMSG_LEN] {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind {
-    Bridge { name: IfName },
+    Bridge { name: IfName, alias: Option<String> },
     Veth { name: IfName, peer: IfName },
 }
 
@@ -159,7 +164,25 @@ pub struct LinkCreate(Kind);
 impl LinkCreate {
     /// bridge を 1 本作る要求。
     pub fn bridge(name: IfName) -> Self {
-        Self(Kind::Bridge { name })
+        Self(Kind::Bridge { name, alias: None })
+    }
+
+    /// bridge の作成時に `IFLA_IFALIAS`（所有トークン）を付ける。veth には付けられず
+    /// `InvalidArgument`。トークンは 1〜255 バイトの可視 ASCII のみ（NUL・空白・制御文字は不可）。
+    pub fn with_alias(self, alias: &str) -> Result<Self, NetError> {
+        if alias.is_empty() || alias.len() > IFALIAS_MAX_LEN {
+            return Err(invalid("link alias length must be 1 to 255 bytes"));
+        }
+        if !alias.bytes().all(|c| c.is_ascii_graphic()) {
+            return Err(invalid("link alias must be visible ASCII"));
+        }
+        match self.0 {
+            Kind::Bridge { name, .. } => Ok(Self(Kind::Bridge {
+                name,
+                alias: Some(alias.to_owned()),
+            })),
+            Kind::Veth { .. } => Err(invalid("link alias is supported for bridge only")),
+        }
     }
 
     /// veth ペア（`name` と `peer`）を作る要求。同名は `InvalidArgument`（fail-closed）。
@@ -182,12 +205,15 @@ impl LinkCreate {
 
     /// nlmsghdr の後ろに続く `ifinfomsg` と属性を `b` へ書き込む。
     pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
-        let (name, kind, peer) = match &self.0 {
-            Kind::Bridge { name } => (name, "bridge", None),
-            Kind::Veth { name, peer } => (name, "veth", Some(peer)),
+        let (name, kind, peer, alias) = match &self.0 {
+            Kind::Bridge { name, alias } => (name, "bridge", None, alias.as_deref()),
+            Kind::Veth { name, peer } => (name, "veth", Some(peer), None),
         };
         b.put_fixed(&ifinfomsg_for_create())?;
         b.put_attr(IFLA_IFNAME, &name.to_nul_terminated())?;
+        if let Some(alias) = alias {
+            b.put_attr(IFLA_IFALIAS, &nul_terminated(alias.as_bytes()))?;
+        }
         b.put_nested(IFLA_LINKINFO, |b| {
             b.put_attr(IFLA_INFO_KIND, &nul_terminated(kind.as_bytes()))?;
             if let Some(peer) = peer {
@@ -409,6 +435,29 @@ impl LinkDelete {
     }
 }
 
+/// `RTM_NEWLINK` 応答のペイロードから `IFLA_IFALIAS` を取り出す（無ければ `None`）。
+///
+/// 応答はカーネル由来の外部入力として属性走査で検証する。NUL 終端を除いた UTF-8 文字列のみ返し、
+/// 不正な属性列は `DataLoss`、UTF-8 でない別名は `None` 扱い（所有トークンと一致し得ないため）。
+pub fn decode_ifinfomsg_alias(payload: &[u8]) -> Result<Option<String>, NetError> {
+    let attrs = payload.get(IFINFOMSG_LEN..).ok_or_else(|| {
+        NetError::new(
+            NetErrorCode::DataLoss,
+            "link reply is shorter than ifinfomsg",
+        )
+    })?;
+    for attr in crate::netlink::AttrIter::new(attrs) {
+        let attr = attr?;
+        if attr.attr_type() == IFLA_IFALIAS {
+            let raw = attr.payload();
+            let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+            let text = raw.get(..end).and_then(|b| std::str::from_utf8(b).ok());
+            return Ok(text.map(str::to_owned));
+        }
+    }
+    Ok(None)
+}
+
 /// `RTM_NEWLINK` 応答（`RTM_GETLINK` の返答）のペイロードから ifindex を取り出す。
 ///
 /// 応答はカーネル由来の外部入力として扱い、添字アクセスを使わず長さ・値を検証する。
@@ -540,6 +589,61 @@ mod tests {
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0].attr_type(), IFLA_INFO_KIND);
         assert_eq!(kids[0].payload(), b"bridge\0");
+    }
+
+    /// TASK-139.1: 所有トークンは IFLA_IFALIAS に NUL 終端で載り、応答側の復号で読み戻せる。
+    #[test]
+    fn net11_bridge_alias_is_encoded_and_decoded() {
+        let data = build(&LinkCreate::bridge(name("br0")).with_alias("tok-1").unwrap());
+        let mut it = NlMsgIter::new(&data);
+        let msg = it.next().unwrap().unwrap();
+        let alias = msg
+            .attrs(IFINFOMSG_LEN)
+            .unwrap()
+            .map(|a| a.unwrap())
+            .find(|a| a.attr_type() == IFLA_IFALIAS)
+            .unwrap();
+        assert_eq!(alias.payload(), b"tok-1\0");
+        assert_eq!(
+            decode_ifinfomsg_alias(msg.payload()).unwrap().as_deref(),
+            Some("tok-1")
+        );
+        let plain = build(&LinkCreate::bridge(name("br0")));
+        let m = NlMsgIter::new(&plain).next().unwrap().unwrap();
+        assert_eq!(decode_ifinfomsg_alias(m.payload()).unwrap(), None);
+        assert_eq!(
+            decode_ifinfomsg_alias(&[0u8; 4]).unwrap_err().code(),
+            NetErrorCode::DataLoss
+        );
+    }
+
+    /// TASK-139.1: 不正な別名と veth への付与は InvalidArgument。
+    #[test]
+    fn net11_alias_validation() {
+        for bad in [
+            "".to_owned(),
+            "a b".to_owned(),
+            "a\0b".to_owned(),
+            "x".repeat(256),
+        ] {
+            assert_eq!(
+                LinkCreate::bridge(name("br0"))
+                    .with_alias(&bad)
+                    .unwrap_err()
+                    .code(),
+                NetErrorCode::InvalidArgument
+            );
+        }
+        assert!(
+            LinkCreate::bridge(name("br0"))
+                .with_alias(&"x".repeat(255))
+                .is_ok()
+        );
+        let veth = LinkCreate::veth(name("v0"), name("v1")).unwrap();
+        assert_eq!(
+            veth.with_alias("t").unwrap_err().code(),
+            NetErrorCode::InvalidArgument
+        );
     }
 
     /// NET-11: メッセージ全体のバイト列を期待値と完全一致で比べる。

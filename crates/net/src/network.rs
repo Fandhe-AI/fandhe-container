@@ -24,6 +24,10 @@
 //!
 //! # ロールバック
 //!
+//! bridge は作成時に `IFLA_IFALIAS` へ作成ごとに一意な所有トークンを付け、名前から ifindex を引く際に
+//! トークン一致を確認する。不一致（同名 link への差し替え）なら操作も削除もしない。bridge 作成要求が
+//! 送信後の応答エラー（`ResourceExhausted` 等）で失敗した場合は作成済みの可能性があるため
+//! `ResourceState::Unknown` で報告する（確定的な拒否のみ空報告）。
 //! 自分が作ったと確定した bridge のみ削除する（address は bridge と一緒に消える）。作成結果が
 //! 不明（`Timeout` / `DataLoss`）なリソースは fail-closed で削除せず、[`RollbackReport::leftover`]
 //! に `ResourceState::Unknown` として報告する。nft バッチは all-or-nothing なので `Aborted` /
@@ -320,8 +324,11 @@ pub(crate) struct NftApplyFailure {
 /// 作成手順が使うカーネル操作の境界。Linux 実装とテストの fake を差し替えるための crate 内部トレイトで、
 /// 公開の拡張点（PLUG-1）ではない。
 pub(crate) trait NetworkOps {
-    fn create_bridge(&self, name: &IfName) -> Result<(), NetError>;
-    fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError>;
+    /// bridge を作り、`IFLA_IFALIAS` に所有トークン `token` を付ける。
+    fn create_bridge(&self, name: &IfName, token: &str) -> Result<(), NetError>;
+    /// 名前から ifindex を引く。`IFLA_IFALIAS` が `token` と一致しない（同名の別 link に差し替わった）
+    /// 場合は `FailedPrecondition` で失敗し、その link を操作させない。
+    fn link_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError>;
     fn add_address(&self, index: IfIndex, gateway: &IpPrefix) -> Result<(), NetError>;
     /// 取得済みの ifindex で up にする（名前再解決で別 link を操作しない）。
     fn set_up(&self, index: IfIndex) -> Result<(), NetError>;
@@ -344,6 +351,37 @@ fn collision_or(e: NetError) -> NetError {
 /// 作成が不明な結果（時間切れ・応答破損）か。
 fn is_indeterminate(code: NetErrorCode) -> bool {
     matches!(code, NetErrorCode::Timeout | NetErrorCode::DataLoss)
+}
+
+/// bridge 作成要求がカーネルに拒否された（作成されていない）と確定できる分類か。
+/// 送信後の応答エラー（`ResourceExhausted`〔件数・サイズ超過〕・`Internal` 等）は要求が適用済みか
+/// 判別できないため、ここに含めず `Unknown` として報告する（fail-closed）。
+fn is_definitely_rejected(code: NetErrorCode) -> bool {
+    matches!(
+        code,
+        NetErrorCode::AlreadyExists
+            | NetErrorCode::PermissionDenied
+            | NetErrorCode::InvalidArgument
+            | NetErrorCode::NotFound
+            | NetErrorCode::FailedPrecondition
+            | NetErrorCode::Unimplemented
+    )
+}
+
+/// 作成ごとに一意な所有トークン（bridge の `IFLA_IFALIAS` に付ける）。プロセス ID・時刻・連番を含み、
+/// 他者が推測して同名 link に付け替えることは想定しない（そもそも `CAP_NET_ADMIN` が必要）。
+fn ownership_token(network: &NetworkName) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!(
+        "fandhe-net:{}:{}:{nanos:x}:{}",
+        network.as_str(),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn rollback_bridge(
@@ -384,10 +422,12 @@ pub(crate) fn create_network_with(
     let bridge = names.bridge().clone();
     let table = names.table().clone();
 
-    // 1. bridge 作成。AlreadyExists は他者のリソースなので削除しない。
-    if let Err(e) = ops.create_bridge(&bridge) {
+    // 1. bridge 作成（所有トークン付き）。AlreadyExists は他者のリソースなので削除しない。
+    // 確定的な拒否以外（送信後の応答エラー等）は作成済みの可能性があるため Unknown で報告する。
+    let token = ownership_token(spec.name());
+    if let Err(e) = ops.create_bridge(&bridge, &token) {
         let mut report = RollbackReport::default();
-        if is_indeterminate(e.code()) {
+        if !is_definitely_rejected(e.code()) {
             report
                 .leftover
                 .push((NetworkResource::Bridge(bridge), ResourceState::Unknown));
@@ -396,8 +436,10 @@ pub(crate) fn create_network_with(
     }
 
     // 2〜4. ifindex 取得後の失敗は、その ifindex で bridge を削除する（address も一緒に消える）。
-    // ifindex 取得前は自分の bridge と確定できないため、名前では削除せず Unknown で報告する（fail-closed）。
-    let index = match ops.link_index(&bridge) {
+    // ifindex は所有トークンの一致を確認して得るため、作成後に同名の別 link へ差し替えられても
+    // それを操作・削除しない。取得前（不一致を含む）は自分の bridge と確定できないため、名前では
+    // 削除せず Unknown で報告する（fail-closed）。
+    let index = match ops.link_index(&bridge, &token) {
         Ok(i) => i,
         Err(e) => {
             let mut report = RollbackReport::default();
@@ -456,14 +498,17 @@ struct LinuxNetworkOps<'a> {
 
 #[cfg(target_os = "linux")]
 impl NetworkOps for LinuxNetworkOps<'_> {
-    fn create_bridge(&self, name: &IfName) -> Result<(), NetError> {
+    fn create_bridge(&self, name: &IfName, token: &str) -> Result<(), NetError> {
         self.route
-            .create_link(&LinkCreate::bridge(name.clone()), self.timeout)
+            .create_link(
+                &LinkCreate::bridge(name.clone()).with_alias(token)?,
+                self.timeout,
+            )
             .map(|_| ())
     }
 
-    fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
-        self.route.link_index(name, self.timeout)
+    fn link_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError> {
+        self.route.link_index_owned(name, token, self.timeout)
     }
 
     fn add_address(&self, index: IfIndex, gateway: &IpPrefix) -> Result<(), NetError> {
@@ -685,11 +730,11 @@ mod tests {
     }
 
     impl NetworkOps for Fake {
-        fn create_bridge(&self, _: &IfName) -> Result<(), NetError> {
+        fn create_bridge(&self, _: &IfName, _: &str) -> Result<(), NetError> {
             self.rec("create_bridge");
             self.fail_bridge.map_or(Ok(()), |c| Err(err(c)))
         }
-        fn link_index(&self, _: &IfName) -> Result<IfIndex, NetError> {
+        fn link_index(&self, _: &IfName, _: &str) -> Result<IfIndex, NetError> {
             self.rec("link_index");
             if self.fail_index {
                 return Err(err(NetErrorCode::NotFound));
@@ -771,6 +816,48 @@ mod tests {
         assert_eq!(e.message(), COLLISION_MSG);
         assert_eq!(e.step, CreateStep::CreateBridge);
         assert_eq!(e.rollback, RollbackReport::default());
+    }
+
+    /// NET-1: 送信後の応答エラー（ResourceExhausted・Internal 等）は作成済みか不明なので Unknown で報告し、
+    /// 確定的な拒否（PermissionDenied 等）は何も報告しない。
+    #[test]
+    fn net1_bridge_post_send_errors_are_unknown_leftover() {
+        for code in [
+            NetErrorCode::ResourceExhausted,
+            NetErrorCode::Internal,
+            NetErrorCode::DataLoss,
+        ] {
+            let f = Fake {
+                fail_bridge: Some(code),
+                ..Default::default()
+            };
+            let e = create_network_with(&f, &spec("web")).unwrap_err();
+            assert_eq!(f.calls(), ["create_bridge"], "{code:?}");
+            assert_eq!(
+                e.rollback.leftover,
+                [(
+                    NetworkResource::Bridge(bridge_of("web")),
+                    ResourceState::Unknown
+                )],
+                "{code:?}"
+            );
+        }
+        let f = Fake {
+            fail_bridge: Some(NetErrorCode::PermissionDenied),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(e.rollback, RollbackReport::default());
+    }
+
+    /// NET-1: 所有トークンは作成ごとに一意で、可視 ASCII のみ。
+    #[test]
+    fn net1_ownership_token_is_unique_and_graphic() {
+        let n = nname("web");
+        let (a, b) = (ownership_token(&n), ownership_token(&n));
+        assert_ne!(a, b);
+        assert!(a.starts_with("fandhe-net:web:"));
+        assert!(a.bytes().all(|c| c.is_ascii_graphic()) && a.len() <= 255);
     }
 
     /// NET-1: bridge 作成の Timeout は fail-closed（削除せず Unknown で報告）。

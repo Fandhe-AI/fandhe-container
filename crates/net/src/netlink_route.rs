@@ -289,7 +289,7 @@ mod socket {
     };
     use crate::netlink_route::{
         IFINFOMSG_LEN, IFLA_IFNAME, IfIndex, IfName, LinkCreate, LinkDelete, LinkSet, RTM_GETLINK,
-        RTM_NEWLINK, decode_ifinfomsg_index,
+        RTM_NEWLINK, decode_ifinfomsg_alias, decode_ifinfomsg_index,
     };
     use crate::nftables_batch::{MAX_BATCH_LEN, NftBatchBytes};
     use crate::sys::{self, Deadline, Readiness, RecvMeta, SysError};
@@ -682,6 +682,34 @@ mod socket {
         /// 名前から ifindex を引く（`RTM_GETLINK`。TASK-139.1・#314）。無ければ `NotFound`。
         /// 応答はカーネル由来の外部入力として検証する（`decode_ifinfomsg_index`）。
         pub fn link_index(&self, name: &IfName, timeout: Duration) -> Result<IfIndex, NetError> {
+            self.link_index_and_alias(name, timeout).map(|(i, _)| i)
+        }
+
+        /// 名前から ifindex を引き、`IFLA_IFALIAS` が `token`（作成時に付けた所有トークン）と
+        /// 一致する場合のみ返す（TASK-139.1・#314）。不一致（別者が同名 link に差し替えた等）は
+        /// `FailedPrecondition` で、呼び出し側はその link を操作・削除してはならない。
+        pub fn link_index_owned(
+            &self,
+            name: &IfName,
+            token: &str,
+            timeout: Duration,
+        ) -> Result<IfIndex, NetError> {
+            let (index, alias) = self.link_index_and_alias(name, timeout)?;
+            if alias.as_deref() == Some(token) {
+                Ok(index)
+            } else {
+                Err(NetError::new(
+                    NetErrorCode::FailedPrecondition,
+                    "link ownership token mismatch (link was replaced)",
+                ))
+            }
+        }
+
+        fn link_index_and_alias(
+            &self,
+            name: &IfName,
+            timeout: Duration,
+        ) -> Result<(IfIndex, Option<String>), NetError> {
             let reply = self.request(RTM_GETLINK, 0, timeout, |b| {
                 b.put_fixed(&[0u8; IFINFOMSG_LEN])?;
                 let mut v = name.as_str().as_bytes().to_vec();
@@ -695,7 +723,9 @@ mod socket {
                 .ok_or_else(|| {
                     NetError::new(NetErrorCode::Internal, "no RTM_NEWLINK in link reply")
                 })?;
-            decode_ifinfomsg_index(msg.payload())
+            let index = decode_ifinfomsg_index(msg.payload())?;
+            let alias = decode_ifinfomsg_alias(msg.payload())?;
+            Ok((index, alias))
         }
 
         /// `message`（`NlMsgBuilder` で組んだ 1 メッセージ）をそのままカーネルへ送る。

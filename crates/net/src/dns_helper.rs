@@ -943,12 +943,19 @@ impl DnsHelperProcess {
         self.listen
     }
 
-    /// 子プロセスがまだ動いているか（`try_wait` で終了を検知する。異常終了後は false。TASK-144.1・NET-7）。
-    /// 状態が取得できない場合も安全側で false（再起動側に倒す）。
-    pub fn is_alive(&mut self) -> bool {
+    /// 子プロセスがまだ動いているか（`try_wait` で終了を検知する。異常終了後は `Ok(false)`。TASK-144.1・NET-7）。
+    /// 状態を取得できない場合は `Err`（「死んでいる」と誤認して二重起動しないよう、生死不明を区別して返す）。
+    pub fn is_alive(&mut self) -> Result<bool, NetError> {
         match self.child.as_mut() {
-            Some(c) => matches!(c.try_wait(), Ok(None)),
-            None => false,
+            Some(c) => match c.try_wait() {
+                Ok(None) => Ok(true),
+                Ok(Some(_)) => Ok(false),
+                Err(_) => Err(NetError::new(
+                    NetErrorCode::Internal,
+                    "dns helper liveness could not be determined",
+                )),
+            },
+            None => Ok(false),
         }
     }
 

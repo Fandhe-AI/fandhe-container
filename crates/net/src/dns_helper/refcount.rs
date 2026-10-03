@@ -16,10 +16,11 @@
 //!   join / leave も待たされる（ネットワークごとのロックへの細分化は将来課題）
 //! - 起動失敗は何も記録しない（fail-closed。次の join で再試行）
 //! - 停止失敗（回収期限切れ）では、メンバーが空の「停止中」エントリとハンドルを保持する。旧プロセスの終了を
-//!   確認できるまで次の join は停止を再試行し、成功してから新ヘルパーを起動する（同一アドレスへの二重 bind を
+//!   確認できるまで次の join / leave は停止を再試行し、成功してから（join なら）新ヘルパーを起動する（同一アドレスへの二重 bind を
 //!   防ぐ）。再試行も失敗すればエラーを返し、起動しない。エントリが破棄されればハンドルの `Drop` が回収する
-//! - join のたびに稼働中ヘルパーの生死を確認し、異常終了していれば同じアドレスで再起動する
-//!   （[`JoinOutcome::Restarted`]）。再起動に失敗すればエラーを返し、死んだエントリは残して次の join で再試行する。
+//! - join のたびに稼働中ヘルパーの生死を確認し、異常終了していれば同じアドレス（port 0 指定時は確定済みの実ポート）で
+//!   再起動する。生死を確認できない場合は再起動せず、旧ハンドルを停止・回収できてから再起動する。復旧はメンバー上限判定
+//!   より先に行う（[`JoinOutcome::Restarted`]）。再起動に失敗すればエラーを返し、死んだエントリは残して次の join で再試行する。
 //!   `is_running` / `bound_addr` は死んだヘルパーを稼働中として報告しない
 //! - 起動・停止の成否と所要時間は [`NetOpRecorder`] へ記録する（REPAIR-4。`NetOpKind::DnsHelperStart` / `DnsHelperStop`）
 //! - ネットワーク数・参加数は上限つき（DoS 対策）。エラー文言にネットワーク名・endpoint・アドレス・pid を含めない
@@ -54,8 +55,8 @@ pub trait DnsHelperLauncher: Send + Sync {
     fn start(&self, listen: DnsListenAddr) -> Result<Self::Handle, NetError>;
     /// ヘルパーを停止して回収する（期限つき）。失敗時はハンドルを保持したまま返し、再試行できる。
     fn stop(&self, handle: &mut Self::Handle) -> Result<(), NetError>;
-    /// ヘルパーがまだ動いているか（異常終了の検知用。取得できない場合は false）。
-    fn is_alive(&self, handle: &mut Self::Handle) -> bool;
+    /// ヘルパーがまだ動いているか（異常終了の検知用）。生死を確認できない場合は `Err`（死亡扱いにしない）。
+    fn is_alive(&self, handle: &mut Self::Handle) -> Result<bool, NetError>;
     /// ハンドルが報告する実際の待受アドレス（port 0 指定時の確定ポートの取得用）。
     fn bound_addr(&self, handle: &Self::Handle) -> SocketAddrV4;
 }
@@ -102,7 +103,7 @@ impl DnsHelperLauncher for ProcessLauncher {
         handle.stop_checked(self.reap_timeout)
     }
 
-    fn is_alive(&self, handle: &mut Self::Handle) -> bool {
+    fn is_alive(&self, handle: &mut Self::Handle) -> Result<bool, NetError> {
         handle.is_alive()
     }
 
@@ -248,22 +249,34 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
                 self.stop_helper(&mut entry.helper)?;
                 reaped = true;
             } else {
-                let alive = self.launcher.is_alive(&mut entry.helper);
+                // 生死不明（try_wait 失敗）のときは再起動しない: 旧プロセスが生きていれば同一アドレスへ二重 bind になる。
+                // まず旧ハンドルを停止・回収し、確認できた場合だけ（死亡扱いで）再起動へ進む。
+                let alive = match self.launcher.is_alive(&mut entry.helper) {
+                    Ok(alive) => alive,
+                    Err(_) => {
+                        self.stop_helper(&mut entry.helper)?;
+                        false
+                    }
+                };
                 let is_member = entry.members.contains(endpoint);
                 if alive && is_member {
                     return Ok(JoinOutcome::AlreadyMember {
                         members: entry.members.len(),
                     });
                 }
+                if !alive {
+                    // 異常終了を検知: 復旧を上限判定より先に行う（上限超過の拒否で死んだヘルパーが放置されない）。
+                    // port 0 指定でも既存参加者の bound_addr を保つため、旧ヘルパーが確定させた実ポートで再起動する。
+                    // 失敗時は死んだエントリを残す（次の join で再試行）。
+                    let bound = self.launcher.bound_addr(&entry.helper);
+                    let relisten = DnsListenAddr::new(*bound.ip(), bound.port())?;
+                    entry.helper = self.start_helper(relisten)?;
+                }
                 if !is_member && entry.members.len() >= self.max_members {
                     return Err(NetError::new(
                         NetErrorCode::ResourceExhausted,
                         "too many members in the network",
                     ));
-                }
-                if !alive {
-                    // 異常終了を検知: 同じアドレスで再起動する。失敗時は死んだエントリを残す（次の join で再試行）。
-                    entry.helper = self.start_helper(listen)?;
                 }
                 entry.members.insert(endpoint.clone());
                 let members = entry.members.len();
@@ -312,7 +325,13 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
         let Some(entry) = map.get_mut(network) else {
             return Ok(LeaveOutcome::NotMember);
         };
-        if entry.stopping || !entry.members.remove(endpoint) {
+        if entry.stopping {
+            // 前回の停止が回収待ち: leave でも回収を再試行できる（join を待たずに解放する）。
+            self.stop_helper(&mut entry.helper)?;
+            map.remove(network);
+            return Ok(LeaveOutcome::Stopped);
+        }
+        if !entry.members.remove(endpoint) {
             return Ok(LeaveOutcome::NotMember);
         }
         if !entry.members.is_empty() {
@@ -342,13 +361,13 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
     pub fn is_running(&self, network: &NetworkName) -> bool {
         self.lock()
             .get_mut(network)
-            .is_some_and(|e| !e.stopping && self.launcher.is_alive(&mut e.helper))
+            .is_some_and(|e| !e.stopping && self.launcher.is_alive(&mut e.helper) == Ok(true))
     }
 
     /// 起動中ヘルパーの実際の待受アドレス（停止中・異常終了済みは `None`）。
     pub fn bound_addr(&self, network: &NetworkName) -> Option<SocketAddrV4> {
         self.lock().get_mut(network).and_then(|e| {
-            (!e.stopping && self.launcher.is_alive(&mut e.helper))
+            (!e.stopping && self.launcher.is_alive(&mut e.helper) == Ok(true))
                 .then(|| self.launcher.bound_addr(&e.helper))
         })
     }
@@ -370,6 +389,7 @@ mod tests {
         fail_start: AtomicBool,
         fail_stop: AtomicBool,
         slow: AtomicBool,
+        unknown: AtomicBool,
         dead: Mutex<HashSet<usize>>,
     }
 
@@ -399,8 +419,14 @@ mod tests {
             self.exit();
             r
         }
-        fn is_alive(&self, h: &mut (SocketAddrV4, usize)) -> bool {
-            !self.dead.lock().expect("lock").contains(&h.1)
+        fn is_alive(&self, h: &mut (SocketAddrV4, usize)) -> Result<bool, NetError> {
+            if self.unknown.load(Ordering::SeqCst) {
+                return Err(NetError::new(
+                    NetErrorCode::Internal,
+                    "fake liveness unknown",
+                ));
+            }
+            Ok(!self.dead.lock().expect("lock").contains(&h.1))
         }
         fn stop(&self, _h: &mut (SocketAddrV4, usize)) -> Result<(), NetError> {
             self.enter();
@@ -525,10 +551,8 @@ mod tests {
             .expect_err("blocked");
         assert_eq!(e.code(), NetErrorCode::Timeout);
         assert_eq!(n(&rc.launcher.starts), 1);
-        assert_eq!(
-            rc.leave(&net("a"), &ep("c1")).expect("leave"),
-            LeaveOutcome::NotMember
-        );
+        // leave も回収を再試行する（失敗中はエラー）。
+        rc.leave(&net("a"), &ep("c1")).expect_err("retry fails");
         // 回収できたら起動する。
         rc.launcher.fail_stop.store(false, Ordering::SeqCst);
         assert_eq!(
@@ -536,7 +560,7 @@ mod tests {
             JoinOutcome::Started
         );
         assert_eq!(n(&rc.launcher.starts), 2);
-        assert_eq!(n(&rc.launcher.stops), 3);
+        assert_eq!(n(&rc.launcher.stops), 4);
         assert!(rc.is_running(&net("a")));
     }
 
@@ -575,6 +599,71 @@ mod tests {
             rc.join(&net("a"), addr(53), &ep("c1")).expect("join"),
             JoinOutcome::Restarted { members: 1 }
         );
+    }
+
+    /// NET-7: 生死不明（try_wait 失敗）では停止・回収に失敗する間は再起動しない。
+    #[test]
+    fn net7_unknown_liveness_stops_before_restart() {
+        let rc = DnsHelperRefCounts::new(Fake::default());
+        rc.join(&net("a"), addr(53), &ep("c1")).expect("join");
+        rc.launcher.unknown.store(true, Ordering::SeqCst);
+        rc.launcher.fail_stop.store(true, Ordering::SeqCst);
+        rc.join(&net("a"), addr(53), &ep("c2"))
+            .expect_err("stop fails");
+        assert_eq!((n(&rc.launcher.starts), n(&rc.launcher.stops)), (1, 1));
+        assert_eq!(rc.members(&net("a")), 1);
+        rc.launcher.fail_stop.store(false, Ordering::SeqCst);
+        assert_eq!(
+            rc.join(&net("a"), addr(53), &ep("c2")).expect("join"),
+            JoinOutcome::Restarted { members: 2 }
+        );
+        assert_eq!((n(&rc.launcher.starts), n(&rc.launcher.stops)), (2, 2));
+    }
+
+    /// NET-7: port 0 のヘルパー再起動は確定済みの実ポートで行い、bound_addr を変えない。
+    #[test]
+    fn net7_restart_keeps_bound_port() {
+        let rc = DnsHelperRefCounts::new(Fake::default());
+        rc.join(&net("a"), addr(0), &ep("c1")).expect("join");
+        rc.launcher.dead.lock().expect("lock").insert(1);
+        let before = rc.launcher.bound_addr(&(addr(5353).socket_addr(), 0));
+        assert_eq!(before.port(), 5353);
+        // Fake は与えられた listen をそのまま bound とするため、再起動後も元ポート（0）に固定される。
+        rc.join(&net("a"), addr(0), &ep("c1")).expect("join");
+        assert_eq!(rc.bound_addr(&net("a")), Some(addr(0).socket_addr()));
+    }
+
+    /// NET-7: 停止回収待ちのとき leave で回収を再試行できる。
+    #[test]
+    fn net7_leave_retries_pending_stop() {
+        let rc = DnsHelperRefCounts::new(Fake::default());
+        rc.join(&net("a"), addr(53), &ep("c1")).expect("join");
+        rc.launcher.fail_stop.store(true, Ordering::SeqCst);
+        rc.leave(&net("a"), &ep("c1")).expect_err("fail");
+        rc.leave(&net("a"), &ep("c1")).expect_err("still failing");
+        rc.launcher.fail_stop.store(false, Ordering::SeqCst);
+        assert_eq!(
+            rc.leave(&net("a"), &ep("c1")).expect("leave"),
+            LeaveOutcome::Stopped
+        );
+        assert_eq!(
+            rc.leave(&net("a"), &ep("c1")).expect("leave"),
+            LeaveOutcome::NotMember
+        );
+        assert_eq!(n(&rc.launcher.stops), 3);
+    }
+
+    /// NET-7: メンバー上限で拒否される join でも、死んだヘルパーは復旧される。
+    #[test]
+    fn net7_dead_helper_restarted_even_when_member_limit_rejects() {
+        let rc = DnsHelperRefCounts::with_limits(Fake::default(), 1, 4);
+        rc.join(&net("a"), addr(53), &ep("c1")).expect("join");
+        rc.launcher.dead.lock().expect("lock").insert(1);
+        let e = rc.join(&net("a"), addr(53), &ep("c2")).expect_err("limit");
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(n(&rc.launcher.starts), 2);
+        assert!(rc.is_running(&net("a")));
+        assert_eq!(rc.members(&net("a")), 1);
     }
 
     /// REPAIR-4: 起動・停止の成功 / 失敗が記録される。

@@ -11,7 +11,9 @@
 //! `unshare(CLONE_NEWNET)` → `/proc/thread-self/ns/net` を open → pin 先ファイルへ bind マウント、を行って
 //! 終了する。`CLONE_NEWNET` は `CLONE_NEWUSER` と違いマルチスレッドのプロセスでも合法で、影響は
 //! 呼び出したスレッドだけに閉じる。元の netns へ戻る必要が生じないので `setns` は使わない。
-//! 結果（ns ファイルの fd）は `mpsc` で返し、待ちは期限つき（REPAIR-5）。
+//! 結果（ns ファイルの fd）は `Mutex` + `Condvar` の受け渡し口で返し、待ちは期限つき（REPAIR-5）。
+//! 期限切れ後に完了したスレッドは、自分で pin のアンマウントとファイル削除を行って回収する
+//! （受け渡し口が `Abandoned` に切り替わっていることを完了時にロック下で確認する）。
 //!
 //! # 安全性の設計（P0。パストラバーサル・symlink・マウント伝播）
 //!
@@ -24,11 +26,13 @@
 //!   作成から mount までの間のパス差し替えを塞ぐ
 //! - fd は `O_CLOEXEC`（std 既定）で、コンテナプロセスへ漏れない
 //!
-//! # 既知の制約
-//!
-//! `ip netns add` が行う「置き場ディレクトリを `MS_SHARED` の自己 bind にする」処理はしない。そのため
-//! 後から作られた別の mount namespace がこの pin のマウントを引き継いで保持し続けると、unpin 後も
-//! netns が生き残りうる。必要性の判断は後続（runtime との結線）に残す（REPAIR-3）。
+//! - 置き場ディレクトリを含むマウントの伝播が `shared` なら拒否する（fail-closed）。`shared` のまま
+//!   bind マウントすると peer の mount namespace へ pin が伝播し、unpin 後も別 namespace が保持して
+//!   netns が生き残りうるため。呼び出し側は置き場を private（または slave）なマウントにしておく
+//!   （例: `mount --bind DIR DIR && mount --make-private DIR`）。`ip netns add` のように置き場を
+//!   `MS_SHARED` の自己 bind にする処理は行わない。判定は `/proc/self/mountinfo` から行い、
+//!   判定できなければ拒否する
+//! - 解除（`unpin`）が失敗したら `ContainerNetns` を呼び出し側へ返す（再試行可能）
 //!
 //! # 権限
 //!
@@ -40,15 +44,16 @@ use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink_route::classify_errno;
-use crate::network::{EndpointId, NetnsFailure, ResourceState};
+use crate::network::{EndpointId, NetnsFailure, ResourceState, UnpinFailure};
 use crate::sys::{self, SysError};
 
 /// `ns` ファイルの絶対パス。`unshare` したスレッド自身の netns を指す。
@@ -157,6 +162,77 @@ fn unshare_and_pin(target: &CStr) -> Result<OwnedFd, NetError> {
     Ok(OwnedFd::from(ns))
 }
 
+/// `/proc/self/mountinfo` の `mountpoint` 欄（8 進エスケープ `\040` 等）を元のバイト列へ戻す。
+fn unescape_mountinfo(field: &str) -> Vec<u8> {
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        if c == b'\\'
+            && let Some(oct) = b.get(i + 1..i + 4)
+            && oct.iter().all(|d| (b'0'..=b'7').contains(d))
+        {
+            let v = oct
+                .iter()
+                .fold(0u32, |acc, d| acc * 8 + u32::from(d - b'0'));
+            if let Ok(byte) = u8::try_from(v) {
+                out.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// `mountinfo` の内容から `dir`（正規化済みの絶対パス）を含むマウントを探し、その伝播が `shared` なら
+/// 拒否する（OS 呼び出しを含まない純粋関数。単体テスト用に分離）。最長一致のマウントポイントを採り、
+/// 同長なら後の行（重ねマウントの最上位）を採る。見つからなければ拒否する（fail-closed）。
+fn check_propagation(mountinfo: &str, dir: &Path) -> Result<(), NetError> {
+    let target = dir.as_os_str().as_bytes();
+    let mut best: Option<(usize, bool)> = None;
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+        let Some(mp_field) = fields.get(4) else {
+            continue;
+        };
+        let mp = unescape_mountinfo(mp_field);
+        let contains = target == mp.as_slice()
+            || mp == b"/"
+            || (target.starts_with(&mp) && target.get(mp.len()) == Some(&b'/'));
+        if !contains {
+            continue;
+        }
+        let shared = fields
+            .iter()
+            .skip(6)
+            .take_while(|f| **f != "-")
+            .any(|f| f.starts_with("shared:"));
+        if best.is_none_or(|(len, _)| mp.len() >= len) {
+            best = Some((mp.len(), shared));
+        }
+    }
+    match best {
+        Some((_, false)) => Ok(()),
+        Some((_, true)) => Err(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "netns directory must not be on a shared mount (make it private first)",
+        )),
+        None => Err(NetError::new(
+            NetErrorCode::Internal,
+            "mount of netns directory not found in mountinfo",
+        )),
+    }
+}
+
+fn check_base_dir_propagation(base: &Path) -> Result<(), NetError> {
+    let real = fs::canonicalize(base).map_err(|e| io_error("resolve netns directory", &e))?;
+    let raw = fs::read("/proc/self/mountinfo").map_err(|e| io_error("read mountinfo", &e))?;
+    check_propagation(&String::from_utf8_lossy(&raw), &real)
+}
+
 /// 作った pin ファイルを消す。失敗は `Present`（残っていると分かる）で報告する。
 fn remove_pin_file(pin: &Path) -> Option<ResourceState> {
     match fs::remove_file(pin) {
@@ -192,13 +268,37 @@ pub(crate) fn create_pinned(
         )
     })?;
 
-    let (tx, rx) = mpsc::channel();
+    // 伝播検査は pin ファイルの作成後に行う（既存物への `AlreadyExists` を先に返すため）。
+    // 拒否したら自分が作ったファイルだけ消す。
+    if let Err(e) = check_base_dir_propagation(base) {
+        return Err(fail(e, remove_pin_file(&pin)));
+    }
+    let pin_c = CString::new(pin.as_os_str().as_bytes()).map_err(|_| {
+        fail(
+            NetError::new(NetErrorCode::InvalidArgument, "netns path contains NUL"),
+            remove_pin_file(&pin),
+        )
+    })?;
+
+    let handoff: Arc<Handoff> = Arc::new((Mutex::new(Slot::Pending), Condvar::new()));
+    let worker_handoff = Arc::clone(&handoff);
+    let worker_pin = pin.clone();
     let spawned = thread::Builder::new()
         .name("fandhe-netns".to_owned())
         .spawn(move || {
             // `file` を握ったまま mount することで、`/proc/self/fd/<n>` が差し替え不能な対象を指す。
             let _hold = file;
-            let _ = tx.send(unshare_and_pin(&target));
+            let result = unshare_and_pin(&target);
+            let (lock, cv) = &*worker_handoff;
+            let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            if matches!(*slot, Slot::Abandoned) {
+                // 呼び出し側は期限切れで見切り済み。完了した副作用はこのスレッドが回収する。
+                drop(slot);
+                reclaim_abandoned(&pin_c, &worker_pin, result.is_ok());
+            } else {
+                *slot = Slot::Done(result);
+                cv.notify_one();
+            }
         });
     if spawned.is_err() {
         return Err(fail(
@@ -210,34 +310,81 @@ pub(crate) fn create_pinned(
         ));
     }
 
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(fd)) => Ok(ContainerNetns { fd, pin }),
-        Ok(Err(error)) => Err(fail(error, remove_pin_file(&pin))),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(fail(
+    let (lock, cv) = &*handoff;
+    let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    let (mut guard, _) = cv
+        .wait_timeout_while(guard, timeout, |s| matches!(s, Slot::Pending))
+        .unwrap_or_else(PoisonError::into_inner);
+    // 未完了なら、ロックを握ったまま `Abandoned` にして回収をスレッドへ引き継ぐ（完了との競合を防ぐ）。
+    match std::mem::replace(&mut *guard, Slot::Abandoned) {
+        Slot::Done(Ok(fd)) => Ok(ContainerNetns { fd, pin }),
+        Slot::Done(Err(error)) => Err(fail(error, remove_pin_file(&pin))),
+        Slot::Pending => Err(fail(
             NetError::new(NetErrorCode::Timeout, "timed out creating netns"),
             Some(ResourceState::Unknown),
         )),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(fail(
-            NetError::new(NetErrorCode::Internal, "netns thread ended unexpectedly"),
+        Slot::Abandoned => Err(fail(
+            NetError::new(NetErrorCode::Internal, "netns handoff in unexpected state"),
             Some(ResourceState::Unknown),
         )),
     }
 }
 
+/// 使い捨てスレッドから呼び出し側への結果の受け渡し状態。
+enum Slot {
+    /// スレッドが未完了。
+    Pending,
+    /// スレッドが完了し、結果を置いた。
+    Done(Result<OwnedFd, NetError>),
+    /// 呼び出し側が期限切れで見切った。以後の後始末は完了時のスレッドが担う。
+    Abandoned,
+}
+
+type Handoff = (Mutex<Slot>, Condvar);
+
+/// 見切られた後に完了したスレッドが、自分の副作用を戻す。`mounted` なら pin をアンマウントし、
+/// いずれの場合も自分が `create_new` で作った pin ファイルを削除する。失敗しても報告先は無い
+/// （呼び出し側へは時間切れ時点で `Unknown` を返済み）ため、ベストエフォート。
+fn reclaim_abandoned(pin_c: &CStr, pin: &Path, mounted: bool) {
+    if mounted {
+        let _ = sys::unmount_detach(pin_c);
+    }
+    let _ = fs::remove_file(pin);
+}
+
 /// pin を外す（`umount2(MNT_DETACH)` → ファイル削除）。fd を drop し参照が尽きれば、カーネルが
 /// netns と中に残った peer veth を破棄する。マウントされていない（`EINVAL`）場合はアンマウントを
 /// 省略してファイルだけ消す。ロールバックと、将来のネットワーク削除（TASK-139.4）が共用する。
-pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), NetError> {
-    let ContainerNetns { fd, pin } = ns;
-    let c_path = CString::new(pin.as_os_str().as_encoded_bytes())
-        .map_err(|_| NetError::new(NetErrorCode::InvalidArgument, "netns path contains NUL"))?;
+///
+/// 失敗時は `ns`（fd と pin パス）を [`UnpinFailure`] に入れて返し、呼び出し側が再試行できる。
+/// 再試行しても、アンマウント済み（`EINVAL`）やファイル削除済みの途中状態から続行できる。
+pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetns>> {
+    let c_path = match CString::new(ns.pin.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => {
+            return Err(UnpinFailure {
+                error: NetError::new(NetErrorCode::InvalidArgument, "netns path contains NUL"),
+                netns: ns,
+            });
+        }
+    };
     match sys::unmount_detach(&c_path) {
         Ok(()) => {}
         Err(SysError::Os(e)) if e == sys::EINVAL => {}
-        Err(e) => return Err(sys_error("umount", e)),
+        Err(e) => {
+            return Err(UnpinFailure {
+                error: sys_error("umount", e),
+                netns: ns,
+            });
+        }
     }
-    drop(fd);
-    fs::remove_file(&pin).map_err(|e| io_error("remove netns pin file", &e))
+    match fs::remove_file(&ns.pin) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(UnpinFailure {
+            error: io_error("remove netns pin file", &e),
+            netns: ns,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +412,46 @@ mod tests {
     fn net1_relative_base_dir_is_rejected() {
         let e = check_base_dir(Path::new("relative/dir")).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+    }
+
+    const MOUNTINFO: &str = "\
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+30 22 0:25 / /run rw,nosuid shared:2 - tmpfs tmpfs rw
+41 30 0:40 / /run/priv rw master:3 - tmpfs tmpfs rw
+42 30 0:41 / /run/with\\040space rw - tmpfs tmpfs rw
+43 41 0:42 / /run/priv/slave rw shared:7 master:3 - tmpfs tmpfs rw
+";
+
+    /// NET-1: 置き場を含むマウントの伝播判定（最長一致・shared 拒否・private / slave 許可）。
+    #[test]
+    fn net1_propagation_check_uses_longest_mount() {
+        let code = |p: &str| check_propagation(MOUNTINFO, Path::new(p)).map_err(|e| e.code());
+        assert_eq!(code("/run/netns"), Err(NetErrorCode::FailedPrecondition));
+        assert_eq!(code("/var/lib/x"), Err(NetErrorCode::FailedPrecondition));
+        assert_eq!(code("/run/priv"), Ok(()));
+        assert_eq!(code("/run/priv/d"), Ok(()));
+        assert_eq!(code("/run/with space/d"), Ok(()));
+        assert_eq!(
+            code("/run/priv/slave/d"),
+            Err(NetErrorCode::FailedPrecondition)
+        );
+        // 前方一致だけでは別マウントとみなさない（`/run/privx` は `/run` に属する）。
+        assert_eq!(code("/run/privx"), Err(NetErrorCode::FailedPrecondition));
+    }
+
+    /// NET-1: mountinfo に該当マウントが無ければ拒否する（fail-closed）。
+    #[test]
+    fn net1_propagation_check_rejects_unknown_mount() {
+        let e = check_propagation("", Path::new("/run/x")).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::Internal);
+    }
+
+    /// 8 進エスケープの復号。
+    #[test]
+    fn mountinfo_octal_unescape() {
+        assert_eq!(unescape_mountinfo("/a\\040b\\134c"), b"/a b\\c");
+        assert_eq!(unescape_mountinfo("/plain"), b"/plain");
+        assert_eq!(unescape_mountinfo("/x\\4"), b"/x\\4");
     }
 
     fn scratch_dir(tag: &str) -> PathBuf {

@@ -876,6 +876,15 @@ pub(crate) struct NetnsFailure {
     pub(crate) leftover: Option<ResourceState>,
 }
 
+/// pin 解除の失敗。解除できなかった netns ハンドルを手放さず、再試行できるよう呼び出し側へ返す。
+#[derive(Debug)]
+pub(crate) struct UnpinFailure<N> {
+    /// 失敗の原因。
+    pub(crate) error: NetError,
+    /// 解除できなかった netns ハンドル（fd と pin パスを保持したまま）。
+    pub(crate) netns: N,
+}
+
 /// 接続手順が使うカーネル操作の境界。Linux 実装とテストの fake を差し替えるための crate 内部トレイトで、
 /// 公開の拡張点（PLUG-1）ではない。[`NetworkOps`] とは独立（ネットワーク作成のテストに影響させない）。
 pub(crate) trait AttachOps {
@@ -883,8 +892,9 @@ pub(crate) trait AttachOps {
     type Netns;
     /// `dir` 直下に `id` 名で pin した新しい netns を作る。失敗時は自分が作った部分資源を片付けてある。
     fn create_netns(&self, dir: &Path, id: &EndpointId) -> Result<Self::Netns, NetnsFailure>;
-    /// pin を外す（umount → ファイル削除）。
-    fn unpin_netns(&self, ns: Self::Netns) -> Result<(), NetError>;
+    /// pin を外す（umount → ファイル削除）。失敗時は `ns` を [`UnpinFailure`] で返し、呼び出し側が
+    /// 再試行できるようにする。
+    fn unpin_netns(&self, ns: Self::Netns) -> Result<(), UnpinFailure<Self::Netns>>;
     /// veth ペアを `NLM_F_EXCL` で作る。
     fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<(), NetError>;
     /// 名前から ifindex を引く。
@@ -908,10 +918,19 @@ fn rollback_netns<O: AttachOps>(
 ) {
     match ops.unpin_netns(ns) {
         Ok(()) => report.removed.push(AttachResource::Netns(pin.to_owned())),
-        Err(_) => report.leftover.push((
-            AttachResource::Netns(pin.to_owned()),
-            ResourceState::Present,
-        )),
+        // ハンドルはここで手放すが、pin のマウントは fd と独立に残るため、報告した pin パスから
+        // 解除をやり直せる（`unpin` は未マウント〔EINVAL〕でもファイル削除へ進む）。
+        Err(UnpinFailure { error, netns }) => {
+            drop(netns);
+            let state = if is_indeterminate(error.code()) {
+                ResourceState::Unknown
+            } else {
+                ResourceState::Present
+            };
+            report
+                .leftover
+                .push((AttachResource::Netns(pin.to_owned()), state));
+        }
     }
 }
 
@@ -1090,7 +1109,7 @@ impl AttachOps for LinuxAttachOps<'_> {
         netns::create_pinned(dir, id, self.timeout)
     }
 
-    fn unpin_netns(&self, ns: ContainerNetns) -> Result<(), NetError> {
+    fn unpin_netns(&self, ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetns>> {
         netns::unpin(ns)
     }
 
@@ -1701,8 +1720,14 @@ mod attach_tests {
         }
     }
 
+    /// netns 置き場のテスト用ディレクトリ。`is_absolute` が 3 OS で真になるよう `temp_dir` 起点にする
+    /// （Windows では `/run/...` が絶対パスと判定されないため。実在は不要で、fake は触らない）。
+    fn netns_dir() -> PathBuf {
+        std::env::temp_dir().join("fc-netns")
+    }
+
     fn spec(id: &str) -> ContainerAttachSpec {
-        ContainerAttachSpec::new(eid(id), &created(), PathBuf::from("/run/fc-netns")).unwrap()
+        ContainerAttachSpec::new(eid(id), &created(), netns_dir()).unwrap()
     }
 
     /// 呼び出しを記録し、指定手順で失敗を注入する fake。link の ifindex は名前の接頭辞で決める。
@@ -1748,10 +1773,13 @@ mod attach_tests {
                 None => Ok(()),
             }
         }
-        fn unpin_netns(&self, (): ()) -> Result<(), NetError> {
+        fn unpin_netns(&self, (): ()) -> Result<(), UnpinFailure<()>> {
             self.rec("unpin_netns");
             if self.unpin_fails {
-                Err(err(NetErrorCode::Internal))
+                Err(UnpinFailure {
+                    error: err(NetErrorCode::Internal),
+                    netns: (),
+                })
             } else {
                 Ok(())
             }
@@ -1810,7 +1838,7 @@ mod attach_tests {
     }
 
     fn pin_of(id: &str) -> PathBuf {
-        PathBuf::from("/run/fc-netns").join(id)
+        netns_dir().join(id)
     }
 
     /// NET-1・TASK-139.2.1: 導出名は決まった形式で、長さは 15 バイト（`IFNAMSIZ` 未満）。
@@ -1870,7 +1898,7 @@ mod attach_tests {
             f.calls(),
             [
                 format!("link_index {}", created().bridge.as_str()),
-                "create_netns /run/fc-netns/web-1".to_owned(),
+                format!("create_netns {}", pin_of("web-1").display()),
                 format!("create_veth {} {}", n.host().as_str(), n.peer().as_str()),
                 format!("link_index {}", n.host().as_str()),
                 format!("link_index {}", n.peer().as_str()),

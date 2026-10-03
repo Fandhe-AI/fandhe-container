@@ -109,38 +109,62 @@ fn exchange(
         }
         match result? {
             Progress::Done(ack) => {
-                return drain_trailing(&mut collector, recv).map(|()| ack);
+                return drain_trailing(&mut collector, deadline, total, recv).map(|()| ack);
             }
             Progress::Pending => {}
         }
     }
 }
 
-/// 本体の判定が揃った後、受信キューに残る応答を待たずに読み切って END の判定を確認する。
+/// 本体の判定が揃った後、受信キューに残る応答を読み切って END の判定を確認する。
 ///
 /// END は `NLM_F_ACK` を持たないため成功時の応答は来ないが、失敗（非 0 errno）は本体の ACK と別の
-/// データグラムで届き得る。カーネルは送信の中で全応答を積み終えるので、待たない受信（timeout 0）で
-/// 取りこぼしなく読める。END の失敗を見逃して成功を返さない（NET-11）。
+/// データグラムで届き得る。カーネルは送信の中で全応答を積み終えるので、短い静止窓
+/// （[`TRAILING_QUIET_WINDOW`]）で読めば取りこぼさない。窓を 0 にしないのは、timeout 0 の受信だと
+/// `poll` 後の EINTR / EAGAIN が即 `Timeout` に写り「キューが空」と区別できず、キュー内の END
+/// エラーを見逃すため（正の窓なら受信側が EINTR を窓の残り時間で再試行する）。
+///
+/// 全体期限（REPAIR-5）を `deadline` で共有し、期限切れは `Timeout`（`Unknown`）にする。上限
+/// （[`MAX_TRAILING_DATAGRAMS`]）まで読んでも応答が止まらなければ、END の判定を確認できないため
+/// 成功にせず `ResourceExhausted`（`Unknown`）にする（fail-closed。NET-11）。
 fn drain_trailing(
     collector: &mut NftBatchAckCollector,
+    deadline: &Deadline,
+    total: Duration,
     mut recv: impl FnMut(Duration) -> Result<Vec<u8>, NetError>,
 ) -> Result<(), NftBatchError> {
-    // 有界（応答が止まらない相手に回り続けない。REPAIR-5）。
     for _ in 0..MAX_TRAILING_DATAGRAMS {
-        match recv(Duration::ZERO) {
+        let remaining = deadline.remaining();
+        if remaining.is_zero() {
+            return Err(collector.timeout_error(total));
+        }
+        match recv(remaining.min(TRAILING_QUIET_WINDOW)) {
             Ok(data) => {
                 collector.feed(&data)?;
             }
-            // 残りの応答なし。
-            Err(e) if e.code() == NetErrorCode::Timeout => return Ok(()),
+            Err(e) if e.code() == NetErrorCode::Timeout => {
+                // 期限切れによる Timeout は「空」と見なさない。
+                if deadline.remaining().is_zero() {
+                    return Err(collector.timeout_error(total));
+                }
+                return Ok(());
+            }
             Err(e) => return Err(collector.unknown(e)),
         }
     }
-    Ok(())
+    Err(collector.unknown(NetError::new(
+        NetErrorCode::ResourceExhausted,
+        format!(
+            "more than {MAX_TRAILING_DATAGRAMS} trailing netlink datagrams after nf_tables batch verdicts"
+        ),
+    )))
 }
 
 /// 本体の判定後に読み切るデータグラム数の上限。
 const MAX_TRAILING_DATAGRAMS: usize = 64;
+
+/// 本体の判定後に「キューが空」と判断するまでの静止窓。成功したバッチごとに最大この時間だけ待つ。
+const TRAILING_QUIET_WINDOW: Duration = Duration::from_millis(1);
 
 impl NetlinkNetfilterSocket {
     /// ソケットを開いて bind する（計測結果は記録しない）。
@@ -302,6 +326,75 @@ mod tests {
         let e = run(&b, Duration::from_millis(50), |_| Ok(()), script(vec![])).expect_err("t");
         assert_eq!(e.code(), NetErrorCode::Timeout);
         assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+    }
+
+    /// NET-11: 末尾の読み切りが上限に達したら成功にせず ResourceExhausted / Unknown。
+    #[test]
+    fn net11_trailing_cap_is_unknown_not_success() {
+        let b = batch(1);
+        let mut first = true;
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            move |_| {
+                if std::mem::take(&mut first) {
+                    Ok(err_dgram(11, 0))
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+        )
+        .expect_err("cap");
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+    }
+
+    /// REPAIR-5: 末尾の読み切り中に期限が切れたら Timeout / Unknown。
+    #[test]
+    fn repair5_deadline_expiry_during_trailing_is_timeout() {
+        let b = batch(1);
+        let mut first = true;
+        let e = run(
+            &b,
+            Duration::from_millis(40),
+            |_| Ok(()),
+            move |_| {
+                if std::mem::take(&mut first) {
+                    Ok(err_dgram(11, 0))
+                } else {
+                    std::thread::sleep(Duration::from_millis(60));
+                    Err(NetError::new(NetErrorCode::Timeout, "none"))
+                }
+            },
+        )
+        .expect_err("expired");
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+    }
+
+    /// NET-11: 末尾の読み切りは timeout 0 でなく正の静止窓で受信する（EINTR を Timeout と誤認しない）。
+    #[test]
+    fn net11_trailing_recv_uses_positive_window() {
+        let b = batch(1);
+        let mut seen = Vec::new();
+        let mut first = true;
+        run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            |t| {
+                seen.push(t);
+                if std::mem::take(&mut first) {
+                    Ok(err_dgram(11, 0))
+                } else {
+                    Err(NetError::new(NetErrorCode::Timeout, "none"))
+                }
+            },
+        )
+        .expect("ok");
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1] > Duration::ZERO && seen[1] <= TRAILING_QUIET_WINDOW);
     }
 
     /// REPAIR-5: 期限後に届いた ACK は成功にせず Timeout に揃える。

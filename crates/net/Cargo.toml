@@ -31,3 +31,10 @@ harness = false
 name = "nftables_dnat_privileged"
 path = "tests/nftables_dnat_privileged.rs"
 harness = false
+
+# bridge・DNAT・masquerade の 3 経路疎通の実機結合試験（NET-11・TASK-138.4・#312）。
+# 子の再入（--child）と root 前提の分離のため harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "nftables_paths_privileged"
+path = "tests/nftables_paths_privileged.rs"
+harness = false

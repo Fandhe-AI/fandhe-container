@@ -607,11 +607,11 @@ fn inconclusive_diagnostic(
             ),
             ForwardPolicyState::AcceptLegacyUnruledOut { .. } => (
                 "LEGACY_IPTABLES_POLICY_UNREAD",
-                "The nftables FORWARD policy is accept, but a legacy iptables FORWARD policy cannot be ruled out; check it with \"iptables -S FORWARD\" (running as root does not help)",
+                "The nftables FORWARD policy is accept, but a legacy iptables FORWARD policy cannot be ruled out; check it with \"iptables-legacy -S FORWARD\"; if /proc/net was unreadable, re-run as a user that can read it (e.g. root)",
             ),
             ForwardPolicyState::NotBaseChain => (
                 "FORWARD_CHAIN_NOT_BASE",
-                "The nftables FORWARD chain has no policy, so a legacy iptables FORWARD policy cannot be ruled out; check it with \"iptables -S FORWARD\" (running as root does not help)",
+                "The nftables FORWARD chain has no policy, so a legacy iptables FORWARD policy cannot be ruled out; check it with \"iptables-legacy -S FORWARD\" (running as root does not help)",
             ),
             ForwardPolicyState::Policy(_) => (
                 "UNRECOGNIZED_POLICY",
@@ -621,13 +621,13 @@ fn inconclusive_diagnostic(
                 legacy_iptables_filter: Some(true),
             } => (
                 "LEGACY_IPTABLES_POLICY_UNREAD",
-                "Legacy iptables filter table exists but its FORWARD policy is not read by this version; check it with \"iptables -S FORWARD\" (running as root does not help)",
+                "Legacy iptables filter table exists but its FORWARD policy is not read by this version; check it with \"iptables-legacy -S FORWARD\" (running as root does not help)",
             ),
             ForwardPolicyState::NotFoundInNftables {
                 legacy_iptables_filter: None,
             } => (
                 "LEGACY_IPTABLES_STATE_UNKNOWN",
-                "Whether a legacy iptables filter table exists could not be determined; check it with \"iptables -S FORWARD\" (running as root does not help)",
+                "Whether a legacy iptables filter table exists could not be determined; re-run as a user that can read /proc/net (e.g. root), or check it with \"iptables-legacy -S FORWARD\"",
             ),
             _ => (
                 "FORWARD_POLICY_UNAVAILABLE",

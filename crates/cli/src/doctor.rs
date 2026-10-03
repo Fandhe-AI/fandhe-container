@@ -140,12 +140,22 @@ impl BrNetfilterProbe {
     }
 }
 
-/// 先頭 [`MAX_PROC_READ`] バイトだけを文字列として読む（無制限読み取りを避ける）。
+/// [`MAX_PROC_READ`] バイト以内のファイルを文字列として読む（無制限読み取りを避ける）。
+///
+/// 上限を超えるファイルは途中で切れた内容を返さず `InvalidData` で失敗させる（切れた内容から
+/// 「行が無い」と誤断定しない fail-closed。呼び出し側は判定不能として扱う）。
 fn read_limited(path: &Path) -> std::io::Result<String> {
     let mut buf = Vec::new();
+    // 上限 + 1 バイトまで読み、超過分が読めたら EOF に達していない（読み切れていない）と判定する。
     File::open(path)?
-        .take(MAX_PROC_READ)
+        .take(MAX_PROC_READ + 1)
         .read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_PROC_READ {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "file exceeds read limit",
+        ));
+    }
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -366,6 +376,23 @@ mod tests {
                 }
             }
         );
+    }
+
+    /// NET-10: 読み取り上限を超える ip_tables_names は「filter なし」と断定せず None（判定不能）。
+    #[test]
+    fn net10_legacy_filter_oversized_is_unknown() {
+        let root = TempRoot::new();
+        // filter 行は上限より後ろにある。
+        let mut text = "nat\n".repeat(MAX_PROC_READ as usize / 4 + 1);
+        text.push_str("filter\n");
+        root.write(IP_TABLES_NAMES, &text);
+        assert_eq!(has_legacy_filter(&root.0), None);
+        let r = read_limited(&root.0.join(IP_TABLES_NAMES)).unwrap_err();
+        assert_eq!(r.kind(), ErrorKind::InvalidData);
+        // ちょうど上限の内容は読み切れるので判定できる（filter 行なし）。
+        let exact = TempRoot::new();
+        exact.write(IP_TABLES_NAMES, &"n".repeat(MAX_PROC_READ as usize));
+        assert_eq!(has_legacy_filter(&exact.0), Some(false));
     }
 
     /// NET-10: legacy iptables の filter テーブルの有無が補助情報に反映される。

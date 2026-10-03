@@ -27,11 +27,12 @@
 //!   上流が 512 バイト超で返す経路を作らない。ログ・エラーには QNAME・パケット内容を載せない
 //! - 待ちはすべて期限つき（試行 [`FORWARD_ATTEMPT_TIMEOUT`]・全体 [`FORWARD_TOTAL_DEADLINE`]。REPAIR-5）。全体期限は
 //!   glibc の resolver 既定タイムアウト（5 秒）より短く、コンテナが先に SERVFAIL を受け取れる
-//! - 転送応答の上限は 512 バイトで、登録済みコンテナ宛てに限る。bridge 内の送信元偽装による別コンテナへの
-//!   反射（最大約 30 倍）は残存リスクである
-//! - `UpstreamServer::new` はヘルパー自身の gateway アドレスを知らないため、`--dns` に gateway を指定する場合の拒否は
-//!   呼び出し側（ネットワーク構成を知る登録経路）の責務である。拒否しないと自分自身へ転送し、単一スレッドの serve が
-//!   最大 [`FORWARD_TOTAL_DEADLINE`] 塞がる（残存リスク。登録経路の実装は TASK-185.4〔#347〕以降）
+//! - 転送応答にも自前応答と同じ増幅上限（要求長 + `MAX_RESPONSE_GROWTH`）を課す。送信元 IP は bridge 内で偽装され得て
+//!   UDP では宛先を認証できないため、上限を超える上流応答は TC=1 の切り詰め応答（質問のみ）に置き換える。TCP 再試行が
+//!   未対応のため、上限を超える応答（複数 RR・CNAME 連鎖等）は現状解決できない（TCP 対応は後続課題）
+//! - 上流応答は質問の一致に加え、後続レコード（名前・圧縮ポインタ・RDLENGTH）が末尾ちょうどまで境界内で完結することを
+//!   検証し、不正な応答は破棄する
+//! - `DnsUpstreamMap::set` は gateway（ヘルパー自身）を上流に指定した登録を拒否する（自己転送で serve が塞がるため）
 //!
 //! # 未実装（REPAIR-3）
 //! - プロセス外のヘルパープロセスへ上流マッピングを登録する経路は無い（`run_dns_helper_main` は NOTIMP のまま）。
@@ -50,9 +51,10 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use super::{
-    DNS_PORT, DnsHeader, DnsRegistry, FLAG_QR, FLAG_RD, HEADER_LEN, HandlerOutcome,
-    MAX_DATAGRAM_LEN, MAX_NAME_LEN, MAX_REGISTRY_ENTRIES, MsgWriter, QCLASS_IN, QueryHandler,
-    RCODE_SERVFAIL, RegistryHandler, ResponseBuf, normalize_qname, parse_question,
+    DNS_PORT, DnsHeader, DnsRegistry, FLAG_QR, FLAG_RD, FLAG_TC, HEADER_LEN, HandlerOutcome,
+    MAX_DATAGRAM_LEN, MAX_NAME_LEN, MAX_REGISTRY_ENTRIES, MAX_RESPONSE_GROWTH, MsgWriter,
+    QCLASS_IN, QueryHandler, RCODE_SERVFAIL, RegistryHandler, ResponseBuf, normalize_qname,
+    parse_question,
 };
 use crate::error::{NetError, NetErrorCode};
 
@@ -168,10 +170,12 @@ impl DnsUpstreamMap {
     }
 
     /// コンテナの上流を登録する。空・上限超過・不正アドレスは、マップを変更する前に `InvalidArgument`。
+    /// `gateway` はこのネットワークの DNS ヘルパー（gateway）の IPv4 で、上流に指定されていれば拒否する。
     /// 同キー・同値は `Unchanged`、別値は上書きせず `AlreadyExists`、件数上限は `ResourceExhausted`。
     pub fn set(
         &self,
         container: Ipv4Addr,
+        gateway: Ipv4Addr,
         servers: &[IpAddr],
     ) -> Result<UpstreamSetOutcome, NetError> {
         if servers.is_empty() || servers.len() > MAX_UPSTREAMS_PER_CONTAINER {
@@ -180,7 +184,14 @@ impl DnsUpstreamMap {
         let mut addrs =
             [SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0); MAX_UPSTREAMS_PER_CONTAINER];
         for (slot, ip) in addrs.iter_mut().zip(servers) {
-            *slot = UpstreamServer::new(*ip)?.socket_addr();
+            let addr = UpstreamServer::new(*ip)?.socket_addr();
+            // ヘルパー自身（gateway）への転送は自己ループで serve を塞ぐため拒否する。
+            if addr.ip() == IpAddr::V4(gateway) {
+                return Err(invalid(
+                    "upstream DNS server must not be the DNS helper's own gateway address",
+                ));
+            }
+            *slot = addr;
         }
         let list = UpstreamList::from_addrs(addrs.get(..servers.len()).unwrap_or(&[]))
             .ok_or_else(|| invalid("upstream DNS server count must be between 1 and 3"))?;
@@ -278,7 +289,71 @@ fn build_forward_query(
     Some((buf, q_end))
 }
 
-/// 上流応答の受理条件: 長さ 12〜512・QR=1・Opcode=0・転送 ID 一致・QDCOUNT=1・質問バイト列の完全一致。
+/// 圧縮名を含む名前を `pos` から読み飛ばして次の位置を返す。ラベル長 63 超・予約ビット（0x40/0x80 単独）・
+/// 範囲外・名前長 255 超・前方（自身以降）を指す圧縮ポインタは `None`（ポインタは追跡せず、位置の妥当性のみ検証する）。
+fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
+    let mut total = 0usize;
+    loop {
+        let len = *msg.get(pos)?;
+        match len & 0xC0 {
+            0x00 => {
+                if len == 0 {
+                    return pos.checked_add(1);
+                }
+                let step = usize::from(len).checked_add(1)?;
+                total = total.checked_add(step)?;
+                if total > MAX_NAME_LEN {
+                    return None;
+                }
+                pos = pos.checked_add(step)?;
+                msg.get(..pos)?;
+            }
+            0xC0 => {
+                let lo = *msg.get(pos.checked_add(1)?)?;
+                let target = usize::from(len & 0x3F) << 8 | usize::from(lo);
+                // ヘッダーより後ろで、かつこのポインタより前だけを許す（ループ・前方参照の排除）。
+                if target < HEADER_LEN || target >= pos {
+                    return None;
+                }
+                return pos.checked_add(2);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// 質問の後ろに続く ANCOUNT + NSCOUNT + ARCOUNT 個のリソースレコードが、メッセージ末尾ちょうどで
+/// 完結するか（名前・固定 10 バイト・RDLENGTH の境界）を検証する。
+fn records_well_formed(reply: &[u8], mut pos: usize) -> bool {
+    let count = |at: usize| -> usize {
+        match reply.get(at..at + 2) {
+            Some(&[a, b]) => usize::from(u16::from_be_bytes([a, b])),
+            _ => 0,
+        }
+    };
+    let total = count(6) + count(8) + count(10);
+    for _ in 0..total {
+        let Some(after_name) = skip_name(reply, pos) else {
+            return false;
+        };
+        let Some(fixed) = reply.get(after_name..after_name.saturating_add(10)) else {
+            return false;
+        };
+        let rdlen = match fixed.get(8..10) {
+            Some(&[a, b]) => usize::from(u16::from_be_bytes([a, b])),
+            _ => return false,
+        };
+        let end = after_name.saturating_add(10).saturating_add(rdlen);
+        if end > reply.len() {
+            return false;
+        }
+        pos = end;
+    }
+    pos == reply.len()
+}
+
+/// 上流応答の受理条件: 長さ 12〜512・QR=1・Opcode=0・転送 ID 一致・QDCOUNT=1・質問バイト列の完全一致・
+/// 後続レコードが末尾まで境界内で完結していること（不正な応答はクライアントへ渡さず破棄する）。
 fn validate_upstream_reply(reply: &[u8], fwd_id: u16, question: &[u8]) -> bool {
     if reply.len() < HEADER_LEN || reply.len() > MAX_DATAGRAM_LEN {
         return false;
@@ -286,11 +361,13 @@ fn validate_upstream_reply(reply: &[u8], fwd_id: u16, question: &[u8]) -> bool {
     let Ok(h) = DnsHeader::parse(reply) else {
         return false;
     };
+    let q_end = HEADER_LEN.saturating_add(question.len());
     h.is_response()
         && h.opcode() == 0
         && h.id() == fwd_id
         && h.qdcount() == 1
-        && reply.get(HEADER_LEN..HEADER_LEN.saturating_add(question.len())) == Some(question)
+        && reply.get(HEADER_LEN..q_end) == Some(question)
+        && records_well_formed(reply, q_end)
 }
 
 /// 1 つの上流へ 1 試行する。受理した応答を `out` に格納して true を返す。
@@ -410,6 +487,43 @@ fn build_servfail(
     filled.is_some() && w.buf.get(..w.len).is_some_and(|b| out.set(b))
 }
 
+/// 上流応答が増幅上限を超えるときの切り詰め応答（QR=1・TC=1・RCODE=NOERROR・質問のみ。長さは要求以下）。
+fn build_truncated(
+    header: &DnsHeader,
+    datagram: &[u8],
+    q_end: usize,
+    out: &mut ResponseBuf,
+) -> bool {
+    let rd = if header.recursion_desired() {
+        FLAG_RD
+    } else {
+        0
+    };
+    let id = header.id().to_be_bytes();
+    let mut w = MsgWriter {
+        buf: [0; MAX_DATAGRAM_LEN],
+        len: 0,
+    };
+    let filled = (|| {
+        w.put(&[
+            id[0],
+            id[1],
+            FLAG_QR | FLAG_TC | rd,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ])?;
+        w.put(datagram.get(HEADER_LEN..q_end)?)
+    })();
+    filled.is_some() && w.buf.get(..w.len).is_some_and(|b| out.set(b))
+}
+
 /// [`RegistryHandler`] と上流転送を合成するハンドラ（NET-12・TASK-185.3）。判定順は module doc を参照。
 /// `respond`（送信元なし）は転送せず [`RegistryHandler`] と同じ挙動にする。
 #[derive(Debug)]
@@ -478,7 +592,18 @@ impl QueryHandler for ForwardingHandler {
         };
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
         match forward_query(&list, datagram, q.end, header.id(), counter, out) {
-            ForwardResult::Forwarded => HandlerOutcome::RespondForwarded,
+            ForwardResult::Forwarded => {
+                // 増幅反射の防止（NET-5）: 要求長 + MAX_RESPONSE_GROWTH を超える応答は、そのまま返さず
+                // TC=1 の切り詰め応答（質問のみ。要求長以下）にする。送信元 IP は偽装され得るため、
+                // 転送応答にも自前応答と同じ上限を課す。
+                if out.as_bytes().len() <= datagram.len().saturating_add(MAX_RESPONSE_GROWTH) {
+                    HandlerOutcome::RespondForwarded
+                } else if build_truncated(header, datagram, q.end, out) {
+                    HandlerOutcome::Respond
+                } else {
+                    HandlerOutcome::NoResponse
+                }
+            }
             ForwardResult::AllFailed => {
                 self.forward_failed.fetch_add(1, Ordering::Relaxed);
                 if build_servfail(header, datagram, q.end, out) {
@@ -502,6 +627,7 @@ mod tests {
     const PEER1: Ipv4Addr = Ipv4Addr::new(10, 215, 0, 2);
     const PEER2: Ipv4Addr = Ipv4Addr::new(10, 215, 0, 3);
     const PEER3: Ipv4Addr = Ipv4Addr::new(10, 215, 0, 4);
+    const GW: Ipv4Addr = Ipv4Addr::new(10, 215, 0, 1);
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -650,9 +776,9 @@ mod tests {
     fn map_semantics() {
         let m = DnsUpstreamMap::new();
         let a = [ip("192.0.2.1")];
-        assert_eq!(m.set(PEER1, &a).unwrap(), UpstreamSetOutcome::Inserted);
-        assert_eq!(m.set(PEER1, &a).unwrap(), UpstreamSetOutcome::Unchanged);
-        let e = m.set(PEER1, &[ip("192.0.2.2")]).unwrap_err();
+        assert_eq!(m.set(PEER1, GW, &a).unwrap(), UpstreamSetOutcome::Inserted);
+        assert_eq!(m.set(PEER1, GW, &a).unwrap(), UpstreamSetOutcome::Unchanged);
+        let e = m.set(PEER1, GW, &[ip("192.0.2.2")]).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::AlreadyExists);
         assert_eq!(m.len(), 1);
         assert_eq!(
@@ -664,7 +790,7 @@ mod tests {
         assert!(m.is_empty());
 
         assert_eq!(
-            m.set(PEER2, &[]).unwrap_err().code(),
+            m.set(PEER2, GW, &[]).unwrap_err().code(),
             NetErrorCode::InvalidArgument
         );
         let four = [
@@ -674,15 +800,28 @@ mod tests {
             ip("192.0.2.4"),
         ];
         assert_eq!(
-            m.set(PEER2, &four).unwrap_err().code(),
+            m.set(PEER2, GW, &four).unwrap_err().code(),
             NetErrorCode::InvalidArgument
         );
         let mixed = [ip("192.0.2.1"), ip("127.0.0.1")];
         assert_eq!(
-            m.set(PEER2, &mixed).unwrap_err().code(),
+            m.set(PEER2, GW, &mixed).unwrap_err().code(),
             NetErrorCode::InvalidArgument
         );
         assert_eq!(m.len(), 0);
+    }
+
+    /// NET-12: gateway（ヘルパー自身）を上流にする登録は拒否し、マップを変更しない。
+    #[test]
+    fn map_rejects_gateway_as_upstream() {
+        let m = DnsUpstreamMap::new();
+        let e = m.set(PEER1, GW, &[ip("10.215.0.1")]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        let e = m
+            .set(PEER1, GW, &[ip("192.0.2.1"), ip("::ffff:10.215.0.1")])
+            .unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        assert!(m.is_empty());
     }
 
     /// NET-12: 件数上限。
@@ -692,10 +831,10 @@ mod tests {
         for i in 0..MAX_REGISTRY_ENTRIES {
             let n = u32::try_from(i).unwrap();
             let peer = Ipv4Addr::from(0x0a00_0000 + n);
-            m.set(peer, &[ip("192.0.2.1")]).unwrap();
+            m.set(peer, GW, &[ip("192.0.2.1")]).unwrap();
         }
         let e = m
-            .set(Ipv4Addr::new(11, 0, 0, 1), &[ip("192.0.2.1")])
+            .set(Ipv4Addr::new(11, 0, 0, 1), GW, &[ip("192.0.2.1")])
             .unwrap_err();
         assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
     }
@@ -745,6 +884,45 @@ mod tests {
             "question"
         );
         assert!(!validate_upstream_reply(&[0; 11], 0, &question), "short");
+        // レコード境界: ANCOUNT=1 で A RR が完結する応答は受理、RDLENGTH 超過・末尾余り・ポインタ不正・件数過大は拒否。
+        let rr = |rdlen: u16, rdata: &[u8], name: &[u8]| {
+            let mut v = mk(7, 0x81, 1, &question);
+            v[7] = 1;
+            v.extend_from_slice(name);
+            v.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 5]);
+            v.extend_from_slice(&rdlen.to_be_bytes());
+            v.extend_from_slice(rdata);
+            v
+        };
+        assert!(validate_upstream_reply(
+            &rr(4, &[1, 2, 3, 4], &[0xC0, 0x0C]),
+            7,
+            &question
+        ));
+        assert!(
+            !validate_upstream_reply(&rr(5, &[1, 2, 3, 4], &[0xC0, 0x0C]), 7, &question),
+            "rdlength overrun"
+        );
+        assert!(
+            !validate_upstream_reply(&rr(4, &[1, 2, 3, 4, 9], &[0xC0, 0x0C]), 7, &question),
+            "trailing bytes"
+        );
+        assert!(
+            !validate_upstream_reply(&rr(4, &[1, 2, 3, 4], &[0xC0, 0xFF]), 7, &question),
+            "pointer out of range"
+        );
+        let own = u8::try_from(HEADER_LEN + question.len()).unwrap();
+        assert!(
+            !validate_upstream_reply(&rr(4, &[1, 2, 3, 4], &[0xC0, own]), 7, &question),
+            "self pointer"
+        );
+        assert!(
+            !validate_upstream_reply(&rr(4, &[1, 2, 3, 4], &[0x80, 0x0C]), 7, &question),
+            "reserved label type"
+        );
+        let mut many = rr(4, &[1, 2, 3, 4], &[0xC0, 0x0C]);
+        many[7] = 2;
+        assert!(!validate_upstream_reply(&many, 7, &question), "count");
         let mut big = mk(7, 0x81, 1, &question);
         big.resize(513, 0);
         assert!(!validate_upstream_reply(&big, 7, &question), "oversized");
@@ -808,33 +986,42 @@ mod tests {
         assert_eq!(u1.seen.lock().unwrap()[0], EXTERNAL);
     }
 
-    /// NET-12: serve 経由では登録済み peer の転送応答（要求長 + 16 超）が増幅ガードを通り、統計に計上される。
+    /// NET-12・NET-5: serve 経由でも転送応答は要求長 + 16 以下に限られる。1 RR の応答は転送され統計に計上され、
+    /// 上限を超える応答は TC=1 の切り詰め応答（質問のみ）に置き換わる。
     #[test]
-    fn serve_allows_forwarded_response_over_growth_limit() {
-        let up = MockUpstream::start(Ipv4Addr::new(198, 51, 100, 1), 2, true);
-        let (h, _) = handler_with(&[(Ipv4Addr::LOCALHOST, up.addr)]);
-        let mut server =
-            DnsHelperServer::bind(DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).unwrap()).unwrap();
-        let addr = server.local_addr();
-        let stop = Arc::new(AtomicBool::new(false));
-        let st = Arc::clone(&stop);
-        let join = thread::spawn(move || {
-            server.serve(&h, &st).unwrap();
-            server
-        });
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let pkt = query(0x7777, EXTERNAL, 1, 0);
-        client.send_to(&pkt, addr).unwrap();
-        let mut buf = [0u8; 600];
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert!(n > pkt.len() + 16, "reply {n} bytes");
-        assert_eq!(&buf[..2], &[0x77, 0x77]);
-        stop.store(true, Ordering::Relaxed);
-        let server = join.join().unwrap();
-        assert_eq!(server.stats().forwarded, 1);
-        assert_eq!(server.stats().suppressed, 0);
+    fn serve_keeps_amplification_limit_for_forwarded_responses() {
+        let one = MockUpstream::start(Ipv4Addr::new(198, 51, 100, 1), 1, true);
+        let two = MockUpstream::start(Ipv4Addr::new(198, 51, 100, 2), 2, true);
+        for (up, expect_tc) in [(&one, false), (&two, true)] {
+            let (h, _) = handler_with(&[(Ipv4Addr::LOCALHOST, up.addr)]);
+            let mut server =
+                DnsHelperServer::bind(DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).unwrap()).unwrap();
+            let addr = server.local_addr();
+            let stop = Arc::new(AtomicBool::new(false));
+            let st = Arc::clone(&stop);
+            let join = thread::spawn(move || {
+                server.serve(&h, &st).unwrap();
+                server
+            });
+            let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let pkt = query(0x7777, EXTERNAL, 1, 0);
+            client.send_to(&pkt, addr).unwrap();
+            let mut buf = [0u8; 600];
+            let (n, _) = client.recv_from(&mut buf).unwrap();
+            assert!(n <= pkt.len() + MAX_RESPONSE_GROWTH, "reply {n} bytes");
+            assert_eq!(&buf[..2], &[0x77, 0x77]);
+            assert_eq!(buf[2] & 0x02 != 0, expect_tc, "TC");
+            if expect_tc {
+                assert_eq!(&buf[6..8], &[0, 0], "ANCOUNT");
+                assert_eq!(n, pkt.len());
+            }
+            stop.store(true, Ordering::Relaxed);
+            let server = join.join().unwrap();
+            assert_eq!(server.stats().forwarded, u64::from(!expect_tc));
+            assert_eq!(server.stats().suppressed, 0);
+        }
     }
 }

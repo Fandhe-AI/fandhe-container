@@ -41,10 +41,9 @@
 //!
 //! # 安全性
 //! 受信バッファは固定長（513 バイト）で、512 バイト超は破棄する。外部入力の解析は `get` / `try_into` のみで
-//! 添字アクセス・`unwrap` を使わない。ヘッダー不正のパケットには応答しない。自前応答は要求長 + [`MAX_RESPONSE_GROWTH`]
-//! バイト以下に限り（増幅反射の防止）、上流転送の応答は上流マッピング登録済みのコンテナ宛てに限って
-//! [`MAX_DATAGRAM_LEN`] まで許す（`HandlerOutcome::RespondForwarded`。bridge 内の送信元偽装による
-//! 別コンテナへの反射は残存リスク）。ログ・統計にはパケットの内容を載せない。待受・準備完了待ち・回収はすべて期限つき（REPAIR-5）。
+//! 添字アクセス・`unwrap` を使わない。ヘッダー不正のパケットには応答しない。自前応答・上流転送の応答とも要求長 + [`MAX_RESPONSE_GROWTH`]
+//! バイト以下に限る（増幅反射の防止。送信元 IP は偽装され得るため転送応答でも緩めない。上限を超える上流応答は
+//! TC=1 の切り詰め応答に置き換わり、TCP 再試行は未対応のため大きな応答は現状解決できない）。ログ・統計にはパケットの内容を載せない。待受・準備完了待ち・回収はすべて期限つき（REPAIR-5）。
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -85,6 +84,7 @@ const READY_PREFIX: &str = "READY ";
 const FLAG_QR: u8 = 0x80;
 const FLAG_RD: u8 = 0x01;
 const FLAG_AA: u8 = 0x04;
+const FLAG_TC: u8 = 0x02;
 const RCODE_NOERROR: u8 = 0;
 const RCODE_SERVFAIL: u8 = 2;
 const RCODE_NOTIMP: u8 = 4;
@@ -354,8 +354,8 @@ impl ResponseBuf {
 pub enum HandlerOutcome {
     /// `out` の内容を返信する。
     Respond,
-    /// 上流から受けた応答を返信する。`serve` は増幅ガードの上限を [`MAX_DATAGRAM_LEN`] にする。
-    /// ハンドラは送信元が上流マッピング登録済みの場合に限って返す（NET-12・TASK-185.3）。
+    /// 上流から受けた応答を返信する（統計の `forwarded` に計上するための区別）。増幅ガードの上限は
+    /// [`HandlerOutcome::Respond`] と同じで、緩めない（NET-12・TASK-185.3）。
     RespondForwarded,
     /// 返信しない。
     NoResponse,
@@ -841,11 +841,11 @@ impl DnsHelperServer {
             };
             out.clear();
             let outcome = handler.respond_from(peer, &header, datagram, &mut out);
-            // 増幅反射の防止: 自前応答は要求長 + A RR 1 件分以下に限る。上流転送の応答は
-            // ハンドラが登録済みコンテナ宛てと確認したときのみ RespondForwarded で返り、512 バイトまで許す。
+            // 増幅反射の防止: 自前応答・上流転送の応答とも要求長 + A RR 1 件分以下に限る。
             let limit = match outcome {
                 HandlerOutcome::Respond => n.saturating_add(MAX_RESPONSE_GROWTH),
-                HandlerOutcome::RespondForwarded => MAX_DATAGRAM_LEN,
+                // 転送応答にも同じ上限を課す（送信元 IP は偽装され得るため。ハンドラの自己申告で緩めない）。
+                HandlerOutcome::RespondForwarded => n.saturating_add(MAX_RESPONSE_GROWTH),
                 HandlerOutcome::NoResponse => continue,
             };
             if out.as_bytes().len() > limit {

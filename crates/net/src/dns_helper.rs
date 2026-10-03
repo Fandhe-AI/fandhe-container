@@ -845,7 +845,7 @@ impl DnsHelperServer {
             };
             out.clear();
             let outcome = handler.respond_from(peer, &header, datagram, &mut out);
-            // 増幅反射の防止: 自前応答・上流転送の応答とも要求長 + A RR 1 件分以下に限る。
+            // 増幅反射の防止: 自前応答は要求長 + A RR 1 件分以下、上流転送の応答は UDP の上限（512 バイト）以下に限る。
             let limit = match outcome {
                 HandlerOutcome::Respond => n.saturating_add(MAX_RESPONSE_GROWTH),
                 // 転送応答は UDP の上限まで許す（`ForwardingHandler` は `SourceVerified` なしに作れず、証印 `ForwardedProof` も外部から作れない）。

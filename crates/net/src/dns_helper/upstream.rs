@@ -39,8 +39,9 @@
 //!   （[`MAX_DATAGRAM_LEN`] = 512 バイト。EDNS OPT を転送しないため上流も 512 以下で返す）を課し、複数 RR・CNAME 連鎖を含む
 //!   通常の応答を TCP 再試行なしで解決できるようにする。上流自身が TC=1 で返した応答は素通しで、クライアントの TCP 再試行は
 //!   ヘルパーが TCP 未対応のため解決できない（後続課題）
-//! - 上流応答は質問の一致に加え、後続レコード（名前・圧縮ポインタ・RDLENGTH）が末尾ちょうどまで境界内で完結することを
-//!   検証し、不正な応答は破棄する
+//! - 上流応答は質問の一致に加え、後続レコード（名前・RDLENGTH・既知の型の RDATA 内の名前）が末尾ちょうどまで境界内で
+//!   完結することを検証し、不正な応答は破棄する。圧縮ポインタは参照先を終端まで追跡して検証し、参照先は追跡のたびに
+//!   厳密に前方へ戻ること（ループ不可）・追跡回数・展開後の名前長 255 で有界にする
 //! - `DnsUpstreamMap::set` は gateway（ヘルパー自身）を上流に指定した登録を拒否する（自己転送で serve が塞がるため）
 //!
 //! # 未実装（REPAIR-3）
@@ -68,6 +69,9 @@ use crate::error::{NetError, NetErrorCode};
 
 /// ワイヤー形式の名前の最大長（終端のゼロを含む。RFC 1035 3.1）。
 const MAX_WIRE_NAME_LEN: usize = 255;
+/// 名前 1 つを読む間に追跡する圧縮ポインタの上限。展開後の名前は 255 オクテット以下で各ラベルは 2 オクテット以上
+/// のため、ラベルは最大 127 個で、正当な圧縮はラベルごとに高々 1 回のポインタで足りる。
+const MAX_POINTER_HOPS: usize = 127;
 /// コンテナ 1 つあたりの上流の最大件数（resolv.conf の MAXNS に合わせた暫定値。spec に規定なし）。
 pub const MAX_UPSTREAMS_PER_CONTAINER: usize = 3;
 /// 上流 1 件あたりの応答待ち期限（暫定値。spec に規定なし）。
@@ -299,20 +303,32 @@ fn build_forward_query(
     Some((buf, q_end))
 }
 
-/// 圧縮名を含む名前を `pos` から読み飛ばして次の位置を返す。ラベル長 63 超・予約ビット（0x40/0x80 単独）・
-/// 範囲外・名前長 255 超・前方（自身以降）を指す圧縮ポインタは `None`（ポインタは追跡せず、位置の妥当性のみ検証する）。
-fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
+/// 圧縮名を含む名前を `start` から終端まで検証し、元の並びで名前の直後になる位置を返す（圧縮ポインタに出会った
+/// 場合はそのポインタ 2 バイトの直後）。圧縮ポインタは参照先を追跡し、参照先のラベル列も終端まで同じ規則で検証する。
+///
+/// `None` になるもの: ラベル長 63 超・予約ビット（0x40 / 0x80 単独）・範囲外・展開後の名前長 255 超（RFC 1035 3.1。
+/// ポインタ経由で連結したラベルも合算する）・参照先がヘッダー内・参照先が直前に読み始めた位置以降（自己参照・前方参照・
+/// 相互参照のループ）・ポインタの追跡回数が [`MAX_POINTER_HOPS`] 超。
+/// 参照先は追跡のたびに厳密に小さくなる（`floor` 未満）ため、ループは構造的に起こらず、追跡回数とメッセージ長でも有界。
+fn skip_name(msg: &[u8], start: usize) -> Option<usize> {
+    let mut pos = start;
+    // 次の参照先が満たすべき上限（排他）。最初は名前の開始位置、追跡後はその参照先。
+    let mut floor = start;
+    // 元の並びでの名前の直後（最初の圧縮ポインタの直後）。ポインタを含まない名前は終端の直後。
+    let mut end: Option<usize> = None;
     let mut total = 0usize;
+    let mut hops = 0usize;
     loop {
         let len = *msg.get(pos)?;
         match len & 0xC0 {
             0x00 => {
                 if len == 0 {
-                    return pos.checked_add(1);
+                    let after_root = pos.checked_add(1)?;
+                    return Some(end.unwrap_or(after_root));
                 }
                 let step = usize::from(len).checked_add(1)?;
                 total = total.checked_add(step)?;
-                // 非圧縮名のワイヤー長は終端のゼロ 1 バイトを含めて 255 オクテット以下（RFC 1035 3.1）。
+                // 名前のワイヤー長は終端のゼロ 1 バイトを含めて 255 オクテット以下（RFC 1035 3.1）。
                 // ここまでの合計（長さバイト + ラベル）は終端を除くので 254 まで許す。
                 // `MAX_NAME_LEN`（253）はドット区切りテキスト表現の上限で、ワイヤー長の上限とは異なる。
                 if total >= MAX_WIRE_NAME_LEN {
@@ -324,19 +340,56 @@ fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
             0xC0 => {
                 let lo = *msg.get(pos.checked_add(1)?)?;
                 let target = usize::from(len & 0x3F) << 8 | usize::from(lo);
-                // ヘッダーより後ろで、かつこのポインタより前だけを許す（ループ・前方参照の排除）。
-                if target < HEADER_LEN || target >= pos {
+                // ヘッダーより後ろで、かつ直前に読み始めた位置より前だけを許す（ループ・前方参照の排除）。
+                if target < HEADER_LEN || target >= floor {
                     return None;
                 }
-                return pos.checked_add(2);
+                hops = hops.checked_add(1)?;
+                if hops > MAX_POINTER_HOPS {
+                    return None;
+                }
+                if end.is_none() {
+                    end = Some(pos.checked_add(2)?);
+                }
+                floor = target;
+                pos = target;
             }
             _ => return None,
         }
     }
 }
 
+/// 名前を含む既知の RR 型について、RDATA 内の名前（圧縮ポインタを含む）を [`skip_name`] で検証し、RDATA の末尾と
+/// 構造が一致するかを返す（RFC 1035 3.3・RFC 2782・RFC 6672）。未知の型は RDLENGTH の境界検査のみに委ねて `true`。
+fn rdata_names_well_formed(msg: &[u8], rtype: u16, rdata_start: usize, rdata_end: usize) -> bool {
+    // 名前 1 つで RDATA を埋める型: NS・CNAME・PTR・DNAME。
+    const NAME_ONLY: [u16; 4] = [2, 5, 12, 39];
+    // 固定長の前置きの後に名前が 1 つ続き、名前が RDATA の末尾ちょうどで終わるか。
+    let prefixed_name = |prefix: usize| {
+        rdata_start
+            .checked_add(prefix)
+            .and_then(|at| skip_name(msg, at))
+            == Some(rdata_end)
+    };
+    match rtype {
+        t if NAME_ONLY.contains(&t) => prefixed_name(0),
+        // MX: PREFERENCE 2 バイト + EXCHANGE。
+        15 => prefixed_name(2),
+        // SRV: PRIORITY・WEIGHT・PORT 各 2 バイト + TARGET。
+        33 => prefixed_name(6),
+        // SOA: MNAME + RNAME + 固定 20 バイト（SERIAL・REFRESH・RETRY・EXPIRE・MINIMUM）。
+        6 => {
+            skip_name(msg, rdata_start)
+                .and_then(|at| skip_name(msg, at))
+                .and_then(|at| at.checked_add(20))
+                == Some(rdata_end)
+        }
+        _ => true,
+    }
+}
+
 /// 質問の後ろに続く ANCOUNT + NSCOUNT + ARCOUNT 個のリソースレコードが、メッセージ末尾ちょうどで
-/// 完結するか（名前・固定 10 バイト・RDLENGTH の境界）を検証する。
+/// 完結するか（名前・固定 10 バイト・RDLENGTH の境界と、既知の型の RDATA 内の名前）を検証する。
 fn records_well_formed(reply: &[u8], mut pos: usize) -> bool {
     let count = |at: usize| -> usize {
         match reply.get(at..at + 2) {
@@ -364,8 +417,9 @@ fn records_well_formed(reply: &[u8], mut pos: usize) -> bool {
         if (rtype == 1 && rdlen != 4) || (rtype == 28 && rdlen != 16) {
             return false;
         }
-        let end = after_name.saturating_add(10).saturating_add(rdlen);
-        if end > reply.len() {
+        let rdata_start = after_name.saturating_add(10);
+        let end = rdata_start.saturating_add(rdlen);
+        if end > reply.len() || !rdata_names_well_formed(reply, rtype, rdata_start, end) {
             return false;
         }
         pos = end;

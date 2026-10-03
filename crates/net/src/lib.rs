@@ -6,8 +6,9 @@
 //! 期限つき往復（`NetlinkRouteSocket::request`。TASK-136.2.2・#844）と、bridge・veth の
 //! `RTM_NEWLINK` 作成メッセージの組み立て（`netlink_route::LinkCreate`。OS 非依存。TASK-136.3.1・#845）と、
 //! `RTM_SETLINK` の netns 移動・up の組み立て（`LinkSet`）および link 作成・設定の送信ラッパー
-//! （`NetlinkRouteSocket::create_link` / `set_link`。TASK-136.3.2・#846）。操作ごとの成功 / 失敗・所要時間の
-//! 記録先を受け取る計装連携点（`instrument`。REPAIR-4）も持つ。link の down・削除・bridge への接続、address / route 操作・
+//! （`NetlinkRouteSocket::create_link` / `set_link`。TASK-136.3.2・#846）と、
+//! 静的 address / route の追加（`RTM_NEWADDR` / `RTM_NEWROUTE`。`netlink_route::addr_route`。TASK-136.4・#301）。
+//! 操作ごとの成功 / 失敗・所要時間の記録先を受け取る計装連携点（`instrument`。REPAIR-4）も持つ。link の down・削除・bridge への接続、
 //! nftables・DNS ヘルパー等は未実装で、G10（TASK-136〜148・TASK-185〜186）で実装する（REPAIR-3）。
 //! PLUG-1 区分は検討中
 //! （制御面の `NetworkPlugin` は plugin 側に区分される一方、DNS ヘルパー・rootless 転送のデータパス

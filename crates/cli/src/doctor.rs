@@ -4,16 +4,17 @@
 //! Docker と同一ホストで自前ネットワーク（NET-1）を併存させると、`br_netfilter` がロードされ、
 //! かつ Docker が iptables の `FORWARD` チェインを `policy drop` にしている環境では、bridge 経由の
 //! 転送が Docker のチェインで落とされ外部到達性が損なわれる可能性がある。本モジュールは次の 2 つの
-//! 事実を取得するだけで（`FORWARD` policy はホストの `ip filter FORWARD` チェインの値であり、Docker が設定した
-//! 値かどうかは照会だけでは判別できない。Docker 起因かの判定は別の根拠で行う。NET-10）、2 条件の組み合わせ判定・警告文・DOCKER-USER 案内・終了コード・サブコマンド配線は
-//! 後続の TASK-148.2（#344）と TASK-79 の範囲である（[`DoctorFindings`] を渡す）。
+//! 事実を取得し（`FORWARD` policy はホストの `ip filter FORWARD` チェインの値であり、Docker が設定した
+//! 値かどうかは照会だけでは判別できない。NET-10）、[`evaluate`] が 2 条件の組み合わせ判定・警告文・
+//! `DOCKER-USER` 案内・終了コード・JSON Lines 出力（TASK-148.2）を担う。サブコマンド配線・出力先の選択・
+//! `process::exit` は TASK-79 の範囲で未実装である。
 //!
 //! # 確認方法
 //!
 //! - `br_netfilter`: `/proc/sys/net/bridge/bridge-nf-call-iptables` の存在で判定する。このディレクトリは
 //!   `br_netfilter` の初期化時に作られるため、モジュール版と組み込み版の両方で使える。
 //!   `/sys/module/br_netfilter` は組み込み版では当てにならないため判定には使わない。ファイルの値
-//!   （`0` / `1`）は bridge 通過パケットを iptables に渡すかどうかとして併せて返す。
+//!   （`0` / `1`）は bridge 通過パケットを iptables に渡すかどうかとして返し、`1` のときだけリスク条件を成立とする（`0` は不成立）。
 //! - `FORWARD` チェインの policy: nf_tables に対する `NFT_MSG_GETCHAIN` の読み取り照会
 //!   （`ip filter FORWARD`）。外部コマンド（`iptables` / `nft`）は起動しない（NET-11・フルスクラッチ方針）。
 //!   nfnetlink は `CAP_NET_ADMIN` を要するため、非特権では [`ForwardPolicyState::PermissionDenied`] になる。
@@ -232,6 +233,13 @@ fn read_limited(path: &Path, limit: u64) -> std::io::Result<String> {
 pub enum ForwardPolicyState {
     /// base chain の policy を取得できた。
     Policy(ChainPolicy),
+    /// nftables 側の policy は accept だが、legacy iptables の filter テーブルが併存しうる（存在する、または
+    /// 読み取れず不明）ため、legacy 側の FORWARD policy が DROP の可能性を否定できない状態。legacy の
+    /// filter テーブルが無いと確認できた場合は [`ForwardPolicyState::Policy`] になる（NET-10・fail-closed）。
+    AcceptLegacyUnruledOut {
+        /// legacy iptables の filter テーブルが存在するか。`None` は判定不能（`NotFoundInNftables` と同義）。
+        legacy_iptables_filter: Option<bool>,
+    },
     /// チェインはあるが policy 属性を持たない（base chain でない）。
     NotBaseChain,
     /// nftables に `ip filter FORWARD` が無い。iptables-legacy 環境では正常で、`legacy_iptables_filter` は
@@ -301,6 +309,15 @@ pub fn probe_forward_policy(source: &dyn ForwardPolicySource, root: &Path) -> Fo
                     },
                 }
             }
+            // nftables 側が accept でも、併存する legacy iptables の FORWARD policy が DROP の
+            // ホストを無リスクと誤判定しない。legacy の filter テーブルが無いと確認できた場合のみ
+            // accept を確定させる（fail-closed。NET-10）。
+            Some(ChainPolicy::Accept) => match has_legacy_filter(root) {
+                Some(false) => ForwardPolicyState::Policy(ChainPolicy::Accept),
+                legacy_iptables_filter => ForwardPolicyState::AcceptLegacyUnruledOut {
+                    legacy_iptables_filter,
+                },
+            },
             Some(p) => ForwardPolicyState::Policy(p),
             None => ForwardPolicyState::NotBaseChain,
         },
@@ -309,7 +326,8 @@ pub fn probe_forward_policy(source: &dyn ForwardPolicySource, root: &Path) -> Fo
                 legacy_iptables_filter: has_legacy_filter(root),
             },
             NetErrorCode::PermissionDenied => ForwardPolicyState::PermissionDenied,
-            NetErrorCode::Unimplemented => ForwardPolicyState::Unsupported,
+            // Linux 上の照会未実装は OS 対象外ではなく判定不能（成功終了に見せない。fail-closed）。
+            // 対象外 OS は関数冒頭で `Unsupported` を返している。
             _ => ForwardPolicyState::Unknown {
                 reason: DoctorProbeError::from_net(&e),
             },
@@ -330,7 +348,7 @@ fn has_legacy_filter(root: &Path) -> Option<bool> {
     }
 }
 
-/// 2 つの probe の結果。組み合わせ判定・表示は TASK-148.2（#344）が担う。
+/// 2 つの probe の結果。組み合わせ判定・表示は [`evaluate`]（TASK-148.2）が担う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoctorFindings {
     /// `br_netfilter` のロード状態。
@@ -344,6 +362,692 @@ pub fn collect(probe: &BrNetfilterProbe, source: &dyn ForwardPolicySource) -> Do
     DoctorFindings {
         br_netfilter: probe.probe(),
         forward_policy: probe_forward_policy(source, &probe.root),
+    }
+}
+
+/// 1 つの条件の判定結果（3 値＋対象外）。「満たさない」と「判定できない」を取り違えない（fail-closed。NET-10）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionState {
+    /// 条件を満たす。
+    Met,
+    /// 条件を満たさないと確定した。
+    NotMet,
+    /// 判定できなかった（権限不足・照会失敗等）。
+    Unknown,
+    /// 対象外の OS。
+    NotApplicable,
+}
+
+/// 2 条件を組み合わせた診断の結論（NET-10・TASK-148.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorOutcome {
+    /// どちらかが満たされないと確定し、リスクなし。
+    NoRisk,
+    /// 2 条件がともに成立し、リスク警告を出す。
+    RiskDetected,
+    /// 少なくとも一方が判定不能で、リスクの有無を確定できない。
+    Inconclusive,
+    /// Linux 以外では対象外。
+    NotApplicable,
+}
+
+/// `doctor` の終了ステータス。
+///
+/// spec に警告用の値の定義がないため本タスクで定めた（`net` の DNS ヘルパーの 1=実行時失敗・2=引数エラーに揃える）。
+/// `Fatal` / `Usage` は TASK-79 の配線側が使う予約値で、本モジュールの評価（[`DoctorReport::exit_status`]）は返さない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorExitStatus {
+    /// 0: 問題なし、または対象外。
+    Ok,
+    /// 1: 致命的エラー（ERR-1。予約）。
+    Fatal,
+    /// 2: 引数エラー（予約）。
+    Usage,
+    /// 3: リスク警告（致命的エラーとは別の値）。
+    Warning,
+    /// 4: 判定不能。
+    Inconclusive,
+}
+
+impl DoctorExitStatus {
+    /// プロセス終了コードの値。
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Ok => 0,
+            Self::Fatal => 1,
+            Self::Usage => 2,
+            Self::Warning => 3,
+            Self::Inconclusive => 4,
+        }
+    }
+}
+
+/// 診断の重大度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorSeverity {
+    /// リスク警告。
+    Warning,
+    /// 情報通知（判定不能など）。
+    Notice,
+}
+
+impl DoctorSeverity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Warning => "warning",
+            Self::Notice => "notice",
+        }
+    }
+}
+
+/// 機械可読な 1 件の診断（`code` は ERR 系に揃えた英大文字スネーク、`message` は英語）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorDiagnostic {
+    /// 重大度。
+    pub severity: DoctorSeverity,
+    /// 機械可読なコード（`BRIDGE_FORWARD_DROP_RISK` / `DIAGNOSIS_INCONCLUSIVE`）。
+    pub code: &'static str,
+    /// 人間向けの説明（英語。ホスト固有の情報を載せない）。
+    pub message: String,
+    /// 対処の案内（`DOCKER-USER` チェインでの許可方法など）。doctor 自身は設定を変更しない。
+    pub remediation: Vec<String>,
+}
+
+/// 評価結果。表示（[`DoctorReport::write_json_lines`]）と終了コード（[`DoctorReport::exit_status`]）の元になる。
+///
+/// CLI への配線（サブコマンド・stdout / stderr の選択・`process::exit`）は TASK-79 の範囲。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorReport {
+    /// 結論。
+    pub outcome: DoctorOutcome,
+    /// 診断（`NoRisk` / `NotApplicable` では空）。
+    pub diagnostics: Vec<DoctorDiagnostic>,
+    /// 判定の元になった事実。
+    pub findings: DoctorFindings,
+}
+
+fn br_netfilter_condition(s: &BrNetfilterState) -> ConditionState {
+    match s {
+        // bridge-nf-call-iptables=1 のときだけ bridge 通過パケットが iptables に渡り、リスクが成立する。
+        // 0 は現時点では渡されないため不成立（将来 sysctl が変わりうることは現在の診断結果と分ける）。
+        // 0 / 1 以外で読めない値は判定不能にする。
+        BrNetfilterState::Loaded {
+            call_iptables: Some(true),
+        } => ConditionState::Met,
+        BrNetfilterState::Loaded {
+            call_iptables: Some(false),
+        } => ConditionState::NotMet,
+        BrNetfilterState::Loaded {
+            call_iptables: None,
+        } => ConditionState::Unknown,
+        BrNetfilterState::NotLoaded => ConditionState::NotMet,
+        BrNetfilterState::Unknown { .. } => ConditionState::Unknown,
+        BrNetfilterState::Unsupported => ConditionState::NotApplicable,
+    }
+}
+
+fn forward_drop_condition(s: &ForwardPolicyState) -> ConditionState {
+    match s {
+        ForwardPolicyState::Policy(ChainPolicy::Drop) => ConditionState::Met,
+        ForwardPolicyState::Policy(ChainPolicy::Accept) => ConditionState::NotMet,
+        // legacy iptables の併存を否定できない accept は無リスクと断定しない。
+        ForwardPolicyState::AcceptLegacyUnruledOut { .. } => ConditionState::Unknown,
+        // 未知のカーネル値は fail-closed で判定不能にする。
+        ForwardPolicyState::Policy(ChainPolicy::Other(_)) => ConditionState::Unknown,
+        // nftables 側の FORWARD は policy を持たないだけで、legacy iptables の filter テーブルが
+        // 併存して policy が DROP の場合がありうる。legacy 側を確認できないため判定不能にする
+        // （fail-closed。NET-10）。
+        ForwardPolicyState::NotBaseChain => ConditionState::Unknown,
+        ForwardPolicyState::NotFoundInNftables {
+            legacy_iptables_filter: Some(false),
+        } => ConditionState::NotMet,
+        // legacy の policy は未取得のため判定できない。
+        ForwardPolicyState::NotFoundInNftables {
+            legacy_iptables_filter: Some(true) | None,
+        } => ConditionState::Unknown,
+        ForwardPolicyState::PermissionDenied => ConditionState::Unknown,
+        ForwardPolicyState::Unknown { .. } => ConditionState::Unknown,
+        ForwardPolicyState::Unsupported => ConditionState::NotApplicable,
+    }
+}
+
+/// 2 条件を組み合わせて診断結果を作る純粋関数（NET-10・TASK-148.2）。
+///
+/// 評価順: 対象外 → どちらか NotMet でリスクなし → 両方 Met で警告 → それ以外は判定不能。
+/// 非 root では GETCHAIN が `PermissionDenied` になるため、判定不能を「問題なし」にせず別通知で知らせる。
+pub fn evaluate(findings: &DoctorFindings) -> DoctorReport {
+    let a = br_netfilter_condition(&findings.br_netfilter);
+    let b = forward_drop_condition(&findings.forward_policy);
+    use ConditionState::{Met, NotApplicable, NotMet};
+    let outcome = if a == NotApplicable || b == NotApplicable {
+        DoctorOutcome::NotApplicable
+    } else if a == NotMet || b == NotMet {
+        DoctorOutcome::NoRisk
+    } else if a == Met && b == Met {
+        DoctorOutcome::RiskDetected
+    } else {
+        DoctorOutcome::Inconclusive
+    };
+    let diagnostics = match outcome {
+        DoctorOutcome::RiskDetected => vec![DoctorDiagnostic {
+            severity: DoctorSeverity::Warning,
+            code: "BRIDGE_FORWARD_DROP_RISK",
+            message: "br_netfilter is loaded and the host \"ip filter FORWARD\" chain policy is drop \
+                      (as Docker sets when it manages iptables); bridged traffic of fandhe-container \
+                      networks may be dropped and external reachability may be lost"
+                .to_string(),
+            remediation: vec![
+                "First check which iptables backend is in use (\"iptables --version\" shows nf_tables or \
+                 legacy) and whether the DOCKER-USER chain exists (\"iptables -S DOCKER-USER\"); \
+                 DOCKER-USER exists only while Docker is running with iptables management enabled"
+                    .to_string(),
+                "If it exists, consider adding narrowly scoped rules to the DOCKER-USER chain for the \
+                 fandhe-container bridge (<bridge>), restricted by source, destination and protocol, \
+                 instead of accepting all forwarded traffic of the bridge, which would bypass \
+                 existing traffic restrictions"
+                    .to_string(),
+                "fandhe-container doctor does not modify firewall rules; apply the rules above yourself"
+                    .to_string(),
+            ],
+        }],
+        DoctorOutcome::Inconclusive => vec![inconclusive_diagnostic(findings, a, b)],
+        DoctorOutcome::NoRisk | DoctorOutcome::NotApplicable => Vec::new(),
+    };
+    DoctorReport {
+        outcome,
+        diagnostics,
+        findings: findings.clone(),
+    }
+}
+
+fn inconclusive_diagnostic(
+    findings: &DoctorFindings,
+    a: ConditionState,
+    b: ConditionState,
+) -> DoctorDiagnostic {
+    let mut reasons: Vec<String> = Vec::new();
+    let mut remediation: Vec<String> = Vec::new();
+    if a == ConditionState::Unknown {
+        // 原因別に診断コードと案内を分ける。値が読めている場合や権限以外の失敗では
+        // 権限での再実行を案内しない（誤誘導の防止）。
+        let (code, advice) = match &findings.br_netfilter {
+            BrNetfilterState::Unknown { reason } if reason.code == "PERMISSION_DENIED" => (
+                "PERMISSION_DENIED",
+                "Re-run as a user that can read /proc/sys/net (e.g. root)",
+            ),
+            BrNetfilterState::Unknown { reason } => (
+                reason.code.as_str(),
+                "Check the probe error code above; the br_netfilter state could not be read",
+            ),
+            BrNetfilterState::Loaded { .. } => (
+                "UNRECOGNIZED_BRIDGE_NF_VALUE",
+                "bridge-nf-call-iptables has a value other than 0 or 1; check it with \"sysctl net.bridge.bridge-nf-call-iptables\" (running as root does not help)",
+            ),
+            _ => (
+                "BR_NETFILTER_UNAVAILABLE",
+                "Check the br_netfilter state manually with \"lsmod | grep br_netfilter\"",
+            ),
+        };
+        reasons.push(format!(
+            "br_netfilter state could not be determined ({code})"
+        ));
+        remediation.push(advice.to_string());
+    }
+    if b == ConditionState::Unknown {
+        // 原因別に診断コードと案内を分ける。権限不足以外は root で再実行しても解消しないため、
+        // CAP_NET_ADMIN の案内を出さない（誤誘導の防止）。
+        let (code, advice) = match &findings.forward_policy {
+            ForwardPolicyState::PermissionDenied => (
+                "PERMISSION_DENIED",
+                "Re-run with CAP_NET_ADMIN (e.g. as root) to read the FORWARD chain policy",
+            ),
+            ForwardPolicyState::Unknown { reason } => (
+                reason.code.as_str(),
+                "Check the probe error code above; the FORWARD chain policy could not be read",
+            ),
+            ForwardPolicyState::AcceptLegacyUnruledOut { .. } => (
+                "LEGACY_IPTABLES_POLICY_UNREAD",
+                "The nftables FORWARD policy is accept, but a legacy iptables FORWARD policy cannot be ruled out; check it with \"iptables-legacy -S FORWARD\"; if /proc/net was unreadable, re-run as a user that can read it (e.g. root)",
+            ),
+            ForwardPolicyState::NotBaseChain => (
+                "FORWARD_CHAIN_NOT_BASE",
+                "The nftables FORWARD chain has no policy, so a legacy iptables FORWARD policy cannot be ruled out; check it with \"iptables-legacy -S FORWARD\" (running as root does not help)",
+            ),
+            ForwardPolicyState::Policy(_) => (
+                "UNRECOGNIZED_POLICY",
+                "The kernel reported an unrecognized FORWARD policy value; check it with \"nft list chain ip filter FORWARD\"",
+            ),
+            ForwardPolicyState::NotFoundInNftables {
+                legacy_iptables_filter: Some(true),
+            } => (
+                "LEGACY_IPTABLES_POLICY_UNREAD",
+                "Legacy iptables filter table exists but its FORWARD policy is not read by this version; check it with \"iptables-legacy -S FORWARD\" (running as root does not help)",
+            ),
+            ForwardPolicyState::NotFoundInNftables {
+                legacy_iptables_filter: None,
+            } => (
+                "LEGACY_IPTABLES_STATE_UNKNOWN",
+                "Whether a legacy iptables filter table exists could not be determined; re-run as a user that can read /proc/net (e.g. root), or check it with \"iptables-legacy -S FORWARD\"",
+            ),
+            _ => (
+                "FORWARD_POLICY_UNAVAILABLE",
+                "Check the FORWARD chain policy manually with \"iptables -S FORWARD\"",
+            ),
+        };
+        reasons.push(format!("forward policy could not be determined ({code})"));
+        remediation.push(advice.to_string());
+    }
+    DoctorDiagnostic {
+        severity: DoctorSeverity::Notice,
+        code: "DIAGNOSIS_INCONCLUSIVE",
+        message: reasons.join("; "),
+        remediation,
+    }
+}
+
+impl DoctorReport {
+    /// 結論に対応する終了ステータス。
+    pub fn exit_status(&self) -> DoctorExitStatus {
+        match self.outcome {
+            DoctorOutcome::NoRisk | DoctorOutcome::NotApplicable => DoctorExitStatus::Ok,
+            DoctorOutcome::RiskDetected => DoctorExitStatus::Warning,
+            DoctorOutcome::Inconclusive => DoctorExitStatus::Inconclusive,
+        }
+    }
+
+    /// 診断を 1 件 1 行の JSON Lines で書き出す（ERR-4 の構造化形式に寄せる）。出力先は TASK-79 が決める。
+    pub fn write_json_lines(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        let br = br_netfilter_token(&self.findings.br_netfilter);
+        let fw = forward_policy_token(&self.findings.forward_policy);
+        for d in &self.diagnostics {
+            let rem: Vec<String> = d
+                .remediation
+                .iter()
+                .map(|r| format!("\"{}\"", json_escape(r)))
+                .collect();
+            writeln!(
+                w,
+                "{{\"severity\":\"{}\",\"code\":\"{}\",\"message\":\"{}\",\"remediation\":[{}],\"br_netfilter\":\"{}\",\"forward_policy\":\"{}\"}}",
+                d.severity.as_str(),
+                json_escape(d.code),
+                json_escape(&d.message),
+                rem.join(","),
+                json_escape(&br),
+                json_escape(&fw),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn br_netfilter_token(s: &BrNetfilterState) -> String {
+    match s {
+        BrNetfilterState::Loaded {
+            call_iptables: Some(true),
+        } => "loaded(call_iptables=1)".to_string(),
+        BrNetfilterState::Loaded {
+            call_iptables: Some(false),
+        } => "loaded(call_iptables=0)".to_string(),
+        BrNetfilterState::Loaded {
+            call_iptables: None,
+        } => "loaded".to_string(),
+        BrNetfilterState::NotLoaded => "not_loaded".to_string(),
+        BrNetfilterState::Unknown { reason } => format!("unknown({})", reason.code),
+        BrNetfilterState::Unsupported => "unsupported".to_string(),
+    }
+}
+
+fn forward_policy_token(s: &ForwardPolicyState) -> String {
+    match s {
+        ForwardPolicyState::Policy(ChainPolicy::Drop) => "policy(drop)".to_string(),
+        ForwardPolicyState::Policy(ChainPolicy::Accept) => "policy(accept)".to_string(),
+        ForwardPolicyState::Policy(ChainPolicy::Other(n)) => format!("policy(other={n})"),
+        ForwardPolicyState::AcceptLegacyUnruledOut { .. } => {
+            "policy(accept,legacy_unruled_out)".to_string()
+        }
+        ForwardPolicyState::NotBaseChain => "not_base_chain".to_string(),
+        ForwardPolicyState::NotFoundInNftables { .. } => "not_found_in_nftables".to_string(),
+        ForwardPolicyState::PermissionDenied => "permission_denied".to_string(),
+        ForwardPolicyState::Unknown { reason } => format!("unknown({})", reason.code),
+        ForwardPolicyState::Unsupported => "unsupported".to_string(),
+    }
+}
+
+/// JSON 文字列リテラルの内側用エスケープ。cli は plugin crate に依存しないため共有せずローカルに持つ
+/// （同種の実装: `crates/plugin/src/lifecycle/resident.rs`）。
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// 評価層（`evaluate`）のテスト。実機に依存しない純粋関数のため全 OS で実行される
+/// （Linux 限定の実機プローブテストは後続の `tests` モジュール）。
+#[cfg(test)]
+mod eval_tests {
+    use super::*;
+
+    fn loaded() -> BrNetfilterState {
+        BrNetfilterState::Loaded {
+            call_iptables: Some(true),
+        }
+    }
+    fn err() -> DoctorProbeError {
+        DoctorProbeError {
+            code: "INTERNAL".to_string(),
+            message: "x".to_string(),
+        }
+    }
+    fn f(b: BrNetfilterState, p: ForwardPolicyState) -> DoctorFindings {
+        DoctorFindings {
+            br_netfilter: b,
+            forward_policy: p,
+        }
+    }
+
+    #[test]
+    fn net10_condition_table_br_netfilter() {
+        use ConditionState::*;
+        for (c, want) in [(Some(true), Met), (Some(false), NotMet), (None, Unknown)] {
+            assert_eq!(
+                br_netfilter_condition(&BrNetfilterState::Loaded { call_iptables: c }),
+                want
+            );
+        }
+        assert_eq!(br_netfilter_condition(&BrNetfilterState::NotLoaded), NotMet);
+        assert_eq!(
+            br_netfilter_condition(&BrNetfilterState::Unknown { reason: err() }),
+            Unknown
+        );
+        assert_eq!(
+            br_netfilter_condition(&BrNetfilterState::Unsupported),
+            NotApplicable
+        );
+    }
+
+    #[test]
+    fn net10_condition_table_forward_policy() {
+        use ConditionState::*;
+        let nf = |l| ForwardPolicyState::NotFoundInNftables {
+            legacy_iptables_filter: l,
+        };
+        let acc = |l| ForwardPolicyState::AcceptLegacyUnruledOut {
+            legacy_iptables_filter: l,
+        };
+        let cases = [
+            (acc(Some(true)), Unknown),
+            (acc(None), Unknown),
+            (ForwardPolicyState::Policy(ChainPolicy::Drop), Met),
+            (ForwardPolicyState::Policy(ChainPolicy::Accept), NotMet),
+            (ForwardPolicyState::Policy(ChainPolicy::Other(7)), Unknown),
+            (ForwardPolicyState::NotBaseChain, Unknown),
+            (nf(Some(false)), NotMet),
+            (nf(Some(true)), Unknown),
+            (nf(None), Unknown),
+            (ForwardPolicyState::PermissionDenied, Unknown),
+            (ForwardPolicyState::Unknown { reason: err() }, Unknown),
+            (ForwardPolicyState::Unsupported, NotApplicable),
+        ];
+        for (s, want) in cases {
+            assert_eq!(forward_drop_condition(&s), want, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn net10_warning_only_when_both_met() {
+        let brs = [
+            loaded(),
+            BrNetfilterState::NotLoaded,
+            BrNetfilterState::Unknown { reason: err() },
+            BrNetfilterState::Unsupported,
+        ];
+        let fws = [
+            ForwardPolicyState::Policy(ChainPolicy::Drop),
+            ForwardPolicyState::Policy(ChainPolicy::Accept),
+            ForwardPolicyState::Policy(ChainPolicy::Other(7)),
+            ForwardPolicyState::NotBaseChain,
+            ForwardPolicyState::NotFoundInNftables {
+                legacy_iptables_filter: None,
+            },
+            ForwardPolicyState::PermissionDenied,
+            ForwardPolicyState::Unsupported,
+        ];
+        for b in &brs {
+            for p in &fws {
+                let r = evaluate(&f(b.clone(), p.clone()));
+                let warns = r
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.code == "BRIDGE_FORWARD_DROP_RISK")
+                    .count();
+                let both = *b == loaded() && *p == ForwardPolicyState::Policy(ChainPolicy::Drop);
+                assert_eq!(warns, usize::from(both), "{b:?} x {p:?}");
+                assert_eq!(r.outcome == DoctorOutcome::RiskDetected, both);
+            }
+        }
+    }
+
+    #[test]
+    fn net10_outcome_mapping() {
+        let o = |b, p| evaluate(&f(b, p)).outcome;
+        // nftables が accept でも legacy 併存を否定できなければ無リスクにしない。
+        assert_eq!(
+            o(
+                loaded(),
+                ForwardPolicyState::AcceptLegacyUnruledOut {
+                    legacy_iptables_filter: Some(true)
+                }
+            ),
+            DoctorOutcome::Inconclusive
+        );
+        assert_eq!(
+            o(
+                BrNetfilterState::NotLoaded,
+                ForwardPolicyState::PermissionDenied
+            ),
+            DoctorOutcome::NoRisk
+        );
+        assert_eq!(
+            o(loaded(), ForwardPolicyState::PermissionDenied),
+            DoctorOutcome::Inconclusive
+        );
+        assert_eq!(
+            o(
+                BrNetfilterState::Unknown { reason: err() },
+                ForwardPolicyState::Policy(ChainPolicy::Accept)
+            ),
+            DoctorOutcome::NoRisk
+        );
+        assert_eq!(
+            o(
+                BrNetfilterState::Unsupported,
+                ForwardPolicyState::Policy(ChainPolicy::Drop)
+            ),
+            DoctorOutcome::NotApplicable
+        );
+    }
+
+    fn risk() -> DoctorReport {
+        evaluate(&f(loaded(), ForwardPolicyState::Policy(ChainPolicy::Drop)))
+    }
+
+    #[test]
+    fn net10_call_iptables_zero_is_no_risk() {
+        let r = evaluate(&f(
+            BrNetfilterState::Loaded {
+                call_iptables: Some(false),
+            },
+            ForwardPolicyState::Policy(ChainPolicy::Drop),
+        ));
+        assert_eq!(r.outcome, DoctorOutcome::NoRisk);
+        assert!(r.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn net10_remediation_checks_first_and_has_no_blanket_accept() {
+        let r = risk();
+        let rem = &r.diagnostics[0].remediation;
+        assert!(
+            rem[0].contains("iptables --version") && rem[0].contains("iptables -S DOCKER-USER")
+        );
+        assert!(rem.iter().all(|x| !x.contains("-j ACCEPT")));
+    }
+
+    #[test]
+    fn net10_warning_mentions_docker_user() {
+        let r = risk();
+        let d = &r.diagnostics[0];
+        assert_eq!(d.severity, DoctorSeverity::Warning);
+        assert!(d.message.contains("drop") && d.message.contains("br_netfilter"));
+        assert!(
+            d.remediation
+                .iter()
+                .any(|x| x.contains("DOCKER-USER") && x.contains("<bridge>"))
+        );
+    }
+
+    #[test]
+    fn net10_exit_codes_distinguish_warning_from_fatal() {
+        assert_eq!(DoctorExitStatus::Ok.code(), 0);
+        assert_eq!(DoctorExitStatus::Fatal.code(), 1);
+        assert_eq!(DoctorExitStatus::Usage.code(), 2);
+        assert_eq!(DoctorExitStatus::Warning.code(), 3);
+        assert_eq!(DoctorExitStatus::Inconclusive.code(), 4);
+        assert_ne!(
+            DoctorExitStatus::Warning.code(),
+            DoctorExitStatus::Fatal.code()
+        );
+        assert_ne!(
+            DoctorExitStatus::Inconclusive.code(),
+            DoctorExitStatus::Fatal.code()
+        );
+        assert_eq!(risk().exit_status(), DoctorExitStatus::Warning);
+        let ok = evaluate(&f(
+            BrNetfilterState::NotLoaded,
+            ForwardPolicyState::PermissionDenied,
+        ));
+        assert_eq!(ok.exit_status(), DoctorExitStatus::Ok);
+        let inc = evaluate(&f(loaded(), ForwardPolicyState::PermissionDenied));
+        assert_eq!(inc.exit_status(), DoctorExitStatus::Inconclusive);
+    }
+
+    #[test]
+    fn net10_inconclusive_notice_is_not_warning() {
+        let r = evaluate(&f(loaded(), ForwardPolicyState::PermissionDenied));
+        let d = &r.diagnostics[0];
+        assert_eq!(d.severity, DoctorSeverity::Notice);
+        assert_eq!(d.code, "DIAGNOSIS_INCONCLUSIVE");
+        assert_eq!(
+            d.message,
+            "forward policy could not be determined (PERMISSION_DENIED)"
+        );
+        assert!(d.remediation[0].contains("CAP_NET_ADMIN"));
+    }
+
+    #[test]
+    fn net10_json_lines_rendering() {
+        let r = evaluate(&f(loaded(), ForwardPolicyState::PermissionDenied));
+        let mut buf = Vec::new();
+        r.write_json_lines(&mut buf).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "{\"severity\":\"notice\",\"code\":\"DIAGNOSIS_INCONCLUSIVE\",\"message\":\"forward policy could not be determined (PERMISSION_DENIED)\",\"remediation\":[\"Re-run with CAP_NET_ADMIN (e.g. as root) to read the FORWARD chain policy\"],\"br_netfilter\":\"loaded(call_iptables=1)\",\"forward_policy\":\"permission_denied\"}\n"
+        );
+        let mut buf = Vec::new();
+        risk().write_json_lines(&mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s.lines().count(), 1);
+        assert!(s.ends_with("\"forward_policy\":\"policy(drop)\"}\n"));
+        let mut buf = Vec::new();
+        evaluate(&f(
+            BrNetfilterState::NotLoaded,
+            ForwardPolicyState::PermissionDenied,
+        ))
+        .write_json_lines(&mut buf)
+        .unwrap();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn net10_inconclusive_legacy_codes_are_distinct() {
+        for (legacy, code) in [
+            (Some(true), "LEGACY_IPTABLES_POLICY_UNREAD"),
+            (None, "LEGACY_IPTABLES_STATE_UNKNOWN"),
+        ] {
+            let r = evaluate(&f(
+                loaded(),
+                ForwardPolicyState::NotFoundInNftables {
+                    legacy_iptables_filter: legacy,
+                },
+            ));
+            let d = &r.diagnostics[0];
+            assert_eq!(d.code, "DIAGNOSIS_INCONCLUSIVE");
+            assert!(d.message.contains(code), "{}", d.message);
+            assert!(!d.remediation[0].contains("CAP_NET_ADMIN"));
+        }
+    }
+
+    #[test]
+    fn net10_not_base_chain_is_inconclusive_not_no_risk() {
+        let r = evaluate(&f(loaded(), ForwardPolicyState::NotBaseChain));
+        assert_eq!(r.outcome, DoctorOutcome::Inconclusive);
+        assert_eq!(r.exit_status(), DoctorExitStatus::Inconclusive);
+        let d = &r.diagnostics[0];
+        assert!(
+            d.message.contains("FORWARD_CHAIN_NOT_BASE"),
+            "{}",
+            d.message
+        );
+        assert!(!d.remediation[0].contains("CAP_NET_ADMIN"));
+    }
+
+    #[test]
+    fn net10_inconclusive_br_netfilter_codes_by_cause() {
+        let fw = ForwardPolicyState::Policy(ChainPolicy::Drop);
+        let perm = DoctorProbeError {
+            code: "PERMISSION_DENIED".to_string(),
+            message: "x".to_string(),
+        };
+        let cases = [
+            (
+                BrNetfilterState::Unknown { reason: perm },
+                "PERMISSION_DENIED",
+                true,
+            ),
+            (
+                BrNetfilterState::Unknown { reason: err() },
+                "INTERNAL",
+                false,
+            ),
+            (
+                BrNetfilterState::Loaded {
+                    call_iptables: None,
+                },
+                "UNRECOGNIZED_BRIDGE_NF_VALUE",
+                false,
+            ),
+        ];
+        for (b, code, root_hint) in cases {
+            let r = evaluate(&f(b, fw.clone()));
+            let d = &r.diagnostics[0];
+            assert!(d.message.contains(code), "{}", d.message);
+            assert_eq!(d.remediation[0].contains("Re-run as a user"), root_hint);
+        }
+    }
+
+    #[test]
+    fn net10_json_escape() {
+        assert_eq!(json_escape("a\"b\\c\nd\u{1}"), "a\\\"b\\\\c\\nd\\u0001");
     }
 }
 
@@ -547,10 +1251,22 @@ mod tests {
             st(Mock(Ok(reply(Some(0))))),
             ForwardPolicyState::Policy(ChainPolicy::Drop)
         );
+        // accept は legacy の filter テーブル不在を確認できた場合のみ確定する。
         assert_eq!(
             st(Mock(Ok(reply(Some(1))))),
+            ForwardPolicyState::AcceptLegacyUnruledOut {
+                legacy_iptables_filter: None
+            }
+        );
+        assert_eq!(
+            probe_forward_policy(&Mock(Ok(reply(Some(1)))), &procfs_root().0),
             ForwardPolicyState::Policy(ChainPolicy::Accept)
         );
+        // Linux 上の Unimplemented は対象外ではなく判定不能。
+        assert!(matches!(
+            st(Mock(Err(NetErrorCode::Unimplemented))),
+            ForwardPolicyState::Unknown { .. }
+        ));
         assert_eq!(st(Mock(Ok(reply(None)))), ForwardPolicyState::NotBaseChain);
         // 別 hook（prerouting）・hook 属性なしの base chain は転送経路の policy として返さない。
         for hook in [Some(0), None] {
@@ -681,5 +1397,17 @@ mod tests_off_linux {
             BrNetfilterProbe::new().probe(),
             BrNetfilterState::Unsupported
         );
+    }
+
+    /// NET-10・TASK-148.2: 実 probe の Unsupported は対象外・終了コード 0。
+    #[test]
+    fn net10_evaluate_unsupported_off_linux() {
+        let findings = DoctorFindings {
+            br_netfilter: BrNetfilterState::Unsupported,
+            forward_policy: ForwardPolicyState::Unsupported,
+        };
+        let r = evaluate(&findings);
+        assert_eq!(r.outcome, DoctorOutcome::NotApplicable);
+        assert_eq!(r.exit_status().code(), 0);
     }
 }

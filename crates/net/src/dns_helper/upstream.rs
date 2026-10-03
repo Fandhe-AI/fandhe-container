@@ -12,10 +12,11 @@
 //!   `QueryHandler::respond_from` で受けた送信元 IP をキーに引く（bridge 上の直接送信なので NAT は挟まらない）
 //!
 //! # 判定順（ForwardingHandler）
-//! 1. QCLASS=IN でレジストリにある名前: 自前応答（A は answer、それ以外は NODATA）。qtype に関わらず転送しない
+//! 1. QCLASS≠IN: 送信元に関わらず転送せず REFUSED（[`RegistryHandler`] と同じ。IN 以外の名前空間を上流へ中継しない）
+//! 2. QCLASS=IN でレジストリにある名前: 自前応答（A は answer、それ以外は NODATA）。qtype に関わらず転送しない
 //!    （サービス名の権威を保つ）
-//! 2. レジストリに無く、送信元が上流マッピング登録済み: そのコンテナの上流へ転送する
-//! 3. レジストリに無く、送信元が未登録: REFUSED（オープンリゾルバにしない）
+//! 3. QCLASS=IN でレジストリに無く、送信元が上流マッピング登録済み: そのコンテナの上流へ転送する
+//! 4. QCLASS=IN でレジストリに無く、送信元が未登録: REFUSED（オープンリゾルバにしない）
 //!
 //! # 安全性
 //! - 転送は登録済みコンテナ宛てに限る。上流は loopback・unspecified・multicast・broadcast・link-local（IPv4 169.254.0.0/16〔メタデータ系アドレスを含む〕・IPv6 fe80::/10）を拒否する。
@@ -557,15 +558,10 @@ impl ForwardingHandler {
         self.forward_failed.load(Ordering::Relaxed)
     }
 
-    fn is_local_name(&self, datagram: &[u8]) -> bool {
-        let Some(q) = parse_question(datagram) else {
-            return false;
-        };
-        if q.qclass != QCLASS_IN {
-            return false;
-        }
+    /// 質問の QNAME がレジストリにあるか（QCLASS の判定は呼び出し側の [`QueryHandler::respond_from`] が先に行う）。
+    fn is_local_name(&self, qname: &[u8]) -> bool {
         let mut norm = [0u8; MAX_NAME_LEN];
-        normalize_qname(q.qname, &mut norm)
+        normalize_qname(qname, &mut norm)
             .and_then(|n| self.registry.lookup(n))
             .is_some()
     }
@@ -588,11 +584,18 @@ impl QueryHandler for ForwardingHandler {
         datagram: &[u8],
         out: &mut ResponseBuf,
     ) -> HandlerOutcome {
+        // 判定順は module doc のとおり: 非 IN・レジストリの名前・未登録の送信元は転送せず、RegistryHandler の
+        // 自前応答（非 IN と管理外名は REFUSED）に委ねる。
+        let Some(q) = parse_question(datagram) else {
+            return self.local.respond(header, datagram, out);
+        };
         let list = match peer.ip().to_canonical() {
-            IpAddr::V4(ip) if !self.is_local_name(datagram) => self.upstreams.lookup(ip),
+            IpAddr::V4(ip) if q.qclass == QCLASS_IN && !self.is_local_name(q.qname) => {
+                self.upstreams.lookup(ip)
+            }
             _ => None,
         };
-        let (Some(list), Some(q)) = (list, parse_question(datagram)) else {
+        let Some(list) = list else {
             return self.local.respond(header, datagram, out);
         };
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);

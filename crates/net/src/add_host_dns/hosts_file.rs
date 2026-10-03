@@ -89,11 +89,20 @@ fn unsupported() -> NetError {
     )
 }
 
+/// 生のパスに `.` だけの要素が（位置に関わらず）含まれるかを返す。`Path::components` は途中の `.` を
+/// 黙って取り除くため、`sub/./hosts` を `sub/hosts` と同一視しないよう区切り `/` で生のバイト列を見る。
+fn has_cur_dir_segment(p: &Path) -> bool {
+    p.as_os_str()
+        .as_bytes()
+        .split(|b| *b == b'/')
+        .any(|seg| seg == b".")
+}
+
 /// 管理ルートの絶対パス `abs` を、symlink を辿らずに `/` から 1 要素ずつ `openat(O_NOFOLLOW |
 /// O_DIRECTORY)` で開いてディレクトリ fd を得る。
 ///
 /// 正規化（`canonicalize`）はしない。正規化すると渡されたパス上の symlink を先に辿ってしまい、リンク先
-/// （管理外のディレクトリ）を管理ルートとして扱うことになるため。相対パス・`..` / `.` を含むパスは
+/// （管理外のディレクトリ）を管理ルートとして扱うことになるため。相対パス・`..` / `.`（途中を含む）を含むパスは
 /// `INVALID_ARGUMENT`、管理ルート自身・祖先が symlink または非ディレクトリなら `FAILED_PRECONDITION`、
 /// 不在なら `NOT_FOUND`。
 fn open_abs_dir_nofollow(abs: &Path) -> Result<OwnedFd, NetError> {
@@ -119,7 +128,7 @@ fn open_abs_dir_nofollow(abs: &Path) -> Result<OwnedFd, NetError> {
         )
     };
     let mut comps = abs.components();
-    if comps.next() != Some(Component::RootDir) {
+    if has_cur_dir_segment(abs) || comps.next() != Some(Component::RootDir) {
         return Err(not_normalized());
     }
     let mut cur = sys::open_root_dir().map_err(map)?;
@@ -138,9 +147,15 @@ fn open_abs_dir_nofollow(abs: &Path) -> Result<OwnedFd, NetError> {
 ///
 /// 管理ルートは正規化せず、`/` から要素ごとに symlink を辿らずに開く（[`open_abs_dir_nofollow`]）。
 ///
-/// `rel` は空でない相対パスで、全要素が通常の名前であること（絶対パス・`..`・`.` は `INVALID_ARGUMENT`）。
-/// 戻り値は（管理ルートのディレクトリ fd, hosts ファイルの fd）。
+/// `rel` は空でない相対パスで、全要素が通常の名前であること（絶対パス・`..`・`.`〔途中を含む〕は
+/// `INVALID_ARGUMENT`）。戻り値は（管理ルートのディレクトリ fd, hosts ファイルの fd）。
 fn open_in_root(managed_root: &Path, rel: &Path) -> Result<(File, File), NetError> {
+    if has_cur_dir_segment(rel) {
+        return Err(NetError::new(
+            NetErrorCode::InvalidArgument,
+            "hosts path must be a plain relative path inside the managed root",
+        ));
+    }
     let mut names = Vec::new();
     for c in rel.components() {
         let Component::Normal(n) = c else {

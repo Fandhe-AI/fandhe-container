@@ -386,9 +386,14 @@ mod linux {
         let deleted = delete_network(&route, &nft, &net, attached, &mut ipam, &mut ports, t)
             .map(|_| ())
             .map_err(|e| fail(format!("delete_network failed: {e}")));
-        result?;
-        stop?;
-        deleted
+        // 後始末の失敗も必ず報告する（先に `?` で返さず、全結果を評価してから最初の失敗を返す）。
+        match (result, stop, deleted) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (Err(e), _, Ok(())) | (Ok(()), Err(e), Ok(())) | (Ok(()), Ok(()), Err(e)) => Err(e),
+            (Err(e), _, Err(d)) | (Ok(()), Err(e), Err(d)) => {
+                Err(fail(format!("{e}; additionally: {d}")))
+            }
+        }
     }
 
     /// 実機計測モード（`--measure`。TASK-141.3・#323・NET-5）。呼び出し元は `scripts/bench/dns_helper_measure.sh`
@@ -411,6 +416,8 @@ mod linux {
         const QUERIES_MAX: u32 = 10_000;
         const WARMUP_MAX: u32 = 1_000;
         const RECORDS_MAX: usize = 16;
+        /// 計測で登録する名前数（svc-a / svc-b / svc-c）。待機上限の算出に使う。
+        const RECORDS_PER_RUN: usize = 3;
         /// クエリごとの受信期限。無応答は ok:false で記録する。
         const RECV_TIMEOUT: Duration = Duration::from_millis(500);
         /// 連続無応答がこの回数に達したらヘルパーが死んでいるとみなして打ち切る（REPAIR-5）。
@@ -550,7 +557,13 @@ mod linux {
                 .env(DIR_ENV, &dir)
                 .spawn();
             let code = match child {
-                Ok(mut c) => wait_deadline(&mut c, Duration::from_secs(600)).unwrap_or(1),
+                Ok(mut c) => {
+                    // クライアント 2 本分 + 作成・削除・PSS 待ちの余裕。--queries / --timeout に連動させる。
+                    let limit = bench_budget(q, w, RECORDS_PER_RUN) * 2
+                        + timeout() * 6
+                        + Duration::from_secs(60);
+                    wait_deadline(&mut c, limit).unwrap_or(1)
+                }
                 Err(_) => {
                     err_line("INTERNAL", "cannot spawn unshare");
                     1
@@ -722,7 +735,7 @@ mod linux {
                         .spawn()
                         .map_err(|e| fail(format!("spawn nsenter: {e}")))?;
                     // 失敗時はクライアントが連続無応答で打ち切るため、期限は十分な余裕を持たせる。
-                    match wait_deadline(&mut child, timeout() * 3 + Duration::from_secs(30)) {
+                    match wait_deadline(&mut child, bench_budget(q, w, records.len())) {
                         Some(0) => {}
                         Some(_) => return Err(fail("container-side dns bench failed")),
                         None => {
@@ -753,8 +766,32 @@ mod linux {
             let deleted = delete_network(&route, &nft, &net, attached, &mut ipam, &mut ports, t)
                 .map(|_| ())
                 .map_err(|e| fail(format!("delete_network failed: {e}")));
-            result?;
-            deleted
+            combine_results(result, deleted)
+        }
+
+        /// 計測結果と後始末（`delete_network`）結果を合成する。どちらかが失敗なら失敗を返し、
+        /// 両方失敗なら両方の内容を載せる（root で作った network の残存を見落とさない）。
+        fn combine_results(
+            result: Result<(), NetError>,
+            deleted: Result<(), NetError>,
+        ) -> Result<(), NetError> {
+            match (result, deleted) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(e), Ok(())) => Err(e),
+                (Ok(()), Err(d)) => Err(d),
+                (Err(e), Err(d)) => Err(fail(format!("{e}; additionally: {d}"))),
+            }
+        }
+
+        /// クライアント 1 プロセスの所要上限。名前数 × (warmup + queries) の全クエリが
+        /// 受信期限まで待たされる最悪ケースに、固定の余裕を足して `--queries` / `--timeout` に連動させる。
+        fn bench_budget(q: u32, w: u32, names: usize) -> Duration {
+            let total = u64::from(q).saturating_add(u64::from(w));
+            let queries = total.saturating_mul(u64::try_from(names).unwrap_or(u64::MAX));
+            let per_query_ms = u64::try_from(RECV_TIMEOUT.as_millis()).unwrap_or(500);
+            timeout() * 3
+                + Duration::from_secs(30)
+                + Duration::from_millis(queries.saturating_mul(per_query_ms))
         }
 
         /// 計測専用ヘルパーを起動し、READY 行を期限内に受理するまで待つ。
@@ -873,8 +910,9 @@ mod linux {
             ]))
         }
 
-        /// 応答が期待どおり（ID 一致・QR=1・RCODE=0・ANCOUNT=1・TYPE=A・RDATA=期待アドレス）かを照合する。
-        fn answer_matches(resp: &[u8], id: u16, want: Ipv4Addr) -> Option<bool> {
+        /// 応答が期待どおり（ID 一致・QR=1・RCODE=0・質問が送信クエリと完全一致・ANCOUNT=1・
+        /// 回答 TYPE=A / CLASS=IN・RDATA=期待アドレス）かを照合する。`query` は送信したパケット全体。
+        fn answer_matches(resp: &[u8], query: &[u8], id: u16, want: Ipv4Addr) -> Option<bool> {
             let flags = be16(resp, 2)?;
             if be16(resp, 0)? != id || flags & 0x8000 == 0 || flags & 0x000f != 0 {
                 return Some(false);
@@ -883,6 +921,10 @@ mod linux {
                 return Some(false);
             }
             let mut off = parse_question(resp)?.end;
+            // 質問（QNAME・QTYPE・QCLASS）が送ったクエリのものと一致すること。
+            if resp.get(12..off)? != query.get(12..)? {
+                return Some(false);
+            }
             // 回答の NAME（圧縮ポインタまたはラベル列）を読み飛ばす。
             loop {
                 let b = *resp.get(off)?;
@@ -897,9 +939,10 @@ mod linux {
                 off = off.checked_add(usize::from(b))?;
             }
             let rtype = be16(resp, off)?;
+            let rclass = be16(resp, off.checked_add(2)?)?;
             let rdlen = be16(resp, off.checked_add(8)?)?;
             let rdata = resp.get(off.checked_add(10)?..off.checked_add(14)?)?;
-            Some(rtype == 1 && rdlen == 4 && rdata == want.octets())
+            Some(rtype == 1 && rclass == 1 && rdlen == 4 && rdata == want.octets())
         }
 
         /// コンテナ netns 側のクライアント（`--dns-bench <ipv4:port> --label <c1|c2> --expect <name>=<ipv4>... --queries N --warmup W`）。
@@ -963,15 +1006,19 @@ mod linux {
                     if sock.send_to(&pkt, target).is_ok() {
                         let deadline = start + RECV_TIMEOUT;
                         while Instant::now() < deadline {
-                            let Ok((n, _)) = sock.recv_from(&mut buf) else {
+                            let Ok((n, src)) = sock.recv_from(&mut buf) else {
                                 break;
                             };
                             let at = start.elapsed();
+                            // 計測対象のヘルパー以外から届いたデータグラムは読み捨てる。
+                            if src != std::net::SocketAddr::V4(target) {
+                                continue;
+                            }
                             let resp = buf.get(..n).unwrap_or(&[]);
                             // ID が違う遅延応答は読み捨てる。
                             if be16(resp, 0) == Some(id) {
-                                result =
-                                    Some((answer_matches(resp, id, *want).unwrap_or(false), at));
+                                let ok = answer_matches(resp, &pkt, id, *want).unwrap_or(false);
+                                result = Some((ok, at));
                                 break;
                             }
                         }

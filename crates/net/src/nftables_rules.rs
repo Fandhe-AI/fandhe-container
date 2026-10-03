@@ -13,7 +13,7 @@
 //! [`RuleCreate`]（NEWRULE 本体。TASK-138.2・#310）が、メッセージ組み立て中に [`NftRuleExprs::put_into`] を呼ぶ。
 //! cmp / immediate / nat / [`RuleDelete`]（TASK-138.3・#311）も同じ層に載る。masq の実機結合は
 //! `tests/nftables_masq_privileged.rs`（TASK-138.2）、DNAT と削除の実機結合は
-//! `tests/nftables_dnat_privileged.rs`（TASK-138.3）、3 経路の統合は TASK-138.4（#312）が担当する。
+//! `tests/nftables_dnat_privileged.rs`（TASK-138.3）、3 経路（bridge・DNAT・masquerade）の統合は `tests/nftables_paths_privileged.rs`（TASK-138.4・#312）が担当する。
 //!
 //! # ワイヤーレイアウト
 //!

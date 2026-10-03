@@ -203,7 +203,7 @@ mod linux {
     }
 
     /// コンテナ netns 側のクライアント（`nsenter --net=<pin> <exe> --dns-client <addr>`）。
-    /// 不正パケットが無応答であることと、続く正常クエリへの応答（ID 一致・QR=1・RCODE=3 の NXDOMAIN。レジストリ空）を確認する。
+    /// 不正パケットが無応答であることと、続く正常クエリへの応答（ID 一致・QR=1・RCODE=4 の NOTIMP。登録経路が無い間）を確認する。
     pub fn client(args: &[OsString]) -> ExitCode {
         let target: Option<SocketAddrV4> = args
             .iter()
@@ -239,8 +239,7 @@ mod linux {
                 return ExitCode::from(1);
             }
             if let Ok((n, _)) = sock.recv_from(&mut buf) {
-                let mut want = vec![0x42, 0x42, 0x85, 0x03, 0, 1, 0, 0, 0, 0, 0, 0];
-                want.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+                let want = vec![0x42, 0x42, 0x81, 0x04, 0, 0, 0, 0, 0, 0, 0, 0];
                 let ok = buf.get(..n) == Some(&want[..]);
                 println!("dns client: reply ok={ok}");
                 return if ok {

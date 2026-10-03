@@ -4,7 +4,7 @@
 //! # 役割と関係
 //! - ネットワーク（`network::create_network` が作る bridge）の gateway の IPv4:53 に UDP で待ち受ける
 //!   ヘルパープロセスを 1 つ起動する基盤。質問セクションのパース（[`parse_question`]）、コンテナ名 → IPv4 の
-//!   レジストリ（[`DnsRegistry`]）、A 応答・NXDOMAIN の組み立て（[`RegistryHandler`]）を持つ
+//!   レジストリ（[`DnsRegistry`]）、A 応答・REFUSED / NODATA の組み立て（[`RegistryHandler`]）を持つ
 //!   （TASK-141.2・#322）。上流 DNS への転送は TASK-185、参照カウントによるオンデマンド起動・終了と
 //!   SIGTERM による正常終了は TASK-144 の責務
 //! - 呼び出し側（将来の統一 CLI / 製品バイナリ。TASK-79）は [`spawn_dns_helper`] で自身または専用バイナリを
@@ -20,9 +20,12 @@
 //! [`DnsRegistry::register`]、切断・停止で [`DnsRegistry::unregister`] を呼ぶ。
 //!
 //! # 未実装（REPAIR-3）
-//! ヘルパープロセス（[`run_dns_helper_main`]）は空のレジストリで起動し、プロセス外から名前を登録する経路は
-//! まだ無い（CORE-1 により起動・停止は別プロセスで起きるため、登録経路の設計は後続タスクで決める）。
-//! このため現時点のヘルパープロセスは全名前に NXDOMAIN を返す。上流転送・TCP・AAAA・EDNS0 も未対応。
+//! プロセス外（ヘルパープロセス）へ名前の登録・削除を伝える経路はまだ無い（CORE-1 により起動・停止は別プロセスで
+//! 起きるため、経路の設計は後続タスクで決める）。経路ができるまで [`run_dns_helper_main`] は
+//! [`RegistryHandler`] に切り替えず、全クエリに NOTIMP を返す [`NotImplementedHandler`] を使い続ける
+//! （登録できない空レジストリで実際の名前解決を妨げない）。[`RegistryHandler`] は同一プロセス内の
+//! 登録側（テスト・将来の組み込み）から使える。上流転送・TCP・AAAA・EDNS0 も未対応。
+//! レジストリに無い名前は存在・不存在を断定せず REFUSED（AA=0）を返す（上流転送 TASK-185 まで）。
 //! PLUG-1 における DNS ヘルパーの core / plugin 区分は検討中で、確定扱いにはしない。
 //!
 //! # 安全性
@@ -67,7 +70,6 @@ const FLAG_QR: u8 = 0x80;
 const FLAG_RD: u8 = 0x01;
 const FLAG_AA: u8 = 0x04;
 const RCODE_NOERROR: u8 = 0;
-const RCODE_NXDOMAIN: u8 = 3;
 const RCODE_NOTIMP: u8 = 4;
 const RCODE_REFUSED: u8 = 5;
 const QTYPE_A: u16 = 1;
@@ -564,7 +566,8 @@ impl MsgWriter {
 
 /// レジストリを引いて A 応答・NXDOMAIN 等を返すハンドラ（NET-5・TASK-141.2）。
 ///
-/// 判定: QCLASS≠IN は REFUSED / 未登録は NXDOMAIN（AA=1）/ 登録済みの A は answer 1 件 / 登録済みの A 以外は
+/// 判定: QCLASS≠IN は REFUSED / 未登録は REFUSED（AA=0。上流転送 TASK-185 が無い間は管理外名の存在・不存在を
+/// 断定せず、外部ドメインの解決を妨げない）/ 登録済みの A は answer 1 件（AA=1）/ 登録済みの A 以外は
 /// NODATA（NOERROR・answer 0。glibc が A と AAAA を並列に引くため NXDOMAIN にしない）。再帰は提供しない（RA=0）。
 /// 要求の EDNS OPT はエコーしない（ARCOUNT=0）。
 #[derive(Debug, Clone)]
@@ -586,12 +589,12 @@ impl RegistryHandler {
         } else {
             let found = normalize_qname(q.qname, &mut norm).and_then(|n| self.registry.lookup(n));
             match found {
-                None => (RCODE_NXDOMAIN, None),
+                None => (RCODE_REFUSED, None),
                 Some(ip) if q.qtype == QTYPE_A => (RCODE_NOERROR, Some(ip)),
                 Some(_) => (RCODE_NOERROR, None),
             }
         };
-        // REFUSED は権威を主張しないため AA を立てない。
+        // REFUSED（管理外名・非 IN）は権威を主張しないため AA を立てない。
         let aa = if rcode == RCODE_REFUSED { 0 } else { FLAG_AA };
         let rd = if header.recursion_desired() {
             FLAG_RD
@@ -867,10 +870,10 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
         return ExitCode::from(1);
     }
     // 親が kill するまで動き続ける。正常終了（SIGTERM）は TASK-144 の責務。
-    // プロセス外からの登録経路は未実装（REPAIR-3）のため、空のレジストリ = 全名前 NXDOMAIN。
+    // プロセス外からの登録経路が未実装（REPAIR-3）の間は RegistryHandler に切り替えず NOTIMP を返す
+    // （空レジストリで名前解決を妨げない）。経路の接続は後続タスク（NET-5）。
     let stop = AtomicBool::new(false);
-    let handler = RegistryHandler::new(Arc::new(DnsRegistry::new()));
-    match server.serve(&handler, &stop) {
+    match server.serve(&NotImplementedHandler, &stop) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             fail_line(e.code().as_str(), e.message());
@@ -1477,15 +1480,15 @@ mod tests {
         assert_eq!(answer(&h, &pkt).get(2..4), Some(&[0x84, 0x00][..]));
     }
 
-    /// NET-5: 未登録名は NXDOMAIN（AA=1・ANCOUNT=0・長さは要求と同じ）。
+    /// NET-5: 未登録名は REFUSED（AA=0・ANCOUNT=0・長さは要求と同じ。存在・不存在を断定しない）。
     #[test]
-    fn handler_nxdomain_for_unknown() {
+    fn handler_refused_for_unknown() {
         let (h, _) = handler_with(&[("web", Ipv4Addr::new(10, 215, 0, 2))]);
         let pkt = named_query(7, 0x0100, "nope", 1, 1);
         let r = answer(&h, &pkt);
         assert_eq!(
             r.get(..12),
-            Some(&[0, 7, 0x85, 3, 0, 1, 0, 0, 0, 0, 0, 0][..])
+            Some(&[0, 7, 0x81, 5, 0, 1, 0, 0, 0, 0, 0, 0][..])
         );
         assert_eq!(r.len(), pkt.len());
     }
@@ -1507,7 +1510,7 @@ mod tests {
         // 1 ラベル "web.x"（ラベル内に '.'）は 2 ラベル登録名 web.x に一致しない。
         let mut pkt = hdr(1, 0x0100, 1);
         pkt.extend_from_slice(b"\x05web.x\x00\x00\x01\x00\x01");
-        assert_eq!(answer(&h, &pkt).get(3), Some(&3));
+        assert_eq!(answer(&h, &pkt).get(3), Some(&5));
         let ok = named_query(1, 0x0100, "web.x", 1, 1);
         assert_eq!(answer(&h, &ok).get(3), Some(&0));
         // EDNS OPT 付き要求（ARCOUNT=1）でも応答は ARCOUNT=0 で OPT をエコーしない。
@@ -1522,14 +1525,14 @@ mod tests {
         assert_eq!(r.len(), plain.len() + 16);
     }
 
-    /// NET-5: unregister（コンテナ停止）後は NXDOMAIN に変わる。
+    /// NET-5: unregister（コンテナ停止）後は REFUSED に変わる。
     #[test]
     fn handler_follows_unregister() {
         let (h, reg) = handler_with(&[("web", Ipv4Addr::new(10, 215, 0, 2))]);
         let pkt = named_query(1, 0x0100, "web", 1, 1);
         assert_eq!(answer(&h, &pkt).get(3), Some(&0));
         reg.unregister(&DnsName::new("web").expect("name"));
-        assert_eq!(answer(&h, &pkt).get(3), Some(&3));
+        assert_eq!(answer(&h, &pkt).get(3), Some(&5));
     }
 
     /// 固定長の応答を返すハンドラ（`serve` の増幅ガード境界の検証用）。
@@ -1573,7 +1576,7 @@ mod tests {
         }
     }
 
-    /// NET-5: 実ソケットで登録名の A 応答と未登録名の NXDOMAIN を受信バイト列で照合する。
+    /// NET-5: 実ソケットで登録名の A 応答と未登録名の REFUSED を受信バイト列で照合する。
     #[test]
     fn serve_registry_over_loopback() {
         let (h, _) = handler_with(&[("web", Ipv4Addr::new(10, 215, 0, 2))]);
@@ -1600,7 +1603,7 @@ mod tests {
             assert!(th.join().expect("join").is_ok());
             assert_eq!(got[0].get(7), Some(&1));
             assert_eq!(got[0].get(got[0].len() - 4..), Some(&[10, 215, 0, 2][..]));
-            assert_eq!(got[1].get(3), Some(&3));
+            assert_eq!(got[1].get(3), Some(&5));
         });
         assert_eq!(server.stats().answered, 2);
     }

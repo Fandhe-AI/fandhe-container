@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_net::netlink_route::{
-    AddrScope, AddressSpec, AttrIter, IFA_LOCAL, IfAddrMsg, IfIndex, IpPrefix, NLM_F_MATCH,
-    NLM_F_ROOT, NetlinkReply, NetlinkRouteSocket, NlMsgBuilder, RTA_OIF, RTM_GETADDR, RTM_GETROUTE,
-    RouteNextHop, RouteSpec, RtMsg,
+    AddrScope, AddressSpec, AttrIter, IFA_ADDRESS, IFA_LOCAL, IfAddrMsg, IfIndex, IpPrefix,
+    NLM_F_MATCH, NLM_F_ROOT, NetlinkReply, NetlinkRouteSocket, NlMsgBuilder, RTA_DST, RTA_OIF,
+    RTM_GETADDR, RTM_GETROUTE, RouteNextHop, RouteSpec, RtMsg,
 };
 
 const RTM_NEWLINK: u16 = 16;
@@ -126,6 +126,18 @@ fn add_address_and_route_in_isolated_netns() {
     .with_nodad();
     sock.add_address(&v6, T)
         .expect("add IPv6 address (is net.ipv6.conf.lo.disable_ipv6 set to 1?)");
+    let v6_octets = "fd00::1".parse::<Ipv6Addr>().expect("v6").octets();
+    let addrs = dump(&sock, RTM_GETADDR, &[0u8; 8]);
+    let v6_found = addrs.messages().iter().any(|m| {
+        let Ok(h) = IfAddrMsg::decode(m.payload()) else {
+            return false;
+        };
+        h.index() == 1
+            && h.prefix_len() == 64
+            && h.family() == 10
+            && attr_payload(m.payload(), 8, IFA_ADDRESS).as_deref() == Some(&v6_octets[..])
+    });
+    assert!(v6_found, "added IPv6 address not found in RTM_GETADDR dump");
 
     // route（default と通常）。
     let default = RouteSpec::new(IpPrefix::default_v4(), RouteNextHop::Device { oif: lo })
@@ -147,5 +159,16 @@ fn add_address_and_route_in_isolated_netns() {
     assert!(
         default_found,
         "default route not found in RTM_GETROUTE dump"
+    );
+
+    let net_found = routes.messages().iter().any(|m| {
+        RtMsg::decode(m.payload()).is_ok_and(|h| {
+            h.family() == 2 && h.table() == 254 && h.dst_len() == 24 && h.protocol() == 4
+        }) && attr_payload(m.payload(), 12, RTA_DST).as_deref() == Some(&[10, 201, 0, 0][..])
+            && attr_payload(m.payload(), 12, RTA_OIF).as_deref() == Some(&1u32.to_ne_bytes()[..])
+    });
+    assert!(
+        net_found,
+        "10.201.0.0/24 route (oif=lo) not found in RTM_GETROUTE dump"
     );
 }

@@ -504,7 +504,6 @@ mod linux {
             &nft,
             &net,
             vec![attached, attached3],
-            &base,
             &mut ipam,
             &mut ports,
             t,
@@ -544,17 +543,7 @@ mod linux {
             return Err(fail("ipam or port reservations were not released"));
         }
         // 冪等: 何も残っていない状態での再実行も成功する。
-        delete_network(
-            &route,
-            &nft,
-            &net,
-            Vec::new(),
-            &base,
-            &mut ipam,
-            &mut ports,
-            t,
-        )
-        .map_err(|e| {
+        delete_network(&route, &nft, &net, Vec::new(), &mut ipam, &mut ports, t).map_err(|e| {
             fail(format!(
                 "repeated delete_network failed at {:?}: {e}",
                 e.step

@@ -63,6 +63,7 @@ use std::time::Duration;
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::NetOpRecorder;
 use crate::netlink_route::{NetlinkRouteSocket, classify_errno};
+use crate::network::delete::PinCheckError;
 use crate::network::{EndpointId, NetnsFailure, ResourceState, UnpinFailure};
 use crate::sys::{self, SysError};
 
@@ -293,7 +294,9 @@ fn remove_pin_file(pin: &Path, fid: FileId) -> Option<ResourceState> {
 
 /// `base` 直下に `id` 名の pin を作り、新しい netns をそこへ固定する。
 ///
-/// 成功時は `ContainerNetns`（fd と pin パス）を返す。失敗時は自分が作ったファイルだけを片付け、
+/// 成功時は `ContainerNetns`（fd と pin パス）と、検査して開いた置き場ディレクトリの識別子
+/// (st_dev, st_ino) を返す。識別子は接続処理が IPAM へ記録し、ネットワーク削除
+/// （`network::delete_network`。TASK-139.4）が置き場の差し替えの検出に使う（[`pin_exists_in`]）。失敗時は自分が作ったファイルだけを片付け、
 /// 時間切れ等で mount の有無が不明なら削除せず `leftover = Some(Unknown)` で報告する。`timeout` は
 /// 使い捨てスレッドの完了待ちの期限（REPAIR-5）。時間切れ後もスレッドは裏で完走しうる。
 ///
@@ -305,7 +308,7 @@ pub(crate) fn create_pinned(
     id: &EndpointId,
     timeout: Duration,
     recorder: &Arc<dyn NetOpRecorder>,
-) -> Result<ContainerNetns, NetnsFailure> {
+) -> Result<(ContainerNetns, FileId), NetnsFailure> {
     let fail = |error: NetError, leftover: Option<ResourceState>| NetnsFailure { error, leftover };
     let dir = Arc::new(open_pin_dir(base).map_err(|e| fail(e, None))?);
     let name = std::ffi::OsStr::new(id.as_str());
@@ -410,11 +413,14 @@ pub(crate) fn create_pinned(
         Slot::Done(Ok((fd, sock))) => {
             // bind 以降は呼び出し側スレッドで行う（bind は socket 作成時の netns を引き継ぐ）。
             match NetlinkRouteSocket::from_unbound_route_fd(sock, Arc::clone(recorder)) {
-                Ok(route) => Ok(ContainerNetns {
-                    fd,
-                    pin,
-                    route: Some(route),
-                }),
+                Ok(route) => Ok((
+                    ContainerNetns {
+                        fd,
+                        pin,
+                        route: Some(route),
+                    },
+                    dir.id,
+                )),
                 Err(error) => {
                     // pin は mount 済み。ハンドルを作れないので、ここで pin を解除して片付ける。
                     drop(fd);
@@ -702,6 +708,8 @@ struct PinDir {
     file: File,
     /// 開いた時点の正規パス（mountinfo 照合用）。
     real: PathBuf,
+    /// 開いた実体の識別子 (st_dev, st_ino)。
+    id: FileId,
 }
 
 impl PinDir {
@@ -734,7 +742,38 @@ fn open_pin_dir(parent: &Path) -> Result<PinDir, NetError> {
     )?;
     let real = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
         .map_err(|e| io_error("resolve netns directory", &e))?;
-    Ok(PinDir { file, real })
+    Ok(PinDir {
+        file,
+        real,
+        id: file_id(&opened),
+    })
+}
+
+/// 接続時に記録した置き場 `dir`（識別子 `dir_id`）の直下に `id` 名の pin が残っているかを返す
+/// （`network::delete_network` の preflight。TASK-139.4・NET-1）。何も変更しない。
+///
+/// 置き場は作成時と同じ検査（[`open_pin_dir`]。symlink でない・group / other 書き込み不可・実効 UID 所有）を
+/// 通して fd で固定し、その識別子が `dir_id` と一致することを確かめてから、固定した fd 経由で pin を
+/// `lstat` する。置き場が消えた・移動した・別のディレクトリに差し替わった・権限が緩められた場合は、
+/// 接続時の置き場と証明できないので [`PinCheckError::Dir`]（残存 pin を見落とさないため、呼び出し側は
+/// 何も変更せずに拒否する）。pin の有無そのものを判定できない場合は [`PinCheckError::Pin`]。
+pub(crate) fn pin_exists_in(
+    dir: &Path,
+    dir_id: (u64, u64),
+    id: &EndpointId,
+) -> Result<bool, PinCheckError> {
+    let pinned = open_pin_dir(dir).map_err(PinCheckError::Dir)?;
+    if pinned.id != dir_id {
+        return Err(PinCheckError::Dir(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "netns directory differs from the one used at attach",
+        )));
+    }
+    match fs::symlink_metadata(pinned.entry(std::ffi::OsStr::new(id.as_str()))) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(PinCheckError::Pin(io_error("stat netns pin", &e))),
+    }
 }
 /// pin ファイルの実体検査（OS 呼び出しを含まない純粋関数）。`create_pinned` が作る形
 /// （通常ファイル・実効 UID 所有・mode `0o400`・空）だけを許す。

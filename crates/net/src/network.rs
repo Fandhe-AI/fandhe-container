@@ -93,6 +93,7 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 pub use delete::delete_network;
 pub use delete::{DeleteResource, DeleteStep, NetworkDeleteError, NetworkDeleteReport};
+pub(crate) use ipam::NetnsDirRecord;
 pub use ipam::StaticIpam;
 pub use publish::{MAX_PORT_PUBLISHES, PortProtocol, PortPublish, PortRegistry};
 
@@ -1005,7 +1006,13 @@ pub(crate) trait AttachOps {
     /// netns ハンドル（Linux では fd と pin パス）。
     type Netns;
     /// `dir` 直下に `id` 名で pin した新しい netns を作る。失敗時は自分が作った部分資源を片付けてある。
-    fn create_netns(&self, dir: &Path, id: &EndpointId) -> Result<Self::Netns, NetnsFailure>;
+    /// 成功時は netns ハンドルと、検査して開いた置き場ディレクトリの識別子 (st_dev, st_ino) を返す。
+    /// 識別子は IPAM へ記録し、`delete_network` が置き場の差し替えを検出するのに使う（TASK-139.4）。
+    fn create_netns(
+        &self,
+        dir: &Path,
+        id: &EndpointId,
+    ) -> Result<(Self::Netns, (u64, u64)), NetnsFailure>;
     /// pin を外す（umount → ファイル削除）。失敗時は `ns` を [`UnpinFailure`] で返し、呼び出し側が
     /// 再試行できるようにする。
     fn unpin_netns(&self, ns: Self::Netns) -> Result<(), UnpinFailure<Self::Netns>>;
@@ -1178,8 +1185,8 @@ pub(crate) fn attach_container_with<O: AttachOps>(
     }
 
     let pin = spec.netns_path();
-    let mut netns = match ops.create_netns(&spec.netns_dir, &spec.endpoint) {
-        Ok(ns) => ns,
+    let (mut netns, pin_dir_id) = match ops.create_netns(&spec.netns_dir, &spec.endpoint) {
+        Ok(created) => created,
         Err(f) => {
             let mut report = AttachRollbackReport::default();
             if let Some(state) = f.leftover {
@@ -1246,7 +1253,10 @@ pub(crate) fn attach_container_with<O: AttachOps>(
     }
 
     // netns 内でのアドレス設定の直前に払い出す。失敗時は作った資源をすべて戻す。
-    let address = match ipam.allocate(&spec.endpoint) {
+    // 払い出しと同時に pin 置き場（パスと識別子）を記録し、削除時に残存 pin を同じ置き場で確認できるようにする
+    // （TASK-139.4）。記録は払い出しの解放（ロールバックを含む）で一緒に消える。
+    let pin_dir = NetnsDirRecord::new(spec.netns_dir.clone(), pin_dir_id);
+    let address = match ipam.allocate_pinned(&spec.endpoint, pin_dir) {
         Ok(a) => a,
         Err(e) => {
             let mut report = AttachRollbackReport::default();
@@ -1425,7 +1435,11 @@ fn link_ref(index: IfIndex) -> Result<LinkRef, NetError> {
 impl AttachOps for LinuxAttachOps<'_> {
     type Netns = ContainerNetns;
 
-    fn create_netns(&self, dir: &Path, id: &EndpointId) -> Result<ContainerNetns, NetnsFailure> {
+    fn create_netns(
+        &self,
+        dir: &Path,
+        id: &EndpointId,
+    ) -> Result<(ContainerNetns, (u64, u64)), NetnsFailure> {
         netns::create_pinned(dir, id, self.timeout, self.route.recorder())
     }
 
@@ -2197,14 +2211,18 @@ mod attach_tests {
     impl AttachOps for Fake {
         type Netns = ();
 
-        fn create_netns(&self, dir: &Path, id: &EndpointId) -> Result<(), NetnsFailure> {
+        fn create_netns(
+            &self,
+            dir: &Path,
+            id: &EndpointId,
+        ) -> Result<((), (u64, u64)), NetnsFailure> {
             self.rec(format!("create_netns {}", dir.join(id.as_str()).display()));
             match self.fail_netns {
                 Some((c, leftover)) => Err(NetnsFailure {
                     error: err(c),
                     leftover,
                 }),
-                None => Ok(()),
+                None => Ok(((), (8, 9))),
             }
         }
         fn unpin_netns(&self, (): ()) -> Result<(), UnpinFailure<()>> {

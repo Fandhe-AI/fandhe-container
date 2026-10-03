@@ -11,12 +11,22 @@
 //! IPAM に払い出しがあるのに渡されていない endpoint は、veth が存在する（または有無を判定できない）場合に
 //! 何も変更せず `FailedPrecondition` で拒否する（fail-closed。生存コンテナの veth を bridge から外したまま
 //! 孤児にしない）。veth が無いと確認できた endpoint（quarantine 中のアドレス等）は削除を続けるが、
-//! `netns_dir` 直下の pin（`<netns_dir>/<endpoint>`）が残っている、または有無を判定できない場合は、
-//! アドレスを解放せず保持して取り残しに載せる。
+//! netns の pin が残っている、または有無を判定できない場合は、アドレスを解放せず保持して取り残しに載せる。
+//!
+//! # pin の置き場の照合
+//!
+//! 渡されていない endpoint の pin は、呼び出し側が渡すパスではなく、接続処理が払い出しと同時に IPAM へ
+//! 記録した置き場（パスと、接続時に開いたディレクトリの識別子 (st_dev, st_ino)。`ipam::NetnsDirRecord`）の
+//! 直下で確認する。別の空ディレクトリを渡されて残存 pin を見落とし、生存する netns のアドレスを
+//! 再払い出ししないため。置き場が消えた・移動した・別のディレクトリに差し替わった・作成時の検査
+//! （symlink でない・group / other 書き込み不可・実効 UID 所有）を満たさなくなった場合は、接続時の置き場と
+//! 証明できないので、何も変更せずに `Preflight` で拒否する（fail-closed）。記録の無い払い出し
+//! （`StaticIpam::reserve` で復元したもの）は pin の有無を判定できないため、アドレスを保持して
+//! `Unknown` で報告する。渡されたコンテナは、`netns_path` が記録の置き場直下でなければ入力検証で拒否する。
 //!
 //! # 順序
 //!
-//! 入力検証 → 渡されていない endpoint の preflight → コンテナごとの veth の所有確認と削除・netns の unpin →
+//! 入力検証 → 渡されていない endpoint の preflight（veth と pin の確認。ここまで何も変更しない）→ コンテナごとの veth の所有確認と削除・netns の unpin →
 //! bridge の所有確認 → 専用 nft テーブルの所有確認と削除（配下の chain と DNAT ルールも消える）→ bridge の削除 →
 //! 予約の解放。
 //! 各段を可能な限り試し（best-effort）、取り残しを [`NetworkDeleteReport::leftover`] にまとめて `Err` で
@@ -57,9 +67,11 @@
 //!   カーネルではトークンが読み戻せず、削除は拒否される（手動解放）
 //! - link の dump API が無いため、IPAM に記録されていない孤児 veth は回収しない。担当 Issue 未確定
 //! - コンテナ単体の切り離しと、プロセスをまたぐ残置 pin の清掃は未実装。担当 Issue 未確定
+//! - pin 置き場の記録は IPAM のメモリ上の状態で、永続化（IPAM 状態の永続化と同じく未実装・担当 Issue 未確定）
+//!   されるまでは、復元した払い出しの pin を照合できない（上記のとおりアドレスを保持する）
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
@@ -76,8 +88,8 @@ use crate::nftables_batch::{NftBatchOutcome, NftName, TableInfo};
 #[cfg(target_os = "linux")]
 use super::link_ref;
 use super::{
-    AttachedContainer, CreatedNetwork, EndpointId, NetworkName, NftApplyFailure, PortRegistry,
-    ResourceState, StaticIpam, UnpinFailure, VethNames, is_indeterminate,
+    AttachedContainer, CreatedNetwork, EndpointId, NetnsDirRecord, NetworkName, NftApplyFailure,
+    PortRegistry, ResourceState, StaticIpam, UnpinFailure, VethNames, is_indeterminate,
 };
 
 /// 失敗した手順。
@@ -179,12 +191,29 @@ pub(crate) trait DeleteOps {
     fn delete_link(&self, link: IfIndex) -> Result<(), NetError>;
     /// pin を外す。失敗時はハンドルを返す。
     fn unpin_netns(&self, ns: Self::Netns) -> Result<(), UnpinFailure<Self::Netns>>;
-    /// pin 先に何か残っているか（`symlink_metadata` 相当。`NotFound` だけが `Ok(false)`）。
-    fn pin_exists(&self, path: &Path) -> Result<bool, NetError>;
+    /// 接続時に記録した置き場 `dir` の直下に `endpoint` 名の pin が残っているか（`NotFound` だけが `Ok(false)`）。
+    /// 置き場が記録と同じ実体と確認できなければ [`PinCheckError::Dir`]。何も変更しない。
+    fn pin_exists(
+        &self,
+        dir: &NetnsDirRecord,
+        endpoint: &EndpointId,
+    ) -> Result<bool, PinCheckError>;
     /// 専用テーブルのハンドルとユーザーデータ（所有トークン）を引く（読み取り専用の照会）。無ければ `NotFound`。
     fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError>;
     /// 専用テーブルをハンドル指定で削除する（配下の chain・ルールも消える）。名前では消さない。
     fn delete_table(&self, table: &NftName, handle: u64) -> Result<(), NftApplyFailure>;
+}
+
+/// 渡されていない endpoint の pin の残存確認の失敗。
+// 構築するのは Linux 実装（`netns::pin_exists_in`）とテストの fake だけ。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) enum PinCheckError {
+    /// 置き場が接続時に記録したものと同じ実体と確認できない（消失・移動・差し替え・検査違反）。
+    /// 残存 pin を見落としうるので、削除は何も変更せずに拒否する。
+    Dir(NetError),
+    /// 置き場は記録どおりだが、pin の有無を判定できない。アドレスを保持して `Unknown` で報告する。
+    Pin(NetError),
 }
 
 /// 名前で引いた link の所有確認用の属性。
@@ -288,7 +317,6 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
     ops: &O,
     network: &CreatedNetwork,
     containers: Vec<AttachedContainer<O::Netns>>,
-    netns_dir: &Path,
     ipam: &mut StaticIpam,
     ports: &mut PortRegistry,
 ) -> Result<NetworkDeleteReport, NetworkDeleteError<O::Netns>> {
@@ -319,7 +347,15 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
                 break;
             }
             Ok(names) => {
-                if ipam.address_of(&c.endpoint) != Some(c.address) || names.host() != &c.host_veth {
+                // pin 置き場の記録があれば、`netns_path` がその直下であることも確かめる（報告に使うパスを
+                // 接続時の置き場に揃える）。
+                let pin_mismatch = ipam
+                    .netns_dir_of(&c.endpoint)
+                    .is_some_and(|d| d.path().join(c.endpoint.as_str()) != c.netns_path);
+                if ipam.address_of(&c.endpoint) != Some(c.address)
+                    || names.host() != &c.host_veth
+                    || pin_mismatch
+                {
                     invalid = Some(precondition("container does not belong to the network"));
                     break;
                 }
@@ -339,7 +375,7 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
     // アドレスを解放してよい endpoint（veth・netns とも解放済み）。
     let mut releasable: Vec<EndpointId> = Vec::new();
     // veth は無いが pin が残っている（または判定できない）endpoint。アドレスを保持して報告する。
-    let mut pin_kept: Vec<(PathBuf, ResourceState, NetError)> = Vec::new();
+    let mut pin_kept: Vec<(DeleteResource, ResourceState, NetError)> = Vec::new();
     for endpoint in unpassed {
         let names = match VethNames::derive(&endpoint) {
             Ok(n) => n,
@@ -355,15 +391,37 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
         match ops.link_index(names.host()) {
             Err(e) if e.code() == NetErrorCode::NotFound => {
                 // veth が無くても netns の pin が残っていれば、中のコンテナは生きているかもしれない。
-                let pin = netns_dir.join(endpoint.as_str());
-                match ops.pin_exists(&pin) {
+                // pin は接続時に記録した置き場で確認する（モジュール doc「pin の置き場の照合」）。
+                let Some(dir) = ipam.netns_dir_of(&endpoint) else {
+                    // 置き場の記録が無い（`reserve` で復元した払い出し）。pin の有無を判定できない。
+                    let address = ipam.address_of(&endpoint);
+                    if let Some(address) = address {
+                        pin_kept.push((
+                            DeleteResource::Address(endpoint, address),
+                            ResourceState::Unknown,
+                            precondition("netns directory of an unpassed endpoint is not recorded"),
+                        ));
+                    }
+                    continue;
+                };
+                let pin = DeleteResource::Netns(dir.path().join(endpoint.as_str()));
+                match ops.pin_exists(dir, &endpoint) {
                     Ok(false) => releasable.push(endpoint),
                     Ok(true) => pin_kept.push((
                         pin,
                         ResourceState::Present,
                         precondition("netns pin of an unpassed endpoint remains"),
                     )),
-                    Err(e) => pin_kept.push((pin, ResourceState::Unknown, e)),
+                    Err(PinCheckError::Pin(e)) => pin_kept.push((pin, ResourceState::Unknown, e)),
+                    Err(PinCheckError::Dir(e)) => {
+                        // 接続時の置き場と証明できない。残存 pin を見落としうるので何も変更せずに拒否する。
+                        return Err(fail(
+                            e,
+                            DeleteStep::Preflight,
+                            NetworkDeleteReport::default(),
+                            containers,
+                        ));
+                    }
                 }
             }
             _ => {
@@ -381,8 +439,8 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
     // コンテナ側の資源（veth・netns pin）がすべて解放済みか。残るあいだは bridge を消さず、
     // 再実行で所有の証明を再利用できるようにする。
     let mut containers_clear = pin_kept.is_empty();
-    for (pin, state, error) in pin_kept {
-        report.leftover.push((DeleteResource::Netns(pin), state));
+    for (resource, state, error) in pin_kept {
+        report.leftover.push((resource, state));
         failures.note(error, DeleteStep::Preflight);
     }
     let mut retry: Vec<AttachedContainer<O::Netns>> = Vec::new();
@@ -681,18 +739,12 @@ impl DeleteOps for LinuxDeleteOps<'_> {
         netns::unpin(ns)
     }
 
-    fn pin_exists(&self, path: &Path) -> Result<bool, NetError> {
-        match std::fs::symlink_metadata(path) {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(NetError::new(
-                NetErrorCode::Internal,
-                match e.raw_os_error() {
-                    Some(errno) => format!("stat netns pin failed: errno {errno}"),
-                    None => "stat netns pin failed".to_owned(),
-                },
-            )),
-        }
+    fn pin_exists(
+        &self,
+        dir: &NetnsDirRecord,
+        endpoint: &EndpointId,
+    ) -> Result<bool, PinCheckError> {
+        netns::pin_exists_in(dir.path(), dir.dir_id(), endpoint)
     }
 
     fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError> {
@@ -722,18 +774,16 @@ impl DeleteOps for LinuxDeleteOps<'_> {
 /// 何も変更せず `FailedPrecondition` で拒否する（モジュール doc「参加中のコンテナの扱い」）。
 /// 取り残しがあれば `Err` で、[`NetworkDeleteError::report`] に解放済みと取り残しを全件載せる。
 /// `CAP_NET_ADMIN` と、unpin に必要な `CAP_SYS_ADMIN` は呼び出し側の責務で、本 crate は権限を上げない。
-/// `netns_dir` は接続時に渡した netns の pin 置き場で、渡されていない endpoint の pin の残存確認に使う。
+/// 渡されていない endpoint の pin の残存は、接続時に IPAM へ記録した置き場で確認する（呼び出し側はパスを
+/// 渡さない。置き場が接続時と同じ実体と確認できなければ何も変更せず拒否する。モジュール doc「pin の置き場の照合」）。
 /// pin の解除に失敗したコンテナは [`NetworkDeleteError::retry`] で netns ハンドルごと返る。
 /// `timeout` は各カーネル要求の期限（REPAIR-5）。
 #[cfg(target_os = "linux")]
-// 公開 API の引数は、カーネル操作の socket 2 本・削除対象・状態 2 種・期限で、まとめる単位が無い。
-#[allow(clippy::too_many_arguments)]
 pub fn delete_network(
     route: &NetlinkRouteSocket,
     nft: &NetlinkNetfilterSocket,
     network: &CreatedNetwork,
     containers: Vec<AttachedContainer<ContainerNetns>>,
-    netns_dir: &Path,
     ipam: &mut StaticIpam,
     ports: &mut PortRegistry,
     timeout: Duration,
@@ -746,7 +796,6 @@ pub fn delete_network(
         },
         network,
         containers,
-        netns_dir,
         ipam,
         ports,
     )
@@ -762,6 +811,8 @@ mod tests {
 
     const TOKEN: &str = "fandhe-net:web:1:0:0";
     const HOST_TOKEN: &str = "fandhe-net:web:1:0:0/ep/host";
+    /// 接続時に記録した pin 置き場の識別子 (st_dev, st_ino)。
+    const DIR_ID: (u64, u64) = (8, 9);
 
     fn eid(s: &str) -> EndpointId {
         EndpointId::new(s).unwrap()
@@ -796,6 +847,10 @@ mod tests {
         /// pin が残っている（`Ok(true)`）とみなす endpoint 名。
         pins_present: Vec<PathBuf>,
         pin_check_err: bool,
+        /// 置き場の現在の識別子。`None` は接続時と同じ `DIR_ID`。
+        dir_id_now: Option<(u64, u64)>,
+        /// 置き場を開けない（消失・検査違反）とみなすときのエラー。
+        dir_open_err: Option<NetErrorCode>,
         table_err: Option<(NetErrorCode, NftBatchOutcome)>,
         /// 照会（`table_info`）で専用テーブルが存在しない（`NotFound`）とみなすか。
         table_absent: bool,
@@ -882,12 +937,24 @@ mod tests {
                 Ok(())
             }
         }
-        fn pin_exists(&self, path: &Path) -> Result<bool, NetError> {
+        fn pin_exists(
+            &self,
+            dir: &NetnsDirRecord,
+            endpoint: &EndpointId,
+        ) -> Result<bool, PinCheckError> {
+            let path = dir.path().join(endpoint.as_str());
             self.rec(format!("pin_exists {}", path.display()));
-            if self.pin_check_err {
-                return Err(err(NetErrorCode::Internal));
+            // Linux 実装（`netns::pin_exists_in`）と同じく、置き場の実体を照合してから pin を見る。
+            if let Some(c) = self.dir_open_err {
+                return Err(PinCheckError::Dir(err(c)));
             }
-            Ok(self.pins_present.iter().any(|p| p == path))
+            if self.dir_id_now.unwrap_or(DIR_ID) != dir.dir_id() {
+                return Err(PinCheckError::Dir(err(NetErrorCode::FailedPrecondition)));
+            }
+            if self.pin_check_err {
+                return Err(PinCheckError::Pin(err(NetErrorCode::Internal)));
+            }
+            Ok(self.pins_present.iter().any(|p| p == &path))
         }
         fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError> {
             self.rec(format!("table_info {}", table.as_str()));
@@ -943,7 +1010,9 @@ mod tests {
     /// `ipam` へ払い出した endpoint を `AttachedContainer` として組む。
     fn attached(ipam: &mut StaticIpam, id: &str) -> AttachedContainer<()> {
         let endpoint = eid(id);
-        let address = ipam.allocate(&endpoint).unwrap();
+        let address = ipam
+            .allocate_pinned(&endpoint, NetnsDirRecord::new(netns_dir(), DIR_ID))
+            .unwrap();
         let names = VethNames::derive(&endpoint).unwrap();
         AttachedContainer {
             endpoint,
@@ -985,9 +1054,7 @@ mod tests {
         let addr = c1.address;
         reserve_port(&mut ports, "c1", 8080);
         let fake = Fake::default();
-        let report =
-            delete_network_with(&fake, &net, vec![c1], &netns_dir(), &mut ipam, &mut ports)
-                .unwrap();
+        let report = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap();
         let host = host_of("c1");
         assert_eq!(
             fake.calls(),
@@ -1023,8 +1090,7 @@ mod tests {
         let (net, mut ipam, mut ports) = setup();
         let _unpassed = attached(&mut ipam, "c1");
         let fake = Fake::default();
-        let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
         assert_eq!(e.step, DeleteStep::Preflight);
         assert_eq!(
@@ -1043,8 +1109,7 @@ mod tests {
             veth_lookup_err: Some(NetErrorCode::Timeout),
             ..Fake::default()
         };
-        let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
         assert_eq!(e.step, DeleteStep::Preflight);
         assert_eq!(fake.calls().len(), 1);
@@ -1061,8 +1126,7 @@ mod tests {
             absent_veths: vec![host_of("c1").as_str().to_owned()],
             ..Fake::default()
         };
-        let report =
-            delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports).unwrap();
+        let report = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap();
         assert!(report.leftover.is_empty());
         assert_eq!(ipam.allocated_count(), 0);
         assert!(ports.is_empty());
@@ -1081,8 +1145,7 @@ mod tests {
             IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 90, 0, 1)), 24).unwrap(),
         )
         .unwrap();
-        let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut other, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![], &mut other, &mut ports).unwrap_err();
         assert_eq!(
             (e.code(), e.step),
             (NetErrorCode::FailedPrecondition, DeleteStep::Validate)
@@ -1091,8 +1154,7 @@ mod tests {
         // アドレス不一致。
         let mut bad = attached(&mut ipam, "c2");
         bad.address = c1.address;
-        let e = delete_network_with(&fake, &net, vec![bad], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![bad], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(
             (e.code(), e.step),
             (NetErrorCode::FailedPrecondition, DeleteStep::Validate)
@@ -1102,8 +1164,7 @@ mod tests {
         // host_veth 不一致。
         let mut bad = attached(&mut ipam, "c3");
         bad.host_veth = host_of("zzz");
-        let e = delete_network_with(&fake, &net, vec![bad], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![bad], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
 
         // endpoint の重複。
@@ -1117,15 +1178,7 @@ mod tests {
             address: c1.address,
             netns: (),
         };
-        let e = delete_network_with(
-            &fake,
-            &net,
-            vec![c1, dup],
-            &netns_dir(),
-            &mut ipam,
-            &mut ports,
-        )
-        .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![c1, dup], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(
             (e.code(), e.step),
             (NetErrorCode::InvalidArgument, DeleteStep::Validate)
@@ -1145,9 +1198,7 @@ mod tests {
             veth_index: Some(99),
             ..Fake::default()
         };
-        let report =
-            delete_network_with(&fake, &net, vec![c1], &netns_dir(), &mut ipam, &mut ports)
-                .unwrap();
+        let report = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap();
         assert!(report.leftover.is_empty());
         assert!(
             report
@@ -1171,8 +1222,7 @@ mod tests {
                 veth_alias: Some(alias),
                 ..Fake::default()
             };
-            let e = delete_network_with(&fake, &net, vec![c1], &netns_dir(), &mut ipam, &mut ports)
-                .unwrap_err();
+            let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
             assert_eq!(
                 (e.code(), e.step),
                 (NetErrorCode::FailedPrecondition, DeleteStep::DeleteVeth)
@@ -1192,9 +1242,7 @@ mod tests {
             absent_veths: vec![host_of("c1").as_str().to_owned()],
             ..Fake::default()
         };
-        let report =
-            delete_network_with(&fake, &net, vec![c1], &netns_dir(), &mut ipam, &mut ports)
-                .unwrap();
+        let report = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap();
         assert!(
             report
                 .removed
@@ -1216,8 +1264,7 @@ mod tests {
                 veth_delete_err: Some(code),
                 ..Fake::default()
             };
-            let e = delete_network_with(&fake, &net, vec![c1], &netns_dir(), &mut ipam, &mut ports)
-                .unwrap_err();
+            let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
             assert_eq!(e.code(), code);
             assert_eq!(
                 e.report.leftover,
@@ -1244,8 +1291,7 @@ mod tests {
             unpin_fails: true,
             ..Fake::default()
         };
-        let e = delete_network_with(&fake, &net, vec![c1], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(
             (e.code(), e.step),
             (NetErrorCode::Internal, DeleteStep::UnpinNetns)
@@ -1277,8 +1323,7 @@ mod tests {
             table_err: Some((NetErrorCode::NotFound, NftBatchOutcome::Aborted)),
             ..Fake::default()
         };
-        let report =
-            delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports).unwrap();
+        let report = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap();
         assert!(
             report
                 .removed
@@ -1297,8 +1342,7 @@ mod tests {
             table_err: Some((NetErrorCode::Timeout, NftBatchOutcome::Unknown)),
             ..Fake::default()
         };
-        let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(
             (e.code(), e.step),
             (NetErrorCode::Timeout, DeleteStep::DeleteNftTable)
@@ -1330,8 +1374,7 @@ mod tests {
             table_err: Some((NetErrorCode::PermissionDenied, NftBatchOutcome::Aborted)),
             ..Fake::default()
         };
-        let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(
             e.report.leftover,
             vec![
@@ -1357,8 +1400,7 @@ mod tests {
             table_userdata: Some(b"other".to_vec()),
             ..Fake::default()
         };
-        let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(
             (e.code(), e.step),
             (NetErrorCode::FailedPrecondition, DeleteStep::DeleteBridge)
@@ -1383,8 +1425,7 @@ mod tests {
             ..Fake::default()
         };
         // bridge が無くても、テーブルは自分のトークンで所有を証明できれば削除して完了する。
-        let report =
-            delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports).unwrap();
+        let report = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap();
         assert!(
             report
                 .removed
@@ -1396,8 +1437,7 @@ mod tests {
             bridge_index: Some(8),
             ..Fake::default()
         };
-        let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(e.step, DeleteStep::DeleteBridge);
         assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
     }
@@ -1413,8 +1453,7 @@ mod tests {
             bridge_delete_err: Some(NetErrorCode::ResourceExhausted),
             ..Fake::default()
         };
-        let e = delete_network_with(&fake, &net, vec![c1], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(
             (e.code(), e.step),
             (NetErrorCode::Internal, DeleteStep::DeleteVeth)
@@ -1431,15 +1470,7 @@ mod tests {
             bridge_delete_err: Some(NetErrorCode::Internal),
             ..Fake::default()
         };
-        let e = delete_network_with(
-            &failing,
-            &net,
-            vec![c1],
-            &netns_dir(),
-            &mut ipam,
-            &mut ports,
-        )
-        .unwrap_err();
+        let e = delete_network_with(&failing, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(e.step, DeleteStep::DeleteBridge);
         assert_eq!(ipam.allocated_count(), 0);
         // 再実行では veth・テーブルがすでに無く、bridge は所有を証明できる状態で残っている。
@@ -1447,8 +1478,7 @@ mod tests {
             table_err: Some((NetErrorCode::NotFound, NftBatchOutcome::Aborted)),
             ..Fake::default()
         };
-        let report =
-            delete_network_with(&gone, &net, vec![], &netns_dir(), &mut ipam, &mut ports).unwrap();
+        let report = delete_network_with(&gone, &net, vec![], &mut ipam, &mut ports).unwrap();
         assert!(report.leftover.is_empty());
     }
 
@@ -1461,15 +1491,8 @@ mod tests {
             unpin_fails: true,
             ..Fake::default()
         };
-        let mut e = delete_network_with(
-            &failing,
-            &net,
-            vec![c1],
-            &netns_dir(),
-            &mut ipam,
-            &mut ports,
-        )
-        .unwrap_err();
+        let mut e =
+            delete_network_with(&failing, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(e.retry.len(), 1);
         let kept = e.retry.pop().unwrap();
         assert_eq!(
@@ -1478,9 +1501,7 @@ mod tests {
         );
         // 返されたコンテナを渡して再実行すると、unpin が成功して収束する。
         let ok = Fake::default();
-        let report =
-            delete_network_with(&ok, &net, vec![kept], &netns_dir(), &mut ipam, &mut ports)
-                .unwrap();
+        let report = delete_network_with(&ok, &net, vec![kept], &mut ipam, &mut ports).unwrap();
         assert!(report.leftover.is_empty());
         assert_eq!(ipam.allocated_count(), 0);
     }
@@ -1500,8 +1521,7 @@ mod tests {
                 pin_check_err: check_err,
                 ..Fake::default()
             };
-            let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-                .unwrap_err();
+            let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
             assert_eq!(e.step, DeleteStep::Preflight);
             assert_eq!(
                 e.report.leftover,
@@ -1538,8 +1558,7 @@ mod tests {
         ] {
             let (net, mut ipam, mut ports) = setup();
             reserve_port(&mut ports, "c1", 8080);
-            let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-                .unwrap_err();
+            let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
             assert_eq!(
                 (e.code(), e.step),
                 (NetErrorCode::FailedPrecondition, DeleteStep::DeleteNftTable)
@@ -1561,7 +1580,7 @@ mod tests {
     fn net1_delete_table_by_proven_handle() {
         let (net, mut ipam, mut ports) = setup();
         let fake = Fake::default();
-        delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports).unwrap();
+        delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap();
         let calls = fake.calls();
         let q = calls.iter().position(|c| c.starts_with("table_info"));
         let d = calls
@@ -1581,8 +1600,7 @@ mod tests {
                 veth_master: Some(master),
                 ..Fake::default()
             };
-            let e = delete_network_with(&fake, &net, vec![c1], &netns_dir(), &mut ipam, &mut ports)
-                .unwrap_err();
+            let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
             assert_eq!(
                 (e.code(), e.step),
                 (NetErrorCode::FailedPrecondition, DeleteStep::DeleteVeth)
@@ -1598,14 +1616,13 @@ mod tests {
     fn net1_delete_rerun_after_success_is_idempotent() {
         let (net, mut ipam, mut ports) = setup();
         let first = Fake::default();
-        delete_network_with(&first, &net, vec![], &netns_dir(), &mut ipam, &mut ports).unwrap();
+        delete_network_with(&first, &net, vec![], &mut ipam, &mut ports).unwrap();
         let rerun = Fake {
             bridge_lookup_err: Some(NetErrorCode::NotFound),
             table_absent: true,
             ..Fake::default()
         };
-        let report =
-            delete_network_with(&rerun, &net, vec![], &netns_dir(), &mut ipam, &mut ports).unwrap();
+        let report = delete_network_with(&rerun, &net, vec![], &mut ipam, &mut ports).unwrap();
         assert!(report.leftover.is_empty());
         assert!(
             report
@@ -1624,8 +1641,7 @@ mod tests {
             table_query_err: Some(NetErrorCode::Timeout),
             ..Fake::default()
         };
-        let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(
             (e.code(), e.step),
             (NetErrorCode::Timeout, DeleteStep::DeleteNftTable)
@@ -1650,15 +1666,8 @@ mod tests {
             veth_delete_err: Some(NetErrorCode::Internal),
             ..Fake::default()
         };
-        let mut e = delete_network_with(
-            &failing,
-            &net,
-            vec![c1],
-            &netns_dir(),
-            &mut ipam,
-            &mut ports,
-        )
-        .unwrap_err();
+        let mut e =
+            delete_network_with(&failing, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
         assert!(!failing.calls().iter().any(|c| c == "delete_link 7"));
         assert!(e.report.leftover.contains(&(
             DeleteResource::Bridge(net.bridge.clone()),
@@ -1670,9 +1679,7 @@ mod tests {
             table_err: Some((NetErrorCode::NotFound, NftBatchOutcome::Aborted)),
             ..Fake::default()
         };
-        let report =
-            delete_network_with(&ok, &net, vec![kept], &netns_dir(), &mut ipam, &mut ports)
-                .unwrap();
+        let report = delete_network_with(&ok, &net, vec![kept], &mut ipam, &mut ports).unwrap();
         assert!(report.leftover.is_empty());
         assert!(ok.calls().iter().any(|c| c == "delete_link 7"));
         assert_eq!(ipam.allocated_count(), 0);
@@ -1684,15 +1691,7 @@ mod tests {
             unpin_fails: true,
             ..Fake::default()
         };
-        let e = delete_network_with(
-            &failing,
-            &net,
-            vec![c1],
-            &netns_dir(),
-            &mut ipam,
-            &mut ports,
-        )
-        .unwrap_err();
+        let e = delete_network_with(&failing, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
         assert!(!failing.calls().iter().any(|c| c == "delete_link 7"));
         assert_eq!(e.retry.len(), 1);
 
@@ -1704,8 +1703,7 @@ mod tests {
             pins_present: vec![pin("c1")],
             ..Fake::default()
         };
-        let _ = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let _ = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
         assert!(!fake.calls().iter().any(|c| c == "delete_link 7"));
     }
 
@@ -1718,24 +1716,15 @@ mod tests {
             veth_delete_err: Some(NetErrorCode::Internal),
             ..Fake::default()
         };
-        let mut e = delete_network_with(
-            &failing,
-            &net,
-            vec![c1],
-            &netns_dir(),
-            &mut ipam,
-            &mut ports,
-        )
-        .unwrap_err();
+        let mut e =
+            delete_network_with(&failing, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(e.step, DeleteStep::DeleteVeth);
         assert!(!failing.calls().iter().any(|c| c == "unpin_netns"));
         assert_eq!(e.retry.len(), 1);
         assert_eq!(ipam.allocated_count(), 1);
         let kept = e.retry.pop().unwrap();
         let ok = Fake::default();
-        let report =
-            delete_network_with(&ok, &net, vec![kept], &netns_dir(), &mut ipam, &mut ports)
-                .unwrap();
+        let report = delete_network_with(&ok, &net, vec![kept], &mut ipam, &mut ports).unwrap();
         assert!(report.leftover.is_empty());
         assert_eq!(ipam.allocated_count(), 0);
     }
@@ -1751,8 +1740,7 @@ mod tests {
         let (net, mut ipam, _) = setup();
         let mut ports = PortRegistry::with_shared_file(path);
         let fake = Fake::default();
-        let e = delete_network_with(&fake, &net, vec![], &netns_dir(), &mut ipam, &mut ports)
-            .unwrap_err();
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(e.step, DeleteStep::ReleaseReservations);
         assert_eq!(
             e.report.leftover,

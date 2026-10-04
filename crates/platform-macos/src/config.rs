@@ -180,6 +180,12 @@ pub enum ConfigError {
     ///
     /// 共有範囲の外のホスト領域が ReadWrite でゲストへ公開されるのを防ぐ（MAC-1・TASK-65.1）。
     SharedDirCrossesMount { path: PathBuf, share_dir: PathBuf },
+    /// 読み書き共有の配下にある symlink のリンク先が、共有範囲内に収まることを確認できない
+    /// （範囲外を指す・リンク先の親まで解決できない。`path` は symlink 自身のパス）。
+    ///
+    /// virtiofs サーバのホスト側での symlink の扱いを検証できないため、範囲外への書き込み経路になり得る
+    /// 構成を fail-closed で拒否する（MAC-1・TASK-65.1）。
+    SharedDirSymlinkEscapes { path: PathBuf, share_dir: PathBuf },
     /// 読み書き共有が VM の保護入力（kernel・initrd・ディスクイメージ・コンソールログ）を含む。
     ///
     /// `field` は保護入力の種別、`path` はその実体パス、`share_dir` は共有ディレクトリ。
@@ -245,6 +251,7 @@ impl ConfigError {
                 "config.shared_dir_contains_protected_input"
             }
             ConfigError::SharedDirCrossesMount { .. } => "config.shared_dir_crosses_mount",
+            ConfigError::SharedDirSymlinkEscapes { .. } => "config.shared_dir_symlink_escapes",
         }
     }
 
@@ -425,6 +432,13 @@ impl ConfigError {
             ConfigError::SharedDirCrossesMount { path, share_dir } => {
                 format!(
                     "read-write shared directory {} contains a mount point: {}",
+                    share_dir.display(),
+                    path.display()
+                )
+            }
+            ConfigError::SharedDirSymlinkEscapes { path, share_dir } => {
+                format!(
+                    "read-write shared directory {} contains a symlink whose target is not confirmed to stay inside it: {}",
                     share_dir.display(),
                     path.display()
                 )
@@ -1056,6 +1070,57 @@ fn crosses_mount(root_dev: u64, entry_dev: u64) -> bool {
     root_dev != entry_dev
 }
 
+/// ReadWrite 共有配下の symlink `link` のリンク先が、共有範囲 `dir`（symlink を解決済みの実体パス）に
+/// 収まることを確認する（MAC-1・TASK-65.1。AGENTS.md の rootfs・マウント・ボリューム境界）。
+///
+/// 背景: FUSE（virtiofs）では symlink はゲストの VFS が `FUSE_READLINK` でリンク先文字列を受け取って
+/// ゲストの名前空間で解決する（Linux `fs/fuse/dir.c` の `fuse_get_link`）。一方、Virtualization.framework
+/// の virtiofs サーバ（ホスト側）は非公開実装で、侵害されたゲストカーネルが symlink の nodeid へ直接
+/// 要求を送った場合にホスト上でリンクを辿らないことは文書化されておらず検証できない。そのため
+/// ホスト視点でリンク先を解決し、範囲外なら [`ConfigError::SharedDirSymlinkEscapes`] で拒否する
+/// （fail-closed）。絶対パスの symlink もホスト視点で判定するため、ゲスト内では無害なもの（Python venv の
+/// `bin/python -> /usr/bin/python3` 等）も範囲外として拒否する保守的な判定になる。
+///
+/// - リンク先が実在する: 全段の symlink を解決した実体パスが `dir` 配下であることを要素単位・大文字小文字
+///   区別で照合する（`dir` も実体パスのため綴りが揃う。大小無視の照合は範囲外を範囲内と誤判定し得る）。
+/// - リンク先が未作成（dangling）: リンク先の親ディレクトリを解決し、それが `dir` 配下で、最終要素が
+///   通常の名前（`..` でない）なら許可する。親まで解決できなければ範囲を確認できないため拒否する。
+/// - それ以外の解決失敗（ループ・権限等）は `PathIo` で fail-closed にする。
+///
+/// 残余（検査では防げない）: 検査から VM 起動・使用までの間のホスト側での差し替え（TOCTOU）と、
+/// ゲストが実行時に `FUSE_SYMLINK` で新たに作る symlink。後者はホスト側サーバがリンクを辿らないことに依存する。
+#[cfg(unix)]
+fn check_symlink_within_share(link: &Path, dir: &Path) -> Result<(), ConfigError> {
+    let escapes = || ConfigError::SharedDirSymlinkEscapes {
+        path: link.to_path_buf(),
+        share_dir: dir.to_path_buf(),
+    };
+    let io_err = |e: std::io::Error| ConfigError::PathIo {
+        field: ConfigField::SharedDirectory,
+        kind: e.kind(),
+    };
+    match std::fs::canonicalize(link) {
+        Ok(real) if real.starts_with(dir) => Ok(()),
+        Ok(_) => Err(escapes()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let target = std::fs::read_link(link).map_err(io_err)?;
+            // 走査は実ディレクトリだけを辿るため、`link` の親は symlink を経由しない実体パス。
+            // 絶対パスの `target` は `join` で置き換わる。
+            let full = link.parent().ok_or_else(escapes)?.join(target);
+            let (Some(parent), Some(_)) = (full.parent(), full.file_name()) else {
+                return Err(escapes());
+            };
+            match std::fs::canonicalize(parent) {
+                Ok(real_parent) if real_parent.starts_with(dir) => Ok(()),
+                Ok(_) => Err(escapes()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(escapes()),
+                Err(e) => Err(io_err(e)),
+            }
+        }
+        Err(e) => Err(io_err(e)),
+    }
+}
+
 /// ReadWrite 共有の配下に、保護入力と同一 inode（`(dev, ino)` 一致）のエントリがあれば拒否する。
 ///
 /// パスの包含検査（[`crate::virtiofs::path_is_within`]）では、共有の外にある保護入力へのハードリンクを
@@ -1063,6 +1128,8 @@ fn crosses_mount(root_dev: u64, entry_dev: u64) -> bool {
 /// AGENTS.md の rootfs・マウント・ボリューム境界）。共有配下を symlink を辿らずに走査して照合する。
 /// 共有配下にルートと異なる `st_dev` のエントリ（マウントポイント）があれば
 /// [`ConfigError::SharedDirCrossesMount`] で拒否する（別ホスト領域の ReadWrite 公開防止）。
+/// 共有配下の symlink はリンク先が共有範囲に収まることを [`check_symlink_within_share`] で確認し、
+/// 確認できなければ [`ConfigError::SharedDirSymlinkEscapes`] で拒否する（範囲外への書き込み経路の防止）。
 /// 保護入力が未作成（コンソールログ等）なら照合対象から外す。走査の I/O 失敗・件数上限超過は
 /// fail-closed で `PathIo` を返す。unix 限定（Windows には `(dev, ino)` が無く、本 crate の
 /// 実行対象は macOS のため走査しない）。`check_share_conflicts` から呼ばれる。
@@ -1103,7 +1170,7 @@ fn find_hardlink_to_protected(
                     kind: std::io::ErrorKind::Other,
                 });
             }
-            // symlink は辿らない（共有外への経路を走査に含めない。リンク先の書き換えは virtiofs 側が解決する）。
+            // symlink は走査で辿らない（共有外を走査に含めない）。リンク先の範囲は下で別途検証する。
             let meta = std::fs::symlink_metadata(entry.path()).map_err(io_err)?;
             // 共有ルートと異なるデバイスのエントリはマウントポイント（別領域）。辿らず拒否する。
             if crosses_mount(root_dev, meta.dev()) {
@@ -1112,7 +1179,9 @@ fn find_hardlink_to_protected(
                     share_dir: dir.to_path_buf(),
                 });
             }
-            if meta.is_dir() {
+            if meta.file_type().is_symlink() {
+                check_symlink_within_share(&entry.path(), dir)?;
+            } else if meta.is_dir() {
                 stack.push(entry.path());
             } else if meta.is_file() {
                 let id = (meta.dev(), meta.ino());
@@ -1284,8 +1353,10 @@ impl VmConfigSpec {
     ///
     /// 共有ディレクトリの配下（同一ディレクトリ自身を含む）に保護入力があれば
     /// [`ConfigError::SharedDirContainsProtectedInput`] を返す。比較は symlink を解決した実体パスで、
-    /// 解決できない（未作成のコンソールログ等）場合は親を解決して補う。ReadOnly 共有は書き換えられない
-    /// ため対象外。`build_vz_configuration` が VZ 呼び出しの前に実行する。
+    /// 解決できない（未作成のコンソールログ等）場合は親を解決して補う。unix では共有配下も走査し、
+    /// 保護入力へのハードリンク・マウント境界・共有範囲外を指す symlink を拒否する（`find_hardlink_to_protected`）。
+    /// ReadOnly 共有は書き換えられないため対象外。`build_vz_configuration` が VZ 呼び出しの前に実行する。
+    /// 検査から VM 起動・使用までの差し替え（TOCTOU）とゲストが実行時に作る symlink は検査できない。
     pub fn check_share_conflicts(&self) -> Result<(), ConfigError> {
         let mut protected = self.protected_inputs();
         if let Some(SerialConsoleSink::LogFile(log)) = self.devices.serial_console() {

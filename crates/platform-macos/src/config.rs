@@ -131,6 +131,8 @@ pub enum ConfigError {
     ConsoleLogParentWorldWritable { path: PathBuf },
     /// コンソールログを開けない、または open 後の同一性検査に失敗した。
     ConsoleLogOpen { kind: std::io::ErrorKind },
+    /// コンソールログの上限つき書き出し（pipe・書き出しスレッド）を開始できない。
+    ConsoleLogWriter { kind: std::io::ErrorKind },
     /// VZ がディスクイメージ attachment を拒否した（NSError の domain / code）。
     DiskAttachment { domain: String, code: isize },
     /// VZ がブロックデバイス識別子を拒否した（NSError の domain / code）。
@@ -172,6 +174,7 @@ impl ConfigError {
                 "config.console_log_parent_world_writable"
             }
             ConfigError::ConsoleLogOpen { .. } => "config.console_log_open",
+            ConfigError::ConsoleLogWriter { .. } => "config.console_log_writer",
             ConfigError::DiskAttachment { .. } => "config.disk_attachment",
             ConfigError::BlockDeviceIdRejected { .. } => "config.block_device_id_rejected",
         }
@@ -287,6 +290,9 @@ impl ConfigError {
             }
             ConfigError::ConsoleLogOpen { kind } => {
                 format!("failed to open console log safely: {kind}")
+            }
+            ConfigError::ConsoleLogWriter { kind } => {
+                format!("failed to start the capped console log writer: {kind}")
             }
             ConfigError::DiskAttachment { domain, code } => {
                 format!("virtualization framework rejected the disk image ({domain} {code})")
@@ -998,12 +1004,31 @@ impl VmConfigSpec {
         inputs
     }
 
+    /// シリアルコンソールの出力先を上限つきの書き出しとして開く（無ければ `None`）。
+    ///
+    /// ログファイルを検証つきで開き（[`Self::open_serial_console_log`]）、ファイル総量
+    /// [`crate::console_log::MAX_CONSOLE_LOG_BYTES`] まで書き出すスレッドへ渡す。戻り値は pipe の書き込み端で、
+    /// 生のログファイルは返さない（上限を迂回する経路を公開しない。#1366 の P1-3・MAC-1・TASK-64.3）。
+    /// 書き出しの開始に失敗した場合、作成済みのログファイル（空）は残る。
+    #[cfg(unix)]
+    pub fn open_serial_console(
+        &self,
+    ) -> Result<Option<crate::console_log::ConsoleLogSink>, ConfigError> {
+        let Some(file) = self.open_serial_console_log()? else {
+            return Ok(None);
+        };
+        crate::console_log::ConsoleLogSink::spawn(file, crate::console_log::MAX_CONSOLE_LOG_BYTES)
+            .map(Some)
+            .map_err(|e| ConfigError::ConsoleLogWriter { kind: e.kind() })
+    }
+
     /// シリアルコンソールのログファイルを追記モードで開く（無ければ `None`）。
     ///
     /// 照合対象（kernel / initrd / ディスクイメージ）は [`Self::protected_inputs`] に固定され、
-    /// 呼び出し側が省略・差し替えできない（MAC-1・TASK-64.3）。
+    /// 呼び出し側が省略・差し替えできない（MAC-1・TASK-64.3）。生の `File` を返すため非公開とし、
+    /// 外部へは [`Self::open_serial_console`]（上限つき）だけを公開する。
     #[cfg(unix)]
-    pub fn open_serial_console_log(&self) -> Result<Option<std::fs::File>, ConfigError> {
+    fn open_serial_console_log(&self) -> Result<Option<std::fs::File>, ConfigError> {
         match self.devices.serial_console() {
             Some(SerialConsoleSink::LogFile(log)) => log
                 .open_for_append_excluding(&self.protected_inputs())
@@ -1083,8 +1108,9 @@ impl VzVmConfiguration {
 /// [`VmConfigSpec`] から `VZVirtualMachineConfiguration` を構築する（MAC-1・TASK-64.2・64.3）。
 ///
 /// `vm::Vm::create`（TASK-64.4）がこの構成から `VZVirtualMachine` を生成する。ゲストのカーネルコマンドライン
-/// `console=hvc0` の出力はコンソールログへ流れる。ホスト側の副作用（ログファイルの作成）は
-/// 失敗し得る処理をすべて終えた後に行う。
+/// `console=hvc0` の出力は pipe 経由で上限つきの書き出しスレッドへ渡り、コンソールログへ追記される
+/// （`crate::console_log`。スレッドは VM が書き込み端を手放すまで残る）。ホスト側の副作用（ログファイルの
+/// 作成・書き出しスレッドの起動）は失敗し得る処理をすべて終えた後に行う。
 ///
 /// Rust 側の検証と VZ の許容範囲照合をすべて終えてから FFI の setter を呼ぶ（ObjC 例外は捕捉できないため）。
 /// `validateWithError` は entitlement 依存の可能性があり、ここでは呼ばず、`vm::Vm::create` が VM 生成前に呼ぶ（TASK-64.4）。
@@ -1153,9 +1179,10 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
 
     // シリアルコンソール（ここで初めてログファイルを作成・open する）。
     // 使用時点で fd を kernel / initrd / ディスクイメージと照合し、リンク数・所有者も検査する。
+    // VZ へはログファイルではなく上限つき書き出しの pipe の書き込み端を渡す（追記量の上限。P1-3）。
     let mut serial = Vec::new();
-    if let Some(file) = spec.open_serial_console_log()? {
-        let handle = crate::sys::new_file_handle(file.into());
+    if let Some(sink) = spec.open_serial_console()? {
+        let handle = crate::sys::new_file_handle(sink.into_write_fd());
         serial.push(crate::sys::new_console_serial_port(&handle));
     }
 

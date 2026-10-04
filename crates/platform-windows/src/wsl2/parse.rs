@@ -854,6 +854,45 @@ mod tests {
             let c = cap(false, b"", &utf16le(text, false));
             assert_eq!(classify_failure(&c), want, "{text}");
         }
+        // ERR-1: 0 件は既知の出力形式に限る。識別子の後に行が続く・両方のストリームに出る・識別子が
+        // 2 行に出る・コード部分に余計な要素がある出力は 0 件扱いにしない。
+        let code = "Error code: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND";
+        for (stdout, stderr) in [
+            (format!("{code}\nSomething else failed."), String::new()),
+            (code.to_string(), code.to_string()),
+            ("Some text".to_string(), code.to_string()),
+            (format!("{code}\n{code}"), String::new()),
+            (
+                "Error code: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND/extra".to_string(),
+                String::new(),
+            ),
+            (
+                "Error code: Wsl/Other/WSL_E_DEFAULT_DISTRO_NOT_FOUND".to_string(),
+                String::new(),
+            ),
+        ] {
+            let c = cap(false, stdout.as_bytes(), stderr.as_bytes());
+            assert_eq!(
+                classify_failure(&c),
+                Failure::Unknown,
+                "{stdout:?} / {stderr:?}"
+            );
+        }
+        // ラベルは全角コロン・ラベルなしも可。stderr だけに出る形も受け付ける。
+        for (stdout, stderr) in [
+            (
+                "エラー コード：Wsl/Service/WSL_E_DEFAULT_DISTRO_NOT_FOUND",
+                "",
+            ),
+            ("", "Guide line\nWsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND\n"),
+        ] {
+            let c = cap(false, stdout.as_bytes(), stderr.as_bytes());
+            assert_eq!(
+                classify_failure(&c),
+                Failure::NoDistro,
+                "{stdout:?} / {stderr:?}"
+            );
+        }
         let phrase_only = cap(false, b"", b"has no installed distributions");
         assert_eq!(classify_failure(&phrase_only), Failure::Unknown);
         let usage = cap(false, b"Usage: wsl.exe [Argument]\n", b"");

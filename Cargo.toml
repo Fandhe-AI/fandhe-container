@@ -37,7 +37,7 @@ repository = "https://github.com/Fandhe-AI/fandhe-container"
 
 # 共通依存の集約先。追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 # 採用済みは serde / serde_json（承認: Issue #138・TASK-29.hdep1。OCI config.json のパース用）・sha2（#278）・
-# objc2 系 5 件（#356・TASK-64.hdep1）。
+# objc2 系 5 件（#356・TASK-64.hdep1）・windows-sys（#371・TASK-67.hdep1）。
 # workspace 内 crate の path 依存は外部クレートの追加ではない（TASK-111.1・#262・PLUG-3。core の optional 依存用）。
 [workspace.dependencies]
 fandhe-container-plugin = { path = "crates/plugin" }
@@ -54,3 +54,6 @@ objc2-foundation = { version = "=0.3.2", default-features = false }
 objc2-virtualization = { version = "=0.3.2", default-features = false }
 block2 = { version = "=0.6.2", default-features = false }
 dispatch2 = { version = "=0.3.1", default-features = false }
+# Windows API の FFI 宣言（WIN-1・TASK-67.3）。承認: Issue #371・TASK-67.hdep1。
+# crates/platform-windows から cfg(windows) ターゲット限定で参照し、features はメンバー側で使う名前空間のみ列挙する。
+windows-sys = { version = "=0.61.2", default-features = false }

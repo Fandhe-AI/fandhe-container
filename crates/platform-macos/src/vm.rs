@@ -1279,6 +1279,27 @@ mod tests {
         assert_eq!(core.lifecycle.state(), VmState::Running);
     }
 
+    /// TASK-64.4: 破棄時の停止が 1 回目に失敗しても、やり直しが成功すれば Stopped で終わり失敗は記録しない。
+    #[test]
+    fn core_drop_stop_retry_succeeds_on_second_attempt() {
+        let (sink, rx) = event_channel(32);
+        let mut core = Core::new(sink);
+        assert_eq!(core.request_drop_stop(true, VmState::Running), Some(1));
+        assert!(core.finish_drop_stop(1, Err(("VZErrorDomain".to_string(), 3))));
+        assert_eq!(core.request_drop_stop(true, VmState::Running), Some(2));
+        assert!(!core.finish_drop_stop(2, Ok(())));
+        assert_eq!(
+            drain(&rx),
+            vec![
+                changed(VmState::Stopped, VmState::Running),
+                changed(VmState::Running, VmState::Stopping),
+                changed(VmState::Stopping, VmState::Running),
+                changed(VmState::Running, VmState::Stopping),
+                changed(VmState::Stopping, VmState::Stopped)
+            ]
+        );
+    }
+
     /// TASK-64.4: 停止できない間（起動途中・完了待ち）の破棄は印だけ残し、完了後に停止を要求し直す。
     #[test]
     fn core_drop_stop_is_deferred_until_operation_completes() {

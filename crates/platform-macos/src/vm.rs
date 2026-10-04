@@ -382,7 +382,15 @@ impl Core {
         input: LifecycleInput,
     ) -> Result<(), VmState> {
         if !self.lifecycle.is_current(generation) {
-            return Err(self.lifecycle.state());
+            let state = self.lifecycle.state();
+            // 停止要求中にゲスト停止通知が先着して世代が無効化された場合でも、停止自体は成功しており
+            // VM は Stopped なので、通知と完了の到着順に依存せず正常な停止として扱う。
+            if matches!(input, LifecycleInput::StopCompleted(_, Ok(())))
+                && state == VmState::Stopped
+            {
+                return Ok(());
+            }
+            return Err(state);
         }
         self.apply(input);
         Ok(())
@@ -711,6 +719,23 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    /// MAC-1・TASK-64.4: 停止通知が停止完了より先着しても、停止要求は正常終了として扱う。
+    #[test]
+    fn core_complete_accepts_stop_after_guest_stopped_notification() {
+        let (sink, _rx) = event_channel(8);
+        let mut core = Core::new(sink);
+        let start = core.begin(LifecycleInput::StartRequested);
+        core.complete(start, LifecycleInput::StartCompleted(start, Ok(())))
+            .unwrap();
+        let stop = core.begin(LifecycleInput::StopRequested);
+        core.apply(LifecycleInput::GuestStopped);
+        assert_eq!(
+            core.complete(stop, LifecycleInput::StopCompleted(stop, Ok(()))),
+            Ok(())
+        );
+        assert_eq!(core.lifecycle.state(), VmState::Stopped);
     }
 
     #[test]

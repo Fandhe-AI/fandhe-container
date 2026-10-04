@@ -275,6 +275,23 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
   FANDHE_CONTAINER_MACOS_VM_KERNEL=/abs/path/to/vmlinux FANDHE_CONTAINER_MACOS_VM_READY_MARKER="<ゲストが起動完了後にだけ出力する文字列>" <上で得たバイナリ> --ignored --nocapture
   ```
 
+- virtiofs の symlink・ハードリンク挙動の手動確認（MAC-1・TASK-65.1 追補・#1374。人間担当。Agent は手順準備まで）: 自動テストは無い手動手順。必要環境は `vm_boot` と同じ（実機の macOS 13 以上・`com.apple.security.virtualization` 付き ad-hoc 署名・自前ビルドのゲストカーネル。root 不要）。**正常ゲストの観測は拒否を維持する判断の補強にしかならない**（`cat link` は `FUSE_READLINK` → ゲスト側解決の正常経路で、侵害ゲストが symlink の nodeid へ直接 `FUSE_OPEN` を送る脅威は観測できない）ため、結果にかかわらず絶対パス symlink・ハードリンクの拒否は本手順だけでは緩めない。範囲外 symlink を含む fixture は ReadWrite 検査を通らないので ReadOnly 共有で観測し、ゲストが実行中に作るリンクの観測は空の ReadWrite 共有で行う。書き込みを伴う確認は `RW` 内に限り、ホストの共有外ファイルを書き換えない。
+  1. fixture（ホスト側。パスは必ずダブルクォートする）:
+
+     ```bash
+     W="$(mktemp -d)"; mkdir "$W/ro" "$W/rw" "$W/ro_hl"
+     echo HOST-OUTSIDE-MARKER > "$W/outside.txt"            # ゲスト内の同パスには GUEST-SIDE-MARKER を置く
+     ln -s "$W/outside.txt" "$W/ro/abs_link"                # 絶対パス symlink
+     ln -s ../outside.txt "$W/ro/rel_link"                  # `..` を含む相対 symlink（共有外）
+     ln -s "$W/missing" "$W/ro/dangling_link"               # dangling
+     echo inside > "$W/ro/inside.txt"; ln -s inside.txt "$W/ro/inside_link"
+     echo hl > "$W/ro_hl/a"; ln "$W/ro_hl/a" "$W/ro_hl/b"; ln "$W/ro_hl/a" "$W/outside_hl"
+     ```
+
+  2. ゲスト側: `ro` を ReadOnly、`rw`（空）を ReadWrite で共有して起動し、`ro` の各 symlink を `readlink`・`cat`・`stat` して読めた内容がホスト側マーカーかゲスト側マーカーかを記録する。`rw` 内で `ln -s`（`FUSE_SYMLINK`）・`ln`（`FUSE_LINK`）を実行し、ホスト側で `ls -l`・`stat` してリンクの実体・リンク数を記録する。`ro_hl` についても読み取りと `stat` のリンク数を記録する
+  3. 判定: ゲスト側マーカーが読める（ホストが辿らない）なら拒否維持の補強のみ。ホスト側マーカーが読めるなら拒否の維持が必須かつ ReadOnly 共有の扱いも見直しが要る（ユーザーへ報告し別 Issue）
+  4. 記録先: 結果を #1374 にコメントし、関連 PR にも記録する
+
 - `make fio-bench`（TASK-25.1・IO-8）: fio・GNU coreutils の `timeout` が入った Linux 環境が必要（root 権限・`/dev/kvm` は不要）。`make fio-bench-selftest`（`--from-json` モード＋固定 fixture＋fio スタブで完結し、実 fio は使わない）は CI の `bench-regression` ジョブに組み込み済みで既定のテスト集合の一部。`make fio-bench` 自体の実機実行・Docker コンテナ内での fio 実行（runbook は [docs/design/io-fio-bench.md](docs/design/io-fio-bench.md)「Docker ベースラインの計測手順」）・その結果の `make fio-baseline-ratio` への入力は TASK-25.2（#113。人間共同）が担う。`make fio-baseline-ratio`（比率算出そのもの）は fio・Docker を必要としないため既定のテスト集合の一部（`make fio-baseline-ratio-selftest` として CI に組み込み済み）
 - 実機での実測・判定が「人間」担当のタスク（`.claude/rules/delegation-impl.md`「着手条件」）を、計測スクリプト準備を超えて Agent が単独で完了扱いにしていないか確認する
 - カーネル監査フォールバックの肯定側送信（SEC-4・TASK-41.5.2。`crates/core/tests/audit_kernel_fallback.rs` の `sec4_task41_5_2_real_kernel_accepts_with_cap_audit_write`）は、`CAP_AUDIT_WRITE` を持つ初期 user namespace が必要でホストの監査ログへ 1 件書き込むため `#[ignore]` で分離している。実行コマンドは `cargo test -p fandhe-container-core --test audit_kernel_fallback -- --ignored`（root 等の権限付きで人間が実施し、結果を PR に記録する）。権限が無い環境の否定側テスト（`sec4_task41_5_2_real_kernel_rejects_without_privilege`）は既定のテスト集合で動く

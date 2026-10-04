@@ -282,6 +282,16 @@ impl Lifecycle {
         true
     }
 
+    /// 要求できなかった操作を取り消す（完了通知は来ないため放棄の目印も残さない）。
+    pub(crate) fn cancel(&mut self, generation: u64) {
+        if self.in_flight == Some(generation) {
+            self.in_flight = None;
+        }
+        if self.abandoned == Some(generation) {
+            self.abandoned = None;
+        }
+    }
+
     /// 進行中の操作がなければ、状態を VZ の実状態 `actual` に合わせる（食い違っていれば `StateChanged`）。
     /// 進行中の操作がある間は、その完了通知が状態を決めるため何もしない。
     pub(crate) fn reconcile(&mut self, actual: VmState) -> Vec<VmEvent> {
@@ -537,6 +547,14 @@ impl Core {
         }
     }
 
+    /// 受け付けた操作 `generation` を VZ へ要求できなかった（要求直前の `canStart` / `canStop` が false）
+    /// ときに取り消し、状態機械を実状態 `actual` へ戻す。取り消し後の状態を返す（`InvalidState` 用）。
+    pub(crate) fn cancel_begun(&mut self, generation: u64, actual: VmState) -> VmState {
+        self.lifecycle.cancel(generation);
+        self.reconcile(actual);
+        self.lifecycle.state()
+    }
+
     /// 進行中の操作がなければ状態機械を VZ の実状態へ合わせ、差分を `StateChanged` で配送する。
     pub(crate) fn reconcile(&mut self, actual: VmState) {
         for event in self.lifecycle.reconcile(actual) {
@@ -785,6 +803,7 @@ mod mac {
                     }
                 };
                 let handler_core = Arc::clone(&core);
+                let reject_tx = tx.clone();
                 let handler = move |vm: &VmRef<'_>, res: Result<(), ErrInfo>| {
                     let outcome = res.clone().map_err(|(domain, code)| match op {
                         VmOp::Start => VmError::StartFailed { domain, code },
@@ -810,9 +829,17 @@ mod mac {
                         issue_drop_stop(vm, &handler_core);
                     }
                 };
-                match op {
+                let requested = match op {
                     VmOp::Start => vm.start(handler),
                     VmOp::Stop => vm.stop(handler),
+                };
+                // 受付後に要求直前の確認で拒否された（シリアルキュー上のため通常は起きない）。操作を取り消し、
+                // 呼び出し元の放棄と直列化するため Core のロック内で InvalidState を返す。
+                if let Err(rejected) = requested {
+                    let actual = VmState::from_raw(rejected.state_raw);
+                    let mut c = lock(&core);
+                    let state = c.cancel_begun(generation, actual);
+                    let _ = reject_tx.try_send(Err(VmError::InvalidState { op, state }));
                 }
             });
             match rx.recv_timeout(self.op_timeout) {
@@ -872,13 +899,17 @@ mod mac {
             return;
         };
         let handler_core = Arc::clone(core);
-        vm.stop(move |vm: &VmRef<'_>, res: Result<(), ErrInfo>| {
+        let requested = vm.stop(move |vm: &VmRef<'_>, res: Result<(), ErrInfo>| {
             let retry = lock(&handler_core).finish_drop_stop(generation, res);
             if retry {
                 let core = Arc::clone(&handler_core);
                 vm.run_after(DROP_STOP_RETRY_DELAY, move |vm| issue_drop_stop(vm, &core));
             }
         });
+        // 要求直前の確認で停止できなかった（既に止まった等）。完了通知は来ないので取り消す。
+        if let Err(rejected) = requested {
+            lock(core).cancel_begun(generation, VmState::from_raw(rejected.state_raw));
+        }
     }
 
     impl Drop for Vm {

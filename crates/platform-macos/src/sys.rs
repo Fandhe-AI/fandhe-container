@@ -7,8 +7,10 @@
 //!
 //! 共通の不変条件: 引数は `Retained` / 参照で生存期間が保証された有効な Objective-C オブジェクトで、
 //! セレクタと型シグネチャは objc2-virtualization 0.3.2 の生成バインディングと一致する。ここで呼ぶ
-//! setter / getter は ObjC 例外を投げない（objc2 の `exception` feature は無効のため、例外は abort になる。
-//! CPU 数・メモリ量は呼び出し側 `config` が VZ の許容範囲を検証済みであること）。設定オブジェクトは
+//! setter / getter は ObjC 例外を投げない（objc2 の `exception` feature は無効のため、ObjC 例外は Rust の
+//! フレームをアンワインドで通り抜け、dispatch の extern "C" 境界等で abort する。捕捉はできないので、例外を
+//! 投げ得る呼び出しは事前条件を確認してから行う。CPU 数・メモリ量は呼び出し側 `config` が VZ の許容範囲を
+//! 検証済みであること）。設定オブジェクトは
 //! VM 生成前で `VZVirtualMachine` のキュー制約は受けない。
 //!
 //! キュー制約（TASK-64.4）: `VZVirtualMachine` の操作・completion handler・delegate は、その VM 専用の
@@ -274,6 +276,13 @@ pub(crate) fn serial_port_count(config: &VZVirtualMachineConfiguration) -> usize
     unsafe { config.serialPorts() }.len()
 }
 
+/// `VmRef::start` / `stop` が事前条件（`canStart` / `canStop`）を満たさず要求しなかったこと。
+///
+/// handler は呼ばれずに破棄される。`state_raw` はその時点の `VZVirtualMachineState` の生値。
+pub(crate) struct OpRejected {
+    pub(crate) state_raw: isize,
+}
+
 /// VM 専用キューのラベル（固定文字列。入力から組み立てない）。
 const VM_QUEUE_LABEL: &str = "ai.fandhe.container.platform-macos.vm";
 
@@ -427,32 +436,53 @@ impl VmRef<'_> {
         unsafe { self.objs.0.vm.state().0 }
     }
 
-    /// 起動可能か。`start` の前に必ず確認する（不正状態の呼び出しは ObjC 例外 = abort になるため）。
+    /// 起動可能か（不正状態での `startWithCompletionHandler:` は ObjC 例外 = abort になるため、`start` も内部で確認する）。
     pub(crate) fn can_start(&self) -> bool {
         // SAFETY: 同上。
         unsafe { self.objs.0.vm.canStart() }
     }
 
-    /// 停止可能か。`stop` の前に必ず確認する。
+    /// 停止可能か（`stop` も内部で確認する）。
     pub(crate) fn can_stop(&self) -> bool {
         // SAFETY: 同上。
         unsafe { self.objs.0.vm.canStop() }
     }
 
-    /// `startWithCompletionHandler:` を呼ぶ。`can_start()` が true であること。
+    /// `canStart` を確認してから `startWithCompletionHandler:` を呼ぶ。起動できない状態なら要求せず
+    /// `OpRejected` を返す（handler は呼ばれない）。
     ///
     /// `handler` は VM キュー上で 1 回だけ、その時点の `VmRef` とともに呼ばれる（続けて停止を要求できる）。
-    pub(crate) fn start(&self, handler: impl Fn(&VmRef<'_>, Result<(), VzErrorInfo>) + 'static) {
+    pub(crate) fn start(
+        &self,
+        handler: impl Fn(&VmRef<'_>, Result<(), VzErrorInfo>) + Send + 'static,
+    ) -> Result<(), OpRejected> {
+        if !self.can_start() {
+            return Err(OpRejected {
+                state_raw: self.state_raw(),
+            });
+        }
         let block = self.completion_block(handler);
-        // SAFETY: VM キュー上で呼ばれ、`can_start` 確認済み。block は VZ が copy して保持し、キュー上で呼ぶ。
-        unsafe { self.objs.0.vm.startWithCompletionHandler(&block) }
+        // SAFETY: VM キュー上で呼ばれ（`VmRef` は !Send でキュー上にしか存在しない）、直前に `canStart` を
+        // 確認済み。シリアルキュー上のため確認と呼び出しの間に他の操作は入らない。block は VZ が copy して
+        // 保持し、キュー上で呼ぶ。
+        unsafe { self.objs.0.vm.startWithCompletionHandler(&block) };
+        Ok(())
     }
 
-    /// `stopWithCompletionHandler:` を呼ぶ。`can_stop()` が true であること。`handler` は `start` と同じ。
-    pub(crate) fn stop(&self, handler: impl Fn(&VmRef<'_>, Result<(), VzErrorInfo>) + 'static) {
+    /// `canStop` を確認してから `stopWithCompletionHandler:` を呼ぶ。戻り値と `handler` は `start` と同じ。
+    pub(crate) fn stop(
+        &self,
+        handler: impl Fn(&VmRef<'_>, Result<(), VzErrorInfo>) + Send + 'static,
+    ) -> Result<(), OpRejected> {
+        if !self.can_stop() {
+            return Err(OpRejected {
+                state_raw: self.state_raw(),
+            });
+        }
         let block = self.completion_block(handler);
-        // SAFETY: VM キュー上で呼ばれ、`can_stop` 確認済み。block の扱いは `start` と同じ。
-        unsafe { self.objs.0.vm.stopWithCompletionHandler(&block) }
+        // SAFETY: VM キュー上で呼ばれ、直前に `canStop` を確認済み。block の扱いは `start` と同じ。
+        unsafe { self.objs.0.vm.stopWithCompletionHandler(&block) };
+        Ok(())
     }
 
     /// `delay` 後に VM キュー上で `f` を実行する（それまで VM を保持し、解放はキュー上で行う）。
@@ -482,7 +512,7 @@ impl VmRef<'_> {
     /// 一度も呼ばずに保持し続けた場合、VM は解放されない（use-after-free より安全側に倒す）。
     fn completion_block(
         &self,
-        handler: impl Fn(&VmRef<'_>, Result<(), VzErrorInfo>) + 'static,
+        handler: impl Fn(&VmRef<'_>, Result<(), VzErrorInfo>) + Send + 'static,
     ) -> RcBlock<dyn Fn(*mut NSError)> {
         let keep = Cell::new(Some(QueueOwned {
             objs: Some(Arc::clone(self.objs)),

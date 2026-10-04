@@ -1878,6 +1878,7 @@ mod tests {
         let t = TempDir::new("log-parent");
         let dir = t.0.join("shared");
         std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = dir.join("console.log");
         let log = ConsoleLogPath::try_new(&path).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();

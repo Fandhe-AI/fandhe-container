@@ -736,6 +736,7 @@ mod mac {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::Receiver;
 
     fn changed(from: VmState, to: VmState) -> VmEvent {
         VmEvent::StateChanged { from, to }
@@ -897,6 +898,10 @@ mod tests {
         }
     }
 
+    fn drain(rx: &Receiver<VmEvent>) -> Vec<VmEvent> {
+        rx.try_iter().collect()
+    }
+
     /// MAC-1・TASK-64.4: 進行中の操作がある間の重複要求は拒否し、先行操作の完了通知を潰さない。
     #[test]
     fn core_begin_rejects_overlapping_operation() {
@@ -923,6 +928,166 @@ mod tests {
         assert_eq!(core.lifecycle.state(), VmState::Running);
         let (_, stop) = begin_ok(&mut core, LifecycleInput::StopRequested, VmState::Running);
         assert_eq!(stop, 2);
+    }
+
+    /// MAC-1・TASK-64.4: `canStart` / `canStop` が false なら実状態を返して拒否し、取り消し済みなら何もしない。
+    #[test]
+    fn core_begin_rejects_disallowed_and_skips_cancelled() {
+        let (sink, rx) = event_channel(8);
+        let mut core = Core::new(sink);
+        let mut ticket = OpTicket::Pending;
+        assert_eq!(
+            core.begin(
+                &mut ticket,
+                LifecycleInput::StopRequested,
+                false,
+                VmState::Stopped
+            ),
+            BeginOutcome::Rejected(VmState::Stopped)
+        );
+        assert_eq!(ticket, OpTicket::Settled);
+        let mut cancelled = OpTicket::Cancelled;
+        assert_eq!(
+            core.begin(
+                &mut cancelled,
+                LifecycleInput::StartRequested,
+                true,
+                VmState::Stopped
+            ),
+            BeginOutcome::Cancelled
+        );
+        assert_eq!(core.lifecycle.state(), VmState::Stopped);
+        assert_eq!(drain(&rx), Vec::<VmEvent>::new());
+    }
+
+    /// REPAIR-5・TASK-64.4: 未着手の操作は待機期限切れで取り消され、キュー上では実行されない。
+    #[test]
+    fn core_abandon_cancels_pending_operation() {
+        let (sink, _rx) = event_channel(8);
+        let mut core = Core::new(sink);
+        let mut ticket = OpTicket::Pending;
+        assert_eq!(core.abandon(&mut ticket), AbandonOutcome::NotStarted);
+        assert_eq!(ticket, OpTicket::Cancelled);
+        assert_eq!(
+            core.begin(
+                &mut ticket,
+                LifecycleInput::StartRequested,
+                true,
+                VmState::Stopped
+            ),
+            BeginOutcome::Cancelled
+        );
+        assert!(!core.lifecycle.has_in_flight());
+    }
+
+    /// REPAIR-5・TASK-64.4: 完了通知が来ないまま放棄した操作は後続の要求を妨げず、実状態から停止できる。
+    #[test]
+    fn core_abandon_unblocks_following_operation() {
+        let (sink, rx) = event_channel(16);
+        let mut core = Core::new(sink);
+        let (mut ticket, start) =
+            begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        assert_eq!(core.abandon(&mut ticket), AbandonOutcome::Abandoned(start));
+        assert!(!core.lifecycle.has_in_flight());
+        drain(&rx);
+        // VZ 上では起動が済んでいた（Running）。停止要求の受付時に実状態へ追従してから Stopping へ進む。
+        let (_, stop) = begin_ok(&mut core, LifecycleInput::StopRequested, VmState::Running);
+        assert_eq!(stop, 2);
+        assert_eq!(
+            drain(&rx),
+            vec![
+                changed(VmState::Starting, VmState::Running),
+                changed(VmState::Running, VmState::Stopping)
+            ]
+        );
+        // 新しい要求の後に届いた放棄済み操作の完了は古い通知として捨てる。
+        assert_eq!(
+            core.complete(start, LifecycleInput::StartCompleted(start, Ok(()))),
+            Err(VmState::Stopping)
+        );
+        assert_eq!(
+            core.complete(stop, LifecycleInput::StopCompleted(stop, Ok(()))),
+            Ok(())
+        );
+        assert_eq!(core.lifecycle.state(), VmState::Stopped);
+    }
+
+    /// REPAIR-5・TASK-64.4: 放棄後に遅れて届いた完了は、他の操作・停止通知がなければ状態機械に適用する。
+    #[test]
+    fn core_applies_late_completion_of_abandoned_operation() {
+        let (sink, rx) = event_channel(16);
+        let mut core = Core::new(sink);
+        let (mut ticket, start) =
+            begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        core.abandon(&mut ticket);
+        // 放棄直後の追従で、実状態がまだ Starting なら変化なし。
+        core.reconcile(VmState::Starting);
+        drain(&rx);
+        assert_eq!(
+            core.complete(start, LifecycleInput::StartCompleted(start, Ok(()))),
+            Ok(())
+        );
+        assert_eq!(
+            drain(&rx),
+            vec![changed(VmState::Starting, VmState::Running)]
+        );
+        // 受理は 1 回限り。
+        assert_eq!(
+            core.complete(start, LifecycleInput::StartCompleted(start, Ok(()))),
+            Err(VmState::Running)
+        );
+    }
+
+    /// REPAIR-5・TASK-64.4: 放棄後に停止通知が先着したら、遅れた起動完了で Running へ逆行しない。
+    #[test]
+    fn core_ignores_late_completion_after_abandon_and_guest_stop() {
+        let (sink, rx) = event_channel(16);
+        let mut core = Core::new(sink);
+        let (mut ticket, start) =
+            begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        core.abandon(&mut ticket);
+        core.apply(LifecycleInput::GuestStopped);
+        drain(&rx);
+        assert_eq!(
+            core.complete(start, LifecycleInput::StartCompleted(start, Ok(()))),
+            Err(VmState::Stopped)
+        );
+        assert_eq!(drain(&rx), Vec::<VmEvent>::new());
+        assert_eq!(core.lifecycle.state(), VmState::Stopped);
+    }
+
+    /// REPAIR-5・TASK-64.4: 完了済みの操作の放棄は何もしない（結果は確定済み）。
+    #[test]
+    fn core_abandon_after_completion_is_settled() {
+        let (sink, _rx) = event_channel(8);
+        let mut core = Core::new(sink);
+        let (mut ticket, start) =
+            begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        core.complete(start, LifecycleInput::StartCompleted(start, Ok(())))
+            .unwrap();
+        assert_eq!(core.abandon(&mut ticket), AbandonOutcome::Settled);
+        assert_eq!(core.lifecycle.state(), VmState::Running);
+        let mut rejected = OpTicket::Settled;
+        assert_eq!(core.abandon(&mut rejected), AbandonOutcome::Settled);
+    }
+
+    /// TASK-64.4: 進行中の操作がある間は実状態へ追従せず、ない間は差分を StateChanged で出す。
+    #[test]
+    fn core_reconcile_follows_actual_state_only_when_idle() {
+        let (sink, rx) = event_channel(8);
+        let mut core = Core::new(sink);
+        let (_, _start) = begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        drain(&rx);
+        core.reconcile(VmState::Running);
+        assert_eq!(core.lifecycle.state(), VmState::Starting);
+        assert_eq!(drain(&rx), Vec::<VmEvent>::new());
+        let (sink, rx) = event_channel(8);
+        let mut idle = Core::new(sink);
+        idle.reconcile(VmState::Running);
+        assert_eq!(
+            drain(&rx),
+            vec![changed(VmState::Stopped, VmState::Running)]
+        );
     }
 
     /// MAC-1・TASK-64.4: 停止通知が停止完了より先着しても、停止要求は正常終了として扱う。

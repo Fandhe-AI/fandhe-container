@@ -1278,6 +1278,18 @@ mod tests {
         extra_on_mount: bool,
         /// true なら nosuid,nodev を無視してマウントする（オプション不成立の模擬）。
         drop_nosuid: bool,
+        /// n 回目の mount 呼び出しを `TIMEOUT` にする（`wsl.exe` の待機タイムアウトの模擬）。
+        timeout_mount_nth: Option<usize>,
+        /// true なら `timeout_mount_nth` のタイムアウト前にゲスト内の mount が成立している。
+        timeout_mount_lands: bool,
+        /// mount 後の mountinfo 読み取りを先頭から何回失敗させるか（一過性の失敗の模擬）。
+        fail_cat_times: usize,
+        /// mountinfo 読み取りの呼び出し回数。
+        cat_calls: usize,
+        /// `Some(landed)` なら umount を `TIMEOUT` にする。`landed` が true なら解除自体は成立している。
+        umount_timeout: Option<bool>,
+        /// `Some(code)` なら mount を成立させたうえで終了コード `code` の失敗を返す（16 等の不確定な失敗の模擬）。
+        landed_exit_code: Option<i32>,
     }
 
     impl Guest {
@@ -1299,11 +1311,35 @@ mod tests {
                 ignore_ro: false,
                 extra_on_mount: false,
                 drop_nosuid: false,
+                timeout_mount_nth: None,
+                timeout_mount_lands: false,
+                fail_cat_times: 0,
+                cat_calls: 0,
+                umount_timeout: None,
+                landed_exit_code: None,
             }
+        }
+
+        fn timeout() -> Result<run::Captured, Wsl2Error> {
+            Err(Wsl2Error::new(
+                Wsl2ErrorCode::Timeout,
+                "wsl.exe did not finish before the deadline",
+            ))
         }
 
         fn run(&mut self, args: &[String], _max: usize) -> Result<run::Captured, Wsl2Error> {
             let cmd: Vec<&str> = args.iter().skip(5).map(String::as_str).collect();
+            if matches!(cmd.as_slice(), ["cat", _]) {
+                self.cat_calls += 1;
+            }
+            let fail_cat = |code| {
+                Ok(run::Captured {
+                    success: false,
+                    code: Some(code),
+                    stdout: vec![],
+                    stderr: vec![],
+                })
+            };
             let ok = |stdout: String| {
                 Ok(run::Captured {
                     success: true,
@@ -1313,13 +1349,10 @@ mod tests {
                 })
             };
             match cmd.as_slice() {
-                ["cat", _] if self.fail_cat_after_mount && self.mount_calls > 0 => {
-                    Ok(run::Captured {
-                        success: false,
-                        code: Some(1),
-                        stdout: vec![],
-                        stderr: vec![],
-                    })
+                ["cat", _] if self.fail_cat_after_mount && self.mount_calls > 0 => fail_cat(1),
+                ["cat", _] if self.fail_cat_times > 0 && self.mount_calls > 0 => {
+                    self.fail_cat_times -= 1;
+                    fail_cat(1)
                 }
                 ["cat", _] => ok(self
                     .mounts
@@ -1364,6 +1397,10 @@ mod tests {
                     }
                     let target = target.as_str();
                     self.mount_calls += 1;
+                    let timed_out = self.timeout_mount_nth == Some(self.mount_calls);
+                    if timed_out && !self.timeout_mount_lands {
+                        return Self::timeout();
+                    }
                     if self.fail_mount_nth == Some(self.mount_calls) {
                         return Ok(run::Captured {
                             success: false,
@@ -1390,14 +1427,26 @@ mod tests {
                         self.opts.push("rw".into());
                         self.next_id += 1;
                     }
+                    if timed_out {
+                        return Self::timeout();
+                    }
+                    if let Some(code) = self.landed_exit_code {
+                        return fail_cat(code);
+                    }
                     ok(String::new())
                 }
                 ["umount", target] => {
                     self.umounts.push((*target).to_string());
+                    if self.umount_timeout == Some(false) {
+                        return Self::timeout();
+                    }
                     if let Some(i) = self.mounts.iter().rposition(|(p, _)| p == target) {
                         self.mounts.remove(i);
                         self.ids.remove(i);
                         self.opts.remove(i);
+                    }
+                    if self.umount_timeout == Some(true) {
+                        return Self::timeout();
                     }
                     ok(String::new())
                 }
@@ -1563,6 +1612,8 @@ mod tests {
         assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
         assert!(e.message().contains("ownership unconfirmed"));
         assert!(g.umounts.is_empty());
+        // REPAIR-5: 回復の読み直しは上限回数で打ち切る（mount 前の 1 回 + 回復の MAX_RECOVERY_READS 回）。
+        assert_eq!(g.cat_calls, 1 + MAX_RECOVERY_READS);
     }
 
     /// SEC: 同じマウント先へ別マウントが積まれて一意に特定できない場合は解除せず失敗する。
@@ -1715,5 +1766,136 @@ mod tests {
         .unwrap();
         assert_eq!(v, 2);
         assert!(g.umounts.is_empty());
+    }
+
+    /// SEC・REPAIR-5: mount 成立後に `wsl.exe` の待機がタイムアウトしても、mountinfo を読み直して
+    /// 自分のマウントを特定し、ロールバックで外す（元のタイムアウトのエラーを返す）。
+    #[test]
+    fn prepare_recovers_and_rolls_back_mount_after_timeout() {
+        let mut g = Guest::new("virtiofs");
+        g.timeout_mount_nth = Some(1);
+        g.timeout_mount_lands = true;
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert_eq!(e.message(), "wsl.exe did not finish before the deadline");
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+        assert_eq!(g.mounts, [("/".to_string(), "ext4".to_string())]);
+    }
+
+    /// REPAIR-5: タイムアウトしたがマウントが成立していなければ、何も外さず元のエラーを返す。
+    #[test]
+    fn prepare_timeout_without_mount_unmounts_nothing() {
+        let mut g = Guest::new("virtiofs");
+        g.timeout_mount_nth = Some(1);
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert_eq!(e.message(), "wsl.exe did not finish before the deadline");
+        assert!(g.umounts.is_empty());
+        assert_eq!(g.mounts.len(), 1);
+        // mount 前の 1 回 + 回復の 1 回（読めたので再試行しない）。
+        assert_eq!(g.cat_calls, 2);
+    }
+
+    /// SEC: タイムアウト後に新規マウントが複数あって自分のものを特定できなければ、外さず未確認として返す。
+    #[test]
+    fn prepare_timeout_with_ambiguous_mounts_fails_closed() {
+        let mut g = Guest::new("virtiofs");
+        g.timeout_mount_nth = Some(1);
+        g.timeout_mount_lands = true;
+        g.extra_on_mount = true;
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert_eq!(
+            e.message(),
+            "wsl.exe did not finish before the deadline (mount ownership unconfirmed; the mount may have been left in place)"
+        );
+        assert!(g.umounts.is_empty());
+        assert_eq!(g.mounts.len(), 3);
+    }
+
+    /// SEC・REPAIR-5: タイムアウト後に mountinfo を上限回数まで読めなければ、外さず未確認として返す。
+    #[test]
+    fn prepare_timeout_with_unreadable_mountinfo_fails_closed() {
+        let mut g = Guest::new("virtiofs");
+        g.timeout_mount_nth = Some(1);
+        g.timeout_mount_lands = true;
+        g.fail_cat_after_mount = true;
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert!(
+            e.message().contains("ownership unconfirmed"),
+            "{}",
+            e.message()
+        );
+        assert!(g.umounts.is_empty());
+        assert_eq!(g.cat_calls, 1 + MAX_RECOVERY_READS);
+    }
+
+    /// SEC: 2 件目の mount がタイムアウトしても、回復した 2 件目と成立済みの 1 件目を逆順に外す。
+    #[test]
+    fn prepare_timeout_midway_rolls_back_all_owned_mounts() {
+        let mut g = Guest::new("virtiofs");
+        g.timeout_mount_nth = Some(2);
+        g.timeout_mount_lands = true;
+        let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", false)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert_eq!(g.umounts, ["/mnt/fandhe/b", "/mnt/fandhe/a"]);
+        assert_eq!(g.mounts.len(), 1);
+    }
+
+    /// REPAIR-5: mount 後の mountinfo 読み取りが一過性に失敗しても、再試行で所有を確認して準備を続ける。
+    #[test]
+    fn prepare_retries_transient_mountinfo_failure() {
+        let mut g = Guest::new("virtiofs");
+        g.fail_cat_times = 1;
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
+        assert_eq!(
+            p.mounts(),
+            [PreparedMount {
+                guest_path: "/mnt/fandhe/a".into(),
+                mount_id: 100,
+                read_only: false
+            }]
+        );
+        assert!(g.umounts.is_empty());
+        // mount 前 1 回 + 所有確認 2 回（1 回失敗）+ 検証 1 回。
+        assert_eq!(g.cat_calls, 4);
+    }
+
+    /// SEC: mount(8) の終了コードがマウント成立と両立しうる値（16）なら、読み直して成立分を外す。
+    #[test]
+    fn prepare_rolls_back_mount_with_uncertain_exit_code() {
+        let mut g = Guest::new("virtiofs");
+        g.landed_exit_code = Some(16);
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "mounting the shared directory failed in the distribution (exit code 16)"
+        );
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+        assert_eq!(g.mounts.len(), 1);
+    }
+
+    /// REPAIR-5: umount がタイムアウトしても、読み直して自分のマウント ID が消えていれば解除済みとし、
+    /// 残っていれば失敗に数える。
+    #[test]
+    fn release_rechecks_after_umount_timeout() {
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        for (landed, want) in [(true, 0), (false, 1)] {
+            let mut g = Guest::new("virtiofs");
+            let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
+            g.umount_timeout = Some(landed);
+            let failures = release_with_exec(&p, &mut |a, m| g.run(a, m));
+            assert_eq!(failures, want, "landed={landed}");
+            assert_eq!(g.umounts, ["/mnt/fandhe/a"], "landed={landed}");
+        }
     }
 }

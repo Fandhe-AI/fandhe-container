@@ -57,7 +57,7 @@ pub enum Wsl2ErrorCode {
     DataLoss,
     /// 出力量・件数・行長が上限を超えた。
     ResourceExhausted,
-    /// 起動権限がない。
+    /// 起動権限がない、または WSL がアクセス拒否（`E_ACCESSDENIED` 等）を返した。
     PermissionDenied,
     /// Windows 以外の OS。
     Unimplemented,
@@ -293,16 +293,29 @@ fn interpret_list(out: &run::Captured) -> Result<Vec<WslDistro>, Wsl2Error> {
 fn failure_error(out: &run::Captured, context: &str) -> Wsl2Error {
     match parse::classify_failure(out) {
         parse::Failure::WslDisabled => not_enabled_error(),
+        parse::Failure::PermissionDenied => Wsl2Error::new(
+            Wsl2ErrorCode::PermissionDenied,
+            format!(
+                "{context}: access denied (exit code {}). Output: {}",
+                exit_code_str(out),
+                parse::excerpt(out)
+            ),
+        ),
         _ => Wsl2Error::new(
             Wsl2ErrorCode::FailedPrecondition,
             format!(
                 "{context} (exit code {}); the inbox wsl.exe may be too old, try 'wsl --update'. Output: {}",
-                out.code
-                    .map_or_else(|| "none".to_string(), |c| c.to_string()),
+                exit_code_str(out),
                 parse::excerpt(out)
             ),
         ),
     }
+}
+
+/// エラーメッセージ用の終了コード表記（終了コードがなければ `none`）。
+fn exit_code_str(out: &run::Captured) -> String {
+    out.code
+        .map_or_else(|| "none".to_string(), |c| c.to_string())
 }
 
 /// バージョンとディストリ一覧から WSL2 の利用可否を判定する（純粋関数）。
@@ -419,7 +432,7 @@ mod tests {
         // HRESULT を伴わない別の識別子の併記も失敗のまま（空の一覧にしない。ERR-1）。
         let denied = format!("{msg}\nError code: Wsl/Service/E_ACCESSDENIED");
         let e = interpret_list(&cap(false, &denied)).unwrap_err();
-        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(e.code(), Wsl2ErrorCode::PermissionDenied);
         assert!(interpret_list(&cap(true, &denied)).is_err());
     }
 

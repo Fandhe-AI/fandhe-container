@@ -25,6 +25,8 @@ const MAX_STATE_CHARS: usize = 32;
 pub(super) enum Failure {
     /// WSL 機能または仮想マシン プラットフォームが無効。
     WslDisabled,
+    /// WSL がアクセス拒否（`E_ACCESSDENIED` 等）を返した。
+    PermissionDenied,
     /// ディストリが 1 件もない。
     NoDistro,
     /// 上記以外。
@@ -301,10 +303,15 @@ pub(super) fn classify_failure(out: &Captured) -> Failure {
         "0x80370102",
         "wsl_e_vmcompute_not_ready",
     ];
+    // アクセス拒否（`E_ACCESSDENIED`・Win32 の `ERROR_ACCESS_DENIED`・その HRESULT `0x80070005`）。
+    const ACCESS_DENIED: [&str; 3] = ["e_accessdenied", "error_access_denied", "0x80070005"];
     // ロケール依存の説明文は使わず、専用のエラー識別子のみで 0 件を判定する。
     const NO_DISTRO: &str = "wsl_e_default_distro_not_found";
-    if DISABLED.iter().any(|t| text.contains(t)) {
+    let has_id = |ids: &[&str]| error_id_tokens(&text).any(|t| ids.contains(&t));
+    if has_id(&DISABLED) {
         Failure::WslDisabled
+    } else if has_id(&ACCESS_DENIED) {
+        Failure::PermissionDenied
     } else if only_error_id_is(&text, NO_DISTRO) {
         Failure::NoDistro
     } else {
@@ -323,19 +330,27 @@ pub(super) fn classify_failure(out: &Captured) -> Failure {
 /// （`wsl.exe --list --online`・`https://aka.ms/wslstore` 等）は `_` を含まないので対象外。
 fn only_error_id_is(text: &str, expected: &str) -> bool {
     let mut found = false;
-    for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-        let is_hex = token
-            .strip_prefix("0x")
-            .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()));
-        if !(token.contains('_') || is_hex) {
-            continue;
-        }
+    for token in error_id_tokens(text) {
         if token != expected {
             return false;
         }
         found = true;
     }
     found
+}
+
+/// `text`（小文字化済み）からエラー識別子の形をしたトークンを列挙する（判定規則は [`only_error_id_is`]）。
+///
+/// 分類（無効・アクセス拒否・0 件）はすべてこのトークンとの完全一致で行い、部分一致で別の識別子を
+/// 取り違えないようにする。
+fn error_id_tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| {
+            let is_hex = token
+                .strip_prefix("0x")
+                .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()));
+            token.contains('_') || is_hex
+        })
 }
 
 /// エラーメッセージに載せる出力の抜粋。印字可能 ASCII 以外は `?` にし、128 バイト以下に切る。
@@ -594,13 +609,16 @@ mod tests {
                 false,
             ),
         );
-        assert_eq!(classify_failure(&mixed), Failure::Unknown);
+        assert_eq!(classify_failure(&mixed), Failure::PermissionDenied);
         // HRESULT を伴わない別の識別子（`E_ACCESSDENIED`）の併記も 0 件扱いにしない。
-        for other in [
-            "Error code: Wsl/Service/E_ACCESSDENIED",
-            "ERROR_FILE_NOT_FOUND",
-            "RPC_S_SERVER_UNAVAILABLE",
-            "Wsl/Service/0x80070005",
+        for (other, want) in [
+            (
+                "Error code: Wsl/Service/E_ACCESSDENIED",
+                Failure::PermissionDenied,
+            ),
+            ("ERROR_FILE_NOT_FOUND", Failure::Unknown),
+            ("RPC_S_SERVER_UNAVAILABLE", Failure::Unknown),
+            ("Wsl/Service/0x80070005", Failure::PermissionDenied),
         ] {
             let mixed = cap(
                 false,
@@ -610,7 +628,7 @@ mod tests {
                     false,
                 ),
             );
-            assert_eq!(classify_failure(&mixed), Failure::Unknown, "{other}");
+            assert_eq!(classify_failure(&mixed), want, "{other}");
         }
         // 0 件時の案内文（コマンド例・URL を含む）は識別子として拾わず、0 件と判定する。
         let full = cap(false, NO_DISTRO_FULL.as_bytes(), b"");

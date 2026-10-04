@@ -23,8 +23,18 @@ pub(super) struct Captured {
     pub(super) stderr: Vec<u8>,
 }
 
-/// 1 本のパイプの読み取り結果（バイト列と上限超過フラグ）。
-type Pipe = (Vec<u8>, bool);
+/// kill 後に子の終了を待つ上限（REPAIR-5）。超えたら回収不能として `INTERNAL` で返す。
+const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 1 本のパイプの読み取り結果。
+struct Pipe {
+    /// 読み取れたバイト列（上限超過時は途中まで）。
+    buf: Vec<u8>,
+    /// `max_bytes` を超えたか。
+    overflow: bool,
+    /// `read()` が EOF 以外のエラーで終わったか（途中出力を成功として返さないための印）。
+    io_error: bool,
+}
 
 /// パイプを `max_bytes` を超えるまで読み、上限超過かどうかと一緒に送る。
 fn spawn_reader<R: Read + Send + 'static>(mut r: R, max_bytes: usize) -> Receiver<Pipe> {
@@ -33,11 +43,20 @@ fn spawn_reader<R: Read + Send + 'static>(mut r: R, max_bytes: usize) -> Receive
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         let mut overflow = false;
+        let mut io_error = false;
         loop {
             match r.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    io_error = true;
+                    break;
+                }
                 Ok(n) => {
-                    let Some(part) = chunk.get(..n) else { break };
+                    let Some(part) = chunk.get(..n) else {
+                        io_error = true;
+                        break;
+                    };
                     buf.extend_from_slice(part);
                     if buf.len() > max_bytes {
                         overflow = true;
@@ -46,14 +65,50 @@ fn spawn_reader<R: Read + Send + 'static>(mut r: R, max_bytes: usize) -> Receive
                 }
             }
         }
-        let _ = tx.send((buf, overflow));
+        let _ = tx.send(Pipe {
+            buf,
+            overflow,
+            io_error,
+        });
     });
     rx
 }
 
-fn kill_and_reap(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+/// 子を kill して `REAP_TIMEOUT` 以内に回収する。kill の失敗は無視せず、回収できるまで待つ
+/// （既に終了していれば kill は失敗しうるが、その場合は回収に成功する）。
+/// 回収できなければ `INTERNAL`（無期限に `wait()` しない。REPAIR-5）。
+fn kill_and_reap(child: &mut Child) -> Result<(), Wsl2Error> {
+    let kill_result = child.kill();
+    let deadline = Instant::now() + REAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(_) => {
+                return Err(Wsl2Error::new(
+                    Wsl2ErrorCode::Internal,
+                    "failed to reap wsl.exe after kill",
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            let msg = if kill_result.is_err() {
+                "failed to kill wsl.exe; the process was not reaped"
+            } else {
+                "wsl.exe was not reaped before the reap deadline"
+            };
+            return Err(Wsl2Error::new(Wsl2ErrorCode::Internal, msg));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 子を kill・回収したうえで `err` を返す。回収に失敗したときはそのエラーを優先する。
+fn abort_with(child: &mut Child, err: Wsl2Error) -> Wsl2Error {
+    match kill_and_reap(child) {
+        Ok(()) => err,
+        Err(reap_err) => reap_err,
+    }
 }
 
 fn spawn_error(e: &std::io::Error) -> Wsl2Error {
@@ -96,10 +151,9 @@ pub(super) fn run_capture(
     }
     let mut child = cmd.spawn().map_err(|e| spawn_error(&e))?;
     let (Some(out_pipe), Some(err_pipe)) = (child.stdout.take(), child.stderr.take()) else {
-        kill_and_reap(&mut child);
-        return Err(Wsl2Error::new(
-            Wsl2ErrorCode::Internal,
-            "failed to capture output pipes",
+        return Err(abort_with(
+            &mut child,
+            Wsl2Error::new(Wsl2ErrorCode::Internal, "failed to capture output pipes"),
         ));
     };
     let out_rx = spawn_reader(out_pipe, max_bytes);
@@ -115,21 +169,28 @@ pub(super) fn run_capture(
         if err.is_none() {
             err = err_rx.try_recv().ok();
         }
-        if out.as_ref().is_some_and(|o| o.1) || err.as_ref().is_some_and(|e| e.1) {
-            kill_and_reap(&mut child);
-            return Err(Wsl2Error::new(
-                Wsl2ErrorCode::ResourceExhausted,
-                "wsl.exe output exceeded the size limit",
+        if out.as_ref().is_some_and(|o| o.io_error) || err.as_ref().is_some_and(|e| e.io_error) {
+            return Err(abort_with(
+                &mut child,
+                Wsl2Error::new(Wsl2ErrorCode::Internal, "failed to read wsl.exe output"),
+            ));
+        }
+        if out.as_ref().is_some_and(|o| o.overflow) || err.as_ref().is_some_and(|e| e.overflow) {
+            return Err(abort_with(
+                &mut child,
+                Wsl2Error::new(
+                    Wsl2ErrorCode::ResourceExhausted,
+                    "wsl.exe output exceeded the size limit",
+                ),
             ));
         }
         if status.is_none() {
             match child.try_wait() {
                 Ok(s) => status = s,
                 Err(_) => {
-                    kill_and_reap(&mut child);
-                    return Err(Wsl2Error::new(
-                        Wsl2ErrorCode::Internal,
-                        "failed to wait for wsl.exe",
+                    return Err(abort_with(
+                        &mut child,
+                        Wsl2Error::new(Wsl2ErrorCode::Internal, "failed to wait for wsl.exe"),
                     ));
                 }
             }
@@ -138,15 +199,17 @@ pub(super) fn run_capture(
             return Ok(Captured {
                 success: s.success(),
                 code: s.code(),
-                stdout: o.0.clone(),
-                stderr: e.0.clone(),
+                stdout: o.buf.clone(),
+                stderr: e.buf.clone(),
             });
         }
         if Instant::now() >= deadline {
-            kill_and_reap(&mut child);
-            return Err(Wsl2Error::new(
-                Wsl2ErrorCode::Timeout,
-                "wsl.exe did not finish before the deadline",
+            return Err(abort_with(
+                &mut child,
+                Wsl2Error::new(
+                    Wsl2ErrorCode::Timeout,
+                    "wsl.exe did not finish before the deadline",
+                ),
             ));
         }
         // 短い間隔のポーリング。期限は上のチェックで保証される。
@@ -208,6 +271,38 @@ mod tests {
         assert!(o.success);
         assert_eq!(o.code, Some(0));
         assert!(!o.stdout.is_empty());
+    }
+
+    /// 読み取りエラーは EOF と区別され、途中出力と一緒に io_error として報告される。
+    #[test]
+    fn reader_reports_io_error() {
+        struct Failing(bool);
+        impl Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("boom"));
+                }
+                self.0 = true;
+                buf[..3].copy_from_slice(b"abc");
+                Ok(3)
+            }
+        }
+        let p = spawn_reader(Failing(false), 1024)
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(p.io_error);
+        assert!(!p.overflow);
+        assert_eq!(p.buf, b"abc");
+    }
+
+    /// 正常な EOF は io_error にならない。
+    #[test]
+    fn reader_eof_is_not_error() {
+        let p = spawn_reader(&b"hello"[..], 1024)
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(!p.io_error);
+        assert_eq!(p.buf, b"hello");
     }
 
     /// WIN-1: 存在しないパスは NOT_FOUND。

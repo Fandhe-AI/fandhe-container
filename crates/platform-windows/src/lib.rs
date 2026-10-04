@@ -15,5 +15,7 @@
 //! PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 
 pub mod error;
+#[cfg(windows)]
+mod sys;
 pub mod wsl2;
 pub mod wslconfig;

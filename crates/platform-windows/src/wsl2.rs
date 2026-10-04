@@ -11,8 +11,8 @@
 //! - `run`: タイムアウトと出力量上限つきの外部プロセス実行器（REPAIR-5）
 //! - 本ファイル: 公開 API・エラー型・`wsl.exe` のパス解決（`cfg(windows)` で分岐するのはここだけ）
 //!
-//! 安全性: シェルを介さず固定の引数配列で起動し、`PATH` 探索はしない（`%SystemRoot%\System32\wsl.exe`
-//! の絶対パスのみ）。`wsl.exe` の出力は untrusted として扱い、不明な形式は fail-closed で `Err` にする。
+//! 安全性: シェルを介さず固定の引数配列で起動し、`PATH` 探索はしない（`GetSystemDirectoryW` が返す
+//! システムディレクトリ配下の `wsl.exe` の絶対パスのみ）。`wsl.exe` の出力は untrusted として扱い、不明な形式は fail-closed で `Err` にする。
 //! 管理者権限を要する WSL の有効化はせず、手順の案内だけを返す。
 //!
 //! エラー型は本モジュール内に置いた暫定版で、crate 共通の構造化エラーは TASK-67.5（#376）で
@@ -307,19 +307,20 @@ fn evaluate(version: WslVersionInfo, distros: Vec<WslDistro>) -> Result<Wsl2Stat
     Ok(status)
 }
 
-/// `wsl.exe` の絶対パスを `%SystemRoot%\System32\wsl.exe` から解決する（`PATH` 探索はしない）。
+/// `wsl.exe` の絶対パスを `GetSystemDirectoryW` が返すシステムディレクトリから解決する（`PATH` 探索はしない）。
 ///
-/// 64bit ターゲット前提（32bit プロセスでは WOW64 リダイレクトで System32 の見え方が変わる）。
+/// 環境変数 `SystemRoot` は起動元が任意に差し替えられるため使わない（任意ディレクトリの
+/// `wsl.exe` 実行を防ぐ）。64bit ターゲット前提（32bit プロセスでは WOW64 リダイレクトで
+/// System32 の見え方が変わる）。
 #[cfg(windows)]
 fn wsl_exe_path() -> Result<PathBuf, Wsl2Error> {
-    let root = std::env::var_os("SystemRoot").map(PathBuf::from);
-    let Some(root) = root.filter(|p| p.is_absolute()) else {
+    let Some(dir) = crate::sys::system_directory() else {
         return Err(Wsl2Error::new(
-            Wsl2ErrorCode::FailedPrecondition,
-            "SystemRoot is not set to an absolute path",
+            Wsl2ErrorCode::Internal,
+            "failed to query the Windows system directory",
         ));
     };
-    let path = root.join("System32").join("wsl.exe");
+    let path = dir.join("wsl.exe");
     if !path.is_file() {
         return Err(Wsl2Error::new(
             Wsl2ErrorCode::NotFound,

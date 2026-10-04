@@ -150,9 +150,75 @@ fn parse_state(tokens: &[&str]) -> DistroState {
     }
 }
 
+/// ヘッダー行から 2 列目（STATE）が始まる文字位置を返す（列境界。空白区切りの 2 番目のトークン）。
+fn state_column_start(header: &str) -> Option<usize> {
+    let mut seen = 0;
+    let mut prev_space = true;
+    for (i, c) in header.chars().enumerate() {
+        let space = c.is_whitespace();
+        if !space && prev_space {
+            seen += 1;
+            if seen == 2 {
+                return Some(i);
+            }
+        }
+        prev_space = space;
+    }
+    None
+}
+
+/// 1 行を（既定フラグ, 名前, 状態トークン列, バージョントークン）へ分ける。
+///
+/// ヘッダーの STATE 列の開始位置（`state_col`）で名前と状態を分け、空白を含むディストリ名を
+/// 切り詰めない。位置が合わない行（全角幅の差などで列がずれた場合）は、末尾 2 トークンを
+/// 状態・バージョンとみなし、残りを名前とする（この場合の状態は 1 語のみ）。
+fn split_row(line: &str, state_col: usize) -> Option<(bool, String, String, String)> {
+    let mut chars: Vec<char> = line.chars().collect();
+    let first = chars.iter().position(|c| !c.is_whitespace())?;
+    let is_default = first < state_col && chars.get(first) == Some(&'*');
+    if is_default {
+        // 位置を保つため '*' は空白に置き換える。
+        *chars.get_mut(first)? = ' ';
+    }
+    let aligned = state_col > 0
+        && chars.get(state_col).is_some_and(|c| !c.is_whitespace())
+        && chars.get(state_col - 1).is_some_and(|c| c.is_whitespace());
+    if aligned {
+        let name: String = chars.get(..state_col)?.iter().collect();
+        let rest: String = chars.get(state_col..)?.iter().collect();
+        let rest = rest.trim();
+        let (state, ver) = rest.rsplit_once(char::is_whitespace)?;
+        let name = name.trim();
+        let state = state.trim();
+        if name.is_empty() || state.is_empty() {
+            return None;
+        }
+        return Some((
+            is_default,
+            name.to_string(),
+            state.to_string(),
+            ver.to_string(),
+        ));
+    }
+    let all: String = chars.iter().collect();
+    let (head, ver) = all.trim().rsplit_once(char::is_whitespace)?;
+    let (name, state) = head.trim_end().rsplit_once(char::is_whitespace)?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some((
+        is_default,
+        name.to_string(),
+        state.to_string(),
+        ver.to_string(),
+    ))
+}
+
 /// `wsl -l -v` の出力からディストリ一覧を取り出す（ヘッダーのみなら空）。
 ///
-/// ヘッダー行は読み飛ばし、各行は「（`*`）名前 状態… バージョン」を位置ベースで解析する。
+/// ヘッダー行は読み飛ばし、各行はヘッダーの列境界で「（`*`）名前 / 状態 / バージョン」に分ける
+/// （空白を含む名前を保つ。位置が合わない行は末尾 2 トークンで分ける）。
 pub(super) fn parse_distros(text: &str) -> Result<Vec<WslDistro>, Wsl2Error> {
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     let header = lines
@@ -162,6 +228,8 @@ pub(super) fn parse_distros(text: &str) -> Result<Vec<WslDistro>, Wsl2Error> {
     if header.split_whitespace().count() < 3 {
         return Err(data_loss("unrecognized `wsl -l -v` header"));
     }
+    let state_col =
+        state_column_start(header).ok_or_else(|| data_loss("unrecognized `wsl -l -v` header"))?;
     let mut distros = Vec::new();
     for line in lines {
         check_line_len(line)?;
@@ -171,33 +239,21 @@ pub(super) fn parse_distros(text: &str) -> Result<Vec<WslDistro>, Wsl2Error> {
                 "too many distributions in output",
             ));
         }
-        let trimmed = line.trim_start();
-        let (is_default, rest) = match trimmed.strip_prefix('*') {
-            Some(r) => (true, r),
-            None => (false, trimmed),
-        };
-        let tokens: Vec<&str> = rest.split_whitespace().collect();
-        let (Some(name), Some(ver), Some(state)) = (
-            tokens.first(),
-            tokens.last(),
-            tokens.get(1..tokens.len().saturating_sub(1)),
-        ) else {
+        let Some((is_default, name, state, ver)) = split_row(line, state_col) else {
             return Err(data_loss("unrecognized distribution row"));
         };
-        if tokens.len() < 3 || state.is_empty() {
-            return Err(data_loss("unrecognized distribution row"));
-        }
         if name.chars().count() > MAX_NAME_CHARS || name.chars().any(|c| c.is_control()) {
             return Err(data_loss("distribution name has an unexpected format"));
         }
-        let version = match *ver {
+        let version = match ver.as_str() {
             "1" => WslMajorVersion::V1,
             "2" => WslMajorVersion::V2,
             _ => return Err(data_loss("unsupported WSL version in distribution row")),
         };
+        let state_tokens: Vec<&str> = state.split_whitespace().collect();
         distros.push(WslDistro {
-            name: (*name).to_string(),
-            state: parse_state(state),
+            name,
+            state: parse_state(&state_tokens),
             version,
             is_default,
         });
@@ -367,12 +423,32 @@ mod tests {
     /// ローカライズされた状態語・ヘッダーのみ。
     #[test]
     fn list_localized_and_empty() {
-        let ja =
-            "  名前     状態      バージョン\n* Ubuntu   実行中    2\n  Deb      Foo Bar   2\n";
+        let ja = "  名前     状態      バージョン\n* Ubuntu 実行中    2\n  Deb    Foo Bar   2\n";
+        // 列がずれた行（全角幅の差など）でも末尾 2 トークンで分けられる。
+        let d = parse_distros("  名前 状態 バージョン\n  Deb 停止 2\n").unwrap();
+        assert_eq!(d[0].name, "Deb");
+        assert_eq!(d[0].state, DistroState::Stopped);
         let d = parse_distros(ja).unwrap();
         assert_eq!(d[0].state, DistroState::Running);
         assert_eq!(d[1].state, DistroState::Other("Foo Bar".into()));
         assert!(parse_distros("  NAME STATE VERSION\n").unwrap().is_empty());
+    }
+
+    /// 空白を含むディストリ名は列境界で保たれ、状態に混入しない。
+    #[test]
+    fn list_name_with_spaces() {
+        let t = "  NAME              STATE           VERSION\n* My Distro Name    Running         2\n  Other One         Stopped         1\n";
+        let d = parse_distros(t).unwrap();
+        assert_eq!(d[0].name, "My Distro Name");
+        assert!(d[0].is_default);
+        assert_eq!(d[0].state, DistroState::Running);
+        assert_eq!(d[1].name, "Other One");
+        assert_eq!(d[1].state, DistroState::Stopped);
+        assert_eq!(d[1].version, WslMajorVersion::V1);
+        // 列がずれた行でも名前は切り詰めない。
+        let d = parse_distros("NAME STATE VERSION\nMy Distro Running 2\n").unwrap();
+        assert_eq!(d[0].name, "My Distro");
+        assert_eq!(d[0].state, DistroState::Running);
     }
 
     /// 異常系: ごみ・バージョン 3・トークン不足・件数超過は Err。

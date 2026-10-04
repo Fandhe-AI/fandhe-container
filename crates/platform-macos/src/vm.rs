@@ -16,8 +16,9 @@
 //! 受け付ける。受付時には VZ の実状態を読んで状態機械を追従させる。放棄後に届いた完了通知は、別の操作や停止
 //! 通知に追い越されていなければ状態機械にだけ適用する（呼び出し元へは返らない）。
 //!
-//! 破棄時の停止: `Vm` の `Drop` は実行中の VM に停止を要求する（ブロックしない）。結果はイベントとして
-//! 配送され、失敗は `VmEvent::StopOnDropFailed` で記録する。
+//! 破棄時の停止: `Vm` の `Drop` は実行中の VM に停止を要求する（ブロックしない）。失敗したら間隔を空けて
+//! 最大 `DROP_STOP_MAX_ATTEMPTS` 回まで要求し直し、それでも止まらなければ `VmEvent::StopOnDropFailed` で
+//! 記録したうえで VM オブジェクトの解放（VZ 側の後始末）に委ねる。
 //!
 //! 注意: `start` / `stop` / `state` を VM キュー上（イベント処理の中など）から呼ぶとデッドロックする。
 //! 最後の防壁としてタイムアウトが `VmError::Timeout` を返す。
@@ -35,6 +36,9 @@ type ErrInfo = (String, isize);
 
 /// イベントチャネルの容量。溢れた分は `VmEvent::EventsDropped` で通知する。
 pub const EVENT_CHANNEL_CAPACITY: usize = 64;
+
+/// `Vm` の破棄時に停止を要求する最大回数（初回を含む）。失敗し続ける VM への要求を有界に保つ。
+pub const DROP_STOP_MAX_ATTEMPTS: u32 = 3;
 
 /// start / stop の待機タイムアウトの暫定値。既定値の確定とクリーンアップは TASK-64.5。
 pub const PROVISIONAL_OP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -88,8 +92,13 @@ pub enum VmEvent {
     StoppedWithError { domain: String, code: isize },
     /// チャネルが溢れて `count` 件のイベントを落とした（送れるようになった時点で 1 回通知する）。
     EventsDropped { count: u64 },
-    /// `Vm` の破棄時に要求した停止が失敗した（VM は動作を続けている可能性がある）。
-    StopOnDropFailed { domain: String, code: isize },
+    /// `Vm` の破棄時に要求した停止が `attempts` 回とも失敗した（最後の失敗の要約。VM は動作を続けている
+    /// 可能性がある）。
+    StopOnDropFailed {
+        domain: String,
+        code: isize,
+        attempts: u32,
+    },
 }
 
 /// 失敗した操作の種別。
@@ -463,6 +472,8 @@ pub(crate) struct Core {
     sink: EventSink,
     /// `Vm` が破棄され、停止を要求すべき状態か（破棄時に停止できなかった場合も、後の完了通知で再試行する）。
     drop_requested: bool,
+    /// 破棄時の停止を要求した回数（`DROP_STOP_MAX_ATTEMPTS` で打ち切る）。
+    drop_stop_attempts: u32,
 }
 
 // macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
@@ -473,6 +484,7 @@ impl Core {
             lifecycle: Lifecycle::new(),
             sink,
             drop_requested: false,
+            drop_stop_attempts: 0,
         }
     }
 
@@ -567,11 +579,16 @@ impl Core {
     ///
     /// 破棄済みの印は常に付ける。`can_stop` が false（起動途中等）または完了待ちの操作がある間は要求せず、
     /// 後でその操作の完了通知が `drop_stop_due` を見て再試行する（起動完了後に動き続けるのを防ぐ）。
+    /// 要求回数が `DROP_STOP_MAX_ATTEMPTS` に達したら以後は要求しない。
     pub(crate) fn request_drop_stop(&mut self, can_stop: bool, actual: VmState) -> Option<u64> {
         self.drop_requested = true;
-        if !can_stop || self.lifecycle.has_in_flight() {
+        if !can_stop
+            || self.lifecycle.has_in_flight()
+            || self.drop_stop_attempts >= DROP_STOP_MAX_ATTEMPTS
+        {
             return None;
         }
+        self.drop_stop_attempts = self.drop_stop_attempts.saturating_add(1);
         self.reconcile(actual);
         self.apply(LifecycleInput::StopRequested);
         Some(self.lifecycle.generation())
@@ -582,20 +599,32 @@ impl Core {
         self.drop_requested && !self.lifecycle.has_in_flight()
     }
 
-    /// 破棄時の停止の完了を適用し、失敗は `StopOnDropFailed` として記録する（呼び出し元はもういないため）。
+    /// 破棄時の停止の完了を適用する。失敗して要求回数が残っていれば `true`（呼び出し元が間隔を空けて
+    /// `request_drop_stop` からやり直す）。
     ///
-    /// 受信側が `Vm` とともに破棄されている・満杯でイベントが届かない場合は、失敗を見失わないよう
-    /// 構造化ログ（1 行 1 JSON）を stderr へ出す（REPAIR-4）。
-    pub(crate) fn finish_drop_stop(&mut self, generation: u64, res: Result<(), ErrInfo>) {
+    /// 回数を使い切った失敗は `StopOnDropFailed` として記録する（呼び出し元はもういないため）。受信側が
+    /// `Vm` とともに破棄されている・満杯でイベントが届かない場合は、失敗を見失わないよう構造化ログ
+    /// （1 行 1 JSON）を stderr へ出す（REPAIR-4）。
+    pub(crate) fn finish_drop_stop(&mut self, generation: u64, res: Result<(), ErrInfo>) -> bool {
         let failure = res.clone().err();
         // 停止通知の先着で無効化されていても、結果は状態機械と通知で既に表されている。
         let _ = self.complete(generation, LifecycleInput::StopCompleted(generation, res));
-        if let Some((domain, code)) = failure {
-            let line = stop_on_drop_failure_log(&domain, code);
-            if !self.sink.send(VmEvent::StopOnDropFailed { domain, code }) {
-                eprintln!("{line}");
-            }
+        let Some((domain, code)) = failure else {
+            return false;
+        };
+        if self.drop_stop_attempts < DROP_STOP_MAX_ATTEMPTS {
+            return true;
         }
+        let attempts = self.drop_stop_attempts;
+        let line = stop_on_drop_failure_log(&domain, code, attempts);
+        if !self.sink.send(VmEvent::StopOnDropFailed {
+            domain,
+            code,
+            attempts,
+        }) {
+            eprintln!("{line}");
+        }
+        false
     }
 }
 
@@ -603,7 +632,7 @@ impl Core {
 /// エスケープする（`sys` 側で 128 文字に切り詰め済み）。
 // macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn stop_on_drop_failure_log(domain: &str, code: isize) -> String {
+fn stop_on_drop_failure_log(domain: &str, code: isize, attempts: u32) -> String {
     let mut escaped = String::with_capacity(domain.len());
     for c in domain.chars() {
         match c {
@@ -614,7 +643,7 @@ fn stop_on_drop_failure_log(domain: &str, code: isize) -> String {
         }
     }
     format!(
-        "{{\"component\":\"platform-macos.vm\",\"operation\":\"stop_on_drop\",\"result\":\"error\",\"code\":\"vm.stop_failed\",\"domain\":\"{escaped}\",\"vz_code\":{code}}}"
+        "{{\"component\":\"platform-macos.vm\",\"operation\":\"stop_on_drop\",\"result\":\"error\",\"code\":\"vm.stop_failed\",\"domain\":\"{escaped}\",\"vz_code\":{code},\"attempts\":{attempts}}}"
     )
 }
 
@@ -634,6 +663,9 @@ mod mac {
     use crate::config::VzVmConfiguration;
     use crate::sys::{self, DelegateEvent, HostInitError, VmRef};
 
+    /// 破棄時の停止が失敗した後、要求し直すまでの間隔（失敗直後は同じ理由で失敗しやすいため）。
+    const DROP_STOP_RETRY_DELAY: Duration = Duration::from_secs(1);
+
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         // 毒化しても状態機械・チケットは壊れないため、中身をそのまま使う（コールバック内で panic させない）。
         m.lock().unwrap_or_else(|e| e.into_inner())
@@ -646,8 +678,8 @@ mod mac {
     /// 起動可能な `VZVirtualMachine` のハンドル。
     ///
     /// 呼び出し元: `fandhe-container-plugin-macos`（TASK-115）。実機での起動確認は TASK-64.6。
-    /// `Drop` は実行中の VM に停止を要求してから、VM を専用キュー上で解放する（ブロックしない。停止の完了・
-    /// 失敗はイベントで届く。完了まで待ちたい呼び出し元は先に `stop` を呼ぶ）。
+    /// `Drop` は実行中の VM に停止を要求してから、VM を専用キュー上で解放する（ブロックしない。失敗時は
+    /// 有界回数やり直す。停止の完了・失敗はイベントで届く。完了まで待ちたい呼び出し元は先に `stop` を呼ぶ）。
     pub struct Vm {
         host: sys::VmHost,
         core: Arc<Mutex<Core>>,
@@ -809,8 +841,9 @@ mod mac {
 
     /// 破棄時の停止を VM キュー上で要求する（`Vm::drop` と、破棄後に届いた操作の完了通知から呼ばれる）。
     ///
-    /// 停止の完了・失敗は `Core::finish_drop_stop` が状態機械とイベントへ記録する。停止できない状態なら
-    /// 何もせず、破棄済みの印だけを残す。
+    /// 停止の完了・失敗は `Core::finish_drop_stop` が状態機械とイベントへ記録する。失敗して要求回数が残って
+    /// いれば `DROP_STOP_RETRY_DELAY` 後に VM キュー上でやり直す（VM はそれまで保持される）。停止できない
+    /// 状態なら何もせず、破棄済みの印だけを残す。
     fn issue_drop_stop(vm: &VmRef<'_>, core: &Arc<Mutex<Core>>) {
         let actual = actual_state(vm);
         let can_stop = vm.can_stop();
@@ -818,8 +851,12 @@ mod mac {
             return;
         };
         let handler_core = Arc::clone(core);
-        vm.stop(move |_vm: &VmRef<'_>, res: Result<(), ErrInfo>| {
-            lock(&handler_core).finish_drop_stop(generation, res);
+        vm.stop(move |vm: &VmRef<'_>, res: Result<(), ErrInfo>| {
+            let retry = lock(&handler_core).finish_drop_stop(generation, res);
+            if retry {
+                let core = Arc::clone(&handler_core);
+                vm.run_after(DROP_STOP_RETRY_DELAY, move |vm| issue_drop_stop(vm, &core));
+            }
         });
     }
 
@@ -1201,7 +1238,7 @@ mod tests {
         drain(&rx);
         let stop = core.request_drop_stop(true, VmState::Running);
         assert_eq!(stop, Some(2));
-        core.finish_drop_stop(2, Ok(()));
+        assert!(!core.finish_drop_stop(2, Ok(())));
         assert_eq!(
             drain(&rx),
             vec![
@@ -1212,25 +1249,34 @@ mod tests {
         assert!(core.drop_stop_due());
     }
 
-    /// TASK-64.4: 破棄時の停止の失敗は StopOnDropFailed として記録される。
+    /// TASK-64.4: 破棄時の停止は失敗しても DROP_STOP_MAX_ATTEMPTS 回までやり直し、使い切った失敗だけを
+    /// StopOnDropFailed として記録する。以後は要求しない。
     #[test]
-    fn core_drop_stop_failure_is_recorded() {
-        let (sink, rx) = event_channel(16);
+    fn core_drop_stop_retries_then_records_failure() {
+        let (sink, rx) = event_channel(32);
         let mut core = Core::new(sink);
-        let generation = core.request_drop_stop(true, VmState::Running);
-        assert_eq!(generation, Some(1));
+        let err = || Err(("VZErrorDomain".to_string(), 3));
+        assert_eq!(core.request_drop_stop(true, VmState::Running), Some(1));
+        assert!(core.finish_drop_stop(1, err()));
+        assert_eq!(core.request_drop_stop(true, VmState::Running), Some(2));
+        assert!(core.finish_drop_stop(2, err()));
         drain(&rx);
-        core.finish_drop_stop(1, Err(("VZErrorDomain".to_string(), 3)));
+        assert_eq!(core.request_drop_stop(true, VmState::Running), Some(3));
+        assert!(!core.finish_drop_stop(3, err()));
         assert_eq!(
             drain(&rx),
             vec![
+                changed(VmState::Running, VmState::Stopping),
                 changed(VmState::Stopping, VmState::Running),
                 VmEvent::StopOnDropFailed {
                     domain: "VZErrorDomain".to_string(),
-                    code: 3
+                    code: 3,
+                    attempts: DROP_STOP_MAX_ATTEMPTS
                 }
             ]
         );
+        assert_eq!(core.request_drop_stop(true, VmState::Running), None);
+        assert_eq!(core.lifecycle.state(), VmState::Running);
     }
 
     /// TASK-64.4: 停止できない間（起動途中・完了待ち）の破棄は印だけ残し、完了後に停止を要求し直す。
@@ -1333,12 +1379,12 @@ mod tests {
     #[test]
     fn stop_on_drop_failure_log_escapes_domain() {
         assert_eq!(
-            stop_on_drop_failure_log("VZErrorDomain", 3),
-            r#"{"component":"platform-macos.vm","operation":"stop_on_drop","result":"error","code":"vm.stop_failed","domain":"VZErrorDomain","vz_code":3}"#
+            stop_on_drop_failure_log("VZErrorDomain", 3, 3),
+            r#"{"component":"platform-macos.vm","operation":"stop_on_drop","result":"error","code":"vm.stop_failed","domain":"VZErrorDomain","vz_code":3,"attempts":3}"#
         );
         assert_eq!(
-            stop_on_drop_failure_log("a\"b\\c\nd", -1),
-            r#"{"component":"platform-macos.vm","operation":"stop_on_drop","result":"error","code":"vm.stop_failed","domain":"a\"b\\c\u000ad","vz_code":-1}"#
+            stop_on_drop_failure_log("a\"b\\c\nd", -1, 1),
+            r#"{"component":"platform-macos.vm","operation":"stop_on_drop","result":"error","code":"vm.stop_failed","domain":"a\"b\\c\u000ad","vz_code":-1,"attempts":1}"#
         );
     }
 
@@ -1347,9 +1393,15 @@ mod tests {
     fn core_drop_stop_failure_without_receiver_does_not_panic() {
         let (sink, rx) = event_channel(4);
         let mut core = Core::new(sink);
-        assert_eq!(core.request_drop_stop(true, VmState::Running), Some(1));
         drop(rx);
-        core.finish_drop_stop(1, Err(("VZErrorDomain".to_string(), 3)));
+        for attempt in 1..=u64::from(DROP_STOP_MAX_ATTEMPTS) {
+            assert_eq!(
+                core.request_drop_stop(true, VmState::Running),
+                Some(attempt)
+            );
+            let retry = core.finish_drop_stop(attempt, Err(("VZErrorDomain".to_string(), 3)));
+            assert_eq!(retry, attempt < u64::from(DROP_STOP_MAX_ATTEMPTS));
+        }
         assert_eq!(core.lifecycle.state(), VmState::Running);
     }
 

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use block2::RcBlock;
-use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
+use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained, DispatchTime};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
@@ -408,6 +408,29 @@ impl VmRef<'_> {
         let block = self.completion_block(handler);
         // SAFETY: VM キュー上で呼ばれ、`can_stop` 確認済み。block の扱いは `start` と同じ。
         unsafe { self.objs.0.vm.stopWithCompletionHandler(&block) }
+    }
+
+    /// `delay` 後に VM キュー上で `f` を実行する（それまで VM を保持し、解放はキュー上で行う）。
+    ///
+    /// `delay` を `DispatchTime` で表せない（桁あふれ）場合は直ちに投入する。
+    pub(crate) fn run_after(&self, delay: Duration, f: impl FnOnce(&VmRef<'_>) + Send + 'static) {
+        let objs = Arc::clone(self.objs);
+        let queue = self.queue.clone();
+        let work = move || {
+            f(&VmRef {
+                objs: &objs,
+                queue: &queue,
+            });
+            // この clone が最後の参照でも、解放は VM キューのスレッド上で行われる。
+            drop(objs);
+        };
+        match DispatchTime::try_from(delay) {
+            // dispatch2 0.3.1 の `after` は `dispatch_after_f` で投入し、常に `Ok` を返す。
+            Ok(when) => {
+                let _ = self.queue.after(when, work);
+            }
+            Err(()) => self.queue.exec_async(work),
+        }
     }
 
     /// completion handler 用の block を作る。

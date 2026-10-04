@@ -252,8 +252,26 @@ enum Direction {
 /// 方向違いのフレームを確保前に拒否する関数を選ぶ。
 fn accept_kind_for(direction: Direction) -> fn(FrameKind) -> Result<(), IoError> {
     match direction {
-        Direction::ServerSide => crate::stream_io::reject_client_originated_response_frame,
+        Direction::ServerSide => reject_client_originated_response_frame,
         Direction::ClientSide => reject_server_originated_request_frame,
+    }
+}
+
+/// `stream_io` を持つ OS（Linux・macOS）では UDS と共有する実体を使う。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::stream_io::reject_client_originated_response_frame;
+
+/// Windows には `stream_io` モジュールが存在しない（UDS 非対応。vsock は
+/// `Unimplemented` を返す）ため、`stream_io` 側と同じ判定を局所的に持つ（IO-1・REPAIR-2）。
+/// 型は到達しないが `Direction` の `match` を全 OS で同形に保つために必要。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn reject_client_originated_response_frame(kind: FrameKind) -> Result<(), IoError> {
+    match kind {
+        FrameKind::Write | FrameKind::Flush => Ok(()),
+        FrameKind::Ack | FrameKind::FlushAck => Err(IoError::new(
+            IoErrorCode::InvalidArgument,
+            format!("server does not accept client-originated response frames: {kind:?}"),
+        )),
     }
 }
 

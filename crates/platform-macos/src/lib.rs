@@ -1,6 +1,7 @@
 //! fandhe-container-platform-macos: macOS Virtualization.framework 経由の VM 起動・VirtioFS（MAC-1）。
 //!
-//! 現状は VM 設定・最小デバイス構成（`config`。TASK-64.2・64.3）とライフサイクル（`vm`。TASK-64.4）まで実装済みで、
+//! 現状は VM 設定・最小デバイス構成（`config`。TASK-64.2・64.3）・コンソールログの上限つき書き出し
+//! （`console_log`。TASK-64.3）とライフサイクル（`vm`。TASK-64.4）まで実装済みで、
 //! タイムアウト既定値・クリーンアップ・エラー型統合は TASK-64.5 で実装する（REPAIR-3: 実装済みを装わない）。
 //!
 //! - プラットフォーム対応: OS 非依存の検証ロジックは全 OS でビルドし 3 OS CI でテストする。
@@ -8,12 +9,25 @@
 //! - 実行前提: `com.apple.security.virtualization` entitlement とコード署名（ad-hoc 可）、最低 macOS 13。
 //! - 呼び出し文脈: 実行時は `fandhe-container-plugin-macos`（TASK-115）が本 crate を別プロセスとして動かす。
 //!   PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
+//! - `unsafe` は `sys` モジュール（`src/sys.rs`・`src/sys/`）に限る（coding-rust.md の事前承認範囲。#4）。
 
 pub mod config;
+#[cfg(unix)]
+pub mod console_log;
 pub mod vm;
 
 #[cfg(target_os = "macos")]
 mod sys;
+
+/// macOS 以外の unix 向けの `sys`: unix 共通の POSIX ラッパー（`src/sys/posix.rs`）だけを持つ。
+///
+/// コンソールログの所有者検査（MAC-1・TASK-64.3）を 3 OS CI の Linux でも実行するため、macOS の `sys` と
+/// 同じパス（`crate::sys::effective_uid`）で呼べるようにする。Virtualization.framework 層は含まない。
+#[cfg(all(unix, not(target_os = "macos")))]
+mod sys {
+    mod posix;
+    pub(crate) use posix::effective_uid;
+}
 
 /// 本バックエンドの利用可否と前提 macOS 版数（拡張可能なように構造体で返す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

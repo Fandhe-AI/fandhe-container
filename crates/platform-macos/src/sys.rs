@@ -18,6 +18,9 @@
 //! 操作は `VmHost::run_async` / `run_timeout` のクロージャと completion handler（いずれもキュー上で実行される）
 //! にだけ `VmRef` として渡す。`VmRef` は本モジュール外で生成できないため、キュー外から VM を触る経路は型として
 //! 存在しない。VM への強参照は `QueueOwned` が持ち、最後の解放を必ずキュー上へ回す。
+//!
+//! unix 共通の POSIX ラッパー（`geteuid` 等）は子モジュール `posix`（`src/sys/posix.rs`）に置く。macOS 以外の
+//! unix では `lib.rs` が `posix` だけを持つ `sys` を定義し、同じ `crate::sys::effective_uid` で呼べるようにする。
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -38,6 +41,9 @@ use objc2_virtualization::{
     VZVirtualMachineDelegate,
 };
 use std::sync::Arc;
+
+mod posix;
+pub(crate) use posix::effective_uid;
 
 /// NSError の domain と code（VZ が返すエラーの機械可読な要約）。domain は長さを制限して保持する。
 pub(crate) type VzErrorInfo = (String, isize);

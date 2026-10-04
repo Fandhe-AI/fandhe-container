@@ -2,8 +2,8 @@
 //!
 //! 構成:
 //! - OS 非依存層: `VmState`・`VmEvent`・`VmError` と、状態遷移を決める純粋な `Lifecycle`・イベント配送
-//!   `EventSink`。FFI 層は遷移を `Lifecycle` に委ねるだけにし、遷移ロジックを Linux 上の `make test` で
-//!   検証できるようにする（REPAIR-12）。
+//!   `EventSink`・操作の受付 / 放棄を直列化する `Core`。FFI 層は遷移を `Core` に委ねるだけにし、遷移ロジックを
+//!   Linux 上の `make test` で検証できるようにする（REPAIR-12）。
 //! - macOS 限定層: `Vm`。`config::VzVmConfiguration` から VM を生成し、`start` / `stop` を同期 API
 //!   （タイムアウト付き。REPAIR-5）として公開する。
 //!
@@ -12,12 +12,16 @@
 //! completion handler・delegate は GCD のワーカースレッドで届くので、呼び出し元（TASK-115 の plugin
 //! プロセス）はメイン run loop を回さずに済む。VM に関わる unsafe はすべて `sys` に閉じ込めている。
 //!
+//! タイムアウト後の回復（REPAIR-5）: 待機期限を過ぎた操作は放棄（世代を無効化）し、後続の start / stop を
+//! 受け付ける。受付時には VZ の実状態を読んで状態機械を追従させる。放棄後に届いた完了通知は、別の操作や停止
+//! 通知に追い越されていなければ状態機械にだけ適用する（呼び出し元へは返らない）。
+//!
 //! 注意: `start` / `stop` / `state` を VM キュー上（イベント処理の中など）から呼ぶとデッドロックする。
 //! 最後の防壁としてタイムアウトが `VmError::Timeout` を返す。
 //!
-//! 未実装（REPAIR-3）: 待機タイムアウトの既定値の確定、タイムアウト・起動失敗時のクリーンアップ、
-//! 実行中 VM の `Drop` 時停止、`VmError` の `error.rs` への移動と `ConfigError` との統合は TASK-64.5。
-//! 協調停止（`requestStop`）・pause / resume / save / restore は範囲外。
+//! 未実装（REPAIR-3）: 待機タイムアウトの既定値の確定、起動失敗時のクリーンアップ、実行中 VM の `Drop` 時
+//! 停止、`VmError` の `error.rs` への移動と `ConfigError` との統合は TASK-64.5。協調停止（`requestStop`）・
+//! pause / resume / save / restore は範囲外。
 
 use std::fmt;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
@@ -208,16 +212,23 @@ pub(crate) enum LifecycleInput {
 /// 状態遷移を決める純粋な状態機械。FFI を持たない。
 ///
 /// 完了入力（`StartCompleted(Err)` → `Error`、`StopCompleted(Err)` → `Running`）は仮の遷移で、VZ の実状態
-/// （例: 起動失敗後に `Stopped`）と食い違い得る。実状態は `Vm::state()` が正で、実状態への追従は TASK-64.5 で扱う。
+/// （例: 起動失敗後に `Stopped`）と食い違い得る。実状態は `Vm::state()` が正。次の要求の受付時・タイムアウト後に
+/// `reconcile` で実状態へ追従する。完了直後の常時追従は TASK-64.5 で扱う。
 ///
 /// 操作世代: 要求ごとに世代を進め、完了通知は要求時の世代と一致する間だけ適用する。ゲスト停止・エラー停止の
 /// 通知は進行中の操作を無効化するため、停止済みの VM を遅れて届いた `StartCompleted(Ok)` が `Running` へ
 /// 逆行させない。
+///
+/// 放棄（REPAIR-5）: 呼び出し元が待機期限で諦めた操作は `abandon` で進行中から外し、後続の要求を受け付ける。
+/// 放棄した操作の完了通知は、その後に新しい要求も停止通知もなければ遅れて適用する（放棄後も VZ 側の操作は
+/// 続いており、その結果が実状態を表すため）。停止通知・新しい要求のどちらかが先に来たら古い通知として捨てる。
 #[derive(Debug)]
 pub(crate) struct Lifecycle {
     state: VmState,
     generation: u64,
     in_flight: Option<u64>,
+    /// 待機期限切れで放棄した操作の世代（完了通知を遅れて受理するための目印）。
+    abandoned: Option<u64>,
 }
 
 // macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
@@ -228,6 +239,7 @@ impl Lifecycle {
             state: VmState::Stopped,
             generation: 0,
             in_flight: None,
+            abandoned: None,
         }
     }
 
@@ -236,9 +248,34 @@ impl Lifecycle {
         self.state
     }
 
-    /// 指定世代が現行の進行中操作か（ゲスト停止等で無効化されていれば false）。
-    pub(crate) fn is_current(&self, generation: u64) -> bool {
-        self.in_flight == Some(generation)
+    /// 指定世代の完了通知を受理するか。現行の進行中操作、または進行中の操作がない間の放棄済み操作なら true
+    /// （ゲスト停止・後続の要求で無効化されていれば false）。
+    pub(crate) fn accepts(&self, generation: u64) -> bool {
+        match self.in_flight {
+            Some(current) => current == generation,
+            None => self.abandoned == Some(generation),
+        }
+    }
+
+    /// 進行中の操作を放棄する（呼び出し元の待機期限切れ。REPAIR-5）。現行の進行中操作だったら true。
+    pub(crate) fn abandon(&mut self, generation: u64) -> bool {
+        if self.in_flight != Some(generation) {
+            return false;
+        }
+        self.in_flight = None;
+        self.abandoned = Some(generation);
+        true
+    }
+
+    /// 進行中の操作がなければ、状態を VZ の実状態 `actual` に合わせる（食い違っていれば `StateChanged`）。
+    /// 進行中の操作がある間は、その完了通知が状態を決めるため何もしない。
+    pub(crate) fn reconcile(&mut self, actual: VmState) -> Vec<VmEvent> {
+        if self.in_flight.is_some() || actual == self.state {
+            return Vec::new();
+        }
+        let from = self.state;
+        self.state = actual;
+        vec![VmEvent::StateChanged { from, to: actual }]
     }
 
     /// 完了待ちの操作があるか。
@@ -287,11 +324,13 @@ impl Lifecycle {
             }
             LifecycleInput::GuestStopped => {
                 self.in_flight = None;
+                self.abandoned = None;
                 extra = Some(VmEvent::GuestStopped);
                 VmState::Stopped
             }
             LifecycleInput::StoppedWithError((domain, code)) => {
                 self.in_flight = None;
+                self.abandoned = None;
                 extra = Some(VmEvent::StoppedWithError { domain, code });
                 VmState::Error
             }
@@ -310,16 +349,18 @@ impl Lifecycle {
     fn begin_op(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.in_flight = Some(self.generation);
+        // 新しい要求が来たら、放棄済み操作の遅れた完了通知は古い通知として捨てる。
+        self.abandoned = None;
     }
 
-    /// 完了通知が現行の進行中操作のものなら受理して true。古い通知は false。
+    /// 完了通知を受理できる（`accepts`）なら受理して true。古い通知は false。
     fn finish_op(&mut self, generation: u64) -> bool {
-        if self.in_flight == Some(generation) {
-            self.in_flight = None;
-            true
-        } else {
-            false
+        if !self.accepts(generation) {
+            return false;
         }
+        self.in_flight = None;
+        self.abandoned = None;
+        true
     }
 }
 
@@ -361,6 +402,48 @@ impl EventSink {
     }
 }
 
+/// `start` / `stop` 1 回分の受付状況。呼び出し元スレッドと VM キューで共有し、必ず `Core` のロックを
+/// 取った後に触る（ロック順は `Core` → チケット）。キュー上の受付と呼び出し元の放棄を直列化するため（REPAIR-5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum OpTicket {
+    /// キューへ投入済みで未着手。
+    Pending,
+    /// 受け付けて VZ へ要求した（値は操作世代）。
+    Begun(u64),
+    /// 受け付けずに結果を返した（`canStart` / `canStop` が false、または重複要求）。
+    Settled,
+    /// 着手前に呼び出し元が待機期限で取り消した。キュー上では何もしない。
+    Cancelled,
+}
+
+/// `Core::begin` の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum BeginOutcome {
+    /// 取り消し済みのため何もしない（結果は呼び出し元へ返さない）。
+    Cancelled,
+    /// 受け付けなかった。その時点の状態を `InvalidState` として返す。
+    Rejected(VmState),
+    /// 受け付けた。値は完了通知に持ち回る操作世代。
+    Begun(u64),
+}
+
+/// `Core::abandon` の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum AbandonOutcome {
+    /// 未着手だったので取り消した（VZ へは要求しない）。
+    NotStarted,
+    /// VZ へ要求済みの操作を放棄した。後続の要求を受け付け、実状態への追従を要する。
+    Abandoned(u64),
+    /// 既に結果が確定していた（結果チャネルに値がある）。
+    Settled,
+}
+
 /// 状態機械とイベント配送をまとめたもの。コールバックと操作側で `Arc<Mutex<_>>` 共有する。
 #[derive(Debug)]
 pub(crate) struct Core {
@@ -378,31 +461,73 @@ impl Core {
         }
     }
 
-    /// 要求入力を適用し、その操作に割り当てた世代を返す（完了通知に持ち回る）。
-    /// 進行中の操作があれば何も適用せず、その時点の状態を `Err` で返す（start / stop の重複を排他する。
-    /// 先行操作の世代を潰して完了通知を破棄させ、状態とイベントが食い違うのを防ぐ）。
-    pub(crate) fn try_begin(&mut self, input: LifecycleInput) -> Result<u64, VmState> {
-        if self.lifecycle.has_in_flight() {
-            return Err(self.lifecycle.state());
+    /// VM キュー上で要求を受け付ける。`allowed` は `canStart` / `canStop`、`actual` は VZ の実状態。
+    ///
+    /// 取り消し済みなら何もしない。受け付けられない（`allowed` が false・進行中の操作がある）なら
+    /// チケットを確定させて `Rejected` を返す。重複要求を拒否するのは、先行操作の世代を潰して完了通知を
+    /// 破棄させ、状態とイベントが食い違うのを防ぐため。受け付ける前に状態機械を実状態へ追従させる
+    /// （タイムアウトで放棄した操作の後でも、実状態から次の操作を始められるようにする。REPAIR-5）。
+    pub(crate) fn begin(
+        &mut self,
+        ticket: &mut OpTicket,
+        input: LifecycleInput,
+        allowed: bool,
+        actual: VmState,
+    ) -> BeginOutcome {
+        if *ticket != OpTicket::Pending {
+            return BeginOutcome::Cancelled;
         }
+        if !allowed {
+            *ticket = OpTicket::Settled;
+            return BeginOutcome::Rejected(actual);
+        }
+        if self.lifecycle.has_in_flight() {
+            *ticket = OpTicket::Settled;
+            return BeginOutcome::Rejected(self.lifecycle.state());
+        }
+        self.reconcile(actual);
         self.apply(input);
-        Ok(self.lifecycle.generation())
+        let generation = self.lifecycle.generation();
+        *ticket = OpTicket::Begun(generation);
+        BeginOutcome::Begun(generation)
+    }
+
+    /// 呼び出し元の待機期限切れで操作を手放す（REPAIR-5）。未着手なら取り消し、要求済みで完了待ちなら
+    /// 世代を放棄して後続の要求を受け付けられるようにする。
+    pub(crate) fn abandon(&mut self, ticket: &mut OpTicket) -> AbandonOutcome {
+        match *ticket {
+            OpTicket::Pending => {
+                *ticket = OpTicket::Cancelled;
+                AbandonOutcome::NotStarted
+            }
+            OpTicket::Begun(generation) if self.lifecycle.abandon(generation) => {
+                AbandonOutcome::Abandoned(generation)
+            }
+            _ => AbandonOutcome::Settled,
+        }
+    }
+
+    /// 進行中の操作がなければ状態機械を VZ の実状態へ合わせ、差分を `StateChanged` で配送する。
+    pub(crate) fn reconcile(&mut self, actual: VmState) {
+        for event in self.lifecycle.reconcile(actual) {
+            self.sink.send(event);
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn begin(&mut self, input: LifecycleInput) -> u64 {
+    pub(crate) fn begin_unchecked(&mut self, input: LifecycleInput) -> u64 {
         self.apply(input);
         self.lifecycle.generation()
     }
 
-    /// 完了入力を適用する。現行世代として受理されれば `Ok`、停止通知等で無効化済みなら適用せず
+    /// 完了入力を適用する。受理されれば `Ok`、停止通知・後続の要求で無効化済みなら適用せず
     /// その時点の状態を `Err` で返す（呼び出し元へ成功を返さないため。TASK-64.4）。
     pub(crate) fn complete(
         &mut self,
         generation: u64,
         input: LifecycleInput,
     ) -> Result<(), VmState> {
-        if !self.lifecycle.is_current(generation) {
+        if !self.lifecycle.accepts(generation) {
             let state = self.lifecycle.state();
             // 停止要求中にゲスト停止通知が先着して世代が無効化された場合でも、停止自体は成功しており
             // VM は Stopped なので、通知と完了の到着順に依存せず正常な停止として扱う。
@@ -429,28 +554,24 @@ pub use mac::Vm;
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::Duration;
 
     use super::{
-        Core, EVENT_CHANNEL_CAPACITY, ErrInfo, LifecycleInput, PROVISIONAL_OP_TIMEOUT, VmError,
-        VmEvent, VmOp, VmState, event_channel,
+        AbandonOutcome, BeginOutcome, Core, EVENT_CHANNEL_CAPACITY, ErrInfo, LifecycleInput,
+        OpTicket, PROVISIONAL_OP_TIMEOUT, VmError, VmEvent, VmOp, VmState, event_channel,
     };
     use crate::config::VzVmConfiguration;
-    use crate::sys::{self, DelegateEvent, HostInitError};
+    use crate::sys::{self, DelegateEvent, HostInitError, VmRef};
 
-    /// キューに投入した操作が未着手。
-    const OP_PENDING: u8 = 0;
-    /// VM キュー上で実行を開始した（以後は取り消せない）。
-    const OP_STARTED: u8 = 1;
-    /// 待機期限切れで呼び出し元が取り消した。キュー上の実行直前に確認して何もせず戻る。
-    const OP_CANCELLED: u8 = 2;
+    fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        // 毒化しても状態機械・チケットは壊れないため、中身をそのまま使う（コールバック内で panic させない）。
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
-    fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
-        // 毒化しても状態機械は壊れないため、中身をそのまま使う（コールバック内で panic させない）。
-        core.lock().unwrap_or_else(|e| e.into_inner())
+    fn actual_state(vm: &VmRef<'_>) -> VmState {
+        VmState::from_raw(vm.state_raw())
     }
 
     /// 起動可能な `VZVirtualMachine` のハンドル。
@@ -504,7 +625,7 @@ mod mac {
         /// フレームワークが報告する現在の状態。`op_timeout` 内に取得できなければ `Unknown(-1)`（REPAIR-5）。
         pub fn state(&self) -> VmState {
             self.host
-                .run_timeout(self.op_timeout, |vm| VmState::from_raw(vm.state_raw()))
+                .run_timeout(self.op_timeout, actual_state)
                 .unwrap_or(VmState::Unknown(-1))
         }
 
@@ -521,38 +642,33 @@ mod mac {
         fn run_op(&self, op: VmOp) -> Result<(), VmError> {
             let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), VmError>>(1);
             let core = Arc::clone(&self.core);
-            let gate = Arc::new(AtomicU8::new(OP_PENDING));
-            let queue_gate = Arc::clone(&gate);
+            let ticket = Arc::new(Mutex::new(OpTicket::Pending));
+            let queue_ticket = Arc::clone(&ticket);
             self.host.run_async(move |vm| {
-                // 待機期限切れで取り消し済みなら start / stop を実行しない。
-                if queue_gate
-                    .compare_exchange(OP_PENDING, OP_STARTED, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    return;
-                }
+                let actual = actual_state(vm);
                 let allowed = match op {
                     VmOp::Start => vm.can_start(),
                     VmOp::Stop => vm.can_stop(),
                 };
-                if !allowed {
-                    let state = VmState::from_raw(vm.state_raw());
-                    let _ = tx.try_send(Err(VmError::InvalidState { op, state }));
-                    return;
-                }
-                // 進行中の操作があれば重複要求として拒否する（VM キューはシリアルなので判定と begin は
-                // 他の要求と競合しない）。
-                let begun = lock(&core).try_begin(match op {
+                let request = match op {
                     VmOp::Start => LifecycleInput::StartRequested,
                     VmOp::Stop => LifecycleInput::StopRequested,
-                });
-                let generation = match begun {
-                    Ok(g) => g,
-                    Err(state) => {
-                        let _ = tx.try_send(Err(VmError::InvalidState { op, state }));
-                        return;
+                };
+                // 受付は Core → チケットの順にロックして行い、呼び出し元の放棄（`abandon`）と直列化する。
+                // VZ への要求（FFI）はロックを外してから行う。
+                let generation = {
+                    let mut c = lock(&core);
+                    let mut t = lock(&queue_ticket);
+                    match c.begin(&mut t, request, allowed, actual) {
+                        BeginOutcome::Cancelled => return,
+                        BeginOutcome::Rejected(state) => {
+                            let _ = tx.try_send(Err(VmError::InvalidState { op, state }));
+                            return;
+                        }
+                        BeginOutcome::Begun(generation) => generation,
                     }
                 };
+                let handler_core = Arc::clone(&core);
                 let handler = move |res: Result<(), ErrInfo>| {
                     let outcome = res.clone().map_err(|(domain, code)| match op {
                         VmOp::Start => VmError::StartFailed { domain, code },
@@ -562,12 +678,16 @@ mod mac {
                         VmOp::Start => LifecycleInput::StartCompleted(generation, res),
                         VmOp::Stop => LifecycleInput::StopCompleted(generation, res),
                     };
-                    // 停止通知で無効化済みの操作は成功を返さず、その時点の状態に応じた InvalidState を返す。
-                    let outcome = match lock(&core).complete(generation, input) {
-                        Ok(()) => outcome,
-                        Err(state) => Err(VmError::InvalidState { op, state }),
-                    };
-                    let _ = tx.try_send(outcome);
+                    {
+                        let mut c = lock(&handler_core);
+                        // 停止通知で無効化済みの操作は成功を返さず、その時点の状態に応じた InvalidState を返す。
+                        let outcome = match c.complete(generation, input) {
+                            Ok(()) => outcome,
+                            Err(state) => Err(VmError::InvalidState { op, state }),
+                        };
+                        // 呼び出し元の放棄と直列化するため、Core のロック内で結果を送る（block しない）。
+                        let _ = tx.try_send(outcome);
+                    }
                 };
                 match op {
                     VmOp::Start => vm.start(handler),
@@ -576,22 +696,39 @@ mod mac {
             });
             match rx.recv_timeout(self.op_timeout) {
                 Ok(result) => result,
-                Err(RecvTimeoutError::Timeout) => {
-                    // 未着手なら取り消す。実行開始済みなら取り消せず、完了通知は世代照合を経て状態機械に
-                    // 適用される（結果は呼び出し元へ届かない。後始末は TASK-64.5）。
-                    let _ = gate.compare_exchange(
-                        OP_PENDING,
-                        OP_CANCELLED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
-                    Err(VmError::Timeout {
-                        op,
-                        after: self.op_timeout,
-                    })
-                }
+                Err(RecvTimeoutError::Timeout) => self.give_up(op, &ticket, &rx),
                 Err(RecvTimeoutError::Disconnected) => Err(VmError::CallbackLost { op }),
             }
+        }
+
+        /// 待機期限切れの後始末（REPAIR-5）。操作を取り消すか放棄して後続の start / stop を受け付けられる
+        /// ようにし、放棄した場合は VM キュー上で実状態へ追従させる。期限直後に結果が確定していればそれを返す。
+        fn give_up(
+            &self,
+            op: VmOp,
+            ticket: &Mutex<OpTicket>,
+            rx: &Receiver<Result<(), VmError>>,
+        ) -> Result<(), VmError> {
+            let abandoned = {
+                let mut c = lock(&self.core);
+                let mut t = lock(ticket);
+                let outcome = c.abandon(&mut t);
+                // 結果はロック内で送られるため、ここで空なら以後この操作の結果は呼び出し元へ届かない。
+                if let Ok(result) = rx.try_recv() {
+                    return result;
+                }
+                matches!(outcome, AbandonOutcome::Abandoned(_))
+            };
+            if abandoned {
+                // キュー自体が詰まっていれば追従は後回しになるが、次の操作の受付時にも実状態へ追従する。
+                let core = Arc::clone(&self.core);
+                self.host
+                    .run_async(move |vm| lock(&core).reconcile(actual_state(vm)));
+            }
+            Err(VmError::Timeout {
+                op,
+                after: self.op_timeout,
+            })
         }
     }
 }
@@ -732,7 +869,7 @@ mod tests {
     fn core_complete_rejects_invalidated_operation() {
         let (sink, _rx) = event_channel(8);
         let mut core = Core::new(sink);
-        let generation = core.begin(LifecycleInput::StartRequested);
+        let generation = core.begin_unchecked(LifecycleInput::StartRequested);
         core.apply(LifecycleInput::GuestStopped);
         assert_eq!(
             core.complete(
@@ -741,7 +878,7 @@ mod tests {
             ),
             Err(VmState::Stopped)
         );
-        let generation = core.begin(LifecycleInput::StartRequested);
+        let generation = core.begin_unchecked(LifecycleInput::StartRequested);
         assert_eq!(
             core.complete(
                 generation,
@@ -751,23 +888,41 @@ mod tests {
         );
     }
 
+    /// テスト用: チケットを新規に作って受け付け、操作世代を返す（受け付けられなければ panic）。
+    fn begin_ok(core: &mut Core, input: LifecycleInput, actual: VmState) -> (OpTicket, u64) {
+        let mut ticket = OpTicket::Pending;
+        match core.begin(&mut ticket, input, true, actual) {
+            BeginOutcome::Begun(generation) => (ticket, generation),
+            other => panic!("unexpected begin outcome: {other:?}"),
+        }
+    }
+
     /// MAC-1・TASK-64.4: 進行中の操作がある間の重複要求は拒否し、先行操作の完了通知を潰さない。
     #[test]
-    fn core_try_begin_rejects_overlapping_operation() {
+    fn core_begin_rejects_overlapping_operation() {
         let (sink, _rx) = event_channel(8);
         let mut core = Core::new(sink);
-        let start = core.try_begin(LifecycleInput::StartRequested).unwrap();
+        let (ticket, start) = begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        assert_eq!(ticket, OpTicket::Begun(1));
+        let mut overlapping = OpTicket::Pending;
         assert_eq!(
-            core.try_begin(LifecycleInput::StopRequested),
-            Err(VmState::Starting)
+            core.begin(
+                &mut overlapping,
+                LifecycleInput::StopRequested,
+                true,
+                VmState::Starting
+            ),
+            BeginOutcome::Rejected(VmState::Starting)
         );
+        assert_eq!(overlapping, OpTicket::Settled);
         assert_eq!(core.lifecycle.state(), VmState::Starting);
         assert_eq!(
             core.complete(start, LifecycleInput::StartCompleted(start, Ok(()))),
             Ok(())
         );
         assert_eq!(core.lifecycle.state(), VmState::Running);
-        assert!(core.try_begin(LifecycleInput::StopRequested).is_ok());
+        let (_, stop) = begin_ok(&mut core, LifecycleInput::StopRequested, VmState::Running);
+        assert_eq!(stop, 2);
     }
 
     /// MAC-1・TASK-64.4: 停止通知が停止完了より先着しても、停止要求は正常終了として扱う。
@@ -775,10 +930,10 @@ mod tests {
     fn core_complete_accepts_stop_after_guest_stopped_notification() {
         let (sink, _rx) = event_channel(8);
         let mut core = Core::new(sink);
-        let start = core.begin(LifecycleInput::StartRequested);
+        let start = core.begin_unchecked(LifecycleInput::StartRequested);
         core.complete(start, LifecycleInput::StartCompleted(start, Ok(())))
             .unwrap();
-        let stop = core.begin(LifecycleInput::StopRequested);
+        let stop = core.begin_unchecked(LifecycleInput::StopRequested);
         core.apply(LifecycleInput::GuestStopped);
         assert_eq!(
             core.complete(stop, LifecycleInput::StopCompleted(stop, Ok(()))),

@@ -1280,8 +1280,11 @@ mod tests {
     struct TmpDir(PathBuf);
     impl TmpDir {
         fn new(tag: &str) -> Self {
+            Self::new_in(&std::env::temp_dir(), tag)
+        }
+        fn new_in(base: &Path, tag: &str) -> Self {
             static N: AtomicU64 = AtomicU64::new(0);
-            let p = std::env::temp_dir().join(format!(
+            let p = base.join(format!(
                 "fc-wslconfig-{tag}-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
@@ -1465,6 +1468,49 @@ mod tests {
             std::fs::read(d.file()).expect("read"),
             b"[wsl2]\nmemory=4GB\n"
         );
+        assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
+    }
+
+    /// WIN-2（Bugbot・Codex 指摘）: リンク以外のリパースポイント（WOF 圧縮）の `.wslconfig` は論理的な内容を
+    /// 読み込めるが、リパースタグを引き継げないため置換は PERMISSION_DENIED で拒否し、内容を変えない（Windows）。
+    /// WOF は NTFS のシステムドライブで有効なため、`%USERPROFILE%` 配下で `compact /exe` を使う。
+    #[cfg(windows)]
+    #[test]
+    fn wof_compressed_file_is_read_but_not_replaced() {
+        use std::os::windows::fs::MetadataExt;
+        let base = std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .expect("USERPROFILE");
+        let d = TmpDir::new_in(&base, "wof");
+        let mut body = String::new();
+        for i in 0..1024 {
+            body.push_str(&format!("# padding line {i:04} for compression\n"));
+        }
+        body.push_str("[wsl2]\nmemory=4GB\n");
+        std::fs::write(d.file(), &body).expect("write");
+        let st = std::process::Command::new("compact")
+            .args(["/c", "/exe:xpress4k", ".wslconfig"])
+            .current_dir(&d.0)
+            .output()
+            .expect("compact");
+        assert!(st.status.success(), "compact failed: {st:?}");
+        let attrs = std::fs::symlink_metadata(d.file())
+            .expect("stat")
+            .file_attributes();
+        assert_eq!(
+            attrs & FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_ATTRIBUTE_REPARSE_POINT,
+            "test setup must produce a WOF reparse point: {st:?}"
+        );
+        let cfg = load(&d.file()).expect("load").expect("exists");
+        assert_eq!(cfg.render(), body);
+        let e = enable_virtiofs_at(&d.file()).expect_err("must refuse");
+        assert_eq!(e.code(), WinErrorCode::PermissionDenied);
+        assert_eq!(
+            e.message(),
+            ".wslconfig is a reparse point (such as a compressed or cloud file); refusing to replace it"
+        );
+        assert_eq!(std::fs::read_to_string(d.file()).expect("read"), body);
         assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
     }
 

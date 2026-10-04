@@ -14,8 +14,9 @@
 //! `console=hvc0` 出力をコンソールログから確認する（TASK-64.6 の vm_boot 結合試験）。[`ConfigError`] は TASK-64.5 で `VmError` に包む予定
 //! （REPAIR-3: 現時点では未統合）。検証後〜起動までの TOCTOU（ファイル差し替え）は残るため、
 //! 起動時の読み込み失敗は TASK-64.4/64.5 のエラー経路で扱う。
-//! コンソールログの open も、検査から open までの間に symlink へ差し替えられる窓は完全には塞げない
-//! （open 後に fd と lstat の `(dev, ino)` を照合して差し替えを検出するのみ）。
+//! コンソールログの open は `O_NOFOLLOW` で最終パス要素の symlink 追従を open 時点で拒否し、
+//! open 後に fd と lstat の `(dev, ino)` も照合する（事前検査〜open 間の symlink 差し替えを塞ぐ。
+//! 親ディレクトリ要素の差し替えは対象外で、親ディレクトリの権限管理に委ねる）。
 
 use std::fmt;
 use std::num::NonZeroU32;
@@ -526,8 +527,8 @@ impl ConsoleLogPath {
 
     /// 追記モード・0600 で開く（無ければ作成。既存ファイルのモードは変えない）。
     ///
-    /// symlink は拒否し、open 後に fd と lstat の `(dev, ino)` を照合して差し替えを検出する。
-    /// 検出前に symlink 先を open してしまう窓は残る（モジュール冒頭の注記を参照）。
+    /// `O_NOFOLLOW` で最終要素が symlink なら open 自体を失敗させ（事前検査との間の差し替えでも
+    /// リンク先を開かない）、open 後に fd の種別と lstat との `(dev, ino)` 照合も維持する。
     #[cfg(unix)]
     pub fn open_for_append(&self) -> Result<std::fs::File, ConfigError> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -554,8 +555,17 @@ impl ConsoleLogPath {
             .append(true)
             .create(true)
             .mode(0o600)
+            .custom_flags(O_NOFOLLOW)
             .open(path)
-            .map_err(|e| open_err(e.kind()))?;
+            .map_err(|e| {
+                // O_NOFOLLOW による拒否（ELOOP 等）は symlink として報告する。
+                match std::fs::symlink_metadata(path) {
+                    Ok(m) if m.file_type().is_symlink() => ConfigError::ConsoleLogIsSymlink {
+                        path: path.to_path_buf(),
+                    },
+                    _ => open_err(e.kind()),
+                }
+            })?;
         let fd_meta = file.metadata().map_err(|e| open_err(e.kind()))?;
         let post = std::fs::symlink_metadata(path).map_err(|e| open_err(e.kind()))?;
         let fd_id = (fd_meta.dev(), fd_meta.ino());
@@ -569,6 +579,38 @@ impl ConsoleLogPath {
         Ok(file)
     }
 }
+
+/// `open(2)` の `O_NOFOLLOW`（libc 非依存のため OS・アーキ別に定義する。値は各 OS の fcntl.h）。
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
+))]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "powerpc64"
+    )
+))]
+const O_NOFOLLOW: i32 = 0x8000;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "powerpc64"
+    ))
+))]
+const O_NOFOLLOW: i32 = 0x2_0000;
 
 /// シリアルコンソールの出力先。
 ///
@@ -1221,6 +1263,21 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let err = ConsoleLogPath::try_new(&link).unwrap_err();
         assert_eq!(err.code(), "config.console_log_is_symlink");
+    }
+
+    /// MAC-1・TASK-64.3: 検証後に symlink へ差し替えられても `O_NOFOLLOW` でリンク先を開かない。
+    #[cfg(unix)]
+    #[test]
+    fn open_for_append_rejects_symlink_swapped_after_validation() {
+        let t = TempDir::new("log-swap");
+        let victim = t.file("victim.log");
+        let before = std::fs::metadata(&victim).unwrap().len();
+        let link = t.0.join("console.log");
+        let log = ConsoleLogPath::try_new(&link).unwrap();
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let err = log.open_for_append().unwrap_err();
+        assert_eq!(err.code(), "config.console_log_is_symlink");
+        assert_eq!(std::fs::metadata(&victim).unwrap().len(), before);
     }
 
     /// MAC-1・TASK-64.3: 新規作成は 0600、既存内容は保持したまま追記される。

@@ -3,8 +3,8 @@
 //! Windows で Linux コンテナを動かす主経路は WSL2 経由とし（WIN-1）、`.wslconfig` の
 //! `virtiofs=true` を opt-in として既定運用に含める（WIN-2）。
 //!
-//! 実装状況: `error`（構造化エラー型）と `wslconfig`（`.wslconfig` の読み書き）は TASK-67.2（#373）で
-//! 実装済み。`sys` は `unsafe` を閉じ込める FFI の薄いラッパーで、`.wslconfig` 置換時のアクセス制御の
+//! 実装状況: `error`（構造化エラー型）・`wslconfig`（`.wslconfig` の読み書き）・`instrument`（操作の成否と
+//! 所要時間の記録先。REPAIR-4）は TASK-67.2（#373）で実装済み。`sys` は `unsafe` を閉じ込める FFI の薄いラッパーで、`.wslconfig` 置換時のアクセス制御の
 //! 複製・検査（Windows の DACL 等・unix の拡張 ACL の検出）に使う。`wsl2`（WSL2 検出・virtiofs マウント・9P フォールバック）は引き続きスタブで、
 //! TASK-67.3〜67.5（#374〜#376）で実装する（REPAIR-3）。
 //!
@@ -17,6 +17,7 @@
 //! PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 
 pub mod error;
+pub mod instrument;
 #[cfg(any(unix, windows))]
 mod sys;
 #[cfg(target_os = "windows")]

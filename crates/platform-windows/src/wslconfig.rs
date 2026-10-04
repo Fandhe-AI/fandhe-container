@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{WinError, WinErrorCode};
+use crate::instrument::{NoopWinOpRecorder, WinOpKind, WinOpRecorder, record_win_op};
 
 /// virtiofs を設定するセクション名（WIN-2。実機検証は未了）。
 pub const WSL2_SECTION: &str = "wsl2";
@@ -434,8 +435,21 @@ fn open_verified(path: &Path) -> Result<std::fs::File, WinError> {
 ///
 /// シンボリックリンク・通常ファイル以外は拒否し（fail-closed）、[`MAX_WSLCONFIG_BYTES`] を超えるものと
 /// 非 UTF-8 は `Err`。
+///
+/// 計測しない呼び出し口。成否・所要時間を記録するには [`load_with_recorder`] を使う。
 pub fn load(path: &Path) -> Result<Option<WslConfig>, WinError> {
-    Ok(load_verified(path)?.map(|(cfg, _source)| cfg))
+    load_with_recorder(path, &NoopWinOpRecorder)
+}
+
+/// [`load`] の計装版。1 回の呼び出しごとに [`WinOpKind::WslconfigLoad`] の成否と所要時間を `recorder` へ
+/// 記録する（REPAIR-4。設定内容・パスは記録しない）。
+pub fn load_with_recorder(
+    path: &Path,
+    recorder: &dyn WinOpRecorder,
+) -> Result<Option<WslConfig>, WinError> {
+    record_win_op(recorder, WinOpKind::WslconfigLoad, || {
+        Ok(load_verified(path)?.map(|(cfg, _source)| cfg))
+    })
 }
 
 /// 読み込んだ `.wslconfig` の検証済みハンドルと、読み込み前に記録した状態。
@@ -804,8 +818,25 @@ fn create_exclusive(path: &Path, parent: &Path, tmp: &Path, data: &[u8]) -> Resu
 /// 書き込み不要のため `AlreadyEnabled`）。読み込み後に別プロセスが作成・置換・書き換えた場合は上書きせず
 /// `INTERNAL`。`Err` のとき通常は元のファイルを変更しない。例外として unix で公開（新規作成の hard_link・
 /// 置換の rename）後の親ディレクトリ fsync に失敗した場合は、作成・置換済みのまま `Err` になりうる。
-/// TASK-67.4（#375）の起動ロジックから呼ばれる想定。
+/// TASK-67.4（#375）の起動ロジックから呼ばれる想定。計測しない呼び出し口で、成否・所要時間を記録するには
+/// [`enable_virtiofs_at_with_recorder`] を使う。
 pub fn enable_virtiofs_at(path: &Path) -> Result<EnableOutcome, WinError> {
+    enable_virtiofs_at_with_recorder(path, &NoopWinOpRecorder)
+}
+
+/// [`enable_virtiofs_at`] の計装版。1 回の呼び出しごとに [`WinOpKind::WslconfigEnableVirtiofs`] の成否と
+/// 所要時間を `recorder` へ記録する（REPAIR-4。内側の読み込みは別サンプルにしない。設定内容・パスは記録しない）。
+pub fn enable_virtiofs_at_with_recorder(
+    path: &Path,
+    recorder: &dyn WinOpRecorder,
+) -> Result<EnableOutcome, WinError> {
+    record_win_op(recorder, WinOpKind::WslconfigEnableVirtiofs, || {
+        enable_virtiofs_inner(path)
+    })
+}
+
+/// [`enable_virtiofs_at`] の本体（読み込み → 編集 → 原子的書き込み）。
+fn enable_virtiofs_inner(path: &Path) -> Result<EnableOutcome, WinError> {
     let (mut cfg, source) = match load_verified(path)? {
         Some((c, s)) => (c, Some(s)),
         None => (WslConfig::parse("")?, None),

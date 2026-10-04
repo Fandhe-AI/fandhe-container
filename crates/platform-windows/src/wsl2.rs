@@ -16,11 +16,20 @@
 //! システムディレクトリ配下の `wsl.exe` の絶対パスのみ）。`wsl.exe` の出力は untrusted として扱い、不明な形式は fail-closed で `Err` にする。
 //! 管理者権限を要する WSL の有効化はせず、手順の案内だけを返す。
 //!
+//! virtiofs 共有マウントと起動前の検証シーケンス（TASK-67.4・#375）は `mount` モジュール。
+//!
 //! エラー型は本モジュール内に置いた暫定版で、crate 共通の構造化エラーは TASK-67.5（#376）で
 //! `error` モジュールへ移してよい（REPAIR-3）。実機の `wsl.exe` での確認は TASK-67.6（#377）の担当。
 
+mod mount;
 mod parse;
 mod run;
+
+pub use mount::{
+    DistroName, GUEST_MOUNT_BASE, HostDir, LaunchRequest, MAX_DISTRO_NAME_LEN, MAX_HOST_DIR_LEN,
+    MAX_MOUNT_NAME_LEN, MAX_SHARED_MOUNTS, MountName, PreparedLaunch, PreparedMount, SharedMount,
+    SharedTransport, launch_with, prepare_virtiofs_launch, prepare_virtiofs_launch_with_recorder,
+};
 
 use std::error::Error;
 use std::fmt;

@@ -8,8 +8,9 @@
 //! - none: loopback（`127.0.0.0/8`・`::1`）以外はコンテナ作成前に `INVALID_ARGUMENT` で拒否し、ファイルに
 //!   一切触れない。loopback は書くが到達性は保証・検証しない（NET-6）。IPv4 射影 `::ffff:127.0.0.1` は
 //!   `IpAddr::is_loopback()` が false のため fail-closed で拒否する。
-//! - bridge: 未実装（REPAIR-3）。DNS ヘルパーの上流転送は TASK-185.3（#346）、軽量運用（NET-8）の直接書き込みは
-//!   TASK-146.2（#336）。bridge では nameserver を決して書かない。
+//! - bridge: [`ResolvConfPlan::for_mode`] / [`apply_dns`] は `UNIMPLEMENTED` のまま（モードだけでは名前解決方式を
+//!   判定できないため。REPAIR-3）。DNS ヘルパーの上流転送は TASK-185.3（#346）。軽量運用（`StaticHosts`。NET-8）の
+//!   直接書き込みは `etc_hosts::apply_static_dns`（TASK-146.2・#336）が [`ResolvConfPlan::for_static_bridge`] で扱う。
 //!
 //! 検証は全件を終えてから書き込む all-or-nothing。ファイルへは `IpAddr` の表記のみを書き、利用者の
 //! 生文字列は到達しない（改行注入で `options` / `search` 行を差し込めない）。
@@ -68,6 +69,23 @@ pub enum DnsApplyOutcome {
     NotRequested,
 }
 
+fn too_many() -> NetError {
+    NetError::new(NetErrorCode::InvalidArgument, "too many --dns servers")
+}
+
+/// 全件を検証してから `IpAddr` 列を返す（all-or-nothing。件数上限は呼び出し側で判定済みであること）。
+fn validate_nameservers(dns: &[&str], loopback_only: bool) -> Result<Vec<IpAddr>, NetError> {
+    let mut nameservers = Vec::with_capacity(dns.len());
+    for s in dns {
+        let ip = parse_ip_addr(s)?;
+        if loopback_only && !ip.is_loopback() {
+            return Err(InputViolation::NotLoopbackForNoneMode.into());
+        }
+        nameservers.push(ip);
+    }
+    Ok(nameservers)
+}
+
 impl ResolvConfPlan {
     /// モードと `--dns` 生入力から計画を作る（副作用なし）。
     ///
@@ -75,10 +93,7 @@ impl ResolvConfPlan {
     /// 1 件でも不正なら `Err` で、呼び出し側はファイル操作に進まない。
     pub fn for_mode(mode: NetworkMode, dns: &[&str]) -> Result<Option<Self>, NetError> {
         if dns.len() > MAX_DNS_SERVERS {
-            return Err(NetError::new(
-                NetErrorCode::InvalidArgument,
-                "too many --dns servers",
-            ));
+            return Err(too_many());
         }
         if dns.is_empty() {
             return Ok(None);
@@ -93,15 +108,27 @@ impl ResolvConfPlan {
             NetworkMode::Host => false,
             NetworkMode::None => true,
         };
-        let mut nameservers = Vec::with_capacity(dns.len());
-        for s in dns {
-            let ip = parse_ip_addr(s)?;
-            if loopback_only && !ip.is_loopback() {
-                return Err(InputViolation::NotLoopbackForNoneMode.into());
-            }
-            nameservers.push(ip);
+        Ok(Some(Self {
+            nameservers: validate_nameservers(dns, loopback_only)?,
+        }))
+    }
+
+    /// 軽量運用（DNS ヘルパーなしの bridge。`NameResolution::StaticHosts`）の計画を作る（副作用なし。
+    /// NET-8・TASK-146.2・#336）。
+    ///
+    /// `etc_hosts::apply_static_dns` から呼ばれる。件数上限は確保の前に判定し、検証は NET-12 と同じ
+    /// [`parse_ip_addr`] を全件に適用する。loopback・IPv6 も受理する（NET-8 に追加制限は無い。到達性は
+    /// 保証・検証しない）。空入力は `Ok(None)`。
+    pub(crate) fn for_static_bridge(dns: &[&str]) -> Result<Option<Self>, NetError> {
+        if dns.len() > MAX_DNS_SERVERS {
+            return Err(too_many());
         }
-        Ok(Some(Self { nameservers }))
+        if dns.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            nameservers: validate_nameservers(dns, false)?,
+        }))
     }
 
     /// 書き込む nameserver（入力順・重複保持）。
@@ -139,7 +166,7 @@ impl ResolvConfPlan {
         })
     }
 
-    fn write_unrecorded(&self, path: &Path) -> Result<PersistGuarantee, NetError> {
+    pub(crate) fn write_unrecorded(&self, path: &Path) -> Result<PersistGuarantee, NetError> {
         let werr = || NetError::new(NetErrorCode::Internal, "failed to write resolv.conf");
         // 呼び出しごとに固有の一時ファイル名（pid + プロセス内カウンタ + 時刻）を同一ディレクトリに作る。
         // 固定名だと同一 path への同時書き込みが互いの tmp を削除・上書きして壊れるため。

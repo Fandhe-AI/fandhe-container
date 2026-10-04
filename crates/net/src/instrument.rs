@@ -59,6 +59,7 @@ pub enum NetOpKind {
     AddHostsApply,
     /// host / none モードの `--dns` 反映（検証 + `resolv.conf` 原子的書き込み。`add_host_dns::resolv_conf`。
     /// TASK-185.4・#347・NET-12）。
+    /// 軽量運用（`StaticHosts`）の `etc_hosts::apply_static_dns` でも使う（TASK-146.2・#336・NET-8）。
     DnsResolvConfWrite,
     /// 軽量運用（DNS ヘルパーなし）のサービス名 hosts 静的注入（検証 + 追記。
     /// `etc_hosts::inject_service_hosts_with_recorder`。TASK-146.1・#334・NET-8）。

@@ -83,7 +83,7 @@ impl ConfigField {
     }
 }
 
-/// 読み書き共有で拒否する特殊ファイルの種別（[`ConfigError::SharedDirSpecialFile`]。TASK-65.1）。
+/// 共有（ReadWrite・ReadOnly 共通）で拒否する特殊ファイルの種別（[`ConfigError::SharedDirSpecialFile`]。TASK-65.1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SpecialFileKind {
@@ -199,32 +199,33 @@ pub enum ConfigError {
     SharedDirNotNormalized { path: PathBuf },
     /// 共有ディレクトリがファイルシステムのルート。
     SharedDirIsRoot,
-    /// 読み書き共有の配下に別のファイルシステムのマウントポイントがある（`path` は最初に見つかった境界）。
+    /// 共有（ReadWrite・ReadOnly 共通）の配下に別のファイルシステムのマウントポイントがある
+    /// （`path` は最初に見つかった境界）。
     ///
-    /// 共有範囲の外のホスト領域が ReadWrite でゲストへ公開されるのを防ぐ（MAC-1・TASK-65.1）。
+    /// 共有範囲の外のホスト領域がゲストへ公開されるのを防ぐ（MAC-1・SEC-4・TASK-65.1）。
     SharedDirCrossesMount { path: PathBuf, share_dir: PathBuf },
-    /// 読み書き共有の配下にある symlink のリンク先が、共有範囲内に収まることを確認できない
+    /// 共有（ReadWrite・ReadOnly 共通）の配下にある symlink のリンク先が、共有範囲内に収まることを確認できない
     /// （範囲外を指す・リンク先の親まで解決できない。`path` は symlink 自身のパス）。
     ///
     /// virtiofs サーバのホスト側での symlink の扱いを検証できないため、範囲外への書き込み経路になり得る
-    /// 構成を fail-closed で拒否する（MAC-1・TASK-65.1）。
+    /// 構成を fail-closed で拒否する（範囲外の読み出し・書き込み経路。MAC-1・SEC-4・TASK-65.1）。
     SharedDirSymlinkEscapes { path: PathBuf, share_dir: PathBuf },
-    /// 読み書き共有の配下に、リンク数が 2 以上の通常ファイル（ハードリンク）がある（`links` はリンク数）。
+    /// 共有（ReadWrite・ReadOnly 共通）の配下に、リンク数が 2 以上の通常ファイル（ハードリンク）がある（`links` はリンク数）。
     ///
     /// 他のリンクが共有範囲外にあるかを確かめられないため、ゲストがリンクを辿らずに範囲外と同じ inode を
-    /// 書き換えられる経路として fail-closed で拒否する（MAC-1・TASK-65.1）。
+    /// 読み書きできる経路として fail-closed で拒否する（MAC-1・TASK-65.1）。
     SharedDirHardlinkedFile {
         path: PathBuf,
         links: u64,
         share_dir: PathBuf,
     },
-    /// 読み書き共有の配下に、許可しない特殊ファイル（キャラクタ / ブロックデバイス・FIFO）がある。
+    /// 共有（ReadWrite・ReadOnly 共通）の配下に、許可しない特殊ファイル（キャラクタ / ブロックデバイス・FIFO）がある。
     SharedDirSpecialFile {
         path: PathBuf,
         kind: SpecialFileKind,
         share_dir: PathBuf,
     },
-    /// 読み書き共有がディレクトリのハードリンクを作れるファイルシステム（HFS+）上にある（macOS）。
+    /// 共有（ReadWrite・ReadOnly 共通）がディレクトリのハードリンクを作れるファイルシステム（HFS+）上にある（macOS）。
     ///
     /// ディレクトリのハードリンクはリンク数で見分けられず、共有範囲外のディレクトリを配下に持ち込めるため
     /// fail-closed で拒否する（MAC-1・TASK-65.1）。`fs_type` は `statfs` の `f_fstypename`。
@@ -479,7 +480,7 @@ impl ConfigError {
             }
             ConfigError::SharedDirCrossesMount { path, share_dir } => {
                 format!(
-                    "read-write shared directory {} contains a mount point: {}",
+                    "shared directory {} contains a mount point: {}",
                     share_dir.display(),
                     path.display()
                 )
@@ -490,7 +491,7 @@ impl ConfigError {
                 share_dir,
             } => {
                 format!(
-                    "read-write shared directory {} contains a hard-linked file ({links} links): {}",
+                    "shared directory {} contains a hard-linked file ({links} links): {}",
                     share_dir.display(),
                     path.display()
                 )
@@ -501,7 +502,7 @@ impl ConfigError {
                 share_dir,
             } => {
                 format!(
-                    "read-write shared directory {} contains a {}: {}",
+                    "shared directory {} contains a {}: {}",
                     share_dir.display(),
                     kind.as_str(),
                     path.display()
@@ -509,13 +510,13 @@ impl ConfigError {
             }
             ConfigError::SharedDirUnsupportedFilesystem { fs_type, share_dir } => {
                 format!(
-                    "read-write shared directory {} is on a {fs_type} filesystem, which allows directory hard links",
+                    "shared directory {} is on a {fs_type} filesystem, which allows directory hard links",
                     share_dir.display()
                 )
             }
             ConfigError::SharedDirSymlinkEscapes { path, share_dir } => {
                 format!(
-                    "read-write shared directory {} contains a symlink whose target is not confirmed to stay inside it: {}",
+                    "shared directory {} contains a symlink whose target is not confirmed to stay inside it: {}",
                     share_dir.display(),
                     path.display()
                 )
@@ -1241,7 +1242,7 @@ fn reject_mounts_under(_dir: &Path) -> Result<(), ConfigError> {
     })
 }
 
-/// ReadWrite 共有配下の symlink `link` のリンク先が、共有範囲 `dir`（symlink を解決済みの実体パス）に
+/// 共有（ReadWrite・ReadOnly 共通）配下の symlink `link` のリンク先が、共有範囲 `dir`（symlink を解決済みの実体パス）に
 /// 収まることを確認する（MAC-1・TASK-65.1。AGENTS.md の rootfs・マウント・ボリューム境界）。
 ///
 /// 背景: FUSE（virtiofs）では symlink はゲストの VFS が `FUSE_READLINK` でリンク先文字列を受け取って
@@ -1305,14 +1306,16 @@ fn check_share_fs_type(fs_type: &[u8], dir: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// ReadWrite 共有の配下で拒否する特殊ファイルの種別を返す（拒否しないものは `None`）。
+/// 共有（ReadWrite・ReadOnly 共通）の配下で拒否する特殊ファイルの種別を返す（拒否しないものは `None`）。
 ///
 /// - キャラクタ / ブロックデバイス: 拒否する。FUSE ではゲストが自分のデバイスとして開く
 ///   （Linux `fs/fuse/inode.c` の `fuse_init_inode` → `init_special_inode`）が、共有経由で任意の
 ///   major / minor のデバイスノードを持ち込めるため。
 /// - FIFO: 拒否する。正常なゲストカーネルはゲスト内で完結させるが、侵害されたゲストカーネルが
 ///   `FUSE_OPEN` を送った場合に、ホスト側サーバがホスト上の FIFO を開くか（ホストのプロセスとの経路・
-///   読み書き待ちでの停止）を確かめられないため。
+///   読み書き待ちでの停止）を確かめられないため。ReadOnly 共有でも読み出しの open だけで待ちに入り得る
+///   （ホストサーバの停止）ため、書き込み権とは無関係に拒否する。デバイスも共有の RO 指定に関係なく
+///   ゲスト側で任意の major / minor として開けるため同様に拒否する。
 /// - ソケット: 許可する。`open(2)` はソケットに対して `ENXIO` で失敗し、FUSE には `connect` に当たる
 ///   要求が無いため、ホスト上のソケットへ届く経路が無い。git の fsmonitor が `.git` 配下に置く
 ///   ソケット等を含む開発用ディレクトリを共有できるようにする。
@@ -1330,7 +1333,7 @@ fn special_file_kind(ft: &std::fs::FileType) -> Option<SpecialFileKind> {
     }
 }
 
-/// ReadWrite 共有の配下に、保護入力と同一 inode（`(dev, ino)` 一致）のエントリがあれば拒否する。
+/// 共有（ReadWrite・ReadOnly 共通）の配下を走査し、保護入力と同一 inode（`(dev, ino)` 一致）のエントリがあれば拒否する。
 ///
 /// パスの包含検査（[`crate::virtiofs::path_is_within`]）では、共有の外にある保護入力へのハードリンクを
 /// 共有内に置かれると検出できず、ゲストが同じ inode を書き換えられる（MAC-1・TASK-65.1。
@@ -1340,8 +1343,12 @@ fn special_file_kind(ft: &std::fs::FileType) -> Option<SpecialFileKind> {
 /// 同一デバイス上の別マウント（Linux の bind mount・macOS の nullfs 等）は `st_dev` が同じため、
 /// Linux はマウント表（[`reject_mounts_under`]）、macOS はディレクトリごとの `statfs(2)` のマウント識別子で
 /// 検出する。検査後に新たにマウントされる TOCTOU は残る。
+/// ReadOnly 共有では `protected` を空で呼ぶ（保護入力の包含は ReadWrite 限定の検査）が、残りの共有範囲外
+/// 経路の検査は同じ厳しさで行う。`nlink > 1` のファイルは他のリンクの位置を確かめられず、範囲外 inode の
+/// 内容を読み出しで露出し得るため RO でも fail-closed で拒否する（ハードリンクを多用するツリーの RO 共有が
+/// できなくなる利便性コストは受け入れる）。MAC-1・SEC-4・TASK-65.1 追補。
 /// 共有配下の symlink はリンク先が共有範囲に収まることを [`check_symlink_within_share`] で確認し、
-/// 確認できなければ [`ConfigError::SharedDirSymlinkEscapes`] で拒否する（範囲外への書き込み経路の防止）。
+/// 確認できなければ [`ConfigError::SharedDirSymlinkEscapes`] で拒否する（範囲外への読み書き経路の防止）。
 /// 保護入力以外でも、リンク数 2 以上の通常ファイルは [`ConfigError::SharedDirHardlinkedFile`]、
 /// キャラクタ / ブロックデバイス・FIFO は [`ConfigError::SharedDirSpecialFile`]（[`special_file_kind`]）、
 /// macOS の HFS+ 上の共有は [`ConfigError::SharedDirUnsupportedFilesystem`] で拒否する。
@@ -1598,14 +1605,18 @@ impl VmConfigSpec {
         inputs
     }
 
-    /// ReadWrite の virtiofs 共有が VM の保護入力（kernel・initrd・ディスクイメージ・コンソールログ）を
-    /// 含まないことを検査する（MAC-1・TASK-65.1。ゲストによる起動入力の書き換え防止）。
+    /// virtiofs 共有の衝突・共有範囲外経路を検査する（MAC-1・SEC-4・TASK-65.1）。
     ///
+    /// ReadWrite 共有は VM の保護入力（kernel・initrd・ディスクイメージ・コンソールログ）を含まないこと
+    /// （ゲストによる起動入力の書き換え防止）を検査する。ReadOnly 共有は書き換えられず、ゲスト自身の
+    /// 起動入力を読めても新たな露出にならないため、保護入力の包含検査だけを行わない。
     /// 共有ディレクトリの配下（同一ディレクトリ自身を含む）に保護入力があれば
     /// [`ConfigError::SharedDirContainsProtectedInput`] を返す。比較は symlink を解決した実体パスで、
     /// 解決できない（未作成のコンソールログ等）場合は親を解決して補う。unix では共有配下も走査し、
     /// 保護入力へのハードリンク・マウント境界・共有範囲外を指す symlink を拒否する（`find_hardlink_to_protected`）。
-    /// ReadOnly 共有は書き換えられないため対象外。`build_vz_configuration` が VZ 呼び出しの前に実行する。
+    /// 共有範囲外経路の検査（マウント境界・範囲外 symlink・ハードリンク・特殊ファイル・HFS+）は
+    /// ReadOnly 共有にも適用する（範囲外ホストファイルの読み出し露出の防止）。
+    /// `build_vz_configuration` が VZ 呼び出しの前に実行する。
     /// 検査から VM 起動・使用までの差し替え（TOCTOU）とゲストが実行時に作る symlink は検査できない。
     pub fn check_share_conflicts(&self) -> Result<(), ConfigError> {
         let mut protected = self.protected_inputs();
@@ -1620,21 +1631,22 @@ impl VmConfigSpec {
             .map(|p| (p.field, resolve_for_containment(p.path)))
             .collect();
         for share in self.shares.shares() {
-            if share.access.is_read_only() {
-                continue;
-            }
+            let read_only = share.access.is_read_only();
             let dir = resolve_for_containment(share.host_dir.as_path());
-            for (field, path) in &resolved {
-                if crate::virtiofs::path_is_within(path, &dir) {
-                    return Err(ConfigError::SharedDirContainsProtectedInput {
-                        field: *field,
-                        path: path.clone(),
-                        share_dir: dir,
-                    });
+            if !read_only {
+                for (field, path) in &resolved {
+                    if crate::virtiofs::path_is_within(path, &dir) {
+                        return Err(ConfigError::SharedDirContainsProtectedInput {
+                            field: *field,
+                            path: path.clone(),
+                            share_dir: dir,
+                        });
+                    }
                 }
             }
+            // ReadOnly は保護入力の照合なし（空）で、範囲外経路の走査だけ行う。
             #[cfg(unix)]
-            find_hardlink_to_protected(&dir, &resolved)?;
+            find_hardlink_to_protected(&dir, if read_only { &[] } else { &resolved })?;
         }
         Ok(())
     }
@@ -1808,7 +1820,7 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
         });
     }
 
-    // ReadWrite 共有が起動入力（kernel・initrd・ディスクイメージ・コンソールログ）を含む構成は、副作用の前に拒否する。
+    // ReadWrite 共有が起動入力を含む構成と、ReadOnly を含む共有範囲外経路のある構成は、副作用の前に拒否する。
     spec.check_share_conflicts()?;
 
     let kernel_url =
@@ -2358,7 +2370,7 @@ mod tests {
         };
         assert_eq!(
             e.to_string(),
-            "config.shared_dir_hardlinked_file: read-write shared directory /s contains a hard-linked file (2 links): /s/f"
+            "config.shared_dir_hardlinked_file: shared directory /s contains a hard-linked file (2 links): /s/f"
         );
         let e = ConfigError::SharedDirSpecialFile {
             path: PathBuf::from("/s/p"),
@@ -2367,7 +2379,7 @@ mod tests {
         };
         assert_eq!(
             e.to_string(),
-            "config.shared_dir_special_file: read-write shared directory /s contains a fifo: /s/p"
+            "config.shared_dir_special_file: shared directory /s contains a fifo: /s/p"
         );
         assert_eq!(SpecialFileKind::CharDevice.as_str(), "character device");
         assert_eq!(SpecialFileKind::BlockDevice.as_str(), "block device");
@@ -2377,7 +2389,7 @@ mod tests {
         };
         assert_eq!(
             e.to_string(),
-            "config.shared_dir_unsupported_filesystem: read-write shared directory /s is on a hfs filesystem, which allows directory hard links"
+            "config.shared_dir_unsupported_filesystem: shared directory /s is on a hfs filesystem, which allows directory hard links"
         );
         let e = ConfigError::SharedDirSymlinkEscapes {
             path: PathBuf::from("/s/link"),
@@ -2385,7 +2397,7 @@ mod tests {
         };
         assert_eq!(
             e.to_string(),
-            "config.shared_dir_symlink_escapes: read-write shared directory /s contains a symlink whose target is not confirmed to stay inside it: /s/link"
+            "config.shared_dir_symlink_escapes: shared directory /s contains a symlink whose target is not confirmed to stay inside it: /s/link"
         );
         let e = ConfigError::VirtiofsTagRejected {
             domain: "VZErrorDomain".to_string(),
@@ -2598,10 +2610,10 @@ broken line
     }
 
     /// MAC-1・TASK-65.1: 保護入力でなくても、ReadWrite 共有配下のリンク数 2 以上の通常ファイルは
-    /// 拒否する（共有範囲外のリンク・共有内だけのリンクとも）。ReadOnly 共有は対象外。
+    /// 拒否する（共有範囲外のリンク・共有内だけのリンクとも）。ReadOnly 共有にも同じ検査を適用する（SEC-4）。
     #[cfg(unix)]
     #[test]
-    fn rejects_read_write_share_with_hardlinked_file() {
+    fn rejects_share_with_hardlinked_file_for_both_access_modes() {
         use crate::virtiofs::{ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
         let t = TempDir::new("share-nlink");
         let real = std::fs::canonicalize(&t.0).unwrap();
@@ -2641,9 +2653,10 @@ broken line
                 share_dir: shared.clone(),
             }
         );
-        ro.check_share_conflicts().unwrap();
+        assert_eq!(ro.check_share_conflicts().unwrap_err(), err);
         std::fs::remove_file(&link).unwrap();
         rw.check_share_conflicts().unwrap();
+        ro.check_share_conflicts().unwrap();
 
         // 共有内だけで完結するハードリンクも、他のリンクの位置を確かめないため拒否する（3 リンク）。
         let a = shared.join("a");
@@ -2655,6 +2668,48 @@ broken line
             err,
             ConfigError::SharedDirHardlinkedFile { links: 3, .. }
         ));
+        assert!(matches!(
+            ro.check_share_conflicts().unwrap_err(),
+            ConfigError::SharedDirHardlinkedFile { links: 3, .. }
+        ));
+        std::fs::remove_file(shared.join("sub").join("b")).unwrap();
+        std::fs::remove_file(shared.join("sub").join("c")).unwrap();
+        ro.check_share_conflicts().unwrap();
+    }
+
+    /// MAC-1・SEC-4・TASK-65.1: ReadOnly 共有内の kernel へのハードリンクは、保護入力の包含検査ではなく
+    /// ハードリンク検査（`SharedDirHardlinkedFile`）で拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn rejects_read_only_share_with_hardlink_to_kernel() {
+        use crate::virtiofs::{ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
+        let t = TempDir::new("share-ro-kernel-link");
+        let real = std::fs::canonicalize(&t.0).unwrap();
+        let shared = real.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let k = real.join("vmlinux");
+        std::fs::write(&k, b"k").unwrap();
+        let ro = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_shared_directories(
+                VirtiofsSharesSpec::try_new(vec![VirtiofsShareSpec::new(
+                    VirtiofsTag::try_new("s").unwrap(),
+                    SharedDirectoryPath::try_new(&shared).unwrap(),
+                    ShareAccess::ReadOnly,
+                )])
+                .unwrap(),
+            );
+        ro.check_share_conflicts().unwrap();
+        let link = shared.join("k-copy");
+        std::fs::hard_link(&k, &link).unwrap();
+        assert_eq!(
+            ro.check_share_conflicts().unwrap_err(),
+            ConfigError::SharedDirHardlinkedFile {
+                path: link,
+                links: 2,
+                share_dir: shared,
+            }
+        );
     }
 
     /// MAC-1・TASK-65.1: 特殊ファイルの判定（キャラクタデバイス・FIFO は拒否、ディレクトリは対象外）と、
@@ -2678,6 +2733,16 @@ broken line
                     VirtiofsTag::try_new("s").unwrap(),
                     SharedDirectoryPath::try_new(&shared).unwrap(),
                     ShareAccess::ReadWrite,
+                )])
+                .unwrap(),
+            );
+        let ro = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_shared_directories(
+                VirtiofsSharesSpec::try_new(vec![VirtiofsShareSpec::new(
+                    VirtiofsTag::try_new("s").unwrap(),
+                    SharedDirectoryPath::try_new(&shared).unwrap(),
+                    ShareAccess::ReadOnly,
                 )])
                 .unwrap(),
             );
@@ -2705,6 +2770,49 @@ broken line
         let sock = shared.join("s");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         rw.check_share_conflicts().unwrap();
+        ro.check_share_conflicts().unwrap();
+    }
+
+    /// MAC-1・SEC-4・TASK-65.1: 配下に別マウントを持つ実ディレクトリ（Linux の `/sys`）の ReadOnly 共有は
+    /// `check_share_conflicts` 経由でも `SharedDirCrossesMount` で拒否する。前提が満たされない環境では
+    /// 理由を出力して判定を省く。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_read_only_share_crossing_mount() {
+        use crate::virtiofs::{ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
+        let t = TempDir::new("share-ro-mount");
+        let k = t.file("vmlinux");
+        let sys = Path::new("/sys");
+        let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            eprintln!("note: /proc/self/mountinfo is unreadable; mount check not exercised");
+            return;
+        };
+        let Some(mount) = mount_point_under(&mountinfo, sys) else {
+            eprintln!("note: no mount point under /sys; mount check not exercised");
+            return;
+        };
+        let Ok(dir) = SharedDirectoryPath::try_new(sys) else {
+            eprintln!(
+                "note: /sys is not accepted as a shared directory; mount check not exercised"
+            );
+            return;
+        };
+        let ro = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_shared_directories(
+                VirtiofsSharesSpec::try_new(vec![VirtiofsShareSpec::new(
+                    VirtiofsTag::try_new("s").unwrap(),
+                    dir,
+                    ShareAccess::ReadOnly,
+                )])
+                .unwrap(),
+            );
+        let err = ro.check_share_conflicts().unwrap_err();
+        assert_eq!(err.code(), "config.shared_dir_crosses_mount");
+        assert!(
+            matches!(&err, ConfigError::SharedDirCrossesMount { share_dir, .. } if share_dir == sys),
+            "{err:?} (mount under /sys: {mount:?})"
+        );
     }
 
     /// MAC-1・TASK-65.1: HFS+（`hfs`）上の共有はディレクトリのハードリンクを見分けられないため拒否する。
@@ -2724,10 +2832,10 @@ broken line
     }
 
     /// MAC-1・TASK-65.1: ReadWrite 共有配下の symlink は、リンク先が共有範囲内なら許可し、範囲外
-    /// （絶対・相対・ディレクトリ・dangling）・ループは拒否する。ReadOnly 共有は対象外。
+    /// （絶対・相対・ディレクトリ・dangling）・ループは拒否する。ReadOnly 共有にも同じ検査を適用する。
     #[cfg(unix)]
     #[test]
-    fn rejects_read_write_share_with_symlink_escaping_share() {
+    fn rejects_share_with_symlink_escaping_share_for_both_access_modes() {
         use crate::virtiofs::{ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
         use std::os::unix::fs::symlink;
         let t = TempDir::new("share-symlink");
@@ -2762,6 +2870,7 @@ broken line
         let inside_dangling = shared.join("sub").join("lock");
         symlink("not-yet-created", &inside_dangling).unwrap();
         rw.check_share_conflicts().unwrap();
+        ro.check_share_conflicts().unwrap();
 
         let expect_escape = |link: &Path| {
             let err = rw.check_share_conflicts().unwrap_err();
@@ -2773,10 +2882,11 @@ broken line
                     share_dir: shared.clone(),
                 }
             );
-            // ReadOnly 共有は書き換えられないため対象外。
-            ro.check_share_conflicts().unwrap();
+            // ReadOnly 共有でも同じ値で拒否する（範囲外の読み出し経路。SEC-4）。
+            assert_eq!(ro.check_share_conflicts().unwrap_err(), err);
             std::fs::remove_file(link).unwrap();
             rw.check_share_conflicts().unwrap();
+            ro.check_share_conflicts().unwrap();
         };
 
         // 共有外の kernel を指す絶対 symlink。
@@ -2813,6 +2923,13 @@ broken line
         assert_eq!(err.code(), "config.path_io");
         assert!(matches!(
             err,
+            ConfigError::PathIo {
+                field: ConfigField::SharedDirectory,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ro.check_share_conflicts().unwrap_err(),
             ConfigError::PathIo {
                 field: ConfigField::SharedDirectory,
                 ..

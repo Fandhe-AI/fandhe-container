@@ -323,19 +323,25 @@ fn not_enabled_error() -> Wsl2Error {
 
 /// `--version` の実行結果を解釈する。
 ///
-/// 正常終了でもバージョンとして読めない出力が WSL 無効・アクセス拒否の識別子を含むなら、解析エラー
-/// ではなく対応する構造化エラーを返す（[`interpret_list`] と同じ扱い。ERR-1）。
+/// 正常終了でもバージョンとして読めない（形式不明の DATA_LOSS）出力が WSL 無効・アクセス拒否の識別子を
+/// 含むなら、解析エラーではなく対応する構造化エラーを返す（[`interpret_list`] と同じ扱い。ERR-1）。
+/// 上限超過（RESOURCE_EXHAUSTED）など DATA_LOSS 以外の解析エラーは識別子で上書きしない。
 fn interpret_version(out: &run::Captured) -> Result<WslVersionInfo, Wsl2Error> {
     if !out.success {
         return Err(failure_error(out, "wsl.exe --version failed"));
     }
     parse::decode_output(&out.stdout)
         .and_then(|t| parse::parse_version(&t))
-        .map_err(|parse_err| match parse::classify_failure(out) {
-            parse::Failure::WslDisabled | parse::Failure::PermissionDenied => {
-                failure_error(out, "wsl.exe --version failed")
+        .map_err(|parse_err| {
+            if parse_err.code() != Wsl2ErrorCode::DataLoss {
+                return parse_err;
             }
-            _ => parse_err,
+            match parse::classify_failure(out) {
+                parse::Failure::WslDisabled | parse::Failure::PermissionDenied => {
+                    failure_error(out, "wsl.exe --version failed")
+                }
+                _ => parse_err,
+            }
         })
 }
 
@@ -345,6 +351,7 @@ fn interpret_version(out: &run::Captured) -> Result<WslVersionInfo, Wsl2Error> {
 /// エラー識別子と同じ文字列でも、正常な一覧を失敗扱いにしない）。一覧として読めない場合に限り
 /// 失敗出力として分類する: ディストリ 0 件の専用識別子だけなら空の一覧（0 件の案内文を終了コード 0 で
 /// 返す環境がある）、WSL 無効・アクセス拒否なら対応する構造化エラー、それ以外は解析エラー（DATA_LOSS）。
+/// 分類は形式不明の解析エラー（DATA_LOSS）に限り、上限超過（RESOURCE_EXHAUSTED）等はそのまま返す。
 /// 非ゼロ終了は、0 件の識別子だけなら空の一覧、それ以外は [`failure_error`]（ERR-1）。
 fn interpret_list(out: &run::Captured) -> Result<Vec<WslDistro>, Wsl2Error> {
     if out.success {
@@ -353,6 +360,9 @@ fn interpret_list(out: &run::Captured) -> Result<Vec<WslDistro>, Wsl2Error> {
                 Ok(distros) => return Ok(distros),
                 Err(e) => e,
             };
+        if parse_err.code() != Wsl2ErrorCode::DataLoss {
+            return Err(parse_err);
+        }
         return match parse::classify_failure(out) {
             parse::Failure::NoDistro => Ok(Vec::new()),
             parse::Failure::WslDisabled | parse::Failure::PermissionDenied => {

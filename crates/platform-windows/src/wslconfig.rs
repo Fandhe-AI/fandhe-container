@@ -494,18 +494,51 @@ fn tmp_path(parent: &Path, tag: &str) -> PathBuf {
 }
 
 /// 一時ファイルを排他的に作り、`data` を書いて fsync する。失敗時は自分が作ったファイルを消す。
-fn write_new_file(tmp: &Path, data: &[u8]) -> Result<std::fs::File, WinError> {
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+///
+/// unix では作成時点から所有者のみ（0600）で作り、`perm_from` があればその権限へ揃えてから内容を書く。
+/// 既定の作成権限（umask 次第で他ユーザー読み取り可）のまま書くと、`kernelCommandLine` 等の秘密情報が
+/// 権限調整までの間だけ漏れうるため、書き込みより前に権限を確定させる。
+fn write_new_file(
+    tmp: &Path,
+    data: &[u8],
+    perm_from: Option<&Path>,
+) -> Result<std::fs::File, WinError> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(tmp)
         .map_err(|e| io_err(&e, "failed to create temporary file"))?;
-    if let Err(e) = f.write_all(data).and_then(|()| f.sync_all()) {
-        drop(f);
-        let _ = std::fs::remove_file(tmp);
-        return Err(io_err(&e, "failed to write temporary file"));
+    let result = (|| -> Result<(), WinError> {
+        #[cfg(unix)]
+        if let Some(src) = perm_from {
+            // 宛先が消えていた場合のみ 0600 のまま続行する。それ以外の失敗は書き込み前に中止する。
+            match std::fs::metadata(src) {
+                Ok(m) => f
+                    .set_permissions(m.permissions())
+                    .map_err(|e| io_err(&e, "failed to copy file permissions"))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_err(&e, "failed to copy file permissions")),
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = perm_from;
+        f.write_all(data)
+            .and_then(|()| f.sync_all())
+            .map_err(|e| io_err(&e, "failed to write temporary file"))
+    })();
+    match result {
+        Ok(()) => Ok(f),
+        Err(e) => {
+            drop(f);
+            let _ = std::fs::remove_file(tmp);
+            Err(e)
+        }
     }
-    Ok(f)
 }
 
 /// `.wslconfig` を書き込む。`mode` により新規作成の排他性と既存置換の方式が変わる。
@@ -513,12 +546,12 @@ fn write_new_file(tmp: &Path, data: &[u8]) -> Result<std::fs::File, WinError> {
 /// - [`WriteMode::CreateOnly`]: 一時ファイルへ書いて fsync した後、`hard_link` で宛先に公開する。
 ///   `hard_link` は宛先が存在すれば失敗する（既存を置換しない）ため、読み込みから公開までの間に
 ///   別プロセスが作った `.wslconfig` を上書きしない（`Err` を返し元のまま残す）。公開後に一時名を消す。
-/// - [`WriteMode::Replace`]（unix）: 一時ファイル → fsync → rename で原子的に置き換える。既存の宛先の
-///   パーミッションを一時ファイルへ引き継ぐ。rename 成功後の親ディレクトリ fsync に失敗した場合は
-///   置換済みのまま `Err` を返す。
-/// - [`WriteMode::Replace`]（Windows）: ACL を保持するため rename せず、リンクを辿らず開いたハンドルへ
-///   上書きする。上書きに失敗したらメモリ上の元の内容を書き戻す（ディスク上の退避ファイルは作らない。
-///   理由は [`overwrite_handle`]）。
+/// - [`WriteMode::Replace`]: 一時ファイル → fsync → rename で原子的に置き換える（全 OS 共通）。途中で
+///   強制終了しても宛先は旧内容か新内容のどちらかで、欠損・混在しない。unix では既存の宛先の
+///   パーミッションを書き込み前に一時ファイルへ引き継ぐ。Windows の rename は既存ファイルを置換し、
+///   置換後の ACL は親ディレクトリから継承した既定になる（エディタの一時ファイル保存と同じ。
+///   ACL の複製には Win32 API が必要で、依存追加はユーザー承認制のため行わない）。rename 成功後の
+///   親ディレクトリ fsync（unix）に失敗した場合は置換済みのまま `Err` を返す。
 ///
 /// 失敗時は自分が作った一時ファイルだけを削除する。読み込みから書き込みまでの間の他プロセスによる
 /// 変更はロックしない（単一ユーザーのホーム配下の設定操作のため許容。新規作成の競合のみ上記で拒否する）。
@@ -527,9 +560,9 @@ fn write_atomic(path: &Path, data: &[u8], mode: WriteMode) -> Result<(), WinErro
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
+    let tmp = tmp_path(parent, "tmp");
     if mode == WriteMode::CreateOnly {
-        let tmp = tmp_path(parent, "tmp");
-        drop(write_new_file(&tmp, data)?);
+        drop(write_new_file(&tmp, data, None)?);
         let linked = std::fs::hard_link(&tmp, path);
         let _ = std::fs::remove_file(&tmp);
         return match linked {
@@ -541,130 +574,19 @@ fn write_atomic(path: &Path, data: &[u8], mode: WriteMode) -> Result<(), WinErro
             Err(e) => Err(io_err(&e, "failed to create .wslconfig")),
         };
     }
-    // Windows では一時ファイルを rename で置換すると既存 `.wslconfig` の ACL が失われる。存在確認と open を
-    // 別操作に分けない（TOCTOU 回避）ため open の NotFound で判定する。
-    #[cfg(windows)]
+    drop(write_new_file(&tmp, data, Some(path))?);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io_err(&e, "failed to replace .wslconfig"));
+    }
+    #[cfg(unix)]
     {
-        if overwrite_existing(path, data)? {
-            Ok(())
-        } else {
-            Err(err(
-                WinErrorCode::NotFound,
-                ".wslconfig disappeared before it could be updated",
-            ))
-        }
+        // rename の反映先を永続化する。失敗しても内容は置換済みのため成功を装わずエラーにする。
+        std::fs::File::open(parent)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| io_err(&e, "failed to sync parent directory"))?;
     }
-    #[cfg(not(windows))]
-    {
-        let tmp = tmp_path(parent, "tmp");
-        let f = write_new_file(&tmp, data)?;
-        #[cfg(unix)]
-        {
-            let perm = std::fs::metadata(path)
-                .and_then(|m| f.set_permissions(m.permissions()))
-                .or_else(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        Ok(())
-                    } else {
-                        Err(e)
-                    }
-                })
-                .map_err(|e| io_err(&e, "failed to copy file permissions"));
-            if let Err(e) = perm {
-                drop(f);
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
-        }
-        drop(f);
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(io_err(&e, "failed to replace .wslconfig"));
-        }
-        #[cfg(unix)]
-        {
-            // rename の反映先を永続化する。失敗しても内容は置換済みのため成功を装わずエラーにする。
-            std::fs::File::open(parent)
-                .and_then(|d| d.sync_all())
-                .map_err(|e| io_err(&e, "failed to sync parent directory"))?;
-        }
-        Ok(())
-    }
-}
-
-/// 既存の `.wslconfig` を開いて内容だけ書き換える（Windows 向け。ACL・属性を保持する）。
-///
-/// リパースポイント（シンボリックリンク等）を辿らずに開き、開いたハンドル自身で通常ファイルであることを
-/// 検証してから書く（検証と書き込みの対象が同一。TOCTOU 回避）。存在しなければ `Ok(false)`。
-#[cfg(windows)]
-fn overwrite_existing(path: &Path, data: &[u8]) -> Result<bool, WinError> {
-    use std::os::windows::fs::OpenOptionsExt;
-    // FILE_FLAG_OPEN_REPARSE_POINT: リパースポイントを辿らず、リンク自体を開く。
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    let mut f = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(io_err(&e, "failed to open .wslconfig for writing")),
-    };
-    let meta = f
-        .metadata()
-        .map_err(|e| io_err(&e, "failed to stat .wslconfig"))?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err(err(
-            WinErrorCode::PermissionDenied,
-            ".wslconfig is not a regular file",
-        ));
-    }
-    overwrite_handle(&mut f, data)?;
-    Ok(true)
-}
-
-/// 開いたファイルの内容を `data` へ置き換える。上書きに失敗したらメモリ上の元の内容を書き戻す。
-///
-/// 1. 元の内容をメモリへ読み出す（上限 [`MAX_WSLCONFIG_BYTES`]）。
-/// 2. truncate で先に空にせず、先頭へ上書き → 長さ調整 → fsync する。
-/// 3. 上書きに失敗したら元の内容を書き戻す。書き戻しにも失敗したら固定文言の `Err` を返す。
-///
-/// 元の内容をディスク上の別ファイルへ退避しない。退避ファイルは親ディレクトリの ACL を継承するため、
-/// 元ファイルより緩い権限で内容（`kernelCommandLine` 等の秘密情報を含みうる）が読めてしまう。ACL の
-/// 複製には Win32 API（依存追加はユーザー承認制）が必要なため、機密性を優先して退避ファイルを持たない。
-/// その代償として、2 の途中でプロセスが強制終了すると内容が欠ける可能性が残る（数 KB 以下の
-/// 単一 write のため窓は狭い。自動復旧はしない）。
-#[cfg_attr(unix, allow(dead_code))]
-fn overwrite_handle(f: &mut std::fs::File, data: &[u8]) -> Result<(), WinError> {
-    use std::io::{Seek, SeekFrom};
-    let mut original = Vec::new();
-    Read::by_ref(f)
-        .take(MAX_WSLCONFIG_BYTES + 1)
-        .read_to_end(&mut original)
-        .map_err(|e| io_err(&e, "failed to read .wslconfig"))?;
-    if original.len() as u64 > MAX_WSLCONFIG_BYTES {
-        return Err(err(
-            WinErrorCode::ResourceExhausted,
-            format!(".wslconfig exceeds {MAX_WSLCONFIG_BYTES} bytes"),
-        ));
-    }
-    let put = |f: &mut std::fs::File, bytes: &[u8]| -> std::io::Result<()> {
-        f.seek(SeekFrom::Start(0))?;
-        f.write_all(bytes)?;
-        f.set_len(bytes.len() as u64)?;
-        f.sync_all()
-    };
-    match put(f, data) {
-        Ok(()) => Ok(()),
-        Err(e) => match put(f, &original) {
-            Ok(()) => Err(io_err(&e, "failed to write .wslconfig")),
-            Err(_) => Err(err(
-                WinErrorCode::Internal,
-                "failed to write .wslconfig and failed to restore its original content",
-            )),
-        },
-    }
+    Ok(())
 }
 
 /// `path` の `.wslconfig` に `virtiofs=true` を opt-in する（読み込み → 編集 → 原子的書き込み）。
@@ -910,21 +832,6 @@ mod tests {
         }
     }
 
-    /// WIN-2: ハンドル上書きは先に空にせず、短い内容へも置き換えられる（truncate 先行の回帰防止）。
-    #[test]
-    fn overwrite_handle_replaces_content_in_place() {
-        let d = TmpDir::new("overwrite");
-        std::fs::write(d.file(), "long original content").expect("write");
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(d.file())
-            .expect("open");
-        overwrite_handle(&mut f, b"short").expect("overwrite");
-        assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
-        assert_eq!(std::fs::read(d.file()).expect("read"), b"short");
-    }
-
     /// WIN-2: 新規作成モードで宛先が既に存在する（競合で現れた）場合は置換せず Err、一時ファイルも残さない。
     #[test]
     fn create_only_refuses_to_replace_existing_file() {
@@ -1029,6 +936,18 @@ mod tests {
         std::fs::set_permissions(d.file(), std::fs::Permissions::from_mode(0o600)).unwrap();
         enable_virtiofs_at(&d.file()).unwrap();
         let mode = std::fs::metadata(d.file()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// WIN-2: 一時ファイルは作成時点から 0600 で、内容を書く前に権限が確定している（unix）。
+    #[cfg(unix)]
+    #[test]
+    fn new_temp_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = TmpDir::new("tmpmode");
+        let tmp = d.0.join("t");
+        drop(write_new_file(&tmp, b"secret", None).unwrap());
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
 

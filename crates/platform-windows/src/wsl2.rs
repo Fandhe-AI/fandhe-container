@@ -281,15 +281,16 @@ pub(crate) fn list_distros_with_program(
 
 /// テスト専用: 実行するプログラムを差し替えて公開 API と同じ処理（起動・出力解析・エラー変換）を行う。
 ///
-/// feature `wsl2-test-support` でのみ公開する（結合試験 `tests/wsl2_detect.rs` が偽の `wsl.exe` を
-/// 渡す。REPAIR-12）。本番では有効にしない（任意のプログラムを `wsl.exe` として起動できるため。
+/// feature `wsl2-test-support` でのみ公開する（結合試験 `tests/wsl2_detect.rs`・`tests/wsl2_mount.rs` が
+/// 偽の `wsl.exe` を渡す。REPAIR-12）。本番では有効にしない（任意のプログラムを `wsl.exe` として起動できるため。
 /// 本番の経路は `GetSystemDirectoryW` 配下の絶対パスのみ。WIN-1）。
 #[cfg(feature = "wsl2-test-support")]
 pub mod test_support {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{Wsl2Error, Wsl2Status, WslDistro, WslVersionInfo};
+    use super::{LaunchRequest, PreparedLaunch, Wsl2Error, Wsl2Status, WslDistro, WslVersionInfo};
+    use crate::wslconfig::VirtiofsState;
 
     /// `program` を `wsl.exe` とみなす [`super::query_version`]。
     pub fn query_version_with_program(
@@ -310,6 +311,37 @@ pub mod test_support {
     /// `program` を `wsl.exe` とみなす [`super::detect`]。
     pub fn detect_with_program(program: &Path, timeout: Duration) -> Result<Wsl2Status, Wsl2Error> {
         super::detect_with_program(program, timeout)
+    }
+
+    /// `program` を `wsl.exe` とみなし、`.wslconfig` の virtiofs 状態を `virtiofs` で与える
+    /// [`super::prepare_virtiofs_launch`]（結合試験 `tests/wsl2_mount.rs`。TASK-67.4・WIN-2）。
+    pub fn prepare_virtiofs_launch_with_program(
+        program: &Path,
+        virtiofs: VirtiofsState,
+        req: &LaunchRequest,
+        timeout: Duration,
+    ) -> Result<PreparedLaunch, Wsl2Error> {
+        super::mount::prepare_with_program(program, virtiofs, req, timeout)
+    }
+
+    /// `program` を `wsl.exe` とみなす [`super::release_virtiofs_launch`]。
+    pub fn release_virtiofs_launch_with_program(
+        program: &Path,
+        prepared: &PreparedLaunch,
+        timeout: Duration,
+    ) -> Result<(), Wsl2Error> {
+        super::mount::release_with_program(program, prepared, timeout)
+    }
+
+    /// `program` を `wsl.exe` とみなし、`.wslconfig` の virtiofs 状態を `virtiofs` で与える [`super::launch_with`]。
+    pub fn launch_with_program<T>(
+        program: &Path,
+        virtiofs: VirtiofsState,
+        req: &LaunchRequest,
+        timeout: Duration,
+        start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
+    ) -> Result<T, Wsl2Error> {
+        super::mount::launch_with_program(program, virtiofs, req, timeout, start)
     }
 }
 

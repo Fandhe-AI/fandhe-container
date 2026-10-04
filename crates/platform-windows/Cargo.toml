@@ -41,7 +41,7 @@ required-features = ["wsl2-test-support"]
 bench = false
 doc = false
 
-# 呼び出し側の結合試験 tests/wsl2_detect.rs は `env!("CARGO_BIN_EXE_fake_wsl")` を使うため同じ feature で
+# 呼び出し側の結合試験 tests/wsl2_detect.rs・tests/wsl2_mount.rs（TASK-67.4）は `env!("CARGO_BIN_EXE_fake_wsl")` を使うため同じ feature で
 # 有効にするが、required-features ではなくファイル先頭の `#![cfg(feature = "wsl2-test-support")]` で
 # 切り替える（`make test-integration` の `cargo test --workspace --test '*'` は required-features を
 # 満たさない target があるとエラーで止まるため。feature なしでは 0 件の test target になる）。

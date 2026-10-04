@@ -894,7 +894,7 @@ fn resolve_environment(
 }
 
 /// `program` を `wsl.exe` として使い、`.wslconfig` の状態を `virtiofs` で与えて準備する。
-fn prepare_with_program(
+pub(super) fn prepare_with_program(
     program: &Path,
     virtiofs: VirtiofsState,
     req: &LaunchRequest,
@@ -953,7 +953,17 @@ pub fn release_virtiofs_launch(
 ) -> Result<(), Wsl2Error> {
     check_timeout(timeout)?;
     let program = wsl_exe_path()?;
-    let mut exec = program_exec(&program, timeout);
+    release_with_program(&program, prepared, timeout)
+}
+
+/// `program` を `wsl.exe` として使う [`release_virtiofs_launch`] の本体。
+pub(super) fn release_with_program(
+    program: &Path,
+    prepared: &PreparedLaunch,
+    timeout: Duration,
+) -> Result<(), Wsl2Error> {
+    check_timeout(timeout)?;
+    let mut exec = program_exec(program, timeout);
     match release_with_exec(prepared, &mut exec) {
         0 => Ok(()),
         n => Err(precondition(format!("{n} unmount(s) failed"))),
@@ -990,9 +1000,21 @@ pub fn launch_with<T>(
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
 ) -> Result<T, Wsl2Error> {
     let (program, state) = resolve_environment(timeout)?;
-    let status = detect_with_program(&program, timeout)?;
-    let mut exec = program_exec(&program, timeout);
-    launch_with_exec(&status, state, req, &mut exec, start)
+    launch_with_program(&program, state, req, timeout, start)
+}
+
+/// `program` を `wsl.exe` として使い、`.wslconfig` の状態を `virtiofs` で与える [`launch_with`] の本体。
+pub(super) fn launch_with_program<T>(
+    program: &Path,
+    virtiofs: VirtiofsState,
+    req: &LaunchRequest,
+    timeout: Duration,
+    start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
+) -> Result<T, Wsl2Error> {
+    check_timeout(timeout)?;
+    let status = detect_with_program(program, timeout)?;
+    let mut exec = program_exec(program, timeout);
+    launch_with_exec(&status, virtiofs, req, &mut exec, start)
 }
 
 #[cfg(test)]

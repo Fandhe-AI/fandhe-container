@@ -399,7 +399,9 @@ fn exec_argv(distro: &DistroName, cmd: &[&str]) -> Vec<String> {
 /// 取り下げへの追従: 記録を書いた後に `mkdir /run/fandhe/<nonce>.done` で完了を確定する。呼び出し側が
 /// 待ちきれずに [`ABANDON_SCRIPT`] で先に `.done` を取った（取り下げた）場合や、記録を書けなかった場合は、
 /// 呼び出し側が所有 ID を受け取れないので、本スクリプト自身が自分のマウント（同一プロセス内で特定した ID が
-/// マウント先の最上位であるもの）を外し、記録を消して終わる（209。外せなかった・特定できなかったときは 210）。
+/// マウント先の最上位であるもの）を外し、記録を消して終わる（209。新しいマウントが無かった場合も 209）。
+/// 外せなかった場合や、新しいマウントが複数あって自分のものを特定できなかった場合は 210（呼び出し側は残置の
+/// 可能性として報告する）。
 ///
 /// ディレクトリの作成は、並行する別の準備が先に作った場合（`EEXIST`）も成功として扱い、直後の検証で安全性を
 /// 確かめる（`/run` は tmpfs で WSL の再起動ごとに消えるため、記録ディレクトリの同時作成は起こりうる）。
@@ -450,8 +452,9 @@ const MOUNT_SCRIPT: &str = concat!(
     "if printf '%s\\n' \"$new\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" ",
     "&& mkdir -- \"$R/$4.done\" 2>/dev/null; then ",
     "[ \"$new\" = none ] || printf '%s\\n' \"$new\"; exit \"$rc\"; fi; ",
-    "x=209; if [ \"$new\" != none ]; then ",
-    "if [ \"$(top \"$T\")\" = \"$new\" ]; then umount \"$T\" >&2 9>&- || x=210; else x=210; fi; fi; ",
+    "x=209; if [ \"$n\" = 1 ]; then ",
+    "if [ \"$(top \"$T\")\" = \"$new\" ]; then umount \"$T\" >&2 9>&- || x=210; else x=210; fi; ",
+    "elif [ \"$n\" != 0 ]; then x=210; fi; ",
     "rm -f -- \"$R/$4\" \"$R/$4.tmp\"; rmdir -- \"$R/$4.claim\" \"$R/$4.done\" 2>/dev/null || :; exit \"$x\""
 );
 /// [`MOUNT_SCRIPT`] の終了コード（`/`・`/mnt`・`/run` 不正 / ディレクトリ作成失敗 / パス要素が危険 /
@@ -1611,7 +1614,7 @@ mod tests {
         ));
         // 記録を確定できない（取り下げを含む）ときは、自分のマウントが最上位なら自分で外して終える。
         assert!(MOUNT_SCRIPT.contains(
-            "x=209; if [ \"$new\" != none ]; then if [ \"$(top \"$T\")\" = \"$new\" ]; then umount \"$T\" >&2 9>&- || x=210; else x=210; fi; fi; "
+            "x=209; if [ \"$n\" = 1 ]; then if [ \"$(top \"$T\")\" = \"$new\" ]; then umount \"$T\" >&2 9>&- || x=210; else x=210; fi; elif [ \"$n\" != 0 ]; then x=210; fi; "
         ));
         assert!(
             ABANDON_SCRIPT.starts_with(
@@ -1932,7 +1935,7 @@ mod tests {
                 self.records.insert(nonce.to_string(), record);
                 return Ok(mine.map_or_else(String::new, |m| format!("{m}\n")));
             }
-            let mut code = 209;
+            let mut code = if fresh.len() > 1 { 210 } else { 209 };
             if let Some(m) = mine {
                 match self.mounts.iter().rposition(|(p, _)| p == target) {
                     Some(i) if self.ids.get(i) == Some(&m) => {
@@ -2976,5 +2979,23 @@ mod tests {
         assert_eq!(g.claims.len(), 1);
         assert!(g.records.is_empty());
         assert_eq!(g.clears, 0);
+    }
+
+    /// SEC: 記録を書けず、新しいマウントが複数あって自分のものを特定できない場合は外さず 210 で終え、
+    /// 呼び出し側は残置の可能性（ownership unconfirmed）として返す。
+    #[test]
+    fn prepare_reports_ambiguous_mount_when_record_cannot_be_written() {
+        let mut g = Guest::new("virtiofs");
+        g.fail_record_write = true;
+        g.extra_on_mount = true;
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "the shared mount could not be recorded (mount ownership unconfirmed; the mount may have been left in place)"
+        );
+        assert!(g.umounts.is_empty());
+        assert_eq!(g.ids, [1, 100, 101]);
     }
 }

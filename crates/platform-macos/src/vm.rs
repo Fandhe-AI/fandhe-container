@@ -1202,6 +1202,32 @@ mod tests {
         assert_eq!(core.lifecycle.state(), VmState::Stopped);
     }
 
+    /// REPAIR-5・TASK-64.4: 放棄後の要求が `canStart` で拒否されても、状態機械は実状態へ追従する。
+    #[test]
+    fn core_rejected_request_after_abandon_follows_actual_state() {
+        let (sink, rx) = event_channel(16);
+        let mut core = Core::new(sink);
+        let (mut ticket, _start) =
+            begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        core.abandon(&mut ticket);
+        drain(&rx);
+        let mut again = OpTicket::Pending;
+        assert_eq!(
+            core.begin(
+                &mut again,
+                LifecycleInput::StartRequested,
+                false,
+                VmState::Running
+            ),
+            BeginOutcome::Rejected(VmState::Running)
+        );
+        assert_eq!(
+            drain(&rx),
+            vec![changed(VmState::Starting, VmState::Running)]
+        );
+        assert_eq!(core.lifecycle.state(), VmState::Running);
+    }
+
     /// REPAIR-5・TASK-64.4: 完了済みの操作の放棄は何もしない（結果は確定済み）。
     #[test]
     fn core_abandon_after_completion_is_settled() {

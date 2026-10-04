@@ -645,6 +645,34 @@ mod tests {
         assert_eq!(d[1].version, WslMajorVersion::V2);
     }
 
+    /// WIN-1: 名前の単語の先頭がたまたま STATE 列（11 文字目）と VERSION 列（26 文字目）に揃っても、
+    /// 行末の既知の状態語を状態とし、名前の末尾語を状態と取り違えない。未知の状態語で列が揃わない行は
+    /// 境界を決められないので DATA_LOSS。
+    #[test]
+    fn list_known_state_wins_over_coincidental_columns() {
+        let t = "  NAME     STATE          VERSION\n* My Linux Distro Running 2\n";
+        let d = parse_distros(t).unwrap();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].name, "My Linux Distro");
+        assert_eq!(d[0].state, DistroState::Running);
+        assert_eq!(d[0].version, WslMajorVersion::V2);
+        assert!(d[0].is_default);
+        // 名前の末尾語が状態語と同じでも、最後の状態語を状態とする。
+        let d = parse_distros("NAME STATE VERSION\nUbuntu Running Stopped 2\n").unwrap();
+        assert_eq!(d[0].name, "Ubuntu Running");
+        assert_eq!(d[0].state, DistroState::Stopped);
+        for bad in [
+            "NAME STATE VERSION\nMy Distro Weird 2\n",
+            "NAME STATE VERSION\nRunning 2\n",
+        ] {
+            assert_eq!(
+                parse_distros(bad).unwrap_err().code(),
+                Wsl2ErrorCode::DataLoss,
+                "{bad}"
+            );
+        }
+    }
+
     /// WIN-1: 日本語を多く含む BOM なし UTF-16LE も UTF-16 として解析できる。
     #[test]
     fn decode_japanese_utf16_without_bom() {

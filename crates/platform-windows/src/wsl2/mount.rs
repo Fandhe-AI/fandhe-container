@@ -277,6 +277,8 @@ pub enum SharedTransport {
 pub struct PreparedMount {
     /// ゲスト内のマウント先。
     pub guest_path: String,
+    /// 本呼び出しが成立させたマウントのカーネルのマウント ID。解除時に所有確認へ使う。
+    pub mount_id: u32,
     /// 読み取り専用か。
     pub read_only: bool,
 }
@@ -363,9 +365,10 @@ fn mkdir_argv(distro: &DistroName, path: &str) -> Vec<String> {
     exec_argv(distro, &["mkdir", "-m", "755", "--", path])
 }
 
-/// symlink を辿らない `stat`（種別・UID・8 進パーミッション）。
+/// symlink を辿らない `stat`（16 進の生 st_mode・UID）。`%F` は gettext で翻訳されロケール依存になるため、
+/// ロケールに依存しない `%f`（生モード）で種別とパーミッションを判定する。
 fn stat_argv(distro: &DistroName, path: &str) -> Vec<String> {
-    exec_argv(distro, &["stat", "-c", "%F %u %a", "--", path])
+    exec_argv(distro, &["stat", "-c", "%f %u", "--", path])
 }
 
 /// マウントコマンドの組み立て。`-t drvfs` が virtiofs で成立するかは実機未検証（TASK-67.6・#377。REPAIR-3）。
@@ -400,6 +403,8 @@ fn mountinfo_argv(distro: &DistroName) -> Vec<String> {
 /// `/proc/self/mountinfo` の 1 エントリ（マウント先と fstype だけ）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MountEntry {
+    /// カーネルが割り当てるマウント ID（マウントインスタンスごとに一意。所有確認に使う）。
+    mount_id: u32,
     mount_point: String,
     fstype: String,
 }
@@ -446,7 +451,12 @@ fn parse_mountinfo(text: &str) -> Result<Vec<MountEntry>, Wsl2Error> {
         }
         let mp = f.get(4).ok_or_else(bad)?;
         let fstype = f.get(sep + 1).ok_or_else(bad)?;
+        let mount_id = f
+            .first()
+            .and_then(|t| t.parse::<u32>().ok())
+            .ok_or_else(bad)?;
         entries.push(MountEntry {
+            mount_id,
             mount_point: unescape_mountinfo(mp).ok_or_else(bad)?,
             fstype: (*fstype).to_string(),
         });
@@ -499,13 +509,36 @@ fn read_mountinfo(distro: &DistroName, exec: Exec<'_>) -> Result<Vec<MountEntry>
     parse_mountinfo(&text)
 }
 
-/// 本呼び出しでマウントを試みた分を逆順に best-effort で外す。失敗件数を返す。
-fn rollback(distro: &DistroName, attempted: &[String], exec: Exec<'_>) -> usize {
+/// 本呼び出しが成立させたマウント 1 件（マウント先とカーネルのマウント ID）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedMount {
+    guest_path: String,
+    mount_id: u32,
+}
+
+/// 本呼び出しが成立させたマウントを逆順に best-effort で外す。失敗件数を返す。
+///
+/// 解除の直前に mountinfo を読み直し、マウント先の最上位エントリが記録したマウント ID と一致する場合に限り
+/// `umount` する。一致しない（他プロセスが差し替えた・既に外れている）場合は他者のマウントを外さないよう
+/// 何もしない。mountinfo を読めない場合は所有を確認できないため外さず、失敗として数える。
+fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> usize {
     let mut failures = 0;
-    for p in attempted.iter().rev() {
-        let ok = matches!(exec(&umount_argv(distro, p), MAX_OUTPUT_BYTES), Ok(o) if o.success);
-        if !ok {
+    for o in owned.iter().rev() {
+        let Ok(entries) = read_mountinfo(distro, exec) else {
             failures += 1;
+            continue;
+        };
+        match find_mount(&entries, &o.guest_path) {
+            Some(e) if e.mount_id == o.mount_id => {
+                let ok = matches!(
+                    exec(&umount_argv(distro, &o.guest_path), MAX_OUTPUT_BYTES),
+                    Ok(out) if out.success
+                );
+                if !ok {
+                    failures += 1;
+                }
+            }
+            _ => {}
         }
     }
     failures
@@ -538,8 +571,10 @@ fn check_guest_dir(
     let text = String::from_utf8(out.stdout)
         .map_err(|_| Wsl2Error::new(Wsl2ErrorCode::DataLoss, "stat output is not valid UTF-8"))?;
     let t: Vec<&str> = text.split_whitespace().collect();
-    let safe = matches!(t.as_slice(), ["directory", "0", mode]
-        if u32::from_str_radix(mode, 8).is_ok_and(|m| m & 0o022 == 0));
+    // st_mode: 種別 (S_IFMT=0o170000) が S_IFDIR=0o040000 で、group/other 書き込みビットが無いこと。
+    let safe = matches!(t.as_slice(), [mode, "0"]
+        if u32::from_str_radix(mode, 16)
+            .is_ok_and(|m| m & 0o170_000 == 0o040_000 && m & 0o022 == 0));
     if safe {
         Ok(Some(()))
     } else {
@@ -562,19 +597,31 @@ fn ensure_guest_dir(distro: &DistroName, path: &str, exec: Exec<'_>) -> Result<(
         .ok_or_else(|| precondition("the mount target is missing after creation"))
 }
 
-/// 1 件のマウント（mount）。試行した時点で `attempted` に積む。ディレクトリは事前に検証済みであること。
+/// 1 件のマウント（mount）。成功後に mountinfo からマウント ID を取得して `owned` に積む。
+/// ディレクトリは事前に検証済みであること。
+///
+/// `mount` が失敗・タイムアウトした場合は、競合する他プロセスのマウントを外さないよう `owned` に積まない
+/// （タイムアウト後にマウントが成立していた場合は残置しうる。所有を確認できないものは外さない方針）。
 fn mount_one(
     distro: &DistroName,
     m: &SharedMount,
-    attempted: &mut Vec<String>,
+    owned: &mut Vec<OwnedMount>,
     exec: Exec<'_>,
 ) -> Result<(), Wsl2Error> {
-    // 応答なし等でも反映済みの可能性があるため、試行した時点でロールバック対象にする。
-    attempted.push(m.guest_path());
     let out = exec(&mount_argv(distro, m), MAX_OUTPUT_BYTES)?;
     if !out.success {
         return Err(step_failed("mounting the shared directory", &out));
     }
+    // 直前に未マウントを確認済みのため、最上位エントリが本呼び出しのマウントである。
+    let entries = read_mountinfo(distro, exec)?;
+    let guest_path = m.guest_path();
+    let mount_id = find_mount(&entries, &guest_path)
+        .map(|e| e.mount_id)
+        .ok_or_else(|| precondition("the shared mount is missing after mounting"))?;
+    owned.push(OwnedMount {
+        guest_path,
+        mount_id,
+    });
     Ok(())
 }
 
@@ -619,22 +666,24 @@ fn prepare_with_exec(
             return Err(precondition("a shared mount target is already mounted"));
         }
     }
-    let mut attempted: Vec<String> = Vec::new();
+    let mut owned: Vec<OwnedMount> = Vec::new();
     for m in &req.mounts {
-        if let Err(e) = mount_one(distro, m, &mut attempted, exec) {
-            return Err(with_rollback_note(e, rollback(distro, &attempted, exec)));
+        if let Err(e) = mount_one(distro, m, &mut owned, exec) {
+            return Err(with_rollback_note(e, rollback(distro, &owned, exec)));
         }
     }
     if let Err(e) = verify_virtiofs(req, exec) {
-        return Err(with_rollback_note(e, rollback(distro, &attempted, exec)));
+        return Err(with_rollback_note(e, rollback(distro, &owned, exec)));
     }
     Ok(PreparedLaunch {
         distro: req.distro.clone(),
         mounts: req
             .mounts
             .iter()
-            .map(|m| PreparedMount {
-                guest_path: m.guest_path(),
+            .zip(&owned)
+            .map(|(m, o)| PreparedMount {
+                guest_path: o.guest_path.clone(),
+                mount_id: o.mount_id,
                 read_only: m.read_only,
             })
             .collect(),
@@ -702,14 +751,17 @@ pub fn prepare_virtiofs_launch_with_recorder(
     })
 }
 
-/// 準備済みマウントを逆順に best-effort で解除する。失敗件数を返す。
+/// 準備済みマウントを逆順に best-effort で解除する（マウント ID が一致するものだけ）。失敗件数を返す。
 fn release_with_exec(prepared: &PreparedLaunch, exec: Exec<'_>) -> usize {
-    let paths: Vec<String> = prepared
+    let owned: Vec<OwnedMount> = prepared
         .mounts
         .iter()
-        .map(|m| m.guest_path.clone())
+        .map(|m| OwnedMount {
+            guest_path: m.guest_path.clone(),
+            mount_id: m.mount_id,
+        })
         .collect();
-    rollback(&prepared.distro, &paths, exec)
+    rollback(&prepared.distro, &owned, exec)
 }
 
 /// [`prepare_virtiofs_launch`] で成立させたマウントを解除する（コンテナ停止後の後始末用）。
@@ -986,10 +1038,12 @@ mod tests {
             e,
             vec![
                 MountEntry {
+                    mount_id: 22,
                     mount_point: "/mnt/fandhe/my dir".into(),
                     fstype: "virtiofs".into()
                 },
                 MountEntry {
+                    mount_id: 23,
                     mount_point: "/mnt/fandhe/b".into(),
                     fstype: "9p".into()
                 },
@@ -1053,11 +1107,14 @@ mod tests {
     /// ゲストの模擬: mountinfo を保持し、mount/umount/mkdir に応答する。
     struct Guest {
         mounts: Vec<(String, String)>,
+        /// `mounts` と同じ添字のマウント ID。
+        ids: Vec<u32>,
+        next_id: u32,
         mount_fstype: &'static str,
         fail_mount_nth: Option<usize>,
         mount_calls: usize,
         umounts: Vec<String>,
-        /// 既存パス → `stat -c '%F %u %a'` の応答（mkdir が追加する）。
+        /// 既存パス → `stat -c '%f %u'` の応答（mkdir が追加する）。
         paths: std::collections::HashMap<String, String>,
     }
 
@@ -1065,6 +1122,8 @@ mod tests {
         fn new(fstype: &'static str) -> Self {
             Self {
                 mounts: vec![("/".into(), "ext4".into())],
+                ids: vec![1],
+                next_id: 100,
                 mount_fstype: fstype,
                 fail_mount_nth: None,
                 mount_calls: 0,
@@ -1088,7 +1147,10 @@ mod tests {
                     .mounts
                     .iter()
                     .enumerate()
-                    .map(|(i, (p, t))| format!("{i} 1 0:{i} / {p} rw - {t} src rw\n"))
+                    .map(|(i, (p, t))| {
+                        let id = self.ids.get(i).copied().unwrap_or(0);
+                        format!("{id} 1 0:{i} / {p} rw - {t} src rw\n")
+                    })
                     .collect()),
                 ["stat", _, _, _, path] => match self.paths.get(*path) {
                     Some(r) => ok(format!("{r}\n")),
@@ -1100,8 +1162,7 @@ mod tests {
                     }),
                 },
                 ["mkdir", _, _, _, path] => {
-                    self.paths
-                        .insert((*path).to_string(), "directory 0 755".to_string());
+                    self.paths.insert((*path).to_string(), "41ed 0".to_string());
                     ok(String::new())
                 }
                 ["mount", .., target] => {
@@ -1116,11 +1177,16 @@ mod tests {
                     }
                     self.mounts
                         .push(((*target).to_string(), self.mount_fstype.to_string()));
+                    self.ids.push(self.next_id);
+                    self.next_id += 1;
                     ok(String::new())
                 }
                 ["umount", target] => {
                     self.umounts.push((*target).to_string());
-                    self.mounts.retain(|(p, _)| p != target);
+                    if let Some(i) = self.mounts.iter().rposition(|(p, _)| p == target) {
+                        self.mounts.remove(i);
+                        self.ids.remove(i);
+                    }
                     ok(String::new())
                 }
                 _ => Err(Wsl2Error::new(Wsl2ErrorCode::Internal, "unexpected")),
@@ -1149,10 +1215,12 @@ mod tests {
             [
                 PreparedMount {
                     guest_path: "/mnt/fandhe/a".into(),
+                    mount_id: 100,
                     read_only: false
                 },
                 PreparedMount {
                     guest_path: "/mnt/fandhe/b".into(),
+                    mount_id: 101,
                     read_only: true
                 },
             ]
@@ -1188,10 +1256,8 @@ mod tests {
             "mounting the shared directory failed in the distribution (exit code 32)"
         );
         assert!(!e.message().contains("bob"));
-        assert_eq!(
-            g.umounts,
-            ["/mnt/fandhe/c", "/mnt/fandhe/b", "/mnt/fandhe/a"]
-        );
+        // 失敗した c は成立していない（他者のマウントかもしれない）ので外さず、成立済みの b・a だけを外す。
+        assert_eq!(g.umounts, ["/mnt/fandhe/b", "/mnt/fandhe/a"]);
         assert_eq!(g.mounts.len(), 1);
     }
 
@@ -1200,6 +1266,7 @@ mod tests {
     fn prepare_refuses_existing_mount_and_disabled() {
         let mut g = Guest::new("virtiofs");
         g.mounts.push(("/mnt/fandhe/a".into(), "ext4".into()));
+        g.ids.push(7);
         let r = req(vec![sm("C:\\a", "a", false)]);
         let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
         assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
@@ -1249,15 +1316,16 @@ mod tests {
     #[test]
     fn prepare_rejects_unsafe_guest_dirs() {
         for bad in [
-            "symbolic link 0 777",
-            "directory 1000 755",
-            "directory 0 777",
-            "directory 0 775",
+            // 生モード（16 進）: symlink 0o120777・他者所有・group/other 書き込み可・通常ファイル。
+            "a1ff 0",
+            "41ed 1000",
+            "41ff 0",
+            "41fd 0",
+            "81a4 0",
         ] {
             for victim in ["/mnt/fandhe", "/mnt/fandhe/a"] {
                 let mut g = Guest::new("virtiofs");
-                g.paths
-                    .insert("/mnt/fandhe".into(), "directory 0 755".into());
+                g.paths.insert("/mnt/fandhe".into(), "41ed 0".into());
                 g.paths.insert(victim.into(), bad.into());
                 let r = req(vec![sm("C:\\a", "a", false)]);
                 let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
@@ -1269,6 +1337,25 @@ mod tests {
                 assert_eq!(g.mount_calls, 0, "{bad} {victim}");
             }
         }
+    }
+
+    /// SEC: 解除前にマウント ID を再確認し、他プロセスが差し替えたマウントは外さない。
+    #[test]
+    fn release_skips_mount_replaced_by_others() {
+        let mut g = Guest::new("virtiofs");
+        let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", false)]);
+        let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
+        // a を他者が別のマウントへ差し替えた状態にする（ID が変わる）。
+        let i = g
+            .mounts
+            .iter()
+            .position(|(m, _)| m == "/mnt/fandhe/a")
+            .unwrap();
+        g.ids[i] = 9999;
+        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m));
+        assert_eq!(failures, 0);
+        assert_eq!(g.umounts, ["/mnt/fandhe/b"]);
+        assert!(g.mounts.iter().any(|(m, _)| m == "/mnt/fandhe/a"));
     }
 
     /// 起動ステップが失敗したら準備済みマウントを逆順に解除する。成功時は解除しない。

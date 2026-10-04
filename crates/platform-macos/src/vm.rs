@@ -230,6 +230,16 @@ impl Lifecycle {
         }
     }
 
+    /// 現在の状態機械上の状態。
+    pub(crate) fn state(&self) -> VmState {
+        self.state
+    }
+
+    /// 指定世代が現行の進行中操作か（ゲスト停止等で無効化されていれば false）。
+    pub(crate) fn is_current(&self, generation: u64) -> bool {
+        self.in_flight == Some(generation)
+    }
+
     /// 直近の要求に割り当てた操作世代。
     pub(crate) fn generation(&self) -> u64 {
         self.generation
@@ -364,6 +374,20 @@ impl Core {
         self.lifecycle.generation()
     }
 
+    /// 完了入力を適用する。現行世代として受理されれば `Ok`、停止通知等で無効化済みなら適用せず
+    /// その時点の状態を `Err` で返す（呼び出し元へ成功を返さないため。TASK-64.4）。
+    pub(crate) fn complete(
+        &mut self,
+        generation: u64,
+        input: LifecycleInput,
+    ) -> Result<(), VmState> {
+        if !self.lifecycle.is_current(generation) {
+            return Err(self.lifecycle.state());
+        }
+        self.apply(input);
+        Ok(())
+    }
+
     pub(crate) fn apply(&mut self, input: LifecycleInput) {
         for event in self.lifecycle.step(input) {
             self.sink.send(event);
@@ -496,10 +520,15 @@ mod mac {
                         VmOp::Start => VmError::StartFailed { domain, code },
                         VmOp::Stop => VmError::StopFailed { domain, code },
                     });
-                    lock(&core).apply(match op {
+                    let input = match op {
                         VmOp::Start => LifecycleInput::StartCompleted(generation, res),
                         VmOp::Stop => LifecycleInput::StopCompleted(generation, res),
-                    });
+                    };
+                    // 停止通知で無効化済みの操作は成功を返さず、その時点の状態に応じた InvalidState を返す。
+                    let outcome = match lock(&core).complete(generation, input) {
+                        Ok(()) => outcome,
+                        Err(state) => Err(VmError::InvalidState { op, state }),
+                    };
                     let _ = tx.try_send(outcome);
                 };
                 match op {
@@ -660,6 +689,30 @@ mod tests {
     }
 
     /// MAC-1・TASK-64.4: エラー停止後に届いた停止完了・古い世代の完了は無視される。
+    /// TASK-64.4: 停止通知で無効化された操作の完了は受理されず、その時点の状態が返る。
+    #[test]
+    fn core_complete_rejects_invalidated_operation() {
+        let (sink, _rx) = event_channel(8);
+        let mut core = Core::new(sink);
+        let generation = core.begin(LifecycleInput::StartRequested);
+        core.apply(LifecycleInput::GuestStopped);
+        assert_eq!(
+            core.complete(
+                generation,
+                LifecycleInput::StartCompleted(generation, Ok(()))
+            ),
+            Err(VmState::Stopped)
+        );
+        let generation = core.begin(LifecycleInput::StartRequested);
+        assert_eq!(
+            core.complete(
+                generation,
+                LifecycleInput::StartCompleted(generation, Ok(()))
+            ),
+            Ok(())
+        );
+    }
+
     #[test]
     fn stale_completions_are_ignored() {
         let mut lc = Lifecycle::new();

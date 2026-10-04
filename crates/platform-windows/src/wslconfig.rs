@@ -1044,8 +1044,11 @@ fn enable_virtiofs_inner(path: &Path) -> Result<EnableOutcome, WinError> {
                 ".wslconfig is read-only; refusing to modify it",
             ));
         }
-        // リンク以外のリパースポイント（WOF 圧縮・クラウドのプレースホルダー等）は読み込めるが、rename による置換では
-        // リパースタグとその動作（圧縮・同期）を引き継げないため置換しない（既存の状態を保つ）。
+        // リンク以外のリパースポイント（クラウドのプレースホルダー等）は読み込めるが、rename による置換では
+        // リパースタグとその動作（同期等）を引き継げないため置換しない（既存の状態を保つ）。WOF 圧縮
+        // （`compact /exe`）はフィルタがリパースポイント属性と圧縮データのストリームを隠すため、この分岐に入らず
+        // 通常のファイルとして更新される（置換後は非圧縮。圧縮はアクセス制御に影響しない。CI の
+        // `wof_compressed_file_is_read_and_updated` で確認）。
         #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt;

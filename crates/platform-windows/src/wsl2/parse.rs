@@ -477,6 +477,33 @@ mod tests {
         assert_eq!(decode_output("日本語".as_bytes()).unwrap(), "日本語");
     }
 
+    /// WIN-1: 行末の `\r`（`\r\n`・`\r\r\n`・末尾）は除き、行の途中の `\r` は DATA_LOSS にする。
+    #[test]
+    fn carriage_return_only_at_line_end() {
+        assert_eq!(decode_output(b"ab\r\r\ncd\r").unwrap(), "ab\ncd");
+        assert_eq!(decode_output(b"x\r\n\0\0").unwrap(), "x\n");
+        assert_eq!(
+            decode_output(&utf16le("x\r\r\ny\r\n", true)).unwrap(),
+            "x\ny\n"
+        );
+        for bad in [
+            &b"ab\rcd"[..],
+            &b"NAME STATE VERSION\r\nUbuntu\rRunning 2\r\n"[..],
+            &b"NAME STATE VERSION\r\nUbu\r\rntu Running 2\r\n"[..],
+        ] {
+            assert_eq!(
+                decode_output(bad).unwrap_err().code(),
+                Wsl2ErrorCode::DataLoss,
+                "{bad:?}"
+            );
+        }
+        let bad16 = utf16le("NAME STATE VERSION\r\nEvil\rUbuntu Running 2\r\n", false);
+        assert_eq!(
+            decode_output(&bad16).unwrap_err().code(),
+            Wsl2ErrorCode::DataLoss
+        );
+    }
+
     /// 異常系: 空・奇数長 UTF-16・不正サロゲート・不正 UTF-8 は DATA_LOSS。
     #[test]
     fn decode_errors() {

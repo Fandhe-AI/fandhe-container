@@ -52,11 +52,11 @@ use crate::wslconfig::{self, VirtiofsState};
 pub const GUEST_MOUNT_BASE: &str = "/mnt/fandhe";
 /// 1 回の起動で指定できる共有マウント数の上限（`wsl.exe` の呼び出し回数を有界にする。REPAIR-5）。
 pub const MAX_SHARED_MOUNTS: usize = 16;
-/// ホストディレクトリ文字列の最大バイト数（WIN-4 の推奨パス長 260 に合わせる）。
+/// ホストディレクトリ文字列の最大文字数（Unicode スカラー値単位。WIN-4 の推奨パス長 260 に合わせる）。
 pub const MAX_HOST_DIR_LEN: usize = 260;
 /// [`MountName`] の最大バイト数。
 pub const MAX_MOUNT_NAME_LEN: usize = 64;
-/// [`DistroName`] の最大バイト数。
+/// [`DistroName`] の最大文字数（Unicode スカラー値単位。`list_distros` の解析上限 128 文字と揃える）。
 pub const MAX_DISTRO_NAME_LEN: usize = 128;
 /// `/proc/self/mountinfo` として受け付ける最大バイト数（多数マウントのディストリで 64 KiB を超えうるため専用）。
 const MAX_MOUNTINFO_BYTES: usize = 256 * 1024;
@@ -91,7 +91,7 @@ pub struct HostDir(String);
 impl HostDir {
     /// 文字列を検証して作る。違反は `INVALID_ARGUMENT`（メッセージに入力は含めない）。
     pub fn parse(s: &str) -> Result<Self, Wsl2Error> {
-        if s.len() > MAX_HOST_DIR_LEN {
+        if s.chars().count() > MAX_HOST_DIR_LEN {
             return Err(invalid("host directory path is too long"));
         }
         let b = s.as_bytes();
@@ -178,7 +178,7 @@ impl DistroName {
     /// 文字列を検証して作る。
     pub fn parse(s: &str) -> Result<Self, Wsl2Error> {
         let ok = !s.is_empty()
-            && s.len() <= MAX_DISTRO_NAME_LEN
+            && s.chars().count() <= MAX_DISTRO_NAME_LEN
             && !s.starts_with('-')
             && s.trim() == s
             && !s.chars().any(char::is_control);
@@ -228,10 +228,8 @@ impl SharedMount {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LaunchRequest {
-    /// 対象ディストリ。
-    pub distro: DistroName,
-    /// 共有マウント（0〜[`MAX_SHARED_MOUNTS`] 件）。
-    pub mounts: Vec<SharedMount>,
+    distro: DistroName,
+    mounts: Vec<SharedMount>,
 }
 
 impl LaunchRequest {
@@ -251,6 +249,17 @@ impl LaunchRequest {
             }
         }
         Ok(Self { distro, mounts })
+    }
+
+    /// 対象ディストリ。
+    pub fn distro(&self) -> &DistroName {
+        &self.distro
+    }
+
+    /// 共有マウント（0〜[`MAX_SHARED_MOUNTS`] 件）。フィールドを非公開にして `new` の検証
+    /// （件数上限・重複拒否）を迂回できないようにしている。変更は検証済みの新しい要求を作り直す。
+    pub fn mounts(&self) -> &[SharedMount] {
+        &self.mounts
     }
 }
 
@@ -308,7 +317,8 @@ fn preflight(
     let Some(d) = status
         .distros
         .iter()
-        .find(|d| d.name == req.distro.as_str())
+        // `wsl --distribution` は大文字小文字を区別しないため、検索も合わせる。
+        .find(|d| d.name.to_lowercase() == req.distro.as_str().to_lowercase())
     else {
         return Err(Wsl2Error::new(
             Wsl2ErrorCode::NotFound,
@@ -348,8 +358,14 @@ fn exec_argv(distro: &DistroName, cmd: &[&str]) -> Vec<String> {
     v
 }
 
-fn mkdir_argv(distro: &DistroName, m: &SharedMount) -> Vec<String> {
-    exec_argv(distro, &["mkdir", "-p", &m.guest_path()])
+/// 非再帰の `mkdir`（既存なら失敗する。`-p` は途中の symlink を辿るため使わない）。
+fn mkdir_argv(distro: &DistroName, path: &str) -> Vec<String> {
+    exec_argv(distro, &["mkdir", "-m", "755", "--", path])
+}
+
+/// symlink を辿らない `stat`（種別・UID・8 進パーミッション）。
+fn stat_argv(distro: &DistroName, path: &str) -> Vec<String> {
+    exec_argv(distro, &["stat", "-c", "%F %u %a", "--", path])
 }
 
 /// マウントコマンドの組み立て。`-t drvfs` が virtiofs で成立するかは実機未検証（TASK-67.6・#377。REPAIR-3）。
@@ -508,17 +524,51 @@ fn with_rollback_note(e: Wsl2Error, failures: usize) -> Wsl2Error {
     )
 }
 
-/// 1 件のマウント（mkdir → mount）。試行した時点で `attempted` に積む。
+/// `path` が「root 所有・他者書き込み不可の実ディレクトリ（symlink でない）」なら `Some(())`、
+/// 存在しなければ `None`。それ以外（symlink・他者所有・書き込み可）は `FAILED_PRECONDITION`。
+fn check_guest_dir(
+    distro: &DistroName,
+    path: &str,
+    exec: Exec<'_>,
+) -> Result<Option<()>, Wsl2Error> {
+    let out = exec(&stat_argv(distro, path), MAX_OUTPUT_BYTES)?;
+    if !out.success {
+        return Ok(None);
+    }
+    let text = String::from_utf8(out.stdout)
+        .map_err(|_| Wsl2Error::new(Wsl2ErrorCode::DataLoss, "stat output is not valid UTF-8"))?;
+    let t: Vec<&str> = text.split_whitespace().collect();
+    let safe = matches!(t.as_slice(), ["directory", "0", mode]
+        if u32::from_str_radix(mode, 8).is_ok_and(|m| m & 0o022 == 0));
+    if safe {
+        Ok(Some(()))
+    } else {
+        Err(precondition(
+            "a mount path component is not a root-owned, non-writable directory (symlinks are rejected)",
+        ))
+    }
+}
+
+/// ゲスト内ディレクトリを symlink 非追従で検証し、無ければ作成して再検証する（root で実行するため）。
+fn ensure_guest_dir(distro: &DistroName, path: &str, exec: Exec<'_>) -> Result<(), Wsl2Error> {
+    if check_guest_dir(distro, path, exec)?.is_some() {
+        return Ok(());
+    }
+    let out = exec(&mkdir_argv(distro, path), MAX_OUTPUT_BYTES)?;
+    if !out.success {
+        return Err(step_failed("creating the mount target", &out));
+    }
+    check_guest_dir(distro, path, exec)?
+        .ok_or_else(|| precondition("the mount target is missing after creation"))
+}
+
+/// 1 件のマウント（mount）。試行した時点で `attempted` に積む。ディレクトリは事前に検証済みであること。
 fn mount_one(
     distro: &DistroName,
     m: &SharedMount,
     attempted: &mut Vec<String>,
     exec: Exec<'_>,
 ) -> Result<(), Wsl2Error> {
-    let out = exec(&mkdir_argv(distro, m), MAX_OUTPUT_BYTES)?;
-    if !out.success {
-        return Err(step_failed("creating the mount target", &out));
-    }
     // 応答なし等でも反映済みの可能性があるため、試行した時点でロールバック対象にする。
     attempted.push(m.guest_path());
     let out = exec(&mount_argv(distro, m), MAX_OUTPUT_BYTES)?;
@@ -553,7 +603,16 @@ fn prepare_with_exec(
 ) -> Result<PreparedLaunch, Wsl2Error> {
     preflight(status, virtiofs, req)?;
     let distro = &req.distro;
-    // 自分が作っていないマウントは外さないため、既存のマウントがあれば何もせず拒否する。
+    // root で mkdir / mount するため、基底・マウント先を symlink 非追従で検証してから進む。
+    // 基底が実ディレクトリ（root 所有）と確定した後は、マウント先は基底の直下で一意に解決される。
+    if !req.mounts.is_empty() {
+        ensure_guest_dir(distro, GUEST_MOUNT_BASE, exec)?;
+        for m in &req.mounts {
+            ensure_guest_dir(distro, &m.guest_path(), exec)?;
+        }
+    }
+    // 自分が作っていないマウントは外さないため、既存のマウントがあれば何もせず拒否する
+    // （検証済みで symlink を含まないため、guest_path が実際に解決されるパスと一致する）。
     let before = read_mountinfo(distro, exec)?;
     for m in &req.mounts {
         if find_mount(&before, &m.guest_path()).is_some() {
@@ -583,6 +642,30 @@ fn prepare_with_exec(
     })
 }
 
+/// `wsl.exe` 相当の実行器を `program` から作る（各呼び出しにタイムアウトと出力上限を適用。REPAIR-5）。
+fn program_exec(
+    program: &Path,
+    timeout: Duration,
+) -> impl FnMut(&[String], usize) -> Result<run::Captured, Wsl2Error> + '_ {
+    move |args: &[String], max: usize| {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        run::run_capture(program, &refs, &[("WSL_UTF8", "1")], timeout, max)
+    }
+}
+
+/// `wsl.exe` のパスと `.wslconfig` の virtiofs 状態を解決する。
+fn resolve_environment(
+    timeout: Duration,
+) -> Result<(std::path::PathBuf, VirtiofsState), Wsl2Error> {
+    check_timeout(timeout)?;
+    let program = wsl_exe_path()?;
+    let path = wslconfig::default_path().map_err(|e| win_error_to_wsl2(&e))?;
+    let state = wslconfig::load(&path)
+        .map_err(|e| win_error_to_wsl2(&e))?
+        .map_or(VirtiofsState::Unset, |c| c.virtiofs_state());
+    Ok((program, state))
+}
+
 /// `program` を `wsl.exe` として使い、`.wslconfig` の状態を `virtiofs` で与えて準備する。
 fn prepare_with_program(
     program: &Path,
@@ -592,16 +675,14 @@ fn prepare_with_program(
 ) -> Result<PreparedLaunch, Wsl2Error> {
     check_timeout(timeout)?;
     let status = detect_with_program(program, timeout)?;
-    let mut exec = |args: &[String], max: usize| {
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        run::run_capture(program, &refs, &[("WSL_UTF8", "1")], timeout, max)
-    };
+    let mut exec = program_exec(program, timeout);
     prepare_with_exec(&status, virtiofs, req, &mut exec)
 }
 
 /// virtiofs 共有マウントを準備する。`timeout` は各 `wsl.exe` 呼び出しに適用する（REPAIR-5）。
 ///
 /// 成功時は全マウントが virtiofs で成立している。失敗時は本呼び出しで作ったマウントを後始末して `Err`。
+/// 成功後のマウントの所有者は呼び出し側で、不要になったら [`release_virtiofs_launch`] で解除する。
 pub fn prepare_virtiofs_launch(
     req: &LaunchRequest,
     timeout: Duration,
@@ -616,27 +697,70 @@ pub fn prepare_virtiofs_launch_with_recorder(
     recorder: &dyn WinOpRecorder,
 ) -> Result<PreparedLaunch, Wsl2Error> {
     record_win_op(recorder, WinOpKind::Wsl2MountShared, || {
-        check_timeout(timeout)?;
-        let program = wsl_exe_path()?;
-        let path = wslconfig::default_path().map_err(|e| win_error_to_wsl2(&e))?;
-        let state = wslconfig::load(&path)
-            .map_err(|e| win_error_to_wsl2(&e))?
-            .map_or(VirtiofsState::Unset, |c| c.virtiofs_state());
+        let (program, state) = resolve_environment(timeout)?;
         prepare_with_program(&program, state, req, timeout)
     })
 }
 
+/// 準備済みマウントを逆順に best-effort で解除する。失敗件数を返す。
+fn release_with_exec(prepared: &PreparedLaunch, exec: Exec<'_>) -> usize {
+    let paths: Vec<String> = prepared
+        .mounts
+        .iter()
+        .map(|m| m.guest_path.clone())
+        .collect();
+    rollback(&prepared.distro, &paths, exec)
+}
+
+/// [`prepare_virtiofs_launch`] で成立させたマウントを解除する（コンテナ停止後の後始末用）。
+///
+/// 解除に失敗したマウントがあれば `FAILED_PRECONDITION`（件数のみをメッセージに載せる）。
+pub fn release_virtiofs_launch(
+    prepared: &PreparedLaunch,
+    timeout: Duration,
+) -> Result<(), Wsl2Error> {
+    check_timeout(timeout)?;
+    let program = wsl_exe_path()?;
+    let mut exec = program_exec(&program, timeout);
+    match release_with_exec(prepared, &mut exec) {
+        0 => Ok(()),
+        n => Err(precondition(format!("{n} unmount(s) failed"))),
+    }
+}
+
+/// 準備成功後に `start` を呼び、`start` が失敗したら準備済みマウントを解除して返す（ロールバック）。
+fn launch_with_exec<T>(
+    status: &Wsl2Status,
+    virtiofs: VirtiofsState,
+    req: &LaunchRequest,
+    exec: Exec<'_>,
+    start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
+) -> Result<T, Wsl2Error> {
+    let prepared = prepare_with_exec(status, virtiofs, req, exec)?;
+    match start(&prepared) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let failures = release_with_exec(&prepared, exec);
+            Err(with_rollback_note(e, failures))
+        }
+    }
+}
+
 /// 準備（事前判定・マウント・fstype 確認）に成功した場合に限り `start` を呼ぶ。
 ///
-/// 準備失敗時は `start` を呼ばずに `Err` を返す。`start` の中身（ゲスト内のコンテナランタイム起動）は
+/// 準備失敗時は `start` を呼ばずに `Err` を返す。`start` が `Err` を返した場合は準備済みマウントを
+/// 解除してから `Err` を返す。`start` が `Ok` の場合マウントは呼び出し側（TASK-116）の所有となり、
+/// 停止時に [`release_virtiofs_launch`] で解除する。`start` の中身（ゲスト内のコンテナランタイム起動）は
 /// TASK-116 が注入する。
 pub fn launch_with<T>(
     req: &LaunchRequest,
     timeout: Duration,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
 ) -> Result<T, Wsl2Error> {
-    let prepared = prepare_virtiofs_launch(req, timeout)?;
-    start(&prepared)
+    let (program, state) = resolve_environment(timeout)?;
+    let status = detect_with_program(&program, timeout)?;
+    let mut exec = program_exec(&program, timeout);
+    launch_with_exec(&status, state, req, &mut exec, start)
 }
 
 #[cfg(test)]
@@ -805,7 +929,7 @@ mod tests {
         let rw = sm("C:\\a b", "data", false);
         let ro = sm("C:\\a b", "data", true);
         assert_eq!(
-            mkdir_argv(&d, &rw),
+            mkdir_argv(&d, &rw.guest_path()),
             [
                 "--distribution",
                 "Ubuntu",
@@ -813,7 +937,9 @@ mod tests {
                 "root",
                 "--exec",
                 "mkdir",
-                "-p",
+                "-m",
+                "755",
+                "--",
                 "/mnt/fandhe/data"
             ]
         );
@@ -931,6 +1057,8 @@ mod tests {
         fail_mount_nth: Option<usize>,
         mount_calls: usize,
         umounts: Vec<String>,
+        /// 既存パス → `stat -c '%F %u %a'` の応答（mkdir が追加する）。
+        paths: std::collections::HashMap<String, String>,
     }
 
     impl Guest {
@@ -941,6 +1069,7 @@ mod tests {
                 fail_mount_nth: None,
                 mount_calls: 0,
                 umounts: vec![],
+                paths: std::collections::HashMap::new(),
             }
         }
 
@@ -961,7 +1090,20 @@ mod tests {
                     .enumerate()
                     .map(|(i, (p, t))| format!("{i} 1 0:{i} / {p} rw - {t} src rw\n"))
                     .collect()),
-                ["mkdir", ..] => ok(String::new()),
+                ["stat", _, _, _, path] => match self.paths.get(*path) {
+                    Some(r) => ok(format!("{r}\n")),
+                    None => Ok(run::Captured {
+                        success: false,
+                        code: Some(1),
+                        stdout: vec![],
+                        stderr: vec![],
+                    }),
+                },
+                ["mkdir", _, _, _, path] => {
+                    self.paths
+                        .insert((*path).to_string(), "directory 0 755".to_string());
+                    ok(String::new())
+                }
                 ["mount", .., target] => {
                     self.mount_calls += 1;
                     if self.fail_mount_nth == Some(self.mount_calls) {
@@ -1083,5 +1225,79 @@ mod tests {
         assert_eq!(e.code(), Wsl2ErrorCode::Unimplemented);
         let e = launch_with(&r, Duration::ZERO, |_| Ok(())).unwrap_err();
         assert_eq!(e.code(), Wsl2ErrorCode::InvalidArgument);
+    }
+
+    /// 手順 REPAIR-2: 長さ上限は文字数単位（日本語パス・Unicode ディストロ名を誤拒否しない）。
+    #[test]
+    fn length_limits_count_chars_not_bytes() {
+        let host = format!("C:\\{}", "あ".repeat(MAX_HOST_DIR_LEN - 3));
+        assert!(HostDir::parse(&host).is_ok());
+        assert!(HostDir::parse(&format!("{host}あ")).is_err());
+        assert!(DistroName::parse(&"あ".repeat(MAX_DISTRO_NAME_LEN)).is_ok());
+        assert!(DistroName::parse(&"あ".repeat(MAX_DISTRO_NAME_LEN + 1)).is_err());
+    }
+
+    /// WIN-1: ディストリ名の照合は大文字小文字を区別しない（`wsl --distribution` と同じ）。
+    #[test]
+    fn preflight_matches_distro_case_insensitively() {
+        let r = LaunchRequest::new(DistroName::parse("ubuntu").expect("name"), vec![])
+            .expect("request");
+        assert!(preflight(&ok_status(), VirtiofsState::Enabled, &r).is_ok());
+    }
+
+    /// SEC: 基底・マウント先が symlink / 他者所有 / 書き込み可なら mount せず拒否する。
+    #[test]
+    fn prepare_rejects_unsafe_guest_dirs() {
+        for bad in [
+            "symbolic link 0 777",
+            "directory 1000 755",
+            "directory 0 777",
+            "directory 0 775",
+        ] {
+            for victim in ["/mnt/fandhe", "/mnt/fandhe/a"] {
+                let mut g = Guest::new("virtiofs");
+                g.paths
+                    .insert("/mnt/fandhe".into(), "directory 0 755".into());
+                g.paths.insert(victim.into(), bad.into());
+                let r = req(vec![sm("C:\\a", "a", false)]);
+                let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+                assert_eq!(
+                    e.code(),
+                    Wsl2ErrorCode::FailedPrecondition,
+                    "{bad} {victim}"
+                );
+                assert_eq!(g.mount_calls, 0, "{bad} {victim}");
+            }
+        }
+    }
+
+    /// 起動ステップが失敗したら準備済みマウントを逆順に解除する。成功時は解除しない。
+    #[test]
+    fn launch_rolls_back_mounts_when_start_fails() {
+        let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", false)]);
+        let mut g = Guest::new("virtiofs");
+        let e = launch_with_exec(
+            &ok_status(),
+            VirtiofsState::Enabled,
+            &r,
+            &mut |a, m| g.run(a, m),
+            |_| Err::<(), _>(Wsl2Error::new(Wsl2ErrorCode::Internal, "start failed")),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Internal);
+        assert_eq!(e.message(), "start failed");
+        assert_eq!(g.umounts, ["/mnt/fandhe/b", "/mnt/fandhe/a"]);
+
+        let mut g = Guest::new("virtiofs");
+        let v = launch_with_exec(
+            &ok_status(),
+            VirtiofsState::Enabled,
+            &r,
+            &mut |a, m| g.run(a, m),
+            |p| Ok(p.mounts().len()),
+        )
+        .unwrap();
+        assert_eq!(v, 2);
+        assert!(g.umounts.is_empty());
     }
 }

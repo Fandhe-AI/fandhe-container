@@ -29,6 +29,7 @@ pub use mount::{
     DistroName, GUEST_MOUNT_BASE, HostDir, LaunchRequest, MAX_DISTRO_NAME_LEN, MAX_HOST_DIR_LEN,
     MAX_MOUNT_NAME_LEN, MAX_SHARED_MOUNTS, MountName, PreparedLaunch, PreparedMount, SharedMount,
     SharedTransport, launch_with, prepare_virtiofs_launch, prepare_virtiofs_launch_with_recorder,
+    release_virtiofs_launch,
 };
 
 use std::error::Error;

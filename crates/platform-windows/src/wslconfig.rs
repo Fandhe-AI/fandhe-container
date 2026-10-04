@@ -1010,6 +1010,58 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
+    /// WIN-2: 公開後の親ディレクトリ同期は失敗を `Err` で返す（unix。存在しないディレクトリで確認）。
+    #[cfg(unix)]
+    #[test]
+    fn sync_parent_dir_reports_failure() {
+        let d = TmpDir::new("syncdir");
+        assert_eq!(sync_parent_dir(&d.0), Ok(()));
+        let e = sync_parent_dir(&d.0.join("missing")).expect_err("must fail");
+        assert_eq!(e.code(), WinErrorCode::NotFound);
+        assert_eq!(e.message(), "failed to sync parent directory");
+    }
+
+    /// `icacls .wslconfig` を `dir` で実行した出力（相対名で呼ぶため置換前後の出力を直接比較できる）。
+    #[cfg(windows)]
+    fn icacls(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("icacls")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("icacls");
+        assert!(out.status.success(), "icacls {args:?} failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// WIN-2・TASK-67.2（レビュー指摘 P0）: 既存ファイルの置換後も個別設定した DACL（明示 ACE と継承保護）が
+    /// 保たれ、親ディレクトリから継承した既定 ACL に置き換わらない。
+    #[cfg(windows)]
+    #[test]
+    fn enable_virtiofs_preserves_windows_dacl() {
+        let d = TmpDir::new("dacl");
+        std::fs::write(d.file(), "[wsl2]\nmemory=4GB\n").expect("write");
+        std::fs::write(d.0.join("fresh"), "x").expect("write fresh");
+        // 継承 ACE を明示 ACE に変換して保護し、LOCAL SERVICE（S-1-5-19）の読み取りを明示 ACE として加える。
+        icacls(&d.0, &[".wslconfig", "/inheritance:d"]);
+        icacls(&d.0, &[".wslconfig", "/grant", "*S-1-5-19:R"]);
+        let before = icacls(&d.0, &[".wslconfig"]);
+        let inherited = icacls(&d.0, &["fresh"]).replacen("fresh", ".wslconfig", 1);
+        assert_ne!(
+            before, inherited,
+            "test setup must differ from the inherited ACL"
+        );
+
+        assert_eq!(enable_virtiofs_at(&d.file()), Ok(EnableOutcome::Added));
+        assert_eq!(
+            std::fs::read(d.file()).expect("read"),
+            b"[wsl2]\nmemory=4GB\nvirtiofs=true\n"
+        );
+        assert_eq!(icacls(&d.0, &[".wslconfig"]), before);
+        let mut entries = d.entries();
+        entries.sort();
+        assert_eq!(entries, vec![".wslconfig".to_string(), "fresh".to_string()]);
+    }
+
     /// シンボリックリンクの `.wslconfig` は拒否しリンク先を変更しない。
     /// Windows ではシンボリックリンクの作成に特権が要るため unix に限定する。
     #[cfg(unix)]

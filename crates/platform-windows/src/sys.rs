@@ -169,3 +169,70 @@ fn win32_error(code: u32) -> std::io::Error {
         Err(_) => std::io::Error::other("unexpected Win32 error code"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+
+    struct TmpDir(PathBuf);
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `icacls <name>` を `dir` で実行した出力（相対名で呼ぶため、同名ファイルなら出力を直接比較できる）。
+    fn icacls(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("icacls")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("icacls");
+        assert!(out.status.success(), "icacls {args:?} failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// WIN-2・TASK-67.2: 元ファイルの明示 ACE と継承保護が宛先へそのまま写る（icacls の出力が一致する）。
+    #[test]
+    fn copy_dacl_reproduces_explicit_and_protected_dacl() {
+        let d = TmpDir(std::env::temp_dir().join(format!("fc-sys-dacl-{}", std::process::id())));
+        std::fs::create_dir_all(&d.0).expect("mkdir");
+        std::fs::write(d.0.join("src"), b"x").expect("write src");
+        std::fs::write(d.0.join("dst"), b"y").expect("write dst");
+        // 継承を明示 ACE に変換して保護し、LOCAL SERVICE（S-1-5-19）の読み取りを明示 ACE として加える。
+        icacls(&d.0, &["src", "/inheritance:d"]);
+        icacls(&d.0, &["src", "/grant", "*S-1-5-19:R"]);
+        let src_acl = icacls(&d.0, &["src"]).replacen("src", "", 1);
+        let dst_before = icacls(&d.0, &["dst"]).replacen("dst", "", 1);
+        assert_ne!(src_acl, dst_before, "test setup must differ");
+
+        let src = File::open(d.0.join("src")).expect("open src");
+        let dst = std::fs::OpenOptions::new()
+            .write(true)
+            .access_mode(GENERIC_WRITE | WRITE_DAC)
+            .open(d.0.join("dst"))
+            .expect("open dst");
+        copy_dacl(&src, &dst).expect("copy_dacl");
+        drop(dst);
+        let dst_after = icacls(&d.0, &["dst"]).replacen("dst", "", 1);
+        assert_eq!(dst_after, src_acl);
+    }
+
+    /// WIN-2: WRITE_DAC なしで開いた宛先には写せず `Err`（失敗を握りつぶさない）。
+    #[test]
+    fn copy_dacl_without_write_dac_fails() {
+        let d = TmpDir(std::env::temp_dir().join(format!("fc-sys-nodac-{}", std::process::id())));
+        std::fs::create_dir_all(&d.0).expect("mkdir");
+        std::fs::write(d.0.join("src"), b"x").expect("write src");
+        std::fs::write(d.0.join("dst"), b"y").expect("write dst");
+        let src = File::open(d.0.join("src")).expect("open src");
+        let dst = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.0.join("dst"))
+            .expect("open dst");
+        let e = copy_dacl(&src, &dst).expect_err("must fail");
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+}

@@ -191,15 +191,23 @@ pub(super) fn parse_version(text: &str) -> Result<WslVersionInfo, Wsl2Error> {
     }
 }
 
+/// 既知の状態語（英語・日本語ロケール。大文字小文字は区別しない）を状態に写す。未知なら `None`。
+fn known_state(word: &str) -> Option<DistroState> {
+    match word.to_lowercase().as_str() {
+        "running" | "実行中" => Some(DistroState::Running),
+        "stopped" | "停止" => Some(DistroState::Stopped),
+        "installing" => Some(DistroState::Installing),
+        "uninstalling" => Some(DistroState::Uninstalling),
+        "converting" => Some(DistroState::Converting),
+        _ => None,
+    }
+}
+
 fn parse_state(tokens: &[&str]) -> DistroState {
     let joined = tokens.join(" ");
-    match joined.to_lowercase().as_str() {
-        "running" | "実行中" => DistroState::Running,
-        "stopped" | "停止" => DistroState::Stopped,
-        "installing" => DistroState::Installing,
-        "uninstalling" => DistroState::Uninstalling,
-        "converting" => DistroState::Converting,
-        _ => DistroState::Other(
+    match known_state(&joined) {
+        Some(state) => state,
+        None => DistroState::Other(
             joined
                 .chars()
                 .filter(|c| !is_disallowed_text_char(*c))
@@ -239,13 +247,15 @@ fn column_starts(header: &str) -> Option<(usize, usize)> {
     }
 }
 
-/// 1 行を（既定フラグ, 名前, 状態トークン列, バージョントークン）へ分ける。
+/// 1 行を（既定フラグ, 名前, 状態, バージョントークン）へ分ける。分けられなければ `None`（DATA_LOSS）。
 ///
-/// ヘッダーの STATE・VERSION 列の開始位置で名前・状態・バージョンを分け、空白を含むディストリ名を
-/// 切り詰めない。列が揃っている行とみなすのは、STATE 列・VERSION 列のどちらの直前も空白で
-/// 開始位置が非空白、かつ VERSION 列以降が 1 トークンの場合だけ（名前が列境界を越えた行は
-/// この条件を満たさない）。それ以外は末尾 2 トークンを状態・バージョン、残りを名前とする
-/// （この場合の状態は 1 語のみ）。
+/// 名前は可変幅で空白を含みうるため、次の順で境界を決める（名前の途中を状態とみなさない）:
+/// 1. 末尾のトークンをバージョン、その直前のトークンが既知の状態語（[`known_state`]）なら状態とし、
+///    残りを名前とする（名前が列幅を越えて STATE 列がずれた行でも、名前の末尾語を状態と取り違えない）。
+/// 2. 状態語が未知なら、ヘッダーの STATE・VERSION 列の開始位置で分ける。列が揃っている行とみなすのは、
+///    STATE 列・VERSION 列のどちらの直前も空白で開始位置が非空白、かつ VERSION 列以降が 1 トークンの
+///    場合だけ（複数語の未知の状態語も保つ）。
+/// 3. どちらでもない行は名前と状態の境界を決められないため、推測せず `None` を返す（fail-closed）。
 fn split_row(
     line: &str,
     state_col: usize,
@@ -258,6 +268,22 @@ fn split_row(
         // 位置を保つため '*' は空白に置き換える。
         *chars.get_mut(first)? = ' ';
     }
+    let all: String = chars.iter().collect();
+    let (head, ver) = all.trim().rsplit_once(char::is_whitespace)?;
+    if let Some((name, state)) = head.trim_end().rsplit_once(char::is_whitespace)
+        && known_state(state).is_some()
+    {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        return Some((
+            is_default,
+            name.to_string(),
+            state.to_string(),
+            ver.to_string(),
+        ));
+    }
     let boundary = |col: usize| {
         col > 0
             && chars.get(col).is_some_and(|c| !c.is_whitespace())
@@ -268,25 +294,13 @@ fn split_row(
         && boundary(state_col)
         && boundary(version_col)
         && ver_tail.split_whitespace().count() == 1;
-    if aligned {
-        let name: String = chars.get(..state_col)?.iter().collect();
-        let state: String = chars.get(state_col..version_col)?.iter().collect();
-        let (name, state, ver) = (name.trim(), state.trim(), ver_tail.trim());
-        if name.is_empty() || state.is_empty() {
-            return None;
-        }
-        return Some((
-            is_default,
-            name.to_string(),
-            state.to_string(),
-            ver.to_string(),
-        ));
+    if !aligned {
+        return None;
     }
-    let all: String = chars.iter().collect();
-    let (head, ver) = all.trim().rsplit_once(char::is_whitespace)?;
-    let (name, state) = head.trim_end().rsplit_once(char::is_whitespace)?;
-    let name = name.trim();
-    if name.is_empty() {
+    let name: String = chars.get(..state_col)?.iter().collect();
+    let state: String = chars.get(state_col..version_col)?.iter().collect();
+    let (name, state, ver) = (name.trim(), state.trim(), ver_tail.trim());
+    if name.is_empty() || state.is_empty() {
         return None;
     }
     Some((
@@ -299,8 +313,8 @@ fn split_row(
 
 /// `wsl -l -v` の出力からディストリ一覧を取り出す（ヘッダーのみなら空）。
 ///
-/// ヘッダー行は読み飛ばし、各行はヘッダーの列境界で「（`*`）名前 / 状態 / バージョン」に分ける
-/// （空白を含む名前を保つ。位置が合わない行は末尾 2 トークンで分ける）。
+/// ヘッダー行は検証して読み飛ばし、各行を「（`*`）名前 / 状態 / バージョン」に分ける（境界の決め方は
+/// [`split_row`]。空白を含む名前を保ち、境界を決められない行は `DATA_LOSS`）。
 pub(super) fn parse_distros(text: &str) -> Result<Vec<WslDistro>, Wsl2Error> {
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     let header = lines
@@ -690,10 +704,15 @@ mod tests {
                 c as u32
             );
         }
-        let ok = parse_distros("NAME STATE VERSION\nUbuntu-日本語 Weird\u{202E}\u{200B}State 2\n")
-            .unwrap();
-        assert_eq!(ok.len(), 1);
+        let ok = parse_distros("NAME STATE VERSION\nUbuntu-日本語 Running 2\n").unwrap();
         assert_eq!(ok[0].name, "Ubuntu-日本語");
+        // 未知の状態語は列が揃った行でのみ受け付ける（STATE 列は 10 文字目・VERSION 列は 24 文字目）。
+        let ok = parse_distros(
+            "  NAME    STATE         VERSION\n  Deb     Weird\u{202E}\u{200B}State  2\n",
+        )
+        .unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].name, "Deb");
         assert_eq!(ok[0].state, DistroState::Other("WeirdState".to_string()));
     }
 

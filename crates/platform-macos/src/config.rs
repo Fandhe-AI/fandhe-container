@@ -1998,4 +1998,39 @@ mod tests {
             .expect("writer thread finished");
         assert!(spec.open_serial_console().unwrap().is_some());
     }
+
+    /// MAC-1・TASK-64.3: 親ディレクトリ自体が symlink なら検証時・open 時とも
+    /// `config.console_log_parent_is_symlink` で拒否し、リンク先にファイルを作らない。
+    #[cfg(unix)]
+    #[test]
+    fn console_log_parent_symlink_is_rejected() {
+        let t = TempDir::new("log-parent-sym");
+        let real = t.0.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = t.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let rejected = ConfigError::ConsoleLogParentIsSymlink { path: link.clone() };
+        assert_eq!(
+            ConsoleLogPath::try_new(link.join("console.log")).unwrap_err(),
+            rejected
+        );
+        assert_eq!(
+            rejected.to_string(),
+            format!(
+                "config.console_log_parent_is_symlink: console log parent directory must not be a symlink: {}",
+                link.display()
+            )
+        );
+        // 検証後に親が symlink へ差し替えられた場合も open 時に拒否する。
+        let swapped = t.0.join("swapped");
+        std::fs::create_dir(&swapped).unwrap();
+        let log = ConsoleLogPath::try_new(swapped.join("console.log")).unwrap();
+        std::fs::remove_dir(&swapped).unwrap();
+        std::os::unix::fs::symlink(&real, &swapped).unwrap();
+        assert_eq!(
+            log.open_for_append_excluding(&[]).unwrap_err(),
+            ConfigError::ConsoleLogParentIsSymlink { path: swapped }
+        );
+        assert!(!real.join("console.log").exists());
+    }
 }

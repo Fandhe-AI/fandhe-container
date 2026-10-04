@@ -28,6 +28,7 @@
 //! pause / resume / save / restore は範囲外。
 
 use std::fmt;
+use std::io::Write;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::Duration;
 
@@ -607,6 +608,9 @@ impl Core {
     /// 回数を使い切った失敗は `StopOnDropFailed` として記録する（呼び出し元はもういないため）。受信側が
     /// `Vm` とともに破棄されている・満杯でイベントが届かない場合は、失敗を見失わないよう構造化ログ
     /// （1 行 1 JSON）を stderr へ出す（REPAIR-4）。
+    ///
+    /// VM キュー上の completion block 内で呼ばれるため panic しないこと（ロックは毒化を許容し、出力の
+    /// 失敗は無視する）。
     pub(crate) fn finish_drop_stop(&mut self, generation: u64, res: Result<(), ErrInfo>) -> bool {
         let failure = res.clone().err();
         let accepted = self
@@ -630,7 +634,9 @@ impl Core {
             code,
             attempts,
         }) {
-            eprintln!("{line}");
+            // VM キュー上の completion block 内から呼ばれる。`eprintln!` は stderr への書き込み失敗（EPIPE 等）で
+            // panic し、VZ / libdispatch のフレームへ巻き戻り得るため、失敗を無視する `writeln!` を使う。
+            let _ = writeln!(std::io::stderr().lock(), "{line}");
         }
         false
     }

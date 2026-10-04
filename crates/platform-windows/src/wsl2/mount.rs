@@ -390,10 +390,6 @@ const MOUNT_SCRIPT: &str = concat!(
 const EXIT_PARENT_BAD: i32 = 70;
 const EXIT_MKDIR_FAILED: i32 = 71;
 const EXIT_PATH_UNSAFE: i32 = 72;
-/// マウントが成立していないと確定できる `mount(8)` の終了コード（1=誤った呼び出し・2=システムエラー・
-/// 32=マウント失敗）。これ以外（16=mtab 書き込みの問題のようにマウント後に起きうるもの・`wsl.exe` 自身の
-/// 異常値・シグナル終了など）は成立の有無が不確定なので、mountinfo を読み直して確かめる。
-const MOUNT_EXIT_NOT_MOUNTED: [i32; 3] = [1, 2, 32];
 
 /// 検証込みマウントコマンドの組み立て。`-t drvfs` が virtiofs で成立するかは実機未検証（TASK-67.6・#377。REPAIR-3）。
 fn mount_argv(distro: &DistroName, m: &SharedMount) -> Vec<String> {
@@ -667,9 +663,11 @@ fn with_rollback_note(e: Wsl2Error, failures: usize) -> Wsl2Error {
 /// mount の結果ごとの扱い:
 /// - 成功: 新規マウントを特定して記録する。特定できなければ（0 件・複数件・mountinfo を上限回数まで読めない）
 ///   他者のマウントを外さないよう記録せず、`ownership unconfirmed` の失敗を返す（fail-closed）。
-/// - 成立していないと確定できる失敗（[`MOUNT_SCRIPT`] の検証失敗・[`MOUNT_EXIT_NOT_MOUNTED`]）: 記録しない。
-/// - 結果が不確定な失敗（`wsl.exe` のタイムアウト・出力読み取り失敗・それ以外の終了コード）: ゲスト内で mount が
-///   成立している可能性があるため、同じ差分基準で mountinfo を読み直す回復経路に入る。新規マウントを特定できれば
+/// - [`MOUNT_SCRIPT`] の検証失敗（70〜72）: `mount` を実行する前に終了しているので、mountinfo を読まずに返す。
+/// - それ以外の失敗（`mount(8)` の終了コード・`wsl.exe` のタイムアウト・出力読み取り失敗・`wsl.exe` 自身の異常値）:
+///   `mount(8)` はマウント成立後の処理でも失敗を返しうる（システムエラー等）ため、終了コードだけで未成立と
+///   決めない。ゲスト内で mount が成立している可能性があるものとして、同じ差分基準で mountinfo を読み直す
+///   回復経路に入る。新規マウントを特定できれば
 ///   `owned` に積んで元のエラーを返し、呼び出し側の [`rollback`] がマウント ID を再確認して外す。新規マウントが
 ///   無ければ元のエラーをそのまま返す。特定できなければ記録せず `ownership unconfirmed` を付けて返す。
 ///   回復の読み取りは [`MAX_RECOVERY_READS`] 回 × 呼び出しごとのタイムアウトで有界（REPAIR-5）。
@@ -688,24 +686,23 @@ fn mount_one(
     let failure = match exec(&mount_argv(distro, m), MAX_OUTPUT_BYTES) {
         Ok(out) if out.success => None,
         Ok(out) => {
-            let e = match out.code {
+            // 70〜72 は MOUNT_SCRIPT が `exec mount` の前に返す（`mount(8)` の終了コードは 64 以下で重ならない）。
+            match out.code {
                 Some(EXIT_PARENT_BAD) => {
-                    precondition("the mount base parent directory is missing or unsafe")
+                    return Err(precondition(
+                        "the mount base parent directory is missing or unsafe",
+                    ));
                 }
-                Some(EXIT_MKDIR_FAILED) => step_failed("creating the mount target", &out),
-                Some(EXIT_PATH_UNSAFE) => precondition(
-                    "a mount path component is not a root-owned, non-writable directory (symlinks are rejected)",
-                ),
-                _ => step_failed("mounting the shared directory", &out),
-            };
-            let settled = out.code.is_some_and(|c| {
-                matches!(c, EXIT_PARENT_BAD | EXIT_MKDIR_FAILED | EXIT_PATH_UNSAFE)
-                    || MOUNT_EXIT_NOT_MOUNTED.contains(&c)
-            });
-            if settled {
-                return Err(e);
+                Some(EXIT_MKDIR_FAILED) => {
+                    return Err(step_failed("creating the mount target", &out));
+                }
+                Some(EXIT_PATH_UNSAFE) => {
+                    return Err(precondition(
+                        "a mount path component is not a root-owned, non-writable directory (symlinks are rejected)",
+                    ));
+                }
+                _ => Some(step_failed("mounting the shared directory", &out)),
             }
-            Some(e)
         }
         Err(e) => Some(e),
     };

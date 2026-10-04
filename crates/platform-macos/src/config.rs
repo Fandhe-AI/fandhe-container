@@ -1902,4 +1902,36 @@ mod tests {
         drop(f);
         assert_eq!(std::fs::read(&path).unwrap(), b"dummy+more");
     }
+
+    /// MAC-1・TASK-64.3: 公開 API の open は上限つきの書き出しを返し、出力は検証済みログへ追記される。
+    #[cfg(unix)]
+    #[test]
+    fn open_serial_console_writes_through_capped_sink() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let t = TempDir::new("log-sink");
+        let (spec, _k, _i) = spec_with_initrd(&t);
+        let path = t.0.join("console.log");
+        let spec = spec
+            .with_devices(console_only(ConsoleLogPath::try_new(&path).unwrap()))
+            .unwrap();
+        let mut sink = spec.open_serial_console().unwrap().expect("console sink");
+        sink.writer()
+            .write_all(b"[    0.000000] Linux version\n")
+            .unwrap();
+        let out = sink
+            .finish(std::time::Duration::from_secs(10))
+            .expect("writer thread finished");
+        assert_eq!(out.written_bytes, 29);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"[    0.000000] Linux version\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let none = VmConfigSpec::from_parts(&t.file("k2"), None, "").unwrap();
+        assert!(none.open_serial_console().unwrap().is_none());
+    }
 }

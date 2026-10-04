@@ -185,10 +185,251 @@ impl ConsoleLogSink {
         self.outcome.recv_timeout(timeout).ok()
     }
 
+    /// テスト用: 書き込み端へ書く（VZ の代わり）。
+    #[cfg(test)]
+    pub(crate) fn writer(&mut self) -> &mut std::io::PipeWriter {
+        &mut self.writer
+    }
+
     /// 書き込み端の fd を取り出す（`NSFileHandle` へ所有を移すため）。書き出しスレッドは切り離され、
     /// VZ が書き込み端を手放した時点の EOF で終了する。
     #[cfg(target_os = "macos")]
     pub(crate) fn into_write_fd(self) -> std::os::fd::OwnedFd {
         self.writer.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MARKER_LEN: u64 = TRUNCATION_MARKER.len() as u64;
+
+    /// MAC-1・TASK-64.3: 計画は区切り文の分を確保し、既存長に応じて予算を減らす。
+    #[test]
+    fn cap_plan_reserves_marker() {
+        assert_eq!(MARKER_LEN, 86);
+        assert_eq!(
+            CapPlan::new(1000, 0),
+            CapPlan {
+                guest_budget: 914,
+                marker_room: true
+            }
+        );
+        assert_eq!(
+            CapPlan::new(1000, 900),
+            CapPlan {
+                guest_budget: 14,
+                marker_room: true
+            }
+        );
+        assert_eq!(
+            CapPlan::new(1000, 914),
+            CapPlan {
+                guest_budget: 0,
+                marker_room: true
+            }
+        );
+        assert_eq!(
+            CapPlan::new(1000, 915),
+            CapPlan {
+                guest_budget: 0,
+                marker_room: false
+            }
+        );
+        assert_eq!(
+            CapPlan::new(1000, 5000),
+            CapPlan {
+                guest_budget: 0,
+                marker_room: false
+            }
+        );
+    }
+
+    /// MAC-1・TASK-64.3: 上限内の出力はすべて書き、区切り文は書かない。
+    #[test]
+    fn copy_within_budget_writes_everything() {
+        let mut dst = Vec::new();
+        let out = copy_capped(&b"hello\n"[..], &mut dst, CapPlan::new(1000, 0));
+        assert_eq!(dst, b"hello\n");
+        assert_eq!(
+            out,
+            ConsoleLogOutcome {
+                written_bytes: 6,
+                ..ConsoleLogOutcome::default()
+            }
+        );
+    }
+
+    /// MAC-1・TASK-64.3: 上限を超えた分は捨て、区切り文を 1 回だけ書き、EOF まで読み続ける。
+    #[test]
+    fn copy_over_budget_truncates_and_marks_once() {
+        let src = vec![b'x'; 20_000];
+        let mut dst = Vec::new();
+        let plan = CapPlan::new(100 + MARKER_LEN, 0);
+        let out = copy_capped(&src[..], &mut dst, plan);
+        let mut expected = vec![b'x'; 100];
+        expected.extend_from_slice(TRUNCATION_MARKER);
+        assert_eq!(dst, expected);
+        assert_eq!(
+            out,
+            ConsoleLogOutcome {
+                written_bytes: 100,
+                discarded_bytes: 19_900,
+                limit_reached: true,
+                marker_written: true,
+                ..ConsoleLogOutcome::default()
+            }
+        );
+    }
+
+    /// MAC-1・TASK-64.3: open 時点で満杯なら何も書かず、区切り文も重ねない。
+    #[test]
+    fn copy_into_full_file_discards_without_marker() {
+        let mut dst = Vec::new();
+        let out = copy_capped(&b"late output"[..], &mut dst, CapPlan::new(1000, 1000));
+        assert!(dst.is_empty());
+        assert_eq!(
+            out,
+            ConsoleLogOutcome {
+                discarded_bytes: 11,
+                limit_reached: true,
+                ..ConsoleLogOutcome::default()
+            }
+        );
+    }
+
+    /// 書き込みが常に失敗する出力先（ディスク満杯の模擬）。
+    struct FullDisk;
+
+    impl Write for FullDisk {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(ErrorKind::StorageFull))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// MAC-1・TASK-64.3: 書き込み失敗後は読み捨てに倒し、EOF まで読み続ける。
+    #[test]
+    fn copy_after_write_error_keeps_draining() {
+        let src = vec![b'y'; 3 * COPY_BUFFER_BYTES];
+        let out = copy_capped(&src[..], FullDisk, CapPlan::new(1 << 20, 0));
+        assert_eq!(
+            out,
+            ConsoleLogOutcome {
+                discarded_bytes: 3 * COPY_BUFFER_BYTES as u64,
+                write_error: Some(ErrorKind::StorageFull),
+                ..ConsoleLogOutcome::default()
+            }
+        );
+    }
+
+    /// 1 回目は `Interrupted`、以後は内側へ委ねる読み出し元。
+    struct InterruptOnce<R> {
+        inner: R,
+        interrupted: bool,
+    }
+
+    impl<R: Read> Read for InterruptOnce<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::Error::from(ErrorKind::Interrupted));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    /// MAC-1・TASK-64.3: `Interrupted` は再試行し、データを失わない。
+    #[test]
+    fn copy_retries_interrupted_read() {
+        let src = InterruptOnce {
+            inner: &b"boot ok\n"[..],
+            interrupted: false,
+        };
+        let mut dst = Vec::new();
+        let out = copy_capped(src, &mut dst, CapPlan::new(1000, 0));
+        assert_eq!(dst, b"boot ok\n");
+        assert_eq!(out.written_bytes, 8);
+        assert_eq!(out.read_error, None);
+    }
+
+    /// テスト用一時ファイル（終了時に削除）。
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn new(tag: &str, content: &[u8]) -> Self {
+            let p = std::env::temp_dir()
+                .join(format!("fandhe-macos-console-{tag}-{}", std::process::id()));
+            std::fs::write(&p, content).expect("write fixture");
+            Self(p)
+        }
+
+        fn append_handle(&self) -> File {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.0)
+                .expect("open fixture")
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// MAC-1・TASK-64.3: pipe 経由の出力は既存内容の後ろへ追記され、閉じると結果が返る。
+    #[test]
+    fn sink_appends_through_pipe() {
+        let t = TempFile::new("append", b"previous\n");
+        let mut sink = ConsoleLogSink::spawn(t.append_handle(), 1000).unwrap();
+        sink.writer().write_all(b"guest boot\n").unwrap();
+        let out = sink.finish(WAIT).expect("writer thread finished");
+        assert_eq!(out.written_bytes, 11);
+        assert!(!out.limit_reached);
+        assert_eq!(std::fs::read(&t.0).unwrap(), b"previous\nguest boot\n");
+    }
+
+    /// MAC-1・TASK-64.3: 本番の上限 `MAX_CONSOLE_LOG_BYTES` を超える出力でも、ファイル総量は上限ちょうどで止まり
+    /// 末尾が区切り文になる（ホストのディスク枯渇の防止。#1366 の P1-3）。
+    #[test]
+    fn sink_stops_at_production_cap() {
+        let t = TempFile::new("cap", b"");
+        let mut sink = ConsoleLogSink::spawn(t.append_handle(), MAX_CONSOLE_LOG_BYTES).unwrap();
+        let chunk = vec![b'z'; 64 * 1024];
+        let total = MAX_CONSOLE_LOG_BYTES + 256 * 1024;
+        let mut sent = 0u64;
+        while sent < total {
+            sink.writer().write_all(&chunk).unwrap();
+            sent += chunk.len() as u64;
+        }
+        let out = sink.finish(WAIT).expect("writer thread finished");
+        let data = std::fs::read(&t.0).unwrap();
+        assert_eq!(data.len() as u64, MAX_CONSOLE_LOG_BYTES);
+        assert!(data.ends_with(TRUNCATION_MARKER));
+        assert_eq!(out.written_bytes, MAX_CONSOLE_LOG_BYTES - MARKER_LEN);
+        assert_eq!(
+            out.discarded_bytes,
+            total - (MAX_CONSOLE_LOG_BYTES - MARKER_LEN)
+        );
+        assert!(out.limit_reached);
+        assert!(out.marker_written);
+    }
+
+    /// MAC-1・TASK-64.3: 既に上限に達したファイルへは追記しない（再起動の繰り返しでも総量が増えない）。
+    #[test]
+    fn sink_does_not_grow_full_file() {
+        let t = TempFile::new("full", &[b'a'; 200]);
+        let mut sink = ConsoleLogSink::spawn(t.append_handle(), 200).unwrap();
+        sink.writer().write_all(b"more output").unwrap();
+        let out = sink.finish(WAIT).expect("writer thread finished");
+        assert_eq!(std::fs::metadata(&t.0).unwrap().len(), 200);
+        assert_eq!(out.discarded_bytes, 11);
+        assert!(!out.marker_written);
     }
 }

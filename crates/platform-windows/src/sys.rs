@@ -27,8 +27,6 @@
 //! - 取得したハンドルは直ちに `std::os::windows::io::OwnedHandle` 等の所有者へ移し、`Drop` で必ず閉じる
 //!   （RAII）。継承可能（`bInheritHandle`）なハンドルは作らない。
 
-#[cfg(unix)]
-pub(crate) use unix::has_extended_acl;
 #[cfg(all(
     test,
     any(
@@ -40,10 +38,13 @@ pub(crate) use unix::has_extended_acl;
     )
 ))]
 pub(crate) use unix::{add_test_acl, add_test_default_acl};
+#[cfg(unix)]
+pub(crate) use unix::{has_extended_acl, security_labels};
 #[cfg(windows)]
 pub(crate) use windows::{
     CREATE_SUSPENDED, GENERIC_WRITE, Job, WRITE_DAC, WRITE_OWNER, copy_security, file_id,
-    has_audit_sacl, resume_suspended_threads, security_snapshot, system_directory,
+    has_audit_sacl, has_named_streams, resume_suspended_threads, security_snapshot,
+    system_directory,
 };
 
 /// Windows の FFI（`windows-sys`）。前半は `wsl2` 用（TASK-67.3・#1364 由来）、後半は `wslconfig` 用（TASK-67.2）。
@@ -261,7 +262,7 @@ mod windows {
     use std::fs::File;
 
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD, ERROR_SUCCESS, LocalFree,
+        ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_PRIVILEGE_NOT_HELD, ERROR_SUCCESS, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
         GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
@@ -274,7 +275,7 @@ mod windows {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
-        GetFileInformationByHandleEx, READ_CONTROL, ReOpenFile,
+        FileStreamInfo, GetFileInformationByHandleEx, READ_CONTROL, ReOpenFile,
     };
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_SYSTEM_SECURITY, SYSTEM_ALARM_ACE_TYPE, SYSTEM_ALARM_CALLBACK_ACE_TYPE,
@@ -578,6 +579,84 @@ mod windows {
         // SAFETY: `sd.0` は有効な自己相対 SD で、`GetSecurityDescriptorLength` が返した `len` バイトはその全体
         // （内部の SID・ACL を含む）。`sd` の生存中に限ってコピーする。
         Ok(unsafe { std::slice::from_raw_parts(sd.0.cast::<u8>(), len) }.to_vec())
+    }
+
+    /// 名前付きストリームの列挙に使う領域の大きさ（バイト。8 の倍数）。超える列挙は `Err`（置換を拒否）。
+    const STREAM_INFO_BYTES: usize = 64 * 1024;
+
+    /// `file` に既定のデータストリーム（`::$DATA`）以外の名前付きストリーム（NTFS の代替データストリーム）が
+    /// あるか（`GetFileInformationByHandleEx` の `FileStreamInfo`。パスを引き直さない）。
+    ///
+    /// `wslconfig` は一時ファイルの rename で元ファイルを置き換えるため名前付きストリームを引き継げない。あれば
+    /// 置換を拒否する（既存データを消さない）。ストリームがない（`ERROR_HANDLE_EOF`）は `false`、領域に収まらない
+    /// （`ERROR_MORE_DATA`）・形式の不正・それ以外の失敗は `Err`。
+    pub(crate) fn has_named_streams(file: &File) -> std::io::Result<bool> {
+        // FILE_STREAM_INFO は 8 バイト境界（LARGE_INTEGER）を要するため u64 の領域を使う。
+        let mut buf = vec![0u64; STREAM_INFO_BYTES / 8];
+        let size = u32::try_from(STREAM_INFO_BYTES).map_err(|_| malformed())?;
+        // SAFETY: `file` は生存中の `File` が所有する有効なハンドル。`buf` は `STREAM_INFO_BYTES` バイトの
+        // 8 バイト境界の書き込み可能領域で、`size` に同じ大きさを渡すため関数はこの範囲を超えて書かない。
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileStreamInfo,
+                buf.as_mut_ptr().cast::<c_void>(),
+                size,
+            )
+        };
+        if ok == 0 {
+            let e = std::io::Error::last_os_error();
+            let code = e.raw_os_error().and_then(|c| u32::try_from(c).ok());
+            return match code {
+                Some(ERROR_HANDLE_EOF) => Ok(false),
+                _ => Err(e),
+            };
+        }
+        let bytes: Vec<u8> = buf.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        let names = parse_stream_names(&bytes).ok_or_else(malformed)?;
+        Ok(names.iter().any(|n| n != DEFAULT_STREAM))
+    }
+
+    /// 既定のデータストリームの名前（UTF-16）。
+    const DEFAULT_STREAM: &[u16] = &[
+        b':' as u16,
+        b':' as u16,
+        b'$' as u16,
+        b'D' as u16,
+        b'A' as u16,
+        b'T' as u16,
+        b'A' as u16,
+    ];
+
+    /// `FILE_STREAM_INFO` の列（NextEntryOffset u32・StreamNameLength u32・StreamSize i64・
+    /// StreamAllocationSize i64・StreamName）からストリーム名を取り出す。形式が壊れていれば `None`。
+    fn parse_stream_names(bytes: &[u8]) -> Option<Vec<Vec<u16>>> {
+        const NAME_OFFSET: usize = 24;
+        let le32 = |off: usize| -> Option<u32> {
+            Some(u32::from_ne_bytes(
+                bytes.get(off..off.checked_add(4)?)?.try_into().ok()?,
+            ))
+        };
+        let mut names = Vec::new();
+        let mut off: usize = 0;
+        loop {
+            let next = usize::try_from(le32(off)?).ok()?;
+            let name_len = usize::try_from(le32(off.checked_add(4)?)?).ok()?;
+            let start = off.checked_add(NAME_OFFSET)?;
+            let raw = bytes.get(start..start.checked_add(name_len)?)?;
+            let (pairs, rest) = raw.as_chunks::<2>();
+            if !rest.is_empty() {
+                return None;
+            }
+            names.push(pairs.iter().map(|c| u16::from_ne_bytes(*c)).collect());
+            if next == 0 {
+                return Some(names);
+            }
+            if next < NAME_OFFSET {
+                return None;
+            }
+            off = off.checked_add(next)?;
+        }
     }
 
     /// `file` の監査用 SACL に監査・アラームの ACE があるか。
@@ -884,6 +963,19 @@ mod unix {
         imp::has_extended_acl(file)
     }
 
+    /// `file` の LSM のセキュリティラベル（拡張属性名と値。値がなければ `None`）の列。
+    ///
+    /// Linux は `security.selinux`・`security.SMACK64` を読む（AppArmor はパスベースでファイルにラベルを持たない）。
+    /// 値は 4096 バイト（`imp::MAX_LABEL_BYTES`）までに制限し、超える・読み取り中に変わる・それ以外の errno は `Err`。macOS は
+    /// 拡張属性としてのセキュリティラベルを持たないため空の列。判定方法を持たない OS・アーキテクチャは `Err`。
+    /// `wslconfig` が元ファイルと一時ファイルで一致するかを比べ、違えば置換を拒否する（ラベルの付け替えは行わない）。
+    pub(crate) fn security_labels(file: &File) -> std::io::Result<SecurityLabels> {
+        imp::security_labels(file)
+    }
+
+    /// [`security_labels`] の戻り値（拡張属性名と値。値がなければ `None`）。
+    pub(crate) type SecurityLabels = Vec<(&'static str, Option<Vec<u8>>)>;
+
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -940,6 +1032,60 @@ mod unix {
                 Some(ENODATA) | Some(EOPNOTSUPP) => Ok(false),
                 _ => Err(e),
             }
+        }
+
+        /// セキュリティラベルとして読む値の上限（バイト。無制限確保の防止）。
+        const MAX_LABEL_BYTES: usize = 4096;
+
+        /// 比較するセキュリティラベルの拡張属性名。
+        const LABEL_XATTRS: [(&str, &std::ffi::CStr); 2] = [
+            ("security.selinux", c"security.selinux"),
+            ("security.SMACK64", c"security.SMACK64"),
+        ];
+
+        pub(super) fn security_labels(file: &File) -> std::io::Result<super::SecurityLabels> {
+            let mut out = Vec::with_capacity(LABEL_XATTRS.len());
+            for (key, name) in LABEL_XATTRS {
+                out.push((key, read_xattr(file, name)?));
+            }
+            Ok(out)
+        }
+
+        /// `file` の拡張属性 `name` の値（なければ `None`）。大きさを問い合わせてから、その大きさの領域へ読む。
+        fn read_xattr(file: &File, name: &std::ffi::CStr) -> std::io::Result<Option<Vec<u8>>> {
+            // SAFETY: `file` は生存中の `File` が所有する有効な fd。`name` は NUL 終端の文字列で呼び出しの間生存
+            // する。`size` に 0 を渡すため `value`（NULL）には書き込まれない。
+            let rc = unsafe { fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+            if rc < 0 {
+                let e = std::io::Error::last_os_error();
+                return match e.raw_os_error() {
+                    Some(ENODATA) | Some(EOPNOTSUPP) => Ok(None),
+                    _ => Err(e),
+                };
+            }
+            let len = usize::try_from(rc).map_err(|_| std::io::Error::other("bad xattr size"))?;
+            if len > MAX_LABEL_BYTES {
+                return Err(std::io::Error::other("security label is too large"));
+            }
+            let mut buf = vec![0u8; len];
+            // SAFETY: `buf` は `len` バイトの書き込み可能領域で、`size` に同じ `len` を渡すため関数はこの範囲を
+            // 超えて書かない。`file`・`name` は上と同じく有効。
+            let rc = unsafe {
+                fgetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    buf.as_mut_ptr().cast::<c_void>(),
+                    len,
+                )
+            };
+            // 問い合わせ後に値が変わった（ERANGE・長さの不一致）場合も含め、失敗は `Err`（fail-closed）。
+            let got = usize::try_from(rc).map_err(|_| std::io::Error::last_os_error())?;
+            if got != len {
+                return Err(std::io::Error::other(
+                    "security label changed while reading",
+                ));
+            }
+            Ok(Some(buf))
         }
 
         /// テスト用: `path` に拡張 ACL（`nobody` の読み取り）を `setxattr` で付ける。`name` は
@@ -1013,6 +1159,11 @@ mod unix {
             fn acl_free(obj: *mut c_void) -> c_int;
         }
 
+        /// macOS は拡張属性としてのセキュリティラベル（SELinux 等）を持たない。
+        pub(super) fn security_labels(_file: &File) -> std::io::Result<super::SecurityLabels> {
+            Ok(Vec::new())
+        }
+
         pub(super) fn has_extended_acl(file: &File) -> std::io::Result<bool> {
             // SAFETY: `file` は生存中の `File` が所有する有効な fd。戻り値は下で NULL 判定し、非 NULL なら
             // 1 回だけ `acl_free` する（以降は参照しない）。
@@ -1047,6 +1198,14 @@ mod unix {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "extended ACL detection is not supported on this platform",
+            ))
+        }
+
+        /// 判定方法を持たない OS・アーキテクチャ。ラベルを確かめられないため常に `Err`（fail-closed）。
+        pub(super) fn security_labels(_file: &File) -> std::io::Result<super::SecurityLabels> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "security label detection is not supported on this platform",
             ))
         }
     }

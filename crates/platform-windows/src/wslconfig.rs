@@ -646,8 +646,8 @@ const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
 
 /// 置換時に一時ファイルの作成属性として引き継ぐ Windows のファイル属性。HIDDEN（0x2）・SYSTEM（0x4）・
 /// NOT_CONTENT_INDEXED（0x2000）・ENCRYPTED。READONLY は置換自体を拒否するため含めず（[`enable_virtiofs_at`]）、
-/// ARCHIVE は作成時に自動で付くため含めない。圧縮・名前付きストリーム・作成日時・短い名前・オブジェクト ID は
-/// 引き継がない（誰が読み書きできるかに影響しないため）。
+/// ARCHIVE は作成時に自動で付くため含めない。圧縮・作成日時・短い名前・オブジェクト ID は引き継がない（誰が
+/// 読み書きできるかに影響しないため）。名前付きストリームは引き継げないため、あれば置換を拒否する。
 #[cfg(windows)]
 const PRESERVED_ATTRIBUTES: u32 =
     0x0000_0002 | 0x0000_0004 | 0x0000_2000 | FILE_ATTRIBUTE_ENCRYPTED;
@@ -824,6 +824,17 @@ fn fill_new_file(
                     "the replacement would inherit an ACL from the directory; refusing to replace .wslconfig",
                 ));
             }
+            // LSM のセキュリティラベル（SELinux・Smack）が元と一致しなければ置換しない（付け替えは行わない。
+            // 新規ファイルのラベルはディレクトリ・ポリシーで決まり、元に個別のラベルがあると変わりうるため）。
+            let label_err = |e: std::io::Error| io_err(&e, "failed to inspect file security label");
+            if crate::sys::security_labels(src).map_err(label_err)?
+                != crate::sys::security_labels(f).map_err(label_err)?
+            {
+                return Err(err(
+                    WinErrorCode::PermissionDenied,
+                    ".wslconfig has a security label that cannot be preserved; refusing to replace it",
+                ));
+            }
         }
         #[cfg(windows)]
         {
@@ -831,6 +842,16 @@ fn fill_new_file(
             // 監査用 SACL は観測できる場合（SeSecurityPrivilege が有効）に限り検査し、監査 ACE があれば
             // 写せないため置換しない。観測できない主体は SACL に制約されず、元ファイルを削除できる（削除で SACL
             // も消える）ため、観測できないことは拒否理由にしない（[`crate::sys::has_audit_sacl`]）。
+            // 名前付きストリーム（代替データストリーム）は rename で引き継げないため、あれば置換しない
+            // （既存データを消さない）。
+            let streams = crate::sys::has_named_streams(src)
+                .map_err(|e| io_err(&e, "failed to inspect file streams"))?;
+            if streams {
+                return Err(err(
+                    WinErrorCode::PermissionDenied,
+                    ".wslconfig has named streams that cannot be preserved; refusing to replace it",
+                ));
+            }
             let audited = crate::sys::has_audit_sacl(src)
                 .map_err(|e| io_err(&e, "failed to inspect file audit settings"))?;
             if audited == Some(true) {

@@ -48,12 +48,17 @@ impl ReaderGuard {
     }
 
     fn acquire_in(counter: &'static AtomicUsize, max: usize) -> Option<Self> {
-        counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < max).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| ReaderGuard(counter))
+        // `fetch_update` / `try_update` は stable の版で改名されるため、版差を避けて CAS ループで書く。
+        let mut cur = counter.load(Ordering::SeqCst);
+        loop {
+            if cur >= max {
+                return None;
+            }
+            match counter.compare_exchange_weak(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(ReaderGuard(counter)),
+                Err(actual) => cur = actual,
+            }
+        }
     }
 }
 
@@ -122,7 +127,11 @@ fn spawn_reader<R: Read + Send + 'static>(
 /// （残留は `MAX_LIVE_READERS` で抑える）。`taskkill` 自体も `REAP_TIMEOUT` で打ち切る。
 #[cfg(windows)]
 fn kill_tree(child: &Child) {
-    let Ok(mut killer) = Command::new("taskkill")
+    // `PATH` 探索を避け、システムディレクトリの `taskkill.exe` を絶対パスで起動する（PLUG-11）。
+    let Some(dir) = crate::sys::system_directory() else {
+        return;
+    };
+    let Ok(mut killer) = Command::new(dir.join("taskkill.exe"))
         .args(["/T", "/F", "/PID", &child.id().to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -134,8 +143,12 @@ fn kill_tree(child: &Child) {
     let deadline = Instant::now() + REAP_TIMEOUT;
     while matches!(killer.try_wait(), Ok(None)) {
         if Instant::now() >= deadline {
+            // 強制終了後の回収も期限付きの `try_wait()` で行い、無期限に `wait()` しない（REPAIR-5）。
             let _ = killer.kill();
-            let _ = killer.wait();
+            let reap_deadline = Instant::now() + REAP_TIMEOUT;
+            while matches!(killer.try_wait(), Ok(None)) && Instant::now() < reap_deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
             return;
         }
         thread::sleep(Duration::from_millis(10));

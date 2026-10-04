@@ -176,6 +176,14 @@ pub enum ConfigError {
     SharedDirNotNormalized { path: PathBuf },
     /// 共有ディレクトリがファイルシステムのルート。
     SharedDirIsRoot,
+    /// 読み書き共有が VM の保護入力（kernel・initrd・ディスクイメージ・コンソールログ）を含む。
+    ///
+    /// `field` は保護入力の種別、`path` はその実体パス、`share_dir` は共有ディレクトリ。
+    SharedDirContainsProtectedInput {
+        field: ConfigField,
+        path: PathBuf,
+        share_dir: PathBuf,
+    },
 }
 
 impl ConfigError {
@@ -229,6 +237,9 @@ impl ConfigError {
             ConfigError::SharedDirSymlink { .. } => "config.shared_dir_symlink",
             ConfigError::SharedDirNotNormalized { .. } => "config.shared_dir_not_normalized",
             ConfigError::SharedDirIsRoot => "config.shared_dir_is_root",
+            ConfigError::SharedDirContainsProtectedInput { .. } => {
+                "config.shared_dir_contains_protected_input"
+            }
         }
     }
 
@@ -405,6 +416,18 @@ impl ConfigError {
             }
             ConfigError::SharedDirIsRoot => {
                 "sharing the filesystem root is not allowed".to_string()
+            }
+            ConfigError::SharedDirContainsProtectedInput {
+                field,
+                path,
+                share_dir,
+            } => {
+                format!(
+                    "read-write shared directory {} contains protected {} input: {}",
+                    share_dir.display(),
+                    field.as_str(),
+                    path.display()
+                )
             }
         }
     }
@@ -788,6 +811,20 @@ struct ProtectedInput<'a> {
     path: &'a Path,
 }
 
+/// 包含検査用に symlink を解決した実体パスを返す。パス自体が解決できなければ親を解決して補い、
+/// それも失敗したら元のパスを返す（コンソールログは未作成でもあり得るため）。
+fn resolve_for_containment(path: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(real_parent) = std::fs::canonicalize(parent)
+    {
+        return real_parent.join(name);
+    }
+    path.to_path_buf()
+}
+
 /// 照合対象の種別に応じた衝突エラー（`path` はコンソールログ側のパス）。
 fn conflict_error(field: ConfigField, path: &Path) -> ConfigError {
     match field {
@@ -1147,6 +1184,43 @@ impl VmConfigSpec {
         inputs
     }
 
+    /// ReadWrite の virtiofs 共有が VM の保護入力（kernel・initrd・ディスクイメージ・コンソールログ）を
+    /// 含まないことを検査する（MAC-1・TASK-65.1。ゲストによる起動入力の書き換え防止）。
+    ///
+    /// 共有ディレクトリの配下（同一ディレクトリ自身を含む）に保護入力があれば
+    /// [`ConfigError::SharedDirContainsProtectedInput`] を返す。比較は symlink を解決した実体パスで、
+    /// 解決できない（未作成のコンソールログ等）場合は親を解決して補う。ReadOnly 共有は書き換えられない
+    /// ため対象外。`build_vz_configuration` が VZ 呼び出しの前に実行する。
+    pub fn check_share_conflicts(&self) -> Result<(), ConfigError> {
+        let mut protected = self.protected_inputs();
+        if let Some(SerialConsoleSink::LogFile(log)) = self.devices.serial_console() {
+            protected.push(ProtectedInput {
+                field: ConfigField::ConsoleLog,
+                path: log.as_path(),
+            });
+        }
+        let resolved: Vec<(ConfigField, PathBuf)> = protected
+            .iter()
+            .map(|p| (p.field, resolve_for_containment(p.path)))
+            .collect();
+        for share in self.shares.shares() {
+            if share.access.is_read_only() {
+                continue;
+            }
+            let dir = resolve_for_containment(share.host_dir.as_path());
+            for (field, path) in &resolved {
+                if crate::virtiofs::path_is_within(path, &dir) {
+                    return Err(ConfigError::SharedDirContainsProtectedInput {
+                        field: *field,
+                        path: path.clone(),
+                        share_dir: dir,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// シリアルコンソールの出力先を上限つきの書き出しとして開く（無ければ `None`）。
     ///
     /// ログファイルを検証つきで開き（[`Self::open_serial_console_log`]）、ファイル長が
@@ -1315,6 +1389,9 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
             max: mem_max,
         });
     }
+
+    // ReadWrite 共有が起動入力（kernel・initrd・ディスクイメージ・コンソールログ）を含む構成は、副作用の前に拒否する。
+    spec.check_share_conflicts()?;
 
     let kernel_url =
         NSURL::from_file_path(spec.kernel.as_path()).ok_or(ConfigError::UrlConversion {
@@ -1902,6 +1979,67 @@ mod tests {
         assert!(!spec.shares.shares()[1].access.is_read_only());
     }
 
+    /// MAC-1・TASK-65.1: ReadWrite 共有が kernel・initrd・ディスク・コンソールログを含む構成は拒否し、
+    /// 別ディレクトリや ReadOnly 共有は許可する。
+    #[test]
+    fn rejects_read_write_share_containing_protected_inputs() {
+        use crate::virtiofs::{ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
+        let t = TempDir::new("share-conflict");
+        let real = std::fs::canonicalize(&t.0).unwrap();
+        let k = real.join("vmlinux");
+        std::fs::write(&k, b"k").unwrap();
+        let other = real.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let shares = |dir: &Path, access| {
+            VirtiofsSharesSpec::try_new(vec![VirtiofsShareSpec::new(
+                VirtiofsTag::try_new("s").unwrap(),
+                SharedDirectoryPath::try_new(dir).unwrap(),
+                access,
+            )])
+            .unwrap()
+        };
+        let base = VmConfigSpec::from_parts(&k, None, "console=hvc0").unwrap();
+        let err = base
+            .clone()
+            .with_shared_directories(shares(&real, ShareAccess::ReadWrite))
+            .check_share_conflicts()
+            .unwrap_err();
+        assert_eq!(err.code(), "config.shared_dir_contains_protected_input");
+        assert!(matches!(
+            err,
+            ConfigError::SharedDirContainsProtectedInput {
+                field: ConfigField::Kernel,
+                ..
+            }
+        ));
+        base.clone()
+            .with_shared_directories(shares(&real, ShareAccess::ReadOnly))
+            .check_share_conflicts()
+            .unwrap();
+        base.clone()
+            .with_shared_directories(shares(&other, ShareAccess::ReadWrite))
+            .check_share_conflicts()
+            .unwrap();
+
+        // 未作成のコンソールログも、共有配下なら拒否する。
+        let log = ConsoleLogPath::try_new(other.join("console.log")).unwrap();
+        let devices =
+            DeviceConfigSpec::try_new(vec![], Some(SerialConsoleSink::LogFile(log))).unwrap();
+        let err = base
+            .with_devices(devices)
+            .unwrap()
+            .with_shared_directories(shares(&other, ShareAccess::ReadWrite))
+            .check_share_conflicts()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::SharedDirContainsProtectedInput {
+                field: ConfigField::ConsoleLog,
+                ..
+            }
+        ));
+    }
+
     /// MAC-1・TASK-65.1: macOS で virtiofs 付き設定を構築し、読み戻した値が入力と一致する。
     #[cfg(target_os = "macos")]
     #[test]
@@ -1912,9 +2050,12 @@ mod tests {
         let cfg = build_vz_configuration(&plain).expect("build without shares");
         assert!(cfg.shared_directories().is_empty());
 
-        let spec = plain.with_shared_directories(shares_for(&t.0));
+        // ReadWrite 共有は kernel を含んではならないため、kernel と別のサブディレクトリを共有する。
+        let share_dir = t.0.join("share");
+        std::fs::create_dir_all(&share_dir).unwrap();
+        let spec = plain.with_shared_directories(shares_for(&share_dir));
         let cfg = build_vz_configuration(&spec).expect("build with shares");
-        let real = std::fs::canonicalize(&t.0).unwrap();
+        let real = std::fs::canonicalize(&share_dir).unwrap();
         let got = cfg.shared_directories();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].tag, "ro");

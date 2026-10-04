@@ -65,9 +65,9 @@ impl SharedDirectoryPath {
     /// トラバーサル対策）。macOS の `/tmp`・`/var` のような祖先の symlink も拒否するため、呼び出し側が
     /// 実体パスへ正規化して渡す。
     ///
-    /// 共有ディレクトリが VM 自身の起動入力（kernel・initrd・ディスクイメージ・コンソールログ）を含むか
-    /// どうかは本型では検査しない。ReadWrite 共有にそれらを含めるとゲストが書き換え得るため、
-    /// 除外は呼び出し側（構成の組み立て側）の責務とする（MAC-1・TASK-65.1。保護入力との照合は後続で追跡）。
+    /// 共有ディレクトリが VM 自身の起動入力（kernel・initrd・ディスクイメージ・コンソールログ）を含むかは
+    /// 本型では検査しない。ReadWrite 共有との包含検査は `VmConfigSpec::check_share_conflicts` が行い、
+    /// `config::build_vz_configuration` が VZ 呼び出しの前に実施する（MAC-1・TASK-65.1）。
     pub fn try_new(path: &Path) -> Result<Self, ConfigError> {
         const FIELD: ConfigField = ConfigField::SharedDirectory;
         check_absolute_utf8(FIELD, path)?;
@@ -117,15 +117,14 @@ impl SharedDirectoryPath {
             }
         }
         // 補強: 実体パスとの一致（Windows の `\\?\` 接頭辞は一致しないため unix のみ）。
+        // 比較は要素単位で行い、末尾スラッシュ・重複セパレータの綴り差を symlink と誤判定しない。
         #[cfg(unix)]
         {
             match std::fs::canonicalize(path) {
-                Ok(real) if real == path => {}
+                Ok(real) if components_eq(&real, path, false) => {}
                 // 大文字小文字非区別 FS（macOS 既定の APFS 等。IO-5）では綴りの大小だけが実体と異なり得る。
                 // 各接頭辞の symlink 検査は通過済みのため、大小のみの差は symlink 経由ではないとして許容する。
-                Ok(real)
-                    if real.to_string_lossy().to_lowercase()
-                        == path.to_string_lossy().to_lowercase() => {}
+                Ok(real) if components_eq(&real, path, true) => {}
                 Ok(_) => {
                     return Err(ConfigError::SharedDirSymlink {
                         path: path.to_path_buf(),
@@ -146,6 +145,45 @@ impl SharedDirectoryPath {
     pub fn as_path(&self) -> &Path {
         &self.0
     }
+}
+
+/// 2 つのパスが要素単位で等しいか（末尾スラッシュ・重複セパレータは `components` が吸収する）。
+/// `ignore_case` なら大文字小文字を区別しない（IO-5）。
+#[cfg(unix)]
+fn components_eq(a: &Path, b: &Path, ignore_case: bool) -> bool {
+    let mut ia = a.components();
+    let mut ib = b.components();
+    loop {
+        match (ia.next(), ib.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) => {
+                let same = if ignore_case {
+                    x.as_os_str().to_string_lossy().to_lowercase()
+                        == y.as_os_str().to_string_lossy().to_lowercase()
+                } else {
+                    x == y
+                };
+                if !same {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// `inner` が `dir` 自身またはその配下か（要素単位・大文字小文字非区別で判定。IO-5）。
+///
+/// 共有ディレクトリと保護入力（kernel・initrd・ディスクイメージ・コンソールログ）の包含検査用で、
+/// 大小のみ異なる綴りも包含とみなす（fail-closed）。
+pub(crate) fn path_is_within(inner: &Path, dir: &Path) -> bool {
+    let lower = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    let (i, d) = (lower(inner), lower(dir));
+    i.len() >= d.len() && i.iter().zip(d.iter()).all(|(a, b)| a == b)
 }
 
 /// 共有のアクセス権。bool にせず、読み書きは明示指定のみ（最小権限）。
@@ -313,7 +351,13 @@ mod tests {
             code(SharedDirectoryPath::try_new(Path::new("rel/dir"))),
             "config.path_not_absolute"
         );
-        let dotdot = t.0.join("..").join(t.0.file_name().unwrap());
+        // verbatim パス（Windows の `\\?\`）では `join("..")` が親へ正規化されてしまうため、文字列で組み立てる。
+        let sep = std::path::MAIN_SEPARATOR;
+        let dotdot = PathBuf::from(format!(
+            "{}{sep}..{sep}{}",
+            t.0.parent().unwrap().to_str().unwrap(),
+            t.0.file_name().unwrap().to_str().unwrap()
+        ));
         assert_eq!(
             code(SharedDirectoryPath::try_new(&dotdot)),
             "config.shared_dir_not_normalized"
@@ -392,5 +436,27 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(ok.shares().len(), 2);
+    }
+
+    /// MAC-1・TASK-65.1: 末尾スラッシュ・重複セパレータは symlink と誤判定しない。
+    #[cfg(unix)]
+    #[test]
+    fn accepts_trailing_and_duplicate_separators() {
+        let t = TempDir::new("sep");
+        let s = t.0.to_str().unwrap();
+        let trailing = PathBuf::from(format!("{s}/"));
+        assert!(SharedDirectoryPath::try_new(&trailing).is_ok());
+        let dup = PathBuf::from(s.replacen("/fandhe-macos", "//fandhe-macos", 1));
+        assert!(SharedDirectoryPath::try_new(&dup).is_ok());
+    }
+
+    /// MAC-1・TASK-65.1: 包含判定は要素単位・大文字小文字非区別。
+    #[test]
+    fn path_within_is_component_wise() {
+        let d = Path::new("/a/Share");
+        assert!(path_is_within(Path::new("/a/share/k"), d));
+        assert!(path_is_within(Path::new("/a/Share"), d));
+        assert!(!path_is_within(Path::new("/a/share2/k"), d));
+        assert!(!path_is_within(Path::new("/a"), d));
     }
 }

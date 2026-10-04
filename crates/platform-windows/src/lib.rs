@@ -4,8 +4,8 @@
 //! `virtiofs=true` を opt-in として既定運用に含める（WIN-2）。
 //!
 //! 実装状況: `error`（構造化エラー型）と `wslconfig`（`.wslconfig` の読み書き）は TASK-67.2（#373）で
-//! 実装済み。`sys`（Windows のみ）は `unsafe` を閉じ込める FFI の薄いラッパーで、`.wslconfig` 置換時の
-//! DACL 複製に使う。`wsl2`（WSL2 検出・virtiofs マウント・9P フォールバック）は引き続きスタブで、
+//! 実装済み。`sys` は `unsafe` を閉じ込める FFI の薄いラッパーで、`.wslconfig` 置換時のアクセス制御の
+//! 複製・検査（Windows の DACL 等・unix の拡張 ACL の検出）に使う。`wsl2`（WSL2 検出・virtiofs マウント・9P フォールバック）は引き続きスタブで、
 //! TASK-67.3〜67.5（#374〜#376）で実装する（REPAIR-3）。
 //!
 //! cfg 方針: Windows 固有の振る舞い（`wsl.exe` 起動・Win32 API）を持つ `wsl2` のみ
@@ -17,7 +17,7 @@
 //! PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 
 pub mod error;
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 mod sys;
 #[cfg(target_os = "windows")]
 pub mod wsl2;

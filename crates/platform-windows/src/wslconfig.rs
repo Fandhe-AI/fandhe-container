@@ -594,7 +594,9 @@ fn tmp_path(parent: &Path, tag: &str) -> PathBuf {
 ///
 /// 内容を書く前にアクセス制御を確定させる（既定の作成権限のまま書くと、`kernelCommandLine` 等の秘密情報が
 /// 調整までの間だけ漏れうるため）。
-/// - unix: 作成時点から所有者のみ（0600）で作り、`acl_from` があればそのパーミッションへ揃える。
+/// - unix: 作成時点から所有者のみ（0600）で作る。`acl_from` があれば、拡張 ACL を持つ・別ユーザー所有・
+///   所有グループを揃えられない場合は内容を書かずに `Err`（置換を拒否）とし、それ以外は所有グループと
+///   パーミッションを揃える。SELinux 等のラベルは同じディレクトリの新規ファイルとしてポリシーに従う。
 /// - Windows: `acl_from` があれば WRITE_DAC・WRITE_OWNER つきで、元の属性（[`PRESERVED_ATTRIBUTES`]）を
 ///   付けて作り、DACL と整合性ラベルを写す（[`crate::sys::copy_security`]）。元が EFS 暗号化なら一時ファイルも
 ///   暗号化されたことを確かめる（平文で書かない）。いずれかを満たせなければ内容を書かずに `Err`（置換を
@@ -646,11 +648,37 @@ fn fill_new_file(
     if let Some(src) = acl_from {
         #[cfg(unix)]
         {
-            let perm = src
+            use std::os::unix::fs::MetadataExt;
+            // パーミッションで再現できない拡張 ACL があれば置換しない（ACL のない新ファイルでは、ACL の
+            // マスクを表すグループビットが所有グループへの許可として効き、読める者が広がりうるため）。
+            let has_acl = crate::sys::has_extended_acl(src)
+                .map_err(|e| io_err(&e, "failed to inspect file ACL"))?;
+            if has_acl {
+                return Err(err(
+                    WinErrorCode::PermissionDenied,
+                    ".wslconfig has an ACL that cannot be preserved; refusing to replace it",
+                ));
+            }
+            let sm = src
                 .metadata()
-                .map_err(|e| io_err(&e, "failed to copy file permissions"))?
-                .permissions();
-            f.set_permissions(perm)
+                .map_err(|e| io_err(&e, "failed to stat .wslconfig"))?;
+            let tm = f
+                .metadata()
+                .map_err(|e| io_err(&e, "failed to stat temporary file"))?;
+            // 所有者は変えられない（特権が要る）ため、別ユーザー所有のファイルは置換しない。
+            if sm.uid() != tm.uid() {
+                return Err(err(
+                    WinErrorCode::PermissionDenied,
+                    ".wslconfig is owned by another user; refusing to replace it",
+                ));
+            }
+            // 所有グループが異なれば揃える（所属していなければ失敗し、置換しない）。揃えないままモードを
+            // 写すと、グループの許可が別のグループへ与えられる。
+            if sm.gid() != tm.gid() {
+                std::os::unix::fs::fchown(&*f, None, Some(sm.gid()))
+                    .map_err(|e| io_err(&e, "failed to copy file group"))?;
+            }
+            f.set_permissions(sm.permissions())
                 .map_err(|e| io_err(&e, "failed to copy file permissions"))?;
         }
         #[cfg(windows)]

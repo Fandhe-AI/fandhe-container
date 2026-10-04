@@ -197,9 +197,11 @@ impl std::error::Error for VmError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LifecycleInput {
     StartRequested,
-    StartCompleted(Result<(), ErrInfo>),
+    /// 第 1 要素は `Core::begin` が返した操作世代。現行の世代と一致しない完了通知は無視される。
+    StartCompleted(u64, Result<(), ErrInfo>),
     StopRequested,
-    StopCompleted(Result<(), ErrInfo>),
+    /// 第 1 要素は `Core::begin` が返した操作世代。現行の世代と一致しない完了通知は無視される。
+    StopCompleted(u64, Result<(), ErrInfo>),
     GuestStopped,
     StoppedWithError(ErrInfo),
 }
@@ -208,16 +210,29 @@ pub(crate) enum LifecycleInput {
 ///
 /// 完了入力（`StartCompleted(Err)` → `Error`、`StopCompleted(Err)` → `Running`）は仮の遷移で、VZ の実状態
 /// （例: 起動失敗後に `Stopped`）と食い違い得る。実状態は `Vm::state()` が正で、実状態への追従は TASK-64.5 で扱う。
+///
+/// 操作世代: 要求ごとに世代を進め、完了通知は要求時の世代と一致する間だけ適用する。ゲスト停止・エラー停止の
+/// 通知は進行中の操作を無効化するため、停止済みの VM を遅れて届いた `StartCompleted(Ok)` が `Running` へ
+/// 逆行させない。
 #[derive(Debug)]
 pub(crate) struct Lifecycle {
     state: VmState,
+    generation: u64,
+    in_flight: Option<u64>,
 }
 
 impl Lifecycle {
     pub(crate) fn new() -> Lifecycle {
         Lifecycle {
             state: VmState::Stopped,
+            generation: 0,
+            in_flight: None,
         }
+    }
+
+    /// 直近の要求に割り当てた操作世代。
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// 入力を適用し、発行すべきイベント列を返す。
@@ -225,18 +240,42 @@ impl Lifecycle {
         let mut events = Vec::new();
         let mut extra = None;
         let next = match input {
-            LifecycleInput::StartRequested => VmState::Starting,
-            LifecycleInput::StartCompleted(Ok(())) => VmState::Running,
-            LifecycleInput::StartCompleted(Err(_)) => VmState::Error,
-            LifecycleInput::StopRequested => VmState::Stopping,
-            LifecycleInput::StopCompleted(Ok(())) => VmState::Stopped,
-            // 停止に失敗した VM は動作を続けているとみなす。
-            LifecycleInput::StopCompleted(Err(_)) => VmState::Running,
+            LifecycleInput::StartRequested => {
+                self.begin_op();
+                VmState::Starting
+            }
+            LifecycleInput::StopRequested => {
+                self.begin_op();
+                VmState::Stopping
+            }
+            LifecycleInput::StartCompleted(generation, res) => {
+                if !self.finish_op(generation) {
+                    return events;
+                }
+                if res.is_ok() {
+                    VmState::Running
+                } else {
+                    VmState::Error
+                }
+            }
+            LifecycleInput::StopCompleted(generation, res) => {
+                if !self.finish_op(generation) {
+                    return events;
+                }
+                // 停止に失敗した VM は動作を続けているとみなす。
+                if res.is_ok() {
+                    VmState::Stopped
+                } else {
+                    VmState::Running
+                }
+            }
             LifecycleInput::GuestStopped => {
+                self.in_flight = None;
                 extra = Some(VmEvent::GuestStopped);
                 VmState::Stopped
             }
             LifecycleInput::StoppedWithError((domain, code)) => {
+                self.in_flight = None;
                 extra = Some(VmEvent::StoppedWithError { domain, code });
                 VmState::Error
             }
@@ -250,6 +289,21 @@ impl Lifecycle {
         }
         events.extend(extra);
         events
+    }
+
+    fn begin_op(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.in_flight = Some(self.generation);
+    }
+
+    /// 完了通知が現行の進行中操作のものなら受理して true。古い通知は false。
+    fn finish_op(&mut self, generation: u64) -> bool {
+        if self.in_flight == Some(generation) {
+            self.in_flight = None;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -304,6 +358,12 @@ impl Core {
         }
     }
 
+    /// 要求入力を適用し、その操作に割り当てた世代を返す（完了通知に持ち回る）。
+    pub(crate) fn begin(&mut self, input: LifecycleInput) -> u64 {
+        self.apply(input);
+        self.lifecycle.generation()
+    }
+
     pub(crate) fn apply(&mut self, input: LifecycleInput) {
         for event in self.lifecycle.step(input) {
             self.sink.send(event);
@@ -316,6 +376,7 @@ pub use mac::Vm;
 
 #[cfg(target_os = "macos")]
 mod mac {
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::Duration;
@@ -326,6 +387,13 @@ mod mac {
     };
     use crate::config::VzVmConfiguration;
     use crate::sys::{self, DelegateEvent, HostInitError};
+
+    /// キューに投入した操作が未着手。
+    const OP_PENDING: u8 = 0;
+    /// VM キュー上で実行を開始した（以後は取り消せない）。
+    const OP_STARTED: u8 = 1;
+    /// 待機期限切れで呼び出し元が取り消した。キュー上の実行直前に確認して何もせず戻る。
+    const OP_CANCELLED: u8 = 2;
 
     fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
         // 毒化しても状態機械は壊れないため、中身をそのまま使う（コールバック内で panic させない）。
@@ -400,7 +468,16 @@ mod mac {
         fn run_op(&self, op: VmOp) -> Result<(), VmError> {
             let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), VmError>>(1);
             let core = Arc::clone(&self.core);
+            let gate = Arc::new(AtomicU8::new(OP_PENDING));
+            let queue_gate = Arc::clone(&gate);
             self.host.run_async(move |vm| {
+                // 待機期限切れで取り消し済みなら start / stop を実行しない。
+                if queue_gate
+                    .compare_exchange(OP_PENDING, OP_STARTED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return;
+                }
                 let allowed = match op {
                     VmOp::Start => vm.can_start(),
                     VmOp::Stop => vm.can_stop(),
@@ -410,7 +487,7 @@ mod mac {
                     let _ = tx.try_send(Err(VmError::InvalidState { op, state }));
                     return;
                 }
-                lock(&core).apply(match op {
+                let generation = lock(&core).begin(match op {
                     VmOp::Start => LifecycleInput::StartRequested,
                     VmOp::Stop => LifecycleInput::StopRequested,
                 });
@@ -420,8 +497,8 @@ mod mac {
                         VmOp::Stop => VmError::StopFailed { domain, code },
                     });
                     lock(&core).apply(match op {
-                        VmOp::Start => LifecycleInput::StartCompleted(res),
-                        VmOp::Stop => LifecycleInput::StopCompleted(res),
+                        VmOp::Start => LifecycleInput::StartCompleted(generation, res),
+                        VmOp::Stop => LifecycleInput::StopCompleted(generation, res),
                     });
                     let _ = tx.try_send(outcome);
                 };
@@ -432,10 +509,20 @@ mod mac {
             });
             match rx.recv_timeout(self.op_timeout) {
                 Ok(result) => result,
-                Err(RecvTimeoutError::Timeout) => Err(VmError::Timeout {
-                    op,
-                    after: self.op_timeout,
-                }),
+                Err(RecvTimeoutError::Timeout) => {
+                    // 未着手なら取り消す。実行開始済みなら取り消せず、完了通知は世代照合を経て状態機械に
+                    // 適用される（結果は呼び出し元へ届かない。後始末は TASK-64.5）。
+                    let _ = gate.compare_exchange(
+                        OP_PENDING,
+                        OP_CANCELLED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    Err(VmError::Timeout {
+                        op,
+                        after: self.op_timeout,
+                    })
+                }
                 Err(RecvTimeoutError::Disconnected) => Err(VmError::CallbackLost { op }),
             }
         }
@@ -499,7 +586,7 @@ mod tests {
             vec![changed(VmState::Stopped, VmState::Starting)]
         );
         assert_eq!(
-            lc.step(LifecycleInput::StartCompleted(Ok(()))),
+            lc.step(LifecycleInput::StartCompleted(1, Ok(()))),
             vec![changed(VmState::Starting, VmState::Running)]
         );
         assert_eq!(
@@ -507,7 +594,7 @@ mod tests {
             vec![changed(VmState::Running, VmState::Stopping)]
         );
         assert_eq!(
-            lc.step(LifecycleInput::StopCompleted(Ok(()))),
+            lc.step(LifecycleInput::StopCompleted(2, Ok(()))),
             vec![changed(VmState::Stopping, VmState::Stopped)]
         );
     }
@@ -519,15 +606,15 @@ mod tests {
         let mut lc = Lifecycle::new();
         lc.step(LifecycleInput::StartRequested);
         assert_eq!(
-            lc.step(LifecycleInput::StartCompleted(Err(err.clone()))),
+            lc.step(LifecycleInput::StartCompleted(1, Err(err.clone()))),
             vec![changed(VmState::Starting, VmState::Error)]
         );
         let mut lc = Lifecycle::new();
         lc.step(LifecycleInput::StartRequested);
-        lc.step(LifecycleInput::StartCompleted(Ok(())));
+        lc.step(LifecycleInput::StartCompleted(1, Ok(())));
         lc.step(LifecycleInput::StopRequested);
         assert_eq!(
-            lc.step(LifecycleInput::StopCompleted(Err(err))),
+            lc.step(LifecycleInput::StopCompleted(2, Err(err))),
             vec![changed(VmState::Stopping, VmState::Running)]
         );
     }
@@ -537,7 +624,7 @@ mod tests {
     fn lifecycle_delegate_notifications() {
         let mut lc = Lifecycle::new();
         lc.step(LifecycleInput::StartRequested);
-        lc.step(LifecycleInput::StartCompleted(Ok(())));
+        lc.step(LifecycleInput::StartCompleted(1, Ok(())));
         assert_eq!(
             lc.step(LifecycleInput::GuestStopped),
             vec![
@@ -547,7 +634,7 @@ mod tests {
         );
         let mut lc = Lifecycle::new();
         lc.step(LifecycleInput::StartRequested);
-        lc.step(LifecycleInput::StartCompleted(Ok(())));
+        lc.step(LifecycleInput::StartCompleted(1, Ok(())));
         assert_eq!(
             lc.step(LifecycleInput::StoppedWithError(("D".to_string(), 7))),
             vec![
@@ -557,6 +644,42 @@ mod tests {
                     code: 7
                 }
             ]
+        );
+    }
+
+    /// MAC-1・TASK-64.4: ゲスト停止後に遅れて届いた起動完了で Running へ逆行しない。
+    #[test]
+    fn stale_start_completion_after_guest_stop_is_ignored() {
+        let mut lc = Lifecycle::new();
+        lc.step(LifecycleInput::StartRequested);
+        lc.step(LifecycleInput::GuestStopped);
+        assert_eq!(
+            lc.step(LifecycleInput::StartCompleted(1, Ok(()))),
+            Vec::<VmEvent>::new()
+        );
+    }
+
+    /// MAC-1・TASK-64.4: エラー停止後に届いた停止完了・古い世代の完了は無視される。
+    #[test]
+    fn stale_completions_are_ignored() {
+        let mut lc = Lifecycle::new();
+        lc.step(LifecycleInput::StartRequested);
+        lc.step(LifecycleInput::StartCompleted(1, Ok(())));
+        lc.step(LifecycleInput::StopRequested);
+        lc.step(LifecycleInput::StoppedWithError(("D".to_string(), 7)));
+        assert_eq!(
+            lc.step(LifecycleInput::StopCompleted(2, Ok(()))),
+            Vec::<VmEvent>::new()
+        );
+        // 停止後の再起動に対し、前回の世代の完了は適用されない。
+        lc.step(LifecycleInput::StartRequested);
+        assert_eq!(
+            lc.step(LifecycleInput::StartCompleted(1, Ok(()))),
+            Vec::<VmEvent>::new()
+        );
+        assert_eq!(
+            lc.step(LifecycleInput::StartCompleted(3, Ok(()))),
+            vec![changed(VmState::Starting, VmState::Running)]
         );
     }
 

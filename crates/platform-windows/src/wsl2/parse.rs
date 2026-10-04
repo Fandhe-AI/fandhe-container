@@ -635,6 +635,25 @@ mod tests {
         assert_eq!(classify_failure(&full), Failure::NoDistro);
         let ja = cap(false, &utf16le(NO_DISTRO_FULL_JA, false), b"");
         assert_eq!(classify_failure(&ja), Failure::NoDistro);
+        // ERR-1: アクセス拒否の識別子は単独でも PermissionDenied。無効の識別子が併記されたら無効を優先し、
+        // 識別子の一部だけが一致するトークンは拾わない（完全一致）。
+        for (text, want) in [
+            (
+                "Error code: Wsl/Service/E_ACCESSDENIED",
+                Failure::PermissionDenied,
+            ),
+            ("ERROR_ACCESS_DENIED", Failure::PermissionDenied),
+            ("Wsl/0x80070005", Failure::PermissionDenied),
+            (
+                "Wsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED\nE_ACCESSDENIED",
+                Failure::WslDisabled,
+            ),
+            ("Wsl/Service/WSL_E_ACCESSDENIED_EXTRA", Failure::Unknown),
+            ("Wsl/0x800700051", Failure::Unknown),
+        ] {
+            let c = cap(false, b"", &utf16le(text, false));
+            assert_eq!(classify_failure(&c), want, "{text}");
+        }
         let phrase_only = cap(false, b"", b"has no installed distributions");
         assert_eq!(classify_failure(&phrase_only), Failure::Unknown);
         let usage = cap(false, b"Usage: wsl.exe [Argument]\n", b"");

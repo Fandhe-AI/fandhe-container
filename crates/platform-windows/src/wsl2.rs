@@ -436,6 +436,29 @@ mod tests {
         assert!(interpret_list(&cap(true, &denied)).is_err());
     }
 
+    /// ERR-1: 起動後に WSL が返したアクセス拒否は、起動時の権限不足と同じ PERMISSION_DENIED になる。
+    #[test]
+    fn access_denied_is_permission_denied() {
+        let out = run::Captured {
+            success: false,
+            code: Some(-1),
+            stdout: Vec::new(),
+            stderr: b"Access is denied.\r\nError code: Wsl/Service/E_ACCESSDENIED\r\n".to_vec(),
+        };
+        let e = interpret_version(&out).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::PermissionDenied);
+        assert_eq!(
+            e.message(),
+            "wsl.exe --version failed: access denied (exit code -1). Output: Access is denied. Error code: Wsl/Service/E_ACCESSDENIED "
+        );
+        let e = interpret_list(&out).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::PermissionDenied);
+        assert!(
+            e.message()
+                .starts_with("wsl.exe -l -v failed: access denied (exit code -1).")
+        );
+    }
+
     /// REPAIR-5・ERR-1: 0 や過大なタイムアウトは INVALID_ARGUMENT。
     #[test]
     fn invalid_timeout_rejected() {

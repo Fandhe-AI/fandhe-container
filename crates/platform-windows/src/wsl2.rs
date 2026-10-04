@@ -415,6 +415,11 @@ mod tests {
         assert_eq!(interpret_list(&cap(false, msg)).unwrap(), Vec::new());
         let mixed = format!("{msg}\nE_ACCESSDENIED 0x80070005");
         assert!(interpret_list(&cap(true, &mixed)).is_err());
+        // HRESULT を伴わない別の識別子の併記も失敗のまま（空の一覧にしない。ERR-1）。
+        let denied = format!("{msg}\nError code: Wsl/Service/E_ACCESSDENIED");
+        let e = interpret_list(&cap(false, &denied)).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert!(interpret_list(&cap(true, &denied)).is_err());
     }
 
     /// REPAIR-5・ERR-1: 0 や過大なタイムアウトは INVALID_ARGUMENT。

@@ -374,6 +374,11 @@ mod tests {
     const JA_VERSION: &str = "WSL バージョン: 2.1.5.0\nカーネル バージョン: 5.15.146.1-2\nWSLg バージョン: 1.0.60\nWindows バージョン: 10.0.22631.3296\n";
     const EN_LIST: &str = "  NAME              STATE           VERSION\r\n* Ubuntu            Running         2\r\n  docker-desktop    Stopped         2\r\n  Legacy            Stopped         1\r\n";
 
+    /// ディストリ 0 件時の `wsl.exe -l -v` 出力を模した例（英語。案内文・コマンド例・URL を含む）。
+    const NO_DISTRO_FULL: &str = "Windows Subsystem for Linux has no installed distributions.\r\nYou can resolve this by installing a distribution with the instructions below:\r\n\r\nUse 'wsl.exe --list --online' to list available distributions\r\nand 'wsl.exe --install <Distro>' to install.\r\n\r\nDistributions can also be installed by visiting the Microsoft Store:\r\nhttps://aka.ms/wslstore\r\nError code: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND\r\n";
+    /// 同（日本語ロケールを想定した例。識別子はロケール非依存）。
+    const NO_DISTRO_FULL_JA: &str = "Linux 用 Windows サブシステムには、ディストリビューションがインストールされていません。\r\n'wsl.exe --list --online' を使用して利用可能なディストリビューションを一覧表示し、\r\n'wsl.exe --install <Distro>' を使用してインストールします。\r\nhttps://aka.ms/wslstore\r\nエラー コード: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND\r\n";
+
     fn cap(success: bool, stdout: &[u8], stderr: &[u8]) -> Captured {
         Captured {
             success,
@@ -590,6 +595,28 @@ mod tests {
             ),
         );
         assert_eq!(classify_failure(&mixed), Failure::Unknown);
+        // HRESULT を伴わない別の識別子（`E_ACCESSDENIED`）の併記も 0 件扱いにしない。
+        for other in [
+            "Error code: Wsl/Service/E_ACCESSDENIED",
+            "ERROR_FILE_NOT_FOUND",
+            "RPC_S_SERVER_UNAVAILABLE",
+            "Wsl/Service/0x80070005",
+        ] {
+            let mixed = cap(
+                false,
+                b"",
+                &utf16le(
+                    &format!("Error code: Wsl/Service/WSL_E_DEFAULT_DISTRO_NOT_FOUND\n{other}"),
+                    false,
+                ),
+            );
+            assert_eq!(classify_failure(&mixed), Failure::Unknown, "{other}");
+        }
+        // 0 件時の案内文（コマンド例・URL を含む）は識別子として拾わず、0 件と判定する。
+        let full = cap(false, NO_DISTRO_FULL.as_bytes(), b"");
+        assert_eq!(classify_failure(&full), Failure::NoDistro);
+        let ja = cap(false, &utf16le(NO_DISTRO_FULL_JA, false), b"");
+        assert_eq!(classify_failure(&ja), Failure::NoDistro);
         let phrase_only = cap(false, b"", b"has no installed distributions");
         assert_eq!(classify_failure(&phrase_only), Failure::Unknown);
         let usage = cap(false, b"Usage: wsl.exe [Argument]\n", b"");

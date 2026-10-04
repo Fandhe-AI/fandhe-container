@@ -416,7 +416,12 @@ struct MountEntry {
 impl MountEntry {
     /// マウントオプションに `ro` が含まれるか。
     fn is_read_only(&self) -> bool {
-        self.options.split(',').any(|o| o == "ro")
+        self.has_option("ro")
+    }
+
+    /// マウントオプションに `opt` が単独のトークンとして含まれるか。
+    fn has_option(&self, opt: &str) -> bool {
+        self.options.split(',').any(|o| o == opt)
     }
 }
 
@@ -534,6 +539,9 @@ struct OwnedMount {
 /// 解除の直前に mountinfo を読み直し、マウント先の最上位エントリが記録したマウント ID と一致する場合に限り
 /// `umount` する。一致しない（他プロセスが差し替えた・既に外れている）場合は他者のマウントを外さないよう
 /// 何もしない。mountinfo を読めない場合は所有を確認できないため外さず、失敗として数える。
+/// 記録したマウント ID がマウント先に残っているのに最上位が他者のマウントである場合も、他者のマウントを
+/// 外せず自分のマウントが残置されるため、未解除として失敗に数える（呼び出し側が後始末を追跡できるようにする）。
+/// 記録したマウント ID が既に存在しなければ（外れている）解除済みとして扱う。
 fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> usize {
     let mut failures = 0;
     for o in owned.iter().rev() {
@@ -551,7 +559,14 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> usize 
                     failures += 1;
                 }
             }
-            _ => {}
+            _ => {
+                let still_mounted = entries
+                    .iter()
+                    .any(|e| e.mount_point == o.guest_path && e.mount_id == o.mount_id);
+                if still_mounted {
+                    failures += 1;
+                }
+            }
         }
     }
     failures
@@ -678,6 +693,11 @@ fn verify_virtiofs(
                     "a shared mount is not backed by virtiofs; the setting may not be applied to the running VM, run 'wsl --shutdown' and retry",
                 ));
             }
+            Some(e) if !e.has_option("nosuid") || !e.has_option("nodev") => {
+                return Err(precondition(
+                    "a shared mount is missing the nosuid or nodev option",
+                ));
+            }
             Some(e) if m.read_only && !e.is_read_only() => {
                 return Err(precondition(
                     "a read-only shared mount is not mounted read-only",
@@ -701,6 +721,14 @@ fn prepare_with_exec(
 ) -> Result<PreparedLaunch, Wsl2Error> {
     preflight(status, virtiofs, req)?;
     let distro = &req.distro;
+    // 共有マウントが 0 件ならゲスト内で検証すべきものが無いため、mountinfo も読まず空の結果を返す。
+    if req.mounts.is_empty() {
+        return Ok(PreparedLaunch {
+            distro: req.distro.clone(),
+            mounts: Vec::new(),
+            transport: SharedTransport::Virtiofs,
+        });
+    }
     // root で mkdir / mount するため、基底・マウント先を symlink 非追従で検証してから進む。
     // 基底が実ディレクトリ（root 所有）と確定した後は、マウント先は基底の直下で一意に解決される。
     if !req.mounts.is_empty() {
@@ -1183,6 +1211,8 @@ mod tests {
         ignore_ro: bool,
         /// true なら mount のたびに同じマウント先へ別プロセスのマウントも積む（競合の模擬）。
         extra_on_mount: bool,
+        /// true なら nosuid,nodev を無視してマウントする（オプション不成立の模擬）。
+        drop_nosuid: bool,
     }
 
     impl Guest {
@@ -1203,6 +1233,7 @@ mod tests {
                 fail_cat_after_mount: false,
                 ignore_ro: false,
                 extra_on_mount: false,
+                drop_nosuid: false,
             }
         }
 
@@ -1262,7 +1293,12 @@ mod tests {
                         .push(((*target).to_string(), self.mount_fstype.to_string()));
                     self.ids.push(self.next_id);
                     let ro = opts.split(',').any(|o| o == "ro") && !self.ignore_ro;
-                    self.opts.push(if ro { "ro" } else { "rw" }.into());
+                    let base = if ro { "ro" } else { "rw" };
+                    self.opts.push(if self.drop_nosuid {
+                        base.to_string()
+                    } else {
+                        format!("{base},nosuid,nodev")
+                    });
                     self.next_id += 1;
                     if self.extra_on_mount {
                         self.mounts
@@ -1467,6 +1503,46 @@ mod tests {
         assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
         assert!(e.message().contains("read-only"));
         assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+    }
+
+    /// SEC: nosuid / nodev が成立していなければ解除してエラーにする。
+    #[test]
+    fn prepare_rejects_missing_nosuid_nodev() {
+        let mut g = Guest::new("virtiofs");
+        g.drop_nosuid = true;
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert!(e.message().contains("nosuid"));
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+    }
+
+    /// 共有マウント 0 件なら mountinfo を読まず空の PreparedLaunch を返す。
+    #[test]
+    fn prepare_with_no_mounts_skips_mountinfo() {
+        let r = req(vec![]);
+        let mut calls = 0;
+        let p = prepare_with_exec(&ok_status(), VirtiofsState::Enabled, &r, &mut |_, _| {
+            calls += 1;
+            Err(Wsl2Error::new(Wsl2ErrorCode::Internal, "unexpected"))
+        })
+        .unwrap();
+        assert!(p.mounts().is_empty());
+        assert_eq!(calls, 0);
+    }
+
+    /// SEC: 自分のマウントの上に他者のマウントが積まれたら、外さず未解除として失敗に数える。
+    #[test]
+    fn release_counts_failure_when_covered_by_others() {
+        let mut g = Guest::new("virtiofs");
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
+        g.mounts.push(("/mnt/fandhe/a".into(), "tmpfs".into()));
+        g.ids.push(777);
+        g.opts.push("rw".into());
+        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m));
+        assert_eq!(failures, 1);
+        assert!(g.umounts.is_empty());
     }
 
     /// SEC: 検証時に最上位のマウント ID が記録値と異なれば、差し替えられたマウントは外さず失敗する。

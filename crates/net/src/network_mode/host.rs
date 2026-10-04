@@ -15,12 +15,19 @@
 //!   （runtime 自体がホスト以外の netns で動く構成）は未実装の将来仕様（REPAIR-3）
 //! - netns はスレッド単位の属性で、`/proc/<pid>/ns/net` はそのうち 1 スレッド（`pid` 自身）しか示さない。
 //!   [`HostNetns::verify_process`] は `/proc/<pid>/task/` の全スレッドを照合し、1 つでも別 netns なら
-//!   `Other` を返す。判定は呼び出し時点のスナップショットで、列挙後に作られたスレッドや列挙後の
+//!   `Other` を返す。判定は列挙時点のスナップショットで、列挙後に作られたスレッドや列挙後の
 //!   `setns(2)` は対象外。想定する呼び出し元は、exec 直後の自分の子を検証する runtime
-//! - procfs の `/proc/<pid>/task/` の列挙は、列挙中に対象の別スレッドが終了すると生存スレッドを
-//!   1 つ取りこぼし得る（カーネルの readdir は終了したスレッドの位置で打ち切り、次の呼び出しを先頭からの
-//!   件数で再開するため、詰まった分だけ飛ぶ）。スレッドの終了と並行して照合すると「全スレッド」の保証は
-//!   弱まる。想定する呼び出し元（exec 直後の単一スレッドの子）では並行終了が起きないため影響しない
+//! - procfs の `/proc/<pid>/task/` の 1 回の列挙は、列挙中に対象の別スレッドが終了すると生存スレッドを
+//!   1 つ取りこぼし得る（カーネルの readdir は、既に返したスレッドが `release_task` でスレッド一覧から
+//!   外れると、次の `getdents` をスレッドグループリーダーからの件数で再開するため、詰まった分だけ飛ぶ）。
+//!   そのため [`HostNetns::verify_process`] は列挙を繰り返し、生の tid 集合（ns link が ENOENT の終了中
+//!   スレッドも含む）が 2 回連続で一致した時点で判定する（`scan_until_stable`）。取りこぼしの原因になった
+//!   スレッドはその列挙に含まれ、一覧から外れているため次の列挙には現れない。よって 2 回連続の一致は、
+//!   前の列挙に取りこぼしが無かったことを意味する（後の列挙が取りこぼしていても、その分は前の列挙で
+//!   照合済み）。そのため各列挙の全エントリを照合し、どの列挙でも別 netns のスレッドが 1 つでもあれば
+//!   即 `Other`。不一致の間は短い待ちを挟んで再列挙し、`MAX_PASSES` 回列挙しても一致しなければ判定不能
+//!   として `FailedPrecondition`（fail-closed。待ちを含め有界）。
+//!   残る穴は、列挙の間に同じ tid が同じプロセスの新しいスレッドへ再利用される場合（pid 空間の一巡を要する）のみ
 //! - [`HostNetns::verify_process`] は pid 再利用による TOCTOU が残る。呼び出し側は自分の子 pid に限って使う。
 //!   `pid` は本プロセスから見える `/proc` の PID namespace での番号として解釈する
 //! - エラーメッセージは固定の英語文で、パスや inode の中身を含めない
@@ -29,6 +36,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink_route::classify_errno;
@@ -96,25 +104,57 @@ fn proc_error(e: &io::Error, message: &'static str) -> NetError {
     )
 }
 
-/// `/proc/<pid>/task/` を列挙し、生存中の各スレッドの (tid, netns 識別子) を返すイテレータを作る。
+/// 1 回の列挙で受け付けるスレッド数の上限（`scan_until_stable`）。
 ///
-/// プロセス自体が無ければ `NotFound`。列挙中に終了したスレッド・終了処理中のスレッドは飛ばす
-/// （`skip_exited_thread`）。数値でないエントリは procfs の想定外の形として `Internal`（fail-closed）。
-/// 全件を `Vec` に集めないため件数上限は設けない。
+/// tid（`u32`）を列挙ごとに `Vec` へ集めて比べるため、確保量を 2 列挙分 × 4 バイト × 上限（512 KiB）に
+/// 抑える。想定する対象（exec 直後の子）はこれより桁違いに少なく、超えた場合は `ResourceExhausted`。
+const MAX_THREADS: usize = 1 << 16;
+
+/// tid 集合が安定するまでの列挙回数の上限（`scan_until_stable`）。
+///
+/// 1 回の列挙はスレッド数に比例する stat で済み、列挙の間の待ち（`retry_backoff`）も合計約 27 ms に
+/// 収まるため、スレッドの生成・終了が続いても有界に終わる（REPAIR-5）。
+const MAX_PASSES: usize = 32;
+
+/// 不一致の後に再列挙するまでの待ちの初期値（`retry_backoff`）。
+const RETRY_BACKOFF_INITIAL: Duration = Duration::from_micros(50);
+
+/// 不一致の後に再列挙するまでの待ちの上限（`retry_backoff`）。
+const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(1);
+
+/// `retry` 回目（1 始まり）の不一致の後、再列挙までに待つ時間を返す純粋関数。
+///
+/// 50 µs から倍々に伸ばし 1 ms で頭打ちにする（50・100・200・400・800・1000・1000 …）。待たずに
+/// 再列挙すると、スレッドの生成・終了が短時間に集中する間（終了処理の残り・スレッドプールの入れ替え）に
+/// 列挙回数の上限を使い切って `FailedPrecondition` になりやすいため、揺れが収まる時間を与える。
+/// 最初の 2 回の列挙の間は待たない（想定する呼び出し元〔exec 直後の子〕は 2 回で一致する）。
+fn retry_backoff(retry: usize) -> Duration {
+    let shift = u32::try_from(retry.saturating_sub(1)).unwrap_or(u32::MAX);
+    RETRY_BACKOFF_INITIAL
+        .checked_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
+        .map_or(RETRY_BACKOFF_MAX, |d| d.min(RETRY_BACKOFF_MAX))
+}
+
+/// `/proc/<pid>/task/` を 1 回列挙し、各スレッドの (tid, netns 識別子) を返すイテレータを作る。
+///
+/// プロセス自体が無ければ `NotFound`。列挙中に終了したスレッド・終了処理中のスレッドは識別子を
+/// `None` にして tid は残す（`skip_exited_thread`。tid 集合の安定判定に含めるため）。数値でない
+/// エントリは procfs の想定外の形として `Internal`（fail-closed）。1 回の列挙は生存スレッドを取りこぼし
+/// 得る（モジュール doc）ため、判定には `scan_until_stable` を通す。件数の上限は呼び出し側が検証する。
 fn task_netns_ids(
     pid: u32,
-) -> Result<impl Iterator<Item = Result<(u32, NsId), NetError>>, NetError> {
+) -> Result<impl Iterator<Item = Result<(u32, Option<NsId>), NetError>>, NetError> {
     let task_dir = Path::new("/proc").join(pid.to_string()).join("task");
     let entries = fs::read_dir(&task_dir)
         .map_err(|e| proc_error(&e, "failed to read thread list in /proc"))?;
-    Ok(entries.filter_map(move |entry| task_netns_id(&task_dir, entry).transpose()))
+    Ok(entries.map(move |entry| task_netns_id(&task_dir, entry)))
 }
 
-/// `task_netns_ids` の 1 エントリ分。終了中・終了済みスレッドは `Ok(None)`。
+/// `task_netns_ids` の 1 エントリ分。終了中・終了済みスレッドは識別子が `None`。
 fn task_netns_id(
     task_dir: &Path,
     entry: io::Result<fs::DirEntry>,
-) -> Result<Option<(u32, NsId)>, NetError> {
+) -> Result<(u32, Option<NsId>), NetError> {
     let entry = entry.map_err(|e| proc_error(&e, "failed to read thread list in /proc"))?;
     let tid = entry
         .file_name()
@@ -129,16 +169,15 @@ fn task_netns_id(
         })?;
     let thread_dir: PathBuf = task_dir.join(tid.to_string());
     match stat_ns_io(&thread_dir.join("ns").join("net")) {
-        Ok(id) => Ok(Some((tid, id))),
-        Err(e) => {
-            skip_exited_thread(&e, || fs::symlink_metadata(&thread_dir).map(|_| ())).map(|()| None)
-        }
+        Ok(id) => Ok((tid, Some(id))),
+        Err(e) => skip_exited_thread(&e, || fs::symlink_metadata(&thread_dir).map(|_| ()))
+            .map(|()| (tid, None)),
     }
 }
 
 /// スレッドの ns link の stat 失敗を「終了中・終了済みとして飛ばす（`Ok(())`）」か「エラー」かに分ける。
 ///
-/// NET-6・TASK-143.1 の全スレッド照合（[`HostNetns::verify_process`]）から呼ばれる。`dir_probe` は
+/// NET-6・TASK-143.1 の全スレッド照合（[`HostNetns::verify_process`]）の列挙（`task_netns_id`）から呼ばれる。`dir_probe` は
 /// スレッドのディレクトリ（`/proc/<pid>/task/<tid>`）を stat する関数で、`PermissionDenied` のときだけ呼ぶ。
 /// - ENOENT: 飛ばす。tid のディレクトリが既に消えた場合に加え、終了処理中のスレッドでも返る。
 ///   カーネルは `do_exit` で `exit_task_namespaces` により nsproxy を外してから、後の `release_task` で
@@ -150,8 +189,9 @@ fn task_netns_id(
 ///   （権限不足を黙って見逃さない）
 /// - その他: 元のエラーを返す
 ///
-/// 全スレッドが飛ばされた場合（全スレッドが終了中のプロセス・`CONFIG_NET_NS` の無いカーネル）は
-/// `classify_membership` が 0 件として `NotFound` を返す（fail-closed）。
+/// 飛ばしたスレッドも tid は列挙に残し、tid 集合の安定判定に含める。全スレッドが飛ばされた場合
+/// （全スレッドが終了中のプロセス・`CONFIG_NET_NS` の無いカーネル）は、`verify_process` が生存スレッド
+/// 0 件として `NotFound` を返す（fail-closed）。
 fn skip_exited_thread(
     e: &io::Error,
     dir_probe: impl FnOnce() -> io::Result<()>,
@@ -170,29 +210,96 @@ fn skip_exited_thread(
     }
 }
 
-/// スレッドごとの netns 識別子の並びから所属を判定する純粋関数。
+/// `scan_until_stable` の結果。
+#[derive(Debug, PartialEq, Eq)]
+enum TaskScan {
+    /// どれかの列挙で `host` と異なる netns のスレッドを見つけた（列挙順で最初のもの）。
+    Other(NsId),
+    /// tid 集合が 2 回連続で一致し、その 2 回の列挙で観測した識別子はすべて `host`。
+    Stable {
+        /// 一致した tid 集合（昇順・重複なし）。
+        tids: Vec<u32>,
+        /// 2 回のどちらかで ns link を stat できた（生存中の）スレッドがあったか。
+        live: bool,
+    },
+}
+
+/// 列挙 `enumerate` を tid 集合が 2 回連続で一致するまで繰り返し、全スレッドの netns を `host` と照合する
+/// （NET-6・TASK-143.1）。列挙と待ち（`pause`）を差し替えられる純粋関数で、副作用は引数経由のみ。
 ///
-/// 1 つでも `host` と異なれば最初の不一致を `Other` として返す。全件一致なら `Member`。
-/// 観測できたスレッドが 0 件なら `NotFound`（判定根拠が無いため fail-closed）。
-fn classify_membership(
+/// `verify_process` が `task_netns_ids` と `std::thread::sleep` を渡して呼ぶ。不一致の後は
+/// `retry_backoff` の時間だけ `pause` してから再列挙する。1 回の procfs 列挙は並行するスレッド終了で生存
+/// スレッドを取りこぼし得るが、2 回連続の一致は前の列挙に取りこぼしが無かったことを示す（モジュール
+/// doc の契約）。判定は次のとおり。
+/// - どの列挙でも、識別子が `host` と異なるエントリを見た時点で `Other`（列挙の途中でも打ち切る）
+/// - 列挙またはエントリの `Err` は再試行せずそのまま返す（権限不足・プロセス消失を隠さない）
+/// - 1 回の列挙が `MAX_THREADS` 件を超えたら `ResourceExhausted`（確保量の上限。coding-rust）
+/// - `MAX_PASSES` 回列挙しても一致しなければ `FailedPrecondition`。スレッドの生成・終了が続いて
+///   「現在の状態では判定できない」ことを表し、時間を置いた再試行で解消し得る点が `FailedPrecondition`
+///   （EBUSY 相当。`netns` でも対象の状態が操作を妨げる場合に使う）の分類に合う。期限切れではないため
+///   `Timeout` は使わない。`Member` とは扱わない（fail-closed）
+fn scan_until_stable<I>(
     host: NsId,
-    ids: impl IntoIterator<Item = Result<NsId, NetError>>,
-) -> Result<HostNetnsMembership, NetError> {
-    let mut seen = false;
-    for id in ids {
-        let id = id?;
-        if id != host {
-            return Ok(HostNetnsMembership::Other { observed: id });
+    mut enumerate: impl FnMut() -> Result<I, NetError>,
+    mut pause: impl FnMut(Duration),
+) -> Result<TaskScan, NetError>
+where
+    I: IntoIterator<Item = Result<(u32, Option<NsId>), NetError>>,
+{
+    let mut prev: Option<(Vec<u32>, bool)> = None;
+    for pass in 0..MAX_PASSES {
+        // pass 回目の列挙の前には pass - 1 回の不一致が起きている。
+        if pass >= 2 {
+            pause(retry_backoff(pass - 1));
         }
-        seen = true;
+        let mut tids: Vec<u32> = Vec::new();
+        let mut live = false;
+        for entry in enumerate()? {
+            let (tid, id) = entry?;
+            if let Some(id) = id {
+                if id != host {
+                    return Ok(TaskScan::Other(id));
+                }
+                live = true;
+            }
+            if tids.len() >= MAX_THREADS {
+                return Err(NetError::new(
+                    NetErrorCode::ResourceExhausted,
+                    "process has too many threads to verify",
+                ));
+            }
+            tids.push(tid);
+        }
+        tids.sort_unstable();
+        // procfs は同じ tid を 2 度返さない想定だが、比較を集合として扱うため防御的に重複を除く。
+        tids.dedup();
+        match prev {
+            Some((prev_tids, prev_live)) if prev_tids == tids => {
+                return Ok(TaskScan::Stable {
+                    tids,
+                    live: live || prev_live,
+                });
+            }
+            _ => prev = Some((tids, live)),
+        }
     }
-    if seen {
-        Ok(HostNetnsMembership::Member)
-    } else {
-        Err(NetError::new(
+    Err(NetError::new(
+        NetErrorCode::FailedPrecondition,
+        "thread list of process did not stabilize",
+    ))
+}
+
+/// `scan_until_stable` の結果を `verify_process` の判定に写す純粋関数。
+///
+/// 生存スレッドを 1 つも観測できなかった安定結果は、判定根拠が無いため `NotFound`（fail-closed）。
+fn membership_from_scan(scan: TaskScan) -> Result<HostNetnsMembership, NetError> {
+    match scan {
+        TaskScan::Other(observed) => Ok(HostNetnsMembership::Other { observed }),
+        TaskScan::Stable { live: true, .. } => Ok(HostNetnsMembership::Member),
+        TaskScan::Stable { live: false, .. } => Err(NetError::new(
             NetErrorCode::NotFound,
             "process has no live threads",
-        ))
+        )),
     }
 }
 
@@ -229,9 +336,13 @@ impl HostNetns {
 
     /// `pid` のプロセスの全スレッドがホスト netns に属するかを返す。
     ///
-    /// `/proc/<pid>/task/` の全スレッドを照合し、1 つでも別 netns なら `Other`（最初の不一致）。
-    /// 呼び出し時点のスナップショットで、以後のスレッド生成・`setns(2)` は対象外。`pid` は
-    /// 1..=`i32::MAX` のみ。pid 再利用の TOCTOU は残る（モジュール doc）。
+    /// `/proc/<pid>/task/` の全スレッドを、tid 集合が 2 回連続で一致するまで列挙し直して照合する
+    /// （並行するスレッド終了による列挙の取りこぼしを塞ぐ。モジュール doc）。不一致の間は列挙の間に
+    /// 短い待ち（合計で最大約 27 ms。`retry_backoff`）を挟むため、呼び出しスレッドをその分ブロックし得る。
+    /// どの列挙でも 1 つでも別 netns なら `Other`（最初の不一致）。生存スレッドが 0 件なら `NotFound`、
+    /// 一致しないまま列挙回数の上限に達したら `FailedPrecondition`、スレッド数が上限を超えたら
+    /// `ResourceExhausted`（いずれも fail-closed）。列挙時点のスナップショットで、以後のスレッド生成・`setns(2)` は対象外。
+    /// `pid` は 1..=`i32::MAX` のみ。pid 再利用の TOCTOU は残る（モジュール doc）。
     pub fn verify_process(&self, pid: u32) -> Result<HostNetnsMembership, NetError> {
         if pid == 0 || pid > i32::MAX as u32 {
             return Err(NetError::new(
@@ -239,8 +350,11 @@ impl HostNetns {
                 "pid is out of range",
             ));
         }
-        let ids = task_netns_ids(pid)?.map(|r| r.map(|(_, id)| id));
-        classify_membership(self.id, ids)
+        membership_from_scan(scan_until_stable(
+            self.id,
+            || task_netns_ids(pid),
+            std::thread::sleep,
+        )?)
     }
 }
 
@@ -248,9 +362,10 @@ impl HostNetns {
 mod tests {
     use super::*;
 
-    /// 自プロセスでスレッドを大量に終了させるテストと、自プロセスのスレッド列挙で特定 tid を探すテストを
-    /// 直列化するロック。並行するスレッド終了で procfs の列挙が生存スレッドを取りこぼし得る（モジュール
-    /// doc の契約）ため、同じプロセス内で並列実行すると後者が偽の失敗になる。
+    /// 自プロセスでスレッドを大量に生成・終了させるテストと、自プロセスを列挙・照合するテストを直列化する
+    /// ロック。取りこぼしは `scan_until_stable` の再列挙で塞がれるが、スレッドの生成・終了が続く間は
+    /// tid 集合が一致しないまま列挙回数の上限に達し、契約どおり FAILED_PRECONDITION（fail-closed）になる。
+    /// 別テストの都合で自プロセスが揺れて偽の失敗にならないよう、同じプロセス内で並列に走らせない。
     static THREAD_CHURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// 呼び出しスレッドの tid（`/proc/thread-self` は `<pid>/task/<tid>` を指す）。
@@ -295,6 +410,7 @@ mod tests {
     /// NET-6: 自プロセスの netns は非 root でも読め、同一 id なら Member、別 id なら Other。
     #[test]
     fn net6_verify_process_self() {
+        let _churn = lock_thread_churn();
         let own = stat_ns(Path::new("/proc/thread-self/ns/net")).unwrap();
         let same = HostNetns { id: own };
         assert_eq!(
@@ -321,62 +437,119 @@ mod tests {
         assert_eq!(e.code(), NetErrorCode::NotFound);
     }
 
-    /// NET-6: 全スレッド一致のみ Member。1 つでも異なれば最初の不一致を Other、0 件は NOT_FOUND、
-    /// 列挙エラーはそのまま返す（片方のスレッドだけ別 netns のプロセスを Member と誤判定しない）。
+    /// 毎回同じ列挙 `pass` を返す差し替え用の列挙で `scan_until_stable` を呼び、結果と列挙回数を返す。
+    /// 列挙が変わらないため再列挙の待ちは起きない（起きたら失敗させる）。
+    fn scan_fixed(
+        host: NsId,
+        pass: &[Result<(u32, Option<NsId>), NetError>],
+    ) -> (Result<TaskScan, NetError>, usize) {
+        let mut calls = 0usize;
+        let scan = scan_until_stable(
+            host,
+            || {
+                calls += 1;
+                Ok::<_, NetError>(pass.to_vec())
+            },
+            |d| panic!("unexpected pause {d:?}"),
+        );
+        (scan, calls)
+    }
+
+    /// NET-6: 全スレッド一致のみ Member。1 つでも異なれば最初の不一致を Other、生存スレッド 0 件は
+    /// NOT_FOUND、エントリのエラーはそのまま返す（片方のスレッドだけ別 netns のプロセスを Member と
+    /// 誤判定しない）。列挙が変わらなければ 2 回目で一致して止まる。
     #[test]
-    fn net6_classify_membership_all_threads() {
+    fn net6_scan_until_stable_all_threads() {
         let h = NsId::new(4, 100);
         let o = NsId::new(4, 200);
         let p = NsId::new(4, 300);
+        let (scan, calls) = scan_fixed(h, &[Ok((10, Some(h))), Ok((11, Some(h)))]);
         assert_eq!(
-            classify_membership(h, [Ok(h), Ok(h)]).unwrap(),
-            HostNetnsMembership::Member
+            scan.unwrap(),
+            TaskScan::Stable {
+                tids: vec![10, 11],
+                live: true
+            }
         );
+        assert_eq!(calls, 2);
+        for (pass, observed) in [
+            (vec![Ok((10, Some(h))), Ok((11, Some(o)))], o),
+            (vec![Ok((10, Some(o))), Ok((11, Some(h)))], o),
+            (
+                vec![Ok((10, Some(h))), Ok((11, Some(p))), Ok((12, Some(o)))],
+                p,
+            ),
+        ] {
+            let (scan, calls) = scan_fixed(h, &pass);
+            assert_eq!(scan.unwrap(), TaskScan::Other(observed), "{pass:?}");
+            assert_eq!(calls, 1, "{pass:?}");
+        }
+        let (scan, calls) = scan_fixed(h, &[]);
+        let scan = scan.unwrap();
         assert_eq!(
-            classify_membership(h, [Ok(h), Ok(o)]).unwrap(),
-            HostNetnsMembership::Other { observed: o }
+            scan,
+            TaskScan::Stable {
+                tids: vec![],
+                live: false
+            }
         );
-        assert_eq!(
-            classify_membership(h, [Ok(o), Ok(h)]).unwrap(),
-            HostNetnsMembership::Other { observed: o }
-        );
-        assert_eq!(
-            classify_membership(h, [Ok(h), Ok(p), Ok(o)]).unwrap(),
-            HostNetnsMembership::Other { observed: p }
-        );
-        let e = classify_membership(h, []).unwrap_err();
+        assert_eq!(calls, 2);
+        let e = membership_from_scan(scan).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::NotFound);
-        let e = classify_membership(
+        assert_eq!(e.message(), "process has no live threads");
+        let (scan, calls) = scan_fixed(
             h,
-            [
-                Ok(h),
+            &[
+                Ok((10, Some(h))),
                 Err(NetError::new(NetErrorCode::PermissionDenied, "denied")),
             ],
-        )
-        .unwrap_err();
-        assert_eq!(e.code(), NetErrorCode::PermissionDenied);
+        );
+        assert_eq!(scan.unwrap_err().code(), NetErrorCode::PermissionDenied);
+        assert_eq!(calls, 1);
     }
 
-    /// NET-6: 複数スレッドの自プロセスでは、起こしたスレッドの tid がすべて列挙され、
-    /// いずれも自スレッドと同じ netns で、verify_process は Member。
+    /// NET-6: `scan_until_stable` の結果の写像。Other はそのまま、生存スレッドありの安定結果は Member、
+    /// 無しは NOT_FOUND（fail-closed）。
+    #[test]
+    fn net6_membership_from_scan() {
+        let o = NsId::new(4, 200);
+        assert_eq!(
+            membership_from_scan(TaskScan::Other(o)).unwrap(),
+            HostNetnsMembership::Other { observed: o }
+        );
+        assert_eq!(
+            membership_from_scan(TaskScan::Stable {
+                tids: vec![10],
+                live: true
+            })
+            .unwrap(),
+            HostNetnsMembership::Member
+        );
+        let e = membership_from_scan(TaskScan::Stable {
+            tids: vec![10],
+            live: false,
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::NotFound);
+    }
+
+    /// NET-6: 複数スレッドの自プロセスでは、起こしたスレッドの tid とリーダーが `scan_until_stable` の
+    /// 安定した tid 集合にすべて含まれ、全スレッドが自スレッドと同じ netns で、verify_process は Member。
     ///
-    /// libtest の他のワーカースレッドが並行して終了すると、procfs の列挙は生存スレッドを 1 つ取りこぼし得る
-    /// （カーネルの `next_tid` は現在のスレッドが `pid_alive` でなくなると打ち切り、次の `getdents` は
-    /// リーダーからの件数で再開する。モジュール doc の契約）。そのため列挙を最大 `PASSES` 回まで繰り返し、
-    /// 起こしたスレッドとリーダーが揃った時点で止める。`Err` は再試行せず即座に失敗させ（終了中
-    /// スレッドの誤エラーの回帰を隠さない）、揃わなかった途中の列挙も含めて全列挙の全件が自スレッドの
-    /// netns であることを確かめる。
+    /// libtest の他のワーカースレッドが並行して終了すると 1 回の procfs 列挙は生存スレッドを取りこぼし
+    /// 得るが（モジュール doc の契約）、`scan_until_stable` が tid 集合の一致まで再列挙するため、テスト側では
+    /// 再列挙しない（ライブラリの保証をそのまま検証する）。`Err` は即座に失敗させる（終了中スレッドの
+    /// 誤エラーの回帰を隠さない）。
     #[test]
     fn net6_task_netns_ids_enumerates_all_threads() {
         const N: usize = 3;
-        const PASSES: usize = 20;
         let _churn = lock_thread_churn();
         let own = stat_ns(Path::new("/proc/thread-self/ns/net")).unwrap();
         let pid = std::process::id();
         let barrier = std::sync::Barrier::new(N + 1);
         // 各スレッドは tid の取得に失敗しても必ず barrier に到達し、main も検証より先に barrier を
         // 抜けるため、失敗時にテストがハングしない（REPAIR-5）。
-        let (tids, snapshots, membership) = std::thread::scope(|s| {
+        let (tids, scan, membership) = std::thread::scope(|s| {
             let (tx, rx) = std::sync::mpsc::channel::<Option<u32>>();
             for _ in 0..N {
                 let tx = tx.clone();
@@ -388,43 +561,26 @@ mod tests {
             }
             drop(tx);
             let tids: Vec<Option<u32>> = rx.iter().take(N).collect();
-            let expected: Vec<u32> = tids.iter().flatten().copied().chain([pid]).collect();
-            let mut snapshots: Vec<Result<Vec<(u32, NsId)>, NetError>> = Vec::new();
-            for _ in 0..PASSES {
-                let snapshot: Result<Vec<(u32, NsId)>, NetError> =
-                    task_netns_ids(pid).and_then(|it| it.collect());
-                let retry = snapshot.as_ref().is_ok_and(|listed| {
-                    !expected
-                        .iter()
-                        .all(|t| listed.iter().any(|(listed_tid, _)| listed_tid == t))
-                });
-                snapshots.push(snapshot);
-                if !retry {
-                    break;
-                }
-            }
+            let scan = scan_until_stable(own, || task_netns_ids(pid), std::thread::sleep);
             let membership = HostNetns { id: own }.verify_process(pid);
             barrier.wait();
-            (tids, snapshots, membership)
+            (tids, scan, membership)
         });
         assert_eq!(tids.len(), N);
-        let snapshots: Vec<Vec<(u32, NsId)>> = snapshots.into_iter().map(|s| s.unwrap()).collect();
-        for listed in &snapshots {
-            assert!(listed.iter().all(|(_, id)| *id == own), "listed {listed:?}");
-        }
-        let listed = snapshots.last().expect("at least one enumeration");
+        let TaskScan::Stable { tids: listed, live } = scan.unwrap() else {
+            panic!("own threads must all be in the own network namespace");
+        };
+        assert!(live, "live threads must be observed");
         for tid in tids {
             let tid = tid.expect("thread tid from /proc/thread-self");
-            assert_eq!(
-                listed.iter().find(|(t, _)| *t == tid).map(|(_, id)| *id),
-                Some(own),
-                "tid {tid}"
+            assert!(
+                listed.binary_search(&tid).is_ok(),
+                "tid {tid} in {listed:?}"
             );
         }
-        assert_eq!(
-            listed.iter().find(|(t, _)| *t == pid).map(|(_, id)| *id),
-            Some(own),
-            "leader {pid}"
+        assert!(
+            listed.binary_search(&pid).is_ok(),
+            "leader {pid} in {listed:?}"
         );
         assert_eq!(membership.unwrap(), HostNetnsMembership::Member);
     }
@@ -472,8 +628,9 @@ mod tests {
     }
 
     /// NET-6: 終了済み・未回収（ゾンビ）の子は nsproxy が外れ、`/proc/<pid>/task/<pid>` が残ったまま
-    /// ns link が ENOENT になる（終了処理中スレッドと同じ状態を決定的に作る）。そのスレッドは飛ばされ、
-    /// 生存スレッド 0 件として verify_process は「生存スレッド無し」の NOT_FOUND（fail-closed）を返す。
+    /// ns link が ENOENT になる（終了処理中スレッドと同じ状態を決定的に作る）。そのスレッドは識別子
+    /// 無し（tid は安定判定のため残す）で列挙され、生存スレッド 0 件として verify_process は「生存
+    /// スレッド無し」の NOT_FOUND（fail-closed）を返す。
     #[test]
     fn net6_verify_process_zombie_has_no_live_threads() {
         let mut child = std::process::Command::new("true")
@@ -497,7 +654,7 @@ mod tests {
             .join("task")
             .join(pid.to_string())
             .exists();
-        let listed: Result<Vec<(u32, NsId)>, NetError> =
+        let listed: Result<Vec<(u32, Option<NsId>)>, NetError> =
             task_netns_ids(pid).and_then(|it| it.collect());
         let own = stat_ns(Path::new("/proc/thread-self/ns/net")).unwrap();
         let membership = HostNetns { id: own }.verify_process(pid);
@@ -506,7 +663,7 @@ mod tests {
 
         assert_eq!(state, Some('Z'));
         assert!(task_dir_present, "zombie thread directory must remain");
-        assert_eq!(listed.unwrap(), Vec::<(u32, NsId)>::new());
+        assert_eq!(listed.unwrap(), vec![(pid, None)]);
         let e = membership.unwrap_err();
         assert_eq!(e.code(), NetErrorCode::NotFound);
         assert_eq!(e.message(), "process has no live threads");
@@ -519,8 +676,9 @@ mod tests {
     ///
     /// 競合の発生は確率的なため本テストは再現の補助で、決定的な検証は
     /// `net6_verify_process_zombie_has_no_live_threads` が担う。待ち合わせを持たず有界に終わる。
-    /// 列挙の取りこぼし（モジュール doc の契約）は本テストの判定を変えない: 列挙の先頭は常に生存中の
-    /// スレッドグループリーダー（libtest のメインスレッド）で、同じ netns のスレッドが 1 件以上見えるため。
+    /// 終了するスレッドで tid 集合が揺れても、`scan_until_stable` が一致するまで再列挙するため Member の
+    /// まま（列挙の先頭は常に生存中のスレッドグループリーダー〔libtest のメインスレッド〕で、生存スレッド
+    /// が 1 件以上見える）。
     #[test]
     fn net6_verify_process_self_while_threads_exit() {
         const ROUNDS: usize = 200;

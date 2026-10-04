@@ -1318,6 +1318,41 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// REPAIR-4・TASK-64.4: 積めたかを返す（満杯・受信側なしは false）。
+    #[test]
+    fn event_sink_send_reports_delivery() {
+        let (mut sink, rx) = event_channel(1);
+        assert!(sink.send(VmEvent::GuestStopped));
+        assert!(!sink.send(VmEvent::GuestStopped));
+        assert_eq!(rx.try_recv(), Ok(VmEvent::GuestStopped));
+        drop(rx);
+        assert!(!sink.send(VmEvent::GuestStopped));
+    }
+
+    /// REPAIR-4・TASK-64.4: 破棄時停止の失敗ログは 1 行の JSON で、domain の引用符・制御文字をエスケープする。
+    #[test]
+    fn stop_on_drop_failure_log_escapes_domain() {
+        assert_eq!(
+            stop_on_drop_failure_log("VZErrorDomain", 3),
+            r#"{"component":"platform-macos.vm","operation":"stop_on_drop","result":"error","code":"vm.stop_failed","domain":"VZErrorDomain","vz_code":3}"#
+        );
+        assert_eq!(
+            stop_on_drop_failure_log("a\"b\\c\nd", -1),
+            r#"{"component":"platform-macos.vm","operation":"stop_on_drop","result":"error","code":"vm.stop_failed","domain":"a\"b\\c\u000ad","vz_code":-1}"#
+        );
+    }
+
+    /// TASK-64.4: 受信側が破棄済みでも破棄時停止の失敗の記録は panic せず、状態機械は Running に戻る。
+    #[test]
+    fn core_drop_stop_failure_without_receiver_does_not_panic() {
+        let (sink, rx) = event_channel(4);
+        let mut core = Core::new(sink);
+        assert_eq!(core.request_drop_stop(true, VmState::Running), Some(1));
+        drop(rx);
+        core.finish_drop_stop(1, Err(("VZErrorDomain".to_string(), 3)));
+        assert_eq!(core.lifecycle.state(), VmState::Running);
+    }
+
     /// MAC-1・TASK-64.4: 受信側が drop 済みでも送信は panic しない。
     #[test]
     fn event_sink_tolerates_disconnected_receiver() {

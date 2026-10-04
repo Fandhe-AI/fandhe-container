@@ -7,21 +7,37 @@
 //!
 //! 共通の不変条件: 引数は `Retained` / 参照で生存期間が保証された有効な Objective-C オブジェクトで、
 //! セレクタと型シグネチャは objc2-virtualization 0.3.2 の生成バインディングと一致する。ここで呼ぶ
-//! setter / getter は ObjC 例外を投げない（objc2 の `exception` feature は無効のため、例外は abort になる。
-//! CPU 数・メモリ量は呼び出し側 `config` が VZ の許容範囲を検証済みであること）。設定オブジェクトは
-//! VM 生成前で `VZVirtualMachine` のキュー制約は受けない（キュー制約は TASK-64.4 で扱う）。
+//! setter / getter は ObjC 例外を投げない（objc2 の `exception` feature は無効のため、ObjC 例外は Rust の
+//! フレームをアンワインドで通り抜け、dispatch の extern "C" 境界等で abort する。捕捉はできないので、例外を
+//! 投げ得る呼び出しは事前条件を確認してから行う。CPU 数・メモリ量は呼び出し側 `config` が VZ の許容範囲を
+//! 検証済みであること）。設定オブジェクトは
+//! VM 生成前で `VZVirtualMachine` のキュー制約は受けない。
+//!
+//! キュー制約（TASK-64.4）: `VZVirtualMachine` の操作・completion handler・delegate は、その VM 専用の
+//! シリアル `DispatchQueue` 上でのみ行う。`VmHost` が VM と delegate を `QueueBound` に包んで保持し、
+//! 操作は `VmHost::run_async` / `run_timeout` のクロージャと completion handler（いずれもキュー上で実行される）
+//! にだけ `VmRef` として渡す。`VmRef` は本モジュール外で生成できないため、キュー外から VM を触る経路は型として
+//! 存在しない。VM への強参照は `QueueOwned` が持ち、最後の解放を必ずキュー上へ回す。
 
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::os::fd::{IntoRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::time::Duration;
 
-use objc2::AnyThread;
+use block2::RcBlock;
+use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained, DispatchTime};
 use objc2::rc::Retained;
+use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
     VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment, VZLinuxBootLoader,
     VZSerialPortConfiguration, VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtualMachineConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZVirtualMachineDelegate,
 };
+use std::sync::Arc;
 
 /// NSError の domain と code（VZ が返すエラーの機械可読な要約）。domain は長さを制限して保持する。
 pub(crate) type VzErrorInfo = (String, isize);
@@ -258,4 +274,346 @@ pub(crate) fn read_back_storage(config: &VZVirtualMachineConfiguration) -> Vec<S
 pub(crate) fn serial_port_count(config: &VZVirtualMachineConfiguration) -> usize {
     // SAFETY: `config` は有効なインスタンスで、getter は副作用のない読み出し。
     unsafe { config.serialPorts() }.len()
+}
+
+/// `VmRef::start` / `stop` が事前条件（`canStart` / `canStop`）を満たさず要求しなかったこと。
+///
+/// handler は呼ばれずに破棄される。`state_raw` はその時点の `VZVirtualMachineState` の生値。
+pub(crate) struct OpRejected {
+    pub(crate) state_raw: isize,
+}
+
+/// VM 専用キューのラベル（固定文字列。入力から組み立てない）。
+const VM_QUEUE_LABEL: &str = "ai.fandhe.container.platform-macos.vm";
+
+/// `VmHost::new` の失敗要因。呼び出し側 `vm` が `VmError` へ写す。
+pub(crate) enum HostInitError {
+    /// この環境で Virtualization.framework が使えない（`isSupported` が false）。
+    Unsupported,
+    /// `validateWithError` が設定を拒否した（entitlement 欠如もここに来る）。
+    InvalidConfiguration(VzErrorInfo),
+}
+
+/// delegate が受け取る VM 停止通知。`vm` の状態機械へ中継される。
+pub(crate) enum DelegateEvent {
+    /// ゲスト側から停止された（`guestDidStopVirtualMachine:`）。
+    GuestStopped,
+    /// エラーで停止した（`virtualMachine:didStopWithError:`）。NSError は要約済み。
+    StoppedWithError(VzErrorInfo),
+}
+
+/// delegate の ivar。通知は VM キュー上で呼ばれる（どのスレッドかは GCD 次第のため handler は `Send`）。
+struct DelegateIvars {
+    handler: Box<dyn Fn(DelegateEvent) + Send>,
+}
+
+define_class!(
+    /// `VZVirtualMachineDelegate` を実装し、停止通知を Rust のクロージャへ中継するクラス。
+    ///
+    /// `VZVirtualMachine.delegate` は weak プロパティのため、`VmObjects` が強参照を VM と同じ寿命で保持する。
+    // SAFETY: NSObject にはサブクラス化の追加要件がなく、ivars の `DelegateIvars` は Drop で特別な処理をしない。
+    #[unsafe(super(NSObject))]
+    #[name = "FandheContainerVmDelegate"]
+    #[ivars = DelegateIvars]
+    struct VmDelegate;
+
+    // SAFETY: NSObject が NSObjectProtocol を実装するため、サブクラスも準拠する。
+    unsafe impl NSObjectProtocol for VmDelegate {}
+
+    // SAFETY: セレクタと引数型は objc2-virtualization 0.3.2 の生成バインディングと一致させている。
+    // 引数は呼び出し中のみ有効なため、NSError はその場で要約して保持しない。panic しない処理だけを行う。
+    unsafe impl VZVirtualMachineDelegate for VmDelegate {
+        #[unsafe(method(guestDidStopVirtualMachine:))]
+        fn guest_did_stop(&self, _vm: &VZVirtualMachine) {
+            (self.ivars().handler)(DelegateEvent::GuestStopped);
+        }
+
+        #[unsafe(method(virtualMachine:didStopWithError:))]
+        fn did_stop_with_error(&self, _vm: &VZVirtualMachine, error: &NSError) {
+            (self.ivars().handler)(DelegateEvent::StoppedWithError(summarize_error(error)));
+        }
+    }
+);
+
+impl VmDelegate {
+    fn new(handler: Box<dyn Fn(DelegateEvent) + Send>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(DelegateIvars { handler });
+        // SAFETY: ivars を設定済みの未初期化オブジェクトに NSObject の `init` を送る標準手順。
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// VM と delegate の組。VM キュー上でのみ触る。
+struct VmObjects {
+    // フィールド順: VM を先に解放し、その後に delegate を解放する。
+    vm: Retained<VZVirtualMachine>,
+    delegate: Retained<VmDelegate>,
+}
+
+/// 専用シリアルキューに束縛された値の包み。キュー上のクロージャ内でだけ中身を触る。
+struct QueueBound<T>(T);
+
+// SAFETY: 中身（VZVirtualMachine・delegate）は ObjC オブジェクトで `Send` ではないが、本モジュールは
+// 中身を参照・解放するコードを VM の専用シリアルキュー上のクロージャ（`run_async` / `run_after` /
+// `run_timeout` / completion handler / `QueueOwned::drop` が投入する解放）にだけ置く。包みを別スレッドへ
+// 動かしても、中身を触る・最後の参照を解放するのは常にそのキューのスレッドである。中身へ到達する唯一の窓口
+// `VmRef` は `!Send` / `!Sync` のため、キュー上のクロージャから別スレッドへ持ち出せない。対象は
+// `VmObjects` に限る（任意の型へ広げない）。
+unsafe impl Send for QueueBound<VmObjects> {}
+// SAFETY: 上記と同じ不変条件。共有参照越しに中身へ到達できるのもキュー上のクロージャ（`VmRef`）だけ。
+unsafe impl Sync for QueueBound<VmObjects> {}
+
+/// VM への強参照を、最後の解放が必ず VM キュー上で起きるように包む。
+///
+/// `VmHost` と、完了待ちの completion handler（VZ が任意のスレッドで block を解放し得る）が持つ。
+/// drop されると参照を VM キューへ送ってそこで解放するため、どのスレッドで drop してもよい。
+struct QueueOwned {
+    objs: Option<Arc<QueueBound<VmObjects>>>,
+    queue: DispatchRetained<DispatchQueue>,
+}
+
+impl Drop for QueueOwned {
+    fn drop(&mut self) {
+        if let Some(objs) = self.objs.take() {
+            // 任意のスレッドから VZVirtualMachine を release しないため、VM キュー上で解放する。
+            self.queue.exec_async(move || drop(objs));
+        }
+    }
+}
+
+/// VM キュー上のクロージャ・completion handler にだけ渡される VM 操作の窓口（本モジュール外では生成できない）。
+///
+/// `!Send` / `!Sync`（`PhantomData<*const ()>`）のため、キュー上のクロージャ内から `thread::scope` 等で
+/// キュー外のスレッドへ渡せない。下の各 `unsafe` の「VM キュー上でのみ存在する」前提を型で保証する。
+pub(crate) struct VmRef<'a> {
+    objs: &'a Arc<QueueBound<VmObjects>>,
+    queue: &'a DispatchRetained<DispatchQueue>,
+    _not_send: PhantomData<*const ()>,
+}
+
+/// `VmRef` が `Send` / `Sync` でないことのコンパイル時検査（依存なしの曖昧性トリック）。
+///
+/// `T: Send`（`Sync`）なら 2 つの impl が両方当てはまり、型推論が曖昧になってコンパイルエラーになる。
+mod vm_ref_is_not_send_or_sync {
+    use super::VmRef;
+
+    trait AmbiguousIfSend<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+
+    trait AmbiguousIfSync<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+
+    const _: fn() = || {
+        <VmRef<'static> as AmbiguousIfSend<_>>::check();
+        <VmRef<'static> as AmbiguousIfSync<_>>::check();
+    };
+}
+
+impl<'a> VmRef<'a> {
+    /// VM キュー上で実行中のクロージャ・completion handler の中でだけ呼ぶ（本モジュール内に限る）。
+    fn on_queue(
+        objs: &'a Arc<QueueBound<VmObjects>>,
+        queue: &'a DispatchRetained<DispatchQueue>,
+    ) -> VmRef<'a> {
+        VmRef {
+            objs,
+            queue,
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl VmRef<'_> {
+    /// 現在の状態の生値（`VZVirtualMachineState`）。
+    pub(crate) fn state_raw(&self) -> isize {
+        // SAFETY: `VmRef` は VM キュー上でのみ存在し、getter は副作用のない読み出し。
+        unsafe { self.objs.0.vm.state().0 }
+    }
+
+    /// 起動可能か（不正状態での `startWithCompletionHandler:` は ObjC 例外 = abort になるため、`start` も内部で確認する）。
+    pub(crate) fn can_start(&self) -> bool {
+        // SAFETY: 同上。
+        unsafe { self.objs.0.vm.canStart() }
+    }
+
+    /// 停止可能か（`stop` も内部で確認する）。
+    pub(crate) fn can_stop(&self) -> bool {
+        // SAFETY: 同上。
+        unsafe { self.objs.0.vm.canStop() }
+    }
+
+    /// `canStart` を確認してから `startWithCompletionHandler:` を呼ぶ。起動できない状態なら要求せず
+    /// `OpRejected` を返す（handler は呼ばれない）。
+    ///
+    /// `handler` は VM キュー上で 1 回だけ、その時点の `VmRef` とともに呼ばれる（続けて停止を要求できる）。
+    pub(crate) fn start(
+        &self,
+        handler: impl Fn(&VmRef<'_>, Result<(), VzErrorInfo>) + Send + 'static,
+    ) -> Result<(), OpRejected> {
+        if !self.can_start() {
+            return Err(OpRejected {
+                state_raw: self.state_raw(),
+            });
+        }
+        let block = self.completion_block(handler);
+        // SAFETY: VM キュー上で呼ばれ（`VmRef` は !Send でキュー上にしか存在しない）、直前に `canStart` を
+        // 確認済み。シリアルキュー上のため確認と呼び出しの間に他の操作は入らない。block は VZ が copy して
+        // 保持し、キュー上で呼ぶ。
+        unsafe { self.objs.0.vm.startWithCompletionHandler(&block) };
+        Ok(())
+    }
+
+    /// `canStop` を確認してから `stopWithCompletionHandler:` を呼ぶ。戻り値と `handler` は `start` と同じ。
+    pub(crate) fn stop(
+        &self,
+        handler: impl Fn(&VmRef<'_>, Result<(), VzErrorInfo>) + Send + 'static,
+    ) -> Result<(), OpRejected> {
+        if !self.can_stop() {
+            return Err(OpRejected {
+                state_raw: self.state_raw(),
+            });
+        }
+        let block = self.completion_block(handler);
+        // SAFETY: VM キュー上で呼ばれ、直前に `canStop` を確認済み。block の扱いは `start` と同じ。
+        unsafe { self.objs.0.vm.stopWithCompletionHandler(&block) };
+        Ok(())
+    }
+
+    /// `delay` 後に VM キュー上で `f` を実行する（それまで VM を保持し、解放はキュー上で行う）。
+    ///
+    /// `delay` を `DispatchTime` で表せない（桁あふれ）場合は直ちに投入する。
+    pub(crate) fn run_after(&self, delay: Duration, f: impl FnOnce(&VmRef<'_>) + Send + 'static) {
+        let objs = Arc::clone(self.objs);
+        let queue = self.queue.clone();
+        let work = move || {
+            f(&VmRef::on_queue(&objs, &queue));
+            // この clone が最後の参照でも、解放は VM キューのスレッド上で行われる。
+            drop(objs);
+        };
+        match DispatchTime::try_from(delay) {
+            // dispatch2 0.3.1 の `after` は `dispatch_after_f` で投入し、常に `Ok` を返す。
+            Ok(when) => {
+                let _ = self.queue.after(when, work);
+            }
+            Err(()) => self.queue.exec_async(work),
+        }
+    }
+
+    /// completion handler 用の block を作る。
+    ///
+    /// block は完了まで VM への強参照（`QueueOwned`）を持ち、`Vm` が先に破棄されても操作中の VM を解放しない。
+    /// 呼ばれた時点で参照を手放す（解放はキュー上）。2 回目以降の呼び出しでは何もしない。VZ が block を
+    /// 一度も呼ばずに保持し続けた場合、VM は解放されない（use-after-free より安全側に倒す）。
+    fn completion_block(
+        &self,
+        handler: impl Fn(&VmRef<'_>, Result<(), VzErrorInfo>) + Send + 'static,
+    ) -> RcBlock<dyn Fn(*mut NSError)> {
+        let keep = Cell::new(Some(QueueOwned {
+            objs: Some(Arc::clone(self.objs)),
+            queue: self.queue.clone(),
+        }));
+        RcBlock::new(move |err: *mut NSError| {
+            let res = completion_result(err);
+            let Some(owned) = keep.take() else {
+                return;
+            };
+            if let Some(objs) = owned.objs.as_ref() {
+                // completion handler は VM キュー上で呼ばれるため、ここで `VmRef` を渡してよい。
+                handler(&VmRef::on_queue(objs, &owned.queue), res);
+            }
+        })
+    }
+}
+
+/// completion handler の `NSError*`（成功時 nil）を要約結果へ変換する。要約は呼び出し中にコピーする。
+fn completion_result(err: *mut NSError) -> Result<(), VzErrorInfo> {
+    // SAFETY: VZ は nil か、handler 呼び出し中に有効な NSError を渡す。借用は本関数内で完結する。
+    match unsafe { err.as_ref() } {
+        None => Ok(()),
+        Some(e) => Err(summarize_error(e)),
+    }
+}
+
+/// 専用シリアルキューと、そこに束縛された `VZVirtualMachine` の持ち主。
+///
+/// `initWithConfiguration:` のメインキュー依存（呼び出し側が run loop を回し続ける必要がある）を避けるため、
+/// VM ごとに専用キューを持つ。コールバックは GCD のワーカースレッドで届く（TASK-64.4 の run loop 統合）。
+pub(crate) struct VmHost {
+    owned: QueueOwned,
+}
+
+impl VmHost {
+    /// 対応確認・設定検証の後に、専用キュー上で動く VM を生成する。
+    pub(crate) fn new(
+        config: &VZVirtualMachineConfiguration,
+        handler: Box<dyn Fn(DelegateEvent) + Send>,
+    ) -> Result<VmHost, HostInitError> {
+        // SAFETY: 引数なしのクラスメソッドで副作用はない。
+        if !unsafe { VZVirtualMachine::isSupported() } {
+            return Err(HostInitError::Unsupported);
+        }
+        // SAFETY: 有効な設定への参照。不正は例外ではなく NSError で返る。ObjC 例外は abort になるため、
+        // 例外を投げ得る init の前に必ず検証する。
+        unsafe { config.validateWithError() }
+            .map_err(|e| HostInitError::InvalidConfiguration(summarize_error(&e)))?;
+        // `None`（DispatchQueueAttr::SERIAL）は `dispatch_queue_create(label, NULL)` = シリアルキュー。
+        let queue = DispatchQueue::new(VM_QUEUE_LABEL, DispatchQueueAttr::SERIAL);
+        let delegate = VmDelegate::new(handler);
+        // SAFETY: 設定は検証済みで VZ が copy する。キューはシリアル。init ファミリーの戻りは +1 所有で
+        // `Retained` が管理する。生成後の操作はすべて `queue` 上で行う。
+        let vm = unsafe {
+            VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), config, &queue)
+        };
+        let host = VmHost {
+            owned: QueueOwned {
+                objs: Some(Arc::new(QueueBound(VmObjects { vm, delegate }))),
+                queue,
+            },
+        };
+        // 専用キューはシリアルのため、後続の操作より先に実行される。完了待ちはしない（無期限 block の回避。REPAIR-5）。
+        host.run_async(|vm| {
+            let objs = &vm.objs.0;
+            let proto = ProtocolObject::from_ref(&*objs.delegate);
+            // SAFETY: delegate は weak 参照のため、`VmObjects` が VM と同じ寿命で強参照を保持する。VM キュー上で呼ぶ。
+            unsafe { objs.vm.setDelegate(Some(proto)) };
+        });
+        Ok(host)
+    }
+
+    /// VM キュー上でクロージャを非同期に実行する。完了は待たない。
+    ///
+    /// `VmHost` の生存中は VM への参照を必ず持つため、クロージャは常に実行される。
+    pub(crate) fn run_async(&self, f: impl FnOnce(&VmRef<'_>) + Send + 'static) {
+        let Some(objs) = self.owned.objs.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let queue = self.owned.queue.clone();
+        self.owned.queue.exec_async(move || {
+            f(&VmRef::on_queue(&objs, &queue));
+            // この clone が最後の参照でも、解放は VM キューのスレッド上で行われる。
+            drop(objs);
+        });
+    }
+
+    /// VM キュー上でクロージャを実行し、結果を `timeout` まで待つ（`run_async` ＋ チャネル。REPAIR-5）。
+    ///
+    /// キューが詰まった場合や VM キュー上から呼んだ場合も期限で戻る。期限切れ・実行されなかった場合は `None`
+    /// （クロージャは後からキュー上で実行され得る）。
+    pub(crate) fn run_timeout<R: Send + 'static>(
+        &self,
+        timeout: Duration,
+        f: impl FnOnce(&VmRef<'_>) -> R + Send + 'static,
+    ) -> Option<R> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<R>(1);
+        self.run_async(move |vm| {
+            let _ = tx.try_send(f(vm));
+        });
+        rx.recv_timeout(timeout).ok()
+    }
 }

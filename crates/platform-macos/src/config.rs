@@ -531,6 +531,21 @@ impl ConsoleLogPath {
     /// リンク先を開かない）、open 後に fd の種別と lstat との `(dev, ino)` 照合も維持する。
     #[cfg(unix)]
     pub fn open_for_append(&self) -> Result<std::fs::File, ConfigError> {
+        self.open_for_append_excluding(&[])
+    }
+
+    /// [`Self::open_for_append`] に加え、open した fd がディスクイメージと同一ファイルなら拒否する。
+    ///
+    /// `DeviceConfigSpec::try_new` の衝突検査は検証時点の 1 回きりで、その後にログパスが
+    /// ディスクイメージへのハードリンクへ差し替えられると検査をすり抜ける。ここでは使用時点
+    /// （open 済みの fd）の `(dev, ino)` を各ディスクイメージの現在の `(dev, ino)` と照合し、
+    /// 一致すれば fd を閉じて `ConsoleLogConflictsWithDiskImage` を返す（MAC-1・TASK-64.3）。
+    /// 追記 open は内容を変更しないため、拒否時にイメージは破損しない。
+    #[cfg(unix)]
+    pub fn open_for_append_excluding(
+        &self,
+        block_devices: &[BlockDeviceSpec],
+    ) -> Result<std::fs::File, ConfigError> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
         let path = self.as_path();
@@ -575,6 +590,15 @@ impl ConsoleLogPath {
             || pre.is_some_and(|p| p != fd_id);
         if swapped {
             return Err(open_err(std::io::ErrorKind::Other));
+        }
+        for dev in block_devices {
+            // 取得失敗は fail-closed（fd は drop で閉じる）。
+            let disk = file_identity(ConfigField::DiskImage, dev.image.as_path())?;
+            if disk == fd_id {
+                return Err(ConfigError::ConsoleLogConflictsWithDiskImage {
+                    path: path.to_path_buf(),
+                });
+            }
         }
         Ok(file)
     }
@@ -904,7 +928,8 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
     if let Some(sink) = spec.devices.serial_console() {
         match sink {
             SerialConsoleSink::LogFile(log) => {
-                let file = log.open_for_append()?;
+                // 使用時点で fd をディスクイメージと照合する（検証後のハードリンク差し替え対策）。
+                let file = log.open_for_append_excluding(spec.devices.block_devices())?;
                 let handle = crate::sys::new_file_handle(file.into());
                 serial.push(crate::sys::new_console_serial_port(&handle));
             }
@@ -1278,6 +1303,25 @@ mod tests {
         let err = log.open_for_append().unwrap_err();
         assert_eq!(err.code(), "config.console_log_is_symlink");
         assert_eq!(std::fs::metadata(&victim).unwrap().len(), before);
+    }
+
+    /// MAC-1・TASK-64.3: 検証後にログがディスクイメージへのハードリンクへ差し替えられても、
+    /// 使用時点の fd 照合で拒否しイメージを変更しない。
+    #[cfg(unix)]
+    #[test]
+    fn open_for_append_rejects_hardlink_to_disk_image_swapped_after_validation() {
+        let t = TempDir::new("log-hardlink");
+        let image = t.file("disk.img");
+        let before = std::fs::read(&image).unwrap();
+        let link = t.0.join("console.log");
+        let log = ConsoleLogPath::try_new(&link).unwrap();
+        let devices = vec![BlockDeviceSpec::root(
+            DiskImagePath::try_new(&image).unwrap(),
+        )];
+        std::fs::hard_link(&image, &link).unwrap();
+        let err = log.open_for_append_excluding(&devices).unwrap_err();
+        assert_eq!(err.code(), "config.console_log_conflicts_with_disk_image");
+        assert_eq!(std::fs::read(&image).unwrap(), before);
     }
 
     /// MAC-1・TASK-64.3: 新規作成は 0600、既存内容は保持したまま追記される。

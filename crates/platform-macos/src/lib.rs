@@ -8,6 +8,10 @@
 //! - 実行前提: `com.apple.security.virtualization` entitlement とコード署名（ad-hoc 可）、最低 macOS 13。
 //! - 呼び出し文脈: 実行時は `fandhe-container-plugin-macos`（TASK-115）が本 crate を別プロセスとして動かす。
 //!   PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
+//! - `unsafe` は `sys` モジュール（`src/sys.rs`・`src/sys/`）に限る（coding-rust.md の事前承認範囲。#4）。
+//!   crate root の `deny(unsafe_code)` と `sys` 宣言の `allow(unsafe_code)` で機械的に強制する。
+
+#![deny(unsafe_code)]
 
 pub mod config;
 #[cfg(unix)]
@@ -15,6 +19,7 @@ pub mod console_log;
 pub mod vm;
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 mod sys;
 
 /// macOS 以外の unix 向けの `sys`: unix 共通の POSIX ラッパー（`src/sys/posix.rs`）だけを持つ。
@@ -22,6 +27,7 @@ mod sys;
 /// コンソールログの所有者検査（MAC-1・TASK-64.3）を 3 OS CI の Linux でも実行するため、macOS の `sys` と
 /// 同じパス（`crate::sys::effective_uid`）で呼べるようにする。Virtualization.framework 層は含まない。
 #[cfg(all(unix, not(target_os = "macos")))]
+#[allow(unsafe_code)]
 mod sys {
     mod posix;
     pub(crate) use posix::effective_uid;

@@ -1472,13 +1472,13 @@ mod tests {
         assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
     }
 
-    /// WIN-2（Bugbot 指摘）: WOF 圧縮した `.wslconfig` も論理的な内容を読み込め、圧縮データの代替データストリーム
-    /// （`:WofCompressedData`）を引き継げないため置換は PERMISSION_DENIED で拒否し、内容を変えない（Windows）。
-    /// WOF は NTFS のシステムドライブで有効なため、`%USERPROFILE%` 配下で `compact /exe` を使う。WOF フィルタは
-    /// リパースポイント属性を隠すため、リンク以外のリパースポイントとしての拒否はここでは通らない。
+    /// WIN-2（Bugbot 指摘）: WOF 圧縮した `.wslconfig` も論理的な内容を読み込め、更新できる（Windows）。WOF は
+    /// NTFS のシステムドライブで有効なため `%USERPROFILE%` 配下で `compact /exe` を使う。WOF フィルタはリパース
+    /// ポイント属性と圧縮データのストリームを隠すため通常のファイルとして扱われ、置換後は非圧縮になる（圧縮は
+    /// アクセス制御に影響しないため引き継がない）。
     #[cfg(windows)]
     #[test]
-    fn wof_compressed_file_is_read_but_not_replaced() {
+    fn wof_compressed_file_is_read_and_updated() {
         let base = std::env::var_os("USERPROFILE")
             .map(PathBuf::from)
             .expect("USERPROFILE");
@@ -1497,13 +1497,11 @@ mod tests {
         assert!(st.status.success(), "compact failed: {st:?}");
         let cfg = load(&d.file()).expect("load").expect("exists");
         assert_eq!(cfg.render(), body);
-        let e = enable_virtiofs_at(&d.file()).expect_err("must refuse");
-        assert_eq!(e.code(), WinErrorCode::PermissionDenied);
+        assert_eq!(enable_virtiofs_at(&d.file()), Ok(EnableOutcome::Added));
         assert_eq!(
-            e.message(),
-            ".wslconfig has named streams that cannot be preserved; refusing to replace it"
+            std::fs::read_to_string(d.file()).expect("read"),
+            format!("{body}virtiofs=true\n")
         );
-        assert_eq!(std::fs::read_to_string(d.file()).expect("read"), body);
         assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
     }
 

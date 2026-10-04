@@ -200,12 +200,18 @@ impl Wsl2Status {
 }
 
 /// `wsl.exe --version` を実行してバージョン情報を返す。
+///
+/// 引数（`timeout`）の検証を `wsl.exe` の探索より先に行う（環境によらず `INVALID_ARGUMENT`）。
 pub fn query_version(timeout: Duration) -> Result<WslVersionInfo, Wsl2Error> {
+    check_timeout(timeout)?;
     query_version_with_program(&wsl_exe_path()?, timeout)
 }
 
 /// `wsl.exe -l -v` を実行してディストリ一覧を返す（0 件なら空の一覧）。
+///
+/// 引数（`timeout`）の検証を `wsl.exe` の探索より先に行う（環境によらず `INVALID_ARGUMENT`）。
 pub fn list_distros(timeout: Duration) -> Result<Vec<WslDistro>, Wsl2Error> {
+    check_timeout(timeout)?;
     list_distros_with_program(&wsl_exe_path()?, timeout)
 }
 
@@ -214,9 +220,18 @@ pub fn list_distros(timeout: Duration) -> Result<Vec<WslDistro>, Wsl2Error> {
 /// WSL が無効、または WSL2 のディストリが 1 件もない場合は有効化手順つきの
 /// `FAILED_PRECONDITION` を返す（WIN-1）。各呼び出しに `timeout` を適用する。
 pub fn detect(timeout: Duration) -> Result<Wsl2Status, Wsl2Error> {
-    let program = wsl_exe_path()?;
-    let version = query_version_with_program(&program, timeout)?;
-    let distros = list_distros_with_program(&program, timeout)?;
+    check_timeout(timeout)?;
+    detect_with_program(&wsl_exe_path()?, timeout)
+}
+
+/// 実行するプログラムを差し替えられる `detect`（テスト用）。
+pub(crate) fn detect_with_program(
+    program: &Path,
+    timeout: Duration,
+) -> Result<Wsl2Status, Wsl2Error> {
+    check_timeout(timeout)?;
+    let version = query_version_with_program(program, timeout)?;
+    let distros = list_distros_with_program(program, timeout)?;
     evaluate(version, distros)
 }
 

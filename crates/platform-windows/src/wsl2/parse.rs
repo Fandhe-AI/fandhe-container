@@ -616,6 +616,38 @@ mod tests {
         );
     }
 
+    /// WIN-1: ディストリ名に制御文字・Unicode 書式文字（Cf）・行 / 段落区切りがあれば DATA_LOSS、
+    /// 未知の状態語からは取り除く。通常の日本語名は受け付ける。
+    #[test]
+    fn list_rejects_invisible_chars() {
+        for c in [
+            '\u{0007}',
+            '\u{00AD}',
+            '\u{061C}',
+            '\u{200B}',
+            '\u{200F}',
+            '\u{2028}',
+            '\u{202E}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{FEFF}',
+            '\u{E0041}',
+        ] {
+            let text = format!("NAME STATE VERSION\nUbu{c}ntu Running 2\n");
+            assert_eq!(
+                parse_distros(&text).unwrap_err().code(),
+                Wsl2ErrorCode::DataLoss,
+                "U+{:04X}",
+                c as u32
+            );
+        }
+        let ok = parse_distros("NAME STATE VERSION\nUbuntu-日本語 Weird\u{202E}\u{200B}State 2\n")
+            .unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].name, "Ubuntu-日本語");
+        assert_eq!(ok[0].state, DistroState::Other("WeirdState".to_string()));
+    }
+
     /// ERR-1: 失敗トークンの分類と抜粋のサニタイズ。
     #[test]
     fn classify_and_excerpt() {

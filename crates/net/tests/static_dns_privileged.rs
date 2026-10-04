@@ -255,6 +255,33 @@ mod linux {
         Ok(())
     }
 
+    /// 外部コマンド出力 1 本あたりの読み取り上限（無制限確保による DoS を防ぐ。REPAIR-5）。
+    const OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+
+    /// パイプを上限つきで読む切り離しスレッドを起動する。上限超過時は超過フラグを立てて読み取りを止める
+    /// （パイプを閉じるため子は SIGPIPE で止まり得る。呼び出し側がフラグを見て子プロセス群を回収する）。
+    fn spawn_capped_reader<R: std::io::Read + Send + 'static>(
+        pipe: Option<R>,
+    ) -> (std::sync::mpsc::Receiver<Vec<u8>>, Arc<AtomicBool>) {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let over = Arc::new(AtomicBool::new(false));
+        let over_t = Arc::clone(&over);
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(p) = pipe {
+                // 上限 + 1 バイトまで読み、超過を検出する。
+                let limit = u64::try_from(OUTPUT_LIMIT_BYTES).unwrap_or(u64::MAX);
+                let _ = p.take(limit.saturating_add(1)).read_to_end(&mut buf);
+                if buf.len() > OUTPUT_LIMIT_BYTES {
+                    over_t.store(true, Ordering::SeqCst);
+                    buf.truncate(OUTPUT_LIMIT_BYTES);
+                }
+            }
+            let _ = tx.send(buf);
+        });
+        (rx, over)
+    }
+
     /// 外部コマンドを期限つきで実行する（REPAIR-5）。期限切れなら子を kill して回収する。
     fn run_cmd(program: &str, args: &[&str]) -> Result<String, NetError> {
         // 子孫がパイプを保持しても止まらないよう、子を新しいプロセスグループに入れ、期限切れ時は
@@ -278,31 +305,20 @@ mod linux {
             let _ = child.kill();
             let _ = child.wait();
         };
-        let mut out_pipe = child.stdout.take();
-        let mut err_pipe = child.stderr.take();
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        let (err_tx, err_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        // 読み取りスレッドは join せず切り離す（グループ kill 後は EOF で自然に終了する）。
-        std::thread::spawn(move || {
-            let mut b = Vec::new();
-            if let Some(p) = out_pipe.as_mut() {
-                let _ = p.read_to_end(&mut b);
-            }
-            let _ = out_tx.send(b);
-        });
-        std::thread::spawn(move || {
-            let mut b = Vec::new();
-            if let Some(p) = err_pipe.as_mut() {
-                let _ = p.read_to_end(&mut b);
-            }
-            let _ = err_tx.send(b);
-        });
+        let (out_rx, out_over) = spawn_capped_reader(child.stdout.take());
+        let (err_rx, err_over) = spawn_capped_reader(child.stderr.take());
         let deadline = Instant::now() + timeout();
         let status = loop {
             match child
                 .try_wait()
                 .map_err(|e| fail(format!("wait {program}: {e}")))?
             {
+                _ if out_over.load(Ordering::SeqCst) || err_over.load(Ordering::SeqCst) => {
+                    kill_group(&mut child);
+                    return Err(fail(format!(
+                        "{program} output exceeded {OUTPUT_LIMIT_BYTES} bytes"
+                    )));
+                }
                 Some(st) => break st,
                 None if Instant::now() >= deadline => {
                     kill_group(&mut child);
@@ -326,6 +342,11 @@ mod linux {
                 format!("{program} output pipes did not close before the deadline"),
             ));
         };
+        if out_over.load(Ordering::SeqCst) || err_over.load(Ordering::SeqCst) {
+            return Err(fail(format!(
+                "{program} output exceeded {OUTPUT_LIMIT_BYTES} bytes"
+            )));
+        }
         if !status.success() {
             return Err(fail(format!(
                 "{program} failed: {}{}",

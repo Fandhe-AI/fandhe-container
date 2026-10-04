@@ -504,6 +504,11 @@ mod windows {
             assert_eq!(parse_label_acl(&low), Some(Some((1, 0x1000))));
             assert_eq!(parse_label_acl(&[2, 0, 8, 0, 0, 0, 0, 0]), Some(None));
             assert_eq!(parse_label_acl(low.get(..20).expect("slice")), None);
+            // AceSize が SID の途中で終わる（RID が ACE の外にはみ出す）形式は拒否する。
+            let mut short = low;
+            short[10] = 16;
+            short[2] = 24;
+            assert_eq!(parse_label_acl(&short), None);
         }
 
         /// WIN-2（レビュー指摘 P1）: 元ファイルにラベルがなく、宛先が親ディレクトリから別のラベルを継承した場合は

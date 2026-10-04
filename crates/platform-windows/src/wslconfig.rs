@@ -1155,6 +1155,27 @@ mod tests {
         assert_eq!(e.code(), WinErrorCode::ResourceExhausted);
     }
 
+    /// WIN-2（security-auditor P2）: ASCII の空白・タブ以外の空白（全角空白・NBSP）と単独の CR は行番号つきの
+    /// INVALID_ARGUMENT で拒否し、ASCII の空白・タブは従来どおり前後から除く。
+    #[test]
+    fn rejects_non_ascii_whitespace_and_lone_cr() {
+        for (input, line) in [
+            ("[wsl2]\nmemory=4GB\u{3000}\n", 2),
+            ("a=1\rb=2\n", 1),
+            ("\u{00A0}[wsl2]\n", 1),
+            ("[wsl2]\r\nvirtiofs=true\r\r\n", 2),
+        ] {
+            let e = WslConfig::parse(input).expect_err("must fail");
+            assert_eq!(e.code(), WinErrorCode::InvalidArgument);
+            assert_eq!(
+                e.message(),
+                format!("line {line}: unsupported whitespace or carriage return")
+            );
+        }
+        let c = WslConfig::parse("\t [ wsl2 ] \t\r\n\t virtiofs \t= \tTrue \t\r\n").expect("parse");
+        assert_eq!(c.virtiofs_state(), VirtiofsState::Enabled);
+    }
+
     /// 値が空でも `]` 後ろのコメントでも受理する。
     #[test]
     fn accepts_comment_after_header_and_empty_value() {
@@ -1550,6 +1571,58 @@ mod tests {
         let mut entries = d.entries();
         entries.sort();
         assert_eq!(entries, vec![".wslconfig".to_string(), "fresh".to_string()]);
+    }
+
+    /// WIN-2（security-auditor P2）: unix の open フラグ（O_NOFOLLOW・O_NONBLOCK）の値を OS・アーキテクチャごとに
+    /// 固定する（libc 0.2.189 と同値）。
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn unix_open_flag_values_are_fixed() {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(
+            (unix_open_flags::O_NOFOLLOW, unix_open_flags::O_NONBLOCK),
+            (0x20000, 0x800)
+        );
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        assert_eq!(
+            (unix_open_flags::O_NOFOLLOW, unix_open_flags::O_NONBLOCK),
+            (0x8000, 0x800)
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            (unix_open_flags::O_NOFOLLOW, unix_open_flags::O_NONBLOCK),
+            (0x100, 0x4)
+        );
+    }
+
+    /// WIN-2（security-auditor P2）: 検査後に FIFO・シンボリックリンクへ差し替えられたパスを open_verified が
+    /// 開いても、FIFO で止まらず、リンクを辿らずに Err を返す（unix）。
+    #[cfg(unix)]
+    #[test]
+    fn open_verified_rejects_fifo_and_symlink_without_blocking() {
+        let d = TmpDir::new("fifo");
+        let fifo = d.0.join("fifo");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(st.success(), "mkfifo failed: {st:?}");
+        let e = open_verified(&fifo).expect_err("fifo must be rejected");
+        assert_eq!(e.code(), WinErrorCode::PermissionDenied);
+        assert_eq!(e.message(), ".wslconfig is not a regular file");
+
+        let target = d.0.join("target");
+        std::fs::write(&target, "[wsl2]\n").expect("write");
+        std::os::unix::fs::symlink(&target, d.file()).expect("symlink");
+        let e = open_verified(&d.file()).expect_err("symlink must be rejected");
+        assert_eq!(e.message(), "failed to open .wslconfig");
+        assert_eq!(std::fs::read(&target).expect("read"), b"[wsl2]\n");
     }
 
     /// シンボリックリンクの `.wslconfig` は拒否しリンク先を変更しない。

@@ -162,14 +162,18 @@ pub(crate) fn copy_capped<R: Read, W: Write>(
         }
         let take = usize::try_from(remaining).map_or(chunk.len(), |r| r.min(chunk.len()));
         let (head, tail) = chunk.split_at_checked(take).unwrap_or((chunk, &[]));
-        if let Err(e) = dst.write_all(head) {
-            record_write_error(&mut out, e.kind(), report);
-            out.discarded_bytes = out.discarded_bytes.saturating_add(chunk_len);
+        let (done, err) = write_counted(&mut dst, head);
+        out.written_bytes = out.written_bytes.saturating_add(done);
+        remaining = remaining.saturating_sub(done);
+        if let Some(kind) = err {
+            // 書けた分は written、残り（head の未書き込み分と tail）は discarded に数える。
+            record_write_error(&mut out, kind, report);
+            out.discarded_bytes = out
+                .discarded_bytes
+                .saturating_add(chunk_len.saturating_sub(done));
             accepting = false;
             continue;
         }
-        out.written_bytes = out.written_bytes.saturating_add(len_u64(head));
-        remaining = remaining.saturating_sub(len_u64(head));
         if !tail.is_empty() {
             accepting = false;
             out.limit_reached = true;
@@ -178,9 +182,9 @@ pub(crate) fn copy_capped<R: Read, W: Write>(
                 written_bytes: out.written_bytes,
             });
             if plan.marker_allowed {
-                match dst.write_all(TRUNCATION_MARKER) {
-                    Ok(()) => out.marker_written = true,
-                    Err(e) => record_write_error(&mut out, e.kind(), report),
+                match write_counted(&mut dst, TRUNCATION_MARKER) {
+                    (_, None) => out.marker_written = true,
+                    (_, Some(kind)) => record_write_error(&mut out, kind, report),
                 }
             }
         }
@@ -189,6 +193,31 @@ pub(crate) fn copy_capped<R: Read, W: Write>(
         report(ConsoleLogEvent::ReadFailed { kind });
     }
     out
+}
+
+/// `buf` を書けるだけ書き、書けたバイト数と（あれば）失敗の種別を返す。
+///
+/// `write_all` は途中まで書いた後に失敗すると書けたバイト数を返さないため、集計を実際のログと一致させる
+/// ために自前で進める。`Interrupted` は再試行し、`Ok(0)` は `WriteZero` として失敗にする。
+fn write_counted<W: Write>(dst: &mut W, buf: &[u8]) -> (u64, Option<ErrorKind>) {
+    let mut rest = buf;
+    let mut done = 0u64;
+    while !rest.is_empty() {
+        match dst.write(rest) {
+            Ok(0) => return (done, Some(ErrorKind::WriteZero)),
+            Ok(n) => {
+                // `Write` の契約上 n <= rest.len() だが、契約違反の実装でも添字で panic させない。
+                let Some(next) = rest.get(n..) else {
+                    return (done, Some(ErrorKind::InvalidData));
+                };
+                done = done.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+                rest = next;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return (done, Some(e.kind())),
+        }
+    }
+    (done, None)
 }
 
 /// 最初の書き込み失敗だけを記録・報告する。

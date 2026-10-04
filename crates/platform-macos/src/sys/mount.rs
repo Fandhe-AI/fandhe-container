@@ -53,10 +53,15 @@ struct Statfs {
 const _: () = assert!(std::mem::size_of::<Statfs>() == 2168);
 const _: () = assert!(std::mem::align_of::<Statfs>() == 8);
 
+// 64 bit inode 版のシンボル名は x86_64 と aarch64 でしか確認していないため、それ以外の macOS では止める。
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("statfs symbol for this macOS target_arch is not verified (x86_64 / aarch64 only)");
+
+// SAFETY: （宣言そのものの妥当性）`int statfs(const char *path, struct statfs *buf)` と同じ引数・戻り値の
+// 型。x86_64 は 64 bit inode 版のシンボル `statfs$INODE64`、aarch64 は既定の `statfs` が上記 `Statfs` の
+// 配置を使う（アーキ差は `cfg_attr(target_arch)` で明示する）。
 unsafe extern "C" {
-    // SAFETY（宣言そのものの妥当性）: `int statfs(const char *path, struct statfs *buf)`。x86_64 では
-    // 64 bit inode 版のシンボル `statfs$INODE64` が上記 `Statfs` の配置を使う（aarch64 は既定がこの版）。
-    #[cfg_attr(not(target_arch = "aarch64"), link_name = "statfs$INODE64")]
+    #[cfg_attr(target_arch = "x86_64", link_name = "statfs$INODE64")]
     fn statfs(path: *const c_char, buf: *mut Statfs) -> c_int;
 }
 

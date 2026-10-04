@@ -809,7 +809,7 @@ pub struct BlockDeviceReadBack {
     pub id: String,
 }
 
-/// 構築済みの `VZVirtualMachineConfiguration`（不透明型）。TASK-64.4 が内部を取り出して使う。
+/// 構築済みの `VZVirtualMachineConfiguration`（不透明型）。`vm::Vm::create`（TASK-64.4）が内部を取り出して使う。
 #[cfg(target_os = "macos")]
 pub struct VzVmConfiguration(
     objc2::rc::Retained<objc2_virtualization::VZVirtualMachineConfiguration>,
@@ -817,7 +817,6 @@ pub struct VzVmConfiguration(
 
 #[cfg(target_os = "macos")]
 impl VzVmConfiguration {
-    #[allow(dead_code)] // TASK-64.4 が利用する。
     pub(crate) fn inner(&self) -> &objc2_virtualization::VZVirtualMachineConfiguration {
         &self.0
     }
@@ -867,12 +866,12 @@ impl VzVmConfiguration {
 
 /// [`VmConfigSpec`] から `VZVirtualMachineConfiguration` を構築する（MAC-1・TASK-64.2・64.3）。
 ///
-/// TASK-64.4 がこの構成から `VZVirtualMachine` を生成する。ゲストのカーネルコマンドライン
+/// `vm::Vm::create`（TASK-64.4）がこの構成から `VZVirtualMachine` を生成する。ゲストのカーネルコマンドライン
 /// `console=hvc0` の出力はコンソールログへ流れる。ホスト側の副作用（ログファイルの作成）は
 /// 失敗し得る処理をすべて終えた後に行う。
 ///
 /// Rust 側の検証と VZ の許容範囲照合をすべて終えてから FFI の setter を呼ぶ（ObjC 例外は捕捉できないため）。
-/// `validateWithError` は entitlement 依存の可能性があり、ここでは呼ばない（TASK-64.4 以降）。
+/// `validateWithError` は entitlement 依存の可能性があり、ここでは呼ばず、`vm::Vm::create` が VM 生成前に呼ぶ（TASK-64.4）。
 #[cfg(target_os = "macos")]
 pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, ConfigError> {
     use objc2_foundation::{NSString, NSURL};

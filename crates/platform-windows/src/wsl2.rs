@@ -576,12 +576,23 @@ mod tests {
     #[test]
     fn invalid_timeout_rejected() {
         let p = Path::new("unused");
-        for t in [Duration::ZERO, Duration::from_secs(301)] {
+        for t in [
+            Duration::ZERO,
+            Duration::from_micros(1),
+            Duration::from_nanos(999_999),
+            Duration::from_secs(300) + Duration::from_nanos(1),
+            Duration::from_secs(301),
+        ] {
             let e = query_version_with_program(p, t).unwrap_err();
-            assert_eq!(e.code(), Wsl2ErrorCode::InvalidArgument);
+            assert_eq!(e.code(), Wsl2ErrorCode::InvalidArgument, "{t:?}");
+            assert_eq!(e.message(), "timeout must be between 1ms and 300s");
             let e = list_distros_with_program(p, t).unwrap_err();
-            assert_eq!(e.code(), Wsl2ErrorCode::InvalidArgument);
+            assert_eq!(e.code(), Wsl2ErrorCode::InvalidArgument, "{t:?}");
         }
+        // 両端（1ms・300s）は受け付ける。
+        assert_eq!(check_timeout(Duration::from_millis(1)), Ok(()));
+        assert_eq!(check_timeout(Duration::from_secs(300)), Ok(()));
+        assert_eq!(MIN_WSL_TIMEOUT, Duration::from_millis(1));
     }
 
     /// WIN-1: 存在しないプログラムは NOT_FOUND（案内つき）。

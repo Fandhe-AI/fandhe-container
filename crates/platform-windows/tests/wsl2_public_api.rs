@@ -10,14 +10,20 @@ use std::time::Duration;
 #[cfg(not(windows))]
 use fandhe_container_platform_windows::wsl2::DEFAULT_WSL_TIMEOUT;
 use fandhe_container_platform_windows::wsl2::{
-    MAX_WSL_TIMEOUT, Wsl2ErrorCode, detect, list_distros, query_version,
+    MAX_WSL_TIMEOUT, MIN_WSL_TIMEOUT, Wsl2ErrorCode, detect, list_distros, query_version,
 };
 
-/// REPAIR-5・ERR-1: 0 や上限超えのタイムアウトは、`wsl.exe` を探す前に INVALID_ARGUMENT になる。
+/// REPAIR-5・ERR-1: 1ms 未満や上限超えのタイムアウトは、`wsl.exe` を探す前に INVALID_ARGUMENT になる。
 #[test]
 fn invalid_timeout_is_rejected_before_probing() {
     let too_long = MAX_WSL_TIMEOUT + Duration::from_millis(1);
-    for timeout in [Duration::ZERO, too_long] {
+    let too_short = MIN_WSL_TIMEOUT - Duration::from_nanos(1);
+    for timeout in [
+        Duration::ZERO,
+        Duration::from_micros(1),
+        too_short,
+        too_long,
+    ] {
         assert_eq!(
             detect(timeout).unwrap_err().code(),
             Wsl2ErrorCode::InvalidArgument

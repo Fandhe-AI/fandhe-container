@@ -1048,6 +1048,60 @@ mod tests {
         assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
     }
 
+    /// WIN-2（レビュー指摘 P1）: 読み込み後に宛先が別ファイルへ置き換えられたら、上書きせず INTERNAL で拒否し、
+    /// 置き換えた側の内容を残す。一時ファイルも残さない。
+    #[test]
+    fn replace_refuses_when_destination_was_swapped() {
+        let d = TmpDir::new("swapped");
+        std::fs::write(d.file(), "[wsl2]\nmemory=4GB\n").expect("write");
+        let (_, source) = load_verified(&d.file()).expect("load").expect("exists");
+        let other = d.0.join("other");
+        std::fs::write(&other, "[wsl2]\nmemory=8GB\n").expect("write other");
+        std::fs::rename(&other, d.file()).expect("swap");
+        let e = write_atomic(
+            &d.file(),
+            b"[wsl2]\nmemory=4GB\nvirtiofs=true\n",
+            WriteMode::Replace(source),
+        )
+        .expect_err("must refuse");
+        assert_eq!(e.code(), WinErrorCode::Internal);
+        assert_eq!(
+            e.message(),
+            ".wslconfig was modified concurrently; refusing to replace it"
+        );
+        assert_eq!(
+            std::fs::read(d.file()).expect("read"),
+            b"[wsl2]\nmemory=8GB\n"
+        );
+        assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
+    }
+
+    /// WIN-2（レビュー指摘 P1）: 読み込み後に同じファイルがその場で書き換えられたら（大きさが変わる）、
+    /// 上書きせず INTERNAL で拒否する。
+    #[test]
+    fn replace_refuses_when_destination_was_modified_in_place() {
+        let d = TmpDir::new("inplace");
+        std::fs::write(d.file(), "[wsl2]\nmemory=4GB\n").expect("write");
+        let (_, source) = load_verified(&d.file()).expect("load").expect("exists");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(d.file())
+            .and_then(|mut f| f.write_all(b"swap=0\n"))
+            .expect("append");
+        let e = write_atomic(
+            &d.file(),
+            b"[wsl2]\nmemory=4GB\nvirtiofs=true\n",
+            WriteMode::Replace(source),
+        )
+        .expect_err("must refuse");
+        assert_eq!(e.code(), WinErrorCode::Internal);
+        assert_eq!(
+            std::fs::read(d.file()).expect("read"),
+            b"[wsl2]\nmemory=4GB\nswap=0\n"
+        );
+        assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
+    }
+
     /// WIN-2・AC2: ファイルがなければ新規作成する。
     #[test]
     fn creates_missing_file() {

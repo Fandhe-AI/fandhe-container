@@ -327,6 +327,20 @@ mod tests {
         assert_eq!(dst_after, src_acl);
     }
 
+    /// WIN-2: 同じファイルを別々に開いたハンドルの `file_id` は一致し、別ファイルとは一致しない。
+    #[test]
+    fn file_id_identifies_the_same_file() {
+        let d = TmpDir(std::env::temp_dir().join(format!("fc-sys-fileid-{}", std::process::id())));
+        std::fs::create_dir_all(&d.0).expect("mkdir");
+        std::fs::write(d.0.join("a"), b"x").expect("write a");
+        std::fs::write(d.0.join("b"), b"x").expect("write b");
+        let a1 = file_id(&File::open(d.0.join("a")).expect("open a")).expect("id a1");
+        let a2 = file_id(&File::open(d.0.join("a")).expect("open a")).expect("id a2");
+        let b = file_id(&File::open(d.0.join("b")).expect("open b")).expect("id b");
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+    }
+
     /// WIN-2: WRITE_DAC なしで開いた宛先には写せず `Err`（失敗を握りつぶさない）。
     #[test]
     fn copy_security_without_write_dac_fails() {

@@ -15,6 +15,16 @@ pub mod vm;
 #[cfg(target_os = "macos")]
 mod sys;
 
+/// macOS 以外の unix 向けの `sys`: unix 共通の POSIX ラッパー（`src/sys/posix.rs`）だけを持つ。
+///
+/// コンソールログの所有者検査（MAC-1・TASK-64.3）を 3 OS CI の Linux でも実行するため、macOS の `sys` と
+/// 同じパス（`crate::sys::effective_uid`）で呼べるようにする。Virtualization.framework 層は含まない。
+#[cfg(all(unix, not(target_os = "macos")))]
+mod sys {
+    mod posix;
+    pub(crate) use posix::effective_uid;
+}
+
 /// 本バックエンドの利用可否と前提 macOS 版数（拡張可能なように構造体で返す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlatformSupport {

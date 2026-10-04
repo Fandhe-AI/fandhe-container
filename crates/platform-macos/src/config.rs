@@ -15,8 +15,14 @@
 //! （REPAIR-3: 現時点では未統合）。検証後〜起動までの TOCTOU（ファイル差し替え）は残るため、
 //! 起動時の読み込み失敗は TASK-64.4/64.5 のエラー経路で扱う。
 //! コンソールログの open は `O_NOFOLLOW` で最終パス要素の symlink 追従を open 時点で拒否し、
-//! open 後に fd と lstat の `(dev, ino)` も照合する（事前検査〜open 間の symlink 差し替えを塞ぐ。
-//! 親ディレクトリ要素の差し替えは対象外で、親ディレクトリの権限管理に委ねる）。
+//! open 後に fd と lstat の `(dev, ino)` も照合する（事前検査〜open 間の symlink 差し替えを塞ぐ）。
+//! 新規作成は `O_CREAT | O_EXCL` で行い、既存ファイルは作成フラグなしで開く。open 後の fd が
+//! kernel / initrd / ディスクイメージと同一ファイルなら拒否し（initrd への追記は次回起動時の
+//! initramfs 注入になり得る）、リンク数が 1 でない・所有者が実効 uid でないファイルも拒否する。
+//!
+//! 信頼前提（fail-closed で検査しない範囲）: 直近の親ディレクトリは「他者書き込み可能かつ sticky bit
+//! なし」なら拒否するが、group 書き込み可は group メンバーを信頼するものとして許可する。祖先ディレクトリ
+//! 要素（親より上）の差し替えは対象外で、呼び出し側の配置ディレクトリの権限管理に委ねる。
 
 use std::fmt;
 use std::num::NonZeroU32;
@@ -111,6 +117,18 @@ pub enum ConfigError {
     ConsoleLogParentNotFound { path: PathBuf },
     /// コンソールログがディスクイメージと同一ファイル。
     ConsoleLogConflictsWithDiskImage { path: PathBuf },
+    /// コンソールログが kernel / initrd と同一ファイル（`field` はどちらか）。
+    ConsoleLogConflictsWithBootFile { field: ConfigField, path: PathBuf },
+    /// 既存のコンソールログの所有者が実効 uid でない（他ユーザーの事前作成）。
+    ConsoleLogNotOwned {
+        path: PathBuf,
+        owner: u32,
+        euid: u32,
+    },
+    /// 既存のコンソールログのハードリンク数が 1 でない（別名経由の追記先すり替え）。
+    ConsoleLogMultipleLinks { path: PathBuf, links: u64 },
+    /// コンソールログの親ディレクトリが他者書き込み可能で sticky bit がない（`path` は親ディレクトリ）。
+    ConsoleLogParentWorldWritable { path: PathBuf },
     /// コンソールログを開けない、または open 後の同一性検査に失敗した。
     ConsoleLogOpen { kind: std::io::ErrorKind },
     /// VZ がディスクイメージ attachment を拒否した（NSError の domain / code）。
@@ -144,6 +162,14 @@ impl ConfigError {
             ConfigError::ConsoleLogParentNotFound { .. } => "config.console_log_parent_not_found",
             ConfigError::ConsoleLogConflictsWithDiskImage { .. } => {
                 "config.console_log_conflicts_with_disk_image"
+            }
+            ConfigError::ConsoleLogConflictsWithBootFile { .. } => {
+                "config.console_log_conflicts_with_boot_file"
+            }
+            ConfigError::ConsoleLogNotOwned { .. } => "config.console_log_not_owned",
+            ConfigError::ConsoleLogMultipleLinks { .. } => "config.console_log_multiple_links",
+            ConfigError::ConsoleLogParentWorldWritable { .. } => {
+                "config.console_log_parent_world_writable"
             }
             ConfigError::ConsoleLogOpen { .. } => "config.console_log_open",
             ConfigError::DiskAttachment { .. } => "config.disk_attachment",
@@ -231,6 +257,31 @@ impl ConfigError {
             ConfigError::ConsoleLogConflictsWithDiskImage { path } => {
                 format!(
                     "console log is the same file as a disk image: {}",
+                    path.display()
+                )
+            }
+            ConfigError::ConsoleLogConflictsWithBootFile { field, path } => {
+                format!(
+                    "console log is the same file as the {} image: {}",
+                    field.as_str(),
+                    path.display()
+                )
+            }
+            ConfigError::ConsoleLogNotOwned { path, owner, euid } => {
+                format!(
+                    "console log is owned by uid {owner}, expected effective uid {euid}: {}",
+                    path.display()
+                )
+            }
+            ConfigError::ConsoleLogMultipleLinks { path, links } => {
+                format!(
+                    "console log has {links} hard links, expected 1: {}",
+                    path.display()
+                )
+            }
+            ConfigError::ConsoleLogParentWorldWritable { path } => {
+                format!(
+                    "console log parent directory is world-writable without the sticky bit: {}",
                     path.display()
                 )
             }
@@ -479,30 +530,21 @@ impl BlockDeviceSpec {
 }
 
 /// 検証済みのコンソールログパス。書き込み先のため、存在しなくてもよいが symlink は拒否する。
+///
+/// 既存ファイルはリンク数 1・所有者が実効 uid であることも検証する（unix。他ユーザーの事前作成・
+/// ハードリンクによる追記先のすり替えを拒否する）。検証は生成時点のもので、使用時点の再検査は
+/// `VmConfigSpec` 経由の open が fd に対して行う（MAC-1・TASK-64.3）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsoleLogPath(PathBuf);
 
 impl ConsoleLogPath {
-    /// 絶対・UTF-8・親ディレクトリ存在・（存在すれば）symlink でない通常ファイルを検証して生成する。
+    /// 絶対・UTF-8・親ディレクトリ存在（他者書き込み可能かつ sticky bit なしは拒否）・（存在すれば）
+    /// symlink でない通常ファイル・リンク数 1・実効 uid 所有を検証して生成する。
     pub fn try_new(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let field = ConfigField::ConsoleLog;
         check_absolute_utf8(field, path)?;
-        let no_parent = || ConfigError::ConsoleLogParentNotFound {
-            path: path.to_path_buf(),
-        };
-        let parent = path.parent().ok_or_else(no_parent)?;
-        match std::fs::metadata(parent) {
-            Ok(m) if m.is_dir() => {}
-            Ok(_) => return Err(no_parent()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(no_parent()),
-            Err(e) => {
-                return Err(ConfigError::PathIo {
-                    field,
-                    kind: e.kind(),
-                });
-            }
-        }
+        check_console_log_parent(path)?;
         match std::fs::symlink_metadata(path) {
             Ok(m) if m.file_type().is_symlink() => Err(ConfigError::ConsoleLogIsSymlink {
                 path: path.to_path_buf(),
@@ -511,7 +553,21 @@ impl ConsoleLogPath {
                 field,
                 path: path.to_path_buf(),
             }),
-            Ok(_) => Ok(Self(path.to_path_buf())),
+            Ok(_m) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    check_log_ownership(
+                        path,
+                        LogFileAttrs {
+                            nlink: _m.nlink(),
+                            uid: _m.uid(),
+                        },
+                        crate::sys::effective_uid(),
+                    )?;
+                }
+                Ok(Self(path.to_path_buf()))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self(path.to_path_buf())),
             Err(e) => Err(ConfigError::PathIo {
                 field,
@@ -525,29 +581,33 @@ impl ConsoleLogPath {
         &self.0
     }
 
-    /// 追記モード・0600 で開く（無ければ作成。既存ファイルのモードは変えない）。
+    /// 追記モードで開く。無ければ `O_CREAT | O_EXCL`・0600 で新規作成する（既存ファイルのモードは変えない）。
     ///
-    /// 非公開。外部からは検証済みの [`DeviceConfigSpec::open_serial_console_log`] 経由でのみ呼べ、
-    /// 照合対象のディスクイメージを呼び出し側が省略・差し替えできない（MAC-1・TASK-64.3）。
-    /// `O_NOFOLLOW` で最終要素が symlink なら open 自体を失敗させ（事前検査との間の差し替えでも
-    /// リンク先を開かない）、open 後に fd の種別と lstat との `(dev, ino)` 照合も維持する。
+    /// 非公開。[`VmConfigSpec::open_serial_console_log`] 経由でのみ呼ばれ、照合対象（kernel / initrd /
+    /// ディスクイメージ）を呼び出し側が省略・差し替えできない（MAC-1・TASK-64.3）。
     ///
-    /// 加えて、open した fd がディスクイメージと同一ファイルなら拒否する。
-    ///
-    /// `DeviceConfigSpec::try_new` の衝突検査は検証時点の 1 回きりで、その後にログパスが
-    /// ディスクイメージへのハードリンクへ差し替えられると検査をすり抜ける。ここでは使用時点
-    /// （open 済みの fd）の `(dev, ino)` を各ディスクイメージの現在の `(dev, ino)` と照合し、
-    /// 一致すれば fd を閉じて `ConsoleLogConflictsWithDiskImage` を返す（MAC-1・TASK-64.3）。
-    /// 追記 open は内容を変更しないため、拒否時にイメージは破損しない。
+    /// 検査（いずれも fail-closed。拒否時は fd を drop で閉じ、何も書き込まない）:
+    /// 1. 親ディレクトリが他者書き込み可能かつ sticky bit なしなら拒否する（P2-4 の信頼前提はモジュール doc）。
+    /// 2. 事前の lstat で存在すれば作成フラグなし、無ければ `O_CREAT | O_EXCL` で開く。後者は事前検査〜open
+    ///    間に他者が作ったファイル（symlink・ハードリンクを含む）を開かず `AlreadyExists` で失敗する。
+    ///    `O_NOFOLLOW` で最終要素が symlink なら open 自体を失敗させる。
+    /// 3. open 後に fd の種別と lstat との `(dev, ino)` を照合する（事前検査との間の差し替え検出）。
+    /// 4. fd の `(dev, ino)` を各照合対象の現在の `(dev, ino)` と比べ、一致すれば
+    ///    `ConsoleLogConflictsWithDiskImage` / `ConsoleLogConflictsWithBootFile` を返す。検証時点の
+    ///    照合は 1 回きりで、その後のハードリンク差し替えはここで塞ぐ。追記 open は内容を変更しない
+    ///    ため、拒否時に照合対象は破損しない。
+    /// 5. fd のリンク数が 1 でなければ `ConsoleLogMultipleLinks`、所有者が実効 uid でなければ
+    ///    `ConsoleLogNotOwned` を返す（4 の後に行い、照合対象へのハードリンクはより具体的な衝突エラーで報告する）。
     #[cfg(unix)]
     fn open_for_append_excluding(
         &self,
-        block_devices: &[BlockDeviceSpec],
+        protected: &[ProtectedInput<'_>],
     ) -> Result<std::fs::File, ConfigError> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
         let path = self.as_path();
         let open_err = |kind: std::io::ErrorKind| ConfigError::ConsoleLogOpen { kind };
+        check_console_log_parent(path)?;
         let pre = match std::fs::symlink_metadata(path) {
             Ok(m) if m.file_type().is_symlink() => {
                 return Err(ConfigError::ConsoleLogIsSymlink {
@@ -564,21 +624,21 @@ impl ConsoleLogPath {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(open_err(e.kind())),
         };
-        let file = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(O_NOFOLLOW)
-            .open(path)
-            .map_err(|e| {
-                // O_NOFOLLOW による拒否（ELOOP 等）は symlink として報告する。
-                match std::fs::symlink_metadata(path) {
-                    Ok(m) if m.file_type().is_symlink() => ConfigError::ConsoleLogIsSymlink {
-                        path: path.to_path_buf(),
-                    },
-                    _ => open_err(e.kind()),
-                }
-            })?;
+        let mut options = std::fs::OpenOptions::new();
+        options.append(true).custom_flags(O_NOFOLLOW);
+        if pre.is_none() {
+            // 新規作成は O_EXCL 付き（他者が先に作ったファイルを開かない）。
+            options.create_new(true).mode(0o600);
+        }
+        let file = options.open(path).map_err(|e| {
+            // O_NOFOLLOW による拒否（ELOOP 等）は symlink として報告する。
+            match std::fs::symlink_metadata(path) {
+                Ok(m) if m.file_type().is_symlink() => ConfigError::ConsoleLogIsSymlink {
+                    path: path.to_path_buf(),
+                },
+                _ => open_err(e.kind()),
+            }
+        })?;
         let fd_meta = file.metadata().map_err(|e| open_err(e.kind()))?;
         let post = std::fs::symlink_metadata(path).map_err(|e| open_err(e.kind()))?;
         let fd_id = (fd_meta.dev(), fd_meta.ino());
@@ -589,16 +649,144 @@ impl ConsoleLogPath {
         if swapped {
             return Err(open_err(std::io::ErrorKind::Other));
         }
-        for dev in block_devices {
+        for input in protected {
             // 取得失敗は fail-closed（fd は drop で閉じる）。
-            let disk = file_identity(ConfigField::DiskImage, dev.image.as_path())?;
-            if disk == fd_id {
-                return Err(ConfigError::ConsoleLogConflictsWithDiskImage {
-                    path: path.to_path_buf(),
-                });
+            if file_identity(input.field, input.path)? == fd_id {
+                return Err(conflict_error(input.field, path));
             }
         }
+        check_log_ownership(
+            path,
+            LogFileAttrs {
+                nlink: fd_meta.nlink(),
+                uid: fd_meta.uid(),
+            },
+            crate::sys::effective_uid(),
+        )?;
         Ok(file)
+    }
+}
+
+/// コンソールログの追記先と同一ファイルであってはならない入力（kernel / initrd / ディスクイメージ）。
+#[derive(Debug, Clone, Copy)]
+struct ProtectedInput<'a> {
+    field: ConfigField,
+    path: &'a Path,
+}
+
+/// 照合対象の種別に応じた衝突エラー（`path` はコンソールログ側のパス）。
+fn conflict_error(field: ConfigField, path: &Path) -> ConfigError {
+    match field {
+        ConfigField::Kernel | ConfigField::Initrd => ConfigError::ConsoleLogConflictsWithBootFile {
+            field,
+            path: path.to_path_buf(),
+        },
+        ConfigField::DiskImage | ConfigField::ConsoleLog => {
+            ConfigError::ConsoleLogConflictsWithDiskImage {
+                path: path.to_path_buf(),
+            }
+        }
+    }
+}
+
+/// 検証時点のコンソールログと照合対象の同一性検査（ログが未作成なら検査不要）。
+///
+/// 使用時点の再検査は open 後の fd に対して行う（`ConsoleLogPath::open_for_append_excluding`）。
+fn check_console_log_conflicts(
+    log: &ConsoleLogPath,
+    protected: &[ProtectedInput<'_>],
+) -> Result<(), ConfigError> {
+    match std::fs::symlink_metadata(log.as_path()) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(ConfigError::PathIo {
+                field: ConfigField::ConsoleLog,
+                kind: e.kind(),
+            });
+        }
+    }
+    let log_id = file_identity(ConfigField::ConsoleLog, log.as_path())?;
+    for input in protected {
+        if file_identity(input.field, input.path)? == log_id {
+            return Err(conflict_error(input.field, log.as_path()));
+        }
+    }
+    Ok(())
+}
+
+/// 既存ログファイルの所有・リンク数の判定材料（lstat / fstat から写す。判定を syscall から分離して
+/// 実効 uid 不一致等を root なしでテストできるようにする。REPAIR-12）。
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogFileAttrs {
+    nlink: u64,
+    uid: u32,
+}
+
+/// リンク数 1 かつ所有者が `euid` であることを検査する（MAC-1・TASK-64.3）。
+///
+/// ハードリンクが複数あるファイル（他所の重要ファイルの別名かもしれない）と、他ユーザーが事前作成した
+/// ファイルへは追記しない。リンク数を先に見る（所有者一致でも別名経由の追記は拒否する）。
+#[cfg(unix)]
+fn check_log_ownership(path: &Path, attrs: LogFileAttrs, euid: u32) -> Result<(), ConfigError> {
+    if attrs.nlink != 1 {
+        return Err(ConfigError::ConsoleLogMultipleLinks {
+            path: path.to_path_buf(),
+            links: attrs.nlink,
+        });
+    }
+    if attrs.uid != euid {
+        return Err(ConfigError::ConsoleLogNotOwned {
+            path: path.to_path_buf(),
+            owner: attrs.uid,
+            euid,
+        });
+    }
+    Ok(())
+}
+
+/// unix の他者書き込みビット（`S_IWOTH`）と sticky bit（`S_ISVTX`）。値は POSIX 共通。
+#[cfg(unix)]
+const MODE_OTHER_WRITE: u32 = 0o002;
+#[cfg(unix)]
+const MODE_STICKY: u32 = 0o1000;
+
+/// 親ディレクトリのモードを判定する（他者書き込み可能かつ sticky bit なしなら拒否）。
+///
+/// sticky bit 付き（`/tmp` 等）なら他者は自分のエントリを差し替え・削除できず、他者が事前作成した
+/// ファイルは所有者検査で拒否されるため許可する。
+#[cfg(unix)]
+fn check_parent_mode(parent: &Path, mode: u32) -> Result<(), ConfigError> {
+    if mode & MODE_OTHER_WRITE != 0 && mode & MODE_STICKY == 0 {
+        return Err(ConfigError::ConsoleLogParentWorldWritable {
+            path: parent.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// コンソールログの親ディレクトリが存在するディレクトリで、（unix では）安全なモードであることを検査する。
+fn check_console_log_parent(path: &Path) -> Result<(), ConfigError> {
+    let no_parent = || ConfigError::ConsoleLogParentNotFound {
+        path: path.to_path_buf(),
+    };
+    let parent = path.parent().ok_or_else(no_parent)?;
+    match std::fs::metadata(parent) {
+        Ok(m) if m.is_dir() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                check_parent_mode(parent, m.permissions().mode())?;
+            }
+            Ok(())
+        }
+        Ok(_) => Err(no_parent()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(no_parent()),
+        Err(e) => Err(ConfigError::PathIo {
+            field: ConfigField::ConsoleLog,
+            kind: e.kind(),
+        }),
     }
 }
 
@@ -735,21 +923,6 @@ impl DeviceConfigSpec {
         &self.block_devices
     }
 
-    /// シリアルコンソールのログファイルを追記モードで開く（無ければ `None`）。
-    ///
-    /// 照合対象のディスクイメージはこの検証済み構成自身の `block_devices` に固定され、
-    /// 呼び出し側が省略・差し替えできない。open した fd がいずれかのディスクイメージと同一
-    /// ファイルなら拒否する（検証後のハードリンク差し替え対策。MAC-1・TASK-64.3）。
-    #[cfg(unix)]
-    pub fn open_serial_console_log(&self) -> Result<Option<std::fs::File>, ConfigError> {
-        match &self.serial_console {
-            Some(SerialConsoleSink::LogFile(log)) => {
-                log.open_for_append_excluding(&self.block_devices).map(Some)
-            }
-            None => Ok(None),
-        }
-    }
-
     /// シリアルコンソールの出力先。
     pub fn serial_console(&self) -> Option<&SerialConsoleSink> {
         self.serial_console.as_ref()
@@ -791,9 +964,52 @@ impl VmConfigSpec {
     }
 
     /// デバイス構成を差し替える（TASK-64.3）。
-    pub fn with_devices(mut self, devices: DeviceConfigSpec) -> Self {
+    ///
+    /// コンソールログが既存なら、kernel / initrd / ディスクイメージと同一ファイルでないことを検証する
+    /// （initrd への追記は次回起動時の initramfs 注入になり得る。MAC-1）。フィールドは公開のため
+    /// 生成後に差し替えられ得るが、使用時点の照合は [`build_vz_configuration`] の open が必ず行う。
+    pub fn with_devices(mut self, devices: DeviceConfigSpec) -> Result<Self, ConfigError> {
         self.devices = devices;
-        self
+        if let Some(SerialConsoleSink::LogFile(log)) = self.devices.serial_console() {
+            check_console_log_conflicts(log, &self.protected_inputs())?;
+        }
+        Ok(self)
+    }
+
+    /// コンソールログの追記先と同一ファイルであってはならない入力（kernel・initrd・全ディスクイメージ）。
+    ///
+    /// 自身のフィールドから導出し、呼び出し側が照合対象を省略・差し替えできないようにする。
+    fn protected_inputs(&self) -> Vec<ProtectedInput<'_>> {
+        let mut inputs = Vec::with_capacity(2 + self.devices.block_devices().len());
+        inputs.push(ProtectedInput {
+            field: ConfigField::Kernel,
+            path: self.kernel.as_path(),
+        });
+        if let Some(initrd) = &self.initrd {
+            inputs.push(ProtectedInput {
+                field: ConfigField::Initrd,
+                path: initrd.as_path(),
+            });
+        }
+        inputs.extend(self.devices.block_devices().iter().map(|d| ProtectedInput {
+            field: ConfigField::DiskImage,
+            path: d.image.as_path(),
+        }));
+        inputs
+    }
+
+    /// シリアルコンソールのログファイルを追記モードで開く（無ければ `None`）。
+    ///
+    /// 照合対象（kernel / initrd / ディスクイメージ）は [`Self::protected_inputs`] に固定され、
+    /// 呼び出し側が省略・差し替えできない（MAC-1・TASK-64.3）。
+    #[cfg(unix)]
+    pub fn open_serial_console_log(&self) -> Result<Option<std::fs::File>, ConfigError> {
+        match self.devices.serial_console() {
+            Some(SerialConsoleSink::LogFile(log)) => log
+                .open_for_append_excluding(&self.protected_inputs())
+                .map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -936,9 +1152,9 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
     }
 
     // シリアルコンソール（ここで初めてログファイルを作成・open する）。
-    // 使用時点で fd をディスクイメージと照合する（検証後のハードリンク差し替え対策）。
+    // 使用時点で fd を kernel / initrd / ディスクイメージと照合し、リンク数・所有者も検査する。
     let mut serial = Vec::new();
-    if let Some(file) = spec.devices.open_serial_console_log()? {
+    if let Some(file) = spec.open_serial_console_log()? {
         let handle = crate::sys::new_file_handle(file.into());
         serial.push(crate::sys::new_console_serial_port(&handle));
     }
@@ -1322,11 +1538,12 @@ mod tests {
         let before = std::fs::read(&image).unwrap();
         let link = t.0.join("console.log");
         let log = ConsoleLogPath::try_new(&link).unwrap();
-        let devices = vec![BlockDeviceSpec::root(
-            DiskImagePath::try_new(&image).unwrap(),
-        )];
+        let protected = [ProtectedInput {
+            field: ConfigField::DiskImage,
+            path: &image,
+        }];
         std::fs::hard_link(&image, &link).unwrap();
-        let err = log.open_for_append_excluding(&devices).unwrap_err();
+        let err = log.open_for_append_excluding(&protected).unwrap_err();
         assert_eq!(err.code(), "config.console_log_conflicts_with_disk_image");
         assert_eq!(std::fs::read(&image).unwrap(), before);
     }
@@ -1403,7 +1620,8 @@ mod tests {
         .unwrap();
         let spec = VmConfigSpec::from_parts(&k, None, "console=hvc0 root=/dev/vda")
             .unwrap()
-            .with_devices(devices);
+            .with_devices(devices)
+            .unwrap();
         let cfg = match build_vz_configuration(&spec) {
             Ok(c) => c,
             Err(e) => panic!("build failed: {e}"),

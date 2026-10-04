@@ -66,6 +66,10 @@ const MAX_MOUNTINFO_LINES: usize = 4096;
 const MAX_MOUNTINFO_LINE_LEN: usize = 4096;
 /// マウントに必須の fstype。
 const VIRTIOFS_FSTYPE: &str = "virtiofs";
+/// 結果が不確定な操作（mount のタイムアウト・mount 後の mountinfo 読み取り失敗・umount の失敗）の後で、
+/// 状態を確かめるために mountinfo を読み直す最大回数。各回は `wsl.exe` 呼び出し 1 回で、呼び出しごとの
+/// タイムアウトが適用されるため、回復に要する時間は最大でこの回数 × タイムアウトに収まる（REPAIR-5）。
+const MAX_RECOVERY_READS: usize = 3;
 
 /// Windows の予約デバイス名（拡張子付きでも予約される）。
 const RESERVED_NAMES: [&str; 22] = [
@@ -386,6 +390,10 @@ const MOUNT_SCRIPT: &str = concat!(
 const EXIT_PARENT_BAD: i32 = 70;
 const EXIT_MKDIR_FAILED: i32 = 71;
 const EXIT_PATH_UNSAFE: i32 = 72;
+/// マウントが成立していないと確定できる `mount(8)` の終了コード（1=誤った呼び出し・2=システムエラー・
+/// 32=マウント失敗）。これ以外（16=mtab 書き込みの問題のようにマウント後に起きうるもの・`wsl.exe` 自身の
+/// 異常値・シグナル終了など）は成立の有無が不確定なので、mountinfo を読み直して確かめる。
+const MOUNT_EXIT_NOT_MOUNTED: [i32; 3] = [1, 2, 32];
 
 /// 検証込みマウントコマンドの組み立て。`-t drvfs` が virtiofs で成立するかは実機未検証（TASK-67.6・#377。REPAIR-3）。
 fn mount_argv(distro: &DistroName, m: &SharedMount) -> Vec<String> {
@@ -541,6 +549,50 @@ fn read_mountinfo(distro: &DistroName, exec: Exec<'_>) -> Result<Vec<MountEntry>
     parse_mountinfo(&text)
 }
 
+/// [`read_mountinfo`] を最大 [`MAX_RECOVERY_READS`] 回試み、最初に成功した結果を返す（全回失敗なら `None`）。
+///
+/// 結果が不確定な操作の後で状態を確かめる回復経路専用。一過性の失敗（`wsl.exe` の遅延によるタイムアウト等）で
+/// 所有確認を諦めないための再試行で、回数と呼び出しごとのタイムアウトで所要時間を有界にする（REPAIR-5）。
+fn read_mountinfo_bounded(distro: &DistroName, exec: Exec<'_>) -> Option<Vec<MountEntry>> {
+    (0..MAX_RECOVERY_READS).find_map(|_| read_mountinfo(distro, exec).ok())
+}
+
+/// mount 後（結果不確定の場合を含む）に、マウント先へ新規出現したマウントを特定した結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewMount {
+    /// mount 前に無かったマウント ID のエントリがマウント先にちょうど 1 件ある（本呼び出しのマウント）。
+    Owned(u32),
+    /// マウント先に新規のエントリが無い（マウントは成立していない）。
+    Absent,
+    /// 新規のエントリが複数ある（他プロセスと競合しており、どれが自分のものか確定できない）。
+    Ambiguous,
+    /// mountinfo を上限回数まで読めなかった。
+    Unreadable,
+}
+
+/// mount 前の全マウント ID（`before_ids`）との差分で、マウント先 `guest_path` の新規マウントを特定する。
+///
+/// 正常系の所有確認と、mount のタイムアウト・mountinfo 読み取り失敗後の回復経路で同じ基準を使う
+/// （mount 前にマウント先が空であることは呼び出し側が確認済み）。読み取りは [`read_mountinfo_bounded`] で有界。
+fn identify_new_mount(
+    distro: &DistroName,
+    guest_path: &str,
+    before_ids: &[u32],
+    exec: Exec<'_>,
+) -> NewMount {
+    let Some(entries) = read_mountinfo_bounded(distro, exec) else {
+        return NewMount::Unreadable;
+    };
+    let mut fresh = entries
+        .iter()
+        .filter(|e| e.mount_point == guest_path && !before_ids.contains(&e.mount_id));
+    match (fresh.next(), fresh.next()) {
+        (Some(mine), None) => NewMount::Owned(mine.mount_id),
+        (None, _) => NewMount::Absent,
+        (Some(_), Some(_)) => NewMount::Ambiguous,
+    }
+}
+
 /// 本呼び出しが成立させたマウント 1 件（マウント先とカーネルのマウント ID）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OwnedMount {
@@ -557,10 +609,14 @@ struct OwnedMount {
 /// 残っている場合は、他者のマウントを外せず自分のマウントが残置されるため、未解除として失敗に数える
 /// （呼び出し側が後始末を追跡できるようにする）。記録したマウント ID が mountinfo のどこにも存在しなければ
 /// （外れている）解除済みとして扱う。
+///
+/// mountinfo の読み取りは [`read_mountinfo_bounded`] で有界に再試行する。`umount` が失敗・タイムアウトした
+/// 場合は結果が不確定なため mountinfo を読み直し、記録したマウント ID がどこにも無ければ解除済みとして扱う
+/// （残っている・読めない場合は失敗に数える。再度の `umount` はしない）。
 fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> usize {
     let mut failures = 0;
     for o in owned.iter().rev() {
-        let Ok(entries) = read_mountinfo(distro, exec) else {
+        let Some(entries) = read_mountinfo_bounded(distro, exec) else {
             failures += 1;
             continue;
         };
@@ -570,7 +626,10 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> usize 
                     exec(&umount_argv(distro, &o.guest_path), MAX_OUTPUT_BYTES),
                     Ok(out) if out.success
                 );
-                if !ok {
+                let gone = ok
+                    || read_mountinfo_bounded(distro, exec)
+                        .is_some_and(|after| after.iter().all(|e| e.mount_id != o.mount_id));
+                if !gone {
                     failures += 1;
                 }
             }
@@ -602,11 +661,23 @@ fn with_rollback_note(e: Wsl2Error, failures: usize) -> Wsl2Error {
 /// 1 件のマウント（mount）。mount 前後の mountinfo の差分でマウント ID を特定して `owned` に積む。
 /// パス検証・ディレクトリ作成・mount は [`MOUNT_SCRIPT`] が 1 プロセスで行う（TOCTOU 防止）。
 ///
-/// `before_ids` は mount 前の mountinfo に存在した全マウント ID。mount 後にマウント先へ新規出現した
-/// エントリがちょうど 1 件のときだけ自分のマウントとして記録する。
-/// 0 件・複数件（他プロセスの競合）・mountinfo 読み取り失敗では所有を確認できないため、他者のマウントを
-/// 外さないよう解除せずに失敗を返す（fail-closed。確認できなかったマウントは残置しうる）。
-/// `mount` が失敗・タイムアウトした場合も `owned` に積まない。
+/// `before_ids` は mount 前の mountinfo に存在した全マウント ID。マウント先へ新規出現したエントリが
+/// ちょうど 1 件のときだけ自分のマウントとして記録する（[`identify_new_mount`]）。
+///
+/// mount の結果ごとの扱い:
+/// - 成功: 新規マウントを特定して記録する。特定できなければ（0 件・複数件・mountinfo を上限回数まで読めない）
+///   他者のマウントを外さないよう記録せず、`ownership unconfirmed` の失敗を返す（fail-closed）。
+/// - 成立していないと確定できる失敗（[`MOUNT_SCRIPT`] の検証失敗・[`MOUNT_EXIT_NOT_MOUNTED`]）: 記録しない。
+/// - 結果が不確定な失敗（`wsl.exe` のタイムアウト・出力読み取り失敗・それ以外の終了コード）: ゲスト内で mount が
+///   成立している可能性があるため、同じ差分基準で mountinfo を読み直す回復経路に入る。新規マウントを特定できれば
+///   `owned` に積んで元のエラーを返し、呼び出し側の [`rollback`] がマウント ID を再確認して外す。新規マウントが
+///   無ければ元のエラーをそのまま返す。特定できなければ記録せず `ownership unconfirmed` を付けて返す。
+///   回復の読み取りは [`MAX_RECOVERY_READS`] 回 × 呼び出しごとのタイムアウトで有界（REPAIR-5）。
+///
+/// 差分基準の帰属は、mount 前の確認から mount までの間に別プロセスが同じマウント先へマウントし、かつ自分の
+/// mount が成立しなかった場合には誤りうる（正常系と同じ残余リスク。マウント先は固定基底配下の専用名）。
+/// また、タイムアウト後にゲスト内で遅れて成立したマウントは回復の読み取り後であれば検出できない（実機での
+/// 挙動確認は TASK-67.6・#377。REPAIR-3）。
 fn mount_one(
     distro: &DistroName,
     m: &SharedMount,
@@ -614,43 +685,61 @@ fn mount_one(
     owned: &mut Vec<OwnedMount>,
     exec: Exec<'_>,
 ) -> Result<(), Wsl2Error> {
-    let out = exec(&mount_argv(distro, m), MAX_OUTPUT_BYTES)?;
-    if !out.success {
-        return Err(match out.code {
-            Some(EXIT_PARENT_BAD) => {
-                precondition("the mount base parent directory is missing or unsafe")
+    let failure = match exec(&mount_argv(distro, m), MAX_OUTPUT_BYTES) {
+        Ok(out) if out.success => None,
+        Ok(out) => {
+            let e = match out.code {
+                Some(EXIT_PARENT_BAD) => {
+                    precondition("the mount base parent directory is missing or unsafe")
+                }
+                Some(EXIT_MKDIR_FAILED) => step_failed("creating the mount target", &out),
+                Some(EXIT_PATH_UNSAFE) => precondition(
+                    "a mount path component is not a root-owned, non-writable directory (symlinks are rejected)",
+                ),
+                _ => step_failed("mounting the shared directory", &out),
+            };
+            let settled = out.code.is_some_and(|c| {
+                matches!(c, EXIT_PARENT_BAD | EXIT_MKDIR_FAILED | EXIT_PATH_UNSAFE)
+                    || MOUNT_EXIT_NOT_MOUNTED.contains(&c)
+            });
+            if settled {
+                return Err(e);
             }
-            Some(EXIT_MKDIR_FAILED) => step_failed("creating the mount target", &out),
-            Some(EXIT_PATH_UNSAFE) => precondition(
-                "a mount path component is not a root-owned, non-writable directory (symlinks are rejected)",
-            ),
-            _ => step_failed("mounting the shared directory", &out),
-        });
-    }
+            Some(e)
+        }
+        Err(e) => Some(e),
+    };
     let guest_path = m.guest_path();
     let unconfirmed = |e: Wsl2Error| {
         Wsl2Error::new(
             e.code(),
             format!(
-                "{} (mount ownership unconfirmed; the mount was left in place)",
+                "{} (mount ownership unconfirmed; the mount may have been left in place)",
                 e.message()
             ),
         )
     };
-    let entries = read_mountinfo(distro, exec).map_err(unconfirmed)?;
-    let mut fresh = entries
-        .iter()
-        .filter(|e| e.mount_point == guest_path && !before_ids.contains(&e.mount_id));
-    let (Some(mine), None) = (fresh.next(), fresh.next()) else {
-        return Err(unconfirmed(precondition(
+    match (
+        identify_new_mount(distro, &guest_path, before_ids, exec),
+        failure,
+    ) {
+        (NewMount::Owned(mount_id), failure) => {
+            owned.push(OwnedMount {
+                guest_path,
+                mount_id,
+            });
+            failure.map_or(Ok(()), Err)
+        }
+        (NewMount::Absent, Some(e)) => Err(e),
+        (NewMount::Absent | NewMount::Ambiguous, None) => Err(unconfirmed(precondition(
             "the shared mount could not be uniquely identified after mounting",
-        )));
-    };
-    owned.push(OwnedMount {
-        guest_path,
-        mount_id: mine.mount_id,
-    });
-    Ok(())
+        ))),
+        (NewMount::Ambiguous, Some(e)) => Err(unconfirmed(e)),
+        (NewMount::Unreadable, None) => Err(unconfirmed(precondition(
+            "reading mountinfo after mounting failed",
+        ))),
+        (NewMount::Unreadable, Some(e)) => Err(unconfirmed(e)),
+    }
 }
 
 /// 全マウントが「自分が成立させたマウント ID の最上位エントリ」かつ virtiofs（読み取り専用要求なら ro）
@@ -788,6 +877,8 @@ fn prepare_with_program(
 /// virtiofs 共有マウントを準備する。`timeout` は各 `wsl.exe` 呼び出しに適用する（REPAIR-5）。
 ///
 /// 成功時は全マウントが virtiofs で成立している。失敗時は本呼び出しで作ったマウントを後始末して `Err`。
+/// mount がタイムアウトした等で結果が不確定な場合も mountinfo を読み直して自分のマウントを特定して外す。
+/// 自分のものと確認できないマウントは外さず、メッセージに `mount ownership unconfirmed` を含めて返す。
 /// 成功後のマウントの所有者は呼び出し側で、不要になったら [`release_virtiofs_launch`] で解除する。
 pub fn prepare_virtiofs_launch(
     req: &LaunchRequest,

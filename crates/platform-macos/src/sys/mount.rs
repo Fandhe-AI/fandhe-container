@@ -94,3 +94,26 @@ pub(crate) fn mount_identity(path: &Path) -> io::Result<MountIdentity> {
         mount_on,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MAC-1・TASK-65.1: 同じディレクトリ配下は同じマウント、`/` と `/dev`（devfs）は別マウントになる。
+    #[test]
+    fn mount_identity_distinguishes_mounts() {
+        let dir = std::env::temp_dir().join(format!("fandhe-macos-sys-mnt-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).expect("create fixture");
+        let a = mount_identity(&dir).expect("statfs dir");
+        let b = mount_identity(&dir.join("sub")).expect("statfs sub");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(a, b);
+        let root = mount_identity(Path::new("/")).expect("statfs root");
+        assert_eq!(root.mount_on, b"/".to_vec());
+        let dev = mount_identity(Path::new("/dev")).expect("statfs dev");
+        assert_eq!(dev.mount_on, b"/dev".to_vec());
+        assert_ne!(root, dev);
+        let err = mount_identity(Path::new("/nonexistent-fandhe-mount-test")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+}

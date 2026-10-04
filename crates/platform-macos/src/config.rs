@@ -2393,6 +2393,43 @@ mod tests {
         }
     }
 
+    /// MAC-1・TASK-65.1: 同一デバイスの bind mount（`st_dev` が同じ）もマウント表から検出する。
+    /// root なしでは bind mount を作れないため、mountinfo の fixture 文字列で照合する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_point_under_share_is_detected_from_mountinfo() {
+        let mountinfo = "\
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+40 22 8:1 /x/share /x/share rw,relatime shared:1 - ext4 /dev/sda1 rw
+41 22 8:1 /data /x/share2/sub rw,relatime shared:1 - ext4 /dev/sda1 rw
+42 22 8:1 /etc /x/share/my\\040dir/etc rw,relatime shared:1 - ext4 /dev/sda1 rw
+broken line
+";
+        let share = Path::new("/x/share");
+        // 共有自身のマウント（40）と兄弟 `/x/share2`（41）は対象外で、配下の bind mount（42）を返す。
+        assert_eq!(
+            mount_point_under(mountinfo, share),
+            Some(PathBuf::from("/x/share/my dir/etc"))
+        );
+        assert_eq!(
+            mount_point_under(mountinfo, Path::new("/x/share2/sub")),
+            None
+        );
+        assert_eq!(
+            mount_point_under(mountinfo, Path::new("/x/share/my dir/etc")),
+            None
+        );
+        assert_eq!(
+            unescape_mountinfo("a\\040b\\011c\\x"),
+            b"a b\tc\\x".to_vec()
+        );
+        // 実環境の mountinfo でも `/` 配下のマウント（/proc 等）を検出する。
+        assert!(matches!(
+            reject_mounts_under(Path::new("/")),
+            Err(ConfigError::SharedDirCrossesMount { .. })
+        ));
+    }
+
     /// MAC-1・TASK-65.1: ReadWrite 共有配下の symlink は、リンク先が共有範囲内なら許可し、範囲外
     /// （絶対・相対・ディレクトリ・dangling）・ループは拒否する。ReadOnly 共有は対象外。
     #[cfg(unix)]

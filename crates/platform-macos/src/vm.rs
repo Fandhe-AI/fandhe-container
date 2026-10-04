@@ -1341,6 +1341,43 @@ mod tests {
         );
     }
 
+    /// TASK-64.4: 停止通知が先着して無効化された破棄時停止の失敗は、記録もやり直しもしない。
+    #[test]
+    fn core_drop_stop_failure_after_stop_notification_is_ignored() {
+        let (sink, rx) = event_channel(32);
+        let mut core = Core::new(sink);
+        let err = || Err(("VZErrorDomain".to_string(), 3));
+        // 最後の 1 回で停止通知が先着する場合も含めて確認する。
+        for attempt in 1..u64::from(DROP_STOP_MAX_ATTEMPTS) {
+            assert_eq!(
+                core.request_drop_stop(true, VmState::Running),
+                Some(attempt)
+            );
+            assert!(core.finish_drop_stop(attempt, err()));
+        }
+        let last = u64::from(DROP_STOP_MAX_ATTEMPTS);
+        assert_eq!(core.request_drop_stop(true, VmState::Running), Some(last));
+        drain(&rx);
+        core.apply(LifecycleInput::GuestStopped);
+        assert!(!core.finish_drop_stop(last, err()));
+        assert_eq!(
+            drain(&rx),
+            vec![
+                changed(VmState::Stopping, VmState::Stopped),
+                VmEvent::GuestStopped
+            ]
+        );
+        assert_eq!(core.lifecycle.state(), VmState::Stopped);
+        // 1 回目で停止通知が先着した場合もやり直さない。
+        let (sink, rx) = event_channel(8);
+        let mut core = Core::new(sink);
+        assert_eq!(core.request_drop_stop(true, VmState::Running), Some(1));
+        core.apply(LifecycleInput::StoppedWithError(("D".to_string(), 7)));
+        drain(&rx);
+        assert!(!core.finish_drop_stop(1, err()));
+        assert_eq!(drain(&rx), Vec::<VmEvent>::new());
+    }
+
     /// TASK-64.4: 停止できない間（起動途中・完了待ち）の破棄は印だけ残し、完了後に停止を要求し直す。
     #[test]
     fn core_drop_stop_is_deferred_until_operation_completes() {

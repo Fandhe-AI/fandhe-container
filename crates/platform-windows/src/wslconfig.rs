@@ -17,8 +17,9 @@
 //! - `.wslconfig` は untrusted 入力として扱い、`unwrap` / 添字を使わず、読み込みは [`MAX_WSLCONFIG_BYTES`]
 //!   までに制限する。エラーの `message` に内容・パスを載せない（[`crate::error`]）。
 //! - 書き込みは同一ディレクトリの一時ファイル → fsync → rename の原子的置換。シンボリックリンクは拒否する。
-//!   既存ファイルの置換では、内容を書く前に元のアクセス制御（unix のパーミッション・Windows の DACL）を
-//!   一時ファイルへ写す（Windows の DACL 複製は `sys` の FFI ラッパー）。
+//!   既存ファイルの置換では、内容を書く前に元のアクセス制御（unix のパーミッション・Windows の DACL・
+//!   整合性ラベル・属性）を一時ファイルへ写す（Windows のセキュリティ記述子の複製は `sys` の FFI ラッパー）。
+//!   読み取り専用のファイルは書き換えない。
 //!
 //! パース規則: 入力は UTF-8（先頭 BOM は許容）。NUL は拒否。前後の空白を除いて判定し、空行・`#` / `;`
 //! 始まりのコメント・`[name]`（閉じ括弧の後ろはコメントのみ可）・`key=value` を受理し、それ以外は
@@ -482,6 +483,18 @@ fn load_verified(path: &Path) -> Result<Option<(WslConfig, std::fs::File)>, WinE
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// `FILE_ATTRIBUTE_ENCRYPTED`（EFS 暗号化。winnt.h）。
+#[cfg(windows)]
+const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
+
+/// 置換時に一時ファイルの作成属性として引き継ぐ Windows のファイル属性。HIDDEN（0x2）・SYSTEM（0x4）・
+/// NOT_CONTENT_INDEXED（0x2000）・ENCRYPTED。READONLY は置換自体を拒否するため含めず（[`enable_virtiofs_at`]）、
+/// ARCHIVE は作成時に自動で付くため含めない。圧縮・名前付きストリーム・作成日時・短い名前・オブジェクト ID は
+/// 引き継がない（誰が読み書きできるかに影響しないため）。
+#[cfg(windows)]
+const PRESERVED_ATTRIBUTES: u32 =
+    0x0000_0002 | 0x0000_0004 | 0x0000_2000 | FILE_ATTRIBUTE_ENCRYPTED;
+
 /// 書き込みの意図。読み込み時点でのファイルの有無を呼び出し側から引き継ぐ。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WriteMode {
@@ -510,9 +523,11 @@ fn tmp_path(parent: &Path, tag: &str) -> PathBuf {
 /// 内容を書く前にアクセス制御を確定させる（既定の作成権限のまま書くと、`kernelCommandLine` 等の秘密情報が
 /// 調整までの間だけ漏れうるため）。
 /// - unix: 作成時点から所有者のみ（0600）で作り、`acl_from` があればそのパーミッションへ揃える。
-/// - Windows: `acl_from` があれば WRITE_DAC つきで開き、その DACL を写す（[`crate::sys::copy_dacl`]）。
-///   写せなければ内容を書かずに `Err`（置換を拒否し、元ファイルは変更しない）。`acl_from` がなければ
-///   親ディレクトリから継承した ACL のまま（新規作成時の通常の既定）。
+/// - Windows: `acl_from` があれば WRITE_DAC・WRITE_OWNER つきで、元の属性（[`PRESERVED_ATTRIBUTES`]）を
+///   付けて作り、DACL と整合性ラベルを写す（[`crate::sys::copy_security`]）。元が EFS 暗号化なら一時ファイルも
+///   暗号化されたことを確かめる（平文で書かない）。いずれかを満たせなければ内容を書かずに `Err`（置換を
+///   拒否し、元ファイルは変更しない）。`acl_from` がなければ親ディレクトリから継承した ACL のまま
+///   （新規作成時の通常の既定）。
 fn write_new_file(
     tmp: &Path,
     data: &[u8],
@@ -526,9 +541,16 @@ fn write_new_file(
         opts.mode(0o600);
     }
     #[cfg(windows)]
-    if acl_from.is_some() {
-        use std::os::windows::fs::OpenOptionsExt;
-        opts.access_mode(crate::sys::GENERIC_WRITE | crate::sys::WRITE_DAC);
+    if let Some(src) = acl_from {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        let attrs = src
+            .metadata()
+            .map_err(|e| io_err(&e, "failed to read file attributes"))?
+            .file_attributes();
+        opts.access_mode(
+            crate::sys::GENERIC_WRITE | crate::sys::WRITE_DAC | crate::sys::WRITE_OWNER,
+        )
+        .attributes(attrs & PRESERVED_ATTRIBUTES);
     }
     let mut f = opts
         .open(tmp)
@@ -560,7 +582,27 @@ fn fill_new_file(
                 .map_err(|e| io_err(&e, "failed to copy file permissions"))?;
         }
         #[cfg(windows)]
-        crate::sys::copy_dacl(src, f).map_err(|e| io_err(&e, "failed to copy file ACL"))?;
+        {
+            use std::os::windows::fs::MetadataExt;
+            crate::sys::copy_security(src, f)
+                .map_err(|e| io_err(&e, "failed to copy file access control"))?;
+            let want = src
+                .metadata()
+                .map_err(|e| io_err(&e, "failed to read file attributes"))?
+                .file_attributes()
+                & FILE_ATTRIBUTE_ENCRYPTED;
+            let got = f
+                .metadata()
+                .map_err(|e| io_err(&e, "failed to read file attributes"))?
+                .file_attributes()
+                & FILE_ATTRIBUTE_ENCRYPTED;
+            if want != got {
+                return Err(err(
+                    WinErrorCode::PermissionDenied,
+                    "failed to preserve .wslconfig encryption; refusing to replace it",
+                ));
+            }
+        }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = src;
@@ -599,11 +641,11 @@ fn sync_parent_dir(parent: &Path) -> Result<(), WinError> {
 /// - [`WriteMode::Replace`]: 一時ファイル → fsync → rename で原子的に置き換える（全 OS 共通）。途中で
 ///   強制終了しても宛先は旧内容か新内容のどちらかで、欠損・混在しない。`acl_from`（読み込みに使った
 ///   検証済みハンドル）のアクセス制御を、内容を書く前に一時ファイルへ写す（unix はパーミッション、
-///   Windows は DACL と継承保護の有無。rename は同一ボリューム内でファイル自身のセキュリティ記述子を
-///   保つため、置換後も元の DACL が残る）。Windows で DACL を写せない場合は置換を拒否して `Err`。
-///   所有者・SACL・整合性ラベルは写さない（所有者の変更には特権が要り、新しい所有者は書き込みを行う
-///   本人なので他者へのアクセスは広がらない。SACL は監査用で特権が要る）。rename 後の親ディレクトリの
-///   同期に失敗した場合は置換済みのまま `Err` を返す。
+///   Windows は DACL と継承保護の有無・整合性ラベル・HIDDEN 等の属性・EFS 暗号化。rename は同一ボリューム内で
+///   ファイル自身のセキュリティ記述子を保つため、置換後も元のアクセス制御が残る）。Windows でこれらを
+///   保てない場合は置換を拒否して `Err`。所有者・監査用 SACL は写さない（所有者の変更には特権が要り、
+///   新しい所有者は書き込みを行う本人なので他者へのアクセスは広がらない。監査用 SACL は特権が要り、
+///   アクセス可否に影響しない）。rename 後の親ディレクトリの同期に失敗した場合は置換済みのまま `Err` を返す。
 ///
 /// 失敗時は自分が作った一時ファイルだけを削除する。読み込みから書き込みまでの間の他プロセスによる
 /// 変更はロックしない（単一ユーザーのホーム配下の設定操作のため許容。新規作成の競合のみ上記で拒否する）。
@@ -647,8 +689,10 @@ fn write_atomic(
 /// `path` の `.wslconfig` に `virtiofs=true` を opt-in する（読み込み → 編集 → 原子的書き込み）。
 ///
 /// ファイルがなければ新規作成（親ディレクトリは作らず、なければ `NOT_FOUND`）。すでに有効なら書き込まない。
-/// 既存ファイルの置換では元のアクセス制御（unix のパーミッション・Windows の DACL）を保ち、保てなければ
-/// 置換しない。`Err` のとき通常は元のファイルを変更しない。例外として unix で公開（新規作成の
+/// 既存ファイルの置換では元のアクセス制御（unix のパーミッション・Windows の DACL・整合性ラベル・暗号化）を
+/// 保ち、保てなければ置換しない。読み取り専用（unix は書き込みビットなし、Windows は READONLY 属性）の
+/// ファイルは利用者の変更防止の意思として扱い、書き換えずに `PERMISSION_DENIED` を返す（有効化済みなら
+/// 書き込み不要のため `AlreadyEnabled`）。`Err` のとき通常は元のファイルを変更しない。例外として unix で公開（新規作成の
 /// hard_link・置換の rename）後の親ディレクトリ fsync に失敗した場合は、作成・置換済みのまま `Err` に
 /// なりうる。TASK-67.4（#375）の起動ロジックから呼ばれる想定。
 pub fn enable_virtiofs_at(path: &Path) -> Result<EnableOutcome, WinError> {
@@ -660,6 +704,19 @@ pub fn enable_virtiofs_at(path: &Path) -> Result<EnableOutcome, WinError> {
     let edit = cfg.enable_virtiofs();
     if edit == VirtiofsEdit::AlreadyEnabled {
         return Ok(EnableOutcome::AlreadyEnabled);
+    }
+    if let Some(src) = &source {
+        let readonly = src
+            .metadata()
+            .map_err(|e| io_err(&e, "failed to stat .wslconfig"))?
+            .permissions()
+            .readonly();
+        if readonly {
+            return Err(err(
+                WinErrorCode::PermissionDenied,
+                ".wslconfig is read-only; refusing to modify it",
+            ));
+        }
     }
     let text = cfg.render();
     if text.len() as u64 > MAX_WSLCONFIG_BYTES {

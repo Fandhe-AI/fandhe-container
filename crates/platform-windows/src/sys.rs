@@ -2,9 +2,10 @@
 //! オーナー決定 2026-09-27〔[#4](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856057084)・
 //! [範囲限定](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856167174)〕）。
 //!
-//! 提供機能は [`copy_dacl`] のみ。`wslconfig` の既存 `.wslconfig` 置換（TASK-67.2・#373・WIN-2）が、
-//! 一時ファイルへ内容を書く前に元ファイルの DACL を写し、rename 後もアクセス制御が後退しないようにする
-//! （親ディレクトリからの継承 ACL への置き換わりで `kernelCommandLine` 等が他ユーザーに読まれるのを防ぐ）。
+//! 提供機能は [`copy_security`] のみ。`wslconfig` の既存 `.wslconfig` 置換（TASK-67.2・#373・WIN-2）が、
+//! 一時ファイルへ内容を書く前に元ファイルの DACL・整合性ラベルを写し、rename 後もアクセス制御が後退しない
+//! ようにする（親ディレクトリからの継承 ACL への置き換わりで `kernelCommandLine` 等が他ユーザーに読まれる
+//! のを防ぐ）。
 //!
 //! # 不変条件
 //! - `unsafe` は本モジュール内に閉じ、公開するのは安全な関数のみ（`unsafe fn` を外へ出さない）。
@@ -27,11 +28,15 @@ const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
 const UNPROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x2000_0000;
 /// `SE_DACL_PROTECTED`（`SECURITY_DESCRIPTOR_CONTROL` のビット。winnt.h）。
 const SE_DACL_PROTECTED: u16 = 0x1000;
+/// `LABEL_SECURITY_INFORMATION`（winnt.h）。SACL のうち整合性ラベル（mandatory label）だけを対象にする。
+const LABEL_SECURITY_INFORMATION: u32 = 0x0000_0010;
 /// `ERROR_SUCCESS`。
 const ERROR_SUCCESS: u32 = 0;
 
-/// `WRITE_DAC`（winnt.h）。[`copy_dacl`] の宛先ハンドルはこの権限つきで開く必要がある。
+/// `WRITE_DAC`（winnt.h）。[`copy_security`] の宛先ハンドルはこの権限つきで開く必要がある。
 pub(crate) const WRITE_DAC: u32 = 0x0004_0000;
+/// `WRITE_OWNER`（winnt.h）。整合性ラベルの設定に必要で、[`copy_security`] の宛先ハンドルに要る。
+pub(crate) const WRITE_OWNER: u32 = 0x0008_0000;
 /// `GENERIC_WRITE`（winnt.h）。
 pub(crate) const GENERIC_WRITE: u32 = 0x4000_0000;
 
@@ -84,8 +89,8 @@ impl Drop for LocalSecurityDescriptor {
     fn drop(&mut self) {
         if !self.0.is_null() {
             // SAFETY: `self.0` は `GetSecurityInfo` が成功時に LocalAlloc で返した SD で、本型だけが所有し、
-            // 解放はこの 1 回だけ行う。解放後に参照する DACL ポインタは本型の生存期間内でしか使わない
-            // （[`copy_dacl`] が `SetSecurityInfo` の完了後に本値を落とす）。
+            // 解放はこの 1 回だけ行う。SD の内部を指す ACL ポインタは本型の生存期間内でしか使わない
+            // （[`copy_security`] が `SetSecurityInfo` の完了後に本値を落とす）。
             unsafe {
                 LocalFree(self.0);
             }
@@ -93,29 +98,36 @@ impl Drop for LocalSecurityDescriptor {
     }
 }
 
-/// `src` の DACL（と継承保護の有無）を `dst` へ写す。
-///
-/// `src` は READ_CONTROL を含む権限（`read(true)` の GENERIC_READ）で、`dst` は [`WRITE_DAC`] を含む権限で
-/// 開いたハンドルであること（満たさなければ `Err`）。所有者・SACL・整合性ラベルは写さない（所有者の
-/// 変更には SeRestorePrivilege が要り、SACL は監査用で SeSecurityPrivilege が要るため。呼び出し側の
-/// 文書を参照）。NULL DACL（全員にフルアクセス）の元ファイルは NULL DACL のまま写す（元より広げない）。
-/// 継承保護の有無も元と揃える。`dst` が `src` と同じディレクトリにあれば、親から継承される ACE も同一に
-/// なり、実効的なアクセス制御は元ファイルと一致する。
-pub(crate) fn copy_dacl(src: &File, dst: &File) -> std::io::Result<()> {
-    let mut dacl: *mut c_void = std::ptr::null_mut();
+/// 取得する ACL の種類。
+#[derive(Clone, Copy)]
+enum AclKind {
+    /// DACL（`DACL_SECURITY_INFORMATION`）。
+    Dacl,
+    /// 整合性ラベルだけを含む SACL（`LABEL_SECURITY_INFORMATION`。READ_CONTROL で読める）。
+    Label,
+}
+
+/// `handle` の SD から `kind` の ACL を取得する。戻り値の ACL ポインタは SD の内部（または NULL）を指し、
+/// 返した [`LocalSecurityDescriptor`] の生存中だけ有効。
+fn get_acl(src: &File, kind: AclKind) -> std::io::Result<(LocalSecurityDescriptor, *mut c_void)> {
+    let mut acl: *mut c_void = std::ptr::null_mut();
     let mut sd: *mut c_void = std::ptr::null_mut();
-    // SAFETY: `src` は生存中の `File` が所有する有効なハンドル。出力引数 `dacl`・`sd` は有効なローカル変数を
-    // 指し、不要な owner / group / sacl には NULL を渡す（API 仕様で許容）。成功時に返る `sd` は直後に
-    // `LocalSecurityDescriptor` が所有し、全経路で 1 回だけ解放される。
+    let (info, dacl_out, sacl_out): (u32, *mut *mut c_void, *mut *mut c_void) = match kind {
+        AclKind::Dacl => (DACL_SECURITY_INFORMATION, &mut acl, std::ptr::null_mut()),
+        AclKind::Label => (LABEL_SECURITY_INFORMATION, std::ptr::null_mut(), &mut acl),
+    };
+    // SAFETY: `src` は生存中の `File` が所有する有効なハンドル。出力引数 `dacl_out` / `sacl_out` の一方と `sd`
+    // は有効なローカル変数を指し、要求しない owner / group と他方の ACL には NULL を渡す（API 仕様で許容）。
+    // 成功時に返る `sd` は直後に `LocalSecurityDescriptor` が所有し、全経路で 1 回だけ解放される。
     let rc = unsafe {
         GetSecurityInfo(
             src.as_raw_handle(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            info,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut dacl,
-            std::ptr::null_mut(),
+            dacl_out,
+            sacl_out,
             &mut sd,
         )
     };
@@ -128,10 +140,26 @@ pub(crate) fn copy_dacl(src: &File, dst: &File) -> std::io::Result<()> {
             "GetSecurityInfo returned no descriptor",
         ));
     }
+    Ok((sd, acl))
+}
+
+/// `src` のアクセス制御（DACL と継承保護の有無・整合性ラベル）を `dst` へ写す。
+///
+/// `src` は READ_CONTROL を含む権限（`read(true)` の GENERIC_READ）で、`dst` は [`WRITE_DAC`] と
+/// [`WRITE_OWNER`]（整合性ラベルの設定に必要）を含む権限で開いたハンドルであること（満たさなければ `Err`）。
+/// - DACL: NULL DACL（全員にフルアクセス）は NULL DACL のまま写す（元より広げない）。継承保護の有無も揃える。
+///   `dst` が `src` と同じディレクトリにあれば、親から継承される ACE も同一になり、実効的な DACL は一致する。
+/// - 整合性ラベル: 元のラベル ACL をそのまま設定する（ラベルがなければ空の ACL で「ラベルなし」を写す）。
+///   呼び出し元の整合性レベルより高いラベルなど設定できない場合は `Err`（呼び出し側は置換を拒否する）。
+/// - 写さないもの: 所有者（変更には SeRestorePrivilege が要る。新しい所有者は書き込みを行う本人で、他者への
+///   アクセスは広がらない）、監査用 SACL（SeSecurityPrivilege が要り、アクセス可否に影響しない）。
+pub(crate) fn copy_security(src: &File, dst: &File) -> std::io::Result<()> {
+    let (dacl_sd, dacl) = get_acl(src, AclKind::Dacl)?;
     let mut control: u16 = 0;
     let mut revision: u32 = 0;
-    // SAFETY: `sd.0` は上で取得した有効な SD（`sd` の生存中は解放されない）。出力引数は有効なローカル変数。
-    let ok = unsafe { GetSecurityDescriptorControl(sd.0, &mut control, &mut revision) };
+    // SAFETY: `dacl_sd.0` は `get_acl` が取得した有効な SD（`dacl_sd` の生存中は解放されない）。
+    // 出力引数は有効なローカル変数。
+    let ok = unsafe { GetSecurityDescriptorControl(dacl_sd.0, &mut control, &mut revision) };
     if ok == 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -140,8 +168,8 @@ pub(crate) fn copy_dacl(src: &File, dst: &File) -> std::io::Result<()> {
     } else {
         UNPROTECTED_DACL_SECURITY_INFORMATION
     };
-    // SAFETY: `dst` は生存中の `File` が所有する有効なハンドル。`dacl` は `sd` の内部（または NULL DACL を
-    // 表す NULL）を指し、`sd` はこの呼び出しの完了後まで解放されない（`sd` の drop は関数末尾）。
+    // SAFETY: `dst` は生存中の `File` が所有する有効なハンドル。`dacl` は `dacl_sd` の内部（または NULL DACL を
+    // 表す NULL）を指し、`dacl_sd` はこの呼び出しの完了後まで解放されない（下の `drop` が呼び出しの後）。
     // owner / group / sacl は変更しないため NULL を渡す（DACL_SECURITY_INFORMATION のみ指定）。
     let rc = unsafe {
         SetSecurityInfo(
@@ -154,7 +182,30 @@ pub(crate) fn copy_dacl(src: &File, dst: &File) -> std::io::Result<()> {
             std::ptr::null(),
         )
     };
-    drop(sd);
+    drop(dacl_sd);
+    if rc != ERROR_SUCCESS {
+        return Err(win32_error(rc));
+    }
+
+    let (label_sd, label) = get_acl(src, AclKind::Label)?;
+    if label.is_null() {
+        return Ok(());
+    }
+    // SAFETY: `dst` は生存中の `File` が所有する有効なハンドル。`label` は `label_sd` の内部を指す非 NULL の
+    // ACL で、`label_sd` はこの呼び出しの完了後まで解放されない（下の `drop` が呼び出しの後）。
+    // LABEL_SECURITY_INFORMATION のみ指定し、owner / group / dacl は変更しないため NULL を渡す。
+    let rc = unsafe {
+        SetSecurityInfo(
+            dst.as_raw_handle(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            label,
+        )
+    };
+    drop(label_sd);
     if rc != ERROR_SUCCESS {
         return Err(win32_error(rc));
     }
@@ -196,7 +247,7 @@ mod tests {
 
     /// WIN-2・TASK-67.2: 元ファイルの明示 ACE と継承保護が宛先へそのまま写る（icacls の出力が一致する）。
     #[test]
-    fn copy_dacl_reproduces_explicit_and_protected_dacl() {
+    fn copy_security_reproduces_explicit_and_protected_dacl() {
         let d = TmpDir(std::env::temp_dir().join(format!("fc-sys-dacl-{}", std::process::id())));
         std::fs::create_dir_all(&d.0).expect("mkdir");
         std::fs::write(d.0.join("src"), b"x").expect("write src");
@@ -211,10 +262,10 @@ mod tests {
         let src = File::open(d.0.join("src")).expect("open src");
         let dst = std::fs::OpenOptions::new()
             .write(true)
-            .access_mode(GENERIC_WRITE | WRITE_DAC)
+            .access_mode(GENERIC_WRITE | WRITE_DAC | WRITE_OWNER)
             .open(d.0.join("dst"))
             .expect("open dst");
-        copy_dacl(&src, &dst).expect("copy_dacl");
+        copy_security(&src, &dst).expect("copy_security");
         drop(dst);
         let dst_after = icacls(&d.0, &["dst"]).replacen("dst", "", 1);
         assert_eq!(dst_after, src_acl);
@@ -222,7 +273,7 @@ mod tests {
 
     /// WIN-2: WRITE_DAC なしで開いた宛先には写せず `Err`（失敗を握りつぶさない）。
     #[test]
-    fn copy_dacl_without_write_dac_fails() {
+    fn copy_security_without_write_dac_fails() {
         let d = TmpDir(std::env::temp_dir().join(format!("fc-sys-nodac-{}", std::process::id())));
         std::fs::create_dir_all(&d.0).expect("mkdir");
         std::fs::write(d.0.join("src"), b"x").expect("write src");
@@ -232,7 +283,7 @@ mod tests {
             .write(true)
             .open(d.0.join("dst"))
             .expect("open dst");
-        let e = copy_dacl(&src, &dst).expect_err("must fail");
+        let e = copy_security(&src, &dst).expect_err("must fail");
         assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

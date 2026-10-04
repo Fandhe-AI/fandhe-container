@@ -1512,6 +1512,18 @@ mod tests {
         assert!(MOUNT_SCRIPT.contains(
             "[ \"$n\" = 1 ] || new=none; printf '%s\\n' \"$new\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" || :; [ \"$new\" = none ] || printf '%s\\n' \"$new\"; exit \"$rc\""
         ));
+        assert_eq!(
+            clear_argv(&d, "00ff").get(5..),
+            Some(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    CLEAR_SCRIPT.to_string(),
+                    "sh".to_string(),
+                    "00ff".to_string()
+                ][..]
+            )
+        );
         // 回復時は claim を先に取って遅れての mount を止め、取れなければ記録を読む。
         assert!(RECORD_SCRIPT.contains(
             "chk \"$R\" || exit 202; if mkdir -- \"$R/$1.claim\" 2>/dev/null; then exit 204; fi; [ -e \"$R/$1\" ] || exit 206; exec cat -- \"$R/$1\""
@@ -1668,6 +1680,8 @@ mod tests {
         defer_mount: bool,
         /// `defer_mount` で残した mount 呼び出しの引数。
         deferred: Option<Vec<String>>,
+        /// CLEAR_SCRIPT の呼び出し回数。
+        clears: usize,
         /// 記録の読み取り回数。
         record_reads: usize,
         /// true なら記録の読み取りを `TIMEOUT` にする。
@@ -1722,6 +1736,7 @@ mod tests {
                 claims: std::collections::HashSet::new(),
                 defer_mount: false,
                 deferred: None,
+                clears: 0,
                 record_reads: 0,
                 fail_record_read: false,
                 drop_record: false,
@@ -1933,6 +1948,13 @@ mod tests {
                         None => fail_cat(206),
                     }
                 }
+                ["sh", "-c", script, "sh", nonce] if *script == CLEAR_SCRIPT => {
+                    // CLEAR_SCRIPT の模擬: 記録と claim を消す。
+                    self.clears += 1;
+                    self.records.remove(*nonce);
+                    self.claims.remove(*nonce);
+                    ok(String::new())
+                }
                 ["sh", "-c", script, "sh", target, id, nonce] if *script == UMOUNT_SCRIPT => {
                     // UMOUNT_SCRIPT の模擬: 最上位のマウント ID が記録値と一致するときだけ外す（不一致は 203）。
                     self.umounts.push((*target).to_string());
@@ -2042,6 +2064,8 @@ mod tests {
         // 失敗した c は成立していない（他者のマウントかもしれない）ので外さず、成立済みの b・a だけを外す。
         assert_eq!(g.umounts, ["/mnt/fandhe/b", "/mnt/fandhe/a"]);
         assert_eq!(g.mounts.len(), 1);
+        // 解除した a・b の記録も、成立しなかった c の記録（none）も残らない。
+        assert!(g.records.is_empty() && g.claims.is_empty());
     }
 
     /// 既存マウントがあれば何も外さずエラー、virtiofs 未設定ならマウントを試みない。
@@ -2181,6 +2205,9 @@ mod tests {
         assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
         assert!(e.message().contains("ownership unconfirmed"));
         assert!(g.umounts.is_empty());
+        // MOUNT_SCRIPT は終了済み（記録は none）なので、記録と claim は消す。
+        assert_eq!(g.clears, 1);
+        assert!(g.records.is_empty() && g.claims.is_empty());
     }
 
     /// SEC: 読み取り専用要求なのに ro でマウントされていなければ解除してエラーにする。
@@ -2286,6 +2313,8 @@ mod tests {
         assert_eq!(failures, 0);
         assert_eq!(g.umounts, ["/mnt/fandhe/b"]);
         assert!(g.mounts.iter().any(|(m, _)| m == "/mnt/fandhe/a"));
+        // 自分のマウントはどちらも残っていないので、記録も残らない。
+        assert!(g.records.is_empty() && g.claims.is_empty());
     }
 
     /// SEC: 記録したマウント ID が別のマウント先へ移されて残っている場合は、解除失敗として数える。
@@ -2307,7 +2336,9 @@ mod tests {
         g.mounts.remove(i);
         g.ids.remove(i);
         g.opts.remove(i);
+        assert_eq!(g.records.len(), 1);
         assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)), 0);
+        assert!(g.records.is_empty() && g.claims.is_empty());
     }
 
     /// 起動ステップが失敗したら準備済みマウントを逆順に解除する。成功時は解除しない。
@@ -2668,5 +2699,9 @@ mod tests {
         assert_eq!(out.code, Some(EXIT_CLAIM_FAILED));
         assert_eq!(g.ids, [1]);
         assert!(g.umounts.is_empty());
+        // 回復時に取った claim は柵として残し（消すと遅れた処理が取り直せる）、記録は作られない。
+        assert_eq!(g.claims.len(), 1);
+        assert!(g.records.is_empty());
+        assert_eq!(g.clears, 0);
     }
 }

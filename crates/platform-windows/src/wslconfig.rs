@@ -1090,8 +1090,41 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
-    /// WIN-2・TASK-67.2（レビュー指摘 P0）: 既存ファイルの置換後も個別設定した DACL（明示 ACE と継承保護）が
-    /// 保たれ、親ディレクトリから継承した既定 ACL に置き換わらない。
+    /// WIN-2・TASK-67.2（レビュー指摘 P1）: 読み取り専用のファイルは書き換えず PERMISSION_DENIED。
+    /// 有効化済みなら書き込み不要のため AlreadyEnabled（全 OS）。
+    #[test]
+    fn read_only_file_is_not_modified() {
+        let d = TmpDir::new("readonly");
+        std::fs::write(d.file(), "[wsl2]\nmemory=4GB\n").expect("write");
+        let set_readonly = |on: bool| {
+            let mut perm = std::fs::metadata(d.file()).expect("stat").permissions();
+            perm.set_readonly(on);
+            std::fs::set_permissions(d.file(), perm).expect("chmod");
+        };
+        set_readonly(true);
+        let e = enable_virtiofs_at(&d.file()).expect_err("must refuse");
+        assert_eq!(e.code(), WinErrorCode::PermissionDenied);
+        assert_eq!(
+            e.message(),
+            ".wslconfig is read-only; refusing to modify it"
+        );
+        assert_eq!(
+            std::fs::read(d.file()).expect("read"),
+            b"[wsl2]\nmemory=4GB\n"
+        );
+        assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
+        set_readonly(false);
+        std::fs::write(d.file(), "[wsl2]\nvirtiofs=true\n").expect("write");
+        set_readonly(true);
+        assert_eq!(
+            enable_virtiofs_at(&d.file()),
+            Ok(EnableOutcome::AlreadyEnabled)
+        );
+        set_readonly(false);
+    }
+
+    /// WIN-2・TASK-67.2（レビュー指摘 P0）: 既存ファイルの置換後も個別設定した DACL（明示 ACE と継承保護）・
+    /// 整合性ラベル・HIDDEN 属性が保たれ、親ディレクトリから継承した既定 ACL に置き換わらない。
     #[cfg(windows)]
     #[test]
     fn enable_virtiofs_preserves_windows_dacl() {
@@ -1101,6 +1134,14 @@ mod tests {
         // 継承 ACE を明示 ACE に変換して保護し、LOCAL SERVICE（S-1-5-19）の読み取りを明示 ACE として加える。
         icacls(&d.0, &[".wslconfig", "/inheritance:d"]);
         icacls(&d.0, &[".wslconfig", "/grant", "*S-1-5-19:R"]);
+        // 明示の整合性ラベル（Low。どの整合性レベルのプロセスからも設定できる）と HIDDEN 属性を付ける。
+        icacls(&d.0, &[".wslconfig", "/setintegritylevel", "L"]);
+        let attrib = std::process::Command::new("attrib")
+            .args(["+h", ".wslconfig"])
+            .current_dir(&d.0)
+            .status()
+            .expect("attrib");
+        assert!(attrib.success(), "attrib +h failed: {attrib:?}");
         let before = icacls(&d.0, &[".wslconfig"]);
         let inherited = icacls(&d.0, &["fresh"]).replacen("fresh", ".wslconfig", 1);
         assert_ne!(
@@ -1114,6 +1155,12 @@ mod tests {
             b"[wsl2]\nmemory=4GB\nvirtiofs=true\n"
         );
         assert_eq!(icacls(&d.0, &[".wslconfig"]), before);
+        let attrs = {
+            use std::os::windows::fs::MetadataExt;
+            std::fs::metadata(d.file()).expect("stat").file_attributes()
+        };
+        // FILE_ATTRIBUTE_HIDDEN（0x2）が残り、READONLY（0x1）は付かない。
+        assert_eq!(attrs & 0x3, 0x2);
         let mut entries = d.entries();
         entries.sort();
         assert_eq!(entries, vec![".wslconfig".to_string(), "fresh".to_string()]);

@@ -245,9 +245,10 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
-    /// WIN-2・TASK-67.2: 元ファイルの明示 ACE と継承保護が宛先へそのまま写る（icacls の出力が一致する）。
+    /// WIN-2・TASK-67.2: 元ファイルの明示 ACE・継承保護・整合性ラベルが宛先へそのまま写る
+    /// （icacls の出力が一致する）。
     #[test]
-    fn copy_security_reproduces_explicit_and_protected_dacl() {
+    fn copy_security_reproduces_dacl_and_integrity_label() {
         let d = TmpDir(std::env::temp_dir().join(format!("fc-sys-dacl-{}", std::process::id())));
         std::fs::create_dir_all(&d.0).expect("mkdir");
         std::fs::write(d.0.join("src"), b"x").expect("write src");
@@ -255,6 +256,8 @@ mod tests {
         // 継承を明示 ACE に変換して保護し、LOCAL SERVICE（S-1-5-19）の読み取りを明示 ACE として加える。
         icacls(&d.0, &["src", "/inheritance:d"]);
         icacls(&d.0, &["src", "/grant", "*S-1-5-19:R"]);
+        // 明示の整合性ラベル（Low。どの整合性レベルのプロセスからも設定できる）を付ける。
+        icacls(&d.0, &["src", "/setintegritylevel", "L"]);
         let src_acl = icacls(&d.0, &["src"]).replacen("src", "", 1);
         let dst_before = icacls(&d.0, &["dst"]).replacen("dst", "", 1);
         assert_ne!(src_acl, dst_before, "test setup must differ");

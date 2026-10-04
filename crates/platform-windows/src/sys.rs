@@ -471,6 +471,46 @@ mod windows {
             assert_ne!(a1, b);
         }
 
+        /// WIN-2: 整合性ラベル ACL のバイト列から（ポリシー, 整合性レベル RID）を取り出す。ラベル ACE が
+        /// なければ `Some(None)`、壊れた形式は `None`。
+        #[test]
+        fn parse_label_acl_extracts_policy_and_level() {
+            // ACL ヘッダ（rev 2・AclSize 28・AceCount 1）+ SYSTEM_MANDATORY_LABEL_ACE（size 20・NW・S-1-16-4096）。
+            let low: [u8; 28] = [
+                2, 0, 28, 0, 1, 0, 0, 0, 0x11, 0, 20, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 16, 0x00,
+                0x10, 0, 0,
+            ];
+            assert_eq!(parse_label_acl(&low), Some(Some((1, 0x1000))));
+            assert_eq!(parse_label_acl(&[2, 0, 8, 0, 0, 0, 0, 0]), Some(None));
+            assert_eq!(parse_label_acl(low.get(..20).expect("slice")), None);
+        }
+
+        /// WIN-2（レビュー指摘 P1）: 元ファイルにラベルがなく、宛先が親ディレクトリから別のラベルを継承した場合は
+        /// 再現できないため `Err`（PermissionDenied）。
+        #[test]
+        fn copy_security_rejects_inherited_label_mismatch() {
+            let d =
+                TmpDir(std::env::temp_dir().join(format!("fc-sys-label-{}", std::process::id())));
+            let plain = d.0.join("plain");
+            let labeled = d.0.join("labeled");
+            std::fs::create_dir_all(&plain).expect("mkdir plain");
+            std::fs::create_dir_all(&labeled).expect("mkdir labeled");
+            std::fs::write(plain.join("src"), b"x").expect("write src");
+            // 新しく作るファイルへ継承される Low ラベルをディレクトリに付けてから宛先を作る。
+            icacls(&d.0, &["labeled", "/setintegritylevel", "(OI)(CI)L"]);
+            let src = File::open(plain.join("src")).expect("open src");
+            let dst = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .access_mode(GENERIC_WRITE | WRITE_DAC | WRITE_OWNER)
+                .open(labeled.join("dst"))
+                .expect("create dst");
+            assert_eq!(integrity_label(&src).expect("src label"), None);
+            assert_eq!(integrity_label(&dst).expect("dst label"), Some((1, 0x1000)));
+            let e = copy_security(&src, &dst).expect_err("must fail");
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+
         /// WIN-2: WRITE_DAC なしで開いた宛先には写せず `Err`（失敗を握りつぶさない）。
         #[test]
         fn copy_security_without_write_dac_fails() {

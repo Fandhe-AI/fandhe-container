@@ -13,12 +13,13 @@
 //!
 //! キュー制約（TASK-64.4）: `VZVirtualMachine` の操作・completion handler・delegate は、その VM 専用の
 //! シリアル `DispatchQueue` 上でのみ行う。`VmHost` が VM と delegate を `QueueBound` に包んで保持し、
-//! 操作は `VmHost::run_async` / `run_sync` のクロージャ（キュー上で実行される）にだけ `VmRef` として渡す。
+//! 操作は `VmHost::run_async` / `run_timeout` のクロージャ（キュー上で実行される）にだけ `VmRef` として渡す。
 //! `VmRef` は本モジュール外で生成できないため、キュー外から VM を触る経路は型として存在しない。
 
 use std::mem::ManuallyDrop;
 use std::os::fd::{IntoRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
@@ -342,7 +343,7 @@ struct VmObjects {
 struct QueueBound<T>(T);
 
 // SAFETY: 中身（VZVirtualMachine・delegate）は ObjC オブジェクトで `Send` ではないが、`VmHost` は
-// 中身を参照・解放するコードを VM の専用シリアルキュー上のクロージャ（`run_async` / `run_sync` / Drop）
+// 中身を参照・解放するコードを VM の専用シリアルキュー上のクロージャ（`run_async` / `run_timeout` / Drop）
 // にだけ置く。包みを別スレッドへ動かしても、中身を触るのは常にそのキューのスレッドである。
 unsafe impl<T> Send for QueueBound<T> {}
 // SAFETY: 上記と同じ不変条件。共有参照越しに中身へ到達できるのもキュー上のクロージャだけ。
@@ -429,7 +430,8 @@ impl VmHost {
             queue,
             objs: ManuallyDrop::new(Arc::new(QueueBound(VmObjects { vm, delegate }))),
         };
-        host.run_sync(|vm| {
+        // 専用キューはシリアルのため、後続の操作より先に実行される。完了待ちはしない（無期限 block の回避。REPAIR-5）。
+        host.run_async(|vm| {
             let proto = ProtocolObject::from_ref(&*vm.0.delegate);
             // SAFETY: delegate は weak 参照のため、`VmObjects` が VM と同じ寿命で強参照を保持する。VM キュー上で呼ぶ。
             unsafe { vm.0.vm.setDelegate(Some(proto)) };
@@ -447,16 +449,20 @@ impl VmHost {
         });
     }
 
-    /// VM キュー上でクロージャを同期実行して結果を返す。VM キュー上から呼ぶとデッドロックする。
+    /// VM キュー上でクロージャを実行し、結果を `timeout` まで待つ（`run_async` ＋ チャネル。REPAIR-5）。
     ///
-    /// 実行されなかった場合（通常は起きない）は `None`。
-    pub(crate) fn run_sync<R: Send>(&self, f: impl FnOnce(&VmRef) -> R + Send) -> Option<R> {
-        let objs: &Arc<QueueBound<VmObjects>> = &self.objs;
-        let mut out = None;
-        self.queue.exec_sync(|| {
-            out = Some(f(&VmRef(&objs.0)));
+    /// キューが詰まった場合や VM キュー上から呼んだ場合も期限で戻る。期限切れ・実行されなかった場合は `None`
+    /// （クロージャは後からキュー上で実行され得る）。
+    pub(crate) fn run_timeout<R: Send + 'static>(
+        &self,
+        timeout: Duration,
+        f: impl FnOnce(&VmRef) -> R + Send + 'static,
+    ) -> Option<R> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<R>(1);
+        self.run_async(move |vm| {
+            let _ = tx.try_send(f(vm));
         });
-        out
+        rx.recv_timeout(timeout).ok()
     }
 }
 

@@ -205,6 +205,9 @@ pub(crate) enum LifecycleInput {
 }
 
 /// 状態遷移を決める純粋な状態機械。FFI を持たない。
+///
+/// 完了入力（`StartCompleted(Err)` → `Error`、`StopCompleted(Err)` → `Running`）は仮の遷移で、VZ の実状態
+/// （例: 起動失敗後に `Stopped`）と食い違い得る。実状態は `Vm::state()` が正で、実状態への追従は TASK-64.5 で扱う。
 #[derive(Debug)]
 pub(crate) struct Lifecycle {
     state: VmState,
@@ -377,10 +380,10 @@ mod mac {
             self.run_op(VmOp::Stop)
         }
 
-        /// フレームワークが報告する現在の状態。取得できなければ `Unknown(-1)`。
+        /// フレームワークが報告する現在の状態。`op_timeout` 内に取得できなければ `Unknown(-1)`（REPAIR-5）。
         pub fn state(&self) -> VmState {
             self.host
-                .run_sync(|vm| VmState::from_raw(vm.state_raw()))
+                .run_timeout(self.op_timeout, |vm| VmState::from_raw(vm.state_raw()))
                 .unwrap_or(VmState::Unknown(-1))
         }
 

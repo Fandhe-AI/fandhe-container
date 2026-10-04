@@ -1956,4 +1956,31 @@ mod tests {
         let none = VmConfigSpec::from_parts(&t.file("k2"), None, "").unwrap();
         assert!(none.open_serial_console().unwrap().is_none());
     }
+
+    /// MAC-1・TASK-64.3: 書き出し中の同じログを別の VM 構成が開くと `config.console_log_in_use` で拒否する
+    /// （上限の二重使用によるディスク枯渇の防止）。
+    #[cfg(unix)]
+    #[test]
+    fn open_serial_console_rejects_log_in_use() {
+        let t = TempDir::new("log-inuse");
+        let (spec, _k, _i) = spec_with_initrd(&t);
+        let path = t.0.join("console.log");
+        let spec = spec
+            .with_devices(console_only(ConsoleLogPath::try_new(&path).unwrap()))
+            .unwrap();
+        let first = spec.open_serial_console().unwrap().expect("console sink");
+        let err = spec.open_serial_console().unwrap_err();
+        assert_eq!(err, ConfigError::ConsoleLogInUse { path: path.clone() });
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "config.console_log_in_use: console log is in use by another virtual machine: {}",
+                path.display()
+            )
+        );
+        first
+            .finish(std::time::Duration::from_secs(10))
+            .expect("writer thread finished");
+        assert!(spec.open_serial_console().unwrap().is_some());
+    }
 }

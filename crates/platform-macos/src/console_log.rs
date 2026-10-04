@@ -702,6 +702,23 @@ mod tests {
         assert!(out.marker_written);
     }
 
+    /// MAC-1・TASK-64.3: 書き出し中の同じログへの 2 つ目の書き出しは `InUse` で拒否し（上限の二重使用を防ぐ）、
+    /// 1 つ目が閉じた後は再び使える。
+    #[test]
+    fn sink_rejects_concurrent_writer_on_same_log() {
+        let t = TempFile::new("lock", b"");
+        let mut first = ConsoleLogSink::spawn(t.append_handle(), 1000).unwrap();
+        assert_eq!(
+            ConsoleLogSink::spawn(t.append_handle(), 1000).err(),
+            Some(SpawnError::InUse)
+        );
+        first.writer().write_all(b"one\n").unwrap();
+        first.finish(WAIT).expect("writer thread finished");
+        let second = ConsoleLogSink::spawn(t.append_handle(), 1000).unwrap();
+        second.finish(WAIT).expect("writer thread finished");
+        assert_eq!(std::fs::read(&t.0).unwrap(), b"one\n");
+    }
+
     /// MAC-1・TASK-64.3: 既に上限に達したファイルへは追記しない（再起動の繰り返しでも総量が増えない）。
     #[test]
     fn sink_does_not_grow_full_file() {

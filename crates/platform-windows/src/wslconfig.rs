@@ -1471,13 +1471,13 @@ mod tests {
         assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
     }
 
-    /// WIN-2（Bugbot・Codex 指摘）: リンク以外のリパースポイント（WOF 圧縮）の `.wslconfig` は論理的な内容を
-    /// 読み込めるが、リパースタグを引き継げないため置換は PERMISSION_DENIED で拒否し、内容を変えない（Windows）。
-    /// WOF は NTFS のシステムドライブで有効なため、`%USERPROFILE%` 配下で `compact /exe` を使う。
+    /// WIN-2（Bugbot 指摘）: WOF 圧縮した `.wslconfig` も論理的な内容を読み込め、圧縮データの代替データストリーム
+    /// （`:WofCompressedData`）を引き継げないため置換は PERMISSION_DENIED で拒否し、内容を変えない（Windows）。
+    /// WOF は NTFS のシステムドライブで有効なため、`%USERPROFILE%` 配下で `compact /exe` を使う。WOF フィルタは
+    /// リパースポイント属性を隠すため、リンク以外のリパースポイントとしての拒否はここでは通らない。
     #[cfg(windows)]
     #[test]
     fn wof_compressed_file_is_read_but_not_replaced() {
-        use std::os::windows::fs::MetadataExt;
         let base = std::env::var_os("USERPROFILE")
             .map(PathBuf::from)
             .expect("USERPROFILE");
@@ -1494,21 +1494,13 @@ mod tests {
             .output()
             .expect("compact");
         assert!(st.status.success(), "compact failed: {st:?}");
-        let attrs = std::fs::symlink_metadata(d.file())
-            .expect("stat")
-            .file_attributes();
-        assert_eq!(
-            attrs & FILE_ATTRIBUTE_REPARSE_POINT,
-            FILE_ATTRIBUTE_REPARSE_POINT,
-            "test setup must produce a WOF reparse point: {st:?}"
-        );
         let cfg = load(&d.file()).expect("load").expect("exists");
         assert_eq!(cfg.render(), body);
         let e = enable_virtiofs_at(&d.file()).expect_err("must refuse");
         assert_eq!(e.code(), WinErrorCode::PermissionDenied);
         assert_eq!(
             e.message(),
-            ".wslconfig is a reparse point (such as a compressed or cloud file); refusing to replace it"
+            ".wslconfig has named streams that cannot be preserved; refusing to replace it"
         );
         assert_eq!(std::fs::read_to_string(d.file()).expect("read"), body);
         assert_eq!(d.entries(), vec![".wslconfig".to_string()]);

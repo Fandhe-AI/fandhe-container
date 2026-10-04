@@ -8,6 +8,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +27,42 @@ pub(super) struct Captured {
 /// kill 後に子の終了を待つ上限（REPAIR-5）。超えたら回収不能として `INTERNAL` で返す。
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 同時に生存を許す読み取りスレッド数の上限（REPAIR-5）。
+///
+/// 孫プロセスがパイプを握り続けると、期限切れ後も読み取りスレッドはブロッキング `read()` から
+/// 戻れない。std だけではスレッド側のパイプを外部から閉じられないため、残留スレッドが
+/// 無制限に蓄積しないよう上限を設け、超過時は新規起動を `RESOURCE_EXHAUSTED` で拒否する
+/// （孫がパイプを閉じれば EOF でスレッドは終了し、カウントは戻る）。
+const MAX_LIVE_READERS: usize = 64;
+
+/// 生存中の読み取りスレッド数。
+static LIVE_READERS: AtomicUsize = AtomicUsize::new(0);
+
+/// 生存カウントの RAII ガード（スレッドの終了・panic で必ず減算する）。
+struct ReaderGuard(&'static AtomicUsize);
+
+impl ReaderGuard {
+    /// 上限未満なら加算してガードを返す。
+    fn acquire() -> Option<Self> {
+        Self::acquire_in(&LIVE_READERS, MAX_LIVE_READERS)
+    }
+
+    fn acquire_in(counter: &'static AtomicUsize, max: usize) -> Option<Self> {
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| ReaderGuard(counter))
+    }
+}
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// 1 本のパイプの読み取り結果。
 struct Pipe {
     /// 読み取れたバイト列（上限超過時は途中まで）。
@@ -37,9 +74,14 @@ struct Pipe {
 }
 
 /// パイプを `max_bytes` を超えるまで読み、上限超過かどうかと一緒に送る。
-fn spawn_reader<R: Read + Send + 'static>(mut r: R, max_bytes: usize) -> Receiver<Pipe> {
+fn spawn_reader<R: Read + Send + 'static>(
+    mut r: R,
+    max_bytes: usize,
+    guard: ReaderGuard,
+) -> Receiver<Pipe> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
+        let _guard = guard;
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         let mut overflow = false;
@@ -74,10 +116,40 @@ fn spawn_reader<R: Read + Send + 'static>(mut r: R, max_bytes: usize) -> Receive
     rx
 }
 
+/// 子孫プロセスを含めて終了させる試み（Windows のみ。`taskkill /T` は std の範囲で孫を閉じる手段）。
+///
+/// 孫がパイプを握ったままだと読み取りスレッドが残るため、kill 前に呼ぶ。失敗は無視する
+/// （残留は `MAX_LIVE_READERS` で抑える）。`taskkill` 自体も `REAP_TIMEOUT` で打ち切る。
+#[cfg(windows)]
+fn kill_tree(child: &Child) {
+    let Ok(mut killer) = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = Instant::now() + REAP_TIMEOUT;
+    while matches!(killer.try_wait(), Ok(None)) {
+        if Instant::now() >= deadline {
+            let _ = killer.kill();
+            let _ = killer.wait();
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(windows))]
+fn kill_tree(_child: &Child) {}
+
 /// 子を kill して `REAP_TIMEOUT` 以内に回収する。kill の失敗は無視せず、回収できるまで待つ
 /// （既に終了していれば kill は失敗しうるが、その場合は回収に成功する）。
 /// 回収できなければ `INTERNAL`（無期限に `wait()` しない。REPAIR-5）。
 fn kill_and_reap(child: &mut Child) -> Result<(), Wsl2Error> {
+    kill_tree(child);
     let kill_result = child.kill();
     let deadline = Instant::now() + REAP_TIMEOUT;
     loop {
@@ -149,6 +221,13 @@ pub(super) fn run_capture(
     for (k, v) in envs {
         cmd.env(k, v);
     }
+    let (Some(out_guard), Some(err_guard)) = (ReaderGuard::acquire(), ReaderGuard::acquire())
+    else {
+        return Err(Wsl2Error::new(
+            Wsl2ErrorCode::ResourceExhausted,
+            "too many outstanding wsl.exe output readers",
+        ));
+    };
     let mut child = cmd.spawn().map_err(|e| spawn_error(&e))?;
     let (Some(out_pipe), Some(err_pipe)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(abort_with(
@@ -156,8 +235,8 @@ pub(super) fn run_capture(
             Wsl2Error::new(Wsl2ErrorCode::Internal, "failed to capture output pipes"),
         ));
     };
-    let out_rx = spawn_reader(out_pipe, max_bytes);
-    let err_rx = spawn_reader(err_pipe, max_bytes);
+    let out_rx = spawn_reader(out_pipe, max_bytes, out_guard);
+    let err_rx = spawn_reader(err_pipe, max_bytes, err_guard);
 
     let mut out: Option<Pipe> = None;
     let mut err: Option<Pipe> = None;
@@ -287,7 +366,7 @@ mod tests {
                 Ok(3)
             }
         }
-        let p = spawn_reader(Failing(false), 1024)
+        let p = spawn_reader(Failing(false), 1024, ReaderGuard::acquire().unwrap())
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
         assert!(p.io_error);
@@ -298,11 +377,25 @@ mod tests {
     /// 正常な EOF は io_error にならない。
     #[test]
     fn reader_eof_is_not_error() {
-        let p = spawn_reader(&b"hello"[..], 1024)
+        let p = spawn_reader(&b"hello"[..], 1024, ReaderGuard::acquire().unwrap())
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
         assert!(!p.io_error);
         assert_eq!(p.buf, b"hello");
+    }
+
+    /// REPAIR-5: ガードは上限で取得に失敗し、解放で枠が戻る。
+    #[test]
+    fn reader_guard_is_bounded() {
+        static LOCAL: AtomicUsize = AtomicUsize::new(0);
+        let g1 = ReaderGuard::acquire_in(&LOCAL, 2).unwrap();
+        let g2 = ReaderGuard::acquire_in(&LOCAL, 2).unwrap();
+        assert!(ReaderGuard::acquire_in(&LOCAL, 2).is_none());
+        drop(g1);
+        assert_eq!(LOCAL.load(Ordering::SeqCst), 1);
+        let g3 = ReaderGuard::acquire_in(&LOCAL, 2).unwrap();
+        drop((g2, g3));
+        assert_eq!(LOCAL.load(Ordering::SeqCst), 0);
     }
 
     /// WIN-1: 存在しないパスは NOT_FOUND。

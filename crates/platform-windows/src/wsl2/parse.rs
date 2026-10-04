@@ -35,38 +35,39 @@ fn data_loss(msg: &str) -> Wsl2Error {
     Wsl2Error::new(Wsl2ErrorCode::DataLoss, msg)
 }
 
+fn decode_utf16le(body: &[u8]) -> Result<String, Wsl2Error> {
+    let (units, rest) = body.as_chunks::<2>();
+    if !rest.is_empty() {
+        return Err(data_loss("UTF-16 output has an odd byte length"));
+    }
+    char::decode_utf16(units.iter().map(|c| u16::from_le_bytes(*c)))
+        .collect::<Result<String, _>>()
+        .map_err(|_| data_loss("output is not valid UTF-16"))
+}
+
 /// stdout のバイト列を文字列にする。UTF-16LE（BOM あり・なし）と UTF-8 を受け付ける。
 ///
-/// `WSL_UTF8=1` に対応しない古い WSL は UTF-16LE で出力するため、奇数位置の NUL の多さで判定する。
+/// `WSL_UTF8=1` に対応しない古い WSL は UTF-16LE で出力する。BOM なしの判定は文字種の割合に
+/// 依存させず、「末尾以外に NUL バイトがある」（UTF-8 テキストは内部に NUL を含まない）で行う。
+/// NUL が全くない場合は UTF-8 として扱う（`wsl.exe` の UTF-16 出力は ASCII の改行や空白を含むため
+/// 必ず NUL を持つ）。読めなければ `DATA_LOSS`。
 pub(super) fn decode_output(bytes: &[u8]) -> Result<String, Wsl2Error> {
     if bytes.is_empty() {
         return Err(data_loss("wsl.exe produced no output"));
     }
-    let has_bom = bytes.starts_with(&[0xFF, 0xFE]);
-    let odd_nuls = bytes.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
-    let looks_utf16 = has_bom || odd_nuls * 3 >= bytes.len() / 2 && odd_nuls > 0;
-    let text = if looks_utf16 {
-        let body = if has_bom {
-            bytes.get(2..).unwrap_or(&[])
-        } else {
-            bytes
-        };
-        if body.len() % 2 != 0 {
-            return Err(data_loss("UTF-16 output has an odd byte length"));
-        }
-        let units = body
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_le_bytes(*c));
-        char::decode_utf16(units)
-            .collect::<Result<String, _>>()
-            .map_err(|_| data_loss("output is not valid UTF-16"))?
+    let text = if let Some(body) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        decode_utf16le(body)?
     } else {
-        let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-        std::str::from_utf8(body)
-            .map_err(|_| data_loss("output is not valid UTF-8"))?
-            .to_string()
+        let end = bytes.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+        let has_interior_nul = bytes.get(..end).is_some_and(|h| h.contains(&0));
+        if has_interior_nul {
+            decode_utf16le(bytes)?
+        } else {
+            let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+            std::str::from_utf8(body)
+                .map_err(|_| data_loss("output is not valid UTF-8"))?
+                .to_string()
+        }
     };
     let text: String = text.replace('\r', "").trim_matches('\0').to_string();
     if text.trim().is_empty() {
@@ -163,29 +164,35 @@ fn is_known_header(header: &str) -> bool {
         .any(|k| tokens.len() == 3 && tokens.iter().zip(k.iter()).all(|(a, b)| a == b))
 }
 
-/// ヘッダー行から 2 列目（STATE）が始まる文字位置を返す（列境界。空白区切りの 2 番目のトークン）。
-fn state_column_start(header: &str) -> Option<usize> {
-    let mut seen = 0;
+/// ヘッダー行から 2 列目（STATE）・3 列目（VERSION）が始まる文字位置を返す（列境界。空白区切りのトークン先頭）。
+fn column_starts(header: &str) -> Option<(usize, usize)> {
+    let mut starts = Vec::new();
     let mut prev_space = true;
     for (i, c) in header.chars().enumerate() {
         let space = c.is_whitespace();
         if !space && prev_space {
-            seen += 1;
-            if seen == 2 {
-                return Some(i);
-            }
+            starts.push(i);
         }
         prev_space = space;
     }
-    None
+    match starts.as_slice() {
+        [_, state, version] => Some((*state, *version)),
+        _ => None,
+    }
 }
 
 /// 1 行を（既定フラグ, 名前, 状態トークン列, バージョントークン）へ分ける。
 ///
-/// ヘッダーの STATE 列の開始位置（`state_col`）で名前と状態を分け、空白を含むディストリ名を
-/// 切り詰めない。位置が合わない行（全角幅の差などで列がずれた場合）は、末尾 2 トークンを
-/// 状態・バージョンとみなし、残りを名前とする（この場合の状態は 1 語のみ）。
-fn split_row(line: &str, state_col: usize) -> Option<(bool, String, String, String)> {
+/// ヘッダーの STATE・VERSION 列の開始位置で名前・状態・バージョンを分け、空白を含むディストリ名を
+/// 切り詰めない。列が揃っている行とみなすのは、STATE 列・VERSION 列のどちらの直前も空白で
+/// 開始位置が非空白、かつ VERSION 列以降が 1 トークンの場合だけ（名前が列境界を越えた行は
+/// この条件を満たさない）。それ以外は末尾 2 トークンを状態・バージョン、残りを名前とする
+/// （この場合の状態は 1 語のみ）。
+fn split_row(
+    line: &str,
+    state_col: usize,
+    version_col: usize,
+) -> Option<(bool, String, String, String)> {
     let mut chars: Vec<char> = line.chars().collect();
     let first = chars.iter().position(|c| !c.is_whitespace())?;
     let is_default = first < state_col && chars.get(first) == Some(&'*');
@@ -193,16 +200,20 @@ fn split_row(line: &str, state_col: usize) -> Option<(bool, String, String, Stri
         // 位置を保つため '*' は空白に置き換える。
         *chars.get_mut(first)? = ' ';
     }
-    let aligned = state_col > 0
-        && chars.get(state_col).is_some_and(|c| !c.is_whitespace())
-        && chars.get(state_col - 1).is_some_and(|c| c.is_whitespace());
+    let boundary = |col: usize| {
+        col > 0
+            && chars.get(col).is_some_and(|c| !c.is_whitespace())
+            && chars.get(col - 1).is_some_and(|c| c.is_whitespace())
+    };
+    let ver_tail: String = chars.get(version_col..).unwrap_or(&[]).iter().collect();
+    let aligned = version_col > state_col
+        && boundary(state_col)
+        && boundary(version_col)
+        && ver_tail.split_whitespace().count() == 1;
     if aligned {
         let name: String = chars.get(..state_col)?.iter().collect();
-        let rest: String = chars.get(state_col..)?.iter().collect();
-        let rest = rest.trim();
-        let (state, ver) = rest.rsplit_once(char::is_whitespace)?;
-        let name = name.trim();
-        let state = state.trim();
+        let state: String = chars.get(state_col..version_col)?.iter().collect();
+        let (name, state, ver) = (name.trim(), state.trim(), ver_tail.trim());
         if name.is_empty() || state.is_empty() {
             return None;
         }
@@ -241,8 +252,8 @@ pub(super) fn parse_distros(text: &str) -> Result<Vec<WslDistro>, Wsl2Error> {
     if !is_known_header(header) {
         return Err(data_loss("unrecognized `wsl -l -v` header"));
     }
-    let state_col =
-        state_column_start(header).ok_or_else(|| data_loss("unrecognized `wsl -l -v` header"))?;
+    let (state_col, version_col) =
+        column_starts(header).ok_or_else(|| data_loss("unrecognized `wsl -l -v` header"))?;
     let mut distros = Vec::new();
     for line in lines {
         check_line_len(line)?;
@@ -252,7 +263,7 @@ pub(super) fn parse_distros(text: &str) -> Result<Vec<WslDistro>, Wsl2Error> {
                 "too many distributions in output",
             ));
         }
-        let Some((is_default, name, state, ver)) = split_row(line, state_col) else {
+        let Some((is_default, name, state, ver)) = split_row(line, state_col, version_col) else {
             return Err(data_loss("unrecognized distribution row"));
         };
         if name.chars().count() > MAX_NAME_CHARS || name.chars().any(|c| c.is_control()) {
@@ -436,7 +447,8 @@ mod tests {
     /// ローカライズされた状態語・ヘッダーのみ。
     #[test]
     fn list_localized_and_empty() {
-        let ja = "  名前     状態      バージョン\n* Ubuntu 実行中    2\n  Deb    Foo Bar   2\n";
+        let ja =
+            "  名前     状態         バージョン\n* Ubuntu 実行中    2\n  Deb    Foo Bar    2\n";
         // 列がずれた行（全角幅の差など）でも末尾 2 トークンで分けられる。
         let d = parse_distros("  名前 状態 バージョン\n  Deb 停止 2\n").unwrap();
         assert_eq!(d[0].name, "Deb");
@@ -477,6 +489,28 @@ mod tests {
         // 列がずれた行でも名前は切り詰めない。
         let d = parse_distros("NAME STATE VERSION\nMy Distro Running 2\n").unwrap();
         assert_eq!(d[0].name, "My Distro");
+        assert_eq!(d[0].state, DistroState::Running);
+    }
+
+    /// 名前が列境界を越え、境界直前に名前中の空白がある行でも名前を切り詰めない。
+    #[test]
+    fn list_name_straddles_column() {
+        let t = "  NAME      STATE     VERSION\n* Very Long Distro Name Running   2\n  Ab Cdefghijkl Stopped   2\n";
+        let d = parse_distros(t).unwrap();
+        assert_eq!(d[0].name, "Very Long Distro Name");
+        assert_eq!(d[0].state, DistroState::Running);
+        assert_eq!(d[1].name, "Ab Cdefghijkl");
+        assert_eq!(d[1].state, DistroState::Stopped);
+        assert_eq!(d[1].version, WslMajorVersion::V2);
+    }
+
+    /// WIN-1: 日本語を多く含む BOM なし UTF-16LE も UTF-16 として解析できる。
+    #[test]
+    fn decode_japanese_utf16_without_bom() {
+        let src =
+            "  名前          状態          バージョン\n* あいうえおかきくけこ 実行中        2\n";
+        let d = parse_distros(&decode_output(&utf16le(src, false)).unwrap()).unwrap();
+        assert_eq!(d[0].name, "あいうえおかきくけこ");
         assert_eq!(d[0].state, DistroState::Running);
     }
 

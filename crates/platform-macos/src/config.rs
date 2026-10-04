@@ -20,9 +20,10 @@
 //! kernel / initrd / ディスクイメージと同一ファイルなら拒否し（initrd への追記は次回起動時の
 //! initramfs 注入になり得る）、リンク数が 1 でない・所有者が実効 uid でないファイルも拒否する。
 //!
-//! 信頼前提（fail-closed で検査しない範囲）: 直近の親ディレクトリは「他者書き込み可能かつ sticky bit
-//! なし」なら拒否するが、group 書き込み可は group メンバーを信頼するものとして許可する。祖先ディレクトリ
-//! 要素（親より上）の差し替えは対象外で、呼び出し側の配置ディレクトリの権限管理に委ねる。
+//! 信頼前提（fail-closed で検査しない範囲）: 直近の親ディレクトリは symlink なら拒否し（macOS の `/tmp`
+//! 等は呼び出し側が実体パスへ正規化して渡す）、「他者書き込み可能かつ sticky bit なし」なら拒否するが、
+//! group 書き込み可は group メンバーを信頼するものとして許可する。祖先ディレクトリ要素（親より上）の
+//! 差し替えは対象外で、呼び出し側の配置ディレクトリの権限管理に委ねる。
 
 use std::fmt;
 use std::num::NonZeroU32;
@@ -129,6 +130,8 @@ pub enum ConfigError {
     ConsoleLogMultipleLinks { path: PathBuf, links: u64 },
     /// コンソールログの親ディレクトリが他者書き込み可能で sticky bit がない（`path` は親ディレクトリ）。
     ConsoleLogParentWorldWritable { path: PathBuf },
+    /// コンソールログの親ディレクトリ自体が symlink（`path` は親ディレクトリ）。
+    ConsoleLogParentIsSymlink { path: PathBuf },
     /// コンソールログを開けない、または open 後の同一性検査に失敗した。
     ConsoleLogOpen { kind: std::io::ErrorKind },
     /// コンソールログの上限つき書き出し（pipe・書き出しスレッド）を開始できない。
@@ -175,6 +178,7 @@ impl ConfigError {
             ConfigError::ConsoleLogParentWorldWritable { .. } => {
                 "config.console_log_parent_world_writable"
             }
+            ConfigError::ConsoleLogParentIsSymlink { .. } => "config.console_log_parent_is_symlink",
             ConfigError::ConsoleLogOpen { .. } => "config.console_log_open",
             ConfigError::ConsoleLogWriter { .. } => "config.console_log_writer",
             ConfigError::ConsoleLogInUse { .. } => "config.console_log_in_use",
@@ -288,6 +292,12 @@ impl ConfigError {
             ConfigError::ConsoleLogParentWorldWritable { path } => {
                 format!(
                     "console log parent directory is world-writable without the sticky bit: {}",
+                    path.display()
+                )
+            }
+            ConfigError::ConsoleLogParentIsSymlink { path } => {
+                format!(
+                    "console log parent directory must not be a symlink: {}",
                     path.display()
                 )
             }
@@ -789,7 +799,12 @@ fn check_console_log_parent(path: &Path) -> Result<(), ConfigError> {
         path: path.to_path_buf(),
     };
     let parent = path.parent().ok_or_else(no_parent)?;
-    match std::fs::metadata(parent) {
+    // 親自体が symlink なら追従せず拒否する（他者所有の symlink だと検査後にリンク先を張り替えられ、
+    // 検査したディレクトリと実際に作成するディレクトリが食い違うため）。
+    match std::fs::symlink_metadata(parent) {
+        Ok(m) if m.file_type().is_symlink() => Err(ConfigError::ConsoleLogParentIsSymlink {
+            path: parent.to_path_buf(),
+        }),
         Ok(m) if m.is_dir() => {
             #[cfg(unix)]
             {

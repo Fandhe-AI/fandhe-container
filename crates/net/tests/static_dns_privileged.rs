@@ -450,8 +450,14 @@ mod linux {
             std::thread::spawn(move || {
                 let mut log: QueryLog = Vec::new();
                 let mut buf = [0u8; MAX_DATAGRAM_LEN];
-                while !flag.load(Ordering::SeqCst) {
+                // 停止フラグが立っても、受信キューに残ったデータグラムを読み切るまで終了しない
+                // （読み取りタイムアウトで空になったことを確認してから抜ける）。probe 成功直後の
+                // finish() で未受信のクエリがログから漏れ、デコイ 0 件判定が誤成功するのを防ぐ（NET-8・NET-12）。
+                loop {
                     let Ok((n, from)) = sock.recv_from(&mut buf) else {
+                        if flag.load(Ordering::SeqCst) {
+                            break;
+                        }
                         continue;
                     };
                     let Some(q) = buf.get(..n) else { continue };

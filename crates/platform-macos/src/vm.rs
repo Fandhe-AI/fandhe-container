@@ -601,19 +601,25 @@ impl Core {
         self.drop_requested && !self.lifecycle.has_in_flight()
     }
 
-    /// 破棄時の停止の完了を適用する。失敗して要求回数が残っていれば `true`（呼び出し元が間隔を空けて
-    /// `request_drop_stop` からやり直す）。
+    /// 破棄時の停止の完了を適用する。受理された失敗で要求回数が残っていれば `true`（呼び出し元が間隔を
+    /// 空けて `request_drop_stop` からやり直す）。
     ///
     /// 回数を使い切った失敗は `StopOnDropFailed` として記録する（呼び出し元はもういないため）。受信側が
     /// `Vm` とともに破棄されている・満杯でイベントが届かない場合は、失敗を見失わないよう構造化ログ
     /// （1 行 1 JSON）を stderr へ出す（REPAIR-4）。
     pub(crate) fn finish_drop_stop(&mut self, generation: u64, res: Result<(), ErrInfo>) -> bool {
         let failure = res.clone().err();
-        // 停止通知の先着で無効化されていても、結果は状態機械と通知で既に表されている。
-        let _ = self.complete(generation, LifecycleInput::StopCompleted(generation, res));
+        let accepted = self
+            .complete(generation, LifecycleInput::StopCompleted(generation, res))
+            .is_ok();
         let Some((domain, code)) = failure else {
             return false;
         };
+        // ゲスト停止・エラー停止の通知が先着して無効化された結果なら、VM は既に止まっている（状態機械と
+        // 通知で表されている）ため、失敗として記録もやり直しもしない。
+        if !accepted {
+            return false;
+        }
         if self.drop_stop_attempts < DROP_STOP_MAX_ATTEMPTS {
             return true;
         }

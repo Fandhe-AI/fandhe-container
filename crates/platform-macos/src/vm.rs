@@ -19,9 +19,6 @@
 //! 実行中 VM の `Drop` 時停止、`VmError` の `error.rs` への移動と `ConfigError` との統合は TASK-64.5。
 //! 協調停止（`requestStop`）・pause / resume / save / restore は範囲外。
 
-// macOS 限定の `Vm` だけが使う内部型は、他 OS ではテストからのみ参照されるため dead_code を許容する。
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
-
 use std::fmt;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::Duration;
@@ -195,12 +192,14 @@ impl std::error::Error for VmError {}
 
 /// 状態機械への入力。
 #[derive(Debug, Clone, PartialEq, Eq)]
+// macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum LifecycleInput {
     StartRequested,
-    /// 第 1 要素は `Core::begin` が返した操作世代。現行の世代と一致しない完了通知は無視される。
+    /// 第 1 要素は `Core::try_begin` が返した操作世代。現行の世代と一致しない完了通知は無視される。
     StartCompleted(u64, Result<(), ErrInfo>),
     StopRequested,
-    /// 第 1 要素は `Core::begin` が返した操作世代。現行の世代と一致しない完了通知は無視される。
+    /// 第 1 要素は `Core::try_begin` が返した操作世代。現行の世代と一致しない完了通知は無視される。
     StopCompleted(u64, Result<(), ErrInfo>),
     GuestStopped,
     StoppedWithError(ErrInfo),
@@ -221,6 +220,8 @@ pub(crate) struct Lifecycle {
     in_flight: Option<u64>,
 }
 
+// macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl Lifecycle {
     pub(crate) fn new() -> Lifecycle {
         Lifecycle {
@@ -238,6 +239,11 @@ impl Lifecycle {
     /// 指定世代が現行の進行中操作か（ゲスト停止等で無効化されていれば false）。
     pub(crate) fn is_current(&self, generation: u64) -> bool {
         self.in_flight == Some(generation)
+    }
+
+    /// 完了待ちの操作があるか。
+    pub(crate) fn has_in_flight(&self) -> bool {
+        self.in_flight.is_some()
     }
 
     /// 直近の要求に割り当てた操作世代。
@@ -325,6 +331,8 @@ pub(crate) struct EventSink {
 }
 
 /// 容量付きのイベントチャネルを作る。
+// macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn event_channel(capacity: usize) -> (EventSink, Receiver<VmEvent>) {
     let (tx, rx) = sync_channel(capacity);
     (EventSink { tx, dropped: 0 }, rx)
@@ -360,6 +368,8 @@ pub(crate) struct Core {
     sink: EventSink,
 }
 
+// macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl Core {
     pub(crate) fn new(sink: EventSink) -> Core {
         Core {
@@ -369,6 +379,17 @@ impl Core {
     }
 
     /// 要求入力を適用し、その操作に割り当てた世代を返す（完了通知に持ち回る）。
+    /// 進行中の操作があれば何も適用せず、その時点の状態を `Err` で返す（start / stop の重複を排他する。
+    /// 先行操作の世代を潰して完了通知を破棄させ、状態とイベントが食い違うのを防ぐ）。
+    pub(crate) fn try_begin(&mut self, input: LifecycleInput) -> Result<u64, VmState> {
+        if self.lifecycle.has_in_flight() {
+            return Err(self.lifecycle.state());
+        }
+        self.apply(input);
+        Ok(self.lifecycle.generation())
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin(&mut self, input: LifecycleInput) -> u64 {
         self.apply(input);
         self.lifecycle.generation()
@@ -519,10 +540,19 @@ mod mac {
                     let _ = tx.try_send(Err(VmError::InvalidState { op, state }));
                     return;
                 }
-                let generation = lock(&core).begin(match op {
+                // 進行中の操作があれば重複要求として拒否する（VM キューはシリアルなので判定と begin は
+                // 他の要求と競合しない）。
+                let begun = lock(&core).try_begin(match op {
                     VmOp::Start => LifecycleInput::StartRequested,
                     VmOp::Stop => LifecycleInput::StopRequested,
                 });
+                let generation = match begun {
+                    Ok(g) => g,
+                    Err(state) => {
+                        let _ = tx.try_send(Err(VmError::InvalidState { op, state }));
+                        return;
+                    }
+                };
                 let handler = move |res: Result<(), ErrInfo>| {
                     let outcome = res.clone().map_err(|(domain, code)| match op {
                         VmOp::Start => VmError::StartFailed { domain, code },
@@ -719,6 +749,25 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    /// MAC-1・TASK-64.4: 進行中の操作がある間の重複要求は拒否し、先行操作の完了通知を潰さない。
+    #[test]
+    fn core_try_begin_rejects_overlapping_operation() {
+        let (sink, _rx) = event_channel(8);
+        let mut core = Core::new(sink);
+        let start = core.try_begin(LifecycleInput::StartRequested).unwrap();
+        assert_eq!(
+            core.try_begin(LifecycleInput::StopRequested),
+            Err(VmState::Starting)
+        );
+        assert_eq!(core.lifecycle.state(), VmState::Starting);
+        assert_eq!(
+            core.complete(start, LifecycleInput::StartCompleted(start, Ok(()))),
+            Ok(())
+        );
+        assert_eq!(core.lifecycle.state(), VmState::Running);
+        assert!(core.try_begin(LifecycleInput::StopRequested).is_ok());
     }
 
     /// MAC-1・TASK-64.4: 停止通知が停止完了より先着しても、停止要求は正常終了として扱う。

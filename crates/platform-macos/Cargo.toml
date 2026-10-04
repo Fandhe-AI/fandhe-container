@@ -7,7 +7,7 @@
 # コード署名（ad-hoc 可）が必要。実質の最低 macOS は 13（vsock 11・virtio-fs 12・virtio-graphics 13）。
 # 使ってはならない feature: objc2-virtualization の既定 feature（VZVirtualMachineView 経由で
 # objc2-app-kit を引く）・objc2 の exception（cc のネイティブビルドを引く）・unstable-* / gnustep-*。
-# virtio-fs・vsock・graphics 用の feature は、使う時点の各タスク（TASK-65 等）が追加する。
+# virtio-fs 用の feature は TASK-65.1 で追加済み。vsock・graphics 用は、使う時点の各タスクが追加する。
 
 [package]
 name = "fandhe-container-platform-macos"
@@ -29,6 +29,8 @@ objc2-virtualization = { workspace = true, features = [
     "VZSerialPortConfiguration", "VZVirtioConsoleDeviceSerialPortConfiguration",
     "VZSerialPortAttachment", "VZFileHandleSerialPortAttachment",
     "VZEntropyDeviceConfiguration", "VZVirtioEntropyDeviceConfiguration",
+    "VZDirectorySharingDeviceConfiguration", "VZVirtioFileSystemDeviceConfiguration",
+    "VZDirectoryShare", "VZSingleDirectoryShare", "VZSharedDirectory",
     "VZError",
 ] }
 block2 = { workspace = true, features = ["std"] }

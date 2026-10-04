@@ -18,6 +18,7 @@
 //! 存在しない。VM への強参照は `QueueOwned` が持ち、最後の解放を必ずキュー上へ回す。
 
 use std::cell::Cell;
+use std::marker::PhantomData;
 use std::os::fd::{IntoRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -344,12 +345,14 @@ struct VmObjects {
 struct QueueBound<T>(T);
 
 // SAFETY: 中身（VZVirtualMachine・delegate）は ObjC オブジェクトで `Send` ではないが、本モジュールは
-// 中身を参照・解放するコードを VM の専用シリアルキュー上のクロージャ（`run_async` / `run_timeout` /
-// completion handler / `QueueOwned::drop` が投入する解放）にだけ置く。包みを別スレッドへ動かしても、
-// 中身を触る・最後の参照を解放するのは常にそのキューのスレッドである。
-unsafe impl<T> Send for QueueBound<T> {}
-// SAFETY: 上記と同じ不変条件。共有参照越しに中身へ到達できるのもキュー上のクロージャだけ。
-unsafe impl<T> Sync for QueueBound<T> {}
+// 中身を参照・解放するコードを VM の専用シリアルキュー上のクロージャ（`run_async` / `run_after` /
+// `run_timeout` / completion handler / `QueueOwned::drop` が投入する解放）にだけ置く。包みを別スレッドへ
+// 動かしても、中身を触る・最後の参照を解放するのは常にそのキューのスレッドである。中身へ到達する唯一の窓口
+// `VmRef` は `!Send` / `!Sync` のため、キュー上のクロージャから別スレッドへ持ち出せない。対象は
+// `VmObjects` に限る（任意の型へ広げない）。
+unsafe impl Send for QueueBound<VmObjects> {}
+// SAFETY: 上記と同じ不変条件。共有参照越しに中身へ到達できるのもキュー上のクロージャ（`VmRef`）だけ。
+unsafe impl Sync for QueueBound<VmObjects> {}
 
 /// VM への強参照を、最後の解放が必ず VM キュー上で起きるように包む。
 ///
@@ -370,9 +373,51 @@ impl Drop for QueueOwned {
 }
 
 /// VM キュー上のクロージャ・completion handler にだけ渡される VM 操作の窓口（本モジュール外では生成できない）。
+///
+/// `!Send` / `!Sync`（`PhantomData<*const ()>`）のため、キュー上のクロージャ内から `thread::scope` 等で
+/// キュー外のスレッドへ渡せない。下の各 `unsafe` の「VM キュー上でのみ存在する」前提を型で保証する。
 pub(crate) struct VmRef<'a> {
     objs: &'a Arc<QueueBound<VmObjects>>,
     queue: &'a DispatchRetained<DispatchQueue>,
+    _not_send: PhantomData<*const ()>,
+}
+
+/// `VmRef` が `Send` / `Sync` でないことのコンパイル時検査（依存なしの曖昧性トリック）。
+///
+/// `T: Send`（`Sync`）なら 2 つの impl が両方当てはまり、型推論が曖昧になってコンパイルエラーになる。
+mod vm_ref_is_not_send_or_sync {
+    use super::VmRef;
+
+    trait AmbiguousIfSend<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+
+    trait AmbiguousIfSync<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+
+    const _: fn() = || {
+        <VmRef<'static> as AmbiguousIfSend<_>>::check();
+        <VmRef<'static> as AmbiguousIfSync<_>>::check();
+    };
+}
+
+impl<'a> VmRef<'a> {
+    /// VM キュー上で実行中のクロージャ・completion handler の中でだけ呼ぶ（本モジュール内に限る）。
+    fn on_queue(
+        objs: &'a Arc<QueueBound<VmObjects>>,
+        queue: &'a DispatchRetained<DispatchQueue>,
+    ) -> VmRef<'a> {
+        VmRef {
+            objs,
+            queue,
+            _not_send: PhantomData,
+        }
+    }
 }
 
 impl VmRef<'_> {
@@ -417,10 +462,7 @@ impl VmRef<'_> {
         let objs = Arc::clone(self.objs);
         let queue = self.queue.clone();
         let work = move || {
-            f(&VmRef {
-                objs: &objs,
-                queue: &queue,
-            });
+            f(&VmRef::on_queue(&objs, &queue));
             // この clone が最後の参照でも、解放は VM キューのスレッド上で行われる。
             drop(objs);
         };
@@ -453,13 +495,7 @@ impl VmRef<'_> {
             };
             if let Some(objs) = owned.objs.as_ref() {
                 // completion handler は VM キュー上で呼ばれるため、ここで `VmRef` を渡してよい。
-                handler(
-                    &VmRef {
-                        objs,
-                        queue: &owned.queue,
-                    },
-                    res,
-                );
+                handler(&VmRef::on_queue(objs, &owned.queue), res);
             }
         })
     }
@@ -529,10 +565,7 @@ impl VmHost {
         };
         let queue = self.owned.queue.clone();
         self.owned.queue.exec_async(move || {
-            f(&VmRef {
-                objs: &objs,
-                queue: &queue,
-            });
+            f(&VmRef::on_queue(&objs, &queue));
             // この clone が最後の参照でも、解放は VM キューのスレッド上で行われる。
             drop(objs);
         });

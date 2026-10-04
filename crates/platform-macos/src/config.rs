@@ -687,6 +687,8 @@ fn conflict_error(field: ConfigField, path: &Path) -> ConfigError {
             field,
             path: path.to_path_buf(),
         },
+        // ConsoleLog は照合対象に来ない（`protected_inputs` は Kernel / Initrd / DiskImage だけを生成する）。
+        // match を網羅するための腕で、ディスクイメージとの衝突として扱う。
         ConfigField::DiskImage | ConfigField::ConsoleLog => {
             ConfigError::ConsoleLogConflictsWithDiskImage {
                 path: path.to_path_buf(),

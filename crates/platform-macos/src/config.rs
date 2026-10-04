@@ -176,6 +176,10 @@ pub enum ConfigError {
     SharedDirNotNormalized { path: PathBuf },
     /// 共有ディレクトリがファイルシステムのルート。
     SharedDirIsRoot,
+    /// 読み書き共有の配下に別のファイルシステムのマウントポイントがある（`path` は最初に見つかった境界）。
+    ///
+    /// 共有範囲の外のホスト領域が ReadWrite でゲストへ公開されるのを防ぐ（MAC-1・TASK-65.1）。
+    SharedDirCrossesMount { path: PathBuf, share_dir: PathBuf },
     /// 読み書き共有が VM の保護入力（kernel・initrd・ディスクイメージ・コンソールログ）を含む。
     ///
     /// `field` は保護入力の種別、`path` はその実体パス、`share_dir` は共有ディレクトリ。
@@ -240,6 +244,7 @@ impl ConfigError {
             ConfigError::SharedDirContainsProtectedInput { .. } => {
                 "config.shared_dir_contains_protected_input"
             }
+            ConfigError::SharedDirCrossesMount { .. } => "config.shared_dir_crosses_mount",
         }
     }
 
@@ -416,6 +421,13 @@ impl ConfigError {
             }
             ConfigError::SharedDirIsRoot => {
                 "sharing the filesystem root is not allowed".to_string()
+            }
+            ConfigError::SharedDirCrossesMount { path, share_dir } => {
+                format!(
+                    "read-write shared directory {} contains a mount point: {}",
+                    share_dir.display(),
+                    path.display()
+                )
             }
             ConfigError::SharedDirContainsProtectedInput {
                 field,
@@ -1038,11 +1050,19 @@ fn file_identity(field: ConfigField, path: &Path) -> Result<FileIdentity, Config
 #[cfg(unix)]
 const MAX_SHARE_SCAN_ENTRIES: usize = 1_000_000;
 
+/// エントリのデバイス番号が共有ルートと異なれば、マウント境界を越えている。
+#[cfg(unix)]
+fn crosses_mount(root_dev: u64, entry_dev: u64) -> bool {
+    root_dev != entry_dev
+}
+
 /// ReadWrite 共有の配下に、保護入力と同一 inode（`(dev, ino)` 一致）のエントリがあれば拒否する。
 ///
 /// パスの包含検査（[`crate::virtiofs::path_is_within`]）では、共有の外にある保護入力へのハードリンクを
 /// 共有内に置かれると検出できず、ゲストが同じ inode を書き換えられる（MAC-1・TASK-65.1。
 /// AGENTS.md の rootfs・マウント・ボリューム境界）。共有配下を symlink を辿らずに走査して照合する。
+/// 共有配下にルートと異なる `st_dev` のエントリ（マウントポイント）があれば
+/// [`ConfigError::SharedDirCrossesMount`] で拒否する（別ホスト領域の ReadWrite 公開防止）。
 /// 保護入力が未作成（コンソールログ等）なら照合対象から外す。走査の I/O 失敗・件数上限超過は
 /// fail-closed で `PathIo` を返す。unix 限定（Windows には `(dev, ino)` が無く、本 crate の
 /// 実行対象は macOS のため走査しない）。`check_share_conflicts` から呼ばれる。
@@ -1069,9 +1089,8 @@ fn find_hardlink_to_protected(
             }
         }
     }
-    if ids.is_empty() {
-        return Ok(());
-    }
+    // マウント境界の検出用に共有ルートのデバイス番号を控える（保護入力の有無に依らず走査する）。
+    let root_dev = std::fs::metadata(dir).map_err(io_err)?.dev();
     let mut stack = vec![dir.to_path_buf()];
     let mut scanned = 0usize;
     while let Some(d) = stack.pop() {
@@ -1086,6 +1105,13 @@ fn find_hardlink_to_protected(
             }
             // symlink は辿らない（共有外への経路を走査に含めない。リンク先の書き換えは virtiofs 側が解決する）。
             let meta = std::fs::symlink_metadata(entry.path()).map_err(io_err)?;
+            // 共有ルートと異なるデバイスのエントリはマウントポイント（別領域）。辿らず拒否する。
+            if crosses_mount(root_dev, meta.dev()) {
+                return Err(ConfigError::SharedDirCrossesMount {
+                    path: entry.path(),
+                    share_dir: dir.to_path_buf(),
+                });
+            }
             if meta.is_dir() {
                 stack.push(entry.path());
             } else if meta.is_file() {
@@ -2147,6 +2173,33 @@ mod tests {
                 assert_eq!(path, link);
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// MAC-1・TASK-65.1: マウント境界（`st_dev` の差）を判定し、共有配下の別デバイスを拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn mount_boundary_detection() {
+        assert!(!crosses_mount(5, 5));
+        assert!(crosses_mount(5, 6));
+        let t = TempDir::new("share-mount");
+        let real = std::fs::canonicalize(&t.0).unwrap();
+        std::fs::create_dir_all(real.join("a")).unwrap();
+        find_hardlink_to_protected(&real, &[]).unwrap();
+        // ルート直下にマウントポイント（/proc 等）を持つ実ディレクトリで拒否を確認する。
+        use std::os::unix::fs::MetadataExt;
+        let root_dev = std::fs::metadata("/").unwrap().dev();
+        let has_mount = std::fs::read_dir("/").unwrap().any(|e| {
+            std::fs::symlink_metadata(e.unwrap().path())
+                .map(|m| m.dev() != root_dev)
+                .unwrap_or(false)
+        });
+        if has_mount {
+            let err = find_hardlink_to_protected(Path::new("/"), &[]);
+            assert!(
+                matches!(err, Err(ConfigError::SharedDirCrossesMount { .. })),
+                "{err:?}"
+            );
         }
     }
 

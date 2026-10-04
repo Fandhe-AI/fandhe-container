@@ -31,7 +31,10 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+use windows_sys::Win32::System::Threading::{
+    GetProcessIdOfThread, OpenThread, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION,
+    THREAD_SUSPEND_RESUME,
+};
 
 /// `CommandExt::creation_flags` に渡す `CREATE_SUSPENDED`（初期スレッドを停止状態で作る）。
 ///
@@ -131,6 +134,8 @@ impl Job {
 /// `ResumeThread` する（`NtResumeProcess` 等の非公開 API は使わない）。`child` のプロセスハンドルを
 /// 借用している間は PID が再利用されないので、別プロセスのスレッドを再開することはない。
 /// 停止状態で作られたプロセスのスレッドは初期スレッド 1 本だけなので、通常は 1 を返す。
+/// スナップショット取得から `OpenThread` までの間にスレッド ID が再利用される競合に備え、開いた
+/// スレッドの所属プロセスを `GetProcessIdOfThread` で照合し、不一致なら再開せず `Err` にする。
 pub(crate) fn resume_suspended_threads(child: &Child) -> io::Result<usize> {
     let pid = child.id();
     // SAFETY: フラグと PID（スレッド列挙では無視される）を値で渡すだけ。失敗時は
@@ -147,31 +152,53 @@ pub(crate) fn resume_suspended_threads(child: &Child) -> io::Result<usize> {
         dwSize: entry_size,
         ..THREADENTRY32::default()
     };
+    // `th32ThreadID`・`th32OwnerProcessID` を読むのに必要な最小サイズ（両フィールドの終端）。
+    // Toolhelp は書き込んだ大きさを `dwSize` に返すため、これ未満のエントリは読まずに飛ばす。
+    let min_size = std::mem::offset_of!(THREADENTRY32, th32OwnerProcessID)
+        .saturating_add(std::mem::size_of::<u32>());
     let mut resumed = 0usize;
     // SAFETY: スナップショットハンドルは `snapshot` が所有する有効なもの。`entry` は `dwSize` を
-    // 構造体の正確なサイズに設定済みの書き込み可能領域で、関数はその範囲内にだけ書く。
+    // 構造体の正確なサイズに設定した書き込み可能領域で、関数はその範囲内にだけ書く。
     let mut more = unsafe { Thread32First(snapshot.as_raw_handle(), &raw mut entry) } != 0;
     while more {
-        if entry.th32OwnerProcessID == pid {
-            resume_thread(entry.th32ThreadID)?;
+        let filled = usize::try_from(entry.dwSize).unwrap_or(0);
+        if filled >= min_size && entry.th32OwnerProcessID == pid {
+            resume_thread(entry.th32ThreadID, pid)?;
             resumed = resumed.saturating_add(1);
         }
-        // SAFETY: `Thread32First` と同じ（`dwSize` は関数が書き換えず、初回に設定した値のまま）。
+        // Toolhelp は呼び出しのたびに `dwSize` を書き換えうるため、毎回正確なサイズに戻す。
+        entry.dwSize = entry_size;
+        // SAFETY: スナップショットハンドルは `snapshot` が所有する有効なもの。`entry` は直前に
+        // `dwSize` を構造体の正確なサイズへ再設定した書き込み可能領域で、関数はその範囲内にだけ書く。
         more = unsafe { Thread32Next(snapshot.as_raw_handle(), &raw mut entry) } != 0;
     }
     Ok(resumed)
 }
 
-/// スレッド ID `tid` を開いて 1 回 `ResumeThread` する。
-fn resume_thread(tid: u32) -> io::Result<()> {
+/// スレッド ID `tid` を開き、所属プロセスが `pid` であることを確かめてから 1 回 `ResumeThread` する。
+///
+/// スナップショット後に `tid` が別プロセスのスレッドへ再利用されていた場合は再開せず `Err`
+/// （fail-closed。呼び出し側は子を終了させて `INTERNAL` を返す）。
+fn resume_thread(tid: u32, pid: u32) -> io::Result<()> {
     // SAFETY: 値渡しの引数のみ（`bInheritHandle` は FALSE で継承不可）。失敗時は NULL を返すので
     // 検査してから所有権を取る。
-    let raw = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, tid) };
+    let raw = unsafe {
+        OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+            0,
+            tid,
+        )
+    };
     if raw.is_null() {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `raw` は直前に開いた有効なスレッドハンドルで、他に所有者はいない。
     let thread = unsafe { OwnedHandle::from_raw_handle(raw) };
+    if thread_process_id(&thread)? != pid {
+        return Err(io::Error::other(
+            "thread id was reused by another process before resume",
+        ));
+    }
     // SAFETY: `thread` が所有する有効なハンドル（THREAD_SUSPEND_RESUME 権限）。失敗時は
     // `u32::MAX`（`(DWORD)-1`）を返す。
     let prev = unsafe { ResumeThread(thread.as_raw_handle()) };
@@ -179,4 +206,15 @@ fn resume_thread(tid: u32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// スレッドハンドル `thread` が属するプロセスの ID を返す（失敗時は `Err`）。
+fn thread_process_id(thread: &OwnedHandle) -> io::Result<u32> {
+    // SAFETY: `thread` が所有する有効なスレッドハンドル（THREAD_QUERY_LIMITED_INFORMATION 権限）を
+    // 借用して渡すだけで、関数はハンドルを閉じない。失敗時は 0 を返す（0 は有効な PID ではない）。
+    let pid = unsafe { GetProcessIdOfThread(thread.as_raw_handle()) };
+    if pid == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(pid)
 }

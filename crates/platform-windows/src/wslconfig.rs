@@ -381,6 +381,52 @@ fn io_err(e: &std::io::Error, what: &str) -> WinError {
     err(code, what)
 }
 
+/// 事前に通常ファイルと確認したパスを開き、開いたハンドル自身を検証する。
+///
+/// パスの再解決による検査と使用の競合（TOCTOU）を避けるため、読み込みは必ずここで検証したハンドルから行う。
+/// Windows はリパースポイントを辿らずに開き、ハンドルの属性がリンクでないことを確認する。unix は開いた後に
+/// パスを `symlink_metadata` で引き直し、ハンドルと同一の inode（dev / ino）の通常ファイルであることを確認する
+/// （検査後にリンクや別ファイルへ差し替えられていれば拒否する）。
+fn open_verified(path: &Path) -> Result<std::fs::File, WinError> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: リパースポイントを辿らず、リンク自体を開く。
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = opts
+        .open(path)
+        .map_err(|e| io_err(&e, "failed to open .wslconfig"))?;
+    let handle_meta = file
+        .metadata()
+        .map_err(|e| io_err(&e, "failed to stat .wslconfig"))?;
+    if handle_meta.file_type().is_symlink() || !handle_meta.is_file() {
+        return Err(err(
+            WinErrorCode::PermissionDenied,
+            ".wslconfig is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let now =
+            std::fs::symlink_metadata(path).map_err(|e| io_err(&e, "failed to stat .wslconfig"))?;
+        if now.file_type().is_symlink()
+            || now.dev() != handle_meta.dev()
+            || now.ino() != handle_meta.ino()
+        {
+            return Err(err(
+                WinErrorCode::PermissionDenied,
+                ".wslconfig changed while it was being opened",
+            ));
+        }
+    }
+    Ok(file)
+}
+
 /// `.wslconfig` を読み込む。ファイルがなければ `Ok(None)`。
 ///
 /// シンボリックリンク・通常ファイル以外は拒否し（fail-closed）、[`MAX_WSLCONFIG_BYTES`] を超えるものと
@@ -403,7 +449,7 @@ pub fn load(path: &Path) -> Result<Option<WslConfig>, WinError> {
             ".wslconfig is not a regular file",
         ));
     }
-    let file = std::fs::File::open(path).map_err(|e| io_err(&e, "failed to open .wslconfig"))?;
+    let file = open_verified(path)?;
     let mut buf = Vec::new();
     file.take(MAX_WSLCONFIG_BYTES + 1)
         .read_to_end(&mut buf)
@@ -471,10 +517,8 @@ fn write_new_file(tmp: &Path, data: &[u8]) -> Result<std::fs::File, WinError> {
 ///   パーミッションを一時ファイルへ引き継ぐ。rename 成功後の親ディレクトリ fsync に失敗した場合は
 ///   置換済みのまま `Err` を返す。
 /// - [`WriteMode::Replace`]（Windows）: ACL を保持するため rename せず、リンクを辿らず開いたハンドルへ
-///   上書きする。上書き前に元の内容を同一ディレクトリの退避ファイルへ fsync 付きで保存し、成功すれば削除、
-///   失敗時は元の内容へ書き戻す。書き戻しにも失敗した場合（プロセス強制終了を含む）は退避ファイルを残し、
-///   エラーメッセージにそのパスを含める（自動復旧はしない。ACL 複製の Win32 API は依存追加が必要なため
-///   TASK-67.2 では採らない）。
+///   上書きする。上書きに失敗したらメモリ上の元の内容を書き戻す（ディスク上の退避ファイルは作らない。
+///   理由は [`overwrite_handle`]）。
 ///
 /// 失敗時は自分が作った一時ファイルだけを削除する。読み込みから書き込みまでの間の他プロセスによる
 /// 変更はロックしない（単一ユーザーのホーム配下の設定操作のため許容。新規作成の競合のみ上記で拒否する）。
@@ -501,7 +545,7 @@ fn write_atomic(path: &Path, data: &[u8], mode: WriteMode) -> Result<(), WinErro
     // 別操作に分けない（TOCTOU 回避）ため open の NotFound で判定する。
     #[cfg(windows)]
     {
-        if overwrite_existing(path, data, &tmp_path(parent, "bak"))? {
+        if overwrite_existing(path, data)? {
             Ok(())
         } else {
             Err(err(
@@ -552,9 +596,8 @@ fn write_atomic(path: &Path, data: &[u8], mode: WriteMode) -> Result<(), WinErro
 ///
 /// リパースポイント（シンボリックリンク等）を辿らずに開き、開いたハンドル自身で通常ファイルであることを
 /// 検証してから書く（検証と書き込みの対象が同一。TOCTOU 回避）。存在しなければ `Ok(false)`。
-/// `backup` は [`overwrite_handle`] が元の内容を退避するパス。
 #[cfg(windows)]
-fn overwrite_existing(path: &Path, data: &[u8], backup: &Path) -> Result<bool, WinError> {
+fn overwrite_existing(path: &Path, data: &[u8]) -> Result<bool, WinError> {
     use std::os::windows::fs::OpenOptionsExt;
     // FILE_FLAG_OPEN_REPARSE_POINT: リパースポイントを辿らず、リンク自体を開く。
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -577,20 +620,23 @@ fn overwrite_existing(path: &Path, data: &[u8], backup: &Path) -> Result<bool, W
             ".wslconfig is not a regular file",
         ));
     }
-    overwrite_handle(&mut f, data, backup)?;
+    overwrite_handle(&mut f, data)?;
     Ok(true)
 }
 
-/// 開いたファイルの内容を `data` へ置き換える。失敗しても元の内容を失わない。
+/// 開いたファイルの内容を `data` へ置き換える。上書きに失敗したらメモリ上の元の内容を書き戻す。
 ///
-/// 1. 元の内容を読み出し、`backup`（排他的に新規作成）へ fsync 付きで保存する。
+/// 1. 元の内容をメモリへ読み出す（上限 [`MAX_WSLCONFIG_BYTES`]）。
 /// 2. truncate で先に空にせず、先頭へ上書き → 長さ調整 → fsync する。
-/// 3. 成功したら `backup` を削除する。上書きに失敗したら元の内容を書き戻し、書き戻しも成功したら
-///    `backup` を削除する。書き戻しに失敗した場合は `backup` を残し、そのパスをエラーに含める。
+/// 3. 上書きに失敗したら元の内容を書き戻す。書き戻しにも失敗したら固定文言の `Err` を返す。
 ///
-/// プロセスが 2 の途中で終了した場合も `backup` に元の内容が残る（自動復旧はしない）。
+/// 元の内容をディスク上の別ファイルへ退避しない。退避ファイルは親ディレクトリの ACL を継承するため、
+/// 元ファイルより緩い権限で内容（`kernelCommandLine` 等の秘密情報を含みうる）が読めてしまう。ACL の
+/// 複製には Win32 API（依存追加はユーザー承認制）が必要なため、機密性を優先して退避ファイルを持たない。
+/// その代償として、2 の途中でプロセスが強制終了すると内容が欠ける可能性が残る（数 KB 以下の
+/// 単一 write のため窓は狭い。自動復旧はしない）。
 #[cfg_attr(unix, allow(dead_code))]
-fn overwrite_handle(f: &mut std::fs::File, data: &[u8], backup: &Path) -> Result<(), WinError> {
+fn overwrite_handle(f: &mut std::fs::File, data: &[u8]) -> Result<(), WinError> {
     use std::io::{Seek, SeekFrom};
     let mut original = Vec::new();
     Read::by_ref(f)
@@ -603,7 +649,6 @@ fn overwrite_handle(f: &mut std::fs::File, data: &[u8], backup: &Path) -> Result
             format!(".wslconfig exceeds {MAX_WSLCONFIG_BYTES} bytes"),
         ));
     }
-    drop(write_new_file(backup, &original)?);
     let put = |f: &mut std::fs::File, bytes: &[u8]| -> std::io::Result<()> {
         f.seek(SeekFrom::Start(0))?;
         f.write_all(bytes)?;
@@ -611,21 +656,12 @@ fn overwrite_handle(f: &mut std::fs::File, data: &[u8], backup: &Path) -> Result
         f.sync_all()
     };
     match put(f, data) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(backup);
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(e) => match put(f, &original) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(backup);
-                Err(io_err(&e, "failed to write .wslconfig"))
-            }
+            Ok(()) => Err(io_err(&e, "failed to write .wslconfig")),
             Err(_) => Err(err(
                 WinErrorCode::Internal,
-                format!(
-                    "failed to write .wslconfig and restore it; the original content is kept in {}",
-                    backup.display()
-                ),
+                "failed to write .wslconfig and failed to restore its original content",
             )),
         },
     }
@@ -884,9 +920,8 @@ mod tests {
             .write(true)
             .open(d.file())
             .expect("open");
-        let bak = d.0.join("bak");
-        overwrite_handle(&mut f, b"short", &bak).expect("overwrite");
-        assert!(!bak.exists());
+        overwrite_handle(&mut f, b"short").expect("overwrite");
+        assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
         assert_eq!(std::fs::read(d.file()).expect("read"), b"short");
     }
 
@@ -907,23 +942,6 @@ mod tests {
             b"[wsl2]\nmemory=4GB\n"
         );
         assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
-    }
-
-    /// WIN-2: 退避ファイルが既に存在する場合は上書きせず Err で、対象ファイルは無変更。
-    #[test]
-    fn overwrite_handle_refuses_existing_backup() {
-        let d = TmpDir::new("bakexists");
-        std::fs::write(d.file(), "original").expect("write");
-        let bak = d.0.join("bak");
-        std::fs::write(&bak, "other").expect("write");
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(d.file())
-            .expect("open");
-        overwrite_handle(&mut f, b"short", &bak).expect_err("must fail");
-        assert_eq!(std::fs::read(d.file()).expect("read"), b"original");
-        assert_eq!(std::fs::read(&bak).expect("read"), b"other");
     }
 
     /// WIN-2・AC2: ファイルがなければ新規作成する。

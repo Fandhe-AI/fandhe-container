@@ -140,6 +140,10 @@ impl ProcessTree {
 
     /// 停止状態の `child` を Job に割り当ててから再開する。失敗時は Job を破棄する（割り当て済みなら
     /// 子も終了する）ので、呼び出し側は子を kill・回収するだけでよい。
+    ///
+    /// 割り当てに失敗しても Job なしで再開して続行はしない（親の終了後に子孫を回収できず読み取り
+    /// スレッドが残る経路を作らないため。fail-closed）。入れ子の Job は Windows 8 以降で使え、新しい
+    /// 空の無名 Job の割り当てが失敗するのは、自プロセスの Job が UI 制限を持つ等で入れ子を許さない場合。
     fn attach(child: &Child) -> std::io::Result<Self> {
         let job = crate::sys::Job::new_kill_on_close()?;
         job.assign(child)?;
@@ -277,15 +281,20 @@ fn run_capture_in(
         ));
     };
     let mut child = cmd.spawn().map_err(|e| spawn_error(&e))?;
+    // Job に入れられない（自プロセスの Job が入れ子を許さない等）場合も、子孫を回収できない状態で
+    // 起動を続けず fail-closed にする（REPAIR-5）。原因を診断できるよう OS エラーをメッセージに含める。
     let tree = match ProcessTree::attach(&child) {
         Ok(tree) => tree,
-        Err(_) => {
+        Err(e) => {
             return Err(abort_with(
                 &mut child,
                 None,
                 Wsl2Error::new(
                     Wsl2ErrorCode::Internal,
-                    "failed to place wsl.exe in a job object",
+                    format!(
+                        "failed to place wsl.exe in a job object; the hosting job may not permit \
+                         nested job objects ({e})"
+                    ),
                 ),
             ));
         }

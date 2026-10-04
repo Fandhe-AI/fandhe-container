@@ -66,7 +66,8 @@ impl SharedDirectoryPath {
     /// 実体パスへ正規化して渡す。
     ///
     /// 共有ディレクトリが VM 自身の起動入力（kernel・initrd・ディスクイメージ・コンソールログ）を含むかは
-    /// 本型では検査しない。ReadWrite 共有との包含検査は `VmConfigSpec::check_share_conflicts` が行い、
+    /// 本型では検査しない。保護入力の包含検査（ReadWrite のみ）と共有範囲外経路の検査（ReadOnly・ReadWrite 共通）は
+    /// `VmConfigSpec::check_share_conflicts` が行い、
     /// `config::build_vz_configuration` が VZ 呼び出しの前に実施する（MAC-1・TASK-65.1）。
     pub fn try_new(path: &Path) -> Result<Self, ConfigError> {
         const FIELD: ConfigField = ConfigField::SharedDirectory;

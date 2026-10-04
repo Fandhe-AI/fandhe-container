@@ -559,6 +559,31 @@ mod tests {
         assert_eq!(e.code(), Wsl2ErrorCode::DataLoss);
     }
 
+    /// ERR-1・REPAIR-5: 正常終了の出力が上限超過（行長 1024 バイト超）なら、無効・アクセス拒否・0 件の
+    /// 識別子を含んでいても RESOURCE_EXHAUSTED のまま返す（識別子による再分類は DATA_LOSS に限る）。
+    #[test]
+    fn resource_exhausted_is_not_reclassified() {
+        let cap = |out: String| run::Captured {
+            success: true,
+            code: Some(0),
+            stdout: out.into_bytes(),
+            stderr: Vec::new(),
+        };
+        let long = "x".repeat(1025);
+        for id in [
+            "Wsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED",
+            "Wsl/Service/E_ACCESSDENIED",
+            "Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND",
+        ] {
+            let out = cap(format!("{long}\nError code: {id}\n"));
+            let e = interpret_list(&out).unwrap_err();
+            assert_eq!(e.code(), Wsl2ErrorCode::ResourceExhausted, "{id}");
+            assert_eq!(e.message(), "output line exceeded the length limit");
+            let e = interpret_version(&out).unwrap_err();
+            assert_eq!(e.code(), Wsl2ErrorCode::ResourceExhausted, "{id}");
+        }
+    }
+
     /// ERR-1: 起動後に WSL が返したアクセス拒否は、起動時の権限不足と同じ PERMISSION_DENIED になる。
     #[test]
     fn access_denied_is_permission_denied() {

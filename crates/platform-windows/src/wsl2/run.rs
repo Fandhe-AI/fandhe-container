@@ -4,6 +4,10 @@
 //! プログラムのパスを引数で受け取るので、テストでは本物の `wsl.exe` を起動せずに済む。
 //! 期限切れでは子を kill して回収する。読み取りスレッドは孫プロセスがパイプを握り続けても
 //! 戻れるよう、無期限に join しない。
+//!
+//! Windows では子を `CREATE_SUSPENDED` で起動し、Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）へ
+//! 割り当ててから再開する（[`ProcessTree`]）。これで `wsl.exe` が先に終了した後もパイプを継承した
+//! 子孫を終了でき、読み取りスレッドは EOF で必ず終わる（REPAIR-5）。
 
 use std::io::Read;
 use std::path::Path;
@@ -29,10 +33,11 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 同時に生存を許す読み取りスレッド数の上限（REPAIR-5）。
 ///
-/// 孫プロセスがパイプを握り続けると、期限切れ後も読み取りスレッドはブロッキング `read()` から
-/// 戻れない。std だけではスレッド側のパイプを外部から閉じられないため、残留スレッドが
-/// 無制限に蓄積しないよう上限を設け、超過時は新規起動を `RESOURCE_EXHAUSTED` で拒否する
-/// （孫がパイプを閉じれば EOF でスレッドは終了し、カウントは戻る）。
+/// 孫プロセスがパイプを握り続けると、読み取りスレッドはブロッキング `read()` から戻れない。
+/// Windows では [`ProcessTree`] が子孫ごと終了させるのでスレッドは EOF で終わるが、Job の
+/// 終了に失敗した場合や Windows 以外でも残留スレッドが無制限に蓄積しないよう、多重防御として
+/// 上限を設け、超過時は新規起動を `RESOURCE_EXHAUSTED` で拒否する（パイプが閉じれば EOF で
+/// スレッドは終了し、カウントは戻る）。
 const MAX_LIVE_READERS: usize = 64;
 
 /// 生存中の読み取りスレッド数。
@@ -42,11 +47,6 @@ static LIVE_READERS: AtomicUsize = AtomicUsize::new(0);
 struct ReaderGuard(&'static AtomicUsize);
 
 impl ReaderGuard {
-    /// 上限未満なら加算してガードを返す。
-    fn acquire() -> Option<Self> {
-        Self::acquire_in(&LIVE_READERS, MAX_LIVE_READERS)
-    }
-
     fn acquire_in(counter: &'static AtomicUsize, max: usize) -> Option<Self> {
         // `fetch_update` / `try_update` は stable の版で改名されるため、版差を避けて CAS ループで書く。
         let mut cur = counter.load(Ordering::SeqCst);
@@ -121,48 +121,67 @@ fn spawn_reader<R: Read + Send + 'static>(
     rx
 }
 
-/// 子孫プロセスを含めて終了させる試み（Windows のみ。`taskkill /T` は std の範囲で孫を閉じる手段）。
+/// 子とその子孫をまとめて終了させる手段（Windows は Job Object。REPAIR-5）。
 ///
-/// 孫がパイプを握ったままだと読み取りスレッドが残るため、kill 前に呼ぶ。失敗は無視する
-/// （残留は `MAX_LIVE_READERS` で抑える）。`taskkill` 自体も `REAP_TIMEOUT` で打ち切る。
+/// [`ProcessTree::prepare`] で起動前の `Command` を設定し、起動直後に [`ProcessTree::attach`] で
+/// 子を Job に入れてから再開する。停止状態のまま割り当てるので、割り当て前に子孫が生まれて Job の
+/// 外へ漏れる競合はない。値を破棄すると Job のハンドルが閉じ、残っている子孫もすべて終了する
+/// （`run_capture` はどの経路で戻っても子孫を残さない）。
 #[cfg(windows)]
-fn kill_tree(child: &Child) {
-    // `PATH` 探索を避け、システムディレクトリの `taskkill.exe` を絶対パスで起動する（PLUG-11）。
-    let Some(dir) = crate::sys::system_directory() else {
-        return;
-    };
-    let Ok(mut killer) = Command::new(dir.join("taskkill.exe"))
-        .args(["/T", "/F", "/PID", &child.id().to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return;
-    };
-    let deadline = Instant::now() + REAP_TIMEOUT;
-    while matches!(killer.try_wait(), Ok(None)) {
-        if Instant::now() >= deadline {
-            // 強制終了後の回収も期限付きの `try_wait()` で行い、無期限に `wait()` しない（REPAIR-5）。
-            let _ = killer.kill();
-            let reap_deadline = Instant::now() + REAP_TIMEOUT;
-            while matches!(killer.try_wait(), Ok(None)) && Instant::now() < reap_deadline {
-                thread::sleep(Duration::from_millis(10));
-            }
-            return;
+struct ProcessTree(crate::sys::Job);
+
+#[cfg(windows)]
+impl ProcessTree {
+    /// 初期スレッドを停止状態で作るよう `cmd` を設定する。
+    fn prepare(cmd: &mut Command) {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(crate::sys::CREATE_SUSPENDED);
+    }
+
+    /// 停止状態の `child` を Job に割り当ててから再開する。失敗時は Job を破棄する（割り当て済みなら
+    /// 子も終了する）ので、呼び出し側は子を kill・回収するだけでよい。
+    fn attach(child: &Child) -> std::io::Result<Self> {
+        let job = crate::sys::Job::new_kill_on_close()?;
+        job.assign(child)?;
+        if crate::sys::resume_suspended_threads(child)? == 0 {
+            return Err(std::io::Error::other(
+                "no thread of the suspended child was resumed",
+            ));
         }
-        thread::sleep(Duration::from_millis(10));
+        Ok(Self(job))
+    }
+
+    /// Job に属する子と子孫をすべて終了させる。失敗は無視する（回収は `kill_and_reap` が期限付きで
+    /// 行い、残留スレッドは `MAX_LIVE_READERS` で抑える）。
+    fn kill(&self) {
+        let _ = self.0.terminate(1);
     }
 }
 
+/// Windows 以外では子孫をまとめる手段を持たない（`wsl.exe` は Windows にしかなく、本経路は
+/// 3 OS でのテスト用。子だけを kill する）。
 #[cfg(not(windows))]
-fn kill_tree(_child: &Child) {}
+struct ProcessTree;
+
+#[cfg(not(windows))]
+impl ProcessTree {
+    fn prepare(_cmd: &mut Command) {}
+
+    fn attach(_child: &Child) -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    fn kill(&self) {}
+}
 
 /// 子を kill して `REAP_TIMEOUT` 以内に回収する。kill の失敗は無視せず、回収できるまで待つ
 /// （既に終了していれば kill は失敗しうるが、その場合は回収に成功する）。
 /// 回収できなければ `INTERNAL`（無期限に `wait()` しない。REPAIR-5）。
-fn kill_and_reap(child: &mut Child) -> Result<(), Wsl2Error> {
-    kill_tree(child);
+/// `tree` があれば先に子孫ごと終了させる（親が終了済みでもパイプを握る子孫を残さない）。
+fn kill_and_reap(child: &mut Child, tree: Option<&ProcessTree>) -> Result<(), Wsl2Error> {
+    if let Some(tree) = tree {
+        tree.kill();
+    }
     let kill_result = child.kill();
     let deadline = Instant::now() + REAP_TIMEOUT;
     loop {
@@ -189,8 +208,8 @@ fn kill_and_reap(child: &mut Child) -> Result<(), Wsl2Error> {
 }
 
 /// 子を kill・回収したうえで `err` を返す。回収に失敗したときはそのエラーを優先する。
-fn abort_with(child: &mut Child, err: Wsl2Error) -> Wsl2Error {
-    match kill_and_reap(child) {
+fn abort_with(child: &mut Child, tree: Option<&ProcessTree>, err: Wsl2Error) -> Wsl2Error {
+    match kill_and_reap(child, tree) {
         Ok(()) => err,
         Err(reap_err) => reap_err,
     }
@@ -225,6 +244,19 @@ pub(super) fn run_capture(
     timeout: Duration,
     max_bytes: usize,
 ) -> Result<Captured, Wsl2Error> {
+    run_capture_in(&LIVE_READERS, program, args, envs, timeout, max_bytes)
+}
+
+/// [`run_capture`] の本体。読み取りスレッドの生存数を `readers` で数える（テストは専用のカウンタを
+/// 渡し、並行する他のテストに影響されずにスレッドの終了を確認する）。
+fn run_capture_in(
+    readers: &'static AtomicUsize,
+    program: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<Captured, Wsl2Error> {
     let deadline = Instant::now() + timeout;
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -234,17 +266,35 @@ pub(super) fn run_capture(
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let (Some(out_guard), Some(err_guard)) = (ReaderGuard::acquire(), ReaderGuard::acquire())
-    else {
+    ProcessTree::prepare(&mut cmd);
+    let (Some(out_guard), Some(err_guard)) = (
+        ReaderGuard::acquire_in(readers, MAX_LIVE_READERS),
+        ReaderGuard::acquire_in(readers, MAX_LIVE_READERS),
+    ) else {
         return Err(Wsl2Error::new(
             Wsl2ErrorCode::ResourceExhausted,
             "too many outstanding wsl.exe output readers",
         ));
     };
     let mut child = cmd.spawn().map_err(|e| spawn_error(&e))?;
+    let tree = match ProcessTree::attach(&child) {
+        Ok(tree) => tree,
+        Err(_) => {
+            return Err(abort_with(
+                &mut child,
+                None,
+                Wsl2Error::new(
+                    Wsl2ErrorCode::Internal,
+                    "failed to place wsl.exe in a job object",
+                ),
+            ));
+        }
+    };
+    let tree = Some(&tree);
     let (Some(out_pipe), Some(err_pipe)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(abort_with(
             &mut child,
+            tree,
             Wsl2Error::new(Wsl2ErrorCode::Internal, "failed to capture output pipes"),
         ));
     };
@@ -264,12 +314,14 @@ pub(super) fn run_capture(
         if out.as_ref().is_some_and(|o| o.io_error) || err.as_ref().is_some_and(|e| e.io_error) {
             return Err(abort_with(
                 &mut child,
+                tree,
                 Wsl2Error::new(Wsl2ErrorCode::Internal, "failed to read wsl.exe output"),
             ));
         }
         if out.as_ref().is_some_and(|o| o.overflow) || err.as_ref().is_some_and(|e| e.overflow) {
             return Err(abort_with(
                 &mut child,
+                tree,
                 Wsl2Error::new(
                     Wsl2ErrorCode::ResourceExhausted,
                     "wsl.exe output exceeded the size limit",
@@ -282,6 +334,7 @@ pub(super) fn run_capture(
                 Err(_) => {
                     return Err(abort_with(
                         &mut child,
+                        tree,
                         Wsl2Error::new(Wsl2ErrorCode::Internal, "failed to wait for wsl.exe"),
                     ));
                 }
@@ -298,6 +351,7 @@ pub(super) fn run_capture(
         if Instant::now() >= deadline {
             return Err(abort_with(
                 &mut child,
+                tree,
                 Wsl2Error::new(
                     Wsl2ErrorCode::Timeout,
                     "wsl.exe did not finish before the deadline",
@@ -314,6 +368,8 @@ mod tests {
     use super::*;
 
     const ENV_MODE: &str = "FANDHE_WSL2_TEST_HELPER";
+    /// 読み取りスレッド単体のテスト用カウンタ（本番の `LIVE_READERS` と分ける）。
+    static TEST_READERS: AtomicUsize = AtomicUsize::new(0);
     const HELPER: &str = "wsl2::run::tests::helper";
 
     /// 自己再実行される子側。環境変数がなければ即座に成功する（通常のテスト実行では何もしない）。
@@ -379,9 +435,13 @@ mod tests {
                 Ok(3)
             }
         }
-        let p = spawn_reader(Failing(false), 1024, ReaderGuard::acquire().unwrap())
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap();
+        let p = spawn_reader(
+            Failing(false),
+            1024,
+            ReaderGuard::acquire_in(&TEST_READERS, MAX_LIVE_READERS).unwrap(),
+        )
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
         assert!(p.io_error);
         assert!(!p.overflow);
         assert_eq!(p.buf, b"abc");
@@ -390,9 +450,13 @@ mod tests {
     /// 正常な EOF は io_error にならない。
     #[test]
     fn reader_eof_is_not_error() {
-        let p = spawn_reader(&b"hello"[..], 1024, ReaderGuard::acquire().unwrap())
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap();
+        let p = spawn_reader(
+            &b"hello"[..],
+            1024,
+            ReaderGuard::acquire_in(&TEST_READERS, MAX_LIVE_READERS).unwrap(),
+        )
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
         assert!(!p.io_error);
         assert_eq!(p.buf, b"hello");
     }

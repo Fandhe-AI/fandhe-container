@@ -163,13 +163,23 @@ mod linux {
             .arg("--inner")
             .env(LAUNCHER_PID_ENV, std::process::id().to_string())
             .env(DIR_ENV, &dir)
+            // 期限切れ時に nsenter 以下の子孫まで回収できるよう、子を新しいプロセスグループに入れる。
+            .process_group(0)
             .spawn()
             .expect("spawn unshare --net --mount");
+        let pgid = child.id();
         let deadline = Instant::now() + timeout() * 6;
         let code = loop {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
                 None if Instant::now() >= deadline => {
+                    // 直接の子だけでなくグループ全体（--inner・nsenter・その子孫）を SIGKILL して回収する。
+                    let _ = Command::new("kill")
+                        .args(["-KILL", "--", &format!("-{pgid}")])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
                     let _ = child.kill();
                     let _ = child.wait();
                     println!("static_dns_privileged: inner did not finish before deadline");

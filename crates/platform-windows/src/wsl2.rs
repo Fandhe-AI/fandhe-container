@@ -319,26 +319,52 @@ fn not_enabled_error() -> Wsl2Error {
 }
 
 /// `--version` の実行結果を解釈する。
+///
+/// 正常終了でもバージョンとして読めない出力が WSL 無効・アクセス拒否の識別子を含むなら、解析エラー
+/// ではなく対応する構造化エラーを返す（[`interpret_list`] と同じ扱い。ERR-1）。
 fn interpret_version(out: &run::Captured) -> Result<WslVersionInfo, Wsl2Error> {
     if !out.success {
         return Err(failure_error(out, "wsl.exe --version failed"));
     }
-    parse::parse_version(&parse::decode_output(&out.stdout)?)
+    parse::decode_output(&out.stdout)
+        .and_then(|t| parse::parse_version(&t))
+        .map_err(|parse_err| match parse::classify_failure(out) {
+            parse::Failure::WslDisabled | parse::Failure::PermissionDenied => {
+                failure_error(out, "wsl.exe --version failed")
+            }
+            _ => parse_err,
+        })
 }
 
-/// `-l -v` の実行結果を解釈する。ディストリ 0 件を示す専用識別子は、終了コードの成否を
-/// 問わず空の一覧として扱う（0 件の案内文を終了コード 0 で返す環境がある）。
+/// `-l -v` の実行結果を解釈する。
+///
+/// 正常終了なら、まず一覧（ヘッダーと各行）として解析し、解析できればそれを返す（ディストリ名が
+/// エラー識別子と同じ文字列でも、正常な一覧を失敗扱いにしない）。一覧として読めない場合に限り
+/// 失敗出力として分類する: ディストリ 0 件の専用識別子だけなら空の一覧（0 件の案内文を終了コード 0 で
+/// 返す環境がある）、WSL 無効・アクセス拒否なら対応する構造化エラー、それ以外は解析エラー（DATA_LOSS）。
+/// 非ゼロ終了は、0 件の識別子だけなら空の一覧、それ以外は [`failure_error`]（ERR-1）。
 fn interpret_list(out: &run::Captured) -> Result<Vec<WslDistro>, Wsl2Error> {
+    if out.success {
+        let parse_err =
+            match parse::decode_output(&out.stdout).and_then(|t| parse::parse_distros(&t)) {
+                Ok(distros) => return Ok(distros),
+                Err(e) => e,
+            };
+        return match parse::classify_failure(out) {
+            parse::Failure::NoDistro => Ok(Vec::new()),
+            parse::Failure::WslDisabled | parse::Failure::PermissionDenied => {
+                Err(failure_error(out, "wsl.exe -l -v failed"))
+            }
+            parse::Failure::Unknown => Err(parse_err),
+        };
+    }
     if matches!(parse::classify_failure(out), parse::Failure::NoDistro) {
         return Ok(Vec::new());
     }
-    if !out.success {
-        return Err(failure_error(out, "wsl.exe -l -v failed"));
-    }
-    parse::parse_distros(&parse::decode_output(&out.stdout)?)
+    Err(failure_error(out, "wsl.exe -l -v failed"))
 }
 
-/// 非ゼロ終了を、既知トークンで分類したエラーへ写す。
+/// 失敗出力（主に非ゼロ終了）を、既知トークンで分類したエラーへ写す。
 fn failure_error(out: &run::Captured, context: &str) -> Wsl2Error {
     match parse::classify_failure(out) {
         parse::Failure::WslDisabled => not_enabled_error(),

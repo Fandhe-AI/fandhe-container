@@ -11,8 +11,8 @@
 //! コンソール（ログファイル出力）を [`DeviceConfigSpec`] で表す。
 //!
 //! 呼び出し文脈: TASK-64.4 が構築済み設定から `VZVirtualMachine` を生成して起動し、ゲストの
-//! `console=hvc0` 出力をコンソールログから確認する（TASK-64.6 の vm_boot 結合試験）。[`ConfigError`] は TASK-64.5 で `VmError` に包む予定
-//! （REPAIR-3: 現時点では未統合）。検証後〜起動までの TOCTOU（ファイル差し替え）は残るため、
+//! `console=hvc0` 出力をコンソールログから確認する（TASK-64.6 の vm_boot 結合試験）。[`ConfigError`] は
+//! `error::PlatformError`（TASK-64.5）に包まれて返る。検証後〜起動までの TOCTOU（ファイル差し替え）は残るため、
 //! 起動時の読み込み失敗は TASK-64.4/64.5 のエラー経路で扱う。kernel / initrd / ディスクイメージの配置
 //! ディレクトリは他者書き込み不可であることを前提とする（他者が差し替えられる場所に置かない）。
 //! コンソールログの open は `O_NOFOLLOW` で最終パス要素の symlink 追従を open 時点で拒否し、

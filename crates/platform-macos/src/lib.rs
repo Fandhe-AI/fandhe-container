@@ -1,8 +1,9 @@
 //! fandhe-container-platform-macos: macOS Virtualization.framework 経由の VM 起動・VirtioFS（MAC-1）。
 //!
 //! 現状は VM 設定・最小デバイス構成（`config`。TASK-64.2・64.3）・コンソールログの上限つき書き出し
-//! （`console_log`。TASK-64.3）とライフサイクル（`vm`。TASK-64.4）まで実装済みで、
-//! タイムアウト既定値・クリーンアップ・エラー型統合は TASK-64.5 で実装する（REPAIR-3: 実装済みを装わない）。
+//! （`console_log`。TASK-64.3）・ライフサイクル（`vm`。TASK-64.4）・構造化エラー（`error`）と
+//! タイムアウト既定値・起動失敗時のクリーンアップ（`vm::Vm::launch`。TASK-64.5）まで実装済み。
+//! 協調停止・pause / resume / save / restore と plugin 境界のエラー写像（TASK-115）は未実装（REPAIR-3）。
 //!
 //! - プラットフォーム対応: OS 非依存の検証ロジックは全 OS でビルドし 3 OS CI でテストする。
 //!   Virtualization.framework 呼び出し（`sys`・構築関数）のみ `cfg(target_os = "macos")` で局所化する（CLI-1）。
@@ -14,6 +15,7 @@
 pub mod config;
 #[cfg(unix)]
 pub mod console_log;
+pub mod error;
 pub mod vm;
 
 #[cfg(target_os = "macos")]

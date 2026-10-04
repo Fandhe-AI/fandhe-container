@@ -1,0 +1,96 @@
+//! macOS の `statfs(2)` の薄いラッパー（`sys` モジュールの macOS 部。`unsafe` 事前承認の範囲。
+//! coding-rust.md「unsafe・FFI・syscall」節・オーナー決定 2026-09-27
+//! 〔[#4](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856057084)・
+//! [範囲限定](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856167174)〕）。
+//!
+//! 呼び出し文脈: `config` の ReadWrite 共有の走査が、配下のディレクトリが共有ルートと同じマウントに
+//! 属するかを [`mount_identity`] で照合する（MAC-1・TASK-65.1）。`st_dev` だけでは同一デバイス上の
+//! 別マウント（nullfs 等）を見分けられないため、カーネルが返すマウント先（`f_mntonname`）と
+//! `f_fsid` を比較する。`libc` / `nix` は依存追加が禁止（dependency-policy）のため、`posix.rs` と同じ流儀で
+//! 必要最小限の `extern "C"` 宣言と構造体を自前で持つ。
+//!
+//! 不変条件: `unsafe fn` を公開しない。公開するのは安全な [`mount_identity`]（`pub(crate)`）のみ。
+
+use std::ffi::{CString, c_char, c_int};
+use std::io;
+use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
+/// `<sys/mount.h>` の `MFSTYPENAMELEN`。
+const MFSTYPENAMELEN: usize = 16;
+/// `<sys/param.h>` の `MAXPATHLEN`（`f_mntonname` / `f_mntfromname` の長さ）。
+const MAXPATHLEN: usize = 1024;
+
+/// `struct statfs`（64 bit inode 版。`_DARWIN_FEATURE_64_BIT_INODE` 定義時の `<sys/mount.h>`）。
+///
+/// フィールドの順序と幅は `libc` クレート（apple）の `statfs` 定義と同じ。aarch64 は `statfs` が、
+/// x86_64 は `statfs$INODE64` がこの配置を使う。
+#[repr(C)]
+// FFI の配置を写すため、読まないフィールドも持つ。
+#[allow(dead_code)]
+struct Statfs {
+    f_bsize: u32,
+    f_iosize: i32,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_owner: u32,
+    f_type: u32,
+    f_flags: u32,
+    f_fssubtype: u32,
+    f_fstypename: [c_char; MFSTYPENAMELEN],
+    f_mntonname: [c_char; MAXPATHLEN],
+    f_mntfromname: [c_char; MAXPATHLEN],
+    f_flags_ext: u32,
+    f_reserved: [u32; 7],
+}
+
+// 構造体の写し間違いをコンパイル時に止める（4+4+5×8+8+4×4+16+1024+1024+4+7×4 = 2168、8 バイト整列）。
+const _: () = assert!(std::mem::size_of::<Statfs>() == 2168);
+const _: () = assert!(std::mem::align_of::<Statfs>() == 8);
+
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: `int statfs(const char *path, struct statfs *buf)`。x86_64 では
+    // 64 bit inode 版のシンボル `statfs$INODE64` が上記 `Statfs` の配置を使う（aarch64 は既定がこの版）。
+    #[cfg_attr(not(target_arch = "aarch64"), link_name = "statfs$INODE64")]
+    fn statfs(path: *const c_char, buf: *mut Statfs) -> c_int;
+}
+
+/// パスが属するマウントの識別子（`f_fsid` とマウント先 `f_mntonname`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MountIdentity {
+    fsid: [i32; 2],
+    mount_on: Vec<u8>,
+}
+
+/// `path` が属するマウントの識別子を返す（`statfs(2)`。symlink は辿る）。
+///
+/// `path` に NUL を含む場合は `InvalidInput`、`statfs` 失敗は `errno` 由来の `io::Error` を返す。
+pub(crate) fn mount_identity(path: &Path) -> io::Result<MountIdentity> {
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut buf = MaybeUninit::<Statfs>::uninit();
+    // SAFETY: `c_path` は NUL 終端の有効な C 文字列で、呼び出し中は生存する。`buf` は `Statfs` の
+    // 大きさ・整列を持つ書き込み可能な領域で、カーネルが成功時に全体を書き込む。グローバル状態は変えない。
+    let rc = unsafe { statfs(c_path.as_ptr(), buf.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `statfs` が 0 を返したため、`buf` はカーネルにより初期化済み。
+    let st = unsafe { buf.assume_init() };
+    // `f_mntonname` は NUL 終端を探し、配列の範囲内だけを読む（NUL が無ければ全長）。
+    let len = st
+        .f_mntonname
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(MAXPATHLEN);
+    let mount_on = st.f_mntonname.iter().take(len).map(|&c| c as u8).collect();
+    Ok(MountIdentity {
+        fsid: st.f_fsid,
+        mount_on,
+    })
+}

@@ -1070,6 +1070,100 @@ fn crosses_mount(root_dev: u64, entry_dev: u64) -> bool {
     root_dev != entry_dev
 }
 
+/// `/proc/self/mountinfo` の読み込み上限（無制限確保の防止。超えたら fail-closed で拒否する）。
+#[cfg(target_os = "linux")]
+const MAX_MOUNTINFO_BYTES: u64 = 16 * 1024 * 1024;
+
+/// `/proc/self/mountinfo` の `mountpoint` 欄（8 進エスケープ `\040` 等）を元のバイト列へ戻す。
+///
+/// `fandhe-container-net` の `netns.rs` と同じ流儀の最小実装（crate をまたいで非公開関数を共有しないため
+/// 本 crate に置く）。
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(field: &str) -> Vec<u8> {
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        if c == b'\\'
+            && let Some(oct) = b.get(i + 1..i + 4)
+            && oct.iter().all(|d| (b'0'..=b'7').contains(d))
+        {
+            let v = oct
+                .iter()
+                .fold(0u32, |acc, d| acc * 8 + u32::from(d - b'0'));
+            if let Ok(byte) = u8::try_from(v) {
+                out.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// `mountinfo`（`/proc/self/mountinfo` の内容）上で、`dir` の真の配下にあるマウントポイントを返す
+/// （OS 呼び出しを含まない純粋関数）。`dir` 自身がマウントポイントなのは対象外。比較は要素単位
+/// （`/x/share2` を `/x/share` の配下と誤判定しない）。欄が欠けた行は読み飛ばす。
+#[cfg(target_os = "linux")]
+fn mount_point_under(mountinfo: &str, dir: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    mountinfo.lines().find_map(|line| {
+        let field = line.split_ascii_whitespace().nth(4)?;
+        let mp = PathBuf::from(std::ffi::OsStr::from_bytes(&unescape_mountinfo(field)));
+        (mp != dir && mp.starts_with(dir)).then_some(mp)
+    })
+}
+
+/// 共有ルート `dir` の配下にあるマウントを、マウント表から検出して拒否する（MAC-1・TASK-65.1）。
+///
+/// `st_dev` の比較だけでは、同一ファイルシステム上の別ディレクトリの bind mount（同じ `st_dev`）を
+/// 見分けられない。Linux は `/proc/self/mountinfo` のマウントポイントを列挙して判定する。
+#[cfg(target_os = "linux")]
+fn reject_mounts_under(dir: &Path) -> Result<(), ConfigError> {
+    use std::io::Read;
+    let io_err = |e: std::io::Error| ConfigError::PathIo {
+        field: ConfigField::SharedDirectory,
+        kind: e.kind(),
+    };
+    let mut raw = Vec::new();
+    std::fs::File::open("/proc/self/mountinfo")
+        .map_err(io_err)?
+        .take(MAX_MOUNTINFO_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(io_err)?;
+    if u64::try_from(raw.len()).map_or(true, |n| n > MAX_MOUNTINFO_BYTES) {
+        return Err(ConfigError::PathIo {
+            field: ConfigField::SharedDirectory,
+            kind: std::io::ErrorKind::Other,
+        });
+    }
+    match mount_point_under(&String::from_utf8_lossy(&raw), dir) {
+        Some(path) => Err(ConfigError::SharedDirCrossesMount {
+            path,
+            share_dir: dir.to_path_buf(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// macOS はマウント表を列挙せず、走査中のディレクトリごとに `statfs(2)` のマウント識別子
+/// （`f_fsid`・`f_mntonname`）を共有ルートと比較する（[`find_hardlink_to_protected`]）。ここでは何もしない。
+#[cfg(target_os = "macos")]
+fn reject_mounts_under(_dir: &Path) -> Result<(), ConfigError> {
+    Ok(())
+}
+
+/// Linux・macOS 以外の unix はマウント境界を確かめる手段を持たないため、fail-closed で拒否する。
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn reject_mounts_under(_dir: &Path) -> Result<(), ConfigError> {
+    Err(ConfigError::PathIo {
+        field: ConfigField::SharedDirectory,
+        kind: std::io::ErrorKind::Unsupported,
+    })
+}
+
 /// ReadWrite 共有配下の symlink `link` のリンク先が、共有範囲 `dir`（symlink を解決済みの実体パス）に
 /// 収まることを確認する（MAC-1・TASK-65.1。AGENTS.md の rootfs・マウント・ボリューム境界）。
 ///
@@ -1128,6 +1222,9 @@ fn check_symlink_within_share(link: &Path, dir: &Path) -> Result<(), ConfigError
 /// AGENTS.md の rootfs・マウント・ボリューム境界）。共有配下を symlink を辿らずに走査して照合する。
 /// 共有配下にルートと異なる `st_dev` のエントリ（マウントポイント）があれば
 /// [`ConfigError::SharedDirCrossesMount`] で拒否する（別ホスト領域の ReadWrite 公開防止）。
+/// 同一デバイス上の別マウント（Linux の bind mount・macOS の nullfs 等）は `st_dev` が同じため、
+/// Linux はマウント表（[`reject_mounts_under`]）、macOS はディレクトリごとの `statfs(2)` のマウント識別子で
+/// 検出する。検査後に新たにマウントされる TOCTOU は残る。
 /// 共有配下の symlink はリンク先が共有範囲に収まることを [`check_symlink_within_share`] で確認し、
 /// 確認できなければ [`ConfigError::SharedDirSymlinkEscapes`] で拒否する（範囲外への書き込み経路の防止）。
 /// 保護入力が未作成（コンソールログ等）なら照合対象から外す。走査の I/O 失敗・件数上限超過は
@@ -1156,8 +1253,13 @@ fn find_hardlink_to_protected(
             }
         }
     }
+    // 同一デバイスの bind mount をマウント表で検出する（Linux。macOS は下の走査で statfs により検出）。
+    reject_mounts_under(dir)?;
     // マウント境界の検出用に共有ルートのデバイス番号を控える（保護入力の有無に依らず走査する）。
     let root_dev = std::fs::metadata(dir).map_err(io_err)?.dev();
+    // macOS: 共有ルートのマウント識別子（`f_fsid`・`f_mntonname`）。同一デバイスの別マウント検出用。
+    #[cfg(target_os = "macos")]
+    let root_mount = crate::sys::mount_identity(dir).map_err(io_err)?;
     let mut stack = vec![dir.to_path_buf()];
     let mut scanned = 0usize;
     while let Some(d) = stack.pop() {
@@ -1182,6 +1284,15 @@ fn find_hardlink_to_protected(
             if meta.file_type().is_symlink() {
                 check_symlink_within_share(&entry.path(), dir)?;
             } else if meta.is_dir() {
+                // macOS の mount(2) はディレクトリにだけマウントできるため、識別子の照合はディレクトリに限る。
+                // `statfs` は symlink を辿るが、ここに来るのは symlink でない実ディレクトリだけ。
+                #[cfg(target_os = "macos")]
+                if crate::sys::mount_identity(&entry.path()).map_err(io_err)? != root_mount {
+                    return Err(ConfigError::SharedDirCrossesMount {
+                        path: entry.path(),
+                        share_dir: dir.to_path_buf(),
+                    });
+                }
                 stack.push(entry.path());
             } else if meta.is_file() {
                 let id = (meta.dev(), meta.ino());

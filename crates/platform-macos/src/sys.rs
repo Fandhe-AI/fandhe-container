@@ -21,6 +21,8 @@
 //!
 //! unix 共通の POSIX ラッパー（`geteuid` 等）は子モジュール `posix`（`src/sys/posix.rs`）に置く。macOS 以外の
 //! unix では `lib.rs` が `posix` だけを持つ `sys` を定義し、同じ `crate::sys::effective_uid` で呼べるようにする。
+//! macOS の `statfs(2)`（マウント識別子。virtiofs 共有のマウント境界検査用。TASK-65.1）は子モジュール `mount`
+//! （`src/sys/mount.rs`）に置く。
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -44,7 +46,9 @@ use objc2_virtualization::{
 };
 use std::sync::Arc;
 
+mod mount;
 mod posix;
+pub(crate) use mount::mount_identity;
 pub(crate) use posix::effective_uid;
 
 /// NSError の domain と code（VZ が返すエラーの機械可読な要約）。domain は長さを制限して保持する。

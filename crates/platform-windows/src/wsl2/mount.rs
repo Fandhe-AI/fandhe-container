@@ -1112,7 +1112,8 @@ fn resolve_pending(distro: &DistroName, nonce: &str, exec: Exec<'_>) -> Pending 
                     .map_or(Pending::Unresolved, Pending::Recorded);
             }
             Ok(out) if out.code == Some(EXIT_GONE) => return Pending::Gone,
-            Ok(out) if out.code == Some(EXIT_PENDING) => return Pending::Unresolved,
+            // 206（mount の途中）・読み取り失敗は、次の読み取りで確定しうるので上限まで読み直す。
+            Ok(out) if out.code == Some(EXIT_PENDING) => {}
             _ => {}
         }
     }
@@ -3128,10 +3129,13 @@ mod tests {
         let left = e.unreleased().unwrap().clone();
         assert_eq!(summary(&left), [("/mnt/fandhe/a", None, false)]);
         // まだ mount の途中なら、release は何も外さず未確定のまま返す。
+        let before = g.status_reads;
         let out = release_with_exec(&left, &mut |a, m| g.run(a, m));
         assert_eq!((out.retry.len(), out.unconfirmed), (1, 0));
         assert_eq!(out.retry.first().map(|o| o.mount_id), Some(None));
         assert!(g.umounts.is_empty());
+        // REPAIR-5: 206 の間は上限回数まで読み直してから未確定として返す。
+        assert_eq!(g.status_reads - before, MAX_RECOVERY_READS);
         // 遅れて mount が成立 → 取り下げ済みなのでゲスト内で自分のマウントを外して 209 で終わる。
         assert_eq!(g.finish_pending(), Some(EXIT_ROLLED_BACK_IN_GUEST));
         assert_eq!(g.ids, [1]);
@@ -3166,7 +3170,8 @@ mod tests {
         assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
         assert_eq!(g.ids, [1]);
         assert!(g.records.is_empty() && g.claims.is_empty() && g.dones.is_empty());
-        assert_eq!(g.status_reads, 2);
+        // 準備のロールバック中は 206 のまま上限まで読み、release では 1 回目で記録の ID を得る。
+        assert_eq!(g.status_reads, MAX_RECOVERY_READS + 1);
     }
 
     /// 取り下げの直前に mount が完了していれば、取り下げは成立せず記録の ID で所有してロールバックで外す。

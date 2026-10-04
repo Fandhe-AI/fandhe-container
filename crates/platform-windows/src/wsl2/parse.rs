@@ -305,21 +305,37 @@ pub(super) fn classify_failure(out: &Captured) -> Failure {
     const NO_DISTRO: &str = "wsl_e_default_distro_not_found";
     if DISABLED.iter().any(|t| text.contains(t)) {
         Failure::WslDisabled
-    } else if text.contains(NO_DISTRO) && !has_other_error_id(&text, NO_DISTRO) {
+    } else if only_error_id_is(&text, NO_DISTRO) {
         Failure::NoDistro
     } else {
         Failure::Unknown
     }
 }
 
-/// `text` に `allowed` 以外のエラー識別子（`wsl_e_*`・`hcs_e_*`・`0x8…` の HRESULT）が併記されているか。
+/// `text`（小文字化済み）に現れるエラー識別子らしいトークンが `expected` だけか（1 回以上現れ、
+/// それ以外の識別子を 1 つも含まない）。
 ///
-/// 別の失敗理由が 0 件判定に紛れ込み、失敗が空の一覧として見落とされるのを防ぐ（fail-closed）。
-fn has_other_error_id(text: &str, allowed: &str) -> bool {
-    let masked = text.replace(allowed, " ");
-    ["wsl_e_", "hcs_e_", "0x8", "0xc"]
-        .iter()
-        .any(|p| masked.contains(p))
+/// 0 件判定に別の失敗理由が併記された出力（`E_ACCESSDENIED`・`ERROR_*`・`RPC_S_*`・HRESULT 等）を
+/// 空の一覧として見落とさないよう、既知の接頭辞を列挙する方式ではなく、識別子の形をしたトークンを
+/// すべて拾って許可リスト（`expected` のみ）と照合する（fail-closed。ERR-1）。
+/// トークンは ASCII 英数字と `_` の連続で、`_` を含むもの（`WSL_E_*`・`E_*` 等の定数名）と
+/// `0x` で始まる 16 進数（HRESULT）を識別子とみなす。案内文の単語・URL・コマンド例
+/// （`wsl.exe --list --online`・`https://aka.ms/wslstore` 等）は `_` を含まないので対象外。
+fn only_error_id_is(text: &str, expected: &str) -> bool {
+    let mut found = false;
+    for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        let is_hex = token
+            .strip_prefix("0x")
+            .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()));
+        if !(token.contains('_') || is_hex) {
+            continue;
+        }
+        if token != expected {
+            return false;
+        }
+        found = true;
+    }
+    found
 }
 
 /// エラーメッセージに載せる出力の抜粋。印字可能 ASCII 以外は `?` にし、128 バイト以下に切る。

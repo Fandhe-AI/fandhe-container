@@ -64,6 +64,10 @@ impl SharedDirectoryPath {
     /// ゲストへ公開されるホスト範囲を、呼び出し側が明示した実ディレクトリに限定するための検証（パス
     /// トラバーサル対策）。macOS の `/tmp`・`/var` のような祖先の symlink も拒否するため、呼び出し側が
     /// 実体パスへ正規化して渡す。
+    ///
+    /// 共有ディレクトリが VM 自身の起動入力（kernel・initrd・ディスクイメージ・コンソールログ）を含むか
+    /// どうかは本型では検査しない。ReadWrite 共有にそれらを含めるとゲストが書き換え得るため、
+    /// 除外は呼び出し側（構成の組み立て側）の責務とする（MAC-1・TASK-65.1。保護入力との照合は後続で追跡）。
     pub fn try_new(path: &Path) -> Result<Self, ConfigError> {
         const FIELD: ConfigField = ConfigField::SharedDirectory;
         check_absolute_utf8(FIELD, path)?;
@@ -117,6 +121,11 @@ impl SharedDirectoryPath {
         {
             match std::fs::canonicalize(path) {
                 Ok(real) if real == path => {}
+                // 大文字小文字非区別 FS（macOS 既定の APFS 等。IO-5）では綴りの大小だけが実体と異なり得る。
+                // 各接頭辞の symlink 検査は通過済みのため、大小のみの差は symlink 経由ではないとして許容する。
+                Ok(real)
+                    if real.to_string_lossy().to_lowercase()
+                        == path.to_string_lossy().to_lowercase() => {}
                 Ok(_) => {
                     return Err(ConfigError::SharedDirSymlink {
                         path: path.to_path_buf(),

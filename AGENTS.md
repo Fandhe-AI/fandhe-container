@@ -272,7 +272,7 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
   cargo test -p fandhe-container-platform-macos --test vm_boot --no-run --message-format=json \
     | jq -r 'select(.reason == "compiler-artifact" and .target.name == "vm_boot" and .executable != null) | .executable'
   codesign --sign - --force --entitlements crates/platform-macos/tests/vm_boot.entitlements <上で得たバイナリ>
-  FANDHE_CONTAINER_MACOS_VM_KERNEL=/abs/path/to/vmlinux <上で得たバイナリ> --ignored --nocapture
+  FANDHE_CONTAINER_MACOS_VM_KERNEL=/abs/path/to/vmlinux FANDHE_CONTAINER_MACOS_VM_READY_MARKER="<ゲストが起動完了後にだけ出力する文字列>" <上で得たバイナリ> --ignored --nocapture
   ```
 
 - `make fio-bench`（TASK-25.1・IO-8）: fio・GNU coreutils の `timeout` が入った Linux 環境が必要（root 権限・`/dev/kvm` は不要）。`make fio-bench-selftest`（`--from-json` モード＋固定 fixture＋fio スタブで完結し、実 fio は使わない）は CI の `bench-regression` ジョブに組み込み済みで既定のテスト集合の一部。`make fio-bench` 自体の実機実行・Docker コンテナ内での fio 実行（runbook は [docs/design/io-fio-bench.md](docs/design/io-fio-bench.md)「Docker ベースラインの計測手順」）・その結果の `make fio-baseline-ratio` への入力は TASK-25.2（#113。人間共同）が担う。`make fio-baseline-ratio`（比率算出そのもの）は fio・Docker を必要としないため既定のテスト集合の一部（`make fio-baseline-ratio-selftest` として CI に組み込み済み）

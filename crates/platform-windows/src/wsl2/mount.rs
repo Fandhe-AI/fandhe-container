@@ -845,9 +845,106 @@ struct OwnedMount {
     guest_path: String,
     mount_id: u32,
     nonce: String,
+    /// 読み取り専用で要求したか（未解除として返す [`PreparedMount`] に引き継ぐ）。
+    read_only: bool,
 }
 
-/// 本呼び出しが成立させたマウントを逆順に best-effort で外す。失敗件数を返す。
+impl OwnedMount {
+    fn to_prepared(&self) -> PreparedMount {
+        PreparedMount {
+            guest_path: self.guest_path.clone(),
+            mount_id: self.mount_id,
+            read_only: self.read_only,
+            nonce: self.nonce.clone(),
+        }
+    }
+}
+
+/// [`MountError::unreleased`] に載せる未解除マウントの最大件数（1 回の要求の共有マウント数の上限と同じ。
+/// 未解除になりうるのは本呼び出しが成立させたマウントだけなので、これを超えることはない。REPAIR-5）。
+pub const MAX_UNRELEASED_MOUNTS: usize = MAX_SHARED_MOUNTS;
+
+/// 未解除のマウントを、そのまま [`release_virtiofs_launch`] に渡せる [`PreparedLaunch`] にまとめる（無ければ `None`）。
+fn unreleased_launch(distro: &DistroName, failed: &[OwnedMount]) -> Option<PreparedLaunch> {
+    if failed.is_empty() {
+        return None;
+    }
+    Some(PreparedLaunch {
+        distro: distro.clone(),
+        mounts: failed
+            .iter()
+            .take(MAX_UNRELEASED_MOUNTS)
+            .map(OwnedMount::to_prepared)
+            .collect(),
+        transport: SharedTransport::Virtiofs,
+    })
+}
+
+/// 共有マウントの準備・起動・解除の失敗（構造化エラーと、解除できずに残ったマウントの所有情報）。
+///
+/// 後始末（ロールバック・解除）で外せなかったマウントがあれば [`MountError::unreleased`] に載せる。これは
+/// そのまま [`release_virtiofs_launch`] に渡して後始末をやり直せる（マウント先・マウント ID・記録の nonce を持つ。
+/// 件数は [`MAX_UNRELEASED_MOUNTS`] 以下）。所有を確認できなかったマウント（`mount ownership unconfirmed`）は
+/// 自分のものと確定できないため載せない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountError {
+    error: Wsl2Error,
+    unreleased: Option<PreparedLaunch>,
+}
+
+impl MountError {
+    /// 機械可読なエラーコード（ERR-1）。
+    pub fn code(&self) -> Wsl2ErrorCode {
+        self.error.code()
+    }
+
+    /// 英語の説明（ホストパス・生出力は含まない）。
+    pub fn message(&self) -> &str {
+        self.error.message()
+    }
+
+    /// 構造化エラー本体。
+    pub fn error(&self) -> &Wsl2Error {
+        &self.error
+    }
+
+    /// 解除できずに残ったマウント（[`release_virtiofs_launch`] に渡して後始末をやり直せる）。
+    pub fn unreleased(&self) -> Option<&PreparedLaunch> {
+        self.unreleased.as_ref()
+    }
+
+    /// 構造化エラーと未解除のマウントに分解する。
+    pub fn into_parts(self) -> (Wsl2Error, Option<PreparedLaunch>) {
+        (self.error, self.unreleased)
+    }
+
+    /// 後始末の失敗件数を `error` のメッセージに添えて、未解除のマウントとともに返す。
+    fn with_unreleased(error: Wsl2Error, distro: &DistroName, failed: &[OwnedMount]) -> Self {
+        Self {
+            error: with_rollback_note(error, failed.len()),
+            unreleased: unreleased_launch(distro, failed),
+        }
+    }
+}
+
+impl From<Wsl2Error> for MountError {
+    fn from(error: Wsl2Error) -> Self {
+        Self {
+            error,
+            unreleased: None,
+        }
+    }
+}
+
+impl std::fmt::Display for MountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for MountError {}
+
+/// 本呼び出しが成立させたマウントを逆順に best-effort で外す。外せなかったマウント（`owned` と同じ順）を返す。
 ///
 /// 解除の直前に mountinfo を読み直し、マウント先の最上位エントリが記録したマウント ID と一致する場合に限り
 /// `umount` する。`umount` は [`UMOUNT_SCRIPT`] がゲスト内で同じ照合をやり直してから行う（照合と解除の間に
@@ -862,11 +959,11 @@ struct OwnedMount {
 /// mountinfo の読み取りは [`read_mountinfo_bounded`] で有界に再試行する。`umount` が失敗・タイムアウトした
 /// 場合は結果が不確定なため mountinfo を読み直し、記録したマウント ID がどこにも無ければ解除済みとして扱う
 /// （残っている・読めない場合は失敗に数える。再度の `umount` はしない）。
-fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> usize {
-    let mut failures = 0;
+fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> Vec<OwnedMount> {
+    let mut failed = Vec::new();
     for o in owned.iter().rev() {
         let Some(entries) = read_mountinfo_bounded(distro, exec) else {
-            failures += 1;
+            failed.push(o.clone());
             continue;
         };
         match find_mount(&entries, &o.guest_path) {
@@ -882,7 +979,7 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> usize 
                     || read_mountinfo_bounded(distro, exec)
                         .is_some_and(|after| after.iter().all(|e| e.mount_id != o.mount_id));
                 if !gone {
-                    failures += 1;
+                    failed.push(o.clone());
                 } else if !ok {
                     // UMOUNT_SCRIPT が記録を消す前に終わったが、マウントは外れている。
                     clear_record(distro, &o.nonce, exec);
@@ -892,7 +989,7 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> usize 
                 // マウント先に無くても、記録したマウント ID が別のマウント先へ移されて残っていれば未解除。
                 let still_mounted = entries.iter().any(|e| e.mount_id == o.mount_id);
                 if still_mounted {
-                    failures += 1;
+                    failed.push(o.clone());
                 } else {
                     // 既に外れている（解除済み）ので記録も消す。
                     clear_record(distro, &o.nonce, exec);
@@ -900,7 +997,8 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> usize 
             }
         }
     }
-    failures
+    failed.reverse();
+    failed
 }
 
 fn with_rollback_note(e: Wsl2Error, failures: usize) -> Wsl2Error {
@@ -1020,6 +1118,7 @@ fn mount_one(
                 guest_path,
                 mount_id,
                 nonce,
+                read_only: m.read_only,
             });
             failure.map_or(Ok(()), Err)
         }
@@ -1109,7 +1208,7 @@ fn prepare_with_exec(
     virtiofs: VirtiofsState,
     req: &LaunchRequest,
     exec: Exec<'_>,
-) -> Result<PreparedLaunch, Wsl2Error> {
+) -> Result<PreparedLaunch, MountError> {
     preflight(status, virtiofs, req)?;
     let distro = &req.distro;
     // 共有マウントが 0 件ならゲスト内で検証すべきものが無いため、mountinfo も読まず空の結果を返す。
@@ -1128,32 +1227,24 @@ fn prepare_with_exec(
     for m in &req.mounts {
         let target = m.guest_path();
         if before.iter().any(|e| e.mount_point == target) {
-            return Err(precondition("a shared mount target is already mounted"));
+            return Err(precondition("a shared mount target is already mounted").into());
         }
     }
     let before_ids: Vec<u32> = before.iter().map(|e| e.mount_id).collect();
     let mut owned: Vec<OwnedMount> = Vec::new();
     for m in &req.mounts {
         if let Err(e) = mount_one(distro, m, &before_ids, &mut owned, exec) {
-            return Err(with_rollback_note(e, rollback(distro, &owned, exec)));
+            let failed = rollback(distro, &owned, exec);
+            return Err(MountError::with_unreleased(e, distro, &failed));
         }
     }
     if let Err(e) = verify_virtiofs(req, &owned, exec) {
-        return Err(with_rollback_note(e, rollback(distro, &owned, exec)));
+        let failed = rollback(distro, &owned, exec);
+        return Err(MountError::with_unreleased(e, distro, &failed));
     }
     Ok(PreparedLaunch {
         distro: req.distro.clone(),
-        mounts: req
-            .mounts
-            .iter()
-            .zip(&owned)
-            .map(|(m, o)| PreparedMount {
-                guest_path: o.guest_path.clone(),
-                mount_id: o.mount_id,
-                read_only: m.read_only,
-                nonce: o.nonce.clone(),
-            })
-            .collect(),
+        mounts: owned.iter().map(OwnedMount::to_prepared).collect(),
         transport: SharedTransport::Virtiofs,
     })
 }
@@ -1188,7 +1279,7 @@ pub(super) fn prepare_with_program(
     virtiofs: VirtiofsState,
     req: &LaunchRequest,
     timeout: Duration,
-) -> Result<PreparedLaunch, Wsl2Error> {
+) -> Result<PreparedLaunch, MountError> {
     check_timeout(timeout)?;
     let status = detect_with_program(program, timeout)?;
     let mut exec = program_exec(program, timeout);
@@ -1200,12 +1291,13 @@ pub(super) fn prepare_with_program(
 /// 成功時は全マウントが virtiofs で成立している。失敗時は本呼び出しで作ったマウントを後始末して `Err`。
 /// mount がタイムアウトした等で結果が不確定な場合も、mount したゲスト内プロセスの記録（所有の証拠）で
 /// 自分のマウントを特定して外す。自分のものと確認できないマウントは外さず、メッセージに
-/// `mount ownership unconfirmed` を含めて返す。
+/// `mount ownership unconfirmed` を含めて返す。後始末で外せなかったマウントは [`MountError::unreleased`] に
+/// 載せるので、呼び出し側はそれを [`release_virtiofs_launch`] へ渡して後始末をやり直せる。
 /// 成功後のマウントの所有者は呼び出し側で、不要になったら [`release_virtiofs_launch`] で解除する。
 pub fn prepare_virtiofs_launch(
     req: &LaunchRequest,
     timeout: Duration,
-) -> Result<PreparedLaunch, Wsl2Error> {
+) -> Result<PreparedLaunch, MountError> {
     prepare_virtiofs_launch_with_recorder(req, timeout, &NoopWinOpRecorder)
 }
 
@@ -1214,15 +1306,15 @@ pub fn prepare_virtiofs_launch_with_recorder(
     req: &LaunchRequest,
     timeout: Duration,
     recorder: &dyn WinOpRecorder,
-) -> Result<PreparedLaunch, Wsl2Error> {
+) -> Result<PreparedLaunch, MountError> {
     record_win_op(recorder, WinOpKind::Wsl2MountShared, || {
         let (program, state) = resolve_environment(timeout)?;
         prepare_with_program(&program, state, req, timeout)
     })
 }
 
-/// 準備済みマウントを逆順に best-effort で解除する（マウント ID が一致するものだけ）。失敗件数を返す。
-fn release_with_exec(prepared: &PreparedLaunch, exec: Exec<'_>) -> usize {
+/// 準備済みマウントを逆順に best-effort で解除する（マウント ID が一致するものだけ）。外せなかったものを返す。
+fn release_with_exec(prepared: &PreparedLaunch, exec: Exec<'_>) -> Vec<OwnedMount> {
     let owned: Vec<OwnedMount> = prepared
         .mounts
         .iter()
@@ -1230,6 +1322,7 @@ fn release_with_exec(prepared: &PreparedLaunch, exec: Exec<'_>) -> usize {
             guest_path: m.guest_path.clone(),
             mount_id: m.mount_id,
             nonce: m.nonce.clone(),
+            read_only: m.read_only,
         })
         .collect();
     rollback(&prepared.distro, &owned, exec)
@@ -1237,11 +1330,12 @@ fn release_with_exec(prepared: &PreparedLaunch, exec: Exec<'_>) -> usize {
 
 /// [`prepare_virtiofs_launch`] で成立させたマウントを解除する（コンテナ停止後の後始末用）。
 ///
-/// 解除に失敗したマウントがあれば `FAILED_PRECONDITION`（件数のみをメッセージに載せる）。
+/// 解除に失敗したマウントがあれば `FAILED_PRECONDITION`（件数のみをメッセージに載せる）。外せなかった
+/// マウントは [`MountError::unreleased`] に載せて返すので、それを再び本関数へ渡して後始末をやり直せる。
 pub fn release_virtiofs_launch(
     prepared: &PreparedLaunch,
     timeout: Duration,
-) -> Result<(), Wsl2Error> {
+) -> Result<(), MountError> {
     release_virtiofs_launch_with_recorder(prepared, timeout, &NoopWinOpRecorder)
 }
 
@@ -1251,7 +1345,7 @@ pub fn release_virtiofs_launch_with_recorder(
     prepared: &PreparedLaunch,
     timeout: Duration,
     recorder: &dyn WinOpRecorder,
-) -> Result<(), Wsl2Error> {
+) -> Result<(), MountError> {
     record_win_op(recorder, WinOpKind::Wsl2UnmountShared, || {
         check_timeout(timeout)?;
         let program = wsl_exe_path()?;
@@ -1264,13 +1358,17 @@ pub(super) fn release_with_program(
     program: &Path,
     prepared: &PreparedLaunch,
     timeout: Duration,
-) -> Result<(), Wsl2Error> {
+) -> Result<(), MountError> {
     check_timeout(timeout)?;
     let mut exec = program_exec(program, timeout);
-    match release_with_exec(prepared, &mut exec) {
-        0 => Ok(()),
-        n => Err(precondition(format!("{n} unmount(s) failed"))),
+    let failed = release_with_exec(prepared, &mut exec);
+    if failed.is_empty() {
+        return Ok(());
     }
+    Err(MountError {
+        error: precondition(format!("{} unmount(s) failed", failed.len())),
+        unreleased: unreleased_launch(&prepared.distro, &failed),
+    })
 }
 
 /// [`release_with_exec`] を [`WinOpKind::Wsl2UnmountShared`] として 1 件記録する（1 件でも解除できなければ失敗）。
@@ -1278,11 +1376,11 @@ fn release_recorded(
     prepared: &PreparedLaunch,
     exec: Exec<'_>,
     recorder: &dyn WinOpRecorder,
-) -> usize {
+) -> Vec<OwnedMount> {
     let timer = WinOpTimer::start(recorder, WinOpKind::Wsl2UnmountShared);
-    let failures = release_with_exec(prepared, exec);
-    timer.finish_with(&if failures == 0 { Ok(()) } else { Err(()) });
-    failures
+    let failed = release_with_exec(prepared, exec);
+    timer.finish_with(&if failed.is_empty() { Ok(()) } else { Err(()) });
+    failed
 }
 
 /// [`launch_with`] の成功時の結果: 起動ステップの戻り値と、解除に使う準備済みマウント。
@@ -1301,19 +1399,19 @@ pub struct Launched<T> {
 /// 準備の結果で計測を確定し、成功なら `start` を呼ぶ。`start` が失敗したら準備済みマウントを解除して返す
 /// （ロールバック。解除は [`WinOpKind::Wsl2UnmountShared`] として記録する）。
 fn finish_launch<T>(
-    prepared: Result<PreparedLaunch, Wsl2Error>,
+    prepared: Result<PreparedLaunch, MountError>,
     timer: WinOpTimer<'_>,
     exec: Exec<'_>,
     recorder: &dyn WinOpRecorder,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
-) -> Result<Launched<T>, Wsl2Error> {
+) -> Result<Launched<T>, MountError> {
     timer.finish_with(&prepared);
     let prepared = prepared?;
     match start(&prepared) {
         Ok(value) => Ok(Launched { value, prepared }),
         Err(e) => {
-            let failures = release_recorded(&prepared, exec, recorder);
-            Err(with_rollback_note(e, failures))
+            let failed = release_recorded(&prepared, exec, recorder);
+            Err(MountError::with_unreleased(e, &prepared.distro, &failed))
         }
     }
 }
@@ -1327,7 +1425,7 @@ fn launch_with_exec<T>(
     exec: Exec<'_>,
     recorder: &dyn WinOpRecorder,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
-) -> Result<Launched<T>, Wsl2Error> {
+) -> Result<Launched<T>, MountError> {
     let timer = WinOpTimer::start(recorder, WinOpKind::Wsl2MountShared);
     let prepared = prepare_with_exec(status, virtiofs, req, exec);
     finish_launch(prepared, timer, exec, recorder, start)
@@ -1336,14 +1434,15 @@ fn launch_with_exec<T>(
 /// 準備（事前判定・マウント・fstype 確認）に成功した場合に限り `start` を呼ぶ。
 ///
 /// 準備失敗時は `start` を呼ばずに `Err` を返す。`start` が `Err` を返した場合は準備済みマウントを
-/// 解除してから `Err` を返す。`start` が `Ok` の場合マウントは呼び出し側（TASK-116）の所有となり、
+/// 解除してから `Err` を返す（外せなかったマウントは [`MountError::unreleased`] に載せる）。`start` が `Ok` の場合
+/// マウントは呼び出し側（TASK-116）の所有となり、
 /// 戻り値の [`Launched::prepared`] を停止時に [`release_virtiofs_launch`] へ渡して解除する。`start` の中身
 /// （ゲスト内のコンテナランタイム起動）は TASK-116 が注入する。
 pub fn launch_with<T>(
     req: &LaunchRequest,
     timeout: Duration,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
-) -> Result<Launched<T>, Wsl2Error> {
+) -> Result<Launched<T>, MountError> {
     launch_with_recorder(req, timeout, &NoopWinOpRecorder, start)
 }
 
@@ -1355,7 +1454,7 @@ pub fn launch_with_recorder<T>(
     timeout: Duration,
     recorder: &dyn WinOpRecorder,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
-) -> Result<Launched<T>, Wsl2Error> {
+) -> Result<Launched<T>, MountError> {
     let timer = WinOpTimer::start(recorder, WinOpKind::Wsl2MountShared);
     // 環境の解決に失敗した場合は timer の Drop が Failure を記録する。
     let (program, state) = resolve_environment(timeout)?;
@@ -1371,7 +1470,7 @@ pub(super) fn launch_with_program<T>(
     req: &LaunchRequest,
     timeout: Duration,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
-) -> Result<Launched<T>, Wsl2Error> {
+) -> Result<Launched<T>, MountError> {
     let recorder = &NoopWinOpRecorder;
     let timer = WinOpTimer::start(recorder, WinOpKind::Wsl2MountShared);
     launch_with_program_timed(program, virtiofs, req, timeout, recorder, timer, start)
@@ -1385,9 +1484,9 @@ fn launch_with_program_timed<'r, T>(
     recorder: &'r dyn WinOpRecorder,
     timer: WinOpTimer<'r>,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
-) -> Result<Launched<T>, Wsl2Error> {
+) -> Result<Launched<T>, MountError> {
     let mut exec = program_exec(program, timeout);
-    let prepared = (|| {
+    let prepared = (|| -> Result<PreparedLaunch, MountError> {
         check_timeout(timeout)?;
         let status = detect_with_program(program, timeout)?;
         prepare_with_exec(&status, virtiofs, req, &mut exec)
@@ -2220,7 +2319,7 @@ mod tests {
         g: &mut Guest,
         r: &LaunchRequest,
         v: VirtiofsState,
-    ) -> Result<PreparedLaunch, Wsl2Error> {
+    ) -> Result<PreparedLaunch, MountError> {
         prepare_with_exec(&ok_status(), v, r, &mut |a, m| g.run(a, m))
     }
 
@@ -2242,7 +2341,7 @@ mod tests {
         recorded.sort_unstable();
         assert_eq!(recorded, ["100", "101"]);
         assert_eq!(g.claims.len(), 2);
-        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)), 0);
+        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).len(), 0);
         assert!(g.records.is_empty());
         assert!(g.claims.is_empty());
     }
@@ -2487,7 +2586,7 @@ mod tests {
         g.mounts.push(("/mnt/fandhe/a".into(), "tmpfs".into()));
         g.ids.push(777);
         g.opts.push("rw".into());
-        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m));
+        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).len();
         assert_eq!(failures, 1);
         assert!(g.umounts.is_empty());
     }
@@ -2501,6 +2600,7 @@ mod tests {
             guest_path: "/mnt/fandhe/a".into(),
             mount_id: 100,
             nonce: "00ff".into(),
+            read_only: false,
         }];
         g.mounts.push(("/mnt/fandhe/a".into(), "virtiofs".into()));
         g.ids.push(555);
@@ -2523,7 +2623,7 @@ mod tests {
             .position(|(m, _)| m == "/mnt/fandhe/a")
             .unwrap();
         g.ids[i] = 9999;
-        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m));
+        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).len();
         assert_eq!(failures, 0);
         assert_eq!(g.umounts, ["/mnt/fandhe/b"]);
         assert!(g.mounts.iter().any(|(m, _)| m == "/mnt/fandhe/a"));
@@ -2543,7 +2643,7 @@ mod tests {
             .position(|(m, _)| m == "/mnt/fandhe/a")
             .unwrap();
         g.mounts[i].0 = "/elsewhere".into();
-        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m));
+        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).len();
         assert_eq!(failures, 1);
         assert!(g.umounts.is_empty());
         // どこにも残っていなければ解除済みとして成功扱い。
@@ -2551,7 +2651,7 @@ mod tests {
         g.ids.remove(i);
         g.opts.remove(i);
         assert_eq!(g.records.len(), 1);
-        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)), 0);
+        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).len(), 0);
         assert!(g.records.is_empty() && g.claims.is_empty());
     }
 
@@ -2620,7 +2720,10 @@ mod tests {
         // 成功時は解除に使う準備済みマウントが戻り値で渡され、それで逆順に解除できる。
         let ids: Vec<u32> = v.prepared.mounts().iter().map(|m| m.mount_id).collect();
         assert_eq!(ids, [100, 101]);
-        assert_eq!(release_with_exec(&v.prepared, &mut |a, m| g.run(a, m)), 0);
+        assert_eq!(
+            release_with_exec(&v.prepared, &mut |a, m| g.run(a, m)).len(),
+            0
+        );
         assert_eq!(g.umounts, ["/mnt/fandhe/b", "/mnt/fandhe/a"]);
     }
 
@@ -2750,7 +2853,7 @@ mod tests {
             let mut g = Guest::new("virtiofs");
             let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
             g.umount_timeout = Some(landed);
-            let failures = release_with_exec(&p, &mut |a, m| g.run(a, m));
+            let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).len();
             assert_eq!(failures, want, "landed={landed}");
             assert_eq!(g.umounts, ["/mnt/fandhe/a"], "landed={landed}");
         }
@@ -2764,7 +2867,7 @@ mod tests {
         let r = req(vec![sm("C:\\a", "a", false)]);
         let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
         g.stack_before_umount = true;
-        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m));
+        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).len();
         assert_eq!(failures, 1);
         assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
         assert_eq!(g.ids, [1, 100, 101]);
@@ -2806,7 +2909,7 @@ mod tests {
         g.mounts.push(("/mnt/fandhe/a".into(), "tmpfs".into()));
         g.ids.push(777);
         g.opts.push("rw".into());
-        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)), 1);
+        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).len(), 1);
         assert_eq!(g.umounts, ["/mnt/fandhe/b"]);
         assert_eq!(g.ids, [1, 100, 777]);
     }
@@ -2997,5 +3100,111 @@ mod tests {
         );
         assert!(g.umounts.is_empty());
         assert_eq!(g.ids, [1, 100, 101]);
+    }
+
+    /// 後始末（ロールバック）で外せなかったマウントは、マウント先・ID・nonce を持つ PreparedLaunch として
+    /// エラーに載り、そのまま解除をやり直せる。外せた場合は載らない。
+    #[test]
+    fn prepare_returns_unreleased_mounts_for_retry() {
+        let mut g = Guest::new("9p");
+        g.umount_timeout = Some(false);
+        let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", true)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert!(
+            e.message().ends_with("(2 rollback unmount(s) also failed)"),
+            "{}",
+            e.message()
+        );
+        let left = e.unreleased().unwrap();
+        assert_eq!(left.distro().as_str(), "Ubuntu");
+        assert_eq!(
+            summary(left),
+            [("/mnt/fandhe/a", 100, false), ("/mnt/fandhe/b", 101, true)]
+        );
+        // 原因が解消すれば、返された情報でそのまま後始末をやり直せる。
+        g.umount_timeout = None;
+        assert_eq!(release_with_exec(left, &mut |a, m| g.run(a, m)).len(), 0);
+        assert_eq!(g.ids, [1]);
+        assert!(g.records.is_empty() && g.claims.is_empty());
+
+        // 外せた場合は未解除の情報を載せない。
+        let mut g = Guest::new("9p");
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.unreleased(), None);
+        let (err, left) = e.into_parts();
+        assert_eq!(err.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert!(left.is_none());
+    }
+
+    /// REPAIR-5: 未解除として返す件数は MAX_UNRELEASED_MOUNTS（= 共有マウント数の上限 16）以下で、
+    /// 上限ちょうどの 16 件すべてが残っても欠けずに返る。
+    #[test]
+    fn unreleased_mounts_are_bounded() {
+        assert_eq!(MAX_UNRELEASED_MOUNTS, 16);
+        let mut g = Guest::new("9p");
+        g.umount_timeout = Some(false);
+        let mounts: Vec<_> = (0..MAX_SHARED_MOUNTS)
+            .map(|i| sm(&format!("C:\\d{i}"), &format!("n{i}"), false))
+            .collect();
+        let e = drive(&mut g, &req(mounts), VirtiofsState::Enabled).unwrap_err();
+        assert!(
+            e.message()
+                .ends_with("(16 rollback unmount(s) also failed)")
+        );
+        let left = e.unreleased().unwrap();
+        assert_eq!(left.mounts().len(), MAX_UNRELEASED_MOUNTS);
+        assert_eq!(left.mounts().first().map(|m| m.mount_id), Some(100));
+        assert_eq!(left.mounts().last().map(|m| m.mount_id), Some(115));
+        // 上限を超える入力が来ても切り詰める（呼び出し側の PreparedLaunch は上限以下しか作れない）。
+        let many: Vec<OwnedMount> = (0..20)
+            .map(|i| OwnedMount {
+                guest_path: format!("/mnt/fandhe/x{i}"),
+                mount_id: 200 + i,
+                nonce: "00ff".into(),
+                read_only: false,
+            })
+            .collect();
+        let capped = unreleased_launch(&distro_name(), &many).unwrap();
+        assert_eq!(capped.mounts().len(), MAX_UNRELEASED_MOUNTS);
+        assert_eq!(unreleased_launch(&distro_name(), &[]), None);
+    }
+
+    /// 起動ステップ失敗時の解除で外せなかったマウントも、エラーに載せて返す。
+    #[test]
+    fn launch_returns_unreleased_mounts_when_rollback_fails() {
+        use crate::instrument::testing::Collect;
+        let mut g = Guest::new("virtiofs");
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let rec = Collect::default();
+        let start_failed = std::cell::Cell::new(false);
+        let e = launch_with_exec(
+            &ok_status(),
+            VirtiofsState::Enabled,
+            &r,
+            &mut |a, m| {
+                // 起動ステップの失敗後は umount（UMOUNT_SCRIPT）がタイムアウトし、マウントが残る。
+                let is_umount = a.get(7).map(String::as_str) == Some(UMOUNT_SCRIPT);
+                if start_failed.get() && is_umount {
+                    return Err(Wsl2Error::new(Wsl2ErrorCode::Timeout, "slow"));
+                }
+                g.run(a, m)
+            },
+            &rec,
+            |_| {
+                start_failed.set(true);
+                Err::<(), _>(Wsl2Error::new(Wsl2ErrorCode::Internal, "start failed"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Internal);
+        assert_eq!(
+            e.message(),
+            "start failed (1 rollback unmount(s) also failed)"
+        );
+        assert_eq!(
+            e.unreleased().map(summary),
+            Some(vec![("/mnt/fandhe/a", 100, false)])
+        );
     }
 }

@@ -27,10 +27,10 @@ mod run;
 
 pub use mount::{
     DistroName, GUEST_MOUNT_BASE, HostDir, LaunchRequest, Launched, MAX_DISTRO_NAME_LEN,
-    MAX_HOST_DIR_LEN, MAX_MOUNT_NAME_LEN, MAX_SHARED_MOUNTS, MountName, PreparedLaunch,
-    PreparedMount, SharedMount, SharedTransport, launch_with, launch_with_recorder,
-    prepare_virtiofs_launch, prepare_virtiofs_launch_with_recorder, release_virtiofs_launch,
-    release_virtiofs_launch_with_recorder,
+    MAX_HOST_DIR_LEN, MAX_MOUNT_NAME_LEN, MAX_SHARED_MOUNTS, MAX_UNRELEASED_MOUNTS, MountError,
+    MountName, PreparedLaunch, PreparedMount, SharedMount, SharedTransport, launch_with,
+    launch_with_recorder, prepare_virtiofs_launch, prepare_virtiofs_launch_with_recorder,
+    release_virtiofs_launch, release_virtiofs_launch_with_recorder,
 };
 
 use std::error::Error;
@@ -291,7 +291,8 @@ pub mod test_support {
     use std::time::Duration;
 
     use super::{
-        LaunchRequest, Launched, PreparedLaunch, Wsl2Error, Wsl2Status, WslDistro, WslVersionInfo,
+        LaunchRequest, Launched, MountError, PreparedLaunch, Wsl2Error, Wsl2Status, WslDistro,
+        WslVersionInfo,
     };
     use crate::wslconfig::VirtiofsState;
 
@@ -323,7 +324,7 @@ pub mod test_support {
         virtiofs: VirtiofsState,
         req: &LaunchRequest,
         timeout: Duration,
-    ) -> Result<PreparedLaunch, Wsl2Error> {
+    ) -> Result<PreparedLaunch, MountError> {
         super::mount::prepare_with_program(program, virtiofs, req, timeout)
     }
 
@@ -332,7 +333,7 @@ pub mod test_support {
         program: &Path,
         prepared: &PreparedLaunch,
         timeout: Duration,
-    ) -> Result<(), Wsl2Error> {
+    ) -> Result<(), MountError> {
         super::mount::release_with_program(program, prepared, timeout)
     }
 
@@ -343,7 +344,7 @@ pub mod test_support {
         req: &LaunchRequest,
         timeout: Duration,
         start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
-    ) -> Result<Launched<T>, Wsl2Error> {
+    ) -> Result<Launched<T>, MountError> {
         super::mount::launch_with_program(program, virtiofs, req, timeout, start)
     }
 }

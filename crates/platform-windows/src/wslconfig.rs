@@ -435,14 +435,38 @@ fn open_verified(path: &Path) -> Result<std::fs::File, WinError> {
 /// シンボリックリンク・通常ファイル以外は拒否し（fail-closed）、[`MAX_WSLCONFIG_BYTES`] を超えるものと
 /// 非 UTF-8 は `Err`。
 pub fn load(path: &Path) -> Result<Option<WslConfig>, WinError> {
-    Ok(load_verified(path)?.map(|(cfg, _file)| cfg))
+    Ok(load_verified(path)?.map(|(cfg, _source)| cfg))
 }
 
-/// [`load`] の本体。解析結果と、読み込みに使った検証済みハンドルを返す。
+/// 読み込んだ `.wslconfig` の検証済みハンドルと、読み込み前に記録した状態。
 ///
-/// [`enable_virtiofs_at`] は返したハンドルを置換時のアクセス制御の複製元にする（unix のパーミッション・
-/// Windows の DACL）。パスを引き直さないため、検証したファイルと複製元が同一であることを保証できる。
-fn load_verified(path: &Path) -> Result<Option<(WslConfig, std::fs::File)>, WinError> {
+/// [`enable_virtiofs_at`] が置換時のアクセス制御の複製元（unix のパーミッション・Windows の DACL 等）と、
+/// 置換直前の競合検出（[`ensure_unchanged`]）に使う。パスを引き直さないため、検証したファイルと複製元が
+/// 同一であることを保証できる。
+struct Source {
+    file: std::fs::File,
+    stamp: Stamp,
+}
+
+/// 同一ファイルへのその場の書き換えを検出するための大きさと最終更新時刻。
+#[derive(Debug, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn stamp(file: &std::fs::File) -> Result<Stamp, WinError> {
+    let m = file
+        .metadata()
+        .map_err(|e| io_err(&e, "failed to stat .wslconfig"))?;
+    Ok(Stamp {
+        len: m.len(),
+        modified: m.modified().ok(),
+    })
+}
+
+/// [`load`] の本体。解析結果と、読み込みに使った検証済みハンドル（[`Source`]）を返す。
+fn load_verified(path: &Path) -> Result<Option<(WslConfig, Source)>, WinError> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -461,6 +485,8 @@ fn load_verified(path: &Path) -> Result<Option<(WslConfig, std::fs::File)>, WinE
         ));
     }
     let file = open_verified(path)?;
+    // 読み込み中の書き換えも置換直前に検出できるよう、読む前に記録する。
+    let stamp = stamp(&file)?;
     let mut buf = Vec::new();
     (&file)
         .take(MAX_WSLCONFIG_BYTES + 1)
@@ -478,7 +504,7 @@ fn load_verified(path: &Path) -> Result<Option<(WslConfig, std::fs::File)>, WinE
             ".wslconfig is not valid UTF-8",
         )
     })?;
-    Ok(Some((WslConfig::parse(&text)?, file)))
+    Ok(Some((WslConfig::parse(&text)?, Source { file, stamp })))
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -496,12 +522,58 @@ const PRESERVED_ATTRIBUTES: u32 =
     0x0000_0002 | 0x0000_0004 | 0x0000_2000 | FILE_ATTRIBUTE_ENCRYPTED;
 
 /// 書き込みの意図。読み込み時点でのファイルの有無を呼び出し側から引き継ぐ。
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum WriteMode {
     /// 読み込み時点でファイルが存在しなかった。宛先が現れていたら置換せず `Err`（排他的な新規作成）。
     CreateOnly,
-    /// 読み込み時点でファイルが存在した。既存の内容を置き換える。
-    Replace,
+    /// 読み込み時点でファイルが存在した。読み込み元（[`Source`]）と同じファイルのまま置き換える。
+    Replace(Source),
+}
+
+/// `a` と `b` が同一のファイル（unix は dev / inode、Windows はボリュームシリアル番号と 128 bit のファイル ID）か。
+fn same_file(a: &std::fs::File, b: &std::fs::File) -> Result<bool, WinError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ma = a
+            .metadata()
+            .map_err(|e| io_err(&e, "failed to stat .wslconfig"))?;
+        let mb = b
+            .metadata()
+            .map_err(|e| io_err(&e, "failed to stat .wslconfig"))?;
+        Ok(ma.dev() == mb.dev() && ma.ino() == mb.ino())
+    }
+    #[cfg(windows)]
+    {
+        let ia = crate::sys::file_id(a).map_err(|e| io_err(&e, "failed to identify .wslconfig"))?;
+        let ib = crate::sys::file_id(b).map_err(|e| io_err(&e, "failed to identify .wslconfig"))?;
+        Ok(ia == ib)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (a, b);
+        Err(err(
+            WinErrorCode::Unimplemented,
+            "file identity check is not supported on this platform",
+        ))
+    }
+}
+
+/// 置換の直前に、宛先が読み込み元と同じファイルのままで、読み込み後に書き換えられていないことを確かめる。
+///
+/// 宛先を [`open_verified`] で開き直し（リンク・通常ファイル以外は拒否）、読み込み元と同一ファイルであること、
+/// 読み込み元ハンドルの大きさ・最終更新時刻が読み込み前の記録（[`Stamp`]）と一致することを確認する。
+/// 違えば別プロセスの変更を上書きしないよう `INTERNAL` で拒否する。確認から rename までの短い間の競合は
+/// 残る（パスを指定する rename では閉じられない。単一ユーザーのホーム配下の設定操作のため許容）。最終更新
+/// 時刻の粒度内で大きさを変えないその場の書き換えは検出できない。
+fn ensure_unchanged(path: &Path, source: &Source) -> Result<(), WinError> {
+    let current = open_verified(path)?;
+    if !same_file(&current, &source.file)? || stamp(&source.file)? != source.stamp {
+        return Err(err(
+            WinErrorCode::Internal,
+            ".wslconfig was modified concurrently; refusing to replace it",
+        ));
+    }
+    Ok(())
 }
 
 /// 同一ディレクトリに一意名の一時ファイルのパスを作る。
@@ -639,45 +711,37 @@ fn sync_parent_dir(parent: &Path) -> Result<(), WinError> {
 ///   別プロセスが作った `.wslconfig` を上書きしない（`Err` を返し元のまま残す）。公開後に一時名を消し、
 ///   親ディレクトリを同期する（[`sync_parent_dir`]）。
 /// - [`WriteMode::Replace`]: 一時ファイル → fsync → rename で原子的に置き換える（全 OS 共通）。途中で
-///   強制終了しても宛先は旧内容か新内容のどちらかで、欠損・混在しない。`acl_from`（読み込みに使った
-///   検証済みハンドル）のアクセス制御を、内容を書く前に一時ファイルへ写す（unix はパーミッション、
+///   強制終了しても宛先は旧内容か新内容のどちらかで、欠損・混在しない。読み込み元（[`Source`]）の
+///   アクセス制御を、内容を書く前に一時ファイルへ写す（unix はパーミッション、
 ///   Windows は DACL と継承保護の有無・整合性ラベル・HIDDEN 等の属性・EFS 暗号化。rename は同一ボリューム内で
 ///   ファイル自身のセキュリティ記述子を保つため、置換後も元のアクセス制御が残る）。Windows でこれらを
 ///   保てない場合は置換を拒否して `Err`。所有者・監査用 SACL は写さない（所有者の変更には特権が要り、
 ///   新しい所有者は書き込みを行う本人なので他者へのアクセスは広がらない。監査用 SACL は特権が要り、
-///   アクセス可否に影響しない）。rename 後の親ディレクトリの同期に失敗した場合は置換済みのまま `Err` を返す。
+///   アクセス可否に影響しない）。rename の直前に宛先が読み込み元と同じで書き換えられていないことを確かめ
+///   （[`ensure_unchanged`]）、違えば置換しない。rename 後の親ディレクトリの同期に失敗した場合は置換済みの
+///   まま `Err` を返す。
 ///
-/// 失敗時は自分が作った一時ファイルだけを削除する。読み込みから書き込みまでの間の他プロセスによる
-/// 変更はロックしない（単一ユーザーのホーム配下の設定操作のため許容。新規作成の競合のみ上記で拒否する）。
-fn write_atomic(
-    path: &Path,
-    data: &[u8],
-    mode: WriteMode,
-    acl_from: Option<std::fs::File>,
-) -> Result<(), WinError> {
+/// 失敗時は自分が作った一時ファイルだけを削除する。ファイルロックは取らず、新規作成・置換とも公開の直前に
+/// 競合を検出して拒否する（単一ユーザーのホーム配下の設定操作のため、検出から公開までの短い間は許容）。
+fn write_atomic(path: &Path, data: &[u8], mode: WriteMode) -> Result<(), WinError> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
     let tmp = tmp_path(parent, "tmp");
-    if mode == WriteMode::CreateOnly {
-        drop(write_new_file(&tmp, data, None)?);
-        let linked = std::fs::hard_link(&tmp, path);
-        // 一時名の削除失敗は無視する。リンク成功後なら一時名は宛先と同一ファイル（同じ内容・同じアクセス
-        // 制御）で新たな露出はなく、作成自体は成功しているため `Err` にすると結果を誤って伝える。
+    let source = match mode {
+        WriteMode::Replace(source) => source,
+        WriteMode::CreateOnly => {
+            return create_exclusive(path, parent, &tmp, data);
+        }
+    };
+    drop(write_new_file(&tmp, data, Some(&source.file))?);
+    if let Err(e) = ensure_unchanged(path, &source) {
         let _ = std::fs::remove_file(&tmp);
-        return match linked {
-            Ok(()) => sync_parent_dir(parent),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(err(
-                WinErrorCode::Internal,
-                ".wslconfig was created concurrently; refusing to replace it",
-            )),
-            Err(e) => Err(io_err(&e, "failed to create .wslconfig")),
-        };
+        return Err(e);
     }
-    drop(write_new_file(&tmp, data, acl_from.as_ref())?);
     // 置換前に複製元のハンドルを閉じる（開いたままの宛先への rename の可否を std の実装に依存させない）。
-    drop(acl_from);
+    drop(source);
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(io_err(&e, "failed to replace .wslconfig"));
@@ -686,18 +750,36 @@ fn write_atomic(
     sync_parent_dir(parent)
 }
 
+/// [`WriteMode::CreateOnly`] の本体（hard_link による排他的な公開と親ディレクトリの同期）。
+fn create_exclusive(path: &Path, parent: &Path, tmp: &Path, data: &[u8]) -> Result<(), WinError> {
+    drop(write_new_file(tmp, data, None)?);
+    let linked = std::fs::hard_link(tmp, path);
+    // 一時名の削除失敗は無視する。リンク成功後なら一時名は宛先と同一ファイル（同じ内容・同じアクセス
+    // 制御）で新たな露出はなく、作成自体は成功しているため `Err` にすると結果を誤って伝える。
+    let _ = std::fs::remove_file(tmp);
+    match linked {
+        Ok(()) => sync_parent_dir(parent),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(err(
+            WinErrorCode::Internal,
+            ".wslconfig was created concurrently; refusing to replace it",
+        )),
+        Err(e) => Err(io_err(&e, "failed to create .wslconfig")),
+    }
+}
+
 /// `path` の `.wslconfig` に `virtiofs=true` を opt-in する（読み込み → 編集 → 原子的書き込み）。
 ///
 /// ファイルがなければ新規作成（親ディレクトリは作らず、なければ `NOT_FOUND`）。すでに有効なら書き込まない。
 /// 既存ファイルの置換では元のアクセス制御（unix のパーミッション・Windows の DACL・整合性ラベル・暗号化）を
 /// 保ち、保てなければ置換しない。読み取り専用（unix は書き込みビットなし、Windows は READONLY 属性）の
 /// ファイルは利用者の変更防止の意思として扱い、書き換えずに `PERMISSION_DENIED` を返す（有効化済みなら
-/// 書き込み不要のため `AlreadyEnabled`）。`Err` のとき通常は元のファイルを変更しない。例外として unix で公開（新規作成の
-/// hard_link・置換の rename）後の親ディレクトリ fsync に失敗した場合は、作成・置換済みのまま `Err` に
-/// なりうる。TASK-67.4（#375）の起動ロジックから呼ばれる想定。
+/// 書き込み不要のため `AlreadyEnabled`）。読み込み後に別プロセスが作成・置換・書き換えた場合は上書きせず
+/// `INTERNAL`。`Err` のとき通常は元のファイルを変更しない。例外として unix で公開（新規作成の hard_link・
+/// 置換の rename）後の親ディレクトリ fsync に失敗した場合は、作成・置換済みのまま `Err` になりうる。
+/// TASK-67.4（#375）の起動ロジックから呼ばれる想定。
 pub fn enable_virtiofs_at(path: &Path) -> Result<EnableOutcome, WinError> {
     let (mut cfg, source) = match load_verified(path)? {
-        Some((c, f)) => (c, Some(f)),
+        Some((c, s)) => (c, Some(s)),
         None => (WslConfig::parse("")?, None),
     };
     let existed = source.is_some();
@@ -707,6 +789,7 @@ pub fn enable_virtiofs_at(path: &Path) -> Result<EnableOutcome, WinError> {
     }
     if let Some(src) = &source {
         let readonly = src
+            .file
             .metadata()
             .map_err(|e| io_err(&e, "failed to stat .wslconfig"))?
             .permissions()
@@ -725,12 +808,11 @@ pub fn enable_virtiofs_at(path: &Path) -> Result<EnableOutcome, WinError> {
             format!("result exceeds {MAX_WSLCONFIG_BYTES} bytes"),
         ));
     }
-    let mode = if existed {
-        WriteMode::Replace
-    } else {
-        WriteMode::CreateOnly
+    let mode = match source {
+        Some(s) => WriteMode::Replace(s),
+        None => WriteMode::CreateOnly,
     };
-    write_atomic(path, text.as_bytes(), mode, source)?;
+    write_atomic(path, text.as_bytes(), mode)?;
     Ok(match edit {
         _ if !existed => EnableOutcome::Created,
         VirtiofsEdit::Updated { previous } => EnableOutcome::Updated { previous },
@@ -956,7 +1038,6 @@ mod tests {
             &d.file(),
             b"[wsl2]\r\nvirtiofs=true\r\n",
             WriteMode::CreateOnly,
-            None,
         )
         .expect_err("must refuse");
         assert_eq!(e.code(), WinErrorCode::Internal);

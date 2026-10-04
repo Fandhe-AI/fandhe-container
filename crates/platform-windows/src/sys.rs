@@ -2,10 +2,10 @@
 //! オーナー決定 2026-09-27〔[#4](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856057084)・
 //! [範囲限定](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856167174)〕）。
 //!
-//! 提供機能は [`copy_security`] のみ。`wslconfig` の既存 `.wslconfig` 置換（TASK-67.2・#373・WIN-2）が、
+//! 提供機能は [`copy_security`] と [`file_id`]。`wslconfig` の既存 `.wslconfig` 置換（TASK-67.2・#373・WIN-2）が、
 //! 一時ファイルへ内容を書く前に元ファイルの DACL・整合性ラベルを写し、rename 後もアクセス制御が後退しない
 //! ようにする（親ディレクトリからの継承 ACL への置き換わりで `kernelCommandLine` 等が他ユーザーに読まれる
-//! のを防ぐ）。
+//! のを防ぐ）。[`file_id`] は置換直前に宛先が読み込み元と同じファイルかを確かめるのに使う。
 //!
 //! # 不変条件
 //! - `unsafe` は本モジュール内に閉じ、公開するのは安全な関数のみ（`unsafe fn` を外へ出さない）。
@@ -80,6 +80,59 @@ unsafe extern "system" {
 unsafe extern "system" {
     // SAFETY（宣言）: `HLOCAL LocalFree(HLOCAL)`（winbase.h）。成功時は NULL を返す。
     fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    // SAFETY（宣言）: `BOOL GetFileInformationByHandleEx(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD)`
+    // （fileapi.h / winbase.h）。`info` は `size` バイトの書き込み可能領域で、クラスに対応する構造体を受ける。
+    // 失敗時は 0（FALSE）。
+    fn GetFileInformationByHandleEx(
+        handle: *mut c_void,
+        class: i32,
+        info: *mut c_void,
+        size: u32,
+    ) -> i32;
+}
+
+/// `FILE_INFO_BY_HANDLE_CLASS::FileIdInfo`（minwinbase.h）。
+const FILE_ID_INFO_CLASS: i32 = 18;
+
+/// `FILE_ID_INFO`（winbase.h）。`FileId` は ReFS でも一意な 128 bit の識別子。
+#[repr(C)]
+#[derive(Default)]
+struct FileIdInfoRaw {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+/// ボリュームとファイルを一意に識別する値（[`file_id`] の戻り値）。比較にだけ使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileId {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+/// `file` のボリュームシリアル番号と 128 bit のファイル ID を返す（`GetFileInformationByHandleEx` の
+/// `FileIdInfo`）。`wslconfig` が置換直前に宛先と読み込み元の同一性を確かめるのに使う。
+pub(crate) fn file_id(file: &File) -> std::io::Result<FileId> {
+    let mut raw = FileIdInfoRaw::default();
+    let size = u32::try_from(std::mem::size_of::<FileIdInfoRaw>())
+        .map_err(|_| std::io::Error::other("FILE_ID_INFO size overflow"))?;
+    // SAFETY: `file` は生存中の `File` が所有する有効なハンドル。`raw` は `FILE_ID_INFO` と同じレイアウト
+    // （repr(C)。u64 と 16 バイト配列）の書き込み可能なローカル変数で、`size` にその大きさを渡すため、
+    // 関数はこの範囲を超えて書かない。
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_ID_INFO_CLASS,
+            (&mut raw as *mut FileIdInfoRaw).cast::<c_void>(),
+            size,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(FileId {
+        volume_serial_number: raw.volume_serial_number,
+        file_id: raw.file_id,
+    })
 }
 
 /// `GetSecurityInfo` が返した SD を、スコープを抜けるときに必ず `LocalFree` する所有者。

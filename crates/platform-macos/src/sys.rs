@@ -302,9 +302,9 @@ pub(crate) enum DelegateEvent {
     StoppedWithError(VzErrorInfo),
 }
 
-/// delegate の ivar。通知は VM キュー上で呼ばれる。
+/// delegate の ivar。通知は VM キュー上で呼ばれる（どのスレッドかは GCD 次第のため handler は `Send`）。
 struct DelegateIvars {
-    handler: Box<dyn Fn(DelegateEvent)>,
+    handler: Box<dyn Fn(DelegateEvent) + Send>,
 }
 
 define_class!(
@@ -336,7 +336,7 @@ define_class!(
 );
 
 impl VmDelegate {
-    fn new(handler: Box<dyn Fn(DelegateEvent)>) -> Retained<Self> {
+    fn new(handler: Box<dyn Fn(DelegateEvent) + Send>) -> Retained<Self> {
         let this = Self::alloc().set_ivars(DelegateIvars { handler });
         // SAFETY: ivars を設定済みの未初期化オブジェクトに NSObject の `init` を送る標準手順。
         unsafe { msg_send![super(this), init] }
@@ -552,7 +552,7 @@ impl VmHost {
     /// 対応確認・設定検証の後に、専用キュー上で動く VM を生成する。
     pub(crate) fn new(
         config: &VZVirtualMachineConfiguration,
-        handler: Box<dyn Fn(DelegateEvent)>,
+        handler: Box<dyn Fn(DelegateEvent) + Send>,
     ) -> Result<VmHost, HostInitError> {
         // SAFETY: 引数なしのクラスメソッドで副作用はない。
         if !unsafe { VZVirtualMachine::isSupported() } {

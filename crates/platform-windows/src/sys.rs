@@ -21,6 +21,17 @@
 #[cfg(windows)]
 pub(crate) use windows::{GENERIC_WRITE, WRITE_DAC, WRITE_OWNER, copy_security, file_id};
 
+#[cfg(all(
+    test,
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    )
+))]
+pub(crate) use unix::add_test_acl;
 #[cfg(unix)]
 pub(crate) use unix::has_extended_acl;
 
@@ -435,6 +446,55 @@ mod unix {
                 _ => Err(e),
             }
         }
+
+        /// テスト用: `path` に拡張 ACL（`nobody` の読み取り）を `setxattr` で付ける。
+        #[cfg(test)]
+        pub(super) fn set_test_acl(path: &std::path::Path) -> std::io::Result<()> {
+            use std::os::unix::ffi::OsStrExt;
+            unsafe extern "C" {
+                // SAFETY（宣言）: `int setxattr(const char *path, const char *name, const void *value,
+                // size_t size, int flags)`（sys/xattr.h）。失敗時は -1。
+                fn setxattr(
+                    path: *const c_char,
+                    name: *const c_char,
+                    value: *const c_void,
+                    size: usize,
+                    flags: c_int,
+                ) -> c_int;
+            }
+            // posix_acl_xattr 形式（version 2 と {tag, perm, id} の列。リトルエンディアン）:
+            // USER_OBJ rw-・USER(65534) r--・GROUP_OBJ r--・MASK r--・OTHER ---。
+            let mut blob = 2u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in [
+                (0x01u16, 6u16, u32::MAX),
+                (0x02, 4, 65534),
+                (0x04, 4, u32::MAX),
+                (0x10, 4, u32::MAX),
+                (0x20, 0, u32::MAX),
+            ] {
+                blob.extend_from_slice(&tag.to_le_bytes());
+                blob.extend_from_slice(&perm.to_le_bytes());
+                blob.extend_from_slice(&id.to_le_bytes());
+            }
+            let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| std::io::Error::other("path contains NUL"))?;
+            // SAFETY: `cpath` と属性名は NUL 終端の文字列で、`blob` は `blob.len()` バイトの読み取り可能な
+            // 領域。いずれも呼び出しの間は生存する。
+            let rc = unsafe {
+                setxattr(
+                    cpath.as_ptr(),
+                    c"system.posix_acl_access".as_ptr(),
+                    blob.as_ptr().cast::<c_void>(),
+                    blob.len(),
+                    0,
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -489,6 +549,67 @@ mod unix {
                 std::io::ErrorKind::Unsupported,
                 "extended ACL detection is not supported on this platform",
             ))
+        }
+    }
+
+    #[cfg(all(
+        test,
+        any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            target_os = "macos"
+        )
+    ))]
+    mod tests {
+        use super::*;
+
+        /// WIN-2・TASK-67.2: ACL のない通常のファイルは `false`。
+        #[test]
+        fn plain_file_has_no_extended_acl() {
+            let p = std::env::temp_dir().join(format!("fc-sys-noacl-{}", std::process::id()));
+            std::fs::write(&p, b"x").expect("write");
+            let r = has_extended_acl(&File::open(&p).expect("open"));
+            let _ = std::fs::remove_file(&p);
+            assert!(!r.expect("detect"));
+        }
+
+        /// WIN-2・TASK-67.2: 拡張 ACL（`nobody` の読み取り）を付けたファイルは `true`。
+        #[test]
+        fn file_with_acl_entry_is_detected() {
+            let p = std::env::temp_dir().join(format!("fc-sys-acl-{}", std::process::id()));
+            std::fs::write(&p, b"x").expect("write");
+            add_test_acl(&p);
+            let r = has_extended_acl(&File::open(&p).expect("open"));
+            let _ = std::fs::remove_file(&p);
+            assert!(r.expect("detect"));
+        }
+    }
+
+    /// テスト用: `path` に拡張 ACL（`nobody` の読み取り）を付ける。Linux は `setxattr`、macOS は `chmod +a`。
+    #[cfg(all(
+        test,
+        any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            target_os = "macos"
+        )
+    ))]
+    pub(crate) fn add_test_acl(path: &std::path::Path) {
+        #[cfg(target_os = "linux")]
+        imp::set_test_acl(path).expect("setxattr system.posix_acl_access");
+        #[cfg(target_os = "macos")]
+        {
+            let st = std::process::Command::new("chmod")
+                .arg("+a")
+                .arg("nobody allow read")
+                .arg(path)
+                .status()
+                .expect("chmod");
+            assert!(st.success(), "chmod +a failed: {st:?}");
         }
     }
 }

@@ -1286,6 +1286,33 @@ mod tests {
         set_readonly(false);
     }
 
+    /// WIN-2・TASK-67.2（レビュー指摘 P0）: パーミッションで再現できない拡張 ACL（Linux の POSIX ACL・macOS の
+    /// ACL）を持つファイルは置換せず PERMISSION_DENIED。元の内容を残し、一時ファイルも残さない。
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))]
+    #[test]
+    fn file_with_extended_acl_is_not_replaced() {
+        let d = TmpDir::new("posixacl");
+        std::fs::write(d.file(), "[wsl2]\nmemory=4GB\n").expect("write");
+        crate::sys::add_test_acl(&d.file());
+        let e = enable_virtiofs_at(&d.file()).expect_err("must refuse");
+        assert_eq!(e.code(), WinErrorCode::PermissionDenied);
+        assert_eq!(
+            e.message(),
+            ".wslconfig has an ACL that cannot be preserved; refusing to replace it"
+        );
+        assert_eq!(
+            std::fs::read(d.file()).expect("read"),
+            b"[wsl2]\nmemory=4GB\n"
+        );
+        assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
+    }
+
     /// WIN-2・TASK-67.2（レビュー指摘 P0）: 既存ファイルの置換後も個別設定した DACL（明示 ACE と継承保護）・
     /// 整合性ラベル・HIDDEN 属性が保たれ、親ディレクトリから継承した既定 ACL に置き換わらない。
     #[cfg(windows)]

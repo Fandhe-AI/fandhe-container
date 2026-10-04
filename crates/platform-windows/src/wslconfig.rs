@@ -555,11 +555,22 @@ struct Source {
     stamp: Stamp,
 }
 
-/// 同一ファイルへのその場の書き換えを検出するための大きさと最終更新時刻。
+/// 同一ファイルへのその場の書き換えと、アクセス制御・属性の変更を検出するための記録。
+///
+/// - 全 OS: 大きさと最終更新時刻（内容の書き換え）。
+/// - unix: モード・所有者・所有グループと ctime（chmod・chown・ACL などの拡張属性の変更でも進む）。
+/// - Windows: ファイル属性（READONLY・HIDDEN・ENCRYPTED 等）と、所有者・DACL・整合性ラベルの SD のバイト列
+///   （[`crate::sys::security_snapshot`]）。
 #[derive(Debug, PartialEq, Eq)]
 struct Stamp {
     len: u64,
     modified: Option<SystemTime>,
+    #[cfg(unix)]
+    unix: (u32, u32, u32, i64, i64),
+    #[cfg(windows)]
+    attributes: u32,
+    #[cfg(windows)]
+    security: Vec<u8>,
 }
 
 fn stamp(file: &std::fs::File) -> Result<Stamp, WinError> {
@@ -569,6 +580,19 @@ fn stamp(file: &std::fs::File) -> Result<Stamp, WinError> {
     Ok(Stamp {
         len: m.len(),
         modified: m.modified().ok(),
+        #[cfg(unix)]
+        unix: {
+            use std::os::unix::fs::MetadataExt;
+            (m.mode(), m.uid(), m.gid(), m.ctime(), m.ctime_nsec())
+        },
+        #[cfg(windows)]
+        attributes: {
+            use std::os::windows::fs::MetadataExt;
+            m.file_attributes()
+        },
+        #[cfg(windows)]
+        security: crate::sys::security_snapshot(file)
+            .map_err(|e| io_err(&e, "failed to read .wslconfig access control"))?,
     })
 }
 
@@ -668,7 +692,8 @@ fn same_file(a: &std::fs::File, b: &std::fs::File) -> Result<bool, WinError> {
 /// 置換の直前に、宛先が読み込み元と同じファイルのままで、読み込み後に書き換えられていないことを確かめる。
 ///
 /// 宛先を [`open_verified`] で開き直し（リンク・通常ファイル以外は拒否）、読み込み元と同一ファイルであること、
-/// 読み込み元ハンドルの大きさ・最終更新時刻が読み込み前の記録（[`Stamp`]）と一致することを確認する。
+/// 読み込み元ハンドルの大きさ・最終更新時刻・アクセス制御・属性（読み取り専用を含む）が読み込み前の記録
+/// （[`Stamp`]）と一致することを確認する。
 /// 違えば別プロセスの変更を上書きしないよう `INTERNAL` で拒否する。確認から rename までの短い間の競合は
 /// 残る（パスを指定する rename では閉じられない。単一ユーザーのホーム配下の設定操作のため許容）。最終更新
 /// 時刻の粒度内で大きさを変えないその場の書き換えは検出できない。
@@ -803,6 +828,17 @@ fn fill_new_file(
         #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt;
+            // 監査用 SACL は観測できる場合（SeSecurityPrivilege が有効）に限り検査し、監査 ACE があれば
+            // 写せないため置換しない。観測できない主体は SACL に制約されず、元ファイルを削除できる（削除で SACL
+            // も消える）ため、観測できないことは拒否理由にしない（[`crate::sys::has_audit_sacl`]）。
+            let audited = crate::sys::has_audit_sacl(src)
+                .map_err(|e| io_err(&e, "failed to inspect file audit settings"))?;
+            if audited == Some(true) {
+                return Err(err(
+                    WinErrorCode::PermissionDenied,
+                    ".wslconfig has an audit SACL that cannot be preserved; refusing to replace it",
+                ));
+            }
             crate::sys::copy_security(src, f)
                 .map_err(|e| io_err(&e, "failed to copy file access control"))?;
             let want = src

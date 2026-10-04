@@ -19,7 +19,10 @@
 //!   `windows-sys` 0.61.2・`libc` 0.2.189 と照合済み（`libc` にない macOS の ACL 関数は `sys/acl.h`）。
 
 #[cfg(windows)]
-pub(crate) use windows::{GENERIC_WRITE, WRITE_DAC, WRITE_OWNER, copy_security, file_id};
+pub(crate) use windows::{
+    GENERIC_WRITE, WRITE_DAC, WRITE_OWNER, copy_security, file_id, has_audit_sacl,
+    security_snapshot,
+};
 
 #[cfg(unix)]
 pub(crate) use unix::has_extended_acl;
@@ -40,7 +43,7 @@ pub(crate) use unix::{add_test_acl, add_test_default_acl};
 mod windows {
     use std::ffi::c_void;
     use std::fs::File;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
     /// `SE_OBJECT_TYPE::SE_FILE_OBJECT`（accctrl.h）。
     const SE_FILE_OBJECT: i32 = 1;
@@ -58,6 +61,20 @@ mod windows {
     const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
     /// `SYSTEM_MANDATORY_LABEL_ACE_TYPE`（winnt.h）。整合性ラベルの ACE 種別。
     const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
+    /// `SACL_SECURITY_INFORMATION`（winnt.h）。読み書きには ACCESS_SYSTEM_SECURITY（SeSecurityPrivilege）が要る。
+    const SACL_SECURITY_INFORMATION: u32 = 0x0000_0008;
+    /// `ACCESS_SYSTEM_SECURITY`（winnt.h）。
+    const ACCESS_SYSTEM_SECURITY: u32 = 0x0100_0000;
+    /// `READ_CONTROL`（winnt.h）。
+    const READ_CONTROL: u32 = 0x0002_0000;
+    /// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`（std の既定の共有モードと同じ）。
+    const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+    /// `ERROR_ACCESS_DENIED`。
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    /// `ERROR_PRIVILEGE_NOT_HELD`。
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+    /// 監査・アラームの ACE 種別（winnt.h の SYSTEM_AUDIT / ALARM 系。2・3・7・8・13〜16）。
+    const AUDIT_ACE_TYPES: [u8; 8] = [0x02, 0x03, 0x07, 0x08, 0x0d, 0x0e, 0x0f, 0x10];
     /// `ERROR_SUCCESS`。
     const ERROR_SUCCESS: u32 = 0;
 
@@ -120,6 +137,9 @@ mod windows {
             info: *mut c_void,
             size: u32,
         ) -> i32;
+        // SAFETY（宣言）: `HANDLE ReOpenFile(HANDLE, DWORD, DWORD, DWORD)`（winbase.h）。同じファイルオブジェクトを
+        // 別のアクセス権で開き直した新しいハンドルを返す（呼び出し側が閉じる）。失敗時は INVALID_HANDLE_VALUE。
+        fn ReOpenFile(handle: *mut c_void, access: u32, share: u32, flags: u32) -> *mut c_void;
     }
 
     /// `FILE_INFO_BY_HANDLE_CLASS::FileIdInfo`（minwinbase.h）。
@@ -191,6 +211,10 @@ mod windows {
         Dacl,
         /// 整合性ラベルだけを含む SACL（`LABEL_SECURITY_INFORMATION`。READ_CONTROL で読める）。
         Label,
+        /// 監査用 SACL（`SACL_SECURITY_INFORMATION`。ACCESS_SYSTEM_SECURITY つきのハンドルが要る）。
+        Sacl,
+        /// 所有者・DACL・整合性ラベルをまとめた SD 全体（比較用。出力ポインタは使わない）。
+        Snapshot,
     }
 
     /// `src` の SD から `part` を取得する。戻り値のポインタ（SID または ACL）は SD の内部（または NULL）を指し、
@@ -208,6 +232,13 @@ mod windows {
             Part::Owner => (OWNER_SECURITY_INFORMATION, &mut out, null, null),
             Part::Dacl => (DACL_SECURITY_INFORMATION, null, &mut out, null),
             Part::Label => (LABEL_SECURITY_INFORMATION, null, null, &mut out),
+            Part::Sacl => (SACL_SECURITY_INFORMATION, null, null, &mut out),
+            Part::Snapshot => (
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
+                null,
+                null,
+                null,
+            ),
         };
         // SAFETY: `src` は生存中の `File` が所有する有効なハンドル。出力引数 `owner_out` / `dacl_out` / `sacl_out`
         // のうち要求する 1 つと `sd` は有効なローカル変数を指し、要求しない group と他の出力には NULL を渡す
@@ -338,27 +369,29 @@ mod windows {
         Ok(())
     }
 
-    /// `file` の整合性ラベル（ポリシーのマスクと整合性レベルの RID）。ラベルがなければ `None`。
-    fn integrity_label(file: &File) -> std::io::Result<Option<(u32, u32)>> {
-        let (sd, acl) = get_part(file, Part::Label)?;
-        if acl.is_null() {
-            return Ok(None);
-        }
-        let malformed = || std::io::Error::other("malformed ACL");
+    fn malformed() -> std::io::Error {
+        std::io::Error::other("malformed security descriptor")
+    }
+
+    /// `sd`（`GetSecurityInfo` が返した自己相対 SD）の全長。
+    fn sd_len(sd: &LocalSecurityDescriptor) -> std::io::Result<usize> {
+        // SAFETY: `sd.0` は `get_part` が取得した有効な自己相対 SD（`sd` の生存中は解放されない）。
+        usize::try_from(unsafe { GetSecurityDescriptorLength(sd.0) }).map_err(|_| malformed())
+    }
+
+    /// `sd` の内部を指す ACL を、SD の全長の内側に収まることを確かめてから `AclSize` バイトだけコピーする。
+    fn copy_acl(sd: &LocalSecurityDescriptor, acl: *mut c_void) -> std::io::Result<Vec<u8>> {
         // `GetSecurityInfo` が返す SD は自己相対形式で、ACL はその内部にある。読み取る範囲が SD の内側に
         // 収まることを、SD の全長と ACL の位置から確かめてから読む。
-        // SAFETY: `sd.0` は `get_part` が取得した有効な自己相対 SD（`sd` の生存中は解放されない）。
-        let sd_len = usize::try_from(unsafe { GetSecurityDescriptorLength(sd.0) })
-            .map_err(|_| malformed())?;
         let acl_off = (acl as usize)
             .checked_sub(sd.0 as usize)
             .ok_or_else(malformed)?;
-        let room = sd_len.checked_sub(acl_off).ok_or_else(malformed)?;
+        let room = sd_len(sd)?.checked_sub(acl_off).ok_or_else(malformed)?;
         if room < 8 {
             return Err(malformed());
         }
         // SAFETY: `acl` は `sd` の内部を指す非 NULL の ACL で、上で `acl` から 8 バイトが SD の内側にあることを
-        // 確認した（`sd` はこの関数の末尾まで解放されない）。ACL の先頭 8 バイトは ACL ヘッダ（AclRevision u8・
+        // 確認した（`sd` は呼び出し側で生存している）。ACL の先頭 8 バイトは ACL ヘッダ（AclRevision u8・
         // Sbz1 u8・AclSize u16・AceCount u16・Sbz2 u16）で、境界合わせを仮定しない `read_unaligned` で読む。
         let size = unsafe { std::ptr::read_unaligned(acl.cast::<u8>().add(2).cast::<u16>()) };
         let size = usize::from(u16::from_le(size));
@@ -367,9 +400,93 @@ mod windows {
         }
         // SAFETY: `acl` から `size`（AclSize）バイトは、上で SD の全長の内側にあると確認した有効な読み取り可能
         // 領域で、`sd` の生存中に限ってコピーする。
-        let bytes = unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), size) }.to_vec();
+        Ok(unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), size) }.to_vec())
+    }
+
+    /// `file` の整合性ラベル（ポリシーのマスクと整合性レベルの RID）。ラベルがなければ `None`。
+    fn integrity_label(file: &File) -> std::io::Result<Option<(u32, u32)>> {
+        let (sd, acl) = get_part(file, Part::Label)?;
+        if acl.is_null() {
+            return Ok(None);
+        }
+        let bytes = copy_acl(&sd, acl)?;
         drop(sd);
         parse_label_acl(&bytes).ok_or_else(malformed)
+    }
+
+    /// `file` の所有者・DACL・整合性ラベルをまとめた自己相対 SD のバイト列（比較用のスナップショット）。
+    ///
+    /// `wslconfig` が読み込み時と置換直前に同じハンドルで取得して比べ、読み込み後のアクセス制御の変更
+    /// （DACL・所有者・ラベル）を検出するのに使う。同じ SD からは同じバイト列が得られる。
+    pub(crate) fn security_snapshot(file: &File) -> std::io::Result<Vec<u8>> {
+        let (sd, _) = get_part(file, Part::Snapshot)?;
+        let len = sd_len(&sd)?;
+        if len == 0 {
+            return Err(malformed());
+        }
+        // SAFETY: `sd.0` は有効な自己相対 SD で、`GetSecurityDescriptorLength` が返した `len` バイトはその全体
+        // （内部の SID・ACL を含む）。`sd` の生存中に限ってコピーする。
+        Ok(unsafe { std::slice::from_raw_parts(sd.0.cast::<u8>(), len) }.to_vec())
+    }
+
+    /// `file` の監査用 SACL に監査・アラームの ACE があるか。
+    ///
+    /// SACL の読み取りには ACCESS_SYSTEM_SECURITY（SeSecurityPrivilege が有効なトークン）が要る。同じファイル
+    /// オブジェクトを `ReOpenFile` で開き直して読めれば、監査 ACE の有無を `Some(bool)` で返す（パスを引き直さない）。
+    /// 特権がない（`ERROR_PRIVILEGE_NOT_HELD`・`ERROR_ACCESS_DENIED`）場合は観測できないため `None`。それ以外の
+    /// 失敗は `Err`。観測できない主体は SACL に制約されず、元ファイルを削除できる（削除で SACL も消える）ため、
+    /// 呼び出し側は `None` を置換の拒否理由にしない。
+    pub(crate) fn has_audit_sacl(file: &File) -> std::io::Result<Option<bool>> {
+        // SAFETY: `file` は生存中の `File` が所有する有効なハンドル。戻り値は下で INVALID_HANDLE_VALUE（-1）
+        // と NULL を判定し、有効なら直後に `OwnedHandle` が所有して 1 回だけ閉じる。
+        let h = unsafe {
+            ReOpenFile(
+                file.as_raw_handle(),
+                ACCESS_SYSTEM_SECURITY | READ_CONTROL,
+                FILE_SHARE_ALL,
+                0,
+            )
+        };
+        if h.is_null() || h as isize == -1 {
+            let e = std::io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(ERROR_PRIVILEGE_NOT_HELD) | Some(ERROR_ACCESS_DENIED) => Ok(None),
+                _ => Err(e),
+            };
+        }
+        // SAFETY: `h` は `ReOpenFile` が返した有効なハンドルで、他に所有者はいない（ここで所有権を移す）。
+        let reopened = File::from(unsafe { OwnedHandle::from_raw_handle(h) });
+        let (sd, sacl) = get_part(&reopened, Part::Sacl)?;
+        if sacl.is_null() {
+            return Ok(Some(false));
+        }
+        let bytes = copy_acl(&sd, sacl)?;
+        drop(sd);
+        acl_ace_types(&bytes)
+            .map(|types| Some(types.iter().any(|t| AUDIT_ACE_TYPES.contains(t))))
+            .ok_or_else(malformed)
+    }
+
+    /// ACL のバイト列の ACE 種別の列。形式が壊れていれば `None`。
+    fn acl_ace_types(acl: &[u8]) -> Option<Vec<u8>> {
+        let count = u16::from_le_bytes(acl.get(4..6)?.try_into().ok()?);
+        let mut types = Vec::with_capacity(usize::from(count));
+        let mut off: usize = 8;
+        for _ in 0..count {
+            let ace_type = *acl.get(off)?;
+            let size = usize::from(u16::from_le_bytes(
+                acl.get(off.checked_add(2)?..off.checked_add(4)?)?
+                    .try_into()
+                    .ok()?,
+            ));
+            let end = off.checked_add(size)?;
+            if size < 4 || end > acl.len() {
+                return None;
+            }
+            types.push(ace_type);
+            off = end;
+        }
+        Some(types)
     }
 
     /// 整合性ラベルの ACL のバイト列から、最初の `SYSTEM_MANDATORY_LABEL_ACE` の（マスク, 整合性レベル RID）を

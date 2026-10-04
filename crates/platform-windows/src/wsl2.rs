@@ -276,12 +276,13 @@ fn interpret_version(out: &run::Captured) -> Result<WslVersionInfo, Wsl2Error> {
     parse::parse_version(&parse::decode_output(&out.stdout)?)
 }
 
-/// `-l -v` の実行結果を解釈する。ディストリ 0 件を示す失敗は空の一覧として扱う。
+/// `-l -v` の実行結果を解釈する。ディストリ 0 件を示す専用識別子は、終了コードの成否を
+/// 問わず空の一覧として扱う（0 件の案内文を終了コード 0 で返す環境がある）。
 fn interpret_list(out: &run::Captured) -> Result<Vec<WslDistro>, Wsl2Error> {
+    if matches!(parse::classify_failure(out), parse::Failure::NoDistro) {
+        return Ok(Vec::new());
+    }
     if !out.success {
-        if matches!(parse::classify_failure(out), parse::Failure::NoDistro) {
-            return Ok(Vec::new());
-        }
         return Err(failure_error(out, "wsl.exe -l -v failed"));
     }
     parse::parse_distros(&parse::decode_output(&out.stdout)?)
@@ -398,6 +399,22 @@ mod tests {
         let mut d = distro(WslMajorVersion::V2);
         d.state = DistroState::Stopped;
         assert!(evaluate(ver(), vec![d]).is_ok());
+    }
+
+    /// WIN-1: 0 件の識別子は終了コード 0 でも空の一覧になり、他の失敗識別子の併記は失敗のまま。
+    #[test]
+    fn interpret_list_no_distro_on_success() {
+        let cap = |success: bool, out: &str| run::Captured {
+            success,
+            code: Some(if success { 0 } else { 1 }),
+            stdout: out.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        let msg = "Wsl/Service/WSL_E_DEFAULT_DISTRO_NOT_FOUND";
+        assert_eq!(interpret_list(&cap(true, msg)).unwrap(), Vec::new());
+        assert_eq!(interpret_list(&cap(false, msg)).unwrap(), Vec::new());
+        let mixed = format!("{msg}\nE_ACCESSDENIED 0x80070005");
+        assert!(interpret_list(&cap(true, &mixed)).is_err());
     }
 
     /// REPAIR-5・ERR-1: 0 や過大なタイムアウトは INVALID_ARGUMENT。

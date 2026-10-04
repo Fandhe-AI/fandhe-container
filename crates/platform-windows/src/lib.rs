@@ -8,7 +8,8 @@
 //! 未実装またはスタブ（REPAIR-3）。
 //!
 //! cfg 方針: `wsl2` は解析器と実行器を 3 OS の CI でテストできるよう全 OS でビルドし、`wsl.exe` の
-//! パス解決だけを `cfg(windows)` で分岐する（Windows 以外では `UNIMPLEMENTED` を返す）。
+//! パス解決（Windows 以外では `UNIMPLEMENTED` を返す）と子孫プロセスをまとめる Job Object（`wsl2::run`）
+//! だけを `cfg(windows)` で分岐する。Win32 API の呼び出しは `sys` に閉じる。
 //! OS 非依存のロジック（`.wslconfig` のテキスト処理・エラー型）も全 OS でビルドする。
 //!
 //! 実行時は `fandhe-container-plugin-windows`（TASK-116）が本 crate を別プロセスとして動かす。

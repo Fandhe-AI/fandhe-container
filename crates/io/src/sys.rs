@@ -112,6 +112,9 @@ fn last_os_error_to_ioerror(context: &str) -> IoError {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) mod vsock;
+
+#[cfg(target_os = "linux")]
 mod linux {
     //! Linux の `getsockopt(SOL_SOCKET, SO_PEERCRED)` 用の FFI 宣言・定数。
 

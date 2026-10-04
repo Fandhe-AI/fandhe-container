@@ -9,7 +9,8 @@
 //!
 //! OS 固有の型（`std::os::unix` 等）・`cfg(target_os = ...)` 分岐は持たない。UDS・vsock・
 //! named pipe などの具象トランスポート実装は後続タスクの担当 crate / モジュールに置く。
-//! UDS のサーバー側（Linux / macOS）は [`crate::server`] が TASK-13.2.1（#820）で
+//! UDS のサーバー側（Linux / macOS）は [`crate::server`] が TASK-13.2.1（#820）で、
+//! vsock（Linux）のサーバー側・クライアント側は [`crate::vsock`] が #1119 で
 //! 具象実装を追加した。
 //!
 //! 1 本の接続を送信側・受信側へ分けて別スレッドから並行に使う API は

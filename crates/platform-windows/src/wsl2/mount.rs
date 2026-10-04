@@ -376,18 +376,25 @@ fn exec_argv(distro: &DistroName, cmd: &[&str]) -> Vec<String> {
 /// 入力は検証済み newtype と 16 進の nonce）。
 ///
 /// 所有の証拠: `mount` の直前と直後に同じプロセス内でマウント先のマウント ID を読み、新しく現れたものが
-/// ちょうど 1 件ならそれを自分のマウントとして標準出力へ書き（`mount` 自身の標準出力は標準エラーへ回し、
-/// 標準出力にはマウント ID の 1 行だけが載るようにする）、`/run/fandhe/<nonce>`（root 所有・`0700` のディレクトリ） にも記録する。`mount` の
-/// 終了コードによらず記録する（`mount(8)` はマウント成立後の処理でも失敗を返しうるため）。`wsl.exe` の待機が
-/// タイムアウトして標準出力を失っても、呼び出し側は記録を読んで自分のマウントを特定できる。新しいマウントが
-/// 0 件・複数件なら記録しない（呼び出し側は所有を確認できないものとして扱い、外さない）。残る窓（同一プロセス内の
-/// `mount` の前後の読み取りの間）に同じマウント先へマウントできるのはゲスト内の root（CAP_SYS_ADMIN）に限られる。
+/// ちょうど 1 件ならそれを自分のマウントとして標準出力へ書く（`mount` 自身の標準出力は標準エラーへ回し、
+/// 標準出力にはマウント ID の 1 行だけが載るようにする）。あわせて root 専用の記録 `/run/fandhe/<nonce>` に
+/// マウント ID（特定できなければ `none`）を一時ファイル経由の rename で書く。`mount` の終了コードによらず記録する
+/// （`mount(8)` はマウント成立後の処理でも失敗を返しうるため）。`wsl.exe` の待機がタイムアウトして標準出力を
+/// 失っても、呼び出し側は記録（[`RECORD_SCRIPT`]）で自分のマウントを特定できる。`none` なら呼び出し側は所有を
+/// 確認できないものとして扱い、外さない。残る窓（同一プロセス内の `mount` の前後の読み取りの間）に同じマウント先へ
+/// マウントできるのはゲスト内の root（CAP_SYS_ADMIN）に限られる。
+///
+/// 遅れての成立の防止: `mount` の直前に `mkdir /run/fandhe/<nonce>.claim` で実行権を確保する（`mkdir` は原子的）。
+/// 呼び出し側がタイムアウト後に [`RECORD_SCRIPT`] で同じ claim を先に取れば、本スクリプトは確保に失敗して
+/// `mount` せずに終わる（205）。これにより、待機をあきらめた後でゲスト内の処理が遅れて動き出してもマウントは
+/// 成立しない。claim を本スクリプトが先に取っていれば、記録が確定するまで呼び出し側が有界に待つ。
 ///
 /// ディレクトリの作成は、並行する別の準備が先に作った場合（`EEXIST`）も成功として扱い、直後の検証で安全性を
 /// 確かめる（`/run` は tmpfs で WSL の再起動ごとに消えるため、記録ディレクトリの同時作成は起こりうる）。
 ///
 /// 終了コード: 200=`/`・`/mnt`・`/run` が root 所有の他者書き込み不可な実ディレクトリでない・201=ディレクトリ作成
-/// 失敗・202=パス要素が symlink / 非 root 所有 / 他者書き込み可。それ以外は `mount` の終了コードをそのまま返す。
+/// 失敗・202=パス要素が symlink / 非 root 所有 / 他者書き込み可・205=実行権（claim）を確保できない（呼び出し側が
+/// 先に取消した等。`mount` しない）。それ以外は `mount` の終了コードをそのまま返す。
 /// `mount(8)` の終了コードは 1〜64 のビットの論理和（0〜127）で、シグナル終了は 128+シグナル番号（192 以下）に
 /// なるため、スクリプト固有のコードは両者と重ならない 200 番台に置く（`mount` 後の失敗を検証失敗と誤認しない）。
 /// 検証は symlink 非追従（`-L`）と `stat` の生モード（`%f`。ロケール非依存）で行う。
@@ -414,16 +421,21 @@ const MOUNT_SCRIPT: &str = concat!(
     "T=\"$B/$2\"; ",
     "[ -L \"$T\" ] || [ -e \"$T\" ] || mkdir -m 755 -- \"$T\" 2>/dev/null || [ -d \"$T\" ] || exit 201; ",
     "chk \"$T\" || exit 202; ",
+    "mkdir -- \"$R/$4.claim\" 2>/dev/null || exit 205; ",
     "pre=$(ids \"$T\"); rc=0; ",
     "mount -t drvfs -o \"$3\" \"$1\" \"$T\" >&2 || rc=$?; ",
     "new=; n=0; for i in $(ids \"$T\"); do case \" $pre \" in *\" $i \"*) ;; *) new=$i; n=$((n + 1)) ;; esac; done; ",
-    "if [ \"$n\" = 1 ]; then printf '%s\\n' \"$new\" > \"$R/$4\" || :; printf '%s\\n' \"$new\"; fi; ",
+    "[ \"$n\" = 1 ] || new=none; ",
+    "printf '%s\\n' \"$new\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" || :; ",
+    "[ \"$new\" = none ] || printf '%s\\n' \"$new\"; ",
     "exit \"$rc\""
 );
-/// [`MOUNT_SCRIPT`] の終了コード（`/`・`/mnt`・`/run` 不正 / ディレクトリ作成失敗 / パス要素が危険）。
+/// [`MOUNT_SCRIPT`] の終了コード（`/`・`/mnt`・`/run` 不正 / ディレクトリ作成失敗 / パス要素が危険 /
+/// 実行権を確保できない）。
 const EXIT_PARENT_BAD: i32 = 200;
 const EXIT_MKDIR_FAILED: i32 = 201;
 const EXIT_PATH_UNSAFE: i32 = 202;
+const EXIT_CLAIM_FAILED: i32 = 205;
 
 /// 呼び出しごとの nonce（[`MOUNT_SCRIPT`] の記録ファイル名）。16 進のみ（パス要素・シェル引数として安全）。
 ///
@@ -461,10 +473,27 @@ fn mount_argv(distro: &DistroName, m: &SharedMount, nonce: &str) -> Vec<String> 
     )
 }
 
-/// ゲスト内で `/run/fandhe/<nonce>`（root 所有・`0700` のディレクトリ）（[`MOUNT_SCRIPT`] の記録）を読むスクリプト。`$1`=nonce。
-/// 記録が無ければ終了コード 204（`cat` の失敗・シグナル終了と重ならない値）。
-const RECORD_SCRIPT: &str = "[ -e \"/run/fandhe/$1\" ] || exit 204; exec cat -- \"/run/fandhe/$1\"";
-/// [`RECORD_SCRIPT`] の終了コード（記録が無い）。
+/// ゲスト内で [`MOUNT_SCRIPT`] の実行権（`/run/fandhe/<nonce>.claim`）の確保を試み、取れなければ記録
+/// `/run/fandhe/<nonce>` を読むスクリプト（`wsl.exe` の待機タイムアウト後の回復用）。`$1`=nonce。
+///
+/// claim を本スクリプトが取れた場合は、[`MOUNT_SCRIPT`] がまだ `mount` に達しておらず、以後も `mount` しない
+/// （確保に失敗して終わる）ことが確定するので終了コード 204（マウントは成立しない）。claim が既にあり記録が
+/// まだ無ければ `mount` の途中なので 206（呼び出し側が有界に読み直す）。記録があればその中身（マウント ID または
+/// `none`）を出力する。記録ディレクトリは [`MOUNT_SCRIPT`] と同じ検証（root 所有・他者書き込み不可・symlink で
+/// ない）をしてから使う。終了コードは `cat`・シグナル終了と重ならない 200 番台。
+const RECORD_SCRIPT: &str = concat!(
+    "set -u; R=/run/fandhe; ",
+    "chk() { [ ! -L \"$1\" ] && [ -d \"$1\" ] || return 1; ",
+    "set -- $(stat -c '%u %f' -- \"$1\"); ",
+    "[ \"$1\" = 0 ] && [ $((0x$2 & 18)) -eq 0 ]; }; ",
+    "chk / || exit 200; chk /run || exit 200; ",
+    "[ -L \"$R\" ] || [ -e \"$R\" ] || mkdir -m 700 -- \"$R\" 2>/dev/null || [ -d \"$R\" ] || exit 201; ",
+    "chk \"$R\" || exit 202; ",
+    "if mkdir -- \"$R/$1.claim\" 2>/dev/null; then exit 204; fi; ",
+    "[ -e \"$R/$1\" ] || exit 206; ",
+    "exec cat -- \"$R/$1\""
+);
+/// [`RECORD_SCRIPT`] の終了コード（claim を先に取った: [`MOUNT_SCRIPT`] のマウントは成立しない）。
 const EXIT_NO_RECORD: i32 = 204;
 
 fn record_argv(distro: &DistroName, nonce: &str) -> Vec<String> {
@@ -480,7 +509,7 @@ fn record_argv(distro: &DistroName, nonce: &str) -> Vec<String> {
 /// `$2`=記録したマウント ID・`$3`=nonce。mountinfo の 1 列目（マウント ID）・2 列目（親のマウント ID）・5 列目
 /// （マウント先）だけを `read` で読む（awk 等に依存しない）。最上位は [`find_mount`] と同じく行順でなくマウント階層で
 /// 決める（同じマウント先の他のエントリから親として参照されていないものがちょうど 1 件）。`umount` に成功したら
-/// [`MOUNT_SCRIPT`] の記録を消す。終了コード 203=最上位を確定できない・最上位が記録したマウントでない（外さない）。
+/// [`MOUNT_SCRIPT`] の記録と claim を消す。終了コード 203=最上位を確定できない・最上位が記録したマウントでない（外さない）。
 /// それ以外は `umount` の終了コード（[`MOUNT_SCRIPT`] と同じ理由で、`umount(8)` の終了コード・シグナル終了と
 /// 重ならない 200 番台に置く）。残る窓（同一プロセス内の確認から `umount` まで）に同じマウント先へマウントできるのは
 /// ゲスト内の root（CAP_SYS_ADMIN）に限られ、[`MOUNT_SCRIPT`] と同じく信頼境界の内側として扱う。
@@ -490,7 +519,7 @@ const UMOUNT_SCRIPT: &str = concat!(
     "done < /proc/self/mountinfo; ",
     "top=; n=0; for i in $ids; do case \" $pars \" in *\" $i \"*) ;; *) top=$i; n=$((n + 1)) ;; esac; done; ",
     "[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; ",
-    "umount \"$1\" || exit $?; rm -f -- \"/run/fandhe/$3\"; exit 0"
+    "umount \"$1\" || exit $?; rm -f -- \"/run/fandhe/$3\"; rmdir -- \"/run/fandhe/$3.claim\" 2>/dev/null || :; exit 0"
 );
 
 fn umount_argv(distro: &DistroName, guest_path: &str, mount_id: u32, nonce: &str) -> Vec<String> {
@@ -685,12 +714,20 @@ fn parse_recorded_id(bytes: &[u8]) -> Option<u32> {
     text.parse().ok()
 }
 
-/// `wsl.exe` の待機タイムアウト等で [`MOUNT_SCRIPT`] の標準出力を失ったときに、ゲスト内の記録
-/// （`/run/fandhe/<nonce>`）を最大 [`MAX_RECOVERY_READS`] 回読む（呼び出しごとのタイムアウトで有界。REPAIR-5）。
+/// [`MOUNT_SCRIPT`] の標準出力からマウント ID を読めなかったとき（`wsl.exe` の待機タイムアウト等）に、
+/// [`RECORD_SCRIPT`] で実行権の取消を兼ねてゲスト内の記録を最大 [`MAX_RECOVERY_READS`] 回読む（呼び出しごとの
+/// タイムアウトで有界。REPAIR-5）。
+///
+/// 204（claim を先に取った）は「本呼び出しのマウントは成立しておらず、以後も成立しない」ことの確定なので
+/// `Missing`。記録が `none` なら [`MOUNT_SCRIPT`] は新しいマウントを特定できなかったので `Missing`。206（`mount` の
+/// 途中）・読み取り失敗は読み直し、上限に達したら `Unreadable`（所有を確認できない）。
 fn read_record(distro: &DistroName, nonce: &str, exec: Exec<'_>) -> Evidence {
     for _ in 0..MAX_RECOVERY_READS {
         match exec(&record_argv(distro, nonce), MAX_OUTPUT_BYTES) {
             Ok(out) if out.success => {
+                if std::str::from_utf8(&out.stdout).is_ok_and(|t| t.trim() == "none") {
+                    return Evidence::Missing;
+                }
                 return parse_recorded_id(&out.stdout).map_or(Evidence::Unreadable, Evidence::Mine);
             }
             Ok(out) if out.code == Some(EXIT_NO_RECORD) => return Evidence::Missing,
@@ -796,7 +833,8 @@ fn with_rollback_note(e: Wsl2Error, failures: usize) -> Wsl2Error {
 /// mountinfo の差分からは推定しない（他者のマウントを自分のものとみなさない）。
 ///
 /// mount の結果ごとの扱い:
-/// - [`MOUNT_SCRIPT`] の検証失敗（200〜202）: `mount` を実行する前に終了しているので、そのまま返す。
+/// - [`MOUNT_SCRIPT`] の検証失敗・実行権の確保失敗（200〜202・205）: `mount` を実行する前に終了しているので、
+///   そのまま返す。
 /// - 成功: 証拠のマウント ID を記録する。証拠が無ければ（新しいマウントを 1 件に特定できない）記録せず、
 ///   `ownership unconfirmed` の失敗を返す（fail-closed）。
 /// - それ以外の失敗（`mount(8)` の終了コード・`wsl.exe` のタイムアウト・出力読み取り失敗・`wsl.exe` 自身の異常値）:
@@ -806,8 +844,9 @@ fn with_rollback_note(e: Wsl2Error, failures: usize) -> Wsl2Error {
 ///   `ownership unconfirmed` を付けて返す。記録・mountinfo の読み直しは [`MAX_RECOVERY_READS`] 回 ×
 ///   呼び出しごとのタイムアウトで有界（REPAIR-5）。
 ///
-/// タイムアウト後にゲスト内で遅れて成立したマウントは、読み直しの後であれば検出できない（実機での挙動確認は
-/// TASK-67.6・#377。REPAIR-3）。
+/// タイムアウト後にゲスト内の処理が遅れて動き出しても、[`RECORD_SCRIPT`] が実行権（claim）を先に取るので
+/// マウントは成立しない。`mount` の途中で上限まで記録が確定しなければ（`mount(2)` が戻らない等）
+/// `ownership unconfirmed` として返す（実機での挙動確認は TASK-67.6・#377。REPAIR-3）。
 fn mount_one(
     distro: &DistroName,
     m: &SharedMount,
@@ -818,7 +857,7 @@ fn mount_one(
     let nonce = new_nonce();
     let (failure, evidence) = match exec(&mount_argv(distro, m, &nonce), MAX_OUTPUT_BYTES) {
         Ok(out) => {
-            // 200〜202 は MOUNT_SCRIPT が `mount` の前に返す（`mount(8)`・シグナル終了のコードと重ならない）。
+            // 200〜202・205 は MOUNT_SCRIPT が `mount` の前に返す（`mount(8)`・シグナル終了のコードと重ならない）。
             let failure = match out.code {
                 _ if out.success => None,
                 Some(EXIT_PARENT_BAD) => {
@@ -833,6 +872,9 @@ fn mount_one(
                     return Err(precondition(
                         "a mount path component is not a root-owned, non-writable directory (symlinks are rejected)",
                     ));
+                }
+                Some(EXIT_CLAIM_FAILED) => {
+                    return Err(precondition("the mount record could not be claimed"));
                 }
                 _ => Some(step_failed("mounting the shared directory", &out)),
             };
@@ -1426,14 +1468,18 @@ mod tests {
         );
         // 検証・mount・所有の特定と記録が同一スクリプト内にあること（TOCTOU 防止・所有の証拠）。
         assert!(MOUNT_SCRIPT.contains(
-            "chk \"$T\" || exit 202; pre=$(ids \"$T\"); rc=0; mount -t drvfs -o \"$3\" \"$1\" \"$T\" >&2 || rc=$?; "
+            "chk \"$T\" || exit 202; mkdir -- \"$R/$4.claim\" 2>/dev/null || exit 205; pre=$(ids \"$T\"); rc=0; mount -t drvfs -o \"$3\" \"$1\" \"$T\" >&2 || rc=$?; "
         ));
         // 並行する準備が先にディレクトリを作っても失敗しない（作成後に chk で安全性を確かめる）。
         assert!(MOUNT_SCRIPT.contains(
             "mkdir -m 700 -- \"$R\" 2>/dev/null || [ -d \"$R\" ] || exit 201; chk \"$R\" || exit 202; "
         ));
         assert!(MOUNT_SCRIPT.contains(
-            "if [ \"$n\" = 1 ]; then printf '%s\\n' \"$new\" > \"$R/$4\" || :; printf '%s\\n' \"$new\"; fi; exit \"$rc\""
+            "[ \"$n\" = 1 ] || new=none; printf '%s\\n' \"$new\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" || :; [ \"$new\" = none ] || printf '%s\\n' \"$new\"; exit \"$rc\""
+        ));
+        // 回復時は claim を先に取って遅れての mount を止め、取れなければ記録を読む。
+        assert!(RECORD_SCRIPT.contains(
+            "chk \"$R\" || exit 202; if mkdir -- \"$R/$1.claim\" 2>/dev/null; then exit 204; fi; [ -e \"$R/$1\" ] || exit 206; exec cat -- \"$R/$1\""
         ));
         // / からの全要素と記録ディレクトリを検証すること・ID の照合と umount が同一スクリプト内にあること。
         assert!(
@@ -1441,7 +1487,7 @@ mod tests {
                 .contains("chk / || exit 200; chk /mnt || exit 200; chk /run || exit 200; ")
         );
         assert!(UMOUNT_SCRIPT.contains(
-            "[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; umount \"$1\" || exit $?; rm -f -- \"/run/fandhe/$3\"; exit 0"
+            "[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; umount \"$1\" || exit $?; rm -f -- \"/run/fandhe/$3\"; rmdir -- \"/run/fandhe/$3.claim\" 2>/dev/null || :; exit 0"
         ));
         assert_eq!(
             record_argv(&d, "00ff").get(5..),
@@ -1578,8 +1624,15 @@ mod tests {
         force_ro: bool,
         /// true なら mountinfo の行を逆順で出力する（行順が最上位判定の契約でないことの模擬）。
         reverse_mountinfo: bool,
-        /// ゲスト内の所有の記録（nonce → マウント ID）。
-        records: std::collections::HashMap<String, u32>,
+        /// ゲスト内の所有の記録（nonce → マウント ID または `none`）。
+        records: std::collections::HashMap<String, String>,
+        /// ゲスト内の実行権（claim）を確保済みの nonce。
+        claims: std::collections::HashSet<String>,
+        /// true なら mount 呼び出しをゲスト内で実行しないまま `TIMEOUT` にし、引数を `deferred` に残す
+        /// （待機をあきらめた後で処理が遅れて動き出す模擬）。
+        defer_mount: bool,
+        /// `defer_mount` で残した mount 呼び出しの引数。
+        deferred: Option<Vec<String>>,
         /// 記録の読み取り回数。
         record_reads: usize,
         /// true なら記録の読み取りを `TIMEOUT` にする。
@@ -1631,6 +1684,9 @@ mod tests {
                 force_ro: false,
                 reverse_mountinfo: false,
                 records: std::collections::HashMap::new(),
+                claims: std::collections::HashSet::new(),
+                defer_mount: false,
+                deferred: None,
                 record_reads: 0,
                 fail_record_read: false,
                 drop_record: false,
@@ -1740,6 +1796,11 @@ mod tests {
                         }
                     }
                     let target = target.as_str();
+                    if self.defer_mount {
+                        self.defer_mount = false;
+                        self.deferred = Some(args.to_vec());
+                        return Self::timeout();
+                    }
                     let ids_at = |g: &Self| -> Vec<u32> {
                         g.mounts
                             .iter()
@@ -1753,6 +1814,9 @@ mod tests {
                     let timed_out = self.timeout_mount_nth == Some(self.mount_calls);
                     if timed_out && !self.timeout_mount_lands {
                         return Self::timeout();
+                    }
+                    if !self.claims.insert((*nonce).to_string()) {
+                        return fail(EXIT_CLAIM_FAILED);
                     }
                     let failed = self.fail_mount_nth == Some(self.mount_calls);
                     if !failed {
@@ -1781,11 +1845,15 @@ mod tests {
                         .filter(|id| !pre.contains(id))
                         .collect();
                     let mut stdout = String::new();
-                    if let [mine] = fresh.as_slice() {
-                        if !self.drop_record {
-                            self.records.insert((*nonce).to_string(), *mine);
+                    let record = match fresh.as_slice() {
+                        [mine] => {
+                            stdout = format!("{mine}\n");
+                            mine.to_string()
                         }
-                        stdout = format!("{mine}\n");
+                        _ => "none".to_string(),
+                    };
+                    if !self.drop_record {
+                        self.records.insert((*nonce).to_string(), record);
                     }
                     if self.noisy_stdout {
                         stdout = format!("unexpected helper message\n{stdout}");
@@ -1817,14 +1885,17 @@ mod tests {
                     })
                 }
                 ["sh", "-c", script, "sh", nonce] if *script == RECORD_SCRIPT => {
-                    // RECORD_SCRIPT の模擬: 記録があれば ID を出力、無ければ 204。
+                    // RECORD_SCRIPT の模擬: claim を先に取れたら 204、記録がまだ無ければ 206、あれば中身を出力。
                     self.record_reads += 1;
                     if self.fail_record_read {
                         return Self::timeout();
                     }
+                    if self.claims.insert((*nonce).to_string()) {
+                        return fail_cat(EXIT_NO_RECORD);
+                    }
                     match self.records.get(*nonce) {
-                        Some(id) => ok(format!("{id}\n")),
-                        None => fail_cat(EXIT_NO_RECORD),
+                        Some(v) => ok(format!("{v}\n")),
+                        None => fail_cat(206),
                     }
                 }
                 ["sh", "-c", script, "sh", target, id, nonce] if *script == UMOUNT_SCRIPT => {
@@ -1855,6 +1926,7 @@ mod tests {
                         self.opts.remove(i);
                     }
                     self.records.remove(*nonce);
+                    self.claims.remove(*nonce);
                     if self.umount_timeout == Some(true) {
                         return Self::timeout();
                     }
@@ -1894,12 +1966,14 @@ mod tests {
             [("/mnt/fandhe/a", 100, false), ("/mnt/fandhe/b", 101, true)]
         );
         assert!(g.umounts.is_empty());
-        // 所有の記録は呼び出しごとの nonce で、解除するまで残る。
-        let mut recorded: Vec<u32> = g.records.values().copied().collect();
+        // 所有の記録と claim は呼び出しごとの nonce で、解除するまで残る。
+        let mut recorded: Vec<&str> = g.records.values().map(String::as_str).collect();
         recorded.sort_unstable();
-        assert_eq!(recorded, [100, 101]);
+        assert_eq!(recorded, ["100", "101"]);
+        assert_eq!(g.claims.len(), 2);
         assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)), 0);
         assert!(g.records.is_empty());
+        assert!(g.claims.is_empty());
     }
 
     /// WIN-2: 9P で成立した場合はロールバックして FAILED_PRECONDITION（暗黙に降格しない）。
@@ -2472,7 +2546,8 @@ mod tests {
         );
         assert!(g.umounts.is_empty());
         assert_eq!(g.ids, [1, 100]);
-        assert_eq!(g.record_reads, 1);
+        // 記録が確定しない（206）ので上限回数まで読み直して打ち切る（REPAIR-5）。
+        assert_eq!(g.record_reads, MAX_RECOVERY_READS);
     }
 
     /// SEC: mount(8) が失敗し、その後に他者のマウントが同じマウント先へ現れても、証拠が無いので外さない
@@ -2504,6 +2579,7 @@ mod tests {
         assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
         assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
         assert!(g.records.is_empty());
+        assert!(g.claims.is_empty());
         assert_eq!(g.record_reads, 1);
     }
 
@@ -2538,6 +2614,24 @@ mod tests {
         let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
         assert_eq!(summary(&p), [("/mnt/fandhe/a", 100, false)]);
         assert_eq!(g.record_reads, 1);
+        assert!(g.umounts.is_empty());
+    }
+
+    /// SEC・REPAIR-5: 待機をあきらめた後でゲスト内の mount 処理が遅れて動き出しても、回復時に実行権（claim）を
+    /// 先に取っているので mount せずに終わる（マウントが後から成立して残置されない）。
+    #[test]
+    fn deferred_mount_after_timeout_cannot_land() {
+        let mut g = Guest::new("virtiofs");
+        g.defer_mount = true;
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert_eq!(e.message(), "wsl.exe did not finish before the deadline");
+        assert_eq!(g.record_reads, 1);
+        let late = g.deferred.take().unwrap();
+        let out = g.run(&late, MAX_OUTPUT_BYTES).unwrap();
+        assert_eq!(out.code, Some(EXIT_CLAIM_FAILED));
+        assert_eq!(g.ids, [1]);
         assert!(g.umounts.is_empty());
     }
 }

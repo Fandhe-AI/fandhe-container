@@ -7,8 +7,10 @@
 # windows-sys は承認済み（#371・TASK-67.hdep1。=0.61.2）で、[target.'cfg(windows)'.dependencies] に限り
 # 使う名前空間の feature だけを列挙する。利用は src/sys.rs（unsafe の事前承認範囲）に閉じる。
 # 現在の用途: wsl.exe・子孫プロセスの管理（TASK-67.3・WIN-1・REPAIR-5）。
-#   Win32_Foundation（HANDLE・CloseHandle）・Win32_Security（CreateJobObjectW の引数型）・
-#   Win32_System_JobObjects（Job Object）・Win32_System_Threading（CREATE_SUSPENDED・OpenThread・ResumeThread）・
+#   Win32_Foundation（HANDLE・INVALID_HANDLE_VALUE。ハンドルを閉じるのは std の OwnedHandle）・
+#   Win32_Security（CreateJobObjectW の引数型 SECURITY_ATTRIBUTES のみ。セキュリティ API は使わない）・
+#   Win32_System_JobObjects（Job Object）・
+#   Win32_System_Threading（CREATE_SUSPENDED・OpenThread・ResumeThread・GetProcessIdOfThread）・
 #   Win32_System_Diagnostics_ToolHelp（スレッド列挙）・Win32_System_SystemInformation（GetSystemDirectoryW）。
 # 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 

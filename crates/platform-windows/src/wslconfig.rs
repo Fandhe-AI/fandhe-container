@@ -864,9 +864,6 @@ fn fill_new_file(
         #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt;
-            // 監査用 SACL は観測できる場合（SeSecurityPrivilege が有効）に限り検査し、監査 ACE があれば
-            // 写せないため置換しない。観測できない主体は SACL に制約されず、元ファイルを削除できる（削除で SACL
-            // も消える）ため、観測できないことは拒否理由にしない（[`crate::sys::has_audit_sacl`]）。
             // 名前付きストリーム（代替データストリーム）は rename で引き継げないため、あれば置換しない
             // （既存データを消さない）。
             let streams = crate::sys::has_named_streams(src)
@@ -877,12 +874,16 @@ fn fill_new_file(
                     ".wslconfig has named streams that cannot be preserved; refusing to replace it",
                 ));
             }
-            let audited = crate::sys::has_audit_sacl(src)
-                .map_err(|e| io_err(&e, "failed to inspect file audit settings"))?;
-            if audited == Some(true) {
+            // SACL のうち整合性ラベル以外（リソース属性・スコープ付きポリシー・信頼ラベル・監査 ACE）は写せないため、
+            // あれば置換しない。監査 ACE は SeSecurityPrivilege が有効な場合にだけ観測でき、観測できない主体は監査
+            // SACL に制約されず元ファイルを削除できる（削除で SACL も消える）ため、観測できないことは拒否理由に
+            // しない（[`crate::sys::has_unpreservable_sacl`]。オーナー判断事項）。
+            let sacl = crate::sys::has_unpreservable_sacl(src)
+                .map_err(|e| io_err(&e, "failed to inspect file SACL"))?;
+            if sacl == Some(true) {
                 return Err(err(
                     WinErrorCode::PermissionDenied,
-                    ".wslconfig has an audit SACL that cannot be preserved; refusing to replace it",
+                    ".wslconfig has SACL entries that cannot be preserved; refusing to replace it",
                 ));
             }
             crate::sys::copy_security(src, f)

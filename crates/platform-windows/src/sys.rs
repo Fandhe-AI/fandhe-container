@@ -43,7 +43,7 @@ pub(crate) use unix::{has_extended_acl, security_labels};
 #[cfg(windows)]
 pub(crate) use windows::{
     CREATE_SUSPENDED, GENERIC_WRITE, Job, WRITE_DAC, WRITE_OWNER, copy_security, file_id,
-    has_audit_sacl, has_named_streams, reopen_for_read, resume_suspended_threads,
+    has_named_streams, has_unpreservable_sacl, reopen_for_read, resume_suspended_threads,
     security_snapshot, system_directory,
 };
 
@@ -269,20 +269,18 @@ mod windows {
         GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
     };
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorLength,
-        LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, SACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-        UNPROTECTED_DACL_SECURITY_INFORMATION,
+        ACL, ATTRIBUTE_SECURITY_INFORMATION, DACL_SECURITY_INFORMATION,
+        GetSecurityDescriptorControl, GetSecurityDescriptorLength, LABEL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SACL_SECURITY_INFORMATION,
+        SCOPE_SECURITY_INFORMATION, SE_DACL_PROTECTED, UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
         FileStreamInfo, GetFileInformationByHandleEx, READ_CONTROL, ReOpenFile,
     };
     use windows_sys::Win32::System::SystemServices::{
-        ACCESS_SYSTEM_SECURITY, SYSTEM_ALARM_ACE_TYPE, SYSTEM_ALARM_CALLBACK_ACE_TYPE,
-        SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE, SYSTEM_ALARM_OBJECT_ACE_TYPE, SYSTEM_AUDIT_ACE_TYPE,
-        SYSTEM_AUDIT_CALLBACK_ACE_TYPE, SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE,
-        SYSTEM_AUDIT_OBJECT_ACE_TYPE, SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+        ACCESS_SYSTEM_SECURITY, PROCESS_TRUST_LABEL_SECURITY_INFORMATION,
+        SYSTEM_MANDATORY_LABEL_ACE_TYPE,
     };
 
     /// `wslconfig` が一時ファイルを開くときに要求する権限（[`copy_security`] の宛先ハンドルの要件）。
@@ -294,17 +292,10 @@ mod windows {
 
     /// std の既定の共有モード（`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`）。
     const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-    /// 監査・アラームの ACE 種別（SYSTEM_AUDIT / ALARM 系）。
-    const AUDIT_ACE_TYPES: [u32; 8] = [
-        SYSTEM_AUDIT_ACE_TYPE,
-        SYSTEM_ALARM_ACE_TYPE,
-        SYSTEM_AUDIT_OBJECT_ACE_TYPE,
-        SYSTEM_ALARM_OBJECT_ACE_TYPE,
-        SYSTEM_AUDIT_CALLBACK_ACE_TYPE,
-        SYSTEM_ALARM_CALLBACK_ACE_TYPE,
-        SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE,
-        SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE,
-    ];
+    /// 特権なしで読める SACL の要素（リソース属性・スコープ付きポリシー ID・プロセス信頼ラベル）。
+    const SACL_EXTRAS_INFORMATION: u32 = ATTRIBUTE_SECURITY_INFORMATION
+        | SCOPE_SECURITY_INFORMATION
+        | PROCESS_TRUST_LABEL_SECURITY_INFORMATION.cast_unsigned();
 
     /// ボリュームとファイルを一意に識別する値（[`file_id`] の戻り値）。比較にだけ使う。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,6 +357,8 @@ mod windows {
         Label,
         /// 監査用 SACL（`SACL_SECURITY_INFORMATION`。ACCESS_SYSTEM_SECURITY つきのハンドルが要る）。
         Sacl,
+        /// 特権なしで読める SACL の要素（リソース属性・スコープ付きポリシー ID・プロセス信頼ラベル）。
+        SaclExtras,
         /// 所有者・DACL・整合性ラベルをまとめた SD 全体（比較用。出力ポインタは使わない）。
         Snapshot,
     }
@@ -386,6 +379,7 @@ mod windows {
             Part::Dacl => (DACL_SECURITY_INFORMATION, null, &mut out, null),
             Part::Label => (LABEL_SECURITY_INFORMATION, null, null, &mut out),
             Part::Sacl => (SACL_SECURITY_INFORMATION, null, null, &mut out),
+            Part::SaclExtras => (SACL_EXTRAS_INFORMATION, null, null, &mut out),
             Part::Snapshot => (
                 OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
                 null,
@@ -676,14 +670,27 @@ mod windows {
         Ok(File::from(unsafe { OwnedHandle::from_raw_handle(h) }))
     }
 
-    /// `file` の監査用 SACL に監査・アラームの ACE があるか。
+    /// `file` の SACL に、置換で引き継げない ACE（整合性ラベル以外）があるか。
     ///
-    /// SACL の読み取りには ACCESS_SYSTEM_SECURITY（SeSecurityPrivilege が有効なトークン）が要る。同じファイル
-    /// オブジェクトを `ReOpenFile` で開き直して読めれば、監査 ACE の有無を `Some(bool)` で返す（パスを引き直さない）。
-    /// 特権がない（`ERROR_PRIVILEGE_NOT_HELD`・`ERROR_ACCESS_DENIED`）場合は観測できないため `None`。それ以外の
-    /// 失敗は `Err`。観測できない主体は SACL に制約されず、元ファイルを削除できる（削除で SACL も消える）ため、
-    /// 呼び出し側は `None` を置換の拒否理由にしない。
-    pub(crate) fn has_audit_sacl(file: &File) -> std::io::Result<Option<bool>> {
+    /// [`copy_security`] が写す SACL の要素は整合性ラベルだけなので、それ以外の ACE があれば置換で失われる。
+    /// 1. 特権なしで読める SACL の要素（リソース属性・スコープ付きポリシー ID・プロセス信頼ラベル。READ_CONTROL で
+    ///    読める）を調べ、ACE があれば `Some(true)`。
+    /// 2. 監査・アラーム ACE を含む SACL 全体は ACCESS_SYSTEM_SECURITY（SeSecurityPrivilege が有効なトークン）が
+    ///    要る。同じファイルオブジェクトを `ReOpenFile` で開き直して読めれば、整合性ラベル以外の ACE の有無を
+    ///    `Some(bool)` で返す（パスを引き直さない）。特権がない（`ERROR_PRIVILEGE_NOT_HELD`・`ERROR_ACCESS_DENIED`）
+    ///    場合は観測できないため `None`。
+    ///
+    /// それ以外の失敗・形式の不正は `Err`。観測できない主体は監査 SACL に制約されず、元ファイルを削除できる
+    /// （削除で SACL も消える）ため、呼び出し側は `None` を置換の拒否理由にしない（オーナー判断事項。PR 本文）。
+    pub(crate) fn has_unpreservable_sacl(file: &File) -> std::io::Result<Option<bool>> {
+        let (sd, extras) = get_part(file, Part::SaclExtras)?;
+        if !extras.is_null() {
+            let bytes = copy_acl(&sd, extras)?;
+            if non_label_ace_present(&bytes).ok_or_else(malformed)? {
+                return Ok(Some(true));
+            }
+        }
+        drop(sd);
         // SAFETY: `file` は生存中の `File` が所有する有効なハンドル。戻り値は下で INVALID_HANDLE_VALUE（-1）
         // と NULL を判定し、有効なら直後に `OwnedHandle` が所有して 1 回だけ閉じる。
         let h = unsafe {
@@ -710,15 +717,18 @@ mod windows {
         }
         let bytes = copy_acl(&sd, sacl)?;
         drop(sd);
-        acl_ace_types(&bytes)
-            .map(|types| {
-                Some(
-                    types
-                        .iter()
-                        .any(|t| AUDIT_ACE_TYPES.contains(&u32::from(*t))),
-                )
-            })
+        non_label_ace_present(&bytes)
+            .map(Some)
             .ok_or_else(malformed)
+    }
+
+    /// ACL のバイト列に整合性ラベル以外の ACE があるか。形式が壊れていれば `None`。
+    fn non_label_ace_present(acl: &[u8]) -> Option<bool> {
+        acl_ace_types(acl).map(|types| {
+            types
+                .iter()
+                .any(|t| u32::from(*t) != SYSTEM_MANDATORY_LABEL_ACE_TYPE)
+        })
     }
 
     /// ACL のバイト列の ACE 種別の列。形式が壊れていれば `None`。
@@ -923,16 +933,16 @@ mod windows {
             assert_ne!(security_snapshot(&f).expect("snapshot c"), a);
         }
 
-        /// WIN-2: 監査用 SACL の検査は、特権が無効な CI のトークンでは観測できず `None`（監査 ACE のない新規
-        /// ファイルを観測できた場合は `Some(false)`）。`Some(true)` の経路は特権の有効化が要るため CI では通らない。
+        /// WIN-2: SACL の検査は、引き継げない ACE のない新規ファイルで `Some(true)` にならない（特権が無効な CI の
+        /// トークンでは監査 SACL を観測できず `None`、観測できれば `Some(false)`）。
         #[test]
-        fn has_audit_sacl_without_audit_entries_is_not_true() {
+        fn has_unpreservable_sacl_without_entries_is_not_true() {
             let d =
                 TmpDir(std::env::temp_dir().join(format!("fc-sys-sacl-{}", std::process::id())));
             std::fs::create_dir_all(&d.0).expect("mkdir");
             std::fs::write(d.0.join("f"), b"x").expect("write");
             let f = File::open(d.0.join("f")).expect("open");
-            let r = has_audit_sacl(&f).expect("inspect");
+            let r = has_unpreservable_sacl(&f).expect("inspect");
             assert!(matches!(r, None | Some(false)), "{r:?}");
         }
 

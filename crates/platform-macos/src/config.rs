@@ -527,14 +527,12 @@ impl ConsoleLogPath {
 
     /// 追記モード・0600 で開く（無ければ作成。既存ファイルのモードは変えない）。
     ///
+    /// 非公開。外部からは検証済みの [`DeviceConfigSpec::open_serial_console_log`] 経由でのみ呼べ、
+    /// 照合対象のディスクイメージを呼び出し側が省略・差し替えできない（MAC-1・TASK-64.3）。
     /// `O_NOFOLLOW` で最終要素が symlink なら open 自体を失敗させ（事前検査との間の差し替えでも
     /// リンク先を開かない）、open 後に fd の種別と lstat との `(dev, ino)` 照合も維持する。
-    #[cfg(unix)]
-    pub fn open_for_append(&self) -> Result<std::fs::File, ConfigError> {
-        self.open_for_append_excluding(&[])
-    }
-
-    /// [`Self::open_for_append`] に加え、open した fd がディスクイメージと同一ファイルなら拒否する。
+    ///
+    /// 加えて、open した fd がディスクイメージと同一ファイルなら拒否する。
     ///
     /// `DeviceConfigSpec::try_new` の衝突検査は検証時点の 1 回きりで、その後にログパスが
     /// ディスクイメージへのハードリンクへ差し替えられると検査をすり抜ける。ここでは使用時点
@@ -542,7 +540,7 @@ impl ConsoleLogPath {
     /// 一致すれば fd を閉じて `ConsoleLogConflictsWithDiskImage` を返す（MAC-1・TASK-64.3）。
     /// 追記 open は内容を変更しないため、拒否時にイメージは破損しない。
     #[cfg(unix)]
-    pub fn open_for_append_excluding(
+    fn open_for_append_excluding(
         &self,
         block_devices: &[BlockDeviceSpec],
     ) -> Result<std::fs::File, ConfigError> {
@@ -737,6 +735,21 @@ impl DeviceConfigSpec {
         &self.block_devices
     }
 
+    /// シリアルコンソールのログファイルを追記モードで開く（無ければ `None`）。
+    ///
+    /// 照合対象のディスクイメージはこの検証済み構成自身の `block_devices` に固定され、
+    /// 呼び出し側が省略・差し替えできない。open した fd がいずれかのディスクイメージと同一
+    /// ファイルなら拒否する（検証後のハードリンク差し替え対策。MAC-1・TASK-64.3）。
+    #[cfg(unix)]
+    pub fn open_serial_console_log(&self) -> Result<Option<std::fs::File>, ConfigError> {
+        match &self.serial_console {
+            Some(SerialConsoleSink::LogFile(log)) => {
+                log.open_for_append_excluding(&self.block_devices).map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
     /// シリアルコンソールの出力先。
     pub fn serial_console(&self) -> Option<&SerialConsoleSink> {
         self.serial_console.as_ref()
@@ -924,16 +937,11 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
     }
 
     // シリアルコンソール（ここで初めてログファイルを作成・open する）。
+    // 使用時点で fd をディスクイメージと照合する（検証後のハードリンク差し替え対策）。
     let mut serial = Vec::new();
-    if let Some(sink) = spec.devices.serial_console() {
-        match sink {
-            SerialConsoleSink::LogFile(log) => {
-                // 使用時点で fd をディスクイメージと照合する（検証後のハードリンク差し替え対策）。
-                let file = log.open_for_append_excluding(spec.devices.block_devices())?;
-                let handle = crate::sys::new_file_handle(file.into());
-                serial.push(crate::sys::new_console_serial_port(&handle));
-            }
-        }
+    if let Some(file) = spec.devices.open_serial_console_log()? {
+        let handle = crate::sys::new_file_handle(file.into());
+        serial.push(crate::sys::new_console_serial_port(&handle));
     }
 
     let boot = crate::sys::new_linux_boot_loader(&kernel_url, initrd_url.as_deref(), &cmdline);
@@ -1300,7 +1308,7 @@ mod tests {
         let link = t.0.join("console.log");
         let log = ConsoleLogPath::try_new(&link).unwrap();
         std::os::unix::fs::symlink(&victim, &link).unwrap();
-        let err = log.open_for_append().unwrap_err();
+        let err = log.open_for_append_excluding(&[]).unwrap_err();
         assert_eq!(err.code(), "config.console_log_is_symlink");
         assert_eq!(std::fs::metadata(&victim).unwrap().len(), before);
     }
@@ -1333,14 +1341,14 @@ mod tests {
         let t = TempDir::new("log-open");
         let path = t.0.join("console.log");
         let log = ConsoleLogPath::try_new(&path).unwrap();
-        let mut f = log.open_for_append().unwrap();
+        let mut f = log.open_for_append_excluding(&[]).unwrap();
         f.write_all(b"first\n").unwrap();
         drop(f);
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        let mut f = log.open_for_append().unwrap();
+        let mut f = log.open_for_append_excluding(&[]).unwrap();
         f.write_all(b"second\n").unwrap();
         drop(f);
         assert_eq!(std::fs::read(&path).unwrap(), b"first\nsecond\n");

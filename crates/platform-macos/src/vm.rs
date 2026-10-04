@@ -168,6 +168,9 @@ impl VmError {
     }
 
     /// 人間可読なメッセージ（英語）。
+    ///
+    /// `domain` は VZ が返した NSError の domain をエスケープせずに埋め込む（`sys` で 128 文字に切り詰め済み）。
+    /// ログ・JSON 等の構造化出力へ載せる呼び出し元は、出力形式に応じてエスケープすること。
     pub fn message(&self) -> String {
         match self {
             VmError::VirtualizationUnsupported => {
@@ -670,7 +673,13 @@ fn stop_on_drop_failure_log(domain: &str, code: isize, attempts: u32) -> String 
         match c {
             '"' => escaped.push_str("\\\""),
             '\\' => escaped.push_str("\\\\"),
-            c if u32::from(c) < 0x20 => escaped.push_str(&format!("\\u{:04x}", u32::from(c))),
+            // 制御文字（C0・DEL・NEL）と、JSON は許すが JavaScript 等で行区切りとして扱われる U+2028 / U+2029 も
+            // `\uXXXX` にして、1 行 1 JSON を崩さない。
+            c if u32::from(c) < 0x20
+                || matches!(c, '\u{7f}' | '\u{85}' | '\u{2028}' | '\u{2029}') =>
+            {
+                escaped.push_str(&format!("\\u{:04x}", u32::from(c)));
+            }
             c => escaped.push(c),
         }
     }

@@ -67,8 +67,8 @@
 //! # スコープ外（TASK-13 の兄弟 sub-issue・後続タスクが担う）
 //! - `std::io::Read` / UDS のストリーム読みループ本体・読み取りタイムアウト
 //!   （REPAIR-5）・サーバー側で `Ack` / `FlushAck` を受信した場合の拒否
-//!   （TASK-13.2.1・#820。`crates/io/src/server.rs` の
-//!   `imp::reject_client_originated_response_frame` が、本モジュールの
+//!   （TASK-13.2.1・#820。`crates/io/src/stream_io.rs` の
+//!   `reject_client_originated_response_frame` が、本モジュールの
 //!   [`ReceiveLimits::admit`] より前・本体バッファ確保より前に拒否する）
 //! - CLI / 設定からの上限値の配線（TASK-13.3・#78）
 //! - 複数接続を跨いだ累積バイト数・未フラッシュ滞留量の上限（IO-10・TASK-16）

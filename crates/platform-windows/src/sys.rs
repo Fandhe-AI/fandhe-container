@@ -21,6 +21,8 @@
 #[cfg(windows)]
 pub(crate) use windows::{GENERIC_WRITE, WRITE_DAC, WRITE_OWNER, copy_security, file_id};
 
+#[cfg(unix)]
+pub(crate) use unix::has_extended_acl;
 #[cfg(all(
     test,
     any(
@@ -31,9 +33,7 @@ pub(crate) use windows::{GENERIC_WRITE, WRITE_DAC, WRITE_OWNER, copy_security, f
         target_os = "macos"
     )
 ))]
-pub(crate) use unix::add_test_acl;
-#[cfg(unix)]
-pub(crate) use unix::has_extended_acl;
+pub(crate) use unix::{add_test_acl, add_test_default_acl};
 
 /// Windows のセキュリティ記述子・ファイル ID の操作（advapi32・kernel32）。
 #[cfg(windows)]
@@ -447,9 +447,13 @@ mod unix {
             }
         }
 
-        /// テスト用: `path` に拡張 ACL（`nobody` の読み取り）を `setxattr` で付ける。
+        /// テスト用: `path` に拡張 ACL（`nobody` の読み取り）を `setxattr` で付ける。`name` は
+        /// `system.posix_acl_access`（ファイルの ACL）または `system.posix_acl_default`（ディレクトリの default ACL）。
         #[cfg(test)]
-        pub(super) fn set_test_acl(path: &std::path::Path) -> std::io::Result<()> {
+        pub(super) fn set_test_acl(
+            path: &std::path::Path,
+            name: &std::ffi::CStr,
+        ) -> std::io::Result<()> {
             use std::os::unix::ffi::OsStrExt;
             unsafe extern "C" {
                 // SAFETY（宣言）: `int setxattr(const char *path, const char *name, const void *value,
@@ -478,12 +482,12 @@ mod unix {
             }
             let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| std::io::Error::other("path contains NUL"))?;
-            // SAFETY: `cpath` と属性名は NUL 終端の文字列で、`blob` は `blob.len()` バイトの読み取り可能な
+            // SAFETY: `cpath` と `name` は NUL 終端の文字列で、`blob` は `blob.len()` バイトの読み取り可能な
             // 領域。いずれも呼び出しの間は生存する。
             let rc = unsafe {
                 setxattr(
                     cpath.as_ptr(),
-                    c"system.posix_acl_access".as_ptr(),
+                    name.as_ptr(),
                     blob.as_ptr().cast::<c_void>(),
                     blob.len(),
                     0,
@@ -600,13 +604,40 @@ mod unix {
     ))]
     pub(crate) fn add_test_acl(path: &std::path::Path) {
         #[cfg(target_os = "linux")]
-        imp::set_test_acl(path).expect("setxattr system.posix_acl_access");
+        imp::set_test_acl(path, c"system.posix_acl_access").expect("setxattr posix_acl_access");
         #[cfg(target_os = "macos")]
         {
             let st = std::process::Command::new("chmod")
                 .arg("+a")
                 .arg("nobody allow read")
                 .arg(path)
+                .status()
+                .expect("chmod");
+            assert!(st.success(), "chmod +a failed: {st:?}");
+        }
+    }
+
+    /// テスト用: ディレクトリ `dir` に、新しく作るファイルへ継承される ACL（`nobody` の読み取り）を付ける。
+    /// Linux は default ACL（`system.posix_acl_default`）、macOS は `file_inherit` つきの ACE。
+    #[cfg(all(
+        test,
+        any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            target_os = "macos"
+        )
+    ))]
+    pub(crate) fn add_test_default_acl(dir: &std::path::Path) {
+        #[cfg(target_os = "linux")]
+        imp::set_test_acl(dir, c"system.posix_acl_default").expect("setxattr posix_acl_default");
+        #[cfg(target_os = "macos")]
+        {
+            let st = std::process::Command::new("chmod")
+                .arg("+a")
+                .arg("nobody allow read,file_inherit")
+                .arg(dir)
                 .status()
                 .expect("chmod");
             assert!(st.success(), "chmod +a failed: {st:?}");

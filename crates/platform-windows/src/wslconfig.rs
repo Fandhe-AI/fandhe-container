@@ -1389,6 +1389,34 @@ mod tests {
         assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
     }
 
+    /// WIN-2・TASK-67.2（レビュー指摘 P0）: 元ファイルに拡張 ACL がなくても、親ディレクトリの default ACL
+    /// （macOS は継承 ACE）を一時ファイルが継承する場合は置換せず PERMISSION_DENIED。元の内容を残す。
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))]
+    #[test]
+    fn replacement_inheriting_directory_acl_is_refused() {
+        let d = TmpDir::new("defaultacl");
+        std::fs::write(d.file(), "[wsl2]\nmemory=4GB\n").expect("write");
+        // 元ファイルの作成後にディレクトリへ継承 ACL を付ける（元ファイルは拡張 ACL を持たない）。
+        crate::sys::add_test_default_acl(&d.0);
+        let e = enable_virtiofs_at(&d.file()).expect_err("must refuse");
+        assert_eq!(e.code(), WinErrorCode::PermissionDenied);
+        assert_eq!(
+            e.message(),
+            "the replacement would inherit an ACL from the directory; refusing to replace .wslconfig"
+        );
+        assert_eq!(
+            std::fs::read(d.file()).expect("read"),
+            b"[wsl2]\nmemory=4GB\n"
+        );
+        assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
+    }
+
     /// WIN-2・TASK-67.2（レビュー指摘 P0）: 既存ファイルの置換後も個別設定した DACL（明示 ACE と継承保護）・
     /// 整合性ラベル・HIDDEN 属性が保たれ、親ディレクトリから継承した既定 ACL に置き換わらない。
     #[cfg(windows)]

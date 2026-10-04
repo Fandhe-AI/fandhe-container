@@ -2101,6 +2101,14 @@ mod tests {
             ConfigError::SharedDirIsRoot.to_string(),
             "config.shared_dir_is_root: sharing the filesystem root is not allowed"
         );
+        let e = ConfigError::SharedDirSymlinkEscapes {
+            path: PathBuf::from("/s/link"),
+            share_dir: PathBuf::from("/s"),
+        };
+        assert_eq!(
+            e.to_string(),
+            "config.shared_dir_symlink_escapes: read-write shared directory /s contains a symlink whose target is not confirmed to stay inside it: /s/link"
+        );
         let e = ConfigError::VirtiofsTagRejected {
             domain: "VZErrorDomain".to_string(),
             code: 1,
@@ -2272,6 +2280,103 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    /// MAC-1・TASK-65.1: ReadWrite 共有配下の symlink は、リンク先が共有範囲内なら許可し、範囲外
+    /// （絶対・相対・ディレクトリ・dangling）・ループは拒否する。ReadOnly 共有は対象外。
+    #[cfg(unix)]
+    #[test]
+    fn rejects_read_write_share_with_symlink_escaping_share() {
+        use crate::virtiofs::{ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
+        use std::os::unix::fs::symlink;
+        let t = TempDir::new("share-symlink");
+        let real = std::fs::canonicalize(&t.0).unwrap();
+        let outside = real.join("outside");
+        let shared = real.join("shared");
+        std::fs::create_dir_all(shared.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let k = outside.join("vmlinux");
+        std::fs::write(&k, b"k").unwrap();
+        std::fs::write(shared.join("sub").join("data"), b"x").unwrap();
+        let spec_for = |access| {
+            VmConfigSpec::from_parts(&k, None, "console=hvc0")
+                .unwrap()
+                .with_shared_directories(
+                    VirtiofsSharesSpec::try_new(vec![VirtiofsShareSpec::new(
+                        VirtiofsTag::try_new("s").unwrap(),
+                        SharedDirectoryPath::try_new(&shared).unwrap(),
+                        access,
+                    )])
+                    .unwrap(),
+                )
+        };
+        let rw = spec_for(ShareAccess::ReadWrite);
+        let ro = spec_for(ShareAccess::ReadOnly);
+
+        // 範囲内を指す symlink（実在・相対・dangling）は許可する。
+        let inside_abs = shared.join("to-data");
+        symlink(shared.join("sub").join("data"), &inside_abs).unwrap();
+        let inside_rel = shared.join("sub").join("to-sibling");
+        symlink("data", &inside_rel).unwrap();
+        let inside_dangling = shared.join("sub").join("lock");
+        symlink("not-yet-created", &inside_dangling).unwrap();
+        rw.check_share_conflicts().unwrap();
+
+        let expect_escape = |link: &Path| {
+            let err = rw.check_share_conflicts().unwrap_err();
+            assert_eq!(err.code(), "config.shared_dir_symlink_escapes");
+            assert_eq!(
+                err,
+                ConfigError::SharedDirSymlinkEscapes {
+                    path: link.to_path_buf(),
+                    share_dir: shared.clone(),
+                }
+            );
+            // ReadOnly 共有は書き換えられないため対象外。
+            ro.check_share_conflicts().unwrap();
+            std::fs::remove_file(link).unwrap();
+            rw.check_share_conflicts().unwrap();
+        };
+
+        // 共有外の kernel を指す絶対 symlink。
+        let link = shared.join("sub").join("kernel-abs");
+        symlink(&k, &link).unwrap();
+        expect_escape(&link);
+        // `..` で共有外へ出る相対 symlink。
+        let link = shared.join("sub").join("kernel-rel");
+        symlink("../../outside/vmlinux", &link).unwrap();
+        expect_escape(&link);
+        // 共有外のディレクトリを指す symlink。
+        let link = shared.join("dir-out");
+        symlink(&outside, &link).unwrap();
+        expect_escape(&link);
+        // 共有外の未作成ファイルを指す dangling symlink。
+        let link = shared.join("dangling-out");
+        symlink(outside.join("later"), &link).unwrap();
+        expect_escape(&link);
+        // リンク先の親も未作成で範囲を確認できない dangling symlink。
+        let link = shared.join("dangling-deep");
+        symlink("missing/later", &link).unwrap();
+        expect_escape(&link);
+        // 共有ディレクトリ自身の親を指す symlink（`..` 終端）。
+        let link = shared.join("parent");
+        symlink("..", &link).unwrap();
+        expect_escape(&link);
+
+        // 解決できないループは PathIo で fail-closed にする。
+        let a = shared.join("loop-a");
+        let b = shared.join("loop-b");
+        symlink(&b, &a).unwrap();
+        symlink(&a, &b).unwrap();
+        let err = rw.check_share_conflicts().unwrap_err();
+        assert_eq!(err.code(), "config.path_io");
+        assert!(matches!(
+            err,
+            ConfigError::PathIo {
+                field: ConfigField::SharedDirectory,
+                ..
+            }
+        ));
     }
 
     /// MAC-1・TASK-65.1: macOS で virtiofs 付き設定を構築し、読み戻した値が入力と一致する。

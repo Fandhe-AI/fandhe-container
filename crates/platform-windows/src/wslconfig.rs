@@ -431,6 +431,9 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// 行う（Windows ではディレクトリを `File::open` できない）ため、永続化の保証は内容のみ。
 /// 読み込みから rename までの間の他プロセスによる変更は上書きされうる（ロックはしない。単一ユーザーの
 /// ホーム配下の設定操作のため許容する）。
+///
+/// unix では既存の宛先のパーミッションを一時ファイルへ引き継ぐ（新規作成時は既定のまま）。
+/// unix で rename 成功後の親ディレクトリ fsync に失敗した場合は、置換済みのまま `Err` を返す。
 fn write_atomic(path: &Path, data: &[u8]) -> Result<(), WinError> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -450,6 +453,24 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), WinError> {
         .create_new(true)
         .open(&tmp)
         .map_err(|e| io_err(&e, "failed to create temporary file"))?;
+    #[cfg(unix)]
+    let perm_result = std::fs::metadata(path)
+        .and_then(|m| f.set_permissions(m.permissions()))
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .map_err(|e| io_err(&e, "failed to copy file permissions"));
+    #[cfg(not(unix))]
+    let perm_result: Result<(), WinError> = Ok(());
+    if let Err(e) = perm_result {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     let result = f
         .write_all(data)
         .and_then(|()| f.sync_all())
@@ -475,7 +496,8 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), WinError> {
 /// `path` の `.wslconfig` に `virtiofs=true` を opt-in する（読み込み → 編集 → 原子的書き込み）。
 ///
 /// ファイルがなければ新規作成（親ディレクトリは作らず、なければ `NOT_FOUND`）。すでに有効なら書き込まない。
-/// `Err` のときは元のファイルを変更しない。TASK-67.4（#375）の起動ロジックから呼ばれる想定。
+/// `Err` のとき通常は元のファイルを変更しない。例外として unix で rename 後の親ディレクトリ fsync に
+/// 失敗した場合は、置換済みのまま `Err` になりうる。TASK-67.4（#375）の起動ロジックから呼ばれる想定。
 pub fn enable_virtiofs_at(path: &Path) -> Result<EnableOutcome, WinError> {
     let (mut cfg, existed) = match load(path)? {
         Some(c) => (c, true),
@@ -774,6 +796,19 @@ mod tests {
         let e = enable_virtiofs_at(&p).expect_err("must fail");
         assert_eq!(e.code(), WinErrorCode::NotFound);
         assert!(!d.0.join("nope").exists());
+    }
+
+    /// 既存ファイルのパーミッションは置換後も引き継がれる（unix）。
+    #[cfg(unix)]
+    #[test]
+    fn enable_virtiofs_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = TmpDir::new("perm");
+        std::fs::write(d.file(), "[wsl2]\nmemory=4GB\n").unwrap();
+        std::fs::set_permissions(d.file(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        enable_virtiofs_at(&d.file()).unwrap();
+        let mode = std::fs::metadata(d.file()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     /// シンボリックリンクの `.wslconfig` は拒否しリンク先を変更しない。

@@ -491,7 +491,7 @@ impl ConfigError {
                 share_dir,
             } => {
                 format!(
-                    "shared directory {} contains a hard-linked file ({links} links): {}",
+                    "shared directory {} contains a hard-linked file ({links} links): {} (hint: replace hard links with copies, e.g. pnpm install --package-import-method=copy or git clone --no-hardlinks)",
                     share_dir.display(),
                     path.display()
                 )
@@ -510,13 +510,13 @@ impl ConfigError {
             }
             ConfigError::SharedDirUnsupportedFilesystem { fs_type, share_dir } => {
                 format!(
-                    "shared directory {} is on a {fs_type} filesystem, which allows directory hard links",
+                    "shared directory {} is on a {fs_type} filesystem, which allows directory hard links (hint: share a directory on an APFS volume)",
                     share_dir.display()
                 )
             }
             ConfigError::SharedDirSymlinkEscapes { path, share_dir } => {
                 format!(
-                    "shared directory {} contains a symlink whose target is not confirmed to stay inside it: {}",
+                    "shared directory {} contains a symlink whose target is not confirmed to stay inside it: {} (hint: use relative symlinks that stay inside the share, or replace symlinks with copies)",
                     share_dir.display(),
                     path.display()
                 )
@@ -1352,8 +1352,15 @@ fn special_file_kind(ft: &std::fs::FileType) -> Option<SpecialFileKind> {
 /// 保護入力以外でも、リンク数 2 以上の通常ファイルは [`ConfigError::SharedDirHardlinkedFile`]、
 /// キャラクタ / ブロックデバイス・FIFO は [`ConfigError::SharedDirSpecialFile`]（[`special_file_kind`]）、
 /// macOS の HFS+ 上の共有は [`ConfigError::SharedDirUnsupportedFilesystem`] で拒否する。
-/// 残余: 検査から使用までの差し替え（TOCTOU）に加え、`canonicalize`・`statfs`・走査にタイムアウトは無く、
-/// 応答しない NFS・autofs 等の配下では検査が止まり得る。
+/// 残余（#1374 で暫定判断。symlink・ハードリンクの実機確認は人間担当で未完了。REPAIR-3・REPAIR-5）:
+/// - 拒否範囲は緩めない（fail-closed）。侵害ゲストが symlink の nodeid へ直接 FUSE 要求を送る脅威は
+///   正常ゲストの観測では否定できないため、緩和は実機結果とユーザー判断を経た別 PR に限る。
+/// - 検査〜VM 使用間の差し替え（TOCTOU）は `build_vz_configuration` で VZ 呼び出し直前に検査する以上の
+///   安価な短縮策が無く、残余リスクとして受け入れる。根本対策は VZ の API 制約上、別途設計が要る。
+/// - `canonicalize`・`statfs`・走査にタイムアウトは無く、応答しない NFS・autofs 等の配下では検査が止まり得る
+///   （ブロック中の呼び出しは取り消せない）。ネットワーク / 自動マウント系 FS 上の ReadWrite 共有を
+///   `f_fstypename` で拒否する案はフォローアップ候補で、未実装。
+///
 /// 保護入力が未作成（コンソールログ等）なら照合対象から外す。走査の I/O 失敗・件数上限超過は
 /// fail-closed で `PathIo` を返す。unix 限定（Windows には `(dev, ino)` が無く、本 crate の
 /// 実行対象は macOS のため走査しない）。`check_share_conflicts` から呼ばれる。
@@ -2370,7 +2377,7 @@ mod tests {
         };
         assert_eq!(
             e.to_string(),
-            "config.shared_dir_hardlinked_file: shared directory /s contains a hard-linked file (2 links): /s/f"
+            "config.shared_dir_hardlinked_file: shared directory /s contains a hard-linked file (2 links): /s/f (hint: replace hard links with copies, e.g. pnpm install --package-import-method=copy or git clone --no-hardlinks)"
         );
         let e = ConfigError::SharedDirSpecialFile {
             path: PathBuf::from("/s/p"),
@@ -2389,7 +2396,7 @@ mod tests {
         };
         assert_eq!(
             e.to_string(),
-            "config.shared_dir_unsupported_filesystem: shared directory /s is on a hfs filesystem, which allows directory hard links"
+            "config.shared_dir_unsupported_filesystem: shared directory /s is on a hfs filesystem, which allows directory hard links (hint: share a directory on an APFS volume)"
         );
         let e = ConfigError::SharedDirSymlinkEscapes {
             path: PathBuf::from("/s/link"),
@@ -2397,7 +2404,7 @@ mod tests {
         };
         assert_eq!(
             e.to_string(),
-            "config.shared_dir_symlink_escapes: shared directory /s contains a symlink whose target is not confirmed to stay inside it: /s/link"
+            "config.shared_dir_symlink_escapes: shared directory /s contains a symlink whose target is not confirmed to stay inside it: /s/link (hint: use relative symlinks that stay inside the share, or replace symlinks with copies)"
         );
         let e = ConfigError::VirtiofsTagRejected {
             domain: "VZErrorDomain".to_string(),

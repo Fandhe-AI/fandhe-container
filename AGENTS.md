@@ -275,6 +275,56 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
   FANDHE_CONTAINER_MACOS_VM_KERNEL=/abs/path/to/vmlinux FANDHE_CONTAINER_MACOS_VM_READY_MARKER="<ゲストが起動完了後にだけ出力する文字列>" <上で得たバイナリ> --ignored --nocapture
   ```
 
+- virtiofs の symlink・ハードリンク挙動の手動確認（MAC-1・TASK-65.1 追補・#1374。人間担当。Agent は手順準備まで）: 自動テストは無い手動手順。必要環境は `vm_boot` と同じ（実機の macOS 13 以上・`com.apple.security.virtualization` 付き ad-hoc 署名・自前ビルドのゲストカーネル。root 不要）。**正常ゲストの観測は拒否を維持する判断の補強にしかならない**（`cat link` は `FUSE_READLINK` → ゲスト側解決の正常経路で、侵害ゲストが symlink の nodeid へ直接 `FUSE_OPEN` を送る脅威は観測できない）ため、結果にかかわらず絶対パス symlink・ハードリンクの拒否は本手順だけでは緩めない。**現行 API では、共有範囲外を指す symlink（絶対パス・`..` 経由）・範囲外への dangling symlink・ハードリンク（`nlink > 1`）を含む fixture は ReadOnly 共有でも `VmConfigSpec::check_share_conflicts`（`build_vz_configuration` が VZ 呼び出し前に実行）が拒否するため VM を起動できず、これらをゲストから観測することはできない**（観測するには拒否の緩和が要り、本手順の範囲外。緩和の要否は別途ユーザー判断）。本手順で観測できるのは共有範囲内に収まるリンクと、ゲストが実行中に作るリンク（空の ReadWrite 共有）に限る。書き込みを伴う確認は `RW` 内に限り、ホストの共有外ファイルを書き換えない。
+  1. fixture（ホスト側。パスは必ずダブルクォートする）:
+
+     ```bash
+     W="$(mktemp -d)"; mkdir "$W/ro" "$W/rw"
+     echo inside > "$W/ro/inside.txt"
+     ln -s inside.txt "$W/ro/inside_link"                   # 共有内の相対 symlink
+     ln -s "$W/ro/inside.txt" "$W/ro/abs_inside_link"       # 共有内を指す絶対パス symlink
+     ln -s "$W/ro/missing" "$W/ro/dangling_inside_link"     # 共有内の未作成パスを指す dangling
+     # 範囲外 symlink・ハードリンク（nlink > 1）の fixture は check_share_conflicts に拒否され起動できないため作らない
+     ```
+
+  2. 実行入口（既存の起動コマンドだけでは共有されない）: `vm_boot` の `#[ignore]` テストは `VmConfigSpec` に共有を追加せず `Vm::launch` を呼ぶため、そのままではゲストから fixture を観測できない。手元の作業ツリーで `crates/platform-macos/tests/vm_boot.rs` の `mac1_minimal_vm_boots_and_stops_on_real_macos` に一時的に次を足して実行する（**コミットしない**。観測後に当該ファイルの変更を破棄して戻す）。`W` は手順 1 の値を環境変数 `FANDHE_CONTAINER_TEST_VIRTIOFS_FIXTURE` で渡す。
+
+     ```rust
+     // `.with_devices(devices).expect("with_devices")` の直後に連結する
+     .with_shared_directories({
+         use fandhe_container_platform_macos::virtiofs::{
+             ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsSharesSpec, VirtiofsTag,
+         };
+         let w = std::path::PathBuf::from(
+             std::env::var("FANDHE_CONTAINER_TEST_VIRTIOFS_FIXTURE").expect("fixture dir"),
+         );
+         let share = |tag: &str, dir: &str, access| {
+             VirtiofsShareSpec::new(
+                 VirtiofsTag::try_new(tag).expect("tag"),
+                 SharedDirectoryPath::try_new(&w.join(dir)).expect("dir"),
+                 access,
+             )
+         };
+         VirtiofsSharesSpec::try_new(vec![
+             share("ro", "ro", ShareAccess::ReadOnly),
+             share("rw", "rw", ShareAccess::ReadWrite),
+         ])
+         .expect("shares")
+     })
+     ```
+
+     ゲスト側のマウント手順（ゲスト資産の init か対話シェルで実行。ゲストカーネルで virtiofs が有効であること）:
+
+     ```sh
+     mkdir -p /mnt/ro /mnt/rw
+     mount -t virtiofs ro /mnt/ro; mount -t virtiofs rw /mnt/rw
+     ```
+
+     対応はホストの `$W/ro`・`$W/rw` がゲストの `/mnt/ro`・`/mnt/rw`（タグ名 = mount の第 1 引数）。シリアル入力手段が無い場合は、上の mount と下の観測コマンドをゲスト資産の起動スクリプトに仕込み、結果をコンソールログ（stderr に出るパス）で読む。
+  3. ゲスト側の観測: `/mnt/ro` の各 symlink（`inside_link`・`abs_inside_link`・`dangling_inside_link`）を `readlink`・`cat`・`stat` して結果を記録する（`abs_inside_link` はゲスト内に同パスが無いため、`cat` が失敗すればゲストの名前空間で解決された証拠になる）。`/mnt/rw` 内でリンク元の通常ファイルを作成（`echo data > /mnt/rw/src`）したうえで、`ln -s src /mnt/rw/sym`（`FUSE_SYMLINK`）・`ln /mnt/rw/src /mnt/rw/hard`（`FUSE_LINK`）を実行し、ホスト側の `$W/rw` で `ls -l`・`stat` してリンクの実体・リンク数を記録する
+  4. 判定: `abs_inside_link` の `cat` がゲスト側で失敗する（ホストが辿らずゲストで解決される）なら拒否維持の補強のみ。ホスト上の `inside.txt` の内容が読めるなら、ホスト側サーバがリンクを辿る証拠としてユーザーへ報告し別 Issue とする。範囲外 symlink・ハードリンクの挙動は本手順では確認できない旨も記録に残す
+  5. 記録先: 結果を #1374 にコメントし、関連 PR にも記録する
+
 - `make fio-bench`（TASK-25.1・IO-8）: fio・GNU coreutils の `timeout` が入った Linux 環境が必要（root 権限・`/dev/kvm` は不要）。`make fio-bench-selftest`（`--from-json` モード＋固定 fixture＋fio スタブで完結し、実 fio は使わない）は CI の `bench-regression` ジョブに組み込み済みで既定のテスト集合の一部。`make fio-bench` 自体の実機実行・Docker コンテナ内での fio 実行（runbook は [docs/design/io-fio-bench.md](docs/design/io-fio-bench.md)「Docker ベースラインの計測手順」）・その結果の `make fio-baseline-ratio` への入力は TASK-25.2（#113。人間共同）が担う。`make fio-baseline-ratio`（比率算出そのもの）は fio・Docker を必要としないため既定のテスト集合の一部（`make fio-baseline-ratio-selftest` として CI に組み込み済み）
 - 実機での実測・判定が「人間」担当のタスク（`.claude/rules/delegation-impl.md`「着手条件」）を、計測スクリプト準備を超えて Agent が単独で完了扱いにしていないか確認する
 - カーネル監査フォールバックの肯定側送信（SEC-4・TASK-41.5.2。`crates/core/tests/audit_kernel_fallback.rs` の `sec4_task41_5_2_real_kernel_accepts_with_cap_audit_write`）は、`CAP_AUDIT_WRITE` を持つ初期 user namespace が必要でホストの監査ログへ 1 件書き込むため `#[ignore]` で分離している。実行コマンドは `cargo test -p fandhe-container-core --test audit_kernel_fallback -- --ignored`（root 等の権限付きで人間が実施し、結果を PR に記録する）。権限が無い環境の否定側テスト（`sec4_task41_5_2_real_kernel_rejects_without_privilege`）は既定のテスト集合で動く

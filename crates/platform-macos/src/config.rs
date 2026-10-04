@@ -1008,8 +1008,9 @@ impl VmConfigSpec {
 
     /// シリアルコンソールの出力先を上限つきの書き出しとして開く（無ければ `None`）。
     ///
-    /// ログファイルを検証つきで開き（[`Self::open_serial_console_log`]）、ファイル総量
-    /// [`crate::console_log::MAX_CONSOLE_LOG_BYTES`] まで書き出すスレッドへ渡す。戻り値は pipe の書き込み端で、
+    /// ログファイルを検証つきで開き（[`Self::open_serial_console_log`]）、ファイル長が
+    /// [`crate::console_log::MAX_CONSOLE_LOG_BYTES`] に達するまでゲスト出力を書き出すスレッドへ渡す
+    /// （超過分は区切り文 1 回と stderr の構造化ログを残して捨てる）。戻り値は pipe の書き込み端で、
     /// 生のログファイルは返さない（上限を迂回する経路を公開しない。#1366 の P1-3・MAC-1・TASK-64.3）。
     /// 書き出しの開始に失敗した場合、作成済みのログファイル（空）は残る。
     #[cfg(unix)]

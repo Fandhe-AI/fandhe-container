@@ -774,8 +774,8 @@ fn mount_one(
     }
 }
 
-/// 全マウントが「自分が成立させたマウント ID の最上位エントリ」かつ virtiofs（読み取り専用要求なら ro）
-/// であることを確認する。`owned` は `req.mounts` と同順・同数。
+/// 全マウントが「自分が成立させたマウント ID の最上位エントリ」かつ virtiofs で、読み取り専用か否かが要求と
+/// 一致する（ro 要求なら ro・読み書き要求なら ro でない）ことを確認する。`owned` は `req.mounts` と同順・同数。
 fn verify_virtiofs(
     req: &LaunchRequest,
     owned: &[OwnedMount],
@@ -805,6 +805,12 @@ fn verify_virtiofs(
             Some(e) if m.read_only && !e.is_read_only() => {
                 return Err(precondition(
                     "a read-only shared mount is not mounted read-only",
+                ));
+            }
+            // 読み書き要求なのに ro で成立した場合も、呼び出し側が書き込み可能と誤認しないよう拒否する。
+            Some(e) if !m.read_only && e.is_read_only() => {
+                return Err(precondition(
+                    "a read-write shared mount is mounted read-only",
                 ));
             }
             Some(_) => {}

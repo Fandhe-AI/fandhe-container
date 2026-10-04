@@ -288,9 +288,44 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
      echo hl > "$W/ro_hl/a"; ln "$W/ro_hl/a" "$W/ro_hl/b"; ln "$W/ro_hl/a" "$W/outside_hl"
      ```
 
-  2. ゲスト側: `ro` を ReadOnly、`rw`（空）を ReadWrite で共有して起動し、`ro` の各 symlink を `readlink`・`cat`・`stat` して読めた内容がホスト側マーカーかゲスト側マーカーかを記録する。`rw` 内で `ln -s`（`FUSE_SYMLINK`）・`ln`（`FUSE_LINK`）を実行し、ホスト側で `ls -l`・`stat` してリンクの実体・リンク数を記録する。`ro_hl` についても読み取りと `stat` のリンク数を記録する
-  3. 判定: ゲスト側マーカーが読める（ホストが辿らない）なら拒否維持の補強のみ。ホスト側マーカーが読めるなら拒否の維持が必須かつ ReadOnly 共有の扱いも見直しが要る（ユーザーへ報告し別 Issue）
-  4. 記録先: 結果を #1374 にコメントし、関連 PR にも記録する
+  2. 実行入口（既存の起動コマンドだけでは共有されない）: `vm_boot` の `#[ignore]` テストは `VmConfigSpec` に共有を追加せず `Vm::launch` を呼ぶため、そのままではゲストから fixture を観測できない。手元の作業ツリーで `crates/platform-macos/tests/vm_boot.rs` の `mac1_minimal_vm_boots_and_stops_on_real_macos` に一時的に次を足して実行する（**コミットしない**。観測後に当該ファイルの変更を破棄して戻す）。`W` は手順 1 の値を環境変数 `FANDHE_CONTAINER_TEST_VIRTIOFS_FIXTURE` で渡す。
+
+     ```rust
+     // `.with_devices(devices).expect("with_devices")` の直後に連結する
+     .with_shared_directories({
+         use fandhe_container_platform_macos::virtiofs::{
+             ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsSharesSpec, VirtiofsTag,
+         };
+         let w = std::path::PathBuf::from(
+             std::env::var("FANDHE_CONTAINER_TEST_VIRTIOFS_FIXTURE").expect("fixture dir"),
+         );
+         let share = |tag: &str, dir: &str, access| {
+             VirtiofsShareSpec::new(
+                 VirtiofsTag::try_new(tag).expect("tag"),
+                 SharedDirectoryPath::try_new(&w.join(dir)).expect("dir"),
+                 access,
+             )
+         };
+         VirtiofsSharesSpec::try_new(vec![
+             share("ro", "ro", ShareAccess::ReadOnly),
+             share("rw", "rw", ShareAccess::ReadWrite),
+             share("ro_hl", "ro_hl", ShareAccess::ReadOnly),
+         ])
+         .expect("shares")
+     })
+     ```
+
+     ゲスト側のマウント手順（ゲスト資産の init か対話シェルで実行。ゲストカーネルで virtiofs が有効であること）:
+
+     ```sh
+     mkdir -p /mnt/ro /mnt/rw /mnt/ro_hl
+     mount -t virtiofs ro /mnt/ro; mount -t virtiofs rw /mnt/rw; mount -t virtiofs ro_hl /mnt/ro_hl
+     ```
+
+     対応はホストの `$W/ro`・`$W/rw`・`$W/ro_hl` がゲストの `/mnt/ro`・`/mnt/rw`・`/mnt/ro_hl`（タグ名 = mount の第 1 引数）。シリアル入力手段が無い場合は、上の mount と下の観測コマンドをゲスト資産の起動スクリプトに仕込み、結果をコンソールログ（stderr に出るパス）で読む。
+  3. ゲスト側の観測: `/mnt/ro` の各 symlink（`abs_link`・`rel_link`・`dangling_link`・`inside_link`）を `readlink`・`cat`・`stat` して読めた内容がホスト側マーカーかゲスト側マーカーかを記録する。`/mnt/rw` 内で `ln -s`（`FUSE_SYMLINK`）・`ln`（`FUSE_LINK`）を実行し、ホスト側の `$W/rw` で `ls -l`・`stat` してリンクの実体・リンク数を記録する。`/mnt/ro_hl/a`・`/mnt/ro_hl/b` の読み取りと `stat` のリンク数も記録する
+  4. 判定: ゲスト側マーカーが読める（ホストが辿らない）なら拒否維持の補強のみ。ホスト側マーカーが読めるなら拒否の維持が必須かつ ReadOnly 共有の扱いも見直しが要る（ユーザーへ報告し別 Issue）
+  5. 記録先: 結果を #1374 にコメントし、関連 PR にも記録する
 
 - `make fio-bench`（TASK-25.1・IO-8）: fio・GNU coreutils の `timeout` が入った Linux 環境が必要（root 権限・`/dev/kvm` は不要）。`make fio-bench-selftest`（`--from-json` モード＋固定 fixture＋fio スタブで完結し、実 fio は使わない）は CI の `bench-regression` ジョブに組み込み済みで既定のテスト集合の一部。`make fio-bench` 自体の実機実行・Docker コンテナ内での fio 実行（runbook は [docs/design/io-fio-bench.md](docs/design/io-fio-bench.md)「Docker ベースラインの計測手順」）・その結果の `make fio-baseline-ratio` への入力は TASK-25.2（#113。人間共同）が担う。`make fio-baseline-ratio`（比率算出そのもの）は fio・Docker を必要としないため既定のテスト集合の一部（`make fio-baseline-ratio-selftest` として CI に組み込み済み）
 - 実機での実測・判定が「人間」担当のタスク（`.claude/rules/delegation-impl.md`「着手条件」）を、計測スクリプト準備を超えて Agent が単独で完了扱いにしていないか確認する

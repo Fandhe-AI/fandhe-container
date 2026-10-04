@@ -1935,6 +1935,69 @@ mod tests {
             err.to_string(),
             "config.console_log_not_owned: console log is owned by uid 0, expected effective uid 501: /var/log/console.log"
         );
+        // group / other の読み書きビットがあれば拒否する（実行ビットは問わない）。
+        let err = check_log_ownership(
+            p,
+            LogFileAttrs {
+                nlink: 1,
+                uid: 501,
+                mode: 0o100644,
+            },
+            501,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::ConsoleLogInsecureMode {
+                path: p.to_path_buf(),
+                mode: 0o644,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "config.console_log_insecure_mode: console log mode 644 allows group or other access, expected 600: /var/log/console.log"
+        );
+        assert_eq!(
+            check_log_ownership(
+                p,
+                LogFileAttrs {
+                    nlink: 1,
+                    uid: 501,
+                    mode: 0o100620
+                },
+                501
+            )
+            .unwrap_err()
+            .code(),
+            "config.console_log_insecure_mode"
+        );
+        assert_eq!(
+            check_log_ownership(
+                p,
+                LogFileAttrs {
+                    nlink: 1,
+                    uid: 501,
+                    mode: 0o100711
+                },
+                501
+            ),
+            Ok(())
+        );
+        // 所有者をモードより先に見る。
+        assert_eq!(
+            check_log_ownership(
+                p,
+                LogFileAttrs {
+                    nlink: 1,
+                    uid: 0,
+                    mode: 0o100666
+                },
+                501
+            )
+            .unwrap_err()
+            .code(),
+            "config.console_log_not_owned"
+        );
         // リンク数を所有者より先に見る。
         let err = check_log_ownership(
             p,
@@ -2099,5 +2162,38 @@ mod tests {
             ConfigError::ConsoleLogParentIsSymlink { path: swapped }
         );
         assert!(!real.join("console.log").exists());
+    }
+
+    /// MAC-1・TASK-64.3: group / other が読み書きできる既存ログは検証時に拒否し、検証後に権限を広げられても
+    /// open 後の fd 検査で拒否する（ゲスト出力の漏えいと、他者の追記・切り詰めによる上限の崩れを防ぐ）。
+    #[cfg(unix)]
+    #[test]
+    fn console_log_with_group_or_other_access_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TempDir::new("log-mode");
+        let path = t.file("console.log");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            ConsoleLogPath::try_new(&path).unwrap_err(),
+            ConfigError::ConsoleLogInsecureMode {
+                path: path.clone(),
+                mode: 0o644,
+            }
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let log = ConsoleLogPath::try_new(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o606)).unwrap();
+        assert_eq!(
+            log.open_for_append_excluding(&[]).unwrap_err(),
+            ConfigError::ConsoleLogInsecureMode {
+                path: path.clone(),
+                mode: 0o606,
+            }
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"dummy");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o606
+        );
     }
 }

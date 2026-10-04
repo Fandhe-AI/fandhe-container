@@ -880,6 +880,11 @@ pub struct ServerEvent<'a> {
     /// イベントへ載せてよい（H1・#820 security-auditor 指摘対応）。取得自体に
     /// 失敗した場合・他の `op`/`outcome` では `None`。
     pub peer_uid: Option<u32>,
+    /// vsock の [`ServerOutcome::RejectedPeerCredential`] の拒否で、接続元の CID が
+    /// 取得できた場合の値（`crate::vsock` が accept した接続の CID が、bind 時に必須指定した
+    /// 期待 CID と不一致だった場合。PLUG-12 相当・SEC-4・#1119）。数値のみで untrusted な
+    /// 文字列を含まない。UDS・他の `op`/`outcome` では常に `None`。
+    pub peer_cid: Option<u32>,
     /// 複数の操作を 1 件にまとめた集約イベントであれば、その集約値（件数・所要時間の
     /// 合計。[`CoalescedServerEvents`] 参照。REPAIR-4・#1118）。通常の 1 操作 1 イベント
     /// では `None`。
@@ -942,6 +947,7 @@ impl fmt::Debug for ServerEvent<'_> {
                 &self.peer_credential_rejections,
             )
             .field("peer_uid", &self.peer_uid)
+            .field("peer_cid", &self.peer_cid)
             .field("coalesced", &self.coalesced)
             .field("error", &self.error)
             .finish()
@@ -1013,7 +1019,7 @@ impl ServerObserver for NoopServerObserver {
 
 /// [`ServerEvent`] の JSON エンコード時に固定で書き込む部分（`event`・`op`・
 /// `kind`・`outcome`・`reason`・`code`・`message_truncated`・
-/// `accept_aborted_retries`・`peer_credential_rejections`・`peer_uid`・
+/// `accept_aborted_retries`・`peer_credential_rejections`・`peer_uid`・`peer_cid`・
 /// `latency_us` のキー名・区切り文字・想定される値の最大長）に見込む上限
 /// バイト数。[`SEND_LOG_LINE_FIXED_OVERHEAD_BYTES`] より、`op`（最大
 /// `"\"op\":\"accept\","` 相当）・`accept_aborted_retries`・
@@ -1023,7 +1029,7 @@ impl ServerObserver for NoopServerObserver {
 /// （`Duration::MAX` のマイクロ秒）ぶん（#1118）を 128 バイト足す。
 /// [`MAX_SERVER_LOG_LINE_BYTES`] の計算にのみ使う保守的な見積もりであり、
 /// 実際のエンコード処理はこの値を直接参照しない。
-const SERVER_LOG_LINE_FIXED_OVERHEAD_BYTES: usize = SEND_LOG_LINE_FIXED_OVERHEAD_BYTES + 384;
+const SERVER_LOG_LINE_FIXED_OVERHEAD_BYTES: usize = SEND_LOG_LINE_FIXED_OVERHEAD_BYTES + 416;
 
 /// [`JsonLinesServerObserver`] がためる 1 行の JSON がとりうる最大バイト数の
 /// 見積もり（[`MAX_SEND_LOG_LINE_BYTES`] のサーバー版）。
@@ -1083,6 +1089,9 @@ struct CoalescedRejections {
     /// 最後に集約した拒否の [`ServerEvent::peer_uid`]（取得できなかった場合は
     /// `None`。そのときは集約行から `last_peer_uid` キー自体を省く）。
     last_peer_uid: Option<u32>,
+    /// 最後に集約した拒否の [`ServerEvent::peer_cid`]（vsock。`None` なら集約行から
+    /// `last_peer_cid` キー自体を省く。#1119）。
+    last_peer_cid: Option<u32>,
 }
 
 /// [`ServerEvent`] を JSON Lines（1 イベント 1 行）へ変換し、上限付きのメモリ内
@@ -1317,6 +1326,7 @@ impl JsonLinesServerObserver {
         if let Some(gap) = self.pending_gap.as_mut() {
             gap.count = gap.count.saturating_add(1);
             gap.last_peer_uid = event.peer_uid;
+            gap.last_peer_cid = event.peer_cid;
         } else if self
             .audit
             .push_encoded_line(seq, || encode_server_event(event))
@@ -1328,6 +1338,7 @@ impl JsonLinesServerObserver {
                 first_seq: seq,
                 count: 1,
                 last_peer_uid: event.peer_uid,
+                last_peer_cid: event.peer_cid,
             });
         }
         self.coalesced_total = self.coalesced_total.saturating_add(1);
@@ -1384,9 +1395,13 @@ fn encode_coalesced_rejections(gap: &CoalescedRejections) -> String {
         Some(uid) => format!(",\"last_peer_uid\":{uid}"),
         None => String::new(),
     };
+    let last_peer_cid = match gap.last_peer_cid {
+        Some(cid) => format!(",\"last_peer_cid\":{cid}"),
+        None => String::new(),
+    };
     format!(
         "{{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"error\",\
-         \"reason\":\"peer_credential_rejections_coalesced\",\"count\":{count}{last_peer_uid}}}"
+         \"reason\":\"peer_credential_rejections_coalesced\",\"count\":{count}{last_peer_uid}{last_peer_cid}}}"
     )
 }
 
@@ -1429,6 +1444,15 @@ fn peer_uid_json_fragment(peer_uid: Option<u32>) -> String {
     }
 }
 
+/// `event.peer_cid` から `"peer_cid":3,` の断片を組み立てる（[`peer_uid_json_fragment`]
+/// と同じ形式。`None` の場合はフィールド自体を省くため、UDS の出力は変わらない。#1119）。
+fn peer_cid_json_fragment(peer_cid: Option<u32>) -> String {
+    match peer_cid {
+        Some(cid) => format!("\"peer_cid\":{cid},"),
+        None => String::new(),
+    }
+}
+
 /// `event.coalesced` から `"coalesced":true,"count":N,"latency_sum_us":S,` の
 /// 末尾カンマありの断片を組み立てる（`None` の場合は何も出さない。#1118）。
 fn coalesced_json_fragment(coalesced: Option<CoalescedServerEvents>) -> String {
@@ -1453,13 +1477,14 @@ fn encode_server_event(event: &ServerEvent<'_>) -> String {
     let retries = event.accept_aborted_retries;
     let cred_rejections = event.peer_credential_rejections;
     let peer_uid = peer_uid_json_fragment(event.peer_uid);
+    let peer_cid = peer_cid_json_fragment(event.peer_cid);
     let coalesced = coalesced_json_fragment(event.coalesced);
     match (&event.outcome, &event.error) {
         (ServerOutcome::Success, _) => {
             format!(
                 "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"ok\",\
                  \"accept_aborted_retries\":{retries},\
-                 \"peer_credential_rejections\":{cred_rejections},{peer_uid}\
+                 \"peer_credential_rejections\":{cred_rejections},{peer_uid}{peer_cid}\
                  {coalesced}\"latency_us\":{latency_us}}}"
             )
         }
@@ -1473,7 +1498,7 @@ fn encode_server_event(event: &ServerEvent<'_>) -> String {
                     "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"error\",\
                      \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
                      \"message_truncated\":true,\"accept_aborted_retries\":{retries},\
-                     \"peer_credential_rejections\":{cred_rejections},{peer_uid}\
+                     \"peer_credential_rejections\":{cred_rejections},{peer_uid}{peer_cid}\
                      {coalesced}\"latency_us\":{latency_us}}}"
                 )
             } else {
@@ -1481,7 +1506,7 @@ fn encode_server_event(event: &ServerEvent<'_>) -> String {
                     "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"error\",\
                      \"reason\":\"{reason}\",\"code\":\"{code}\",\"message\":\"{message}\",\
                      \"accept_aborted_retries\":{retries},\
-                     \"peer_credential_rejections\":{cred_rejections},{peer_uid}\
+                     \"peer_credential_rejections\":{cred_rejections},{peer_uid}{peer_cid}\
                      {coalesced}\"latency_us\":{latency_us}}}"
                 )
             }
@@ -1495,7 +1520,7 @@ fn encode_server_event(event: &ServerEvent<'_>) -> String {
             format!(
                 "{{\"event\":\"io_server\",\"op\":\"{op}\",{kind}\"outcome\":\"error\",\
                  \"reason\":\"{reason}\",\"accept_aborted_retries\":{retries},\
-                 \"peer_credential_rejections\":{cred_rejections},{peer_uid}\
+                 \"peer_credential_rejections\":{cred_rejections},{peer_uid}{peer_cid}\
                  {coalesced}\"latency_us\":{latency_us}}}"
             )
         }
@@ -1972,6 +1997,7 @@ mod tests {
             accept_aborted_retries: 2,
             peer_credential_rejections: 0,
             peer_uid: None,
+            peer_cid: None,
             coalesced: None,
             error: None,
         };
@@ -2001,6 +2027,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 0,
             peer_uid: None,
+            peer_cid: None,
             coalesced: None,
             error: Some(SendEventError {
                 code: IoErrorCode::InvalidArgument,
@@ -2032,6 +2059,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 0,
             peer_uid: None,
+            peer_cid: None,
             coalesced: None,
             error: Some(SendEventError {
                 code: IoErrorCode::Unavailable,
@@ -2064,6 +2092,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 1,
             peer_uid: Some(1000),
+            peer_cid: None,
             coalesced: None,
             error: Some(SendEventError {
                 code: IoErrorCode::InvalidArgument,
@@ -2082,6 +2111,35 @@ mod tests {
         );
     }
 
+    /// #1119（PLUG-12 相当・SEC-4）: vsock の CID 不一致の拒否イベントは、接続元の CID を
+    /// `peer_cid` として数値のまま JSON へ含める（`peer_uid` は UDS 専用のため出さない）。
+    #[test]
+    fn plug12_1119_encode_server_event_includes_peer_cid_for_vsock_rejection() {
+        let event = ServerEvent {
+            op: ServerOp::Accept,
+            kind: None,
+            outcome: ServerOutcome::RejectedPeerCredential,
+            latency: Duration::ZERO,
+            accept_aborted_retries: 0,
+            peer_credential_rejections: 2,
+            peer_uid: None,
+            peer_cid: Some(1),
+            coalesced: None,
+            error: Some(SendEventError {
+                code: IoErrorCode::InvalidArgument,
+                message: "peer cid does not match",
+            }),
+        };
+
+        assert_eq!(
+            encode_server_event(&event),
+            "{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"error\",\
+             \"reason\":\"rejected_peer_credential\",\"code\":\"INVALID_ARGUMENT\",\
+             \"message\":\"peer cid does not match\",\"accept_aborted_retries\":0,\
+             \"peer_credential_rejections\":2,\"peer_cid\":1,\"latency_us\":0}"
+        );
+    }
+
     /// H1・#820: 接続元の uid の取得自体に失敗した場合（`peer_uid` は
     /// `None`）は、`peer_uid` キー自体を省く。
     #[test]
@@ -2095,6 +2153,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 1,
             peer_uid: None,
+            peer_cid: None,
             coalesced: None,
             error: Some(SendEventError {
                 code: IoErrorCode::Internal,
@@ -2121,6 +2180,7 @@ mod tests {
             accept_aborted_retries: retries,
             peer_credential_rejections: 0,
             peer_uid: None,
+            peer_cid: None,
             coalesced: None,
             error: None,
         };
@@ -2152,6 +2212,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 1,
             peer_uid,
+            peer_cid: None,
             coalesced: None,
             error: Some(SendEventError {
                 code: IoErrorCode::InvalidArgument,
@@ -2170,6 +2231,7 @@ mod tests {
             accept_aborted_retries: retries,
             peer_credential_rejections: 0,
             peer_uid: None,
+            peer_cid: None,
             coalesced: None,
             error: None,
         }
@@ -2384,15 +2446,17 @@ mod tests {
             first_seq: u64::MAX,
             count: u64::MAX,
             last_peer_uid: Some(u32::MAX),
+            last_peer_cid: Some(u32::MAX),
         };
         let encoded = encode_coalesced_rejections(&worst);
         assert_eq!(
             encoded,
             "{\"event\":\"io_server\",\"op\":\"accept\",\"outcome\":\"error\",\
              \"reason\":\"peer_credential_rejections_coalesced\",\
-             \"count\":18446744073709551615,\"last_peer_uid\":4294967295}"
+             \"count\":18446744073709551615,\"last_peer_uid\":4294967295,\
+             \"last_peer_cid\":4294967295}"
         );
-        assert_eq!(encoded.len(), 157);
+        assert_eq!(encoded.len(), 184);
         // `MAX_SERVER_AUDIT_GAP_LINE_BYTES <= MAX_SERVER_LOG_LINE_BYTES` は
         // `const` assert で保証済み。
         assert!(encoded.len() <= MAX_SERVER_AUDIT_GAP_LINE_BYTES);
@@ -2427,6 +2491,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 0,
             peer_uid: None,
+            peer_cid: None,
             coalesced: None,
             error: Some(SendEventError {
                 code: IoErrorCode::Timeout,
@@ -2471,6 +2536,7 @@ mod tests {
             accept_aborted_retries: u32::MAX,
             peer_credential_rejections: u32::MAX,
             peer_uid: Some(u32::MAX),
+            peer_cid: Some(u32::MAX),
             coalesced: Some(CoalescedServerEvents::new(u64::MAX, Duration::MAX)),
             error: Some(SendEventError {
                 code: IoErrorCode::ResourceExhausted,
@@ -2517,6 +2583,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 0,
             peer_uid: None,
+            peer_cid: None,
             coalesced: Some(CoalescedServerEvents::new(3, Duration::from_micros(1500))),
             error: None,
         };
@@ -2540,6 +2607,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 0,
             peer_uid: None,
+            peer_cid: None,
             coalesced: Some(CoalescedServerEvents::new(2, Duration::ZERO)),
             error: Some(SendEventError {
                 code: IoErrorCode::Unavailable,
@@ -2568,6 +2636,7 @@ mod tests {
             accept_aborted_retries: 0,
             peer_credential_rejections: 0,
             peer_uid: None,
+            peer_cid: None,
             coalesced: None,
             error: None,
         });

@@ -468,6 +468,80 @@ mod tests {
         );
     }
 
+    /// 先頭 `capacity` バイトだけ受け付け、以後は失敗する出力先（途中でディスクが満杯になる模擬）。
+    struct PartialDisk {
+        data: Vec<u8>,
+        capacity: usize,
+    }
+
+    impl Write for PartialDisk {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let room = self.capacity - self.data.len();
+            if room == 0 {
+                return Err(std::io::Error::from(ErrorKind::StorageFull));
+            }
+            let n = room.min(buf.len());
+            self.data.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// MAC-1・TASK-64.3: 途中まで書けた後の失敗では、書けた分を written、残りを discarded に数える
+    /// （集計を実際のログと一致させる）。
+    #[test]
+    fn copy_counts_partial_write_before_failure() {
+        let src = vec![b'p'; 1000];
+        let mut dst = PartialDisk {
+            data: Vec::new(),
+            capacity: 300,
+        };
+        let (out, events) = copy_collect(&src[..], &mut dst, CapPlan::new(1 << 20, 0));
+        assert_eq!(dst.data.len(), 300);
+        assert_eq!(
+            out,
+            ConsoleLogOutcome {
+                written_bytes: 300,
+                discarded_bytes: 700,
+                write_error: Some(ErrorKind::StorageFull),
+                ..ConsoleLogOutcome::default()
+            }
+        );
+        assert_eq!(
+            events,
+            vec![ConsoleLogEvent::WriteFailed {
+                kind: ErrorKind::StorageFull
+            }]
+        );
+    }
+
+    /// MAC-1・TASK-64.3: 区切り文の途中で失敗したら区切り文は書けていない扱いにし、失敗を報告する。
+    #[test]
+    fn copy_reports_marker_write_failure() {
+        let src = [b'm'; 200];
+        let mut dst = PartialDisk {
+            data: Vec::new(),
+            capacity: 110,
+        };
+        let (out, events) = copy_collect(&src[..], &mut dst, CapPlan::new(100, 0));
+        assert_eq!(out.written_bytes, 100);
+        assert_eq!(out.discarded_bytes, 100);
+        assert!(out.limit_reached);
+        assert!(!out.marker_written);
+        assert_eq!(out.write_error, Some(ErrorKind::StorageFull));
+        assert_eq!(
+            events,
+            vec![
+                ConsoleLogEvent::LimitReached { written_bytes: 100 },
+                ConsoleLogEvent::WriteFailed {
+                    kind: ErrorKind::StorageFull
+                },
+            ]
+        );
+    }
+
     /// 1 回目は `Interrupted`、以後は内側へ委ねる読み出し元。
     struct InterruptOnce<R> {
         inner: R,

@@ -863,6 +863,7 @@ mod tests {
             bridge_token: TOKEN.to_owned(),
             table: names.table().clone(),
             gateway: IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 1)), 24).unwrap(),
+            name_resolution: Default::default(),
         }
     }
 

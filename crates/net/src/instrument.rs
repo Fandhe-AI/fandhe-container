@@ -60,6 +60,9 @@ pub enum NetOpKind {
     /// host / none モードの `--dns` 反映（検証 + `resolv.conf` 原子的書き込み。`add_host_dns::resolv_conf`。
     /// TASK-185.4・#347・NET-12）。
     DnsResolvConfWrite,
+    /// 軽量運用（DNS ヘルパーなし）のサービス名 hosts 静的注入（検証 + 追記。
+    /// `etc_hosts::inject_service_hosts_with_recorder`。TASK-146.1・#334・NET-8）。
+    StaticHostsInject,
 }
 
 impl NetOpKind {
@@ -78,6 +81,7 @@ impl NetOpKind {
             NetOpKind::DnsHelperStop => "dns.helper.stop",
             NetOpKind::AddHostsApply => "hosts.add_host.apply",
             NetOpKind::DnsResolvConfWrite => "dns.resolv_conf.write",
+            NetOpKind::StaticHostsInject => "hosts.static.inject",
         }
     }
 }
@@ -252,7 +256,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 12] = [
+    const ALL_KINDS: [NetOpKind; 13] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
@@ -265,6 +269,7 @@ mod tests {
         NetOpKind::DnsHelperStop,
         NetOpKind::AddHostsApply,
         NetOpKind::DnsResolvConfWrite,
+        NetOpKind::StaticHostsInject,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
@@ -285,6 +290,7 @@ mod tests {
             NetOpKind::DnsResolvConfWrite.as_str(),
             "dns.resolv_conf.write"
         );
+        assert_eq!(NetOpKind::StaticHostsInject.as_str(), "hosts.static.inject");
     }
 
     /// REPAIR-4: 操作名は core の `OpName::new` と同じ規則に収まる（net は core に依存できないため

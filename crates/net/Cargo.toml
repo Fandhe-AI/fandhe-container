@@ -98,3 +98,11 @@ harness = false
 name = "add_host_privileged"
 path = "tests/add_host_privileged.rs"
 harness = false
+
+# 軽量運用（StaticHosts）の bridge ネットワークで /etc/hosts 静的注入によりサービス名が解決され、DNS ヘルパーが
+# 起動しないことの実機前提テスト（NET-8・NET-7・TASK-146.1・#334）。子の再入（--inner / --probe）と root 前提の
+# 分離のため harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "etc_hosts_privileged"
+path = "tests/etc_hosts_privileged.rs"
+harness = false

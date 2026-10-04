@@ -103,6 +103,7 @@ pub use ipam::StaticIpam;
 pub use publish::{MAX_PORT_PUBLISHES, PortProtocol, PortPublish, PortRegistry};
 
 use crate::error::{NetError, NetErrorCode};
+use crate::etc_hosts::NameResolution;
 #[cfg(target_os = "linux")]
 use crate::netlink_route::{
     AddrScope, AddressSpec, LinkCreate, LinkDelete, LinkIndex, LinkRef, LinkSet,
@@ -263,6 +264,7 @@ impl NetworkResourceNames {
 pub struct NetworkCreateSpec {
     name: NetworkName,
     gateway: IpPrefix,
+    name_resolution: NameResolution,
 }
 
 impl NetworkCreateSpec {
@@ -283,7 +285,11 @@ impl NetworkCreateSpec {
         if u32::from(addr) & host_mask == host_mask {
             return Err(invalid("gateway must not be the broadcast address"));
         }
-        Ok(Self { name, gateway })
+        Ok(Self {
+            name,
+            gateway,
+            name_resolution: NameResolution::default(),
+        })
     }
 
     /// ネットワーク名。
@@ -294,6 +300,18 @@ impl NetworkCreateSpec {
     /// gateway（bridge に付与するアドレス）。
     pub fn gateway(&self) -> IpPrefix {
         self.gateway
+    }
+
+    /// 名前解決方式を指定する（既定は [`NameResolution::DnsHelper`]）。`StaticHosts` を選ぶと
+    /// DNS ヘルパーを起動しない軽量運用になる（NET-8・TASK-146.1・#334）。
+    pub fn with_name_resolution(mut self, resolution: NameResolution) -> Self {
+        self.name_resolution = resolution;
+        self
+    }
+
+    /// 名前解決方式。
+    pub fn name_resolution(&self) -> NameResolution {
+        self.name_resolution
     }
 }
 
@@ -313,6 +331,9 @@ pub struct CreatedNetwork {
     pub table: NftName,
     /// bridge に付与した gateway。
     pub gateway: IpPrefix,
+    /// 名前解決方式（NET-7 の DNS ヘルパーか、NET-8 の hosts 静的注入か。TASK-146.1・#334）。
+    /// プロセスをまたぐ永続化は未実装（REPAIR-3）。
+    pub name_resolution: NameResolution,
 }
 
 /// 失敗した手順。
@@ -607,6 +628,7 @@ pub(crate) fn create_network_with(
         bridge_token: token,
         table,
         gateway: spec.gateway(),
+        name_resolution: spec.name_resolution(),
     })
 }
 
@@ -1833,6 +1855,18 @@ mod tests {
         NetworkResourceNames::derive(&nname(n)).unwrap().table
     }
 
+    /// NET-8・TASK-146.1: 名前解決方式の既定は DnsHelper で、指定値が CreatedNetwork へ引き継がれる。
+    #[test]
+    fn net8_name_resolution_is_carried_to_created_network() {
+        assert_eq!(spec("web").name_resolution(), NameResolution::DnsHelper);
+        let c = create_network_with(&Fake::default(), &spec("web")).unwrap();
+        assert_eq!(c.name_resolution, NameResolution::DnsHelper);
+        let s = spec("web").with_name_resolution(NameResolution::StaticHosts);
+        assert_eq!(s.name_resolution(), NameResolution::StaticHosts);
+        let c = create_network_with(&Fake::default(), &s).unwrap();
+        assert_eq!(c.name_resolution, NameResolution::StaticHosts);
+    }
+
     /// NET-1・TASK-139.1: 全手順成功。
     #[test]
     fn net1_create_success() {
@@ -2194,6 +2228,7 @@ mod attach_tests {
             bridge_token: "fandhe-net:web:1:0:0".to_owned(),
             table: names.table().clone(),
             gateway: IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 1)), 24).unwrap(),
+            name_resolution: Default::default(),
         }
     }
 

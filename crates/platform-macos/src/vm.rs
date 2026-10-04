@@ -506,6 +506,8 @@ impl Core {
         }
         if !allowed {
             *ticket = OpTicket::Settled;
+            // 拒否する場合も、進行中の操作がなければ状態機械を実状態へ追従させる（放棄後の回復を早める）。
+            self.reconcile(actual);
             return BeginOutcome::Rejected(actual);
         }
         if self.lifecycle.has_in_flight() {
@@ -803,18 +805,28 @@ mod mac {
             });
             match rx.recv_timeout(self.op_timeout) {
                 Ok(result) => result,
-                Err(RecvTimeoutError::Timeout) => self.give_up(op, &ticket, &rx),
-                Err(RecvTimeoutError::Disconnected) => Err(VmError::CallbackLost { op }),
+                Err(RecvTimeoutError::Timeout) => {
+                    let timeout = VmError::Timeout {
+                        op,
+                        after: self.op_timeout,
+                    };
+                    self.give_up(&ticket, &rx, timeout)
+                }
+                // 完了通知の block が呼ばれずに解放された。完了待ちのまま残さず、タイムアウトと同じく放棄する。
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.give_up(&ticket, &rx, VmError::CallbackLost { op })
+                }
             }
         }
 
-        /// 待機期限切れの後始末（REPAIR-5）。操作を取り消すか放棄して後続の start / stop を受け付けられる
-        /// ようにし、放棄した場合は VM キュー上で実状態へ追従させる。期限直後に結果が確定していればそれを返す。
+        /// 待機期限切れ・通知経路の喪失の後始末（REPAIR-5）。操作を取り消すか放棄して後続の start / stop を
+        /// 受け付けられるようにし、放棄した場合は VM キュー上で実状態へ追従させる。直前に結果が確定していれば
+        /// それを、なければ `error` を返す。
         fn give_up(
             &self,
-            op: VmOp,
             ticket: &Mutex<OpTicket>,
             rx: &Receiver<Result<(), VmError>>,
+            error: VmError,
         ) -> Result<(), VmError> {
             let abandoned = {
                 let mut c = lock(&self.core);
@@ -832,10 +844,7 @@ mod mac {
                 self.host
                     .run_async(move |vm| lock(&core).reconcile(actual_state(vm)));
             }
-            Err(VmError::Timeout {
-                op,
-                after: self.op_timeout,
-            })
+            Err(error)
         }
     }
 

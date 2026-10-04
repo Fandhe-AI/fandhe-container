@@ -43,8 +43,8 @@ pub(crate) use unix::{has_extended_acl, security_labels};
 #[cfg(windows)]
 pub(crate) use windows::{
     CREATE_SUSPENDED, GENERIC_WRITE, Job, WRITE_DAC, WRITE_OWNER, copy_security, file_id,
-    has_audit_sacl, has_named_streams, resume_suspended_threads, security_snapshot,
-    system_directory,
+    has_audit_sacl, has_named_streams, reopen_for_read, resume_suspended_threads,
+    security_snapshot, system_directory,
 };
 
 /// Windows の FFI（`windows-sys`）。前半は `wsl2` 用（TASK-67.3・#1364 由来）、後半は `wslconfig` 用（TASK-67.2）。
@@ -262,7 +262,8 @@ mod windows {
     use std::fs::File;
 
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_PRIVILEGE_NOT_HELD, ERROR_SUCCESS, LocalFree,
+        ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_PRIVILEGE_NOT_HELD, ERROR_SUCCESS,
+        GENERIC_READ, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
         GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
@@ -657,6 +658,22 @@ mod windows {
             }
             off = off.checked_add(next)?;
         }
+    }
+
+    /// リンク以外のリパースポイント（WOF 圧縮・クラウドのプレースホルダー等）を `FILE_FLAG_OPEN_REPARSE_POINT` で
+    /// 開いた `file` を、同じファイルオブジェクトのまま通常の読み取り用に開き直す（`ReOpenFile`。パスを引き直さない）。
+    ///
+    /// リパースポイント自体として開いたハンドルからはファイルシステムフィルタが論理的な内容を返さないため、
+    /// `wslconfig` の `open_verified` が、リンク（名前の代理となるタグ）でないことを確かめた後に使う。
+    pub(crate) fn reopen_for_read(file: &File) -> std::io::Result<File> {
+        // SAFETY: `file` は生存中の `File` が所有する有効なハンドル。戻り値は下で INVALID_HANDLE_VALUE と NULL を
+        // 判定し、有効なら直後に `OwnedHandle` が所有して 1 回だけ閉じる。
+        let h = unsafe { ReOpenFile(file.as_raw_handle(), GENERIC_READ, FILE_SHARE_ALL, 0) };
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `h` は `ReOpenFile` が返した有効なハンドルで、他に所有者はいない（ここで所有権を移す）。
+        Ok(File::from(unsafe { OwnedHandle::from_raw_handle(h) }))
     }
 
     /// `file` の監査用 SACL に監査・アラームの ACE があるか。

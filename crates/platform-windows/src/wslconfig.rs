@@ -466,7 +466,8 @@ fn open_flags_supported() -> Result<(), WinError> {
 /// 事前に通常ファイルと確認したパスを開き、開いたハンドル自身を検証する。
 ///
 /// パスの再解決による検査と使用の競合（TOCTOU）を避けるため、読み込みは必ずここで検証したハンドルから行う。
-/// Windows はリパースポイントを辿らずに開き、ハンドルの属性がリンクでないことを確認する。unix は
+/// Windows はリパースポイントを辿らずに開き、ハンドルの属性がリンクでないことを確認する（リンク以外の
+/// リパースポイントは同じファイルを通常の読み取り用に開き直す）。unix は
 /// `O_NOFOLLOW | O_NONBLOCK` で開き（リンクを辿らず、FIFO で止まらない）、開いた後に
 /// パスを `symlink_metadata` で引き直し、ハンドルと同一の inode（dev / ino）の通常ファイルであることを確認する
 /// （検査後にリンクや別ファイルへ差し替えられていれば拒否する）。
@@ -506,6 +507,26 @@ fn open_verified(path: &Path) -> Result<std::fs::File, WinError> {
             ".wslconfig is not a regular file",
         ));
     }
+    // リンク以外のリパースポイント（WOF 圧縮・クラウドのプレースホルダー等）は、リパースポイント自体として開いた
+    // ハンドルからは論理的な内容を読めないため、同じファイルオブジェクトを通常の読み取り用に開き直す
+    // （リンク〔名前の代理となるタグ〕は上の `is_symlink` で拒否済み）。
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::MetadataExt;
+        if handle_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            let reopened = crate::sys::reopen_for_read(&file)
+                .map_err(|e| io_err(&e, "failed to open .wslconfig"))?;
+            if !same_file(&reopened, &file)? {
+                return Err(err(
+                    WinErrorCode::PermissionDenied,
+                    ".wslconfig changed while it was being opened",
+                ));
+            }
+            reopened
+        } else {
+            file
+        }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -639,6 +660,10 @@ fn load_verified(path: &Path) -> Result<Option<(WslConfig, Source)>, WinError> {
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// `FILE_ATTRIBUTE_REPARSE_POINT`（winnt.h）。
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 /// `FILE_ATTRIBUTE_ENCRYPTED`（EFS 暗号化。winnt.h）。
 #[cfg(windows)]

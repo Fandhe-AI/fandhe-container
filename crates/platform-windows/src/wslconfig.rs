@@ -21,7 +21,8 @@
 //!   整合性ラベル・属性）を一時ファイルへ写す（Windows のセキュリティ記述子の複製は `sys` の FFI ラッパー）。
 //!   読み取り専用のファイルは書き換えない。
 //!
-//! パース規則: 入力は UTF-8（先頭 BOM は許容）。NUL は拒否。前後の空白を除いて判定し、空行・`#` / `;`
+//! パース規則: 入力は UTF-8（先頭 BOM は許容）。NUL と、ASCII の空白・タブ以外の空白（単独の CR・全角空白・
+//! NBSP 等）は拒否。前後の ASCII 空白・タブを除いて判定し、空行・`#` / `;`
 //! 始まりのコメント・`[name]`（閉じ括弧の後ろはコメントのみ可）・`key=value` を受理し、それ以外は
 //! `INVALID_ARGUMENT`。セクション名とキー名は ASCII 大文字小文字を区別しない。値は trim して
 //! `true` / `false`（大文字小文字不問）のみ真偽として扱い、行内コメントは解釈しない（値の一部になり
@@ -130,12 +131,26 @@ fn bad_line(n: usize, what: &str) -> WinError {
     err(WinErrorCode::InvalidArgument, format!("line {n}: {what}"))
 }
 
+/// 行内で許す空白（ASCII の空白とタブ）だけを前後から除く。
+///
+/// `str::trim` は Unicode の空白（全角空白・NBSP 等）まで除き、見た目が同じでも WSL 側の解釈と食い違いうるため
+/// 使わない。それ以外の空白・単独の CR は [`WslConfig::parse`] が `INVALID_ARGUMENT` で拒否する。
+fn trim_ws(s: &str) -> &str {
+    s.trim_matches([' ', '\t'])
+}
+
+/// 行内に許さない空白（ASCII の空白・タブ以外の空白文字。単独の CR・VT・FF・全角空白・NBSP 等）を含むか。
+fn has_unsupported_whitespace(s: &str) -> bool {
+    s.chars()
+        .any(|c| c.is_whitespace() && c != ' ' && c != '\t')
+}
+
 fn is_comment_start(s: &str) -> bool {
     s.starts_with('#') || s.starts_with(';')
 }
 
 fn classify_value(value: &str) -> VirtiofsState {
-    let v = value.trim();
+    let v = trim_ws(value);
     if v.eq_ignore_ascii_case("true") {
         VirtiofsState::Enabled
     } else if v.eq_ignore_ascii_case("false") {
@@ -184,7 +199,10 @@ impl WslConfig {
             } else {
                 (chunk, "")
             };
-            let t = body.trim();
+            if has_unsupported_whitespace(body) {
+                return Err(bad_line(n, "unsupported whitespace or carriage return"));
+            }
+            let t = trim_ws(body);
             let kind = if t.is_empty() {
                 Kind::Blank
             } else if is_comment_start(t) {
@@ -193,11 +211,11 @@ impl WslConfig {
                 let (name, after) = rest
                     .split_once(']')
                     .ok_or_else(|| bad_line(n, "unterminated section header"))?;
-                let name = name.trim();
+                let name = trim_ws(name);
                 if name.is_empty() {
                     return Err(bad_line(n, "empty section name"));
                 }
-                let after = after.trim();
+                let after = trim_ws(after);
                 if !after.is_empty() && !is_comment_start(after) {
                     return Err(bad_line(n, "unexpected text after section header"));
                 }
@@ -205,14 +223,14 @@ impl WslConfig {
                 section = Some(name.clone());
                 Kind::Section(name)
             } else if let Some((k, v)) = t.split_once('=') {
-                let k = k.trim();
+                let k = trim_ws(k);
                 if k.is_empty() {
                     return Err(bad_line(n, "empty key"));
                 }
                 Kind::Key {
                     section: section.clone(),
                     key: k.to_ascii_lowercase(),
-                    value: v.trim().to_string(),
+                    value: trim_ws(v).to_string(),
                 }
             } else {
                 return Err(bad_line(n, "expected key=value"));
@@ -295,7 +313,7 @@ impl WslConfig {
                     continue;
                 }
                 previous.get_or_insert(st);
-                let indent_len = line.body.len() - line.body.trim_start().len();
+                let indent_len = line.body.len() - line.body.trim_start_matches([' ', '\t']).len();
                 let indent = line.body.get(..indent_len).unwrap_or("").to_string();
                 let eol = std::mem::take(&mut line.eol);
                 *line = Self::new_key_line(eol, &indent);
@@ -385,10 +403,71 @@ fn io_err(e: &std::io::Error, what: &str) -> WinError {
     err(code, what)
 }
 
+/// `open(2)` のフラグ。値は OS・アーキテクチャで異なるため `cfg` で定義し、テストで固定する
+/// （libc 0.2.189 と照合済み）。判定できない OS・アーキテクチャはビルドしない（読み書き API が使えなくなる
+/// ことはなく、[`open_verified`] が `UNIMPLEMENTED` を返す）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+mod unix_open_flags {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(super) const O_NOFOLLOW: i32 = 0o400_000;
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub(super) const O_NOFOLLOW: i32 = 0o100_000;
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(super) const O_NONBLOCK: i32 = 0o4_000;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_NOFOLLOW: i32 = 0x100;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_NONBLOCK: i32 = 0x4;
+}
+
+/// 安全な open フラグ（`unix_open_flags`）を持たない unix。リンクを辿りうる・FIFO で止まりうる open を
+/// しないよう `UNIMPLEMENTED`（fail-closed）。
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))
+))]
+fn open_flags_supported() -> Result<(), WinError> {
+    Err(err(
+        WinErrorCode::Unimplemented,
+        "safe open flags are not defined for this platform",
+    ))
+}
+
+/// 安全な open フラグを持つ（または不要な）OS・アーキテクチャ。
+#[cfg(not(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))
+)))]
+fn open_flags_supported() -> Result<(), WinError> {
+    Ok(())
+}
+
 /// 事前に通常ファイルと確認したパスを開き、開いたハンドル自身を検証する。
 ///
 /// パスの再解決による検査と使用の競合（TOCTOU）を避けるため、読み込みは必ずここで検証したハンドルから行う。
-/// Windows はリパースポイントを辿らずに開き、ハンドルの属性がリンクでないことを確認する。unix は開いた後に
+/// Windows はリパースポイントを辿らずに開き、ハンドルの属性がリンクでないことを確認する。unix は
+/// `O_NOFOLLOW | O_NONBLOCK` で開き（リンクを辿らず、FIFO で止まらない）、開いた後に
 /// パスを `symlink_metadata` で引き直し、ハンドルと同一の inode（dev / ino）の通常ファイルであることを確認する
 /// （検査後にリンクや別ファイルへ差し替えられていれば拒否する）。
 fn open_verified(path: &Path) -> Result<std::fs::File, WinError> {
@@ -401,6 +480,20 @@ fn open_verified(path: &Path) -> Result<std::fs::File, WinError> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // リンクを辿らず（差し替えられていれば ELOOP で失敗）、FIFO 等へ差し替えられていても open で
+        // 無期限に待たない（REPAIR-5）。通常ファイルの読み込みには O_NONBLOCK は影響しない。
+        opts.custom_flags(unix_open_flags::O_NOFOLLOW | unix_open_flags::O_NONBLOCK);
+    }
+    open_flags_supported()?;
     let file = opts
         .open(path)
         .map_err(|e| io_err(&e, "failed to open .wslconfig"))?;

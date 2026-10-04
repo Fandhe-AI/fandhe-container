@@ -95,6 +95,9 @@ mod windows {
             dacl: *const c_void,
             sacl: *const c_void,
         ) -> u32;
+        // SAFETY（宣言）: `DWORD GetSecurityDescriptorLength(PSECURITY_DESCRIPTOR)`（securitybaseapi.h）。
+        // 有効な SD の大きさ（自己相対形式なら内部の SID・ACL を含む全体のバイト数）を返す。
+        fn GetSecurityDescriptorLength(security_descriptor: *mut c_void) -> u32;
         // SAFETY（宣言）: `BOOL GetSecurityDescriptorControl(PSECURITY_DESCRIPTOR, PSECURITY_DESCRIPTOR_CONTROL,
         // LPDWORD)`（securitybaseapi.h）。失敗時は 0（FALSE）。
         fn GetSecurityDescriptorControl(
@@ -208,8 +211,9 @@ mod windows {
         };
         // SAFETY: `src` は生存中の `File` が所有する有効なハンドル。出力引数 `owner_out` / `dacl_out` / `sacl_out`
         // のうち要求する 1 つと `sd` は有効なローカル変数を指し、要求しない group と他の出力には NULL を渡す
-        // （API 仕様で許容）。成功時に返る `sd` は直後に `LocalSecurityDescriptor` が所有し、全経路で 1 回だけ
-        // 解放される。
+        // （API 仕様で許容）。`sd` は成功（ERROR_SUCCESS）を確認してから `LocalSecurityDescriptor` に所有させ、
+        // 以降は全経路で 1 回だけ解放される。失敗時の `sd` は API が値を保証しないため解放しない（不定値の
+        // `LocalFree` よりリーク側に倒す）。
         let rc = unsafe {
             GetSecurityInfo(
                 src.as_raw_handle(),
@@ -222,10 +226,10 @@ mod windows {
                 &mut sd,
             )
         };
-        let sd = LocalSecurityDescriptor(sd);
         if rc != ERROR_SUCCESS {
             return Err(win32_error(rc));
         }
+        let sd = LocalSecurityDescriptor(sd);
         if sd.0.is_null() {
             return Err(std::io::Error::other(
                 "GetSecurityInfo returned no descriptor",
@@ -340,19 +344,32 @@ mod windows {
         if acl.is_null() {
             return Ok(None);
         }
-        // SAFETY: `acl` は `sd` の内部を指す非 NULL の ACL（`sd` はこの関数の末尾まで解放されない）。ACL の先頭
-        // 8 バイトは ACL ヘッダ（AclRevision u8・Sbz1 u8・AclSize u16・AceCount u16・Sbz2 u16）で、AclSize は
-        // ヘッダを含む ACL 全体の大きさ。ヘッダの読み取りは境界合わせを仮定しない `read_unaligned` で行う。
+        let malformed = || std::io::Error::other("malformed ACL");
+        // `GetSecurityInfo` が返す SD は自己相対形式で、ACL はその内部にある。読み取る範囲が SD の内側に
+        // 収まることを、SD の全長と ACL の位置から確かめてから読む。
+        // SAFETY: `sd.0` は `get_part` が取得した有効な自己相対 SD（`sd` の生存中は解放されない）。
+        let sd_len = usize::try_from(unsafe { GetSecurityDescriptorLength(sd.0) })
+            .map_err(|_| malformed())?;
+        let acl_off = (acl as usize)
+            .checked_sub(sd.0 as usize)
+            .ok_or_else(malformed)?;
+        let room = sd_len.checked_sub(acl_off).ok_or_else(malformed)?;
+        if room < 8 {
+            return Err(malformed());
+        }
+        // SAFETY: `acl` は `sd` の内部を指す非 NULL の ACL で、上で `acl` から 8 バイトが SD の内側にあることを
+        // 確認した（`sd` はこの関数の末尾まで解放されない）。ACL の先頭 8 バイトは ACL ヘッダ（AclRevision u8・
+        // Sbz1 u8・AclSize u16・AceCount u16・Sbz2 u16）で、境界合わせを仮定しない `read_unaligned` で読む。
         let size = unsafe { std::ptr::read_unaligned(acl.cast::<u8>().add(2).cast::<u16>()) };
         let size = usize::from(u16::from_le(size));
-        if size < 8 {
-            return Err(std::io::Error::other("malformed ACL"));
+        if size < 8 || size > room {
+            return Err(malformed());
         }
-        // SAFETY: 上記のとおり `acl` から `size`（AclSize）バイトは同じ SD 内の有効な読み取り可能領域で、
-        // `sd` の生存中に限ってコピーする。
+        // SAFETY: `acl` から `size`（AclSize）バイトは、上で SD の全長の内側にあると確認した有効な読み取り可能
+        // 領域で、`sd` の生存中に限ってコピーする。
         let bytes = unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), size) }.to_vec();
         drop(sd);
-        parse_label_acl(&bytes).ok_or_else(|| std::io::Error::other("malformed ACL"))
+        parse_label_acl(&bytes).ok_or_else(malformed)
     }
 
     /// 整合性ラベルの ACL のバイト列から、最初の `SYSTEM_MANDATORY_LABEL_ACE` の（マスク, 整合性レベル RID）を
@@ -376,19 +393,23 @@ mod windows {
             if ace_size < 4 {
                 return None;
             }
+            let ace_end = off.checked_add(ace_size)?;
+            if ace_end > acl.len() {
+                return None;
+            }
             if ace_type == SYSTEM_MANDATORY_LABEL_ACE_TYPE {
                 let mask = le32(off.checked_add(4)?)?;
                 let sid = off.checked_add(8)?;
                 let sub_count = usize::from(*acl.get(sid.checked_add(1)?)?);
-                if sub_count == 0 {
+                let last = sub_count.checked_sub(1)?;
+                let rid_off = sid.checked_add(8)?.checked_add(last.checked_mul(4)?)?;
+                // RID（最後のサブ権限）が ACE の内側に収まること（隣の ACE や ACL の外を読まない）。
+                if rid_off.checked_add(4)? > ace_end {
                     return None;
                 }
-                let rid_off = sid
-                    .checked_add(8)?
-                    .checked_add((sub_count - 1).checked_mul(4)?)?;
                 return Some(Some((mask, le32(rid_off)?)));
             }
-            off = off.checked_add(ace_size)?;
+            off = ace_end;
         }
         Some(None)
     }
@@ -538,8 +559,8 @@ mod unix {
 
     /// `file` に拡張 ACL（パーミッションビットで表せないアクセス制御）があるか。
     ///
-    /// Linux は `system.posix_acl_access` 拡張属性の有無で判定する（基本エントリだけの ACL は拡張属性として
-    /// 保存されないため、あれば拡張 ACL）。ファイルシステムが拡張属性に対応しない（`EOPNOTSUPP`）場合は ACL を
+    /// Linux は `system.posix_acl_access`（基本エントリだけの ACL は拡張属性として保存されないため、あれば拡張
+    /// ACL）と、NFSv4 ACL・richacl・CIFS / SMB3 の ACL を表す拡張属性の有無で判定する（`imp::ACL_XATTRS`）。ファイルシステムが拡張属性に対応しない（`EOPNOTSUPP`）場合は ACL を
     /// 持ちえないので `false`。macOS は `acl_get_fd` が ACL を返せば `true`（`ENOENT` なら `false`）。
     /// それ以外の errno と、判定方法を持たない OS・アーキテクチャは `Err`（呼び出し側は置換を拒否する）。
     pub(crate) fn has_extended_acl(file: &File) -> std::io::Result<bool> {
@@ -567,17 +588,33 @@ mod unix {
             fn fgetxattr(fd: c_int, name: *const c_char, value: *mut c_void, size: usize) -> isize;
         }
 
+        /// アクセス制御を表す拡張属性の名前。POSIX ACL に加え、NFSv4 ACL（NFS クライアント・ZFS 等）・
+        /// richacl・CIFS / SMB3 のセキュリティ記述子も対象にする。いずれかがあれば、パーミッションビットだけでは
+        /// 再現できないアクセス制御を持つとみなす（NFSv4・CIFS 上のファイルは常に該当し、置換は拒否される）。
+        pub(super) const ACL_XATTRS: [&std::ffi::CStr; 6] = [
+            c"system.posix_acl_access",
+            c"system.nfs4_acl",
+            c"system.nfs4_acl_xdr",
+            c"system.richacl",
+            c"system.cifs_acl",
+            c"system.smb3_acl",
+        ];
+
         pub(super) fn has_extended_acl(file: &File) -> std::io::Result<bool> {
-            // SAFETY: `file` は生存中の `File` が所有する有効な fd。`name` は NUL 終端の静的文字列。
-            // `size` に 0 を渡すため `value`（NULL）には書き込まれない。
-            let rc = unsafe {
-                fgetxattr(
-                    file.as_raw_fd(),
-                    c"system.posix_acl_access".as_ptr(),
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
+            for name in ACL_XATTRS {
+                if has_xattr(file, name)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        /// `file` に拡張属性 `name` があるか。ない（`ENODATA`）・ファイルシステムが対応しない（`EOPNOTSUPP`）は
+        /// `false`、それ以外の失敗は `Err`（呼び出し側は置換を拒否する）。
+        fn has_xattr(file: &File, name: &std::ffi::CStr) -> std::io::Result<bool> {
+            // SAFETY: `file` は生存中の `File` が所有する有効な fd。`name` は NUL 終端の文字列で呼び出しの間生存
+            // する。`size` に 0 を渡すため `value`（NULL）には書き込まれない。
+            let rc = unsafe { fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
             if rc >= 0 {
                 return Ok(true);
             }

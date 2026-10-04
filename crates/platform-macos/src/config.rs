@@ -133,6 +133,8 @@ pub enum ConfigError {
     ConsoleLogOpen { kind: std::io::ErrorKind },
     /// コンソールログの上限つき書き出し（pipe・書き出しスレッド）を開始できない。
     ConsoleLogWriter { kind: std::io::ErrorKind },
+    /// 同じコンソールログを別の書き出し（別の VM）が使用中。
+    ConsoleLogInUse { path: PathBuf },
     /// VZ がディスクイメージ attachment を拒否した（NSError の domain / code）。
     DiskAttachment { domain: String, code: isize },
     /// VZ がブロックデバイス識別子を拒否した（NSError の domain / code）。
@@ -175,6 +177,7 @@ impl ConfigError {
             }
             ConfigError::ConsoleLogOpen { .. } => "config.console_log_open",
             ConfigError::ConsoleLogWriter { .. } => "config.console_log_writer",
+            ConfigError::ConsoleLogInUse { .. } => "config.console_log_in_use",
             ConfigError::DiskAttachment { .. } => "config.disk_attachment",
             ConfigError::BlockDeviceIdRejected { .. } => "config.block_device_id_rejected",
         }
@@ -293,6 +296,12 @@ impl ConfigError {
             }
             ConfigError::ConsoleLogWriter { kind } => {
                 format!("failed to start the capped console log writer: {kind}")
+            }
+            ConfigError::ConsoleLogInUse { path } => {
+                format!(
+                    "console log is in use by another virtual machine: {}",
+                    path.display()
+                )
             }
             ConfigError::DiskAttachment { domain, code } => {
                 format!("virtualization framework rejected the disk image ({domain} {code})")
@@ -1017,12 +1026,21 @@ impl VmConfigSpec {
     pub fn open_serial_console(
         &self,
     ) -> Result<Option<crate::console_log::ConsoleLogSink>, ConfigError> {
+        use crate::console_log::{ConsoleLogSink, MAX_CONSOLE_LOG_BYTES, SpawnError};
+        let Some(SerialConsoleSink::LogFile(log)) = self.devices.serial_console() else {
+            return Ok(None);
+        };
+        let log_path = log.as_path();
         let Some(file) = self.open_serial_console_log()? else {
             return Ok(None);
         };
-        crate::console_log::ConsoleLogSink::spawn(file, crate::console_log::MAX_CONSOLE_LOG_BYTES)
-            .map(Some)
-            .map_err(|e| ConfigError::ConsoleLogWriter { kind: e.kind() })
+        match ConsoleLogSink::spawn(file, MAX_CONSOLE_LOG_BYTES) {
+            Ok(sink) => Ok(Some(sink)),
+            Err(SpawnError::InUse) => Err(ConfigError::ConsoleLogInUse {
+                path: log_path.to_path_buf(),
+            }),
+            Err(SpawnError::Io(kind)) => Err(ConfigError::ConsoleLogWriter { kind }),
+        }
     }
 
     /// シリアルコンソールのログファイルを追記モードで開く（無ければ `None`）。

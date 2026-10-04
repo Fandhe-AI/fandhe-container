@@ -20,7 +20,10 @@
 //!   fd を手放したとき）に来る。それまでスレッドは残る（VM 1 台につき 1 本）。呼び出し側は join しない
 //!   （VM が生きている間は終わらないため、join するとハングする）。結果は [`ConsoleLogSink::finish`] で
 //!   期限付きで受け取れる（VZ へ渡す前に閉じる場合のみ。REPAIR-5）。
-//! - 前提: 1 つのログファイルへ同時に書くのは 1 台の VM だけ（上限は open 時のファイル長から数える）。
+//! - 排他: 上限は open 時のファイル長から数えるため、書き出し中はログファイルに排他の advisory lock
+//!   （`File::try_lock`。unix では `flock(2)`）を保持する。同じログを別の VM（本 crate の別の書き出し）が
+//!   使おうとすると [`SpawnError::InUse`] で拒否し、複数の書き出しが上限をそれぞれ使い切ることを防ぐ。lock は
+//!   書き出しスレッドがファイルを閉じる（EOF で終了する）まで保持される。lock に従わない外部プロセスの追記は対象外。
 //!
 //! 上限値 [`MAX_CONSOLE_LOG_BYTES`] は spec に規定がなく暫定値である（下記 doc 参照）。
 
@@ -245,12 +248,33 @@ pub struct ConsoleLogSink {
     outcome: Receiver<ConsoleLogOutcome>,
 }
 
+/// [`ConsoleLogSink::spawn`] の失敗要因。呼び出し側 `config` が `ConfigError` へ写す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnError {
+    /// 同じログファイルを別の書き出しが使用中（排他 lock を取れない）。
+    InUse,
+    /// lock・ファイル長の取得・pipe 作成・スレッド起動の失敗。
+    Io(ErrorKind),
+}
+
+impl From<std::io::Error> for SpawnError {
+    fn from(e: std::io::Error) -> Self {
+        SpawnError::Io(e.kind())
+    }
+}
+
 impl ConsoleLogSink {
-    /// pipe を作り、`file`（検証・追記 open 済み）へゲスト出力をファイル長 `cap` まで書き出すスレッドを起動する。
+    /// `file`（検証・追記 open 済み）の排他 lock を取り、pipe を作り、ゲスト出力をファイル長 `cap` まで書き出す
+    /// スレッドを起動する。
     ///
-    /// 失敗（ファイル長の取得・pipe 作成・スレッド起動）は `io::Error` で返し、その場合 `file` と pipe は drop で閉じる。
-    /// 書き出し中の出来事（上限到達・書き込み / 読み出し失敗）は stderr の構造化ログで報告する。
-    pub(crate) fn spawn(file: File, cap: u64) -> std::io::Result<ConsoleLogSink> {
+    /// lock を取ってからファイル長を読むため、上限の計算は他の書き出しと競合しない。失敗時は `file`（と lock）・
+    /// pipe を drop で閉じる。書き出し中の出来事（上限到達・書き込み / 読み出し失敗）は stderr の構造化ログで報告する。
+    pub(crate) fn spawn(file: File, cap: u64) -> Result<ConsoleLogSink, SpawnError> {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(SpawnError::InUse),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
         let plan = CapPlan::new(cap, file.metadata()?.len());
         let (reader, writer) = std::io::pipe()?;
         let (tx, rx) = mpsc::sync_channel(1);

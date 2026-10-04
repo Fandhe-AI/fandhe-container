@@ -1595,6 +1595,8 @@ mod tests {
                 );
                 assert_eq!(g.mount_calls, 0, "{bad} {victim}");
                 assert!(g.mounts.len() == 1, "{bad} {victim}");
+                // exec mount 前の検証失敗（70〜72）は回復の読み直しをしない（mount 前の 1 回のみ）。
+                assert_eq!(g.cat_calls, 1, "{bad} {victim}");
             }
         }
     }
@@ -1865,20 +1867,25 @@ mod tests {
         assert_eq!(g.cat_calls, 4);
     }
 
-    /// SEC: mount(8) の終了コードがマウント成立と両立しうる値（16）なら、読み直して成立分を外す。
+    /// SEC: mount(8) が失敗コード（2=システムエラー・16・32=マウント失敗）を返しても成立していた場合は、
+    /// 終了コードだけで未成立と決めず、読み直して成立分を外す。
     #[test]
-    fn prepare_rolls_back_mount_with_uncertain_exit_code() {
-        let mut g = Guest::new("virtiofs");
-        g.landed_exit_code = Some(16);
-        let r = req(vec![sm("C:\\a", "a", false)]);
-        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
-        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
-        assert_eq!(
-            e.message(),
-            "mounting the shared directory failed in the distribution (exit code 16)"
-        );
-        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
-        assert_eq!(g.mounts.len(), 1);
+    fn prepare_rolls_back_mount_that_landed_despite_failure_code() {
+        for code in [2, 16, 32] {
+            let mut g = Guest::new("virtiofs");
+            g.landed_exit_code = Some(code);
+            let r = req(vec![sm("C:\\a", "a", false)]);
+            let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+            assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition, "{code}");
+            assert_eq!(
+                e.message(),
+                format!(
+                    "mounting the shared directory failed in the distribution (exit code {code})"
+                )
+            );
+            assert_eq!(g.umounts, ["/mnt/fandhe/a"], "{code}");
+            assert_eq!(g.mounts.len(), 1, "{code}");
+        }
     }
 
     /// REPAIR-5: umount がタイムアウトしても、読み直して自分のマウント ID が消えていれば解除済みとし、

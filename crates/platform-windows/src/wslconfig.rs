@@ -1355,6 +1355,84 @@ mod tests {
         );
     }
 
+    /// WIN-2（レビュー指摘 P1）: 読み込み後に読み取り専用にされたら、置換直前の確認で INTERNAL で拒否し、元の
+    /// 内容を残す（全 OS）。
+    #[test]
+    fn replace_refuses_when_made_read_only_after_load() {
+        let d = TmpDir::new("ro-after-load");
+        std::fs::write(d.file(), "[wsl2]\nmemory=4GB\n").expect("write");
+        let (_, source) = load_verified(&d.file()).expect("load").expect("exists");
+        let set_readonly = |on: bool| {
+            let mut perm = std::fs::metadata(d.file()).expect("stat").permissions();
+            perm.set_readonly(on);
+            std::fs::set_permissions(d.file(), perm).expect("chmod");
+        };
+        set_readonly(true);
+        let e = write_atomic(
+            &d.file(),
+            b"[wsl2]\nmemory=4GB\nvirtiofs=true\n",
+            WriteMode::Replace(source),
+        )
+        .expect_err("must refuse");
+        assert_eq!(e.code(), WinErrorCode::Internal);
+        assert_eq!(
+            e.message(),
+            ".wslconfig was modified concurrently; refusing to replace it"
+        );
+        assert_eq!(
+            std::fs::read(d.file()).expect("read"),
+            b"[wsl2]\nmemory=4GB\n"
+        );
+        assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
+        set_readonly(false);
+    }
+
+    /// WIN-2（レビュー指摘 P1）: 読み込み後にモード（アクセス制御）が変えられたら、置換直前の確認で INTERNAL で
+    /// 拒否する（unix。ACL の付与は ctime を進め同様に検出されるが、付与後の複製元検査が先に拒否する）。
+    #[cfg(unix)]
+    #[test]
+    fn replace_refuses_when_mode_changed_after_load() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = TmpDir::new("mode-after-load");
+        std::fs::write(d.file(), "[wsl2]\nmemory=4GB\n").expect("write");
+        std::fs::set_permissions(d.file(), std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let (_, source) = load_verified(&d.file()).expect("load").expect("exists");
+        std::fs::set_permissions(d.file(), std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        let e = write_atomic(
+            &d.file(),
+            b"[wsl2]\nmemory=4GB\nvirtiofs=true\n",
+            WriteMode::Replace(source),
+        )
+        .expect_err("must refuse");
+        assert_eq!(e.code(), WinErrorCode::Internal);
+        assert_eq!(
+            std::fs::read(d.file()).expect("read"),
+            b"[wsl2]\nmemory=4GB\n"
+        );
+        assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
+    }
+
+    /// WIN-2（レビュー指摘 P1）: 読み込み後に DACL が変えられたら、置換直前の確認で INTERNAL で拒否する（Windows）。
+    #[cfg(windows)]
+    #[test]
+    fn replace_refuses_when_dacl_changed_after_load() {
+        let d = TmpDir::new("dacl-after-load");
+        std::fs::write(d.file(), "[wsl2]\nmemory=4GB\n").expect("write");
+        let (_, source) = load_verified(&d.file()).expect("load").expect("exists");
+        icacls(&d.0, &[".wslconfig", "/grant", "*S-1-5-19:R"]);
+        let e = write_atomic(
+            &d.file(),
+            b"[wsl2]\nmemory=4GB\nvirtiofs=true\n",
+            WriteMode::Replace(source),
+        )
+        .expect_err("must refuse");
+        assert_eq!(e.code(), WinErrorCode::Internal);
+        assert_eq!(
+            std::fs::read(d.file()).expect("read"),
+            b"[wsl2]\nmemory=4GB\n"
+        );
+    }
+
     /// WIN-2・AC2: ファイルがなければ新規作成する。
     #[test]
     fn creates_missing_file() {

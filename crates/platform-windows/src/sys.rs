@@ -654,6 +654,43 @@ mod windows {
             assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
         }
 
+        /// WIN-2: 同じファイルの SD スナップショットは一致し、DACL を変えると変わる。
+        #[test]
+        fn security_snapshot_detects_dacl_change() {
+            let d =
+                TmpDir(std::env::temp_dir().join(format!("fc-sys-snap-{}", std::process::id())));
+            std::fs::create_dir_all(&d.0).expect("mkdir");
+            std::fs::write(d.0.join("f"), b"x").expect("write");
+            let f = File::open(d.0.join("f")).expect("open");
+            let a = security_snapshot(&f).expect("snapshot a");
+            assert!(!a.is_empty());
+            assert_eq!(security_snapshot(&f).expect("snapshot b"), a);
+            icacls(&d.0, &["f", "/grant", "*S-1-5-19:R"]);
+            assert_ne!(security_snapshot(&f).expect("snapshot c"), a);
+        }
+
+        /// WIN-2: 監査用 SACL の検査は、特権が無効な CI のトークンでは観測できず `None`（監査 ACE のない新規
+        /// ファイルを観測できた場合は `Some(false)`）。`Some(true)` の経路は特権の有効化が要るため CI では通らない。
+        #[test]
+        fn has_audit_sacl_without_audit_entries_is_not_true() {
+            let d =
+                TmpDir(std::env::temp_dir().join(format!("fc-sys-sacl-{}", std::process::id())));
+            std::fs::create_dir_all(&d.0).expect("mkdir");
+            std::fs::write(d.0.join("f"), b"x").expect("write");
+            let f = File::open(d.0.join("f")).expect("open");
+            let r = has_audit_sacl(&f).expect("inspect");
+            assert!(matches!(r, None | Some(false)), "{r:?}");
+        }
+
+        /// WIN-2: ACE 種別の列挙は ACE と ACL の境界を確かめる。
+        #[test]
+        fn acl_ace_types_checks_bounds() {
+            let audit: [u8; 16] = [2, 0, 16, 0, 1, 0, 0, 0, 0x02, 0x40, 8, 0, 0, 0, 0, 0];
+            assert_eq!(acl_ace_types(&audit), Some(vec![0x02]));
+            assert_eq!(acl_ace_types(&[2, 0, 8, 0, 0, 0, 0, 0]), Some(vec![]));
+            assert_eq!(acl_ace_types(audit.get(..12).expect("slice")), None);
+        }
+
         /// WIN-2: WRITE_DAC なしで開いた宛先には写せず `Err`（失敗を握りつぶさない）。
         #[test]
         fn copy_security_without_write_dac_fails() {

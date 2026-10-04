@@ -969,10 +969,13 @@ mod windows {
         fn has_named_streams_detects_alternate_data_stream() {
             let d = TmpDir(std::env::temp_dir().join(format!("fc-sys-ads-{}", std::process::id())));
             std::fs::create_dir_all(&d.0).expect("mkdir");
-            std::fs::write(d.0.join("f"), b"x").expect("write");
-            assert!(!has_named_streams(&File::open(d.0.join("f")).expect("open")).expect("plain"));
-            std::fs::write(d.0.join("f:extra"), b"y").expect("write stream");
-            assert!(has_named_streams(&File::open(d.0.join("f")).expect("open")).expect("ads"));
+            // 1 文字の名前に `:` を続けると `Path::join` がドライブ指定（`f:`）と解釈するため、2 文字以上の名前を使う。
+            std::fs::write(d.0.join("data"), b"x").expect("write");
+            assert!(
+                !has_named_streams(&File::open(d.0.join("data")).expect("open")).expect("plain")
+            );
+            std::fs::write(d.0.join("data:extra"), b"y").expect("write stream");
+            assert!(has_named_streams(&File::open(d.0.join("data")).expect("open")).expect("ads"));
         }
 
         /// WIN-2: WRITE_DAC なしで開いた宛先には写せず `Err`（失敗を握りつぶさない）。

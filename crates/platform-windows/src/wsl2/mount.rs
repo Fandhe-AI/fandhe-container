@@ -45,7 +45,7 @@ use super::{
     detect_with_program, run, wsl_exe_path,
 };
 use crate::error::{WinError, WinErrorCode};
-use crate::instrument::{NoopWinOpRecorder, WinOpKind, WinOpRecorder, record_win_op};
+use crate::instrument::{NoopWinOpRecorder, WinOpKind, WinOpRecorder, WinOpTimer, record_win_op};
 use crate::wslconfig::{self, VirtiofsState};
 
 /// ゲスト内のマウント先の基底。マウント先は常に `<基底>/<MountName>`（任意パスへの上書きマウントを不可能にする）。
@@ -1069,9 +1069,21 @@ pub fn release_virtiofs_launch(
     prepared: &PreparedLaunch,
     timeout: Duration,
 ) -> Result<(), Wsl2Error> {
-    check_timeout(timeout)?;
-    let program = wsl_exe_path()?;
-    release_with_program(&program, prepared, timeout)
+    release_virtiofs_launch_with_recorder(prepared, timeout, &NoopWinOpRecorder)
+}
+
+/// [`release_virtiofs_launch`] の計装版（解除全体の成否と所要時間を [`WinOpKind::Wsl2UnmountShared`] として
+/// 1 件記録する。REPAIR-4）。
+pub fn release_virtiofs_launch_with_recorder(
+    prepared: &PreparedLaunch,
+    timeout: Duration,
+    recorder: &dyn WinOpRecorder,
+) -> Result<(), Wsl2Error> {
+    record_win_op(recorder, WinOpKind::Wsl2UnmountShared, || {
+        check_timeout(timeout)?;
+        let program = wsl_exe_path()?;
+        release_with_program(&program, prepared, timeout)
+    })
 }
 
 /// `program` を `wsl.exe` として使う [`release_virtiofs_launch`] の本体。
@@ -1088,6 +1100,18 @@ pub(super) fn release_with_program(
     }
 }
 
+/// [`release_with_exec`] を [`WinOpKind::Wsl2UnmountShared`] として 1 件記録する（1 件でも解除できなければ失敗）。
+fn release_recorded(
+    prepared: &PreparedLaunch,
+    exec: Exec<'_>,
+    recorder: &dyn WinOpRecorder,
+) -> usize {
+    let timer = WinOpTimer::start(recorder, WinOpKind::Wsl2UnmountShared);
+    let failures = release_with_exec(prepared, exec);
+    timer.finish_with(&if failures == 0 { Ok(()) } else { Err(()) });
+    failures
+}
+
 /// [`launch_with`] の成功時の結果: 起動ステップの戻り値と、解除に使う準備済みマウント。
 ///
 /// マウントは呼び出し側（TASK-116）の所有になるため、停止時に `prepared` を [`release_virtiofs_launch`] へ
@@ -1101,40 +1125,73 @@ pub struct Launched<T> {
     pub prepared: PreparedLaunch,
 }
 
-/// 準備成功後に `start` を呼び、`start` が失敗したら準備済みマウントを解除して返す（ロールバック）。
+/// 準備の結果で計測を確定し、成功なら `start` を呼ぶ。`start` が失敗したら準備済みマウントを解除して返す
+/// （ロールバック。解除は [`WinOpKind::Wsl2UnmountShared`] として記録する）。
+fn finish_launch<T>(
+    prepared: Result<PreparedLaunch, Wsl2Error>,
+    timer: WinOpTimer<'_>,
+    exec: Exec<'_>,
+    recorder: &dyn WinOpRecorder,
+    start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
+) -> Result<Launched<T>, Wsl2Error> {
+    timer.finish_with(&prepared);
+    let prepared = prepared?;
+    match start(&prepared) {
+        Ok(value) => Ok(Launched { value, prepared }),
+        Err(e) => {
+            let failures = release_recorded(&prepared, exec, recorder);
+            Err(with_rollback_note(e, failures))
+        }
+    }
+}
+
+/// 模擬実行器で [`launch_with_recorder`] と同じ流れを通す（ユニットテスト用）。
+#[cfg(test)]
 fn launch_with_exec<T>(
     status: &Wsl2Status,
     virtiofs: VirtiofsState,
     req: &LaunchRequest,
     exec: Exec<'_>,
+    recorder: &dyn WinOpRecorder,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
 ) -> Result<Launched<T>, Wsl2Error> {
-    let prepared = prepare_with_exec(status, virtiofs, req, exec)?;
-    match start(&prepared) {
-        Ok(value) => Ok(Launched { value, prepared }),
-        Err(e) => {
-            let failures = release_with_exec(&prepared, exec);
-            Err(with_rollback_note(e, failures))
-        }
-    }
+    let timer = WinOpTimer::start(recorder, WinOpKind::Wsl2MountShared);
+    let prepared = prepare_with_exec(status, virtiofs, req, exec);
+    finish_launch(prepared, timer, exec, recorder, start)
 }
 
 /// 準備（事前判定・マウント・fstype 確認）に成功した場合に限り `start` を呼ぶ。
 ///
 /// 準備失敗時は `start` を呼ばずに `Err` を返す。`start` が `Err` を返した場合は準備済みマウントを
 /// 解除してから `Err` を返す。`start` が `Ok` の場合マウントは呼び出し側（TASK-116）の所有となり、
-/// 戻り値の [`Launched::prepared`] を停止時に [`release_virtiofs_launch`] へ渡して解除する。`start` の中身（ゲスト内のコンテナランタイム起動）は
-/// TASK-116 が注入する。
+/// 戻り値の [`Launched::prepared`] を停止時に [`release_virtiofs_launch`] へ渡して解除する。`start` の中身
+/// （ゲスト内のコンテナランタイム起動）は TASK-116 が注入する。
 pub fn launch_with<T>(
     req: &LaunchRequest,
     timeout: Duration,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
 ) -> Result<Launched<T>, Wsl2Error> {
-    let (program, state) = resolve_environment(timeout)?;
-    launch_with_program(&program, state, req, timeout, start)
+    launch_with_recorder(req, timeout, &NoopWinOpRecorder, start)
 }
 
-/// `program` を `wsl.exe` として使い、`.wslconfig` の状態を `virtiofs` で与える [`launch_with`] の本体。
+/// [`launch_with`] の計装版（REPAIR-4）。準備（環境の解決を含む）を [`WinOpKind::Wsl2MountShared`]、
+/// 起動ステップ失敗時のロールバックを [`WinOpKind::Wsl2UnmountShared`] としてそれぞれ 1 件記録する
+/// （起動ステップ自体は記録しない）。
+pub fn launch_with_recorder<T>(
+    req: &LaunchRequest,
+    timeout: Duration,
+    recorder: &dyn WinOpRecorder,
+    start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
+) -> Result<Launched<T>, Wsl2Error> {
+    let timer = WinOpTimer::start(recorder, WinOpKind::Wsl2MountShared);
+    // 環境の解決に失敗した場合は timer の Drop が Failure を記録する。
+    let (program, state) = resolve_environment(timeout)?;
+    launch_with_program_timed(&program, state, req, timeout, recorder, timer, start)
+}
+
+/// `program` を `wsl.exe` として使い、`.wslconfig` の状態を `virtiofs` で与える [`launch_with`]
+/// （結合試験用の `wsl2::test_support` からのみ使う。計測はしない）。
+#[cfg(feature = "wsl2-test-support")]
 pub(super) fn launch_with_program<T>(
     program: &Path,
     virtiofs: VirtiofsState,
@@ -1142,10 +1199,27 @@ pub(super) fn launch_with_program<T>(
     timeout: Duration,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
 ) -> Result<Launched<T>, Wsl2Error> {
-    check_timeout(timeout)?;
-    let status = detect_with_program(program, timeout)?;
+    let recorder = &NoopWinOpRecorder;
+    let timer = WinOpTimer::start(recorder, WinOpKind::Wsl2MountShared);
+    launch_with_program_timed(program, virtiofs, req, timeout, recorder, timer, start)
+}
+
+fn launch_with_program_timed<'r, T>(
+    program: &Path,
+    virtiofs: VirtiofsState,
+    req: &LaunchRequest,
+    timeout: Duration,
+    recorder: &'r dyn WinOpRecorder,
+    timer: WinOpTimer<'r>,
+    start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
+) -> Result<Launched<T>, Wsl2Error> {
     let mut exec = program_exec(program, timeout);
-    launch_with_exec(&status, virtiofs, req, &mut exec, start)
+    let prepared = (|| {
+        check_timeout(timeout)?;
+        let status = detect_with_program(program, timeout)?;
+        prepare_with_exec(&status, virtiofs, req, &mut exec)
+    })();
+    finish_launch(prepared, timer, &mut exec, recorder, start)
 }
 
 #[cfg(test)]
@@ -1895,6 +1969,33 @@ mod tests {
         assert_eq!(e.code(), Wsl2ErrorCode::InvalidArgument);
     }
 
+    /// REPAIR-4: 公開の起動・解除経路も環境の解決に失敗した場合を含めて 1 件ずつ記録する
+    /// （Windows 以外は `wsl.exe` を解決できず UNIMPLEMENTED）。
+    #[cfg(not(windows))]
+    #[test]
+    fn public_launch_and_release_paths_are_instrumented() {
+        use crate::instrument::WinOpOutcome::Failure;
+        use crate::instrument::testing::Collect;
+        let rec = Collect::default();
+        let e = launch_with_recorder(&req(vec![]), Duration::from_secs(1), &rec, |_| Ok(()))
+            .unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Unimplemented);
+        assert_eq!(rec.kinds(), [(WinOpKind::Wsl2MountShared, Failure)]);
+
+        let mut g = Guest::new("virtiofs");
+        let p = drive(
+            &mut g,
+            &req(vec![sm("C:\\a", "a", false)]),
+            VirtiofsState::Enabled,
+        )
+        .unwrap();
+        let rec = Collect::default();
+        let e =
+            release_virtiofs_launch_with_recorder(&p, Duration::from_secs(1), &rec).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Unimplemented);
+        assert_eq!(rec.kinds(), [(WinOpKind::Wsl2UnmountShared, Failure)]);
+    }
+
     /// 手順 REPAIR-2: 長さ上限は文字数単位（日本語パス・Unicode ディストロ名を誤拒否しない）。
     #[test]
     fn length_limits_count_chars_not_bytes() {
@@ -2101,33 +2202,67 @@ mod tests {
     }
 
     /// 起動ステップが失敗したら準備済みマウントを逆順に解除する。成功時は解除しない。
+    /// REPAIR-4: 準備と（起動ステップ失敗時の）解除をそれぞれ 1 件記録する。
     #[test]
     fn launch_rolls_back_mounts_when_start_fails() {
+        use crate::instrument::WinOpOutcome::{Failure, Success};
+        use crate::instrument::testing::Collect;
         let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", false)]);
         let mut g = Guest::new("virtiofs");
+        let rec = Collect::default();
         let e = launch_with_exec(
             &ok_status(),
             VirtiofsState::Enabled,
             &r,
             &mut |a, m| g.run(a, m),
+            &rec,
             |_| Err::<(), _>(Wsl2Error::new(Wsl2ErrorCode::Internal, "start failed")),
         )
         .unwrap_err();
         assert_eq!(e.code(), Wsl2ErrorCode::Internal);
         assert_eq!(e.message(), "start failed");
         assert_eq!(g.umounts, ["/mnt/fandhe/b", "/mnt/fandhe/a"]);
+        assert_eq!(
+            rec.kinds(),
+            [
+                (WinOpKind::Wsl2MountShared, Success),
+                (WinOpKind::Wsl2UnmountShared, Success)
+            ]
+        );
+
+        // 準備に失敗したら起動ステップを呼ばず、準備の失敗だけを 1 件記録する。
+        let mut g = Guest::new("9p");
+        let rec = Collect::default();
+        let mut called = false;
+        launch_with_exec(
+            &ok_status(),
+            VirtiofsState::Enabled,
+            &r,
+            &mut |a, m| g.run(a, m),
+            &rec,
+            |_| {
+                called = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(!called);
+        assert_eq!(rec.kinds(), [(WinOpKind::Wsl2MountShared, Failure)]);
 
         let mut g = Guest::new("virtiofs");
+        let rec = Collect::default();
         let v = launch_with_exec(
             &ok_status(),
             VirtiofsState::Enabled,
             &r,
             &mut |a, m| g.run(a, m),
+            &rec,
             |p| Ok(p.mounts().len()),
         )
         .unwrap();
         assert_eq!(v.value, 2);
         assert!(g.umounts.is_empty());
+        assert_eq!(rec.kinds(), [(WinOpKind::Wsl2MountShared, Success)]);
         // 成功時は解除に使う準備済みマウントが戻り値で渡され、それで逆順に解除できる。
         let ids: Vec<u32> = v.prepared.mounts().iter().map(|m| m.mount_id).collect();
         assert_eq!(ids, [100, 101]);

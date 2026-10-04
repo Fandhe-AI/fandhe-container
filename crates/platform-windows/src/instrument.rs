@@ -35,6 +35,9 @@ pub enum WinOpKind {
     WslconfigEnableVirtiofs,
     /// virtiofs 共有マウントの準備 1 回（事前判定・マウント・fstype 確認。TASK-67.4）。
     Wsl2MountShared,
+    /// virtiofs 共有マウントの解除 1 回（停止時の解除・起動ステップ失敗時のロールバック。1 件でも解除できな
+    /// ければ失敗。TASK-67.4）。
+    Wsl2UnmountShared,
 }
 
 impl WinOpKind {
@@ -44,6 +47,7 @@ impl WinOpKind {
             WinOpKind::WslconfigLoad => "wslconfig.load",
             WinOpKind::WslconfigEnableVirtiofs => "wslconfig.enable_virtiofs",
             WinOpKind::Wsl2MountShared => "wsl2.mount_shared",
+            WinOpKind::Wsl2UnmountShared => "wsl2.unmount_shared",
         }
     }
 }
@@ -218,10 +222,11 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [WinOpKind; 3] = [
+    const ALL_KINDS: [WinOpKind; 4] = [
         WinOpKind::WslconfigLoad,
         WinOpKind::WslconfigEnableVirtiofs,
         WinOpKind::Wsl2MountShared,
+        WinOpKind::Wsl2UnmountShared,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
@@ -233,6 +238,7 @@ mod tests {
             "wslconfig.enable_virtiofs"
         );
         assert_eq!(WinOpKind::Wsl2MountShared.as_str(), "wsl2.mount_shared");
+        assert_eq!(WinOpKind::Wsl2UnmountShared.as_str(), "wsl2.unmount_shared");
     }
 
     /// REPAIR-4: 操作名は core の `OpName::new` と同じ規則に収まる（本 crate は core に依存できないため

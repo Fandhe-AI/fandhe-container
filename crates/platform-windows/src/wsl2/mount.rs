@@ -3,13 +3,18 @@
 //! Windows のホストディレクトリを WSL2 ディストリ内の固定の基底（[`GUEST_MOUNT_BASE`]）配下へマウントし、
 //! マウントが virtiofs で成立していることを確認してから、呼び出し側が渡す起動ステップへ進む。
 //! 呼び出し元は `fandhe-container-plugin-windows`（TASK-116）。検証・マウントのどこかで失敗した場合は
-//! 起動ステップを呼ばずに構造化エラー（`code` / `message`。ERR-1）を返す（fail-closed）。
+//! 起動ステップを呼ばずに構造化エラー（[`MountError`]。`code` / `message`〔ERR-1〕と、後始末で外せなかった
+//! マウントの所有情報）を返す（fail-closed）。
 //!
 //! 構成:
 //! - 入力の検証済み newtype（[`HostDir`]・[`MountName`]・[`DistroName`]・[`SharedMount`]・[`LaunchRequest`]）。
 //!   生の文字列を `wsl.exe` の引数へ直接連結せず、型で「壊れた値を表現できない」ようにする（REPAIR-2）。
 //! - 純粋関数（事前判定・argv 組み立て・`/proc/self/mountinfo` 解析）。全 OS でユニットテストする。
 //! - 実行部（`run::run_capture` 経由。各呼び出しにタイムアウトを適用する。REPAIR-5）。
+//!
+//! 後始末の追跡の前提: ゲスト内の root は信頼境界の内側として扱い、root や WSL がゲスト内プロセスを強制終了した
+//! 場合の後始末は対象外とする。`/run/fandhe` の残留物（柵の claim・ロックファイル）は tmpfs 上にあり WSL の再起動で
+//! 消える。
 //!
 //! 検証の本体はマウント後の fstype 確認である。`.wslconfig` の `virtiofs=true` はファイル上の設定に過ぎず、
 //! `wsl --shutdown` までは稼働中の VM に反映されないため、設定の確認だけでは virtiofs の成立を保証できない。
@@ -23,8 +28,12 @@
 //! - `mount -t drvfs <Windows パス> <マウント先>` が `virtiofs=true` 有効時に virtiofs で成立するという
 //!   前提、およびマウントオプション `nosuid,nodev` の受理は実機で未検証（PoC-4 は机上調査のみ。WIN-2 の再検証
 //!   条件）。コマンドの組み立ては `mount_argv` に集約しており、実機確認は TASK-67.6（#377）で行う。
-//! - `wsl.exe` を差し替える結合試験（偽 `wsl.exe` のマウント系モード）は未整備。実行部は模擬実行器による
-//!   ユニットテストで検証している。
+//! - 結合試験 `tests/wsl2_mount.rs`（feature `wsl2-test-support`）は、偽 `wsl.exe`（`tests/bin/fake_wsl.rs` の
+//!   マウント系モード）を子プロセスとして起動し、公開 API と同じ経路（検出 → mount → mountinfo によるマウント
+//!   ID・fstype の確認 → 起動ステップ → 解除）と argv の受け渡しを検証する。偽 `wsl.exe` はゲスト内スクリプトを
+//!   解釈しないため、スクリプトの振る舞い（ロック・claim・記録・取り下げ・タイムアウトからの回復）は模擬ゲストの
+//!   ユニットテストで検証し、本物の WSL2 ゲストでの挙動（`flock`・`/run`・`mount.drvfs`）は TASK-67.6（#377）で
+//!   実機確認する。
 //! - 暫定の `WinError` → `Wsl2Error` 変換（`win_error_to_wsl2`）は TASK-67.5（#376）でエラー型を共通化する際に
 //!   置き換える。
 //!

@@ -610,7 +610,8 @@ fn tmp_path(parent: &Path, tag: &str) -> PathBuf {
 /// 調整までの間だけ漏れうるため）。
 /// - unix: 作成時点から所有者のみ（0600）で作る。`acl_from` があれば、拡張 ACL を持つ・別ユーザー所有・
 ///   所有グループを揃えられない場合は内容を書かずに `Err`（置換を拒否）とし、それ以外は所有グループと
-///   パーミッションを揃える。SELinux 等のラベルは同じディレクトリの新規ファイルとしてポリシーに従う。
+///   パーミッションを揃える。揃えた後の一時ファイルが親ディレクトリから ACL を継承していれば（元と実効的な
+///   アクセス制御が一致しないため）同様に拒否する。SELinux 等のラベルは同じディレクトリの新規ファイルとしてポリシーに従う。
 /// - Windows: `acl_from` があれば WRITE_DAC・WRITE_OWNER つきで、元の属性（[`PRESERVED_ATTRIBUTES`]）を
 ///   付けて作り、DACL と整合性ラベルを写す（[`crate::sys::copy_security`]）。元が EFS 暗号化なら一時ファイルも
 ///   暗号化されたことを確かめる（平文で書かない）。いずれかを満たせなければ内容を書かずに `Err`（置換を
@@ -694,6 +695,17 @@ fn fill_new_file(
             }
             f.set_permissions(sm.permissions())
                 .map_err(|e| io_err(&e, "failed to copy file permissions"))?;
+            // 元ファイルに拡張 ACL はない（上で確認済み）ため、一時ファイルも拡張 ACL を持たないことを確かめる。
+            // 親ディレクトリの default ACL（macOS は継承 ACE）を継承していると、モードを写したことで ACL の
+            // マスクが広がり、元ファイルを読めなかった利用者が置換後のファイルを読めうるため拒否する。
+            let inherited = crate::sys::has_extended_acl(f)
+                .map_err(|e| io_err(&e, "failed to inspect file ACL"))?;
+            if inherited {
+                return Err(err(
+                    WinErrorCode::PermissionDenied,
+                    "the replacement would inherit an ACL from the directory; refusing to replace .wslconfig",
+                ));
+            }
         }
         #[cfg(windows)]
         {

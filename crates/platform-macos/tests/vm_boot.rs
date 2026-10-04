@@ -17,8 +17,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fandhe_container_platform_macos::config::{
-    BlockDeviceId, BlockDeviceSpec, ConsoleLogPath, CpuCount, DeviceConfigSpec, DiskImagePath,
-    MEMORY_ALIGNMENT_BYTES, MemorySize, SerialConsoleSink, VmConfigSpec, build_vz_configuration,
+    BlockDeviceId, BlockDeviceSpec, ConfigError, ConsoleLogPath, CpuCount, DeviceConfigSpec,
+    DiskImagePath, MEMORY_ALIGNMENT_BYTES, MemorySize, SerialConsoleSink, VmConfigSpec,
+    build_vz_configuration,
+};
+use fandhe_container_platform_macos::virtiofs::{
+    ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsSharesSpec, VirtiofsTag,
 };
 use fandhe_container_platform_macos::vm::{OpTimeouts, Vm, VmEvent, VmState};
 
@@ -177,6 +181,80 @@ fn mac1_build_vz_configuration_public_api_reads_back() {
     assert_eq!(devs[0].id, "root");
     assert_eq!(cfg.serial_port_count(), 1);
     assert!(log.exists());
+}
+
+/// MAC-1・SEC-4・TASK-65.1: ReadOnly 共有にも共有範囲外経路の検査（symlink の範囲外リンク先・
+/// ハードリンク）を適用する。公開 API の `build_vz_configuration` で、検査に失敗する間は拒否され、
+/// 経路を取り除くと受理されて読み取り専用として読み戻せる。
+#[test]
+fn mac1_build_vz_configuration_readonly_share_escape_checks() {
+    let s = Scratch::new("ro-share", false);
+    let kernel = s.file("vmlinux", b"dummy");
+    let shared = s.dir.join("shared");
+    std::fs::create_dir(&shared).expect("create shared dir");
+    std::fs::write(shared.join("data.txt"), b"d").expect("write shared file");
+    let outside = s.file("outside.txt", b"o");
+    let spec = VmConfigSpec::from_parts(&kernel, None, "console=hvc0")
+        .expect("spec")
+        .with_shared_directories(
+            VirtiofsSharesSpec::try_new(vec![VirtiofsShareSpec::new(
+                VirtiofsTag::try_new("ro").expect("tag"),
+                SharedDirectoryPath::try_new(&shared).expect("shared path"),
+                ShareAccess::ReadOnly,
+            )])
+            .expect("shares"),
+        );
+
+    // 範囲外を指す symlink がある間は拒否する。
+    let link = shared.join("escape");
+    std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+    match build_vz_configuration(&spec) {
+        Err(e) => {
+            assert_eq!(e.code(), "config.shared_dir_symlink_escapes");
+            assert_eq!(
+                e,
+                ConfigError::SharedDirSymlinkEscapes {
+                    path: link.clone(),
+                    share_dir: shared.clone(),
+                }
+            );
+        }
+        Ok(_) => panic!("ReadOnly share with an escaping symlink must be rejected"),
+    }
+    std::fs::remove_file(&link).expect("remove symlink");
+
+    // 共有範囲外のファイルへのハードリンク（リンク数 2）がある間も拒否する。
+    let hard = shared.join("hard");
+    std::fs::hard_link(&outside, &hard).expect("hard link");
+    match build_vz_configuration(&spec) {
+        Err(e) => {
+            assert_eq!(e.code(), "config.shared_dir_hardlinked_file");
+            assert_eq!(
+                e,
+                ConfigError::SharedDirHardlinkedFile {
+                    path: hard.clone(),
+                    links: 2,
+                    share_dir: shared.clone(),
+                }
+            );
+        }
+        Ok(_) => panic!("ReadOnly share with a hard-linked file must be rejected"),
+    }
+    std::fs::remove_file(&hard).expect("remove hard link");
+
+    // 経路を取り除くと受理され、読み取り専用の共有として反映される。
+    let cfg = match build_vz_configuration(&spec) {
+        Ok(c) => c,
+        Err(e) => panic!("clean ReadOnly share must be accepted: {e}"),
+    };
+    let shares = cfg.shared_directories();
+    assert_eq!(shares.len(), 1);
+    assert_eq!(shares[0].tag, "ro");
+    assert!(shares[0].read_only);
+    assert_eq!(
+        shares[0].path.as_ref().and_then(|p| p.canonicalize().ok()),
+        shared.canonicalize().ok()
+    );
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {

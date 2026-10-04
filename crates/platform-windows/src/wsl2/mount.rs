@@ -376,11 +376,15 @@ fn exec_argv(distro: &DistroName, cmd: &[&str]) -> Vec<String> {
 /// 入力は検証済み newtype と 16 進の nonce）。
 ///
 /// 所有の証拠: `mount` の直前と直後に同じプロセス内でマウント先のマウント ID を読み、新しく現れたものが
-/// ちょうど 1 件ならそれを自分のマウントとして標準出力へ書き、`/run/fandhe/<nonce>`（root 所有・`0700` のディレクトリ） にも記録する。`mount` の
+/// ちょうど 1 件ならそれを自分のマウントとして標準出力へ書き（`mount` 自身の標準出力は標準エラーへ回し、
+/// 標準出力にはマウント ID の 1 行だけが載るようにする）、`/run/fandhe/<nonce>`（root 所有・`0700` のディレクトリ） にも記録する。`mount` の
 /// 終了コードによらず記録する（`mount(8)` はマウント成立後の処理でも失敗を返しうるため）。`wsl.exe` の待機が
 /// タイムアウトして標準出力を失っても、呼び出し側は記録を読んで自分のマウントを特定できる。新しいマウントが
 /// 0 件・複数件なら記録しない（呼び出し側は所有を確認できないものとして扱い、外さない）。残る窓（同一プロセス内の
 /// `mount` の前後の読み取りの間）に同じマウント先へマウントできるのはゲスト内の root（CAP_SYS_ADMIN）に限られる。
+///
+/// ディレクトリの作成は、並行する別の準備が先に作った場合（`EEXIST`）も成功として扱い、直後の検証で安全性を
+/// 確かめる（`/run` は tmpfs で WSL の再起動ごとに消えるため、記録ディレクトリの同時作成は起こりうる）。
 ///
 /// 終了コード: 200=`/`・`/mnt`・`/run` が root 所有の他者書き込み不可な実ディレクトリでない・201=ディレクトリ作成
 /// 失敗・202=パス要素が symlink / 非 root 所有 / 他者書き込み可。それ以外は `mount` の終了コードをそのまま返す。
@@ -403,15 +407,15 @@ const MOUNT_SCRIPT: &str = concat!(
     "chk / || exit 200; ",
     "chk /mnt || exit 200; ",
     "chk /run || exit 200; ",
-    "[ -L \"$R\" ] || [ -e \"$R\" ] || mkdir -m 700 -- \"$R\" || exit 201; ",
+    "[ -L \"$R\" ] || [ -e \"$R\" ] || mkdir -m 700 -- \"$R\" 2>/dev/null || [ -d \"$R\" ] || exit 201; ",
     "chk \"$R\" || exit 202; ",
-    "[ -L \"$B\" ] || [ -e \"$B\" ] || mkdir -m 755 -- \"$B\" || exit 201; ",
+    "[ -L \"$B\" ] || [ -e \"$B\" ] || mkdir -m 755 -- \"$B\" 2>/dev/null || [ -d \"$B\" ] || exit 201; ",
     "chk \"$B\" || exit 202; ",
     "T=\"$B/$2\"; ",
-    "[ -L \"$T\" ] || [ -e \"$T\" ] || mkdir -m 755 -- \"$T\" || exit 201; ",
+    "[ -L \"$T\" ] || [ -e \"$T\" ] || mkdir -m 755 -- \"$T\" 2>/dev/null || [ -d \"$T\" ] || exit 201; ",
     "chk \"$T\" || exit 202; ",
     "pre=$(ids \"$T\"); rc=0; ",
-    "mount -t drvfs -o \"$3\" \"$1\" \"$T\" || rc=$?; ",
+    "mount -t drvfs -o \"$3\" \"$1\" \"$T\" >&2 || rc=$?; ",
     "new=; n=0; for i in $(ids \"$T\"); do case \" $pre \" in *\" $i \"*) ;; *) new=$i; n=$((n + 1)) ;; esac; done; ",
     "if [ \"$n\" = 1 ]; then printf '%s\\n' \"$new\" > \"$R/$4\" || :; printf '%s\\n' \"$new\"; fi; ",
     "exit \"$rc\""
@@ -832,7 +836,11 @@ fn mount_one(
                 }
                 _ => Some(step_failed("mounting the shared directory", &out)),
             };
-            let evidence = parse_recorded_id(&out.stdout).map_or(Evidence::Missing, Evidence::Mine);
+            // 標準出力から読めなければ（想定外の出力が混ざった等）、ゲスト内の記録で確かめる。
+            let evidence = match parse_recorded_id(&out.stdout) {
+                Some(id) => Evidence::Mine(id),
+                None => read_record(distro, &nonce, exec),
+            };
             (failure, evidence)
         }
         // 標準出力を失ったので、MOUNT_SCRIPT がゲスト内に残した記録を読む。
@@ -1017,8 +1025,9 @@ pub(super) fn prepare_with_program(
 /// virtiofs 共有マウントを準備する。`timeout` は各 `wsl.exe` 呼び出しに適用する（REPAIR-5）。
 ///
 /// 成功時は全マウントが virtiofs で成立している。失敗時は本呼び出しで作ったマウントを後始末して `Err`。
-/// mount がタイムアウトした等で結果が不確定な場合も mountinfo を読み直して自分のマウントを特定して外す。
-/// 自分のものと確認できないマウントは外さず、メッセージに `mount ownership unconfirmed` を含めて返す。
+/// mount がタイムアウトした等で結果が不確定な場合も、mount したゲスト内プロセスの記録（所有の証拠）で
+/// 自分のマウントを特定して外す。自分のものと確認できないマウントは外さず、メッセージに
+/// `mount ownership unconfirmed` を含めて返す。
 /// 成功後のマウントの所有者は呼び出し側で、不要になったら [`release_virtiofs_launch`] で解除する。
 pub fn prepare_virtiofs_launch(
     req: &LaunchRequest,
@@ -1343,7 +1352,11 @@ mod tests {
         );
         // 検証・mount・所有の特定と記録が同一スクリプト内にあること（TOCTOU 防止・所有の証拠）。
         assert!(MOUNT_SCRIPT.contains(
-            "chk \"$T\" || exit 202; pre=$(ids \"$T\"); rc=0; mount -t drvfs -o \"$3\" \"$1\" \"$T\" || rc=$?; "
+            "chk \"$T\" || exit 202; pre=$(ids \"$T\"); rc=0; mount -t drvfs -o \"$3\" \"$1\" \"$T\" >&2 || rc=$?; "
+        ));
+        // 並行する準備が先にディレクトリを作っても失敗しない（作成後に chk で安全性を確かめる）。
+        assert!(MOUNT_SCRIPT.contains(
+            "mkdir -m 700 -- \"$R\" 2>/dev/null || [ -d \"$R\" ] || exit 201; chk \"$R\" || exit 202; "
         ));
         assert!(MOUNT_SCRIPT.contains(
             "if [ \"$n\" = 1 ]; then printf '%s\\n' \"$new\" > \"$R/$4\" || :; printf '%s\\n' \"$new\"; fi; exit \"$rc\""
@@ -1501,6 +1514,8 @@ mod tests {
         drop_record: bool,
         /// true なら MOUNT_SCRIPT の読み取りの後に、同じマウント先へ他者のマウントが現れる。
         foreign_after_script: bool,
+        /// true なら MOUNT_SCRIPT の標準出力の先頭に想定外の 1 行が混ざる。
+        noisy_stdout: bool,
         /// true なら mount のたびに同じマウント先へ別プロセスのマウントも積む（競合の模擬）。
         extra_on_mount: bool,
         /// true なら nosuid,nodev を無視してマウントする（オプション不成立の模擬）。
@@ -1546,6 +1561,7 @@ mod tests {
                 fail_record_read: false,
                 drop_record: false,
                 foreign_after_script: false,
+                noisy_stdout: false,
                 extra_on_mount: false,
                 drop_nosuid: false,
                 timeout_mount_nth: None,
@@ -1696,6 +1712,9 @@ mod tests {
                             self.records.insert((*nonce).to_string(), *mine);
                         }
                         stdout = format!("{mine}\n");
+                    }
+                    if self.noisy_stdout {
+                        stdout = format!("unexpected helper message\n{stdout}");
                     }
                     if self.foreign_after_script {
                         // スクリプトの読み取りの後に他者のマウントが現れた（証拠には含まれない）。
@@ -2373,5 +2392,17 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.len(), 56);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()), "{a}");
+    }
+
+    /// 標準出力に想定外の行が混ざってマウント ID を読めなくても、ゲスト内の記録で所有を確かめて続行する。
+    #[test]
+    fn prepare_falls_back_to_record_when_stdout_is_noisy() {
+        let mut g = Guest::new("virtiofs");
+        g.noisy_stdout = true;
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
+        assert_eq!(summary(&p), [("/mnt/fandhe/a", 100, false)]);
+        assert_eq!(g.record_reads, 1);
+        assert!(g.umounts.is_empty());
     }
 }

@@ -322,6 +322,13 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
      mount -t virtiofs ro /mnt/ro; mount -t virtiofs rw /mnt/rw; mount -t virtiofs ro_hl /mnt/ro_hl
      ```
 
+     ゲスト側マーカーの用意（手順 3 の観測前に、ゲスト内で `mount` の後に実行する。`abs_link` がゲスト側の同パスへ解決されたときに `GUEST-SIDE-MARKER` が読める状態にしないと、`cat` が単にファイル不存在で失敗して「ホストが辿った / 辿らない」を区別できない）。`<W の値>` は手順 1 の `$W` の展開結果（ホストで `echo "$W"` した絶対パス）を貼る:
+
+     ```sh
+     mkdir -p "<W の値>" && echo GUEST-SIDE-MARKER > "<W の値>/outside.txt"   # abs_link（絶対パス symlink）の解決先
+     echo GUEST-SIDE-MARKER > /mnt/outside.txt                                 # rel_link（`../outside.txt`）の解決先（/mnt/ro の 1 つ上）
+     ```
+
      対応はホストの `$W/ro`・`$W/rw`・`$W/ro_hl` がゲストの `/mnt/ro`・`/mnt/rw`・`/mnt/ro_hl`（タグ名 = mount の第 1 引数）。シリアル入力手段が無い場合は、上の mount と下の観測コマンドをゲスト資産の起動スクリプトに仕込み、結果をコンソールログ（stderr に出るパス）で読む。
   3. ゲスト側の観測: `/mnt/ro` の各 symlink（`abs_link`・`rel_link`・`dangling_link`・`inside_link`）を `readlink`・`cat`・`stat` して読めた内容がホスト側マーカーかゲスト側マーカーかを記録する。`/mnt/rw` 内で `ln -s`（`FUSE_SYMLINK`）・`ln`（`FUSE_LINK`）を実行し、ホスト側の `$W/rw` で `ls -l`・`stat` してリンクの実体・リンク数を記録する。`/mnt/ro_hl/a`・`/mnt/ro_hl/b` の読み取りと `stat` のリンク数も記録する
   4. 判定: ゲスト側マーカーが読める（ホストが辿らない）なら拒否維持の補強のみ。ホスト側マーカーが読めるなら拒否の維持が必須かつ ReadOnly 共有の扱いも見直しが要る（ユーザーへ報告し別 Issue）

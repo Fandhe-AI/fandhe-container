@@ -291,7 +291,12 @@ pub struct PreparedMount {
     /// ゲスト内のマウント先。
     pub guest_path: String,
     /// 本呼び出しが成立させたマウントのカーネルのマウント ID。解除時に所有確認へ使う。
-    pub mount_id: u32,
+    ///
+    /// `None` は「未確定」: mount を取り下げた・記録を確定できなかったため、ゲスト内の記録
+    /// （`/run/fandhe/<nonce>`）からしか所有を確かめられないもの。[`MountError::unreleased`] にだけ現れ、
+    /// [`release_virtiofs_launch`] が記録を読み直して確定したものだけを外す。準備に成功した [`PreparedLaunch`] では
+    /// 常に `Some`。
+    pub mount_id: Option<u32>,
     /// 読み取り専用か。
     pub read_only: bool,
     /// ゲスト内の所有の記録（`/run/fandhe/<nonce>`）の nonce。解除に成功したら記録を消すために使う。
@@ -408,9 +413,11 @@ fn exec_argv(distro: &DistroName, cmd: &[&str]) -> Vec<String> {
 /// 取り下げへの追従: 記録を書いた後に `mkdir /run/fandhe/<nonce>.done` で完了を確定する。呼び出し側が
 /// 待ちきれずに [`ABANDON_SCRIPT`] で先に `.done` を取った（取り下げた）場合や、記録を書けなかった場合は、
 /// 呼び出し側が所有 ID を受け取れないので、本スクリプト自身が自分のマウント（同一プロセス内で特定した ID が
-/// マウント先の最上位であるもの）を外し、記録を消して終わる（209。新しいマウントが無かった場合も 209）。
-/// 外せなかった場合や、新しいマウントが複数あって自分のものを特定できなかった場合は 210（呼び出し側は残置の
-/// 可能性として報告する）。
+/// マウント先の最上位であるもの）を外し、記録・claim・`.done` を消して終わる（209。新しいマウントが無かった
+/// 場合も 209）。外せなかった場合や、新しいマウントが複数あって自分のものを特定できなかった場合は 210 で、記録
+/// （マウント ID または `none`）と `.done` を残して終わる。呼び出し側は未確定の記録として
+/// [`MountError::unreleased`] に載せ、後の [`release_virtiofs_launch`] が [`STATUS_SCRIPT`] で記録を読み直して
+/// 回収する（記録が無ければ 209 で外し終えたとみなす）。
 ///
 /// ディレクトリの作成は、並行する別の準備が先に作った場合（`EEXIST`）も成功として扱い、直後の検証で安全性を
 /// 確かめる（`/run` は tmpfs で WSL の再起動ごとに消えるため、記録ディレクトリの同時作成は起こりうる）。
@@ -464,7 +471,9 @@ const MOUNT_SCRIPT: &str = concat!(
     "x=209; if [ \"$n\" = 1 ]; then ",
     "if [ \"$(top \"$T\")\" = \"$new\" ]; then umount \"$T\" >&2 9>&- || x=210; else x=210; fi; ",
     "elif [ \"$n\" != 0 ]; then x=210; fi; ",
-    "rm -f -- \"$R/$4\" \"$R/$4.tmp\"; rmdir -- \"$R/$4.claim\" \"$R/$4.done\" 2>/dev/null || :; exit \"$x\""
+    "if [ \"$x\" = 209 ]; then rm -f -- \"$R/$4\" \"$R/$4.tmp\"; rmdir -- \"$R/$4.claim\" \"$R/$4.done\" 2>/dev/null || :; ",
+    "else printf '%s\\n' \"$new\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" || :; mkdir -- \"$R/$4.done\" 2>/dev/null || :; fi; ",
+    "exit \"$x\""
 );
 /// [`MOUNT_SCRIPT`] の終了コード（`/`・`/mnt`・`/run` 不正 / ディレクトリ作成失敗 / パス要素が危険 /
 /// 実行権を確保できない）。
@@ -554,6 +563,24 @@ const ABANDON_SCRIPT: &str = concat!(
 /// [`ABANDON_SCRIPT`] の終了コード（取り下げ成立）。
 const EXIT_ABANDONED: i32 = 211;
 
+/// 取り下げた（または記録を確定できなかった）[`MOUNT_SCRIPT`] の状態を、何も作らずに読むスクリプト（`$1`=nonce）。
+/// [`release_virtiofs_launch`] が未確定の記録（マウント ID が `None` の [`PreparedMount`]）を回収するときに使う。
+///
+/// 記録があればその中身（マウント ID または `none`）を出力する。記録が無く claim があれば `mount` の途中なので
+/// 206。どちらも無ければ [`MOUNT_SCRIPT`] が自分のマウントを外して後始末を終えた（209）ので 212。
+const STATUS_SCRIPT: &str = concat!(
+    "if [ -e \"/run/fandhe/$1\" ]; then exec cat -- \"/run/fandhe/$1\"; fi; ",
+    "if [ -d \"/run/fandhe/$1.claim\" ]; then exit 206; fi; exit 212"
+);
+/// [`STATUS_SCRIPT`] の終了コード（記録が確定していない: `mount` の途中）。
+const EXIT_PENDING: i32 = 206;
+/// [`STATUS_SCRIPT`] の終了コード（ゲスト内で後始末済み）。
+const EXIT_GONE: i32 = 212;
+
+fn status_argv(distro: &DistroName, nonce: &str) -> Vec<String> {
+    exec_argv(distro, &["sh", "-c", STATUS_SCRIPT, "sh", nonce])
+}
+
 fn abandon_argv(distro: &DistroName, nonce: &str) -> Vec<String> {
     exec_argv(distro, &["sh", "-c", ABANDON_SCRIPT, "sh", nonce])
 }
@@ -590,8 +617,13 @@ fn clear_record(distro: &DistroName, nonce: &str, exec: Exec<'_>) {
 /// それ以外は `umount` の終了コード（[`MOUNT_SCRIPT`] と同じ理由で、`umount(8)` の終了コード・シグナル終了と
 /// 重ならない 200 番台に置く）。残る窓（同一プロセス内の確認から `umount` まで）に同じマウント先へマウントできるのは
 /// ゲスト内の root（CAP_SYS_ADMIN）に限られ、[`MOUNT_SCRIPT`] と同じく信頼境界の内側として扱う。
+/// 照合と `umount` は [`MOUNT_SCRIPT`] と同じマウント先ごとのロック（`/run/fandhe/lock.<名前>` の `flock`）の下で
+/// 行い、取り下げられた [`MOUNT_SCRIPT`] 自身の後始末と同時に同じマウント先を外さない（ロックを取れなければ 207 で
+/// 外さずに終え、呼び出し側は未解除として扱う）。
 const UMOUNT_SCRIPT: &str = concat!(
-    "set -u; ids=; pars=; ",
+    "set -u; command -v flock > /dev/null || exit 207; exec 9> \"/run/fandhe/lock.${1##*/}\"; w=0; ",
+    "until flock -n 9; do w=$((w + 1)); [ \"$w\" -le 100 ] || exit 207; sleep 0.1; done; ",
+    "ids=; pars=; ",
     "while read -r id par _ _ mp _; do if [ \"$mp\" = \"$1\" ]; then ids=\"$ids $id\"; pars=\"$pars $par\"; fi; ",
     "done < /proc/self/mountinfo; ",
     "top=; n=0; for i in $ids; do case \" $pars \" in *\" $i \"*) ;; *) top=$i; n=$((n + 1)) ;; esac; done; ",
@@ -852,7 +884,8 @@ fn count_fresh_mounts(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OwnedMount {
     guest_path: String,
-    mount_id: u32,
+    /// `None` は未確定（[`PreparedMount::mount_id`] と同じ意味）。
+    mount_id: Option<u32>,
     nonce: String,
     /// 読み取り専用で要求したか（未解除として返す [`PreparedMount`] に引き継ぐ）。
     read_only: bool,
@@ -872,6 +905,22 @@ impl OwnedMount {
 /// [`MountError::unreleased`] に載せる未解除マウントの最大件数（1 回の要求の共有マウント数の上限と同じ。
 /// 未解除になりうるのは本呼び出しが成立させたマウントだけなので、これを超えることはない。REPAIR-5）。
 pub const MAX_UNRELEASED_MOUNTS: usize = MAX_SHARED_MOUNTS;
+
+/// 後始末（[`rollback`]）の結果: やり直せる未解除のマウントと、所有を確かめられず外さなかった件数。
+#[derive(Debug, Default)]
+struct RollbackOutcome {
+    /// 外せなかった・まだ確定していないマウント（[`MountError::unreleased`] に載せ、後から解除をやり直せる）。
+    retry: Vec<OwnedMount>,
+    /// 記録が `none` で自分のマウントを特定できず、外さなかった件数（やり直しても所有を確かめられない）。
+    unconfirmed: usize,
+}
+
+impl RollbackOutcome {
+    /// 後始末が完了しなかった件数。
+    fn failures(&self) -> usize {
+        self.retry.len() + self.unconfirmed
+    }
+}
 
 /// 未解除のマウントを、そのまま [`release_virtiofs_launch`] に渡せる [`PreparedLaunch`] にまとめる（無ければ `None`）。
 fn unreleased_launch(distro: &DistroName, failed: &[OwnedMount]) -> Option<PreparedLaunch> {
@@ -928,10 +977,10 @@ impl MountError {
     }
 
     /// 後始末の失敗件数を `error` のメッセージに添えて、未解除のマウントとともに返す。
-    fn with_unreleased(error: Wsl2Error, distro: &DistroName, failed: &[OwnedMount]) -> Self {
+    fn with_unreleased(error: Wsl2Error, distro: &DistroName, outcome: &RollbackOutcome) -> Self {
         Self {
-            error: with_rollback_note(error, failed.len()),
-            unreleased: unreleased_launch(distro, failed),
+            error: with_rollback_note(error, outcome),
+            unreleased: unreleased_launch(distro, &outcome.retry),
         }
     }
 }
@@ -968,27 +1017,52 @@ impl std::error::Error for MountError {}
 /// mountinfo の読み取りは [`read_mountinfo_bounded`] で有界に再試行する。`umount` が失敗・タイムアウトした
 /// 場合は結果が不確定なため mountinfo を読み直し、記録したマウント ID がどこにも無ければ解除済みとして扱う
 /// （残っている・読めない場合は失敗に数える。再度の `umount` はしない）。
-fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> Vec<OwnedMount> {
-    let mut failed = Vec::new();
+///
+/// マウント ID が未確定（`None`）のものは、先に [`resolve_pending`] でゲスト内の記録を読み直す。記録の ID で
+/// 所有を確かめられたものだけを上と同じ手順で外し、ゲスト内で後始末済み（209）なら完了、まだ `mount` の途中・
+/// 読めないなら未確定のまま `retry` に残す。記録が `none` なら外さず `unconfirmed` に数える（fail-closed）。
+fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> RollbackOutcome {
+    let mut out = RollbackOutcome::default();
     for o in owned.iter().rev() {
+        let id = match o.mount_id {
+            Some(id) => id,
+            None => match resolve_pending(distro, &o.nonce, exec) {
+                Pending::Recorded(id) => id,
+                Pending::Gone => continue,
+                Pending::NotAttributed => {
+                    // MOUNT_SCRIPT は終了済み（記録が確定）なので記録は消してよい。マウントは外さない。
+                    clear_record(distro, &o.nonce, exec);
+                    out.unconfirmed += 1;
+                    continue;
+                }
+                Pending::Unresolved => {
+                    out.retry.push(o.clone());
+                    continue;
+                }
+            },
+        };
+        let o = OwnedMount {
+            mount_id: Some(id),
+            ..o.clone()
+        };
         let Some(entries) = read_mountinfo_bounded(distro, exec) else {
-            failed.push(o.clone());
+            out.retry.push(o);
             continue;
         };
         match find_mount(&entries, &o.guest_path) {
-            Some(e) if e.mount_id == o.mount_id => {
+            Some(e) if e.mount_id == id => {
                 let ok = matches!(
                     exec(
-                        &umount_argv(distro, &o.guest_path, o.mount_id, &o.nonce),
+                        &umount_argv(distro, &o.guest_path, id, &o.nonce),
                         MAX_OUTPUT_BYTES
                     ),
                     Ok(out) if out.success
                 );
                 let gone = ok
                     || read_mountinfo_bounded(distro, exec)
-                        .is_some_and(|after| after.iter().all(|e| e.mount_id != o.mount_id));
+                        .is_some_and(|after| after.iter().all(|e| e.mount_id != id));
                 if !gone {
-                    failed.push(o.clone());
+                    out.retry.push(o);
                 } else if !ok {
                     // UMOUNT_SCRIPT が記録を消す前に終わったが、マウントは外れている。
                     clear_record(distro, &o.nonce, exec);
@@ -996,9 +1070,9 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> Vec<Ow
             }
             _ => {
                 // マウント先に無くても、記録したマウント ID が別のマウント先へ移されて残っていれば未解除。
-                let still_mounted = entries.iter().any(|e| e.mount_id == o.mount_id);
+                let still_mounted = entries.iter().any(|e| e.mount_id == id);
                 if still_mounted {
-                    failed.push(o.clone());
+                    out.retry.push(o);
                 } else {
                     // 既に外れている（解除済み）ので記録も消す。
                     clear_record(distro, &o.nonce, exec);
@@ -1006,21 +1080,55 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> Vec<Ow
             }
         }
     }
-    failed.reverse();
-    failed
+    out.retry.reverse();
+    out
 }
 
-fn with_rollback_note(e: Wsl2Error, failures: usize) -> Wsl2Error {
-    if failures == 0 {
-        return e;
+/// 未確定の記録（[`STATUS_SCRIPT`]）を読み直した結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    /// 記録にマウント ID がある（本呼び出しのマウント。外してよい）。
+    Recorded(u32),
+    /// 記録が `none`（自分のマウントを特定できなかった。外さない）。
+    NotAttributed,
+    /// 記録も claim も無い（ゲスト内の [`MOUNT_SCRIPT`] が自分のマウントを外して後始末を終えた）。
+    Gone,
+    /// まだ `mount` の途中、または読めない（未確定のまま残す）。
+    Unresolved,
+}
+
+/// 未確定の記録を最大 [`MAX_RECOVERY_READS`] 回読み直す（呼び出しごとのタイムアウトで有界。REPAIR-5）。
+fn resolve_pending(distro: &DistroName, nonce: &str, exec: Exec<'_>) -> Pending {
+    for _ in 0..MAX_RECOVERY_READS {
+        match exec(&status_argv(distro, nonce), MAX_OUTPUT_BYTES) {
+            Ok(out) if out.success => {
+                if std::str::from_utf8(&out.stdout).is_ok_and(|t| t.trim() == "none") {
+                    return Pending::NotAttributed;
+                }
+                return parse_recorded_id(&out.stdout)
+                    .map_or(Pending::Unresolved, Pending::Recorded);
+            }
+            Ok(out) if out.code == Some(EXIT_GONE) => return Pending::Gone,
+            Ok(out) if out.code == Some(EXIT_PENDING) => return Pending::Unresolved,
+            _ => {}
+        }
     }
-    Wsl2Error::new(
-        e.code(),
-        format!(
-            "{} ({failures} rollback unmount(s) also failed)",
-            e.message()
-        ),
-    )
+    Pending::Unresolved
+}
+
+fn with_rollback_note(e: Wsl2Error, outcome: &RollbackOutcome) -> Wsl2Error {
+    let mut message = e.message().to_string();
+    let failed = outcome.retry.len();
+    if failed > 0 {
+        message.push_str(&format!(" ({failed} rollback unmount(s) also failed)"));
+    }
+    if outcome.unconfirmed > 0 {
+        message.push_str(&format!(
+            " ({} mount(s) could not be attributed and may have been left in place)",
+            outcome.unconfirmed
+        ));
+    }
+    Wsl2Error::new(e.code(), message)
 }
 
 /// 1 件のマウント（mount）。[`MOUNT_SCRIPT`] が同じプロセス内で特定したマウント ID を所有の証拠として
@@ -1092,9 +1200,17 @@ fn mount_one(
                         "the shared mount could not be recorded and was rolled back in the distribution",
                     ));
                 }
+                // 記録を確定できず、ゲスト内でも外せなかった。MOUNT_SCRIPT は記録（ID または none）を残して
+                // 終わるので、未確定として積み、rollback / release_virtiofs_launch が読み直して回収する。
                 Some(EXIT_GUEST_ROLLBACK_FAILED) => {
+                    owned.push(OwnedMount {
+                        guest_path: m.guest_path(),
+                        mount_id: None,
+                        nonce: nonce.clone(),
+                        read_only: m.read_only,
+                    });
                     return Err(precondition(
-                        "the shared mount could not be recorded (mount ownership unconfirmed; the mount may have been left in place)",
+                        "the shared mount could not be recorded and was not rolled back in the distribution",
                     ));
                 }
                 _ => Some(step_failed("mounting the shared directory", &out)),
@@ -1125,7 +1241,7 @@ fn mount_one(
         Evidence::Mine(mount_id) => {
             owned.push(OwnedMount {
                 guest_path,
-                mount_id,
+                mount_id: Some(mount_id),
                 nonce,
                 read_only: m.read_only,
             });
@@ -1133,13 +1249,19 @@ fn mount_one(
         }
         Evidence::Unreadable => Err(unconfirmed(failure.unwrap_or_else(not_identified))),
         Evidence::Abandoned => {
+            // 取り下げた mount は、ゲスト内の MOUNT_SCRIPT が mount から戻った時点で外す（209）。外せなかった
+            // 場合（210）は記録が残るので、未確定（マウント ID なし）として積み、rollback / release_virtiofs_launch
+            // が記録を読み直して回収する。
+            owned.push(OwnedMount {
+                guest_path,
+                mount_id: None,
+                nonce,
+                read_only: m.read_only,
+            });
             let e = failure.unwrap_or_else(not_identified);
             Err(Wsl2Error::new(
                 e.code(),
-                format!(
-                    "{} (the in-flight mount was abandoned; the distribution rolls it back when the mount returns)",
-                    e.message()
-                ),
+                format!("{} (the in-flight mount was abandoned)", e.message()),
             ))
         }
         Evidence::Missing | Evidence::Fenced => {
@@ -1174,7 +1296,7 @@ fn verify_virtiofs(
     };
     for (m, o) in req.mounts.iter().zip(owned) {
         match find_mount(&after, &o.guest_path) {
-            Some(e) if e.mount_id != o.mount_id => {
+            Some(e) if Some(e.mount_id) != o.mount_id => {
                 return Err(precondition(
                     "a shared mount was replaced by another mount after mounting",
                 ));
@@ -1322,8 +1444,9 @@ pub fn prepare_virtiofs_launch_with_recorder(
     })
 }
 
-/// 準備済みマウントを逆順に best-effort で解除する（マウント ID が一致するものだけ）。外せなかったものを返す。
-fn release_with_exec(prepared: &PreparedLaunch, exec: Exec<'_>) -> Vec<OwnedMount> {
+/// 準備済みマウントを逆順に best-effort で解除する（マウント ID が一致するもの・未確定の記録で所有を確かめられた
+/// ものだけ）。後始末の結果を返す。
+fn release_with_exec(prepared: &PreparedLaunch, exec: Exec<'_>) -> RollbackOutcome {
     let owned: Vec<OwnedMount> = prepared
         .mounts
         .iter()
@@ -1340,7 +1463,10 @@ fn release_with_exec(prepared: &PreparedLaunch, exec: Exec<'_>) -> Vec<OwnedMoun
 /// [`prepare_virtiofs_launch`] で成立させたマウントを解除する（コンテナ停止後の後始末用）。
 ///
 /// 解除に失敗したマウントがあれば `FAILED_PRECONDITION`（件数のみをメッセージに載せる）。外せなかった
-/// マウントは [`MountError::unreleased`] に載せて返すので、それを再び本関数へ渡して後始末をやり直せる。
+/// マウント・まだ確定していない記録は [`MountError::unreleased`] に載せて返すので、それを再び本関数へ渡して
+/// 後始末をやり直せる（件数は [`MAX_UNRELEASED_MOUNTS`] 以下）。未確定の記録（マウント ID が `None`）は
+/// ゲスト内の記録を読み直し、記録の ID で所有を確かめられたものだけを外す。ゲスト内で既に外し終えていれば
+/// 完了として扱い、記録が `none`（自分のマウントを特定できない）なら外さずに件数だけを報告する（fail-closed）。
 pub fn release_virtiofs_launch(
     prepared: &PreparedLaunch,
     timeout: Duration,
@@ -1370,13 +1496,20 @@ pub(super) fn release_with_program(
 ) -> Result<(), MountError> {
     check_timeout(timeout)?;
     let mut exec = program_exec(program, timeout);
-    let failed = release_with_exec(prepared, &mut exec);
-    if failed.is_empty() {
+    let outcome = release_with_exec(prepared, &mut exec);
+    if outcome.failures() == 0 {
         return Ok(());
     }
+    let mut message = format!("{} unmount(s) failed", outcome.retry.len());
+    if outcome.unconfirmed > 0 {
+        message.push_str(&format!(
+            " ({} mount(s) could not be attributed and may have been left in place)",
+            outcome.unconfirmed
+        ));
+    }
     Err(MountError {
-        error: precondition(format!("{} unmount(s) failed", failed.len())),
-        unreleased: unreleased_launch(&prepared.distro, &failed),
+        error: precondition(message),
+        unreleased: unreleased_launch(&prepared.distro, &outcome.retry),
     })
 }
 
@@ -1385,11 +1518,15 @@ fn release_recorded(
     prepared: &PreparedLaunch,
     exec: Exec<'_>,
     recorder: &dyn WinOpRecorder,
-) -> Vec<OwnedMount> {
+) -> RollbackOutcome {
     let timer = WinOpTimer::start(recorder, WinOpKind::Wsl2UnmountShared);
-    let failed = release_with_exec(prepared, exec);
-    timer.finish_with(&if failed.is_empty() { Ok(()) } else { Err(()) });
-    failed
+    let outcome = release_with_exec(prepared, exec);
+    timer.finish_with(&if outcome.failures() == 0 {
+        Ok(())
+    } else {
+        Err(())
+    });
+    outcome
 }
 
 /// [`launch_with`] の成功時の結果: 起動ステップの戻り値と、解除に使う準備済みマウント。
@@ -1724,6 +1861,21 @@ mod tests {
         assert!(MOUNT_SCRIPT.contains(
             "x=209; if [ \"$n\" = 1 ]; then if [ \"$(top \"$T\")\" = \"$new\" ]; then umount \"$T\" >&2 9>&- || x=210; else x=210; fi; elif [ \"$n\" != 0 ]; then x=210; fi; "
         ));
+        // 210 では記録（ID または none）と .done を残し、後の release が STATUS_SCRIPT で回収できるようにする。
+        assert!(MOUNT_SCRIPT.contains(
+            "else printf '%s\\n' \"$new\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" || :; mkdir -- \"$R/$4.done\" 2>/dev/null || :; fi; exit \"$x\""
+        ));
+        assert!(
+            STATUS_SCRIPT
+                .ends_with("if [ -d \"/run/fandhe/$1.claim\" ]; then exit 206; fi; exit 212")
+        );
+        assert!(UMOUNT_SCRIPT.starts_with(
+            "set -u; command -v flock > /dev/null || exit 207; exec 9> \"/run/fandhe/lock.${1##*/}\"; "
+        ));
+        assert_eq!(
+            status_argv(&d, "00ff").get(9).map(String::as_str),
+            Some("00ff")
+        );
         assert!(
             ABANDON_SCRIPT.starts_with(
                 "if mkdir -- \"/run/fandhe/$1.done\" 2>/dev/null; then exit 211; fi; "
@@ -1923,8 +2075,12 @@ mod tests {
         pending: Option<(String, String, String)>,
         /// true なら取り下げの直前に `pending` の mount が完了する。
         complete_before_abandon: bool,
-        /// true なら MOUNT_SCRIPT が記録を書けない。
+        /// true なら MOUNT_SCRIPT が記録を書けない（最初の書き込みだけ失敗し、210 での書き直しは成功する）。
         fail_record_write: bool,
+        /// true なら取り下げ・記録失敗の後でゲスト内の自分のマウントを外せない（210）。
+        self_umount_fails: bool,
+        /// STATUS_SCRIPT の呼び出し回数。
+        status_reads: usize,
         /// 取り下げ（ABANDON_SCRIPT）の呼び出し回数。
         abandon_calls: usize,
         /// true なら MOUNT_SCRIPT の読み取りの後に、同じマウント先へ他者のマウントが現れる。
@@ -1985,6 +2141,8 @@ mod tests {
                 pending: None,
                 complete_before_abandon: false,
                 fail_record_write: false,
+                self_umount_fails: false,
+                status_reads: 0,
                 abandon_calls: 0,
                 foreign_after_script: false,
                 noisy_stdout: false,
@@ -2046,7 +2204,7 @@ mod tests {
             let mut code = if fresh.len() > 1 { 210 } else { 209 };
             if let Some(m) = mine {
                 match self.mounts.iter().rposition(|(p, _)| p == target) {
-                    Some(i) if self.ids.get(i) == Some(&m) => {
+                    Some(i) if self.ids.get(i) == Some(&m) && !self.self_umount_fails => {
                         self.mounts.remove(i);
                         self.ids.remove(i);
                         self.opts.remove(i);
@@ -2054,9 +2212,16 @@ mod tests {
                     _ => code = 210,
                 }
             }
-            self.records.remove(nonce);
-            self.claims.remove(nonce);
-            self.dones.remove(nonce);
+            if code == 209 {
+                self.records.remove(nonce);
+                self.claims.remove(nonce);
+                self.dones.remove(nonce);
+            } else {
+                // 210: 記録（ID または none）を書き直し、.done を残す（記録の書き込みの失敗は最初の 1 回だけ）。
+                let record = mine.map_or_else(|| "none".to_string(), |m| m.to_string());
+                self.records.insert(nonce.to_string(), record);
+                self.dones.insert(nonce.to_string());
+            }
             Err(code)
         }
 
@@ -2268,6 +2433,15 @@ mod tests {
                         None => fail_cat(206),
                     }
                 }
+                ["sh", "-c", script, "sh", nonce] if *script == STATUS_SCRIPT => {
+                    // STATUS_SCRIPT の模擬: 記録があれば中身、claim だけなら 206、どちらも無ければ 212。
+                    self.status_reads += 1;
+                    match self.records.get(*nonce) {
+                        Some(v) => ok(format!("{v}\n")),
+                        None if self.claims.contains(*nonce) => fail_cat(EXIT_PENDING),
+                        None => fail_cat(EXIT_GONE),
+                    }
+                }
                 ["sh", "-c", script, "sh", nonce] if *script == CLEAR_SCRIPT => {
                     // CLEAR_SCRIPT の模擬: 記録・claim・done を消す。
                     self.clears += 1;
@@ -2317,7 +2491,7 @@ mod tests {
     }
 
     /// 準備済みマウントの (マウント先・マウント ID・読み取り専用か)。
-    fn summary(p: &PreparedLaunch) -> Vec<(&str, u32, bool)> {
+    fn summary(p: &PreparedLaunch) -> Vec<(&str, Option<u32>, bool)> {
         p.mounts()
             .iter()
             .map(|m| (m.guest_path.as_str(), m.mount_id, m.read_only))
@@ -2342,7 +2516,10 @@ mod tests {
         assert_eq!(p.distro().as_str(), "Ubuntu");
         assert_eq!(
             summary(&p),
-            [("/mnt/fandhe/a", 100, false), ("/mnt/fandhe/b", 101, true)]
+            [
+                ("/mnt/fandhe/a", Some(100), false),
+                ("/mnt/fandhe/b", Some(101), true)
+            ]
         );
         assert!(g.umounts.is_empty());
         // 所有の記録と claim は呼び出しごとの nonce で、解除するまで残る。
@@ -2350,7 +2527,7 @@ mod tests {
         recorded.sort_unstable();
         assert_eq!(recorded, ["100", "101"]);
         assert_eq!(g.claims.len(), 2);
-        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).len(), 0);
+        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).failures(), 0);
         assert!(g.records.is_empty());
         assert!(g.claims.is_empty());
     }
@@ -2595,7 +2772,7 @@ mod tests {
         g.mounts.push(("/mnt/fandhe/a".into(), "tmpfs".into()));
         g.ids.push(777);
         g.opts.push("rw".into());
-        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).len();
+        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).failures();
         assert_eq!(failures, 1);
         assert!(g.umounts.is_empty());
     }
@@ -2607,7 +2784,7 @@ mod tests {
         let r = req(vec![sm("C:\\a", "a", false)]);
         let owned = vec![OwnedMount {
             guest_path: "/mnt/fandhe/a".into(),
-            mount_id: 100,
+            mount_id: Some(100),
             nonce: "00ff".into(),
             read_only: false,
         }];
@@ -2632,7 +2809,7 @@ mod tests {
             .position(|(m, _)| m == "/mnt/fandhe/a")
             .unwrap();
         g.ids[i] = 9999;
-        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).len();
+        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).failures();
         assert_eq!(failures, 0);
         assert_eq!(g.umounts, ["/mnt/fandhe/b"]);
         assert!(g.mounts.iter().any(|(m, _)| m == "/mnt/fandhe/a"));
@@ -2652,7 +2829,7 @@ mod tests {
             .position(|(m, _)| m == "/mnt/fandhe/a")
             .unwrap();
         g.mounts[i].0 = "/elsewhere".into();
-        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).len();
+        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).failures();
         assert_eq!(failures, 1);
         assert!(g.umounts.is_empty());
         // どこにも残っていなければ解除済みとして成功扱い。
@@ -2660,7 +2837,7 @@ mod tests {
         g.ids.remove(i);
         g.opts.remove(i);
         assert_eq!(g.records.len(), 1);
-        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).len(), 0);
+        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).failures(), 0);
         assert!(g.records.is_empty() && g.claims.is_empty());
     }
 
@@ -2727,10 +2904,15 @@ mod tests {
         assert!(g.umounts.is_empty());
         assert_eq!(rec.kinds(), [(WinOpKind::Wsl2MountShared, Success)]);
         // 成功時は解除に使う準備済みマウントが戻り値で渡され、それで逆順に解除できる。
-        let ids: Vec<u32> = v.prepared.mounts().iter().map(|m| m.mount_id).collect();
+        let ids: Vec<u32> = v
+            .prepared
+            .mounts()
+            .iter()
+            .filter_map(|m| m.mount_id)
+            .collect();
         assert_eq!(ids, [100, 101]);
         assert_eq!(
-            release_with_exec(&v.prepared, &mut |a, m| g.run(a, m)).len(),
+            release_with_exec(&v.prepared, &mut |a, m| g.run(a, m)).failures(),
             0
         );
         assert_eq!(g.umounts, ["/mnt/fandhe/b", "/mnt/fandhe/a"]);
@@ -2826,7 +3008,7 @@ mod tests {
         g.fail_cat_times = 1;
         let r = req(vec![sm("C:\\a", "a", false)]);
         let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
-        assert_eq!(summary(&p), [("/mnt/fandhe/a", 100, false)]);
+        assert_eq!(summary(&p), [("/mnt/fandhe/a", Some(100), false)]);
         assert!(g.umounts.is_empty());
         // mount 前 1 回 + 検証 2 回（1 回失敗。所有は MOUNT_SCRIPT の標準出力で確定するので読まない）。
         assert_eq!(g.cat_calls, 3);
@@ -2862,7 +3044,7 @@ mod tests {
             let mut g = Guest::new("virtiofs");
             let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
             g.umount_timeout = Some(landed);
-            let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).len();
+            let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).failures();
             assert_eq!(failures, want, "landed={landed}");
             assert_eq!(g.umounts, ["/mnt/fandhe/a"], "landed={landed}");
         }
@@ -2876,7 +3058,7 @@ mod tests {
         let r = req(vec![sm("C:\\a", "a", false)]);
         let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
         g.stack_before_umount = true;
-        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).len();
+        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m)).failures();
         assert_eq!(failures, 1);
         assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
         assert_eq!(g.ids, [1, 100, 101]);
@@ -2912,13 +3094,13 @@ mod tests {
         g.reverse_mountinfo = true;
         let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", false)]);
         let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
-        let ids: Vec<u32> = p.mounts().iter().map(|m| m.mount_id).collect();
+        let ids: Vec<u32> = p.mounts().iter().filter_map(|m| m.mount_id).collect();
         assert_eq!(ids, [100, 101]);
         // a の上に他者のマウントを積む（行は逆順で出力される）。
         g.mounts.push(("/mnt/fandhe/a".into(), "tmpfs".into()));
         g.ids.push(777);
         g.opts.push("rw".into());
-        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).len(), 1);
+        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).failures(), 1);
         assert_eq!(g.umounts, ["/mnt/fandhe/b"]);
         assert_eq!(g.ids, [1, 100, 777]);
     }
@@ -2934,15 +3116,54 @@ mod tests {
         assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
         assert_eq!(
             e.message(),
-            "wsl.exe did not finish before the deadline (the in-flight mount was abandoned; the distribution rolls it back when the mount returns)"
+            "wsl.exe did not finish before the deadline (the in-flight mount was abandoned) (1 rollback unmount(s) also failed)"
         );
         assert_eq!(g.record_reads, MAX_RECOVERY_READS);
         assert_eq!(g.abandon_calls, 1);
+        assert!(g.umounts.is_empty());
+        // 取り下げた mount はマウント ID 未確定（None）の記録として返る。
+        let left = e.unreleased().unwrap().clone();
+        assert_eq!(summary(&left), [("/mnt/fandhe/a", None, false)]);
+        // まだ mount の途中なら、release は何も外さず未確定のまま返す。
+        let out = release_with_exec(&left, &mut |a, m| g.run(a, m));
+        assert_eq!((out.retry.len(), out.unconfirmed), (1, 0));
+        assert_eq!(out.retry.first().map(|o| o.mount_id), Some(None));
         assert!(g.umounts.is_empty());
         // 遅れて mount が成立 → 取り下げ済みなのでゲスト内で自分のマウントを外して 209 で終わる。
         assert_eq!(g.finish_pending(), Some(EXIT_ROLLED_BACK_IN_GUEST));
         assert_eq!(g.ids, [1]);
         assert!(g.records.is_empty() && g.claims.is_empty() && g.dones.is_empty());
+        // ゲスト内で後始末済みなら、返された記録の release は成功として扱う。
+        assert_eq!(
+            release_with_exec(&left, &mut |a, m| g.run(a, m)).failures(),
+            0
+        );
+        assert!(g.umounts.is_empty());
+    }
+
+    /// 取り下げ後にゲスト内で自分のマウントを外せなかった（210）場合も、記録に残った ID で、返された未確定の
+    /// 記録を既存の release に渡して回収できる。
+    #[test]
+    fn release_recovers_abandoned_mount_left_by_guest() {
+        let mut g = Guest::new("virtiofs");
+        g.hang_mount = true;
+        g.self_umount_fails = true;
+        let r = req(vec![sm("C:\\a", "a", true)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        let left = e.unreleased().unwrap().clone();
+        assert_eq!(summary(&left), [("/mnt/fandhe/a", None, true)]);
+        assert_eq!(g.finish_pending(), Some(EXIT_GUEST_ROLLBACK_FAILED));
+        assert_eq!(g.ids, [1, 100]);
+        assert_eq!(
+            g.records.values().map(String::as_str).collect::<Vec<_>>(),
+            ["100"]
+        );
+        let out = release_with_exec(&left, &mut |a, m| g.run(a, m));
+        assert_eq!(out.failures(), 0);
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+        assert_eq!(g.ids, [1]);
+        assert!(g.records.is_empty() && g.claims.is_empty() && g.dones.is_empty());
+        assert_eq!(g.status_reads, 2);
     }
 
     /// 取り下げの直前に mount が完了していれば、取り下げは成立せず記録の ID で所有してロールバックで外す。
@@ -3066,7 +3287,7 @@ mod tests {
         g.noisy_stdout = true;
         let r = req(vec![sm("C:\\a", "a", false)]);
         let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
-        assert_eq!(summary(&p), [("/mnt/fandhe/a", 100, false)]);
+        assert_eq!(summary(&p), [("/mnt/fandhe/a", Some(100), false)]);
         assert_eq!(g.record_reads, 1);
         assert!(g.umounts.is_empty());
     }
@@ -3103,12 +3324,15 @@ mod tests {
         let r = req(vec![sm("C:\\a", "a", false)]);
         let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
         assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        // 210 の記録は none（自分のマウントを特定できない）なので、外さず件数だけを報告し、やり直し対象にもしない。
         assert_eq!(
             e.message(),
-            "the shared mount could not be recorded (mount ownership unconfirmed; the mount may have been left in place)"
+            "the shared mount could not be recorded and was not rolled back in the distribution (1 mount(s) could not be attributed and may have been left in place)"
         );
+        assert_eq!(e.unreleased(), None);
         assert!(g.umounts.is_empty());
         assert_eq!(g.ids, [1, 100, 101]);
+        assert!(g.records.is_empty() && g.claims.is_empty());
     }
 
     /// 後始末（ロールバック）で外せなかったマウントは、マウント先・ID・nonce を持つ PreparedLaunch として
@@ -3129,11 +3353,17 @@ mod tests {
         assert_eq!(left.distro().as_str(), "Ubuntu");
         assert_eq!(
             summary(left),
-            [("/mnt/fandhe/a", 100, false), ("/mnt/fandhe/b", 101, true)]
+            [
+                ("/mnt/fandhe/a", Some(100), false),
+                ("/mnt/fandhe/b", Some(101), true)
+            ]
         );
         // 原因が解消すれば、返された情報でそのまま後始末をやり直せる。
         g.umount_timeout = None;
-        assert_eq!(release_with_exec(left, &mut |a, m| g.run(a, m)).len(), 0);
+        assert_eq!(
+            release_with_exec(left, &mut |a, m| g.run(a, m)).failures(),
+            0
+        );
         assert_eq!(g.ids, [1]);
         assert!(g.records.is_empty() && g.claims.is_empty());
 
@@ -3163,13 +3393,13 @@ mod tests {
         );
         let left = e.unreleased().unwrap();
         assert_eq!(left.mounts().len(), MAX_UNRELEASED_MOUNTS);
-        assert_eq!(left.mounts().first().map(|m| m.mount_id), Some(100));
-        assert_eq!(left.mounts().last().map(|m| m.mount_id), Some(115));
+        assert_eq!(left.mounts().first().map(|m| m.mount_id), Some(Some(100)));
+        assert_eq!(left.mounts().last().map(|m| m.mount_id), Some(Some(115)));
         // 上限を超える入力が来ても切り詰める（呼び出し側の PreparedLaunch は上限以下しか作れない）。
         let many: Vec<OwnedMount> = (0..20)
             .map(|i| OwnedMount {
                 guest_path: format!("/mnt/fandhe/x{i}"),
-                mount_id: 200 + i,
+                mount_id: Some(200 + i),
                 nonce: "00ff".into(),
                 read_only: false,
             })
@@ -3213,7 +3443,7 @@ mod tests {
         );
         assert_eq!(
             e.unreleased().map(summary),
-            Some(vec![("/mnt/fandhe/a", 100, false)])
+            Some(vec![("/mnt/fandhe/a", Some(100), false)])
         );
     }
 }

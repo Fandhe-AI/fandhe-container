@@ -85,7 +85,7 @@ fn prepare_then_release_through_fake_wsl() {
         .unwrap();
     assert_eq!(p.transport(), SharedTransport::Virtiofs);
     assert_eq!(p.distro().as_str(), "Ubuntu");
-    let got: Vec<(&str, u32, bool)> = p
+    let got: Vec<(&str, Option<u32>, bool)> = p
         .mounts()
         .iter()
         .map(|m: &PreparedMount| (m.guest_path.as_str(), m.mount_id, m.read_only))
@@ -93,8 +93,8 @@ fn prepare_then_release_through_fake_wsl() {
     assert_eq!(
         got,
         vec![
-            ("/mnt/fandhe/work", 100, false),
-            ("/mnt/fandhe/data", 101, true)
+            ("/mnt/fandhe/work", Some(100), false),
+            ("/mnt/fandhe/data", Some(101), true)
         ]
     );
     assert_eq!(mounted(&exe), ["/mnt/fandhe/work", "/mnt/fandhe/data"]);

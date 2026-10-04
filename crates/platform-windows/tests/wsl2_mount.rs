@@ -128,7 +128,7 @@ fn prepare_refuses_without_virtiofs_opt_in() {
 }
 
 /// AC2・REPAIR-5: 起動ステップが失敗したら準備済みマウントを外し、起動ステップのエラーを返す。
-/// 成功時は起動ステップの戻り値を返し、マウントは呼び出し側の所有として残る。
+/// 成功時は起動ステップの戻り値と解除用の準備済みマウントを返し、マウントは呼び出し側の所有として残る。
 #[test]
 fn launch_rolls_back_when_start_fails_through_fake_wsl() {
     let exe = fresh_fake("mount_launch");
@@ -147,6 +147,9 @@ fn launch_rolls_back_when_start_fails_through_fake_wsl() {
         Ok(p.mounts().len())
     })
     .unwrap();
-    assert_eq!(n, 2);
+    assert_eq!(n.value, 2);
     assert_eq!(mounted(&exe), ["/mnt/fandhe/work", "/mnt/fandhe/data"]);
+    // 戻り値の準備済みマウントで解除できる（解除に必要な所有情報が呼び出し側へ渡る）。
+    release_virtiofs_launch_with_program(&exe, &n.prepared, TIMEOUT).unwrap();
+    assert!(mounted(&exe).is_empty());
 }

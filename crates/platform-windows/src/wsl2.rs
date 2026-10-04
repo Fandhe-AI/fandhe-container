@@ -26,10 +26,10 @@ mod parse;
 mod run;
 
 pub use mount::{
-    DistroName, GUEST_MOUNT_BASE, HostDir, LaunchRequest, MAX_DISTRO_NAME_LEN, MAX_HOST_DIR_LEN,
-    MAX_MOUNT_NAME_LEN, MAX_SHARED_MOUNTS, MountName, PreparedLaunch, PreparedMount, SharedMount,
-    SharedTransport, launch_with, prepare_virtiofs_launch, prepare_virtiofs_launch_with_recorder,
-    release_virtiofs_launch,
+    DistroName, GUEST_MOUNT_BASE, HostDir, LaunchRequest, Launched, MAX_DISTRO_NAME_LEN,
+    MAX_HOST_DIR_LEN, MAX_MOUNT_NAME_LEN, MAX_SHARED_MOUNTS, MountName, PreparedLaunch,
+    PreparedMount, SharedMount, SharedTransport, launch_with, prepare_virtiofs_launch,
+    prepare_virtiofs_launch_with_recorder, release_virtiofs_launch,
 };
 
 use std::error::Error;
@@ -289,7 +289,9 @@ pub mod test_support {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{LaunchRequest, PreparedLaunch, Wsl2Error, Wsl2Status, WslDistro, WslVersionInfo};
+    use super::{
+        LaunchRequest, Launched, PreparedLaunch, Wsl2Error, Wsl2Status, WslDistro, WslVersionInfo,
+    };
     use crate::wslconfig::VirtiofsState;
 
     /// `program` を `wsl.exe` とみなす [`super::query_version`]。
@@ -340,7 +342,7 @@ pub mod test_support {
         req: &LaunchRequest,
         timeout: Duration,
         start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
-    ) -> Result<T, Wsl2Error> {
+    ) -> Result<Launched<T>, Wsl2Error> {
         super::mount::launch_with_program(program, virtiofs, req, timeout, start)
     }
 }

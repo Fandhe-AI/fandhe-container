@@ -976,6 +976,19 @@ pub(super) fn release_with_program(
     }
 }
 
+/// [`launch_with`] の成功時の結果: 起動ステップの戻り値と、解除に使う準備済みマウント。
+///
+/// マウントは呼び出し側（TASK-116）の所有になるため、停止時に `prepared` を [`release_virtiofs_launch`] へ
+/// 渡して解除する（解除に必要な所有情報〔マウント先・マウント ID〕を戻り値で明示的に引き渡す）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Launched<T> {
+    /// 起動ステップ `start` の戻り値。
+    pub value: T,
+    /// 起動ステップに渡した準備済みマウント（解除時に [`release_virtiofs_launch`] へ渡す）。
+    pub prepared: PreparedLaunch,
+}
+
 /// 準備成功後に `start` を呼び、`start` が失敗したら準備済みマウントを解除して返す（ロールバック）。
 fn launch_with_exec<T>(
     status: &Wsl2Status,
@@ -983,10 +996,10 @@ fn launch_with_exec<T>(
     req: &LaunchRequest,
     exec: Exec<'_>,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
-) -> Result<T, Wsl2Error> {
+) -> Result<Launched<T>, Wsl2Error> {
     let prepared = prepare_with_exec(status, virtiofs, req, exec)?;
     match start(&prepared) {
-        Ok(v) => Ok(v),
+        Ok(value) => Ok(Launched { value, prepared }),
         Err(e) => {
             let failures = release_with_exec(&prepared, exec);
             Err(with_rollback_note(e, failures))
@@ -998,13 +1011,13 @@ fn launch_with_exec<T>(
 ///
 /// 準備失敗時は `start` を呼ばずに `Err` を返す。`start` が `Err` を返した場合は準備済みマウントを
 /// 解除してから `Err` を返す。`start` が `Ok` の場合マウントは呼び出し側（TASK-116）の所有となり、
-/// 停止時に [`release_virtiofs_launch`] で解除する。`start` の中身（ゲスト内のコンテナランタイム起動）は
+/// 戻り値の [`Launched::prepared`] を停止時に [`release_virtiofs_launch`] へ渡して解除する。`start` の中身（ゲスト内のコンテナランタイム起動）は
 /// TASK-116 が注入する。
 pub fn launch_with<T>(
     req: &LaunchRequest,
     timeout: Duration,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
-) -> Result<T, Wsl2Error> {
+) -> Result<Launched<T>, Wsl2Error> {
     let (program, state) = resolve_environment(timeout)?;
     launch_with_program(&program, state, req, timeout, start)
 }
@@ -1016,7 +1029,7 @@ pub(super) fn launch_with_program<T>(
     req: &LaunchRequest,
     timeout: Duration,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
-) -> Result<T, Wsl2Error> {
+) -> Result<Launched<T>, Wsl2Error> {
     check_timeout(timeout)?;
     let status = detect_with_program(program, timeout)?;
     let mut exec = program_exec(program, timeout);
@@ -1877,8 +1890,13 @@ mod tests {
             |p| Ok(p.mounts().len()),
         )
         .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v.value, 2);
         assert!(g.umounts.is_empty());
+        // 成功時は解除に使う準備済みマウントが戻り値で渡され、それで逆順に解除できる。
+        let ids: Vec<u32> = v.prepared.mounts().iter().map(|m| m.mount_id).collect();
+        assert_eq!(ids, [100, 101]);
+        assert_eq!(release_with_exec(&v.prepared, &mut |a, m| g.run(a, m)), 0);
+        assert_eq!(g.umounts, ["/mnt/fandhe/b", "/mnt/fandhe/a"]);
     }
 
     /// SEC・REPAIR-5: mount 成立後に `wsl.exe` の待機がタイムアウトしても、mountinfo を読み直して

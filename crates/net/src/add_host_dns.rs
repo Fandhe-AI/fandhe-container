@@ -31,6 +31,9 @@
 #[cfg(target_os = "linux")]
 mod hosts_file;
 pub mod resolv_conf;
+// TASK-186 不正入力ケースの副作用不変テスト（NET-12・TASK-185.5）。
+#[cfg(test)]
+mod net12_cases_tests;
 
 use std::net::IpAddr;
 use std::path::Path;

@@ -386,8 +386,10 @@ pub(crate) fn event_channel(capacity: usize) -> (EventSink, Receiver<VmEvent>) {
 
 impl EventSink {
     /// イベントを送る。満杯なら落とした件数を数え、次に送れた時に `EventsDropped` を先に送る。
-    /// 受信側が drop 済みなら黙って捨てる。
-    pub(crate) fn send(&mut self, event: VmEvent) {
+    /// 受信側が drop 済みなら捨てる（panic しない）。
+    ///
+    /// 戻り値は `event` をチャネルへ積めたか（満杯で落とした・受信側がない場合は false）。
+    pub(crate) fn send(&mut self, event: VmEvent) -> bool {
         if self.dropped > 0 {
             let notice = VmEvent::EventsDropped {
                 count: self.dropped,
@@ -396,13 +398,18 @@ impl EventSink {
                 Ok(()) => self.dropped = 0,
                 Err(TrySendError::Full(_)) => {
                     self.dropped = self.dropped.saturating_add(1);
-                    return;
+                    return false;
                 }
-                Err(TrySendError::Disconnected(_)) => return,
+                Err(TrySendError::Disconnected(_)) => return false,
             }
         }
-        if let Err(TrySendError::Full(_)) = self.tx.try_send(event) {
-            self.dropped = self.dropped.saturating_add(1);
+        match self.tx.try_send(event) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                self.dropped = self.dropped.saturating_add(1);
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => false,
         }
     }
 }
@@ -576,14 +583,39 @@ impl Core {
     }
 
     /// 破棄時の停止の完了を適用し、失敗は `StopOnDropFailed` として記録する（呼び出し元はもういないため）。
+    ///
+    /// 受信側が `Vm` とともに破棄されている・満杯でイベントが届かない場合は、失敗を見失わないよう
+    /// 構造化ログ（1 行 1 JSON）を stderr へ出す（REPAIR-4）。
     pub(crate) fn finish_drop_stop(&mut self, generation: u64, res: Result<(), ErrInfo>) {
         let failure = res.clone().err();
         // 停止通知の先着で無効化されていても、結果は状態機械と通知で既に表されている。
         let _ = self.complete(generation, LifecycleInput::StopCompleted(generation, res));
         if let Some((domain, code)) = failure {
-            self.sink.send(VmEvent::StopOnDropFailed { domain, code });
+            let line = stop_on_drop_failure_log(&domain, code);
+            if !self.sink.send(VmEvent::StopOnDropFailed { domain, code }) {
+                eprintln!("{line}");
+            }
         }
     }
+}
+
+/// 破棄時の停止の失敗を表す構造化ログ 1 行（JSON）。`domain` は VZ 由来の外部入力のため JSON 文字列として
+/// エスケープする（`sys` 側で 128 文字に切り詰め済み）。
+// macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn stop_on_drop_failure_log(domain: &str, code: isize) -> String {
+    let mut escaped = String::with_capacity(domain.len());
+    for c in domain.chars() {
+        match c {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            c if u32::from(c) < 0x20 => escaped.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => escaped.push(c),
+        }
+    }
+    format!(
+        "{{\"component\":\"platform-macos.vm\",\"operation\":\"stop_on_drop\",\"result\":\"error\",\"code\":\"vm.stop_failed\",\"domain\":\"{escaped}\",\"vz_code\":{code}}}"
+    )
 }
 
 #[cfg(target_os = "macos")]

@@ -835,12 +835,16 @@ fn check_console_log_parent(path: &Path) -> Result<(), ConfigError> {
     )
 ))]
 const O_NOFOLLOW: i32 = 0x0100;
+// Linux uapi の `arch/{arm,arm64,powerpc,m68k}/include/uapi/asm/fcntl.h` は `0100000`（= 0x8000）、
+// それ以外（asm-generic・x86・mips・sparc・riscv・loongarch・s390x 等）は 0x20000 相当。
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     any(
         target_arch = "aarch64",
         target_arch = "arm",
-        target_arch = "powerpc64"
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "m68k"
     )
 ))]
 const O_NOFOLLOW: i32 = 0x8000;
@@ -849,7 +853,9 @@ const O_NOFOLLOW: i32 = 0x8000;
     not(any(
         target_arch = "aarch64",
         target_arch = "arm",
-        target_arch = "powerpc64"
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "m68k"
     ))
 ))]
 const O_NOFOLLOW: i32 = 0x2_0000;

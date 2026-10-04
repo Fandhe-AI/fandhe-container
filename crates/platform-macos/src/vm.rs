@@ -16,11 +16,14 @@
 //! 受け付ける。受付時には VZ の実状態を読んで状態機械を追従させる。放棄後に届いた完了通知は、別の操作や停止
 //! 通知に追い越されていなければ状態機械にだけ適用する（呼び出し元へは返らない）。
 //!
+//! 破棄時の停止: `Vm` の `Drop` は実行中の VM に停止を要求する（ブロックしない）。結果はイベントとして
+//! 配送され、失敗は `VmEvent::StopOnDropFailed` で記録する。
+//!
 //! 注意: `start` / `stop` / `state` を VM キュー上（イベント処理の中など）から呼ぶとデッドロックする。
 //! 最後の防壁としてタイムアウトが `VmError::Timeout` を返す。
 //!
-//! 未実装（REPAIR-3）: 待機タイムアウトの既定値の確定、起動失敗時のクリーンアップ、実行中 VM の `Drop` 時
-//! 停止、`VmError` の `error.rs` への移動と `ConfigError` との統合は TASK-64.5。協調停止（`requestStop`）・
+//! 未実装（REPAIR-3）: 待機タイムアウトの既定値の確定、起動失敗時のクリーンアップ、`VmError` の
+//! `error.rs` への移動と `ConfigError` との統合は TASK-64.5。協調停止（`requestStop`）・
 //! pause / resume / save / restore は範囲外。
 
 use std::fmt;
@@ -85,6 +88,8 @@ pub enum VmEvent {
     StoppedWithError { domain: String, code: isize },
     /// チャネルが溢れて `count` 件のイベントを落とした（送れるようになった時点で 1 回通知する）。
     EventsDropped { count: u64 },
+    /// `Vm` の破棄時に要求した停止が失敗した（VM は動作を続けている可能性がある）。
+    StopOnDropFailed { domain: String, code: isize },
 }
 
 /// 失敗した操作の種別。
@@ -449,6 +454,8 @@ pub(crate) enum AbandonOutcome {
 pub(crate) struct Core {
     lifecycle: Lifecycle,
     sink: EventSink,
+    /// `Vm` が破棄され、停止を要求すべき状態か（破棄時に停止できなかった場合も、後の完了通知で再試行する）。
+    drop_requested: bool,
 }
 
 // macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
@@ -458,6 +465,7 @@ impl Core {
         Core {
             lifecycle: Lifecycle::new(),
             sink,
+            drop_requested: false,
         }
     }
 
@@ -547,6 +555,35 @@ impl Core {
             self.sink.send(event);
         }
     }
+
+    /// `Vm` の破棄に伴う停止を VM キュー上で受け付ける。停止要求を出すべきならその操作世代を返す。
+    ///
+    /// 破棄済みの印は常に付ける。`can_stop` が false（起動途中等）または完了待ちの操作がある間は要求せず、
+    /// 後でその操作の完了通知が `drop_stop_due` を見て再試行する（起動完了後に動き続けるのを防ぐ）。
+    pub(crate) fn request_drop_stop(&mut self, can_stop: bool, actual: VmState) -> Option<u64> {
+        self.drop_requested = true;
+        if !can_stop || self.lifecycle.has_in_flight() {
+            return None;
+        }
+        self.reconcile(actual);
+        self.apply(LifecycleInput::StopRequested);
+        Some(self.lifecycle.generation())
+    }
+
+    /// 破棄済みで、完了待ちの操作がない（破棄時の停止を要求し直すべき）か。
+    pub(crate) fn drop_stop_due(&self) -> bool {
+        self.drop_requested && !self.lifecycle.has_in_flight()
+    }
+
+    /// 破棄時の停止の完了を適用し、失敗は `StopOnDropFailed` として記録する（呼び出し元はもういないため）。
+    pub(crate) fn finish_drop_stop(&mut self, generation: u64, res: Result<(), ErrInfo>) {
+        let failure = res.clone().err();
+        // 停止通知の先着で無効化されていても、結果は状態機械と通知で既に表されている。
+        let _ = self.complete(generation, LifecycleInput::StopCompleted(generation, res));
+        if let Some((domain, code)) = failure {
+            self.sink.send(VmEvent::StopOnDropFailed { domain, code });
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -577,7 +614,8 @@ mod mac {
     /// 起動可能な `VZVirtualMachine` のハンドル。
     ///
     /// 呼び出し元: `fandhe-container-plugin-macos`（TASK-115）。実機での起動確認は TASK-64.6。
-    /// `Drop` は VM を専用キュー上で解放するだけで、実行中 VM の停止はしない（TASK-64.5）。
+    /// `Drop` は実行中の VM に停止を要求してから、VM を専用キュー上で解放する（ブロックしない。停止の完了・
+    /// 失敗はイベントで届く。完了まで待ちたい呼び出し元は先に `stop` を呼ぶ）。
     pub struct Vm {
         host: sys::VmHost,
         core: Arc<Mutex<Core>>,
@@ -669,7 +707,7 @@ mod mac {
                     }
                 };
                 let handler_core = Arc::clone(&core);
-                let handler = move |res: Result<(), ErrInfo>| {
+                let handler = move |vm: &VmRef<'_>, res: Result<(), ErrInfo>| {
                     let outcome = res.clone().map_err(|(domain, code)| match op {
                         VmOp::Start => VmError::StartFailed { domain, code },
                         VmOp::Stop => VmError::StopFailed { domain, code },
@@ -678,7 +716,7 @@ mod mac {
                         VmOp::Start => LifecycleInput::StartCompleted(generation, res),
                         VmOp::Stop => LifecycleInput::StopCompleted(generation, res),
                     };
-                    {
+                    let retry_drop_stop = {
                         let mut c = lock(&handler_core);
                         // 停止通知で無効化済みの操作は成功を返さず、その時点の状態に応じた InvalidState を返す。
                         let outcome = match c.complete(generation, input) {
@@ -687,6 +725,11 @@ mod mac {
                         };
                         // 呼び出し元の放棄と直列化するため、Core のロック内で結果を送る（block しない）。
                         let _ = tx.try_send(outcome);
+                        c.drop_stop_due()
+                    };
+                    // 破棄時に停止できなかった（起動途中等）VM は、この完了を機に停止を要求し直す。
+                    if retry_drop_stop {
+                        issue_drop_stop(vm, &handler_core);
                     }
                 };
                 match op {
@@ -729,6 +772,31 @@ mod mac {
                 op,
                 after: self.op_timeout,
             })
+        }
+    }
+
+    /// 破棄時の停止を VM キュー上で要求する（`Vm::drop` と、破棄後に届いた操作の完了通知から呼ばれる）。
+    ///
+    /// 停止の完了・失敗は `Core::finish_drop_stop` が状態機械とイベントへ記録する。停止できない状態なら
+    /// 何もせず、破棄済みの印だけを残す。
+    fn issue_drop_stop(vm: &VmRef<'_>, core: &Arc<Mutex<Core>>) {
+        let actual = actual_state(vm);
+        let can_stop = vm.can_stop();
+        let Some(generation) = lock(core).request_drop_stop(can_stop, actual) else {
+            return;
+        };
+        let handler_core = Arc::clone(core);
+        vm.stop(move |_vm: &VmRef<'_>, res: Result<(), ErrInfo>| {
+            lock(&handler_core).finish_drop_stop(generation, res);
+        });
+    }
+
+    impl Drop for Vm {
+        fn drop(&mut self) {
+            // ブロックしない: 停止要求を VM キューへ投入するだけ。キューはシリアルのため、この後に
+            // `VmHost::drop` が投入する解放より先に実行され、停止の完了までは completion handler が VM を保持する。
+            let core = Arc::clone(&self.core);
+            self.host.run_async(move |vm| issue_drop_stop(vm, &core));
         }
     }
 }

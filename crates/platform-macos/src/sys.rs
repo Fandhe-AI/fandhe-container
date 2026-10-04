@@ -13,10 +13,11 @@
 //!
 //! キュー制約（TASK-64.4）: `VZVirtualMachine` の操作・completion handler・delegate は、その VM 専用の
 //! シリアル `DispatchQueue` 上でのみ行う。`VmHost` が VM と delegate を `QueueBound` に包んで保持し、
-//! 操作は `VmHost::run_async` / `run_timeout` のクロージャ（キュー上で実行される）にだけ `VmRef` として渡す。
-//! `VmRef` は本モジュール外で生成できないため、キュー外から VM を触る経路は型として存在しない。
+//! 操作は `VmHost::run_async` / `run_timeout` のクロージャと completion handler（いずれもキュー上で実行される）
+//! にだけ `VmRef` として渡す。`VmRef` は本モジュール外で生成できないため、キュー外から VM を触る経路は型として
+//! 存在しない。VM への強参照は `QueueOwned` が持ち、最後の解放を必ずキュー上へ回す。
 
-use std::mem::ManuallyDrop;
+use std::cell::Cell;
 use std::os::fd::{IntoRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -342,47 +343,102 @@ struct VmObjects {
 /// 専用シリアルキューに束縛された値の包み。キュー上のクロージャ内でだけ中身を触る。
 struct QueueBound<T>(T);
 
-// SAFETY: 中身（VZVirtualMachine・delegate）は ObjC オブジェクトで `Send` ではないが、`VmHost` は
-// 中身を参照・解放するコードを VM の専用シリアルキュー上のクロージャ（`run_async` / `run_timeout` / Drop）
-// にだけ置く。包みを別スレッドへ動かしても、中身を触るのは常にそのキューのスレッドである。
+// SAFETY: 中身（VZVirtualMachine・delegate）は ObjC オブジェクトで `Send` ではないが、本モジュールは
+// 中身を参照・解放するコードを VM の専用シリアルキュー上のクロージャ（`run_async` / `run_timeout` /
+// completion handler / `QueueOwned::drop` が投入する解放）にだけ置く。包みを別スレッドへ動かしても、
+// 中身を触る・最後の参照を解放するのは常にそのキューのスレッドである。
 unsafe impl<T> Send for QueueBound<T> {}
 // SAFETY: 上記と同じ不変条件。共有参照越しに中身へ到達できるのもキュー上のクロージャだけ。
 unsafe impl<T> Sync for QueueBound<T> {}
 
-/// VM キュー上のクロージャにだけ渡される VM 操作の窓口（本モジュール外では生成できない）。
-pub(crate) struct VmRef<'a>(&'a VmObjects);
+/// VM への強参照を、最後の解放が必ず VM キュー上で起きるように包む。
+///
+/// `VmHost` と、完了待ちの completion handler（VZ が任意のスレッドで block を解放し得る）が持つ。
+/// drop されると参照を VM キューへ送ってそこで解放するため、どのスレッドで drop してもよい。
+struct QueueOwned {
+    objs: Option<Arc<QueueBound<VmObjects>>>,
+    queue: DispatchRetained<DispatchQueue>,
+}
+
+impl Drop for QueueOwned {
+    fn drop(&mut self) {
+        if let Some(objs) = self.objs.take() {
+            // 任意のスレッドから VZVirtualMachine を release しないため、VM キュー上で解放する。
+            self.queue.exec_async(move || drop(objs));
+        }
+    }
+}
+
+/// VM キュー上のクロージャ・completion handler にだけ渡される VM 操作の窓口（本モジュール外では生成できない）。
+pub(crate) struct VmRef<'a> {
+    objs: &'a Arc<QueueBound<VmObjects>>,
+    queue: &'a DispatchRetained<DispatchQueue>,
+}
 
 impl VmRef<'_> {
     /// 現在の状態の生値（`VZVirtualMachineState`）。
     pub(crate) fn state_raw(&self) -> isize {
         // SAFETY: `VmRef` は VM キュー上でのみ存在し、getter は副作用のない読み出し。
-        unsafe { self.0.vm.state().0 }
+        unsafe { self.objs.0.vm.state().0 }
     }
 
     /// 起動可能か。`start` の前に必ず確認する（不正状態の呼び出しは ObjC 例外 = abort になるため）。
     pub(crate) fn can_start(&self) -> bool {
         // SAFETY: 同上。
-        unsafe { self.0.vm.canStart() }
+        unsafe { self.objs.0.vm.canStart() }
     }
 
     /// 停止可能か。`stop` の前に必ず確認する。
     pub(crate) fn can_stop(&self) -> bool {
         // SAFETY: 同上。
-        unsafe { self.0.vm.canStop() }
+        unsafe { self.objs.0.vm.canStop() }
     }
 
     /// `startWithCompletionHandler:` を呼ぶ。`can_start()` が true であること。
-    pub(crate) fn start(&self, handler: impl Fn(Result<(), VzErrorInfo>) + 'static) {
-        let block = RcBlock::new(move |err: *mut NSError| handler(completion_result(err)));
+    ///
+    /// `handler` は VM キュー上で 1 回だけ、その時点の `VmRef` とともに呼ばれる（続けて停止を要求できる）。
+    pub(crate) fn start(&self, handler: impl Fn(&VmRef<'_>, Result<(), VzErrorInfo>) + 'static) {
+        let block = self.completion_block(handler);
         // SAFETY: VM キュー上で呼ばれ、`can_start` 確認済み。block は VZ が copy して保持し、キュー上で呼ぶ。
-        unsafe { self.0.vm.startWithCompletionHandler(&block) }
+        unsafe { self.objs.0.vm.startWithCompletionHandler(&block) }
     }
 
-    /// `stopWithCompletionHandler:` を呼ぶ。`can_stop()` が true であること。
-    pub(crate) fn stop(&self, handler: impl Fn(Result<(), VzErrorInfo>) + 'static) {
-        let block = RcBlock::new(move |err: *mut NSError| handler(completion_result(err)));
+    /// `stopWithCompletionHandler:` を呼ぶ。`can_stop()` が true であること。`handler` は `start` と同じ。
+    pub(crate) fn stop(&self, handler: impl Fn(&VmRef<'_>, Result<(), VzErrorInfo>) + 'static) {
+        let block = self.completion_block(handler);
         // SAFETY: VM キュー上で呼ばれ、`can_stop` 確認済み。block の扱いは `start` と同じ。
-        unsafe { self.0.vm.stopWithCompletionHandler(&block) }
+        unsafe { self.objs.0.vm.stopWithCompletionHandler(&block) }
+    }
+
+    /// completion handler 用の block を作る。
+    ///
+    /// block は完了まで VM への強参照（`QueueOwned`）を持ち、`Vm` が先に破棄されても操作中の VM を解放しない。
+    /// 呼ばれた時点で参照を手放す（解放はキュー上）。2 回目以降の呼び出しでは何もしない。VZ が block を
+    /// 一度も呼ばずに保持し続けた場合、VM は解放されない（use-after-free より安全側に倒す）。
+    fn completion_block(
+        &self,
+        handler: impl Fn(&VmRef<'_>, Result<(), VzErrorInfo>) + 'static,
+    ) -> RcBlock<dyn Fn(*mut NSError)> {
+        let keep = Cell::new(Some(QueueOwned {
+            objs: Some(Arc::clone(self.objs)),
+            queue: self.queue.clone(),
+        }));
+        RcBlock::new(move |err: *mut NSError| {
+            let res = completion_result(err);
+            let Some(owned) = keep.take() else {
+                return;
+            };
+            if let Some(objs) = owned.objs.as_ref() {
+                // completion handler は VM キュー上で呼ばれるため、ここで `VmRef` を渡してよい。
+                handler(
+                    &VmRef {
+                        objs,
+                        queue: &owned.queue,
+                    },
+                    res,
+                );
+            }
+        })
     }
 }
 
@@ -400,8 +456,7 @@ fn completion_result(err: *mut NSError) -> Result<(), VzErrorInfo> {
 /// `initWithConfiguration:` のメインキュー依存（呼び出し側が run loop を回し続ける必要がある）を避けるため、
 /// VM ごとに専用キューを持つ。コールバックは GCD のワーカースレッドで届く（TASK-64.4 の run loop 統合）。
 pub(crate) struct VmHost {
-    queue: DispatchRetained<DispatchQueue>,
-    objs: ManuallyDrop<Arc<QueueBound<VmObjects>>>,
+    owned: QueueOwned,
 }
 
 impl VmHost {
@@ -427,23 +482,34 @@ impl VmHost {
             VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), config, &queue)
         };
         let host = VmHost {
-            queue,
-            objs: ManuallyDrop::new(Arc::new(QueueBound(VmObjects { vm, delegate }))),
+            owned: QueueOwned {
+                objs: Some(Arc::new(QueueBound(VmObjects { vm, delegate }))),
+                queue,
+            },
         };
         // 専用キューはシリアルのため、後続の操作より先に実行される。完了待ちはしない（無期限 block の回避。REPAIR-5）。
         host.run_async(|vm| {
-            let proto = ProtocolObject::from_ref(&*vm.0.delegate);
+            let objs = &vm.objs.0;
+            let proto = ProtocolObject::from_ref(&*objs.delegate);
             // SAFETY: delegate は weak 参照のため、`VmObjects` が VM と同じ寿命で強参照を保持する。VM キュー上で呼ぶ。
-            unsafe { vm.0.vm.setDelegate(Some(proto)) };
+            unsafe { objs.vm.setDelegate(Some(proto)) };
         });
         Ok(host)
     }
 
     /// VM キュー上でクロージャを非同期に実行する。完了は待たない。
-    pub(crate) fn run_async(&self, f: impl FnOnce(&VmRef) + Send + 'static) {
-        let objs = Arc::clone(&self.objs);
-        self.queue.exec_async(move || {
-            f(&VmRef(&objs.0));
+    ///
+    /// `VmHost` の生存中は VM への参照を必ず持つため、クロージャは常に実行される。
+    pub(crate) fn run_async(&self, f: impl FnOnce(&VmRef<'_>) + Send + 'static) {
+        let Some(objs) = self.owned.objs.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let queue = self.owned.queue.clone();
+        self.owned.queue.exec_async(move || {
+            f(&VmRef {
+                objs: &objs,
+                queue: &queue,
+            });
             // この clone が最後の参照でも、解放は VM キューのスレッド上で行われる。
             drop(objs);
         });
@@ -456,21 +522,12 @@ impl VmHost {
     pub(crate) fn run_timeout<R: Send + 'static>(
         &self,
         timeout: Duration,
-        f: impl FnOnce(&VmRef) -> R + Send + 'static,
+        f: impl FnOnce(&VmRef<'_>) -> R + Send + 'static,
     ) -> Option<R> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<R>(1);
         self.run_async(move |vm| {
             let _ = tx.try_send(f(vm));
         });
         rx.recv_timeout(timeout).ok()
-    }
-}
-
-impl Drop for VmHost {
-    fn drop(&mut self) {
-        // SAFETY: Drop は 1 度だけ呼ばれ、以後 `self.objs` には触れない。
-        let objs = unsafe { ManuallyDrop::take(&mut self.objs) };
-        // 任意のスレッドから VZVirtualMachine を release しないため、VM キュー上で解放する。
-        self.queue.exec_async(move || drop(objs));
     }
 }

@@ -533,6 +533,251 @@ mod tests {
         assert_eq!(e.code(), NetErrorCode::NotFound);
     }
 
+    /// 差し替え用の列挙 `pass`（0 始まりの列挙回数から 1 回分の列挙を返す）で `scan_until_stable` を
+    /// 呼び、結果・列挙回数・再列挙前の待ちの記録を返す（実際には待たない）。
+    fn scan_scripted(
+        host: NsId,
+        pass: impl Fn(usize) -> Result<Vec<Result<(u32, Option<NsId>), NetError>>, NetError>,
+    ) -> (Result<TaskScan, NetError>, usize, Vec<Duration>) {
+        let mut calls = 0usize;
+        let mut pauses = Vec::new();
+        let scan = scan_until_stable(
+            host,
+            || {
+                let r = pass(calls);
+                calls += 1;
+                r
+            },
+            |d| pauses.push(d),
+        );
+        (scan, calls, pauses)
+    }
+
+    /// NET-6: 再列挙前の待ちは 50 µs から倍々に伸び、1 ms で頭打ち（極端な回数でも溢れない）。
+    #[test]
+    fn net6_retry_backoff_schedule() {
+        let us = Duration::from_micros;
+        assert_eq!(retry_backoff(1), us(50));
+        assert_eq!(retry_backoff(2), us(100));
+        assert_eq!(retry_backoff(3), us(200));
+        assert_eq!(retry_backoff(4), us(400));
+        assert_eq!(retry_backoff(5), us(800));
+        assert_eq!(retry_backoff(6), us(1000));
+        assert_eq!(retry_backoff(30), us(1000));
+        assert_eq!(retry_backoff(33), us(1000));
+        assert_eq!(retry_backoff(usize::MAX), us(1000));
+    }
+
+    /// NET-6: tid 集合が前回と異なる間は再列挙し、2 回連続で一致した時点で止まる（取りこぼしのある
+    /// 列挙で判定しない）。並び順の違いは同じ集合として扱う。
+    #[test]
+    fn net6_scan_until_stable_reenumerates_until_tids_match() {
+        let h = NsId::new(4, 100);
+        // 1 回目 {10,11,12}・2 回目 {10,11}（12 が終了）・3 回目 {10,11} で一致する。
+        let (scan, calls, pauses) = scan_scripted(h, |n| {
+            Ok(match n {
+                0 => vec![Ok((10, Some(h))), Ok((11, Some(h))), Ok((12, Some(h)))],
+                _ => vec![Ok((10, Some(h))), Ok((11, Some(h)))],
+            })
+        });
+        assert_eq!(
+            scan.unwrap(),
+            TaskScan::Stable {
+                tids: vec![10, 11],
+                live: true
+            }
+        );
+        assert_eq!(calls, 3);
+        assert_eq!(pauses, vec![Duration::from_micros(50)]);
+        // 1 回目で 11 を取りこぼし（{10,12}）、2 回目は {10,11,12}、3 回目で一致する。
+        let (scan, calls, pauses) = scan_scripted(h, |n| {
+            Ok(match n {
+                0 => vec![Ok((10, Some(h))), Ok((12, Some(h)))],
+                _ => vec![Ok((10, Some(h))), Ok((11, Some(h))), Ok((12, Some(h)))],
+            })
+        });
+        assert_eq!(
+            scan.unwrap(),
+            TaskScan::Stable {
+                tids: vec![10, 11, 12],
+                live: true
+            }
+        );
+        assert_eq!(calls, 3);
+        assert_eq!(pauses, vec![Duration::from_micros(50)]);
+        // 並び順だけが違う列挙は同じ集合として 2 回目で一致する。
+        let (scan, calls, pauses) = scan_scripted(h, |n| {
+            Ok(if n % 2 == 0 {
+                vec![Ok((11, Some(h))), Ok((10, Some(h)))]
+            } else {
+                vec![Ok((10, Some(h))), Ok((11, Some(h)))]
+            })
+        });
+        assert_eq!(
+            scan.unwrap(),
+            TaskScan::Stable {
+                tids: vec![10, 11],
+                live: true
+            }
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(pauses, Vec::<Duration>::new());
+    }
+
+    /// NET-6: tid 集合が毎回変わり続けると、`MAX_PASSES`（32）回で打ち切って判定不能の
+    /// FAILED_PRECONDITION を返す（Member と扱わない。有界に終わる。REPAIR-5）。
+    #[test]
+    fn net6_scan_until_stable_gives_up_after_max_passes() {
+        let h = NsId::new(4, 100);
+        let (scan, calls, pauses) = scan_scripted(h, |n| {
+            let churn = if n % 2 == 0 { 11 } else { 12 };
+            Ok(vec![Ok((10, Some(h))), Ok((churn, Some(h)))])
+        });
+        let e = scan.unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.code().as_str(), "FAILED_PRECONDITION");
+        assert_eq!(e.message(), "thread list of process did not stabilize");
+        assert_eq!(MAX_PASSES, 32);
+        assert_eq!(calls, 32);
+        // 3 回目以降の各列挙の前に 1 回ずつ（30 回）待ち、合計は 26.55 ms で有界。
+        let expected: Vec<Duration> = (1..=30).map(retry_backoff).collect();
+        assert_eq!(pauses, expected);
+        assert_eq!(
+            pauses.iter().sum::<Duration>(),
+            Duration::from_micros(26_550)
+        );
+    }
+
+    /// NET-6: 別 netns のスレッドは何回目の列挙で見えても即 Other（以後の列挙・同じ列挙の残りを読まない）。
+    #[test]
+    fn net6_scan_until_stable_detects_other_in_any_pass() {
+        let h = NsId::new(4, 100);
+        let o = NsId::new(4, 200);
+        // 1 回目で 11 を取りこぼし、2 回目で別 netns の 11 が見える。
+        let (scan, calls, pauses) = scan_scripted(h, |n| {
+            Ok(match n {
+                0 => vec![Ok((10, Some(h)))],
+                _ => vec![Ok((10, Some(h))), Ok((11, Some(o)))],
+            })
+        });
+        assert_eq!(scan.unwrap(), TaskScan::Other(o));
+        assert_eq!(calls, 2);
+        assert_eq!(pauses, Vec::<Duration>::new());
+        // 1 回目で見えた後のエントリ（エラー）は読まない。
+        let (scan, calls, pauses) = scan_scripted(h, |_| {
+            Ok(vec![
+                Ok((10, Some(o))),
+                Err(NetError::new(NetErrorCode::Internal, "unreachable")),
+            ])
+        });
+        assert_eq!(scan.unwrap(), TaskScan::Other(o));
+        assert_eq!(calls, 1);
+        assert_eq!(pauses, Vec::<Duration>::new());
+    }
+
+    /// NET-6: 終了中スレッド（識別子 None）も tid 集合に含めて比べる。生存中だった tid が終了中に
+    /// 変わっても集合は同じで、2 回のどちらかで生存スレッドを観測していれば live。
+    #[test]
+    fn net6_scan_until_stable_counts_exiting_threads() {
+        let h = NsId::new(4, 100);
+        let (scan, calls, pauses) = scan_scripted(h, |n| {
+            Ok(match n {
+                0 => vec![Ok((10, Some(h))), Ok((11, None))],
+                _ => vec![Ok((10, None)), Ok((11, None))],
+            })
+        });
+        assert_eq!(
+            scan.unwrap(),
+            TaskScan::Stable {
+                tids: vec![10, 11],
+                live: true
+            }
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(pauses, Vec::<Duration>::new());
+        // 終了中の 11 が一覧から外れると集合が変わるため再列挙する。
+        let (scan, calls, pauses) = scan_scripted(h, |n| {
+            Ok(match n {
+                0 => vec![Ok((10, Some(h))), Ok((11, None))],
+                _ => vec![Ok((10, Some(h)))],
+            })
+        });
+        assert_eq!(
+            scan.unwrap(),
+            TaskScan::Stable {
+                tids: vec![10],
+                live: true
+            }
+        );
+        assert_eq!(calls, 3);
+        assert_eq!(pauses, vec![Duration::from_micros(50)]);
+    }
+
+    /// NET-6: 2 回目以降の列挙・エントリのエラーは再試行せずそのまま返す（プロセス消失・権限不足を隠さない）。
+    #[test]
+    fn net6_scan_until_stable_propagates_errors_in_later_pass() {
+        let h = NsId::new(4, 100);
+        let (scan, calls, pauses) = scan_scripted(h, |n| match n {
+            0 => Ok(vec![Ok((10, Some(h))), Ok((11, Some(h)))]),
+            _ => Err(NetError::new(NetErrorCode::NotFound, "gone")),
+        });
+        assert_eq!(scan.unwrap_err().code(), NetErrorCode::NotFound);
+        assert_eq!(calls, 2);
+        assert_eq!(pauses, Vec::<Duration>::new());
+        let (scan, calls, pauses) = scan_scripted(h, |n| {
+            Ok(match n {
+                0 => vec![Ok((10, Some(h)))],
+                _ => vec![
+                    Ok((10, Some(h))),
+                    Err(NetError::new(NetErrorCode::PermissionDenied, "denied")),
+                ],
+            })
+        });
+        assert_eq!(scan.unwrap_err().code(), NetErrorCode::PermissionDenied);
+        assert_eq!(calls, 2);
+        assert_eq!(pauses, Vec::<Duration>::new());
+    }
+
+    /// NET-6: 1 回の列挙の件数は `MAX_THREADS`（65536）件まで受け付け、超えたら確保前に
+    /// RESOURCE_EXHAUSTED を返す（再列挙しない）。
+    #[test]
+    fn net6_scan_until_stable_limits_thread_count() {
+        let h = NsId::new(4, 100);
+        assert_eq!(MAX_THREADS, 65_536);
+        let limit = u32::try_from(MAX_THREADS).unwrap();
+        let mut calls = 0usize;
+        let scan = scan_until_stable(
+            h,
+            || {
+                calls += 1;
+                Ok::<_, NetError>((0..limit).map(|t| Ok((t, Some(h)))))
+            },
+            |d| panic!("unexpected pause {d:?}"),
+        );
+        let TaskScan::Stable { tids, live } = scan.unwrap() else {
+            panic!("all threads are in the host network namespace");
+        };
+        assert_eq!(
+            (tids.len(), tids.first(), tids.last()),
+            (MAX_THREADS, Some(&0), Some(&(limit - 1)))
+        );
+        assert!(live);
+        assert_eq!(calls, 2);
+        let mut calls = 0usize;
+        let scan = scan_until_stable(
+            h,
+            || {
+                calls += 1;
+                Ok::<_, NetError>((0..=limit).map(|t| Ok((t, Some(h)))))
+            },
+            |d| panic!("unexpected pause {d:?}"),
+        );
+        let e = scan.unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "process has too many threads to verify");
+        assert_eq!(calls, 1);
+    }
+
     /// NET-6: 複数スレッドの自プロセスでは、起こしたスレッドの tid とリーダーが `scan_until_stable` の
     /// 安定した tid 集合にすべて含まれ、全スレッドが自スレッドと同じ netns で、verify_process は Member。
     ///

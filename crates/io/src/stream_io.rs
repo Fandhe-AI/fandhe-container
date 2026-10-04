@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use crate::error::{IoError, IoErrorCode};
 use crate::protocol::{FRAME_HEADER_LEN, Frame, FrameHeader, FrameKind};
 use crate::recv_limits::ReceiveLimits;
+use crate::server::RecvAttempt;
 use crate::transport::IoTimeout;
 
 /// 期限付き read / write に必要なストリーム操作（`UnixStream` と vsock 用
@@ -60,12 +61,50 @@ impl TimedStream for std::net::TcpStream {
     }
 }
 
-/// `recv_frame` の結果に、ヘッダ検証を通過した時点で確定するフレーム種別
-/// （[`crate::observe::ServerEvent::kind`] に必要）を添えて持ち帰る型（REPAIR-4）。
-pub(crate) struct RecvAttempt {
-    pub(crate) result: Result<Frame, IoError>,
-    pub(crate) kind: Option<FrameKind>,
+/// accept の期限切れを表すエラー（`crate::server` / `crate::vsock` の accept の全経路で共有する。
+/// ループ先頭・成功経路・WouldBlock・再試行判定のどこで期限切れを検出しても
+/// 同じ `code` / `message` を返し、観測イベントの見分けがつくようにする。
+/// REPAIR-4・REPAIR-5・#820）。
+pub(crate) fn accept_timeout_error() -> IoError {
+    IoError::new(
+        IoErrorCode::Timeout,
+        "accept timed out waiting for a client connection",
+    )
 }
+
+/// 受付ループの再試行判定（H3・H4・#820 security-auditor 指摘対応）。
+///
+/// `remaining` が `Duration::ZERO` なら [`IoErrorCode::Timeout`]、
+/// `retries` が `max_retries` を超えていれば [`IoErrorCode::Unavailable`]
+/// （相手に起因する異常であり、実装バグを示す `Internal` ではない。H4）、
+/// どちらでもなければ `None`（再試行を続ける）を返す純粋関数。
+///
+/// 呼び出し元（`crate::server` / `crate::vsock` の accept）は、この判定の**前に**必ず件数の
+/// 加算・（peer credential 拒否の場合の）拒否の通知を済ませておく（H3。
+/// 期限の直前に起きた拒否も件数・記録に残すため）。
+pub(crate) fn accept_retry_deadline_or_limit(
+    remaining: Duration,
+    retries: u32,
+    max_retries: u32,
+    exceeded_message: &str,
+) -> Option<IoError> {
+    if remaining.is_zero() {
+        return Some(accept_timeout_error());
+    }
+    if retries > max_retries {
+        return Some(IoError::new(
+            IoErrorCode::Unavailable,
+            exceeded_message.to_string(),
+        ));
+    }
+    None
+}
+
+/// `accept` が `ConnectionAborted`（相手が accept 完了前に切断した）を
+/// 受け続けた場合の再試行回数の上限（REPAIR-5: 相手の応答を待つ処理は
+/// 無期限にループしない。`deadline` 自体も毎回照合するため、この上限は
+/// 「短時間に大量の切断が続く」病的なケースの保険）。
+pub(crate) const MAX_ACCEPT_ABORT_RETRIES: u32 = 32;
 
 /// `crate::protocol` の「ストリーム読みの手順」（1: 固定長ヘッダを読む→
 /// 2: `FrameHeader::from_bytes` で検証→3: 方向的に受理できない種別を確保前に拒否→

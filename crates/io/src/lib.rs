@@ -11,8 +11,10 @@
 //! TASK-13.2.1（#820）で実装済み（[`server::UdsServer`]・
 //! [`server::UdsConnection`]。accept・送受信のイベントは
 //! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS `connect` と
-//! [`client::PipelineClient`] との本番結合・vsock・named pipe はまだない
-//! （REPAIR-3。スタブの明示）。1 本の接続を送信側・受信側へ分けて並行に使う API は
+//! [`client::PipelineClient`] との本番結合・named pipe はまだない
+//! （REPAIR-3。スタブの明示）。vsock は Linux（x86_64 / aarch64）のサーバー側・クライアント側を
+//! [`vsock`] が実装済み（#1119。macOS の Virtualization.framework・Windows の hvsock は
+//! 未実装で `Unimplemented`）。1 本の接続を送信側・受信側へ分けて並行に使う API は
 //! [`transport::SplitTransport`]（#1118）で、UDS サーバー側が
 //! [`server::UdsSendHalf`]・[`server::UdsRecvHalf`] として実装する。
 //! [`protocol::Frame`] のペイロード内部レイアウト（request id・ACK の対応付け）は
@@ -89,6 +91,7 @@ mod sys;
 #[path = "sys/windows.rs"]
 mod sys_windows;
 pub mod transport;
+pub mod vsock;
 pub mod writeback;
 
 pub use barrier::{
@@ -142,6 +145,9 @@ pub use settings::{
 pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, SplitTransport,
     WireFrame,
+};
+pub use vsock::{
+    VsockAddr, VsockConnection, VsockPeerPolicy, VsockRecvHalf, VsockSendHalf, VsockServer,
 };
 pub use writeback::{
     AppendFileSink, BatchSink, SinkOpenMode, SinkPersistReport, SinkWriteReport, WritebackReport,

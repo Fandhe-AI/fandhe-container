@@ -199,7 +199,7 @@
 //!   （`crates/io/src/writeback.rs` モジュール doc「受信上限」節参照）
 //! - クライアント側の UDS 接続（`connect`）・[`crate::client::PipelineClient`]
 //!   との本番結合
-//! - vsock（microVM）トランスポート
+//! - vsock（microVM）トランスポートは [`crate::vsock`]（#1119）に実装済み（本ファイルの範囲外）
 //! - `path` の直近の親ディレクトリ以外（祖先のパス要素）の symlink 検査は
 //!   行わない（`imp::validate_parent_dir`（Linux / macOS 限定の非公開関数）
 //!   のドキュメンテーションコメント参照）。祖先ディレクトリが bind 後に
@@ -235,9 +235,16 @@ use crate::observe::{
 };
 use crate::protocol::{Frame, FrameKind};
 use crate::recv_limits::ReceiveLimits;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::stream_io::RecvAttempt;
 use crate::transport::{FrameReceiver, FrameSender, IoTimeout, SharedPoison, SplitTransport};
+
+/// `recv_frame` の結果に、ヘッダ検証を通過した時点で確定するフレーム種別
+/// （[`crate::observe::ServerEvent::kind`] に必要）を添えて持ち帰る非公開型
+/// （REPAIR-4）。UDS・vsock が共有する `crate::stream_io` の `recv_frame_on` が組み立てる。
+/// 非 Linux / macOS の `imp` も同じシグネチャを保つため、OS 非依存の本ファイルに置く。
+pub(crate) struct RecvAttempt {
+    pub(crate) result: Result<Frame, IoError>,
+    pub(crate) kind: Option<FrameKind>,
+}
 
 /// [`imp::ServerInner::accept`] の結果に、受付ループ内で再試行した回数
 /// （[`crate::observe::ServerEvent::accept_aborted_retries`]・
@@ -441,6 +448,7 @@ impl<O: ServerObserver> UdsServer<O> {
                 accept_aborted_retries: attempt.aborted_retries,
                 peer_credential_rejections: attempt.peer_credential_rejections,
                 peer_uid: None,
+                peer_cid: None,
                 coalesced: None,
                 error: None,
             }),
@@ -452,6 +460,7 @@ impl<O: ServerObserver> UdsServer<O> {
                 accept_aborted_retries: attempt.aborted_retries,
                 peer_credential_rejections: attempt.peer_credential_rejections,
                 peer_uid: None,
+                peer_cid: None,
                 coalesced: None,
                 error: Some(SendEventError {
                     code: err.code(),
@@ -578,7 +587,7 @@ impl<C: ServerObserver> UdsConnection<C> {
 
 /// 成功イベントを組み立てて `observer` へ通知する（[`UdsConnection`] と分割後の
 /// 両半分が共有。REPAIR-4）。
-fn emit_success<C: ServerObserver>(
+pub(crate) fn emit_success<C: ServerObserver>(
     observer: &mut C,
     op: ServerOp,
     kind: Option<FrameKind>,
@@ -596,7 +605,7 @@ fn emit_success<C: ServerObserver>(
 }
 
 /// 失敗イベントを組み立てて `observer` へ通知する（[`emit_success`] の失敗版）。
-fn emit_failure<C: ServerObserver>(
+pub(crate) fn emit_failure<C: ServerObserver>(
     observer: &mut C,
     op: ServerOp,
     kind: Option<FrameKind>,
@@ -634,13 +643,14 @@ fn emit_event<C: ServerObserver>(
         accept_aborted_retries: 0,
         peer_credential_rejections: 0,
         peer_uid: None,
+        peer_cid: None,
         coalesced,
         error: error.map(|(code, message)| SendEventError { code, message }),
     });
 }
 
 /// poison 済み接続への呼び出しに返すエラー（P1-3）。
-fn unavailable_after_poison() -> IoError {
+pub(crate) fn unavailable_after_poison() -> IoError {
     IoError::new(
         IoErrorCode::Unavailable,
         "connection is poisoned by a previous error and must be reconnected",
@@ -949,7 +959,7 @@ impl<C: ServerObserver> Drop for SharedObserverInner<C> {
 /// 取らない。`pending` のガードは pop / push / take の文の中だけで解放する）。`notify` は
 /// `pending` を解放してから `hook` を `try_lock` するため、両半分・`with` の間で
 /// デッドロックしない。
-struct SharedObserver<C: ServerObserver>(Arc<SharedObserverInner<C>>);
+pub(crate) struct SharedObserver<C: ServerObserver>(Arc<SharedObserverInner<C>>);
 
 impl<C: ServerObserver> Clone for SharedObserver<C> {
     fn clone(&self) -> Self {
@@ -958,7 +968,7 @@ impl<C: ServerObserver> Clone for SharedObserver<C> {
 }
 
 impl<C: ServerObserver> SharedObserver<C> {
-    fn new(hook: C) -> Self {
+    pub(crate) fn new(hook: C) -> Self {
         Self(Arc::new(SharedObserverInner {
             hook: Mutex::new(hook),
             pending: Mutex::new(PendingState::default()),
@@ -1041,7 +1051,7 @@ impl<C: ServerObserver> SharedObserver<C> {
     /// 1 回の排出ですべて `f` より前に適用される。並行して積まれた分はその後ろに並び、
     /// `f` の後の排出が引き継ぐ。I/O 経路ではないため期限は設けないが、件数上限
     /// （REPAIR-5）は保つ。
-    fn with<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
         let result = {
             let mut guard = self.0.hook.lock().unwrap_or_else(PoisonError::into_inner);
             let mut budget = MAX_DRAIN_PER_CALL;
@@ -1095,7 +1105,7 @@ impl<C: ServerObserver> SharedObserver<C> {
 }
 
 /// 成功イベントを保留キュー経由で通知する。
-fn notify_success<C: ServerObserver>(
+pub(crate) fn notify_success<C: ServerObserver>(
     observer: &SharedObserver<C>,
     op: ServerOp,
     kind: Option<FrameKind>,
@@ -1115,7 +1125,7 @@ fn notify_success<C: ServerObserver>(
 }
 
 /// 失敗イベントを保留キュー経由で通知する（エラーは所有データへ複製する）。
-fn notify_failure<C: ServerObserver>(
+pub(crate) fn notify_failure<C: ServerObserver>(
     observer: &SharedObserver<C>,
     op: ServerOp,
     kind: Option<FrameKind>,
@@ -1399,12 +1409,6 @@ mod imp {
     /// 最小限にする方針であり、本タスクの受け入れ条件は依存追加なしの
     /// std 実装を求めている）。
     const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
-
-    /// `accept` が `ConnectionAborted`（相手が accept 完了前に切断した）を
-    /// 受け続けた場合の再試行回数の上限（REPAIR-5: 相手の応答を待つ処理は
-    /// 無期限にループしない。`deadline` 自体も毎回照合するため、この上限は
-    /// 「短時間に大量の切断が続く」病的なケースの保険）。
-    const MAX_ACCEPT_ABORT_RETRIES: u32 = 32;
 
     pub(super) struct ServerInner {
         listener: UnixListener,
@@ -1894,51 +1898,13 @@ mod imp {
             accept_aborted_retries: 0,
             peer_credential_rejections,
             peer_uid: rejection.peer_uid,
+            peer_cid: None,
             coalesced: None,
             error: Some(SendEventError {
                 code: rejection.error.code(),
                 message: rejection.error.message(),
             }),
         }
-    }
-
-    /// accept の期限切れを表すエラー（[`ServerInner::accept`] の全経路で共有する。
-    /// ループ先頭・成功経路・WouldBlock・再試行判定のどこで期限切れを検出しても
-    /// 同じ `code` / `message` を返し、観測イベントの見分けがつくようにする。
-    /// REPAIR-4・REPAIR-5・#820）。
-    fn accept_timeout_error() -> IoError {
-        IoError::new(
-            IoErrorCode::Timeout,
-            "accept timed out waiting for a client connection",
-        )
-    }
-
-    /// 受付ループの再試行判定（H3・H4・#820 security-auditor 指摘対応）。
-    ///
-    /// `remaining` が `Duration::ZERO` なら [`IoErrorCode::Timeout`]、
-    /// `retries` が `max_retries` を超えていれば [`IoErrorCode::Unavailable`]
-    /// （相手に起因する異常であり、実装バグを示す `Internal` ではない。H4）、
-    /// どちらでもなければ `None`（再試行を続ける）を返す純粋関数。
-    ///
-    /// 呼び出し元（[`ServerInner::accept`]）は、この判定の**前に**必ず件数の
-    /// 加算・（peer credential 拒否の場合の）拒否の通知を済ませておく（H3。
-    /// 期限の直前に起きた拒否も件数・記録に残すため）。
-    fn accept_retry_deadline_or_limit(
-        remaining: Duration,
-        retries: u32,
-        max_retries: u32,
-        exceeded_message: &str,
-    ) -> Option<IoError> {
-        if remaining.is_zero() {
-            return Some(accept_timeout_error());
-        }
-        if retries > max_retries {
-            return Some(IoError::new(
-                IoErrorCode::Unavailable,
-                exceeded_message.to_string(),
-            ));
-        }
-        None
     }
 
     /// 親ディレクトリが symlink でなく・ディレクトリであり・owner 以外に

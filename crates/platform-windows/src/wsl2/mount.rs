@@ -1196,11 +1196,21 @@ mod tests {
         );
         // 検証と mount が同一スクリプト内にあること（TOCTOU 防止）。
         assert!(MOUNT_SCRIPT.contains("chk \"$T\" || exit 72; exec mount -t drvfs"));
+        // / からの全要素を検証すること・ID の照合と umount が同一スクリプト内にあること（TOCTOU 防止）。
+        assert!(MOUNT_SCRIPT.contains("chk / || exit 70; chk /mnt || exit 70; "));
+        assert!(UMOUNT_SCRIPT.contains("[ \"$top\" = \"$2\" ] || exit 73; exec umount \"$1\""));
         assert_eq!(
-            umount_argv(&d, "/mnt/fandhe/data")
-                .last()
-                .map(String::as_str),
-            Some("/mnt/fandhe/data")
+            umount_argv(&d, "/mnt/fandhe/data", 123).get(5..),
+            Some(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    UMOUNT_SCRIPT.to_string(),
+                    "sh".to_string(),
+                    "/mnt/fandhe/data".to_string(),
+                    "123".to_string()
+                ][..]
+            )
         );
         assert_eq!(
             mountinfo_argv(&d)[5..],
@@ -1318,6 +1328,8 @@ mod tests {
         cat_calls: usize,
         /// `Some(landed)` なら umount を `TIMEOUT` にする。`landed` が true なら解除自体は成立している。
         umount_timeout: Option<bool>,
+        /// true なら UMOUNT_SCRIPT の照合直前に同じマウント先へ他者のマウントが積まれる（照合と解除の競合の模擬）。
+        stack_before_umount: bool,
         /// `Some(code)` なら mount を成立させたうえで終了コード `code` の失敗を返す（16 等の不確定な失敗の模擬）。
         landed_exit_code: Option<i32>,
     }
@@ -1333,10 +1345,10 @@ mod tests {
                 fail_mount_nth: None,
                 mount_calls: 0,
                 umounts: vec![],
-                paths: std::collections::HashMap::from([(
-                    "/mnt".to_string(),
-                    "41ed 0".to_string(),
-                )]),
+                paths: std::collections::HashMap::from([
+                    ("/".to_string(), "41ed 0".to_string()),
+                    ("/mnt".to_string(), "41ed 0".to_string()),
+                ]),
                 fail_cat_after_mount: false,
                 ignore_ro: false,
                 extra_on_mount: false,
@@ -1347,6 +1359,7 @@ mod tests {
                 cat_calls: 0,
                 umount_timeout: None,
                 landed_exit_code: None,
+                stack_before_umount: false,
             }
         }
 
@@ -1411,10 +1424,11 @@ mod tests {
                                 .is_ok_and(|m| m & 0o170_000 == 0o040_000 && m & 0o022 == 0))
                     };
                     let target = format!("/mnt/fandhe/{name}");
-                    match self.paths.get("/mnt") {
-                        Some(r) if safe(r) => {}
-                        Some(_) => return fail(72),
-                        None => return fail(70),
+                    for dir in ["/", "/mnt"] {
+                        match self.paths.get(dir) {
+                            Some(r) if safe(r) => {}
+                            _ => return fail(70),
+                        }
                     }
                     for dir in ["/mnt/fandhe", target.as_str()] {
                         match self.paths.get(dir) {
@@ -1465,8 +1479,25 @@ mod tests {
                     }
                     ok(String::new())
                 }
-                ["umount", target] => {
+                ["sh", "-c", script, "sh", target, id] if *script == UMOUNT_SCRIPT => {
+                    // UMOUNT_SCRIPT の模擬: 最上位のマウント ID が記録値と一致するときだけ外す（不一致は 73）。
                     self.umounts.push((*target).to_string());
+                    if self.stack_before_umount {
+                        self.mounts
+                            .push(((*target).to_string(), "tmpfs".to_string()));
+                        self.ids.push(self.next_id);
+                        self.opts.push("rw".into());
+                        self.next_id += 1;
+                    }
+                    let top = self
+                        .mounts
+                        .iter()
+                        .rposition(|(p, _)| p == target)
+                        .and_then(|i| self.ids.get(i))
+                        .map(u32::to_string);
+                    if top.as_deref() != Some(*id) {
+                        return fail_cat(73);
+                    }
                     if self.umount_timeout == Some(false) {
                         return Self::timeout();
                     }
@@ -1615,7 +1646,7 @@ mod tests {
             "41fd 0",
             "81a4 0",
         ] {
-            for victim in ["/mnt", "/mnt/fandhe", "/mnt/fandhe/a"] {
+            for victim in ["/", "/mnt", "/mnt/fandhe", "/mnt/fandhe/a"] {
                 let mut g = Guest::new("virtiofs");
                 g.paths.insert("/mnt/fandhe".into(), "41ed 0".into());
                 g.paths.insert(victim.into(), bad.into());
@@ -1934,5 +1965,19 @@ mod tests {
             assert_eq!(failures, want, "landed={landed}");
             assert_eq!(g.umounts, ["/mnt/fandhe/a"], "landed={landed}");
         }
+    }
+
+    /// SEC: 照合後・umount 前に同じマウント先へ他者のマウントが積まれても、ゲスト内の再照合で外さず
+    /// 未解除として失敗に数える（他者のマウントも自分のマウントも残る）。
+    #[test]
+    fn release_does_not_unmount_mount_stacked_before_umount() {
+        let mut g = Guest::new("virtiofs");
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
+        g.stack_before_umount = true;
+        let failures = release_with_exec(&p, &mut |a, m| g.run(a, m));
+        assert_eq!(failures, 1);
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+        assert_eq!(g.ids, [1, 100, 101]);
     }
 }

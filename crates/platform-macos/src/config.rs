@@ -1177,6 +1177,13 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("fandhe-macos-cfg-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("create temp dir");
+            // umask に依らず親ディレクトリ検査（他者書き込み可能かつ sticky なしは拒否）を通る 0700 にする。
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod temp dir");
+            }
             Self(dir)
         }
 
@@ -1636,5 +1643,236 @@ mod tests {
         assert_eq!(devs[0].id, "root");
         assert_eq!(cfg.serial_port_count(), 1);
         assert!(log_path.exists());
+    }
+
+    /// テスト用の VM 設定仕様（kernel・initrd あり、デバイスなし）。
+    fn spec_with_initrd(t: &TempDir) -> (VmConfigSpec, PathBuf, PathBuf) {
+        let k = t.file("vmlinux");
+        let i = t.file("initrd.img");
+        let spec = VmConfigSpec::from_parts(&k, Some(&i), "console=hvc0").unwrap();
+        (spec, k, i)
+    }
+
+    fn console_only(log: ConsoleLogPath) -> DeviceConfigSpec {
+        DeviceConfigSpec::try_new(vec![], Some(SerialConsoleSink::LogFile(log))).unwrap()
+    }
+
+    /// MAC-1・TASK-64.3: ログ先が initrd と同一ファイルなら検証時に
+    /// `config.console_log_conflicts_with_boot_file`（field = initrd）で拒否する。
+    #[test]
+    fn with_devices_rejects_console_log_same_as_initrd() {
+        let t = TempDir::new("log-initrd");
+        let (spec, _k, i) = spec_with_initrd(&t);
+        let err = spec
+            .with_devices(console_only(ConsoleLogPath::try_new(&i).unwrap()))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::ConsoleLogConflictsWithBootFile {
+                field: ConfigField::Initrd,
+                path: i.clone(),
+            }
+        );
+        assert_eq!(err.code(), "config.console_log_conflicts_with_boot_file");
+        assert_eq!(
+            err.message(),
+            format!(
+                "console log is the same file as the initrd image: {}",
+                i.display()
+            )
+        );
+    }
+
+    /// MAC-1・TASK-64.3: ログ先が kernel と同一ファイルなら検証時に拒否する（field = kernel）。
+    #[test]
+    fn with_devices_rejects_console_log_same_as_kernel() {
+        let t = TempDir::new("log-kernel");
+        let (spec, k, _i) = spec_with_initrd(&t);
+        let err = spec
+            .with_devices(console_only(ConsoleLogPath::try_new(&k).unwrap()))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::ConsoleLogConflictsWithBootFile {
+                field: ConfigField::Kernel,
+                path: k,
+            }
+        );
+    }
+
+    /// MAC-1・TASK-64.3: 未作成のログ先は検証を通り、照合対象と衝突しない。
+    #[test]
+    fn with_devices_accepts_new_console_log() {
+        let t = TempDir::new("log-new");
+        let (spec, _k, _i) = spec_with_initrd(&t);
+        let log = ConsoleLogPath::try_new(t.0.join("console.log")).unwrap();
+        let spec = spec.with_devices(console_only(log.clone())).unwrap();
+        assert_eq!(
+            spec.devices.serial_console(),
+            Some(&SerialConsoleSink::LogFile(log))
+        );
+    }
+
+    /// MAC-1・TASK-64.3: 検証後にログが initrd へのハードリンクへ差し替えられても、使用時点の
+    /// fd 照合で拒否し initrd を変更しない（次回起動時の initramfs 注入の防止）。
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_hardlink_to_initrd_swapped_after_validation() {
+        let t = TempDir::new("log-initrd-swap");
+        let (spec, _k, i) = spec_with_initrd(&t);
+        let before = std::fs::read(&i).unwrap();
+        let link = t.0.join("console.log");
+        let spec = spec
+            .with_devices(console_only(ConsoleLogPath::try_new(&link).unwrap()))
+            .unwrap();
+        std::fs::hard_link(&i, &link).unwrap();
+        let err = spec.open_serial_console_log().unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::ConsoleLogConflictsWithBootFile {
+                field: ConfigField::Initrd,
+                path: link,
+            }
+        );
+        assert_eq!(std::fs::read(&i).unwrap(), before);
+    }
+
+    /// MAC-1・TASK-64.3: 検証後にログが kernel へのハードリンクへ差し替えられても拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_hardlink_to_kernel_swapped_after_validation() {
+        let t = TempDir::new("log-kernel-swap");
+        let (spec, k, _i) = spec_with_initrd(&t);
+        let link = t.0.join("console.log");
+        let spec = spec
+            .with_devices(console_only(ConsoleLogPath::try_new(&link).unwrap()))
+            .unwrap();
+        std::fs::hard_link(&k, &link).unwrap();
+        assert_eq!(
+            spec.open_serial_console_log().unwrap_err().code(),
+            "config.console_log_conflicts_with_boot_file"
+        );
+        assert_eq!(std::fs::read(&k).unwrap(), b"dummy");
+    }
+
+    /// MAC-1・TASK-64.3: ハードリンクが複数ある既存ファイルは検証時に `config.console_log_multiple_links`。
+    #[cfg(unix)]
+    #[test]
+    fn console_log_with_multiple_links_rejected_at_validation() {
+        let t = TempDir::new("log-nlink");
+        let victim = t.file("victim.txt");
+        let link = t.0.join("console.log");
+        std::fs::hard_link(&victim, &link).unwrap();
+        assert_eq!(
+            ConsoleLogPath::try_new(&link).unwrap_err(),
+            ConfigError::ConsoleLogMultipleLinks {
+                path: link,
+                links: 2,
+            }
+        );
+    }
+
+    /// MAC-1・TASK-64.3: 検証後に照合対象外のファイルへのハードリンクへ差し替えられても、
+    /// 使用時点の fd のリンク数検査で拒否し、リンク先を変更しない。
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_hardlink_created_after_validation() {
+        let t = TempDir::new("log-nlink-swap");
+        let victim = t.file("victim.txt");
+        let link = t.0.join("console.log");
+        let log = ConsoleLogPath::try_new(&link).unwrap();
+        std::fs::hard_link(&victim, &link).unwrap();
+        assert_eq!(
+            log.open_for_append_excluding(&[]).unwrap_err(),
+            ConfigError::ConsoleLogMultipleLinks {
+                path: link,
+                links: 2,
+            }
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"dummy");
+    }
+
+    /// MAC-1・TASK-64.3: 所有者・リンク数の判定（root なしで uid 不一致を検査するため純粋関数で照合する）。
+    #[cfg(unix)]
+    #[test]
+    fn log_ownership_judgement() {
+        let p = Path::new("/var/log/console.log");
+        assert_eq!(
+            check_log_ownership(p, LogFileAttrs { nlink: 1, uid: 501 }, 501),
+            Ok(())
+        );
+        let err = check_log_ownership(p, LogFileAttrs { nlink: 1, uid: 0 }, 501).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::ConsoleLogNotOwned {
+                path: p.to_path_buf(),
+                owner: 0,
+                euid: 501,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "config.console_log_not_owned: console log is owned by uid 0, expected effective uid 501: /var/log/console.log"
+        );
+        // リンク数を所有者より先に見る。
+        let err = check_log_ownership(p, LogFileAttrs { nlink: 3, uid: 0 }, 501).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "config.console_log_multiple_links: console log has 3 hard links, expected 1: /var/log/console.log"
+        );
+    }
+
+    /// MAC-1・TASK-64.3: 親ディレクトリのモード判定（他者書き込み可能かつ sticky なしのみ拒否）。
+    #[cfg(unix)]
+    #[test]
+    fn parent_mode_judgement() {
+        let p = Path::new("/srv/logs");
+        let rejected = ConfigError::ConsoleLogParentWorldWritable {
+            path: p.to_path_buf(),
+        };
+        assert_eq!(check_parent_mode(p, 0o40777), Err(rejected.clone()));
+        assert_eq!(check_parent_mode(p, 0o40703), Err(rejected.clone()));
+        assert_eq!(check_parent_mode(p, 0o41777), Ok(()));
+        assert_eq!(check_parent_mode(p, 0o40775), Ok(()));
+        assert_eq!(check_parent_mode(p, 0o40700), Ok(()));
+        assert_eq!(
+            rejected.to_string(),
+            "config.console_log_parent_world_writable: console log parent directory is world-writable without the sticky bit: /srv/logs"
+        );
+    }
+
+    /// MAC-1・TASK-64.3: 実ディレクトリでも、0777 の親は検証時・open 時とも拒否し、0777 + sticky は許可する。
+    #[cfg(unix)]
+    #[test]
+    fn world_writable_parent_without_sticky_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TempDir::new("log-parent");
+        let dir = t.0.join("shared");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("console.log");
+        let log = ConsoleLogPath::try_new(&path).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let rejected = ConfigError::ConsoleLogParentWorldWritable { path: dir.clone() };
+        assert_eq!(ConsoleLogPath::try_new(&path).unwrap_err(), rejected);
+        assert_eq!(log.open_for_append_excluding(&[]).unwrap_err(), rejected);
+        assert!(!path.exists());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(ConsoleLogPath::try_new(&path).is_ok());
+        assert!(log.open_for_append_excluding(&[]).is_ok());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// MAC-1・TASK-64.3: 自分が作成した単一リンクの既存ログは所有者・リンク数検査を通り、追記できる。
+    #[cfg(unix)]
+    #[test]
+    fn existing_own_console_log_is_accepted() {
+        use std::io::Write;
+        let t = TempDir::new("log-own");
+        let path = t.file("console.log");
+        let log = ConsoleLogPath::try_new(&path).unwrap();
+        let mut f = log.open_for_append_excluding(&[]).unwrap();
+        f.write_all(b"+more").unwrap();
+        drop(f);
+        assert_eq!(std::fs::read(&path).unwrap(), b"dummy+more");
     }
 }

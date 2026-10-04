@@ -196,6 +196,29 @@ fn require_kernel() -> PathBuf {
     })
 }
 
+/// ブートマーカーを決める。未指定は既定値、空文字列は拒否する。
+///
+/// 空マーカーは `contains` が常に true になり、ゲストが何も出力しなくても起動確認を通過してしまうため（MAC-1）。
+fn resolve_boot_marker(raw: Option<String>) -> Result<String, String> {
+    match raw {
+        None => Ok("Linux version".to_string()),
+        Some(m) if m.is_empty() => {
+            Err("boot marker must not be empty (it would match any console output)".to_string())
+        }
+        Some(m) => Ok(m),
+    }
+}
+
+#[test]
+fn mac1_boot_marker_rejects_empty_and_defaults_when_unset() {
+    assert_eq!(resolve_boot_marker(None), Ok("Linux version".to_string()));
+    assert_eq!(
+        resolve_boot_marker(Some("login:".to_string())),
+        Ok("login:".to_string())
+    );
+    assert!(resolve_boot_marker(Some(String::new())).is_err());
+}
+
 /// 末尾の最大 `max` バイトを文字列にする（失敗時の診断用）。
 fn tail_lossy(bytes: &[u8], max: usize) -> String {
     let start = bytes.len().saturating_sub(max);
@@ -214,8 +237,8 @@ fn mac1_minimal_vm_boots_and_stops_on_real_macos() {
     let disk = env_path("FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE");
     let cmdline = std::env::var("FANDHE_CONTAINER_MACOS_VM_CMDLINE")
         .unwrap_or_else(|_| "console=hvc0".to_string());
-    let marker = std::env::var("FANDHE_CONTAINER_MACOS_VM_BOOT_MARKER")
-        .unwrap_or_else(|_| "Linux version".to_string());
+    let marker = resolve_boot_marker(std::env::var("FANDHE_CONTAINER_MACOS_VM_BOOT_MARKER").ok())
+        .expect("invalid FANDHE_CONTAINER_MACOS_VM_BOOT_MARKER");
     let boot_secs: u64 =
         match std::env::var("FANDHE_CONTAINER_MACOS_VM_BOOT_TIMEOUT_SECS") {
             Ok(v) => v.parse().ok().filter(|n| (1..=600).contains(n)).expect(

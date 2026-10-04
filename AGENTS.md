@@ -275,17 +275,16 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
   FANDHE_CONTAINER_MACOS_VM_KERNEL=/abs/path/to/vmlinux FANDHE_CONTAINER_MACOS_VM_READY_MARKER="<ゲストが起動完了後にだけ出力する文字列>" <上で得たバイナリ> --ignored --nocapture
   ```
 
-- virtiofs の symlink・ハードリンク挙動の手動確認（MAC-1・TASK-65.1 追補・#1374。人間担当。Agent は手順準備まで）: 自動テストは無い手動手順。必要環境は `vm_boot` と同じ（実機の macOS 13 以上・`com.apple.security.virtualization` 付き ad-hoc 署名・自前ビルドのゲストカーネル。root 不要）。**正常ゲストの観測は拒否を維持する判断の補強にしかならない**（`cat link` は `FUSE_READLINK` → ゲスト側解決の正常経路で、侵害ゲストが symlink の nodeid へ直接 `FUSE_OPEN` を送る脅威は観測できない）ため、結果にかかわらず絶対パス symlink・ハードリンクの拒否は本手順だけでは緩めない。範囲外 symlink を含む fixture は ReadWrite 検査を通らないので ReadOnly 共有で観測し、ゲストが実行中に作るリンクの観測は空の ReadWrite 共有で行う。書き込みを伴う確認は `RW` 内に限り、ホストの共有外ファイルを書き換えない。
+- virtiofs の symlink・ハードリンク挙動の手動確認（MAC-1・TASK-65.1 追補・#1374。人間担当。Agent は手順準備まで）: 自動テストは無い手動手順。必要環境は `vm_boot` と同じ（実機の macOS 13 以上・`com.apple.security.virtualization` 付き ad-hoc 署名・自前ビルドのゲストカーネル。root 不要）。**正常ゲストの観測は拒否を維持する判断の補強にしかならない**（`cat link` は `FUSE_READLINK` → ゲスト側解決の正常経路で、侵害ゲストが symlink の nodeid へ直接 `FUSE_OPEN` を送る脅威は観測できない）ため、結果にかかわらず絶対パス symlink・ハードリンクの拒否は本手順だけでは緩めない。**現行 API では、共有範囲外を指す symlink（絶対パス・`..` 経由）・範囲外への dangling symlink・ハードリンク（`nlink > 1`）を含む fixture は ReadOnly 共有でも `VmConfigSpec::check_share_conflicts`（`build_vz_configuration` が VZ 呼び出し前に実行）が拒否するため VM を起動できず、これらをゲストから観測することはできない**（観測するには拒否の緩和が要り、本手順の範囲外。緩和の要否は別途ユーザー判断）。本手順で観測できるのは共有範囲内に収まるリンクと、ゲストが実行中に作るリンク（空の ReadWrite 共有）に限る。書き込みを伴う確認は `RW` 内に限り、ホストの共有外ファイルを書き換えない。
   1. fixture（ホスト側。パスは必ずダブルクォートする）:
 
      ```bash
-     W="$(mktemp -d)"; mkdir "$W/ro" "$W/rw" "$W/ro_hl"
-     echo HOST-OUTSIDE-MARKER > "$W/outside.txt"            # ゲスト内の同パスには GUEST-SIDE-MARKER を置く
-     ln -s "$W/outside.txt" "$W/ro/abs_link"                # 絶対パス symlink
-     ln -s ../outside.txt "$W/ro/rel_link"                  # `..` を含む相対 symlink（共有外）
-     ln -s "$W/missing" "$W/ro/dangling_link"               # dangling
-     echo inside > "$W/ro/inside.txt"; ln -s inside.txt "$W/ro/inside_link"
-     echo hl > "$W/ro_hl/a"; ln "$W/ro_hl/a" "$W/ro_hl/b"; ln "$W/ro_hl/a" "$W/outside_hl"
+     W="$(mktemp -d)"; mkdir "$W/ro" "$W/rw"
+     echo inside > "$W/ro/inside.txt"
+     ln -s inside.txt "$W/ro/inside_link"                   # 共有内の相対 symlink
+     ln -s "$W/ro/inside.txt" "$W/ro/abs_inside_link"       # 共有内を指す絶対パス symlink
+     ln -s "$W/ro/missing" "$W/ro/dangling_inside_link"     # 共有内の未作成パスを指す dangling
+     # 範囲外 symlink・ハードリンク（nlink > 1）の fixture は check_share_conflicts に拒否され起動できないため作らない
      ```
 
   2. 実行入口（既存の起動コマンドだけでは共有されない）: `vm_boot` の `#[ignore]` テストは `VmConfigSpec` に共有を追加せず `Vm::launch` を呼ぶため、そのままではゲストから fixture を観測できない。手元の作業ツリーで `crates/platform-macos/tests/vm_boot.rs` の `mac1_minimal_vm_boots_and_stops_on_real_macos` に一時的に次を足して実行する（**コミットしない**。観測後に当該ファイルの変更を破棄して戻す）。`W` は手順 1 の値を環境変数 `FANDHE_CONTAINER_TEST_VIRTIOFS_FIXTURE` で渡す。
@@ -309,7 +308,6 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
          VirtiofsSharesSpec::try_new(vec![
              share("ro", "ro", ShareAccess::ReadOnly),
              share("rw", "rw", ShareAccess::ReadWrite),
-             share("ro_hl", "ro_hl", ShareAccess::ReadOnly),
          ])
          .expect("shares")
      })
@@ -318,20 +316,13 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
      ゲスト側のマウント手順（ゲスト資産の init か対話シェルで実行。ゲストカーネルで virtiofs が有効であること）:
 
      ```sh
-     mkdir -p /mnt/ro /mnt/rw /mnt/ro_hl
-     mount -t virtiofs ro /mnt/ro; mount -t virtiofs rw /mnt/rw; mount -t virtiofs ro_hl /mnt/ro_hl
+     mkdir -p /mnt/ro /mnt/rw
+     mount -t virtiofs ro /mnt/ro; mount -t virtiofs rw /mnt/rw
      ```
 
-     ゲスト側マーカーの用意（手順 3 の観測前に、ゲスト内で `mount` の後に実行する。`abs_link` がゲスト側の同パスへ解決されたときに `GUEST-SIDE-MARKER` が読める状態にしないと、`cat` が単にファイル不存在で失敗して「ホストが辿った / 辿らない」を区別できない）。`<W の値>` は手順 1 の `$W` の展開結果（ホストで `echo "$W"` した絶対パス）を貼る:
-
-     ```sh
-     mkdir -p "<W の値>" && echo GUEST-SIDE-MARKER > "<W の値>/outside.txt"   # abs_link（絶対パス symlink）の解決先
-     echo GUEST-SIDE-MARKER > /mnt/outside.txt                                 # rel_link（`../outside.txt`）の解決先（/mnt/ro の 1 つ上）
-     ```
-
-     対応はホストの `$W/ro`・`$W/rw`・`$W/ro_hl` がゲストの `/mnt/ro`・`/mnt/rw`・`/mnt/ro_hl`（タグ名 = mount の第 1 引数）。シリアル入力手段が無い場合は、上の mount と下の観測コマンドをゲスト資産の起動スクリプトに仕込み、結果をコンソールログ（stderr に出るパス）で読む。
-  3. ゲスト側の観測: `/mnt/ro` の各 symlink（`abs_link`・`rel_link`・`dangling_link`・`inside_link`）を `readlink`・`cat`・`stat` して読めた内容がホスト側マーカーかゲスト側マーカーかを記録する。`/mnt/rw` 内で `ln -s`（`FUSE_SYMLINK`）・`ln`（`FUSE_LINK`）を実行し、ホスト側の `$W/rw` で `ls -l`・`stat` してリンクの実体・リンク数を記録する。`/mnt/ro_hl/a`・`/mnt/ro_hl/b` の読み取りと `stat` のリンク数も記録する
-  4. 判定: ゲスト側マーカーが読める（ホストが辿らない）なら拒否維持の補強のみ。ホスト側マーカーが読めるなら拒否の維持が必須かつ ReadOnly 共有の扱いも見直しが要る（ユーザーへ報告し別 Issue）
+     対応はホストの `$W/ro`・`$W/rw` がゲストの `/mnt/ro`・`/mnt/rw`（タグ名 = mount の第 1 引数）。シリアル入力手段が無い場合は、上の mount と下の観測コマンドをゲスト資産の起動スクリプトに仕込み、結果をコンソールログ（stderr に出るパス）で読む。
+  3. ゲスト側の観測: `/mnt/ro` の各 symlink（`inside_link`・`abs_inside_link`・`dangling_inside_link`）を `readlink`・`cat`・`stat` して結果を記録する（`abs_inside_link` はゲスト内に同パスが無いため、`cat` が失敗すればゲストの名前空間で解決された証拠になる）。`/mnt/rw` 内で `ln -s`（`FUSE_SYMLINK`）・`ln`（`FUSE_LINK`）を実行し、ホスト側の `$W/rw` で `ls -l`・`stat` してリンクの実体・リンク数を記録する
+  4. 判定: `abs_inside_link` の `cat` がゲスト側で失敗する（ホストが辿らずゲストで解決される）なら拒否維持の補強のみ。ホスト上の `inside.txt` の内容が読めるなら、ホスト側サーバがリンクを辿る証拠としてユーザーへ報告し別 Issue とする。範囲外 symlink・ハードリンクの挙動は本手順では確認できない旨も記録に残す
   5. 記録先: 結果を #1374 にコメントし、関連 PR にも記録する
 
 - `make fio-bench`（TASK-25.1・IO-8）: fio・GNU coreutils の `timeout` が入った Linux 環境が必要（root 権限・`/dev/kvm` は不要）。`make fio-bench-selftest`（`--from-json` モード＋固定 fixture＋fio スタブで完結し、実 fio は使わない）は CI の `bench-regression` ジョブに組み込み済みで既定のテスト集合の一部。`make fio-bench` 自体の実機実行・Docker コンテナ内での fio 実行（runbook は [docs/design/io-fio-bench.md](docs/design/io-fio-bench.md)「Docker ベースラインの計測手順」）・その結果の `make fio-baseline-ratio` への入力は TASK-25.2（#113。人間共同）が担う。`make fio-baseline-ratio`（比率算出そのもの）は fio・Docker を必要としないため既定のテスト集合の一部（`make fio-baseline-ratio-selftest` として CI に組み込み済み）

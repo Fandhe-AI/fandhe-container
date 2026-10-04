@@ -370,8 +370,10 @@ fn exec_argv(distro: &DistroName, cmd: &[&str]) -> Vec<String> {
 /// 差し替えて検証外の場所へ root でマウントさせられる（TOCTOU）。そのため全工程を単一プロセスに拘束し、
 /// 検証から `mount` までの窓を最小にする。位置引数は `$1`=ホストディレクトリ・`$2`=マウント名・`$3`=オプション
 /// （固定スクリプトに値を埋め込まず引数で渡すため、シェルのインジェクションは起きない。入力は検証済み newtype）。
-/// 終了コード: 70=`/`・`/mnt` が root 所有の他者書き込み不可な実ディレクトリでない・71=ディレクトリ作成失敗・
-/// 72=パス要素が symlink / 非 root 所有 / 他者書き込み可。`mount` 自身の失敗はその終了コード（64 以下）をそのまま返す。
+/// 終了コード: 200=`/`・`/mnt` が root 所有の他者書き込み不可な実ディレクトリでない・201=ディレクトリ作成失敗・
+/// 202=パス要素が symlink / 非 root 所有 / 他者書き込み可。`mount` 自身の終了コードはそのまま返る。
+/// `mount(8)` の終了コードは 1〜64 のビットの論理和（0〜127）で、シグナル終了は 128+シグナル番号（192 以下）に
+/// なるため、スクリプト固有のコードは両者と重ならない 200 番台に置く（`exec mount` 後の失敗を検証失敗と誤認しない）。
 /// 検証は symlink 非追従（`-L`）と `stat` の生モード（`%f`。ロケール非依存）で行う。
 ///
 /// `/` からマウント先までの全要素が「root 所有・group / other 書き込み不可・symlink でない」ことを確かめるため、
@@ -384,19 +386,19 @@ const MOUNT_SCRIPT: &str = concat!(
     "chk() { [ ! -L \"$1\" ] && [ -d \"$1\" ] || return 1; ",
     "set -- $(stat -c '%u %f' -- \"$1\"); ",
     "[ \"$1\" = 0 ] && [ $((0x$2 & 18)) -eq 0 ]; }; ",
-    "chk / || exit 70; ",
-    "chk /mnt || exit 70; ",
-    "[ -L \"$B\" ] || [ -e \"$B\" ] || mkdir -m 755 -- \"$B\" || exit 71; ",
-    "chk \"$B\" || exit 72; ",
+    "chk / || exit 200; ",
+    "chk /mnt || exit 200; ",
+    "[ -L \"$B\" ] || [ -e \"$B\" ] || mkdir -m 755 -- \"$B\" || exit 201; ",
+    "chk \"$B\" || exit 202; ",
     "T=\"$B/$2\"; ",
-    "[ -L \"$T\" ] || [ -e \"$T\" ] || mkdir -m 755 -- \"$T\" || exit 71; ",
-    "chk \"$T\" || exit 72; ",
+    "[ -L \"$T\" ] || [ -e \"$T\" ] || mkdir -m 755 -- \"$T\" || exit 201; ",
+    "chk \"$T\" || exit 202; ",
     "exec mount -t drvfs -o \"$3\" \"$1\" \"$T\""
 );
 /// [`MOUNT_SCRIPT`] の終了コード（`/mnt` 不正 / ディレクトリ作成失敗 / パス要素が危険）。
-const EXIT_PARENT_BAD: i32 = 70;
-const EXIT_MKDIR_FAILED: i32 = 71;
-const EXIT_PATH_UNSAFE: i32 = 72;
+const EXIT_PARENT_BAD: i32 = 200;
+const EXIT_MKDIR_FAILED: i32 = 201;
+const EXIT_PATH_UNSAFE: i32 = 202;
 
 /// 検証込みマウントコマンドの組み立て。`-t drvfs` が virtiofs で成立するかは実機未検証（TASK-67.6・#377。REPAIR-3）。
 fn mount_argv(distro: &DistroName, m: &SharedMount) -> Vec<String> {
@@ -426,13 +428,13 @@ fn mount_argv(distro: &DistroName, m: &SharedMount) -> Vec<String> {
 /// 確認した自分のマウントではなく他者のマウントを外しうる。そのため [`MOUNT_SCRIPT`] と同様に単一プロセスへ拘束し、
 /// 窓を最小にする。位置引数は `$1`=マウント先（固定基底配下の検証済み名で、mountinfo の 8 進エスケープを含まない）・
 /// `$2`=記録したマウント ID。mountinfo の 1 列目（マウント ID）と 5 列目（マウント先）だけを `read` で読む
-/// （awk 等に依存しない）。終了コード 73=最上位が記録したマウントでない（外さない）。それ以外は `umount` の
-/// 終了コード（64 以下）。残る窓（同一プロセス内の確認から `umount` まで）に同じマウント先へマウントできるのは
+/// （awk 等に依存しない）。終了コード 203=最上位が記録したマウントでない（外さない）。それ以外は `umount` の
+/// 終了コード（[`MOUNT_SCRIPT`] と同じ理由で、`umount(8)` の終了コード・シグナル終了と重ならない 200 番台に置く）。残る窓（同一プロセス内の確認から `umount` まで）に同じマウント先へマウントできるのは
 /// ゲスト内の root（CAP_SYS_ADMIN）に限られ、[`MOUNT_SCRIPT`] と同じく信頼境界の内側として扱う。
 const UMOUNT_SCRIPT: &str = concat!(
     "set -u; top=; ",
     "while read -r id _ _ _ mp _; do if [ \"$mp\" = \"$1\" ]; then top=$id; fi; done < /proc/self/mountinfo; ",
-    "[ \"$top\" = \"$2\" ] || exit 73; ",
+    "[ \"$top\" = \"$2\" ] || exit 203; ",
     "exec umount \"$1\""
 );
 
@@ -628,7 +630,7 @@ struct OwnedMount {
 ///
 /// 解除の直前に mountinfo を読み直し、マウント先の最上位エントリが記録したマウント ID と一致する場合に限り
 /// `umount` する。`umount` は [`UMOUNT_SCRIPT`] がゲスト内で同じ照合をやり直してから行う（照合と解除の間に
-/// 積まれた他者のマウントを外さない。不一致の終了コード 73 は `umount` の失敗と同様に読み直して判定する）。
+/// 積まれた他者のマウントを外さない。不一致の終了コード 203 は `umount` の失敗と同様に読み直して判定する）。
 /// 一致しない（他プロセスが差し替えた・既に外れている）場合は他者のマウントを外さないよう何もしない。
 /// mountinfo を読めない場合は所有を確認できないため外さず、失敗として数える。
 /// 記録したマウント ID がマウント先の最上位でなくても mountinfo のどこか（他者が移動した別のマウント先を含む）に
@@ -696,7 +698,7 @@ fn with_rollback_note(e: Wsl2Error, failures: usize) -> Wsl2Error {
 /// mount の結果ごとの扱い:
 /// - 成功: 新規マウントを特定して記録する。特定できなければ（0 件・複数件・mountinfo を上限回数まで読めない）
 ///   他者のマウントを外さないよう記録せず、`ownership unconfirmed` の失敗を返す（fail-closed）。
-/// - [`MOUNT_SCRIPT`] の検証失敗（70〜72）: `mount` を実行する前に終了しているので、mountinfo を読まずに返す。
+/// - [`MOUNT_SCRIPT`] の検証失敗（200〜202）: `mount` を実行する前に終了しているので、mountinfo を読まずに返す。
 /// - それ以外の失敗（`mount(8)` の終了コード・`wsl.exe` のタイムアウト・出力読み取り失敗・`wsl.exe` 自身の異常値）:
 ///   `mount(8)` はマウント成立後の処理でも失敗を返しうる（システムエラー等）ため、終了コードだけで未成立と
 ///   決めない。ゲスト内で mount が成立している可能性があるものとして、同じ差分基準で mountinfo を読み直す
@@ -719,7 +721,7 @@ fn mount_one(
     let failure = match exec(&mount_argv(distro, m), MAX_OUTPUT_BYTES) {
         Ok(out) if out.success => None,
         Ok(out) => {
-            // 70〜72 は MOUNT_SCRIPT が `exec mount` の前に返す（`mount(8)` の終了コードは 64 以下で重ならない）。
+            // 200〜202 は MOUNT_SCRIPT が `exec mount` の前に返す（`mount(8)`・シグナル終了のコードと重ならない）。
             match out.code {
                 Some(EXIT_PARENT_BAD) => {
                     return Err(precondition(
@@ -1195,10 +1197,10 @@ mod tests {
             Some("nosuid,nodev,ro")
         );
         // 検証と mount が同一スクリプト内にあること（TOCTOU 防止）。
-        assert!(MOUNT_SCRIPT.contains("chk \"$T\" || exit 72; exec mount -t drvfs"));
+        assert!(MOUNT_SCRIPT.contains("chk \"$T\" || exit 202; exec mount -t drvfs"));
         // / からの全要素を検証すること・ID の照合と umount が同一スクリプト内にあること（TOCTOU 防止）。
-        assert!(MOUNT_SCRIPT.contains("chk / || exit 70; chk /mnt || exit 70; "));
-        assert!(UMOUNT_SCRIPT.contains("[ \"$top\" = \"$2\" ] || exit 73; exec umount \"$1\""));
+        assert!(MOUNT_SCRIPT.contains("chk / || exit 200; chk /mnt || exit 200; "));
+        assert!(UMOUNT_SCRIPT.contains("[ \"$top\" = \"$2\" ] || exit 203; exec umount \"$1\""));
         assert_eq!(
             umount_argv(&d, "/mnt/fandhe/data", 123).get(5..),
             Some(
@@ -1427,13 +1429,13 @@ mod tests {
                     for dir in ["/", "/mnt"] {
                         match self.paths.get(dir) {
                             Some(r) if safe(r) => {}
-                            _ => return fail(70),
+                            _ => return fail(EXIT_PARENT_BAD),
                         }
                     }
                     for dir in ["/mnt/fandhe", target.as_str()] {
                         match self.paths.get(dir) {
                             Some(r) if safe(r) => {}
-                            Some(_) => return fail(72),
+                            Some(_) => return fail(EXIT_PATH_UNSAFE),
                             None => {
                                 self.paths.insert(dir.to_string(), "41ed 0".to_string());
                             }
@@ -1480,7 +1482,7 @@ mod tests {
                     ok(String::new())
                 }
                 ["sh", "-c", script, "sh", target, id] if *script == UMOUNT_SCRIPT => {
-                    // UMOUNT_SCRIPT の模擬: 最上位のマウント ID が記録値と一致するときだけ外す（不一致は 73）。
+                    // UMOUNT_SCRIPT の模擬: 最上位のマウント ID が記録値と一致するときだけ外す（不一致は 203）。
                     self.umounts.push((*target).to_string());
                     if self.stack_before_umount {
                         self.mounts
@@ -1496,7 +1498,7 @@ mod tests {
                         .and_then(|i| self.ids.get(i))
                         .map(u32::to_string);
                     if top.as_deref() != Some(*id) {
-                        return fail_cat(73);
+                        return fail_cat(203);
                     }
                     if self.umount_timeout == Some(false) {
                         return Self::timeout();
@@ -1659,7 +1661,7 @@ mod tests {
                 );
                 assert_eq!(g.mount_calls, 0, "{bad} {victim}");
                 assert!(g.mounts.len() == 1, "{bad} {victim}");
-                // exec mount 前の検証失敗（70〜72）は回復の読み直しをしない（mount 前の 1 回のみ）。
+                // exec mount 前の検証失敗（200〜202）は回復の読み直しをしない（mount 前の 1 回のみ）。
                 assert_eq!(g.cat_calls, 1, "{bad} {victim}");
             }
         }
@@ -1931,11 +1933,11 @@ mod tests {
         assert_eq!(g.cat_calls, 4);
     }
 
-    /// SEC: mount(8) が失敗コード（2=システムエラー・16・32=マウント失敗）を返しても成立していた場合は、
-    /// 終了コードだけで未成立と決めず、読み直して成立分を外す。
+    /// SEC: mount(8) が失敗コード（2=システムエラー・16・32=マウント失敗・ビットの組み合わせの 70〜72）を
+    /// 返しても成立していた場合は、終了コードだけで未成立と決めず、読み直して成立分を外す。
     #[test]
     fn prepare_rolls_back_mount_that_landed_despite_failure_code() {
-        for code in [2, 16, 32] {
+        for code in [2, 16, 32, 70, 71, 72] {
             let mut g = Guest::new("virtiofs");
             g.landed_exit_code = Some(code);
             let r = req(vec![sm("C:\\a", "a", false)]);

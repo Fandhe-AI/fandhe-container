@@ -1,5 +1,5 @@
 #![cfg(target_os = "macos")]
-//! objc2 / Virtualization.framework の FFI 呼び出しを包む薄いラッパーの置き場（MAC-1・TASK-64.1/64.2/64.3）。
+//! objc2 / Virtualization.framework の FFI 呼び出しを包む薄いラッパーの置き場（MAC-1・TASK-64.1/64.2/64.3・65.1）。
 //!
 //! 上位モジュール（`config`）へは安全な API だけを公開し、`unsafe fn` を本モジュールの外へ公開しない。
 //! 各 `unsafe` は `// SAFETY:` で不変条件を明記し、`.claude/rules/coding-rust.md` の事前承認（#4）の
@@ -35,9 +35,11 @@ use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
-    VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment, VZLinuxBootLoader,
-    VZSerialPortConfiguration, VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZDirectorySharingDeviceConfiguration, VZDiskImageStorageDeviceAttachment,
+    VZFileHandleSerialPortAttachment, VZLinuxBootLoader, VZSerialPortConfiguration,
+    VZSharedDirectory, VZSingleDirectoryShare, VZStorageDeviceConfiguration,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioFileSystemDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
     VZVirtualMachineDelegate,
 };
 use std::sync::Arc;
@@ -61,6 +63,13 @@ fn summarize_error(err: &NSError) -> VzErrorInfo {
         err.domain().to_string().chars().take(128).collect(),
         err.code(),
     )
+}
+
+/// 読み戻した virtiofs 共有設定（診断用）。
+pub(crate) struct ShareReadBack {
+    pub(crate) tag: String,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) read_only: bool,
 }
 
 /// 読み戻したブートローダ設定（kernel パス・initrd パス・コマンドライン）。
@@ -205,6 +214,78 @@ pub(crate) fn new_virtio_block_device(
         }
         dev.into_super()
     }
+}
+
+/// virtiofs の共有タグを VZ 側でも検証する（35 バイト以下・UTF-8 等）。
+pub(crate) fn validate_virtiofs_tag(tag: &NSString) -> Result<(), VzErrorInfo> {
+    // SAFETY: `tag` は有効な NSString への参照。クラスメソッドで副作用はなく、不正値は例外ではなく
+    // NSError として返る。
+    unsafe { VZVirtioFileSystemDeviceConfiguration::validateTag_error(tag) }
+        .map_err(|e| summarize_error(&e))
+}
+
+/// 単一ディレクトリ共有の virtiofs デバイス設定を生成する。
+///
+/// `tag` は呼び出し側が `validate_virtiofs_tag` 済み、`url` は検証済みのホストディレクトリの file URL であること
+/// （`initWithTag:` は不正タグで ObjC 例外を投げ、捕捉できず abort するため）。
+pub(crate) fn new_virtiofs_device(
+    tag: &NSString,
+    url: &NSURL,
+    read_only: bool,
+) -> Retained<VZDirectorySharingDeviceConfiguration> {
+    // SAFETY: `tag` / `url` は有効な参照で呼び出し中は生存する。`tag` は事前に VZ の検証を通している。
+    // alloc した未初期化オブジェクトを init ファミリーで初期化し、所有権は `Retained` が引き継ぐ。
+    // `VZSharedDirectory` は `url` を保持し、`VZSingleDirectoryShare` は directory を、デバイス設定は
+    // share を retain する（setter は例外を投げない）。
+    unsafe {
+        let dir =
+            VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), url, read_only);
+        let share =
+            VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &dir);
+        let dev = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+            VZVirtioFileSystemDeviceConfiguration::alloc(),
+            tag,
+        );
+        dev.setShare(Some(&share.into_super()));
+        dev.into_super()
+    }
+}
+
+/// virtiofs デバイス群を設定に組み込む。
+pub(crate) fn set_directory_sharing_devices(
+    config: &VZVirtualMachineConfiguration,
+    devices: &[Retained<VZDirectorySharingDeviceConfiguration>],
+) {
+    let devices = NSArray::from_retained_slice(devices);
+    // SAFETY: 配列は有効で、VZ 側が copy する（呼び出し中のみ生存すればよい）。要素は有効なデバイス設定。
+    unsafe { config.setDirectorySharingDevices(&devices) }
+}
+
+/// 設定済みの virtiofs 共有を読み戻す（テスト・診断用）。
+pub(crate) fn read_back_shares(config: &VZVirtualMachineConfiguration) -> Vec<ShareReadBack> {
+    // SAFETY: `config` は有効なインスタンスで、getter は副作用のない読み出し。
+    let devices = unsafe { config.directorySharingDevices() };
+    devices
+        .to_vec()
+        .into_iter()
+        .filter_map(|dev| {
+            let fs = dev
+                .downcast::<VZVirtioFileSystemDeviceConfiguration>()
+                .ok()?;
+            // SAFETY: `fs` は有効なインスタンスで、getter は副作用のない読み出し。戻りは `Retained` が管理する。
+            let share = unsafe { fs.share() }?;
+            let single = share.downcast::<VZSingleDirectoryShare>().ok()?;
+            // SAFETY: `single` / その directory は有効なインスタンスで、getter は副作用のない読み出し。
+            unsafe {
+                let dir = single.directory();
+                Some(ShareReadBack {
+                    tag: fs.tag().to_string(),
+                    path: dir.URL().to_file_path(),
+                    read_only: dir.isReadOnly(),
+                })
+            }
+        })
+        .collect()
 }
 
 /// 所有 fd を `NSFileHandle` に移す。

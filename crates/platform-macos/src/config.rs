@@ -10,6 +10,9 @@
 //! 最小デバイス構成（TASK-64.3）として virtio-blk のルートディスクと virtio-console のシリアル
 //! コンソール（ログファイル出力）を [`DeviceConfigSpec`] で表す。
 //!
+//! virtiofs 共有（TASK-65.1）は [`VmConfigSpec::shares`]（`crate::virtiofs`）で表し、
+//! [`build_vz_configuration`] が `VZVirtioFileSystemDeviceConfiguration` として VM 構成へ追加する。
+//!
 //! 呼び出し文脈: TASK-64.4 が構築済み設定から `VZVirtualMachine` を生成して起動し、ゲストの
 //! `console=hvc0` 出力をコンソールログから確認する（TASK-64.6 の vm_boot 結合試験）。[`ConfigError`] は
 //! `error::PlatformError`（TASK-64.5）に包まれて返る。検証後〜起動までの TOCTOU（ファイル差し替え）は残るため、
@@ -32,6 +35,8 @@
 use std::fmt;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+
+use crate::virtiofs::VirtiofsSharesSpec;
 
 /// カーネルコマンドラインの最大バイト数（Linux の `COMMAND_LINE_SIZE` 相当。無制限確保の防止）。
 pub const MAX_COMMAND_LINE_BYTES: usize = 2048;
@@ -62,6 +67,8 @@ pub enum ConfigField {
     DiskImage,
     /// シリアルコンソールのログファイル。
     ConsoleLog,
+    /// virtiofs で共有するホストディレクトリ（TASK-65.1）。
+    SharedDirectory,
 }
 
 impl ConfigField {
@@ -71,6 +78,7 @@ impl ConfigField {
             ConfigField::Initrd => "initrd",
             ConfigField::DiskImage => "disk_image",
             ConfigField::ConsoleLog => "console_log",
+            ConfigField::SharedDirectory => "shared_directory",
         }
     }
 }
@@ -148,6 +156,26 @@ pub enum ConfigError {
     DiskAttachment { domain: String, code: isize },
     /// VZ がブロックデバイス識別子を拒否した（NSError の domain / code）。
     BlockDeviceIdRejected { domain: String, code: isize },
+    /// virtiofs 共有タグが空（TASK-65.1）。
+    VirtiofsTagEmpty,
+    /// virtiofs 共有タグが上限を超えた。
+    VirtiofsTagTooLong { len: usize, max: usize },
+    /// virtiofs 共有タグに許可外の文字がある（`index` はバイト位置）。
+    VirtiofsTagInvalidChar { index: usize },
+    /// VZ が virtiofs 共有タグを拒否した（NSError の domain / code）。
+    VirtiofsTagRejected { domain: String, code: isize },
+    /// virtiofs 共有タグ（大文字小文字非区別）が重複した。
+    DuplicateVirtiofsTag { tag: String },
+    /// virtiofs 共有数が上限を超えた。
+    TooManyVirtiofsShares { count: usize, max: usize },
+    /// 共有ディレクトリがディレクトリでない。
+    SharedDirNotDirectory { path: PathBuf },
+    /// 共有ディレクトリのパス要素に symlink が含まれる（`path` は最初に見つかった symlink）。
+    SharedDirSymlink { path: PathBuf },
+    /// 共有ディレクトリのパスに `.` / `..` が含まれる。
+    SharedDirNotNormalized { path: PathBuf },
+    /// 共有ディレクトリがファイルシステムのルート。
+    SharedDirIsRoot,
 }
 
 impl ConfigError {
@@ -191,6 +219,16 @@ impl ConfigError {
             ConfigError::ConsoleLogInUse { .. } => "config.console_log_in_use",
             ConfigError::DiskAttachment { .. } => "config.disk_attachment",
             ConfigError::BlockDeviceIdRejected { .. } => "config.block_device_id_rejected",
+            ConfigError::VirtiofsTagEmpty => "config.virtiofs_tag_empty",
+            ConfigError::VirtiofsTagTooLong { .. } => "config.virtiofs_tag_too_long",
+            ConfigError::VirtiofsTagInvalidChar { .. } => "config.virtiofs_tag_invalid_char",
+            ConfigError::VirtiofsTagRejected { .. } => "config.virtiofs_tag_rejected",
+            ConfigError::DuplicateVirtiofsTag { .. } => "config.duplicate_virtiofs_tag",
+            ConfigError::TooManyVirtiofsShares { .. } => "config.too_many_virtiofs_shares",
+            ConfigError::SharedDirNotDirectory { .. } => "config.shared_dir_not_directory",
+            ConfigError::SharedDirSymlink { .. } => "config.shared_dir_symlink",
+            ConfigError::SharedDirNotNormalized { .. } => "config.shared_dir_not_normalized",
+            ConfigError::SharedDirIsRoot => "config.shared_dir_is_root",
         }
     }
 
@@ -332,6 +370,42 @@ impl ConfigError {
             ConfigError::BlockDeviceIdRejected { domain, code } => {
                 format!("virtualization framework rejected the block device id ({domain} {code})")
             }
+            ConfigError::VirtiofsTagEmpty => "virtiofs tag must not be empty".to_string(),
+            ConfigError::VirtiofsTagTooLong { len, max } => {
+                format!("virtiofs tag is {len} bytes, max is {max}")
+            }
+            ConfigError::VirtiofsTagInvalidChar { index } => {
+                format!(
+                    "virtiofs tag has a disallowed character at byte {index} (allowed: ASCII letters, digits, '.', '_', '-')"
+                )
+            }
+            ConfigError::VirtiofsTagRejected { domain, code } => {
+                format!("virtualization framework rejected the virtiofs tag ({domain} {code})")
+            }
+            ConfigError::DuplicateVirtiofsTag { tag } => {
+                format!("virtiofs tag is used more than once: {tag}")
+            }
+            ConfigError::TooManyVirtiofsShares { count, max } => {
+                format!("{count} virtiofs shares requested, max is {max}")
+            }
+            ConfigError::SharedDirNotDirectory { path } => {
+                format!("shared directory is not a directory: {}", path.display())
+            }
+            ConfigError::SharedDirSymlink { path } => {
+                format!(
+                    "shared directory path must not contain a symlink: {}",
+                    path.display()
+                )
+            }
+            ConfigError::SharedDirNotNormalized { path } => {
+                format!(
+                    "shared directory path must not contain '.' or '..': {}",
+                    path.display()
+                )
+            }
+            ConfigError::SharedDirIsRoot => {
+                "sharing the filesystem root is not allowed".to_string()
+            }
         }
     }
 }
@@ -345,7 +419,7 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// UTF-8・NUL なし・絶対パスであることだけを検証する（読み込み元・書き込み先で共通）。
-fn check_absolute_utf8(field: ConfigField, path: &Path) -> Result<(), ConfigError> {
+pub(crate) fn check_absolute_utf8(field: ConfigField, path: &Path) -> Result<(), ConfigError> {
     match path.to_str() {
         Some(s) if !s.contains('\0') => {}
         _ => return Err(ConfigError::PathInvalidEncoding { field }),
@@ -721,9 +795,9 @@ fn conflict_error(field: ConfigField, path: &Path) -> ConfigError {
             field,
             path: path.to_path_buf(),
         },
-        // ConsoleLog は照合対象に来ない（`protected_inputs` は Kernel / Initrd / DiskImage だけを生成する）。
+        // ConsoleLog / SharedDirectory は照合対象に来ない（`protected_inputs` は Kernel / Initrd / DiskImage だけを生成する）。
         // match を網羅するための腕で、ディスクイメージとの衝突として扱う。
-        ConfigField::DiskImage | ConfigField::ConsoleLog => {
+        ConfigField::DiskImage | ConfigField::ConsoleLog | ConfigField::SharedDirectory => {
             ConfigError::ConsoleLogConflictsWithDiskImage {
                 path: path.to_path_buf(),
             }
@@ -1010,6 +1084,8 @@ pub struct VmConfigSpec {
     pub memory: MemorySize,
     /// 最小デバイス構成（TASK-64.3。既定はデバイスなし）。
     pub devices: DeviceConfigSpec,
+    /// virtiofs 共有（TASK-65.1。既定は共有なし）。
+    pub shares: VirtiofsSharesSpec,
 }
 
 impl VmConfigSpec {
@@ -1026,7 +1102,14 @@ impl VmConfigSpec {
             cpus: CpuCount::default(),
             memory: MemorySize::default(),
             devices: DeviceConfigSpec::default(),
+            shares: VirtiofsSharesSpec::default(),
         })
+    }
+
+    /// virtiofs 共有を差し替える（TASK-65.1）。検証は [`VirtiofsSharesSpec::try_new`] 済み。
+    pub fn with_shared_directories(mut self, shares: VirtiofsSharesSpec) -> Self {
+        self.shares = shares;
+        self
     }
 
     /// デバイス構成を差し替える（TASK-64.3）。
@@ -1120,6 +1203,18 @@ pub struct BlockDeviceReadBack {
     pub id: String,
 }
 
+/// 読み戻した virtiofs 共有設定（診断用。TASK-65.1）。
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedDirectoryReadBack {
+    /// 共有タグ。
+    pub tag: String,
+    /// ホストディレクトリのパス。
+    pub path: Option<PathBuf>,
+    /// 読み取り専用か。
+    pub read_only: bool,
+}
+
 /// 構築済みの `VZVirtualMachineConfiguration`（不透明型）。`vm::Vm::create`（TASK-64.4）が内部を取り出して使う。
 #[cfg(target_os = "macos")]
 pub struct VzVmConfiguration(
@@ -1160,6 +1255,18 @@ impl VzVmConfiguration {
                 path: d.path,
                 read_only: d.read_only,
                 id: d.id,
+            })
+            .collect()
+    }
+
+    /// 設定済みの virtiofs 共有（診断用。TASK-65.1）。
+    pub fn shared_directories(&self) -> Vec<SharedDirectoryReadBack> {
+        crate::sys::read_back_shares(&self.0)
+            .into_iter()
+            .map(|s| SharedDirectoryReadBack {
+                tag: s.tag,
+                path: s.path,
+                read_only: s.read_only,
             })
             .collect()
     }
@@ -1247,6 +1354,24 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
         ));
     }
 
+    // virtiofs 共有（副作用なし。件数は VirtiofsSharesSpec が上限検証済み）。
+    // タグは VZ 側でも検証してから init する（init は不正値で ObjC 例外を投げ、捕捉できず abort するため）。
+    let mut sharing = Vec::with_capacity(spec.shares.shares().len());
+    for share in spec.shares.shares() {
+        let tag = NSString::from_str(share.tag.as_str());
+        crate::sys::validate_virtiofs_tag(&tag)
+            .map_err(|(domain, code)| ConfigError::VirtiofsTagRejected { domain, code })?;
+        let url =
+            NSURL::from_file_path(share.host_dir.as_path()).ok_or(ConfigError::UrlConversion {
+                field: ConfigField::SharedDirectory,
+            })?;
+        sharing.push(crate::sys::new_virtiofs_device(
+            &tag,
+            &url,
+            share.access.is_read_only(),
+        ));
+    }
+
     // シリアルコンソール（ここで初めてログファイルを作成・open する）。
     // 使用時点で fd を kernel / initrd / ディスクイメージと照合し、リンク数・所有者も検査する。
     // VZ へはログファイルではなく上限つき書き出しの pipe の書き込み端を渡す（追記量の上限。P1-3）。
@@ -1259,6 +1384,7 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
     let boot = crate::sys::new_linux_boot_loader(&kernel_url, initrd_url.as_deref(), &cmdline);
     let config = crate::sys::new_vm_configuration(&boot, cpus, memory);
     crate::sys::set_devices(&config, &storage, &serial);
+    crate::sys::set_directory_sharing_devices(&config, &sharing);
     Ok(VzVmConfiguration(config))
 }
 
@@ -1711,6 +1837,97 @@ mod tests {
             code: 3,
         };
         assert_eq!(e.code(), "config.block_device_id_rejected");
+    }
+
+    /// MAC-1・TASK-65.1: virtiofs 関連の code と Display を具体値で固定する。
+    #[test]
+    fn virtiofs_error_codes_are_stable() {
+        let e = ConfigError::TooManyVirtiofsShares { count: 9, max: 8 };
+        assert_eq!(
+            e.to_string(),
+            "config.too_many_virtiofs_shares: 9 virtiofs shares requested, max is 8"
+        );
+        let e = ConfigError::VirtiofsTagTooLong { len: 36, max: 35 };
+        assert_eq!(
+            e.to_string(),
+            "config.virtiofs_tag_too_long: virtiofs tag is 36 bytes, max is 35"
+        );
+        assert_eq!(
+            ConfigError::SharedDirIsRoot.to_string(),
+            "config.shared_dir_is_root: sharing the filesystem root is not allowed"
+        );
+        let e = ConfigError::VirtiofsTagRejected {
+            domain: "VZErrorDomain".to_string(),
+            code: 1,
+        };
+        assert_eq!(e.code(), "config.virtiofs_tag_rejected");
+        assert_eq!(
+            ConfigError::DuplicateVirtiofsTag {
+                tag: "a".to_string()
+            }
+            .code(),
+            "config.duplicate_virtiofs_tag"
+        );
+    }
+
+    fn shares_for(dir: &Path) -> VirtiofsSharesSpec {
+        use crate::virtiofs::{ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
+        let real = std::fs::canonicalize(dir).unwrap();
+        VirtiofsSharesSpec::try_new(vec![
+            VirtiofsShareSpec::new(
+                VirtiofsTag::try_new("ro").unwrap(),
+                SharedDirectoryPath::try_new(&real).unwrap(),
+                ShareAccess::ReadOnly,
+            ),
+            VirtiofsShareSpec::new(
+                VirtiofsTag::try_new("rw").unwrap(),
+                SharedDirectoryPath::try_new(&real).unwrap(),
+                ShareAccess::ReadWrite,
+            ),
+        ])
+        .unwrap()
+    }
+
+    /// MAC-1・TASK-65.1: 既定は共有なしで、`with_shared_directories` が `shares` に入る。
+    #[test]
+    fn with_shared_directories_sets_shares() {
+        let t = TempDir::new("shares-spec");
+        let k = t.file("vmlinux");
+        let spec = VmConfigSpec::from_parts(&k, None, "console=hvc0").unwrap();
+        assert!(spec.shares.shares().is_empty());
+        let spec = spec.with_shared_directories(shares_for(&t.0));
+        assert_eq!(spec.shares.shares().len(), 2);
+        assert_eq!(spec.shares.shares()[0].tag.as_str(), "ro");
+        assert!(spec.shares.shares()[0].access.is_read_only());
+        assert!(!spec.shares.shares()[1].access.is_read_only());
+    }
+
+    /// MAC-1・TASK-65.1: macOS で virtiofs 付き設定を構築し、読み戻した値が入力と一致する。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn builds_vz_configuration_with_virtiofs_and_reads_back() {
+        let t = TempDir::new("vz-fs");
+        let k = t.file("vmlinux");
+        let plain = VmConfigSpec::from_parts(&k, None, "console=hvc0").unwrap();
+        let cfg = build_vz_configuration(&plain).expect("build without shares");
+        assert!(cfg.shared_directories().is_empty());
+
+        let spec = plain.with_shared_directories(shares_for(&t.0));
+        let cfg = build_vz_configuration(&spec).expect("build with shares");
+        let real = std::fs::canonicalize(&t.0).unwrap();
+        let got = cfg.shared_directories();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].tag, "ro");
+        assert!(got[0].read_only);
+        assert_eq!(
+            got[0]
+                .path
+                .as_ref()
+                .map(|p| std::fs::canonicalize(p).unwrap()),
+            Some(real.clone())
+        );
+        assert_eq!(got[1].tag, "rw");
+        assert!(!got[1].read_only);
     }
 
     /// MAC-1・TASK-64.3: macOS でデバイス付き設定を構築し、読み戻した値が入力と一致する。

@@ -433,8 +433,8 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// ホーム配下の設定操作のため許容する）。
 ///
 /// unix では既存の宛先のパーミッションを一時ファイルへ引き継ぐ（新規作成時は既定のまま）。
-/// 非 unix（Windows）では既存の宛先がある場合 ACL を保持するため rename せず同一ファイルへ上書きする
-/// （原子性は保証しない。新規作成時のみ一時ファイル経由）。
+/// Windows では既存の宛先がある場合 ACL を保持するため rename せず、リンクを辿らず開いたハンドルへ
+/// 上書きする（クラッシュ時の原子性は保証しない。書き込み失敗時は元の内容へ戻す。新規作成時のみ一時ファイル経由）。
 /// unix で rename 成功後の親ディレクトリ fsync に失敗した場合は、置換済みのまま `Err` を返す。
 fn write_atomic(path: &Path, data: &[u8]) -> Result<(), WinError> {
     let parent = match path.parent() {
@@ -451,11 +451,11 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), WinError> {
         nanos
     ));
     // Windows では一時ファイルを rename で置換すると既存 `.wslconfig` の ACL が失われる。ACL の複製には
-    // Win32 API（依存追加が必要）を要するため、既存ファイルがある場合は同一ファイルへ上書きして
-    // ACL を保持する（原子性は失う代わりに制限 ACL を緩めない側＝安全側へ倒す）。
-    #[cfg(not(unix))]
-    if path.exists() {
-        return overwrite_in_place(path, data);
+    // Win32 API（依存追加が必要）を要するため、既存ファイルがある場合は検証済みハンドルへ上書きして
+    // ACL を保持する。存在確認と open を別操作に分けない（TOCTOU 回避）ため open の NotFound で判定する。
+    #[cfg(windows)]
+    if overwrite_existing(path, data)? {
+        return Ok(());
     }
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -502,17 +502,70 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), WinError> {
     Ok(())
 }
 
-/// 既存ファイルを置換せず内容だけ書き換える（ACL・属性を保持する。非 unix 向け。原子的ではない）。
-#[cfg(not(unix))]
-fn overwrite_in_place(path: &Path, data: &[u8]) -> Result<(), WinError> {
-    let mut f = std::fs::OpenOptions::new()
+/// 既存の `.wslconfig` を開いて内容だけ書き換える（Windows 向け。ACL・属性を保持する）。
+///
+/// リパースポイント（シンボリックリンク等）を辿らずに開き、開いたハンドル自身で通常ファイルであることを
+/// 検証してから書く（検証と書き込みの対象が同一。TOCTOU 回避）。存在しなければ `Ok(false)`。
+#[cfg(windows)]
+fn overwrite_existing(path: &Path, data: &[u8]) -> Result<bool, WinError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_OPEN_REPARSE_POINT: リパースポイントを辿らず、リンク自体を開く。
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let mut f = match std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
-        .truncate(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|e| io_err(&e, "failed to open .wslconfig for writing"))?;
-    f.write_all(data)
-        .and_then(|()| f.sync_all())
-        .map_err(|e| io_err(&e, "failed to write .wslconfig"))
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(io_err(&e, "failed to open .wslconfig for writing")),
+    };
+    let meta = f
+        .metadata()
+        .map_err(|e| io_err(&e, "failed to stat .wslconfig"))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(err(
+            WinErrorCode::PermissionDenied,
+            ".wslconfig is not a regular file",
+        ));
+    }
+    overwrite_handle(&mut f, data)?;
+    Ok(true)
+}
+
+/// 開いたファイルの内容を `data` へ置き換える。失敗時は元の内容へ戻す（ベストエフォート）。
+///
+/// truncate で先に空にせず、元の内容をメモリへ退避してから先頭へ上書き → 長さ調整 → fsync する。
+/// 書き込み途中で失敗した場合は退避した内容を書き戻し、失敗した旨を `Err` で返す。
+/// プロセスクラッシュ時の原子性は保証しない（ACL 保持とのトレードオフ）。
+#[cfg_attr(unix, allow(dead_code))]
+fn overwrite_handle(f: &mut std::fs::File, data: &[u8]) -> Result<(), WinError> {
+    use std::io::{Seek, SeekFrom};
+    let mut original = Vec::new();
+    Read::by_ref(f)
+        .take(MAX_WSLCONFIG_BYTES + 1)
+        .read_to_end(&mut original)
+        .map_err(|e| io_err(&e, "failed to read .wslconfig"))?;
+    if original.len() as u64 > MAX_WSLCONFIG_BYTES {
+        return Err(err(
+            WinErrorCode::ResourceExhausted,
+            format!(".wslconfig exceeds {MAX_WSLCONFIG_BYTES} bytes"),
+        ));
+    }
+    let put = |f: &mut std::fs::File, bytes: &[u8]| -> std::io::Result<()> {
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(bytes)?;
+        f.set_len(bytes.len() as u64)?;
+        f.sync_all()
+    };
+    match put(f, data) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = put(f, &original);
+            Err(io_err(&e, "failed to write .wslconfig"))
+        }
+    }
 }
 
 /// `path` の `.wslconfig` に `virtiofs=true` を opt-in する（読み込み → 編集 → 原子的書き込み）。
@@ -751,6 +804,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// WIN-2: ハンドル上書きは先に空にせず、短い内容へも置き換えられる（truncate 先行の回帰防止）。
+    #[test]
+    fn overwrite_handle_replaces_content_in_place() {
+        let d = TmpDir::new("overwrite");
+        std::fs::write(d.file(), "long original content").expect("write");
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(d.file())
+            .expect("open");
+        overwrite_handle(&mut f, b"short").expect("overwrite");
+        assert_eq!(std::fs::read(d.file()).expect("read"), b"short");
     }
 
     /// WIN-2・AC2: ファイルがなければ新規作成する。

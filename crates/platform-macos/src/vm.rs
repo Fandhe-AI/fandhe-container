@@ -23,13 +23,23 @@
 //! 注意: `start` / `stop` / `state` を VM キュー上（イベント処理の中など）から呼ぶとデッドロックする。
 //! 最後の防壁としてタイムアウトが `VmError::Timeout` を返す。
 //!
-//! 未実装（REPAIR-3）: 待機タイムアウトの既定値の確定、起動失敗時のクリーンアップ、`VmError` の
-//! `error.rs` への移動と `ConfigError` との統合は TASK-64.5。協調停止（`requestStop`）・
-//! pause / resume / save / restore は範囲外。
+//! タイムアウト既定値（TASK-64.5・REPAIR-5）: start / stop / 状態照会ごとの既定値と許容範囲を
+//! [`OpTimeouts`] で表す。待機ロジックは OS 非依存の `await_op_result` に切り出し、期限超過で
+//! `VmError::Timeout` を返すことを Linux 上のテストで検証する。
+//!
+//! 起動失敗時のクリーンアップ（TASK-64.5）: 失敗した完了通知の直後に `Core::complete_and_settle` が
+//! VZ の実状態へ追従し、状態機械が `Error` のまま残らない。`Vm::launch`（macOS）は設定の構築・VM 生成・
+//! 起動のどこで失敗しても、所有する設定と VM を Rust の drop 順（VM → 設定）で解放する。解放後は VM の
+//! `Drop` が停止を要求し（起動途中なら完了後に再要求）、コンソールログの排他 lock も書き出しスレッドの
+//! 終了とともに解放される。本 crate は一時ファイルを作らず、コンソールログも診断材料として削除しない。
+//!
+//! エラー型は `crate::error` に移動し、本モジュールから `VmError`・`VmOp` を再エクスポートする（ERR-1）。
+//!
+//! 未実装（REPAIR-3）: 協調停止（`requestStop`）・pause / resume / save / restore は範囲外。
+//! plugin 境界のエラー写像は TASK-115。
 
-use std::fmt;
 use std::io::Write;
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::time::Duration;
 
 /// NSError の要約（domain, code）。
@@ -41,8 +51,113 @@ pub const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// `Vm` の破棄時に停止を要求する最大回数（初回を含む）。失敗し続ける VM への要求を有界に保つ。
 pub const DROP_STOP_MAX_ATTEMPTS: u32 = 3;
 
-/// start / stop の待機タイムアウトの暫定値。既定値の確定とクリーンアップは TASK-64.5。
-pub const PROVISIONAL_OP_TIMEOUT: Duration = Duration::from_secs(30);
+pub use crate::error::{VmError, VmOp};
+
+/// `start` の完了待ちの既定タイムアウト。VZ の start 完了はゲストのブートではなく VM 開始を指すため、
+/// 30 秒あれば最小構成でも十分な余裕がある（MAC-1・REPAIR-5・TASK-64.5。実測に基づく見直しは別途）。
+pub const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `stop`（破壊的停止）の完了待ちの既定タイムアウト（REPAIR-5・TASK-64.5）。
+pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `Vm::state` が VM キューの応答を待つ既定タイムアウト（REPAIR-5・TASK-64.5）。
+pub const DEFAULT_STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 指定できるタイムアウトの下限。0 や極小値で常時失敗させる設定を拒否する。
+pub const MIN_OP_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// 指定できるタイムアウトの上限。巨大値による無期限に近い待機を拒否する。
+pub const MAX_OP_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 操作ごとの待機タイムアウト。範囲外の値を表現できない検証済み型（REPAIR-2・REPAIR-5・TASK-64.5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpTimeouts {
+    start: Duration,
+    stop: Duration,
+    state_query: Duration,
+}
+
+impl OpTimeouts {
+    /// 3 つの値を `MIN_OP_TIMEOUT..=MAX_OP_TIMEOUT` で検証して作る。範囲外は `VmError::InvalidTimeout`。
+    pub fn try_new(
+        start: Duration,
+        stop: Duration,
+        state_query: Duration,
+    ) -> Result<OpTimeouts, VmError> {
+        for (field, value) in [
+            ("start", start),
+            ("stop", stop),
+            ("state_query", state_query),
+        ] {
+            if !(MIN_OP_TIMEOUT..=MAX_OP_TIMEOUT).contains(&value) {
+                return Err(VmError::InvalidTimeout {
+                    field,
+                    requested: value,
+                    min: MIN_OP_TIMEOUT,
+                    max: MAX_OP_TIMEOUT,
+                });
+            }
+        }
+        Ok(OpTimeouts {
+            start,
+            stop,
+            state_query,
+        })
+    }
+
+    /// `start` の完了待ち。
+    pub fn start(&self) -> Duration {
+        self.start
+    }
+
+    /// `stop` の完了待ち。
+    pub fn stop(&self) -> Duration {
+        self.stop
+    }
+
+    /// 状態照会の応答待ち。
+    pub fn state_query(&self) -> Duration {
+        self.state_query
+    }
+
+    /// 操作種別に対応する完了待ち。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn for_op(&self, op: VmOp) -> Duration {
+        match op {
+            VmOp::Start => self.start,
+            VmOp::Stop => self.stop,
+        }
+    }
+}
+
+impl Default for OpTimeouts {
+    fn default() -> Self {
+        OpTimeouts {
+            start: DEFAULT_START_TIMEOUT,
+            stop: DEFAULT_STOP_TIMEOUT,
+            state_query: DEFAULT_STATE_QUERY_TIMEOUT,
+        }
+    }
+}
+
+/// 操作の結果を期限付きで待つ。呼び出し元の `Vm::run_op`（macOS）が使う OS 非依存の待機部分。
+///
+/// 期限内に結果が届けばそのまま返す。期限切れなら `VmError::Timeout`、送信側が失われたら
+/// `VmError::CallbackLost` を `give_up` に渡し、その戻り値（直前に確定した結果があればそれ）を返す。
+/// `give_up` は操作の取り消し・放棄の後始末を担う（REPAIR-5・TASK-64.5）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn await_op_result(
+    rx: &Receiver<Result<(), VmError>>,
+    op: VmOp,
+    timeout: Duration,
+    give_up: impl FnOnce(VmError) -> Result<(), VmError>,
+) -> Result<(), VmError> {
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => give_up(VmError::Timeout { op, after: timeout }),
+        Err(RecvTimeoutError::Disconnected) => give_up(VmError::CallbackLost { op }),
+    }
+}
 
 /// VM の状態（`VZVirtualMachineState` に対応）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,116 +217,6 @@ pub enum VmEvent {
     },
 }
 
-/// 失敗した操作の種別。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VmOp {
-    Start,
-    Stop,
-}
-
-impl VmOp {
-    fn as_str(self) -> &'static str {
-        match self {
-            VmOp::Start => "start",
-            VmOp::Stop => "stop",
-        }
-    }
-}
-
-/// VM ライフサイクルのエラー（ERR 系・REPAIR-4。message は英語）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum VmError {
-    /// Virtualization.framework がこの環境で使えない。
-    VirtualizationUnsupported,
-    /// 設定が `validateWithError` に拒否された（entitlement 欠如を含む）。
-    InvalidConfiguration {
-        domain: String,
-        code: isize,
-    },
-    /// 現在の状態では操作できない（`canStart` / `canStop` が false）。
-    InvalidState {
-        op: VmOp,
-        state: VmState,
-    },
-    StartFailed {
-        domain: String,
-        code: isize,
-    },
-    StopFailed {
-        domain: String,
-        code: isize,
-    },
-    /// 完了通知が期限内に届かなかった。
-    Timeout {
-        op: VmOp,
-        after: Duration,
-    },
-    /// 完了通知が届く前に通知経路が失われた。
-    CallbackLost {
-        op: VmOp,
-    },
-}
-
-impl VmError {
-    /// 機械可読なエラーコード。
-    pub fn code(&self) -> &'static str {
-        match self {
-            VmError::VirtualizationUnsupported => "vm.virtualization_unsupported",
-            VmError::InvalidConfiguration { .. } => "vm.invalid_configuration",
-            VmError::InvalidState { .. } => "vm.invalid_state",
-            VmError::StartFailed { .. } => "vm.start_failed",
-            VmError::StopFailed { .. } => "vm.stop_failed",
-            VmError::Timeout { .. } => "vm.timeout",
-            VmError::CallbackLost { .. } => "vm.callback_lost",
-        }
-    }
-
-    /// 人間可読なメッセージ（英語）。
-    ///
-    /// `domain` は VZ が返した NSError の domain をエスケープせずに埋め込む（`sys` で 128 文字に切り詰め済み）。
-    /// ログ・JSON 等の構造化出力へ載せる呼び出し元は、出力形式に応じてエスケープすること。
-    pub fn message(&self) -> String {
-        match self {
-            VmError::VirtualizationUnsupported => {
-                "Virtualization.framework is not supported on this host".to_string()
-            }
-            VmError::InvalidConfiguration { domain, code } => {
-                format!("virtual machine configuration was rejected ({domain}, code {code})")
-            }
-            VmError::InvalidState { op, state } => {
-                format!(
-                    "cannot {} the virtual machine in state {state:?}",
-                    op.as_str()
-                )
-            }
-            VmError::StartFailed { domain, code } => {
-                format!("virtual machine failed to start ({domain}, code {code})")
-            }
-            VmError::StopFailed { domain, code } => {
-                format!("virtual machine failed to stop ({domain}, code {code})")
-            }
-            VmError::Timeout { op, after } => {
-                format!("{} did not complete within {after:?}", op.as_str())
-            }
-            VmError::CallbackLost { op } => {
-                format!(
-                    "completion of {} was lost before it was delivered",
-                    op.as_str()
-                )
-            }
-        }
-    }
-}
-
-impl fmt::Display for VmError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code(), self.message())
-    }
-}
-
-impl std::error::Error for VmError {}
-
 /// 状態機械への入力。
 #[derive(Debug, Clone, PartialEq, Eq)]
 // macOS 限定の `Vm` だけが使う内部項目。他 OS ではテストからのみ参照されるため、この項目に限り dead_code を許容する。
@@ -231,7 +236,7 @@ pub(crate) enum LifecycleInput {
 ///
 /// 完了入力（`StartCompleted(Err)` → `Error`、`StopCompleted(Err)` → `Running`）は仮の遷移で、VZ の実状態
 /// （例: 起動失敗後に `Stopped`）と食い違い得る。実状態は `Vm::state()` が正。次の要求の受付時・タイムアウト後に
-/// `reconcile` で実状態へ追従する。完了直後の常時追従は TASK-64.5 で扱う。
+/// `reconcile` で実状態へ追従する。失敗した完了通知の直後は `Core::complete_and_settle` が追従する（TASK-64.5）。
 ///
 /// 操作世代: 要求ごとに世代を進め、完了通知は要求時の世代と一致する間だけ適用する。ゲスト停止・エラー停止の
 /// 通知は進行中の操作を無効化するため、停止済みの VM を遅れて届いた `StartCompleted(Ok)` が `Running` へ
@@ -593,6 +598,26 @@ impl Core {
         Ok(())
     }
 
+    /// `complete` に加え、失敗した完了（`StartCompleted(Err)` / `StopCompleted(Err)`）や無効化された完了の
+    /// 直後に VZ の実状態 `actual` へ状態機械を追従させる。起動失敗後に仮の `Error` が残り、VZ の `Stopped`
+    /// と食い違うのを防ぐ（MAC-1・TASK-64.5）。VM キュー上の completion handler から呼ぶ。
+    pub(crate) fn complete_and_settle(
+        &mut self,
+        generation: u64,
+        input: LifecycleInput,
+        actual: VmState,
+    ) -> Result<(), VmState> {
+        let failed = matches!(
+            input,
+            LifecycleInput::StartCompleted(_, Err(_)) | LifecycleInput::StopCompleted(_, Err(_))
+        );
+        let result = self.complete(generation, input);
+        if failed || result.is_err() {
+            self.reconcile(actual);
+        }
+        result
+    }
+
     pub(crate) fn apply(&mut self, input: LifecycleInput) {
         for event in self.lifecycle.step(input) {
             self.sink.send(event);
@@ -693,15 +718,16 @@ pub use mac::Vm;
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use std::sync::mpsc::{Receiver, RecvTimeoutError};
+    use std::sync::mpsc::Receiver;
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::Duration;
 
     use super::{
         AbandonOutcome, BeginOutcome, Core, EVENT_CHANNEL_CAPACITY, ErrInfo, LifecycleInput,
-        OpTicket, PROVISIONAL_OP_TIMEOUT, VmError, VmEvent, VmOp, VmState, event_channel,
+        OpTicket, OpTimeouts, VmError, VmEvent, VmOp, VmState, await_op_result, event_channel,
     };
-    use crate::config::VzVmConfiguration;
+    use crate::config::{VmConfigSpec, VzVmConfiguration, build_vz_configuration};
+    use crate::error::PlatformError;
     use crate::sys::{self, DelegateEvent, HostInitError, VmRef};
 
     /// 破棄時の停止が失敗した後、要求し直すまでの間隔（失敗直後は同じ理由で失敗しやすいため）。
@@ -725,12 +751,20 @@ mod mac {
         host: sys::VmHost,
         core: Arc<Mutex<Core>>,
         events: Option<Receiver<VmEvent>>,
-        op_timeout: Duration,
+        timeouts: OpTimeouts,
     }
 
     impl Vm {
-        /// 構築済み設定から VM を生成する（起動はしない）。
+        /// 構築済み設定から既定のタイムアウト（`OpTimeouts::default`）で VM を生成する（起動はしない）。
         pub fn create(config: &VzVmConfiguration) -> Result<Vm, VmError> {
+            Vm::create_with_timeouts(config, OpTimeouts::default())
+        }
+
+        /// 構築済み設定から、タイムアウトを指定して VM を生成する（起動はしない）。
+        pub fn create_with_timeouts(
+            config: &VzVmConfiguration,
+            timeouts: OpTimeouts,
+        ) -> Result<Vm, VmError> {
             let (sink, rx) = event_channel(EVENT_CHANNEL_CAPACITY);
             let core = Arc::new(Mutex::new(Core::new(sink)));
             let cb_core = Arc::clone(&core);
@@ -751,8 +785,29 @@ mod mac {
                 host,
                 core,
                 events: Some(rx),
-                op_timeout: PROVISIONAL_OP_TIMEOUT,
+                timeouts,
             })
+        }
+
+        /// 設定の構築・VM 生成・起動を一括で行い、起動済みの VM を返す（MAC-1・REPAIR-5・TASK-64.5）。
+        ///
+        /// 呼び出し元: `fandhe-container-plugin-macos`（TASK-115）。どの段で失敗しても（`?` による早期 return と
+        /// 起動のタイムアウトを含む）、所有する VM と設定を drop 順（VM → 設定）で解放する。VM の `Drop` が
+        /// 停止を要求し（起動途中なら完了通知の後に再要求）、設定が保持していた serial の書き込み端が閉じて
+        /// コンソールログの書き出しスレッドが終了し、排他 lock も解放される。
+        ///
+        /// コンソールログは失敗の診断材料として削除しない。本 crate は一時ファイルを作らず（kernel・initrd・
+        /// ディスクイメージは呼び出し側の所有物）、追記先として検証したパスを削除対象にする経路も作らない。
+        pub fn launch(spec: &VmConfigSpec, timeouts: OpTimeouts) -> Result<Vm, PlatformError> {
+            // 宣言順の逆に drop される: `vm`（先）→ `config`（後）。
+            let config = build_vz_configuration(spec)?;
+            let vm = Vm::create_with_timeouts(&config, timeouts)?;
+            if let Err(e) = vm.start() {
+                drop(vm);
+                drop(config);
+                return Err(e.into());
+            }
+            Ok(vm)
         }
 
         /// VM を起動し、完了（または失敗・タイムアウト）まで待つ。
@@ -765,10 +820,11 @@ mod mac {
             self.run_op(VmOp::Stop)
         }
 
-        /// フレームワークが報告する現在の状態。`op_timeout` 内に取得できなければ `Unknown(-1)`（REPAIR-5）。
+        /// フレームワークが報告する現在の状態。`state_query` タイムアウト内に取得できなければ
+        /// `Unknown(-1)`（REPAIR-5）。
         pub fn state(&self) -> VmState {
             self.host
-                .run_timeout(self.op_timeout, actual_state)
+                .run_timeout(self.timeouts.state_query(), actual_state)
                 .unwrap_or(VmState::Unknown(-1))
         }
 
@@ -825,10 +881,11 @@ mod mac {
                     let retry_drop_stop = {
                         let mut c = lock(&handler_core);
                         // 停止通知で無効化済みの操作は成功を返さず、その時点の状態に応じた InvalidState を返す。
-                        let outcome = match c.complete(generation, input) {
-                            Ok(()) => outcome,
-                            Err(state) => Err(VmError::InvalidState { op, state }),
-                        };
+                        let outcome =
+                            match c.complete_and_settle(generation, input, actual_state(vm)) {
+                                Ok(()) => outcome,
+                                Err(state) => Err(VmError::InvalidState { op, state }),
+                            };
                         // 呼び出し元の放棄と直列化するため、Core のロック内で結果を送る（block しない）。
                         let _ = tx.try_send(outcome);
                         c.drop_stop_due()
@@ -851,20 +908,9 @@ mod mac {
                     let _ = reject_tx.try_send(Err(VmError::InvalidState { op, state }));
                 }
             });
-            match rx.recv_timeout(self.op_timeout) {
-                Ok(result) => result,
-                Err(RecvTimeoutError::Timeout) => {
-                    let timeout = VmError::Timeout {
-                        op,
-                        after: self.op_timeout,
-                    };
-                    self.give_up(&ticket, &rx, timeout)
-                }
-                // 完了通知の block が呼ばれずに解放された。完了待ちのまま残さず、タイムアウトと同じく放棄する。
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.give_up(&ticket, &rx, VmError::CallbackLost { op })
-                }
-            }
+            await_op_result(&rx, op, self.timeouts.for_op(op), |error| {
+                self.give_up(&ticket, &rx, error)
+            })
         }
 
         /// 待機期限切れ・通知経路の喪失の後始末（REPAIR-5）。操作を取り消すか放棄して後続の start / stop を
@@ -1646,5 +1692,220 @@ mod tests {
             errors[5].to_string(),
             "vm.timeout: stop did not complete within 3s"
         );
+    }
+
+    /// REPAIR-5・TASK-64.5: 結果が届かないまま期限を過ぎたら `Timeout` を返し、放棄処理に渡る。
+    #[test]
+    fn await_op_result_times_out_with_concrete_error() {
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<Result<(), VmError>>(1);
+        let started = std::time::Instant::now();
+        let res = await_op_result(&rx, VmOp::Start, Duration::from_millis(50), Err);
+        assert_eq!(
+            res,
+            Err(VmError::Timeout {
+                op: VmOp::Start,
+                after: Duration::from_millis(50)
+            })
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// REPAIR-5・TASK-64.5: 送信側が失われたら `CallbackLost`。
+    #[test]
+    fn await_op_result_reports_callback_lost() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), VmError>>(1);
+        drop(tx);
+        let res = await_op_result(&rx, VmOp::Stop, Duration::from_secs(5), Err);
+        assert_eq!(res, Err(VmError::CallbackLost { op: VmOp::Stop }));
+    }
+
+    /// REPAIR-5・TASK-64.5: 期限内に届いた結果はそのまま返り、放棄処理は呼ばれない。
+    #[test]
+    fn await_op_result_returns_delivered_result_without_give_up() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), VmError>>(1);
+        let failure = VmError::StartFailed {
+            domain: "D".into(),
+            code: 5,
+        };
+        tx.send(Err(failure.clone())).expect("send");
+        let res = await_op_result(&rx, VmOp::Start, Duration::from_secs(5), |_| {
+            panic!("give_up must not run")
+        });
+        assert_eq!(res, Err(failure));
+    }
+
+    /// REPAIR-5・TASK-64.5: 放棄の直前に確定した結果は期限切れより優先される。
+    #[test]
+    fn await_op_result_prefers_late_settled_result() {
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<Result<(), VmError>>(1);
+        let res = await_op_result(&rx, VmOp::Start, Duration::from_millis(20), |_| Ok(()));
+        assert_eq!(res, Ok(()));
+    }
+
+    /// REPAIR-5・TASK-64.5: 既定値は具体値で固定し、境界値の内側だけ受理する。
+    #[test]
+    fn op_timeouts_defaults_and_bounds() {
+        let d = OpTimeouts::default();
+        assert_eq!(d.start(), Duration::from_secs(30));
+        assert_eq!(d.stop(), Duration::from_secs(15));
+        assert_eq!(d.state_query(), Duration::from_secs(5));
+        assert_eq!(d.for_op(VmOp::Stop), Duration::from_secs(15));
+
+        let ok = OpTimeouts::try_new(MIN_OP_TIMEOUT, MAX_OP_TIMEOUT, MIN_OP_TIMEOUT);
+        assert_eq!(ok.map(|t| t.stop()), Ok(MAX_OP_TIMEOUT));
+
+        let one_ns = Duration::from_nanos(1);
+        for (bad, field) in [
+            (MIN_OP_TIMEOUT - one_ns, "start"),
+            (MAX_OP_TIMEOUT + one_ns, "stop"),
+            (Duration::ZERO, "state_query"),
+        ] {
+            let ok = Duration::from_secs(1);
+            let res = match field {
+                "start" => OpTimeouts::try_new(bad, ok, ok),
+                "stop" => OpTimeouts::try_new(ok, bad, ok),
+                _ => OpTimeouts::try_new(ok, ok, bad),
+            };
+            assert_eq!(
+                res,
+                Err(VmError::InvalidTimeout {
+                    field,
+                    requested: bad,
+                    min: MIN_OP_TIMEOUT,
+                    max: MAX_OP_TIMEOUT
+                })
+            );
+        }
+    }
+
+    /// MAC-1・TASK-64.5: 起動失敗の完了直後に実状態 Stopped へ追従し、Error のまま残らない。
+    #[test]
+    fn failed_start_settles_to_actual_state() {
+        let (sink, rx) = event_channel(8);
+        let mut core = Core::new(sink);
+        let (_, generation) = begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        let res = core.complete_and_settle(
+            generation,
+            LifecycleInput::StartCompleted(generation, Err(("VZErrorDomain".to_string(), 1))),
+            VmState::Stopped,
+        );
+        assert_eq!(res, Ok(()));
+        assert_eq!(core.lifecycle.state(), VmState::Stopped);
+        assert_eq!(
+            drain(&rx),
+            vec![
+                changed(VmState::Stopped, VmState::Starting),
+                changed(VmState::Starting, VmState::Error),
+                changed(VmState::Error, VmState::Stopped),
+            ]
+        );
+    }
+
+    /// MAC-1・TASK-64.5: 成功した完了では追加の追従イベントを出さない。
+    #[test]
+    fn successful_start_does_not_reconcile_extra() {
+        let (sink, rx) = event_channel(8);
+        let mut core = Core::new(sink);
+        let (_, generation) = begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        let res = core.complete_and_settle(
+            generation,
+            LifecycleInput::StartCompleted(generation, Ok(())),
+            VmState::Running,
+        );
+        assert_eq!(res, Ok(()));
+        assert_eq!(
+            drain(&rx),
+            vec![
+                changed(VmState::Stopped, VmState::Starting),
+                changed(VmState::Starting, VmState::Running),
+            ]
+        );
+    }
+
+    /// MAC-1・REPAIR-5・TASK-64.5: `Vm::launch` が失敗しても、コンソールログの排他 lock は有界時間内に解放される。
+    ///
+    /// 実機起動は要さない。GitHub の macOS ランナーでは `VirtualizationUnsupported`、entitlement がない環境では
+    /// `InvalidConfiguration`、ダミー kernel では `StartFailed` で失敗する。いずれも許容し、lock の解放だけを確認する。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_failure_releases_console_log_lock() {
+        use crate::config::{ConsoleLogPath, DeviceConfigSpec, SerialConsoleSink, VmConfigSpec};
+        use std::os::unix::fs::PermissionsExt;
+
+        // 既存ディレクトリを再利用・削除しないよう、`create_dir`（既存なら失敗）で新規作成できた名前だけを使う。
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp dir");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = (0..100u32)
+            .find_map(|n| {
+                let candidate = base.join(format!(
+                    "fandhe-macos-launch-{}-{nanos}-{n}",
+                    std::process::id()
+                ));
+                std::fs::create_dir(&candidate).ok().map(|()| candidate)
+            })
+            .expect("create a fresh unique temp dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let kernel = dir.join("vmlinux");
+        std::fs::write(&kernel, b"dummy").expect("write kernel");
+        std::fs::set_permissions(&kernel, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let log = dir.join("console.log");
+
+        let devices = DeviceConfigSpec::try_new(
+            vec![],
+            Some(SerialConsoleSink::LogFile(
+                ConsoleLogPath::try_new(&log).expect("log path"),
+            )),
+        )
+        .expect("devices");
+        let spec = VmConfigSpec::from_parts(&kernel, None, "console=hvc0")
+            .and_then(|s| s.with_devices(devices))
+            .expect("spec");
+
+        let timeouts = OpTimeouts::try_new(
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        )
+        .expect("timeouts");
+        match Vm::launch(&spec, timeouts) {
+            Ok(vm) => drop(vm),
+            Err(e) => assert!(
+                [
+                    "vm.virtualization_unsupported",
+                    "vm.invalid_configuration",
+                    "vm.start_failed",
+                    "vm.timeout",
+                ]
+                .contains(&e.code()),
+                "unexpected launch error: {e}"
+            ),
+        }
+
+        // lock の解放は VM キュー上で非同期に起きるため、有界ポーリングで確認する（REPAIR-5）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let sink = loop {
+            match spec.open_serial_console() {
+                Ok(Some(sink)) => break sink,
+                Ok(None) => panic!("console sink is configured"),
+                Err(e) if e.code() == "config.console_log_in_use" => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "console log lock was not released"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        };
+        sink.finish(Duration::from_secs(5));
+        // このテストが新規作成したディレクトリ配下の既知ファイルだけを消す（再帰削除はしない）。
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(&kernel);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

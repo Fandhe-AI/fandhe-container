@@ -382,11 +382,49 @@ pub(super) fn classify_failure(out: &Captured) -> Failure {
         Failure::WslDisabled
     } else if has_id(&ACCESS_DENIED) {
         Failure::PermissionDenied
-    } else if only_error_id_is(&text, NO_DISTRO) {
+    } else if only_error_id_is(&text, NO_DISTRO) && has_no_distro_shape(out) {
         Failure::NoDistro
     } else {
         Failure::Unknown
     }
+}
+
+/// ディストリ 0 件の出力形式か（[`classify_failure`] の 0 件判定を既知の形に限る。ERR-1）。
+///
+/// - stdout・stderr のちょうど一方だけが内容を持つ（どちらに出るかは版で異なりうるので両方を許す）
+/// - 0 件の識別子はちょうど 1 行にだけ現れ、その行が最後の非空行である
+/// - その行は任意のラベル（「Error code」等のローカライズ文字列）と `:`（全角も可）の後に、
+///   `Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND` または `Wsl/Service/WSL_E_DEFAULT_DISTRO_NOT_FOUND` だけを持つ
+///
+/// 終了コードの値は実機で未確認のため条件にしない（TASK-67.6・#377）。識別子を伴わない説明文だけの
+/// 別の失敗はロケール表なしには区別できないが、`wsl.exe` は失敗ごとにエラーコード行を 1 行出すため、
+/// 別の失敗は別の識別子として [`only_error_id_is`] で拒否される。
+fn has_no_distro_shape(out: &Captured) -> bool {
+    let decoded = |b: &[u8]| decode_output(b).ok().filter(|t| !t.trim().is_empty());
+    let text = match (decoded(&out.stdout), decoded(&out.stderr)) {
+        (Some(t), None) | (None, Some(t)) => t,
+        _ => return false,
+    };
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim().to_ascii_lowercase())
+        .filter(|l| !l.is_empty())
+        .collect();
+    const ID: &str = "wsl_e_default_distro_not_found";
+    if lines.iter().filter(|l| l.contains(ID)).count() != 1 {
+        return false;
+    }
+    let Some(last) = lines.last() else {
+        return false;
+    };
+    let code = last
+        .rsplit_once([':', '：'])
+        .map_or(last.as_str(), |(_, c)| c)
+        .trim();
+    matches!(
+        code,
+        "wsl/wsl_e_default_distro_not_found" | "wsl/service/wsl_e_default_distro_not_found"
+    )
 }
 
 /// `text`（小文字化済み）に現れるエラー識別子らしいトークンが `expected` だけか（1 回以上現れ、

@@ -88,6 +88,40 @@ fn check_line_len(line: &str) -> Result<(), Wsl2Error> {
     Ok(())
 }
 
+/// 外部出力の文字列（ディストリ名・未知の状態語）に許さない文字か。
+///
+/// 制御文字（Cc）に加え、Unicode の書式文字（一般カテゴリ Cf。ゼロ幅文字・双方向制御・BOM・
+/// 不可視の演算子・タグ文字等）と行区切り・段落区切り（U+2028・U+2029）を対象にする。
+/// 表示上は見えない・並びを入れ替える文字で別のディストリ名に偽装されるのを防ぐ（依存を増やさず、
+/// Cf の範囲は Unicode 16.0 の一覧を直接持つ）。
+fn is_disallowed_text_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08E2}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0001}'
+                | '\u{E0020}'..='\u{E007F}'
+        )
+}
+
 fn is_version_token(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= MAX_VERSION_CHARS
@@ -146,7 +180,7 @@ fn parse_state(tokens: &[&str]) -> DistroState {
         _ => DistroState::Other(
             joined
                 .chars()
-                .filter(|c| !c.is_control())
+                .filter(|c| !is_disallowed_text_char(*c))
                 .take(MAX_STATE_CHARS)
                 .collect(),
         ),
@@ -268,7 +302,7 @@ pub(super) fn parse_distros(text: &str) -> Result<Vec<WslDistro>, Wsl2Error> {
         let Some((is_default, name, state, ver)) = split_row(line, state_col, version_col) else {
             return Err(data_loss("unrecognized distribution row"));
         };
-        if name.chars().count() > MAX_NAME_CHARS || name.chars().any(|c| c.is_control()) {
+        if name.chars().count() > MAX_NAME_CHARS || name.chars().any(is_disallowed_text_char) {
             return Err(data_loss("distribution name has an unexpected format"));
         }
         let version = match ver.as_str() {

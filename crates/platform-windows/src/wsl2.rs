@@ -511,6 +511,41 @@ mod tests {
         assert!(interpret_list(&cap(true, &denied)).is_err());
     }
 
+    /// WIN-1・ERR-1: 正常終了の一覧は先に解析するので、エラー識別子と同じ名前のディストリも一覧に
+    /// 残る。正常終了でも一覧として読めない出力のアクセス拒否・無効は構造化エラーになる。
+    #[test]
+    fn success_list_is_parsed_before_classification() {
+        let cap = |out: &str| run::Captured {
+            success: true,
+            code: Some(0),
+            stdout: out.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        let list = "  NAME                              STATE      VERSION\n* WSL_E_DEFAULT_DISTRO_NOT_FOUND    Running    2\n";
+        let d = interpret_list(&cap(list)).unwrap();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].name, "WSL_E_DEFAULT_DISTRO_NOT_FOUND");
+        assert_eq!(d[0].state, DistroState::Running);
+        assert!(d[0].is_usable_wsl2());
+
+        let denied = "Error code: Wsl/Service/E_ACCESSDENIED\n";
+        let e = interpret_list(&cap(denied)).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::PermissionDenied);
+        assert_eq!(
+            e.message(),
+            "wsl.exe -l -v failed: access denied (exit code 0). Output: Error code: Wsl/Service/E_ACCESSDENIED "
+        );
+        let e = interpret_version(&cap(denied)).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::PermissionDenied);
+        let disabled = "Error code: Wsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED\n";
+        let e = interpret_list(&cap(disabled)).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert!(e.message().contains("wsl --install"));
+        // 識別子のない未知の出力は解析エラーのまま。
+        let e = interpret_list(&cap("hello\n")).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::DataLoss);
+    }
+
     /// ERR-1: 起動後に WSL が返したアクセス拒否は、起動時の権限不足と同じ PERMISSION_DENIED になる。
     #[test]
     fn access_denied_is_permission_denied() {

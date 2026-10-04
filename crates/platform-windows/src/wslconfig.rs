@@ -1766,7 +1766,8 @@ mod tests {
     }
 
     /// WIN-2・TASK-67.2（レビュー指摘 P0）: 既存ファイルの置換後も個別設定した DACL（明示 ACE と継承保護）・
-    /// 整合性ラベル・HIDDEN 属性が保たれ、親ディレクトリから継承した既定 ACL に置き換わらない。
+    /// 整合性ラベル・HIDDEN / SYSTEM 属性が保たれ、親ディレクトリから継承した既定 ACL に置き換わらない（宛先が
+    /// HIDDEN・SYSTEM でも置換できる。レビュー指摘 P1）。
     #[cfg(windows)]
     #[test]
     fn enable_virtiofs_preserves_windows_dacl() {
@@ -1776,10 +1777,10 @@ mod tests {
         // 継承 ACE を明示 ACE に変換して保護し、LOCAL SERVICE（S-1-5-19）の読み取りを明示 ACE として加える。
         icacls(&d.0, &[".wslconfig", "/inheritance:d"]);
         icacls(&d.0, &[".wslconfig", "/grant", "*S-1-5-19:R"]);
-        // 明示の整合性ラベル（Low。どの整合性レベルのプロセスからも設定できる）と HIDDEN 属性を付ける。
+        // 明示の整合性ラベル（Low。どの整合性レベルのプロセスからも設定できる）と HIDDEN・SYSTEM 属性を付ける。
         icacls(&d.0, &[".wslconfig", "/setintegritylevel", "L"]);
         let attrib = std::process::Command::new("attrib")
-            .args(["+h", ".wslconfig"])
+            .args(["+h", "+s", ".wslconfig"])
             .current_dir(&d.0)
             .status()
             .expect("attrib");
@@ -1801,8 +1802,9 @@ mod tests {
             use std::os::windows::fs::MetadataExt;
             std::fs::metadata(d.file()).expect("stat").file_attributes()
         };
-        // FILE_ATTRIBUTE_HIDDEN（0x2）が残り、READONLY（0x1）は付かない。
-        assert_eq!(attrs & 0x3, 0x2);
+        // HIDDEN（0x2）・SYSTEM（0x4）が残り、READONLY（0x1）は付かない（宛先が HIDDEN・SYSTEM でも rename で
+        // 置換できる）。
+        assert_eq!(attrs & 0x7, 0x6);
         let mut entries = d.entries();
         entries.sort();
         assert_eq!(entries, vec![".wslconfig".to_string(), "fresh".to_string()]);

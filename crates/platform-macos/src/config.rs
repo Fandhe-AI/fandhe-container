@@ -491,7 +491,7 @@ impl ConfigError {
                 share_dir,
             } => {
                 format!(
-                    "shared directory {} contains a hard-linked file ({links} links): {} (hint: replace hard links with copies, e.g. pnpm package-import-method=copy or git clone --no-hardlinks)",
+                    "shared directory {} contains a hard-linked file ({links} links): {} (hint: replace hard links with copies, e.g. pnpm install --package-import-method=copy or git clone --no-hardlinks)",
                     share_dir.display(),
                     path.display()
                 )
@@ -2377,7 +2377,7 @@ mod tests {
         };
         assert_eq!(
             e.to_string(),
-            "config.shared_dir_hardlinked_file: shared directory /s contains a hard-linked file (2 links): /s/f (hint: replace hard links with copies, e.g. pnpm package-import-method=copy or git clone --no-hardlinks)"
+            "config.shared_dir_hardlinked_file: shared directory /s contains a hard-linked file (2 links): /s/f (hint: replace hard links with copies, e.g. pnpm install --package-import-method=copy or git clone --no-hardlinks)"
         );
         let e = ConfigError::SharedDirSpecialFile {
             path: PathBuf::from("/s/p"),

@@ -321,7 +321,7 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
      ```
 
      対応はホストの `$W/ro`・`$W/rw` がゲストの `/mnt/ro`・`/mnt/rw`（タグ名 = mount の第 1 引数）。シリアル入力手段が無い場合は、上の mount と下の観測コマンドをゲスト資産の起動スクリプトに仕込み、結果をコンソールログ（stderr に出るパス）で読む。
-  3. ゲスト側の観測: `/mnt/ro` の各 symlink（`inside_link`・`abs_inside_link`・`dangling_inside_link`）を `readlink`・`cat`・`stat` して結果を記録する（`abs_inside_link` はゲスト内に同パスが無いため、`cat` が失敗すればゲストの名前空間で解決された証拠になる）。`/mnt/rw` 内で `ln -s`（`FUSE_SYMLINK`）・`ln`（`FUSE_LINK`）を実行し、ホスト側の `$W/rw` で `ls -l`・`stat` してリンクの実体・リンク数を記録する
+  3. ゲスト側の観測: `/mnt/ro` の各 symlink（`inside_link`・`abs_inside_link`・`dangling_inside_link`）を `readlink`・`cat`・`stat` して結果を記録する（`abs_inside_link` はゲスト内に同パスが無いため、`cat` が失敗すればゲストの名前空間で解決された証拠になる）。`/mnt/rw` 内でリンク元の通常ファイルを作成（`echo data > /mnt/rw/src`）したうえで、`ln -s src /mnt/rw/sym`（`FUSE_SYMLINK`）・`ln /mnt/rw/src /mnt/rw/hard`（`FUSE_LINK`）を実行し、ホスト側の `$W/rw` で `ls -l`・`stat` してリンクの実体・リンク数を記録する
   4. 判定: `abs_inside_link` の `cat` がゲスト側で失敗する（ホストが辿らずゲストで解決される）なら拒否維持の補強のみ。ホスト上の `inside.txt` の内容が読めるなら、ホスト側サーバがリンクを辿る証拠としてユーザーへ報告し別 Issue とする。範囲外 symlink・ハードリンクの挙動は本手順では確認できない旨も記録に残す
   5. 記録先: 結果を #1374 にコメントし、関連 PR にも記録する
 

@@ -267,6 +267,40 @@ pub(crate) fn list_distros_with_program(
     interpret_list(&out)
 }
 
+/// テスト専用: 実行するプログラムを差し替えて公開 API と同じ処理（起動・出力解析・エラー変換）を行う。
+///
+/// feature `wsl2-test-support` でのみ公開する（結合試験 `tests/wsl2_detect.rs` が偽の `wsl.exe` を
+/// 渡す。REPAIR-12）。本番では有効にしない（任意のプログラムを `wsl.exe` として起動できるため。
+/// 本番の経路は `GetSystemDirectoryW` 配下の絶対パスのみ。WIN-1）。
+#[cfg(feature = "wsl2-test-support")]
+pub mod test_support {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use super::{Wsl2Error, Wsl2Status, WslDistro, WslVersionInfo};
+
+    /// `program` を `wsl.exe` とみなす [`super::query_version`]。
+    pub fn query_version_with_program(
+        program: &Path,
+        timeout: Duration,
+    ) -> Result<WslVersionInfo, Wsl2Error> {
+        super::query_version_with_program(program, timeout)
+    }
+
+    /// `program` を `wsl.exe` とみなす [`super::list_distros`]。
+    pub fn list_distros_with_program(
+        program: &Path,
+        timeout: Duration,
+    ) -> Result<Vec<WslDistro>, Wsl2Error> {
+        super::list_distros_with_program(program, timeout)
+    }
+
+    /// `program` を `wsl.exe` とみなす [`super::detect`]。
+    pub fn detect_with_program(program: &Path, timeout: Duration) -> Result<Wsl2Status, Wsl2Error> {
+        super::detect_with_program(program, timeout)
+    }
+}
+
 fn check_timeout(timeout: Duration) -> Result<(), Wsl2Error> {
     if timeout.is_zero() || timeout > MAX_WSL_TIMEOUT {
         return Err(Wsl2Error::new(

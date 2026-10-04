@@ -21,6 +21,27 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# WSL2 検出の結合試験（TASK-67.3・WIN-1・REPAIR-5・REPAIR-12）用の偽 `wsl.exe` と、実行するプログラムを
+# 差し替える API（`wsl2::test_support`）を専用 feature でのみビルド・公開する（crates/io の
+# crash-test-server と同じ仕組み）。feature を付けないビルド（リリース成果物を含む）ではこの bin も
+# 差し替え API も存在しないため、任意のプログラムを wsl.exe として起動する経路が本番に入らない。
+# 中身のない feature で、依存は引き込まない。
+[features]
+wsl2-test-support = []
+
+[[bin]]
+name = "fake_wsl"
+path = "tests/bin/fake_wsl.rs"
+required-features = ["wsl2-test-support"]
+bench = false
+doc = false
+
+# 呼び出し側の結合試験 tests/wsl2_detect.rs は `env!("CARGO_BIN_EXE_fake_wsl")` を使うため同じ feature で
+# 有効にするが、required-features ではなくファイル先頭の `#![cfg(feature = "wsl2-test-support")]` で
+# 切り替える（`make test-integration` の `cargo test --workspace --test '*'` は required-features を
+# 満たさない target があるとエラーで止まるため。feature なしでは 0 件の test target になる）。
+# 公開 API だけを使う結合試験（tests/wsl2_public_api.rs）は feature なしで実行される。
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",

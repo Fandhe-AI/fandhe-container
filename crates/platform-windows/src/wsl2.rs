@@ -29,6 +29,8 @@ use std::time::Duration;
 
 /// 外部プロセス待ちの既定タイムアウト。WSL のコールドスタートを見込んで 10 秒とする（REPAIR-5）。
 pub const DEFAULT_WSL_TIMEOUT: Duration = Duration::from_secs(10);
+/// 指定できるタイムアウトの下限（これ未満の値は `INVALID_ARGUMENT`）。
+pub const MIN_WSL_TIMEOUT: Duration = Duration::from_millis(1);
 /// 指定できるタイムアウトの上限（これを超える値は `INVALID_ARGUMENT`）。
 pub const MAX_WSL_TIMEOUT: Duration = Duration::from_secs(300);
 /// `wsl.exe` の出力（stdout・stderr それぞれ）の上限バイト数。超えたら kill して拒否する。
@@ -301,8 +303,9 @@ pub mod test_support {
     }
 }
 
+/// `timeout` が [`MIN_WSL_TIMEOUT`]〜[`MAX_WSL_TIMEOUT`]（両端を含む）にあるか検証する（REPAIR-5・ERR-1）。
 fn check_timeout(timeout: Duration) -> Result<(), Wsl2Error> {
-    if timeout.is_zero() || timeout > MAX_WSL_TIMEOUT {
+    if !(MIN_WSL_TIMEOUT..=MAX_WSL_TIMEOUT).contains(&timeout) {
         return Err(Wsl2Error::new(
             Wsl2ErrorCode::InvalidArgument,
             "timeout must be between 1ms and 300s",

@@ -427,14 +427,18 @@ fn mount_argv(distro: &DistroName, m: &SharedMount) -> Vec<String> {
 /// 確認と `umount` を別々の `wsl.exe` 呼び出しに分けると、その隙間に別のマウントが同じマウント先へ積まれ、
 /// 確認した自分のマウントではなく他者のマウントを外しうる。そのため [`MOUNT_SCRIPT`] と同様に単一プロセスへ拘束し、
 /// 窓を最小にする。位置引数は `$1`=マウント先（固定基底配下の検証済み名で、mountinfo の 8 進エスケープを含まない）・
-/// `$2`=記録したマウント ID。mountinfo の 1 列目（マウント ID）と 5 列目（マウント先）だけを `read` で読む
-/// （awk 等に依存しない）。終了コード 203=最上位が記録したマウントでない（外さない）。それ以外は `umount` の
+/// `$2`=記録したマウント ID。mountinfo の 1 列目（マウント ID）・2 列目（親のマウント ID）・5 列目（マウント先）
+/// だけを `read` で読む（awk 等に依存しない）。最上位は [`find_mount`] と同じく行順でなくマウント階層で決める
+/// （同じマウント先の他のエントリから親として参照されていないものがちょうど 1 件）。終了コード 203=最上位を
+/// 確定できない・最上位が記録したマウントでない（外さない）。それ以外は `umount` の
 /// 終了コード（[`MOUNT_SCRIPT`] と同じ理由で、`umount(8)` の終了コード・シグナル終了と重ならない 200 番台に置く）。残る窓（同一プロセス内の確認から `umount` まで）に同じマウント先へマウントできるのは
 /// ゲスト内の root（CAP_SYS_ADMIN）に限られ、[`MOUNT_SCRIPT`] と同じく信頼境界の内側として扱う。
 const UMOUNT_SCRIPT: &str = concat!(
-    "set -u; top=; ",
-    "while read -r id _ _ _ mp _; do if [ \"$mp\" = \"$1\" ]; then top=$id; fi; done < /proc/self/mountinfo; ",
-    "[ \"$top\" = \"$2\" ] || exit 203; ",
+    "set -u; ids=; pars=; ",
+    "while read -r id par _ _ mp _; do if [ \"$mp\" = \"$1\" ]; then ids=\"$ids $id\"; pars=\"$pars $par\"; fi; ",
+    "done < /proc/self/mountinfo; ",
+    "top=; n=0; for i in $ids; do case \" $pars \" in *\" $i \"*) ;; *) top=$i; n=$((n + 1)) ;; esac; done; ",
+    "[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; ",
     "exec umount \"$1\""
 );
 
@@ -450,11 +454,14 @@ fn mountinfo_argv(distro: &DistroName) -> Vec<String> {
     exec_argv(distro, &["cat", "/proc/self/mountinfo"])
 }
 
-/// `/proc/self/mountinfo` の 1 エントリ（マウント ID・マウント先・マウントオプション・fstype）。
+/// `/proc/self/mountinfo` の 1 エントリ（マウント ID・親のマウント ID・マウント先・マウントオプション・fstype）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MountEntry {
     /// カーネルが割り当てるマウント ID（マウントインスタンスごとに一意。所有確認に使う）。
     mount_id: u32,
+    /// 親のマウント ID（mountinfo の 2 番目のフィールド）。同じマウント先に積まれたマウントの親は、
+    /// その直下のマウントになる（[`find_mount`] の最上位判定に使う）。
+    parent_id: u32,
     mount_point: String,
     /// マウントごとのオプション（mountinfo の 6 番目のフィールド。`ro` / `rw` を含む）。
     options: String,
@@ -516,12 +523,12 @@ fn parse_mountinfo(text: &str) -> Result<Vec<MountEntry>, Wsl2Error> {
         let mp = f.get(4).ok_or_else(bad)?;
         let fstype = f.get(sep + 1).ok_or_else(bad)?;
         let options = f.get(5).ok_or_else(bad)?;
-        let mount_id = f
-            .first()
-            .and_then(|t| t.parse::<u32>().ok())
-            .ok_or_else(bad)?;
+        let id_at = |i: usize| f.get(i).and_then(|t| t.parse::<u32>().ok());
+        let mount_id = id_at(0).ok_or_else(bad)?;
+        let parent_id = id_at(1).ok_or_else(bad)?;
         entries.push(MountEntry {
             mount_id,
+            parent_id,
             mount_point: unescape_mountinfo(mp).ok_or_else(bad)?,
             options: (*options).to_string(),
             fstype: (*fstype).to_string(),
@@ -533,9 +540,25 @@ fn parse_mountinfo(text: &str) -> Result<Vec<MountEntry>, Wsl2Error> {
     Ok(entries)
 }
 
-/// 同一マウント先が複数ある場合は最後（最上位）のエントリを返す。
+/// マウント先 `guest_path` の最上位のエントリを返す（パスの解決で到達するマウント。`umount` が外す対象）。
+///
+/// mountinfo の行順は最上位判定の契約ではないため、行順に頼らずマウント階層で決める。同じマウント先に
+/// 積まれたマウントの親はその直下のマウントなので、同じマウント先のエントリのうち、同じマウント先の他の
+/// エントリから親として参照されていないものが最上位である。該当がちょうど 1 件でなければ（同じパス文字列が
+/// 別々の親の下に見える等）最上位を確定できないため `None` を返す（呼び出し側は所有を確認できないものとして
+/// 扱い、外さない。fail-closed）。[`UMOUNT_SCRIPT`] もゲスト内で同じ基準で照合する。
 fn find_mount<'a>(entries: &'a [MountEntry], guest_path: &str) -> Option<&'a MountEntry> {
-    entries.iter().rev().find(|e| e.mount_point == guest_path)
+    let at: Vec<&MountEntry> = entries
+        .iter()
+        .filter(|e| e.mount_point == guest_path)
+        .collect();
+    let mut tops = at
+        .iter()
+        .filter(|e| !at.iter().any(|o| o.parent_id == e.mount_id));
+    match (tops.next(), tops.next()) {
+        (Some(top), None) => Some(top),
+        _ => None,
+    }
 }
 
 /// 暫定の `WinError` → `Wsl2Error` 変換。TASK-67.5（#376）でエラー型を共通化する際に置き換える（REPAIR-3）。
@@ -815,7 +838,9 @@ fn verify_virtiofs(
             }
             Some(_) => {}
             None => {
-                return Err(precondition("the shared mount is missing after mounting"));
+                return Err(precondition(
+                    "the shared mount is missing or its topmost mount cannot be determined after mounting",
+                ));
             }
         }
     }
@@ -845,7 +870,8 @@ fn prepare_with_exec(
     // （mountinfo は論理パスで照合する。symlink を含むパスは MOUNT_SCRIPT が mount 前に拒否する）。
     let before = read_mountinfo(distro, exec)?;
     for m in &req.mounts {
-        if find_mount(&before, &m.guest_path()).is_some() {
+        let target = m.guest_path();
+        if before.iter().any(|e| e.mount_point == target) {
             return Err(precondition("a shared mount target is already mounted"));
         }
     }
@@ -1241,7 +1267,11 @@ mod tests {
         assert!(MOUNT_SCRIPT.contains("chk \"$T\" || exit 202; exec mount -t drvfs"));
         // / からの全要素を検証すること・ID の照合と umount が同一スクリプト内にあること（TOCTOU 防止）。
         assert!(MOUNT_SCRIPT.contains("chk / || exit 200; chk /mnt || exit 200; "));
-        assert!(UMOUNT_SCRIPT.contains("[ \"$top\" = \"$2\" ] || exit 203; exec umount \"$1\""));
+        assert!(
+            UMOUNT_SCRIPT.contains(
+                "[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; exec umount \"$1\""
+            )
+        );
         assert_eq!(
             umount_argv(&d, "/mnt/fandhe/data", 123).get(5..),
             Some(
@@ -1272,12 +1302,14 @@ mod tests {
             vec![
                 MountEntry {
                     mount_id: 22,
+                    parent_id: 1,
                     mount_point: "/mnt/fandhe/my dir".into(),
                     options: "rw,nosuid".into(),
                     fstype: "virtiofs".into()
                 },
                 MountEntry {
                     mount_id: 23,
+                    parent_id: 1,
                     mount_point: "/mnt/fandhe/b".into(),
                     options: "rw".into(),
                     fstype: "9p".into()
@@ -1294,6 +1326,7 @@ mod tests {
             "garbage line",
             "1 2 3 4 5 6 7 8",
             "1 2 3 4 /a\\9 rw - x y",
+            "1 x 3:4 / /a rw - x y",
         ] {
             assert_eq!(
                 parse_mountinfo(bad).unwrap_err().code(),
@@ -1359,6 +1392,8 @@ mod tests {
         ignore_ro: bool,
         /// true なら `ro` を要求しなくても ro でマウントする（読み書き要求の不成立の模擬）。
         force_ro: bool,
+        /// true なら mountinfo の行を逆順で出力する（行順が最上位判定の契約でないことの模擬）。
+        reverse_mountinfo: bool,
         /// true なら mount のたびに同じマウント先へ別プロセスのマウントも積む（競合の模擬）。
         extra_on_mount: bool,
         /// true なら nosuid,nodev を無視してマウントする（オプション不成立の模擬）。
@@ -1397,6 +1432,7 @@ mod tests {
                 fail_cat_after_mount: false,
                 ignore_ro: false,
                 force_ro: false,
+                reverse_mountinfo: false,
                 extra_on_mount: false,
                 drop_nosuid: false,
                 timeout_mount_nth: None,
@@ -1443,16 +1479,30 @@ mod tests {
                     self.fail_cat_times -= 1;
                     fail_cat(1)
                 }
-                ["cat", _] => ok(self
-                    .mounts
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (p, t))| {
-                        let id = self.ids.get(i).copied().unwrap_or(0);
-                        let o = self.opts.get(i).map_or("rw", String::as_str);
-                        format!("{id} 1 0:{i} / {p} {o} - {t} src rw\n")
-                    })
-                    .collect()),
+                ["cat", _] => {
+                    // 親のマウント ID: 同じマウント先に先に積まれたマウントがあればそれ、無ければ `/`（ID 1）。
+                    let mut lines: Vec<String> = self
+                        .mounts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (p, t))| {
+                            let id = self.ids.get(i).copied().unwrap_or(0);
+                            let parent = self
+                                .mounts
+                                .iter()
+                                .take(i)
+                                .rposition(|(q, _)| q == p)
+                                .and_then(|j| self.ids.get(j).copied())
+                                .unwrap_or(if i == 0 { 0 } else { 1 });
+                            let o = self.opts.get(i).map_or("rw", String::as_str);
+                            format!("{id} {parent} 0:{i} / {p} {o} - {t} src rw\n")
+                        })
+                        .collect();
+                    if self.reverse_mountinfo {
+                        lines.reverse();
+                    }
+                    ok(lines.concat())
+                }
                 ["sh", "-c", _, "sh", _host, name, opts] => {
                     // MOUNT_SCRIPT の模擬: /mnt → 基底 → マウント先を検証し（無ければ作成）、mount する。
                     let fail = |code: i32| {
@@ -2047,5 +2097,46 @@ mod tests {
         assert_eq!(failures, 1);
         assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
         assert_eq!(g.ids, [1, 100, 101]);
+    }
+
+    /// SEC: 最上位はマウント階層（親のマウント ID）で決め、mountinfo の行順に頼らない。
+    /// 同じパス文字列の最上位候補が複数あって確定できなければ `None`（所有を確認できないものとして扱う）。
+    #[test]
+    fn find_mount_uses_hierarchy_not_line_order() {
+        // 102 が 100 の上に積まれているが、行は逆順。
+        let text = "102 100 0:4 / /mnt/fandhe/a rw - tmpfs x rw\n\
+                    1 0 0:1 / / rw - ext4 x rw\n\
+                    100 1 0:2 / /mnt/fandhe/a rw - virtiofs x rw\n";
+        let e = parse_mountinfo(text).unwrap();
+        assert_eq!(
+            find_mount(&e, "/mnt/fandhe/a").map(|m| m.mount_id),
+            Some(102)
+        );
+        // 別々の親の下に同じパス文字列が 2 つ見える場合は確定できない。
+        let text = "100 50 0:2 / /mnt/fandhe/a rw - virtiofs x rw\n\
+                    101 60 0:3 / /mnt/fandhe/a rw - virtiofs x rw\n";
+        let e = parse_mountinfo(text).unwrap();
+        assert_eq!(find_mount(&e, "/mnt/fandhe/a"), None);
+        // UMOUNT_SCRIPT も行順でなく親子関係で最上位を数える。
+        assert!(UMOUNT_SCRIPT.contains("while read -r id par _ _ mp _;"));
+        assert!(UMOUNT_SCRIPT.contains("[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; "));
+    }
+
+    /// SEC: mountinfo の行が逆順でも、準備・解除と、他者に覆われたマウントを外さない判定が変わらない。
+    #[test]
+    fn prepare_and_release_do_not_depend_on_mountinfo_order() {
+        let mut g = Guest::new("virtiofs");
+        g.reverse_mountinfo = true;
+        let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", false)]);
+        let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
+        let ids: Vec<u32> = p.mounts().iter().map(|m| m.mount_id).collect();
+        assert_eq!(ids, [100, 101]);
+        // a の上に他者のマウントを積む（行は逆順で出力される）。
+        g.mounts.push(("/mnt/fandhe/a".into(), "tmpfs".into()));
+        g.ids.push(777);
+        g.opts.push("rw".into());
+        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)), 1);
+        assert_eq!(g.umounts, ["/mnt/fandhe/b"]);
+        assert_eq!(g.ids, [1, 100, 777]);
     }
 }

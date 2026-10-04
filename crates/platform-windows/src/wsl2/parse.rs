@@ -52,7 +52,7 @@ fn decode_utf16le(body: &[u8]) -> Result<String, Wsl2Error> {
 /// `WSL_UTF8=1` に対応しない古い WSL は UTF-16LE で出力する。BOM なしの判定は文字種の割合に
 /// 依存させず、「末尾以外に NUL バイトがある」（UTF-8 テキストは内部に NUL を含まない）で行う。
 /// NUL が全くない場合は UTF-8 として扱う（`wsl.exe` の UTF-16 出力は ASCII の改行や空白を含むため
-/// 必ず NUL を持つ）。読めなければ `DATA_LOSS`。
+/// 必ず NUL を持つ）。読めなければ `DATA_LOSS`。行末以外の `\r` も `DATA_LOSS`（[`normalize_line_endings`]）。
 pub(super) fn decode_output(bytes: &[u8]) -> Result<String, Wsl2Error> {
     if bytes.is_empty() {
         return Err(data_loss("wsl.exe produced no output"));
@@ -71,11 +71,33 @@ pub(super) fn decode_output(bytes: &[u8]) -> Result<String, Wsl2Error> {
                 .to_string()
         }
     };
-    let text: String = text.replace('\r', "").trim_matches('\0').to_string();
+    let text = normalize_line_endings(text.trim_matches('\0'))?;
     if text.trim().is_empty() {
         return Err(data_loss("wsl.exe produced no output"));
     }
     Ok(text)
+}
+
+/// 行末の復帰文字だけを取り除く。`\r` の連続の直後が `\n` か末尾なら除去し（`wsl.exe` は UTF-16 出力で
+/// `\r\r\n` を出す）、それ以外の位置の `\r` は `DATA_LOSS` にする。
+///
+/// 行の途中の `\r` は表示を巻き戻してディストリ名等を偽装でき、空白扱いで列の区切りにもなるため、
+/// 後段の検証に頼らずここで拒否する（外部入力の fail-closed。WIN-1）。
+fn normalize_line_endings(text: &str) -> Result<String, Wsl2Error> {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\r' {
+            out.push(c);
+            continue;
+        }
+        while chars.next_if_eq(&'\r').is_some() {}
+        match chars.peek() {
+            None | Some('\n') => {}
+            Some(_) => return Err(data_loss("carriage return outside a line ending")),
+        }
+    }
+    Ok(out)
 }
 
 fn check_line_len(line: &str) -> Result<(), Wsl2Error> {

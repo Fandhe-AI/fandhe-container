@@ -219,7 +219,8 @@ enum TaskScan {
     Stable {
         /// 一致した tid 集合（昇順・重複なし）。
         tids: Vec<u32>,
-        /// 2 回のどちらかで ns link を stat できた（生存中の）スレッドがあったか。
+        /// 後（直近）の列挙で ns link を stat できた（生存中の）スレッドがあったか。前の列挙で生存して
+        /// いても、直近で全スレッドが終了中なら `false`（生存スレッド無しとして fail-closed にする）。
         live: bool,
     },
 }
@@ -246,7 +247,7 @@ fn scan_until_stable<I>(
 where
     I: IntoIterator<Item = Result<(u32, Option<NsId>), NetError>>,
 {
-    let mut prev: Option<(Vec<u32>, bool)> = None;
+    let mut prev: Option<Vec<u32>> = None;
     for pass in 0..MAX_PASSES {
         // pass 回目の列挙の前には pass - 1 回の不一致が起きている。
         if pass >= 2 {
@@ -273,14 +274,11 @@ where
         tids.sort_unstable();
         // procfs は同じ tid を 2 度返さない想定だが、比較を集合として扱うため防御的に重複を除く。
         tids.dedup();
+        // 生存の有無は直近の列挙で判定する（前の列挙の生存は、その後に全スレッドが終了中になり得るため
+        // 根拠にしない）。
         match prev {
-            Some((prev_tids, prev_live)) if prev_tids == tids => {
-                return Ok(TaskScan::Stable {
-                    tids,
-                    live: live || prev_live,
-                });
-            }
-            _ => prev = Some((tids, live)),
+            Some(prev_tids) if prev_tids == tids => return Ok(TaskScan::Stable { tids, live }),
+            _ => prev = Some(tids),
         }
     }
     Err(NetError::new(
@@ -676,7 +674,8 @@ mod tests {
     }
 
     /// NET-6: 終了中スレッド（識別子 None）も tid 集合に含めて比べる。生存中だった tid が終了中に
-    /// 変わっても集合は同じで、2 回のどちらかで生存スレッドを観測していれば live。
+    /// 変わっても集合は同じで、生存の有無は直近の列挙で決まる（直近で全スレッドが終了中なら live でなく、
+    /// verify_process は NOT_FOUND。前の列挙の生存を根拠に Member としない）。
     #[test]
     fn net6_scan_until_stable_counts_exiting_threads() {
         let h = NsId::new(4, 100);
@@ -686,15 +685,19 @@ mod tests {
                 _ => vec![Ok((10, None)), Ok((11, None))],
             })
         });
+        let scan = scan.unwrap();
         assert_eq!(
-            scan.unwrap(),
+            scan,
             TaskScan::Stable {
                 tids: vec![10, 11],
-                live: true
+                live: false
             }
         );
         assert_eq!(calls, 2);
         assert_eq!(pauses, Vec::<Duration>::new());
+        let e = membership_from_scan(scan).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::NotFound);
+        assert_eq!(e.message(), "process has no live threads");
         // 終了中の 11 が一覧から外れると集合が変わるため再列挙する。
         let (scan, calls, pauses) = scan_scripted(h, |n| {
             Ok(match n {

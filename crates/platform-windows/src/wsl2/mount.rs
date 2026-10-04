@@ -50,6 +50,8 @@ use crate::wslconfig::{self, VirtiofsState};
 
 /// ゲスト内のマウント先の基底。マウント先は常に `<基底>/<MountName>`（任意パスへの上書きマウントを不可能にする）。
 pub const GUEST_MOUNT_BASE: &str = "/mnt/fandhe";
+/// [`GUEST_MOUNT_BASE`] の親ディレクトリ（symlink でないことを事前に検証する）。
+const GUEST_MOUNT_PARENT: &str = "/mnt";
 /// 1 回の起動で指定できる共有マウント数の上限（`wsl.exe` の呼び出し回数を有界にする。REPAIR-5）。
 pub const MAX_SHARED_MOUNTS: usize = 16;
 /// ホストディレクトリ文字列の最大文字数（Unicode スカラー値単位。WIN-4 の推奨パス長 260 に合わせる）。
@@ -613,8 +615,19 @@ fn mount_one(
         return Err(step_failed("mounting the shared directory", &out));
     }
     // 直前に未マウントを確認済みのため、最上位エントリが本呼び出しのマウントである。
-    let entries = read_mountinfo(distro, exec)?;
     let guest_path = m.guest_path();
+    let entries = match read_mountinfo(distro, exec) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // mount は成立済みだがマウント ID を確認できない。残置を避けるため、直前まで未マウントだった
+            // 検証済みのマウント先（root 所有の実ディレクトリ）に限り、ID 未確認のまま 1 回だけ解除を試みる。
+            let unmounted = matches!(
+                exec(&umount_argv(distro, &guest_path), MAX_OUTPUT_BYTES),
+                Ok(out) if out.success
+            );
+            return Err(with_rollback_note(e, usize::from(!unmounted)));
+        }
+    };
     let mount_id = find_mount(&entries, &guest_path)
         .map(|e| e.mount_id)
         .ok_or_else(|| precondition("the shared mount is missing after mounting"))?;
@@ -653,6 +666,11 @@ fn prepare_with_exec(
     // root で mkdir / mount するため、基底・マウント先を symlink 非追従で検証してから進む。
     // 基底が実ディレクトリ（root 所有）と確定した後は、マウント先は基底の直下で一意に解決される。
     if !req.mounts.is_empty() {
+        // 基底の親（/mnt）が symlink だと mkdir / mount が解決後パスへ作用し、mountinfo の記録が
+        // 論理パスと食い違って所有を追えなくなるため、基底より先に親も symlink 非追従で検証する。
+        if check_guest_dir(distro, GUEST_MOUNT_PARENT, exec)?.is_none() {
+            return Err(precondition("the mount base parent directory is missing"));
+        }
         ensure_guest_dir(distro, GUEST_MOUNT_BASE, exec)?;
         for m in &req.mounts {
             ensure_guest_dir(distro, &m.guest_path(), exec)?;
@@ -1116,6 +1134,8 @@ mod tests {
         umounts: Vec<String>,
         /// 既存パス → `stat -c '%f %u'` の応答（mkdir が追加する）。
         paths: std::collections::HashMap<String, String>,
+        /// true なら mount 成功後の mountinfo 読み取りを失敗させる。
+        fail_cat_after_mount: bool,
     }
 
     impl Guest {
@@ -1128,7 +1148,11 @@ mod tests {
                 fail_mount_nth: None,
                 mount_calls: 0,
                 umounts: vec![],
-                paths: std::collections::HashMap::new(),
+                paths: std::collections::HashMap::from([(
+                    "/mnt".to_string(),
+                    "41ed 0".to_string(),
+                )]),
+                fail_cat_after_mount: false,
             }
         }
 
@@ -1143,6 +1167,14 @@ mod tests {
                 })
             };
             match cmd.as_slice() {
+                ["cat", _] if self.fail_cat_after_mount && self.mount_calls > 0 => {
+                    Ok(run::Captured {
+                        success: false,
+                        code: Some(1),
+                        stdout: vec![],
+                        stderr: vec![],
+                    })
+                }
                 ["cat", _] => ok(self
                     .mounts
                     .iter()
@@ -1323,7 +1355,7 @@ mod tests {
             "41fd 0",
             "81a4 0",
         ] {
-            for victim in ["/mnt/fandhe", "/mnt/fandhe/a"] {
+            for victim in ["/mnt", "/mnt/fandhe", "/mnt/fandhe/a"] {
                 let mut g = Guest::new("virtiofs");
                 g.paths.insert("/mnt/fandhe".into(), "41ed 0".into());
                 g.paths.insert(victim.into(), bad.into());
@@ -1337,6 +1369,18 @@ mod tests {
                 assert_eq!(g.mount_calls, 0, "{bad} {victim}");
             }
         }
+    }
+
+    /// SEC: mount 成功後に mountinfo を読めなくてもマウントを残置しない。
+    #[test]
+    fn prepare_unmounts_when_mountinfo_read_fails_after_mount() {
+        let mut g = Guest::new("virtiofs");
+        g.fail_cat_after_mount = true;
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+        assert_eq!(g.mounts.len(), 1);
     }
 
     /// SEC: 解除前にマウント ID を再確認し、他プロセスが差し替えたマウントは外さない。

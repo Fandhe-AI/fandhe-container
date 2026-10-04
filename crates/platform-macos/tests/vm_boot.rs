@@ -222,6 +222,52 @@ fn resolve_ready_marker(raw: Option<String>) -> Result<String, String> {
     }
 }
 
+/// ブートマーカーと起動完了マーカーの重複を拒否する。
+///
+/// 一致・包含関係にあると起動初期の出力だけで両方が成立し、起動完了前にゲストが停止しても通ってしまう（MAC-1）。
+fn validate_marker_pair(boot: &str, ready: &str) -> Result<(), String> {
+    if boot.contains(ready) || ready.contains(boot) {
+        return Err(format!(
+            "boot marker {boot:?} and ready marker {ready:?} must not be equal or contain one another"
+        ));
+    }
+    Ok(())
+}
+
+/// ブートマーカーの出現より後に起動完了マーカーが現れたかを返す。
+///
+/// 起動完了マーカーはブートマーカー末尾以降だけを探索し、順序（ブート後に起動完了）を保証する（MAC-1）。
+fn markers_observed_in_order(text: &str, boot: &str, ready: &str) -> bool {
+    text.find(boot)
+        .and_then(|pos| text.get(pos + boot.len()..))
+        .is_some_and(|rest| rest.contains(ready))
+}
+
+#[test]
+fn mac1_marker_pair_rejects_overlap() {
+    assert!(validate_marker_pair("Linux version", "Linux version").is_err());
+    assert!(validate_marker_pair("Linux version", "Linux").is_err());
+    assert!(validate_marker_pair("Linux", "Linux version 6").is_err());
+    assert!(validate_marker_pair("Linux version", "login:").is_ok());
+}
+
+#[test]
+fn mac1_ready_marker_must_follow_boot_marker() {
+    let (b, r) = ("Linux version", "login:");
+    assert!(markers_observed_in_order(
+        "Linux version 6.1\nlogin: ",
+        b,
+        r
+    ));
+    assert!(!markers_observed_in_order(
+        "login: \nLinux version 6.1",
+        b,
+        r
+    ));
+    assert!(!markers_observed_in_order("Linux version 6.1", b, r));
+    assert!(!markers_observed_in_order("login:", b, r));
+}
+
 #[test]
 fn mac1_ready_marker_is_required_and_non_empty() {
     assert!(resolve_ready_marker(None).is_err());
@@ -265,6 +311,7 @@ fn mac1_minimal_vm_boots_and_stops_on_real_macos() {
     let ready_marker =
         resolve_ready_marker(std::env::var("FANDHE_CONTAINER_MACOS_VM_READY_MARKER").ok())
             .expect("invalid FANDHE_CONTAINER_MACOS_VM_READY_MARKER");
+    validate_marker_pair(&marker, &ready_marker).expect("invalid marker pair");
     let boot_secs: u64 =
         match std::env::var("FANDHE_CONTAINER_MACOS_VM_BOOT_TIMEOUT_SECS") {
             Ok(v) => v.parse().ok().filter(|n| (1..=600).contains(n)).expect(
@@ -331,7 +378,7 @@ fn mac1_minimal_vm_boots_and_stops_on_real_macos() {
             last = bytes;
         }
         let text = String::from_utf8_lossy(&last);
-        if text.contains(&marker) && text.contains(&ready_marker) {
+        if markers_observed_in_order(&text, &marker, &ready_marker) {
             break true;
         }
         if Instant::now() >= deadline {
@@ -341,7 +388,7 @@ fn mac1_minimal_vm_boots_and_stops_on_real_macos() {
     };
     if !found {
         let msg = format!(
-            "boot marker {marker:?} and ready marker {ready_marker:?} not both observed within {boot_secs}s; console tail:\n{}",
+            "boot marker {marker:?} and ready marker {ready_marker:?} not observed in order (boot then ready) within {boot_secs}s; console tail:\n{}",
             tail_lossy(&last, 4096)
         );
         let _ = vm.stop();

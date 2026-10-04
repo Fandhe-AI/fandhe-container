@@ -11,12 +11,15 @@
 //! - 子: `/` を rprivate にして tmpfs を載せ、軽量運用の `create_network` で c1 を `attach_container` する。
 //!   `join_network` が `HelperDisabled` で gateway:53 の UDP 待受が 0 件であることを確かめる。bridge に secondary
 //!   アドレス（gateway と別）を付与してそこへ偽 DNS サーバー（クエリログ付き UDP）を待ち受けさせ、`apply_static_dns` で
-//!   書いた `resolv.conf` を `nsenter --net=<c1 の pin> <exe> --probe ...` で読む stub resolver にクエリを送らせる。
+//!   書いた `resolv.conf` を `nsenter --net=<c1 の pin> unshare --mount -- sh -c ...`（/etc/resolv.conf へ bind mount）経由で <exe> --probe が読む stub resolver にクエリを送らせる。
 //!   サーバー側のクエリログ（送信元 = c1 のアドレス・QNAME・QTYPE）と、gateway:53 のデコイが受信 0 件であることで
 //!   「指定サーバーへ直接届いた」ことを照合する
 //!
 //! probe は getaddrinfo を使わない（ホストの nsswitch が `resolve` / `mdns` 等を経由して `resolv.conf` を無視し、
 //! ホストの resolver へクエリが漏れ得るため）。`resolv.conf` の先頭 `nameserver` へ手組みの A クエリを直接送る。
+//!
+//! probe は生成した `resolv.conf` を c1 側の mount namespace で `/etc/resolv.conf` へ bind mount し、固定パス
+//! `/etc/resolv.conf` を読む（コンテナ内から見える配置で使えることの検証）。
 //!
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・外部コマンド）を
 //! 満たさない場合は skip せず失敗する。
@@ -123,7 +126,7 @@ mod linux {
             .as_deref()
             == Some("0");
         assert!(uid_root, "this test requires root (euid 0); see AGENTS.md");
-        for tool in ["unshare", "nsenter", "mount"] {
+        for tool in ["unshare", "nsenter", "mount", "sh"] {
             let ok = Command::new(tool)
                 .arg("--help")
                 .stdout(Stdio::null())
@@ -669,9 +672,18 @@ mod linux {
         let pin_arg = format!("--net={pin}");
         let qname = probe_qname();
         let want = ANSWER_IP.to_string();
+        // コンテナ側の /etc/resolv.conf として使える状態かを検証するため、c1 の netns に入ったうえで
+        // 使い捨ての mount namespace を作り、生成した resolv.conf を /etc/resolv.conf へ bind mount して
+        // から probe に固定パス /etc/resolv.conf を読ませる（mount は host へ伝播しない）。
+        // 値はシェル文字列へ連結せず位置引数（$1..$4）で渡す。
+        let script = "mount --make-rprivate / && mount --bind \"$1\" /etc/resolv.conf \
+             && exec \"$2\" --probe /etc/resolv.conf \"$3\" \"$4\"";
         let out = run_cmd(
             "nsenter",
-            &[&pin_arg, exe_str, "--probe", resolv_str, &qname, &want],
+            &[
+                &pin_arg, "unshare", "--mount", "--", "sh", "-c", script, "sh", resolv_str,
+                exe_str, &qname, &want,
+            ],
         )?;
         if out.trim() != "probe: ok" {
             return Err(fail(format!("unexpected probe output: {out}")));

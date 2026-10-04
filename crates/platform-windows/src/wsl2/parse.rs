@@ -150,6 +150,19 @@ fn parse_state(tokens: &[&str]) -> DistroState {
     }
 }
 
+/// ヘッダー行が既知の列名（NAME / STATE / VERSION と日本語ロケールの 名前 / 状態 / バージョン）を
+/// この順で 3 列ちょうど持つか（想定外の先頭出力を拒否して fail-closed にする）。
+fn is_known_header(header: &str) -> bool {
+    const KNOWN: [[&str; 3]; 2] = [["name", "state", "version"], ["名前", "状態", "バージョン"]];
+    let tokens: Vec<String> = header
+        .split_whitespace()
+        .map(|t| t.to_lowercase())
+        .collect();
+    KNOWN
+        .iter()
+        .any(|k| tokens.len() == 3 && tokens.iter().zip(k.iter()).all(|(a, b)| a == b))
+}
+
 /// ヘッダー行から 2 列目（STATE）が始まる文字位置を返す（列境界。空白区切りの 2 番目のトークン）。
 fn state_column_start(header: &str) -> Option<usize> {
     let mut seen = 0;
@@ -225,7 +238,7 @@ pub(super) fn parse_distros(text: &str) -> Result<Vec<WslDistro>, Wsl2Error> {
         .next()
         .ok_or_else(|| data_loss("wsl.exe produced no output"))?;
     check_line_len(header)?;
-    if header.split_whitespace().count() < 3 {
+    if !is_known_header(header) {
         return Err(data_loss("unrecognized `wsl -l -v` header"));
     }
     let state_col =
@@ -432,6 +445,22 @@ mod tests {
         assert_eq!(d[0].state, DistroState::Running);
         assert_eq!(d[1].state, DistroState::Other("Foo Bar".into()));
         assert!(parse_distros("  NAME STATE VERSION\n").unwrap().is_empty());
+    }
+
+    /// 想定外の先頭行（列名・順序・列数が違う）は拒否する。
+    #[test]
+    fn unexpected_header_is_rejected() {
+        for h in [
+            "Some banner text here\n",
+            "STATE NAME VERSION\n",
+            "NAME STATE\n",
+            "NAME STATE VERSION EXTRA\n",
+            "foo bar baz\n",
+        ] {
+            let t = format!("{h}Ubuntu Running 2\n");
+            let e = parse_distros(&t).unwrap_err();
+            assert_eq!(e.code(), Wsl2ErrorCode::DataLoss, "{h}");
+        }
     }
 
     /// 空白を含むディストリ名は列境界で保たれ、状態に混入しない。

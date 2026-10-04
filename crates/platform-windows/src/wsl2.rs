@@ -171,6 +171,14 @@ pub struct WslDistro {
     pub is_default: bool,
 }
 
+impl WslDistro {
+    /// WSL2 で、かつ起動可能な状態（Running / Stopped）か。
+    pub fn is_usable_wsl2(&self) -> bool {
+        self.version == WslMajorVersion::V2
+            && matches!(self.state, DistroState::Running | DistroState::Stopped)
+    }
+}
+
 /// `detect` の結果。WSL2 のディストリが 1 件以上あることを保証する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -182,11 +190,11 @@ pub struct Wsl2Status {
 }
 
 impl Wsl2Status {
-    /// WSL2 のディストリが 1 件以上あるか。
+    /// 起動可能な状態（実行中または停止中）の WSL2 ディストリが 1 件以上あるか。
+    ///
+    /// Installing / Uninstalling / Converting や未知の状態のみの場合は false（fail-closed）。
     pub fn has_wsl2_distro(&self) -> bool {
-        self.distros
-            .iter()
-            .any(|d| d.version == WslMajorVersion::V2)
+        self.distros.iter().any(WslDistro::is_usable_wsl2)
     }
 }
 
@@ -301,7 +309,7 @@ fn evaluate(version: WslVersionInfo, distros: Vec<WslDistro>) -> Result<Wsl2Stat
     if !status.has_wsl2_distro() {
         return Err(Wsl2Error::new(
             Wsl2ErrorCode::FailedPrecondition,
-            format!("no WSL2 distribution is installed. {ENABLE_GUIDE}"),
+            format!("no usable WSL2 distribution is available. {ENABLE_GUIDE}"),
         ));
     }
     Ok(status)
@@ -371,6 +379,25 @@ mod tests {
         let s = evaluate(ver(), vec![distro(WslMajorVersion::V2)]).unwrap();
         assert!(s.has_wsl2_distro());
         assert_eq!(s.distros.len(), 1);
+    }
+
+    /// WIN-1: 起動可能でない状態（Installing 等）の V2 のみなら失敗し、Stopped は成功する。
+    #[test]
+    fn evaluate_requires_usable_state() {
+        for st in [
+            DistroState::Installing,
+            DistroState::Uninstalling,
+            DistroState::Converting,
+            DistroState::Other("Foo".into()),
+        ] {
+            let mut d = distro(WslMajorVersion::V2);
+            d.state = st;
+            let e = evaluate(ver(), vec![d]).unwrap_err();
+            assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        }
+        let mut d = distro(WslMajorVersion::V2);
+        d.state = DistroState::Stopped;
+        assert!(evaluate(ver(), vec![d]).is_ok());
     }
 
     /// REPAIR-5・ERR-1: 0 や過大なタイムアウトは INVALID_ARGUMENT。

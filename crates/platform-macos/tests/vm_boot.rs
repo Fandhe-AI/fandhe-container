@@ -187,8 +187,9 @@ fn env_path(name: &str) -> Option<PathBuf> {
 fn require_kernel() -> PathBuf {
     env_path("FANDHE_CONTAINER_MACOS_VM_KERNEL").unwrap_or_else(|| {
         panic!(
-            "FANDHE_CONTAINER_MACOS_VM_KERNEL (absolute path to a guest kernel) is required. \
-             Optional: FANDHE_CONTAINER_MACOS_VM_INITRD, FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE, \
+            "FANDHE_CONTAINER_MACOS_VM_KERNEL (absolute path to a guest kernel) and \
+             FANDHE_CONTAINER_MACOS_VM_READY_MARKER (a string the guest prints only after boot completes) \
+             are required. Optional: FANDHE_CONTAINER_MACOS_VM_INITRD, FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE, \
              FANDHE_CONTAINER_MACOS_VM_CMDLINE (default \"console=hvc0\"), \
              FANDHE_CONTAINER_MACOS_VM_BOOT_MARKER (default \"Linux version\"), \
              FANDHE_CONTAINER_MACOS_VM_BOOT_TIMEOUT_SECS (1-600, default 60). See AGENTS.md."
@@ -209,6 +210,28 @@ fn resolve_boot_marker(raw: Option<String>) -> Result<String, String> {
     }
 }
 
+/// 起動完了マーカーを決める。既定値は無く、未指定・空文字列は拒否する。
+///
+/// `Linux version` のような起動初期のマーカーだけでは、直後にゲストが停止しても成功してしまう。
+/// ゲスト資産が起動完了後にだけ出力する文字列を呼び出し側に必ず指定させる（MAC-1）。
+fn resolve_ready_marker(raw: Option<String>) -> Result<String, String> {
+    match raw {
+        None => Err("FANDHE_CONTAINER_MACOS_VM_READY_MARKER is required".to_string()),
+        Some(m) if m.is_empty() => Err("ready marker must not be empty".to_string()),
+        Some(m) => Ok(m),
+    }
+}
+
+#[test]
+fn mac1_ready_marker_is_required_and_non_empty() {
+    assert!(resolve_ready_marker(None).is_err());
+    assert!(resolve_ready_marker(Some(String::new())).is_err());
+    assert_eq!(
+        resolve_ready_marker(Some("login:".to_string())),
+        Ok("login:".to_string())
+    );
+}
+
 #[test]
 fn mac1_boot_marker_rejects_empty_and_defaults_when_unset() {
     assert_eq!(resolve_boot_marker(None), Ok("Linux version".to_string()));
@@ -225,7 +248,7 @@ fn tail_lossy(bytes: &[u8], max: usize) -> String {
     String::from_utf8_lossy(bytes.get(start..).unwrap_or_default()).into_owned()
 }
 
-/// MAC-1・TASK-64.6: 実機で最小 VM を起動し、コンソールにブートマーカーが出て、停止できる。
+/// MAC-1・TASK-64.6: 実機で最小 VM を起動し、コンソールにブートマーカーと起動完了マーカーが出て、停止できる。
 ///
 /// 実機前提のため既定集合から分離している（CI 通過のための弱体化ではない）。必要なもの: 実機 macOS 13 以上、
 /// `com.apple.security.virtualization` 付きで署名したテストバイナリ、ゲスト資産（#362 の方式）。
@@ -239,6 +262,9 @@ fn mac1_minimal_vm_boots_and_stops_on_real_macos() {
         .unwrap_or_else(|_| "console=hvc0".to_string());
     let marker = resolve_boot_marker(std::env::var("FANDHE_CONTAINER_MACOS_VM_BOOT_MARKER").ok())
         .expect("invalid FANDHE_CONTAINER_MACOS_VM_BOOT_MARKER");
+    let ready_marker =
+        resolve_ready_marker(std::env::var("FANDHE_CONTAINER_MACOS_VM_READY_MARKER").ok())
+            .expect("invalid FANDHE_CONTAINER_MACOS_VM_READY_MARKER");
     let boot_secs: u64 =
         match std::env::var("FANDHE_CONTAINER_MACOS_VM_BOOT_TIMEOUT_SECS") {
             Ok(v) => v.parse().ok().filter(|n| (1..=600).contains(n)).expect(
@@ -304,7 +330,8 @@ fn mac1_minimal_vm_boots_and_stops_on_real_macos() {
         if let Ok(bytes) = std::fs::read(&log) {
             last = bytes;
         }
-        if String::from_utf8_lossy(&last).contains(&marker) {
+        let text = String::from_utf8_lossy(&last);
+        if text.contains(&marker) && text.contains(&ready_marker) {
             break true;
         }
         if Instant::now() >= deadline {
@@ -314,17 +341,19 @@ fn mac1_minimal_vm_boots_and_stops_on_real_macos() {
     };
     if !found {
         let msg = format!(
-            "boot marker {marker:?} not observed within {boot_secs}s; console tail:\n{}",
+            "boot marker {marker:?} and ready marker {ready_marker:?} not both observed within {boot_secs}s; console tail:\n{}",
             tail_lossy(&last, 4096)
         );
         let _ = vm.stop();
         panic!("{msg}");
     }
     println!(
-        "vm_boot: boot marker observed (marker={marker:?}, elapsed_ms={})",
+        "vm_boot: boot marker observed (marker={marker:?}, ready_marker={ready_marker:?}, elapsed_ms={})",
         started.elapsed().as_millis()
     );
 
+    // 起動完了後もゲストが停止・異常終了していないことを確認してから停止する。
+    assert_eq!(vm.state(), VmState::Running, "guest stopped after boot");
     vm.stop().expect("stop");
     assert_eq!(vm.state(), VmState::Stopped);
 }

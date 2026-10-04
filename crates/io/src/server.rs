@@ -1398,7 +1398,7 @@ mod imp {
 
     use crate::error::{IoError, IoErrorCode};
     use crate::observe::{SendEventError, ServerEvent, ServerOp, ServerOutcome};
-    use crate::protocol::{Frame, FrameKind};
+    use crate::protocol::Frame;
     use crate::recv_limits::ReceiveLimits;
     use crate::stream_io::*;
     use crate::transport::IoTimeout;
@@ -2094,31 +2094,10 @@ mod imp {
         }
     }
 
-    /// サーバーが受信してはならない応答系種別（`Ack`・`FlushAck`）を拒否する
-    /// （IO-1・REPAIR-2・#820 レビュー指摘）。
-    ///
-    /// UDS サーバー側はクライアントからの `Write` / `Flush` のみを受け取る
-    /// 想定であり（`Ack` / `FlushAck` はサーバーからクライアントへ返す側）、
-    /// クライアントからこれらが届くのはプロトコル違反として扱う
-    /// （`FrameKind` の全バリアントを列挙する `match` にし、将来種別が
-    /// 追加された場合はここがコンパイルエラーになって判断漏れを防ぐ。
-    /// fail-closed）。`crates/io/src/recv_limits.rs` モジュール doc の
-    /// 「スコープ外」節が「サーバー側で Ack / FlushAck を受信した場合の拒否は
-    /// TASK-13.2.1（#820）が担う」としている箇所の実体がこの関数である。
-    fn reject_client_originated_response_frame(kind: FrameKind) -> Result<(), IoError> {
-        match kind {
-            FrameKind::Write | FrameKind::Flush => Ok(()),
-            FrameKind::Ack | FrameKind::FlushAck => Err(IoError::new(
-                IoErrorCode::InvalidArgument,
-                format!("server does not accept client-originated response frames: {kind:?}"),
-            )),
-        }
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::protocol::{FRAME_HEADER_LEN, FrameHeader};
+        use crate::protocol::{FRAME_HEADER_LEN, FrameHeader, FrameKind};
         use std::io::{Read, Write};
 
         /// TASK-13.2.1: `WouldBlock` / `TimedOut` は `Timeout` に写像される。

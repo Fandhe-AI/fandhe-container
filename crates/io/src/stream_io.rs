@@ -106,6 +106,27 @@ pub(crate) fn accept_retry_deadline_or_limit(
 /// 「短時間に大量の切断が続く」病的なケースの保険）。
 pub(crate) const MAX_ACCEPT_ABORT_RETRIES: u32 = 32;
 
+/// サーバーが受信してはならない応答系種別（`Ack`・`FlushAck`）を拒否する
+/// （IO-1・REPAIR-2・#820 レビュー指摘）。
+///
+/// UDS・vsock のサーバー側はクライアントからの `Write` / `Flush` のみを受け取る
+/// 想定であり（`Ack` / `FlushAck` はサーバーからクライアントへ返す側）、
+/// クライアントからこれらが届くのはプロトコル違反として扱う
+/// （`FrameKind` の全バリアントを列挙する `match` にし、将来種別が
+/// 追加された場合はここがコンパイルエラーになって判断漏れを防ぐ。
+/// fail-closed）。`crates/io/src/recv_limits.rs` モジュール doc の
+/// 「スコープ外」節が「サーバー側で Ack / FlushAck を受信した場合の拒否は
+/// TASK-13.2.1（#820）が担う」としている箇所の実体がこの関数である。
+pub(crate) fn reject_client_originated_response_frame(kind: FrameKind) -> Result<(), IoError> {
+    match kind {
+        FrameKind::Write | FrameKind::Flush => Ok(()),
+        FrameKind::Ack | FrameKind::FlushAck => Err(IoError::new(
+            IoErrorCode::InvalidArgument,
+            format!("server does not accept client-originated response frames: {kind:?}"),
+        )),
+    }
+}
+
 /// `crate::protocol` の「ストリーム読みの手順」（1: 固定長ヘッダを読む→
 /// 2: `FrameHeader::from_bytes` で検証→3: 方向的に受理できない種別を確保前に拒否→
 /// 4: `ReceiveLimits::admit` で確保前の受理判定→5: 検証済みの `body_len` を上限に

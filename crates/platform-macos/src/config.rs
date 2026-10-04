@@ -1034,6 +1034,75 @@ fn file_identity(field: ConfigField, path: &Path) -> Result<FileIdentity, Config
     }
 }
 
+/// ハードリンク検査で走査する共有配下のエントリ数の上限（無制限走査による DoS の防止）。
+#[cfg(unix)]
+const MAX_SHARE_SCAN_ENTRIES: usize = 1_000_000;
+
+/// ReadWrite 共有の配下に、保護入力と同一 inode（`(dev, ino)` 一致）のエントリがあれば拒否する。
+///
+/// パスの包含検査（[`crate::virtiofs::path_is_within`]）では、共有の外にある保護入力へのハードリンクを
+/// 共有内に置かれると検出できず、ゲストが同じ inode を書き換えられる（MAC-1・TASK-65.1。
+/// AGENTS.md の rootfs・マウント・ボリューム境界）。共有配下を symlink を辿らずに走査して照合する。
+/// 保護入力が未作成（コンソールログ等）なら照合対象から外す。走査の I/O 失敗・件数上限超過は
+/// fail-closed で `PathIo` を返す。unix 限定（Windows には `(dev, ino)` が無く、本 crate の
+/// 実行対象は macOS のため走査しない）。`check_share_conflicts` から呼ばれる。
+#[cfg(unix)]
+fn find_hardlink_to_protected(
+    dir: &Path,
+    protected: &[(ConfigField, PathBuf)],
+) -> Result<(), ConfigError> {
+    use std::os::unix::fs::MetadataExt;
+    let io_err = |e: std::io::Error| ConfigError::PathIo {
+        field: ConfigField::SharedDirectory,
+        kind: e.kind(),
+    };
+    let mut ids: Vec<(ConfigField, PathBuf, (u64, u64))> = Vec::new();
+    for (field, path) in protected {
+        match std::fs::metadata(path) {
+            Ok(m) => ids.push((*field, path.clone(), (m.dev(), m.ino()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(ConfigError::PathIo {
+                    field: *field,
+                    kind: e.kind(),
+                });
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    let mut scanned = 0usize;
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).map_err(io_err)? {
+            let entry = entry.map_err(io_err)?;
+            scanned += 1;
+            if scanned > MAX_SHARE_SCAN_ENTRIES {
+                return Err(ConfigError::PathIo {
+                    field: ConfigField::SharedDirectory,
+                    kind: std::io::ErrorKind::Other,
+                });
+            }
+            // symlink は辿らない（共有外への経路を走査に含めない。リンク先の書き換えは virtiofs 側が解決する）。
+            let meta = std::fs::symlink_metadata(entry.path()).map_err(io_err)?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                let id = (meta.dev(), meta.ino());
+                if let Some((field, _, _)) = ids.iter().find(|(_, _, pid)| *pid == id) {
+                    return Err(ConfigError::SharedDirContainsProtectedInput {
+                        field: *field,
+                        path: entry.path(),
+                        share_dir: dir.to_path_buf(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 検証済みのデバイス構成（ブロックデバイス群とシリアルコンソール）。
 ///
 /// フィールドは非公開で、[`DeviceConfigSpec::try_new`] を通った組み合わせだけが存在する（REPAIR-2）。
@@ -1217,6 +1286,8 @@ impl VmConfigSpec {
                     });
                 }
             }
+            #[cfg(unix)]
+            find_hardlink_to_protected(&dir, &resolved)?;
         }
         Ok(())
     }
@@ -2038,6 +2109,45 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// MAC-1・TASK-65.1: 共有内に置かれた保護入力へのハードリンクは、パス包含では検出できないが
+    /// `(dev, ino)` 照合で拒否する。無関係なファイルだけの共有は許可する。
+    #[cfg(unix)]
+    #[test]
+    fn rejects_read_write_share_with_hardlink_to_protected_input() {
+        use crate::virtiofs::{ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
+        let t = TempDir::new("share-hardlink");
+        let real = std::fs::canonicalize(&t.0).unwrap();
+        let outside = real.join("outside");
+        let shared = real.join("shared");
+        std::fs::create_dir_all(shared.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let k = outside.join("vmlinux");
+        std::fs::write(&k, b"k").unwrap();
+        let shares = VirtiofsSharesSpec::try_new(vec![VirtiofsShareSpec::new(
+            VirtiofsTag::try_new("s").unwrap(),
+            SharedDirectoryPath::try_new(&shared).unwrap(),
+            ShareAccess::ReadWrite,
+        )])
+        .unwrap();
+        let spec = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_shared_directories(shares);
+        std::fs::write(shared.join("sub").join("plain"), b"x").unwrap();
+        spec.check_share_conflicts().unwrap();
+
+        let link = shared.join("sub").join("alias");
+        std::fs::hard_link(&k, &link).unwrap();
+        let err = spec.check_share_conflicts().unwrap_err();
+        assert_eq!(err.code(), "config.shared_dir_contains_protected_input");
+        match err {
+            ConfigError::SharedDirContainsProtectedInput { field, path, .. } => {
+                assert_eq!(field, ConfigField::Kernel);
+                assert_eq!(path, link);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     /// MAC-1・TASK-65.1: macOS で virtiofs 付き設定を構築し、読み戻した値が入力と一致する。

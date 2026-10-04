@@ -1832,11 +1832,23 @@ mod tests {
         use crate::config::{ConsoleLogPath, DeviceConfigSpec, SerialConsoleSink, VmConfigSpec};
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir()
+        // 既存ディレクトリを再利用・削除しないよう、`create_dir`（既存なら失敗）で新規作成できた名前だけを使う。
+        let base = std::env::temp_dir()
             .canonicalize()
-            .expect("canonical temp dir")
-            .join(format!("fandhe-macos-launch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+            .expect("canonical temp dir");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = (0..100u32)
+            .find_map(|n| {
+                let candidate = base.join(format!(
+                    "fandhe-macos-launch-{}-{nanos}-{n}",
+                    std::process::id()
+                ));
+                std::fs::create_dir(&candidate).ok().map(|()| candidate)
+            })
+            .expect("create a fresh unique temp dir");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         let kernel = dir.join("vmlinux");
         std::fs::write(&kernel, b"dummy").expect("write kernel");
@@ -1891,6 +1903,9 @@ mod tests {
             }
         };
         sink.finish(Duration::from_secs(5));
-        let _ = std::fs::remove_dir_all(&dir);
+        // このテストが新規作成したディレクトリ配下の既知ファイルだけを消す（再帰削除はしない）。
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(&kernel);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

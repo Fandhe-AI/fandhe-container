@@ -37,10 +37,10 @@
 //! | コマンド | 振る舞い |
 //! | ---- | ---- |
 //! | `cat /proc/self/mountinfo` | マウント表を mountinfo 形式で出力（0） |
-//! | `sh -c <検証込み mount スクリプト> sh <ホスト> <名前> <オプション>` | `/mnt/fandhe/<名前>` に新しい ID でマウントを積む（`mount_9p` は fstype `9p`、他は `virtiofs`。0） |
-//! | `sh -c <ID 照合付き umount スクリプト> sh <マウント先> <ID>` | 最上位の ID が一致すれば外す（0）、不一致は 203 |
+//! | `sh -c <検証込み mount スクリプト> sh <ホスト> <名前> <オプション> <nonce>` | `/mnt/fandhe/<名前>` に新しい ID でマウントを積み、その ID を出力する（`mount_9p` は fstype `9p`、他は `virtiofs`。0） |
+//! | `sh -c <ID 照合付き umount スクリプト> sh <マウント先> <ID> <nonce>` | 最上位の ID が一致すれば外す（0）、不一致は 203 |
 //!
-//! スクリプト本文はゲストのシェルで解釈せず、`exec mount -t drvfs` / `exec umount` を含むかだけを確かめる
+//! スクリプト本文はゲストのシェルで解釈せず、`mount -t drvfs` / `umount "$1"` を含むかだけを確かめる
 //! （本文の振る舞いはユニットテストの模擬ゲストと実機確認 TASK-67.6・#377 の担当）。
 
 use std::io::Write;
@@ -111,7 +111,9 @@ fn guest_exec(mode: &str, cmd: &[&str]) -> ExitCode {
                 .collect();
             emit(text.as_bytes(), 0)
         }
-        ["sh", "-c", script, "sh", _host, name, opts] if script.contains("exec mount -t drvfs") => {
+        ["sh", "-c", script, "sh", _host, name, opts, _nonce]
+            if script.contains("mount -t drvfs") =>
+        {
             let id = rows.iter().map(|r| r.0).max().unwrap_or(0).max(99) + 1;
             let base = if opts.split(',').any(|o| o == "ro") {
                 "ro"
@@ -125,9 +127,13 @@ fn guest_exec(mode: &str, cmd: &[&str]) -> ExitCode {
                 format!("{base},nosuid,nodev"),
                 fstype.to_string(),
             ));
-            save_state(&rows).map_or(ExitCode::from(3), |()| ExitCode::SUCCESS)
+            if save_state(&rows).is_none() {
+                return ExitCode::from(3);
+            }
+            // 本物のスクリプトと同じく、自分のマウント ID（mount 前後の差分）を標準出力へ書く。
+            emit(format!("{id}\n").as_bytes(), 0)
         }
-        ["sh", "-c", script, "sh", target, id] if script.contains("exec umount") => {
+        ["sh", "-c", script, "sh", target, id, _nonce] if script.contains("umount \"$1\"") => {
             let top = rows.iter().rposition(|r| r.1 == *target);
             match top {
                 Some(i) if rows.get(i).is_some_and(|r| r.0.to_string() == *id) => {

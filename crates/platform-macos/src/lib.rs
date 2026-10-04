@@ -1,7 +1,7 @@
 //! fandhe-container-platform-macos: macOS Virtualization.framework 経由の VM 起動・VirtioFS（MAC-1）。
 //!
-//! 現状は VM 設定（`config`。TASK-64.2）まで実装済みで、デバイス・ライフサイクル・エラー型統合は
-//! TASK-64.3〜64.5 で実装する（REPAIR-3: 実装済みを装わない）。
+//! 現状は VM 設定・最小デバイス構成（`config`。TASK-64.2・64.3）まで実装済みで、ライフサイクル・
+//! エラー型統合は TASK-64.4〜64.5 で実装する（REPAIR-3: 実装済みを装わない）。
 //!
 //! - プラットフォーム対応: OS 非依存の検証ロジックは全 OS でビルドし 3 OS CI でテストする。
 //!   Virtualization.framework 呼び出し（`sys`・構築関数）のみ `cfg(target_os = "macos")` で局所化する（CLI-1）。

@@ -83,6 +83,29 @@ impl ConfigField {
     }
 }
 
+/// 読み書き共有で拒否する特殊ファイルの種別（[`ConfigError::SharedDirSpecialFile`]。TASK-65.1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SpecialFileKind {
+    /// キャラクタデバイス。
+    CharDevice,
+    /// ブロックデバイス。
+    BlockDevice,
+    /// FIFO（名前付きパイプ）。
+    Fifo,
+}
+
+impl SpecialFileKind {
+    /// メッセージ用の英語名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpecialFileKind::CharDevice => "character device",
+            SpecialFileKind::BlockDevice => "block device",
+            SpecialFileKind::Fifo => "fifo",
+        }
+    }
+}
+
 /// VM 設定の検証・構築エラー。`code()` は機械可読、`message()` は英語の人間向け文（ERR 系・REPAIR-4）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -186,6 +209,26 @@ pub enum ConfigError {
     /// virtiofs サーバのホスト側での symlink の扱いを検証できないため、範囲外への書き込み経路になり得る
     /// 構成を fail-closed で拒否する（MAC-1・TASK-65.1）。
     SharedDirSymlinkEscapes { path: PathBuf, share_dir: PathBuf },
+    /// 読み書き共有の配下に、リンク数が 2 以上の通常ファイル（ハードリンク）がある（`links` はリンク数）。
+    ///
+    /// 他のリンクが共有範囲外にあるかを確かめられないため、ゲストがリンクを辿らずに範囲外と同じ inode を
+    /// 書き換えられる経路として fail-closed で拒否する（MAC-1・TASK-65.1）。
+    SharedDirHardlinkedFile {
+        path: PathBuf,
+        links: u64,
+        share_dir: PathBuf,
+    },
+    /// 読み書き共有の配下に、許可しない特殊ファイル（キャラクタ / ブロックデバイス・FIFO）がある。
+    SharedDirSpecialFile {
+        path: PathBuf,
+        kind: SpecialFileKind,
+        share_dir: PathBuf,
+    },
+    /// 読み書き共有がディレクトリのハードリンクを作れるファイルシステム（HFS+）上にある（macOS）。
+    ///
+    /// ディレクトリのハードリンクはリンク数で見分けられず、共有範囲外のディレクトリを配下に持ち込めるため
+    /// fail-closed で拒否する（MAC-1・TASK-65.1）。`fs_type` は `statfs` の `f_fstypename`。
+    SharedDirUnsupportedFilesystem { fs_type: String, share_dir: PathBuf },
     /// 読み書き共有が VM の保護入力（kernel・initrd・ディスクイメージ・コンソールログ）を含む。
     ///
     /// `field` は保護入力の種別、`path` はその実体パス、`share_dir` は共有ディレクトリ。
@@ -252,6 +295,11 @@ impl ConfigError {
             }
             ConfigError::SharedDirCrossesMount { .. } => "config.shared_dir_crosses_mount",
             ConfigError::SharedDirSymlinkEscapes { .. } => "config.shared_dir_symlink_escapes",
+            ConfigError::SharedDirHardlinkedFile { .. } => "config.shared_dir_hardlinked_file",
+            ConfigError::SharedDirSpecialFile { .. } => "config.shared_dir_special_file",
+            ConfigError::SharedDirUnsupportedFilesystem { .. } => {
+                "config.shared_dir_unsupported_filesystem"
+            }
         }
     }
 
@@ -434,6 +482,35 @@ impl ConfigError {
                     "read-write shared directory {} contains a mount point: {}",
                     share_dir.display(),
                     path.display()
+                )
+            }
+            ConfigError::SharedDirHardlinkedFile {
+                path,
+                links,
+                share_dir,
+            } => {
+                format!(
+                    "read-write shared directory {} contains a hard-linked file ({links} links): {}",
+                    share_dir.display(),
+                    path.display()
+                )
+            }
+            ConfigError::SharedDirSpecialFile {
+                path,
+                kind,
+                share_dir,
+            } => {
+                format!(
+                    "read-write shared directory {} contains a {}: {}",
+                    share_dir.display(),
+                    kind.as_str(),
+                    path.display()
+                )
+            }
+            ConfigError::SharedDirUnsupportedFilesystem { fs_type, share_dir } => {
+                format!(
+                    "read-write shared directory {} is on a {fs_type} filesystem, which allows directory hard links",
+                    share_dir.display()
                 )
             }
             ConfigError::SharedDirSymlinkEscapes { path, share_dir } => {
@@ -1215,6 +1292,44 @@ fn check_symlink_within_share(link: &Path, dir: &Path) -> Result<(), ConfigError
     }
 }
 
+/// 共有ルートのファイルシステム種別（`statfs` の `f_fstypename`）が、ディレクトリのハードリンクを作れる
+/// HFS+（`hfs`）なら拒否する（macOS。リンク数では見分けられないため fail-closed。MAC-1・TASK-65.1）。
+#[cfg(any(target_os = "macos", test))]
+fn check_share_fs_type(fs_type: &[u8], dir: &Path) -> Result<(), ConfigError> {
+    if fs_type.eq_ignore_ascii_case(b"hfs") {
+        return Err(ConfigError::SharedDirUnsupportedFilesystem {
+            fs_type: String::from_utf8_lossy(fs_type).into_owned(),
+            share_dir: dir.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// ReadWrite 共有の配下で拒否する特殊ファイルの種別を返す（拒否しないものは `None`）。
+///
+/// - キャラクタ / ブロックデバイス: 拒否する。FUSE ではゲストが自分のデバイスとして開く
+///   （Linux `fs/fuse/inode.c` の `fuse_init_inode` → `init_special_inode`）が、共有経由で任意の
+///   major / minor のデバイスノードを持ち込めるため。
+/// - FIFO: 拒否する。正常なゲストカーネルはゲスト内で完結させるが、侵害されたゲストカーネルが
+///   `FUSE_OPEN` を送った場合に、ホスト側サーバがホスト上の FIFO を開くか（ホストのプロセスとの経路・
+///   読み書き待ちでの停止）を確かめられないため。
+/// - ソケット: 許可する。`open(2)` はソケットに対して `ENXIO` で失敗し、FUSE には `connect` に当たる
+///   要求が無いため、ホスト上のソケットへ届く経路が無い。git の fsmonitor が `.git` 配下に置く
+///   ソケット等を含む開発用ディレクトリを共有できるようにする。
+#[cfg(unix)]
+fn special_file_kind(ft: &std::fs::FileType) -> Option<SpecialFileKind> {
+    use std::os::unix::fs::FileTypeExt;
+    if ft.is_char_device() {
+        Some(SpecialFileKind::CharDevice)
+    } else if ft.is_block_device() {
+        Some(SpecialFileKind::BlockDevice)
+    } else if ft.is_fifo() {
+        Some(SpecialFileKind::Fifo)
+    } else {
+        None
+    }
+}
+
 /// ReadWrite 共有の配下に、保護入力と同一 inode（`(dev, ino)` 一致）のエントリがあれば拒否する。
 ///
 /// パスの包含検査（[`crate::virtiofs::path_is_within`]）では、共有の外にある保護入力へのハードリンクを
@@ -1227,6 +1342,11 @@ fn check_symlink_within_share(link: &Path, dir: &Path) -> Result<(), ConfigError
 /// 検出する。検査後に新たにマウントされる TOCTOU は残る。
 /// 共有配下の symlink はリンク先が共有範囲に収まることを [`check_symlink_within_share`] で確認し、
 /// 確認できなければ [`ConfigError::SharedDirSymlinkEscapes`] で拒否する（範囲外への書き込み経路の防止）。
+/// 保護入力以外でも、リンク数 2 以上の通常ファイルは [`ConfigError::SharedDirHardlinkedFile`]、
+/// キャラクタ / ブロックデバイス・FIFO は [`ConfigError::SharedDirSpecialFile`]（[`special_file_kind`]）、
+/// macOS の HFS+ 上の共有は [`ConfigError::SharedDirUnsupportedFilesystem`] で拒否する。
+/// 残余: 検査から使用までの差し替え（TOCTOU）に加え、`canonicalize`・`statfs`・走査にタイムアウトは無く、
+/// 応答しない NFS・autofs 等の配下では検査が止まり得る。
 /// 保護入力が未作成（コンソールログ等）なら照合対象から外す。走査の I/O 失敗・件数上限超過は
 /// fail-closed で `PathIo` を返す。unix 限定（Windows には `(dev, ino)` が無く、本 crate の
 /// 実行対象は macOS のため走査しない）。`check_share_conflicts` から呼ばれる。
@@ -1260,6 +1380,10 @@ fn find_hardlink_to_protected(
     // macOS: 共有ルートのマウント識別子（`f_fsid`・`f_mntonname`）。同一デバイスの別マウント検出用。
     #[cfg(target_os = "macos")]
     let root_mount = crate::sys::mount_identity(dir).map_err(io_err)?;
+    // macOS: HFS+ はディレクトリのハードリンクを作れ、リンク数では見分けられない。走査中のディレクトリは
+    // すべて共有ルートと同じマウント（下で照合）なので、共有ルートの種別だけで判定して拒否する。
+    #[cfg(target_os = "macos")]
+    check_share_fs_type(root_mount.fs_type(), dir)?;
     let mut stack = vec![dir.to_path_buf()];
     let mut scanned = 0usize;
     while let Some(d) = stack.pop() {
@@ -1303,6 +1427,21 @@ fn find_hardlink_to_protected(
                         share_dir: dir.to_path_buf(),
                     });
                 }
+                // 保護入力でなくても、他のリンクが共有範囲外にあればゲストが範囲外の inode を書き換えられる。
+                // 他のリンクの位置は確かめられないため、リンク数 2 以上は一律に拒否する（fail-closed）。
+                if meta.nlink() > 1 {
+                    return Err(ConfigError::SharedDirHardlinkedFile {
+                        path: entry.path(),
+                        links: meta.nlink(),
+                        share_dir: dir.to_path_buf(),
+                    });
+                }
+            } else if let Some(kind) = special_file_kind(&meta.file_type()) {
+                return Err(ConfigError::SharedDirSpecialFile {
+                    path: entry.path(),
+                    kind,
+                    share_dir: dir.to_path_buf(),
+                });
             }
         }
     }
@@ -2428,6 +2567,22 @@ broken line
             reject_mounts_under(Path::new("/")),
             Err(ConfigError::SharedDirCrossesMount { .. })
         ));
+    }
+
+    /// MAC-1・TASK-65.1: HFS+（`hfs`）上の共有はディレクトリのハードリンクを見分けられないため拒否する。
+    #[test]
+    fn rejects_share_on_hfs() {
+        let dir = Path::new("/Volumes/ext/share");
+        assert_eq!(
+            check_share_fs_type(b"hfs", dir),
+            Err(ConfigError::SharedDirUnsupportedFilesystem {
+                fs_type: "hfs".to_string(),
+                share_dir: dir.to_path_buf(),
+            })
+        );
+        assert!(check_share_fs_type(b"HFS", dir).is_err());
+        assert_eq!(check_share_fs_type(b"apfs", dir), Ok(()));
+        assert_eq!(check_share_fs_type(b"hfsplus-like", dir), Ok(()));
     }
 
     /// MAC-1・TASK-65.1: ReadWrite 共有配下の symlink は、リンク先が共有範囲内なら許可し、範囲外

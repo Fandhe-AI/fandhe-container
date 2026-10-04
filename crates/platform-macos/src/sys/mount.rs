@@ -65,11 +65,28 @@ unsafe extern "C" {
     fn statfs(path: *const c_char, buf: *mut Statfs) -> c_int;
 }
 
-/// パスが属するマウントの識別子（`f_fsid` とマウント先 `f_mntonname`）。
+/// パスが属するマウントの識別子（`f_fsid`・マウント先 `f_mntonname`・ファイルシステム種別 `f_fstypename`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MountIdentity {
     fsid: [i32; 2],
     mount_on: Vec<u8>,
+    fs_type: Vec<u8>,
+}
+
+impl MountIdentity {
+    /// ファイルシステム種別（`f_fstypename`。例: `apfs`・`hfs`）。
+    pub(crate) fn fs_type(&self) -> &[u8] {
+        &self.fs_type
+    }
+}
+
+/// NUL 終端の固定長 `c_char` 配列を、配列の範囲内だけ読んでバイト列にする（NUL が無ければ全長）。
+fn bytes_until_nul(chars: &[c_char]) -> Vec<u8> {
+    chars
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect()
 }
 
 /// `path` が属するマウントの識別子を返す（`statfs(2)`。symlink は辿る）。
@@ -87,16 +104,11 @@ pub(crate) fn mount_identity(path: &Path) -> io::Result<MountIdentity> {
     }
     // SAFETY: `statfs` が 0 を返したため、`buf` はカーネルにより初期化済み。
     let st = unsafe { buf.assume_init() };
-    // `f_mntonname` は NUL 終端を探し、配列の範囲内だけを読む（NUL が無ければ全長）。
-    let len = st
-        .f_mntonname
-        .iter()
-        .position(|&c| c == 0)
-        .unwrap_or(MAXPATHLEN);
-    let mount_on = st.f_mntonname.iter().take(len).map(|&c| c as u8).collect();
+    // 文字列欄は NUL 終端を探し、配列の範囲内だけを読む。
     Ok(MountIdentity {
         fsid: st.f_fsid,
-        mount_on,
+        mount_on: bytes_until_nul(&st.f_mntonname),
+        fs_type: bytes_until_nul(&st.f_fstypename),
     })
 }
 

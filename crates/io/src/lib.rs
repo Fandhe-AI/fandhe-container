@@ -82,6 +82,8 @@ pub mod protocol;
 pub mod recv_limits;
 pub mod server;
 pub mod settings;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod stream_io;
 mod sys;
 #[cfg(windows)]
 #[path = "sys/windows.rs"]

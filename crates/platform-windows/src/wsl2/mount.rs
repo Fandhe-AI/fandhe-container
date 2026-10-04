@@ -13,8 +13,9 @@
 //! - 実行部（`run::run_capture` 経由。各呼び出しにタイムアウトを適用する。REPAIR-5）。
 //!
 //! 後始末の追跡の前提: ゲスト内の root は信頼境界の内側として扱い、root や WSL がゲスト内プロセスを強制終了した
-//! 場合の後始末は対象外とする。`/run/fandhe` の残留物（柵の claim・ロックファイル）は tmpfs 上にあり WSL の再起動で
-//! 消える。
+//! 場合の後始末は対象外とする。`/run/fandhe` の残留物（柵の claim・ロックファイル・未回収の記録）は tmpfs 上にあり
+//! WSL の再起動で消える。取り下げた mount とゲスト内で外せなかった mount は、記録の nonce を
+//! [`MountError::unreleased`]（マウント ID 未確定）で返し、既存の [`release_virtiofs_launch`] で回収する。
 //!
 //! 検証の本体はマウント後の fstype 確認である。`.wslconfig` の `virtiofs=true` はファイル上の設定に過ぎず、
 //! `wsl --shutdown` までは稼働中の VM に反映されないため、設定の確認だけでは virtiofs の成立を保証できない。
@@ -942,8 +943,10 @@ fn unreleased_launch(distro: &DistroName, failed: &[OwnedMount]) -> Option<Prepa
 ///
 /// 後始末（ロールバック・解除）で外せなかったマウントがあれば [`MountError::unreleased`] に載せる。これは
 /// そのまま [`release_virtiofs_launch`] に渡して後始末をやり直せる（マウント先・マウント ID・記録の nonce を持つ。
-/// 件数は [`MAX_UNRELEASED_MOUNTS`] 以下）。所有を確認できなかったマウント（`mount ownership unconfirmed`）は
-/// 自分のものと確定できないため載せない。
+/// 件数は [`MAX_UNRELEASED_MOUNTS`] 以下）。取り下げた mount・記録を確定できなかった mount は、マウント ID が
+/// 未確定（`None`）のまま載せ、[`release_virtiofs_launch`] がゲスト内の記録で所有を確かめてから回収する。
+/// 記録の無い（mount したプロセスの証拠が無い）マウント（`mount ownership unconfirmed`）は自分のものと
+/// 確定できないため載せない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountError {
     error: Wsl2Error,

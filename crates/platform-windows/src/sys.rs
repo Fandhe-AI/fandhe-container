@@ -19,8 +19,8 @@
 //!
 //! # 不変条件
 //! - `unsafe` は本モジュール内に閉じ、公開するのは安全な関数・型のみ（`unsafe fn` を外へ出さない）。
-//! - Windows の `wsl2` 用の宣言・構造体レイアウトは承認済みの `windows-sys`（#371・TASK-67.hdep1）のものを使う。
-//!   `wslconfig` 用は `extern "system"` 宣言（windows-sys 0.61.2 と照合済み）。
+//! - Windows の宣言・構造体レイアウト・定数は承認済みの `windows-sys`（#371・TASK-67.hdep1。`=0.61.2`、
+//!   Windows 限定）のものを使い、手書きしない。
 //! - unix は `libc` クレートに依存せず（dependency-policy「ユーザー承認制」）、std が既にリンクしている libc の
 //!   関数を必要最小限の `extern "C"` 宣言で使う。宣言と定数は `libc` 0.2.189 と照合済み（`libc` にない macOS の
 //!   `acl_get_fd`・`acl_free` は `sys/acl.h` の宣言に基づき、macOS CI の実行結果を根拠とする）。
@@ -260,113 +260,49 @@ mod windows {
     use std::ffi::c_void;
     use std::fs::File;
 
-    /// `SE_OBJECT_TYPE::SE_FILE_OBJECT`（accctrl.h）。
-    const SE_FILE_OBJECT: i32 = 1;
-    /// `DACL_SECURITY_INFORMATION`（winnt.h）。
-    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
-    /// `PROTECTED_DACL_SECURITY_INFORMATION`（winnt.h）。親からの継承 ACE を受け付けない DACL として設定する。
-    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
-    /// `UNPROTECTED_DACL_SECURITY_INFORMATION`（winnt.h）。親からの継承 ACE を受け付ける DACL として設定する。
-    const UNPROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x2000_0000;
-    /// `SE_DACL_PROTECTED`（`SECURITY_DESCRIPTOR_CONTROL` のビット。winnt.h）。
-    const SE_DACL_PROTECTED: u16 = 0x1000;
-    /// `LABEL_SECURITY_INFORMATION`（winnt.h）。SACL のうち整合性ラベル（mandatory label）だけを対象にする。
-    const LABEL_SECURITY_INFORMATION: u32 = 0x0000_0010;
-    /// `OWNER_SECURITY_INFORMATION`（winnt.h）。
-    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
-    /// `SYSTEM_MANDATORY_LABEL_ACE_TYPE`（winnt.h）。整合性ラベルの ACE 種別。
-    const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
-    /// `SACL_SECURITY_INFORMATION`（winnt.h）。読み書きには ACCESS_SYSTEM_SECURITY（SeSecurityPrivilege）が要る。
-    const SACL_SECURITY_INFORMATION: u32 = 0x0000_0008;
-    /// `ACCESS_SYSTEM_SECURITY`（winnt.h）。
-    const ACCESS_SYSTEM_SECURITY: u32 = 0x0100_0000;
-    /// `READ_CONTROL`（winnt.h）。
-    const READ_CONTROL: u32 = 0x0002_0000;
-    /// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`（std の既定の共有モードと同じ）。
-    const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
-    /// `ERROR_ACCESS_DENIED`。
-    const ERROR_ACCESS_DENIED: i32 = 5;
-    /// `ERROR_PRIVILEGE_NOT_HELD`。
-    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
-    /// 監査・アラームの ACE 種別（winnt.h の SYSTEM_AUDIT / ALARM 系。2・3・7・8・13〜16）。
-    const AUDIT_ACE_TYPES: [u8; 8] = [0x02, 0x03, 0x07, 0x08, 0x0d, 0x0e, 0x0f, 0x10];
-    /// `ERROR_SUCCESS`。
-    const ERROR_SUCCESS: u32 = 0;
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD, ERROR_SUCCESS, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorLength,
+        LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, SACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
+        GetFileInformationByHandleEx, READ_CONTROL, ReOpenFile,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_SYSTEM_SECURITY, SYSTEM_ALARM_ACE_TYPE, SYSTEM_ALARM_CALLBACK_ACE_TYPE,
+        SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE, SYSTEM_ALARM_OBJECT_ACE_TYPE, SYSTEM_AUDIT_ACE_TYPE,
+        SYSTEM_AUDIT_CALLBACK_ACE_TYPE, SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE,
+        SYSTEM_AUDIT_OBJECT_ACE_TYPE, SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+    };
 
-    /// `WRITE_DAC`（winnt.h）。[`copy_security`] の宛先ハンドルはこの権限つきで開く必要がある。
-    pub(crate) const WRITE_DAC: u32 = 0x0004_0000;
-    /// `WRITE_OWNER`（winnt.h）。所有者・整合性ラベルの設定に必要で、[`copy_security`] の宛先ハンドルに要る。
-    pub(crate) const WRITE_OWNER: u32 = 0x0008_0000;
-    /// `GENERIC_WRITE`（winnt.h）。
-    pub(crate) const GENERIC_WRITE: u32 = 0x4000_0000;
+    /// `wslconfig` が一時ファイルを開くときに要求する権限（[`copy_security`] の宛先ハンドルの要件）。
+    pub(crate) use windows_sys::Win32::Foundation::GENERIC_WRITE;
+    /// DACL の設定に必要（[`copy_security`] の宛先ハンドルに要る）。
+    pub(crate) use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+    /// 所有者・整合性ラベルの設定に必要（[`copy_security`] の宛先ハンドルに要る）。
+    pub(crate) use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
 
-    #[link(name = "advapi32")]
-    unsafe extern "system" {
-        // SAFETY（宣言）: `DWORD GetSecurityInfo(HANDLE, SE_OBJECT_TYPE, SECURITY_INFORMATION, PSID*, PSID*,
-        // PACL*, PACL*, PSECURITY_DESCRIPTOR*)`（aclapi.h）。成功時は ERROR_SUCCESS を返し、
-        // `*ppSecurityDescriptor` に LocalAlloc 済みの自己相対 SD を返す（呼び出し側が LocalFree する）。
-        // `*ppDacl` はその SD の内部を指す（SD を解放するまで有効）。
-        fn GetSecurityInfo(
-            handle: *mut c_void,
-            object_type: i32,
-            security_info: u32,
-            owner: *mut *mut c_void,
-            group: *mut *mut c_void,
-            dacl: *mut *mut c_void,
-            sacl: *mut *mut c_void,
-            security_descriptor: *mut *mut c_void,
-        ) -> u32;
-        // SAFETY（宣言）: `DWORD SetSecurityInfo(HANDLE, SE_OBJECT_TYPE, SECURITY_INFORMATION, PSID, PSID,
-        // PACL, PACL)`（aclapi.h）。`handle` は WRITE_DAC 権限が必要。成功時は ERROR_SUCCESS。
-        fn SetSecurityInfo(
-            handle: *mut c_void,
-            object_type: i32,
-            security_info: u32,
-            owner: *mut c_void,
-            group: *mut c_void,
-            dacl: *const c_void,
-            sacl: *const c_void,
-        ) -> u32;
-        // SAFETY（宣言）: `DWORD GetSecurityDescriptorLength(PSECURITY_DESCRIPTOR)`（securitybaseapi.h）。
-        // 有効な SD の大きさ（自己相対形式なら内部の SID・ACL を含む全体のバイト数）を返す。
-        fn GetSecurityDescriptorLength(security_descriptor: *mut c_void) -> u32;
-        // SAFETY（宣言）: `BOOL GetSecurityDescriptorControl(PSECURITY_DESCRIPTOR, PSECURITY_DESCRIPTOR_CONTROL,
-        // LPDWORD)`（securitybaseapi.h）。失敗時は 0（FALSE）。
-        fn GetSecurityDescriptorControl(
-            security_descriptor: *mut c_void,
-            control: *mut u16,
-            revision: *mut u32,
-        ) -> i32;
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        // SAFETY（宣言）: `HLOCAL LocalFree(HLOCAL)`（winbase.h）。成功時は NULL を返す。
-        fn LocalFree(mem: *mut c_void) -> *mut c_void;
-        // SAFETY（宣言）: `BOOL GetFileInformationByHandleEx(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD)`
-        // （fileapi.h / winbase.h）。`info` は `size` バイトの書き込み可能領域で、クラスに対応する構造体を受ける。
-        // 失敗時は 0（FALSE）。
-        fn GetFileInformationByHandleEx(
-            handle: *mut c_void,
-            class: i32,
-            info: *mut c_void,
-            size: u32,
-        ) -> i32;
-        // SAFETY（宣言）: `HANDLE ReOpenFile(HANDLE, DWORD, DWORD, DWORD)`（winbase.h）。同じファイルオブジェクトを
-        // 別のアクセス権で開き直した新しいハンドルを返す（呼び出し側が閉じる）。失敗時は INVALID_HANDLE_VALUE。
-        fn ReOpenFile(handle: *mut c_void, access: u32, share: u32, flags: u32) -> *mut c_void;
-    }
-
-    /// `FILE_INFO_BY_HANDLE_CLASS::FileIdInfo`（minwinbase.h）。
-    const FILE_ID_INFO_CLASS: i32 = 18;
-
-    /// `FILE_ID_INFO`（winbase.h）。`FileId` は ReFS でも一意な 128 bit の識別子。
-    #[repr(C)]
-    #[derive(Default)]
-    struct FileIdInfoRaw {
-        volume_serial_number: u64,
-        file_id: [u8; 16],
-    }
+    /// std の既定の共有モード（`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`）。
+    const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    /// 監査・アラームの ACE 種別（SYSTEM_AUDIT / ALARM 系）。
+    const AUDIT_ACE_TYPES: [u32; 8] = [
+        SYSTEM_AUDIT_ACE_TYPE,
+        SYSTEM_ALARM_ACE_TYPE,
+        SYSTEM_AUDIT_OBJECT_ACE_TYPE,
+        SYSTEM_ALARM_OBJECT_ACE_TYPE,
+        SYSTEM_AUDIT_CALLBACK_ACE_TYPE,
+        SYSTEM_ALARM_CALLBACK_ACE_TYPE,
+        SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE,
+        SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE,
+    ];
 
     /// ボリュームとファイルを一意に識別する値（[`file_id`] の戻り値）。比較にだけ使う。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,17 +314,17 @@ mod windows {
     /// `file` のボリュームシリアル番号と 128 bit のファイル ID を返す（`GetFileInformationByHandleEx` の
     /// `FileIdInfo`）。`wslconfig` が置換直前に宛先と読み込み元の同一性を確かめるのに使う。
     pub(crate) fn file_id(file: &File) -> std::io::Result<FileId> {
-        let mut raw = FileIdInfoRaw::default();
-        let size = u32::try_from(std::mem::size_of::<FileIdInfoRaw>())
+        let mut raw = FILE_ID_INFO::default();
+        let size = u32::try_from(std::mem::size_of::<FILE_ID_INFO>())
             .map_err(|_| std::io::Error::other("FILE_ID_INFO size overflow"))?;
-        // SAFETY: `file` は生存中の `File` が所有する有効なハンドル。`raw` は `FILE_ID_INFO` と同じレイアウト
-        // （repr(C)。u64 と 16 バイト配列）の書き込み可能なローカル変数で、`size` にその大きさを渡すため、
-        // 関数はこの範囲を超えて書かない。
+        // SAFETY: `file` は生存中の `File` が所有する有効なハンドル。`raw` は情報クラス `FileIdInfo` に対応する
+        // `FILE_ID_INFO`（windows-sys のレイアウト）の書き込み可能なローカル変数で、`size` にその正確な大きさを
+        // 渡すため、関数はこの範囲を超えて書かない。
         let ok = unsafe {
             GetFileInformationByHandleEx(
                 file.as_raw_handle(),
-                FILE_ID_INFO_CLASS,
-                (&mut raw as *mut FileIdInfoRaw).cast::<c_void>(),
+                FileIdInfo,
+                (&raw mut raw).cast::<c_void>(),
                 size,
             )
         };
@@ -396,8 +332,8 @@ mod windows {
             return Err(std::io::Error::last_os_error());
         }
         Ok(FileId {
-            volume_serial_number: raw.volume_serial_number,
-            file_id: raw.file_id,
+            volume_serial_number: raw.VolumeSerialNumber,
+            file_id: raw.FileId.Identifier,
         })
     }
 
@@ -467,8 +403,8 @@ mod windows {
                 info,
                 owner_out,
                 std::ptr::null_mut(),
-                dacl_out,
-                sacl_out,
+                dacl_out.cast::<*mut ACL>(),
+                sacl_out.cast::<*mut ACL>(),
                 &mut sd,
             )
         };
@@ -522,7 +458,7 @@ mod windows {
                 DACL_SECURITY_INFORMATION | protection,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                dacl,
+                dacl.cast::<ACL>(),
                 std::ptr::null(),
             )
         };
@@ -567,7 +503,7 @@ mod windows {
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null(),
-                    label,
+                    label.cast::<ACL>(),
                 )
             };
             if rc != ERROR_SUCCESS {
@@ -662,9 +598,10 @@ mod windows {
                 0,
             )
         };
-        if h.is_null() || h as isize == -1 {
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
             let e = std::io::Error::last_os_error();
-            return match e.raw_os_error() {
+            let code = e.raw_os_error().and_then(|c| u32::try_from(c).ok());
+            return match code {
                 Some(ERROR_PRIVILEGE_NOT_HELD) | Some(ERROR_ACCESS_DENIED) => Ok(None),
                 _ => Err(e),
             };
@@ -678,7 +615,13 @@ mod windows {
         let bytes = copy_acl(&sd, sacl)?;
         drop(sd);
         acl_ace_types(&bytes)
-            .map(|types| Some(types.iter().any(|t| AUDIT_ACE_TYPES.contains(t))))
+            .map(|types| {
+                Some(
+                    types
+                        .iter()
+                        .any(|t| AUDIT_ACE_TYPES.contains(&u32::from(*t))),
+                )
+            })
             .ok_or_else(malformed)
     }
 
@@ -729,7 +672,7 @@ mod windows {
             if ace_end > acl.len() {
                 return None;
             }
-            if ace_type == SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+            if u32::from(ace_type) == SYSTEM_MANDATORY_LABEL_ACE_TYPE {
                 let mask = le32(off.checked_add(4)?)?;
                 let sid = off.checked_add(8)?;
                 let sub_count = usize::from(*acl.get(sid.checked_add(1)?)?);

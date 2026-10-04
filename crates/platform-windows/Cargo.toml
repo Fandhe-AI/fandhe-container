@@ -7,8 +7,13 @@
 # windows-sys は承認済み（#371・TASK-67.hdep1。=0.61.2）で、[target.'cfg(windows)'.dependencies] に限り
 # 使う名前空間の feature だけを列挙する。利用は src/sys.rs（unsafe の事前承認範囲）に閉じる。
 # 現在の用途: wsl.exe・子孫プロセスの管理（TASK-67.3・WIN-1・REPAIR-5）。
-#   Win32_Foundation（HANDLE・INVALID_HANDLE_VALUE。ハンドルを閉じるのは std の OwnedHandle）・
-#   Win32_Security（CreateJobObjectW の引数型 SECURITY_ATTRIBUTES のみ。セキュリティ API は使わない）・
+#   Win32_Foundation（HANDLE・INVALID_HANDLE_VALUE・LocalFree・エラーコード・GENERIC_WRITE。ハンドルを閉じるのは
+#   std の OwnedHandle）・
+#   Win32_Security（CreateJobObjectW の引数型 SECURITY_ATTRIBUTES、.wslconfig 置換の SD 操作〔ACL・
+#   GetSecurityDescriptorLength / Control・*_SECURITY_INFORMATION〕。TASK-67.2）・
+#   Win32_Security_Authorization（GetSecurityInfo・SetSecurityInfo・SE_FILE_OBJECT。TASK-67.2）・
+#   Win32_Storage_FileSystem（GetFileInformationByHandleEx・FILE_ID_INFO・ReOpenFile・アクセス権定数。TASK-67.2）・
+#   Win32_System_SystemServices（ACCESS_SYSTEM_SECURITY・ACE 種別定数。TASK-67.2）・
 #   Win32_System_JobObjects（Job Object）・
 #   Win32_System_Threading（CREATE_SUSPENDED・OpenThread・ResumeThread・GetProcessIdOfThread）・
 #   Win32_System_Diagnostics_ToolHelp（スレッド列挙）・Win32_System_SystemInformation（GetSystemDirectoryW）。
@@ -46,7 +51,10 @@ doc = false
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_SystemInformation",

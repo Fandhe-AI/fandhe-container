@@ -1533,6 +1533,53 @@ mod tests {
         );
     }
 
+    /// REPAIR-4・TASK-64.4: DEL・NEL・U+2028 / U+2029 も \uXXXX にエスケープし、1 行に収める。
+    #[test]
+    fn stop_on_drop_failure_log_escapes_line_separators() {
+        let line = stop_on_drop_failure_log("a\u{7f}b\u{85}c\u{2028}d\u{2029}e", 1, 3);
+        assert_eq!(
+            line,
+            r#"{"component":"platform-macos.vm","operation":"stop_on_drop","result":"error","code":"vm.stop_failed","domain":"a\u007fb\u0085c\u2028d\u2029e","vz_code":1,"attempts":3}"#
+        );
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    /// TASK-64.4: 要求直前の確認で拒否された操作は取り消され、実状態へ戻って後続の要求を受け付ける。
+    #[test]
+    fn core_cancel_begun_restores_actual_state() {
+        let (sink, rx) = event_channel(16);
+        let mut core = Core::new(sink);
+        let (_, start) = begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        drain(&rx);
+        assert_eq!(core.cancel_begun(start, VmState::Stopped), VmState::Stopped);
+        assert_eq!(
+            drain(&rx),
+            vec![changed(VmState::Starting, VmState::Stopped)]
+        );
+        assert!(!core.lifecycle.has_in_flight());
+        // 取り消した世代の完了は受理しない。
+        assert_eq!(
+            core.complete(start, LifecycleInput::StartCompleted(start, Ok(()))),
+            Err(VmState::Stopped)
+        );
+        let (_, again) = begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        assert_eq!(again, 2);
+    }
+
+    /// TASK-64.4: 放棄済みの操作を取り消すと、遅れた完了の受理の目印も消える。
+    #[test]
+    fn core_cancel_begun_clears_abandoned_marker() {
+        let (sink, _rx) = event_channel(16);
+        let mut core = Core::new(sink);
+        let (mut ticket, start) =
+            begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        core.abandon(&mut ticket);
+        assert!(core.lifecycle.accepts(start));
+        core.cancel_begun(start, VmState::Stopped);
+        assert!(!core.lifecycle.accepts(start));
+        assert_eq!(core.lifecycle.state(), VmState::Stopped);
+    }
+
     /// TASK-64.4: 受信側が破棄済みでも破棄時停止の失敗の記録は panic せず、状態機械は Running に戻る。
     #[test]
     fn core_drop_stop_failure_without_receiver_does_not_panic() {

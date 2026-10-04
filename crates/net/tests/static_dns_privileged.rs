@@ -2,7 +2,7 @@
 //! `nameserver` へ直接書かれ、コンテナからの名前解決クエリが指定サーバーへ直接到達することの実機結合試験
 //! （NET-8・NET-12・TASK-146.3・#337・TASK-185・MS-8。書き込み側は TASK-146.2・#336 の `apply_static_dns`）。
 //!
-//! root と util-linux の `unshare` / `nsenter` / `mount` が必要な実機前提テストのため `harness = false` の
+//! root と util-linux の `setsid` / `unshare` / `nsenter` / `mount` が必要な実機前提テストのため `harness = false` の
 //! 独自 `main` で動かし、`-- --ignored` を付けたときだけ実行する（未指定時は「ignored」を出力して成功終了
 //! する分離であり、CI 通過のための弱体化ではない。`AGENTS.md`「実機前提テスト」節）。非 Linux では対象外。
 //!
@@ -135,7 +135,7 @@ mod linux {
             .map(|s| s.success())
             .unwrap_or(false);
         assert!(sh_ok, "`sh` is required; see AGENTS.md");
-        for tool in ["unshare", "nsenter", "mount"] {
+        for tool in ["setsid", "unshare", "nsenter", "mount"] {
             let ok = Command::new(tool)
                 .arg("--help")
                 .stdout(Stdio::null())
@@ -144,6 +144,44 @@ mod linux {
                 .map(|s| s.success())
                 .unwrap_or(false);
             assert!(ok, "util-linux `{tool}` is required; see AGENTS.md");
+        }
+    }
+
+    /// セッション `sid` に属する全プロセスを SIGKILL する。run_cmd が別プロセスグループへ移したコマンドも
+    /// 同一セッションのため回収できる。fork 競合に備え、残りが無くなるまで数回走査する。
+    fn kill_session(sid: u32) {
+        for _ in 0..5 {
+            let mut pids = Vec::new();
+            if let Ok(rd) = fs::read_dir("/proc") {
+                for ent in rd.flatten() {
+                    let name = ent.file_name();
+                    let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+                        continue;
+                    };
+                    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                        continue;
+                    };
+                    // comm は括弧内で空白を含み得るため、最後の ')' 以降を分割する（state ppid pgrp session ...）。
+                    let session = stat
+                        .rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().nth(3))
+                        .and_then(|v| v.parse::<u32>().ok());
+                    if session == Some(sid) {
+                        pids.push(pid.to_string());
+                    }
+                }
+            }
+            if pids.is_empty() {
+                return;
+            }
+            let _ = Command::new("kill")
+                .args(["-KILL", "--"])
+                .args(&pids)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -157,29 +195,24 @@ mod linux {
         let dir = fs::canonicalize(&dir).expect("canonicalize temp dir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
         let exe = std::env::current_exe().expect("current_exe");
-        let mut child = Command::new("unshare")
-            .args(["--net", "--mount", "--"])
+        // setsid で新セッションを作る（exec のため pid == sid）。run_cmd は各コマンドを別プロセスグループに
+        // 置くので、期限切れ時の回収はグループではなくセッション単位で行う。
+        let mut child = Command::new("setsid")
+            .args(["--", "unshare", "--net", "--mount", "--"])
             .arg(exe)
             .arg("--inner")
             .env(LAUNCHER_PID_ENV, std::process::id().to_string())
             .env(DIR_ENV, &dir)
-            // 期限切れ時に nsenter 以下の子孫まで回収できるよう、子を新しいプロセスグループに入れる。
-            .process_group(0)
             .spawn()
             .expect("spawn unshare --net --mount");
-        let pgid = child.id();
+        let sid = child.id();
         let deadline = Instant::now() + timeout() * 6;
         let code = loop {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
                 None if Instant::now() >= deadline => {
-                    // 直接の子だけでなくグループ全体（--inner・nsenter・その子孫）を SIGKILL して回収する。
-                    let _ = Command::new("kill")
-                        .args(["-KILL", "--", &format!("-{pgid}")])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
+                    // --inner と run_cmd 配下の nsenter・probe 等、セッション内の全プロセスを SIGKILL して回収する。
+                    kill_session(sid);
                     let _ = child.kill();
                     let _ = child.wait();
                     println!("static_dns_privileged: inner did not finish before deadline");

@@ -6,8 +6,9 @@
 //! 実装状況:
 //! - `error`（構造化エラー型）・`wslconfig`（`.wslconfig` の読み書き）・`instrument`（操作の成否と所要時間の
 //!   記録先。REPAIR-4）は TASK-67.2（#373）で実装済み。
-//! - `wsl2` の WSL2 検出・バージョン確認（TASK-67.3・#374）は実装済み。virtiofs マウント・起動（TASK-67.4）・
-//!   9P フォールバック（TASK-67.5）は未実装またはスタブ（REPAIR-3）。
+//! - `wsl2` の WSL2 検出・バージョン確認（TASK-67.3・#374）は実装済み。virtiofs 共有マウントと起動前の検証
+//!   シーケンス（TASK-67.4・#375。ゲスト内ランタイムの常駐起動は TASK-116）も実装済み。9P フォールバック
+//!   （TASK-67.5）は未実装（REPAIR-3）。
 //! - `sys` は `unsafe` を閉じ込める FFI の薄いラッパー。Windows は `wsl2` の `wsl.exe` パス解決・Job Object と
 //!   `wslconfig` 置換時のアクセス制御の複製・検査に、unix は `wslconfig` 置換時の拡張 ACL の検出に使う。
 //!

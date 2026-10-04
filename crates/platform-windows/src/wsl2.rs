@@ -16,11 +16,22 @@
 //! システムディレクトリ配下の `wsl.exe` の絶対パスのみ）。`wsl.exe` の出力は untrusted として扱い、不明な形式は fail-closed で `Err` にする。
 //! 管理者権限を要する WSL の有効化はせず、手順の案内だけを返す。
 //!
+//! virtiofs 共有マウントと起動前の検証シーケンス（TASK-67.4・#375）は `mount` モジュール。
+//!
 //! エラー型は本モジュール内に置いた暫定版で、crate 共通の構造化エラーは TASK-67.5（#376）で
 //! `error` モジュールへ移してよい（REPAIR-3）。実機の `wsl.exe` での確認は TASK-67.6（#377）の担当。
 
+mod mount;
 mod parse;
 mod run;
+
+pub use mount::{
+    DistroName, GUEST_MOUNT_BASE, HostDir, LaunchRequest, Launched, MAX_DISTRO_NAME_LEN,
+    MAX_HOST_DIR_LEN, MAX_MOUNT_NAME_LEN, MAX_SHARED_MOUNTS, MAX_UNRELEASED_MOUNTS, MountError,
+    MountName, PreparedLaunch, PreparedMount, SharedMount, SharedTransport, launch_with,
+    launch_with_recorder, prepare_virtiofs_launch, prepare_virtiofs_launch_with_recorder,
+    release_virtiofs_launch, release_virtiofs_launch_with_recorder,
+};
 
 use std::error::Error;
 use std::fmt;
@@ -271,15 +282,19 @@ pub(crate) fn list_distros_with_program(
 
 /// テスト専用: 実行するプログラムを差し替えて公開 API と同じ処理（起動・出力解析・エラー変換）を行う。
 ///
-/// feature `wsl2-test-support` でのみ公開する（結合試験 `tests/wsl2_detect.rs` が偽の `wsl.exe` を
-/// 渡す。REPAIR-12）。本番では有効にしない（任意のプログラムを `wsl.exe` として起動できるため。
+/// feature `wsl2-test-support` でのみ公開する（結合試験 `tests/wsl2_detect.rs`・`tests/wsl2_mount.rs` が
+/// 偽の `wsl.exe` を渡す。REPAIR-12）。本番では有効にしない（任意のプログラムを `wsl.exe` として起動できるため。
 /// 本番の経路は `GetSystemDirectoryW` 配下の絶対パスのみ。WIN-1）。
 #[cfg(feature = "wsl2-test-support")]
 pub mod test_support {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{Wsl2Error, Wsl2Status, WslDistro, WslVersionInfo};
+    use super::{
+        LaunchRequest, Launched, MountError, PreparedLaunch, Wsl2Error, Wsl2Status, WslDistro,
+        WslVersionInfo,
+    };
+    use crate::wslconfig::VirtiofsState;
 
     /// `program` を `wsl.exe` とみなす [`super::query_version`]。
     pub fn query_version_with_program(
@@ -300,6 +315,37 @@ pub mod test_support {
     /// `program` を `wsl.exe` とみなす [`super::detect`]。
     pub fn detect_with_program(program: &Path, timeout: Duration) -> Result<Wsl2Status, Wsl2Error> {
         super::detect_with_program(program, timeout)
+    }
+
+    /// `program` を `wsl.exe` とみなし、`.wslconfig` の virtiofs 状態を `virtiofs` で与える
+    /// [`super::prepare_virtiofs_launch`]（結合試験 `tests/wsl2_mount.rs`。TASK-67.4・WIN-2）。
+    pub fn prepare_virtiofs_launch_with_program(
+        program: &Path,
+        virtiofs: VirtiofsState,
+        req: &LaunchRequest,
+        timeout: Duration,
+    ) -> Result<PreparedLaunch, MountError> {
+        super::mount::prepare_with_program(program, virtiofs, req, timeout)
+    }
+
+    /// `program` を `wsl.exe` とみなす [`super::release_virtiofs_launch`]。
+    pub fn release_virtiofs_launch_with_program(
+        program: &Path,
+        prepared: &PreparedLaunch,
+        timeout: Duration,
+    ) -> Result<(), MountError> {
+        super::mount::release_with_program(program, prepared, timeout)
+    }
+
+    /// `program` を `wsl.exe` とみなし、`.wslconfig` の virtiofs 状態を `virtiofs` で与える [`super::launch_with`]。
+    pub fn launch_with_program<T>(
+        program: &Path,
+        virtiofs: VirtiofsState,
+        req: &LaunchRequest,
+        timeout: Duration,
+        start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
+    ) -> Result<Launched<T>, MountError> {
+        super::mount::launch_with_program(program, virtiofs, req, timeout, start)
     }
 }
 

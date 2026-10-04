@@ -1,5 +1,5 @@
-//! WSL2 検出の結合試験（`tests/wsl2_detect.rs`。TASK-67.3・WIN-1・REPAIR-5・REPAIR-12）が `wsl.exe` の
-//! 代わりに起動する偽の実行ファイル。
+//! WSL2 検出の結合試験（`tests/wsl2_detect.rs`。TASK-67.3・WIN-1・REPAIR-5・REPAIR-12）と virtiofs 共有
+//! マウントの結合試験（`tests/wsl2_mount.rs`。TASK-67.4・WIN-2）が `wsl.exe` の代わりに起動する偽の実行ファイル。
 //!
 //! これはテスト専用の道具であり、本物の `wsl.exe` の出力を保証するものではない（REPAIR-3。出力例は
 //! 解析器のユニットテストと同じく模したもので、実機での確認は TASK-67.6・#377）。専用 feature
@@ -26,6 +26,22 @@
 //! | `garbage` | 未知の形式（0） | 未知の形式（0） |
 //! | `hang` | 60 秒眠る | 60 秒眠る |
 //! | `flood` | 128 KiB を出力（0） | 同左（0） |
+//!
+//! # マウント系モード（`mount_ok` / `mount_9p` / `mount_launch` / `mount_unset`）
+//!
+//! `--version` / `-l -v` は `ok` と同じ。加えて `--distribution Ubuntu --user root --exec <コマンド>` を受け付け、
+//! ゲストのマウント表を実行ファイルと同じ場所の `<実行ファイル名>.state`（行ごとに `ID<TAB>マウント先<TAB>
+//! オプション<TAB>fstype`）に保持して、呼び出しをまたいで状態を持つ。状態ファイルが無ければ `/`（ID 1・ext4）
+//! だけの表から始める。結合試験はモードごとに別の状態ファイルを使い、開始時に削除して初期化する。
+//!
+//! | コマンド | 振る舞い |
+//! | ---- | ---- |
+//! | `cat /proc/self/mountinfo` | マウント表を mountinfo 形式で出力（0） |
+//! | `sh -c <検証込み mount スクリプト> sh <ホスト> <名前> <オプション> <nonce>` | `/mnt/fandhe/<名前>` に新しい ID でマウントを積み、その ID を出力する（`mount_9p` は fstype `9p`、他は `virtiofs`。0） |
+//! | `sh -c <ID 照合付き umount スクリプト> sh <マウント先> <ID> <nonce>` | 最上位の ID が一致すれば外す（0）、不一致は 203 |
+//!
+//! スクリプト本文はゲストのシェルで解釈せず、`mount -t drvfs` / `umount "$1"` を含むかだけを確かめる
+//! （本文の振る舞いはユニットテストの模擬ゲストと実機確認 TASK-67.6・#377 の担当）。
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -44,6 +60,91 @@ const DENIED: &str = "Access is denied.\r\nError code: Wsl/Service/E_ACCESSDENIE
 enum Call {
     Version,
     List,
+    /// `--distribution Ubuntu --user root --exec` に続くゲスト内コマンド（マウント系モードのみ受け付ける）。
+    Exec(Vec<String>),
+}
+
+/// マウント表の 1 行（ID・マウント先・オプション・fstype）。
+type MountRow = (u32, String, String, String);
+
+fn state_path() -> Option<std::path::PathBuf> {
+    Some(std::env::current_exe().ok()?.with_extension("state"))
+}
+
+fn load_state() -> Option<Vec<MountRow>> {
+    let path = state_path()?;
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Some(vec![(1, "/".into(), "rw".into(), "ext4".into())]);
+    };
+    text.lines()
+        .map(|l| {
+            let mut f = l.split('\t');
+            Some((
+                f.next()?.parse().ok()?,
+                f.next()?.to_string(),
+                f.next()?.to_string(),
+                f.next()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn save_state(rows: &[MountRow]) -> Option<()> {
+    let text: String = rows
+        .iter()
+        .map(|(id, p, o, t)| format!("{id}\t{p}\t{o}\t{t}\n"))
+        .collect();
+    std::fs::write(state_path()?, text).ok()
+}
+
+/// マウント系モードのゲスト内コマンドを模擬する。
+fn guest_exec(mode: &str, cmd: &[&str]) -> ExitCode {
+    let Some(mut rows) = load_state() else {
+        return ExitCode::from(3);
+    };
+    match cmd {
+        ["cat", "/proc/self/mountinfo"] => {
+            let text: String = rows
+                .iter()
+                .enumerate()
+                .map(|(i, (id, p, o, t))| format!("{id} 1 0:{i} / {p} {o} - {t} src rw\n"))
+                .collect();
+            emit(text.as_bytes(), 0)
+        }
+        ["sh", "-c", script, "sh", _host, name, opts, _nonce]
+            if script.contains("mount -t drvfs") =>
+        {
+            let id = rows.iter().map(|r| r.0).max().unwrap_or(0).max(99) + 1;
+            let base = if opts.split(',').any(|o| o == "ro") {
+                "ro"
+            } else {
+                "rw"
+            };
+            let fstype = if mode == "mount_9p" { "9p" } else { "virtiofs" };
+            rows.push((
+                id,
+                format!("/mnt/fandhe/{name}"),
+                format!("{base},nosuid,nodev"),
+                fstype.to_string(),
+            ));
+            if save_state(&rows).is_none() {
+                return ExitCode::from(3);
+            }
+            // 本物のスクリプトと同じく、自分のマウント ID（mount 前後の差分）を標準出力へ書く。
+            emit(format!("{id}\n").as_bytes(), 0)
+        }
+        ["sh", "-c", script, "sh", target, id, _nonce] if script.contains("umount \"$1\"") => {
+            let top = rows.iter().rposition(|r| r.1 == *target);
+            match top {
+                Some(i) if rows.get(i).is_some_and(|r| r.0.to_string() == *id) => {
+                    rows.remove(i);
+                    save_state(&rows).map_or(ExitCode::from(3), |()| ExitCode::SUCCESS)
+                }
+                _ => ExitCode::from(203),
+            }
+        }
+        _ => ExitCode::from(64),
+    }
 }
 
 fn utf16le_with_bom(s: &str) -> Vec<u8> {
@@ -79,6 +180,14 @@ fn main() -> ExitCode {
     {
         ["--version"] => Call::Version,
         ["-l", "-v"] => Call::List,
+        [
+            "--distribution",
+            "Ubuntu",
+            "--user",
+            "root",
+            "--exec",
+            rest @ ..,
+        ] if !rest.is_empty() => Call::Exec(rest.iter().map(|s| (*s).to_string()).collect()),
         _ => return ExitCode::from(64),
     };
     if std::env::var("WSL_UTF8").as_deref() != Ok("1") {
@@ -87,7 +196,18 @@ fn main() -> ExitCode {
     let Some(mode) = mode() else {
         return ExitCode::from(2);
     };
+    let mount_mode = matches!(
+        mode.as_str(),
+        "mount_ok" | "mount_9p" | "mount_launch" | "mount_unset"
+    );
     match (mode.as_str(), call) {
+        (_, Call::Exec(cmd)) if mount_mode => {
+            let cmd: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            guest_exec(&mode, &cmd)
+        }
+        (_, Call::Exec(_)) => ExitCode::from(64),
+        (_, Call::Version) if mount_mode => emit(EN_VERSION.as_bytes(), 0),
+        (_, Call::List) if mount_mode => emit(EN_LIST.as_bytes(), 0),
         ("ok" | "nodistro" | "v1only", Call::Version) => emit(EN_VERSION.as_bytes(), 0),
         ("ok", Call::List) => emit(EN_LIST.as_bytes(), 0),
         ("utf16", Call::Version) => emit(&utf16le_with_bom(EN_VERSION), 0),

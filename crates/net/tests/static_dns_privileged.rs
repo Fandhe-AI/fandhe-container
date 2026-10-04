@@ -126,7 +126,16 @@ mod linux {
             .as_deref()
             == Some("0");
         assert!(uid_root, "this test requires root (euid 0); see AGENTS.md");
-        for tool in ["unshare", "nsenter", "mount", "sh"] {
+        // sh は dash 等が `--help` を受け付けず終了コード 2 を返すため、POSIX sh で必ず成功する `-c ':'` で存在確認する。
+        let sh_ok = Command::new("sh")
+            .args(["-c", ":"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(sh_ok, "`sh` is required; see AGENTS.md");
+        for tool in ["unshare", "nsenter", "mount"] {
             let ok = Command::new(tool)
                 .arg("--help")
                 .stdout(Stdio::null())

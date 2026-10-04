@@ -1158,6 +1158,81 @@ mod tests {
         );
     }
 
+    /// TASK-64.4: 破棄時に実行中なら停止を要求し、成功すれば Stopped で終わる。
+    #[test]
+    fn core_drop_stop_stops_running_vm() {
+        let (sink, rx) = event_channel(16);
+        let mut core = Core::new(sink);
+        let (_, start) = begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        core.complete(start, LifecycleInput::StartCompleted(start, Ok(())))
+            .unwrap();
+        drain(&rx);
+        let stop = core.request_drop_stop(true, VmState::Running);
+        assert_eq!(stop, Some(2));
+        core.finish_drop_stop(2, Ok(()));
+        assert_eq!(
+            drain(&rx),
+            vec![
+                changed(VmState::Running, VmState::Stopping),
+                changed(VmState::Stopping, VmState::Stopped)
+            ]
+        );
+        assert!(core.drop_stop_due());
+    }
+
+    /// TASK-64.4: 破棄時の停止の失敗は StopOnDropFailed として記録される。
+    #[test]
+    fn core_drop_stop_failure_is_recorded() {
+        let (sink, rx) = event_channel(16);
+        let mut core = Core::new(sink);
+        let generation = core.request_drop_stop(true, VmState::Running);
+        assert_eq!(generation, Some(1));
+        drain(&rx);
+        core.finish_drop_stop(1, Err(("VZErrorDomain".to_string(), 3)));
+        assert_eq!(
+            drain(&rx),
+            vec![
+                changed(VmState::Stopping, VmState::Running),
+                VmEvent::StopOnDropFailed {
+                    domain: "VZErrorDomain".to_string(),
+                    code: 3
+                }
+            ]
+        );
+    }
+
+    /// TASK-64.4: 停止できない間（起動途中・完了待ち）の破棄は印だけ残し、完了後に停止を要求し直す。
+    #[test]
+    fn core_drop_stop_is_deferred_until_operation_completes() {
+        let (sink, _rx) = event_channel(16);
+        let mut core = Core::new(sink);
+        let (mut ticket, start) =
+            begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        core.abandon(&mut ticket);
+        // 起動途中で canStop が false。
+        assert_eq!(core.request_drop_stop(false, VmState::Starting), None);
+        assert!(core.drop_stop_due());
+        core.complete(start, LifecycleInput::StartCompleted(start, Ok(())))
+            .unwrap();
+        assert!(core.drop_stop_due());
+        assert_eq!(core.request_drop_stop(true, VmState::Running), Some(2));
+        assert!(!core.drop_stop_due());
+        assert_eq!(core.lifecycle.state(), VmState::Stopping);
+    }
+
+    /// TASK-64.4: 完了待ちの操作がある間は破棄時の停止を要求しない（その完了を待って再試行する）。
+    #[test]
+    fn core_drop_stop_waits_for_in_flight_operation() {
+        let (sink, _rx) = event_channel(16);
+        let mut core = Core::new(sink);
+        let (_, start) = begin_ok(&mut core, LifecycleInput::StartRequested, VmState::Stopped);
+        assert_eq!(core.request_drop_stop(true, VmState::Starting), None);
+        assert!(!core.drop_stop_due());
+        core.complete(start, LifecycleInput::StartCompleted(start, Ok(())))
+            .unwrap();
+        assert!(core.drop_stop_due());
+    }
+
     /// MAC-1・TASK-64.4: 停止通知が停止完了より先着しても、停止要求は正常終了として扱う。
     #[test]
     fn core_complete_accepts_stop_after_guest_stopped_notification() {

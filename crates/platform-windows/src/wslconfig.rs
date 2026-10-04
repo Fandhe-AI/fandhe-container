@@ -1033,17 +1033,27 @@ fn enable_virtiofs_inner(path: &Path) -> Result<EnableOutcome, WinError> {
         return Ok(EnableOutcome::AlreadyEnabled);
     }
     if let Some(src) = &source {
-        let readonly = src
+        let meta = src
             .file
             .metadata()
-            .map_err(|e| io_err(&e, "failed to stat .wslconfig"))?
-            .permissions()
-            .readonly();
-        if readonly {
+            .map_err(|e| io_err(&e, "failed to stat .wslconfig"))?;
+        if meta.permissions().readonly() {
             return Err(err(
                 WinErrorCode::PermissionDenied,
                 ".wslconfig is read-only; refusing to modify it",
             ));
+        }
+        // リンク以外のリパースポイント（WOF 圧縮・クラウドのプレースホルダー等）は読み込めるが、rename による置換では
+        // リパースタグとその動作（圧縮・同期）を引き継げないため置換しない（既存の状態を保つ）。
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(err(
+                    WinErrorCode::PermissionDenied,
+                    ".wslconfig is a reparse point (such as a compressed or cloud file); refusing to replace it",
+                ));
+            }
         }
     }
     let text = cfg.render();
@@ -1456,42 +1466,6 @@ mod tests {
             b"[wsl2]\nmemory=4GB\n"
         );
         assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
-    }
-
-    /// WIN-2（Bugbot 指摘）: リンク以外のリパースポイント（WOF 圧縮）の `.wslconfig` も論理的な内容を読み、
-    /// 更新できる（Windows。`compact /exe` で WOF 圧縮したファイルで確認）。
-    #[cfg(windows)]
-    #[test]
-    fn wof_compressed_file_is_read_and_updated() {
-        use std::os::windows::fs::MetadataExt;
-        let d = TmpDir::new("wof");
-        let mut body = String::new();
-        for i in 0..1024 {
-            body.push_str(&format!("# padding line {i:04} for compression\n"));
-        }
-        body.push_str("[wsl2]\nmemory=4GB\n");
-        std::fs::write(d.file(), &body).expect("write");
-        let st = std::process::Command::new("compact")
-            .args(["/c", "/exe:xpress4k", ".wslconfig"])
-            .current_dir(&d.0)
-            .output()
-            .expect("compact");
-        assert!(st.status.success(), "compact failed: {st:?}");
-        let attrs = std::fs::symlink_metadata(d.file())
-            .expect("stat")
-            .file_attributes();
-        assert_eq!(
-            attrs & FILE_ATTRIBUTE_REPARSE_POINT,
-            FILE_ATTRIBUTE_REPARSE_POINT,
-            "test setup must produce a WOF reparse point"
-        );
-        let cfg = load(&d.file()).expect("load").expect("exists");
-        assert_eq!(cfg.render(), body);
-        assert_eq!(enable_virtiofs_at(&d.file()), Ok(EnableOutcome::Added));
-        assert_eq!(
-            std::fs::read_to_string(d.file()).expect("read"),
-            format!("{body}virtiofs=true\n")
-        );
     }
 
     /// WIN-2（レビュー指摘 P1）: 名前付きストリームを持つファイルは置換せず PERMISSION_DENIED。本体と

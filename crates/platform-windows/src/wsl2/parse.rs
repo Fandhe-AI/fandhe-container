@@ -301,17 +301,25 @@ pub(super) fn classify_failure(out: &Captured) -> Failure {
         "0x80370102",
         "wsl_e_vmcompute_not_ready",
     ];
-    const NO_DISTRO: [&str; 2] = [
-        "wsl_e_default_distro_not_found",
-        "has no installed distributions",
-    ];
+    // ロケール依存の説明文は使わず、専用のエラー識別子のみで 0 件を判定する。
+    const NO_DISTRO: &str = "wsl_e_default_distro_not_found";
     if DISABLED.iter().any(|t| text.contains(t)) {
         Failure::WslDisabled
-    } else if NO_DISTRO.iter().any(|t| text.contains(t)) {
+    } else if text.contains(NO_DISTRO) && !has_other_error_id(&text, NO_DISTRO) {
         Failure::NoDistro
     } else {
         Failure::Unknown
     }
+}
+
+/// `text` に `allowed` 以外のエラー識別子（`wsl_e_*`・`hcs_e_*`・`0x8…` の HRESULT）が併記されているか。
+///
+/// 別の失敗理由が 0 件判定に紛れ込み、失敗が空の一覧として見落とされるのを防ぐ（fail-closed）。
+fn has_other_error_id(text: &str, allowed: &str) -> bool {
+    let masked = text.replace(allowed, " ");
+    ["wsl_e_", "hcs_e_", "0x8", "0xc"]
+        .iter()
+        .any(|p| masked.contains(p))
 }
 
 /// エラーメッセージに載せる出力の抜粋。印字可能 ASCII 以外は `?` にし、128 バイト以下に切る。
@@ -556,6 +564,18 @@ mod tests {
             &utf16le("Wsl/Service/WSL_E_DEFAULT_DISTRO_NOT_FOUND", false),
         );
         assert_eq!(classify_failure(&none), Failure::NoDistro);
+        // 別の失敗理由が併記された場合は 0 件扱いにしない。
+        let mixed = cap(
+            false,
+            b"",
+            &utf16le(
+                "WSL_E_DEFAULT_DISTRO_NOT_FOUND\nError code: Wsl/Service/E_ACCESSDENIED 0x80070005",
+                false,
+            ),
+        );
+        assert_eq!(classify_failure(&mixed), Failure::Unknown);
+        let phrase_only = cap(false, b"", b"has no installed distributions");
+        assert_eq!(classify_failure(&phrase_only), Failure::Unknown);
         let usage = cap(false, b"Usage: wsl.exe [Argument]\n", b"");
         assert_eq!(classify_failure(&usage), Failure::Unknown);
         let noisy = cap(false, "日本語\u{7}".repeat(100).as_bytes(), b"");

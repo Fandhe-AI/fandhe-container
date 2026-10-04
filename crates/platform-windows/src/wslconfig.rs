@@ -1161,6 +1161,39 @@ mod tests {
         assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
     }
 
+    /// REPAIR-4・WIN-2: 計装版は操作ごとに種別と成否を 1 件ずつ記録し、結果は計測しない版と同じ。
+    #[test]
+    fn recorder_receives_one_sample_per_operation() {
+        use crate::instrument::WinOpOutcome;
+        use crate::instrument::testing::Collect;
+        let d = TmpDir::new("recorder");
+        let c = Collect::default();
+        assert_eq!(load_with_recorder(&d.file(), &c), Ok(None));
+        assert_eq!(
+            enable_virtiofs_at_with_recorder(&d.file(), &c),
+            Ok(EnableOutcome::Created)
+        );
+        assert_eq!(
+            enable_virtiofs_at_with_recorder(&d.file(), &c),
+            Ok(EnableOutcome::AlreadyEnabled)
+        );
+        std::fs::write(d.file(), "[wsl2\n").expect("write");
+        let e = enable_virtiofs_at_with_recorder(&d.file(), &c).expect_err("must fail");
+        assert_eq!(e.code(), WinErrorCode::InvalidArgument);
+        let e = load_with_recorder(&d.file(), &c).expect_err("must fail");
+        assert_eq!(e.code(), WinErrorCode::InvalidArgument);
+        assert_eq!(
+            c.kinds(),
+            vec![
+                (WinOpKind::WslconfigLoad, WinOpOutcome::Success),
+                (WinOpKind::WslconfigEnableVirtiofs, WinOpOutcome::Success),
+                (WinOpKind::WslconfigEnableVirtiofs, WinOpOutcome::Success),
+                (WinOpKind::WslconfigEnableVirtiofs, WinOpOutcome::Failure),
+                (WinOpKind::WslconfigLoad, WinOpOutcome::Failure),
+            ]
+        );
+    }
+
     /// WIN-2・AC2: ファイルがなければ新規作成する。
     #[test]
     fn creates_missing_file() {

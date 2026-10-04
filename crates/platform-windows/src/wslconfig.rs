@@ -433,6 +433,8 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// ホーム配下の設定操作のため許容する）。
 ///
 /// unix では既存の宛先のパーミッションを一時ファイルへ引き継ぐ（新規作成時は既定のまま）。
+/// 非 unix（Windows）では既存の宛先がある場合 ACL を保持するため rename せず同一ファイルへ上書きする
+/// （原子性は保証しない。新規作成時のみ一時ファイル経由）。
 /// unix で rename 成功後の親ディレクトリ fsync に失敗した場合は、置換済みのまま `Err` を返す。
 fn write_atomic(path: &Path, data: &[u8]) -> Result<(), WinError> {
     let parent = match path.parent() {
@@ -448,6 +450,13 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), WinError> {
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
         nanos
     ));
+    // Windows では一時ファイルを rename で置換すると既存 `.wslconfig` の ACL が失われる。ACL の複製には
+    // Win32 API（依存追加が必要）を要するため、既存ファイルがある場合は同一ファイルへ上書きして
+    // ACL を保持する（原子性は失う代わりに制限 ACL を緩めない側＝安全側へ倒す）。
+    #[cfg(not(unix))]
+    if path.exists() {
+        return overwrite_in_place(path, data);
+    }
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -491,6 +500,19 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), WinError> {
             .map_err(|e| io_err(&e, "failed to sync parent directory"))?;
     }
     Ok(())
+}
+
+/// 既存ファイルを置換せず内容だけ書き換える（ACL・属性を保持する。非 unix 向け。原子的ではない）。
+#[cfg(not(unix))]
+fn overwrite_in_place(path: &Path, data: &[u8]) -> Result<(), WinError> {
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| io_err(&e, "failed to open .wslconfig for writing"))?;
+    f.write_all(data)
+        .and_then(|()| f.sync_all())
+        .map_err(|e| io_err(&e, "failed to write .wslconfig"))
 }
 
 /// `path` の `.wslconfig` に `virtiofs=true` を opt-in する（読み込み → 編集 → 原子的書き込み）。
@@ -568,6 +590,14 @@ mod tests {
             out,
             "# top\r\nglobal=1\r\n\r\n[experimental]\r\nsparseVhd=true\r\n\r\n[wsl2]\r\nmemory=4GB\r\n; note\r\nvirtiofs=true\r\n\r\n[boot]\r\nsystemd=true\r\n"
         );
+    }
+
+    /// WIN-2: 改行なしの末尾空白行があってもセクションが連結されない（レビュー指摘 P1）。
+    #[test]
+    fn appends_section_after_trailing_blank_without_eol() {
+        let (e, out) = enable("[boot]\n   ");
+        assert_eq!(e, VirtiofsEdit::Added);
+        assert_eq!(out, "[boot]\n   \n[wsl2]\nvirtiofs=true\n");
     }
 
     /// WIN-2: `[wsl2]` がなければ末尾に区切りの空行つきで追加する（AC1）。

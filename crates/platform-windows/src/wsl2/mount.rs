@@ -1344,6 +1344,8 @@ mod tests {
         fail_cat_after_mount: bool,
         /// true なら `ro` を無視して rw でマウントする（ro 不成立の模擬）。
         ignore_ro: bool,
+        /// true なら `ro` を要求しなくても ro でマウントする（読み書き要求の不成立の模擬）。
+        force_ro: bool,
         /// true なら mount のたびに同じマウント先へ別プロセスのマウントも積む（競合の模擬）。
         extra_on_mount: bool,
         /// true なら nosuid,nodev を無視してマウントする（オプション不成立の模擬）。
@@ -1381,6 +1383,7 @@ mod tests {
                 ]),
                 fail_cat_after_mount: false,
                 ignore_ro: false,
+                force_ro: false,
                 extra_on_mount: false,
                 drop_nosuid: false,
                 timeout_mount_nth: None,
@@ -1486,7 +1489,8 @@ mod tests {
                     self.mounts
                         .push((target.to_string(), self.mount_fstype.to_string()));
                     self.ids.push(self.next_id);
-                    let ro = opts.split(',').any(|o| o == "ro") && !self.ignore_ro;
+                    let ro =
+                        (opts.split(',').any(|o| o == "ro") && !self.ignore_ro) || self.force_ro;
                     let base = if ro { "ro" } else { "rw" };
                     self.opts.push(if self.drop_nosuid {
                         base.to_string()
@@ -1731,6 +1735,22 @@ mod tests {
         assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
         assert!(e.message().contains("read-only"));
         assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+    }
+
+    /// WIN-2: 読み書き要求なのに ro で成立した場合も、解除して FAILED_PRECONDITION にする。
+    #[test]
+    fn prepare_rejects_read_write_mounted_read_only() {
+        let mut g = Guest::new("virtiofs");
+        g.force_ro = true;
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "a read-write shared mount is mounted read-only"
+        );
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+        assert_eq!(g.mounts.len(), 1);
     }
 
     /// SEC: nosuid / nodev が成立していなければ解除してエラーにする。

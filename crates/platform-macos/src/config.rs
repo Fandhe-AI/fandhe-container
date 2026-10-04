@@ -19,13 +19,15 @@
 //! open 後に fd と lstat の `(dev, ino)` も照合する（事前検査〜open 間の symlink 差し替えを塞ぐ）。
 //! 新規作成は `O_CREAT | O_EXCL` で行い、既存ファイルは作成フラグなしで開く。open 後の fd が
 //! kernel / initrd / ディスクイメージと同一ファイルなら拒否し（initrd への追記は次回起動時の
-//! initramfs 注入になり得る）、リンク数が 1 でない・所有者が実効 uid でないファイルも拒否する。
+//! initramfs 注入になり得る）、リンク数が 1 でない・所有者が実効 uid でない・group / other が読み書き
+//! できるファイルも拒否する。
 //!
 //! 信頼前提（fail-closed で検査しない範囲）: 直近の親ディレクトリは symlink なら拒否し（macOS の `/tmp`
 //! 等は呼び出し側が実体パスへ正規化して渡す）、「他者書き込み可能かつ sticky bit なし」なら拒否するが、
 //! group 書き込み可は group メンバーを信頼するものとして許可する。祖先ディレクトリ要素（親より上）の
-//! 差し替えは対象外で、呼び出し側の配置ディレクトリの権限管理に委ねる。既存ログファイルのモードは
-//! 変更・検査しない（他者が読み書きできる権限なら、出力の秘匿性と上限は保証しない）。
+//! 差し替えは対象外で、呼び出し側の配置ディレクトリの権限管理に委ねる。既存ログファイルは group / other
+//! が読み書きできるモードなら拒否する（モードは変更しない）。権限を狭める前から他者が開いていた fd 経由の
+//! 書き込みは対象外。
 
 use std::fmt;
 use std::num::NonZeroU32;
@@ -130,6 +132,8 @@ pub enum ConfigError {
     },
     /// 既存のコンソールログのハードリンク数が 1 でない（別名経由の追記先すり替え）。
     ConsoleLogMultipleLinks { path: PathBuf, links: u64 },
+    /// 既存のコンソールログを group / other が読み書きできる（`mode` は権限ビット）。
+    ConsoleLogInsecureMode { path: PathBuf, mode: u32 },
     /// コンソールログの親ディレクトリが他者書き込み可能で sticky bit がない（`path` は親ディレクトリ）。
     ConsoleLogParentWorldWritable { path: PathBuf },
     /// コンソールログの親ディレクトリ自体が symlink（`path` は親ディレクトリ）。
@@ -177,6 +181,7 @@ impl ConfigError {
             }
             ConfigError::ConsoleLogNotOwned { .. } => "config.console_log_not_owned",
             ConfigError::ConsoleLogMultipleLinks { .. } => "config.console_log_multiple_links",
+            ConfigError::ConsoleLogInsecureMode { .. } => "config.console_log_insecure_mode",
             ConfigError::ConsoleLogParentWorldWritable { .. } => {
                 "config.console_log_parent_world_writable"
             }
@@ -288,6 +293,12 @@ impl ConfigError {
             ConfigError::ConsoleLogMultipleLinks { path, links } => {
                 format!(
                     "console log has {links} hard links, expected 1: {}",
+                    path.display()
+                )
+            }
+            ConfigError::ConsoleLogInsecureMode { path, mode } => {
+                format!(
+                    "console log mode {mode:o} allows group or other access, expected 600: {}",
                     path.display()
                 )
             }
@@ -589,6 +600,7 @@ impl ConsoleLogPath {
                         LogFileAttrs {
                             nlink: _m.nlink(),
                             uid: _m.uid(),
+                            mode: _m.mode(),
                         },
                         crate::sys::effective_uid(),
                     )?;
@@ -687,6 +699,7 @@ impl ConsoleLogPath {
             LogFileAttrs {
                 nlink: fd_meta.nlink(),
                 uid: fd_meta.uid(),
+                mode: fd_meta.mode(),
             },
             crate::sys::effective_uid(),
         )?;
@@ -751,12 +764,19 @@ fn check_console_log_conflicts(
 struct LogFileAttrs {
     nlink: u64,
     uid: u32,
+    mode: u32,
 }
 
-/// リンク数 1 かつ所有者が `euid` であることを検査する（MAC-1・TASK-64.3）。
+/// group / other の読み書きビット（`S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH`。値は POSIX 共通）。
+#[cfg(unix)]
+const MODE_GROUP_OTHER_RW: u32 = 0o066;
+
+/// リンク数 1・所有者が `euid`・group / other が読み書きできないことを検査する（MAC-1・TASK-64.3）。
 ///
-/// ハードリンクが複数あるファイル（他所の重要ファイルの別名かもしれない）と、他ユーザーが事前作成した
-/// ファイルへは追記しない。リンク数を先に見る（所有者一致でも別名経由の追記は拒否する）。
+/// ハードリンクが複数あるファイル（他所の重要ファイルの別名かもしれない）・他ユーザーが事前作成した
+/// ファイル・他者が読み書きできるファイル（ゲスト出力の漏えいと、外部からの追記・切り詰めで上限を維持
+/// できない）へは追記しない。リンク数 → 所有者 → モードの順に見る。モードは変更しない（拒否のみ。
+/// 呼び出し側が `chmod 600` 等で直す）。
 #[cfg(unix)]
 fn check_log_ownership(path: &Path, attrs: LogFileAttrs, euid: u32) -> Result<(), ConfigError> {
     if attrs.nlink != 1 {
@@ -770,6 +790,12 @@ fn check_log_ownership(path: &Path, attrs: LogFileAttrs, euid: u32) -> Result<()
             path: path.to_path_buf(),
             owner: attrs.uid,
             euid,
+        });
+    }
+    if attrs.mode & MODE_GROUP_OTHER_RW != 0 {
+        return Err(ConfigError::ConsoleLogInsecureMode {
+            path: path.to_path_buf(),
+            mode: attrs.mode & 0o7777,
         });
     }
     Ok(())
@@ -1261,6 +1287,13 @@ mod tests {
         fn file(&self, name: &str) -> PathBuf {
             let p = self.0.join(name);
             std::fs::write(&p, b"dummy").expect("write fixture");
+            // umask に依らず、既存ログのモード検査（group / other の読み書き不可）を通る 0600 にする。
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
+                    .expect("chmod fixture");
+            }
             p
         }
     }
@@ -1869,10 +1902,27 @@ mod tests {
     fn log_ownership_judgement() {
         let p = Path::new("/var/log/console.log");
         assert_eq!(
-            check_log_ownership(p, LogFileAttrs { nlink: 1, uid: 501 }, 501),
+            check_log_ownership(
+                p,
+                LogFileAttrs {
+                    nlink: 1,
+                    uid: 501,
+                    mode: 0o100600
+                },
+                501
+            ),
             Ok(())
         );
-        let err = check_log_ownership(p, LogFileAttrs { nlink: 1, uid: 0 }, 501).unwrap_err();
+        let err = check_log_ownership(
+            p,
+            LogFileAttrs {
+                nlink: 1,
+                uid: 0,
+                mode: 0o100600,
+            },
+            501,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             ConfigError::ConsoleLogNotOwned {
@@ -1886,7 +1936,16 @@ mod tests {
             "config.console_log_not_owned: console log is owned by uid 0, expected effective uid 501: /var/log/console.log"
         );
         // リンク数を所有者より先に見る。
-        let err = check_log_ownership(p, LogFileAttrs { nlink: 3, uid: 0 }, 501).unwrap_err();
+        let err = check_log_ownership(
+            p,
+            LogFileAttrs {
+                nlink: 3,
+                uid: 0,
+                mode: 0o100600,
+            },
+            501,
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "config.console_log_multiple_links: console log has 3 hard links, expected 1: /var/log/console.log"

@@ -500,6 +500,25 @@ fn record_argv(distro: &DistroName, nonce: &str) -> Vec<String> {
     exec_argv(distro, &["sh", "-c", RECORD_SCRIPT, "sh", nonce])
 }
 
+/// ゲスト内で [`MOUNT_SCRIPT`] の記録・一時ファイル・claim を消すスクリプト（`$1`=nonce）。
+///
+/// [`MOUNT_SCRIPT`] が終了済みと分かっている場合（記録が確定している・マウントが解除済み）にだけ使う。実行中かも
+/// しれない場合に claim を消すと、遅れて動き出した処理が claim を取り直して mount しうるため使わない
+/// （回復時に [`RECORD_SCRIPT`] が取った claim は柵として残す。`/run` は tmpfs で WSL の再起動時に消える）。
+const CLEAR_SCRIPT: &str = concat!(
+    "rm -f -- \"/run/fandhe/$1\" \"/run/fandhe/$1.tmp\"; ",
+    "rmdir -- \"/run/fandhe/$1.claim\" 2>/dev/null; exit 0"
+);
+
+fn clear_argv(distro: &DistroName, nonce: &str) -> Vec<String> {
+    exec_argv(distro, &["sh", "-c", CLEAR_SCRIPT, "sh", nonce])
+}
+
+/// [`CLEAR_SCRIPT`] を best-effort で 1 回実行する（失敗しても記録が残るだけで、マウントの安全性には影響しない）。
+fn clear_record(distro: &DistroName, nonce: &str, exec: Exec<'_>) {
+    let _ = exec(&clear_argv(distro, nonce), MAX_OUTPUT_BYTES);
+}
+
 /// ゲスト内で「マウント先の最上位のマウント ID が記録値と一致するか確認 → umount → 記録の削除」を 1 つの `sh`
 /// プロセスで行うスクリプト。
 ///
@@ -699,9 +718,12 @@ fn read_mountinfo_bounded(distro: &DistroName, exec: Exec<'_>) -> Option<Vec<Mou
 enum Evidence {
     /// [`MOUNT_SCRIPT`] の標準出力または記録にあったマウント ID（本呼び出しのマウント）。
     Mine(u32),
-    /// 証拠が無い（mount が成立していない、または新しいマウントを 1 件に特定できなかった）。
+    /// 証拠が無い（[`MOUNT_SCRIPT`] は終了済みで、mount が成立していないか新しいマウントを 1 件に特定できなかった。
+    /// 記録は `none`）。
     Missing,
-    /// 記録を上限回数まで読めなかった。
+    /// 回復時に [`RECORD_SCRIPT`] が claim を先に取った（本呼び出しの mount は成立しておらず、以後もしない）。
+    Fenced,
+    /// 記録を上限回数まで読めなかった（`mount` の途中で確定しない場合を含む）。
     Unreadable,
 }
 
@@ -719,7 +741,7 @@ fn parse_recorded_id(bytes: &[u8]) -> Option<u32> {
 /// タイムアウトで有界。REPAIR-5）。
 ///
 /// 204（claim を先に取った）は「本呼び出しのマウントは成立しておらず、以後も成立しない」ことの確定なので
-/// `Missing`。記録が `none` なら [`MOUNT_SCRIPT`] は新しいマウントを特定できなかったので `Missing`。206（`mount` の
+/// `Fenced`。記録が `none` なら [`MOUNT_SCRIPT`] は新しいマウントを特定できなかったので `Missing`。206（`mount` の
 /// 途中）・読み取り失敗は読み直し、上限に達したら `Unreadable`（所有を確認できない）。
 fn read_record(distro: &DistroName, nonce: &str, exec: Exec<'_>) -> Evidence {
     for _ in 0..MAX_RECOVERY_READS {
@@ -730,7 +752,7 @@ fn read_record(distro: &DistroName, nonce: &str, exec: Exec<'_>) -> Evidence {
                 }
                 return parse_recorded_id(&out.stdout).map_or(Evidence::Unreadable, Evidence::Mine);
             }
-            Ok(out) if out.code == Some(EXIT_NO_RECORD) => return Evidence::Missing,
+            Ok(out) if out.code == Some(EXIT_NO_RECORD) => return Evidence::Fenced,
             _ => {}
         }
     }
@@ -798,6 +820,9 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> usize 
                         .is_some_and(|after| after.iter().all(|e| e.mount_id != o.mount_id));
                 if !gone {
                     failures += 1;
+                } else if !ok {
+                    // UMOUNT_SCRIPT が記録を消す前に終わったが、マウントは外れている。
+                    clear_record(distro, &o.nonce, exec);
                 }
             }
             _ => {
@@ -805,6 +830,9 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> usize 
                 let still_mounted = entries.iter().any(|e| e.mount_id == o.mount_id);
                 if still_mounted {
                     failures += 1;
+                } else {
+                    // 既に外れている（解除済み）ので記録も消す。
+                    clear_record(distro, &o.nonce, exec);
                 }
             }
         }
@@ -898,8 +926,10 @@ fn mount_one(
             ),
         )
     };
-    match (evidence, failure) {
-        (Evidence::Mine(mount_id), failure) => {
+    let not_identified =
+        || precondition("the shared mount could not be uniquely identified after mounting");
+    match evidence {
+        Evidence::Mine(mount_id) => {
             owned.push(OwnedMount {
                 guest_path,
                 mount_id,
@@ -907,14 +937,19 @@ fn mount_one(
             });
             failure.map_or(Ok(()), Err)
         }
-        (Evidence::Missing | Evidence::Unreadable, None) => Err(unconfirmed(precondition(
-            "the shared mount could not be uniquely identified after mounting",
-        ))),
-        (Evidence::Unreadable, Some(e)) => Err(unconfirmed(e)),
-        (Evidence::Missing, Some(e)) => {
-            match count_fresh_mounts(distro, &guest_path, before_ids, exec) {
-                Some(0) => Err(e),
-                _ => Err(unconfirmed(e)),
+        Evidence::Unreadable => Err(unconfirmed(failure.unwrap_or_else(not_identified))),
+        Evidence::Missing | Evidence::Fenced => {
+            if evidence == Evidence::Missing {
+                // MOUNT_SCRIPT は終了済みで本呼び出しのマウントは無いので、記録と claim を消す
+                // （Fenced の claim は遅れて動き出す処理を止める柵なので残す）。
+                clear_record(distro, &nonce, exec);
+            }
+            match failure {
+                None => Err(unconfirmed(not_identified())),
+                Some(e) => match count_fresh_mounts(distro, &guest_path, before_ids, exec) {
+                    Some(0) => Err(e),
+                    _ => Err(unconfirmed(e)),
+                },
             }
         }
     }

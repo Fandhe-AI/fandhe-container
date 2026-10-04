@@ -928,6 +928,53 @@ mod windows {
             assert_eq!(acl_ace_types(audit.get(..12).expect("slice")), None);
         }
 
+        /// WIN-2（レビュー指摘 P1）: `FILE_STREAM_INFO` の列からストリーム名を取り出し、壊れた形式は `None`。
+        #[test]
+        fn parse_stream_names_reads_entries() {
+            fn entry(next: u32, name: &str) -> Vec<u8> {
+                let units: Vec<u16> = name.encode_utf16().collect();
+                let mut v = next.to_ne_bytes().to_vec();
+                v.extend_from_slice(&u32::try_from(units.len() * 2).expect("len").to_ne_bytes());
+                v.extend_from_slice(&[0u8; 16]);
+                for u in &units {
+                    v.extend_from_slice(&u.to_ne_bytes());
+                }
+                while !v.len().is_multiple_of(8) {
+                    v.push(0);
+                }
+                v
+            }
+            let first = entry(0, "::$DATA");
+            let mut two = entry(0, "::$DATA");
+            let next = u32::try_from(two.len()).expect("len");
+            two.splice(0..4, next.to_ne_bytes());
+            two.extend(entry(0, ":extra:$DATA"));
+            let names = |b: &[u8]| {
+                parse_stream_names(b).map(|v| {
+                    v.iter()
+                        .map(|n| String::from_utf16_lossy(n))
+                        .collect::<Vec<_>>()
+                })
+            };
+            assert_eq!(names(&first), Some(vec!["::$DATA".to_string()]));
+            assert_eq!(
+                names(&two),
+                Some(vec!["::$DATA".to_string(), ":extra:$DATA".to_string()])
+            );
+            assert_eq!(names(first.get(..20).expect("slice")), None);
+        }
+
+        /// WIN-2（レビュー指摘 P1）: 名前付きストリームの有無を検出する。
+        #[test]
+        fn has_named_streams_detects_alternate_data_stream() {
+            let d = TmpDir(std::env::temp_dir().join(format!("fc-sys-ads-{}", std::process::id())));
+            std::fs::create_dir_all(&d.0).expect("mkdir");
+            std::fs::write(d.0.join("f"), b"x").expect("write");
+            assert!(!has_named_streams(&File::open(d.0.join("f")).expect("open")).expect("plain"));
+            std::fs::write(d.0.join("f:extra"), b"y").expect("write stream");
+            assert!(has_named_streams(&File::open(d.0.join("f")).expect("open")).expect("ads"));
+        }
+
         /// WIN-2: WRITE_DAC なしで開いた宛先には写せず `Err`（失敗を握りつぶさない）。
         #[test]
         fn copy_security_without_write_dac_fails() {
@@ -1222,6 +1269,26 @@ mod unix {
     ))]
     mod tests {
         use super::*;
+
+        /// WIN-2（レビュー指摘 P0）: セキュリティラベルの列は、同じディレクトリに作った 2 つのファイルで一致する
+        /// （Linux は SELinux・Smack の 2 属性、macOS は空）。
+        #[test]
+        fn security_labels_match_for_siblings() {
+            let d = std::env::temp_dir().join(format!("fc-sys-label-{}", std::process::id()));
+            std::fs::create_dir_all(&d).expect("mkdir");
+            std::fs::write(d.join("a"), b"x").expect("write a");
+            std::fs::write(d.join("b"), b"y").expect("write b");
+            let a = security_labels(&File::open(d.join("a")).expect("open a"));
+            let b = security_labels(&File::open(d.join("b")).expect("open b"));
+            let _ = std::fs::remove_dir_all(&d);
+            let (a, b) = (a.expect("labels a"), b.expect("labels b"));
+            let keys: Vec<&str> = a.iter().map(|(k, _)| *k).collect();
+            #[cfg(target_os = "linux")]
+            assert_eq!(keys, vec!["security.selinux", "security.SMACK64"]);
+            #[cfg(target_os = "macos")]
+            assert_eq!(keys, Vec::<&str>::new());
+            assert_eq!(a, b);
+        }
 
         /// WIN-2・TASK-67.2: ACL のない通常のファイルは `false`。
         #[test]

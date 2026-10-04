@@ -1433,6 +1433,31 @@ mod tests {
         assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
     }
 
+    /// WIN-2（レビュー指摘 P1）: 名前付きストリームを持つファイルは置換せず PERMISSION_DENIED。本体と
+    /// ストリームの内容を残す（Windows）。
+    #[cfg(windows)]
+    #[test]
+    fn file_with_named_stream_is_not_replaced() {
+        let d = TmpDir::new("ads");
+        std::fs::write(d.file(), "[wsl2]\nmemory=4GB\n").expect("write");
+        std::fs::write(d.0.join(".wslconfig:note"), "keep").expect("write stream");
+        let e = enable_virtiofs_at(&d.file()).expect_err("must refuse");
+        assert_eq!(e.code(), WinErrorCode::PermissionDenied);
+        assert_eq!(
+            e.message(),
+            ".wslconfig has named streams that cannot be preserved; refusing to replace it"
+        );
+        assert_eq!(
+            std::fs::read(d.file()).expect("read"),
+            b"[wsl2]\nmemory=4GB\n"
+        );
+        assert_eq!(
+            std::fs::read(d.0.join(".wslconfig:note")).expect("read stream"),
+            b"keep"
+        );
+        assert_eq!(d.entries(), vec![".wslconfig".to_string()]);
+    }
+
     /// WIN-2（レビュー指摘 P1）: 読み込み後に DACL が変えられたら、置換直前の確認で INTERNAL で拒否する（Windows）。
     #[cfg(windows)]
     #[test]

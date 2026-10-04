@@ -1,13 +1,15 @@
 //! fandhe-container-platform-macos: macOS Virtualization.framework 経由の VM 起動・VirtioFS（MAC-1）。
 //!
-//! 現状は TASK-64.1 で依存と cfg ガードの骨格を置いただけで、VM 設定・デバイス・ライフサイクル・
-//! エラー型は TASK-64.2〜64.5 で実装する（REPAIR-3: 実装済みを装わない）。
+//! 現状は VM 設定（`config`。TASK-64.2）まで実装済みで、デバイス・ライフサイクル・エラー型統合は
+//! TASK-64.3〜64.5 で実装する（REPAIR-3: 実装済みを装わない）。
 //!
-//! - プラットフォーム対応: macOS 固有のモジュール・依存は `cfg(target_os = "macos")` で局所化し、
-//!   非 macOS では platform モジュールを持たない空実装になる（CLI-1）。
+//! - プラットフォーム対応: OS 非依存の検証ロジックは全 OS でビルドし 3 OS CI でテストする。
+//!   Virtualization.framework 呼び出し（`sys`・構築関数）のみ `cfg(target_os = "macos")` で局所化する（CLI-1）。
 //! - 実行前提: `com.apple.security.virtualization` entitlement とコード署名（ad-hoc 可）、最低 macOS 13。
 //! - 呼び出し文脈: 実行時は `fandhe-container-plugin-macos`（TASK-115）が本 crate を別プロセスとして動かす。
 //!   PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
+
+pub mod config;
 
 #[cfg(target_os = "macos")]
 mod sys;

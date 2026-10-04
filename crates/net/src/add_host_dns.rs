@@ -216,6 +216,11 @@ impl AddHostEntry {
         })
     }
 
+    /// 検証済みの hostname と IP から組み立てる（`etc_hosts` の静的注入が再利用する。TASK-146.1）。
+    pub(crate) fn from_parts(host: HostName, ip: IpAddr) -> Self {
+        Self { host, ip }
+    }
+
     /// 検証済み hostname。
     pub fn host(&self) -> &HostName {
         &self.host
@@ -288,6 +293,27 @@ pub fn append_add_hosts(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (managed_root, hosts_rel);
+        Err(NetError::new(
+            NetErrorCode::Unimplemented,
+            "appending to hosts file is only supported on Linux",
+        ))
+    }
+}
+
+/// 描画済みの hosts 行を既存の追記経路（`hosts_file::append_lines`）へ渡す（`etc_hosts` の静的注入用。
+/// TASK-146.1・#334・NET-8）。行は検証済みの型から描画したものに限る。非 Linux は `UNIMPLEMENTED`。
+pub(crate) fn append_hosts_lines(
+    managed_root: &Path,
+    hosts_rel: &Path,
+    lines: &str,
+) -> Result<(), NetError> {
+    #[cfg(target_os = "linux")]
+    {
+        hosts_file::append_lines(managed_root, hosts_rel, lines)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (managed_root, hosts_rel, lines);
         Err(NetError::new(
             NetErrorCode::Unimplemented,
             "appending to hosts file is only supported on Linux",

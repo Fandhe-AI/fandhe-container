@@ -25,6 +25,11 @@
 //! - 起動・停止の成否と所要時間は [`NetOpRecorder`] へ記録する（REPAIR-4。`NetOpKind::DnsHelperStart` / `DnsHelperStop`）
 //! - ネットワーク数・参加数は上限つき（DoS 対策）。エラー文言にネットワーク名・endpoint・アドレス・pid を含めない
 //!
+//! # 軽量運用（NET-8・TASK-146.1・#334）
+//! `CreatedNetwork` を持つ呼び出し側は [`DnsHelperRefCounts::join_network`] を使う。名前解決方式が
+//! `StaticHosts` のネットワークではヘルパーを起動せず（[`JoinOutcome::HelperDisabled`]）、サービス名は
+//! `etc_hosts` の静的注入で解決する。
+//!
 //! # 実機結合テスト
 //! 実ネットワーク上のオンデマンド起動・終了は `crates/net/tests/dns_helper_ondemand_privileged.rs`
 //! （TASK-144.2・#330。root 前提で `-- --ignored` 指定時のみ実行）で確かめる。実機での実証は TASK-145。
@@ -46,7 +51,7 @@ use super::{
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
-use crate::network::{EndpointId, NetworkName};
+use crate::network::{CreatedNetwork, EndpointId, NetworkName};
 
 /// 同時に管理するネットワーク数の上限（無制限確保の防止）。
 pub const MAX_TRACKED_NETWORKS: usize = 1024;
@@ -137,6 +142,8 @@ pub enum JoinOutcome {
         /// 現在の人数。
         members: usize,
     },
+    /// ネットワークが軽量運用（`NameResolution::StaticHosts`）のため何もしなかった（NET-8・TASK-146.1）。
+    HelperDisabled,
 }
 
 /// [`DnsHelperRefCounts::leave`] の結果。
@@ -227,6 +234,26 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
         record_net_op(self.recorder.as_ref(), NetOpKind::DnsHelperStop, || {
             self.launcher.stop(handle)
         })
+    }
+
+    /// `CreatedNetwork` を持つ呼び出し側の入口。ネットワークの名前解決方式が軽量運用
+    /// （[`NameResolution::StaticHosts`]。NET-8・TASK-146.1・#334）なら、ロックも launcher も触らず
+    /// [`JoinOutcome::HelperDisabled`] を返す（参照カウントによるオンデマンド起動を発動させない）。
+    /// それ以外は gateway:53 を待受先として [`DnsHelperRefCounts::join`] へ委譲する。
+    ///
+    /// 生の `join` はモードを知らないため、`CreatedNetwork` を持つ呼び出し側は本メソッドを使い、
+    /// 軽量運用のネットワークへ `join` を直接呼ばないこと。離脱は `leave` をそのまま使える
+    /// （未参加なら `NotMember` で冪等）。
+    pub fn join_network(
+        &self,
+        net: &CreatedNetwork,
+        endpoint: &EndpointId,
+    ) -> Result<JoinOutcome, NetError> {
+        if !net.name_resolution.uses_dns_helper() {
+            return Ok(JoinOutcome::HelperDisabled);
+        }
+        let listen = DnsListenAddr::for_network(net)?;
+        self.join(&net.name, listen, endpoint)
     }
 
     /// ネットワークへ参加する。0→1 のときだけヘルパーを起動する（失敗時は何も記録しない）。
@@ -379,6 +406,7 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::etc_hosts::NameResolution;
     use crate::instrument::NetOpOutcome;
     use crate::instrument::testing::Collect;
     use std::net::Ipv4Addr;
@@ -459,6 +487,60 @@ mod tests {
     }
     fn n(v: &AtomicUsize) -> usize {
         v.load(Ordering::SeqCst)
+    }
+
+    fn created_net(res: NameResolution) -> CreatedNetwork {
+        use crate::netlink_route::{IfIndex, IpPrefix};
+        use crate::network::NetworkResourceNames;
+        let name = net("web");
+        let names = NetworkResourceNames::derive(&name).expect("names");
+        CreatedNetwork {
+            name,
+            bridge: names.bridge().clone(),
+            bridge_index: IfIndex::new(7).expect("ifindex"),
+            bridge_token: "fandhe-net:web:1:0:0".to_owned(),
+            table: names.table().clone(),
+            gateway: IpPrefix::new(std::net::IpAddr::V4(Ipv4Addr::new(10, 89, 0, 1)), 24)
+                .expect("gateway"),
+            name_resolution: res,
+        }
+    }
+
+    /// NET-8・NET-7・TASK-146.1: 軽量運用のネットワークでは join_network がヘルパーを起動しない。
+    #[test]
+    fn net8_static_hosts_network_never_starts_helper() {
+        let rc = DnsHelperRefCounts::new(Fake::default());
+        let nw = created_net(NameResolution::StaticHosts);
+        for id in ["c1", "c2"] {
+            assert_eq!(
+                rc.join_network(&nw, &ep(id)).expect("join"),
+                JoinOutcome::HelperDisabled
+            );
+        }
+        assert_eq!(n(&rc.launcher.starts), 0);
+        assert!(!rc.is_running(&nw.name));
+        assert_eq!(rc.members(&nw.name), 0);
+        assert_eq!(rc.bound_addr(&nw.name), None);
+        assert_eq!(
+            rc.leave(&nw.name, &ep("c1")).expect("leave"),
+            LeaveOutcome::NotMember
+        );
+    }
+
+    /// NET-7・TASK-146.1: 既定（DnsHelper）のネットワークでは従来どおり起動する。
+    #[test]
+    fn net7_dns_helper_network_starts_via_join_network() {
+        let rc = DnsHelperRefCounts::new(Fake::default());
+        let nw = created_net(NameResolution::DnsHelper);
+        assert_eq!(
+            rc.join_network(&nw, &ep("c1")).expect("join"),
+            JoinOutcome::Started
+        );
+        assert_eq!(n(&rc.launcher.starts), 1);
+        assert_eq!(
+            rc.bound_addr(&nw.name),
+            Some(SocketAddrV4::new(Ipv4Addr::new(10, 89, 0, 1), 53))
+        );
     }
 
     /// NET-7: 0→1 で起動がちょうど 1 回。

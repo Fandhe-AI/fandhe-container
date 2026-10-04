@@ -370,14 +370,21 @@ fn exec_argv(distro: &DistroName, cmd: &[&str]) -> Vec<String> {
 /// 差し替えて検証外の場所へ root でマウントさせられる（TOCTOU）。そのため全工程を単一プロセスに拘束し、
 /// 検証から `mount` までの窓を最小にする。位置引数は `$1`=ホストディレクトリ・`$2`=マウント名・`$3`=オプション
 /// （固定スクリプトに値を埋め込まず引数で渡すため、シェルのインジェクションは起きない。入力は検証済み newtype）。
-/// 終了コード: 70=`/mnt` が実ディレクトリでない・71=ディレクトリ作成失敗・72=パス要素が symlink / 非 root 所有 /
-/// 他者書き込み可。`mount` 自身の失敗はその終了コード（64 以下）をそのまま返す。
+/// 終了コード: 70=`/`・`/mnt` が root 所有の他者書き込み不可な実ディレクトリでない・71=ディレクトリ作成失敗・
+/// 72=パス要素が symlink / 非 root 所有 / 他者書き込み可。`mount` 自身の失敗はその終了コード（64 以下）をそのまま返す。
 /// 検証は symlink 非追従（`-L`）と `stat` の生モード（`%f`。ロケール非依存）で行う。
+///
+/// `/` からマウント先までの全要素が「root 所有・group / other 書き込み不可・symlink でない」ことを確かめるため、
+/// 検証後に要素を差し替えられる（rename・symlink への置換）のはゲスト内の root（uid 0）に限られる。ゲスト内 root は
+/// マウントの付け外しやこのシェルへの介入も自由にできる信頼境界の内側であり、本スクリプトが防ぐ対象は非特権の
+/// プロセスによる差し替えである。ディレクトリをハンドル（fd・cwd）で固定してマウントする方式は、WSL の
+/// `mount.drvfs` ヘルパーの挙動が実機未検証のため採らない（TASK-67.6・#377 で再検討する。REPAIR-3）。
 const MOUNT_SCRIPT: &str = concat!(
     "set -eu; B=/mnt/fandhe; ",
     "chk() { [ ! -L \"$1\" ] && [ -d \"$1\" ] || return 1; ",
     "set -- $(stat -c '%u %f' -- \"$1\"); ",
     "[ \"$1\" = 0 ] && [ $((0x$2 & 18)) -eq 0 ]; }; ",
+    "chk / || exit 70; ",
     "chk /mnt || exit 70; ",
     "[ -L \"$B\" ] || [ -e \"$B\" ] || mkdir -m 755 -- \"$B\" || exit 71; ",
     "chk \"$B\" || exit 72; ",
@@ -412,8 +419,29 @@ fn mount_argv(distro: &DistroName, m: &SharedMount) -> Vec<String> {
     )
 }
 
-fn umount_argv(distro: &DistroName, guest_path: &str) -> Vec<String> {
-    exec_argv(distro, &["umount", guest_path])
+/// ゲスト内で「マウント先の最上位のマウント ID が記録値と一致するか確認 → umount」を 1 つの `sh` プロセスで行う
+/// スクリプト。
+///
+/// 確認と `umount` を別々の `wsl.exe` 呼び出しに分けると、その隙間に別のマウントが同じマウント先へ積まれ、
+/// 確認した自分のマウントではなく他者のマウントを外しうる。そのため [`MOUNT_SCRIPT`] と同様に単一プロセスへ拘束し、
+/// 窓を最小にする。位置引数は `$1`=マウント先（固定基底配下の検証済み名で、mountinfo の 8 進エスケープを含まない）・
+/// `$2`=記録したマウント ID。mountinfo の 1 列目（マウント ID）と 5 列目（マウント先）だけを `read` で読む
+/// （awk 等に依存しない）。終了コード 73=最上位が記録したマウントでない（外さない）。それ以外は `umount` の
+/// 終了コード（64 以下）。残る窓（同一プロセス内の確認から `umount` まで）に同じマウント先へマウントできるのは
+/// ゲスト内の root（CAP_SYS_ADMIN）に限られ、[`MOUNT_SCRIPT`] と同じく信頼境界の内側として扱う。
+const UMOUNT_SCRIPT: &str = concat!(
+    "set -u; top=; ",
+    "while read -r id _ _ _ mp _; do if [ \"$mp\" = \"$1\" ]; then top=$id; fi; done < /proc/self/mountinfo; ",
+    "[ \"$top\" = \"$2\" ] || exit 73; ",
+    "exec umount \"$1\""
+);
+
+fn umount_argv(distro: &DistroName, guest_path: &str, mount_id: u32) -> Vec<String> {
+    let id = mount_id.to_string();
+    exec_argv(
+        distro,
+        &["sh", "-c", UMOUNT_SCRIPT, "sh", guest_path, id.as_str()],
+    )
 }
 
 fn mountinfo_argv(distro: &DistroName) -> Vec<String> {
@@ -599,8 +627,10 @@ struct OwnedMount {
 /// 本呼び出しが成立させたマウントを逆順に best-effort で外す。失敗件数を返す。
 ///
 /// 解除の直前に mountinfo を読み直し、マウント先の最上位エントリが記録したマウント ID と一致する場合に限り
-/// `umount` する。一致しない（他プロセスが差し替えた・既に外れている）場合は他者のマウントを外さないよう
-/// 何もしない。mountinfo を読めない場合は所有を確認できないため外さず、失敗として数える。
+/// `umount` する。`umount` は [`UMOUNT_SCRIPT`] がゲスト内で同じ照合をやり直してから行う（照合と解除の間に
+/// 積まれた他者のマウントを外さない。不一致の終了コード 73 は `umount` の失敗と同様に読み直して判定する）。
+/// 一致しない（他プロセスが差し替えた・既に外れている）場合は他者のマウントを外さないよう何もしない。
+/// mountinfo を読めない場合は所有を確認できないため外さず、失敗として数える。
 /// 記録したマウント ID がマウント先の最上位でなくても mountinfo のどこか（他者が移動した別のマウント先を含む）に
 /// 残っている場合は、他者のマウントを外せず自分のマウントが残置されるため、未解除として失敗に数える
 /// （呼び出し側が後始末を追跡できるようにする）。記録したマウント ID が mountinfo のどこにも存在しなければ
@@ -619,7 +649,10 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> usize 
         match find_mount(&entries, &o.guest_path) {
             Some(e) if e.mount_id == o.mount_id => {
                 let ok = matches!(
-                    exec(&umount_argv(distro, &o.guest_path), MAX_OUTPUT_BYTES),
+                    exec(
+                        &umount_argv(distro, &o.guest_path, o.mount_id),
+                        MAX_OUTPUT_BYTES
+                    ),
                     Ok(out) if out.success
                 );
                 let gone = ok

@@ -129,6 +129,12 @@ mod tests {
         assert_eq!(root.mount_on, b"/".to_vec());
         let dev = mount_identity(Path::new("/dev")).expect("statfs dev");
         assert_eq!(dev.mount_on, b"/dev".to_vec());
+        assert_eq!(dev.fs_type(), b"devfs");
+        assert_eq!(
+            bytes_until_nul(&[b'h' as c_char, b's' as c_char, 0, b'x' as c_char]),
+            b"hs"
+        );
+        assert_eq!(bytes_until_nul(&[b'a' as c_char; 3]), b"aaa");
         assert_ne!(root, dev);
         let err = mount_identity(Path::new("/nonexistent-fandhe-mount-test")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);

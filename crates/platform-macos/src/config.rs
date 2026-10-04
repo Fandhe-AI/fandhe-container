@@ -2351,6 +2351,34 @@ mod tests {
             ConfigError::SharedDirIsRoot.to_string(),
             "config.shared_dir_is_root: sharing the filesystem root is not allowed"
         );
+        let e = ConfigError::SharedDirHardlinkedFile {
+            path: PathBuf::from("/s/f"),
+            links: 2,
+            share_dir: PathBuf::from("/s"),
+        };
+        assert_eq!(
+            e.to_string(),
+            "config.shared_dir_hardlinked_file: read-write shared directory /s contains a hard-linked file (2 links): /s/f"
+        );
+        let e = ConfigError::SharedDirSpecialFile {
+            path: PathBuf::from("/s/p"),
+            kind: SpecialFileKind::Fifo,
+            share_dir: PathBuf::from("/s"),
+        };
+        assert_eq!(
+            e.to_string(),
+            "config.shared_dir_special_file: read-write shared directory /s contains a fifo: /s/p"
+        );
+        assert_eq!(SpecialFileKind::CharDevice.as_str(), "character device");
+        assert_eq!(SpecialFileKind::BlockDevice.as_str(), "block device");
+        let e = ConfigError::SharedDirUnsupportedFilesystem {
+            fs_type: "hfs".to_string(),
+            share_dir: PathBuf::from("/s"),
+        };
+        assert_eq!(
+            e.to_string(),
+            "config.shared_dir_unsupported_filesystem: read-write shared directory /s is on a hfs filesystem, which allows directory hard links"
+        );
         let e = ConfigError::SharedDirSymlinkEscapes {
             path: PathBuf::from("/s/link"),
             share_dir: PathBuf::from("/s"),
@@ -2567,6 +2595,116 @@ broken line
             reject_mounts_under(Path::new("/")),
             Err(ConfigError::SharedDirCrossesMount { .. })
         ));
+    }
+
+    /// MAC-1・TASK-65.1: 保護入力でなくても、ReadWrite 共有配下のリンク数 2 以上の通常ファイルは
+    /// 拒否する（共有範囲外のリンク・共有内だけのリンクとも）。ReadOnly 共有は対象外。
+    #[cfg(unix)]
+    #[test]
+    fn rejects_read_write_share_with_hardlinked_file() {
+        use crate::virtiofs::{ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
+        let t = TempDir::new("share-nlink");
+        let real = std::fs::canonicalize(&t.0).unwrap();
+        let outside = real.join("outside");
+        let shared = real.join("shared");
+        std::fs::create_dir_all(shared.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let k = outside.join("vmlinux");
+        std::fs::write(&k, b"k").unwrap();
+        let spec_for = |access| {
+            VmConfigSpec::from_parts(&k, None, "console=hvc0")
+                .unwrap()
+                .with_shared_directories(
+                    VirtiofsSharesSpec::try_new(vec![VirtiofsShareSpec::new(
+                        VirtiofsTag::try_new("s").unwrap(),
+                        SharedDirectoryPath::try_new(&shared).unwrap(),
+                        access,
+                    )])
+                    .unwrap(),
+                )
+        };
+        let rw = spec_for(ShareAccess::ReadWrite);
+        let ro = spec_for(ShareAccess::ReadOnly);
+
+        // 共有範囲外の（保護入力でない）ファイルへのハードリンク。
+        let store = outside.join("store-file");
+        std::fs::write(&store, b"s").unwrap();
+        let link = shared.join("sub").join("from-store");
+        std::fs::hard_link(&store, &link).unwrap();
+        let err = rw.check_share_conflicts().unwrap_err();
+        assert_eq!(err.code(), "config.shared_dir_hardlinked_file");
+        assert_eq!(
+            err,
+            ConfigError::SharedDirHardlinkedFile {
+                path: link.clone(),
+                links: 2,
+                share_dir: shared.clone(),
+            }
+        );
+        ro.check_share_conflicts().unwrap();
+        std::fs::remove_file(&link).unwrap();
+        rw.check_share_conflicts().unwrap();
+
+        // 共有内だけで完結するハードリンクも、他のリンクの位置を確かめないため拒否する（3 リンク）。
+        let a = shared.join("a");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::hard_link(&a, shared.join("sub").join("b")).unwrap();
+        std::fs::hard_link(&a, shared.join("sub").join("c")).unwrap();
+        let err = rw.check_share_conflicts().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::SharedDirHardlinkedFile { links: 3, .. }
+        ));
+    }
+
+    /// MAC-1・TASK-65.1: 特殊ファイルの判定（キャラクタデバイス・FIFO は拒否、ディレクトリは対象外）と、
+    /// ReadWrite 共有配下のソケットを許可することを確認する。デバイスノードの作成には root が要り、
+    /// FIFO の作成（`mkfifo`）は std に無く子プロセスを起こすと並行テストの fd（ロック）を fork で一時的に
+    /// 引き継いでしまうため、判定は `/dev/null` と `std::io::pipe` の読み出し端（`/dev/fd/N`）で行う。
+    #[cfg(unix)]
+    #[test]
+    fn classifies_special_files_and_allows_sockets_in_share() {
+        use crate::virtiofs::{ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
+        let t = TempDir::new("sp");
+        let real = std::fs::canonicalize(&t.0).unwrap();
+        let shared = real.join("sh");
+        std::fs::create_dir_all(&shared).unwrap();
+        let k = real.join("vmlinux");
+        std::fs::write(&k, b"k").unwrap();
+        let rw = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_shared_directories(
+                VirtiofsSharesSpec::try_new(vec![VirtiofsShareSpec::new(
+                    VirtiofsTag::try_new("s").unwrap(),
+                    SharedDirectoryPath::try_new(&shared).unwrap(),
+                    ShareAccess::ReadWrite,
+                )])
+                .unwrap(),
+            );
+
+        let null = std::fs::symlink_metadata("/dev/null").unwrap();
+        assert_eq!(
+            special_file_kind(&null.file_type()),
+            Some(SpecialFileKind::CharDevice)
+        );
+        let dir = std::fs::symlink_metadata(&shared).unwrap();
+        assert_eq!(special_file_kind(&dir.file_type()), None);
+        {
+            use std::os::fd::AsRawFd;
+            let (reader, _writer) = std::io::pipe().unwrap();
+            // `/dev/fd/N` は fd の実体（ここでは pipe = FIFO）を返す（Linux・macOS 共通）。
+            let fifo = std::fs::metadata(format!("/dev/fd/{}", reader.as_raw_fd())).unwrap();
+            assert_eq!(
+                special_file_kind(&fifo.file_type()),
+                Some(SpecialFileKind::Fifo)
+            );
+        }
+
+        // ソケットは許可する（open(2) は ENXIO で、FUSE に connect 相当の要求は無い）。
+        // macOS の `sun_path` は 104 バイトのため、一時ディレクトリ配下でも収まる短い名前にする。
+        let sock = shared.join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        rw.check_share_conflicts().unwrap();
     }
 
     /// MAC-1・TASK-65.1: HFS+（`hfs`）上の共有はディレクトリのハードリンクを見分けられないため拒否する。

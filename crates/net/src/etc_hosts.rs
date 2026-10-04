@@ -13,7 +13,7 @@
 //! 3. `DnsHelperRefCounts::join_network`（`JoinOutcome::HelperDisabled` になりヘルパーは起動しない）
 //! 4. コンテナ起動直前に [`inject_service_hosts`]（参加者全員の名前とアドレスを渡す）
 //! 5. 同じく起動直前に `--dns` があれば [`apply_static_dns`]（runtime が用意した `resolv.conf` のパスへ
-//!    `nameserver` を直接書く。NET-8・TASK-146.2・#336。指定サーバーへの到達確認は #337・TASK-146.3）
+//!    `nameserver` を直接書く。NET-8・TASK-146.2・#336。指定サーバーへの到達確認は実機前提テスト `tests/static_dns_privileged.rs`。#337・TASK-146.3）
 //!
 //! hosts ファイルの生成とコンテナへの bind mount は runtime / core の責務で、本モジュールは管理ルート配下の
 //! 既存の通常ファイルへ追記するだけ。書き込みは `--add-host`（NET-12・TASK-185.2）と同じ追記経路

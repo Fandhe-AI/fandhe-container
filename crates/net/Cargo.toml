@@ -106,3 +106,11 @@ harness = false
 name = "etc_hosts_privileged"
 path = "tests/etc_hosts_privileged.rs"
 harness = false
+
+# 軽量運用（StaticHosts）の bridge ネットワークで --dns の値が resolv.conf へ直接書かれ、コンテナからのクエリが
+# 指定サーバーへ直接到達することの実機前提テスト（NET-8・NET-12・TASK-146.3・#337）。子の再入（--inner / --probe）と
+# root 前提の分離のため harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "static_dns_privileged"
+path = "tests/static_dns_privileged.rs"
+harness = false

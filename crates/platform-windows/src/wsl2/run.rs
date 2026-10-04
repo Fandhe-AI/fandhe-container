@@ -381,6 +381,18 @@ mod tests {
                 use std::io::Write;
                 let _ = std::io::stdout().write_all(&vec![b'x'; 100_000]);
             }
+            // 孫（`sleep`）を起動して即座に終了する。孫は stdout / stderr（`run_capture` のパイプ）を
+            // 継承して握り続けるので、親の終了後もパイプは EOF にならない。
+            Ok("orphan") => {
+                let exe = std::env::current_exe().unwrap();
+                let grandchild = Command::new(exe)
+                    .args(["--exact", HELPER, "--nocapture", "--test-threads=1"])
+                    .env(ENV_MODE, "sleep")
+                    .stdin(Stdio::null())
+                    .spawn();
+                // 孫の回収は行わずに終了する（親が先に終了する状況を作るため）。
+                std::mem::forget(grandchild);
+            }
             _ => {}
         }
     }
@@ -403,6 +415,36 @@ mod tests {
         let e = run_helper("sleep", Duration::from_millis(500), 65536).unwrap_err();
         assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
         assert!(start.elapsed() < Duration::from_secs(30));
+    }
+
+    /// REPAIR-5: 親（`wsl.exe` 相当）が先に終了し、パイプを継承した孫が残っても、期限切れで Job ごと
+    /// 終了させて読み取りスレッドを有限時間で終わらせる（PID 指定の `taskkill /T` では終了済みの
+    /// 親から孫を辿れず、スレッドが残っていた）。Job Object は Windows の機構なので Windows で検証する。
+    #[cfg(windows)]
+    #[test]
+    fn orphaned_grandchild_is_terminated_with_job() {
+        static READERS: AtomicUsize = AtomicUsize::new(0);
+        let exe = std::env::current_exe().unwrap();
+        let timeout = Duration::from_secs(5);
+        let start = Instant::now();
+        let e = run_capture_in(
+            &READERS,
+            &exe,
+            &["--exact", HELPER, "--nocapture", "--test-threads=1"],
+            &[(ENV_MODE, "orphan")],
+            timeout,
+            65536,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert!(start.elapsed() < timeout + REAP_TIMEOUT + Duration::from_secs(10));
+        // 孫が終了すれば両パイプが EOF になり、2 本の読み取りスレッドが終わってカウントが 0 に戻る。
+        // 孫は 60 秒眠るので、Job で終了させなければ以下の 10 秒以内に 0 にはならない。
+        let wait_deadline = Instant::now() + Duration::from_secs(10);
+        while READERS.load(Ordering::SeqCst) != 0 && Instant::now() < wait_deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(READERS.load(Ordering::SeqCst), 0);
     }
 
     /// REPAIR-5: 出力が上限を超えたら RESOURCE_EXHAUSTED。

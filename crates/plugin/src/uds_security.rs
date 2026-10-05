@@ -81,7 +81,7 @@
 //!   user namespace 外の uid は overflowuid として見え、不一致で拒否される（安全側）。
 //! - 同一 UID の別プロセスは脅威モデル外（第 1 層は 0700 の配置ディレクトリ）。
 //! - `unsafe` を含む取得処理は `crate::sys::peer_uid`（`sys` モジュール）に閉じる。
-//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。別 UID 接続拒否の結合試験は `tests/peer_auth.rs`（TASK-124.4・#295。実機前提の 2 件は人間が実行）。拒否 1 件ごとの監査イベント通知は `crate::audit`（TASK-124.5・#1388・SEC-4）。永続的な監査ログへの配線は core 側 proxy（TASK-114）で未実装（REPAIR-3）。
+//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。別 UID 接続拒否の結合試験は `tests/peer_auth.rs`（TASK-124.4・#295。実機前提の 2 件は人間が実行）。accept / connect で最初の読み書きより前に検証する順序は `transport::tests::plug12_order` で機械照合する（TASK-124.6・#1389）。拒否 1 件ごとの監査イベント通知は `crate::audit`（TASK-124.5・#1388・SEC-4）。永続的な監査ログへの配線は core 側 proxy（TASK-114）で未実装（REPAIR-3）。
 //!
 //! # Windows に固有の peer 認証を持たない理由（WIN-1・PLUG-12。TASK-124.3・#294）
 //! 「未実装の残件」ではなく、設計上この crate に Win32 向け実装を置かない判断である。

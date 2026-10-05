@@ -1,5 +1,9 @@
 //! UDS の peer credential 認証の結合試験（PLUG-12。TASK-124.4・#295）。
 //!
+//! TASK-124.6（#1389）: 拒否時に先送りフレームを読まない・送らない順序の照合は cfg(test) の入口が
+//! 必要なため、crate 内ユニットテスト（`transport::tests::plug12_order`）で行う。本ファイルは
+//! 公開 API で、accept 前に届いたフレームが accept で消費されないことだけを確認する。
+//!
 //! 公開 API（`UdsListener::accept`・`UdsStream::connect`）を通して、同一 UID は受理・別 UID は拒否
 //! されることを確認する。検証本体は `uds_security::verify_peer`（Linux は SO_PEERCRED、macOS は
 //! getpeereid。TASK-124.1・TASK-124.2）で、accept / connect の直後に呼ばれる。
@@ -117,6 +121,29 @@ mod unix {
         let dir = TempDir::new();
         let l = UdsListener::bind(&dir.sock()).unwrap();
         assert_same_uid_roundtrip(&l);
+    }
+
+    /// PLUG-12・TASK-124.6: accept より前に client が送ったフレームは、検証経路で消費されず
+    /// 受理後の最初のフレームとして読める。
+    #[test]
+    fn plug12_accept_does_not_consume_frame_sent_before_accept() {
+        let dir = TempDir::new();
+        let l = UdsListener::bind(&dir.sock()).unwrap();
+        let rpc = RpcTimeout::new(WAIT).unwrap();
+        let path = l.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let mut c = UdsStream::connect(&path, WAIT).unwrap();
+            c.write_frame(&encode_message(&msg(1, false, "early")).unwrap(), rpc)
+                .unwrap();
+            tx.send(()).unwrap();
+            c
+        });
+        rx.recv_timeout(WAIT).unwrap();
+        let mut s = l.accept(WAIT).unwrap();
+        let req = decode_message::<String>(&s.read_frame(rpc).unwrap()).unwrap();
+        assert_eq!(req, msg(1, false, "early"));
+        drop(h.join().unwrap());
     }
 
     /// 実機前提テストの fixture パスを環境変数から取る。未設定・相対パスは skip せず panic する。

@@ -14,8 +14,10 @@
 //! - macOS: `getpeereid(2)`（TASK-124.2・#293。`LOCAL_PEERCRED` の `struct xucred` を自前で写さず libSystem の
 //!   安定 ABI に乗り、arch 依存定数を持たないため `target_arch` 分岐は不要。Linux の `SO_PEERCRED` と同じ
 //!   「接続時点の実効 uid」を返す共通インターフェース）
-//! - いずれの unix: `fchmodat(2)`（`AT_SYMLINK_NOFOLLOW`。Linux の `fchmodat2` 非対応環境は `O_PATH` fd 経由へ縮退）・`unlinkat(2)` を検証済みディレクトリ fd
-//!   基準で呼ぶ（パス再解決による TOCTOU を避ける。PLUG-12）
+//! - Linux・macOS: `fchmodat(2)`（`AT_SYMLINK_NOFOLLOW`。Linux の `fchmodat2` 非対応環境は `O_PATH` fd 経由へ縮退）を
+//!   検証済みディレクトリ fd 基準で呼ぶ（パス再解決による TOCTOU を避ける。PLUG-12）。それ以外の unix は
+//!   `mode_t` の幅・`AT_SYMLINK_NOFOLLOW` の値を持たないため `fchmodat` を呼ばず `Unsupported`（fail-closed。#1308）
+//! - いずれの unix: `unlinkat(2)` を検証済みディレクトリ fd 基準で呼ぶ（OS 依存の型・定数を使わず flags は 0 固定。PLUG-12）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_NOFOLLOW | O_DIRECTORY)` で配置ディレクトリを
 //!   ルートから 1 要素ずつ辿る（祖先要素の symlink を拒否。PLUG-12）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_CREAT | O_NOFOLLOW)` で bind ロックファイルを開く
@@ -30,6 +32,9 @@
 //!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
+//! - OS ごとに値・幅が異なる定数・型（`ModeT`・`AT_SYMLINK_NOFOLLOW`・`O_*` 等）は対応 OS ごとに個別定義し、
+//!   対応外 OS 向けの仮置き（他 OS の値の流用）を置かない。値を持たない OS の経路は `Unsupported` で fail-closed
+//!   （誤った flags で symlink を追従する経路を作らない。PLUG-12・#1308）
 
 #![cfg(unix)]
 
@@ -57,21 +62,23 @@ pub(crate) fn effective_uid() -> u32 {
 type ModeT = u32;
 #[cfg(target_os = "macos")]
 type ModeT = u16;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-type ModeT = u32;
+// 対応外 OS（Linux・macOS 以外）向けの定義は置かない。値・幅が OS ごとに違い、流用すると
+// symlink 追従の flags になり得るため、その経路は `fchmodat_nofollow` が `Unsupported` を返す（PLUG-12・#1308）。
 
 #[cfg(target_os = "linux")]
 const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 #[cfg(target_os = "macos")]
 const AT_SYMLINK_NOFOLLOW: i32 = 0x20;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: POSIX の `int fchmodat(int, const char *, mode_t, int)` と
     // 同じ型・幅（`mode_t` は Linux で `u32`、macOS で `u16`。上の `ModeT`）。
     #[link_name = "fchmodat"]
     fn c_fchmodat(dirfd: i32, path: *const core::ffi::c_char, mode: ModeT, flags: i32) -> i32;
+}
+
+unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: POSIX の `int unlinkat(int, const char *, int)` と同じ型・幅。
     #[link_name = "unlinkat"]
     fn c_unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
@@ -83,7 +90,9 @@ unsafe extern "C" {
 /// まず `fchmodat(AT_SYMLINK_NOFOLLOW)` を試す。この flags は Linux 6.6 の `fchmodat2` に依存し、
 /// 古いカーネル・libc（musl 等）では `ENOSYS` / `EOPNOTSUPP` / `EINVAL` で失敗するため、Linux では
 /// その場合に限り [`fchmodat_via_opath`] へ縮退する（symlink 防御は保ったまま古い環境でも bind 可能にする）。
-/// 縮退できない環境・OS はそのままエラー（fail-closed）。
+/// 縮退できない環境はそのままエラー（fail-closed）。Linux・macOS 以外の unix は `mode_t` の幅・
+/// `AT_SYMLINK_NOFOLLOW` の値を持たないため `fchmodat` を呼ばず `Unsupported` を返す（fail-closed。#1308）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn fchmodat_nofollow(dir: &File, name: &CStr, mode: u32) -> io::Result<()> {
     let mode = ModeT::try_from(mode).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: fd は `&File` の借用中のため有効。`name` は NUL 終端の有効な C 文字列。
@@ -103,6 +112,13 @@ pub(crate) fn fchmodat_nofollow(dir: &File, name: &CStr, mode: u32) -> io::Resul
         }
     }
     Err(err)
+}
+
+/// Linux・macOS 以外の unix 向け。`fchmodat` を呼ばず `Unsupported` を返す（fail-closed。#1308）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn fchmodat_nofollow(dir: &File, name: &CStr, mode: u32) -> io::Result<()> {
+    let _ = (dir, name, mode);
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// `fchmodat2` 非対応環境向けの縮退実装（Linux のみ）。`name` を `O_PATH | O_NOFOLLOW` で開き、
@@ -1243,4 +1259,35 @@ pub(crate) fn resident_size_bytes(pid: u32) -> io::Result<u64> {
     // SAFETY: 戻り値が構造体サイズと一致したため、カーネルが全フィールドを書き込み済み。
     let info = unsafe { info.assume_init() };
     Ok(info.pti_resident_size)
+}
+
+/// PLUG-12・#1308: Linux・macOS 以外の OS 向けに他 OS の値を流用した仮置きの `const` / `type` を
+/// 置かないことをソース照合で保証する（対応外 OS は CI で実行できないための機械照合。REPAIR-12）。
+#[cfg(test)]
+mod placeholder_tests {
+    #[test]
+    fn plug12_no_placeholder_constants_for_unsupported_os() {
+        let src = include_str!("sys.rs");
+        let lines: Vec<&str> = src.lines().map(str::trim_start).collect();
+        let neg = concat!("#[cfg(", "not(any(target_os");
+        let mut found = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if !l.starts_with(neg) {
+                continue;
+            }
+            // 属性行（複数行の場合あり）を飛ばして直後の item を調べる。
+            let item = lines[i + 1..].iter().find(|n| {
+                !n.starts_with(')')
+                    && !n.starts_with("target_os")
+                    && !n.starts_with("any(")
+                    && !n.starts_with("#[")
+            });
+            if let Some(n) = item
+                && (n.starts_with("const ") || n.starts_with("type ") || n.starts_with("static "))
+            {
+                found.push(i + 1);
+            }
+        }
+        assert_eq!(found, Vec::<usize>::new());
+    }
 }

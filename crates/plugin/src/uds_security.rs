@@ -57,6 +57,26 @@
 //!   親が 0700 かつ自 UID 所有のため、bind から 0600 化までの mode 差は他 UID から到達できない。
 //! - [`RuntimeDir::socket_path`] が socket 名の検証と `sun_path` 長検証を bind 前に行う（#288）。
 //!
+//! # 都度起動の残骸の掃除（#1310・PLUG-7・PLUG-12・REPAIR-5・TASK-110.1）
+//! 都度起動（`call_once`）は呼び出しごとに `oneshot-<pid>-<連番>.sock` を bind する。core 側が SIGKILL 等で
+//! 異常終了すると socket と記録つきロックファイルが残り、名前が一意なため同名の再 bind（bind 前の stale
+//! 削除。TASK-123.2）が起きず、runtime directory に溜まり続ける。[`RuntimeDir::sweep_one_shot_leftovers`] が
+//! これを掃除する。
+//! - 呼ぶ時機: runtime directory の初期化時（[`RuntimeDir::ensure_under`]・[`RuntimeDir::from_env`]）に
+//!   best-effort で 1 回行う（失敗しても初期化は失敗させない）。残骸は異常終了したプロセスからしか生じず、
+//!   プロセスごとの初期化 1 回で収束する（常駐デーモンを持たない CORE-1 では CLI 起動ごとに初期化が走る）。
+//!   各 `call_once` の前に置くと全呼び出しにディレクトリ列挙が上乗せされ、境界レイテンシ（PLUG-6）に
+//!   響くため採らない。長時間動くプロセスは公開メソッドを任意の時機に呼べる。
+//! - 候補: `oneshot-<10 進>-<10 進>.sock.lock` の名前に厳密一致するロックファイルだけ（記録の無い socket は
+//!   削除根拠が無いので候補にしない。`resident-*` など他の名前も対象外）。
+//! - 判定・削除は bind 前の stale 削除と同じ処理（`acquire_bind_lock`・`clear_stale_socket`）を使い、
+//!   新しい削除規則は持たない。ロックを取れない（使用中）・symlink・他 UID 所有・記録が無い／不一致の
+//!   ものは削除しない。socket が消えて残ったロックファイルは `BindLock` の drop が unlink する。
+//! - 上限: 読むエントリ数は [`ONE_SHOT_SWEEP_MAX_ENTRIES`] まで（超えた分は次回の初期化で処理。REPAIR-5）。
+//! - 残余: 列挙はパス基準（`read_dir`）で、得た名前はヒントにすぎない。判定・削除はすべて検証済みディレクトリ
+//!   fd 基準で行うため、差し替えられても削除対象にはならない。bind 成功から記録書き込みまでの間に異常終了した
+//!   記録なし socket は削除しない（手動削除が必要。fail-closed）。常駐モードの `resident-*` は対象外。
+//!
 //! # `XDG_RUNTIME_DIR` 未設定時のフォールバック（TASK-123.4・#289）
 //! 未設定または空のときだけ、OS・euid ごとに単一の基底を選び、通常経路と同じ検証
 //! （[`RuntimeDir::ensure_under`] 相当）を省略なく適用する。
@@ -104,6 +124,26 @@ use crate::error::{PluginError, PluginErrorCode};
 /// runtime directory 名（`$XDG_RUNTIME_DIR` 直下。PLUG-12）。
 pub const RUNTIME_DIR_NAME: &str = "fandhe-container";
 
+/// 掃除で読むディレクトリエントリ数の上限（REPAIR-5。#1310）。超えた分は次回の初期化で処理する。
+pub const ONE_SHOT_SWEEP_MAX_ENTRIES: usize = 256;
+
+/// 都度起動の残骸の掃除結果（#1310・PLUG-7）。呼び出し側（TASK-114）が構造化ログへ出す材料。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct OneShotSweep {
+    /// 読んだディレクトリエントリ数（対象外の名前を含む。上限は [`ONE_SHOT_SWEEP_MAX_ENTRIES`]）。
+    pub examined: u32,
+    /// 削除した socket 数（掃除前に存在し、掃除後に無いと lstat で確認できたもの。
+    /// ロックファイルだけが残っていた場合は数えない）。
+    pub removed: u32,
+    /// ロックを他者が保持中（使用中）で飛ばした数。
+    pub in_use: u32,
+    /// 削除根拠が無い・拒否（symlink・他 UID・記録なし／不一致）・エラーで飛ばした数。
+    pub skipped: u32,
+    /// 上限に達して走査を打ち切ったか。
+    pub truncated: bool,
+}
+
 /// 検証済みの UDS 配置ディレクトリ（PLUG-12）。生の `PathBuf` ではなく newtype で返し、
 /// 検証を経ていないパスと型で区別する。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +185,16 @@ impl RuntimeDir {
     /// 検証済みディレクトリのパス。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 異常終了で残った都度起動の socket とロックファイルを掃除する（#1310・PLUG-7・PLUG-12）。
+    ///
+    /// 初期化時に best-effort で呼ばれるほか、TASK-114 の core 側 proxy が結果（件数）を得るために
+    /// 呼べる。判定規則・上限・残余はモジュール doc の「都度起動の残骸の掃除」参照。ディレクトリを
+    /// 開けない・検証に失敗した場合のみ `Err`。個別エントリの失敗は [`OneShotSweep::skipped`] に数える。
+    /// 非 unix は `Unimplemented`（fail-closed）。
+    pub fn sweep_one_shot_leftovers(&self) -> Result<OneShotSweep, PluginError> {
+        imp::sweep_one_shot_leftovers(self)
     }
 }
 
@@ -224,7 +274,10 @@ pub(crate) use imp::{BindLock, acquire_bind_lock, clear_stale_socket};
 
 #[cfg(unix)]
 mod imp {
-    use super::{RUNTIME_DIR_NAME, RuntimeDir, runtime_dir_base, validate_base};
+    use super::{
+        ONE_SHOT_SWEEP_MAX_ENTRIES, OneShotSweep, RUNTIME_DIR_NAME, RuntimeDir, runtime_dir_base,
+        validate_base,
+    };
     use crate::error::{PluginError, PluginErrorCode};
     use std::fs::{DirBuilder, File, Metadata};
     use std::io;
@@ -493,7 +546,90 @@ mod imp {
         // ルートから symlink 非追従で開き直し、開いた fd 自体を検証する。lstat・作成との間に
         // 経路上の要素や runtime directory が symlink へ差し替えられていれば open が失敗する。
         verify(&fstat(&open_nofollow(&dir)?)?, euid)?;
-        Ok(RuntimeDir { path: dir })
+        let runtime_dir = RuntimeDir { path: dir };
+        // 異常終了で残った都度起動の残骸を掃除する（#1310）。掃除の失敗で初期化を失敗させない
+        // （残骸は次回の初期化で再試行され、判定不能なものは削除しない fail-closed）。
+        let _ = sweep_one_shot(&runtime_dir.path, euid);
+        Ok(runtime_dir)
+    }
+
+    pub(super) fn sweep_one_shot_leftovers(dir: &RuntimeDir) -> Result<OneShotSweep, PluginError> {
+        sweep_one_shot(&dir.path, crate::sys::effective_uid())
+    }
+
+    /// 都度起動のロックファイル名 `oneshot-<10 進>-<10 進>.sock.lock` に厳密一致するとき、対応する
+    /// socket 名（`.lock` を除いたもの）を返す純粋関数（#1310）。数字は 1〜20 桁（u64 の桁数）。
+    pub(super) fn one_shot_socket_name_of_lock(name: &[u8]) -> Option<&[u8]> {
+        let socket = name.strip_suffix(b".lock")?;
+        let body = socket.strip_suffix(b".sock")?.strip_prefix(b"oneshot-")?;
+        let mut parts = body.split(|c| *c == b'-');
+        let (pid, seq) = (parts.next()?, parts.next()?);
+        let ok = |x: &[u8]| (1..=20).contains(&x.len()) && x.iter().all(u8::is_ascii_digit);
+        (parts.next().is_none() && ok(pid) && ok(seq)).then_some(socket)
+    }
+
+    /// `dir_path`（検証済みの runtime directory）を走査し、残骸の socket とロックファイルを掃除する
+    /// （#1310）。`euid` は自 UID（テストで他 UID を注入できるよう引数に取る）。
+    pub(super) fn sweep_one_shot(dir_path: &Path, euid: u32) -> Result<OneShotSweep, PluginError> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let real = std::fs::canonicalize(dir_path).map_err(|e| map_io(&e))?;
+        let dir = open_nofollow(&real)?;
+        verify(&fstat(&dir)?, euid)?;
+        let entries = std::fs::read_dir(&real).map_err(|e| map_io(&e))?;
+        let mut out = OneShotSweep::default();
+        for entry in entries {
+            if out.examined as usize >= ONE_SHOT_SWEEP_MAX_ENTRIES {
+                out.truncated = true;
+                break;
+            }
+            out.examined += 1;
+            let Ok(entry) = entry else {
+                out.skipped += 1;
+                continue;
+            };
+            let file_name = entry.file_name();
+            let Some(socket) = one_shot_socket_name_of_lock(file_name.as_bytes()) else {
+                continue;
+            };
+            let Ok(name) = std::ffi::CString::new(socket) else {
+                out.skipped += 1;
+                continue;
+            };
+            let public = real.join(std::ffi::OsString::from_vec(socket.to_vec()));
+            sweep_one(&dir, &name, &public, euid, &mut out);
+        }
+        Ok(out)
+    }
+
+    /// 1 つの候補を stale 削除と同じ手順で処理し、結果を `out` に数える。
+    fn sweep_one(
+        dir: &File,
+        name: &std::ffi::CStr,
+        public: &Path,
+        euid: u32,
+        out: &mut OneShotSweep,
+    ) {
+        let lock = match acquire_bind_lock(dir, name, public, euid) {
+            Ok(l) => l,
+            Err(e) if e.code() == PluginErrorCode::AlreadyExists => {
+                out.in_use += 1;
+                return;
+            }
+            Err(_) => {
+                out.skipped += 1;
+                return;
+            }
+        };
+        let existed = matches!(lstat_opt(dir, name, public), Ok(Some(_)));
+        let cleared = clear_stale_socket(dir, name, public, euid, &lock);
+        let remains = !matches!(lstat_opt(dir, name, public), Ok(None));
+        match (cleared, existed, remains) {
+            (Ok(()), true, false) => out.removed += 1,
+            // ロックファイルだけの残骸（socket は無い）。ロックの drop が unlink する。
+            (Ok(()), false, false) => {}
+            _ => out.skipped += 1,
+        }
+        // `lock` の drop で、記録が空になったロックファイルを unlink する。
     }
 
     /// 既存エントリの分類結果（PLUG-12・TASK-123.2）。
@@ -1019,6 +1155,67 @@ mod imp {
             }
         }
 
+        /// #1310・PLUG-7: 掃除候補は `oneshot-<10 進>-<10 進>.sock.lock` に厳密一致する名前だけ。
+        #[test]
+        fn plug7_one_shot_lock_name_parser_is_strict() {
+            fn ok(n: &str) -> Option<&[u8]> {
+                one_shot_socket_name_of_lock(n.as_bytes())
+            }
+            assert_eq!(
+                ok("oneshot-1-0.sock.lock"),
+                Some(b"oneshot-1-0.sock".as_slice())
+            );
+            let max = format!("oneshot-{}-{}.sock.lock", u64::MAX, u64::MAX);
+            assert!(ok(&max).is_some());
+            for bad in [
+                "resident-1-0.sock.lock",
+                "oneshot-a-0.sock.lock",
+                "oneshot-1-0.sock",
+                "oneshot--0.sock.lock",
+                "oneshot-1-.sock.lock",
+                "oneshot-1-0-2.sock.lock",
+                "oneshot-1.sock.lock",
+                "oneshot-1-0.sock.lock.lock",
+                "xoneshot-1-0.sock.lock",
+                "oneshot-1-0.sock.lockx",
+                "oneshot-1-+0.sock.lock",
+                "oneshot-1-000000000000000000000.sock.lock",
+            ] {
+                assert_eq!(ok(bad), None, "{bad}");
+            }
+            assert_eq!(
+                one_shot_socket_name_of_lock(b"oneshot-1-\xff.sock.lock"),
+                None
+            );
+        }
+
+        /// #1310・PLUG-12: 自 UID でないとして走査するとディレクトリ検証で拒否され、何も削除しない。
+        #[test]
+        fn plug12_sweep_rejects_foreign_uid_and_keeps_files() {
+            let t = Tmp::new();
+            let sock = t.0.join("oneshot-9-0.sock");
+            let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let lock = t.0.join("oneshot-9-0.sock.lock");
+            std::fs::write(&lock, b"").unwrap();
+            let e = sweep_one_shot(&t.0, crate::sys::effective_uid().wrapping_add(1)).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert!(sock.exists() && lock.exists());
+            drop(l);
+        }
+
+        /// #1310・REPAIR-5: 走査件数は上限で打ち切る。
+        #[test]
+        fn repair5_sweep_truncates_at_entry_limit() {
+            let t = Tmp::new();
+            for i in 0..=ONE_SHOT_SWEEP_MAX_ENTRIES {
+                std::fs::write(t.0.join(format!("other-{i}")), b"").unwrap();
+            }
+            let r = sweep_one_shot(&t.0, crate::sys::effective_uid()).unwrap();
+            assert_eq!(r.examined as usize, ONE_SHOT_SWEEP_MAX_ENTRIES);
+            assert!(r.truncated);
+            assert_eq!(r.removed, 0);
+        }
+
         /// PLUG-12: 記録は完全な形式（末尾改行つき）だけを同一性として読む。書きかけは専用ファイルとは
         /// 認めるが、管理下の証拠にはしない（TASK-123.2）。
         #[test]
@@ -1461,6 +1658,12 @@ mod imp {
         _dir: &RuntimeDir,
         _name: &str,
     ) -> Result<std::path::PathBuf, PluginError> {
+        Err(unimplemented())
+    }
+
+    pub(super) fn sweep_one_shot_leftovers(
+        _dir: &RuntimeDir,
+    ) -> Result<super::OneShotSweep, PluginError> {
         Err(unimplemented())
     }
 }

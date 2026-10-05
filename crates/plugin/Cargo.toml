@@ -6,6 +6,7 @@
 # エラー型は TASK-107.1（#244）、フレームヘッダ型は TASK-107.2（#245）、制御メッセージの
 # serde_json 符号化は TASK-107.3（#247）、UDS listener は TASK-107.4（#248）、UDS client 接続は TASK-107.5（#249）、ACK/RPC 待機のタイムアウトは TASK-107.6（#250）、runtime directory の解決・作成は TASK-123.1（#286）、socket パスの bind 前検証は TASK-123.3（#288）、XDG 未設定時のフォールバックは TASK-123.4（#289）で追加。依存は serde / serde_json（workspace 参照。
 # 都度起動モードは TASK-110.1（#258）、常駐モードは TASK-110.2（#259）、モード選択 API は TASK-110.3（#260）、Linux の peer 認証（SO_PEERCRED）の検証集約は TASK-124.1（#292）、別 UID 接続拒否の結合試験は TASK-124.4（#295）、peer 認証の順序照合テストは TASK-124.6（#1389）で追加（依存追加なし）。
+# 異常終了で残った都度起動の socket・ロックファイルの掃除は #1310 で追加（依存追加なし）。
 # RSS サンプラーは TASK-112.1（#265）、常駐 plugin の RSS 計測テスト（実機前提）は TASK-112.3（#267）で追加（依存追加なし）。
 # 承認: #138・#246）のみ。依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 # core からは `fandhe-container-core` の `plugin` feature 経由で optional に参照される（PLUG-3・TASK-111.1・#262）。

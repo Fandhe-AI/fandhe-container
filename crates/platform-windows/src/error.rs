@@ -5,8 +5,9 @@
 //! `message` には英語の固定文言と数値（行番号・バイト長）だけを載せ、`.wslconfig` の内容やパスは載せない
 //! （kernelCommandLine やユーザー名入りパスを含みうるため）。
 //!
-//! 現状は `.wslconfig` 操作（`wslconfig` モジュール）が使う分類だけを持つ。9P フォールバック等の
-//! 分類拡張は TASK-67.5（#376）で行う（`#[non_exhaustive]` のため追加は互換）。
+//! `.wslconfig` 操作（`wslconfig` モジュール）と WSL2 操作（`wsl2` モジュール。`Wsl2Error` は本型の別名）が
+//! 共通で使う。分類拡張は `#[non_exhaustive]` のため互換（TASK-67.5・#376 で
+//! `FailedPrecondition`・`Timeout`・`DataLoss` を追加し、WSL2 側の暫定エラー型を統合した）。
 
 use std::error::Error;
 use std::fmt;
@@ -17,7 +18,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WinErrorCode {
-    /// 不正な入力（構文エラー・非 UTF-8・NUL・通常ファイル以外・不正なパス）。
+    /// 不正な入力（構文エラー・非 UTF-8・NUL・通常ファイル以外・不正なパス・不正な引数）。
     InvalidArgument,
     /// 対象（ファイル・親ディレクトリ）が存在しない。
     NotFound,
@@ -27,6 +28,12 @@ pub enum WinErrorCode {
     ResourceExhausted,
     /// 対応外の OS（fail-closed）。
     Unimplemented,
+    /// 前提条件を満たさない（WSL2 無効・virtiofs 非成立の厳格拒否など。ERR-1）。
+    FailedPrecondition,
+    /// 期限内に終了しなかった（REPAIR-5）。
+    Timeout,
+    /// 外部出力が空・未対応形式・不正なエンコーディング。
+    DataLoss,
     /// 上記以外の内部エラー（分類できない I/O 失敗）。
     Internal,
 }
@@ -40,6 +47,9 @@ impl WinErrorCode {
             Self::PermissionDenied => "PERMISSION_DENIED",
             Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
             Self::Unimplemented => "UNIMPLEMENTED",
+            Self::FailedPrecondition => "FAILED_PRECONDITION",
+            Self::Timeout => "TIMEOUT",
+            Self::DataLoss => "DATA_LOSS",
             Self::Internal => "INTERNAL",
         }
     }
@@ -93,6 +103,9 @@ mod tests {
             (WinErrorCode::PermissionDenied, "PERMISSION_DENIED"),
             (WinErrorCode::ResourceExhausted, "RESOURCE_EXHAUSTED"),
             (WinErrorCode::Unimplemented, "UNIMPLEMENTED"),
+            (WinErrorCode::FailedPrecondition, "FAILED_PRECONDITION"),
+            (WinErrorCode::Timeout, "TIMEOUT"),
+            (WinErrorCode::DataLoss, "DATA_LOSS"),
             (WinErrorCode::Internal, "INTERNAL"),
         ];
         for (code, s) in cases {

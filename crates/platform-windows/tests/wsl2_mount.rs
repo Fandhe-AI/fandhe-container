@@ -14,19 +14,28 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use fandhe_container_platform_windows::instrument::WinWarningCode;
 use fandhe_container_platform_windows::wsl2::test_support::{
     launch_with_program, prepare_virtiofs_launch_with_program, release_virtiofs_launch_with_program,
 };
 use fandhe_container_platform_windows::wsl2::{
     DistroName, HostDir, LaunchRequest, MountName, PreparedMount, SharedMount, SharedTransport,
-    Wsl2Error, Wsl2ErrorCode,
+    TransportPolicy, Wsl2Error, Wsl2ErrorCode,
 };
 use fandhe_container_platform_windows::wslconfig::VirtiofsState;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 偽 `wsl.exe` のマウント系モード（テストごとに別の状態ファイルを使うため 1 テスト 1 モード）。
-const MODES: [&str; 4] = ["mount_ok", "mount_9p", "mount_launch", "mount_unset"];
+const MODES: [&str; 7] = [
+    "mount_ok",
+    "mount_9p",
+    "mount_9p_unset",
+    "mount_9p_applied",
+    "mount_9p_launch",
+    "mount_launch",
+    "mount_unset",
+];
 
 /// モードごとの名前で偽 `wsl.exe` を置いたディレクトリ（`tests/wsl2_detect.rs` と同じ用意の仕方。
 /// 状態ファイルが衝突しないよう別ディレクトリにする）。
@@ -83,7 +92,7 @@ fn prepare_then_release_through_fake_wsl() {
     let exe = fresh_fake("mount_ok");
     let p = prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Enabled, &request(), TIMEOUT)
         .unwrap();
-    assert_eq!(p.transport(), SharedTransport::Virtiofs);
+    assert_eq!(p.transport(), Some(SharedTransport::Virtiofs));
     assert_eq!(p.distro().as_str(), "Ubuntu");
     let got: Vec<(&str, Option<u32>, bool)> = p
         .mounts()
@@ -102,11 +111,12 @@ fn prepare_then_release_through_fake_wsl() {
     assert!(mounted(&exe).is_empty());
 }
 
-/// WIN-2: 9P で成立したら FAILED_PRECONDITION で拒否し、作ったマウントを外してから返す。
+/// WIN-2: 厳格方針（`RequireVirtiofs`）で 9P が成立したら FAILED_PRECONDITION で拒否し、作ったマウントを外してから返す。
 #[test]
 fn prepare_rejects_9p_and_rolls_back_through_fake_wsl() {
     let exe = fresh_fake("mount_9p");
-    let e = prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Enabled, &request(), TIMEOUT)
+    let req = request().with_transport_policy(TransportPolicy::RequireVirtiofs);
+    let e = prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Enabled, &req, TIMEOUT)
         .unwrap_err();
     assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
     assert!(
@@ -117,11 +127,12 @@ fn prepare_rejects_9p_and_rolls_back_through_fake_wsl() {
     assert!(mounted(&exe).is_empty());
 }
 
-/// WIN-2: `.wslconfig` で virtiofs が有効でなければ、ゲスト内のコマンドを一切実行しない。
+/// WIN-2: 厳格方針で `.wslconfig` の virtiofs が有効でなければ、ゲスト内のコマンドを一切実行しない。
 #[test]
 fn prepare_refuses_without_virtiofs_opt_in() {
     let exe = fresh_fake("mount_unset");
-    let e = prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Unset, &request(), TIMEOUT)
+    let req = request().with_transport_policy(TransportPolicy::RequireVirtiofs);
+    let e = prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Unset, &req, TIMEOUT)
         .unwrap_err();
     assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
     assert!(!exe.with_extension("state").exists());
@@ -150,6 +161,51 @@ fn launch_rolls_back_when_start_fails_through_fake_wsl() {
     assert_eq!(n.value, 2);
     assert_eq!(mounted(&exe), ["/mnt/fandhe/work", "/mnt/fandhe/data"]);
     // 戻り値の準備済みマウントで解除できる（解除に必要な所有情報が呼び出し側へ渡る）。
+    release_virtiofs_launch_with_program(&exe, &n.prepared, TIMEOUT).unwrap();
+    assert!(mounted(&exe).is_empty());
+}
+
+/// WIN-2・ERR-1: 既定方針で 9P が成立（設定は有効だが VM に未反映）したら、警告つきで受理し、マウントは残る。
+#[test]
+fn prepare_falls_back_to_9p_with_not_applied_warning() {
+    let exe = fresh_fake("mount_9p_applied");
+    let p = prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Enabled, &request(), TIMEOUT)
+        .unwrap();
+    assert_eq!(p.transport(), Some(SharedTransport::NineP));
+    assert_eq!(
+        p.warning().map(|w| w.code()),
+        Some(WinWarningCode::VirtiofsNotApplied)
+    );
+    assert_eq!(mounted(&exe), ["/mnt/fandhe/work", "/mnt/fandhe/data"]);
+    release_virtiofs_launch_with_program(&exe, &p, TIMEOUT).unwrap();
+    assert!(mounted(&exe).is_empty());
+}
+
+/// WIN-2: 設定が未有効のまま 9P で成立した場合は `VIRTIOFS_NOT_ENABLED` の警告。
+#[test]
+fn prepare_falls_back_to_9p_with_not_enabled_warning() {
+    let exe = fresh_fake("mount_9p_unset");
+    let p = prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Unset, &request(), TIMEOUT)
+        .unwrap();
+    assert_eq!(p.transport(), Some(SharedTransport::NineP));
+    assert_eq!(
+        p.warning().map(|w| w.code()),
+        Some(WinWarningCode::VirtiofsNotEnabled)
+    );
+    release_virtiofs_launch_with_program(&exe, &p, TIMEOUT).unwrap();
+    assert!(mounted(&exe).is_empty());
+}
+
+/// WIN-2・AC1: 9P フォールバックでも起動ステップは呼ばれて起動を継続し、解除できる。
+#[test]
+fn launch_continues_on_9p_fallback() {
+    let exe = fresh_fake("mount_9p_launch");
+    let n = launch_with_program(&exe, VirtiofsState::Enabled, &request(), TIMEOUT, |p| {
+        Ok(p.mounts().len())
+    })
+    .unwrap();
+    assert_eq!(n.value, 2);
+    assert_eq!(n.prepared.transport(), Some(SharedTransport::NineP));
     release_virtiofs_launch_with_program(&exe, &n.prepared, TIMEOUT).unwrap();
     assert!(mounted(&exe).is_empty());
 }

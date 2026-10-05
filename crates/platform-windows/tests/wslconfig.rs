@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use fandhe_container_platform_windows::error::WinErrorCode;
 use fandhe_container_platform_windows::instrument::{
-    WinOpKind, WinOpOutcome, WinOpRecorder, WinOpSample,
+    WinOpKind, WinOpOutcome, WinOpRecorder, WinOpSample, WinWarning,
 };
 use fandhe_container_platform_windows::wslconfig::{
     EnableOutcome, VirtiofsState, enable_virtiofs_at, enable_virtiofs_at_with_recorder, load,
@@ -65,6 +65,8 @@ impl WinOpRecorder for Collect {
             v.push(*s);
         }
     }
+
+    fn record_win_warning(&self, _w: &WinWarning) {}
 }
 
 impl Collect {

@@ -18,8 +18,8 @@
 //!
 //! virtiofs 共有マウントと起動前の検証シーケンス（TASK-67.4・#375）は `mount` モジュール。
 //!
-//! エラー型は本モジュール内に置いた暫定版で、crate 共通の構造化エラーは TASK-67.5（#376）で
-//! `error` モジュールへ移してよい（REPAIR-3）。実機の `wsl.exe` での確認は TASK-67.6（#377）の担当。
+//! エラー型は crate 共通の `error` モジュールの `WinError` / `WinErrorCode` に統合済み（TASK-67.5・#376。
+//! `Wsl2Error` / `Wsl2ErrorCode` は互換の別名）。実機の `wsl.exe` での確認は TASK-67.6（#377）の担当。
 
 mod mount;
 mod parse;
@@ -28,13 +28,12 @@ mod run;
 pub use mount::{
     DistroName, GUEST_MOUNT_BASE, HostDir, LaunchRequest, Launched, MAX_DISTRO_NAME_LEN,
     MAX_HOST_DIR_LEN, MAX_MOUNT_NAME_LEN, MAX_SHARED_MOUNTS, MAX_UNRELEASED_MOUNTS, MountError,
-    MountName, PreparedLaunch, PreparedMount, SharedMount, SharedTransport, launch_with,
-    launch_with_recorder, prepare_virtiofs_launch, prepare_virtiofs_launch_with_recorder,
-    release_virtiofs_launch, release_virtiofs_launch_with_recorder,
+    MountName, PreparedLaunch, PreparedMount, SharedMount, SharedTransport, TransportPolicy,
+    launch_with, launch_with_recorder, prepare_virtiofs_launch,
+    prepare_virtiofs_launch_with_recorder, release_virtiofs_launch,
+    release_virtiofs_launch_with_recorder,
 };
 
-use std::error::Error;
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -52,85 +51,10 @@ pub const MAX_DISTROS: usize = 256;
 /// WSL2 が使えない場合に添える有効化手順の案内（英語。ERR-1）。
 const ENABLE_GUIDE: &str = "Run 'wsl --install' (or enable the \"Virtual Machine Platform\" and \"Windows Subsystem for Linux\" features), reboot, then run 'wsl --set-default-version 2'";
 
-/// `Wsl2Error` の機械可読な分類（ERR-1）。文字列は `PluginErrorCode::as_str` と揃える。
-///
-/// `#[non_exhaustive]` のため、呼び出し側の `match` は `_` 分岐を持つこと。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum Wsl2ErrorCode {
-    /// タイムアウト値などの不正な引数。
-    InvalidArgument,
-    /// `wsl.exe` が存在しない（WSL 未インストール）。
-    NotFound,
-    /// WSL2 が無効、または使えるディストリがない（有効化手順を添える）。
-    FailedPrecondition,
-    /// 期限内に終了しなかった（REPAIR-5）。
-    Timeout,
-    /// 出力が空・未対応形式・不正なエンコーディング。
-    DataLoss,
-    /// 出力量・件数・行長が上限を超えた。
-    ResourceExhausted,
-    /// 起動権限がない、または WSL がアクセス拒否（`E_ACCESSDENIED` 等）を返した。
-    PermissionDenied,
-    /// Windows 以外の OS。
-    Unimplemented,
-    /// 上記以外の I/O エラー。
-    Internal,
-}
-
-impl Wsl2ErrorCode {
-    /// 機械可読な `code` 文字列を返す（ERR-1）。
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::InvalidArgument => "INVALID_ARGUMENT",
-            Self::NotFound => "NOT_FOUND",
-            Self::FailedPrecondition => "FAILED_PRECONDITION",
-            Self::Timeout => "TIMEOUT",
-            Self::DataLoss => "DATA_LOSS",
-            Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
-            Self::PermissionDenied => "PERMISSION_DENIED",
-            Self::Unimplemented => "UNIMPLEMENTED",
-            Self::Internal => "INTERNAL",
-        }
-    }
-}
-
-/// WSL2 検出系の構造化エラー（`code` と英語の `message`。ERR-1）。
+/// WSL2 操作の構造化エラー型は crate 共通の [`WinError`](crate::error::WinError) の別名（ERR-1・TASK-67.5）。
 ///
 /// `message` に生の出力は載せない。載せるのはサニタイズ済み（128 バイト以下の印字可能 ASCII）の抜粋だけ。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Wsl2Error {
-    code: Wsl2ErrorCode,
-    message: String,
-}
-
-impl Wsl2Error {
-    /// 分類とメッセージ（英語）からエラーを作る。
-    pub fn new(code: Wsl2ErrorCode, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-        }
-    }
-
-    /// 機械可読な分類を返す。
-    pub fn code(&self) -> Wsl2ErrorCode {
-        self.code
-    }
-
-    /// 人間可読なメッセージを返す。
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl fmt::Display for Wsl2Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code.as_str(), self.message)
-    }
-}
-
-impl Error for Wsl2Error {}
+pub use crate::error::{WinError as Wsl2Error, WinErrorCode as Wsl2ErrorCode};
 
 /// `wsl.exe --version` の結果。
 #[derive(Debug, Clone, PartialEq, Eq)]

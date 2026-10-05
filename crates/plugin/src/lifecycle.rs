@@ -474,7 +474,8 @@ struct ChildGuard {
     reported_unreaped: bool,
     /// 直接の子（プロセスグループのリーダー）を wait 済みか。true ならグループ宛ての送信をしない。
     /// 回収後は pid（= pgid）が再利用され得るため、別プロセスのグループへ誤送信しないための印
-    /// （`try_wait` が `Some` / `Err` を返した時点で必ず立てる。#1311）。
+    /// `try_wait` が `Some` を返した時点で立てる。`Err`（状態確認の失敗）は回収済みの証明にならない
+    /// ため立てず、グループ宛ての SIGKILL を省略しない（孫が残り得る。#1311・PLUG-7・REPAIR-5）。
     leader_reaped: bool,
 }
 
@@ -496,8 +497,9 @@ impl ChildGuard {
             Some(c) => c.try_wait(),
             None => Ok(None),
         };
-        // 回収済み、または回収状態が不明（Err）なら以後グループへ送らない（fail-closed）。
-        if !matches!(result, Ok(None)) {
+        // 回収済みが確定した（Some）場合だけ以後グループへ送らない。Err は状態不明のため、
+        // 立てずにグループ停止を試みられるようにする（fail-closed）。
+        if matches!(result, Ok(Some(_))) {
             self.leader_reaped = true;
         }
         result
@@ -536,12 +538,10 @@ impl ChildGuard {
         let group_failed = false;
         // kill の前に終了済みかを確認し、自発終了の状態をそのまま拾う（kill との競合窓を狭める）。
         if let Ok(Some(status)) = c.try_wait() {
-            if group_failed {
-                // 直接の子は回収済みだが孫の停止を保証できない。pid 報告のため `Child` は手放さない。
-                self.leader_reaped = true;
-                return Reap::Unreaped;
-            }
             self.release_reaped();
+            if group_failed {
+                return Reap::GroupKillFailed;
+            }
             return Reap::Reaped(status);
         }
         // setsid / setpgid でグループを抜けた plugin 本体も確実に止めるフォールバック。
@@ -551,11 +551,10 @@ impl ChildGuard {
         loop {
             match c.try_wait() {
                 Ok(Some(status)) => {
-                    if group_failed {
-                        self.leader_reaped = true;
-                        return Reap::Unreaped;
-                    }
                     self.release_reaped();
+                    if group_failed {
+                        return Reap::GroupKillFailed;
+                    }
                     return Reap::Reaped(status);
                 }
                 Ok(None) => {}
@@ -594,7 +593,10 @@ impl ChildGuard {
         match self.kill_and_reap() {
             Reap::Reaped(status) => classify_reaped(status),
             // 既に回収済みのガードに対して呼ばれることはないが、終了状態が不明なため成功扱いしない。
-            Reap::AlreadyReaped | Reap::Unreaped => OneShotTermination::Unreaped,
+            // グループ送信失敗は孫の停止を保証できないため成功扱いにしない。
+            Reap::AlreadyReaped | Reap::GroupKillFailed | Reap::Unreaped => {
+                OneShotTermination::Unreaped
+            }
         }
     }
 }
@@ -638,6 +640,9 @@ enum Reap {
     Reaped(ExitStatus),
     /// 既に回収済みで保持している子がない。
     AlreadyReaped,
+    /// 直接の子は回収済み（pid は解放済みで報告対象にしない）だが、グループ宛て SIGKILL が許容外の
+    /// エラーで失敗し、孫の停止を保証できない。呼び出し側は元のエラーを優先して返す。
+    GroupKillFailed,
     /// kill 失敗または期限超過で回収を確認できなかった（孤児の可能性）。
     Unreaped,
 }
@@ -1211,6 +1216,14 @@ mod tests {
             still_running,
             "group was signalled after the leader was reaped"
         );
+    }
+
+    /// #1311・PLUG-7: グループ送信失敗後に直接の子が回収済みなら、元のエラーを優先できるよう
+    /// `is_reaped` は真（解放済み pid を未回収として報告しない）。
+    #[test]
+    fn plug7_group_kill_failed_counts_as_leader_reaped() {
+        assert!(Reap::GroupKillFailed.is_reaped());
+        assert!(!Reap::Unreaped.is_reaped());
     }
 
     /// #1311・PLUG-7: 回収済みで `child` を手放した後は何も送らない（`AlreadyReaped`）。

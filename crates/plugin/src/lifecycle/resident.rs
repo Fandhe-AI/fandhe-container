@@ -467,7 +467,9 @@ impl ResidentPlugin {
                     original
                 }
             },
-            Reap::AlreadyReaped => {
+            // 直接の子は回収済み（pid は解放済み）。孫の停止は保証できないが、未回収 pid として
+            // 報告せず元のエラーを返す（#1311・PLUG-7）。
+            Reap::AlreadyReaped | Reap::GroupKillFailed => {
                 self.state = ResidentState::Killed;
                 original
             }

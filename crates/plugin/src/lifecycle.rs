@@ -818,6 +818,11 @@ fn call_once_inner(
     // 子の回収後に収集結果を受け取る。子が終了していれば書き込み端は閉じており即座に完了する。
     // 戻る時点で読み取りスレッドは停止している（停止を確認できなければ結果に記録する）。
     let stderr = capture.finish(ONE_SHOT_STDERR_DRAIN_TIMEOUT);
+    // 受付で拒否した接続の監査イベント（既定出力。PLUG-12・SEC-4・TASK-124.5）を、結果の確定後に有界で
+    // 回収する。都度起動の呼び出し元は直後に終了し得るため、ここで出力完了を待つ（受付経路では待たない。
+    // REPAIR-5）。未出力が無ければ即座に戻る。期限切れでも結果は変えず、未出力・失敗の件数は
+    // `crate::audit` の件数取得関数で観測できる。
+    let _ = crate::audit::flush_default_audit(crate::audit::DEFAULT_AUDIT_FLUSH_TIMEOUT);
     (result, stderr)
 }
 

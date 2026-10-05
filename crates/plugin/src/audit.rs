@@ -38,10 +38,14 @@
 //!   [`flush_default_audit`] が true を返すのは、すべての拒否が出力済みか失敗計上済みになった後に限る。
 //! - stderr への書き込みが失敗した場合（閉じている・書けない）は失われた件数を
 //!   [`default_audit_write_failures`] へ数え、黙って消えない（呼び出し側が監視できる）。
-//! - 拒否の通知ごとに、出力完了を最大 50ms（有界）待ってから戻る。通常は即時に完了するため、
-//!   拒否直後にプロセスが終了しても行は失われない。stderr が停滞している場合は待機が期限で
-//!   打ち切られ、未出力分は書き込みスレッドが後続で出力する（終了直前に確実に回収したい運用は
-//!   [`flush_default_audit`] を呼ぶか、[`JsonLinesPeerAuthObserver`] 等を渡す）。
+//! - 拒否の通知（受付経路）ではキューへの投入までしか行わず、出力完了を待たない。pid 不一致の接続を
+//!   拒否して受付を続ける `accept_peer_pid` で待ち時間が累積し、正しい接続が期限切れになるのを防ぐ
+//!   （REPAIR-5）。
+//! - 出力完了の待機は [`flush_default_audit`]（有界）で明示的に行う。拒否直後にプロセスが終了し得る
+//!   経路は終了前にこれを呼ぶ。都度起動モード（`crate::lifecycle::call_once`）は、受付・往復・子の
+//!   回収が済んで結果が確定した後に 1 回だけ最大 50ms 待つ（結果には影響しない）。`accept` /
+//!   `connect` / 常駐モードは待たないため、呼び出し側が終了前に [`flush_default_audit`] を呼ぶか、
+//!   [`JsonLinesPeerAuthObserver`] 等を渡して自分で回収する。
 
 use crate::error::PluginErrorCode;
 use serde::Serialize;
@@ -58,8 +62,10 @@ pub const MAX_PEER_AUTH_AUDIT_LOG_BUFFER_BYTES: usize = 128 * 1024;
 /// 既定出力の書き込みキューの最大件数。
 pub const DEFAULT_AUDIT_QUEUE_CAPACITY: usize = 256;
 
-/// 既定 observer が拒否ごとに出力完了を待つ上限（REPAIR-5。停滞時もこの時間で戻る）。
-const DEFAULT_AUDIT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+/// 都度起動モードが結果の確定後に既定出力の完了を待つ上限（REPAIR-5。停滞時もこの時間で戻る）。
+/// `crate::lifecycle` の `call_once` 系が [`flush_default_audit`] へ渡す。受付経路では待たない。
+pub(crate) const DEFAULT_AUDIT_FLUSH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(50);
 
 /// 書き込みスレッドが未出力の集約件数を定期的に回収する間隔（次の行の到着に依存しない）。
 const AGGREGATE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
@@ -404,18 +410,21 @@ impl PeerAuthObserver for NoopPeerAuthObserver {
 }
 
 /// 観測フックを渡さない公開入口（`accept` / `connect`）の既定: stderr へ JSON Lines を 1 行出す。
-/// 呼び出し側ではブロックしない（有界キュー経由）。契約はモジュール doc を参照。
+/// 呼び出し側ではブロックせず、出力完了も待たない（有界キューへ投入するだけ）。契約はモジュール doc を参照。
 #[derive(Debug, Default)]
 pub(crate) struct StderrPeerAuthObserver;
 
 impl PeerAuthObserver for StderrPeerAuthObserver {
     fn on_rejection(&mut self, event: &PeerAuthRejection<'_>) {
-        let sink = default_sink();
-        sink.submit(event.to_json_line());
-        // 拒否の直後にプロセスが終了しても行が失われないよう、有界で出力完了を待つ（SEC-4）。
-        // 拒否は稀な経路で、通常は即時に完了する。stderr 停滞時も最大 DEFAULT_AUDIT_FLUSH_TIMEOUT で戻る。
-        let _ = sink.flush(DEFAULT_AUDIT_FLUSH_TIMEOUT);
+        notify_sink(default_sink(), event);
     }
+}
+
+/// 拒否 1 件を sink へ投入する（既定 observer の本体）。出力完了は待たない: 受付経路で待つと、
+/// 拒否して受付を続けるループ（`accept_peer_pid`）で待ち時間が累積する（REPAIR-5）。
+/// 出力完了の待機は `flush_default_audit` で明示的に行う（SEC-4）。
+fn notify_sink(sink: &AuditSink, event: &PeerAuthRejection<'_>) {
+    sink.submit(event.to_json_line());
 }
 
 /// 有界メモリへ JSON Lines を積む受け手（io の `JsonLinesServerObserver` 相当）。
@@ -598,6 +607,28 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
         // 書き込みスレッドが 1 件を保持し、キュー 2 件を除いた残りが集約対象になる。
         assert!(sink.counts().pending_dropped >= 40);
+    }
+
+    /// REPAIR-5・SEC-4（#1388）: 出力先が停滞していても、拒否の通知は出力完了を待たずに戻る
+    /// （拒否が重なっても待ち時間が累積しない）。件数は 1 件も失われず数えられている。
+    #[test]
+    fn repair5_notify_does_not_wait_for_stalled_output() {
+        let (_gate, rx) = std::sync::mpsc::channel::<()>();
+        let sink = AuditSink::spawn(Blocked(rx), 4);
+        let p = Path::new("/x.sock");
+        let start = std::time::Instant::now();
+        for _ in 0..40 {
+            notify_sink(&sink, &ev(PeerAuthRejectReason::PidMismatch, Some(1001), p));
+        }
+        // 通知ごとに DEFAULT_AUDIT_FLUSH_TIMEOUT（50ms）待つ実装なら 40 件で 2 秒かかる。
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            start.elapsed()
+        );
+        let c = sink.counts();
+        assert_eq!(c.queued + c.pending_dropped, 40);
+        assert_eq!(c.write_failures, 0);
     }
 
     struct Failing;

@@ -183,6 +183,8 @@ impl UdsListener {
     ///
     /// 拒否した接続は既定の出力先（stderr の JSON Lines 1 行）へ監査イベントとして通知する
     /// （PLUG-12・SEC-4・TASK-124.5）。出力先を指定する場合は [`Self::accept_observed`]。
+    /// 通知は非同期の出力キューへの投入までで出力完了を待たない（REPAIR-5）。拒否の直後に終了する
+    /// プロセスは、終了前に [`crate::audit::flush_default_audit`] を呼んで回収する。
     pub fn accept(&self, timeout: Duration) -> Result<UdsStream, PluginError> {
         self.accept_observed(timeout, &mut StderrPeerAuthObserver)
     }
@@ -286,6 +288,8 @@ impl UdsStream {
     ///
     /// server の peer 認証で拒否した場合は既定の出力先（stderr の JSON Lines 1 行）へ監査イベントを
     /// 通知する（PLUG-12・SEC-4・TASK-124.5）。出力先を指定する場合は [`Self::connect_observed`]。
+    /// 通知は非同期の出力キューへの投入までで出力完了を待たない（REPAIR-5）。拒否の直後に終了する
+    /// プロセスは、終了前に [`crate::audit::flush_default_audit`] を呼んで回収する。
     pub fn connect(path: &Path, timeout: Duration) -> Result<Self, PluginError> {
         Self::connect_observed(path, timeout, &mut StderrPeerAuthObserver)
     }

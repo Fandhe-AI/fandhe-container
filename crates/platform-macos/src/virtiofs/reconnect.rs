@@ -137,7 +137,8 @@ impl ReconnectPolicy {
     }
 }
 
-/// 接続試行スレッドの実行中フラグを、スレッド終了（またはスレッド起動失敗）時に戻す RAII ガード。
+/// 接続試行スレッドの実行中フラグを戻す RAII ガード。正常時は結果を送る前に明示的に drop し、
+/// パニック・スレッド起動失敗時は破棄時に戻す。
 struct BusyGuard(Arc<AtomicBool>);
 
 impl Drop for BusyGuard {
@@ -255,6 +256,8 @@ where
     /// 復帰まで残り得る（スレッドは強制終了できない。[`VirtiofsConnector::connect`] の契約は期限内に戻ること）が、
     /// `connect_busy` が立っている間は新しいスレッドを起動せず即 `Unavailable` で失敗させるため、
     /// 取り残されるスレッドはクライアントごとに最大 1 本に有界化される。遅れて確立した接続は破棄される。
+    /// busy は connector のロック解放後・結果送信前に戻すため、結果を受け取った時点で次の試行は必ず
+    /// connector を呼べる（送信後に戻すと、間隔の短い次の試行が誤って `Unavailable` になる）。
     fn connect_with_deadline(&self) -> Result<C::Transport, IoError> {
         if self.connect_busy.swap(true, Ordering::AcqRel) {
             return Err(IoError::new(
@@ -270,7 +273,9 @@ where
         let spawned = std::thread::Builder::new()
             .name("virtiofs-connect".to_owned())
             .spawn(move || {
-                let _busy = busy;
+                // パニック時も unwind で drop され busy が戻る。
+                let busy = busy;
+                // scrutinee の MutexGuard はこの let 文の終わりで解放される。
                 let result = match connector.try_lock() {
                     Ok(mut guard) => guard.connect(timeout),
                     Err(TryLockError::WouldBlock) => Err(IoError::new(
@@ -282,6 +287,9 @@ where
                         "connector panicked during an earlier attempt",
                     )),
                 };
+                // connector ロック → busy → 結果送信の順で解放する。受信側は送信を受け取った時点で
+                // busy が戻っていることを観測できる（channel の送受信が happens-before を与える）。
+                drop(busy);
                 // 受信側が期限切れで去っていれば確立済みの接続はここで破棄される。
                 let _ = tx.send(result);
             });

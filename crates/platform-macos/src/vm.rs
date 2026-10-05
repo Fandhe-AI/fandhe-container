@@ -27,6 +27,10 @@
 //! [`OpTimeouts`] で表す。待機ロジックは OS 非依存の `await_op_result` に切り出し、期限超過で
 //! `VmError::Timeout` を返すことを Linux 上のテストで検証する。
 //!
+//! ゲスト内 virtiofs mount の待機（TASK-65.3）: `Vm::launch` は `start` 成功後、mount 指定つき共有の報告を
+//! `guest_mount` モジュールの契約で `OpTimeouts::guest_mount`（既定 60 秒）を上限に待つ。ゲスト init が未実装の
+//! 間（REPAIR-3）は、mount 指定つきの `launch` は報告が届かず `guest_mount.timeout` になる。
+//!
 //! 起動失敗時のクリーンアップ（TASK-64.5）: 失敗した完了通知の直後に `Core::complete_and_settle` が
 //! VZ の実状態へ追従し、状態機械が `Error` のまま残らない。`Vm::launch`（macOS）は設定の構築・VM 生成・
 //! 起動のどこで失敗しても、所有する設定と VM を Rust の drop 順（VM → 設定）で解放する。解放後は VM の
@@ -63,6 +67,9 @@ pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// `Vm::state` が VM キューの応答を待つ既定タイムアウト（REPAIR-5・TASK-64.5）。
 pub const DEFAULT_STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `Vm::launch` がゲスト内 virtiofs mount の報告を待つ既定タイムアウト（MAC-1・REPAIR-5・TASK-65.3）。
+pub const DEFAULT_GUEST_MOUNT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 指定できるタイムアウトの下限。0 や極小値で常時失敗させる設定を拒否する。
 pub const MIN_OP_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -75,6 +82,7 @@ pub struct OpTimeouts {
     start: Duration,
     stop: Duration,
     state_query: Duration,
+    guest_mount: Duration,
 }
 
 impl OpTimeouts {
@@ -102,7 +110,28 @@ impl OpTimeouts {
             start,
             stop,
             state_query,
+            guest_mount: DEFAULT_GUEST_MOUNT_TIMEOUT,
         })
+    }
+
+    /// ゲスト mount 報告の待機時間を差し替える（`MIN_OP_TIMEOUT..=MAX_OP_TIMEOUT`。TASK-65.3）。
+    pub fn with_guest_mount(mut self, guest_mount: Duration) -> Result<OpTimeouts, VmError> {
+        if !(MIN_OP_TIMEOUT..=MAX_OP_TIMEOUT).contains(&guest_mount) {
+            return Err(VmError::InvalidTimeout {
+                field: "guest_mount",
+                requested: guest_mount,
+                min: MIN_OP_TIMEOUT,
+                max: MAX_OP_TIMEOUT,
+            });
+        }
+        self.guest_mount = guest_mount;
+        Ok(self)
+    }
+
+    /// ゲスト mount 報告の待機時間。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn guest_mount(&self) -> Duration {
+        self.guest_mount
     }
 
     /// `start` の完了待ち。
@@ -136,6 +165,7 @@ impl Default for OpTimeouts {
             start: DEFAULT_START_TIMEOUT,
             stop: DEFAULT_STOP_TIMEOUT,
             state_query: DEFAULT_STATE_QUERY_TIMEOUT,
+            guest_mount: DEFAULT_GUEST_MOUNT_TIMEOUT,
         }
     }
 }
@@ -796,16 +826,32 @@ mod mac {
         /// 停止を要求し（起動途中なら完了通知の後に再要求）、設定が保持していた serial の書き込み端が閉じて
         /// コンソールログの書き出しスレッドが終了し、排他 lock も解放される。
         ///
+        /// `spec` にゲスト mount 指定の共有があれば、`start` の成功後に全共有の mount 報告を
+        /// `OpTimeouts::guest_mount` を上限に待ち、失敗・期限切れ・VM 停止は `PlatformError::GuestMount`
+        /// （`guest_mount.*`）で返す。`Vm::create` を直接使う呼び出し元は mount の結果を検証されない。
+        ///
         /// コンソールログは失敗の診断材料として削除しない。本 crate は一時ファイルを作らず（kernel・initrd・
         /// ディスクイメージは呼び出し側の所有物）、追記先として検証したパスを削除対象にする経路も作らない。
         pub fn launch(spec: &VmConfigSpec, timeouts: OpTimeouts) -> Result<Vm, PlatformError> {
             // 宣言順の逆に drop される: `vm`（先）→ `config`（後）。
-            let config = build_vz_configuration(spec)?;
+            let mut config = build_vz_configuration(spec)?;
             let vm = Vm::create_with_timeouts(&config, timeouts)?;
             if let Err(e) = vm.start() {
                 drop(vm);
                 drop(config);
                 return Err(e.into());
+            }
+            // ゲスト内 virtiofs mount の完了を待つ（mount 指定がある場合のみ。MAC-1・TASK-65.3）。
+            if let Some(watch) = config.take_guest_mount_watch() {
+                let alive = || match vm.state() {
+                    VmState::Running | VmState::Starting => Ok(()),
+                    other => Err(other),
+                };
+                if let Err(e) = watch.wait(timeouts.guest_mount(), alive) {
+                    drop(vm);
+                    drop(config);
+                    return Err(e.into());
+                }
             }
             Ok(vm)
         }
@@ -1907,5 +1953,28 @@ mod tests {
         let _ = std::fs::remove_file(&log);
         let _ = std::fs::remove_file(&kernel);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// MAC-1・REPAIR-5・TASK-65.3: ゲスト mount の待機時間は既定 60 秒で、範囲外は `vm.invalid_timeout`。
+    #[test]
+    fn guest_mount_timeout_default_and_bounds() {
+        assert_eq!(OpTimeouts::default().guest_mount(), Duration::from_secs(60));
+        let ok = OpTimeouts::default()
+            .with_guest_mount(MAX_OP_TIMEOUT)
+            .unwrap();
+        assert_eq!(ok.guest_mount(), MAX_OP_TIMEOUT);
+        assert_eq!(ok.start(), DEFAULT_START_TIMEOUT);
+        let one_ns = Duration::from_nanos(1);
+        for bad in [MIN_OP_TIMEOUT - one_ns, MAX_OP_TIMEOUT + one_ns] {
+            assert_eq!(
+                OpTimeouts::default().with_guest_mount(bad),
+                Err(VmError::InvalidTimeout {
+                    field: "guest_mount",
+                    requested: bad,
+                    min: MIN_OP_TIMEOUT,
+                    max: MAX_OP_TIMEOUT
+                })
+            );
+        }
     }
 }

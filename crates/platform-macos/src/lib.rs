@@ -3,8 +3,9 @@
 //! 現状は VM 設定・最小デバイス構成（`config`。TASK-64.2・64.3）・コンソールログの上限つき書き出し
 //! （`console_log`。TASK-64.3）・ライフサイクル（`vm`。TASK-64.4）・構造化エラー（`error`）と
 //! タイムアウト既定値・起動失敗時のクリーンアップ（`vm::Vm::launch`。TASK-64.5）まで実装済み。
-//! virtiofs 共有のデバイス構成（`virtiofs`。TASK-65.1）も実装済みで、ゲスト内 mount（TASK-65.3）と
-//! I/O 共有プロトコルへの接続（TASK-65.2）は未実装（REPAIR-3）。
+//! virtiofs 共有のデバイス構成（`virtiofs`。TASK-65.1）も実装済み。ゲスト内 mount（`guest_mount`。
+//! TASK-65.3）はホスト側（指示の生成・報告の検証・`Vm::launch` での待機）まで実装済みで、指示を実行して
+//! 報告するゲスト init は未実装（REPAIR-3）。I/O 共有プロトコルへの接続（TASK-65.2）も未実装（REPAIR-3）。
 //! 協調停止・pause / resume / save / restore と plugin 境界のエラー写像（TASK-115）は未実装（REPAIR-3）。
 //!
 //! - プラットフォーム対応: OS 非依存の検証ロジックは全 OS でビルドし 3 OS CI でテストする。
@@ -18,6 +19,7 @@ pub mod config;
 #[cfg(unix)]
 pub mod console_log;
 pub mod error;
+pub mod guest_mount;
 pub mod virtiofs;
 pub mod vm;
 

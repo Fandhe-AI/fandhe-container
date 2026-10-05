@@ -31,8 +31,10 @@
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::Duration;
+
+use crate::guest_mount::{ReportItem, ReportScanner};
 
 /// コンソールログのゲスト出力の上限（バイト。ファイル長で数える）。
 ///
@@ -135,11 +137,26 @@ impl CapPlan {
 ///
 /// 上限到達・書き込み失敗・読み出し失敗はそれぞれ最初の 1 回だけ `report` へ渡す。panic しない。
 /// `Interrupted` の読み出しは再試行し、その他の読み出し失敗で終了する。
+#[cfg(test)]
 pub(crate) fn copy_capped<R: Read, W: Write>(
+    src: R,
+    dst: W,
+    plan: CapPlan,
+    report: &mut dyn FnMut(ConsoleLogEvent),
+) -> ConsoleLogOutcome {
+    copy_capped_observed(src, dst, plan, report, &mut |_| {})
+}
+
+/// [`copy_capped`] に観測フックを加えた版。`observer` は読み出したチャンクを上限処理の**前**に受け取る。
+///
+/// ログの上限到達後・書き込み失敗後も読み続ける間は観測できるため、ブートログが長くてもゲストの mount 報告
+/// （`guest_mount`。MAC-1・TASK-65.3）を取りこぼさない。観測はバイト列を見るだけで、ログの上限は迂回しない。
+pub(crate) fn copy_capped_observed<R: Read, W: Write>(
     mut src: R,
     mut dst: W,
     plan: CapPlan,
     report: &mut dyn FnMut(ConsoleLogEvent),
+    observer: &mut dyn FnMut(&[u8]),
 ) -> ConsoleLogOutcome {
     let mut buf = [0u8; COPY_BUFFER_BYTES];
     let mut out = ConsoleLogOutcome::default();
@@ -160,6 +177,7 @@ pub(crate) fn copy_capped<R: Read, W: Write>(
             out.read_error = Some(ErrorKind::InvalidData);
             break;
         };
+        observer(chunk);
         let chunk_len = len_u64(chunk);
         if !accepting {
             out.discarded_bytes = out.discarded_bytes.saturating_add(chunk_len);
@@ -271,7 +289,14 @@ impl ConsoleLogSink {
     ///
     /// lock を取ってからファイル長を読むため、上限の計算は他の書き出しと競合しない。失敗時は `file`（と lock）・
     /// pipe を drop で閉じる。書き出し中の出来事（上限到達・書き込み / 読み出し失敗）は stderr の構造化ログで報告する。
-    pub(crate) fn spawn(file: File, cap: u64) -> Result<ConsoleLogSink, SpawnError> {
+    ///
+    /// `reports` を渡すと、書き出しスレッドがゲスト出力から mount 報告行を走査して送る（`try_send` のみで
+    /// スレッドはブロックしない。受信側が破棄されたら以後は走査しない。MAC-1・TASK-65.3）。
+    pub(crate) fn spawn(
+        file: File,
+        cap: u64,
+        reports: Option<SyncSender<ReportItem>>,
+    ) -> Result<ConsoleLogSink, SpawnError> {
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Err(SpawnError::InUse),
@@ -284,7 +309,25 @@ impl ConsoleLogSink {
             .name(WRITER_THREAD_NAME.to_string())
             .stack_size(WRITER_THREAD_STACK_BYTES)
             .spawn(move || {
-                let outcome = copy_capped(reader, file, plan, &mut report_to_stderr);
+                let mut reports = reports;
+                let mut scanner = ReportScanner::new();
+                let mut observe = |chunk: &[u8]| {
+                    let Some(tx) = reports.as_ref() else {
+                        return;
+                    };
+                    let mut disconnected = false;
+                    scanner.feed(chunk, &mut |item| {
+                        // 満杯なら捨てる（待機側は期限で失敗する）。切断されたら以後は走査しない。
+                        if let Err(TrySendError::Disconnected(_)) = tx.try_send(item) {
+                            disconnected = true;
+                        }
+                    });
+                    if disconnected {
+                        reports = None;
+                    }
+                };
+                let outcome =
+                    copy_capped_observed(reader, file, plan, &mut report_to_stderr, &mut observe);
                 // 受け手が既に無い（VZ へ渡して取っ手を手放した）なら結果は捨てる（出来事は報告済み）。
                 let _ = tx.send(outcome);
             })?;
@@ -673,7 +716,7 @@ mod tests {
     #[test]
     fn sink_appends_through_pipe() {
         let t = TempFile::new("append", b"previous\n");
-        let mut sink = ConsoleLogSink::spawn(t.append_handle(), 1000).unwrap();
+        let mut sink = ConsoleLogSink::spawn(t.append_handle(), 1000, None).unwrap();
         sink.writer().write_all(b"guest boot\n").unwrap();
         let out = sink.finish(WAIT).expect("writer thread finished");
         assert_eq!(out.written_bytes, 11);
@@ -686,7 +729,8 @@ mod tests {
     #[test]
     fn sink_stops_at_production_cap() {
         let t = TempFile::new("cap", b"");
-        let mut sink = ConsoleLogSink::spawn(t.append_handle(), MAX_CONSOLE_LOG_BYTES).unwrap();
+        let mut sink =
+            ConsoleLogSink::spawn(t.append_handle(), MAX_CONSOLE_LOG_BYTES, None).unwrap();
         let chunk = vec![b'z'; 64 * 1024];
         let total = MAX_CONSOLE_LOG_BYTES + 256 * 1024;
         let mut sent = 0u64;
@@ -709,14 +753,14 @@ mod tests {
     #[test]
     fn sink_rejects_concurrent_writer_on_same_log() {
         let t = TempFile::new("lock", b"");
-        let mut first = ConsoleLogSink::spawn(t.append_handle(), 1000).unwrap();
+        let mut first = ConsoleLogSink::spawn(t.append_handle(), 1000, None).unwrap();
         assert_eq!(
-            ConsoleLogSink::spawn(t.append_handle(), 1000).err(),
+            ConsoleLogSink::spawn(t.append_handle(), 1000, None).err(),
             Some(SpawnError::InUse)
         );
         first.writer().write_all(b"one\n").unwrap();
         first.finish(WAIT).expect("writer thread finished");
-        let second = ConsoleLogSink::spawn(t.append_handle(), 1000).unwrap();
+        let second = ConsoleLogSink::spawn(t.append_handle(), 1000, None).unwrap();
         second.finish(WAIT).expect("writer thread finished");
         assert_eq!(std::fs::read(&t.0).unwrap(), b"one\n");
     }
@@ -725,11 +769,51 @@ mod tests {
     #[test]
     fn sink_does_not_grow_full_file() {
         let t = TempFile::new("full", &[b'a'; 200]);
-        let mut sink = ConsoleLogSink::spawn(t.append_handle(), 200).unwrap();
+        let mut sink = ConsoleLogSink::spawn(t.append_handle(), 200, None).unwrap();
         sink.writer().write_all(b"more output").unwrap();
         let out = sink.finish(WAIT).expect("writer thread finished");
         assert_eq!(std::fs::metadata(&t.0).unwrap().len(), 200);
         assert_eq!(out.discarded_bytes, 11);
         assert!(!out.marker_written);
+    }
+
+    /// MAC-1・TASK-65.3: ログの上限に達した後に出た mount 報告も観測フックに届く（上限は迂回しない）。
+    #[test]
+    fn sink_reports_guest_mount_after_log_cap() {
+        use crate::guest_mount::{GuestMountOutcome, GuestMountReport};
+        use crate::virtiofs::VirtiofsTag;
+        let t = TempFile::new("report", b"");
+        let (tx, rx) = mpsc::sync_channel(4);
+        let mut sink = ConsoleLogSink::spawn(t.append_handle(), 100, Some(tx)).unwrap();
+        sink.writer().write_all(&[b'z'; 4096]).unwrap();
+        sink.writer()
+            .write_all(b"\nfandhe-guest: virtiofs-mount v1 tag=data result=ok\r\n")
+            .unwrap();
+        let out = sink.finish(WAIT).expect("writer thread finished");
+        assert!(out.limit_reached);
+        assert_eq!(
+            rx.recv_timeout(WAIT).unwrap(),
+            Ok(GuestMountReport {
+                tag: VirtiofsTag::try_new("data").unwrap(),
+                outcome: GuestMountOutcome::Mounted
+            })
+        );
+        // 書き込み端が閉じて書き出しスレッドが終わると送信側が破棄され、切断になる。
+        assert!(rx.recv_timeout(WAIT).is_err());
+    }
+
+    /// MAC-1・TASK-65.3: 受信側が破棄されても書き出しスレッドは止まらずログを書き続ける。
+    #[test]
+    fn sink_survives_dropped_report_receiver() {
+        let t = TempFile::new("report-drop", b"");
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut sink = ConsoleLogSink::spawn(t.append_handle(), 1000, Some(tx)).unwrap();
+        drop(rx);
+        let line = b"fandhe-guest: virtiofs-mount v1 tag=data result=ok\n";
+        sink.writer().write_all(line).unwrap();
+        sink.writer().write_all(line).unwrap();
+        sink.writer().write_all(b"after\n").unwrap();
+        let out = sink.finish(WAIT).expect("writer thread finished");
+        assert_eq!(out.written_bytes, 2 * line.len() as u64 + 6);
     }
 }

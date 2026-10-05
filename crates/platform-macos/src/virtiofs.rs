@@ -6,8 +6,9 @@
 //! `config::build_vz_configuration` が `sys` 経由で行う。不正値は panic ではなく [`ConfigError`] で返す。
 //!
 //! 呼び出し文脈: `config::build_vz_configuration` が共有ごとにデバイス構成を組み立てる。ゲスト内の mount
-//! （TASK-65.3。タグが mount 引数になるため文字種を絞っている）と I/O 共有プロトコルへの接続（TASK-65.2）は
-//! 別タスクで、本モジュールでは未実装（REPAIR-3）。キャッシュポリシーは VZ に設定項目がなく扱わない。
+//! 指定（`guest_mount`。TASK-65.3）は任意で、指示・報告の契約は `guest_mount` モジュールにある（タグが
+//! 指示トークンの一部になるため文字種を絞っている）。I/O 共有プロトコルへの接続（TASK-65.2）は別タスクで、
+//! 本モジュールでは未実装（REPAIR-3）。キャッシュポリシーは VZ に設定項目がなく扱わない。
 //!
 //! 信頼前提: 共有ディレクトリの検証（symlink 非経由・実在ディレクトリ）から VM 起動までの間にパスが差し
 //! 替えられる TOCTOU は検査できない。呼び出し側が実体パスを渡し、共有ディレクトリの祖先を他者が書き換えられ
@@ -16,6 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::{ConfigError, ConfigField, check_absolute_utf8};
+use crate::guest_mount::GuestMountPoint;
 
 /// virtiofs 共有の最大件数（無制限確保の防止。`MAX_BLOCK_DEVICES` に合わせる）。
 pub const MAX_VIRTIOFS_SHARES: usize = 8;
@@ -213,6 +215,8 @@ pub struct VirtiofsShareSpec {
     pub host_dir: SharedDirectoryPath,
     /// アクセス権。
     pub access: ShareAccess,
+    /// ゲスト内の mount point（TASK-65.3）。`None` ならデバイスだけ見せ、ゲストでの mount は指示しない。
+    pub guest_mount: Option<GuestMountPoint>,
 }
 
 impl VirtiofsShareSpec {
@@ -222,7 +226,14 @@ impl VirtiofsShareSpec {
             tag,
             host_dir,
             access,
+            guest_mount: None,
         }
+    }
+
+    /// ゲスト内 mount point を指定する（TASK-65.3）。起動時にゲストが自動で mount し、結果を報告する。
+    pub fn with_guest_mount(mut self, mount_point: GuestMountPoint) -> Self {
+        self.guest_mount = Some(mount_point);
+        self
     }
 }
 
@@ -251,6 +262,18 @@ impl VirtiofsSharesSpec {
                     tag: share.tag.as_str().to_string(),
                 });
             }
+            // 同一または入れ子の mount point はマウント順への依存と上書きを生むため拒否する（TASK-65.3）。
+            if let Some(mp) = &share.guest_mount
+                && shares
+                    .iter()
+                    .skip(i + 1)
+                    .filter_map(|o| o.guest_mount.as_ref())
+                    .any(|o| mp.overlaps(o))
+            {
+                return Err(ConfigError::DuplicateGuestMountPoint {
+                    path: mp.as_str().to_string(),
+                });
+            }
         }
         Ok(Self { shares })
     }
@@ -258,6 +281,15 @@ impl VirtiofsSharesSpec {
     /// 共有群。
     pub fn shares(&self) -> &[VirtiofsShareSpec] {
         &self.shares
+    }
+
+    /// ゲスト mount 指定のある共有の tag（ゲストからの報告を待つ対象。TASK-65.3）。
+    pub fn guest_mount_tags(&self) -> Vec<String> {
+        self.shares
+            .iter()
+            .filter(|s| s.guest_mount.is_some())
+            .map(|s| s.tag.as_str().to_string())
+            .collect()
     }
 }
 

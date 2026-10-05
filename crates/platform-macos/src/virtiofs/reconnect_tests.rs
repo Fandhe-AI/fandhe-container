@@ -304,8 +304,13 @@ fn connection_loss_then_reconnect_failure() {
     assert_eq!(err.code(), "virtiofs_io.reconnect_failed");
     assert!(matches!(
         err,
-        VirtiofsIoError::ReconnectFailed { attempts: 2, .. }
+        VirtiofsIoError::ReconnectFailed {
+            attempts: 2,
+            unflushed_writes: 1,
+            ..
+        }
     ));
+    assert_eq!(c.unflushed_writes(), 0);
     assert!(!c.is_connected());
     assert_eq!(*h.calls.borrow(), 3);
     assert_eq!(*h.pauses.borrow(), vec![Duration::from_millis(3)]);
@@ -324,7 +329,37 @@ fn non_disconnect_error_passes_through_then_reconnects_next_call() {
     assert_eq!(*h.calls.borrow(), 1);
     assert!(!c.is_connected());
 
-    c.write(b"b").expect("write after reconnect");
+    // poison 後の再接続では旧接続の未確定 Write(1 件) を黙って捨てず ConnectionLost で明示する。
+    let err = c.write(b"b").expect_err("unflushed must be reported");
+    assert!(matches!(
+        err,
+        VirtiofsIoError::ConnectionLost {
+            op: VirtiofsIoOp::Write,
+            unflushed_writes: 1,
+            reconnected: true,
+            ..
+        }
+    ));
     assert_eq!(*h.calls.borrow(), 2);
     assert_eq!(c.reconnects(), 1);
+    assert_eq!(c.unflushed_writes(), 0);
+    c.write(b"b").expect("write after acknowledged loss");
+    assert_eq!(c.unflushed_writes(), 1);
+}
+
+/// IO-2・TASK-65.5: 通常 ACK（暗黙 flush）では未確定件数を減らさない。FLUSH ACK 成功時のみ 0 に戻る。
+#[test]
+fn normal_ack_does_not_reset_unflushed() {
+    let dir = TempDir::new("implicit");
+    let script = vec![Ok(Mode::Healthy)];
+    let (res, _h) = build(&dir, ShareAccess::ReadWrite, 4, script, policy(3, 1));
+    let mut c = res.expect("connected");
+    let mut acked = 0;
+    for _ in 0..6 {
+        acked += c.write(b"x").expect("write").acked_writes;
+    }
+    assert!(acked > 0, "implicit ack expected with a small limit");
+    assert_eq!(c.unflushed_writes(), 6);
+    c.flush().expect("flush");
+    assert_eq!(c.unflushed_writes(), 0);
 }

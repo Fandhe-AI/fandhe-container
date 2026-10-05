@@ -137,7 +137,12 @@ pub enum VirtiofsIoError {
         source: IoError,
     },
     /// 再接続を既定回数試みたがすべて失敗した（TASK-65.5）。`source` は最後の試行のエラー。
-    ReconnectFailed { attempts: u32, source: IoError },
+    /// `unflushed_writes` は切断時点で永続化が確認できていなかった `Write` の件数（初回接続の失敗では 0）。
+    ReconnectFailed {
+        attempts: u32,
+        unflushed_writes: u64,
+        source: IoError,
+    },
     /// 再接続ポリシーの値が許容範囲外（TASK-65.5）。`field` は違反した項目名。
     InvalidReconnectPolicy { field: &'static str },
 }
@@ -198,8 +203,18 @@ impl VirtiofsIoError {
                  {unflushed_writes} unflushed write(s) must be re-issued",
                 op.as_str()
             ),
-            VirtiofsIoError::ReconnectFailed { attempts, source } => {
-                format!("virtiofs io reconnect failed after {attempts} attempt(s): {source}")
+            VirtiofsIoError::ReconnectFailed {
+                attempts,
+                unflushed_writes,
+                source,
+            } => {
+                let base =
+                    format!("virtiofs io reconnect failed after {attempts} attempt(s): {source}");
+                if *unflushed_writes > 0 {
+                    format!("{base}; {unflushed_writes} unflushed write(s) must be re-issued")
+                } else {
+                    base
+                }
             }
             VirtiofsIoError::InvalidReconnectPolicy { field } => {
                 format!("virtiofs io reconnect policy {field} is outside the allowed range")

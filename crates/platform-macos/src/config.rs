@@ -189,6 +189,20 @@ pub enum ConfigError {
     VirtiofsTagRejected { domain: String, code: isize },
     /// virtiofs 共有タグ（大文字小文字非区別）が重複した。
     DuplicateVirtiofsTag { tag: String },
+    /// ゲスト mount point が `GUEST_MOUNT_BASE` 配下でない（MAC-1・TASK-65.3）。
+    GuestMountPointNotUnderBase,
+    /// ゲスト mount point に許可外の要素・文字がある（`index` はバイト位置）。
+    GuestMountPointInvalid { index: usize },
+    /// ゲスト mount point が長さの上限を超えた。
+    GuestMountPointTooLong { len: usize, max: usize },
+    /// ゲスト mount point が他の共有と重複または入れ子になっている。
+    DuplicateGuestMountPoint { path: String },
+    /// ゲスト mount 指定があるのにシリアルコンソールがなく、結果を検証できない（fail-closed）。
+    GuestMountRequiresConsole,
+    /// ゲスト mount 指定があるのにカーネルコマンドラインに `console=hvc0` がなく、報告がホストへ届かない（fail-closed）。
+    GuestMountRequiresConsoleArg,
+    /// ユーザー指定のコマンドラインに予約キー（`fandhe.` 始まり）のトークンがある（`index` はバイト位置）。
+    CommandLineReservedKey { index: usize },
     /// virtiofs 共有数が上限を超えた。
     TooManyVirtiofsShares { count: usize, max: usize },
     /// 共有ディレクトリがディレクトリでない。
@@ -286,6 +300,13 @@ impl ConfigError {
             ConfigError::VirtiofsTagInvalidChar { .. } => "config.virtiofs_tag_invalid_char",
             ConfigError::VirtiofsTagRejected { .. } => "config.virtiofs_tag_rejected",
             ConfigError::DuplicateVirtiofsTag { .. } => "config.duplicate_virtiofs_tag",
+            ConfigError::GuestMountPointNotUnderBase => "config.guest_mount_point_not_under_base",
+            ConfigError::GuestMountPointInvalid { .. } => "config.guest_mount_point_invalid",
+            ConfigError::GuestMountPointTooLong { .. } => "config.guest_mount_point_too_long",
+            ConfigError::DuplicateGuestMountPoint { .. } => "config.duplicate_guest_mount_point",
+            ConfigError::GuestMountRequiresConsole => "config.guest_mount_requires_console",
+            ConfigError::GuestMountRequiresConsoleArg => "config.guest_mount_requires_console_arg",
+            ConfigError::CommandLineReservedKey { .. } => "config.command_line_reserved_key",
             ConfigError::TooManyVirtiofsShares { .. } => "config.too_many_virtiofs_shares",
             ConfigError::SharedDirNotDirectory { .. } => "config.shared_dir_not_directory",
             ConfigError::SharedDirSymlink { .. } => "config.shared_dir_symlink",
@@ -453,6 +474,28 @@ impl ConfigError {
             }
             ConfigError::VirtiofsTagRejected { domain, code } => {
                 format!("virtualization framework rejected the virtiofs tag ({domain} {code})")
+            }
+            ConfigError::GuestMountPointNotUnderBase => format!(
+                "guest mount point must be under {}/",
+                crate::guest_mount::GUEST_MOUNT_BASE
+            ),
+            ConfigError::GuestMountPointInvalid { index } => format!(
+                "guest mount point has an invalid element or character at byte {index} (allowed: ASCII letters, digits, '.', '_', '-'; '.' and '..' are not allowed)"
+            ),
+            ConfigError::GuestMountPointTooLong { len, max } => {
+                format!("guest mount point is {len} bytes (or has too many elements), max is {max}")
+            }
+            ConfigError::DuplicateGuestMountPoint { path } => {
+                format!("guest mount point is duplicated or nested: {path}")
+            }
+            ConfigError::GuestMountRequiresConsole => {
+                "guest mount requires a serial console to verify the result".to_string()
+            }
+            ConfigError::GuestMountRequiresConsoleArg => {
+                "guest mount requires 'console=hvc0' in the kernel command line".to_string()
+            }
+            ConfigError::CommandLineReservedKey { index } => {
+                format!("kernel command line has a reserved 'fandhe.' key at byte {index}")
             }
             ConfigError::DuplicateVirtiofsTag { tag } => {
                 format!("virtiofs tag is used more than once: {tag}")
@@ -1658,6 +1701,47 @@ impl VmConfigSpec {
         Ok(())
     }
 
+    /// ゲストへ渡す実効コマンドライン（ユーザー指定＋ゲスト mount の指示。MAC-1・TASK-65.3）。
+    ///
+    /// ユーザー指定に予約キー（`fandhe.` 始まり）があれば拒否し、連結後に [`KernelCommandLine::try_new`] を
+    /// 再度通して長さ上限を実効値に対して適用する。mount 指定が無ければユーザー指定と同一。
+    pub fn effective_cmdline(&self) -> Result<KernelCommandLine, ConfigError> {
+        crate::guest_mount::reject_reserved_keys(self.cmdline.as_str())?;
+        let directives = crate::guest_mount::encode_directives(&self.shares);
+        if directives.is_empty() {
+            return Ok(self.cmdline.clone());
+        }
+        let joined = if self.cmdline.as_str().is_empty() {
+            directives
+        } else {
+            format!("{} {directives}", self.cmdline.as_str())
+        };
+        KernelCommandLine::try_new(&joined)
+    }
+
+    /// ゲスト mount の結果を待つ対象の tag（mount 指定が無ければ `None`）。
+    ///
+    /// mount 指定があるのにシリアルコンソールが無い構成は、結果を検証する経路が無いため拒否する（fail-closed）。
+    pub fn guest_mount_plan(&self) -> Result<Option<Vec<String>>, ConfigError> {
+        let tags = self.shares.guest_mount_tags();
+        if tags.is_empty() {
+            return Ok(None);
+        }
+        if self.devices.serial_console().is_none() {
+            return Err(ConfigError::GuestMountRequiresConsole);
+        }
+        // 報告は hvc0 のコンソール出力で届く。console= が無いと mount に成功しても報告が来ず launch が待ち続ける。
+        if !self
+            .cmdline
+            .as_str()
+            .split_ascii_whitespace()
+            .any(|t| t == "console=hvc0")
+        {
+            return Err(ConfigError::GuestMountRequiresConsoleArg);
+        }
+        Ok(Some(tags))
+    }
+
     /// シリアルコンソールの出力先を上限つきの書き出しとして開く（無ければ `None`）。
     ///
     /// ログファイルを検証つきで開き（[`Self::open_serial_console_log`]）、ファイル長が
@@ -1669,6 +1753,15 @@ impl VmConfigSpec {
     pub fn open_serial_console(
         &self,
     ) -> Result<Option<crate::console_log::ConsoleLogSink>, ConfigError> {
+        self.open_serial_console_with_reports(None)
+    }
+
+    /// [`Self::open_serial_console`] に、ゲストの mount 報告の送信側を渡す版（MAC-1・TASK-65.3）。
+    #[cfg(unix)]
+    pub fn open_serial_console_with_reports(
+        &self,
+        reports: Option<crate::guest_mount::ReportSender>,
+    ) -> Result<Option<crate::console_log::ConsoleLogSink>, ConfigError> {
         use crate::console_log::{ConsoleLogSink, MAX_CONSOLE_LOG_BYTES, SpawnError};
         let Some(SerialConsoleSink::LogFile(log)) = self.devices.serial_console() else {
             return Ok(None);
@@ -1677,7 +1770,7 @@ impl VmConfigSpec {
         let Some(file) = self.open_serial_console_log()? else {
             return Ok(None);
         };
-        match ConsoleLogSink::spawn(file, MAX_CONSOLE_LOG_BYTES) {
+        match ConsoleLogSink::spawn(file, MAX_CONSOLE_LOG_BYTES, reports) {
             Ok(sink) => Ok(Some(sink)),
             Err(SpawnError::InUse) => Err(ConfigError::ConsoleLogInUse {
                 path: log_path.to_path_buf(),
@@ -1730,12 +1823,18 @@ pub struct SharedDirectoryReadBack {
 #[cfg(target_os = "macos")]
 pub struct VzVmConfiguration(
     objc2::rc::Retained<objc2_virtualization::VZVirtualMachineConfiguration>,
+    Option<crate::guest_mount::GuestMountWatch>,
 );
 
 #[cfg(target_os = "macos")]
 impl VzVmConfiguration {
     pub(crate) fn inner(&self) -> &objc2_virtualization::VZVirtualMachineConfiguration {
         &self.0
+    }
+
+    /// ゲスト mount の待機対象を取り出す（mount 指定が無ければ `None`。1 度だけ取り出せる。TASK-65.3）。
+    pub(crate) fn take_guest_mount_watch(&mut self) -> Option<crate::guest_mount::GuestMountWatch> {
+        self.1.take()
     }
 
     /// 設定済みの CPU 数（診断用）。
@@ -1830,6 +1929,16 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
     // ReadWrite 共有が起動入力を含む構成と、ReadOnly を含む共有範囲外経路のある構成は、副作用の前に拒否する。
     spec.check_share_conflicts()?;
 
+    // 実効コマンドライン（ゲスト mount の指示を含む）と待機対象を、副作用（ログ作成・スレッド起動）の前に確定する。
+    let effective_cmdline = spec.effective_cmdline()?;
+    let (report_tx, mount_watch) = match spec.guest_mount_plan()? {
+        Some(tags) => {
+            let (tx, watch) = crate::guest_mount::GuestMountWatch::channel(tags);
+            (Some(tx), Some(watch))
+        }
+        None => (None, None),
+    };
+
     let kernel_url =
         NSURL::from_file_path(spec.kernel.as_path()).ok_or(ConfigError::UrlConversion {
             field: ConfigField::Kernel,
@@ -1842,7 +1951,7 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
         ),
         None => None,
     };
-    let cmdline = NSString::from_str(spec.cmdline.as_str());
+    let cmdline = NSString::from_str(effective_cmdline.as_str());
 
     // ブロックデバイス（副作用なし。件数は DeviceConfigSpec が上限検証済み）。
     let mut storage = Vec::with_capacity(spec.devices.block_devices().len());
@@ -1890,7 +1999,7 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
     // 使用時点で fd を kernel / initrd / ディスクイメージと照合し、リンク数・所有者も検査する。
     // VZ へはログファイルではなく上限つき書き出しの pipe の書き込み端を渡す（追記量の上限。P1-3）。
     let mut serial = Vec::new();
-    if let Some(sink) = spec.open_serial_console()? {
+    if let Some(sink) = spec.open_serial_console_with_reports(report_tx)? {
         let handle = crate::sys::new_file_handle(sink.into_write_fd());
         serial.push(crate::sys::new_console_serial_port(&handle));
     }
@@ -1899,7 +2008,7 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
     let config = crate::sys::new_vm_configuration(&boot, cpus, memory);
     crate::sys::set_devices(&config, &storage, &serial);
     crate::sys::set_directory_sharing_devices(&config, &sharing);
-    Ok(VzVmConfiguration(config))
+    Ok(VzVmConfiguration(config, mount_watch))
 }
 
 #[cfg(test)]
@@ -1914,6 +2023,9 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("fandhe-macos-cfg-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("create temp dir");
+            // macOS の一時ディレクトリ（/var/folders/...）は /private/var への symlink を含み、共有ディレクトリの
+            // symlink 拒否検証（SharedDirSymlink）に掛かるため、正規化済みパスを使う。
+            let dir = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
             // umask に依らず親ディレクトリ検査（他者書き込み可能かつ sticky なしは拒否）を通る 0700 にする。
             #[cfg(unix)]
             {
@@ -3457,5 +3569,206 @@ broken line
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o606
         );
+    }
+
+    /// ゲスト mount 指定つき共有（tag, mount point, access）。
+    fn mount_shares(
+        dir: &Path,
+        specs: &[(&str, &str, crate::virtiofs::ShareAccess)],
+    ) -> VirtiofsSharesSpec {
+        use crate::guest_mount::GuestMountPoint;
+        use crate::virtiofs::{SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
+        let host = SharedDirectoryPath::try_new(dir).unwrap();
+        VirtiofsSharesSpec::try_new(
+            specs
+                .iter()
+                .map(|(tag, mp, access)| {
+                    VirtiofsShareSpec::new(
+                        VirtiofsTag::try_new(tag).unwrap(),
+                        host.clone(),
+                        *access,
+                    )
+                    .with_guest_mount(GuestMountPoint::try_new(mp).unwrap())
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// MAC-1・TASK-65.3: 実効コマンドラインは具体的な文字列で、mount 指定なしならユーザー指定のまま。
+    #[test]
+    fn effective_cmdline_appends_directives() {
+        use crate::virtiofs::ShareAccess::{ReadOnly, ReadWrite};
+        let t = TempDir::new("eff-cmdline");
+        let k = t.file("vmlinux");
+        let base = VmConfigSpec::from_parts(&k, None, "console=hvc0").unwrap();
+        assert_eq!(base.effective_cmdline().unwrap().as_str(), "console=hvc0");
+        let spec = base.clone().with_shared_directories(mount_shares(
+            &t.0,
+            &[
+                ("a", "/mnt/fandhe/a", ReadOnly),
+                ("b", "/mnt/fandhe/b", ReadWrite),
+            ],
+        ));
+        assert_eq!(
+            spec.effective_cmdline().unwrap().as_str(),
+            "console=hvc0 fandhe.virtiofs=a:/mnt/fandhe/a:ro fandhe.virtiofs=b:/mnt/fandhe/b:rw"
+        );
+        let empty = VmConfigSpec::from_parts(&k, None, "")
+            .unwrap()
+            .with_shared_directories(mount_shares(&t.0, &[("a", "/mnt/fandhe/a", ReadOnly)]));
+        assert_eq!(
+            empty.effective_cmdline().unwrap().as_str(),
+            "fandhe.virtiofs=a:/mnt/fandhe/a:ro"
+        );
+    }
+
+    /// MAC-1・TASK-65.3: ユーザー指定の予約キーは拒否し、実効長は連結後に上限検証する。
+    #[test]
+    fn effective_cmdline_rejects_reserved_and_overlong() {
+        use crate::virtiofs::ShareAccess::ReadWrite;
+        let t = TempDir::new("eff-reserved");
+        let k = t.file("vmlinux");
+        for user in ["fandhe.virtiofs=x:/mnt/fandhe/x:rw", "quiet fandhe.x=1"] {
+            let spec = VmConfigSpec::from_parts(&k, None, user).unwrap();
+            assert_eq!(
+                spec.effective_cmdline().unwrap_err().code(),
+                "config.command_line_reserved_key",
+                "{user}"
+            );
+        }
+        // ユーザー指定は上限内でも、指示の連結後に 2048 バイトを超えれば拒否する。
+        let user = "a".repeat(2000);
+        let specs: Vec<(String, String)> = (0..8)
+            .map(|i| (format!("tag{i}"), format!("/mnt/fandhe/m{i}")))
+            .collect();
+        let refs: Vec<(&str, &str, crate::virtiofs::ShareAccess)> = specs
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str(), ReadWrite))
+            .collect();
+        let spec = VmConfigSpec::from_parts(&k, None, &user)
+            .unwrap()
+            .with_shared_directories(mount_shares(&t.0, &refs));
+        assert_eq!(
+            spec.effective_cmdline().unwrap_err().code(),
+            "config.command_line_too_long"
+        );
+    }
+
+    /// MAC-1・TASK-65.3: mount 指定があるのにコンソールが無い構成は fail-closed で拒否する。
+    #[test]
+    fn guest_mount_requires_console() {
+        use crate::virtiofs::ShareAccess::ReadOnly;
+        let t = TempDir::new("mount-console");
+        let k = t.file("vmlinux");
+        let shares = mount_shares(&t.0, &[("a", "/mnt/fandhe/a", ReadOnly)]);
+        let spec = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_shared_directories(shares.clone());
+        assert_eq!(
+            spec.guest_mount_plan(),
+            Err(ConfigError::GuestMountRequiresConsole)
+        );
+        let log = ConsoleLogPath::try_new(t.0.join("console.log")).unwrap();
+        let devices =
+            DeviceConfigSpec::try_new(vec![], Some(SerialConsoleSink::LogFile(log))).unwrap();
+        let with_console = spec.with_devices(devices).unwrap();
+        assert_eq!(
+            with_console.guest_mount_plan(),
+            Ok(Some(vec!["a".to_string()]))
+        );
+        // console=hvc0 が無いコマンドラインは報告が届かないため拒否する。
+        let no_arg = VmConfigSpec::from_parts(&k, None, "quiet")
+            .unwrap()
+            .with_shared_directories(shares.clone())
+            .with_devices(
+                DeviceConfigSpec::try_new(
+                    vec![],
+                    Some(SerialConsoleSink::LogFile(
+                        ConsoleLogPath::try_new(t.0.join("console2.log")).unwrap(),
+                    )),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            no_arg.guest_mount_plan(),
+            Err(ConfigError::GuestMountRequiresConsoleArg)
+        );
+        // mount 指定の無い共有だけなら待機対象なし（コンソールも不要）。
+        let plain = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_shared_directories(shares_for(&t.0));
+        assert_eq!(plain.guest_mount_plan(), Ok(None));
+    }
+
+    /// MAC-1・TASK-65.3: mount point の重複・入れ子は共有の集合として拒否する。
+    #[test]
+    fn duplicate_or_nested_mount_points_rejected() {
+        use crate::guest_mount::GuestMountPoint;
+        use crate::virtiofs::{SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
+        let t = TempDir::new("mount-dup");
+        let host = SharedDirectoryPath::try_new(&t.0).unwrap();
+        let mk = |tag: &str, mp: &str| {
+            VirtiofsShareSpec::new(
+                VirtiofsTag::try_new(tag).unwrap(),
+                host.clone(),
+                crate::virtiofs::ShareAccess::ReadOnly,
+            )
+            .with_guest_mount(GuestMountPoint::try_new(mp).unwrap())
+        };
+        for (a, b) in [
+            ("/mnt/fandhe/x", "/mnt/fandhe/x"),
+            ("/mnt/fandhe/x", "/mnt/fandhe/x/y"),
+            ("/mnt/fandhe/x/y", "/mnt/fandhe/x"),
+        ] {
+            let err = VirtiofsSharesSpec::try_new(vec![mk("t1", a), mk("t2", b)]).unwrap_err();
+            assert_eq!(err.code(), "config.duplicate_guest_mount_point", "{a} {b}");
+        }
+        assert!(
+            VirtiofsSharesSpec::try_new(vec![
+                mk("t1", "/mnt/fandhe/x"),
+                mk("t2", "/mnt/fandhe/xy")
+            ])
+            .is_ok()
+        );
+    }
+
+    /// MAC-1・TASK-65.3: 追加した ConfigError の code / message は具体値。
+    #[test]
+    fn guest_mount_config_error_strings() {
+        let cases = [
+            (
+                ConfigError::GuestMountPointNotUnderBase,
+                "config.guest_mount_point_not_under_base",
+                "guest mount point must be under /mnt/fandhe/",
+            ),
+            (
+                ConfigError::GuestMountRequiresConsole,
+                "config.guest_mount_requires_console",
+                "guest mount requires a serial console to verify the result",
+            ),
+            (
+                ConfigError::GuestMountRequiresConsoleArg,
+                "config.guest_mount_requires_console_arg",
+                "guest mount requires 'console=hvc0' in the kernel command line",
+            ),
+            (
+                ConfigError::CommandLineReservedKey { index: 4 },
+                "config.command_line_reserved_key",
+                "kernel command line has a reserved 'fandhe.' key at byte 4",
+            ),
+            (
+                ConfigError::DuplicateGuestMountPoint {
+                    path: "/mnt/fandhe/x".into(),
+                },
+                "config.duplicate_guest_mount_point",
+                "guest mount point is duplicated or nested: /mnt/fandhe/x",
+            ),
+        ];
+        for (e, code, msg) in cases {
+            assert_eq!(e.code(), code);
+            assert_eq!(e.message(), msg);
+        }
     }
 }

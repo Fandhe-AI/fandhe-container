@@ -5,7 +5,9 @@
 //! タイムアウト既定値・起動失敗時のクリーンアップ（`vm::Vm::launch`。TASK-64.5）まで実装済み。
 //! virtiofs 共有のデバイス構成（`virtiofs`。TASK-65.1）と、汎用トランスポート上の I/O 共有プロトコル
 //! クライアント（`virtiofs::VirtiofsIoClient`。TASK-65.2）も実装済み。クライアント側の UDS `connect`・
-//! macOS ホスト側の VZ vsock・ゲスト内 mount（TASK-65.3）は未実装（REPAIR-3）。
+//! macOS ホスト側の VZ vsock は未実装（REPAIR-3）。ゲスト内 mount（`guest_mount`。TASK-65.3）は
+//! ホスト側（指示の生成・報告の検証・`Vm::launch` での待機）まで実装済みで、指示を実行して報告する
+//! ゲスト init は未実装（REPAIR-3）。
 //! 協調停止・pause / resume / save / restore と plugin 境界のエラー写像（TASK-115）は未実装（REPAIR-3）。
 //!
 //! - プラットフォーム対応: OS 非依存の検証ロジックは全 OS でビルドし 3 OS CI でテストする。
@@ -19,6 +21,7 @@ pub mod config;
 #[cfg(unix)]
 pub mod console_log;
 pub mod error;
+pub mod guest_mount;
 pub mod virtiofs;
 pub mod vm;
 

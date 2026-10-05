@@ -31,6 +31,16 @@
 //! - Linux・macOS: `killpg(2)`（`kill_process_group`。plugin の子のプロセスグループへ `SIGKILL`。#1311。それ以外の unix は `Unsupported`）
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
+//! # 限界（残存リスク。対策は未実装。PLUG-12・#1390）
+//! - 資格情報の時点: Linux の `SO_PEERCRED` は、接続を受け付ける側（server）が `listen(2)` を呼んだ時点の
+//!   プロセスの資格情報を、client 側から見た peer 資格情報として返す（`man 7 unix`）。client が検証する
+//!   のは accept 時点のプロセスではなく listen 時点のものである。macOS の `getpeereid(2)` も接続確立時点
+//!   の値と想定するが、同じ文言での挙動は未検証。
+//! - fd の受け渡し: 接続済み fd を `SCM_RIGHTS`・fork 継承で別プロセスへ渡しても、資格情報は接続確立時点の
+//!   まま変わらないため検出できない。
+//! - PID 再利用: `peer_pid` の照合は数値比較で、対象プロセス終了後に同じ pid が再利用される窓が残る
+//!   （pidfd 等による緩和は将来課題）。
+//!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
 //!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
@@ -820,6 +830,8 @@ mod linux {
 
     pub(super) const UCRED_SIZE: usize = core::mem::size_of::<Ucred>();
     const _: () = assert!(UCRED_SIZE <= u32::MAX as usize);
+    // ABI 固定: `struct ucred` は pid_t・uid_t・gid_t の 4 バイト 3 つ（x86_64 / aarch64 共通で 12 バイト）。
+    const _: () = assert!(UCRED_SIZE == 12);
     pub(super) const UCRED_LEN: u32 = UCRED_SIZE as u32;
 
     #[cfg(target_arch = "x86_64")]
@@ -851,7 +863,38 @@ unsafe extern "C" {
     fn getpeereid(socket: i32, euid: *mut u32, egid: *mut u32) -> i32;
 }
 
+/// 取得バッファの初期値に使う番兵値（`(uid_t)-1`）。有効な uid として割り当てられない値で、syscall が
+/// 成功を返しつつ書き込まなかった場合に、core が root（uid 0）でも peer と一致させないために使う（PLUG-12・#1390）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+const PEER_ID_SENTINEL: u32 = u32::MAX;
+
+/// 取得した peer uid が番兵値のままなら（＝書き込まれていない）エラー、そうでなければ値を返す（fail-closed）。
+/// `peer_uid`（Linux・macOS）から呼ばれる、unsafe を含まないテスト可能な継ぎ目。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn peer_uid_from_raw(raw: u32) -> Result<u32, PluginError> {
+    if raw == PEER_ID_SENTINEL {
+        return Err(PluginError::new(
+            PluginErrorCode::Internal,
+            "failed to obtain peer credential",
+        ));
+    }
+    Ok(raw)
+}
+
 /// 接続元の接続時点の資格情報（SO_PEERCRED）を取得する（Linux）。取得できなければ fail-closed でエラー。
+/// バッファは番兵値（pid は -1、uid・gid は `u32::MAX`）で初期化する。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -859,13 +902,14 @@ unsafe extern "C" {
 fn peer_ucred(stream: &UnixStream) -> Result<linux::Ucred, PluginError> {
     use std::os::unix::io::AsRawFd;
     let mut ucred = linux::Ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
+        pid: -1,
+        uid: PEER_ID_SENTINEL,
+        gid: PEER_ID_SENTINEL,
     };
     let mut len = linux::UCRED_LEN;
     // SAFETY: fd は `&UnixStream` の借用中のため有効。`optval` はスタック上の `#[repr(C)]` な
-    // `ucred` を指し、`optlen` はそのサイズを指す有効なポインタ。
+    // `ucred` を指し、`optlen` はそのサイズを指す有効なポインタ。バッファは番兵値で初期化済みで、
+    // 書き込まれたとは仮定せず、成功は戻り値・`len`・呼び出し側の番兵検査で確認する。
     let rc = unsafe {
         linux::getsockopt(
             stream.as_raw_fd(),
@@ -885,16 +929,20 @@ fn peer_ucred(stream: &UnixStream) -> Result<linux::Ucred, PluginError> {
 }
 
 /// 接続元の接続時点の実効 uid を返す（Linux。SO_PEERCRED。TASK-124.1・#292）。取得できなければ fail-closed でエラー。
-/// user namespace 外の uid は overflowuid として観測されうる（照合側で不一致となり拒否される）。
+/// 接続元が別の user namespace にあり uid がマッピングされていない場合、overflowuid（Linux 既定 65534）として
+/// 観測される。照合側で拒否されるのは core 自身の euid が overflowuid として観測されない場合に限り、core の
+/// euid 自体が 65534 として観測される構成（未マッピングの user namespace 内・nobody 実行等）では数値が
+/// 一致して受理される（overflowuid を特別扱いしない。現状挙動）。取得値が番兵値のままなら `Internal`。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
-    Ok(peer_ucred(stream)?.uid)
+    peer_uid_from_raw(peer_ucred(stream)?.uid)
 }
 
 /// 接続元の pid を返す（Linux。都度起動モードで応答者を spawn した子に限定するため。PLUG-7・PLUG-12）。
+/// 呼び出し側の pid 照合は数値比較で、対象終了後の PID 再利用の窓が残る（モジュール doc「限界」）。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -915,9 +963,11 @@ pub(crate) fn peer_pid(stream: &UnixStream) -> Result<u32, PluginError> {
 #[cfg(target_os = "macos")]
 pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
     use std::os::unix::io::AsRawFd;
-    let mut euid: u32 = 0;
-    let mut egid: u32 = 0;
+    let mut euid: u32 = PEER_ID_SENTINEL;
+    let mut egid: u32 = PEER_ID_SENTINEL;
     // SAFETY: fd は `&UnixStream` の借用中のため有効。2 つのポインタはスタック上の有効な変数を指す。
+    // 変数は番兵値で初期化済みで、書き込まれたとは仮定せず戻り値と番兵検査で確認する（`getpeereid` は
+    // 成功時に必ず書くため防御的措置）。
     let rc = unsafe { getpeereid(stream.as_raw_fd(), &raw mut euid, &raw mut egid) };
     if rc != 0 {
         return Err(PluginError::new(
@@ -925,10 +975,11 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
             "failed to obtain peer credential",
         ));
     }
-    Ok(euid)
+    peer_uid_from_raw(euid)
 }
 
-/// 接続元の pid を返す（macOS。`LOCAL_PEERPID`）。
+/// 接続元の pid を返す（macOS。`LOCAL_PEERPID`）。初期値は -1 で、書き込まれなければ `try_from` で失敗する。
+/// 呼び出し側の pid 照合は数値比較で、PID 再利用の窓が残る（モジュール doc「限界」）。
 #[cfg(target_os = "macos")]
 pub(crate) fn peer_pid(stream: &UnixStream) -> Result<u32, PluginError> {
     use std::os::unix::io::AsRawFd;
@@ -947,7 +998,7 @@ pub(crate) fn peer_pid(stream: &UnixStream) -> Result<u32, PluginError> {
             optlen: *mut u32,
         ) -> i32;
     }
-    let mut pid: i32 = 0;
+    let mut pid: i32 = -1;
     let mut len: u32 = core::mem::size_of::<i32>() as u32;
     // SAFETY: fd は `&UnixStream` の借用中のため有効。`optval` はスタック上の `pid_t`（i32）を指し、
     // `optlen` はそのサイズを指す有効なポインタ。
@@ -1348,6 +1399,37 @@ mod tests {
         let (a, _b) = UnixStream::pair().unwrap();
         assert_eq!(peer_uid(&a).unwrap(), effective_uid());
         assert_eq!(peer_pid(&a).unwrap(), std::process::id());
+    }
+}
+
+/// 番兵値検査の検証（PLUG-12・#1390）。Linux・macOS 共通のヘルパを照合する。
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod peer_sentinel_tests {
+    use super::*;
+
+    /// PLUG-12: 番兵値のままの uid は `Internal`・固定メッセージで拒否される（fail-closed）。
+    #[test]
+    fn plug12_peer_uid_from_raw_rejects_sentinel() {
+        let err = peer_uid_from_raw(u32::MAX).unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::Internal);
+        assert!(err.to_string().contains("failed to obtain peer credential"));
+    }
+
+    /// PLUG-12: root（0）・overflowuid（65534）・通常 uid は誤って拒否しない。
+    #[test]
+    fn plug12_peer_uid_from_raw_passes_valid_uids() {
+        for uid in [0u32, 1000, 65534] {
+            assert_eq!(peer_uid_from_raw(uid).unwrap(), uid);
+        }
     }
 }
 

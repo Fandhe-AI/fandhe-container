@@ -29,6 +29,7 @@ use fandhe_container_platform_macos::config::{
     BlockDeviceSpec, ConsoleLogPath, DeviceConfigSpec, DiskImagePath, SerialConsoleSink,
     VmConfigSpec, build_vz_configuration,
 };
+use fandhe_container_platform_macos::console_log::TRUNCATION_MARKER;
 use fandhe_container_platform_macos::guest_mount::{self, GuestMountPoint};
 use fandhe_container_platform_macos::virtiofs::{
     ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsSharesSpec, VirtiofsTag,
@@ -245,6 +246,13 @@ impl ProbeLog {
     }
 }
 
+/// コンソールログが書き出しスレッドの上限（`MAX_CONSOLE_LOG_BYTES`）で打ち切られたか。
+/// 区切り文は上限到達時に末尾へ 1 回だけ書かれ、以後ゲスト出力は破棄されるため、
+/// 末尾が区切り文ならプローブ行の後続は観測できない。
+fn log_truncated(bytes: &[u8]) -> bool {
+    bytes.ends_with(TRUNCATION_MARKER)
+}
+
 /// ログ全体を畳み込む。プローブ契約（AGENTS.md「最後に done」）に従い、次を `invalid`
 /// （fail-closed）とする: op ごとの重複報告・done の重複・done 以降の後続報告・
 /// read / readdir / write の全報告が揃う前の done。
@@ -260,17 +268,23 @@ fn parse_probe_log(text: &str) -> ProbeLog {
             continue;
         }
         match item {
+            // 成功・失敗を合わせて op ごとに 1 回だけ報告できる。2 回目は種別によらず不正。
             ProbeItem::Read(v) => {
-                out.invalid |= out.read.replace(v).is_some();
+                out.invalid |= out.reported("read");
+                out.read = Some(v);
             }
             ProbeItem::Readdir(v) => {
-                out.invalid |= out.readdir.replace(v).is_some();
+                out.invalid |= out.reported("readdir");
+                out.readdir = Some(v);
             }
             ProbeItem::Write => {
-                out.invalid |= out.write_done;
+                out.invalid |= out.reported("write");
                 out.write_done = true;
             }
-            ProbeItem::OpError(op) => out.errors.push(op),
+            ProbeItem::OpError(op) => {
+                out.invalid |= out.reported(&op);
+                out.errors.push(op);
+            }
             ProbeItem::Done => {
                 out.invalid |= !["read", "readdir", "write"]
                     .iter()
@@ -419,6 +433,14 @@ fn boot_and_probe(tag: &str) -> ProbeOutcome {
         if parse_probe_log(&String::from_utf8_lossy(&last)).done {
             break;
         }
+        if log_truncated(&last) {
+            // 上限後のゲスト出力は破棄されるため、待っても done は観測できない。明示的に失敗させる。
+            let _ = vm.stop();
+            panic!(
+                "console log hit the size limit before the probe done line; console tail:\n{}",
+                tail_lossy(&last, 4096)
+            );
+        }
         if Instant::now() >= deadline {
             let _ = vm.stop();
             panic!(
@@ -548,6 +570,20 @@ fn mac1_io5_parse_probe_log_requires_done_last_and_complete() {
         "{pre}op=read result=error\n{pre}op=readdir result=error\n{pre}op=write result=error\n{pre}done\n"
     ));
     assert!(err.done && !err.invalid);
+    // 失敗報告の重複、および成功と失敗の混在も同じ op の重複として不正。
+    let dup_err = parse_probe_log(&format!(
+        "{pre}op=read result=error\n{pre}op=read result=error\n"
+    ));
+    assert!(dup_err.invalid);
+    let mixed = parse_probe_log(&format!(
+        "{pre}op=write result=done\n{pre}op=write result=error\n"
+    ));
+    assert!(mixed.invalid);
+    // 上限到達で打ち切られたログは末尾の区切り文で判別できる。
+    let mut cut = b"noise".to_vec();
+    cut.extend_from_slice(TRUNCATION_MARKER);
+    assert!(log_truncated(&cut));
+    assert!(!log_truncated(b"noise"));
     // 早過ぎる done。
     let early = parse_probe_log(&format!("{pre}op=read value=t\n{pre}done\n"));
     assert!(early.done && early.invalid);

@@ -19,7 +19,9 @@
 //!   プロセスの終了として同様に `Unavailable` とする。
 //! - 失敗した接続は再利用しない。往復が失敗した時点で接続を閉じ、子を kill・回収してセッションを終了
 //!   状態にする。以後の [`ResidentPlugin::call`] は I/O せず `FailedPrecondition`。回収を確認できない
-//!   場合は `Internal`（pid つき）を返し、その子は以後回収しない（都度起動モードと同じ契約）。
+//!   場合は `Internal`（pid つき）を返し、その子は以後回収しない（都度起動モードと同じ契約）。子は回収
+//!   できたがプロセスグループを停止できなかった場合は、未回収とは別の `Internal`（pid なし。
+//!   `process group could not be killed`）を返し、状態は [`ResidentState::GroupKillFailed`] になる。
 //! - 子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ。stdin / stdout は null、stderr は
 //!   セッション全期間で 1 本の読み取りスレッドが上限つきで収集し、[`ResidentPlugin::shutdown`] の結果
 //!   （失敗時も [`ResidentShutdownError`] に載せる）でのみ返す（untrusted）。[`ResidentPlugin`] の破棄（panic 等を含む）でも子の kill・回収とスレッド停止を行う。
@@ -110,6 +112,10 @@ pub enum ResidentState {
     Killed,
     /// 強制終了を試みたが回収を確認できなかった（孤児の可能性。pid はエラーで報告済み）。
     Unreaped,
+    /// 直接の子は回収済み（pid は解放済みで報告しない）だが、子のプロセスグループ宛ての kill が失敗し、
+    /// 孫プロセスの停止を保証できない（#1311・PLUG-7・REPAIR-5）。未回収の子（[`Self::Unreaped`]）とは
+    /// 別の状態で、[`ResidentPlugin::shutdown`] も後始末の失敗（`Internal`）を返す。
+    GroupKillFailed,
 }
 
 /// [`ResidentPlugin::shutdown`] の結果。
@@ -472,10 +478,10 @@ impl ResidentPlugin {
                 original
             }
             // 直接の子は回収済み（pid は解放済みで報告しない）だが、孫の停止を保証できない。
-            // 元のエラーに隠さず後始末の失敗として返し、状態も `Unreaped` にして shutdown でも
-            // 失敗を報告する（#1311・PLUG-7・REPAIR-5）。
+            // 元のエラーに隠さず後始末の失敗として返す。状態は未回収の子（`Unreaped`）と区別して
+            // `GroupKillFailed` にし、shutdown でも同じ種類の失敗を報告する（#1311・PLUG-7・REPAIR-5）。
             Reap::GroupKillFailed => {
-                self.state = ResidentState::Unreaped;
+                self.state = ResidentState::GroupKillFailed;
                 group_kill_failed_error("a failed call")
             }
             Reap::Unreaped => {
@@ -488,7 +494,8 @@ impl ResidentPlugin {
     /// セッションを終了させる。接続を閉じて EOF を見せ、[`ONE_SHOT_EXIT_TIMEOUT`] まで自発終了を待ち、
     /// 超過で強制終了・回収する。既に終了済みのセッションでは、その終了状況をそのまま使う。
     ///
-    /// 自発終了が非ゼロ・取得不能なら `Unavailable`、回収を確認できなければ `Internal`（pid つき）を
+    /// 自発終了が非ゼロ・取得不能なら `Unavailable`、回収を確認できなければ `Internal`（pid つき）、子は
+    /// 回収できたがプロセスグループを停止できなければ `Internal`（pid なし。未回収とは別のメッセージ）を
     /// [`ResidentShutdownError`] で返す。いずれの経路でも、エラーを返す前に stderr の収集結果を
     /// 期限つき（[`ONE_SHOT_STDERR_DRAIN_TIMEOUT`]）で受け取って読み取りスレッドの停止を確認し、
     /// 診断情報（クラッシュ時の plugin の stderr 等）を [`ResidentShutdownError::stderr`] で渡す。
@@ -499,11 +506,16 @@ impl ResidentPlugin {
             ResidentState::Exited { code } => OneShotTermination::Exited { code },
             ResidentState::Killed => OneShotTermination::Killed,
             ResidentState::Unreaped => OneShotTermination::Unreaped,
+            ResidentState::GroupKillFailed => OneShotTermination::GroupKillFailed,
         };
         // 失敗の判定を先に済ませ（報告済みの印は `unreaped_error` が付ける）、stderr は必ず回収する。
         let failure = if termination == OneShotTermination::Unreaped {
             self.state = ResidentState::Unreaped;
             Some(unreaped_error(&mut self.guard, "shutdown"))
+        } else if termination == OneShotTermination::GroupKillFailed {
+            // 直接の子は回収済みのため未回収としては報告しない（pid も報告済みの印も付けない）。
+            self.state = ResidentState::GroupKillFailed;
+            Some(group_kill_failed_error("shutdown"))
         } else if let OneShotTermination::Exited { code } = termination
             && code != Some(0)
         {

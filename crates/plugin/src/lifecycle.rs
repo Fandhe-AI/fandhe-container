@@ -18,6 +18,10 @@
 //!   含む）を元のエラーに代えて返す。報告した pid の子は、この呼び出しではそれ以降回収しない
 //!   （報告後に回収すると、解放済みの pid を未回収として伝えることになるため）。子は終了済みでも
 //!   ゾンビとして残り、親プロセスの終了時に OS が引き取る。呼び出し側はその pid を未回収として扱う。
+//! - プロセスグループの停止失敗（#1311）: 直接の子は回収できたが、子のプロセスグループ宛ての kill が
+//!   失敗して孫の停止を保証できない場合は、未回収の子とは別の `Internal`（メッセージに
+//!   `process group could not be killed` を含み、解放済みの子の pid は含めない）を元のエラーに代えて
+//!   返す。`could not be reaped` とは報告しない（PLUG-7・REPAIR-5）。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
 //!   stdin / stdout は null。stderr は親へ継承させず、専用の UNIX ソケット対で受けて
 //!   [`OneShotStderr`] として返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は
@@ -198,9 +202,13 @@ pub enum OneShotTermination {
     Exited { code: Option<i32> },
     /// 猶予内に終了せず強制終了し、回収まで確認した（回収した終了状態が強制終了によるもの）。
     Killed,
-    /// 強制終了を試みたが、[`ONE_SHOT_REAP_TIMEOUT`] 内に回収を確認できなかった（kill 失敗を含む）。
-    /// 呼び出し側は孤児の可能性として扱う（REPAIR-5・PLUG-7）。
+    /// 強制終了を試みたが、[`ONE_SHOT_REAP_TIMEOUT`] 内に直接の子の回収を確認できなかった（直接の子への
+    /// kill 失敗を含む）。呼び出し側は孤児の可能性として扱う（REPAIR-5・PLUG-7）。
     Unreaped,
+    /// 直接の子は回収済み（pid は解放済み）だが、子のプロセスグループ宛ての kill が失敗し、孫プロセスの
+    /// 停止を保証できない（#1311・PLUG-7・REPAIR-5）。未回収の子（[`Self::Unreaped`]）とは別の結果で、
+    /// 成功した呼び出しの結果には現れない（呼び出しは `Internal` で失敗する）。
+    GroupKillFailed,
 }
 
 /// plugin が stderr へ書いた内容の収集結果（untrusted。出所は起動した plugin プロセス）。
@@ -465,7 +473,9 @@ impl OneShotOutcome {
 /// 子プロセスを保持し、Drop で kill・回収を試みるガード（panic 等の早期離脱でも子を残さない）。
 ///
 /// 回収の成否を呼び出し側へ返す責務は明示的な [`Self::kill_and_reap`] / [`Self::wait_or_kill`] の
-/// 呼び出しが担う。未回収として報告した後（[`unreaped_error`]）は `Drop` で回収しない。報告後に回収
+/// 呼び出しが担う。直接の子の未回収（`Unreaped`）と、直接の子は回収済みでプロセスグループの停止だけが
+/// 失敗した場合（`GroupKillFailed`）は別の結果として返し、呼び出し側はそれぞれ [`unreaped_error`]・
+/// [`group_kill_failed_error`] で報告する（#1311・PLUG-7・REPAIR-5）。未回収として報告した後（[`unreaped_error`]）は `Drop` で回収しない。報告後に回収
 /// すると、呼び出し側へ伝えた pid が解放済みになり、別プロセスを指し得るため（kill は報告前に送信
 /// 済みで、`Drop` での再試行は待ち時間を延ばすだけになる）。
 struct ChildGuard {
@@ -514,6 +524,8 @@ impl ChildGuard {
     /// kill して回収を `ONE_SHOT_REAP_TIMEOUT` まで待つ。
     ///
     /// kill の失敗は無視せず、回収確認ができなければ `Unreaped` を返す（呼び出し側が報告する）。
+    /// 直接の子を回収できてもグループ宛ての送信が許容外のエラーで失敗した場合は `GroupKillFailed` を
+    /// 返す（子は手放し済みで、未回収とは区別する）。
     /// 回収できなかった場合は `Child` を保持し続ける（呼び出し側が pid を報告できるよう手放さない）。
     /// 回収できた場合は終了状態を捨てずに返す。kill の直前・直後に子が自発終了していた場合、
     /// 回収される状態は「こちらの kill」ではなく子自身の終了状態になるため、呼び出し側が
@@ -528,7 +540,8 @@ impl ChildGuard {
         // 子を先に回収すると孫へ送る安全な機会を失うため（ゾンビの終了状態はシグナルで変わらず、
         // `classify_reaped` の区別は保たれる）。許容するエラーは「グループに生存者がいない」ことを
         // 示すものに限る（`group_kill_tolerated`）。それ以外の失敗は孫の停止を保証できないため、
-        // 直接の子を回収できても `Unreaped` を返す（成功扱いにしない。PLUG-7・REPAIR-5）。
+        // 直接の子を回収できても `GroupKillFailed` を返す（成功扱いにしない。回収済みの子を未回収とも
+        // 報告しない。PLUG-7・REPAIR-5）。直接の子も回収できなければ `Unreaped` が優先する。
         #[cfg(unix)]
         let group_failed = !self.leader_reaped
             && crate::sys::kill_process_group(c.id())
@@ -590,14 +603,21 @@ impl ChildGuard {
             std::thread::sleep(interval);
             interval = (interval * 2).min(POLL_MAX);
         }
-        match self.kill_and_reap() {
-            Reap::Reaped(status) => classify_reaped(status),
-            // 既に回収済みのガードに対して呼ばれることはないが、終了状態が不明なため成功扱いしない。
-            // グループ送信失敗は孫の停止を保証できないため成功扱いにしない。
-            Reap::AlreadyReaped | Reap::GroupKillFailed | Reap::Unreaped => {
-                OneShotTermination::Unreaped
-            }
-        }
+        termination_after_kill(self.kill_and_reap())
+    }
+}
+
+/// 終了猶予の超過後に行った [`ChildGuard::kill_and_reap`] の結果を終了状況へ写す（PLUG-7・REPAIR-5）。
+///
+/// グループ停止の失敗（直接の子は回収済み）は未回収の子と区別して保つ。`Unreaped` へ畳むと、呼び出し側が
+/// 回収済みの子を「回収できなかった」と誤って報告するため（#1311）。
+fn termination_after_kill(reap: Reap) -> OneShotTermination {
+    match reap {
+        Reap::Reaped(status) => classify_reaped(status),
+        // 孫の停止を保証できないため成功扱いにしないが、直接の子は回収済みなので未回収にもしない。
+        Reap::GroupKillFailed => OneShotTermination::GroupKillFailed,
+        // 既に回収済みのガードに対して呼ばれることはないが、終了状態が不明なため成功扱いしない。
+        Reap::AlreadyReaped | Reap::Unreaped => OneShotTermination::Unreaped,
     }
 }
 
@@ -617,7 +637,7 @@ impl Drop for ChildGuard {
 /// （Linux・macOS 以外）で、送信自体ができないことと直接の子の回収成否は別問題のため許容し、
 /// `Child::kill` による直接の子の kill・回収だけにフォールバックする（孫の回収は保証しない。この環境では
 /// 回収済みの pid を未回収として報告しない。PLUG-7・#1311）。それ以外（`InvalidInput` 等）は孫の停止を
-/// 保証できず、呼び出し側（`kill_and_reap`）が `Unreaped` として報告する。
+/// 保証できず、同じく `GroupKillFailed` として報告する（直接の子も回収できなかった場合だけ `Unreaped`）。
 #[cfg(unix)]
 fn group_kill_tolerated(e: &io::Error) -> bool {
     const ESRCH: i32 = 3;
@@ -635,7 +655,8 @@ enum Reap {
     /// 既に回収済みで保持している子がない。
     AlreadyReaped,
     /// 直接の子は回収済み（pid は解放済みで報告対象にしない）だが、グループ宛て SIGKILL が許容外の
-    /// エラーで失敗し、孫の停止を保証できない。呼び出し側は元のエラーを優先して返す。
+    /// エラーで失敗し、孫の停止を保証できない。呼び出し側は `Unreaped`（未回収の子）へ畳まず、元の
+    /// エラーに代えて [`group_kill_failed_error`] を返す（PLUG-7・REPAIR-5）。
     GroupKillFailed,
     /// kill 失敗または期限超過で回収を確認できなかった（孤児の可能性）。
     Unreaped,
@@ -947,7 +968,8 @@ fn unreaped_error(guard: &mut ChildGuard, phase: &str) -> PluginError {
 }
 
 /// 接続の受付・1 往復・子の回収を行う。`Ok` で戻る時点で子は回収済み。回収を確認できなかった場合は
-/// `Internal`（[`unreaped_error`]）を返し、以後 `guard` はその子を回収しない。
+/// `Internal`（[`unreaped_error`]）を返し、以後 `guard` はその子を回収しない。子は回収できたが
+/// プロセスグループを停止できなかった場合は `Internal`（[`group_kill_failed_error`]）を返す。
 fn exchange_and_reap(
     guard: &mut ChildGuard,
     listener: UdsListener,
@@ -986,12 +1008,22 @@ fn exchange_and_reap(
         Err(e) => return Err(reap_after_failure(guard, e)),
     };
     let termination = guard.wait_or_kill(ONE_SHOT_EXIT_TIMEOUT);
-    // 回収を確認できない子（孤児の可能性）と異常終了（非ゼロ・シグナル）は成功扱いにしない（REPAIR-5・PLUG-7）。
+    check_termination_after_response(guard, termination).map(|()| (response, termination))
+}
+
+/// 応答受信後の終了状況を検査する。回収を確認できない子（孤児の可能性）・グループ停止の失敗（孫が残る
+/// 可能性）・異常終了（非ゼロ・シグナル）は成功扱いにしない（REPAIR-5・PLUG-7）。
+///
+/// グループ停止の失敗では直接の子は回収済みのため、未回収（[`unreaped_error`]）としては報告せず、
+/// `guard` に報告済みの印も付けない（#1311）。
+fn check_termination_after_response(
+    guard: &mut ChildGuard,
+    termination: OneShotTermination,
+) -> Result<(), PluginError> {
     match termination {
         OneShotTermination::Unreaped => Err(unreaped_error(guard, "the response")),
-        OneShotTermination::Exited { code: Some(0) } | OneShotTermination::Killed => {
-            Ok((response, termination))
-        }
+        OneShotTermination::GroupKillFailed => Err(group_kill_failed_error("the response")),
+        OneShotTermination::Exited { code: Some(0) } | OneShotTermination::Killed => Ok(()),
         OneShotTermination::Exited { .. } => Err(PluginError::new(
             PluginErrorCode::Unavailable,
             "plugin process exited abnormally after the response",

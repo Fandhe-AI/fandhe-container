@@ -25,23 +25,27 @@
 //!   （失敗時も [`ResidentShutdownError`] に載せる）でのみ返す（untrusted）。[`ResidentPlugin`] の破棄（panic 等を含む）でも子の kill・回収とスレッド停止を行う。
 //! - 応答は untrusted。フレームの長さ上限・チェックサムは transport 側で検証済みで、内容は解釈しない。
 //!
+//! # 孫プロセス（#1311）
+//!
+//! 呼び出しタイムアウト・shutdown・`Drop` の kill は子のプロセスグループ全体へ送り、孫も止める。
+//! plugin の自発終了後に先に回収した場合・グループを抜けた孫・Windows は対象外（`super` のモジュール doc を参照）。
+//!
 //! # 未実装（REPAIR-3）
 //!
 //! - core の別プロセス起動をまたいで外部管理の常駐 plugin へ再接続する経路（attach）。plugin 発見・
 //!   登録（TASK-109）と proxy（TASK-114）側の責務とする。PLUG-7 は「呼び出しごとに接続のみ行う」と
 //!   記すが、本実装は起動後に接続を保持する形である（spec 側の表現との差は PR で報告）。
 //! - 起動対象の信頼性検証（TASK-122・PLUG-11。検証から spawn までの
-//!   差し替え〔TOCTOU〕も本タスクでは解決しない）、孫プロセスの回収、要求 ID と応答 ID の対応づけ（TASK-114）。
+//!   差し替え〔TOCTOU〕も本タスクでは解決しない）、要求 ID と応答 ID の対応づけ（TASK-114）。
 
 use super::{
     ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotPlugin, OneShotStderr,
-    OneShotTermination, PLUGIN_SOCKET_ENV, Reap, StderrCapture, classify_reaped, rpc_timeout,
-    spawn_error, stderr_channel, unreaped_error,
+    OneShotTermination, Reap, StderrCapture, classify_reaped, rpc_timeout, spawn_error,
+    stderr_channel, unreaped_error,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
 use crate::transport::{RpcTimeout, UdsListener, UdsStream};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -297,15 +301,8 @@ impl ResidentPlugin {
                 "failed to prepare capturing plugin stderr",
             )
         })?;
-        // `Command` は文の終わりで drop され、親側に書き込み端は残らない。
-        let spawned = Command::new(&plugin.program)
-            .args(&plugin.args)
-            .env_clear()
-            .env(PLUGIN_SOCKET_ENV, listener.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(child_stderr)
-            .spawn();
+        let spawned =
+            super::spawn_plugin(&plugin.program, &plugin.args, listener.path(), child_stderr);
         let mut guard = match spawned {
             Ok(child) => ChildGuard::new(child),
             Err(e) => return Err(spawn_error(&e)),
@@ -380,7 +377,7 @@ impl ResidentPlugin {
         match self.guard.try_wait() {
             Ok(None) => {}
             Ok(Some(status)) => {
-                self.guard.child = None;
+                self.guard.release_reaped();
                 self.stream = None;
                 let code = status.code();
                 self.state = ResidentState::Exited { code };
@@ -436,7 +433,7 @@ impl ResidentPlugin {
         loop {
             match self.guard.try_wait() {
                 Ok(Some(status)) => {
-                    self.guard.child = None;
+                    self.guard.release_reaped();
                     let code = status.code();
                     self.state = ResidentState::Exited { code };
                     // 終了コード 0 の後始末（EOF を受けた正常終了）は通信失敗の原因ではないため、

@@ -88,6 +88,22 @@ mod unix {
         let behavior = std::fs::read_to_string(sock.parent().unwrap().join("behavior")).unwrap();
         match behavior.as_str() {
             "exit_early" => {}
+            // 孫（`/bin/sleep 60`。stderr を引き継ぐ）を起動して pid をファイルへ書き、接続後に応答しない
+            // （#1311。プロセスグループ単位の回収を確かめる）。pid ファイルは接続より前に書く。
+            "grandchild_silent" => {
+                #[allow(clippy::zombie_processes)]
+                let gc = std::process::Command::new("/bin/sleep")
+                    .arg("60")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let dir = sock.parent().unwrap();
+                std::fs::write(dir.join("gc.tmp"), gc.id().to_string()).unwrap();
+                std::fs::rename(dir.join("gc.tmp"), dir.join("grandchild.pid")).unwrap();
+                let _s = UdsStream::connect(&sock, Duration::from_secs(5)).unwrap();
+                std::thread::sleep(Duration::from_secs(60));
+            }
             "silent_no_connect" => std::thread::sleep(Duration::from_secs(60)),
             mode => {
                 if mode == "stderr_small" || mode == "stderr_exit3_after_first" {
@@ -313,6 +329,49 @@ mod unix {
         assert_process_gone(child_pid);
         let again = session.call(&ping(), rpc(500)).unwrap_err();
         assert_eq!(again.code(), PluginErrorCode::FailedPrecondition);
+    }
+
+    /// #1311・PLUG-7: 呼び出しタイムアウト後の kill はプロセスグループ全体へ届き、孫も残らない。
+    #[test]
+    fn plug7_resident_call_timeout_kills_grandchild_process_group() {
+        let dir = TempDir::new("grandchild_silent");
+        let mut session = start(&dir, 5000).unwrap();
+        let e = session.call(&ping(), rpc(500)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Timeout);
+        assert_eq!(session.state(), ResidentState::Killed);
+        let pid: u32 = std::fs::read_to_string(dir.0.join("grandchild.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let t = Instant::now();
+        loop {
+            let alive = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            #[cfg(target_os = "linux")]
+            let alive = alive
+                && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map(|st| {
+                        !st.rsplit(')')
+                            .next()
+                            .unwrap_or("")
+                            .trim_start()
+                            .starts_with('Z')
+                    })
+                    .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "grandchild {pid} alive"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// 接続前に終了した子は、期限を待たず Unavailable になる。

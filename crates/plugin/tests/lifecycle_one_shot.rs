@@ -93,6 +93,22 @@ mod unix {
         match behavior.as_str() {
             "exit_early" => {}
             "stderr_exit_early" => write_stderr(b"boom: cannot start\n"),
+            // 孫（`/bin/sleep 60`。stderr を引き継ぐ）を起動し、pid をファイルへ書いてから、接続後に
+            // 応答せず待つ（#1311。プロセスグループ単位の回収を確かめる）。
+            "grandchild_silent" => {
+                #[allow(clippy::zombie_processes)]
+                let gc = std::process::Command::new("/bin/sleep")
+                    .arg("60")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let dir = sock.parent().unwrap();
+                std::fs::write(dir.join("gc.tmp"), gc.id().to_string()).unwrap();
+                std::fs::rename(dir.join("gc.tmp"), dir.join("grandchild.pid")).unwrap();
+                let _s = UdsStream::connect(&sock, Duration::from_secs(5)).unwrap();
+                std::thread::sleep(Duration::from_secs(60));
+            }
             "silent_no_connect" => std::thread::sleep(Duration::from_secs(60)),
             mode => {
                 // 接続前に書く。親が stderr を読み続けていなければバッファが埋まって子はここで止まる。
@@ -180,6 +196,50 @@ mod unix {
         );
         #[cfg(not(target_os = "linux"))]
         let _ = pid;
+    }
+
+    /// 孫が有限時間内に存在しなくなる（init に引き取られ回収されるまでの猶予を見る）ことを確かめる。
+    /// Linux ではゾンビ（`Z`）も消滅として扱う（pid 1 が回収しない開発コンテナ対応）。
+    fn assert_process_gone_within(pid: u32, limit: Duration) {
+        let start = Instant::now();
+        loop {
+            let alive = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            #[cfg(target_os = "linux")]
+            let alive = alive
+                && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map(|st| {
+                        !st.rsplit(')')
+                            .next()
+                            .unwrap_or("")
+                            .trim_start()
+                            .starts_with('Z')
+                    })
+                    .unwrap_or(false);
+            if !alive {
+                return;
+            }
+            assert!(start.elapsed() < limit, "grandchild {pid} still alive");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// #1311・PLUG-7・REPAIR-5: タイムアウト後始末の kill はプロセスグループ全体へ届き、孫も残らない。
+    #[test]
+    fn plug7_one_shot_timeout_kills_grandchild_process_group() {
+        let (res, elapsed, dir) = run("grandchild_silent", 2000);
+        assert_eq!(res.unwrap_err().code(), PluginErrorCode::Timeout);
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+        let pid: u32 = std::fs::read_to_string(dir.0.join("grandchild.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_gone_within(pid, Duration::from_secs(5));
     }
 
     fn no_socket_left(dir: &TempDir) {

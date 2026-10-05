@@ -25,11 +25,12 @@
 //! - client connect（#249）: `socket(2)` / `connect(2)`（macOS は `fcntl(F_SETFD)` も）で非ブロッキング接続を期限までリトライする（REPAIR-5）。
 //!   対応外の OS・アーキテクチャは `Unsupported`
 //! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
+//! - Linux・macOS: `killpg(2)`（`kill_process_group`。plugin の子のプロセスグループへ `SIGKILL`。#1311。それ以外の unix は `Unsupported`）
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 //! - OS ごとに値・幅が異なる定数・型（`ModeT`・`AT_SYMLINK_NOFOLLOW`・`O_*` 等）は対応 OS ごとに個別定義し、
@@ -56,6 +57,53 @@ unsafe extern "C" {
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: 引数を取らず、POSIX の規定上エラー条件を持たない。
     unsafe { geteuid() }
+}
+
+/// `SIGKILL` のシグナル番号。Linux（`asm-generic/signal.h`）・macOS（`sys/signal.h`）で 9 で、
+/// std の `Child::kill` が unix で送る番号と同じ（`crate::lifecycle` の終了状態分類も参照する）。
+pub(crate) const SIGKILL: i32 = 9;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: POSIX の `int killpg(int pgrp, int sig)`（Linux: killpg(3)、
+    // macOS: killpg(2)）と同じ型・幅。`int` は対応ターゲット（Linux x86_64・aarch64、macOS）で
+    // 32 bit 符号付きのため `target_arch` 分岐は不要。ポインタ引数を取らない。
+    #[link_name = "killpg"]
+    fn c_killpg(pgrp: i32, sig: i32) -> i32;
+}
+
+/// プロセスグループ `pgid` の全プロセスへ `SIGKILL` を 1 回送る（`killpg(2)`。PLUG-7・REPAIR-5・#1311）。
+///
+/// `crate::lifecycle` の `ChildGuard::kill_and_reap` が、`process_group(0)` で起動した plugin の子の
+/// pid（= pgid）を渡して孫プロセスごと止めるために呼ぶ。シグナルは `SIGKILL` 固定で、番号を
+/// 呼び出し側へ出さない。`pgid` が 2 未満または `i32` に収まらない場合は送信せず `InvalidInput` を返す
+/// （`killpg(0, ..)` は呼び出し側自身のグループ宛て、1 以下は init・未定義の宛先になり得るため fail-closed）。
+///
+/// 呼び出し側の不変条件: 送信先は自プロセスが spawn し、まだ wait していない子の pgid に限る
+/// （wait 済みなら pid が再利用され得るため送らない）。グループが空の `ESRCH` もエラーとして返すので、
+/// 呼び出し側が無視するか判断する。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn kill_process_group(pgid: u32) -> io::Result<()> {
+    let pgrp = i32::try_from(pgid).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    if pgrp < 2 {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    // SAFETY: 引数はポインタを含まない整数 2 つでメモリ安全性の前提がない。`pgrp` は 2 以上に検証済みで、
+    // 自プロセスや全プロセス宛てにならない。送信先が未回収の子のグループに限る不変条件は呼び出し側
+    // （`ChildGuard`）が維持する。
+    let rc = unsafe { c_killpg(pgrp, SIGKILL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Linux・macOS 以外の unix 向け。`SIGKILL` の値を持たないため送信せず `Unsupported` を返す（fail-closed）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn kill_process_group(pgid: u32) -> io::Result<()> {
+    let _ = pgid;
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 #[cfg(target_os = "linux")]
@@ -1289,5 +1337,33 @@ mod placeholder_tests {
             }
         }
         assert_eq!(found, Vec::<usize>::new());
+    }
+}
+
+/// #1311・PLUG-7: `kill_process_group` の入力検証と送信。
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod killpg_tests {
+    use super::*;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::Command;
+
+    #[test]
+    fn rejects_pgid_below_two_or_out_of_range() {
+        for bad in [0u32, 1, u32::MAX, i32::MAX as u32 + 1] {
+            let err = kill_process_group(bad).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "pgid={bad}");
+        }
+    }
+
+    #[test]
+    fn kills_new_process_group_with_sigkill() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        kill_process_group(child.id()).unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(9));
     }
 }

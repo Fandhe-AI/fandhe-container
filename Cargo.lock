@@ -130,6 +130,7 @@ version = "0.0.0"
 dependencies = [
  "block2",
  "dispatch2",
+ "fandhe-container-io",
  "objc2",
  "objc2-foundation",
  "objc2-virtualization",

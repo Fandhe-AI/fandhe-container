@@ -16,6 +16,13 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# virtiofs 共有の I/O 共有プロトコルクライアント（MAC-1・TASK-65.2）が io crate の PipelineClient を使う。
+# workspace 内 crate の path 依存で外部クレートの追加ではない（ルート Cargo.toml の
+# [workspace.dependencies] 冒頭コメント・crates/cli の net 依存と同じ扱い）。3 OS でビルドするため
+# ターゲットで限定しない。
+[dependencies]
+fandhe-container-io = { path = "../io" }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true, features = ["std"] }
 objc2-foundation = { workspace = true, features = ["std"] }

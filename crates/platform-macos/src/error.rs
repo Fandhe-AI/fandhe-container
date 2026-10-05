@@ -14,6 +14,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::config::ConfigError;
+use crate::virtiofs::VirtiofsIoError;
 use crate::vm::VmState;
 
 /// 失敗した操作の種別。
@@ -223,6 +224,8 @@ pub enum PlatformError {
     Vm(VmError),
     /// ゲスト内 virtiofs mount の検証失敗（`guest_mount.*`。TASK-65.3）。
     GuestMount(GuestMountError),
+    /// virtiofs の I/O 共有プロトコルクライアントの失敗（`virtiofs_io.*`。TASK-65.2）。
+    VirtiofsIo(VirtiofsIoError),
 }
 
 impl PlatformError {
@@ -232,6 +235,7 @@ impl PlatformError {
             PlatformError::Config(e) => e.code(),
             PlatformError::Vm(e) => e.code(),
             PlatformError::GuestMount(e) => e.code(),
+            PlatformError::VirtiofsIo(e) => e.code(),
         }
     }
 
@@ -241,6 +245,7 @@ impl PlatformError {
             PlatformError::Config(e) => e.message(),
             PlatformError::Vm(e) => e.message(),
             PlatformError::GuestMount(e) => e.message(),
+            PlatformError::VirtiofsIo(e) => e.message(),
         }
     }
 }
@@ -257,6 +262,7 @@ impl std::error::Error for PlatformError {
             PlatformError::Config(e) => Some(e),
             PlatformError::Vm(e) => Some(e),
             PlatformError::GuestMount(e) => Some(e),
+            PlatformError::VirtiofsIo(e) => Some(e),
         }
     }
 }
@@ -276,6 +282,12 @@ impl From<VmError> for PlatformError {
 impl From<GuestMountError> for PlatformError {
     fn from(e: GuestMountError) -> Self {
         PlatformError::GuestMount(e)
+    }
+}
+
+impl From<VirtiofsIoError> for PlatformError {
+    fn from(e: VirtiofsIoError) -> Self {
+        PlatformError::VirtiofsIo(e)
     }
 }
 

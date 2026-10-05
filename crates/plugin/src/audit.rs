@@ -32,7 +32,9 @@
 //! - 書き込みスレッドを起動できなかった場合・停止した場合（受信側 Disconnected・スレッドの異常終了）は
 //!   出力経路が無いため、拒否件数・未出力の集約件数・キュー残存分を直接
 //!   [`default_audit_write_failures`] へ計上する。
-//! - 件数の移し替えは「移し先へ足してから移し元を減らす」順に行う（移し替え中の区間は回収中として数える）。
+//! - 件数（キュー残存・未出力の集約・失敗累計）と書き込みスレッドの生存状態は 1 つの mutex で保護し、
+//!   移し替え（満杯時の加算・停止時の回収）を不可分に行う。ロックは数個の整数の更新と `try_send`
+//!   （非ブロッキング）の間だけ保持し、出力先への書き込み中には保持しない（REPAIR-5）。
 //!   [`flush_default_audit`] が true を返すのは、すべての拒否が出力済みか失敗計上済みになった後に限る。
 //! - stderr への書き込みが失敗した場合（閉じている・書けない）は失われた件数を
 //!   [`default_audit_write_failures`] へ数え、黙って消えない（呼び出し側が監視できる）。
@@ -45,9 +47,8 @@ use crate::error::PluginErrorCode;
 use serde::Serialize;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// 監査枠の最大行数（`crates/io` の監査枠と同値）。
 pub const PEER_AUTH_AUDIT_LOG_CAPACITY: usize = 256;
@@ -63,151 +64,135 @@ const DEFAULT_AUDIT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// 書き込みスレッドが未出力の集約件数を定期的に回収する間隔（次の行の到着に依存しない）。
 const AGGREGATE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// 既定出力の件数と書き込みスレッドの生存状態（[`AuditSink`] が 1 つの mutex で保護する）。
+///
+/// 不変条件: 受け付けた拒否は、出力済みになるまで `queued`・`pending_dropped`・`write_failures` の
+/// いずれか 1 つに必ず数えられている。`writer_alive` が false の間は `queued`・`pending_dropped` は
+/// 0（出力する主体が居ないため、すべて `write_failures` へ移してある）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SinkCounts {
+    /// キューに積まれ、書き込みスレッドが出力を終えていない件数。
+    queued: u64,
+    /// キュー満杯で行として積めず、集約行での出力を待っている件数（集約行の書き込み中も残す）。
+    pending_dropped: u64,
+    /// 出力できずに失われた件数の累計。
+    write_failures: u64,
+    /// 書き込みスレッドが受信・出力を続けているか（起動失敗・終了後は false）。
+    writer_alive: bool,
+}
+
+impl SinkCounts {
+    /// 出力する主体が居なくなったとき、未出力の件数をすべて失敗累計へ移す（SEC-4）。
+    fn reclaim_lost(&mut self) {
+        self.writer_alive = false;
+        self.write_failures = self
+            .write_failures
+            .saturating_add(self.queued)
+            .saturating_add(self.pending_dropped);
+        self.queued = 0;
+        self.pending_dropped = 0;
+    }
+}
+
+/// 件数の mutex を取る。ロック中は panic し得る処理をしないが、万一 poison していても件数の観測と
+/// 計上は続ける（監査件数を読めなくする方が害が大きい）。
+fn lock_counts(counts: &Mutex<SinkCounts>) -> MutexGuard<'_, SinkCounts> {
+    counts.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// 未出力の集約件数があれば集約行として書く。書けなければ件数を失敗累計へ移す（SEC-4）。
 ///
-/// 書き込みスレッドだけが呼ぶ。`pending` は書き込みの完了（または失敗の計上）後に、書いた件数だけ
-/// 減らす。先に 0 へ戻すと、集約行がまだ出力されていない間に `AuditSink::flush` が「未出力 0 件」と
-/// 判定してしまう（終了直前の flush 後にプロセスが終了すると拒否記録が失われる）。書き込み中に
-/// `submit` が足した件数は減算後も残り、次回の集約行になる。
-fn emit_aggregate<W: Write>(out: &mut W, pending: &AtomicU64, failures: &AtomicU64) {
-    let dropped = pending.load(Ordering::Acquire);
+/// 書き込みスレッドだけが呼ぶ。`pending_dropped` は書き込みの完了（または失敗の計上）後に、書いた
+/// 件数だけ減らす。先に 0 へ戻すと、集約行がまだ出力されていない間に `AuditSink::flush` が
+/// 「未出力 0 件」と判定してしまう（終了直前の flush 後にプロセスが終了すると拒否記録が失われる）。
+/// 書き込み中に `submit` が足した件数は減算後も残り、次回の集約行になる。書き込み中はロックを
+/// 保持しない（出力先が停滞しても `submit` を待たせない。REPAIR-5）。
+fn emit_aggregate<W: Write>(out: &mut W, counts: &Mutex<SinkCounts>) {
+    let dropped = lock_counts(counts).pending_dropped;
     if dropped == 0 {
         return;
     }
     let agg = format!(
         "{{\"event\":\"plugin_peer_auth\",\"outcome\":\"error\",\"reason\":\"peer_auth_rejections_coalesced\",\"count\":{dropped}}}"
     );
-    if writeln!(out, "{agg}").and_then(|()| out.flush()).is_err() {
-        failures.fetch_add(dropped, Ordering::AcqRel);
+    let failed = writeln!(out, "{agg}").and_then(|()| out.flush()).is_err();
+    let mut c = lock_counts(counts);
+    if failed {
+        c.write_failures = c.write_failures.saturating_add(dropped);
     }
-    saturating_sub(pending, dropped);
+    c.pending_dropped = c.pending_dropped.saturating_sub(dropped);
+}
+
+/// 書き込みスレッドの終了時（出力先の `Write` の panic による異常終了を含む）に、生存状態を落として
+/// 出力されずに残った件数を失敗累計へ移す後始末。後続の `submit` が無くても件数が失われず、
+/// 終了後の `submit` は（`writer_alive` を同じロックの下で見るため）必ず失敗累計へ計上される（SEC-4）。
+struct ReclaimOnExit(Arc<Mutex<SinkCounts>>);
+
+impl Drop for ReclaimOnExit {
+    fn drop(&mut self) {
+        lock_counts(&self.0).reclaim_lost();
+    }
 }
 
 /// 既定出力の有界・非ブロッキング sink（専用スレッドが `Write` へ書く）。
 struct AuditSink {
+    /// 書き込みスレッドへのキュー。スレッドを起動できなかった場合は `None`。
     tx: Option<SyncSender<String>>,
-    /// キュー満杯・スレッド不在で未出力の件数（次の書き込み成功時に集約行へ）。
-    pending_dropped: Arc<AtomicU64>,
-    /// 書き込み失敗で失われた件数の累計。
-    write_failures: Arc<AtomicU64>,
-    /// キューに積まれ、書き込みスレッドが出力を終えていない件数（スレッド停止時に失敗として回収し、
-    /// `flush` が出力完了の判定に使う）。
-    queued: Arc<AtomicU64>,
-    /// `queued`・`pending_dropped` を失敗累計へ移し替えている最中の回収処理の数。移し元を 0 へ戻して
-    /// から失敗累計へ足すまでの区間を `flush` が「完了」と誤認しないために数える。
-    reclaiming: Arc<AtomicU64>,
-}
-
-/// 0 未満にならないよう `n` 減らす（停止時の回収で 0 へ戻された後の減算に備える）。
-fn saturating_sub(counter: &AtomicU64, n: u64) {
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-        Some(v.saturating_sub(n))
-    });
-}
-
-/// 出力する主体が居なくなった件数（キュー残存分・未出力の集約件数）を失敗累計へ移す（SEC-4）。
-///
-/// 書き込みスレッドの停止後に `submit`（受信側 Disconnected）とスレッド終了時の後始末から呼ばれる。
-/// 各カウンタは `swap(0)` で取り出すため、並行して呼ばれても同じ件数を二重には計上しない。
-fn reclaim_lost(
-    queued: &AtomicU64,
-    pending: &AtomicU64,
-    failures: &AtomicU64,
-    reclaiming: &AtomicU64,
-) {
-    reclaiming.fetch_add(1, Ordering::AcqRel);
-    let lost = queued
-        .swap(0, Ordering::AcqRel)
-        .saturating_add(pending.swap(0, Ordering::AcqRel));
-    failures.fetch_add(lost, Ordering::AcqRel);
-    saturating_sub(reclaiming, 1);
-}
-
-/// 書き込みスレッドの終了時（出力先の `Write` の panic による異常終了を含む）に、出力されずに残った
-/// 件数を失敗累計へ移す後始末。後続の `submit` が無くても件数が失われない（SEC-4）。
-struct ReclaimOnExit {
-    queued: Arc<AtomicU64>,
-    pending: Arc<AtomicU64>,
-    failures: Arc<AtomicU64>,
-    reclaiming: Arc<AtomicU64>,
-}
-
-impl Drop for ReclaimOnExit {
-    fn drop(&mut self) {
-        reclaim_lost(
-            &self.queued,
-            &self.pending,
-            &self.failures,
-            &self.reclaiming,
-        );
-    }
+    /// 件数と生存状態。`submit`・`flush`・書き込みスレッドが共有する。
+    counts: Arc<Mutex<SinkCounts>>,
 }
 
 impl AuditSink {
     fn spawn<W: Write + Send + 'static>(mut out: W, capacity: usize) -> Self {
-        let pending_dropped = Arc::new(AtomicU64::new(0));
-        let write_failures = Arc::new(AtomicU64::new(0));
+        let counts = Arc::new(Mutex::new(SinkCounts {
+            writer_alive: true,
+            ..SinkCounts::default()
+        }));
         let (tx, rx) = sync_channel::<String>(capacity);
-        let queued = Arc::new(AtomicU64::new(0));
-        let reclaiming = Arc::new(AtomicU64::new(0));
-        let (pd, wf, qd) = (
-            Arc::clone(&pending_dropped),
-            Arc::clone(&write_failures),
-            Arc::clone(&queued),
-        );
-        let on_exit = ReclaimOnExit {
-            queued: Arc::clone(&queued),
-            pending: Arc::clone(&pending_dropped),
-            failures: Arc::clone(&write_failures),
-            reclaiming: Arc::clone(&reclaiming),
-        };
+        let thread_counts = Arc::clone(&counts);
         let spawned = std::thread::Builder::new()
             .name("peer-auth-audit".into())
             .spawn(move || {
-                // 宣言の逆順に drop されるため、受信側（`rx`）を閉じた後に後始末が走る。閉じる前に
-                // 積めた行は `queued` に数えられており、閉じた後の `submit` は Disconnected として
-                // 自分で回収するので、どちらの順でも件数は失敗累計へ移る。
-                let _on_exit = on_exit;
-                let rx = rx;
+                let counts = thread_counts;
+                // スレッドがどの経路で終わっても（panic を含む）生存状態を落として残存件数を回収する。
+                let _on_exit = ReclaimOnExit(Arc::clone(&counts));
                 loop {
                     match rx.recv_timeout(AGGREGATE_FLUSH_INTERVAL) {
                         Ok(line) => {
-                            emit_aggregate(&mut out, &pd, &wf);
-                            if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
-                                wf.fetch_add(1, Ordering::AcqRel);
-                            }
+                            emit_aggregate(&mut out, &counts);
+                            let failed =
+                                writeln!(out, "{line}").and_then(|()| out.flush()).is_err();
                             // 書き込み完了後に減らす（`flush` が「未出力 0 件」を判定できるように）。
-                            saturating_sub(&qd, 1);
+                            let mut c = lock_counts(&counts);
+                            if failed {
+                                c.write_failures = c.write_failures.saturating_add(1);
+                            }
+                            c.queued = c.queued.saturating_sub(1);
                         }
                         // 次の行を待たずに未出力の集約件数を回収する（SEC-4。送信側が
                         // あふれ後に拒否を受けなくても件数が出力される）。
-                        Err(RecvTimeoutError::Timeout) => emit_aggregate(&mut out, &pd, &wf),
+                        Err(RecvTimeoutError::Timeout) => emit_aggregate(&mut out, &counts),
                         Err(RecvTimeoutError::Disconnected) => {
-                            emit_aggregate(&mut out, &pd, &wf);
+                            emit_aggregate(&mut out, &counts);
                             break;
                         }
                     }
                 }
             });
+        if spawned.is_err() {
+            // クロージャは起動失敗時に破棄され、`ReclaimOnExit` は作られない。ここで生存状態を落とす。
+            lock_counts(&counts).reclaim_lost();
+            return Self { tx: None, counts };
+        }
         Self {
-            tx: spawned.ok().map(|_| tx),
-            pending_dropped,
-            write_failures,
-            queued,
-            reclaiming,
+            tx: Some(tx),
+            counts,
         }
     }
 
-    /// 出力も失敗計上も済んでいない件数が無ければ true。
-    ///
-    /// 読む順序は件数の移し替えの順序と対にしている（順序を変えると移し替え中の件数を見落とす）:
-    /// - `submit` の満杯時は `pending_dropped` へ足してから `queued` を減らすので、`queued` を先に読む。
-    /// - 回収（`reclaim_lost`）は `reclaiming` を足してから `queued`・`pending_dropped` を 0 へ戻すので、
-    ///   `reclaiming` を最後に読む。
-    fn is_settled(&self) -> bool {
-        self.queued.load(Ordering::Acquire) == 0
-            && self.pending_dropped.load(Ordering::Acquire) == 0
-            && self.reclaiming.load(Ordering::Acquire) == 0
+    /// 件数と生存状態の現在値（観測用の写し）。
+    fn counts(&self) -> SinkCounts {
+        *lock_counts(&self.counts)
     }
 
     /// 積まれた行と集約件数が出力されるまで、最大 `timeout` だけ待つ（SEC-4・REPAIR-5）。
@@ -216,8 +201,9 @@ impl AuditSink {
     fn flush(&self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            // スレッド不在のときは `submit` が同期的に失敗累計へ計上済み。
-            if self.tx.is_none() || self.is_settled() {
+            // 書き込みスレッドが居ないときは件数がすべて失敗累計へ移してあり、queued・pending は 0。
+            let c = self.counts();
+            if c.queued == 0 && c.pending_dropped == 0 {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
@@ -229,32 +215,31 @@ impl AuditSink {
 
     /// ブロックせずキューへ積む。積めなければ件数に合算する（捨てたことを黙らせない）。
     ///
+    /// 生存状態の確認・`try_send`（非ブロッキング）・件数の更新を 1 回のロックの中で行う。書き込み
+    /// スレッドの終了処理（`ReclaimOnExit`）も同じロックを取るため、「満杯と判定した直後にスレッドが
+    /// 終了して回収が先に走り、後から足した件数が誰にも出力・計上されない」ことは起きない。
+    ///
+    /// - 積めた: `queued` へ数える（書き込みスレッドが出力後に減らす）。
     /// - `Full`: 書き込みスレッドが生きているので `pending_dropped` へ積み、集約行で出す。
-    /// - `Disconnected` / スレッド不在: 集約行を出す主体が居ないため、この 1 件に加えて
+    /// - `Disconnected` / スレッド不在・終了済み: 出力する主体が居ないため、この 1 件に加えて
     ///   未出力の集約件数・キュー残存分も `write_failures` へ直接計上する（SEC-4）。
     fn submit(&self, line: String) {
-        let Some(tx) = &self.tx else {
-            self.write_failures.fetch_add(1, Ordering::AcqRel);
-            return;
+        let mut c = lock_counts(&self.counts);
+        let tx = match &self.tx {
+            Some(tx) if c.writer_alive => tx,
+            _ => {
+                c.write_failures = c.write_failures.saturating_add(1);
+                return;
+            }
         };
-        // 送信前に積む（受信側の減算が先行して 0 未満にならないように）。
-        self.queued.fetch_add(1, Ordering::AcqRel);
         match tx.try_send(line) {
-            Ok(()) => {}
+            Ok(()) => c.queued = c.queued.saturating_add(1),
             Err(TrySendError::Full(_)) => {
-                // 集約側へ足してから減らす（逆順だと、この 1 件がどちらにも数えられていない瞬間に
-                // 並行する `flush` が「未出力 0 件」と判定し得る）。
-                self.pending_dropped.fetch_add(1, Ordering::AcqRel);
-                saturating_sub(&self.queued, 1);
+                c.pending_dropped = c.pending_dropped.saturating_add(1);
             }
             Err(TrySendError::Disconnected(_)) => {
-                // queued には今回の 1 件も含まれる。
-                reclaim_lost(
-                    &self.queued,
-                    &self.pending_dropped,
-                    &self.write_failures,
-                    &self.reclaiming,
-                );
+                c.write_failures = c.write_failures.saturating_add(1);
+                c.reclaim_lost();
             }
         }
     }
@@ -275,13 +260,13 @@ pub fn flush_default_audit(timeout: std::time::Duration) -> bool {
 
 /// 既定出力で stderr への書き込みに失敗し、失われた拒否イベントの累計件数（SEC-4）。
 pub fn default_audit_write_failures() -> u64 {
-    default_sink().write_failures.load(Ordering::Acquire)
+    default_sink().counts().write_failures
 }
 
 /// 既定出力でキューあふれのため未出力のまま保留中の拒否件数（SEC-4）。
 /// 書き込みスレッドが定期回収して集約行にするまでの観測用で、stderr 停滞中は増え続ける。
 pub fn default_audit_pending_dropped() -> u64 {
-    default_sink().pending_dropped.load(Ordering::Acquire)
+    default_sink().counts().pending_dropped
 }
 
 /// 拒否が起きた側（accept = core の listener、connect = plugin の client）。
@@ -612,7 +597,7 @@ mod tests {
         }
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
         // 書き込みスレッドが 1 件を保持し、キュー 2 件を除いた残りが集約対象になる。
-        assert!(sink.pending_dropped.load(Ordering::Acquire) >= 40);
+        assert!(sink.counts().pending_dropped >= 40);
     }
 
     struct Failing;
@@ -632,11 +617,11 @@ mod tests {
         sink.submit("a".into());
         sink.submit("b".into());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while sink.write_failures.load(Ordering::Acquire) < 2 {
+        while sink.counts().write_failures < 2 {
             assert!(std::time::Instant::now() < deadline, "failures not counted");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(sink.write_failures.load(Ordering::Acquire), 2);
+        assert_eq!(sink.counts().write_failures, 2);
     }
 
     struct Shared(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -662,7 +647,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         // 書き込みスレッドが受信待ちの状態でのあふれ記録（後続の行は来ない）。
-        sink.pending_dropped.fetch_add(3, Ordering::AcqRel);
+        lock_counts(&sink.counts).pending_dropped += 3;
         while !String::from_utf8_lossy(&buf.lock().unwrap()).contains("\"count\":3") {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -670,7 +655,7 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
+        assert_eq!(sink.counts().pending_dropped, 0);
     }
 
     /// SEC-4: flush は出力完了まで待ち、完了後は行が書かれている。停滞時は期限で false を返す。
@@ -723,13 +708,13 @@ mod tests {
             4,
         );
         // 通常行は積まず、あふれ 3 件だけを保留させる（定期回収が集約行を書き始める）。
-        sink.pending_dropped.fetch_add(3, Ordering::AcqRel);
+        lock_counts(&sink.counts).pending_dropped += 3;
         started_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("aggregate write did not start");
         // 書き込みは始まったが完了していない。この間は未完了として数える。
-        assert_eq!(sink.queued.load(Ordering::Acquire), 0);
-        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 3);
+        assert_eq!(sink.counts().queued, 0);
+        assert_eq!(sink.counts().pending_dropped, 3);
         assert!(!sink.flush(std::time::Duration::from_millis(30)));
         assert_eq!(String::from_utf8_lossy(&buf.lock().unwrap()), "");
 
@@ -739,18 +724,18 @@ mod tests {
             String::from_utf8_lossy(&buf.lock().unwrap()),
             "{\"event\":\"plugin_peer_auth\",\"outcome\":\"error\",\"reason\":\"peer_auth_rejections_coalesced\",\"count\":3}\n"
         );
-        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
-        assert_eq!(sink.write_failures.load(Ordering::Acquire), 0);
+        assert_eq!(sink.counts().pending_dropped, 0);
+        assert_eq!(sink.counts().write_failures, 0);
     }
 
     /// SEC-4: 集約行を書けなかった場合、flush が true を返す時点で件数は失敗累計へ計上済み。
     #[test]
     fn sec4_flush_after_failed_aggregate_write_sees_failures_counted() {
         let sink = AuditSink::spawn(Failing, 4);
-        sink.pending_dropped.fetch_add(3, Ordering::AcqRel);
+        lock_counts(&sink.counts).pending_dropped += 3;
         assert!(sink.flush(std::time::Duration::from_secs(5)));
-        assert_eq!(sink.write_failures.load(Ordering::Acquire), 3);
-        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
+        assert_eq!(sink.counts().write_failures, 3);
+        assert_eq!(sink.counts().pending_dropped, 0);
     }
 
     /// SEC-4: 集約行の書き込み中にあふれた件数は失われず、次の集約行として出力される。
@@ -767,11 +752,11 @@ mod tests {
             },
             4,
         );
-        sink.pending_dropped.fetch_add(3, Ordering::AcqRel);
+        lock_counts(&sink.counts).pending_dropped += 3;
         started_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("aggregate write did not start");
-        sink.pending_dropped.fetch_add(2, Ordering::AcqRel);
+        lock_counts(&sink.counts).pending_dropped += 2;
         drop(gate_tx);
         assert!(sink.flush(std::time::Duration::from_secs(5)));
         let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
@@ -784,7 +769,7 @@ mod tests {
             })
             .collect();
         assert_eq!(counts, vec![3, 2]);
-        assert_eq!(sink.write_failures.load(Ordering::Acquire), 0);
+        assert_eq!(sink.counts().write_failures, 0);
     }
 
     /// SEC-4: キュー満杯の 1 件は `pending_dropped` へ移り、`queued` には残らない。
@@ -807,8 +792,24 @@ mod tests {
             .expect("write did not start");
         sink.submit("queued".into());
         sink.submit("overflow".into());
-        assert_eq!(sink.queued.load(Ordering::Acquire), 2);
-        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 1);
+        assert_eq!(sink.counts().queued, 2);
+        assert_eq!(sink.counts().pending_dropped, 1);
+    }
+
+    /// 書き込みの開始を通知し、門が開いたら panic する出力先（書き込みスレッドの異常終了を再現する）。
+    struct PanicAfterGate {
+        started: std::sync::mpsc::Sender<()>,
+        gate: std::sync::mpsc::Receiver<()>,
+    }
+    impl Write for PanicAfterGate {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            let _ = self.started.send(());
+            let _ = self.gate.recv();
+            panic!("writer panicked after gate (test)");
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     struct Panicking;
@@ -826,29 +827,34 @@ mod tests {
     #[test]
     fn sec4_writer_thread_exit_reclaims_unwritten_counts_as_failures() {
         let sink = AuditSink::spawn(Panicking, 4);
-        sink.pending_dropped.fetch_add(3, Ordering::AcqRel);
+        lock_counts(&sink.counts).pending_dropped += 3;
         sink.submit("a".into());
         assert!(sink.flush(std::time::Duration::from_secs(5)));
         // 通常行 1 件 + 未出力の集約 3 件
-        assert_eq!(sink.write_failures.load(Ordering::Acquire), 4);
-        assert_eq!(sink.queued.load(Ordering::Acquire), 0);
-        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
+        assert_eq!(sink.counts().write_failures, 4);
+        assert_eq!(sink.counts().queued, 0);
+        assert_eq!(sink.counts().pending_dropped, 0);
     }
 
-    /// SEC-4: 書き込みスレッド不在のときは件数が失敗累計へ計上される。
+    /// SEC-4: 書き込みスレッド不在のときは件数が失敗累計へ計上され、flush は計上済みとして true を返す。
     #[test]
     fn sec4_spawn_failure_counts_as_write_failure() {
         let sink = AuditSink {
             tx: None,
-            pending_dropped: Arc::new(AtomicU64::new(0)),
-            write_failures: Arc::new(AtomicU64::new(0)),
-            queued: Arc::new(AtomicU64::new(0)),
-            reclaiming: Arc::new(AtomicU64::new(0)),
+            counts: Arc::new(Mutex::new(SinkCounts::default())),
         };
         sink.submit("x".into());
         sink.submit("y".into());
-        assert_eq!(sink.write_failures.load(Ordering::Acquire), 2);
-        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
+        assert_eq!(
+            sink.counts(),
+            SinkCounts {
+                queued: 0,
+                pending_dropped: 0,
+                write_failures: 2,
+                writer_alive: false,
+            }
+        );
+        assert!(sink.flush(std::time::Duration::from_millis(30)));
     }
 
     /// SEC-4: 受信側停止（Disconnected）後の拒否は、今回分・未出力の集約件数・キュー残存分を
@@ -858,20 +864,76 @@ mod tests {
         let (tx, rx) = sync_channel::<String>(4);
         let sink = AuditSink {
             tx: Some(tx),
-            pending_dropped: Arc::new(AtomicU64::new(3)),
-            write_failures: Arc::new(AtomicU64::new(0)),
-            queued: Arc::new(AtomicU64::new(0)),
-            reclaiming: Arc::new(AtomicU64::new(0)),
+            counts: Arc::new(Mutex::new(SinkCounts {
+                pending_dropped: 3,
+                writer_alive: true,
+                ..SinkCounts::default()
+            })),
         };
         sink.submit("a".into());
         sink.submit("b".into());
+        assert_eq!(sink.counts().queued, 2);
         drop(rx);
         sink.submit("c".into());
         // 残存 2 件 + 今回 1 件 + 未出力の集約 3 件
-        assert_eq!(sink.write_failures.load(Ordering::Acquire), 6);
-        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
+        assert_eq!(
+            sink.counts(),
+            SinkCounts {
+                queued: 0,
+                pending_dropped: 0,
+                write_failures: 6,
+                writer_alive: false,
+            }
+        );
         sink.submit("d".into());
-        assert_eq!(sink.write_failures.load(Ordering::Acquire), 7);
+        assert_eq!(sink.counts().write_failures, 7);
+    }
+
+    /// SEC-4（#1388）: キューが満杯のまま書き込みスレッドが終了しても、満杯で数えた件数は失敗累計へ
+    /// 移り、終了後の拒否も失敗累計へ計上される（どの件数も残留せず flush が完了する）。
+    #[test]
+    fn sec4_full_queue_then_writer_exit_leaves_no_stranded_count() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let sink = AuditSink::spawn(
+            PanicAfterGate {
+                started: started_tx,
+                gate: gate_rx,
+            },
+            1,
+        );
+        sink.submit("held".into());
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("write did not start");
+        sink.submit("queued".into());
+        sink.submit("overflow".into());
+        assert_eq!(sink.counts().queued, 2);
+        assert_eq!(sink.counts().pending_dropped, 1);
+        // 書き込みスレッドを異常終了させる。
+        drop(gate_tx);
+        assert!(sink.flush(std::time::Duration::from_secs(5)));
+        assert_eq!(
+            sink.counts(),
+            SinkCounts {
+                queued: 0,
+                pending_dropped: 0,
+                write_failures: 3,
+                writer_alive: false,
+            }
+        );
+        // 終了後の拒否は満杯・切断のどちらに見えても失敗累計へ入る。
+        sink.submit("after".into());
+        assert_eq!(
+            sink.counts(),
+            SinkCounts {
+                queued: 0,
+                pending_dropped: 0,
+                write_failures: 4,
+                writer_alive: false,
+            }
+        );
+        assert!(sink.flush(std::time::Duration::from_millis(30)));
     }
 
     /// SEC-4: 容量超過は捨てず集約行 1 行（count = 超過件数）になる。

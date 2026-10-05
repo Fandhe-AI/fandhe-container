@@ -202,10 +202,11 @@ fn timeout_values_are_wired_to_recv() {
     // 2 件目は Write 容量（上限 - 1 = 1）に達しているため、先に暗黙 flush で a を確定する（ACK 1 件 + FlushAck）。
     let second = client.write(b"b").expect("second write");
     assert_eq!(second.acked_writes, 1);
-    assert_eq!(
-        *log.lock().expect("lock"),
-        vec![Duration::from_secs(3), Duration::from_secs(3)]
-    );
+    // 各 recv には Flush 全体の期限（3s）の残り時間が渡る（0 超 3s 以下）。
+    for d in log.lock().expect("lock").iter() {
+        assert!(*d > Duration::ZERO && *d <= Duration::from_secs(3), "{d:?}");
+    }
+    assert_eq!(log.lock().expect("lock").len(), 2);
 
     // flush: Flush 用の予約枠で送信でき、b の通常 ACK と FlushAck を受け取る。
     let report = client.flush().expect("flush");
@@ -213,6 +214,74 @@ fn timeout_values_are_wired_to_recv() {
     assert_eq!(log.lock().expect("lock").len(), 4);
     assert_eq!(client.in_flight(), 0);
     assert!(!client.is_poisoned());
+}
+
+/// 受信ごとに固定時間 sleep してから ACK を返す mock（Flush 全体の期限検証用）。
+struct SlowTransport {
+    inner: RecordingTransport,
+    delay: Duration,
+}
+
+impl FrameSender for SlowTransport {
+    type Frame = Frame;
+    fn send_frame(&mut self, frame: &Frame, t: IoTimeout) -> Result<(), IoError> {
+        self.inner.send_frame(frame, t)
+    }
+}
+
+impl FrameReceiver for SlowTransport {
+    type Frame = Frame;
+    fn recv_frame(&mut self, t: IoTimeout) -> Result<Frame, IoError> {
+        std::thread::sleep(self.delay);
+        self.inner.recv_frame(t)
+    }
+}
+
+/// REPAIR-5・TASK-65.2: 各 ACK が個別の期限内に届いても、Flush 全体の期限を超えたら Timeout になる。
+#[test]
+fn flush_total_deadline_is_enforced_across_acks() {
+    let dir = TempDir::new("deadline");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let flush_ack = IoTimeout::new(Duration::from_millis(150)).expect("timeout");
+    let timeouts = VirtiofsIoTimeouts::new(secs(1), secs(1), flush_ack);
+    let mut client = VirtiofsIoClient::new(
+        &share(&dir, ShareAccess::ReadWrite),
+        SlowTransport {
+            inner: RecordingTransport::new(&log),
+            delay: Duration::from_millis(60),
+        },
+        InFlightLimit::new(8).expect("limit"),
+        NoopSendObserver,
+        timeouts,
+    )
+    .expect("client");
+    for _ in 0..4 {
+        client.write(b"x").expect("write");
+    }
+    // 受信 5 回（通常 ACK 4 + FlushAck）× 60ms = 300ms > 150ms。各 recv は 150ms 未満で完了するため、
+    // 従来実装（毎回 150ms を渡す）では成功してしまう境界ケース。
+    let err = client.flush().expect_err("total deadline must expire");
+    assert_eq!(err.code(), "virtiofs_io.timeout");
+    assert!(client.is_poisoned());
+    // 渡された期限は単調に減り、元の値（150ms）を超えない。
+    let seen = log.lock().expect("lock").clone();
+    assert!(seen.len() >= 2 && seen.len() < 5, "{seen:?}");
+    assert!(seen.iter().all(|d| *d <= Duration::from_millis(150)));
+    assert!(seen.windows(2).all(|w| w[1] <= w[0]), "{seen:?}");
+}
+
+/// REPAIR-5: 期限到達済み（残り 0）と加算オーバーフローはいずれも Timeout（fail-closed）。
+#[test]
+fn remaining_until_expired_or_overflow_is_timeout() {
+    type C = VirtiofsIoClient<RecordingTransport, NoopSendObserver>;
+    let past = Instant::now();
+    std::thread::sleep(Duration::from_millis(2));
+    let e = C::remaining_until(Some(past)).expect_err("expired");
+    assert_eq!(e.code(), "virtiofs_io.timeout");
+    let e = C::remaining_until(None).expect_err("overflow");
+    assert_eq!(e.code(), "virtiofs_io.timeout");
+    let ok = C::remaining_until(Instant::now().checked_add(Duration::from_secs(5))).expect("ok");
+    assert!(ok.as_duration() > Duration::ZERO && ok.as_duration() <= Duration::from_secs(5));
 }
 
 /// MAC-1・IO-2・TASK-65.2（D3）: 上限 1 は Flush 用の予約枠を取れないため構築を拒否する。

@@ -36,7 +36,7 @@
 //! 汎用トランスポートを受け取る契約に留める。
 
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fandhe_container_io::{
     AckMetrics, AckReceipt, Frame, FrameKind, FrameReceiver, FrameSender, InFlightLimit, IoError,
@@ -354,13 +354,19 @@ where
     }
 
     /// 送信時点の in-flight 件数を上限に（有限ループ）、`barrier` の `FlushAck` まで ACK を受け取る。
+    ///
+    /// `flush_ack` は 1 回の Flush 全体の期限として扱う。開始時に期限（deadline）を定め、各 `recv_ack` には
+    /// 残り時間だけを渡す。ACK が期限直前に届くたびに待ち時間が再開すると、in-flight 上限件数ぶん
+    /// 単一の `flush` が拘束され得るため（REPAIR-5）。期限超過は `IoErrorCode::Timeout` に揃える。
     fn drain_until(&mut self, barrier: RequestId, acked: &mut u64) -> Result<(), VirtiofsIoError> {
         const OP: VirtiofsIoOp = VirtiofsIoOp::Flush;
+        let deadline = Instant::now().checked_add(self.timeouts.flush_ack.as_duration());
         let rounds = self.client.queue().len();
         for _ in 0..rounds {
+            let remaining = Self::remaining_until(deadline)?;
             let receipt = self
                 .client
-                .recv_ack(self.timeouts.flush_ack)
+                .recv_ack(remaining)
                 .map_err(|e| Self::protocol(OP, e))?;
             match receipt {
                 AckReceipt::Write(_) => {
@@ -373,6 +379,23 @@ where
             }
         }
         Err(VirtiofsIoError::UnexpectedAck { op: OP })
+    }
+
+    /// `deadline` までの残り時間を `IoTimeout` にする。残りが 0 以下（期限到達）なら `Timeout` を返す。
+    ///
+    /// `deadline` が `None`（加算オーバーフロー）の場合は fail-closed で即 `Timeout` とする。
+    fn remaining_until(deadline: Option<Instant>) -> Result<IoTimeout, VirtiofsIoError> {
+        const OP: VirtiofsIoOp = VirtiofsIoOp::Flush;
+        let expired = || {
+            Self::protocol(
+                OP,
+                IoError::new(IoErrorCode::Timeout, "flush deadline exceeded"),
+            )
+        };
+        let deadline = deadline.ok_or_else(expired)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // Duration::ZERO は IoTimeout として構築できない（期限到達と同義）。
+        IoTimeout::new(remaining).map_err(|_| expired())
     }
 
     /// `bodies` を順に `write` し、最後に `flush` するコミット単位（D3 の滞留を必ず確定させる）。

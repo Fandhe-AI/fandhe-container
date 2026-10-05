@@ -610,11 +610,17 @@ impl Drop for ChildGuard {
 /// プロセスグループへの `SIGKILL` 送信エラーのうち、グループに生存者がいないことを示すものか。
 ///
 /// `ESRCH`（グループが空）は正常。macOS はゾンビのみのグループで `EPERM` を返すため同様に許容する
-/// （同一ユーザーの生存者への送信は `EPERM` にならない）。それ以外（`InvalidInput`・`Unsupported` 等）は
-/// 孫の停止を保証できず、呼び出し側（`kill_and_reap`）が `Unreaped` として報告する（PLUG-7・#1311）。
+/// （同一ユーザーの生存者への送信は `EPERM` にならない）。`Unsupported` はグループ送信を持たない unix
+/// （Linux・macOS 以外）で、送信自体ができないことと直接の子の回収成否は別問題のため許容し、
+/// `Child::kill` による直接の子の kill・回収だけにフォールバックする（孫の回収は保証しない。この環境では
+/// 回収済みの pid を未回収として報告しない。PLUG-7・#1311）。それ以外（`InvalidInput` 等）は孫の停止を
+/// 保証できず、呼び出し側（`kill_and_reap`）が `Unreaped` として報告する。
 #[cfg(unix)]
 fn group_kill_tolerated(e: &io::Error) -> bool {
     const ESRCH: i32 = 3;
+    if e.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
     #[cfg(target_os = "macos")]
     const EPERM: i32 = 1;
     match e.raw_os_error() {
@@ -984,7 +990,8 @@ fn exchange_and_reap(
 mod tests {
     use super::*;
 
-    /// PLUG-7・#1311: グループ送信エラーの許容は ESRCH のみ。InvalidInput・Unsupported は許容しない。
+    /// PLUG-7・#1311: グループ送信エラーの許容は ESRCH と Unsupported（送信非対応 unix で直接の子の
+    /// 回収結果を Unreaped に変えない）のみ。InvalidInput は許容しない。
     #[cfg(unix)]
     #[test]
     fn plug7_group_kill_tolerates_only_empty_group_errors() {
@@ -992,7 +999,7 @@ mod tests {
         assert!(!group_kill_tolerated(&io::Error::from(
             io::ErrorKind::InvalidInput
         )));
-        assert!(!group_kill_tolerated(&io::Error::from(
+        assert!(group_kill_tolerated(&io::Error::from(
             io::ErrorKind::Unsupported
         )));
         assert!(!group_kill_tolerated(&io::Error::from_raw_os_error(22)));

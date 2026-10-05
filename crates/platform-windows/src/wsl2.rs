@@ -28,9 +28,10 @@ mod run;
 pub use mount::{
     DistroName, GUEST_MOUNT_BASE, HostDir, LaunchRequest, Launched, MAX_DISTRO_NAME_LEN,
     MAX_HOST_DIR_LEN, MAX_MOUNT_NAME_LEN, MAX_SHARED_MOUNTS, MAX_UNRELEASED_MOUNTS, MountError,
-    MountName, PreparedLaunch, PreparedMount, SharedMount, SharedTransport, launch_with,
-    launch_with_recorder, prepare_virtiofs_launch, prepare_virtiofs_launch_with_recorder,
-    release_virtiofs_launch, release_virtiofs_launch_with_recorder,
+    MountName, PreparedLaunch, PreparedMount, SharedMount, SharedTransport, TransportPolicy,
+    launch_with, launch_with_recorder, prepare_virtiofs_launch,
+    prepare_virtiofs_launch_with_recorder, release_virtiofs_launch,
+    release_virtiofs_launch_with_recorder,
 };
 
 use std::path::{Path, PathBuf};

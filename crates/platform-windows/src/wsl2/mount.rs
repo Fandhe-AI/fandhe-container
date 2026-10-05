@@ -19,8 +19,13 @@
 //!
 //! 検証の本体はマウント後の fstype 確認である。`.wslconfig` の `virtiofs=true` はファイル上の設定に過ぎず、
 //! `wsl --shutdown` までは稼働中の VM に反映されないため、設定の確認だけでは virtiofs の成立を保証できない。
-//! 9P のまま成立した場合も `FAILED_PRECONDITION` で拒否し、暗黙に降格しない（9P へのフォールバックは
-//! TASK-67.5・#376 の担当）。
+//!
+//! 輸送方式は [`TransportPolicy`] で選ぶ（TASK-67.5・#376。WIN-2）。既定の [`TransportPolicy::PreferVirtiofs`]
+//! は virtiofs を優先し、使えない環境（設定が未有効・稼働中の VM に未反映・カーネルが非対応）では 9P で成立した
+//! 共有を受理して起動を続け、降格を [`WinWarning`]（[`PreparedLaunch::warning`]・
+//! [`WinOpRecorder::record_win_warning`]）で必ず通知する（暗黙に降格しない）。[`TransportPolicy::RequireVirtiofs`]
+//! は virtiofs 以外を `FAILED_PRECONDITION` で拒否する。許可する fstype は `virtiofs` と `9p` だけで、未知の
+//! fstype はポリシーによらず拒否する（fail-closed）。所有確認・`nosuid`/`nodev`・ro/rw の検査は 9P でも緩めない。
 //!
 //! # 未実装範囲・前提（REPAIR-3）
 //!
@@ -29,6 +34,9 @@
 //! - `mount -t drvfs <Windows パス> <マウント先>` が `virtiofs=true` 有効時に virtiofs で成立するという
 //!   前提、およびマウントオプション `nosuid,nodev` の受理は実機で未検証（PoC-4 は机上調査のみ。WIN-2 の再検証
 //!   条件）。コマンドの組み立ては `mount_argv` に集約しており、実機確認は TASK-67.6（#377）で行う。
+//! - 9P フォールバック（TASK-67.5）で、WSL2 の drvfs 共有が `/proc/self/mountinfo` 上で fstype `9p` になること、
+//!   9P 経路で `nosuid,nodev,ro` が受理されることも実機で未検証（偽 `wsl.exe` は `9p` を返す前提）。TASK-67.6（#377）で
+//!   実機確認する。
 //! - 結合試験 `tests/wsl2_mount.rs`（feature `wsl2-test-support`）は、偽 `wsl.exe`（`tests/bin/fake_wsl.rs` の
 //!   マウント系モード）を子プロセスとして起動し、公開 API と同じ経路（検出 → mount → mountinfo によるマウント
 //!   ID・fstype の確認 → 起動ステップ → 解除）と argv の受け渡しを検証する。偽 `wsl.exe` はゲスト内スクリプトを
@@ -52,7 +60,10 @@ use super::{
     DistroState, MAX_OUTPUT_BYTES, Wsl2Error, Wsl2ErrorCode, Wsl2Status, check_timeout,
     detect_with_program, run, wsl_exe_path,
 };
-use crate::instrument::{NoopWinOpRecorder, WinOpKind, WinOpRecorder, WinOpTimer, record_win_op};
+use crate::instrument::{
+    NoopWinOpRecorder, WinOpKind, WinOpRecorder, WinOpTimer, WinWarning, WinWarningCode,
+    record_win_op,
+};
 use crate::wslconfig::{self, VirtiofsState};
 
 /// ゲスト内のマウント先の基底。マウント先は常に `<基底>/<MountName>`（任意パスへの上書きマウントを不可能にする）。
@@ -73,6 +84,8 @@ const MAX_MOUNTINFO_LINES: usize = 4096;
 const MAX_MOUNTINFO_LINE_LEN: usize = 4096;
 /// マウントに必須の fstype。
 const VIRTIOFS_FSTYPE: &str = "virtiofs";
+/// 9P フォールバックで受理するもう一方の fstype（WSL2 の drvfs 既定共有。WIN-2）。
+const NINEP_FSTYPE: &str = "9p";
 /// 結果が不確定な操作（mount のタイムアウト・mount 後の mountinfo 読み取り失敗・umount の失敗）の後で、
 /// 状態を確かめるために mountinfo を読み直す最大回数。各回は `wsl.exe` 呼び出し 1 回で、呼び出しごとの
 /// タイムアウトが適用されるため、回復に要する時間は最大でこの回数 × タイムアウトに収まる（REPAIR-5）。
@@ -235,12 +248,26 @@ impl SharedMount {
     }
 }
 
+/// 共有の輸送方式の選択方針（WIN-2・TASK-67.5）。
+///
+/// WIN-2 は 9P を既定の輸送とし virtiofs を opt-in とするため、既定は virtiofs 優先・9P へのフォールバック許可。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum TransportPolicy {
+    /// virtiofs を優先し、使えなければ警告つきで 9P にフォールバックして起動を続ける（既定）。
+    #[default]
+    PreferVirtiofs,
+    /// virtiofs 以外（未有効・9P で成立）を `FAILED_PRECONDITION` で拒否する（TASK-67.4 の厳格動作）。
+    RequireVirtiofs,
+}
+
 /// 起動要求（ディストリと共有マウント一覧）。件数上限と、名前・ホストディレクトリの重複を拒否する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LaunchRequest {
     distro: DistroName,
     mounts: Vec<SharedMount>,
+    policy: TransportPolicy,
 }
 
 impl LaunchRequest {
@@ -259,7 +286,23 @@ impl LaunchRequest {
                 }
             }
         }
-        Ok(Self { distro, mounts })
+        Ok(Self {
+            distro,
+            mounts,
+            policy: TransportPolicy::default(),
+        })
+    }
+
+    /// 輸送方式の方針を差し替えた要求を返す（既定は [`TransportPolicy::PreferVirtiofs`]）。
+    #[must_use]
+    pub fn with_transport_policy(mut self, policy: TransportPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// 輸送方式の方針。
+    pub fn transport_policy(&self) -> TransportPolicy {
+        self.policy
     }
 
     /// 対象ディストリ。
@@ -274,12 +317,24 @@ impl LaunchRequest {
     }
 }
 
-/// 共有の輸送方式。現状は virtiofs のみ（9P は TASK-67.5・#376 が追加する）。
+/// 共有の輸送方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SharedTransport {
     /// virtiofs。
     Virtiofs,
+    /// 9P（virtiofs が使えない環境へのフォールバック。性能は低い。TASK-67.5・WIN-2）。
+    NineP,
+}
+
+impl SharedTransport {
+    /// 機械可読な名前（`"virtiofs"` / `"9p"`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Virtiofs => VIRTIOFS_FSTYPE,
+            Self::NineP => NINEP_FSTYPE,
+        }
+    }
 }
 
 /// 検証済みマウント 1 件。
@@ -307,6 +362,7 @@ pub struct PreparedLaunch {
     distro: DistroName,
     mounts: Vec<PreparedMount>,
     transport: SharedTransport,
+    warning: Option<WinWarning>,
 }
 
 impl PreparedLaunch {
@@ -323,6 +379,11 @@ impl PreparedLaunch {
     /// 成立した輸送方式。
     pub fn transport(&self) -> SharedTransport {
         self.transport
+    }
+
+    /// 9P へフォールバックした場合の警告（virtiofs で成立した場合・共有マウントが 0 件の場合は `None`）。
+    pub fn warning(&self) -> Option<WinWarning> {
+        self.warning
     }
 }
 
@@ -354,12 +415,59 @@ fn preflight(
             "the requested WSL distribution cannot be used: {why}"
         )));
     }
-    if virtiofs != VirtiofsState::Enabled {
+    if req.policy == TransportPolicy::RequireVirtiofs && virtiofs != VirtiofsState::Enabled {
         return Err(precondition(
             "virtiofs is not enabled. Set 'virtiofs=true' under [wsl2] in .wslconfig and run 'wsl --shutdown' to apply it",
         ));
     }
     Ok(())
+}
+
+/// マウント後に観測した fstype 1 件を方針に照らして検査する（許可リスト。未知の fstype は常に拒否）。
+fn check_fstype(policy: TransportPolicy, fstype: &str) -> Result<(), Wsl2Error> {
+    match fstype {
+        VIRTIOFS_FSTYPE => Ok(()),
+        NINEP_FSTYPE if policy == TransportPolicy::PreferVirtiofs => Ok(()),
+        NINEP_FSTYPE => Err(precondition(
+            "a shared mount is not backed by virtiofs; the setting may not be applied to the running VM, run 'wsl --shutdown' and retry",
+        )),
+        _ => Err(precondition(
+            "a shared mount is backed by an unsupported filesystem type",
+        )),
+    }
+}
+
+/// 共有マウントが 0 件のときの想定輸送方式（ゲスト内を観測しないため設定状態から決める。警告は出さない）。
+fn assumed_transport(virtiofs: VirtiofsState) -> SharedTransport {
+    if virtiofs == VirtiofsState::Enabled {
+        SharedTransport::Virtiofs
+    } else {
+        SharedTransport::NineP
+    }
+}
+
+/// 観測した fstype 一覧から輸送方式と警告を決める（純粋関数。WIN-2・TASK-67.5）。
+///
+/// 全て virtiofs なら `Virtiofs`（設定が未有効でも実際に成立していれば警告なし）。1 件でも 9P なら性能の低い側の
+/// `NineP` とし、設定が `Enabled` 以外なら `VirtiofsNotEnabled`、`Enabled` なら `VirtiofsNotApplied` を添える。
+/// 許可リスト外の fstype・厳格方針での 9P は `FAILED_PRECONDITION`。
+fn decide_transport(
+    policy: TransportPolicy,
+    virtiofs: VirtiofsState,
+    fstypes: &[&str],
+) -> Result<(SharedTransport, Option<WinWarning>), Wsl2Error> {
+    for t in fstypes {
+        check_fstype(policy, t)?;
+    }
+    if fstypes.iter().all(|t| *t == VIRTIOFS_FSTYPE) {
+        return Ok((SharedTransport::Virtiofs, None));
+    }
+    let code = if virtiofs == VirtiofsState::Enabled {
+        WinWarningCode::VirtiofsNotApplied
+    } else {
+        WinWarningCode::VirtiofsNotEnabled
+    };
+    Ok((SharedTransport::NineP, Some(WinWarning::new(code))))
 }
 
 /// `wsl.exe` へ渡す引数: ゲスト内 root でシェルを介さず `cmd` を直接実行する。
@@ -908,7 +1016,11 @@ impl RollbackOutcome {
 }
 
 /// 未解除のマウントを、そのまま [`release_virtiofs_launch`] に渡せる [`PreparedLaunch`] にまとめる（無ければ `None`）。
-fn unreleased_launch(distro: &DistroName, failed: &[OwnedMount]) -> Option<PreparedLaunch> {
+fn unreleased_launch(
+    distro: &DistroName,
+    failed: &[OwnedMount],
+    transport: SharedTransport,
+) -> Option<PreparedLaunch> {
     if failed.is_empty() {
         return None;
     }
@@ -919,7 +1031,8 @@ fn unreleased_launch(distro: &DistroName, failed: &[OwnedMount]) -> Option<Prepa
             .take(MAX_UNRELEASED_MOUNTS)
             .map(OwnedMount::to_prepared)
             .collect(),
-        transport: SharedTransport::Virtiofs,
+        transport,
+        warning: None,
     })
 }
 
@@ -964,10 +1077,15 @@ impl MountError {
     }
 
     /// 後始末の失敗件数を `error` のメッセージに添えて、未解除のマウントとともに返す。
-    fn with_unreleased(error: Wsl2Error, distro: &DistroName, outcome: &RollbackOutcome) -> Self {
+    fn with_unreleased(
+        error: Wsl2Error,
+        distro: &DistroName,
+        outcome: &RollbackOutcome,
+        transport: SharedTransport,
+    ) -> Self {
         Self {
             error: with_rollback_note(error, outcome),
-            unreleased: unreleased_launch(distro, &outcome.retry),
+            unreleased: unreleased_launch(distro, &outcome.retry, transport),
         }
     }
 }
@@ -1269,19 +1387,22 @@ fn mount_one(
     }
 }
 
-/// 全マウントが「自分が成立させたマウント ID の最上位エントリ」かつ virtiofs で、読み取り専用か否かが要求と
-/// 一致する（ro 要求なら ro・読み書き要求なら ro でない）ことを確認する。`owned` は `req.mounts` と同順・同数。
-fn verify_virtiofs(
+/// 全マウントが「自分が成立させたマウント ID の最上位エントリ」かつ許可リストの fstype（virtiofs、方針が許せば
+/// 9P）で、`nosuid`/`nodev` を持ち、読み取り専用か否かが要求と一致する（ro 要求なら ro・読み書き要求なら ro で
+/// ない）ことを確認し、輸送方式と警告を決めて返す。`owned` は `req.mounts` と同順・同数。9P でも検査は緩めない。
+fn verify_shared(
     req: &LaunchRequest,
+    virtiofs: VirtiofsState,
     owned: &[OwnedMount],
     exec: Exec<'_>,
-) -> Result<(), Wsl2Error> {
+) -> Result<(SharedTransport, Option<WinWarning>), Wsl2Error> {
     if owned.len() != req.mounts.len() {
         return Err(precondition("the shared mount records are inconsistent"));
     }
     let Some(after) = read_mountinfo_bounded(&req.distro, exec) else {
         return Err(precondition("reading mountinfo after mounting failed"));
     };
+    let mut fstypes: Vec<&str> = Vec::with_capacity(owned.len());
     for (m, o) in req.mounts.iter().zip(owned) {
         match find_mount(&after, &o.guest_path) {
             Some(e) if Some(e.mount_id) != o.mount_id => {
@@ -1289,10 +1410,13 @@ fn verify_virtiofs(
                     "a shared mount was replaced by another mount after mounting",
                 ));
             }
-            Some(e) if e.fstype != VIRTIOFS_FSTYPE => {
-                return Err(precondition(
-                    "a shared mount is not backed by virtiofs; the setting may not be applied to the running VM, run 'wsl --shutdown' and retry",
-                ));
+            Some(e) if check_fstype(req.policy, &e.fstype).is_err() => {
+                // ガード側で Err と確認済み。理論上到達しない `None` 側も fail-closed の拒否にする。
+                return Err(check_fstype(req.policy, &e.fstype)
+                    .err()
+                    .unwrap_or_else(|| {
+                        precondition("a shared mount has an unsupported filesystem type")
+                    }));
             }
             Some(e) if !e.has_option("nosuid") || !e.has_option("nodev") => {
                 return Err(precondition(
@@ -1310,7 +1434,7 @@ fn verify_virtiofs(
                     "a read-write shared mount is mounted read-only",
                 ));
             }
-            Some(_) => {}
+            Some(e) => fstypes.push(e.fstype.as_str()),
             None => {
                 return Err(precondition(
                     "the shared mount is missing or its topmost mount cannot be determined after mounting",
@@ -1318,7 +1442,7 @@ fn verify_virtiofs(
             }
         }
     }
-    Ok(())
+    decide_transport(req.policy, virtiofs, &fstypes)
 }
 
 /// 事前判定・マウント・fstype 確認までを行う。成功時のみ [`PreparedLaunch`] を返す。
@@ -1335,7 +1459,8 @@ fn prepare_with_exec(
         return Ok(PreparedLaunch {
             distro: req.distro.clone(),
             mounts: Vec::new(),
-            transport: SharedTransport::Virtiofs,
+            transport: assumed_transport(virtiofs),
+            warning: None,
         });
     }
     // 基底・マウント先の symlink 非追従検証とディレクトリ作成は mount と同じゲスト内プロセスで行う
@@ -1354,17 +1479,31 @@ fn prepare_with_exec(
     for m in &req.mounts {
         if let Err(e) = mount_one(distro, m, &before_ids, &mut owned, exec) {
             let failed = rollback(distro, &owned, exec);
-            return Err(MountError::with_unreleased(e, distro, &failed));
+            return Err(MountError::with_unreleased(
+                e,
+                distro,
+                &failed,
+                assumed_transport(virtiofs),
+            ));
         }
     }
-    if let Err(e) = verify_virtiofs(req, &owned, exec) {
-        let failed = rollback(distro, &owned, exec);
-        return Err(MountError::with_unreleased(e, distro, &failed));
-    }
+    let (transport, warning) = match verify_shared(req, virtiofs, &owned, exec) {
+        Ok(decided) => decided,
+        Err(e) => {
+            let failed = rollback(distro, &owned, exec);
+            return Err(MountError::with_unreleased(
+                e,
+                distro,
+                &failed,
+                assumed_transport(virtiofs),
+            ));
+        }
+    };
     Ok(PreparedLaunch {
         distro: req.distro.clone(),
         mounts: owned.iter().map(OwnedMount::to_prepared).collect(),
-        transport: SharedTransport::Virtiofs,
+        transport,
+        warning,
     })
 }
 
@@ -1403,9 +1542,11 @@ pub(super) fn prepare_with_program(
     prepare_with_exec(&status, virtiofs, req, &mut exec)
 }
 
-/// virtiofs 共有マウントを準備する。`timeout` は各 `wsl.exe` 呼び出しに適用する（REPAIR-5）。
+/// 共有マウントを準備する（関数名は TASK-67.4 からの互換。既定の [`TransportPolicy::PreferVirtiofs`] では
+/// virtiofs が使えない場合に 9P へフォールバックする）。`timeout` は各 `wsl.exe` 呼び出しに適用する（REPAIR-5）。
 ///
-/// 成功時は全マウントが virtiofs で成立している。失敗時は本呼び出しで作ったマウントを後始末して `Err`。
+/// 成功時は全マウントが virtiofs（方針が許せば 9P。[`PreparedLaunch::transport`]・[`PreparedLaunch::warning`]）で
+/// 成立している。失敗時は本呼び出しで作ったマウントを後始末して `Err`。
 /// mount がタイムアウトした等で結果が不確定な場合も、mount したゲスト内プロセスの記録（所有の証拠）で
 /// 自分のマウントを特定して外す。自分のものと確認できないマウントは外さず、メッセージに
 /// `mount ownership unconfirmed` を含めて返す。後始末で外せなかったマウントは [`MountError::unreleased`] に
@@ -1424,10 +1565,19 @@ pub fn prepare_virtiofs_launch_with_recorder(
     timeout: Duration,
     recorder: &dyn WinOpRecorder,
 ) -> Result<PreparedLaunch, MountError> {
-    record_win_op(recorder, WinOpKind::Wsl2MountShared, || {
+    let prepared = record_win_op(recorder, WinOpKind::Wsl2MountShared, || {
         let (program, state) = resolve_environment(timeout)?;
         prepare_with_program(&program, state, req, timeout)
-    })
+    })?;
+    emit_warning(&prepared, recorder);
+    Ok(prepared)
+}
+
+/// 準備に成功した結果に警告（9P フォールバック）があれば記録先へちょうど 1 回渡す（TASK-67.5・WIN-2）。
+fn emit_warning(prepared: &PreparedLaunch, recorder: &dyn WinOpRecorder) {
+    if let Some(w) = prepared.warning {
+        recorder.record_win_warning(&w);
+    }
 }
 
 /// 準備済みマウントを逆順に best-effort で解除する（マウント ID が一致するもの・未確定の記録で所有を確かめられた
@@ -1495,7 +1645,7 @@ pub(super) fn release_with_program(
     }
     Err(MountError {
         error: precondition(message),
-        unreleased: unreleased_launch(&prepared.distro, &outcome.retry),
+        unreleased: unreleased_launch(&prepared.distro, &outcome.retry, prepared.transport),
     })
 }
 
@@ -1539,11 +1689,18 @@ fn finish_launch<T>(
 ) -> Result<Launched<T>, MountError> {
     timer.finish_with(&prepared);
     let prepared = prepared?;
+    // 9P フォールバックの警告は start の成否によらず起動前に 1 回通知する（起動は継続する。WIN-2）。
+    emit_warning(&prepared, recorder);
     match start(&prepared) {
         Ok(value) => Ok(Launched { value, prepared }),
         Err(e) => {
             let failed = release_recorded(&prepared, exec, recorder);
-            Err(MountError::with_unreleased(e, &prepared.distro, &failed))
+            Err(MountError::with_unreleased(
+                e,
+                &prepared.distro,
+                &failed,
+                prepared.transport,
+            ))
         }
     }
 }
@@ -1667,6 +1824,11 @@ mod tests {
         LaunchRequest::new(distro_name(), mounts).expect("valid request")
     }
 
+    /// virtiofs 必須（フォールバックなし）の要求。TASK-67.4 の厳格動作を確かめるテストで使う。
+    fn req_strict(mounts: Vec<SharedMount>) -> LaunchRequest {
+        req(mounts).with_transport_policy(TransportPolicy::RequireVirtiofs)
+    }
+
     /// WIN-4・REPAIR-2: ドライブレター絶対パスは受理し、危険な形式は具体的に拒否する。
     #[test]
     fn host_dir_accepts_and_rejects() {
@@ -1758,7 +1920,10 @@ mod tests {
             VirtiofsState::Disabled,
             VirtiofsState::Other,
         ] {
-            let e = preflight(&ok_status(), s, &r).unwrap_err();
+            // 既定（PreferVirtiofs）は未有効でも通す。厳格方針では拒否する。
+            assert!(preflight(&ok_status(), s, &r).is_ok());
+            let rs = req_strict(vec![sm("C:\\a", "a", false)]);
+            let e = preflight(&ok_status(), s, &rs).unwrap_err();
             assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
             assert!(e.message().contains("virtiofs=true"), "{}", e.message());
         }
@@ -2496,7 +2661,7 @@ mod tests {
     #[test]
     fn prepare_rejects_9p_and_rolls_back() {
         let mut g = Guest::new("9p");
-        let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", false)]);
+        let r = req_strict(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", false)]);
         let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
         assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
         assert!(e.message().contains("wsl --shutdown"));
@@ -2540,7 +2705,8 @@ mod tests {
         assert!(g.umounts.is_empty());
         assert_eq!(g.mount_calls, 0);
         let mut g2 = Guest::new("virtiofs");
-        assert!(drive(&mut g2, &r, VirtiofsState::Unset).is_err());
+        let rs = req_strict(vec![sm("C:\\a", "a", false)]);
+        assert!(drive(&mut g2, &rs, VirtiofsState::Unset).is_err());
         assert_eq!(g2.mount_calls, 0);
     }
 
@@ -2751,7 +2917,8 @@ mod tests {
         g.mounts.push(("/mnt/fandhe/a".into(), "virtiofs".into()));
         g.ids.push(555);
         g.opts.push("rw".into());
-        let e = verify_virtiofs(&r, &owned, &mut |a, m| g.run(a, m)).unwrap_err();
+        let e =
+            verify_shared(&r, VirtiofsState::Enabled, &owned, &mut |a, m| g.run(a, m)).unwrap_err();
         assert!(e.message().contains("replaced"));
         assert!(g.umounts.is_empty());
     }
@@ -2834,10 +3001,11 @@ mod tests {
         let mut g = Guest::new("9p");
         let rec = Collect::default();
         let mut called = false;
+        let rs = req_strict(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", false)]);
         launch_with_exec(
             &ok_status(),
             VirtiofsState::Enabled,
-            &r,
+            &rs,
             &mut |a, m| g.run(a, m),
             &rec,
             |_| {
@@ -3299,13 +3467,208 @@ mod tests {
         assert!(g.records.is_empty() && g.claims.is_empty());
     }
 
+    /// WIN-2: `decide_transport` の表（ポリシー × 設定状態 × fstype）。期待値は具体値で照合する。
+    #[test]
+    fn win2_decide_transport_table() {
+        use crate::wslconfig::VirtiofsState as V;
+        use WinWarningCode::{VirtiofsNotApplied as NA, VirtiofsNotEnabled as NE};
+        let prefer = TransportPolicy::PreferVirtiofs;
+        let strict = TransportPolicy::RequireVirtiofs;
+        let vf = SharedTransport::Virtiofs;
+        let np = SharedTransport::NineP;
+        #[allow(clippy::type_complexity)]
+        let ok_cases: Vec<(
+            TransportPolicy,
+            V,
+            &[&str],
+            SharedTransport,
+            Option<WinWarningCode>,
+        )> = vec![
+            (prefer, V::Enabled, &["virtiofs", "virtiofs"], vf, None),
+            (prefer, V::Unset, &["virtiofs"], vf, None),
+            (strict, V::Enabled, &["virtiofs"], vf, None),
+            (prefer, V::Enabled, &["9p", "9p"], np, Some(NA)),
+            (prefer, V::Unset, &["9p"], np, Some(NE)),
+            (prefer, V::Disabled, &["9p"], np, Some(NE)),
+            (prefer, V::Other, &["9p"], np, Some(NE)),
+            (prefer, V::Enabled, &["virtiofs", "9p"], np, Some(NA)),
+            (prefer, V::Unset, &["9p", "virtiofs"], np, Some(NE)),
+        ];
+        for (policy, state, types, want_t, want_w) in ok_cases {
+            let (t, w) = decide_transport(policy, state, types).unwrap();
+            assert_eq!(t, want_t, "{policy:?} {state:?} {types:?}");
+            assert_eq!(
+                w.map(|w| w.code()),
+                want_w,
+                "{policy:?} {state:?} {types:?}"
+            );
+        }
+        // 厳格方針での 9P と、未知の fstype（方針によらず）は FAILED_PRECONDITION。
+        let err_cases: [(TransportPolicy, &[&str]); 4] = [
+            (strict, &["9p"]),
+            (strict, &["virtiofs", "9p"]),
+            (prefer, &["ext4"]),
+            (prefer, &["virtiofs", "tmpfs"]),
+        ];
+        for (policy, types) in err_cases {
+            let e = decide_transport(policy, V::Enabled, types).unwrap_err();
+            assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition, "{types:?}");
+        }
+    }
+
+    /// WIN-2・ERR-1: 既定方針では 9P で成立した共有を受理し、警告つきで起動を続けられる（マウントは残る）。
+    #[test]
+    fn win2_prepare_falls_back_to_9p_with_warning() {
+        let mut g = Guest::new("9p");
+        let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", true)]);
+        let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
+        assert_eq!(p.transport(), SharedTransport::NineP);
+        assert_eq!(p.transport().as_str(), "9p");
+        assert_eq!(
+            p.warning().map(|w| w.code()),
+            Some(WinWarningCode::VirtiofsNotApplied)
+        );
+        assert_eq!(
+            summary(&p),
+            [
+                ("/mnt/fandhe/a", Some(100), false),
+                ("/mnt/fandhe/b", Some(101), true)
+            ]
+        );
+        assert!(g.umounts.is_empty());
+        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).failures(), 0);
+        assert_eq!(g.ids, [1]);
+
+        // 設定が未有効のときは VIRTIOFS_NOT_ENABLED。
+        let mut g = Guest::new("9p");
+        let p = drive(&mut g, &r, VirtiofsState::Unset).unwrap();
+        assert_eq!(p.transport(), SharedTransport::NineP);
+        assert_eq!(
+            p.warning().map(|w| w.code()),
+            Some(WinWarningCode::VirtiofsNotEnabled)
+        );
+        assert!(g.umounts.is_empty());
+    }
+
+    /// WIN-2: 設定が未有効でも実際に virtiofs で成立していれば警告なし。9P でも所有確認・オプション検査は緩めない。
+    #[test]
+    fn win2_fallback_keeps_verification_strict() {
+        let mut g = Guest::new("virtiofs");
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let p = drive(&mut g, &r, VirtiofsState::Unset).unwrap();
+        assert_eq!(p.transport(), SharedTransport::Virtiofs);
+        assert_eq!(p.warning(), None);
+
+        // 未知の fstype は既定方針でもロールバックして拒否する（fail-closed）。
+        let mut g = Guest::new("ext4");
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert!(e.message().contains("unsupported filesystem type"));
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+
+        // 9P でも nosuid/nodev の欠落は拒否する。
+        let mut g = Guest::new("9p");
+        g.mounts.push(("/mnt/fandhe/a".into(), "9p".into()));
+        let owned = vec![OwnedMount {
+            guest_path: "/mnt/fandhe/a".into(),
+            mount_id: Some(100),
+            nonce: "00ff".into(),
+            read_only: false,
+        }];
+        g.ids.push(100);
+        g.opts.push("rw".into());
+        let e =
+            verify_shared(&r, VirtiofsState::Enabled, &owned, &mut |a, m| g.run(a, m)).unwrap_err();
+        assert!(e.message().contains("nosuid or nodev"), "{}", e.message());
+    }
+
+    /// WIN-2: 共有マウントが 0 件のとき、ゲスト内を観測せず設定状態から輸送方式を決め、警告は出さない。
+    #[test]
+    fn win2_zero_mounts_transport_follows_setting() {
+        let r = req(vec![]);
+        for (state, want) in [
+            (VirtiofsState::Enabled, SharedTransport::Virtiofs),
+            (VirtiofsState::Unset, SharedTransport::NineP),
+        ] {
+            let mut g = Guest::new("virtiofs");
+            let p = drive(&mut g, &r, state).unwrap();
+            assert_eq!(p.transport(), want);
+            assert_eq!(p.warning(), None);
+            assert_eq!(g.mount_calls, 0);
+        }
+    }
+
+    /// WIN-2・REPAIR-4: フォールバック時は警告がちょうど 1 件、start が呼ばれ（失敗時も警告は 1 件）、
+    /// virtiofs 成功時と準備失敗時は 0 件。
+    #[test]
+    fn win2_launch_emits_single_warning_and_continues() {
+        use crate::instrument::testing::Collect;
+        let r = req(vec![sm("C:\\a", "a", false)]);
+
+        let mut g = Guest::new("9p");
+        let rec = Collect::default();
+        let v = launch_with_exec(
+            &ok_status(),
+            VirtiofsState::Enabled,
+            &r,
+            &mut |a, m| g.run(a, m),
+            &rec,
+            |p| Ok(p.transport()),
+        )
+        .unwrap();
+        assert_eq!(v.value, SharedTransport::NineP);
+        assert_eq!(rec.warning_codes(), [WinWarningCode::VirtiofsNotApplied]);
+        assert!(g.umounts.is_empty());
+
+        let mut g = Guest::new("9p");
+        let rec = Collect::default();
+        let e = launch_with_exec(
+            &ok_status(),
+            VirtiofsState::Unset,
+            &r,
+            &mut |a, m| g.run(a, m),
+            &rec,
+            |_| Err::<(), _>(Wsl2Error::new(Wsl2ErrorCode::Internal, "start failed")),
+        )
+        .unwrap_err();
+        assert_eq!(e.message(), "start failed");
+        assert_eq!(rec.warning_codes(), [WinWarningCode::VirtiofsNotEnabled]);
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+
+        let mut g = Guest::new("virtiofs");
+        let rec = Collect::default();
+        launch_with_exec(
+            &ok_status(),
+            VirtiofsState::Enabled,
+            &r,
+            &mut |a, m| g.run(a, m),
+            &rec,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(rec.warning_codes().is_empty());
+
+        let mut g = Guest::new("ext4");
+        let rec = Collect::default();
+        launch_with_exec(
+            &ok_status(),
+            VirtiofsState::Enabled,
+            &r,
+            &mut |a, m| g.run(a, m),
+            &rec,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(rec.warning_codes().is_empty());
+    }
+
     /// 後始末（ロールバック）で外せなかったマウントは、マウント先・ID・nonce を持つ PreparedLaunch として
     /// エラーに載り、そのまま解除をやり直せる。外せた場合は載らない。
     #[test]
     fn prepare_returns_unreleased_mounts_for_retry() {
         let mut g = Guest::new("9p");
         g.umount_timeout = Some(false);
-        let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", true)]);
+        let r = req_strict(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", true)]);
         let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
         assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
         assert!(
@@ -3350,7 +3713,7 @@ mod tests {
         let mounts: Vec<_> = (0..MAX_SHARED_MOUNTS)
             .map(|i| sm(&format!("C:\\d{i}"), &format!("n{i}"), false))
             .collect();
-        let e = drive(&mut g, &req(mounts), VirtiofsState::Enabled).unwrap_err();
+        let e = drive(&mut g, &req_strict(mounts), VirtiofsState::Enabled).unwrap_err();
         assert!(
             e.message()
                 .ends_with("(16 rollback unmount(s) also failed)")
@@ -3368,9 +3731,12 @@ mod tests {
                 read_only: false,
             })
             .collect();
-        let capped = unreleased_launch(&distro_name(), &many).unwrap();
+        let capped = unreleased_launch(&distro_name(), &many, SharedTransport::Virtiofs).unwrap();
         assert_eq!(capped.mounts().len(), MAX_UNRELEASED_MOUNTS);
-        assert_eq!(unreleased_launch(&distro_name(), &[]), None);
+        assert_eq!(
+            unreleased_launch(&distro_name(), &[], SharedTransport::Virtiofs),
+            None
+        );
     }
 
     /// 起動ステップ失敗時の解除で外せなかったマウントも、エラーに載せて返す。

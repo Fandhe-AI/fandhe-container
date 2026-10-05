@@ -12,7 +12,8 @@
 //! # 未実装範囲（REPAIR-3）
 //!
 //! - core の `OpRecorder` との接続アダプタ（上位 crate の担当。本 crate からは提供しない）
-//! - WSL2 検出・virtiofs マウント等の後続操作（TASK-67.3〜67.5）の種別は、各操作と一緒に [`WinOpKind`] へ追加する
+//! - 9P フォールバック警告（[`WinWarning`]）の構造化ログ行（`level: warn`）への書き出し（上位 crate の担当。
+//!   本 crate は JSON を組まず、[`WinOpRecorder::record_win_warning`] でデータとして渡すだけ。TASK-67.5・WIN-2）
 //!
 //! # 機微情報
 //!
@@ -33,9 +34,9 @@ pub enum WinOpKind {
     /// `virtiofs=true` の opt-in 1 回（読み込みから作成・置換・親ディレクトリ同期まで。書き込み不要の
     /// `AlreadyEnabled` も成功として 1 件）。内側の読み込みは別サンプルとして記録しない。
     WslconfigEnableVirtiofs,
-    /// virtiofs 共有マウントの準備 1 回（事前判定・マウント・fstype 確認。TASK-67.4）。
+    /// 共有マウントの準備 1 回（事前判定・マウント・fstype 確認。virtiofs または 9P フォールバック。TASK-67.4・67.5）。
     Wsl2MountShared,
-    /// virtiofs 共有マウントの解除 1 回（停止時の解除・起動ステップ失敗時のロールバック。1 件でも解除できな
+    /// 共有マウントの解除 1 回（停止時の解除・起動ステップ失敗時のロールバック。1 件でも解除できな
     /// ければ失敗。TASK-67.4）。
     Wsl2UnmountShared,
 }
@@ -107,6 +108,62 @@ impl WinOpSample {
     }
 }
 
+/// 警告の機械可読な分類（ERR-1。`WinErrorCode` と同じく大文字スネークの固定文字列）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum WinWarningCode {
+    /// `.wslconfig` で virtiofs が有効でなく、共有が 9P にフォールバックした（WIN-2）。
+    VirtiofsNotEnabled,
+    /// `.wslconfig` では有効だが稼働中の VM・カーネルに反映されず、共有が 9P にフォールバックした（WIN-2）。
+    VirtiofsNotApplied,
+}
+
+impl WinWarningCode {
+    /// 機械可読な `code` 文字列を返す。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VirtiofsNotEnabled => "VIRTIOFS_NOT_ENABLED",
+            Self::VirtiofsNotApplied => "VIRTIOFS_NOT_APPLIED",
+        }
+    }
+}
+
+/// 起動を止めない警告 1 件（`code` と英語の固定 `message`。ERR-1・REPAIR-4）。
+///
+/// `message` は `'static` な固定文言で、ホストパス・ユーザー名・`.wslconfig` の内容・`wsl.exe` の生出力を
+/// 含まない。ヒープ確保なしの値型。構造化ログ行（`level: warn`）への書き出しは上位 crate
+/// （`fandhe-container-plugin-windows`・TASK-116）のアダプタが担う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WinWarning {
+    code: WinWarningCode,
+    message: &'static str,
+}
+
+impl WinWarning {
+    /// 分類から固定文言つきの警告を作る。
+    pub fn new(code: WinWarningCode) -> Self {
+        let message = match code {
+            WinWarningCode::VirtiofsNotEnabled => {
+                "virtiofs is not enabled; falling back to 9P (slower). Set 'virtiofs=true' under [wsl2] in .wslconfig and run 'wsl --shutdown' to enable it"
+            }
+            WinWarningCode::VirtiofsNotApplied => {
+                "virtiofs is enabled in .wslconfig but the shared mount is backed by 9P; falling back to 9P (slower). The setting may not be applied to the running VM or the WSL kernel may not support virtiofs; run 'wsl --shutdown' and retry"
+            }
+        };
+        Self { code, message }
+    }
+
+    /// 機械可読な分類。
+    pub fn code(&self) -> WinWarningCode {
+        self.code
+    }
+
+    /// 英語の固定メッセージ。
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+}
+
 /// 計測結果を受け取る記録先（REPAIR-4）。
 ///
 /// 契約: 設定ファイル操作の経路から呼ばれるため、有界時間で戻ること（I/O・相手応答待ち・無期限のロック待ちを
@@ -115,6 +172,10 @@ impl WinOpSample {
 pub trait WinOpRecorder: Send + Sync {
     /// 1 件の計測結果を記録する。
     fn record_win_op(&self, sample: &WinOpSample);
+
+    /// 起動を止めない警告（9P フォールバック等。TASK-67.5・WIN-2）を 1 件記録する。既定は何もしない
+    /// （既存の実装は互換のまま）。契約は [`record_win_op`](Self::record_win_op) と同じ。
+    fn record_win_warning(&self, _warning: &WinWarning) {}
 }
 
 /// 計測しない場合に明示的に渡す既定実装。
@@ -190,12 +251,18 @@ pub(crate) mod testing {
 
     /// 受け取ったサンプルを順に保持する。
     #[derive(Default)]
-    pub(crate) struct Collect(Mutex<Vec<WinOpSample>>);
+    pub(crate) struct Collect(Mutex<Vec<WinOpSample>>, Mutex<Vec<WinWarning>>);
 
     impl WinOpRecorder for Collect {
         fn record_win_op(&self, s: &WinOpSample) {
             if let Ok(mut v) = self.0.lock() {
                 v.push(*s);
+            }
+        }
+
+        fn record_win_warning(&self, w: &WinWarning) {
+            if let Ok(mut v) = self.1.lock() {
+                v.push(*w);
             }
         }
     }
@@ -204,6 +271,14 @@ pub(crate) mod testing {
         /// これまでに記録されたサンプル。
         pub(crate) fn items(&self) -> Vec<WinOpSample> {
             self.0.lock().map(|v| v.clone()).unwrap_or_default()
+        }
+
+        /// これまでに記録された警告の code 列。
+        pub(crate) fn warning_codes(&self) -> Vec<WinWarningCode> {
+            self.1
+                .lock()
+                .map(|v| v.iter().map(WinWarning::code).collect())
+                .unwrap_or_default()
         }
 
         /// (種別, 結果) の列。
@@ -333,5 +408,39 @@ mod tests {
         assert_eq!(sample.kind(), WinOpKind::WslconfigLoad);
         assert_eq!(sample.outcome(), WinOpOutcome::Success);
         assert_eq!(sample.latency(), Duration::from_millis(3));
+    }
+
+    /// WIN-2・ERR-1: 警告 code 文字列は固定で、message はパス区切りを含まない英語の固定文言。
+    #[test]
+    fn win2_warning_code_strings_and_messages_are_fixed() {
+        assert_eq!(
+            WinWarningCode::VirtiofsNotEnabled.as_str(),
+            "VIRTIOFS_NOT_ENABLED"
+        );
+        assert_eq!(
+            WinWarningCode::VirtiofsNotApplied.as_str(),
+            "VIRTIOFS_NOT_APPLIED"
+        );
+        for code in [
+            WinWarningCode::VirtiofsNotEnabled,
+            WinWarningCode::VirtiofsNotApplied,
+        ] {
+            let w = WinWarning::new(code);
+            assert_eq!(w.code(), code);
+            assert!(w.message().contains("9P"), "{code:?}");
+            assert!(!w.message().contains('/') && !w.message().contains('\\'));
+            assert!(w.message().is_ascii());
+        }
+    }
+
+    /// WIN-2: `record_win_warning` の既定実装は何もせず、`Collect` は警告を保持する。
+    #[test]
+    fn win2_record_win_warning_default_is_noop() {
+        let w = WinWarning::new(WinWarningCode::VirtiofsNotEnabled);
+        NoopWinOpRecorder.record_win_warning(&w);
+        let c = Collect::default();
+        c.record_win_warning(&w);
+        assert_eq!(c.warning_codes(), vec![WinWarningCode::VirtiofsNotEnabled]);
+        assert!(c.items().is_empty());
     }
 }

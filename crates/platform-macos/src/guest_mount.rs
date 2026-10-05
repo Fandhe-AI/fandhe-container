@@ -418,6 +418,7 @@ impl GuestMountTracker {
 /// 照会が決着しなかった場合は `Err(VmState::Unknown(_))` を返す）を確認し、VM が停止していれば `VmStopped` で早期に失敗させる。
 /// 待機中の `Unknown` は一過性とみなして継続するが、全共有の報告が揃った成功確定時に `Unknown` のままなら
 /// 期限まで再照会し、確認できなければ `VmStopped { state: Unknown(_) }` で失敗させる（成功を確定しない。fail-closed・REPAIR-5）。
+/// 全共有の成功確定前に、受信済みの後続報告もすべて検証する（矛盾・失敗・不正があれば失敗）。
 /// 停止前に届いていた報告は先に処理する。送信側が破棄されたら `ReportChannelClosed`。
 pub fn await_guest_mounts(
     rx: &Receiver<ReportItem>,
@@ -447,6 +448,13 @@ pub fn await_guest_mounts(
             Ok(item) => match tracker.apply(item) {
                 TrackerStatus::Pending => {}
                 TrackerStatus::AllMounted => {
+                    // 成功確定前に、既にチャネルへ届いている後続報告をすべて検証する（例: a=ok, b=ok, a=error
+                    // の矛盾する重複を見逃さない。ゲスト出力は untrusted のため fail-closed）。
+                    while let Ok(next) = rx.try_recv() {
+                        if let TrackerStatus::Failed(e) = tracker.apply(next) {
+                            return Err(e);
+                        }
+                    }
                     if overflow.load(Ordering::Acquire) {
                         return Err(overflow_error());
                     }
@@ -898,6 +906,33 @@ mod tests {
     }
 
     const TICK: Duration = Duration::from_millis(5);
+
+    /// MAC-1・TASK-65.3: 全共有の成功確定後に受信済みの矛盾報告（a=ok, b=ok, a=error）があれば失敗にする。
+    #[test]
+    fn await_rejects_conflicting_report_queued_after_all_mounted() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        tx.send(ok_report("a")).unwrap();
+        tx.send(ok_report("b")).unwrap();
+        tx.send(Ok(GuestMountReport {
+            tag: tag("a"),
+            outcome: GuestMountOutcome::Failed { errno: 5 },
+        }))
+        .unwrap();
+        let mut t = tracker(&["a", "b"]);
+        assert_eq!(
+            await_guest_mounts(
+                &rx,
+                &mut t,
+                &AtomicBool::new(false),
+                Duration::from_secs(5),
+                TICK,
+                |_| Ok(())
+            ),
+            Err(GuestMountError::InvalidReport {
+                reason: "conflicting duplicate report for tag 'a'".to_string()
+            })
+        );
+    }
 
     /// MAC-1・REPAIR-5・TASK-65.3: 待機の成功・期限切れ・VM 停止・送信側切断。
     #[test]

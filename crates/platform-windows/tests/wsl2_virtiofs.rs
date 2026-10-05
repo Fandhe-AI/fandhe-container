@@ -190,6 +190,37 @@ fn test_timeout() -> Duration {
     t
 }
 
+/// ゲスト内で `sh -c` を root で実行し、(成功か, stdout) を返す。`timeout` 超過は kill して panic する。
+fn guest_sh(distro: &str, script: &str, timeout: Duration) -> (bool, String) {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    let mut child = Command::new("wsl.exe")
+        .args(["-d", distro, "--user", "root", "--", "sh", "-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn wsl.exe");
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait().expect("poll wsl.exe") {
+            Some(s) => break s,
+            None if start.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("wsl.exe timed out: {script}");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let mut out = String::new();
+    if let Some(mut so) = child.stdout.take() {
+        let _ = so.read_to_string(&mut out);
+    }
+    (status.success(), out)
+}
+
 /// WIN-1・WIN-2: 実 WSL2 での検出と、virtiofs（または 9P フォールバック）共有マウントの準備・解除。
 #[test]
 #[ignore = "requires real Windows with WSL2 and a WSL2 distribution (and .wslconfig virtiofs=true applied for the virtiofs expectation); see AGENTS.md"]
@@ -214,7 +245,7 @@ fn win1_win2_shared_mount_on_real_wsl2() {
     let usable = status
         .distros
         .iter()
-        .any(|d| d.name == distro_name && d.is_usable_wsl2());
+        .any(|d| d.name.eq_ignore_ascii_case(&distro_name) && d.is_usable_wsl2());
     assert!(
         usable,
         "the specified distribution is not a usable WSL2 distribution"
@@ -292,6 +323,53 @@ fn win1_win2_shared_mount_on_real_wsl2() {
             ("/mnt/fandhe/fc-it-rw".to_string(), true, false),
             ("/mnt/fandhe/fc-it-ro".to_string(), true, true),
         ]
+    );
+
+    // REPAIR-12: メタデータだけでなく、ゲストから実際に共有内容が見えることを検証する。
+    // 解除前に行う。失敗しても guard が Drop で解除する。
+    let rw_guest = &prepared.mounts()[0].guest_path;
+    let ro_guest = &prepared.mounts()[1].guest_path;
+    let read = guest_sh(
+        &distro_name,
+        &format!("cat '{ro_guest}/marker.txt'"),
+        timeout,
+    );
+    assert_eq!(
+        (read.0, read.1.as_str()),
+        (true, "fandhe-it"),
+        "marker must be readable from the read-only share"
+    );
+    let read = guest_sh(
+        &distro_name,
+        &format!("cat '{rw_guest}/marker.txt'"),
+        timeout,
+    );
+    assert_eq!(
+        (read.0, read.1.as_str()),
+        (true, "fandhe-it"),
+        "marker must be readable from the read-write share"
+    );
+    // 対照: rw 共有には書ける（ro 側の失敗が環境要因でないことの切り分け）。
+    let w = guest_sh(
+        &distro_name,
+        &format!("echo -n written > '{rw_guest}/w.txt'"),
+        timeout,
+    );
+    assert!(w.0, "write to the read-write share must succeed: {}", w.1);
+    assert_eq!(
+        std::fs::read(tmp.path().join("rw").join("w.txt")).expect("host sees guest write"),
+        b"written"
+    );
+    // ro 共有への書き込みは拒否される。
+    let w = guest_sh(
+        &distro_name,
+        &format!("echo -n x > '{ro_guest}/w.txt'"),
+        timeout,
+    );
+    assert!(!w.0, "write to the read-only share must be rejected");
+    assert!(
+        !tmp.path().join("ro").join("w.txt").exists(),
+        "read-only share must not gain a file on the host"
     );
 
     // 明示解除。成功したらガードは二重に解除しない。

@@ -226,15 +226,21 @@ mod unix {
         }
     }
 
-    /// REPAIR-5: 走査するエントリ数は上限で打ち切る。
+    /// REPAIR-5: 候補の件数は上限で打ち切り、対象外の名前は件数に数えない。
     #[test]
-    fn repair5_sweep_stops_at_entry_limit() {
+    fn repair5_sweep_stops_at_candidate_limit() {
         let base = Base::new();
         let rd = RuntimeDir::ensure_under(&base.0).unwrap();
         for i in 0..=ONE_SHOT_SWEEP_MAX_ENTRIES {
             std::fs::write(rd.path().join(format!("other-{i}")), b"").unwrap();
         }
         let r: OneShotSweep = rd.sweep_one_shot_leftovers().unwrap();
+        assert_eq!(r.examined, 0);
+        assert!(!r.truncated);
+        for i in 0..=ONE_SHOT_SWEEP_MAX_ENTRIES {
+            std::fs::write(rd.path().join(format!("oneshot-1-{i}.sock.lock")), b"").unwrap();
+        }
+        let r = rd.sweep_one_shot_leftovers().unwrap();
         assert_eq!(r.examined as usize, ONE_SHOT_SWEEP_MAX_ENTRIES);
         assert!(r.truncated);
         assert_eq!(r.removed, 0);

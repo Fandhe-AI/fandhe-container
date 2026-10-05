@@ -72,7 +72,11 @@
 //! - 判定・削除は bind 前の stale 削除と同じ処理（`acquire_bind_lock`・`clear_stale_socket`）を使い、
 //!   新しい削除規則は持たない。ロックを取れない（使用中）・symlink・他 UID 所有・記録が無い／不一致の
 //!   ものは削除しない。socket が消えて残ったロックファイルは `BindLock` の drop が unlink する。
-//! - 上限: 読むエントリ数は [`ONE_SHOT_SWEEP_MAX_ENTRIES`] まで（超えた分は次回の初期化で処理。REPAIR-5）。
+//! - 上限（REPAIR-5）: 処理する候補（上記の名前一致）は [`ONE_SHOT_SWEEP_MAX_ENTRIES`] 件まで、列挙する
+//!   エントリ総数は [`ONE_SHOT_SWEEP_MAX_SCAN`] 件まで。対象外の名前は候補の件数に数えないため、先頭に
+//!   対象外ファイルが多くても後方の残骸が飢餓しない。上限を超えた候補は次回の初期化で処理する（使用中・
+//!   削除不能で残る候補が上限件数を超えて先頭に居座る場合は後方が処理されない。使用中は生存プロセスの
+//!   ロックで、異常終了の残骸の数に比べ稀として許容する）。
 //! - 残余: 列挙はパス基準（`read_dir`）で、得た名前はヒントにすぎない。判定・削除はすべて検証済みディレクトリ
 //!   fd 基準で行うため、差し替えられても削除対象にはならない。bind 成功から記録書き込みまでの間に異常終了した
 //!   記録なし socket は削除しない（手動削除が必要。fail-closed）。常駐モードの `resident-*` は対象外。
@@ -124,14 +128,19 @@ use crate::error::{PluginError, PluginErrorCode};
 /// runtime directory 名（`$XDG_RUNTIME_DIR` 直下。PLUG-12）。
 pub const RUNTIME_DIR_NAME: &str = "fandhe-container";
 
-/// 掃除で読むディレクトリエントリ数の上限（REPAIR-5。#1310）。超えた分は次回の初期化で処理する。
+/// 掃除で処理する候補（都度起動のロックファイル名に一致したもの）の件数上限（REPAIR-5。#1310）。
+/// 超えた分は次回の初期化で処理する。
 pub const ONE_SHOT_SWEEP_MAX_ENTRIES: usize = 256;
+
+/// 掃除で列挙するディレクトリエントリ総数の上限（対象外の名前を含む。REPAIR-5。#1310）。
+/// 巨大ディレクトリでの無制限な列挙を防ぐ安全上限で、候補の件数上限とは別に数える。
+pub const ONE_SHOT_SWEEP_MAX_SCAN: usize = 65_536;
 
 /// 都度起動の残骸の掃除結果（#1310・PLUG-7）。呼び出し側（TASK-114）が構造化ログへ出す材料。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct OneShotSweep {
-    /// 読んだディレクトリエントリ数（対象外の名前を含む。上限は [`ONE_SHOT_SWEEP_MAX_ENTRIES`]）。
+    /// 処理した候補の数（対象外の名前は含まない。上限は [`ONE_SHOT_SWEEP_MAX_ENTRIES`]）。
     pub examined: u32,
     /// 削除した socket 数（掃除前に存在し、掃除後に無いと lstat で確認できたもの。
     /// ロックファイルだけが残っていた場合は数えない）。
@@ -140,7 +149,7 @@ pub struct OneShotSweep {
     pub in_use: u32,
     /// 削除根拠が無い・拒否（symlink・他 UID・記録なし／不一致）・エラーで飛ばした数。
     pub skipped: u32,
-    /// 上限に達して走査を打ち切ったか。
+    /// 候補の件数上限または列挙総数の上限に達して走査を打ち切ったか。
     pub truncated: bool,
 }
 
@@ -275,8 +284,8 @@ pub(crate) use imp::{BindLock, acquire_bind_lock, clear_stale_socket};
 #[cfg(unix)]
 mod imp {
     use super::{
-        ONE_SHOT_SWEEP_MAX_ENTRIES, OneShotSweep, RUNTIME_DIR_NAME, RuntimeDir, runtime_dir_base,
-        validate_base,
+        ONE_SHOT_SWEEP_MAX_ENTRIES, ONE_SHOT_SWEEP_MAX_SCAN, OneShotSweep, RUNTIME_DIR_NAME,
+        RuntimeDir, runtime_dir_base, validate_base,
     };
     use crate::error::{PluginError, PluginErrorCode};
     use std::fs::{DirBuilder, File, Metadata};
@@ -577,12 +586,11 @@ mod imp {
         verify(&fstat(&dir)?, euid)?;
         let entries = std::fs::read_dir(&real).map_err(|e| map_io(&e))?;
         let mut out = OneShotSweep::default();
-        for entry in entries {
-            if out.examined as usize >= ONE_SHOT_SWEEP_MAX_ENTRIES {
+        for (scanned, entry) in entries.enumerate() {
+            if scanned >= ONE_SHOT_SWEEP_MAX_SCAN {
                 out.truncated = true;
                 break;
             }
-            out.examined += 1;
             let Ok(entry) = entry else {
                 out.skipped += 1;
                 continue;
@@ -591,6 +599,12 @@ mod imp {
             let Some(socket) = one_shot_socket_name_of_lock(file_name.as_bytes()) else {
                 continue;
             };
+            // 件数上限は候補だけを数える（対象外の名前で枠を消費して後方の残骸が飢餓しないように）。
+            if out.examined as usize >= ONE_SHOT_SWEEP_MAX_ENTRIES {
+                out.truncated = true;
+                break;
+            }
+            out.examined += 1;
             let Ok(name) = std::ffi::CString::new(socket) else {
                 out.skipped += 1;
                 continue;
@@ -1203,12 +1217,28 @@ mod imp {
             drop(l);
         }
 
-        /// #1310・REPAIR-5: 走査件数は上限で打ち切る。
+        /// #1310・REPAIR-5: 対象外の名前は候補の件数上限を消費せず、後方の候補も処理される。
         #[test]
-        fn repair5_sweep_truncates_at_entry_limit() {
+        fn repair5_sweep_does_not_count_non_candidates() {
             let t = Tmp::new();
             for i in 0..=ONE_SHOT_SWEEP_MAX_ENTRIES {
                 std::fs::write(t.0.join(format!("other-{i}")), b"").unwrap();
+            }
+            let sock = t.0.join("oneshot-9-0.sock");
+            let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            drop(l);
+            std::fs::write(t.0.join("oneshot-9-0.sock.lock"), b"").unwrap();
+            let r = sweep_one_shot(&t.0, crate::sys::effective_uid()).unwrap();
+            assert_eq!(r.examined, 1);
+            assert!(!r.truncated);
+        }
+
+        /// #1310・REPAIR-5: 候補の件数は上限で打ち切る。
+        #[test]
+        fn repair5_sweep_truncates_candidates_at_limit() {
+            let t = Tmp::new();
+            for i in 0..=ONE_SHOT_SWEEP_MAX_ENTRIES {
+                std::fs::write(t.0.join(format!("oneshot-1-{i}.sock.lock")), b"").unwrap();
             }
             let r = sweep_one_shot(&t.0, crate::sys::effective_uid()).unwrap();
             assert_eq!(r.examined as usize, ONE_SHOT_SWEEP_MAX_ENTRIES);

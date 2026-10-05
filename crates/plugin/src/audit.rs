@@ -20,6 +20,13 @@
 //! core 側 proxy（TASK-114）が `crates/core` の監査ログへ配線する責務で、本 crate では未実装。
 //! 観測フックを渡さない `UdsListener::accept` / `UdsStream::connect` は stderr へ JSON Lines を 1 行出す
 //! （`call_once` の既定出力と同じ流儀。書き込み失敗は無視する）。
+//!
+//! # 既知の制約（既定 observer の stderr 書き込み）
+//! 既定の `StderrPeerAuthObserver` は `stderr` へ同期書き込みするため、stderr がパイプで読み手が
+//! 停滞すると accept ループ内でブロックし得る（上記「ブロックする I/O をしない」契約の例外）。
+//! 通常 stderr はブロックせず、同一 UID からの大量接続は脅威モデル外のため既定では許容する。
+//! 運用で問題になる場合は、呼び出し側がメモリバッファの [`JsonLinesPeerAuthObserver`] を渡す。
+//! 既定出力の非ブロック化・バッファ化は将来課題（REPAIR-5）。
 
 use crate::error::PluginErrorCode;
 use serde::Serialize;

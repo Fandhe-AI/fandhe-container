@@ -634,8 +634,54 @@ pub(crate) struct LockHandle {
     pub created: bool,
 }
 
+/// ロックファイルの開き方（PLUG-12・#1310）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockOpen {
+    /// bind 用。無ければ作成する。自分が作成した直後に他者が先にロックを取っていた場合は、期限つきで
+    /// 解放を待つ（[`lock_file_at`] の「作成直後の競合」参照）。
+    Bind,
+    /// 無ければ作成する。他者が保持中なら待たずに `WouldBlock`（掃除の走査位置ヒント用）。
+    Create,
+    /// 既存のファイルだけを開く（作成しない）。無ければ `NotFound`（掃除用。掃除が、消えた残骸の
+    /// 名前でロックファイルを作り直して bind と競合しないようにする）。
+    Existing,
+}
+
+/// 自分が作成した直後のロックファイルを他者が先にロックしていた場合に、解放を待つ回数と間隔
+/// （合計 100 ms。REPAIR-5 の有限な待ち）。相手になるのは作成と `flock` の間に割り込んだ掃除で、
+/// 保持は 1 候補の判定の間だけなので通常は 1 回目の待ちで解放される。
+const CREATED_LOCK_WAIT_ATTEMPTS: u32 = 100;
+const CREATED_LOCK_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// テスト専用。[`lock_file_at`] が新規作成（`O_EXCL`）してから `flock` を取るまでの間に処理を差し込み、
+/// 別プロセスの割り込み（掃除が先にロックを取る）を決定的に再現する（PLUG-12・#1310）。
+#[cfg(test)]
+pub(crate) mod lock_test_hook {
+    use std::cell::RefCell;
+    use std::ffi::CStr;
+    use std::fs::File;
+
+    type Hook = Box<dyn FnOnce(&File, &CStr)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// 呼び出しスレッドの次の新規作成 1 回だけに `hook` を差し込む。
+    pub(crate) fn set(hook: impl FnOnce(&File, &CStr) + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run(dir: &File, name: &CStr) {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(dir, name);
+        }
+    }
+}
+
 /// `dir` 基準で `name` のロックファイルを `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`・0600 で開き
-/// （無ければ作成）、非ブロッキングで排他ロックを取る。`O_NONBLOCK` は、既存の名前が FIFO・デバイス
+/// （`mode` に応じて無ければ作成）、非ブロッキングで排他ロックを取る。`O_NONBLOCK` は、既存の名前が FIFO・デバイス
 /// 等だった場合に open が相手を待って止まらないようにするため（通常ファイルの読み書きには影響しない。
 /// REPAIR-5）。開いた fd が通常ファイルでなければロックせず `PermissionDenied`。他者が保持中なら `WouldBlock`。listener の生存判定に接続 probe を
 /// 使わず、「ロックを取れる＝以前の保持者は消えた」で stale を判定するための基盤（既存 listener の
@@ -646,7 +692,16 @@ pub(crate) struct LockHandle {
 /// 同じくロック fd も継承する（どちらも `O_CLOEXEC` で exec 時に閉じる）。子が両方を持ち続ける間は
 /// socket も実際に接続可能なので、ロック保持＝listener 生存という対応は fork をまたいでも崩れない。
 /// そのため fork 時に子側のロックだけを外す仕組み（`pthread_atfork` 等）は持たない。
-pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
+///
+/// # 作成直後の競合（#1310）
+/// 作成（`O_EXCL`）と `flock` は別の操作で、その間に別プロセスの掃除（`uds_security` の都度起動の残骸
+/// 掃除）が同じ名前を開いて先にロックを取りうる。[`LockOpen::Bind`] では、自分が作成したファイルで
+/// `WouldBlock` になった場合に限り、[`CREATED_LOCK_WAIT_ATTEMPTS`] 回まで待って取り直す。待たないと、
+/// 正当な bind が掃除との競合だけで「使用中」として失敗する。掃除は判定後に空のロックファイルを
+/// unlink するので、待って取れたロックは名前から外れた inode のものでありうる。その確認と作り直しは
+/// 呼び出し側（`acquire_bind_lock` の `names_open_file`）が行う。既存ファイルを開いた場合は待たない
+/// （保持者は生存中の listener でありうる）。
+pub(crate) fn lock_file_at(dir: &File, name: &CStr, mode: LockOpen) -> io::Result<LockHandle> {
     #[cfg(any(
         target_os = "macos",
         all(
@@ -678,7 +733,13 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
         // 上限まで競合し続けた場合は使用中＝`WouldBlock` として返し、待ち続けない。REPAIR-5）。
         const OPEN_ATTEMPTS: usize = 8;
         let mut opened = None;
+        if mode == LockOpen::Existing {
+            opened = Some((open(O_RDWR)?, false));
+        }
         for _ in 0..OPEN_ATTEMPTS {
+            if opened.is_some() {
+                break;
+            }
             match open(O_RDWR | O_CREAT | O_EXCL) {
                 Ok(f) => {
                     opened = Some((f, true));
@@ -703,12 +764,28 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
         if !file.metadata()?.is_file() {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
-        match file.try_lock() {
-            Ok(()) => Ok(LockHandle { file, created }),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                Err(io::Error::from(io::ErrorKind::WouldBlock))
+        #[cfg(test)]
+        if created {
+            lock_test_hook::run(dir, name);
+        }
+        // 自分が作成した直後に他者（掃除）が先にロックを取っていた場合だけ、期限つきで待つ。
+        let mut waits_left = if created && mode == LockOpen::Bind {
+            CREATED_LOCK_WAIT_ATTEMPTS
+        } else {
+            0
+        };
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(LockHandle { file, created }),
+                Err(std::fs::TryLockError::WouldBlock) if waits_left > 0 => {
+                    waits_left -= 1;
+                    std::thread::sleep(CREATED_LOCK_WAIT_INTERVAL);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
             }
-            Err(std::fs::TryLockError::Error(e)) => Err(e),
         }
     }
     #[cfg(not(any(
@@ -719,7 +796,7 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
         )
     )))]
     {
-        let _ = (dir, name);
+        let _ = (dir, name, mode);
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }

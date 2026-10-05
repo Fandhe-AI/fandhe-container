@@ -95,6 +95,16 @@
 //!   ディレクトリ fd 基準）。ディレクトリ位置の安定性はファイルシステム依存で（位置が並び順の番号に
 //!   なる実装では、手前の削除で後続がずれる）、ずれて飛ばしたエントリは、末尾到達後に先頭から始まる
 //!   次の周回で処理する（1 周で消えなくても周回を重ねて収束する）。
+//! - 前提と適用範囲: 判定は「ロックファイルの `flock` を取れる = 以前の保持者は消えた」に依る。この前提は
+//!   bind 前の stale 削除（同名を再 bind するときだけ）で使っていたもので、本掃除により runtime directory を
+//!   初期化するすべてのプロセス起動へ適用範囲が広がる。`flock` が排他にならず黙って成功する
+//!   ファイルシステム（ロックを転送しないネットワークファイルシステム等）では成り立たず、生存中の
+//!   listener の socket を残骸と誤認しうる。runtime directory は `XDG_RUNTIME_DIR`（tmpfs）等のローカル
+//!   ファイルシステムに置く前提である（その検出は未実装）。
+//! - bind との競合: 掃除は既存のロックファイルだけを開き、作成しない。bind 側は、自分が作成した直後の
+//!   ロックファイルを掃除が先にロックしていた場合に期限つき（合計 100 ms）で待って取り直す
+//!   （`crate::sys::lock_file_at`）。掃除が空のロックファイルを unlink した後に bind 側が古い inode を
+//!   掴んだ場合は、`acquire_bind_lock` が名前と inode の一致を確かめて作り直す。
 //! - 削除を拒否する socket（symlink・他 UID 所有・socket 以外・記録なし／不一致）のロックファイルは、
 //!   記録も含めて変更・unlink しない（PLUG-12 の拒否対象を保持する）。
 //! - 列挙・判定・削除はすべて検証済みディレクトリ fd 基準で行い、パスを再解決しない（列挙は
@@ -607,12 +617,19 @@ mod imp {
         }
         // ルートから symlink 非追従で開き直し、開いた fd 自体を検証する。lstat・作成との間に
         // 経路上の要素や runtime directory が symlink へ差し替えられていれば open が失敗する。
-        verify(&fstat(&open_nofollow(&dir)?)?, euid)?;
-        let runtime_dir = RuntimeDir { path: dir };
-        // 異常終了で残った都度起動の残骸を掃除する（#1310）。掃除の失敗で初期化を失敗させない
-        // （残骸は次回の初期化で再試行され、判定不能なものは削除しない fail-closed）。
-        let _ = sweep_one_shot(&runtime_dir.path, euid);
-        Ok(runtime_dir)
+        let verified = open_nofollow(&dir)?;
+        verify(&fstat(&verified)?, euid)?;
+        // 異常終了で残った都度起動の残骸を掃除する（#1310）。いま検証した fd をそのまま基準にし、
+        // パスを再解決しない。掃除の失敗で初期化を失敗させない（残骸は次回の初期化で再試行され、
+        // 判定不能なものは削除しない fail-closed）。
+        let _ = sweep_dir(
+            &verified,
+            euid,
+            ONE_SHOT_SWEEP_MAX_SCAN,
+            ONE_SHOT_SWEEP_MAX_ENTRIES,
+            ONE_SHOT_SWEEP_MAX_SKIP,
+        );
+        Ok(RuntimeDir { path: dir })
     }
 
     pub(super) fn sweep_one_shot_leftovers(dir: &RuntimeDir) -> Result<OneShotSweep, PluginError> {
@@ -706,7 +723,7 @@ mod imp {
         fn open(dir: &File, euid: u32) -> Option<Self> {
             use std::os::unix::fs::FileExt;
             let name = std::ffi::CString::new(SWEEP_CURSOR_NAME).ok()?;
-            let handle = crate::sys::lock_file_at(dir, &name).ok()?;
+            let handle = crate::sys::lock_file_at(dir, &name, crate::sys::LockOpen::Create).ok()?;
             let meta = handle.file.metadata().ok()?;
             if !meta.is_file()
                 || meta.uid() != euid
@@ -863,22 +880,7 @@ mod imp {
         .map(|(out, _)| out)
     }
 
-    /// 掃除の本体。掃除結果と、列挙で読んだエントリの総数（読み取り上限の照合用）を返す。
-    ///
-    /// 走査は 2 段階: (1) 走査位置ヒントの位置から列挙して候補名だけを集める（[`scan_candidates`]。
-    /// この間は何も削除しない。列挙中のディレクトリ変更で後続エントリが落ちないように）。列挙は
-    /// 検証済みディレクトリ fd 基準で行い、パスを再解決しない。(2) 集めた候補を処理する。上限で
-    /// 打ち切った場合は次回の開始位置を保存し、末尾まで走査し終えたらヒントを削除して先頭へ戻る（#1310）。
-    ///
-    /// この回に socket・ロックファイルを 1 つでも削除した場合は、打ち切り位置ではなく「この回の開始位置」を
-    /// 保存し、次回は同じ位置から走査し直す。削除でディレクトリの並びが詰まると、打ち切り位置（まとめ
-    /// 読みの境界からの件数）が指すエントリがずれ、未処理の残骸を飛ばしうるため。開始位置より手前は
-    /// この回に何も削除していないので、開始位置は削除後もそのまま使える。走査し直しても処理済みは消えて
-    /// おり、削除が起きるたびに残骸は減る。1 つも削除しなかった回（候補がすべて使用中・削除根拠なし）は
-    /// 打ち切り位置へ進むので、削除できない候補が上限を埋めても後方へ到達する。
-    ///
-    /// ヒントの位置から 1 件も読めなかった場合（ディレクトリが縮んだ・ヒントが壊れている・`lseek` が
-    /// 拒否した）は、同じ回のうちに先頭から走査し直す（先頭側の取りこぼしを避ける）。
+    /// パスから runtime directory を開いて検証し、[`sweep_dir`] を呼ぶ（公開メソッド・テスト用の入口）。
     fn sweep_one_shot_counted(
         dir_path: &Path,
         euid: u32,
@@ -889,7 +891,37 @@ mod imp {
         let real = std::fs::canonicalize(dir_path).map_err(|e| map_io(&e))?;
         let dir = open_nofollow(&real)?;
         verify(&fstat(&dir)?, euid)?;
-        let cursor = SweepCursor::open(&dir, euid);
+        sweep_dir(&dir, euid, max_scan, max_entries, max_skip)
+    }
+
+    /// 掃除の本体（`dir` は検証済みの runtime directory の fd）。掃除結果と、列挙で読んだエントリの総数
+    /// （読み取り上限の照合用）を返す。
+    ///
+    /// 走査は 2 段階: (1) 走査位置ヒントの位置から列挙して候補名だけを集める（[`scan_candidates`]。
+    /// この間は何も削除しない。列挙中のディレクトリ変更で後続エントリが落ちないように）。列挙は
+    /// 検証済みディレクトリ fd 基準で行い、パスを再解決しない。(2) 集めた候補を処理する。上限で
+    /// 打ち切った場合は次回の開始位置を保存し、末尾まで走査し終えたらヒントを削除して先頭へ戻る（#1310）。
+    ///
+    /// この回に socket・ロックファイルを 1 つでも削除した場合は、打ち切り位置ではなく「この回の開始位置」を
+    /// 保存し、次回は同じ位置から走査し直す。削除でディレクトリの並びが詰まると、打ち切り位置（まとめ
+    /// 読みの境界からの件数）が指すエントリがずれ、未処理の残骸を飛ばしうるため。開始位置から走査し直せば、
+    /// この回に走査した範囲のずれは影響しない。走査し直しても処理済みは消えており、削除が起きるたびに
+    /// 残骸は減る。ただし開始位置そのものも常に不変ではない。削除される socket は候補のロックファイルとは
+    /// 別のエントリで、開始位置より手前にありうる。位置が並び順の番号になるファイルシステムでは、その
+    /// 削除で開始位置が指すエントリが後ろへずれ、間のエントリを飛ばしうる。飛ばした残骸は、末尾到達後に
+    /// 先頭から始まる次の周回で処理する。1 つも削除しなかった回（候補がすべて使用中・削除根拠なし）は
+    /// 打ち切り位置へ進むので、削除できない候補が上限を埋めても後方へ到達する。
+    ///
+    /// ヒントの位置から 1 件も読めなかった場合（ディレクトリが縮んだ・ヒントが壊れている・`lseek` が
+    /// 拒否した）は、同じ回のうちに先頭から走査し直す（先頭側の取りこぼしを避ける）。
+    fn sweep_dir(
+        dir: &File,
+        euid: u32,
+        max_scan: usize,
+        max_entries: usize,
+        max_skip: u64,
+    ) -> Result<(OneShotSweep, usize), PluginError> {
+        let cursor = SweepCursor::open(dir, euid);
         let start = cursor.as_ref().map_or_else(ScanPos::default, |c| c.start);
         // 段階 1: 列挙して候補名を集める（削除しない）。
         let head = ScanPos::default();
@@ -898,7 +930,7 @@ mod imp {
         // この回に実際に走査を始めた位置（ヒントを使えなかった場合は先頭）。
         let mut from = start;
         if start != head
-            && let Ok(scan) = scan_candidates(&dir, start, max_scan, max_entries, max_skip)
+            && let Ok(scan) = scan_candidates(dir, start, max_scan, max_entries, max_skip)
         {
             read = scan.read;
             resumed = (scan.read > 0).then_some(scan);
@@ -908,7 +940,7 @@ mod imp {
             None => {
                 from = head;
                 let scan =
-                    scan_candidates(&dir, head, max_scan, max_entries, max_skip).map_err(|_| {
+                    scan_candidates(dir, head, max_scan, max_entries, max_skip).map_err(|_| {
                         err(
                             PluginErrorCode::Internal,
                             "failed to enumerate runtime directory",
@@ -929,14 +961,14 @@ mod imp {
         let mut removed_any = false;
         for name in &scan.candidates {
             out.examined += 1;
-            let before = entry_count(&dir, name);
-            sweep_one(&dir, name, euid, &mut out);
-            removed_any |= entry_count(&dir, name) < before;
+            let before = entry_count(dir, name);
+            sweep_one(dir, name, euid, &mut out);
+            removed_any |= entry_count(dir, name) < before;
         }
         if let Some(cursor) = &cursor {
             // 削除した回は開始位置から走査し直す（打ち切り位置は削除で並びが詰まるとずれるため）。
             cursor.store(
-                &dir,
+                dir,
                 scan.next.map(|next| if removed_any { from } else { next }),
             );
         }
@@ -955,8 +987,12 @@ mod imp {
 
     /// 1 つの候補を stale 削除と同じ手順で処理し、結果を `out` に数える。
     fn sweep_one(dir: &File, name: &std::ffi::CStr, euid: u32, out: &mut OneShotSweep) {
-        let mut lock = match acquire_bind_lock(dir, name, euid) {
+        // 既存のロックファイルだけを開く（作成しない）。列挙後に消えた名前でロックファイルを作り直すと、
+        // 同じ名前を bind しようとしている別プロセスと競合するため。
+        let mut lock = match acquire_lock(dir, name, euid, crate::sys::LockOpen::Existing) {
             Ok(l) => l,
+            // 列挙後に消えた（他の掃除・保持者の解放が片付けた）。何もしない。
+            Err(e) if e.code() == PluginErrorCode::NotFound => return,
             Err(e) if e.code() == PluginErrorCode::AlreadyExists => {
                 out.in_use += 1;
                 return;
@@ -1230,19 +1266,39 @@ mod imp {
 
     /// `name` に対応するロックを取得する。他者が保持中（生存中の listener）は `AlreadyExists`、
     /// symlink・他 UID 所有・通常ファイル以外は `PermissionDenied`（fail-closed）。
+    ///
+    /// 自分が作成した直後のロックファイルを掃除が先にロックしていた場合は、期限つきで待って取り直す
+    /// （`crate::sys::lock_file_at` の「作成直後の競合」。#1310）。
     pub(crate) fn acquire_bind_lock(
         dir: &File,
         name: &std::ffi::CStr,
         euid: u32,
+    ) -> Result<BindLock, PluginError> {
+        acquire_lock(dir, name, euid, crate::sys::LockOpen::Bind)
+    }
+
+    /// [`acquire_bind_lock`] の本体。掃除は `LockOpen::Existing` で呼び、ロックファイルを作成しない
+    /// （無ければ `NotFound`）。
+    fn acquire_lock(
+        dir: &File,
+        name: &std::ffi::CStr,
+        euid: u32,
+        open: crate::sys::LockOpen,
     ) -> Result<BindLock, PluginError> {
         let invalid = || err(PluginErrorCode::InvalidArgument, "invalid socket path");
         let mut bytes = name.to_bytes().to_vec();
         bytes.extend_from_slice(b".lock");
         let lock_name = std::ffi::CString::new(bytes).map_err(|_| invalid())?;
         for _ in 0..LOCK_ATTEMPTS {
-            let handle = match crate::sys::lock_file_at(dir, &lock_name) {
+            let handle = match crate::sys::lock_file_at(dir, &lock_name, open) {
                 Ok(h) => h,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(busy()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(err(
+                        PluginErrorCode::NotFound,
+                        "socket lock file does not exist",
+                    ));
+                }
                 Err(e)
                     if e.kind() == io::ErrorKind::PermissionDenied
                         || e.raw_os_error().is_some_and(is_symlink_errno) =>
@@ -1794,6 +1850,136 @@ mod imp {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
+        }
+
+        /// PLUG-12（#1310）: bind 側がロックファイルを作成（`O_EXCL`）してから `flock` を取るまでの間に、
+        /// 別プロセスの掃除が先に `flock` を取った場合を再現する。割り込んだ側は 20 ms 後に空のロック
+        /// ファイルを unlink して解放する（掃除の `BindLock` の drop と同じ）。bind 側は待って取り直し、
+        /// 名前から外れた inode を捨てて作り直すので、`AlreadyExists` で失敗せずロックを得る。
+        #[test]
+        fn plug12_bind_lock_waits_for_sweeper_that_won_flock_after_create() {
+            use std::sync::{Arc, Mutex};
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = File::open(&t.0).unwrap();
+            let name = c"oneshot-1-0.sock";
+            let lock_path = t.0.join("oneshot-1-0.sock.lock");
+            let intruder = Arc::new(Mutex::new(None));
+            let (slot, path) = (Arc::clone(&intruder), lock_path.clone());
+            crate::sys::lock_test_hook::set(move |_, _| {
+                let held = File::open(&path).unwrap();
+                held.try_lock().unwrap();
+                *slot.lock().unwrap() = Some(std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    std::fs::remove_file(&path).unwrap();
+                    drop(held);
+                }));
+            });
+            let lock = acquire_bind_lock(&dir, name, euid).unwrap();
+            let handle = intruder.lock().unwrap().take();
+            handle.expect("hook must have run once").join().unwrap();
+            // 得たロックは、いま名前が指しているファイルのもの（他者は取れない）。
+            assert!(lock_path.exists());
+            let other = File::open(&lock_path).unwrap();
+            assert!(matches!(
+                other.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            assert_eq!(
+                acquire_bind_lock(&dir, name, euid).unwrap_err().code(),
+                PluginErrorCode::AlreadyExists
+            );
+            drop(lock);
+        }
+
+        /// PLUG-12（#1310）: 実際の掃除（`sweep_one`）が、bind 側の作成と `flock` の間に走り切った場合。
+        /// 掃除は socket の無い空のロックファイルを unlink する（削除 0・使用中 0・飛ばし 0）。bind 側は
+        /// 名前から外れた inode を掴むが、それを捨てて作り直し、ロックを得る。
+        #[test]
+        fn plug12_bind_lock_survives_sweep_between_create_and_flock() {
+            use std::sync::{Arc, Mutex};
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = File::open(&t.0).unwrap();
+            let name = c"oneshot-1-0.sock";
+            let lock_path = t.0.join("oneshot-1-0.sock.lock");
+            let seen = Arc::new(Mutex::new(None));
+            let (slot, path) = (Arc::clone(&seen), lock_path.clone());
+            crate::sys::lock_test_hook::set(move |d, _| {
+                let existed = path.exists();
+                let mut out = OneShotSweep::default();
+                sweep_one(d, c"oneshot-1-0.sock", euid, &mut out);
+                *slot.lock().unwrap() = Some((existed, path.exists(), out));
+            });
+            let lock = acquire_bind_lock(&dir, name, euid).unwrap();
+            assert_eq!(
+                *seen.lock().unwrap(),
+                Some((true, false, OneShotSweep::default()))
+            );
+            assert!(lock_path.exists());
+            assert_eq!(
+                acquire_bind_lock(&dir, name, euid).unwrap_err().code(),
+                PluginErrorCode::AlreadyExists
+            );
+            drop(lock);
+        }
+
+        /// PLUG-12・REPAIR-5（#1310）: 作成直後に割り込んだ側がロックを解放しない場合、bind 側は 100 ms
+        /// （1 ms × 100 回）だけ待って `AlreadyExists` を返す（待ち続けない）。走査位置ヒント用の
+        /// `LockOpen::Create` は待たずに `WouldBlock` を返す。
+        #[test]
+        fn repair5_bind_lock_wait_after_create_is_bounded() {
+            use std::sync::{Arc, Mutex};
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = File::open(&t.0).unwrap();
+            let held = Arc::new(Mutex::new(Vec::new()));
+            let hold = |file: &'static str| {
+                let (slot, path) = (Arc::clone(&held), t.0.join(file));
+                crate::sys::lock_test_hook::set(move |_, _| {
+                    let f = File::open(&path).unwrap();
+                    f.try_lock().unwrap();
+                    slot.lock().unwrap().push(f);
+                });
+            };
+            hold("oneshot-1-0.sock.lock");
+            let started = std::time::Instant::now();
+            let e = acquire_bind_lock(&dir, c"oneshot-1-0.sock", euid).unwrap_err();
+            let waited = started.elapsed();
+            assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+            assert!(
+                waited >= std::time::Duration::from_millis(100)
+                    && waited < std::time::Duration::from_secs(10),
+                "waited={waited:?}"
+            );
+            hold("hint");
+            let started = std::time::Instant::now();
+            let e =
+                crate::sys::lock_file_at(&dir, c"hint", crate::sys::LockOpen::Create).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+            assert!(started.elapsed() < std::time::Duration::from_millis(100));
+            assert_eq!(held.lock().unwrap().len(), 2);
+        }
+
+        /// PLUG-7・PLUG-12（#1310）: 掃除はロックファイルを作成しない。列挙後に消えた名前を処理しても
+        /// 何も作らず、何も数えない（bind しようとしている別プロセスと同じ名前で競合しない）。
+        #[test]
+        fn plug7_sweep_does_not_create_lock_files() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = File::open(&t.0).unwrap();
+            let mut out = OneShotSweep::default();
+            sweep_one(&dir, c"oneshot-1-0.sock", euid, &mut out);
+            assert_eq!(out, OneShotSweep::default());
+            assert_eq!(std::fs::read_dir(&t.0).unwrap().count(), 0);
+            let e = crate::sys::lock_file_at(
+                &dir,
+                c"oneshot-1-0.sock.lock",
+                crate::sys::LockOpen::Existing,
+            )
+            .unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::NotFound);
+            assert_eq!(std::fs::read_dir(&t.0).unwrap().count(), 0);
         }
 
         /// #1310・PLUG-7: 掃除候補は `oneshot-<10 進>-<10 進>.sock.lock` に厳密一致する名前だけ。

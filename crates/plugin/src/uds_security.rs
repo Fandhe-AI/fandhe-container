@@ -699,8 +699,22 @@ mod imp {
         }
     }
 
+    /// 公開メソッドの本体。`RuntimeDir` の保存済みパス（初期化時に祖先の symlink を解決済みの基底 +
+    /// `fandhe-container`）を、正規化し直さずルートから 1 要素ずつ symlink 非追従で開く。初期化後に
+    /// runtime directory や祖先が symlink へ差し替えられていれば open が失敗し、リンク先を走査・削除
+    /// しない（PLUG-12。`canonicalize` するとリンク先を辿ってしまう）。開いた fd を検証してから掃除する。
     pub(super) fn sweep_one_shot_leftovers(dir: &RuntimeDir) -> Result<OneShotSweep, PluginError> {
-        sweep_one_shot(&dir.path, crate::sys::effective_uid())
+        let euid = crate::sys::effective_uid();
+        let verified = open_nofollow(&dir.path)?;
+        verify(&fstat(&verified)?, euid)?;
+        sweep_dir(
+            &verified,
+            euid,
+            ONE_SHOT_SWEEP_MAX_SCAN,
+            ONE_SHOT_SWEEP_MAX_ENTRIES,
+            ONE_SHOT_SWEEP_MAX_SKIP,
+        )
+        .map(|(out, _)| out)
     }
 
     /// 都度起動のロックファイル名 `oneshot-<10 進>-<10 進>.sock.lock` に厳密一致するとき、対応する
@@ -714,8 +728,10 @@ mod imp {
         (parts.next().is_none() && ok(pid) && ok(seq)).then_some(socket)
     }
 
-    /// `dir_path`（検証済みの runtime directory）を走査し、残骸の socket とロックファイルを掃除する
-    /// （#1310）。`euid` は自 UID（テストで他 UID を注入できるよう引数に取る）。
+    /// テスト用の入口。`dir_path` を正規化して開き、既定の上限で掃除する（#1310）。`euid` は自 UID
+    /// （他 UID を注入できるよう引数に取る）。公開メソッドと初期化はパスを正規化し直さない
+    /// （[`sweep_one_shot_leftovers`]・`create_in_base`）。
+    #[cfg(test)]
     pub(super) fn sweep_one_shot(dir_path: &Path, euid: u32) -> Result<OneShotSweep, PluginError> {
         sweep_one_shot_limited(
             dir_path,
@@ -959,7 +975,8 @@ mod imp {
         }
     }
 
-    /// 上限を引数に取る [`sweep_one_shot`] の本体（テストで小さい上限を注入できるようにする）。
+    /// 上限を引数に取る [`sweep_one_shot`] の本体（テストで小さい上限を注入する）。
+    #[cfg(test)]
     pub(super) fn sweep_one_shot_limited(
         dir_path: &Path,
         euid: u32,
@@ -976,7 +993,9 @@ mod imp {
         .map(|(out, _)| out)
     }
 
-    /// パスから runtime directory を開いて検証し、[`sweep_dir`] を呼ぶ（公開メソッド・テスト用の入口）。
+    /// パスを正規化して runtime directory を開いて検証し、[`sweep_dir`] を呼ぶ（テスト用の入口。一時
+    /// ディレクトリのパスは祖先に symlink を含みうるため正規化する。製品の経路は正規化し直さない）。
+    #[cfg(test)]
     fn sweep_one_shot_counted(
         dir_path: &Path,
         euid: u32,
@@ -2149,6 +2168,37 @@ mod imp {
             );
             assert_eq!(sweep_failure_log(Ok(&truncated)), None);
             assert_eq!(sweep_failure_log(Ok(&OneShotSweep::default())), None);
+        }
+
+        /// PLUG-12（#1310）: 初期化後に runtime directory の名前が symlink へ差し替えられた場合、公開の掃除は
+        /// リンク先を辿らず `PermissionDenied` で拒否し、リンク先の残骸（削除できる形のロックファイル）にも
+        /// 元のディレクトリの残骸にも触れない。
+        #[test]
+        fn plug12_public_sweep_rejects_runtime_dir_swapped_to_symlink() {
+            let t = Tmp::new();
+            let base = t.0.canonicalize().unwrap();
+            let euid = crate::sys::effective_uid();
+            let dir = ensure_dir(&base, euid).unwrap();
+            let original_lock = dir.path().join("oneshot-1-0.sock.lock");
+            std::fs::write(&original_lock, b"").unwrap();
+            let moved = base.join("moved");
+            std::fs::rename(dir.path(), &moved).unwrap();
+            let decoy = base.join("decoy");
+            DirBuilder::new().mode(0o700).create(&decoy).unwrap();
+            let decoy_lock = decoy.join("oneshot-2-0.sock.lock");
+            std::fs::write(&decoy_lock, b"").unwrap();
+            std::os::unix::fs::symlink(&decoy, dir.path()).unwrap();
+            let e = sweep_one_shot_leftovers(&dir).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert!(decoy_lock.exists());
+            assert!(moved.join("oneshot-1-0.sock.lock").exists());
+            assert_eq!(std::fs::read_dir(&decoy).unwrap().count(), 1);
+            // 差し替えを戻せば、同じ `RuntimeDir` で掃除できる。
+            std::fs::remove_file(dir.path()).unwrap();
+            std::fs::rename(&moved, dir.path()).unwrap();
+            let r = sweep_one_shot_leftovers(&dir).unwrap();
+            assert_eq!((r.examined, r.truncated), (1, false));
+            assert!(!original_lock.exists());
         }
 
         /// PLUG-7・PLUG-12（#1310）: 掃除はロックファイルを作成しない。列挙後に消えた名前を処理しても

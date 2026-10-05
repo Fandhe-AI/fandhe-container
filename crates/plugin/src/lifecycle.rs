@@ -662,15 +662,16 @@ fn spawn_error(e: &io::Error) -> PluginError {
 /// 構造化ログには、plugin の stderr の内容は含めず件数のみ載せる。失敗時の内容が必要な呼び出し側は
 /// [`call_once_observed`] の [`OneShotRecord::stderr`] を使う。
 ///
-/// 受付で拒否した接続の監査イベント（PLUG-12・SEC-4）は、結果の確定後に有界（最大 50ms）で出力完了を
-/// 待つ。期限内に確認できなかった場合は構造化ログの `peer_auth_audit_flushed` が false になる
-/// （[`OneShotRecord::peer_auth_audit_flushed`]）。
+/// `audit` は受付で拒否した接続（UID・pid の不一致・取得失敗）の監査イベントの受け手で、拒否 1 件に
+/// つき 1 回、同期で呼ばれる（PLUG-12・SEC-4・TASK-124.5）。必須で、既定の出力先は無い（出力・永続化は
+/// 呼び出し側の責務。`crate::audit` のモジュール doc）。
 pub fn call_once(
     plugin: &OneShotPlugin,
     request: &Frame,
     timeout: OneShotTimeout,
+    audit: &mut dyn crate::audit::PeerAuthObserver,
 ) -> Result<OneShotOutcome, PluginError> {
-    call_once_observed(plugin, request, timeout, &mut |record| {
+    call_once_observed(plugin, request, timeout, audit, &mut |record| {
         use std::io::Write;
         // 構造化ログ（JSON Lines）を stderr へ 1 行出す。書き込み失敗は呼び出し結果に影響させない。
         let _ = writeln!(io::stderr(), "{}", record.to_json_line());
@@ -696,16 +697,6 @@ pub struct OneShotRecord {
     /// plugin が stderr へ書いた内容（untrusted・上限つき）。成功・失敗のどちらでも渡す。
     /// [`Self::to_json_line`] には内容を含めず、件数と打ち切りの有無だけを出す。
     pub stderr: OneShotStderr,
-    /// 受付で拒否した接続の監査イベント（既定出力。PLUG-12・SEC-4・TASK-124.5）が、戻る時点ですべて
-    /// 出力済み（または失敗累計へ計上済み）であることを確認できたか。拒否が無ければ true。
-    ///
-    /// false は、親の stderr が停滞して有界の待機（最大 50ms）内に出力を確認できなかったことを表す
-    /// （失敗の明示。黙って捨てない）。未出力のイベントはプロセス内のキューに残っており、このまま
-    /// プロセスが終了すると失われる。呼び出し側は終了前に `crate::audit::flush_default_audit` を
-    /// より長い期限で呼び直すか、失敗として扱うこと（件数は `default_audit_pending_dropped` /
-    /// `default_audit_write_failures` で観測できる）。終了後も残る監査ログへの記録は core 側 proxy
-    /// （TASK-114）の責務で、本 crate では未実装（REPAIR-3）。
-    pub peer_auth_audit_flushed: bool,
 }
 
 impl OneShotRecord {
@@ -720,8 +711,7 @@ impl OneShotRecord {
         format!(
             "{{\"op\":\"{}\",\"success\":{},\"error_code\":{},\"elapsed_us\":{},\
              \"plugin_stderr_bytes\":{},\"plugin_stderr_truncated\":{},\
-             \"plugin_stderr_complete\":{},\"plugin_stderr_reader_stopped\":{},\
-             \"peer_auth_audit_flushed\":{}}}",
+             \"plugin_stderr_complete\":{},\"plugin_stderr_reader_stopped\":{}}}",
             self.operation,
             self.success,
             code,
@@ -729,8 +719,7 @@ impl OneShotRecord {
             self.stderr.total_bytes(),
             self.stderr.is_truncated(),
             self.stderr.is_complete(),
-            self.stderr.reader_stopped(),
-            self.peer_auth_audit_flushed
+            self.stderr.reader_stopped()
         )
     }
 }
@@ -738,28 +727,23 @@ impl OneShotRecord {
 /// [`call_once`] と同じ処理を行い、終了時に 1 件の [`OneShotRecord`] を `observer` へ渡す（REPAIR-4）。
 ///
 /// 成功・失敗のどの終了経路でも必ず 1 回だけ呼ばれる。`observer` は呼び出しスレッド上で同期的に
-/// 実行されるため、長時間ブロックしないこと。
+/// 実行されるため、長時間ブロックしないこと。`audit` は [`call_once`] と同じ（peer 認証の拒否イベントの
+/// 受け手。必須）。
 pub fn call_once_observed(
     plugin: &OneShotPlugin,
     request: &Frame,
     timeout: OneShotTimeout,
+    audit: &mut dyn crate::audit::PeerAuthObserver,
     observer: &mut dyn FnMut(&OneShotRecord),
 ) -> Result<OneShotOutcome, PluginError> {
     let start = Instant::now();
-    let (result, stderr) = call_once_inner(plugin, request, timeout);
-    // 受付で拒否した接続の監査イベント（既定出力。PLUG-12・SEC-4・TASK-124.5）を、結果の確定後に有界で
-    // 回収する。都度起動の呼び出し元は直後に終了し得るため、ここで出力完了を待つ（受付経路では待たない。
-    // REPAIR-5）。未出力が無ければ即座に戻る。期限切れは黙って捨てず、記録の
-    // `peer_auth_audit_flushed` で呼び出し側へ明示する（stderr の読み取り停止確認と同じ扱い）。
-    let peer_auth_audit_flushed =
-        crate::audit::flush_default_audit(crate::audit::DEFAULT_AUDIT_FLUSH_TIMEOUT);
+    let (result, stderr) = call_once_inner(plugin, request, timeout, audit);
     observer(&OneShotRecord {
         operation: "plugin.call_once",
         success: result.is_ok(),
         error_code: result.as_ref().err().map(|e| e.code().as_str()),
         elapsed: start.elapsed(),
         stderr: stderr.clone(),
-        peer_auth_audit_flushed,
     });
     result.map(|(response, termination)| OneShotOutcome {
         response,
@@ -774,6 +758,7 @@ fn call_once_inner(
     plugin: &OneShotPlugin,
     request: &Frame,
     timeout: OneShotTimeout,
+    audit: &mut dyn crate::audit::PeerAuthObserver,
 ) -> (
     Result<(Frame, OneShotTermination), PluginError>,
     OneShotStderr,
@@ -837,7 +822,7 @@ fn call_once_inner(
             return (Err(error), OneShotStderr::empty());
         }
     };
-    let result = exchange_and_reap(&mut guard, listener, request, deadline);
+    let result = exchange_and_reap(&mut guard, listener, request, deadline, audit);
     // 子の回収後に収集結果を受け取る。子が終了していれば書き込み端は閉じており即座に完了する。
     // 戻る時点で読み取りスレッドは停止している（停止を確認できなければ結果に記録する）。
     let stderr = capture.finish(ONE_SHOT_STDERR_DRAIN_TIMEOUT);
@@ -876,6 +861,7 @@ fn exchange_and_reap(
     listener: UdsListener,
     request: &Frame,
     deadline: Instant,
+    audit: &mut dyn crate::audit::PeerAuthObserver,
 ) -> Result<(Frame, OneShotTermination), PluginError> {
     // 受付・往復はブロック内で完結させ、抜けた時点で接続を閉じて子に EOF を見せる
     // （続けて listener を drop して socket を unlink してから終了を待つ）。
@@ -897,12 +883,7 @@ fn exchange_and_reap(
                     "plugin exited before connecting",
                 )),
             };
-            listener.accept_peer_pid(
-                left,
-                child_pid,
-                &mut check_child,
-                &mut crate::audit::StderrPeerAuthObserver,
-            )?
+            listener.accept_peer_pid(left, child_pid, &mut check_child, audit)?
         };
         stream.write_frame(request, rpc_timeout(remaining(deadline)?)?)?;
         stream.read_frame(rpc_timeout(remaining(deadline)?)?)
@@ -955,9 +936,13 @@ mod tests {
         let plugin = OneShotPlugin::new(abs.into(), vec![], dir).unwrap();
         let req = Frame::new(Vec::new()).unwrap();
         let mut records = Vec::new();
-        let r = call_once_observed(&plugin, &req, OneShotTimeout::default(), &mut |rec| {
-            records.push(rec.clone())
-        });
+        let r = call_once_observed(
+            &plugin,
+            &req,
+            OneShotTimeout::default(),
+            &mut crate::audit::NoopPeerAuthObserver,
+            &mut |rec| records.push(rec.clone()),
+        );
         assert!(r.is_err());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].operation, "plugin.call_once");
@@ -980,7 +965,6 @@ mod tests {
                 complete: false,
                 reader_stopped: true,
             },
-            peer_auth_audit_flushed: true,
         };
         // plugin の stderr の内容は行へ埋め込まず、出所を明示したキーで件数だけを出す。
         assert_eq!(
@@ -988,28 +972,7 @@ mod tests {
             "{\"op\":\"plugin.call_once\",\"success\":false,\"error_code\":\"TIMEOUT\",\
              \"elapsed_us\":1500,\"plugin_stderr_bytes\":70000,\
              \"plugin_stderr_truncated\":true,\"plugin_stderr_complete\":false,\
-             \"plugin_stderr_reader_stopped\":true,\"peer_auth_audit_flushed\":true}"
-        );
-    }
-
-    /// SEC-4・REPAIR-5（TASK-124.5・#1388）: 監査イベントの出力を期限内に確認できなかった場合は、
-    /// 記録の行に `peer_auth_audit_flushed:false` として明示される（黙って捨てない）。
-    #[test]
-    fn sec4_record_json_line_reports_unflushed_peer_auth_audit() {
-        let rec = OneShotRecord {
-            operation: "plugin.call_once",
-            success: true,
-            error_code: None,
-            elapsed: Duration::from_micros(20),
-            stderr: OneShotStderr::empty(),
-            peer_auth_audit_flushed: false,
-        };
-        assert_eq!(
-            rec.to_json_line(),
-            "{\"op\":\"plugin.call_once\",\"success\":true,\"error_code\":null,\
-             \"elapsed_us\":20,\"plugin_stderr_bytes\":0,\
-             \"plugin_stderr_truncated\":false,\"plugin_stderr_complete\":true,\
-             \"plugin_stderr_reader_stopped\":true,\"peer_auth_audit_flushed\":false}"
+             \"plugin_stderr_reader_stopped\":true}"
         );
     }
 
@@ -1289,7 +1252,12 @@ mod tests {
         let listener = UdsListener::bind(&dir.join("a.sock")).unwrap();
         let path = listener.path().to_path_buf();
         let me = std::process::id();
-        let _c = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
+        let _c = UdsStream::connect(
+            &path,
+            Duration::from_secs(2),
+            &mut crate::audit::NoopPeerAuthObserver,
+        )
+        .unwrap();
         let e = listener
             .accept_peer_pid(
                 Duration::from_millis(300),
@@ -1299,7 +1267,12 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Timeout);
-        let _c2 = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
+        let _c2 = UdsStream::connect(
+            &path,
+            Duration::from_secs(2),
+            &mut crate::audit::NoopPeerAuthObserver,
+        )
+        .unwrap();
         assert!(
             listener
                 .accept_peer_pid(
@@ -1325,7 +1298,12 @@ mod tests {
         let listener = UdsListener::bind(&dir.join("a.sock")).unwrap();
         let path = listener.path().to_path_buf();
         let me = std::process::id();
-        let _c = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
+        let _c = UdsStream::connect(
+            &path,
+            Duration::from_secs(2),
+            &mut crate::audit::NoopPeerAuthObserver,
+        )
+        .unwrap();
         let mut calls = 0u32;
         let started = std::time::Instant::now();
         let e = listener

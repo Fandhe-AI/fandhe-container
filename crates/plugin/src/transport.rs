@@ -26,7 +26,7 @@
 //! - 残余: 0700 の自 UID 所有ディレクトリ内でエントリを差し替えられるのは同一 UID のみで、
 //!   同一 UID は脅威モデル外（socket と同一性の照合は行わず、ディレクトリ fd 基準で名前を操作する）
 //! - peer 認証で拒否した接続は 1 件ごとに監査イベントとして通知する（`crate::audit`。
-//!   `accept_observed` / `connect_observed`、未指定の `accept` / `connect` は stderr へ JSON Lines。
+//!   `accept` / `connect` は受け手 `PeerAuthObserver` を必須引数に取り、既定の出力先は持たない。
 //!   SEC-4・TASK-124.5・#1388）。永続的な監査ログへの配線は core 側 proxy（TASK-114）で未実装（REPAIR-3）
 //! - accept した接続の peer credential（`SO_PEERCRED` / `getpeereid`。`crate::sys`）を検証し、
 //!   自 UID 以外は切断して `PermissionDenied` を返す
@@ -63,7 +63,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use crate::audit::{PeerAuthObserver, StderrPeerAuthObserver};
+use crate::audit::PeerAuthObserver;
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
 
@@ -181,20 +181,11 @@ impl UdsListener {
     /// 返す接続は peer credential が自 UID であることを確認済み。不一致は接続を切断して
     /// `PermissionDenied` を返す（呼び出し側の受付ループは継続してよい）。
     ///
-    /// 拒否した接続は既定の出力先（stderr の JSON Lines 1 行）へ監査イベントとして通知する
-    /// （PLUG-12・SEC-4・TASK-124.5）。出力先を指定する場合は [`Self::accept_observed`]。
-    /// 通知は非同期の出力キューへの投入までで出力完了を待たない（REPAIR-5）。拒否の直後に終了する
-    /// プロセスは、終了前に [`crate::audit::flush_default_audit`] を呼んで回収する。
-    pub fn accept(&self, timeout: Duration) -> Result<UdsStream, PluginError> {
-        self.accept_observed(timeout, &mut StderrPeerAuthObserver)
-    }
-
-    /// [`Self::accept`] の監査イベント出力先指定版（PLUG-12・SEC-4・TASK-124.5・#1388）。
-    ///
-    /// peer 認証で拒否した接続 1 件につき `observer` へ 1 件通知する（UID 不一致・peer UID 取得失敗）。
-    /// 通知は切断後・エラー返却前に行い、返すエラーは `accept` と同じ（UID 値を含まない固定文言）。
-    /// 観測しない場合は `NoopPeerAuthObserver` を明示的に渡す。
-    pub fn accept_observed(
+    /// peer 認証で拒否した接続 1 件につき、監査イベントを `observer` へ 1 件通知する（UID 不一致・peer UID
+    /// 取得失敗。PLUG-12・SEC-4・TASK-124.5・#1388）。通知は切断後・エラー返却前に同期で行い、返すエラーは
+    /// UID 値を含まない固定文言。`observer` は必須で、既定の出力先は無い（出力・永続化は呼び出し側の責務。
+    /// `crate::audit` のモジュール doc）。受理した接続では呼ばれない。
+    pub fn accept(
         &self,
         timeout: Duration,
         observer: &mut dyn PeerAuthObserver,
@@ -286,17 +277,10 @@ impl UdsStream {
     /// `PermissionDenied`、期限切れ（backlog 満杯を含む）は `Timeout`。接続後に server の peer UID が
     /// 自 UID でなければ切断して `PermissionDenied`、取得できない環境は `Unimplemented`（fail-closed）。
     ///
-    /// server の peer 認証で拒否した場合は既定の出力先（stderr の JSON Lines 1 行）へ監査イベントを
-    /// 通知する（PLUG-12・SEC-4・TASK-124.5）。出力先を指定する場合は [`Self::connect_observed`]。
-    /// 通知は非同期の出力キューへの投入までで出力完了を待たない（REPAIR-5）。拒否の直後に終了する
-    /// プロセスは、終了前に [`crate::audit::flush_default_audit`] を呼んで回収する。
-    pub fn connect(path: &Path, timeout: Duration) -> Result<Self, PluginError> {
-        Self::connect_observed(path, timeout, &mut StderrPeerAuthObserver)
-    }
-
-    /// [`Self::connect`] の監査イベント出力先指定版（PLUG-12・SEC-4・TASK-124.5・#1388）。
-    /// 拒否 1 件につき `observer` へ 1 件通知する。返すエラーは `connect` と同じ。
-    pub fn connect_observed(
+    /// server の peer 認証で拒否した場合は、監査イベントを `observer` へ 1 件通知する（PLUG-12・SEC-4・
+    /// TASK-124.5・#1388）。通知は切断後・エラー返却前に同期で行う。`observer` は必須で、既定の出力先は
+    /// 無い（出力・永続化は呼び出し側の責務。`crate::audit` のモジュール doc）。
+    pub fn connect(
         path: &Path,
         timeout: Duration,
         observer: &mut dyn PeerAuthObserver,
@@ -1426,7 +1410,9 @@ mod tests {
             // 拒否後も同じ listener は同一 UID の接続を受理し続ける。
             let (sent, h) = spawn_presend_client(l.path().to_path_buf(), bytes);
             sent.recv_timeout(WAIT).unwrap();
-            let mut s = l.accept(WAIT).unwrap();
+            let mut s = l
+                .accept(WAIT, &mut crate::audit::NoopPeerAuthObserver)
+                .unwrap();
             let f = s.read_frame(RpcTimeout::new(WAIT).unwrap()).unwrap();
             assert_eq!(f.payload(), b"presend-frame");
             drop(s);
@@ -1826,7 +1812,7 @@ mod tests {
         use super::*;
 
         fn noop_connect(path: &Path) -> Result<UdsStream, PluginError> {
-            UdsStream::connect_observed(
+            UdsStream::connect(
                 path,
                 Duration::from_secs(2),
                 &mut crate::audit::NoopPeerAuthObserver,
@@ -1844,9 +1830,7 @@ mod tests {
                 let _ = noop_connect(&path);
             });
             let mut rec = Recorder::default();
-            let e = l
-                .accept_observed(Duration::from_secs(5), &mut rec)
-                .unwrap_err();
+            let e = l.accept(Duration::from_secs(5), &mut rec).unwrap_err();
             t.join().unwrap();
             assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
             assert_eq!(
@@ -1874,7 +1858,7 @@ mod tests {
             let (l, dir) = audit_listener("acc-ok");
             let _c = noop_connect(l.path()).unwrap();
             let mut rec = Recorder::default();
-            assert!(l.accept_observed(Duration::from_secs(5), &mut rec).is_ok());
+            assert!(l.accept(Duration::from_secs(5), &mut rec,).is_ok());
             assert_eq!(rec.0, vec![]);
             drop(l);
             let _ = std::fs::remove_dir_all(&dir);
@@ -1914,9 +1898,7 @@ mod tests {
         fn plug12_sec4_connect_same_uid_emits_no_audit_event() {
             let (l, dir) = audit_listener("con-ok");
             let mut rec = Recorder::default();
-            assert!(
-                UdsStream::connect_observed(l.path(), Duration::from_secs(2), &mut rec).is_ok()
-            );
+            assert!(UdsStream::connect(l.path(), Duration::from_secs(2), &mut rec,).is_ok());
             assert_eq!(rec.0, vec![]);
             drop(l);
             let _ = std::fs::remove_dir_all(&dir);
@@ -1989,9 +1971,7 @@ mod tests {
             let t = std::thread::spawn(move || {
                 let _ = noop_connect(&path);
             });
-            let e = l
-                .accept_observed(Duration::from_secs(5), &mut obs)
-                .unwrap_err();
+            let e = l.accept(Duration::from_secs(5), &mut obs).unwrap_err();
             t.join().unwrap();
             assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
             assert_eq!(obs.len(), crate::audit::PEER_AUTH_AUDIT_LOG_CAPACITY);

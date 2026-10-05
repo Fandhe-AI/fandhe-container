@@ -262,8 +262,12 @@ mod supported {
                 let plugin =
                     OneShotPlugin::new(std::env::current_exe().unwrap(), args, dir.clone())
                         .unwrap();
-                let mut session =
-                    ResidentPlugin::start(&plugin, ResidentStartTimeout::default()).unwrap();
+                let mut session = ResidentPlugin::start(
+                    &plugin,
+                    ResidentStartTimeout::default(),
+                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                )
+                .unwrap();
                 let child = session.pid().unwrap();
                 assert_ne!(
                     child,
@@ -291,7 +295,12 @@ mod supported {
         let Some(sock) = std::env::var_os(PLUGIN_SOCKET_ENV) else {
             return;
         };
-        let mut s = UdsStream::connect(Path::new(&sock), Duration::from_secs(5)).unwrap();
+        let mut s = UdsStream::connect(
+            Path::new(&sock),
+            Duration::from_secs(5),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap();
         while let Ok(req) = s.read_frame(rpc5()) {
             s.write_frame(&reference_handle(&req), rpc5()).unwrap();
         }
@@ -518,7 +527,12 @@ mod supported {
             let Some(sock) = std::env::var_os(PLUGIN_SOCKET_ENV) else {
                 return;
             };
-            let mut s = UdsStream::connect(&PathBuf::from(sock), OP_TIMEOUT).unwrap();
+            let mut s = UdsStream::connect(
+                &PathBuf::from(sock),
+                OP_TIMEOUT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
             while s.read_frame(rpc()).is_ok() {
                 s.write_frame(&Frame::new(b"pong".to_vec()).unwrap(), rpc())
                     .unwrap();
@@ -546,9 +560,12 @@ mod supported {
             .collect();
             let plugin =
                 OneShotPlugin::new(std::env::current_exe().unwrap(), args, dir.0.clone()).unwrap();
-            let mut session =
-                ResidentPlugin::start(&plugin, ResidentStartTimeout::new(OP_TIMEOUT).unwrap())
-                    .unwrap();
+            let mut session = ResidentPlugin::start(
+                &plugin,
+                ResidentStartTimeout::new(OP_TIMEOUT).unwrap(),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
             assert_eq!(session.state(), ResidentState::Running);
             let pid = session.pid().unwrap();
             assert_ne!(pid, std::process::id());

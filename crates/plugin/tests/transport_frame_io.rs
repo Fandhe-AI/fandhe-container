@@ -10,6 +10,7 @@ fn repair5_frame_io_requires_unix_transport() {
     let err = UdsStream::connect(
         std::path::Path::new("s.sock"),
         std::time::Duration::from_secs(1),
+        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
     )
     .unwrap_err();
     assert_eq!(err.code(), PluginErrorCode::Unimplemented);
@@ -67,8 +68,18 @@ mod unix {
     /// listener を bind し、client 接続と accept 済み server 側接続の組を返す。
     fn pair(dir: &TempDir) -> (UdsListener, UdsStream, UdsStream) {
         let l = UdsListener::bind(&dir.sock()).unwrap();
-        let client = UdsStream::connect(l.path(), WAIT).unwrap();
-        let server = l.accept(WAIT).unwrap();
+        let client = UdsStream::connect(
+            l.path(),
+            WAIT,
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap();
+        let server = l
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         (l, client, server)
     }
 

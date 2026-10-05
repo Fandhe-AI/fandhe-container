@@ -32,9 +32,8 @@ pub mod transport;
 pub mod uds_security;
 
 pub use audit::{
-    JsonLinesPeerAuthObserver, MAX_PEER_AUTH_AUDIT_LOG_BUFFER_BYTES, NoopPeerAuthObserver,
-    PEER_AUTH_AUDIT_LOG_CAPACITY, PeerAuthObserver, PeerAuthOp, PeerAuthRejectReason,
-    PeerAuthRejection,
+    JsonLinesPeerAuthObserver, MAX_PEER_AUTH_AUDIT_LOG_BUFFER_BYTES, PEER_AUTH_AUDIT_LOG_CAPACITY,
+    PeerAuthObserver, PeerAuthOp, PeerAuthRejectReason, PeerAuthRejection,
 };
 pub use error::{PLUGIN_ERROR_MESSAGE_MAX_BYTES, PluginError, PluginErrorCode};
 pub use frame::{

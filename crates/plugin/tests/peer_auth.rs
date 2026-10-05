@@ -28,6 +28,7 @@ fn plug12_peer_auth_is_unimplemented_on_non_unix() {
     let err = UdsStream::connect(
         std::path::Path::new("s.sock"),
         std::time::Duration::from_secs(1),
+        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
     )
     .unwrap_err();
     assert_eq!(err.code(), PluginErrorCode::Unimplemented);
@@ -98,16 +99,21 @@ mod unix {
     }
 
     /// 同一 UID の connect → accept を 1 組成立させ、受理後にフレームを往復できることを確認する。
+    /// 受理した経路では監査イベントが 0 件であることも照合する（PLUG-12・SEC-4・TASK-124.5）。
     fn assert_same_uid_roundtrip(l: &UdsListener) {
         let rpc = RpcTimeout::new(WAIT).unwrap();
         let path = l.path().to_path_buf();
         let h = std::thread::spawn(move || {
-            let mut c = UdsStream::connect(&path, WAIT).unwrap();
+            let mut audit = fandhe_container_plugin::JsonLinesPeerAuthObserver::new();
+            let mut c = UdsStream::connect(&path, WAIT, &mut audit).unwrap();
+            assert_eq!(audit.drain_lines(), Vec::<String>::new());
             c.write_frame(&encode_message(&msg(1, false, "ping")).unwrap(), rpc)
                 .unwrap();
             decode_message::<String>(&c.read_frame(rpc).unwrap()).unwrap()
         });
-        let mut s = l.accept(WAIT).unwrap();
+        let mut audit = fandhe_container_plugin::JsonLinesPeerAuthObserver::new();
+        let mut s = l.accept(WAIT, &mut audit).unwrap();
+        assert_eq!(audit.drain_lines(), Vec::<String>::new());
         let req = decode_message::<String>(&s.read_frame(rpc).unwrap()).unwrap();
         assert_eq!(req, msg(1, false, "ping"));
         s.write_frame(&encode_message(&msg(1, true, "pong")).unwrap(), rpc)
@@ -133,14 +139,24 @@ mod unix {
         let path = l.path().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         let h = std::thread::spawn(move || {
-            let mut c = UdsStream::connect(&path, WAIT).unwrap();
+            let mut c = UdsStream::connect(
+                &path,
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
             c.write_frame(&encode_message(&msg(1, false, "early")).unwrap(), rpc)
                 .unwrap();
             tx.send(()).unwrap();
             c
         });
         rx.recv_timeout(WAIT).unwrap();
-        let mut s = l.accept(WAIT).unwrap();
+        let mut s = l
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         let req = decode_message::<String>(&s.read_frame(rpc).unwrap()).unwrap();
         assert_eq!(req, msg(1, false, "early"));
         drop(h.join().unwrap());
@@ -195,7 +211,10 @@ mod unix {
             let _ = tx.send(buf);
         });
 
-        match l.accept(Duration::from_secs(10)) {
+        match l.accept(
+            Duration::from_secs(10),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        ) {
             Ok(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -260,7 +279,12 @@ mod unix {
             "fixture socket must be owned by a different UID than the test user"
         );
 
-        let err = UdsStream::connect(Path::new(&path), WAIT).unwrap_err();
+        let err = UdsStream::connect(
+            Path::new(&path),
+            WAIT,
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
         assert_eq!(err.message(), MISMATCH_MESSAGE);
     }

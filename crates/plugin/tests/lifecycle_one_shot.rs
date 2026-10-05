@@ -15,7 +15,13 @@ fn plug7_one_shot_requires_unix_transport() {
     let dir = std::env::temp_dir();
     let plugin = OneShotPlugin::new(exe, vec![], dir).unwrap();
     let req = Frame::new(b"ping".to_vec()).unwrap();
-    let err = call_once(&plugin, &req, OneShotTimeout::default()).unwrap_err();
+    let err = call_once(
+        &plugin,
+        &req,
+        OneShotTimeout::default(),
+        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+    )
+    .unwrap_err();
     assert_eq!(err.code(), PluginErrorCode::Unimplemented);
 }
 
@@ -113,7 +119,12 @@ mod unix {
                         .spawn()
                         .unwrap();
                 }
-                let mut s = UdsStream::connect(&sock, Duration::from_secs(5)).unwrap();
+                let mut s = UdsStream::connect(
+                    &sock,
+                    Duration::from_secs(5),
+                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                )
+                .unwrap();
                 if mode == "silent_after_connect" {
                     std::thread::sleep(Duration::from_secs(60));
                     return;
@@ -153,12 +164,17 @@ mod unix {
         let (res, elapsed) = with_watchdog("call_once", move || {
             let req = Frame::new(b"ping".to_vec()).unwrap();
             let start = Instant::now();
+            let mut audit = fandhe_container_plugin::JsonLinesPeerAuthObserver::new();
             let r = call_once(
                 &plugin,
                 &req,
                 OneShotTimeout::new(Duration::from_millis(ms)).unwrap(),
+                &mut audit,
             );
-            (r, start.elapsed())
+            let elapsed = start.elapsed();
+            // 接続するのは spawn した子だけなので、peer 認証の拒否イベントは 0 件（PLUG-12・SEC-4）。
+            assert_eq!(audit.drain_lines(), Vec::<String>::new());
+            (r, elapsed)
         });
         (res, elapsed, dir)
     }
@@ -324,6 +340,7 @@ mod unix {
                 &plugin,
                 &req,
                 OneShotTimeout::new(Duration::from_millis(8000)).unwrap(),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
                 &mut |rec| records.push(rec.clone()),
             );
             (r, records)
@@ -339,8 +356,7 @@ mod unix {
         assert!(
             line.ends_with(
                 ",\"plugin_stderr_bytes\":19,\"plugin_stderr_truncated\":false,\
-                 \"plugin_stderr_complete\":true,\"plugin_stderr_reader_stopped\":true,\
-                 \"peer_auth_audit_flushed\":true}"
+                 \"plugin_stderr_complete\":true,\"plugin_stderr_reader_stopped\":true}"
             ),
             "{line}"
         );
@@ -353,7 +369,13 @@ mod unix {
         let missing = dir.0.join("no-such-plugin");
         let plugin = OneShotPlugin::new(missing, vec![], dir.0.clone()).unwrap();
         let req = Frame::new(b"ping".to_vec()).unwrap();
-        let err = call_once(&plugin, &req, OneShotTimeout::default()).unwrap_err();
+        let err = call_once(
+            &plugin,
+            &req,
+            OneShotTimeout::default(),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), PluginErrorCode::NotFound);
         no_socket_left(&dir);
     }

@@ -275,9 +275,15 @@ impl ResidentPlugin {
     /// 終了した場合は期限を待たず `Unavailable`。失敗経路ではいずれも子を kill・回収してから返し、
     /// 回収を確認できない場合は `Internal`（pid つき）を返す。非 unix では bind が `Unimplemented` を
     /// 返し、子は spawn されない。
+    ///
+    /// `audit` は受付で拒否した接続（UID・pid の不一致・取得失敗）の監査イベントの受け手で、拒否 1 件に
+    /// つき 1 回、同期で呼ばれる（PLUG-12・SEC-4・TASK-124.5）。必須で、既定の出力先は無い（出力・永続化は
+    /// 呼び出し側の責務。`crate::audit` のモジュール doc）。
+    /// 接続の確立後（`call` 系）は peer 認証を行わないため、受け手は起動時にのみ使う。
     pub fn start(
         plugin: &OneShotPlugin,
         timeout: ResidentStartTimeout,
+        audit: &mut dyn crate::audit::PeerAuthObserver,
     ) -> Result<Self, PluginError> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -342,12 +348,7 @@ impl ResidentPlugin {
                     "plugin exited before connecting",
                 )),
             };
-            listener.accept_peer_pid(
-                left,
-                child_pid,
-                &mut check_child,
-                &mut crate::audit::StderrPeerAuthObserver,
-            )
+            listener.accept_peer_pid(left, child_pid, &mut check_child, audit)
         })();
         // 接続後は入口を残さない（socket を unlink する）。
         drop(listener);
@@ -631,7 +632,12 @@ mod tests {
         let abs = if cfg!(windows) { "C:\\p" } else { "/bin/p" };
         let dir = std::env::temp_dir().join("fcos-nonexistent-resident-dir");
         let plugin = OneShotPlugin::new(abs.into(), vec![], dir).unwrap();
-        let e = ResidentPlugin::start(&plugin, ResidentStartTimeout::default()).unwrap_err();
+        let e = ResidentPlugin::start(
+            &plugin,
+            ResidentStartTimeout::default(),
+            &mut crate::audit::NoopPeerAuthObserver,
+        )
+        .unwrap_err();
         assert_ne!(e.message(), "plugin program not found");
     }
 }

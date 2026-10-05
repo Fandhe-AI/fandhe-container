@@ -690,6 +690,151 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
+    /// 書き込みの開始を通知してから、門が開く（送信側が drop される）まで止まる出力先。
+    struct Gated {
+        started: std::sync::mpsc::Sender<()>,
+        gate: std::sync::mpsc::Receiver<()>,
+        buf: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+    impl Write for Gated {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let _ = self.started.send(());
+            let _ = self.gate.recv();
+            self.buf.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// SEC-4（#1388）: 集約行の書き込み中は flush が成功を返さず、書き込み完了後にのみ true になる。
+    #[test]
+    fn sec4_flush_does_not_succeed_while_aggregate_write_is_in_progress() {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let sink = AuditSink::spawn(
+            Gated {
+                started: started_tx,
+                gate: gate_rx,
+                buf: Arc::clone(&buf),
+            },
+            4,
+        );
+        // 通常行は積まず、あふれ 3 件だけを保留させる（定期回収が集約行を書き始める）。
+        sink.pending_dropped.fetch_add(3, Ordering::AcqRel);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("aggregate write did not start");
+        // 書き込みは始まったが完了していない。この間は未完了として数える。
+        assert_eq!(sink.queued.load(Ordering::Acquire), 0);
+        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 3);
+        assert!(!sink.flush(std::time::Duration::from_millis(30)));
+        assert_eq!(String::from_utf8_lossy(&buf.lock().unwrap()), "");
+
+        drop(gate_tx);
+        assert!(sink.flush(std::time::Duration::from_secs(5)));
+        assert_eq!(
+            String::from_utf8_lossy(&buf.lock().unwrap()),
+            "{\"event\":\"plugin_peer_auth\",\"outcome\":\"error\",\"reason\":\"peer_auth_rejections_coalesced\",\"count\":3}\n"
+        );
+        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
+        assert_eq!(sink.write_failures.load(Ordering::Acquire), 0);
+    }
+
+    /// SEC-4: 集約行を書けなかった場合、flush が true を返す時点で件数は失敗累計へ計上済み。
+    #[test]
+    fn sec4_flush_after_failed_aggregate_write_sees_failures_counted() {
+        let sink = AuditSink::spawn(Failing, 4);
+        sink.pending_dropped.fetch_add(3, Ordering::AcqRel);
+        assert!(sink.flush(std::time::Duration::from_secs(5)));
+        assert_eq!(sink.write_failures.load(Ordering::Acquire), 3);
+        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
+    }
+
+    /// SEC-4: 集約行の書き込み中にあふれた件数は失われず、次の集約行として出力される。
+    #[test]
+    fn sec4_drops_during_aggregate_write_are_emitted_in_next_aggregate() {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let sink = AuditSink::spawn(
+            Gated {
+                started: started_tx,
+                gate: gate_rx,
+                buf: Arc::clone(&buf),
+            },
+            4,
+        );
+        sink.pending_dropped.fetch_add(3, Ordering::AcqRel);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("aggregate write did not start");
+        sink.pending_dropped.fetch_add(2, Ordering::AcqRel);
+        drop(gate_tx);
+        assert!(sink.flush(std::time::Duration::from_secs(5)));
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let counts: Vec<u64> = out
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["count"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(counts, vec![3, 2]);
+        assert_eq!(sink.write_failures.load(Ordering::Acquire), 0);
+    }
+
+    /// SEC-4: キュー満杯の 1 件は `pending_dropped` へ移り、`queued` には残らない。
+    #[test]
+    fn sec4_full_queue_moves_one_rejection_to_pending_dropped() {
+        let (_gate, rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let sink = AuditSink::spawn(
+            Gated {
+                started: started_tx,
+                gate: rx,
+                buf: Arc::new(std::sync::Mutex::new(Vec::new())),
+            },
+            1,
+        );
+        sink.submit("held".into());
+        // 書き込みスレッドが 1 行目を取り出して止まるのを待つ（キューは空になる）。
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("write did not start");
+        sink.submit("queued".into());
+        sink.submit("overflow".into());
+        assert_eq!(sink.queued.load(Ordering::Acquire), 2);
+        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 1);
+    }
+
+    struct Panicking;
+    impl Write for Panicking {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            panic!("writer panicked (test)");
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// SEC-4: 書き込みスレッドが異常終了したら、後続の拒否が無くても残存件数が失敗累計へ移り、
+    /// flush は完了（失敗計上済み）を返す。
+    #[test]
+    fn sec4_writer_thread_exit_reclaims_unwritten_counts_as_failures() {
+        let sink = AuditSink::spawn(Panicking, 4);
+        sink.pending_dropped.fetch_add(3, Ordering::AcqRel);
+        sink.submit("a".into());
+        assert!(sink.flush(std::time::Duration::from_secs(5)));
+        // 通常行 1 件 + 未出力の集約 3 件
+        assert_eq!(sink.write_failures.load(Ordering::Acquire), 4);
+        assert_eq!(sink.queued.load(Ordering::Acquire), 0);
+        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
+    }
+
     /// SEC-4: 書き込みスレッド不在のときは件数が失敗累計へ計上される。
     #[test]
     fn sec4_spawn_failure_counts_as_write_failure() {

@@ -1573,8 +1573,10 @@ mod tests {
     fn plug12_peer_uid_overflowuid_pair_is_accepted_as_identical() {
         assert!(peer_uid_matches(65534, 65534));
         assert!(verify_peer_with(|| Ok(65534), 65534).is_ok());
-        let err = verify_peer_with(|| Ok(65534), 1000).unwrap_err();
-        assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+        let rej = verify_peer_with(|| Ok(65534), 1000).unwrap_err();
+        assert_eq!(rej.error.code(), PluginErrorCode::PermissionDenied);
+        // 監査イベントには観測した peer uid（65534）をそのまま載せる（TASK-124.5・SEC-4）。
+        assert_eq!(rej.peer_uid, Some(65534));
     }
 
     /// PLUG-12: 不一致は PermissionDenied・固定メッセージで UID 値を含まない。

@@ -524,14 +524,23 @@ impl ChildGuard {
         // wait していない間に限る。ゾンビでも未回収の間は pid（= pgid）が再利用されないため、送信先は
         // 自分が起動したグループに限られる。最初の `try_wait` より前に送るのは、自発終了済み（ゾンビ）の
         // 子を先に回収すると孫へ送る安全な機会を失うため（ゾンビの終了状態はシグナルで変わらず、
-        // `classify_reaped` の区別は保たれる）。エラーは無視する（グループが空の ESRCH は正常で、macOS
-        // はゾンビのみのグループで EPERM になり得る。回収の成否は下の `try_wait` が判定する）。
+        // `classify_reaped` の区別は保たれる）。許容するエラーは「グループに生存者がいない」ことを
+        // 示すものに限る（`group_kill_tolerated`）。それ以外の失敗は孫の停止を保証できないため、
+        // 直接の子を回収できても `Unreaped` を返す（成功扱いにしない。PLUG-7・REPAIR-5）。
         #[cfg(unix)]
-        if !self.leader_reaped {
-            let _ = crate::sys::kill_process_group(c.id());
-        }
+        let group_failed = !self.leader_reaped
+            && crate::sys::kill_process_group(c.id())
+                .err()
+                .is_some_and(|e| !group_kill_tolerated(&e));
+        #[cfg(not(unix))]
+        let group_failed = false;
         // kill の前に終了済みかを確認し、自発終了の状態をそのまま拾う（kill との競合窓を狭める）。
         if let Ok(Some(status)) = c.try_wait() {
+            if group_failed {
+                // 直接の子は回収済みだが孫の停止を保証できない。pid 報告のため `Child` は手放さない。
+                self.leader_reaped = true;
+                return Reap::Unreaped;
+            }
             self.release_reaped();
             return Reap::Reaped(status);
         }
@@ -542,6 +551,10 @@ impl ChildGuard {
         loop {
             match c.try_wait() {
                 Ok(Some(status)) => {
+                    if group_failed {
+                        self.leader_reaped = true;
+                        return Reap::Unreaped;
+                    }
                     self.release_reaped();
                     return Reap::Reaped(status);
                 }
@@ -591,6 +604,24 @@ impl Drop for ChildGuard {
         if !self.reported_unreaped {
             let _ = self.kill_and_reap();
         }
+    }
+}
+
+/// プロセスグループへの `SIGKILL` 送信エラーのうち、グループに生存者がいないことを示すものか。
+///
+/// `ESRCH`（グループが空）は正常。macOS はゾンビのみのグループで `EPERM` を返すため同様に許容する
+/// （同一ユーザーの生存者への送信は `EPERM` にならない）。それ以外（`InvalidInput`・`Unsupported` 等）は
+/// 孫の停止を保証できず、呼び出し側（`kill_and_reap`）が `Unreaped` として報告する（PLUG-7・#1311）。
+#[cfg(unix)]
+fn group_kill_tolerated(e: &io::Error) -> bool {
+    const ESRCH: i32 = 3;
+    #[cfg(target_os = "macos")]
+    const EPERM: i32 = 1;
+    match e.raw_os_error() {
+        Some(ESRCH) => true,
+        #[cfg(target_os = "macos")]
+        Some(EPERM) => true,
+        _ => false,
     }
 }
 
@@ -952,6 +983,20 @@ fn exchange_and_reap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PLUG-7・#1311: グループ送信エラーの許容は ESRCH のみ。InvalidInput・Unsupported は許容しない。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_group_kill_tolerates_only_empty_group_errors() {
+        assert!(group_kill_tolerated(&io::Error::from_raw_os_error(3)));
+        assert!(!group_kill_tolerated(&io::Error::from(
+            io::ErrorKind::InvalidInput
+        )));
+        assert!(!group_kill_tolerated(&io::Error::from(
+            io::ErrorKind::Unsupported
+        )));
+        assert!(!group_kill_tolerated(&io::Error::from_raw_os_error(22)));
+    }
 
     #[test]
     fn plug7_timeout_rejects_zero_and_over_max() {

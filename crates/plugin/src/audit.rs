@@ -28,8 +28,8 @@
 //! - キューが満杯の場合は、捨てずに件数を数え、書き込みスレッドが定期的（次の行の到着を待たない）に
 //!   集約行（`peer_auth_rejections_coalesced`）として出す。出力待ちの件数は
 //!   [`default_audit_pending_dropped`] で観測できる。
-//! - 書き込みスレッドを起動できなかった場合は出力経路が無いため、件数を直接
-//!   [`default_audit_write_failures`] へ計上する。
+//! - 書き込みスレッドを起動できなかった場合・停止した場合（受信側 Disconnected）は出力経路が無い
+//!   ため、拒否件数・未出力の集約件数・キュー残存分を直接 [`default_audit_write_failures`] へ計上する。
 //! - stderr への書き込みが失敗した場合（閉じている・書けない）は失われた件数を
 //!   [`default_audit_write_failures`] へ数え、黙って消えない（呼び出し側が監視できる）。
 //! - 書き込みスレッドの出力は非同期のため、直後にプロセスが終了すると未出力の行は失われ得る。
@@ -75,6 +75,13 @@ struct AuditSink {
     pending_dropped: Arc<AtomicU64>,
     /// 書き込み失敗で失われた件数の累計。
     write_failures: Arc<AtomicU64>,
+    /// キューに積まれ、書き込みスレッドが未受信の件数（スレッド停止時に失敗として回収する）。
+    queued: Arc<AtomicU64>,
+}
+
+/// 0 未満にならないよう 1 減らす（Disconnected 回収で 0 へ戻された後の減算に備える）。
+fn saturating_dec(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1));
 }
 
 impl AuditSink {
@@ -82,13 +89,19 @@ impl AuditSink {
         let pending_dropped = Arc::new(AtomicU64::new(0));
         let write_failures = Arc::new(AtomicU64::new(0));
         let (tx, rx) = sync_channel::<String>(capacity);
-        let (pd, wf) = (Arc::clone(&pending_dropped), Arc::clone(&write_failures));
+        let queued = Arc::new(AtomicU64::new(0));
+        let (pd, wf, qd) = (
+            Arc::clone(&pending_dropped),
+            Arc::clone(&write_failures),
+            Arc::clone(&queued),
+        );
         let spawned = std::thread::Builder::new()
             .name("peer-auth-audit".into())
             .spawn(move || {
                 loop {
                     match rx.recv_timeout(AGGREGATE_FLUSH_INTERVAL) {
                         Ok(line) => {
+                            saturating_dec(&qd);
                             emit_aggregate(&mut out, &pd, &wf);
                             if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
                                 wf.fetch_add(1, Ordering::AcqRel);
@@ -108,26 +121,34 @@ impl AuditSink {
             tx: spawned.ok().map(|_| tx),
             pending_dropped,
             write_failures,
+            queued,
         }
     }
 
     /// ブロックせずキューへ積む。積めなければ件数に合算する（捨てたことを黙らせない）。
+    ///
+    /// - `Full`: 書き込みスレッドが生きているので `pending_dropped` へ積み、集約行で出す。
+    /// - `Disconnected` / スレッド不在: 集約行を出す主体が居ないため、この 1 件に加えて
+    ///   未出力の集約件数・キュー残存分も `write_failures` へ直接計上する（SEC-4）。
     fn submit(&self, line: String) {
-        let sent = match &self.tx {
-            Some(tx) => !matches!(
-                tx.try_send(line),
-                Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
-            ),
-            None => false,
-        };
-        if sent {
-            return;
-        }
-        if self.tx.is_none() {
-            // 書き込みスレッドが無く永久に出力できないため、失敗累計へ直接計上する。
+        let Some(tx) = &self.tx else {
             self.write_failures.fetch_add(1, Ordering::AcqRel);
-        } else {
-            self.pending_dropped.fetch_add(1, Ordering::AcqRel);
+            return;
+        };
+        // 送信前に積む（受信側の減算が先行して 0 未満にならないように）。
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        match tx.try_send(line) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                saturating_dec(&self.queued);
+                self.pending_dropped.fetch_add(1, Ordering::AcqRel);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // queued には今回の 1 件も含まれる。
+                let lost = self.queued.swap(0, Ordering::AcqRel)
+                    + self.pending_dropped.swap(0, Ordering::AcqRel);
+                self.write_failures.fetch_add(lost, Ordering::AcqRel);
+            }
         }
     }
 }
@@ -540,11 +561,34 @@ mod tests {
             tx: None,
             pending_dropped: Arc::new(AtomicU64::new(0)),
             write_failures: Arc::new(AtomicU64::new(0)),
+            queued: Arc::new(AtomicU64::new(0)),
         };
         sink.submit("x".into());
         sink.submit("y".into());
         assert_eq!(sink.write_failures.load(Ordering::Acquire), 2);
         assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
+    }
+
+    /// SEC-4: 受信側停止（Disconnected）後の拒否は、今回分・未出力の集約件数・キュー残存分を
+    /// すべて失敗累計へ計上する。
+    #[test]
+    fn sec4_disconnected_receiver_counts_all_as_write_failures() {
+        let (tx, rx) = sync_channel::<String>(4);
+        let sink = AuditSink {
+            tx: Some(tx),
+            pending_dropped: Arc::new(AtomicU64::new(3)),
+            write_failures: Arc::new(AtomicU64::new(0)),
+            queued: Arc::new(AtomicU64::new(0)),
+        };
+        sink.submit("a".into());
+        sink.submit("b".into());
+        drop(rx);
+        sink.submit("c".into());
+        // 残存 2 件 + 今回 1 件 + 未出力の集約 3 件
+        assert_eq!(sink.write_failures.load(Ordering::Acquire), 6);
+        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
+        sink.submit("d".into());
+        assert_eq!(sink.write_failures.load(Ordering::Acquire), 7);
     }
 
     /// SEC-4: 容量超過は捨てず集約行 1 行（count = 超過件数）になる。

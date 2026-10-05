@@ -48,6 +48,8 @@ const MAX_PROBE_LINE_BYTES: usize = 256;
 const WRITE_LINE: &str = "fandhe-virtiofs-write-v1";
 const WRITE_LINES: usize = 4096;
 const MAX_OUT_ENTRIES: usize = 16;
+/// VM 破棄後、コンソールログの書き出しスレッドが EOF で終わるのを待つ上限（REPAIR-5）。
+const CONSOLE_LOG_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -277,6 +279,33 @@ fn log_truncated(bytes: &[u8]) -> bool {
     bytes.ends_with(TRUNCATION_MARKER)
 }
 
+/// コンソールログの書き出しスレッド（`console_log`）がログを閉じ終えるまで待つ。
+///
+/// 書き出しスレッドはログへの排他 advisory lock（unix では `flock(2)`）を EOF でファイルを閉じるまで
+/// 保持する（`console_log` モジュールの「排他」）。EOF は VM と設定が解放され serial の書き込み端が
+/// すべて閉じたときに来るため、`Vm` を破棄した後に lock を取れれば、ゲスト出力はすべてファイルへ
+/// 反映済みで以後増えない。期限内に取れなければ不完全なログで判定しないよう `Err` を返す（fail-closed）。
+fn wait_console_log_settled(path: &Path, timeout: Duration) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open console log: {e}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            // 取得した lock は `file` の drop で解放される。
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("lock console log: {e}"));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "console log writer did not finish within {timeout:?}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// ログ全体を畳み込む。プローブ契約（AGENTS.md「最後に done」）に従い、次を `invalid`
 /// （fail-closed）とする: op ごとの重複報告・done の重複・done 以降の後続報告・
 /// read / readdir / write の全報告が揃う前の done・名前空間を持つが復号できない行（done の前後とも）。
@@ -491,9 +520,13 @@ fn boot_and_probe(tag: &str) -> ProbeOutcome {
     // ゲストとの TOCTOU を避けるため、停止を確認してから共有の中身を検証する。
     vm.stop().expect("stop");
     assert_eq!(vm.state(), VmState::Stopped);
-    if let Ok(bytes) = std::fs::read(&log_path) {
-        last = bytes;
+    // stop は VM の停止だけを待ち、pipe からログへの書き出しは非同期に続く。VM を破棄して書き込み端を
+    // 閉じ、書き出しスレッドの終了（lock の解放）を確認してから確定したログで最終判定する。
+    drop(vm);
+    if let Err(e) = wait_console_log_settled(&log_path, CONSOLE_LOG_SETTLE_TIMEOUT) {
+        panic!("{e}; console tail:\n{}", tail_lossy(&last, 4096));
     }
+    last = std::fs::read(&log_path).expect("read settled console log");
     // done 検出後〜停止までにゲスト出力が上限へ達すると、done の後の重複報告・エラーが破棄される。
     // 停止後に読み直したログでも打ち切りを拒否する（fail-closed）。
     assert!(
@@ -814,6 +847,39 @@ fn mac1_io5_probe_timeout_bounds() {
     for bad in ["0", "601", "abc", ""] {
         assert!(resolve_probe_timeout(Some(bad.into())).is_err(), "{bad}");
     }
+}
+
+/// MAC-1・IO-5・TASK-65.4・REPAIR-5: ログの確定待ちは書き出し側の lock 解放で完了し、
+/// 解放されなければ期限で失敗する。
+#[test]
+fn mac1_io5_wait_console_log_settled_follows_writer_lock() {
+    let s = Scratch::new("settle", false);
+    let log = s.file("console.log", b"boot\n");
+    // 書き出しスレッドの代役: 別の open で排他 lock を保持し、200ms 後に閉じる。
+    let writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .expect("open writer");
+    writer.lock().expect("writer lock");
+    assert_eq!(
+        wait_console_log_settled(&log, Duration::from_millis(100)),
+        Err("console log writer did not finish within 100ms".to_string())
+    );
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(writer);
+    });
+    assert_eq!(
+        wait_console_log_settled(&log, Duration::from_secs(10)),
+        Ok(())
+    );
+    release.join().expect("release thread");
+    // ログが無ければ待たずに失敗する。
+    let missing = s.dir.join("missing.log");
+    assert!(
+        wait_console_log_settled(&missing, Duration::from_secs(1))
+            .is_err_and(|e| e.starts_with("open console log: "))
+    );
 }
 
 /// MAC-1・IO-5・TASK-65.4: 停止後の write 検証は symlink・余剰エントリ・内容不一致を拒否する。

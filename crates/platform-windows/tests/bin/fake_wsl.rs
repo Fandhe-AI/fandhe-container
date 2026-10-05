@@ -27,7 +27,7 @@
 //! | `hang` | 60 秒眠る | 60 秒眠る |
 //! | `flood` | 128 KiB を出力（0） | 同左（0） |
 //!
-//! # マウント系モード（`mount_ok` / `mount_9p` / `mount_launch` / `mount_unset`）
+//! # マウント系モード（`mount_ok` / `mount_9p` / `mount_9p_unset` / `mount_9p_applied` / `mount_9p_launch` / `mount_launch` / `mount_unset`）
 //!
 //! `--version` / `-l -v` は `ok` と同じ。加えて `--distribution Ubuntu --user root --exec <コマンド>` を受け付け、
 //! ゲストのマウント表を実行ファイルと同じ場所の `<実行ファイル名>.state`（行ごとに `ID<TAB>マウント先<TAB>
@@ -37,7 +37,7 @@
 //! | コマンド | 振る舞い |
 //! | ---- | ---- |
 //! | `cat /proc/self/mountinfo` | マウント表を mountinfo 形式で出力（0） |
-//! | `sh -c <検証込み mount スクリプト> sh <ホスト> <名前> <オプション> <nonce>` | `/mnt/fandhe/<名前>` に新しい ID でマウントを積み、その ID を出力する（`mount_9p` は fstype `9p`、他は `virtiofs`。0） |
+//! | `sh -c <検証込み mount スクリプト> sh <ホスト> <名前> <オプション> <nonce>` | `/mnt/fandhe/<名前>` に新しい ID でマウントを積み、その ID を出力する（`mount_9p*` は fstype `9p`、他は `virtiofs`。0。9P フォールバックの結合試験が並列でも状態ファイルが衝突しないよう別名のモードを持つ） |
 //! | `sh -c <ID 照合付き umount スクリプト> sh <マウント先> <ID> <nonce>` | 最上位の ID が一致すれば外す（0）、不一致は 203 |
 //!
 //! スクリプト本文はゲストのシェルで解釈せず、`mount -t drvfs` / `umount "$1"` を含むかだけを確かめる
@@ -120,7 +120,11 @@ fn guest_exec(mode: &str, cmd: &[&str]) -> ExitCode {
             } else {
                 "rw"
             };
-            let fstype = if mode == "mount_9p" { "9p" } else { "virtiofs" };
+            let fstype = if mode.starts_with("mount_9p") {
+                "9p"
+            } else {
+                "virtiofs"
+            };
             rows.push((
                 id,
                 format!("/mnt/fandhe/{name}"),
@@ -198,7 +202,13 @@ fn main() -> ExitCode {
     };
     let mount_mode = matches!(
         mode.as_str(),
-        "mount_ok" | "mount_9p" | "mount_launch" | "mount_unset"
+        "mount_ok"
+            | "mount_9p"
+            | "mount_9p_unset"
+            | "mount_9p_applied"
+            | "mount_9p_launch"
+            | "mount_launch"
+            | "mount_unset"
     );
     match (mode.as_str(), call) {
         (_, Call::Exec(cmd)) if mount_mode => {

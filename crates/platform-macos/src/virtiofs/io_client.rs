@@ -13,8 +13,8 @@
 //!
 //! - 通常 ACK は「サーバーがバッファへ受理した」ことだけを意味し、永続化は保証しない。永続化の保証は
 //!   FLUSH ACK だけが持つ（IO-1・IO-2。`docs/api/io-barrier.md`）。
-//! - すべての ACK 待ちにタイムアウトを渡す（REPAIR-5）。`write` の枠空け待ちは `ack`、`flush` の ACK 受け取り
-//!   （通常 ACK 分と最後の `FlushAck`）は区別せず `flush_ack` を使う。
+//! - すべての ACK 待ちにタイムアウトを渡す（REPAIR-5）。`write` の暗黙 flush と `flush` の ACK 受け取り
+//!   （通常 ACK 分と最後の `FlushAck`）は区別せず `flush_ack` を使う（`ack` は予約値で現在は未使用）。
 //! - エラー後の接続は再利用しない（poison。P1-3）。再接続は呼び出し元の責務。
 //! - 共有が [`ShareAccess::ReadOnly`] の場合は構築を拒否する（fail-closed）。
 //! - virtiofs タグはワイヤーへ載せない（`writeback.rs` の D1）。タグは識別・観測用に保持するだけで、
@@ -24,8 +24,10 @@
 //!
 //! サーバーが ACK を返すのは batch_size 到達・バイト上限到達・`Flush` 受信・自動フラッシュのときだけ。
 //! batch_size 未満の `Write` だけを送って ACK を待つとタイムアウトまで止まる。そのため
-//! 「in-flight 上限 ≥ サーバーの batch_size にする」か「件数未達の残りは必ず `flush` で確定させる」
-//! （[`VirtiofsIoClient::write_all_and_flush`]）のどちらかを守ること。
+//! 本クライアントは in-flight 上限のうち 1 枠を `Flush` 用に予約し（上限は [`MIN_IN_FLIGHT_LIMIT`] 以上）、
+//! `Write` が残り 1 枠に達すると通常 ACK を待たず暗黙の `Flush` で確定させるため、上限とサーバーの
+//! batch_size の大小に関わらず ACK 待ちで止まらない。件数未達の残りは呼び出し側が `flush`
+//! （[`VirtiofsIoClient::write_all_and_flush`]）で確定させること。
 //!
 //! # 未実装（REPAIR-3）
 //!
@@ -43,6 +45,8 @@ use fandhe_container_io::{
 
 use super::{ShareAccess, VirtiofsShareSpec, VirtiofsTag};
 
+/// in-flight 上限の下限（`Flush` 用の予約 1 枠 + `Write` 1 枠）。
+pub const MIN_IN_FLIGHT_LIMIT: usize = 2;
 /// 既定の送信タイムアウト（秒。REPAIR-5）。
 pub const DEFAULT_VIRTIOFS_IO_SEND_TIMEOUT_SECS: u64 = 5;
 /// 既定の ACK 待ちタイムアウト（秒）。`fandhe_container_io::MAX_IO_TIMEOUT` に合わせる。
@@ -84,7 +88,7 @@ impl VirtiofsIoTimeouts {
         self.send
     }
 
-    /// `write` が満杯の枠を空けるときの ACK 待ちタイムアウト。
+    /// 予約値（現在 `write` の暗黙 flush も `flush_ack` を使うため、クライアント内では未使用）。
     pub fn ack(&self) -> IoTimeout {
         self.ack
     }
@@ -121,6 +125,8 @@ pub enum VirtiofsIoError {
     Protocol { op: VirtiofsIoOp, source: IoError },
     /// 期待と異なる種別・対応の ACK を受け取った。
     UnexpectedAck { op: VirtiofsIoOp },
+    /// in-flight 上限が `Flush` 用の予約枠を含めて足りない（[`MIN_IN_FLIGHT_LIMIT`] 未満）。
+    InFlightLimitTooSmall { limit: usize },
 }
 
 impl VirtiofsIoError {
@@ -129,6 +135,9 @@ impl VirtiofsIoError {
         match self {
             VirtiofsIoError::ReadOnlyShare { .. } => "virtiofs_io.read_only_share",
             VirtiofsIoError::UnexpectedAck { .. } => "virtiofs_io.unexpected_ack",
+            VirtiofsIoError::InFlightLimitTooSmall { .. } => {
+                "virtiofs_io.in_flight_limit_too_small"
+            }
             VirtiofsIoError::Protocol { source, .. } => match source.code() {
                 IoErrorCode::InvalidArgument => "virtiofs_io.invalid_argument",
                 IoErrorCode::Timeout => "virtiofs_io.timeout",
@@ -153,6 +162,10 @@ impl VirtiofsIoError {
             VirtiofsIoError::Protocol { op, source } => {
                 format!("virtiofs io {} failed: {}", op.as_str(), source)
             }
+            VirtiofsIoError::InFlightLimitTooSmall { limit } => format!(
+                "virtiofs io in-flight limit {limit} is too small; at least {MIN_IN_FLIGHT_LIMIT} is required \
+                 (one slot is reserved for flush)"
+            ),
             VirtiofsIoError::UnexpectedAck { op } => format!(
                 "virtiofs io {} received an unexpected ack; the connection must be re-established",
                 op.as_str()
@@ -227,6 +240,10 @@ where
                 tag: share.tag.clone(),
             });
         }
+        // Flush 用に 1 枠を予約するため、上限 1 では Write を 1 件も積めない。
+        if limit.get() < MIN_IN_FLIGHT_LIMIT {
+            return Err(VirtiofsIoError::InFlightLimitTooSmall { limit: limit.get() });
+        }
         Ok(Self {
             tag: share.tag.clone(),
             client: PipelineClient::new(transport, limit, observer),
@@ -282,29 +299,18 @@ where
         Ok(())
     }
 
-    /// キューが満杯なら通常 ACK を 1 件受け取って枠を空ける。受け取った件数（0 または 1）を返す。
-    fn make_room(&mut self, op: VirtiofsIoOp) -> Result<u64, VirtiofsIoError> {
-        if !self.client.queue().is_full() {
-            return Ok(0);
-        }
-        let receipt = self
-            .client
-            .recv_ack(self.timeouts.ack)
-            .map_err(|e| Self::protocol(op, e))?;
-        match receipt {
-            AckReceipt::Write(_) => Ok(1),
-            _ => {
-                self.broken = true;
-                Err(VirtiofsIoError::UnexpectedAck { op })
-            }
-        }
-    }
-
-    /// `Write` を 1 件パイプライン送信する。キューが満杯なら先に通常 ACK を 1 件受け取る（D3）。
+    /// `Write` を 1 件パイプライン送信する。
+    ///
+    /// キューの 1 枠は `Flush` 用に予約する。`Write` が残り 1 枠（上限 - 1 件）に達していたら、通常 ACK を
+    /// 待たずに先に暗黙の `Flush` で滞留分を確定させる（サーバーは batch_size 未満の `Write` に `Flush` 受信まで
+    /// ACK を返さないため、通常 ACK 待ちでは in-flight 上限 ≤ batch_size のときに止まる。D3）。
     pub fn write(&mut self, body: &[u8]) -> Result<WriteReport, VirtiofsIoError> {
         const OP: VirtiofsIoOp = VirtiofsIoOp::Write;
         self.ensure_usable(OP)?;
-        let acked_writes = self.make_room(OP)?;
+        let mut acked_writes = 0;
+        if self.client.queue().len() >= self.write_capacity() {
+            acked_writes = self.flush_inner()?.acked_writes;
+        }
         let sent = self
             .client
             .send(FrameKind::Write, body, self.timeouts.send)
@@ -315,15 +321,25 @@ where
         })
     }
 
+    /// `Write` が占有できる最大件数（上限 - `Flush` 用の予約 1 枠。構築時に上限 ≥ 2 を保証済み）。
+    fn write_capacity(&self) -> usize {
+        self.client.queue().limit().get().saturating_sub(1)
+    }
+
     /// `Flush` を送り、それ以前の通常 ACK を順に受け取ってから同じ request id の `FlushAck` を待つ（IO-2）。
     pub fn flush(&mut self) -> Result<FlushReport, VirtiofsIoError> {
+        self.ensure_usable(VirtiofsIoOp::Flush)?;
+        self.flush_inner()
+    }
+
+    /// `flush` の本体。`Write` は予約枠を超えて積まれないため、`Flush` 送信用の枠は常に空いている。
+    fn flush_inner(&mut self) -> Result<FlushReport, VirtiofsIoError> {
         const OP: VirtiofsIoOp = VirtiofsIoOp::Flush;
-        self.ensure_usable(OP)?;
-        let mut acked_writes = self.make_room(OP)?;
         let barrier = self
             .client
             .flush(self.timeouts.send)
             .map_err(|e| Self::protocol(OP, e))?;
+        let mut acked_writes = 0;
         // 送信後は ACK の受け取りが途中で失敗すると状態が曖昧になるため、以後の再利用を拒否する。
         match self.drain_until(barrier.id(), &mut acked_writes) {
             Ok(()) => Ok(FlushReport {

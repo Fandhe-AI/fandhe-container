@@ -190,32 +190,48 @@ fn platform_error_wraps_virtiofs_io_error() {
     );
 }
 
-/// REPAIR-5・TASK-65.2: write が枠を空けるときは ack 値、flush の受け取りは flush_ack 値を渡す。
+/// REPAIR-5・TASK-65.2: write の暗黙 flush と flush の受け取りはいずれも flush_ack 値を渡す。
 #[test]
 fn timeout_values_are_wired_to_recv() {
     let dir = TempDir::new("wire");
     let timeouts = VirtiofsIoTimeouts::new(secs(1), secs(2), secs(3));
-    let (mut client, log) = recording_client(&dir, 1, timeouts);
+    let (mut client, log) = recording_client(&dir, 2, timeouts);
 
     let first = client.write(b"a").expect("first write");
     assert_eq!(first.acked_writes, 0);
-    // 2 件目は満杯のため先に ack タイムアウトで 1 件受け取る。
+    // 2 件目は Write 容量（上限 - 1 = 1）に達しているため、先に暗黙 flush で a を確定する（ACK 1 件 + FlushAck）。
     let second = client.write(b"b").expect("second write");
     assert_eq!(second.acked_writes, 1);
-    assert_eq!(*log.lock().expect("lock"), vec![Duration::from_secs(2)]);
-
-    // flush: 満杯なので枠空け（ack=2s）→ Flush 送信 → FlushAck 受信（flush_ack=3s）。
-    // 枠空けで通常 ACK 1 件（b）、Flush 送信後の drain は FlushAck のみなので通常 ACK は合計 1 件。
-    let report = client.flush().expect("flush");
-    assert_eq!(report.acked_writes, 1);
     assert_eq!(
         *log.lock().expect("lock"),
-        vec![
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-            Duration::from_secs(3)
-        ]
+        vec![Duration::from_secs(3), Duration::from_secs(3)]
     );
+
+    // flush: Flush 用の予約枠で送信でき、b の通常 ACK と FlushAck を受け取る。
+    let report = client.flush().expect("flush");
+    assert_eq!(report.acked_writes, 1);
+    assert_eq!(log.lock().expect("lock").len(), 4);
     assert_eq!(client.in_flight(), 0);
     assert!(!client.is_poisoned());
+}
+
+/// MAC-1・IO-2・TASK-65.2（D3）: 上限 1 は Flush 用の予約枠を取れないため構築を拒否する。
+#[test]
+fn in_flight_limit_below_minimum_is_rejected() {
+    let dir = TempDir::new("limit1");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let err = VirtiofsIoClient::new(
+        &share(&dir, ShareAccess::ReadWrite),
+        RecordingTransport::new(&log),
+        InFlightLimit::new(1).expect("limit"),
+        NoopSendObserver,
+        VirtiofsIoTimeouts::try_default().expect("defaults"),
+    )
+    .err()
+    .expect("must be rejected");
+    assert_eq!(err.code(), "virtiofs_io.in_flight_limit_too_small");
+    assert_eq!(
+        err.message(),
+        "virtiofs io in-flight limit 1 is too small; at least 2 is required (one slot is reserved for flush)"
+    );
 }

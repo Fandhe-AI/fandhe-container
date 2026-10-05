@@ -237,14 +237,16 @@ fn ack_wait_times_out_and_poisons() {
     let (client_end, silent_peer) = duplex();
     let timeouts = VirtiofsIoTimeouts::new(
         secs(5),
-        IoTimeout::new(Duration::from_millis(50)).expect("t"),
         secs(5),
+        IoTimeout::new(Duration::from_millis(50)).expect("t"),
     );
-    let mut c = client(&dir, client_end, 1, timeouts);
+    let mut c = client(&dir, client_end, 2, timeouts);
 
     c.write(b"a").expect("first write fits");
     let started = Instant::now();
-    let err = c.write(b"b").expect_err("must time out waiting for ack");
+    let err = c
+        .write(b"b")
+        .expect_err("must time out waiting for flush ack");
     assert_eq!(err.code(), "virtiofs_io.timeout");
     assert!(started.elapsed() < Duration::from_secs(5));
     assert!(c.is_poisoned());
@@ -278,4 +280,40 @@ fn flush_ack_wait_times_out() {
     assert_eq!(next.code(), "virtiofs_io.unavailable");
 
     drop(silent_peer);
+}
+
+/// IO-2・TASK-65.2（D3）: in-flight 上限 4 < サーバー batch_size 8 でも、Flush 用の予約枠により
+/// 上限まで Write を積んだ後の flush と、上限を超える連続 write がタイムアウトせず確定する。
+#[test]
+fn flush_works_when_in_flight_limit_is_below_server_batch_size() {
+    let dir = TempDir::new("limit-below-batch");
+    let (client_end, server_end) = duplex();
+    let sink = MemorySink::default();
+    let server = spawn_server(server_end, 8, sink.clone());
+    let mut c = client(
+        &dir,
+        client_end,
+        4,
+        VirtiofsIoTimeouts::new(secs(5), secs(5), secs(5)),
+    );
+
+    let bodies: Vec<Vec<u8>> = (0u8..10).map(|i| vec![i; 2]).collect();
+    let refs: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+    let report = c.write_all_and_flush(&refs).expect("write_all_and_flush");
+
+    assert_eq!(report.acked_writes, 10);
+    assert!(!c.is_poisoned());
+    assert_eq!(c.in_flight(), 0);
+    assert_eq!(*sink.0.lock().expect("lock"), bodies.concat());
+
+    // 予約枠を除く 3 件（上限 4 - 1）を積んだ直後の flush も確定できる。
+    for body in [b"x".as_slice(), b"y", b"z"] {
+        c.write(body).expect("write");
+    }
+    assert_eq!(c.in_flight(), 3);
+    let report = c.flush().expect("flush");
+    assert_eq!(report.acked_writes, 3);
+
+    drop(c);
+    server.join().expect("server thread");
 }

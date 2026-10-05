@@ -140,6 +140,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | SIGKILL 耐性（IO-3・TASK-18.3.1。実測は [io-crash-safety](docs/design/io-crash-safety.md)） | `crates/io/tests/crash_safety.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-io --features crash-test-server --test crash_safety` | 既定 CI 集合（`integration-test` 3 OS・`rust-ci`）で実行し、実機前提ではない。`integration-test` は「crash_safety の存在確認」ステップで glob による無言除外を検出する。電源断後の媒体永続化（IO-2）と実測レポート・妥当性判断（TASK-18 の人間担当）は保証しない |
 | vsock トランスポート往復・期限・受信上限・poison・CID 検証（IO-1・REPAIR-5・P1-3・PLUG-12 相当・SEC-4・#1119） | `crates/io/tests/vsock.rs` | 実機前提の loopback 試験 14 件は `make test-integration` では `ignored`。手順は「実機前提テスト」節 | `vsock_loopback` カーネルモジュールを要するため `#[ignore]` で分離（CI 通過のための弱体化ではない）。アドレス定数・`VsockPeerPolicy` の検証（全 OS）と、非 Linux で `bind` / `connect` が `Unimplemented` になること（REPAIR-3）は既定集合で常時実行する。期限・受信上限・poison・方向別のフレーム種別の共通処理は UDS と共有する `crates/io/src/stream_io.rs` にあり、`tests/server.rs` が既定集合で検証する |
 | macOS VM 起動・設定構築の結合試験（MAC-1・TASK-64.6・#363） | `crates/platform-macos/tests/vm_boot.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-platform-macos --test vm_boot` | macOS のみ（他 OS は `#![cfg]` で 0 件）。範囲外 CPU・メモリの拒否（副作用前）・`PlatformError` の表示・`build_vz_configuration` の読み戻しの 4 件、ゲスト mount 指定のコンソール必須拒否と実効コマンドライン読み戻し（TASK-65.3）の 2 件に加え、実機テスト用マーカー検証（ブート・起動完了マーカーの重複拒否・出現順・必須性・既定値）の 4 件、計 10 件を既定集合で実行する。実機起動の 1 件は `#[ignore]` で分離しており（CI 通過のための弱体化ではない）、手順は「実機前提テスト」節 |
+| macOS virtiofs の read/write/readdir 結合試験（MAC-1・IO-5・TASK-65.4・#367） | `crates/platform-macos/tests/virtiofs_io.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-platform-macos --test virtiofs_io` | macOS のみ（他 OS は `#![cfg]` で 0 件）。プローブ行の解釈（契約外のプローブ行の拒否を含む）・fixture・spec 読み戻し・コンソールログの確定待ち・停止後の write 検証など 11 件を既定集合で実行する。read / write / readdir の実機テスト 3 件は `#[ignore]` で分離しており（CI 通過のための弱体化ではない）、手順は「実機前提テスト」節 |
 | WSL2 virtiofs 共有の Windows 固有検証と実機結合試験（WIN-1・WIN-2・TASK-67.6・#377） | `crates/platform-windows/tests/wsl2_virtiofs.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-platform-windows --test wsl2_virtiofs` | Windows のみ（他 OS は `#![cfg]` で 0 件）。一時ディレクトリ配下の受理・`canonicalize` の `\\?\` 形式の拒否・`%USERPROFILE%\.wslconfig` の既定パスの 3 件を既定集合で実行する（WSL の有無に依存しない）。実機 WSL2 の 1 件は `#[ignore]` で分離しており（CI 通過のための弱体化ではない）、手順は「実機前提テスト」節 |
 | デーモンレス確認（CORE-1・D-19・SUP-1・TASK-28.2） | `crates/core/tests/daemonless.rs`・`crates/supervisor/tests/daemonless.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-core --test daemonless`・`cargo test -p fandhe-container-supervisor --test daemonless` | root・namespace を要さず自身が起動した子プロセスのみを対象とするため、分離せず既定 CI 集合に含める。検証本体は Linux のみ（`/proc` 走査）。役割プロセスは代役で、本番バイナリでの n=0 確認と SUP-1 の実機計測は TASK-45・47・49 の担当 |
 | NETLINK_ROUTE ソケット往復（NET-11・TASK-136.2.1） | `crates/net/tests/netlink_route_socket.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-net --test netlink_route_socket` | 非特権の RTM_GETLINK dump のみで root を要さないため、分離せず既定 CI 集合に含める。Linux のみ（他 OS では cfg で空）。link の特権テスト（bridge・veth 作成 → netns 移動 → up → address / route。TASK-136.5・#302）は実機前提テスト `link_netns_privileged`（#846。下記「実機前提テスト」節） |
@@ -275,6 +276,29 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
   codesign --sign - --force --entitlements crates/platform-macos/tests/vm_boot.entitlements <上で得たバイナリ>
   FANDHE_CONTAINER_MACOS_VM_KERNEL=/abs/path/to/vmlinux FANDHE_CONTAINER_MACOS_VM_READY_MARKER="<ゲストが起動完了後にだけ出力する文字列>" <上で得たバイナリ> --ignored --nocapture
   ```
+
+- `virtiofs_io`（MAC-1・IO-5・TASK-65.4・#367・MS-5。`crates/platform-macos/tests/virtiofs_io.rs` の `#[ignore]` テスト `mac1_io5_virtiofs_read_on_real_macos`・`mac1_io5_virtiofs_write_on_real_macos`・`mac1_io5_virtiofs_readdir_on_real_macos` の 3 件、通常の libtest harness）: 実機でゲストから RW の virtiofs 共有（タグ `fandhe-io`・ゲスト mount point `/mnt/fandhe/io`）へ read / write / readdir できることを検証する実機前提テスト。`Vm::launch` の成功がゲスト mount 報告（TASK-65.3）のゲートを兼ねる。IO-5 のうち macOS 分の疎通のみが対象で、大文字小文字衝突・Unicode 正規化は対象外。必要環境は `vm_boot` と同じ（実機の macOS 13 以上・`com.apple.security.virtualization` 付き ad-hoc 署名）に加え、ゲスト init が `fandhe.virtiofs=` 指示による mount と報告行（`fandhe-guest: virtiofs-mount v1 ...`）、および下記プローブ契約を実装していること、ゲストカーネルで virtiofs が有効であること（資産は本リポに含めない）。環境変数は `vm_boot` と共通の `FANDHE_CONTAINER_MACOS_VM_KERNEL`（必須）・`_INITRD`・`_DISK_IMAGE`・`_CMDLINE`（既定 `console=hvc0`）と、`FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS`（1〜600、既定 60）。ホストは起動前に `in/read.txt`（nonce 1 行）・`in/dir/{a,b,c}-<nonce>`・空の `out/` を共有へ置く。ゲストは次の行をコンソールへ出す（read / readdir はコンソール報告、write だけ `out/write.txt` に `fandhe-virtiofs-write-v1` を 4096 行書いて sync する）: `fandhe-guest-test: virtiofs-io v1 op=read value=<read.txt の 1 行目>`、`... op=readdir entries=<in/dir の名前のカンマ区切り>`、`... op=write result=done`、失敗時 `... op=<op> result=error`、最後に `fandhe-guest-test: virtiofs-io v1 done`。`fandhe-guest-test: virtiofs-io`（末尾に半角空白 1 つ）で始まる行はすべてプローブ行とみなし、上記の形に復号できない行（版数違い・未知 op・空 value・256 バイト超等）は done の前後を問わず不正として失敗させる。ホストは VM を停止して `Stopped` を確認した後に `out/` を検証する（ゲスト出力は untrusted）。プローブの最終判定は、VM を破棄してコンソールログの書き出しスレッドが排他 lock を手放す（EOF で終了する）のを最大 30 秒待ってから、確定したログに対して行う（期限内に手放されなければ失敗）。各テストが VM を 1 台起動するため `--test-threads=1` で直列に実行する。結果は PR に記録する（Agent は実機未実施）。
+  参照用のゲスト側シェル断片（busybox のみ）:
+
+  ```sh
+  P="fandhe-guest-test: virtiofs-io v1"
+  D=/mnt/fandhe/io
+  echo "$P op=read value=$(head -n1 $D/in/read.txt)"
+  echo "$P op=readdir entries=$(ls -1 $D/in/dir | tr '\n' ',' | sed 's/,$//')"
+  yes fandhe-virtiofs-write-v1 | head -n 4096 > $D/out/write.txt && sync && echo "$P op=write result=done" || echo "$P op=write result=error"
+  echo "$P done"
+  ```
+
+  実行手順:
+
+  ```bash
+  cargo test -p fandhe-container-platform-macos --test virtiofs_io --no-run --message-format=json \
+    | jq -r 'select(.reason == "compiler-artifact" and .target.name == "virtiofs_io" and .executable != null) | .executable'
+  codesign --sign - --force --entitlements crates/platform-macos/tests/vm_boot.entitlements <上で得たバイナリ>
+  FANDHE_CONTAINER_MACOS_VM_KERNEL=/abs/path/to/vmlinux <上で得たバイナリ> --ignored --test-threads=1 --nocapture
+  ```
+
+  実機テストの scratch（`CARGO_TARGET_TMPDIR` 配下の `virtiofs-read-*`・`virtiofs-write-*`・`virtiofs-readdir-*` ディレクトリ。`write.txt` 4096 行と `console.log`）はログ参照のため削除せず残す。不要になったら `cargo clean` または当該ディレクトリを手動で削除する。
 
 - `wsl2_virtiofs`（WIN-1・WIN-2・TASK-67.6・#377・MS-5。`crates/platform-windows/tests/wsl2_virtiofs.rs` の `#[ignore]` テスト `win1_win2_shared_mount_on_real_wsl2` 1 件、通常の libtest harness）: 実 WSL2 ディストリに対し `detect` で指定ディストリが WSL2 として使えることを確認し、`prepare_virtiofs_launch` で rw / ro の 2 共有をマウントして輸送方式（`virtiofs` または `9p`）・警告・マウント先と ro/rw を検証し、`release_virtiofs_launch` で解除する実機前提テスト（解除前にゲストから `wsl.exe` 経由で目印ファイルの読み取り・rw 共有への書き込み成功とホスト反映・ro 共有への書き込み拒否も検証する。REPAIR-12）。`src/wsl2/mount.rs` に残る「実機未検証」の前提（`mount -t drvfs` が virtiofs で成立すること・`nosuid,nodev,ro` の受理・9P フォールバック時の fstype）の確認入口。必要環境は実機の Windows 10 / 11（または Server）で WSL2 が有効、WSL2 ディストリが 1 つ以上あること。virtiofs を期待する場合は `.wslconfig` の `[wsl2]` に `virtiofs=true` を書き `wsl --shutdown` で反映済みであること（テストは `.wslconfig` に書き込まない）。Windows の管理者権限は不要（ゲスト内の操作は `--user root`）。GitHub ホステッドの windows runner では実行しない。環境変数は `FANDHE_CONTAINER_WSL_DISTRO`（必須。未設定は panic）・`FANDHE_CONTAINER_WSL_EXPECT_TRANSPORT`（`virtiofs`〔既定〕または `9p`。他の値は panic）・`FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 60。整数の秒で指定し、`MIN_WSL_TIMEOUT`〜`MAX_WSL_TIMEOUT`〔1〜300 秒〕の範囲外や非整数は panic）。virtiofs 有効時と無効時（9p）の 2 回を実行し、結果を PR または #377 に記録する。結果が出たら `src/wsl2/mount.rs` の「実機未検証」の記述を別 PR で更新する
 

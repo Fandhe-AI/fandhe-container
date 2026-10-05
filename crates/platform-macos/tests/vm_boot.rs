@@ -21,6 +21,7 @@ use fandhe_container_platform_macos::config::{
     DiskImagePath, MEMORY_ALIGNMENT_BYTES, MemorySize, SerialConsoleSink, VmConfigSpec,
     build_vz_configuration,
 };
+use fandhe_container_platform_macos::guest_mount::GuestMountPoint;
 use fandhe_container_platform_macos::virtiofs::{
     ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsSharesSpec, VirtiofsTag,
 };
@@ -181,6 +182,60 @@ fn mac1_build_vz_configuration_public_api_reads_back() {
     assert_eq!(devs[0].id, "root");
     assert_eq!(cfg.serial_port_count(), 1);
     assert!(log.exists());
+}
+
+/// MAC-1・TASK-65.3: ゲスト mount 指定があるのにシリアルコンソールが無い構成は、副作用の前に
+/// `config.guest_mount_requires_console` で拒否される。
+#[test]
+fn mac1_build_vz_configuration_rejects_guest_mount_without_console() {
+    let s = Scratch::new("mount-noconsole", false);
+    let kernel = s.file("vmlinux", b"dummy");
+    let share_dir = s.dir.join("share");
+    std::fs::create_dir(&share_dir).expect("create share dir");
+    let shares = VirtiofsSharesSpec::try_new(vec![
+        VirtiofsShareSpec::new(
+            VirtiofsTag::try_new("data").expect("tag"),
+            SharedDirectoryPath::try_new(&share_dir).expect("share dir"),
+            ShareAccess::ReadOnly,
+        )
+        .with_guest_mount(GuestMountPoint::try_new("/mnt/fandhe/data").expect("mount point")),
+    ])
+    .expect("shares");
+    let spec = VmConfigSpec::from_parts(&kernel, None, "console=hvc0")
+        .expect("spec")
+        .with_shared_directories(shares);
+    match build_vz_configuration(&spec) {
+        Err(e) => assert_eq!(e.code(), "config.guest_mount_requires_console"),
+        Ok(_) => panic!("expected guest_mount_requires_console"),
+    }
+}
+
+/// MAC-1・TASK-65.3: ゲスト mount 指定つきの共有は、実効コマンドラインに指示トークンが連結されて
+/// VZ の設定へ読み戻せる。
+#[test]
+fn mac1_build_vz_configuration_appends_guest_mount_directives() {
+    let s = Scratch::new("mount-cmdline", false);
+    let (spec, _log) = spec_with_console(&s);
+    let share_dir = s.dir.join("share");
+    std::fs::create_dir(&share_dir).expect("create share dir");
+    let shares = VirtiofsSharesSpec::try_new(vec![
+        VirtiofsShareSpec::new(
+            VirtiofsTag::try_new("data").expect("tag"),
+            SharedDirectoryPath::try_new(&share_dir).expect("share dir"),
+            ShareAccess::ReadWrite,
+        )
+        .with_guest_mount(GuestMountPoint::try_new("/mnt/fandhe/data").expect("mount point")),
+    ])
+    .expect("shares");
+    let spec = spec.with_shared_directories(shares);
+    let cfg = match build_vz_configuration(&spec) {
+        Ok(c) => c,
+        Err(e) => panic!("build failed: {e}"),
+    };
+    assert_eq!(
+        cfg.command_line().as_deref(),
+        Some("console=hvc0 fandhe.virtiofs=data:/mnt/fandhe/data:rw")
+    );
 }
 
 /// MAC-1・SEC-4・TASK-65.1: ReadOnly 共有にも共有範囲外経路の検査（symlink の範囲外リンク先・

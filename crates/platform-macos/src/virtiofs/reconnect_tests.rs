@@ -297,7 +297,7 @@ fn connection_loss_reconnects_without_resend() {
     assert!(logs[1].lock().expect("lock").is_empty());
     drop(logs);
 
-    // 呼び出し元がコミット単位を再発行すれば確定できる。
+    // 冪等な Write なら、呼び出し元がコミット単位を再発行して確定できる（非冪等は再発行不可）。
     let report = c.write_all_and_flush(&[b"a", b"b"]).expect("re-issue");
     assert_eq!(report.acked_writes, 2);
 }

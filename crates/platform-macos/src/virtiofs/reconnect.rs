@@ -15,10 +15,14 @@
 //!   永続化を保証せず（IO-2。`docs/api/io-barrier.md`）、サーバーは batch_size 到達時に自動フラッシュするため
 //!   一部だけ永続化されている可能性がある（暗黙 flush で FLUSH ACK を確認できた分は件数から除く）。黙って再送すると重複書き込みや欠落を招く。
 //!   再接続に成功しても失敗した操作は [`VirtiofsIoError::ConnectionLost`] で返し、`unflushed_writes` の
-//!   件数とともに呼び出し元へコミット単位（[`ReconnectingVirtiofsIoClient::write_all_and_flush`]）の再発行を委ねる。
+//!   件数とともに呼び出し元へ判断を委ねる。`unflushed_writes` は「永続化されたかもしれない件数の上限」であり、
+//!   どの `Write` が確定済みかは判別できない（重複排除用のコミット ID もワイヤー上に無い。未実装）。
+//!   したがって全件再発行が安全なのは各 `Write` が冪等（オフセット指定の上書き等）な場合に限る。
+//!   追記など非冪等な `Write` は、呼び出し元が読み戻し検証等で確定範囲を確認するまで再発行してはならない
+//!   （部分的に永続化済みの状態で全件再発行すると書き込みが重複する。IO-2）。
 //! - 接続断以外のエラー（タイムアウト・DataLoss・想定外 ACK）は元のエラーをそのまま返す。client が poison
 //!   されていれば次の呼び出しの冒頭で再接続する。その時点で未確定の `Write` が残っていれば、操作を実行せず
-//!   `ConnectionLost`（再接続成功）または件数付き `ReconnectFailed` で明示し、呼び出し元の再発行を求める。
+//!   `ConnectionLost`（再接続成功）または件数付き `ReconnectFailed` で明示し、呼び出し元の判断（冪等な Write のみ再発行可）を求める。
 //! - 最悪の総待ち時間は `max_attempts × connect_timeout + (max_attempts − 1) × interval` で有界
 //!   （既定 3×5s + 2×0.5s = 16s、上限値 10×10s + 9×10s = 190s。REPAIR-5）。無限リトライはしない。
 //! - 再接続のたびに [`VirtiofsIoClient::new`] を通すため、ReadOnly 共有の拒否（fail-closed）は毎回再検証される。
@@ -366,6 +370,9 @@ where
     }
 
     /// `bodies` を順に `write` し最後に `flush` するコミット単位。途中の切断は `ConnectionLost` で返す。
+    ///
+    /// 途中で一部の `Write` だけ永続化されて切断される場合があり、重複排除（コミット ID）は無い。
+    /// 失敗後の全件再発行は各 `body` が冪等な場合に限る（モジュール冒頭の契約参照。IO-2）。
     pub fn write_all_and_flush(
         &mut self,
         bodies: &[&[u8]],

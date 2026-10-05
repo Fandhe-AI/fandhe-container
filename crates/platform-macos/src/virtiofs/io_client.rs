@@ -129,7 +129,8 @@ pub enum VirtiofsIoError {
     /// in-flight 上限が `Flush` 用の予約枠を含めて足りない（[`MIN_IN_FLIGHT_LIMIT`] 未満）。
     InFlightLimitTooSmall { limit: usize },
     /// 接続断を検知した（TASK-65.5）。失敗した操作は再送されない。`unflushed_writes` は最後に成功した
-    /// `flush` 以降に送った `Write` の件数で、永続化の有無が不明なため呼び出し元がコミット単位で再発行する。
+    /// `flush` 以降に送った `Write` の件数で、一部が永続化済みかもしれない（確定範囲は判別不能）。
+    /// 再発行は各 `Write` が冪等な場合に限り安全で、非冪等な場合は呼び出し元が確定範囲を検証する（IO-2）。
     ConnectionLost {
         op: VirtiofsIoOp,
         unflushed_writes: u64,

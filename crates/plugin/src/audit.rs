@@ -32,8 +32,10 @@
 //!   ため、拒否件数・未出力の集約件数・キュー残存分を直接 [`default_audit_write_failures`] へ計上する。
 //! - stderr への書き込みが失敗した場合（閉じている・書けない）は失われた件数を
 //!   [`default_audit_write_failures`] へ数え、黙って消えない（呼び出し側が監視できる）。
-//! - 書き込みスレッドの出力は非同期のため、直後にプロセスが終了すると未出力の行は失われ得る。
-//!   確実に回収したい運用では、呼び出し側が [`JsonLinesPeerAuthObserver`] 等を渡す。
+//! - 拒否の通知ごとに、出力完了を最大 50ms（有界）待ってから戻る。通常は即時に完了するため、
+//!   拒否直後にプロセスが終了しても行は失われない。stderr が停滞している場合は待機が期限で
+//!   打ち切られ、未出力分は書き込みスレッドが後続で出力する（終了直前に確実に回収したい運用は
+//!   [`flush_default_audit`] を呼ぶか、[`JsonLinesPeerAuthObserver`] 等を渡す）。
 
 use crate::error::PluginErrorCode;
 use serde::Serialize;
@@ -50,6 +52,9 @@ pub const MAX_PEER_AUTH_AUDIT_LOG_BUFFER_BYTES: usize = 128 * 1024;
 
 /// 既定出力の書き込みキューの最大件数。
 pub const DEFAULT_AUDIT_QUEUE_CAPACITY: usize = 256;
+
+/// 既定 observer が拒否ごとに出力完了を待つ上限（REPAIR-5。停滞時もこの時間で戻る）。
+const DEFAULT_AUDIT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// 書き込みスレッドが未出力の集約件数を定期的に回収する間隔（次の行の到着に依存しない）。
 const AGGREGATE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
@@ -75,7 +80,8 @@ struct AuditSink {
     pending_dropped: Arc<AtomicU64>,
     /// 書き込み失敗で失われた件数の累計。
     write_failures: Arc<AtomicU64>,
-    /// キューに積まれ、書き込みスレッドが未受信の件数（スレッド停止時に失敗として回収する）。
+    /// キューに積まれ、書き込みスレッドが出力を終えていない件数（スレッド停止時に失敗として回収し、
+    /// `flush` が出力完了の判定に使う）。
     queued: Arc<AtomicU64>,
 }
 
@@ -101,11 +107,12 @@ impl AuditSink {
                 loop {
                     match rx.recv_timeout(AGGREGATE_FLUSH_INTERVAL) {
                         Ok(line) => {
-                            saturating_dec(&qd);
                             emit_aggregate(&mut out, &pd, &wf);
                             if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
                                 wf.fetch_add(1, Ordering::AcqRel);
                             }
+                            // 書き込み完了後に減らす（`flush` が「未出力 0 件」を判定できるように）。
+                            saturating_dec(&qd);
                         }
                         // 次の行を待たずに未出力の集約件数を回収する（SEC-4。送信側が
                         // あふれ後に拒否を受けなくても件数が出力される）。
@@ -122,6 +129,24 @@ impl AuditSink {
             pending_dropped,
             write_failures,
             queued,
+        }
+    }
+
+    /// 積まれた行と集約件数が出力されるまで、最大 `timeout` だけ待つ（SEC-4・REPAIR-5）。
+    /// 出力が済んだ（または出力経路が無く失敗計上済みの）場合は true、期限切れは false。
+    fn flush(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.tx.is_none()
+                || (self.queued.load(Ordering::Acquire) == 0
+                    && self.pending_dropped.load(Ordering::Acquire) == 0)
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -156,6 +181,14 @@ impl AuditSink {
 fn default_sink() -> &'static AuditSink {
     static SINK: OnceLock<AuditSink> = OnceLock::new();
     SINK.get_or_init(|| AuditSink::spawn(std::io::stderr(), DEFAULT_AUDIT_QUEUE_CAPACITY))
+}
+
+/// 既定出力の未出力イベントを最大 `timeout` だけ待って回収する（SEC-4・REPAIR-5）。
+///
+/// プロセス終了直前（都度起動モードの終了経路等）に呼ぶと、非同期の書き込みスレッドに積まれた
+/// 拒否イベントが失われない。期限内に出力できれば true、期限切れは false（有界。無限には待たない）。
+pub fn flush_default_audit(timeout: std::time::Duration) -> bool {
+    default_sink().flush(timeout)
 }
 
 /// 既定出力で stderr への書き込みに失敗し、失われた拒否イベントの累計件数（SEC-4）。
@@ -310,7 +343,11 @@ pub(crate) struct StderrPeerAuthObserver;
 
 impl PeerAuthObserver for StderrPeerAuthObserver {
     fn on_rejection(&mut self, event: &PeerAuthRejection<'_>) {
-        default_sink().submit(event.to_json_line());
+        let sink = default_sink();
+        sink.submit(event.to_json_line());
+        // 拒否の直後にプロセスが終了しても行が失われないよう、有界で出力完了を待つ（SEC-4）。
+        // 拒否は稀な経路で、通常は即時に完了する。stderr 停滞時も最大 DEFAULT_AUDIT_FLUSH_TIMEOUT で戻る。
+        let _ = sink.flush(DEFAULT_AUDIT_FLUSH_TIMEOUT);
     }
 }
 
@@ -552,6 +589,23 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
+    }
+
+    /// SEC-4: flush は出力完了まで待ち、完了後は行が書かれている。停滞時は期限で false を返す。
+    #[test]
+    fn sec4_flush_waits_for_written_line_and_is_bounded() {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = AuditSink::spawn(Shared(Arc::clone(&buf)), 4);
+        sink.submit("last".into());
+        assert!(sink.flush(std::time::Duration::from_secs(5)));
+        assert_eq!(String::from_utf8_lossy(&buf.lock().unwrap()), "last\n");
+
+        let (_gate, rx) = std::sync::mpsc::channel::<()>();
+        let stalled = AuditSink::spawn(Blocked(rx), 4);
+        stalled.submit("x".into());
+        let start = std::time::Instant::now();
+        assert!(!stalled.flush(std::time::Duration::from_millis(30)));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
     /// SEC-4: 書き込みスレッド不在のときは件数が失敗累計へ計上される。

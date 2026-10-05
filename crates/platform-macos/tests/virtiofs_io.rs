@@ -456,6 +456,13 @@ fn boot_and_probe(tag: &str) -> ProbeOutcome {
     if let Ok(bytes) = std::fs::read(&log_path) {
         last = bytes;
     }
+    // done 検出後〜停止までにゲスト出力が上限へ達すると、done の後の重複報告・エラーが破棄される。
+    // 停止後に読み直したログでも打ち切りを拒否する（fail-closed）。
+    assert!(
+        !log_truncated(&last),
+        "console log hit the size limit after the probe done line; later guest output was lost; console tail:\n{}",
+        tail_lossy(&last, 4096)
+    );
     let write_check = verify_write(&fixture.share_dir);
     ProbeOutcome {
         log: parse_probe_log(&String::from_utf8_lossy(&last)),

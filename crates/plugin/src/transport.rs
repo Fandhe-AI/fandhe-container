@@ -1252,6 +1252,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::audit::{PeerAuthOp, PeerAuthRejectReason, PeerAuthRejection};
 
     /// 相手側の生 socket と、検証を経ずに包んだ `UdsStream` の対を作る。
@@ -1490,9 +1491,11 @@ mod tests {
     }
 
     /// 拒否イベントを所有コピーで積むテスト用の受け手。
+    #[cfg(unix)]
     #[derive(Default)]
     struct Recorder(Vec<RecordedRejection>);
 
+    #[cfg(unix)]
     #[derive(Debug, PartialEq, Eq)]
     struct RecordedRejection {
         op: PeerAuthOp,
@@ -1505,6 +1508,7 @@ mod tests {
         socket_path: std::path::PathBuf,
     }
 
+    #[cfg(unix)]
     impl PeerAuthObserver for Recorder {
         fn on_rejection(&mut self, e: &PeerAuthRejection<'_>) {
             self.0.push(RecordedRejection {
@@ -1532,6 +1536,7 @@ mod tests {
         (l, dir)
     }
 
+    #[cfg(unix)]
     fn rejection(
         op: PeerAuthOp,
         reason: PeerAuthRejectReason,

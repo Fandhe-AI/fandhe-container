@@ -21,6 +21,9 @@
 //!   `mode_t` の幅・`AT_SYMLINK_NOFOLLOW` の値を持たないため `fchmodat` を呼ばず `Unsupported`（fail-closed。#1308）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `mkdirat(2)` を検証済みディレクトリ fd 基準で呼ぶ（runtime directory の作成。PLUG-12・#1309）
 //! - いずれの unix: `unlinkat(2)` を検証済みディレクトリ fd 基準で呼ぶ（OS 依存の型・定数を使わず flags は 0 固定。PLUG-12）
+//! - いずれの unix（対応 OS・アーキテクチャ）: `fdopendir(3)`・`readdir(3)`・`closedir(3)` で、検証済みディレクトリ fd 基準
+//!   （`openat(dir, ".")`）にカーネルのディレクトリ位置（`lseek(2)`。std の `Seek`）から名前を列挙する
+//!   （都度起動の残骸掃除の再開可能な列挙。#1310・PLUG-7・REPAIR-5。[`DirStream`]）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_NOFOLLOW | O_DIRECTORY)` で配置ディレクトリを
 //!   ルートから 1 要素ずつ辿る（祖先要素の symlink を拒否。PLUG-12）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_CREAT | O_NOFOLLOW)` で bind ロックファイルを開く
@@ -42,7 +45,7 @@
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 //! - OS ごとに値・幅が異なる定数・型（`ModeT`・`AT_SYMLINK_NOFOLLOW`・`O_*` 等）は対応 OS ごとに個別定義し、
@@ -631,10 +634,95 @@ pub(crate) struct LockHandle {
     pub created: bool,
 }
 
+/// ロックファイルの開き方（PLUG-12・#1310）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockOpen {
+    /// bind 用。無ければ作成する。自分が作成した直後に他者が先にロックを取っていた場合は、期限つきで
+    /// 解放を待つ（[`lock_file_at`] の「作成直後の競合」参照）。
+    Bind,
+    /// 無ければ作成する。他者が保持中なら待たずに `WouldBlock`（掃除の走査位置ヒント用）。
+    Create,
+    /// 既存のファイルだけを開く（作成しない）。無ければ `NotFound`（掃除用。掃除が、消えた残骸の
+    /// 名前でロックファイルを作り直して bind と競合しないようにする）。
+    Existing,
+}
+
+/// [`lock_file_at`] の失敗（PLUG-12・#1310）。「`flock` を試みて他者が保持中だった」と「`flock` を
+/// 試みる前に open の競合が続いた」を型で区別する。前者だけが「この配置先で `flock` の衝突を検出
+/// できた」証拠になる（`uds_security` の排他の確認が使う）。bind にとってはどちらも「使用中」。
+#[derive(Debug)]
+pub(crate) enum LockError {
+    /// `flock` を試み、他者が保持中だった（`try_lock` が `WouldBlock`）。
+    Held,
+    /// 作成（`O_EXCL`）が `EEXIST`、既存を開くと `ENOENT` という競合が上限まで続いた。`flock` は
+    /// 一度も試していない。待ち続けないための打ち切りで、使用中として扱う（REPAIR-5）。
+    OpenContended,
+    /// それ以外の失敗（開けない・通常ファイルでない・ロック非対応・未対応 OS 等）。
+    Io(io::Error),
+}
+
+impl From<io::Error> for LockError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// 自分が作成した直後のロックファイルを他者が先にロックしていた場合に、解放を待つ回数と間隔
+/// （[`lock_file_at`] の呼び出し 1 回につき合計 100 ms。REPAIR-5 の有限な待ち）。相手になるのは作成と
+/// `flock` の間に割り込んだ掃除で、保持は 1 候補の判定の間だけなので通常は 1 回目の待ちで解放される。
+/// 呼び出し側（`uds_security::acquire_bind_lock`）は、名前から外れた inode を掴むたびに作り直して
+/// 本関数を呼び直す（上限 8 回）ため、bind 1 回の待ちは最悪で 8 回 × 100 ms（約 0.8 秒）になる。
+/// 呼び出し側の期限（`call_once` の合計期限等）とは連動しない。
+const CREATED_LOCK_WAIT_ATTEMPTS: u32 = 100;
+const CREATED_LOCK_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// テスト専用。[`lock_file_at`] が新規作成（`O_EXCL`）してから `flock` を取るまでの間に処理を差し込み、
+/// 別プロセスの割り込み（掃除が先にロックを取る）を決定的に再現する（PLUG-12・#1310）。
+#[cfg(test)]
+pub(crate) mod lock_test_hook {
+    use std::cell::RefCell;
+    use std::ffi::CStr;
+    use std::fs::File;
+
+    type Hook = Box<dyn FnOnce(&File, &CStr)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static CONTENDED_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// 呼び出しスレッドの以降 `n` 回の「作成 → 既存を開く」の試行を、競合（作成は `EEXIST`、既存を
+    /// 開くと `ENOENT`）で失敗したものとして扱わせる（実際には開かない）。
+    pub(crate) fn contend_opens(n: usize) {
+        CONTENDED_OPENS.with(|c| c.set(n));
+    }
+
+    pub(super) fn take_contended_open() -> bool {
+        CONTENDED_OPENS.with(|c| {
+            let left = c.get();
+            c.set(left.saturating_sub(1));
+            left > 0
+        })
+    }
+
+    /// 呼び出しスレッドの次の新規作成 1 回だけに `hook` を差し込む。
+    pub(crate) fn set(hook: impl FnOnce(&File, &CStr) + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run(dir: &File, name: &CStr) {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(dir, name);
+        }
+    }
+}
+
 /// `dir` 基準で `name` のロックファイルを `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`・0600 で開き
-/// （無ければ作成）、非ブロッキングで排他ロックを取る。`O_NONBLOCK` は、既存の名前が FIFO・デバイス
+/// （`mode` に応じて無ければ作成）、非ブロッキングで排他ロックを取る。`O_NONBLOCK` は、既存の名前が FIFO・デバイス
 /// 等だった場合に open が相手を待って止まらないようにするため（通常ファイルの読み書きには影響しない。
-/// REPAIR-5）。開いた fd が通常ファイルでなければロックせず `PermissionDenied`。他者が保持中なら `WouldBlock`。listener の生存判定に接続 probe を
+/// REPAIR-5）。開いた fd が通常ファイルでなければロックせず `PermissionDenied`。他者が保持中なら
+/// [`LockError::Held`]、ロックを試みる前の open の競合が続いた場合は [`LockError::OpenContended`]。listener の生存判定に接続 probe を
 /// 使わず、「ロックを取れる＝以前の保持者は消えた」で stale を判定するための基盤（既存 listener の
 /// accept queue に副作用を与えない。PLUG-12）。未対応の OS・アーキテクチャは `Unsupported`。
 ///
@@ -643,7 +731,20 @@ pub(crate) struct LockHandle {
 /// 同じくロック fd も継承する（どちらも `O_CLOEXEC` で exec 時に閉じる）。子が両方を持ち続ける間は
 /// socket も実際に接続可能なので、ロック保持＝listener 生存という対応は fork をまたいでも崩れない。
 /// そのため fork 時に子側のロックだけを外す仕組み（`pthread_atfork` 等）は持たない。
-pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
+///
+/// # 作成直後の競合（#1310）
+/// 作成（`O_EXCL`）と `flock` は別の操作で、その間に別プロセスの掃除（`uds_security` の都度起動の残骸
+/// 掃除）が同じ名前を開いて先にロックを取りうる。[`LockOpen::Bind`] では、自分が作成したファイルで
+/// `WouldBlock` になった場合に限り、[`CREATED_LOCK_WAIT_ATTEMPTS`] 回まで待って取り直す。待たないと、
+/// 正当な bind が掃除との競合だけで「使用中」として失敗する。掃除は判定後に空のロックファイルを
+/// unlink するので、待って取れたロックは名前から外れた inode のものでありうる。その確認と作り直しは
+/// 呼び出し側（`acquire_bind_lock` の `names_open_file`）が行う。既存ファイルを開いた場合は待たない
+/// （保持者は生存中の listener でありうる）。
+pub(crate) fn lock_file_at(
+    dir: &File,
+    name: &CStr,
+    mode: LockOpen,
+) -> Result<LockHandle, LockError> {
     #[cfg(any(
         target_os = "macos",
         all(
@@ -672,10 +773,20 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
         };
         // 新規作成（O_EXCL）を試し、既にあれば O_CREAT なしで既存を開く。その間に保持者が解放時の
         // unlink をした場合は ENOENT になるため、上限つきで最初からやり直す（`created` を正確に保つ。
-        // 上限まで競合し続けた場合は使用中＝`WouldBlock` として返し、待ち続けない。REPAIR-5）。
+        // 上限まで競合し続けた場合は `OpenContended` を返し、待ち続けない。REPAIR-5）。
         const OPEN_ATTEMPTS: usize = 8;
         let mut opened = None;
+        if mode == LockOpen::Existing {
+            opened = Some((open(O_RDWR)?, false));
+        }
         for _ in 0..OPEN_ATTEMPTS {
+            if opened.is_some() {
+                break;
+            }
+            #[cfg(test)]
+            if lock_test_hook::take_contended_open() {
+                continue;
+            }
             match open(O_RDWR | O_CREAT | O_EXCL) {
                 Ok(f) => {
                     opened = Some((f, true));
@@ -687,25 +798,39 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 },
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
         let Some((file, created)) = opened else {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            return Err(LockError::OpenContended);
         };
         // 通常ファイル以外（FIFO・デバイス等）はロックを試みる前に拒否する（flock 自体が失敗して
         // 理由が分からなくなる OS があるため。内容にも触れない）。
         if !file.metadata()?.is_file() {
-            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied).into());
         }
-        match file.try_lock() {
-            Ok(()) => Ok(LockHandle { file, created }),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                Err(io::Error::from(io::ErrorKind::WouldBlock))
+        #[cfg(test)]
+        if created {
+            lock_test_hook::run(dir, name);
+        }
+        // 自分が作成した直後に他者（掃除）が先にロックを取っていた場合だけ、期限つきで待つ。
+        let mut waits_left = if created && mode == LockOpen::Bind {
+            CREATED_LOCK_WAIT_ATTEMPTS
+        } else {
+            0
+        };
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(LockHandle { file, created }),
+                Err(std::fs::TryLockError::WouldBlock) if waits_left > 0 => {
+                    waits_left -= 1;
+                    std::thread::sleep(CREATED_LOCK_WAIT_INTERVAL);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Err(LockError::Held),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
             }
-            Err(std::fs::TryLockError::Error(e)) => Err(e),
         }
     }
     #[cfg(not(any(
@@ -716,8 +841,8 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
         )
     )))]
     {
-        let _ = (dir, name);
-        Err(io::Error::from(io::ErrorKind::Unsupported))
+        let _ = (dir, name, mode);
+        Err(io::Error::from(io::ErrorKind::Unsupported).into())
     }
 }
 
@@ -767,6 +892,215 @@ pub(crate) fn unlinkat(dir: &File, name: &CStr) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+/// `fdopendir(3)`・`readdir(3)`・`closedir(3)` と errno 取得の宣言、`struct dirent` の `d_name` の位置
+/// （#1310。`crates/io/src/sys.rs` の `for_each_dir_entry` と同じ流儀。本 crate は io crate に依存しない
+/// ため宣言を個別に持つ）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+mod dir_abi {
+    use core::ffi::c_void;
+
+    /// Linux（LP64。glibc・musl）の `struct dirent`: `d_ino`(8)・`d_off`(8)・`d_reclen`(2)・`d_type`(1) の
+    /// 直後が `d_name`。x86_64・aarch64 で同一（`man 3 readdir`）。
+    #[cfg(target_os = "linux")]
+    pub(super) const DIRENT_NAME_OFFSET: usize = 19;
+    /// macOS（64 bit inode 版）の `struct dirent`: `d_ino`(8)・`d_seekoff`(8)・`d_reclen`(2)・
+    /// `d_namlen`(2)・`d_type`(1) の直後が `d_name`（macOS SDK の `sys/dirent.h`）。
+    #[cfg(target_os = "macos")]
+    pub(super) const DIRENT_NAME_OFFSET: usize = 21;
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の `DIR *fdopendir(int fd)`・
+        // `struct dirent *readdir(DIR *)`・`int closedir(DIR *)`。DIR は不透明ポインタ（`*mut c_void`）、
+        // dirent は先頭バイトへのポインタとして扱い、`d_name` だけを固定オフセットで読む。macOS の
+        // x86_64 は 64 bit inode 版の DIR / dirent を扱うシンボル（`$INODE64`）を fdopendir・readdir で
+        // 揃える（混在させると DIR のレイアウトが食い違う。closedir は版を持たない）。arm64 の macOS は
+        // 64 bit inode 版のみのため接尾辞を付けない。
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "fdopendir$INODE64"
+        )]
+        pub(super) fn fdopendir(fd: i32) -> *mut c_void;
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "readdir$INODE64"
+        )]
+        pub(super) fn readdir(dir: *mut c_void) -> *mut u8;
+        pub(super) fn closedir(dir: *mut c_void) -> i32;
+        // SAFETY（宣言そのものの妥当性）: スレッドローカルな errno へのポインタを返す
+        // （glibc・musl は `__errno_location`、macOS は `__error`。引数なし）。
+        #[cfg(target_os = "linux")]
+        pub(super) fn __errno_location() -> *mut i32;
+        #[cfg(target_os = "macos")]
+        pub(super) fn __error() -> *mut i32;
+    }
+}
+
+/// 検証済みディレクトリ fd 基準で、指定したカーネルのディレクトリ位置から名前を順に読むストリーム
+/// （#1310・PLUG-7・PLUG-12・REPAIR-5）。
+///
+/// `uds_security` の都度起動の残骸掃除が、1 回の読み取り数を上限内に保ったまま前回の続きから列挙する
+/// ために使う。パスを再解決せず `openat(dir, ".")` で開き直すため、列挙対象は検証済みディレクトリそのもの
+/// である（`dir` の fd とは別の open file description なので、`dir` の読み取り位置は変えない）。
+///
+/// 位置は `lseek(2)` で設定・取得するカーネルのディレクトリ offset（不透明な値）で、件数ではない。
+/// POSIX は `fdopendir` が「呼び出し時点の fd の file offset から」エントリを返すと定める。`telldir(3)` の
+/// 値は使わない（macOS では `DIR` ごとの表の添字で、プロセスをまたいで使えない）。libc は複数エントリを
+/// まとめて読むため、[`DirStream::position`] が返すのは「libc が最後にまとめ読みした直後」の位置である
+/// （消費済みエントリの直後とは限らない）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+pub(crate) struct DirStream {
+    /// `fdopendir` が返した `DIR *`（drop の `closedir` まで有効。読み取り用 fd の所有権を持つ）。
+    handle: *mut core::ffi::c_void,
+    /// `handle` の fd を dup したもの（同じ open file description。位置の取得だけに使う）。
+    position: File,
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+impl DirStream {
+    /// `dir` を開き直し、カーネルのディレクトリ位置 `offset`（0 は先頭）から読むストリームを返す。
+    /// `offset` が不正で `lseek` が失敗した場合は `Err`（呼び出し側が先頭からやり直す）。
+    pub(crate) fn open_at(dir: &File, offset: u64) -> io::Result<Self> {
+        use std::io::{Seek, SeekFrom};
+        use std::os::unix::io::IntoRawFd;
+        let file = openat_dir_nofollow(dir.as_raw_fd(), c".")?;
+        (&file).seek(SeekFrom::Start(offset))?;
+        let position = file.try_clone()?;
+        let fd = file.into_raw_fd();
+        // SAFETY: `fd` は直前に `into_raw_fd` で取り出した有効なディレクトリ fd で、他に所有者がいない。
+        // 成功すれば所有権は DIR へ移り、drop の closedir で閉じられる。
+        let handle = unsafe { dir_abi::fdopendir(fd) };
+        if handle.is_null() {
+            let err = io::Error::last_os_error();
+            // SAFETY: fdopendir が失敗したとき fd の所有権は移らないため、唯一の所有者である
+            // 本関数がここで閉じる（`fd` は上で取り出した有効な fd）。
+            drop(unsafe { File::from_raw_fd(fd) });
+            return Err(err);
+        }
+        Ok(Self { handle, position })
+    }
+
+    /// 次のエントリ（`.`・`..` を除く）の名前を `visit` へ渡し、その戻り値を返す。末尾なら `Ok(None)`。
+    /// 名前は次の読み取りまでしか有効でない借用のため、`visit` の外へ持ち出すなら複製する。
+    pub(crate) fn next_entry<R>(
+        &mut self,
+        visit: impl FnOnce(&[u8]) -> R,
+    ) -> io::Result<Option<R>> {
+        loop {
+            // 末尾（NULL・errno 変化なし）とエラー（NULL・errno 設定）を区別するため errno を 0 にする。
+            // SAFETY: errno へのポインタは呼び出しスレッドのスレッドローカル領域を指し、常に有効。
+            #[cfg(target_os = "linux")]
+            unsafe {
+                *dir_abi::__errno_location() = 0;
+            }
+            // SAFETY: 同上（macOS の errno アクセサ）。
+            #[cfg(target_os = "macos")]
+            unsafe {
+                *dir_abi::__error() = 0;
+            }
+            // SAFETY: `self.handle` は `open_at` で得た closedir 前の有効な DIR*。`&mut self` により
+            // 同じ DIR* への並行した readdir は起きない。
+            let entry = unsafe { dir_abi::readdir(self.handle) };
+            if entry.is_null() {
+                let err = io::Error::last_os_error();
+                return match err.raw_os_error() {
+                    Some(0) | None => Ok(None),
+                    Some(_) => Err(err),
+                };
+            }
+            // SAFETY: 返った dirent は次の readdir / closedir まで有効。`d_name` は
+            // `DIRENT_NAME_OFFSET` から始まり、libc が構造体の範囲内での NUL 終端を保証する。
+            // 得た借用は本ループ内（次の readdir より前）でしか使わない。
+            let name =
+                unsafe { CStr::from_ptr(entry.add(dir_abi::DIRENT_NAME_OFFSET).cast()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            return Ok(Some(visit(name)));
+        }
+    }
+
+    /// カーネルのディレクトリ位置（libc が最後にまとめ読みした直後の位置）を返す。この値を
+    /// [`DirStream::open_at`] へ渡すと、まだ libc が読んでいない続きから読める。
+    /// libc はまとめ読みを先に済ませることがあるため（macOS の `fdopendir` は開いた時点で最初の分を読む）、
+    /// 開いた直後の値が `open_at` に渡した位置と同じとは限らない。まとめ読みの大きさも一定ではない
+    /// （macOS は開いた直後の 1 回が小さい）。
+    pub(crate) fn position(&self) -> io::Result<u64> {
+        use std::io::Seek;
+        let mut file = &self.position;
+        file.stream_position()
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+impl Drop for DirStream {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` は `open_at` で得た有効な DIR* で、drop 以降は使わない。DIR が所有する
+        // fd もここで閉じられる（`position` は別の fd で、フィールドの drop が閉じる）。
+        unsafe { dir_abi::closedir(self.handle) };
+    }
+}
+
+/// 対応外の OS・アーキテクチャ向け（fail-closed）。dirent の配置を持たないため列挙せず、
+/// 常に `Unsupported` を返す。
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+pub(crate) struct DirStream(());
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+impl DirStream {
+    pub(crate) fn open_at(dir: &File, offset: u64) -> io::Result<Self> {
+        let _ = (dir, offset);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn next_entry<R>(
+        &mut self,
+        visit: impl FnOnce(&[u8]) -> R,
+    ) -> io::Result<Option<R>> {
+        let _ = visit;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn position(&self) -> io::Result<u64> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
 
@@ -1603,6 +1937,99 @@ pub(crate) fn resident_size_bytes(pid: u32) -> io::Result<u64> {
     // SAFETY: 戻り値が構造体サイズと一致したため、カーネルが全フィールドを書き込み済み。
     let info = unsafe { info.assume_init() };
     Ok(info.pti_resident_size)
+}
+
+/// `DirStream` の照合（対応 OS・アーキテクチャ共通。macOS の経路は macOS の CI が実行する）。
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod dir_stream_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("fc-dirs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// PLUG-7・PLUG-12（#1310）: `DirStream` は検証済みディレクトリ fd 基準で `.`・`..` を除く名前を
+    /// すべて返し、末尾まで読んだ後のカーネル位置から開き直すと何も返さない（続きから読める）。
+    #[test]
+    fn plug7_dir_stream_lists_names_and_resumes_at_kernel_position() {
+        let d = tmpdir("list");
+        for n in ["a", "b", "c"] {
+            std::fs::write(d.join(n), b"").unwrap();
+        }
+        let dir = open_dir_nofollow(&d.canonicalize().unwrap()).unwrap();
+        let mut stream = DirStream::open_at(&dir, 0).unwrap();
+        let mut names = Vec::new();
+        while let Some(n) = stream.next_entry(<[u8]>::to_vec).unwrap() {
+            names.push(String::from_utf8(n).unwrap());
+        }
+        names.sort();
+        assert_eq!(names, ["a", "b", "c"]);
+        let end = stream.position().unwrap();
+        assert_ne!(end, 0);
+        let mut rest = DirStream::open_at(&dir, end).unwrap();
+        assert_eq!(rest.next_entry(<[u8]>::to_vec).unwrap(), None);
+        // 開き直しは別の open file description なので、`dir` 自身の読み取り位置は変わらない。
+        let mut again = DirStream::open_at(&dir, 0).unwrap();
+        let mut count = 0;
+        while again.next_entry(|_| ()).unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// PLUG-7・REPAIR-5（#1310）: libc のまとめ読みの境界で得たカーネル位置から開き直すと、その境界より
+    /// 後ろのエントリだけが返る（手前を読み直さずに続きから読める）。3,000 件のディレクトリで、2 つ目の
+    /// まとめ読みの境界から読んだ件数が「全件 - 境界より手前の件数」に一致することを確かめる。
+    #[test]
+    fn plug7_dir_stream_resumes_from_batch_boundary() {
+        const TOTAL: usize = 3_000;
+        let d = tmpdir("resume");
+        for i in 0..TOTAL {
+            std::fs::write(d.join(format!("entry-{i:04}")), b"").unwrap();
+        }
+        let dir = open_dir_nofollow(&d.canonicalize().unwrap()).unwrap();
+        let mut stream = DirStream::open_at(&dir, 0).unwrap();
+        // (まとめ読みを始めた位置, その先頭エントリの通し番号)
+        let mut batches: Vec<(u64, usize)> = Vec::new();
+        let mut pos = 0u64;
+        let mut total = 0usize;
+        while stream.next_entry(|_| ()).unwrap().is_some() {
+            let now = stream.position().unwrap();
+            if now != pos {
+                batches.push((pos, total));
+                pos = now;
+            }
+            total += 1;
+        }
+        assert_eq!(total, TOTAL);
+        assert!(batches.len() >= 2, "batches={batches:?}");
+        let (offset, before) = batches[1];
+        let mut rest = DirStream::open_at(&dir, offset).unwrap();
+        let mut remaining = 0usize;
+        while rest.next_entry(|_| ()).unwrap().is_some() {
+            remaining += 1;
+        }
+        assert_eq!(
+            remaining,
+            TOTAL - before,
+            "offset={offset} before={before} batches={:?}",
+            &batches[..batches.len().min(6)]
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }
 
 /// PLUG-12・#1308: Linux・macOS 以外の OS 向けに他 OS の値を流用した仮置きの `const` / `type` を

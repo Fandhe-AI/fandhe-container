@@ -769,6 +769,8 @@ fn call_once_inner(
         return (Err(timeout_error()), OneShotStderr::empty());
     };
 
+    // 異常終了で残るこの名前の socket とロックファイルは、runtime directory の初期化時に掃除される
+    // （`RuntimeDir::sweep_one_shot_leftovers`。#1310）。呼び出しごとの列挙で境界レイテンシを増やさない。
     let name = format!(
         "oneshot-{}-{}.sock",
         std::process::id(),

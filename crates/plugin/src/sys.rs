@@ -920,6 +920,9 @@ impl DirStream {
 
     /// カーネルのディレクトリ位置（libc が最後にまとめ読みした直後の位置）を返す。この値を
     /// [`DirStream::open_at`] へ渡すと、まだ libc が読んでいない続きから読める。
+    /// libc はまとめ読みを先に済ませることがあるため（macOS の `fdopendir` は開いた時点で最初の分を読む）、
+    /// 開いた直後の値が `open_at` に渡した位置と同じとは限らない。まとめ読みの大きさも一定ではない
+    /// （macOS は開いた直後の 1 回が小さい）。
     pub(crate) fn position(&self) -> io::Result<u64> {
         use std::io::Seek;
         let mut file = &self.position;
@@ -1845,7 +1848,6 @@ mod dir_stream_tests {
         }
         let dir = open_dir_nofollow(&d.canonicalize().unwrap()).unwrap();
         let mut stream = DirStream::open_at(&dir, 0).unwrap();
-        assert_eq!(stream.position().unwrap(), 0);
         let mut names = Vec::new();
         while let Some(n) = stream.next_entry(<[u8]>::to_vec).unwrap() {
             names.push(String::from_utf8(n).unwrap());

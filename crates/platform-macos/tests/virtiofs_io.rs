@@ -280,10 +280,13 @@ fn log_truncated(bytes: &[u8]) -> bool {
 /// ログ全体を畳み込む。プローブ契約（AGENTS.md「最後に done」）に従い、次を `invalid`
 /// （fail-closed）とする: op ごとの重複報告・done の重複・done 以降の後続報告・
 /// read / readdir / write の全報告が揃う前の done・名前空間を持つが復号できない行（done の前後とも）。
-fn parse_probe_log(text: &str) -> ProbeLog {
+///
+/// ログは生バイトのまま `\n` で行に分割する（lossy 変換すると非 UTF-8 のプローブ行が置換文字で
+/// 受理されてしまうため）。行末の `\r` は `parse_probe_line` が除く。
+fn parse_probe_log(log: impl AsRef<[u8]>) -> ProbeLog {
     let mut out = ProbeLog::default();
-    for line in text.lines() {
-        let item = match parse_probe_line(line.as_bytes()) {
+    for line in log.as_ref().split(|b| *b == b'\n') {
+        let item = match parse_probe_line(line) {
             ProbeLine::Other => continue,
             ProbeLine::Malformed => {
                 out.invalid = true;
@@ -459,7 +462,7 @@ fn boot_and_probe(tag: &str) -> ProbeOutcome {
         if let Ok(bytes) = std::fs::read(&log_path) {
             last = bytes;
         }
-        if parse_probe_log(&String::from_utf8_lossy(&last)).done {
+        if parse_probe_log(&last).done {
             break;
         }
         if log_truncated(&last) {
@@ -494,7 +497,7 @@ fn boot_and_probe(tag: &str) -> ProbeOutcome {
     );
     let write_check = verify_write(&fixture.share_dir);
     ProbeOutcome {
-        log: parse_probe_log(&String::from_utf8_lossy(&last)),
+        log: parse_probe_log(&last),
         console_tail: tail_lossy(&last, 4096),
         write_check,
         fixture,
@@ -603,14 +606,14 @@ fn mac1_io5_parse_probe_line_cases() {
 #[test]
 fn mac1_io5_parse_probe_log_rejects_duplicate_or_conflicting_reports() {
     let pre = PROBE_PREFIX;
-    let ok = parse_probe_log(&format!(
+    let ok = parse_probe_log(format!(
         "kernel noise\n{pre}op=read value=t\n{pre}op=readdir entries=a\n{pre}op=write result=done\n{pre}done\n"
     ));
     assert_eq!(ok.read.as_deref(), Some("t"));
     assert!(ok.write_done && ok.done && !ok.invalid);
-    let dup = parse_probe_log(&format!("{pre}op=read value=t\n{pre}op=read value=u\n"));
+    let dup = parse_probe_log(format!("{pre}op=read value=t\n{pre}op=read value=u\n"));
     assert!(dup.invalid);
-    let dup_w = parse_probe_log(&format!(
+    let dup_w = parse_probe_log(format!(
         "{pre}op=write result=done\n{pre}op=write result=done\n"
     ));
     assert!(dup_w.invalid);
@@ -623,19 +626,19 @@ fn mac1_io5_parse_probe_log_requires_done_last_and_complete() {
     let body =
         format!("{pre}op=read value=t\n{pre}op=readdir entries=a\n{pre}op=write result=done\n");
     // 全 op の報告後に done が 1 回だけなら有効。
-    let ok = parse_probe_log(&format!("{body}{pre}done\n"));
+    let ok = parse_probe_log(format!("{body}{pre}done\n"));
     assert!(ok.done && !ok.invalid);
     // 失敗報告も「報告済み」として数える。
-    let err = parse_probe_log(&format!(
+    let err = parse_probe_log(format!(
         "{pre}op=read result=error\n{pre}op=readdir result=error\n{pre}op=write result=error\n{pre}done\n"
     ));
     assert!(err.done && !err.invalid);
     // 失敗報告の重複、および成功と失敗の混在も同じ op の重複として不正。
-    let dup_err = parse_probe_log(&format!(
+    let dup_err = parse_probe_log(format!(
         "{pre}op=read result=error\n{pre}op=read result=error\n"
     ));
     assert!(dup_err.invalid);
-    let mixed = parse_probe_log(&format!(
+    let mixed = parse_probe_log(format!(
         "{pre}op=write result=done\n{pre}op=write result=error\n"
     ));
     assert!(mixed.invalid);
@@ -645,13 +648,13 @@ fn mac1_io5_parse_probe_log_requires_done_last_and_complete() {
     assert!(log_truncated(&cut));
     assert!(!log_truncated(b"noise"));
     // 早過ぎる done。
-    let early = parse_probe_log(&format!("{pre}op=read value=t\n{pre}done\n"));
+    let early = parse_probe_log(format!("{pre}op=read value=t\n{pre}done\n"));
     assert!(early.done && early.invalid);
     // done の重複。
-    let dup = parse_probe_log(&format!("{body}{pre}done\n{pre}done\n"));
+    let dup = parse_probe_log(format!("{body}{pre}done\n{pre}done\n"));
     assert!(dup.invalid);
     // done 以降の後続報告（エラー含む）。
-    let late = parse_probe_log(&format!("{body}{pre}done\n{pre}op=write result=error\n"));
+    let late = parse_probe_log(format!("{body}{pre}done\n{pre}op=write result=error\n"));
     assert!(late.invalid);
 }
 
@@ -662,7 +665,7 @@ fn mac1_io5_parse_probe_log_rejects_malformed_probe_lines() {
     let body =
         format!("{pre}op=read value=t\n{pre}op=readdir entries=a\n{pre}op=write result=done\n");
     // 名前空間を持たない行は混ざっても有効のまま。
-    let noise = parse_probe_log(&format!(
+    let noise = parse_probe_log(format!(
         "[    0.1] boot\n{body}random output\n{pre}done\nreboot: Power down\n"
     ));
     assert_eq!(noise.read.as_deref(), Some("t"));
@@ -674,12 +677,31 @@ fn mac1_io5_parse_probe_log_rejects_malformed_probe_lines() {
         format!("{pre}op=read value="),
         "fandhe-guest-test: virtiofs-io v2 done".to_string(),
     ] {
-        let log = parse_probe_log(&format!("{body}{pre}done\n{late}\n"));
+        let log = parse_probe_log(format!("{body}{pre}done\n{late}\n"));
         assert!(log.done && log.invalid, "after done: {late}");
     }
     // done の前に現れた形式崩れも、他の報告が揃っていても不正。
-    let early = parse_probe_log(&format!("{pre}op=write result=ok\n{body}{pre}done\n"));
+    let early = parse_probe_log(format!("{pre}op=write result=ok\n{body}{pre}done\n"));
     assert!(early.done && early.write_done && early.invalid);
+    // 非 UTF-8 の値を持つプローブ行は生バイトのまま判定し、置換文字で受理しない。
+    let mut raw = format!("{pre}op=read value=t").into_bytes();
+    raw.push(0xff);
+    raw.extend_from_slice(
+        format!("\n{pre}op=readdir entries=a\n{pre}op=write result=done\n{pre}done\n").as_bytes(),
+    );
+    let bad = parse_probe_log(&raw);
+    assert_eq!(bad.read, None);
+    assert!(bad.done && bad.invalid);
+    // 非 UTF-8 のカーネル出力（名前空間を持たない行）は無視し、CRLF の行も受理する。
+    let mut crlf = vec![0xff, 0xfe, b'\n'];
+    crlf.extend_from_slice(
+        format!("{body}{pre}done\n")
+            .replace('\n', "\r\n")
+            .as_bytes(),
+    );
+    let ok = parse_probe_log(&crlf);
+    assert_eq!(ok.read.as_deref(), Some("t"));
+    assert!(ok.done && !ok.invalid);
 }
 
 /// MAC-1・IO-5・TASK-65.4: 不足と余剰の両方を検出する。

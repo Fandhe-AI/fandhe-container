@@ -168,7 +168,8 @@ pub fn encode_directives(shares: &VirtiofsSharesSpec) -> String {
 /// コマンドラインから指示トークンを復号する（ゲスト init 側の対。他のトークンは無視する）。
 pub fn parse_directives(cmdline: &str) -> Result<Vec<GuestMountDirective>, DirectiveError> {
     let mut out = Vec::new();
-    for token in cmdline.split(' ') {
+    // /proc/cmdline は末尾に改行を持つため、空白類（改行・タブ含む）で区切る。
+    for token in cmdline.split_ascii_whitespace() {
         let Some(body) = token.strip_prefix(DIRECTIVE_KEY) else {
             continue;
         };
@@ -411,14 +412,15 @@ impl GuestMountTracker {
 
 /// 全共有の mount 報告を期限付きで待つ（REPAIR-5）。
 ///
-/// `poll_interval` ごとに `is_alive` を確認し、VM が停止していれば `VmStopped` で早期に失敗させる。
+/// `poll_interval` ごとに `is_alive`（引数は全体期限までの残り時間。照会はこの時間内に終えること。
+/// 照会が決着しなかった場合は `Ok` を返して稼働中とみなす）を確認し、VM が停止していれば `VmStopped` で早期に失敗させる。
 /// 停止前に届いていた報告は先に処理する。送信側が破棄されたら `ReportChannelClosed`。
 pub fn await_guest_mounts(
     rx: &Receiver<ReportItem>,
     tracker: &mut GuestMountTracker,
     timeout: Duration,
     poll_interval: Duration,
-    mut is_alive: impl FnMut() -> Result<(), VmState>,
+    mut is_alive: impl FnMut(Duration) -> Result<(), VmState>,
 ) -> Result<(), GuestMountError> {
     if tracker.pending().is_empty() {
         return Ok(());
@@ -439,7 +441,9 @@ pub fn await_guest_mounts(
                 TrackerStatus::Failed(e) => return Err(e),
             },
             Err(RecvTimeoutError::Timeout) => {
-                if let Err(state) = is_alive() {
+                // 状態照会にも残り時間を上限として渡し、全体の期限を超えさせない（REPAIR-5）。
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if let Err(state) = is_alive(remaining) {
                     return Err(GuestMountError::VmStopped { state });
                 }
             }
@@ -468,7 +472,7 @@ impl GuestMountWatch {
     pub fn wait(
         self,
         timeout: Duration,
-        is_alive: impl FnMut() -> Result<(), VmState>,
+        is_alive: impl FnMut(Duration) -> Result<(), VmState>,
     ) -> Result<(), GuestMountError> {
         let mut tracker = GuestMountTracker::new(self.expected);
         await_guest_mounts(&self.rx, &mut tracker, timeout, POLL_INTERVAL, is_alive)
@@ -513,6 +517,15 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// MAC-1・TASK-65.3: /proc/cmdline 末尾の改行があっても最後の指示を復号できる。
+    #[test]
+    fn parse_directives_tolerates_trailing_newline() {
+        let got =
+            parse_directives("console=hvc0 fandhe.virtiofs=data:/mnt/fandhe/data:ro\n").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].access, ShareAccess::ReadOnly);
     }
 
     /// MAC-1・TASK-65.3: mount point の境界値。
@@ -809,7 +822,7 @@ mod tests {
     /// MAC-1・REPAIR-5・TASK-65.3: 待機の成功・期限切れ・VM 停止・送信側切断。
     #[test]
     fn await_outcomes() {
-        let alive = || Ok(());
+        let alive = |_: Duration| Ok(());
 
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         tx.send(ok_report("a")).unwrap();
@@ -833,7 +846,7 @@ mod tests {
 
         let mut t = tracker(&["a"]);
         assert_eq!(
-            await_guest_mounts(&rx, &mut t, Duration::from_secs(5), TICK, || Err(
+            await_guest_mounts(&rx, &mut t, Duration::from_secs(5), TICK, |_| Err(
                 VmState::Stopped
             )),
             Err(GuestMountError::VmStopped {
@@ -854,6 +867,6 @@ mod tests {
     fn watch_waits_for_expected_tags() {
         let (tx, watch) = GuestMountWatch::channel(vec!["a".into()]);
         tx.send(ok_report("a")).unwrap();
-        assert_eq!(watch.wait(Duration::from_secs(5), || Ok(())), Ok(()));
+        assert_eq!(watch.wait(Duration::from_secs(5), |_| Ok(())), Ok(()));
     }
 }

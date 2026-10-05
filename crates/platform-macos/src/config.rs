@@ -199,6 +199,8 @@ pub enum ConfigError {
     DuplicateGuestMountPoint { path: String },
     /// ゲスト mount 指定があるのにシリアルコンソールがなく、結果を検証できない（fail-closed）。
     GuestMountRequiresConsole,
+    /// ゲスト mount 指定があるのにカーネルコマンドラインに `console=hvc0` がなく、報告がホストへ届かない（fail-closed）。
+    GuestMountRequiresConsoleArg,
     /// ユーザー指定のコマンドラインに予約キー（`fandhe.` 始まり）のトークンがある（`index` はバイト位置）。
     CommandLineReservedKey { index: usize },
     /// virtiofs 共有数が上限を超えた。
@@ -303,6 +305,7 @@ impl ConfigError {
             ConfigError::GuestMountPointTooLong { .. } => "config.guest_mount_point_too_long",
             ConfigError::DuplicateGuestMountPoint { .. } => "config.duplicate_guest_mount_point",
             ConfigError::GuestMountRequiresConsole => "config.guest_mount_requires_console",
+            ConfigError::GuestMountRequiresConsoleArg => "config.guest_mount_requires_console_arg",
             ConfigError::CommandLineReservedKey { .. } => "config.command_line_reserved_key",
             ConfigError::TooManyVirtiofsShares { .. } => "config.too_many_virtiofs_shares",
             ConfigError::SharedDirNotDirectory { .. } => "config.shared_dir_not_directory",
@@ -487,6 +490,9 @@ impl ConfigError {
             }
             ConfigError::GuestMountRequiresConsole => {
                 "guest mount requires a serial console to verify the result".to_string()
+            }
+            ConfigError::GuestMountRequiresConsoleArg => {
+                "guest mount requires 'console=hvc0' in the kernel command line".to_string()
             }
             ConfigError::CommandLineReservedKey { index } => {
                 format!("kernel command line has a reserved 'fandhe.' key at byte {index}")
@@ -1723,6 +1729,15 @@ impl VmConfigSpec {
         }
         if self.devices.serial_console().is_none() {
             return Err(ConfigError::GuestMountRequiresConsole);
+        }
+        // 報告は hvc0 のコンソール出力で届く。console= が無いと mount に成功しても報告が来ず launch が待ち続ける。
+        if !self
+            .cmdline
+            .as_str()
+            .split_ascii_whitespace()
+            .any(|t| t == "console=hvc0")
+        {
+            return Err(ConfigError::GuestMountRequiresConsoleArg);
         }
         Ok(Some(tags))
     }
@@ -3659,6 +3674,24 @@ broken line
             with_console.guest_mount_plan(),
             Ok(Some(vec!["a".to_string()]))
         );
+        // console=hvc0 が無いコマンドラインは報告が届かないため拒否する。
+        let no_arg = VmConfigSpec::from_parts(&k, None, "quiet")
+            .unwrap()
+            .with_shared_directories(shares.clone())
+            .with_devices(
+                DeviceConfigSpec::try_new(
+                    vec![],
+                    Some(SerialConsoleSink::LogFile(
+                        ConsoleLogPath::try_new(t.0.join("console2.log")).unwrap(),
+                    )),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            no_arg.guest_mount_plan(),
+            Err(ConfigError::GuestMountRequiresConsoleArg)
+        );
         // mount 指定の無い共有だけなら待機対象なし（コンソールも不要）。
         let plain = VmConfigSpec::from_parts(&k, None, "console=hvc0")
             .unwrap()
@@ -3711,6 +3744,11 @@ broken line
                 ConfigError::GuestMountRequiresConsole,
                 "config.guest_mount_requires_console",
                 "guest mount requires a serial console to verify the result",
+            ),
+            (
+                ConfigError::GuestMountRequiresConsoleArg,
+                "config.guest_mount_requires_console_arg",
+                "guest mount requires 'console=hvc0' in the kernel command line",
             ),
             (
                 ConfigError::CommandLineReservedKey { index: 4 },

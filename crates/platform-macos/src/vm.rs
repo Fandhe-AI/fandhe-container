@@ -843,9 +843,10 @@ mod mac {
             }
             // ゲスト内 virtiofs mount の完了を待つ（mount 指定がある場合のみ。MAC-1・TASK-65.3）。
             if let Some(watch) = config.take_guest_mount_watch() {
-                let alive = || match vm.state() {
-                    VmState::Running | VmState::Starting => Ok(()),
-                    other => Err(other),
+                // 照会が期限内に決着しない（キュー詰まり）場合は停止と断定せず稼働中とみなす。
+                let alive = |remaining: Duration| match vm.state_within(remaining) {
+                    None | Some(VmState::Running | VmState::Starting) => Ok(()),
+                    Some(other) => Err(other),
                 };
                 if let Err(e) = watch.wait(timeouts.guest_mount(), alive) {
                     drop(vm);
@@ -872,6 +873,15 @@ mod mac {
             self.host
                 .run_timeout(self.timeouts.state_query(), actual_state)
                 .unwrap_or(VmState::Unknown(-1))
+        }
+
+        /// `state` の照会時間を `budget` でも制限する版。決着しなければ `None`（REPAIR-5）。
+        fn state_within(&self, budget: Duration) -> Option<VmState> {
+            let limit = self
+                .timeouts
+                .state_query()
+                .min(budget.max(Duration::from_millis(1)));
+            self.host.run_timeout(limit, actual_state).ok()
         }
 
         /// イベントを 1 件受け取る。`take_events` 後、または期限切れなら `None`。

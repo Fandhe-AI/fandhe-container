@@ -62,6 +62,7 @@ fandhe-container/
 │   │   ├── bench-calibration.md   # ベンチ基準値の校正記録・試行ログ（TASK-88.2・REPAIR-8。実測は前提ベンチ未実装のため保留）
 │   │   ├── measurements/
 │   │   │   └── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
+│   │   ├── macos-vm-strategy.md   # macOS の VM 利用方式（既定: 常駐 VM 共用＋軽量プロセス分離／オプション: 1 コンテナ = 1 VM。TASK-66・MAC-4）
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   │   └── rootless-network.md    # rootless ネットワーク外部ヘルパー選択肢の設計ドラフト（TASK-147・NET-9。採否未決）
 │   ├── setup/                     # 利用者向けセットアップ手順

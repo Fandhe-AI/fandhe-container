@@ -1048,6 +1048,8 @@ fn unreleased_launch(
 pub struct MountError {
     error: Wsl2Error,
     unreleased: Option<PreparedLaunch>,
+    /// 9P 降格の警告の分類（サイズを抑えるため分類のみ保持し、固定文言は取得時に復元する）。
+    warning: Option<WinWarningCode>,
 }
 
 impl MountError {
@@ -1071,6 +1073,20 @@ impl MountError {
         self.unreleased.as_ref()
     }
 
+    /// 起動ステップの失敗時に、9P へ降格していた事実を示す警告（WIN-2）。
+    ///
+    /// 準備が 9P で成立した後に起動ステップが失敗した場合に限り `Some` になる。既定 API
+    /// （[`launch_with`]。記録先なし）でも、失敗結果から降格を確認できる。
+    pub fn warning(&self) -> Option<WinWarning> {
+        self.warning.map(WinWarning::new)
+    }
+
+    /// 9P 降格の警告を失敗結果に保持させる。
+    fn with_warning(mut self, warning: Option<WinWarning>) -> Self {
+        self.warning = warning.map(|w| w.code());
+        self
+    }
+
     /// 構造化エラーと未解除のマウントに分解する。
     pub fn into_parts(self) -> (Wsl2Error, Option<PreparedLaunch>) {
         (self.error, self.unreleased)
@@ -1086,6 +1102,7 @@ impl MountError {
         Self {
             error: with_rollback_note(error, outcome),
             unreleased: unreleased_launch(distro, &outcome.retry, transport),
+            warning: None,
         }
     }
 }
@@ -1095,6 +1112,7 @@ impl From<Wsl2Error> for MountError {
         Self {
             error,
             unreleased: None,
+            warning: None,
         }
     }
 }
@@ -1646,6 +1664,7 @@ pub(super) fn release_with_program(
     Err(MountError {
         error: precondition(message),
         unreleased: unreleased_launch(&prepared.distro, &outcome.retry, prepared.transport),
+        warning: None,
     })
 }
 
@@ -1695,12 +1714,10 @@ fn finish_launch<T>(
         Ok(value) => Ok(Launched { value, prepared }),
         Err(e) => {
             let failed = release_recorded(&prepared, exec, recorder);
-            Err(MountError::with_unreleased(
-                e,
-                &prepared.distro,
-                &failed,
-                prepared.transport,
-            ))
+            Err(
+                MountError::with_unreleased(e, &prepared.distro, &failed, prepared.transport)
+                    .with_warning(prepared.warning),
+            )
         }
     }
 }
@@ -1727,6 +1744,9 @@ fn launch_with_exec<T>(
 /// マウントは呼び出し側（TASK-116）の所有となり、
 /// 戻り値の [`Launched::prepared`] を停止時に [`release_virtiofs_launch`] へ渡して解除する。`start` の中身
 /// （ゲスト内のコンテナランタイム起動）は TASK-116 が注入する。
+///
+/// 記録先を持たないため、9P 降格の警告（WIN-2）は成功時は [`PreparedLaunch::warning`]、
+/// `start` 失敗時は [`MountError::warning`] から確認する。
 pub fn launch_with<T>(
     req: &LaunchRequest,
     timeout: Duration,
@@ -3633,6 +3653,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.message(), "start failed");
         assert_eq!(rec.warning_codes(), [WinWarningCode::VirtiofsNotEnabled]);
+        // 記録先なしの既定 API でも、失敗結果から 9P 降格を確認できる。
+        assert_eq!(
+            e.warning(),
+            Some(WinWarning::new(WinWarningCode::VirtiofsNotEnabled))
+        );
         assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
 
         let mut g = Guest::new("virtiofs");

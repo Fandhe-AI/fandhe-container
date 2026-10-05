@@ -14,7 +14,7 @@
 //! - `fandhe-guest-test: virtiofs-io v1 op=readdir entries=<in/dir の名前のカンマ区切り>`
 //! - `fandhe-guest-test: virtiofs-io v1 op=write result=done`（`out/write.txt` へ書いて sync 後）
 //! - 失敗時 `... op=<op> result=error`、最後に `fandhe-guest-test: virtiofs-io v1 done`
-//! - 名前空間 `fandhe-guest-test: virtiofs-io ` で始まる行はすべてプローブ行とみなし、上記の形に
+//! - 名前空間 `fandhe-guest-test: virtiofs-io`（末尾に空白 1 つ）で始まる行はすべてプローブ行とみなし、上記の形に
 //!   復号できないもの（版数違い・未知 op・空 value・上限超過・非 UTF-8 等）は位置によらず不正とする。
 //!
 //! 接頭辞は `guest_mount::REPORT_PREFIX`（`fandhe-guest: ...`）と先頭から食い違うため、mount 報告の走査に誤認されない。

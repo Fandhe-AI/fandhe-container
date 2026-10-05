@@ -843,9 +843,11 @@ mod mac {
             }
             // ゲスト内 virtiofs mount の完了を待つ（mount 指定がある場合のみ。MAC-1・TASK-65.3）。
             if let Some(watch) = config.take_guest_mount_watch() {
-                // 照会が期限内に決着しない（キュー詰まり）場合は停止と断定せず稼働中とみなす。
+                // 照会が期限内に決着しない（キュー詰まり）場合は `Unknown(-1)` を返す。待機中は一過性として
+                // 継続し、成功確定時は再照会しても確認できなければ失敗にする（fail-closed）。
                 let alive = |remaining: Duration| match vm.state_within(remaining) {
-                    None | Some(VmState::Running | VmState::Starting) => Ok(()),
+                    None => Err(VmState::Unknown(-1)),
+                    Some(VmState::Running | VmState::Starting) => Ok(()),
                     Some(other) => Err(other),
                 };
                 if let Err(e) = watch.wait(timeouts.guest_mount(), alive) {

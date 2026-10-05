@@ -415,7 +415,9 @@ impl GuestMountTracker {
 /// 全共有の mount 報告を期限付きで待つ（REPAIR-5）。
 ///
 /// `poll_interval` ごとに `is_alive`（引数は全体期限までの残り時間。照会はこの時間内に終えること。
-/// 照会が決着しなかった場合は `Ok` を返して稼働中とみなす）を確認し、VM が停止していれば `VmStopped` で早期に失敗させる。
+/// 照会が決着しなかった場合は `Err(VmState::Unknown(_))` を返す）を確認し、VM が停止していれば `VmStopped` で早期に失敗させる。
+/// 待機中の `Unknown` は一過性とみなして継続するが、全共有の報告が揃った成功確定時に `Unknown` のままなら
+/// 期限まで再照会し、確認できなければ `VmStopped { state: Unknown(_) }` で失敗させる（成功を確定しない。fail-closed・REPAIR-5）。
 /// 停止前に届いていた報告は先に処理する。送信側が破棄されたら `ReportChannelClosed`。
 pub fn await_guest_mounts(
     rx: &Receiver<ReportItem>,
@@ -449,19 +451,30 @@ pub fn await_guest_mounts(
                         return Err(overflow_error());
                     }
                     // 成功確定前にも VM の稼働を確認する（停止済みなら成功を返さない）。
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    return match is_alive(remaining) {
-                        Ok(()) => Ok(()),
-                        Err(state) => Err(GuestMountError::VmStopped { state }),
-                    };
+                    loop {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        match is_alive(remaining) {
+                            Ok(()) => return Ok(()),
+                            Err(state @ VmState::Unknown(_)) => {
+                                // 状態未確認: 期限まで再照会し、確認できなければ成功にしない。
+                                let left = deadline.saturating_duration_since(Instant::now());
+                                if left.is_zero() {
+                                    return Err(GuestMountError::VmStopped { state });
+                                }
+                                std::thread::sleep(left.min(poll_interval));
+                            }
+                            Err(state) => return Err(GuestMountError::VmStopped { state }),
+                        }
+                    }
                 }
                 TrackerStatus::Failed(e) => return Err(e),
             },
             Err(RecvTimeoutError::Timeout) => {
                 // 状態照会にも残り時間を上限として渡し、全体の期限を超えさせない（REPAIR-5）。
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                if let Err(state) = is_alive(remaining) {
-                    return Err(GuestMountError::VmStopped { state });
+                match is_alive(remaining) {
+                    Ok(()) | Err(VmState::Unknown(_)) => {}
+                    Err(state) => return Err(GuestMountError::VmStopped { state }),
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -923,6 +936,24 @@ mod tests {
             Err(GuestMountError::Timeout {
                 after: Duration::from_millis(100),
                 pending: vec!["b".into()]
+            })
+        );
+
+        // 成功確定時に状態を確認できない（Unknown のまま期限切れ）なら成功にしない。
+        let (tx2, rx2) = std::sync::mpsc::sync_channel(4);
+        tx2.send(ok_report("a")).unwrap();
+        let mut t = tracker(&["a"]);
+        assert_eq!(
+            await_guest_mounts(
+                &rx2,
+                &mut t,
+                &no_overflow,
+                Duration::from_millis(50),
+                TICK,
+                |_| Err(VmState::Unknown(-1))
+            ),
+            Err(GuestMountError::VmStopped {
+                state: VmState::Unknown(-1)
             })
         );
 

@@ -2023,6 +2023,9 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("fandhe-macos-cfg-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("create temp dir");
+            // macOS の一時ディレクトリ（/var/folders/...）は /private/var への symlink を含み、共有ディレクトリの
+            // symlink 拒否検証（SharedDirSymlink）に掛かるため、正規化済みパスを使う。
+            let dir = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
             // umask に依らず親ディレクトリ検査（他者書き込み可能かつ sticky なしは拒否）を通る 0700 にする。
             #[cfg(unix)]
             {

@@ -78,13 +78,16 @@
 //!   新しい削除規則は持たない。ロックを取れない（使用中）・symlink・他 UID 所有・記録が無い／不一致の
 //!   ものは削除しない。socket が消えて残ったロックファイルは `BindLock` の drop が unlink する。
 //! - 上限（REPAIR-5）: 処理する候補（上記の名前一致）は [`ONE_SHOT_SWEEP_MAX_ENTRIES`] 件まで、列挙する
-//!   エントリ総数は [`ONE_SHOT_SWEEP_MAX_SCAN`] 件まで（ヒントまでの読み飛ばしは列挙数に数えず、ディレクトリ
-//!   末尾で止まるためコストはディレクトリの実サイズで有界）。列挙中は何も削除せず、候補名を集めてから処理する。対象外の名前は候補の件数に数えないため、先頭に
-//!   対象外ファイルが多くても後方の残骸が飢餓しない。上限で打ち切った場合は、次回の開始位置（読み飛ばす
-//!   エントリ数）を runtime directory 直下の走査位置ヒント（`fcsweep-cursor`。0600・排他 flock・best-effort）
-//!   へ保存し、次回の初期化はそこから走査する。ディレクトリ末尾まで走査し終えるとヒントを削除して先頭へ戻る
-//!   ため、上限より後方の残骸も複数回の初期化で収束して処理される。ヒントは走査範囲を変えるだけで、改ざん・
-//!   破損しても削除対象は変わらない（判定・削除は検証済みディレクトリ fd 基準）。
+//!   エントリ総数は [`ONE_SHOT_SWEEP_MAX_SCAN`] 件まで（ヒントまでの読み飛ばしも含めた 1 回の読み取り
+//!   総数の上限）。列挙中は何も削除せず、候補名を集めてから処理する。対象外の名前は候補の件数に数えない
+//!   ため、先頭に対象外ファイルが多くても後方の残骸が飢餓しない。上限で打ち切った場合は、次回の開始位置
+//!   （読み飛ばすエントリ数）を runtime directory 直下の走査位置ヒント（`fcsweep-cursor`。0600・排他
+//!   flock・best-effort）へ保存し、次回の初期化はそこから走査する。ヒントが上限以上のときは使わず先頭から
+//!   走査する（上限を超える位置の残骸は、手前の残骸が消えて位置が詰まるまで到達しない既知の限界）。
+//!   ディレクトリ末尾まで走査し終えるとヒントを削除して先頭へ戻る。ヒントは走査範囲を変えるだけで、
+//!   改ざん・破損しても削除対象は変わらない（判定・削除は検証済みディレクトリ fd 基準）。
+//! - 削除を拒否する socket（symlink・他 UID 所有・socket 以外・記録なし／不一致）のロックファイルは、
+//!   記録も含めて変更・unlink しない（PLUG-12 の拒否対象を保持する）。
 //! - 残余: 列挙はパス基準（`read_dir`）で、得た名前はヒントにすぎない。判定・削除はすべて検証済みディレクトリ
 //!   fd 基準で行うため、差し替えられても削除対象にはならない。bind 成功から記録書き込みまでの間に異常終了した
 //!   記録なし socket は削除しない（手動削除が必要。fail-closed）。常駐モードの `resident-*` は対象外。
@@ -706,14 +709,13 @@ mod imp {
 
     /// 上限を引数に取る [`sweep_one_shot`] の本体（テストで小さい上限を注入できるようにする）。
     ///
-    /// 走査は 2 段階: (1) 走査位置ヒントまで読み飛ばし（読み飛ばしは列挙数に数えない。ディレクトリ末尾で
-    /// 止まるため、改ざんされた巨大なヒントでもコストはディレクトリの実サイズで有界。上限で打ち切る
-    /// と後方へ進めなくなるため、ヒントの大きさでは弾かない）、そこから `max_scan` 件まで列挙して候補名だけを集める（この間は何も削除しない。
-    /// 列挙中のディレクトリ変更で後続エントリが落ちないように）。(2) 集めた候補を処理する。読み飛ばしを
-    /// 含む 1 回の読み取りエントリ数はディレクトリの実サイズ以内で、候補処理・列挙は `max_scan` 件以内（REPAIR-5）。上限で打ち切った場合は
-    /// 次回の開始位置を保存し、末尾まで走査し終えたら 0 に戻す（#1310）。保存位置は、この回に削除した
-    /// socket とロックファイル（候補 1 件につき最大 2 エントリ）の分だけ手前へ戻す。保守的に手前へ
-    /// ずらすのは、再走査は無害（処理済みは消えている）だが、先へずれると未処理を飛ばすため。
+    /// 走査は 2 段階: (1) 走査位置ヒントまで読み飛ばし、そこから列挙して候補名だけを集める（この間は何も
+    /// 削除しない。列挙中のディレクトリ変更で後続エントリが落ちないように）。読み飛ばしも含めた 1 回の
+    /// 読み取り総数は `max_scan` 以内（REPAIR-5。ヒントが `max_scan` 以上なら使わず先頭から走査する）。
+    /// (2) 集めた候補を処理する。上限で打ち切った場合は次回の開始位置を保存し、末尾まで走査し終えたら 0 に
+    /// 戻す（#1310）。保存位置は、この回に削除した socket とロックファイル（候補 1 件につき最大 2
+    /// エントリ）の分だけ手前へ戻す。保守的に手前へずらすのは、再走査は無害（処理済みは消えている）だが、
+    /// 先へずれると未処理を飛ばすため。
     pub(super) fn sweep_one_shot_limited(
         dir_path: &Path,
         euid: u32,
@@ -725,7 +727,11 @@ mod imp {
         let dir = open_nofollow(&real)?;
         verify(&fstat(&dir)?, euid)?;
         let cursor = SweepCursor::open(&dir, euid);
-        let hint = cursor.as_ref().map_or(0, |c| c.start);
+        // 読み飛ばしも 1 回の読み取り総数（`max_scan`）に含める（REPAIR-5）。ヒントが上限以上なら
+        // 使わず先頭から走査する（上限を超える位置は、手前の残骸が消えて位置が詰まるまで到達しない）。
+        let hint = cursor
+            .as_ref()
+            .map_or(0, |c| if c.start < max_scan { c.start } else { 0 });
         let mut start = hint;
         let mut entries = std::fs::read_dir(&real).map_err(|e| map_io(&e))?;
         let mut out = OneShotSweep::default();
@@ -741,11 +747,11 @@ mod imp {
         // 段階 1: 列挙して候補名を集める（削除しない）。次回の開始位置 0 は「末尾まで走査し終えた」。
         let mut candidates: Vec<std::ffi::CString> = Vec::new();
         let mut next = 0usize;
-        let mut scanned = 0usize;
+        let mut scanned = start;
         for entry in entries {
             if scanned >= max_scan {
                 out.truncated = true;
-                next = start + scanned;
+                next = scanned;
                 break;
             }
             scanned += 1;
@@ -760,7 +766,7 @@ mod imp {
             // 件数上限は候補だけを数える（対象外の名前で枠を消費して後方の残骸が飢餓しないように）。
             if candidates.len() >= max_entries {
                 out.truncated = true;
-                next = start + scanned - 1;
+                next = scanned - 1;
                 break;
             }
             let Ok(name) = std::ffi::CString::new(socket) else {
@@ -798,7 +804,7 @@ mod imp {
 
     /// 1 つの候補を stale 削除と同じ手順で処理し、結果を `out` に数える。
     fn sweep_one(dir: &File, name: &std::ffi::CStr, euid: u32, out: &mut OneShotSweep) {
-        let lock = match acquire_bind_lock(dir, name, euid) {
+        let mut lock = match acquire_bind_lock(dir, name, euid) {
             Ok(l) => l,
             Err(e) if e.code() == PluginErrorCode::AlreadyExists => {
                 out.in_use += 1;
@@ -809,6 +815,30 @@ mod imp {
                 return;
             }
         };
+        // 削除できない socket（symlink・他 UID 所有・socket 以外・記録なし／不一致・判定不能）には、
+        // `clear_stale_socket` を呼ばずロックファイルも保持する。`clear_stale_socket` は拒否時にも
+        // 記録を消す場合があり、空になったロックを drop が unlink すると、拒否した socket の
+        // 削除根拠（PLUG-12）が失われるため。
+        match lstat_opt(dir, name) {
+            Ok(None) => {}
+            Ok(Some(ident)) => {
+                let deletable = matches!(
+                    classify_existing(Some(&ident), euid),
+                    ExistingEntry::OwnSocket(_)
+                ) && record_key(&ident).is_some()
+                    && lock.recorded() == record_key(&ident);
+                if !deletable {
+                    lock.retain();
+                    out.skipped += 1;
+                    return;
+                }
+            }
+            Err(_) => {
+                lock.retain();
+                out.skipped += 1;
+                return;
+            }
+        }
         let existed = matches!(lstat_opt(dir, name), Ok(Some(_)));
         let cleared = clear_stale_socket(dir, name, euid, &lock);
         let remains = !matches!(lstat_opt(dir, name), Ok(None));
@@ -902,6 +932,9 @@ mod imp {
         dir: File,
         /// ロックファイル名（`<socket 名>.lock`）。
         lock_name: std::ffi::CString,
+        /// true の間は drop でロックファイルを unlink しない（掃除が削除を拒否した socket の
+        /// ロックを保持するため。#1310・PLUG-12）。
+        keep: bool,
     }
 
     impl Drop for BindLock {
@@ -909,7 +942,8 @@ mod imp {
             // 記録が空なら、このロックファイルを根拠に削除できる socket は無い。flock を持ったまま、
             // 名前がまだ自分の inode を指す場合だけ unlink する（別の inode には触れない）。
             let unrecorded = self.file.metadata().is_ok_and(|m| m.len() == 0);
-            if unrecorded
+            if !self.keep
+                && unrecorded
                 && matches!(
                     crate::sys::names_open_file(&self.dir, &self.lock_name, &self.file),
                     Ok(true)
@@ -969,6 +1003,11 @@ mod imp {
         /// （管理下と見なさない）。
         fn recorded(&self) -> Option<[u64; RECORD_FIELDS]> {
             parse_record(&read_record(&self.file)?)
+        }
+
+        /// drop 時のロックファイル unlink を止める（記録も変更しない）。
+        fn retain(&mut self) {
+            self.keep = true;
         }
     }
 
@@ -1124,6 +1163,7 @@ mod imp {
         }
         let dir = dir.try_clone().map_err(|_| inspect())?;
         Ok(BindLock {
+            keep: false,
             file: handle.file,
             dir,
             lock_name,
@@ -1254,44 +1294,55 @@ mod imp {
             }
         }
 
-        /// REPAIR-5・PLUG-7（#1310）: 列挙総数の上限を超える位置にある残骸も、走査位置ヒントを進める
-        /// ことで複数回の掃除で必ず処理される（先頭の対象外ファイルが上限を超えても収束する）。
+        /// REPAIR-5・PLUG-7（#1310）: 1 回の読み取り総数（読み飛ばしを含む）は `max_scan` 以内で、
+        /// 上限内に収まる残骸は複数回の掃除で処理される。上限以上の位置のヒントは使わず先頭から走査する。
         #[test]
-        fn plug7_sweep_converges_past_scan_limit() {
+        fn repair5_sweep_total_reads_bounded_including_skip() {
             let base = std::env::temp_dir().join(format!("fcsc-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&base);
             DirBuilder::new().mode(0o700).create(&base).unwrap();
             let euid = crate::sys::effective_uid();
             const MAX_SCAN: usize = 8;
-            for i in 0..40 {
+            for i in 0..20 {
                 std::fs::write(base.join(format!("other-{i}")), b"").unwrap();
             }
-            let locks: Vec<_> = (0..4)
-                .map(|i| base.join(format!("oneshot-1-{i}.sock.lock")))
-                .collect();
-            for l in &locks {
-                std::fs::write(l, b"").unwrap();
-            }
-            // 44 件 / 8 件ずつ → 6 回で一巡する。一巡し終える（打ち切られない）まで有限回で繰り返す。
-            let mut truncated_runs = 0;
-            let mut finished = false;
-            for _ in 0..20 {
-                let r = sweep_one_shot_limited(&base, euid, MAX_SCAN, 256).unwrap();
-                truncated_runs += usize::from(r.truncated);
-                if !r.truncated {
-                    finished = true;
-                    break;
-                }
-            }
-            assert!(finished);
-            assert!(truncated_runs >= 1);
-            for l in &locks {
-                assert!(!l.exists(), "{}", l.display());
-            }
-            // 一巡し終えたらヒントのファイルは残らない。
+            let lock = base.join("oneshot-1-0.sock.lock");
+            std::fs::write(&lock, b"").unwrap();
             let cursor = base.join(std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap());
-            assert!(!cursor.exists());
+            // 上限以上の位置を指すヒント（改ざん・過去の値）は使わず、先頭から上限内で走査する。
+            std::fs::write(&cursor, b"15\n").unwrap();
+            let r = sweep_one_shot_limited(&base, euid, MAX_SCAN, 256).unwrap();
+            assert!(r.truncated);
+            let saved = std::fs::read_to_string(&cursor).unwrap();
+            let next: usize = saved.trim().parse().unwrap();
+            assert!(next <= MAX_SCAN, "next={next}");
+            // 上限内の位置にあるロックは（走査順に依らず）高々数回で処理される or 位置が上限内に留まる。
+            for _ in 0..4 {
+                let r = sweep_one_shot_limited(&base, euid, MAX_SCAN, 256).unwrap();
+                assert!(r.examined <= 1);
+            }
             let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// PLUG-12（#1310）: 削除を拒否する socket（symlink・記録なしの socket 以外）のロックファイルは、
+        /// 掃除で記録も unlink もされず保持される。
+        #[test]
+        fn plug12_sweep_keeps_lock_of_refused_socket() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let target = t.0.join("target");
+            std::fs::write(&target, b"x").unwrap();
+            std::os::unix::fs::symlink(&target, t.0.join("oneshot-1-0.sock")).unwrap();
+            std::fs::write(t.0.join("oneshot-1-0.sock.lock"), b"").unwrap();
+            std::fs::write(t.0.join("oneshot-1-1.sock"), b"regular").unwrap();
+            std::fs::write(t.0.join("oneshot-1-1.sock.lock"), b"").unwrap();
+            let r = sweep_one_shot_limited(&t.0, euid, 1024, 256).unwrap();
+            assert_eq!(r.removed, 0);
+            assert_eq!(r.skipped, 2);
+            assert!(t.0.join("oneshot-1-0.sock.lock").exists());
+            assert!(t.0.join("oneshot-1-1.sock.lock").exists());
+            assert!(t.0.join("oneshot-1-0.sock").symlink_metadata().is_ok());
+            assert_eq!(std::fs::read(&target).unwrap(), b"x");
         }
 
         /// REPAIR-5・PLUG-7（#1310）: ハードリンクされた既存ファイル・無関係な内容の既存ファイルを
@@ -1329,7 +1380,7 @@ mod imp {
                 f.lock().unwrap();
                 held.push(f);
             }
-            for i in 0..12 {
+            for i in 0..4 {
                 std::fs::write(t.0.join(format!("other-{i}")), b"").unwrap();
             }
             let tail = t.0.join("oneshot-2-0.sock.lock");

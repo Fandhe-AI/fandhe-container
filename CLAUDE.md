@@ -64,8 +64,8 @@ fandhe-container/
 │   │   │   └── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   │   └── rootless-network.md    # rootless ネットワーク外部ヘルパー選択肢の設計ドラフト（TASK-147・NET-9。採否未決）
-│   ├── setup/
-│   │   └── windows.md             # Windows セットアップ手順: NTFS セマンティクス差異（TASK-68・WIN-4）
+│   ├── setup/                     # 利用者向けセットアップ手順
+│   │   └── windows.md             # Windows セットアップ前提条件（WSL2・Developer Mode・`.wslconfig` の virtiofs。TASK-69・WIN-5。NTFS セマンティクス差異への対応〔TASK-68・WIN-4〕を統合）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external・ci（稼働）/ release（発火条件無効化中）
 ├── .agents/skills/                # npx skills add の導入実体

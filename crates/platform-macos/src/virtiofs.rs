@@ -8,7 +8,7 @@
 //! 呼び出し文脈: `config::build_vz_configuration` が共有ごとにデバイス構成を組み立てる。ゲスト内の mount
 //! 指定（`guest_mount`。TASK-65.3）は任意で、指示・報告の契約は `guest_mount` モジュールにある（タグが
 //! 指示トークンの一部になるため文字種を絞っている）。I/O 共有プロトコルへのクライアント接続は
-//! `io_client`（TASK-65.2）。キャッシュポリシーは VZ に設定項目がなく扱わない。
+//! `io_client`（TASK-65.2）、切断時の再接続は `reconnect`（TASK-65.5）。キャッシュポリシーは VZ に設定項目がなく扱わない。
 //!
 //! 信頼前提: 共有ディレクトリの検証（symlink 非経由・実在ディレクトリ）から VM 起動までの間にパスが差し
 //! 替えられる TOCTOU は検査できない。呼び出し側が実体パスを渡し、共有ディレクトリの祖先を他者が書き換えられ
@@ -24,6 +24,13 @@ pub use io_client::{
     DEFAULT_VIRTIOFS_IO_ACK_TIMEOUT_SECS, DEFAULT_VIRTIOFS_IO_FLUSH_ACK_TIMEOUT_SECS,
     DEFAULT_VIRTIOFS_IO_SEND_TIMEOUT_SECS, FlushReport, MIN_IN_FLIGHT_LIMIT, VirtiofsIoClient,
     VirtiofsIoError, VirtiofsIoOp, VirtiofsIoTimeouts, WriteReport,
+};
+
+mod reconnect;
+pub use reconnect::{
+    DEFAULT_VIRTIOFS_RECONNECT_ATTEMPTS, DEFAULT_VIRTIOFS_RECONNECT_CONNECT_TIMEOUT_SECS,
+    DEFAULT_VIRTIOFS_RECONNECT_INTERVAL_MILLIS, MAX_RECONNECT_ATTEMPTS, MAX_RECONNECT_INTERVAL,
+    ReconnectPolicy, ReconnectingVirtiofsIoClient, VirtiofsConnector,
 };
 
 /// virtiofs 共有の最大件数（無制限確保の防止。`MAX_BLOCK_DEVICES` に合わせる）。

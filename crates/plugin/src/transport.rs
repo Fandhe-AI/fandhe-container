@@ -12,7 +12,7 @@
 //!   bind 直後の umask 次第でも他 UID が接続できる窓は生じない（0600 化は多層防御）
 //! - 配置ディレクトリへの経路は `canonicalize` 後にルートから 1 要素ずつ `openat(O_NOFOLLOW)` で
 //!   辿り（検証後に祖先が symlink へ差し替わると失敗）、bind 自体も検証済み fd 基準で行う
-//!   （Linux は `/proc/self/fd/<fd>/<name>`。祖先パスを再解決しない。macOS は残余あり: `bind_target` 参照）
+//!   （Linux は `/proc/self/fd/<fd>/<name>`。祖先パスを再解決しない。macOS は bind 自体に残余あり〔`bind_target` 参照〕。bind 後の識別情報の確認は macOS も `fstatat` で fd 基準。#1307）
 //! - 配置ディレクトリは 1 度だけ開いた fd（検証対象そのもの）を保持し、bind 後の 0600 化
 //!   （`fchmodat(dirfd, name, AT_SYMLINK_NOFOLLOW)`）と Drop 時の削除（`unlinkat(dirfd, name)`）は
 //!   その fd 基準で行う。パスを再解決しないため、検証後に中間要素・`..`・symlink が差し替わっても
@@ -616,7 +616,7 @@ mod imp {
     /// 作る（祖先パスの再解決なし。`/proc` 不在なら bind が失敗＝fail-closed）。
     /// 他の unix（macOS）: `bindat` 相当が無いため `canonical/name`（＝公開パス）へ bind し、直後の
     /// `configure`（fd 基準の所有者・種別確認と 0600 化）で検証する。残余: 祖先ディレクトリの
-    /// 書き込み権限を持つ他主体が bind の瞬間に差し替える窓が残る（TASK-123・TASK-124 で再検討）。
+    /// 書き込み権限を持つ他主体が bind の瞬間に差し替える窓が残る。bind 後の確認（`lstat_at`）は macOS でも `fstatat` で検証済み fd 基準（#1307）。
     fn bind_target(dir: &File, public: &Path, name: &Path) -> PathBuf {
         #[cfg(target_os = "linux")]
         {
@@ -678,11 +678,11 @@ mod imp {
             // 生存判定は接続 probe でなく sibling lock の flock（既存 listener に副作用を与えない）。
             // 以降で失敗した場合、記録の無いロックファイルは `BindLock` の drop が解放の直前に削除する
             // （削除と取得の競合は取得側の同一性確認で排除する。`BindLock` の doc 参照）。
-            let lock = crate::uds_security::acquire_bind_lock(&dir, &name, &bound, euid)?;
-            crate::uds_security::clear_stale_socket(&dir, &name, &bound, euid, &lock)?;
+            let lock = crate::uds_security::acquire_bind_lock(&dir, &name, euid)?;
+            crate::uds_security::clear_stale_socket(&dir, &name, euid, &lock)?;
             let listener = UnixListener::bind(&target).map_err(|e| map_bind_error(e.kind()))?;
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
-            let identity = sys::lstat_at(&dir, &name, &bound).ok();
+            let identity = sys::lstat_at(&dir, &name).ok();
             let inner = Self {
                 listener,
                 dir,
@@ -926,7 +926,7 @@ mod imp {
             let Some(expected) = self.identity else {
                 return;
             };
-            let gone = match sys::lstat_at(&self.dir, &self.name, &self.path) {
+            let gone = match sys::lstat_at(&self.dir, &self.name) {
                 Ok(now) if now == expected => match sys::unlinkat(&self.dir, &self.name) {
                     Ok(()) => true,
                     Err(e) => e.kind() == io::ErrorKind::NotFound,

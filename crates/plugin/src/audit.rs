@@ -25,8 +25,11 @@
 //! 既定の `StderrPeerAuthObserver` は呼び出し側スレッドで stderr に書かず、有界キュー（
 //! [`DEFAULT_AUDIT_QUEUE_CAPACITY`] 件）へ `try_send` するだけなので、stderr の読み手が停滞しても
 //! accept / connect は待たされない（ブロックしない）。
-//! - キューが満杯・書き込みスレッドを起動できない場合は、捨てずに件数を数え、次に書き込みに成功した
-//!   時点で集約行（`peer_auth_rejections_coalesced`）として出す。
+//! - キューが満杯の場合は、捨てずに件数を数え、書き込みスレッドが定期的（次の行の到着を待たない）に
+//!   集約行（`peer_auth_rejections_coalesced`）として出す。出力待ちの件数は
+//!   [`default_audit_pending_dropped`] で観測できる。
+//! - 書き込みスレッドを起動できなかった場合は出力経路が無いため、件数を直接
+//!   [`default_audit_write_failures`] へ計上する。
 //! - stderr への書き込みが失敗した場合（閉じている・書けない）は失われた件数を
 //!   [`default_audit_write_failures`] へ数え、黙って消えない（呼び出し側が監視できる）。
 //! - 書き込みスレッドの出力は非同期のため、直後にプロセスが終了すると未出力の行は失われ得る。
@@ -37,7 +40,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, OnceLock};
 
 /// 監査枠の最大行数（`crates/io` の監査枠と同値）。
@@ -47,6 +50,23 @@ pub const MAX_PEER_AUTH_AUDIT_LOG_BUFFER_BYTES: usize = 128 * 1024;
 
 /// 既定出力の書き込みキューの最大件数。
 pub const DEFAULT_AUDIT_QUEUE_CAPACITY: usize = 256;
+
+/// 書き込みスレッドが未出力の集約件数を定期的に回収する間隔（次の行の到着に依存しない）。
+const AGGREGATE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// 未出力の集約件数があれば集約行として書く。書けなければ件数を失敗累計へ移す（SEC-4）。
+fn emit_aggregate<W: Write>(out: &mut W, pending: &AtomicU64, failures: &AtomicU64) {
+    let dropped = pending.swap(0, Ordering::AcqRel);
+    if dropped == 0 {
+        return;
+    }
+    let agg = format!(
+        "{{\"event\":\"plugin_peer_auth\",\"outcome\":\"error\",\"reason\":\"peer_auth_rejections_coalesced\",\"count\":{dropped}}}"
+    );
+    if writeln!(out, "{agg}").and_then(|()| out.flush()).is_err() {
+        failures.fetch_add(dropped, Ordering::AcqRel);
+    }
+}
 
 /// 既定出力の有界・非ブロッキング sink（専用スレッドが `Write` へ書く）。
 struct AuditSink {
@@ -66,21 +86,21 @@ impl AuditSink {
         let spawned = std::thread::Builder::new()
             .name("peer-auth-audit".into())
             .spawn(move || {
-                for line in rx {
-                    let dropped = pd.swap(0, Ordering::AcqRel);
-                    if dropped > 0 {
-                        let agg = format!(
-                            "{{\"event\":\"plugin_peer_auth\",\"outcome\":\"error\",\"reason\":\"peer_auth_rejections_coalesced\",\"count\":{dropped}}}"
-                        );
-                        if writeln!(out, "{agg}").is_err() {
-                            wf.fetch_add(dropped, Ordering::AcqRel);
+                loop {
+                    match rx.recv_timeout(AGGREGATE_FLUSH_INTERVAL) {
+                        Ok(line) => {
+                            emit_aggregate(&mut out, &pd, &wf);
+                            if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+                                wf.fetch_add(1, Ordering::AcqRel);
+                            }
                         }
-                    }
-                    if writeln!(out, "{line}")
-                        .and_then(|()| out.flush())
-                        .is_err()
-                    {
-                        wf.fetch_add(1, Ordering::AcqRel);
+                        // 次の行を待たずに未出力の集約件数を回収する（SEC-4。送信側が
+                        // あふれ後に拒否を受けなくても件数が出力される）。
+                        Err(RecvTimeoutError::Timeout) => emit_aggregate(&mut out, &pd, &wf),
+                        Err(RecvTimeoutError::Disconnected) => {
+                            emit_aggregate(&mut out, &pd, &wf);
+                            break;
+                        }
                     }
                 }
             });
@@ -100,7 +120,13 @@ impl AuditSink {
             ),
             None => false,
         };
-        if !sent {
+        if sent {
+            return;
+        }
+        if self.tx.is_none() {
+            // 書き込みスレッドが無く永久に出力できないため、失敗累計へ直接計上する。
+            self.write_failures.fetch_add(1, Ordering::AcqRel);
+        } else {
             self.pending_dropped.fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -114,6 +140,12 @@ fn default_sink() -> &'static AuditSink {
 /// 既定出力で stderr への書き込みに失敗し、失われた拒否イベントの累計件数（SEC-4）。
 pub fn default_audit_write_failures() -> u64 {
     default_sink().write_failures.load(Ordering::Acquire)
+}
+
+/// 既定出力でキューあふれのため未出力のまま保留中の拒否件数（SEC-4）。
+/// 書き込みスレッドが定期回収して集約行にするまでの観測用で、stderr 停滞中は増え続ける。
+pub fn default_audit_pending_dropped() -> u64 {
+    default_sink().pending_dropped.load(Ordering::Acquire)
 }
 
 /// 拒否が起きた側（accept = core の listener、connect = plugin の client）。
@@ -465,6 +497,54 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(sink.write_failures.load(Ordering::Acquire), 2);
+    }
+
+    struct Shared(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Shared {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// SEC-4: あふれ件数は後続の拒否が無くても定期回収で集約行として出力される。
+    #[test]
+    fn sec4_pending_dropped_is_emitted_without_next_line() {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = AuditSink::spawn(Shared(Arc::clone(&buf)), 1);
+        sink.submit("first".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !String::from_utf8_lossy(&buf.lock().unwrap()).contains("first") {
+            assert!(std::time::Instant::now() < deadline, "line not written");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // 書き込みスレッドが受信待ちの状態でのあふれ記録（後続の行は来ない）。
+        sink.pending_dropped.fetch_add(3, Ordering::AcqRel);
+        while !String::from_utf8_lossy(&buf.lock().unwrap()).contains("\"count\":3") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "aggregate not emitted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
+    }
+
+    /// SEC-4: 書き込みスレッド不在のときは件数が失敗累計へ計上される。
+    #[test]
+    fn sec4_spawn_failure_counts_as_write_failure() {
+        let sink = AuditSink {
+            tx: None,
+            pending_dropped: Arc::new(AtomicU64::new(0)),
+            write_failures: Arc::new(AtomicU64::new(0)),
+        };
+        sink.submit("x".into());
+        sink.submit("y".into());
+        assert_eq!(sink.write_failures.load(Ordering::Acquire), 2);
+        assert_eq!(sink.pending_dropped.load(Ordering::Acquire), 0);
     }
 
     /// SEC-4: 容量超過は捨てず集約行 1 行（count = 超過件数）になる。

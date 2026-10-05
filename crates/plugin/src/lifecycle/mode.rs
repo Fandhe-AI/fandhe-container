@@ -240,7 +240,14 @@ impl PluginSession {
     ///
     /// 都度起動は起動仕様と期限を保持するだけで spawn しない（spawn は [`call`](Self::call) ごと）。
     /// 常駐は [`ResidentPlugin::start`] で子を起動し接続を確立する（失敗はそのエラーを返す）。
-    pub fn start(plugin: &OneShotPlugin, mode: PluginMode) -> Result<Self, PluginError> {
+    ///
+    /// `audit` は peer 認証で拒否した接続の監査イベントの受け手（PLUG-12・SEC-4・TASK-124.5。必須）。
+    /// 常駐は起動時の受付でのみ使い、都度起動はここでは使わない（受付は `call` ごと）。
+    pub fn start(
+        plugin: &OneShotPlugin,
+        mode: PluginMode,
+        audit: &mut dyn crate::audit::PeerAuthObserver,
+    ) -> Result<Self, PluginError> {
         let inner = match mode {
             PluginMode::OneShot { timeout } => Inner::OneShot {
                 plugin: plugin.clone(),
@@ -248,7 +255,7 @@ impl PluginSession {
                 stats: OneShotStats::default(),
             },
             PluginMode::Resident { start, rpc } => Inner::Resident {
-                session: ResidentPlugin::start(plugin, start)?,
+                session: ResidentPlugin::start(plugin, start, audit)?,
                 rpc,
             },
         };
@@ -266,8 +273,16 @@ impl PluginSession {
     /// 要求を 1 往復させる。観測記録は両モードとも構造化ログ（JSON Lines）として stderr へ 1 行出す
     /// （REPAIR-4。都度起動は従来の [`call_once`](super::call_once) と同じ挙動）。記録を自分で受け取るなら
     /// [`call_observed`](Self::call_observed) を使う。応答は untrusted。
-    pub fn call(&mut self, request: &Frame) -> Result<PluginCallOutcome, PluginError> {
-        self.call_observed(request, &mut |record| {
+    ///
+    /// `audit` は peer 認証で拒否した接続の監査イベントの受け手（PLUG-12・SEC-4・TASK-124.5。必須）。
+    /// 都度起動は呼び出しごとに受付を行うため拒否 1 件につき 1 回呼ばれる。常駐は接続済みで受付を
+    /// 行わないため呼ばれない（モードを問わず同じ署名にするために受け取る）。
+    pub fn call(
+        &mut self,
+        request: &Frame,
+        audit: &mut dyn crate::audit::PeerAuthObserver,
+    ) -> Result<PluginCallOutcome, PluginError> {
+        self.call_observed(request, audit, &mut |record| {
             use std::io::Write;
             // 書き込み失敗は呼び出し結果に影響させない。
             let _ = writeln!(std::io::stderr(), "{}", record.to_json_line());
@@ -277,10 +292,11 @@ impl PluginSession {
     /// [`call`](Self::call) と同じ処理を行い、終了時に 1 件の [`PluginCallRecord`] を `observer` へ
     /// 渡す（REPAIR-4）。成功・失敗のどの経路でも 1 回だけ呼ばれ、呼び出しスレッド上で同期実行される
     /// ため長時間ブロックしないこと。都度起動は [`call_once_observed`] へ、常駐は
-    /// [`ResidentPlugin::call_observed`] へ委譲する。
+    /// [`ResidentPlugin::call_observed`] へ委譲する。`audit` は [`call`](Self::call) と同じ。
     pub fn call_observed(
         &mut self,
         request: &Frame,
+        audit: &mut dyn crate::audit::PeerAuthObserver,
         observer: &mut dyn FnMut(&PluginCallRecord),
     ) -> Result<PluginCallOutcome, PluginError> {
         match &mut self.inner {
@@ -290,7 +306,7 @@ impl PluginSession {
                 stats,
             } => {
                 let mut stderr = None;
-                let result = call_once_observed(plugin, request, *timeout, &mut |rec| {
+                let result = call_once_observed(plugin, request, *timeout, audit, &mut |rec| {
                     stderr = Some(rec.stderr.clone());
                     observer(&PluginCallRecord {
                         mode: PluginModeKind::OneShot,
@@ -428,7 +444,12 @@ mod tests {
         let dir = std::env::temp_dir();
         let program = dir.join("no-such-plugin");
         let plugin = OneShotPlugin::new(program, vec![], dir).unwrap();
-        let session = PluginSession::start(&plugin, PluginMode::one_shot()).unwrap();
+        let session = PluginSession::start(
+            &plugin,
+            PluginMode::one_shot(),
+            &mut crate::audit::NoopPeerAuthObserver,
+        )
+        .unwrap();
         assert_eq!(session.mode(), PluginModeKind::OneShot);
         assert!(matches!(
             session.shutdown().unwrap(),

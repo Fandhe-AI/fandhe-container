@@ -13,12 +13,25 @@ fn plug7_mode_selection_requires_unix_transport() {
     let exe = std::env::current_exe().unwrap();
     let dir = std::env::temp_dir();
     let plugin = OneShotPlugin::new(exe, vec![], dir).unwrap();
-    let err = PluginSession::start(&plugin, PluginMode::resident()).unwrap_err();
+    let err = PluginSession::start(
+        &plugin,
+        PluginMode::resident(),
+        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+    )
+    .unwrap_err();
     assert_eq!(err.code(), PluginErrorCode::Unimplemented);
-    let mut session = PluginSession::start(&plugin, PluginMode::one_shot()).unwrap();
+    let mut session = PluginSession::start(
+        &plugin,
+        PluginMode::one_shot(),
+        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+    )
+    .unwrap();
     assert_eq!(session.mode(), PluginModeKind::OneShot);
     let err = session
-        .call(&Frame::new(b"ping".to_vec()).unwrap())
+        .call(
+            &Frame::new(b"ping".to_vec()).unwrap(),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
         .unwrap_err();
     assert_eq!(err.code(), PluginErrorCode::Unimplemented);
 }
@@ -82,7 +95,12 @@ mod unix {
             return;
         };
         let sock = PathBuf::from(sock);
-        let mut s = UdsStream::connect(&sock, Duration::from_secs(5)).unwrap();
+        let mut s = UdsStream::connect(
+            &sock,
+            Duration::from_secs(5),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap();
         let mut seq = 0u32;
         while s.read_frame(rpc(5000)).is_ok() {
             seq += 1;
@@ -143,13 +161,30 @@ mod unix {
             let me = std::process::id();
 
             // 1. 都度起動: 呼び出しごとに新しいプロセスで、seq は毎回 1。
-            let mut s = PluginSession::start(&plugin, PluginMode::one_shot()).unwrap();
+            let mut s = PluginSession::start(
+                &plugin,
+                PluginMode::one_shot(),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
             assert_eq!(s.mode(), PluginModeKind::OneShot);
-            let (a1, seq) = parse(&s.call(&ping()).unwrap().into_response());
+            let (a1, seq) = parse(
+                &s.call(
+                    &ping(),
+                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                )
+                .unwrap()
+                .into_response(),
+            );
             assert_eq!(seq, 1);
             assert_process_gone(a1);
             no_socket_left(&dir);
-            let out = s.call(&ping()).unwrap();
+            let out = s
+                .call(
+                    &ping(),
+                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                )
+                .unwrap();
             // 都度起動の終了状況と stderr は統一 API でも保持される。
             assert_eq!(
                 out.termination(),
@@ -174,12 +209,44 @@ mod unix {
             }
 
             // 2. 常駐へ切替: 同一 pid で seq が 1, 2, 3。
-            let mut s = PluginSession::start(&plugin, PluginMode::resident()).unwrap();
+            let mut s = PluginSession::start(
+                &plugin,
+                PluginMode::resident(),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
             assert_eq!(s.mode(), PluginModeKind::Resident);
-            let (b, seq) = parse(&s.call(&ping()).unwrap().into_response());
+            let (b, seq) = parse(
+                &s.call(
+                    &ping(),
+                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                )
+                .unwrap()
+                .into_response(),
+            );
             assert_eq!(seq, 1);
-            assert_eq!(parse(&s.call(&ping()).unwrap().into_response()), (b, 2));
-            assert_eq!(parse(&s.call(&ping()).unwrap().into_response()), (b, 3));
+            assert_eq!(
+                parse(
+                    &s.call(
+                        &ping(),
+                        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new()
+                    )
+                    .unwrap()
+                    .into_response()
+                ),
+                (b, 2)
+            );
+            assert_eq!(
+                parse(
+                    &s.call(
+                        &ping(),
+                        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new()
+                    )
+                    .unwrap()
+                    .into_response()
+                ),
+                (b, 3)
+            );
             assert!(b != me && b != a1 && b != a2);
             match s.shutdown().unwrap() {
                 PluginSessionShutdown::Resident(done) => assert_eq!(
@@ -192,8 +259,20 @@ mod unix {
             no_socket_left(&dir);
 
             // 3. 再び都度起動へ切替。
-            let mut s = PluginSession::start(&plugin, PluginMode::one_shot()).unwrap();
-            let (c, seq) = parse(&s.call(&ping()).unwrap().into_response());
+            let mut s = PluginSession::start(
+                &plugin,
+                PluginMode::one_shot(),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
+            let (c, seq) = parse(
+                &s.call(
+                    &ping(),
+                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                )
+                .unwrap()
+                .into_response(),
+            );
             assert_eq!(seq, 1);
             assert_ne!(c, b);
             assert_process_gone(c);
@@ -217,10 +296,19 @@ mod unix {
                 (PluginMode::resident(), "plugin.resident_call"),
             ] {
                 let kind = mode.kind();
-                let mut s = PluginSession::start(&plugin, mode).unwrap();
+                let mut s = PluginSession::start(
+                    &plugin,
+                    mode,
+                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                )
+                .unwrap();
                 let mut records = Vec::new();
-                s.call_observed(&ping(), &mut |r| records.push(r.clone()))
-                    .unwrap();
+                s.call_observed(
+                    &ping(),
+                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                    &mut |r| records.push(r.clone()),
+                )
+                .unwrap();
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].mode, kind);
                 assert_eq!(records[0].operation, op);
@@ -239,12 +327,27 @@ mod unix {
         let missing = dir.0.join("no-such-plugin");
         let plugin = OneShotPlugin::new(missing, vec![], dir.0.clone()).unwrap();
 
-        let e = PluginSession::start(&plugin, PluginMode::resident()).unwrap_err();
+        let e = PluginSession::start(
+            &plugin,
+            PluginMode::resident(),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::NotFound);
         no_socket_left(&dir);
 
-        let mut s = PluginSession::start(&plugin, PluginMode::one_shot()).unwrap();
-        let e = s.call(&ping()).unwrap_err();
+        let mut s = PluginSession::start(
+            &plugin,
+            PluginMode::one_shot(),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap();
+        let e = s
+            .call(
+                &ping(),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::NotFound);
         no_socket_left(&dir);
     }

@@ -1452,37 +1452,6 @@ mod tests {
         d
     }
 
-    /// PLUG-7・PLUG-12（#1310）: `DirStream` は検証済みディレクトリ fd 基準で `.`・`..` を除く名前を
-    /// すべて返し、末尾まで読んだ後のカーネル位置から開き直すと何も返さない（続きから読める）。
-    #[test]
-    fn plug7_dir_stream_lists_names_and_resumes_at_kernel_position() {
-        let d = tmpdir("dirstream");
-        for n in ["a", "b", "c"] {
-            std::fs::write(d.join(n), b"").unwrap();
-        }
-        let dir = open_dir_nofollow(&d.canonicalize().unwrap()).unwrap();
-        let mut stream = DirStream::open_at(&dir, 0).unwrap();
-        assert_eq!(stream.position().unwrap(), 0);
-        let mut names = Vec::new();
-        while let Some(n) = stream.next_entry(<[u8]>::to_vec).unwrap() {
-            names.push(String::from_utf8(n).unwrap());
-        }
-        names.sort();
-        assert_eq!(names, ["a", "b", "c"]);
-        let end = stream.position().unwrap();
-        assert_ne!(end, 0);
-        let mut rest = DirStream::open_at(&dir, end).unwrap();
-        assert_eq!(rest.next_entry(<[u8]>::to_vec).unwrap(), None);
-        // 開き直しは別の open file description なので、`dir` 自身の読み取り位置は変わらない。
-        let mut again = DirStream::open_at(&dir, 0).unwrap();
-        let mut count = 0;
-        while again.next_entry(|_| ()).unwrap().is_some() {
-            count += 1;
-        }
-        assert_eq!(count, 3);
-        std::fs::remove_dir_all(&d).unwrap();
-    }
-
     /// PLUG-12: `fchmodat2` 非対応環境向けの縮退経路が socket の mode を設定できる。
     #[test]
     fn opath_fallback_sets_socket_mode_0600() {
@@ -1843,6 +1812,100 @@ pub(crate) fn resident_size_bytes(pid: u32) -> io::Result<u64> {
     // SAFETY: 戻り値が構造体サイズと一致したため、カーネルが全フィールドを書き込み済み。
     let info = unsafe { info.assume_init() };
     Ok(info.pti_resident_size)
+}
+
+/// `DirStream` の照合（対応 OS・アーキテクチャ共通。macOS の経路は macOS の CI が実行する）。
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod dir_stream_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("fc-dirs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// PLUG-7・PLUG-12（#1310）: `DirStream` は検証済みディレクトリ fd 基準で `.`・`..` を除く名前を
+    /// すべて返し、末尾まで読んだ後のカーネル位置から開き直すと何も返さない（続きから読める）。
+    #[test]
+    fn plug7_dir_stream_lists_names_and_resumes_at_kernel_position() {
+        let d = tmpdir("list");
+        for n in ["a", "b", "c"] {
+            std::fs::write(d.join(n), b"").unwrap();
+        }
+        let dir = open_dir_nofollow(&d.canonicalize().unwrap()).unwrap();
+        let mut stream = DirStream::open_at(&dir, 0).unwrap();
+        assert_eq!(stream.position().unwrap(), 0);
+        let mut names = Vec::new();
+        while let Some(n) = stream.next_entry(<[u8]>::to_vec).unwrap() {
+            names.push(String::from_utf8(n).unwrap());
+        }
+        names.sort();
+        assert_eq!(names, ["a", "b", "c"]);
+        let end = stream.position().unwrap();
+        assert_ne!(end, 0);
+        let mut rest = DirStream::open_at(&dir, end).unwrap();
+        assert_eq!(rest.next_entry(<[u8]>::to_vec).unwrap(), None);
+        // 開き直しは別の open file description なので、`dir` 自身の読み取り位置は変わらない。
+        let mut again = DirStream::open_at(&dir, 0).unwrap();
+        let mut count = 0;
+        while again.next_entry(|_| ()).unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// PLUG-7・REPAIR-5（#1310）: libc のまとめ読みの境界で得たカーネル位置から開き直すと、その境界より
+    /// 後ろのエントリだけが返る（手前を読み直さずに続きから読める）。3,000 件のディレクトリで、2 つ目の
+    /// まとめ読みの境界から読んだ件数が「全件 - 境界より手前の件数」に一致することを確かめる。
+    #[test]
+    fn plug7_dir_stream_resumes_from_batch_boundary() {
+        const TOTAL: usize = 3_000;
+        let d = tmpdir("resume");
+        for i in 0..TOTAL {
+            std::fs::write(d.join(format!("entry-{i:04}")), b"").unwrap();
+        }
+        let dir = open_dir_nofollow(&d.canonicalize().unwrap()).unwrap();
+        let mut stream = DirStream::open_at(&dir, 0).unwrap();
+        // (まとめ読みを始めた位置, その先頭エントリの通し番号)
+        let mut batches: Vec<(u64, usize)> = Vec::new();
+        let mut pos = 0u64;
+        let mut total = 0usize;
+        while stream.next_entry(|_| ()).unwrap().is_some() {
+            let now = stream.position().unwrap();
+            if now != pos {
+                batches.push((pos, total));
+                pos = now;
+            }
+            total += 1;
+        }
+        assert_eq!(total, TOTAL);
+        assert!(batches.len() >= 2, "batches={batches:?}");
+        let (offset, before) = batches[1];
+        let mut rest = DirStream::open_at(&dir, offset).unwrap();
+        let mut remaining = 0usize;
+        while rest.next_entry(|_| ()).unwrap().is_some() {
+            remaining += 1;
+        }
+        assert_eq!(
+            remaining,
+            TOTAL - before,
+            "offset={offset} before={before} batches={:?}",
+            &batches[..batches.len().min(6)]
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }
 
 /// PLUG-12・#1308: Linux・macOS 以外の OS 向けに他 OS の値を流用した仮置きの `const` / `type` を

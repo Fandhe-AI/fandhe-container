@@ -176,7 +176,7 @@ pub struct OneShotSweep {
     pub in_use: u32,
     /// 削除根拠が無い・拒否（symlink・他 UID・記録なし／不一致）・エラーで飛ばした数。
     pub skipped: u32,
-    /// 候補の件数上限または列挙総数の上限に達して走査を打ち切ったか。
+    /// 候補の件数上限または走査するエントリ数の上限に達して走査を打ち切ったか（続きは次回の掃除が走査する）。
     pub truncated: bool,
 }
 
@@ -641,7 +641,7 @@ mod imp {
 
     /// 走査位置ヒントを保存するファイル名（runtime directory 直下。候補の名前規則に一致しない）。
     const SWEEP_CURSOR_NAME: &[u8] = b"fcsweep-cursor";
-    /// 走査位置ヒントの最大長（`<10 進 u64> <10 進 u64>\n`。10 進 u64 は 20 桁）。
+    /// 走査位置ヒントの最大長（`<10 進 u64> <10 進 u64>\n`。10 進 u64 は 20 桁なので内容は最大 42 バイト）。
     const SWEEP_CURSOR_MAX_LEN: usize = 48;
 
     /// 掃除の走査位置（#1310）。件数ではなくカーネルのディレクトリ位置で表す。
@@ -1514,9 +1514,13 @@ mod imp {
             let mut passes = 0;
             let mut total_read = 0;
             let mut offsets = std::collections::BTreeSet::new();
+            // 失敗時の診断用: 各回の（開始位置, 読み取り数, 打ち切り）。
+            let mut history = Vec::new();
             loop {
-                let skip = stored_pos(&t.0).map_or(0, |p| p.skip) as usize;
+                let before = stored_pos(&t.0);
+                let skip = before.map_or(0, |p| p.skip) as usize;
                 let (r, read) = sweep_one_shot_counted(&t.0, euid, MAX_SCAN, 256).unwrap();
+                history.push((before, read, r.truncated));
                 passes += 1;
                 total_read += read;
                 assert!(skip < OTHERS, "skip={skip}");
@@ -1527,7 +1531,7 @@ mod imp {
                 if !r.truncated {
                     break;
                 }
-                assert!(passes < 13, "sweep did not reach the end");
+                assert!(passes < 13, "sweep did not reach the end: {history:?}");
             }
             assert_eq!(passes, 13);
             assert!(!lock.exists());

@@ -216,7 +216,8 @@ impl UdsListener {
     /// （都度起動モード専用。PLUG-7・PLUG-12・REPAIR-5。`crate::lifecycle::call_once` が使う）。
     ///
     /// peer の pid が `expected_pid` と一致しない接続（同一 UID の別プロセス）は切断して受付を継続する
-    /// （期限内に限る。pid を取得できない環境は fail-closed でエラー）。接続待ちの間は `abort` を
+    /// （期限内に限る。pid を取得できない環境は fail-closed でエラー）。pid 照合は数値比較のため、子の終了後に
+    /// 同じ pid が再利用される窓が残る（pidfd 等での緩和は将来課題。`crate::sys` の「限界」・PLUG-12）。接続待ちの間は `abort` を
     /// 繰り返し呼び、`Some(err)` を返したらその `err` で受付を中断する。保留中の接続がある場合は
     /// `abort` より接続の受理を優先する（期限切れ間際に届いた接続を取りこぼさない）。
     /// 拒否した接続（UID・pid の不一致・取得失敗）は 1 件ごとに `observer` へ通知する（TASK-124.5）。

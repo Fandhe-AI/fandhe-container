@@ -83,7 +83,13 @@
 //! - 順序: accept（connect）の直後、フレームの read・write より前に検証する。
 //! - fail-closed: 取得失敗も UID 不一致も `Err` を返し、呼び出し側は stream を drop して切断する。
 //! - 比較する UID は接続時点の peer の実効 uid と、listener bind 時（client は connect 時）の自 euid。
-//!   user namespace 外の uid は overflowuid として見え、不一致で拒否される（安全側）。
+//!   接続元が別の user namespace にあり uid が未マッピングなら overflowuid（Linux 既定 65534）として見え、
+//!   core 自身の euid が overflowuid として観測されない通常の構成では不一致で拒否される（安全側）。core の
+//!   euid 自体が 65534 として観測される構成（未マッピングの user namespace 内・nobody 実行等）では数値が
+//!   一致して受理される。照合は数値の完全一致のみで overflowuid を特別扱いしない（現状挙動。#1390）。
+//! - 限界（残存リスク。対策は未実装。詳細は `crate::sys` のモジュール doc「限界」）: (a) client 側で得られるのは
+//!   server が `listen(2)` を呼んだ時点の資格情報（Linux。`man 7 unix`。macOS は未検証）、(b) 接続済み fd を
+//!   別プロセスへ渡しても検出できない、(c) pid 照合には PID 再利用の窓が残る。
 //! - 同一 UID の別プロセスは脅威モデル外（第 1 層は 0700 の配置ディレクトリ）。
 //! - `unsafe` を含む取得処理は `crate::sys::peer_uid`（`sys` モジュール）に閉じる。
 //! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。別 UID 接続拒否の結合試験は `tests/peer_auth.rs`（TASK-124.4・#295。実機前提の 2 件は人間が実行）。accept / connect で最初の読み書きより前に検証する順序は `transport::tests::plug12_order` で機械照合する（TASK-124.6・#1389）。拒否 1 件ごとの監査イベント通知は `crate::audit`（TASK-124.5・#1388・SEC-4）。永続的な監査ログへの配線は core 側 proxy（TASK-114）で未実装（REPAIR-3）。
@@ -238,6 +244,9 @@ fn verify_peer_with(
 /// `transport` の accept 直後・connect 直後（最初の read より前）から呼ばれる。Err なら呼び出し側が
 /// stream を drop して切断し、`PeerRejection` から監査イベントを通知して `error` を返す
 /// （TASK-124.5）。取得は `crate::sys::peer_uid`（Linux は SO_PEERCRED）。
+///
+/// client の connect 側で得る peer 資格情報は server が `listen(2)` を呼んだ時点のものであり、接続済み fd の
+/// 別プロセスへの受け渡しも検出できない（モジュール doc・`crate::sys` の「限界」）。
 #[cfg(unix)]
 pub(crate) fn verify_peer(
     stream: &std::os::unix::net::UnixStream,
@@ -1555,6 +1564,17 @@ mod tests {
         for (p, e) in [(1000, 1001), (0, 1000), (1000, 0), (65534, 1000)] {
             assert!(!peer_uid_matches(p, e), "{p} vs {e}");
         }
+    }
+
+    /// PLUG-12・#1390: core の euid 自体が overflowuid（65534）として観測される構成では、peer も 65534 なら
+    /// 数値一致で受理される（現状挙動の固定。前提条件はモジュール doc 参照）。対照として 65534 対 1000 は拒否。
+    #[cfg(unix)]
+    #[test]
+    fn plug12_peer_uid_overflowuid_pair_is_accepted_as_identical() {
+        assert!(peer_uid_matches(65534, 65534));
+        assert!(verify_peer_with(|| Ok(65534), 65534).is_ok());
+        let err = verify_peer_with(|| Ok(65534), 1000).unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
     }
 
     /// PLUG-12: 不一致は PermissionDenied・固定メッセージで UID 値を含まない。

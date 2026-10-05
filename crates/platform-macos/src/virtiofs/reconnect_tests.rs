@@ -106,19 +106,19 @@ impl FrameReceiver for MockTransport {
 /// 接続結果の台本。`Ok(mode)` で接続成功、`Err` で失敗。尽きたら失敗し続ける。
 struct ScriptedConnector {
     script: VecDeque<Result<Mode, IoError>>,
-    calls: Rc<RefCell<u32>>,
+    calls: Arc<Mutex<u32>>,
     /// 接続ごとに作った送信ログ（接続の順）。
-    logs: Rc<RefCell<Vec<SentLog>>>,
+    logs: Arc<Mutex<Vec<SentLog>>>,
 }
 
 impl VirtiofsConnector for ScriptedConnector {
     type Transport = MockTransport;
     fn connect(&mut self, _timeout: IoTimeout) -> Result<MockTransport, IoError> {
-        *self.calls.borrow_mut() += 1;
+        *self.calls.lock().expect("lock") += 1;
         match self.script.pop_front() {
             Some(Ok(mode)) => {
                 let sent: SentLog = Arc::default();
-                self.logs.borrow_mut().push(Arc::clone(&sent));
+                self.logs.lock().expect("lock").push(Arc::clone(&sent));
                 Ok(MockTransport {
                     mode,
                     pending: VecDeque::new(),
@@ -132,12 +132,49 @@ impl VirtiofsConnector for ScriptedConnector {
 }
 
 struct Harness {
-    calls: Rc<RefCell<u32>>,
-    logs: Rc<RefCell<Vec<SentLog>>>,
+    calls: Arc<Mutex<u32>>,
+    logs: Arc<Mutex<Vec<SentLog>>>,
     pauses: Rc<RefCell<Vec<Duration>>>,
 }
 
-type Client = ReconnectingVirtiofsIoClient<ScriptedConnector, NoopSendObserver>;
+type Client<C = ScriptedConnector> = ReconnectingVirtiofsIoClient<C, NoopSendObserver>;
+
+/// 応答しない connector（`connect_timeout` を無視して長時間ブロック）。
+struct HangingConnector;
+
+impl VirtiofsConnector for HangingConnector {
+    type Transport = MockTransport;
+    fn connect(&mut self, _timeout: IoTimeout) -> Result<MockTransport, IoError> {
+        std::thread::sleep(Duration::from_secs(3));
+        Err(IoError::new(IoErrorCode::Unavailable, "late"))
+    }
+}
+
+/// REPAIR-5・MAC-1・TASK-65.5: connector が timeout を無視してハングしても、接続試行は期限で打ち切られ
+/// 総待ち時間が `max_attempts × connect_timeout + 間隔` で有界になる（2 回目以降は即 Unavailable）。
+#[test]
+fn hanging_connector_is_cut_off_at_connect_timeout() {
+    let dir = TempDir::new("hang");
+    let timeout = IoTimeout::new(Duration::from_millis(100)).expect("timeout");
+    let policy = ReconnectPolicy::try_new(2, Duration::from_millis(1), timeout).expect("policy");
+    let started = std::time::Instant::now();
+    let err = Client::<HangingConnector>::connect_with_pause(
+        &share(&dir, ShareAccess::ReadWrite),
+        HangingConnector,
+        InFlightLimit::new(4).expect("limit"),
+        NoopSendObserver,
+        VirtiofsIoTimeouts::new(secs(1), secs(1), secs(1)),
+        policy,
+        Box::new(|_| {}),
+    )
+    .err()
+    .expect("must fail");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(
+        err,
+        VirtiofsIoError::ReconnectFailed { attempts: 2, .. }
+    ));
+}
 
 fn policy(attempts: u32, interval_ms: u64) -> ReconnectPolicy {
     ReconnectPolicy::try_new(attempts, Duration::from_millis(interval_ms), secs(1)).expect("policy")
@@ -151,14 +188,14 @@ fn build(
     policy: ReconnectPolicy,
 ) -> (Result<Client, VirtiofsIoError>, Harness) {
     let h = Harness {
-        calls: Rc::default(),
-        logs: Rc::default(),
+        calls: Arc::default(),
+        logs: Arc::default(),
         pauses: Rc::default(),
     };
     let connector = ScriptedConnector {
         script: script.into(),
-        calls: Rc::clone(&h.calls),
-        logs: Rc::clone(&h.logs),
+        calls: Arc::clone(&h.calls),
+        logs: Arc::clone(&h.logs),
     };
     let pauses = Rc::clone(&h.pauses);
     let client = Client::connect_with_pause(
@@ -215,14 +252,14 @@ fn invalid_construction_never_calls_connector() {
         res.err().expect("rejected").code(),
         "virtiofs_io.read_only_share"
     );
-    assert_eq!(*h.calls.borrow(), 0);
+    assert_eq!(*h.calls.lock().expect("lock"), 0);
 
     let (res, h) = build(&dir, ShareAccess::ReadWrite, 1, vec![], policy(3, 1));
     assert_eq!(
         res.err().expect("rejected").code(),
         "virtiofs_io.in_flight_limit_too_small"
     );
-    assert_eq!(*h.calls.borrow(), 0);
+    assert_eq!(*h.calls.lock().expect("lock"), 0);
 }
 
 /// REPAIR-5・ERR-1・TASK-65.5: 失敗し続ける connector では回数ちょうど試行し、間隔は N-1 回で、構造化エラーを返す。
@@ -231,7 +268,7 @@ fn exhausted_attempts_return_reconnect_failed() {
     let dir = TempDir::new("exhaust");
     let (res, h) = build(&dir, ShareAccess::ReadWrite, 4, vec![], policy(3, 7));
     let err = res.err().expect("must fail");
-    assert_eq!(*h.calls.borrow(), 3);
+    assert_eq!(*h.calls.lock().expect("lock"), 3);
     assert_eq!(*h.pauses.borrow(), vec![Duration::from_millis(7); 2]);
     assert_eq!(err.code(), "virtiofs_io.reconnect_failed");
     assert_eq!(
@@ -253,7 +290,7 @@ fn succeeds_on_third_attempt() {
     let script = vec![Err(refused()), Err(refused()), Ok(Mode::Healthy)];
     let (res, h) = build(&dir, ShareAccess::ReadWrite, 4, script, policy(3, 1));
     let mut c = res.expect("connected");
-    assert_eq!(*h.calls.borrow(), 3);
+    assert_eq!(*h.calls.lock().expect("lock"), 3);
     assert!(c.is_connected());
     c.write(b"a").expect("write");
     let report = c.flush().expect("flush");
@@ -277,7 +314,8 @@ fn connection_loss_reconnects_without_resend() {
     assert_eq!(
         err.message(),
         "virtiofs io flush failed because the connection was lost; reconnected=true, \
-         2 unflushed write(s) must be re-issued"
+         up to 2 unflushed write(s) may or may not be persisted; \
+         re-issue only idempotent writes, otherwise verify the committed range first"
     );
     assert!(matches!(
         err,
@@ -292,7 +330,7 @@ fn connection_loss_reconnects_without_resend() {
     assert!(c.is_connected());
 
     // 新しい接続には何も送られていない（自動再送なし）。
-    let logs = h.logs.borrow();
+    let logs = h.logs.lock().expect("lock");
     assert_eq!(logs.len(), 2);
     assert!(logs[1].lock().expect("lock").is_empty());
     drop(logs);
@@ -322,7 +360,7 @@ fn connection_loss_then_reconnect_failure() {
     ));
     assert_eq!(c.unflushed_writes(), 0);
     assert!(!c.is_connected());
-    assert_eq!(*h.calls.borrow(), 3);
+    assert_eq!(*h.calls.lock().expect("lock"), 3);
     assert_eq!(*h.pauses.borrow(), vec![Duration::from_millis(3)]);
 }
 
@@ -336,7 +374,7 @@ fn non_disconnect_error_passes_through_then_reconnects_next_call() {
     c.write(b"a").expect("write");
     let err = c.flush().expect_err("timeout");
     assert_eq!(err.code(), "virtiofs_io.timeout");
-    assert_eq!(*h.calls.borrow(), 1);
+    assert_eq!(*h.calls.lock().expect("lock"), 1);
     assert!(!c.is_connected());
 
     // poison 後の再接続では旧接続の未確定 Write(1 件) を黙って捨てず ConnectionLost で明示する。
@@ -350,7 +388,7 @@ fn non_disconnect_error_passes_through_then_reconnects_next_call() {
             ..
         }
     ));
-    assert_eq!(*h.calls.borrow(), 2);
+    assert_eq!(*h.calls.lock().expect("lock"), 2);
     assert_eq!(c.reconnects(), 1);
     assert_eq!(c.unflushed_writes(), 0);
     c.write(b"b").expect("write after acknowledged loss");

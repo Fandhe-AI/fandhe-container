@@ -32,6 +32,8 @@
 //! 具象 [`VirtiofsConnector`]（ゲストの vsock 接続・ホスト側 UDS / VZ vsock の connect）は別タスク
 //! （TASK-115 ほか）。バックオフは固定間隔のみで、指数バックオフ・ジッターは将来拡張。
 
+use std::sync::mpsc::{RecvTimeoutError, channel};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
 use fandhe_container_io::{
@@ -61,6 +63,9 @@ pub trait VirtiofsConnector {
     type Transport: FrameSender<Frame = Frame> + FrameReceiver<Frame = Frame>;
 
     /// 1 回の接続試行。`timeout` 以内に確立できなければ `IoErrorCode::Timeout` 等で返す（REPAIR-5）。
+    ///
+    /// 実装側が `timeout` を守れなくても、呼び出し側（[`ReconnectingVirtiofsIoClient`]）が別スレッドで
+    /// 試行し `timeout` 経過時点で待機を打ち切るため、総待ち時間の上限は崩れない。
     fn connect(&mut self, timeout: IoTimeout) -> Result<Self::Transport, IoError>;
 }
 
@@ -132,7 +137,7 @@ where
     O: SendObserver + Clone,
 {
     share: VirtiofsShareSpec,
-    connector: C,
+    connector: Arc<Mutex<C>>,
     limit: InFlightLimit,
     observer: O,
     timeouts: VirtiofsIoTimeouts,
@@ -145,7 +150,8 @@ where
 
 impl<C, O> ReconnectingVirtiofsIoClient<C, O>
 where
-    C: VirtiofsConnector,
+    C: VirtiofsConnector + Send + 'static,
+    C::Transport: Send + 'static,
     O: SendObserver + Clone,
 {
     /// ReadOnly 共有と `limit < MIN_IN_FLIGHT_LIMIT` を接続前に拒否し、ポリシーに従って初回接続する。
@@ -188,7 +194,7 @@ where
         }
         let mut this = Self {
             share: share.clone(),
-            connector,
+            connector: Arc::new(Mutex::new(connector)),
             limit,
             observer,
             timeouts,
@@ -223,11 +229,56 @@ where
         self.client.as_ref().is_some_and(|c| !c.is_poisoned())
     }
 
+    /// 1 回の接続試行を別スレッドで走らせ、`connect_timeout` 経過で待機を打ち切る（REPAIR-5）。
+    ///
+    /// connector が応答しなくても呼び出し元は期限内に戻る。打ち切った試行のスレッドは connector の
+    /// 復帰まで残り得るが、その間は connector のロックを握り続けるため、後続の試行は即座に
+    /// `Unavailable` で失敗する（スレッドを積み増さない）。遅れて確立した接続は破棄される。
+    fn connect_with_deadline(&self) -> Result<C::Transport, IoError> {
+        let (tx, rx) = channel();
+        let connector = Arc::clone(&self.connector);
+        let timeout = self.policy.connect_timeout;
+        let spawned = std::thread::Builder::new()
+            .name("virtiofs-connect".to_owned())
+            .spawn(move || {
+                let result = match connector.try_lock() {
+                    Ok(mut guard) => guard.connect(timeout),
+                    Err(TryLockError::WouldBlock) => Err(IoError::new(
+                        IoErrorCode::Unavailable,
+                        "previous connect attempt is still running",
+                    )),
+                    Err(TryLockError::Poisoned(_)) => Err(IoError::new(
+                        IoErrorCode::Internal,
+                        "connector panicked during an earlier attempt",
+                    )),
+                };
+                // 受信側が期限切れで去っていれば確立済みの接続はここで破棄される。
+                let _ = tx.send(result);
+            });
+        if spawned.is_err() {
+            return Err(IoError::new(
+                IoErrorCode::ResourceExhausted,
+                "failed to spawn connect worker",
+            ));
+        }
+        match rx.recv_timeout(timeout.as_duration()) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(IoError::new(
+                IoErrorCode::Timeout,
+                "connect attempt exceeded its deadline",
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(IoError::new(
+                IoErrorCode::Internal,
+                "connect worker terminated without a result",
+            )),
+        }
+    }
+
     /// ポリシーに従い接続を確立する。全試行が失敗したら [`VirtiofsIoError::ReconnectFailed`]。
     fn establish(&mut self) -> Result<(), VirtiofsIoError> {
         let mut last: Option<IoError> = None;
         for attempt in 1..=self.policy.max_attempts {
-            match self.connector.connect(self.policy.connect_timeout) {
+            match self.connect_with_deadline() {
                 Ok(transport) => {
                     let client = VirtiofsIoClient::new(
                         &self.share,

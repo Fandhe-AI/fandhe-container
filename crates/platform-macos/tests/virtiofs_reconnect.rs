@@ -212,7 +212,8 @@ fn reconnects_after_disconnect_and_commit_unit_is_reissued() {
     assert_eq!(
         err.message(),
         "virtiofs io flush failed because the connection was lost; reconnected=true, \
-         2 unflushed write(s) must be re-issued"
+         up to 2 unflushed write(s) may or may not be persisted; \
+         re-issue only idempotent writes, otherwise verify the committed range first"
     );
     assert_eq!(c.reconnects(), 1);
     assert_eq!(c.unflushed_writes(), 0);

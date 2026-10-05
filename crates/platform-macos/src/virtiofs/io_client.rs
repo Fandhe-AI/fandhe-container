@@ -201,7 +201,8 @@ impl VirtiofsIoError {
                 ..
             } => format!(
                 "virtiofs io {} failed because the connection was lost; reconnected={reconnected}, \
-                 {unflushed_writes} unflushed write(s) must be re-issued",
+                 up to {unflushed_writes} unflushed write(s) may or may not be persisted; \
+                 re-issue only idempotent writes, otherwise verify the committed range first",
                 op.as_str()
             ),
             VirtiofsIoError::ReconnectFailed {
@@ -212,7 +213,10 @@ impl VirtiofsIoError {
                 let base =
                     format!("virtiofs io reconnect failed after {attempts} attempt(s): {source}");
                 if *unflushed_writes > 0 {
-                    format!("{base}; {unflushed_writes} unflushed write(s) must be re-issued")
+                    format!(
+                        "{base}; up to {unflushed_writes} unflushed write(s) may or may not be persisted; \
+                         re-issue only idempotent writes, otherwise verify the committed range first"
+                    )
                 } else {
                     base
                 }

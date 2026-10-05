@@ -340,7 +340,8 @@ fn connection_loss_reconnects_without_resend() {
     assert_eq!(report.acked_writes, 2);
 }
 
-/// REPAIR-5・ERR-1・TASK-65.5: 切断後の再接続にも失敗したら ReconnectFailed を返し、panic しない。
+/// REPAIR-5・ERR-1・IO-2・TASK-65.5: 切断後の再接続にも失敗したら ReconnectFailed を返し、panic しない。
+/// 未確定件数は保持され、後続の操作でも同じ件数で再通知される。
 #[test]
 fn connection_loss_then_reconnect_failure() {
     let dir = TempDir::new("lost-fail");
@@ -362,6 +363,77 @@ fn connection_loss_then_reconnect_failure() {
     assert!(!c.is_connected());
     assert_eq!(*h.calls.lock().expect("lock"), 3);
     assert_eq!(*h.pauses.borrow(), vec![Duration::from_millis(3)]);
+
+    // 後続の write も再接続に失敗し、旧接続の件数を再び通知する（write 自体は送らない）。
+    let err = c.write(b"b").expect_err("still unreachable");
+    assert!(matches!(
+        err,
+        VirtiofsIoError::ReconnectFailed {
+            attempts: 2,
+            unflushed_writes: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        err.message(),
+        "virtiofs io reconnect failed after 2 attempt(s): UNAVAILABLE: connect refused; \
+         up to 1 unflushed write(s) may or may not be persisted; \
+         re-issue only idempotent writes, otherwise verify the committed range first"
+    );
+    assert_eq!(c.unflushed_writes(), 1);
+    assert_eq!(*h.calls.lock().expect("lock"), 5);
+    assert_eq!(c.reconnects(), 0);
+}
+
+/// IO-2・TASK-65.5: 再接続に失敗した後の操作で再接続に成功しても、旧接続の未確定件数を黙って捨てず
+/// ConnectionLost で通知し、その操作は実行しない（新しい接続には何も送らない）。
+#[test]
+fn unflushed_count_survives_failed_reconnect_until_reported() {
+    let dir = TempDir::new("lost-fail-recover");
+    let script = vec![
+        Ok(Mode::DieOnRecv),
+        Err(refused()),
+        Err(refused()),
+        Ok(Mode::Healthy),
+    ];
+    let (res, h) = build(&dir, ShareAccess::ReadWrite, 8, script, policy(2, 1));
+    let mut c = res.expect("connected");
+    c.write(b"a").expect("write");
+    let err = c.flush().expect_err("reconnect fails");
+    assert!(matches!(
+        err,
+        VirtiofsIoError::ReconnectFailed {
+            attempts: 2,
+            unflushed_writes: 1,
+            ..
+        }
+    ));
+    assert_eq!(c.unflushed_writes(), 1);
+
+    let err = c.write(b"b").expect_err("unflushed must be reported");
+    match &err {
+        VirtiofsIoError::ConnectionLost {
+            op: VirtiofsIoOp::Write,
+            unflushed_writes: 1,
+            reconnected: true,
+            source,
+        } => assert_eq!(
+            source.to_string(),
+            "UNAVAILABLE: an earlier reconnect failed while writes were unflushed"
+        ),
+        other => panic!("unexpected: {other:?}"),
+    }
+    assert_eq!(c.unflushed_writes(), 0);
+    assert_eq!(c.reconnects(), 1);
+    assert_eq!(*h.calls.lock().expect("lock"), 4);
+    {
+        let logs = h.logs.lock().expect("lock");
+        assert_eq!(logs.len(), 2);
+        assert!(logs[1].lock().expect("lock").is_empty());
+    }
+
+    c.write(b"b").expect("write after acknowledged loss");
+    assert_eq!(c.unflushed_writes(), 1);
 }
 
 /// REPAIR-5・TASK-65.5: 接続断以外のエラーは元のまま返し、次の呼び出しで再接続する。
@@ -481,5 +553,29 @@ fn stuck_connect_thread_is_not_stacked() {
             assert_eq!(source.code(), IoErrorCode::Unavailable);
         }
         other => panic!("unexpected: {other:?}"),
+    }
+}
+
+/// REPAIR-5・TASK-65.5: 試行間の待機が実質 0 でも、前の試行の結果を受け取った時点で実行中フラグは
+/// 戻っており、次の試行は必ず connector を呼ぶ（誤って `previous connect attempt is still running` で
+/// 失敗しない）。競合を踏みやすいよう繰り返して確認する。
+#[test]
+fn back_to_back_attempts_always_call_connector() {
+    let dir = TempDir::new("back-to-back");
+    for round in 0..500 {
+        let (res, h) = build(&dir, ShareAccess::ReadWrite, 4, vec![], policy(3, 1));
+        match res.err().expect("must fail") {
+            VirtiofsIoError::ReconnectFailed {
+                attempts: 3,
+                unflushed_writes: 0,
+                source,
+            } => assert_eq!(
+                source.to_string(),
+                "UNAVAILABLE: connect refused",
+                "round {round}"
+            ),
+            other => panic!("round {round}: unexpected: {other:?}"),
+        }
+        assert_eq!(*h.calls.lock().expect("lock"), 3, "round {round}");
     }
 }

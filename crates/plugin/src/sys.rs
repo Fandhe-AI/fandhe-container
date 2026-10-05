@@ -19,6 +19,7 @@
 //! - Linux・macOS: `fchmodat(2)`（`AT_SYMLINK_NOFOLLOW`。Linux の `fchmodat2` 非対応環境は `O_PATH` fd 経由へ縮退）を
 //!   検証済みディレクトリ fd 基準で呼ぶ（パス再解決による TOCTOU を避ける。PLUG-12）。それ以外の unix は
 //!   `mode_t` の幅・`AT_SYMLINK_NOFOLLOW` の値を持たないため `fchmodat` を呼ばず `Unsupported`（fail-closed。#1308）
+//! - いずれの unix（対応 OS・アーキテクチャ）: `mkdirat(2)` を検証済みディレクトリ fd 基準で呼ぶ（runtime directory の作成。PLUG-12・#1309）
 //! - いずれの unix: `unlinkat(2)` を検証済みディレクトリ fd 基準で呼ぶ（OS 依存の型・定数を使わず flags は 0 固定。PLUG-12）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_NOFOLLOW | O_DIRECTORY)` で配置ディレクトリを
 //!   ルートから 1 要素ずつ辿る（祖先要素の symlink を拒否。PLUG-12）
@@ -32,7 +33,7 @@
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 //! - OS ごとに値・幅が異なる定数・型（`ModeT`・`AT_SYMLINK_NOFOLLOW`・`O_*` 等）は対応 OS ごとに個別定義し、
@@ -554,6 +555,21 @@ unsafe extern "C" {
     fn c_openat(dirfd: i32, path: *const core::ffi::c_char, flags: i32, ...) -> i32;
 }
 
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: POSIX の `int mkdirat(int, const char *, mode_t)` と同じ型・幅
+    // （`mode_t` は Linux で `u32`、macOS で `u16`。上の `ModeT`。確認元: Linux の `man 2 mkdirat`・
+    // macOS SDK の `sys/stat.h`）。可変長引数・flags 引数は無い。
+    #[link_name = "mkdirat"]
+    fn c_mkdirat(dirfd: i32, path: *const core::ffi::c_char, mode: ModeT) -> i32;
+}
+
 /// `dirfd` 基準で `name` を `O_DIRECTORY | O_NOFOLLOW` で開く（1 要素）。
 #[cfg(any(
     target_os = "macos",
@@ -741,6 +757,44 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr) -> io::Result<LockHandle> {
         let _ = (dir, name);
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+/// `dir`（検証済みの開いたディレクトリ fd）基準で、単一要素 `name` のディレクトリを作成する
+/// （`mkdirat(2)`。PLUG-12・#1309）。`crate::uds_security` の runtime directory 作成が呼び、
+/// パスを再解決しないため、検証後に祖先を差し替えられても検証済みの `dir` の外には作られない。
+///
+/// 呼び出し元は `name` を `/` を含まない単一要素にする。`mode` は umask 適用前の値。最終要素が
+/// symlink でも辿らず `EEXIST`（`ErrorKind::AlreadyExists`）になる。Linux・macOS の対応アーキテクチャ以外は
+/// `Unsupported`（fail-closed）。
+pub(crate) fn mkdirat(dir: &File, name: &CStr, mode: u32) -> io::Result<()> {
+    let mode = ModeT::try_from(mode).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: fd は `&File` の借用中のため有効。`name` は NUL 終端の C 文字列で呼び出しの間生きている。
+    // `mkdirat` は fd を返さず、最終要素の symlink は辿らない（存在すれば `EEXIST`）。
+    let rc = unsafe { c_mkdirat(dir.as_raw_fd(), name.as_ptr(), mode) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+pub(crate) fn mkdirat(dir: &File, name: &CStr, mode: u32) -> io::Result<()> {
+    let _ = (dir, name, mode);
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// `dir`（開いたディレクトリ fd）基準で `name` を unlink する（ディレクトリは対象外: flags=0）。

@@ -339,7 +339,8 @@ mod unix {
         assert!(
             line.ends_with(
                 ",\"plugin_stderr_bytes\":19,\"plugin_stderr_truncated\":false,\
-                 \"plugin_stderr_complete\":true,\"plugin_stderr_reader_stopped\":true}"
+                 \"plugin_stderr_complete\":true,\"plugin_stderr_reader_stopped\":true,\
+                 \"peer_auth_audit_flushed\":true}"
             ),
             "{line}"
         );

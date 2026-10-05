@@ -43,7 +43,9 @@
 //!   （REPAIR-5）。
 //! - 出力完了の待機は [`flush_default_audit`]（有界）で明示的に行う。拒否直後にプロセスが終了し得る
 //!   経路は終了前にこれを呼ぶ。都度起動モード（`crate::lifecycle::call_once`）は、受付・往復・子の
-//!   回収が済んで結果が確定した後に 1 回だけ最大 50ms 待つ（結果には影響しない）。`accept` /
+//!   回収が済んで結果が確定した後に 1 回だけ最大 50ms 待ち、期限内に出力を確認できたかを観測記録
+//!   （`OneShotRecord::peer_auth_audit_flushed`）で呼び出し側へ明示する（結果は変えない。false は
+//!   未出力のイベントがプロセス内に残っていることを表し、そのまま終了すると失われる）。`accept` /
 //!   `connect` / 常駐モードは待たないため、呼び出し側が終了前に [`flush_default_audit`] を呼ぶか、
 //!   [`JsonLinesPeerAuthObserver`] 等を渡して自分で回収する。
 

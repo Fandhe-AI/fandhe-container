@@ -174,11 +174,15 @@ pub struct PluginCallRecord {
     pub elapsed: Duration,
     /// plugin の stderr（untrusted・上限つき）。都度起動のみ `Some`（成功・失敗のどちらでも）。
     pub stderr: Option<OneShotStderr>,
+    /// 受付で拒否した接続の監査イベントの出力を確認できたか（PLUG-12・SEC-4）。都度起動のみ `Some`。
+    /// `Some(false)` の意味と対処は [`OneShotRecord::peer_auth_audit_flushed`](super::OneShotRecord) を参照。
+    pub peer_auth_audit_flushed: Option<bool>,
 }
 
 impl PluginCallRecord {
     /// JSON Lines の 1 行（改行なし）へ符号化する。値は固定文字列・数値・真偽値のみで、plugin の
     /// stderr の内容は埋め込まない（件数と打ち切りの有無だけを `plugin_stderr_*` で出す）。
+    /// 都度起動では監査イベントの出力確認の結果を `peer_auth_audit_flushed` で出す（SEC-4）。
     pub fn to_json_line(&self) -> String {
         let code = match self.error_code {
             Some(c) => format!("\"{c}\""),
@@ -195,14 +199,19 @@ impl PluginCallRecord {
             ),
             None => String::new(),
         };
+        let audit = match self.peer_auth_audit_flushed {
+            Some(flushed) => format!(",\"peer_auth_audit_flushed\":{flushed}"),
+            None => String::new(),
+        };
         format!(
-            "{{\"mode\":\"{}\",\"op\":\"{}\",\"success\":{},\"error_code\":{},\"elapsed_us\":{}{}}}",
+            "{{\"mode\":\"{}\",\"op\":\"{}\",\"success\":{},\"error_code\":{},\"elapsed_us\":{}{}{}}}",
             self.mode.as_str(),
             self.operation,
             self.success,
             code,
             self.elapsed.as_micros(),
-            stderr
+            stderr,
+            audit
         )
     }
 }
@@ -299,6 +308,7 @@ impl PluginSession {
                         error_code: rec.error_code,
                         elapsed: rec.elapsed,
                         stderr: Some(rec.stderr.clone()),
+                        peer_auth_audit_flushed: Some(rec.peer_auth_audit_flushed),
                     });
                 });
                 stats.calls = stats.calls.saturating_add(1);
@@ -328,6 +338,7 @@ impl PluginSession {
                         error_code: rec.error_code,
                         elapsed: rec.elapsed,
                         stderr: None,
+                        peer_auth_audit_flushed: None,
                     });
                 })
                 .map(|response| PluginCallOutcome {
@@ -403,6 +414,40 @@ mod tests {
         assert_eq!(PluginModeKind::Resident.as_str(), "resident");
         assert_eq!(PluginMode::one_shot().kind(), PluginModeKind::OneShot);
         assert_eq!(PluginMode::resident().kind(), PluginModeKind::Resident);
+    }
+
+    /// SEC-4・REPAIR-4（TASK-124.5・#1388）: 都度起動の記録は監査イベントの出力確認の結果を行に出し、
+    /// 常駐の記録（確認を行わない）にはキーを出さない。
+    #[test]
+    fn sec4_call_record_json_line_reports_peer_auth_audit_flush() {
+        let one_shot = PluginCallRecord {
+            mode: PluginModeKind::OneShot,
+            operation: "plugin.call_once",
+            success: true,
+            error_code: None,
+            elapsed: Duration::from_micros(20),
+            stderr: None,
+            peer_auth_audit_flushed: Some(false),
+        };
+        assert_eq!(
+            one_shot.to_json_line(),
+            "{\"mode\":\"one_shot\",\"op\":\"plugin.call_once\",\"success\":true,\
+             \"error_code\":null,\"elapsed_us\":20,\"peer_auth_audit_flushed\":false}"
+        );
+        let resident = PluginCallRecord {
+            mode: PluginModeKind::Resident,
+            operation: "plugin.resident_call",
+            success: true,
+            error_code: None,
+            elapsed: Duration::from_micros(20),
+            stderr: None,
+            peer_auth_audit_flushed: None,
+        };
+        assert_eq!(
+            resident.to_json_line(),
+            "{\"mode\":\"resident\",\"op\":\"plugin.resident_call\",\"success\":true,\
+             \"error_code\":null,\"elapsed_us\":20}"
+        );
     }
 
     /// PLUG-7・REPAIR-5: 既定モードは各期限型の既定値（10 秒）を持つ。

@@ -223,7 +223,8 @@ struct ProbeLog {
     write_done: bool,
     errors: Vec<String>,
     done: bool,
-    /// 同じ op の重複報告（矛盾の有無によらず不正として扱う）。
+    /// 同じ op の重複報告・done の重複・done 以降の後続報告・全 op 報告前の done
+    /// （矛盾の有無によらず不正として扱う）。
     invalid: bool,
 }
 
@@ -232,26 +233,50 @@ impl ProbeLog {
     fn has_error(&self, op: &str) -> bool {
         self.errors.iter().any(|e| e == op)
     }
+
+    /// 指定 op の報告（成功値または失敗）が出ているか。
+    fn reported(&self, op: &str) -> bool {
+        let ok = match op {
+            "read" => self.read.is_some(),
+            "readdir" => self.readdir.is_some(),
+            _ => self.write_done,
+        };
+        ok || self.has_error(op)
+    }
 }
 
-/// ログ全体を畳み込む。op ごとの重複報告は `invalid`（fail-closed）。
+/// ログ全体を畳み込む。プローブ契約（AGENTS.md「最後に done」）に従い、次を `invalid`
+/// （fail-closed）とする: op ごとの重複報告・done の重複・done 以降の後続報告・
+/// read / readdir / write の全報告が揃う前の done。
 fn parse_probe_log(text: &str) -> ProbeLog {
     let mut out = ProbeLog::default();
     for line in text.lines() {
-        match parse_probe_line(line.as_bytes()) {
-            Some(ProbeItem::Read(v)) => {
+        let Some(item) = parse_probe_line(line.as_bytes()) else {
+            continue;
+        };
+        if out.done {
+            // done は最終行でなければならない（重複 done も後続報告もここで弾く）。
+            out.invalid = true;
+            continue;
+        }
+        match item {
+            ProbeItem::Read(v) => {
                 out.invalid |= out.read.replace(v).is_some();
             }
-            Some(ProbeItem::Readdir(v)) => {
+            ProbeItem::Readdir(v) => {
                 out.invalid |= out.readdir.replace(v).is_some();
             }
-            Some(ProbeItem::Write) => {
+            ProbeItem::Write => {
                 out.invalid |= out.write_done;
                 out.write_done = true;
             }
-            Some(ProbeItem::OpError(op)) => out.errors.push(op),
-            Some(ProbeItem::Done) => out.done = true,
-            None => {}
+            ProbeItem::OpError(op) => out.errors.push(op),
+            ProbeItem::Done => {
+                out.invalid |= !["read", "readdir", "write"]
+                    .iter()
+                    .all(|op| out.reported(op));
+                out.done = true;
+            }
         }
     }
     out
@@ -497,7 +522,7 @@ fn mac1_io5_parse_probe_line_cases() {
 fn mac1_io5_parse_probe_log_rejects_duplicate_or_conflicting_reports() {
     let pre = PROBE_PREFIX;
     let ok = parse_probe_log(&format!(
-        "kernel noise\n{pre}op=read value=t\n{pre}op=write result=done\n{pre}done\n"
+        "kernel noise\n{pre}op=read value=t\n{pre}op=readdir entries=a\n{pre}op=write result=done\n{pre}done\n"
     ));
     assert_eq!(ok.read.as_deref(), Some("t"));
     assert!(ok.write_done && ok.done && !ok.invalid);
@@ -507,6 +532,31 @@ fn mac1_io5_parse_probe_log_rejects_duplicate_or_conflicting_reports() {
         "{pre}op=write result=done\n{pre}op=write result=done\n"
     ));
     assert!(dup_w.invalid);
+}
+
+/// MAC-1・IO-5・TASK-65.4: done は全 op 報告後の最終行でなければ不正（fail-closed）。
+#[test]
+fn mac1_io5_parse_probe_log_requires_done_last_and_complete() {
+    let pre = PROBE_PREFIX;
+    let body =
+        format!("{pre}op=read value=t\n{pre}op=readdir entries=a\n{pre}op=write result=done\n");
+    // 全 op の報告後に done が 1 回だけなら有効。
+    let ok = parse_probe_log(&format!("{body}{pre}done\n"));
+    assert!(ok.done && !ok.invalid);
+    // 失敗報告も「報告済み」として数える。
+    let err = parse_probe_log(&format!(
+        "{pre}op=read result=error\n{pre}op=readdir result=error\n{pre}op=write result=error\n{pre}done\n"
+    ));
+    assert!(err.done && !err.invalid);
+    // 早過ぎる done。
+    let early = parse_probe_log(&format!("{pre}op=read value=t\n{pre}done\n"));
+    assert!(early.done && early.invalid);
+    // done の重複。
+    let dup = parse_probe_log(&format!("{body}{pre}done\n{pre}done\n"));
+    assert!(dup.invalid);
+    // done 以降の後続報告（エラー含む）。
+    let late = parse_probe_log(&format!("{body}{pre}done\n{pre}op=write result=error\n"));
+    assert!(late.invalid);
 }
 
 /// MAC-1・IO-5・TASK-65.4: 不足と余剰の両方を検出する。

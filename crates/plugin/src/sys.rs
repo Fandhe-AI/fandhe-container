@@ -21,6 +21,9 @@
 //!   `mode_t` の幅・`AT_SYMLINK_NOFOLLOW` の値を持たないため `fchmodat` を呼ばず `Unsupported`（fail-closed。#1308）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `mkdirat(2)` を検証済みディレクトリ fd 基準で呼ぶ（runtime directory の作成。PLUG-12・#1309）
 //! - いずれの unix: `unlinkat(2)` を検証済みディレクトリ fd 基準で呼ぶ（OS 依存の型・定数を使わず flags は 0 固定。PLUG-12）
+//! - いずれの unix（対応 OS・アーキテクチャ）: `fdopendir(3)`・`readdir(3)`・`closedir(3)` で、検証済みディレクトリ fd 基準
+//!   （`openat(dir, ".")`）にカーネルのディレクトリ位置（`lseek(2)`。std の `Seek`）から名前を列挙する
+//!   （都度起動の残骸掃除の再開可能な列挙。#1310・PLUG-7・REPAIR-5。[`DirStream`]）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_NOFOLLOW | O_DIRECTORY)` で配置ディレクトリを
 //!   ルートから 1 要素ずつ辿る（祖先要素の symlink を拒否。PLUG-12）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_CREAT | O_NOFOLLOW)` で bind ロックファイルを開く
@@ -42,7 +45,7 @@
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 //! - OS ごとに値・幅が異なる定数・型（`ModeT`・`AT_SYMLINK_NOFOLLOW`・`O_*` 等）は対応 OS ごとに個別定義し、
@@ -770,6 +773,212 @@ pub(crate) fn unlinkat(dir: &File, name: &CStr) -> io::Result<()> {
     }
 }
 
+/// `fdopendir(3)`・`readdir(3)`・`closedir(3)` と errno 取得の宣言、`struct dirent` の `d_name` の位置
+/// （#1310。`crates/io/src/sys.rs` の `for_each_dir_entry` と同じ流儀。本 crate は io crate に依存しない
+/// ため宣言を個別に持つ）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+mod dir_abi {
+    use core::ffi::c_void;
+
+    /// Linux（LP64。glibc・musl）の `struct dirent`: `d_ino`(8)・`d_off`(8)・`d_reclen`(2)・`d_type`(1) の
+    /// 直後が `d_name`。x86_64・aarch64 で同一（`man 3 readdir`）。
+    #[cfg(target_os = "linux")]
+    pub(super) const DIRENT_NAME_OFFSET: usize = 19;
+    /// macOS（64 bit inode 版）の `struct dirent`: `d_ino`(8)・`d_seekoff`(8)・`d_reclen`(2)・
+    /// `d_namlen`(2)・`d_type`(1) の直後が `d_name`（macOS SDK の `sys/dirent.h`）。
+    #[cfg(target_os = "macos")]
+    pub(super) const DIRENT_NAME_OFFSET: usize = 21;
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の `DIR *fdopendir(int fd)`・
+        // `struct dirent *readdir(DIR *)`・`int closedir(DIR *)`。DIR は不透明ポインタ（`*mut c_void`）、
+        // dirent は先頭バイトへのポインタとして扱い、`d_name` だけを固定オフセットで読む。macOS の
+        // x86_64 は 64 bit inode 版の DIR / dirent を扱うシンボル（`$INODE64`）を fdopendir・readdir で
+        // 揃える（混在させると DIR のレイアウトが食い違う。closedir は版を持たない）。arm64 の macOS は
+        // 64 bit inode 版のみのため接尾辞を付けない。
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "fdopendir$INODE64"
+        )]
+        pub(super) fn fdopendir(fd: i32) -> *mut c_void;
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "readdir$INODE64"
+        )]
+        pub(super) fn readdir(dir: *mut c_void) -> *mut u8;
+        pub(super) fn closedir(dir: *mut c_void) -> i32;
+        // SAFETY（宣言そのものの妥当性）: スレッドローカルな errno へのポインタを返す
+        // （glibc・musl は `__errno_location`、macOS は `__error`。引数なし）。
+        #[cfg(target_os = "linux")]
+        pub(super) fn __errno_location() -> *mut i32;
+        #[cfg(target_os = "macos")]
+        pub(super) fn __error() -> *mut i32;
+    }
+}
+
+/// 検証済みディレクトリ fd 基準で、指定したカーネルのディレクトリ位置から名前を順に読むストリーム
+/// （#1310・PLUG-7・PLUG-12・REPAIR-5）。
+///
+/// `uds_security` の都度起動の残骸掃除が、1 回の読み取り数を上限内に保ったまま前回の続きから列挙する
+/// ために使う。パスを再解決せず `openat(dir, ".")` で開き直すため、列挙対象は検証済みディレクトリそのもの
+/// である（`dir` の fd とは別の open file description なので、`dir` の読み取り位置は変えない）。
+///
+/// 位置は `lseek(2)` で設定・取得するカーネルのディレクトリ offset（不透明な値）で、件数ではない。
+/// POSIX は `fdopendir` が「呼び出し時点の fd の file offset から」エントリを返すと定める。`telldir(3)` の
+/// 値は使わない（macOS では `DIR` ごとの表の添字で、プロセスをまたいで使えない）。libc は複数エントリを
+/// まとめて読むため、[`DirStream::position`] が返すのは「libc が最後にまとめ読みした直後」の位置である
+/// （消費済みエントリの直後とは限らない）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+pub(crate) struct DirStream {
+    /// `fdopendir` が返した `DIR *`（drop の `closedir` まで有効。読み取り用 fd の所有権を持つ）。
+    handle: *mut core::ffi::c_void,
+    /// `handle` の fd を dup したもの（同じ open file description。位置の取得だけに使う）。
+    position: File,
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+impl DirStream {
+    /// `dir` を開き直し、カーネルのディレクトリ位置 `offset`（0 は先頭）から読むストリームを返す。
+    /// `offset` が不正で `lseek` が失敗した場合は `Err`（呼び出し側が先頭からやり直す）。
+    pub(crate) fn open_at(dir: &File, offset: u64) -> io::Result<Self> {
+        use std::io::{Seek, SeekFrom};
+        use std::os::unix::io::IntoRawFd;
+        let file = openat_dir_nofollow(dir.as_raw_fd(), c".")?;
+        (&file).seek(SeekFrom::Start(offset))?;
+        let position = file.try_clone()?;
+        let fd = file.into_raw_fd();
+        // SAFETY: `fd` は直前に `into_raw_fd` で取り出した有効なディレクトリ fd で、他に所有者がいない。
+        // 成功すれば所有権は DIR へ移り、drop の closedir で閉じられる。
+        let handle = unsafe { dir_abi::fdopendir(fd) };
+        if handle.is_null() {
+            let err = io::Error::last_os_error();
+            // SAFETY: fdopendir が失敗したとき fd の所有権は移らないため、唯一の所有者である
+            // 本関数がここで閉じる（`fd` は上で取り出した有効な fd）。
+            drop(unsafe { File::from_raw_fd(fd) });
+            return Err(err);
+        }
+        Ok(Self { handle, position })
+    }
+
+    /// 次のエントリ（`.`・`..` を除く）の名前を `visit` へ渡し、その戻り値を返す。末尾なら `Ok(None)`。
+    /// 名前は次の読み取りまでしか有効でない借用のため、`visit` の外へ持ち出すなら複製する。
+    pub(crate) fn next_entry<R>(
+        &mut self,
+        visit: impl FnOnce(&[u8]) -> R,
+    ) -> io::Result<Option<R>> {
+        loop {
+            // 末尾（NULL・errno 変化なし）とエラー（NULL・errno 設定）を区別するため errno を 0 にする。
+            // SAFETY: errno へのポインタは呼び出しスレッドのスレッドローカル領域を指し、常に有効。
+            #[cfg(target_os = "linux")]
+            unsafe {
+                *dir_abi::__errno_location() = 0;
+            }
+            // SAFETY: 同上（macOS の errno アクセサ）。
+            #[cfg(target_os = "macos")]
+            unsafe {
+                *dir_abi::__error() = 0;
+            }
+            // SAFETY: `self.handle` は `open_at` で得た closedir 前の有効な DIR*。`&mut self` により
+            // 同じ DIR* への並行した readdir は起きない。
+            let entry = unsafe { dir_abi::readdir(self.handle) };
+            if entry.is_null() {
+                let err = io::Error::last_os_error();
+                return match err.raw_os_error() {
+                    Some(0) | None => Ok(None),
+                    Some(_) => Err(err),
+                };
+            }
+            // SAFETY: 返った dirent は次の readdir / closedir まで有効。`d_name` は
+            // `DIRENT_NAME_OFFSET` から始まり、libc が構造体の範囲内での NUL 終端を保証する。
+            // 得た借用は本ループ内（次の readdir より前）でしか使わない。
+            let name =
+                unsafe { CStr::from_ptr(entry.add(dir_abi::DIRENT_NAME_OFFSET).cast()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            return Ok(Some(visit(name)));
+        }
+    }
+
+    /// カーネルのディレクトリ位置（libc が最後にまとめ読みした直後の位置）を返す。この値を
+    /// [`DirStream::open_at`] へ渡すと、まだ libc が読んでいない続きから読める。
+    pub(crate) fn position(&self) -> io::Result<u64> {
+        use std::io::Seek;
+        let mut file = &self.position;
+        file.stream_position()
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+impl Drop for DirStream {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` は `open_at` で得た有効な DIR* で、drop 以降は使わない。DIR が所有する
+        // fd もここで閉じられる（`position` は別の fd で、フィールドの drop が閉じる）。
+        unsafe { dir_abi::closedir(self.handle) };
+    }
+}
+
+/// 対応外の OS・アーキテクチャ向け（fail-closed）。dirent の配置を持たないため列挙せず、
+/// 常に `Unsupported` を返す。
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+pub(crate) struct DirStream(());
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+impl DirStream {
+    pub(crate) fn open_at(dir: &File, offset: u64) -> io::Result<Self> {
+        let _ = (dir, offset);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn next_entry<R>(
+        &mut self,
+        visit: impl FnOnce(&[u8]) -> R,
+    ) -> io::Result<Option<R>> {
+        let _ = visit;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn position(&self) -> io::Result<u64> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     /// `struct ucred` と同じレイアウト。
@@ -1241,6 +1450,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// PLUG-7・PLUG-12（#1310）: `DirStream` は検証済みディレクトリ fd 基準で `.`・`..` を除く名前を
+    /// すべて返し、末尾まで読んだ後のカーネル位置から開き直すと何も返さない（続きから読める）。
+    #[test]
+    fn plug7_dir_stream_lists_names_and_resumes_at_kernel_position() {
+        let d = tmpdir("dirstream");
+        for n in ["a", "b", "c"] {
+            std::fs::write(d.join(n), b"").unwrap();
+        }
+        let dir = open_dir_nofollow(&d.canonicalize().unwrap()).unwrap();
+        let mut stream = DirStream::open_at(&dir, 0).unwrap();
+        assert_eq!(stream.position().unwrap(), 0);
+        let mut names = Vec::new();
+        while let Some(n) = stream.next_entry(<[u8]>::to_vec).unwrap() {
+            names.push(String::from_utf8(n).unwrap());
+        }
+        names.sort();
+        assert_eq!(names, ["a", "b", "c"]);
+        let end = stream.position().unwrap();
+        assert_ne!(end, 0);
+        let mut rest = DirStream::open_at(&dir, end).unwrap();
+        assert_eq!(rest.next_entry(<[u8]>::to_vec).unwrap(), None);
+        // 開き直しは別の open file description なので、`dir` 自身の読み取り位置は変わらない。
+        let mut again = DirStream::open_at(&dir, 0).unwrap();
+        let mut count = 0;
+        while again.next_entry(|_| ()).unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     /// PLUG-12: `fchmodat2` 非対応環境向けの縮退経路が socket の mode を設定できる。

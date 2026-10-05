@@ -77,20 +77,29 @@
 //! - 判定・削除は bind 前の stale 削除と同じ処理（`acquire_bind_lock`・`clear_stale_socket`）を使い、
 //!   新しい削除規則は持たない。ロックを取れない（使用中）・symlink・他 UID 所有・記録が無い／不一致の
 //!   ものは削除しない。socket が消えて残ったロックファイルは `BindLock` の drop が unlink する。
-//! - 上限（REPAIR-5）: 処理する候補（上記の名前一致）は [`ONE_SHOT_SWEEP_MAX_ENTRIES`] 件まで、列挙する
-//!   エントリ総数は [`ONE_SHOT_SWEEP_MAX_SCAN`] 件まで（ヒントまでの読み飛ばしも含めた 1 回の読み取り
-//!   総数の上限）。列挙中は何も削除せず、候補名を集めてから処理する。対象外の名前は候補の件数に数えない
-//!   ため、先頭に対象外ファイルが多くても後方の残骸が飢餓しない。上限で打ち切った場合は、次回の開始位置
-//!   （読み飛ばすエントリ数）を runtime directory 直下の走査位置ヒント（`fcsweep-cursor`。0600・排他
-//!   flock・best-effort）へ保存し、次回の初期化はそこから走査する。ヒントが上限以上のときは使わず先頭から
-//!   走査する（上限を超える位置の残骸は、手前の残骸が消えて位置が詰まるまで到達しない既知の限界）。
-//!   ディレクトリ末尾まで走査し終えるとヒントを削除して先頭へ戻る。ヒントは走査範囲を変えるだけで、
-//!   改ざん・破損しても削除対象は変わらない（判定・削除は検証済みディレクトリ fd 基準）。
+//! - 上限（REPAIR-5）: 処理する候補（上記の名前一致）は [`ONE_SHOT_SWEEP_MAX_ENTRIES`] 件まで、走査する
+//!   エントリは [`ONE_SHOT_SWEEP_MAX_SCAN`] 件まで。列挙中は何も削除せず、候補名を集めてから処理する。
+//!   対象外の名前は候補の件数に数えないため、先頭に対象外ファイルが多くても後方の残骸が飢餓しない。
+//! - 再開: 上限で打ち切った場合は、次に読むはずだったエントリの位置を runtime directory 直下の走査位置
+//!   ヒント（`fcsweep-cursor`。0600・排他 flock・best-effort）へ保存し、次回の初期化はそこから走査する。
+//!   位置は件数ではなくカーネルのディレクトリ位置（`lseek` で設定できる値。`crate::sys::DirStream`）で
+//!   持つため、手前のエントリを読み直さずに続きから列挙できる。先頭に走査上限以上の対象外エントリが
+//!   あっても、回を重ねるごとに位置が進み、後方の残骸へ到達する。libc は複数エントリをまとめて読み、
+//!   カーネルの位置はまとめ読みの境界でしか得られないため、ヒントは「境界の位置」と「そこからの件数」の
+//!   組で、再開時は最初のまとめ読み 1 回分の中だけを読み飛ばす。1 回の読み取り総数は、ディレクトリの
+//!   大きさに依らず「libc のバッファ 1 個分 + 走査上限 + 1」件以内である。ディレクトリ末尾まで走査し
+//!   終えるとヒントを削除して先頭へ戻る。
+//! - ヒントの性質: 走査範囲を変えるだけで、改ざん・破損しても削除対象は変わらない（判定・削除は検証済み
+//!   ディレクトリ fd 基準）。ディレクトリ位置の安定性はファイルシステム依存で（位置が並び順の番号に
+//!   なる実装では、手前の削除で後続がずれる）、ずれて飛ばしたエントリは、末尾到達後に先頭から始まる
+//!   次の周回で処理する（1 周で消えなくても周回を重ねて収束する）。
 //! - 削除を拒否する socket（symlink・他 UID 所有・socket 以外・記録なし／不一致）のロックファイルは、
 //!   記録も含めて変更・unlink しない（PLUG-12 の拒否対象を保持する）。
-//! - 残余: 列挙はパス基準（`read_dir`）で、得た名前はヒントにすぎない。判定・削除はすべて検証済みディレクトリ
-//!   fd 基準で行うため、差し替えられても削除対象にはならない。bind 成功から記録書き込みまでの間に異常終了した
-//!   記録なし socket は削除しない（手動削除が必要。fail-closed）。常駐モードの `resident-*` は対象外。
+//! - 列挙・判定・削除はすべて検証済みディレクトリ fd 基準で行い、パスを再解決しない（列挙は
+//!   `openat(dir, ".")` で開き直した fd を読む）。列挙で得た名前は候補の手掛かりにすぎず、削除の可否は
+//!   候補ごとに fd 基準で判定し直す。
+//! - 残余: bind 成功から記録書き込みまでの間に異常終了した記録なし socket は削除しない（手動削除が必要。
+//!   fail-closed）。常駐モードの `resident-*` は対象外。
 //!
 //! # `XDG_RUNTIME_DIR` 未設定時のフォールバック（TASK-123.4・#289）
 //! 未設定または空のときだけ、OS・euid ごとに単一の基底を選び、通常経路と同じ検証
@@ -149,8 +158,9 @@ pub const RUNTIME_DIR_NAME: &str = "fandhe-container";
 /// 超えた分は次回の初期化で処理する。
 pub const ONE_SHOT_SWEEP_MAX_ENTRIES: usize = 256;
 
-/// 掃除で列挙するディレクトリエントリ総数の上限（対象外の名前を含む。REPAIR-5。#1310）。
-/// 巨大ディレクトリでの無制限な列挙を防ぐ安全上限で、候補の件数上限とは別に数える。
+/// 掃除 1 回で走査するディレクトリエントリ数の上限（対象外の名前を含む。REPAIR-5。#1310）。
+/// 巨大ディレクトリでの無制限な列挙を防ぐ安全上限で、候補の件数上限とは別に数える。超えた分は
+/// 次回の初期化が続きの位置から走査する（再開位置までの読み飛ばしは libc のバッファ 1 個分以内）。
 pub const ONE_SHOT_SWEEP_MAX_SCAN: usize = 65_536;
 
 /// 都度起動の残骸の掃除結果（#1310・PLUG-7）。呼び出し側（TASK-114）が構造化ログへ出す材料。
@@ -631,25 +641,55 @@ mod imp {
 
     /// 走査位置ヒントを保存するファイル名（runtime directory 直下。候補の名前規則に一致しない）。
     const SWEEP_CURSOR_NAME: &[u8] = b"fcsweep-cursor";
-    /// 走査位置ヒントの最大長（10 進 u64 は 20 桁）。
-    const SWEEP_CURSOR_MAX_LEN: usize = 32;
+    /// 走査位置ヒントの最大長（`<10 進 u64> <10 進 u64>\n`。10 進 u64 は 20 桁）。
+    const SWEEP_CURSOR_MAX_LEN: usize = 48;
 
-    /// 前回打ち切った位置（スキップするエントリ数）を保存・取得する走査位置ヒント。
+    /// 掃除の走査位置（#1310）。件数ではなくカーネルのディレクトリ位置で表す。
+    ///
+    /// `offset` は libc がまとめ読みを始めた位置（`lseek` で設定できる不透明な値。0 は先頭）、`skip` は
+    /// その位置から読んだまとめ読み 1 回分の中で読み飛ばす件数。libc は複数エントリをまとめて読み、
+    /// カーネルの位置はまとめ読みの境界でしか得られないため、境界の位置と境界からの件数の組で
+    /// 「次に読むエントリ」を指す。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub(super) struct ScanPos {
+        pub(super) offset: u64,
+        pub(super) skip: u64,
+    }
+
+    /// 前回打ち切った位置（[`ScanPos`]）を保存・取得する走査位置ヒント。
     ///
     /// 列挙総数の上限（REPAIR-5）を保ったまま、上限より後方の残骸へも複数回の初期化で到達できる
     /// ようにする（先頭の対象外ファイルが多い巨大ディレクトリで掃除が収束しない問題への対策）。
-    /// 値は「何件読み飛ばすか」のヒントにすぎず、壊れた・改ざんされた値は走査範囲を変えるだけで
-    /// 削除対象は変えない（判定・削除は検証済みディレクトリ fd 基準）。
+    /// 位置はカーネルのディレクトリ位置なので、そこまでのエントリを読み直さずに続きから列挙できる。
+    /// 値はヒントにすぎず、壊れた・改ざんされた値は走査範囲を変えるだけで削除対象は変えない
+    /// （判定・削除は検証済みディレクトリ fd 基準）。
     ///
-    /// ヒントのファイルは「自 UID 所有・通常ファイル・単一リンク・空または `<10 進>\n` 形式」と確認
-    /// できた場合だけ使う（`BindLock` の専用ファイル検証と同方針）。確認できない既存ファイル（他
+    /// ヒントのファイルは「自 UID 所有・通常ファイル・単一リンク・空または `<10 進> <10 進>\n` 形式」と
+    /// 確認できた場合だけ使う（`BindLock` の専用ファイル検証と同方針）。確認できない既存ファイル（他
     /// ファイルへのハードリンク・無関係な内容）には書き込み・切り詰め・unlink をせず、ヒントを諦めて
-    /// 先頭（0）から走査し、保存もしない。他の掃除が保持中・開けない場合も同様（best-effort）。
+    /// 先頭から走査し、保存もしない。他の掃除が保持中・開けない場合も同様（best-effort）。
     struct SweepCursor {
         handle: crate::sys::LockHandle,
         name: std::ffi::CString,
         /// 読み込んだ開始位置（検証済み。形式不正なら開かない）。
-        start: usize,
+        start: ScanPos,
+    }
+
+    /// 走査位置ヒントの内容（`<offset> <skip>\n`。空は先頭）を解釈する純粋関数。
+    pub(super) fn parse_scan_pos(text: &[u8]) -> Option<ScanPos> {
+        if text.is_empty() {
+            return Some(ScanPos::default());
+        }
+        let body = text.strip_suffix(b"\n")?;
+        let mut parts = body.split(|c| *c == b' ');
+        let (offset, skip) = (parts.next()?, parts.next()?);
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(ScanPos {
+            offset: parse_decimal(offset)?,
+            skip: parse_decimal(skip)?,
+        })
     }
 
     impl SweepCursor {
@@ -670,13 +710,7 @@ mod imp {
             if n as u64 != meta.len() {
                 return None;
             }
-            let start = match buf.get(..n)? {
-                [] => 0,
-                text => {
-                    let digits = text.strip_suffix(b"\n")?;
-                    usize::try_from(parse_decimal(digits)?).ok()?
-                }
-            };
+            let start = parse_scan_pos(buf.get(..n)?)?;
             Some(Self {
                 handle,
                 name,
@@ -684,10 +718,10 @@ mod imp {
             })
         }
 
-        /// `next` を保存する。0（走査完了）ならファイルを残さない。
-        fn store(&self, dir: &File, next: usize) {
+        /// 次回の開始位置を保存する。`None`（末尾まで走査し終えた）ならファイルを残さない。
+        fn store(&self, dir: &File, next: Option<ScanPos>) {
             use std::os::unix::fs::FileExt;
-            if next == 0 {
+            let Some(next) = next else {
                 let _ = self.handle.file.set_len(0);
                 // 名前がまだ自分の inode を指す場合だけ unlink する（別ファイルには触れない）。
                 if matches!(
@@ -697,99 +731,200 @@ mod imp {
                     let _ = crate::sys::unlinkat(dir, &self.name);
                 }
                 return;
-            }
+            };
             if self.handle.file.set_len(0).is_ok() {
                 let _ = self
                     .handle
                     .file
-                    .write_all_at(format!("{next}\n").as_bytes(), 0);
+                    .write_all_at(format!("{} {}\n", next.offset, next.skip).as_bytes(), 0);
+            }
+        }
+    }
+
+    /// 列挙（段階 1）の結果。
+    #[derive(Debug, Default)]
+    struct Scan {
+        /// 候補の socket 名（ロックファイル名から `.lock` を除いたもの）。`max_entries` 件以内。
+        candidates: Vec<std::ffi::CString>,
+        /// 上限で打ち切った場合の次回の開始位置。`None` は末尾まで走査し終えた。
+        next: Option<ScanPos>,
+        /// 読んだエントリの総数（再開位置までの読み飛ばし・打ち切り判定の 1 件を含む）。
+        read: usize,
+        /// 列挙の途中でエラーになった（残りは次回、先頭から走査し直す）。
+        failed: bool,
+    }
+
+    /// `start` から列挙して候補名を集める（何も削除しない）。
+    ///
+    /// 読み取り数の上限（REPAIR-5）: 走査するのは `max_scan` 件まで（打ち切り判定の 1 件を加えて
+    /// `max_scan + 1` 件）。これとは別に `start.skip` 件を読み飛ばすが、読み飛ばすのは最初のまとめ読み
+    /// 1 回分の中だけで、まとめ読みの境界を越えたら（ディレクトリが変わった・ヒントが壊れている）
+    /// そこで読み飛ばしをやめる。したがって 1 回の読み取り総数は、ディレクトリの大きさに依らず
+    /// 「libc のバッファ 1 個分 + `max_scan` + 1」件以内に収まる。
+    ///
+    /// 打ち切るときは、次に読むはずだったエントリの位置（そのまとめ読みを始めたカーネル位置と、
+    /// その中での件数）を `next` に返す。位置はまとめ読みの境界を越えるたびに先へ進むため、
+    /// 削除対象外のエントリが何件続いても、次回は上限より後方から再開できる。
+    fn scan_candidates(
+        dir: &File,
+        start: ScanPos,
+        max_scan: usize,
+        max_entries: usize,
+    ) -> io::Result<Scan> {
+        let mut stream = crate::sys::DirStream::open_at(dir, start.offset)?;
+        let mut out = Scan::default();
+        // 最後に観測したカーネル位置。fdopendir が最初のまとめ読みを先に済ませる実装でも境界を
+        // 検出できるよう、初期値は開いた直後の位置ではなく自分で設定した `start.offset` にする。
+        let mut kernel_pos = start.offset;
+        // 次に読むエントリの位置（まとめ読みを始めた位置と、その中での件数）。
+        let mut here = ScanPos {
+            offset: start.offset,
+            skip: 0,
+        };
+        let mut batches = 0u32;
+        let mut to_skip = start.skip;
+        let mut scanned = 0usize;
+        loop {
+            let entry =
+                stream.next_entry(|name| one_shot_socket_name_of_lock(name).map(<[u8]>::to_vec));
+            let candidate = match entry {
+                Ok(Some(candidate)) => candidate,
+                // 末尾まで走査し終えた。
+                Ok(None) => return Ok(out),
+                // 残りを諦め、次回は先頭から走査する。
+                Err(_) => {
+                    out.failed = true;
+                    return Ok(out);
+                }
+            };
+            let Ok(now) = stream.position() else {
+                out.failed = true;
+                return Ok(out);
+            };
+            out.read += 1;
+            if now != kernel_pos {
+                // このエントリは、`kernel_pos` から始まる新しいまとめ読みの先頭。
+                here = ScanPos {
+                    offset: kernel_pos,
+                    skip: 0,
+                };
+                kernel_pos = now;
+                batches = batches.saturating_add(1);
+            }
+            let this = here;
+            here.skip = here.skip.saturating_add(1);
+            if to_skip > 0 {
+                if batches <= 1 {
+                    to_skip -= 1;
+                    continue;
+                }
+                // 最初のまとめ読みを越えた。読み飛ばしをやめ、このエントリから走査する。
+                to_skip = 0;
+            }
+            if scanned >= max_scan {
+                out.next = Some(this);
+                return Ok(out);
+            }
+            scanned += 1;
+            let Some(socket) = candidate else {
+                continue;
+            };
+            // 件数上限は候補だけを数える（対象外の名前で枠を消費して後方の残骸が飢餓しないように）。
+            if out.candidates.len() >= max_entries {
+                out.next = Some(this);
+                return Ok(out);
+            }
+            // readdir の名前は NUL を含まないため失敗しない（失敗しても候補にしないだけ）。
+            if let Ok(name) = std::ffi::CString::new(socket) {
+                out.candidates.push(name);
             }
         }
     }
 
     /// 上限を引数に取る [`sweep_one_shot`] の本体（テストで小さい上限を注入できるようにする）。
-    ///
-    /// 走査は 2 段階: (1) 走査位置ヒントまで読み飛ばし、そこから列挙して候補名だけを集める（この間は何も
-    /// 削除しない。列挙中のディレクトリ変更で後続エントリが落ちないように）。読み飛ばしも含めた 1 回の
-    /// 読み取り総数は `max_scan` 以内（REPAIR-5。ヒントが `max_scan` 以上なら使わず先頭から走査する）。
-    /// (2) 集めた候補を処理する。上限で打ち切った場合は次回の開始位置を保存し、末尾まで走査し終えたら 0 に
-    /// 戻す（#1310）。保存位置は、この回に削除した socket とロックファイル（候補 1 件につき最大 2
-    /// エントリ）の分だけ手前へ戻す。保守的に手前へずらすのは、再走査は無害（処理済みは消えている）だが、
-    /// 先へずれると未処理を飛ばすため。
     pub(super) fn sweep_one_shot_limited(
         dir_path: &Path,
         euid: u32,
         max_scan: usize,
         max_entries: usize,
     ) -> Result<OneShotSweep, PluginError> {
-        use std::os::unix::ffi::OsStrExt;
+        sweep_one_shot_counted(dir_path, euid, max_scan, max_entries).map(|(out, _)| out)
+    }
+
+    /// 掃除の本体。掃除結果と、列挙で読んだエントリの総数（読み取り上限の照合用）を返す。
+    ///
+    /// 走査は 2 段階: (1) 走査位置ヒントの位置から列挙して候補名だけを集める（[`scan_candidates`]。
+    /// この間は何も削除しない。列挙中のディレクトリ変更で後続エントリが落ちないように）。列挙は
+    /// 検証済みディレクトリ fd 基準で行い、パスを再解決しない。(2) 集めた候補を処理する。上限で
+    /// 打ち切った場合は次回の開始位置を保存し、末尾まで走査し終えたらヒントを削除して先頭へ戻る（#1310）。
+    ///
+    /// 保存する位置の件数（[`ScanPos::skip`]）は、この回に削除した socket とロックファイル（候補 1 件に
+    /// つき最大 2 エントリ）の分だけ手前へ戻す。削除でまとめ読みの中の並びが詰まるためで、手前へ
+    /// ずれても再走査は無害（処理済みは消えている）だが、先へずれると未処理を飛ばす。削除できなかった
+    /// 候補（使用中・削除根拠なし）の分は戻さないので、それらが上限を埋めても後方へ進む。
+    ///
+    /// ヒントの位置から 1 件も読めなかった場合（ディレクトリが縮んだ・ヒントが壊れている・`lseek` が
+    /// 拒否した）は、同じ回のうちに先頭から走査し直す（先頭側の取りこぼしを避ける）。
+    fn sweep_one_shot_counted(
+        dir_path: &Path,
+        euid: u32,
+        max_scan: usize,
+        max_entries: usize,
+    ) -> Result<(OneShotSweep, usize), PluginError> {
         let real = std::fs::canonicalize(dir_path).map_err(|e| map_io(&e))?;
         let dir = open_nofollow(&real)?;
         verify(&fstat(&dir)?, euid)?;
         let cursor = SweepCursor::open(&dir, euid);
-        // 読み飛ばしも 1 回の読み取り総数（`max_scan`）に含める（REPAIR-5）。ヒントが上限以上なら
-        // 使わず先頭から走査する（上限を超える位置は、手前の残骸が消えて位置が詰まるまで到達しない）。
-        let hint = cursor
-            .as_ref()
-            .map_or(0, |c| if c.start < max_scan { c.start } else { 0 });
-        let mut start = hint;
-        let mut entries = std::fs::read_dir(&real).map_err(|e| map_io(&e))?;
-        let mut out = OneShotSweep::default();
-        // 読み飛ばし。ディレクトリ末尾まで進んでもヒントに届かない（縮んだ・改ざんされた）場合は、
-        // 先頭から走査し直す（前回の位置より後ろに何も無いため、先頭の取りこぼしを避ける）。
-        for _ in 0..start {
-            if entries.next().is_none() {
-                entries = std::fs::read_dir(&real).map_err(|e| map_io(&e))?;
-                start = 0;
-                break;
-            }
+        let start = cursor.as_ref().map_or_else(ScanPos::default, |c| c.start);
+        // 段階 1: 列挙して候補名を集める（削除しない）。
+        let head = ScanPos::default();
+        let mut read = 0usize;
+        let mut resumed = None;
+        if start != head
+            && let Ok(scan) = scan_candidates(&dir, start, max_scan, max_entries)
+        {
+            read = scan.read;
+            resumed = (scan.read > 0).then_some(scan);
         }
-        // 段階 1: 列挙して候補名を集める（削除しない）。次回の開始位置 0 は「末尾まで走査し終えた」。
-        let mut candidates: Vec<std::ffi::CString> = Vec::new();
-        let mut next = 0usize;
-        let mut scanned = start;
-        for entry in entries {
-            if scanned >= max_scan {
-                out.truncated = true;
-                next = scanned;
-                break;
+        let scan = match resumed {
+            Some(scan) => scan,
+            None => {
+                let scan = scan_candidates(&dir, head, max_scan, max_entries).map_err(|_| {
+                    err(
+                        PluginErrorCode::Internal,
+                        "failed to enumerate runtime directory",
+                    )
+                })?;
+                read = read.saturating_add(scan.read);
+                scan
             }
-            scanned += 1;
-            let Ok(entry) = entry else {
-                out.skipped += 1;
-                continue;
-            };
-            let file_name = entry.file_name();
-            let Some(socket) = one_shot_socket_name_of_lock(file_name.as_bytes()) else {
-                continue;
-            };
-            // 件数上限は候補だけを数える（対象外の名前で枠を消費して後方の残骸が飢餓しないように）。
-            if candidates.len() >= max_entries {
-                out.truncated = true;
-                next = scanned - 1;
-                break;
-            }
-            let Ok(name) = std::ffi::CString::new(socket) else {
-                out.examined += 1;
-                out.skipped += 1;
-                continue;
-            };
-            candidates.push(name);
+        };
+        let mut out = OneShotSweep {
+            truncated: scan.next.is_some(),
+            ..OneShotSweep::default()
+        };
+        if scan.failed {
+            out.skipped += 1;
         }
-        // 段階 2: 集めた候補を処理する。
-        // 実際に消えたエントリ数（socket・ロックファイル）だけ保存位置を手前へ戻す。削除できなかった
-        // 候補（使用中・削除根拠なし）は位置を戻さず、後方の残骸へ進めるようにする。
-        let mut removed_entries = 0usize;
-        for name in &candidates {
+        // 段階 2: 集めた候補を処理する。実際に消えたエントリ数（socket・ロックファイル）を数える。
+        let mut removed_entries = 0u64;
+        for name in &scan.candidates {
             out.examined += 1;
             let before = entry_count(&dir, name);
             sweep_one(&dir, name, euid, &mut out);
-            removed_entries += before.saturating_sub(entry_count(&dir, name));
+            removed_entries = removed_entries
+                .saturating_add(before.saturating_sub(entry_count(&dir, name)) as u64);
         }
         if let Some(cursor) = &cursor {
-            cursor.store(&dir, next.saturating_sub(removed_entries));
+            cursor.store(
+                &dir,
+                scan.next.map(|next| ScanPos {
+                    offset: next.offset,
+                    skip: next.skip.saturating_sub(removed_entries),
+                }),
+            );
         }
-        Ok(out)
+        Ok((out, read))
     }
     /// 候補の socket とそのロックファイルのうち、現在存在するエントリ数（0〜2）を返す。
     fn entry_count(dir: &File, socket: &std::ffi::CStr) -> usize {
@@ -1294,34 +1429,165 @@ mod imp {
             }
         }
 
-        /// REPAIR-5・PLUG-7（#1310）: 1 回の読み取り総数（読み飛ばしを含む）は `max_scan` 以内で、
-        /// 上限内に収まる残骸は複数回の掃除で処理される。上限以上の位置のヒントは使わず先頭から走査する。
+        /// 走査位置ヒントの現在値を読む（無ければ `None`）。
+        fn stored_pos(dir: &Path) -> Option<ScanPos> {
+            let name = std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap();
+            std::fs::read(dir.join(name))
+                .ok()
+                .map(|b| parse_scan_pos(&b).unwrap())
+        }
+
+        /// PLUG-7・REPAIR-5（#1310）: 走査位置ヒントは `<offset> <skip>\n` に厳密一致する内容だけを受け付ける。
         #[test]
-        fn repair5_sweep_total_reads_bounded_including_skip() {
-            let base = std::env::temp_dir().join(format!("fcsc-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&base);
-            DirBuilder::new().mode(0o700).create(&base).unwrap();
+        fn plug7_scan_pos_parser_is_strict() {
+            assert_eq!(parse_scan_pos(b""), Some(ScanPos { offset: 0, skip: 0 }));
+            assert_eq!(
+                parse_scan_pos(b"12 3\n"),
+                Some(ScanPos {
+                    offset: 12,
+                    skip: 3
+                })
+            );
+            assert_eq!(
+                parse_scan_pos(b"18446744073709551615 0\n"),
+                Some(ScanPos {
+                    offset: u64::MAX,
+                    skip: 0
+                })
+            );
+            for bad in [
+                &b"12\n"[..],
+                b"12 3",
+                b"12 3 4\n",
+                b"12  3\n",
+                b" 12 3\n",
+                b"-1 0\n",
+                b"a b\n",
+                b"18446744073709551616 0\n",
+                b"not a hint",
+            ] {
+                assert_eq!(parse_scan_pos(bad), None, "{bad:?}");
+            }
+        }
+
+        /// PLUG-7・REPAIR-5（#1310）: 先頭に走査上限（8 件）以上の対象外エントリがあっても、1 回の読み取りを
+        /// 上限内に保ったまま複数回の掃除で後方の残骸へ到達する。20 件の対象外 + ロック 1 件 + ヒント自身の
+        /// 22 エントリを 8 件ずつ走査するので、3 回で末尾に達してヒントが消える。
+        #[test]
+        fn plug7_repair5_sweep_reaches_leftover_behind_scan_limit() {
+            let t = Tmp::new();
             let euid = crate::sys::effective_uid();
             const MAX_SCAN: usize = 8;
             for i in 0..20 {
-                std::fs::write(base.join(format!("other-{i}")), b"").unwrap();
+                std::fs::write(t.0.join(format!("other-{i}")), b"").unwrap();
             }
-            let lock = base.join("oneshot-1-0.sock.lock");
+            let lock = t.0.join("oneshot-1-0.sock.lock");
             std::fs::write(&lock, b"").unwrap();
-            let cursor = base.join(std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap());
-            // 上限以上の位置を指すヒント（改ざん・過去の値）は使わず、先頭から上限内で走査する。
-            std::fs::write(&cursor, b"15\n").unwrap();
-            let r = sweep_one_shot_limited(&base, euid, MAX_SCAN, 256).unwrap();
-            assert!(r.truncated);
-            let saved = std::fs::read_to_string(&cursor).unwrap();
-            let next: usize = saved.trim().parse().unwrap();
-            assert!(next <= MAX_SCAN, "next={next}");
-            // 上限内の位置にあるロックは（走査順に依らず）高々数回で処理される or 位置が上限内に留まる。
-            for _ in 0..4 {
-                let r = sweep_one_shot_limited(&base, euid, MAX_SCAN, 256).unwrap();
-                assert!(r.examined <= 1);
+            let mut truncated = Vec::new();
+            for _ in 0..3 {
+                let skip = stored_pos(&t.0).map_or(0, |p| p.skip) as usize;
+                let (r, read) = sweep_one_shot_counted(&t.0, euid, MAX_SCAN, 256).unwrap();
+                assert!(read <= skip + MAX_SCAN + 1, "read={read} skip={skip}");
+                truncated.push(r.truncated);
             }
-            let _ = std::fs::remove_dir_all(&base);
+            assert_eq!(truncated, [true, true, false]);
+            assert!(!lock.exists());
+            assert_eq!(stored_pos(&t.0), None);
+        }
+
+        /// PLUG-7・REPAIR-5（#1310）: libc のまとめ読みをまたぐ大きさ（対象外 6,100 件）でも、再開位置は
+        /// カーネルのディレクトリ位置で進み、各回の読み取りは「読み飛ばし + 上限 500 件 + 1」以内に収まる。
+        /// 6,102 エントリ（対象外 + ロック + ヒント自身）を 500 件ずつ走査するので 13 回で末尾に達し、
+        /// どこにあっても残骸のロックが消える。読み取り総数はエントリ数に比例する（件数で読み飛ばす
+        /// 方式では回ごとに先頭から読み直すため、回数に比例して増える）。
+        #[test]
+        fn plug7_repair5_sweep_resumes_by_kernel_position_in_large_directory() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            const MAX_SCAN: usize = 500;
+            const OTHERS: usize = 6_100;
+            for i in 0..OTHERS {
+                std::fs::write(t.0.join(format!("other-{i:04}")), b"").unwrap();
+            }
+            let lock = t.0.join("oneshot-1-0.sock.lock");
+            std::fs::write(&lock, b"").unwrap();
+            let mut passes = 0;
+            let mut total_read = 0;
+            let mut offsets = std::collections::BTreeSet::new();
+            loop {
+                let skip = stored_pos(&t.0).map_or(0, |p| p.skip) as usize;
+                let (r, read) = sweep_one_shot_counted(&t.0, euid, MAX_SCAN, 256).unwrap();
+                passes += 1;
+                total_read += read;
+                assert!(skip < OTHERS, "skip={skip}");
+                assert!(read <= skip + MAX_SCAN + 1, "read={read} skip={skip}");
+                if let Some(p) = stored_pos(&t.0) {
+                    offsets.insert(p.offset);
+                }
+                if !r.truncated {
+                    break;
+                }
+                assert!(passes < 13, "sweep did not reach the end");
+            }
+            assert_eq!(passes, 13);
+            assert!(!lock.exists());
+            assert_eq!(stored_pos(&t.0), None);
+            // 先頭（0）以外のカーネル位置から再開した回がある（まとめ読みの境界を越えて進んだ）。
+            assert!(offsets.iter().any(|o| *o != 0), "offsets={offsets:?}");
+            // 読み取り総数はエントリ数に比例する（各回の読み飛ばしは libc のバッファ 1 個分以内）。
+            assert!(total_read < 4 * OTHERS, "total_read={total_read}");
+        }
+
+        /// PLUG-7・REPAIR-5（#1310）: `lseek` が拒否する位置・巨大な読み飛ばし件数のヒント（破損・改ざん）でも
+        /// 有限の読み取りで終わり、残骸は高々 2 回の掃除で消える。
+        #[test]
+        fn plug7_cursor_garbage_position_terminates_and_recovers() {
+            let name = std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap();
+            let euid = crate::sys::effective_uid();
+            // (a) 位置が不正（`lseek` が失敗する）: 同じ回のうちに先頭から走査し直す。
+            let t = Tmp::new();
+            std::fs::write(t.0.join(name), b"18446744073709551615 7\n").unwrap();
+            let lock = t.0.join("oneshot-1-0.sock.lock");
+            std::fs::write(&lock, b"").unwrap();
+            let (r, read) = sweep_one_shot_counted(&t.0, euid, 1024, 256).unwrap();
+            assert_eq!((r.examined, r.truncated, read), (1, false, 2));
+            assert!(!lock.exists());
+            assert_eq!(stored_pos(&t.0), None);
+            // (b) 読み飛ばし件数が巨大: 最初のまとめ読み（2 エントリ）で末尾に達して終わり、ヒントを
+            // 消す。残骸は次の回に先頭から走査して消える。
+            let t = Tmp::new();
+            std::fs::write(t.0.join(name), b"0 999999999\n").unwrap();
+            let lock = t.0.join("oneshot-1-0.sock.lock");
+            std::fs::write(&lock, b"").unwrap();
+            let (r, read) = sweep_one_shot_counted(&t.0, euid, 1024, 256).unwrap();
+            assert_eq!((r.examined, r.truncated, read), (0, false, 2));
+            assert!(lock.exists());
+            assert_eq!(stored_pos(&t.0), None);
+            let (r, read) = sweep_one_shot_counted(&t.0, euid, 1024, 256).unwrap();
+            assert_eq!((r.examined, r.truncated, read), (1, false, 2));
+            assert!(!lock.exists());
+        }
+
+        /// PLUG-7（#1310）: 掃除で削除した分だけ保存位置を手前へ戻すため、削除で並びが詰まっても未処理の
+        /// 残骸を飛ばさない。候補上限 2 件でロック 6 件を掃除すると、ちょうど 3 回ですべて消える。
+        #[test]
+        fn plug7_cursor_rewinds_by_removed_entries() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let locks: Vec<_> = (0..6)
+                .map(|i| t.0.join(format!("oneshot-1-{i}.sock.lock")))
+                .collect();
+            for l in &locks {
+                std::fs::write(l, b"").unwrap();
+            }
+            let mut results = Vec::new();
+            for _ in 0..3 {
+                let r = sweep_one_shot_limited(&t.0, euid, 1024, 2).unwrap();
+                results.push((r.examined, r.truncated));
+            }
+            assert_eq!(results, [(2, true), (2, true), (2, false)]);
+            assert_eq!(locks.iter().filter(|l| l.exists()).count(), 0);
+            assert_eq!(stored_pos(&t.0), None);
         }
 
         /// PLUG-12（#1310）: 削除を拒否する socket（symlink・記録なしの socket 以外）のロックファイルは、
@@ -1395,14 +1661,14 @@ mod imp {
             drop(held);
         }
 
-        /// REPAIR-5（#1310）: ディレクトリ実サイズを超える巨大なヒントでも、読み飛ばしはディレクトリ末尾で
-        /// 止まり、有限時間で終わって走査完了（ヒント削除）に戻る。
+        /// REPAIR-5（#1310）: ディレクトリの末尾より先を指す位置のヒントでも 1 件も読まずに末尾と分かり、
+        /// 同じ回のうちに先頭から走査し直して走査完了（ヒント削除）に戻る。
         #[test]
         fn plug7_cursor_beyond_directory_size_terminates_and_resets() {
             let t = Tmp::new();
             let euid = crate::sys::effective_uid();
             let name = std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap();
-            std::fs::write(t.0.join(name), b"999999999\n").unwrap();
+            std::fs::write(t.0.join(name), b"999999999 0\n").unwrap();
             let lock = t.0.join("oneshot-1-0.sock.lock");
             std::fs::write(&lock, b"").unwrap();
             let r = sweep_one_shot_limited(&t.0, euid, 1024, 256).unwrap();

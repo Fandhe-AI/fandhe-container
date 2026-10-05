@@ -68,7 +68,8 @@
 //! 削除。TASK-123.2）が起きず、runtime directory に溜まり続ける。[`RuntimeDir::sweep_one_shot_leftovers`] が
 //! これを掃除する。
 //! - 呼ぶ時機: runtime directory の初期化時（[`RuntimeDir::ensure_under`]・[`RuntimeDir::from_env`]）に
-//!   best-effort で 1 回行う（失敗しても初期化は失敗させない）。残骸は異常終了したプロセスからしか生じず、
+//!   best-effort で 1 回行う（失敗しても初期化は失敗させない。掃除を始められなかった・列挙が途中で
+//!   失敗した場合は、構造化ログ `plugin.sweep_one_shot` を stderr へ 1 行出す。REPAIR-4）。残骸は異常終了したプロセスからしか生じず、
 //!   プロセスごとの初期化 1 回で収束する（常駐デーモンを持たない CORE-1 では CLI 起動ごとに初期化が走る）。
 //!   各 `call_once` の前に置くと全呼び出しにディレクトリ列挙が上乗せされ、境界レイテンシ（PLUG-6）に
 //!   響くため採らない。長時間動くプロセスは公開メソッドを任意の時機に呼べる。
@@ -190,6 +191,30 @@ pub struct OneShotSweep {
     pub skipped: u32,
     /// 候補の件数上限または走査するエントリ数の上限に達して走査を打ち切ったか（続きは次回の掃除が走査する）。
     pub truncated: bool,
+    /// 列挙が途中で失敗し、未走査のエントリが残っている可能性があるか（`truncated` とは別。上限では
+    /// なくエラーで止まった。次回の掃除は先頭から走査し直す）。`false` かつ `truncated` も `false` の
+    /// ときだけ、末尾まで走査し終えている。
+    pub incomplete: bool,
+}
+
+impl OneShotSweep {
+    /// 掃除が完了しなかったことを知らせる構造化ログ（JSON Lines の 1 行。改行なし。REPAIR-4）。
+    ///
+    /// 初期化時の掃除は best-effort で、失敗しても初期化は続ける。その失敗を無通知にしないため、
+    /// 初期化経路が stderr へ出す（成功時は出さない。件数の記録は TASK-114 の core 側 proxy が
+    /// [`RuntimeDir::sweep_one_shot_leftovers`] の結果から行う）。値は固定文字列・真偽値だけで、
+    /// 外部入力（ファイル名等）を埋め込まない。`error_code` は掃除を始められなかった場合の機械可読な
+    /// `code`（ERR-1）、`incomplete` は列挙が途中で失敗した場合に `true`。
+    pub fn failure_json_line(error_code: Option<&'static str>, incomplete: bool) -> String {
+        let code = match error_code {
+            Some(c) => format!("\"{c}\""),
+            None => "null".to_string(),
+        };
+        format!(
+            "{{\"op\":\"plugin.sweep_one_shot\",\"success\":false,\"error_code\":{code},\
+             \"incomplete\":{incomplete}}}"
+        )
+    }
 }
 
 /// 検証済みの UDS 配置ディレクトリ（PLUG-12）。生の `PathBuf` ではなく newtype で返し、
@@ -622,14 +647,33 @@ mod imp {
         // 異常終了で残った都度起動の残骸を掃除する（#1310）。いま検証した fd をそのまま基準にし、
         // パスを再解決しない。掃除の失敗で初期化を失敗させない（残骸は次回の初期化で再試行され、
         // 判定不能なものは削除しない fail-closed）。
-        let _ = sweep_dir(
+        let swept = sweep_dir(
             &verified,
             euid,
             ONE_SHOT_SWEEP_MAX_SCAN,
             ONE_SHOT_SWEEP_MAX_ENTRIES,
             ONE_SHOT_SWEEP_MAX_SKIP,
         );
+        // 掃除を始められなかった・列挙が途中で失敗した場合は、初期化は続けるが無通知にしない
+        // （構造化ログを stderr へ 1 行出す。REPAIR-4。書き込み失敗は初期化に影響させない）。
+        if let Some(line) = sweep_failure_log(swept.as_ref().map(|(out, _)| out)) {
+            use std::io::Write;
+            let _ = writeln!(io::stderr(), "{line}");
+        }
         Ok(RuntimeDir { path: dir })
+    }
+
+    /// 初期化時の掃除結果から、出すべき失敗ログ（[`OneShotSweep::failure_json_line`]）を決める純粋関数。
+    /// 末尾まで走査した・上限で打ち切った（次回に続きを走査する正常な経過）場合は `None`。
+    pub(super) fn sweep_failure_log(swept: Result<&OneShotSweep, &PluginError>) -> Option<String> {
+        match swept {
+            Ok(out) if out.incomplete => Some(OneShotSweep::failure_json_line(None, true)),
+            Ok(_) => None,
+            Err(e) => Some(OneShotSweep::failure_json_line(
+                Some(e.code().as_str()),
+                false,
+            )),
+        }
     }
 
     pub(super) fn sweep_one_shot_leftovers(dir: &RuntimeDir) -> Result<OneShotSweep, PluginError> {
@@ -779,6 +823,17 @@ mod imp {
         read: usize,
         /// 列挙の途中でエラーになった（残りは次回、先頭から走査し直す）。
         failed: bool,
+    }
+
+    /// 列挙の結果を掃除結果の初期値へ写す純粋関数。列挙が途中で失敗した場合は `incomplete` を立て
+    /// （走査完了と区別する）、`skipped` に 1 件数える。
+    fn scan_outcome(scan: &Scan) -> OneShotSweep {
+        OneShotSweep {
+            truncated: scan.next.is_some(),
+            incomplete: scan.failed,
+            skipped: u32::from(scan.failed),
+            ..OneShotSweep::default()
+        }
     }
 
     /// `start` から列挙して候補名を集める（何も削除しない）。
@@ -950,13 +1005,7 @@ mod imp {
                 scan
             }
         };
-        let mut out = OneShotSweep {
-            truncated: scan.next.is_some(),
-            ..OneShotSweep::default()
-        };
-        if scan.failed {
-            out.skipped += 1;
-        }
+        let mut out = scan_outcome(&scan);
         // 段階 2: 集めた候補を処理する。socket・ロックファイルが実際に消えたかを確かめる。
         let mut removed_any = false;
         for name in &scan.candidates {
@@ -1959,6 +2008,48 @@ mod imp {
             assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
             assert!(started.elapsed() < std::time::Duration::from_millis(100));
             assert_eq!(held.lock().unwrap().len(), 2);
+        }
+
+        /// REPAIR-4・PLUG-7（#1310）: 列挙が途中で失敗した掃除は走査完了と区別でき（`incomplete`）、初期化時は
+        /// 失敗の構造化ログを出す。末尾まで走査した・上限で打ち切った場合は出さない。
+        #[test]
+        fn repair4_sweep_failure_is_reported_not_dropped() {
+            let failed = scan_outcome(&Scan {
+                failed: true,
+                ..Scan::default()
+            });
+            assert_eq!(
+                (failed.incomplete, failed.truncated, failed.skipped),
+                (true, false, 1)
+            );
+            assert_eq!(
+                sweep_failure_log(Ok(&failed)).as_deref(),
+                Some(
+                    "{\"op\":\"plugin.sweep_one_shot\",\"success\":false,\
+                     \"error_code\":null,\"incomplete\":true}"
+                )
+            );
+            let e = err(
+                PluginErrorCode::Internal,
+                "failed to enumerate runtime directory",
+            );
+            assert_eq!(
+                sweep_failure_log(Err(&e)).as_deref(),
+                Some(
+                    "{\"op\":\"plugin.sweep_one_shot\",\"success\":false,\
+                     \"error_code\":\"INTERNAL\",\"incomplete\":false}"
+                )
+            );
+            let truncated = scan_outcome(&Scan {
+                next: Some(ScanPos { offset: 7, skip: 1 }),
+                ..Scan::default()
+            });
+            assert_eq!(
+                (truncated.incomplete, truncated.truncated, truncated.skipped),
+                (false, true, 0)
+            );
+            assert_eq!(sweep_failure_log(Ok(&truncated)), None);
+            assert_eq!(sweep_failure_log(Ok(&OneShotSweep::default())), None);
         }
 
         /// PLUG-7・PLUG-12（#1310）: 掃除はロックファイルを作成しない。列挙後に消えた名前を処理しても

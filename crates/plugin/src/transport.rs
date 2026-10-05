@@ -63,9 +63,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use crate::audit::{
-    PeerAuthObserver, PeerAuthOp, PeerAuthRejectReason, PeerAuthRejection, StderrPeerAuthObserver,
-};
+use crate::audit::{PeerAuthObserver, StderrPeerAuthObserver};
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
 
@@ -521,10 +519,10 @@ fn map_connect_error(kind: io::ErrorKind) -> PluginError {
 #[cfg(unix)]
 mod imp {
     use super::{
-        FrameOp, PeerAuthObserver, PeerAuthOp, PeerAuthRejectReason, PeerAuthRejection, RpcTimeout,
-        TimeoutRestore, UDS_DEFAULT_IO_TIMEOUT, map_bind_error, map_connect_error,
-        map_frame_io_error,
+        FrameOp, PeerAuthObserver, RpcTimeout, TimeoutRestore, UDS_DEFAULT_IO_TIMEOUT,
+        map_bind_error, map_connect_error, map_frame_io_error,
     };
+    use crate::audit::{PeerAuthOp, PeerAuthRejectReason, PeerAuthRejection};
     use crate::error::{PluginError, PluginErrorCode};
     use crate::frame::{FRAME_HEADER_LEN, Frame, FrameHeader};
     use crate::sys;
@@ -914,8 +912,9 @@ mod imp {
             Self::connect_with_expected(path, timeout, sys::effective_uid(), observer)
         }
 
-        /// `connect` の本体。期待 UID を引数に取るのはテストで期待値をずらすためで、本番は常に
-        /// 自 euid を渡す（`#[cfg(test)]` 以外から別値で呼べない。TASK-124.5）。
+        /// `connect` の本体。期待 UID を引数に取るのはテストで期待値をずらすためで、本番経路
+        /// （`connect`）は常に自 euid を渡す。可視性は `pub(super)` のため非テストビルドにも
+        /// 存在するが、呼び出し元は `connect` とテストに限る（TASK-124.5）。
         pub(super) fn connect_with_expected(
             path: &Path,
             timeout: Duration,
@@ -1253,6 +1252,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::{PeerAuthOp, PeerAuthRejectReason, PeerAuthRejection};
 
     /// 相手側の生 socket と、検証を経ずに包んだ `UdsStream` の対を作る。
     #[cfg(unix)]

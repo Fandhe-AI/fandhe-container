@@ -35,8 +35,6 @@
 //!   解釈しないため、スクリプトの振る舞い（ロック・claim・記録・取り下げ・タイムアウトからの回復）は模擬ゲストの
 //!   ユニットテストで検証し、本物の WSL2 ゲストでの挙動（`flock`・`/run`・`mount.drvfs`）は TASK-67.6（#377）で
 //!   実機確認する。
-//! - 暫定の `WinError` → `Wsl2Error` 変換（`win_error_to_wsl2`）は TASK-67.5（#376）でエラー型を共通化する際に
-//!   置き換える。
 //!
 //! # 権限
 //!
@@ -54,7 +52,6 @@ use super::{
     DistroState, MAX_OUTPUT_BYTES, Wsl2Error, Wsl2ErrorCode, Wsl2Status, check_timeout,
     detect_with_program, run, wsl_exe_path,
 };
-use crate::error::{WinError, WinErrorCode};
 use crate::instrument::{NoopWinOpRecorder, WinOpKind, WinOpRecorder, WinOpTimer, record_win_op};
 use crate::wslconfig::{self, VirtiofsState};
 
@@ -759,19 +756,6 @@ fn find_mount<'a>(entries: &'a [MountEntry], guest_path: &str) -> Option<&'a Mou
     }
 }
 
-/// 暫定の `WinError` → `Wsl2Error` 変換。TASK-67.5（#376）でエラー型を共通化する際に置き換える（REPAIR-3）。
-fn win_error_to_wsl2(e: &WinError) -> Wsl2Error {
-    let code = match e.code() {
-        WinErrorCode::InvalidArgument => Wsl2ErrorCode::InvalidArgument,
-        WinErrorCode::NotFound => Wsl2ErrorCode::NotFound,
-        WinErrorCode::PermissionDenied => Wsl2ErrorCode::PermissionDenied,
-        WinErrorCode::ResourceExhausted => Wsl2ErrorCode::ResourceExhausted,
-        WinErrorCode::Unimplemented => Wsl2ErrorCode::Unimplemented,
-        _ => Wsl2ErrorCode::Internal,
-    };
-    Wsl2Error::new(code, e.message())
-}
-
 // ---- シーケンス（実行器を差し替え可能にした本体） ----
 
 /// `wsl.exe` 相当の実行器: 引数列と stdout/stderr の上限バイト数を受け取り、タイムアウト付きで実行する。
@@ -1401,10 +1385,8 @@ fn resolve_environment(
 ) -> Result<(std::path::PathBuf, VirtiofsState), Wsl2Error> {
     check_timeout(timeout)?;
     let program = wsl_exe_path()?;
-    let path = wslconfig::default_path().map_err(|e| win_error_to_wsl2(&e))?;
-    let state = wslconfig::load(&path)
-        .map_err(|e| win_error_to_wsl2(&e))?
-        .map_or(VirtiofsState::Unset, |c| c.virtiofs_state());
+    let path = wslconfig::default_path()?;
+    let state = wslconfig::load(&path)?.map_or(VirtiofsState::Unset, |c| c.virtiofs_state());
     Ok((program, state))
 }
 
@@ -2002,32 +1984,6 @@ mod tests {
             parse_mountinfo(&many).unwrap_err().code(),
             Wsl2ErrorCode::ResourceExhausted
         );
-    }
-
-    /// 暫定変換の code 写像（#376 で共通化するまで）。
-    #[test]
-    fn win_error_mapping() {
-        let cases = [
-            (
-                WinErrorCode::InvalidArgument,
-                Wsl2ErrorCode::InvalidArgument,
-            ),
-            (WinErrorCode::NotFound, Wsl2ErrorCode::NotFound),
-            (
-                WinErrorCode::PermissionDenied,
-                Wsl2ErrorCode::PermissionDenied,
-            ),
-            (
-                WinErrorCode::ResourceExhausted,
-                Wsl2ErrorCode::ResourceExhausted,
-            ),
-            (WinErrorCode::Unimplemented, Wsl2ErrorCode::Unimplemented),
-            (WinErrorCode::Internal, Wsl2ErrorCode::Internal),
-        ];
-        for (w, s) in cases {
-            let e = win_error_to_wsl2(&WinError::new(w, "m"));
-            assert_eq!((e.code(), e.message()), (s, "m"));
-        }
     }
 
     /// ゲストの模擬: mountinfo を保持し、mount/umount/mkdir に応答する。

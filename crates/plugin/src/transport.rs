@@ -613,6 +613,11 @@ mod imp {
         identity: Option<sys::FileIdent>,
         /// bind 時点の自プロセスの実効 uid（accept ごとの peer 照合の基準）。
         euid: u32,
+        /// テスト専用: peer 認証で拒否した接続を drop せず退避する（PLUG-12・TASK-124.6・#1389）。
+        /// 拒否時に相手が先送りしたフレームが 1 バイトも読まれていないことを、退避した stream から
+        /// 受信キューを読んで照合するため。リリースビルドには存在せず、拒否した接続は従来どおり drop する。
+        #[cfg(test)]
+        rejected: std::sync::Mutex<Option<UnixStream>>,
     }
 
     impl ListenerInner {
@@ -650,6 +655,8 @@ mod imp {
                 path: bound,
                 identity,
                 euid,
+                #[cfg(test)]
+                rejected: std::sync::Mutex::new(None),
             };
             // 管理下の証拠として socket の同一性をロックへ記録する。記録できないまま listener を返すと、
             // 異常終了時に記録の無い socket が残り、以後の bind が stale と判定できず `AlreadyExists` に
@@ -702,6 +709,37 @@ mod imp {
             expected_pid: Option<u32>,
             abort: &mut dyn FnMut() -> Option<PluginError>,
         ) -> Result<StreamInner, PluginError> {
+            self.accept_with(timeout, self.euid, expected_pid, abort)
+        }
+
+        /// テスト専用: 期待 UID をずらして peer 認証を拒否させる入口（PLUG-12・TASK-124.6・#1389）。
+        /// 検証（`verify_peer`）は必ず通る。検証を省く経路ではない。
+        #[cfg(test)]
+        pub(super) fn accept_with_expected_uid(
+            &self,
+            timeout: Duration,
+            expected_uid: u32,
+        ) -> Result<StreamInner, PluginError> {
+            self.accept_with(timeout, expected_uid, None, &mut || None)
+        }
+
+        /// テスト専用: 拒否して退避した接続を取り出す。
+        #[cfg(test)]
+        pub(super) fn take_rejected(&self) -> Option<UnixStream> {
+            self.rejected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        }
+
+        /// `accept` の本体。`expected_uid` は公開経路では常に `self.euid`。
+        fn accept_with(
+            &self,
+            timeout: Duration,
+            expected_uid: u32,
+            expected_pid: Option<u32>,
+            abort: &mut dyn FnMut() -> Option<PluginError>,
+        ) -> Result<StreamInner, PluginError> {
             let deadline = Instant::now() + timeout;
             let mut poll_interval = ACCEPT_POLL_INITIAL;
             loop {
@@ -719,7 +757,15 @@ mod imp {
                         // 別 UID（取得不能を含む）は切断して拒否する（PLUG-12・fail-closed）。
                         // drop で fd を閉じるため相手は切断される。
                         // accept 直後・最初の read より前に検証する（TASK-124.1・#292）。
-                        crate::uds_security::verify_peer(&stream, self.euid)?;
+                        // 順序は `transport::tests::plug12_order` で機械照合する（TASK-124.6・#1389）。
+                        #[cfg(not(test))]
+                        crate::uds_security::verify_peer(&stream, expected_uid)?;
+                        // テストでは拒否した接続を退避する（drop しない。`rejected` 参照）。
+                        #[cfg(test)]
+                        if let Err(e) = crate::uds_security::verify_peer(&stream, expected_uid) {
+                            *self.rejected.lock().unwrap_or_else(|p| p.into_inner()) = Some(stream);
+                            return Err(e);
+                        }
                         // 応答者の限定指定がある場合、spawn した子以外（同一 UID の別プロセス）は
                         // 切断して受付を継続する（PLUG-7。取得不能は fail-closed でエラー）。
                         if let Some(pid) = expected_pid
@@ -819,12 +865,34 @@ mod imp {
 
         /// 期限付き connect → server の peer UID 照合 → blocking 化 → 既定 I/O 期限の付与。
         pub(super) fn connect(path: &Path, timeout: Duration) -> Result<Self, PluginError> {
+            Self::connect_with(path, timeout, sys::effective_uid())
+        }
+
+        /// テスト専用: 期待 UID をずらして peer 認証を拒否させる入口（PLUG-12・TASK-124.6・#1389）。
+        /// 検証（`verify_peer`）は必ず通る。検証を省く経路ではない。
+        #[cfg(test)]
+        pub(super) fn connect_with_expected_uid(
+            path: &Path,
+            timeout: Duration,
+            expected_uid: u32,
+        ) -> Result<Self, PluginError> {
+            Self::connect_with(path, timeout, expected_uid)
+        }
+
+        /// `connect` の本体。`expected_uid` は公開経路では常に自プロセスの実効 uid。
+        fn connect_with(
+            path: &Path,
+            timeout: Duration,
+            expected_uid: u32,
+        ) -> Result<Self, PluginError> {
             check_sun_path_len(path)?;
             let deadline = Instant::now() + timeout;
             let stream =
                 sys::connect_unix(path, deadline).map_err(|e| map_connect_error(e.kind()))?;
             // 偽 listener への誘導対策（PLUG-12）。不一致・取得不能は何も送らず drop で切断する。
-            crate::uds_security::verify_peer(&stream, sys::effective_uid())?;
+            // 最初の送信より前に検証する。順序は `transport::tests::plug12_order` で機械照合する
+            // （TASK-124.6・#1389）。
+            crate::uds_security::verify_peer(&stream, expected_uid)?;
             stream.set_nonblocking(false).map_err(|_| {
                 PluginError::new(
                     PluginErrorCode::Internal,
@@ -1132,6 +1200,198 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PLUG-12・TASK-124.6: peer 認証が最初のフレーム読み取り（accept）・最初の送信（connect）より
+    /// 前であることを実接続で照合するテスト群。
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    mod plug12_order {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc;
+
+        const WAIT: Duration = Duration::from_secs(5);
+        const MISMATCH: &str = "peer credential does not match the current user";
+
+        /// 0700 の一時ディレクトリ（socket の配置先。drop で削除）。
+        struct TempDir(PathBuf);
+        impl TempDir {
+            fn new() -> Self {
+                static N: AtomicU32 = AtomicU32::new(0);
+                let p = std::env::temp_dir().join(format!(
+                    "fctr-{}-{}",
+                    std::process::id(),
+                    N.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+                Self(p)
+            }
+            fn sock(&self) -> PathBuf {
+                self.0.join("s.sock")
+            }
+        }
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn shifted_uid() -> u32 {
+            crate::sys::effective_uid().wrapping_add(1)
+        }
+
+        fn presend_frame() -> Vec<u8> {
+            Frame::new(b"presend-frame".to_vec()).unwrap().encode()
+        }
+
+        /// 生 client が connect 直後にフレームを送り、送信完了を通知して EOF を待つスレッドを起こす。
+        #[allow(clippy::type_complexity)]
+        fn spawn_presend_client(
+            path: PathBuf,
+            bytes: Vec<u8>,
+        ) -> (
+            mpsc::Receiver<()>,
+            std::thread::JoinHandle<std::io::Result<usize>>,
+        ) {
+            let (tx, rx) = mpsc::channel();
+            let h = std::thread::spawn(move || {
+                let mut c = UnixStream::connect(&path)?;
+                c.set_read_timeout(Some(WAIT))?;
+                c.write_all(&bytes)?;
+                tx.send(()).ok();
+                let mut buf = [0u8; 16];
+                c.read(&mut buf)
+            });
+            (rx, h)
+        }
+
+        /// accept 側。peer 認証の拒否時、先送りされたフレームは 1 バイトも読まれず
+        /// （受信キューに全量残り）、`UdsStream` も作られない。
+        #[test]
+        fn plug12_accept_rejection_leaves_presend_frame_unread() {
+            let dir = TempDir::new();
+            let l = UdsListener::bind(&dir.sock()).unwrap();
+            let bytes = presend_frame();
+            let (sent, h) = spawn_presend_client(l.path().to_path_buf(), bytes.clone());
+            sent.recv_timeout(WAIT).unwrap();
+
+            let e = l
+                .inner
+                .accept_with_expected_uid(WAIT, shifted_uid())
+                .unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert_eq!(e.message(), MISMATCH);
+
+            let mut rejected = l.inner.take_rejected().expect("rejected stream stashed");
+            rejected.set_nonblocking(false).unwrap();
+            rejected.set_read_timeout(Some(WAIT)).unwrap();
+            let mut got = vec![0u8; bytes.len()];
+            rejected.read_exact(&mut got).unwrap();
+            assert_eq!(got, bytes);
+            rejected.set_nonblocking(true).unwrap();
+            let mut extra = [0u8; 1];
+            let e = rejected.read(&mut extra).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+
+            // 退避した接続を閉じると client は EOF を観測する。
+            drop(rejected);
+            assert_eq!(h.join().unwrap().unwrap(), 0);
+
+            // 拒否後も同じ listener は同一 UID の接続を受理し続ける。
+            let (sent, h) = spawn_presend_client(l.path().to_path_buf(), bytes);
+            sent.recv_timeout(WAIT).unwrap();
+            let mut s = l.accept(WAIT).unwrap();
+            let f = s.read_frame(RpcTimeout::new(WAIT).unwrap()).unwrap();
+            assert_eq!(f.payload(), b"presend-frame");
+            drop(s);
+            h.join().unwrap().unwrap();
+        }
+
+        /// 陽性対照。検証を通る接続では先送りフレームが最初のフレームとして読め、退避された接続は
+        /// 無い（拒否時だけを捉える計測であることの確認）。
+        #[test]
+        fn plug12_accept_success_reads_presend_frame_as_first_frame() {
+            let dir = TempDir::new();
+            let l = UdsListener::bind(&dir.sock()).unwrap();
+            let (sent, h) = spawn_presend_client(l.path().to_path_buf(), presend_frame());
+            sent.recv_timeout(WAIT).unwrap();
+            let inner = l
+                .inner
+                .accept_with_expected_uid(WAIT, crate::sys::effective_uid())
+                .unwrap();
+            assert!(l.inner.take_rejected().is_none());
+            let mut s = UdsStream {
+                inner,
+                poisoned: false,
+                io_timeout_unrestored: false,
+            };
+            let f = s.read_frame(RpcTimeout::new(WAIT).unwrap()).unwrap();
+            assert_eq!(f.payload(), b"presend-frame");
+            drop(s);
+            h.join().unwrap().unwrap();
+        }
+
+        /// connect 側。server 検証の拒否時は `StreamInner` が作られず、server は 1 バイトも
+        /// 受信しない（EOF のみ）。
+        #[test]
+        fn plug12_connect_rejection_sends_no_bytes() {
+            let dir = TempDir::new();
+            let server = UnixListener::bind(dir.sock()).unwrap();
+            let e = imp::StreamInner::connect_with_expected_uid(&dir.sock(), WAIT, shifted_uid())
+                .unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert_eq!(e.message(), MISMATCH);
+
+            server.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + WAIT;
+            let conn = loop {
+                match server.accept() {
+                    Ok((c, _)) => break c,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "no connection");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            };
+            // client は既に close 済み。macOS では set_read_timeout が EINVAL になり得るため、
+            // nonblocking のまま期限付きで読む。
+            conn.set_nonblocking(true).unwrap();
+            let mut conn = conn;
+            let mut buf = [0u8; 16];
+            let n = loop {
+                match conn.read(&mut buf) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "no EOF");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("read failed: {e}"),
+                }
+            };
+            assert_eq!(n, 0);
+
+            // 対照: 期待 UID をずらさなければ同じ listener へ接続できる。
+            let ok = imp::StreamInner::connect_with_expected_uid(
+                &dir.sock(),
+                WAIT,
+                crate::sys::effective_uid(),
+            );
+            assert!(ok.is_ok());
+        }
+    }
 
     /// 相手側の生 socket と、検証を経ずに包んだ `UdsStream` の対を作る。
     #[cfg(unix)]

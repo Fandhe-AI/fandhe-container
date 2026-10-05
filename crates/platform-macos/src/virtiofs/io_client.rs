@@ -139,6 +139,7 @@ pub enum VirtiofsIoError {
     },
     /// 再接続を既定回数試みたがすべて失敗した（TASK-65.5）。`source` は最後の試行のエラー。
     /// `unflushed_writes` は切断時点で永続化が確認できていなかった `Write` の件数（初回接続の失敗では 0）。
+    /// 件数は再接続に成功して `ConnectionLost` で通知されるまで保持され、以後の操作でも再通知される（IO-2）。
     ReconnectFailed {
         attempts: u32,
         unflushed_writes: u64,

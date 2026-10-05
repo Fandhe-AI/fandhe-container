@@ -23,6 +23,9 @@
 //! - 接続断以外のエラー（タイムアウト・DataLoss・想定外 ACK）は元のエラーをそのまま返す。client が poison
 //!   されていれば次の呼び出しの冒頭で再接続する。その時点で未確定の `Write` が残っていれば、操作を実行せず
 //!   `ConnectionLost`（再接続成功）または件数付き `ReconnectFailed` で明示し、呼び出し元の判断（冪等な Write のみ再発行可）を求める。
+//! - 再接続に失敗しても未確定件数は捨てずに保持する。以後の `write` / `flush` は冒頭で再び再接続を試み、
+//!   成功すれば操作を実行せず `ConnectionLost`、失敗すれば同じ件数の `ReconnectFailed` を返す。件数が 0 に
+//!   戻るのは、FLUSH ACK を確認したときか、再接続に成功して `ConnectionLost` で件数を通知したときだけ（IO-2）。
 //! - 最悪の総待ち時間は `max_attempts × connect_timeout + (max_attempts − 1) × interval` で有界
 //!   （既定 3×5s + 2×0.5s = 16s、上限値 10×10s + 9×10s = 190s。REPAIR-5）。無限リトライはしない。
 //! - 再接続のたびに [`VirtiofsIoClient::new`] を通すため、ReadOnly 共有の拒否（fail-closed）は毎回再検証される。
@@ -236,6 +239,7 @@ where
 
     /// 最後に FLUSH ACK（明示 `flush` または暗黙 flush）を確認して以降に送った `Write` の件数
     /// （永続化未確認の上限値。通常 ACK では減らさない。送信結果が曖昧な失敗 `Write` も含み、送信前に拒否された `Write` は含まない。IO-1・IO-2）。
+    /// 再接続に失敗した後も保持し、再接続に成功して `ConnectionLost` で通知したときに 0 へ戻す。
     pub fn unflushed_writes(&self) -> u64 {
         self.unflushed_writes
     }
@@ -341,8 +345,9 @@ where
 
     /// 使える接続がなければ（未接続・poison）再接続する。`op` は次に実行しようとしている操作。
     ///
-    /// 旧接続に未確定の `Write` が残っていた場合（タイムアウト等で poison された後）は、黙って捨てずに
-    /// 再接続のうえ [`VirtiofsIoError::ConnectionLost`] で呼び出し元へ明示する。`op` は実行されない。
+    /// 旧接続に未確定の `Write` が残っていた場合（タイムアウト等で poison された後、または前回の再接続が
+    /// 失敗した後）は、黙って捨てずに再接続のうえ [`VirtiofsIoError::ConnectionLost`]（失敗なら件数付きの
+    /// `ReconnectFailed`）で呼び出し元へ明示する。`op` は実行されない。
     fn ensure_connected(&mut self, op: VirtiofsIoOp) -> Result<(), VirtiofsIoError> {
         if self.is_connected() {
             return Ok(());
@@ -350,28 +355,39 @@ where
         if self.unflushed_writes == 0 {
             return self.reconnect();
         }
-        let source = IoError::new(
-            IoErrorCode::Unavailable,
-            "previous connection was poisoned by an earlier error",
-        );
+        let source = if self.client.is_none() {
+            IoError::new(
+                IoErrorCode::Unavailable,
+                "an earlier reconnect failed while writes were unflushed",
+            )
+        } else {
+            IoError::new(
+                IoErrorCode::Unavailable,
+                "previous connection was poisoned by an earlier error",
+            )
+        };
         Err(self.reconnect_reporting_unflushed(op, source))
     }
 
-    /// 旧接続の未確定件数を持ち出して再接続する。成功なら `ConnectionLost`、全試行失敗なら件数付きの
-    /// `ReconnectFailed` を返す（件数は返却値へ移し、状態は 0 に戻す。新接続に未確定分は存在しない）。
+    /// 旧接続の未確定件数を通知しつつ再接続する。成功なら件数を 0 に戻して `ConnectionLost` を返す
+    /// （新接続に未確定分は存在しない）。失敗なら件数を状態に残したまま件数付きの `ReconnectFailed` を
+    /// 返し、後続の操作でも同じ件数を再通知させる（IO-2。失敗時に 0 へ戻すと以後の再接続成功で黙って破棄される）。
     fn reconnect_reporting_unflushed(
         &mut self,
         op: VirtiofsIoOp,
         source: IoError,
     ) -> VirtiofsIoError {
-        let unflushed_writes = std::mem::take(&mut self.unflushed_writes);
+        let unflushed_writes = self.unflushed_writes;
         match self.reconnect() {
-            Ok(()) => VirtiofsIoError::ConnectionLost {
-                op,
-                unflushed_writes,
-                reconnected: true,
-                source,
-            },
+            Ok(()) => {
+                self.unflushed_writes = 0;
+                VirtiofsIoError::ConnectionLost {
+                    op,
+                    unflushed_writes,
+                    reconnected: true,
+                    source,
+                }
+            }
             Err(VirtiofsIoError::ReconnectFailed {
                 attempts, source, ..
             }) => VirtiofsIoError::ReconnectFailed {
@@ -379,10 +395,7 @@ where
                 unflushed_writes,
                 source,
             },
-            Err(e) => {
-                self.unflushed_writes = unflushed_writes;
-                e
-            }
+            Err(e) => e,
         }
     }
 

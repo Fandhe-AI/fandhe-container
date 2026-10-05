@@ -358,7 +358,7 @@ fn connection_loss_then_reconnect_failure() {
             ..
         }
     ));
-    assert_eq!(c.unflushed_writes(), 0);
+    assert_eq!(c.unflushed_writes(), 1);
     assert!(!c.is_connected());
     assert_eq!(*h.calls.lock().expect("lock"), 3);
     assert_eq!(*h.pauses.borrow(), vec![Duration::from_millis(3)]);

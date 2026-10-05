@@ -4,7 +4,7 @@
 //! `wsl2::test_support` 経由で公開 API と同じ処理（検出 → mount → mountinfo によるマウント ID・fstype の確認 →
 //! 起動ステップ → 解除）を 3 OS で確かめる。実行器との接続（argv の受け渡し・呼び出しごとのタイムアウト・
 //! 出力の解析）を通すことが目的で、ゲスト内スクリプトの振る舞いは模擬ゲストのユニットテスト
-//! （`src/wsl2/mount.rs`）と実機確認（TASK-67.6・#377）の担当。
+//! （`src/wsl2/mount.rs`）と実機確認（tests/wsl2_virtiofs.rs の #[ignore] テスト。TASK-67.6・#377）の担当。
 //! feature `wsl2-test-support` が必要（`cargo test -p fandhe-container-platform-windows --all-features`）。
 //! feature なしでは本ファイル全体を外し、0 件の test target になる（Cargo.toml のコメント参照）。
 

@@ -1,7 +1,7 @@
 //! WSL2 検出の公開 API の結合試験（TASK-67.3・WIN-1・ERR-1・REPAIR-5・REPAIR-12）。
 //!
 //! feature なしで実行でき、環境（WSL の有無）によらず結果が決まる経路だけを確かめる（ホストの
-//! `wsl.exe` は起動しない。実機の WSL2 での確認は TASK-67.6・#377）。
+//! `wsl.exe` は起動しない。実機の WSL2 での確認は tests/wsl2_virtiofs.rs の #[ignore] テスト（TASK-67.6・#377））。
 //! 子プロセスの起動・出力解析を含む正常系・失敗系は `tests/wsl2_detect.rs`（feature
 //! `wsl2-test-support`）が偽の `wsl.exe` で検証する。
 

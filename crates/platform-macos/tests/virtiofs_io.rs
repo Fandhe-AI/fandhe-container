@@ -291,6 +291,11 @@ fn resolve_probe_timeout(raw: Option<String>) -> Result<Duration, String> {
 /// 読み込みは期待長 + 1 バイトで打ち切る。
 fn verify_write(share_dir: &Path) -> Result<(), String> {
     let out = share_dir.join("out");
+    // out/ 自体がゲストにより symlink へ差し替えられていないかを先に確認する（read_dir は symlink を辿るため）。
+    let out_meta = std::fs::symlink_metadata(&out).map_err(|e| format!("stat out: {e}"))?;
+    if !out_meta.file_type().is_dir() {
+        return Err("out is not a real directory".to_string());
+    }
     let mut names = Vec::new();
     for ent in std::fs::read_dir(&out)
         .map_err(|e| format!("read_dir out: {e}"))?
@@ -585,6 +590,11 @@ fn mac1_io5_verify_write_rejects_symlink_extra_entries_and_bad_content() {
     std::fs::write(out.join("write.txt"), &good).expect("write");
     std::fs::write(out.join("extra"), b"x").expect("extra");
     assert!(verify_write(&f.share_dir).is_err(), "extra entry");
+    // out/ 自体を symlink へ差し替えた場合も拒否する。
+    let moved = s.dir.join("moved_out");
+    std::fs::rename(&out, &moved).expect("rename out");
+    std::os::unix::fs::symlink(&moved, &out).expect("symlink out");
+    assert!(verify_write(&f.share_dir).is_err(), "symlinked out dir");
 }
 
 /// MAC-1・IO-5・TASK-65.4: ゲストが共有の `in/read.txt` を read できる。

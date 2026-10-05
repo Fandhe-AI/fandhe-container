@@ -297,6 +297,8 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
   FANDHE_CONTAINER_MACOS_VM_KERNEL=/abs/path/to/vmlinux <上で得たバイナリ> --ignored --test-threads=1 --nocapture
   ```
 
+  実機テストの scratch（`CARGO_TARGET_TMPDIR` 配下の `virtiofs-read-*`・`virtiofs-write-*`・`virtiofs-readdir-*` ディレクトリ。`write.txt` 4096 行と `console.log`）はログ参照のため削除せず残す。不要になったら `cargo clean` または当該ディレクトリを手動で削除する。
+
 - virtiofs の symlink・ハードリンク挙動の手動確認（MAC-1・TASK-65.1 追補・#1374。人間担当。Agent は手順準備まで）: 自動テストは無い手動手順。必要環境は `vm_boot` と同じ（実機の macOS 13 以上・`com.apple.security.virtualization` 付き ad-hoc 署名・自前ビルドのゲストカーネル。root 不要）。**正常ゲストの観測は拒否を維持する判断の補強にしかならない**（`cat link` は `FUSE_READLINK` → ゲスト側解決の正常経路で、侵害ゲストが symlink の nodeid へ直接 `FUSE_OPEN` を送る脅威は観測できない）ため、結果にかかわらず絶対パス symlink・ハードリンクの拒否は本手順だけでは緩めない。**現行 API では、共有範囲外を指す symlink（絶対パス・`..` 経由）・範囲外への dangling symlink・ハードリンク（`nlink > 1`）を含む fixture は ReadOnly 共有でも `VmConfigSpec::check_share_conflicts`（`build_vz_configuration` が VZ 呼び出し前に実行）が拒否するため VM を起動できず、これらをゲストから観測することはできない**（観測するには拒否の緩和が要り、本手順の範囲外。緩和の要否は別途ユーザー判断）。本手順で観測できるのは共有範囲内に収まるリンクと、ゲストが実行中に作るリンク（空の ReadWrite 共有）に限る。書き込みを伴う確認は `RW` 内に限り、ホストの共有外ファイルを書き換えない。
   1. fixture（ホスト側。パスは必ずダブルクォートする）:
 

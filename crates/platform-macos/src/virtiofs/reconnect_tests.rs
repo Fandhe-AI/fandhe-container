@@ -52,6 +52,8 @@ enum Mode {
     DieOnRecv,
     /// 受信するとタイムアウトを返す。
     TimeoutOnRecv,
+    /// 送信すると接続断（`Unavailable`）を返す（相手がフレームを受理したか不明な送信失敗）。
+    DieOnSend,
 }
 
 type SentLog = Arc<Mutex<Vec<FrameKind>>>;
@@ -65,6 +67,12 @@ struct MockTransport {
 impl FrameSender for MockTransport {
     type Frame = Frame;
     fn send_frame(&mut self, frame: &Frame, _t: IoTimeout) -> Result<(), IoError> {
+        if matches!(self.mode, Mode::DieOnSend) {
+            return Err(IoError::new(
+                IoErrorCode::Unavailable,
+                "peer closed on send",
+            ));
+        }
         let env = decode_request(frame)?;
         self.sent.lock().expect("lock").push(env.kind());
         self.pending.push_back((env.kind(), env.id()));
@@ -76,7 +84,9 @@ impl FrameReceiver for MockTransport {
     type Frame = Frame;
     fn recv_frame(&mut self, _t: IoTimeout) -> Result<Frame, IoError> {
         match self.mode {
-            Mode::DieOnRecv => Err(IoError::new(IoErrorCode::Unavailable, "peer closed")),
+            Mode::DieOnRecv | Mode::DieOnSend => {
+                Err(IoError::new(IoErrorCode::Unavailable, "peer closed"))
+            }
             Mode::TimeoutOnRecv => Err(IoError::new(IoErrorCode::Timeout, "recv timed out")),
             Mode::Healthy => {
                 let (kind, id) = self
@@ -347,9 +357,10 @@ fn non_disconnect_error_passes_through_then_reconnects_next_call() {
     assert_eq!(c.unflushed_writes(), 1);
 }
 
-/// IO-2・TASK-65.5: 通常 ACK（暗黙 flush）では未確定件数を減らさない。FLUSH ACK 成功時のみ 0 に戻る。
+/// IO-2・TASK-65.5: 通常 ACK だけでは件数を減らさないが、暗黙 flush の FLUSH ACK 確認分は除く。
+/// limit=4（Write 枠 3）で 6 件送ると 4 件目で暗黙 flush が走り、その時点の 3 件は永続化確認済み。
 #[test]
-fn normal_ack_does_not_reset_unflushed() {
+fn implicit_flush_ack_reduces_unflushed() {
     let dir = TempDir::new("implicit");
     let script = vec![Ok(Mode::Healthy)];
     let (res, _h) = build(&dir, ShareAccess::ReadWrite, 4, script, policy(3, 1));
@@ -358,8 +369,28 @@ fn normal_ack_does_not_reset_unflushed() {
     for _ in 0..6 {
         acked += c.write(b"x").expect("write").acked_writes;
     }
-    assert!(acked > 0, "implicit ack expected with a small limit");
-    assert_eq!(c.unflushed_writes(), 6);
+    assert_eq!(acked, 3, "implicit flush acks the first 3 writes");
+    assert_eq!(c.unflushed_writes(), 3);
     c.flush().expect("flush");
+    assert_eq!(c.unflushed_writes(), 0);
+}
+
+/// IO-2・TASK-65.5: 送信に失敗した Write も未確定として数え、最初の Write の失敗でも件数が 1 になる。
+#[test]
+fn failed_send_counts_as_ambiguous_unflushed() {
+    let dir = TempDir::new("send-fail");
+    let script = vec![Ok(Mode::DieOnSend), Ok(Mode::Healthy)];
+    let (res, _h) = build(&dir, ShareAccess::ReadWrite, 8, script, policy(3, 1));
+    let mut c = res.expect("connected");
+    let err = c.write(b"a").expect_err("send fails");
+    assert!(matches!(
+        err,
+        VirtiofsIoError::ConnectionLost {
+            op: VirtiofsIoOp::Write,
+            unflushed_writes: 1,
+            reconnected: true,
+            ..
+        }
+    ));
     assert_eq!(c.unflushed_writes(), 0);
 }

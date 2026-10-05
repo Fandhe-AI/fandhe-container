@@ -271,6 +271,8 @@ where
     timeouts: VirtiofsIoTimeouts,
     /// 状態が曖昧になったエラー（想定外 ACK・flush 途中の失敗）後に立てる。以後の呼び出しを拒否する。
     broken: bool,
+    /// FLUSH ACK を確認できた回数（`confirmed_flushes` 参照）。
+    confirmed_flushes: u64,
 }
 
 impl<T, O> VirtiofsIoClient<T, O>
@@ -300,6 +302,7 @@ where
             client: PipelineClient::new(transport, limit, observer),
             timeouts,
             broken: false,
+            confirmed_flushes: 0,
         })
     }
 
@@ -311,6 +314,12 @@ where
     /// 設定されたタイムアウト。
     pub fn timeouts(&self) -> VirtiofsIoTimeouts {
         self.timeouts
+    }
+
+    /// FLUSH ACK を確認できた回数（暗黙 flush を含む。IO-2）。呼び出し前後の差で、その呼び出しの途中に
+    /// 永続化が確定したか（`write` が暗黙 flush に成功した後で失敗した場合を含む）を判定するのに使う（TASK-65.5）。
+    pub fn confirmed_flushes(&self) -> u64 {
+        self.confirmed_flushes
     }
 
     /// 接続が再利用不可か（トランスポート失効または本クライアントが曖昧状態を検出済み）。
@@ -393,10 +402,13 @@ where
         let mut acked_writes = 0;
         // 送信後は ACK の受け取りが途中で失敗すると状態が曖昧になるため、以後の再利用を拒否する。
         match self.drain_until(barrier.id(), &mut acked_writes) {
-            Ok(()) => Ok(FlushReport {
-                acked_writes,
-                barrier: barrier.id(),
-            }),
+            Ok(()) => {
+                self.confirmed_flushes = self.confirmed_flushes.saturating_add(1);
+                Ok(FlushReport {
+                    acked_writes,
+                    barrier: barrier.id(),
+                })
+            }
             Err(e) => {
                 self.broken = true;
                 Err(e)

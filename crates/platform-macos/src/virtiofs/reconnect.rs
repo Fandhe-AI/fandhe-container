@@ -13,7 +13,7 @@
 //!
 //! - 失敗した操作も、最後の `FlushAck` 以降に送った未確定の `Write` も**自動では再送しない**。通常 ACK は
 //!   永続化を保証せず（IO-2。`docs/api/io-barrier.md`）、サーバーは batch_size 到達時に自動フラッシュするため
-//!   一部だけ永続化されている可能性がある。黙って再送すると重複書き込みや欠落を招く。
+//!   一部だけ永続化されている可能性がある（暗黙 flush で FLUSH ACK を確認できた分は件数から除く）。黙って再送すると重複書き込みや欠落を招く。
 //!   再接続に成功しても失敗した操作は [`VirtiofsIoError::ConnectionLost`] で返し、`unflushed_writes` の
 //!   件数とともに呼び出し元へコミット単位（[`ReconnectingVirtiofsIoClient::write_all_and_flush`]）の再発行を委ねる。
 //! - 接続断以外のエラー（タイムアウト・DataLoss・想定外 ACK）は元のエラーをそのまま返す。client が poison
@@ -208,8 +208,8 @@ where
         self.reconnects
     }
 
-    /// 最後に FLUSH ACK を確認した `flush` 以降に送った `Write` の件数（永続化未確認の上限値。
-    /// 通常 ACK では減らさない。IO-1・IO-2）。
+    /// 最後に FLUSH ACK（明示 `flush` または暗黙 flush）を確認して以降に送った `Write` の件数
+    /// （永続化未確認の上限値。通常 ACK では減らさない。送信に失敗した曖昧な `Write` も含む。IO-1・IO-2）。
     pub fn unflushed_writes(&self) -> u64 {
         self.unflushed_writes
     }
@@ -321,18 +321,31 @@ where
     /// `Write` を 1 件送る。接続断は再接続のうえ `ConnectionLost` で返し、再送はしない。
     pub fn write(&mut self, body: &[u8]) -> Result<WriteReport, VirtiofsIoError> {
         self.ensure_connected(VirtiofsIoOp::Write)?;
-        let result = match self.client.as_mut() {
-            Some(c) => c.write(body),
+        let (result, flushes_before, flushes_after) = match self.client.as_mut() {
+            Some(c) => {
+                let before = c.confirmed_flushes();
+                let r = c.write(body);
+                (r, before, c.confirmed_flushes())
+            }
             None => return Err(Self::not_connected(VirtiofsIoOp::Write)),
         };
+        // 暗黙 flush が FLUSH ACK を確認できていれば、それ以前の Write は永続化済み（IO-2）なので
+        // 件数を 0 に戻す。後続の送信が失敗した場合でも、確認済みの事実は失わない。
+        if flushes_after > flushes_before {
+            self.unflushed_writes = 0;
+        }
         match result {
             Ok(report) => {
-                // 通常 ACK は永続化を保証しない（IO-2）ため、暗黙 flush が走っても件数は減らさない。
-                // 0 に戻すのは FLUSH ACK を確認できた `flush` 成功時のみ（件数は永続化未確認の上限値）。
+                // 通常 ACK は永続化を保証しない（IO-2）ため減らさない。
                 self.unflushed_writes = self.unflushed_writes.saturating_add(1);
                 Ok(report)
             }
-            Err(e) => Err(self.classify(VirtiofsIoOp::Write, e)),
+            Err(e) => {
+                // 送信失敗は相手がフレームを受理したか不明（曖昧）。再発行判断から漏れないよう
+                // 失敗した Write も未確定として数える（暗黙 flush 段階の失敗では過大計上になるが安全側）。
+                self.unflushed_writes = self.unflushed_writes.saturating_add(1);
+                Err(self.classify(VirtiofsIoOp::Write, e))
+            }
         }
     }
 

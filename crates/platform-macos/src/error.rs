@@ -146,6 +146,71 @@ impl fmt::Display for VmError {
 
 impl std::error::Error for VmError {}
 
+/// ゲスト内 virtiofs mount の検証失敗（MAC-1・TASK-65.3。message は英語）。
+///
+/// `vm::Vm::launch` が、ゲストの報告（`guest_mount` の報告行）を期限付きで待った結果として返す。
+/// tag は `VirtiofsTag` で検証済みの文字種のため、message へそのまま埋め込む。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GuestMountError {
+    /// ゲストが mount の失敗を報告した（`errno` はゲストの値で 1..=4095）。
+    Failed { tag: String, errno: u16 },
+    /// 期限内に全共有の報告が揃わなかった（`pending` は未報告の tag）。
+    Timeout {
+        after: Duration,
+        pending: Vec<String>,
+    },
+    /// 不正な報告（未知の tag・矛盾する重複・書式不正）。
+    InvalidReport { reason: String },
+    /// 報告を待つ間に VM が停止した。
+    VmStopped { state: VmState },
+    /// コンソールの書き出しスレッドが終了し、報告を受け取れなくなった。
+    ReportChannelClosed,
+}
+
+impl GuestMountError {
+    /// 機械可読なエラーコード。
+    pub fn code(&self) -> &'static str {
+        match self {
+            GuestMountError::Failed { .. } => "guest_mount.failed",
+            GuestMountError::Timeout { .. } => "guest_mount.timeout",
+            GuestMountError::InvalidReport { .. } => "guest_mount.invalid_report",
+            GuestMountError::VmStopped { .. } => "guest_mount.vm_stopped",
+            GuestMountError::ReportChannelClosed => "guest_mount.report_channel_closed",
+        }
+    }
+
+    /// 人間可読なメッセージ（英語）。
+    pub fn message(&self) -> String {
+        match self {
+            GuestMountError::Failed { tag, errno } => {
+                format!("guest failed to mount virtiofs share '{tag}' (errno {errno})")
+            }
+            GuestMountError::Timeout { after, pending } => format!(
+                "guest did not report mount results within {after:?} (pending: {})",
+                pending.join(", ")
+            ),
+            GuestMountError::InvalidReport { reason } => {
+                format!("invalid guest mount report: {reason}")
+            }
+            GuestMountError::VmStopped { state } => {
+                format!("virtual machine stopped (state {state:?}) before guest mounts completed")
+            }
+            GuestMountError::ReportChannelClosed => {
+                "console reader ended before guest mounts completed".to_string()
+            }
+        }
+    }
+}
+
+impl fmt::Display for GuestMountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code(), self.message())
+    }
+}
+
+impl std::error::Error for GuestMountError {}
+
 /// crate 横断の構造化エラー（ERR-1）。設定の検証失敗とライフサイクルの失敗を 1 つの型で返す。
 ///
 /// 呼び出し元: `vm::Vm::launch`（macOS）と、将来の `fandhe-container-plugin-macos`（TASK-115）。
@@ -157,6 +222,8 @@ pub enum PlatformError {
     Config(ConfigError),
     /// VM ライフサイクルの失敗（`vm.*`）。
     Vm(VmError),
+    /// ゲスト内 virtiofs mount の検証失敗（`guest_mount.*`。TASK-65.3）。
+    GuestMount(GuestMountError),
     /// virtiofs の I/O 共有プロトコルクライアントの失敗（`virtiofs_io.*`。TASK-65.2）。
     VirtiofsIo(VirtiofsIoError),
 }
@@ -167,6 +234,7 @@ impl PlatformError {
         match self {
             PlatformError::Config(e) => e.code(),
             PlatformError::Vm(e) => e.code(),
+            PlatformError::GuestMount(e) => e.code(),
             PlatformError::VirtiofsIo(e) => e.code(),
         }
     }
@@ -176,6 +244,7 @@ impl PlatformError {
         match self {
             PlatformError::Config(e) => e.message(),
             PlatformError::Vm(e) => e.message(),
+            PlatformError::GuestMount(e) => e.message(),
             PlatformError::VirtiofsIo(e) => e.message(),
         }
     }
@@ -192,6 +261,7 @@ impl std::error::Error for PlatformError {
         match self {
             PlatformError::Config(e) => Some(e),
             PlatformError::Vm(e) => Some(e),
+            PlatformError::GuestMount(e) => Some(e),
             PlatformError::VirtiofsIo(e) => Some(e),
         }
     }
@@ -206,6 +276,12 @@ impl From<ConfigError> for PlatformError {
 impl From<VmError> for PlatformError {
     fn from(e: VmError) -> Self {
         PlatformError::Vm(e)
+    }
+}
+
+impl From<GuestMountError> for PlatformError {
+    fn from(e: GuestMountError) -> Self {
+        PlatformError::GuestMount(e)
     }
 }
 
@@ -260,5 +336,55 @@ mod tests {
             e.message(),
             "start timeout 0ns is outside the allowed range 100ms..=600s"
         );
+    }
+
+    /// MAC-1・ERR-1・TASK-65.3: guest_mount.* の code / message / Display は具体値で固定する。
+    #[test]
+    fn guest_mount_errors_are_concrete() {
+        let cases = [
+            (
+                GuestMountError::Failed {
+                    tag: "data".into(),
+                    errno: 19,
+                },
+                "guest_mount.failed",
+                "guest failed to mount virtiofs share 'data' (errno 19)",
+            ),
+            (
+                GuestMountError::Timeout {
+                    after: Duration::from_secs(60),
+                    pending: vec!["a".into(), "b".into()],
+                },
+                "guest_mount.timeout",
+                "guest did not report mount results within 60s (pending: a, b)",
+            ),
+            (
+                GuestMountError::InvalidReport {
+                    reason: "unknown tag".into(),
+                },
+                "guest_mount.invalid_report",
+                "invalid guest mount report: unknown tag",
+            ),
+            (
+                GuestMountError::VmStopped {
+                    state: VmState::Stopped,
+                },
+                "guest_mount.vm_stopped",
+                "virtual machine stopped (state Stopped) before guest mounts completed",
+            ),
+            (
+                GuestMountError::ReportChannelClosed,
+                "guest_mount.report_channel_closed",
+                "console reader ended before guest mounts completed",
+            ),
+        ];
+        for (e, code, msg) in cases {
+            assert_eq!(e.code(), code);
+            assert_eq!(e.message(), msg);
+            assert_eq!(e.to_string(), format!("{code}: {msg}"));
+            let p = PlatformError::from(e);
+            assert_eq!(p.code(), code);
+            assert_eq!(p.message(), msg);
+        }
     }
 }

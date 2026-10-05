@@ -1115,7 +1115,9 @@ mod tests {
             .status();
     }
 
+    #[cfg(unix)]
     const GRANDCHILD_SCRIPT_EXIT: &str = "/bin/sleep 30 >/dev/null 2>&1 & echo $!; exit 0";
+    #[cfg(unix)]
     const GRANDCHILD_SCRIPT_WAIT: &str = "/bin/sleep 30 >/dev/null 2>&1 & echo $!; wait";
 
     /// #1311・PLUG-7: 子が生存中の `kill_and_reap` はグループ内の孫も止める。

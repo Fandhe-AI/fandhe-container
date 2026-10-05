@@ -18,25 +18,103 @@
 //! # 未実装（REPAIR-3）
 //! [`JsonLinesPeerAuthObserver`] は一時的なメモリバッファで、永続的な SEC-4 監査ログではない。
 //! core 側 proxy（TASK-114）が `crates/core` の監査ログへ配線する責務で、本 crate では未実装。
-//! 観測フックを渡さない `UdsListener::accept` / `UdsStream::connect` は stderr へ JSON Lines を 1 行出す
-//! （`call_once` の既定出力と同じ流儀。書き込み失敗は無視する）。
+//! 観測フックを渡さない `UdsListener::accept` / `UdsStream::connect` は、専用の書き込みスレッドへ
+//! 有界キューで渡して stderr へ JSON Lines を出す（下記「既定出力の契約」）。
 //!
-//! # 既知の制約（既定 observer の stderr 書き込み）
-//! 既定の `StderrPeerAuthObserver` は `stderr` へ同期書き込みするため、stderr がパイプで読み手が
-//! 停滞すると accept ループ内でブロックし得る（上記「ブロックする I/O をしない」契約の例外）。
-//! 通常 stderr はブロックせず、同一 UID からの大量接続は脅威モデル外のため既定では許容する。
-//! 運用で問題になる場合は、呼び出し側がメモリバッファの [`JsonLinesPeerAuthObserver`] を渡す。
-//! 既定出力の非ブロック化・バッファ化は将来課題（REPAIR-5）。
+//! # 既定出力の契約（REPAIR-5・SEC-4）
+//! 既定の `StderrPeerAuthObserver` は呼び出し側スレッドで stderr に書かず、有界キュー（
+//! [`DEFAULT_AUDIT_QUEUE_CAPACITY`] 件）へ `try_send` するだけなので、stderr の読み手が停滞しても
+//! accept / connect は待たされない（ブロックしない）。
+//! - キューが満杯・書き込みスレッドを起動できない場合は、捨てずに件数を数え、次に書き込みに成功した
+//!   時点で集約行（`peer_auth_rejections_coalesced`）として出す。
+//! - stderr への書き込みが失敗した場合（閉じている・書けない）は失われた件数を
+//!   [`default_audit_write_failures`] へ数え、黙って消えない（呼び出し側が監視できる）。
+//! - 書き込みスレッドの出力は非同期のため、直後にプロセスが終了すると未出力の行は失われ得る。
+//!   確実に回収したい運用では、呼び出し側が [`JsonLinesPeerAuthObserver`] 等を渡す。
 
 use crate::error::PluginErrorCode;
 use serde::Serialize;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, OnceLock};
 
 /// 監査枠の最大行数（`crates/io` の監査枠と同値）。
 pub const PEER_AUTH_AUDIT_LOG_CAPACITY: usize = 256;
 /// 監査枠の最大バイト数（`crates/io` の監査枠と同値）。
 pub const MAX_PEER_AUTH_AUDIT_LOG_BUFFER_BYTES: usize = 128 * 1024;
+
+/// 既定出力の書き込みキューの最大件数。
+pub const DEFAULT_AUDIT_QUEUE_CAPACITY: usize = 256;
+
+/// 既定出力の有界・非ブロッキング sink（専用スレッドが `Write` へ書く）。
+struct AuditSink {
+    tx: Option<SyncSender<String>>,
+    /// キュー満杯・スレッド不在で未出力の件数（次の書き込み成功時に集約行へ）。
+    pending_dropped: Arc<AtomicU64>,
+    /// 書き込み失敗で失われた件数の累計。
+    write_failures: Arc<AtomicU64>,
+}
+
+impl AuditSink {
+    fn spawn<W: Write + Send + 'static>(mut out: W, capacity: usize) -> Self {
+        let pending_dropped = Arc::new(AtomicU64::new(0));
+        let write_failures = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = sync_channel::<String>(capacity);
+        let (pd, wf) = (Arc::clone(&pending_dropped), Arc::clone(&write_failures));
+        let spawned = std::thread::Builder::new()
+            .name("peer-auth-audit".into())
+            .spawn(move || {
+                for line in rx {
+                    let dropped = pd.swap(0, Ordering::AcqRel);
+                    if dropped > 0 {
+                        let agg = format!(
+                            "{{\"event\":\"plugin_peer_auth\",\"outcome\":\"error\",\"reason\":\"peer_auth_rejections_coalesced\",\"count\":{dropped}}}"
+                        );
+                        if writeln!(out, "{agg}").is_err() {
+                            wf.fetch_add(dropped, Ordering::AcqRel);
+                        }
+                    }
+                    if writeln!(out, "{line}")
+                        .and_then(|()| out.flush())
+                        .is_err()
+                    {
+                        wf.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+            });
+        Self {
+            tx: spawned.ok().map(|_| tx),
+            pending_dropped,
+            write_failures,
+        }
+    }
+
+    /// ブロックせずキューへ積む。積めなければ件数に合算する（捨てたことを黙らせない）。
+    fn submit(&self, line: String) {
+        let sent = match &self.tx {
+            Some(tx) => !matches!(
+                tx.try_send(line),
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
+            ),
+            None => false,
+        };
+        if !sent {
+            self.pending_dropped.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn default_sink() -> &'static AuditSink {
+    static SINK: OnceLock<AuditSink> = OnceLock::new();
+    SINK.get_or_init(|| AuditSink::spawn(std::io::stderr(), DEFAULT_AUDIT_QUEUE_CAPACITY))
+}
+
+/// 既定出力で stderr への書き込みに失敗し、失われた拒否イベントの累計件数（SEC-4）。
+pub fn default_audit_write_failures() -> u64 {
+    default_sink().write_failures.load(Ordering::Acquire)
+}
 
 /// 拒否が起きた側（accept = core の listener、connect = plugin の client）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,13 +251,13 @@ impl PeerAuthObserver for NoopPeerAuthObserver {
 }
 
 /// 観測フックを渡さない公開入口（`accept` / `connect`）の既定: stderr へ JSON Lines を 1 行出す。
-/// 書き込み失敗は無視する（接続可否に影響させない）。
+/// 呼び出し側ではブロックしない（有界キュー経由）。契約はモジュール doc を参照。
 #[derive(Debug, Default)]
 pub(crate) struct StderrPeerAuthObserver;
 
 impl PeerAuthObserver for StderrPeerAuthObserver {
     fn on_rejection(&mut self, event: &PeerAuthRejection<'_>) {
-        let _ = writeln!(std::io::stderr(), "{}", event.to_json_line());
+        default_sink().submit(event.to_json_line());
     }
 }
 
@@ -338,6 +416,55 @@ mod tests {
         let line = ev(PeerAuthRejectReason::UidMismatch, Some(1), &p).to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["socket_path_lossy"], true);
+    }
+
+    struct Blocked(std::sync::mpsc::Receiver<()>);
+    impl Write for Blocked {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// REPAIR-5: 出力先が停滞しても submit は待たず、あふれた分は件数に合算される。
+    #[test]
+    fn repair5_stalled_writer_does_not_block_submit() {
+        let (_gate, rx) = std::sync::mpsc::channel::<()>();
+        let sink = AuditSink::spawn(Blocked(rx), 2);
+        let start = std::time::Instant::now();
+        for i in 0..50 {
+            sink.submit(format!("line{i}"));
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        // 書き込みスレッドが 1 件を保持し、キュー 2 件を除いた残りが集約対象になる。
+        assert!(sink.pending_dropped.load(Ordering::Acquire) >= 40);
+    }
+
+    struct Failing;
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("closed"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// SEC-4: 書き込み失敗は黙って消えず失敗件数に計上される。
+    #[test]
+    fn sec4_write_failure_is_counted() {
+        let sink = AuditSink::spawn(Failing, 8);
+        sink.submit("a".into());
+        sink.submit("b".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sink.write_failures.load(Ordering::Acquire) < 2 {
+            assert!(std::time::Instant::now() < deadline, "failures not counted");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(sink.write_failures.load(Ordering::Acquire), 2);
     }
 
     /// SEC-4: 容量超過は捨てず集約行 1 行（count = 超過件数）になる。

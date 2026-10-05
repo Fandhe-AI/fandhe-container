@@ -27,9 +27,13 @@
 //! accept / connect は待たされない（ブロックしない）。
 //! - キューが満杯の場合は、捨てずに件数を数え、書き込みスレッドが定期的（次の行の到着を待たない）に
 //!   集約行（`peer_auth_rejections_coalesced`）として出す。出力待ちの件数は
-//!   [`default_audit_pending_dropped`] で観測できる。
-//! - 書き込みスレッドを起動できなかった場合・停止した場合（受信側 Disconnected）は出力経路が無い
-//!   ため、拒否件数・未出力の集約件数・キュー残存分を直接 [`default_audit_write_failures`] へ計上する。
+//!   [`default_audit_pending_dropped`] で観測できる。この件数は集約行の書き込み中も残し、書き込みの
+//!   完了（または失敗の計上）後に初めて減らす（書き込み途中を「出力済み」と数えない）。
+//! - 書き込みスレッドを起動できなかった場合・停止した場合（受信側 Disconnected・スレッドの異常終了）は
+//!   出力経路が無いため、拒否件数・未出力の集約件数・キュー残存分を直接
+//!   [`default_audit_write_failures`] へ計上する。
+//! - 件数の移し替えは「移し先へ足してから移し元を減らす」順に行う（移し替え中の区間は回収中として数える）。
+//!   [`flush_default_audit`] が true を返すのは、すべての拒否が出力済みか失敗計上済みになった後に限る。
 //! - stderr への書き込みが失敗した場合（閉じている・書けない）は失われた件数を
 //!   [`default_audit_write_failures`] へ数え、黙って消えない（呼び出し側が監視できる）。
 //! - 拒否の通知ごとに、出力完了を最大 50ms（有界）待ってから戻る。通常は即時に完了するため、
@@ -60,8 +64,13 @@ const DEFAULT_AUDIT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::fr
 const AGGREGATE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// 未出力の集約件数があれば集約行として書く。書けなければ件数を失敗累計へ移す（SEC-4）。
+///
+/// 書き込みスレッドだけが呼ぶ。`pending` は書き込みの完了（または失敗の計上）後に、書いた件数だけ
+/// 減らす。先に 0 へ戻すと、集約行がまだ出力されていない間に `AuditSink::flush` が「未出力 0 件」と
+/// 判定してしまう（終了直前の flush 後にプロセスが終了すると拒否記録が失われる）。書き込み中に
+/// `submit` が足した件数は減算後も残り、次回の集約行になる。
 fn emit_aggregate<W: Write>(out: &mut W, pending: &AtomicU64, failures: &AtomicU64) {
-    let dropped = pending.swap(0, Ordering::AcqRel);
+    let dropped = pending.load(Ordering::Acquire);
     if dropped == 0 {
         return;
     }
@@ -71,6 +80,7 @@ fn emit_aggregate<W: Write>(out: &mut W, pending: &AtomicU64, failures: &AtomicU
     if writeln!(out, "{agg}").and_then(|()| out.flush()).is_err() {
         failures.fetch_add(dropped, Ordering::AcqRel);
     }
+    saturating_sub(pending, dropped);
 }
 
 /// 既定出力の有界・非ブロッキング sink（専用スレッドが `Write` へ書く）。
@@ -83,11 +93,54 @@ struct AuditSink {
     /// キューに積まれ、書き込みスレッドが出力を終えていない件数（スレッド停止時に失敗として回収し、
     /// `flush` が出力完了の判定に使う）。
     queued: Arc<AtomicU64>,
+    /// `queued`・`pending_dropped` を失敗累計へ移し替えている最中の回収処理の数。移し元を 0 へ戻して
+    /// から失敗累計へ足すまでの区間を `flush` が「完了」と誤認しないために数える。
+    reclaiming: Arc<AtomicU64>,
 }
 
-/// 0 未満にならないよう 1 減らす（Disconnected 回収で 0 へ戻された後の減算に備える）。
-fn saturating_dec(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1));
+/// 0 未満にならないよう `n` 減らす（停止時の回収で 0 へ戻された後の減算に備える）。
+fn saturating_sub(counter: &AtomicU64, n: u64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+        Some(v.saturating_sub(n))
+    });
+}
+
+/// 出力する主体が居なくなった件数（キュー残存分・未出力の集約件数）を失敗累計へ移す（SEC-4）。
+///
+/// 書き込みスレッドの停止後に `submit`（受信側 Disconnected）とスレッド終了時の後始末から呼ばれる。
+/// 各カウンタは `swap(0)` で取り出すため、並行して呼ばれても同じ件数を二重には計上しない。
+fn reclaim_lost(
+    queued: &AtomicU64,
+    pending: &AtomicU64,
+    failures: &AtomicU64,
+    reclaiming: &AtomicU64,
+) {
+    reclaiming.fetch_add(1, Ordering::AcqRel);
+    let lost = queued
+        .swap(0, Ordering::AcqRel)
+        .saturating_add(pending.swap(0, Ordering::AcqRel));
+    failures.fetch_add(lost, Ordering::AcqRel);
+    saturating_sub(reclaiming, 1);
+}
+
+/// 書き込みスレッドの終了時（出力先の `Write` の panic による異常終了を含む）に、出力されずに残った
+/// 件数を失敗累計へ移す後始末。後続の `submit` が無くても件数が失われない（SEC-4）。
+struct ReclaimOnExit {
+    queued: Arc<AtomicU64>,
+    pending: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    reclaiming: Arc<AtomicU64>,
+}
+
+impl Drop for ReclaimOnExit {
+    fn drop(&mut self) {
+        reclaim_lost(
+            &self.queued,
+            &self.pending,
+            &self.failures,
+            &self.reclaiming,
+        );
+    }
 }
 
 impl AuditSink {
@@ -96,14 +149,26 @@ impl AuditSink {
         let write_failures = Arc::new(AtomicU64::new(0));
         let (tx, rx) = sync_channel::<String>(capacity);
         let queued = Arc::new(AtomicU64::new(0));
+        let reclaiming = Arc::new(AtomicU64::new(0));
         let (pd, wf, qd) = (
             Arc::clone(&pending_dropped),
             Arc::clone(&write_failures),
             Arc::clone(&queued),
         );
+        let on_exit = ReclaimOnExit {
+            queued: Arc::clone(&queued),
+            pending: Arc::clone(&pending_dropped),
+            failures: Arc::clone(&write_failures),
+            reclaiming: Arc::clone(&reclaiming),
+        };
         let spawned = std::thread::Builder::new()
             .name("peer-auth-audit".into())
             .spawn(move || {
+                // 宣言の逆順に drop されるため、受信側（`rx`）を閉じた後に後始末が走る。閉じる前に
+                // 積めた行は `queued` に数えられており、閉じた後の `submit` は Disconnected として
+                // 自分で回収するので、どちらの順でも件数は失敗累計へ移る。
+                let _on_exit = on_exit;
+                let rx = rx;
                 loop {
                     match rx.recv_timeout(AGGREGATE_FLUSH_INTERVAL) {
                         Ok(line) => {
@@ -112,7 +177,7 @@ impl AuditSink {
                                 wf.fetch_add(1, Ordering::AcqRel);
                             }
                             // 書き込み完了後に減らす（`flush` が「未出力 0 件」を判定できるように）。
-                            saturating_dec(&qd);
+                            saturating_sub(&qd, 1);
                         }
                         // 次の行を待たずに未出力の集約件数を回収する（SEC-4。送信側が
                         // あふれ後に拒否を受けなくても件数が出力される）。
@@ -129,18 +194,30 @@ impl AuditSink {
             pending_dropped,
             write_failures,
             queued,
+            reclaiming,
         }
+    }
+
+    /// 出力も失敗計上も済んでいない件数が無ければ true。
+    ///
+    /// 読む順序は件数の移し替えの順序と対にしている（順序を変えると移し替え中の件数を見落とす）:
+    /// - `submit` の満杯時は `pending_dropped` へ足してから `queued` を減らすので、`queued` を先に読む。
+    /// - 回収（`reclaim_lost`）は `reclaiming` を足してから `queued`・`pending_dropped` を 0 へ戻すので、
+    ///   `reclaiming` を最後に読む。
+    fn is_settled(&self) -> bool {
+        self.queued.load(Ordering::Acquire) == 0
+            && self.pending_dropped.load(Ordering::Acquire) == 0
+            && self.reclaiming.load(Ordering::Acquire) == 0
     }
 
     /// 積まれた行と集約件数が出力されるまで、最大 `timeout` だけ待つ（SEC-4・REPAIR-5）。
     /// 出力が済んだ（または出力経路が無く失敗計上済みの）場合は true、期限切れは false。
+    /// 集約行・通常行の書き込み中は未完了として扱う（書き込みの完了か失敗の計上を待つ）。
     fn flush(&self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if self.tx.is_none()
-                || (self.queued.load(Ordering::Acquire) == 0
-                    && self.pending_dropped.load(Ordering::Acquire) == 0)
-            {
+            // スレッド不在のときは `submit` が同期的に失敗累計へ計上済み。
+            if self.tx.is_none() || self.is_settled() {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
@@ -165,14 +242,19 @@ impl AuditSink {
         match tx.try_send(line) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
-                saturating_dec(&self.queued);
+                // 集約側へ足してから減らす（逆順だと、この 1 件がどちらにも数えられていない瞬間に
+                // 並行する `flush` が「未出力 0 件」と判定し得る）。
                 self.pending_dropped.fetch_add(1, Ordering::AcqRel);
+                saturating_sub(&self.queued, 1);
             }
             Err(TrySendError::Disconnected(_)) => {
                 // queued には今回の 1 件も含まれる。
-                let lost = self.queued.swap(0, Ordering::AcqRel)
-                    + self.pending_dropped.swap(0, Ordering::AcqRel);
-                self.write_failures.fetch_add(lost, Ordering::AcqRel);
+                reclaim_lost(
+                    &self.queued,
+                    &self.pending_dropped,
+                    &self.write_failures,
+                    &self.reclaiming,
+                );
             }
         }
     }
@@ -616,6 +698,7 @@ mod tests {
             pending_dropped: Arc::new(AtomicU64::new(0)),
             write_failures: Arc::new(AtomicU64::new(0)),
             queued: Arc::new(AtomicU64::new(0)),
+            reclaiming: Arc::new(AtomicU64::new(0)),
         };
         sink.submit("x".into());
         sink.submit("y".into());
@@ -633,6 +716,7 @@ mod tests {
             pending_dropped: Arc::new(AtomicU64::new(3)),
             write_failures: Arc::new(AtomicU64::new(0)),
             queued: Arc::new(AtomicU64::new(0)),
+            reclaiming: Arc::new(AtomicU64::new(0)),
         };
         sink.submit("a".into());
         sink.submit("b".into());

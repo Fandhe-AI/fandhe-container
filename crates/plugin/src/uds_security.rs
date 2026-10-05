@@ -21,9 +21,13 @@
 //!   `UdsListener::bind` の配置ディレクトリ検証と同じ仕組み）の `fstat` 結果で行う。経路上の要素が
 //!   symlink（`canonicalize` 後の差し替えを含む）なら open が失敗し、パスの再解決で検証対象と
 //!   別の場所を見ることはない（fail-closed）。基底は lstat した実体と fd の dev / ino の一致も確認する。
-//! - 残余: 作成（`mkdir`）だけはパス指定で行う。検証済みの祖先を書き換えられるのは root と自 UID
-//!   のみで、その場合も作成後に fd で開き直して検証するため、未検証の場所を返すことはない。
-//!   返した後の保護は `UdsListener::bind` が bind 時に配置ディレクトリを fd で再検証して担う。
+//! - 作成は検証済みの基底 fd 基準の `mkdirat`（`crate::sys::mkdirat`）で行い、パスを再解決しない
+//!   （#1309）。作成後はルートから symlink 非追従で開き直して検証するため、祖先を差し替えられても
+//!   検証済みの基底の外には作られず、開き直しが失敗する。
+//! - 残余: 作成前の既存確認（lstat）はパス指定で行う。symlink・非ディレクトリを早く拒否し作成要否を
+//!   決めるだけで、この確認が欺かれても `mkdirat` は検証済み fd 基準で最終要素の symlink を辿らないため
+//!   安全性には影響しない。返した後の保護は `UdsListener::bind` が bind 時に配置ディレクトリを fd で
+//!   再検証して担う。
 //! - 作成は非再帰で、基底ディレクトリ（`XDG_RUNTIME_DIR` 自体）は作らない。
 //! - エラーメッセージは固定の英語文字列で、パス・環境変数値を含めない。
 //! - 既存 socket パス（TASK-123.2・#287）: `UdsListener::bind` が bind 前に検証済みディレクトリ fd 基準で
@@ -226,10 +230,13 @@ pub(crate) use imp::{BindLock, acquire_bind_lock, clear_stale_socket};
 mod imp {
     use super::{RUNTIME_DIR_NAME, RuntimeDir, runtime_dir_base, validate_base};
     use crate::error::{PluginError, PluginErrorCode};
-    use std::fs::{DirBuilder, File, Metadata};
+    use std::fs::{File, Metadata};
     use std::io;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
+
+    /// runtime directory 名の C 文字列版（`mkdirat` へ渡す。[`RUNTIME_DIR_NAME`] と一致をテストで照合）。
+    const RUNTIME_DIR_CNAME: &std::ffi::CStr = c"fandhe-container";
 
     /// Linux のフォールバック基底の根（root は直下、非 root は `user/<euid>`）。
     const RUN_ROOT: &str = "/run";
@@ -437,11 +444,11 @@ mod imp {
         dir.metadata().map_err(|e| map_io(&e))
     }
 
-    /// 基底と全祖先を検証し、基底の実パス（canonical）を返す（PLUG-12）。
+    /// 基底と全祖先を検証し、基底の実パス（canonical）と検証済みの基底 fd を返す（PLUG-12）。
     ///
     /// 検証は実パスの各要素を symlink 非追従で開いた fd に対して行う。`canonicalize` 後に経路上の
     /// 要素が symlink へ差し替えられた場合は open が失敗する。
-    fn resolve_base(base: &Path, euid: u32) -> Result<PathBuf, PluginError> {
+    fn resolve_base(base: &Path, euid: u32) -> Result<(PathBuf, File), PluginError> {
         // 末尾 `/` は lstat が最終要素の symlink を辿る原因になるため、components で正規化して除く。
         let normalized: PathBuf = base.components().collect();
         let link_meta = std::fs::symlink_metadata(&normalized).map_err(|e| map_io(&e))?;
@@ -452,7 +459,8 @@ mod imp {
         for ancestor in real.ancestors().skip(1) {
             verify_ancestor(&fstat(&open_nofollow(ancestor)?)?, euid)?;
         }
-        let meta = fstat(&open_nofollow(&real)?)?;
+        let base_fd = open_nofollow(&real)?;
+        let meta = fstat(&base_fd)?;
         // 開いた fd が lstat した実体と同一であること（検査と open の間の差し替え検出）。
         if meta.dev() != link_meta.dev() || meta.ino() != link_meta.ino() {
             return Err(PluginError::new(
@@ -461,7 +469,7 @@ mod imp {
             ));
         }
         verify_base(&meta, euid)?;
-        Ok(real)
+        Ok((real, base_fd))
     }
 
     /// `base/fandhe-container` を解決し、無ければ 0700 で作成して検証する。
@@ -469,7 +477,17 @@ mod imp {
         validate_base(base)?;
         // 基底自体と全祖先を先に検証する。他ユーザーが書ける・symlink の基底や祖先では、
         // 検証済みの子を後から rename・差し替えられ配置パスの安全性が失われるため（PLUG-12）。
-        let real_base = resolve_base(base, euid)?;
+        let (real_base, base_fd) = resolve_base(base, euid)?;
+        create_in_base(&base_fd, &real_base, euid)
+    }
+
+    /// 検証済みの基底 fd 基準で runtime directory を（無ければ）作成し、開き直して検証する。
+    /// `ensure_dir` から呼ばれる。検証と作成の間に基底パスが差し替えられる場合をテストで再現するため分離。
+    fn create_in_base(
+        base_fd: &File,
+        real_base: &Path,
+        euid: u32,
+    ) -> Result<RuntimeDir, PluginError> {
         let dir = real_base.join(RUNTIME_DIR_NAME);
         match std::fs::symlink_metadata(&dir) {
             // 既存の symlink・非ディレクトリは open を試みる前に拒否する（修復・削除はしない）。
@@ -481,10 +499,17 @@ mod imp {
             }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // 非再帰。競合作成（AlreadyExists）は下の fd 検証で判定する。
-                match DirBuilder::new().mode(0o700).create(&dir) {
+                // 非再帰。検証済みの基底 fd 基準で作る（#1309）。競合作成（AlreadyExists）は
+                // 下の fd 検証で判定する。
+                match crate::sys::mkdirat(base_fd, RUNTIME_DIR_CNAME, 0o700) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                        return Err(PluginError::new(
+                            PluginErrorCode::Unimplemented,
+                            "runtime directory is not implemented on this platform",
+                        ));
+                    }
                     Err(e) => return Err(map_io(&e)),
                 }
             }
@@ -933,6 +958,8 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::fs::DirBuilder;
+        use std::os::unix::fs::DirBuilderExt;
         use std::os::unix::fs::PermissionsExt;
 
         fn ident(uid: u32, is_socket: bool, is_symlink: bool) -> crate::sys::FileIdent {
@@ -1163,6 +1190,58 @@ mod imp {
 
         fn open_dir_for_test(p: &Path) -> File {
             File::open(p).unwrap()
+        }
+
+        /// PLUG-12・#1309: runtime directory 名の C 文字列定数が公開名と一致する。
+        #[test]
+        fn plug12_runtime_dir_cname_matches_name() {
+            assert_eq!(RUNTIME_DIR_CNAME.to_bytes(), RUNTIME_DIR_NAME.as_bytes());
+        }
+
+        /// PLUG-12・#1309: mkdirat は 0700 で作成し、既存・同名 symlink は AlreadyExists（リンク先に作らない）。
+        #[test]
+        fn plug12_mkdirat_creates_0700_and_reports_existing() {
+            let t = Tmp::new();
+            let fd = open_dir_for_test(&t.0);
+            crate::sys::mkdirat(&fd, RUNTIME_DIR_CNAME, 0o700).unwrap();
+            let mode = std::fs::metadata(t.0.join(RUNTIME_DIR_NAME))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o7777, 0o700);
+            let e = crate::sys::mkdirat(&fd, RUNTIME_DIR_CNAME, 0o700).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+
+            let target = t.0.join("target");
+            DirBuilder::new().mode(0o700).create(&target).unwrap();
+            std::os::unix::fs::symlink(&target, t.0.join("lnk")).unwrap();
+            let e = crate::sys::mkdirat(&fd, c"lnk", 0o700).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        }
+
+        /// PLUG-12・#1309: 検証後に基底パスが symlink へ差し替えられても、作成は検証済み fd の側で
+        /// 行われ、差し替え先には作られない。開き直しは失敗する。
+        #[test]
+        fn plug12_create_fails_when_base_is_swapped_to_symlink() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let base = t.0.join("base");
+            let decoy = t.0.join("decoy");
+            let moved = t.0.join("moved");
+            DirBuilder::new().mode(0o700).create(&base).unwrap();
+            DirBuilder::new().mode(0o700).create(&decoy).unwrap();
+            let (real, fd) = resolve_base(&base, euid).unwrap();
+            std::fs::rename(&base, &moved).unwrap();
+            std::os::unix::fs::symlink(&decoy, &base).unwrap();
+            let err = create_in_base(&fd, &real, euid).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+            assert!(!decoy.join(RUNTIME_DIR_NAME).exists());
+            let mode = std::fs::metadata(moved.join(RUNTIME_DIR_NAME))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o7777, 0o700);
         }
 
         /// PLUG-12: 所有者不一致は 0700 でも拒否する（別 UID を用意せず分岐を照合する）。

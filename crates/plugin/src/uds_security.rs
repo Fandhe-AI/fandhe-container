@@ -102,7 +102,9 @@
 //!   配置先では成り立たず、生存中の listener の socket を残骸と誤認しうる。そのため掃除は毎回、
 //!   この runtime directory で `flock` が実際に排他になることを確かめてから行う（走査位置ヒントの
 //!   ロックを取り、同じファイルを別の open でロックできないことを確認する）。確認できなければ
-//!   何も削除せず `FailedPrecondition` を返す（fail-closed。初期化時は構造化ログに出す）。確かめ
+//!   何も削除せず `FailedPrecondition` を返す（fail-closed。初期化時は構造化ログに出す）。ヒントの
+//!   ファイルを開けない・作れない環境では確認できないため、掃除は毎回行われない（残骸は残る）。
+//!   確認できなかった経路では、確認のために作った空の `fcsweep-cursor` を残す。確かめ
 //!   られるのは同一ホスト内の排他で、複数ホストが runtime directory を共有しロックがホスト間で
 //!   伝わらない構成は検出できない（UDS はホスト内でしか接続できず、runtime directory は
 //!   `XDG_RUNTIME_DIR` 等のホスト固有の場所に置く前提）。
@@ -272,7 +274,9 @@ impl RuntimeDir {
     ///
     /// 初期化時に best-effort で呼ばれるほか、TASK-114 の core 側 proxy が結果（件数）を得るために
     /// 呼べる。判定規則・上限・残余はモジュール doc の「都度起動の残骸の掃除」参照。ディレクトリを
-    /// 開けない・検証に失敗した場合のみ `Err`。個別エントリの失敗は [`OneShotSweep::skipped`] に数える。
+    /// 開けない・検証に失敗した場合（初期化後に symlink へ差し替えられた場合を含む。`PermissionDenied`）、
+    /// この runtime directory で `flock` の排他を確認できない場合（`FailedPrecondition`。何も削除しない）、
+    /// 列挙を始められない場合（`Internal`）に `Err`。個別エントリの失敗は [`OneShotSweep::skipped`] に数える。
     /// 非 unix は `Unimplemented`（fail-closed）。
     pub fn sweep_one_shot_leftovers(&self) -> Result<OneShotSweep, PluginError> {
         imp::sweep_one_shot_leftovers(self)
@@ -810,12 +814,18 @@ mod imp {
     }
 
     /// 走査位置ヒントの書きかけ（`<offset> <skip>\n` の、改行より手前で切れた先頭側）かを判定する純粋関数。
-    /// 保存は切り詰めてから先頭へ 1 回書くため、途中で止まると形式の先頭側だけが残る。数字と高々 1 個の
-    /// 空白だけから成り、数字で始まるものに限る（無関係な内容は書きかけと認めない）。
+    /// 保存は切り詰めてから先頭へ 1 回書くため、途中で止まると形式の先頭側だけが残る。1 項目め
+    /// （1〜20 桁の数字）と、あれば空白 1 個に続く 2 項目め（0〜20 桁の数字）だけから成るものに限る
+    /// （10 進 u64 は 20 桁以内。桁数を超える・無関係な内容は書きかけと認めない）。
     pub(super) fn is_scan_pos_fragment(text: &[u8]) -> bool {
-        text.first().is_some_and(u8::is_ascii_digit)
-            && text.iter().all(|c| c.is_ascii_digit() || *c == b' ')
-            && text.iter().filter(|c| **c == b' ').count() <= 1
+        let digits = |x: &[u8], min: usize| {
+            (min..=20).contains(&x.len()) && x.iter().all(u8::is_ascii_digit)
+        };
+        let mut parts = text.split(|c| *c == b' ');
+        let (offset, skip) = (parts.next(), parts.next());
+        parts.next().is_none()
+            && offset.is_some_and(|x| digits(x, 1))
+            && skip.is_none_or(|x| digits(x, 0))
     }
 
     /// ヒントの内容から開始位置を決める。完全な形式ならその位置、書きかけなら先頭（専用ファイルとして
@@ -835,21 +845,52 @@ mod imp {
         Unknown,
     }
 
+    /// ロック取得の試行結果（排他の判定に使う分類）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum LockTry {
+        /// `flock` を取れた。
+        Locked,
+        /// `flock` を試み、他者が保持中だった（衝突を検出できた）。
+        Held,
+        /// それ以外（`flock` を試みる前の open の競合・開けない・ロック非対応等）。`flock` の衝突を
+        /// 検出した証拠にならない。
+        Other,
+    }
+
+    impl LockTry {
+        fn of(result: &Result<crate::sys::LockHandle, crate::sys::LockError>) -> Self {
+            match result {
+                Ok(_) => Self::Locked,
+                Err(crate::sys::LockError::Held) => Self::Held,
+                Err(crate::sys::LockError::OpenContended | crate::sys::LockError::Io(_)) => {
+                    Self::Other
+                }
+            }
+        }
+    }
+
     /// `flock` の排他性の判定（純粋関数）。`first` は走査位置ヒントのロック取得、`second` は取得できた
-    /// 場合に同じファイルを別の open file description で開いて試した取得の結果（成功は `Ok`、失敗は
-    /// `ErrorKind`）。`flock` は open file description ごとのロックなので、排他が効くなら 2 回目は必ず
-    /// `WouldBlock` になる。1 回目が `WouldBlock`（他の掃除が保持中）なら、衝突を検出できているので
-    /// 排他が効いている。それ以外（2 回目も取れた・エラー）は排他を確認できない。
-    pub(super) fn judge_flock_probe(
-        first: Result<(), io::ErrorKind>,
-        second: Option<Result<(), io::ErrorKind>>,
-    ) -> FlockProbe {
+    /// 場合に同じファイルを別の open file description で開いて試した取得の結果。`flock` は open file
+    /// description ごとのロックなので、排他が効くなら 2 回目は必ず「保持中」になる。1 回目が「保持中」
+    /// （他の掃除が保持中）なら、衝突を検出できているので排他が効いている。「保持中」と数えるのは
+    /// 実際に `flock` を試みて衝突した場合だけで、`flock` を試みる前の open の競合による打ち切り
+    /// （`LockError::OpenContended`）は含めない。それ以外（2 回目も取れた・エラー）は排他を確認できない。
+    pub(super) fn judge_flock_probe(first: LockTry, second: Option<LockTry>) -> FlockProbe {
         match (first, second) {
-            (Err(io::ErrorKind::WouldBlock), _) => FlockProbe::Exclusive,
-            (Ok(()), Some(Err(io::ErrorKind::WouldBlock))) => FlockProbe::Exclusive,
-            (Ok(()), Some(Ok(()))) => FlockProbe::NotExclusive,
+            (LockTry::Held, _) => FlockProbe::Exclusive,
+            (LockTry::Locked, Some(LockTry::Held)) => FlockProbe::Exclusive,
+            (LockTry::Locked, Some(LockTry::Locked)) => FlockProbe::NotExclusive,
             _ => FlockProbe::Unknown,
         }
+    }
+
+    /// 排他の確認中に、並行する掃除が走査位置ヒントを unlink・作り直した場合のやり直し回数。
+    const FLOCK_PROBE_ATTEMPTS: usize = 4;
+
+    /// 2 つの fd が同じ inode（dev / ino）を指すか。
+    fn same_inode(a: &File, b: &File) -> io::Result<bool> {
+        let (a, b) = (a.metadata()?, b.metadata()?);
+        Ok(a.dev() == b.dev() && a.ino() == b.ino())
     }
 
     /// 掃除の前に、この runtime directory で `flock` が排他になることを実際に確かめる（PLUG-12）。
@@ -860,21 +901,57 @@ mod imp {
     /// ヒントのロックを取り、同じファイルを別の open でロックできないことを確かめる。戻り値の
     /// ハンドルは、取得できた場合の走査位置ヒントのロック（そのまま [`SweepCursor`] に使う）。
     ///
+    /// 2 回目の open は名前を引き直すため、並行する掃除がヒントを unlink・作り直すと別の inode を
+    /// 開きうる。同じファイルで試したと言えるよう、2 回目の前後で名前が 1 回目の inode を指している
+    /// ことを確かめ、2 回目も取れた場合は両方の fd が同じ inode のときだけ「排他が効かない」と判定する。
+    /// 食い違った場合は [`FLOCK_PROBE_ATTEMPTS`] 回までやり直し、それでも確かめられなければ確認不能とする。
+    ///
     /// 確かめられるのは同一ホスト内の排他だけである。複数ホストが同じ runtime directory を共有し、
     /// ロックがホスト間で伝わらない構成は検出できない（UDS はホスト内でしか接続できず、runtime
     /// directory は `XDG_RUNTIME_DIR` 等のホスト固有の場所に置く前提）。
+    ///
+    /// 確認にはヒントのファイルを開く・作る必要がある。開けない・作れない環境（書き込み不可・
+    /// 同名が通常ファイル以外・ロック非対応等）では確認不能になり、掃除は毎回行われない（残骸は残る。
+    /// 初期化時は構造化ログに出る）。確認不能・排他が効かないと判定した経路では、確認のために作った
+    /// 空の `fcsweep-cursor` を削除せず残す（次回も同じファイルで確認する。掃除を行えた回は、
+    /// 末尾まで走査し終えた時点で削除する）。
     fn probe_flock(dir: &File) -> (FlockProbe, Option<crate::sys::LockHandle>) {
+        use crate::sys::{LockError, LockOpen, lock_file_at, names_open_file};
         let Ok(name) = std::ffi::CString::new(SWEEP_CURSOR_NAME) else {
             return (FlockProbe::Unknown, None);
         };
-        let first = crate::sys::lock_file_at(dir, &name, crate::sys::LockOpen::Create);
-        let second = first.as_ref().ok().map(|_| {
-            crate::sys::lock_file_at(dir, &name, crate::sys::LockOpen::Existing)
-                .map(|_| ())
-                .map_err(|e| e.kind())
-        });
-        let probe = judge_flock_probe(first.as_ref().map(|_| ()).map_err(|e| e.kind()), second);
-        (probe, first.ok())
+        for _ in 0..FLOCK_PROBE_ATTEMPTS {
+            let first = lock_file_at(dir, &name, LockOpen::Create);
+            let first_try = LockTry::of(&first);
+            let Ok(held) = first else {
+                return (judge_flock_probe(first_try, None), None);
+            };
+            match names_open_file(dir, &name, &held.file) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => return (FlockProbe::Unknown, None),
+            }
+            let second = lock_file_at(dir, &name, LockOpen::Existing);
+            let second_try = LockTry::of(&second);
+            // 2 回目が同じファイルを試したと言える場合だけ判定に使う。
+            let same_file = match &second {
+                Ok(other) => same_inode(&held.file, &other.file),
+                Err(LockError::Held) => names_open_file(dir, &name, &held.file),
+                // 並行する掃除が unlink した直後（名前が無い）。やり直す。
+                Err(LockError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(_) => return (FlockProbe::Unknown, None),
+            };
+            match same_file {
+                Ok(true) => {
+                    let probe = judge_flock_probe(first_try, Some(second_try));
+                    let handle = (probe == FlockProbe::Exclusive).then_some(held);
+                    return (probe, handle);
+                }
+                Ok(false) => continue,
+                Err(_) => return (FlockProbe::Unknown, None),
+            }
+        }
+        (FlockProbe::Unknown, None)
     }
 
     impl SweepCursor {
@@ -1468,14 +1545,17 @@ mod imp {
         for _ in 0..LOCK_ATTEMPTS {
             let handle = match crate::sys::lock_file_at(dir, &lock_name, open) {
                 Ok(h) => h,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(busy()),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // 他者が保持中、または open の競合が上限まで続いた。どちらも使用中として扱う。
+                Err(crate::sys::LockError::Held | crate::sys::LockError::OpenContended) => {
+                    return Err(busy());
+                }
+                Err(crate::sys::LockError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
                     return Err(err(
                         PluginErrorCode::NotFound,
                         "socket lock file does not exist",
                     ));
                 }
-                Err(e)
+                Err(crate::sys::LockError::Io(e))
                     if e.kind() == io::ErrorKind::PermissionDenied
                         || e.raw_os_error().is_some_and(is_symlink_errno) =>
                 {
@@ -1701,6 +1781,8 @@ mod imp {
                 b"12 3 4",
                 b"not a hint",
                 b"-1 0",
+                b"123456789012345678901",
+                b"1 123456789012345678901",
             ] {
                 assert!(!is_scan_pos_fragment(other), "{other:?}");
                 assert_eq!(cursor_start(other), None, "{other:?}");
@@ -2183,7 +2265,7 @@ mod imp {
             let started = std::time::Instant::now();
             let e =
                 crate::sys::lock_file_at(&dir, c"hint", crate::sys::LockOpen::Create).unwrap_err();
-            assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+            assert!(matches!(e, crate::sys::LockError::Held), "{e:?}");
             assert!(started.elapsed() < std::time::Duration::from_millis(100));
             assert_eq!(held.lock().unwrap().len(), 2);
         }
@@ -2271,28 +2353,16 @@ mod imp {
         /// では排他と判定され、他者が走査位置ヒントを保持中でも（衝突を検出できるので）排他と判定する。
         #[test]
         fn plug12_sweep_requires_verified_exclusive_flock() {
-            use io::ErrorKind::{NotFound, Unsupported, WouldBlock};
+            use LockTry::{Held, Locked, Other};
+            assert_eq!(judge_flock_probe(Locked, Some(Held)), FlockProbe::Exclusive);
+            assert_eq!(judge_flock_probe(Held, None), FlockProbe::Exclusive);
             assert_eq!(
-                judge_flock_probe(Ok(()), Some(Err(WouldBlock))),
-                FlockProbe::Exclusive
-            );
-            assert_eq!(
-                judge_flock_probe(Err(WouldBlock), None),
-                FlockProbe::Exclusive
-            );
-            assert_eq!(
-                judge_flock_probe(Ok(()), Some(Ok(()))),
+                judge_flock_probe(Locked, Some(Locked)),
                 FlockProbe::NotExclusive
             );
-            assert_eq!(
-                judge_flock_probe(Ok(()), Some(Err(NotFound))),
-                FlockProbe::Unknown
-            );
-            assert_eq!(judge_flock_probe(Ok(()), None), FlockProbe::Unknown);
-            assert_eq!(
-                judge_flock_probe(Err(Unsupported), None),
-                FlockProbe::Unknown
-            );
+            assert_eq!(judge_flock_probe(Locked, Some(Other)), FlockProbe::Unknown);
+            assert_eq!(judge_flock_probe(Locked, None), FlockProbe::Unknown);
+            assert_eq!(judge_flock_probe(Other, None), FlockProbe::Unknown);
             let t = Tmp::new();
             let dir = File::open(&t.0).unwrap();
             let (probe, handle) = probe_flock(&dir);
@@ -2307,6 +2377,62 @@ mod imp {
             let r = sweep_one_shot_limited(&t.0, crate::sys::effective_uid(), 1024, 256).unwrap();
             assert_eq!((r.examined, r.truncated, r.incomplete), (1, false, false));
             assert!(!lock.exists());
+        }
+
+        /// PLUG-12・REPAIR-5（#1310）: `flock` を試みる前の open の競合が上限（8 回）まで続いた打ち切りは、
+        /// 「保持中」とは別の失敗（`OpenContended`）で返る。`flock` の衝突を検出した証拠にならないので
+        /// 排他の確認は確認不能になり、掃除は `FailedPrecondition` で何も削除しない。bind にとっては
+        /// 従来どおり使用中（`AlreadyExists`）。
+        #[test]
+        fn plug12_open_contention_is_not_evidence_of_exclusive_flock() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = File::open(&t.0).unwrap();
+            crate::sys::lock_test_hook::contend_opens(8);
+            let e =
+                crate::sys::lock_file_at(&dir, c"hint", crate::sys::LockOpen::Create).unwrap_err();
+            assert!(matches!(e, crate::sys::LockError::OpenContended), "{e:?}");
+            assert_eq!(std::fs::read_dir(&t.0).unwrap().count(), 0);
+
+            crate::sys::lock_test_hook::contend_opens(8);
+            assert_eq!(
+                acquire_bind_lock(&dir, c"oneshot-1-0.sock", euid)
+                    .unwrap_err()
+                    .code(),
+                PluginErrorCode::AlreadyExists
+            );
+
+            let lock = t.0.join("oneshot-2-0.sock.lock");
+            std::fs::write(&lock, b"").unwrap();
+            crate::sys::lock_test_hook::contend_opens(8);
+            let (probe, handle) = probe_flock(&dir);
+            assert_eq!((probe, handle.is_some()), (FlockProbe::Unknown, false));
+            crate::sys::lock_test_hook::contend_opens(8);
+            let e = sweep_dir(&dir, euid, 1024, 256, 65_536).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::FailedPrecondition);
+            assert!(lock.exists());
+            // 競合が無ければ、同じディレクトリで排他を確認でき、残骸を消す。
+            let (r, _) = sweep_dir(&dir, euid, 1024, 256, 65_536).unwrap();
+            assert_eq!((r.examined, r.truncated), (1, false));
+            assert!(!lock.exists());
+        }
+
+        /// PLUG-12（#1310）: 排他の確認は、並行する掃除が走査位置ヒントを unlink・作り直しても誤判定しない。
+        /// 1 回目の取得（作成）の直後に名前が別の inode へ差し替わった場合は、その回を判定に使わず
+        /// やり直し、排他と判定する（得たロックは、いま名前が指しているファイルのもの）。
+        #[test]
+        fn plug12_flock_probe_retries_when_hint_is_replaced() {
+            let t = Tmp::new();
+            let dir = File::open(&t.0).unwrap();
+            let path = t.0.join(std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap());
+            crate::sys::lock_test_hook::set(move |_, _| {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::write(&path, b"").unwrap();
+            });
+            let (probe, handle) = probe_flock(&dir);
+            assert_eq!((probe, handle.is_some()), (FlockProbe::Exclusive, true));
+            let held = handle.unwrap();
+            assert!(crate::sys::names_open_file(&dir, c"fcsweep-cursor", &held.file).unwrap());
         }
 
         /// PLUG-7・PLUG-12（#1310）: 掃除はロックファイルを作成しない。列挙後に消えた名前を処理しても
@@ -2326,7 +2452,10 @@ mod imp {
                 crate::sys::LockOpen::Existing,
             )
             .unwrap_err();
-            assert_eq!(e.kind(), io::ErrorKind::NotFound);
+            assert!(
+                matches!(&e, crate::sys::LockError::Io(e) if e.kind() == io::ErrorKind::NotFound),
+                "{e:?}"
+            );
             assert_eq!(std::fs::read_dir(&t.0).unwrap().count(), 0);
         }
 

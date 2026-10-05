@@ -647,6 +647,26 @@ pub(crate) enum LockOpen {
     Existing,
 }
 
+/// [`lock_file_at`] の失敗（PLUG-12・#1310）。「`flock` を試みて他者が保持中だった」と「`flock` を
+/// 試みる前に open の競合が続いた」を型で区別する。前者だけが「この配置先で `flock` の衝突を検出
+/// できた」証拠になる（`uds_security` の排他の確認が使う）。bind にとってはどちらも「使用中」。
+#[derive(Debug)]
+pub(crate) enum LockError {
+    /// `flock` を試み、他者が保持中だった（`try_lock` が `WouldBlock`）。
+    Held,
+    /// 作成（`O_EXCL`）が `EEXIST`、既存を開くと `ENOENT` という競合が上限まで続いた。`flock` は
+    /// 一度も試していない。待ち続けないための打ち切りで、使用中として扱う（REPAIR-5）。
+    OpenContended,
+    /// それ以外の失敗（開けない・通常ファイルでない・ロック非対応・未対応 OS 等）。
+    Io(io::Error),
+}
+
+impl From<io::Error> for LockError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
 /// 自分が作成した直後のロックファイルを他者が先にロックしていた場合に、解放を待つ回数と間隔
 /// （[`lock_file_at`] の呼び出し 1 回につき合計 100 ms。REPAIR-5 の有限な待ち）。相手になるのは作成と
 /// `flock` の間に割り込んだ掃除で、保持は 1 候補の判定の間だけなので通常は 1 回目の待ちで解放される。
@@ -668,6 +688,21 @@ pub(crate) mod lock_test_hook {
 
     thread_local! {
         static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static CONTENDED_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// 呼び出しスレッドの以降 `n` 回の「作成 → 既存を開く」の試行を、競合（作成は `EEXIST`、既存を
+    /// 開くと `ENOENT`）で失敗したものとして扱わせる（実際には開かない）。
+    pub(crate) fn contend_opens(n: usize) {
+        CONTENDED_OPENS.with(|c| c.set(n));
+    }
+
+    pub(super) fn take_contended_open() -> bool {
+        CONTENDED_OPENS.with(|c| {
+            let left = c.get();
+            c.set(left.saturating_sub(1));
+            left > 0
+        })
     }
 
     /// 呼び出しスレッドの次の新規作成 1 回だけに `hook` を差し込む。
@@ -686,7 +721,8 @@ pub(crate) mod lock_test_hook {
 /// `dir` 基準で `name` のロックファイルを `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`・0600 で開き
 /// （`mode` に応じて無ければ作成）、非ブロッキングで排他ロックを取る。`O_NONBLOCK` は、既存の名前が FIFO・デバイス
 /// 等だった場合に open が相手を待って止まらないようにするため（通常ファイルの読み書きには影響しない。
-/// REPAIR-5）。開いた fd が通常ファイルでなければロックせず `PermissionDenied`。他者が保持中なら `WouldBlock`。listener の生存判定に接続 probe を
+/// REPAIR-5）。開いた fd が通常ファイルでなければロックせず `PermissionDenied`。他者が保持中なら
+/// [`LockError::Held`]、ロックを試みる前の open の競合が続いた場合は [`LockError::OpenContended`]。listener の生存判定に接続 probe を
 /// 使わず、「ロックを取れる＝以前の保持者は消えた」で stale を判定するための基盤（既存 listener の
 /// accept queue に副作用を与えない。PLUG-12）。未対応の OS・アーキテクチャは `Unsupported`。
 ///
@@ -704,7 +740,11 @@ pub(crate) mod lock_test_hook {
 /// unlink するので、待って取れたロックは名前から外れた inode のものでありうる。その確認と作り直しは
 /// 呼び出し側（`acquire_bind_lock` の `names_open_file`）が行う。既存ファイルを開いた場合は待たない
 /// （保持者は生存中の listener でありうる）。
-pub(crate) fn lock_file_at(dir: &File, name: &CStr, mode: LockOpen) -> io::Result<LockHandle> {
+pub(crate) fn lock_file_at(
+    dir: &File,
+    name: &CStr,
+    mode: LockOpen,
+) -> Result<LockHandle, LockError> {
     #[cfg(any(
         target_os = "macos",
         all(
@@ -733,7 +773,7 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr, mode: LockOpen) -> io::Resul
         };
         // 新規作成（O_EXCL）を試し、既にあれば O_CREAT なしで既存を開く。その間に保持者が解放時の
         // unlink をした場合は ENOENT になるため、上限つきで最初からやり直す（`created` を正確に保つ。
-        // 上限まで競合し続けた場合は使用中＝`WouldBlock` として返し、待ち続けない。REPAIR-5）。
+        // 上限まで競合し続けた場合は `OpenContended` を返し、待ち続けない。REPAIR-5）。
         const OPEN_ATTEMPTS: usize = 8;
         let mut opened = None;
         if mode == LockOpen::Existing {
@@ -742,6 +782,10 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr, mode: LockOpen) -> io::Resul
         for _ in 0..OPEN_ATTEMPTS {
             if opened.is_some() {
                 break;
+            }
+            #[cfg(test)]
+            if lock_test_hook::take_contended_open() {
+                continue;
             }
             match open(O_RDWR | O_CREAT | O_EXCL) {
                 Ok(f) => {
@@ -754,18 +798,18 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr, mode: LockOpen) -> io::Resul
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 },
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
         let Some((file, created)) = opened else {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            return Err(LockError::OpenContended);
         };
         // 通常ファイル以外（FIFO・デバイス等）はロックを試みる前に拒否する（flock 自体が失敗して
         // 理由が分からなくなる OS があるため。内容にも触れない）。
         if !file.metadata()?.is_file() {
-            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied).into());
         }
         #[cfg(test)]
         if created {
@@ -784,10 +828,8 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr, mode: LockOpen) -> io::Resul
                     waits_left -= 1;
                     std::thread::sleep(CREATED_LOCK_WAIT_INTERVAL);
                 }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
-                }
-                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+                Err(std::fs::TryLockError::WouldBlock) => return Err(LockError::Held),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
             }
         }
     }
@@ -800,7 +842,7 @@ pub(crate) fn lock_file_at(dir: &File, name: &CStr, mode: LockOpen) -> io::Resul
     )))]
     {
         let _ = (dir, name, mode);
-        Err(io::Error::from(io::ErrorKind::Unsupported))
+        Err(io::Error::from(io::ErrorKind::Unsupported).into())
     }
 }
 

@@ -758,8 +758,11 @@ mod imp {
     /// 値はヒントにすぎず、壊れた・改ざんされた値は走査範囲を変えるだけで削除対象は変えない
     /// （判定・削除は検証済みディレクトリ fd 基準）。
     ///
-    /// ヒントのファイルは「自 UID 所有・通常ファイル・単一リンク・空または `<10 進> <10 進>\n` 形式」と
-    /// 確認できた場合だけ使う（`BindLock` の専用ファイル検証と同方針）。確認できない既存ファイル（他
+    /// ヒントのファイルは「自 UID 所有・通常ファイル・単一リンク・空または `<10 進> <10 進>\n` 形式
+    /// （その書きかけを含む）」と確認できた場合だけ使う（`BindLock` の専用ファイル検証と同方針）。
+    /// 書きかけ（保存の途中で異常終了・書き込み失敗して、形式の先頭側だけが残ったもの。
+    /// [`is_scan_pos_fragment`]）は専用ファイルと認めるが位置としては使わず、先頭から走査して、
+    /// その回の結果で上書き・削除する（壊れたヒントが残り続けて再開できなくなるのを防ぐ）。確認できない既存ファイル（他
     /// ファイルへのハードリンク・無関係な内容）には書き込み・切り詰め・unlink をせず、ヒントを諦めて
     /// 先頭から走査し、保存もしない。他の掃除が保持中・開けない場合も同様（best-effort）。
     struct SweepCursor {
@@ -786,6 +789,21 @@ mod imp {
         })
     }
 
+    /// 走査位置ヒントの書きかけ（`<offset> <skip>\n` の、改行より手前で切れた先頭側）かを判定する純粋関数。
+    /// 保存は切り詰めてから先頭へ 1 回書くため、途中で止まると形式の先頭側だけが残る。数字と高々 1 個の
+    /// 空白だけから成り、数字で始まるものに限る（無関係な内容は書きかけと認めない）。
+    pub(super) fn is_scan_pos_fragment(text: &[u8]) -> bool {
+        text.first().is_some_and(u8::is_ascii_digit)
+            && text.iter().all(|c| c.is_ascii_digit() || *c == b' ')
+            && text.iter().filter(|c| **c == b' ').count() <= 1
+    }
+
+    /// ヒントの内容から開始位置を決める。完全な形式ならその位置、書きかけなら先頭（専用ファイルとして
+    /// 上書きを許す）、それ以外（無関係な内容）は `None`（触れない）。
+    pub(super) fn cursor_start(text: &[u8]) -> Option<ScanPos> {
+        parse_scan_pos(text).or_else(|| is_scan_pos_fragment(text).then(ScanPos::default))
+    }
+
     impl SweepCursor {
         fn open(dir: &File, euid: u32) -> Option<Self> {
             use std::os::unix::fs::FileExt;
@@ -804,7 +822,7 @@ mod imp {
             if n as u64 != meta.len() {
                 return None;
             }
-            let start = parse_scan_pos(buf.get(..n)?)?;
+            let start = cursor_start(buf.get(..n)?)?;
             Some(Self {
                 handle,
                 name,
@@ -1581,6 +1599,57 @@ mod imp {
             std::fs::read(dir.join(name))
                 .ok()
                 .map(|b| parse_scan_pos(&b).unwrap())
+        }
+
+        /// PLUG-7・REPAIR-5（#1310）: 保存の途中で切れた走査位置ヒント（書きかけ）は専用ファイルと認め、位置と
+        /// しては使わず先頭から走査して、その回の結果で上書き・削除する（壊れたヒントが残り続けない）。
+        /// 無関係な内容・旧形式（改行で終わるが項目が足りない）は書きかけと認めない。
+        #[test]
+        fn plug7_torn_cursor_is_recovered() {
+            for torn in [&b"12"[..], b"12 ", b"12 3", b"18446744073709551615 1844"] {
+                assert!(is_scan_pos_fragment(torn), "{torn:?}");
+                assert_eq!(cursor_start(torn), Some(ScanPos::default()), "{torn:?}");
+            }
+            for other in [
+                &b"12\n"[..],
+                b" 12",
+                b"12  3",
+                b"12 3 4",
+                b"not a hint",
+                b"-1 0",
+            ] {
+                assert!(!is_scan_pos_fragment(other), "{other:?}");
+                assert_eq!(cursor_start(other), None, "{other:?}");
+            }
+            assert_eq!(
+                cursor_start(b"12 3\n"),
+                Some(ScanPos {
+                    offset: 12,
+                    skip: 3
+                })
+            );
+            let euid = crate::sys::effective_uid();
+            let name = std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap();
+            // 末尾まで走査し終えた回: 書きかけのヒントは削除される。
+            let t = Tmp::new();
+            std::fs::write(t.0.join(name), b"123 4").unwrap();
+            let lock = t.0.join("oneshot-1-0.sock.lock");
+            std::fs::write(&lock, b"").unwrap();
+            let (r, read) = sweep_one_shot_counted(&t.0, euid, 1024, 256, 65_536).unwrap();
+            assert_eq!((r.examined, r.truncated, read), (1, false, 2));
+            assert!(!lock.exists());
+            assert_eq!(stored_pos(&t.0), None);
+            // 上限で打ち切った回: 書きかけのヒントは完全な形式で上書きされ、次回から再開できる。
+            let t = Tmp::new();
+            std::fs::write(t.0.join(name), b"123 4").unwrap();
+            for i in 0..5 {
+                std::fs::write(t.0.join(format!("other-{i}")), b"").unwrap();
+            }
+            let (r, read) = sweep_one_shot_counted(&t.0, euid, 2, 256, 65_536).unwrap();
+            assert_eq!((r.truncated, read), (true, 3));
+            let stored = std::fs::read(t.0.join(name)).unwrap();
+            let pos = parse_scan_pos(&stored).expect("hint must be rewritten in full form");
+            assert_eq!(pos.skip, 2);
         }
 
         /// PLUG-7・REPAIR-5（#1310）: 走査位置ヒントは `<offset> <skip>\n` に厳密一致する内容だけを受け付ける。

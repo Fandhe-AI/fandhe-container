@@ -74,9 +74,11 @@
 //!   ものは削除しない。socket が消えて残ったロックファイルは `BindLock` の drop が unlink する。
 //! - 上限（REPAIR-5）: 処理する候補（上記の名前一致）は [`ONE_SHOT_SWEEP_MAX_ENTRIES`] 件まで、列挙する
 //!   エントリ総数は [`ONE_SHOT_SWEEP_MAX_SCAN`] 件まで。対象外の名前は候補の件数に数えないため、先頭に
-//!   対象外ファイルが多くても後方の残骸が飢餓しない。上限を超えた候補は次回の初期化で処理する（使用中・
-//!   削除不能で残る候補が上限件数を超えて先頭に居座る場合は後方が処理されない。使用中は生存プロセスの
-//!   ロックで、異常終了の残骸の数に比べ稀として許容する）。
+//!   対象外ファイルが多くても後方の残骸が飢餓しない。上限で打ち切った場合は、次回の開始位置（読み飛ばす
+//!   エントリ数）を runtime directory 直下の走査位置ヒント（`fcsweep-cursor`。0600・排他 flock・best-effort）
+//!   へ保存し、次回の初期化はそこから走査する。ディレクトリ末尾まで走査し終えるとヒントを削除して先頭へ戻る
+//!   ため、上限より後方の残骸も複数回の初期化で収束して処理される。ヒントは走査範囲を変えるだけで、改ざん・
+//!   破損しても削除対象は変わらない（判定・削除は検証済みディレクトリ fd 基準）。
 //! - 残余: 列挙はパス基準（`read_dir`）で、得た名前はヒントにすぎない。判定・削除はすべて検証済みディレクトリ
 //!   fd 基準で行うため、差し替えられても削除対象にはならない。bind 成功から記録書き込みまでの間に異常終了した
 //!   記録なし socket は削除しない（手動削除が必要。fail-closed）。常駐モードの `resident-*` は対象外。
@@ -580,15 +582,92 @@ mod imp {
     /// `dir_path`（検証済みの runtime directory）を走査し、残骸の socket とロックファイルを掃除する
     /// （#1310）。`euid` は自 UID（テストで他 UID を注入できるよう引数に取る）。
     pub(super) fn sweep_one_shot(dir_path: &Path, euid: u32) -> Result<OneShotSweep, PluginError> {
+        sweep_one_shot_limited(
+            dir_path,
+            euid,
+            ONE_SHOT_SWEEP_MAX_SCAN,
+            ONE_SHOT_SWEEP_MAX_ENTRIES,
+        )
+    }
+
+    /// 走査位置ヒントを保存するファイル名（runtime directory 直下。候補の名前規則に一致しない）。
+    const SWEEP_CURSOR_NAME: &[u8] = b"fcsweep-cursor";
+    /// 走査位置ヒントの最大長（10 進 u64 は 20 桁）。
+    const SWEEP_CURSOR_MAX_LEN: usize = 32;
+
+    /// 前回打ち切った位置（スキップするエントリ数）を保存・取得する走査位置ヒント。
+    ///
+    /// 列挙総数の上限（REPAIR-5）を保ったまま、上限より後方の残骸へも複数回の初期化で到達できる
+    /// ようにする（先頭の対象外ファイルが多い巨大ディレクトリで掃除が収束しない問題への対策）。
+    /// 値は「何件読み飛ばすか」のヒントにすぎず、壊れた・改ざんされた値は走査範囲を変えるだけで
+    /// 削除対象は変えない（判定・削除は検証済みディレクトリ fd 基準）。他の掃除が保持中・開けない場合は
+    /// 先頭（0）から走査し、保存もしない（best-effort）。
+    struct SweepCursor {
+        handle: crate::sys::LockHandle,
+        name: std::ffi::CString,
+    }
+
+    impl SweepCursor {
+        fn open(dir: &File) -> Option<Self> {
+            let name = std::ffi::CString::new(SWEEP_CURSOR_NAME).ok()?;
+            let handle = crate::sys::lock_file_at(dir, &name).ok()?;
+            Some(Self { handle, name })
+        }
+
+        fn load(&self) -> usize {
+            use std::os::unix::fs::FileExt;
+            let mut buf = [0u8; SWEEP_CURSOR_MAX_LEN];
+            let Ok(n) = self.handle.file.read_at(&mut buf, 0) else {
+                return 0;
+            };
+            let text = buf.get(..n).map(|b| b.trim_ascii()).unwrap_or_default();
+            parse_decimal(text)
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(0)
+        }
+
+        /// `next` を保存する。0（走査完了）ならファイルを残さない。
+        fn store(&self, dir: &File, next: usize) {
+            use std::os::unix::fs::FileExt;
+            if next == 0 {
+                let _ = self.handle.file.set_len(0);
+                let _ = crate::sys::unlinkat(dir, &self.name);
+                return;
+            }
+            if self.handle.file.set_len(0).is_ok() {
+                let _ = self
+                    .handle
+                    .file
+                    .write_all_at(format!("{next}\n").as_bytes(), 0);
+            }
+        }
+    }
+
+    /// 上限を引数に取る [`sweep_one_shot`] の本体（テストで小さい上限を注入できるようにする）。
+    ///
+    /// 走査は前回の打ち切り位置（[`SweepCursor`]）から `max_scan` 件まで。上限で打ち切った場合は
+    /// 次回の開始位置を保存し、ディレクトリ末尾まで走査し終えたら 0 に戻す（#1310・REPAIR-5）。
+    pub(super) fn sweep_one_shot_limited(
+        dir_path: &Path,
+        euid: u32,
+        max_scan: usize,
+        max_entries: usize,
+    ) -> Result<OneShotSweep, PluginError> {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
         let real = std::fs::canonicalize(dir_path).map_err(|e| map_io(&e))?;
         let dir = open_nofollow(&real)?;
         verify(&fstat(&dir)?, euid)?;
+        let cursor = SweepCursor::open(&dir);
+        let start = cursor.as_ref().map_or(0, SweepCursor::load);
         let entries = std::fs::read_dir(&real).map_err(|e| map_io(&e))?;
         let mut out = OneShotSweep::default();
-        for (scanned, entry) in entries.enumerate() {
-            if scanned >= ONE_SHOT_SWEEP_MAX_SCAN {
+        // 次回の開始位置。0 は「末尾まで走査し終えた」を表す。
+        let mut next = 0usize;
+        for (index, entry) in entries.enumerate().skip(start) {
+            let scanned = index - start;
+            if scanned >= max_scan {
                 out.truncated = true;
+                next = index;
                 break;
             }
             let Ok(entry) = entry else {
@@ -600,8 +679,9 @@ mod imp {
                 continue;
             };
             // 件数上限は候補だけを数える（対象外の名前で枠を消費して後方の残骸が飢餓しないように）。
-            if out.examined as usize >= ONE_SHOT_SWEEP_MAX_ENTRIES {
+            if out.examined as usize >= max_entries {
                 out.truncated = true;
+                next = index;
                 break;
             }
             out.examined += 1;
@@ -611,6 +691,9 @@ mod imp {
             };
             let public = real.join(std::ffi::OsString::from_vec(socket.to_vec()));
             sweep_one(&dir, &name, &public, euid, &mut out);
+        }
+        if let Some(cursor) = &cursor {
+            cursor.store(&dir, next);
         }
         Ok(out)
     }
@@ -1095,6 +1178,46 @@ mod imp {
                 mtime_sec: 3,
                 mtime_nsec: 4,
             }
+        }
+
+        /// REPAIR-5・PLUG-7（#1310）: 列挙総数の上限を超える位置にある残骸も、走査位置ヒントを進める
+        /// ことで複数回の掃除で必ず処理される（先頭の対象外ファイルが上限を超えても収束する）。
+        #[test]
+        fn plug7_sweep_converges_past_scan_limit() {
+            let base = std::env::temp_dir().join(format!("fcsc-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            DirBuilder::new().mode(0o700).create(&base).unwrap();
+            let euid = crate::sys::effective_uid();
+            const MAX_SCAN: usize = 8;
+            for i in 0..40 {
+                std::fs::write(base.join(format!("other-{i}")), b"").unwrap();
+            }
+            let locks: Vec<_> = (0..4)
+                .map(|i| base.join(format!("oneshot-1-{i}.sock.lock")))
+                .collect();
+            for l in &locks {
+                std::fs::write(l, b"").unwrap();
+            }
+            // 44 件 / 8 件ずつ → 6 回で一巡する。一巡し終える（打ち切られない）まで有限回で繰り返す。
+            let mut truncated_runs = 0;
+            let mut finished = false;
+            for _ in 0..20 {
+                let r = sweep_one_shot_limited(&base, euid, MAX_SCAN, 256).unwrap();
+                truncated_runs += usize::from(r.truncated);
+                if !r.truncated {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished);
+            assert!(truncated_runs >= 1);
+            for l in &locks {
+                assert!(!l.exists(), "{}", l.display());
+            }
+            // 一巡し終えたらヒントのファイルは残らない。
+            let cursor = base.join(std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap());
+            assert!(!cursor.exists());
+            let _ = std::fs::remove_dir_all(&base);
         }
 
         #[test]

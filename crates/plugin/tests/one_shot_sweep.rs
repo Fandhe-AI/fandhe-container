@@ -36,7 +36,10 @@ mod unix {
     impl Base {
         fn new() -> Self {
             static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
+            // macOS の sun_path 上限（104 バイト）に収めるため、長い `TMPDIR`（/var/folders/...）ではなく
+            // 短い /tmp 直下に作る（/tmp は macOS で /private/tmp への symlink のため正規化する）。
+            let tmp = std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::env::temp_dir());
+            let p = tmp.join(format!(
                 "fcsw-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)

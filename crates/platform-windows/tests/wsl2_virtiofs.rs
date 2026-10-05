@@ -17,6 +17,8 @@
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fandhe_container_platform_windows::instrument::WinWarningCode;
@@ -28,23 +30,44 @@ use fandhe_container_platform_windows::wsl2::{
 use fandhe_container_platform_windows::wslconfig;
 
 /// 一時ディレクトリを作り、Drop で削除するガード（panic 時も残さない）。
-struct TempDir(PathBuf);
+///
+/// 実機 WSL2 側のマウント解除を確認できなかった場合は [`TempDir::retain_flag`] 経由で保持指示を受け、
+/// 共有元のデータ消失を避けるため Drop で削除しない。
+struct TempDir {
+    dir: PathBuf,
+    retain: Arc<AtomicBool>,
+}
 
 impl TempDir {
     fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("fandhe-it-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        Self(dir)
+        Self {
+            dir,
+            retain: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        &self.dir
+    }
+
+    /// 解除失敗時に `true` を立てると Drop で削除されなくなるフラグ。
+    fn retain_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.retain)
     }
 }
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if self.retain.load(Ordering::SeqCst) {
+            eprintln!(
+                "shared source directory retained because unmount was not confirmed: {}",
+                self.dir.display()
+            );
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -93,12 +116,42 @@ const ENV_TIMEOUT: &str = "FANDHE_CONTAINER_TEST_TIMEOUT_SECS";
 struct ReleaseGuard {
     prepared: Option<PreparedLaunch>,
     timeout: Duration,
+    /// 解除失敗時に共有元ディレクトリの削除を抑止するフラグ（`TempDir::retain_flag`）。
+    retain: Arc<AtomicBool>,
+    /// 診断出力用の共有元ルート。
+    source_root: PathBuf,
+}
+
+/// 解除を試み、失敗したら共有元を保持させ、パスと未解除情報を stderr に出す。
+fn release_or_retain(
+    prepared: &PreparedLaunch,
+    timeout: Duration,
+    retain: &AtomicBool,
+    source_root: &Path,
+) -> bool {
+    match release_virtiofs_launch(prepared, timeout) {
+        Ok(_) => true,
+        Err(e) => {
+            retain.store(true, Ordering::SeqCst);
+            let unreleased: Vec<&str> = e
+                .unreleased()
+                .map(|u| u.mounts().iter().map(|m| m.guest_path.as_str()).collect())
+                .unwrap_or_default();
+            eprintln!(
+                "release failed: code={} message={} source_root={} unreleased_guest_paths={unreleased:?}",
+                e.code().as_str(),
+                e.message(),
+                source_root.display()
+            );
+            false
+        }
+    }
 }
 
 impl Drop for ReleaseGuard {
     fn drop(&mut self) {
         if let Some(p) = self.prepared.take() {
-            let _ = release_virtiofs_launch(&p, self.timeout);
+            release_or_retain(&p, self.timeout, &self.retain, &self.source_root);
         }
     }
 }
@@ -174,7 +227,7 @@ fn win1_win2_shared_mount_on_real_wsl2() {
             // 未解除のマウントが残っていれば回収する。
             let n = e.unreleased().map_or(0, |u| u.mounts().len());
             if let Some(u) = e.unreleased() {
-                let _ = release_virtiofs_launch(u, timeout);
+                release_or_retain(u, timeout, &tmp.retain_flag(), tmp.path());
             }
             panic!(
                 "prepare failed: code={} message={} unreleased={n}",
@@ -186,6 +239,8 @@ fn win1_win2_shared_mount_on_real_wsl2() {
     let mut guard = ReleaseGuard {
         prepared: Some(prepared.clone()),
         timeout,
+        retain: tmp.retain_flag(),
+        source_root: tmp.path().to_path_buf(),
     };
 
     // WIN-2: 輸送方式・警告・ディストリ・マウント内容。
@@ -221,13 +276,12 @@ fn win1_win2_shared_mount_on_real_wsl2() {
     );
 
     // 明示解除。成功したらガードは二重に解除しない。
-    release_virtiofs_launch(&prepared, timeout).unwrap_or_else(|e| {
-        panic!(
-            "release failed: code={} message={} unreleased={}",
-            e.code().as_str(),
-            e.message(),
-            e.unreleased().map_or(0, |u| u.mounts().len())
-        )
-    });
+    // 失敗時は共有元を保持（release_or_retain が診断出力済み）してから panic する。
+    let released = release_or_retain(&prepared, timeout, &tmp.retain_flag(), tmp.path());
     guard.prepared = None;
+    assert!(
+        released,
+        "release failed; shared source retained at {}",
+        tmp.path().display()
+    );
 }

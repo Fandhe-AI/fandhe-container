@@ -40,12 +40,31 @@ struct TempDir {
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("fandhe-it-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        Self {
-            dir,
-            retain: Arc::new(AtomicBool::new(false)),
+        // PID・時刻・プロセス内カウンタで一意な名前を作り、`create_dir`（既存ならエラー）で
+        // 新規作成に成功したディレクトリだけを所有する。既存ディレクトリを Drop で消さないため。
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for _ in 0..100 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let dir = std::env::temp_dir().join(format!(
+                "fandhe-it-{tag}-{}-{nanos}-{seq}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {
+                    return Self {
+                        dir,
+                        retain: Arc::new(AtomicBool::new(false)),
+                    };
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create temp dir: {e}"),
+            }
         }
+        panic!("could not create a unique temp dir");
     }
 
     fn path(&self) -> &Path {

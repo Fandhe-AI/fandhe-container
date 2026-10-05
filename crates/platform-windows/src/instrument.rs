@@ -173,9 +173,13 @@ pub trait WinOpRecorder: Send + Sync {
     /// 1 件の計測結果を記録する。
     fn record_win_op(&self, sample: &WinOpSample);
 
-    /// 起動を止めない警告（9P フォールバック等。TASK-67.5・WIN-2）を 1 件記録する。既定は何もしない
-    /// （既存の実装は互換のまま）。契約は [`record_win_op`](Self::record_win_op) と同じ。
-    fn record_win_warning(&self, _warning: &WinWarning) {}
+    /// 起動を止めない警告（9P フォールバック等。TASK-67.5・WIN-2）を 1 件記録する。契約は
+    /// [`record_win_op`](Self::record_win_op) と同じ。
+    ///
+    /// 既定実装を持たない必須メソッドにしている。既定で何もしないと、既存の記録先が警告を黙って捨てて
+    /// 降格に気付けなくなる（WIN-2「暗黙に降格しない」違反）ため、実装側にコンパイル時に対応を強制する。
+    /// 警告を扱わない場合も、空実装を明示的に書かせる。
+    fn record_win_warning(&self, warning: &WinWarning);
 }
 
 /// 計測しない場合に明示的に渡す既定実装。
@@ -184,6 +188,8 @@ pub struct NoopWinOpRecorder;
 
 impl WinOpRecorder for NoopWinOpRecorder {
     fn record_win_op(&self, _sample: &WinOpSample) {}
+
+    fn record_win_warning(&self, _warning: &WinWarning) {}
 }
 
 /// 計測中の操作を表すガード。
@@ -433,9 +439,9 @@ mod tests {
         }
     }
 
-    /// WIN-2: `record_win_warning` の既定実装は何もせず、`Collect` は警告を保持する。
+    /// WIN-2: `NoopWinOpRecorder` は警告を捨て、`Collect` は警告を保持する（必須メソッドで暗黙に落とせない）。
     #[test]
-    fn win2_record_win_warning_default_is_noop() {
+    fn win2_record_win_warning_is_required_and_noop_discards() {
         let w = WinWarning::new(WinWarningCode::VirtiofsNotEnabled);
         NoopWinOpRecorder.record_win_warning(&w);
         let c = Collect::default();

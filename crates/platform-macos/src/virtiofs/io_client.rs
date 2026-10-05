@@ -15,7 +15,8 @@
 //!   FLUSH ACK だけが持つ（IO-1・IO-2。`docs/api/io-barrier.md`）。
 //! - すべての ACK 待ちにタイムアウトを渡す（REPAIR-5）。`write` の暗黙 flush と `flush` の ACK 受け取り
 //!   （通常 ACK 分と最後の `FlushAck`）は区別せず `flush_ack` を使う（`ack` は予約値で現在は未使用）。
-//! - エラー後の接続は再利用しない（poison。P1-3）。再接続は呼び出し元の責務。
+//! - エラー後の接続は再利用しない（poison。P1-3）。再接続は `reconnect` モジュールの
+//!   `ReconnectingVirtiofsIoClient` が担う（TASK-65.5）。
 //! - 共有が [`ShareAccess::ReadOnly`] の場合は構築を拒否する（fail-closed）。
 //! - virtiofs タグはワイヤーへ載せない（`writeback.rs` の D1）。タグは識別・観測用に保持するだけで、
 //!   載せるのは IO-1 契約の変更（`PROTOCOL_VERSION` の繰り上げを伴いうる）になるため行わない。
@@ -127,6 +128,18 @@ pub enum VirtiofsIoError {
     UnexpectedAck { op: VirtiofsIoOp },
     /// in-flight 上限が `Flush` 用の予約枠を含めて足りない（[`MIN_IN_FLIGHT_LIMIT`] 未満）。
     InFlightLimitTooSmall { limit: usize },
+    /// 接続断を検知した（TASK-65.5）。失敗した操作は再送されない。`unflushed_writes` は最後に成功した
+    /// `flush` 以降に送った `Write` の件数で、永続化の有無が不明なため呼び出し元がコミット単位で再発行する。
+    ConnectionLost {
+        op: VirtiofsIoOp,
+        unflushed_writes: u64,
+        reconnected: bool,
+        source: IoError,
+    },
+    /// 再接続を既定回数試みたがすべて失敗した（TASK-65.5）。`source` は最後の試行のエラー。
+    ReconnectFailed { attempts: u32, source: IoError },
+    /// 再接続ポリシーの値が許容範囲外（TASK-65.5）。`field` は違反した項目名。
+    InvalidReconnectPolicy { field: &'static str },
 }
 
 impl VirtiofsIoError {
@@ -137,6 +150,11 @@ impl VirtiofsIoError {
             VirtiofsIoError::UnexpectedAck { .. } => "virtiofs_io.unexpected_ack",
             VirtiofsIoError::InFlightLimitTooSmall { .. } => {
                 "virtiofs_io.in_flight_limit_too_small"
+            }
+            VirtiofsIoError::ConnectionLost { .. } => "virtiofs_io.connection_lost",
+            VirtiofsIoError::ReconnectFailed { .. } => "virtiofs_io.reconnect_failed",
+            VirtiofsIoError::InvalidReconnectPolicy { .. } => {
+                "virtiofs_io.invalid_reconnect_policy"
             }
             VirtiofsIoError::Protocol { source, .. } => match source.code() {
                 IoErrorCode::InvalidArgument => "virtiofs_io.invalid_argument",
@@ -170,6 +188,22 @@ impl VirtiofsIoError {
                 "virtiofs io {} received an unexpected ack; the connection must be re-established",
                 op.as_str()
             ),
+            VirtiofsIoError::ConnectionLost {
+                op,
+                unflushed_writes,
+                reconnected,
+                ..
+            } => format!(
+                "virtiofs io {} failed because the connection was lost; reconnected={reconnected}, \
+                 {unflushed_writes} unflushed write(s) must be re-issued",
+                op.as_str()
+            ),
+            VirtiofsIoError::ReconnectFailed { attempts, source } => {
+                format!("virtiofs io reconnect failed after {attempts} attempt(s): {source}")
+            }
+            VirtiofsIoError::InvalidReconnectPolicy { field } => {
+                format!("virtiofs io reconnect policy {field} is outside the allowed range")
+            }
         }
     }
 }
@@ -183,7 +217,9 @@ impl fmt::Display for VirtiofsIoError {
 impl std::error::Error for VirtiofsIoError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            VirtiofsIoError::Protocol { source, .. } => Some(source),
+            VirtiofsIoError::Protocol { source, .. }
+            | VirtiofsIoError::ConnectionLost { source, .. }
+            | VirtiofsIoError::ReconnectFailed { source, .. } => Some(source),
             _ => None,
         }
     }

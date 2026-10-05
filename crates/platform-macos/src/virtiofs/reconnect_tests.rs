@@ -432,3 +432,54 @@ fn failed_send_counts_as_ambiguous_unflushed() {
     ));
     assert_eq!(c.unflushed_writes(), 0);
 }
+
+/// IO-2・TASK-65.5: ペイロード検証など送信前に拒否された Write は何も送っていないので未確定に数えず、
+/// 接続も維持される（再接続しない）。
+#[test]
+fn pre_send_rejection_is_not_counted_as_unflushed() {
+    let dir = TempDir::new("pre-send");
+    let script = vec![Ok(Mode::Healthy)];
+    let (res, h) = build(&dir, ShareAccess::ReadWrite, 8, script, policy(3, 1));
+    let mut c = res.expect("connected");
+    c.write(b"ok").expect("write");
+    assert_eq!(c.unflushed_writes(), 1);
+    let oversized = vec![0u8; fandhe_container_io::MAX_PAYLOAD_LEN as usize + 1];
+    let err = c.write(&oversized).expect_err("rejected before send");
+    assert!(matches!(err, VirtiofsIoError::Protocol { .. }), "{err:?}");
+    assert_eq!(c.unflushed_writes(), 1);
+    assert!(c.is_connected());
+    assert_eq!(c.reconnects(), 0);
+    assert_eq!(*h.calls.lock().expect("calls"), 1);
+}
+
+/// REPAIR-5: 取り残された接続スレッドがある間は新しいスレッドを起動しない（積み増さない）。
+#[test]
+fn stuck_connect_thread_is_not_stacked() {
+    let dir = TempDir::new("no-stack");
+    let timeout = IoTimeout::new(Duration::from_millis(50)).expect("timeout");
+    let policy = ReconnectPolicy::try_new(4, Duration::from_millis(1), timeout).expect("policy");
+    let started = std::time::Instant::now();
+    let err = Client::<HangingConnector>::connect_with_pause(
+        &share(&dir, ShareAccess::ReadWrite),
+        HangingConnector,
+        InFlightLimit::new(4).expect("limit"),
+        NoopSendObserver,
+        VirtiofsIoTimeouts::new(secs(1), secs(1), secs(1)),
+        policy,
+        Box::new(|_| {}),
+    )
+    .err()
+    .expect("must fail");
+    // 2 回目以降は待たずに失敗するため、総時間は 1 回分の期限程度。
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    match err {
+        VirtiofsIoError::ReconnectFailed {
+            attempts: 4,
+            source,
+            ..
+        } => {
+            assert_eq!(source.code(), IoErrorCode::Unavailable);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}

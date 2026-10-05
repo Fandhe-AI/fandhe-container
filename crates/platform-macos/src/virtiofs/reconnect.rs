@@ -32,6 +32,7 @@
 //! 具象 [`VirtiofsConnector`]（ゲストの vsock 接続・ホスト側 UDS / VZ vsock の connect）は別タスク
 //! （TASK-115 ほか）。バックオフは固定間隔のみで、指数バックオフ・ジッターは将来拡張。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
@@ -64,8 +65,11 @@ pub trait VirtiofsConnector {
 
     /// 1 回の接続試行。`timeout` 以内に確立できなければ `IoErrorCode::Timeout` 等で返す（REPAIR-5）。
     ///
-    /// 実装側が `timeout` を守れなくても、呼び出し側（[`ReconnectingVirtiofsIoClient`]）が別スレッドで
-    /// 試行し `timeout` 経過時点で待機を打ち切るため、総待ち時間の上限は崩れない。
+    /// 契約: 実装は `timeout` 以内に必ず戻らなければならない（ソケットの connect / 読み書きに期限を設ける）。
+    /// 呼び出し側（[`ReconnectingVirtiofsIoClient`]）は別スレッドで試行し `timeout` 経過時点で待機を打ち切るが、
+    /// これは契約違反の connector に対する防御であり、スレッドを強制終了はできない。違反した connector の
+    /// 試行スレッドは戻るまで残るものの、クライアントごとに同時 1 本までで、残っている間は新しい試行を
+    /// 起動せず即 `Unavailable` で失敗させるためスレッドは積み増されない。
     fn connect(&mut self, timeout: IoTimeout) -> Result<Self::Transport, IoError>;
 }
 
@@ -130,6 +134,15 @@ impl ReconnectPolicy {
     }
 }
 
+/// 接続試行スレッドの実行中フラグを、スレッド終了（またはスレッド起動失敗）時に戻す RAII ガード。
+struct BusyGuard(Arc<AtomicBool>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// 切断時に再接続する virtiofs I/O クライアント（MAC-1・TASK-65.5。契約はモジュール doc）。
 pub struct ReconnectingVirtiofsIoClient<C, O>
 where
@@ -143,6 +156,8 @@ where
     timeouts: VirtiofsIoTimeouts,
     policy: ReconnectPolicy,
     client: Option<VirtiofsIoClient<C::Transport, O>>,
+    /// 接続試行スレッドが実行中か。期限切れで取り残されたスレッドがある間は新規に起動しない（REPAIR-5）。
+    connect_busy: Arc<AtomicBool>,
     unflushed_writes: u64,
     reconnects: u64,
     pause: Box<dyn FnMut(Duration)>,
@@ -200,6 +215,7 @@ where
             timeouts,
             policy,
             client: None,
+            connect_busy: Arc::new(AtomicBool::new(false)),
             unflushed_writes: 0,
             reconnects: 0,
             pause,
@@ -219,7 +235,7 @@ where
     }
 
     /// 最後に FLUSH ACK（明示 `flush` または暗黙 flush）を確認して以降に送った `Write` の件数
-    /// （永続化未確認の上限値。通常 ACK では減らさない。送信に失敗した曖昧な `Write` も含む。IO-1・IO-2）。
+    /// （永続化未確認の上限値。通常 ACK では減らさない。送信結果が曖昧な失敗 `Write` も含み、送信前に拒否された `Write` は含まない。IO-1・IO-2）。
     pub fn unflushed_writes(&self) -> u64 {
         self.unflushed_writes
     }
@@ -232,15 +248,25 @@ where
     /// 1 回の接続試行を別スレッドで走らせ、`connect_timeout` 経過で待機を打ち切る（REPAIR-5）。
     ///
     /// connector が応答しなくても呼び出し元は期限内に戻る。打ち切った試行のスレッドは connector の
-    /// 復帰まで残り得るが、その間は connector のロックを握り続けるため、後続の試行は即座に
-    /// `Unavailable` で失敗する（スレッドを積み増さない）。遅れて確立した接続は破棄される。
+    /// 復帰まで残り得る（スレッドは強制終了できない。[`VirtiofsConnector::connect`] の契約は期限内に戻ること）が、
+    /// `connect_busy` が立っている間は新しいスレッドを起動せず即 `Unavailable` で失敗させるため、
+    /// 取り残されるスレッドはクライアントごとに最大 1 本に有界化される。遅れて確立した接続は破棄される。
     fn connect_with_deadline(&self) -> Result<C::Transport, IoError> {
+        if self.connect_busy.swap(true, Ordering::AcqRel) {
+            return Err(IoError::new(
+                IoErrorCode::Unavailable,
+                "previous connect attempt is still running",
+            ));
+        }
+        // 起動の成否・パニックを問わず、スレッド（またはその closure）の破棄時に busy を戻す。
+        let busy = BusyGuard(Arc::clone(&self.connect_busy));
         let (tx, rx) = channel();
         let connector = Arc::clone(&self.connector);
         let timeout = self.policy.connect_timeout;
         let spawned = std::thread::Builder::new()
             .name("virtiofs-connect".to_owned())
             .spawn(move || {
+                let _busy = busy;
                 let result = match connector.try_lock() {
                     Ok(mut guard) => guard.connect(timeout),
                     Err(TryLockError::WouldBlock) => Err(IoError::new(
@@ -376,11 +402,11 @@ where
     /// `Write` を 1 件送る。接続断は再接続のうえ `ConnectionLost` で返し、再送はしない。
     pub fn write(&mut self, body: &[u8]) -> Result<WriteReport, VirtiofsIoError> {
         self.ensure_connected(VirtiofsIoOp::Write)?;
-        let (result, flushes_before, flushes_after) = match self.client.as_mut() {
+        let (result, flushes_before, flushes_after, poisoned) = match self.client.as_mut() {
             Some(c) => {
                 let before = c.confirmed_flushes();
                 let r = c.write(body);
-                (r, before, c.confirmed_flushes())
+                (r, before, c.confirmed_flushes(), c.is_poisoned())
             }
             None => return Err(Self::not_connected(VirtiofsIoOp::Write)),
         };
@@ -396,9 +422,13 @@ where
                 Ok(report)
             }
             Err(e) => {
-                // 送信失敗は相手がフレームを受理したか不明（曖昧）。再発行判断から漏れないよう
-                // 失敗した Write も未確定として数える（暗黙 flush 段階の失敗では過大計上になるが安全側）。
-                self.unflushed_writes = self.unflushed_writes.saturating_add(1);
+                // フレーム送信後に結果が曖昧になった失敗（トランスポート失敗・暗黙 flush 途中の失敗）は
+                // client が poison される。相手が受理したか不明なため未確定として数える（暗黙 flush 段階の
+                // 失敗では過大計上になるが安全側）。ペイロード検証・キュー登録など送信前の拒否では
+                // client は poison されず、何も送っていないので数えない（IO-2）。
+                if poisoned {
+                    self.unflushed_writes = self.unflushed_writes.saturating_add(1);
+                }
                 Err(self.classify(VirtiofsIoOp::Write, e))
             }
         }

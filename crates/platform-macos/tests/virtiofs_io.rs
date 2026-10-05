@@ -14,6 +14,8 @@
 //! - `fandhe-guest-test: virtiofs-io v1 op=readdir entries=<in/dir の名前のカンマ区切り>`
 //! - `fandhe-guest-test: virtiofs-io v1 op=write result=done`（`out/write.txt` へ書いて sync 後）
 //! - 失敗時 `... op=<op> result=error`、最後に `fandhe-guest-test: virtiofs-io v1 done`
+//! - 名前空間 `fandhe-guest-test: virtiofs-io ` で始まる行はすべてプローブ行とみなし、上記の形に
+//!   復号できないもの（版数違い・未知 op・空 value・上限超過・非 UTF-8 等）は位置によらず不正とする。
 //!
 //! 接頭辞は `guest_mount::REPORT_PREFIX`（`fandhe-guest: ...`）と先頭から食い違うため、mount 報告の走査に誤認されない。
 //! read / readdir はコンソール報告、write だけは共有ファイルで検証し、write 経路の故障が他の判定を巻き込まない。
@@ -36,6 +38,9 @@ use fandhe_container_platform_macos::virtiofs::{
 };
 use fandhe_container_platform_macos::vm::{OpTimeouts, Vm, VmState};
 
+/// プローブ行の名前空間。これで始まる行は版数によらずプローブ行として扱う（契約外なら不正）。
+const PROBE_NAMESPACE: &str = "fandhe-guest-test: virtiofs-io ";
+/// 本テストが解釈する版（v1）の接頭辞。`PROBE_NAMESPACE` で始まる。
 const PROBE_PREFIX: &str = "fandhe-guest-test: virtiofs-io v1 ";
 const SHARE_TAG: &str = "fandhe-io";
 const GUEST_MOUNT: &str = "/mnt/fandhe/io";
@@ -186,12 +191,31 @@ enum ProbeItem {
     Done,
 }
 
-/// 1 行がプローブ行なら復号する。行頭一致のみ受理し、上限超過・未知 op・空 value は無視する。
-fn parse_probe_line(line: &[u8]) -> Option<ProbeItem> {
-    if line.len() > MAX_PROBE_LINE_BYTES {
-        return None;
-    }
+/// 1 行の分類結果。名前空間を持つ行は `Other` にならない（取りこぼしを不正として表に出すため）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeLine {
+    /// プローブ名前空間で始まらない行（カーネル出力等）。無視してよい。
+    Other,
+    /// プローブ名前空間で始まるが契約の形に復号できない行。fail-closed で不正とする。
+    Malformed,
+    Item(ProbeItem),
+}
+
+/// 1 行を分類する。名前空間の判定は行頭の生バイトで先に行い、その後の上限超過・非 UTF-8・
+/// 版数違い・未知 op・空 value はすべて `Malformed` とする（無視して見逃さない）。
+fn parse_probe_line(line: &[u8]) -> ProbeLine {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if !line.starts_with(PROBE_NAMESPACE.as_bytes()) {
+        return ProbeLine::Other;
+    }
+    if line.len() > MAX_PROBE_LINE_BYTES {
+        return ProbeLine::Malformed;
+    }
+    decode_probe_item(line).map_or(ProbeLine::Malformed, ProbeLine::Item)
+}
+
+/// 名前空間を持つ行を v1 の契約どおりに復号する。形が崩れていれば `None`。
+fn decode_probe_item(line: &[u8]) -> Option<ProbeItem> {
     let text = std::str::from_utf8(line).ok()?;
     let rest = text.strip_prefix(PROBE_PREFIX)?;
     if rest == "done" {
@@ -224,8 +248,8 @@ struct ProbeLog {
     write_done: bool,
     errors: Vec<String>,
     done: bool,
-    /// 同じ op の重複報告・done の重複・done 以降の後続報告・全 op 報告前の done
-    /// （矛盾の有無によらず不正として扱う）。
+    /// 同じ op の重複報告・done の重複・done 以降の後続報告・全 op 報告前の done・
+    /// 復号できないプローブ行（矛盾の有無・位置によらず不正として扱う）。
     invalid: bool,
 }
 
@@ -255,12 +279,17 @@ fn log_truncated(bytes: &[u8]) -> bool {
 
 /// ログ全体を畳み込む。プローブ契約（AGENTS.md「最後に done」）に従い、次を `invalid`
 /// （fail-closed）とする: op ごとの重複報告・done の重複・done 以降の後続報告・
-/// read / readdir / write の全報告が揃う前の done。
+/// read / readdir / write の全報告が揃う前の done・名前空間を持つが復号できない行（done の前後とも）。
 fn parse_probe_log(text: &str) -> ProbeLog {
     let mut out = ProbeLog::default();
     for line in text.lines() {
-        let Some(item) = parse_probe_line(line.as_bytes()) else {
-            continue;
+        let item = match parse_probe_line(line.as_bytes()) {
+            ProbeLine::Other => continue,
+            ProbeLine::Malformed => {
+                out.invalid = true;
+                continue;
+            }
+            ProbeLine::Item(item) => item,
         };
         if out.done {
             // done は最終行でなければならない（重複 done も後続報告もここで弾く）。
@@ -500,6 +529,9 @@ fn mac1_io5_probe_spec_builds_with_rw_share_and_guest_mount() {
 /// MAC-1・IO-5・TASK-65.4: プローブ行は mount 報告の走査（`fandhe-guest:`）に誤認されない。
 #[test]
 fn mac1_io5_probe_prefix_does_not_overlap_mount_report_prefix() {
+    assert!(PROBE_PREFIX.starts_with(PROBE_NAMESPACE));
+    assert!(!PROBE_NAMESPACE.starts_with(guest_mount::REPORT_PREFIX));
+    assert!(!guest_mount::REPORT_PREFIX.starts_with(PROBE_NAMESPACE));
     assert!(!PROBE_PREFIX.starts_with(guest_mount::REPORT_PREFIX));
     assert!(!guest_mount::REPORT_PREFIX.starts_with(PROBE_PREFIX));
     for line in [
@@ -517,33 +549,54 @@ fn mac1_io5_parse_probe_line_cases() {
     let pre = PROBE_PREFIX;
     assert_eq!(
         p(&format!("{pre}op=read value=tok1")),
-        Some(ProbeItem::Read("tok1".into()))
+        ProbeLine::Item(ProbeItem::Read("tok1".into()))
     );
     assert_eq!(
         p(&format!("{pre}op=readdir entries=a-1,b-1,c-1")),
-        Some(ProbeItem::Readdir("a-1,b-1,c-1".into()))
+        ProbeLine::Item(ProbeItem::Readdir("a-1,b-1,c-1".into()))
     );
     assert_eq!(
         p(&format!("{pre}op=write result=done")),
-        Some(ProbeItem::Write)
+        ProbeLine::Item(ProbeItem::Write)
     );
     assert_eq!(
         p(&format!("{pre}op=readdir result=error")),
-        Some(ProbeItem::OpError("readdir".into()))
+        ProbeLine::Item(ProbeItem::OpError("readdir".into()))
     );
-    assert_eq!(p(&format!("{pre}done")), Some(ProbeItem::Done));
+    assert_eq!(p(&format!("{pre}done")), ProbeLine::Item(ProbeItem::Done));
     // CRLF は許容する。
     assert_eq!(
         p(&format!("{pre}op=read value=tok1\r")),
-        Some(ProbeItem::Read("tok1".into()))
+        ProbeLine::Item(ProbeItem::Read("tok1".into()))
     );
-    // 行頭以外に現れた接頭辞は無視する。
-    assert_eq!(p(&format!("x {pre}op=read value=tok1")), None);
-    // 上限超過・未知 op・空 value は無視する。
+    // 名前空間を持たない行・行頭以外に現れた接頭辞は無視する。
+    assert_eq!(p("[    0.1] virtio-fs: probe"), ProbeLine::Other);
+    assert_eq!(p(&format!("x {pre}op=read value=tok1")), ProbeLine::Other);
+    // 名前空間を持つが契約外の行は不正: 上限超過・未知 op・空 value・未知の field・
+    // done の後ろの余剰・版数違い・版数なし・非 UTF-8。
     let long = format!("{pre}op=read value={}", "a".repeat(MAX_PROBE_LINE_BYTES));
-    assert_eq!(p(&long), None);
-    assert_eq!(p(&format!("{pre}op=chmod result=error")), None);
-    assert_eq!(p(&format!("{pre}op=read value=")), None);
+    assert_eq!(p(&long), ProbeLine::Malformed);
+    assert_eq!(
+        p(&format!("{pre}op=chmod result=error")),
+        ProbeLine::Malformed
+    );
+    assert_eq!(p(&format!("{pre}op=chmod value=x")), ProbeLine::Malformed);
+    assert_eq!(p(&format!("{pre}op=read value=")), ProbeLine::Malformed);
+    assert_eq!(p(&format!("{pre}op=write result=ok")), ProbeLine::Malformed);
+    assert_eq!(p(&format!("{pre}op=read")), ProbeLine::Malformed);
+    assert_eq!(p(&format!("{pre}done now")), ProbeLine::Malformed);
+    assert_eq!(p(pre), ProbeLine::Malformed);
+    assert_eq!(
+        p("fandhe-guest-test: virtiofs-io v2 op=read value=tok1"),
+        ProbeLine::Malformed
+    );
+    assert_eq!(
+        p("fandhe-guest-test: virtiofs-io done"),
+        ProbeLine::Malformed
+    );
+    let mut non_utf8 = format!("{pre}op=read value=").into_bytes();
+    non_utf8.push(0xff);
+    assert_eq!(parse_probe_line(&non_utf8), ProbeLine::Malformed);
 }
 
 /// MAC-1・IO-5・TASK-65.4: 同じ op の重複報告は不正として扱う（fail-closed）。
@@ -600,6 +653,33 @@ fn mac1_io5_parse_probe_log_requires_done_last_and_complete() {
     // done 以降の後続報告（エラー含む）。
     let late = parse_probe_log(&format!("{body}{pre}done\n{pre}op=write result=error\n"));
     assert!(late.invalid);
+}
+
+/// MAC-1・IO-5・TASK-65.4: 復号できないプローブ行は done の前後とも不正（fail-closed）。
+#[test]
+fn mac1_io5_parse_probe_log_rejects_malformed_probe_lines() {
+    let pre = PROBE_PREFIX;
+    let body =
+        format!("{pre}op=read value=t\n{pre}op=readdir entries=a\n{pre}op=write result=done\n");
+    // 名前空間を持たない行は混ざっても有効のまま。
+    let noise = parse_probe_log(&format!(
+        "[    0.1] boot\n{body}random output\n{pre}done\nreboot: Power down\n"
+    ));
+    assert_eq!(noise.read.as_deref(), Some("t"));
+    assert_eq!(noise.readdir.as_deref(), Some("a"));
+    assert!(noise.write_done && noise.done && !noise.invalid);
+    // done の後の未知 op・形式崩れ・版数違い。
+    for late in [
+        format!("{pre}op=chmod result=error"),
+        format!("{pre}op=read value="),
+        "fandhe-guest-test: virtiofs-io v2 done".to_string(),
+    ] {
+        let log = parse_probe_log(&format!("{body}{pre}done\n{late}\n"));
+        assert!(log.done && log.invalid, "after done: {late}");
+    }
+    // done の前に現れた形式崩れも、他の報告が揃っていても不正。
+    let early = parse_probe_log(&format!("{pre}op=write result=ok\n{body}{pre}done\n"));
+    assert!(early.done && early.write_done && early.invalid);
 }
 
 /// MAC-1・IO-5・TASK-65.4: 不足と余剰の両方を検出する。
@@ -736,7 +816,7 @@ fn mac1_io5_virtiofs_read_on_real_macos() {
     );
     assert!(
         !o.log.invalid,
-        "duplicate probe reports:\n{}",
+        "invalid probe reports (duplicate, out of order or malformed):\n{}",
         o.console_tail
     );
 }
@@ -753,7 +833,7 @@ fn mac1_io5_virtiofs_write_on_real_macos() {
     );
     assert!(
         !o.log.invalid,
-        "duplicate probe reports:\n{}",
+        "invalid probe reports (duplicate, out of order or malformed):\n{}",
         o.console_tail
     );
     assert_eq!(
@@ -776,7 +856,7 @@ fn mac1_io5_virtiofs_readdir_on_real_macos() {
     );
     assert!(
         !o.log.invalid,
-        "duplicate probe reports:\n{}",
+        "invalid probe reports (duplicate, out of order or malformed):\n{}",
         o.console_tail
     );
     let reported = o.log.readdir.as_deref().unwrap_or_else(|| {

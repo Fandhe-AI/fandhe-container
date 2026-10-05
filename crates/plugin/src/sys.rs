@@ -14,6 +14,8 @@
 //! - macOS: `getpeereid(2)`（TASK-124.2・#293。`LOCAL_PEERCRED` の `struct xucred` を自前で写さず libSystem の
 //!   安定 ABI に乗り、arch 依存定数を持たないため `target_arch` 分岐は不要。Linux の `SO_PEERCRED` と同じ
 //!   「接続時点の実効 uid」を返す共通インターフェース）
+//! - macOS: `fstatat(2)`（`AT_SYMLINK_NOFOLLOW`）で、検証済みディレクトリ fd 基準の socket・ロックファイルの識別情報
+//!   （dev・ino・uid・種別・mtime）を取得する（パスを再解決しない。#1307・PLUG-12。`lstat_at` の macOS 経路）
 //! - Linux・macOS: `fchmodat(2)`（`AT_SYMLINK_NOFOLLOW`。Linux の `fchmodat2` 非対応環境は `O_PATH` fd 経由へ縮退）を
 //!   検証済みディレクトリ fd 基準で呼ぶ（パス再解決による TOCTOU を避ける。PLUG-12）。それ以外の unix は
 //!   `mode_t` の幅・`AT_SYMLINK_NOFOLLOW` の値を持たないため `fchmodat` を呼ばず `Unsupported`（fail-closed。#1308）
@@ -342,6 +344,118 @@ fn statx_ident(dirfd: i32, name: &CStr, flags: i32) -> io::Result<FileIdent> {
     })
 }
 
+/// macOS の `struct stat`（64 bit inode 版。`<sys/stat.h>` の `__DARWIN_STRUCT_STAT64`）と `fstatat(2)` の宣言。
+///
+/// レイアウトは x86_64・aarch64 とも LP64 で同一。差はシンボル名のみで、x86_64 は 32 bit inode 版との
+/// 互換のため `fstatat$INODE64`、aarch64 は `fstatat`（`crates/platform-macos/src/sys/mount.rs` の
+/// `statfs` と同じ流儀）。参照元: apple-oss-distributions/xnu `bsd/sys/stat.h`。
+#[cfg(target_os = "macos")]
+mod stat_abi {
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    compile_error!("macOS の struct stat レイアウトは x86_64 / aarch64 のみ確認済み（#1307）");
+
+    /// `struct timespec`（`time_t` = `long` と `long`。16 バイト）。
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct Timespec {
+        pub tv_sec: i64,
+        pub tv_nsec: i64,
+    }
+
+    // 未参照のフィールドは、カーネルが書き込む `struct stat` の配置（サイズ・offset）を写すために残す。
+    #[repr(C)]
+    #[allow(dead_code)]
+    pub(super) struct Stat {
+        pub st_dev: i32,
+        pub st_mode: u16,
+        pub st_nlink: u16,
+        pub st_ino: u64,
+        pub st_uid: u32,
+        pub st_gid: u32,
+        pub st_rdev: i32,
+        pub st_atimespec: Timespec,
+        pub st_mtimespec: Timespec,
+        pub st_ctimespec: Timespec,
+        pub st_birthtimespec: Timespec,
+        pub st_size: i64,
+        pub st_blocks: i64,
+        pub st_blksize: i32,
+        pub st_flags: u32,
+        pub st_gen: u32,
+        pub st_lspare: i32,
+        pub st_qspare: [i64; 2],
+    }
+    const _: () = assert!(core::mem::size_of::<Stat>() == 144);
+    const _: () = assert!(core::mem::align_of::<Stat>() == 8);
+    const _: () = assert!(core::mem::offset_of!(Stat, st_ino) == 8);
+    const _: () = assert!(core::mem::offset_of!(Stat, st_atimespec) == 32);
+    const _: () = assert!(core::mem::offset_of!(Stat, st_mtimespec) == 48);
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: `int fstatat(int, const char *, struct stat *, int)` と同じ
+        // 型・幅。`Stat` は 64 bit inode 版の `struct stat`（上の assert でサイズを固定）で、x86_64 は
+        // `$INODE64` 版のシンボルを選ぶ（32 bit inode 版を呼ぶとレイアウトが食い違うため必須）。
+        #[cfg_attr(target_arch = "x86_64", link_name = "fstatat$INODE64")]
+        pub(super) fn fstatat(
+            dirfd: i32,
+            path: *const core::ffi::c_char,
+            buf: *mut Stat,
+            flags: i32,
+        ) -> i32;
+    }
+}
+
+/// `fstatat(dirfd, name, flags)` を呼び、識別情報へ変換する（macOS のみ。`lstat_at` から呼ばれる）。
+///
+/// `flags` に `AT_SYMLINK_NOFOLLOW` を渡すと symlink 自体の情報を返す。
+#[cfg(target_os = "macos")]
+fn fstatat_ident(dirfd: i32, name: &CStr, flags: i32) -> io::Result<FileIdent> {
+    let zero = stat_abi::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut st = stat_abi::Stat {
+        st_dev: 0,
+        st_mode: 0,
+        st_nlink: 0,
+        st_ino: 0,
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        st_atimespec: zero,
+        st_mtimespec: zero,
+        st_ctimespec: zero,
+        st_birthtimespec: zero,
+        st_size: 0,
+        st_blocks: 0,
+        st_blksize: 0,
+        st_flags: 0,
+        st_gen: 0,
+        st_lspare: 0,
+        st_qspare: [0; 2],
+    };
+    // SAFETY: `dirfd` は呼び出し側が借用中の開いた fd。`name` は NUL 終端の有効な C 文字列。
+    // `st` はスタック上の 144 バイトの `#[repr(C)]` 領域で、カーネルが書き込むサイズと一致（assert で固定）。
+    // ポインタは呼び出しの間だけ有効で、保持しない。
+    let rc = unsafe { stat_abi::fstatat(dirfd, name.as_ptr(), &raw mut st, flags) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(FileIdent {
+        // std の `MetadataExt::dev()`（`st_dev as u64`＝`i32` からの符号拡張）と同じ変換。
+        // `names_open_file` が fd 側の `file.metadata().dev()` と比較するため、ゼロ拡張だと
+        // 高位ビットが立つ `dev_t` で常に不一致になる。
+        dev: i64::from(st.st_dev) as u64,
+        ino: st.st_ino,
+        uid: st.st_uid,
+        is_socket: u32::from(st.st_mode) & 0o170000 == 0o140000,
+        is_symlink: u32::from(st.st_mode) & 0o170000 == 0o120000,
+        mtime_sec: st.st_mtimespec.tv_sec,
+        mtime_nsec: u32::try_from(st.st_mtimespec.tv_nsec)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?,
+    })
+}
+
 /// `statx` の `AT_EMPTY_PATH`（fd 自体を対象にする。Linux の全アーキテクチャで共通値）。
 #[cfg(target_os = "linux")]
 const AT_EMPTY_PATH: i32 = 0x1000;
@@ -351,15 +465,11 @@ const AT_EMPTY_PATH: i32 = 0x1000;
 ///
 /// bind ロックの取得後・解放時に、ロックファイル名が「いま flock を持っている inode」をまだ指して
 /// いるかを確かめるために使う（保持者が解放時に unlink した古い inode を掴んだ取得者を弾く。
-/// PLUG-12・TASK-123.2）。Linux は両方を `statx` で取得しパスを再解決しない。Linux 以外は
-/// [`lstat_at`] と同じく `fallback_path` の `symlink_metadata` へ縮退する。
-pub(crate) fn names_open_file(
-    dir: &File,
-    name: &CStr,
-    fallback_path: &std::path::Path,
-    file: &File,
-) -> io::Result<bool> {
-    let named = match lstat_at(dir, name, fallback_path) {
+/// PLUG-12・TASK-123.2）。名前側は [`lstat_at`]（Linux は `statx`・macOS は `fstatat`）、fd 側は
+/// `statx(AT_EMPTY_PATH)` / `fstat` で取得し、どちらもパスを再解決しない（#1307）。
+/// Linux・macOS 以外の unix は [`lstat_at`] が `Unsupported` を返すため `Err`（fail-closed）。
+pub(crate) fn names_open_file(dir: &File, name: &CStr, file: &File) -> io::Result<bool> {
+    let named = match lstat_at(dir, name) {
         Ok(i) => i,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
@@ -380,35 +490,25 @@ pub(crate) fn names_open_file(
 
 /// `dir` 基準で `name`（symlink を辿らない）の識別情報を返す。
 ///
-/// Linux は `statx(dirfd, name, AT_SYMLINK_NOFOLLOW)` でパスを再解決しない。Linux 以外の unix は
-/// アーキテクチャ別の `struct stat` を自前で持たないため `fallback_path` の `symlink_metadata` に
-/// 縮退する（残余: macOS ではパス再解決の競合窓が残る。ディレクトリ自体は 0700 の自 UID 所有で
-/// 同一 UID のみが差し替えられる。TASK-123・TASK-124 で fstatat 化を検討）。
-pub(crate) fn lstat_at(
-    dir: &File,
-    name: &CStr,
-    fallback_path: &std::path::Path,
-) -> io::Result<FileIdent> {
+/// 検証済みディレクトリ fd を基準にし、パスを再解決しない（PLUG-12・#1307）。`crate::uds_security`
+/// （既存エントリの検査・bind ロック）と `crate::transport`（bind 後の同一性確認・Drop の後始末）から呼ばれる。
+/// - Linux: `statx(dirfd, name, AT_SYMLINK_NOFOLLOW)`
+/// - macOS: `fstatat(dirfd, name, AT_SYMLINK_NOFOLLOW)`（[`fstatat_ident`]）
+/// - それ以外の unix: `Unsupported`（fail-closed。パス指定の `lstat` へ縮退しない。
+///   `open_dir_nofollow` も `Unsupported` を返すため、実運用ではここへ到達しない）
+pub(crate) fn lstat_at(dir: &File, name: &CStr) -> io::Result<FileIdent> {
     #[cfg(target_os = "linux")]
     {
-        let _ = fallback_path;
         statx_ident(dir.as_raw_fd(), name, AT_SYMLINK_NOFOLLOW)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        fstatat_ident(dir.as_raw_fd(), name, AT_SYMLINK_NOFOLLOW)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
         let _ = (dir, name);
-        let m = std::fs::symlink_metadata(fallback_path)?;
-        Ok(FileIdent {
-            dev: m.dev(),
-            ino: m.ino(),
-            uid: m.uid(),
-            is_socket: m.file_type().is_socket(),
-            is_symlink: m.file_type().is_symlink(),
-            mtime_sec: m.mtime(),
-            mtime_nsec: u32::try_from(m.mtime_nsec())
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?,
-        })
+        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
 
@@ -1237,6 +1337,114 @@ mod macos_tests {
         assert_eq!(peer_pid(&client).expect("client side"), std::process::id());
     }
 }
+/// macOS の `lstat_at` / `names_open_file`（`fstatat` 経路）の検証（PLUG-12・#1307）。
+#[cfg(all(test, target_os = "macos"))]
+mod macos_stat_tests {
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, symlink};
+    use std::os::unix::net::UnixListener;
+
+    /// 0700 の一時ディレクトリ（終了時に削除）。
+    struct Tmp(std::path::PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("fc-fstatat-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// PLUG-12: socket の dev・ino・uid・種別・mtime を、dir fd 基準で `symlink_metadata` と同じ値で返す。
+    #[test]
+    fn plug12_macos_lstat_at_returns_socket_identity_from_dir_fd() {
+        let t = Tmp::new("ident");
+        let _l = UnixListener::bind(t.0.join("s")).unwrap();
+        let dir = File::open(&t.0).unwrap();
+        let ident = lstat_at(&dir, c"s").unwrap();
+        let m = std::fs::symlink_metadata(t.0.join("s")).unwrap();
+        assert_eq!(ident.dev, m.dev());
+        assert_eq!(ident.ino, m.ino());
+        assert_eq!(ident.uid, m.uid());
+        assert_eq!(ident.uid, effective_uid());
+        assert_eq!(ident.mtime_sec, m.mtime());
+        assert_eq!(i64::from(ident.mtime_nsec), m.mtime_nsec());
+        assert!(ident.is_socket);
+        assert!(!ident.is_symlink);
+    }
+
+    /// PLUG-12: symlink は辿らず、リンク自身の情報を返す。
+    #[test]
+    fn plug12_macos_lstat_at_does_not_follow_symlink() {
+        let t = Tmp::new("link");
+        let _l = UnixListener::bind(t.0.join("s")).unwrap();
+        symlink("s", t.0.join("l")).unwrap();
+        let dir = File::open(&t.0).unwrap();
+        let ident = lstat_at(&dir, c"l").unwrap();
+        let target = std::fs::symlink_metadata(t.0.join("s")).unwrap();
+        assert!(ident.is_symlink);
+        assert!(!ident.is_socket);
+        assert_eq!(
+            ident.ino,
+            std::fs::symlink_metadata(t.0.join("l")).unwrap().ino()
+        );
+        assert_ne!(ident.ino, target.ino());
+    }
+
+    /// PLUG-12: dir fd を開いた後にディレクトリが rename されても、fd の指すディレクトリ内の
+    /// エントリを返す（元のパスに別の同名エントリがあっても再解決しない）。
+    #[test]
+    fn plug12_macos_lstat_at_is_relative_to_dir_fd_after_rename() {
+        let t = Tmp::new("rename");
+        let orig = t.0.join("d");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&orig)
+            .unwrap();
+        let _l = UnixListener::bind(orig.join("s")).unwrap();
+        let want = std::fs::symlink_metadata(orig.join("s")).unwrap().ino();
+        let dir = File::open(&orig).unwrap();
+        std::fs::rename(&orig, t.0.join("moved")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&orig)
+            .unwrap();
+        std::fs::write(orig.join("s"), b"x").unwrap();
+        let ident = lstat_at(&dir, c"s").unwrap();
+        assert_eq!(ident.ino, want);
+        assert!(ident.is_socket);
+    }
+
+    /// PLUG-12: 存在しない名前は `NotFound`。
+    #[test]
+    fn plug12_macos_lstat_at_missing_name_is_not_found() {
+        let t = Tmp::new("missing");
+        let dir = File::open(&t.0).unwrap();
+        let e = lstat_at(&dir, c"nope").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// PLUG-12: 名前が開いているファイルと同じ inode を指す場合だけ `true`。
+    #[test]
+    fn plug12_macos_names_open_file_matches_only_same_inode() {
+        let t = Tmp::new("names");
+        let dir = File::open(&t.0).unwrap();
+        let p = t.0.join("f");
+        std::fs::write(&p, b"a").unwrap();
+        let f = File::open(&p).unwrap();
+        assert!(names_open_file(&dir, c"f", &f).unwrap());
+        std::fs::remove_file(&p).unwrap();
+        assert!(!names_open_file(&dir, c"f", &f).unwrap());
+        std::fs::write(&p, b"b").unwrap();
+        assert!(!names_open_file(&dir, c"f", &f).unwrap());
+    }
+}
+
 // ---- macOS の常駐メモリ（RSS）取得（PLUG-8・PLUG-9。TASK-112.1・#265） ----
 
 /// 指定 pid の常駐メモリ量（バイト）を返す（macOS。libproc の `proc_pidinfo(PROC_PIDTASKINFO)`）。

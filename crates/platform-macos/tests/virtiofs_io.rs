@@ -334,26 +334,32 @@ struct EntriesMismatch {
     extra: BTreeSet<String>,
     /// 報告内で 2 回以上現れたエントリ（集合化で潰れるため別枠で検出する）。
     duplicate: BTreeSet<String>,
+    /// 空要素の数（`a,,b`・末尾 `,` 等。ゲストの報告形式の崩れとして余剰と同様に拒否する）。
+    empty: usize,
 }
 
-/// 期待集合と報告（カンマ区切り）を比較し、不足と余剰の両方を返す。
+/// 期待集合と報告（カンマ区切り）を比較し、不足・余剰・重複・空要素をすべて返す。
 fn compare_entries(expected: &BTreeSet<String>, reported: &str) -> Result<(), EntriesMismatch> {
     let mut got: BTreeSet<String> = BTreeSet::new();
     let mut duplicate: BTreeSet<String> = BTreeSet::new();
-    for e in reported.split(',').filter(|e| !e.is_empty()) {
-        if !got.insert(e.to_string()) {
+    let mut empty = 0usize;
+    for e in reported.split(',') {
+        if e.is_empty() {
+            empty += 1;
+        } else if !got.insert(e.to_string()) {
             duplicate.insert(e.to_string());
         }
     }
     let missing: BTreeSet<String> = expected.difference(&got).cloned().collect();
     let extra: BTreeSet<String> = got.difference(expected).cloned().collect();
-    if missing.is_empty() && extra.is_empty() && duplicate.is_empty() {
+    if missing.is_empty() && extra.is_empty() && duplicate.is_empty() && empty == 0 {
         Ok(())
     } else {
         Err(EntriesMismatch {
             missing,
             extra,
             duplicate,
+            empty,
         })
     }
 }
@@ -704,7 +710,7 @@ fn mac1_io5_parse_probe_log_rejects_malformed_probe_lines() {
     assert!(ok.done && !ok.invalid);
 }
 
-/// MAC-1・IO-5・TASK-65.4: 不足と余剰の両方を検出する。
+/// MAC-1・IO-5・TASK-65.4: 不足・余剰・重複・空要素をすべて検出する。
 #[test]
 fn mac1_io5_compare_entries_detects_missing_and_extra() {
     let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
@@ -715,7 +721,8 @@ fn mac1_io5_compare_entries_detects_missing_and_extra() {
         Err(EntriesMismatch {
             missing: set(&["c"]),
             extra: set(&[]),
-            duplicate: set(&[])
+            duplicate: set(&[]),
+            empty: 0
         })
     );
     assert_eq!(
@@ -723,7 +730,8 @@ fn mac1_io5_compare_entries_detects_missing_and_extra() {
         Err(EntriesMismatch {
             missing: set(&[]),
             extra: set(&["d"]),
-            duplicate: set(&[])
+            duplicate: set(&[]),
+            empty: 0
         })
     );
     assert_eq!(
@@ -731,7 +739,8 @@ fn mac1_io5_compare_entries_detects_missing_and_extra() {
         Err(EntriesMismatch {
             missing: set(&["b", "c"]),
             extra: set(&["x"]),
-            duplicate: set(&[])
+            duplicate: set(&[]),
+            empty: 0
         })
     );
     assert_eq!(
@@ -739,7 +748,8 @@ fn mac1_io5_compare_entries_detects_missing_and_extra() {
         Err(EntriesMismatch {
             missing: exp.clone(),
             extra: set(&[]),
-            duplicate: set(&[])
+            duplicate: set(&[]),
+            empty: 1
         })
     );
     assert_eq!(
@@ -747,9 +757,23 @@ fn mac1_io5_compare_entries_detects_missing_and_extra() {
         Err(EntriesMismatch {
             missing: set(&[]),
             extra: set(&[]),
-            duplicate: set(&["a"])
+            duplicate: set(&["a"]),
+            empty: 0
         })
     );
+    // 空要素（末尾・途中・先頭のカンマ）は他が一致していても不一致。
+    for (reported, empty) in [("a,b,c,", 1), ("a,,b,c", 1), (",a,b,c", 1), ("a,b,,c,", 2)] {
+        assert_eq!(
+            compare_entries(&exp, reported),
+            Err(EntriesMismatch {
+                missing: set(&[]),
+                extra: set(&[]),
+                duplicate: set(&[]),
+                empty
+            }),
+            "{reported}"
+        );
+    }
 }
 
 /// MAC-1・IO-5・TASK-65.4: fixture のレイアウト。

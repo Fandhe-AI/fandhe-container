@@ -227,6 +227,13 @@ struct ProbeLog {
     invalid: bool,
 }
 
+impl ProbeLog {
+    /// 指定 op の失敗報告（`result=error`）があるか。
+    fn has_error(&self, op: &str) -> bool {
+        self.errors.iter().any(|e| e == op)
+    }
+}
+
 /// ログ全体を畳み込む。op ごとの重複報告は `invalid`（fail-closed）。
 fn parse_probe_log(text: &str) -> ProbeLog {
     let mut out = ProbeLog::default();
@@ -254,21 +261,29 @@ fn parse_probe_log(text: &str) -> ProbeLog {
 struct EntriesMismatch {
     missing: BTreeSet<String>,
     extra: BTreeSet<String>,
+    /// 報告内で 2 回以上現れたエントリ（集合化で潰れるため別枠で検出する）。
+    duplicate: BTreeSet<String>,
 }
 
 /// 期待集合と報告（カンマ区切り）を比較し、不足と余剰の両方を返す。
 fn compare_entries(expected: &BTreeSet<String>, reported: &str) -> Result<(), EntriesMismatch> {
-    let got: BTreeSet<String> = reported
-        .split(',')
-        .filter(|e| !e.is_empty())
-        .map(str::to_string)
-        .collect();
+    let mut got: BTreeSet<String> = BTreeSet::new();
+    let mut duplicate: BTreeSet<String> = BTreeSet::new();
+    for e in reported.split(',').filter(|e| !e.is_empty()) {
+        if !got.insert(e.to_string()) {
+            duplicate.insert(e.to_string());
+        }
+    }
     let missing: BTreeSet<String> = expected.difference(&got).cloned().collect();
     let extra: BTreeSet<String> = got.difference(expected).cloned().collect();
-    if missing.is_empty() && extra.is_empty() {
+    if missing.is_empty() && extra.is_empty() && duplicate.is_empty() {
         Ok(())
     } else {
-        Err(EntriesMismatch { missing, extra })
+        Err(EntriesMismatch {
+            missing,
+            extra,
+            duplicate,
+        })
     }
 }
 
@@ -504,28 +519,40 @@ fn mac1_io5_compare_entries_detects_missing_and_extra() {
         compare_entries(&exp, "a,b"),
         Err(EntriesMismatch {
             missing: set(&["c"]),
-            extra: set(&[])
+            extra: set(&[]),
+            duplicate: set(&[])
         })
     );
     assert_eq!(
         compare_entries(&exp, "a,b,c,d"),
         Err(EntriesMismatch {
             missing: set(&[]),
-            extra: set(&["d"])
+            extra: set(&["d"]),
+            duplicate: set(&[])
         })
     );
     assert_eq!(
         compare_entries(&exp, "a,x"),
         Err(EntriesMismatch {
             missing: set(&["b", "c"]),
-            extra: set(&["x"])
+            extra: set(&["x"]),
+            duplicate: set(&[])
         })
     );
     assert_eq!(
         compare_entries(&exp, ""),
         Err(EntriesMismatch {
             missing: exp.clone(),
-            extra: set(&[])
+            extra: set(&[]),
+            duplicate: set(&[])
+        })
+    );
+    assert_eq!(
+        compare_entries(&exp, "a,a,b,c"),
+        Err(EntriesMismatch {
+            missing: set(&[]),
+            extra: set(&[]),
+            duplicate: set(&["a"])
         })
     );
 }
@@ -602,6 +629,11 @@ fn mac1_io5_verify_write_rejects_symlink_extra_entries_and_bad_content() {
 #[ignore = "requires real macOS 13+ with Virtualization.framework, a test binary codesigned with com.apple.security.virtualization, and a guest init implementing fandhe.virtiofs directives and the virtiofs-io probe; see AGENTS.md"]
 fn mac1_io5_virtiofs_read_on_real_macos() {
     let o = boot_and_probe("virtiofs-read");
+    assert!(
+        !o.log.has_error("read"),
+        "op=read reported result=error; console tail:\n{}",
+        o.console_tail
+    );
     assert_eq!(
         o.log.read.as_deref(),
         Some(o.fixture.read_value.as_str()),
@@ -622,8 +654,13 @@ fn mac1_io5_virtiofs_read_on_real_macos() {
 fn mac1_io5_virtiofs_write_on_real_macos() {
     let o = boot_and_probe("virtiofs-write");
     assert!(
-        o.log.write_done && !o.log.errors.iter().any(|e| e == "write"),
+        o.log.write_done && !o.log.has_error("write"),
         "op=write not reported done; console tail:\n{}",
+        o.console_tail
+    );
+    assert!(
+        !o.log.invalid,
+        "duplicate probe reports:\n{}",
         o.console_tail
     );
     assert_eq!(
@@ -639,6 +676,16 @@ fn mac1_io5_virtiofs_write_on_real_macos() {
 #[ignore = "requires real macOS 13+ with Virtualization.framework, a test binary codesigned with com.apple.security.virtualization, and a guest init implementing fandhe.virtiofs directives and the virtiofs-io probe; see AGENTS.md"]
 fn mac1_io5_virtiofs_readdir_on_real_macos() {
     let o = boot_and_probe("virtiofs-readdir");
+    assert!(
+        !o.log.has_error("readdir"),
+        "op=readdir reported result=error; console tail:\n{}",
+        o.console_tail
+    );
+    assert!(
+        !o.log.invalid,
+        "duplicate probe reports:\n{}",
+        o.console_tail
+    );
     let reported = o.log.readdir.as_deref().unwrap_or_else(|| {
         panic!(
             "op=readdir not reported; expected {:?}; console tail:\n{}",

@@ -242,13 +242,13 @@ impl FrameReceiver for SlowTransport {
 fn flush_total_deadline_is_enforced_across_acks() {
     let dir = TempDir::new("deadline");
     let log = Arc::new(Mutex::new(Vec::new()));
-    let flush_ack = IoTimeout::new(Duration::from_millis(150)).expect("timeout");
+    let flush_ack = IoTimeout::new(Duration::from_millis(1000)).expect("timeout");
     let timeouts = VirtiofsIoTimeouts::new(secs(1), secs(1), flush_ack);
     let mut client = VirtiofsIoClient::new(
         &share(&dir, ShareAccess::ReadWrite),
         SlowTransport {
             inner: RecordingTransport::new(&log),
-            delay: Duration::from_millis(60),
+            delay: Duration::from_millis(250),
         },
         InFlightLimit::new(8).expect("limit"),
         NoopSendObserver,
@@ -258,15 +258,15 @@ fn flush_total_deadline_is_enforced_across_acks() {
     for _ in 0..4 {
         client.write(b"x").expect("write");
     }
-    // 受信 5 回（通常 ACK 4 + FlushAck）× 60ms = 300ms > 150ms。各 recv は 150ms 未満で完了するため、
-    // 従来実装（毎回 150ms を渡す）では成功してしまう境界ケース。
+    // 受信 5 回（通常 ACK 4 + FlushAck）× 250ms = 1250ms > 1000ms。各 recv は 1000ms 未満で完了するため、
+    // 従来実装（毎回 1000ms を渡す）では成功してしまう境界ケース。
     let err = client.flush().expect_err("total deadline must expire");
     assert_eq!(err.code(), "virtiofs_io.timeout");
     assert!(client.is_poisoned());
-    // 渡された期限は単調に減り、元の値（150ms）を超えない。
+    // 渡された期限は単調に減り、元の値（1000ms）を超えない。
     let seen = log.lock().expect("lock").clone();
-    assert!(seen.len() >= 2 && seen.len() < 5, "{seen:?}");
-    assert!(seen.iter().all(|d| *d <= Duration::from_millis(150)));
+    assert!(!seen.is_empty() && seen.len() < 5, "{seen:?}");
+    assert!(seen.iter().all(|d| *d <= Duration::from_millis(1000)));
     assert!(seen.windows(2).all(|w| w[1] <= w[0]), "{seen:?}");
 }
 

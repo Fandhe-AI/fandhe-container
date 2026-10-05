@@ -103,9 +103,11 @@
 //!   listener の socket を残骸と誤認しうる。runtime directory は `XDG_RUNTIME_DIR`（tmpfs）等のローカル
 //!   ファイルシステムに置く前提である（その検出は未実装）。
 //! - bind との競合: 掃除は既存のロックファイルだけを開き、作成しない。bind 側は、自分が作成した直後の
-//!   ロックファイルを掃除が先にロックしていた場合に期限つき（合計 100 ms）で待って取り直す
+//!   ロックファイルを掃除が先にロックしていた場合に期限つき（1 回の取得につき 100 ms）で待って取り直す
 //!   （`crate::sys::lock_file_at`）。掃除が空のロックファイルを unlink した後に bind 側が古い inode を
-//!   掴んだ場合は、`acquire_bind_lock` が名前と inode の一致を確かめて作り直す。
+//!   掴んだ場合は、`acquire_bind_lock` が名前と inode の一致を確かめて作り直す。作り直すたびに同じ
+//!   待ちが起こりうるため、bind 1 回の待ちは最悪で作り直しの上限 8 回 × 100 ms（約 0.8 秒）になる。
+//!   この待ちは `call_once` の期限とは連動しない。
 //! - 削除を拒否する socket（symlink・他 UID 所有・socket 以外・記録なし／不一致）のロックファイルは、
 //!   記録も含めて変更・unlink しない（PLUG-12 の拒否対象を保持する）。
 //! - 列挙・判定・削除はすべて検証済みディレクトリ fd 基準で行い、パスを再解決しない（列挙は
@@ -204,10 +206,12 @@ impl OneShotSweep {
     /// 初期化経路が stderr へ出す（成功時は出さない。件数の記録は TASK-114 の core 側 proxy が
     /// [`RuntimeDir::sweep_one_shot_leftovers`] の結果から行う）。値は固定文字列・真偽値だけで、
     /// 外部入力（ファイル名等）を埋め込まない。`error_code` は掃除を始められなかった場合の機械可読な
-    /// `code`（ERR-1）、`incomplete` は列挙が途中で失敗した場合に `true`。
-    pub fn failure_json_line(error_code: Option<&'static str>, incomplete: bool) -> String {
+    /// `code`（ERR-1）、`incomplete` は列挙が途中で失敗した場合に `true`。`error_code` は任意の文字列
+    /// ではなく [`PluginErrorCode`] で受け、その固定の表記（英大文字と `_` のみ）だけを埋め込む
+    /// （エスケープが要る文字を渡せず、壊れた JSON を組み立てられない。REPAIR-2）。
+    pub fn failure_json_line(error_code: Option<PluginErrorCode>, incomplete: bool) -> String {
         let code = match error_code {
-            Some(c) => format!("\"{c}\""),
+            Some(c) => format!("\"{}\"", c.as_str()),
             None => "null".to_string(),
         };
         format!(
@@ -669,10 +673,7 @@ mod imp {
         match swept {
             Ok(out) if out.incomplete => Some(OneShotSweep::failure_json_line(None, true)),
             Ok(_) => None,
-            Err(e) => Some(OneShotSweep::failure_json_line(
-                Some(e.code().as_str()),
-                false,
-            )),
+            Err(e) => Some(OneShotSweep::failure_json_line(Some(e.code()), false)),
         }
     }
 
@@ -1317,7 +1318,9 @@ mod imp {
     /// symlink・他 UID 所有・通常ファイル以外は `PermissionDenied`（fail-closed）。
     ///
     /// 自分が作成した直後のロックファイルを掃除が先にロックしていた場合は、期限つきで待って取り直す
-    /// （`crate::sys::lock_file_at` の「作成直後の競合」。#1310）。
+    /// （`crate::sys::lock_file_at` の「作成直後の競合」。#1310）。待ちは取得 1 回につき 100 ms で、
+    /// 名前から外れた inode を掴むたびに作り直して取得し直すため、最悪は [`LOCK_ATTEMPTS`]（8 回）×
+    /// 100 ms（約 0.8 秒）になる。呼び出し側の期限（`call_once` の合計期限等）とは連動しない。
     pub(crate) fn acquire_bind_lock(
         dir: &File,
         name: &std::ffi::CStr,
@@ -1973,8 +1976,8 @@ mod imp {
             drop(lock);
         }
 
-        /// PLUG-12・REPAIR-5（#1310）: 作成直後に割り込んだ側がロックを解放しない場合、bind 側は 100 ms
-        /// （1 ms × 100 回）だけ待って `AlreadyExists` を返す（待ち続けない）。走査位置ヒント用の
+        /// PLUG-12・REPAIR-5（#1310）: 作成直後に割り込んだ側がロックを解放しない場合、bind 側は取得 1 回分の
+        /// 100 ms（1 ms × 100 回）だけ待って `AlreadyExists` を返す（待ち続けない）。走査位置ヒント用の
         /// `LockOpen::Create` は待たずに `WouldBlock` を返す。
         #[test]
         fn repair5_bind_lock_wait_after_create_is_bounded() {
@@ -2032,6 +2035,11 @@ mod imp {
             let e = err(
                 PluginErrorCode::Internal,
                 "failed to enumerate runtime directory",
+            );
+            assert_eq!(
+                OneShotSweep::failure_json_line(Some(PluginErrorCode::PermissionDenied), false),
+                "{\"op\":\"plugin.sweep_one_shot\",\"success\":false,\
+                 \"error_code\":\"PERMISSION_DENIED\",\"incomplete\":false}"
             );
             assert_eq!(
                 sweep_failure_log(Err(&e)).as_deref(),

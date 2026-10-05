@@ -648,8 +648,11 @@ pub(crate) enum LockOpen {
 }
 
 /// 自分が作成した直後のロックファイルを他者が先にロックしていた場合に、解放を待つ回数と間隔
-/// （合計 100 ms。REPAIR-5 の有限な待ち）。相手になるのは作成と `flock` の間に割り込んだ掃除で、
-/// 保持は 1 候補の判定の間だけなので通常は 1 回目の待ちで解放される。
+/// （[`lock_file_at`] の呼び出し 1 回につき合計 100 ms。REPAIR-5 の有限な待ち）。相手になるのは作成と
+/// `flock` の間に割り込んだ掃除で、保持は 1 候補の判定の間だけなので通常は 1 回目の待ちで解放される。
+/// 呼び出し側（`uds_security::acquire_bind_lock`）は、名前から外れた inode を掴むたびに作り直して
+/// 本関数を呼び直す（上限 8 回）ため、bind 1 回の待ちは最悪で 8 回 × 100 ms（約 0.8 秒）になる。
+/// 呼び出し側の期限（`call_once` の合計期限等）とは連動しない。
 const CREATED_LOCK_WAIT_ATTEMPTS: u32 = 100;
 const CREATED_LOCK_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 

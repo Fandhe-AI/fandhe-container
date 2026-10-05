@@ -1260,12 +1260,74 @@ mod tests {
         );
     }
 
-    /// #1311・PLUG-7: グループ送信失敗後に直接の子が回収済みなら、元のエラーを優先できるよう
-    /// `is_reaped` は真（解放済み pid を未回収として報告しない）。
+    /// #1311・PLUG-7・REPAIR-5: グループ送信失敗は後始末の成功に数えない（`is_reaped` は偽）。
     #[test]
-    fn plug7_group_kill_failed_counts_as_leader_reaped() {
+    fn plug7_group_kill_failed_is_not_a_successful_reap() {
         assert!(!Reap::GroupKillFailed.is_reaped());
         assert!(!Reap::Unreaped.is_reaped());
+        assert!(Reap::AlreadyReaped.is_reaped());
+    }
+
+    /// #1311・PLUG-7・REPAIR-5: 終了猶予超過後のグループ停止失敗は、未回収の子（`Unreaped`）へ畳まずに
+    /// 別の終了状況として保つ。
+    #[test]
+    fn plug7_termination_after_kill_keeps_group_kill_failure_distinct() {
+        assert_eq!(
+            termination_after_kill(Reap::GroupKillFailed),
+            OneShotTermination::GroupKillFailed
+        );
+        assert_eq!(
+            termination_after_kill(Reap::Unreaped),
+            OneShotTermination::Unreaped
+        );
+        assert_eq!(
+            termination_after_kill(Reap::AlreadyReaped),
+            OneShotTermination::Unreaped
+        );
+    }
+
+    /// #1311・PLUG-7・REPAIR-5: 応答後のグループ停止失敗は `group_kill_failed_error` で報告し、回収済みの
+    /// 子を「回収できなかった」とは報告しない（pid を含めず、報告済みの印も付けない）。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_group_kill_failure_after_response_is_not_reported_as_unreaped() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut guard = ChildGuard::new(child);
+        // グループ停止失敗の時点で直接の子は回収済み（`child` は `None`）。その状態を再現する。
+        assert_eq!(
+            guard.wait_or_kill(Duration::from_secs(5)),
+            OneShotTermination::Exited { code: Some(0) }
+        );
+        assert_eq!(guard.pid(), None);
+
+        let e = check_termination_after_response(&mut guard, OneShotTermination::GroupKillFailed)
+            .unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Internal);
+        assert_eq!(
+            e.message(),
+            "plugin process group could not be killed after the response; \
+             the direct child was reaped but descendant processes may remain"
+        );
+        assert!(!guard.reported_unreaped);
+
+        // 未回収の子は従来どおり別のメッセージで報告する（両者を取り違えない）。
+        let e =
+            check_termination_after_response(&mut guard, OneShotTermination::Unreaped).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Internal);
+        assert_eq!(
+            e.message(),
+            "plugin process could not be reaped after the response"
+        );
+        assert_eq!(
+            check_termination_after_response(&mut guard, OneShotTermination::Killed),
+            Ok(())
+        );
     }
 
     /// #1311・PLUG-7: 回収済みで `child` を手放した後は何も送らない（`AlreadyReaped`）。

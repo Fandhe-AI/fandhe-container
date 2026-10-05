@@ -635,6 +635,54 @@ mod tests {
         );
     }
 
+    /// #1311・PLUG-7・REPAIR-5: グループ停止に失敗したセッションの shutdown は、回収済みの子を
+    /// 「回収できなかった」と報告せず、グループ停止の失敗として報告する（pid を含めない）。
+    #[test]
+    fn plug7_resident_shutdown_reports_group_kill_failure_not_unreaped() {
+        // 子は回収済みで手放した状態（`fail_session` が `Reap::GroupKillFailed` を受けた後と同じ）。
+        let session = ResidentPlugin {
+            stream: None,
+            guard: ChildGuard {
+                child: None,
+                reported_unreaped: false,
+                leader_reaped: true,
+            },
+            capture: None,
+            state: ResidentState::GroupKillFailed,
+        };
+        assert_eq!(session.pid(), None);
+        let failure = session.shutdown().unwrap_err();
+        assert_eq!(failure.error().code(), PluginErrorCode::Internal);
+        assert_eq!(
+            failure.error().message(),
+            "plugin process group could not be killed after shutdown; \
+             the direct child was reaped but descendant processes may remain"
+        );
+        assert_eq!(failure.stderr(), &OneShotStderr::empty());
+    }
+
+    /// PLUG-7・REPAIR-5: 未回収（`Unreaped`）状態のセッションの shutdown は、従来どおり未回収として報告する
+    /// （グループ停止の失敗と取り違えない）。
+    #[test]
+    fn plug7_resident_shutdown_keeps_unreaped_report_distinct() {
+        let session = ResidentPlugin {
+            stream: None,
+            guard: ChildGuard {
+                child: None,
+                reported_unreaped: false,
+                leader_reaped: true,
+            },
+            capture: None,
+            state: ResidentState::Unreaped,
+        };
+        let failure = session.shutdown().unwrap_err();
+        assert_eq!(failure.error().code(), PluginErrorCode::Internal);
+        assert_eq!(
+            failure.error().message(),
+            "plugin process could not be reaped after shutdown"
+        );
+    }
+
     /// PLUG-7: socket ディレクトリが無ければ bind で失敗し、子は spawn されない（プログラム不在の
     /// `NotFound` ではなく bind 側のエラーになる）。
     #[test]

@@ -81,7 +81,7 @@
 //!   user namespace 外の uid は overflowuid として見え、不一致で拒否される（安全側）。
 //! - 同一 UID の別プロセスは脅威モデル外（第 1 層は 0700 の配置ディレクトリ）。
 //! - `unsafe` を含む取得処理は `crate::sys::peer_uid`（`sys` モジュール）に閉じる。
-//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。別 UID 接続拒否の結合試験は `tests/peer_auth.rs`（TASK-124.4・#295。実機前提の 2 件は人間が実行）。未実装は拒否の監査ログ（SEC-4）。
+//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。別 UID 接続拒否の結合試験は `tests/peer_auth.rs`（TASK-124.4・#295。実機前提の 2 件は人間が実行）。拒否 1 件ごとの監査イベント通知は `crate::audit`（TASK-124.5・#1388・SEC-4）。永続的な監査ログへの配線は core 側 proxy（TASK-114）で未実装（REPAIR-3）。
 //!
 //! # Windows に固有の peer 認証を持たない理由（WIN-1・PLUG-12。TASK-124.3・#294）
 //! 「未実装の残件」ではなく、設計上この crate に Win32 向け実装を置かない判断である。
@@ -189,20 +189,41 @@ fn peer_uid_matches(peer: u32, expected: u32) -> bool {
     peer == expected
 }
 
+/// 照合で拒否した結果（PLUG-12・SEC-4・TASK-124.5）。
+///
+/// `error` は呼び出し側へ返すエラー（UID 値を含まない固定文言。従来と同一）、`reason` / `peer_uid` は
+/// 監査イベント（`crate::audit::PeerAuthRejection`）の材料で、呼び出し側へは返さない。
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct PeerRejection {
+    pub(crate) reason: crate::audit::PeerAuthRejectReason,
+    /// 観測できた peer UID（取得失敗では `None`）。
+    pub(crate) peer_uid: Option<u32>,
+    pub(crate) error: PluginError,
+}
+
 /// 取得関数を差し替えられる検証本体（取得失敗の fail-closed をテストで再現するため。PLUG-12）。
 #[cfg(unix)]
 fn verify_peer_with(
     get: impl FnOnce() -> Result<u32, PluginError>,
     expected_uid: u32,
-) -> Result<(), PluginError> {
+) -> Result<(), PeerRejection> {
     // 取得失敗はそのまま伝播する（Ok にしない）。
-    let peer = get()?;
+    let peer = get().map_err(|error| PeerRejection {
+        reason: crate::audit::PeerAuthRejectReason::PeerUidUnavailable,
+        peer_uid: None,
+        error,
+    })?;
     if !peer_uid_matches(peer, expected_uid) {
         // メッセージは固定文字列で UID 値を含めない。
-        return Err(PluginError::new(
-            PluginErrorCode::PermissionDenied,
-            "peer credential does not match the current user",
-        ));
+        return Err(PeerRejection {
+            reason: crate::audit::PeerAuthRejectReason::UidMismatch,
+            peer_uid: Some(peer),
+            error: PluginError::new(
+                PluginErrorCode::PermissionDenied,
+                "peer credential does not match the current user",
+            ),
+        });
     }
     Ok(())
 }
@@ -210,12 +231,13 @@ fn verify_peer_with(
 /// 接続済み stream の peer uid を `expected_uid` と照合する（PLUG-12・TASK-124.1・#292）。
 ///
 /// `transport` の accept 直後・connect 直後（最初の read より前）から呼ばれる。Err なら呼び出し側が
-/// stream を drop して切断する。取得は `crate::sys::peer_uid`（Linux は SO_PEERCRED）。
+/// stream を drop して切断し、`PeerRejection` から監査イベントを通知して `error` を返す
+/// （TASK-124.5）。取得は `crate::sys::peer_uid`（Linux は SO_PEERCRED）。
 #[cfg(unix)]
 pub(crate) fn verify_peer(
     stream: &std::os::unix::net::UnixStream,
     expected_uid: u32,
-) -> Result<(), PluginError> {
+) -> Result<(), PeerRejection> {
     verify_peer_with(|| crate::sys::peer_uid(stream), expected_uid)
 }
 
@@ -1484,6 +1506,9 @@ mod tests {
     #[test]
     fn plug12_verify_peer_rejects_mismatched_uid_with_permission_denied() {
         let err = verify_peer_with(|| Ok(1001), 1000).unwrap_err();
+        assert_eq!(err.reason, crate::audit::PeerAuthRejectReason::UidMismatch);
+        assert_eq!(err.peer_uid, Some(1001));
+        let err = err.error;
         assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
         let msg = err.to_string();
         assert!(msg.contains("peer credential does not match the current user"));
@@ -1495,7 +1520,13 @@ mod tests {
     #[test]
     fn plug12_verify_peer_fails_closed_when_credential_unavailable() {
         for code in [PluginErrorCode::Internal, PluginErrorCode::Unimplemented] {
-            let err = verify_peer_with(|| Err(PluginError::new(code, "x")), 1000).unwrap_err();
+            let rej = verify_peer_with(|| Err(PluginError::new(code, "x")), 1000).unwrap_err();
+            assert_eq!(
+                rej.reason,
+                crate::audit::PeerAuthRejectReason::PeerUidUnavailable
+            );
+            assert_eq!(rej.peer_uid, None);
+            let err = rej.error;
             assert_eq!(err.code(), code);
         }
     }
@@ -1519,7 +1550,8 @@ mod tests {
                     },
                     expected,
                 )
-                .unwrap_err();
+                .unwrap_err()
+                .error;
                 assert_eq!(err.code(), code);
                 assert_ne!(err.code(), PluginErrorCode::PermissionDenied);
                 assert_eq!(err.message(), "failed to obtain peer credential");
@@ -1544,7 +1576,8 @@ mod tests {
         let me = crate::sys::effective_uid();
         assert!(verify_peer(&a, me).is_ok());
         let err = verify_peer(&a, me.wrapping_add(1)).unwrap_err();
-        assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+        assert_eq!(err.peer_uid, Some(me));
+        assert_eq!(err.error.code(), PluginErrorCode::PermissionDenied);
     }
 
     /// PLUG-12: 未設定・空・相対は FailedPrecondition（`/tmp` 等へ落とさない）。

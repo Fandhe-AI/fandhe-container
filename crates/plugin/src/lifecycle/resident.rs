@@ -342,7 +342,12 @@ impl ResidentPlugin {
                     "plugin exited before connecting",
                 )),
             };
-            listener.accept_peer_pid(left, child_pid, &mut check_child)
+            listener.accept_peer_pid(
+                left,
+                child_pid,
+                &mut check_child,
+                &mut crate::audit::StderrPeerAuthObserver,
+            )
         })();
         // 接続後は入口を残さない（socket を unlink する）。
         drop(listener);

@@ -874,7 +874,12 @@ fn exchange_and_reap(
                     "plugin exited before connecting",
                 )),
             };
-            listener.accept_peer_pid(left, child_pid, &mut check_child)?
+            listener.accept_peer_pid(
+                left,
+                child_pid,
+                &mut check_child,
+                &mut crate::audit::StderrPeerAuthObserver,
+            )?
         };
         stream.write_frame(request, rpc_timeout(remaining(deadline)?)?)?;
         stream.read_frame(rpc_timeout(remaining(deadline)?)?)
@@ -1241,13 +1246,23 @@ mod tests {
         let me = std::process::id();
         let _c = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
         let e = listener
-            .accept_peer_pid(Duration::from_millis(300), me.wrapping_add(1), &mut || None)
+            .accept_peer_pid(
+                Duration::from_millis(300),
+                me.wrapping_add(1),
+                &mut || None,
+                &mut crate::audit::NoopPeerAuthObserver,
+            )
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Timeout);
         let _c2 = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
         assert!(
             listener
-                .accept_peer_pid(Duration::from_secs(2), me, &mut || None)
+                .accept_peer_pid(
+                    Duration::from_secs(2),
+                    me,
+                    &mut || None,
+                    &mut crate::audit::NoopPeerAuthObserver,
+                )
                 .is_ok()
         );
         drop(listener);
@@ -1269,13 +1284,18 @@ mod tests {
         let mut calls = 0u32;
         let started = std::time::Instant::now();
         let e = listener
-            .accept_peer_pid(Duration::from_secs(10), me.wrapping_add(1), &mut || {
-                calls += 1;
-                Some(PluginError::new(
-                    PluginErrorCode::Unavailable,
-                    "child exited early",
-                ))
-            })
+            .accept_peer_pid(
+                Duration::from_secs(10),
+                me.wrapping_add(1),
+                &mut || {
+                    calls += 1;
+                    Some(PluginError::new(
+                        PluginErrorCode::Unavailable,
+                        "child exited early",
+                    ))
+                },
+                &mut crate::audit::NoopPeerAuthObserver,
+            )
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Unavailable);
         assert_eq!(calls, 1);

@@ -14,11 +14,12 @@
 //! PLUG-12 の peer 認証（TASK-124）は Linux の SO_PEERCRED（`uds_security::verify_peer`。TASK-124.1・#292）と
 //! macOS の `getpeereid` 経路（TASK-124.2・#293）が実装・検証済みで、
 //! 別 UID 接続拒否の結合試験（TASK-124.4・#295。実機前提の 2 件は人間が実行）も追加済みで、
-//! 残り（拒否の監査ログ）は未完了（Windows は WIN-1 により固有実装を持たない旨を `uds_security` に文書化済み。TASK-124.3・#294。TASK-108 ほか。REPAIR-3）。
+//! 拒否した接続の監査イベント通知（`audit`。TASK-124.5・#1388・SEC-4）も実装済みで、永続的な監査ログへの配線は core 側 proxy（TASK-114）で未実装（Windows は WIN-1 により固有実装を持たない旨を `uds_security` に文書化済み。TASK-124.3・#294。TASK-108 ほか。REPAIR-3）。
 //! 本体は G8（TASK-107 が crate 本体、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124）で
 //! 実装する。plugin 発見・登録（TASK-109）の成果物は `fandhe-container-core` 側に置かれ、本 crate ではない。
 //! PLUG-1 区分は core・plugin 双方が依存する境界基盤ライブラリ（crate-naming.md 決定 4）。
 
+pub mod audit;
 pub(crate) mod checksum;
 pub mod error;
 pub mod frame;
@@ -30,6 +31,11 @@ pub(crate) mod sys;
 pub mod transport;
 pub mod uds_security;
 
+pub use audit::{
+    JsonLinesPeerAuthObserver, MAX_PEER_AUTH_AUDIT_LOG_BUFFER_BYTES, NoopPeerAuthObserver,
+    PEER_AUTH_AUDIT_LOG_CAPACITY, PeerAuthObserver, PeerAuthOp, PeerAuthRejectReason,
+    PeerAuthRejection,
+};
 pub use error::{PLUGIN_ERROR_MESSAGE_MAX_BYTES, PluginError, PluginErrorCode};
 pub use frame::{
     CHECKSUM_LEN, FRAME_HEADER_LEN, Frame, FrameChecksum, FrameHeader, MAX_FRAME_LEN,

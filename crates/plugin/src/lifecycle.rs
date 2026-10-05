@@ -611,8 +611,9 @@ impl Drop for ChildGuard {
 
 /// プロセスグループへの `SIGKILL` 送信エラーのうち、グループに生存者がいないことを示すものか。
 ///
-/// `ESRCH`（グループが空）は正常。macOS はゾンビのみのグループで `EPERM` を返すため同様に許容する
-/// （同一ユーザーの生存者への送信は `EPERM` にならない）。`Unsupported` はグループ送信を持たない unix
+/// `ESRCH`（グループが空）は正常。`EPERM` は許容しない。macOS ではゾンビのみのグループでも
+/// 生存者への送信権限不足でも `EPERM` になり両者を区別できないため、孫の停止を保証できない失敗として
+/// 扱い、呼び出し側（`kill_and_reap`）が `GroupKillFailed` として報告する（PLUG-7・REPAIR-5）。`Unsupported` はグループ送信を持たない unix
 /// （Linux・macOS 以外）で、送信自体ができないことと直接の子の回収成否は別問題のため許容し、
 /// `Child::kill` による直接の子の kill・回収だけにフォールバックする（孫の回収は保証しない。この環境では
 /// 回収済みの pid を未回収として報告しない。PLUG-7・#1311）。それ以外（`InvalidInput` 等）は孫の停止を
@@ -623,14 +624,7 @@ fn group_kill_tolerated(e: &io::Error) -> bool {
     if e.kind() == io::ErrorKind::Unsupported {
         return true;
     }
-    #[cfg(target_os = "macos")]
-    const EPERM: i32 = 1;
-    match e.raw_os_error() {
-        Some(ESRCH) => true,
-        #[cfg(target_os = "macos")]
-        Some(EPERM) => true,
-        _ => false,
-    }
+    e.raw_os_error() == Some(ESRCH)
 }
 
 /// [`ChildGuard::kill_and_reap`] の結果。
@@ -1008,6 +1002,8 @@ mod tests {
             io::ErrorKind::Unsupported
         )));
         assert!(!group_kill_tolerated(&io::Error::from_raw_os_error(22)));
+        // EPERM は生存者への権限不足と区別できないため、どの OS でも失敗として扱う。
+        assert!(!group_kill_tolerated(&io::Error::from_raw_os_error(1)));
     }
 
     #[test]

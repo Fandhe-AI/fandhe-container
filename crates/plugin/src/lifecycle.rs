@@ -642,9 +642,11 @@ enum Reap {
 }
 
 impl Reap {
-    /// 子が残っていない（回収を確認できた）か。
+    /// 直接の子の回収とグループ停止の両方を確認できたか。`GroupKillFailed` は孫の停止を保証できない
+    /// ため偽（呼び出し側は [`group_kill_failed_error`] で後始末の失敗として報告する）。
+    #[cfg(test)]
     fn is_reaped(self) -> bool {
-        !matches!(self, Self::Unreaped)
+        matches!(self, Self::Reaped(_) | Self::AlreadyReaped)
     }
 }
 
@@ -910,11 +912,23 @@ fn spawn_plugin(
 /// 応答前の失敗経路で子を明示的に kill・回収する。回収を確認できなければ、元のエラーではなく
 /// 回収失敗（`Internal`）を返す（孤児の可能性を呼び出し側へ伝える。REPAIR-5・PLUG-7）。
 fn reap_after_failure(guard: &mut ChildGuard, error: PluginError) -> PluginError {
-    if guard.kill_and_reap().is_reaped() {
-        error
-    } else {
-        unreaped_error(guard, "a failed exchange")
+    match guard.kill_and_reap() {
+        Reap::Reaped(_) | Reap::AlreadyReaped => error,
+        Reap::GroupKillFailed => group_kill_failed_error("a failed exchange"),
+        Reap::Unreaped => unreaped_error(guard, "a failed exchange"),
     }
+}
+
+/// 直接の子は回収済みだが、プロセスグループ宛て SIGKILL が失敗し孫の停止を保証できないことを
+/// 伝えるエラー（`Internal`）。元のエラーに隠さず、後始末の失敗として呼び出し側へ返す
+/// （PLUG-7・REPAIR-5・#1311）。直接の子の pid は解放済みのため含めない。
+pub(crate) fn group_kill_failed_error(phase: &str) -> PluginError {
+    PluginError::new(
+        PluginErrorCode::Internal,
+        format!(
+            "plugin process group could not be killed after {phase}; the direct child was reaped but descendant processes may remain"
+        ),
+    )
 }
 
 /// 回収を確認できなかった子についてのエラー（`Internal`）。呼び出し側が未回収の子を特定できるよう
@@ -1218,7 +1232,7 @@ mod tests {
     /// `is_reaped` は真（解放済み pid を未回収として報告しない）。
     #[test]
     fn plug7_group_kill_failed_counts_as_leader_reaped() {
-        assert!(Reap::GroupKillFailed.is_reaped());
+        assert!(!Reap::GroupKillFailed.is_reaped());
         assert!(!Reap::Unreaped.is_reaped());
     }
 

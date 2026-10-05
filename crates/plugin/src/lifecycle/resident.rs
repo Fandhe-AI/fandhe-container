@@ -40,8 +40,8 @@
 
 use super::{
     ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotPlugin, OneShotStderr,
-    OneShotTermination, Reap, StderrCapture, classify_reaped, rpc_timeout, spawn_error,
-    stderr_channel, unreaped_error,
+    OneShotTermination, Reap, StderrCapture, classify_reaped, group_kill_failed_error, rpc_timeout,
+    spawn_error, stderr_channel, unreaped_error,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
@@ -467,11 +467,16 @@ impl ResidentPlugin {
                     original
                 }
             },
-            // 直接の子は回収済み（pid は解放済み）。孫の停止は保証できないが、未回収 pid として
-            // 報告せず元のエラーを返す（#1311・PLUG-7）。
-            Reap::AlreadyReaped | Reap::GroupKillFailed => {
+            Reap::AlreadyReaped => {
                 self.state = ResidentState::Killed;
                 original
+            }
+            // 直接の子は回収済み（pid は解放済みで報告しない）だが、孫の停止を保証できない。
+            // 元のエラーに隠さず後始末の失敗として返し、状態も `Unreaped` にして shutdown でも
+            // 失敗を報告する（#1311・PLUG-7・REPAIR-5）。
+            Reap::GroupKillFailed => {
+                self.state = ResidentState::Unreaped;
+                group_kill_failed_error("a failed call")
             }
             Reap::Unreaped => {
                 self.state = ResidentState::Unreaped;
@@ -531,10 +536,10 @@ fn not_running_error() -> PluginError {
 
 /// 起動失敗経路で子を kill・回収する。回収を確認できなければ元のエラーに代えて `Internal`。
 fn reap_after_failure(guard: &mut ChildGuard, error: PluginError) -> PluginError {
-    if guard.kill_and_reap().is_reaped() {
-        error
-    } else {
-        unreaped_error(guard, "a failed start")
+    match guard.kill_and_reap() {
+        Reap::Reaped(_) | Reap::AlreadyReaped => error,
+        Reap::GroupKillFailed => group_kill_failed_error("a failed start"),
+        Reap::Unreaped => unreaped_error(guard, "a failed start"),
     }
 }
 

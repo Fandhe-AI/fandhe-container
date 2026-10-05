@@ -184,8 +184,7 @@ pub fn measure_host_path_length(path: &Path) -> HostPathLength {
 ///   WIN-4 の「パス長は 260 文字以内を推奨」は、260 は許容・261 以上は超過とする
 ///   本関数の閾値に対応する。
 /// - io crate（本関数・本モジュール）はフラグの設定・読み取り・検証をしない。フラグの
-///   運用はセットアップ手順の担当で、TASK-68（`docs/setup/windows.md`・WIN-4）で
-///   文書化する予定であり、現時点では未実装（REPAIR-3）。
+///   運用手順は `docs/setup/windows.md`（TASK-68・WIN-4）に記載している。
 /// - [`CaseCollisionSet`] もフラグを観測しないため、フラグを設定したディレクトリでは
 ///   衝突検出は過検出側に倒れる（モジュール doc の「見逃しより過検出」の方針どおり）。
 ///

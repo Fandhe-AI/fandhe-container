@@ -276,8 +276,20 @@ fn win1_win2_shared_mount_on_real_wsl2() {
         Err(e) => {
             // 未解除のマウントが残っていれば回収する。
             let n = e.unreleased().map_or(0, |u| u.mounts().len());
-            if let Some(u) = e.unreleased() {
-                release_or_retain(u, timeout, &tmp.retain_flag(), tmp.path());
+            match e.unreleased() {
+                Some(u) => {
+                    release_or_retain(u, timeout, &tmp.retain_flag(), tmp.path());
+                }
+                None => {
+                    // 未解除の情報が無くても、`mount ownership unconfirmed` のようにマウントの
+                    // 残存を否定できない失敗がある。共有元のデータ消失を避けるため保持し、
+                    // 手動確認用にパスを出力する（fail-closed）。
+                    tmp.retain_flag().store(true, Ordering::SeqCst);
+                    eprintln!(
+                        "prepare failed without unreleased info; mounts may remain: source_root={}",
+                        tmp.path().display()
+                    );
+                }
             }
             panic!(
                 "prepare failed: code={} message={} unreleased={n}",

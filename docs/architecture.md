@@ -115,13 +115,15 @@ plugin 境界のワイヤー形式（別プロセス＋長さ接頭辞フレー�
 
 ### 現状（Cargo.toml の実測）
 
-2026-09-27 時点で、workspace 内 crate 間の依存辺は **0 件**である。19 crate＋`benches` はいずれも TASK-1.3 の雛形段階で、`[dependencies]` を持たない。確認コマンド:
+workspace 内 crate 間の依存辺は、実装が進んだ TASK から順に `Cargo.toml` へ追加されている（例: `cli` → `net`、`platform-macos` → `io`）。網羅的な一覧は下記の確認コマンドで取得する。
+
+確認コマンド:
 
 ```bash
 cargo metadata --format-version 1 --no-deps | jq '[.packages[] | {name, deps: [.dependencies[].name]}]'
 ```
 
-依存は各 TASK の実装が進むにつれて追加される。追加時は本節（「現状」）を更新する。
+依存は各 TASK の実装が進むにつれて追加される。追加時は「設計上の依存方向」の表を更新する。
 
 ### 設計上の依存方向
 
@@ -141,6 +143,7 @@ flowchart LR
     cli -.->|想定| oci
     cli -.->|想定| stack
     cli -->|確定| net
+    platform_macos -->|確定| io
     plugin_star["plugin-*（バイナリ群）"] -.->|想定| core
     core -.->|optional・plugin feature| plugin["plugin（境界基盤）"]
     stack -.->|想定| core
@@ -158,6 +161,7 @@ flowchart LR
 | `core` → `io` | `VolumeProvider`（core 実装）がデータパスで I/O 共有層を使う想定（D-14。G2/G3 で確定） | 想定 |
 | `cli` → `core` | 統一 CLI が実行層を呼ぶ想定（G6・TASK-79） | 想定 |
 | `cli` → `oci` | 統一 CLI がイメージ管理を呼ぶ想定（G6・TASK-79） | 想定 |
+| `platform-macos` → `io` | virtiofs 共有の I/O 共有プロトコルクライアント（`PipelineClient`）を使う（MAC-1・TASK-65.2。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド → core 側で、規則 2 の逆向きのため抵触しない | 確定 |
 | `cli` → `net` | `doctor` が br_netfilter・ホストの `ip filter FORWARD` policy の判定材料を net の読み取り照会（GETCHAIN）で取得する（NET-10・TASK-148.1。workspace 内 path 依存で実装済み。組み合わせ判定・警告・DOCKER-USER 案内・終了コードの評価層は TASK-148.2 で実装済み。CLI 配線は TASK-79） | 確定 |
 | `cli` → `stack` | 統一 CLI が TOML スキーマを呼ぶ想定（G6・TASK-155） | 想定 |
 | `plugin-*`（バイナリ群） → `core` | トレイト型（`ContainerRuntime` 等の共通型）を参照する想定（TASK-114〜118） | 想定 |

@@ -14,6 +14,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::config::ConfigError;
+use crate::virtiofs::VirtiofsIoError;
 use crate::vm::VmState;
 
 /// 失敗した操作の種別。
@@ -156,6 +157,8 @@ pub enum PlatformError {
     Config(ConfigError),
     /// VM ライフサイクルの失敗（`vm.*`）。
     Vm(VmError),
+    /// virtiofs の I/O 共有プロトコルクライアントの失敗（`virtiofs_io.*`。TASK-65.2）。
+    VirtiofsIo(VirtiofsIoError),
 }
 
 impl PlatformError {
@@ -164,6 +167,7 @@ impl PlatformError {
         match self {
             PlatformError::Config(e) => e.code(),
             PlatformError::Vm(e) => e.code(),
+            PlatformError::VirtiofsIo(e) => e.code(),
         }
     }
 
@@ -172,6 +176,7 @@ impl PlatformError {
         match self {
             PlatformError::Config(e) => e.message(),
             PlatformError::Vm(e) => e.message(),
+            PlatformError::VirtiofsIo(e) => e.message(),
         }
     }
 }
@@ -187,6 +192,7 @@ impl std::error::Error for PlatformError {
         match self {
             PlatformError::Config(e) => Some(e),
             PlatformError::Vm(e) => Some(e),
+            PlatformError::VirtiofsIo(e) => Some(e),
         }
     }
 }
@@ -200,6 +206,12 @@ impl From<ConfigError> for PlatformError {
 impl From<VmError> for PlatformError {
     fn from(e: VmError) -> Self {
         PlatformError::Vm(e)
+    }
+}
+
+impl From<VirtiofsIoError> for PlatformError {
+    fn from(e: VirtiofsIoError) -> Self {
+        PlatformError::VirtiofsIo(e)
     }
 }
 

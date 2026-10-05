@@ -16,6 +16,7 @@ fn plug5_ack_timeout_requires_unix_transport() {
     let err = UdsStream::connect(
         std::path::Path::new("s.sock"),
         std::time::Duration::from_secs(1),
+        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
     )
     .unwrap_err();
     assert_eq!(err.code(), PluginErrorCode::Unimplemented);
@@ -112,8 +113,18 @@ mod unix {
     fn assert_client_times_out(act: impl FnOnce(&mut UdsStream) + Send + 'static) {
         let dir = TempDir::new();
         let l = UdsListener::bind(&dir.sock()).unwrap();
-        let mut client = UdsStream::connect(l.path(), WAIT).unwrap();
-        let server = l.accept(WAIT).unwrap();
+        let mut client = UdsStream::connect(
+            l.path(),
+            WAIT,
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap();
+        let server = l
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         let (release, acted, done) = run_silent_server(server, act);
 
         let frame = encode_message(&request(42, "ping")).unwrap();

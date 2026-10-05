@@ -449,7 +449,12 @@ mod boundary {
 
     /// 子プロセスの本体。`socket` へ接続して [`serve_connection`] を回す。
     pub fn serve_socket(socket: &Path) -> Result<(), BenchError> {
-        let mut stream = UdsStream::connect(socket, SETUP_TIMEOUT).map_err(plugin_err)?;
+        let mut stream = UdsStream::connect(
+            socket,
+            SETUP_TIMEOUT,
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .map_err(plugin_err)?;
         serve_connection(&mut stream, &MockImageStore)
     }
 
@@ -512,7 +517,12 @@ mod boundary {
         let dir = TempDir::new()?;
         let listener = UdsListener::bind(&dir.path().join("s")).map_err(plugin_err)?;
         let child = PluginProcess::spawn(listener.path())?;
-        let mut stream = listener.accept(SETUP_TIMEOUT).map_err(plugin_err)?;
+        let mut stream = listener
+            .accept(
+                SETUP_TIMEOUT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .map_err(plugin_err)?;
         let result = measure_framed(&mut stream, trials, samples);
         drop(stream);
         // 計測失敗時は `child` の Drop で kill・wait される。
@@ -688,12 +698,19 @@ mod tests {
                     .map_err(|e| BenchError::new("bind", e.message()))?;
                 let sock = listener.path().to_path_buf();
                 let plugin = std::thread::spawn(move || {
-                    let mut st = UdsStream::connect(&sock, Duration::from_secs(5))
-                        .map_err(|e| BenchError::new("connect", e.message()))?;
+                    let mut st = UdsStream::connect(
+                        &sock,
+                        Duration::from_secs(5),
+                        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                    )
+                    .map_err(|e| BenchError::new("connect", e.message()))?;
                     serve_connection(&mut st, &MockImageStore)
                 });
                 let mut st = listener
-                    .accept(Duration::from_secs(5))
+                    .accept(
+                        Duration::from_secs(5),
+                        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                    )
                     .map_err(|e| BenchError::new("accept", e.message()))?;
                 let v = measure_framed(&mut st, 2, 5)?;
                 drop(st);
@@ -724,7 +741,12 @@ mod tests {
         let listener = UdsListener::bind(&dir.path().join("s")).unwrap();
         let sock = listener.path().to_path_buf();
         let client = std::thread::spawn(move || {
-            let mut st = UdsStream::connect(&sock, Duration::from_secs(5)).unwrap();
+            let mut st = UdsStream::connect(
+                &sock,
+                Duration::from_secs(5),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
             let req = ControlMessage::Request {
                 id: MessageId::new(1),
                 body: vec!["delete_images".to_string()],
@@ -735,7 +757,12 @@ mod tests {
             // サーバが拒否して閉じるまで保持する。
             std::thread::sleep(Duration::from_millis(200));
         });
-        let mut st = listener.accept(Duration::from_secs(5)).unwrap();
+        let mut st = listener
+            .accept(
+                Duration::from_secs(5),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         let err = serve_connection(&mut st, &MockImageStore).unwrap_err();
         assert_eq!(err.code, "protocol");
         client.join().unwrap();

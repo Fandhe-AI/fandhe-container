@@ -661,12 +661,17 @@ fn spawn_error(e: &io::Error) -> PluginError {
 /// plugin の stderr は親へ継承させず [`OneShotOutcome::stderr`] で返す。本関数が親の stderr へ出す
 /// 構造化ログには、plugin の stderr の内容は含めず件数のみ載せる。失敗時の内容が必要な呼び出し側は
 /// [`call_once_observed`] の [`OneShotRecord::stderr`] を使う。
+///
+/// `audit` は受付で拒否した接続（UID・pid の不一致・取得失敗）の監査イベントの受け手で、拒否 1 件に
+/// つき 1 回、同期で呼ばれる（PLUG-12・SEC-4・TASK-124.5）。必須で、既定の出力先は無い（出力・永続化は
+/// 呼び出し側の責務。`crate::audit` のモジュール doc）。
 pub fn call_once(
     plugin: &OneShotPlugin,
     request: &Frame,
     timeout: OneShotTimeout,
+    audit: &mut dyn crate::audit::PeerAuthObserver,
 ) -> Result<OneShotOutcome, PluginError> {
-    call_once_observed(plugin, request, timeout, &mut |record| {
+    call_once_observed(plugin, request, timeout, audit, &mut |record| {
         use std::io::Write;
         // 構造化ログ（JSON Lines）を stderr へ 1 行出す。書き込み失敗は呼び出し結果に影響させない。
         let _ = writeln!(io::stderr(), "{}", record.to_json_line());
@@ -722,15 +727,17 @@ impl OneShotRecord {
 /// [`call_once`] と同じ処理を行い、終了時に 1 件の [`OneShotRecord`] を `observer` へ渡す（REPAIR-4）。
 ///
 /// 成功・失敗のどの終了経路でも必ず 1 回だけ呼ばれる。`observer` は呼び出しスレッド上で同期的に
-/// 実行されるため、長時間ブロックしないこと。
+/// 実行されるため、長時間ブロックしないこと。`audit` は [`call_once`] と同じ（peer 認証の拒否イベントの
+/// 受け手。必須）。
 pub fn call_once_observed(
     plugin: &OneShotPlugin,
     request: &Frame,
     timeout: OneShotTimeout,
+    audit: &mut dyn crate::audit::PeerAuthObserver,
     observer: &mut dyn FnMut(&OneShotRecord),
 ) -> Result<OneShotOutcome, PluginError> {
     let start = Instant::now();
-    let (result, stderr) = call_once_inner(plugin, request, timeout);
+    let (result, stderr) = call_once_inner(plugin, request, timeout, audit);
     observer(&OneShotRecord {
         operation: "plugin.call_once",
         success: result.is_ok(),
@@ -751,6 +758,7 @@ fn call_once_inner(
     plugin: &OneShotPlugin,
     request: &Frame,
     timeout: OneShotTimeout,
+    audit: &mut dyn crate::audit::PeerAuthObserver,
 ) -> (
     Result<(Frame, OneShotTermination), PluginError>,
     OneShotStderr,
@@ -814,7 +822,7 @@ fn call_once_inner(
             return (Err(error), OneShotStderr::empty());
         }
     };
-    let result = exchange_and_reap(&mut guard, listener, request, deadline);
+    let result = exchange_and_reap(&mut guard, listener, request, deadline, audit);
     // 子の回収後に収集結果を受け取る。子が終了していれば書き込み端は閉じており即座に完了する。
     // 戻る時点で読み取りスレッドは停止している（停止を確認できなければ結果に記録する）。
     let stderr = capture.finish(ONE_SHOT_STDERR_DRAIN_TIMEOUT);
@@ -853,6 +861,7 @@ fn exchange_and_reap(
     listener: UdsListener,
     request: &Frame,
     deadline: Instant,
+    audit: &mut dyn crate::audit::PeerAuthObserver,
 ) -> Result<(Frame, OneShotTermination), PluginError> {
     // 受付・往復はブロック内で完結させ、抜けた時点で接続を閉じて子に EOF を見せる
     // （続けて listener を drop して socket を unlink してから終了を待つ）。
@@ -874,7 +883,7 @@ fn exchange_and_reap(
                     "plugin exited before connecting",
                 )),
             };
-            listener.accept_peer_pid(left, child_pid, &mut check_child)?
+            listener.accept_peer_pid(left, child_pid, &mut check_child, audit)?
         };
         stream.write_frame(request, rpc_timeout(remaining(deadline)?)?)?;
         stream.read_frame(rpc_timeout(remaining(deadline)?)?)
@@ -927,9 +936,13 @@ mod tests {
         let plugin = OneShotPlugin::new(abs.into(), vec![], dir).unwrap();
         let req = Frame::new(Vec::new()).unwrap();
         let mut records = Vec::new();
-        let r = call_once_observed(&plugin, &req, OneShotTimeout::default(), &mut |rec| {
-            records.push(rec.clone())
-        });
+        let r = call_once_observed(
+            &plugin,
+            &req,
+            OneShotTimeout::default(),
+            &mut crate::audit::NoopPeerAuthObserver,
+            &mut |rec| records.push(rec.clone()),
+        );
         assert!(r.is_err());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].operation, "plugin.call_once");
@@ -1239,15 +1252,35 @@ mod tests {
         let listener = UdsListener::bind(&dir.join("a.sock")).unwrap();
         let path = listener.path().to_path_buf();
         let me = std::process::id();
-        let _c = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
+        let _c = UdsStream::connect(
+            &path,
+            Duration::from_secs(2),
+            &mut crate::audit::NoopPeerAuthObserver,
+        )
+        .unwrap();
         let e = listener
-            .accept_peer_pid(Duration::from_millis(300), me.wrapping_add(1), &mut || None)
+            .accept_peer_pid(
+                Duration::from_millis(300),
+                me.wrapping_add(1),
+                &mut || None,
+                &mut crate::audit::NoopPeerAuthObserver,
+            )
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Timeout);
-        let _c2 = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
+        let _c2 = UdsStream::connect(
+            &path,
+            Duration::from_secs(2),
+            &mut crate::audit::NoopPeerAuthObserver,
+        )
+        .unwrap();
         assert!(
             listener
-                .accept_peer_pid(Duration::from_secs(2), me, &mut || None)
+                .accept_peer_pid(
+                    Duration::from_secs(2),
+                    me,
+                    &mut || None,
+                    &mut crate::audit::NoopPeerAuthObserver,
+                )
                 .is_ok()
         );
         drop(listener);
@@ -1265,17 +1298,27 @@ mod tests {
         let listener = UdsListener::bind(&dir.join("a.sock")).unwrap();
         let path = listener.path().to_path_buf();
         let me = std::process::id();
-        let _c = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
+        let _c = UdsStream::connect(
+            &path,
+            Duration::from_secs(2),
+            &mut crate::audit::NoopPeerAuthObserver,
+        )
+        .unwrap();
         let mut calls = 0u32;
         let started = std::time::Instant::now();
         let e = listener
-            .accept_peer_pid(Duration::from_secs(10), me.wrapping_add(1), &mut || {
-                calls += 1;
-                Some(PluginError::new(
-                    PluginErrorCode::Unavailable,
-                    "child exited early",
-                ))
-            })
+            .accept_peer_pid(
+                Duration::from_secs(10),
+                me.wrapping_add(1),
+                &mut || {
+                    calls += 1;
+                    Some(PluginError::new(
+                        PluginErrorCode::Unavailable,
+                        "child exited early",
+                    ))
+                },
+                &mut crate::audit::NoopPeerAuthObserver,
+            )
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Unavailable);
         assert_eq!(calls, 1);

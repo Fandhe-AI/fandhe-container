@@ -78,8 +78,8 @@
 //!   新しい削除規則は持たない。ロックを取れない（使用中）・symlink・他 UID 所有・記録が無い／不一致の
 //!   ものは削除しない。socket が消えて残ったロックファイルは `BindLock` の drop が unlink する。
 //! - 上限（REPAIR-5）: 処理する候補（上記の名前一致）は [`ONE_SHOT_SWEEP_MAX_ENTRIES`] 件まで、列挙する
-//!   エントリ総数は [`ONE_SHOT_SWEEP_MAX_SCAN`] 件まで（ヒントまでの読み飛ばしは別枠で
-//!   [`ONE_SHOT_SWEEP_MAX_SKIP`] 件まで）。列挙中は何も削除せず、候補名を集めてから処理する。対象外の名前は候補の件数に数えないため、先頭に
+//!   エントリ総数は [`ONE_SHOT_SWEEP_MAX_SCAN`] 件まで（ヒントまでの読み飛ばしは列挙数に数えず、ディレクトリ
+//!   末尾で止まるためコストはディレクトリの実サイズで有界）。列挙中は何も削除せず、候補名を集めてから処理する。対象外の名前は候補の件数に数えないため、先頭に
 //!   対象外ファイルが多くても後方の残骸が飢餓しない。上限で打ち切った場合は、次回の開始位置（読み飛ばす
 //!   エントリ数）を runtime directory 直下の走査位置ヒント（`fcsweep-cursor`。0600・排他 flock・best-effort）
 //!   へ保存し、次回の初期化はそこから走査する。ディレクトリ末尾まで走査し終えるとヒントを削除して先頭へ戻る
@@ -143,11 +143,6 @@ pub const ONE_SHOT_SWEEP_MAX_ENTRIES: usize = 256;
 /// 掃除で列挙するディレクトリエントリ総数の上限（対象外の名前を含む。REPAIR-5。#1310）。
 /// 巨大ディレクトリでの無制限な列挙を防ぐ安全上限で、候補の件数上限とは別に数える。
 pub const ONE_SHOT_SWEEP_MAX_SCAN: usize = 65_536;
-
-/// 走査位置ヒントまで読み飛ばすエントリ数の上限（REPAIR-5。#1310）。読み飛ばしも読み取りであり、
-/// 列挙分（[`ONE_SHOT_SWEEP_MAX_SCAN`]）と合わせて 1 回の初期化の総読み取り数を有限に保つ。
-/// これを超えるヒントは壊れた値として無視し、先頭から走査する。
-pub const ONE_SHOT_SWEEP_MAX_SKIP: usize = 1_048_576;
 
 /// 都度起動の残骸の掃除結果（#1310・PLUG-7）。呼び出し側（TASK-114）が構造化ログへ出す材料。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -297,8 +292,8 @@ pub(crate) use imp::{BindLock, acquire_bind_lock, clear_stale_socket};
 #[cfg(unix)]
 mod imp {
     use super::{
-        ONE_SHOT_SWEEP_MAX_ENTRIES, ONE_SHOT_SWEEP_MAX_SCAN, ONE_SHOT_SWEEP_MAX_SKIP, OneShotSweep,
-        RUNTIME_DIR_NAME, RuntimeDir, runtime_dir_base, validate_base,
+        ONE_SHOT_SWEEP_MAX_ENTRIES, ONE_SHOT_SWEEP_MAX_SCAN, OneShotSweep, RUNTIME_DIR_NAME,
+        RuntimeDir, runtime_dir_base, validate_base,
     };
     use crate::error::{PluginError, PluginErrorCode};
     use std::fs::{File, Metadata};
@@ -618,7 +613,6 @@ mod imp {
             dir_path,
             euid,
             ONE_SHOT_SWEEP_MAX_SCAN,
-            ONE_SHOT_SWEEP_MAX_SKIP,
             ONE_SHOT_SWEEP_MAX_ENTRIES,
         )
     }
@@ -703,10 +697,11 @@ mod imp {
 
     /// 上限を引数に取る [`sweep_one_shot`] の本体（テストで小さい上限を注入できるようにする）。
     ///
-    /// 走査は 2 段階: (1) 走査位置ヒントまで読み飛ばし（`max_skip` 件まで。超える値は壊れたヒントと
-    /// みなして先頭から）、そこから `max_scan` 件まで列挙して候補名だけを集める（この間は何も削除しない。
+    /// 走査は 2 段階: (1) 走査位置ヒントまで読み飛ばし（読み飛ばしは列挙数に数えない。ディレクトリ末尾で
+    /// 止まるため、改ざんされた巨大なヒントでもコストはディレクトリの実サイズで有界。上限で打ち切る
+    /// と後方へ進めなくなるため、ヒントの大きさでは弾かない）、そこから `max_scan` 件まで列挙して候補名だけを集める（この間は何も削除しない。
     /// 列挙中のディレクトリ変更で後続エントリが落ちないように）。(2) 集めた候補を処理する。読み飛ばしを
-    /// 含む 1 回の読み取りエントリ数は `max_skip + max_scan` 件以内（REPAIR-5）。上限で打ち切った場合は
+    /// 含む 1 回の読み取りエントリ数はディレクトリの実サイズ以内で、候補処理・列挙は `max_scan` 件以内（REPAIR-5）。上限で打ち切った場合は
     /// 次回の開始位置を保存し、末尾まで走査し終えたら 0 に戻す（#1310）。保存位置は、この回に削除した
     /// socket とロックファイル（候補 1 件につき最大 2 エントリ）の分だけ手前へ戻す。保守的に手前へ
     /// ずらすのは、再走査は無害（処理済みは消えている）だが、先へずれると未処理を飛ばすため。
@@ -714,7 +709,6 @@ mod imp {
         dir_path: &Path,
         euid: u32,
         max_scan: usize,
-        max_skip: usize,
         max_entries: usize,
     ) -> Result<OneShotSweep, PluginError> {
         use std::os::unix::ffi::OsStrExt;
@@ -723,12 +717,15 @@ mod imp {
         verify(&fstat(&dir)?, euid)?;
         let cursor = SweepCursor::open(&dir, euid);
         let hint = cursor.as_ref().map_or(0, |c| c.start);
-        let start = if hint > max_skip { 0 } else { hint };
+        let mut start = hint;
         let mut entries = std::fs::read_dir(&real).map_err(|e| map_io(&e))?;
         let mut out = OneShotSweep::default();
-        // 読み飛ばし（ディレクトリが縮んでいれば末尾で止まり、以降の列挙は空になる）。
+        // 読み飛ばし。ディレクトリ末尾まで進んでもヒントに届かない（縮んだ・改ざんされた）場合は、
+        // 先頭から走査し直す（前回の位置より後ろに何も無いため、先頭の取りこぼしを避ける）。
         for _ in 0..start {
             if entries.next().is_none() {
+                entries = std::fs::read_dir(&real).map_err(|e| map_io(&e))?;
+                start = 0;
                 break;
             }
         }
@@ -765,16 +762,31 @@ mod imp {
             candidates.push(name);
         }
         // 段階 2: 集めた候補を処理する。
+        // 実際に消えたエントリ数（socket・ロックファイル）だけ保存位置を手前へ戻す。削除できなかった
+        // 候補（使用中・削除根拠なし）は位置を戻さず、後方の残骸へ進めるようにする。
+        let mut removed_entries = 0usize;
         for name in &candidates {
             out.examined += 1;
+            let before = entry_count(&dir, name);
             sweep_one(&dir, name, euid, &mut out);
+            removed_entries += before.saturating_sub(entry_count(&dir, name));
         }
         if let Some(cursor) = &cursor {
-            let shift = candidates.len().saturating_mul(2);
-            cursor.store(&dir, next.saturating_sub(shift));
+            cursor.store(&dir, next.saturating_sub(removed_entries));
         }
         Ok(out)
     }
+    /// 候補の socket とそのロックファイルのうち、現在存在するエントリ数（0〜2）を返す。
+    fn entry_count(dir: &File, socket: &std::ffi::CStr) -> usize {
+        let mut lock = socket.to_bytes().to_vec();
+        lock.extend_from_slice(b".lock");
+        let lock_exists = std::ffi::CString::new(lock)
+            .ok()
+            .is_some_and(|l| !matches!(lstat_opt(dir, &l), Ok(None)));
+        let socket_exists = !matches!(lstat_opt(dir, socket), Ok(None));
+        usize::from(lock_exists) + usize::from(socket_exists)
+    }
+
     /// 1 つの候補を stale 削除と同じ手順で処理し、結果を `out` に数える。
     fn sweep_one(dir: &File, name: &std::ffi::CStr, euid: u32, out: &mut OneShotSweep) {
         let lock = match acquire_bind_lock(dir, name, euid) {
@@ -1255,7 +1267,7 @@ mod imp {
             let mut truncated_runs = 0;
             let mut finished = false;
             for _ in 0..20 {
-                let r = sweep_one_shot_limited(&base, euid, MAX_SCAN, 1024, 256).unwrap();
+                let r = sweep_one_shot_limited(&base, euid, MAX_SCAN, 256).unwrap();
                 truncated_runs += usize::from(r.truncated);
                 if !r.truncated {
                     finished = true;
@@ -1284,27 +1296,56 @@ mod imp {
             std::fs::write(&victim, b"precious data").unwrap();
             std::fs::hard_link(&victim, t.0.join(name)).unwrap();
             std::fs::write(t.0.join("oneshot-1-0.sock.lock"), b"").unwrap();
-            let r = sweep_one_shot_limited(&t.0, euid, 1024, 1024, 256).unwrap();
+            let r = sweep_one_shot_limited(&t.0, euid, 1024, 256).unwrap();
             assert!(!r.truncated);
             assert_eq!(std::fs::read(&victim).unwrap(), b"precious data");
             assert!(t.0.join(name).exists());
             // 単一リンクでも内容が形式外なら使わず、触れない。
             std::fs::remove_file(t.0.join(name)).unwrap();
             std::fs::write(t.0.join(name), b"not a hint").unwrap();
-            sweep_one_shot_limited(&t.0, euid, 1024, 1024, 256).unwrap();
+            sweep_one_shot_limited(&t.0, euid, 1024, 256).unwrap();
             assert_eq!(std::fs::read(t.0.join(name)).unwrap(), b"not a hint");
         }
 
-        /// REPAIR-5（#1310）: 読み飛ばし上限を超える（壊れた）ヒントは無視して先頭から走査する。
+        /// REPAIR-5・PLUG-7（#1310）: 削除できない候補（使用中）が上限を埋めても、保存位置は巻き戻らず
+        /// 後方の残骸へ複数回で到達する。
         #[test]
-        fn plug7_cursor_beyond_skip_limit_restarts_from_head() {
+        fn plug7_cursor_advances_past_undeletable_candidates() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let mut held = Vec::new();
+            for i in 0..4 {
+                let p = t.0.join(format!("oneshot-1-{i}.sock.lock"));
+                let f = std::fs::File::create(&p).unwrap();
+                f.lock().unwrap();
+                held.push(f);
+            }
+            for i in 0..12 {
+                std::fs::write(t.0.join(format!("other-{i}")), b"").unwrap();
+            }
+            let tail = t.0.join("oneshot-2-0.sock.lock");
+            std::fs::write(&tail, b"").unwrap();
+            for _ in 0..40 {
+                let r = sweep_one_shot_limited(&t.0, euid, 16, 2).unwrap();
+                if !r.truncated {
+                    break;
+                }
+            }
+            assert!(!tail.exists());
+            drop(held);
+        }
+
+        /// REPAIR-5（#1310）: ディレクトリ実サイズを超える巨大なヒントでも、読み飛ばしはディレクトリ末尾で
+        /// 止まり、有限時間で終わって走査完了（ヒント削除）に戻る。
+        #[test]
+        fn plug7_cursor_beyond_directory_size_terminates_and_resets() {
             let t = Tmp::new();
             let euid = crate::sys::effective_uid();
             let name = std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap();
             std::fs::write(t.0.join(name), b"999999999\n").unwrap();
             let lock = t.0.join("oneshot-1-0.sock.lock");
             std::fs::write(&lock, b"").unwrap();
-            let r = sweep_one_shot_limited(&t.0, euid, 1024, 16, 256).unwrap();
+            let r = sweep_one_shot_limited(&t.0, euid, 1024, 256).unwrap();
             assert_eq!(r.examined, 1);
             assert!(!lock.exists());
             assert!(!t.0.join(name).exists());

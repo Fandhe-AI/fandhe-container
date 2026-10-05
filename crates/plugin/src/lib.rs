@@ -52,6 +52,5 @@ pub use transport::{
     UDS_RPC_TIMEOUT_DEFAULT, UDS_RPC_TIMEOUT_MAX, UdsListener, UdsStream,
 };
 pub use uds_security::{
-    ONE_SHOT_SWEEP_MAX_ENTRIES, ONE_SHOT_SWEEP_MAX_SCAN, ONE_SHOT_SWEEP_MAX_SKIP, OneShotSweep,
-    RUNTIME_DIR_NAME, RuntimeDir,
+    ONE_SHOT_SWEEP_MAX_ENTRIES, ONE_SHOT_SWEEP_MAX_SCAN, OneShotSweep, RUNTIME_DIR_NAME, RuntimeDir,
 };

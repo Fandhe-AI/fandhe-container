@@ -35,7 +35,9 @@
 //! 指示を読んで `mount(2)` を実行し報告を出すゲスト init（TASK-64 の Rust 製 init）は本リポに未存在。
 //! 実機の end-to-end 検証は TASK-65.4。mount 後の再接続・エラー処理は TASK-65.5。
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
 use crate::config::ConfigError;
@@ -418,6 +420,7 @@ impl GuestMountTracker {
 pub fn await_guest_mounts(
     rx: &Receiver<ReportItem>,
     tracker: &mut GuestMountTracker,
+    overflow: &AtomicBool,
     timeout: Duration,
     poll_interval: Duration,
     mut is_alive: impl FnMut(Duration) -> Result<(), VmState>,
@@ -427,6 +430,10 @@ pub fn await_guest_mounts(
     }
     let deadline = Instant::now() + timeout;
     loop {
+        // 報告が溢れて破棄されたなら、成功報告の喪失（誤った timeout）や失敗報告の喪失を避けるため即失敗にする。
+        if overflow.load(Ordering::Acquire) {
+            return Err(overflow_error());
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(GuestMountError::Timeout {
@@ -437,7 +444,17 @@ pub fn await_guest_mounts(
         match rx.recv_timeout(remaining.min(poll_interval)) {
             Ok(item) => match tracker.apply(item) {
                 TrackerStatus::Pending => {}
-                TrackerStatus::AllMounted => return Ok(()),
+                TrackerStatus::AllMounted => {
+                    if overflow.load(Ordering::Acquire) {
+                        return Err(overflow_error());
+                    }
+                    // 成功確定前にも VM の稼働を確認する（停止済みなら成功を返さない）。
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    return match is_alive(remaining) {
+                        Ok(()) => Ok(()),
+                        Err(state) => Err(GuestMountError::VmStopped { state }),
+                    };
+                }
                 TrackerStatus::Failed(e) => return Err(e),
             },
             Err(RecvTimeoutError::Timeout) => {
@@ -454,18 +471,61 @@ pub fn await_guest_mounts(
     }
 }
 
+fn overflow_error() -> GuestMountError {
+    GuestMountError::InvalidReport {
+        reason: "report channel overflow".to_string(),
+    }
+}
+
+/// 書き出しスレッド側の報告送信口。チャネルが満杯で報告を捨てた場合は溢れフラグを立て、
+/// 待機側（[`await_guest_mounts`]）が起動を失敗にできるようにする。
+#[derive(Debug)]
+pub struct ReportSender {
+    tx: SyncSender<ReportItem>,
+    overflow: Arc<AtomicBool>,
+}
+
+impl ReportSender {
+    /// 送信側と溢れフラグから作る。
+    pub fn new(tx: SyncSender<ReportItem>, overflow: Arc<AtomicBool>) -> Self {
+        Self { tx, overflow }
+    }
+
+    /// 非ブロッキングで送る。満杯なら溢れフラグを立てる。受信側が破棄済みなら `false`。
+    pub fn deliver(&self, item: ReportItem) -> bool {
+        match self.tx.try_send(item) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                self.overflow.store(true, Ordering::Release);
+                true
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+}
+
 /// `Vm::launch` が待機に使う受信側と期待 tag 集合。
 #[derive(Debug)]
 pub struct GuestMountWatch {
     rx: Receiver<ReportItem>,
     expected: Vec<String>,
+    overflow: Arc<AtomicBool>,
 }
 
 impl GuestMountWatch {
     /// 報告チャネル（有界）を作り、書き出しスレッド用の送信側と待機用の watch を返す。
-    pub fn channel(expected: Vec<String>) -> (SyncSender<ReportItem>, GuestMountWatch) {
+    pub fn channel(expected: Vec<String>) -> (ReportSender, GuestMountWatch) {
         let (tx, rx) = sync_channel(MAX_VIRTIOFS_SHARES * 2);
-        (tx, GuestMountWatch { rx, expected })
+        let overflow = Arc::new(AtomicBool::new(false));
+        let sender = ReportSender::new(tx, Arc::clone(&overflow));
+        (
+            sender,
+            GuestMountWatch {
+                rx,
+                expected,
+                overflow,
+            },
+        )
     }
 
     /// 全共有の報告が揃うまで `timeout` を上限に待つ。受信側は返った時点で破棄される。
@@ -475,7 +535,14 @@ impl GuestMountWatch {
         is_alive: impl FnMut(Duration) -> Result<(), VmState>,
     ) -> Result<(), GuestMountError> {
         let mut tracker = GuestMountTracker::new(self.expected);
-        await_guest_mounts(&self.rx, &mut tracker, timeout, POLL_INTERVAL, is_alive)
+        await_guest_mounts(
+            &self.rx,
+            &mut tracker,
+            &self.overflow,
+            timeout,
+            POLL_INTERVAL,
+            is_alive,
+        )
     }
 }
 
@@ -823,13 +890,21 @@ mod tests {
     #[test]
     fn await_outcomes() {
         let alive = |_: Duration| Ok(());
+        let no_overflow = AtomicBool::new(false);
 
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         tx.send(ok_report("a")).unwrap();
         tx.send(ok_report("b")).unwrap();
         let mut t = tracker(&["a", "b"]);
         assert_eq!(
-            await_guest_mounts(&rx, &mut t, Duration::from_secs(5), TICK, alive),
+            await_guest_mounts(
+                &rx,
+                &mut t,
+                &no_overflow,
+                Duration::from_secs(5),
+                TICK,
+                alive
+            ),
             Ok(())
         );
 
@@ -837,7 +912,14 @@ mod tests {
         tx.send(ok_report("a")).unwrap();
         let mut t = tracker(&["a", "b"]);
         assert_eq!(
-            await_guest_mounts(&rx, &mut t, Duration::from_millis(100), TICK, alive),
+            await_guest_mounts(
+                &rx,
+                &mut t,
+                &no_overflow,
+                Duration::from_millis(100),
+                TICK,
+                alive
+            ),
             Err(GuestMountError::Timeout {
                 after: Duration::from_millis(100),
                 pending: vec!["b".into()]
@@ -846,9 +928,14 @@ mod tests {
 
         let mut t = tracker(&["a"]);
         assert_eq!(
-            await_guest_mounts(&rx, &mut t, Duration::from_secs(5), TICK, |_| Err(
-                VmState::Stopped
-            )),
+            await_guest_mounts(
+                &rx,
+                &mut t,
+                &no_overflow,
+                Duration::from_secs(5),
+                TICK,
+                |_| Err(VmState::Stopped)
+            ),
             Err(GuestMountError::VmStopped {
                 state: VmState::Stopped
             })
@@ -857,7 +944,14 @@ mod tests {
         drop(tx);
         let mut t = tracker(&["a", "b"]);
         assert_eq!(
-            await_guest_mounts(&rx, &mut t, Duration::from_secs(5), TICK, alive),
+            await_guest_mounts(
+                &rx,
+                &mut t,
+                &no_overflow,
+                Duration::from_secs(5),
+                TICK,
+                alive
+            ),
             Err(GuestMountError::ReportChannelClosed)
         );
     }
@@ -866,7 +960,35 @@ mod tests {
     #[test]
     fn watch_waits_for_expected_tags() {
         let (tx, watch) = GuestMountWatch::channel(vec!["a".into()]);
-        tx.send(ok_report("a")).unwrap();
+        assert!(tx.deliver(ok_report("a")));
         assert_eq!(watch.wait(Duration::from_secs(5), |_| Ok(())), Ok(()));
+    }
+
+    /// MAC-1・REPAIR-5・TASK-65.3: 報告がチャネルから溢れたら待機は即失敗する（報告の黙殺で誤 timeout にしない）。
+    #[test]
+    fn watch_fails_on_report_overflow() {
+        let (tx, watch) = GuestMountWatch::channel(vec!["a".into()]);
+        for _ in 0..(MAX_VIRTIOFS_SHARES * 2 + 1) {
+            assert!(tx.deliver(ok_report("zzz")));
+        }
+        assert_eq!(
+            watch.wait(Duration::from_secs(5), |_| Ok(())),
+            Err(GuestMountError::InvalidReport {
+                reason: "report channel overflow".into()
+            })
+        );
+    }
+
+    /// MAC-1・TASK-65.3: 全共有 mount 済みでも VM が停止していれば成功にしない。
+    #[test]
+    fn all_mounted_but_vm_stopped_fails() {
+        let (tx, watch) = GuestMountWatch::channel(vec!["a".into()]);
+        assert!(tx.deliver(ok_report("a")));
+        assert_eq!(
+            watch.wait(Duration::from_secs(5), |_| Err(VmState::Stopped)),
+            Err(GuestMountError::VmStopped {
+                state: VmState::Stopped
+            })
+        );
     }
 }

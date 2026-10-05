@@ -1760,7 +1760,7 @@ impl VmConfigSpec {
     #[cfg(unix)]
     pub fn open_serial_console_with_reports(
         &self,
-        reports: Option<std::sync::mpsc::SyncSender<crate::guest_mount::ReportItem>>,
+        reports: Option<crate::guest_mount::ReportSender>,
     ) -> Result<Option<crate::console_log::ConsoleLogSink>, ConfigError> {
         use crate::console_log::{ConsoleLogSink, MAX_CONSOLE_LOG_BYTES, SpawnError};
         let Some(SerialConsoleSink::LogFile(log)) = self.devices.serial_console() else {

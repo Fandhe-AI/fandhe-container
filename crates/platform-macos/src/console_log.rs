@@ -31,10 +31,10 @@
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use crate::guest_mount::{ReportItem, ReportScanner};
+use crate::guest_mount::{ReportScanner, ReportSender};
 
 /// コンソールログのゲスト出力の上限（バイト。ファイル長で数える）。
 ///
@@ -295,7 +295,7 @@ impl ConsoleLogSink {
     pub(crate) fn spawn(
         file: File,
         cap: u64,
-        reports: Option<SyncSender<ReportItem>>,
+        reports: Option<ReportSender>,
     ) -> Result<ConsoleLogSink, SpawnError> {
         match file.try_lock() {
             Ok(()) => {}
@@ -317,8 +317,8 @@ impl ConsoleLogSink {
                     };
                     let mut disconnected = false;
                     scanner.feed(chunk, &mut |item| {
-                        // 満杯なら捨てる（待機側は期限で失敗する）。切断されたら以後は走査しない。
-                        if let Err(TrySendError::Disconnected(_)) = tx.try_send(item) {
+                        // 満杯なら溢れフラグを立てる（待機側が起動を失敗にする）。切断されたら以後は走査しない。
+                        if !tx.deliver(item) {
                             disconnected = true;
                         }
                     });
@@ -784,7 +784,12 @@ mod tests {
         use crate::virtiofs::VirtiofsTag;
         let t = TempFile::new("report", b"");
         let (tx, rx) = mpsc::sync_channel(4);
-        let mut sink = ConsoleLogSink::spawn(t.append_handle(), 100, Some(tx)).unwrap();
+        let mut sink = ConsoleLogSink::spawn(
+            t.append_handle(),
+            100,
+            Some(ReportSender::new(tx, Default::default())),
+        )
+        .unwrap();
         sink.writer().write_all(&[b'z'; 4096]).unwrap();
         sink.writer()
             .write_all(b"\nfandhe-guest: virtiofs-mount v1 tag=data result=ok\r\n")
@@ -807,7 +812,12 @@ mod tests {
     fn sink_survives_dropped_report_receiver() {
         let t = TempFile::new("report-drop", b"");
         let (tx, rx) = mpsc::sync_channel(1);
-        let mut sink = ConsoleLogSink::spawn(t.append_handle(), 1000, Some(tx)).unwrap();
+        let mut sink = ConsoleLogSink::spawn(
+            t.append_handle(),
+            1000,
+            Some(ReportSender::new(tx, Default::default())),
+        )
+        .unwrap();
         drop(rx);
         let line = b"fandhe-guest: virtiofs-mount v1 tag=data result=ok\n";
         sink.writer().write_all(line).unwrap();

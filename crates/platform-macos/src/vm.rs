@@ -881,7 +881,7 @@ mod mac {
                 .timeouts
                 .state_query()
                 .min(budget.max(Duration::from_millis(1)));
-            self.host.run_timeout(limit, actual_state).ok()
+            self.host.run_timeout(limit, actual_state)
         }
 
         /// イベントを 1 件受け取る。`take_events` 後、または期限切れなら `None`。

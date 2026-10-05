@@ -92,7 +92,7 @@ fn prepare_then_release_through_fake_wsl() {
     let exe = fresh_fake("mount_ok");
     let p = prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Enabled, &request(), TIMEOUT)
         .unwrap();
-    assert_eq!(p.transport(), SharedTransport::Virtiofs);
+    assert_eq!(p.transport(), Some(SharedTransport::Virtiofs));
     assert_eq!(p.distro().as_str(), "Ubuntu");
     let got: Vec<(&str, Option<u32>, bool)> = p
         .mounts()
@@ -171,7 +171,7 @@ fn prepare_falls_back_to_9p_with_not_applied_warning() {
     let exe = fresh_fake("mount_9p_applied");
     let p = prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Enabled, &request(), TIMEOUT)
         .unwrap();
-    assert_eq!(p.transport(), SharedTransport::NineP);
+    assert_eq!(p.transport(), Some(SharedTransport::NineP));
     assert_eq!(
         p.warning().map(|w| w.code()),
         Some(WinWarningCode::VirtiofsNotApplied)
@@ -187,7 +187,7 @@ fn prepare_falls_back_to_9p_with_not_enabled_warning() {
     let exe = fresh_fake("mount_9p_unset");
     let p = prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Unset, &request(), TIMEOUT)
         .unwrap();
-    assert_eq!(p.transport(), SharedTransport::NineP);
+    assert_eq!(p.transport(), Some(SharedTransport::NineP));
     assert_eq!(
         p.warning().map(|w| w.code()),
         Some(WinWarningCode::VirtiofsNotEnabled)
@@ -205,7 +205,7 @@ fn launch_continues_on_9p_fallback() {
     })
     .unwrap();
     assert_eq!(n.value, 2);
-    assert_eq!(n.prepared.transport(), SharedTransport::NineP);
+    assert_eq!(n.prepared.transport(), Some(SharedTransport::NineP));
     release_virtiofs_launch_with_program(&exe, &n.prepared, TIMEOUT).unwrap();
     assert!(mounted(&exe).is_empty());
 }

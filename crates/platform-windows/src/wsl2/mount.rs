@@ -361,7 +361,8 @@ pub struct PreparedMount {
 pub struct PreparedLaunch {
     distro: DistroName,
     mounts: Vec<PreparedMount>,
-    transport: SharedTransport,
+    /// fstype を観測できたときだけ `Some`（共有マウント 0 件・失敗時の未解除情報では `None`）。
+    transport: Option<SharedTransport>,
     warning: Option<WinWarning>,
 }
 
@@ -376,8 +377,11 @@ impl PreparedLaunch {
         &self.mounts
     }
 
-    /// 成立した輸送方式。
-    pub fn transport(&self) -> SharedTransport {
+    /// ゲスト内の fstype を観測して確定した輸送方式。
+    ///
+    /// 共有マウントが 0 件、または本値が失敗時の未解除情報（[`MountError::unreleased`]）の場合は
+    /// 何も観測していないため `None`（設定状態からの推測値を確定値として返さない。WIN-2）。
+    pub fn transport(&self) -> Option<SharedTransport> {
         self.transport
     }
 
@@ -434,15 +438,6 @@ fn check_fstype(policy: TransportPolicy, fstype: &str) -> Result<(), Wsl2Error> 
         _ => Err(precondition(
             "a shared mount is backed by an unsupported filesystem type",
         )),
-    }
-}
-
-/// 共有マウントが 0 件のときの想定輸送方式（ゲスト内を観測しないため設定状態から決める。警告は出さない）。
-fn assumed_transport(virtiofs: VirtiofsState) -> SharedTransport {
-    if virtiofs == VirtiofsState::Enabled {
-        SharedTransport::Virtiofs
-    } else {
-        SharedTransport::NineP
     }
 }
 
@@ -1019,7 +1014,7 @@ impl RollbackOutcome {
 fn unreleased_launch(
     distro: &DistroName,
     failed: &[OwnedMount],
-    transport: SharedTransport,
+    transport: Option<SharedTransport>,
 ) -> Option<PreparedLaunch> {
     if failed.is_empty() {
         return None;
@@ -1087,9 +1082,10 @@ impl MountError {
         self
     }
 
-    /// 構造化エラーと未解除のマウントに分解する。
-    pub fn into_parts(self) -> (Wsl2Error, Option<PreparedLaunch>) {
-        (self.error, self.unreleased)
+    /// 構造化エラー・未解除のマウント・9P 降格の警告に分解する（消費後も警告を失わない。WIN-2）。
+    pub fn into_parts(self) -> (Wsl2Error, Option<PreparedLaunch>, Option<WinWarning>) {
+        let warning = self.warning.map(WinWarning::new);
+        (self.error, self.unreleased, warning)
     }
 
     /// 後始末の失敗件数を `error` のメッセージに添えて、未解除のマウントとともに返す。
@@ -1097,7 +1093,7 @@ impl MountError {
         error: Wsl2Error,
         distro: &DistroName,
         outcome: &RollbackOutcome,
-        transport: SharedTransport,
+        transport: Option<SharedTransport>,
     ) -> Self {
         Self {
             error: with_rollback_note(error, outcome),
@@ -1477,7 +1473,7 @@ fn prepare_with_exec(
         return Ok(PreparedLaunch {
             distro: req.distro.clone(),
             mounts: Vec::new(),
-            transport: assumed_transport(virtiofs),
+            transport: None,
             warning: None,
         });
     }
@@ -1497,30 +1493,20 @@ fn prepare_with_exec(
     for m in &req.mounts {
         if let Err(e) = mount_one(distro, m, &before_ids, &mut owned, exec) {
             let failed = rollback(distro, &owned, exec);
-            return Err(MountError::with_unreleased(
-                e,
-                distro,
-                &failed,
-                assumed_transport(virtiofs),
-            ));
+            return Err(MountError::with_unreleased(e, distro, &failed, None));
         }
     }
     let (transport, warning) = match verify_shared(req, virtiofs, &owned, exec) {
         Ok(decided) => decided,
         Err(e) => {
             let failed = rollback(distro, &owned, exec);
-            return Err(MountError::with_unreleased(
-                e,
-                distro,
-                &failed,
-                assumed_transport(virtiofs),
-            ));
+            return Err(MountError::with_unreleased(e, distro, &failed, None));
         }
     };
     Ok(PreparedLaunch {
         distro: req.distro.clone(),
         mounts: owned.iter().map(OwnedMount::to_prepared).collect(),
-        transport,
+        transport: Some(transport),
         warning,
     })
 }
@@ -2657,7 +2643,7 @@ mod tests {
         let mut g = Guest::new("virtiofs");
         let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", true)]);
         let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
-        assert_eq!(p.transport(), SharedTransport::Virtiofs);
+        assert_eq!(p.transport(), Some(SharedTransport::Virtiofs));
         assert_eq!(p.distro().as_str(), "Ubuntu");
         assert_eq!(
             summary(&p),
@@ -3496,6 +3482,8 @@ mod tests {
         let strict = TransportPolicy::RequireVirtiofs;
         let vf = SharedTransport::Virtiofs;
         let np = SharedTransport::NineP;
+        // 理由: 表の 1 行（方針・設定状態・fstype 列・期待輸送・期待警告）を型で名付けても読みやすさが
+        // 増えず、この 1 テスト内でしか使わないため、clippy::type_complexity を局所的に許可する。
         #[allow(clippy::type_complexity)]
         let ok_cases: Vec<(
             TransportPolicy,
@@ -3542,8 +3530,8 @@ mod tests {
         let mut g = Guest::new("9p");
         let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", true)]);
         let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
-        assert_eq!(p.transport(), SharedTransport::NineP);
-        assert_eq!(p.transport().as_str(), "9p");
+        assert_eq!(p.transport(), Some(SharedTransport::NineP));
+        assert_eq!(p.transport().map(SharedTransport::as_str), Some("9p"));
         assert_eq!(
             p.warning().map(|w| w.code()),
             Some(WinWarningCode::VirtiofsNotApplied)
@@ -3562,7 +3550,7 @@ mod tests {
         // 設定が未有効のときは VIRTIOFS_NOT_ENABLED。
         let mut g = Guest::new("9p");
         let p = drive(&mut g, &r, VirtiofsState::Unset).unwrap();
-        assert_eq!(p.transport(), SharedTransport::NineP);
+        assert_eq!(p.transport(), Some(SharedTransport::NineP));
         assert_eq!(
             p.warning().map(|w| w.code()),
             Some(WinWarningCode::VirtiofsNotEnabled)
@@ -3576,7 +3564,7 @@ mod tests {
         let mut g = Guest::new("virtiofs");
         let r = req(vec![sm("C:\\a", "a", false)]);
         let p = drive(&mut g, &r, VirtiofsState::Unset).unwrap();
-        assert_eq!(p.transport(), SharedTransport::Virtiofs);
+        assert_eq!(p.transport(), Some(SharedTransport::Virtiofs));
         assert_eq!(p.warning(), None);
 
         // 未知の fstype は既定方針でもロールバックして拒否する（fail-closed）。
@@ -3602,17 +3590,14 @@ mod tests {
         assert!(e.message().contains("nosuid or nodev"), "{}", e.message());
     }
 
-    /// WIN-2: 共有マウントが 0 件のとき、ゲスト内を観測せず設定状態から輸送方式を決め、警告は出さない。
+    /// WIN-2: 共有マウントが 0 件のとき、ゲスト内を観測しないため輸送方式は未確認（`None`）で、警告も出さない。
     #[test]
     fn win2_zero_mounts_transport_follows_setting() {
         let r = req(vec![]);
-        for (state, want) in [
-            (VirtiofsState::Enabled, SharedTransport::Virtiofs),
-            (VirtiofsState::Unset, SharedTransport::NineP),
-        ] {
+        for state in [VirtiofsState::Enabled, VirtiofsState::Unset] {
             let mut g = Guest::new("virtiofs");
             let p = drive(&mut g, &r, state).unwrap();
-            assert_eq!(p.transport(), want);
+            assert_eq!(p.transport(), None);
             assert_eq!(p.warning(), None);
             assert_eq!(g.mount_calls, 0);
         }
@@ -3636,7 +3621,7 @@ mod tests {
             |p| Ok(p.transport()),
         )
         .unwrap();
-        assert_eq!(v.value, SharedTransport::NineP);
+        assert_eq!(v.value, Some(SharedTransport::NineP));
         assert_eq!(rec.warning_codes(), [WinWarningCode::VirtiofsNotApplied]);
         assert!(g.umounts.is_empty());
 
@@ -3723,7 +3708,8 @@ mod tests {
         let mut g = Guest::new("9p");
         let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
         assert_eq!(e.unreleased(), None);
-        let (err, left) = e.into_parts();
+        let (err, left, warn) = e.into_parts();
+        assert_eq!(warn, None);
         assert_eq!(err.code(), Wsl2ErrorCode::FailedPrecondition);
         assert!(left.is_none());
     }
@@ -3756,10 +3742,11 @@ mod tests {
                 read_only: false,
             })
             .collect();
-        let capped = unreleased_launch(&distro_name(), &many, SharedTransport::Virtiofs).unwrap();
+        let capped =
+            unreleased_launch(&distro_name(), &many, Some(SharedTransport::Virtiofs)).unwrap();
         assert_eq!(capped.mounts().len(), MAX_UNRELEASED_MOUNTS);
         assert_eq!(
-            unreleased_launch(&distro_name(), &[], SharedTransport::Virtiofs),
+            unreleased_launch(&distro_name(), &[], Some(SharedTransport::Virtiofs)),
             None
         );
     }

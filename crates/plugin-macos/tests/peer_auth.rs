@@ -121,13 +121,23 @@ fn task115_4_plug12_same_uid_listener_is_accepted_without_rejection() {
 
 /// PLUG-12 / TASK-115.4（実機前提）: 別 UID が listen 中の socket への接続を plugin が拒否し fail-closed する。
 ///
-/// 別 UID が listen 中で実行ユーザーから接続できる socket を人間が用意する。fixture は読み取りと
-/// connect のみで、削除・chmod しない。テスト自身は sudo を呼ばず、シェルも介さない。
+/// 別 UID が listen 中で実行ユーザーから接続できる socket と、その listener が受信したバイトを
+/// 書き出す空の記録ファイルを人間が用意する。fixture は読み取りと connect のみで、削除・chmod しない。
+/// 拒否の確認は終了コード・stderr に加え、listener 側の受信バイト数が 0 であること（認証前に
+/// データを送らない。PLUG-12・REPAIR-12）で行う。テスト自身は sudo を呼ばず、シェルも介さない。
 #[test]
 #[ignore = "requires a listening socket owned by another UID prepared by a human; PLUG-12"]
 fn task115_4_plug12_rejects_other_uid_listener() {
     let raw = std::env::var_os("FANDHE_CONTAINER_TEST_OTHER_UID_SOCKET").expect(
         "FANDHE_CONTAINER_TEST_OTHER_UID_SOCKET must be set to an absolute path (see AGENTS.md)",
+    );
+    let recv_raw = std::env::var_os("FANDHE_CONTAINER_TEST_OTHER_UID_RECEIVED_FILE").expect(
+        "FANDHE_CONTAINER_TEST_OTHER_UID_RECEIVED_FILE must be set to an absolute path (see AGENTS.md)",
+    );
+    let recv_path = PathBuf::from(recv_raw);
+    assert!(
+        recv_path.is_absolute(),
+        "received file must be an absolute path"
     );
     let path = PathBuf::from(raw);
     assert!(path.is_absolute(), "fixture must be an absolute path");
@@ -145,4 +155,16 @@ fn task115_4_plug12_rejects_other_uid_listener() {
         "{err}"
     );
     assert!(!err.contains(path.to_str().expect("utf8")), "{err}");
+
+    // 認証前にデータを送る回帰の検出: listener が受信したバイト数は 0 でなければならない。
+    let received = std::fs::metadata(&recv_path).expect("received-bytes file must exist");
+    assert!(
+        received.is_file(),
+        "received-bytes file must be a regular file"
+    );
+    assert_eq!(
+        received.len(),
+        0,
+        "listener of another UID must receive 0 bytes before peer authentication"
+    );
 }

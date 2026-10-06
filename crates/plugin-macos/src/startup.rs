@@ -196,6 +196,11 @@ fn check_sun_path_len(path: &Path) -> Result<(), PluginError> {
 
 /// 明示パス（引数・環境変数）の検証: 絶対パス・`..` なし・`sun_path` 長以内（PLUG-2）。
 fn validate_explicit(path: PathBuf) -> Result<PathBuf, PluginError> {
+    // NUL を含むパスは UDS の sun_path として使えず後段で初めて失敗するため、ここで拒否する。
+    // NUL は UTF-8 でも 1 バイトのまま保たれるため lossy 変換で全 OS 共通に検出できる。
+    if path.as_os_str().to_string_lossy().contains('\0') {
+        return Err(invalid("socket path must not contain NUL"));
+    }
     if !path.is_absolute() {
         return Err(invalid("socket path must be absolute"));
     }
@@ -397,6 +402,28 @@ mod tests {
         let mut s = String::from("/");
         s.push_str(&"a".repeat(n - 1));
         PathBuf::from(s)
+    }
+
+    /// PLUG-2: NUL を含む明示パス（引数・環境変数）は `InvalidArgument` で拒否する。
+    #[test]
+    fn explicit_path_with_nul_is_rejected() {
+        let mut p = abs("a.sock").into_os_string();
+        p.push("\0x");
+        let a = StartupArgs {
+            socket: Some(PathBuf::from(p.clone())),
+        };
+        assert_eq!(
+            code(resolve_socket_path(&a, None, no_default)),
+            PluginErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(resolve_socket_path(
+                &StartupArgs::default(),
+                Some(p.as_os_str()),
+                no_default
+            )),
+            PluginErrorCode::InvalidArgument
+        );
     }
 
     /// PLUG-2: 明示パスも `sun_path` 容量 - 1 は許可し、容量ちょうどは拒否する。

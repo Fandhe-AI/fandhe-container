@@ -73,7 +73,9 @@ fn task116_1_relative_path_rejected() {
 #[test]
 fn task116_1_default_path_uses_runtime_dir() {
     use std::os::unix::fs::DirBuilderExt;
-    let base = std::env::temp_dir().join(format!("fc-pw-startup-{}", std::process::id()));
+    // macOS の `temp_dir()`（/var/folders/...）は長く `sun_path`（104 バイト）を超えるため、
+    // 短い固定の `/tmp` 直下を使う（PLUG-12 の長さ検証自体は plugin crate 側の責務）。
+    let base = std::path::PathBuf::from("/tmp").join(format!("fc-pw-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::DirBuilder::new()
         .mode(0o700)

@@ -152,11 +152,24 @@ where
     })
 }
 
-/// `--socket=<path>` 形式の値部分を返す。
+/// `--socket=<path>` 形式の値部分を返す。接頭辞のみを OS 文字列として判定し、値は `OsString` のまま返す
+/// （非 UTF-8 パスを `--socket <path>` 形式と同様に受理するため）。
 fn strip_eq_form(arg: &OsStr) -> Option<OsString> {
-    let s = arg.to_str()?;
-    let rest = s.strip_prefix(SOCKET_ARG)?.strip_prefix('=')?;
-    Some(OsString::from(rest))
+    let prefix = format!("{SOCKET_ARG}=");
+    let prefix = prefix.as_bytes();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let rest = arg.as_bytes().strip_prefix(prefix)?;
+        Some(OsString::from_vec(rest.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        // 非 unix ではパスを UTF-8（WTF-8）として扱い、UTF-8 に変換できる範囲のみ受理する。
+        let s = arg.to_str()?;
+        let rest = s.as_bytes().strip_prefix(prefix)?;
+        Some(OsString::from(std::str::from_utf8(rest).ok()?))
+    }
 }
 
 /// 既定 socket パス（検証済み runtime directory 直下。`/tmp` へは落とさない。PLUG-12）。
@@ -231,6 +244,17 @@ mod tests {
         };
         resolve_startup([], Some(os(ABS)), d0).unwrap();
         assert_eq!(calls0.get(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plug1_eq_form_accepts_non_utf8_path() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let mut raw = b"--socket=/run/x/".to_vec();
+        raw.extend_from_slice(&[0xff, 0xfe]);
+        let c = resolve_startup([OsString::from_vec(raw)], None, no_default).unwrap();
+        assert_eq!(c.socket_path().as_os_str().as_bytes(), b"/run/x/\xff\xfe");
+        assert_eq!(c.socket_source(), SocketSource::Arg);
     }
 
     #[test]

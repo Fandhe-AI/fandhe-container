@@ -24,6 +24,7 @@
 //! 件数・1 要素長・合計長・ファイルサイズを確保前に検証する。エラーメッセージは固定の英語文言で、
 //! env の値・ファイル内容・入力文字列は含めない（env は秘密情報を含み得るため）。
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -101,10 +102,12 @@ pub struct EnvFile {
 impl EnvFile {
     /// ファイル内容を解釈する（純関数）。
     ///
-    /// 行単位で、空行と `#` 始まりの行（前置空白を除いた先頭）は無視する。行末の `\r` は除去し、
+    /// 先頭の UTF-8 BOM（U+FEFF。Windows のエディタが付ける）は除去する（付いたままだと先頭 KEY が
+    /// 静かに壊れるため。IO-5）。行単位で、空行と `#` 始まりの行（前置空白を除いた先頭）は無視する。行末の `\r` は除去し、
     /// KEY 側の前置空白は除去する。VALUE は加工しない。不正行は行番号つきのエラーにする
     /// （行の内容は含めない）。
     pub fn parse(content: &str) -> Result<Self, TraitError> {
+        let content = content.strip_prefix('\u{feff}').unwrap_or(content);
         let mut vars = Vec::new();
         for (idx, raw) in content.split('\n').enumerate() {
             let line = raw.strip_suffix('\r').unwrap_or(raw);
@@ -128,9 +131,14 @@ impl EnvFile {
 
     /// ファイルを読み込んで解釈する。
     ///
-    /// 開いた fd に対して通常ファイルであることを確認し（FIFO・デバイスでのハング防止）、
+    /// FIFO は書き手がいないと `open(2)` 自体がブロックするため、open 前に `metadata` で通常ファイル
+    /// であることを確認し（REPAIR-5）、open 後も fd の `metadata` で再確認する（TOCTOU 対策）。
     /// [`ENV_FILE_MAX_BYTES`] 超過・非 UTF-8 は拒否する。
     pub fn read(path: &Path) -> Result<Self, TraitError> {
+        let pre = std::fs::metadata(path).map_err(|_| invalid("cannot open env file"))?;
+        if !pre.is_file() {
+            return Err(invalid("env file must be a regular file"));
+        }
         let file = File::open(path).map_err(|_| invalid("cannot open env file"))?;
         let meta = file
             .metadata()
@@ -176,28 +184,37 @@ impl EnvSet {
     /// ベース env・env ファイル・`-e` を優先順位どおりに統合する。
     ///
     /// ベース < env ファイル（指定順）< `-e`（指定順）。件数・合計長の上限を超えると `InvalidArgument`。
+    /// 重複排除は KEY の索引で行い入力件数に対し線形。入力の各要素は検証済み（[`EnvVar::parse`]・
+    /// [`EnvFile::parse`] 経由）であることが前提で、統合後の件数は都度上限検証する。
     pub fn resolve(
         base: &[EnvVar],
         files: &[EnvFile],
         vars: &[EnvVar],
     ) -> Result<Self, TraitError> {
         let mut set = Self::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
         let all = base
             .iter()
             .chain(files.iter().flat_map(|f| f.vars.iter()))
             .chain(vars.iter());
         for v in all {
-            set.upsert(v);
+            match index.get(&v.key) {
+                Some(&i) => {
+                    if let Some(e) = set.entries.get_mut(i) {
+                        e.value.clone_from(&v.value);
+                    }
+                }
+                None => {
+                    if set.entries.len() >= ENV_MAX_ENTRIES {
+                        return Err(invalid("too many env entries"));
+                    }
+                    index.insert(v.key.clone(), set.entries.len());
+                    set.entries.push(v.clone());
+                }
+            }
         }
         set.check_limits()?;
         Ok(set)
-    }
-
-    fn upsert(&mut self, var: &EnvVar) {
-        match self.entries.iter_mut().find(|e| e.key == var.key) {
-            Some(existing) => existing.value.clone_from(&var.value),
-            None => self.entries.push(var.clone()),
-        }
     }
 
     fn check_limits(&self) -> Result<(), TraitError> {
@@ -364,8 +381,39 @@ mod tests {
         std::fs::write(&p, [b'A', b'=', 0xff, 0xfe]).unwrap();
         assert!(EnvFile::read(&p).is_err());
 
+        // BOM 付きファイルでも先頭 KEY が壊れない。
+        std::fs::write(&p, "\u{feff}A=1\nB=2\n").unwrap();
+        assert_eq!(EnvFile::read(&p).unwrap().vars()[0].key(), "A");
+
         assert!(EnvFile::read(&dir).is_err());
         assert!(EnvFile::read(&dir.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SUP-12・TASK-169.4: 先頭 BOM は除去し、2 行目以降の U+FEFF は KEY に残る（加工しない）。
+    #[test]
+    fn sup12_env_file_parse_strips_leading_bom() {
+        let f = EnvFile::parse("\u{feff}A=1\nB=2\n").unwrap();
+        let got: Vec<_> = f.vars().iter().map(|v| (v.key(), v.value())).collect();
+        assert_eq!(got, [("A", "1"), ("B", "2")]);
+    }
+
+    /// SUP-12・TASK-169.4・REPAIR-5: FIFO は open 前に拒否され、書き手がいなくてもブロックしない。
+    #[cfg(unix)]
+    #[test]
+    fn sup12_env_file_read_rejects_fifo_without_blocking() {
+        let dir = std::env::temp_dir().join(format!("fc-envfifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("f.env");
+        let ok = std::process::Command::new("mkfifo")
+            .arg(&p)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "mkfifo must be available on unix test hosts");
+        let e = EnvFile::read(&p).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert!(e.message().contains("regular file"), "{}", e.message());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

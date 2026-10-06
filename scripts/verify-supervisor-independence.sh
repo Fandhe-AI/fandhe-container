@@ -284,6 +284,11 @@ tree_of() { # <root pid>
     for p in "${queue[@]}"; do
       for c in ${CH[$p]:-}; do
         case "${SZ[$c]:-}" in Z | X | x | '') continue ;; esac
+        # 追加前に上限を確認する。1 つの親に多数の子がいても上限を超えて追加しない。
+        if [ "$n" -ge 512 ]; then
+          TREE_TRUNC=1
+          break 2
+        fi
         TREE+="${c}:${SS[$c]}:${p} "
         next+=("$c")
         n=$((n + 1))
@@ -326,12 +331,12 @@ owned_kill() {
 }
 
 # 期限付きの待機。<秒> <コマンド...> が成功するまで 0.1 秒間隔で再試行し、期限切れなら 1（REPAIR-5）。
+# 期限は反復回数でなく bash の $SECONDS（実経過秒）で判定する。各試行の実行時間も期限に算入される。
 wait_until() {
-  local limit=$(($1 * 10)) n=0
+  local deadline=$((SECONDS + $1))
   shift
   while ! "$@"; do
-    n=$((n + 1))
-    [ "$n" -lt "$limit" ] || return 1
+    [ "$SECONDS" -lt "$deadline" ] || return 1
     sleep 0.1
   done
 }
@@ -378,13 +383,12 @@ track_descendants() {
 
 # 待機中の定期追跡つき。<秒> <コマンド...> を wait_until と同じ規則で待ち、各試行の前に子孫を記録する。
 wait_tracked() {
-  local limit=$(($1 * 10)) n=0
+  local deadline=$((SECONDS + $1))
   shift
   while :; do
     track_descendants
     "$@" && return 0
-    n=$((n + 1))
-    [ "$n" -lt "$limit" ] || return 1
+    [ "$SECONDS" -lt "$deadline" ] || return 1
     sleep 0.1
   done
 }

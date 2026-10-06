@@ -2,7 +2,8 @@
 //!
 //! core 側 proxy（TASK-114）が spawn する別プロセス。argv / 環境変数を lib の `resolve_startup` へ渡し、
 //! core が bind 済みの UDS へ `UdsStream::connect`（peer credential 検証つき。PLUG-12）で接続して
-//! `frame_loop::serve` で要求を順次処理する（TASK-116.2・#393）。終了時に stderr へ 1 行 JSON
+//! `frame_loop::serve` で要求を `adapter::WindowsRuntimeAdapter` へ渡して順次処理する
+//! （TASK-116.2・#393、TASK-116.3・#394）。終了時に stderr へ 1 行 JSON
 //! （英語・機械可読）を出す。
 //!
 //! 終了コード: 0 = 相手の正常切断でループ終了、2 = 起動設定の解決失敗、3 = 接続失敗、
@@ -14,7 +15,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, UdsStream};
-use fandhe_container_plugin_windows::frame_loop::{UnimplementedHandler, serve};
+use fandhe_container_plugin_windows::adapter::{
+    PlatformBackend, UnimplementedGuestStart, WindowsRuntimeAdapter,
+};
+use fandhe_container_plugin_windows::frame_loop::serve;
 use fandhe_container_plugin_windows::{PLUGIN_SOCKET_ENV, default_socket_path, resolve_startup};
 
 /// 接続期限（core の常駐起動期限 10 秒より短くする。REPAIR-5）。
@@ -52,7 +56,10 @@ fn main() -> ExitCode {
             return ExitCode::from(3);
         }
     };
-    match serve(&mut stream, &mut UnimplementedHandler) {
+    match serve(
+        &mut stream,
+        &mut WindowsRuntimeAdapter::new(PlatformBackend, UnimplementedGuestStart),
+    ) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             report("plugin.frame_loop", Some(source), &e, "");

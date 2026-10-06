@@ -19,9 +19,9 @@
 //! その接続に閉じる。
 //!
 //! # 未実装範囲（REPAIR-3）
-//! 本体型 `Vec<String>`（先頭要素が操作名）は spec 未規定の暫定契約で、型つき本体への置換は #394。
-//! 既定ハンドラ [`UnimplementedHandler`] は全操作に `UNIMPLEMENTED` を返す。`ContainerRuntime`
-//! アダプタ（#394）・シャットダウン / ヘルスチェック（#396）は未実装。#396 は [`IDLE_POLL`] の継ぎ目に
+//! 本体型 `Vec<String>`（先頭要素が操作名）は spec 未規定の暫定契約で、型つき本体への置換は TASK-114 で確定する。
+//! 既定ハンドラ [`UnimplementedHandler`] は全操作に `UNIMPLEMENTED` を返す（アダプタ未結線時・テスト用。
+//! 実ハンドラは `adapter::WindowsRuntimeAdapter`・#394）。シャットダウン / ヘルスチェック（#396）は未実装。#396 は [`IDLE_POLL`] の継ぎ目に
 //! 停止フラグ確認を足せる。
 //!
 //! 対応 ID: TASK-116・PLUG-1・PLUG-2・PLUG-5・WIN-1・REPAIR-2・REPAIR-3・REPAIR-5・REPAIR-12。
@@ -49,7 +49,7 @@ const BODY_CHUNK: usize = 64 * 1024;
 /// 応答の符号化失敗時に返す固定文言（入力断片を載せない）。
 const MSG_ENCODE_FAILED: &str = "failed to encode response";
 
-/// 要求ハンドラの境界。`body` は先頭要素が操作名・以降が引数の暫定契約（#394 で型つき本体へ置換）。
+/// 要求ハンドラの境界。`body` は先頭要素が操作名・以降が引数の暫定契約（TASK-114 で型つき本体へ置換）。
 ///
 /// `Err` は同じ `MessageId` の `Error` 応答になる。メッセージに入力値を含めないこと（外部入力の反射防止）。
 pub trait RequestHandler {
@@ -67,7 +67,7 @@ where
 }
 
 /// 全操作に `UNIMPLEMENTED` を返す既定ハンドラ。実装済みを装わない（REPAIR-3）。
-/// `ContainerRuntime` アダプタ（#394・TASK-116.3）が差し替える。
+/// 実ハンドラは `adapter::WindowsRuntimeAdapter`（#394・TASK-116.3）で、本型はテスト用に残す。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnimplementedHandler;
 

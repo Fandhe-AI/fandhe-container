@@ -7,7 +7,8 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //! 起動設定の解決は TASK-116.1（#392）、UDS 接続後のフレーム送受信ループは TASK-116.2（#393。[`frame_loop`]）で実装済み。
-//! `ContainerRuntime` アダプタ（#394）、discovery 登録・plugin 側 bind（#395）、
+//! `ContainerRuntime` アダプタ（#394。[`adapter`]）は create / start / stop を platform-windows へ委譲済みで、
+//! ゲスト内ランタイム起動・kill / delete / state・型つき本体は未実装。discovery 登録・plugin 側 bind（#395）、
 //! シャットダウン・ヘルスチェック（#396）は未実装。実行時は WSL2 内の Linux で動く前提（WIN-1）で、
 //! 非 unix ネイティブビルドでは既定パス解決が `Unimplemented` となり fail-closed になる。
 //!
@@ -17,6 +18,7 @@
 //!
 //! 対応 ID: TASK-116・PLUG-1・PLUG-4・PLUG-11・PLUG-12・WIN-1・REPAIR-3。
 
+pub mod adapter;
 pub mod frame_loop;
 
 use std::ffi::{OsStr, OsString};

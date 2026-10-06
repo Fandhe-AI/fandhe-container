@@ -9,6 +9,8 @@
 //! 期限を過ぎた作業スレッドは止められず、処理が戻るまで残る。無制限に増やさないため、生存中の作業
 //! スレッド数を [`Workers`] で数え、上限 [`MAX_WORKERS`] に達していれば新しい処理を開始せず
 //! [`IsolateError::Busy`] で拒否する（fail-closed）。残ったスレッドは plugin プロセスの終了で消える。
+//! 計数は [`Workers`] の実体ごとで、create の検証用（アダプタ）と launch 用（`PlatformBackend`）は別の実体を
+//! 持つ。プロセス全体で残り得る作業スレッドは最大 `2 * MAX_WORKERS`（8）。
 //! 期限後に作業スレッドが返した値は受け手が無いため drop される（`Vm` なら drop の停止要求が走る）。
 
 use std::sync::Arc;
@@ -16,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::time::Duration;
 
-/// 同時に生存できる作業スレッド数の上限（期限超過で残ったスレッドを含む。無制限確保の防止）。
+/// 1 つの [`Workers`] で同時に生存できる作業スレッド数の上限（期限超過で残ったスレッドを含む。無制限確保の防止）。
 pub const MAX_WORKERS: usize = 4;
 
 /// 生存中の作業スレッド数。複製は同じ計数を共有する。

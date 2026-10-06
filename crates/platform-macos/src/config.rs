@@ -1448,7 +1448,7 @@ fn check_scan_limit(limit: Option<ShareScanLimit>) -> Result<(), ConfigError> {
 ///   正常ゲストの観測では否定できないため、緩和は実機結果とユーザー判断を経た別 PR に限る。
 /// - 検査〜VM 使用間の差し替え（TOCTOU）は `build_vz_configuration` で VZ 呼び出し直前に検査する以上の
 ///   安価な短縮策が無く、残余リスクとして受け入れる。根本対策は VZ の API 制約上、別途設計が要る。
-/// - 走査は `limit` があればエントリごと・ディレクトリごとに期限を確かめ、超過で
+/// - 走査は `limit` があればエントリごと・ディレクトリごと・走査終了時に期限を確かめ、超過で
 ///   [`ConfigError::SharedDirScanTimeout`] を返して打ち切る（REPAIR-5・TASK-115.3）。`limit` が `None` の
 ///   呼び出しは件数上限だけで止まる。期限つきでも、個々の `canonicalize`・`statfs`・`read_dir` が応答しない
 ///   NFS・autofs 等の配下でブロックした場合は取り消せず、検査が止まり得る（期限は呼び出しの合間にしか

@@ -63,7 +63,8 @@
 //! 応答しないファイルシステム（NFS・autofs 等）の上で 1 回の OS 呼び出しが戻らないことがあり、走査の期限
 //! （呼び出しの合間に確かめる）では打ち切れない。これらは [`crate::isolate::run`] で作業スレッドへ隔離し、
 //! 要求処理スレッドは [`CREATE_VALIDATION_TIMEOUT`]・[`LAUNCH_TOTAL_TIMEOUT`] だけ待って `TIMEOUT` を返す。
-//! 戻らない作業スレッドは残るが数を上限で抑え（[`crate::isolate::MAX_WORKERS`]）、上限に達したら新しい
+//! 戻らない作業スレッドは残るが数を上限で抑え（[`crate::isolate::MAX_WORKERS`]。create 用・launch 用で
+//! 別々に 4、合計 8）、上限に達した側は新しい
 //! 処理を開始せず `UNAVAILABLE` で拒否する。start の期限超過は VM が作られ得るため停止未確認
 //! （`LaunchFailed`）として扱う。stop は VM キューへの期限つき要求だけでファイルシステムに触れない。
 //!

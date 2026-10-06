@@ -25,7 +25,7 @@
 //! env の値・ファイル内容・入力文字列は含めない（env は秘密情報を含み得るため）。
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::Path;
 
@@ -41,6 +41,64 @@ pub const ENV_MAX_ENTRY_BYTES: usize = CONFIG_MAX_STRING_BYTES;
 pub const ENV_MAX_TOTAL_BYTES: usize = 1 << 20;
 /// env ファイル 1 つの最大バイト数。
 pub const ENV_FILE_MAX_BYTES: usize = ENV_MAX_TOTAL_BYTES;
+
+/// `open(2)` に渡す `O_NONBLOCK`（unix のみ。`unsafe`・外部クレートなしで std の `custom_flags` へ渡す）。
+///
+/// FIFO を読み取りで開くと書き手が現れるまで `open` がブロックするため、非ブロッキングで開いて
+/// fd の種別検査で弾く（REPAIR-5）。値は OS・アーキテクチャで異なるため `cfg` で分けて定義する。
+/// 定義できない環境は 0（フラグなし）になり、open 前の `metadata` 検査のみが防御になる。
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+))]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+const O_NONBLOCK: i32 = 0x4;
+#[cfg(not(any(
+    all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    ),
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
+#[cfg_attr(not(unix), allow(dead_code))]
+const O_NONBLOCK: i32 = 0;
+
+/// 読み取り専用・非ブロッキング（unix）で env ファイルを開く。
+fn open_nonblocking(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NONBLOCK);
+    }
+    opts.open(path)
+}
 
 /// `KEY=VALUE` 1 件（検証済み）。
 #[derive(Clone, PartialEq, Eq)]
@@ -132,14 +190,16 @@ impl EnvFile {
     /// ファイルを読み込んで解釈する。
     ///
     /// FIFO は書き手がいないと `open(2)` 自体がブロックするため、open 前に `metadata` で通常ファイル
-    /// であることを確認し（REPAIR-5）、open 後も fd の `metadata` で再確認する（TOCTOU 対策）。
+    /// であることを確認し（REPAIR-5）、さらに非ブロッキングで open して fd の `metadata` で再確認する。
+    /// 検査後に FIFO へ差し替えられても `O_NONBLOCK` により open は即座に返り、fd 種別検査で拒否される
+    /// （TOCTOU 対策）。通常ファイルの読み取りは `O_NONBLOCK` の影響を受けない。
     /// [`ENV_FILE_MAX_BYTES`] 超過・非 UTF-8 は拒否する。
     pub fn read(path: &Path) -> Result<Self, TraitError> {
         let pre = std::fs::metadata(path).map_err(|_| invalid("cannot open env file"))?;
         if !pre.is_file() {
             return Err(invalid("env file must be a regular file"));
         }
-        let file = File::open(path).map_err(|_| invalid("cannot open env file"))?;
+        let file = open_nonblocking(path).map_err(|_| invalid("cannot open env file"))?;
         let meta = file
             .metadata()
             .map_err(|_| invalid("cannot stat env file"))?;
@@ -184,6 +244,8 @@ impl EnvSet {
     /// ベース env・env ファイル・`-e` を優先順位どおりに統合する。
     ///
     /// ベース < env ファイル（指定順）< `-e`（指定順）。件数・合計長の上限を超えると `InvalidArgument`。
+    /// 検証するのは env 単体の上限のみで、パス・argv を含めた起動可能性は保証しない
+    /// （[`EnvSet::check_entrypoint_budget`] で別途検証する）。
     /// 重複排除は KEY の索引で行い入力件数に対し線形。入力の各要素は検証済み（[`EnvVar::parse`]・
     /// [`EnvFile::parse`] 経由）であることが前提で、統合後の件数は都度上限検証する。
     pub fn resolve(
@@ -215,6 +277,30 @@ impl EnvSet {
         }
         set.check_limits()?;
         Ok(set)
+    }
+
+    /// 起動時のパス・argv を含めた合計が core の `exec::Entrypoint::new` の上限
+    /// （[`ENV_MAX_TOTAL_BYTES`]。パス・argv・env の NUL 終端込み合計）に収まるか検証する。
+    ///
+    /// [`EnvSet::resolve`] は env のみで上限を検証するため、上限近くの env は argv 次第で
+    /// `Entrypoint::new` に拒否される。launcher は `Entrypoint::new` の前（または代わりに）これを呼び、
+    /// 受け渡し先で初めて失敗することを避ける（SUP-12・TASK-169.4。本番 launcher の結線は TASK-79）。
+    pub fn check_entrypoint_budget<S: AsRef<str>>(
+        &self,
+        path: &str,
+        args: &[S],
+    ) -> Result<(), TraitError> {
+        let mut total = path.len().saturating_add(1);
+        for a in args {
+            total = total.saturating_add(a.as_ref().len().saturating_add(1));
+        }
+        for e in &self.entries {
+            total = total.saturating_add(e.key.len() + 1 + e.value.len() + 1);
+        }
+        if total > ENV_MAX_TOTAL_BYTES {
+            return Err(invalid("entrypoint with env is too large"));
+        }
+        Ok(())
     }
 
     fn check_limits(&self) -> Result<(), TraitError> {
@@ -359,6 +445,22 @@ mod tests {
         );
     }
 
+    /// SUP-12・TASK-169.4: env 単体で上限ちょうどでも、パス・argv を含めると予算超過で拒否する。
+    #[test]
+    fn sup12_env_entrypoint_budget() {
+        // 1 要素 100000 バイト × 10 = 1_000_000 + NUL 等。env 単体では上限内。
+        let big: Vec<_> = (0..10)
+            .map(|i| var(&format!("K{i}={}", "x".repeat(100_000))))
+            .collect();
+        let set = EnvSet::resolve(&big, &[], &[]).unwrap();
+        assert!(set.check_entrypoint_budget("/bin/sh", &["sh"]).is_ok());
+        let long_arg = "a".repeat(60_000);
+        let e = set
+            .check_entrypoint_budget("/bin/sh", &["sh", long_arg.as_str()])
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    }
+
     /// SUP-12・TASK-169.4: env ファイルの読み込み（上限ちょうど受理・超過拒否・ディレクトリ拒否・非 UTF-8 拒否）。
     #[test]
     fn sup12_env_file_read() {
@@ -414,6 +516,25 @@ mod tests {
         let e = EnvFile::read(&p).unwrap_err();
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert!(e.message().contains("regular file"), "{}", e.message());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SUP-12・TASK-169.4・REPAIR-5: metadata 検査後に FIFO へ差し替えられた場合を模し、
+    /// 非ブロッキング open が書き手なしの FIFO でも即座に返り、fd 種別が通常ファイルでないことを確認する。
+    #[cfg(unix)]
+    #[test]
+    fn sup12_env_file_open_nonblocking_does_not_hang_on_fifo() {
+        let dir = std::env::temp_dir().join(format!("fc-envfifo2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("f.env");
+        let ok = std::process::Command::new("mkfifo")
+            .arg(&p)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "mkfifo must be available on unix test hosts");
+        let f = open_nonblocking(&p).unwrap();
+        assert!(!f.metadata().unwrap().is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

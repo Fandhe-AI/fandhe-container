@@ -1558,7 +1558,8 @@ fn find_hardlink_to_protected(
             }
         }
     }
-    Ok(())
+    // 最後のエントリの検査が期限後に終わった場合も、期限内の完了として扱わない。
+    check_scan_limit(limit)
 }
 
 /// 検証済みのデバイス構成（ブロックデバイス群とシリアルコンソール）。
@@ -1736,7 +1737,7 @@ impl VmConfigSpec {
     ///
     /// `budget` は全共有の合計（共有ごとではない）。期限を過ぎたら
     /// [`ConfigError::SharedDirScanTimeout`] を返す（検査未完了を成功扱いしない。fail-closed）。検査内容・
-    /// 拒否範囲は期限なしの版と同一で、緩めない。期限はエントリ・ディレクトリの合間に確かめるため、
+    /// 拒否範囲は期限なしの版と同一で、緩めない。期限はエントリ・ディレクトリの合間と検査の終了時に確かめるため、
     /// 1 回の OS 呼び出しが応答しない場合（NFS・autofs 等）は打ち切れない（`find_hardlink_to_protected` の残余）。
     /// 走査を行わない非 unix では期限を使わない。
     pub fn check_share_conflicts_within(&self, budget: Duration) -> Result<(), ConfigError> {
@@ -1778,6 +1779,11 @@ impl VmConfigSpec {
             // ReadOnly は保護入力の照合なし（空）で、範囲外経路の走査だけ行う。
             #[cfg(unix)]
             find_hardlink_to_protected(&dir, if read_only { &[] } else { &resolved }, limit)?;
+        }
+        // 走査を伴わない検査（実体パスの解決・包含判定）だけで期限を過ぎた場合も超過として返す。
+        #[cfg(unix)]
+        if !self.shares.shares().is_empty() {
+            check_scan_limit(limit)?;
         }
         Ok(())
     }

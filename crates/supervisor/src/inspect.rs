@@ -24,9 +24,12 @@ use std::num::NonZeroU32;
 use std::path::Path;
 
 use fandhe_container_core::traits::{
-    CgroupPlacement, ContainerId, ContainerState, GetStateRequest, HealthStatus, StateRecord,
-    StateRevision, StateStore, TraitError,
+    CgroupPlacement, ContainerId, ContainerState, ErrorCode, GetStateRequest, HealthStatus,
+    StateRecord, StateRevision, StateStore, TraitError,
 };
+
+/// bundle・cgroupScope の最大バイト数（出力有界化の上限。core の `state.json` 検証値と揃える）。
+const MAX_FIELD_BYTES: usize = 4096;
 
 /// 1 コンテナ分の inspect 出力の内容（SUP-11）。[`StateRecord`] のスナップショット。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,10 +40,29 @@ pub struct InspectReport {
 
 impl InspectReport {
     /// レコードから出力内容を作る。
-    pub fn from_record(record: &StateRecord) -> Self {
-        Self {
-            record: record.clone(),
+    ///
+    /// 公開 API 経由の任意の [`StateRecord`] でも出力サイズを有界に保つため、bundle・cgroupScope が
+    /// 各 [`MAX_FIELD_BYTES`] バイトを超えるレコードは [`ErrorCode::InvalidArgument`] で拒否する
+    /// （`StateRecord::new` は絶対パスしか検証しない。無制限確保の防止。SUP-11・TASK-168.1）。
+    /// ID は [`ContainerId`] 構築時に 255 バイト以下へ検証済み。
+    pub fn from_record(record: &StateRecord) -> Result<Self, TraitError> {
+        if record.bundle().as_os_str().len() > MAX_FIELD_BYTES {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("bundle path must be at most {MAX_FIELD_BYTES} bytes"),
+            ));
         }
+        if let Some(c) = record.cgroup()
+            && c.scope().as_str().len() > MAX_FIELD_BYTES
+        {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("cgroup scope must be at most {MAX_FIELD_BYTES} bytes"),
+            ));
+        }
+        Ok(Self {
+            record: record.clone(),
+        })
     }
 
     /// コンテナ ID。
@@ -150,7 +172,7 @@ impl InspectReport {
 /// core の [`TraitError`] をそのまま返し、部分的な出力は作らない。
 pub fn inspect(store: &dyn StateStore, id: &ContainerId) -> Result<InspectReport, TraitError> {
     let record = store.get(&GetStateRequest::new(id.clone()))?;
-    Ok(InspectReport::from_record(&record))
+    InspectReport::from_record(&record)
 }
 
 fn push_opt_num(out: &mut String, v: Option<u32>) {
@@ -192,7 +214,7 @@ mod tests {
     use super::*;
     use fandhe_container_core::traits::{
         CgroupScope, ContainerStatus, CreateStateRequest, DeleteStateRequest, DeleteStateResponse,
-        ErrorCode, ListStateRequest, StateList, SupervisionState, UpdateStateRequest,
+        ListStateRequest, StateList, SupervisionState, UpdateStateRequest,
     };
 
     /// 固定レコードまたは固定エラーを返すメモリ上のフェイク。
@@ -246,7 +268,10 @@ mod tests {
             "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2}}",
             json_escape(&b.to_string_lossy())
         );
-        assert_eq!(InspectReport::from_record(&rec).to_json(), expected);
+        assert_eq!(
+            InspectReport::from_record(&rec).unwrap().to_json(),
+            expected
+        );
     }
 
     #[test]
@@ -262,7 +287,10 @@ mod tests {
             "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0}}",
             json_escape(&b.to_string_lossy())
         );
-        assert_eq!(InspectReport::from_record(&rec).to_json(), expected);
+        assert_eq!(
+            InspectReport::from_record(&rec).unwrap().to_json(),
+            expected
+        );
     }
 
     #[test]
@@ -282,7 +310,26 @@ mod tests {
             "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0}}",
             json_escape(&b.to_string_lossy())
         );
-        assert_eq!(InspectReport::from_record(&rec).to_json(), expected);
+        assert_eq!(
+            InspectReport::from_record(&rec).unwrap().to_json(),
+            expected
+        );
+    }
+
+    #[test]
+    fn sup11_task168_1_from_record_rejects_oversized_bundle() {
+        let ok = bundle().join("a".repeat(MAX_FIELD_BYTES - bundle().as_os_str().len() - 1));
+        let mk = |b: std::path::PathBuf| {
+            StateRecord::new(
+                ContainerStatus::created(cid("c"), None),
+                b,
+                StateRevision::from_raw(1),
+            )
+            .unwrap()
+        };
+        assert!(InspectReport::from_record(&mk(ok.clone())).is_ok());
+        let e = InspectReport::from_record(&mk(ok.join("x"))).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
     }
 
     #[test]
@@ -303,7 +350,7 @@ mod tests {
             StateRevision::from_raw(1),
         )
         .unwrap();
-        let json = InspectReport::from_record(&rec).to_json();
+        let json = InspectReport::from_record(&rec).unwrap().to_json();
         assert!(json.contains("x\\\"y\\nz\\u0002\""), "{json}");
         assert!(!json.contains('\n'));
     }
@@ -316,7 +363,7 @@ mod tests {
             StateRevision::from_raw(1),
         )
         .unwrap();
-        let report = InspectReport::from_record(&rec);
+        let report = InspectReport::from_record(&rec).unwrap();
         let mut buf = Vec::new();
         report.write_json(&mut buf).unwrap();
         assert_eq!(buf, format!("{}\n", report.to_json()).into_bytes());

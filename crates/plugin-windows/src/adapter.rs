@@ -188,12 +188,18 @@ impl<'a> RequestDeadline<'a> {
         }
     }
 
+    /// 停止要求（SIGTERM フラグ）が立っているか。
+    fn stop_requested(self) -> bool {
+        self.stop.is_some_and(|s| s.load(Ordering::SeqCst))
+    }
+
     /// 残り時間を返す。[`MIN_STEP_BUDGET`] 未満なら操作に着手させず `TIMEOUT` を返す。
     /// 停止要求が立っていれば `UNAVAILABLE` を返し、操作の各段の境界で要求処理を早期に打ち切る
     /// （終了時の `release_all` に時間を回し、core の終了猶予内にマウントを解除するため。WIN-2・REPAIR-5）。
-    /// 実行中の 1 段（`wsl.exe` 呼び出し）は中断できず、その段の持ち分までは完了を待つ。
+    /// 実行中の 1 段（`wsl.exe` 呼び出し）は中断できず、その段の持ち分までは完了を待つ。launch 内の各段の境界は
+    /// [`WindowsBackend::launch`] の `cancel` で確認する。
     fn remaining(self) -> Result<Duration, PluginError> {
-        if self.stop.is_some_and(|s| s.load(Ordering::SeqCst)) {
+        if self.stop_requested() {
             return Err(err(PluginErrorCode::Unavailable, MSG_SHUTTING_DOWN));
         }
         let left = self.at.saturating_duration_since(Instant::now());
@@ -284,11 +290,16 @@ pub trait WindowsBackend {
     /// `budget` は WSL2 の検出とマウント準備全体（複数マウント）で共有する合計期限。準備失敗時の回復と
     /// `guest` 失敗時のロールバックには、準備とは別に同じ長さが割り当てられる（解除できなければ
     /// `unreleased` で返す。WIN-2・REPAIR-5）。したがって `guest` を除く合計は `2 * budget` 以内。
+    ///
+    /// `cancel` は停止要求（SIGTERM）の有無。実装は検出前・各マウントの着手前・ゲスト起動前の安全な境界で
+    /// 確認し、`true` なら所有済みのマウントを巻き戻して失敗を返す（終了猶予内に解除へ進むため。
+    /// 実行中の `wsl.exe` 呼び出しは中断しない。TASK-116.5・WIN-2・REPAIR-5）。
     fn launch(
         &self,
         req: &LaunchRequest,
         guest: &dyn GuestStart<Self::Prepared>,
         budget: Duration,
+        cancel: &dyn Fn() -> bool,
     ) -> Result<LaunchOutcome<Self::Prepared>, BackendFailure<Self::Prepared>>;
 
     /// 準備済みマウントを解除する。`budget` は全マウントの解除で共有する合計期限。
@@ -336,10 +347,13 @@ impl WindowsBackend for PlatformBackend {
         req: &LaunchRequest,
         guest: &dyn GuestStart<PreparedLaunch>,
         budget: Duration,
+        cancel: &dyn Fn() -> bool,
     ) -> Result<LaunchOutcome<PreparedLaunch>, BackendFailure<PreparedLaunch>> {
         let Launched { prepared, .. } =
-            wsl2::launch_with_recorder(req, budget, &StderrJsonRecorder, |p| guest.start(p))
-                .map_err(failure_from_mount)?;
+            wsl2::launch_cancellable_with_recorder(req, budget, &StderrJsonRecorder, cancel, |p| {
+                guest.start(p)
+            })
+            .map_err(failure_from_mount)?;
         Ok(LaunchOutcome {
             transport: prepared.transport(),
             warning: prepared.warning().map(|w| w.code()),
@@ -559,12 +573,13 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
             Some(Entry::Created(req)) => {
                 let budget = launch_budget(deadline.remaining()?);
                 let (backend, guest) = (&self.backend, &self.guest);
+                let cancel = || deadline.stop_requested();
                 // stop / release_all と同じく panic を要求元へのエラーフレームに変える。panic 時は
                 // 準備済みマウントの所有情報がバックエンドの内側で失われており、ここでは回収できない
                 // （そのため記録先 `StderrJsonRecorder` は panic しない実装にしている）。登録は Created の
                 // まま残し、再度の start は platform-windows が既存マウントを検出して拒否する（fail-closed）。
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    backend.launch(req, guest, budget)
+                    backend.launch(req, guest, budget, &cancel)
                 })) {
                     Ok(r) => r,
                     Err(_) => return Err(err(PluginErrorCode::Internal, "launch panicked")),
@@ -813,6 +828,10 @@ mod tests {
         budgets: RefCell<Vec<Duration>>,
         /// check_distro へ渡された合計期限。
         check_budgets: RefCell<Vec<Duration>>,
+        /// launch に渡された打ち切り判定の評価結果（呼び出し順）。
+        cancel_seen: RefCell<Vec<bool>>,
+        /// launch の入口で立てる停止フラグ（launch 実行中の SIGTERM を模す）。
+        raise_stop: RefCell<Option<Rc<AtomicBool>>>,
     }
 
     impl WindowsBackend for Fake {
@@ -832,8 +851,13 @@ mod tests {
             req: &LaunchRequest,
             guest: &dyn GuestStart<FakePrepared>,
             budget: Duration,
+            cancel: &dyn Fn() -> bool,
         ) -> Result<LaunchOutcome<FakePrepared>, BackendFailure<FakePrepared>> {
             self.budgets.borrow_mut().push(budget);
+            if let Some(f) = self.raise_stop.borrow().as_ref() {
+                f.store(true, Ordering::SeqCst);
+            }
+            self.cancel_seen.borrow_mut().push(cancel());
             let mounts: Vec<String> = req
                 .mounts()
                 .iter()
@@ -1260,6 +1284,26 @@ mod tests {
         let idle = AtomicBool::new(false);
         a.handle_within(&s(CREATE), REQUEST_BUDGET, Some(&idle))
             .unwrap();
+    }
+
+    /// TASK-116.5・WIN-2・REPAIR-5: launch の実行中に立った停止フラグは `cancel` 経由でバックエンドの
+    /// 各段の境界へ伝わる（要求前に立っていなければ false、実行中に立てば true）。
+    #[test]
+    fn task116_5_win2_stop_flag_reaches_backend_launch_as_cancel() {
+        let (mut a, _) = adapter(Fake::default());
+        a.handle(&s(CREATE)).unwrap();
+        let idle = AtomicBool::new(false);
+        a.handle_within(&s(&["start", "c1"]), REQUEST_BUDGET, Some(&idle))
+            .unwrap();
+        assert_eq!(*a.backend.cancel_seen.borrow(), vec![false]);
+
+        a.handle(&s(&["stop", "c1"])).unwrap();
+        a.handle(&s(CREATE)).unwrap();
+        let flag = Rc::new(AtomicBool::new(false));
+        *a.backend.raise_stop.borrow_mut() = Some(Rc::clone(&flag));
+        a.handle_within(&s(&["start", "c1"]), REQUEST_BUDGET, Some(&flag))
+            .unwrap();
+        assert_eq!(*a.backend.cancel_seen.borrow(), vec![false, true]);
     }
 
     /// REPAIR-5: start / stop は要求の期限から配分した合計期限を、release_all は残り時間（上限 RELEASE_BUDGET）を渡す。

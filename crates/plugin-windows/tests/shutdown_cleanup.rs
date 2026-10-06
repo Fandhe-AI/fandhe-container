@@ -45,6 +45,7 @@ impl WindowsBackend for FakeBackend {
         req: &LaunchRequest,
         guest: &dyn GuestStart<FakePrepared>,
         _budget: Duration,
+        _cancel: &dyn Fn() -> bool,
     ) -> Result<LaunchOutcome<FakePrepared>, BackendFailure<FakePrepared>> {
         self.calls
             .lock()

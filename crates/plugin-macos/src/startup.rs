@@ -5,8 +5,8 @@
 //! 3) 既定 `RuntimeDir::from_env()` 配下の [`DEFAULT_SOCKET_NAME`]。
 //!
 //! 本モジュールは socket を開かない（bind も connect もしない）。解決したパスは
-//! bind / connect のどちらにも使える検証済みの絶対パスである。`sun_path` 長の検証は
-//! 既定パスは `RuntimeDir::socket_path`、明示パスは将来の bind / connect 側が担う。
+//! bind / connect のどちらにも使える検証済みの絶対パスである。`sun_path` 長は既定パスを
+//! `RuntimeDir::socket_path`、明示パスを本モジュールの `validate_explicit` が検証する。
 //! 明示パスの配置ディレクトリの検証（所有者・権限・symlink。PLUG-12）も bind 時の既存機構へ委ねる。
 //!
 //! 引数・環境変数は untrusted な外部入力として扱い、件数・合計バイト数を上限検証する。
@@ -124,8 +124,8 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocatio
             help = true;
         } else if arg == OsStr::new(SOCKET_FLAG) {
             pending_value = true;
-        } else if let Some(v) = arg.to_str().and_then(|s| s.strip_prefix("--socket=")) {
-            set_socket(&mut socket, OsStr::new(v))?;
+        } else if let Some(v) = strip_socket_prefix(&arg) {
+            set_socket(&mut socket, v)?;
         } else {
             return Err(invalid("unknown argument"));
         }
@@ -139,6 +139,27 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocatio
     Ok(Invocation::Run(StartupArgs { socket }))
 }
 
+/// `--socket=<PATH>` 形式の値部分を取り出す。
+///
+/// unix ではパスが任意のバイト列のため `OsStr` のバイト列で接頭辞を判定し、非 UTF-8 の値も
+/// `--socket <PATH>` 形式と同様に受理する。非 unix は `to_str` で判定する（Windows の
+/// 孤立サロゲートを含む値は受理しない。現状 Windows は serving 未対応のため許容）。
+fn strip_socket_prefix(arg: &OsStr) -> Option<&OsStr> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        arg.as_bytes()
+            .strip_prefix(b"--socket=")
+            .map(OsStr::from_bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        arg.to_str()
+            .and_then(|s| s.strip_prefix("--socket="))
+            .map(OsStr::new)
+    }
+}
+
 fn set_socket(slot: &mut Option<PathBuf>, value: &OsStr) -> Result<(), PluginError> {
     if slot.is_some() {
         return Err(invalid("duplicate --socket"));
@@ -150,7 +171,30 @@ fn set_socket(slot: &mut Option<PathBuf>, value: &OsStr) -> Result<(), PluginErr
     Ok(())
 }
 
-/// 明示パス（引数・環境変数）の検証: 絶対パスかつ `..` を含まない。
+/// `sockaddr_un.sun_path` の容量（終端 NUL を含むバイト数）。Linux は 108。
+/// `fandhe_container_plugin` 内の同名検証（`RuntimeDir::socket_path` が使う）と同じ値で、
+/// 同 crate では非公開のためここに持つ（PLUG-2）。
+#[cfg(target_os = "linux")]
+const SUN_PATH_CAPACITY: usize = 108;
+/// macOS・BSD 系は 104。
+#[cfg(all(unix, not(target_os = "linux")))]
+const SUN_PATH_CAPACITY: usize = 104;
+
+/// `path` が `sun_path` に収まる（終端 NUL を残せる）ことを確認する。非 unix は UDS 長制限なし。
+fn check_sun_path_len(path: &Path) -> Result<(), PluginError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if path.as_os_str().as_bytes().len() >= SUN_PATH_CAPACITY {
+            return Err(invalid("socket path is too long"));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// 明示パス（引数・環境変数）の検証: 絶対パス・`..` なし・`sun_path` 長以内（PLUG-2）。
 fn validate_explicit(path: PathBuf) -> Result<PathBuf, PluginError> {
     if !path.is_absolute() {
         return Err(invalid("socket path must be absolute"));
@@ -158,6 +202,7 @@ fn validate_explicit(path: PathBuf) -> Result<PathBuf, PluginError> {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(invalid("socket path must not contain '..'"));
     }
+    check_sun_path_len(&path)?;
     Ok(path)
 }
 
@@ -345,6 +390,65 @@ mod tests {
         assert_eq!(code(parse_args(many)), PluginErrorCode::InvalidArgument);
         let long = vec![OsString::from("a".repeat(ONE_SHOT_ARGS_MAX_BYTES + 1))];
         assert_eq!(code(parse_args(long)), PluginErrorCode::InvalidArgument);
+    }
+
+    #[cfg(unix)]
+    fn path_of_len(n: usize) -> PathBuf {
+        let mut s = String::from("/");
+        s.push_str(&"a".repeat(n - 1));
+        PathBuf::from(s)
+    }
+
+    /// PLUG-2: 明示パスも `sun_path` 容量 - 1 は許可し、容量ちょうどは拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn explicit_path_sun_path_boundary() {
+        let ok = path_of_len(SUN_PATH_CAPACITY - 1);
+        let a = StartupArgs {
+            socket: Some(ok.clone()),
+        };
+        assert_eq!(
+            resolve_socket_path(&a, None, no_default)
+                .unwrap()
+                .socket_path(),
+            ok.as_path()
+        );
+        let long = path_of_len(SUN_PATH_CAPACITY);
+        let a = StartupArgs {
+            socket: Some(long.clone()),
+        };
+        assert_eq!(
+            code(resolve_socket_path(&a, None, no_default)),
+            PluginErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(resolve_socket_path(
+                &StartupArgs::default(),
+                Some(long.as_os_str()),
+                no_default
+            )),
+            PluginErrorCode::InvalidArgument
+        );
+    }
+
+    /// 非 UTF-8 のパスは `--socket=` 形式でも空白区切り形式と同様に受理する。
+    #[cfg(unix)]
+    #[test]
+    fn socket_flag_equals_form_accepts_non_utf8() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let value = b"/tmp/\xff\xfe.sock".to_vec();
+        let mut eq = b"--socket=".to_vec();
+        eq.extend_from_slice(&value);
+        let a = parse_run(vec![OsString::from_vec(eq)]);
+        let b = parse_run(vec![
+            OsString::from("--socket"),
+            OsString::from_vec(value.clone()),
+        ]);
+        assert_eq!(a, b);
+        assert_eq!(
+            a.socket.as_deref().map(|p| p.as_os_str().as_bytes()),
+            Some(value.as_slice())
+        );
     }
 
     #[test]

@@ -53,7 +53,13 @@ struct Tmp(PathBuf);
 
 impl Tmp {
     fn new(tag: &str) -> Self {
-        let p = std::env::temp_dir().join(format!("fc-pm-{tag}-{}", std::process::id()));
+        // macOS の TMPDIR（/var/folders/...）は長く、既定 socket パスが UDS の `sun_path`
+        // 上限（104 バイト）を超えるため、unix では短い /tmp 配下を使う。
+        #[cfg(unix)]
+        let base = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let base = std::env::temp_dir();
+        let p = base.join(format!("fc-pm-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("create tmp dir");
         #[cfg(unix)]

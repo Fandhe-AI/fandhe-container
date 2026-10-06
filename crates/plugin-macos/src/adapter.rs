@@ -139,16 +139,19 @@ pub enum BackendError {
 }
 
 impl BackendError {
-    /// VM が既に停止済み（`Stopped` / `Error`）で停止操作が `InvalidState` になった場合 true。
+    /// VM が既に停止済み（`Stopped`）で停止操作が `InvalidState` になった場合 true。
     ///
-    /// ゲスト側のシャットダウン・クラッシュ後は再試行しても同じ理由で失敗し解放できなくなるため、
-    /// 呼び出し側は停止済みとして登録を外す（TASK-115.3・MAC-1）。
+    /// ゲスト側のシャットダウン後は再試行しても同じ理由で失敗し解放できなくなるため、呼び出し側は
+    /// 停止済みとして登録を外す（TASK-115.3・MAC-1）。停止完了を確認できるのは `Stopped` だけで、
+    /// `Error` を含む他の状態は停止を確認できないため false（登録を残し、`stop` は失敗、`stop_all` は
+    /// `remaining` に数える。停止未確認を成功扱いしない。REPAIR-3）。`Error` の VM が `Stopped` へ
+    /// 遷移した後の `stop` 再試行で登録が外れる。
     fn is_already_halted(&self) -> bool {
         use fandhe_container_platform_macos::vm::VmState;
         matches!(
             self,
             BackendError::Platform(PlatformError::Vm(VmError::InvalidState {
-                state: VmState::Stopped | VmState::Error,
+                state: VmState::Stopped,
                 ..
             }))
         )
@@ -339,7 +342,8 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
     /// `plugin.cleanup` の `remaining` と終了コードで報告する。以降の回収は `Vm` の drop による停止要求
     /// （非同期・有界回数）と core 側の終了処理に委ねる（完了は保証しない。REPAIR-3）。
     pub fn stop_all_within(&mut self, budget: Duration) -> StopAllSummary {
-        let deadline = Instant::now() + budget;
+        // 表現範囲を超える予算は期限なしとして扱う（panic させない）。
+        let deadline = Instant::now().checked_add(budget);
         let per_stop = self.backend.stop_timeout();
         let mut summary = StopAllSummary {
             stopped: 0,
@@ -355,9 +359,10 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
                 true
             }
             State::Running(h) => {
-                let affordable = deadline
-                    .checked_duration_since(Instant::now())
-                    .is_some_and(|left| left >= per_stop);
+                let affordable = deadline.is_none_or(|d| {
+                    d.checked_duration_since(Instant::now())
+                        .is_some_and(|left| left >= per_stop)
+                });
                 if affordable
                     && backend
                         .stop(h)
@@ -503,7 +508,7 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         }
         if let State::Running(h) = &entry.state {
             // 失敗時は登録を残す（再試行可）。
-            // 既に停止済み（InvalidState）なら停止成功として扱い、登録を外す。
+            // 既に停止済み（`Stopped` の InvalidState）なら停止成功として扱い、登録を外す。
             if let Err(e) = self.backend.stop(h)
                 && !e.is_already_halted()
             {
@@ -757,6 +762,8 @@ mod tests {
         unsupported_launch: bool,
         fail_stop: bool,
         halted_stop: bool,
+        /// 停止要求を VM の `Error` 状態で拒否する（停止未確認）。
+        error_stop: bool,
         stop_timeout: Duration,
         next: u32,
     }
@@ -800,6 +807,14 @@ mod tests {
                     VmError::InvalidState {
                         op: VmOp::Stop,
                         state: VmState::Stopped,
+                    },
+                )));
+            }
+            if c.error_stop {
+                return Err(BackendError::Platform(PlatformError::Vm(
+                    VmError::InvalidState {
+                        op: VmOp::Stop,
+                        state: VmState::Error,
                     },
                 )));
             }
@@ -1419,11 +1434,66 @@ mod tests {
         );
     }
 
+    /// TASK-115.3・REPAIR-3: `Error` 状態で停止要求が拒否された VM は停止未確認として登録を残し、
+    /// `stop` は失敗、`stop_all` は `remaining` に数える。`Stopped` を確認できた再試行で登録が外れる。
+    #[test]
+    fn task115_3_repair3_error_state_stop_is_not_confirmed() {
+        let dir = tmp_dir("error-state");
+        let k = kernel(&dir);
+        let (mut a, f) = adapter();
+        create_ok(&mut a, "a", &k);
+        a.handle(&s(&["start", "a"])).expect("start");
+        f.0.borrow_mut().error_stop = true;
+        assert_eq!(
+            err_of(a.handle(&s(&["stop", "a"]))),
+            (
+                PluginErrorCode::FailedPrecondition,
+                "vm.invalid_state: cannot stop the virtual machine in state Error".to_string()
+            )
+        );
+        assert_eq!(
+            a.stop_all(),
+            StopAllSummary {
+                stopped: 0,
+                remaining: 1
+            }
+        );
+        f.0.borrow_mut().error_stop = false;
+        f.0.borrow_mut().halted_stop = true;
+        assert_eq!(a.handle(&s(&["stop", "a"])).expect("stop"), s(&["stopped"]));
+        assert_eq!(
+            a.stop_all(),
+            StopAllSummary {
+                stopped: 0,
+                remaining: 0
+            }
+        );
+    }
+
+    /// TASK-115.3・REPAIR-5: 表現範囲を超える停止予算でも panic せず、期限なしとして全件の停止を試みる。
+    #[test]
+    fn task115_3_repair5_stop_all_huge_budget_does_not_panic() {
+        let dir = tmp_dir("huge-budget");
+        let k = kernel(&dir);
+        let (mut a, f) = adapter();
+        f.0.borrow_mut().stop_timeout = Duration::from_secs(1);
+        create_ok(&mut a, "a", &k);
+        a.handle(&s(&["start", "a"])).expect("start");
+        assert_eq!(
+            a.stop_all_within(Duration::MAX),
+            StopAllSummary {
+                stopped: 1,
+                remaining: 0
+            }
+        );
+        assert_eq!(f.0.borrow().stopped, vec![1]);
+    }
+
     /// TASK-115.3・REPAIR-5: 起動・終了の待機は core の RPC 期限 10 秒・終了猶予 5 秒に収まる。
     #[test]
     fn task115_3_repair5_timeouts_fit_core_deadlines() {
-        let launch = LAUNCH_START_TIMEOUT + LAUNCH_GUEST_MOUNT_TIMEOUT;
-        assert_eq!(launch, Duration::from_secs(7));
+        let launch = LAUNCH_START_TIMEOUT + LAUNCH_GUEST_MOUNT_TIMEOUT + SHARE_SCAN_TIMEOUT;
+        assert_eq!(launch, Duration::from_secs(9));
         assert!(launch < Duration::from_secs(10));
         assert_eq!(SHUTDOWN_BUDGET, Duration::from_secs(4));
         assert!(SHUTDOWN_BUDGET < Duration::from_secs(5));

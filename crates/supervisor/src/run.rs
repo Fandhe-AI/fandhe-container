@@ -41,7 +41,7 @@
 //!
 //! 未実装（将来仕様と対応ビヘイビア ID）:
 //! - restart ポリシー `no` / `on-failure[:N]` / `always` / `unless-stopped` の評価と最大回数 N での打ち切り（SUP-3）。
-//!   ポリシー実装後、異常終了の既定判定（[`crate::restart`] の `is_abnormal_exit`。TASK-159.1 で移設）はポリシー評価（#488）に置き換わる。
+//!   ポリシー実装後、異常終了の既定判定（[`crate::restart`] の `is_abnormal_exit`。TASK-159.1 で移設）は、再 launch 実装時にポリシー評価（`evaluate_restart`。TASK-159.2 で実装済み）への配線に置き換わる（#489・TASK-159.3）。
 //! - 再試行間隔（バックオフ）。バックオフ 0 のとき再起動レイテンシ中央値 100ms 以下が目標（SUP-3）。
 //!   上限 N とバックオフが無いと再起動ストームになるため、ポリシー実装時に必須とする。
 //! - 本番 `ProcessLauncher` による再 launch と、新しい pid での `Running` 再記録・監視継続（SUP-3。core の launcher 提供が前提）。

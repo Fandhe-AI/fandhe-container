@@ -158,6 +158,9 @@ version = "0.0.0"
 [[package]]
 name = "fandhe-container-plugin-macos"
 version = "0.0.0"
+dependencies = [
+ "fandhe-container-plugin",
+]
 
 [[package]]
 name = "fandhe-container-plugin-mcp"

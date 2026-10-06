@@ -34,9 +34,11 @@ fn sup1_task157_4_run_rs_has_no_global_state_or_raw_pid_access() {
 fn sup1_task157_4_manifest_has_only_core_dependency() {
     const MANIFEST: &str = include_str!("../Cargo.toml");
     let deps = MANIFEST.split("[dependencies]").nth(1).unwrap_or("");
+    // `[dependencies]` 節のみを対象にする（後続の `[[test]]` 等のテーブルは依存ではない）。
     let entries: Vec<&str> = deps
         .lines()
         .map(str::trim)
+        .take_while(|l| !l.starts_with('['))
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
     assert_eq!(entries, ["fandhe-container-core = { path = \"../core\" }"]);

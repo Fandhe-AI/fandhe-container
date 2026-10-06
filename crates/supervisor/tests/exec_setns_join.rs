@@ -69,19 +69,17 @@ mod linux {
             .into_owned()
     }
 
-    /// 終了時に pid1 と `unshare` を確実に止める。
+    /// 終了時に `unshare` と pid1 を確実に止める。
+    ///
+    /// pid1 は `unshare --kill-child` が親（`Child` ハンドルで保持する `unshare`）の死に連動して
+    /// 落とす。数値 PID への `kill` は pid1 が先に回収された場合の PID 再利用で無関係なプロセスを
+    /// 殺し得る（SEC-1）ため行わない。
     struct Fixture {
         unshare: Child,
-        pid1: Option<u32>,
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            if let Some(pid) = self.pid1 {
-                let _ = Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status();
-            }
             let _ = self.unshare.kill();
             let _ = self.unshare.wait();
         }
@@ -93,7 +91,7 @@ mod linux {
                 "--user",
                 "--map-root-user",
                 "--pid",
-                "--fork",
+                "--kill-child",
                 "--mount",
                 "--uts",
                 "--ipc",
@@ -105,10 +103,7 @@ mod linux {
             .spawn()
             .expect("spawn unshare");
         let unshare_pid = unshare.id();
-        let mut fx = Fixture {
-            unshare,
-            pid1: None,
-        };
+        let _fx = Fixture { unshare };
 
         // `--fork` した子（新 PID namespace の PID 1）が現れるまで待つ。
         let deadline = Instant::now() + timeout();
@@ -119,7 +114,6 @@ mod linux {
             assert!(Instant::now() < deadline, "pid1 did not appear in time");
             std::thread::sleep(Duration::from_millis(20));
         };
-        fx.pid1 = Some(pid1);
 
         let exe = std::env::current_exe().expect("current_exe");
         let mut joiner = Command::new("nsenter")

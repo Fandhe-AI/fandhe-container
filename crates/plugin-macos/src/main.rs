@@ -13,13 +13,15 @@
 //! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データを含めない。
 //! peer 認証の拒否イベント行は socket パスを含むため転記しない（永続的な監査ログへの配線は
 //! core 側 TASK-114 で未実装。REPAIR-3・SEC-4）。
-//! 既定ハンドラは全操作に `UNIMPLEMENTED` を返す（`ContainerRuntime` アダプタは TASK-115.3）。
+//! 要求は `adapter::MacosRuntimeAdapter`（TASK-115.3・#387）が処理し、終了時に実行中 VM を `stop_all` で停止する。
+//! 停止結果は stderr へ件数のみの 1 行 JSON（`plugin.cleanup`）で出す。
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, PluginErrorCode, UdsStream};
-use fandhe_container_plugin_macos::frame_loop::{UnimplementedHandler, serve};
+use fandhe_container_plugin_macos::adapter::{MacosRuntimeAdapter, PlatformBackend};
+use fandhe_container_plugin_macos::frame_loop::serve;
 use fandhe_container_plugin_macos::startup::{self, RunOutcome};
 
 /// `InvalidArgument` の終了コード。
@@ -62,7 +64,17 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_CONNECT_FAILED);
         }
     };
-    match serve(&mut stream, &mut UnimplementedHandler) {
+    let mut adapter = MacosRuntimeAdapter::new(PlatformBackend);
+    let outcome = serve(&mut stream, &mut adapter);
+    // Vm の Drop は停止を待たないため、正常切断・異常終了のどちらでも期限つきで明示停止する。
+    let summary = adapter.stop_all();
+    if summary.stopped > 0 || summary.remaining > 0 {
+        eprintln!(
+            "{{\"event\":\"plugin.cleanup\",\"stopped\":{},\"remaining\":{}}}",
+            summary.stopped, summary.remaining
+        );
+    }
+    match outcome {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             report(&e);

@@ -1,0 +1,899 @@
+//! `ContainerRuntime` アダプタ: core からの create / start / stop 要求を `fandhe-container-platform-macos`
+//! の VM 起動・virtiofs 共有へ委譲し、失敗を plugin のエラーフレームへ写す（TASK-115.3・#387。
+//! PLUG-1・MAC-1・ERR-1・REPAIR-2・REPAIR-3・REPAIR-5・REPAIR-12）。
+//!
+//! 呼び出し元: `main.rs` が [`MacosRuntimeAdapter`] を [`crate::frame_loop::serve`] の `RequestHandler` として
+//! 渡す。フレームの復号・応答の組み立ては `frame_loop` が担い、本モジュールは「要求本体 → platform-macos の
+//! 関数呼び出し → 応答本体 / [`PluginError`]」だけを担う。呼び出し先の VM 操作は [`MacosBackend`] 越しにし、
+//! 実 VM を起動できない 3 OS の CI でも偽実装でテストできるようにする。
+//!
+//! # 暫定ワイヤー契約（spec 未規定。型つき本体への置換は core 側 proxy の TASK-114）
+//!
+//! | 操作 | 要求本体 | 成功応答本体 |
+//! | ---- | -------- | ------------ |
+//! | create | `["create", id, kernel, initrd または "", cmdline, (tag, host_dir, "ro" / "rw")*]` | `["created"]` |
+//! | start | `["start", id]` | `["running"]` |
+//! | stop | `["stop", id]` | `["stopped"]` |
+//! | kill / delete / state / その他 | — | Error `UNIMPLEMENTED` |
+//!
+//! `id` は core の `ContainerId` と同じ規則（空・`.`・`..` 不可、255 バイト以下、`[A-Za-z0-9._-]`）で
+//! 検証する（TASK-114 で core 型へ置換）。create は検証と登録のみ、start が `Vm::launch`、stop が
+//! `Vm::stop` と登録解除（delete が無いため stop が資源をすべて手放す）。
+//!
+//! # エラー対応表（[`to_plugin_error`] が唯一の変換箇所）
+//!
+//! | platform-macos | `PluginErrorCode` |
+//! | -------------- | ----------------- |
+//! | `Config`（既定） | `INVALID_ARGUMENT` |
+//! | `Config`: `PathIo`・`UrlConversion`・`DiskAttachment`・`ConsoleLogOpen`・`ConsoleLogWriter` | `INTERNAL` |
+//! | `Config`: `ConsoleLogNotOwned`・`ConsoleLogInsecureMode`・`ConsoleLogParentWorldWritable` | `PERMISSION_DENIED` |
+//! | `Config`: `ConsoleLogInUse` | `FAILED_PRECONDITION` |
+//! | `Vm`: `VirtualizationUnsupported`・`InvalidConfiguration`・`InvalidState` | `FAILED_PRECONDITION` |
+//! | `Vm`: `InvalidTimeout` | `INVALID_ARGUMENT` |
+//! | `Vm`: `StartFailed`・`StopFailed` | `INTERNAL` |
+//! | `Vm`・`GuestMount`: `Timeout` | `TIMEOUT` |
+//! | `Vm::CallbackLost`・`GuestMount::VmStopped`・`GuestMount::ReportChannelClosed` | `UNAVAILABLE` |
+//! | `GuestMount::Failed`・`InvalidReport` | `INTERNAL` |
+//! | `VirtiofsIo::Protocol` | 同名コードへ 1:1（`resource_exhausted` は `FAILED_PRECONDITION`） |
+//! | `VirtiofsIo::ReadOnlyShare` | `FAILED_PRECONDITION` |
+//! | `VirtiofsIo::InFlightLimitTooSmall`・`InvalidReconnectPolicy` | `INVALID_ARGUMENT` |
+//! | `VirtiofsIo::ConnectionLost`・`ReconnectFailed` | 未永続化 write があれば `DATA_LOSS`、なければ `UNAVAILABLE` |
+//! | 上記以外・将来追加分 | `INTERNAL`（fail-closed） |
+//! | [`BackendError::UnsupportedHost`] | `UNIMPLEMENTED` |
+//!
+//! message は先頭に元の `code()` を付ける（core が元の分類を区別できる）。`Config` 系は `message()` が要求由来の
+//! パスを埋め込むため使わず固定文言にする（入力の反射防止）。アダプタ自身の検証エラーも固定文言のみ。
+//!
+//! # 未実装範囲（実装済みを装わない。REPAIR-3）
+//! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（TASK-114 待ち）。
+//! - virtiofs 共有は「デバイス構成のみ」。ゲスト内 mount 先の指定は受け付けない（ゲスト init 未実装のため
+//!   `guest_mount.timeout` になる。MAC-1）。rootfs ブロックデバイス・コンソールログ・CPU / メモリ指定も含まない。
+//! - 1 コンテナ = 1 VM（常駐 VM 共用の MAC-4 は未決）。状態はプロセス内メモリのみ（都度起動モードでは引き継げない）。
+//! - VM 操作の期限は `OpTimeouts::default()`。core 側 RPC 期限との整合は TASK-114 の判断事項。
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use fandhe_container_platform_macos::config::{ConfigError, VmConfigSpec};
+use fandhe_container_platform_macos::error::{GuestMountError, PlatformError, VmError};
+use fandhe_container_platform_macos::virtiofs::{
+    ShareAccess, SharedDirectoryPath, VirtiofsIoError, VirtiofsShareSpec, VirtiofsSharesSpec,
+    VirtiofsTag,
+};
+use fandhe_container_plugin::{PluginError, PluginErrorCode};
+
+use crate::frame_loop::RequestHandler;
+
+/// 登録できるコンテナ数の上限（無制限確保の防止）。
+pub const MAX_CONTAINERS: usize = 64;
+
+/// id の最大バイト数（core の `ContainerId` と同じ）。
+const ID_MAX_BYTES: usize = 255;
+
+const MSG_MALFORMED: &str = "malformed request";
+const MSG_INVALID_ID: &str = "invalid container id";
+const MSG_UNIMPLEMENTED: &str = "operation is not implemented";
+const MSG_UNSUPPORTED_HOST: &str = "Virtualization.framework is only available on macOS";
+const MSG_CONFIG_REJECTED: &str = "VM configuration was rejected";
+
+/// platform-macos への委譲境界。実機は [`PlatformBackend`]、テストは偽実装。
+pub trait MacosBackend {
+    /// 起動済み VM のハンドル。drop で資源を手放す。
+    type Handle;
+    /// VM を構築して起動する（失敗時の後始末は実装側が担う）。
+    fn launch(&self, spec: &VmConfigSpec) -> Result<Self::Handle, BackendError>;
+    /// 期限つきで VM を停止する。
+    fn stop(&self, handle: &Self::Handle) -> Result<(), BackendError>;
+}
+
+/// [`MacosBackend`] の失敗。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackendError {
+    /// platform-macos が返したエラー。
+    Platform(PlatformError),
+    /// 非 macOS ビルド。Virtualization.framework を呼べない（fail-closed）。
+    UnsupportedHost,
+}
+
+impl From<PlatformError> for BackendError {
+    fn from(e: PlatformError) -> Self {
+        BackendError::Platform(e)
+    }
+}
+
+/// 実バックエンド。macOS では `Vm::launch` / `Vm::stop` へ委譲し、他 OS では常に `UnsupportedHost`。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PlatformBackend;
+
+#[cfg(target_os = "macos")]
+impl MacosBackend for PlatformBackend {
+    type Handle = fandhe_container_platform_macos::vm::Vm;
+
+    fn launch(&self, spec: &VmConfigSpec) -> Result<Self::Handle, BackendError> {
+        use fandhe_container_platform_macos::vm::{OpTimeouts, Vm};
+        Ok(Vm::launch(spec, OpTimeouts::default())?)
+    }
+
+    fn stop(&self, handle: &Self::Handle) -> Result<(), BackendError> {
+        handle.stop().map_err(|e| PlatformError::Vm(e).into())
+    }
+}
+
+/// 非 macOS 用の構築不能なハンドル型（起動が成功しないことを型で表す）。
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+pub enum NoVm {}
+
+#[cfg(not(target_os = "macos"))]
+impl MacosBackend for PlatformBackend {
+    type Handle = NoVm;
+
+    fn launch(&self, _spec: &VmConfigSpec) -> Result<Self::Handle, BackendError> {
+        Err(BackendError::UnsupportedHost)
+    }
+
+    fn stop(&self, handle: &Self::Handle) -> Result<(), BackendError> {
+        match *handle {}
+    }
+}
+
+enum State<H> {
+    Created,
+    Running(H),
+}
+
+struct Entry<H> {
+    spec: VmConfigSpec,
+    state: State<H>,
+}
+
+/// [`MacosRuntimeAdapter::stop_all`] の結果（件数のみ。秘匿情報を含めない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopAllSummary {
+    /// 停止に成功した実行中 VM の数。
+    pub stopped: usize,
+    /// 停止に失敗して残った実行中 VM の数。
+    pub remaining: usize,
+}
+
+/// create / start / stop を [`MacosBackend`] へ委譲する要求ハンドラ。
+pub struct MacosRuntimeAdapter<B: MacosBackend> {
+    backend: B,
+    entries: BTreeMap<String, Entry<B::Handle>>,
+}
+
+impl<B: MacosBackend> MacosRuntimeAdapter<B> {
+    /// 空の登録簿で作る。
+    pub fn new(backend: B) -> Self {
+        Self {
+            backend,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// 実行中の VM すべてに期限つき停止を試み、停止できた分を登録簿から外す。
+    ///
+    /// `Vm` の `Drop` は停止を要求するだけで待たないため、接続終了時に `main.rs` が明示的に呼ぶ。
+    pub fn stop_all(&mut self) -> StopAllSummary {
+        let mut summary = StopAllSummary {
+            stopped: 0,
+            remaining: 0,
+        };
+        let backend = &self.backend;
+        self.entries.retain(|_, entry| match &entry.state {
+            State::Created => false,
+            State::Running(h) => {
+                if backend.stop(h).is_ok() {
+                    summary.stopped += 1;
+                    false
+                } else {
+                    summary.remaining += 1;
+                    true
+                }
+            }
+        });
+        summary
+    }
+
+    fn create(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
+        let (id, kernel, initrd, cmdline, rest) = match body {
+            [_, id, kernel, initrd, cmdline, rest @ ..] => (id, kernel, initrd, cmdline, rest),
+            _ => return Err(invalid(MSG_MALFORMED)),
+        };
+        validate_id(id)?;
+        if rest.len() % 3 != 0 {
+            return Err(invalid(MSG_MALFORMED));
+        }
+        if self.entries.contains_key(id.as_str()) {
+            return Err(PluginError::new(
+                PluginErrorCode::AlreadyExists,
+                "container already exists",
+            ));
+        }
+        if self.entries.len() >= MAX_CONTAINERS {
+            return Err(PluginError::new(
+                PluginErrorCode::FailedPrecondition,
+                "too many containers",
+            ));
+        }
+        let initrd = if initrd.is_empty() {
+            None
+        } else {
+            Some(Path::new(initrd.as_str()))
+        };
+        let mut shares = Vec::new();
+        // 端数は上で検査済みのため捨てる剰余は空。
+        let (triples, _) = rest.as_chunks::<3>();
+        for triple in triples {
+            {
+                let [tag, dir, access] = triple;
+                let access = match access.as_str() {
+                    "ro" => ShareAccess::ReadOnly,
+                    "rw" => ShareAccess::ReadWrite,
+                    _ => return Err(invalid(MSG_MALFORMED)),
+                };
+                shares.push(VirtiofsShareSpec::new(
+                    VirtiofsTag::try_new(tag).map_err(config_to_plugin)?,
+                    SharedDirectoryPath::try_new(Path::new(dir.as_str()))
+                        .map_err(config_to_plugin)?,
+                    access,
+                ));
+            }
+        }
+        let spec = VmConfigSpec::from_parts(Path::new(kernel.as_str()), initrd, cmdline)
+            .map_err(config_to_plugin)?
+            .with_shared_directories(
+                VirtiofsSharesSpec::try_new(shares).map_err(config_to_plugin)?,
+            );
+        spec.check_share_conflicts().map_err(config_to_plugin)?;
+        self.entries.insert(
+            id.clone(),
+            Entry {
+                spec,
+                state: State::Created,
+            },
+        );
+        Ok(vec!["created".to_string()])
+    }
+
+    fn start(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
+        let id = single_id(body)?;
+        let entry = self.entries.get_mut(id).ok_or_else(not_found)?;
+        if !matches!(entry.state, State::Created) {
+            return Err(PluginError::new(
+                PluginErrorCode::FailedPrecondition,
+                "container is not in the created state",
+            ));
+        }
+        // 失敗時は Created のまま残す（再試行可。後始末は backend.launch が担う）。
+        let handle = self
+            .backend
+            .launch(&entry.spec)
+            .map_err(|e| backend_to_plugin(&e))?;
+        entry.state = State::Running(handle);
+        Ok(vec!["running".to_string()])
+    }
+
+    fn stop(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
+        let id = single_id(body)?;
+        let entry = self.entries.get(id).ok_or_else(not_found)?;
+        if let State::Running(h) = &entry.state {
+            // 失敗時は登録を残す（再試行可）。
+            self.backend.stop(h).map_err(|e| backend_to_plugin(&e))?;
+        }
+        self.entries.remove(id);
+        Ok(vec!["stopped".to_string()])
+    }
+}
+
+impl<B: MacosBackend> RequestHandler for MacosRuntimeAdapter<B> {
+    fn handle(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
+        match body.first().map(String::as_str) {
+            Some("create") => self.create(body),
+            Some("start") => self.start(body),
+            Some("stop") => self.stop(body),
+            _ => Err(PluginError::new(
+                PluginErrorCode::Unimplemented,
+                MSG_UNIMPLEMENTED,
+            )),
+        }
+    }
+}
+
+fn invalid(msg: &str) -> PluginError {
+    PluginError::new(PluginErrorCode::InvalidArgument, msg)
+}
+
+fn not_found() -> PluginError {
+    PluginError::new(PluginErrorCode::NotFound, "container not found")
+}
+
+/// `["start" | "stop", id]` の形を検証して id を返す。
+fn single_id(body: &[String]) -> Result<&str, PluginError> {
+    match body {
+        [_, id] => {
+            validate_id(id)?;
+            Ok(id.as_str())
+        }
+        _ => Err(invalid(MSG_MALFORMED)),
+    }
+}
+
+/// core の `ContainerId` と同じ規則（TASK-114 で core 型へ置換予定）。
+fn validate_id(id: &str) -> Result<(), PluginError> {
+    let ok = !id.is_empty()
+        && id.len() <= ID_MAX_BYTES
+        && id != "."
+        && id != ".."
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(MSG_INVALID_ID))
+    }
+}
+
+fn config_to_plugin(e: ConfigError) -> PluginError {
+    to_plugin_error(&PlatformError::Config(e))
+}
+
+fn backend_to_plugin(e: &BackendError) -> PluginError {
+    match e {
+        BackendError::Platform(p) => to_plugin_error(p),
+        BackendError::UnsupportedHost => {
+            PluginError::new(PluginErrorCode::Unimplemented, MSG_UNSUPPORTED_HOST)
+        }
+    }
+}
+
+/// platform-macos のエラーを plugin のエラーフレーム用へ変換する唯一の箇所（モジュール doc の対応表）。
+pub fn to_plugin_error(e: &PlatformError) -> PluginError {
+    use PluginErrorCode as C;
+    let (code, detail): (C, String) = match e {
+        PlatformError::Config(c) => {
+            let code = match c {
+                ConfigError::PathIo { .. }
+                | ConfigError::UrlConversion { .. }
+                | ConfigError::DiskAttachment { .. }
+                | ConfigError::ConsoleLogOpen { .. }
+                | ConfigError::ConsoleLogWriter { .. } => C::Internal,
+                ConfigError::ConsoleLogNotOwned { .. }
+                | ConfigError::ConsoleLogInsecureMode { .. }
+                | ConfigError::ConsoleLogParentWorldWritable { .. } => C::PermissionDenied,
+                ConfigError::ConsoleLogInUse { .. } => C::FailedPrecondition,
+                _ => C::InvalidArgument,
+            };
+            // message() は要求由来のパスを埋め込むため使わない。
+            (code, MSG_CONFIG_REJECTED.to_string())
+        }
+        PlatformError::Vm(v) => {
+            let code = match v {
+                VmError::VirtualizationUnsupported
+                | VmError::InvalidConfiguration { .. }
+                | VmError::InvalidState { .. } => C::FailedPrecondition,
+                VmError::InvalidTimeout { .. } => C::InvalidArgument,
+                VmError::Timeout { .. } => C::Timeout,
+                VmError::CallbackLost { .. } => C::Unavailable,
+                _ => C::Internal,
+            };
+            (code, e.message())
+        }
+        PlatformError::GuestMount(g) => {
+            let code = match g {
+                GuestMountError::Timeout { .. } => C::Timeout,
+                GuestMountError::VmStopped { .. } | GuestMountError::ReportChannelClosed => {
+                    C::Unavailable
+                }
+                _ => C::Internal,
+            };
+            (code, e.message())
+        }
+        PlatformError::VirtiofsIo(v) => {
+            let code = match v {
+                VirtiofsIoError::Protocol { .. } => match e.code() {
+                    "virtiofs_io.invalid_argument" => C::InvalidArgument,
+                    "virtiofs_io.timeout" => C::Timeout,
+                    "virtiofs_io.unavailable" => C::Unavailable,
+                    "virtiofs_io.unimplemented" => C::Unimplemented,
+                    "virtiofs_io.data_loss" => C::DataLoss,
+                    "virtiofs_io.already_exists" => C::AlreadyExists,
+                    "virtiofs_io.resource_exhausted" => C::FailedPrecondition,
+                    _ => C::Internal,
+                },
+                VirtiofsIoError::ReadOnlyShare { .. } => C::FailedPrecondition,
+                VirtiofsIoError::InFlightLimitTooSmall { .. }
+                | VirtiofsIoError::InvalidReconnectPolicy { .. } => C::InvalidArgument,
+                VirtiofsIoError::ConnectionLost {
+                    unflushed_writes, ..
+                }
+                | VirtiofsIoError::ReconnectFailed {
+                    unflushed_writes, ..
+                } => {
+                    if *unflushed_writes > 0 {
+                        C::DataLoss
+                    } else {
+                        C::Unavailable
+                    }
+                }
+                _ => C::Internal,
+            };
+            (code, e.message())
+        }
+        // 将来追加される分類は fail-closed で INTERNAL にする。
+        _ => (C::Internal, e.message()),
+    };
+    PluginError::new(code, format!("{}: {}", e.code(), detail))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use fandhe_container_io::{IoError, IoErrorCode};
+    use fandhe_container_platform_macos::error::VmOp;
+    use fandhe_container_platform_macos::virtiofs::VirtiofsIoOp;
+    use fandhe_container_platform_macos::vm::VmState;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Calls {
+        launched: Vec<(PathBuf, Vec<(String, bool)>)>,
+        stopped: Vec<u32>,
+        fail_launch: bool,
+        fail_stop: bool,
+        next: u32,
+    }
+
+    #[derive(Clone, Default)]
+    struct Fake(Rc<RefCell<Calls>>);
+
+    impl MacosBackend for Fake {
+        type Handle = u32;
+        fn launch(&self, spec: &VmConfigSpec) -> Result<u32, BackendError> {
+            let mut c = self.0.borrow_mut();
+            if c.fail_launch {
+                return Err(BackendError::Platform(PlatformError::Vm(
+                    VmError::StartFailed {
+                        domain: "d".into(),
+                        code: 1,
+                    },
+                )));
+            }
+            let shares = spec
+                .shares
+                .shares()
+                .iter()
+                .map(|s| (s.tag.as_str().to_string(), s.access.is_read_only()))
+                .collect();
+            c.launched
+                .push((spec.kernel.as_path().to_path_buf(), shares));
+            c.next += 1;
+            Ok(c.next)
+        }
+        fn stop(&self, h: &u32) -> Result<(), BackendError> {
+            let mut c = self.0.borrow_mut();
+            if c.fail_stop {
+                return Err(BackendError::UnsupportedHost);
+            }
+            c.stopped.push(*h);
+            Ok(())
+        }
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("fc-adapter-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("mkdir");
+        d.canonicalize().expect("canon")
+    }
+
+    fn kernel(dir: &Path) -> String {
+        let k = dir.join("vmlinuz");
+        std::fs::write(&k, b"k").expect("write");
+        k.to_str().expect("utf8").to_string()
+    }
+
+    fn adapter() -> (MacosRuntimeAdapter<Fake>, Fake) {
+        let f = Fake::default();
+        (MacosRuntimeAdapter::new(f.clone()), f)
+    }
+
+    fn create_ok(a: &mut MacosRuntimeAdapter<Fake>, id: &str, k: &str) {
+        let r = a.handle(&s(&["create", id, k, "", "console=hvc0"]));
+        assert_eq!(r.expect("create"), s(&["created"]));
+    }
+
+    fn err_of(r: Result<Vec<String>, PluginError>) -> (PluginErrorCode, String) {
+        let e = r.expect_err("must fail");
+        (e.code(), e.message().to_string())
+    }
+
+    /// TASK-115.3・PLUG-1・MAC-1: create は登録のみ、start が launch を 1 回、stop が stop を 1 回呼ぶ。
+    #[test]
+    fn task115_3_plug1_mac1_create_start_stop_delegate() {
+        let dir = tmp_dir("flow");
+        let k = kernel(&dir);
+        let share = dir.join("share");
+        std::fs::create_dir_all(&share).expect("mkdir");
+        let (mut a, f) = adapter();
+        let r = a.handle(&s(&[
+            "create",
+            "c1",
+            &k,
+            "",
+            "console=hvc0",
+            "data",
+            share.to_str().expect("utf8"),
+            "rw",
+        ]));
+        assert_eq!(r.expect("create"), s(&["created"]));
+        assert!(f.0.borrow().launched.is_empty());
+        assert_eq!(
+            a.handle(&s(&["start", "c1"])).expect("start"),
+            s(&["running"])
+        );
+        assert_eq!(
+            f.0.borrow().launched,
+            vec![(PathBuf::from(&k), vec![("data".to_string(), false)])]
+        );
+        assert_eq!(
+            a.handle(&s(&["stop", "c1"])).expect("stop"),
+            s(&["stopped"])
+        );
+        assert_eq!(f.0.borrow().stopped, vec![1]);
+        assert_eq!(
+            err_of(a.handle(&s(&["start", "c1"]))).0,
+            PluginErrorCode::NotFound
+        );
+    }
+
+    /// TASK-115.3・PLUG-1: 状態遷移・重複・上限・未登録のエラーコード。
+    #[test]
+    fn task115_3_plug1_state_errors() {
+        let dir = tmp_dir("state");
+        let k = kernel(&dir);
+        let (mut a, _f) = adapter();
+        create_ok(&mut a, "a", &k);
+        let dup = a.handle(&s(&["create", "a", &k, "", ""]));
+        assert_eq!(err_of(dup).0, PluginErrorCode::AlreadyExists);
+        assert_eq!(
+            err_of(a.handle(&s(&["stop", "zz"]))).0,
+            PluginErrorCode::NotFound
+        );
+        a.handle(&s(&["start", "a"])).expect("start");
+        let (c, m) = err_of(a.handle(&s(&["start", "a"])));
+        assert_eq!(c, PluginErrorCode::FailedPrecondition);
+        assert_eq!(m, "container is not in the created state");
+        for i in 1..MAX_CONTAINERS {
+            create_ok(&mut a, &format!("n{i}"), &k);
+        }
+        let over = a.handle(&s(&["create", "over", &k, "", ""]));
+        assert_eq!(
+            err_of(over),
+            (
+                PluginErrorCode::FailedPrecondition,
+                "too many containers".to_string()
+            )
+        );
+    }
+
+    /// TASK-115.3・PLUG-1・REPAIR-2: 不正本体は固定文言で拒否し、入力値を反射しない。
+    #[test]
+    fn task115_3_plug1_malformed_requests_do_not_reflect_input() {
+        let (mut a, _f) = adapter();
+        let cases: Vec<Vec<String>> = vec![
+            s(&["create", "a", "/k", ""]),
+            s(&["create", "a", "/k", "", "c", "tag"]),
+            s(&["create", "a", "/k", "", "c", "tag", "/d", "SECRETMODE"]),
+            s(&["create", "..", "/k", "", "c"]),
+            s(&["create", "a/b", "/k", "", "c"]),
+            s(&["start"]),
+            s(&["start", "a", "extra"]),
+            s(&["stop", ""]),
+        ];
+        for body in cases {
+            let (c, m) = err_of(a.handle(&body));
+            assert_eq!(c, PluginErrorCode::InvalidArgument, "{body:?}");
+            assert!(
+                m == "malformed request" || m == "invalid container id",
+                "{m}"
+            );
+        }
+    }
+
+    /// TASK-115.3・PLUG-1: kill / delete / state / 未知操作は UNIMPLEMENTED。
+    #[test]
+    fn task115_3_plug1_unknown_ops_unimplemented() {
+        let (mut a, _f) = adapter();
+        for op in ["kill", "delete", "state", "bogus"] {
+            let (c, m) = err_of(a.handle(&s(&[op, "a"])));
+            assert_eq!(c, PluginErrorCode::Unimplemented);
+            assert_eq!(m, "operation is not implemented");
+        }
+    }
+
+    /// TASK-115.3・REPAIR-3: launch 失敗は Created のまま残り、stop 失敗は登録を残す。
+    #[test]
+    fn task115_3_mac1_failures_keep_state_for_retry() {
+        let dir = tmp_dir("retry");
+        let k = kernel(&dir);
+        let (mut a, f) = adapter();
+        create_ok(&mut a, "a", &k);
+        f.0.borrow_mut().fail_launch = true;
+        let (c, m) = err_of(a.handle(&s(&["start", "a"])));
+        assert_eq!(c, PluginErrorCode::Internal);
+        assert!(m.starts_with("vm.start_failed: "), "{m}");
+        f.0.borrow_mut().fail_launch = false;
+        a.handle(&s(&["start", "a"])).expect("retry start");
+        f.0.borrow_mut().fail_stop = true;
+        let (c, m) = err_of(a.handle(&s(&["stop", "a"])));
+        assert_eq!(c, PluginErrorCode::Unimplemented);
+        assert_eq!(m, MSG_UNSUPPORTED_HOST);
+        f.0.borrow_mut().fail_stop = false;
+        a.handle(&s(&["stop", "a"])).expect("retry stop");
+    }
+
+    /// TASK-115.3・MAC-1: Config 系エラーは要求由来のパスを message に含めない。
+    #[test]
+    fn task115_3_mac1_config_error_does_not_leak_path() {
+        let (mut a, _f) = adapter();
+        let (c, m) = err_of(a.handle(&s(&["create", "a", "/nonexistent/SECRETPATH", "", ""])));
+        assert_eq!(c, PluginErrorCode::InvalidArgument);
+        assert_eq!(m, "config.path_not_found: VM configuration was rejected");
+    }
+
+    /// TASK-115.3・PLUG-1: stop_all は実行中のみ数え、失敗分は残す。
+    #[test]
+    fn task115_3_plug1_stop_all_counts() {
+        let dir = tmp_dir("stopall");
+        let k = kernel(&dir);
+        let (mut a, f) = adapter();
+        for id in ["a", "b", "c"] {
+            create_ok(&mut a, id, &k);
+        }
+        a.handle(&s(&["start", "a"])).expect("start");
+        a.handle(&s(&["start", "b"])).expect("start");
+        f.0.borrow_mut().fail_stop = true;
+        assert_eq!(
+            a.stop_all(),
+            StopAllSummary {
+                stopped: 0,
+                remaining: 2
+            }
+        );
+        f.0.borrow_mut().fail_stop = false;
+        assert_eq!(
+            a.stop_all(),
+            StopAllSummary {
+                stopped: 2,
+                remaining: 0
+            }
+        );
+    }
+
+    fn pe(e: PlatformError) -> (PluginErrorCode, String) {
+        let p = to_plugin_error(&e);
+        (p.code(), p.message().to_string())
+    }
+
+    /// TASK-115.3・ERR-1: エラー対応表の各行を具体値で照合する。
+    #[test]
+    fn task115_3_err1_mapping_table() {
+        use PluginErrorCode as C;
+        let p = || PathBuf::from("/x");
+        let cfg = |e| PlatformError::Config(e);
+        assert_eq!(pe(cfg(ConfigError::InvalidCpuCount)).0, C::InvalidArgument);
+        assert_eq!(
+            pe(cfg(ConfigError::PathIo {
+                field: fandhe_container_platform_macos::config::ConfigField::Kernel,
+                kind: std::io::ErrorKind::Other
+            }))
+            .0,
+            C::Internal
+        );
+        assert_eq!(
+            pe(cfg(ConfigError::ConsoleLogParentWorldWritable {
+                path: p()
+            })),
+            (
+                C::PermissionDenied,
+                "config.console_log_parent_world_writable: VM configuration was rejected"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            pe(cfg(ConfigError::ConsoleLogInUse { path: p() })).0,
+            C::FailedPrecondition
+        );
+        let vm = |e| PlatformError::Vm(e);
+        let d = || "dom".to_string();
+        assert_eq!(
+            pe(vm(VmError::VirtualizationUnsupported)).0,
+            C::FailedPrecondition
+        );
+        assert_eq!(
+            pe(vm(VmError::InvalidConfiguration {
+                domain: d(),
+                code: 1
+            }))
+            .0,
+            C::FailedPrecondition
+        );
+        assert_eq!(
+            pe(vm(VmError::InvalidState {
+                op: VmOp::Start,
+                state: VmState::Running
+            }))
+            .0,
+            C::FailedPrecondition
+        );
+        assert_eq!(
+            pe(vm(VmError::InvalidTimeout {
+                field: "start",
+                requested: Duration::ZERO,
+                min: Duration::from_millis(100),
+                max: Duration::from_secs(600)
+            }))
+            .0,
+            C::InvalidArgument
+        );
+        assert_eq!(
+            pe(vm(VmError::StopFailed {
+                domain: d(),
+                code: 2
+            })),
+            (
+                C::Internal,
+                "vm.stop_failed: virtual machine failed to stop (dom, code 2)".to_string()
+            )
+        );
+        assert_eq!(
+            pe(vm(VmError::Timeout {
+                op: VmOp::Start,
+                after: Duration::from_secs(30)
+            })),
+            (
+                C::Timeout,
+                "vm.timeout: start did not complete within 30s".to_string()
+            )
+        );
+        assert_eq!(
+            pe(vm(VmError::CallbackLost { op: VmOp::Stop })).0,
+            C::Unavailable
+        );
+        let gm = |e| PlatformError::GuestMount(e);
+        assert_eq!(
+            pe(gm(GuestMountError::Timeout {
+                after: Duration::from_secs(60),
+                pending: vec![]
+            }))
+            .0,
+            C::Timeout
+        );
+        assert_eq!(
+            pe(gm(GuestMountError::VmStopped {
+                state: VmState::Stopped
+            }))
+            .0,
+            C::Unavailable
+        );
+        assert_eq!(
+            pe(gm(GuestMountError::ReportChannelClosed)).0,
+            C::Unavailable
+        );
+        assert_eq!(
+            pe(gm(GuestMountError::Failed {
+                tag: "t".into(),
+                errno: 5
+            }))
+            .0,
+            C::Internal
+        );
+        assert_eq!(
+            pe(gm(GuestMountError::InvalidReport { reason: "r".into() })).0,
+            C::Internal
+        );
+    }
+
+    /// TASK-115.3・ERR-1・IO-2: virtiofs I/O エラーの対応（データ喪失の可能性を区別する）。
+    #[test]
+    fn task115_3_err1_virtiofs_io_mapping() {
+        use PluginErrorCode as C;
+        let io = |c| IoError::new(c, "x");
+        let proto = |c| {
+            PlatformError::VirtiofsIo(VirtiofsIoError::Protocol {
+                op: VirtiofsIoOp::Write,
+                source: io(c),
+            })
+        };
+        assert_eq!(pe(proto(IoErrorCode::Timeout)).0, C::Timeout);
+        assert_eq!(pe(proto(IoErrorCode::Unavailable)).0, C::Unavailable);
+        assert_eq!(pe(proto(IoErrorCode::DataLoss)).0, C::DataLoss);
+        assert_eq!(pe(proto(IoErrorCode::AlreadyExists)).0, C::AlreadyExists);
+        assert_eq!(
+            pe(proto(IoErrorCode::ResourceExhausted)),
+            (
+                C::FailedPrecondition,
+                format!(
+                    "virtiofs_io.resource_exhausted: {}",
+                    proto(IoErrorCode::ResourceExhausted).message()
+                )
+            )
+        );
+        let lost = |n| {
+            PlatformError::VirtiofsIo(VirtiofsIoError::ConnectionLost {
+                op: VirtiofsIoOp::Write,
+                unflushed_writes: n,
+                reconnected: false,
+                source: io(IoErrorCode::Unavailable),
+            })
+        };
+        assert_eq!(pe(lost(3)).0, C::DataLoss);
+        assert_eq!(pe(lost(0)).0, C::Unavailable);
+        let failed = PlatformError::VirtiofsIo(VirtiofsIoError::ReconnectFailed {
+            attempts: 3,
+            unflushed_writes: 1,
+            source: io(IoErrorCode::Unavailable),
+        });
+        assert_eq!(pe(failed).0, C::DataLoss);
+        assert_eq!(
+            pe(PlatformError::VirtiofsIo(
+                VirtiofsIoError::InFlightLimitTooSmall { limit: 1 }
+            ))
+            .0,
+            C::InvalidArgument
+        );
+        assert_eq!(
+            pe(PlatformError::VirtiofsIo(
+                VirtiofsIoError::InvalidReconnectPolicy { field: "f" }
+            ))
+            .0,
+            C::InvalidArgument
+        );
+        assert_eq!(
+            pe(PlatformError::VirtiofsIo(VirtiofsIoError::UnexpectedAck {
+                op: VirtiofsIoOp::Flush
+            }))
+            .0,
+            C::Internal
+        );
+        let tag = VirtiofsTag::try_new("t").expect("tag");
+        assert_eq!(
+            pe(PlatformError::VirtiofsIo(VirtiofsIoError::ReadOnlyShare {
+                tag
+            }))
+            .0,
+            C::FailedPrecondition
+        );
+    }
+
+    /// TASK-115.3・REPAIR-3: 非 macOS の実バックエンドは UNIMPLEMENTED で成功を装わない。
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn task115_3_repair3_platform_backend_is_unsupported_off_macos() {
+        let dir = tmp_dir("unsupported");
+        let k = kernel(&dir);
+        let mut a = MacosRuntimeAdapter::new(PlatformBackend);
+        assert_eq!(
+            a.handle(&s(&["create", "a", &k, "", ""])).expect("create"),
+            s(&["created"])
+        );
+        assert_eq!(
+            err_of(a.handle(&s(&["start", "a"]))),
+            (
+                PluginErrorCode::Unimplemented,
+                MSG_UNSUPPORTED_HOST.to_string()
+            )
+        );
+    }
+}

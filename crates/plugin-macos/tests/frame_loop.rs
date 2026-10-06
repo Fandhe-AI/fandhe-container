@@ -159,7 +159,7 @@ fn expect_disconnected(h: &mut Harness) {
 #[test]
 fn task115_2_plug1_sequential_requests_keep_connection_and_exit_0_on_close() {
     let mut h = Harness::start();
-    expect_unimplemented(h.call(1, &["create", "a"]), 1);
+    expect_unimplemented(h.call(1, &["kill", "a"]), 1);
     expect_unimplemented(h.call(2, &["list"]), 2);
     let (code, err) = h.finish();
     assert_eq!(code, 0, "{err}");
@@ -287,4 +287,77 @@ fn task115_2_plug1_stalled_partial_frame_times_out() {
     let (code, err) = h.finish_with(false);
     assert_eq!(code, 4, "{err}");
     assert!(err.starts_with("error: TIMEOUT: "), "{err}");
+}
+
+/// 応答が Error のとき (code, message) を返す。
+fn expect_error(msg: ControlMessage<Vec<String>>, want_id: u64) -> (PluginErrorCode, String) {
+    match msg {
+        ControlMessage::Error { id, error } => {
+            assert_eq!(id.get(), want_id);
+            (error.code(), error.message().to_string())
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// 3 OS 共通の検証経路（TASK-115.3・#387）: 存在しない kernel と不正 id は固定文言の INVALID_ARGUMENT。
+#[test]
+fn task115_3_plug1_adapter_rejects_invalid_create_with_fixed_messages() {
+    let mut h = Harness::start();
+    let r = expect_error(
+        h.call(1, &["create", "a", "/nonexistent/SECRET", "", ""]),
+        1,
+    );
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::InvalidArgument,
+            "config.path_not_found: VM configuration was rejected".to_string()
+        )
+    );
+    let r = expect_error(h.call(2, &["create", "..", "/k", "", ""]), 2);
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::InvalidArgument,
+            "invalid container id".to_string()
+        )
+    );
+    expect_unimplemented(h.call(3, &["kill", "a"]), 3);
+    let (code, err) = h.finish();
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(err, "");
+}
+
+/// create 成功後の start は、非 macOS では UNIMPLEMENTED、macOS では entitlement なしの VZ 失敗（Error）になる。
+/// いずれも接続は継続し、後続要求に応答して終了コード 0 で終わる。
+#[test]
+fn task115_3_mac1_start_returns_error_frame_and_keeps_connection() {
+    let mut h = Harness::start();
+    let kernel = h.dir.join("kernel");
+    std::fs::write(&kernel, b"k").expect("write kernel");
+    let k = kernel.to_str().expect("utf8").to_string();
+    match h.call(1, &["create", "a", &k, "", ""]) {
+        ControlMessage::Response { id, body } => {
+            assert_eq!(id.get(), 1);
+            assert_eq!(body, vec!["created".to_string()]);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    let (code, message) = expect_error(h.call(2, &["start", "a"]), 2);
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert_eq!(code, PluginErrorCode::Unimplemented);
+        assert_eq!(
+            message,
+            "Virtualization.framework is only available on macOS"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (code, message);
+    }
+    expect_unimplemented(h.call(3, &["delete", "a"]), 3);
+    let (code, err) = h.finish();
+    assert_eq!(code, 0, "{err}");
 }

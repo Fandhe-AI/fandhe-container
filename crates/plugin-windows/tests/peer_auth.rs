@@ -4,7 +4,8 @@
 //! `UdsStream::connect`（server の peer UID 照合つき）のみであることを固定する。
 //! 別 UID の listener の拒否は root なしに用意できないため `#[ignore]` の実機前提テスト（準備手順は
 //! `AGENTS.md`「実機前提テスト」節）。待ちはすべて期限つきで、超過時は kill して失敗にする（REPAIR-5）。
-//! 実行環境は unix のみ（WIN-1: 実行時は WSL2 内の Linux）。
+//! 実行環境は unix のみ（plugin 境界機構の UDS が unix 限定のため）。
+//! 本番の実行場所（Windows ホスト側か WSL2 内か）は未確定で、#1415 でオーナー判断待ち（WIN-1）。
 #![cfg(unix)]
 
 use std::io::Read;

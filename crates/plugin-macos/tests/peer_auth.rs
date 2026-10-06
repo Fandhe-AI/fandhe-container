@@ -20,6 +20,8 @@ use fandhe_container_plugin::{
 
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-macos");
 const WAIT: Duration = Duration::from_secs(30);
+/// 別プロセス listener の受信記録が出揃うのを待つ猶予（plugin 終了後に 0 バイトを監視し続ける時間）。
+const SETTLE: Duration = Duration::from_secs(2);
 /// peer 不一致の拒否で返る固定メッセージ（共有 crate 側の契約と同値。UID 値を含めない）。
 const MISMATCH_MESSAGE: &str = "peer credential does not match the current user";
 
@@ -157,14 +159,23 @@ fn task115_4_plug12_rejects_other_uid_listener() {
     assert!(!err.contains(path.to_str().expect("utf8")), "{err}");
 
     // 認証前にデータを送る回帰の検出: listener が受信したバイト数は 0 でなければならない。
-    let received = std::fs::metadata(&recv_path).expect("received-bytes file must exist");
+    // plugin の終了は別プロセス listener の記録完了を保証しないため、終了後に決定的な猶予
+    // （SETTLE）の間サイズを監視し続け、1 バイトでも観測した時点で失敗にする（REPAIR-5・REPAIR-12）。
     assert!(
-        received.is_file(),
+        std::fs::metadata(&recv_path)
+            .expect("received-bytes file must exist")
+            .is_file(),
         "received-bytes file must be a regular file"
     );
-    assert_eq!(
-        received.len(),
-        0,
-        "listener of another UID must receive 0 bytes before peer authentication"
-    );
+    let start = Instant::now();
+    while start.elapsed() < SETTLE {
+        let len = std::fs::metadata(&recv_path)
+            .expect("received-bytes file must exist")
+            .len();
+        assert_eq!(
+            len, 0,
+            "listener of another UID must receive 0 bytes before peer authentication"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

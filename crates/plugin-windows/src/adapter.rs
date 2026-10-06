@@ -63,7 +63,9 @@ use fandhe_container_platform_windows::wsl2::{
     self, DistroName, HostDir, LaunchRequest, Launched, MAX_SHARED_MOUNTS, MountError, MountName,
     PreparedLaunch, SharedMount, SharedTransport, TransportPolicy,
 };
-use fandhe_container_plugin::{PluginError, PluginErrorCode, UDS_RPC_TIMEOUT_DEFAULT};
+use fandhe_container_plugin::{
+    ONE_SHOT_EXIT_TIMEOUT, PluginError, PluginErrorCode, UDS_RPC_TIMEOUT_DEFAULT,
+};
 
 use crate::frame_loop::RequestHandler;
 
@@ -86,9 +88,16 @@ pub const REQUEST_BUDGET: Duration = UDS_RPC_TIMEOUT_DEFAULT.saturating_sub(RESP
 /// （全マウントで共有。stop では要求の残り時間とのうち短い方を渡す。REPAIR-5・WIN-2）。
 pub const RELEASE_BUDGET: Duration = Duration::from_secs(4);
 
+/// 終了時の解除の後、終了行の出力とプロセス終了に残す余裕。
+pub const EXIT_MARGIN: Duration = Duration::from_secs(1);
+
 /// [`WindowsRuntimeAdapter::release_all`] 全体の合計期限（複数コンテナ・複数マウントで共有）。
 /// 超過分は解除せず `entries` に残し、[`ReleaseAllReport::remaining`] で報告する。
-pub const RELEASE_ALL_BUDGET: Duration = Duration::from_secs(8);
+///
+/// 呼び出し元（core 側）が plugin の自発終了を待つ猶予 `ONE_SHOT_EXIT_TIMEOUT`（超過で強制終了）から
+/// [`EXIT_MARGIN`] を引いた値。終了時の解除はこの 1 回だけで、[`Drop`] は再試行しない（終了処理全体を
+/// 猶予内に収める。REPAIR-5・WIN-2）。
+pub const RELEASE_ALL_BUDGET: Duration = ONE_SHOT_EXIT_TIMEOUT.saturating_sub(EXIT_MARGIN);
 
 /// 残り期限がこの値未満のときは新たな解除を始めない（platform-windows の最小期限より十分大きく取る）。
 const MIN_STEP_BUDGET: Duration = Duration::from_millis(50);
@@ -467,6 +476,8 @@ pub struct WindowsRuntimeAdapter<B: WindowsBackend, G: GuestStart<B::Prepared>> 
     backend: B,
     guest: G,
     entries: BTreeMap<String, Entry<B::Prepared>>,
+    /// 直近の要求より後に [`Self::release_all`] が最後まで走ったか（`Drop` での二重の解除を避ける）。
+    release_all_done: bool,
 }
 
 impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> {
@@ -476,6 +487,7 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
             backend,
             guest,
             entries: BTreeMap::new(),
+            release_all_done: false,
         }
     }
 
@@ -560,6 +572,8 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
         total: Duration,
     ) -> Result<Vec<String>, PluginError> {
         let deadline = RequestDeadline::after(total);
+        // 要求を処理した後の状態は未解除かもしれないため、終了時の解除をやり直せるようにする。
+        self.release_all_done = false;
         match body.first().map(String::as_str) {
             Some("create") => self.create(body, deadline),
             Some("start") => self.start(body, deadline),
@@ -570,7 +584,9 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
 
     /// 保持中のマウントをすべて解除する（接続終了・異常終了時の後始末。WIN-2・REPAIR-5）。
     ///
-    /// `serve` 終了後に呼ぶほか、[`Drop`] からも呼ばれる（冪等）。全体で [`RELEASE_ALL_BUDGET`] の
+    /// `serve` 終了後に呼ぶ（冪等）。呼ばれないまま破棄された場合（panic・早期 return）に限り [`Drop`] が
+    /// 1 回呼ぶ。本関数が最後まで走った後の `Drop` は再試行しない（解除の合計を [`RELEASE_ALL_BUDGET`] の
+    /// 1 回分に収め、呼び出し元の終了猶予を超えない）。全体で [`RELEASE_ALL_BUDGET`] の
     /// 合計期限を持ち、各解除には残り時間（最大 [`RELEASE_BUDGET`]）だけを渡す。解除に失敗した・期限切れで
     /// 着手できなかった準備済みマウントは `entries` に残し、件数を [`ReleaseAllReport::remaining`] で返す
     /// （手動回収または次回の stop / release_all で再試行できる）。
@@ -621,6 +637,8 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
                 }
             }
         }
+        // 途中で panic して巻き戻った場合は立てない（その場合は Drop が残りの解除を試みる）。
+        self.release_all_done = true;
         report
     }
 
@@ -676,9 +694,12 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
 
 impl<B: WindowsBackend, G: GuestStart<B::Prepared>> Drop for WindowsRuntimeAdapter<B, G> {
     fn drop(&mut self) {
-        // panic・早期 return 経路でも共有マウントを残さない（WIN-2）。結果は呼び出し元が
-        // 明示的に `release_all` を呼んだ場合のみ観測できる。
-        let _ = self.release_all();
+        // panic・早期 return 経路でも共有マウントを残さない（WIN-2）。明示的な `release_all` が
+        // 最後まで走った後は再試行しない（終了処理が呼び出し元の終了猶予を超えて強制終了されると、
+        // 解除が途中で止まるため。REPAIR-5）。残った件数はその戻り値で報告済み。
+        if !self.release_all_done {
+            let _ = self.release_all();
+        }
     }
 }
 
@@ -1173,8 +1194,34 @@ mod tests {
         assert_eq!((r.released, r.remaining), (1, 0));
     }
 
+    /// REPAIR-5: 終了時の解除の合計期限は、呼び出し元の終了猶予 5 秒から余裕 1 秒を引いた 4 秒。
     #[test]
-    fn task116_3_win2_release_all_reports_remaining_and_drop_retries() {
+    fn task116_3_repair5_release_all_budget_fits_in_exit_grace() {
+        assert_eq!(ONE_SHOT_EXIT_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(EXIT_MARGIN, Duration::from_secs(1));
+        assert_eq!(RELEASE_ALL_BUDGET, Duration::from_secs(4));
+    }
+
+    /// REPAIR-5・WIN-2: release_all を呼ばずに破棄した場合は Drop が 1 回だけ解除を試みる。
+    #[test]
+    fn task116_3_win2_drop_releases_when_release_all_was_not_called() {
+        let (mut a, calls) = adapter(Fake::default());
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap();
+        drop(a);
+        assert_eq!(calls.borrow().last().unwrap(), "release:Ubuntu");
+        let releases = calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("release"))
+            .count();
+        assert_eq!(releases, 1);
+    }
+
+    /// REPAIR-5・WIN-2: 明示的な release_all が残り件数を報告した後、Drop は解除を再試行しない
+    /// （解除の試行は 1 回。終了処理の合計を RELEASE_ALL_BUDGET の 1 回分に収める）。
+    #[test]
+    fn task116_3_win2_release_all_reports_remaining_and_drop_does_not_retry() {
         let fake = Fake::default();
         *fake.release_err.borrow_mut() = Some(BackendFailure {
             error: WinError::new(WinErrorCode::Timeout, "timed out"),
@@ -1192,7 +1239,18 @@ mod tests {
             .iter()
             .filter(|c| c.starts_with("release"))
             .count();
-        assert_eq!(releases, 2);
+        assert_eq!(releases, 1);
+    }
+
+    /// WIN-2: release_all の後に要求を処理した場合は、破棄時に Drop が改めて解除を試みる。
+    #[test]
+    fn task116_3_win2_drop_releases_mounts_created_after_release_all() {
+        let (mut a, calls) = adapter(Fake::default());
+        assert_eq!(a.release_all(), ReleaseAllReport::default());
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap();
+        drop(a);
+        assert_eq!(calls.borrow().last().unwrap(), "release:Ubuntu");
     }
 
     #[test]

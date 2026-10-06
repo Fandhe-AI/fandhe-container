@@ -117,6 +117,9 @@ mod linux {
 
         let exe = std::env::current_exe().expect("current_exe");
         let mut joiner = Command::new("nsenter")
+            // `--map-root-user` の user namespace は setgroups が deny のため、nsenter 既定の
+            // setgroups(0) が EPERM になる。資格情報を維持して参加する。
+            .arg("--preserve-credentials")
             .arg(format!("--user=/proc/{pid1}/ns/user"))
             .arg(exe)
             .arg("--joiner")

@@ -48,6 +48,10 @@
 //! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（TASK-114 待ち）。
 //! - virtiofs 共有は「デバイス構成のみ」。ゲスト内 mount 先の指定は受け付けない（ゲスト init 未実装のため
 //!   `guest_mount.timeout` になる。MAC-1）。rootfs ブロックデバイス・コンソールログ・CPU / メモリ指定も含まない。
+//! - 起動失敗後の `start` 再試行は拒否する（失敗した VM の停止は非同期で完了を確認できず、VM が重複し得るため。
+//!   `stop` で登録を解除し `create` し直す）。同時実行 VM 数は [`SHUTDOWN_BUDGET`] 内に逐次停止できる数
+//!   （停止待ち 2 秒なら 2）に制限する。停止できず残った VM の回収は `Vm` の drop 停止要求（非同期）と
+//!   core の終了処理に委ね、完了は保証しない。
 //! - 1 コンテナ = 1 VM（常駐 VM 共用の MAC-4 は未決）。状態はプロセス内メモリのみ（都度起動モードでは引き継げない）。
 //! - VM 操作の期限は core 側 RPC・都度起動の合計期限（10 秒）と終了猶予（5 秒）に収まる固定値
 //!   （[`LAUNCH_START_TIMEOUT`] 等・[`SHUTDOWN_BUDGET`]）。core からの期限伝達（要求本体への期限指定）は TASK-114。
@@ -190,6 +194,10 @@ impl MacosBackend for PlatformBackend {
 
 enum State<H> {
     Created,
+    /// 起動に失敗した。`Vm` の drop による停止要求は非同期で完了を待てないため、先の VM が止まったことを
+    /// 確認できない。そのため `start` の再試行を拒否し（VM の重複起動防止。REPAIR-3）、`stop` での登録解除と
+    /// 新規 `create` だけを許す。
+    LaunchFailed,
     Running(H),
 }
 
@@ -233,6 +241,10 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
     ///
     /// 残り予算が 1 回の停止待ち（[`MacosBackend::stop_timeout`]）に満たなければ以降の VM は試さず
     /// `remaining` に数える（core の終了猶予を超えて plugin が強制終了されるのを避ける。REPAIR-5）。
+    /// 同時に実行できる VM 数は [`Self::max_running`] で予算内に全件停止できる数へ抑えているため、
+    /// 通常は `remaining` が 0 になる。停止できず残った VM は登録簿に残り、呼び出し側（`main.rs`）が
+    /// `plugin.cleanup` の `remaining` と終了コードで報告する。以降の回収は `Vm` の drop による停止要求
+    /// （非同期・有界回数）と core 側の終了処理に委ねる（完了は保証しない。REPAIR-3）。
     pub fn stop_all_within(&mut self, budget: Duration) -> StopAllSummary {
         let deadline = Instant::now() + budget;
         let per_stop = self.backend.stop_timeout();
@@ -242,7 +254,7 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         };
         let backend = &self.backend;
         self.entries.retain(|_, entry| match &entry.state {
-            State::Created => false,
+            State::Created | State::LaunchFailed => false,
             State::Running(h) => {
                 let affordable = deadline
                     .checked_duration_since(Instant::now())
@@ -261,6 +273,17 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
             }
         });
         summary
+    }
+
+    /// 同時に実行できる VM 数の上限。[`SHUTDOWN_BUDGET`] 内で逐次停止できる数（停止待ちが 0 なら制限しない）。
+    fn max_running(&self) -> usize {
+        let per_stop = self.backend.stop_timeout().as_millis();
+        if per_stop == 0 {
+            return usize::MAX;
+        }
+        usize::try_from(SHUTDOWN_BUDGET.as_millis() / per_stop)
+            .unwrap_or(usize::MAX)
+            .max(1)
     }
 
     fn create(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
@@ -326,6 +349,12 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
 
     fn start(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
         let id = single_id(body)?;
+        let running = self
+            .entries
+            .values()
+            .filter(|e| matches!(e.state, State::Running(_)))
+            .count();
+        let max_running = self.max_running();
         let entry = self.entries.get_mut(id).ok_or_else(not_found)?;
         if !matches!(entry.state, State::Created) {
             return Err(PluginError::new(
@@ -333,13 +362,24 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
                 "container is not in the created state",
             ));
         }
-        // 失敗時は Created のまま残す（再試行可。後始末は backend.launch が担う）。
-        let handle = self
-            .backend
-            .launch(&entry.spec)
-            .map_err(|e| backend_to_plugin(&e))?;
-        entry.state = State::Running(handle);
-        Ok(vec!["running".to_string()])
+        if running >= max_running {
+            return Err(PluginError::new(
+                PluginErrorCode::FailedPrecondition,
+                "too many running VMs",
+            ));
+        }
+        // 失敗時は LaunchFailed にして再試行を拒否する（失敗した VM の停止は非同期で完了を確認できず、
+        // 再試行すると VM が重複し得るため。後始末は backend.launch が担う）。
+        match self.backend.launch(&entry.spec) {
+            Ok(handle) => {
+                entry.state = State::Running(handle);
+                Ok(vec!["running".to_string()])
+            }
+            Err(e) => {
+                entry.state = State::LaunchFailed;
+                Err(backend_to_plugin(&e))
+            }
+        }
     }
 
     fn stop(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
@@ -707,10 +747,10 @@ mod tests {
         }
     }
 
-    /// TASK-115.3・REPAIR-3: launch 失敗は Created のまま残り、stop 失敗は登録を残す。
+    /// TASK-115.3・REPAIR-3: launch 失敗後は start 再試行を拒否し（VM 重複防止）、stop で登録を解除できる。
     #[test]
-    fn task115_3_mac1_failures_keep_state_for_retry() {
-        let dir = tmp_dir("retry");
+    fn task115_3_repair3_launch_failure_blocks_restart() {
+        let dir = tmp_dir("launchfail");
         let k = kernel(&dir);
         let (mut a, f) = adapter();
         create_ok(&mut a, "a", &k);
@@ -719,7 +759,52 @@ mod tests {
         assert_eq!(c, PluginErrorCode::Internal);
         assert!(m.starts_with("vm.start_failed: "), "{m}");
         f.0.borrow_mut().fail_launch = false;
-        a.handle(&s(&["start", "a"])).expect("retry start");
+        let (c, m) = err_of(a.handle(&s(&["start", "a"])));
+        assert_eq!(c, PluginErrorCode::FailedPrecondition);
+        assert_eq!(m, "container is not in the created state");
+        assert!(f.0.borrow().launched.is_empty());
+        assert_eq!(a.handle(&s(&["stop", "a"])).expect("stop"), s(&["stopped"]));
+        assert!(f.0.borrow().stopped.is_empty());
+        create_ok(&mut a, "a", &k);
+        a.handle(&s(&["start", "a"])).expect("start after recreate");
+    }
+
+    /// TASK-115.3・REPAIR-5: 同時実行 VM 数は終了予算内に全件停止できる数に制限され、全件停止できる。
+    #[test]
+    fn task115_3_repair5_running_cap_fits_shutdown_budget() {
+        let dir = tmp_dir("cap");
+        let k = kernel(&dir);
+        let (mut a, f) = adapter();
+        f.0.borrow_mut().stop_timeout = Duration::from_secs(2);
+        for id in ["a", "b", "c"] {
+            create_ok(&mut a, id, &k);
+        }
+        a.handle(&s(&["start", "a"])).expect("start");
+        a.handle(&s(&["start", "b"])).expect("start");
+        assert_eq!(
+            err_of(a.handle(&s(&["start", "c"]))),
+            (
+                PluginErrorCode::FailedPrecondition,
+                "too many running VMs".to_string()
+            )
+        );
+        assert_eq!(
+            a.stop_all(),
+            StopAllSummary {
+                stopped: 2,
+                remaining: 0
+            }
+        );
+    }
+
+    /// TASK-115.3・REPAIR-3: stop 失敗は登録を残す。
+    #[test]
+    fn task115_3_mac1_failures_keep_state_for_retry() {
+        let dir = tmp_dir("retry");
+        let k = kernel(&dir);
+        let (mut a, f) = adapter();
+        create_ok(&mut a, "a", &k);
+        a.handle(&s(&["start", "a"])).expect("start");
         f.0.borrow_mut().fail_stop = true;
         let (c, m) = err_of(a.handle(&s(&["stop", "a"])));
         assert_eq!(c, PluginErrorCode::Unimplemented);

@@ -15,11 +15,15 @@
 //! | #240 | TASK-157.6 | healthcheck フックの土台（実装済み。コマンド実行・周期実行は TASK-161） |
 //! | #241 | TASK-157.7 | logs 捕捉の土台（実装済み。永続化・ローテーションは SUP-7・TASK-164 で未実装） |
 //! | #242 | TASK-157.8 | 結合テスト |
+//! | #500 | TASK-163.1 | exec: pid1 特定・setns（`exec`。実装済み。コマンド実行は未実装） |
+//! | #501〜#503 | TASK-163.2〜163.4 | exec: cgroup join・seccomp / Landlock 再適用・execve と統合テスト（未実装） |
 //! | #1069 | TASK-157.9 | state.json 書き込み排他 |
 //!
 //! supervisor から `fandhe-container-core` への一方向依存は導入済み（TASK-157.3・#237）。
 //! `StateStore` は core の既定実装を使い、2 つ目の実装は持たない（決定 6）。
 
+#[cfg(target_os = "linux")]
+pub mod exec;
 pub mod health;
 pub mod logs;
 pub mod run;

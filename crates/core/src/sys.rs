@@ -100,6 +100,7 @@ mod consts {
     pub const CLONE_NEWIPC: i32 = 0x0800_0000;
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
+    pub const CLONE_NEWNET: i32 = 0x4000_0000;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
@@ -234,6 +235,7 @@ mod consts {
     pub const CLONE_NEWIPC: i32 = 0x0800_0000;
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
+    pub const CLONE_NEWNET: i32 = 0x4000_0000;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
@@ -376,6 +378,7 @@ mod consts {
     pub const CLONE_NEWIPC: i32 = 0;
     pub const CLONE_NEWUSER: i32 = 0;
     pub const CLONE_NEWPID: i32 = 0;
+    pub const CLONE_NEWNET: i32 = 0;
     pub const MS_NOSUID: u64 = 0;
     pub const MS_NODEV: u64 = 0;
     pub const MS_NOEXEC: u64 = 0;
@@ -482,6 +485,8 @@ pub(crate) enum NsFlag {
     Ipc,
     User,
     Pid,
+    /// network namespace。`setns(2)` による参加（SUP-6・TASK-163.1）専用で、`unshare` 経路は使わない。
+    Net,
 }
 
 impl NsFlag {
@@ -493,11 +498,15 @@ impl NsFlag {
             Self::Ipc => consts::CLONE_NEWIPC,
             Self::User => consts::CLONE_NEWUSER,
             Self::Pid => consts::CLONE_NEWPID,
+            Self::Net => consts::CLONE_NEWNET,
         }
     }
 }
 
 unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: glibc 2.14+ / musl の `int setns(int fd, int nstype)` と同じ型幅
+    // （SUP-6・TASK-163.1）。`syscall(2)` 経由にせず arch 別の syscall 番号を増やさない。
+    fn setns(fd: i32, nstype: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: glibc / musl の `int unshare(int flags)` と同じ型幅。
     fn unshare(flags: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int sethostname(const char *name, size_t len)`。
@@ -736,6 +745,27 @@ pub(crate) fn poll_readable(fd: BorrowedFd<'_>, timeout_ms: i32) -> Result<bool,
         return Err(last_error());
     }
     Ok(r > 0)
+}
+
+/// 稼働中プロセスの pidfd 経由で、指定 namespace 群へ 1 回の `setns(2)` で参加する（Linux 5.8 以降。
+/// SUP-6・TASK-163.1）。
+///
+/// 呼び出し元は `crate::exec::join_namespaces` のみで、単一スレッドであることを確認済みの前提で呼ぶ。
+/// 1 回の syscall なので全 namespace が all-or-nothing で切り替わり、途中まで参加した状態を作らない。
+/// 空の集合と `NsFlag::User`（user namespace 参加は未対応。fail-closed）は `EINVAL` で拒否する。
+pub(crate) fn setns_pidfd(pidfd: BorrowedFd<'_>, flags: &[NsFlag]) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    if flags.is_empty() || flags.contains(&NsFlag::User) {
+        return Err(SysError::Os(EINVAL));
+    }
+    let bits = flags.iter().fold(0i32, |acc, f| acc | f.bits());
+    // SAFETY: 引数は整数のみでポインタを取らない。`pidfd` は呼び出しの間有効な `BorrowedFd`。
+    // 副作用は呼び出しスレッドの namespace 所属の変更で、呼び出し側が単一スレッドであることを
+    // 確認済み。失敗時（-1）はカーネルが namespace を変更しない。
+    let rc = unsafe { setns(pidfd.as_raw_fd(), bits) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
 /// 直前の失敗した syscall の errno を `SysError` にする（失敗直後に呼ぶこと）。
@@ -2166,6 +2196,25 @@ mod tests {
         assert_eq!(NsFlag::Ipc.bits(), 0x0800_0000);
         assert_eq!(NsFlag::User.bits(), 0x1000_0000);
         assert_eq!(NsFlag::Pid.bits(), 0x2000_0000);
+    }
+
+    /// SUP-6・TASK-163.1: network namespace のビット値。
+    #[test]
+    fn sup6_ns_flag_net_bits_are_exact() {
+        assert_eq!(NsFlag::Net.bits(), 0x4000_0000);
+    }
+
+    /// SUP-6・TASK-163.1: 空集合・user namespace は拒否し、namespace でない fd は EINVAL（副作用なし）。
+    #[test]
+    fn sup6_setns_pidfd_rejects_invalid_input() {
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let fd = std::os::fd::AsFd::as_fd(&null);
+        assert_eq!(setns_pidfd(fd, &[]), Err(SysError::Os(EINVAL)));
+        assert_eq!(setns_pidfd(fd, &[NsFlag::User]), Err(SysError::Os(EINVAL)));
+        assert_eq!(
+            setns_pidfd(fd, &[NsFlag::Mount, NsFlag::Net]),
+            Err(SysError::Os(EINVAL))
+        );
     }
 
     /// x86_64: open フラグ・errno は asm-generic の値（include/uapi/asm-generic/fcntl.h・

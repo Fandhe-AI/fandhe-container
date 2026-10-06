@@ -30,11 +30,13 @@
 //! 待たされ、共有マウント解除が終了猶予を超えるのを防ぐ。WIN-2・REPAIR-5）。
 //! 要求処理中に立った場合は、ハンドラへ [`RequestHandler::handle_with_stop`] で伝え、ハンドラが各段の
 //! 境界で処理を早期に打ち切る（共有マウント解除の時間を確保する。WIN-2・REPAIR-5）。
+//! 応答送信も [`IDLE_POLL`] ごとに停止フラグを確認し、相手が読まず送信が詰まっていても立てば
+//! 未送信分を破棄して抜ける（応答送信で最大 [`FRAME_DEADLINE`] 待たされない。WIN-2・REPAIR-5）。
 //! 呼び出し側（`main.rs`）が抜けた後に共有マウントを解除して終了する。
 //!
 //! 対応 ID: TASK-116・PLUG-1・PLUG-2・PLUG-5・WIN-1・REPAIR-2・REPAIR-3・REPAIR-5・REPAIR-12。
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -277,6 +279,62 @@ fn recv_frame_until<R: Read>(
     Ok(Recv::Frame(Frame::decode_body(header, &body)?))
 }
 
+/// 応答送信の結果。
+#[derive(Debug, PartialEq, Eq)]
+enum Send {
+    /// 全量を送り終えた。
+    Done,
+    /// 送信途中に停止フラグが立った（未送信分は破棄。接続は呼び出し側が閉じる）。
+    Shutdown,
+}
+
+/// 応答フレームを [`IDLE_POLL`] 周期で停止フラグを確認しながら送る（WIN-2・REPAIR-5・#396）。
+///
+/// 相手が読まず送信が詰まっても、停止フラグが立てば最大 [`IDLE_POLL`] で `Send::Shutdown` を返し、
+/// 5 秒の終了猶予内に共有マウントの解除へ進めるようにする。合計期限 `deadline` 超過は `Timeout`。
+/// `w` の write 期限は呼び出し側が [`IDLE_POLL`] 程度に設定しておく（`serve_until` が設定済み）。
+fn send_frame_until<W: Write>(
+    w: &mut W,
+    frame: &Frame,
+    deadline: Duration,
+    stop: &AtomicBool,
+) -> Result<Send, PluginError> {
+    let encoded = frame.encode();
+    let started = Instant::now();
+    let mut sent = 0usize;
+    while sent < encoded.len() {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(Send::Shutdown);
+        }
+        if started.elapsed() >= deadline {
+            return Err(PluginError::new(
+                PluginErrorCode::Timeout,
+                "frame send deadline exceeded",
+            ));
+        }
+        let Some(rest) = encoded.get(sent..) else {
+            return Err(PluginError::new(PluginErrorCode::Internal, "send index"));
+        };
+        match w.write(rest) {
+            Ok(0) => {
+                return Err(PluginError::new(
+                    PluginErrorCode::Unavailable,
+                    "connection closed while sending a frame",
+                ));
+            }
+            Ok(n) => sent = sent.saturating_add(n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted || is_idle(e.kind()) => {}
+            Err(_) => {
+                return Err(PluginError::new(
+                    PluginErrorCode::Unavailable,
+                    "frame write failed",
+                ));
+            }
+        }
+    }
+    Ok(Send::Done)
+}
+
 /// [`Recv::RawUnusable`] 後の代替受信（`read_frame`）の結果。
 #[derive(Debug)]
 enum Fallback {
@@ -345,7 +403,76 @@ pub fn serve_until<H: RequestHandler>(
             }
         };
         let reply = handle_frame_with(&frame, handler, Some(stop))?;
-        stream.write_frame(&reply, RpcTimeout::default())?;
+        if let Send::Shutdown = send_frame_until(stream, &reply, FRAME_DEADLINE, stop)? {
+            return Ok(LoopExit::ShutdownRequested);
+        }
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+
+    /// 常に WouldBlock を返す（相手が読まず送信が詰まった状態）。`stop` があれば初回 write で立てる。
+    struct Stalled<'a> {
+        stop: Option<&'a AtomicBool>,
+    }
+
+    impl Write for Stalled<'_> {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            if let Some(s) = self.stop {
+                s.store(true, Ordering::SeqCst);
+            }
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn reply() -> Frame {
+        error_frame(
+            MessageId::new(1),
+            PluginError::new(PluginErrorCode::Internal, "x"),
+        )
+        .expect("encode")
+    }
+
+    #[test]
+    fn task116_5_win2_stalled_send_with_stop_shuts_down() {
+        let stop = AtomicBool::new(false);
+        let mut w = Stalled { stop: Some(&stop) };
+        let out = send_frame_until(&mut w, &reply(), Duration::from_secs(30), &stop).expect("send");
+        assert_eq!(out, Send::Shutdown);
+    }
+
+    #[test]
+    fn task116_5_win2_flag_set_before_send_writes_nothing() {
+        let stop = AtomicBool::new(true);
+        let mut buf: Vec<u8> = Vec::new();
+        let out =
+            send_frame_until(&mut buf, &reply(), Duration::from_secs(30), &stop).expect("send");
+        assert_eq!(out, Send::Shutdown);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn task116_5_win2_send_writes_full_frame() {
+        let stop = AtomicBool::new(false);
+        let f = reply();
+        let mut buf: Vec<u8> = Vec::new();
+        let out = send_frame_until(&mut buf, &f, Duration::from_secs(30), &stop).expect("send");
+        assert_eq!(out, Send::Done);
+        assert_eq!(buf, f.encode());
+    }
+
+    #[test]
+    fn task116_5_win2_stalled_send_without_stop_times_out() {
+        let stop = AtomicBool::new(false);
+        let mut w = Stalled { stop: None };
+        let err = send_frame_until(&mut w, &reply(), Duration::from_millis(20), &stop)
+            .expect_err("timeout");
+        assert_eq!(err.code(), PluginErrorCode::Timeout);
     }
 }
 

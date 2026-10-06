@@ -10,7 +10,8 @@
 //! 実行場所は Windows ホスト（`wsl.exe` を起動できる側）の前提。非 Windows では create が `UNIMPLEMENTED`。
 //!
 //! 終了コード: 0 = 相手の正常切断でループ終了、2 = 起動設定の解決失敗、3 = 接続失敗、
-//! 4 = フレームループの異常終了（転送エラー・プロトコル違反）。
+//! 4 = フレームループの異常終了（転送エラー・プロトコル違反）、5 = 共有マウントの解除失敗が残った
+//! （serve の結果に関わらず優先。`plugin.cleanup` の `remaining` 件は呼び出し元が手動回収する）。
 //! 接続経路は peer 認証つき `UdsStream::connect` のみ（TASK-116.4・#395・PLUG-12）。別 UID の listener は
 //! `PERMISSION_DENIED`・終了コード 3 で fail-closed し、`peer_auth_rejections` に件数のみ出す。
 //! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データを含めない。
@@ -71,11 +72,16 @@ fn main() -> ExitCode {
             cleanup.released, cleanup.remaining
         );
     }
+    if let Err(e) = &result {
+        report("plugin.frame_loop", Some(source), e, "");
+    }
+    // 解除失敗は成功扱いにしない（共有マウントが残り得る。特権操作の後始末・WIN-2）。
+    // adapter 破棄後は所有情報が失われるため、件数つきの plugin.cleanup 行で呼び出し元に回収を促す。
+    if cleanup.remaining > 0 {
+        return ExitCode::from(5);
+    }
     match result {
         Ok(_) => ExitCode::SUCCESS,
-        Err(e) => {
-            report("plugin.frame_loop", Some(source), &e, "");
-            ExitCode::from(4)
-        }
+        Err(_) => ExitCode::from(4),
     }
 }

@@ -444,18 +444,33 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
     /// `DEFAULT_WSL_TIMEOUT` で有界。
     pub fn release_all(&mut self) -> ReleaseAllReport {
         let mut report = ReleaseAllReport::default();
-        for (id, entry) in std::mem::take(&mut self.entries) {
-            match entry {
-                Entry::Created(_) => {}
-                Entry::Running(p) | Entry::Unreleased(p) => match self.backend.release(&p) {
-                    Ok(()) => report.released += 1,
-                    Err(f) => {
-                        report.remaining += 1;
-                        // 所有情報を失わないため、元の ID のまま再試行可能な形で保持し直す。
-                        let keep = f.unreleased.unwrap_or(p);
-                        self.entries.insert(id, Entry::Unreleased(keep));
-                    }
-                },
+        // 1 件ずつ取り出して解除する。`backend.release` が panic しても（記録先 stderr の破損による
+        // `eprintln!` の panic 等）、未処理のエントリは `entries` に残り、Drop で再試行できる。
+        let ids: Vec<String> = self.entries.keys().cloned().collect();
+        for id in ids {
+            let Some(entry) = self.entries.remove(&id) else {
+                continue;
+            };
+            let p = match entry {
+                Entry::Created(_) => continue,
+                Entry::Running(p) | Entry::Unreleased(p) => p,
+            };
+            let backend = &self.backend;
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backend.release(&p)));
+            match outcome {
+                Ok(Ok(())) => report.released += 1,
+                Ok(Err(f)) => {
+                    report.remaining += 1;
+                    // 所有情報を失わないため、元の ID のまま再試行可能な形で保持し直す。
+                    let keep = f.unreleased.unwrap_or(p);
+                    self.entries.insert(id, Entry::Unreleased(keep));
+                }
+                Err(_) => {
+                    // panic 時は解除済みか不明なため、未解除として保持し直す。
+                    report.remaining += 1;
+                    self.entries.insert(id, Entry::Unreleased(p));
+                }
             }
         }
         report
@@ -522,6 +537,7 @@ mod tests {
         check_err: Option<WinErrorCode>,
         launch_err: RefCell<Option<BackendFailure<FakePrepared>>>,
         release_err: RefCell<Option<BackendFailure<FakePrepared>>>,
+        panic_once: RefCell<bool>,
     }
 
     impl WindowsBackend for Fake {
@@ -564,6 +580,9 @@ mod tests {
         }
         fn release(&self, p: &FakePrepared) -> Result<(), BackendFailure<FakePrepared>> {
             self.calls.borrow_mut().push(format!("release:{}", p.0));
+            if self.panic_once.replace(false) {
+                panic!("fake release panic");
+            }
             match self.release_err.borrow_mut().take() {
                 Some(f) => Err(f),
                 None => Ok(()),
@@ -771,6 +790,25 @@ mod tests {
             2
         );
         assert_eq!(a.release_all(), ReleaseAllReport::default());
+    }
+
+    #[test]
+    fn task116_3_win2_release_all_panic_keeps_remaining_entries_for_retry() {
+        let fake = Fake::default();
+        let (mut a, calls) = adapter(fake);
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap();
+        let mut c2 = s(CREATE);
+        c2[1] = "c2".into();
+        a.handle(&c2).unwrap();
+        a.handle(&s(&["start", "c2"])).unwrap();
+        *a.backend.panic_once.borrow_mut() = true;
+        let r = a.release_all();
+        assert_eq!((r.released, r.remaining), (1, 1));
+        let r = a.release_all();
+        assert_eq!((r.released, r.remaining), (1, 0));
+        assert_eq!(a.release_all(), ReleaseAllReport::default());
+        drop(calls);
     }
 
     #[test]

@@ -96,6 +96,23 @@ pub enum BackendError {
     UnsupportedHost,
 }
 
+impl BackendError {
+    /// VM が既に停止済み（`Stopped` / `Error`）で停止操作が `InvalidState` になった場合 true。
+    ///
+    /// ゲスト側のシャットダウン・クラッシュ後は再試行しても同じ理由で失敗し解放できなくなるため、
+    /// 呼び出し側は停止済みとして登録を外す（TASK-115.3・MAC-1）。
+    fn is_already_halted(&self) -> bool {
+        use fandhe_container_platform_macos::vm::VmState;
+        matches!(
+            self,
+            BackendError::Platform(PlatformError::Vm(VmError::InvalidState {
+                state: VmState::Stopped | VmState::Error,
+                ..
+            }))
+        )
+    }
+}
+
 impl From<PlatformError> for BackendError {
     fn from(e: PlatformError) -> Self {
         BackendError::Platform(e)
@@ -184,7 +201,10 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         self.entries.retain(|_, entry| match &entry.state {
             State::Created => false,
             State::Running(h) => {
-                if backend.stop(h).is_ok() {
+                if backend
+                    .stop(h)
+                    .map_or_else(|e| e.is_already_halted(), |()| true)
+                {
                     summary.stopped += 1;
                     false
                 } else {
@@ -280,7 +300,12 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         let entry = self.entries.get(id).ok_or_else(not_found)?;
         if let State::Running(h) = &entry.state {
             // 失敗時は登録を残す（再試行可）。
-            self.backend.stop(h).map_err(|e| backend_to_plugin(&e))?;
+            // 既に停止済み（InvalidState）なら停止成功として扱い、登録を外す。
+            if let Err(e) = self.backend.stop(h)
+                && !e.is_already_halted()
+            {
+                return Err(backend_to_plugin(&e));
+            }
         }
         self.entries.remove(id);
         Ok(vec!["stopped".to_string()])
@@ -448,6 +473,7 @@ mod tests {
         stopped: Vec<u32>,
         fail_launch: bool,
         fail_stop: bool,
+        halted_stop: bool,
         next: u32,
     }
 
@@ -479,6 +505,14 @@ mod tests {
         }
         fn stop(&self, h: &u32) -> Result<(), BackendError> {
             let mut c = self.0.borrow_mut();
+            if c.halted_stop {
+                return Err(BackendError::Platform(PlatformError::Vm(
+                    VmError::InvalidState {
+                        op: VmOp::Stop,
+                        state: VmState::Stopped,
+                    },
+                )));
+            }
             if c.fail_stop {
                 return Err(BackendError::UnsupportedHost);
             }
@@ -647,9 +681,34 @@ mod tests {
     #[test]
     fn task115_3_mac1_config_error_does_not_leak_path() {
         let (mut a, _f) = adapter();
-        let (c, m) = err_of(a.handle(&s(&["create", "a", "/nonexistent/SECRETPATH", "", ""])));
+        // OS 非依存の絶対パス（Windows では Unix 形式パスが相対扱いになるため temp_dir 基準にする）。
+        let missing = std::env::temp_dir().join("fc-adapter-SECRETPATH-missing");
+        let missing = missing.to_str().expect("utf8");
+        let (c, m) = err_of(a.handle(&s(&["create", "a", missing, "", ""])));
         assert_eq!(c, PluginErrorCode::InvalidArgument);
         assert_eq!(m, "config.path_not_found: VM configuration was rejected");
+        assert!(!m.contains("SECRETPATH"));
+    }
+
+    /// TASK-115.3・MAC-1: 停止済み VM の InvalidState は停止成功として登録を外す。
+    #[test]
+    fn task115_3_mac1_already_halted_stop_releases_entry() {
+        let dir = tmp_dir("halted");
+        let k = kernel(&dir);
+        let (mut a, f) = adapter();
+        create_ok(&mut a, "a", &k);
+        create_ok(&mut a, "b", &k);
+        a.handle(&s(&["start", "a"])).expect("start");
+        a.handle(&s(&["start", "b"])).expect("start");
+        f.0.borrow_mut().halted_stop = true;
+        assert_eq!(a.handle(&s(&["stop", "a"])).expect("stop"), s(&["stopped"]));
+        assert_eq!(
+            a.stop_all(),
+            StopAllSummary {
+                stopped: 1,
+                remaining: 0
+            }
+        );
     }
 
     /// TASK-115.3・PLUG-1: stop_all は実行中のみ数え、失敗分は残す。

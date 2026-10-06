@@ -9,7 +9,7 @@
 //! 失敗時は stderr へ 1 行 `error: <CODE>: <message>`（機械可読な code と固定文言。REPAIR-4）を出す。
 //! 終了コード: 0 = 正常（`--help`・相手の正常切断）、2 = `InvalidArgument`（起動引数・パス）、
 //! 3 = 接続失敗、4 = フレームループの異常終了（転送エラー・プロトコル違反）、1 = その他の起動失敗。
-//! 3・4 は plugin-windows と同じ値（core 側 proxy が同じ規則で扱えるようにする）。
+//! 5 = 終了時に停止できなかった VM が残った。3・4 は plugin-windows と同じ値（core 側 proxy が同じ規則で扱えるようにする）。
 //! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データを含めない。
 //! peer 認証の拒否イベント行は socket パスを含むため転記しない（永続的な監査ログへの配線は
 //! core 側 TASK-114 で未実装。REPAIR-3・SEC-4）。
@@ -32,6 +32,8 @@ const EXIT_FAILURE: u8 = 1;
 const EXIT_CONNECT_FAILED: u8 = 3;
 /// フレームループ異常終了の終了コード。
 const EXIT_LOOP_FAILED: u8 = 4;
+/// 終了時の停止に失敗した VM が残った場合の終了コード。
+const EXIT_CLEANUP_INCOMPLETE: u8 = 5;
 
 /// 接続期限（core の常駐起動期限より短くする。REPAIR-5）。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -75,10 +77,15 @@ fn main() -> ExitCode {
         );
     }
     match outcome {
-        Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             report(&e);
             ExitCode::from(EXIT_LOOP_FAILED)
         }
+        // 停止できなかった VM が残るなら成功扱いにしない（機械可読な code を stderr へ出す）。
+        Ok(_) if summary.remaining > 0 => {
+            eprintln!("error: INTERNAL: failed to stop remaining VMs");
+            ExitCode::from(EXIT_CLEANUP_INCOMPLETE)
+        }
+        Ok(_) => ExitCode::SUCCESS,
     }
 }

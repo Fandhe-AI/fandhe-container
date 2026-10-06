@@ -2,7 +2,8 @@
 //!
 //! テスト側が `UdsListener` を bind して子（plugin-windows）を spawn し、子が connect してくる
 //! 既存契約（core が bind・plugin が connect）どおりに往復させる。待ちはすべて期限つきで、超過時は
-//! kill して失敗にする（REPAIR-5）。実行環境は unix のみ（WIN-1: 実行時は WSL2 内の Linux）。
+//! kill して失敗にする（REPAIR-5）。実行環境は unix のみ（plugin 境界機構の UDS が unix 限定のため）。
+//! 本番の実行場所（Windows ホスト側か WSL2 内か）は未確定で、#1415 でオーナー判断待ち（WIN-1）。
 //! 対応 ID: TASK-116・PLUG-1・PLUG-12・WIN-1・REPAIR-5。
 #![cfg(unix)]
 

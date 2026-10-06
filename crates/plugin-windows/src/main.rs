@@ -7,16 +7,22 @@
 //! （英語・機械可読）を出す。
 //!
 //! serve 終了後（正常切断・異常終了とも）に `release_all` で保持中の共有マウントを解除し、件数を出す（WIN-2）。
-//! 実行場所は Windows ホスト（`wsl.exe` を起動できる側）の前提。非 Windows では create が `UNIMPLEMENTED`。
+//! 実行場所（Windows ホスト側か WSL2 内か）と core との接続経路は未確定（#1415 でオーナー判断待ち）。
+//! 現状の実バックエンドは `wsl.exe` を起動できる Windows ホスト上でだけ動作し、非 Windows では create が
+//! `UNIMPLEMENTED`。一方で plugin 境界機構の UDS は unix 限定で、両方を満たす経路はまだ無い。
 //!
-//! 終了コード: 0 = 相手の正常切断または SIGTERM でループ終了、1 = SIGTERM ハンドラの登録失敗（TASK-116.5・#396）、2 = 起動設定の解決失敗、3 = 接続失敗、
+//! 終了コード: 0 = 相手の正常切断または SIGTERM でループ終了、1 = SIGTERM ハンドラの登録失敗・Linux の未確認アーキテクチャ（TASK-116.5・#396）、2 = 起動設定の解決失敗、3 = 接続失敗、
 //! 4 = フレームループの異常終了（転送エラー・プロトコル違反）、5 = 共有マウントの解除失敗が残った
 //! （serve の結果に関わらず優先。`plugin.cleanup` は `remaining` の件数のみを出す）。終了後に残った
 //! マウントを本 plugin から回収する手段は未実装で、対象の特定に必要な情報も出力しない（プロセスを
 //! またぐ回収は #1412。理由は `adapter` のモジュール doc「未実装範囲」を参照。WIN-2・REPAIR-3）。
 //! SIGTERM（#396）: 次の受信境界（検知遅れは最大 `IDLE_POLL` 1 秒）でループを抜け、`plugin.shutdown` を出して
 //! 上記の `release_all`（最大 `RELEASE_ALL_BUDGET` 4 秒）で共有マウントを解除してから終了する。要求処理中に届いた場合は、各段の境界（次の WSL2 操作の着手前）で要求を打ち切って解除へ進む（実行中の 1 段は中断できず、その持ち分までは待つ）。SIGKILL・猶予超過では
-//! マウントが残り得る（回収は #1412）。SIGINT / SIGHUP・Windows ホスト上の終了要求は対象外（未実装。REPAIR-3）。
+//! マウントが残り得る（回収は #1412）。SIGINT / SIGHUP は対象外。
+//! Windows ホスト上の終了要求は未実装（REPAIR-3）: Windows ビルドは何も登録せず `Ok` で進むため、切断（EOF）
+//! 以外の終了要求では `release_all` を通らない（実行場所の判断は #1415、プロセスをまたぐ回収は #1412）。
+//! SIGTERM ハンドラを登録するのは Linux（x86_64 / aarch64）・macOS のみで、Linux の他アーキテクチャは
+//! 起動を終了コード 1 で拒否する（`sys` のモジュール doc 参照）。
 //! ヘルスチェック（`ping`）は adapter が即応答する。
 //! 接続経路は peer 認証つき `UdsStream::connect` のみ（TASK-116.4・#395・PLUG-12）。別 UID の listener は
 //! `PERMISSION_DENIED`・終了コード 3 で fail-closed し、`peer_auth_rejections` に件数のみ出す。
@@ -61,7 +67,10 @@ fn main() -> ExitCode {
         }
     };
     let source = cfg.socket_source().as_str();
-    // 接続前に登録して取りこぼしを避ける。解除できない状態では動かさない（fail-closed）。
+    // 接続前に登録して取りこぼしを避ける。登録に失敗した場合と Linux の未確認アーキテクチャ（登録を
+    // 試みず `UNIMPLEMENTED`）は fail-closed で終了する。Linux 以外の非対応 OS（Windows ホストを含む）は
+    // 何も登録せず `Ok` が返るため、SIGTERM 相当の終了要求で解除できないまま動く（Windows ホスト上の
+    // 終了要求は未実装。REPAIR-3。実行場所の判断は #1415、プロセスをまたぐ回収は #1412）。
     let stop = match install_sigterm_flag() {
         Ok(flag) => flag,
         Err(e) => {

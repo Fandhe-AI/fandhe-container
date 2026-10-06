@@ -14,7 +14,15 @@
 //! | create | `["create", id, kernel, initrd または "", cmdline, (tag, host_dir, "ro" / "rw")*]` | `["created"]` |
 //! | start | `["start", id]` | `["running"]` |
 //! | stop | `["stop", id]` | `["stopped"]` |
+//! | ping | `["ping"]`（要素 1 つ） | `["pong"]` |
 //! | kill / delete / state / その他 | — | Error `UNIMPLEMENTED` |
+//!
+//! `ping`（TASK-115.5・#389）はヘルスチェック用で、登録簿・バックエンド・ファイルシステム・`isolate` 作業
+//! スレッドに触れずメモリ内だけで即応答する（VM がハングしていても応答できる）。内部状態（VM 数・id）は返さず、
+//! `plugin.op` 計測の対象にも含めない（定期的な ping で stderr ログを増やさない）。余分な要素つきは
+//! `INVALID_ARGUMENT`。フレームループは単一スレッドで要求を順次処理するため、先行要求の処理中は完了後に応答する
+//! （最悪で `LAUNCH_TOTAL_TIMEOUT` + 送受信。core の RPC 既定期限内）。core 側のタイムアウト・再起動判定は
+//! 対象外（PLUG-4）。
 //!
 //! `id` は core の `ContainerId` と同じ規則（空・`.`・`..` 不可、255 バイト以下、`[A-Za-z0-9._-]`）で
 //! 検証する（TASK-114 で core 型へ置換）。create は検証と登録のみ、start が `Vm::launch`、stop が
@@ -157,6 +165,11 @@ pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(4);
 
 /// id の最大バイト数（core の `ContainerId` と同じ）。
 const ID_MAX_BYTES: usize = 255;
+
+/// ヘルスチェックの操作名（TASK-115.5・#389。plugin-windows と同じ文字列を使う暫定契約）。
+pub const OP_PING: &str = "ping";
+/// ヘルスチェックの成功応答本体の唯一の要素。
+pub const REPLY_PONG: &str = "pong";
 
 const MSG_MALFORMED: &str = "malformed request";
 const MSG_INVALID_ID: &str = "invalid container id";
@@ -625,6 +638,14 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
 
 impl<B: MacosBackend> RequestHandler for MacosRuntimeAdapter<B> {
     fn handle(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
+        // ヘルスチェックは状態・計測に触れない前段で処理する（TASK-115.5）。
+        if body.first().map(String::as_str) == Some(OP_PING) {
+            return if body.len() == 1 {
+                Ok(vec![REPLY_PONG.to_string()])
+            } else {
+                Err(invalid(MSG_MALFORMED))
+            };
+        }
         let (idx, op) = match body.first().map(String::as_str) {
             Some("create") => (0, "create"),
             Some("start") => (1, "start"),
@@ -1115,6 +1136,45 @@ mod tests {
             assert_eq!(c, PluginErrorCode::Unimplemented);
             assert_eq!(m, "operation is not implemented");
         }
+    }
+
+    /// TASK-115.5・PLUG-1: ping は pong を返し、余分な要素は固定文言で拒否する。
+    #[test]
+    fn task115_5_plug1_ping_returns_pong_and_rejects_extra() {
+        let (mut a, _f) = adapter();
+        assert_eq!(a.handle(&s(&["ping"])).expect("ping"), s(&["pong"]));
+        let (c, m) = err_of(a.handle(&s(&["ping", "SECRETARG"])));
+        assert_eq!(c, PluginErrorCode::InvalidArgument);
+        assert_eq!(m, "malformed request");
+    }
+
+    /// TASK-115.5・REPAIR-4: ping は launch / stop を呼ばず、計測イベントも出さず、VM 実行中・起動失敗登録ありでも応答する。
+    #[test]
+    fn task115_5_repair4_ping_touches_nothing() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let dir = tmp_dir("ping");
+        let k = kernel(&dir);
+        let events: Rc<RefCell<Vec<OpEvent>>> = Rc::default();
+        let sink = Rc::clone(&events);
+        let (a, f) = adapter();
+        let mut a = a.with_op_sink(move |e| sink.borrow_mut().push(e.clone()));
+        create_ok(&mut a, "a", &k);
+        a.handle(&s(&["start", "a"])).expect("start");
+        f.0.borrow_mut().fail_launch = true;
+        create_ok(&mut a, "b", &k);
+        err_of(a.handle(&s(&["start", "b"])));
+        let before = events.borrow().len();
+        let (launched, stopped) = {
+            let c = f.0.borrow();
+            (c.launched.len(), c.stopped.len())
+        };
+        for _ in 0..3 {
+            assert_eq!(a.handle(&s(&["ping"])).expect("ping"), s(&["pong"]));
+        }
+        assert_eq!(events.borrow().len(), before);
+        let c = f.0.borrow();
+        assert_eq!((c.launched.len(), c.stopped.len()), (launched, stopped));
     }
 
     /// TASK-115.3・REPAIR-3: launch 失敗後は start 再試行・stop による登録解除・同 ID の再 create を拒否する（VM 重複防止）。

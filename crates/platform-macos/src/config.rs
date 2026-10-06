@@ -35,6 +35,7 @@
 use std::fmt;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::virtiofs::VirtiofsSharesSpec;
 
@@ -244,6 +245,12 @@ pub enum ConfigError {
     /// ディレクトリのハードリンクはリンク数で見分けられず、共有範囲外のディレクトリを配下に持ち込めるため
     /// fail-closed で拒否する（MAC-1・TASK-65.1）。`fs_type` は `statfs` の `f_fstypename`。
     SharedDirUnsupportedFilesystem { fs_type: String, share_dir: PathBuf },
+    /// 共有配下の走査（共有範囲外経路の検査）が呼び出し側の指定した期限 `after` 内に終わらなかった。
+    ///
+    /// 走査を打ち切った時点では共有範囲外経路が無いことを確認できていないため、fail-closed で拒否する
+    /// （巨大な共有ツリーで呼び出し側の RPC 期限を超えて処理を占有しないため。REPAIR-5・MAC-1・TASK-115.3）。
+    /// 要求由来のパスは持たない。
+    SharedDirScanTimeout { after: Duration },
     /// 読み書き共有が VM の保護入力（kernel・initrd・ディスクイメージ・コンソールログ）を含む。
     ///
     /// `field` は保護入力の種別、`path` はその実体パス、`share_dir` は共有ディレクトリ。
@@ -322,6 +329,7 @@ impl ConfigError {
             ConfigError::SharedDirUnsupportedFilesystem { .. } => {
                 "config.shared_dir_unsupported_filesystem"
             }
+            ConfigError::SharedDirScanTimeout { .. } => "config.shared_dir_scan_timeout",
         }
     }
 
@@ -555,6 +563,12 @@ impl ConfigError {
                 format!(
                     "shared directory {} is on a {fs_type} filesystem, which allows directory hard links (hint: share a directory on an APFS volume)",
                     share_dir.display()
+                )
+            }
+            ConfigError::SharedDirScanTimeout { after } => {
+                format!(
+                    "shared directory scan did not finish within {} ms (hint: share a smaller directory tree)",
+                    after.as_millis()
                 )
             }
             ConfigError::SharedDirSymlinkEscapes { path, share_dir } => {
@@ -1376,6 +1390,40 @@ fn special_file_kind(ft: &std::fs::FileType) -> Option<SpecialFileKind> {
     }
 }
 
+/// 共有配下の走査の期限（REPAIR-5・TASK-115.3）。`budget` はエラー報告用の元の指定値。
+///
+/// 1 回の [`VmConfigSpec::check_share_conflicts_within`] で全共有が同じ期限を共有する（共有ごとではない）。
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct ShareScanLimit {
+    deadline: Instant,
+    budget: Duration,
+}
+
+impl ShareScanLimit {
+    /// 現在時刻から `budget` 後を期限にする。加算が表現範囲を超える巨大値は期限なしと同じ扱いにできない
+    /// ため、表現できる範囲の遠い将来（約 1 年後）へ丸める（panic させない）。
+    fn starting_now(budget: Duration) -> Self {
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(budget)
+            .or_else(|| now.checked_add(Duration::from_secs(365 * 24 * 60 * 60)))
+            .unwrap_or(now);
+        Self { deadline, budget }
+    }
+}
+
+/// 期限を過ぎていれば [`ConfigError::SharedDirScanTimeout`] を返す（`None` は期限なし）。
+#[cfg(unix)]
+fn check_scan_limit(limit: Option<ShareScanLimit>) -> Result<(), ConfigError> {
+    match limit {
+        Some(l) if Instant::now() >= l.deadline => {
+            Err(ConfigError::SharedDirScanTimeout { after: l.budget })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// 共有（ReadWrite・ReadOnly 共通）の配下を走査し、保護入力と同一 inode（`(dev, ino)` 一致）のエントリがあれば拒否する。
 ///
 /// パスの包含検査（[`crate::virtiofs::path_is_within`]）では、共有の外にある保護入力へのハードリンクを
@@ -1400,9 +1448,12 @@ fn special_file_kind(ft: &std::fs::FileType) -> Option<SpecialFileKind> {
 ///   正常ゲストの観測では否定できないため、緩和は実機結果とユーザー判断を経た別 PR に限る。
 /// - 検査〜VM 使用間の差し替え（TOCTOU）は `build_vz_configuration` で VZ 呼び出し直前に検査する以上の
 ///   安価な短縮策が無く、残余リスクとして受け入れる。根本対策は VZ の API 制約上、別途設計が要る。
-/// - `canonicalize`・`statfs`・走査にタイムアウトは無く、応答しない NFS・autofs 等の配下では検査が止まり得る
-///   （ブロック中の呼び出しは取り消せない）。ネットワーク / 自動マウント系 FS 上の ReadWrite 共有を
-///   `f_fstypename` で拒否する案はフォローアップ候補で、未実装。
+/// - 走査は `limit` があればエントリごと・ディレクトリごとに期限を確かめ、超過で
+///   [`ConfigError::SharedDirScanTimeout`] を返して打ち切る（REPAIR-5・TASK-115.3）。`limit` が `None` の
+///   呼び出しは件数上限だけで止まる。期限つきでも、個々の `canonicalize`・`statfs`・`read_dir` が応答しない
+///   NFS・autofs 等の配下でブロックした場合は取り消せず、検査が止まり得る（期限は呼び出しの合間にしか
+///   確かめられない）。ネットワーク / 自動マウント系 FS 上の ReadWrite 共有を `f_fstypename` で拒否する案は
+///   フォローアップ候補で、未実装。
 ///
 /// 保護入力が未作成（コンソールログ等）なら照合対象から外す。走査の I/O 失敗・件数上限超過は
 /// fail-closed で `PathIo` を返す。unix 限定（Windows には `(dev, ino)` が無く、本 crate の
@@ -1411,6 +1462,7 @@ fn special_file_kind(ft: &std::fs::FileType) -> Option<SpecialFileKind> {
 fn find_hardlink_to_protected(
     dir: &Path,
     protected: &[(ConfigField, PathBuf)],
+    limit: Option<ShareScanLimit>,
 ) -> Result<(), ConfigError> {
     use std::os::unix::fs::MetadataExt;
     let io_err = |e: std::io::Error| ConfigError::PathIo {
@@ -1431,6 +1483,7 @@ fn find_hardlink_to_protected(
         }
     }
     // 同一デバイスの bind mount をマウント表で検出する（Linux。macOS は下の走査で statfs により検出）。
+    check_scan_limit(limit)?;
     reject_mounts_under(dir)?;
     // マウント境界の検出用に共有ルートのデバイス番号を控える（保護入力の有無に依らず走査する）。
     let root_dev = std::fs::metadata(dir).map_err(io_err)?.dev();
@@ -1444,8 +1497,11 @@ fn find_hardlink_to_protected(
     let mut stack = vec![dir.to_path_buf()];
     let mut scanned = 0usize;
     while let Some(d) = stack.pop() {
+        // 空ディレクトリが続くツリーでも期限を確かめる。
+        check_scan_limit(limit)?;
         for entry in std::fs::read_dir(&d).map_err(io_err)? {
             let entry = entry.map_err(io_err)?;
+            check_scan_limit(limit)?;
             scanned += 1;
             if scanned > MAX_SHARE_SCAN_ENTRIES {
                 return Err(ConfigError::PathIo {
@@ -1668,7 +1724,32 @@ impl VmConfigSpec {
     /// ReadOnly 共有にも適用する（範囲外ホストファイルの読み出し露出の防止）。
     /// `build_vz_configuration` が VZ 呼び出しの前に実行する。
     /// 検査から VM 起動・使用までの差し替え（TOCTOU）とゲストが実行時に作る symlink は検査できない。
+    ///
+    /// 走査に期限は無い（件数上限のみ）。相手の応答期限を持つ呼び出し元（plugin の RPC 経路等）は
+    /// [`Self::check_share_conflicts_within`] を使う（REPAIR-5）。
     pub fn check_share_conflicts(&self) -> Result<(), ConfigError> {
+        self.check_share_conflicts_limited(None)
+    }
+
+    /// [`Self::check_share_conflicts`] と同じ検査を、共有配下の走査を `budget` 内に打ち切って行う
+    /// （REPAIR-5・MAC-1・TASK-115.3）。
+    ///
+    /// `budget` は全共有の合計（共有ごとではない）。期限を過ぎたら
+    /// [`ConfigError::SharedDirScanTimeout`] を返す（検査未完了を成功扱いしない。fail-closed）。検査内容・
+    /// 拒否範囲は期限なしの版と同一で、緩めない。期限はエントリ・ディレクトリの合間に確かめるため、
+    /// 1 回の OS 呼び出しが応答しない場合（NFS・autofs 等）は打ち切れない（`find_hardlink_to_protected` の残余）。
+    /// 走査を行わない非 unix では期限を使わない。
+    pub fn check_share_conflicts_within(&self, budget: Duration) -> Result<(), ConfigError> {
+        self.check_share_conflicts_limited(Some(ShareScanLimit::starting_now(budget)))
+    }
+
+    fn check_share_conflicts_limited(
+        &self,
+        limit: Option<ShareScanLimit>,
+    ) -> Result<(), ConfigError> {
+        // 非 unix は共有配下を走査しないため期限を使わない。
+        #[cfg(not(unix))]
+        let _ = limit;
         let mut protected = self.protected_inputs();
         if let Some(SerialConsoleSink::LogFile(log)) = self.devices.serial_console() {
             protected.push(ProtectedInput {
@@ -1696,7 +1777,7 @@ impl VmConfigSpec {
             }
             // ReadOnly は保護入力の照合なし（空）で、範囲外経路の走査だけ行う。
             #[cfg(unix)]
-            find_hardlink_to_protected(&dir, if read_only { &[] } else { &resolved })?;
+            find_hardlink_to_protected(&dir, if read_only { &[] } else { &resolved }, limit)?;
         }
         Ok(())
     }
@@ -1901,8 +1982,31 @@ impl VzVmConfiguration {
 ///
 /// Rust 側の検証と VZ の許容範囲照合をすべて終えてから FFI の setter を呼ぶ（ObjC 例外は捕捉できないため）。
 /// `validateWithError` は entitlement 依存の可能性があり、ここでは呼ばず、`vm::Vm::create` が VM 生成前に呼ぶ（TASK-64.4）。
+///
+/// 共有配下の走査に期限は無い。期限が要る呼び出し元は [`build_vz_configuration_within`] を使う。
 #[cfg(target_os = "macos")]
 pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, ConfigError> {
+    build_vz_configuration_limited(spec, None)
+}
+
+/// [`build_vz_configuration`] と同じ構築を、共有配下の走査（`VmConfigSpec::check_share_conflicts_within`）を
+/// `share_scan` 内に打ち切って行う（REPAIR-5・MAC-1・TASK-115.3）。
+///
+/// `vm::Vm::launch` が `OpTimeouts::share_scan` の指定時に呼ぶ。期限超過は
+/// [`ConfigError::SharedDirScanTimeout`]（副作用の前に返す）。
+#[cfg(target_os = "macos")]
+pub fn build_vz_configuration_within(
+    spec: &VmConfigSpec,
+    share_scan: Duration,
+) -> Result<VzVmConfiguration, ConfigError> {
+    build_vz_configuration_limited(spec, Some(share_scan))
+}
+
+#[cfg(target_os = "macos")]
+fn build_vz_configuration_limited(
+    spec: &VmConfigSpec,
+    share_scan: Option<Duration>,
+) -> Result<VzVmConfiguration, ConfigError> {
     use objc2_foundation::{NSString, NSURL};
 
     let (cpu_min, cpu_max) = crate::sys::allowed_cpu_range();
@@ -1927,7 +2031,10 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
     }
 
     // ReadWrite 共有が起動入力を含む構成と、ReadOnly を含む共有範囲外経路のある構成は、副作用の前に拒否する。
-    spec.check_share_conflicts()?;
+    match share_scan {
+        Some(budget) => spec.check_share_conflicts_within(budget)?,
+        None => spec.check_share_conflicts()?,
+    }
 
     // 実効コマンドライン（ゲスト mount の指示を含む）と待機対象を、副作用（ログ作成・スレッド起動）の前に確定する。
     let effective_cmdline = spec.effective_cmdline()?;
@@ -2625,6 +2732,81 @@ mod tests {
         ));
     }
 
+    /// REPAIR-5・MAC-1・TASK-115.3: 期限つきの共有検査は、期限超過で走査を打ち切り
+    /// `config.shared_dir_scan_timeout` を返す。期限内なら期限なしの版と同じ結果（許可・拒否）になる。
+    #[cfg(unix)]
+    #[test]
+    fn share_scan_deadline_aborts_with_structured_error() {
+        use crate::virtiofs::{ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
+        let t = TempDir::new("share-scan-deadline");
+        let real = std::fs::canonicalize(&t.0).unwrap();
+        let outside = real.join("outside");
+        let shared = real.join("shared");
+        std::fs::create_dir_all(shared.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let k = outside.join("vmlinux");
+        std::fs::write(&k, b"k").unwrap();
+        std::fs::write(shared.join("sub").join("plain"), b"x").unwrap();
+        let spec = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_shared_directories(
+                VirtiofsSharesSpec::try_new(vec![VirtiofsShareSpec::new(
+                    VirtiofsTag::try_new("s").unwrap(),
+                    SharedDirectoryPath::try_new(&shared).unwrap(),
+                    ShareAccess::ReadOnly,
+                )])
+                .unwrap(),
+            );
+        // 期限 0 は走査開始時点で超過している。
+        let err = spec
+            .check_share_conflicts_within(Duration::ZERO)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::SharedDirScanTimeout {
+                after: Duration::ZERO
+            }
+        );
+        assert_eq!(err.code(), "config.shared_dir_scan_timeout");
+        // 走査関数へ過ぎた期限を直接渡しても同じエラーになり、`after` は指定値をそのまま報告する。
+        let past = ShareScanLimit {
+            deadline: Instant::now(),
+            budget: Duration::from_millis(7),
+        };
+        assert_eq!(
+            find_hardlink_to_protected(&shared, &[], Some(past)),
+            Err(ConfigError::SharedDirScanTimeout {
+                after: Duration::from_millis(7)
+            })
+        );
+        assert_eq!(
+            ConfigError::SharedDirScanTimeout {
+                after: Duration::from_millis(7)
+            }
+            .message(),
+            "shared directory scan did not finish within 7 ms (hint: share a smaller directory tree)"
+        );
+        // 十分な期限なら期限なしの版と同じく許可し、拒否すべき構成は期限つきでも同じコードで拒否する。
+        let ample = Duration::from_secs(60);
+        assert_eq!(spec.check_share_conflicts_within(ample), Ok(()));
+        std::fs::hard_link(shared.join("sub").join("plain"), outside.join("alias")).unwrap();
+        assert_eq!(
+            spec.check_share_conflicts_within(ample).unwrap_err().code(),
+            "config.shared_dir_hardlinked_file"
+        );
+        assert_eq!(
+            spec.check_share_conflicts().unwrap_err().code(),
+            "config.shared_dir_hardlinked_file"
+        );
+        // 巨大な期限でも panic しない（加算の桁あふれを丸める）。
+        assert_eq!(
+            spec.check_share_conflicts_within(Duration::MAX)
+                .unwrap_err()
+                .code(),
+            "config.shared_dir_hardlinked_file"
+        );
+    }
+
     /// MAC-1・TASK-65.1: 共有内に置かれた保護入力へのハードリンクは、パス包含では検出できないが
     /// `(dev, ino)` 照合で拒否する。無関係なファイルだけの共有は許可する。
     #[cfg(unix)]
@@ -2673,7 +2855,7 @@ mod tests {
         let t = TempDir::new("share-mount");
         let real = std::fs::canonicalize(&t.0).unwrap();
         std::fs::create_dir_all(real.join("a")).unwrap();
-        find_hardlink_to_protected(&real, &[]).unwrap();
+        find_hardlink_to_protected(&real, &[], None).unwrap();
         // ルート直下にマウントポイント（/proc 等）を持つ実ディレクトリで拒否を確認する。
         use std::os::unix::fs::MetadataExt;
         let root_dev = std::fs::metadata("/").unwrap().dev();
@@ -2683,7 +2865,7 @@ mod tests {
                 .unwrap_or(false)
         });
         if has_mount {
-            let err = find_hardlink_to_protected(Path::new("/"), &[]);
+            let err = find_hardlink_to_protected(Path::new("/"), &[], None);
             assert!(
                 matches!(err, Err(ConfigError::SharedDirCrossesMount { .. })),
                 "{err:?}"

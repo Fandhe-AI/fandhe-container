@@ -83,6 +83,8 @@ pub struct OpTimeouts {
     stop: Duration,
     state_query: Duration,
     guest_mount: Duration,
+    /// `Vm::launch` が構成構築時に行う共有配下の走査の期限。`None` は期限なし（件数上限のみ）。
+    share_scan: Option<Duration>,
 }
 
 impl OpTimeouts {
@@ -111,7 +113,32 @@ impl OpTimeouts {
             stop,
             state_query,
             guest_mount: DEFAULT_GUEST_MOUNT_TIMEOUT,
+            share_scan: None,
         })
+    }
+
+    /// `Vm::launch` が構成構築時に行う共有配下の走査（`VmConfigSpec::check_share_conflicts_within`）の
+    /// 期限を指定する（`MIN_OP_TIMEOUT..=MAX_OP_TIMEOUT`。REPAIR-5・MAC-1・TASK-115.3）。
+    ///
+    /// 未指定（既定）は従来どおり期限なしで、件数上限だけで止まる。相手の応答期限を持つ呼び出し元
+    /// （plugin の RPC 経路）が指定する。超過は `ConfigError::SharedDirScanTimeout`。
+    pub fn with_share_scan(mut self, share_scan: Duration) -> Result<OpTimeouts, VmError> {
+        if !(MIN_OP_TIMEOUT..=MAX_OP_TIMEOUT).contains(&share_scan) {
+            return Err(VmError::InvalidTimeout {
+                field: "share_scan",
+                requested: share_scan,
+                min: MIN_OP_TIMEOUT,
+                max: MAX_OP_TIMEOUT,
+            });
+        }
+        self.share_scan = Some(share_scan);
+        Ok(self)
+    }
+
+    /// 共有配下の走査の期限（未指定は `None`）。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn share_scan(&self) -> Option<Duration> {
+        self.share_scan
     }
 
     /// ゲスト mount 報告の待機時間を差し替える（`MIN_OP_TIMEOUT..=MAX_OP_TIMEOUT`。TASK-65.3）。
@@ -166,6 +193,7 @@ impl Default for OpTimeouts {
             stop: DEFAULT_STOP_TIMEOUT,
             state_query: DEFAULT_STATE_QUERY_TIMEOUT,
             guest_mount: DEFAULT_GUEST_MOUNT_TIMEOUT,
+            share_scan: None,
         }
     }
 }
@@ -756,7 +784,9 @@ mod mac {
         AbandonOutcome, BeginOutcome, Core, EVENT_CHANNEL_CAPACITY, ErrInfo, LifecycleInput,
         OpTicket, OpTimeouts, VmError, VmEvent, VmOp, VmState, await_op_result, event_channel,
     };
-    use crate::config::{VmConfigSpec, VzVmConfiguration, build_vz_configuration};
+    use crate::config::{
+        VmConfigSpec, VzVmConfiguration, build_vz_configuration, build_vz_configuration_within,
+    };
     use crate::error::PlatformError;
     use crate::sys::{self, DelegateEvent, HostInitError, VmRef};
 
@@ -834,7 +864,11 @@ mod mac {
         /// ディスクイメージは呼び出し側の所有物）、追記先として検証したパスを削除対象にする経路も作らない。
         pub fn launch(spec: &VmConfigSpec, timeouts: OpTimeouts) -> Result<Vm, PlatformError> {
             // 宣言順の逆に drop される: `vm`（先）→ `config`（後）。
-            let mut config = build_vz_configuration(spec)?;
+            // 共有配下の走査は、期限の指定があればその範囲で打ち切る（REPAIR-5・TASK-115.3）。
+            let mut config = match timeouts.share_scan() {
+                Some(budget) => build_vz_configuration_within(spec, budget)?,
+                None => build_vz_configuration(spec)?,
+            };
             let vm = Vm::create_with_timeouts(&config, timeouts)?;
             if let Err(e) = vm.start() {
                 drop(vm);
@@ -1982,6 +2016,29 @@ mod tests {
                 OpTimeouts::default().with_guest_mount(bad),
                 Err(VmError::InvalidTimeout {
                     field: "guest_mount",
+                    requested: bad,
+                    min: MIN_OP_TIMEOUT,
+                    max: MAX_OP_TIMEOUT
+                })
+            );
+        }
+    }
+
+    /// REPAIR-5・MAC-1・TASK-115.3: 共有走査の期限は既定で未指定（従来どおり）で、指定は範囲内のみ受け付ける。
+    #[test]
+    fn share_scan_timeout_default_and_bounds() {
+        assert_eq!(OpTimeouts::default().share_scan(), None);
+        let base = OpTimeouts::try_new(MIN_OP_TIMEOUT, MIN_OP_TIMEOUT, MIN_OP_TIMEOUT).unwrap();
+        assert_eq!(base.share_scan(), None);
+        let ok = base.with_share_scan(Duration::from_secs(2)).unwrap();
+        assert_eq!(ok.share_scan(), Some(Duration::from_secs(2)));
+        assert_eq!(ok.guest_mount(), DEFAULT_GUEST_MOUNT_TIMEOUT);
+        let one_ns = Duration::from_nanos(1);
+        for bad in [MIN_OP_TIMEOUT - one_ns, MAX_OP_TIMEOUT + one_ns] {
+            assert_eq!(
+                OpTimeouts::default().with_share_scan(bad),
+                Err(VmError::InvalidTimeout {
+                    field: "share_scan",
                     requested: bad,
                     min: MIN_OP_TIMEOUT,
                     max: MAX_OP_TIMEOUT

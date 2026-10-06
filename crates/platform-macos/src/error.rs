@@ -68,7 +68,7 @@ pub enum VmError {
     },
     /// 待機タイムアウトの指定が許容範囲（`MIN_OP_TIMEOUT`..=`MAX_OP_TIMEOUT`）外（REPAIR-5・TASK-64.5）。
     InvalidTimeout {
-        /// 範囲外だった項目名（`start` / `stop` / `state_query`）。
+        /// 範囲外だった項目名（`start` / `stop` / `state_query` / `guest_mount` / `share_scan`）。
         field: &'static str,
         requested: Duration,
         min: Duration,

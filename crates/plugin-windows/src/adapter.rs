@@ -259,7 +259,10 @@ pub struct LaunchOutcome<P> {
 /// [`REQUEST_BUDGET`] の配分へ加える（REPAIR-3・REPAIR-5）。
 pub trait GuestStart<P> {
     /// 共有マウント準備後に呼ばれる。`Err` ならマウントはロールバックされる。
-    fn start(&self, prepared: &P) -> Result<(), WinError>;
+    ///
+    /// `remaining` は launch 全体の期限のうち本ステップに残された時間（REPAIR-5）。実装はこの時間内に
+    /// 返し、超過する場合は `WinErrorCode::Timeout` を返す（期限超過後の成功を正常として扱わない）。
+    fn start(&self, prepared: &P, remaining: Duration) -> Result<(), WinError>;
 }
 
 /// 既定の起動ステップ。実体が無いため `UNIMPLEMENTED` を返す（REPAIR-3）。
@@ -267,7 +270,7 @@ pub trait GuestStart<P> {
 pub struct UnimplementedGuestStart;
 
 impl<P> GuestStart<P> for UnimplementedGuestStart {
-    fn start(&self, _prepared: &P) -> Result<(), WinError> {
+    fn start(&self, _prepared: &P, _remaining: Duration) -> Result<(), WinError> {
         Err(WinError::new(
             WinErrorCode::Unimplemented,
             "in-guest runtime start is not implemented",
@@ -349,9 +352,10 @@ impl WindowsBackend for PlatformBackend {
         budget: Duration,
         cancel: &dyn Fn() -> bool,
     ) -> Result<LaunchOutcome<PreparedLaunch>, BackendFailure<PreparedLaunch>> {
+        let began = Instant::now();
         let Launched { prepared, .. } =
             wsl2::launch_cancellable_with_recorder(req, budget, &StderrJsonRecorder, cancel, |p| {
-                guest.start(p)
+                guest.start(p, budget.saturating_sub(began.elapsed()))
             })
             .map_err(failure_from_mount)?;
         Ok(LaunchOutcome {
@@ -876,7 +880,7 @@ mod tests {
                 return Err(f);
             }
             let p = FakePrepared(req.distro().as_str().to_string());
-            guest.start(&p)?;
+            guest.start(&p, budget)?;
             Ok(LaunchOutcome {
                 prepared: p,
                 transport: Some(SharedTransport::Virtiofs),
@@ -902,7 +906,7 @@ mod tests {
 
     struct OkGuest;
     impl GuestStart<FakePrepared> for OkGuest {
-        fn start(&self, _: &FakePrepared) -> Result<(), WinError> {
+        fn start(&self, _: &FakePrepared, _: Duration) -> Result<(), WinError> {
             Ok(())
         }
     }

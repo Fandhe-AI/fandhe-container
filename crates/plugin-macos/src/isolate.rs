@@ -33,12 +33,18 @@ impl Workers {
 
     /// 上限未満なら 1 枠確保する。確保できなければ `None`。
     fn acquire(&self) -> Option<Slot> {
-        self.0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < MAX_WORKERS).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Slot(self.clone()))
+        let mut current = self.0.load(Ordering::SeqCst);
+        // 競合で値が変わっていたら読み直して再判定する（上限未満の間だけ加算を試みる）。
+        while current < MAX_WORKERS {
+            match self
+                .0
+                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return Some(Slot(self.clone())),
+                Err(seen) => current = seen,
+            }
+        }
+        None
     }
 }
 
@@ -59,14 +65,16 @@ pub enum IsolateError {
     Timeout { after: Duration },
     /// 生存中の作業スレッドが上限に達しており、開始しなかった。
     Busy,
-    /// 作業スレッドを起動できなかった、または結果を返さずに終了した（panic 等）。
-    Failed,
+    /// 作業スレッドを起動できず、処理を開始しなかった。
+    SpawnFailed,
+    /// 作業スレッドが処理を開始した後、結果を返さずに終了した（panic 等）。処理の副作用は起き得る。
+    Died,
 }
 
 /// `f` を作業スレッドで実行し、`timeout` まで結果を待つ。
 ///
-/// `f` は開始されないか（[`IsolateError::Busy`]・起動失敗の [`IsolateError::Failed`]）、ちょうど 1 回
-/// 実行される。期限超過後も `f` は走り続け得るため、`f` の副作用は「期限超過でも完了し得る」前提で
+/// `f` は開始されないか（[`IsolateError::Busy`]・[`IsolateError::SpawnFailed`]）、ちょうど 1 回
+/// 実行される（[`IsolateError::Timeout`]・[`IsolateError::Died`] は開始後の失敗）。期限超過後も `f` は走り続け得るため、`f` の副作用は「期限超過でも完了し得る」前提で
 /// 呼び出し側が扱う（VM 起動なら停止未確認として記録する等）。
 pub fn run<T, F>(workers: &Workers, timeout: Duration, f: F) -> Result<T, IsolateError>
 where
@@ -84,12 +92,12 @@ where
             let _ = tx.send(f());
         });
     if spawned.is_err() {
-        return Err(IsolateError::Failed);
+        return Err(IsolateError::SpawnFailed);
     }
     match rx.recv_timeout(timeout) {
         Ok(v) => Ok(v),
         Err(RecvTimeoutError::Timeout) => Err(IsolateError::Timeout { after: timeout }),
-        Err(RecvTimeoutError::Disconnected) => Err(IsolateError::Failed),
+        Err(RecvTimeoutError::Disconnected) => Err(IsolateError::Died),
     }
 }
 
@@ -151,14 +159,14 @@ mod tests {
         assert_eq!(run(&w, Duration::from_secs(30), || 7), Ok(7));
     }
 
-    /// TASK-115.3・REPAIR-5: 作業スレッドが panic しても呼び出し側は panic せず `Failed` を受け取り、枠は戻る。
+    /// TASK-115.3・REPAIR-5: 作業スレッドが panic しても呼び出し側は panic せず `Died` を受け取り、枠は戻る。
     #[test]
     fn task115_3_repair5_worker_panic_is_reported() {
         let w = Workers::default();
         let r: Result<(), IsolateError> = run(&w, Duration::from_secs(30), || {
             std::panic::resume_unwind(Box::new("worker failure"));
         });
-        assert_eq!(r, Err(IsolateError::Failed));
+        assert_eq!(r, Err(IsolateError::Died));
         assert_eq!(wait_live(&w, 0), 0);
     }
 }

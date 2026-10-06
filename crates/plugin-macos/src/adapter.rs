@@ -164,7 +164,7 @@ pub enum BackendError {
     /// 起動全体の期限（`after`）内に `launch` が終わらなかった。作業スレッドは起動を続け得るため、
     /// VM が作られた可能性がある（期限後に完成した VM は drop の停止要求へ回るが、完了は確認できない）。
     LaunchTimedOut { after: Duration },
-    /// `launch` を開始しなかった（作業スレッドの上限・起動失敗）。VM は作られていない。
+    /// `launch` を開始しなかった（作業スレッドの上限・作業スレッドの起動失敗）。VM は作られていない。
     /// `busy` は上限に達していた場合 true。
     LaunchNotStarted { busy: bool },
 }
@@ -250,8 +250,10 @@ impl MacosBackend for PlatformBackend {
             Ok(launched) => Ok(launched?),
             Err(IsolateError::Timeout { after }) => Err(BackendError::LaunchTimedOut { after }),
             Err(IsolateError::Busy) => Err(BackendError::LaunchNotStarted { busy: true }),
-            // 作業スレッドが結果を返さずに終わった場合、VM が作られたかを確かめられない（fail-closed）。
-            Err(IsolateError::Failed) => Err(BackendError::LaunchTimedOut {
+            // 作業スレッドを起動できなかった場合は起動を始めていない（VM なし）。
+            Err(IsolateError::SpawnFailed) => Err(BackendError::LaunchNotStarted { busy: false }),
+            // 起動を始めた作業スレッドが結果を返さずに終わった場合、VM が作られたかを確かめられない（fail-closed）。
+            Err(IsolateError::Died) => Err(BackendError::LaunchTimedOut {
                 after: LAUNCH_TOTAL_TIMEOUT,
             }),
         }
@@ -494,7 +496,9 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
                 PluginError::new(PluginErrorCode::Timeout, MSG_VALIDATION_TIMEOUT)
             }
             IsolateError::Busy => PluginError::new(PluginErrorCode::Unavailable, MSG_WORKERS_BUSY),
-            IsolateError::Failed => PluginError::new(PluginErrorCode::Internal, MSG_WORKER_FAILED),
+            IsolateError::SpawnFailed | IsolateError::Died => {
+                PluginError::new(PluginErrorCode::Internal, MSG_WORKER_FAILED)
+            }
         })??;
         self.entries.insert(
             id.clone(),

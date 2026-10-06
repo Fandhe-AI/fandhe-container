@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
 use fandhe_container_core::traits::{
-    ContainerState, ContainerStatus, ErrorCode, Signal, SupervisionState, TraitError,
+    ContainerStatus, ErrorCode, Signal, SupervisionState, TraitError,
 };
 
 use crate::run::{
@@ -604,7 +604,7 @@ fn relaunch_bounded(
 /// バックオフ → [`Relauncher::relaunch`] → `Running(新 pid)` と `restart_count + 1` を 1 回の書き込みで記録。
 /// `Running` 再記録では `supervisor_pid` は `None` のままで、次周の `monitor` が監視権を取り直す。
 ///
-/// [`MonitorOperation::Restart`] を再起動 1 回ごとに通知する。`elapsed` は終了検知から `Running` 記録完了までで、
+/// [`MonitorOperation::Restart`] を再起動 1 回ごとに通知する。`elapsed` は終了検知（`Stopped` 記録の前）から `Running` 記録完了までで、
 /// バックオフ時間を含む（バックオフ 0 のとき SUP-3 の「再起動レイテンシ中央値 100ms 以下」に相当）。
 ///
 /// `monitor` 自体が失敗しても終了を確認できていない `process` は捨てず、[`SuperviseOutcome::MonitorError`] /
@@ -632,8 +632,17 @@ pub fn supervise_with_restart(
                 });
             }
         };
-        let (exit, restart_count) = match &last {
-            MonitorOutcome::Exited { exit, record } => (*exit, record.restart_count()),
+        let (exit, restart_count, detected, exited_status) = match &last {
+            MonitorOutcome::Exited {
+                exit,
+                record,
+                detected_at,
+            } => (
+                *exit,
+                record.restart_count(),
+                *detected_at,
+                record.status().clone(),
+            ),
             MonitorOutcome::StopRequested { .. } => {
                 return Ok(SuperviseOutcome::Stopped {
                     last,
@@ -652,7 +661,6 @@ pub fn supervise_with_restart(
                 });
             }
         };
-        let detected = Instant::now();
         let intent = if stop.is_stop_requested() {
             StopIntent::Requested
         } else {
@@ -726,13 +734,11 @@ pub fn supervise_with_restart(
         }
         let new_pid = new_process.pid();
         let id = state.id().clone();
-        // 前回の終了記録（`Stopped`・監視権なし）のままであることを確かめて書く。delete 等で変わっていれば書かない。
+        // 自分が監視して記録した終了記録（同一の `Stopped` 状態・監視権なし）のままであることを確かめて書く。
+        // 競合後に stop / delete / 再作成など別の遷移が入っていれば書かない（health 更新による revision 変化は許容）。
         let written = write_with_retry_when(
             state,
-            |rec| {
-                rec.status().state() == ContainerState::Stopped
-                    && rec.supervision().supervisor_pid().is_none()
-            },
+            |rec| rec.status() == &exited_status && rec.supervision().supervisor_pid().is_none(),
             |rec| {
                 // 競合後の refresh で他者の更新を消さないよう、書き込みごとに最新値から加算する（上限で頭打ち）。
                 Ok((
@@ -772,6 +778,7 @@ pub fn supervise_with_restart(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_core::traits::ContainerState;
 
     fn sig(n: u8) -> ExitClass {
         ExitClass::Signaled {
@@ -1439,6 +1446,53 @@ mod tests {
         assert!(matches!(out, SuperviseOutcome::RelaunchFailed { .. }));
         // 初期 1 + 競合の外部加算 1 + 自分の再起動 1 = 3（再 launch 失敗は数えない）。
         assert_eq!(st.rec.lock().unwrap().restart_count(), 3);
+    }
+
+    /// SUP-3・TASK-159.3: 競合後に別の遷移（別の終了コードの Stopped）が入っていたら Running で上書きせず、
+    /// 新プロセスを後始末して RestartUnrecorded で戻る。
+    #[test]
+    fn sup3_task159_3_changed_exit_record_aborts_restart() {
+        let st = store(0, 42);
+        struct Interleave(Queue, Arc<Store>);
+        impl Relauncher for Interleave {
+            fn relaunch(&self, t: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+                // 再 launch 中に別処理が Stopped（別コード）へ書き換え、直後の書き込みを競合させる。
+                {
+                    let mut g = self.1.rec.lock().unwrap();
+                    let next = StateRecord::new(
+                        ContainerStatus::stopped(cid(), Some(99)),
+                        g.bundle().to_path_buf(),
+                        StateRevision::from_raw(g.revision().value() + 1),
+                    )
+                    .unwrap()
+                    .with_supervision(g.supervision());
+                    *g = next;
+                }
+                *self.1.conflicts.lock().unwrap() = 1;
+                self.0.relaunch(t)
+            }
+        }
+        let q = Arc::new(Interleave(
+            Queue::new(&[(43, ProcessExit::Exited(0))]),
+            st.clone(),
+        ));
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &rl(&q),
+            &MonitorConfig::default(),
+            &cfg("always"),
+            &StopToken::new(),
+            &Events::default(),
+        )
+        .unwrap();
+        assert!(matches!(out, SuperviseOutcome::RestartUnrecorded { .. }));
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.status().state(), ContainerState::Stopped);
+        assert_eq!(g.status().exit_code(), Some(99));
+        // 競合用の外部加算 1 のみで、自分の再起動は数えない。
+        assert_eq!(g.restart_count(), 1);
     }
 
     /// SUP-3・TASK-159.3: restart_count は u32::MAX で頭打ちになり panic しない。

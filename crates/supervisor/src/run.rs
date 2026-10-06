@@ -184,6 +184,9 @@ pub enum MonitorOutcome {
         exit: ProcessExit,
         /// 書き込み後のレコード。
         record: StateRecord,
+        /// 終了を検知した時刻（`Stopped` 記録の前）。再起動レイテンシ（SUP-3）に終了記録の時間を含めるため
+        /// [`crate::restart::supervise_with_restart`] が起点に使う。
+        detected_at: Instant,
     },
     /// 終了を検知しプロセスは回収済みだが、`Stopped` の書き込みに失敗した（状態は `Running` のまま、
     /// `supervisor_pid` も自 pid のまま残り得る）。再 `wait` はできないため、終了状態を失わないよう
@@ -409,6 +412,7 @@ fn monitor_after_claim(
         }) {
             Ok(None) => continue,
             Ok(Some(exit)) => {
+                let detected_at = Instant::now();
                 let code = exit_code_of(exit);
                 let id = state.id().clone();
                 // 回収後は再 wait できないため、書き込み失敗でも終了状態を返す。
@@ -424,7 +428,11 @@ fn monitor_after_claim(
                     })
                 });
                 return Ok(match written {
-                    Ok(record) => MonitorOutcome::Exited { exit, record },
+                    Ok(record) => MonitorOutcome::Exited {
+                        exit,
+                        record,
+                        detected_at,
+                    },
                     Err(error) => MonitorOutcome::ExitedUnrecorded { exit, error },
                 });
             }
@@ -864,7 +872,7 @@ mod tests {
         let mut s = attach(&store);
         let p = FakeProc::exiting(3, ProcessExit::Exited(7));
         let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
-        let MonitorOutcome::Exited { exit, record } = out else {
+        let MonitorOutcome::Exited { exit, record, .. } = out else {
             panic!("unexpected outcome")
         };
         assert_eq!(exit, ProcessExit::Exited(7));
@@ -884,7 +892,7 @@ mod tests {
         let mut s = attach(&store);
         let p = FakeProc::exiting(1, ProcessExit::Signaled(9));
         let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
-        let MonitorOutcome::Exited { exit, record } = out else {
+        let MonitorOutcome::Exited { exit, record, .. } = out else {
             panic!("unexpected outcome")
         };
         assert_eq!(exit, ProcessExit::Signaled(9));

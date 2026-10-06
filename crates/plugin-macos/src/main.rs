@@ -71,7 +71,7 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_CONNECT_FAILED);
         }
     };
-    let mut adapter = MacosRuntimeAdapter::new(PlatformBackend)
+    let mut adapter = MacosRuntimeAdapter::new(PlatformBackend::default())
         .with_op_sink(|ev| eprintln!("{}", ev.to_json_line()));
     let outcome = serve(&mut stream, &mut adapter);
     // Vm の Drop は停止を待たないため、正常切断・異常終了のどちらでも期限つきで明示停止する。

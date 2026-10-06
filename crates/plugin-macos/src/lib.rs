@@ -18,4 +18,5 @@
 
 pub mod adapter;
 pub mod frame_loop;
+pub mod isolate;
 pub mod startup;

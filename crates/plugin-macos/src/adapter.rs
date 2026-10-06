@@ -41,6 +41,8 @@
 //! | `VirtiofsIo::ConnectionLost`・`ReconnectFailed` | 未永続化 write があれば `DATA_LOSS`、なければ `UNAVAILABLE` |
 //! | 上記以外・将来追加分 | `INTERNAL`（fail-closed） |
 //! | [`BackendError::UnsupportedHost`] | `UNIMPLEMENTED` |
+//! | [`BackendError::LaunchTimedOut`]・create の検証の期限超過 | `TIMEOUT` |
+//! | [`BackendError::LaunchNotStarted`]・create の検証を開始できない | `UNAVAILABLE` |
 //!
 //! message は先頭に元の `code()` を付ける（core が元の分類を区別できる）。`Config` 系は `message()` が要求由来の
 //! パスを埋め込むため使わず固定文言にする（入力の反射防止）。`GuestMount` 系も共有タグを含むため固定文言にする。アダプタ自身の検証エラーも固定文言のみ。
@@ -54,6 +56,16 @@
 //! （[`rewrite_known_alias`]）。それ以外の symlink は辿らない。置換後のパスも `try_new` が全要素を検証する。
 //! 共有配下の走査（範囲外 symlink・ハードリンク・マウント境界）は create と start（`Vm::launch` 内の再検査）の
 //! どちらも [`SHARE_SCAN_TIMEOUT`] で打ち切り、超過は `TIMEOUT`（`config.shared_dir_scan_timeout`）で返す（REPAIR-5）。
+//!
+//! # 取り消せない OS 呼び出しの隔離（REPAIR-5）
+//!
+//! 要求由来のパスに触れる処理（create の kernel・initrd・共有元の検証と共有走査、start の `Vm::launch`）は
+//! 応答しないファイルシステム（NFS・autofs 等）の上で 1 回の OS 呼び出しが戻らないことがあり、走査の期限
+//! （呼び出しの合間に確かめる）では打ち切れない。これらは [`crate::isolate::run`] で作業スレッドへ隔離し、
+//! 要求処理スレッドは [`CREATE_VALIDATION_TIMEOUT`]・[`LAUNCH_TOTAL_TIMEOUT`] だけ待って `TIMEOUT` を返す。
+//! 戻らない作業スレッドは残るが数を上限で抑え（[`crate::isolate::MAX_WORKERS`]）、上限に達したら新しい
+//! 処理を開始せず `UNAVAILABLE` で拒否する。start の期限超過は VM が作られ得るため停止未確認
+//! （`LaunchFailed`）として扱う。stop は VM キューへの期限つき要求だけでファイルシステムに触れない。
 //!
 //! # 未実装範囲（実装済みを装わない。REPAIR-3）
 //! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（TASK-114 待ち）。
@@ -83,6 +95,7 @@ use fandhe_container_platform_macos::virtiofs::{
 use fandhe_container_plugin::{PluginError, PluginErrorCode};
 
 use crate::frame_loop::RequestHandler;
+use crate::isolate::{self, IsolateError, Workers};
 
 /// 登録できるコンテナ数の上限（無制限確保の防止）。
 pub const MAX_CONTAINERS: usize = 64;
@@ -97,6 +110,12 @@ pub const LAUNCH_STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// `Vm::launch` の最大所要は 7 秒で、10 秒の RPC・都度起動の合計期限に 3 秒の余裕（plugin プロセスの起動・
 /// UDS 接続・フレーム送受信の分）を残す。各段階は固定配分で、合計がこの上限を超えない。
 pub const LAUNCH_GUEST_MOUNT_TIMEOUT: Duration = Duration::from_secs(3);
+/// start（`Vm::launch`）全体を作業スレッドで待つ上限。各段階（走査 1 秒・start 3 秒・ゲスト mount 3 秒）の
+/// 合計と同じ 7 秒で、段階ごとの期限で打ち切れない OS 呼び出しのブロックもここで打ち切る（REPAIR-5）。
+pub const LAUNCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(7);
+/// create の検証全体（kernel・initrd・共有元の検証と共有走査）を作業スレッドで待つ上限（REPAIR-5）。
+/// 走査の期限（[`SHARE_SCAN_TIMEOUT`] 1 秒）に検証の余裕を足した値で、10 秒の RPC 期限に 7 秒の余裕を残す。
+pub const CREATE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(3);
 /// 共有ディレクトリ配下の走査（`VmConfigSpec::check_share_conflicts_within`）の期限（REPAIR-5・MAC-1）。
 ///
 /// create は検証と登録だけなので 10 秒の RPC 期限に 9 秒の余裕を残す。start は `Vm::launch` が構成構築時に
@@ -116,6 +135,10 @@ const MSG_INVALID_ID: &str = "invalid container id";
 const MSG_UNIMPLEMENTED: &str = "operation is not implemented";
 const MSG_UNSUPPORTED_HOST: &str = "Virtualization.framework is only available on macOS";
 const MSG_CONFIG_REJECTED: &str = "VM configuration was rejected";
+const MSG_VALIDATION_TIMEOUT: &str = "request validation did not finish in time";
+const MSG_LAUNCH_TIMEOUT: &str = "VM launch did not finish in time";
+const MSG_WORKERS_BUSY: &str = "too many operations are blocked on the host file system";
+const MSG_WORKER_FAILED: &str = "isolated operation failed";
 
 /// platform-macos への委譲境界。実機は [`PlatformBackend`]、テストは偽実装。
 pub trait MacosBackend {
@@ -137,6 +160,12 @@ pub enum BackendError {
     Platform(PlatformError),
     /// 非 macOS ビルド。Virtualization.framework を呼べない（fail-closed）。
     UnsupportedHost,
+    /// 起動全体の期限（`after`）内に `launch` が終わらなかった。作業スレッドは起動を続け得るため、
+    /// VM が作られた可能性がある（期限後に完成した VM は drop の停止要求へ回るが、完了は確認できない）。
+    LaunchTimedOut { after: Duration },
+    /// `launch` を開始しなかった（作業スレッドの上限・起動失敗）。VM は作られていない。
+    /// `busy` は上限に達していた場合 true。
+    LaunchNotStarted { busy: bool },
 }
 
 impl BackendError {
@@ -168,6 +197,8 @@ impl BackendError {
     fn vm_may_exist(&self) -> bool {
         match self {
             BackendError::UnsupportedHost => false,
+            BackendError::LaunchNotStarted { .. } => false,
+            BackendError::LaunchTimedOut { .. } => true,
             BackendError::Platform(PlatformError::Config(_)) => false,
             BackendError::Platform(PlatformError::Vm(
                 VmError::VirtualizationUnsupported
@@ -186,8 +217,13 @@ impl From<PlatformError> for BackendError {
 }
 
 /// 実バックエンド。macOS では `Vm::launch` / `Vm::stop` へ委譲し、他 OS では常に `UnsupportedHost`。
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PlatformBackend;
+///
+/// `launch` は [`crate::isolate`] の作業スレッドで実行する。`workers` はその生存数（複製は計数を共有する）。
+#[derive(Debug, Default, Clone)]
+pub struct PlatformBackend {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    workers: Workers,
+}
 
 #[cfg(target_os = "macos")]
 impl MacosBackend for PlatformBackend {
@@ -204,7 +240,20 @@ impl MacosBackend for PlatformBackend {
         .and_then(|t| t.with_guest_mount(LAUNCH_GUEST_MOUNT_TIMEOUT))
         .and_then(|t| t.with_share_scan(SHARE_SCAN_TIMEOUT))
         .map_err(PlatformError::Vm)?;
-        Ok(Vm::launch(spec, timeouts)?)
+        // 構成構築のファイルシステム操作は取り消せないため、起動全体を作業スレッドへ隔離して期限つきで待つ。
+        // 期限後に完成した `Vm` は受け手が無く作業スレッド側で drop され、停止要求が走る（REPAIR-5）。
+        let spec = spec.clone();
+        match isolate::run(&self.workers, LAUNCH_TOTAL_TIMEOUT, move || {
+            Vm::launch(&spec, timeouts)
+        }) {
+            Ok(launched) => Ok(launched?),
+            Err(IsolateError::Timeout { after }) => Err(BackendError::LaunchTimedOut { after }),
+            Err(IsolateError::Busy) => Err(BackendError::LaunchNotStarted { busy: true }),
+            // 作業スレッドが結果を返さずに終わった場合、VM が作られたかを確かめられない（fail-closed）。
+            Err(IsolateError::Failed) => Err(BackendError::LaunchTimedOut {
+                after: LAUNCH_TOTAL_TIMEOUT,
+            }),
+        }
     }
 
     fn stop_timeout(&self) -> Duration {
@@ -305,6 +354,13 @@ pub struct MacosRuntimeAdapter<B: MacosBackend> {
     sink: Box<dyn FnMut(&OpEvent)>,
     /// create の共有走査の期限（既定 [`SHARE_SCAN_TIMEOUT`]。テストだけが差し替える）。
     share_scan_timeout: Duration,
+    /// create の検証全体を待つ上限（既定 [`CREATE_VALIDATION_TIMEOUT`]。テストだけが差し替える）。
+    create_validation_timeout: Duration,
+    /// create の検証を隔離する作業スレッドの生存数。
+    workers: Workers,
+    /// テスト専用: 次の create の検証を、送信側が閉じるまで作業スレッド内で止める（応答しない OS 呼び出しの代役）。
+    #[cfg(test)]
+    validation_gate: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl<B: MacosBackend> MacosRuntimeAdapter<B> {
@@ -316,6 +372,10 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
             counts: [[0; 2]; 3],
             sink: Box::new(|_| {}),
             share_scan_timeout: SHARE_SCAN_TIMEOUT,
+            create_validation_timeout: CREATE_VALIDATION_TIMEOUT,
+            workers: Workers::default(),
+            #[cfg(test)]
+            validation_gate: None,
         }
     }
 
@@ -415,39 +475,26 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
                 "too many containers",
             ));
         }
-        let initrd = if initrd.is_empty() {
-            None
-        } else {
-            Some(Path::new(initrd.as_str()))
-        };
-        let mut shares = Vec::new();
-        // 端数は上で検査済みのため捨てる剰余は空。
-        let (triples, _) = rest.as_chunks::<3>();
-        for triple in triples {
-            {
-                let [tag, dir, access] = triple;
-                let access = match access.as_str() {
-                    "ro" => ShareAccess::ReadOnly,
-                    "rw" => ShareAccess::ReadWrite,
-                    _ => return Err(invalid(MSG_MALFORMED)),
-                };
-                shares.push(VirtiofsShareSpec::new(
-                    VirtiofsTag::try_new(tag).map_err(config_to_plugin)?,
-                    // 要求の値を解決せずに検証する（既知の別名だけ実体へ置換。モジュール doc 参照）。
-                    SharedDirectoryPath::try_new(&rewrite_known_alias(dir, KNOWN_ROOT_ALIASES))
-                        .map_err(config_to_plugin)?,
-                    access,
-                ));
+        // 以降はホストのファイルシステムに触れる。取り消せない呼び出しで要求処理を止めないよう作業スレッドへ
+        // 隔離し、期限を過ぎたら結果を待たない（残った検証は副作用を持たず、結果は捨てられる。REPAIR-5）。
+        let (kernel, initrd, cmdline) = (kernel.clone(), initrd.clone(), cmdline.clone());
+        let (rest, scan) = (rest.to_vec(), self.share_scan_timeout);
+        #[cfg(test)]
+        let gate = self.validation_gate.take();
+        let spec = isolate::run(&self.workers, self.create_validation_timeout, move || {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                let _ = gate.recv();
             }
-        }
-        let spec = VmConfigSpec::from_parts(Path::new(kernel.as_str()), initrd, cmdline)
-            .map_err(config_to_plugin)?
-            .with_shared_directories(
-                VirtiofsSharesSpec::try_new(shares).map_err(config_to_plugin)?,
-            );
-        // 走査は期限内に打ち切る（巨大な共有元で要求処理を占有しない。REPAIR-5）。
-        spec.check_share_conflicts_within(self.share_scan_timeout)
-            .map_err(config_to_plugin)?;
+            build_spec(&kernel, &initrd, &cmdline, &rest, scan)
+        })
+        .map_err(|e| match e {
+            IsolateError::Timeout { .. } => {
+                PluginError::new(PluginErrorCode::Timeout, MSG_VALIDATION_TIMEOUT)
+            }
+            IsolateError::Busy => PluginError::new(PluginErrorCode::Unavailable, MSG_WORKERS_BUSY),
+            IsolateError::Failed => PluginError::new(PluginErrorCode::Internal, MSG_WORKER_FAILED),
+        })??;
         self.entries.insert(
             id.clone(),
             Entry {
@@ -577,6 +624,48 @@ fn single_id(body: &[String]) -> Result<&str, PluginError> {
     }
 }
 
+/// create の要求本体から検証済みの VM 設定を組み立てる（ホストのファイルシステムに触れる唯一の create 処理）。
+///
+/// `MacosRuntimeAdapter::create` が [`crate::isolate::run`] の作業スレッドで呼ぶ。`shares` は
+/// `(tag, host_dir, "ro" / "rw")` の並び（長さが 3 の倍数であることは呼び出し側が検査済み）。副作用は無い。
+fn build_spec(
+    kernel: &str,
+    initrd: &str,
+    cmdline: &str,
+    shares: &[String],
+    share_scan_timeout: Duration,
+) -> Result<VmConfigSpec, PluginError> {
+    let initrd = if initrd.is_empty() {
+        None
+    } else {
+        Some(Path::new(initrd))
+    };
+    let mut specs = Vec::new();
+    // 端数は呼び出し側で検査済みのため捨てる剰余は空。
+    let (triples, _) = shares.as_chunks::<3>();
+    for [tag, dir, access] in triples {
+        let access = match access.as_str() {
+            "ro" => ShareAccess::ReadOnly,
+            "rw" => ShareAccess::ReadWrite,
+            _ => return Err(invalid(MSG_MALFORMED)),
+        };
+        specs.push(VirtiofsShareSpec::new(
+            VirtiofsTag::try_new(tag).map_err(config_to_plugin)?,
+            // 要求の値を解決せずに検証する（既知の別名だけ実体へ置換。モジュール doc 参照）。
+            SharedDirectoryPath::try_new(&rewrite_known_alias(dir, KNOWN_ROOT_ALIASES))
+                .map_err(config_to_plugin)?,
+            access,
+        ));
+    }
+    let spec = VmConfigSpec::from_parts(Path::new(kernel), initrd, cmdline)
+        .map_err(config_to_plugin)?
+        .with_shared_directories(VirtiofsSharesSpec::try_new(specs).map_err(config_to_plugin)?);
+    // 走査は期限内に打ち切る（巨大な共有元で処理を占有しない。REPAIR-5）。
+    spec.check_share_conflicts_within(share_scan_timeout)
+        .map_err(config_to_plugin)?;
+    Ok(spec)
+}
+
 /// core の `ContainerId` と同じ規則（TASK-114 で core 型へ置換予定）。
 fn validate_id(id: &str) -> Result<(), PluginError> {
     let ok = !id.is_empty()
@@ -641,6 +730,15 @@ fn backend_to_plugin(e: &BackendError) -> PluginError {
         BackendError::Platform(p) => to_plugin_error(p),
         BackendError::UnsupportedHost => {
             PluginError::new(PluginErrorCode::Unimplemented, MSG_UNSUPPORTED_HOST)
+        }
+        BackendError::LaunchTimedOut { .. } => {
+            PluginError::new(PluginErrorCode::Timeout, MSG_LAUNCH_TIMEOUT)
+        }
+        BackendError::LaunchNotStarted { busy: true } => {
+            PluginError::new(PluginErrorCode::Unavailable, MSG_WORKERS_BUSY)
+        }
+        BackendError::LaunchNotStarted { busy: false } => {
+            PluginError::new(PluginErrorCode::Unavailable, MSG_WORKER_FAILED)
         }
     }
 }
@@ -1363,6 +1461,80 @@ mod tests {
         );
     }
 
+    /// TASK-115.3・REPAIR-5: create の検証が戻らなくても要求処理は期限で `TIMEOUT` を返して登録せず、
+    /// 戻らない検証が上限まで溜まったら新しい検証を開始せず `UNAVAILABLE` で拒否する。検証が戻れば再び通る。
+    #[test]
+    fn task115_3_repair5_blocked_create_validation_times_out() {
+        let dir = tmp_dir("blocked-validation");
+        let k = kernel(&dir);
+        let (mut a, _f) = adapter();
+        assert_eq!(a.create_validation_timeout, Duration::from_secs(3));
+        a.create_validation_timeout = Duration::from_millis(20);
+        let mut releases = Vec::new();
+        for _ in 0..isolate::MAX_WORKERS {
+            let (release, gate) = std::sync::mpsc::channel::<()>();
+            releases.push(release);
+            a.validation_gate = Some(gate);
+            assert_eq!(
+                err_of(a.handle(&s(&["create", "a", &k, "", ""]))),
+                (
+                    PluginErrorCode::Timeout,
+                    "request validation did not finish in time".to_string()
+                )
+            );
+        }
+        assert_eq!(a.workers.live(), isolate::MAX_WORKERS);
+        assert_eq!(
+            err_of(a.handle(&s(&["create", "a", &k, "", ""]))),
+            (
+                PluginErrorCode::Unavailable,
+                "too many operations are blocked on the host file system".to_string()
+            )
+        );
+        // どの要求も登録していない。
+        assert_eq!(
+            err_of(a.handle(&s(&["start", "a"]))).0,
+            PluginErrorCode::NotFound
+        );
+        drop(releases);
+        for _ in 0..500 {
+            if a.workers.live() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(a.workers.live(), 0);
+        a.create_validation_timeout = CREATE_VALIDATION_TIMEOUT;
+        create_ok(&mut a, "a", &k);
+    }
+
+    /// TASK-115.3・REPAIR-5・REPAIR-3: 起動全体の期限超過は `TIMEOUT` で VM が作られ得る失敗（停止未確認）、
+    /// 起動を開始しなかった失敗は `UNAVAILABLE` で VM なしとして扱う。
+    #[test]
+    fn task115_3_repair5_launch_isolation_errors_map() {
+        let timed_out = BackendError::LaunchTimedOut {
+            after: LAUNCH_TOTAL_TIMEOUT,
+        };
+        assert!(timed_out.vm_may_exist());
+        let p = backend_to_plugin(&timed_out);
+        assert_eq!(
+            (p.code(), p.message()),
+            (PluginErrorCode::Timeout, "VM launch did not finish in time")
+        );
+        for (busy, msg) in [
+            (
+                true,
+                "too many operations are blocked on the host file system",
+            ),
+            (false, "isolated operation failed"),
+        ] {
+            let e = BackendError::LaunchNotStarted { busy };
+            assert!(!e.vm_may_exist());
+            let p = backend_to_plugin(&e);
+            assert_eq!((p.code(), p.message()), (PluginErrorCode::Unavailable, msg));
+        }
+    }
+
     /// TASK-115.3・REPAIR-5: 走査期限の超過は `TIMEOUT` へ写し、VM を作らない失敗として扱う。
     #[test]
     fn task115_3_repair5_scan_timeout_maps_to_timeout() {
@@ -1495,6 +1667,10 @@ mod tests {
         assert_eq!(LAUNCH_GUEST_MOUNT_TIMEOUT, Duration::from_secs(3));
         assert_eq!(launch, Duration::from_secs(7));
         assert_eq!(Duration::from_secs(10) - launch, Duration::from_secs(3));
+        // 起動全体の待ち上限は段階の合計と同じで、段階の期限で打ち切れないブロックもこの時間で打ち切る。
+        assert_eq!(LAUNCH_TOTAL_TIMEOUT, launch);
+        assert_eq!(CREATE_VALIDATION_TIMEOUT, Duration::from_secs(3));
+        assert!(SHARE_SCAN_TIMEOUT < CREATE_VALIDATION_TIMEOUT);
         assert_eq!(SHUTDOWN_BUDGET, Duration::from_secs(4));
         assert!(SHUTDOWN_BUDGET < Duration::from_secs(5));
         assert!(LAUNCH_STOP_TIMEOUT <= SHUTDOWN_BUDGET);
@@ -1759,7 +1935,7 @@ mod tests {
     fn task115_3_repair3_platform_backend_is_unsupported_off_macos() {
         let dir = tmp_dir("unsupported");
         let k = kernel(&dir);
-        let mut a = MacosRuntimeAdapter::new(PlatformBackend);
+        let mut a = MacosRuntimeAdapter::new(PlatformBackend::default());
         assert_eq!(
             a.handle(&s(&["create", "a", &k, "", ""])).expect("create"),
             s(&["created"])

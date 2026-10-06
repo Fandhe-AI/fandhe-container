@@ -44,14 +44,14 @@ impl WindowsBackend for FakeBackend {
         &self,
         req: &LaunchRequest,
         guest: &dyn GuestStart<FakePrepared>,
-        _budget: Duration,
+        budget: Duration,
         _cancel: &dyn Fn() -> bool,
     ) -> Result<LaunchOutcome<FakePrepared>, BackendFailure<FakePrepared>> {
         self.calls
             .lock()
             .expect("lock")
             .push(format!("launch:{}", req.distro().as_str()));
-        guest.start(&FakePrepared)?;
+        guest.start(&FakePrepared, budget)?;
         Ok(LaunchOutcome {
             prepared: FakePrepared,
             transport: Some(SharedTransport::Virtiofs),
@@ -79,7 +79,7 @@ impl WindowsBackend for FakeBackend {
 struct OkGuest;
 
 impl GuestStart<FakePrepared> for OkGuest {
-    fn start(&self, _p: &FakePrepared) -> Result<(), WinError> {
+    fn start(&self, _p: &FakePrepared, _remaining: Duration) -> Result<(), WinError> {
         Ok(())
     }
 }

@@ -79,7 +79,7 @@ mod mock_core {
             &self,
             req: &LaunchRequest,
             guest: &dyn GuestStart<FakePrepared>,
-            _budget: Duration,
+            budget: Duration,
             _cancel: &dyn Fn() -> bool,
         ) -> Result<LaunchOutcome<FakePrepared>, BackendFailure<FakePrepared>> {
             let mode = {
@@ -104,7 +104,7 @@ mod mock_core {
             };
             match mode {
                 LaunchMode::Ok { transport, warning } => {
-                    guest.start(&FakePrepared)?;
+                    guest.start(&FakePrepared, budget)?;
                     Ok(LaunchOutcome {
                         prepared: FakePrepared,
                         transport,
@@ -132,7 +132,7 @@ mod mock_core {
     struct OkGuest;
 
     impl GuestStart<FakePrepared> for OkGuest {
-        fn start(&self, _p: &FakePrepared) -> Result<(), WinError> {
+        fn start(&self, _p: &FakePrepared, _remaining: Duration) -> Result<(), WinError> {
             Ok(())
         }
     }
@@ -536,10 +536,25 @@ mod real_wsl2 {
     }
 
     impl GuestStart<PreparedLaunch> for MarkerGuest {
-        fn start(&self, p: &PreparedLaunch) -> Result<(), WinError> {
+        fn start(&self, p: &PreparedLaunch, remaining: Duration) -> Result<(), WinError> {
+            // REPAIR-5: 全共有の確認をアダプタから渡された残り時間内に収める。期限切れは Timeout で失敗させる。
+            let began = Instant::now();
             for m in p.mounts() {
+                let left = remaining.saturating_sub(began.elapsed());
+                if left.is_zero() {
+                    return Err(WinError::new(
+                        WinErrorCode::Timeout,
+                        "guest marker check exceeded the launch deadline",
+                    ));
+                }
                 let script = format!("test -f '{}/marker.txt'", m.guest_path);
-                if !guest_sh_ok(&self.distro, &script, self.timeout) {
+                if !guest_sh_ok(&self.distro, &script, self.timeout.min(left)) {
+                    if began.elapsed() >= remaining {
+                        return Err(WinError::new(
+                            WinErrorCode::Timeout,
+                            "guest marker check exceeded the launch deadline",
+                        ));
+                    }
                     return Err(WinError::new(
                         WinErrorCode::FailedPrecondition,
                         "marker file is not visible from the guest",

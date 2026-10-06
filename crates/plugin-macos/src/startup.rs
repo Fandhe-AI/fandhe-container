@@ -4,8 +4,8 @@
 //! 2) 環境変数 `PLUGIN_SOCKET_ENV`（core の起動経路が設定する既存契約）、
 //! 3) 既定 `RuntimeDir::from_env()` 配下の [`DEFAULT_SOCKET_NAME`]。
 //!
-//! 本モジュールは socket を開かない（bind も connect もしない）。解決したパスは
-//! bind / connect のどちらにも使える検証済みの絶対パスである。`sun_path` 長は既定パスを
+//! 本モジュールは socket を開かない（bind も connect もしない）。解決したパスは検証済みの絶対パスで、
+//! `main.rs` が `UdsStream::connect`（core が bind 済みの listener へ接続する既存契約）に使う。`sun_path` 長は既定パスを
 //! `RuntimeDir::socket_path`、明示パスを本モジュールの `validate_explicit` が検証する。
 //! 明示パスの配置ディレクトリの検証（所有者・権限・symlink。PLUG-12）も bind 時の既存機構へ委ねる。
 //!
@@ -83,11 +83,14 @@ pub enum Invocation {
     Run(StartupArgs),
 }
 
-/// [`run`] の正常終了の種別（将来のサービス提供ループ用に拡張できる型。TASK-115.2）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// [`run`] の正常終了の種別（TASK-115.2 で `Ready` を追加）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
     /// 使用法の表示を要求された（呼び出し側が [`usage`] を出す）。
     HelpPrinted,
+    /// 起動設定を解決できた。呼び出し側（`main.rs`）が socket へ接続して
+    /// `frame_loop::serve` を駆動する（本モジュールは socket を開かない）。
+    Ready(StartupConfig),
 }
 
 fn invalid(msg: &str) -> PluginError {
@@ -252,18 +255,15 @@ pub fn default_socket_path() -> Result<PathBuf, PluginError> {
 
 /// 起動処理本体。
 ///
-/// 現状の正常系は `--help` のみ。パス解決に成功しても送受信ループは未実装（TASK-115.2 で
-/// ループへ置き換える）のため `Unimplemented` を返す（サービス提供中を装わない。REPAIR-3）。
+/// `--help` は `HelpPrinted`、通常起動はパス解決に成功すると `Ready` を返す。接続と送受信ループは
+/// 呼び出し側（`main.rs`・`frame_loop`。TASK-115.2）の責務で、ここでは socket を開かない。
 pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<RunOutcome, PluginError> {
     match parse_args(args)? {
         Invocation::Help => Ok(RunOutcome::HelpPrinted),
         Invocation::Run(a) => {
             let env = std::env::var_os(PLUGIN_SOCKET_ENV);
-            let _config = resolve_socket_path(&a, env.as_deref(), default_socket_path)?;
-            Err(PluginError::new(
-                PluginErrorCode::Unimplemented,
-                "plugin serving loop is not implemented yet",
-            ))
+            let config = resolve_socket_path(&a, env.as_deref(), default_socket_path)?;
+            Ok(RunOutcome::Ready(config))
         }
     }
 }

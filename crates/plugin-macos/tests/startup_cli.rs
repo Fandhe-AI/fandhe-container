@@ -107,19 +107,24 @@ fn unknown_flag_exits_two_with_invalid_argument() {
     );
 }
 
+/// 存在しない socket への接続失敗は終了コード 3（TASK-115.2）。socket は作られず、パスも出力しない。
 #[test]
-fn explicit_socket_reports_unimplemented_and_creates_nothing() {
+fn explicit_socket_connect_failure_exits_three_and_creates_nothing() {
     let t = Tmp::new("arg");
     let sock = t.0.join("a.sock");
-    let o = run(&["--socket", sock.to_str().expect("utf8 path")], &[]);
-    assert_eq!(o.code, Some(1));
-    assert_eq!(
-        o.stderr.trim(),
-        format!(
-            "error: {}: plugin serving loop is not implemented yet",
-            PluginErrorCode::Unimplemented.as_str()
-        )
+    let sock_str = sock.to_str().expect("utf8 path");
+    let o = run(&["--socket", sock_str], &[]);
+    assert_eq!(o.code, Some(3), "stderr: {}", o.stderr);
+    #[cfg(unix)]
+    let want = PluginErrorCode::NotFound.as_str();
+    #[cfg(not(unix))]
+    let want = PluginErrorCode::Unimplemented.as_str();
+    assert!(
+        o.stderr.starts_with(&format!("error: {want}: ")),
+        "stderr: {}",
+        o.stderr
     );
+    assert!(!o.stderr.contains(sock_str), "stderr: {}", o.stderr);
     assert!(!sock.exists());
 }
 
@@ -128,8 +133,8 @@ fn explicit_socket_reports_unimplemented_and_creates_nothing() {
 fn default_path_resolves_runtime_dir_without_creating_socket() {
     let t = Tmp::new("def");
     let o = run(&[], &[("XDG_RUNTIME_DIR", t.0.as_os_str())]);
-    assert_eq!(o.code, Some(1), "stderr: {}", o.stderr);
-    assert!(o.stderr.contains(PluginErrorCode::Unimplemented.as_str()));
+    assert_eq!(o.code, Some(3), "stderr: {}", o.stderr);
+    assert!(o.stderr.contains(PluginErrorCode::NotFound.as_str()));
     assert!(t.0.join("fandhe-container").is_dir());
     assert!(
         !t.0.join("fandhe-container")

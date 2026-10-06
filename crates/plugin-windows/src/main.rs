@@ -15,7 +15,7 @@
 //! マウントを本 plugin から回収する手段は未実装で、対象の特定に必要な情報も出力しない（プロセスを
 //! またぐ回収は #1412。理由は `adapter` のモジュール doc「未実装範囲」を参照。WIN-2・REPAIR-3）。
 //! SIGTERM（#396）: 次の受信境界（検知遅れは最大 `IDLE_POLL` 1 秒）でループを抜け、`plugin.shutdown` を出して
-//! 上記の `release_all`（最大 `RELEASE_ALL_BUDGET` 4 秒）で共有マウントを解除してから終了する。SIGKILL・猶予超過では
+//! 上記の `release_all`（最大 `RELEASE_ALL_BUDGET` 4 秒）で共有マウントを解除してから終了する。要求処理中に届いた場合は、各段の境界（次の WSL2 操作の着手前）で要求を打ち切って解除へ進む（実行中の 1 段は中断できず、その持ち分までは待つ）。SIGKILL・猶予超過では
 //! マウントが残り得る（回収は #1412）。SIGINT / SIGHUP・Windows ホスト上の終了要求は対象外（未実装。REPAIR-3）。
 //! ヘルスチェック（`ping`）は adapter が即応答する。
 //! 接続経路は peer 認証つき `UdsStream::connect` のみ（TASK-116.4・#395・PLUG-12）。別 UID の listener は

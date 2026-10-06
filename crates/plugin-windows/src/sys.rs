@@ -21,7 +21,7 @@
 //!   （SIGTERM 経路なし。実装済みを装わない。REPAIR-3）。
 //!
 //! # 限界（残存リスク）
-//! SIGKILL は捕捉できない。SIGTERM 送信側の猶予内に `release_all`（最大 `RELEASE_ALL_BUDGET` 4 秒）が終わらず
+//! SIGKILL は捕捉できない。要求処理中の SIGTERM は各段の境界でしか打ち切れず（実行中の `wsl.exe` 呼び出しは中断できない）、その段の残りと `release_all`（最大 `RELEASE_ALL_BUDGET` 4 秒）が SIGTERM 送信側の猶予内に終わらず
 //! SIGKILL された場合、共有マウントは残留しうる（回収は #1412）。Windows ホスト上のビルドではシグナル経路が無くフラグは立たない
 //! （コンソール制御ハンドラ等は未実装。REPAIR-3）。SIGINT / SIGHUP は本モジュールの対象外（#396 の受入基準は SIGTERM のみ）。
 

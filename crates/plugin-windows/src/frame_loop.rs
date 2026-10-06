@@ -27,6 +27,8 @@
 //! [`serve_until`] は停止フラグ（SIGTERM。`sys::install_sigterm_flag`）を、フレームを 1 バイトも
 //! 受けていない間だけ [`IDLE_POLL`] ごとに確認し、立っていれば [`LoopExit::ShutdownRequested`] で抜ける。
 //! 受信途中のフレームは打ち切らず [`FRAME_DEADLINE`] 内で受け切って応答する（境界ずれ防止）。
+//! 要求処理中に立った場合は、ハンドラへ [`RequestHandler::handle_with_stop`] で伝え、ハンドラが各段の
+//! 境界で処理を早期に打ち切る（共有マウント解除の時間を確保する。WIN-2・REPAIR-5）。
 //! 呼び出し側（`main.rs`）が抜けた後に共有マウントを解除して終了する。
 //!
 //! 対応 ID: TASK-116・PLUG-1・PLUG-2・PLUG-5・WIN-1・REPAIR-2・REPAIR-3・REPAIR-5・REPAIR-12。
@@ -61,6 +63,16 @@ const MSG_ENCODE_FAILED: &str = "failed to encode response";
 pub trait RequestHandler {
     /// 1 要求を処理して応答本体を返す。
     fn handle(&mut self, body: &[String]) -> Result<Vec<String>, PluginError>;
+
+    /// 停止フラグ付きで 1 要求を処理する（TASK-116.5・#396）。既定は [`Self::handle`] へ委譲する。
+    /// 実装は処理中に `stop` を確認して早期に打ち切り、終了時の後始末へ時間を残せる（WIN-2・REPAIR-5）。
+    fn handle_with_stop(
+        &mut self,
+        body: &[String],
+        _stop: &AtomicBool,
+    ) -> Result<Vec<String>, PluginError> {
+        self.handle(body)
+    }
 }
 
 impl<F> RequestHandler for F
@@ -108,6 +120,15 @@ pub fn handle_frame<H: RequestHandler>(
     frame: &Frame,
     handler: &mut H,
 ) -> Result<Frame, PluginError> {
+    handle_frame_with(frame, handler, None)
+}
+
+/// [`handle_frame`] に停止フラグを渡せる版。`stop` があればハンドラへ伝える（TASK-116.5・#396）。
+fn handle_frame_with<H: RequestHandler>(
+    frame: &Frame,
+    handler: &mut H,
+    stop: Option<&AtomicBool>,
+) -> Result<Frame, PluginError> {
     let msg = decode_message::<Vec<String>>(frame)?;
     let (id, body) = match msg {
         ControlMessage::Request { id, body } => (id, body),
@@ -130,6 +151,8 @@ pub fn handle_frame<H: RequestHandler>(
             PluginErrorCode::InvalidArgument,
             "request body must have 1 to 64 items",
         ))
+    } else if let Some(stop) = stop {
+        handler.handle_with_stop(&body, stop)
     } else {
         handler.handle(&body)
     };
@@ -316,7 +339,7 @@ pub fn serve_until<H: RequestHandler>(
                 }
             }
         };
-        let reply = handle_frame(&frame, handler)?;
+        let reply = handle_frame_with(&frame, handler, Some(stop))?;
         stream.write_frame(&reply, RpcTimeout::default())?;
     }
 }
